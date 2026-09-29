@@ -1,0 +1,19 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "s4-sfu",
+      "runtimeExecutable": "go",
+      "runtimeArgs": [
+        "-C",
+        "spikes/s4-sfu",
+        "run",
+        ".",
+        "-addr",
+        "localhost:8080",
+        "-loopback"
+      ],
+      "port": 8080
+    }
+  ]
+}

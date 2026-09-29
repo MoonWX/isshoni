@@ -1,0 +1,7 @@
+# Cross-compiler for the Windows audio engine DLL (compile check + prebuilt DLL from a Mac).
+# Official builds use MSVC (see CMakeLists.txt); this image is for dev convenience only.
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      g++-mingw-w64-x86-64-posix make ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src

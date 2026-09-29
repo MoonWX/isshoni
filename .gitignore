@@ -1,0 +1,14 @@
+# build outputs
+bin/
+dist/
+build/msvc/
+*.exe
+*.test
+*.out
+
+# dependencies
+node_modules/
+
+# OS / editor
+.DS_Store
+*.swp

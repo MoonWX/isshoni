@@ -1,0 +1,1072 @@
+{
+  "probe": {
+    "os_build": 26200,
+    "process_loopback": true,
+    "format": "float32",
+    "master_volume": 0.19,
+    "master_muted": true,
+    "device": "REDACTED",
+    "error": ""
+  },
+  "scenarios": [
+    {
+      "name": "app-boundary",
+      "what": "an app launched BY a voice app (e.g. a browser opened from a Discord link) is still heard",
+      "info": false,
+      "result": "PASS",
+      "checks": [
+        {
+          "freq": 1031,
+          "from": 1.5,
+          "to": 0,
+          "expect": "present",
+          "why": "browser started by the voice app",
+          "level_db": -12.041463115904484,
+          "pass": true
+        }
+      ],
+      "clicks_at_s": null,
+      "tone_apps_under_explorer": true,
+      "final_status": {
+        "mode": "include-set",
+        "streams": [
+          {
+            "label": "music.exe",
+            "kind": "include",
+            "state": "running",
+            "format": "float32",
+            "pid": 22080,
+            "buffered_ms": 40,
+            "buffer_ms": 10,
+            "peak": 0.0000,
+            "max_peak": 0.0000,
+            "packets": 568,
+            "silent_packets": 0,
+            "discontinuities": 0,
+            "underruns": 0,
+            "trims": 0,
+            "overflows": 0,
+            "error": ""
+          },
+          {
+            "label": "thunderbird.exe",
+            "kind": "include",
+            "state": "running",
+            "format": "float32",
+            "pid": 25664,
+            "buffered_ms": 40,
+            "buffer_ms": 10,
+            "peak": 0.0000,
+            "max_peak": 0.0000,
+            "packets": 568,
+            "silent_packets": 0,
+            "discontinuities": 0,
+            "underruns": 0,
+            "trims": 0,
+            "overflows": 0,
+            "error": ""
+          },
+          {
+            "label": "gameviewerserver.exe",
+            "kind": "include",
+            "state": "running",
+            "format": "float32",
+            "pid": 5368,
+            "buffered_ms": 40,
+            "buffer_ms": 10,
+            "peak": 0.0000,
+            "max_peak": 0.0000,
+            "packets": 568,
+            "silent_packets": 0,
+            "discontinuities": 0,
+            "underruns": 0,
+            "trims": 0,
+            "overflows": 0,
+            "error": ""
+          },
+          {
+            "label": "brave.exe",
+            "kind": "include",
+            "state": "running",
+            "format": "float32",
+            "pid": 25756,
+            "buffered_ms": 30,
+            "buffer_ms": 10,
+            "peak": 0.0000,
+            "max_peak": 0.0000,
+            "packets": 567,
+            "silent_packets": 0,
+            "discontinuities": 0,
+            "underruns": 0,
+            "trims": 0,
+            "overflows": 0,
+            "error": ""
+          },
+          {
+            "label": "firefox.exe",
+            "kind": "include",
+            "state": "running",
+            "format": "float32",
+            "pid": 29404,
+            "buffered_ms": 40,
+            "buffer_ms": 10,
+            "peak": 0.0000,
+            "max_peak": 0.0000,
+            "packets": 568,
+            "silent_packets": 0,
+            "discontinuities": 0,
+            "underruns": 0,
+            "trims": 0,
+            "overflows": 0,
+            "error": ""
+          },
+          {
+            "label": "microsoft.media.player.exe",
+            "kind": "include",
+            "state": "running",
+            "format": "float32",
+            "pid": 4656,
+            "buffered_ms": 30,
+            "buffer_ms": 10,
+            "peak": 0.0000,
+            "max_peak": 0.0000,
+            "packets": 567,
+            "silent_packets": 0,
+            "discontinuities": 0,
+            "underruns": 0,
+            "trims": 0,
+            "overflows": 0,
+            "error": ""
+          },
+          {
+            "label": "browser.exe",
+            "kind": "include",
+            "state": "running",
+            "format": "float32",
+            "pid": 7152,
+            "buffered_ms": 30,
+            "buffer_ms": 10,
+            "peak": 0.2500,
+            "max_peak": 0.2500,
+            "packets": 567,
+            "silent_packets": 0,
+            "discontinuities": 0,
+            "underruns": 0,
+            "trims": 0,
+            "overflows": 0,
+            "error": ""
+          }
+        ],
+        "totals": {
+          "discontinuities": 0,
+          "overflows": 0,
+          "underruns": 0,
+          "trims": 0,
+          "dropped_chunks": 0,
+          "mixer_resyncs": 0
+        },
+        "sessions": [
+          {
+            "pid": 19968,
+            "exe": "steam.exe",
+            "state": "inactive",
+            "multi_process": false,
+            "excluded": false,
+            "reason": "",
+            "note": "NOT captured: launcher/shell process (its own UI sounds only)"
+          },
+          {
+            "pid": 22080,
+            "exe": "music.exe",
+            "state": "inactive",
+            "multi_process": true,
+            "excluded": false,
+            "reason": "",
+            "note": ""
+          },
+          {
+            "pid": 25664,
+            "exe": "thunderbird.exe",
+            "state": "inactive",
+            "multi_process": false,
+            "excluded": false,
+            "reason": "",
+            "note": ""
+          },
+          {
+            "pid": 5368,
+            "exe": "gameviewerserver.exe",
+            "state": "active",
+            "multi_process": false,
+            "excluded": false,
+            "reason": "",
+            "note": ""
+          },
+          {
+            "pid": 29220,
+            "exe": "s1.exe",
+            "state": "active",
+            "multi_process": false,
+            "excluded": true,
+            "reason": "isshoni itself",
+            "note": ""
+          },
+          {
+            "pid": 25756,
+            "exe": "brave.exe",
+            "state": "active",
+            "multi_process": false,
+            "excluded": false,
+            "reason": "",
+            "note": ""
+          },
+          {
+            "pid": 29404,
+            "exe": "firefox.exe",
+            "state": "inactive",
+            "multi_process": false,
+            "excluded": false,
+            "reason": "",
+            "note": ""
+          },
+          {
+            "pid": 18384,
+            "exe": "discord.exe",
+            "state": "inactive",
+            "multi_process": false,
+            "excluded": true,
+            "reason": "app rule discord.exe",
+            "note": ""
+          },
+          {
+            "pid": 27256,
+            "exe": "discord.exe",
+            "state": "inactive",
+            "multi_process": false,
+            "excluded": true,
+            "reason": "app rule discord.exe",
+            "note": ""
+          },
+          {
+            "pid": 4656,
+            "exe": "microsoft.media.player.exe",
+            "state": "inactive",
+            "multi_process": true,
+            "excluded": false,
+            "reason": "",
+            "note": ""
+          },
+          {
+            "pid": 7152,
+            "exe": "browser.exe",
+            "state": "active",
+            "multi_process": false,
+            "excluded": false,
+            "reason": "",
+            "note": ""
+          }
+        ],
+        "mic_users": [
+          {
+            "pid": 19968,
+            "app_root_pid": 19968
+          },
+          {
+            "pid": 18384,
+            "app_root_pid": 2412
+          }
+        ],
+        "events": [
+          {
+            "t_ns": 14146333810800,
+            "label": "music.exe",
+            "event": "opened"
+          },
+          {
+            "t_ns": 14146334100200,
+            "label": "thunderbird.exe",
+            "event": "opened"
+          },
+          {
+            "t_ns": 14146334371000,
+            "label": "gameviewerserver.exe",
+            "event": "opened"
+          },
+          {
+            "t_ns": 14146334659900,
+            "label": "brave.exe",
+            "event": "opened"
+          },
+          {
+            "t_ns": 14146334911200,
+            "label": "firefox.exe",
+            "event": "opened"
+          },
+          {
+            "t_ns": 14146335220800,
+            "label": "microsoft.media.player.exe",
+            "event": "opened"
+          },
+          {
+            "t_ns": 14146335677000,
+            "label": "browser.exe",
+            "event": "opened"
+          },
+          {
+            "t_ns": 14146385567100,
+            "label": "music.exe",
+            "event": "running (fade in)"
+          },
+          {
+            "t_ns": 14146385572600,
+            "label": "thunderbird.exe",
+            "event": "running (fade in)"
+          },
+          {
+            "t_ns": 14146385577400,
+            "label": "gameviewerserver.exe",
+            "event": "running (fade in)"
+          },
+          {
+            "t_ns": 14146385581800,
+            "label": "brave.exe",
+            "event": "running (fade in)"
+          },
+          {
+            "t_ns": 14146385586500,
+            "label": "firefox.exe",
+            "event": "running (fade in)"
+          },
+          {
+            "t_ns": 14146385591200,
+            "label": "microsoft.media.player.exe",
+            "event": "running (fade in)"
+          },
+          {
+            "t_ns": 14146385595700,
+            "label": "browser.exe",
+            "event": "running (fade in)"
+          }
+        ],
+        "warnings": [
+          "multi-process audio session from music.exe: its other processes can't be vetted",
+          "multi-process audio session from microsoft.media.player.exe: its other processes can't be vetted"
+        ]
+      }
+    },
+    {
+      "name": "late-start",
+      "what": "apps that start mid-share are classified within ~1 s; clean start/stop",
+      "info": false,
+      "result": "FAIL",
+      "checks": [
+        {
+          "freq": 1031,
+          "from": 1.5,
+          "to": 0,
+          "expect": "present",
+          "why": "game",
+          "level_db": -12.041918320831353,
+          "pass": true
+        },
+        {
+          "freq": 453,
+          "from": 1.5,
+          "to": 0,
+          "expect": "absent",
+          "why": "voice app started mid-share",
+          "level_db": -84.72701279510366,
+          "pass": true
+        },
+        {
+          "freq": 683,
+          "from": 4.5,
+          "to": 5.8,
+          "expect": "present",
+          "why": "game started mid-share (picked up ≤1.5 s)",
+          "level_db": -12.041458595213292,
+          "pass": true
+        }
+      ],
+      "clicks_at_s": [
+        3.19,
+        6.11
+      ],
+      "click_details": [
+        {
+          "at_s": 3.191,
+          "step": 0.0337,
+          "snippet": [
+            -0.2468,
+            -0.2499,
+            -0.2485,
+            -0.2426,
+            -0.2322,
+            -0.2176,
+            -0.1991,
+            -0.1769,
+            -0.1516,
+            -0.1234,
+            -0.093,
+            -0.061,
+            -0.0278,
+            0.0059,
+            0.0394,
+            0.0723,
+            0.1038,
+            0.1335,
+            0.1607,
+            0.185,
+            0.206,
+            0.2231,
+            0.2363,
+            0.2451,
+            0.2182,
+            0.2403,
+            0.2579,
+            0.271,
+            0.2795,
+            0.2836,
+            0.2833,
+            0.2788,
+            0.2705,
+            0.2587,
+            0.2438,
+            0.2262,
+            0.2065,
+            0.185,
+            0.1624,
+            0.1392,
+            0.1158,
+            0.0927,
+            0.0705,
+            0.0495,
+            0.0302,
+            0.0129,
+            -0.0022,
+            -0.0147
+          ],
+          "engine_events_nearby": [
+            "-0.076s game2.exe: opened",
+            "-0.031s game2.exe: running (fade in)"
+          ]
+        },
+        {
+          "at_s": 6.11,
+          "step": 0.1509,
+          "snippet": [
+            -0.0513,
+            -0.0082,
+            0.0366,
+            0.0825,
+            0.1287,
+            0.1746,
+            0.2195,
+            0.2625,
+            0.3033,
+            0.3409,
+            0.3748,
+            0.4044,
+            0.4293,
+            0.4488,
+            0.4627,
+            0.4707,
+            0.4726,
+            0.4681,
+            0.4575,
+            0.4406,
+            0.4177,
+            0.3889,
+            0.3549,
+            0.3158,
+            0.1649,
+            0.1382,
+            0.1089,
+            0.0776,
+            0.0449,
+            0.0114,
+            -0.0223,
+            -0.0556,
+            -0.0879,
+            -0.1186,
+            -0.1471,
+            -0.173,
+            -0.1957,
+            -0.2148,
+            -0.2301,
+            -0.2411,
+            -0.2478,
+            -0.25,
+            -0.2476,
+            -0.2408,
+            -0.2295,
+            -0.2141,
+            -0.1947,
+            -0.1719
+          ],
+          "engine_events_nearby": [
+            "+0.100s game2.exe: fading out",
+            "+0.100s game2.exe: removed"
+          ]
+        }
+      ],
+      "tone_apps_under_explorer": true,
+      "final_status": {
+        "mode": "include-set",
+        "streams": [
+          {
+            "label": "music.exe",
+            "kind": "include",
+            "state": "running",
+            "format": "float32",
+            "pid": 22080,
+            "buffered_ms": 30,
+            "buffer_ms": 10,
+            "peak": 0.0000,
+            "max_peak": 0.0000,
+            "packets": 878,
+            "silent_packets": 0,
+            "discontinuities": 0,
+            "underruns": 0,
+            "trims": 0,
+            "overflows": 0,
+            "error": ""
+          },
+          {
+            "label": "thunderbird.exe",
+            "kind": "include",
+            "state": "running",
+            "format": "float32",
+            "pid": 25664,
+            "buffered_ms": 30,
+            "buffer_ms": 10,
+            "peak": 0.0000,
+            "max_peak": 0.0000,
+            "packets": 878,
+            "silent_packets": 0,
+            "discontinuities": 0,
+            "underruns": 0,
+            "trims": 0,
+            "overflows": 0,
+            "error": ""
+          },
+          {
+            "label": "gameviewerserver.exe",
+            "kind": "include",
+            "state": "running",
+            "format": "float32",
+            "pid": 5368,
+            "buffered_ms": 30,
+            "buffer_ms": 10,
+            "peak": 0.0000,
+            "max_peak": 0.0000,
+            "packets": 878,
+            "silent_packets": 0,
+            "discontinuities": 0,
+            "underruns": 0,
+            "trims": 0,
+            "overflows": 0,
+            "error": ""
+          },
+          {
+            "label": "brave.exe",
+            "kind": "include",
+            "state": "running",
+            "format": "float32",
+            "pid": 25756,
+            "buffered_ms": 30,
+            "buffer_ms": 10,
+            "peak": 0.0000,
+            "max_peak": 0.0000,
+            "packets": 878,
+            "silent_packets": 0,
+            "discontinuities": 0,
+            "underruns": 0,
+            "trims": 0,
+            "overflows": 0,
+            "error": ""
+          },
+          {
+            "label": "firefox.exe",
+            "kind": "include",
+            "state": "running",
+            "format": "float32",
+            "pid": 29404,
+            "buffered_ms": 30,
+            "buffer_ms": 10,
+            "peak": 0.0000,
+            "max_peak": 0.0000,
+            "packets": 878,
+            "silent_packets": 0,
+            "discontinuities": 0,
+            "underruns": 0,
+            "trims": 0,
+            "overflows": 0,
+            "error": ""
+          },
+          {
+            "label": "microsoft.media.player.exe",
+            "kind": "include",
+            "state": "running",
+            "format": "float32",
+            "pid": 4656,
+            "buffered_ms": 30,
+            "buffer_ms": 10,
+            "peak": 0.0000,
+            "max_peak": 0.0000,
+            "packets": 878,
+            "silent_packets": 0,
+            "discontinuities": 0,
+            "underruns": 0,
+            "trims": 0,
+            "overflows": 0,
+            "error": ""
+          },
+          {
+            "label": "game.exe",
+            "kind": "include",
+            "state": "running",
+            "format": "float32",
+            "pid": 17364,
+            "buffered_ms": 30,
+            "buffer_ms": 10,
+            "peak": 0.2500,
+            "max_peak": 0.2500,
+            "packets": 878,
+            "silent_packets": 0,
+            "discontinuities": 0,
+            "underruns": 0,
+            "trims": 0,
+            "overflows": 0,
+            "error": ""
+          }
+        ],
+        "totals": {
+          "discontinuities": 0,
+          "overflows": 0,
+          "underruns": 0,
+          "trims": 0,
+          "dropped_chunks": 0,
+          "mixer_resyncs": 0
+        },
+        "sessions": [
+          {
+            "pid": 19968,
+            "exe": "steam.exe",
+            "state": "inactive",
+            "multi_process": false,
+            "excluded": false,
+            "reason": "",
+            "note": "NOT captured: launcher/shell process (its own UI sounds only)"
+          },
+          {
+            "pid": 22080,
+            "exe": "music.exe",
+            "state": "inactive",
+            "multi_process": true,
+            "excluded": false,
+            "reason": "",
+            "note": ""
+          },
+          {
+            "pid": 25664,
+            "exe": "thunderbird.exe",
+            "state": "inactive",
+            "multi_process": false,
+            "excluded": false,
+            "reason": "",
+            "note": ""
+          },
+          {
+            "pid": 5368,
+            "exe": "gameviewerserver.exe",
+            "state": "active",
+            "multi_process": false,
+            "excluded": false,
+            "reason": "",
+            "note": ""
+          },
+          {
+            "pid": 29220,
+            "exe": "s1.exe",
+            "state": "active",
+            "multi_process": false,
+            "excluded": true,
+            "reason": "isshoni itself",
+            "note": ""
+          },
+          {
+            "pid": 25756,
+            "exe": "brave.exe",
+            "state": "active",
+            "multi_process": false,
+            "excluded": false,
+            "reason": "",
+            "note": ""
+          },
+          {
+            "pid": 29404,
+            "exe": "firefox.exe",
+            "state": "inactive",
+            "multi_process": false,
+            "excluded": false,
+            "reason": "",
+            "note": ""
+          },
+          {
+            "pid": 18384,
+            "exe": "discord.exe",
+            "state": "inactive",
+            "multi_process": false,
+            "excluded": true,
+            "reason": "app rule discord.exe",
+            "note": ""
+          },
+          {
+            "pid": 27256,
+            "exe": "discord.exe",
+            "state": "inactive",
+            "multi_process": false,
+            "excluded": true,
+            "reason": "app rule discord.exe",
+            "note": ""
+          },
+          {
+            "pid": 4656,
+            "exe": "microsoft.media.player.exe",
+            "state": "inactive",
+            "multi_process": true,
+            "excluded": false,
+            "reason": "",
+            "note": ""
+          },
+          {
+            "pid": 17364,
+            "exe": "game.exe",
+            "state": "active",
+            "multi_process": false,
+            "excluded": false,
+            "reason": "",
+            "note": ""
+          },
+          {
+            "pid": 15156,
+            "exe": "fakevoice.exe",
+            "state": "active",
+            "multi_process": false,
+            "excluded": true,
+            "reason": "app rule fakevoice.exe",
+            "note": ""
+          }
+        ],
+        "mic_users": [
+          {
+            "pid": 19968,
+            "app_root_pid": 19968
+          },
+          {
+            "pid": 18384,
+            "app_root_pid": 2412
+          }
+        ],
+        "events": [
+          {
+            "t_ns": 14155006573800,
+            "label": "music.exe",
+            "event": "opened"
+          },
+          {
+            "t_ns": 14155006868500,
+            "label": "thunderbird.exe",
+            "event": "opened"
+          },
+          {
+            "t_ns": 14155007164400,
+            "label": "gameviewerserver.exe",
+            "event": "opened"
+          },
+          {
+            "t_ns": 14155007485400,
+            "label": "brave.exe",
+            "event": "opened"
+          },
+          {
+            "t_ns": 14155007783500,
+            "label": "firefox.exe",
+            "event": "opened"
+          },
+          {
+            "t_ns": 14155008027300,
+            "label": "microsoft.media.player.exe",
+            "event": "opened"
+          },
+          {
+            "t_ns": 14155008268500,
+            "label": "game.exe",
+            "event": "opened"
+          },
+          {
+            "t_ns": 14155057109000,
+            "label": "music.exe",
+            "event": "running (fade in)"
+          },
+          {
+            "t_ns": 14155057114400,
+            "label": "thunderbird.exe",
+            "event": "running (fade in)"
+          },
+          {
+            "t_ns": 14155057118900,
+            "label": "gameviewerserver.exe",
+            "event": "running (fade in)"
+          },
+          {
+            "t_ns": 14155057123700,
+            "label": "brave.exe",
+            "event": "running (fade in)"
+          },
+          {
+            "t_ns": 14155057128000,
+            "label": "firefox.exe",
+            "event": "running (fade in)"
+          },
+          {
+            "t_ns": 14155057132700,
+            "label": "microsoft.media.player.exe",
+            "event": "running (fade in)"
+          },
+          {
+            "t_ns": 14155057137500,
+            "label": "game.exe",
+            "event": "running (fade in)"
+          },
+          {
+            "t_ns": 14158111893500,
+            "label": "game2.exe",
+            "event": "opened"
+          },
+          {
+            "t_ns": 14158156989900,
+            "label": "game2.exe",
+            "event": "running (fade in)"
+          },
+          {
+            "t_ns": 14161207002300,
+            "label": "game2.exe",
+            "event": "fading out"
+          },
+          {
+            "t_ns": 14161207007100,
+            "label": "game2.exe",
+            "event": "removed"
+          }
+        ],
+        "warnings": [
+          "multi-process audio session from music.exe: its other processes can't be vetted",
+          "multi-process audio session from microsoft.media.player.exe: its other processes can't be vetted"
+        ]
+      }
+    },
+    {
+      "name": "late-start-endpoint",
+      "what": "control for late-start: same timeline through plain Windows loopback (no isshoni mixing); clicks here come from Windows/the test apps, not isshoni",
+      "info": true,
+      "result": "INFO",
+      "checks": [
+        {
+          "freq": 1031,
+          "from": 1.5,
+          "to": 0,
+          "expect": "present",
+          "why": "game",
+          "level_db": -12.041466782631176,
+          "pass": true
+        },
+        {
+          "freq": 683,
+          "from": 4.5,
+          "to": 5.8,
+          "expect": "present",
+          "why": "game started mid-share",
+          "level_db": -12.04146752035503,
+          "pass": true
+        }
+      ],
+      "clicks_at_s": null,
+      "tone_apps_under_explorer": true,
+      "final_status": {
+        "mode": "endpoint",
+        "streams": [
+          {
+            "label": "default output (everything, no exclusion)",
+            "kind": "endpoint",
+            "state": "running",
+            "format": "float32+convert",
+            "pid": 0,
+            "buffered_ms": 20,
+            "buffer_ms": 200,
+            "peak": 0.4960,
+            "max_peak": 0.7484,
+            "packets": 895,
+            "silent_packets": 0,
+            "discontinuities": 1,
+            "underruns": 0,
+            "trims": 0,
+            "overflows": 0,
+            "error": ""
+          }
+        ],
+        "totals": {
+          "discontinuities": 1,
+          "overflows": 0,
+          "underruns": 0,
+          "trims": 0,
+          "dropped_chunks": 0,
+          "mixer_resyncs": 0
+        },
+        "sessions": [
+          {
+            "pid": 19968,
+            "exe": "steam.exe",
+            "state": "inactive",
+            "multi_process": false,
+            "excluded": false,
+            "reason": "",
+            "note": ""
+          },
+          {
+            "pid": 22080,
+            "exe": "music.exe",
+            "state": "inactive",
+            "multi_process": true,
+            "excluded": false,
+            "reason": "",
+            "note": ""
+          },
+          {
+            "pid": 25664,
+            "exe": "thunderbird.exe",
+            "state": "inactive",
+            "multi_process": false,
+            "excluded": false,
+            "reason": "",
+            "note": ""
+          },
+          {
+            "pid": 5368,
+            "exe": "gameviewerserver.exe",
+            "state": "active",
+            "multi_process": false,
+            "excluded": false,
+            "reason": "",
+            "note": ""
+          },
+          {
+            "pid": 29220,
+            "exe": "s1.exe",
+            "state": "active",
+            "multi_process": false,
+            "excluded": true,
+            "reason": "isshoni itself",
+            "note": ""
+          },
+          {
+            "pid": 25756,
+            "exe": "brave.exe",
+            "state": "active",
+            "multi_process": false,
+            "excluded": false,
+            "reason": "",
+            "note": ""
+          },
+          {
+            "pid": 29404,
+            "exe": "firefox.exe",
+            "state": "inactive",
+            "multi_process": false,
+            "excluded": false,
+            "reason": "",
+            "note": ""
+          },
+          {
+            "pid": 18384,
+            "exe": "discord.exe",
+            "state": "inactive",
+            "multi_process": false,
+            "excluded": true,
+            "reason": "app rule discord.exe",
+            "note": ""
+          },
+          {
+            "pid": 27256,
+            "exe": "discord.exe",
+            "state": "inactive",
+            "multi_process": false,
+            "excluded": true,
+            "reason": "app rule discord.exe",
+            "note": ""
+          },
+          {
+            "pid": 4656,
+            "exe": "microsoft.media.player.exe",
+            "state": "inactive",
+            "multi_process": true,
+            "excluded": false,
+            "reason": "",
+            "note": ""
+          },
+          {
+            "pid": 21272,
+            "exe": "game.exe",
+            "state": "active",
+            "multi_process": false,
+            "excluded": false,
+            "reason": "",
+            "note": ""
+          },
+          {
+            "pid": 31148,
+            "exe": "fakevoice.exe",
+            "state": "active",
+            "multi_process": false,
+            "excluded": false,
+            "reason": "",
+            "note": ""
+          }
+        ],
+        "mic_users": [
+          {
+            "pid": 19968,
+            "app_root_pid": 19968
+          },
+          {
+            "pid": 18384,
+            "app_root_pid": 2412
+          }
+        ],
+        "events": [
+          {
+            "t_ns": 14166872342300,
+            "label": "default output (everything, no exclusion)",
+            "event": "opened"
+          },
+          {
+            "t_ns": 14166900246900,
+            "label": "default output (everything, no exclusion)",
+            "event": "capture discontinuity (Windows dropped data)"
+          },
+          {
+            "t_ns": 14166910540300,
+            "label": "default output (everything, no exclusion)",
+            "event": "running (fade in)"
+          }
+        ],
+        "warnings": [
+          "multi-process audio session from music.exe: its other processes can't be vetted",
+          "multi-process audio session from microsoft.media.player.exe: its other processes can't be vetted"
+        ]
+      }
+    }
+  ],
+  "time": "2026-09-29T14:07:33+08:00"
+}

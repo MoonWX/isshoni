@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>isshoni · spike S4</title>
+<style>
+  :root { --bg: #fff; --fg: #1b1b1f; --muted: #6b6b76; --line: #d9d9e0; --accent: #3b5bdb; --panel: #f6f6f9; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #16161a; --fg: #e8e8ee; --muted: #9a9aa6; --line: #33333b; --accent: #7b93ff; --panel: #1f1f25; }
+  }
+  body { margin: 0; padding: 16px; font: 14px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  fieldset { border: 1px solid var(--line); border-radius: 8px; margin: 0 0 12px; padding: 8px 12px; background: var(--panel); }
+  legend { color: var(--muted); }
+  label { margin-right: 12px; white-space: nowrap; }
+  button { margin: 2px 4px 2px 0; }
+  button.on { outline: 2px solid var(--accent); }
+  #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 12px; }
+  .tile { border: 1px solid var(--line); border-radius: 8px; padding: 8px; background: var(--panel); min-width: 0; }
+  .tile.focused { border-color: var(--accent); }
+  .tile video { width: 100%; background: #000; border-radius: 4px; aspect-ratio: 16 / 9; }
+  pre { white-space: pre-wrap; word-break: break-all; font-size: 12px; margin: 4px 0 0; }
+  #log { max-height: 220px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; padding: 8px; }
+  #motion { width: 320px; height: 180px; border-radius: 4px; display: block; }
+  .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<h1>isshoni · spike S4: Pion SFU (simulcast H.264 + layer switching)</h1>
+<p id="banner" hidden style="background:#fdecea;color:#611a15;border:1px solid #f5c2c0;border-radius:8px;padding:8px 12px"></p>
+
+<fieldset>
+  <legend>Connect</legend>
+  <label>Name <input id="name" size="12"></label>
+  <button id="join">Join</button>
+  <span id="me" class="muted"></span>
+  <button id="copy">Copy results JSON (incl. log)</button>
+</fieldset>
+
+<fieldset>
+  <legend>Share</legend>
+  <label>H.264 profile
+    <select id="profile">
+      <option value="auto">browser default</option>
+      <option value="42e01f">constrained baseline 42e01f</option>
+      <option value="42001f">baseline 42001f</option>
+      <option value="4d001f">main 4d001f</option>
+      <option value="640c1f">constrained high 640c1f</option>
+      <option value="64001f">high 64001f</option>
+    </select>
+  </label>
+  <label><input type="checkbox" id="simulcast" checked> simulcast (full + 1/4)</label>
+  <label>fps <select id="fps"><option>30</option><option selected>60</option></select></label>
+  <label>max kbps <input id="bitrate" size="6" value="8000"></label>
+  <label>hint <select id="hint"><option value="">none</option><option selected>motion</option><option>detail</option><option>text</option></select></label>
+  <br>
+  <button id="shareScreen">Share screen/window…</button>
+  <button id="shareTab">Share this tab</button>
+  <button id="shareCanvas">Share test pattern (canvas + tone, no picker)</button>
+  <button id="stop" disabled>Stop</button>
+  <pre id="pubstats" class="muted"></pre>
+  <canvas id="motion" width="1280" height="720"></canvas>
+  <button id="tone">Play test tone</button>
+</fieldset>
+
+<div id="grid"></div>
+
+<h3>Log</h3>
+<pre id="log"></pre>
+
+<script src="app.js"></script>
+</body>
+</html>

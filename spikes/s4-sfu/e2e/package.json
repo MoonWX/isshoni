@@ -1,0 +1,12 @@
+{
+  "name": "s4-sfu-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "e2e": "node run.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.63.0",
+    "puppeteer-core": "^25.12.0"
+  }
+}
