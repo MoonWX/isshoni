@@ -14,7 +14,7 @@ peer-to-peer to each viewer. isshoni fills that gap with:
 - native desktop sharers with per-app audio exclusion and hardware encoding;
 - zero-install viewers in the browser, including phones.
 
-Starting point: `/Users/wangxiao.123/Code/isshoni` is empty (not yet a git repo). One developer; MacBook Pro M5 plus a
+Starting point: an empty repository. One developer; MacBook Pro M5 plus a
 Windows x64 PC plus iPhone/iPad. The plan is based on two research rounds (12 researchers plus fact-checkers, about 250
 claims checked, as of 2026-09-28) and a 4-lens adversarial review of the draft.
 
@@ -399,6 +399,15 @@ there is no webview:
 found (a click when a new app's stream attaches) is fixed by an onset fade. Firefox viewers work, but a fresh Firefox
 needs OpenH264 first, so the SFU must retry a subscription that failed on the codec.
 
+**Verified on macOS 27 (2026-09-29, `spikes/s2-mac-audio`).** One global exclude tap keeps voice apps out as digital
+silence. That covers Electron-style helpers, helpers with no bundle ID, apps that start mid-share, and isshoni's own
+WKWebView (matched by responsible PID). Changes to the design:
+- Excluding or re-including an app **while it plays** cuts it within one sample (a click). The engine builds a second
+  tap and crossfades over 20 ms; two taps align within ±1 sample.
+- `IsRunningInput` is also true for tap readers. Mic detection must check the process's input devices
+  (`kAudioProcessPropertyDevices`) for a real device.
+- Apps that start mid-share don't leak even without `bundleIDs`: the process-list listener wins the race.
+
 **Discord Web's own screen share** (checked in its code, build 622805, 2026-09-29) passes none of Chrome's
 audio-exclusion options. Sharing the entire screen or a window with system audio therefore echoes the call back to
 everyone, and includes every tab. Sharing a single tab carries only that tab's audio (measured in Edge 153: YouTube tab heard, the call's own tab
@@ -620,7 +629,10 @@ draft C ABI.
 - **S1, Windows mixer** (CLI → WAV + FFT) on **physical Win10 22H2 and Win11**:
   - Discord, TeamSpeak and a Chrome profile are excluded at ≥40 dB;
   - streams are added and removed without clicks.
-- **S2, macOS**:
+- **S2, macOS**. **Status 2026-09-29: audio passed on macOS 27** (12/12 scenarios, crossfade for audible changes,
+  refined mic detection). **The TCC grant survived 5 rebuilds** signed with one self-signed identity (no prompt).
+  Still open: macOS 14.4/15/26, picker/window exclusion, and DMG/curl install. See `spikes/s2-mac-audio/README.md`
+  and `spikes/s2-mac-vt/README.md`.
   - tap exclusion covering Discord helpers, helpers that start late, and the WKWebView GPU process matched by
     responsible PID;
   - picker and filter exclusion of isshoni's own windows;
@@ -690,7 +702,7 @@ Total: roughly a year of solo work to v1.0. M1 is already usable by friends; eac
 | Risk | Mitigation |
 |---|---|
 | Windows process-tree semantics (orphans, PID reuse, brokers) let voice audio leak through | S1 on physical Win10/11; ancestor rules with launcher stops; mic detection; "What friends hear" |
-| macOS: taps silently output zeros; helpers start late; WKWebView audio in XPC processes | Rebuild triggers; process-list listener; `bundleIDs` on 26+; sound check in onboarding; S2 |
+| macOS: taps silently output zeros; helpers start late; WKWebView audio in XPC processes | Rebuild triggers; process-list listener; `bundleIDs` on 26+; sound check in onboarding; S2 (late helpers and WKWebView verified on 27) |
 | Apple tightens Gatekeeper for self-signed apps (macOS 28?) | curl and Homebrew paths don't depend on the first-launch check; Chrome web sharer as fallback; signing is configurable so switching to Developer ID is only a certificate change |
 | Self-signed or update key leaks, and signed malware inherits users' capture grants | Protected CI environment with owner approval; an offline backup key; published fingerprints; planned move to an offline root CA |
 | Custom SFU downlink adaptation is the biggest engineering cost | Explicit layers first, then REMB/loss, then TWCC; LiveKit sidecar as Plan B (S4 gate) |
