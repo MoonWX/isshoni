@@ -630,7 +630,8 @@ draft C ABI.
   - Discord, TeamSpeak and a Chrome profile are excluded at ≥40 dB;
   - streams are added and removed without clicks.
 - **S2, macOS**. **Status 2026-09-29: audio passed on macOS 27** (12/12 scenarios, crossfade for audible changes,
-  refined mic detection). **The TCC grant survived 5 rebuilds** signed with one self-signed identity (no prompt).
+  refined mic detection). **The System Audio Recording and Local Network grants survived rebuilds** signed with one
+  self-signed identity (builds 1→9, no second prompt).
   Still open: macOS 14.4/15/26, picker/window exclusion, and DMG/curl install. See `spikes/s2-mac-audio/README.md`
   and `spikes/s2-mac-vt/README.md`.
   - tap exclusion covering Discord helpers, helpers that start late, and the WKWebView GPU process matched by

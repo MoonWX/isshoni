@@ -24,6 +24,8 @@ func runDarwinCommand(cmd string, args []string) error {
 		return cmdOpenApp(args)
 	case "webtone":
 		return cmdWebTone(args)
+	case "lancheck":
+		return cmdLanCheck(args)
 	}
 	e, err := loadEngine()
 	if err != nil {

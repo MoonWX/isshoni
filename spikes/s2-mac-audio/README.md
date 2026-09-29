@@ -18,8 +18,11 @@ go test ./...         # analysis + resampler unit tests
 ```
 
 `run-selftest.sh` starts the app through LaunchServices, so macOS attributes the permission to "isshoni S2". Running
-`s2` from a terminal would attribute it to the terminal app instead. Manual tools: `s2 probe`, `s2 apps` (every audio
-process with its responsible app and classification), `s2 record -d 20 -o out.wav`.
+`s2` from a terminal would attribute it to the terminal app instead. Other tools:
+- `s2 probe`;
+- `s2 apps [-json]`: every audio process with its responsible app and classification;
+- `s2 record -d 20 -o out.wav`;
+- `./run-app.sh lancheck`: the Local Network permission (sends one UDP datagram to the default gateway).
 
 ## What it does
 
@@ -77,13 +80,20 @@ Full run, `./run-selftest.sh -mic` (build 6): **12 PASS, 3 INFO (controls), 0 fa
 | aggregate-with-output (variant) | ℹ️ works too | voice −157 |
 | mic-user: unknown app holding the microphone | ✅ | −172 |
 
-**Permission persistence (plan gate, macOS 27 part): ✅** Builds 1→6 changed the code each time (a new CDHash), but
+**Permission persistence (plan gate, macOS 27 part): ✅** Builds 1→9 changed the code each time (a new CDHash), but
 all were signed with the same self-signed identity. The designated requirement stayed
-`identifier "io.isshoni.spike.s2" and certificate root = H"0f43…7e54"`. macOS asked for System Audio Recording
-**once** (build 1). Every later build captured audio within 0.3–0.5 s with no prompt, and the private preflight
-reported "allowed". The identity is untrusted, and no trust settings were changed. `codesign` accepts it when it is
-selected by SHA-1 hash, and TCC is satisfied by the stable designated requirement. **No paid Apple account is needed
-to keep grants across updates.**
+`identifier "io.isshoni.spike.s2" and certificate root = H"0f43…7e54"`.
+- **System Audio Recording:** macOS asked **once** (build 1). Every later build captured audio within 0.3–0.5 s with
+  no prompt, and the private preflight reported "allowed".
+- **Local Network:** granted on build 8 and kept on build 9 with no prompt. Before the grant, the send failed with
+  EPIPE; the terminal context, which already has the grant, sent the same packet fine.
+
+  A native app can always connect to the Mac's **own** LAN address (S4's block of Firefox there was
+  Firefox-specific). That's why `lancheck` targets the gateway.
+
+The identity is untrusted, and no trust settings were changed. `codesign` accepts it when it is selected by SHA-1 hash,
+and TCC is satisfied by the stable designated requirement. **No paid Apple account is needed to keep grants across
+updates.**
 
 ## Findings that change the M3 design
 
@@ -127,5 +137,5 @@ to keep grants across updates.**
   `s2 apps` / `s2 record` are ready for a manual check.
 - **Default-output-device changes mid-share:** the rebuild path exists, but switching the default device is the
   owner's setting, so it's untested.
-- **Video side of S2:** SCContentSharingPicker and excluding isshoni's own windows, the DMG "Open Anyway" and curl
-  install paths, and the Local Network grant. The VideoToolbox encode benchmark is in `../s2-mac-vt`.
+- **Video side of S2:** SCContentSharingPicker and excluding isshoni's own windows, plus the DMG "Open Anyway" and curl
+  install paths. The VideoToolbox encode benchmark is in `../s2-mac-vt`.

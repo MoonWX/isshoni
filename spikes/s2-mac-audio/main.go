@@ -16,6 +16,7 @@ const usage = `s2 — isshoni spike S2 (macOS audio exclusion)
   s2 apps [-exclude id,…]                   list audio processes and how they would be classified
   s2 record -d 20 -o out.wav                capture what friends would hear (default voice-app list + mic detection)
   s2 analyze -present 1000 -absent 440 file.wav   measure tones in a WAV (any OS)
+  ./run-app.sh lancheck                     Local Network permission check (connects to this Mac's LAN address)
 
   internal (used by selftest): s2 tone -f 440 -d 10 [-mic] [-pidfile f]
     s2 spawn [-pidfile f] <exe> <args…>    s2 openapp [-pidfile f] -d 10 <app> <args…>    s2 webtone -f 907 -d 5
@@ -65,7 +66,7 @@ func run(cmd string, args []string) error {
 	switch cmd {
 	case "analyze":
 		return cmdAnalyze(args)
-	case "probe", "apps", "record", "selftest", "tone", "spawn", "openapp", "webtone":
+	case "probe", "apps", "record", "selftest", "tone", "spawn", "openapp", "webtone", "lancheck":
 		return runDarwinCommand(cmd, args)
 	}
 	fmt.Print(usage)

@@ -67,7 +67,8 @@ mkapp "$fx/FakeVoIP.app" FakeVoIP com.isshoni.test.fakevoip "Fake VoIP" \
   '<key>NSMicrophoneUsageDescription</key><string>isshoni self-test: this fake voice app holds the microphone so isshoni can detect it.</string>'
 cp "$out/s2.bin" "$fx/voice-cli-helper"
 mkapp "$out/isshoni-s2.app" s2 io.isshoni.spike.s2 "isshoni S2" \
-  '<key>NSAudioCaptureUsageDescription</key><string>isshoni shares your system audio with friends, minus voice apps. This test checks that.</string>'
+  '<key>NSAudioCaptureUsageDescription</key><string>isshoni shares your system audio with friends, minus voice apps. This test checks that.</string>
+  <key>NSLocalNetworkUsageDescription</key><string>isshoni connects to servers and friends on your local network.</string>'
 rm "$out/s2.bin"
 
 # Inner code first.
