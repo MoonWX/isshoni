@@ -4,7 +4,8 @@ import "slices"
 
 // Error is the payload of an error message (01 §8.13). It is a reply when Re is set on the envelope (scope request),
 // otherwise a notification. It carries codes, never English text; Params holds machine-readable values for i18n
-// interpolation.
+// interpolation. Its tstype tag types Params as unknown values in TypeScript, not any (tygo splits a tag at its
+// commas, so the tag spells Record<string, unknown> as an index signature).
 type Error struct {
 	Code         ErrorCode      `json:"code"`
 	Retryable    bool           `json:"retryable"`
@@ -15,7 +16,7 @@ type Error struct {
 	PC           PCKind         `json:"pc,omitempty"`
 	Gen          uint32         `json:"gen,omitempty"`
 	Neg          uint32         `json:"neg,omitempty"`
-	Params       map[string]any `json:"params,omitempty"` // machine-readable values for i18n interpolation; never prose
+	Params       map[string]any `json:"params,omitempty" tstype:"{ [key: string]: unknown }"` // machine-readable values for i18n interpolation; never prose
 }
 
 // ErrorScope says what an error affects, and so what an older client does with a code it doesn't know (01 §12.3).

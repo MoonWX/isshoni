@@ -205,7 +205,7 @@ type DoctorSummary struct {
 type Alert struct {
 	Code     AlertCode      `json:"code"`
 	Severity AlertSeverity  `json:"severity"`
-	Params   map[string]any `json:"params,omitempty"`
+	Params   map[string]any `json:"params,omitempty" tstype:"{ [key: string]: unknown }"`
 }
 
 // ServerStatus is the admin socket's GET /v1/status (04 §12.2, isshoni admin status --json) and doctor's view of a
