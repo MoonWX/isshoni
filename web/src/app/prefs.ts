@@ -2,6 +2,10 @@
 // the page works when storage is blocked). lastRoomId has its own key, isshoni.lastRoomId, because 01 §10.5 reads
 // it for rejoining; the rest is one JSON value under isshoni.prefs. Values that fail validation fall back to the
 // defaults one by one.
+//
+// Other tabs share the storage, and each tab's store holds what it loaded. So a change writes only what changed:
+// lastRoomId only when this tab joins another room, and the JSON value read back, with just the changed fields
+// replaced (dismissals are merged), so a volume change in one tab doesn't undo a room or a dismissal from another.
 import { createStore, type StoreApi } from 'zustand/vanilla';
 
 import { PresetAuto, PresetGame, PresetMovie, PresetText, type Preset } from '../protocol/types.gen';
@@ -81,11 +85,36 @@ export function loadPrefs(storage: KeyValueStore): Prefs {
   };
 }
 
-function save(storage: KeyValueStore, p: Prefs): void {
-  const { lastRoomId, volume, preset, dismissed, debug } = p;
-  storage.set(PREFS_KEY, JSON.stringify({ volume, preset, dismissed, debug }));
-  if (lastRoomId === null) storage.remove(LAST_ROOM_KEY);
-  else storage.set(LAST_ROOM_KEY, lastRoomId);
+type JsonPrefs = Omit<Prefs, 'lastRoomId'>;
+const JSON_FIELDS = ['volume', 'preset', 'dismissed', 'debug'] as const satisfies readonly (keyof JsonPrefs)[];
+
+/** Both tabs' dismissals; an id dismissed in both keeps the later time. */
+function mergeDismissed(
+  stored: Readonly<Record<string, number>>,
+  mine: Readonly<Record<string, number>>,
+): Record<string, number> {
+  const out: Record<string, number> = { ...stored };
+  for (const [id, at] of Object.entries(mine)) out[id] = Math.max(out[id] ?? at, at);
+  return out;
+}
+
+/** Writes the fields that changed from prev to next, on top of what storage holds now. */
+function saveChanges(storage: KeyValueStore, next: Prefs, prev: Prefs): void {
+  if (next.lastRoomId !== prev.lastRoomId) {
+    if (next.lastRoomId === null) storage.remove(LAST_ROOM_KEY);
+    else storage.set(LAST_ROOM_KEY, next.lastRoomId);
+  }
+  const changed = JSON_FIELDS.filter((k) => next[k] !== prev[k]);
+  if (changed.length === 0) return;
+  const { volume, preset, dismissed, debug } = loadPrefs(storage);
+  const merged: { -readonly [K in keyof JsonPrefs]: JsonPrefs[K] } = { volume, preset, dismissed, debug };
+  for (const k of changed) {
+    if (k === 'volume') merged.volume = next.volume;
+    else if (k === 'preset') merged.preset = next.preset;
+    else if (k === 'dismissed') merged.dismissed = mergeDismissed(dismissed, next.dismissed);
+    else merged.debug = next.debug;
+  }
+  storage.set(PREFS_KEY, JSON.stringify(merged));
 }
 
 export function createPrefsStore(storage: KeyValueStore): PrefsStore {
@@ -112,8 +141,8 @@ export function createPrefsStore(storage: KeyValueStore): PrefsStore {
       set({ debug });
     },
   }));
-  store.subscribe((s) => {
-    save(storage, s);
+  store.subscribe((next, prev) => {
+    saveChanges(storage, next, prev);
   });
   return store;
 }

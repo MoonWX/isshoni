@@ -5,6 +5,7 @@
 // - the i18n catalog, so components render real English strings;
 // - (S27) MSW for REST: the server in test/msw.ts listens for the whole file, errors on requests no handler covers,
 //   and drops a test's own handlers after it; api() is bound to a test platform (test/platform.ts) before each test;
+//   globalThis.WebSocket, which MSW patches read-only, stays assignable for fake signaling servers;
 // - (S27) jsdom's page counts as a secure context (a localhost page is one in browsers; jsdom leaves the flag unset);
 // - (S27) FakeRTCPeerConnection.instances is emptied after each test.
 import '@testing-library/jest-dom/vitest';
@@ -26,7 +27,21 @@ if (typeof window !== 'undefined' && !('isSecureContext' in window && window.isS
 
 beforeAll(() => {
   server.listen({ onUnhandledFrame: 'error' });
+  keepGlobalWritable('WebSocket');
 });
+
+/**
+ * MSW's node server also intercepts WebSocket: it replaces globalThis.WebSocket with a configurable but read-only
+ * property, so a plain assignment (protocol/testing's FakeSignalServer.install()) would throw. Making the patched
+ * property writable keeps such fakes working; server.close() still restores the original, since the patch stays
+ * configurable.
+ */
+function keepGlobalWritable(name: 'WebSocket'): void {
+  const d = Object.getOwnPropertyDescriptor(globalThis, name);
+  if (d && 'value' in d && d.writable !== true && d.configurable === true) {
+    Object.defineProperty(globalThis, name, { ...d, writable: true });
+  }
+}
 
 beforeEach(() => {
   configureApi(createTestPlatform());

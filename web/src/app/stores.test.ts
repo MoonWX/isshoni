@@ -30,6 +30,17 @@ describe('uiStore', () => {
     expect(ui.getState().toasts.at(-1)?.message).toBe(`n${String(MAX_TOASTS + 1)}`);
   });
 
+  it('announces each toast: errors assertively, others politely', () => {
+    const ui = createUiStore();
+    ui.getState().toast({ kind: 'success', message: 'Invite copied' });
+    expect(ui.getState().announcements).toMatchObject({ polite: { text: 'Invite copied' }, assertive: null });
+    ui.getState().toast({ kind: 'error', message: 'Room is full' });
+    expect(ui.getState().announcements.assertive?.text).toBe('Room is full');
+    const first = ui.getState().announcements.polite;
+    ui.getState().toast({ kind: 'success', message: 'Invite copied' });
+    expect(ui.getState().announcements.polite?.id).not.toBe(first?.id);
+  });
+
   it('announces to the polite region by default, with a new id each time', () => {
     const ui = createUiStore();
     ui.getState().announce('alex started sharing');
@@ -84,6 +95,45 @@ describe('prefsStore (05 §6.1)', () => {
     });
     prefs.getState().setLastRoomId(null);
     expect(storage.get(LAST_ROOM_KEY)).toBeNull();
+  });
+
+  it("writes only what changed, so one tab doesn't undo another tab's room or dismissals", () => {
+    const storage = createMemoryStorage({ [LAST_ROOM_KEY]: 'lounge' });
+    const tabA = createPrefsStore(storage);
+    const tabB = createPrefsStore(storage);
+    tabA.getState().setLastRoomId('k3m9p2qxw7ht');
+    tabA.getState().dismiss('push-card', 1000);
+    tabA.getState().setPreset('text');
+    // Tab B still holds what it loaded (lounge, no dismissals, preset auto).
+    tabB.getState().setVolume(0.25);
+    tabB.getState().dismiss('install-card', 2000);
+    tabA.getState().dismiss('install-card', 3000);
+    tabB.getState().dismiss('push-card', 500);
+    expect(storage.get(LAST_ROOM_KEY)).toBe('k3m9p2qxw7ht');
+    expect(loadPrefs(storage)).toEqual({
+      volume: 0.25,
+      lastRoomId: 'k3m9p2qxw7ht',
+      preset: 'text',
+      // The later time of each id wins.
+      dismissed: { 'push-card': 1000, 'install-card': 3000 },
+      debug: false,
+    });
+    // Leaving the room in tab B clears it; tab A's next change doesn't bring it back.
+    tabB.getState().setLastRoomId(null);
+    tabA.getState().setDebug(true);
+    expect(storage.get(LAST_ROOM_KEY)).toBeNull();
+    expect(loadPrefs(storage)).toMatchObject({ volume: 0.25, preset: 'text', debug: true });
+  });
+
+  it('writes nothing when a setter changes nothing', () => {
+    const storage = createMemoryStorage();
+    const set = vi.spyOn(storage, 'set');
+    const remove = vi.spyOn(storage, 'remove');
+    const prefs = createPrefsStore(storage);
+    prefs.getState().setLastRoomId(null);
+    prefs.getState().setDebug(false);
+    expect(set).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
   });
 
   it('keeps valid fields of a damaged value and defaults the rest', () => {

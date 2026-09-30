@@ -5,7 +5,15 @@
 // Wire types come from 01's types.gen.ts. The interfaces are declared in full now ("interfaces first", README §4);
 // the browser's sharing (S35/S46), PWA (S38) and push (S77) providers are stubs until their slices land.
 import type { ClientNotifications, ClientRequests, ServerEnvelope, ServerMessages } from '../protocol/registry.gen';
-import type { Caps, ClientInfo, HelloAuth, Preset, ShareKind, ShareParams } from '../protocol/types.gen';
+import type {
+  Caps,
+  ClientInfo,
+  HelloAuth,
+  MessageTypeHello,
+  Preset,
+  ShareKind,
+  ShareParams,
+} from '../protocol/types.gen';
 
 export type PlatformKind = 'browser' | 'desktop' | 'mobile';
 export type PushSupport = 'supported' | 'needs-install' | 'denied' | 'unsupported';
@@ -74,17 +82,22 @@ export interface Platform {
 // ---- sharing ----
 
 /**
- * The part of 01's SignalClient (protocol/signal-client.ts) that sharing uses, as a structural type: SignalClient
- * satisfies it, and platform/ doesn't depend on the class. The signatures are 01 §16's.
+ * The part of 01's SignalClient (protocol/signal-client.ts, S20) that sharing uses, as a structural type: SignalClient
+ * satisfies it, and platform/ doesn't depend on the class. The signatures are SignalClient's own (01 §16): request()
+ * never sends hello (the client does), and a listener gets the envelope of its own message type. Once
+ * signal-client.ts is on this branch, ShareContext.signal can be SignalClient itself (05 §8).
  */
 export interface SignalClientLike {
-  request<K extends keyof ClientRequests>(
+  request<K extends Exclude<keyof ClientRequests, typeof MessageTypeHello>>(
     type: K,
     data: ClientRequests[K]['data'],
     opts?: { timeoutMs?: number },
   ): Promise<ClientRequests[K]['result']>;
   notify<K extends keyof ClientNotifications>(type: K, data: ClientNotifications[K]): boolean;
-  on<K extends keyof ServerMessages>(type: K, fn: (data: ServerMessages[K], env: ServerEnvelope) => void): () => void;
+  on<K extends keyof ServerMessages>(
+    type: K,
+    fn: (data: ServerMessages[K], env: ServerEnvelope<K>) => void,
+  ): () => void;
   probe(): void;
 }
 

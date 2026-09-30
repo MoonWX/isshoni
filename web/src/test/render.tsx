@@ -6,11 +6,11 @@ import { createMemoryRouter, RouterProvider, type DataRouter, type RouteObject }
 
 import { AppProviders } from '../app/App';
 import { createAppServices, type AppServices } from '../app/context';
+import { seedInfo } from '../app/info';
 import { createQueryClient } from '../app/queryClient';
 import { createAppRoutes } from '../app/router';
 import type { Platform } from '../platform/types';
 import type { Info } from '../protocol/api.gen';
-import { queryKeys } from '../protocol/queryKeys';
 import { configureApi } from '../protocol/rest';
 import { infoFixture } from './msw';
 import { createTestPlatform } from './platform';
@@ -32,7 +32,7 @@ export function createTestServices({
     ...queryClient.getDefaultOptions(),
     queries: { ...queryClient.getDefaultOptions().queries, retry: false },
   });
-  if (info) queryClient.setQueryData(queryKeys.info, info);
+  if (info) seedInfo(queryClient, info);
   return createAppServices(platform, queryClient);
 }
 

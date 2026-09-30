@@ -285,3 +285,20 @@ describe('fake media', () => {
     }
   });
 });
+
+describe('test setup (setup.ts)', () => {
+  it('leaves globalThis.WebSocket assignable under MSW, so a fake signaling server can take it over', () => {
+    const g = globalThis as { WebSocket?: unknown };
+    const previous = g.WebSocket;
+    const FakeSocket = function FakeSocket() {
+      // A stand-in constructor; only its identity matters here.
+    };
+    try {
+      g.WebSocket = FakeSocket;
+      expect(g.WebSocket).toBe(FakeSocket);
+    } finally {
+      g.WebSocket = previous;
+    }
+    expect(g.WebSocket).toBe(previous);
+  });
+});

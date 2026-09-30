@@ -104,19 +104,31 @@ describe('Toasts', () => {
     vi.useRealTimers();
   });
 
-  it('shows toasts with roles by kind; the action runs and dismisses; ✕ dismisses', async () => {
-    const { services } = renderWithApp(<Toasts />);
+  it('lists toasts as plain list items and announces them through the live regions; action and ✕ dismiss', async () => {
+    const { services } = renderWithApp(
+      <>
+        <Announcer />
+        <Toasts />
+      </>,
+    );
     const run = vi.fn();
     act(() => {
       services.ui.getState().toast({ kind: 'info', message: 'bo started sharing', action: { label: 'Watch', run } });
       services.ui.getState().toast({ kind: 'error', message: 'Room is full' });
     });
     const region = screen.getByRole('region', { name: 'Notifications' });
-    expect(within(region).getByRole('status')).toHaveTextContent('bo started sharing');
-    expect(within(region).getByRole('alert')).toHaveTextContent('Room is full');
+    const items = within(within(region).getByRole('list')).getAllByRole('listitem');
+    expect(items.map((li) => li.textContent)).toEqual([
+      expect.stringContaining('bo started sharing'),
+      expect.stringContaining('Room is full'),
+    ]);
+    expect(within(region).queryByRole('status')).not.toBeInTheDocument();
+    expect(within(region).queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByTestId('announcer-polite')).toHaveTextContent('bo started sharing');
+    expect(screen.getByTestId('announcer-assertive')).toHaveTextContent('Room is full');
     await userEvent.click(screen.getByRole('button', { name: 'Watch' }));
     expect(run).toHaveBeenCalledOnce();
-    expect(screen.queryByText('bo started sharing')).not.toBeInTheDocument();
+    expect(within(region).queryByText('bo started sharing')).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
     expect(services.ui.getState().toasts).toEqual([]);
   });

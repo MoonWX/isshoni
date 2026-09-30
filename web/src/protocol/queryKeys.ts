@@ -1,6 +1,8 @@
 // TanStack Query keys for the REST resources (05 §6.2). Every query uses one of these, so 01's `invalidate` topics
 // (invalidate.ts) reach them. A key with parameters extends its base key (['invites', {state: 'all'}]), and
-// invalidating the base key also invalidates every parameterized form (TanStack matches key prefixes).
+// invalidating the base key also invalidates every parameterized form (TanStack matches key prefixes). ['me'] is the
+// exception: ['me','sessions'] and ['me','devices'] are resources of their own, so the `me` topic invalidates ['me']
+// exactly.
 
 export const queryKeys = {
   /** GET /api/v1/info: seeded at boot (05 §4). */

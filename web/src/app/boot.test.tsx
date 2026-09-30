@@ -16,16 +16,12 @@ import { fragmentTokenKey, loadInfo, stashFragmentToken, startApp, type StartedA
 import { createAppRoutes } from './router';
 import { CHANNEL_NAME } from './session';
 import { useApp } from './context';
-import { useQuery } from '@tanstack/react-query';
+import { useInfo } from './info';
 
 /** A tiny app for boot tests: shows the path and the seeded server name. */
 function AppReady() {
   const { queryClient } = useApp();
-  const info = useQuery<Info>({
-    queryKey: queryKeys.info,
-    queryFn: () => Promise.reject(new Error('seeded at boot')),
-    staleTime: Infinity,
-  });
+  const info = useInfo();
   return (
     <main>
       <h1>app ready</h1>

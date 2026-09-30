@@ -1,7 +1,9 @@
 // Toasts (05 §6.1 uiStore): short messages at the bottom of the screen ("Sharing was stopped from another tab",
-// "bo started sharing [Watch]"). Errors use role="alert", others role="status". A toast leaves after its duration;
-// the timer pauses while the pointer is over it or focus is inside it (WCAG 2.2.1), and ✕ dismisses it at once.
-// Under prefers-reduced-motion they appear without sliding (05 §16.6).
+// "bo started sharing [Watch]"), a plain list in a labelled region. Screen readers hear them through the Announcer's
+// persistent live regions (uiStore.toast() announces the message: errors assertively, others politely), because a
+// live region inserted together with its text is announced unreliably, and a role on the <li> would break the list.
+// A toast leaves after its duration; the timer pauses while the pointer is over it or focus is inside it
+// (WCAG 2.2.1), and ✕ dismisses it at once. Under prefers-reduced-motion they appear without sliding (05 §16.6).
 import { CircleAlert, CircleCheck, Info, X } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -64,7 +66,7 @@ function ToastItem({ toast, onDismiss }: { toast: Toast; onDismiss: () => void }
 
   const Icon = ICONS[toast.kind];
   return (
-    <li ref={item} className={cx(styles.toast, styles[toast.kind])} role={toast.kind === 'error' ? 'alert' : 'status'}>
+    <li ref={item} className={cx(styles.toast, styles[toast.kind])} data-kind={toast.kind}>
       <Icon className={styles.icon} aria-hidden="true" />
       <p className={styles.message}>{toast.message}</p>
       {toast.action && (

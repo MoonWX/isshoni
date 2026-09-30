@@ -8,9 +8,8 @@
 //  3. i18next with the bundled en.json; <html lang>.
 //  4. GET /api/v1/info, retried after 1, 2 and 4 s: unreachable → Offline (retries on `online` and every 10 s);
 //     setupRequired and the path isn't /setup → NotSetUp; any other failure → Fatal.
-//  5. The QueryClient (seeded with info) and the router; render.
+//  5. The QueryClient (seeded with info: app/info.ts, which pages read through useInfo()) and the router; render.
 //  6. After the first render, production builds only: register the service worker when the browser is idle.
-import type { QueryClient } from '@tanstack/react-query';
 import { StrictMode, useCallback, useEffect, useRef, useState } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { I18nextProvider } from 'react-i18next';
@@ -23,11 +22,11 @@ import { registerServiceWorker } from '../platform/browser/pwa';
 import { detectPlatform } from '../platform/detect';
 import type { KeyValueStore, Platform } from '../platform/types';
 import type { Info } from '../protocol/api.gen';
-import { queryKeys } from '../protocol/queryKeys';
 import { ApiError, api, configureApi, isRetryableError } from '../protocol/rest';
 import { PageSpinner } from '../ui/Spinner';
 import { App } from './App';
 import { createAppServices, type AppServices } from './context';
+import { seedInfo } from './info';
 import { clearMe } from './me';
 import { createQueryClient } from './queryClient';
 import { createAppRoutes } from './router';
@@ -222,10 +221,6 @@ function BootGate({
       }
       return <App services={services} router={getRouter()} />;
   }
-}
-
-function seedInfo(queryClient: QueryClient, info: Info): void {
-  queryClient.setQueryData(queryKeys.info, info);
 }
 
 /** What startApp started: the React root and, past steps 1–2, the services. stop() unmounts and unhooks. */

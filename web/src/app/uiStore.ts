@@ -65,7 +65,10 @@ export interface UiState {
   /** When set, this screen replaces the router. */
   readonly screen: AppScreen | null;
 
-  /** Shows a toast; returns its id. Default duration: 5 s, errors 8 s. */
+  /**
+   * Shows a toast and announces its message (errors assertively, others politely); returns its id. Default
+   * duration: 5 s, errors 8 s.
+   */
   toast(t: ToastInput): number;
   dismissToast(id: number): void;
   /** Sends text to a live region (screen readers only). */
@@ -98,7 +101,12 @@ export function createUiStore(): UiStore {
         id,
         durationMs: t.durationMs === undefined ? DEFAULT_DURATION[t.kind] : t.durationMs,
       };
-      set((s) => ({ toasts: [...s.toasts, toast].slice(-MAX_TOASTS) }));
+      const politeness: Politeness = t.kind === 'error' ? 'assertive' : 'polite';
+      const announcement: Announcement = { id: nextId++, text: t.message };
+      set((s) => ({
+        toasts: [...s.toasts, toast].slice(-MAX_TOASTS),
+        announcements: { ...s.announcements, [politeness]: announcement },
+      }));
       return id;
     },
     dismissToast(id) {
