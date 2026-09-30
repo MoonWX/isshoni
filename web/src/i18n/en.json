@@ -1,6 +1,176 @@
 {
   "common": {
     "appName": "isshoni",
-    "tagline": "Watch your friends' screens together"
+    "tagline": "Watch your friends' screens together",
+    "loading": "Loading…",
+    "reload": "Reload",
+    "close": "Close",
+    "cancel": "Cancel",
+    "copy": "Copy",
+    "copied": "Copied",
+    "goHome": "Go to isshoni",
+    "notFound": {
+      "title": "Nothing here",
+      "body": "This page doesn't exist. Check the link, or go back to isshoni."
+    },
+    "pageUnavailable": {
+      "title": "Not in this build yet",
+      "body": "This page is part of isshoni, but the version running on this server doesn't have it yet."
+    },
+    "routeError": {
+      "title": "Something went wrong",
+      "body": "This page stopped working. Reload to try again."
+    },
+    "screens": {
+      "offline": {
+        "title": "Can't reach the server",
+        "body": "Check your internet connection. isshoni keeps trying and opens as soon as the server answers.",
+        "retry": "Try now",
+        "retrying": "Trying…"
+      },
+      "needsHttps": {
+        "title": "isshoni needs HTTPS",
+        "body": "Screen sharing, notifications and the app itself only work over a secure connection. Ask your admin to check the TLS setup."
+      },
+      "notSetUp": {
+        "title": "This server isn't set up yet",
+        "body": "Whoever runs the server creates the first admin account. On the server, run:",
+        "docker": "With Docker:",
+        "after": "Then open the link it prints."
+      },
+      "unsupported": {
+        "title": "This browser can't run isshoni",
+        "body": "isshoni needs WebRTC for video, and this browser doesn't have it or has it turned off. Open this page in a current version of Chrome, Edge, Firefox or Safari."
+      },
+      "fatal": {
+        "title": "Something went wrong",
+        "body": "isshoni stopped. Reload the page to start again.",
+        "code": "Error: {{code}}",
+        "accountDisabled": {
+          "title": "Your account was disabled",
+          "body": "An admin turned off your account. Ask them if you think this is a mistake."
+        },
+        "tooManyConnections": {
+          "title": "isshoni is open in too many tabs",
+          "body": "Close the isshoni tabs you don't need, then reload this one."
+        },
+        "media": {
+          "title": "Can't connect media",
+          "body": "The video connection failed twice in a row. Reload the page to try again."
+        }
+      },
+      "versionMismatch": {
+        "title": "This page is out of date",
+        "body": "The server runs a newer isshoni. Reload to get the matching version.",
+        "serverOlder": "The server runs an older isshoni than this page. Ask your admin to update the server.",
+        "stillStale": "Reloading didn't help. Ask your admin to check the server.",
+        "versions": "This page: {{client}} · Server: {{server}}"
+      }
+    }
+  },
+  "a11y": {
+    "notifications": "Notifications",
+    "dismiss": "Dismiss",
+    "loading": "Loading",
+    "stepOf": "Step {{current}} of {{total}}:",
+    "stepDoneOf": "Step {{current}} of {{total}}, done:"
+  },
+  "errors": {
+    "unknown": "Something went wrong ({{code}}).",
+    "withRef": "{{message}} Reference: {{ref}}",
+    "bad_message": "The app sent something the server couldn't read. Reload the page.",
+    "hello_required": "The connection started the wrong way. Reload the page.",
+    "hello_timeout": "The connection took too long to start.",
+    "idle_timeout": "The connection went quiet for too long.",
+    "protocol_unsupported": "This page and the server run different versions. Reload the page.",
+    "client_outdated": "This app is too old for the server. Update it.",
+    "unauthenticated": "You're signed out. Log in again.",
+    "session_revoked": "You were signed out.",
+    "account_disabled": "Your account was disabled. Ask an admin.",
+    "too_many_connections": "isshoni is open in too many tabs. Close some of them.",
+    "rate_limited": {
+      "wait_one": "Too many attempts. Try again in {{count}} second.",
+      "wait_other": "Too many attempts. Try again in {{count}} seconds.",
+      "later": "Too many attempts. Try again in a moment."
+    },
+    "slow_connection": "Your connection couldn't keep up with the server.",
+    "replaced": "This connection continued in a newer one.",
+    "server_shutdown": "The server is restarting.",
+    "internal": "Something went wrong on the server.",
+    "bad_request": "The server couldn't accept that request.",
+    "unknown_type": "The server doesn't know that request. Reload the page.",
+    "message_too_large": "That's too much data for one message.",
+    "forbidden": "You're not allowed to do that.",
+    "feature_disabled": "That feature is turned off on this server.",
+    "not_in_room": "You're not in a room.",
+    "room_not_found": "That room doesn't exist anymore.",
+    "room_full": "This room is full.",
+    "kicked": "You were removed from the room.",
+    "room_closed": "An admin deleted this room.",
+    "share_not_found": "That share has already ended.",
+    "share_limit": "No more shares can start right now.",
+    "codec_not_supported": "This browser can't send the video format isshoni uses (H.264). Use Chrome or Edge.",
+    "sdp_invalid": "The media connection couldn't be set up.",
+    "stale_negotiation": "The media connection changed while it was being set up.",
+    "agent_target_not_found": "None of your other isshoni apps is connected.",
+    "validation_failed": "Check the highlighted fields.",
+    "unsupported_media_type": "The server couldn't read that request. Reload the page.",
+    "payload_too_large": "That's too much data for one request.",
+    "method_not_allowed": "The server doesn't allow that. Reload the page.",
+    "invalid_credentials": "Wrong username or password.",
+    "wrong_password": "Your current password isn't right.",
+    "csrf_failed": "The server refused a request that seemed to come from another site. Reload the page.",
+    "account_pending": "An admin hasn't approved your account yet. Try logging in later.",
+    "registration_closed": "This server isn't taking new accounts.",
+    "invite_required": "You need an invite link to join this server.",
+    "not_found": "That doesn't exist.",
+    "user_not_found": "That user doesn't exist anymore.",
+    "invite_invalid": "This invite link doesn't work. Ask for a new one.",
+    "invite_expired": "This invite link has expired. Ask for a new one.",
+    "invite_used_up": "This invite link has been used up. Ask for a new one.",
+    "invite_revoked": "This invite link was revoked. Ask for a new one.",
+    "setup_unavailable": "This server is already set up. Log in instead.",
+    "setup_token_invalid": "This setup link doesn't work anymore. Run the setup-url command on the server for a new one.",
+    "reset_token_invalid": "This reset link doesn't work anymore. Ask an admin for a new one.",
+    "username_taken": "That username is taken.",
+    "room_name_taken": "A room with that name already exists.",
+    "last_admin": "The server needs at least one active admin.",
+    "self_action_forbidden": "Change your own account on the Account page.",
+    "room_is_default": "The default room can't be deleted.",
+    "limit_reached": {
+      "rooms": "This server has as many rooms as it can hold. Delete one first.",
+      "invites": "This server has as many active invites as it allows. Revoke some first.",
+      "member_invites": "You have as many active invites as you're allowed. Revoke some first.",
+      "pending_signups": "Too many sign-ups are waiting for approval. Try again later.",
+      "generic": "This server reached one of its limits."
+    },
+    "setting_locked": "This setting is fixed in the server's config file ({{field}}).",
+    "push_endpoint_rejected": "The server can't send notifications to this browser.",
+    "push_unavailable": "Notifications are turned off on this server.",
+    "server_busy": "The server is busy. Try again in a moment.",
+    "bad_sdp": "The connection test sent something the server couldn't use.",
+    "transport_disabled": "That connection type is turned off on this server.",
+    "doctor_busy": "A check is already running. Try again in a few seconds.",
+    "not_ready": "The server is still starting. Try again in a moment.",
+    "backup_invalid": "That backup file isn't valid.",
+    "backup_newer": "That backup comes from a newer version of isshoni.",
+    "restore_in_progress": "A restore is already running.",
+    "insufficient_storage": "The server is out of disk space.",
+    "invalid_token": "Your sign-in expired. Log in again.",
+    "authorization_pending": "Waiting for you to approve this device.",
+    "slow_down": "Checking too often. Wait a moment.",
+    "access_denied": "The device link was declined.",
+    "expired_token": "The device code expired. Start again.",
+    "invalid_grant": "Your sign-in doesn't work anymore. Log in again.",
+    "device_code_invalid": "That code doesn't work or has expired.",
+    "local": {
+      "connection_lost": "The connection dropped before the server answered.",
+      "request_timeout": "The server didn't answer in time.",
+      "not_ready": "Not connected to the server yet.",
+      "capture_failed": "Couldn't capture that. Another app may be blocking it.",
+      "h264_unavailable": "This browser can't send H.264 video. Use Chrome or Edge.",
+      "webrtc_failed": "Couldn't set up the video connection.",
+      "offline": "You're offline. Check your connection."
+    }
   }
 }

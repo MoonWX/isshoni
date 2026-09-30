@@ -36,17 +36,21 @@ func newTestTransport(t *testing.T, opts TransportOptions) *Transport {
 	return tr
 }
 
-// fakePortMux is a PortMux whose ICE sub-listener is a plain TCP listener on 127.0.0.1, standing in for the 443
-// multiplexer until README S26, with the shared ICE connection count.
-func fakePortMux(t *testing.T, maxICE int) *PortMux {
+// newTestPortMux binds a PortMux on 127.0.0.1:0 (unless opts.Addr says otherwise) and closes it when the test ends.
+func newTestPortMux(t *testing.T, opts PortMuxOptions) *PortMux {
 	t.Helper()
-	var lc net.ListenConfig
-	ln, err := lc.Listen(context.Background(), "tcp4", "127.0.0.1:0")
+	if opts.Addr == "" {
+		opts.Addr = "127.0.0.1:0"
+	}
+	m, err := ListenPortMux(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := &PortMux{addr: ln.Addr(), ice: ln, iceConns: newConnLimiter(maxICE)}
-	t.Cleanup(func() { _ = m.Close() })
+	t.Cleanup(func() {
+		if err := m.Close(); err != nil {
+			t.Errorf("PortMux.Close: %v", err)
+		}
+	})
 	return m
 }
 
@@ -60,7 +64,7 @@ func TestTransportAdvertised(t *testing.T) {
 		iface("eth0", 0, "192.168.1.20", "2001:db8::20"),
 		iface("docker0", 0, "172.17.0.1"),
 	}}
-	pm := fakePortMux(t, 0)
+	pm := newTestPortMux(t, PortMuxOptions{})
 	udp := newMemPacketConn("192.168.1.20:7882")
 	var counter TransferCounter
 	tr := newTestTransport(t, TransportOptions{
@@ -120,7 +124,7 @@ func TestTransportAdvertised(t *testing.T) {
 // TestTransportSharedICELimit: the 7882/tcp listener shares the per-IP ICE count with the 443 multiplexer, so the
 // 65th ICE-TCP connection across both ports is closed.
 func TestTransportSharedICELimit(t *testing.T) {
-	pm := fakePortMux(t, 0)
+	pm := newTestPortMux(t, PortMuxOptions{})
 	key := IPKey(netip.MustParseAddr("127.0.0.1"))
 	for range DefaultMaxICEConnsPerIP - 1 { // 63 connections open on 443
 		if !pm.iceConns.acquire(key) {
@@ -304,7 +308,7 @@ func TestTransportErrors(t *testing.T) {
 }
 
 func TestTransportCloseIdempotent(t *testing.T) {
-	pm := fakePortMux(t, 0)
+	pm := newTestPortMux(t, PortMuxOptions{})
 	tr, err := NewTransport(context.Background(), TransportOptions{
 		UDPAddr: "127.0.0.1:0", TCPAddr: "127.0.0.1:0", PortMux: pm, IncludeLoopback: true,
 		Interfaces: &fakeIfaces{ifs: []Interface{loIface()}},

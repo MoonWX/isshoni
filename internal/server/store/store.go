@@ -7,8 +7,8 @@
 // ErrNeedsOperator. All reads and writes go through DB.Read and DB.Write, which hand the callback a *Q bound to one
 // transaction.
 //
-// The store imports only the standard library, modernc.org/sqlite and internal/protocol/api; it never reads config
-// (the wiring fills Options).
+// The store imports only the standard library, modernc.org/sqlite, internal/protocol/api and, for the serverName
+// setting, golang.org/x/text's PRECIS profiles (03 §2.2); it never reads config (the wiring fills Options).
 package store
 
 import (
@@ -114,7 +114,8 @@ type DB struct {
 //  7. upsert the meta keys created_at (if missing) and last_app_version;
 //  8. EnsureDefaultRoom;
 //  9. open the reader pool;
-//  10. run PRAGMA optimize=0x10002.
+//  10. load the settings cache (03 §9);
+//  11. run PRAGMA optimize=0x10002.
 //
 // Errors a restart can't fix wrap ErrNeedsOperator. A cancelled ctx never does.
 func Open(ctx context.Context, o Options) (_ *DB, err error) {
@@ -144,12 +145,12 @@ func Open(ctx context.Context, o Options) (_ *DB, err error) {
 	writer.SetConnMaxLifetime(0)
 	writer.SetConnMaxIdleTime(0)
 	db := &DB{
-		opts:     o,
-		writer:   writer,
-		settings: newSettingsCache(),
-		log:      o.Logger,
-		now:      o.Clock,
+		opts:   o,
+		writer: writer,
+		log:    o.Logger,
+		now:    o.Clock,
 	}
+	db.settings = newSettingsCache(db)
 	defer func() {
 		if err != nil {
 			_ = db.closePools() // the Open error is the one that matters
@@ -193,7 +194,12 @@ func Open(ctx context.Context, o Options) (_ *DB, err error) {
 		return nil, openErr(ctx, o.Path, "store: open readers", err)
 	}
 
-	// 10. Analyze the tables that need it, as SQLite recommends right after opening (cheap on a small DB).
+	// 10. The settings cache.
+	if err := db.settings.load(ctx); err != nil {
+		return nil, openErr(ctx, o.Path, "store: load settings", err)
+	}
+
+	// 11. Analyze the tables that need it, as SQLite recommends right after opening (cheap on a small DB).
 	if _, err := writer.ExecContext(ctx, "PRAGMA optimize=0x10002"); err != nil {
 		return nil, openErr(ctx, o.Path, "store: PRAGMA optimize", err)
 	}

@@ -56,7 +56,9 @@ type RouterOptions struct {
 //
 // pattern is the http.ServeMux pattern that routes the request ("/api/v1/", "GET /ws", "GET /healthz", "/" for the
 // SPA and for the JSON 404 of reserved paths no route handles), also for responses written before routing (the
-// gate's 503, the Host check's 421). status is the final status (101 for a WebSocket upgrade, 500 for a panic) and
+// gate's 503, the Host check's 421). A request that one of 03's API routes serves reports that route's API pattern
+// instead ("GET /api/v1/info", also for routes added with API.Handle); the API's JSON 404 and 405 keep "/api/v1/".
+// status is the final status (101 for a WebSocket upgrade, 500 for a panic) and
 // bytes the response body bytes written through the ResponseWriter (not the bytes of a hijacked connection).
 type RouteObserver interface {
 	ObserveRoute(pattern string, status int, bytes int64)

@@ -11,10 +11,10 @@ import (
 // when RetryAfter is set. It never carries English text.
 type Error struct {
 	Code       string            `json:"code"`
-	Fields     map[string]string `json:"fields,omitempty"`     // validation_failed: field JSON name → Field* code
-	Params     map[string]any    `json:"params,omitempty"`     // e.g. {"limit": "rooms"} (Param* keys); never prose
-	RetryAfter int               `json:"retryAfter,omitempty"` // seconds; also sent as the Retry-After header
-	RequestID  string            `json:"requestId,omitempty"`  // 04's request ID, set on 500 internal (bug reports)
+	Fields     map[string]string `json:"fields,omitempty"`                                     // validation_failed: field JSON name → Field* code
+	Params     map[string]any    `json:"params,omitempty" tstype:"{ [key: string]: unknown }"` // e.g. {"limit": "rooms"} (Param* keys); never prose
+	RetryAfter int               `json:"retryAfter,omitempty"`                                 // seconds; also sent as the Retry-After header
+	RequestID  string            `json:"requestId,omitempty"`                                  // 04's request ID, set on 500 internal (bug reports)
 }
 
 // Error implements the error interface.

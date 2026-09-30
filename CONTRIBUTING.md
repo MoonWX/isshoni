@@ -33,6 +33,11 @@ Dev notes:
 - Safari and phones need HTTPS: test them against a VPS install of a prerelease rather than adding TLS to the dev
   setup.
 - On macOS, Local Network privacy can block a browser's LAN ICE candidates; dev uses loopback, which is not affected.
+- On macOS, if cgo or `-race` builds (`task test:go`, golangci-lint) fail to link with an `arm64e.x1` `.tbd` error,
+  the Command Line Tools linker is older than the SDK. Update the Command Line Tools, or run with `SDKROOT` set to
+  Xcode's SDK:
+  `export SDKROOT=$(DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun --sdk macosx --show-sdk-path)`.
+  A "built for newer macOS version" linker warning after that is harmless.
 
 ## Tasks
 

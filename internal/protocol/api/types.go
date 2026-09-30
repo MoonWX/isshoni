@@ -488,7 +488,7 @@ type AuditEntry struct {
 	Actor   AuditRef       `json:"actor"`
 	Target  *AuditRef      `json:"target,omitempty"` // absent when the action has no target
 	IP      string         `json:"ip,omitempty"`
-	Detail  map[string]any `json:"detail"` // small, never secrets; {} when empty
+	Detail  map[string]any `json:"detail" tstype:"{ [key: string]: unknown }"` // small, never secrets; {} when empty
 }
 
 // AuditRef is an audit row's actor or target. Actor kinds: user, cli, system, anonymous. Target kinds: user,

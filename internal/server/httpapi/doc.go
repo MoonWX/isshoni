@@ -17,7 +17,21 @@
 // No access log: only 5xx responses log one line (route pattern, status, request ID), and a panic or an internal
 // error logs its cause instead. URLs, queries and bodies are never logged.
 //
+// The API part (api.go, deps.go, info.go; 03 §12):
+//   - API: 03's REST API, mounted by the router at /api/v1/. Its chain (03 §12.1): body limit (16 KiB for auth and
+//     device endpoints, 64 KiB elsewhere) → no-store on every response → route lookup (JSON 404 not_found, 405
+//     method_not_allowed with Allow; a matched route reports its own pattern to the RouteObserver) → any
+//     Authorization header is 401 unauthenticated (no bearer tokens in M1, 03 §7.5) → CSRF (auth.Service.CSRF,
+//     03 §7.5) → authenticate (User and Admin routes) → MaybeRotate → access check → handler. API.Handle registers
+//     other docs' routes behind the same chain, with an Access level (Public, User, Admin); PrincipalFrom gives a
+//     handler its caller.
+//   - The interfaces the wiring implements (04 §6.6): Signal (01's hub), Push (04's push service) and InfoSource
+//     (04's build information), each declared in full; nil Signal and Info have built-in defaults, nil Push means
+//     push is off.
+//   - GET /api/v1/info (03 §12.4.1). The other endpoints of 03 §12.3, and DashboardAccounts, come with the later
+//     account slices (README S30 on).
+//
 // Imports (04 §2): config, logx, version, store, auth and internal/protocol(/api); never ops, push, netx, tlsmgr,
-// signal, sfu or sfuplane, which reach the router through small interfaces declared here (RouteObserver) or through
-// the wiring.
+// signal, sfu or sfuplane, which reach this package through small interfaces declared here (RouteObserver, Signal,
+// Push, InfoSource) that the wiring implements.
 package httpapi

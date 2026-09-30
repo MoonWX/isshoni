@@ -7,28 +7,34 @@
 // wiring (04 §6.6) adapts each one; package signaltest has fakes for tests. The hub never imports config, store,
 // auth or sfu.
 //
-// # What exists so far (README slice S11, 01 slice P3)
+// # What exists so far (README slices S11 and S19, 01 slices P3 and P4)
 //
 //   - upgrade.go: the six upgrade checks of 01 §3.1 (shutdown, the exact Origin allowlist, cookie authentication,
 //     pre-auth limits per IP key and server-wide, 16 connections per user, Accept) and the hello handshake of
 //     01 §8.2 (validation, cookie or bearer authentication, revalidation, version negotiation, the client floor);
 //   - conn.go: the socket (reader, writer with a bounded send queue, pinger) and the connection actor with its idle
-//     timeout, periodic revalidation, revocation and shutdown;
+//     timeout, periodic revalidation, revocation and shutdown; a connection leaves its room when it closes;
 //   - dispatch.go: message handling: bad_message, the size limits, unknown types, roles, features, the per-type
-//     rate limits, ping/pong, caps and stats bookkeeping, and not_in_room outside a room;
+//     rate limits, ping/pong, room.join and room.leave, caps and stats bookkeeping, and not_in_room outside a room;
+//   - room.go: rooms and participants (01 §4.1, §8.4–8.6): a participant merges a user's connections in a room;
+//     room.state snapshots are coalesced (at most one broadcast per StateCoalesce per room) and encoded once per
+//     broadcast; room.events; watchers from the desired subscriptions; the room_full policy; the MediaPeer of each
+//     room membership and its MediaSink;
 //   - ratelimit.go: token buckets, the global message and byte limits with the flood rule, per-type limits;
 //   - resume.go: the resume token format (01 §10.3); metrics.go: the Prometheus series of 01 §18;
 //   - hub.go: Config, Deps, Policy, New, Ready, Shutdown, Notify, CloseConnections, UpdateUser, CloseRoom, Snapshot.
 //
-// Later slices fill in the rest of the declared interface: rooms, participants, room.state and room.event (S19),
-// resume and grace (S28), shares, negotiation and the MediaPlane calls (S40), and the same-user relay (S51). Until
-// then those requests get error{internal} with a ref, and the log says what is not implemented yet.
+// Later slices fill in the rest of the declared interface: resume and grace (S28), shares, subscriptions,
+// negotiation and the other MediaPlane calls (S40), and the same-user relay (S51). Until then those requests get
+// error{internal} with a ref, and the log says what is not implemented yet.
 //
 // # Concurrency
 //
 // Each connection is one actor goroutine that owns the connection's state; other goroutines reach it through its
 // inbox (post never blocks; a full inbox closes the connection as slow_connection). Each socket has a reader (the
-// ServeHTTP goroutine), a writer that drains the send queue, and a pinger. The hub lock guards the maps of sockets
-// and connections and is never held while calling a dependency, writing to a socket, or sending on a channel that
-// can block. Lock order: hub → room → connection.
+// ServeHTTP goroutine), a writer that drains the send queue, and a pinger. The hub lock guards the maps of sockets,
+// connections and rooms; each room's lock guards its participants, shares and snapshot state. No lock is held while
+// calling a dependency (a MediaPeer included), writing to a socket, or sending on a channel that can block: a room
+// change collects its messages and posts them to the connections' actors after unlocking. A scheduled room.state
+// broadcast runs on its timer's goroutine, counted like the others. Lock order: hub → room → connection.
 package signal

@@ -86,7 +86,8 @@ internal/server/httpapi/
 ```
 
 **Import rules** (the single table is 04 §2, which is also the `depguard` source; these are 03's rows):
-- `store` imports only `internal/protocol/api` (plus the stdlib and modernc).
+- `store` imports only `internal/protocol/api` (plus the stdlib, modernc and `golang.org/x/text/secure/precis`, which
+  checks the `serverName` setting, §9).
 - `auth` imports `store` and `internal/protocol/api`, never `config` or `httpapi`.
 - `httpapi` may import `config`, `logx`, `store`, `auth`, `internal/protocol` and `internal/protocol/api`, and never
   `ops`, `push`, `netx`, `tlsmgr`, `signal`, `sfu` or `sfuplane`. What it needs from them comes through small
@@ -95,7 +96,8 @@ internal/server/httpapi/
 
 ### 2.2 New dependencies (all permissive)
 
-- `golang.org/x/text` (BSD-3-Clause): `secure/precis` for usernames, passwords and room names.
+- `golang.org/x/text` (BSD-3-Clause): `secure/precis` for usernames, passwords, room names and the `serverName`
+  setting.
 - A **common-password list**: SecLists `10k-most-common` (MIT), filtered to entries of 8 characters or more, lowercased,
   gzipped and embedded (about 25 KB). The attribution goes into `THIRD_PARTY_NOTICES` (06).
 - Nothing else. argon2 comes from `golang.org/x/crypto/argon2`. CSRF uses the stdlib. The limiter is about 80 lines
@@ -223,7 +225,9 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   7. upsert the meta keys `created_at` (if missing) and `last_app_version`;
   8. `EnsureDefaultRoom`;
   9. open the reader pool;
-  10. run `PRAGMA optimize=0x10002`.
+  10. load the settings cache (§9): a bad or unknown row is logged at WARN with its key (never the value) and
+      ignored;
+  11. run `PRAGMA optimize=0x10002`.
 - **Errors a restart can't fix**: the store exports
   `var ErrNeedsOperator = errors.New("store: needs operator action")`. `Open` returns each of these wrapped with it
   (`fmt.Errorf("…: %w", ErrNeedsOperator)`), keeping the message shown above:
@@ -1193,7 +1197,9 @@ reason to its `error{code, retryable:false}` message and close code (01 §12.1, 
      hash (outside the transaction), then one `Write`:
      - check the token hash is unexpired and **no admin exists**;
      - create the user (`role=admin`, `created_via=setup`) and a session;
-     - delete all setup tokens and set `server.name` if it was given;
+     - delete all setup tokens and set `server.name` if it was given, with `db.Settings().UpdateTx` in the same
+       `Write` (it writes its own `settings.changed` audit row; the handler calls the returned `apply` after the
+       commit, §9);
      - `EnsureDefaultRoom`, and audit `setup.completed`.
      
      The response is 201 with the session cookie. A race between two tabs leaves exactly one admin: the loser gets 404
@@ -1636,6 +1642,9 @@ func (c *SettingsCache) Defaults() Settings
 func (c *SettingsCache) Locked() []string   // JSON names pinned by config
 func (c *SettingsCache) Pin(field string, value any) error // 04, before serving: a TOML key forces a value
 func (c *SettingsCache) Update(ctx context.Context, patch map[string]json.RawMessage, a Actor) (Settings, error)
+// UpdateTx is Update inside the caller's Write (setup/complete, §7.8). apply swaps the cache and runs OnChange; the
+// caller calls it only after its Write committed. A skipped apply is caught up by the next settings write.
+func (c *SettingsCache) UpdateTx(q *Q, patch map[string]json.RawMessage, a Actor) (apply func() Settings, err error)
 func (c *SettingsCache) OnChange(fn func(old, new Settings)) (cancel func())
 ```
 
@@ -2254,6 +2263,7 @@ type Deps struct {
 	Signal   Signal                         // wiring adapter over 01's hub; nil-safe (tests): no presence, no-op hooks
 	Push     Push                           // wiring adapter over 04's push service; nil → push_unavailable
 	Info     InfoSource                     // 04
+	Site     Site                           // 04's RouterOptions.Site: /info's publicUrl and server.name fallback
 	ClientIP func(*http.Request) netip.Addr // 04's httpapi.ClientIP
 	Clock    func() time.Time
 	Logger   *slog.Logger
@@ -2567,9 +2577,9 @@ above; "a logout in tab A redirects tab B" by S33's component test; and mobile s
   - `(*Q).AddTransfer`, `TransferMonth`, `GetMeta`, `SetMeta` (04: transfer accounting and ops state);
   - `store.Room`, `store.PushSubscription`, `store.PushPreferences`, `store.Actor`, `store.CLIActor`.
 - **Settings**: `store.Settings` with its JSON field names; `(*SettingsCache).Get`, `Defaults`, `OnChange`, `Pin`,
-  `Update`, `Locked`. Consumers: `MaxParticipantsPerRoom`, `MaxSharesPerRoom`, `MaxShareBitrateKbps` and
-  `MinClientVersion` (01, through `Deps.Policy`); `MaxShareBitrateKbps` (02, through `SetLimits`); `UpdateCheck`,
-  `TransferAlertGB` (04, through the wiring's `ops.Policy`); `SetupWizardDone` (05).
+  `Update`, `UpdateTx` (03's setup/complete), `Locked`. Consumers: `MaxParticipantsPerRoom`, `MaxSharesPerRoom`,
+  `MaxShareBitrateKbps` and `MinClientVersion` (01, through `Deps.Policy`); `MaxShareBitrateKbps` (02, through
+  `SetLimits`); `UpdateCheck`, `TransferAlertGB` (04, through the wiring's `ops.Policy`); `SetupWizardDone` (05).
 - **Auth**:
   - `auth.New(ctx, db, auth.Options{Keys, Origins, ClientIP, Conns, Alerts, Argon, Clock, Logger})`;
   - `auth.Keys{Session, Invite}` and `auth.Origins{Primary, Public}`;

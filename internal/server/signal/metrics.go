@@ -16,9 +16,8 @@ const (
 	dirOut = "out"
 )
 
-// metrics are the hub's Prometheus series (01 §18). A nil *metrics (no Deps.Metrics) records nothing. The room,
-// share and client-stats series are registered now and fed by the slices that bring rooms, shares and stats
-// forwarding (README S19, S40).
+// metrics are the hub's Prometheus series (01 §18). A nil *metrics (no Deps.Metrics) records nothing. The share and
+// client-stats series are registered now and fed by the slice that brings shares and stats forwarding (README S40).
 type metrics struct {
 	connections *prometheus.GaugeVec   // isshoni_ws_connections{kind,role}
 	messages    *prometheus.CounterVec // isshoni_ws_messages_total{type,dir}
@@ -149,6 +148,14 @@ func (m *metrics) errorSent(code protocol.ErrorCode) {
 			label = "unknown"
 		}
 		m.errors.WithLabelValues(label).Inc()
+	}
+}
+
+// roomCounts sets isshoni_rooms and isshoni_participants.
+func (m *metrics) roomCounts(rooms, participants int) {
+	if m != nil {
+		m.rooms.Set(float64(rooms))
+		m.participants.Set(float64(participants))
 	}
 }
 

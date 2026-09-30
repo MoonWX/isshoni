@@ -3,11 +3,8 @@ package fake
 import (
 	"bytes"
 	"fmt"
-	"math/rand/v2"
 	"testing"
 )
-
-func newTestRand() *rand.Rand { return newRand(1, 2) }
 
 // splitAnnexB splits an access unit at its 4-byte start codes and checks each NAL unit's escaping.
 func splitAnnexB(t *testing.T, au []byte) [][]byte {
@@ -58,7 +55,7 @@ type testSPS struct {
 func (s testSPS) profileKey() string { return fmt.Sprintf("%02x%02x", s.profileIDC, s.constraints) }
 
 // readSPS parses the SPS NAL units buildSPS writes (H.264 7.3.2.1.1, the fields this package sets) with a bit
-// reader of its own, so the writer isn't checked against itself. S22 adds the check with the SFU's parser.
+// reader of its own, so the writer isn't checked against itself; TestSFUParsesSPS checks them with the SFU's parser.
 func readSPS(t *testing.T, nal []byte) testSPS {
 	t.Helper()
 	if nal[0] != nalSPS {
