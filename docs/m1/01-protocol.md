@@ -230,7 +230,10 @@ JSON conventions:
 - Keys are camelCase. Unknown keys are **ignored** by both sides; never use `DisallowUnknownFields` outside tests.
 - IDs are strings, never numbers.
 - Units live in the name: bit rates in bits/s, named `…Bitrate` (integers); durations in ms, named `…Ms`; timestamps are
-  RFC 3339 UTC strings with millisecond precision, named `…At` or `serverTime`.
+  RFC 3339 UTC strings with exactly three fractional digits and a `Z` suffix (`2026-10-12T19:04:05.123Z`, like
+  JavaScript's `Date.toISOString`; the fraction is truncated), named `…At` or `serverTime`. The form has a fixed
+  width, so it also sorts as text. 03's REST API sends the same form (03 §3.3, `api.WireTime`). Readers accept any
+  RFC 3339 form.
 - Enums are lowercase strings (`high`, `screen`); error codes are snake_case.
 - Optional fields are omitted when empty (`omitempty`/`omitzero`), and their zero value always means "old behavior".
   Booleans are named so that `false` is the default.
@@ -2476,7 +2479,7 @@ go out with scope `pc` plus the call's `pc`, `gen` and `neg`, keeping the mapped
 |---|---|
 | `sfu.role_forbidden`, `sfu.not_owner` | `forbidden` (scope request; pc from the PC methods) |
 | `sfu.bad_pc`, `sfu.pc_limit` | `bad_request` (scope request; pc from the PC methods) |
-| `sfu.unknown_track` | `bad_request`, `params {field: "tracks", reason: "invalid"}` (scope pc) |
+| `sfu.unknown_track` | `bad_request`, `params {field: "tracks", reason: "invalid"}` (scope pc). Only for a malformed binding (02 §6.3); an m-section of a share that ended in a race is answered `a=inactive`, with no error (§9 rule 4) |
 | `sfu.too_many_subscriptions` | `bad_request`, `params {field: "subs", reason: "too_many"}` |
 | `sfu.bad_sdp`, `sfu.bad_rid` | `sdp_invalid` (scope `pc`, with `pc`, `gen`, `neg`) |
 | `sfu.stale_offer` | `stale_negotiation` (scope `pc`, with `pc`, `gen`, `neg`); the client ignores it |

@@ -68,7 +68,7 @@ func TestTimeFieldsHaveMarshalers(t *testing.T) {
 var wireTime = regexp.MustCompile(`^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$`)
 
 // TestGoldenTimestampsUTCMilliseconds: every string in the golden files that parses as RFC 3339 has the one wire form
-// of 03 §3.3, "2026-10-01T12:00:00.000Z".
+// of 03 §3.3, "2026-10-01T12:00:00.000Z", and is exactly what WireTime encodes for it.
 func TestGoldenTimestampsUTCMilliseconds(t *testing.T) {
 	n := 0
 	for _, c := range goldenCases() {
@@ -77,12 +77,16 @@ func TestGoldenTimestampsUTCMilliseconds(t *testing.T) {
 			if !ok {
 				return
 			}
-			if _, err := time.Parse(time.RFC3339Nano, s); err != nil {
+			parsed, err := time.Parse(time.RFC3339Nano, s)
+			if err != nil {
 				return
 			}
 			n++
 			if !wireTime.MatchString(s) {
 				t.Errorf("%s: %s = %q is not RFC 3339 UTC with milliseconds", c.name, path, s)
+			}
+			if b, err := json.Marshal(WireTime(parsed)); err != nil || string(b) != `"`+s+`"` {
+				t.Errorf("%s: %s = %q, but WireTime encodes it as %s (%v)", c.name, path, s, b, err)
 			}
 		})
 	}

@@ -183,7 +183,7 @@ Open this link in your browser to create the admin account (valid 24 hours, work
 Running `isshoni setup-url` again makes a new link and cancels this one.
 ```
 
-`--json`: `{"url":"https://203.0.113.7/setup#Qm9f…","expiresAt":"2026-09-30T10:00:00Z","tlsReady":true}`.
+`--json`: `{"url":"https://203.0.113.7/setup#Qm9f…","expiresAt":"2026-09-30T10:00:00.000Z","tlsReady":true}`.
 
 When the certificate is not ready yet, the link is still printed with a note: "The certificate isn't ready yet. The
 link works once it is; check with `isshoni doctor`." `--wait 180s` first waits for readiness; it is for Docker and
@@ -1523,7 +1523,7 @@ type Secret string
 func (s Secret) Reveal() string
 func (Secret) String() string                    // "[redacted]"
 func (Secret) GoString() string                  // "[redacted]"
-func (Secret) Format(f fmt.State, verb rune)     // "[redacted]" for every verb
+func (Secret) Format(f fmt.State, verb rune)     // "[redacted]" for every verb except %p and %w (below)
 func (Secret) LogValue() slog.Value              // "[redacted]"
 func (Secret) MarshalJSON() ([]byte, error)      // "\"[redacted]\""; use Reveal() to send a real value
 func (Secret) MarshalText() ([]byte, error)      // "[redacted]"
@@ -1538,6 +1538,11 @@ func Err(err error) slog.Attr                                  // slog.Any("err"
 Rules:
 - **Format**: `auto` = text when stderr is a TTY, otherwise JSON (systemd journal and Docker both get JSON lines).
 - **Levels** from `log.level`; runtime change through the admin socket (`--for` reverts automatically).
+- **`Secret` gaps** that come from Go itself, because a `Secret` is a string (and `SecretBytes` a slice) underneath:
+  fmt prints the raw operand for `%p` and `%w`, which it never passes to a `Formatter` for a string. go vet's printf
+  check (part of `go test` and CI) rejects both verbs for a `Secret`, so neither can reach a log. fmt also can't call
+  methods on unexported struct fields: keep `Secret` fields exported, or don't print the struct. A `Secret` is never a
+  map key (encoding/json writes a string-kind key as it is). For `SecretBytes`, `%p` prints the slice's address.
 - **Safety net `ReplaceAttr`**: attributes whose key is `password`, `token`, `secret`, `authorization`, `cookie`,
   `sdp`, `offer`, `answer`, `candidate`, `endpoint` or ends in `_token` are replaced with `[redacted]`, whatever
   their type.
@@ -1783,8 +1788,10 @@ type Policy interface {
 | `POST /v1/doctor` | `{"only": ["dns"]}` (optional) | `api.DoctorReport` (server-side checks) | – |
 | `POST /v1/log-level` | `{"level":"debug","for":"30m"}` | 204 | 400 |
 
-User, invite and setup operations call 03's service layer (§19); this doc only defines the socket surface. Statuses
-come from `api.StatusOf`; the four backup/restore codes are (04) rows in 03's code table. The CLI branches on `code`,
+User, invite and setup operations call 03's service layer (§19); this doc only defines the socket surface. Timestamps
+in these bodies (`expiresAt`, `createdAt`, `lastSeenAt`) have 03 §3.3's fixed form, `2026-09-30T10:00:00.000Z`, the
+same as REST and signaling: `ops` declares them as `api.WireTime` (or uses 03's DTOs). Statuses come from
+`api.StatusOf`; the four backup/restore codes are (04) rows in 03's code table. The CLI branches on `code`,
 never on the HTTP status, and maps codes to exit codes (e.g. `setup_unavailable` → 7 with the reset-password fix,
 §12.5).
 
@@ -2328,8 +2335,8 @@ func Info() BuildInfo // Protocol and Schema zero: this package imports nothing 
 ```
 
 `isshoni version`: `isshoni 0.3.0 (commit 1a2b3c4, built 2026-09-29, go1.27.x, linux/amd64, protocol 1, schema 7)`
-(the plan's toolchain: `go 1.26` directive, toolchain pinned to the latest go1.27 patch); `--short` prints `0.3.0`
-(install.sh compares it); `--json` prints `BuildInfo` (camelCase keys). The SPA gets the same string at build time:
+(the plan's toolchain: `go 1.26.0` directive, toolchain pinned to the latest go1.27 patch, 06 §7.1); `--short`
+prints `0.3.0` (install.sh compares it); `--json` prints `BuildInfo` (camelCase keys). The SPA gets the same string at build time:
 06 builds the SPA with `ISSHONI_VERSION` equal to the ldflags `version` in every task and in goreleaser (06 §7.2), so
 `dist/version.json` always equals `version.Version()`. The §9.5 startup comparison stays as a warning; a mismatch in a
 release build is a bug. There is no separate `buildinfo` package.
@@ -2368,7 +2375,7 @@ no tokens, SDP, push endpoints or usernames.
 | `netx` rewrite | Rules/filters for each row of §7.5 (direct, 1:1 NAT, Docker bridge, home LAN Append, IPv6 literal) |
 | `tlsmgr` | Manual: load, reload on file change and SIGHUP, bad new pair keeps the old, key mismatch, expiry warning; `HTTPHandler`: ACME path passthrough, 503 while not ready, 308 to config host (ignores request Host), off-mode passthrough; ACME problem → hint code table |
 | `httpapi` | Middleware order; read deadline: a request body trickled past it (shortened in tests) is cut, and `/ws` has no deadline after the upgrade; security headers per response type (`/sw.js` carries the HTML CSP, with `connect-src` including `'self'`; other non-HTML files carry `default-src 'none'`); HSTS only with domain+TLS; host check incl. dev localhost; trusted-proxy XFF (right-most untrusted) and ignoring XFF in non-off modes; error envelope; `DecodeJSON` limits; SPA table of §9.5 (asset 404, dotted path 404, deep link → index 200, `/setup` → 404 via hook, ETag/304, `.br` negotiation, MIME types without `/etc/mime.types`) |
-| `logx` | `Secret` redacted in text and JSON handlers, all fmt verbs, `json.Marshal`; `ReplaceAttr` key list; pion bridge drops SDP-like lines and rate-limits; format auto-detection |
+| `logx` | `Secret` redacted in text and JSON handlers, every fmt verb except `%p` and `%w` (which go vet rejects), `json.Marshal`; `ReplaceAttr` key list; pion bridge drops SDP-like lines and rate-limits; format auto-detection |
 | `ops` | Health state machine (starting → ready → shutting_down); conntest function (transport validation, `transport_disabled` with `params.transport` for each transport without a listener, per-user rate limit, `sfu.probe_limit` → 429, `publicIp` `""` without a public IPv4, `container` value) with a fake `Prober`; transfer flush, month rollover at UTC midnight, 80/100 % alerts once; release parser (drafts, prereleases, semver order, security marker, ETag 304); dashboard JSON golden file |
 | `ops` admin | Peer-cred filter (injected creds); every endpoint via `httptest` over a real unix socket (short path under `/tmp`: macOS `sun_path` is 104 bytes); backup tar layout and manifest; offline backup falls back to raw files only when `BackupFile` fails; restore validation rejects traversal, symlinks, extra names, bad hashes, and (through `InspectFile`, whatever the manifest says) a newer schema, a history mismatch or a failed integrity check; offline commands exit 7 while the data-directory lock is held; swap crash recovery from each `plan.json` state; old WAL never next to the new DB |
 | `doctor` | Each check with fake FS/resolver/STUN/clock/DMI; `tls` with no certificate is `warn` with `fixCode` = the §8.7 code right after one failed ACME attempt and `fail` after 10 min; `public_ip` in `ip` mode with DMI `aws`/`gcp` adds the `public_ip.ephemeral` info (not in `auto` mode or on other providers); `clock` with a fake `adjtimex` returning EPERM (sync unknown, no warn; skew check decides; `info` in `manual`/`off`); provider table; bandwidth numbers (plan example 10.53 Mbps/viewer and 105 Mbps; exit scenario 41.5 Mbps); JSON golden; text render; exit codes 0/5 and `--strict` |

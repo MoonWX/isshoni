@@ -160,7 +160,9 @@ keyframe.
   returns its `tracks` binding (mid → share, kind), which the viewer uses to map `ontrack` (01 §9 rule 4); the msid
   is a debugging aid.
 - Publish side: every pub offer carries 01's `tracks` binding (mid → share, kind) for each sending m-section. The SFU
-  maps tracks to shares by that binding, read afresh on every offer. A rebuilt pub PC has new mids but lists the same
+  maps tracks to shares by that binding, read afresh on every offer. A sending m-section without a binding (the hub
+  dropped the TrackRefs of a share that ended while the offer was in flight) carries no share and is answered
+  `a=inactive` (§8.4). A rebuilt pub PC has new mids but lists the same
   `shareId`s, so its tracks attach to the existing Shares. The msid stream id the browser chose is ignored.
 - Rids: `f` = full (source, ≤1080p60 by default), `q` = preview (360p15, about 0.3 Mbps). In M1 a video m-line carries
   a subset of {`f`, `q`} (at most 2 rids) or no rids, which means a single `f` layer. Any other rid is rejected with
@@ -522,7 +524,7 @@ func (e *Error) Error() string
 | `sfu.bad_sdp` | HandleOffer, HandleAnswer | no | unparsable SDP, data channel in a media PC, >8 m-lines, a pub offer >64 KiB or a sub answer >256 KiB (01 §3.3) |
 | `sfu.no_h264` | HandleOffer | no | the video m-line offers no H.264 packetization-mode=1 (browser without H.264 encoder) |
 | `sfu.bad_rid` | HandleOffer | no | a rid outside {f,q} (M1), or more than 2 |
-| `sfu.unknown_track` | HandleOffer | no | a sending m-section missing from `tracks`, or a binding to a share that isn't this Conn's |
+| `sfu.unknown_track` | HandleOffer | no | a malformed binding: `tracks` binds one mid twice, a binding of this Conn's share has another kind than its m-section, or one share has a second video or audio m-section. Not for a sending m-section without a binding, or bound to a share that isn't a `pending`/`live`/`stalled` share of this Conn (a share that ended while its offer was in flight): §8.4 answers that m-section `a=inactive` and ignores it (01 §9 rule 4) |
 | `sfu.stale_answer` | HandleAnswer | no | `gen`/`neg` don't match the outstanding offer (sfuplane drops it silently) |
 | `sfu.stale_offer` | HandleOffer | no | pub offer with a `gen` lower than the current one, or a `neg` lower than the last one in the current `gen` (sfuplane sends `stale_negotiation`; the client ignores it) |
 | `sfu.pc_limit` | HandleOffer | no | a third PC or a second PC of the same kind |
@@ -539,6 +541,12 @@ func (e *Error) Error() string
 and uses `Share` and `RetryAfter` when it builds the wire error. A §8.4 violation changes nothing, so a share whose
 video offers no H.264 stays as it was: the hub ends it itself (`sfu.no_h264` → `codec_not_supported` with scope
 share, then `StopShare(id, stopped)`).
+
+**A share that ends while its pub offer is in flight** (for example `share.stop` crossing a re-offer) is not an error
+(01 §9 rule 4 and §15.4 win over an earlier draft of this section): the hub drops that share's TrackRefs before
+`HandleOffer`, and the server still answers. The SFU answers every sending m-section that has no binding, or whose
+binding names a share that isn't a `pending`/`live`/`stalled` share of this Conn, with `a=inactive` and ignores it
+(§8.4). There is no `sfu.unknown_track` for that case; the code remains only for the malformed bindings in the table.
 
 ### 6.4 How signal drives it (wire names are 01's)
 
@@ -746,11 +754,16 @@ compatible one in the order `6400, 640c, 4d00, 42e0, 4200`.
 
 `HandleOffer(PCPub)` runs these steps in the actor:
 1. **Validate** the parsed offer (`sdpcheck.go`), before anything is applied: ≤64 KiB, ≤8 m-lines, no
-   `m=application`. Each sending m-line's mid appears in `tracks`, bound to a share of this Conn in `pending`, `live` or
-   `stalled` (`sfu.unknown_track` otherwise). Per share: at most one video and one audio m-line. Video offers H.264
-   packetization-mode=1. Rids ⊆ {f,q}, at most 2, or none (one `f` layer). A violation returns its §6.3 code (with
-   `Error.Share` set when the failing m-section maps to a share) and changes nothing. Before all this, a lower `gen`
-   or a lower `neg` in the current `gen` returns `sfu.stale_offer`, and a repeated `neg` gets the stored answer.
+   `m=application`. A sending m-line (`sendrecv` or `sendonly`) carries a share when its mid is bound in `tracks` to a
+   share of this Conn in `pending`, `live` or `stalled`. A sending m-line with no binding, or bound to any other share
+   (one that ended while the offer was in flight: the hub already dropped its TrackRefs, 01 §9 rule 4), carries no
+   share: it is not an error, skips every check below, gets `a=inactive` in step 5, and the SFU attaches nothing that
+   arrives on it. `tracks` binding one mid twice, a binding of this Conn's share whose kind isn't its m-line's, or a
+   share's second video or audio m-line is `sfu.unknown_track` (per share: at most one video and one audio m-line).
+   Video offers H.264 packetization-mode=1. Rids ⊆ {f,q}, at most 2, or none (one `f` layer). A violation returns its
+   §6.3 code (with `Error.Share` set when the failing m-section maps to a share) and changes nothing. Before all this,
+   a lower `gen` or a lower `neg` in the current `gen` returns `sfu.stale_offer`, and a repeated `neg` gets the stored
+   answer.
 2. Create the pub PC if needed, or replace it when `gen` is higher than the current one (PC guards, §12). Store the
    mid → share binding for `OnTrack`. Then `SetRemoteDescription(offer)` and flush buffered candidates.
 3. **Filter codecs** on each video transceiver: `SetCodecPreferences` keeps, in the offerer's order, only the profiles
@@ -758,11 +771,18 @@ compatible one in the order `6400, 640c, 4d00, 42e0, 4200`.
    has to encode an allowed profile. (Slice 10 verifies that Pion honours transceiver preferences in answers. If it
    doesn't, the fallback is to strip the other PTs from the offer before step 2.)
 4. `CreateAnswer`, `SetLocalDescription(answer)`, wait for gathering (≤2 s).
-5. **Opus bitrate per share**: in the copy sent to the client (not the local description), set `maxaveragebitrate` on
-   each audio m-line to its share's preset: Movie 256000, otherwise 128000. The parameter only tells the remote
-   encoder what to do, so Pion's local description can keep the default. `stereo=1;sprop-stereo=1` are already in the
-   engine's fmtp. Then return the answer to the caller (`HandleOffer` is synchronous) and keep it as the stored last
-   answer for a repeated `neg`.
+5. **Edit the copy sent to the client** (not the local description; these attributes only tell the remote side what
+   to do, so Pion's local description can keep its own):
+   - **Opus per share**: Pion answers with the offerer's Opus fmtp, not the engine's (Chrome offers
+     `minptime=10;useinbandfec=1`), so on each audio m-line that carries a share, set `stereo=1;sprop-stereo=1` (a
+     sender encodes stereo only when the receiver's SDP asks for it, S4) and `maxaveragebitrate` to its share's preset:
+     Movie 256000, otherwise 128000. Other parameters keep their order; a missing fmtp line is added.
+   - **No share**: each sending m-line that carries no share (step 1) gets `a=inactive` in place of Pion's `recvonly`
+     (Pion v4.2 has no exported per-transceiver direction). The browser then stops sending on it; its transceiver
+     stays usable for the client's next share, which the next offer binds.
+
+   Then return the answer to the caller (`HandleOffer` is synchronous) and keep it as the stored last answer for a
+   repeated `neg`.
 
 ### 8.5 Viewers without H.264 (fresh Firefox profile, S4)
 
@@ -1527,8 +1547,9 @@ through `export_test.go`; integration tests use real time unless noted.
 - `pacer_test`: a 150 KB burst at 24 Mbps takes 50 ms ± 10%; a 1 fps idle stream followed by a 300-packet frame
   arriving at 20 Mbps adds less than 20 ms; the same frame injected all at once leaves at the configured rate
   (20 Mbps for an 8 Mbps `f`, ± 10%).
-- `sdpcheck_test`: each validation code; Opus `maxaveragebitrate` edit per m-line; the answer check for m-lines
-  without H.264.
+- `sdpcheck_test`: each validation code; a sending m-section without a binding, or bound to a share that isn't this
+  Conn's, carries no share and is no error (and skips the per-share checks); the Opus edit per m-line (stereo and
+  `maxaveragebitrate`) and `a=inactive` on the m-lines without a share; the answer check for m-lines without H.264.
 - `policy_test` (fake clock): high → cb at once; cb → high after 60 s; conns without H.264 ignored.
 - `api_test`: with a loopback `netx.Transport` (04) that has a fake 443 ICE listener, a sub offer contains UDP 7882,
   passive TCP 443 and 7882 candidates and no trickle; the probe APIs each advertise only their transport; the
@@ -1569,8 +1590,10 @@ with `fake.Source`, `sfutest.Viewer`)**
     it → no negotiation failure, then a retry.
 14. `TestHandshakeTimeout`: a client that never completes ICE → PC closed at 10 s ± 1 s, `PCStateEvent`. An ICE
     restart that never completes gets no server timer and no event.
-15. `TestGuards`: a third PC, a fifth share, a bad rid (`h`, or three rids), an unknown track binding, no H.264, a
-    data channel, a stale pub offer → the §6.3 codes, with nothing applied.
+15. `TestGuards`: a third PC, a fifth share, a bad rid (`h`, or three rids), a malformed track binding (a video
+    m-line bound as audio), no H.264, a data channel, a stale pub offer → the §6.3 codes, with nothing applied. A share
+    stopped while its re-offer is in flight (the offer still binds it): the answer comes back with that share's
+    m-lines `a=inactive`, no error, and the publisher's other share keeps flowing.
 16. `TestDownlinkAdaptation`: the viewer's REMB comes from `rembsim` with a scripted link capacity, starting at
     20 Mbps. (a) Idle → motion: the focused share's `f` runs at 0.2 Mbps for 30 s (`Source.SetBitrate`), then at
     8 Mbps for 30 s; the viewer stays on `high` and gets no `bandwidth` state event. (b) Throttle: capacity drops to

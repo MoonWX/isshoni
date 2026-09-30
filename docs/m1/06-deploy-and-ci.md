@@ -894,15 +894,21 @@ actionlint 1.<latest>
 
 - `<latest>` means: pin the exact latest patch when slice S1 lands. Versions are bumped by hand, monthly, in one PR;
   Dependabot can't read `.tool-versions`.
-- `go.mod` has `go 1.26` and `toolchain go1.27.<same patch>` (the plan: language version 1.26, newest toolchain).
-  CI reads the version from `go.mod`, not from `.tool-versions`, and `task lint:pins` fails if the two differ.
+- `go.mod` has `go 1.26.0` and `toolchain go1.27.1`, the `.tool-versions` patch (the plan: language version 1.26,
+  newest toolchain). The go line carries a patch because `golang.org/x/text`, `golang.org/x/crypto` and
+  `modernc.org/sqlite` require `go 1.26.0`, so `go get` and `go mod tidy` write it that way; the language version is
+  still 1.26. `tools/go.mod` has the same two lines. CI reads the version from `go.mod`, not from `.tool-versions`,
+  and `task lint:pins` fails if the two differ.
 - Node's bundled npm (11.x) is used; `package.json` has `"engines": {"node": ">=26"}` and
   `"packageManager": "npm@<exact 11.x version>"`.
 
 **`tools/go.mod`** is a separate module, `github.com/MoonWX/isshoni/tools`, with Go 1.24+ `tool` directives:
-- tools: `github.com/gzuidhof/tygo`, `github.com/google/go-licenses/v2`, `golang.org/x/vuln/cmd/govulncheck`;
-- our own small programs: `tools/notices` (section 8.4), `tools/relserve` (section 11.2) and `tools/exittest`
-  (section 12).
+- tools: `github.com/gzuidhof/tygo`, `github.com/google/go-licenses/v2`, `golang.org/x/vuln/cmd/govulncheck`, and
+  Task, golangci-lint and shfmt (`mvdan.cc/sh/v3`) at the `.tool-versions` versions (`task lint:pins` checks them).
+  actionlint and ShellCheck come from mise or a package manager (actionlint v1.7.12 doesn't build against the
+  `go.yaml.in/yaml/v4` release candidate that golangci-lint's gosec needs);
+- our own small programs: `tools/repocheck` (behind `task lint:pins` and `lint:keys`), `tools/notices` (section 8.4),
+  `tools/relserve` (section 11.2) and `tools/exittest` (section 12).
 
 `task tools` builds the pinned tools into `.bin/`, using the repo toolchain:
 `go -C tools build -o ../.bin/ github.com/gzuidhof/tygo …`. They run from the repo root (tygo and go-licenses load the
@@ -1054,7 +1060,7 @@ task dev:setup-url        # in a second terminal: open the printed link, create 
 | `.github/workflows/nightly.yml` | `schedule: '17 3 * * *'`, `workflow_dispatch` | slow and flaky-prone checks (8.5) |
 | `.github/workflows/release.yml` | `push` tags `v*`, `workflow_dispatch` (dry run) | section 9 |
 | `.github/workflows/site.yml` | `push` to `main` (paths `docs/**`), `workflow_dispatch`, `workflow_call` | section 10 |
-| `.github/dependabot.yml` | weekly | `gomod` (`/`, `/tools`), `npm` (`/web`, `/docs`), `github-actions`, `docker` (`/deploy/docker`); minor and patch updates grouped per ecosystem |
+| `.github/dependabot.yml` | weekly | `gomod` (`/`, `/tools`), `npm` (`/web`, `/docs`), `github-actions`, `docker` (`/deploy/docker`); minor and patch updates grouped per ecosystem; `target-branch: m1/server-web` for every ecosystem while M1 lands there (README §4), switched to `main` after M1. The tools pinned in `.tool-versions` (Task, golangci-lint, shfmt) are ignored in `/tools` and bumped by hand |
 
 **Rules for every workflow:**
 - Top-level `permissions: contents: read`; jobs raise permissions individually.

@@ -3,19 +3,18 @@ package api
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
-	"time"
 )
 
 // The MarshalJSON methods below enforce two wire rules of the package (doc.go) for every encoder, not only for the
 // producers that remember them:
-//   - timestamps are RFC 3339 UTC strings with exactly three fractional digits ("2026-10-01T12:00:00.000Z", 03 §3.3,
-//     the same as 01's timestamps and JavaScript's Date.toISOString), whatever the location and precision of the
-//     time.Time. They are fixed width, so they also sort as text;
+//   - timestamps are WireTime's form (wiretime.go): RFC 3339 UTC strings with exactly three fractional digits and a
+//     Z suffix ("2026-10-01T12:00:00.000Z", 03 §3.3, the same as 01's timestamps and JavaScript's
+//     Date.toISOString), whatever the location and precision of the time.Time. They are fixed width, so they also
+//     sort as text;
 //   - lists are always present: a nil slice encodes as [] and a nil AuditEntry.Detail as {}, never as null.
 //
 // Each method converts the value to a local type without methods (the same fields and tags), fills in nil
-// collections and overrides each time.Time field with an msTime field of the same JSON name, so encoding stays with
+// collections and overrides each time.Time field with a WireTime field of the same JSON name, so encoding stays with
 // encoding/json. The overriding timestamp fields come last in the encoded object (JSON objects are unordered; the
 // goldens show the order). Decoding is unchanged: time.Time accepts any RFC 3339 form.
 //
@@ -43,36 +42,14 @@ func nonNil[T any](s []T) []T {
 	return s
 }
 
-// msTime encodes a time.Time as RFC 3339 UTC with exactly three fractional digits (truncated, not rounded).
-type msTime time.Time
-
-const msTimeLayout = "2006-01-02T15:04:05.000Z07:00"
-
-// errTimeRange is returned for a timestamp that RFC 3339 cannot hold, as time.Time.MarshalJSON does.
-var errTimeRange = errors.New("api: time year outside of range [0,9999]")
-
-func (t msTime) MarshalJSON() ([]byte, error) {
-	tt := time.Time(t).UTC()
-	if y := tt.Year(); y < 0 || y > 9999 {
-		return nil, errTimeRange
-	}
-	b := make([]byte, 0, len(msTimeLayout)+2)
-	b = append(b, '"')
-	b = tt.AppendFormat(b, msTimeLayout)
-	return append(b, '"'), nil
-}
-
-// IsZero makes omitzero fields behave as they do with time.Time: a zero time in any location is absent.
-func (t msTime) IsZero() bool { return time.Time(t).IsZero() }
-
 // ---- types.go ----
 
 func (u User) MarshalJSON() ([]byte, error) {
 	type plain User
 	return marshal(struct {
 		plain
-		CreatedAt msTime `json:"createdAt,omitzero"`
-	}{plain(u), msTime(u.CreatedAt)})
+		CreatedAt WireTime `json:"createdAt,omitzero"`
+	}{plain(u), WireTime(u.CreatedAt)})
 }
 
 func (i Info) MarshalJSON() ([]byte, error) {
@@ -86,27 +63,27 @@ func (i InviteInfo) MarshalJSON() ([]byte, error) {
 	type plain InviteInfo
 	return marshal(struct {
 		plain
-		ExpiresAt msTime `json:"expiresAt"`
-	}{plain(i), msTime(i.ExpiresAt)})
+		ExpiresAt WireTime `json:"expiresAt"`
+	}{plain(i), WireTime(i.ExpiresAt)})
 }
 
 func (s SessionInfo) MarshalJSON() ([]byte, error) {
 	type plain SessionInfo
 	return marshal(struct {
 		plain
-		CreatedAt  msTime `json:"createdAt"`
-		ExpiresAt  msTime `json:"expiresAt,omitzero"`
-		LastSeenAt msTime `json:"lastSeenAt,omitzero"`
-	}{plain(s), msTime(s.CreatedAt), msTime(s.ExpiresAt), msTime(s.LastSeenAt)})
+		CreatedAt  WireTime `json:"createdAt"`
+		ExpiresAt  WireTime `json:"expiresAt,omitzero"`
+		LastSeenAt WireTime `json:"lastSeenAt,omitzero"`
+	}{plain(s), WireTime(s.CreatedAt), WireTime(s.ExpiresAt), WireTime(s.LastSeenAt)})
 }
 
 func (d DeviceInfo) MarshalJSON() ([]byte, error) {
 	type plain DeviceInfo
 	return marshal(struct {
 		plain
-		CreatedAt  msTime `json:"createdAt,omitzero"`
-		LastSeenAt msTime `json:"lastSeenAt,omitzero"`
-	}{plain(d), msTime(d.CreatedAt), msTime(d.LastSeenAt)})
+		CreatedAt  WireTime `json:"createdAt,omitzero"`
+		LastSeenAt WireTime `json:"lastSeenAt,omitzero"`
+	}{plain(d), WireTime(d.CreatedAt), WireTime(d.LastSeenAt)})
 }
 
 func (r SessionsResponse) MarshalJSON() ([]byte, error) {
@@ -134,8 +111,8 @@ func (r Room) MarshalJSON() ([]byte, error) {
 	type plain Room
 	return marshal(struct {
 		plain
-		CreatedAt msTime `json:"createdAt"`
-	}{plain(r), msTime(r.CreatedAt)})
+		CreatedAt WireTime `json:"createdAt"`
+	}{plain(r), WireTime(r.CreatedAt)})
 }
 
 func (i Invite) MarshalJSON() ([]byte, error) {
@@ -144,9 +121,9 @@ func (i Invite) MarshalJSON() ([]byte, error) {
 	p.RedeemedBy = nonNil(p.RedeemedBy)
 	return marshal(struct {
 		plain
-		CreatedAt msTime `json:"createdAt"`
-		ExpiresAt msTime `json:"expiresAt"`
-	}{p, msTime(i.CreatedAt), msTime(i.ExpiresAt)})
+		CreatedAt WireTime `json:"createdAt"`
+		ExpiresAt WireTime `json:"expiresAt"`
+	}{p, WireTime(i.CreatedAt), WireTime(i.ExpiresAt)})
 }
 
 func (r InvitesResponse) MarshalJSON() ([]byte, error) {
@@ -160,10 +137,10 @@ func (u AdminUser) MarshalJSON() ([]byte, error) {
 	type plain AdminUser
 	return marshal(struct {
 		plain
-		CreatedAt   msTime `json:"createdAt"`
-		LastLoginAt msTime `json:"lastLoginAt,omitzero"`
-		LastSeenAt  msTime `json:"lastSeenAt,omitzero"`
-	}{plain(u), msTime(u.CreatedAt), msTime(u.LastLoginAt), msTime(u.LastSeenAt)})
+		CreatedAt   WireTime `json:"createdAt"`
+		LastLoginAt WireTime `json:"lastLoginAt,omitzero"`
+		LastSeenAt  WireTime `json:"lastSeenAt,omitzero"`
+	}{plain(u), WireTime(u.CreatedAt), WireTime(u.LastLoginAt), WireTime(u.LastSeenAt)})
 }
 
 func (r AdminUsersResponse) MarshalJSON() ([]byte, error) {
@@ -177,16 +154,16 @@ func (l ResetLink) MarshalJSON() ([]byte, error) {
 	type plain ResetLink
 	return marshal(struct {
 		plain
-		ExpiresAt msTime `json:"expiresAt"`
-	}{plain(l), msTime(l.ExpiresAt)})
+		ExpiresAt WireTime `json:"expiresAt"`
+	}{plain(l), WireTime(l.ExpiresAt)})
 }
 
 func (u PendingUser) MarshalJSON() ([]byte, error) {
 	type plain PendingUser
 	return marshal(struct {
 		plain
-		RequestedAt msTime `json:"requestedAt"`
-	}{plain(u), msTime(u.RequestedAt)})
+		RequestedAt WireTime `json:"requestedAt"`
+	}{plain(u), WireTime(u.RequestedAt)})
 }
 
 func (r ApprovalsResponse) MarshalJSON() ([]byte, error) {
@@ -211,8 +188,8 @@ func (e AuditEntry) MarshalJSON() ([]byte, error) {
 	}
 	return marshal(struct {
 		plain
-		At msTime `json:"at"`
-	}{p, msTime(e.At)})
+		At WireTime `json:"at"`
+	}{p, WireTime(e.At)})
 }
 
 func (a AuditPage) MarshalJSON() ([]byte, error) {
@@ -239,8 +216,8 @@ func (d OpsDashboard) MarshalJSON() ([]byte, error) {
 	p.Alerts = nonNil(p.Alerts)
 	return marshal(struct {
 		plain
-		GeneratedAt msTime `json:"generatedAt"`
-	}{p, msTime(d.GeneratedAt)})
+		GeneratedAt WireTime `json:"generatedAt"`
+	}{p, WireTime(d.GeneratedAt)})
 }
 
 func (s ServerInfo) MarshalJSON() ([]byte, error) {
@@ -249,8 +226,8 @@ func (s ServerInfo) MarshalJSON() ([]byte, error) {
 	p.Advertised = nonNil(p.Advertised)
 	return marshal(struct {
 		plain
-		StartedAt msTime `json:"startedAt"`
-	}{p, msTime(s.StartedAt)})
+		StartedAt WireTime `json:"startedAt"`
+	}{p, WireTime(s.StartedAt)})
 }
 
 func (t TLSInfo) MarshalJSON() ([]byte, error) {
@@ -259,19 +236,19 @@ func (t TLSInfo) MarshalJSON() ([]byte, error) {
 	p.Names = nonNil(p.Names)
 	return marshal(struct {
 		plain
-		NotBefore   msTime `json:"notBefore,omitzero"`
-		NotAfter    msTime `json:"notAfter,omitzero"`
-		NextRenewal msTime `json:"nextRenewal,omitzero"`
-		LastErrorAt msTime `json:"lastErrorAt,omitzero"`
-	}{p, msTime(t.NotBefore), msTime(t.NotAfter), msTime(t.NextRenewal), msTime(t.LastErrorAt)})
+		NotBefore   WireTime `json:"notBefore,omitzero"`
+		NotAfter    WireTime `json:"notAfter,omitzero"`
+		NextRenewal WireTime `json:"nextRenewal,omitzero"`
+		LastErrorAt WireTime `json:"lastErrorAt,omitzero"`
+	}{p, WireTime(t.NotBefore), WireTime(t.NotAfter), WireTime(t.NextRenewal), WireTime(t.LastErrorAt)})
 }
 
 func (u UpdateInfo) MarshalJSON() ([]byte, error) {
 	type plain UpdateInfo
 	return marshal(struct {
 		plain
-		CheckedAt msTime `json:"checkedAt"`
-	}{plain(u), msTime(u.CheckedAt)})
+		CheckedAt WireTime `json:"checkedAt"`
+	}{plain(u), WireTime(u.CheckedAt)})
 }
 
 func (r RoomLive) MarshalJSON() ([]byte, error) {
@@ -294,8 +271,8 @@ func (c ConnectionLive) MarshalJSON() ([]byte, error) {
 	type plain ConnectionLive
 	return marshal(struct {
 		plain
-		ConnectedAt msTime `json:"connectedAt"`
-	}{plain(c), msTime(c.ConnectedAt)})
+		ConnectedAt WireTime `json:"connectedAt"`
+	}{plain(c), WireTime(c.ConnectedAt)})
 }
 
 func (s ShareLive) MarshalJSON() ([]byte, error) {
@@ -304,16 +281,16 @@ func (s ShareLive) MarshalJSON() ([]byte, error) {
 	p.Layers = nonNil(p.Layers)
 	return marshal(struct {
 		plain
-		StartedAt msTime `json:"startedAt"`
-	}{p, msTime(s.StartedAt)})
+		StartedAt WireTime `json:"startedAt"`
+	}{p, WireTime(s.StartedAt)})
 }
 
 func (d DoctorSummary) MarshalJSON() ([]byte, error) {
 	type plain DoctorSummary
 	return marshal(struct {
 		plain
-		RanAt msTime `json:"ranAt"`
-	}{plain(d), msTime(d.RanAt)})
+		RanAt WireTime `json:"ranAt"`
+	}{plain(d), WireTime(d.RanAt)})
 }
 
 func (s ServerStatus) MarshalJSON() ([]byte, error) {
@@ -323,8 +300,8 @@ func (s ServerStatus) MarshalJSON() ([]byte, error) {
 	p.Listeners = nonNil(p.Listeners)
 	return marshal(struct {
 		plain
-		StartedAt msTime `json:"startedAt"`
-	}{p, msTime(s.StartedAt)})
+		StartedAt WireTime `json:"startedAt"`
+	}{p, WireTime(s.StartedAt)})
 }
 
 // ---- doctor.go ----
@@ -335,8 +312,8 @@ func (r DoctorReport) MarshalJSON() ([]byte, error) {
 	p.Checks = nonNil(p.Checks)
 	return marshal(struct {
 		plain
-		RanAt msTime `json:"ranAt"`
-	}{p, msTime(r.RanAt)})
+		RanAt WireTime `json:"ranAt"`
+	}{p, WireTime(r.RanAt)})
 }
 
 // ---- conntest.go ----

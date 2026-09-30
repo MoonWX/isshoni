@@ -11,9 +11,11 @@
 //   - JSON names are camelCase; enum values are lowercase strings; error codes are snake_case and never carry English
 //     text (the SPA maps a code to errors.<code> and a field code to fieldErrors.<field>.<code>).
 //   - Timestamps are time.Time (tygo maps them to string) and go on the wire as RFC 3339 UTC strings with exactly
-//     three fractional digits, "2026-10-01T12:00:00.000Z" (03 §3.3), like 01's: fixed width, so they also sort as
-//     text. The MarshalJSON methods in encode.go convert any location and truncate any precision for every encoder;
-//     readers accept any RFC 3339 form. Durations are integer seconds, with the unit in the name (expiresIn,
+//     three fractional digits and a Z suffix, "2026-10-01T12:00:00.000Z" (03 §3.3), the same form as 01's signaling
+//     timestamps: fixed width, so they also sort as text. WireTime (wiretime.go) is that form; the MarshalJSON
+//     methods in encode.go encode every DTO timestamp through it, converting any location and truncating any
+//     precision for every encoder, and other packages use it for timestamps in their own JSON (04's admin socket).
+//     Readers accept any RFC 3339 form. Durations are integer seconds, with the unit in the name (expiresIn,
 //     retryAfter, expiresInS). PushPayload.TS is the one timestamp sent as unix milliseconds (04 §14.3).
 //   - Optional fields carry omitempty or omitzero, and their zero value means "absent". Lists are always present
 //     ([] rather than null, and AuditEntry.Detail is {} when empty), also when a producer leaves a slice nil: the
