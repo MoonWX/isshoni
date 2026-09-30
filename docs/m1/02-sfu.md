@@ -1036,7 +1036,9 @@ cache and every forwarding DownTrack as a late packet.
   so the viewer re-syncs at once after a switch or when audio is turned on.
 - Audio and video DownTracks of a share have the same msid stream (ShareID), so browsers lip-sync them with these SRs.
 - Budget: the SFU adds no timestamp error while SRs are fresh. The in-process test asserts |A/V offset| ≤ 5 ms through
-  switches and pauses. The 45 ms end-to-end target is measured in the browser e2e (05).
+  switches and pauses. The plan's 45 ms end-to-end target is checked by that Go test (integration 5, README S63; the
+  plan puts the flash-plus-beep check in the Go integration tests) and by the exit session's survey ("nobody reports
+  audio out of sync", 06 §12.3). No browser spec measures the A/V offset (05 §19.3).
 
 ### 9.7 Keyframe requests
 
@@ -1444,7 +1446,10 @@ isshoni-loadtest -server https://example.org -admin admin   # password from ISSH
 - **Scenario `all-high`** (stress, report only): every 30 s, 10 more `low` subscriptions become `high`, until loss
   exceeds 2% or server CPU exceeds 90%. Reports egress, CPU and loss at each step (the knee). The plan's full
   all-high is about 730 Mbps.
-- **Scenario `smoke`** (CI): 2×2, 30 s, `-decodable`, the same checks with relaxed thresholds.
+- **Scenario `smoke`** (CI): 2×2, 30 s, `-decodable`, the same checks with relaxed thresholds. Explicit
+  `-publishers` and `-subscribers` override a scenario's size. With `-subscribers 0` the tool only publishes for
+  `-duration` and skips the client checks, so a browser can be the viewer (`web/e2e/decodable.spec.ts`, README S89,
+  §17).
 - **Server data**: every 5 s, `GET /api/v1/admin/dashboard` (04 §11.4: `server.process` with CPU seconds, RSS and
   NumCPU, the live rooms and shares from `Snapshot`, and totals). Once before clients join (baseline RSS) and during
   the run. The egress value is the dashboard's `media.egressBps` (the SFU's RTP-level total,
@@ -1584,8 +1589,13 @@ with `fake.Source`, `sfutest.Viewer`)**
     publish side and then recovered by RTX still reaches every viewer once.
 
 **Browser e2e (owned by 05, relies on this doc)**: Chrome only (Playwright with Google Chrome, 05 §19.3). Chrome
-sharer (canvas) → SFU → Chrome viewers: `framesDecoded > 0`, audio energy, switches; the Go decodable publisher →
-Chrome. The 45 ms A/V target is measured there. Firefox is covered by integration 13 (a viewer MediaEngine without
+sharer (canvas) → SFU → Chrome viewers: `framesDecoded > 0`, audio energy, switches. No browser spec measures the A/V
+offset (the tone tab has no flash/beep marker, 05 §19.3): the 45 ms A/V target is checked by integration 5 (README
+S63, |flash − beep| ≤ 5 ms through the SFU) and by the exit survey ("nobody reports audio out of sync", 06 §12.3).
+The Go decodable publisher → Chrome check belongs to the load-tool slice (README S89, slice 15 here), not to 05's
+slices: `web/e2e/decodable.spec.ts` runs `isshoni-loadtest -scenario smoke -decodable -publishers 1 -subscribers 0`
+(§15.2) against 05's e2e server fixture, and a Chrome viewer in the same room shows `framesDecoded > 0` on that
+share. Firefox is covered by integration 13 (a viewer MediaEngine without
 H.264) and the manual matrix row M-FF-1 (05 §19.4); the codec policy by integration 12. There is no Firefox
 Playwright project. The manual matrix (05 §19.4) also has the downlink row: a viewer on a throttled link (Network Link
 Conditioner or `tc`) drops to `low` with reason `bandwidth` and returns to `high` within about 2 minutes of lifting the
@@ -1619,7 +1629,7 @@ milestone gate before the M1 exit test). `-scenario smoke` runs as a Go test in 
   (`Publisher`) as the start of M2's client core; **`internal/server/sfu/sfutest`** (`Harness`, `DirectSignaler`,
   `Viewer`, `FaultConn`) for 01's integration tests in `internal/server/itest`.
 - **`cmd/isshoni-loadtest`** CLI and exit codes (§15.2) for the `smoke` Go test in `test-go` against an in-process
-  server (S89) and the exit-test pre-flight.
+  server (S89), `web/e2e/decodable.spec.ts` (S89, §17) and the exit-test pre-flight.
 
 ## 19. Depends on
 
@@ -1667,8 +1677,11 @@ milestone gate before the M1 exit test). `-scenario smoke` runs as a Go test in 
   (cancels its 3 s timer and starts the 15 s rebuild timer from that offer, 05 §9); shows the four wire status
   reasons.
 - The connection-test UI calls 04's endpoint. The Chrome-only e2e (05 §19.3) covers the compatible Chrome cells of
-  §8.2 and the 45 ms A/V target. The manual matrix (05 §19.4) holds M-FF-1 (Firefox) and the throttled-downlink row
-  (drop to `low`, back on `high` within about 2 minutes of lifting the throttle, §17).
+  §8.2; it measures no A/V offset (the 45 ms target is integration 5 plus the exit survey, §9.6). The manual matrix
+  (05 §19.4) holds M-FF-1 (Firefox) and the throttled-downlink row (drop to `low`, back on `high` within about
+  2 minutes of lifting the throttle, §17).
+- 05's e2e server fixture (`startServer`, 05 §19.3), which `web/e2e/decodable.spec.ts` (README S89) uses to run
+  `isshoni-loadtest` against a Chrome viewer (§17).
 
 **06-deploy-and-ci.md**
 - sysctls `net.core.rmem_max` and `wmem_max` = 8388608 in install.sh and the Docker docs; compose publishes
@@ -1699,7 +1712,7 @@ doc's.
 | 12 | Observability | `Snapshot`, `ConnStats`, `Metrics`, logs | a test reads every metric after integration 2 with non-zero counters where expected; no SDP or IPs in info logs (log capture test) |
 | 13 | Uplink control | `UplinkPolicy`, admin cap REMB and hint, `SetLimits`, layer pausing (stretch; cuttable to M5 without a protocol change) | a test with `MaxShareKbps` → REMB on the pub PC every 1 s; layer pausing hint after 10 s unwatched and resume with PLI |
 | 14 | Connection-test probe | `probe.go`, probe APIs, echo channel | Integration 18; limits enforced |
-| 15 | Decodable fake and load test | decodable H.264 and the Opus asset; `cmd/isshoni-loadtest` (setup through 03's REST, scenarios, measurements, JSON, exit codes) on 01's `internal/client/signal` | `fake` tests; `smoke` passes as a Go test against an in-process server (S89); a Chrome e2e (05) decodes the decodable stream |
+| 15 | Decodable fake and load test | decodable H.264 and the Opus asset; `cmd/isshoni-loadtest` (setup through 03's REST, scenarios, measurements, JSON, exit codes) on 01's `internal/client/signal`; `web/e2e/decodable.spec.ts` | `fake` tests; `smoke` passes as a Go test against an in-process server (S89); `decodable.spec` (S89, not a 05 slice) runs `isshoni-loadtest -scenario smoke -decodable -publishers 1 -subscribers 0` against 05's e2e server fixture, and a Chrome viewer shows `framesDecoded > 0` |
 | 16 | Load gate | run `focus` on a 4 vCPU VPS from a second VM; fix what fails | every §15.2 criterion passes; `all-high` knee recorded in the release notes draft |
 
 ## Decisions taken at integration (formerly open questions)

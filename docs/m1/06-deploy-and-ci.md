@@ -415,6 +415,9 @@ isshoni config init --path … --tls.mode manual --domain … --tls.cert-file �
 
 The flags are 04's config flags (04 §4.2: `--` plus the key path with `_` → `-`). Then `chown root:isshoni` and
 `chmod 0640`. `config init` refuses to overwrite an existing file (exit 7).
+- With `--tls.mode off` and a loopback `listen.http` (the default), `config init` also writes
+  `network.trusted_proxies = ["127.0.0.0/8", "::1/128"]` into the file (04 §4.4), so a reverse proxy on the same host
+  passes the real client IPs and the admin sees the value. install.sh passes no flag for it.
 
 **Env isolation.** After `parse_args`, the script copies what it needs from `ISSHONI_*` variables into its own
 variables and runs `unset` on every `ISSHONI_*` name it reads, and on any other `ISSHONI_*` variable found with
@@ -783,17 +786,30 @@ services:
 - **Bind mount instead of a volume:** `sudo chown 65532:65532 ./data` first, and mount it at `/var/lib/isshoni`.
 - **Rootless Docker and Podman:** binding 80/443 needs `net.ipv4.ip_unprivileged_port_start=80` on the host, and UDP
   through slirp4netns/pasta is slow. Rootful Docker or install.sh is recommended.
+- **IPv6 clients in bridge mode.** The bridge network has no IPv6 by default (04 §7.6), so IPv6 clients reach
+  isshoni through `docker-proxy`, which connects from the bridge gateway's address: they all share that one address's
+  per-IP limits (login, registration, invite check, WebSocket handshakes; 03, 01), and one stranger can lock them all
+  out. When the domain has an AAAA record, use `compose.host.yaml` (6.3). `task docker:smoke` checks this behaviour
+  (11.3).
 - **Operations:**
   - setup link: `docker compose exec isshoni isshoni setup-url`;
   - doctor: `docker compose exec isshoni isshoni doctor`;
-  - backup to the host: `docker compose exec -T isshoni isshoni admin backup --out - > isshoni-backup.tar.gz`;
-    restore: `docker compose exec -T isshoni isshoni admin restore --yes - < isshoni-backup.tar.gz` (04 §12.3–§12.4).
+  - backup to the host, the only documented Docker form (04 §12.3):
+    `(umask 077; docker compose exec -T isshoni isshoni admin backup --out - > isshoni-backup.tar.gz)`. The archive
+    holds `secrets.json` and the TLS private keys; a plain shell redirect would create the file with the host's umask
+    (usually `0644`, readable by every local user), and the subshell's `umask 077` makes it `0600`;
+    restore: `docker compose exec -T isshoni isshoni admin restore --yes - < isshoni-backup.tar.gz` (04 §12.4).
     `--yes` is required: `-T` gives no TTY and stdin carries the archive, so no confirmation can be read. Without it
-    the CLI refuses and prints this exact command. `task docker:smoke` runs it (11.3), so the docs can't drift;
-  - when the server refuses to start (exit 78, e.g. a newer DB schema after a downgrade): `docker compose stop`,
-    `docker compose run --rm isshoni admin restore --offline /var/lib/isshoni/backups/<file>`, `docker compose up -d`
-    (04 §6.3). `docker compose stop` comes first because the offline restore refuses (exit 7) while any container
-    still holds the data directory (04 §5.1 lock);
+    the CLI refuses and prints this exact command. `task docker:smoke` runs both (11.3), so the docs can't drift;
+  - when the server refuses to start (exit 78, e.g. a newer DB schema after a downgrade): systemd stops on exit 78,
+    but under `restart: unless-stopped` Docker restarts the container in a loop (the backoff is capped at about a
+    minute). `docker compose logs --tail 50 isshoni` shows the reason and the exact restore command. Then, in this
+    order: `docker compose stop` (first, before any restore), `docker compose run --rm isshoni admin restore
+    --offline /var/lib/isshoni/backups/<file>`, `docker compose up -d` (04 §6.3). `docker compose stop` comes first
+    because the loop keeps restarting the server, and the offline restore refuses (exit 7) while any container still
+    holds the data directory (04 §5.1 lock). Every restart after a partial migration writes one more pre-migration
+    backup; the rotation always keeps the newest file per schema version (03 §4.4), so the file the older image needs
+    survives the loop;
   - logs: `docker compose logs -f` (JSON under Docker, per the plan).
 - **Ports 80/443 already taken** by nginx, Caddy or Traefik on the host: `compose.yaml` fails with "port is already
   allocated". The page links to the Docker section of `/install/reverse-proxy` (6.5).
@@ -947,8 +963,9 @@ vars:
 | `notices` | `go -C tools run ./notices …` → `THIRD_PARTY_NOTICES` | section 8.4 |
 | `release:prepare` | **no npm**: fails with "web/dist was built for X, not VERSION: run task build:web VERSION=…" unless `web/dist/version.json`'s `version` equals `VERSION` (read with `sed`, no Node); then `notices`, stamp `dist-extra/install.sh` (`VERSION=`) | goreleaser's before hook (`task release:prepare VERSION={{ .Version }}`, 9.2). The SPA comes from outside: the unprivileged `web` job in `release.yml` (9.3), or `release:snapshot` below. So the privileged release job runs no third-party JavaScript |
 | `release:snapshot` | `build:web`, then `goreleaser release --snapshot --clean --skip=sign,sbom`; both get `ISSHONI_SNAPSHOT_VERSION` (default `0.0.0-dev.<12-char commit>`), as `VERSION` for `build:web` and as env for goreleaser | local dry run; `goreleaser-check` and the distro tests use it too |
+| `release:compat` | `task release:compat VERSION=<v>` (`<v>` is the tag without `v`, e.g. `0.2.0`): copies `internal/protocol/testdata/v1` to `internal/protocol/testdata/compat/<v>/`, then deletes all but the two newest final-release snapshots (SemVer order). Fails unless `VERSION` is a final `X.Y.Z`: prereleases (`-rc.N`) get no snapshot, and a forgotten `VERSION=` leaves the dev version, which fails too | 01 §14.3. Run in the release-prep PR (9.1 "Before tagging"); release.yml checks the result (9.3). Plain `sh` and `cp`, no Go or Node. S01 writes it as a stub; S75 (01 P13) owns the body |
 | `deploy:test` | distro container tests; `DISTRO=debian-12` selects one | needs podman or Docker |
-| `docker:smoke` | section 6 smoke test (bridge with a backup → restore round trip, host, no-volume, no `.env`; 11.3) | |
+| `docker:smoke` | section 6 smoke test (bridge with a backup → restore round trip and the IPv6 client-IP check, host, no-volume, no `.env`; 11.3) | |
 | `site:dev` / `site:build` | `npx --prefix docs vitepress dev\|build docs` | |
 | `clean` | remove `bin/`, `.bin/`, `dist/`, `dist-extra/`, `web/dist/*` (keeps `.gitkeep`), `.dev/` | |
 
@@ -966,15 +983,16 @@ Both files use 04's keys (04 §4.3):
 
 ```toml
 # deploy/dev/isshoni.dev.toml                      # deploy/dev/isshoni.e2e.toml differs where noted
-public_url = "http://localhost:5173"              # e2e: "http://127.0.0.1:18080" (SPA embedded)
-data_dir   = ".dev/data"                          # e2e: set by ISSHONI_DATA_DIR (a temp dir per run)
+public_url = "http://localhost:5173"              # e2e: "http://127.0.0.1:18080" (SPA embedded; default only)
+data_dir   = ".dev/data"                          # e2e: set per server by ISSHONI_DATA_DIR (a fresh temp dir)
 
 [listen]
-http    = "127.0.0.1:8080"                        # e2e: "127.0.0.1:18080"
-ice_udp = ":7882"                                 # e2e: ":17882" (so e2e can run next to task dev)
+http    = "127.0.0.1:8080"                        # e2e: "127.0.0.1:18080" (default only, like the ICE ports)
+ice_udp = ":7882"                                 # e2e: ":17882" (so a manual e2e run fits next to task dev)
 ice_tcp = ":7882"                                 # e2e: ":17882"
-admin_socket = ".dev/admin.sock"                  # e2e: global-setup passes --listen.admin-socket /tmp/isshoni-e2e-<pid>.sock
-                                                  # (macOS limits socket paths to 104 bytes)
+admin_socket = ".dev/admin.sock"                  # e2e: the fixture passes --listen.admin-socket per server
+                                                  # (<os tmpdir>/isshoni-e2e-<pid>-<n>.sock: macOS limits socket
+                                                  # paths to 104 bytes)
 
 [tls]
 mode = "off"
@@ -995,6 +1013,13 @@ release_check = false
   (off mode on a loopback listener).
 - 04's validation accepts an `http://` public URL only for loopback hosts (`localhost`, `127.0.0.1`, `[::1]`).
 - `.dev/data` and `.dev/` are created by the server on first start (04 §5.1); nothing needs to be created by hand.
+- **The e2e file's ports are defaults only.** `web/e2e/global-setup.ts` only finds the binary; it starts no server.
+  05's `startServer` fixture (05 §19.3) starts every e2e server with `--config deploy/dev/isshoni.e2e.toml` plus, per
+  server: free ports chosen in Node, passed as `--listen.http 127.0.0.1:<p>`, `--listen.ice-udp :<u>`,
+  `--listen.ice-tcp :<t>` and `--public-url http://127.0.0.1:<p>`; a fresh temp data dir (`ISSHONI_DATA_DIR`); and
+  its own `--listen.admin-socket <os tmpdir>/isshoni-e2e-<pid>-<n>.sock`. Parallel workers, specs with their own
+  server and a running `task dev` therefore never share a port, a data dir or a socket. The TOML values only matter
+  for a manual `isshoni serve --config deploy/dev/isshoni.e2e.toml`.
 
 localhost is a secure context, so `getDisplayMedia`, service workers and Secure cookies work in Chrome, Edge and
 Firefox.
@@ -1067,7 +1092,7 @@ The `changes` job (`dorny/paths-filter`) sets these outputs. On `push` to `main`
 | `protocol` | go or web | `task gen:check` (tygo drift). The golden fixtures (`01`) run inside `test-go` and `web` | 5 | yes |
 | `licenses` | go, web or site | `task licenses` | 10 | yes |
 | `build` | always | downloads `web/dist`, `task notices`, `task build:go` (no Node on this runner); `bin/isshoni version --json` must show the commit and `0.0.0-ci.<run>`; warns above 60 MB. Uploads `bin/isshoni` | 10 | yes |
-| `e2e` | go or web | setup-node and `npm ci` in `web/`; downloads the binary and runs `chmod +x bin/isshoni` (artifacts lose the mode bit); env `ISSHONI_BIN: ${{ github.workspace }}/bin/isshoni`; the runner's preinstalled Google Chrome stable (`npx --prefix web playwright install chrome` only if it is missing); starts a PulseAudio null sink (Chrome needs an output device for tab audio; drop this step if slice S4 shows it isn't needed); `xvfb-run -a npm --prefix web run e2e`. On failure uploads the Playwright trace, video and server JSON log | 20 | yes |
+| `e2e` | go or web | setup-node and `npm ci` in `web/`; downloads the binary and runs `chmod +x bin/isshoni` (artifacts lose the mode bit); env `ISSHONI_BIN: ${{ github.workspace }}/bin/isshoni`; the runner's preinstalled Google Chrome stable (`npx --prefix web playwright install chrome` only if it is missing); starts a PulseAudio null sink (Chrome needs an output device for tab audio; drop this step if slice S4 shows it isn't needed); `xvfb-run -a npm --prefix web run e2e`. On failure uploads the Playwright trace, video and the per-server JSON logs (`web/test-results/server-*.log`, 14) | 20 | yes |
 | `lint-deploy` | deploy | `task lint:sh lint:actions lint:keys lint:unit lint:pins test:sh` | 10 | yes |
 | `distro` | deploy or release | matrix of the 6 container distros (4.13), scenarios from 11.2; setup-node and `npm ci` in `web/`, because `task release:snapshot` builds the SPA (7.2) | 30 | yes |
 | `docker-smoke` | docker, deploy or release | `task docker:smoke` (11.3), linux/amd64 | 15 | yes |
@@ -1204,6 +1229,11 @@ owner.
 
      A patch release only needs install.sh with a domain, plus one phone.
   3. Release-notes facts are ready: migrations yes/no, protocol bump yes/no, security fixes.
+  4. **Release-prep PR** (final releases only; a `-rc.N` tag skips this step): on a branch from `main`, run
+     `task release:compat VERSION=X.Y.Z` (7.2), commit `internal/protocol/testdata/compat/`, open a PR into `main`
+     and merge it once `ci-ok` is green. Tag that merge commit. The release job can't commit the snapshot itself:
+     `main` requires a PR and `ci-ok`, and Actions may not open PRs (8.6). Without the merged snapshot, release.yml's
+     `build` job fails before goreleaser runs (9.3).
 - **Tag and push** with plain git: `git tag -a v0.1.0 -m v0.1.0 && git push origin v0.1.0`. `gh` is not needed.
 - **Approve.** The owner edits the draft notes on GitHub, then approves the `release` environment (works from the
   GitHub mobile app).
@@ -1387,12 +1417,16 @@ The workflow computes the version once: the tag without `v`, or `0.0.0-dryrun.<r
   1. checkout with `fetch-depth: 0`;
   2. download the `web-dist` artifact into `web/dist/`;
   3. setup-go (from `go.mod`), Task, syft, cosign v3, buildx, ghcr login with `GITHUB_TOKEN`;
-  4. `goreleaser release --clean`, which creates the **draft** release and pushes `ghcr.io/moonwx/isshoni:<v>`. Its
+  4. **compat snapshot check** (non-prerelease tags only; skipped for `-rc.N` and in a dry run): fails with "run task
+     release:compat VERSION=<v> in a release-prep PR (9.1)" unless `internal/protocol/testdata/compat/<v>/` exists
+     and `diff -r internal/protocol/testdata/v1 internal/protocol/testdata/compat/<v>` finds no difference (01
+     §14.3). It runs before goreleaser, so a missing or stale snapshot creates no draft and pushes no image;
+  5. `goreleaser release --clean`, which creates the **draft** release and pushes `ghcr.io/moonwx/isshoni:<v>`. Its
      before hook (`task release:prepare`, 7.2) runs no npm: it fails unless `web/dist/version.json` is `<v>`, then
      writes `THIRD_PARTY_NOTICES` (Go only, 8.4) and stamps `install.sh`;
-  5. `actions/attest-build-provenance` for `dist/*.tar.gz dist/*.zip dist/*.deb dist/*.rpm dist/checksums.txt
+  6. `actions/attest-build-provenance` for `dist/*.tar.gz dist/*.zip dist/*.deb dist/*.rpm dist/checksums.txt
      dist-extra/install.sh`;
-  6. image digest via `docker buildx imagetools inspect ghcr.io/moonwx/isshoni:<v> --format '{{json .Manifest}}'`,
+  7. image digest via `docker buildx imagetools inspect ghcr.io/moonwx/isshoni:<v> --format '{{json .Manifest}}'`,
      then `cosign sign --yes ghcr.io/moonwx/isshoni@<digest>` and `attest-build-provenance` with that
      `subject-digest` and `push-to-registry: true`.
 - Timeout 45 min.
@@ -1513,9 +1547,9 @@ After a leak, the backup key signs until a new key exists, and a security adviso
 | `/install/` | Shell install: the one-liner; what the script does, step by step; every flag and env var (4.1); non-interactive and cloud-init use; upgrade; uninstall/purge; **manual verification** (10.3); supported distros (4.13) |
 | `/install/docker` | compose (bridge) with `.env` (an empty or missing value means unset: IP certificate, STUN detection); host-network alternative and switching modes (6.3); host sysctls; ufw bypass; bind-mount ownership; rootless notes; setup-url, doctor, backup, restore (`restore --yes -`), offline restore, logs, upgrade (6.4); a link to `/install/reverse-proxy#docker` for hosts whose 80/443 are taken; the Let's Encrypt notice: "isshoni gets its certificate from Let's Encrypt. Using it means you accept the Let's Encrypt Subscriber Agreement: https://letsencrypt.org/repository/" |
 | `/install/vps` | Choosing a VPS (CPU, RAM, **transfer**, with the plan's bandwidth example and formula); ports table (section 2); per-provider firewall steps with stable anchors (10.4) |
-| `/install/reverse-proxy` | `tls.mode=off` behind Caddy, nginx and Traefik: WebSocket upgrade for `/ws`, trusted `X-Forwarded-*` CIDRs, and that **7882/udp and 7882/tcp must still be reachable directly**. A Docker section (`#docker`) with the compose file and notes of 6.5 |
+| `/install/reverse-proxy` | `tls.mode=off` behind Caddy, nginx and Traefik: WebSocket upgrade for `/ws`, trusted `X-Forwarded-*` CIDRs (a proxy on the same host needs no setting: with a loopback `listen.http`, `127.0.0.0/8` and `::1/128` are trusted by default, 04 §8.5), and that **7882/udp and 7882/tcp must still be reachable directly**. A Docker section (`#docker`) with the compose file and notes of 6.5 |
 | `/install/tls` | The four TLS modes: auto (domain), ip (6-day Let's Encrypt IP certificates, GA since 2026-01), manual, off (needs `ISSHONI_PUBLIC_URL`, 4.1); why self-signed is not supported (plan); for auto and ip, the Let's Encrypt notice: "isshoni gets its certificate from Let's Encrypt. Using it means you accept the Let's Encrypt Subscriber Agreement: https://letsencrypt.org/repository/" |
-| `/guide/` | For friends: joining with an invite, watching (focus, audio follows focus, fullscreen, tap to unmute), sharing from Chrome/Edge ("window + its audio"; the whole-screen warning), phones (Add to Home Screen, notifications, iOS limits) |
+| `/guide/` | For friends: joining with an invite, with the chat-app tip "Opened from a chat app? Use its ⋯ menu → Open in Safari/Chrome first" (a chat app's built-in browser has its own cookie jar and no Add to Home Screen; 05's in-app banner); watching (focus, audio follows focus, fullscreen, tap to unmute), sharing from Chrome/Edge ("window + its audio"; the whole-screen warning), phones (Add to Home Screen, notifications, iOS limits) |
 | `/troubleshooting` | Sections for every doctor check and every connection-test result (10.4), plus: certificate not issued; UDP blocked (ICE-TCP 443 still works); CGNAT/home server; Firefox's first join (OpenH264 download, S4); macOS Local Network permission (S4 finding 6); iOS tap to unmute; DRM shows black; "Copy diagnostics" **Later (M5)** |
 | `/privacy` | The plan's "Privacy and trust model", word for word in substance, plus the **server's outbound connections exactly as 04 §16's table** (destination, when, what is sent, off switch), rendered in full: including STUN to Cloudflare and Google every 10 minutes, the ACME-directory clock check, and the four push services (payloads encrypted, RFC 8291). 04 §16 is the single source; the page adds nothing and drops nothing. Also what the installer contacts (the site and GitHub) and what the site stores (nothing) |
 | `/code-signing` | Code-signing policy (below) |
@@ -1589,6 +1623,15 @@ package, and because `tools/` is a separate module that can't import `internal/`
 | wizard connection test (`05`) | `/troubleshooting#ct-<code>` | one `{#ct-<code>}` heading per result code in `web/src/conntest/codes.json` (05 §14.2) |
 | wizard fix text per provider (`05`), doctor text output (`04`) | `/install/vps#<provider-id>` | one heading per `CloudProvider` constant: 04's typed constants in `internal/protocol/api/conntest.go`, which `task gen` also writes to `web/src/protocol/api.gen.ts` for 05 (today `aws`, `gcp`, `azure`, `oracle`, `hetzner`, `digitalocean`, `vultr`, `linode`, `scaleway`, `ovh`, `alibaba`, `tencent`, `unknown`). The test collects the constants from the Go file with `go/parser`, not from a hand-kept list. The page may add sections the product never links to (`aws-lightsail`, `contabo`, `home`) |
 | installer and docs | `/install/reverse-proxy`, `/install/reverse-proxy#docker`, `/install/vps`, `/security#verify`, `/security#keys` | fixed |
+
+**`ct-` sections whose fix is not the firewall.** Most `ct-` sections point to the cloud and host firewall. This one
+must not:
+- `#ct-no_public_ip` (05 §14.2; every row ✗ while the server doesn't know its public IPv4): the probe answers carry no
+  IPv4 address, so browsers can't reach the media ports whatever the firewall says. It happens with a domain or
+  off-mode server in a Docker bridge or behind a router when STUN is blocked, or with `network.stun_servers = []` and
+  no `public_ip`. Fix: set `public_ip = "<the server's public IPv4>"` in `/etc/isshoni/isshoni.toml`, then
+  `sudo systemctl restart isshoni`; under Docker set `ISSHONI_PUBLIC_IP` in `.env`, then `docker compose up -d` (which
+  recreates the container with the new env; `docker compose restart` would keep the old env). Then run the test again.
 
 The Go base URL is `version.DocsURL = "https://moonwx.github.io/isshoni/"` (04 §15), one constant.
 
@@ -1706,9 +1749,14 @@ page is written):
    - `docker compose exec -T isshoni isshoni setup-url` prints `^https://smoke\.test/setup#.+`;
    - `docker compose down && up -d` → the admin still exists after seeding (`setup-url` exits 7);
    - backup → restore round trip with the exact commands of 6.4:
-     `docker compose exec -T isshoni isshoni admin backup --out - > b.tar.gz`, then
-     `docker compose exec -T isshoni isshoni admin restore --yes - < b.tar.gz` → exit 0; health is `healthy` again
-     within 60 s; `setup-url` still exits 7 (the admin survived);
+     `(umask 077; docker compose exec -T isshoni isshoni admin backup --out - > b.tar.gz)` → `stat -c %a b.tar.gz`
+     prints `600`; then `docker compose exec -T isshoni isshoni admin restore --yes - < b.tar.gz` → exit 0; health
+     is `healthy` again within 60 s; `setup-url` still exits 7 (the admin survived);
+   - **client IP over IPv6** (the 6.4 warning; skipped with a note when the runner has no IPv6 loopback): log in as
+     the seeded admin with `curl --resolve 'smoke.test:443:[::1]'` (`POST /api/v1/auth/login`), then
+     `GET /api/v1/me/sessions` with that cookie. The `current` session's `lastIp` is the compose network's gateway
+     (from `docker network inspect isshoni_default`), not `::1`: docker-proxy forwards IPv6 clients from that
+     address. If a Docker update changes this, the test fails and 6.4 is updated;
    - `docker inspect` shows `ReadonlyRootfs: true` and `CapDrop: [ALL]`.
 4. **Host:** the same with `compose.host.yaml`, plus `ss -ltnp` on the runner shows :443 owned by the container's
    process.
@@ -1778,7 +1826,7 @@ can watch.
 |---|---|---|
 | T−15 min | A starts `tools/exittest collect` on the VPS, detached from the SSH session (12.3) | |
 | T−5 | B and E sign up (A sent them the invite link beforehand). B starts a window share (a video in a window), so the others have something to watch from their first second. E has the firewall rules in place | the admin dashboard shows E's connection as `tcp443` (pre-flight 4); E's seconds from opening the link to video playing |
-| T+0 | A posts the invite link in the voice chat; C and D sign up | per person: seconds from opening the link to video playing (link → sign-up form → Lounge → B's share plays → one tap to unmute), the plan's first-join journey |
+| T+0 | A posts the invite link in the voice chat; C and D long-press it → Open in Safari (C) / Chrome (D), not the chat app's built-in browser, and sign up there | per person: seconds from opening the link to video playing (link → sign-up form → Lounge → B's share plays → one tap to unmute), the plan's first-join journey |
 | T+5 | A shares (Movie) | A's share, the newest, takes focus; audio and video OK for everyone |
 | T+10 | Everyone switches focus between A's and B's shares | switching focus moves the audio (audio follows focus) |
 | T+15 | C and D: Add to Home Screen and allow notifications; E allows notifications | C and D log in once inside the Home Screen app (it has its own cookie jar; an expected action, 12.3) |
@@ -1872,7 +1920,7 @@ Anything beyond these, such as a reload, a second tap, a re-join or a second log
 | Unit | `tools/relserve` | `/latest` redirect format matches GitHub's; files served; the CA verifies |
 | Static | `lint-deploy` | shellcheck, shfmt, actionlint, `systemd-analyze verify`, the key block, `.tool-versions` = `go.mod` toolchain |
 | Integration | distro containers C1–C13 (11.2) | install, idempotency, upgrade, downgrade refusal, tamper refusal, port conflict, re-runs after exit 7 and exit 5, uninstall, purge, backup/restore |
-| Integration | Docker smoke (11.3) | bridge and host bind 443 as designed, healthcheck, setup-url via exec, persistence, backup → restore through `exec -T` with `--yes`, no-volume refusal, start with no `.env` |
+| Integration | Docker smoke (11.3) | bridge and host bind 443 as designed, healthcheck, setup-url via exec, persistence, backup (a `0600` file) → restore through `exec -T` with `--yes`, an IPv6 client seen as the bridge gateway (6.4), no-volume refusal, start with no `.env` |
 | Integration | `goreleaser-check` | the asset names and archive contents of section 3 |
 | Integration | site | the build, and **anchor coverage**: `go test ./internal/server/ops/doctor -run TestDocsAnchors` (10.4: reads `docs/troubleshooting.md` and `docs/install/vps.md`; ids from the doctor registry, the `CloudProvider` constants and `web/src/conntest/codes.json`) |
 | E2E | Playwright in CI (content from `05`) | the CI plumbing: a Chrome sharer → SFU → Chrome viewer; `framesDecoded > 0`; audio energy |
@@ -1910,9 +1958,10 @@ Anything beyond these, such as a reload, a second tap, a re-join or a second log
   `docs/package.json`: `dev`, `build`.
 - **e2e contract:** CI and `task e2e` provide `ISSHONI_BIN` (the absolute path of the built binary with the embedded
   SPA), `CI=1`, Google
-  Chrome stable, Xvfb and a PulseAudio null sink. The e2e server uses `deploy/dev/isshoni.e2e.toml` on
-  `127.0.0.1:18080`, and `ISSHONI_DATA_DIR` is a fresh temp dir. On failure, Playwright writes its report to
-  `web/playwright-report/` and the server log to `web/test-results/server.log`.
+  Chrome stable, Xvfb and a PulseAudio null sink. 05's fixtures start the e2e servers (05 §19.3) with
+  `deploy/dev/isshoni.e2e.toml` as the base config. No port is fixed: each server gets free ports, a fresh
+  `ISSHONI_DATA_DIR` temp dir and its own admin socket through flags (7.3). On failure, Playwright writes its report
+  to `web/playwright-report/`; each server's stdout and stderr are in `web/test-results/server-<worker>-<n>.log`.
 - **Task names** (7.2) and the required check name `ci-ok`.
 - **Reserved non-key env names.** These `ISSHONI_*` names are not config keys, and 04 ignores them without a warning
   (04 §4.2's reserved list):
@@ -1992,8 +2041,10 @@ Anything beyond these, such as a reload, a second tap, a re-join or a second log
   scaffold (README S09), not from the repo skeleton slice.
 
 **From `01-protocol.md`:** `tygo.yaml` (both packages) and the generator `internal/protocol/gen/tsregistry`;
-golden fixtures run by `go test ./internal/protocol/...` and by Vitest; the compat snapshot step at release (01
-§14.3); the `stats` counters and `isshoni_client_*` metrics for the exit test (01 §8.11, §18).
+golden fixtures run by `go test ./internal/protocol/...` and by Vitest; the fixture directory
+`internal/protocol/testdata/v1` that `task release:compat` snapshots in the release-prep PR (7.2, 9.1) and release.yml
+checks (9.3), and the compat test that decodes the snapshots (01 §14.3); the `stats` counters and `isshoni_client_*`
+metrics for the exit test (01 §8.11, §18).
 
 **From `02-sfu.md`:** `cmd/isshoni-loadtest` flags for the pre-flight (5×5, 15 minutes); SFU metric names; entries in
 `deploy/notices/extra.txt` for any adapted Galene or LiveKit code.
@@ -2013,7 +2064,7 @@ M1 timeline:
 | S1 | Scaffolding and dev loop (1.5 d) | `LICENSE` (Apache-2.0; the repo has none yet), `NOTICE`, `.tool-versions`, `go.mod` toolchain, `tools/go.mod`, `Taskfile.yml`, `.golangci.yml`, `.gitignore`, `go.mod` `ignore ./web/node_modules` and `ignore ./docs/node_modules`, `deploy/dev/*.toml`, `CONTRIBUTING.md` (the build info package is 04's `internal/version`) | Fresh clone: `mise install && task setup` succeed; `task lint:go lint:pins test:go` pass on the empty module; `task --list` shows every task of 7.2 (tasks whose inputs don't exist yet exit 0 with a note); `.bin/tygo` is v0.2.21; `task build:go` stops with a clear message while `web/dist/index.html` is missing. (`web/embed.go` and `web/dist/.gitkeep` come with 05's web scaffold, README S09) | — |
 | S2 | CI core (1.5 d) | `ci.yml` with `changes`, `lint-go`, `test-go`, `web`, `protocol`, `build`, `ci-ok`; `dependabot.yml`; actionlint; one-time GitHub setup (8.6, steps 1–3 and 6–7) | A PR with a gofmt error, a tygo drift or a failing Vitest test makes `ci-ok` fail; a clean PR passes in < 12 minutes; `main` can't be merged red | S1 |
 | S3 | License gate and notices (1.5 d) | go-licenses job, `web/scripts/licenses.mjs` with tests, `tools/notices` with golden test, `deploy/notices/*` | Adding a GPL-3.0 fixture dependency fails `licenses`; `THIRD_PARTY_NOTICES` lists every module in `go version -m bin/isshoni` plus the Go runtime and every prod npm package | S2 |
-| S4 | e2e in CI (1 d) | `e2e` job: Chrome, Xvfb, Pulse null sink (keep only if needed), artifacts | `05`'s smoke test runs green; a forced failure uploads the trace, video and server log | S2, 05 skeleton |
+| S4 | e2e in CI (1 d) | `e2e` job: Chrome, Xvfb, Pulse null sink (keep only if needed), artifacts | `05`'s smoke test runs green; a forced failure uploads the trace, video and per-server logs | S2, 05 skeleton |
 | S5 | Unit, sysctl, firewall, packaging files (1 d) | `deploy/systemd`, `deploy/sysctl`, `deploy/firewall`, `deploy/packaging` | `systemd-analyze verify` passes; in a Debian 13 VM a hand-placed binary starts as `isshoni`, binds 443, `CapEff` = 0x400; the security score is recorded in 4.5 | S1 |
 | S6 | install.sh core (3 d) | 4.1–4.10 fresh-install path, 4.12 rules, unit tests (11.1), `tools/relserve`, `lint:keys` | All unit tests pass under the 3 shells; C1 and C6 pass in a Debian 12 container against a local test release | S5 |
 | S7 | install.sh lifecycle and distro matrix (2.5 d) | upgrade, repair, downgrade, uninstall, purge, firewall offer, port check; `distro` CI job | C1–C13 pass on all 6 container distros in CI | S6, 03/04 CLI |

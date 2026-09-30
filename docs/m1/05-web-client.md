@@ -225,8 +225,8 @@ that would otherwise show a blank page.
 4. `GET /api/v1/info` (03 §12.4.1; no auth; retried 3× after 1 s, 2 s, 4 s):
    - network failure → **Offline** screen, auto-retry on the `online` event and every 10 s;
    - `setupRequired: true` and the path is not `/setup` → **NotSetUp** screen ("This server isn't set up yet. On the
-     server run `isshoni setup-url` (Docker: `docker compose exec isshoni isshoni setup-url`) and open the link it
-     prints").
+     server run `sudo isshoni setup-url` (Docker: `docker compose exec isshoni isshoni setup-url`) and open the link
+     it prints").
 5. Create the `QueryClient` (seeded with `info`) and the router; render.
 6. After first render and only in production builds: register the service worker (§16.2) when the browser is idle.
 
@@ -344,7 +344,7 @@ REST calls the SPA makes (03 §12.3 unless marked 04):
 | `POST /api/v1/push/subscriptions` · `POST /api/v1/push/unsubscribe` · `POST /api/v1/push/test` · `GET/PUT /api/v1/push/preferences` (all 03; the VAPID key is in `GET /api/v1/info`) | notifications (§16.3) |
 | (04) `POST /api/v1/conntest` | connection test (§14.2) |
 | `GET /api/v1/admin/users` · `PATCH/DELETE /api/v1/admin/users/{id}` · `POST …/{id}/password-reset` · `POST …/{id}/sign-out` | users |
-| `GET /api/v1/admin/approvals` · `POST …/{id}/approve` · `POST …/{id}/reject` | approvals |
+| `GET /api/v1/admin/approvals` · `POST …/{id}/approve` · `POST …/{id}/reject` (and its `all` form: `POST …/all/reject` `{"all": true}` → 200 `{rejected}`, 03 §7.9) | approvals |
 | `POST /api/v1/admin/rooms` · `PATCH/DELETE /api/v1/admin/rooms/{id}` | rooms |
 | `GET/PATCH /api/v1/admin/settings` | settings, dashboard checklist, wizard Done |
 | `GET /api/v1/admin/audit` | audit |
@@ -615,11 +615,20 @@ outside `platform/` may read cookies or `location.origin` or build `/api` URLs b
   | Condition | pub (client offers) | sub (server offers) |
   |---|---|---|
   | ICE `disconnected` for 3 s (timer cancelled if it recovers) | `restartIce()` and a new offer, same `gen` | `pc.restart {pc:'sub', gen, mode:'ice', reason:'disconnected'}` |
-  | ICE restart not `connected` within 15 s | rebuild: new PC, `gen + 1`, same tracks and shareIds | `pc.restart {pc:'sub', gen, mode:'rebuild', reason:'disconnected'}`; the server offers `gen + 1` |
+  | ICE restart not `connected` within 15 s | rebuild: new PC, `gen + 1`, same tracks and shareIds | 15 s from the sub offer with a new `ice-ufrag` (below): `pc.restart {pc:'sub', gen, mode:'rebuild', reason:'disconnected'}`; the server offers `gen + 1` |
   | PC `failed` | rebuild at once | `pc.restart {pc:'sub', gen, mode:'rebuild', reason:'failed'}` |
-  | after a resumed `welcome`, the PC isn't `connected` | ICE restart | nothing: the server's `Resync()` sends an ICE-restart offer; the timers above keep running |
+  | after a resumed `welcome`, the PC isn't `connected` | ICE restart | nothing: the server's `Resync()` sends an ICE-restart offer, which counts as the ICE restart (below); the timers above keep running |
   | server sends `pc.restart {pc:'pub', mode:'rebuild'}` | rebuild | — |
   | `sdp_invalid` or `bad_request` error (scope `pc`) | rebuild once; a second within 60 s → "Can't connect media" with Reload | same, through `pc.restart {mode:'rebuild'}` |
+
+  **A sub offer with a new `ice-ufrag` is the sub ICE restart**, whoever asked for it: the client's
+  `pc.restart {pc:'sub', mode:'ice'}` or the server's `Resync()` (01 §10.4, 02 §5.3). `SubscriberPC.handleOffer`
+  compares the offer's `a=ice-ufrag` with the current remote description's. On a change it cancels the 3 s timer, so
+  no `pc.restart {mode:'ice'}` of its own follows, and starts the 15 s rebuild timer from that offer, not from its
+  request. This is the usual case after a network switch (Wi-Fi to LTE): the sub PC has been `disconnected` for 3 s
+  when the socket resumes, so `Resync()` and the client's recorded rule both ask for a restart. The SFU runs only one
+  (it skips a request while one is queued or was offered less than 5 s ago), and the client's timer follows the
+  restart that actually happens.
 
   Restart reasons are `disconnected` and `failed` only. Limits (they bind the client only): one ICE restart per PC per
   5 s, one rebuild per PC per 10 s. A `pc.restart` from the server whose `gen` is older than the current pub `gen` is
@@ -639,7 +648,7 @@ outside `platform/` may read cookies or `location.origin` or build `/api` URLs b
 export class SubscriberPC {
   constructor(deps: { platform: Platform; signal: SignalClient; registry: MediaRegistry; log: Logger });
   readonly gen: number;
-  handleOffer(o: PCOffer): Promise<void>;       // queued; higher gen → replace the PC; repeated neg → resend answer
+  handleOffer(o: PCOffer): Promise<void>;       // queued; higher gen → replace the PC; repeated neg → resend answer; new ice-ufrag = ICE restart (§9)
   handleIce(i: PCICE): Promise<void>;
   requestRestart(mode: RestartMode, reason: RestartReason): void;   // pc.restart {pc:'sub', gen, mode, reason}; reason 'disconnected' | 'failed'
   getStats(): Promise<RTCStatsReport | null>;
@@ -1177,10 +1186,13 @@ Three steps across two routes, so a reload never loses progress:
    - On load: take the token that boot step 0 stashed (§4) in `sessionStorage['isshoni.setup']` and keep it in memory
      (`fragmentToken.ts`, 03 §7.8).
    - `POST /api/v1/auth/setup/check {token}`: `setup_token_invalid` → "This setup link was replaced or has expired. On
-     the server run `isshoni setup-url` for a new one."; `setup_unavailable` → "Already set up → Log in".
+     the server run `sudo isshoni setup-url` (Docker: `docker compose exec isshoni isshoni setup-url`) for a new
+     one."; `setup_unavailable` → "Already set up → Log in".
    - Form: username, password (with show/hide, no confirm field; rules from `info.accountRules`), optional server name.
      `POST /api/v1/auth/setup/complete` → 201 with the session cookie → clear the stored token → navigate to
      `/admin/welcome?step=2`.
+   - This step is slice W3 (§23), so a fresh server can be set up from the browser early. Until W10 adds steps 2–3,
+     `SetupPage` navigates to `/` instead.
 2. **`/admin/welcome?step=2`, connection test** (`ConnTestPanel`, §14.2). "Continue" is always allowed; after a
    failure it is visually secondary to "Test again".
 3. **`/admin/welcome?step=3`, invite friends.**
@@ -1331,7 +1343,7 @@ TCP ✓), `no_media` (all ✗), `no_public_ip` (all ✗ with `server.publicIp` e
 |---|---|---|
 | Dashboard | Live rooms; per share: owner, layers with size/fps/bitrate/loss, viewer counts, egress; total egress now; month-to-date transfer and projection; client versions; TLS and public IP; last doctor summary; alerts ("isshoni vX available (security fix)"); accounts and security events (`accounts`, 03); the setup checklist (§14.1) | `GET /api/v1/admin/dashboard` (04), every 2 s while visible; `GET /api/v1/admin/settings` (for `settings.setupWizardDone`, the checklist card) |
 | Users | Username, role, status, created via, last seen, online; rename; make or remove admin (asks for the admin's password, 03 §7.11); disable/enable; reset link (shown once; when the target is an admin, first asks for your password and sends it as `currentPassword`, and `wrong_password` shows under the field, 03 §7.10); sign out everywhere; delete. On your own row, disable, delete and reset are hidden (03 §7.11: use `/account`) | `GET/PATCH/DELETE /api/v1/admin/users…`, `POST …/password-reset`, `POST …/sign-out` |
-| Approvals | Pending sign-ups (username, time, IP) with Approve and Reject | `GET /api/v1/admin/approvals`, `POST …/approve`, `…/reject` |
+| Approvals | Pending sign-ups (username, time, IP) with Approve and Reject. **Reject all** (for a flood of fake sign-ups, 03 §7.9) asks for confirmation ("Reject all pending sign-ups? Anyone who is real can sign up again."), then shows "Rejected {rejected} sign-ups" from the response | `GET /api/v1/admin/approvals`, `POST …/approve`, `…/reject`; Reject all: `POST /api/v1/admin/approvals/all/reject` `{"all": true}` → 200 `{rejected}` |
 | Invites | Create (expiry 1 h, 1 day, 7 days, 30 days; uses 1, 10, 50; note), list (creator, uses, expiry, state; a filter hides inactive invites by default, client-side), revoke. The link shows once, at creation | `GET /api/v1/invites?state=all`, `POST /api/v1/invites`, `DELETE /api/v1/invites/{id}` |
 | Rooms | List, create, rename, delete (not the default room: 409 `room_is_default`) | `GET /api/v1/rooms`, `POST/PATCH/DELETE /api/v1/admin/rooms…` |
 | Settings | Server name (`serverName`, empty = the server's host); registration mode; invite defaults and `membersCanInvite`; soft limits (participants and shares per room, share bitrate cap); transfer alert (GB per month); `minClientVersion`; release check; fields in `locked` are read-only with "Set in isshoni.toml"; `setupWizardDone` is never shown as a field. On save, the `admin.settings` invalidate topic already refreshes `['info']` (§6.2) | `GET/PATCH /api/v1/admin/settings` |
@@ -1500,6 +1512,11 @@ and, on Android, in the room's one-time card. iOS: the Home Screen sheet above, 
     constant there has no `conntest.nat.<nat>` entry. The script reads both constant lists from `api.gen.ts`.
 
   Unused keys are warnings.
+
+  CI runs `check:i18n` on every PR from the first web slice on, so each rule arrives with the slice that makes it
+  checkable (§23): W1 writes the script with the `t('…')` rule; W2 adds the error-code rule and every `errors.<code>`
+  key; W10 adds the `CloudProvider`/`NATKind` rule and its `fix.firewall.*` and `conntest.nat.*` texts; W13 adds the
+  unused-key warnings and a test that a removed key fails the check.
 - The catalog is the single source for Go-rendered strings later (plan): *later (M2)* the tray embeds it. 04's doctor
   CLI keeps its own English templates of the same codes (04 §13.2).
 
@@ -1621,7 +1638,7 @@ export default defineConfig({
 | `viewer/layerPolicy.ts` | each rule in §12.4, including PiP while hidden, fullscreen, the 10 s hidden rule |
 | `viewer/autoFocus.ts` | newest share auto-focused; manual holds; resumes after the manual share ends; `replaces` carries focus and audio only for the same user; `?focus=`; own share never focused |
 | `viewer/audioOut.ts` (fake media element) | locked → blocked on `NotAllowedError` → playing after tap; swap keeps playing |
-| `viewer/SubscriberPC.ts`, `share/PublisherPC.ts` (fake RTCPeerConnection) | `gen`/`neg` rules of §9: stale gen dropped, repeated neg resends the stored answer, one outstanding offer with folding, candidate buffering (64), `probe()` on `disconnected`, recovery timers (3 s, 15 s, spacing 5 s/10 s, 5 rebuilds → UI state), no sub `pc.restart` after a resumed welcome |
+| `viewer/SubscriberPC.ts`, `share/PublisherPC.ts` (fake RTCPeerConnection) | `gen`/`neg` rules of §9: stale gen dropped, repeated neg resends the stored answer, one outstanding offer with folding, candidate buffering (64), `probe()` on `disconnected`, recovery timers (3 s, 15 s, spacing 5 s/10 s, 5 rebuilds → UI state), no sub `pc.restart` after a resumed welcome; a sub offer with a new `ice-ufrag` cancels the 3 s timer (no `pc.restart {mode:'ice'}` follows) and starts the 15 s rebuild timer from that offer, also when the client had already sent its own request |
 | `rooms/RoomSession.ts` (fake SignalClient) | resync after resumed and not-resumed welcomes (01 §10.5): pending offer re-sent, full `subscribe.update` only when non-empty and in chunks of 64, re-publish with `replaces`, stray server share stopped; `join()` before `ready` joins on the next resync; a resumed welcome with a missing or other `roomId` re-joins the desired room; own `share.stopped` (each reason) and the `room.state` fallback drive §13.1 |
 | `protocol/invalidate.ts` | each topic → its query keys |
 | `protocol/rest.ts` | both error envelopes parse to the same `ApiError`; `Content-Type` always set on unsafe methods |
@@ -1706,7 +1723,7 @@ Stats are read through `window.__isshoni.stats()` (§10.7).
 | `unmute.spec` | without the autoplay flag, "Tap to unmute" appears; after a click, the audio element plays and `audioLevel > 0.05` |
 | `reconnect.spec` | (a) `__isshoni.dropSocket()`: resumed with the same `connectionId`, `framesDecoded` keeps rising, no new sub offer; (b) `context.setOffline(true)` for 5 s: the banner appears after 2 s, then clears; (c) own server, `restart()` (same data dir and ports): the viewer decodes the re-published share within 15 s, focused, with audio |
 | `warning.spec` | fake display `monitor+audio` shows the warning; "Share without sound" publishes without an audio track; "Pick something else" reopens the picker |
-| `a11y.spec` | axe (`wcag2a`, `wcag2aa`, `wcag21aa`) on login, invite, setup, the room with a share, admin users: no serious or critical violations; the tile list is keyboard-reachable; `F` toggles fullscreen |
+| `a11y.spec` | axe (`wcag2a`, `wcag2aa`, `wcag21aa`) on login, invite, reset, setup, the room with a share, admin users: no serious or critical violations; the tile list is keyboard-reachable; `F` toggles fullscreen |
 | `pwa.spec` | the manifest parses; the service worker activates; offline navigation shows the Offline screen from the cached shell |
 | `version.spec` | `page.routeWebSocket` rewrites `serverVersion` in `welcome`: the page reloads once, then shows VersionMismatch; a routed `protocol_unsupported` error shows it at once |
 | `admin.spec` | own server (approval mode is server-wide): create and revoke an invite; approve a pending sign-up in approval mode; doctor page renders results |
@@ -1726,13 +1743,14 @@ tests). The M1 exit check is the human session of 06 §12.
 | M-IOS-3 | iPhone with a Discord call on the same phone | both audible; isshoni doesn't interrupt the call |
 | M-IOS-4 (optional) | iPhone, invite link opened from a chat app | the in-app banner (or, where undetectable, the chat-app line of `needs-install`) appears; Copy link → Safari → sign up there and log in only once more inside the Home Screen app |
 | M-IPAD | iPad Safari | element fullscreen; keyboard shortcuts with a hardware keyboard |
-| M-AND-1 | Android Chrome (emulator + a friend's phone) | install prompt; push; background audio; media-session metadata |
+| M-AND-1 | Android Chrome (emulator + a friend's phone) | invite → sign up → Lounge; install prompt; push; background audio; media-session metadata |
 | M-FF-1 | Firefox, fresh profile | decoder-pending message with audio playing, then video without a reload; the Chrome sharer switches to Constrained Baseline |
 | M-SAF | Safari macOS viewer | plays High; PiP |
 | M-EDGE | Edge on Windows 11 sharer | window + its audio: only that app heard; whole screen + system audio shows the warning |
 | M-CHR-MAC | Chrome on macOS sharer | High profile; hardware encoders for both layers (stats) |
 | M-LAN | Firefox on macOS against a LAN server | the Local Network fix text appears (S4 finding 6) |
 | M-WIFI | phone viewer switching Wi-Fi → LTE | playback recovers without a reload (01 §11.5 C) |
+| M-BW | Chrome viewer on a throttled downlink (macOS Network Link Conditioner, or `tc` on Linux), watching a share with motion | the focused tile drops to `low` with reason `bandwidth` ("Lower quality (your connection)"); after the throttle is lifted it returns to `high` within about 2 minutes, with no reload (02 §10.2, trial upgrades) |
 
 ---
 
@@ -1783,12 +1801,13 @@ recovery rules of §9–§10; error codes and client actions of §12.
 
 **02-sfu.md**: `ShareParams` numbers per preset (02 §8.6, matching §13.5 here); codec policy and
 `quality.hint{codec}` (§8.3); caps-driven Firefox handling and the server's retries (§8.5); probe PCs (§7.6); layer
-pausing through `quality.hint.encodings` (§11).
+pausing through `quality.hint.encodings` (§11); one sub ICE restart at a time (§5.3), so the client counts a sub offer
+with a new `ice-ufrag` as its restart (§9 here).
 
 **03-accounts-and-store.md**: the REST endpoints and DTOs of §12 (paths in §6.2 here, including push subscriptions
-and preferences), the error envelope (§12.2), CSRF by content type (§7.5),
-cookies (§7.4), setup/invite/reset flows (§7.8–§7.10), `setupWizardDone` (§7.8), `Me.permissions` and `Me.badges`,
-`GET /api/v1/rooms` with `showRoomList` and `defaultRoomId`, admin-only room creation.
+and preferences), the error envelope (§12.2), CSRF by content type (§7.5), cookies (§7.4), setup/invite/reset flows
+(§7.8–§7.10), the approval queue and its Reject all (§7.9), `setupWizardDone` (§7.8), `Me.permissions` and
+`Me.badges`, `GET /api/v1/rooms` with `showRoomList` and `defaultRoomId`, admin-only room creation.
 
 **04-server-platform.md**: SPA serving and headers (§9.5–§9.6); `POST /api/v1/conntest` (§7.7); doctor JSON and
 provider ids (§13); `GET /api/v1/admin/bandwidth` (§13.4); dashboard (§11.4); the push payload (§14.3); dev Host check
@@ -1819,29 +1838,29 @@ demo is possible after W7.
 
 | # | Slice | Size | Depends on | Acceptance |
 |---|---|---|---|---|
-| W1 | **Scaffold, build and embed**: npm project, Vite/React/TS 6 strict, ESLint (all plugins), Prettier, Vitest, i18n init with `en.json`, tokens and global CSS, `boot-check.js`, `embed.go`, build plugins (version, compress, report), `check:size`; 06's license script wired into `build` | M | 06 S1 | `npm ci && npm run lint && npm run typecheck && npm test -- --run && npm run build && npm run check:size` pass; a JSX literal string fails lint; `go build ./...` works on a fresh clone and embeds a real build after `task build:web`; `.br`/`.gz` siblings present; React Router 8 API names confirmed |
-| W2 | **Platform + REST + boot**: `types.ts`, `BrowserPlatform` (client info, caps via 01's `detectCaps`, role, storage, apiFetch), `rest.ts`/`ApiError`, query client, `invalidate.ts`, boot sequence, Offline/NeedsHttps/NotSetUp/Unsupported/Fatal screens | M | W1, 01 P2, 03 DTOs | Unit tests for `ApiError` (both envelopes) and the topic map; MSW tests for each boot branch; `role` is `viewer` with a mobile UA |
-| W3 | **Auth**: login, invite, signup, pending, reset, logout, guards, `next` guard, BroadcastChannel logout, About/trust model | M | W2, 03 auth | Component tests for each error code on each form; the fragment is removed before the first request (spy on fetch); a logout in tab A redirects tab B |
+| W1 | **Scaffold, build and embed**: npm project, Vite/React/TS 6 strict, ESLint (all plugins), Prettier, Vitest, i18n init with `en.json`, tokens and global CSS, `boot-check.js`, `embed.go`, build plugins (version, compress, report), `check:size`, `scripts/check-i18n.mjs` with its first rule (a `t('…')` literal key missing from `en.json`, §16.5); 06's license script wired into `build` | M | 06 S1 | `npm ci && npm run lint && npm run typecheck && npm test -- --run && npm run build && npm run check:size && npm run check:i18n` pass; a JSX literal string fails lint; a `t('…')` literal key missing from `en.json` fails `check:i18n`; `go build ./...` works on a fresh clone and embeds a real build after `task build:web`; `.br`/`.gz` siblings present; React Router 8 API names confirmed |
+| W2 | **Platform + REST + boot**: `types.ts`, `BrowserPlatform` (client info, caps via 01's `detectCaps`, role, storage, apiFetch), `rest.ts`/`ApiError`, query client, `invalidate.ts`, boot sequence, Offline/NeedsHttps/NotSetUp/Unsupported/Fatal screens; the `check:i18n` error-code rule (§16.5) and an `errors.<code>` key in `en.json` for every `ErrorCode` and api `Code…` constant | M | W1, 01 P2, 03 DTOs | Unit tests for `ApiError` (both envelopes) and the topic map; MSW tests for each boot branch; `role` is `viewer` with a mobile UA; `check:i18n` fails when an error code has no `errors.<code>` key; the i18n unit test of §19.1 passes |
+| W3 | **Auth and setup step 1**: login, invite, signup, pending, reset, logout, guards, `next` guard, BroadcastChannel logout, About/trust model; `/setup` step 1 (§14.1, `SetupPage`: fragment token, `setup/check`, create-admin form, `setup/complete`), navigating to `/` until W10 | M | W2, 03 auth | Component tests for each error code on each form; the fragment is removed before the first request (spy on fetch); a logout in tab A redirects tab B; `SetupPage` (MSW) reads the `/setup` fragment token, calls `setup/check`, and its form calls `setup/complete`, then navigates to `/` |
 | W4 | **Signaling wiring**: `connection.ts` with 01's `SignalClient`, `connectionStore`, the §7.1 UI states, stale-build reload | S | W2, 01 P10 | Against a `task dev` server the page reaches `ready`; killing the server shows "Reconnecting…" after 2 s and recovers; a fake `staleBuild` reloads once |
 | W5 | **Room session and shell**: `RoomSession` join/leave/resync, `roomStore`, `room.event` announcements, RoomPage layout, header, people panel, switcher (`showRoomList`), `InRoomBar`, root redirect | M | W4, 01 P4–P5, 03 rooms | Two browsers in Lounge see each other within 1 s; closing a tab removes its presence at once (close 1000) while cutting its network keeps it for the grace period; the switcher appears only when `showRoomList` |
 | W6 | **Web sharer core**: ShareSheet, `pick()` with the §13.2 options and fallbacks, fake-display seam, `classify`, `ScreenAudioWarning`, `share.start`, `PublisherPC` (gen/neg, tracks), codec prefs, encodings from `ShareParams`, presets, stop and browser-stop | L | W5, 01 P7, 02 publish | `watch.spec`'s sharer half: `room.state` shows the share live with layers `high` and `low`; `warning.spec` passes; the tone-tab capture works in CI (xvfb) and the choice is recorded; unit tests for classify/codecPrefs/encodings |
 | W7 | **Viewer core**: `SubscriberPC`, media registry, Stage/Tile/ViewerLayout, auto-focus, audio-follows-focus via `audioOut`, TapToStart, watchers popover, stats collector core and the `window.__isshoni` debug handle | L | W5, W6, 02 subscribe | `watch.spec`, `focus-audio.spec` and `unmute.spec` pass |
 | W8 | **Layers, fullscreen, keyboard, mobile**: `layerPolicy` + `SubscriptionSync`, IntersectionObserver and visibility, fullscreen/PiP/wake lock, shortcuts, phone layouts, iOS handling, media session, `?focus=` | M | W7 | `layers.spec` passes; policy unit tests; manual M-IOS-1 and M-AND-1 viewing checks pass |
 | W9 | **Resilience**: §9 recovery table, `resync` (resumed and not), re-publish with `replaces` and focus carry-over, 60 s capture hold, Firefox codec wait (caps polling and `caps.update` only), `quality.hint` (codec switch and layer `active` flags) | L | W7, W6, 01 P9 | `reconnect.spec` (a)(b)(c) pass; manual M-FF-1 and M-WIFI pass; a `quality.hint{codec}` makes the sharer re-offer and viewers keep decoding |
-| W10 | **Setup wizard + connection test**: `/setup`, `/admin/welcome`, `runConnTest`, verdicts, fix text, `InviteLinkCard` with QR | L | W3, 04 conntest, 02 probe | `setup.spec` passes; on a test VPS with UDP 7882 blocked by the provider firewall the page shows ✗ UDP / ✓ TCP with that provider's text; a non-admin sees no fix text |
+| W10 | **Setup wizard steps 2–3 + connection test**: `/admin/welcome` (`WelcomePage` steps 2–3, `setupWizardDone`), W3's `SetupPage` now navigates to `/admin/welcome?step=2`; `runConnTest`, verdicts, fix text, `InviteLinkCard` with QR; the `check:i18n` `CloudProvider`/`NATKind` rule (§16.5) with every `fix.firewall.<provider>` and `conntest.nat.<nat>` text | L | W3, 04 conntest, 02 probe | `setup.spec` passes; `check:i18n` fails when a `CloudProvider` or `NATKind` constant has no text; on a test VPS with UDP 7882 blocked by the provider firewall the page shows ✗ UDP / ✓ TCP with that provider's text; a non-admin sees no fix text |
 | W11 | **Account + PWA + Web Push**: account and devices pages, manifest, SW (`sw-plugin`, routes, push), update pill, install prompts, notifications flow incl. iOS Home Screen guidance, the in-app browser banner and preferences | L | W3, 03 push REST, 04 push wiring | `pwa.spec` passes; SW unit tests pass; manual M-IOS-2 and M-AND-1 push checks pass |
 | W12 | **Admin pages**: dashboard, users, approvals, invites, rooms, settings, audit, doctor + bandwidth | L | W3, W10, 03/04 admin | `admin.spec` passes; the dashboard updates every 2 s while visible and stops when hidden |
-| W13 | **Hardening**: debug overlay with `stats.watch`, `stats` notifications, sharer hints and level meter, announcer, reduced motion, `check:i18n`, VersionMismatch, `a11y.spec`, `version.spec` | M | W7, W9 | Those specs pass; `check:i18n` catches a removed key; the overlay shows per-tile stats with no IPs; the upload hint appears under Chrome DevTools network throttling (manual) |
+| W13 | **Hardening**: debug overlay with `stats.watch`, `stats` notifications, sharer hints and level meter, announcer, reduced motion, `check:i18n` unused-key warnings (its other rules came in W1, W2 and W10), VersionMismatch, `a11y.spec`, `version.spec` | M | W7, W9 | Those specs pass; a test shows `check:i18n` fails when a key is removed, and the script warns about unused keys; the overlay shows per-tile stats with no IPs; the upload hint appears under Chrome DevTools network throttling (manual) |
 | W14 | **CI and exit checks**: full e2e in CI (06), manual matrix §19.4 | M | all | CI green on a PR; the matrix filled in; the 06 §12 exit session passes (5 friends, 2 hours, no manual fixes; iPhone and Android watch) |
 
 ---
 
-## 24. Open questions for the owner
+## 24. Owner decisions
 
-1. **Auto-focus after a manual pick** (moved to `README.md`, "Questions for the owner"). The plan says the newest
-   share is focused automatically. Proposed: once a friend clicks a tile, a newly started share only shows a "bo
-   started sharing [Watch]" toast instead of taking over the stage and the sound, until the picked share ends. OK, or
-   always jump to the newest share?
+1. **Auto-focus after a manual pick: toast** (owner, 2026-09-30). The newest share is focused automatically only
+   while the friend hasn't picked a tile. Once they click a tile, a newly started share shows a "bo started sharing
+   [Watch]" toast instead of taking over the stage and the sound, until the picked share ends; then the newest live
+   share is focused again.
 
 Decided at integration:
 - **Web sharing in desktop Firefox and Safari**: the Share button appears wherever the feature probe passes (plan:

@@ -144,7 +144,11 @@ Conventions:
 - `--socket PATH` overrides `listen.admin_socket` for client commands.
 - `--json` prints exactly one JSON document on stdout; human text goes to stderr.
 - Colors only on a TTY and only when `NO_COLOR` is unset.
-- Destructive commands (`restore`, `rotate-secrets`) ask `Continue? [y/N]` on a TTY; without a TTY they need `--yes`.
+- Destructive commands (`restore`, `rotate-secrets`) ask `Continue? [y/N]` only when stdin is a TTY (so never for
+  `restore -`, whose stdin is the archive); otherwise they need `--yes`. Without it they refuse (exit 2) and print the
+  exact command with `--yes` added, in the environment's form (Docker when a container is detected, §5.1; the same
+  detection as §6.1 step 4), e.g. `sudo isshoni admin restore --yes /root/backup.tar.gz` under systemd, or
+  `docker compose exec -T isshoni isshoni admin restore --yes - < backup.tar.gz` in Docker.
 - The CLI never opens the database or writes to the data directory, except `--offline` commands (§12.6).
 
 ### 3.2 Exit codes
@@ -153,7 +157,7 @@ Conventions:
 |---|---|
 | 0 | Success (doctor: no `fail` results) |
 | 1 | Runtime error: cannot bind a port, another isshoni process holds the data-directory lock (§5.1), a `store.Open` error that does not wrap `store.ErrNeedsOperator`, backup failed, unexpected server error |
-| 2 | Usage error: unknown command or flag, missing argument |
+| 2 | Usage error: unknown command or flag, missing argument, a destructive command without a TTY and without `--yes` (§3.1) |
 | 78 | `EX_CONFIG`: a configuration or data problem that a restart can't fix: invalid config (all problems are printed, §4.5, including a policy value that 03's `SettingsCache.Pin` rejects), `config init`/`config example`: the given values are invalid, any `store.Open` error for which `errors.Is(err, store.ErrNeedsOperator)` (newer schema, history mismatch, failed migration, corrupt DB, …; 03's message is printed), a corrupt `secrets.json`, wrong owner of data files (§5.2), or a container without a data volume (§6.3). systemd's `RestartPreventExitStatus=78` (06) stops the restart loop |
 | 4 | Server not reachable on the admin socket: not running or wrong path, or permission denied, which prints its own message: "Permission denied on /run/isshoni/admin.sock: run it with sudo (sudo isshoni …)" (§12.1) |
 | 5 | `doctor`: at least one `fail` (with `--strict`, also any `warn`) |
@@ -1600,7 +1604,8 @@ One owner per metric: 01 registers the signaling and presence metrics (`isshoni_
 registers an adapter over 02's `SFU.Metrics()` for the `isshoni_sfu_*` names (02 §13, including
 `isshoni_sfu_selected_transport`). That adapter is a `prometheus.Collector` in `wire.go`: on every scrape it calls
 `SFU.Metrics()` once and emits the 02 §13 names with exactly the label values that 02 lists (probe PCs are not
-counted); it adds no labels of its own. No per-user labels.
+counted); it adds no labels of its own. Its table test covers every 02 §13 name, including
+`isshoni_sfu_ingress_duplicates_total` (from `IngressDuplicates`). No per-user labels.
 
 ### 11.3 Transfer accounting and alerts
 
@@ -1843,9 +1848,12 @@ Server side (or the CLI with `--offline`), after receiving the body into `restor
 Crash safety: at startup, a plan in state `swapping` is completed idempotently (for each item: if the target is
 missing and the staged copy exists, move it). A leftover `restore/new` without a plan is deleted with a log line.
 
-CLI: `isshoni admin restore PATH` (or `-` for stdin: `docker compose exec -T isshoni isshoni admin restore - <
-backup.tar.gz`) shows the manifest, asks for confirmation, streams the file, then waits (≤ 60 s) for
-`/v1/health` to answer again and prints the result.
+CLI: `isshoni admin restore PATH` (or `-` for stdin, the Docker form: `docker compose exec -T isshoni isshoni admin
+restore --yes - < backup.tar.gz`) shows the manifest, asks for confirmation, streams the file, then waits (≤ 60 s)
+for `/v1/health` to answer again and prints the result. It asks for confirmation only when stdin is a terminal;
+otherwise `--yes` is required (§3.1). With `-` stdin carries the archive, so `--yes` is always required there;
+`docker compose exec -T` also gives no TTY. Without `--yes` it refuses and prints the exact command with `--yes` for
+its environment (06 §6.4 documents the Docker form above, and `task docker:smoke` runs it).
 
 ### 12.5 Setup URL, users, invites
 
@@ -1952,9 +1960,9 @@ templates live in `messages_en.go` for the CLI; 05 renders the same codes from i
 | `data_dir` | Exists, owned by the service uid, 0700, free space; in a container: is a mount (§5.1) | free < 1 GB; mode wider than 0700 | not writable; ephemeral in a container |
 | `secrets` | Present, 0600, parseable | mode wider (server fixes it) | unreadable or corrupt |
 | `schema` | DB schema vs binary (offline: through `DBFiles`, §13.1) | – | newer than binary (the server refuses to start; the fix is 03's message plus the restore command for the environment, from the same formatter as §6.1 step 4) |
-| `public_ip` | Detection result, method and NAT kind (§7.4) | `port_forward` ("forward TCP 80, 443, 7882 and UDP 7882 to {local}"); IPv6 missing (`info`) | `symmetric`, `cgnat_likely`, or no public IPv4/IPv6 |
+| `public_ip` | Detection result, method and NAT kind (§7.4) | `port_forward` ("forward TCP 80, 443, 7882 and UDP 7882 to {local}"); IPv6 missing (`info`); `ip` mode on provider `aws` or `gcp` (§13.3), otherwise ok (`info`, code `public_ip.ephemeral`): "The default public IPv4 changes on stop/start; in IP mode that moves the server's address and breaks every link, installed app and push subscription. Attach an Elastic IP (AWS) / reserve a static external IP (GCP), or use a domain", the same advice as 06's `/install/vps#aws` and `#gcp` | `symmetric`, `cgnat_likely`, or no public IPv4/IPv6 |
 | `dns` | `auto`/`manual` with domain: A/AAAA via the system resolver vs public IPs; CAA allows `letsencrypt.org` | AAAA present but not this server | no A/AAAA, or A points elsewhere |
-| `tls` | Mode, names, issuer, `not_after`, next renewal, last ACME error code (§8.7) | renewal failing but cert valid; manual cert < 14 days | no cert after 10 min; expired; key mismatch |
+| `tls` | Mode, names, issuer, `not_after`, next renewal, last ACME error code (§8.7) | no cert yet and at least one ACME attempt has failed (from the first failure, not after 10 min: `fixCode` = `Status.LastErrorCode`, `fix` = its §8.7 fix text, so install.sh's doctor output at its 180 s timeout names the cause); renewal failing but cert valid; manual cert < 14 days | no cert after 10 min (with the same `fixCode`/`fix` when an attempt failed); expired; key mismatch |
 | `clock` | Linux `adjtimex` `STA_UNSYNC` flag (no network); in `auto`/`ip`, skew vs the `Date` header of the ACME directory. If `adjtimex` fails with EPERM or ENOSYS (systemd `ProtectClock=`/`SystemCallFilter=` in 06's unit, or a container seccomp profile), the sync flag is reported as unknown (no warn) and only the skew check against the ACME directory's `Date` header decides; in `manual`/`off` mode without that check the status is `info` | not synchronized, or skew 30 s–5 min | skew > 5 min |
 | `udp_buffers` | Linux: `net.core.rmem_max`/`wmem_max` ≥ `udp_buffer_bytes`; effective SO_RCVBUF on the media sockets | below target. Fix: if `/etc/sysctl.d/60-isshoni.conf` or `/usr/lib/sysctl.d/60-isshoni.conf` exists, `sudo sysctl --system`; otherwise `printf 'net.core.rmem_max=8388608\nnet.core.wmem_max=8388608\n' \| sudo tee /etc/sysctl.d/60-isshoni.conf && sudo sysctl --system` (06 §6.4); in Docker, "on the Docker host" | – |
 | `ports` | **Local only**: isshoni listening on 443/tcp, 80/tcp, 7882/udp, 7882/tcp (or, offline, whether they can be bound). The text always says: "This only checks this machine. The browser connection test checks from outside." | a port disabled by config | a port in use by another program (offline) |
@@ -1968,7 +1976,8 @@ templates live in `messages_en.go` for the CLI; 05 renders the same codes from i
 
 Text output (abbreviated). After every `warn`/`fail` line the text output adds a line
 `more: <version.DocsURL>troubleshooting#doctor-<id>` (indented like `fix:`); after `firewall_hint` with a provider
-other than `unknown` it adds `<version.DocsURL>install/vps#<provider>`. JSON output stays as in §13.5; 05 builds the same links from `id`
+other than `unknown`, and after `public_ip`'s `public_ip.ephemeral` line, it adds
+`<version.DocsURL>install/vps#<provider>`. JSON output stays as in §13.5; 05 builds the same links from `id`
 and `env.provider`.
 
 ```
@@ -2362,10 +2371,10 @@ no tokens, SDP, push endpoints or usernames.
 | `logx` | `Secret` redacted in text and JSON handlers, all fmt verbs, `json.Marshal`; `ReplaceAttr` key list; pion bridge drops SDP-like lines and rate-limits; format auto-detection |
 | `ops` | Health state machine (starting → ready → shutting_down); conntest function (transport validation, `transport_disabled` with `params.transport` for each transport without a listener, per-user rate limit, `sfu.probe_limit` → 429, `publicIp` `""` without a public IPv4, `container` value) with a fake `Prober`; transfer flush, month rollover at UTC midnight, 80/100 % alerts once; release parser (drafts, prereleases, semver order, security marker, ETag 304); dashboard JSON golden file |
 | `ops` admin | Peer-cred filter (injected creds); every endpoint via `httptest` over a real unix socket (short path under `/tmp`: macOS `sun_path` is 104 bytes); backup tar layout and manifest; offline backup falls back to raw files only when `BackupFile` fails; restore validation rejects traversal, symlinks, extra names, bad hashes, and (through `InspectFile`, whatever the manifest says) a newer schema, a history mismatch or a failed integrity check; offline commands exit 7 while the data-directory lock is held; swap crash recovery from each `plan.json` state; old WAL never next to the new DB |
-| `doctor` | Each check with fake FS/resolver/STUN/clock/DMI; `clock` with a fake `adjtimex` returning EPERM (sync unknown, no warn; skew check decides; `info` in `manual`/`off`); provider table; bandwidth numbers (plan example 10.53 Mbps/viewer and 105 Mbps; exit scenario 41.5 Mbps); JSON golden; text render; exit codes 0/5 and `--strict` |
+| `doctor` | Each check with fake FS/resolver/STUN/clock/DMI; `tls` with no certificate is `warn` with `fixCode` = the §8.7 code right after one failed ACME attempt and `fail` after 10 min; `public_ip` in `ip` mode with DMI `aws`/`gcp` adds the `public_ip.ephemeral` info (not in `auto` mode or on other providers); `clock` with a fake `adjtimex` returning EPERM (sync unknown, no warn; skew check decides; `info` in `manual`/`off`); provider table; bandwidth numbers (plan example 10.53 Mbps/viewer and 105 Mbps; exit scenario 41.5 Mbps); JSON golden; text render; exit codes 0/5 and `--strict` |
 | `push` | `ValidateEndpoint` table (http, :8443, userinfo, IP literal, localhost, 10/8, [::1], fd00::/8, 169.254.169.254, 100.64/10, name resolving private → `push_endpoint_rejected` with the right `reason`); `Control` blocks a rebinding resolver; no redirects followed; recipient filter passed to the store (sharer and `PresentUserIDs` excluded, `Pref`); `admin.alert` payload per 03 alert kind; VAPID fingerprint change deletes all subscriptions before `push.New` returns; dedup window; per-recipient bucket; 404/410/401/403 prune; 429 retry with `Retry-After`; payload < 1 KB; round trip through a fake push service that **decrypts** `aes128gcm` with the test subscription's private key and checks the VAPID JWT (`aud`, `exp`, `sub`) |
 | `version` | Build with `-ldflags -X …` in a test and check `isshoni version --json`; BuildInfo fallback |
-| `cmd/isshoni` | `testscript` (rogpeppe/go-internal, test-only): every subcommand's usage, exit codes (incl. healthcheck 0/1 only), a permission case run as a non-root uid that is not the server's (a socket directory it can't enter, and a server whose peer-cred filter rejects it): `setup-url` and `admin status` exit 4 with the `sudo` message, `doctor` prints it and runs no offline checks (skipped when the tests run as root), `--json` shapes, confirmation prompts and `--yes`, container `--out` requirement, `admin backup --out -` refused with exit 2 and the umask Docker form when stdout is a terminal (testscript `ttyout`) |
+| `cmd/isshoni` | `testscript` (rogpeppe/go-internal, test-only): every subcommand's usage, exit codes (incl. healthcheck 0/1 only), a permission case run as a non-root uid that is not the server's (a socket directory it can't enter, and a server whose peer-cred filter rejects it): `setup-url` and `admin status` exit 4 with the `sudo` message, `doctor` prints it and runs no offline checks (skipped when the tests run as root), `--json` shapes, confirmation prompts and `--yes`, the no-TTY refusal without `--yes` (exit 2, printing the `--yes` command in the systemd form and, with container detection faked, the `docker compose exec -T` form), container `--out` requirement, `admin backup --out -` refused with exit 2 and the umask Docker form when stdout is a terminal (testscript `ttyout`) |
 
 ### Integration (in-process, `servertest`)
 
@@ -2373,8 +2382,16 @@ no tokens, SDP, push endpoints or usernames.
   headers.
 - **TLS path through the 443 mux**: `servertest.Options{TLS: true}` (a private test CA, manual mode) → WSS signaling
   over HTTP/1.1 and SPA over h2 on the same port.
-- **ICE-TCP via 443**: `listen.ice_udp=""`; a Pion client restricted to `tcp4` joins, a fake-engine publisher shares,
-  media arrives through the 443 multiplexer; the same via 7882/tcp.
+- **ICE-TCP via 443** (in `internal/server/itest`, README S59, once the hub and the SFU are wired into `serve`):
+  `servertest.Options{TLS: true}` with `listen.ice_udp = ""` and `listen.ice_tcp = ""`; a Go publisher restricted to
+  `tcp4` shares, an `sfutest.Viewer` decodes its media, and WSS signaling runs on the same port; both Go clients'
+  selected candidate pairs are TCP with the TLS listener's port as the remote port. The same via 7882/tcp in off mode
+  (no 443 multiplexer there, §8.5). README S85 adds the metric assertion to this test:
+  `isshoni_sfu_selected_transport{transport="tcp443"}` counts both PCs. S7's `servertest` check (README S44) runs
+  before that wiring, so it uses a stub `/ws` handler and a raw RFC 4571 STUN frame on the 443 port, not media.
+- **Connection test over TLS**: `servertest.Options{TLS: true}`; `POST /api/v1/conntest` with `tcp443` returns an
+  answer that connects through the 443 multiplexer (README S80). The browser e2e harness runs in off mode only, so
+  this Go test is the only `tcp443` probe check (05 §19.3).
 - **Graceful shutdown**: connected clients receive `server.shutdown`, `error{server_shutdown}` and close code 1012
   within 2 s; REST gets 503 `server_shutdown`; `Run` returns within `shutdown_timeout`; goleak clean.
 - **Refusing to start**: seed a DB with a newer schema → `serve` exits 78 and prints 03's message with the backup
@@ -2389,8 +2406,10 @@ no tokens, SDP, push endpoints or usernames.
   invites invalid; push rows gone (session cascade and VAPID purge) before the first request is served.
 - **Wiring** (§6.6): every adapter has a table test; a unit test asserts that the registry's policy defaults equal
   03's `SettingsCache.Defaults()`; a unit test asserts that `netx.IPKey` and 03's limiter key (exported by `auth` for
-  this test) give the same key for the `IPKey` table of the netx tests; in-process, `logout-everywhere` closes that user's WebSocket within 100 ms, and an
-  admin settings change of `maxShareBitrateKbps` reaches `SFU.SetLimits`.
+  this test) give the same key for the `IPKey` table of the netx tests; in-process (off mode),
+  `POST /api/v1/auth/logout` closes that session's WebSocket (`session_revoked` on the wire) within 100 ms, and an
+  admin settings change of `maxShareBitrateKbps` reaches `SFU.SetLimits`. Logout-everywhere and the rest of 03 §7.7's
+  revocation matrix are 03's tests, with a fake `ConnCloser`.
 - **ACME** (CI job with Pebble + challtestsrv as service containers; Pebble listens with `httpPort`/`tlsPort` matching
   our test listeners): `auto` for a test domain and `ip` for `127.0.0.1`-mapped IP identifiers with the `shortlived`
   profile; a no-SNI handshake gets the IP certificate; renewal fires under a shortened lifetime.
@@ -2399,10 +2418,11 @@ no tokens, SDP, push endpoints or usernames.
 
 ### End-to-end (Playwright harness from 05; assertions owned here)
 
-- TCP-only viewer: server with `listen.ice_udp=""`; Chrome viewer plays (`framesDecoded > 0`) and the selected
-  candidate pair is TCP.
-- Connection test: wizard step 2 reports UDP ✓, TCP 443 ✓ (TLS test mode), TCP 7882 ✓ on localhost; in off mode the
-  TCP 443 row is hidden; with `listen.ice_udp = ""` the UDP row shows ✗ with the "UDP turned off" text.
+- TCP-only viewer (`tcp-only.spec`): its own server (05's `startServer` fixture) with `listen.ice_udp = ""`; Chrome
+  viewer plays (`framesDecoded > 0`) and the selected candidate pair is TCP.
+- Connection test: wizard step 2 reports UDP ✓ and TCP 7882 ✓ on localhost with the TCP 443 row hidden (the harness
+  runs in off mode, so `tcp443` answers `transport_disabled`; the TLS case is the Go test above); with
+  `listen.ice_udp = ""` the UDP row shows ✗ with the "UDP turned off" text.
 
 ### Manual (M1 exit)
 
@@ -2558,17 +2578,17 @@ with the other docs and adds the wiring slices of §6.6.
 | S4 | HTTP skeleton and SPA | `internal/server` with `off` mode, router, global middleware chain, JSON/error helpers on 03's `api.Error`, SPA handler, security headers, `/healthz` `/readyz`, graceful shutdown skeleton, `servertest` | httpapi tests; `servertest.Start` ready < 1 s; built SPA served with correct caching | S2, S3, 03 DTOs |
 | S5 | Public IP and ICE transports | `DetectPublicAddrs`, rewrite rules, UDP mux with counting conns, 7882/tcp mux, `Transport` (incl. `TCPMux443/7882`, `PacketConns`), `Transport.Apply`, `TransferCounter` | netx unit tests; a Pion PeerConnection pair connects through `Transport` over UDP and over TCP 7882 on loopback | S1 |
 | S6 | 443 multiplexer | `PortMux`, `prefixConn`, limits, ICE sub-listener into `TCPMuxDefault` | portmux tests (TLS, RFC 4571, plain HTTP hint, garbage, slow client, limits, Close); goleak clean | S5 |
-| S7 | TLS manager | certmagic `auto`/`ip`, `manual` reload, port 80 handler, HSTS, zap bridge, hints; `servertest` TLS option with a test CA | Pebble CI job issues domain and IP certs; WSS + h2 + ICE-TCP on one port in `servertest`; manual reload tests; **a Let's Encrypt staging IP certificate issued on a real VPS** | S4, S6 |
+| S7 | TLS manager | certmagic `auto`/`ip`, `manual` reload, port 80 handler, HSTS, zap bridge, hints; `servertest` TLS option with a test CA | Pebble CI job issues domain and IP certs; WSS (to a stub `/ws` handler) + h2 + ICE-TCP (a raw RFC 4571 STUN frame) on one port in `servertest`, with media over 443 left to W2; manual reload tests; **a Let's Encrypt staging IP certificate issued on a real VPS** | S4, S6 |
 | S8 | Admin socket basics | Socket server/client, peer creds, `health`/`ready`/`status`, `healthcheck`, `setup-url` (+QR, `--wait`), `users`, `invite create`, `log-level` | testscript CLI tests; healthcheck exits 0/1 only; setup-url exits 7 after setup (fake auth) | S4 |
 | S9 | Backup, restore, rotation | Backup tar, restore of archives and `.db` files with validate/swap/re-exec and crash recovery, offline mode, `rotate-secrets` with restart | Round-trip and crash-recovery tests; a newer-schema DB → `serve` exits 78 → offline restore of the pre-migration DB → serving | S8, 03 store API |
-| W1 | Wiring v1 | §6.6 adapters for 01's hub (fake media) and 03's store/auth/httpapi; settings pins | `serve` in off mode: login over REST, `/ws` joins Lounge; logout-everywhere closes the socket in < 100 ms | S4, S8, 01 P5, 03 sessions/setup |
-| W2 | Wiring v2 | SFU + `sfuplane` + Transport + PortMux in `serve`; metrics adapter | 01 P8's integration tests pass against `servertest` | W1, S7, 01 P8, 02 slice 7 |
+| W1 | Wiring v1 | §6.6 adapters for 01's hub (fake media) and 03's store/auth/httpapi; settings pins | `serve` in off mode: login over REST, `/ws` joins Lounge; `POST /api/v1/auth/logout` closes that session's socket (`session_revoked` on the wire) in < 100 ms | S4, S8, 01 P5, 03 sessions/setup |
+| W2 | Wiring v2 | SFU + `sfuplane` + Transport + PortMux in `serve`; metrics adapter | 01 P8's integration tests pass against `servertest`; the ICE-TCP-via-443 test of §17 passes in `internal/server/itest` | W1, S7, 01 P8, 02 slice 7 |
 | S10 | Ops data | Transfer accounting and alerts, metrics endpoint, release check (dashboard: S10b) | metrics scrape test; month rollover and alert-once tests; release parser tests | S5, S8 |
 | S10b | Dashboard | `/api/v1/admin/dashboard` with `LiveSource`/`AccountsSource` adapters | Golden dashboard JSON with fake sources; a failing source doesn't fail the response | S10, W2 |
 | S11 | doctor | All checks, `--only`, `--list-checks`, provider table, bandwidth calculator, text/JSON output, `/api/v1/admin/doctor`, `/api/v1/admin/bandwidth`, periodic run | doctor unit tests; numbers of §13.4; `doctor --json` on a VPS all ok | S7, S8, S10 |
 | S12 | Web Push | VAPID, `httpapi.Push` methods, guarded sender, triggers, dedup, limits, pruning, VAPID fingerprint check | push unit tests incl. decrypting fake push service; manual iPhone and Android notification | S3, 03 tables |
 | S12b | Push wiring | push as `PushNotifier`, `AdminAlerter`, `httpapi.Push` | a share going live in `servertest` reaches the fake push service for an absent user only | S12, W2 |
-| S13 | Connection test | `/api/v1/conntest` handler on 02's `Probe` | Playwright wizard step 2 shows UDP ✓ and TCP 7882 ✓ locally with the TCP 443 row hidden (off mode); with `listen.ice_udp = ""` the UDP row shows ✗ with the "UDP turned off" text | S7, 02 slice 14 |
+| S13 | Connection test | `/api/v1/conntest` handler on 02's `Probe` | In `servertest` with TLS the `tcp443` probe connects (§17); Playwright wizard step 2 shows UDP ✓ and TCP 7882 ✓ locally with the TCP 443 row hidden (off mode); with `listen.ice_udp = ""` the UDP row shows ✗ with the "UDP turned off" text | S7, 02 slice 14 |
 | S14 | Hardening | SIGHUP, full shutdown with 01's notice, log canary, TCP-only e2e, `doctor` in Docker bridge and host modes | All integration and e2e tests of §17 pass; manual 2-hour session checklist | all above |
 
 ## Decisions taken at integration (formerly open questions)

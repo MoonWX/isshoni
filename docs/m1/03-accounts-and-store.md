@@ -967,7 +967,9 @@ This is the first open question in §19. `/api/v1/info` serves the limits, so ch
 
 ### 7.3 Throttles
 
-The throttles are in-memory token buckets (decision 8), in `auth/limiter.go`. IPv6 addresses are keyed by their /64.
+The throttles are in-memory token buckets (decision 8), in `auth/limiter.go`. Every per-IP key is `auth.IPKey`
+(§7.13): an IPv4 address as its /32, an IPv6 address as its /64. It is exported so that 04's wiring test pins
+`netx.IPKey` to the same result (04 §7.2, §17).
 
 | Bucket | Key | Burst | Refill | Consumed by | Checked |
 |---|---|---|---|---|---|
@@ -1016,6 +1018,8 @@ The throttles are in-memory token buckets (decision 8), in `auth/limiter.go`. IP
     log.
   - `auth.login_failed` rows have a global cap of 600 per hour. Beyond it, one `auth.throttled {scope:"global"}` row
     is written per hour.
+- **Log**: a blocked attempt logs one `warn` line with `remote_ip` (no username), at most once per `IPKey` per
+  minute, like 01's pre-auth `429` (01 §3.1). No `info` line carries a client IP (§11).
 
 ### 7.4 Web sessions
 
@@ -1150,9 +1154,9 @@ reason to its `error{code, retryable:false}` message and close code (01 §12.1, 
   - it returns `Link{URL: Origins.Primary + "/setup#" + token, ExpiresAt}`.
   - Only the newest link works. 04's `isshoni setup-url` (through the admin socket) calls it and prints the URL and
     QR code. For an existing admin, the CLI instead suggests `isshoni admin users reset-password <name>`.
-- **At startup with no admin**, the server logs this line at INFO, without the token (no token ever reaches the
-  logs): "No admin account yet. Run `isshoni setup-url` (Docker: `docker compose exec isshoni isshoni setup-url`) to
-  get the one-time setup link."
+- **At startup with no admin**, the server logs this line at INFO (04 §6.1 step 10), without the token (no token
+  ever reaches the logs): "Finish setup: run `sudo isshoni setup-url` (Docker: `docker compose exec isshoni isshoni
+  setup-url`)".
 - **Flow**: the SPA reads the token from `location.hash` and removes the fragment with `history.replaceState` (05).
   1. `POST /api/v1/auth/setup/check {token}` → 204. It lets the page show "link expired" before the form is filled
      in.
@@ -1380,6 +1384,10 @@ type Principal struct {
 
 func (p Principal) IsAdmin() bool
 func ActorOf(p Principal, ip netip.Addr) store.Actor
+
+// IPKey is the limiter's key for a client IP (§7.3): an IPv4 address (IPv4-mapped IPv6 is unmapped first) as its /32,
+// an IPv6 address as its /64. 04's wiring test pins netx.IPKey to it (04 §17).
+func IPKey(a netip.Addr) netip.Prefix
 
 // Implemented by the wiring over 01's Hub.CloseConnections (04 §6.6). Selects connections by user, session or device.
 type ConnSelector struct {
@@ -1705,9 +1713,11 @@ are written from this table.
 - the usernames tried for unknown accounts;
 - SDP, ICE candidates, media and stats history;
 - anything the plan keeps on the device (window titles, app lists, exclusions, "What friends hear");
-- IP history beyond the last IP per session or device and the 30-day audit log.
+- IP history beyond the last IP per session or device, the 30-day audit log and the security-event log lines below.
 
-HTTP access logs are off (04).
+HTTP access logs are off (04). Security-event log lines (a pre-auth WebSocket `429` and an Origin `403`, 01 §3.1;
+login-limit hits, §7.3) may contain the client IP. They are logged at `warn`, at most once per IP per minute, and
+are kept as long as journald or Docker log rotation keeps them, not pruned at 30 days like the audit log.
 
 **Memory only**: throttle buckets (IP, username key, or both; at most 100,000 keys per bucket) and the 30-second
 session cache.
@@ -1741,9 +1751,10 @@ session cache.
   - *Admin*: an active admin.
 - **PATCH** is a JSON merge: only the fields present change.
 - **Rate-limited responses** send both `Retry-After` and `error.retryAfter` (seconds).
-- **Middleware order** (outermost first): 04's global chain (recover → request ID → transfer/metrics → shutdown gate
-  → Host check → real IP → security headers, 04 §9.3), then this API chain: body limit → no-store → CSRF (unsafe
-  methods) → authenticate (skipped for Public) → `MaybeRotate` → access check → handler.
+- **Middleware order** (outermost first): 04's global chain (recover → request ID → read deadline →
+  transfer/metrics → shutdown gate → Host check → real IP → security headers, 04 §9.3), then this API chain: body
+  limit → no-store → CSRF (unsafe methods) → authenticate (skipped for Public) → `MaybeRotate` → access check →
+  handler.
 
 ### 12.2 Errors
 
@@ -1933,7 +1944,8 @@ Examples use `watch.example.com` and documentation IPs. IDs are illustrative.
 - `features` holds opaque capability strings. M1 has `passwordReset`, plus `push` exactly when the `push` object is
   present (push enabled and a VAPID key loaded); M2 adds `deviceFlow`. Clients ignore unknown values.
 - `push` is omitted when push is unavailable.
-- `setupRequired` lets `/` show "This server isn't set up yet. Run `isshoni setup-url` on the server."
+- `setupRequired` lets `/` show "This server isn't set up yet. On the server run `sudo isshoni setup-url` (Docker:
+  `docker compose exec isshoni isshoni setup-url`)" (05 §4, NotSetUp).
 
 #### 12.4.2 Auth
 
@@ -2413,7 +2425,8 @@ SPA removes the fragment right after reading it (05).
   runes, reserved names, and the 128-byte limit. `FuzzNormalizeUsername`: output is idempotent and the key is stable.
 - **Password rules**: the length counts runes, OpaqueString handles non-ASCII spaces, a common password is caught
   regardless of case, and a password equal to the username is rejected.
-- **Limiter**: burst and refill (fake clock); IPv6 addresses in one /64 share a key; the map cap evicts full buckets
+- **Limiter**: burst and refill (fake clock); IPv6 addresses in one /64 share a key (`IPKey` table: IPv4,
+  IPv4-mapped IPv6, two addresses in one /64, neighbouring /64s); the map cap evicts full buckets
   first; a successful login refills that address's `auth-user-ip` bucket and leaves `auth-user` as it was.
 - **Hash budget**: fake clock and the counting hasher; 1000 logins for random usernames from 1000 random /64s, spread
   over 10 simulated seconds, hash at most 20 + 5 × 10 = 70 times. The others get 503 `server_busy` with
@@ -2534,6 +2547,7 @@ above; "a logout in tab A redirects tab B" by S33's component test; and mobile s
     `SetupAvailable(ctx)`, `IssueSetupToken(ctx, actor)`, `IssuePasswordReset`, `UpdateUser`, `CreateInvite`,
     `UserByUsername`, `RunJanitor(ctx)`;
   - `auth.ConnCloser{CloseConnections(ConnSelector, reason) int}`, `auth.ConnSelector`, and the `auth.Reason*` codes;
+  - `auth.IPKey(netip.Addr) netip.Prefix`, the limiter's per-IP key (04: the wiring test pins `netx.IPKey` to it);
   - `auth.AdminAlerter{AdminAlert(ctx, AdminAlert)}`, `auth.AdminAlert{Kind, Actor, Target, At}`, and the alert kinds
     in §7.11.
 - **httpapi**:
@@ -2648,7 +2662,8 @@ slice.
 6. **Sessions and login**: `Authenticate`, `AuthenticateCookie`, the cookie helpers, `MaybeRotate`, the cache,
    `Touch`; `login`, `logout` and `me`, with throttles and audit.
    *Acceptance*: the login, rotation and throttle integration tests; the hasher counter proves there is no hashing
-   while throttled.
+   while throttled; logout and the login-with-an-old-cookie row call `ConnCloser` with that session and the §7.7
+   reason (fake `ConnCloser`).
    *Depends on*: 3, 4.
 7. **Setup**: `SetupAvailable`, `IssueSetupToken` (exported for 04's CLI), and `setup/check` and `setup/complete`.
    *Acceptance*: the setup integration tests, including the parallel-complete race.
@@ -2681,8 +2696,9 @@ slice.
     *Depends on*: 8–12.
 14. **WebSocket credentials** (done inside 04's wiring slice): the `Authenticator`, `ConnCloser` and `Signal`
     adapters over this package.
-    *Acceptance*: an in-process test in which 01's hub closes a connection within 100 ms of `logout-everywhere`.
-    *Depends on*: 6, 9, and 01's hub.
+    *Acceptance*: an in-process test in which 01's hub closes a connection within 100 ms of `POST /api/v1/auth/logout`
+    (the §7.7 `logged_out` reason, sent as `session_revoked` on the wire).
+    *Depends on*: 6, and 01's hub.
 15. ***Later (M2)*: device flow and bearer tokens**: `device/*` endpoints, bearer `Authenticate`, the WebSocket
     bearer path, refresh rotation with reuse detection and grace, Wails CORS, and `me` for devices.
     *Acceptance*: RFC 8628 state tests (pending, slow_down, denied, expired, consumed), reuse revoking the device, the
@@ -2691,12 +2707,11 @@ slice.
 
 ---
 
-## 19. Open questions for the owner
+## 19. Owner decisions
 
-1. **Minimum password length** (moved to `README.md`, "Questions for the owner"). This spec uses 8 characters, with a
-   common-password blocklist and throttles. NIST SP 800-63B-4 (2025) recommends 15 for passwords used as the only
-   factor, which is safer but adds friction for friends signing up on phones. Keep 8, or pick 10, 12 or 15? Only
-   `CheckPassword` and `/info.accountRules` change.
+1. **Minimum password length: 8 characters** (owner, 2026-09-30), with the common-password blocklist and the
+   throttles in §7. NIST SP 800-63B-4 recommends 15 for a single factor; the owner chose 8 so friends can sign up on
+   phones. Changing it later only touches `CheckPassword` and `/info.accountRules`.
 
 Decided at integration: **invites from non-admins** stay behind the setting `membersCanInvite`, default **off**, in
 line with the plan's "an admin plus invite links".

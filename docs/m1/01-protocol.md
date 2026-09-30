@@ -859,12 +859,14 @@ type ShareStart struct {
 }
 
 // ShareParams tells the sharer how to encode. The server computes it from the preset, the room's codec safe set and
-// admin limits (policy and numbers: 02). Web clients map maxPixels to scaleResolutionDownBy =
-// max(1, sqrt(width*height/maxPixels)) and apply it with RTCRtpSender.setParameters.
+// admin limits (policy and numbers: 02). Encodings is in wire order, high first (f, then q); that is not the order
+// a web client gives the browser. Web clients (05 §13.4) pass complete sendEncodings to addTransceiver in ascending
+// order (q, then f), each with rid, active, maxBitrate, maxFramerate and scaleResolutionDownBy =
+// max(1, sqrt(width*height/maxPixels)). Later changes go through RTCRtpSender.setParameters, matched by rid.
 type ShareParams struct {
 	ShareID      string     `json:"shareId"`
 	Codec        CodecKey   `json:"codec"`        // H.264 profile to put first in setCodecPreferences
-	Encodings    []Encoding `json:"encodings"`    // high first
+	Encodings    []Encoding `json:"encodings"`    // wire order, high first (f, q); not the sendEncodings order
 	AudioBitrate int        `json:"audioBitrate"` // Opus target in bit/s (the pub answer's maxaveragebitrate)
 }
 
@@ -903,14 +905,22 @@ type ShareStop struct {
 - **Effect**: the share is created in `starting` (visible in `room.state`); `MediaPeer.CreateShare` returns the
   `ShareParams`.
 - **Then the client** adds its transceivers and sends `pc.offer` on the pub PC with `tracks` naming this `shareId`
-  (§9). Web: one video transceiver with `sendEncodings` for `f` and `q`, `setCodecPreferences` with `codec` first,
-  then the other H.264 profiles and RTX.
+  (§9). Web (05 §13.4, the setup S4 validated):
+  - set the video track's `contentHint`, then add one video transceiver with **complete** `sendEncodings` in
+    ascending order (`q`, then `f`), each carrying `rid`, `active`, `maxBitrate`, `maxFramerate` and
+    `scaleResolutionDownBy`, so nothing is left to browser defaults;
+  - `setCodecPreferences` with `codec` first, then the other H.264 profiles and RTX;
+  - the audio transceiver with `sendEncodings: [{maxBitrate: audioBitrate}]`;
+  - one `setParameters` call on the video sender for `degradationPreference` only (try/catch), then `pc.offer`.
+
+  After the offer, `setParameters` is used only for hints (§8.10), source resizes and preset changes, and always
+  matches encodings by `rid`.
 - **Timeout**: without a first keyframe within 30 s the share ends with `media_timeout`.
 
 `share.update`:
 - It changes the label or preset of a share of the same user (`share_not_found`, `forbidden` if another user's).
-- The reply carries the new `ShareParams`. The client applies `encodings` with `setParameters`. If `audioBitrate`
-  changed, it re-offers the pub PC so the answer carries the new Opus `maxaveragebitrate`.
+- The reply carries the new `ShareParams`. The client applies `encodings` with `setParameters`, matched by `rid`.
+  If `audioBitrate` changed, it re-offers the pub PC so the answer carries the new Opus `maxaveragebitrate`.
 
 `share.stop`:
 - It is idempotent: an unknown or already ended share replies `ok`. Stopping another user's share is `forbidden`.
@@ -1520,8 +1530,16 @@ PC recovers first.
 | Condition | Client does |
 |---|---|
 | ICE `disconnected` for **3 s** | Sends `pc.restart{pc: sub, mode: ice, reason: disconnected}`; the server answers with an ICE-restart offer (same `gen`, `neg + 1`) |
-| ICE restart not `connected` within **15 s**, or PC `failed` | Sends `pc.restart{pc: sub, mode: rebuild, reason: failed}`; the server offers a new PC (`gen + 1`) |
-| After a resumed `welcome` | Nothing: the server's `Resync()` ICE-restarts a sub PC that isn't connected |
+| ICE restart not `connected` within **15 s** of the ICE-restart offer, or PC `failed` | Sends `pc.restart{pc: sub, mode: rebuild, reason: failed}`; the server offers a new PC (`gen + 1`) |
+| After a resumed `welcome` | Nothing: the server's `Resync()` ICE-restarts a sub PC that isn't connected, and that offer counts as the client's restart (below) |
+
+**A sub offer with a new `ice-ufrag` is the sub ICE restart, whoever asked for it**: the client's
+`pc.restart{sub, ice}` or the server's `Resync()`. On such an offer the client cancels its 3 s timer and starts the
+15 s rebuild timer from that offer, not from its own request. The server runs one sub ICE restart at a time: a
+`pc.restart{sub, ice}` that arrives while one for this `gen` is queued, or less than 5 s after its offer with neither
+`connected` nor `failed` since, sends no new offer (02 §5.3). This is the usual case after a network switch: the
+client's sub PC has been `disconnected` for 3 s when the socket resumes, so its request sent on `ready` and
+`Resync()` both ask, and one offer serves both.
 
 **Server**: it starts exactly three actions on its own:
 1. `pc.restart{pc: pub, gen, mode: rebuild, reason: failed}` when the current pub PC reaches `failed`, or when a new
@@ -1611,13 +1629,16 @@ UI: video autoplays muted; "Tap to unmute" unmutes the element locally (no messa
 
 ```
 Alex's browser                          Hub                                         SFU
- getDisplayMedia() → video (+ audio) track; displaySurface → kind
+ getDisplayMedia() → video (+ audio) track; displaySurface → kind; audio track contentHint music
  │ share.start{screen, auto, audio, ref} id 5 ►│ role ✓, in room ✓, limits ✓
  │                                       │ peer.CreateShare(s_a, meta) ────────────►│ codec from room safe set
- │◄ ok re 5 {s_a, codec h264/6400, encodings f/q, audioBitrate 128000}
+ │◄ ok re 5 {s_a, codec h264/6400, encodings f,q (wire order, high first), audioBitrate 128000}
  │◄ room.state (s_a starting) to all; viewers show no tile yet
- addTransceiver(video, sendEncodings f,q) · setCodecPreferences(6400 first, other H.264, RTX)
- addTransceiver(audio, contentHint music) · setParameters from encodings
+ video track contentHint from the preset
+ addTransceiver(video, sendEncodings q,f: complete, ascending; rid, active, maxBitrate, maxFramerate,
+                scaleResolutionDownBy) · setCodecPreferences(6400 first, other H.264, RTX)
+ addTransceiver(audio, sendEncodings [{maxBitrate: 128000}]) · setCodecPreferences(Opus)
+ video sender setParameters: degradationPreference only (try/catch)
  │ pc.offer{pub,1,1, tracks: 0→s_a video, 1→s_a audio} ►│ peer.HandleOffer ────►│ answer: 6400 first,
  │◄ pc.answer{pub,1,1}                   │◄──────────────────────────────────────────│ Opus maxaveragebitrate
  │ pc.ice ×n ───────────────────────────►│
@@ -1696,9 +1717,11 @@ t≈5.5 s  connected → keyframe requests → s_a live; subscriptions resume on
 
 **C. Wi-Fi → LTE** (both break): A and B together. Socket and ICE fail, the client resumes the socket first (skip-wait
 on `online`), then the resumed-`welcome` rows of §10.4 run: the client ICE-restarts its pub PC, and the server's
-`Resync()` ICE-restarts the sub PC. When the new path isn't up within 15 s, the client rebuilds the pub PC and sends
-`pc.restart{sub, rebuild, failed}` for the sub PC. The server sends no `pc.restart{mode: ice}` and doesn't rebuild the
-sub PC on its own ICE state.
+`Resync()` ICE-restarts the sub PC. The client's sub 3 s timer has usually expired by then, so it also sends
+`pc.restart{sub, ice}` on `ready`; the server sends no second offer for it, and the client counts the `Resync()` offer
+(new `ice-ufrag`) as its restart (§10.4). When the new path isn't up within 15 s of the restart offers, the client
+rebuilds the pub PC and sends `pc.restart{sub, rebuild, failed}` for the sub PC. The server sends no
+`pc.restart{mode: ice}` and doesn't rebuild the sub PC on its own ICE state.
 
 ### 11.6 Server restart
 
@@ -2408,7 +2431,7 @@ Connection.
 | `HandleOffer(o)` | `HandleOffer(ctx, PCPub, o.Gen, o.Neg, o.SDP, tracks)` → answer SDP | synchronous (gathering is instant with muxes, capped at 2 s); a higher `gen` replaces the pub PC; a lower `gen`, or a lower `neg` in the current `gen`, returns `sfu.stale_offer`. Before the call the hub drops TrackRefs of shares that aren't `starting`/`live`/`stalled` shares of this connection (§9 rule 4) and ends bound shares that `tracks` omit (§8.7) |
 | `HandleAnswer(a)` | `HandleAnswer(ctx, PCSub, a.Gen, a.Neg, a.SDP)` | a stale `gen`/`neg` is dropped silently |
 | `AddICE(c)` | `AddICECandidate(ctx, c.PC, c.Gen, init)` | end-of-candidates is ignored |
-| `Restart(r)` | `mode: ice` → `RestartICE(ctx, PCSub, r.Gen)`; `mode: rebuild` → `ResetPC(ctx, PCSub, r.Gen)` | pub restarts are client offers; a lower `gen` than the current one does nothing and returns nil |
+| `Restart(r)` | `mode: ice` → `RestartICE(ctx, PCSub, r.Gen)`; `mode: rebuild` → `ResetPC(ctx, PCSub, r.Gen)` | pub restarts are client offers; a lower `gen` than the current one does nothing and returns nil; `RestartICE` also returns nil with no new offer while a sub ICE restart is under way (§10.4, 02 §5.3) |
 | `ClosePC(c)` | `ClosePC(ctx, c.PC, c.Gen)` | the hub calls it only for `pub` and has already ended the shares of the closed pub PC; a lower `gen` does nothing and returns nil |
 | `Subscribe(wants)` | `UpdateSubscriptions(ctx, items)` | items failing with `sfu.share_not_found` become `ignored`; other per-item errors: below |
 | `SetCaps(c)` | `SetDecodeCaps(ctx, DecodeCaps{H264: profiles})` | `"h264/6400"` → `"6400"`; non-H.264 keys dropped |
