@@ -1,0 +1,23 @@
+{
+  "server": {
+    "name": "watch.example.com",
+    "version": "0.1.0",
+    "publicUrl": "https://watch.example.com"
+  },
+  "protocol": {
+    "current": 1,
+    "min": 1
+  },
+  "minClientVersion": "",
+  "registration": "invite",
+  "setupRequired": true,
+  "features": [
+    "passwordReset"
+  ],
+  "accountRules": {
+    "usernameMinLength": 2,
+    "usernameMaxLength": 32,
+    "passwordMinLength": 8,
+    "passwordMaxLength": 128
+  }
+}

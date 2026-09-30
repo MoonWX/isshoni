@@ -1,0 +1,20 @@
+{
+  "user": {
+    "id": "b8f2n4r6t0vz",
+    "username": "Samuel",
+    "role": "admin",
+    "status": "active",
+    "createdVia": "invite",
+    "invitedBy": {
+      "id": "k3m9p2qxw7ht",
+      "username": "Alex"
+    },
+    "sessions": 2,
+    "devices": 0,
+    "online": true,
+    "resetPending": false,
+    "createdAt": "2026-10-02T08:15:30.500Z",
+    "lastLoginAt": "2026-10-02T08:15:30.500Z",
+    "lastSeenAt": "2026-10-03T07:00:00.000Z"
+  }
+}

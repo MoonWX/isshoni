@@ -1,0 +1,10 @@
+{
+  "type": "room.event",
+  "data": {
+    "kind": "participant.joined",
+    "roomId": "lounge",
+    "userId": "b8f2n4r6t0vz",
+    "name": "Bea",
+    "at": "2026-10-12T19:01:12.000Z"
+  }
+}

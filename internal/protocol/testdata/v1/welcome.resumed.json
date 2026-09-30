@@ -1,0 +1,36 @@
+{
+  "type": "welcome",
+  "re": "1",
+  "data": {
+    "protocol": 1,
+    "serverVersion": "0.1.0",
+    "minClientVersion": "",
+    "features": [
+      "agent.relay"
+    ],
+    "limits": {
+      "maxMessageBytes": 65536,
+      "maxSdpBytes": 262144,
+      "maxSharesPerUser": 4,
+      "messagesPerSecond": 20,
+      "messageBurst": 100,
+      "pingIntervalMs": 15000,
+      "idleTimeoutMs": 45000,
+      "graceMs": 30000,
+      "maxRoomParticipants": 10,
+      "maxRoomShares": 6,
+      "maxVideoBitrate": 8000000
+    },
+    "iceServers": [],
+    "connectionId": "c_7d2m9x4k1q8v3p6z",
+    "resumeToken": "r1.AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkq",
+    "resumed": true,
+    "roomId": "lounge",
+    "defaultRoomId": "lounge",
+    "user": {
+      "id": "b8f2n4r6t0vz",
+      "name": "Bea"
+    },
+    "serverTime": "2026-10-12T19:05:40.000Z"
+  }
+}

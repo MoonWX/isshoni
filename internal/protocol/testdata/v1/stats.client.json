@@ -1,0 +1,85 @@
+{
+  "type": "stats",
+  "data": {
+    "intervalMs": 10000,
+    "pcs": [
+      {
+        "pc": "sub",
+        "gen": 1,
+        "state": "connected",
+        "rttMs": 38,
+        "candidateType": "prflx",
+        "transport": "udp"
+      },
+      {
+        "pc": "pub",
+        "gen": 1,
+        "state": "connected",
+        "rttMs": 36,
+        "outgoingBitrate": 9500000,
+        "candidateType": "host",
+        "transport": "udp"
+      }
+    ],
+    "inbound": [
+      {
+        "shareId": "s_q7m2x9c4v8b1n5k3",
+        "kind": "video",
+        "bitrate": 7400000,
+        "packetsLost": 12,
+        "jitterBufferMs": 41,
+        "fps": 59.8,
+        "width": 1920,
+        "height": 1080,
+        "freezeCount": 1,
+        "decoder": "ExternalDecoder",
+        "hwDecoder": true,
+        "codec": "h264/6400",
+        "framesDecoded": 35880,
+        "framesDropped": 3,
+        "freezeDurationMs": 180
+      },
+      {
+        "shareId": "s_q7m2x9c4v8b1n5k3",
+        "kind": "audio",
+        "bitrate": 128000,
+        "packetsLost": 0,
+        "jitterBufferMs": 60,
+        "codec": "opus",
+        "concealedSamples": 480,
+        "totalSamples": 2880000
+      }
+    ],
+    "outbound": [
+      {
+        "shareId": "s_z1x2c3v4b5n6m7k8",
+        "kind": "video",
+        "rid": "f",
+        "bitrate": 7800000,
+        "fps": 60,
+        "width": 1920,
+        "height": 1080,
+        "encoder": "ExternalEncoder",
+        "hwEncoder": true,
+        "qualityLimitation": "none"
+      },
+      {
+        "shareId": "s_z1x2c3v4b5n6m7k8",
+        "kind": "video",
+        "rid": "q",
+        "bitrate": 290000,
+        "fps": 15,
+        "width": 640,
+        "height": 360,
+        "encoder": "ExternalEncoder",
+        "hwEncoder": true,
+        "qualityLimitation": "none"
+      },
+      {
+        "shareId": "s_z1x2c3v4b5n6m7k8",
+        "kind": "audio",
+        "bitrate": 128000
+      }
+    ]
+  }
+}

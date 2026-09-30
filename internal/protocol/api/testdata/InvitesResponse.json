@@ -1,0 +1,47 @@
+{
+  "invites": [
+    {
+      "id": "h6j8k0m2n4p6",
+      "note": "for Sam",
+      "createdBy": {
+        "id": "k3m9p2qxw7ht",
+        "username": "Alex"
+      },
+      "maxUses": 10,
+      "uses": 0,
+      "state": "active",
+      "redeemedBy": [],
+      "createdAt": "2026-10-01T12:00:00.000Z",
+      "expiresAt": "2026-10-08T12:00:00.000Z"
+    },
+    {
+      "id": "j7k9m1n3p5r7",
+      "note": "",
+      "createdBy": {
+        "id": "k3m9p2qxw7ht",
+        "username": "Alex"
+      },
+      "maxUses": 1,
+      "uses": 1,
+      "state": "used_up",
+      "redeemedBy": [
+        {
+          "id": "b8f2n4r6t0vz",
+          "username": "Sam"
+        }
+      ],
+      "createdAt": "2026-09-20T09:00:00.000Z",
+      "expiresAt": "2026-09-27T09:00:00.000Z"
+    },
+    {
+      "id": "a1c3e5g7j9m1",
+      "note": "",
+      "maxUses": 10,
+      "uses": 0,
+      "state": "expired",
+      "redeemedBy": [],
+      "createdAt": "2026-09-18T07:30:00.000Z",
+      "expiresAt": "2026-09-19T07:30:00.000Z"
+    }
+  ]
+}

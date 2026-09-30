@@ -1,0 +1,14 @@
+Adapted code and data (notices test fixture)
+
+--------------------------------------------------------------------------------
+Example word list
+Source: https://example.com/words, commit 0123456789abcdef
+Used in: internal/example/data/words.txt.gz
+License: MIT
+--------------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2026 The word list authors
+
+(license text)

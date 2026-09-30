@@ -1,0 +1,10 @@
+{
+  "type": "share.start",
+  "id": "5",
+  "data": {
+    "kind": "screen",
+    "preset": "auto",
+    "audio": true,
+    "ref": "1s7fq2"
+  }
+}

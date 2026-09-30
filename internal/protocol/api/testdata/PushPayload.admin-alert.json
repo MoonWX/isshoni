@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "type": "admin.alert",
+  "ts": 1790712000000,
+  "tag": "admin:signup_pending",
+  "url": "/admin/approvals",
+  "kind": "signup_pending",
+  "actor": "system",
+  "target": "sam_k"
+}

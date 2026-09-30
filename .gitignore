@@ -5,10 +5,35 @@ build/msvc/
 *.exe
 *.test
 *.out
+dist-extra/
+THIRD_PARTY_NOTICES
+# web/dist holds the built SPA, but its .gitkeep is committed so `go:embed all:dist` works on a fresh clone.
+!web/dist/
+web/dist/*
+!web/dist/.gitkeep
+
+# tools, Task state and dev data
+.bin/
+.task/
+.dev/
 
 # dependencies
 node_modules/
 
-# OS / editor
+# web test and build reports
+web/build-report.json
+web/playwright-report/
+web/test-results/
+
+# project site: files copied in at build time, and VitePress output
+docs/public/install.sh
+docs/public/compose*.yaml
+docs/public/keys/
+docs/.vitepress/dist/
+docs/.vitepress/cache/
+docs/.vitepress/release.json
+
+# OS / editor / local agent worktrees
 .DS_Store
 *.swp
+.claude/worktrees/

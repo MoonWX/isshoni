@@ -1,0 +1,21 @@
+{
+  "type": "pc.offer",
+  "data": {
+    "pc": "pub",
+    "gen": 1,
+    "neg": 1,
+    "sdp": "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=pub-offer\r\nt=0 0\r\n",
+    "tracks": [
+      {
+        "mid": "0",
+        "shareId": "s_q7m2x9c4v8b1n5k3",
+        "kind": "video"
+      },
+      {
+        "mid": "1",
+        "shareId": "s_q7m2x9c4v8b1n5k3",
+        "kind": "audio"
+      }
+    ]
+  }
+}

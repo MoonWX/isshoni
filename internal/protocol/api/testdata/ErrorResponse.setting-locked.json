@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": "setting_locked",
+    "params": {
+      "field": "updateCheck"
+    }
+  }
+}

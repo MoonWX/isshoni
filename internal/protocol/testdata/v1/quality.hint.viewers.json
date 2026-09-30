@@ -1,0 +1,25 @@
+{
+  "type": "quality.hint",
+  "data": {
+    "shareId": "s_q7m2x9c4v8b1n5k3",
+    "reason": "viewers",
+    "encodings": [
+      {
+        "rid": "f",
+        "layer": "high",
+        "active": false,
+        "maxBitrate": 8000000,
+        "maxFramerate": 60,
+        "maxPixels": 2073600
+      },
+      {
+        "rid": "q",
+        "layer": "low",
+        "active": true,
+        "maxBitrate": 300000,
+        "maxFramerate": 15,
+        "maxPixels": 230400
+      }
+    ]
+  }
+}

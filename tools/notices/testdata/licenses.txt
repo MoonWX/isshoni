@@ -1,0 +1,14 @@
+isshoni web client: third-party packages (notices test fixture)
+
+--------------------------------------------------------------------------------
+react 19.3.0
+License: MIT
+--------------------------------------------------------------------------------
+
+== LICENSE ==
+
+MIT License
+
+Copyright (c) Meta Platforms, Inc. and affiliates.
+
+(license text)

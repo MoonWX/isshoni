@@ -1,0 +1,26 @@
+{
+  "defaultRoomId": "lounge",
+  "showRoomList": true,
+  "rooms": [
+    {
+      "id": "lounge",
+      "name": "Lounge",
+      "isDefault": true,
+      "live": {
+        "participants": 3,
+        "shares": 1
+      },
+      "createdAt": "2026-10-01T12:00:00.000Z"
+    },
+    {
+      "id": "p4t7w2m9k1qs",
+      "name": "🎬 Movie night",
+      "isDefault": false,
+      "live": {
+        "participants": 0,
+        "shares": 0
+      },
+      "createdAt": "2026-10-02T18:30:00.250Z"
+    }
+  ]
+}

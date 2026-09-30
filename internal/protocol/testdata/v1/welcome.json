@@ -1,0 +1,31 @@
+{
+  "type": "welcome",
+  "re": "1",
+  "data": {
+    "protocol": 1,
+    "serverVersion": "0.1.0",
+    "minClientVersion": "0.1.0",
+    "features": [],
+    "limits": {
+      "maxMessageBytes": 65536,
+      "maxSdpBytes": 262144,
+      "maxSharesPerUser": 4,
+      "messagesPerSecond": 20,
+      "messageBurst": 100,
+      "pingIntervalMs": 15000,
+      "idleTimeoutMs": 45000,
+      "graceMs": 30000
+    },
+    "iceServers": [],
+    "connectionId": "c_k3v9q2m7xw4pa8d1",
+    "resumeToken": "r1.KywtLi8wMTIzNDU2Nzg5Ojs8PT4_QEFCQ0RFRkdISUpLTE1OT1BRUlNU",
+    "resumed": false,
+    "defaultRoomId": "lounge",
+    "user": {
+      "id": "k3m9p2qxw7ht",
+      "name": "Alex",
+      "admin": true
+    },
+    "serverTime": "2026-10-12T19:04:05.123Z"
+  }
+}

@@ -1,0 +1,57 @@
+# A bad flag is a usage error: the error and the command's usage on stderr, nothing on stdout, exit 2.
+exitcode 2 isshoni version --bogus
+! stdout .
+cmp stderr version-bogus.txt
+
+exitcode 2 isshoni --bogus
+! stdout .
+stderr '^isshoni: unknown flag --bogus$'
+stderr '^Usage: isshoni <command> \[flags\] \[arguments\]$'
+
+exitcode 2 isshoni serve --bogus
+stderr '^isshoni serve: unknown flag --bogus$'
+stderr '^Usage: isshoni serve \[flags\] \[config flags\]$'
+
+exitcode 2 isshoni admin users set-role --role admin alice
+stderr '^isshoni admin users set-role: unknown flag --role$'
+stderr '^Usage: isshoni admin users set-role \[flags\] \[config flags\] NAME admin\|user$'
+
+exitcode 2 isshoni setup-url --wait soon
+stderr '^isshoni setup-url: invalid value "soon" for flag --wait: parse error$'
+
+exitcode 2 isshoni admin log-level --for
+stderr '^isshoni admin log-level: flag needs an argument: --for$'
+
+exitcode 2 isshoni version --short=maybe
+stderr '^isshoni version: invalid boolean value "maybe" for --short: parse error$'
+
+# Unknown commands are usage errors too, with a suggestion when one is close.
+exitcode 2 isshoni sreve
+stderr '^isshoni: unknown command "sreve" \(did you mean "serve"\?\)$'
+
+exitcode 2 isshoni admin userz list
+stderr '^isshoni admin: unknown command "userz" \(did you mean "users"\?\)$'
+
+# Flags go before arguments.
+exitcode 2 isshoni admin restore backup.tar.gz --yes
+stderr '^isshoni admin restore: flag --yes after an argument: flags go before arguments$'
+
+exitcode 2 isshoni admin restore
+stderr '^isshoni admin restore: missing argument PATH\|-$'
+
+# healthcheck exits only 0 or 1, even for a bad flag: Docker's HEALTHCHECK reserves 2.
+exitcode 1 isshoni healthcheck --bogus
+! stdout .
+stderr '^isshoni healthcheck: unknown flag --bogus$'
+stderr '^Usage: isshoni healthcheck \[flags\] \[config flags\]$'
+
+-- version-bogus.txt --
+isshoni version: unknown flag --bogus
+Usage: isshoni version [flags]
+
+Flags:
+  --json      print the build information as JSON
+  --short     print only the version, e.g. 0.3.0
+  -h, --help  show this help
+
+Run 'isshoni help version' for more.

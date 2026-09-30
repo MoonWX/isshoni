@@ -1,0 +1,66 @@
+# Weekly version updates (docs/m1/06-deploy-and-ci.md §8.1, "06" below). Minor and patch
+# updates are grouped per ecosystem; a major update gets a pull request of its own.
+#
+# Target branch: during M1 every pull request goes to m1/server-web, where M1 work lands before
+# it reaches main (docs/m1/README.md §4, "Branches and PRs"), so every ecosystem below sets
+# target-branch: m1/server-web. After M1, when m1/server-web has been merged into main for the
+# last time, switch every target-branch to main (or delete the lines: main is the default).
+# Dependabot reads this file from the default branch, so a change here takes effect once it is
+# merged into main.
+#
+# Not covered here: the tools pinned in .tool-versions, including the Task, golangci-lint and
+# shfmt modules in tools/go.mod (bumped by hand, monthly: 06 §7.1), and spikes/, which is
+# throwaway.
+
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directories:
+      - /
+      - /tools
+    target-branch: m1/server-web # switch to main after M1 (see the top of this file)
+    schedule:
+      interval: weekly
+    # Task, golangci-lint and shfmt are pinned in tools/go.mod and in .tool-versions, which must
+    # agree (task lint:pins). They are bumped by hand, together (06 §7.1), not here. shfmt is the
+    # mvdan.cc/sh/v3 module, which Task's shell uses too.
+    ignore:
+      - dependency-name: github.com/go-task/task/v3
+      - dependency-name: github.com/golangci/golangci-lint/v2
+      - dependency-name: mvdan.cc/sh/v3
+    groups:
+      go-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directories:
+      - /web
+      - /docs
+    target-branch: m1/server-web # switch to main after M1
+    schedule:
+      interval: weekly
+    groups:
+      npm-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: m1/server-web # switch to main after M1
+    schedule:
+      interval: weekly
+    groups:
+      actions-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directory: /deploy/docker
+    target-branch: m1/server-web # switch to main after M1
+    schedule:
+      interval: weekly
+    groups:
+      docker-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]

@@ -1,0 +1,609 @@
+# Developer tasks for isshoni (https://taskfile.dev). `task --list` shows them; the contract for each one is
+# docs/m1/06-deploy-and-ci.md §7.2.
+#
+# Task runs every command through its built-in POSIX shell, so the tasks work on macOS, Linux and Windows (a few are
+# Linux-only and say so). A task whose inputs do not exist yet (the web app, the installer, the site, ...) prints a
+# note and exits 0.
+#
+# No Task yet? Build the pinned one: `go -C tools build -o ../.bin/ github.com/go-task/task/v3/cmd/task`, then run
+# `.bin/task setup` (see CONTRIBUTING.md).
+
+# The guards below use `if:` on commands (Task 3.47, fixed in 3.48). An older Task stops here with a version error
+# instead of running both sides of a guard.
+version: '3.48'
+
+set: [pipefail]
+
+vars:
+  # One version per build: the Go binary (ldflags) and the web app (env ISSHONI_VERSION, written into
+  # web/dist/version.json) always get the same value. `task build VERSION=…` wins, then env ISSHONI_VERSION (CI),
+  # then 0.0.0-dev+<12-char commit>, plus -dirty when the working tree has changes. Outside a git checkout the
+  # commit is "unknown", so the tasks still run.
+  COMMIT:
+    sh: git rev-parse --short=12 HEAD 2>/dev/null || echo unknown
+  DIRTY:
+    sh: test -z "$(git status --porcelain 2>/dev/null)" || printf '%s' -dirty
+  DEV_VERSION: '0.0.0-dev+{{.COMMIT}}{{.DIRTY}}'
+  VERSION: '{{.ISSHONI_VERSION | default .DEV_VERSION}}'
+  VERSION_PKG: github.com/MoonWX/isshoni/internal/version
+
+  # The pinned Go tools of tools/go.mod, built into .bin/ by `task tools` (one tools:<name> task each).
+  GOLANGCI_LINT: '.bin/golangci-lint{{exeExt}}'
+  GO_LICENSES: '.bin/go-licenses{{exeExt}}'
+  TYGO: '.bin/tygo{{exeExt}}'
+  SHFMT: '.bin/shfmt{{exeExt}}'
+
+tasks:
+  # ---------------------------------------------------------------------------------------------------------------
+  # Setup
+
+  setup:
+    desc: Install what a fresh clone needs (npm packages, Go modules, the pinned Go tools in .bin/)
+    cmds:
+      - cmd: "echo 'setup: note: web/package.json does not exist yet, skipping npm ci in web/'"
+        silent: true
+        if: '[ ! -f web/package.json ]'
+      - cmd: npm --prefix web ci
+        if: '[ -f web/package.json ]'
+      - cmd: "echo 'setup: note: docs/package.json does not exist yet, skipping npm ci in docs/'"
+        silent: true
+        if: '[ ! -f docs/package.json ]'
+      - cmd: npm --prefix docs ci
+        if: '[ -f docs/package.json ]'
+      - go mod download
+      - task: tools
+
+  setup:e2e:
+    desc: Install Google Chrome for the Playwright e2e tests (only needed for `task e2e`)
+    cmds:
+      - cmd: "echo 'setup:e2e: skipped, web/package.json does not exist yet'"
+        silent: true
+        if: '[ ! -f web/package.json ]'
+      - cmd: npx --prefix web playwright install chrome
+        if: '[ -f web/package.json ]'
+
+  tools:
+    desc: >-
+      Build the pinned Go tools of tools/go.mod into .bin/ (task, golangci-lint, tygo, go-licenses, govulncheck,
+      shfmt)
+    cmds:
+      # One after the other, so the tools' shared dependencies are compiled once.
+      - task: tools:task
+      - task: tools:golangci-lint
+      - task: tools:tygo
+      - task: tools:go-licenses
+      - task: tools:govulncheck
+      - task: tools:shfmt
+
+  # One task per tool, so a task that needs one tool (gen, licenses, lint:*) builds only that one on a cold cache.
+  # Each rebuilds its binary when tools/go.mod or tools/go.sum changes (its toolchain line picks the Go version that
+  # builds the tools) or the binary is missing. None of the tools needs cgo; without it no C toolchain is involved
+  # (golangci-lint's plugin loader is off).
+  tools:task:
+    run: once
+    env: {CGO_ENABLED: '0'}
+    sources: [tools/go.mod, tools/go.sum]
+    generates: ['.bin/task{{exeExt}}']
+    cmds:
+      - go -C tools build -o ../.bin/ github.com/go-task/task/v3/cmd/task
+
+  tools:golangci-lint:
+    run: once
+    env: {CGO_ENABLED: '0'}
+    sources: [tools/go.mod, tools/go.sum]
+    generates: ['{{.GOLANGCI_LINT}}']
+    cmds:
+      - go -C tools build -o ../.bin/ github.com/golangci/golangci-lint/v2/cmd/golangci-lint
+
+  tools:tygo:
+    run: once
+    env: {CGO_ENABLED: '0'}
+    sources: [tools/go.mod, tools/go.sum]
+    generates: ['{{.TYGO}}']
+    cmds:
+      - go -C tools build -o ../.bin/ github.com/gzuidhof/tygo
+
+  tools:go-licenses:
+    run: once
+    env: {CGO_ENABLED: '0'}
+    sources: [tools/go.mod, tools/go.sum]
+    generates: ['{{.GO_LICENSES}}']
+    cmds:
+      - go -C tools build -o ../.bin/ github.com/google/go-licenses/v2
+
+  tools:govulncheck:
+    run: once
+    env: {CGO_ENABLED: '0'}
+    sources: [tools/go.mod, tools/go.sum]
+    generates: ['.bin/govulncheck{{exeExt}}']
+    cmds:
+      - go -C tools build -o ../.bin/ golang.org/x/vuln/cmd/govulncheck
+
+  tools:shfmt:
+    run: once
+    env: {CGO_ENABLED: '0'}
+    sources: [tools/go.mod, tools/go.sum]
+    generates: ['{{.SHFMT}}']
+    cmds:
+      - go -C tools build -o ../.bin/ mvdan.cc/sh/v3/cmd/shfmt
+
+  # ---------------------------------------------------------------------------------------------------------------
+  # Development
+
+  dev:
+    desc: Run the server (127.0.0.1:8080) and Vite (:5173) together, then open http://localhost:5173
+    deps: [dev:server, dev:web]
+
+  dev:server:
+    desc: Run the server in off mode with deploy/dev/isshoni.dev.toml (restart it by hand after Go changes)
+    cmds:
+      - cmd: "echo 'dev:server: skipped, cmd/isshoni does not exist yet'"
+        silent: true
+        if: '[ ! -d cmd/isshoni ]'
+      - cmd: go run -ldflags "-X {{.VERSION_PKG}}.version={{.VERSION}}" ./cmd/isshoni serve --config deploy/dev/isshoni.dev.toml
+        if: '[ -d cmd/isshoni ]'
+
+  dev:web:
+    desc: Run Vite on :5173; it proxies /api and /ws to the dev server
+    env:
+      ISSHONI_VERSION: '{{.VERSION}}'
+    cmds:
+      - cmd: "echo 'dev:web: skipped, web/package.json does not exist yet'"
+        silent: true
+        if: '[ ! -f web/package.json ]'
+      - cmd: npm --prefix web run dev
+        if: '[ -f web/package.json ]'
+
+  dev:setup-url:
+    desc: Print the first-run admin link of the dev server (run it while `task dev` runs)
+    cmds:
+      - cmd: "echo 'dev:setup-url: skipped, cmd/isshoni does not exist yet'"
+        silent: true
+        if: '[ ! -d cmd/isshoni ]'
+      - cmd: go run ./cmd/isshoni setup-url --config deploy/dev/isshoni.dev.toml
+        if: '[ -d cmd/isshoni ]'
+
+  # ---------------------------------------------------------------------------------------------------------------
+  # Code generation
+
+  gen:
+    desc: Generate the TypeScript protocol types (tygo, tygo.yaml) and the message registry into web/src/protocol/
+    deps: [tools:tygo]
+    cmds:
+      - cmd: "echo 'gen: note: internal/protocol and internal/protocol/api do not both exist yet, skipping tygo'"
+        silent: true
+        if: '! [ -d internal/protocol ] || ! [ -d internal/protocol/api ]'
+      - cmd: '{{.TYGO}} generate'
+        if: '[ -d internal/protocol ] && [ -d internal/protocol/api ]'
+      - cmd: "echo 'gen: note: internal/protocol/gen/tsregistry does not exist yet, skipping the registry'"
+        silent: true
+        if: '[ ! -d internal/protocol/gen/tsregistry ]'
+      - cmd: go run ./internal/protocol/gen/tsregistry -o web/src/protocol/registry.gen.ts
+        if: '[ -d internal/protocol/gen/tsregistry ]'
+
+  gen:check:
+    desc: Fail when web/src/protocol/ differs from what `task gen` writes (the CI drift check)
+    cmds:
+      - task: gen
+      - cmd: |
+          drift=$(git status --porcelain -- web/src/protocol/)
+          if [ -n "$drift" ]; then
+            echo "$drift"
+            echo 'gen:check: the generated TypeScript in web/src/protocol/ is out of date: run "task gen" and commit the result' >&2
+            exit 1
+          fi
+        silent: true
+
+  # ---------------------------------------------------------------------------------------------------------------
+  # Tests
+
+  test:
+    desc: Run every test suite (test:go, test:web, test:sh)
+    cmds:
+      - task: test:go
+      - task: test:web
+      - task: test:sh
+
+  test:go:
+    desc: >-
+      Run the Go tests with the race detector (it needs cgo) for the main module and tools/; `task test:go -- ARGS`
+      passes ARGS to the main module's run (CI: -coverprofile=coverage.out -covermode=atomic)
+    env:
+      CGO_ENABLED: '1'
+    vars:
+      # Empty only while the main module has no packages. When go list itself fails, the real command runs and
+      # prints go's error.
+      GO_PKGS:
+        sh: go list -e ./... 2>/dev/null || echo 'go list failed'
+    cmds:
+      - cmd: "echo 'test:go: note: the main module has no Go packages yet'"
+        silent: true
+        if: '{{if .GO_PKGS}}false{{else}}true{{end}}'
+      - cmd: go test -race -count=1 -timeout 15m {{.CLI_ARGS}} ./...
+        if: '{{if .GO_PKGS}}true{{else}}false{{end}}'
+      - go -C tools test -race -count=1 -timeout 15m ./...
+
+  test:web:
+    desc: Run the web unit tests (Vitest)
+    cmds:
+      - cmd: "echo 'test:web: skipped, web/package.json does not exist yet'"
+        silent: true
+        if: '[ ! -f web/package.json ]'
+      - cmd: npm --prefix web test -- --run
+        if: '[ -f web/package.json ]'
+
+  test:sh:
+    desc: Run the install.sh unit tests under dash, bash --posix and busybox sh
+    cmds:
+      - cmd: "echo 'test:sh: skipped, deploy/test/install_unit.sh does not exist yet'"
+        silent: true
+        if: '[ ! -f deploy/test/install_unit.sh ]'
+      - cmd: |
+          for shell in dash 'bash --posix' 'busybox sh'; do
+            echo "test:sh: $shell deploy/test/install_unit.sh"
+            $shell deploy/test/install_unit.sh
+          done
+        silent: true
+        if: '[ -f deploy/test/install_unit.sh ]'
+
+  # ---------------------------------------------------------------------------------------------------------------
+  # Linters
+
+  lint:
+    desc: Run every linter (lint:go, lint:web, lint:sh, lint:actions, lint:keys, lint:pins, lint:unit)
+    cmds:
+      - task: lint:go
+      - task: lint:web
+      - task: lint:sh
+      - task: lint:actions
+      - task: lint:keys
+      - task: lint:pins
+      - task: lint:unit
+
+  lint:go:
+    desc: golangci-lint, go mod tidy -diff, and go vet for GOOS darwin and windows (the main module and tools/)
+    deps: [tools:golangci-lint]
+    vars:
+      # As in test:go: empty only while the main module has no packages.
+      GO_PKGS:
+        sh: go list -e ./... 2>/dev/null || echo 'go list failed'
+    cmds:
+      - cmd: "echo 'lint:go: note: the main module has no Go packages yet, skipping golangci-lint and go vet for it'"
+        silent: true
+        if: '{{if .GO_PKGS}}false{{else}}true{{end}}'
+      - cmd: '{{.GOLANGCI_LINT}} run'
+        if: '{{if .GO_PKGS}}true{{else}}false{{end}}'
+      - cmd: GOOS=darwin go vet ./...
+        if: '{{if .GO_PKGS}}true{{else}}false{{end}}'
+      - cmd: GOOS=windows go vet ./...
+        if: '{{if .GO_PKGS}}true{{else}}false{{end}}'
+      - go mod tidy -diff
+      - cd tools && ../{{.GOLANGCI_LINT}} run ./...
+      - go -C tools vet ./...
+      - go -C tools mod tidy -diff
+
+  lint:web:
+    desc: Lint and type-check the web app
+    cmds:
+      - cmd: "echo 'lint:web: skipped, web/package.json does not exist yet'"
+        silent: true
+        if: '[ ! -f web/package.json ]'
+      - cmd: npm --prefix web run lint
+        if: '[ -f web/package.json ]'
+      - cmd: npm --prefix web run typecheck
+        if: '[ -f web/package.json ]'
+
+  lint:sh:
+    desc: Check the shell scripts under deploy/ with shellcheck (POSIX sh) and shfmt (.bin/shfmt)
+    deps: [tools:shfmt]
+    cmds:
+      - cmd: |
+          set -- deploy/**/*.sh
+          if [ $# -eq 0 ]; then
+            echo 'lint:sh: skipped, there are no shell scripts under deploy/ yet'
+            exit 0
+          fi
+          # ShellCheck is not a Go program, so it comes from mise or a package manager, not from tools/go.mod.
+          command -v shellcheck >/dev/null || { echo 'lint:sh: shellcheck is not installed: run "mise install" or install ShellCheck (see .tool-versions)' >&2; exit 1; }
+          echo "lint:sh: shellcheck --shell=sh and shfmt -p -i 2 -d over $# scripts"
+          status=0
+          shellcheck --shell=sh "$@" || status=1
+          {{.SHFMT}} -p -i 2 -d "$@" || status=1
+          exit $status
+        silent: true
+        shopt: [globstar, nullglob]
+
+  lint:actions:
+    desc: Check the GitHub Actions workflows with actionlint
+    cmds:
+      - cmd: "echo 'lint:actions: skipped, .github/workflows does not exist yet'"
+        silent: true
+        if: '[ ! -d .github/workflows ]'
+      # actionlint comes from mise or a package manager (tools/go.mod says why it is not built into .bin/).
+      - cmd: |
+          command -v actionlint >/dev/null || { echo 'lint:actions: actionlint is not installed: run "mise install" or install actionlint (see .tool-versions)' >&2; exit 1; }
+          echo 'lint:actions: actionlint over .github/workflows'
+          actionlint
+        silent: true
+        if: '[ -d .github/workflows ]'
+
+  lint:keys:
+    desc: Check that the key block embedded in deploy/install.sh equals deploy/keys/allowed_signers
+    cmds:
+      - go -C tools run ./repocheck -root .. keys
+
+  lint:pins:
+    desc: Check that .tool-versions, the go.mod toolchain and the tools/go.mod versions agree
+    cmds:
+      - go -C tools run ./repocheck -root .. pins
+
+  lint:unit:
+    desc: Verify the systemd unit with systemd-analyze (Linux only; skipped elsewhere)
+    cmds:
+      - cmd: "echo 'lint:unit: skipped, systemd-analyze runs on Linux only'"
+        silent: true
+        if: '{{if eq OS "linux"}}false{{else}}true{{end}}'
+      - cmd: "echo 'lint:unit: skipped, deploy/systemd/isshoni.service does not exist yet'"
+        silent: true
+        if: '{{if eq OS "linux"}}[ ! -f deploy/systemd/isshoni.service ]{{else}}false{{end}}'
+      - cmd: |
+          # ExecStart=isshoni is resolved in systemd's fixed search path when the unit loads, so verify rejects the
+          # unit on a machine where isshoni is not installed. Verify a copy that starts it through /usr/bin/env.
+          # verify only warns about values it ignores ("Failed to parse ..., ignoring"): any message about the
+          # unit fails the check as well.
+          dir=$(mktemp -d)
+          sed 's|^ExecStart=isshoni |ExecStart=/usr/bin/env isshoni |' deploy/systemd/isshoni.service > "$dir/isshoni.service"
+          echo 'lint:unit: systemd-analyze verify deploy/systemd/isshoni.service'
+          status=0
+          out=$(systemd-analyze verify "$dir/isshoni.service" 2>&1) || status=$?
+          rm -rf "$dir"
+          if [ -n "$out" ]; then
+            printf '%s\n' "$out" | sed "s|$dir/|deploy/systemd/|g"
+            case $out in *isshoni.service*) [ "$status" -ne 0 ] || status=1 ;; esac
+          fi
+          exit $status
+        silent: true
+        if: '{{if eq OS "linux"}}[ -f deploy/systemd/isshoni.service ]{{else}}false{{end}}'
+
+  # ---------------------------------------------------------------------------------------------------------------
+  # Build
+
+  build:
+    desc: Build the web app, then the server binary, both stamped with the same VERSION
+    cmds:
+      - task: build:web
+        vars: {VERSION: '{{.VERSION}}'}
+      - task: build:go
+        vars: {VERSION: '{{.VERSION}}'}
+
+  build:web:
+    desc: Build the web app into web/dist/ (a no-op when nothing changed and web/dist is for this VERSION)
+    env:
+      ISSHONI_VERSION: '{{.VERSION}}'
+    sources:
+      - web/package.json
+      - web/package-lock.json
+      - web/index.html
+      - web/*.config.*
+      - web/tsconfig*.json
+      - web/licenses.overrides.json
+      - web/src/**/*
+      - web/public/**/*
+      - web/build/**/*
+      - web/scripts/**/*
+    generates:
+      - web/dist/index.html
+      - web/dist/version.json
+    status:
+      - test "$(node -p "require('./web/dist/version.json').version")" = '{{.VERSION}}'
+    cmds:
+      - cmd: "echo 'build:web: skipped, web/package.json does not exist yet'"
+        silent: true
+        if: '[ ! -f web/package.json ]'
+      - cmd: npm --prefix web run build
+        if: '[ -f web/package.json ]'
+
+  build:go:
+    desc: Build bin/isshoni (CGO_ENABLED=0, no Node needed) with the web app of web/dist/ embedded
+    preconditions:
+      - sh: '[ -f web/dist/index.html ]'
+        msg: >-
+          web/dist/index.html is missing, and the binary embeds the web app from web/dist/.
+          Run "task build:web" first, or "task build" for both (CI downloads the web job's artifact).
+    env:
+      CGO_ENABLED: '0'
+    cmds:
+      - cmd: "echo 'build:go: skipped, cmd/isshoni does not exist yet'"
+        silent: true
+        if: '[ ! -d cmd/isshoni ]'
+      - cmd: >-
+          go build -trimpath
+          -ldflags "-s -w
+          -X {{.VERSION_PKG}}.version={{.VERSION}}
+          -X {{.VERSION_PKG}}.commit=$(git rev-parse HEAD)
+          -X {{.VERSION_PKG}}.date=$(TZ=UTC0 git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd)"
+          -o bin/isshoni{{exeExt}} ./cmd/isshoni
+        if: '[ -d cmd/isshoni ]'
+
+  e2e:
+    desc: Build with a non-dev version (0.0.0-e2e.local unless ISSHONI_VERSION is set), then run the Playwright tests
+    vars:
+      E2E_VERSION: '{{.ISSHONI_VERSION | default "0.0.0-e2e.local"}}'
+    env:
+      ISSHONI_BIN: '{{.ROOT_DIR}}/bin/isshoni{{exeExt}}'
+    cmds:
+      - cmd: "echo 'e2e: skipped, web/playwright.config.ts does not exist yet'"
+        silent: true
+        if: '[ ! -f web/playwright.config.ts ]'
+      - task: build
+        vars: {VERSION: '{{.E2E_VERSION}}'}
+        if: '[ -f web/playwright.config.ts ]'
+      - cmd: npm --prefix web run e2e
+        if: '[ -f web/playwright.config.ts ]'
+
+  # ---------------------------------------------------------------------------------------------------------------
+  # Licenses
+
+  licenses:
+    desc: The license gate - go-licenses for linux, darwin and windows, and the npm license check of web/ and docs/
+    deps: [tools:go-licenses]
+    cmds:
+      - cmd: "echo 'licenses: note: cmd/ does not exist yet, skipping go-licenses'"
+        silent: true
+        if: '[ ! -d cmd ]'
+      - for: [linux, darwin, windows]
+        cmd: GOOS={{.ITEM}} {{.GO_LICENSES}} check ./cmd/... --ignore github.com/MoonWX/isshoni --disallowed_types=forbidden,restricted,unknown
+        if: '[ -d cmd ]'
+      - cmd: "echo 'licenses: note: web/scripts/licenses.mjs does not exist yet, skipping the npm check'"
+        silent: true
+        if: '[ ! -f web/scripts/licenses.mjs ]'
+      - cmd: node web/scripts/licenses.mjs check --dir web
+        if: '[ -f web/scripts/licenses.mjs ] && [ -f web/package.json ]'
+      - cmd: node web/scripts/licenses.mjs check --dir docs
+        if: '[ -f web/scripts/licenses.mjs ] && [ -f docs/package.json ]'
+
+  notices:
+    desc: Write THIRD_PARTY_NOTICES for bin/isshoni (Go modules, the Go runtime, the bundled npm packages)
+    cmds:
+      - cmd: "echo 'notices: skipped, tools/notices does not exist yet'"
+        silent: true
+        if: '[ ! -d tools/notices ]'
+      - cmd: >-
+          go -C tools run ./notices -root .. -pkg ./cmd/isshoni -goos linux,darwin,windows
+          -npm ../web/dist/licenses.txt -extra ../deploy/notices/extra.txt -version {{.VERSION}}
+          -o ../THIRD_PARTY_NOTICES
+        if: '[ -d tools/notices ]'
+
+  # ---------------------------------------------------------------------------------------------------------------
+  # Release
+
+  release:prepare:
+    desc: goreleaser's before hook, no npm - check web/dist is for VERSION, write THIRD_PARTY_NOTICES, stamp install.sh
+    cmds:
+      - cmd: "echo 'release:prepare: note: web/package.json does not exist yet, skipping the web/dist check'"
+        silent: true
+        if: '[ ! -f web/package.json ]'
+      - cmd: |
+          want='{{.VERSION}}'
+          if [ ! -f web/dist/version.json ]; then
+            echo "release:prepare: web/dist/version.json is missing: run task build:web VERSION=$want" >&2
+            exit 1
+          fi
+          got=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' web/dist/version.json)
+          if [ "$got" != "$want" ]; then
+            echo "release:prepare: web/dist was built for ${got:-an unknown version}, not $want: run task build:web VERSION=$want" >&2
+            exit 1
+          fi
+        silent: true
+        if: '[ -f web/package.json ]'
+      - task: notices
+        vars: {VERSION: '{{.VERSION}}'}
+      - cmd: "echo 'release:prepare: note: deploy/install.sh does not exist yet, nothing to stamp'"
+        silent: true
+        if: '[ ! -f deploy/install.sh ]'
+      - cmd: |
+          mkdir -p dist-extra
+          sed 's/^ISSHONI_INSTALLER_VERSION="@VERSION@"/ISSHONI_INSTALLER_VERSION="{{.VERSION}}"/' deploy/install.sh > dist-extra/install.sh
+          if ! grep -q '^ISSHONI_INSTALLER_VERSION="{{.VERSION}}"$' dist-extra/install.sh; then
+            echo 'release:prepare: deploy/install.sh has no ISSHONI_INSTALLER_VERSION="@VERSION@" line to stamp' >&2
+            exit 1
+          fi
+          echo 'release:prepare: stamped dist-extra/install.sh with {{.VERSION}}'
+        silent: true
+        if: '[ -f deploy/install.sh ]'
+
+  release:snapshot:
+    desc: Local release dry run - build the web app, then goreleaser --snapshot without signing or SBOMs
+    vars:
+      SNAPSHOT_VERSION: '{{.ISSHONI_SNAPSHOT_VERSION | default (print "0.0.0-dev." .COMMIT)}}'
+    env:
+      ISSHONI_SNAPSHOT_VERSION: '{{.SNAPSHOT_VERSION}}'
+    cmds:
+      - cmd: "echo 'release:snapshot: skipped, .goreleaser.yaml does not exist yet'"
+        silent: true
+        if: '[ ! -f .goreleaser.yaml ]'
+      - task: build:web
+        vars: {VERSION: '{{.SNAPSHOT_VERSION}}'}
+        if: '[ -f .goreleaser.yaml ]'
+      - cmd: goreleaser release --snapshot --clean --skip=sign,sbom
+        if: '[ -f .goreleaser.yaml ]'
+
+  release:compat:
+    desc: Snapshot the protocol fixtures for the final release VERSION=X.Y.Z (run in the release-prep PR)
+    cmds:
+      - cmd: |
+          case '{{.VERSION}}' in
+            *[!0-9.]* | .* | *. | *..* | *.*.*.*) ok=no ;;
+            *.*.*) ok=yes ;;
+            *) ok=no ;;
+          esac
+          if [ "$ok" = no ]; then
+            echo 'release:compat: VERSION={{.VERSION}} is not a final X.Y.Z release: run task release:compat VERSION=X.Y.Z' >&2
+            exit 1
+          fi
+        silent: true
+      - cmd: "echo 'release:compat: skipped, internal/protocol/testdata/v1 does not exist yet'"
+        silent: true
+        if: '[ ! -d internal/protocol/testdata/v1 ]'
+      - cmd: |
+          echo 'release:compat: not implemented yet: copy internal/protocol/testdata/v1 to internal/protocol/testdata/compat/{{.VERSION}}/ and keep the two newest (docs/m1/01-protocol.md §14.3)' >&2
+          exit 1
+        silent: true
+        if: '[ -d internal/protocol/testdata/v1 ]'
+
+  # ---------------------------------------------------------------------------------------------------------------
+  # Deployment tests
+
+  deploy:test:
+    desc: Run the installer scenarios in distro containers (DISTRO=debian-12 selects one; needs podman or Docker)
+    cmds:
+      - cmd: "echo 'deploy:test: skipped, deploy/test/distro-test.sh does not exist yet'"
+        silent: true
+        if: '[ ! -f deploy/test/distro-test.sh ]'
+      - cmd: sh deploy/test/distro-test.sh {{.DISTRO}}
+        if: '[ -f deploy/test/distro-test.sh ]'
+
+  docker:smoke:
+    desc: Run the Docker smoke test (bridge and host networking, backup and restore, no volume, no .env)
+    cmds:
+      - cmd: "echo 'docker:smoke: skipped, deploy/test/docker-smoke.sh does not exist yet'"
+        silent: true
+        if: '[ ! -f deploy/test/docker-smoke.sh ]'
+      - cmd: sh deploy/test/docker-smoke.sh
+        if: '[ -f deploy/test/docker-smoke.sh ]'
+
+  # ---------------------------------------------------------------------------------------------------------------
+  # Project site
+
+  site:dev:
+    desc: Serve the project site (VitePress) with live reload
+    cmds:
+      - cmd: "echo 'site:dev: skipped, docs/package.json does not exist yet'"
+        silent: true
+        if: '[ ! -f docs/package.json ]'
+      - cmd: npx --prefix docs vitepress dev docs
+        if: '[ -f docs/package.json ]'
+
+  site:build:
+    desc: Build the project site (VitePress) into docs/.vitepress/dist/
+    cmds:
+      - cmd: "echo 'site:build: skipped, docs/package.json does not exist yet'"
+        silent: true
+        if: '[ ! -f docs/package.json ]'
+      - cmd: npx --prefix docs vitepress build docs
+        if: '[ -f docs/package.json ]'
+
+  # ---------------------------------------------------------------------------------------------------------------
+
+  clean:
+    desc: >-
+      Remove build output (bin/, dist/, dist-extra/, web/dist/* except .gitkeep), .dev/, and the pinned tools in .bin/
+      except task
+    cmds:
+      # .bin/task stays (06 §7.2 says .bin/): it is often the Task running this command, and deleting it would leave
+      # a contributor without the go-built Task (Windows cannot delete a running .exe anyway). `task tools` builds
+      # the others again.
+      - rm -rf bin dist dist-extra .dev .task
+      - >-
+        rm -rf {{.GOLANGCI_LINT}} {{.TYGO}} {{.GO_LICENSES}} .bin/govulncheck{{exeExt}} {{.SHFMT}}
+      - rm -rf web/dist/*

@@ -1,0 +1,12 @@
+{
+  "room": {
+    "id": "p4t7w2m9k1qs",
+    "name": "🎬 Movie night",
+    "isDefault": false,
+    "live": {
+      "participants": 0,
+      "shares": 0
+    },
+    "createdAt": "2026-10-02T18:30:00.250Z"
+  }
+}

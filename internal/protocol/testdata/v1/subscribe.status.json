@@ -1,0 +1,14 @@
+{
+  "type": "subscribe.status",
+  "data": {
+    "subs": [
+      {
+        "shareId": "s_z1x2c3v4b5n6m7k8",
+        "video": "low",
+        "audio": "on",
+        "requestedVideo": "high",
+        "reason": "bandwidth"
+      }
+    ]
+  }
+}

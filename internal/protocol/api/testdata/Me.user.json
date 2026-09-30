@@ -1,0 +1,19 @@
+{
+  "user": {
+    "id": "b8f2n4r6t0vz",
+    "username": "Sam",
+    "role": "user",
+    "createdAt": "2026-10-02T08:15:30.500Z"
+  },
+  "session": {
+    "id": "z9x8c7v6b5n4",
+    "name": "Safari on iPhone",
+    "current": true,
+    "createdAt": "2026-10-02T08:15:30.500Z",
+    "expiresAt": "2027-03-31T08:15:30.500Z"
+  },
+  "permissions": {
+    "admin": false,
+    "createInvites": false
+  }
+}

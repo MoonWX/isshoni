@@ -1,0 +1,52 @@
+{
+  "server": {
+    "version": "0.3.0",
+    "origin": "http://localhost:8080",
+    "process": {
+      "cpuSeconds": 0.4,
+      "rssBytes": 52000000,
+      "numCpu": 8,
+      "goroutines": 37
+    },
+    "tls": {
+      "mode": "off",
+      "names": [],
+      "ready": true
+    },
+    "publicIpv4": "",
+    "publicIpv6": "",
+    "nat": "unknown",
+    "advertised": [],
+    "startedAt": "2026-09-29T18:00:00.000Z"
+  },
+  "transfer": {
+    "month": "2026-09",
+    "egressBytes": 0,
+    "ingressBytes": 0,
+    "alertGb": 0,
+    "egressBps": 0,
+    "ingressBps": 0
+  },
+  "media": {
+    "ingressBps": 0,
+    "egressBps": 0,
+    "downTracks": 0,
+    "peerConnections": {
+      "udp": 0,
+      "tcp443": 0,
+      "tcp7882": 0
+    }
+  },
+  "rooms": [],
+  "clients": [],
+  "alerts": [
+    {
+      "code": "dashboard.source_failed",
+      "severity": "warn",
+      "params": {
+        "source": "accounts"
+      }
+    }
+  ],
+  "generatedAt": "2026-09-29T18:00:03.500Z"
+}

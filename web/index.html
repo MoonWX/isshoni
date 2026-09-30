@@ -1,0 +1,33 @@
+<!doctype html>
+<!--
+  The SPA shell (05 §4, §16.1). No inline scripts or styles: the server's CSP allows only same-origin files.
+  /boot-check.js, /manifest.webmanifest and /icons/* are served from public/.
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="description" content="Watch your friends' screens together" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#f6f6f9" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#101014" media="(prefers-color-scheme: dark)" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="isshoni" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/icons/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+    <title>isshoni</title>
+  </head>
+  <body>
+    <noscript>
+      <div class="boot-message">
+        <h1>isshoni needs JavaScript</h1>
+        <p>Turn on JavaScript for this site, then reload the page.</p>
+      </div>
+    </noscript>
+    <div id="root"></div>
+    <script src="/boot-check.js"></script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

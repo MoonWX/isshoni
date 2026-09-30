@@ -1,0 +1,20 @@
+# Commands whose behavior later slices add say so and exit 1 (a runtime error, not a usage error).
+exitcode 1 isshoni serve
+! stdout .
+stderr '^isshoni serve: not implemented in this build yet$'
+
+exitcode 1 isshoni setup-url --json --wait 1s
+stderr '^isshoni setup-url: not implemented in this build yet$'
+
+exitcode 1 isshoni admin users set-role alice admin
+stderr '^isshoni admin users set-role: not implemented in this build yet$'
+
+exitcode 1 isshoni admin backup --out -
+stderr '^isshoni admin backup: not implemented in this build yet$'
+
+exitcode 1 isshoni healthcheck --ready
+stderr '^isshoni healthcheck: not implemented in this build yet$'
+
+# Commands that read the config accept the config flags.
+exitcode 1 isshoni admin status --listen.admin-socket /tmp/isshoni-test.sock --json
+stderr '^isshoni admin status: not implemented in this build yet$'

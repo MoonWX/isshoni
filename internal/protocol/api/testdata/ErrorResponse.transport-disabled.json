@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": "transport_disabled",
+    "params": {
+      "transport": "tcp443"
+    }
+  }
+}

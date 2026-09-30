@@ -1,0 +1,77 @@
+# The root usage goes to stdout for help, --help and -h (exit 0).
+exec isshoni help
+cmp stdout usage.txt
+! stderr .
+
+exec isshoni --help
+cmp stdout usage.txt
+
+exec isshoni -h
+cmp stdout usage.txt
+
+# Without a command it is a usage error: the message and the usage on stderr, exit 2.
+exitcode 2 isshoni
+! stdout .
+stderr '^isshoni: missing command$'
+stderr '^Usage: isshoni <command> \[flags\] \[arguments\]$'
+
+# A group lists its commands.
+exec isshoni help admin
+stdout '^Usage: isshoni admin <command> \[flags\] \[arguments\]$'
+stdout '^  users           Manage accounts'
+stdout '^Run ''isshoni help admin <command>'' for more about a command\.$'
+
+exitcode 2 isshoni admin users
+stderr '^isshoni admin users: missing command$'
+stderr '^  set-role        Change a user''s role$'
+
+# A command's usage: its line, description, flags and the config flags note.
+exec isshoni help admin restore
+cmp stdout restore.txt
+
+exec isshoni admin restore --help
+cmp stdout restore.txt
+
+exec isshoni help version
+stdout '^Usage: isshoni version \[flags\]$'
+stdout '^  --json +print the build information as JSON$'
+stdout '^  --short +print only the version, e\.g\. 0\.3\.0$'
+! stdout 'config flags'
+
+-- usage.txt --
+Usage: isshoni <command> [flags] [arguments]
+
+isshoni runs a self-hosted server for sharing screens (and system audio) with friends and watching
+them together in the browser.
+
+Commands:
+  serve        Run the server
+  setup-url    Print a one-time link that creates the admin account
+  doctor       Diagnose the server and this machine
+  healthcheck  Check that the server is alive, or ready with --ready
+  admin        Manage a running server: status, users, invites, backups
+  config       Check, print or write the configuration
+  version      Print build information
+  help         Show help for a command
+
+Flags:
+  --version   print build information and exit
+  -h, --help  show this help
+
+Run 'isshoni help <command>' for more about a command.
+Documentation: https://moonwx.github.io/isshoni/
+-- restore.txt --
+Usage: isshoni admin restore [flags] [config flags] PATH|-
+
+Restores a backup archive (.tar.gz), or only the database from a pre-migration backups/pre-*.db
+file, and restarts the server. It asks for confirmation on a terminal; otherwise --yes is required.
+With - the archive comes from stdin, so --yes is always required.
+
+Flags:
+  --offline      restore into the data directory directly while the server is stopped
+  --socket PATH  admin socket PATH (default: listen.admin_socket from the config, /run/isshoni/admin.sock)
+  --yes          don't ask for confirmation
+  -h, --help     show this help
+
+Config flags: --config PATH (default /etc/isshoni/isshoni.toml, env ISSHONI_CONFIG) and one
+flag per config key, such as --tls.mode or --public-ip. See 'isshoni help serve'.

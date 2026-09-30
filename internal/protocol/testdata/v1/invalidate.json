@@ -1,0 +1,9 @@
+{
+  "type": "invalidate",
+  "data": {
+    "topics": [
+      "rooms",
+      "admin.approvals"
+    ]
+  }
+}

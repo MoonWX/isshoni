@@ -1,0 +1,29 @@
+# Base configuration of the Playwright e2e servers (docs/m1/06-deploy-and-ci.md §7.3). Not for production.
+#
+# The ports, the data directory and the admin socket below are defaults only. The e2e fixture starts every server
+# with this file plus its own free ports (--listen.http, --listen.ice-udp, --listen.ice-tcp, --public-url), a fresh
+# temporary data directory (ISSHONI_DATA_DIR) and its own --listen.admin-socket, so parallel workers and a running
+# `task dev` never share a port, a data directory or a socket. The values here only matter for a manual
+# `isshoni serve --config deploy/dev/isshoni.e2e.toml`, and they are chosen so that it fits next to `task dev`.
+
+public_url = "http://127.0.0.1:18080" # the SPA is embedded in the binary: no Vite in e2e
+data_dir   = ".dev/e2e-data"
+
+[listen]
+http         = "127.0.0.1:18080"
+ice_udp      = ":17882"
+ice_tcp      = ":17882"
+admin_socket = ".dev/e2e-admin.sock"
+
+[tls]
+mode = "off"
+
+[network]
+include_loopback = true # same-machine ICE: the browser and the server share the loopback interface
+stun_servers     = []   # no STUN in CI; the public IP stays unknown, which off mode allows
+
+[log]
+format = "json" # CI keeps each server's log as an artifact, and JSON lines can be parsed
+
+[updates]
+release_check = false
