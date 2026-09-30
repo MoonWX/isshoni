@@ -1,14 +1,17 @@
 package signal
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -196,8 +199,11 @@ type Hub struct {
 	cancel context.CancelFunc
 
 	// wg counts every goroutine the hub owns: each ServeHTTP call past the first check (it runs the socket's
-	// reader), and each writer, pinger, connection actor and periodic Revalidate call. Shutdown waits for it.
+	// reader), and each writer, pinger, connection actor, periodic Revalidate call and scheduled room.state
+	// broadcast. Shutdown waits for it.
 	wg sync.WaitGroup
+
+	revs atomic.Uint64 // the last room.state rev (nextRev)
 
 	mu             sync.Mutex
 	closing        bool
@@ -207,6 +213,8 @@ type Hub struct {
 	conns          map[string]*conn     // connections by id (ready; detached ones from S28 on)
 	userSlots      map[string]int       // per user: connections plus handshaking cookie sockets (01 §3.1 step 5)
 	preAuth        int                  // concurrent pre-auth sockets (01 §3.1 step 4)
+	rooms          map[string]*room     // rooms with at least one participant, by id
+	participants   int                  // participants over all rooms, CloseRoom's included until they are detached
 	closedRooms    map[string]struct{}  // rooms closed by CloseRoom, for this process's lifetime
 }
 
@@ -267,6 +275,7 @@ func New(cfg Config, deps Deps) (*Hub, error) {
 		sockets:     make(map[*socket]struct{}),
 		conns:       make(map[string]*conn),
 		userSlots:   make(map[string]int),
+		rooms:       make(map[string]*room),
 		closedRooms: make(map[string]struct{}),
 	}
 	return h, nil
@@ -457,8 +466,9 @@ func (h *Hub) CloseConnections(sel ConnSelector, code protocol.ErrorCode) int {
 	return n
 }
 
-// UpdateUser applies a rename or role change to the user's open connections: their Identity now, and the names in
-// room.state with the rooms slice (README S19).
+// UpdateUser applies a rename or role change to the user's open connections: their Identity (admin topics of Notify
+// follow the flag) and the participant's name in the room.state of every room they are in. Each connection's actor
+// applies it; the snapshots with the new name go out coalesced like any change.
 func (h *Hub) UpdateUser(userID, name string, admin bool) {
 	h.mu.Lock()
 	var conns []*conn
@@ -476,19 +486,52 @@ func (h *Hub) UpdateUser(userID, name string, admin bool) {
 // CloseRoom → room_closed (scope room); clients rejoin defaultRoomId. It also records roomID as closed for the
 // process lifetime; a room.join that passed GetRoom before the delete gets room_not_found.
 //
-// The hub has no rooms before the rooms slice (README S19), which sends room_closed to the room's connections; this
-// skeleton records the closed id.
+// The room's connections leave it (their shares end with room_closed and their MediaPeers close) and get
+// error{room_closed, scope room, roomId}; connections in other rooms get nothing. Nothing more is sent about the room:
+// no room.state and no room.event. Each connection's actor does its part right after the call returns.
 func (h *Hub) CloseRoom(roomID string) {
 	h.mu.Lock()
 	h.closedRooms[roomID] = struct{}{}
+	r := h.rooms[roomID]
+	var conns []*conn
+	if r != nil {
+		delete(h.rooms, roomID)
+		r.mu.Lock()
+		r.closed = true
+		r.stopTimerLocked()
+		r.membersLocked(func(m *member) { conns = append(conns, m.c) })
+		r.mu.Unlock()
+		h.metrics.roomCounts(len(h.rooms), h.participants)
+	}
 	h.mu.Unlock()
-	h.log.Info("room closed", slog.String("room_id", roomID))
+	for _, c := range conns {
+		c.post(func() { c.roomClosed(r) })
+	}
+	h.log.Info("room closed", slog.String("room_id", roomID), slog.Int("connections", len(conns)))
 }
 
-// Snapshot returns the live state for presence counts (03) and the admin dashboard (04). Rooms are always present
-// ([] when empty); rooms come with README S19.
+// Snapshot returns the live state for presence counts (03) and the admin dashboard (04): every room with at least
+// one participant, sorted by id, with participants and shares in room.state order. Slices are never nil. A room's
+// Name is the one its latest room.join read with GetRoom, so it lags a rename (03 §8) until the next join: 04's
+// dashboard adapter prefers the store's current name. LiveShare.Layers is empty and EgressBitrate 0 until the stats
+// forwarding of README S40 keeps each MediaPeer's Stats for the snapshot.
 func (h *Hub) Snapshot() LiveSnapshot {
-	return LiveSnapshot{Rooms: []LiveRoom{}}
+	h.mu.Lock()
+	rooms := make([]*room, 0, len(h.rooms))
+	for _, r := range h.rooms {
+		rooms = append(rooms, r)
+	}
+	h.mu.Unlock()
+	slices.SortFunc(rooms, func(a, b *room) int { return cmp.Compare(a.id, b.id) })
+	snap := LiveSnapshot{Rooms: make([]LiveRoom, 0, len(rooms))}
+	for _, r := range rooms {
+		r.mu.Lock()
+		if !r.closed {
+			snap.Rooms = append(snap.Rooms, r.liveLocked())
+		}
+		r.mu.Unlock()
+	}
+	return snap
 }
 
 // later: func (h *Hub) Kick(roomID, userID string) error  // → kicked (scope room) + rejoin block

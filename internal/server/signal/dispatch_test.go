@@ -125,14 +125,16 @@ func TestMessageRules(t *testing.T) {
 			t.Errorf("re %q", re)
 		}
 
-		// room.join is the rooms slice's (README S19): error{internal} with a ref, logged at WARN.
-		id = request(t, c, protocol.MessageTypeRoomJoin, protocol.RoomJoin{RoomID: "lounge"})
+		// share.start in a room is the shares slice's (README S40): error{internal} with a ref, logged at WARN.
+		join(t, c, "lounge")
+		id = request(t, c, protocol.MessageTypeShareStart, protocol.ShareStart{Kind: protocol.ShareKindScreen,
+			Preset: protocol.PresetAuto, Ref: "r3"})
 		pe, re = expectError(t, c, protocol.ErrorCodeInternal, protocol.ErrorScopeRequest)
 		ref, _ := pe.Params["ref"].(string)
 		if re != id || len(ref) != 8 || !pe.Retryable {
 			t.Errorf("re %q, ref %q, retryable %v", re, ref, pe.Retryable)
 		}
-		if e.logs.count("level=WARN", "not implemented yet", "ref="+ref, "type=room.join") != 1 {
+		if e.logs.count("level=WARN", "not implemented yet", "ref="+ref, "type=share.start") != 1 {
 			t.Errorf("no WARN line for ref %s:\n%s", ref, e.logs)
 		}
 

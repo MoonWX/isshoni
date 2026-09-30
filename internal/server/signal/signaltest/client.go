@@ -45,7 +45,7 @@ func (e *RefusedError) Unwrap() error { return e.Err }
 type Client struct {
 	WS *websocket.Conn
 
-	msgs     chan protocol.Envelope
+	msgs     chan Frame
 	done     chan struct{}
 	err      error         // the reader's final error; read it after done is closed
 	quit     chan struct{} // closed by Close: the reader stops waiting
@@ -76,7 +76,7 @@ func Dial(ctx context.Context, hc *http.Client, url string, o DialOptions) (*Cli
 		return nil, fmt.Errorf("signaltest: dial: %w", err)
 	}
 	ws.SetReadLimit(clientReadLimit)
-	c := &Client{WS: ws, msgs: make(chan protocol.Envelope, clientQueue), done: make(chan struct{}),
+	c := &Client{WS: ws, msgs: make(chan Frame, clientQueue), done: make(chan struct{}),
 		quit: make(chan struct{})}
 	if o.Paused {
 		c.Pause()
@@ -114,7 +114,7 @@ func (c *Client) read(ctx context.Context) {
 			return
 		}
 		select {
-		case c.msgs <- env:
+		case c.msgs <- Frame{Envelope: env, Raw: b}:
 		case <-c.quit:
 			c.err = errClientClosed
 			return
@@ -169,26 +169,38 @@ func (c *Client) SendBinary(b []byte) error {
 	return nil
 }
 
+// Frame is one message the client received: the parsed envelope and the frame's bytes.
+type Frame struct {
+	Envelope protocol.Envelope
+	Raw      []byte
+}
+
 // Recv returns the next message. After the socket has closed and every queued message has been read, it returns the
 // reader's error: for a close frame, a websocket.CloseError (see websocket.CloseStatus).
 func (c *Client) Recv(ctx context.Context) (protocol.Envelope, error) {
+	f, err := c.RecvFrame(ctx)
+	return f.Envelope, err
+}
+
+// RecvFrame is Recv with the frame's bytes, for tests that compare what several clients received.
+func (c *Client) RecvFrame(ctx context.Context) (Frame, error) {
 	select {
-	case env := <-c.msgs:
-		return env, nil
+	case f := <-c.msgs:
+		return f, nil
 	default:
 	}
 	select {
-	case env := <-c.msgs:
-		return env, nil
+	case f := <-c.msgs:
+		return f, nil
 	case <-c.done:
 		select {
-		case env := <-c.msgs:
-			return env, nil
+		case f := <-c.msgs:
+			return f, nil
 		default:
-			return protocol.Envelope{}, c.err
+			return Frame{}, c.err
 		}
 	case <-ctx.Done():
-		return protocol.Envelope{}, fmt.Errorf("signaltest: recv: %w", ctx.Err())
+		return Frame{}, fmt.Errorf("signaltest: recv: %w", ctx.Err())
 	}
 }
 
