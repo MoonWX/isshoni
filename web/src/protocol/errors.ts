@@ -147,8 +147,8 @@ export class ProtocolError extends Error {
   /**
    * The error a close code stands for when the server closed without a preceding error (01 §12.2, the column "Client
    * without a preceding error"), or undefined when the client just backs off (1000, 1001, 1006, 1009, 1011, 1012,
-   * 4408, 4503 and every code this build doesn't know). The code is chosen so that 05's handling by code gives the
-   * table's client action:
+   * 4408, 4503 and every code this build doesn't know; SignalClient also logs a 1009). The code is chosen so that
+   * 05's handling by code gives the table's client action:
    * - 4401 → unauthenticated (scope session): the login page;
    * - 4409 → replaced: stop silently;
    * - 4426 → protocol_unsupported: the update screen (params are empty: the server's versions are unknown);

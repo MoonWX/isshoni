@@ -20,6 +20,7 @@ import type {
   ServerMessages,
 } from './registry.gen';
 import {
+  CloseCodeMessageTooBig,
   CloseCodeNormal,
   ErrorCodeRateLimited,
   ErrorScopeConnection,
@@ -216,7 +217,8 @@ interface EndCause {
 
 /**
  * The signaling client of 01 §16. One instance per tab (05 §7). Every public method is safe in every state and from
- * inside a listener; state changes are reported through onState, server messages through on.
+ * inside a listener; state changes are reported through onState, in order (a change made from a state listener is
+ * reported once the current state has reached every listener), server messages through on.
  */
 export class SignalClient {
   readonly #opts: SignalClientOptions;
@@ -232,6 +234,10 @@ export class SignalClient {
   readonly #pending = new Map<string, PendingRequest>();
   readonly #listeners = new Map<string, Set<Listener>>();
   readonly #stateListeners = new Set<StateListener>();
+  /** The states not yet reported to every state listener (see #emit). */
+  readonly #emitQueue: [SignalState, SignalStateInfo][] = [];
+  /** #emit is delivering: a state change from a listener only queues. */
+  #emitting = false;
   /** The last server.shutdown, from its arrival until ready. */
   #shutdown: ServerShutdown | undefined;
   /** The next backoff waits exactly #shutdown.reconnectInMs. */
@@ -366,7 +372,11 @@ export class SignalClient {
     };
   }
 
-  /** Listens to state changes (see SignalStateInfo). Returns the unsubscribe function. */
+  /**
+   * Listens to state changes (see SignalStateInfo). Every listener gets every state in order, also when a listener
+   * changes the state: that change is reported after the current one, so the state property may already be ahead of
+   * the state a listener is given. Returns the unsubscribe function.
+   */
   onState(fn: StateListener): () => void {
     this.#stateListeners.add(fn);
     return () => {
@@ -555,6 +565,10 @@ export class SignalClient {
    * §12.2), drop the socket and fail the pending requests.
    */
   #end(cause: EndCause): void {
+    if (cause.error === undefined && cause.closeCode === CloseCodeMessageTooBig) {
+      // 01 §12.2: backoff, log. This client sent a message over the server's read limit: a bug worth seeing.
+      report('SignalClient: the server closed with 1009 (a message over its read limit)', undefined);
+    }
     let error = cause.error;
     if (error === undefined && cause.closeCode !== undefined) {
       error = ProtocolError.fromCloseCode(cause.closeCode);
@@ -806,13 +820,30 @@ export class SignalClient {
     return this.#shutdown !== undefined ? { shutdown: this.#shutdown } : {};
   }
 
+  /**
+   * Reports a state to every state listener. A listener that changes the state (stop(), start(), retryNow(), …) gets
+   * the new state queued: it reaches the listeners after the current one has reached all of them, so every listener
+   * sees every state in order and ends on the client's state.
+   */
   #emit(state: SignalState, info: SignalStateInfo): void {
-    for (const fn of [...this.#stateListeners]) {
-      try {
-        fn(state, info);
-      } catch (err) {
-        report('SignalClient: a state listener failed', err);
+    this.#emitQueue.push([state, info]);
+    if (this.#emitting) {
+      return;
+    }
+    this.#emitting = true;
+    try {
+      for (let e = this.#emitQueue.shift(); e !== undefined; e = this.#emitQueue.shift()) {
+        const [s, i] = e;
+        for (const fn of [...this.#stateListeners]) {
+          try {
+            fn(s, i);
+          } catch (err) {
+            report('SignalClient: a state listener failed', err);
+          }
+        }
       }
+    } finally {
+      this.#emitting = false;
     }
   }
 }

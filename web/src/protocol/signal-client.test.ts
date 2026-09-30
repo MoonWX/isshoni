@@ -1,6 +1,7 @@
 // SignalClient and ProtocolError (01 §10.1–§10.3, §12, §16; the TypeScript cases of §19) against the fake server
 // of ./testing, with Vitest's fake timers: handshake, backoff and its reset rule, skip-wait, ping and probe, resume,
-// requests, the close-code and error → state mapping, unknown codes, stale builds, server.shutdown and page events.
+// requests, the close-code and error → state mapping, unknown codes, stale builds, server.shutdown, the order of
+// state events when a listener changes the state, and page events.
 import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
 
 import type * as api from './api.gen';
@@ -712,6 +713,7 @@ describe('close codes and errors → state (01 §12.2)', () => {
     [4409, 'stopped', 'replaced'],
     [4426, 'stopped', 'protocol_unsupported'],
   ] as const)('close %i without an error → %s (%s)', async (code, state, errorCode) => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const c = await readyClient();
     server.close(code);
     expect(c.state).toBe(state);
@@ -719,6 +721,20 @@ describe('close codes and errors → state (01 §12.2)', () => {
     if (errorCode !== undefined) {
       expect(lastInfo().error).toMatchObject({ closeCode: code, local: false });
     }
+    expect(error).toHaveBeenCalledTimes(code === 1009 ? 1 : 0); // "backoff, log" for 1009 only
+  });
+
+  it('logs a close 1009 without an error once, and backs off', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const c = await readyClient();
+    server.close(1009);
+    expect(c.state).toBe('backoff');
+    expect(lastInfo().error).toBeUndefined();
+    expect(error).toHaveBeenCalledTimes(1);
+    expect(error).toHaveBeenCalledWith(expect.stringContaining('1009'), undefined);
+    await tick(BackoffMaxMs);
+    expect(c.state).toBe('ready');
+    expect(error).toHaveBeenCalledTimes(1);
   });
 
   it.each([
@@ -941,6 +957,81 @@ describe('server.shutdown', () => {
     server.shutdown(3000);
     window.dispatchEvent(new Event('online'));
     expect(c.state).toBe('connecting');
+  });
+});
+
+describe('state listeners', () => {
+  /** A client without the log listener of makeClient, so a test can put its own listeners first. */
+  function bareClient(): SignalClient {
+    const c = new SignalClient({ url, client: clientInfo, role: 'full', caps: () => ({ decode: [] }) });
+    client = c;
+    return c;
+  }
+
+  it('reports a stop() made by a ready listener after ready, to every listener', async () => {
+    const c = bareClient();
+    const first: SignalState[] = [];
+    const second: SignalState[] = [];
+    c.onState((s) => {
+      first.push(s);
+      if (s === 'ready') {
+        c.stop();
+      }
+    });
+    c.onState((s) => {
+      second.push(s);
+    });
+    c.start();
+    await tick();
+    expect(c.state).toBe('stopped');
+    expect(first).toEqual(['connecting', 'handshaking', 'ready', 'stopped']);
+    expect(second).toEqual(['connecting', 'handshaking', 'ready', 'stopped']);
+  });
+
+  it('reports a retryNow() made by a backoff listener after backoff, to every listener', async () => {
+    const c = bareClient();
+    let retried = false;
+    c.onState((s) => {
+      if (s === 'backoff' && !retried) {
+        retried = true;
+        c.retryNow();
+      }
+    });
+    const second: { state: SignalState; info: SignalStateInfo }[] = [];
+    c.onState((state, info) => {
+      second.push({ state, info });
+    });
+    c.start();
+    await tick();
+    server.autoOpen = false;
+    server.drop();
+    expect(c.state).toBe('connecting');
+    expect(second.map((e) => e.state)).toEqual(['connecting', 'handshaking', 'ready', 'backoff', 'connecting']);
+    expect(second.at(-2)?.info).toMatchObject({ delayMs: expect.any(Number) as number, rateLimited: false });
+    expect(server.sockets).toHaveLength(2);
+  });
+
+  it('reports a start() made by a stopped listener after stopped, to every listener', async () => {
+    const c = bareClient();
+    let restarted = false;
+    c.onState((s) => {
+      if (s === 'stopped' && !restarted) {
+        restarted = true;
+        c.start();
+      }
+    });
+    const second: SignalState[] = [];
+    c.onState((s) => {
+      second.push(s);
+    });
+    c.start();
+    await tick();
+    server.error(makeError('session_revoked', 'session'));
+    expect(c.state).toBe('connecting');
+    expect(second).toEqual(['connecting', 'handshaking', 'ready', 'stopped', 'connecting']);
+    await tick();
+    expect(c.state).toBe('ready');
+    expect(second.at(-1)).toBe('ready');
   });
 });
 
