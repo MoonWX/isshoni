@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -33,7 +34,10 @@ func TestScripts(t *testing.T) {
 		Setup: func(env *testscript.Env) error {
 			// Under -race a process that exits 0 first sleeps atexit_sleep_ms (1 s by default) to flush reports.
 			env.Setenv("GORACE", strings.TrimSpace(os.Getenv("GORACE")+" atexit_sleep_ms=0"))
-			return nil
+			// Never read the machine's /etc/isshoni/isshoni.toml: an empty config file unless a script sets another.
+			empty := filepath.Join(env.WorkDir, ".empty.toml")
+			env.Setenv("ISSHONI_CONFIG", empty)
+			return os.WriteFile(empty, nil, 0o600)
 		},
 	})
 }
@@ -61,11 +65,22 @@ func cmdExitCode(ts *testscript.TestScript, neg bool, args []string) {
 	}
 }
 
-// runCLI runs the CLI in-process.
+// runCLI runs the CLI in-process with an empty config file (never the machine's /etc/isshoni/isshoni.toml).
 func runCLI(t *testing.T, args ...string) (code int, stdout, stderr string) {
 	t.Helper()
+	return runCLIEnv(t, nil, args...)
+}
+
+// runCLIEnv is runCLI with extra environment variables (os.Environ form); ISSHONI_CONFIG defaults to an empty file.
+func runCLIEnv(t *testing.T, environ []string, args ...string) (code int, stdout, stderr string) {
+	t.Helper()
+	empty := filepath.Join(t.TempDir(), "empty.toml")
+	if err := os.WriteFile(empty, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	var out, errOut bytes.Buffer
-	code = run(t.Context(), &invocation{stdout: &out, stderr: &errOut}, args)
+	inv := &invocation{stdout: &out, stderr: &errOut, environ: append([]string{"ISSHONI_CONFIG=" + empty}, environ...)}
+	code = run(t.Context(), inv, args)
 	return code, out.String(), errOut.String()
 }
 
@@ -147,14 +162,18 @@ var validArgs = map[string][]string{
 	"admin users disable":        {"alice"},
 	"admin users enable":         {"alice"},
 	"admin log-level":            {"debug"},
-	"config init":                {"--path", "isshoni.toml"},
+}
+
+// implemented are the leaves that work in this build.
+var implemented = map[string]bool{
+	"version": true, "help": true, "config check": true, "config print": true, "config example": true, "config init": true,
 }
 
 // Each leaf a later slice fills in says so and exits 1.
 func TestNotImplemented(t *testing.T) {
 	for _, p := range leaves(root(), nil) {
 		name := strings.Join(p, " ")
-		if name == "version" || name == "help" {
+		if implemented[name] {
 			continue
 		}
 		code, stdout, stderr := runCLI(t, append(p, validArgs[name]...)...)
@@ -217,7 +236,12 @@ func TestUsageErrors(t *testing.T) {
 		{[]string{"version", "--short", "--json"}, exitUsage, "isshoni version: --short and --json can't be combined"},
 		{[]string{"version", "extra"}, exitUsage, `isshoni version: unexpected argument "extra"`},
 		{[]string{"version", "--short=maybe"}, exitUsage, `isshoni version: invalid boolean value "maybe" for --short: parse error`},
-		{[]string{"serve", "--tls.mode"}, exitUsage, "isshoni serve: unknown flag --tls.mode"},
+		{[]string{"serve", "--tls.mod", "ip"}, exitUsage, "isshoni serve: unknown flag --tls.mod"},
+		{[]string{"serve", "--tls.mode"}, exitUsage, "isshoni serve: flag needs an argument: --tls.mode"},
+		{[]string{"serve", "extra"}, exitUsage, `isshoni serve: unexpected argument "extra"`},
+		{[]string{"config", "example", "--config", "x.toml"}, exitUsage, "isshoni config example: unknown flag --config"},
+		{[]string{"config", "init", "--path", "x.toml", "--config", "y.toml"}, exitUsage, "isshoni config init: unknown flag --config"},
+		{[]string{"config", "check", "--json"}, exitUsage, "isshoni config check: unknown flag --json"},
 		{[]string{"admin"}, exitUsage, "isshoni admin: missing command"},
 		{[]string{"admin", "--json"}, exitUsage, "isshoni admin: unknown flag --json"},
 		{[]string{"admin", "users", "lst"}, exitUsage, `isshoni admin users: unknown command "lst" (did you mean "list"?)`},

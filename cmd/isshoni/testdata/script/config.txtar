@@ -1,0 +1,67 @@
+# config init writes the commented file, with the values of its flags only (the environment is ignored).
+env ISSHONI_DOMAIN=from-env.example.com
+exec isshoni config init --path isshoni.toml --tls.mode ip --public-ip 8.8.8.8
+! stdout .
+stderr '^Wrote isshoni.toml$'
+grep '^public_ip = "8\.8\.8\.8"$' isshoni.toml
+grep '^mode = "ip"$' isshoni.toml
+grep '^# domain = "watch\.example\.com"$' isshoni.toml
+! grep 'from-env' isshoni.toml
+env ISSHONI_DOMAIN=
+
+# It refuses to overwrite an existing file (exit 7) and leaves it alone.
+cp isshoni.toml before.toml
+exitcode 7 isshoni config init --path isshoni.toml --domain watch.example.com
+! stdout .
+stderr '^isshoni config init: isshoni\.toml already exists, and config init never overwrites a file: edit it, or move it away first$'
+cmp isshoni.toml before.toml
+
+# Invalid values exit 78, print every problem with its fix, and write nothing.
+exitcode 78 isshoni config init --path other.toml --tls.mode auto
+! stdout .
+stderr '^config error: tls\.mode = "auto" \(flag --tls\.mode\) needs a domain\.$'
+stderr '^  fix: set domain to a DNS name'
+! exists other.toml
+
+# config example round-trips: the file it prints is what config check and config print read back.
+exec isshoni config example --domain watch.example.com --log.level debug --network.stun-servers a.example:3478,b.example:3478
+! stderr .
+cp stdout example.toml
+exec isshoni config check --config example.toml
+stdout '^config ok \(file example\.toml\)$'
+! stderr .
+exec isshoni config print --config example.toml
+stdout '^domain = "watch\.example\.com" +# file example\.toml:\d+$'
+stdout '^network\.stun_servers = \["a\.example:3478", "b\.example:3478"\] +# file example\.toml:\d+$'
+stdout '^# effective tls\.mode: auto$'
+stdout '^# registration\.mode: not set \(admin UI value applies; default "invite"\)$'
+
+# Errors show file:line and a fix; config check and serve exit 78.
+exitcode 78 isshoni config check --config bad.toml
+! stdout .
+cmp stderr bad-problems.txt
+exitcode 78 isshoni serve --config bad.toml
+cmp stderr bad-problems.txt
+
+# Empty env values count as unset (compose's ${VAR:-}); ISSHONI_CONFIG points at an empty file here.
+env ISSHONI_PUBLIC_IP=
+exec isshoni config print --json
+stdout '"key":"public_ip","value":"auto","source":\{"kind":"default"\}'
+stdout '"tlsMode":"ip"'
+
+-- bad.toml --
+# A config with mistakes.
+domain = "203.0.113.7"
+
+[tls]
+mdoe = "auto"
+
+[listen]
+ice_udp = "7882"
+-- bad-problems.txt --
+config error: tls.mdoe (file bad.toml:5:1) is not a config key.
+  fix: did you mean tls.mode? (mode = … under [tls])
+config error: domain = "203.0.113.7" (file bad.toml:2) is an IP address, not a domain name.
+  fix: set public_ip = "203.0.113.7" instead and leave domain empty.
+config error: listen.ice_udp = "7882" (file bad.toml:8) is not a host:port address.
+  fix: use host:port, like ":443", "0.0.0.0:443" or "127.0.0.1:8080".

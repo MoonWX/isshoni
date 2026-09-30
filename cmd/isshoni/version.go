@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MoonWX/isshoni/internal/protocol"
+	"github.com/MoonWX/isshoni/internal/server/store"
 	"github.com/MoonWX/isshoni/internal/version"
 )
 
@@ -16,8 +18,8 @@ func versionCmd() *command {
 	return &command{
 		name:    "version",
 		summary: "Print build information",
-		help: "Prints the version, commit, commit date, Go version and platform (and the signaling protocol and " +
-			"database schema versions, once known). 'isshoni --version' prints the same line.",
+		help: "Prints the version, commit, commit date, Go version, platform, signaling protocol version and " +
+			"database schema version. 'isshoni --version' prints the same line.",
 		setup: func(fs *flag.FlagSet) runFunc {
 			short := fs.Bool("short", false, "print only the version, e.g. 0.3.0")
 			asJSON := fs.Bool("json", false, "print the build information as JSON")
@@ -32,12 +34,12 @@ func versionCmd() *command {
 }
 
 // buildInfo is version.Info plus the numbers only this command knows: Protocol from protocol.Version (01) and
-// Schema from store.LatestSchemaVersion() (03). Both stay zero, and out of the output, until those packages exist.
-// S03 and S07 add them in the same group as this slice (S05), so S15, the first later slice that touches
-// cmd/isshoni, sets bi.Protocol and bi.Schema here, tests that 'version --json' contains both, and drops "once
-// known" from the command's help.
+// Schema from store.LatestSchemaVersion() (03), the newest schema this binary migrates to.
 func buildInfo() version.BuildInfo {
-	return version.Info()
+	bi := version.Info()
+	bi.Protocol = protocol.Version
+	bi.Schema = store.LatestSchemaVersion()
+	return bi
 }
 
 func printVersion(w io.Writer, bi version.BuildInfo, short, asJSON bool) error {
