@@ -39,9 +39,10 @@ M3 (macOS app) and M4 (Linux agent) need no breaking change.
 ## 2. Scope
 
 **M1**: everything in this doc not marked later: the web client (`kind: web`, roles `full` and `viewer`), the in-process test
-client and the load test (`kind: tool`), cookie auth, the bearer field in `hello` (validated through 03's
-`AuthenticateBearer`), rooms, shares, subscriptions, negotiation, reconnect, errors, stats, notifications, and the
-same-user relay transport (`agent.send`/`agent.recv`, small and cuttable, see slice P12).
+client and the load test (`kind: tool`), cookie auth, the bearer field in `hello` (parsed and shape-checked; the M1
+wiring's `AuthenticateBearer` always returns `ErrInvalid`, so a bearer `hello` gets `unauthenticated`; 03's
+`AuthenticateBearerToken` backs it from M2), rooms, shares, subscriptions, negotiation, reconnect, errors, stats,
+notifications, and the same-user relay transport (`agent.send`/`agent.recv`, small and cuttable, see slice P12).
 
 **Later**: `publisher`/`agent` roles in use (M2, M4), `user.connections` (M2), share pause (M2), relay payload
 schemas (`share.request` etc., M2/M4), a middle layer (M5), admin kick with a rejoin block (the `kicked` codes are
@@ -58,16 +59,17 @@ setup wizard is **not** a signaling feature; it uses a REST endpoint owned by 04
 `GET /ws` with `Upgrade: websocket`, served by the main HTTPS handler (the TLS side of the 443 mux, or the plain
 listener in `tls.mode=off`). URL for the SPA: `new URL('/ws', location.href)` with `wss:` (or `ws:` in `task dev`).
 
-The upgrade handler (`signal.Hub.ServeHTTP`) runs these checks in order. The status codes are only visible to
-non-browser clients; browsers see a failed socket and fall back to backoff (§10.2).
+The upgrade handler (`signal.Hub.ServeHTTP`) runs these checks in order. HTTP status codes are only visible to
+non-browser clients; browsers see a failed socket and fall back to backoff (§10.2). That is why step 5 answers
+in-band.
 
 | Step | Check | On failure |
 |---|---|---|
 | 1 | Hub is not shutting down | `503`, `Retry-After: 2` |
 | 2 | `Origin` header absent (non-browser client), or exactly equal (scheme, host case-insensitive, port with defaults normalized) to `Config.PublicOrigin` (04's `Site.Origin`) or an entry of `Config.AllowedOrigins`. `AllowedOrigins` is empty in M1 and is not a config key; M2 adds the Wails asset origins in code, accepted only for bearer connections | `403` |
-| 3 | Session cookie present → `Authenticator.AuthenticateRequest(r)`. Valid → the connection is **cookie-authenticated**. Absent or invalid → **pre-auth** | (no failure here) |
-| 4 | Pre-auth only: ≤ 20 pre-auth upgrades per client IP per minute (plan guard; 04 key `limits.ws_handshakes_per_ip_per_minute`), ≤ 500 concurrent pre-auth sockets server-wide | `429` with `Retry-After`, or `503` |
-| 5 | Cookie-authenticated only: the user has < 16 open connections (constant). Bearer connections are checked at `hello` (`too_many_connections`) | `429` |
+| 3 | `Authenticator.AuthenticateRequest(r)` on every upgrade (the hub never parses cookie names; 03 owns them). Success → the connection is **cookie-authenticated**. `ErrNoCredentials` or `ErrInvalid` → **pre-auth** | any other error: `503`, `Retry-After: 2` |
+| 4 | Pre-auth only: ≤ 20 pre-auth upgrades per client IP (IPv4 address; IPv6 keyed by its /64, as in 03 §7.3) per minute (plan guard; 04 key `limits.ws_handshakes_per_ip_per_minute`), ≤ 500 concurrent pre-auth sockets server-wide | `429` with `Retry-After`, or `503` |
+| 5 | Cookie-authenticated only: the user has < 16 open connections (constant). Bearer connections are checked at `hello` (`too_many_connections`) | accept, send `error{too_many_connections, scope: connection}`, close `4429` (so browsers can show the notice) |
 | 6 | `websocket.Accept` with `CompressionMode: CompressionDisabled`, no subprotocols, and `InsecureSkipVerify: true`: step 2 already did the exact Origin check (coder/websocket's own check compares Origin with `r.Host`, which breaks behind proxies that rewrite `Host`) | — |
 
 The hub owns every upgrade-time check for `/ws` (Origin, pre-auth limits, per-user cap). 03's auth only validates
@@ -84,7 +86,7 @@ Client IP is `Deps.ClientIP(r)` from 04 (honors `X-Forwarded-For` only from trus
 |---|---|---|---|
 | Web SPA (browser, PWA) | HttpOnly session cookie (03) | Upgrade request | Origin must be allowlisted (step 2). CSRF protection for the socket is the Origin check plus `SameSite=Lax` |
 | Load test, Go tests (`kind: tool`) | Session cookie from `POST /api/v1/auth/login` (03), sent as a `Cookie` header | Upgrade request | No `Origin` header; not counted as pre-auth, so the load test isn't throttled |
-| Desktop app Go connection, desktop SPA in webview, Linux agent (M2+) | Bearer access token from the device flow (03) | `hello.auth` | Field and validation exist in v1. If the upgrade already carried a valid cookie, `hello.auth` must be absent (`bad_request`). Native clients never put the token in a header or a subprotocol: `hello.auth` is the only bearer path (03 follows this) |
+| Desktop app Go connection, desktop SPA in webview, Linux agent (M2+) | Bearer access token from the device flow (03) | `hello.auth` | The field and its shape check exist in v1. If the upgrade already carried a valid cookie, `hello.auth` must be absent (`bad_request`). Native clients never put the token in a header or a subprotocol: `hello.auth` is the only bearer path (03 follows this). M1: always `unauthenticated`. M2: the app refreshes its access token before every `hello`. On `unauthenticated` it refreshes once and retries, and relinks only if that also fails (there is no `invalid_token` on the WebSocket) |
 
 Rules:
 - The identity (`signal.Identity`: user, session or device) is fixed for the connection's lifetime.
@@ -93,10 +95,15 @@ Rules:
 - Revocation is pushed: 03's revocation paths (logout, password change or reset, account disabled or deleted, device
   revoked) call `Hub.CloseConnections(sel, code)` through the wiring adapter for 03's `auth.ConnCloser` (04 §6.6). The
   hub sends `error{session_revoked|account_disabled, scope: session}` and closes (`4401`/`4403`).
-- The hub re-validates every connection at connect and every **5 min** with `Authenticator.Revalidate`. The wiring
-  maps it to 03's `Touch`, which also refreshes the session's last-seen time, so a long session never idles out.
-- A resume token (§10.3) is never a credential. The connection must authenticate as the same user as the connection it
-  resumes.
+- The hub re-validates every connection at connect and every **5 min** with `Authenticator.Revalidate` (03 `Touch`,
+  which also refreshes last-seen, so a long session never idles out). Only `ErrInvalid` (session or device gone or
+  expired, or user not active) closes the connection, with `session_revoked`/4401. Any other error is transient: the
+  connection stays, the hub logs WARN and retries at the next tick. Session expiry is not pushed by 03; this check
+  finds it.
+  - A `Revalidate` result with a changed `Name` or `Admin` is applied like `UpdateUser` (identity and `room.state`
+    refreshed). This is how admin-CLI role changes reach open connections.
+- A resume token (§10.3) is never a credential. The connection must authenticate as the same user and the same
+  session or device as the connection it resumes (§10.3).
 
 ### 3.3 Frames and limits (M1)
 
@@ -113,15 +120,19 @@ Rules:
 
 ### 3.4 Heartbeat (M1)
 
-- Browsers can't send or observe WebSocket ping frames, so liveness is an application-level `ping`/`pong`.
+- Browsers can't send or observe WebSocket ping frames, so client-side liveness is an application-level
+  `ping`/`pong`. Browsers do answer the server's ping frames automatically, even in hidden tabs whose timers are
+  throttled (Chrome wakes chained timers once a minute after 5 min hidden).
 - The client sends `ping` every `limits.pingIntervalMs` (15 s). With no `pong` within 10 s, it closes the socket
   itself and reconnects (§10.2).
 - The client also sends an immediate `ping` (3 s timeout) when:
-  - any of its PCs becomes `disconnected`;
+  - any of its PCs becomes `disconnected` (the PC code calls `SignalClient.probe()`, §16);
   - the page becomes visible;
   - the browser fires `online`.
-- The server closes a socket that sent nothing (any message counts) for `limits.idleTimeoutMs` (45 s):
-  `error{idle_timeout}`, close `4408`. The connection then enters grace.
+- The hub sends a WebSocket ping frame every 15 s (`Conn.Ping` with a 10 s timeout) from a per-socket goroutine. A
+  missed pong does not close the socket by itself; the idle rule below does.
+- The server closes a socket from which no frame (any message, or a pong frame) arrived for `limits.idleTimeoutMs`
+  (45 s): `error{idle_timeout}`, close `4408`. The connection then enters grace.
 
 ## 4. Model
 
@@ -163,10 +174,13 @@ handshaking ────────► ready ◄──────────�
 
 - `detached`: the socket is gone, but PCs, shares and subscriptions stay. Media keeps flowing if the PCs are healthy
   (a WebSocket drop is not a media drop).
-- Close codes `1000` and `1001` **from the client** mean it left on purpose (logout, page unload). The hub skips grace
-  and closes immediately, so a reloaded sharer's frozen share disappears at once.
+- Close codes `1000` and `1001` **from the client** mean it left on purpose (logout, page unload); the web client
+  sends 1000, and 1001 comes from browsers' automatic close on unload and from Go clients. The hub skips grace and
+  closes immediately, so a reloaded sharer's frozen share disappears at once.
 - `closed`: subscriptions removed, own shares ended (`disconnected` or the specific reason), MediaPeer closed,
-  participant removed if it was the last connection (`room.event participant.left`).
+  participant removed if it was the last connection (`room.event participant.left`). A connection closed by 03
+  revocation (`CloseConnections`) skips grace and uses `EndReason left` for its shares and, if it was the last
+  connection, for `participant.left`.
 
 ### 4.3 Participant state (M1)
 
@@ -186,7 +200,8 @@ share.start ok                first video keyframe (SFU)
 
 - **Ownership**: the hub owns the share lifecycle and both 30 s timeouts. The SFU only reports media facts (first
   keyframe, pub PC not connected, tracks re-bound) through `MediaSink.ShareMedia`; it never ends a share on its own
-  (02 §5.3).
+  (02 §5.3). `stalled → live` happens on the first keyframe after the pub PC is connected again, with or without a
+  new offer (02 §5.3).
 - `starting` shares appear in `room.state`, so the owner's other devices know. Viewers render no tile for them and
   subscribe only once they are `live`.
 - `stalled` means the publisher's pub PC is not connected (disconnected, failed or being rebuilt). It is media-agnostic
@@ -249,9 +264,9 @@ After `welcome`:
   (plan) and stop. The server also rejects them: `client_outdated`, close `4426`. The floor is 03's setting
   `minClientVersion` (admin UI), which 04's config key `clients.min_version` can pin; the hub reads it through
   `Deps.Policy` at every `hello`.
-- **Web client**: if `welcome.serverVersion !== BUILD_VERSION`, the SPA is stale (a cached PWA shell). It asks the
-  service worker to update and reloads once, guarded by a `sessionStorage` flag to avoid loops. The server does not
-  reject a mismatched web build while its protocol is supported.
+- **Web client**: if `welcome.serverVersion !== BUILD_VERSION` and neither is a dev build (§16), the SPA is stale (a
+  cached PWA shell). It asks the service worker to update and reloads once, guarded by a `sessionStorage` flag to
+  avoid loops. The server does not reject a mismatched web build while its protocol is supported.
 
 ### 6.2 Features
 
@@ -552,7 +567,8 @@ type UserInfo struct {
 
 type Limits struct {
 	MaxMessageBytes     int   `json:"maxMessageBytes"`               // 65536
-	MaxSDPBytes         int   `json:"maxSdpBytes"`                   // 262144: max pc.offer/pc.answer message
+	// MaxSDPBytes: max pc.answer (sub) message; pub offers are limited to 65536 bytes and 8 m-lines by the SFU.
+	MaxSDPBytes         int   `json:"maxSdpBytes"`                   // 262144
 	MaxSharesPerUser    int   `json:"maxSharesPerUser"`              // 4
 	MaxRoomParticipants int   `json:"maxRoomParticipants,omitempty"` // admin soft limit (03 maxParticipantsPerRoom); 0 = none
 	MaxRoomShares       int   `json:"maxRoomShares,omitempty"`       // admin soft limit (03 maxSharesPerRoom); 0 = none
@@ -628,6 +644,10 @@ type RoomInfo struct {
 `room.join`:
 - Errors: `room_not_found`; `forbidden` (`RoomDirectory.CanJoin`, room locks later); `room_full` (admin soft limit,
   `params.limit`). *Later*: `kicked` (rejoin blocked after an admin kick, `retryAfterMs`).
+  - `room_not_found` also when the room was closed by `CloseRoom` after the join read it (checked under the hub
+    lock).
+  - A `roomId` that isn't ≤ 64 chars `[A-Za-z0-9_-]` gets `room_not_found` (not `bad_request`), matching 03's REST
+    404.
 - Effects:
   - joining the room the connection is already in replies `ok` and resends `room.state`;
   - otherwise the connection leaves its current room: its shares there end with `left`, and its MediaPeer closes;
@@ -713,7 +733,7 @@ type ShareInfo struct {
 	Preset       Preset       `json:"preset"`
 	Audio        bool         `json:"audio"`  // declared at start; after live: whether an audio track arrived
 	Status       ShareStatus  `json:"status"`
-	Layers       []VideoLayer `json:"layers"` // layers actually received, e.g. ["high","low"]; [] while starting
+	Layers       []VideoLayer `json:"layers"` // layers whose tracks arrived (paused layers included), e.g. ["high","low"]; [] while starting
 	Codec        CodecKey     `json:"codec,omitempty"` // H.264 profile currently published
 	StartedAt    time.Time    `json:"startedAt"`
 	Replaces     string       `json:"replaces,omitempty"` // re-publish after a restart/rebuild (§10.6)
@@ -796,7 +816,7 @@ type EndReason string
 
 const (
 	EndReasonStopped        EndReason = "stopped"         // share.stop, pc.close, or tracks removed by the owner
-	EndReasonLeft           EndReason = "left"            // room.leave / room.join elsewhere / deliberate close
+	EndReasonLeft           EndReason = "left"            // room.leave / room.join elsewhere / deliberate close / closed by revocation (03)
 	EndReasonDisconnected   EndReason = "disconnected"    // grace expired
 	EndReasonMediaTimeout   EndReason = "media_timeout"   // starting or stalled for 30 s
 	EndReasonKicked         EndReason = "kicked"          // reserved: admin kick is later
@@ -806,7 +826,9 @@ const (
 ```
 
 Events go to every connection in the room, including the actor's own connections; clients suppress toasts for their
-own user. On `share.started` the hub also calls `PushNotifier.ShareStarted` (04) unless `replaces` is set.
+own user. The owner's connections use `share.stopped.reason` to tell the sharer why the server ended its share
+(05 §13.1); no separate error is sent (the one exception is `codec_not_supported`, §9 rule 7). On `share.started`
+the hub also calls `PushNotifier.ShareStarted` (04) unless `replaces` is set.
 
 ### 8.7 `share.start`, `share.update`, `share.stop` (M1)
 
@@ -894,8 +916,12 @@ type ShareStop struct {
 - It is idempotent: an unknown or already ended share replies `ok`. Stopping another user's share is `forbidden`.
 - The share ends with `stopped`. The client then stops the share's transceivers and re-offers, or sends `pc.close`
   when no shares remain.
-- Server fallbacks: if a pub offer no longer maps any track to a live share, that share ends with `stopped`. `pc.close`
-  on a pub PC ends all its shares with `stopped`.
+- Server fallbacks:
+  - For every pub offer, of any `gen`, the hub ends with `stopped` each share of this connection that an earlier pub
+    offer bound and that the new `tracks` omit. It calls `EndShare` before the offer is applied
+    (`MediaPeer.HandleOffer`). A `starting` share that no pub offer has bound yet is left alone; its 30 s start
+    timeout still applies.
+  - `pc.close` on a pub PC ends all its shares with `stopped`.
 
 ### 8.8 `pc.offer`, `pc.answer`, `pc.ice`, `pc.restart`, `pc.close` (M1)
 
@@ -904,7 +930,7 @@ type ShareStop struct {
   "tracks": [{"mid": "0", "shareId": "s_q7m2x9c4v8b1n5k3", "kind": "video"},
              {"mid": "1", "shareId": "s_q7m2x9c4v8b1n5k3", "kind": "audio"}]}}
 {"type": "pc.answer", "data": {"pc": "pub", "gen": 1, "neg": 1, "sdp": "v=0\r\n…"}}
-{"type": "pc.offer", "data": {"pc": "sub", "gen": 2, "neg": 1, "sdp": "v=0\r\n…", "iceRestart": false,
+{"type": "pc.offer", "data": {"pc": "sub", "gen": 2, "neg": 1, "sdp": "v=0\r\n…",
   "tracks": [{"mid": "0", "shareId": "s_q7m2x9c4v8b1n5k3", "kind": "video"},
              {"mid": "1", "shareId": "s_q7m2x9c4v8b1n5k3", "kind": "audio"}]}}
 {"type": "pc.ice", "data": {"pc": "pub", "gen": 1, "candidate": {"candidate":
@@ -917,12 +943,11 @@ type ShareStop struct {
 
 ```go
 type PCOffer struct {
-	PC         PCKind     `json:"pc"`
-	Gen        uint32     `json:"gen"` // PC generation, starts at 1; the side that creates PCs increments it
-	Neg        uint32     `json:"neg"` // offer number within gen, starts at 1; the offerer increments it
-	SDP        SDP        `json:"sdp"`
-	Tracks     []TrackRef `json:"tracks"`               // every m-section currently carrying a share
-	ICERestart bool       `json:"iceRestart,omitempty"` // informational; the SDP has new ICE credentials
+	PC     PCKind     `json:"pc"`
+	Gen    uint32     `json:"gen"`    // PC generation, starts at 1; the side that creates PCs increments it
+	Neg    uint32     `json:"neg"`    // offer number within gen, starts at 1; the offerer increments it
+	SDP    SDP        `json:"sdp"`    // an ICE restart shows only here (new ICE credentials); there is no flag
+	Tracks []TrackRef `json:"tracks"` // every m-section currently carrying a share
 }
 
 type PCAnswer struct {
@@ -952,8 +977,8 @@ type ICECandidate struct {
 	UsernameFragment *string `json:"usernameFragment,omitempty"`
 }
 
-// PCRestart asks the offerer of a PC to restart ICE or rebuild the PC.
-// Client -> server: for sub (the server offers). Server -> client: for pub (the client offers).
+// PCRestart asks the offerer of a PC to restart ICE or rebuild the PC (§10.4).
+// Client -> server: sub only (mode ice or rebuild). Server -> client: pub only, mode rebuild (reason failed).
 type PCRestart struct {
 	PC     PCKind        `json:"pc"`
 	Gen    uint32        `json:"gen"` // generation the requester has now; stale requests are ignored
@@ -973,11 +998,11 @@ type RestartReason string
 const (
 	RestartReasonDisconnected RestartReason = "disconnected"
 	RestartReasonFailed       RestartReason = "failed"
-	RestartReasonResume       RestartReason = "resume"
 	// No "codec" reason: codec-blocked subscriptions are retried by the server (02 §8.5), never by the client.
 )
 
-// PCClose tells the server the client closed a PC on purpose (no shares left, or leaving).
+// PCClose tells the server the client closed its pub PC on purpose (no shares left, or leaving).
+// M1 clients send it only for pub; the server ignores pc: sub.
 type PCClose struct {
 	PC  PCKind `json:"pc"`
 	Gen uint32 `json:"gen"`
@@ -1040,12 +1065,13 @@ extra wire value is needed.
 
 - `subscribe.update` is **desired state per share**, merged into the connection's existing wants. Items for shares
   not in the room are ignored and listed in `ignored`, never an error: shares can end while the request is in flight.
+  An item that fails for another reason (for example too many subscriptions) fails the whole request with the mapped
+  error (§15.4); the items before it stay applied.
 - `video: off` with `audio: off` pauses a subscription but keeps its transceivers, so toggling a tile needs no
   renegotiation. A subscription is removed only when its share ends or the connection leaves the room.
-- **Audio-follows-focus** (05 policy, M1):
-  - the focused share is `{high, on}`, other visible tiles `{low, off}`, hidden tiles `{off, off}`;
-  - a newly live share is focused automatically;
-  - a tile's speaker button moves audio without changing focus.
+- **Audio-follows-focus** (M1): which layer and audio each share gets (auto/manual focus, speaker button, PiP, hidden
+  page) is 05's policy (05 §12.2–§12.4). Typical results: focused `{high, on}`, visible `{low, off}`, not visible
+  `{off, off}`.
 
   The client sends all changes of one user action in **one** `subscribe.update`, so the server applies them
   atomically: the old audio stops and the new one starts in the same step.
@@ -1056,9 +1082,10 @@ extra wire value is needed.
 ### 8.10 `quality.hint`, `caps.update` (M1)
 
 ```json
-{"type": "quality.hint", "data": {"shareId": "s_q7m2x9c4v8b1n5k3", "reason": "codec", "codec": "h264/42e0",
+{"type": "quality.hint", "data": {"shareId": "s_q7m2x9c4v8b1n5k3", "reason": "codec", "codec": "h264/42e0"}}
+{"type": "quality.hint", "data": {"shareId": "s_q7m2x9c4v8b1n5k3", "reason": "viewers",
   "encodings": [
-    {"rid": "f", "layer": "high", "active": true, "maxBitrate": 8000000, "maxFramerate": 60, "maxPixels": 2073600},
+    {"rid": "f", "layer": "high", "active": false, "maxBitrate": 8000000, "maxFramerate": 60, "maxPixels": 2073600},
     {"rid": "q", "layer": "low", "active": true, "maxBitrate": 300000, "maxFramerate": 15, "maxPixels": 230400}]}}
 {"type": "caps.update", "data": {"caps": {"decode": ["h264/42e0", "h264/4200", "opus"]}}}
 ```
@@ -1069,7 +1096,7 @@ type QualityHint struct {
 	ShareID    string     `json:"shareId"`
 	Reason     HintReason `json:"reason"`
 	Codec      CodecKey   `json:"codec,omitempty"`      // set: switch profile (the client re-offers the pub PC with it first)
-	Encodings  []Encoding `json:"encodings,omitempty"`  // set: apply with setParameters (active, maxBitrate, ...)
+	Encodings  []Encoding `json:"encodings,omitempty"`  // set: the complete list; apply every entry with setParameters (active, maxBitrate, ...)
 	MaxBitrate int64      `json:"maxBitrate,omitempty"` // native publishers (M2+): total cap, applied with hysteresis
 }
 
@@ -1093,7 +1120,10 @@ type CapsUpdate struct {
     `maxFramerate`, `scaleResolutionDownBy` from `maxPixels`);
   - `codec` set: call `setCodecPreferences` with that profile first and re-offer the pub PC (same `gen`, `neg + 1`).
     The server's answer puts that profile first, and Chrome switches encoders with a keyframe.
-- The server re-emits the current hint per share after a resume.
+  - A `codec` equal to the one the client last applied needs no re-offer, because hints are re-sent after every
+    resume.
+- After a resume (`Resync()`), the server re-sends per share the codec hint and the last encodings hint, if one was
+  sent.
 - `caps.update`: the client sends it when its capabilities change (web: poll the capabilities every 5 s while any
   subscription has `reason: codec`). The server updates the room's codec safe set (02) and retries codec-blocked
   subscriptions (§11.7). At most 12 per minute. It is the client's only part in codec recovery: all rebuild retries
@@ -1252,8 +1282,6 @@ The exact REST paths per topic are 03's; the SPA maps topics to its query keys (
 {"type": "error", "re": "5", "data": {"code": "share_limit", "retryable": false, "scope": "request",
   "params": {"limit": 4, "per": "user"}}}
 {"type": "error", "data": {"code": "sdp_invalid", "retryable": false, "scope": "pc", "pc": "sub", "gen": 2, "neg": 3}}
-{"type": "error", "data": {"code": "codec_not_supported", "retryable": true, "scope": "subscription",
-  "shareId": "s_q7m2x9c4v8b1n5k3"}}
 {"type": "error", "data": {"code": "session_revoked", "retryable": false, "scope": "session"}}
 ```
 
@@ -1274,8 +1302,8 @@ type Error struct {
 type ErrorScope string
 
 const (
-	ErrorScopeRequest      ErrorScope = "request"      // only the request `re` failed
-	ErrorScopeSubscription ErrorScope = "subscription" // a subscription can't deliver something; see subscribe.status
+	ErrorScopeRequest      ErrorScope = "request"      // only the request `re` failed (never used for notifications)
+	ErrorScopeSubscription ErrorScope = "subscription" // reserved: no M1 code uses it; subscribe.status reports subscriptions
 	ErrorScopeShare        ErrorScope = "share"        // one of the user's shares failed or can't be published
 	ErrorScopePC           ErrorScope = "pc"           // negotiation (pc, gen, neg) failed
 	ErrorScopeRoom         ErrorScope = "room"         // the connection is no longer in the room
@@ -1361,34 +1389,43 @@ These rules bind the web client (05), the Go test and load-test clients, the SFU
    - `gen` starts at 1 per PC kind per connection. The side that creates PCs increments it when it replaces a PC:
      the client for `pub`, the server for `sub`.
    - An offer with a higher `gen` replaces the receiver's PC: close the old one, create a new one.
-   - Messages with a lower `gen` are dropped. `pc.offer` for `pub` with an old `gen` gets `error{stale_negotiation}`.
+   - Messages with a lower `gen` are dropped. `pc.offer` for `pub` with an old `gen` gets
+     `error{stale_negotiation, scope: pc, pc, gen, neg}`.
    - After `welcome{resumed: false}` everything resets: all PCs are gone, and `gen` starts at 1 again.
+   - The server-side `gen`/`neg` bookkeeping is 02's (the SFU) for both PC kinds. The hub keeps no PC counters and
+     checks only role and ownership.
 3. **Negotiations.** Within a `gen`, the offerer numbers offers `neg = 1, 2, …` and has at most one outstanding.
    - Changes made while an offer is outstanding are folded into one follow-up offer (S4 `negotiateSub`). The server
      debounces sub offers by 50 ms.
    - The answer echoes `neg`. The offerer ignores answers whose `neg` isn't its outstanding one.
-   - The answerer handles a repeated `neg` by resending its stored last answer (safe replay after a resume), and
-     ignores a lower `neg`.
+   - The answerer handles a repeated `neg` by resending its stored last answer (safe replay after a resume). The
+     client ignores a sub offer with a lower `neg`. The server answers a pub offer with a lower `neg` with
+     `error{stale_negotiation, scope: pc, pc, gen, neg}`, which the client ignores.
 4. **Track mapping.**
    - Every offer lists `tracks` for all m-sections currently carrying a share. Both sides use `tracks`, not msid, to
      map m-sections to shares; the SFU still sets the msid stream id to the `shareId` for debugging.
-   - The pub offer's tracks must reference `starting`/`live`/`stalled` shares **published by this connection**
-     (`bad_request`, `params.field: "tracks"`). A share has exactly one video m-section, with 1–2 rids, and at most one
-     audio m-section.
+   - The pub offer's `tracks` name shares published by this connection. TrackRefs of a share that isn't a
+     `starting`/`live`/`stalled` share of this connection (for example one that ended in a race) are ignored: the
+     server still answers, and those m-sections carry no share. A malformed `tracks` array (duplicate mids, > 8
+     entries, bad `kind`) gets `error{bad_request, scope: pc, pc, gen, neg, params.field: "tracks"}`; `pc.offer` is a
+     notification, so its errors are never scope `request`.
+   - A share has exactly one video m-section with 0–2 rids from {`f`, `q`} (none = a single `f` layer), and at most
+     one audio m-section.
    - The sub offer's mapping can change between offers, because the SFU reuses inactive transceivers (02). The client
      re-maps on every offer.
 5. **Candidates.**
    - Clients trickle their candidates with `pc.ice`, and may send an end-of-candidates marker.
    - The server puts all of its candidates in its SDP: host candidates with the public address, UDP 7882, TCP 443
-     (ICE-TCP through the 443 mux, not in `tls.mode=off`) and TCP 7882. It waits for gathering to complete, which is
-     at most 1 s with muxes, and never trickles (02). `MediaSink.ICE` exists for later use only.
-   - Both sides buffer candidates that arrive before the remote description of the same `gen` (S4): at most 64 per
-     PC, the oldest dropped first.
+     (ICE-TCP through the 443 mux, not in `tls.mode=off`) and TCP 7882. It waits for gathering (instant with muxes,
+     capped at 2 s) and never trickles (02). `MediaSink.ICE` exists for later use only.
+   - Both sides buffer candidates that arrive before the remote description of the same `gen` (S4). The server keeps
+     at most 64 remote candidates per PC per `gen` in total, buffered or applied; later ones are dropped (the early
+     ones are the host candidates).
 6. **Web answers.** The web client adds `stereo=1;sprop-stereo=1` to the Opus `fmtp` of its sub answer (S4:
    receivers must ask for stereo themselves).
 7. **Publishing codec.** The client offers every H.264 profile it can encode (packetization-mode 1) plus RTX, with
    `ShareParams.codec` (or the latest `quality.hint.codec`) first. It offers no VP8/VP9/AV1 in v1. If the offer has no
-   usable H.264, the share ends and the client gets `error{codec_not_supported, scope: share}`.
+   usable H.264, the hub ends the share with `stopped` and sends `error{codec_not_supported, scope: share, shareId}`.
 8. **Failures while applying.**
    - An SDP that can't be applied gets `error{sdp_invalid, scope: pc, pc, gen, neg}`. The PC's owner rebuilds it once
      (`gen + 1`, or `pc.restart{rebuild}` for sub).
@@ -1396,7 +1433,9 @@ These rules bind the web client (05), the Go test and load-test clients, the SFU
      (client-side).
 9. **At most 2 PCs per connection** (plan guard), by construction: one per kind, replaced by `gen`.
 10. **Closing.**
-    - The client sends `pc.close` when it closes a PC on purpose (last share stopped, leaving the room).
+    - The client sends `pc.close` when it closes its pub PC on purpose (last share stopped, leaving the room).
+    - The sub PC closes server-side on `room.leave` or a `room.join` elsewhere; the client closes its local sub PC
+      without sending anything. The server ignores `pc.close{pc: sub}` (reserved).
     - The server never asks to rebuild a pub PC that carries no live share. `room.leave` closes both PCs server-side.
 
 ## 10. Reconnect and recovery (M1)
@@ -1418,7 +1457,7 @@ These rules bind the web client (05), the Go test and load-test clients, the SFU
 
 - `stopped` reasons and client actions:
   - `unauthenticated`, `session_revoked`: go to the login page;
-  - `account_disabled`: show the notice;
+  - `account_disabled`, `too_many_connections`: show the notice;
   - `protocol_unsupported`, `client_outdated`: show the update screen;
   - `replaced`: stop silently, this socket was superseded;
   - `bad_message`: show "Something went wrong" with Reload.
@@ -1430,7 +1469,10 @@ These rules bind the web client (05), the Go test and load-test clients, the SFU
 - Delay for attempt n (n = 0 for the first retry after a drop): `min(10 s, 0.5 s × 2ⁿ) × U(0.8, 1.2)`, clamped to
   **[0.5 s, 10 s]**. That gives about 0.5, 1, 2, 4, 8, 10, 10, … s.
 - `n` resets only after the connection has been `ready` for 10 s, so a crash-looping server keeps the backoff high.
-- These events skip the current wait once: `online`, page becomes visible, or the user taps Retry.
+- These events skip the current wait once: `online`, page becomes visible, or the user taps Retry (except a
+  rate-limit wait, below).
+- After `error{rate_limited, scope: connection}` (or close 4429 without a preceding error), the next delay is
+  `max(30 s, retryAfterMs)`. `online`, visibility and `retryNow()` don't shorten it.
 - After `server.shutdown`, the first delay is exactly `reconnectInMs`, then the normal sequence.
 - UI: "Reconnecting…" appears after 2 s in `backoff`, so short blips show nothing. After 30 s it reads "Can't reach
   the server, retrying".
@@ -1449,7 +1491,8 @@ These rules bind the web client (05), the Go test and load-test clients, the SFU
   - the HMAC is valid;
   - the connection exists in this process (ready or detached);
   - the token hash matches;
-  - the authenticated user equals the connection's user.
+  - the authenticated identity has the same user and the same session (cookie) or device (bearer) as the
+    connection.
 
   Otherwise `welcome.resumed = false`. That is not an error.
 - If the connection's old socket is still attached (half-open), the hub sends it `error{replaced}`, closes it with
@@ -1461,18 +1504,39 @@ These rules bind the web client (05), the Go test and load-test clients, the SFU
 
 ### 10.4 PeerConnection recovery
 
-| Condition (observed by either side) | Offerer of that PC does | The other side does |
-|---|---|---|
-| ICE `disconnected` for **3 s** (timer cancelled if it recovers) | ICE restart: new offer with fresh ICE credentials, same `gen` | Sends `pc.restart{mode: ice, reason: disconnected}` to the offerer |
-| ICE restart not `connected` within **15 s** | Rebuild: new PC, `gen + 1`, re-add everything | Sends `pc.restart{mode: rebuild}` |
-| PC `failed` | Rebuild at once | Sends `pc.restart{mode: rebuild, reason: failed}` |
-| After a resumed `welcome`, a PC that isn't `connected` | ICE restart | (server: `MediaPeer.Resync()` does the same for sub) |
+The client drives the recovery of both of its PCs, from the states it observes. Each 3 s timer is cancelled if the
+PC recovers first.
+
+**Pub** (the client offers):
+
+| Condition | Client does |
+|---|---|
+| ICE `disconnected` for **3 s** | ICE restart: new offer with fresh ICE credentials, same `gen`, `neg + 1` |
+| ICE restart not `connected` within **15 s**, PC `failed`, or `pc.restart{pc: pub, mode: rebuild}` received | Rebuild: new PC, `gen + 1`, re-add everything |
+| After a resumed `welcome`, the pub PC isn't `connected` | ICE restart |
+
+**Sub** (the server offers):
+
+| Condition | Client does |
+|---|---|
+| ICE `disconnected` for **3 s** | Sends `pc.restart{pc: sub, mode: ice, reason: disconnected}`; the server answers with an ICE-restart offer (same `gen`, `neg + 1`) |
+| ICE restart not `connected` within **15 s**, or PC `failed` | Sends `pc.restart{pc: sub, mode: rebuild, reason: failed}`; the server offers a new PC (`gen + 1`) |
+| After a resumed `welcome` | Nothing: the server's `Resync()` ICE-restarts a sub PC that isn't connected |
+
+**Server**: it starts exactly three actions on its own:
+1. `pc.restart{pc: pub, gen, mode: rebuild, reason: failed}` when the current pub PC reaches `failed`, or when a new
+   pub PC misses its 10 s handshake (02);
+2. inside `Resync()` (§10.5), an ICE-restart offer for a sub PC that isn't connected;
+3. SFU-internal sub rebuilds for codec recovery (§11.7, 02 §8.5).
+
+It never sends `pc.restart{mode: ice}` and never rebuilds a sub PC because of its own ICE state.
 
 Limits:
-- At most one ICE restart per PC per 5 s and one rebuild per PC per 10 s.
+- The client does at most one ICE restart per PC per 5 s and one rebuild per PC per 10 s. The spacing applies to the
+  client's own actions and to its `pc.restart` requests; it does not bind the server's three actions above.
 - A `pc.restart` whose `gen` is older than the offerer's current one is ignored.
-- While signaling isn't `ready`, PC state changes are only recorded. Acting needs the socket; the rule in the last row
-  runs on `ready`.
+- While signaling isn't `ready`, PC state changes are only recorded. Acting needs the socket; the resumed-`welcome`
+  rows run on `ready`.
 - Rebuilding `pub` keeps the same local `MediaStreamTrack`s and the same `shareId`s. Viewers see the share go
   `stalled`, then `live` again.
 - After 5 rebuilds of the same PC without reaching `connected` (about 1 min), the UI shows "Can't reach the server's
@@ -1485,17 +1549,20 @@ Limits:
 1. Server: `room.state` (if in a room), then `MediaPeer.Resync()`. That re-sends the pending sub offer (same `neg`),
    re-emits `subscribe.status` and `quality.hint`, and ICE-restarts non-connected sub PCs.
 2. Client:
+   - if `welcome.roomId` is absent or differs from the room it wants, sends `room.join` for that room;
    - re-sends its pending pub offer if it had one (same `neg`);
-   - applies the PC rule of §10.4;
+   - applies the resumed-`welcome` rows of §10.4 (ICE-restart a pub PC that isn't connected; nothing for sub);
    - sends one `subscribe.update` with its full desired set;
    - retries requests that failed with `connection_lost` (`share.start` with the same `ref`, `share.stop`);
    - reconciles its shares against `room.state`: a local live share whose `shareId` is missing on the server is
      re-published with `replaces` (§10.6); a server share with this `connectionId` that the client no longer has is
-     stopped with `share.stop`.
+     stopped with `share.stop`. This re-publish applies only here. A share that the server ends while the socket is
+     `ready` is not re-published; the client stops it (05 §13.1).
 
 **Not resumed** (`resumed: false`; server restarted, grace expired or token rotated):
 1. The client discards all PCs and resets `gen`.
-2. It sends `room.join` with the last room id: memory first, then `localStorage` `isshoni.lastRoomId`, else
+2. It sends `room.join` with the last room id: memory first (the room the app currently wants: 05's desired room,
+   also set by a join made before the first welcome), then `localStorage` `isshoni.lastRoomId`, else
    `defaultRoomId`.
 3. It re-publishes every local share whose capture is still alive: `share.start{replaces: oldShareId, ref: new}`, then
    a new pub PC `gen 1`.
@@ -1585,9 +1652,11 @@ S4 measured about 52 ms median and 106 ms max for a Chrome switch.
 ```
 Bea (focused s_a: high+on)            Hub / SFU
  Carl starts sharing → room.state (s_c live) + room.event share.started
- auto-focus newest:
+ auto-focus newest (focus mode auto, 05 §12.2):
  │ subscribe.update{[s_a low off, s_c high on]} ─► one atomic update: s_a audio DownTrack stops
- │                                               forwarding, s_c audio DownTrack starts; no overlap, no gap
+ │                                               forwarding, s_c audio DownTrack starts; no overlap. If s_c
+ │                                               had no subscription yet, its audio starts after the sub
+ │                                               renegotiation (50 ms debounce + one round trip)
  │══ s_c Opus only ══
  speaker button on s_a's tile (audio moves, focus stays):
  │ subscribe.update{[s_c high off, s_a low on]} ─►
@@ -1604,7 +1673,8 @@ is `off` costs no bandwidth because the server doesn't forward it.
 **A. WebSocket drops, media fine** (mobile carrier NAT timeout, proxy reset):
 
 ```
-t=0      socket closes (1006) or 3 pings go unanswered → client: backoff 0.5 s
+t=0      socket closes (1006), or a ping gets no pong within 10 s (3 s for an immediate ping, §3.4)
+         → client: backoff 0.5 s
          Hub: connection detached; room.state: Bea "reconnecting" (≤ 200 ms). Media keeps flowing.
 t≈0.5 s  → hello{resumeToken}   ← welcome{resumed: true, roomId}   ← room.state
          Hub: peer.Resync() → pending offers / statuses / hints re-sent
@@ -1625,7 +1695,10 @@ t≈5.5 s  connected → keyframe requests → s_a live; subscriptions resume on
 ```
 
 **C. Wi-Fi → LTE** (both break): A and B together. Socket and ICE fail, the client resumes the socket first (skip-wait
-on `online`), then the PC rule of §10.4 row 4 runs. When the new path isn't up within 15 s, the PC is rebuilt.
+on `online`), then the resumed-`welcome` rows of §10.4 run: the client ICE-restarts its pub PC, and the server's
+`Resync()` ICE-restarts the sub PC. When the new path isn't up within 15 s, the client rebuilds the pub PC and sends
+`pc.restart{sub, rebuild, failed}` for the sub PC. The server sends no `pc.restart{mode: ice}` and doesn't rebuild the
+sub PC on its own ICE state.
 
 ### 11.6 Server restart
 
@@ -1660,8 +1733,8 @@ Dan's fresh Firefox                     Hub                                    S
  │ subscribe.update{s_a high on} ─────────►│ peer.Subscribe ───────────────────────►│ viewer can't decode:
  │                                        │                                        │ adds audio only
  │◄ pc.offer{sub,1,1, tracks: 0→s_a audio}  (answer, ICE) → Dan hears s_a
- │◄ error{codec_not_supported, scope subscription, s_a, retryable}  (once, for logs and the toast)
- │◄ subscribe.status{s_a video off, requestedVideo high, reason codec}
+ │◄ subscribe.status{s_a video off, requestedVideo high, reason codec}  (the first one with reason codec
+ │    also shows the toast; there is no separate error)
  UI tile: "Your browser is still getting its video decoder, retrying…" (audio plays)
  client: every 5 s re-read capabilities (the only client-side retry)
  server (02 §8.5): if caps list H.264 but the answer still rejects video (Firefox lists H.264 before it can use it),
@@ -1693,7 +1766,7 @@ forever: a code is never renamed or reused with another meaning. 05 maps each to
 | `bad_message` | connection | no | frame isn't a JSON object, or the envelope is invalid | stop; "Something went wrong" + Reload | 4400 |
 | `hello_required` | connection | no | first message isn't `hello` | stop (bug) | 4400 |
 | `hello_timeout` | connection | yes | no `hello` within 10 s | backoff | 4408 |
-| `idle_timeout` | connection | yes | nothing received for 45 s | backoff | 4408 |
+| `idle_timeout` | connection | yes | no frame (message or pong) received for 45 s | backoff | 4408 |
 | `protocol_unsupported` | connection | no | no common protocol version; `params {serverMin, serverMax, serverVersion}` | update screen ("Ask your admin to update" if the server is older, else "Update the app") | 4426 |
 | `client_outdated` | connection | no | native client below `minClientVersion` | "Update the app" + "Open in browser" | 4426 |
 | `unauthenticated` | session | no | no valid cookie and no valid bearer | login page | 4401 |
@@ -1701,19 +1774,19 @@ forever: a code is never renamed or reused with another meaning. 05 maps each to
 | `account_disabled` | session | no | admin disabled the account | notice | 4403 |
 | `too_many_connections` | connection | no | more than 16 connections for this user | notice: "Close other isshoni tabs" | 4429 |
 | `rate_limited` | request | yes | per-type or global rate limit; `retryAfterMs` | retry after the delay | — |
-| `rate_limited` | pc | yes | PC creation limit (02: 10 per connection per minute), with `pc`, `gen`, `retryAfterMs` | retry the rebuild after the delay | — |
+| `rate_limited` | pc | yes | PC creation limit (02: 10 client-caused PC creations per PC kind per minute), with `pc`, `gen`, `retryAfterMs` | retry the rebuild after the delay | — |
 | `rate_limited` | connection | yes | global bucket empty for 10 s | backoff (at least 30 s) | 4429 |
 | `slow_connection` | connection | yes | send queue overflow | backoff | 4503 |
 | `replaced` | connection | no | the same connection resumed on another socket | stop silently | 4409 |
 | `server_shutdown` | connection | yes | the hub is stopping (after `server.shutdown`) | wait `reconnectInMs` | 1012 |
 | `internal` | request or connection | yes | unexpected server error; `params {ref}` is an 8-char id also written to the server log, so a user can report it | retry once / backoff | 1011 if connection |
-| `bad_request` | request (or connection for a second `hello`) | no | payload invalid; `params {field, reason}` with reason `required`, `invalid`, `too_long`, `too_many` or `duplicate` | generic error (a bug) | 4400 if connection |
+| `bad_request` | request; pc for `pc.*` notifications; connection for a second `hello` | no | payload invalid; `params {field, reason}` with reason `required`, `invalid`, `too_long`, `too_many` or `duplicate` | generic error (a bug) | 4400 if connection |
 | `unknown_type` | request | no | a request type the server doesn't know | generic error | — |
 | `message_too_large` | request | no | a non-SDP message over 64 KiB after `hello` | generic error | — |
 | `forbidden` | request | no | role, ownership or `CanJoin` check failed | generic "not allowed" | — |
 | `feature_disabled` | request | no | a message behind a feature that isn't active | hide the feature | — |
 | `not_in_room` | request | no | share or PC message without a room | rejoin, then retry | — |
-| `room_not_found` | request | no | unknown or deleted room | go to `defaultRoomId` | — |
+| `room_not_found` | request | no | unknown, deleted or malformed room id | go to `defaultRoomId` | — |
 | `room_full` | request | yes | admin soft limit; `params {limit}` | "Room is full" | — |
 | `kicked` | room | no | *later*: an admin removed the user from the room (reserved code) | leave the room UI; "You were removed from {room}" | — |
 | `kicked` | request | yes | *later*: `room.join` during the rejoin block; `retryAfterMs` (reserved code) | show the remaining time | — |
@@ -1721,17 +1794,24 @@ forever: a code is never renamed or reused with another meaning. 05 maps each to
 | `share_not_found` | request | no | `share.update` of an unknown share | refresh from `room.state` | — |
 | `share_limit` | request | no | `params {limit, per: "user"\|"room"}` (per user: the constant 4; per room: 03's `maxSharesPerRoom`) | "You're already sharing" / "Room has too many shares" | — |
 | `codec_not_supported` | share | no | publisher offered no usable H.264 | "This browser can't share in a format friends can watch; use Chrome/Edge or the desktop app" | — |
-| `codec_not_supported` | subscription | yes | a subscription's video became codec-blocked (§11.7) | wait + retry flow; UI from `subscribe.status` | — |
 | `sdp_invalid` | pc | no | SDP failed to apply (`pc`, `gen`, `neg`) | rebuild that PC once (§9 rule 8) | — |
-| `stale_negotiation` | pc | no | pub offer for an old `gen` | ignore (the client already moved on) | — |
+| `stale_negotiation` | pc | no | pub offer with an older `gen`, or an older `neg` in the current `gen` (`pc`, `gen`, `neg`) | ignore (the client already moved on) | — |
 | `agent_target_not_found` | request | no | no same-user connection matches | "Your helper isn't running" (M2/M4) | — |
+
+Scope `request` is used only for messages that have an `id`. An error caused by a `pc.*` notification always has
+scope `pc` with `pc`, `gen` and `neg`, whichever row its code comes from.
+
+Shared with 03's REST table (one `errors.<code>` namespace): `bad_request`, `unauthenticated`, `forbidden`,
+`rate_limited`, `internal`, `account_disabled`, `room_not_found`, `server_shutdown`. They must mean the same thing in
+both. A new code must not reuse a REST code with another meaning (test in `internal/protocol/api`). Payloads differ:
+`retryAfterMs` here vs REST `retryAfter` (s); `params.ref` here vs REST `requestId`.
 
 ### 12.2 WebSocket close codes
 
 | Code | Meaning | Client without a preceding `error` |
 |---|---|---|
-| 1000 | Normal closure (client logout) | — |
-| 1001 | Going away (client page unload; server stop) | backoff |
+| 1000 | Normal closure (client logout or page unload; the server skips grace) | — |
+| 1001 | Going away (the browser's own close on unload, Go clients, server stop) | backoff |
 | 1003 | Binary frame | stop (bug) |
 | 1006 | Abnormal (no close frame: network) | backoff |
 | 1009 | Message too big (coder/websocket) | backoff, log |
@@ -1767,9 +1847,9 @@ made while `stopped`).
 |---|---|---|
 | Hello timeout | 10 s | server |
 | Request timeout (client side) | 10 s | clients |
-| Ping interval / pong timeout / server idle timeout | 15 s / 10 s / 45 s | §3.4 |
+| Client ping interval / pong timeout; server ping frame interval; server idle timeout | 15 s / 10 s; 15 s; 45 s (any frame, incl. pongs) | §3.4 |
 | Grace | 30 s | §10.3 |
-| ICE disconnected → restart; restart → rebuild; min spacing | 3 s; 15 s; 5 s (restart), 10 s (rebuild) | §10.4 |
+| ICE disconnected → restart; restart → rebuild; min spacing (client) | 3 s; 15 s; 5 s (restart), 10 s (rebuild) | §10.4 |
 | Share `starting` / `stalled` timeout | 30 s / 30 s | §4.4 |
 | `stalled` threshold (pub PC not connected) | 2 s | §4.4 |
 | `room.state` coalescing | ≤ 1 per 200 ms per room | §8.5 |
@@ -1781,13 +1861,13 @@ made while `stopped`).
 | Web sharer keeps capture without a server | 60 s | §10.6 |
 | Read limit | 64 KiB before `welcome`; 256 KiB after, for `pc.offer`/`pc.answer` only | §3.3 |
 | Send queue | 512 messages or 8 MiB | §3.3 |
-| Pre-auth upgrades | 20 per IP per minute; 500 concurrent server-wide | §3.1 |
+| Pre-auth upgrades | 20 per IP per minute (IPv6 per /64); 500 concurrent server-wide | §3.1 |
 | Connections per user | 16 | §3.1 |
 | Shares per user (all rooms) | 4 (a constant in `signal.DefaultConfig`, not a config key). An abuse guard: GeForce allows 8 NVENC sessions, about 4 two-layer shares (plan) | §8.7 |
 | Room soft limits | participants, shares: 0 = none (03 settings `maxParticipantsPerRoom`, `maxSharesPerRoom`, read through `Deps.Policy`) | §8.7 |
 | Global message rate | 20/s refill, burst 100; 512 KiB/s refill, burst 1 MiB | server |
 | Per type | `room.join` 10/min · `share.start` 10/min · `pc.restart` 12/min per PC · pub offers with a new `gen` 6/min · `caps.update` 12/min · `stats` 1 per 5 s (excess dropped silently) · `agent.send` 10/s | server |
-| Field sizes | `id`/`ref` ≤ 32; `label` ≤ 40 code points; room/user ids ≤ 64; `subs` ≤ 64; `tracks` ≤ 16 (pub offers); candidate ≤ 512 B; buffered candidates ≤ 64 per PC; `agent.send.payload` ≤ 16 KiB; `stats` ≤ 16 KiB; `features`, `caps.decode` ≤ 32 entries | `protocol` validation |
+| Field sizes | `id`/`ref` ≤ 32; `label` ≤ 40 code points; room/user ids ≤ 64; `subs` ≤ 64; `tracks` ≤ 8 (pub offers); pub offer SDP ≤ 64 KiB and ≤ 8 m-lines (02 §12); sub answer ≤ 256 KiB; candidate ≤ 512 B; buffered candidates ≤ 64 per PC per gen (later ones dropped); `agent.send.payload` ≤ 16 KiB; `stats` ≤ 16 KiB; `features`, `caps.decode` ≤ 32 entries | `protocol` validation |
 
 Why 256 KiB for SDP: a Chrome sub answer is about 2.7 KB per video m-section when the offer lists 5 H.264 profiles
 plus RTX, and about 0.6 KB per audio m-section. That is about 3.3 KB per watched share, so 64 KiB would stop a viewer at
@@ -1833,14 +1913,20 @@ Forbidden:
   share.start.json  ok.share.start.json  share.update.json  share.stop.json
   pc.offer.pub.json  pc.answer.pub.json  pc.offer.sub.json  pc.answer.sub.json  pc.ice.json  pc.ice.end.json
   pc.restart.json  pc.close.json  subscribe.update.json  ok.subscribe.update.json  subscribe.status.json
-  quality.hint.json  caps.update.json  stats.client.json  stats.watch.json  stats.server.json
-  invalidate.json  server.shutdown.json  error.request.json  error.pc.json  error.subscription.codec.json
+  quality.hint.codec.json  quality.hint.viewers.json  caps.update.json  stats.client.json  stats.watch.json
+  stats.server.json  invalidate.json  server.shutdown.json  error.request.json  error.pc.json  error.share.codec.json
   error.session.json  agent.send.json  ok.agent.send.json  agent.recv.json
   ```
-- **Compat snapshots**: at each release tag, the release job (06) copies `testdata/v1` to
-  `testdata/compat/<version>/` and keeps the last two releases. Tests decode every compat fixture with the current
-  code. They assert that decoding succeeds, and that re-encoding keeps every key present in the fixture with an equal
-  value. That enforces "additive only" mechanically.
+- **Compat snapshots** are taken before tagging, in the release-prep PR. The release job cannot commit them: `main`
+  requires a PR and `ci-ok`, and Actions may not open PRs (06 §8.6).
+  - `task release:compat VERSION=<version>` (06 §7.2; `<version>` is the tag without its `v`, e.g. `0.2.0`) copies
+    `testdata/v1` to `testdata/compat/<version>/` and deletes all but the two newest final-release snapshots.
+    Prereleases (`-rc.N`) get no snapshot. The PR is merged before the tag is pushed (06 §9.1 "Before tagging").
+  - For a non-prerelease tag, release.yml's `build` job first checks that `testdata/compat/<version>/` exists and is
+    identical to `testdata/v1`, and fails before goreleaser runs if not (06 §9.3).
+  - Tests decode every compat fixture with the current code. They assert that decoding succeeds, and that
+    re-encoding keeps every key present in the fixture with an equal value. That enforces "additive only"
+    mechanically.
 
 ### 14.4 TypeScript generation and drift check
 
@@ -2013,7 +2099,7 @@ type Config struct {
 	Grace             time.Duration       // 30s
 	HelloTimeout      time.Duration       // 10s
 	IdleTimeout       time.Duration       // 45s
-	PingInterval      time.Duration       // 15s (advertised)
+	PingInterval      time.Duration       // 15s (advertised; also the hub's WebSocket ping-frame interval, §3.4)
 	StateCoalesce     time.Duration       // 200ms
 	ShareStartTimeout time.Duration       // 30s
 	StalledTimeout    time.Duration       // 30s
@@ -2075,11 +2161,14 @@ func (h *Hub) Notify(t Target, topics ...protocol.Topic)
 // The wiring implements 03's auth.ConnCloser with it (reason → code table in §15.4).
 func (h *Hub) CloseConnections(sel ConnSelector, code protocol.ErrorCode) int
 func (h *Hub) UpdateUser(userID, name string, admin bool) // rename or role change: refresh room.state names, Identity
-func (h *Hub) CloseRoom(roomID string)                    // → room_closed (scope room); clients rejoin defaultRoomId
+// CloseRoom → room_closed (scope room); clients rejoin defaultRoomId. It also records roomID as closed for the
+// process lifetime; a room.join that passed GetRoom before the delete gets room_not_found.
+func (h *Hub) CloseRoom(roomID string)
 func (h *Hub) Snapshot() LiveSnapshot                     // presence counts (03), admin dashboard (04)
 // later: func (h *Hub) Kick(roomID, userID string) error  // → kicked (scope room) + rejoin block
 
 // ConnSelector selects connections by user, session or device (same fields as 03's auth.ConnSelector).
+// UserID is required: an empty UserID matches nothing (ERROR log, returns 0). The other fields narrow within that user.
 type ConnSelector struct {
 	UserID          string
 	SessionID       string // "" = any
@@ -2104,15 +2193,19 @@ type Identity struct {
 }
 
 // Authenticator is implemented by a wiring adapter over 03's auth.Service (04 §6.6):
-// AuthenticateRequest → auth.Authenticate(r) (cookie only; M1 has no bearer on REST or /ws upgrades),
+// AuthenticateRequest → auth.AuthenticateCookie(r) (session cookie only; Authorization headers are ignored on /ws),
 // Revalidate → auth.Touch + a user re-read, AuthenticateBearer → M2 device tokens (M1: always ErrInvalid).
 type Authenticator interface {
-	// AuthenticateRequest reads the session cookie. ErrNoCredentials if absent; ErrInvalid if bad or expired.
+	// AuthenticateRequest reads the session cookie. ErrNoCredentials if absent; ErrInvalid if bad or expired;
+	// other errors are transient (the hub answers 503).
 	AuthenticateRequest(r *http.Request) (Identity, error)
 	// AuthenticateBearer validates a device access token (device flow, 03, M2).
 	AuthenticateBearer(ctx context.Context, token protocol.Secret) (Identity, error)
 	// Revalidate reports whether the session/device behind id is still valid and marks it as seen (03 Touch);
 	// the result can update Name/Admin. Called at connect and every RevalidateEvery.
+	// Returns ErrInvalid only when the session/device is gone or expired or the user is not active (the hub then
+	// closes with session_revoked). Any other error is transient: the hub keeps the connection and retries at the
+	// next RevalidateEvery.
 	Revalidate(ctx context.Context, id Identity, ip netip.Addr) (Identity, error)
 }
 
@@ -2136,7 +2229,10 @@ type PushNotifier interface {
 }
 
 type PushShareStarted struct {
-	RoomID, RoomName string
+	RoomID   string
+	// RoomName is read with GetRoom when the event is built; the hub never caches room names, so renames (03 §8)
+	// need no hook.
+	RoomName string
 	ShareID          string
 	UserID, UserName string
 	PresentUserIDs   []string  // participants in the room now (present or reconnecting): 04 skips them
@@ -2163,11 +2259,11 @@ type MediaPeer interface {
 	CreateShare(shareID string, meta protocol.ShareStart) (protocol.ShareParams, error)
 	UpdateShare(shareID string, meta protocol.ShareUpdate) (protocol.ShareParams, error)
 	EndShare(shareID string, reason protocol.EndReason)
-	HandleOffer(o protocol.PCOffer) (protocol.PCAnswer, error)  // pub PC; *protocol.Error for sdp_invalid etc.
+	HandleOffer(o protocol.PCOffer) (protocol.PCAnswer, error)  // pub PC; errors are *protocol.Error (scope pc; §15.4)
 	HandleAnswer(a protocol.PCAnswer) error                     // sub PC
 	AddICE(c protocol.PCICE) error
 	Restart(r protocol.PCRestart) error                         // sub: ICE restart or rebuild (client asked)
-	ClosePC(c protocol.PCClose)
+	ClosePC(c protocol.PCClose) error                           // pub only (the hub ignores pc.close{sub})
 	Subscribe(wants []protocol.SubscriptionWant) (ignored []string, err error)
 	SetCaps(protocol.Caps)
 	Resync()                // §10.5: re-emit pending sub offer, statuses, hints; ICE-restart non-connected sub PC
@@ -2183,7 +2279,7 @@ type MediaSink interface {
 	SubscriptionStatus(s []protocol.SubscriptionStatus)
 	QualityHint(h protocol.QualityHint)
 	ShareMedia(shareID string, ev ShareMediaEvent)
-	Error(e protocol.Error)                     // scope pc, subscription or share
+	Error(e protocol.Error)                     // scope pc or share
 }
 
 type ShareMediaEvent struct {
@@ -2199,8 +2295,8 @@ const (
 	ShareMediaLive    ShareMediaKind = iota + 1 // first keyframe, or recovered after stalled
 	ShareMediaStalled                           // pub PC not connected for 2 s, or its tracks are gone (PC rebuilt)
 	ShareMediaChanged                           // layers/codec/audio changed while live
-	ShareMediaGone                              // reserved: the hub itself ends a share whose tracks a same-gen pub
-	                                            // offer no longer lists (§8.7); the SFU never emits it in M1
+	ShareMediaGone                              // reserved: the hub itself ends a share whose tracks a pub offer of
+	                                            // any gen no longer lists (§8.7); the SFU never emits it in M1
 )
 
 // LiveSnapshot feeds the admin dashboard (03/04 expose it over REST).
@@ -2309,12 +2405,12 @@ Connection.
 | `CreateShare(id, meta)` | `StartShare(ctx, StartShareParams{ID: id, Preset, Audio, Source: meta.Kind})` → `sfu.ShareParams` | converted to `protocol.ShareParams` (`Codec = "h264/" + Profile`, `Layer` from the rid) |
 | `UpdateShare(id, u)` | `UpdateShare(ctx, id, ShareUpdate{Preset})` → `sfu.ShareParams` | label changes never reach the SFU |
 | `EndShare(id, reason)` | `StopShare(ctx, id, reason)` | the hub always calls the publishing connection's peer |
-| `HandleOffer(o)` | `HandleOffer(ctx, PCPub, o.Gen, o.Neg, o.SDP, tracks)` → answer SDP | synchronous (gathering is instant with muxes); a higher `gen` replaces the pub PC |
+| `HandleOffer(o)` | `HandleOffer(ctx, PCPub, o.Gen, o.Neg, o.SDP, tracks)` → answer SDP | synchronous (gathering is instant with muxes, capped at 2 s); a higher `gen` replaces the pub PC; a lower `gen`, or a lower `neg` in the current `gen`, returns `sfu.stale_offer`. Before the call the hub drops TrackRefs of shares that aren't `starting`/`live`/`stalled` shares of this connection (§9 rule 4) and ends bound shares that `tracks` omit (§8.7) |
 | `HandleAnswer(a)` | `HandleAnswer(ctx, PCSub, a.Gen, a.Neg, a.SDP)` | a stale `gen`/`neg` is dropped silently |
 | `AddICE(c)` | `AddICECandidate(ctx, c.PC, c.Gen, init)` | end-of-candidates is ignored |
-| `Restart(r)` | `mode: ice` → `RestartICE(ctx, PCSub)`; `mode: rebuild` → `ResetPC(ctx, PCSub)` | pub restarts are client offers |
-| `ClosePC(c)` | `ClosePC(ctx, c.PC)` | the hub has already ended the shares of a closed pub PC |
-| `Subscribe(wants)` | `UpdateSubscriptions(ctx, items)` | items failing with `sfu.share_not_found` become `ignored` |
+| `Restart(r)` | `mode: ice` → `RestartICE(ctx, PCSub, r.Gen)`; `mode: rebuild` → `ResetPC(ctx, PCSub, r.Gen)` | pub restarts are client offers; a lower `gen` than the current one does nothing and returns nil |
+| `ClosePC(c)` | `ClosePC(ctx, c.PC, c.Gen)` | the hub calls it only for `pub` and has already ended the shares of the closed pub PC; a lower `gen` does nothing and returns nil |
+| `Subscribe(wants)` | `UpdateSubscriptions(ctx, items)` | items failing with `sfu.share_not_found` become `ignored`; other per-item errors: below |
 | `SetCaps(c)` | `SetDecodeCaps(ctx, DecodeCaps{H264: profiles})` | `"h264/6400"` → `"6400"`; non-H.264 keys dropped |
 | `Resync()` | `Resync()` | |
 | `Stats()` | `Stats()` → `protocol.ServerStats` | |
@@ -2326,13 +2422,17 @@ Connection.
 |---|---|
 | `Signaler.SendOffer(PCSub, gen, neg, sdp, tracks)` | `Offer(PCOffer{pc: sub, gen, neg, sdp, tracks})` |
 | `SubscriptionStateEvent` | `SubscriptionStatus` (reason map below) |
-| `CodecPolicyEvent{Profile}` | one `QualityHint{shareId, reason: codec, codec: "h264/"+Profile, encodings}` per share this connection publishes |
-| `QualityHintEvent{MaxBitrate, Layers}` | `QualityHint{reason: admin (a cap) or viewers (layer pausing), maxBitrate, encodings}`: the share's current encodings with `active` and `maxBitrate` applied |
-| `PCStateEvent{PCPub, failed}` | `RestartRequest{pc: pub, gen, mode: rebuild, reason: failed}` |
-| `PCStateEvent{PCSub, …}` | nothing: the client drives sub restarts, and the SFU rebuilds sub PCs itself for codec retries |
+| `CodecPolicyEvent{Share, Profile}` (one per share this connection publishes) | `QualityHint{shareId, reason: codec, codec: "h264/"+Profile}` with no encodings (a profile switch doesn't change them) |
+| `QualityHintEvent{Share, Reason, MaxBitrate, Encodings}` | `QualityHint{shareId, reason: ev.Reason, maxBitrate, encodings converted 1:1}`; `Reason` is `admin` or `viewers`, and `Encodings` is the full current `f`/`q` list with the cap and pause state applied by the SFU |
+| `PCStateEvent{PCPub, Gen, failed}` | `RestartRequest{pc: pub, gen: ev.Gen, mode: rebuild, reason: failed}` (the SFU emits PCStateEvents only for the current PC of each kind) |
+| `PCStateEvent{PCSub, …}` | nothing: the client drives sub restarts (§10.4); the SFU ICE-restarts in `Resync()` and rebuilds sub PCs itself only for codec retries |
 | `ErrorEvent` | `Error` (code map below) |
-| `RoomEvents.ShareUpdated` | `ShareMedia` on the publishing connection's sink: `pending→live` or `stalled→live` = `Live`; `→stalled` = `Stalled`; layers, profile or audio changed while live = `Changed` |
+| `RoomEvents.ShareUpdated` | `ShareMedia` on the publishing connection's sink: `pending→live` or `stalled→live` = `Live`; `→stalled` = `Stalled`; a layer attached or ended, the profile changed, or audio changed while live = `Changed`. `Layers` is built from `ShareInfo.Layers` (every layer whose track is attached, paused ones included), ignoring `LayerInfo.Active` |
 | `RoomEvents.ShareEnded`, `CodecPolicyChanged` | ignored: the hub ends shares itself; per-connection `CodecPolicyEvent`s cover publishers |
+
+The SFU computes the content of every hint; `sfuplane` only converts types and keeps no encoding or share-list state.
+On `Resync()` the SFU re-sends one `CodecPolicyEvent` per share and the last `QualityHintEvent` per share, if one was
+sent.
 
 **Values**: `ShareKind` screen/window/tab ↔ `SourceScreen/Window/Tab`; `VideoLayer` high/low/off ↔
 `QualityHigh/Low/Off`; `AudioState` on ↔ `true`; `EndReason` strings are identical in both packages; `Role`,
@@ -2344,35 +2444,47 @@ Connection.
 
 **Error codes** (`sfu.*` never goes on the wire):
 
+Errors from the six PC methods (`HandleOffer`, `HandleAnswer`, `AddICECandidate`, `RestartICE`, `ResetPC`, `ClosePC`)
+go out with scope `pc` plus the call's `pc`, `gen` and `neg`, keeping the mapped code below. The one exception is
+`sfu.no_h264`. Wherever `sfu.Error.RetryAfter` is set (`pc_rate_limited`, `busy`, `probe_limit`), `retryAfterMs` =
+`Error.RetryAfter`.
+
 | `sfu` code | Wire |
 |---|---|
-| `sfu.role_forbidden`, `sfu.not_owner` | `forbidden` (request) |
-| `sfu.bad_pc`, `sfu.pc_limit` | `bad_request` |
-| `sfu.unknown_track` | `bad_request`, `params {field: "tracks", reason: "invalid"}` |
+| `sfu.role_forbidden`, `sfu.not_owner` | `forbidden` (scope request; pc from the PC methods) |
+| `sfu.bad_pc`, `sfu.pc_limit` | `bad_request` (scope request; pc from the PC methods) |
+| `sfu.unknown_track` | `bad_request`, `params {field: "tracks", reason: "invalid"}` (scope pc) |
 | `sfu.too_many_subscriptions` | `bad_request`, `params {field: "subs", reason: "too_many"}` |
 | `sfu.bad_sdp`, `sfu.bad_rid` | `sdp_invalid` (scope `pc`, with `pc`, `gen`, `neg`) |
-| `sfu.no_h264` | `codec_not_supported` (scope `share`) |
-| `sfu.pc_rate_limited` | `rate_limited` (scope `pc`, `retryAfterMs`) |
+| `sfu.stale_offer` | `stale_negotiation` (scope `pc`, with `pc`, `gen`, `neg`); the client ignores it |
+| `sfu.no_h264` | `codec_not_supported` (scope `share`, `shareId` = `Error.Share`); the hub then ends that share with `stopped` |
+| `sfu.pc_rate_limited` | `rate_limited` (scope `pc`, `retryAfterMs` = `Error.RetryAfter`) |
 | `sfu.share_not_found` | `share_not_found` (or `ignored` in `subscribe.update`) |
 | `sfu.too_many_shares` | `share_limit` (`per: "user"`) |
-| `sfu.busy`, `sfu.internal` | `internal` (retryable) |
-| `sfu.stale_answer`, `sfu.closed`, `sfu.negotiation_timeout` | nothing is sent; logged at debug (the SFU already rebuilt the sub PC on a timeout) |
+| `sfu.busy`, `sfu.internal` | `internal` (retryable; scope request, or pc from the PC methods) |
+| `sfu.closed` | `not_in_room` on `CreateShare`/`UpdateShare`/`Subscribe`; nothing on a notification path; logged at debug |
+| `sfu.stale_answer` | nothing is sent; logged at debug |
 | `sfu.probe_limit` | not signaling: 04's `/api/v1/conntest` answers 429 `rate_limited` |
 
+In `subscribe.update`, a per-item error other than `sfu.share_not_found` fails the whole request with the mapped
+code; the items before it stay applied.
+
 **03 revocation reasons** (the wiring's `auth.ConnCloser` adapter): `account_disabled` → `ErrorCodeAccountDisabled`;
-every other reason (`logged_out`, `session_revoked`, `session_expired`, `password_changed`, `password_reset`,
-`account_deleted`, `device_revoked`) → `ErrorCodeSessionRevoked`.
+every other reason (`logged_out`, `session_revoked`, `password_changed`, `password_reset`, `account_deleted`,
+`device_revoked`) → `ErrorCodeSessionRevoked`. Session expiry is not pushed; `Revalidate` finds it (§3.2).
 
 ## 16. TypeScript: `web/src/protocol/` (M1)
 
 | File | Content | Owner |
 |---|---|---|
 | `types.gen.ts` | tygo output | generated |
+| `api.gen.ts` | tygo output of `internal/protocol/api` (03's and 04's REST DTOs, §14.4) | generated |
 | `registry.gen.ts` | message maps and type arrays | generated |
 | `codecs.ts` | `detectCaps(): Caps` (getCapabilities → `CodecKey`, H.264 packetization-mode=1 only), `h264Key(fmtp)` | this doc |
 | `signal-client.ts` | `SignalClient` (§10.1–§10.3, §10.5 signaling part) | this doc |
 | `errors.ts` | `ProtocolError` (`code`, `scope`, `retryable`, `params`, `local`) | this doc |
-| `index.ts` | re-exports | this doc |
+| `index.ts` | re-exports of this doc's files | this doc |
+| `rest.ts`, `queryKeys.ts`, `invalidate.ts` | REST client, query keys, `invalidate` topic mapping | 05 |
 
 PC management (`RTCPeerConnection`, simulcast, `setCodecPreferences`, stereo munging) lives in 05's
 `src/platform`, following §9 and §10.4.
@@ -2386,13 +2498,16 @@ export interface SignalClientOptions {
   role: Role;
   caps: () => Caps;                           // re-read on every (re)connect
   features?: Feature[];
-  onResync?: (w: Welcome) => void;            // after every welcome (resumed or not), before onState('ready') fires
+  // after every welcome (the first after start() included, resumed or not). state is already 'ready'
+  // (request/notify work); onState('ready') listeners fire right after it returns; not awaited
+  onResync?: (w: Welcome) => void;
 }
 
 export class SignalClient {
   constructor(opts: SignalClientOptions);
   start(): void;
-  stop(code?: 1000 | 1001): void;
+  stop(): void;       // closes with 1000; the server skips grace
+  probe(): void;      // immediate ping with a 3 s pong timeout (§3.4); no-op unless ready
   readonly state: SignalState;
   readonly welcome: Welcome | undefined;
   request<K extends keyof ClientRequests>(type: K, data: ClientRequests[K]['data'],
@@ -2402,16 +2517,20 @@ export class SignalClient {
   onState(fn: (s: SignalState,
     info: { resumed?: boolean; staleBuild?: boolean; error?: ProtocolError;
             shutdown?: ServerShutdown }) => void): () => void;   // shutdown: set from server.shutdown until ready
-  retryNow(): void;   // skip the current backoff wait (the UI's Retry button; §10.2)
+  retryNow(): void;   // skip the current backoff wait, except a rate-limit wait (§10.2); the UI's Retry button
 }
 ```
 
 Behavior (normative):
 - `ping`/`pong` per §3.4, and backoff with skip-wait per §10.2. The resume token is kept in memory.
-- On `welcome{serverVersion != BUILD_VERSION}` it reports `staleBuild: true` with the `ready` state, and 05 reloads
-  (§6.1).
-- It closes with `1001` on `pagehide` (not `beforeunload`, which breaks the bfcache on some browsers), so the server
-  skips grace.
+- The client pings immediately on `visibilitychange → visible` and `online` by itself; 05 calls `probe()` when a PC
+  becomes `disconnected`.
+- On `welcome{serverVersion}` it reports `staleBuild: true` only when `serverVersion != BUILD_VERSION` and neither is
+  a dev build (prerelease starts with `dev`, 04 §15). It reports it with the `ready` state, and 05 reloads (§6.1).
+- It closes with `1000` on `pagehide` (browsers accept only 1000 or 3000–4999 in `WebSocket.close`; not
+  `beforeunload`, which breaks the bfcache on some browsers), so the server skips grace. On `pageshow` with
+  `persisted: true` it calls `start()` again (a new connection, `resumed: false`).
+- `request()` never retries. It rejects with `ProtocolError`, and callers (05) apply §12.1's client action.
 
 ## 17. Security and privacy (M1)
 
@@ -2431,10 +2550,16 @@ Behavior (normative):
   private and CGNAT addresses (02 §7.3). The server still learns every client address it needs as a peer-reflexive
   candidate from incoming checks. The protocol carries candidates either way, so switching to ICE-lite later needs no
   change.
-- **Logging**:
+- **Logging** (README "Logging", 04 §10: no access logs):
   - `Secret` and `SDP` redact themselves (`slog.LogValuer`, `fmt.Formatter`);
   - the hub logs message types, codes and ids, never payloads, SDP, tokens or candidate addresses;
-  - client IPs are logged only at connect (info) and in 03's audit log.
+  - connect, resume and close lines carry `conn_id` and `user_id` only, never the client IP, so they do not add up
+    to a per-user IP history;
+  - `remote_ip` appears only on security events, logged at `warn`: a pre-auth `429` (step 4) and an Origin `403`
+    (step 2), each at most once per client IP (IPv6: /64) per minute so a flood cannot flood the log. No `info`
+    line carries a client IP, which keeps S90's log canary true;
+  - the durable IP record is 03's (last IP per session, and the audit log with 30-day pruning). Security-event lines
+    live as long as journald or Docker log rotation keeps them; 03 §11 says so for the privacy page.
 - **Privacy** (plan):
   - no window titles (labels are user-typed, default empty);
   - no OS or version shown to other users;
@@ -2443,9 +2568,10 @@ Behavior (normative):
 
 ## 18. Observability (M1)
 
-- **slog attributes**: `conn`, `user`, `room`, `share`, `pc`, `gen`, `code`.
+- **slog attributes**: README's names `conn_id`, `user_id`, `room_id`, `share_id`, plus `pc`, `gen`, `code`.
+  `remote_ip` only on the §17 security events.
   - `info`: connect, resume (`resumed=true|false`), close (with code), share start/end (with reason), kick,
-    revocation.
+    revocation. None of them carries `remote_ip`.
   - `debug`: every message type in and out.
 - **Prometheus** (only when `Deps.Metrics` is set, 04):
   - `isshoni_ws_connections{kind,role}` gauge;
@@ -2481,7 +2607,10 @@ Behavior (normative):
 In `internal/server/signal`, with `signaltest` fakes and `httptest`:
 - **Upgrade** (the Origin matrix moved here from 03): bad Origin → 403; Origin that differs only in host case or an
   explicit default port → OK; missing Origin + cookie → OK (non-browser); an M2 Wails origin with a cookie → 403;
-  21st pre-auth upgrade per IP per minute → 429; shutting down → 503.
+  21st pre-auth upgrade per IP per minute → 429; 21 pre-auth upgrades within a minute from different addresses in
+  one IPv6 /64 → the 21st gets 429; a 17th cookie upgrade of one user → accepted, then
+  `error{too_many_connections}` + 4429; `AuthenticateRequest` failing with a non-credential error → 503; shutting
+  down → 503.
 - **Handshake**:
   - non-hello first → `hello_required` + 4400;
   - no hello in `HelloTimeout` → 4408;
@@ -2489,7 +2618,7 @@ In `internal/server/signal`, with `signaltest` fakes and `httptest`:
   - bad cookie and no bearer → 4401;
   - cookie and `hello.auth` both → `bad_request`;
   - a 65 KiB message before welcome → 1009;
-  - a 200 KiB `pc.offer` after welcome → accepted; a 70 KiB `stats` → `message_too_large`.
+  - a 200 KiB `pc.answer` (sub) after welcome → accepted by the hub; a 70 KiB `stats` → `message_too_large`.
 - **Rate limits**: a burst of 101 messages → `rate_limited` with `retryAfterMs`; continuous flood → 4429.
   `share.start` 11×/min → `rate_limited`. `stats` twice within 5 s → the second is dropped silently.
 - **Roles**: a table test of every client message × every role against §6.3.
@@ -2501,6 +2630,8 @@ In `internal/server/signal`, with `signaltest` fakes and `httptest`:
   - byte-identical snapshots to all recipients;
   - `room.event`s not sent on join or resume;
   - `CloseRoom` → `room_closed` (scope room) to that room's connections only;
+  - a `room.join` whose `GetRoom` returns before `CloseRoom` but attaches after it → `room_not_found`, no in-memory
+    room left;
   - `room_full` when `Policy().MaxRoomParticipants` is reached; a raised limit applies to the next join;
   - `Notify` targets (user, admins, room, all).
 - **Shares**:
@@ -2508,7 +2639,8 @@ In `internal/server/signal`, with `signaltest` fakes and `httptest`:
   - the same `ref` → same `shareId`;
   - `starting → live → stalled → live`, `starting` timeout and `stalled` timeout → `media_timeout` events;
   - `share.stop` is idempotent; another user's → `forbidden`; same user from another connection → OK;
-  - `pc.close` ends shares; a pub offer without a share's tracks ends it;
+  - `pc.close` ends shares; a pub offer (any `gen`) without a bound share's tracks ends it with `stopped` before the
+    offer is applied; a `starting` share that was never bound is left alone;
   - `replaces` is copied to state and event, and Push is not called.
 - **Resume**:
   - socket killed → detached; within grace → `resumed: true`, same `connectionId`, shares unchanged, participant
@@ -2517,10 +2649,14 @@ In `internal/server/signal`, with `signaltest` fakes and `httptest`:
   - an old token after rotation → `resumed: false`;
   - another user's token → `resumed: false`;
   - resume while the old socket is still attached → old socket gets `replaced` + 4409;
-  - client close 1001 → no grace.
-- **Revocation**: `CloseConnections({SessionID})` → `session_revoked` + 4401 only on connections of that session;
-  `{UserID, ExceptSessionID}` keeps the excepted session; `account_disabled` → 4403; `Revalidate` failure on the
-  5 min tick (a shortened interval in tests) → `session_revoked`.
+  - client close 1000 or 1001 → no grace.
+- **Revocation**: `CloseConnections({UserID, SessionID})` → `session_revoked` + 4401 only on connections of that
+  session; `{UserID, ExceptSessionID}` keeps the excepted session; a selector with empty `UserID` closes nothing;
+  `account_disabled` → 4403; `Revalidate` returning `ErrInvalid` on the 5 min tick (a shortened interval in tests) →
+  `session_revoked`; `Revalidate` returning a non-`ErrInvalid` error (fake: context deadline) keeps the connection
+  open and is retried at the next tick.
+- **Heartbeat**: a client that sends no messages but answers the hub's ping frames stays open past `IdleTimeout`; one
+  that answers nothing gets `idle_timeout` + 4408.
 - **Shutdown**: `server.shutdown` with the given reason and `reconnectInMs` in [500, 3000] to every connection, then
   `error{server_shutdown}` and 1012, and `Shutdown` returns before its ctx deadline.
 - **Adapter** (`sfuplane`): table tests for every row of §15.4 (calls, events, values, reasons, error codes) against a
@@ -2613,17 +2749,17 @@ to LTE switch; 5 friends for 2 h.
   - package `signaltest` (fakes).
 - **`internal/server/sfuplane`**: `New`, `Plane` (`Bind`, `NewPeer`) and the mapping tables of §15.4.
 - **`internal/client/signal`**: `Dial`, `Options`, `Client`, `State*`, `StateChange`.
-- **`web/src/protocol/`**: `types.gen.ts`, `api.gen.ts` (03's package), `registry.gen.ts` (`ClientRequests`,
-  `ClientNotifications`, `ServerMessages`, `ServerEnvelope`), `SignalClient` (incl. `retryNow`, `info.shutdown`),
-  `SignalState`, `SignalClientOptions`, `ProtocolError`, `detectCaps`, `h264Key`.
+- **`web/src/protocol/`**: `types.gen.ts`, `api.gen.ts` (03's and 04's REST DTOs), `registry.gen.ts` (`ClientRequests`,
+  `ClientNotifications`, `ServerMessages`, `ServerEnvelope`), `SignalClient` (incl. `retryNow`, `probe`,
+  `info.shutdown`), `SignalState`, `SignalClientOptions`, `ProtocolError`, `detectCaps`, `h264Key`.
 - **Config consumed** (04 owns every key; `ISSHONI_*` overrides per 04): only the guard
   `limits.ws_handshakes_per_ip_per_minute` (20). Admin policy comes from 03's settings through `Deps.Policy`:
   `minClientVersion`, `maxParticipantsPerRoom`, `maxSharesPerRoom`, `maxShareBitrateKbps` (pinnable by 04's policy
   keys `clients.min_version`, `limits.max_participants_per_room`, `limits.max_shares_per_room`,
   `limits.max_bitrate_kbps`). Grace (30 s), shares per user (4) and connections per user (16) are constants.
 - **Secrets consumed**: `keys.resume` (32 random bytes in `secrets.json`, 04 `config.KeyResume`).
-- **Tasks and CI**: `task gen`, `task gen:check` (06 `Taskfile.yml`); `testdata/compat/<version>/` snapshot step at
-  release (§14.3, wired by 06's release job).
+- **Tasks and CI**: `task gen`, `task gen:check`, `task release:compat VERSION=<version>` (06 `Taskfile.yml`); the
+  `testdata/compat/<version>/` snapshot is committed in the release-prep PR and checked by 06's release job (§14.3).
 
 ## 21. Depends on
 
@@ -2631,8 +2767,14 @@ to LTE switch; 5 friends for 2 h.
 - Exposes the `*sfu.SFU`/`*sfu.Conn` API that `sfuplane` (§15.4) maps to `MediaPlane`/`MediaPeer`/`MediaSink`,
   with this doc's counters: `HandleOffer`/`HandleAnswer`/`AddICECandidate` take `gen` and `neg`, pub offers carry the
   `tracks` binding, sub offers return one, share ids come from the hub (`StartShareParams.ID`), and `HandleOffer`
-  returns the answer synchronously. It follows §9 and §10.4 on the server side: `gen`/`neg` bookkeeping, candidate
-  buffering, the 50 ms offer debounce, stored last answer for replay, and `Resync`.
+  returns the answer synchronously. It follows §9 and §10.4 on the server side: `gen`/`neg` bookkeeping (the SFU is
+  its only owner, for both PC kinds), candidate buffering, the 50 ms offer debounce, stored last answer for replay,
+  and `Resync`.
+- `RestartICE`, `ResetPC` and `ClosePC` also take `gen`; a lower one does nothing and returns nil. `HandleOffer` with a
+  lower `gen`, or a lower `neg` in the current `gen`, returns `sfu.stale_offer`.
+- Carries the fields `sfuplane` maps (§15.4): `sfu.Error.Share` and `RetryAfter`, `PCStateEvent.Gen` (emitted only
+  for the current PC of each kind), `CodecPolicyEvent.Share` (one per published share), and
+  `QualityHintEvent.Reason`/`Encodings` (the full `f`/`q` list with the cap and pause state applied).
 - Reports media state through `RoomEvents.ShareUpdated`, which `sfuplane` turns into `ShareMediaEvent`s:
   - `Live` on the first keyframe (and after recovering);
   - `Stalled` after the pub PC has been not connected for 2 s, or while a rebuilt pub PC has no tracks yet;
@@ -2644,8 +2786,7 @@ to LTE switch; 5 friends for 2 h.
 - Owns the codec safe set from `Caps`:
   - viewers with no H.264 are left out;
   - it decides when to emit `quality.hint{codec}`;
-  - codec-blocked subscriptions get audio only and `StatusReason codec`, plus one
-    `error{codec_not_supported, subscription}`;
+  - codec-blocked subscriptions get audio only and `StatusReason codec`;
   - after `SetCaps` gains H.264 it rebuilds the sub PC; while an answer keeps rejecting video it rebuilds every 20 s,
     at most 9 times (the only codec retry loop; clients send no `pc.restart` for codecs).
 - Owns `ShareParams`/`Encoding` numbers per preset, and the Opus `maxaveragebitrate` per share in the pub answer
@@ -2658,7 +2799,8 @@ to LTE switch; 5 friends for 2 h.
   user (the per-user connection limit is 16).
 
 **03-accounts-and-store.md** (all through the wiring adapters of 04 §6.6):
-- `auth.Authenticate(r)` (cookie) and `auth.Touch` back `Authenticator`; `store` backs `RoomDirectory`.
+- `auth.AuthenticateCookie(r)` (cookie only, ignores Authorization) and `auth.Touch` back `Authenticator`; `store`
+  backs `RoomDirectory`.
 - Revocation paths call `auth.ConnCloser.CloseConnections(sel, reason)`, which maps to `Hub.CloseConnections`
   (reason table in §15.4).
 - `httpapi.Signal` hooks map to the hub: `UserChanged` → `Hub.UpdateUser`, `RoomDeleted` → `Hub.CloseRoom`,
@@ -2697,7 +2839,9 @@ to LTE switch; 5 friends for 2 h.
 - `tools/go.mod` pins tygo v0.2.21; `task gen` / `task gen:check` as in §14.4.
 - CI runs the protocol drift check, `go test -race` (including fixtures, compat and fuzz seeds), and the Vitest
   protocol tests.
-- The release job snapshots fixtures into `internal/protocol/testdata/compat/<version>/` and keeps the last two.
+- `task release:compat VERSION=<version>` copies the fixtures into `internal/protocol/testdata/compat/<version>/` and
+  keeps the last two final releases; it runs in the release-prep PR and is on the 06 §9.1 "Before tagging" list. For a
+  non-prerelease tag, release.yml's `build` job fails if that snapshot is missing or differs from `testdata/v1`.
 - Playwright e2e covers the reconnect and restart scenarios in §19.
 
 ## 22. Implementation slices
@@ -2712,13 +2856,13 @@ Each slice is independently testable and lands behind green CI. Estimates assume
 | P4 | Rooms and participants | `room.join/leave`, Participant merge, coalesced byte-identical `room.state`, `room.event`, watchers from desired subscriptions (fake media), `Notify`, `CloseRoom`, `UpdateUser`, `CloseConnections` and revalidation, `Policy`, `Snapshot` | Room, notify and revocation tests of §19 green | P3 |
 | P5 | Resume and grace | Resume tokens (HMAC, rotation), detached state, grace timer, `replaced`, deliberate-close fast path, `Resync` hook | Resume tests of §19 green, including "no leave/join events within grace" | P4 |
 | P6 | Go signaling client | `internal/client/signal`: dial, hello, backoff, resume, requests, events, states | Tests against the P5 hub: reconnect with resume after a killed socket; backoff bounds; `Close` → server skips grace | P5 |
-| P7 | Shares and negotiation plumbing (fake media) | `share.start/update/stop` (limits, `ref`, `replaces`, state machine and timeouts), `pc.*` routing with role, ownership and `gen` checks, `subscribe.update`/status, `quality.hint`, `caps.update`, `stats`/`stats.watch` forwarding, Push call | Share and role-matrix tests of §19 green against the fake `MediaPlane` | P5 |
+| P7 | Shares and negotiation plumbing (fake media) | `share.start/update/stop` (limits, `ref`, `replaces`, state machine and timeouts), `pc.*` routing with role and ownership checks (gen/neg are checked by 02), `subscribe.update`/status, `quality.hint`, `caps.update`, `stats`/`stats.watch` forwarding, Push call | Share and role-matrix tests of §19 green against the fake `MediaPlane` | P5 |
 | P8 | Real SFU wiring | `internal/server/sfuplane` (§15.4) with its table tests; in-process integration harness `internal/server/itest` with 02's fake publisher and `sfutest.Viewer` on P6 | Adapter table tests green; integration cases 1–3 and 9 of §19 green | P6, P7, 02's SFU slices 6–7, 04 wiring v1 |
 | P9 | Recovery end to end | ICE restart and rebuild paths, `Resync`, server restart with `replaces`, codec-blocked viewer flow | Integration cases 4–8 of §19 green; no goroutine leaks | P8 |
 | P10 | TS SignalClient | `web/src/protocol/signal-client.ts`, `errors.ts`, `index.ts` | Vitest cases of §19 green; the SPA (05) connects to a `task dev` server and reaches `ready` | P2, P5 |
 | P11 | E2E | Playwright watch, reconnect, restart and focus scenarios (with 05/06) | All four scenarios green in CI on Google Chrome | P9, P10, 05 viewer/sharer |
 | P12 | Same-user relay (cuttable) | `agent.send`/`agent.recv`, feature `agent.relay`, limits | Two connections of one user exchange messages; another user's target → `agent_target_not_found`; payload 17 KiB → `message_too_large`; 11/s → `rate_limited` | P7 |
-| P13 | Compat snapshot | Release-job step and the compat test (§14.3) | A fake "release" copies fixtures; removing a field from a type fails the compat test | P1, 06 release job |
+| P13 | Compat snapshot | The compat test (§14.3); the `release:compat` task body and the release-job check are 06's (README S75) | `task release:compat VERSION=0.0.1` on a scratch branch copies the fixtures and prunes to two; the release check fails on a missing or stale snapshot; removing a field from a type fails the compat test | P1, 06 release job |
 
 ## 23. Decisions taken at integration (formerly open questions)
 

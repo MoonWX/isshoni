@@ -29,7 +29,7 @@ from here.
 | 5 | CSRF protection is Go's `net/http.CrossOriginProtection` plus a mandatory `Content-Type: application/json` | Stdlib and token-free. Forms can't send JSON, and cross-origin JSON needs a preflight, which the server never grants |
 | 6 | Unicode usernames with PRECIS (RFC 8265), 2–32 characters, `_ - .` allowed | Friend groups write their names in their own scripts. PRECIS gives a standard, stable comparison key |
 | 7 | Sessions last 30 days idle and 180 days at most. The token rotates every 24 h, and the old token stays valid for 60 s | A phone PWA opened on weekends stays logged in. Rotation limits a stolen cookie. The grace period stops parallel requests from logging the user out |
-| 8 | Throttles live in memory (token buckets) and run before any hashing or DB access | An attacker cannot restart the server. Persisting each failure would turn an attack into DB writes |
+| 8 | Throttles live in memory (token buckets) and run before any hashing or DB access (the one exception is a read of the user's known IPs while that account's bucket is empty, §7.3) | An attacker cannot restart the server. Persisting each failure would turn an attack into DB writes |
 | 9 | Admin password reset issues a **one-time reset link**, clears the password and revokes everything | The admin never learns the password. The same path (via the CLI) recovers a sole admin who is locked out |
 | 10 | Pending sign-ups are ordinary `users` rows with `status='pending'`, and that is the approval queue | One place for usernames and uniqueness. Rejecting a sign-up frees its name |
 | 11 | Settings that an admin can change in the UI live in the DB (`settings`), with typed validation and a live cache. TOML stays for infrastructure, and a TOML key can **pin** a setting | Registration mode and limits change at runtime without a restart. Config can still force a value |
@@ -62,8 +62,8 @@ It does not own the following, and uses them through interfaces (§16, §17):
 internal/protocol/api/            REST DTOs + error codes; imports only the stdlib (tygo → TS)
   types.go  errors.go  device.go (later: M2)  testdata/*.json (golden JSON)
 internal/server/store/
-  store.go        Open, Options, DB, Read/Write, Ping, QuickCheck, Stats, BackupTo, Close
-  migrate.go      migrator, pre-migration backups, newer-schema refusal
+  store.go        Open, Options, DB, Read/Write, Ping, QuickCheck, Stats, BackupTo, Close, BackupFile
+  migrate.go      migrator, pre-migration backups, newer-schema refusal, LatestSchemaVersion, InspectFile
   migrations/0001_init.sql
   ids.go  errors.go  meta.go
   users.go sessions.go devices.go invites.go setup.go resets.go rooms.go push.go audit.go prune.go
@@ -72,7 +72,7 @@ internal/server/auth/
   service.go      Service, Options, Principal, Actor helpers
   tokens.go       random tokens, keyed hashes, key fingerprints
   username.go  password.go  argon2.go  limiter.go  useragent.go
-  session.go      cookie, rotation, cache, Authenticate, Touch
+  session.go      cookie, rotation, cache, Authenticate, AuthenticateCookie, Touch
   origin.go       CSRF wrapper (REST only; the WebSocket Origin check is 01's)
   setup.go  register.go  invite.go  reset.go  users.go  alerts.go  janitor.go
   deviceflow.go   later (M2)
@@ -84,6 +84,14 @@ internal/server/httpapi/
   admin_users.go  admin_rooms.go  admin_settings.go  admin_audit.go  accounts.go (dashboard accounts part)
   device.go       later (M2)
 ```
+
+**Import rules** (the single table is 04 §2, which is also the `depguard` source; these are 03's rows):
+- `store` imports only `internal/protocol/api` (plus the stdlib and modernc).
+- `auth` imports `store` and `internal/protocol/api`, never `config` or `httpapi`.
+- `httpapi` may import `config`, `logx`, `store`, `auth`, `internal/protocol` and `internal/protocol/api`, and never
+  `ops`, `push`, `netx`, `tlsmgr`, `signal`, `sfu` or `sfuplane`. What it needs from them comes through small
+  interfaces declared in httpapi (`Signal`, `Push`, `InfoSource`, and the router's metrics interface, 04).
+- Only `internal/server` (the wiring), `cmd/isshoni` and `servertest` combine these packages with 04's.
 
 ### 2.2 New dependencies (all permissive)
 
@@ -212,6 +220,19 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   8. `EnsureDefaultRoom`;
   9. open the reader pool;
   10. run `PRAGMA optimize=0x10002`.
+- **Errors a restart can't fix**: the store exports
+  `var ErrNeedsOperator = errors.New("store: needs operator action")`. `Open` returns each of these wrapped with it
+  (`fmt.Errorf("…: %w", ErrNeedsOperator)`), keeping the message shown above:
+  - the schema history mismatch;
+  - a failed migration step (its SQL or its Go step);
+  - a failed `PRAGMA foreign_key_check`;
+  - `SQLITE_CORRUPT` or `SQLITE_NOTADB`, at open or during a migration;
+  - WAL mode unavailable (§4.1);
+  - not enough free space for the pre-migration backup (§4.4);
+  - a schema newer than the binary: `*SchemaTooNewError` has `Unwrap() error` returning `ErrNeedsOperator` (§4.5).
+
+  04 exits with 78 exactly when `errors.Is(err, store.ErrNeedsOperator)`, and with 1 for any other `Open` error. In
+  both cases it prints this doc's message.
 
 ### 4.4 Pre-migration backups
 
@@ -222,9 +243,27 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 - **Free space**: before the backup, `Open` checks that free space is at least 2 × (DB + WAL size). Otherwise it fails
   with `store: not enough free disk space for the pre-migration backup (need X MB, have Y MB)`, and nothing changes.
 - **Rotation**: after a successful backup, `Open` deletes `pre-*.db` files beyond the newest 5, ordered by the
-  timestamp in the name.
-- `db.BackupTo(ctx, path)` also uses `VACUUM INTO`, for `isshoni admin backup` (04). Restore is a file copy that 04's
-  CLI does while the server is stopped.
+  timestamp in the name. It always keeps the newest file for each distinct `<ver>`, even when that file is older than
+  the newest 5. The reason is a restart loop: Docker's `restart: unless-stopped` (06) restarts forever after exit 78,
+  and every start that finds an older schema writes one more backup. Example: an upgrade from schema 3 commits
+  migrations 4 and 5 and then fails at 6. Each restart then writes another `pre-5-*.db`, and without this rule the
+  only `pre-3-*.db`, the file the old binary needs (§4.5), would be gone after 5 restarts. The folder holds at most 5
+  files plus one per schema version the server has ever migrated from, which is a handful of small DB copies.
+- `db.BackupTo(ctx, path)` also uses `VACUUM INTO`, for `isshoni admin backup` (04).
+- **File-level functions** (§6), for 04's offline backup, its restore validation of archives and bare `.db` files,
+  and offline doctor's schema check. None of them migrates, creates `backups/` or writes `meta`. `InspectFile` and
+  `BackupFile` open the source read-only (`mode=ro`); `LatestSchemaVersion` opens nothing (it reads the embedded
+  migrations). `ops` may not import `store`, so `cmd/isshoni` and the wiring pass them to 04 as functions.
+  - `LatestSchemaVersion()` is the highest schema version this binary knows.
+  - `InspectFile(ctx, dbPath, backupDir)` returns `FileInfo`: the schema version, `meta.last_app_version`, whether the
+    migration history matches the embedded files (`HistoryOK`), the `PRAGMA integrity_check` result (`Integrity`,
+    nil = ok) and, for a newer schema, the same `*SchemaTooNewError` that `Open` would return (`backupDir` is only
+    read, to fill its `Backup`).
+  - `BackupFile(ctx, src, dst)` opens `src` read-only and runs `VACUUM INTO dst`; it fails if `dst` exists.
+- **Close**: `(*DB).Close` checkpoints with `PRAGMA wal_checkpoint(TRUNCATE)` (§6), so the `.db` file alone is
+  complete after a clean shutdown.
+- Restore is 04's (04 §12.4): the running server validates, shuts down, closes the store and swaps the files, then
+  re-execs; `--offline` does the same while the server is stopped.
 
 ### 4.5 Refusing a newer schema
 
@@ -236,19 +275,24 @@ type SchemaTooNewError struct {
 	LastAppVersion string // meta.last_app_version, e.g. "0.6.1"
 	Backup         string // newest backups/pre-<BinaryVersion>-*.db, or "" if there is none
 }
+
+func (e *SchemaTooNewError) Error() string
+func (e *SchemaTooNewError) Unwrap() error // ErrNeedsOperator (§4.3)
 ```
 
-`Error()` gives the user one actionable message, for example:
+`Error()` gives the user one actionable message: the problem, the versions and the backup file, with no command. For
+example:
 
 > database schema 5 is newer than this isshoni build supports (4); it was last used by isshoni 0.6.1. Install
-> isshoni 0.6.1 or newer, or restore the database from before the upgrade with
-> `sudo -u isshoni isshoni admin restore --offline /var/lib/isshoni/backups/pre-4-20261014T021500Z.db` (changes made
-> after that backup are lost).
+> isshoni 0.6.1 or newer, or restore the database from before the upgrade:
+> /var/lib/isshoni/backups/pre-4-20261014T021500Z.db (changes made after that backup are lost)
 
-With no matching backup, the second half becomes "no backup for schema 4 was found in <dir>". 04 prints the message
-and exits with code 78 (EX_CONFIG; systemd's `RestartPreventExitStatus=78` stops the restart loop, 06), and offline
-doctor shows it. 04's `admin restore` accepts such a `.db` file and restores only the database (04 §12.4). There are no "compatible newer schema" exceptions: the plan
-says refuse, and release notes flag every migration (06).
+With no matching backup, the second half becomes "no backup for schema 4 was found in <dir>". 04 prints the message,
+appends the exact `isshoni admin restore --offline` command for systemd or Docker, and exits with code 78 (EX_CONFIG;
+systemd's `RestartPreventExitStatus=78` stops the restart loop, 06). Offline doctor's `schema` check shows the same
+text through the same 04 formatter. 04's `admin restore` accepts such a `.db` file and restores only the database
+(04 §12.4). There are no "compatible newer schema" exceptions: the plan says refuse, and release notes flag every
+migration (06).
 
 ### 4.6 Key fingerprints (rotate-secrets)
 
@@ -261,7 +305,7 @@ says refuse, and release notes flag every migration (06).
   honest.
 - This startup check is the only purge path: `isshoni admin rotate-secrets` writes the new keys and restarts the
   server (04 §5.3); there are no live rotation hooks. 04's push service does the same for VAPID with the meta key
-  `vapid_key_fp`.
+  `vapid_key_fp`, in `push.New`, which the wiring runs before `auth.New` and before serving.
 
 ### 4.7 Janitor and pruning
 
@@ -331,7 +375,9 @@ CREATE TABLE devices (
   id           TEXT PRIMARY KEY,
   user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   name         TEXT NOT NULL,                            -- from the app, e.g. "Alex-PC" (≤ 64 chars)
-  client_kind  TEXT NOT NULL CHECK (client_kind IN ('desktop','agent','mobile')),
+  client_kind  TEXT NOT NULL CHECK (client_kind IN ('desktop','mobile')),
+                                                         -- 01 ClientKind; the Linux agent is desktop + os linux
+                                                         -- (role agent is a hello field)
   os           TEXT NOT NULL CHECK (os IN ('windows','macos','linux','ios','android')),
   app_version  TEXT NOT NULL,
   linked_via   TEXT NOT NULL CHECK (linked_via IN ('device_flow','password')),
@@ -356,7 +402,9 @@ CREATE INDEX device_tokens_expiry ON device_tokens(expires_at);
 CREATE TABLE device_codes (                              -- RFC 8628 pending authorizations; later (M2)
   device_code_hash BLOB PRIMARY KEY,
   user_code_hash   BLOB NOT NULL UNIQUE,
-  client_kind      TEXT NOT NULL CHECK (client_kind IN ('desktop','agent','mobile')),
+  client_kind      TEXT NOT NULL CHECK (client_kind IN ('desktop','mobile')),
+                                                         -- 01 ClientKind; the Linux agent is desktop + os linux
+                                                         -- (role agent is a hello field)
   device_name      TEXT NOT NULL,
   os               TEXT NOT NULL,
   app_version      TEXT NOT NULL,
@@ -525,6 +573,7 @@ var (
 	ErrConflict       = errors.New("store: unique constraint")
 	ErrInviteUnusable = errors.New("store: invite expired, used up or revoked")
 	ErrDefaultRoom    = errors.New("store: the default room cannot be deleted")
+	ErrNeedsOperator  = errors.New("store: needs operator action") // wraps every Open error a restart can't fix (§4.3)
 )
 
 type ConflictError struct{ Column string } // "username_key" | "name_key" | "endpoint"
@@ -684,6 +733,9 @@ type Options struct {
 
 func Open(ctx context.Context, o Options) (*DB, error) // migrates; may return *SchemaTooNewError
 
+// Close rejects new Read/Write calls, waits for running transactions, closes the reader pool, runs
+// PRAGMA wal_checkpoint(TRUNCATE) on the writer, then closes it. Idempotent. 04 calls it after stopping the janitor
+// and the push queue.
 func (db *DB) Close() error
 func (db *DB) Read(ctx context.Context, fn func(q *Q) error) error  // reader pool, snapshot
 func (db *DB) Write(ctx context.Context, fn func(q *Q) error) error // writer, BEGIN IMMEDIATE
@@ -710,6 +762,21 @@ type Stats struct {
 }
 
 type PruneStats struct{ Sessions, Tokens, Invites, Pending, DeviceCodes, DeviceTokens, Audit int }
+
+// ---- file-level (§4.4): never migrate, never create backups/, never write meta ----
+func LatestSchemaVersion() int // highest version in the embedded migrations; opens nothing
+// InspectFile opens dbPath read-only (mode=ro). backupDir is only read, to fill TooNew.Backup.
+func InspectFile(ctx context.Context, dbPath, backupDir string) (FileInfo, error)
+// BackupFile opens src read-only (mode=ro) and runs VACUUM INTO dst; fails if dst exists.
+func BackupFile(ctx context.Context, src, dst string) error
+
+type FileInfo struct {
+	SchemaVersion  int
+	LastAppVersion string             // meta.last_app_version
+	HistoryOK      bool               // schema_migrations names match the embedded files
+	Integrity      error              // PRAGMA integrity_check; nil = ok
+	TooNew         *SchemaTooNewError // non-nil when SchemaVersion > LatestSchemaVersion()
+}
 ```
 
 `*Q` wraps the transaction. Read methods work in both `Read` and `Write`. Write methods fail inside `Read`, which a
@@ -732,6 +799,9 @@ func (q *Q) DeleteUser(id UserID) error
 func (q *Q) CountActiveAdmins() (int, error)
 func (q *Q) AnyAdmin() (bool, error)                                 // any status
 func (q *Q) CountPending() (int, error)
+func (q *Q) DeletePending() ([]UserID, error)                        // reject all (§7.9): every pending row
+// KnownIPs returns the last_ip of each live session of that user (§7.3); none for an unknown name.
+func (q *Q) KnownIPs(usernameKey string, now time.Time) ([]string, error)
 
 // sessions
 func (q *Q) CreateSession(s *Session) error                          // sets ID
@@ -876,7 +946,8 @@ from §12.2.
 
 There are no composition rules, no expiry and no forced periodic changes. Pasting and password managers stay allowed
 (05). The minimum of 8 is lower than NIST SP 800-63B-4's 15 for single-factor passwords. Online guessing is capped at
-about 30 per hour per account (§7.3), the common list removes weak choices, and argon2id makes a stolen DB expensive.
+about 30 per hour per account after a first burst of 30, however many addresses the attacker uses (the `auth-user`
+bucket, §7.3), the common list removes weak choices, and argon2id makes a stolen DB expensive.
 This is the first open question in §19. `/api/v1/info` serves the limits, so changing them touches only the server.
 
 **Hashing** (`internal/server/auth/argon2.go`):
@@ -885,7 +956,8 @@ This is the first open question in §19. `/api/v1/info` serves the limits, so ch
 - **Verify** parses the parameters from the stored string. If they differ from the current `ArgonParams`, a successful
   login rehashes the password. The new hash is computed outside the transaction and written in the same `Write` as the
   login's other updates.
-- **Semaphore**: at most `max(2, runtime.NumCPU()/2)` hashes run at once.
+- **Semaphore**: at most `max(2, runtime.NumCPU()/2)` hashes run at once. Anonymous hashes must first pass the
+  global `auth-hash` budget (§7.3), which caps their rate; the semaphore caps only how many run at once.
   - At most 32 callers may wait; the 33rd gets `server_busy` at once.
   - A caller that waits more than 10 s gets `server_busy` (503, `Retry-After: 5`).
   - Peak hashing memory is N × 19 MiB, which is 38 MiB on a 1–3 vCPU VPS.
@@ -900,22 +972,48 @@ The throttles are in-memory token buckets (decision 8), in `auth/limiter.go`. IP
 | Bucket | Key | Burst | Refill | Consumed by | Checked |
 |---|---|---|---|---|---|
 | `auth-ip` | client IP | 20 | 1 per 15 s | Every attempt at login, register, setup/check+complete, reset/check+complete, invite/check, device/code and device/password *(later: M2)* | First, before any work |
-| `auth-user` | username key (existing or not) | 5 | 1 per 2 min | Failed password checks | Before hashing |
-| `register-ip` | client IP | 5 | 1 per 12 min | Sign-up requests without an invite (approval mode). Invite registrations are limited by the invite's own `maxUses` instead (the load test, 02, registers many users from one IP) | Before hashing |
+| `auth-user-ip` | username key (existing or not) + client IP | 5 | 1 per 2 min | Failed password checks | Before hashing, after `auth-ip`. A hard block |
+| `auth-user` | username key (existing or not) | 30 | 1 per 2 min | Failed password checks, from any IP | After `auth-user-ip`. When it is empty, the user's known IPs still pass (below) |
+| `register-ip` | client IP | 5 | 1 per 12 min | Sign-up requests without an invite (approval mode). Invite registrations are limited by the invite's own `maxUses` instead (the load test, 02, registers many users from one IP) | Before hashing, after `auth-ip` |
+| `auth-hash` | one for the whole server | 20 | 5 per s | Every public request that reaches the hash: login (the dummy hash too), register, setup/complete, reset/complete, device/password *(later: M2)* | Last: after all of the buckets above, before the semaphore (§7.2) |
 | `lookup` *(later: M2)* | session ID | 10 | 1 per min | Failed user-code lookups | Before lookup |
 | `push-test` | user ID | 1 | 1 per 10 s | `POST /push/test` | Before sending |
 
-- A blocked attempt gets 429 `rate_limited` with `retryAfter` and a `Retry-After` header. It does no hashing and no
-  DB access.
-- A successful login refills that username's `auth-user` bucket.
+- A blocked attempt gets 429 `rate_limited` with `retryAfter` and a `Retry-After` header. It does no hashing, and no
+  DB access other than the known-IP read below.
+- **Two buckets per username**: `auth-user-ip` stops one address from guessing, and only that address. A stranger who
+  fails 5 times from address A blocks A, not the friend's correct password from address B. `auth-user` caps guessing
+  across all addresses at about 30 per hour (§7.2). A stranger with enough addresses can empty it; from then on only
+  the user's known IPs get through until it refills.
+- **Known IPs**: when `auth-user` is empty, the login still goes on if the client IP (IPv4) or its /64 (IPv6) matches
+  the `last_ip` of one of that user's live sessions (not past `idle_expires_at` or `expires_at`; M2 adds linked
+  devices). That address is still limited by its own `auth-user-ip` bucket. The set comes from `KnownIPs` (§6), one
+  indexed read on the reader pool, done only while the bucket is empty, so the normal path stays free of DB access
+  (decision 8). An unknown username has no sessions and stays blocked. A friend who logs in from a new place while
+  the account is under attack (for example a new iPhone Home Screen app on mobile data, §7.4) waits for the refill.
+  A signed long-lived device cookie that would let such a browser through comes *later (M6 hardening)*.
+- A successful login refills that username's `auth-user-ip` bucket for that IP. It doesn't touch `auth-user`, so a
+  friend's login never hands an attacker a fresh budget.
+- **`auth-hash`** caps the total rate of anonymous argon2 hashes, which the per-IP and per-username buckets can't: a
+  stranger with many addresses (IPv6 /64s are cheap) could otherwise keep every hash slot busy with random usernames,
+  and the SFU would compete for CPU. 5 hashes per second at about 50 ms each use a quarter of one core, about 1/8 of a
+  2 vCPU VPS. Keeping the bucket empty takes about 75 addresses, each spending all of its `auth-ip` refill. When it is
+  empty, the request gets 503 `server_busy` with `Retry-After` (the seconds until the next token, at least 1) and
+  does no hashing. The trade-off: under such an attack, new logins, sign-ups and resets wait. Existing sessions,
+  WebSockets and media are unaffected, because nothing on those paths hashes. Password checks by a logged-in user
+  (changing the password, deleting the account, granting admin) don't use this bucket.
 - Each map holds at most 100,000 keys. When it is full, full buckets (idle keys) are evicted first, then the least
   recently used ones.
 - The plan's "20 pre-auth WebSocket handshakes per IP per minute" is enforced by 01's hub at the upgrade (01 §3.1;
   04 key `limits.ws_handshakes_per_ip_per_minute`). Cookie-authenticated upgrades aren't counted there, so 10 friends
   behind one NAT who reconnect after a server restart are never blocked.
 - **Audit**:
-  - The first block of a key writes one `auth.throttled {scope, key}` row. The key is the IP, or the username only if
-    that user exists. Later blocks in the same episode are not logged.
+  - The first block of a key writes one `auth.throttled {scope, key}` row. Later blocks in the same episode are not
+    logged. The scope is `ip` for `auth-ip` and `register-ip` (the key is the IP), `username` for `auth-user` (a row
+    only if that user exists; the key is the username) and `hash` for `auth-hash` (no key).
+  - `auth-user-ip` blocks write no `auth.throttled` row. The `auth.login_failed` rows before them already show the
+    address (and the account, if it exists), and one row per pair would let a stranger with many addresses flood the
+    log.
   - `auth.login_failed` rows have a global cap of 600 per hour. Beyond it, one `auth.throttled {scope:"global"}` row
     is written per hour.
 
@@ -950,6 +1048,11 @@ Set-Cookie: __Host-isshoni_session=<43-char token>; Path=/; Max-Age=2592000; Htt
     timestamp decides.
   - It happens on REST use, and through `Touch` from the signal hub (01's `Authenticator.Revalidate`, adapted by the
     wiring) at WebSocket connect and every 5 min while connected. A 2-hour session therefore never idles out.
+  - On every call, `Touch` checks from the cache or a read that the session exists, is unexpired and belongs to an
+    `active` user, and returns `*api.Error{unauthenticated}` otherwise. (M2: for a bearer principal it checks the
+    device row; the access token's expiry does not matter after `hello`, 01 §3.2.) The
+    `last_seen_at`/`idle_expires_at` write is best effort and throttled to once per 5 min: a write error is logged
+    and never returned.
 - **Cache**:
   - An in-memory map from token hash to (session, user), with a 30 s TTL.
   - Every revoke, role, status and rename path invalidates it synchronously, by session or by user. There is only one
@@ -991,12 +1094,14 @@ Set-Cookie: __Host-isshoni_session=<43-char token>; Path=/; Max-Age=2592000; Htt
 `websocket.Accept` (01 §3.1). This doc supplies only credential checks, through a small wiring adapter that
 implements 01's `signal.Authenticator` (04 §6.6):
 
-1. **Cookie** (M1): `AuthenticateRequest(r)` → `(*Service).Authenticate(r)`, restricted to the session cookie. An
-   unknown, expired or non-`active` session → `signal.ErrInvalid`; no cookie → `signal.ErrNoCredentials`. WebSocket
-   upgrades never rotate the session token (§7.4).
+1. **Cookie** (M1): `AuthenticateRequest(r)` → `(*Service).AuthenticateCookie(r)`, which reads only the session
+   cookie and ignores any `Authorization` header (the REST rules of §7.5 do not apply to /ws). `ErrNoCookie` →
+   `signal.ErrNoCredentials`; `unauthenticated` (an unknown, expired or non-`active` session) → `signal.ErrInvalid`;
+   other errors pass through (the hub answers 503). WebSocket upgrades never rotate the session token (§7.4).
 2. **Revalidation**: `Revalidate(ctx, id, ip)` → `(*Service).Touch(ctx, p, ip)` plus a user re-read (username, role).
-   The hub calls it at connect and every 5 min; an `unauthenticated` result makes the hub close the connection with
-   `session_revoked`.
+   The hub calls it at connect and every 5 min. The adapter maps `*api.Error{unauthenticated}` to `signal.ErrInvalid`
+   (the hub closes with `session_revoked`) and passes any other error through unchanged. The hub keeps the
+   connection on those and retries in 5 min (01 §3.2).
 3. *Later (M2)*: bearer access tokens arrive in `hello.auth` (01 D2), never in a header or subprotocol. The adapter's
    `AuthenticateBearer` calls `(*Service).AuthenticateBearerToken(ctx, token)`. The Wails asset origins
    (`wails://wails`, `wails://wails.localhost`, `http://wails.localhost`, `https://wails.localhost`, confirmed against
@@ -1004,14 +1109,18 @@ implements 01's `signal.Authenticator` (04 §6.6):
 
 ### 7.7 Revocation
 
-Every row below commits first. Then `ConnCloser.CloseConnections(sel, reason)` runs (the wiring implements it with
-01's `Hub.CloseConnections`, mapping `account_disabled` to `account_disabled` and every other reason to
-`session_revoked`, 01 §15.4), and the session cache is invalidated.
+Every row below commits first. Then the session cache is invalidated, and only then does
+`ConnCloser.CloseConnections(sel, reason)` run (the wiring implements it with 01's `Hub.CloseConnections`, mapping
+`account_disabled` to `account_disabled` and every other reason to `session_revoked`, 01 §15.4). No code path
+deletes a session row without this call, except two that need none: the janitor's prune of expired sessions (see
+below the table) and the startup purge after a `session` key change (no connection exists yet).
 
 | Event | Web sessions | Devices and tokens *(later: M2)* | Push subscriptions | Pending reset link | Live connections closed (reason) |
 |---|---|---|---|---|---|
 | Logout | This one | — | This session's | — | This session (`logged_out`) |
 | Revoke one session | That one | — | That session's | — | That session (`session_revoked`) |
+| Login, registration, setup or reset completion that arrives with an existing session cookie | That old session | — | That session's | — | That session (`session_revoked`) |
+| Session cap eviction (the 51st session) | The evicted ones (`TrimSessions` result) | — | Theirs | — | Those sessions (`session_revoked`) |
 | "Sign out other browsers" | All but the current one | — | Theirs | — | Those sessions (`session_revoked`) |
 | "Log out everywhere" | All | All | All | — | All of the user's (`logged_out`) |
 | Change own password | All but the current one (rotated) | All | Theirs | Deleted | Others (`password_changed`) |
@@ -1019,10 +1128,13 @@ Every row below commits first. Then `ConnCloser.CloseConnections(sel, reason)` r
 | Admin: sign out everywhere | All | All | All | — | All (`session_revoked`) |
 | Admin: disable user | All | All | All | Deleted | All (`account_disabled`) |
 | Delete user (admin or self) | Cascade | Cascade | Cascade | Cascade | All (`account_deleted`) |
-| Role change or rename | — | — | — | — | None. The hub gets `Signal.UserChanged(id, username, admin)` |
+| Role change or rename | — | — | — | — | None. The hub gets `Signal.UserChanged(id, username, admin)` (REST path. A CLI `set-role` reaches open connections at the hub's next Revalidate, ≤ 5 min.) |
 | Revoke device *(later: M2)* | — | That device | That device's | — | That device (`device_revoked`) |
 | Refresh-token reuse *(later: M2)* | — | That device | That device's | — | That device (`device_revoked`) |
 | `session` key rotated | All users' | All users' | Cascade | — | Server restart |
+
+Session expiry (idle or absolute) is not pushed. A live connection's expired session is found by the hub's 5-min
+Revalidate (§7.6).
 
 Pending device codes that the user approved are deleted along with the devices (`DeleteDeviceCodesOf`). 01 maps each
 reason to its `error{code, retryable:false}` message and close code (01 §12.1, §15.4).
@@ -1053,8 +1165,8 @@ reason to its `error{code, retryable:false}` message and close code (01 §12.1, 
      
      The response is 201 with the session cookie. A race between two tabs leaves exactly one admin: the loser gets 404
      `setup_unavailable`.
-- The wizard's next steps (connection test, first invite) run as that logged-in admin. The SPA keeps its progress in
-  the setting `setupWizardDone` (§9).
+- The wizard's next steps (connection test, first invite) run as that logged-in admin. The SPA sets
+  `setupWizardDone` when the admin finishes the wizard; step progress lives in the URL (05 §14.1).
 
 ### 7.9 Registration modes, invites and the approval queue
 
@@ -1070,7 +1182,7 @@ reason to its `error{code, retryable:false}` message and close code (01 §12.1, 
 
 **Invites**:
 - **Who creates them**: admins. Members can too when `invites.members_can_create` is true (default false). Members see
-  and revoke only their own invites, and may have at most 10 active.
+  and revoke only their own invites, and may have at most 10 active → 409 `limit_reached {limit:"member_invites"}`.
 - **Limits**: `expiresInHours` is 1–720 (default `invites.default_ttl_hours` = 168) and `maxUses` is 1–1000 (default
   `invites.default_max_uses` = 10). At most 100 active invites per server → 409 `limit_reached {limit:"invites"}`.
 - **Link**: `Origins.Primary + "/invite#" + token`. It is returned **once**, at creation. Only the hash is kept, so a
@@ -1085,7 +1197,7 @@ reason to its `error{code, retryable:false}` message and close code (01 §12.1, 
 2. the mode;
 3. with `inviteToken`: the invite's state (without using it yet);
 4. field validation (422);
-5. the hash (semaphore, outside the transaction);
+5. the `auth-hash` budget (§7.3), then the hash (semaphore, outside the transaction);
 6. one `Write`:
    - with an invite: `UseInvite` (atomic), `CreateUser(status=active, created_via=invite, invite_id)`,
      `CreateSession`, and audit `user.registered {inviteId}` → **201** with the cookie, and the SPA lands in Lounge;
@@ -1103,6 +1215,12 @@ invite is validated, so usernames can't be enumerated without an invite. In appr
 - **Approve**: `status=active`, `approved_by` and `approved_at` are set, and `user.approved` is audited. The user can
   log in from then on; before that, login answers 403 `account_pending`, but only after a correct password.
 - **Reject**: the row is deleted, which frees the username, and `user.signup_rejected` is audited.
+- **Reject all**: the same endpoint with `all` in place of the ID and the body `{"all": true}` deletes every row that
+  is pending when the transaction runs. Both are required, so a stray request can't empty the queue: `all` without
+  that body is looked up as an ID and gets 404. It writes one
+  `user.signup_rejected {all: true, count}` row with no target and answers 200 `{rejected: n}`. The admin page's
+  "Reject all" button (05) is for a flood of fake sign-ups (§11). A real sign-up that arrived a moment before is
+  rejected too; its username is free again, so that friend just signs up once more.
 - **Expiry**: pending rows expire after 14 days (janitor).
 - Pending users get no session in M1, so there is no "you were approved" push. Their page says "An admin will review
   your request. Try logging in later."
@@ -1157,7 +1275,7 @@ invite is validated, so usernames can't be enumerated without an invite. In appr
 | `admin_password_reset` | A reset link was issued for an admin |
 | `registration_mode_changed` | `registration.mode` changed |
 | `signup_pending` | A sign-up request arrived (at most one alert per 10 min) |
-| `secrets_rotated` | Key fingerprints changed at startup (§4.6) |
+| `secrets_rotated` | Key fingerprints changed at startup (§4.6). After a session-key rotation no push subscription survives, so this alert shows only as a security event and log line |
 | `transfer_threshold` | Month-to-date egress crossed 80 % or 100 % of `transferAlertGb` (raised by 04 §11.3 through the same `AdminAlerter`; `Target` = `"80"` or `"100"`) |
 | `refresh_token_reused` *(later: M2)* | A spent refresh token was replayed; that device was revoked |
 
@@ -1170,7 +1288,8 @@ names) and our error envelope. Rationale: only first-party clients use it.
   10 per hour per IP). It returns `deviceCode` (32 bytes), `userCode` (8 letters from `BCDFGHJKLMNPQRSTVWXZ`, shown
   as `XXXX-XXXX`), `verificationUri` (`<primary>/link`), `verificationUriComplete` (`<primary>/link?code=WDJB-MJHT`),
   `expiresIn: 600` and `interval: 5`. User codes are normalized to upper case with `-` and spaces removed, then
-  hashed.
+  hashed. `clientKind` is `desktop` or `mobile` (01 `ClientKind`; the Linux agent sends `desktop`); anything else →
+  422 `validation_failed {clientKind: invalid}`.
 - **Approve** (in the browser, as the logged-in user):
   - `/link?code=…` calls `POST /device/lookup {userCode}`, which shows "Link *isshoni for Windows* on *Alex-PC*?",
     plus the requesting IP and the request time;
@@ -1193,6 +1312,8 @@ names) and our error envelope. Rationale: only first-party clients use it.
   - `Authorization: Bearer isa_…` works on every user and admin endpoint and on the WebSocket (§7.6);
   - expired or unknown tokens get 401 `invalid_token` with `WWW-Authenticate: Bearer error="invalid_token"`, so the
     app knows to refresh rather than relink;
+  - on the WebSocket the token travels only in `hello.auth` and failure is always `unauthenticated` (01 §3.2). The
+    app refreshes before every `hello`, and on `unauthenticated` refreshes once and retries before relinking;
   - `POST /device/revoke` (bearer) is the app's own "Sign out", and the Devices page (M1) revokes any device.
 - **Caps**: 20 devices per user; the 21st evicts the least recently seen one.
 
@@ -1211,11 +1332,16 @@ type Origins struct {
 
 type Options struct {
 	Keys     Keys
-	Origins  func() Origins                  // 04; read per request (TLS mode changes add origins)
+	Origins  func() Origins                  // 04; fixed for the process lifetime (config changes need a restart,
+	                                         // 04 §4). 01's WebSocket allowlist (Config.PublicOrigin) uses the same
+	                                         // Site.Origin
 	ClientIP func(*http.Request) netip.Addr  // 04; trusted-proxy aware
-	Conns    ConnCloser                      // wiring adapter over 01's Hub.CloseConnections; nil = no-op (tests, CLI)
+	Conns    ConnCloser                      // wiring adapter over 01's Hub.CloseConnections; nil = no-op only in unit
+	                                         // tests and offline CLI commands (admin-socket commands run in the
+	                                         // server and use the real adapter)
 	Alerts   AdminAlerter                    // 04's push; nil = alerts are only logged
 	Argon    ArgonParams                     // zero = DefaultArgon
+	Hashes   HashBudget                      // the auth-hash bucket (§7.3); zero = DefaultHashBudget; tests only
 	Clock    func() time.Time
 	Logger   *slog.Logger
 }
@@ -1229,6 +1355,10 @@ type ArgonParams struct {
 }
 
 var DefaultArgon = ArgonParams{MemoryKiB: 19456, Time: 2, Threads: 1, SaltLen: 16, KeyLen: 32}
+
+type HashBudget struct{ Burst, PerSecond int }
+
+var DefaultHashBudget = HashBudget{Burst: 20, PerSecond: 5}
 
 type Method uint8
 
@@ -1245,7 +1375,7 @@ type Principal struct {
 	Method     Method
 	SessionID  store.SessionID // Method == MethodSession
 	DeviceID   store.DeviceID  // Method == MethodBearer (M2)
-	ClientKind string          // "web" for sessions; the device's kind ("desktop"|"agent"|"mobile") for bearer
+	ClientKind string          // "web" for sessions; the device's kind ("desktop"|"mobile", 01 ClientKind) for bearer
 }
 
 func (p Principal) IsAdmin() bool
@@ -1253,7 +1383,7 @@ func ActorOf(p Principal, ip netip.Addr) store.Actor
 
 // Implemented by the wiring over 01's Hub.CloseConnections (04 §6.6). Selects connections by user, session or device.
 type ConnSelector struct {
-	UserID          store.UserID
+	UserID          store.UserID    // required, never empty (01 closes nothing otherwise)
 	SessionID       store.SessionID // "" = any
 	DeviceID        store.DeviceID  // "" = any
 	ExceptSessionID store.SessionID // keep this one (password change, "sign out other browsers")
@@ -1267,7 +1397,6 @@ type ConnCloser interface {
 const (
 	ReasonLoggedOut       = "logged_out"
 	ReasonSessionRevoked  = "session_revoked"
-	ReasonSessionExpired  = "session_expired"
 	ReasonPasswordChanged = "password_changed"
 	ReasonPasswordReset   = "password_reset"
 	ReasonAccountDisabled = "account_disabled"
@@ -1304,13 +1433,18 @@ type LoginResult struct {
 }
 
 // ---- HTTP integration ----
-func (s *Service) Authenticate(r *http.Request) (Principal, error)   // cookie (M1) or bearer (M2); REST and, via
-                                                                     // the wiring, 01's WebSocket Authenticator
-func (s *Service) Touch(ctx context.Context, p Principal, ip netip.Addr) error // hub Revalidate: connect + every 5 min
+func (s *Service) Authenticate(r *http.Request) (Principal, error)       // cookie (M1) or bearer (M2); REST only
+func (s *Service) AuthenticateCookie(r *http.Request) (Principal, error) // /ws only: session cookie, never rotates,
+                                                                         // ignores Authorization
+// Touch is the hub's Revalidate: validates session/device + user every call; write throttled and best effort; only
+// unauthenticated means gone (§7.4, §7.6).
+func (s *Service) Touch(ctx context.Context, p Principal, ip netip.Addr) error
 func (s *Service) MaybeRotate(w http.ResponseWriter, p Principal)    // REST middleware (§7.4)
 func (s *Service) SetSessionCookie(w http.ResponseWriter, token string, idleExpires time.Time)
 func (s *Service) ClearSessionCookie(w http.ResponseWriter)
 func (s *Service) CSRF(next http.Handler) http.Handler               // §7.5
+
+var ErrNoCookie = errors.New("auth: no session cookie") // AuthenticateCookie: the request has no session cookie
 
 // ---- setup ----
 func (s *Service) SetupAvailable(ctx context.Context) (bool, error)
@@ -1360,6 +1494,7 @@ type InviteInput struct {
 // ---- admin (also used by the admin socket with store.CLIActor) ----
 func (s *Service) Approve(ctx context.Context, a store.Actor, id store.UserID) (store.User, error)
 func (s *Service) Reject(ctx context.Context, a store.Actor, id store.UserID) error
+func (s *Service) RejectAll(ctx context.Context, a store.Actor) (int, error) // §7.9; one audit row with the count
 func (s *Service) UpdateUser(ctx context.Context, a store.Actor, id store.UserID, ch UserChange) (store.User, error)
 func (s *Service) DeleteUser(ctx context.Context, a store.Actor, id store.UserID) error
 func (s *Service) SignOutUser(ctx context.Context, a store.Actor, id store.UserID) (sessions, devices int, err error)
@@ -1393,6 +1528,9 @@ func (s *Service) PasswordDeviceLogin(ctx context.Context, in api.DevicePassword
 ```
 
 All service errors are `*api.Error` (§12.2) carrying a stable code, so httpapi maps them to status codes in one table.
+The one exception is `ErrNoCookie`, which only the /ws adapter sees (§7.6); `AuthenticateCookie` returns
+`*api.Error{unauthenticated}` for an invalid, expired or non-`active` session and passes any other error through
+as-is.
 
 ---
 
@@ -1410,17 +1548,19 @@ All service errors are `*api.Error` (§12.2) carrying a stable code, so httpapi 
 - **Who**: admins create, rename and delete rooms. Room creation by members comes *later*, as a setting.
 - **Cap**: 200 rooms (abuse guard) → 409 `limit_reached {limit:"rooms"}`.
 - **UX rule** (plan): `GET /api/v1/rooms` returns `showRoomList = (room count > 1)`.
-  - While it is false, the SPA hides the room list and the in-room "Create room" button, and admins create the second
-    room under Admin → Rooms.
+  - While it is false, the SPA hides the room list and the in-room "Create room" link (shown to admins only; it opens
+    Admin → Rooms), and admins create the second room under Admin → Rooms.
   - Deleting down to one room hides the list again.
 - **Hooks into the signal hub (01)** through `httpapi.Signal` (§12.5), called after the commit:
   - `Notify(NotifyTarget{All: true}, protocol.TopicRooms)` on create, rename and delete, so clients refresh their room
     list or name;
   - `RoomDeleted(id)` on delete. The hub ends that room's shares (`room_closed`) and sends its connections
     `error{room_closed, scope: room}`; clients rejoin `defaultRoomId` themselves (01 §12.1).
+  - A rename needs no hub hook: the hub reads names through `RoomDirectory.GetRoom` when it uses them (01 §15.2).
 - **Room IDs** are stable across renames. They appear in SPA URLs (`/r/<id>`, 05) and in `isshoni://` deep links
-  (plan). `GET /api/v1/rooms/{id}` → 404 `room_not_found` lets the SPA say "This room was deleted" and fall back to
-  Lounge.
+  (plan). Room ids are never reused after a delete (random ids; `lounge` can't be deleted). 01's hub relies on this.
+  An unknown or deleted room in `/r/<id>` is reported by 01's `room.join` error `room_not_found`; the SPA then goes
+  to `defaultRoomId` (05).
 - **Live counts** in room lists come from `Signal.RoomPresence()` (01). They are never stored.
 - Later: per-room locks (plan: Later), room order, invites into a specific room, and an i18n default name.
 
@@ -1467,9 +1607,14 @@ Fields:{...}}`, and a pinned field gets 409 `setting_locked`. The new values and
 (with `{changes:{field:{from,to}}}`) are written in one `Write`. After the commit, the cache swaps and `OnChange`
 callbacks run.
 
+`Pin` runs the same validation as `Update`. On failure it returns
+`*api.Error{validation_failed, Fields:{<json name>: <field code>}}`, which 04 reports as a config error naming the TOML
+key, its source and the field code (exit 78). `Defaults()` is the single source of policy defaults: 04's config
+registry repeats them only for documentation and `config example`, and a wiring test checks that they match.
+
 | Field | Type, range | Default | Read by (enforced in) |
 |---|---|---|---|
-| `serverName` | string, 0–64 chars, PRECIS Nickname | `""` | 03 (`/info`, invite check), 04/05 (manifest, titles) |
+| `serverName` | string, 0–64 chars, PRECIS Nickname | `""` | 03 (`/info`, invite check), 05 (titles, via `/info`) |
 | `registrationMode` | `invite` \| `approval` \| `closed` | `invite` | 03. A change raises an alert |
 | `inviteDefaultTtlHours` | int 1–720 | 168 | 03 |
 | `inviteDefaultMaxUses` | int 1–1000 | 10 | 03 |
@@ -1480,7 +1625,7 @@ callbacks run.
 | `transferAlertGb` | int 0–1000000 (0 = off; 1 GB = 10⁹ bytes) | 0 | 04 (transfer alerts) |
 | `updateCheck` | bool | true | 04 (daily release check) |
 | `minClientVersion` | "" or SemVer | `""` | 01 (`hello` reply), 03 (`/info`) |
-| `setupWizardDone` | bool | false | 05 (wizard resume) |
+| `setupWizardDone` | bool | false | 05 (dashboard setup checklist) |
 
 The "no numeric limits" rule from the plan holds: every limit defaults to 0, meaning off, and is an optional admin
 soft limit.
@@ -1501,14 +1646,14 @@ soft limit.
 | `setup.completed` | the new admin | user | `{}` | ✓ |
 | `auth.login` | user | session | `{}` | |
 | `auth.login_failed` | anonymous | user (only if it exists) | `{reason: wrong_password\|unknown_user\|account_pending\|account_disabled}` | |
-| `auth.throttled` | anonymous | — | `{scope: ip\|username\|global, key}` | ✓ |
+| `auth.throttled` | anonymous | — | `{scope: ip\|username\|hash\|global, key}` (§7.3) | ✓ |
 | `auth.logout` | user | session | `{}` | |
 | `auth.logout_everywhere` | user | user | `{sessions, devices}` | |
 | `auth.password_changed` | user | user | `{}` | |
 | `session.revoked` | user | session | `{name}` | |
 | `user.registered` | the new user | user | `{inviteId}` | |
 | `user.signup_requested` | anonymous (name = username) | user | `{}` (the IP column holds the sign-up IP) | |
-| `user.approved` / `user.signup_rejected` | admin | user | `{}` | |
+| `user.approved` / `user.signup_rejected` | admin | user (none for reject all) | `{}` / `{}`, or `{all: true, count}` for reject all | |
 | `user.signup_expired` | system | user | `{}` | |
 | `user.renamed` | admin/cli | user | `{from, to}` | |
 | `user.role_changed` | admin/cli | user | `{from, to}` | ✓ |
@@ -1541,7 +1686,7 @@ are written from this table.
 | Username as typed, plus its comparison key | `users` | Login, display | Account deleted (pending sign-ups: 14 d) |
 | Password hash (argon2id) | `users` | Login | Account deleted, or cleared by an admin reset |
 | Role, status, creation and approval times, approver, invite used, last login time | `users` | Admin pages | Account deleted |
-| Per web session: token hash, browser label ("Chrome on Windows"), created and last-seen times, **last IP** | `sessions` | Staying logged in; the Devices page | Logout, revoke, 30 d idle or 180 d total (removed within 1 h) |
+| Per web session: token hash, browser label ("Chrome on Windows"), created and last-seen times, **last IP** | `sessions` | Staying logged in; the Devices page; letting the user's own addresses past a login throttle under attack (§7.3) | Logout, revoke, 30 d idle or 180 d total (removed within 1 h) |
 | Per linked app *(later: M2)*: name, app kind, OS, app version, created and last-seen times, last IP, token hashes | `devices`, `device_tokens` | Native apps | Revoked; tokens at expiry |
 | Pending app links *(later: M2)*: the same, plus the requesting IP | `device_codes` | The approval screen | ≤ 70 min |
 | Invites: token hash, note, creator, limits, use count | `invites` | Invite links | 30 d after the invite stops working |
@@ -1552,7 +1697,7 @@ are written from this table.
 | Server transfer totals per month (bytes in and out, no per-user data) | `transfer_months` | Admin dashboard, transfer alerts (04) | Kept (a few bytes per month) |
 | Settings and who last changed them | `settings` | Admin settings | Changed back to the default |
 | Audit log: action, actor and target names, **IP**, small detail | `audit_log` | Security review | 30 d |
-| Pre-migration backups: full copies of all of the above | `backups/` | Recovery from a failed upgrade | The newest 5 are kept, so deleted accounts can live on in them until they rotate out |
+| Pre-migration backups: full copies of all of the above | `backups/` | Recovery from a failed upgrade | The newest 5 are kept, plus the newest one for each older schema version (§4.4), so deleted accounts can live on in them until they rotate out |
 
 **Never stored**:
 - passwords, and any raw token, cookie or code;
@@ -1564,10 +1709,15 @@ are written from this table.
 
 HTTP access logs are off (04).
 
-**Memory only**: throttle buckets (IP or username key, at most 100,000 per bucket) and the 30-second session cache.
+**Memory only**: throttle buckets (IP, username key, or both; at most 100,000 keys per bucket) and the 30-second
+session cache.
 
-**Known trade-off**: in `approval` mode anyone who knows the server URL can check whether a username exists, at 5
-tries per hour per IP. Invite mode (the default) doesn't have this.
+**Known trade-offs** of `approval` mode; invite mode (the default) has neither:
+- Anyone who knows the server URL can check whether a username exists, at 5 tries per hour per IP.
+- A stranger can fill the 50-slot pending queue from about 10 addresses (`register-ip` allows 5 sign-ups per
+  address at once). Real sign-ups then get 409 `limit_reached` until an admin clears the queue with "Reject all"
+  (§7.9) or the rows expire after 14 days. Invite links keep working meanwhile, and switching to invite mode stops
+  new sign-ups.
 
 ---
 
@@ -1646,7 +1796,7 @@ type ErrorResponse struct {
 | `validation_failed` | 422 | See `fields` |
 | `unsupported_media_type` | 415 | Unsafe request without `Content-Type: application/json` |
 | `payload_too_large` | 413 | Body over the limit |
-| `method_not_allowed` | 405 | |
+| `method_not_allowed` | 405 | Known `/api/v1` path, wrong method; the `Allow` header lists the allowed ones |
 | `unauthenticated` | 401 | No valid session (or bearer) |
 | `invalid_credentials` | 401 | Wrong username or password (the same answer for unknown users) |
 | `invalid_token` *(later: M2)* | 401 | Bearer access token expired or unknown: refresh |
@@ -1668,24 +1818,36 @@ type ErrorResponse struct {
 | `last_admin` | 409 | Would leave no active admin |
 | `self_action_forbidden` | 409 | Use the self-service endpoint instead |
 | `room_is_default` | 409 | Lounge can't be deleted |
-| `limit_reached` | 409 | `params.limit`: `rooms`, `invites`, `pending_signups` |
+| `limit_reached` | 409 | `params.limit`: `rooms`, `invites`, `member_invites`, `pending_signups` |
 | `setting_locked` | 409 | `params.field`, pinned by config |
-| `push_endpoint_rejected` | 422 | `params.reason`: `not_https`, `bad_port`, `userinfo`, `ip_literal`, `private_address`, `unresolvable`, `too_long` or `bad_keys` (the DNS checks are 04's `ValidateEndpoint`) |
+| `push_endpoint_rejected` | 422 | `params.reason`: `not_https`, `bad_port`, `userinfo`, `ip_literal`, `private_address`, `unresolvable`, `too_long` or `bad_keys` (`too_long` and `bad_keys` come from the handler, the rest from 04's `ValidateEndpoint`, §12.4.6) |
 | `push_unavailable` | 503 | Push is off (`push.enabled=false`, 04) |
 | `rate_limited` | 429 | `retryAfter` |
-| `server_busy` | 503 | Hash queue full; `retryAfter` |
+| `server_busy` | 503 | Hash queue full, or the server-wide `auth-hash` budget is empty (§7.3); `retryAfter` |
 | `internal` | 500 | Logged with `requestId` (04), never with details on the wire |
-| `not_found` (04) | 404 | Unknown `/api/…` route |
+| `not_found` (03 inside `/api/v1`, 04 elsewhere under `/api/`) | 404 | Unknown `/api/…` route |
 | `bad_sdp` (04) | 400 | `/conntest`: the offer isn't a data-channel-only SDP |
 | `transport_disabled` (04) | 409 | `/conntest`: `tcp443` in `tls.mode=off` |
 | `doctor_busy` (04) | 429 | A doctor run is in progress or ran less than 10 s ago; `retryAfter` |
 | `not_ready` (04) | 503 | The media plane isn't ready yet |
 | `server_shutdown` (04) | 503 | The server is stopping or restarting; `Retry-After: 5` (same code as 01's WebSocket error) |
+| `backup_invalid` (04, admin socket only) | 400 | The archive or DB file failed validation |
+| `backup_newer` (04, admin socket only) | 409 | The backup's schema is newer than this binary |
+| `restore_in_progress` (04, admin socket only) | 409 | A restore is already running |
+| `insufficient_storage` (04, admin socket only) | 507 | Not enough free disk space for the backup or restore |
 | `authorization_pending`, `slow_down`, `access_denied`, `expired_token`, `invalid_grant` *(later: M2)* | 400 | RFC 8628 and OAuth semantics |
 | `device_code_invalid` *(later: M2)* | 404 | Unknown or expired user code |
 
 **Field codes**: `required`, `too_short`, `too_long`, `invalid`, `reserved`, `too_common`, `same_as_username`,
 `out_of_range`, `not_allowed`.
+
+**Codes shared with 01's WebSocket errors** (01 §12.1): `bad_request`, `unauthenticated`, `forbidden`,
+`account_disabled`, `room_not_found`, `rate_limited`, `internal` and `server_shutdown`. Each side keeps its own wire
+shape and unit rule (REST: `retryAfter` in seconds and `requestId`; WebSocket: `retryAfterMs` and `params.ref`). A
+code that appears in both tables must mean the same thing, and its `errors.<code>` text must work for both: the SPA
+interpolates a wait time normalized to seconds and one normalized reference id. `internal/protocol/api/errors_test.go`
+(a test file only, which imports `internal/protocol`) asserts that the set of codes present in both `api.Code*` and
+`protocol.ErrorCode*` equals this list.
 
 ### 12.3 Endpoint table
 
@@ -1713,13 +1875,10 @@ Common errors are not repeated per row: `bad_request`, `payload_too_large`, `uns
 | 17 | `GET /api/v1/me/devices` | User | 200 `{devices}` (empty until M2) | — | M1 |
 | 18 | `DELETE /api/v1/me/devices/{id}` | User | 204 | 404 `not_found` | M1 |
 | 19 | `GET /api/v1/rooms` | User | 200 `Rooms` | — | M1 |
-| 20 | `GET /api/v1/rooms/{id}` | User | 200 `{room}` | 404 `room_not_found` | M1 |
 | 21 | `GET /api/v1/invites` | User | 200 `{invites}` (admin: all; member: own) | 403 `forbidden` (member without permission) | M1 |
 | 22 | `POST /api/v1/invites` | Admin, or User if `membersCanInvite` | 201 `{invite, url}` | 403 `forbidden`/`registration_closed`, 409 `limit_reached`, 422 | M1 |
 | 23 | `DELETE /api/v1/invites/{id}` | Admin, or the creator | 204 | 404 `not_found` | M1 |
 | 24 | `POST /api/v1/push/subscriptions` | User | 201 `{id}` (new) · 200 `{id}` (existing) | 422 `push_endpoint_rejected`, 503 `push_unavailable` | M1 |
-| 25 | `GET /api/v1/push/subscriptions` | User | 200 `{subscriptions}` | — | M1 |
-| 26 | `DELETE /api/v1/push/subscriptions/{id}` | User | 204 | 404 `not_found` | M1 |
 | 27 | `POST /api/v1/push/unsubscribe` | User | 204 (idempotent, by endpoint) | — | M1 |
 | 28 | `POST /api/v1/push/test` | User | 202 (this session's subscriptions) | 404 `not_found` (none), 429 (1 per 10 s), 503 `push_unavailable` | M1 |
 | 29 | `GET /api/v1/admin/users` | Admin | 200 `{users}` (`?status=active\|pending\|disabled`) | — | M1 |
@@ -1729,7 +1888,7 @@ Common errors are not repeated per row: `bad_request`, `payload_too_large`, `uns
 | 33 | `POST /api/v1/admin/users/{id}/sign-out` | Admin | 200 `{sessions, devices}` | 404 | M1 |
 | 34 | `GET /api/v1/admin/approvals` | Admin | 200 `{pending}` | — | M1 |
 | 35 | `POST /api/v1/admin/approvals/{id}/approve` | Admin | 200 `{user}` | 404 `user_not_found` (not pending) | M1 |
-| 36 | `POST /api/v1/admin/approvals/{id}/reject` | Admin | 204 | 404 | M1 |
+| 36 | `POST /api/v1/admin/approvals/{id}/reject` | Admin | 204 · with `{id}` = `all` and `{"all": true}`: 200 `{rejected}` (§7.9) | 404 (also `all` without that body) | M1 |
 | 37 | `POST /api/v1/admin/rooms` | Admin | 201 `{room}` | 409 `room_name_taken`/`limit_reached`, 422 | M1 |
 | 38 | `PATCH /api/v1/admin/rooms/{id}` | Admin | 200 `{room}` | 404 `room_not_found`, 409 `room_name_taken`, 422 | M1 |
 | 39 | `DELETE /api/v1/admin/rooms/{id}` | Admin | 204 | 404, 409 `room_is_default` | M1 |
@@ -1771,8 +1930,8 @@ Examples use `watch.example.com` and documentation IPs. IDs are illustrative.
 - `server.name` is the setting, or else the host of the primary origin.
 - `protocol` comes from `internal/protocol` (01).
 - `minClientVersion` is the setting (`""` = no floor; pinnable by 04's `clients.min_version`).
-- `features` holds opaque capability strings. M1 has `push` and `passwordReset`; M2 adds `deviceFlow`. Clients ignore
-  unknown values.
+- `features` holds opaque capability strings. M1 has `passwordReset`, plus `push` exactly when the `push` object is
+  present (push enabled and a VAPID key loaded); M2 adds `deviceFlow`. Clients ignore unknown values.
 - `push` is omitted when push is unavailable.
 - `setupRequired` lets `/` show "This server isn't set up yet. Run `isshoni setup-url` on the server."
 
@@ -1876,8 +2035,6 @@ cookie and applies the revocation row in §7.7.
 }
 ```
 
-`GET /api/v1/rooms/{id}` → `{"room": {…}}`.
-
 `POST /api/v1/admin/rooms` `{"name": "🎬 Movie night"}` → `201 {"room": {…}}`.
 
 `PATCH /api/v1/admin/rooms/{id}` `{"name": "Games"}` → `200 {"room": {…}}`.
@@ -1911,12 +2068,15 @@ for 30 days.
 {"endpoint": "https://fcm.googleapis.com/fcm/send/dx1…", "keys": {"p256dh": "BNcRd…", "auth": "tBHItJI5svbpez7KI4CCXg"}}
 ```
 
-**Validation**:
-- the endpoint is an `https` URL of at most 2048 bytes;
-- the host is not an IP literal in a private, loopback, link-local or ULA range;
-- `p256dh` decodes to 65 bytes starting with `0x04`, and `auth` decodes to 16 bytes;
-- then `Push.ValidateEndpoint` runs (04), which resolves DNS and rejects private addresses (the plan's rule). 04's
-  sender re-checks at dial time against DNS rebinding.
+**Validation**, in this order; each failure is 422 `push_endpoint_rejected` with that `params.reason`:
+1. the endpoint is at most 2048 bytes, else `too_long`;
+2. `p256dh` decodes to 65 bytes starting with `0x04` and `auth` to 16 bytes, else `bad_keys`;
+3. then `Push.ValidateEndpoint` (04) checks the scheme (`https` only, `not_https`), the port (443, `bad_port`), no
+   userinfo (`userinfo`), a DNS name rather than an IP literal (`ip_literal`), and that the name resolves
+   (`unresolvable`) only to public addresses (`private_address`, the plan's rule). 04's sender re-checks at dial time
+   against DNS rebinding.
+
+The handler checks only the body shape; every URL and host rule is 04's.
 
 **Storage**: the row is upserted by endpoint and bound to the current session, with a name from the User-Agent. Each
 user keeps at most 10 subscriptions; the oldest is evicted. The SPA calls this **on every app start** once permission
@@ -1924,13 +2084,10 @@ is granted. That keeps the binding current after re-logins and makes the call id
 
 The VAPID public key comes from `GET /api/v1/info` (`push.vapidPublicKey`, §12.4.1); there is no separate config
 endpoint. The SPA re-subscribes when the key differs from its subscription's `applicationServerKey` (after
-`rotate-secrets --include-vapid`, 04).
+`rotate-secrets`, 04).
 
 **Other endpoints**:
-- `GET /api/v1/push/subscriptions` → `{"subscriptions": [{"id", "name", "createdAt", "lastSuccessAt"}]}`. Endpoints
-  are never returned.
 - `POST /api/v1/push/unsubscribe` `{"endpoint": "…"}` → 204.
-- `DELETE /api/v1/push/subscriptions/{id}` → 204.
 - `POST /api/v1/push/test` → 202. It sends a `push.test` notification to **this session's** subscriptions (this
   browser) through `Push.SendTest`. At most 1 per 10 s per user (`push-test` bucket).
 - `GET /api/v1/push/preferences` → `{"shareStarted": "all", "adminAlerts": true}`; `PUT` with the same shape → 200.
@@ -1998,6 +2155,9 @@ pending users go through the approval endpoints (otherwise 422 with `fields.stat
 `GET /api/v1/admin/approvals` →
 `{"pending": [{"id": "…", "username": "sam_k", "requestedAt": "…", "ip": "198.51.100.23"}]}`.
 
+`POST /api/v1/admin/approvals/{id}/reject` `{}` → 204. `POST /api/v1/admin/approvals/all/reject` `{"all": true}` →
+`200 {"rejected": 37}`.
+
 `GET /api/v1/admin/settings` →
 `{"settings": {Settings…}, "defaults": {Settings…}, "locked": ["updateCheck"]}`.
 
@@ -2050,7 +2210,7 @@ type Deps struct {
 	DB       *store.DB
 	Auth     *auth.Service
 	Signal   Signal                         // wiring adapter over 01's hub; nil-safe (tests): no presence, no-op hooks
-	Push     Push                           // 04's push service; nil → push_unavailable
+	Push     Push                           // wiring adapter over 04's push service; nil → push_unavailable
 	Info     InfoSource                     // 04
 	ClientIP func(*http.Request) netip.Addr // 04's httpapi.ClientIP
 	Clock    func() time.Time
@@ -2058,7 +2218,10 @@ type Deps struct {
 }
 
 func New(d Deps) *API
-func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) // mounted by 04's router at /api/v1/
+// ServeHTTP is mounted by 04's router at /api/v1/. After the no-store step it answers every unmatched /api/v1 path
+// with 404 not_found and every method mismatch with 405 method_not_allowed plus an Allow header, through
+// WriteError. This covers routes added through Handle. 04's router handles only /api/ paths outside /api/v1/.
+func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request)
 // Handle registers a route owned by another doc behind the same /api/v1 chain (auth, CSRF, body limit, no-store),
 // e.g. a.Handle("POST /api/v1/admin/doctor", httpapi.Admin, h). Patterns use Go 1.22+ ServeMux syntax.
 // 04's conntest, dashboard, doctor and bandwidth routes are registered this way by 04's wiring.
@@ -2091,7 +2254,8 @@ type NotifyTarget struct {
 	All    bool         // every connection
 }
 
-// Implemented by the Web Push service (04).
+// Implemented by the wiring's adapter over 04's push service (it converts store.PushSubscription to
+// push.Subscription).
 type Push interface {
 	VAPIDPublicKey() string                                     // base64url, uncompressed P-256
 	ValidateEndpoint(ctx context.Context, endpoint string) error // nil or *api.Error{push_endpoint_rejected}
@@ -2112,10 +2276,13 @@ type InfoSource interface {
 | Room created, renamed or deleted | `{All}`: `rooms` |
 | User renamed or role changed | `{UserID: target}`: `me`; `{Admins}`: `admin.users` |
 | User disabled, enabled, deleted, signed out, reset link issued | `{Admins}`: `admin.users` |
-| Sign-up requested, approved, rejected or expired | `{Admins}`: `admin.approvals`, `admin.users` |
+| Sign-up requested, approved or rejected | `{Admins}`: `admin.approvals`, `admin.users` |
 | Invite created, revoked or used by a registration | `{Admins}`: `admin.invites`; `{UserID: creator}`: `admin.invites` when a member created it |
 | Settings changed | `{Admins}`: `admin.settings` |
-| A session created, revoked or expired; a device linked or revoked (M2) | `{UserID}`: `devices` |
+| `membersCanInvite` changed | `{All}`: `me` (members' `permissions.createInvites`) |
+| A session created or revoked; a device linked or revoked (M2) | `{UserID}`: `devices` |
+
+Only REST handlers notify. Janitor expiry and admin-CLI changes are picked up at the SPA's next refetch.
 
 The DTOs in `internal/protocol/api` (tygo → TS; 01's tygo config gains this package) are:
 - `Info`, `AccountRules`;
@@ -2124,8 +2291,8 @@ The DTOs in `internal/protocol/api` (tygo → TS; 01's tygo config gains this pa
 - `SetupCompleteRequest`, `ResetCompleteRequest`, `ChangePasswordRequest`, `DeleteSelfRequest`;
 - `Room`, `RoomPresence` (the `live` object in room lists), `Rooms`;
 - `Invite`, `CreateInviteRequest`, `CreateInviteResponse`;
-- `PushSubscribeRequest`, `PushSubscriptionInfo`, `PushPreferences`;
-- `AdminUser`, `PatchUserRequest`, `PendingUser`, `ResetLink`;
+- `PushSubscribeRequest`, `PushPreferences`;
+- `AdminUser`, `PatchUserRequest`, `PendingUser`, `RejectRequest` (`{all}`), `RejectAllResponse`, `ResetLink`;
 - `SettingsResponse` (with `Settings` mirrored from store), `AuditEntry`, `AuditPage`, `DashboardAccounts`;
 - `Error`, `ErrorResponse`, the `Code*` constants and `StatusOf`;
 - 04's REST and push DTOs live in the same package (04 §2): the dashboard, doctor, bandwidth, connection-test and
@@ -2139,13 +2306,13 @@ Golden JSON for each DTO goes in `internal/protocol/api/testdata/`.
 
 | Route | Owner | Access / notes |
 |---|---|---|
-| `GET /ws` | 01 | The hub does its own Origin and pre-auth checks; credentials through the wiring's `Authenticator` over `auth.Authenticate` and `Touch` (§7.6) |
+| `GET /ws` | 01 | The hub does its own Origin and pre-auth checks; credentials through the wiring's `Authenticator` over `auth.AuthenticateCookie` and `Touch` (§7.6) |
 | `GET /healthz`, `GET /readyz` | 04 | Public; readyz uses `db.Ping` |
 | `POST /api/v1/conntest` | 04 (on 02's probe) | `API.Handle` with `User`: any signed-in user (05 shows fix text to admins only) |
 | `GET /api/v1/admin/dashboard` | 04 | `API.Handle` with `Admin`; the `accounts` part comes from `DashboardAccounts` |
 | `GET\|POST /api/v1/admin/doctor`, `GET /api/v1/admin/bandwidth` | 04 | `API.Handle` with `Admin` |
 | `/metrics` on `127.0.0.1:9469` | 04 | Separate listener |
-| SPA routes (`/`, `/r/{id}`, `/invite`, `/signup`, `/reset`, `/link`, `/account`, `/admin/*`), `/download`, install scripts | 04, 05, 06 | `/setup` must answer **404** when `auth.SetupAvailable` is false. Every other SPA route is always served |
+| SPA routes (every route in 05 §5), `/download`, install scripts | 04, 05, 06 | `/setup` must answer **404** when `auth.SetupAvailable` is false. Every other SPA route is always served |
 
 **Admin socket (04's CLI, 04 §3.1 and §12.2) → functions here**:
 
@@ -2183,7 +2350,7 @@ SPA removes the fragment right after reading it (05).
 
 | Item | Value |
 |---|---|
-| argon2id | m = 19 MiB, t = 2, p = 1; concurrency `max(2, NumCPU/2)`; 32 waiters; 10 s wait → `server_busy` |
+| argon2id | m = 19 MiB, t = 2, p = 1; concurrency `max(2, NumCPU/2)`; 32 waiters; 10 s wait → `server_busy`; anonymous hashes: burst 20, 5 per s server-wide (`auth-hash`) → `server_busy` |
 | Session | 32-byte token; 30 d idle; 180 d max; rotation 24 h; old-token grace 60 s; touch every 5 min at most; cache 30 s; 50 per user |
 | Setup token | 24 h, single use, one live at a time |
 | Invite | 1–720 h (default 168); 1–1000 uses (default 10); 100 active per server; 10 active per member |
@@ -2195,7 +2362,7 @@ SPA removes the fragment right after reading it (05).
 | Request bodies | 16 KiB (auth and device), 64 KiB (other) |
 | Audit | 30 d retention; detail ≤ 1 KiB; `login_failed` capped at 600 per hour |
 | Device flow *(later: M2)* | Code 10 min; poll interval 5 s (+5 s per `slow_down`); access 15 min; refresh 90 d; reuse grace 30 s; 20 devices per user |
-| SQLite | busy_timeout 5000 ms; slow-write warning 250 ms; 5 pre-migration backups |
+| SQLite | busy_timeout 5000 ms; slow-write warning 250 ms; pre-migration backups: the newest 5, plus the newest per schema version |
 | Push preferences | defaults `shareStarted: all`, `adminAlerts: true` |
 
 ---
@@ -2208,12 +2375,19 @@ SPA removes the fragment right after reading it (05).
   index (a test queries `sqlite_master`).
 - **Backups**:
   - Using a fake migration list (v1 → v2 → … → v8), each upgrade from ≥ 1 writes `backups/pre-<old>-<ts>.db`. Only
-    the newest 5 remain, and each backup opens and has the old version.
+    the newest 5 remain, plus the newest file of each older `<old>`, and each backup opens and has the old version.
+  - **Restart loop**: a DB at v3 and a fake list whose v6 fails. Eight `Open` calls in a row (the injected clock moves
+    1 s per call) each return `ErrNeedsOperator`. The first writes `pre-3-*.db` and each later one a `pre-5-*.db`;
+    afterwards the `pre-3-*.db` file is still there, next to exactly 5 `pre-5-*.db` files.
   - A new DB writes no backup.
   - Low free space (an injected statfs) fails before any change.
 - **Newer schema**: a DB at v9 against a binary that knows v8 gives a `SchemaTooNewError` with `Backup` set to the
   newest `pre-8-*.db`, and a DB at v9 with no backup gives `Backup == ""`. A renamed migration gives the history
   mismatch error.
+- **Needs operator**: each case of §4.3 satisfies `errors.Is(err, ErrNeedsOperator)`; a cancelled context does not.
+- **File-level functions**: `InspectFile` reports the version, history, integrity and `TooNew` of fixture files
+  (current, newer, renamed migration, corrupted page); `InspectFile` and `BackupFile` leave the source byte-identical
+  and create no `backups/`; a `BackupFile` copy opens with the same version.
 - **Constraints**:
   - FKs are enforced: deleting a user cascades to sessions, devices and push subscriptions, and sets invites'
     `created_by` to NULL.
@@ -2240,15 +2414,19 @@ SPA removes the fragment right after reading it (05).
 - **Password rules**: the length counts runes, OpaqueString handles non-ASCII spaces, a common password is caught
   regardless of case, and a password equal to the username is rejected.
 - **Limiter**: burst and refill (fake clock); IPv6 addresses in one /64 share a key; the map cap evicts full buckets
-  first; a successful login refills the username bucket.
+  first; a successful login refills that address's `auth-user-ip` bucket and leaves `auth-user` as it was.
+- **Hash budget**: fake clock and the counting hasher; 1000 logins for random usernames from 1000 random /64s, spread
+  over 10 simulated seconds, hash at most 20 + 5 × 10 = 70 times. The others get 503 `server_busy` with
+  `Retry-After` ≥ 1 and no hash.
 - **Cookies**: the attribute matrix (https: `__Host-`, Secure, HttpOnly, Lax, Path=/, Max-Age; http dev: no prefix and
   no Secure).
 - **Rotation**: after 24 h a REST request rotates, a WebSocket upgrade never does, and the old token works for 60 s.
 - **CSRF matrix**: `Sec-Fetch-Site` values (`same-origin`, `none`, `same-site`, `cross-site`) × Origin
   (match, mismatch, absent) × method × Content-Type.
-- **WebSocket credentials** (the Origin matrix is 01's test now): `Authenticate` on an upgrade request with a valid
-  cookie returns the principal and never rotates; a disabled or pending user → unauthenticated; `Touch` on a revoked
-  session → unauthenticated.
+- **WebSocket credentials** (the Origin matrix is 01's test now): `AuthenticateCookie` on an upgrade request with a
+  valid cookie returns the principal and never rotates, and ignores an `Authorization` header; no cookie →
+  `ErrNoCookie`; a disabled or pending user → unauthenticated; `Touch` on a revoked or expired session →
+  unauthenticated; a failing last-seen write → nil.
 - **Revocation**: for every row of §7.7, a fake `ConnCloser` records the exact selector and reason, and the session
   cache is invalidated.
 - **Key fingerprints**: changing the `session` key deletes sessions and device tables; changing the `invite` key
@@ -2265,13 +2443,23 @@ SPA removes the fragment right after reading it (05).
   register without an invite → 403 `invite_required`; a taken username → 409 without using the invite.
 - **Approval mode**: register without an invite → 202; login → 403 `account_pending`, and a wrong password → 401; the
   admin approves → login 200; rejecting frees the username; the 51st pending sign-up → 409 `limit_reached`; a pending
-  user older than 14 d is pruned; the `signup_pending` alert is coalesced to one per 10 min.
+  user older than 14 d is pruned; the `signup_pending` alert is coalesced to one per 10 min. Reject all with 3 pending
+  → 200 `{rejected: 3}`, the queue is empty, and one `user.signup_rejected {all: true, count: 3}` row is written;
+  `all` without the `{"all": true}` body → 404 and nothing is deleted.
 - **Closed mode**: invite check, register and invite creation → 403 `registration_closed`.
-- **Login throttles**:
-  - 5 wrong passwords for one username, then the 6th → 429 with `Retry-After`, and the hasher counter doesn't move;
+- **Login throttles** (these tests set `Options.Hashes` large, except where `auth-hash` is emptied):
+  - 5 wrong passwords for one username from address A, then the 6th from A → 429 with `Retry-After`, and the hasher
+    counter doesn't move;
+  - the correct password from address B then → 200: a lockout from A doesn't block B;
+  - 5 more addresses with 5 wrong passwords each empty `auth-user`. The correct password from a new address C → 429
+    without a hash; from B, which is the `last_ip` of a live session → 200; and from another address in the /64 of a
+    live session's IPv6 `last_ip` → 200;
   - the IP bucket blocks the 21st attempt;
   - an unknown username costs exactly one hash;
-  - the audit holds `auth.login_failed` rows without unknown usernames, and one `auth.throttled` row.
+  - with the `auth-hash` bucket empty, a login → 503 `server_busy` with `Retry-After`, and
+    the hasher counter doesn't move;
+  - the audit holds `auth.login_failed` rows without unknown usernames, one `auth.throttled` row per scope hit
+    (`username` once for the emptied `auth-user`), and none for `auth-user-ip`.
 - **Sessions**: the list marks `current`; revoking one → that cookie gets 401; revoke-others keeps the current one;
   logout-everywhere clears the cookie and deletes the user's devices; the 51st session evicts the least recently seen.
 - **Passwords**: changing the password keeps the current session and kills the others. An admin reset makes the old
@@ -2283,9 +2471,9 @@ SPA removes the fragment right after reading it (05).
 - **Rooms**: Lounge exists after the first start; `showRoomList` is false with 1 room and true with 2; a
   case-insensitive duplicate name → 409; deleting Lounge → 409; deleting another room calls `Signal.RoomDeleted`; the
   201st room → 409.
-- **Push**: `http://` → 422; an IP literal `https://10.0.0.1/…` → 422; a fake `ValidateEndpoint` rejection → 422; a
-  valid subscription → 201, and the same endpoint again → 200; the 11th subscription evicts the oldest; logout
-  deletes the session's subscriptions.
+- **Push**: an endpoint over 2048 bytes → 422 `too_long`; bad keys → 422 `bad_keys`; a fake `ValidateEndpoint`
+  rejection → 422 with its reason; a valid subscription → 201, and the same endpoint again → 200; the 11th
+  subscription evicts the oldest; logout deletes the session's subscriptions.
 - **Settings**: a bad value → 422 with `fields`; a pinned field → 409; `OnChange` fires; a registration-mode change
   raises an alert and a security event.
 - **Audit**: every action in §10 that M1 can trigger is produced by at least one test, with the IP from `ClientIP`.
@@ -2301,15 +2489,15 @@ SPA removes the fragment right after reading it (05).
 - **DTO golden fixtures** in `internal/protocol/api/testdata` round-trip. The tygo drift check (01's CI job) covers
   the TS output.
 
-**E2E (Playwright, the harness is 05/06's)**:
-- A new server: `isshoni setup-url` → the wizard creates the admin → the connection-test step renders → copy the
-  invite link.
-- In a second browser context, open the invite → the form → land in Lounge.
-- Approval mode round trip (request → admin approves → login).
-- Logout, and "log out everywhere" as seen from the other context (its WebSocket closes and it redirects to login).
-- An admin reset link used in a third context.
-- Mobile viewport (iPhone and Pixel profiles): login and invite sign-up.
-- axe checks on the login, invite, setup and reset pages.
+**E2E**: 03 owns no browser specs. Its flows run in 05's Playwright specs (05 §19.3):
+- `setup.spec`: `isshoni setup-url` → the wizard creates the admin → the connection-test step → the invite link;
+- `invite.spec`: a second browser context opens the invite, signs up and lands in Lounge;
+- `admin.spec`: the approval mode round trip (a pending sign-up → the admin approves);
+- `a11y.spec`: axe on the login, invite and setup pages, and the reset page too (a one-line addition in 05).
+
+The rest is covered below the browser: the admin reset link, logout and "log out everywhere" by the integration tests
+above; "a logout in tab A redirects tab B" by S33's component test; and mobile sign-up by 05's manual checks M-IOS-1
+(invite → sign-up on an iPhone) and M-AND-1.
 
 ---
 
@@ -2321,25 +2509,30 @@ SPA removes the fragment right after reading it (05).
   strings); `store.DefaultRoomID = "lounge"`; `store.Role` (`admin`|`user`); `store.RegistrationMode`.
 - **Store**:
   - `store.Open(ctx, store.Options{Path, BackupDir, AppVersion, Readers, Clock, Logger}) (*store.DB, error)`;
-  - `*store.SchemaTooNewError{DBVersion, BinaryVersion, LastAppVersion, Backup}`;
-  - `(*DB).Read`, `Write`, `Ping`, `QuickCheck`, `SchemaVersion`, `Stats`, `BackupTo`, `Prune`, `Settings`;
+  - `*store.SchemaTooNewError{DBVersion, BinaryVersion, LastAppVersion, Backup}` and `store.ErrNeedsOperator` (04:
+    exit 78 exactly when `errors.Is(err, store.ErrNeedsOperator)`);
+  - `store.LatestSchemaVersion`, `store.InspectFile`, `store.FileInfo` and `store.BackupFile` (04: offline backup,
+    restore validation and offline doctor);
+  - `(*DB).Read`, `Write`, `Ping`, `QuickCheck`, `SchemaVersion`, `Stats`, `BackupTo`, `Prune`, `Settings`, `Close`;
+  - `(*Q).ListUsers` and `store.UserRow` (04: admin socket `GET /v1/users`, fields id, username, role, status,
+    createdAt, lastSeenAt);
   - `(*Q).RoomByID`, `ListRooms` (01: room.join validation);
   - `(*Q).ListPushSubscriptions(PushFilter)`, `RecordPushResult`, `DeletePushSubscriptionByID`,
     `DeleteAllPushSubscriptions`, `PrunePushSubscriptions`, `PushPreferences` (04: sender);
   - `(*Q).AddTransfer`, `TransferMonth`, `GetMeta`, `SetMeta` (04: transfer accounting and ops state);
   - `store.Room`, `store.PushSubscription`, `store.PushPreferences`, `store.Actor`, `store.CLIActor`.
-- **Settings**: `store.Settings` with its JSON field names; `(*SettingsCache).Get`, `OnChange`, `Pin`, `Update`,
-  `Locked`. Consumers: `MaxParticipantsPerRoom`, `MaxSharesPerRoom`, `MaxShareBitrateKbps` and `MinClientVersion`
-  (01, through `Deps.Policy`); `MaxShareBitrateKbps` (02, through `SetLimits`); `UpdateCheck`, `TransferAlertGB` and
-  `ServerName` (04); `SetupWizardDone` (05).
+- **Settings**: `store.Settings` with its JSON field names; `(*SettingsCache).Get`, `Defaults`, `OnChange`, `Pin`,
+  `Update`, `Locked`. Consumers: `MaxParticipantsPerRoom`, `MaxSharesPerRoom`, `MaxShareBitrateKbps` and
+  `MinClientVersion` (01, through `Deps.Policy`); `MaxShareBitrateKbps` (02, through `SetLimits`); `UpdateCheck`,
+  `TransferAlertGB` (04, through the wiring's `ops.Policy`); `SetupWizardDone` (05).
 - **Auth**:
   - `auth.New(ctx, db, auth.Options{Keys, Origins, ClientIP, Conns, Alerts, Argon, Clock, Logger})`;
   - `auth.Keys{Session, Invite}` and `auth.Origins{Primary, Public}`;
   - `auth.Principal{UserID, Username, Role, Method, SessionID, DeviceID, ClientKind}`, `auth.MethodSession`,
     `auth.MethodBearer`;
-  - `(*Service).Authenticate(r)`, `Touch(ctx, p, ip)`, `SetupAvailable(ctx)`,
-    `IssueSetupToken(ctx, actor)`, `IssuePasswordReset`, `UpdateUser`, `CreateInvite`, `UserByUsername`,
-    `RunJanitor(ctx)`;
+  - `(*Service).Authenticate(r)`, `(*Service).AuthenticateCookie(r)` and `auth.ErrNoCookie`, `Touch(ctx, p, ip)`,
+    `SetupAvailable(ctx)`, `IssueSetupToken(ctx, actor)`, `IssuePasswordReset`, `UpdateUser`, `CreateInvite`,
+    `UserByUsername`, `RunJanitor(ctx)`;
   - `auth.ConnCloser{CloseConnections(ConnSelector, reason) int}`, `auth.ConnSelector`, and the `auth.Reason*` codes;
   - `auth.AdminAlerter{AdminAlert(ctx, AdminAlert)}`, `auth.AdminAlert{Kind, Actor, Target, At}`, and the alert kinds
     in §7.11.
@@ -2366,7 +2559,7 @@ SPA removes the fragment right after reading it (05).
   adapts to `auth.ConnCloser` and `httpapi.Signal` (01 §15.2, §15.4). The hub closes connections with
   `error{session_revoked|account_disabled, retryable: false}`; clients of a deleted room rejoin the default room.
 - The hub owns the WebSocket Origin check, the pre-auth limits and `websocket.Accept`; it calls the wiring's
-  `Authenticator` (over `Authenticate` and `Touch`) at connect and every 5 min.
+  `Authenticator` (over `AuthenticateCookie` and `Touch`) at connect and every 5 min.
 - *Later (M2)*: bearer tokens arrive in `hello.auth` only (01 D2).
 - 01 reads `MinClientVersion`, `MaxParticipantsPerRoom`, `MaxSharesPerRoom` and `MaxShareBitrateKbps` through the
   wiring's `Deps.Policy`, and uses string user and room ids.
@@ -2381,19 +2574,24 @@ SPA removes the fragment right after reading it (05).
   → `ClientIP`.
 - `secrets.json` provides 32-byte `session` and `invite` keys; `rotate-secrets` replaces them and restarts the server,
   so §4.6's startup check purges the affected rows.
-- Startup: `store.Open` runs before the listeners. 04 prints `SchemaTooNewError` and exits with 78; `admin restore
-  --offline` accepts a pre-migration `.db` file.
+- Startup: `store.Open` runs before the listeners. 04 prints this doc's message and exits with 78 exactly when
+  `errors.Is(err, store.ErrNeedsOperator)`, and with 1 otherwise; `admin restore --offline` accepts a pre-migration
+  `.db` file. Offline backup, restore validation and offline doctor use `BackupFile`, `InspectFile` and
+  `LatestSchemaVersion`, which `cmd/isshoni` and the wiring pass to 04 as functions.
 - Wiring (04 §6.6):
-  - `auth.New` gets the push service (adapted) as `AdminAlerter`, and `RunJanitor` runs under `serve`;
+  - `auth.New` runs after `push.New` (its VAPID check) and gets the push service (adapted) as `AdminAlerter`, and
+    `RunJanitor` runs under `serve`;
   - the adapters for `auth.ConnCloser`, `httpapi.Signal` and 01's `Authenticator`/`RoomDirectory`/`Policy`;
   - `httpapi.API` is mounted at `/api/v1/` behind 04's global chain, and 04's REST routes register through
     `API.Handle`;
   - `/readyz` uses `db.Ping`;
   - the SPA handler returns 404 for `/setup` when `SetupAvailable` is false;
   - the global security headers (04 §9.6) and the JSON helpers (`WriteJSON`, `WriteError`, `DecodeJSON`).
-- The Web Push service implements `httpapi.Push` (VAPID key, `ValidateEndpoint` with a DNS check and private-IP
-  refusal, `SendTest`) and `auth.AdminAlerter`. It sends "X started streaming" using `ListPushSubscriptions` with
-  `Pref: "share_started"`, and deletes subscriptions on 404/410/401/403.
+- The wiring's adapter over 04's push service implements `httpapi.Push` (it converts `store.PushSubscription` to
+  `push.Subscription`): the VAPID key, `ValidateEndpoint` (every URL and host rule of §12.4.6, including the DNS
+  check and private-address refusal) and `SendTest`. The push service, adapted, is also `auth.AdminAlerter`. It
+  sends "X started streaming" using `ListPushSubscriptions` with `Pref: "share_started"`, and deletes
+  subscriptions on 404/410/401/403.
 - 04 provides an `InfoSource` and owns the admin dashboard endpoint, which embeds `DashboardAccounts`.
 - Doctor uses `QuickCheck` and `Stats`. The admin socket commands map as in §12.6. Backup and restore cover the DB,
   `secrets.json` and certs together, because tokens are only valid with the matching keys.
@@ -2408,9 +2606,8 @@ SPA removes the fragment right after reading it (05).
 - It reads fragment tokens and removes them with `history.replaceState`.
 - It calls `GET /api/v1/me` at start (daily rotation) and upserts the push subscription at start; the VAPID key comes
   from `/info`.
-- Pages: `/setup`, `/invite`, `/signup`, `/reset`, `/login`, `/account` (sessions, devices, notifications and
-  preferences, password, delete account), `/admin/*` (users, approvals, invites, rooms, settings, audit, dashboard),
-  and `/link` in M2. The admin nav badge comes from `me.badges`.
+- Pages: the pages in 05 §5, including `/setup`, `/invite`, `/signup`, `/pending`, `/reset`, `/login`, `/account/*`
+  and `/admin/*`, plus `/link` in M2. The admin nav badge comes from `me.badges`.
 
 **docs/m1/06-deploy-and-ci.md**
 - The license gate allows `golang.org/x/text` (BSD) and the embedded SecLists subset (MIT, listed in
@@ -2429,7 +2626,8 @@ slice.
 
 1. **Store foundation**: `store.Open` (DSN, pools, WAL check), the migrator (bookkeeping, forward-only, FK
    procedure, history check), pre-migration backups and rotation, `SchemaTooNewError`, `0001_init.sql`, `meta`,
-   `EnsureDefaultRoom`, `Ping`, `QuickCheck`, `Stats`, `BackupTo`.
+   `EnsureDefaultRoom`, `Ping`, `QuickCheck`, `Stats`, `BackupTo`, `Close`, `ErrNeedsOperator`, and the file-level
+   `LatestSchemaVersion`, `InspectFile` and `BackupFile`.
    *Acceptance*: the store unit tests for migrations, backups, newer-schema refusal and constraints pass; a new DB has
    Lounge; `sqlite3 isshoni.db .schema` matches §5.
 2. **Store queries and pruning**: every M1 `*Q` method in §6 and `Prune`.
@@ -2440,15 +2638,15 @@ slice.
    *Acceptance*: the golden tests pass; the CSRF and Content-Type matrix tests pass; `/info` returns the §12.4.1 shape;
    every response has `no-store`.
 4. **Auth primitives**: token generation and keyed hashes, key fingerprints and purge, `NormalizeUsername`,
-   `CheckPassword` with the embedded list, the argon2 hasher (PHC, semaphore, dummy), the limiter, and
-   `DescribeUserAgent`.
+   `CheckPassword` with the embedded list, the argon2 hasher (PHC, semaphore, dummy), the limiter (with `auth-hash`),
+   and `DescribeUserAgent`.
    *Acceptance*: the auth unit tests for these parts, including fuzz targets running for 30 s in CI.
 5. **Settings**: `SettingsCache` (typed struct, validation, `Pin`, `OnChange`, audit), plus
    `GET/PATCH /admin/settings` (behind a temporary admin fixture).
    *Acceptance*: the settings unit and integration tests.
    *Depends on*: 2, 3.
-6. **Sessions and login**: `Authenticate`, the cookie helpers, `MaybeRotate`, the cache, `Touch`; `login`, `logout`
-   and `me`, with throttles and audit.
+6. **Sessions and login**: `Authenticate`, `AuthenticateCookie`, the cookie helpers, `MaybeRotate`, the cache,
+   `Touch`; `login`, `logout` and `me`, with throttles and audit.
    *Acceptance*: the login, rotation and throttle integration tests; the hasher counter proves there is no hashing
    while throttled.
    *Depends on*: 3, 4.
@@ -2471,8 +2669,8 @@ slice.
 11. **Rooms**: user and admin room endpoints, `showRoomList`, the Signal hooks and presence counts.
     *Acceptance*: the rooms integration tests.
     *Depends on*: 6.
-12. **Push subscriptions and preferences**: subscribe (upsert and validation), list, unsubscribe, delete, test
-    (this session), `GET/PUT /push/preferences`.
+12. **Push subscriptions and preferences**: subscribe (upsert and validation), unsubscribe, test (this session),
+    `GET/PUT /push/preferences`.
     *Acceptance*: the push integration tests with a fake `Push`; preferences round-trip and filter
     `ListPushSubscriptions(Pref)`.
     *Depends on*: 6.

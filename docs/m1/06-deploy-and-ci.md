@@ -119,7 +119,7 @@ Not root: the script prefixes privileged commands with `sudo` (which asks on the
 | `--yes`, `-y` | `ISSHONI_YES=1` | Never ask; take every default, which includes opening firewall ports |
 | `--no-firewall` | `ISSHONI_NO_FIREWALL=1` | Never touch the firewall |
 | `--firewall` | | Offer the firewall step again on an upgrade |
-| `--no-start` | | Install only: no start, no certificate, no setup link |
+| `--no-start` | | Install only: no start, no certificate, no setup link. Running the installer again later without it does the first start (4.2) |
 | `--allow-downgrade` | | Allow an older version (restore a matching backup first; section 4.10) |
 | `--reinstall` | | Reinstall the same version (repairs the binary) |
 | `--uninstall` | | Remove isshoni and keep its config, data and user |
@@ -129,7 +129,9 @@ Not root: the script prefixes privileged commands with `sudo` (which asks on the
 | | `ISSHONI_TLS_ACME_EMAIL` | Optional ACME account e-mail (04's key `tls.acme_email`) |
 | | `ISSHONI_DOWNLOAD_BASE` | Mirror of `https://github.com/MoonWX/isshoni/releases`. **Signatures are still checked against the embedded key** |
 
-Flags win over env. Unknown flags → exit 2.
+Flags win over env. Unknown flags → exit 2. `--tls-mode off` (or `ISSHONI_TLS_MODE=off`) without
+`ISSHONI_PUBLIC_URL` → exit 2: "off mode needs ISSHONI_PUBLIC_URL=https://your.domain". The installer never writes
+an off-mode config without a public URL.
 
 **Exit codes**
 
@@ -158,20 +160,40 @@ main
  └─ install
       IV := installed version (`/usr/local/bin/isshoni version --short`, empty if none)
       TV := --version > ISSHONI_VERSION > stamped version > latest (4.3)
-      IV = TV, no --reinstall ──► repair (unit, sysctl) ─► ensure running ─► status ─► exit 0
+      STARTED := `systemctl is-enabled --quiet isshoni` succeeds (an earlier run got as far as the start)
       IV > TV, no --allow-downgrade ──► exit 6
-      fetch + verify (4.3) ────────────────────────── fail ─► exit 3 (nothing changed)
-      install binary (.new → version check → mv), user, dirs, unit, sysctl, firewall profiles (4.4–4.7)
-      fresh (no config)? ─► the one question (4.8) ─► `isshoni config init` ─► doctor pre-check
+      IV = TV, no --reinstall, STARTED ──► repair (unit, sysctl) ─► ensure running ─► wait ready (4.10; timeout
+          ─► exit 5) ─► setup-url: link + QR, or "Setup is already done. Open https://host/" ─► exit 0
+      IV ≠ TV or --reinstall:
+          fetch + verify (4.3) ───────────────────────── fail ─► exit 3 (nothing changed)
+          install binary (.new → version check → mv)
+      user, dirs, unit, sysctl, firewall profiles (4.4–4.7)
+      no config? ─► the one question (4.8) ─► `isshoni config init` ─► doctor pre-check ── cancel ─► exit 8 (4.8)
+      --no-start ─► "Installed. Run this installer again to start isshoni." ─► exit 0
       port check (4.9) ──────────────────────────────── conflict ─► exit 7
-      fresh or --firewall ─► firewall offer (4.9)
-      daemon-reload ─► enable + start (fresh) | restart (upgrade)
-      wait ready (4.10) ─────────────────────────────── timeout ─► diagnostics ─► exit 5
-      fresh ─► setup link + QR │ upgrade ─► "Upgraded IV → TV" │ admin exists ─► "Open https://host/"
+      not STARTED (first start) ─► firewall offer (4.9) ─► daemon-reload ─► enable --now
+      STARTED (upgrade, --reinstall) ─► firewall offer only with --firewall ─► daemon-reload ─► restart
+      wait ready (4.10) ─────────────────────────────── timeout ─► diagnostics ─► "Fix the problem above,
+                                                          then run this installer again." ─► exit 5
+      first start ─► setup link + QR │ upgrade ─► "Upgraded IV → TV" │ admin exists ─► "Open https://host/"
 ```
 
 Order matters: the firewall step runs **before** the start, so Let's Encrypt can reach ports 80/443 on the first try.
 The doctor pre-check runs before the start, so a DNS mistake doesn't burn Let's Encrypt's failed-validation limit.
+
+**Re-runs finish the job.** Whether the first-start tail runs (port check, firewall offer, `enable --now`, ready
+wait, setup link) is decided by "unit not enabled", never by "no config" and never by IV. A run that stopped before
+the start leaves the unit disabled, so running the installer again, with the same version, picks up where it
+stopped:
+- after exit 7 (port conflict): the config from the first run is kept, so there is no question; the port check runs
+  again, then the firewall offer, the start and the setup link;
+- after exit 8 at the pre-check prompt, or after `--no-start`: as above, and after exit 8 the question is asked
+  again (that run's config was deleted, 4.8);
+- after `--uninstall` (C9): the binary is fetched again, the kept config is used, and the start runs; `setup-url`
+  exits 7, so the script prints "Setup is already done. Open https://<host>/".
+
+After exit 5 the unit is already enabled, so a re-run takes the repair branch. That branch also ends with the ready
+wait and `setup-url` (4.10), so once the admin has fixed the cause, the re-run prints the setup link.
 
 ### 4.3 Download and verification (fail closed)
 
@@ -259,6 +281,7 @@ User=isshoni
 Group=isshoni
 # Relative on purpose: systemd searches /usr/local/bin (install.sh) then /usr/bin (deb/rpm).
 ExecStart=isshoni serve --config /etc/isshoni/isshoni.toml
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=3
 # 78 = config error or database schema newer than this binary: restarting can't help.
@@ -311,6 +334,11 @@ Why these settings:
 - **`RestartPreventExitStatus=78`**: 04 exits 78 for every state a restart can't fix (invalid config, newer DB schema,
   failed migration, corrupt DB or secrets; 04 §6.3).
 - **`SystemCallErrorNumber=EPERM`**: a filtered syscall returns an error instead of killing the process.
+- **`ExecReload`**: `systemctl reload isshoni` sends SIGHUP, which re-reads manual TLS files and `log.level`
+  (04 §6.5). Everything else needs `systemctl restart isshoni`.
+- **`ProtectClock=yes`** (and `@system-service`) also blocks the read-only `adjtimex` call, so the server-side doctor
+  can't read the kernel's clock-sync flag. 04's `clock` check then treats the sync state as unknown and relies on the
+  Date-header skew check (04 §13.2). Don't relax `ProtectClock` for this.
 - **`ConfigurationDirectory` keeps the default mode 0755**: the config file itself is 0640 root:isshoni.
 - **Target score**: `systemd-analyze security isshoni` should report an exposure of 2.5 or less. Slice S5 records the
   real number, and CI fails if a change raises it by more than 0.2.
@@ -360,8 +388,8 @@ admin sees in `ufw status`.
 
 ### 4.8 The one question, and the config file
 
-Asked only on a fresh install (no `/etc/isshoni/isshoni.toml`) and when neither `--domain`, `--ip` nor
-`--tls-mode` was given. It is read from `/dev/tty`, because stdin is the piped script. With no TTY and no
+Asked only when there is no `/etc/isshoni/isshoni.toml` (a fresh install, or a re-run after a cancel, 4.2) and
+when neither `--domain`, `--ip` nor `--tls-mode` was given. It is read from `/dev/tty`, because stdin is the piped script. With no TTY and no
 `--yes` → exit 2: "Non-interactive install: pass --domain NAME or --ip".
 
 ```
@@ -388,12 +416,28 @@ isshoni config init --path … --tls.mode manual --domain … --tls.cert-file �
 The flags are 04's config flags (04 §4.2: `--` plus the key path with `_` → `-`). Then `chown root:isshoni` and
 `chmod 0640`. `config init` refuses to overwrite an existing file (exit 7).
 
-**Pre-check.** `isshoni doctor --config /etc/isshoni/isshoni.toml --only dns,public_ip,clock` (offline mode, 04 §13.1)
-prints its own human-readable text.
+**Env isolation.** After `parse_args`, the script copies what it needs from `ISSHONI_*` variables into its own
+variables and runs `unset` on every `ISSHONI_*` name it reads, and on any other `ISSHONI_*` variable found with
+`env`. `config init`, `doctor`, `healthcheck` and `setup-url` therefore see only the config file, never a stray
+variable from the admin's shell. `config init` takes its values from flags only and validates the result before
+writing.
+- `config init` exit 78 (invalid values, e.g. a private IP in IP mode): nothing was written. Print its message, then
+  ask the question again (interactive) or exit 2 (non-interactive).
+
+**Pre-check.** `isshoni doctor --config /etc/isshoni/isshoni.toml --only dns,public_ip,clock,firewall_hint`
+(offline mode, 04 §13.1) prints its own human-readable text.
+- `firewall_hint` is DMI-based and works offline. On a detected provider it prints that provider's cloud-firewall
+  steps and the `/install/vps#<provider>` link **before** the start, so the admin can open 80/443 before Let's
+  Encrypt tries. It only prints: no extra prompt.
 - Exit 0: go on (warnings are printed and don't block).
 - Exit 5 (a `fail`, e.g. "share.example.com points to 198.51.100.4 but this server is 203.0.113.7"): ask
   "[R]e-enter the domain, use the [I]P instead, or [C]ontinue anyway?", default R. With `--yes` → continue, with a
   warning.
+- On R and I, the script deletes the `/etc/isshoni/isshoni.toml` it created in this run (never a file that existed
+  before), calls `config init` again with the new answer and repeats the pre-check.
+- **Cancel** (Ctrl-C or end of input at this prompt, exit 8) also deletes the config created in this run, like R and
+  I. The next run then asks the question again (4.2). A port conflict (exit 7) keeps the config: the answer was
+  fine, only the port was busy.
 
 ### 4.9 Ports in use, and the firewall offer
 
@@ -404,11 +448,12 @@ prints its own human-readable text.
   ```
   Port 443 is used by nginx (pid 812). isshoni needs ports 80 and 443.
   Either stop nginx, or run isshoni behind it:
-    curl -fsSL https://moonwx.github.io/isshoni/install.sh | sh -s -- --tls-mode off
+    curl -fsSL https://moonwx.github.io/isshoni/install.sh | ISSHONI_PUBLIC_URL=https://share.example.com sh -s -- --tls-mode off
   Guide: https://moonwx.github.io/isshoni/install/reverse-proxy
   ```
 
-**Firewall offer** (fresh install or `--firewall`; skipped by `--no-firewall`; default answer Yes; `--yes` accepts):
+**Firewall offer** (first start, i.e. unit not enabled (4.2), or `--firewall`; skipped by `--no-firewall`; default
+answer Yes; `--yes` accepts):
 
 | Detected | Offer | Action |
 |---|---|---|
@@ -419,30 +464,37 @@ prints its own human-readable text.
 
 - **An inactive ufw or firewalld is never enabled**, because that could lock the admin out of SSH.
 - **Always printed at the end:** "If your provider has a cloud firewall (AWS, Google Cloud, Azure, Oracle, …), open
-  the same ports there: https://moonwx.github.io/isshoni/install/vps". The browser connection test in the setup
+  the same ports there: https://moonwx.github.io/isshoni/install/vps". The provider-specific steps were already
+  printed before the start by the pre-check's `firewall_hint` (4.8). The browser connection test in the setup
   wizard (`05`) is the real reachability check.
 
 ### 4.10 Start, certificate wait, setup link, upgrade
 
 **Start.**
 - `systemctl daemon-reload`.
-- Fresh install: `systemctl enable --now isshoni`.
+- First start (unit not enabled, 4.2) with effective TLS mode `auto` or `ip`: first print one line (a notice, not a
+  question; also printed with `--yes`): "isshoni gets its certificate from Let's Encrypt. Using it means you accept
+  the Let's Encrypt Subscriber Agreement: https://letsencrypt.org/repository/".
+- First start: `systemctl enable --now isshoni`.
 - Upgrade: `systemctl restart isshoni` (signaling reconnect covers clients: `01`/`04`).
-- Repair (same version): restart only if the unit or the binary changed.
+- Repair (same version, unit enabled): restart only if the unit or the binary changed. If it isn't active:
+  `systemctl reset-failed isshoni` (a unit that exited 78 or hit `StartLimitBurst` won't start otherwise), then
+  `systemctl start isshoni`.
 
-**Wait.**
+**Wait** (every path that starts or keeps the server: first start, upgrade and repair).
 - Poll `isshoni healthcheck --ready` (04: exit 0 ready, 1 not ready or unreachable). Ready means DB, TLS
   certificate, media sockets and the hub, per the plan.
-- Every 2 s, for at most 180 s on a fresh install and 120 s on an upgrade.
+- Every 2 s, for at most 180 s on a first start and 120 s on an upgrade or repair.
 - Every 10 s it prints `Waiting for the HTTPS certificate… (20 s)`.
 - After 30 s it adds: "Let's Encrypt must reach this server on port 80 or 443. Check your provider's firewall."
-- On timeout: the last 30 lines of `journalctl -u isshoni --no-pager`, the full `isshoni doctor` output, and the
-  links to troubleshooting → exit 5.
+- On timeout: the last 30 lines of `journalctl -u isshoni --no-pager`, the full `isshoni doctor` output, the links
+  to troubleshooting, and as the last line "Fix the problem above, then run this installer again." → exit 5. The
+  unit stays enabled, so the re-run takes the repair branch, waits again and prints the setup link (4.2).
 
-**Setup link** (fresh install).
+**Setup link** (first start and repair; an upgrade prints "Upgraded IV → TV" instead).
 - Runs `isshoni setup-url` with `--qr` when stdout is a TTY.
-- Exit 7 from `setup-url` means an admin already exists: print "Setup is already done. Open https://<host>/". Exit 4
-  means the server isn't reachable (diagnostics, exit 5).
+- Exit 0: the link is printed (below). Exit 7 from `setup-url` means an admin already exists: print "Setup is already
+  done. Open https://<host>/". Exit 4 means the server isn't reachable (diagnostics, exit 5).
 
 ```
 isshoni 0.1.0 is running.
@@ -456,15 +508,19 @@ isshoni 0.1.0 is running.
 ```
 
 **Upgrade rules.**
-- The server itself writes `backups/pre-<ver>-<ts>.db` before migrating (`03`/`04`).
+- The server itself writes `backups/pre-<schema>-<ts>.db` before migrating (`03`/`04`). `<schema>` is the schema
+  version before migrating, e.g. `pre-3-20261014T021500Z.db` (03 §4.4).
 - The installer never edits an existing config and never re-asks the question.
 - Firewall again only with `--firewall`.
 - **No automatic rollback.** After a migration the old binary refuses the newer schema, so an automatic binary
   rollback would only produce a second failure.
-- On exit 5 after an upgrade, the script prints the manual rollback:
+- On exit 5 after an upgrade, the script prints the manual rollback with the exact file:
   `sudo systemctl stop isshoni && sudo -u isshoni isshoni admin restore --offline
-  /var/lib/isshoni/backups/pre-<schema>-<ts>.db` (04 §12.4 accepts a pre-migration DB file), then re-run the
-  installer with `--version <old> --allow-downgrade`.
+  /var/lib/isshoni/backups/pre-3-20261014T021500Z.db` (04 §12.4 accepts a pre-migration DB file), then re-run the
+  installer with `--version <old> --allow-downgrade`. The script finds that file itself, with privilege (the
+  directory is `isshoni` 0700, so an unprivileged shell can't expand the glob): the newest match of
+  `ls -t /var/lib/isshoni/backups/pre-*.db`, run through its `sudo` prefix. If there is none (this upgrade didn't
+  migrate), it prints only the `--version <old> --allow-downgrade` step.
 
 **Version comparison** is SemVer, implemented in awk:
 - `X.Y.Z` is compared numerically;
@@ -484,13 +540,18 @@ isshoni 0.1.0 is running.
    - firewalld: `--permanent --remove-service=isshoni`, reload, remove the XML;
    - iptables: delete the rules tagged `isshoni` and save.
 5. Print: "Kept: /etc/isshoni (config), /var/lib/isshoni (database, certificates, backups) and the isshoni user.
-   Remove them with --purge. Back up first with: sudo isshoni admin backup --out <file> (while it runs)".
+   Remove them with --purge. Before --purge, back up with `sudo isshoni admin backup --out <file>` while isshoni is
+   installed and running (run this installer again to bring it back)." It can't offer a backup command for right
+   now: at this point the service is stopped and the binary deleted, and an offline backup refuses to run as root
+   (04 §12.6).
 
 **`--purge`**:
 - Asks for `purge` to be typed; `--yes` skips the question.
 - Runs uninstall, then `rm -rf /etc/isshoni /var/lib/isshoni /run/isshoni`, then `userdel isshoni` and
   `groupdel isshoni` if the group still exists.
-- It does **not** make a backup; the prompt says so and shows the backup command.
+- It does **not** make a backup; the prompt says so and shows `sudo isshoni admin backup --out <file>`. The prompt
+  comes before uninstall step 1, while the server still runs, so that command works; any answer but `purge` exits 8
+  with nothing changed.
 
 If isshoni was installed from a package, both refuse and print `apt remove isshoni` / `dnf remove isshoni`.
 
@@ -508,9 +569,12 @@ If isshoni was installed from a package, both refuse and print `apt remove issho
     dies when there is none), `confirm`\*;
   - `parse_args`\*, `preflight`, `detect_arch`\*, `detect_distro`, `need_ssh_keygen`, `downloader`, `download`;
   - `resolve_version`\*, `version_cmp`\*, `normalize_domain`\*, `checksum_for`\*, `verify_release`\*;
-  - `install_binary`, `ensure_user`, `install_unit`, `apply_sysctl`, `install_fw_profiles`, `write_config`,
-    `doctor_precheck`, `check_ports`\* (parses `ss` output), `offer_firewall`, `start_or_restart`, `wait_ready`,
-    `print_setup`;
+  - `install_binary`, `ensure_user`, `install_unit`, `apply_sysctl`, `install_fw_profiles`, `write_config` (calls
+    `config init` with flags only, after `ISSHONI_*` is unset; on a pre-check R or I it deletes the file it created
+    in this run and calls `config init` again, and on a cancel there it deletes that file and exits 8; 4.8),
+    `doctor_precheck`, `is_started` (`systemctl is-enabled --quiet isshoni`, 4.2), `check_ports`\* (parses `ss`
+    output), `offer_firewall`, `start_or_restart`, `wait_ready`, `print_setup`, `newest_premigration_backup`
+    (privileged `ls -t`, 4.10);
   - `do_uninstall`, `do_purge`, `main`.
 - **Output.** Colors only when stdout is a TTY and `NO_COLOR` is unset. No emoji. Every error says what to do next.
 - **Never** logs the setup token anywhere but stdout. Never writes it to a file.
@@ -618,6 +682,7 @@ CMD ["serve"]
 ```yaml
 # isshoni. Start: docker compose up -d   Then: docker compose exec isshoni isshoni setup-url
 # Put ISSHONI_DOMAIN=share.example.com in a .env file next to this file, or leave it empty for an IP certificate.
+# isshoni gets its certificate from Let's Encrypt. Using it means you accept the Let's Encrypt Subscriber Agreement: https://letsencrypt.org/repository/
 # Docs: https://moonwx.github.io/isshoni/install/docker
 name: isshoni
 services:
@@ -649,6 +714,9 @@ volumes:
   data:
 ```
 
+- **Empty means unset.** An empty `ISSHONI_*` value counts as unset (04 §4.2), so leaving `ISSHONI_DOMAIN`/
+  `ISSHONI_PUBLIC_IP` out of `.env` (or having no `.env` at all) gives an IP certificate and STUN detection. To set a
+  key to the empty string, use a mounted config file or a flag.
 - **Non-root on 443 in bridge mode.** Docker sets `net.ipv4.ip_unprivileged_port_start=0` inside container network
   namespaces (Docker ≥ 20.10), so the nonroot user binds 80/443 with `cap_drop: [ALL]`.
 - **Public IP.** The container sees a 172.x address, so the server advertises the public IP from STUN or
@@ -689,10 +757,17 @@ services:
 ```
 
 - **Why a bind mount and not the named volume.** Root with `cap_drop: [ALL]` has no `CAP_DAC_OVERRIDE`, so it can't
-  write into the image's 65532-owned `/var/lib/isshoni`. A root-owned host directory avoids that. (It is the same path
-  as a systemd install, so don't run both on one host.)
-- **Switching modes** needs a one-time copy. The docs give the `docker run --rm -v isshoni_data:/from -v
-  /var/lib/isshoni:/to …` command using a throwaway image, which is fine because it isn't shipped.
+  write into the image's 65532-owned `/var/lib/isshoni`. A root-owned host directory avoids that. It is the same path
+  as a systemd install; a second server on the same data directory refuses to start (04 §5.1 lock).
+- **Switching modes** needs a one-time copy, with the old containers stopped. The docs give this command, using a
+  throwaway image, which is fine because it isn't shipped:
+
+  ```
+  docker run --rm -v isshoni_data:/from -v /var/lib/isshoni:/to alpine sh -c 'cp -a /from/. /to/ && chown -R 0:0 /to'
+  ```
+
+  The `chown` is required: host mode runs as root without `CAP_DAC_OVERRIDE` and can't write the copied 65532-owned
+  0700 directory. For the reverse direction (host → bridge), swap the mounts and end with `chown -R 65532:65532 /to`.
 - **The host firewall applies** in host mode (no Docker iptables rules), so the ufw/firewalld steps from 4.9 apply.
 - **Why not non-root plus `cap_add`?** Docker doesn't give ambient capabilities to a non-root user, and file
   capabilities are blocked by `no-new-privileges`.
@@ -712,11 +787,77 @@ services:
   - setup link: `docker compose exec isshoni isshoni setup-url`;
   - doctor: `docker compose exec isshoni isshoni doctor`;
   - backup to the host: `docker compose exec -T isshoni isshoni admin backup --out - > isshoni-backup.tar.gz`;
-    restore: `docker compose exec -T isshoni isshoni admin restore - < isshoni-backup.tar.gz` (04 §12.3–§12.4);
+    restore: `docker compose exec -T isshoni isshoni admin restore --yes - < isshoni-backup.tar.gz` (04 §12.3–§12.4).
+    `--yes` is required: `-T` gives no TTY and stdin carries the archive, so no confirmation can be read. Without it
+    the CLI refuses and prints this exact command. `task docker:smoke` runs it (11.3), so the docs can't drift;
   - when the server refuses to start (exit 78, e.g. a newer DB schema after a downgrade): `docker compose stop`,
     `docker compose run --rm isshoni admin restore --offline /var/lib/isshoni/backups/<file>`, `docker compose up -d`
-    (04 §6.3);
+    (04 §6.3). `docker compose stop` comes first because the offline restore refuses (exit 7) while any container
+    still holds the data directory (04 §5.1 lock);
   - logs: `docker compose logs -f` (JSON under Docker, per the plan).
+- **Ports 80/443 already taken** by nginx, Caddy or Traefik on the host: `compose.yaml` fails with "port is already
+  allocated". The page links to the Docker section of `/install/reverse-proxy` (6.5).
+
+### 6.5 Docker behind the host's reverse proxy (`/install/reverse-proxy#docker`)
+
+For hosts where a proxy already owns 80/443. The page gives a **complete compose file**, used instead of
+`compose.yaml`, not a merge override: a compose override can't remove the base file's 80/443 mappings (only with
+`!override`, Compose ≥ 2.24.4).
+
+```yaml
+# isshoni behind your own reverse proxy on this host. Your proxy forwards https://share.example.com to 127.0.0.1:8080.
+# Put ISSHONI_PUBLIC_URL=https://share.example.com in a .env file next to this file.
+# Docs: https://moonwx.github.io/isshoni/install/reverse-proxy#docker
+name: isshoni
+services:
+  isshoni:
+    image: ghcr.io/moonwx/isshoni:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080/tcp" # plain HTTP for the proxy on this host only; never publish it on all addresses
+      - "7882:7882/udp"           # media, direct (not through the proxy)
+      - "7882:7882/tcp"           # ICE-TCP, direct (443 belongs to the proxy)
+    environment:
+      ISSHONI_TLS_MODE: "off"
+      ISSHONI_PUBLIC_URL: ${ISSHONI_PUBLIC_URL:?set ISSHONI_PUBLIC_URL=https://your.domain in .env}
+      ISSHONI_LISTEN_HTTP: 0.0.0.0:8080                  # inside the container; the mapping above keeps it on loopback
+      ISSHONI_NETWORK_TRUSTED_PROXIES: 172.30.89.0/24    # this file's network: the proxy's connections arrive from its gateway
+      ISSHONI_PUBLIC_IP: ${ISSHONI_PUBLIC_IP:-}          # empty: detected with STUN
+    networks: [isshoni]
+    volumes:
+      - data:/var/lib/isshoni
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run/isshoni:uid=65532,gid=65532,mode=0750
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+networks:
+  isshoni:
+    ipam:
+      config:
+        - subnet: 172.30.89.0/24   # fixed, so ISSHONI_NETWORK_TRUSTED_PROXIES can name it; any free private /24 works
+volumes:
+  data:
+```
+
+- **Why `0.0.0.0:8080` inside, `127.0.0.1` outside.** Off mode listens on loopback by default (04), which a published
+  port can't reach inside the container. Publishing on `127.0.0.1` keeps plain HTTP off the internet.
+- **Why the trusted range is the compose network.** The host proxy's connections reach the container through
+  Docker's port forwarding, so the TCP peer is the network's gateway (`172.30.89.1`), not `127.0.0.1`. Without
+  that range in `network.trusted_proxies`, client IPs are wrong and `X-Forwarded-Proto` is ignored (04 §8.5). Only
+  isshoni, and a proxy container you attach (below), sit on this network, so trusting the /24 trusts nobody else.
+- **A proxy that runs in Docker too** joins this network (`networks: isshoni: { external: true, name:
+  isshoni_isshoni }` in its own compose file) and forwards to `http://isshoni:8080`; the `8080` mapping can then go.
+- The proxy config itself is the same as for a shell install in off mode (WebSocket upgrade for `/ws`, upstream
+  `127.0.0.1:8080`). ICE-TCP uses 7882 only, because the proxy owns 443 (04 §8.5), and 7882 must be open in the
+  cloud firewall. Published ports bypass ufw (6.4).
+- Operations (setup-url, doctor, backup, restore) are the same commands as in 6.4.
 
 ## 7. Development workflow
 
@@ -725,7 +866,7 @@ services:
 `.tool-versions` (read by mise and asdf):
 
 ```
-golang 1.26.5
+golang 1.27.<latest patch>
 nodejs 26.5.0
 task 3.<latest>
 golangci-lint 2.<latest>
@@ -737,8 +878,8 @@ actionlint 1.<latest>
 
 - `<latest>` means: pin the exact latest patch when slice S1 lands. Versions are bumped by hand, monthly, in one PR;
   Dependabot can't read `.tool-versions`.
-- `go.mod` has `go 1.26` and `toolchain go1.26.5`. CI reads the version from `go.mod`, not from `.tool-versions`, and
-  `task lint:pins` fails if the two differ.
+- `go.mod` has `go 1.26` and `toolchain go1.27.<same patch>` (the plan: language version 1.26, newest toolchain).
+  CI reads the version from `go.mod`, not from `.tool-versions`, and `task lint:pins` fails if the two differ.
 - Node's bundled npm (11.x) is used; `package.json` has `"engines": {"node": ">=26"}` and
   `"packageManager": "npm@<exact 11.x version>"`.
 
@@ -756,16 +897,37 @@ info" error when its Go version differs from the one in `PATH`.
 
 Task runs every command through its built-in POSIX shell, so the tasks work on macOS, Linux and Windows.
 
+**One version per build.** A top-level Task variable `VERSION` is the single version string of a build. Both halves
+get the same value: the Go binary as ldflags `version`, and the Vite build (and `vite dev`) as env
+`ISSHONI_VERSION`, which 05's `version-plugin.ts` writes into `web/dist/version.json`. A mismatch between the two
+would trigger 01's stale-build reload.
+
+```yaml
+vars:
+  DEV_VERSION:
+    sh: printf '0.0.0-dev+%s%s' "$(git rev-parse --short=12 HEAD)" "$(test -z "$(git status --porcelain)" || printf '%s' -dirty)"
+  VERSION: '{{.ISSHONI_VERSION | default .DEV_VERSION}}'
+```
+
+- Order: `task build VERSION=…` on the command line (a CLI variable wins over a global one), else env
+  `ISSHONI_VERSION` (CI, 8.2), else `0.0.0-dev+<12-char commit>`, plus `-dirty` when the working tree has changes.
+- A "dev build" is one whose SemVer prerelease starts with `dev` (04 §15). Local builds are dev builds; CI builds
+  (`0.0.0-ci.<run>`) and releases are not. A local `task release:snapshot` without `ISSHONI_SNAPSHOT_VERSION` is one
+  (`0.0.0-dev.<12-char commit>`).
+- **Exception: `task e2e`.** When `ISSHONI_VERSION` is unset, it passes `VERSION=0.0.0-e2e.local` to `build`. That is
+  a non-dev prerelease, so 05's `version.spec` (which needs a non-dev SPA, 8.2) passes on the Mac too, and the binary
+  and the SPA still share one version.
+
 | Task | Does | Notes |
 |---|---|---|
 | `setup` | `npm ci` in `web/` and `docs/`, `go mod download`, `task tools` | once per clone |
 | `setup:e2e` | `npx --prefix web playwright install chrome` | only for e2e |
 | `dev` | runs `dev:server` and `dev:web` in parallel | open http://localhost:5173 |
-| `dev:server` | `go run ./cmd/isshoni serve --config deploy/dev/isshoni.dev.toml` | restart by hand; optional `watchexec -r -e go -- task dev:server` |
-| `dev:web` | `npm --prefix web run dev` | Vite on 5173; proxies `/api` and `/ws` to 127.0.0.1:8080 (`05` owns `vite.config.ts`) |
+| `dev:server` | `go run -ldflags "-X github.com/MoonWX/isshoni/internal/version.version={{.VERSION}}" ./cmd/isshoni serve --config deploy/dev/isshoni.dev.toml` | restart by hand; optional `watchexec -r -e go -- task dev:server`. Same `VERSION` as `dev:web`, so dev never hits 01's stale-build reload |
+| `dev:web` | `npm --prefix web run dev` with env `ISSHONI_VERSION={{.VERSION}}` | Vite on 5173; proxies `/api` and `/ws` to 127.0.0.1:8080 (`05` owns `vite.config.ts`) |
 | `dev:setup-url` | `go run ./cmd/isshoni setup-url --config deploy/dev/isshoni.dev.toml` | first-run admin link |
-| `gen` | `.bin/tygo generate` (config `tygo.yaml`, content owned by `01`; both `internal/protocol` and `internal/protocol/api`), then `go run ./internal/protocol/gen/tsregistry -o web/src/protocol/registry.gen.ts` | |
-| `gen:check` | `gen`, then `git diff --exit-code -- web/src/protocol/` | the CI drift check |
+| `gen` | `deps: [tools]`; `.bin/tygo generate` (config `tygo.yaml`, content owned by `01`; both `internal/protocol` and `internal/protocol/api`), then `go run ./internal/protocol/gen/tsregistry -o web/src/protocol/registry.gen.ts` | |
+| `gen:check` | `gen`, then fail if `git status --porcelain -- web/src/protocol/` prints anything (changed or new untracked files) | the CI drift check |
 | `test` | `test:go`, `test:web`, `test:sh` | |
 | `test:go` | `CGO_ENABLED=1 go test -race -count=1 -timeout 15m ./...` | the race detector needs cgo; the shipped binary stays `CGO_ENABLED=0` |
 | `test:web` | `npm --prefix web test -- --run` | Vitest |
@@ -777,19 +939,21 @@ Task runs every command through its built-in POSIX shell, so the tasks work on m
 | `lint:actions` | `actionlint` | |
 | `lint:keys` | embedded block in `install.sh` = `deploy/keys/allowed_signers` | |
 | `lint:unit` | `systemd-analyze verify deploy/systemd/isshoni.service` (Linux only; skipped elsewhere) | |
-| `build:web` | `npm --prefix web run build` → `web/dist/` (plus `web/dist/licenses.txt`) | Task `sources`/`generates` make it a no-op when nothing changed |
-| `build` | `build:web`, then `go build -trimpath -ldflags "-X …/internal/version.version=… -X …commit=… -X …date=…" -o bin/isshoni ./cmd/isshoni` with `CGO_ENABLED=0` (04 §15) | fails if `web/dist/index.html` is missing |
-| `e2e` | `build`, then `npm --prefix web run e2e` with `ISSHONI_BIN=bin/isshoni` | Playwright, Chrome channel |
+| `build:web` | `npm --prefix web run build` with env `ISSHONI_VERSION={{.VERSION}}` → `web/dist/` (plus `web/dist/licenses.txt` and `version.json`) | Task `sources`/`generates` make it a no-op when nothing changed. A `status:` check next to them (a one-line `node -p` read of `web/dist/version.json`) makes it out of date whenever that file's `version` ≠ `{{.VERSION}}` |
+| `build:go` | `CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/MoonWX/isshoni/internal/version.version={{.VERSION}} -X github.com/MoonWX/isshoni/internal/version.commit=$(git rev-parse HEAD) -X github.com/MoonWX/isshoni/internal/version.date=$(git log -1 --format=%cI)" -o bin/isshoni ./cmd/isshoni` (04 §15) | Go only, no Node needed (CI's `build` job). Fails if `web/dist/index.html` is missing. The flags are identical in content to 9.2 (commit date, as goreleaser's `{{ .CommitDate }}` and `mod_timestamp`) |
+| `build` | `build:web`, then `build:go` | one `VERSION` for both |
+| `e2e` | `build` with `VERSION: '{{.ISSHONI_VERSION \| default "0.0.0-e2e.local"}}'`, then `npm --prefix web run e2e` with `ISSHONI_BIN={{.ROOT_DIR}}/bin/isshoni` | a non-dev version (see above). `ISSHONI_BIN` is absolute, because npm runs scripts from `web/`. Playwright, Chrome channel |
 | `licenses` | go-licenses check (3 GOOS) and `node web/scripts/licenses.mjs check` for `web/` and `docs/` | section 8.3 |
 | `notices` | `go -C tools run ./notices …` → `THIRD_PARTY_NOTICES` | section 8.4 |
-| `release:prepare` | `build:web`, `notices`, stamp `dist-extra/install.sh` (`VERSION=`) | goreleaser's before hook |
-| `release:snapshot` | `goreleaser release --snapshot --clean --skip=sign,sbom` | local dry run |
+| `release:prepare` | **no npm**: fails with "web/dist was built for X, not VERSION: run task build:web VERSION=…" unless `web/dist/version.json`'s `version` equals `VERSION` (read with `sed`, no Node); then `notices`, stamp `dist-extra/install.sh` (`VERSION=`) | goreleaser's before hook (`task release:prepare VERSION={{ .Version }}`, 9.2). The SPA comes from outside: the unprivileged `web` job in `release.yml` (9.3), or `release:snapshot` below. So the privileged release job runs no third-party JavaScript |
+| `release:snapshot` | `build:web`, then `goreleaser release --snapshot --clean --skip=sign,sbom`; both get `ISSHONI_SNAPSHOT_VERSION` (default `0.0.0-dev.<12-char commit>`), as `VERSION` for `build:web` and as env for goreleaser | local dry run; `goreleaser-check` and the distro tests use it too |
 | `deploy:test` | distro container tests; `DISTRO=debian-12` selects one | needs podman or Docker |
-| `docker:smoke` | section 6 smoke test (bridge, host, no-volume) | |
+| `docker:smoke` | section 6 smoke test (bridge with a backup → restore round trip, host, no-volume, no `.env`; 11.3) | |
 | `site:dev` / `site:build` | `npx --prefix docs vitepress dev\|build docs` | |
 | `clean` | remove `bin/`, `.bin/`, `dist/`, `dist-extra/`, `web/dist/*` (keeps `.gitkeep`), `.dev/` | |
 
 `.gitignore` gains: `.bin/`, `dist-extra/`, `.dev/`, `web/dist/*`, `!web/dist/.gitkeep`, `THIRD_PARTY_NOTICES`,
+`web/build-report.json`, `web/playwright-report/`, `web/test-results/`,
 `docs/public/{install.sh,compose*.yaml,keys/}`, `docs/.vitepress/{dist,cache}`, `docs/.vitepress/release.json`.
 
 **`web/dist/.gitkeep`** is committed. `//go:embed all:dist` needs at least one file, so `go build`, `go test` and
@@ -830,6 +994,7 @@ release_check = false
   browser's real origin through the proxy, and 04's Host check accepts `localhost` because the site is in dev mode
   (off mode on a loopback listener).
 - 04's validation accepts an `http://` public URL only for loopback hosts (`localhost`, `127.0.0.1`, `[::1]`).
+- `.dev/data` and `.dev/` are created by the server on first start (04 §5.1); nothing needs to be created by hand.
 
 localhost is a secure context, so `getDisplayMedia`, service workers and Secure cookies work in Chrome, Edge and
 Firefox.
@@ -879,28 +1044,35 @@ task dev:setup-url        # in a second terminal: open the printed link, create 
 
 All jobs run on `ubuntu-24.04` unless noted.
 
+Workflow-level `env: ISSHONI_VERSION: 0.0.0-ci.${{ github.run_number }}`. The `web` job's SPA (05's Vite config reads
+it) and the `build` job's binary (Task's `VERSION`, 7.2) therefore carry the same **non-dev** version. 05's
+`version.spec` e2e test needs a non-dev SPA: 01's stale-build path is only testable in a non-dev build.
+install.sh reads the same name as the version to install (4.1), so the install.sh tests (`test:sh`, `distro`,
+`docker-smoke`) unset every `ISSHONI_*` variable before they set their own.
+
 The `changes` job (`dorny/paths-filter`) sets these outputs. On `push` to `main` every filter is true.
 - `go`: `**/*.go`, `go.mod`, `go.sum`, `tools/**`, `internal/protocol/testdata/**`, `.golangci.yml`, `tygo.yaml`
 - `web`: `web/**`
 - `deploy`: `deploy/**`, `.github/workflows/**`, `Taskfile.yml`, `.tool-versions`
 - `docker`: `deploy/docker/**`, `deploy/compose*.yaml`
 - `release`: `.goreleaser.yaml`, `.github/workflows/release.yml`, `deploy/packaging/**`
-- `site`: `docs/**` except `docs/PLAN.md` and `docs/m1/**`
+- `site`: `docs/**` except `docs/PLAN.md` and `docs/m1/**`, plus `web/src/conntest/codes.json` (the anchor test,
+  10.4)
 
 | Job | Runs when | Steps and assertions | Timeout | Gates merge |
 |---|---|---|---|---|
 | `lint-go` | go | `golangci-lint run` (config below); `go mod tidy -diff`; `go vet` for GOOS darwin and windows | 10 | yes |
 | `test-go` | go | `task test:go`; coverage uploaded as an artifact (no external service) | 20 | yes |
-| `web` | web or go | `npm ci`, then `lint`, `typecheck`, `test -- --run`, `check:i18n`, `build`, `check:size` (05 §2). Uploads `web/dist` | 10 | yes |
+| `web` | always (`build` always needs its artifact) | `npm ci`, then `lint`, `typecheck`, `test -- --run`, `check:i18n`, `build`, `check:size` (05 §2). Uploads `web/dist` | 10 | yes |
 | `protocol` | go or web | `task gen:check` (tygo drift). The golden fixtures (`01`) run inside `test-go` and `web` | 5 | yes |
 | `licenses` | go, web or site | `task licenses` | 10 | yes |
-| `build` | always | downloads `web/dist`, `task notices`, `task build`; `bin/isshoni version --json` must show the commit; warns above 60 MB. Uploads `bin/isshoni` | 10 | yes |
-| `e2e` | go or web | downloads the binary; starts a PulseAudio null sink (Chrome needs an output device for tab audio; drop this step if slice S4 shows it isn't needed); `xvfb-run -a npm --prefix web run e2e` with Chrome stable. On failure uploads the Playwright trace, video and server JSON log | 20 | yes |
+| `build` | always | downloads `web/dist`, `task notices`, `task build:go` (no Node on this runner); `bin/isshoni version --json` must show the commit and `0.0.0-ci.<run>`; warns above 60 MB. Uploads `bin/isshoni` | 10 | yes |
+| `e2e` | go or web | setup-node and `npm ci` in `web/`; downloads the binary and runs `chmod +x bin/isshoni` (artifacts lose the mode bit); env `ISSHONI_BIN: ${{ github.workspace }}/bin/isshoni`; the runner's preinstalled Google Chrome stable (`npx --prefix web playwright install chrome` only if it is missing); starts a PulseAudio null sink (Chrome needs an output device for tab audio; drop this step if slice S4 shows it isn't needed); `xvfb-run -a npm --prefix web run e2e`. On failure uploads the Playwright trace, video and server JSON log | 20 | yes |
 | `lint-deploy` | deploy | `task lint:sh lint:actions lint:keys lint:unit lint:pins test:sh` | 10 | yes |
-| `distro` | deploy or release | matrix of the 6 container distros (4.13), scenarios from 11.2 | 30 | yes |
+| `distro` | deploy or release | matrix of the 6 container distros (4.13), scenarios from 11.2; setup-node and `npm ci` in `web/`, because `task release:snapshot` builds the SPA (7.2) | 30 | yes |
 | `docker-smoke` | docker, deploy or release | `task docker:smoke` (11.3), linux/amd64 | 15 | yes |
-| `goreleaser-check` | release | `goreleaser check`; `task release:snapshot`; asserts the asset list of section 3 (names and archive contents) | 20 | yes |
-| `site` | site or deploy | `vitepress build`; troubleshooting-anchor test (10.4) | 10 | yes |
+| `goreleaser-check` | release | setup-node and `npm ci` in `web/`; `goreleaser check`; `task release:snapshot` (builds the SPA first, 7.2); asserts the asset list of section 3 (names and archive contents) | 20 | yes |
+| `site` | site or deploy | `vitepress build`; setup-go (from `go.mod`), then `go test ./internal/server/ops/doctor -run TestDocsAnchors` (10.4) | 10 | yes |
 | `govulncheck` | go | `.bin/govulncheck ./...`, `continue-on-error: true` (new CVEs mustn't block unrelated PRs; nightly and release gate on it) | 10 | no |
 | `ci-ok` | always (`if: always()`) | fails if any job in `needs` is `failure` or `cancelled`; `skipped` counts as success | 2 | **the only required check** |
 
@@ -925,6 +1097,9 @@ The `changes` job (`dorny/paths-filter`) sets these outputs. On `push` to `main`
 
 **npm.** `web/scripts/licenses.mjs` (ours, about 100 lines; dev deps `spdx-expression-parse` and `spdx-satisfies`,
 both MIT). Usage: `node web/scripts/licenses.mjs check|notices [--dir web|docs]`.
+- **Paths.** The script finds the repo root from `import.meta.url` (`web/scripts/` → `../..`). `--dir` is relative to
+  the repo root (default `web`), and `notices` always writes `<root>/web/dist/licenses.txt`. So it works the same
+  from the root (Task) and from `web/` (05's `build` script).
 - Package list:
   - `npm query '.prod'`: packages bundled into the SPA (shipped);
   - `npm query '*'`: all installed packages.
@@ -956,7 +1131,7 @@ same holds for git and PulseAudio on runners. The "no GPL" rule covers code in t
   `github.com/google/licensecheck` (BSD-3-Clause).
   - A module whose license isn't on the shipped allowlist, or on `exceptions.md`, fails the build: the second gate.
   - Apache-2.0 `NOTICE` files are reproduced, as the license requires.
-- **Go runtime.** A "Go standard library and runtime (go1.26.x)" entry from `$(go env GOROOT)/LICENSE`, because the
+- **Go runtime.** A "Go standard library and runtime (go1.27.x)" entry from `$(go env GOROOT)/LICENSE`, because the
   runtime is linked into the binary.
 - **Output.** Plain text, sorted by module path, deterministic (no dates; `<v>` only in the header). Sections: Go
   modules, "Web client (bundled JavaScript)" (from `licenses.txt`), and "Adapted source code" (`extra.txt`, a
@@ -1019,7 +1194,11 @@ owner.
 - **Before tagging** (manual checklist in `docs/m1/`, not published):
   1. `nightly` is green, including `distro-vm`, or those VM runs were done by hand.
   2. Manual real-VPS smoke for a minor release (the patch rule is below):
-     - install.sh with a domain, and IP mode;
+     - install.sh with a domain;
+     - install.sh in IP mode (Enter at the question), started at least 4 days before tagging. Keep that server up
+       until one automatic renewal has been seen: the 160 h certificate renews after about 80 h (04 §8.1–8.2), so
+       `isshoni_tls_cert_not_after_seconds` advances and doctor `tls` is ok. On it, one iPhone Home Screen app
+       receives a `push.test` (Account → Notifications) on the IP origin;
      - Docker bridge mode with real Let's Encrypt;
      - iPhone and Android viewers.
 
@@ -1037,7 +1216,8 @@ project_name: isshoni
 
 before:
   hooks:
-    # web build, THIRD_PARTY_NOTICES, stamped dist-extra/install.sh. Task skips parts that are up to date.
+    # No npm here: checks that web/dist (built by the unprivileged `web` job, 9.3) is for this version,
+    # then THIRD_PARTY_NOTICES and the stamped dist-extra/install.sh.
     - task release:prepare VERSION={{ .Version }}
 
 snapshot:
@@ -1167,6 +1347,9 @@ changelog:
     exclude: ["^docs:", "^test:", "^ci:", "^chore\\(deps\\)"]
 ```
 
+- **Snapshots go through `task release:snapshot`** (7.2), which builds the SPA with `ISSHONI_SNAPSHOT_VERSION` first.
+  A bare `goreleaser release --snapshot` without it takes the `incpatch` fallback, and the before hook then stops at
+  the `version.json` check, because no SPA was built for that version.
 - **Verify in slice S9** (these could not be checked from docs alone):
   - that `dockers_v2.extra_files` keeps repo-relative paths in the build context. The Dockerfile relies on
     `deploy/docker/rootfs/`; if paths are flattened, change the `COPY` source;
@@ -1179,20 +1362,37 @@ changelog:
 ### 9.3 `release.yml`
 
 ```
-tag v* ──► build ──► sign (Environment "release": owner approves) ──► verify ──► publish ──► site
-                     draft release exists; nothing public except the exact image tag
+tag v* ──► web ──► build ──► sign (Environment "release": owner approves) ──► verify ──► publish ──► site
+                             draft release exists; nothing public except the exact image tag
 ```
 
+The workflow computes the version once: the tag without `v`, or `0.0.0-dryrun.<run>` in a dry run. `web` and
+`build` both use it.
+
+**`web`** (unprivileged; the only job that runs npm)
+- Permissions: `contents: read` only, no secrets, checkout with `persist-credentials: false`.
+- Steps (the build half of ci.yml's `web` job; lint and tests already ran in CI): setup-node (from
+  `.tool-versions`), `npm ci` in `web/`, then `npm --prefix web run build` with env `ISSHONI_VERSION=<version>` (so
+  `web/dist/version.json` and `licenses.txt` are written); uploads `web/dist` as the artifact `web-dist`.
+- Why a separate job: the web build runs third-party JavaScript (every npm dependency, bumped weekly by
+  Dependabot). In `build` it would inherit goreleaser's `GITHUB_TOKEN` (contents, packages, OIDC). It could push
+  images, swap draft assets together with `checksums.txt` before the owner signs, or mint OIDC tokens for cosign.
+  Here it holds no write permission at all.
+- Timeout 10 min.
+
 **`build`**
-- Permissions: `contents: write`, `packages: write`, `id-token: write`, `attestations: write`.
+- `needs: web`. Permissions: `contents: write`, `packages: write`, `id-token: write`, `attestations: write`.
+- **No Node on this runner**: no setup-node, no npm, no npm cache. Only goreleaser and pinned Go tools run.
 - Steps:
   1. checkout with `fetch-depth: 0`;
-  2. setup-go (from `go.mod`), setup-node (from `.tool-versions`), Task, syft, cosign v3, buildx, ghcr login with
-     `GITHUB_TOKEN`;
-  3. `goreleaser release --clean`, which creates the **draft** release and pushes `ghcr.io/moonwx/isshoni:<v>`;
-  4. `actions/attest-build-provenance` for `dist/*.tar.gz dist/*.zip dist/*.deb dist/*.rpm dist/checksums.txt
+  2. download the `web-dist` artifact into `web/dist/`;
+  3. setup-go (from `go.mod`), Task, syft, cosign v3, buildx, ghcr login with `GITHUB_TOKEN`;
+  4. `goreleaser release --clean`, which creates the **draft** release and pushes `ghcr.io/moonwx/isshoni:<v>`. Its
+     before hook (`task release:prepare`, 7.2) runs no npm: it fails unless `web/dist/version.json` is `<v>`, then
+     writes `THIRD_PARTY_NOTICES` (Go only, 8.4) and stamps `install.sh`;
+  5. `actions/attest-build-provenance` for `dist/*.tar.gz dist/*.zip dist/*.deb dist/*.rpm dist/checksums.txt
      dist-extra/install.sh`;
-  5. image digest via `docker buildx imagetools inspect ghcr.io/moonwx/isshoni:<v> --format '{{json .Manifest}}'`,
+  6. image digest via `docker buildx imagetools inspect ghcr.io/moonwx/isshoni:<v> --format '{{json .Manifest}}'`,
      then `cosign sign --yes ghcr.io/moonwx/isshoni@<digest>` and `attest-build-provenance` with that
      `subject-digest` and `push-to-registry: true`.
 - Timeout 45 min.
@@ -1213,7 +1413,8 @@ tag v* ──► build ──► sign (Environment "release": owner approves) �
 - Matrix: `debian-12`, `ubuntu-24.04`.
 - Downloads the draft's assets into `mirror/v<v>/` and serves them with `tools/relserve` (HTTPS, test CA).
 - In a systemd container, runs the **released, stamped `install.sh` with the production key** and
-  `ISSHONI_DOWNLOAD_BASE`, `--tls-mode off --yes`, then asserts `/api/v1/info` reports `server.version` = `<v>`.
+  `ISSHONI_DOWNLOAD_BASE`, `ISSHONI_PUBLIC_URL=http://127.0.0.1:8080` and `--tls-mode off --yes` (as C1 does), then
+  asserts `/api/v1/info` reports `server.version` = `<v>`.
 - Also:
   - `cosign verify-blob` on the checksums bundle (identity from 4.3);
   - `cosign verify ghcr.io/moonwx/isshoni:<v>` with the same identity and issuer;
@@ -1233,7 +1434,8 @@ tag v* ──► build ──► sign (Environment "release": owner approves) �
 - A `release` event created with `GITHUB_TOKEN` doesn't trigger other workflows, so the site deploy is called directly.
 
 **Dry run** (`workflow_dispatch`, input `dry_run: true`):
-- `build` runs `goreleaser release --snapshot --clean --skip=publish` with `ISSHONI_SNAPSHOT_VERSION=0.0.0-dryrun.<run>`.
+- `web` builds the SPA as `0.0.0-dryrun.<run>`; `build` runs `goreleaser release --snapshot --clean --skip=publish`
+  with `ISSHONI_SNAPSHOT_VERSION=0.0.0-dryrun.<run>`.
 - A `sign-dry` job (**no environment**) signs with an ephemeral key made in the job and verifies with it.
 - `verify` runs against those files with a test-stamped `install.sh`.
 - This proves the pipeline before the first real tag.
@@ -1309,13 +1511,13 @@ After a leak, the backup key signs until a new key exists, and a security adviso
 |---|---|
 | `/` | What isshoni is (one paragraph plus screenshot), "Install in 2 minutes" (one-liner and Docker), the "voice apps are kept out" pitch with an honest "desktop apps coming" note, links |
 | `/install/` | Shell install: the one-liner; what the script does, step by step; every flag and env var (4.1); non-interactive and cloud-init use; upgrade; uninstall/purge; **manual verification** (10.3); supported distros (4.13) |
-| `/install/docker` | compose (bridge) with `.env`; host-network alternative; host sysctls; ufw bypass; bind-mount ownership; rootless notes; setup-url, doctor, backup, logs, upgrade (6.4) |
+| `/install/docker` | compose (bridge) with `.env` (an empty or missing value means unset: IP certificate, STUN detection); host-network alternative and switching modes (6.3); host sysctls; ufw bypass; bind-mount ownership; rootless notes; setup-url, doctor, backup, restore (`restore --yes -`), offline restore, logs, upgrade (6.4); a link to `/install/reverse-proxy#docker` for hosts whose 80/443 are taken; the Let's Encrypt notice: "isshoni gets its certificate from Let's Encrypt. Using it means you accept the Let's Encrypt Subscriber Agreement: https://letsencrypt.org/repository/" |
 | `/install/vps` | Choosing a VPS (CPU, RAM, **transfer**, with the plan's bandwidth example and formula); ports table (section 2); per-provider firewall steps with stable anchors (10.4) |
-| `/install/reverse-proxy` | `tls.mode=off` behind Caddy, nginx and Traefik: WebSocket upgrade for `/ws`, trusted `X-Forwarded-*` CIDRs, and that **7882/udp and 7882/tcp must still be reachable directly** |
-| `/install/tls` | The four TLS modes: auto (domain), ip (6-day Let's Encrypt IP certificates, GA since 2026-01), manual, off; why self-signed is not supported (plan) |
+| `/install/reverse-proxy` | `tls.mode=off` behind Caddy, nginx and Traefik: WebSocket upgrade for `/ws`, trusted `X-Forwarded-*` CIDRs, and that **7882/udp and 7882/tcp must still be reachable directly**. A Docker section (`#docker`) with the compose file and notes of 6.5 |
+| `/install/tls` | The four TLS modes: auto (domain), ip (6-day Let's Encrypt IP certificates, GA since 2026-01), manual, off (needs `ISSHONI_PUBLIC_URL`, 4.1); why self-signed is not supported (plan); for auto and ip, the Let's Encrypt notice: "isshoni gets its certificate from Let's Encrypt. Using it means you accept the Let's Encrypt Subscriber Agreement: https://letsencrypt.org/repository/" |
 | `/guide/` | For friends: joining with an invite, watching (focus, audio follows focus, fullscreen, tap to unmute), sharing from Chrome/Edge ("window + its audio"; the whole-screen warning), phones (Add to Home Screen, notifications, iOS limits) |
 | `/troubleshooting` | Sections for every doctor check and every connection-test result (10.4), plus: certificate not issued; UDP blocked (ICE-TCP 443 still works); CGNAT/home server; Firefox's first join (OpenH264 download, S4); macOS Local Network permission (S4 finding 6); iOS tap to unmute; DRM shows black; "Copy diagnostics" **Later (M5)** |
-| `/privacy` | The plan's "Privacy and trust model", word for word in substance, plus the **list of outbound connections** a server makes: ACME CA, STUN (for the public IP), browser push services (payloads encrypted, RFC 8291), the optional daily GitHub release check. Also what the installer contacts (the site and GitHub) and what the site stores (nothing) |
+| `/privacy` | The plan's "Privacy and trust model", word for word in substance, plus the **server's outbound connections exactly as 04 §16's table** (destination, when, what is sent, off switch), rendered in full: including STUN to Cloudflare and Google every 10 minutes, the ACME-directory clock check, and the four push services (payloads encrypted, RFC 8291). 04 §16 is the single source; the page adds nothing and drops nothing. Also what the installer contacts (the site and GitHub) and what the site stores (nothing) |
 | `/code-signing` | Code-signing policy (below) |
 | `/security` | Reporting a vulnerability (GitHub private vulnerability reporting); supported versions (latest minor); release signing keys and fingerprints (`#keys`); **how to verify** downloads, images and provenance (`#verify`) |
 | `/reference/config`, `/reference/cli` | Hand-written from `04`'s key and command tables in M1. **Later (M5):** generated by an `isshoni docs` command |
@@ -1373,25 +1575,37 @@ sudo sh install.sh
 
 ### 10.4 Anchor contract (links from the product into the site)
 
-The server and the SPA link to fixed anchors. A test fails the build when one is missing.
+The server and the SPA link to fixed anchors. A test fails the build when one is missing: **one Go test,
+`TestDocsAnchors` in `internal/server/ops/doctor/docsanchors_test.go`**. It reads the doctor check ids from the
+registry (`CheckIDs()`), the `CloudProvider` constants from `internal/protocol/api/conntest.go`, and the `ct-` codes
+from `web/src/conntest/codes.json`, then checks the headings in `docs/troubleshooting.md` and `docs/install/vps.md`.
+No Vitest test is needed in `docs/`. It lives in the doctor package because no other slice of its group touches that
+package, and because `tools/` is a separate module that can't import `internal/` packages. It runs in `test-go`
+(any Go change) and in the `site` job (8.2), so a docs-only or codes-only PR runs it too.
 
 | From | Link | Anchor rule |
 |---|---|---|
-| doctor output, admin dashboard (`04`) | `/troubleshooting#doctor-<check-id>` | one `{#doctor-<id>}` heading per id in `isshoni doctor --list-checks --json` (04 §13.2 ids, with underscores: `public_ip`, `udp_buffers`, …) |
+| doctor text output, admin dashboard (`04`) | `/troubleshooting#doctor-<check-id>` | one `{#doctor-<id>}` heading per id of `doctor.CheckIDs()`, the list `isshoni doctor --list-checks` prints (04 §13.1; 04 §13.2 ids, with underscores: `public_ip`, `udp_buffers`, …) |
 | wizard connection test (`05`) | `/troubleshooting#ct-<code>` | one `{#ct-<code>}` heading per result code in `web/src/conntest/codes.json` (05 §14.2) |
-| wizard fix text per provider (`05`), doctor (`04`) | `/install/vps#<provider-id>` | one heading per id that 04 detects (04 §13.3): `aws`, `gcp`, `azure`, `oracle`, `hetzner`, `digitalocean`, `vultr`, `linode`, `scaleway`, `ovh`, `alibaba`, `tencent`, `unknown`. The page may add sections the product never links to (`aws-lightsail`, `contabo`, `home`) |
-| installer and docs | `/install/reverse-proxy`, `/install/vps`, `/security#verify`, `/security#keys` | fixed |
+| wizard fix text per provider (`05`), doctor text output (`04`) | `/install/vps#<provider-id>` | one heading per `CloudProvider` constant: 04's typed constants in `internal/protocol/api/conntest.go`, which `task gen` also writes to `web/src/protocol/api.gen.ts` for 05 (today `aws`, `gcp`, `azure`, `oracle`, `hetzner`, `digitalocean`, `vultr`, `linode`, `scaleway`, `ovh`, `alibaba`, `tencent`, `unknown`). The test collects the constants from the Go file with `go/parser`, not from a hand-kept list. The page may add sections the product never links to (`aws-lightsail`, `contabo`, `home`) |
+| installer and docs | `/install/reverse-proxy`, `/install/reverse-proxy#docker`, `/install/vps`, `/security#verify`, `/security#keys` | fixed |
 
 The Go base URL is `version.DocsURL = "https://moonwx.github.io/isshoni/"` (04 §15), one constant.
+
+- **doctor's text output** prints the `/troubleshooting#doctor-<id>` and `/install/vps#<provider>` links (04 §13.1).
+  Its `--json` output carries no links; 05 builds the same links from `id` and `env.provider`.
 
 **`/install/vps` per provider.** Each section says where the cloud firewall is, whether it blocks by default, the
 ports from section 2, and quirks. Known quirks to state (re-check each against the provider's current docs when the
 page is written):
 - **AWS EC2** (`#aws`; Lightsail has its own `#aws-lightsail` section): security groups block everything but SSH on a
   new instance; add IPv4 and IPv6 rules; egress is billed
-  per GB, and a 2-hour, 5-person session is about 40 GB (section 12).
+  per GB, and a 2-hour, 5-person session is about 40 GB (section 12). "Before installing without a domain, attach an
+  Elastic IP": the default public IPv4 changes on stop/start, and in IP mode that moves the server's address, which
+  breaks every friend's link, installed app and push subscription.
 - **AWS Lightsail:** separate IPv4 and IPv6 firewall tabs.
-- **Google Cloud:** VPC firewall rules with target tags; the "Allow HTTP/HTTPS" boxes don't cover 7882.
+- **Google Cloud:** VPC firewall rules with target tags; the "Allow HTTP/HTTPS" boxes don't cover 7882. "Before
+  installing without a domain, reserve a static external IP" (the default one is ephemeral, same effect as on AWS).
 - **Azure:** an NSG on the NIC or subnet.
 - **Oracle Cloud:**
   - the VCN security list or NSG, **and** the image's own iptables REJECT rule (the installer handles that, 4.9);
@@ -1400,7 +1614,7 @@ page is written):
 - **Vultr:** some images enable ufw (the installer handles that).
 - **Scaleway:** security groups.
 - **Home server:** router port forwarding for 80, 443 and 7882 TCP+UDP; CGNAT (doctor detects it) means a VPS is
-  needed.
+  needed. "Use a domain with dynamic DNS; IP mode breaks when your IP changes."
 
 ### 10.5 `site.yml`
 
@@ -1441,8 +1655,8 @@ page is written):
 ### 11.2 Distro scenarios: `deploy/test/distro-test.sh`
 
 **Setup.**
-- `ISSHONI_SNAPSHOT_VERSION=0.0.1-ci.1` and then `0.0.1-ci.2` with `task release:snapshot`. The web build and notices
-  are reused through Task's up-to-date check.
+- `ISSHONI_SNAPSHOT_VERSION=0.0.1-ci.1` and then `0.0.1-ci.2` with `task release:snapshot`, which builds the SPA
+  with each version first (7.2), so binary and SPA always match.
 - Each snapshot's `checksums.txt` is signed with an ephemeral key.
 - A test copy of `install.sh` is made with that key between the markers.
 - `tools/relserve` serves `https://host.containers.internal:8443/download/v<ver>/…` and `/latest` → 302 `/tag/v0.0.1-ci.2`, with a
@@ -1456,16 +1670,17 @@ page is written):
 |---|---|---|
 | C1 | Fresh install of ci.1 with `--yes --tls-mode off` and `ISSHONI_PUBLIC_URL=http://127.0.0.1:8080` | exit 0; `systemctl is-active` = active; the process runs as `isshoni`; `CapEff` = `0000000000000400` (only `CAP_NET_BIND_SERVICE`); config `root:isshoni 640`; `/var/lib/isshoni` `isshoni:isshoni 700`; openssh-client was auto-installed; `GET /api/v1/info` → `server.version` = `0.0.1-ci.1`; `isshoni setup-url --json` gives a URL containing `/setup#` |
 | C2 | Seed | the admin is created through `03`'s setup endpoint; `isshoni admin users list --json` has 1 admin |
-| C3 | Re-run with the same version | exit 0; config sha256 unchanged; `ActiveEnterTimestamp` unchanged (no restart); no question asked (no TTY, and it still exits 0) |
+| C3 | Re-run with the same version | exit 0; config sha256 unchanged; `ActiveEnterTimestamp` unchanged (no restart); no question asked (no TTY, and it still exits 0); the output says "Setup is already done" (repair ends with `setup-url`, 4.10) |
 | C4 | Upgrade to ci.2 | exit 0; `/api/v1/info` `server.version` = ci.2; the seeded admin still logs in; `isshoni setup-url` exits 7 (admin exists); the output says "Upgraded 0.0.1-ci.1 → 0.0.1-ci.2" |
 | C5 | Downgrade with `--version 0.0.1-ci.1` | exit 6; still ci.2 and active |
 | C6 | Tampered mirror: checksums changed, `.sig` missing, archive swapped | exit 3 each time; binary sha256 and service state unchanged |
-| C7 | Port conflict: a Python UDP socket on 7882 before a fresh install (second container) | exit 7; the message names `python3` |
+| C7 | Port conflict: a Python UDP socket on 7882 before a fresh install with C1's flags (second container); then the socket is closed and the installer run again with the same flags | first run: exit 7; the message names `python3`; `systemctl is-enabled isshoni` fails. Re-run: exit 0; no question; the firewall step runs (its output line is present); the unit is enabled and active; the output has a `/setup#` link |
 | C8 | `--uninstall` | exit 0; binary and unit gone; `/etc/isshoni`, `/var/lib/isshoni` and the user kept |
-| C9 | Reinstall after uninstall | no question asked (config exists); admin still exists |
+| C9 | Reinstall after uninstall | exit 0; no question asked (config exists); the unit is enabled and active again; the output says "Setup is already done"; admin still exists |
 | C10 | Backup, purge, install, restore | `isshoni admin backup --out /root/b.tar.gz` → purge (`--yes`) → nothing left (paths, user) → fresh install with `--tls-mode off` → `isshoni admin restore --yes /root/b.tar.gz` → the admin logs in |
 | C11 | No systemd (plain `docker run debian:12`) | exit 4, message points to Docker |
 | C12 | Non-root without sudo | exit 4 |
+| C13 | Re-run after exit 5 (third container): a test drop-in `/etc/systemd/system/isshoni.service.d/zz-test.conf` with `ExecStartPre=/bin/false` makes every start fail; fresh install with C1's flags; then the drop-in is removed with `systemctl daemon-reload` (the admin's fix) and the installer run again | first run: exit 5 after the wait; the last output line is "Fix the problem above, then run this installer again."; the unit is enabled. Re-run: exit 0; no question; the unit is active; the output has a `/setup#` link |
 
 **VM-only scenarios** (nightly):
 
@@ -1490,11 +1705,21 @@ page is written):
      version;
    - `docker compose exec -T isshoni isshoni setup-url` prints `^https://smoke\.test/setup#.+`;
    - `docker compose down && up -d` → the admin still exists after seeding (`setup-url` exits 7);
+   - backup → restore round trip with the exact commands of 6.4:
+     `docker compose exec -T isshoni isshoni admin backup --out - > b.tar.gz`, then
+     `docker compose exec -T isshoni isshoni admin restore --yes - < b.tar.gz` → exit 0; health is `healthy` again
+     within 60 s; `setup-url` still exits 7 (the admin survived);
    - `docker inspect` shows `ReadonlyRootfs: true` and `CapDrop: [ALL]`.
 4. **Host:** the same with `compose.host.yaml`, plus `ss -ltnp` on the runner shows :443 owned by the container's
    process.
 5. **No volume:** `docker run --rm <image>` exits 78 within 10 s and logs a message containing `/var/lib/isshoni`.
-6. **Healthcheck:** `docker inspect` shows a HEALTHCHECK whose command is `/usr/local/bin/isshoni healthcheck`.
+6. **No `.env`:** `deploy/compose.yaml` started from a directory without a `.env` file, with an override that only
+   sets the local image. `ISSHONI_DOMAIN` and `ISSHONI_PUBLIC_IP` reach the container as empty strings. Asserts:
+   - the container keeps running (no exit 78 over an empty value);
+   - `docker compose exec -T isshoni isshoni config print --json` shows `domain` and `public_ip` with source
+     `default`, not `env`, and the derived TLS mode `ip` (04 §4.2 empty-means-unset rule). No certificate is
+     expected: the runner can't pass ACME.
+7. **Healthcheck:** `docker inspect` shows a HEALTHCHECK whose command is `/usr/local/bin/isshoni healthcheck`.
 
 ## 12. M1 exit test run book
 
@@ -1518,12 +1743,24 @@ can watch.
 
 | Participant | Device | Role |
 |---|---|---|
-| A (owner, admin) | Windows 11, Chrome | sharer (Movie preset: a 1080p60 film clip with sound, "window + its audio"); runs the collector over SSH |
+| A (owner, admin) | Windows 11, Chrome | sharer (Movie preset: a 1080p60 film clip with sound, "window + its audio"); starts the collector on the VPS, detached from the SSH session (12.3) |
 | B | macOS, Chrome or Edge | sharer (game or video in a window) |
 | C | iPhone, iOS ≥ 16.4, Safari → Home Screen app | viewer; on mobile data part of the time |
 | D | Android, Chrome → installed app | viewer |
-| E | Windows or Linux laptop, Chrome or Firefox | viewer; **UDP to 7882 blocked**, to force ICE-TCP on 443 (Windows: `New-NetFirewallRule -DisplayName isshoni-test -Direction Outbound -Protocol UDP -RemotePort 7882 -Action Block`, removed afterwards) |
+| E | Windows or Linux laptop, **Chrome** | viewer; **all outbound traffic to port 7882 blocked, UDP and TCP**, so ICE-TCP on 443 is the only path (like a hotel or office network that allows only 443). Blocking only UDP would leave TCP 7882, which the server offers too, and ICE may pick it |
 
+- **E's firewall rules**, removed afterwards:
+  - Windows (these cover IPv4 and IPv6):
+    `New-NetFirewallRule -DisplayName isshoni-test -Direction Outbound -Protocol UDP -RemotePort 7882 -Action Block`
+    and the same line with `-Protocol TCP`; remove both with `Remove-NetFirewallRule -DisplayName isshoni-test`.
+  - Linux (one nft rule for both protocols and both IP families):
+    `sudo nft add table inet isshoni_test`,
+    `sudo nft add chain inet isshoni_test out '{ type filter hook output priority 0; }'`,
+    `sudo nft add rule inet isshoni_test out meta l4proto '{ tcp, udp }' th dport 7882 reject`; remove with
+    `sudo nft delete table inet isshoni_test`.
+- **E uses Chrome, not Firefox.** A Firefox viewer switches the whole room to Constrained Baseline, which takes B's
+  macOS Chrome share off hardware simulcast (S4 finding 4), and E shares at T+90 while Firefox is not a tested sharer
+  (05). Firefox viewing stays with the separate M-FF-1 row of 05 §19.4's manual matrix, outside the exit test.
 - Everyone talks on their usual voice app (Discord), as in real use.
 - Friends agree to the test, and nothing is recorded except the metrics below.
 
@@ -1532,31 +1769,39 @@ can watch.
 2. The wizard's connection test from A shows UDP ✓, TCP ✓ and the RTT.
 3. Load pre-flight from a second machine: `isshoni-loadtest` (`02`) with 5 publishers × 5 subscribers for 15
    minutes. Pass: CPU under 40% of 2 vCPU, loss under 0.5%, RSS flat.
+4. On the day, before T+0 (the T−5 row): with E's firewall rules in place, the admin dashboard must show E's
+   connection as `tcp443`. If it doesn't, fix E's rules before starting.
 
 ### 12.2 Timeline
 
 | Time | Action | What to record |
 |---|---|---|
-| T−15 min | A starts `tools/exittest collect` on the VPS (below) | |
-| T+0 | A posts the invite link in the voice chat; everyone signs up | seconds from opening the link to video playing, per person |
-| T+5 | A shares (Movie) | everyone: one tap to unmute, then audio and video OK |
-| T+10 | B shares | the newest share gets focus; switching focus moves the audio (audio follows focus) |
-| T+15 | C and D: Add to Home Screen and allow notifications; E allows notifications | |
-| T+20 | A stops and restarts the share | C, D and E get "A started streaming" |
+| T−15 min | A starts `tools/exittest collect` on the VPS, detached from the SSH session (12.3) | |
+| T−5 | B and E sign up (A sent them the invite link beforehand). B starts a window share (a video in a window), so the others have something to watch from their first second. E has the firewall rules in place | the admin dashboard shows E's connection as `tcp443` (pre-flight 4); E's seconds from opening the link to video playing |
+| T+0 | A posts the invite link in the voice chat; C and D sign up | per person: seconds from opening the link to video playing (link → sign-up form → Lounge → B's share plays → one tap to unmute), the plan's first-join journey |
+| T+5 | A shares (Movie) | A's share, the newest, takes focus; audio and video OK for everyone |
+| T+10 | Everyone switches focus between A's and B's shares | switching focus moves the audio (audio follows focus) |
+| T+15 | C and D: Add to Home Screen and allow notifications; E allows notifications | C and D log in once inside the Home Screen app (it has its own cookie jar; an expected action, 12.3) |
+| T+19 | C, D and E leave: C swipes the Home Screen app away, D closes the installed app, E closes the tab. Everyone waits at least 40 s, so the 30 s resume grace ends and they are no longer present in the room | |
+| T+20 | A stops and restarts the share, at least 10 minutes after A's previous share start (T+5): `share.started` pushes skip people present in the room and are sent at most once per (room, sharer) per 10 minutes (04 §14.3–14.4) | C, D and E get "A started streaming": each person's delivery time. Each taps the notification and must land on A's share (through `?focus=`) within 10 s. If the timing slips, `push.test` (Account → Notifications) is the fallback check for delivery |
 | T+25–60 | Watch together, normal use; E uses fullscreen and keyboard navigation | freezes longer than 2 s (who, when) |
 | T+60 | A runs `sudo systemctl restart isshoni` (announced) | seconds until each client plays again, with no action (target ≤ 30 s) |
 | T+70 | C switches Wi-Fi → mobile data, and back at T+80 | seconds until C plays again (target ≤ 10 s) |
 | T+75 | A turns Wi-Fi off for 10 s | A's share resumes without re-picking (inside the 30 s grace) |
-| T+85 | C locks the phone for 2 minutes, then unlocks | video plays again after unlock (iOS: foreground only) |
+| T+85 | C locks the phone for 2 minutes, then unlocks | video plays again after unlock (iOS: foreground only), with at most one tap (an expected action, 12.3) |
 | T+90–100 | Stress: every desktop participant (A, B, E) shares at once | CPU, egress, loss |
 | T+100–120 | Normal watching | |
-| T+120 | End; A stops the collector; everyone fills in the survey | |
+| T+120 | End; A stops the collector (`sudo systemctl stop exittest-collect`); everyone fills in the survey | |
 
 ### 12.3 Measurements
 
-**`tools/exittest collect -o run.csv -metrics http://127.0.0.1:9469/metrics`** (Go, stdlib only, runs as root). Every
-10 s it records:
-- isshoni CPU % (from `/proc/<pid>/stat`), RSS, threads and open fds;
+**`tools/exittest collect -o run.csv -metrics http://127.0.0.1:9469/metrics`** (Go, stdlib only, runs as root). A
+starts it detached from the SSH session, because A drops Wi-Fi at T+75:
+`sudo systemd-run --unit=exittest-collect --working-directory="$PWD" "$PWD/exittest" collect -o run.csv -metrics
+http://127.0.0.1:9469/metrics` (or inside `tmux`). Every 10 s it records:
+- the isshoni PID, re-resolved on every sample with `systemctl show -p MainPID --value isshoni`; a changed PID is
+  written to `run.csv` as a `restart` row, so the T+60 restart is marked;
+- isshoni CPU % (from `/proc/<pid>/stat` of that PID), RSS, threads and open fds;
 - load average;
 - NIC rx/tx bytes (`/proc/net/dev`);
 - UDP `InDatagrams`, `OutDatagrams`, `RcvbufErrors`, `SndbufErrors` and `InErrors` (`/proc/net/snmp`);
@@ -1564,8 +1809,10 @@ can watch.
 
 Every 30 s it saves a `/metrics` scrape.
 
-`tools/exittest summarize run.csv` prints the table below. The owner then adds the journal excerpt
-(`journalctl -u isshoni --since …`, with warnings and errors only).
+`tools/exittest summarize run.csv` prints the table below. It computes every rate and total per process (split at
+the `restart` rows) and treats a counter that goes down as a reset, the Prometheus way (the increase after a reset is
+the new value), because the saved `/metrics` counters start again at zero at T+60. The owner then adds the journal
+excerpt (`journalctl -u isshoni --since …`, with warnings and errors only).
 
 **Metrics read from the server** (names from 01 §18, 02 §13 and 04 §11.2):
 - Go and process collectors (`go_goroutines`, `process_resident_memory_bytes`, `process_cpu_seconds_total`);
@@ -1584,16 +1831,23 @@ Every 30 s it saves a `/metrics` scrape.
 
 | Measure | Target |
 |---|---|
-| Manual fixes (reloads, re-joins, server commands other than the scripted restart) | **0** |
+| Manual fixes (reloads, re-joins, server commands other than the scripted restart) | **0**. Expected actions are not manual fixes: see the list below the table |
 | Session | 2 h; the server never restarts except at T+60 |
 | Server CPU | average < 50% of 2 vCPU, peak < 80% |
-| Memory | RSS growth between T+30 and T+120 < 20% (no leak); goroutines back to baseline after the stress |
+| Memory | RSS growth from T+65 to T+120 < 20% (the process started at T+60, about 55 minutes; no leak); goroutines back to the T+85 baseline (taken before the stress) after it. T+5 → T+59, the first process, is reported as a second sample |
 | UDP socket errors | `RcvbufErrors + SndbufErrors` = 0, or < 0.01% of datagrams |
 | Recovery | after the server restart: all 5 play again in ≤ 30 s; after C's network switch: ≤ 10 s; A's share survives a 10 s drop |
 | Viewing quality | total freeze time < 1% of watch time on desktop and < 3% on phones; no decode errors that need a reload |
 | Phones | iPhone and Android: video + audio after one tap, Home Screen app installed, notification received, playing again after unlock |
 | ICE-TCP | E's selected transport is TCP on 443 all session long |
 | Survey (1–5) | median ≥ 4 for picture and sound; nobody reports audio out of sync |
+
+**Expected user actions** (not manual fixes; recorded per person, with the time):
+- one tap to unmute after each join (the first join, and the return through the notification at T+20);
+- one login inside each Home Screen app (C's iOS app, D's Android app; the app has its own cookie jar, 05 §16.3);
+- at most one tap after unlock at T+85 (05 §12.8: iOS may need it after an interruption).
+
+Anything beyond these, such as a reload, a second tap, a re-join or a second login, counts as a manual fix.
 
 **Survey** (5 questions):
 1. Did you have to reload or fix anything?
@@ -1617,10 +1871,10 @@ Every 30 s it saves a `/metrics` scrape.
 | Unit | `tools/notices` golden test on a fixture module tree | deterministic output; Apache `NOTICE` included; a non-allowlisted license fails; the Go runtime entry is present |
 | Unit | `tools/relserve` | `/latest` redirect format matches GitHub's; files served; the CA verifies |
 | Static | `lint-deploy` | shellcheck, shfmt, actionlint, `systemd-analyze verify`, the key block, `.tool-versions` = `go.mod` toolchain |
-| Integration | distro containers C1–C12 (11.2) | install, idempotency, upgrade, downgrade refusal, tamper refusal, port conflict, uninstall, purge, backup/restore |
-| Integration | Docker smoke (11.3) | bridge and host bind 443 as designed, healthcheck, setup-url via exec, persistence, no-volume refusal |
+| Integration | distro containers C1–C13 (11.2) | install, idempotency, upgrade, downgrade refusal, tamper refusal, port conflict, re-runs after exit 7 and exit 5, uninstall, purge, backup/restore |
+| Integration | Docker smoke (11.3) | bridge and host bind 443 as designed, healthcheck, setup-url via exec, persistence, backup → restore through `exec -T` with `--yes`, no-volume refusal, start with no `.env` |
 | Integration | `goreleaser-check` | the asset names and archive contents of section 3 |
-| Integration | site | the build, and **anchor coverage**: `go test ./internal/server/ops -run TestDocsAnchors` (reads `docs/troubleshooting.md` and `docs/install/vps.md`; ids from the doctor registry and the provider list) and a Vitest test for the `ct-` codes |
+| Integration | site | the build, and **anchor coverage**: `go test ./internal/server/ops/doctor -run TestDocsAnchors` (10.4: reads `docs/troubleshooting.md` and `docs/install/vps.md`; ids from the doctor registry, the `CloudProvider` constants and `web/src/conntest/codes.json`) |
 | E2E | Playwright in CI (content from `05`) | the CI plumbing: a Chrome sharer → SFU → Chrome viewer; `framesDecoded > 0`; audio energy |
 | E2E | release dry run (9.3) | build → sign → verify on snapshot artifacts with ephemeral keys |
 | E2E | VMs V1–V6 (nightly) | SELinux, sysctl, real firewalls, Pebble ACME, security score |
@@ -1635,7 +1889,8 @@ Every 30 s it saves a `/metrics` scrape.
 - **systemd environment of the server:** `User=isshoni`, `CAP_NET_BIND_SERVICE` only, `ProtectSystem=strict`
   (only `/var/lib/isshoni` and `/run/isshoni` are writable), `PrivateTmp`, `AF_NETLINK` allowed, `UMask=0077`,
   journald captures stdout.
-  - `JOURNAL_STREAM` is set, so `04` picks JSON logs.
+  - stderr is not a TTY under systemd, so 04's `log.format = "auto"` writes JSON lines (04 §10).
+  - `systemctl reload` sends SIGHUP (`ExecReload`, 4.5).
   - Exit 78 stops restarts.
   - `TimeoutStopSec=20`: graceful shutdown must finish in under 15 s.
 - **Container environment:** image `ghcr.io/moonwx/isshoni`; binary `/usr/local/bin/isshoni`; uid 65532; env
@@ -1647,15 +1902,28 @@ Every 30 s it saves a `/metrics` scrape.
     `v`; unset → `0.0.0-dev+<commit>` from the build info);
   - constant `version.DocsURL`;
   - `CGO_ENABLED=0`, `-trimpath`;
-  - `web/dist/.gitkeep` committed; `task build` requires `web/dist/index.html`.
-- **npm scripts** required in `web/package.json`: `dev`, `build`, `lint`, `typecheck`, `test`, `e2e`; `build` must
-  also write `dist/licenses.txt` (it runs `node scripts/licenses.mjs notices`). In `docs/package.json`: `dev`,
-  `build`.
-- **e2e contract:** CI provides `ISSHONI_BIN` (the path of the built binary with the embedded SPA), `CI=1`, Google
+  - `web/dist/.gitkeep` committed; `task build` requires `web/dist/index.html`;
+  - `ISSHONI_VERSION` (build time, read by 05's Vite config) always equals the ldflags `version` of the binary it is
+    embedded in, for `task build`, `task dev`, e2e and goreleaser (one Task `VERSION`, 7.2).
+- **npm scripts** required in `web/package.json`: `dev`, `build`, `lint`, `typecheck`, `test`, `e2e`, `check:i18n`,
+  `check:size`; `build` must also write `dist/licenses.txt` (it runs `node scripts/licenses.mjs notices`). In
+  `docs/package.json`: `dev`, `build`.
+- **e2e contract:** CI and `task e2e` provide `ISSHONI_BIN` (the absolute path of the built binary with the embedded
+  SPA), `CI=1`, Google
   Chrome stable, Xvfb and a PulseAudio null sink. The e2e server uses `deploy/dev/isshoni.e2e.toml` on
   `127.0.0.1:18080`, and `ISSHONI_DATA_DIR` is a fresh temp dir. On failure, Playwright writes its report to
   `web/playwright-report/` and the server log to `web/test-results/server.log`.
 - **Task names** (7.2) and the required check name `ci-ok`.
+- **Reserved non-key env names.** These `ISSHONI_*` names are not config keys, and 04 ignores them without a warning
+  (04 §4.2's reserved list):
+  - install.sh: `ISSHONI_VERSION` (version to install), `ISSHONI_YES`, `ISSHONI_NO_FIREWALL`,
+    `ISSHONI_DOWNLOAD_BASE`, `ISSHONI_INSTALL_SOURCED` (unit tests);
+  - goreleaser: `ISSHONI_SNAPSHOT_VERSION`;
+  - e2e: `ISSHONI_BIN`;
+  - 05 dev and build: `ISSHONI_VERSION` (version stamped into the SPA), `ISSHONI_DEV_SERVER` (Vite proxy target).
+
+  Any new `ISSHONI_*` name that is not a config key must be added to 04 §4.2's reserved list. 04's own env-only names
+  (`ISSHONI_CONFIG`, `ISSHONI_IN_CONTAINER`, `ISSHONI_ALLOW_EPHEMERAL_DATA`) are read by 04 and are not on this list.
 - **Tools:** `tools/go.mod` (tygo, go-licenses v2, govulncheck); `.bin/` output; `tygo.yaml` at the repo root.
 - **Release assets and names** (section 3), Docker tags (section 3), the signing namespace `isshoni-checksums` and
   principal `isshoni-release`, `deploy/keys/allowed_signers`, and the cosign identity
@@ -1687,7 +1955,8 @@ Every 30 s it saves a `/metrics` scrape.
   - `isshoni admin backup --out F|-`, `isshoni admin restore F|- [--yes] [--offline]` (an archive or a pre-migration
     `.db` file), `isshoni admin users list --json`.
 - **Exit code 78** from `serve` for every state a restart can't fix: invalid config, newer DB schema, failed
-  migration, corrupt DB or secrets, container without a data volume.
+  migration, corrupt DB or secrets, container without a data volume, data directory or `secrets.json` not owned by or
+  writable for the service user.
 - **Env names** (04's mechanical rule `ISSHONI_` + key path):
   - `ISSHONI_CONFIG`; `ISSHONI_DATA_DIR` (default `/var/lib/isshoni`); env-only `ISSHONI_IN_CONTAINER` and
     `ISSHONI_ALLOW_EPHEMERAL_DATA`;
@@ -1707,18 +1976,20 @@ Every 30 s it saves a `/metrics` scrape.
   - no `sd_notify` (the unit is `Type=exec`); graceful shutdown in ≤ 10 s.
 - **A permissive QR library** for `--qr` (`skip2/go-qrcode`, MIT).
 
-**From `03-accounts-and-store.md`:** `POST /api/v1/auth/setup/complete` (with the token from `setup-url --json`) and
+**From `03-accounts-and-store.md`:** `POST /api/v1/auth/setup/complete` (with the token taken from the fragment, after
+`#`, of `url` in `setup-url --json`) and
 `POST /api/v1/auth/login` for seeding in C2, C4 and C10; the pre-migration backup file name
 `backups/pre-<schema>-<ts>.db`; restore semantics (04 §12.4).
 
 **From `05-web-client.md`:**
-- `web/package.json` scripts (section 14, plus `check:i18n` and `check:size`); `vite.config.ts` proxy to
+- `web/package.json` scripts (section 14); `vite.config.ts` proxy to
   127.0.0.1:8080 for `/api` and `/ws`;
 - Playwright config with the Chrome channel, reading `ISSHONI_BIN`, and the tone-tab or canvas sharer (S4 finding 7:
   headless Chrome can't auto-accept `getDisplayMedia`);
 - connection-test result codes in `web/src/conntest/codes.json`;
 - a link to `/licenses.txt` (served from `web/dist`);
-- `web/embed.go` (`//go:embed all:dist`), created by the repo skeleton slice with 04 §9.5's content.
+- `web/embed.go` (`//go:embed all:dist`) with 04 §9.5's content, and `web/dist/.gitkeep`: both come from 05's web
+  scaffold (README S09), not from the repo skeleton slice.
 
 **From `01-protocol.md`:** `tygo.yaml` (both packages) and the generator `internal/protocol/gen/tsregistry`;
 golden fixtures run by `go test ./internal/protocol/...` and by Vitest; the compat snapshot step at release (01
@@ -1739,16 +2010,16 @@ M1 timeline:
 
 | # | Slice | Scope | Acceptance | Depends on |
 |---|---|---|---|---|
-| S1 | Scaffolding and dev loop (1.5 d) | `LICENSE` (Apache-2.0; the repo has none yet), `NOTICE`, `.tool-versions`, `go.mod` toolchain, `tools/go.mod`, `Taskfile.yml`, `.golangci.yml`, `.gitignore`, `web/dist/.gitkeep`, `go.mod` `ignore ./web/node_modules`, `deploy/dev/*.toml`, `CONTRIBUTING.md` (the build info package is 04's `internal/version`) | On a fresh clone: `mise install && task setup && task lint test build` pass on the skeleton; `task dev` serves the SPA on :5173 with the API proxied (once the 04/05 skeletons exist) | — |
+| S1 | Scaffolding and dev loop (1.5 d) | `LICENSE` (Apache-2.0; the repo has none yet), `NOTICE`, `.tool-versions`, `go.mod` toolchain, `tools/go.mod`, `Taskfile.yml`, `.golangci.yml`, `.gitignore`, `go.mod` `ignore ./web/node_modules` and `ignore ./docs/node_modules`, `deploy/dev/*.toml`, `CONTRIBUTING.md` (the build info package is 04's `internal/version`) | Fresh clone: `mise install && task setup` succeed; `task lint:go lint:pins test:go` pass on the empty module; `task --list` shows every task of 7.2 (tasks whose inputs don't exist yet exit 0 with a note); `.bin/tygo` is v0.2.21; `task build:go` stops with a clear message while `web/dist/index.html` is missing. (`web/embed.go` and `web/dist/.gitkeep` come with 05's web scaffold, README S09) | — |
 | S2 | CI core (1.5 d) | `ci.yml` with `changes`, `lint-go`, `test-go`, `web`, `protocol`, `build`, `ci-ok`; `dependabot.yml`; actionlint; one-time GitHub setup (8.6, steps 1–3 and 6–7) | A PR with a gofmt error, a tygo drift or a failing Vitest test makes `ci-ok` fail; a clean PR passes in < 12 minutes; `main` can't be merged red | S1 |
 | S3 | License gate and notices (1.5 d) | go-licenses job, `web/scripts/licenses.mjs` with tests, `tools/notices` with golden test, `deploy/notices/*` | Adding a GPL-3.0 fixture dependency fails `licenses`; `THIRD_PARTY_NOTICES` lists every module in `go version -m bin/isshoni` plus the Go runtime and every prod npm package | S2 |
 | S4 | e2e in CI (1 d) | `e2e` job: Chrome, Xvfb, Pulse null sink (keep only if needed), artifacts | `05`'s smoke test runs green; a forced failure uploads the trace, video and server log | S2, 05 skeleton |
 | S5 | Unit, sysctl, firewall, packaging files (1 d) | `deploy/systemd`, `deploy/sysctl`, `deploy/firewall`, `deploy/packaging` | `systemd-analyze verify` passes; in a Debian 13 VM a hand-placed binary starts as `isshoni`, binds 443, `CapEff` = 0x400; the security score is recorded in 4.5 | S1 |
 | S6 | install.sh core (3 d) | 4.1–4.10 fresh-install path, 4.12 rules, unit tests (11.1), `tools/relserve`, `lint:keys` | All unit tests pass under the 3 shells; C1 and C6 pass in a Debian 12 container against a local test release | S5 |
-| S7 | install.sh lifecycle and distro matrix (2.5 d) | upgrade, repair, downgrade, uninstall, purge, firewall offer, port check; `distro` CI job | C1–C12 pass on all 6 container distros in CI | S6, 03/04 CLI |
+| S7 | install.sh lifecycle and distro matrix (2.5 d) | upgrade, repair, downgrade, uninstall, purge, firewall offer, port check; `distro` CI job | C1–C13 pass on all 6 container distros in CI | S6, 03/04 CLI |
 | S8 | Docker (1.5 d) | Dockerfile, rootfs, `compose.yaml`, `compose.host.yaml`, `docker-smoke` job | 11.3 passes on amd64 in CI and arm64 locally; the no-volume start is refused | S5, 04 container guard |
-| S9 | goreleaser and release pipeline (2.5 d) | `.goreleaser.yaml`, `release.yml` (build, sign, verify, publish, dry run), keys generated by the owner, `allowed_signers`, environment `release` | The dry run passes end to end; tag `v0.1.0-rc.1` → draft → approval → signed → verified → published without moving `:latest` or GitHub's "latest"; `curl …/v0.1.0-rc.1/install.sh \| sh` works on a real VPS | S6, S8 |
-| S10 | Project site (2.5 d) | VitePress skeleton, all M1 pages (10.2), `site.yml`, `release.json`, anchor tests, Pages settings (8.6 step 5) | The site is live; the served `install.sh` equals the latest release asset (sha256 test in `site.yml`); the anchor tests pass for the doctor ids, `ct-` codes and provider ids; no request leaves for a third-party origin (checked in the browser's network panel) | S9 (install.sh), 04/05 id lists |
+| S9 | goreleaser and release pipeline (2.5 d) | `.goreleaser.yaml`, `release.yml` (web, build, sign, verify, publish, dry run), keys generated by the owner, `allowed_signers`, environment `release` | The dry run passes end to end; tag `v0.1.0-rc.1` → draft → approval → signed → verified → published without moving `:latest` or GitHub's "latest"; `curl …/v0.1.0-rc.1/install.sh \| sh` works on a real VPS | S6, S8 |
+| S10 | Project site (2.5 d) | VitePress skeleton, all M1 pages (10.2), `site.yml`, `release.json`, the anchor test `internal/server/ops/doctor/docsanchors_test.go` (10.4) and the `site` job's Go step, Pages settings (8.6 step 5) | The site is live; the served `install.sh` equals the latest release asset (sha256 test in `site.yml`); the anchor tests pass for the doctor ids, `ct-` codes and provider ids; no request leaves for a third-party origin (checked in the browser's network panel) | S9 (install.sh), 04/05 id lists |
 | S11 | Nightly and VMs (2 d) | `nightly.yml`: VM matrix V1–V6 (Pebble), multi-arch smoke, cross-OS Go tests, govulncheck, full goreleaser snapshot, link check | One green nightly with all rows (or KVM rows marked skipped with the reason, and run by hand in UTM/Tart once) | S7, S8, S9 |
 | S12 | Exit test (1 d prep + the session) | `tools/exittest` (collect, summarize), the run book as a checklist, the session, the results file | All pass criteria in 12.3 met on an rc; `v0.1.0` tagged from that commit (or a fixed one after a re-run) | everything |
 

@@ -76,15 +76,34 @@ internal/server/
   servertest/        servertest.go
 ```
 
-Import rules (checked by a `depguard` rule in golangci-lint, 06):
-- `version`, `logx`, `config` import nothing from `internal/server/...` (config may import `logx`).
-- `netx` imports pion, `logx`; never `config` (it takes plain option structs, so `doctor` and tests can use it freely).
-- `tlsmgr`, `ops`, `ops/doctor`, `push` import `config`, `logx`, `netx`, `internal/protocol`,
-  `internal/protocol/api`. `httpapi` also holds 03's `API` and so imports `store` and `auth`.
-- Only `internal/server` (the wiring) imports `sfu`, `sfuplane`, `signal`, `auth` and `store`, and adapts them to the
-  small interfaces that `ops` and `push` declare. So `ops` and `push` compile and test without 01–03. `ops` and
-  `push` expose plain `http.Handler`s that take the caller as arguments; the wiring registers them with 03's
-  `API.Handle(pattern, access, h)` and passes the principal from `httpapi.PrincipalFrom`.
+Import rules. This table is the single source for the `depguard` rules in golangci-lint (06 §8); other docs point
+here instead of repeating it. It covers packages of this repo only; the standard library and third-party modules are
+governed by the license gate (06).
+
+| Package | May import (this repo) | Never imports |
+|---|---|---|
+| `internal/version` | nothing (a leaf) | any package of this repo |
+| `internal/logx` | `version` | `internal/server/...` |
+| `config` | `logx`, `version` | any other `internal/server/...` package |
+| `netx` | `logx`, `version`, `internal/protocol/api` (for `api.NATKind`, `api.CloudProvider`); plus pion | `config` (it takes plain option structs, so `doctor` and tests can use it freely), `sfu` |
+| 03's `store` | `internal/protocol/api` only (plus the standard library and modernc) | anything else |
+| 03's `auth` | `store`, `internal/protocol/api` | anything else |
+| `httpapi` (this router and 03's `API`) | `config`, `logx`, `version`, `store`, `auth`, `internal/protocol`, `internal/protocol/api` | `ops`, `push`, `netx`, `tlsmgr`, `signal`, `sfu`, `sfuplane` |
+| `tlsmgr`, `ops`, `ops/doctor`, `push` | `config`, `logx`, `version`, `netx`, `internal/protocol`, `internal/protocol/api` (and `ops` → `ops/doctor`) | `httpapi`, `store`, `auth`, `signal`, `sfu`, `sfuplane` |
+| 02's `internal/server/sfu`, `sfu/sfutest` | `netx` (`Transport`, `TransportOptions`); the rest per 02 | – (`netx` never imports `sfu`) |
+| `internal/server` (the wiring), `cmd/isshoni`, `servertest` | all of the above | – |
+
+- Of the packages in this table, only `internal/server`, `cmd/isshoni` and `servertest` import `signal`, `sfu` and
+  `sfuplane`, or combine `store`/`auth` with `ops`/`push` (01's and 02's own packages and tests follow their docs). They adapt 01–03 to the small interfaces that `ops` and `push` declare, so `ops`
+  and `push` compile and test without 01–03.
+- The router takes a small interface declared in `httpapi` (`RouteObserver`, §9.2) in place of `*ops.Metrics`.
+- `ops` and `push` export typed functions that return DTOs and `*api.Error` (e.g.
+  `Dashboard.Snapshot(ctx) (api.OpsDashboard, error)`); the wiring wraps each with `httpapi.DecodeJSON`/`WriteJSON`/
+  `WriteError` and registers it with `API.Handle`, passing the principal from `httpapi.PrincipalFrom`.
+- `httpapi.Push` is implemented by a wiring adapter that converts `store.PushSubscription` to `push.Subscription`
+  (§6.6).
+- 03's file-level store functions (`store.LatestSchemaVersion`, `InspectFile`, `BackupFile`) reach `ops` and
+  `ops/doctor` as function values passed in by `cmd/isshoni` and the wiring (§12.3, §12.4, §13.1).
 - JSON types that the SPA reads (dashboard, doctor report, bandwidth, connection test, push payload) live in
   `internal/protocol/api` next to 03's DTOs (files `ops.go`, `doctor.go`, `conntest.go`, `push.go`), so tygo
   generates them into `web/src/protocol/api.gen.ts` (01 §14.4). The error envelope is 03's `api.Error`. All JSON
@@ -99,8 +118,8 @@ Import rules (checked by a `depguard` rule in golangci-lint, 06):
 | Command | What it does | Talks to |
 |---|---|---|
 | `isshoni serve [config flags]` | Runs the server. Docker `CMD ["serve"]` | – |
-| `isshoni setup-url [--qr\|--no-qr] [--wait DUR] [--json]` | Mints a one-time setup link and prints it (plus a QR code on a TTY) | admin socket |
-| `isshoni doctor [--json] [--strict] [--only ID,…] [--list-checks] [--bandwidth-flags…]` | Diagnostics (§13). Works with or without a running server. `--only` runs the named checks (install.sh uses `dns,public_ip,clock` before the first start); `--list-checks --json` prints the check ids (06's anchor test) | admin socket if up |
+| `isshoni setup-url [--qr\|--no-qr] [--wait DUR] [--json]` | Mints a one-time setup link and prints it (plus a QR code on a TTY). `--wait` is for Docker and manual use; install.sh waits with `healthcheck --ready` and then calls `setup-url` once | admin socket |
+| `isshoni doctor [--json] [--strict] [--only ID,…] [--list-checks] [--bandwidth-flags…]` | Diagnostics (§13). Works with or without a running server. `--only` runs the named checks (install.sh uses `dns,public_ip,clock` before the first start); `--list-checks --json` prints a JSON array of the check ids (06's anchor test, §13.1) | admin socket if up |
 | `isshoni healthcheck [--ready] [--wait DUR]` | Liveness (default) or readiness. Docker `HEALTHCHECK` (liveness); install.sh uses `--ready` | admin socket |
 | `isshoni admin status [--json]` | Version, uptime, TLS, rooms, connections | admin socket |
 | `isshoni admin backup [--out PATH\|-] [--no-certs] [--offline]` | Writes a backup archive (§12.3) | admin socket |
@@ -109,13 +128,13 @@ Import rules (checked by a `depguard` rule in golangci-lint, 06):
 | `isshoni admin users reset-password NAME` | Prints a one-time password-reset link | admin socket |
 | `isshoni admin users set-role NAME admin\|user` | Changes a role (03's roles) | admin socket |
 | `isshoni admin users disable\|enable NAME` | Blocks or unblocks sign-in (disable revokes sessions and devices) | admin socket |
-| `isshoni admin invite create [--uses N] [--ttl DUR]` | Prints an invite link (defaults from 03: 10 uses, 7 days) | admin socket |
-| `isshoni admin rotate-secrets [--include-vapid] [--yes]` | Rotates generated secrets and restarts the server (§5.3) | admin socket |
+| `isshoni admin invite create [--uses N] [--ttl DUR]` | Prints an invite link. Flags left out are not sent; defaults: the server's invite settings (03 §9). `--ttl` is whole hours from `1h` to `720h` | admin socket |
+| `isshoni admin rotate-secrets [--yes]` | Rotates all generated secrets (session, invite, resume and VAPID keys) and restarts the server (§5.3) | admin socket |
 | `isshoni admin log-level LEVEL [--for DUR]` | Changes the log level at runtime (default `--for 30m`, then back) | admin socket |
 | `isshoni config check` | Loads and validates config; prints problems | – |
 | `isshoni config print [--json]` | Effective config with the source of every value | – |
-| `isshoni config example [config flags]` | Prints a commented `isshoni.toml` with the given values set | – |
-| `isshoni config init --path PATH [config flags]` | Writes the same commented file to PATH (0640, the caller fixes the owner) and refuses to overwrite an existing file (exit 7). install.sh uses it, e.g. `--tls.mode ip --public-ip 203.0.113.7` or `--domain watch.example.com` (06 §4.8) | – |
+| `isshoni config example [config flags]` | Prints a commented `isshoni.toml` with the given values set. Like `config init`, values come from flags only and are validated (errors → exit 78, nothing on stdout) | – |
+| `isshoni config init --path PATH [config flags]` | Writes the same commented file to PATH (0640, the caller fixes the owner) and refuses to overwrite an existing file (exit 7). Values come from flags only; `ISSHONI_*` env is ignored, so the file holds exactly what the caller passed, plus `network.trusted_proxies` in `off` mode with a loopback `listen.http` (§4.4). The resulting config is validated like `config check`: on any error the problems are printed and it exits 78 without writing (warnings are printed and the file is written). install.sh uses it, e.g. `--tls.mode ip --public-ip 203.0.113.7` or `--domain watch.example.com` (06 §4.8) | – |
 | `isshoni version [--short\|--json]` · `isshoni --version` | Build info (§15); `--short` prints only the version, e.g. `0.1.0` (install.sh) | – |
 | `isshoni help [CMD]` | Usage | – |
 
@@ -133,12 +152,12 @@ Conventions:
 | Code | Meaning |
 |---|---|
 | 0 | Success (doctor: no `fail` results) |
-| 1 | Runtime error: cannot bind a port, backup failed, unexpected server error |
+| 1 | Runtime error: cannot bind a port, another isshoni process holds the data-directory lock (§5.1), a `store.Open` error that does not wrap `store.ErrNeedsOperator`, backup failed, unexpected server error |
 | 2 | Usage error: unknown command or flag, missing argument |
-| 78 | `EX_CONFIG`: a configuration or data problem that a restart can't fix: invalid config (all problems are printed, §4.5), a DB schema newer than this binary, a failed migration, a corrupt DB or `secrets.json`, or a container without a data volume (§6.3). systemd's `RestartPreventExitStatus=78` (06) stops the restart loop |
-| 4 | Server not reachable on the admin socket (not running, wrong path, or permission denied) |
+| 78 | `EX_CONFIG`: a configuration or data problem that a restart can't fix: invalid config (all problems are printed, §4.5, including a policy value that 03's `SettingsCache.Pin` rejects), `config init`/`config example`: the given values are invalid, any `store.Open` error for which `errors.Is(err, store.ErrNeedsOperator)` (newer schema, history mismatch, failed migration, corrupt DB, …; 03's message is printed), a corrupt `secrets.json`, wrong owner of data files (§5.2), or a container without a data volume (§6.3). systemd's `RestartPreventExitStatus=78` (06) stops the restart loop |
+| 4 | Server not reachable on the admin socket: not running or wrong path, or permission denied, which prints its own message: "Permission denied on /run/isshoni/admin.sock: run it with sudo (sudo isshoni …)" (§12.1) |
 | 5 | `doctor`: at least one `fail` (with `--strict`, also any `warn`) |
-| 7 | Refused: precondition not met (an admin already exists, backup is newer than this binary, `--offline` while the server runs, running as the wrong user, `config init` target exists) |
+| 7 | Refused: precondition not met (an admin already exists: `setup_unavailable`, backup is newer than this binary, `--offline` while the server runs or holds the data-directory lock, running as the wrong user, `config init` target exists) |
 | 75 | `serve` on a platform without re-exec (Windows): "restart required" after a restore |
 | 130 | Interrupted (SIGINT) |
 
@@ -163,7 +182,8 @@ Running `isshoni setup-url` again makes a new link and cancels this one.
 `--json`: `{"url":"https://203.0.113.7/setup#Qm9f…","expiresAt":"2026-09-30T10:00:00Z","tlsReady":true}`.
 
 When the certificate is not ready yet, the link is still printed with a note: "The certificate isn't ready yet. The
-link works once it is; check with `isshoni doctor`." `--wait 180s` first waits for readiness (install.sh uses this).
+link works once it is; check with `isshoni doctor`." `--wait 180s` first waits for readiness; it is for Docker and
+manual use. install.sh waits with `isshoni healthcheck --ready` and then calls `setup-url` once (06).
 
 QR rendering uses `github.com/skip2/go-qrcode` (MIT) `ToSmallString`: half-block characters, 2-module quiet zone.
 It is a new dependency (permissive) added for this command only.
@@ -193,16 +213,24 @@ For TOML path `section.key` (or top-level `key`):
 - flag: `--` + path with `_` → `-`. Example: `--tls.mode`, `--public-ip`, `--listen.admin-socket`.
 - Lists in env and flags are comma-separated (`ISSHONI_NETWORK_TRUSTED_PROXIES=10.0.0.0/8,172.16.0.0/12`). Durations
   use Go syntax (`10s`, `168h`). Booleans: `true/false/1/0`.
+- An env variable set to the empty string (`ISSHONI_PUBLIC_IP=`) is treated as unset: the value comes from the file or
+  the default, `Source` is not `env`, and `IsSet` is false. This is what compose's `${VAR:-}` produces. To set a key
+  to an empty string, use the file or a flag.
 
 All keys are declared once in `config/keys.go` (path, default, kind, help, `Policy` flag, consumer). That registry
-drives the TOML decoder, env and flag parsing, `config print`, `config example`, `serve --help` and the generated
-config reference on the project site (06). **Other docs add keys only through this registry.**
+drives the TOML decoder, env and flag parsing, `config print`, `config example` and `serve --help`; the site's
+`/reference/config` is hand-written from this registry in M1 and generated later (M5, 06 §10.2). **Other docs add
+keys only through this registry.**
 
 Unknown keys:
 - In the file: error 78, with position and a "did you mean" suggestion (edit distance ≤ 2), from go-toml/v2
   `DisallowUnknownFields` (`*toml.StrictMissingError`).
-- In env: a warning with the same suggestion (env may hold unrelated variables). `ISSHONI_VERSION` (install.sh) and
-  `ISSHONI_CONFIG` are known and ignored.
+- In env: a warning with the same suggestion (env may hold unrelated variables).
+- Reserved non-key names are ignored without a warning. The list lives in `config/keys.go` next to the registry and
+  matches 06's list; a new non-key `ISSHONI_*` name must be added to both: `ISSHONI_CONFIG`, `ISSHONI_VERSION`
+  (install.sh target version and the Vite build version), `ISSHONI_YES`, `ISSHONI_NO_FIREWALL`,
+  `ISSHONI_DOWNLOAD_BASE`, `ISSHONI_INSTALL_SOURCED`, `ISSHONI_INSTALLER_VERSION`, `ISSHONI_SNAPSHOT_VERSION`,
+  `ISSHONI_BIN`, `ISSHONI_DEV_SERVER`. The env-only switches of §4.3 are read, not ignored.
 
 ### 4.3 Key reference
 
@@ -248,7 +276,7 @@ Unknown keys:
 | `network.exclude_interfaces` | `["docker*","br-*","veth*","virbr*","cni*","flannel*","cali*","kube-*"]` | Glob list; never used for media |
 | `network.include_loopback` | `false` | Dev only: advertise 127.0.0.1 / ::1 candidates |
 | `network.udp_buffer_bytes` | `8388608` | SO_RCVBUF/SO_SNDBUF requested on media sockets; needs sysctl ≥ this (§13) |
-| `network.trusted_proxies` | `[]` | CIDRs allowed to set `X-Forwarded-*` (`off` mode only, §8.5) |
+| `network.trusted_proxies` | `[]`; `["127.0.0.0/8", "::1/128"]` when the effective mode is `off` and `listen.http` is loopback (§4.4) | CIDRs allowed to set `X-Forwarded-*` (`off` mode only, §8.5). `config init` writes the loopback default into the file explicitly |
 
 **Policy keys** (§4.6: editable in the admin UI unless set here; 03's settings field in brackets)
 
@@ -267,12 +295,12 @@ Unknown keys:
 | Key | Default | Consumer |
 |---|---|---|
 | `limits.ws_handshakes_per_ip_per_minute` | `20` | 01's hub (plan guard). Raise it for LAN parties behind one IP |
-| `limits.conns_per_ip` | `256` | netx: open TCP connections per source IP on 443 and 80 |
+| `limits.conns_per_ip` | `256` | netx: open TCP connections per source IP (IPv4 address or IPv6 /64, §7.2) on 443 and 80 |
 | `sfu.pause_unwatched_layers` | `true` | 02 §11: hint browsers to pause the full layer nobody watches |
 
 **Env-only switches** (not keys; read directly): `ISSHONI_CONFIG` (config path), `ISSHONI_IN_CONTAINER=1` (set by
-06's image; also detected, §5.1), `ISSHONI_ALLOW_EPHEMERAL_DATA=1` (tests only: skip the container data-volume check),
-`ISSHONI_VERSION` (install.sh only; ignored).
+06's image; also detected, §5.1), `ISSHONI_ALLOW_EPHEMERAL_DATA=1` (tests only: skip the container data-volume check).
+The other reserved names of §4.2 (`ISSHONI_VERSION`, install.sh's and the dev tasks' variables) are ignored.
 
 **`[push]`, `[metrics]`, `[log]`, `[updates]`**
 
@@ -288,11 +316,11 @@ Unknown keys:
 | `updates.release_url` | GitHub releases API URL of `MoonWX/isshoni` | Hidden; tests only |
 
 `isshoni config example --public-ip 203.0.113.7` prints (comments abbreviated here; `config init --path P` writes
-the same text):
+the same text; the `Reference` URL is built from `version.DocsURL`):
 
 ```toml
 # isshoni server configuration. Every key also has an ISSHONI_* env variable and a --flag.
-# Reference: https://<project-site>/config
+# Reference: https://moonwx.github.io/isshoni/reference/config
 
 # domain = "watch.example.com"   # set this to use a domain; empty = use the public IP
 public_ip = "203.0.113.7"        # "auto" detects it with STUN
@@ -318,6 +346,18 @@ domain is error 78 (fix: set `domain`, or use `ip`).
 | `manual` | `https://<domain>` if set, else `https://<public ip>` | same |
 | `off` | `public_url`; dev (loopback `listen.http`, no `public_url`): `http://localhost:<port>` | from the URL |
 
+`Dev` is true only when the effective mode is `off`, `listen.http` is a loopback address, and `public_url` is empty or
+its host is `localhost`, `127.0.0.1` or `[::1]`. A reverse-proxy install (an `https://` public URL on a real host
+name) is never dev.
+
+**Trusted proxies in `off` mode**: when the effective mode is `off`, `listen.http` is a loopback address and
+`network.trusted_proxies` is not set (`IsSet` false), the effective value is `["127.0.0.0/8", "::1/128"]`. Only
+local processes can reach a loopback listener, so trusting them is safe, and it keeps the common setup (Caddy or nginx
+on the same host, `listen.http = "127.0.0.1:8080"`) from showing every friend as `127.0.0.1`. Otherwise every per-IP
+guard of 01 and 03 would be one shared bucket, and one stranger's failed logins would block sign-in for everyone. An
+explicit value, even `[]`, wins. `config init` writes the value into the file explicitly in this case (the one value
+it writes that the caller did not pass), so the operator sees it.
+
 ```go
 package config
 
@@ -336,7 +376,7 @@ type Site struct {
 	Host     string  // "watch.example.com", "203.0.113.7", "[2001:db8::1]", with ":port" if not default
 	Hostname string  // without port and brackets
 	TLSMode  TLSMode
-	Dev      bool    // off mode on a loopback listener: accept any localhost Host header
+	Dev      bool    // off mode, loopback listen.http, public_url empty or on a loopback host: accept any localhost Host header
 	// ExtraOrigins: later (M2) the Wails asset origins, added in code, not config.
 	ExtraOrigins []string
 }
@@ -376,6 +416,7 @@ Rules (E = error, W = warning):
 | Durations > 0; `udp_buffer_bytes` between 1 MiB and 64 MiB | E |
 | `push.subject` starts with `mailto:` or `https:` | E |
 | `clients.min_version` is SemVer | E |
+| Policy key value accepted by 03's `SettingsCache.Pin` (ranges of 03 §9) | E (at serve startup; reported like other config errors, exit 78) |
 | `metrics.listen` not loopback | W |
 | `tls.acme_staging` or `tls.acme_ca_root` set | W (not for production) |
 
@@ -387,11 +428,17 @@ A few product settings can be changed in the admin UI (stored by 03 in `settings
 pinned by an operator in config. The rule, borrowed from Mattermost's env overrides:
 - If a policy key is set by flag, env or file, it wins, and the admin UI shows the field read-only with "Set in the
   server config".
-- Otherwise the DB value applies; otherwise the registry default.
+- Otherwise the DB value applies; otherwise 03's default (`SettingsCache.Defaults()`). The registry repeats that
+  default for docs and `config example` only, and a wiring unit test asserts they match.
 
 Mechanism: after `store.Open` and before serving, the wiring calls 03's `SettingsCache.Pin(field, value)` for every
 policy key where `cfg.IsSet(key)` is true, using the key → field map in §4.3. 03's `Locked()` then lists the field,
-the admin UI shows it read-only, and `PATCH /admin/settings` answers 409 `setting_locked`.
+the admin UI shows it read-only, and `PATCH /admin/settings` answers 409 `setting_locked`. 03's settings are the only
+source of validation for policy values: a `Pin` error becomes a config `Problem` naming the TOML key, its source and
+03's field code, and `serve` exits 78 (§4.5).
+
+`config print` shows an unpinned policy key as "not set (admin UI value applies)", because the effective value lives
+in the DB.
 
 ### 4.7 Go API
 
@@ -414,6 +461,7 @@ type Config struct {
 	Registration Registration `toml:"registration"`
 	Clients      Clients      `toml:"clients"`
 	Limits       Limits       `toml:"limits"`
+	SFU          SFU          `toml:"sfu"`
 	Push         Push         `toml:"push"`
 	Metrics      Metrics      `toml:"metrics"`
 	Log          Log          `toml:"log"`
@@ -437,16 +485,19 @@ type Network struct {
 	ExcludeInterfaces []string
 	IncludeLoopback   bool
 	UDPBufferBytes    int
-	TrustedProxies    []netip.Prefix
+	TrustedProxies    []netip.Prefix // effective value: the loopback default of §4.4 is filled in by Load
 }
 type Registration struct{ Mode string }
 type Clients struct{ MinVersion string }
 type Limits struct {
+	MaxParticipantsPerRoom     int // toml: max_participants_per_room
+	MaxSharesPerRoom           int // toml: max_shares_per_room
 	TransferAlertGB            int
 	MaxBitrateKbps             int
 	WSHandshakesPerIPPerMinute int
 	ConnsPerIP                 int
 }
+type SFU struct{ PauseUnwatchedLayers bool } // toml: pause_unwatched_layers
 type Push struct {
 	Enabled bool
 	Subject string
@@ -503,6 +554,7 @@ type Paths struct {
 ```
 /var/lib/isshoni/             0700 isshoni:isshoni (systemd StateDirectory; Docker volume, uid 65532)
 ├─ isshoni.db, -wal, -shm     03 (SQLite)
+├─ isshoni.lock               data-directory lock (flock; see below)
 ├─ secrets.json               0600 (§5.2)
 ├─ certmagic/                 0700, certmagic FileStorage (certificates, ACME account keys, locks)
 ├─ backups/                   0700: pre-<schema>-<ts>.db (03, last 5), pre-restore-<ts>.tar.gz (§12.4, last 5)
@@ -511,13 +563,19 @@ type Paths struct {
 
 Startup checks (fail → exit 78 with a fix line; restarting can't help):
 - The server sets `umask 0077` first, so everything it creates is private.
-- `data_dir` must exist and be writable by the process (fix: `sudo chown -R isshoni:isshoni /var/lib/isshoni`, or in
-  Docker for bind mounts `sudo chown -R 65532:65532 ./data`).
+- `serve` creates `data_dir` (and the admin socket's parent directory) with mode 0700 if missing. If `data_dir` is
+  owned by the process and wider than 0700, it is chmod-ed to 0700 with a warning. It must then be writable by the
+  process; the fix line prints the process's real uid:gid (e.g. `sudo chown -R isshoni:isshoni /var/lib/isshoni` on
+  systemd, `sudo chown -R 65532:65532 <host path>` for a bind mount in bridge compose, `0:0` in `compose.host.yaml`).
 - **In a container, `data_dir` must be a mount** (checked in `/proc/self/mountinfo`: a mount point equal to `data_dir`
-  or a parent other than `/`). Otherwise exit 78: "Your data would be lost when the container is removed. Mount a
-  volume at /var/lib/isshoni (see compose.yaml), e.g. `-v isshoni-data:/var/lib/isshoni`." `ISSHONI_ALLOW_EPHEMERAL_DATA=1`
+  or a parent other than `/`). The check runs after the directory is created, so a directory that `serve` just created
+  in a container still exits 78: "Your data would be lost when the container is removed. Mount a volume at
+  /var/lib/isshoni (see compose.yaml), e.g. `-v isshoni-data:/var/lib/isshoni`." `ISSHONI_ALLOW_EPHEMERAL_DATA=1`
   skips the check (tests only). Rationale: losing the admin account and certs on `docker compose down` is the worst
   failure for a foolproof setup (a stricter form of the plan's "doctor fails").
+- **Data-directory lock**: `serve` holds an exclusive `flock` (`LockFileEx` on Windows) on `data_dir/isshoni.lock` for
+  its lifetime. If it can't get it, it exits 1: "another isshoni process is using <data_dir>". Offline commands take
+  the same lock non-blocking (§12.6). The lock also works across containers that share the volume.
 - Running as uid 0 outside a container logs a warning (install.sh creates the `isshoni` user). Root inside a container
   is the documented host-network variant (06), so it is allowed.
 - If `GOMEMLIMIT` is unset and a cgroup memory limit exists, the server calls `debug.SetMemoryLimit(0.8 × limit)`.
@@ -550,8 +608,8 @@ fsync, rename, fsync of the directory). Format:
 
 - Keys are registered by name in code; a registered name missing from the file (added by a newer version) is generated
   and saved at startup. Unknown names in the file are kept.
-- File mode wider than 0600 → fixed to 0600 with a warning. Owner ≠ process uid → exit 1 ("run: sudo chown isshoni:
-  isshoni /var/lib/isshoni/secrets.json"). Corrupt JSON → exit 78 with reason `secrets_corrupt` and the fix "restore
+- File mode wider than 0600 → fixed to 0600 with a warning. Owner ≠ process uid → exit 78 ("run: sudo chown isshoni:
+  isshoni /var/lib/isshoni/secrets.json"; restarting can't fix it). Corrupt JSON → exit 78 with reason `secrets_corrupt` and the fix "restore
   it: `isshoni admin restore --offline <backup>`" (never silently regenerated: that would log everyone out).
 - VAPID keys come from `webpush.GenerateVAPIDKeys()`.
 
@@ -560,22 +618,23 @@ server (§5.3), so every consumer only has to handle "the key differs from last 
 
 | Key | Consumer | After rotation (at the next start) |
 |---|---|---|
-| `session` | 03 | Key fingerprint changed → all web sessions **and** device tokens are deleted (03 §4.6; everyone signs in again; desktop apps relink, M2+) |
-| `invite` | 03 | Fingerprint changed → outstanding invite, setup, password-reset and device-code links are deleted |
+| `session` | 03 | Key fingerprint changed → all web sessions, device tokens and device codes are deleted (03 §4.6), and with the sessions every web push subscription (cascade, 03 §5); users sign in again and the SPA re-subscribes (desktop apps relink, M2+) |
+| `invite` | 03 | Fingerprint changed → outstanding invite, setup and password-reset links are deleted |
 | `resume` | 01 | Nothing to do: old resume tokens fail the HMAC; clients do a fresh join (harmless) |
-| `vapid` | push (§14) | Fingerprint in 03's `meta` key `vapid_key_fp` changed → all push subscriptions are deleted; each browser re-subscribes the next time the app opens (05) |
+| `vapid` | push (§14) | Fingerprint in 03's `meta` key `vapid_key_fp` changed → all push subscriptions are deleted; each browser re-subscribes the next time the app opens (05). The check runs synchronously in `push.New`, before any listener serves (§6.1 step 8) |
 
 ### 5.3 Rotation (`isshoni admin rotate-secrets`)
 
-- Default set: `session`, `invite`, `resume`. `--include-vapid` adds VAPID. Rationale: VAPID rotation silently stops
-  phone notifications until each phone reopens the app, and a leaked VAPID key only lets someone send notifications
-  if they also have the subscription list.
+- Rotates all four: `session`, `invite`, `resume` and VAPID (plan: "`isshoni admin rotate-secrets` rotates them").
+  There is no flag to pick keys; the CLI always sends `vapid: true`. The session rotation already deletes every push
+  subscription (cascade), so rotating VAPID at the same time costs nothing extra.
 - Hard cut, no overlap window: rotation is for suspected compromise, so old keys must stop working immediately.
 - Order: write the new file atomically → reply `202 {"rotated": [...], "restarting": true}` → graceful shutdown with
   reason `restart` (clients see the restart notice, §6.4) → re-exec (§6.5). At startup each consumer compares key
   fingerprints (table above) and purges; 03 writes the `secrets.rotated` audit row and the `secrets_rotated` admin
-  alert. Rationale: no live key swapping and no hook ordering; a restart costs clients a few seconds, and rotation is
-  rare.
+  alert. The alert stays as an audit and security event plus a log line; after a session rotation its push copy
+  reaches no one, because no subscriptions are left. Rationale: no live key swapping and no hook ordering; a restart
+  costs clients a few seconds, and rotation is rare.
 
 ```go
 package config
@@ -639,21 +698,32 @@ var ErrRestartRequested = errors.New("server: restart requested") // cmd/isshoni
 ### 6.1 Startup sequence (`serve`)
 
 1. Parse config (exit 78 on errors). Build the logger (§10).
-2. Data dir checks, `umask`, memory limit (§5.1).
-3. Open `secrets.json` (create on first run; corrupt → exit 78).
-4. Open the store (03: migrations with the pre-migration backup). A `*store.SchemaTooNewError`, a failed migration or
-   a corrupt database → print 03's message (it names the backup to restore) and exit 78 (§6.3). Then pin the policy
-   settings that the config sets (§4.6).
+2. `umask`, data dir checks (create with 0700, tighten, writable, container mount), the data-directory lock, memory
+   limit (§5.1).
+3. Open `secrets.json` (create on first run; corrupt or wrong owner → exit 78).
+4. Open the store (03: migrations with the pre-migration backup). A `store.Open` error for which
+   `errors.Is(err, store.ErrNeedsOperator)` (newer schema, history mismatch, failed migration, corrupt database, …) →
+   print 03's message and exit 78 (§6.3); any other `store.Open` error → print it and exit 1. On a
+   `*store.SchemaTooNewError` with a non-empty `Backup`, 03's message states the problem, the versions and the backup
+   file; 04 then prints the restore command for the environment (Docker when a container is detected, §5.1):
+   - systemd: `sudo -u isshoni isshoni admin restore --offline <Backup>`, then `sudo systemctl start isshoni`;
+   - Docker: `docker compose stop && docker compose run --rm isshoni admin restore --offline <Backup> && docker compose up -d`.
+
+   Offline doctor's `schema` fix uses the same formatter (§13.2). Then pin the policy settings that the config sets
+   (§4.6); a value that `Pin` rejects → exit 78.
 5. Detect public addresses (§7.4; ≤ 5 s).
-6. Bind listeners: 443 multiplexer, 80, 7882/udp (per local IP), 7882/tcp, metrics, admin socket. A busy port → exit 1
-   with the owner if known ("port 443 is in use (another web server?). Stop it, or run isshoni behind it with
-   `tls.mode = "off"`").
+6. Bind listeners: 443 `PortMux`, 80, metrics, admin socket; then `netx.NewTransport` binds 7882/udp (per local IP)
+   and 7882/tcp. `NewTransport` is the only code that binds 7882. A busy port → exit 1 with the owner if known
+   ("port 443 is in use (another web server?). Stop it, or run isshoni behind it with `tls.mode = "off"`"; "port
+   7882/udp is in use (another isshoni?). Stop it, or change `listen.ice_udp`").
 7. Start the TLS manager (certificate is obtained asynchronously).
-8. Build `netx.Transport`, then the components and adapters of §6.6 (SFU, hub, auth, httpapi, push, ops); register
-   readiness checks.
+8. Build the components and adapters of §6.6 on top of the existing Transport, in this order: `push.New` (VAPID
+   fingerprint check and purge; not built with `push.enabled=false`), then `auth.New` (session and invite fingerprint
+   checks with the push `AdminAlerter`, 03 §4.6), then httpapi, hub, SFU (on the Transport), ops; register readiness
+   checks. Every fingerprint purge finishes here, before any listener serves in step 9.
 9. Start HTTP servers and the admin socket (listeners are bound; the certificate may still be pending).
 10. Log one line: `isshoni 0.3.0 ready: https://203.0.113.7 (tls=ip) media udp/7882 ice-tcp 443,7882`. If no admin
-    exists: "Finish setup: run `isshoni setup-url` (Docker: `docker compose exec isshoni isshoni setup-url`)". The
+    exists: "Finish setup: run `sudo isshoni setup-url` (Docker: `docker compose exec isshoni isshoni setup-url`)". The
     setup token itself is **never** logged.
 
 ### 6.2 Liveness and readiness
@@ -672,12 +742,14 @@ Liveness is false after shutdown began. Endpoints: §11.1.
 
 ### 6.3 Refusing to start
 
-When the server loads its config but can't safely serve (newer schema, failed migration, corrupt DB, corrupt
-`secrets.json`, no data volume in a container), it **exits 78** with one actionable message (plan: "refuses to start
-on a newer schema and tells the user which backup to restore"). Rationale: simpler than a half-running server, and
-systemd's `RestartPreventExitStatus=78` (06) prevents a restart loop.
+When the server loads its config but can't safely serve (a `store.Open` error wrapping `store.ErrNeedsOperator`:
+newer schema, history mismatch, failed migration, corrupt DB, …; a corrupt or wrongly owned `secrets.json`; no data
+volume in a container), it **exits 78** with one actionable message (plan: "refuses to start on a newer schema and
+tells the user which backup to restore"). Rationale: simpler than a half-running server, and systemd's
+`RestartPreventExitStatus=78` (06) prevents a restart loop.
 
-Recovery is offline (§12.6), because nothing is listening:
+Recovery is offline (§12.6), because nothing is listening. For a newer schema the server prints the exact command for
+its environment (§6.1 step 4):
 - systemd: `sudo -u isshoni isshoni admin restore --offline /var/lib/isshoni/backups/pre-4-20261014T021500Z.db` (a
   pre-migration DB file) or `… --offline backup.tar.gz`, then `sudo systemctl start isshoni`. Installing the newer
   version again is the other fix for a newer schema.
@@ -698,8 +770,8 @@ and for a restore or `rotate-secrets` restart:
 | 1. `readyz` → 503 `shutting_down` | 0 | Load balancers/monitors stop sending |
 | 2. New `/ws` upgrades and API calls → 503 `server_shutdown` (`Retry-After: 5`) | 0 | |
 | 3. `Hub.Shutdown(ctx, reason)` (01): every connection gets `server.shutdown{reason, reconnectInMs}` and `error{code: "server_shutdown", retryable: true, scope: "connection"}`, then WebSocket close **1012 (Service Restart)**. The wire reason is `restart` for SIGTERM, restore and rotation (SIGTERM can't tell stop from restart) | ≤ 2 s | The SPA shows "Server restarting… reconnecting" and reconnects after `reconnectInMs`; after the restart it rejoins and re-publishes (01 §10.5–§10.6) |
-| 4. `SFU.Close()` closes all PeerConnections; then `Transport.Close()` closes the muxes | ≤ 1 s | |
-| 5. `http.Server.Shutdown` on all servers | ≤ 5 s | Idle keep-alives close |
+| 4. `SFU.Close()` closes all PeerConnections (concurrently; 02 guarantees it returns within 1 s); then `Transport.Close()` closes the muxes | ≤ 1 s | |
+| 5. `http.Server.Shutdown` on all servers, then `PortMux.Close()` (closes the raw :443 listener and both sub-listeners; the ICE sub-listener may already be closed by `Transport.Close`, which is harmless) | ≤ 5 s | Idle keep-alives close |
 | 6. Flush transfer counters, drain the push queue (≤ 2 s), close the admin socket, close the store (WAL checkpoint) | ≤ 2 s | |
 | 7. Exit 0 (or re-exec, §6.5) | total ≤ `shutdown_timeout` (10 s) | |
 
@@ -718,28 +790,32 @@ A second SIGTERM/SIGINT exits immediately with code 1. 06 sets systemd `TimeoutS
 
 ### 6.6 Wiring (`internal/server/wire.go`)
 
-The only place that imports 01's `signal` and `sfuplane`, 02's `sfu`, and 03's `store`, `auth` and `httpapi` together.
-Each adapter is a few lines and has a table test.
+The only place (with `cmd/isshoni` and `servertest`, §2) that imports 01's `signal` and `sfuplane`, 02's `sfu`, and
+03's `store`, `auth` and `httpapi` together. Each adapter is a few lines and has a table test.
 
 | Consumer interface | Implemented by | Mapping |
 |---|---|---|
-| `sfu.Config.Transport` | `netx.NewTransport` (§7.3) | built once; the SFU calls `Apply` |
+| `sfu.Config` | built by the wiring | `Transport` = `netx.NewTransport` (§7.3; built once in §6.1 step 6, the SFU calls `Apply`); `PauseUnwatchedLayers` = config `sfu.pause_unwatched_layers`; `Limits` = `Limits{MaxShareKbps: SettingsCache.Get().maxShareBitrateKbps}` at construction |
 | `sfu.Deps.Events` (`RoomEvents`) and `signal.Deps.Media` (`MediaPlane`) | 01's `sfuplane.New`, then `Plane.Bind(sfu)` | 01 §15.4 |
-| `signal.Authenticator` | 03's `auth.Service` | `AuthenticateRequest` → `Authenticate(r)` (cookie only in M1; `Principal` → `Identity{UserID, Name: Username, Admin: Role == admin, SessionID}`); `Revalidate(ctx, id, ip)` → `Touch` + user re-read; `AuthenticateBearer` → `ErrInvalid` in M1 (M2: `AuthenticateBearerToken`) |
+| `signal.Authenticator` | 03's `auth.Service` | `AuthenticateRequest` → `AuthenticateCookie(r)` (`auth.ErrNoCookie` → `ErrNoCredentials`, `*api.Error{unauthenticated}` → `ErrInvalid`, other errors passed through; `Principal` → `Identity{UserID, Name: Username, Admin: Role == admin, SessionID}`); `Revalidate(ctx, id, ip)` → `Touch` + user re-read; `*api.Error{unauthenticated}` → `signal.ErrInvalid`, any other error passed through (transient); `AuthenticateBearer` → `ErrInvalid` in M1 (M2: `AuthenticateBearerToken`) |
 | `signal.RoomDirectory` | 03's store | `GetRoom` → `RoomByID` (`store.ErrNotFound` → `signal.ErrNotFound`); `DefaultRoomID` → `store.DefaultRoomID`; `CanJoin` → nil |
 | `signal.Deps.Policy` | 03's `SettingsCache.Get()` | `minClientVersion`, `maxParticipantsPerRoom`, `maxSharesPerRoom`, `maxShareBitrateKbps × 1000` |
 | `signal.PushNotifier` | this doc's `push.Service.ShareStarted` | same fields (`PresentUserIDs`, `At`) |
 | `auth.ConnCloser` | 01's `Hub.CloseConnections` | selector fields copied; `account_disabled` → `ErrorCodeAccountDisabled`, every other reason → `ErrorCodeSessionRevoked` |
-| `auth.AdminAlerter` | `push.Service.AdminAlert` | payload `admin.alert` (§14.3) |
+| `auth.AdminAlerter` (`auth.Options.Alerts`) | `push.Service.AdminAlert` | payload `admin.alert` (§14.3); `nil` with `push.enabled=false` (alerts are then only logged) |
 | `httpapi.Signal` | 01's hub | `RoomPresence`/`OnlineUserIDs` from `Hub.Snapshot()`; `RoomDeleted` → `CloseRoom`; `UserChanged` → `UpdateUser`; `Notify` → `Hub.Notify` |
-| `httpapi.Push` | `push.Service` | `VAPIDPublicKey`, `ValidateEndpoint`, `SendTest` |
+| `httpapi.Push` | a wiring adapter over `push.Service` | `VAPIDPublicKey` and `ValidateEndpoint` passed straight through; `SendTest` converts `[]store.PushSubscription` to `[]push.Subscription` |
 | `httpapi.InfoSource` | `internal/version`, `internal/protocol` | `ServerVersion`, `Protocol` |
+| `httpapi.RouteObserver` (`RouterOptions.Observer`) | `ops.Metrics` | `ObserveRoute(pattern, status, bytes)` (§9.2) |
 | 02's live limits | `SettingsCache.OnChange` | `SFU.SetLimits(Limits{MaxShareKbps: maxShareBitrateKbps})` |
+| `ops.Policy` (`TransferAlertGB() int`, `ReleaseCheck() bool`) | 03's `SettingsCache.Get()` | `transferAlertGb`, `updateCheck`; read on every tick (§11.3, §11.5) |
 | `ops.LiveSource`, `ops.AccountsSource`, `ops.Prober` | hub + SFU, 03's `API.DashboardAccounts`, `SFU.Probe` | §11.4, §7.7 |
-| `push.Store`, `push.Directory` | 03's store | §14.7 |
-| REST routes of `ops` and `push`-adjacent handlers | 03's `API.Handle` | `POST /api/v1/conntest` (User), `GET /api/v1/admin/dashboard`, `GET\|POST /api/v1/admin/doctor`, `GET /api/v1/admin/bandwidth` (Admin) |
+| Offline DB functions of `ops` (backup, restore) and `ops/doctor` (`schema`) | 03's `store.LatestSchemaVersion`, `store.InspectFile`, `store.BackupFile` | passed as function values (§2); `cmd/isshoni` does the same for offline commands (§12.3, §12.4, §13.1) |
+| `push.Store` | 03's store | §14.7 |
+| `push.enabled=false` | – | the wiring passes `httpapi.Deps.Push = nil` and `auth.Options.Alerts = nil`, and does not start `push.Service`; 03 then answers `push_unavailable` and omits `push` from `/info` |
+| REST routes of `ops` and `push` | 03's `API.Handle` | each typed `ops`/`push` function is wrapped with `httpapi.DecodeJSON`/`WriteJSON`/`WriteError` and registered through `API.Handle` with the principal from `httpapi.PrincipalFrom` (§2): `POST /api/v1/conntest` (User), `GET /api/v1/admin/dashboard`, `GET\|POST /api/v1/admin/doctor`, `GET /api/v1/admin/bandwidth` (Admin) |
 | Admin socket handlers | 03's `auth.Service`, `store.DB` | 03 §12.6 table |
-| Metrics | `ops.Metrics.Registerer()` to 01; an adapter over `SFU.Metrics()` | §11.2 |
+| Metrics | `ops.Metrics.Registerer()` to 01; a `prometheus.Collector` over `SFU.Metrics()` | §11.2 |
 
 ## 7. Networking (`internal/server/netx`)
 
@@ -767,10 +843,10 @@ package netx
 type PortMuxOptions struct {
 	Addr             string        // ":443"
 	ClassifyTimeout  time.Duration // 10 s: time allowed for the first byte
-	MaxPending       int           // 1024 connections waiting for their first byte
-	MaxPendingPerIP  int           // 32
-	MaxConnsPerIP    int           // limits.conns_per_ip (256): open TLS + ICE connections per source IP
-	MaxICEConnsPerIP int           // 64
+	MaxPending       int           // 1024 connections waiting for their first byte; when full, the oldest is closed
+	MaxPendingPerIP  int           // 32 per IPKey
+	MaxConnsPerIP    int           // limits.conns_per_ip (256): open TLS + ICE connections per IPKey
+	MaxICEConnsPerIP int           // 64 per IPKey; one count across 443 and 7882/tcp (§7.3)
 	QueueLen         int           // 128 per sub-listener; a full queue for 1 s drops the connection
 	PublicHost       string        // for the plain-HTTP hint response
 	Counter          *TransferCounter
@@ -781,14 +857,20 @@ type PortMux struct{ /* … */ }
 
 func ListenPortMux(opts PortMuxOptions) (*PortMux, error)
 func (m *PortMux) TLS() net.Listener // conns whose first byte was 0x16; the byte is replayed
-func (m *PortMux) ICE() net.Listener // conns that start with an RFC 4571 frame; Addr() is the *net.TCPAddr of :443
+func (m *PortMux) ICE() net.Listener // conns that start with an RFC 4571 frame; Addr() is the *net.TCPAddr of :443;
+                                     // its Close is idempotent (Transport.Close closes it, then PortMux.Close again)
 func (m *PortMux) Addr() net.Addr
-func (m *PortMux) Close() error      // both sub-listeners then return net.ErrClosed from Accept
+func (m *PortMux) Close() error      // raw listener and both sub-listeners; Accept then returns net.ErrClosed
 func (m *PortMux) Stats() PortMuxStats
 
 type PortMuxStats struct {
 	TLS, ICE, PlainHTTP, Garbage, Timeout, Limited uint64 // accepted-connection outcomes
 }
+
+// IPKey is the key of every per-IP count in netx (pending, open and ICE, on 443, 80 and 7882/tcp): an IPv4 address
+// (IPv4-mapped IPv6 is unmapped first) as its /32, an IPv6 address as its /64. It gives the same result as 03's
+// limiter key (03 §7.3) and 01's pre-auth key (01 §3.1).
+func IPKey(a netip.Addr) netip.Prefix
 ```
 
 Accept loop: the raw listener's `Accept` never blocks on classification; each connection gets a goroutine that sets a
@@ -810,9 +892,18 @@ Handoff:
   the plan's 10 s handshake limit.
 - `ICE()` goes to `ice.NewTCPMuxDefault(ice.TCPMuxParams{Listener: m.ICE(), FirstStunBindTimeout: 10 * time.Second,
   AliveDurationForConnFromStun: 30 * time.Second, ReadBufferSize: 64, WriteBufferSize: 4 << 20, Logger: pionLog})`.
-  DTLS then has 10 s too (02 sets it with `SetDTLSConnectContextMaker`).
-- Per-IP counts are decremented when a connection closes (the wrapper's `Close` hook). Exceeding a limit closes the
-  new connection immediately and counts it as `Limited`.
+  The 7882/tcp listener uses the same `TCPMuxParams` (§7.3). DTLS then has 10 s too (02 sets it with
+  `SetDTLSConnectContextMaker`).
+- Per-IP counts are keyed by `IPKey`, so one IPv6 host that owns a /64 (every VPS has one) counts once, not once per
+  address. netx may not import 03's `auth` (§2), so it has its own few-line function; a wiring unit test (§17) pins
+  `netx.IPKey` and 03's limiter key to the same result.
+- Per-IP counts are decremented when a connection closes (the wrapper's `Close` hook). Exceeding a per-IP limit closes
+  the new connection immediately and counts it as `Limited`.
+- A full pending pool works the other way round: when `MaxPending` connections are waiting for their first byte, the
+  **oldest** pending connection is closed (counted as `Limited`) and the new one is admitted (after the per-IP pending
+  check, which still closes the new one when its key already has 32 pending). Silent sockets then only
+  push each other out; they can't lock friends out of 443. Pending connections sit in a FIFO list under the mux's
+  mutex; closing one makes its classifier goroutine's `Read` fail, which removes it.
 - Byte counters (`Counter`) wrap both routes: ICE → path `media_tcp`, TLS → path `web`.
 
 HTTP/2, ALPN and WebSocket:
@@ -839,13 +930,14 @@ type TransportOptions struct {
 	UDPAddr           string   // listen.ice_udp; "" = no UDP
 	TCPAddr           string   // listen.ice_tcp; "" = no 7882/tcp
 	PortMux           *PortMux // 443 ICE sub-listener; nil in off mode
+	MaxICEConnsPerIP  int      // 64 per IPKey; shares PortMux's ICE count when PortMux is set (one count for 443 and 7882)
 	ExcludeInterfaces []string
 	IncludeLoopback   bool
 	IPv6              bool
 	UDPBufferBytes    int
 	Public            PublicAddrs
 	InContainer       bool
-	CloudProvider     string   // §13.3
+	CloudProvider     api.CloudProvider // §13.3
 	Counter           *TransferCounter
 	PacketConns       []net.PacketConn // tests only: use these instead of binding UDPAddr (02's sfutest.FaultConn)
 	Logger            *slog.Logger
@@ -854,7 +946,7 @@ type TransportOptions struct {
 type AdvertisedAddr struct {
 	Proto string // "udp" | "tcp"
 	Addr  netip.AddrPort
-	Via   string // "udp7882" | "tcp443" | "tcp7882"
+	Via   string // "udp" | "tcp443" | "tcp7882"
 	LAN   bool   // kept private address (Append mode, §7.5)
 }
 
@@ -862,13 +954,13 @@ type Transport struct {
 	UDPMux          ice.UDPMux // *ice.MultiUDPMuxDefault; nil if UDP disabled
 	TCPMux          ice.TCPMux // *ice.MultiTCPMuxDefault over 443 and 7882; nil if neither
 	TCPMux443       ice.TCPMux // the 443 part alone (02's per-transport probe APIs); nil in off mode
-	TCPMux7882      ice.TCPMux // the 7882 part alone; nil if listen.ice_tcp is 
+	TCPMux7882      ice.TCPMux // the 7882 part alone; nil if listen.ice_tcp is ""
 	NetworkTypes    []webrtc.NetworkType // udp4/udp6/tcp4/tcp6 as available
 	RewriteRules    []webrtc.ICEAddressRewriteRule
 	InterfaceFilter func(name string) bool
 	IPFilter        func(ip net.IP) bool
 	IncludeLoopback bool
-	Advertised      []AdvertisedAddr
+	Advertised      []AdvertisedAddr // every advertised address with its final address:port after rewrite rules
 	RcvBuf, SndBuf  int // effective socket buffers read back with getsockopt
 }
 
@@ -877,6 +969,8 @@ func NewTransport(ctx context.Context, opts TransportOptions) (*Transport, error
 // Apply configures a SettingEngine: SetICEUDPMux, SetICETCPMux, SetNetworkTypes, SetInterfaceFilter,
 // SetIPFilter, SetICEAddressRewriteRules, SetIncludeLoopbackCandidate, and mDNS disabled.
 // 02 calls it for each webrtc.API it builds, then adds its own settings (DTLS timeout, ICE timeouts…).
+// Apply only calls SettingEngine setters and keeps no other state, so a later setter call overrides it
+// (02's probe APIs rely on this).
 func (t *Transport) Apply(se *webrtc.SettingEngine) error
 
 func (t *Transport) Close() error
@@ -889,11 +983,19 @@ Construction details:
   `PacketConn`, then `ice.NewUDPMuxDefault` per socket and `ice.NewMultiUDPMuxDefault(muxes...)`. We build it
   ourselves only to count bytes and read back buffer sizes. The counting wrapper implements
   `ice.AddrPortReaderWriter` (`ReadFromAddrPort`/`WriteToAddrPort`) so pion keeps its allocation-free path. Port `0`
-  (tests): bind the first address, reuse its port for the others.
+  (tests): bind the first address, reuse its port for the others. If `RcvBuf` or `SndBuf` read back below
+  `udp_buffer_bytes`, `NewTransport` logs one warn line (`component=netx`) naming the sysctl fix; doctor's
+  `udp_buffers` check reports the same (§13.2). The SFU does not log buffer sizes.
 - **TCP**: `ice.NewTCPMuxDefault` on the 443 ICE sub-listener and on a plain 7882 listener, combined with
   `ice.NewMultiTCPMuxDefault(mux443, mux7882)`. pion's gatherer uses `GetAllConns` of the multi mux, so each local
   address gets a passive TCP candidate on **both** 443 and 7882. Both sub-listeners report an unspecified IP, so pion
-  advertises every local address (then filtered and rewritten).
+  advertises every local address (then filtered and rewritten). The 7882 listener is wrapped like the 443 ICE route:
+  a per-IP limit of `MaxICEConnsPerIP` (64) ICE connections per `IPKey` (IPv4 address or IPv6 /64, §7.2), counted
+  together with 443 (excess closed and counted as `Limited`), a byte counter (path `media_tcp`), and the same `ice.TCPMuxParams` (`FirstStunBindTimeout` 10 s,
+  `AliveDurationForConnFromStun` 30 s, `ReadBufferSize` 64, `WriteBufferSize` 4 MiB).
+- **Advertised**: `Advertised` holds every advertised address with its final address:port after the rewrite rules
+  (§7.5). 02 uses it to label selected candidate pairs (`Via`); the same value set `udp` | `tcp443` | `tcp7882` is used
+  everywhere (dashboard, metrics).
 - Interfaces are enumerated once at startup (06: systemd `After=network-online.target`). Hot-plugged interfaces need a
   restart.
 
@@ -902,15 +1004,17 @@ Construction details:
 ```go
 package netx
 
-type Method string  // "config" | "interface" | "stun" | "none"
-type NATKind string // "none" | "one_to_one" | "port_forward" | "symmetric" | "cgnat_likely" | "unknown"
+type Method string // "config" | "interface" | "stun" | "none"
+
+// NAT kinds are api.NATKind (internal/protocol/api/conntest.go, §7.7):
+// "none" | "one_to_one" | "port_forward" | "symmetric" | "cgnat_likely" | "unknown".
 
 type PublicAddrs struct {
 	V4, V6        netip.Addr // zero if none
 	V4Method      Method
 	V6Method      Method
 	LocalV4       netip.Addr // IPv4 of the default-route interface (may equal V4)
-	NAT           NATKind
+	NAT           api.NATKind
 	STUNMapped    []netip.AddrPort // per STUN server, for doctor
 	DetectedAt    time.Time
 }
@@ -953,7 +1057,8 @@ A to B; restart isshoni to apply"). Rationale: rewrite rules are fixed per `webr
 addresses rarely change.
 
 Privacy: STUN contacts Cloudflare and Google at startup and every 10 minutes (one UDP packet each). Setting `public_ip`
-limits this to one NAT check at startup. The privacy page says so (§16).
+limits this to one NAT check at startup; `network.stun_servers = []` stops STUN entirely (set `public_ip` to a literal
+then). The privacy page says so (§16).
 
 ### 7.5 Address rewrite rules
 
@@ -991,15 +1096,23 @@ small `ops.Prober` interface.
 POST /api/v1/conntest            access: User (03 API.Handle) · CSRF: 03
 Request:  {"transport": "udp" | "tcp443" | "tcp7882", "offer": "<SDP with one data channel>"}
 Response: 200 {"answer": "<SDP>", "expiresInS": 20,
-               "server": {"publicIp": "203.0.113.7", "provider": "hetzner",
+               "server": {"publicIp": "203.0.113.7", "provider": "hetzner", "container": "none",
                           "udpPort": 7882, "tcpPorts": [443, 7882], "nat": "none"}}
-Errors:   400 bad_sdp · 409 transport_disabled (tcp443 in off mode) · 429 rate_limited · 503 not_ready
+Errors:   400 bad_sdp · 409 transport_disabled (params.transport) · 429 rate_limited · 503 not_ready
 ```
+
+- 409 `transport_disabled` (with `params.transport`) is returned when that transport has no listener: `tcp443` in off
+  mode, `udp` when `listen.ice_udp = ""`, `tcp7882` when `listen.ice_tcp = ""`. 02's `Probe` returns
+  `sfu.transport_disabled` whenever the mux for the requested transport is nil.
+- `server.publicIp` is `""` when no public IPv4 is known (dev or CI without STUN). `server.container` is `none` |
+  `docker` | `podman` | `other`, the same values as doctor's `env.container` (§13.5), from `InContainer` detection.
 
 ```go
 package ops
 
-type Prober interface { // the wiring adapts 02's SFU.Probe
+type Prober interface {
+	// The wiring adapts 02's SFU.Probe: it converts userID/transport to sfu.UserID/sfu.ProbeTransport, discards
+	// the result channel, and maps sfu.probe_limit to 429 rate_limited and sfu.transport_disabled to 409.
 	Probe(ctx context.Context, userID string, transport string, offerSDP string) (answerSDP string, err error)
 }
 ```
@@ -1009,12 +1122,16 @@ type Prober interface { // the wiring adapts 02's SFU.Probe
   candidates. The browser's own candidates are not needed: its checks create peer-reflexive candidates on the server.
 - The probe PC echoes every data-channel message (the browser measures RTT; `getStats` `currentRoundTripTime` also
   works). It closes after 20 s or when the channel closes. ICE timeouts: disconnected 3 s, failed 8 s; DTLS 10 s.
-- Limits: 12 requests per minute per user here; 3 concurrent probes per user (05 runs all three at once) and 20
-  globally in 02 (`sfu.probe_limit` → 429 `rate_limited`).
+- Limits: 12 requests per minute per user here (429 `rate_limited` with `Retry-After`); in 02, one live probe per
+  (user, transport), where a new one replaces the old, and 20 globally (`sfu.probe_limit` → 429).
+- Probe answers hold IPv4 candidates only when a public IPv4 is known (02 §7.6).
 - `provider` (§13.3) and `nat` (§7.4) let 05 show provider-specific fix text from its catalog; 05 shows it to admins
   only.
 
-Types (`internal/protocol/api/conntest.go`): `ConnTestRequest`, `ConnTestResponse`, `ConnTestServerInfo`.
+Types (`internal/protocol/api/conntest.go`): `ConnTestRequest`, `ConnTestResponse`, `ConnTestServerInfo`, plus
+`type CloudProvider string` with one constant per §13.3 id and `type NATKind string` with the §7.4 values, so
+`task gen` puts them in `api.gen.ts` for 05's check and 06's anchor test. `ConnTestServerInfo.Provider` and `.NAT` use
+these types, and `netx` and `doctor` use them instead of their own.
 
 ### 7.8 Limits and timeouts (summary)
 
@@ -1022,11 +1139,14 @@ Types (`internal/protocol/api/conntest.go`): `ConnTestRequest`, `ConnTestRespons
 |---|---|
 | 443 first byte | 10 s |
 | TLS handshake (via `ReadHeaderTimeout`) | 10 s |
-| ICE-TCP first STUN Binding | 10 s; connection created from STUN with unknown ufrag lives 30 s |
+| ICE-TCP first STUN Binding | 10 s on 443 and 7882; connection created from STUN with unknown ufrag lives 30 s |
 | DTLS handshake (02 sets it) | 10 s |
-| Pending (unclassified) connections | 1024 total, 32 per IP |
-| Open connections per IP on 443/80 | 256 (`limits.conns_per_ip`); ICE-TCP 64 per IP |
-| HTTP servers | `ReadHeaderTimeout` 10 s, `IdleTimeout` 120 s, `MaxHeaderBytes` 16 KiB, no `ReadTimeout`/`WriteTimeout` (WebSocket) |
+| Per-IP key (every row below that says "per IP") | IPv4 address, or the IPv6 /64 (`netx.IPKey`, §7.2) |
+| Pending (unclassified) connections | 1024 total (when full, the oldest pending one is closed), 32 per IP |
+| Open connections per IP on 443/80 | 256 (`limits.conns_per_ip`) |
+| ICE-TCP connections per IP | 64 across 443 and 7882 |
+| HTTP servers | `ReadHeaderTimeout` 10 s, `IdleTimeout` 120 s, `MaxHeaderBytes` 16 KiB, no server `ReadTimeout`/`WriteTimeout` (WebSocket) |
+| Main server request read deadline | 30 s per request via `http.ResponseController`, except `/ws` (§9.3) |
 | Port 80 server | `ReadHeaderTimeout` 5 s, `IdleTimeout` 30 s |
 | JSON request bodies | 64 KiB default (`httpapi.DecodeJSON`) |
 | UDP socket buffers | 8 MiB requested |
@@ -1110,6 +1230,7 @@ cfg = certmagic.New(cache, certmagic.Config{
 	FallbackServerName: name, // unknown SNI gets our cert and a clear name-mismatch error instead of a handshake failure
 	RenewalWindowRatio: ratio, // auto: certmagic default (1/3); ip: 0.5, so a 160 h cert renews after ~80 h with 3 days of slack
 	OnEvent:            m.onEvent, // cert_obtained / cert_failed / cached_managed_cert → Status, readiness
+	OCSP:               certmagic.OCSPConfig{DisableStapling: true}, // no OCSP requests (§16)
 	Logger:             zl,
 })
 issuer := certmagic.NewACMEIssuer(cfg, certmagic.ACMEIssuer{
@@ -1123,6 +1244,9 @@ cfg.ManageAsync(ctx, []string{name}) // name = domain, or the IP string
 ```
 
 - `certmagic.UserAgent = version.UserAgent()`.
+- OCSP stapling is disabled (`OCSP.DisableStapling = true`): Let's Encrypt no longer runs OCSP, and the server should
+  make no outbound requests the privacy page (§16) doesn't list. Manual certificates are loaded without certmagic
+  (§8.4), so they cause no OCSP requests either.
 - The TLS config gets `MinVersion: tls.VersionTLS12` and `NextProtos` from §7.2.
 - certmagic answers challenges through our listeners: `HTTPChallengeHandler` on port 80 and `acme-tls/1` in the TLS
   config on 443. It never opens its own ports.
@@ -1154,7 +1278,8 @@ cfg.ManageAsync(ctx, []string{name}) // name = domain, or the IP string
 - The app is served over plain HTTP on `listen.http`. There is no 443 multiplexer, so ICE-TCP uses 7882 only (the
   proxy owns 443).
 - `X-Forwarded-For` and `X-Forwarded-Proto` are honored only when the TCP peer is inside `network.trusted_proxies`.
-  Client IP = the right-most `X-Forwarded-For` entry that is not itself a trusted proxy. `X-Forwarded-Host` and
+  With a loopback `listen.http` that defaults to `127.0.0.0/8` and `::1/128` (§4.4), so a proxy on the same host works
+  without setting it. Client IP = the right-most `X-Forwarded-For` entry that is not itself a trusted proxy. `X-Forwarded-Host` and
   `Forwarded` are ignored; links always use `Site.Origin`.
 - In `auto`, `ip` and `manual` modes all `X-Forwarded-*` headers are ignored.
 - 06 documents example Caddy/nginx configs, including the WebSocket upgrade headers.
@@ -1227,8 +1352,13 @@ type RouterOptions struct {
 	Gate           *Gate          // shutting-down switch
 	API            http.Handler   // 03's *API, mounted at /api/v1/
 	WS             http.Handler   // 01's *signal.Hub, mounted at /ws
-	Metrics        *ops.Metrics
+	Observer       RouteObserver  // ops.Metrics implements it; the wiring passes it in (httpapi never imports ops)
 	Logger         *slog.Logger
+}
+
+// RouteObserver receives one call per response from the transfer/metrics middleware (§9.3).
+type RouteObserver interface {
+	ObserveRoute(pattern string, status int, bytes int64)
 }
 
 type Router struct{ /* … */ }
@@ -1257,14 +1387,20 @@ type Gate struct{ /* atomic state: serving | shutting_down */ }
 
 1. **Recover**: panic → 500 `internal`, logged with stack and route pattern, never with body or query.
 2. **Request ID**: 16 hex chars, `X-Request-Id` response header.
-3. **Transfer/metrics**: response bytes and status class per route pattern.
-4. **Gate**: shutting down → 503 `server_shutdown` (`Retry-After: 5`). Exempt: `/healthz`, `/readyz`.
-5. **Host check**: `Host` must equal `Site.Host` (or, when `Site.Dev`, any `localhost`/`127.0.0.1`/`[::1]` host so the
+3. **Read deadline**: `http.ResponseController(w).SetReadDeadline(now + 30 s)` on every request. The server has no
+   `ReadTimeout` (it would kill WebSockets, §7.8), so without this a client could trickle a request body for as long
+   as it likes. The router's `/ws` mount clears the deadline (`SetReadDeadline(time.Time{})`) before it hands the
+   request to 01's hub, so 01 needs nothing. Every `ResponseWriter` wrapper in the chain implements
+   `Unwrap() http.ResponseWriter` so the controller reaches the connection. Main server only; the admin socket streams
+   large backup and restore bodies and sets no deadline.
+4. **Transfer/metrics**: response bytes and status class per route pattern, reported to `RouterOptions.Observer`.
+5. **Gate**: shutting down → 503 `server_shutdown` (`Retry-After: 5`). Exempt: `/healthz`, `/readyz`.
+6. **Host check**: `Host` must equal `Site.Host` (or, when `Site.Dev`, any `localhost`/`127.0.0.1`/`[::1]` host so the
    Vite proxy works). Otherwise `421 Misdirected Request`, plain text. Exempt: `/healthz`, `/readyz`. Rationale: blocks
    DNS-rebinding against LAN installs and keeps cookies and Origin checks consistent.
-6. **Real IP**: stores `ClientIP` in the context.
-7. **Security headers** (§9.6).
-8. Inside `/api/v1/`: 03's chain (body limit → no-store → CSRF → authenticate → rotate → access, 03 §12.1), then the
+7. **Real IP**: stores `ClientIP` in the context.
+8. **Security headers** (§9.6).
+9. Inside `/api/v1/`: 03's chain (body limit → no-store → CSRF → authenticate → rotate → access, 03 §12.1), then the
    handler.
 
 No access log (plan). 5xx responses log one line with `route` (the pattern, not the URL), status and request ID.
@@ -1281,7 +1417,8 @@ Every JSON error from any `/api` route uses 03's envelope and code table (03 §1
 `code` is a stable snake_case string that 05 translates; the server never sends English UI text. The WebSocket
 `error` message (01) uses the same codes where the meaning is the same (`rate_limited`, `internal`,
 `server_shutdown`). Codes this doc adds to 03's table: `not_found`, `bad_sdp`, `transport_disabled`, `not_ready`,
-`server_shutdown`, `doctor_busy`; it also uses 03's `bad_request`, `payload_too_large`, `unsupported_media_type`,
+`server_shutdown`, `doctor_busy`, and, on the admin socket only (§12), `backup_invalid`, `backup_newer`,
+`restore_in_progress` and `insufficient_storage`; it also uses 03's `bad_request`, `payload_too_large`, `unsupported_media_type`,
 `method_not_allowed`, `rate_limited`, `internal`, `push_endpoint_rejected` and `push_unavailable`. The Host check's 421
 is plain text, not JSON.
 
@@ -1302,9 +1439,11 @@ func Dist() fs.FS { sub, _ := fs.Sub(dist, "dist"); return sub }
 ```
 
 - The repo keeps `web/dist/.gitkeep` (06 adds the `.gitignore` exception) so Go builds without a web build. If
-  `index.html` is missing, the server serves a built-in page "Web UI not built: run `task build:web`" (dev only).
-- 06 adds `ignore ./web/node_modules` to `go.mod` (Go 1.25+ directive) so `go build ./...` never walks npm packages
-  that ship `.go` files.
+  `index.html` is missing, the server serves a built-in page "Web UI not built: run `task build:web`" in any build,
+  with status 503; a non-dev build also logs a startup warning "this binary has no web UI (built without web/dist);
+  use a release artifact".
+- 06 adds `ignore ./web/node_modules` and `ignore ./docs/node_modules` to `go.mod` (Go 1.25+ directive) so
+  `go build ./...` never walks npm packages that ship `.go` files.
 - At startup the handler walks `Dist()` once and precomputes, per file, an ETag (first 16 hex chars of SHA-256) and the
   content type.
 
@@ -1314,10 +1453,11 @@ Serving rules:
 |---|---|---|
 | `GET/HEAD /assets/<hashed name>` that exists | the file | `public, max-age=31536000, immutable` |
 | `/assets/…` that does not exist | `404` (never `index.html`: a stale hashed asset after an upgrade must fail as a 404, not as HTML with a JS MIME error) | `no-store` |
-| `/sw.js`, `/manifest.webmanifest`, `/index.html` | the file | `no-cache` (revalidate with ETag) |
-| other existing root files (icons, `robots.txt`) | the file | `public, max-age=86400` |
+| any existing file outside `/assets/` and `/icons/` (`/sw.js`, `/manifest.webmanifest`, `/index.html`, `/boot-check.js`, `/version.json`, `/licenses.txt`, `/robots.txt`) | the file | `no-cache` (revalidate with ETag) |
+| `/icons/*` | the file | `public, max-age=86400` |
 | path whose last segment contains a `.` and does not exist | `404` | `no-store` |
-| `/api/…`, `/ws`, `/healthz`, `/readyz` not matched by a route | `404` JSON `not_found` | `no-store` |
+| `/api/…` outside `/api/v1/`, `/ws`, `/healthz`, `/readyz` not matched | `404` JSON `not_found` | `no-store` |
+| inside `/api/v1/` | 03's API answers unmatched paths with 404 JSON `not_found` and method mismatches with 405 JSON `method_not_allowed` plus `Allow` (03 §12.5), including routes added through `Handle` | `no-store` (03's chain) |
 | any other `GET/HEAD` path | `index.html` with status `SPAStatus(path)` (200, or 404 for `/setup` after setup) | `no-cache` |
 | other methods on SPA paths | `405` | – |
 
@@ -1332,24 +1472,28 @@ Serving rules:
 - 05 must not use dots in client-side route segments (rule above) and keeps `sw.js` and `manifest.webmanifest` at the
   root (scope `/`).
 - `dist/version.json` (`{"version":"0.3.0"}`, written by the Vite build) is compared with `version.Version()` at
-  startup; a mismatch logs a warning (only possible in dev builds).
+  startup; a mismatch logs a warning. 06 feeds the same version to both halves in every build (§15), so a mismatch in
+  a release build is a bug.
 
 ### 9.6 Security headers
 
 | Header | Value | Applies to |
 |---|---|---|
-| `Content-Security-Policy` | `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' wss://<host>; worker-src 'self'; manifest-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'` | HTML |
-| `Content-Security-Policy` | `default-src 'none'; frame-ancestors 'none'` | everything else |
+| `Content-Security-Policy` | `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' wss://<host>; worker-src 'self'; manifest-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'` | HTML and `/sw.js` |
+| `Content-Security-Policy` | `default-src 'none'; frame-ancestors 'none'` | everything else (not HTML, not `/sw.js`) |
 | `X-Content-Type-Options` | `nosniff` | all |
 | `Referrer-Policy` | `no-referrer` (plan) | all |
 | `Cross-Origin-Opener-Policy` | `same-origin` | HTML |
 | `Cross-Origin-Resource-Policy` | `same-origin` | all |
 | `Permissions-Policy` | `display-capture=(self), fullscreen=(self), picture-in-picture=(self), autoplay=(self), camera=(), microphone=(), geolocation=(), usb=(), payment=(), browsing-topics=()` | HTML |
 | `Strict-Transport-Security` | `max-age=31536000` (no `includeSubDomains`, no `preload`: other subdomains of the admin's domain are not ours) | TLS responses when serving a domain and `tls.hsts`; never for IP hosts (RFC 6797 ignores them) |
-| `Cache-Control` | `no-store` | every `/api` response (03 may relax specific GETs) |
+| `Cache-Control` | `no-store` | responses written by this doc's router outside `/api/v1/` (§9.5 404 rows, `/healthz`, `/readyz`); everything under `/api/v1/`, including routes registered through `API.Handle`, gets it from 03's chain (03 §13), with no exceptions |
 | `X-Robots-Tag` | `noindex` | all |
 
-Notes: `connect-src` lists `wss://<host>` explicitly because older Safari versions don't match `wss:` with `'self'`
+Notes: a service worker's CSP comes from its script response. `/sw.js` needs `connect-src 'self'` for its cache
+fill, network-first navigations and push re-subscription, so it gets the HTML policy; the worker only fetches
+same-origin, so it needs nothing beyond that policy.
+`connect-src` lists `wss://<host>` explicitly because older Safari versions don't match `wss:` with `'self'`
 (`ws://<host>` when `Site.Origin` is `http://`, i.e. dev).
 `style-src 'self'` works because Vite extracts CSS to files and React sets inline styles through the CSSOM, which CSP
 does not block. 05 asks here if it needs a relaxation. The desktop webview's CSP (M2) is separate.
@@ -1454,7 +1598,9 @@ registry nobody scrapes.
 One owner per metric: 01 registers the signaling and presence metrics (`isshoni_ws_*`, `isshoni_rooms`,
 `isshoni_participants`, `isshoni_shares{status}`, `isshoni_client_*`, 01 §18) through `Registerer()`; the wiring
 registers an adapter over 02's `SFU.Metrics()` for the `isshoni_sfu_*` names (02 §13, including
-`isshoni_sfu_selected_transport`). No per-user labels.
+`isshoni_sfu_selected_transport`). That adapter is a `prometheus.Collector` in `wire.go`: on every scrape it calls
+`SFU.Metrics()` once and emits the 02 §13 names with exactly the label values that 02 lists (probe PCs are not
+counted); it adds no labels of its own. No per-user labels.
 
 ### 11.3 Transfer accounting and alerts
 
@@ -1464,9 +1610,10 @@ registers an adapter over 02's `SFU.Metrics()` for the `isshoni_sfu_*` names (02
 - `netx.TransferCounter` keeps atomic totals. `ops.Transfer` flushes deltas to the DB every 60 s and at shutdown, per
   **calendar month in UTC**, in 03's table `transfer_months` (03 §5, `AddTransfer`/`TransferMonth`).
 - Alerts when month-to-date egress crosses 80 % and 100 % of the setting `transferAlertGb` (pinnable by
-  `limits.transfer_alert_gb`; 1 GB = 10⁹ bytes): once per threshold per month (remembered in 03's `meta` key
-  `ops.transfer_alert_sent` = `"2026-09:80"`), shown as a dashboard alert and pushed to admins as the admin alert
-  `transfer_threshold` (03 §7.11, payload §14.3).
+  `limits.transfer_alert_gb`; 1 GB = 10⁹ bytes). `ops` reads it only through `ops.Policy.TransferAlertGB()` on every
+  tick (the wiring backs it with 03's `SettingsCache.Get()`, §6.6), never from `config.Config`. Each threshold fires
+  once per month (remembered in 03's `meta` key `ops.transfer_alert_sent` = `"2026-09:80"`), shown as a dashboard
+  alert and pushed to admins as the admin alert `transfer_threshold` (03 §7.11, payload §14.3).
 - Projection: `mtd × days_in_month / days_elapsed`, shown after day 3.
 
 ```go
@@ -1493,7 +1640,7 @@ func (c *TransferCounter) Totals() map[Path]struct{ Egress, Ingress uint64 }
     "process": {"cpuSeconds": 1834.2, "rssBytes": 187000000, "numCpu": 2, "goroutines": 412},
     "tls": {"mode": "ip", "names": ["203.0.113.7"], "ready": true, "notAfter": "2026-10-05T10:00:00.000Z", "nextRenewal": "2026-10-02T12:00:00.000Z"},
     "publicIpv4": "203.0.113.7", "publicIpv6": "", "nat": "none",
-    "advertised": [{"proto": "udp", "addr": "203.0.113.7:7882", "via": "udp7882"}, {"proto": "tcp", "addr": "203.0.113.7:443", "via": "tcp443"}],
+    "advertised": [{"proto": "udp", "addr": "203.0.113.7:7882", "via": "udp"}, {"proto": "tcp", "addr": "203.0.113.7:443", "via": "tcp443"}],
     "update": {"latest": "0.3.1", "url": "https://github.com/MoonWX/isshoni/releases/tag/v0.3.1", "security": true, "checkedAt": "2026-09-29T09:12:00.000Z"}
   },
   "transfer": {"month": "2026-09", "egressBytes": 412000000000, "ingressBytes": 98000000000,
@@ -1530,6 +1677,16 @@ func (c *TransferCounter) Totals() map[Path]struct{ Egress, Ingress uint64 }
 - Live data comes through interfaces declared in `ops`; `internal/server/wire.go` (§6.6) adapts 01's
   `Hub.Snapshot()` (participants, connections, last client stats, watchers) and 02's `SFU.Snapshot()` (per-share
   layers, bitrates, loss, egress, selected transports):
+  - `connections[].transport` (`udp` | `tcp443` | `tcp7882`, the value set of §7.3) and `rttMs` come from 02's
+    `RoomSnapshot.Conns` (`ConnSummary`), joined on the connection id; all other connection fields come from
+    `Hub.Snapshot()`. The hub's client stats are not used for these two fields.
+  - `participants[].watching` comes from `Hub.Snapshot()` (desired subscriptions, what `room.state` shows users);
+    `shares[].viewers` comes from 02's `ShareSnapshot.Viewers` (forwarded quality).
+  - `rooms[].shares[]` comes from `RoomSnapshot.Shares`, one to one: `codec` = `"h264/"` + `Info.Profile`, `kind` =
+    `Info.Source`, `ownerUserId` = `Info.User`, `layers[]` from `Info.Layers` (`rid`, `width`, `height`, `fps`,
+    `bitrate`, `lossPct`), `viewers` from `Viewers`, and `ingressBps`/`egressBps` from the `ShareSnapshot`.
+  - `media` comes from `SnapshotTotals`, with `peerConnections` = `PCsByTransport` (probe PCs are not included). 02's
+    load test reads `media.egressBps`.
 
 ```go
 package ops
@@ -1540,6 +1697,12 @@ type LiveSource interface {
 }
 type AccountsSource interface {
 	Accounts(ctx context.Context) (api.DashboardAccounts, error) // 03's API.DashboardAccounts; 1 s timeout
+}
+// Policy is the only way ops reads policy settings (§11.3, §11.5); the wiring backs it with 03's
+// SettingsCache.Get() and ops calls it on every tick.
+type Policy interface {
+	TransferAlertGB() int // transferAlertGb
+	ReleaseCheck() bool   // updateCheck
 }
 ```
 
@@ -1553,8 +1716,9 @@ type AccountsSource interface {
 - `GET https://api.github.com/repos/MoonWX/isshoni/releases?per_page=20` with `Accept: application/vnd.github+json`,
   `X-GitHub-Api-Version: 2022-11-28`, `User-Agent: isshoni/<version>` and `If-None-Match` (ETag). Nothing else is
   sent. 10 s timeout, 1 MiB response limit.
-- First run 5–60 minutes after start (random), then every 24 h ± 1 h. Off when `updates.release_check=false` (policy
-  key, so the admin UI can switch it off).
+- First run 5–60 minutes after start (random), then every 24 h ± 1 h. Off when the setting `updateCheck` is false
+  (policy key `updates.release_check`, so the admin UI can switch it off). `ops` reads it only through
+  `ops.Policy.ReleaseCheck()` on every tick, never from `config.Config`.
 - Ignore drafts; ignore prereleases unless the running version is a prerelease. Compare with
   `golang.org/x/mod/semver`.
 - **Security flag**: any release newer than the running one whose body contains `<!-- isshoni:security -->` (06's
@@ -1578,9 +1742,22 @@ type AccountsSource interface {
 - **Root never touches the DB files**: `sudo isshoni admin …` only talks to the socket; the server process (user
   `isshoni`) does the reads and writes. In Docker, `docker compose exec isshoni isshoni admin …` runs as the container
   user.
-- Every mutating call is written to 03's audit log with actor `cli` and the peer uid.
-- Base URL for the client: `http://isshoni/v1/…` with a `DialContext` to the socket. Errors use the envelope of §9.4
-  plus an English `message` and `fix` for the CLI to print.
+- User, invite and setup calls are audited by 03's service with `store.CLIActor` (03 §10); `rotate-secrets` is audited
+  at the next start (`secrets.rotated`); `backup`, `restore` and `log-level` log one INFO line with the peer uid and
+  are not audited (a restore replaces the audit log anyway). No uid goes into the audit log.
+- **Client dial errors** (`ops.DialAdmin` classifies them; every client command and doctor use it):
+  - *Not running*: `ENOENT` (no socket or no `/run/isshoni`) or `ECONNREFUSED` (a stale socket file). Exit 4 with
+    "isshoni is not running (no server on /run/isshoni/admin.sock)"; `doctor` runs offline (§13.1).
+  - *Permission denied*: `EACCES`/`EPERM` on stat or connect (for example `/run/isshoni` is `0750` and the caller is
+    neither root nor in the `isshoni` group, or the socket is `0600`), or the server closes the connection before the
+    first response (the peer-cred refusal above). Exit 4 with "Permission denied on /run/isshoni/admin.sock: run it
+    with sudo (sudo isshoni <command>)", using the real socket path and the command as typed. `doctor` prints the same
+    message and runs no checks: offline checks as an ordinary user would only show a wall of false failures (config and
+    data dir unreadable, ports "in use" by the running server). `healthcheck` prints it too and still exits 1.
+- Base URL for the client: `http://isshoni/v1/…` with a `DialContext` to the socket. Errors use a socket-only response
+  wrapper around 03's envelope: `{"error": api.Error, "message": "…", "fix": "…"}`, where `message` and `fix` are
+  English for the CLI to print. They are never added to `api.Error` itself. The socket passes 03's service errors
+  through unchanged, and the status is always `api.StatusOf(code)`.
 
 ### 12.2 Endpoints
 
@@ -1589,19 +1766,22 @@ type AccountsSource interface {
 | `GET /v1/health` | – | `{"status":"ok","version":"0.3.0"}` | 503 `{"status":"shutting_down"}` |
 | `GET /v1/ready` | – | `{"status":"ready","checks":{…}}` | 503 not ready |
 | `GET /v1/status` | – | version, uptime, site, TLS status, public addrs, listeners, rooms/participants/shares counts, schema version | – |
-| `POST /v1/setup-url` | `{"waitReadyS": 0}` | `{"url":"https://…/setup#…","expiresAt":"…","tlsReady":true}` | 409 `admin_exists` |
+| `POST /v1/setup-url` | `{"waitReadyS": 0}` | `{"url":"https://…/setup#…","expiresAt":"…","tlsReady":true}` | 404 `setup_unavailable` |
 | `GET /v1/users` | – | `{"users":[{"id","username","role","status","createdAt","lastSeenAt"}]}` | – |
 | `POST /v1/users/{name}/reset-link` | – | `{"url":"https://…/reset#…","expiresAt":"…"}` | 404 `user_not_found` |
 | `POST /v1/users/{name}/role` | `{"role":"admin"}` | 204 | 404, 409 `last_admin` |
 | `POST /v1/users/{name}/disable` · `/enable` | – | 204 | 404, 409 `last_admin` |
-| `POST /v1/invites` | `{"uses":10,"ttl":"168h"}` | `{"url":"https://…/invite#…","expiresAt":"…"}` | 409 `registration_closed` |
+| `POST /v1/invites` | `{"uses":10,"ttl":"168h"}`; both optional (omitted → 0 → the setting's default); `ttl` in whole hours `1h`–`720h` | `{"url":"https://…/invite#…","expiresAt":"…"}` | 403 `registration_closed`, 422 `validation_failed` |
 | `GET /v1/backup?certs=1` | – | `application/gzip` stream, `Content-Disposition: attachment; filename="isshoni-backup-…tar.gz"` | 500 |
 | `POST /v1/restore` | `application/gzip` archive or `application/vnd.sqlite3` DB body (≤ 2 GiB) | 202 `{"restarting":true,"preRestoreBackup":"backups/pre-restore-20260929T101500Z.tar.gz"}` | 400 `backup_invalid`, 409 `backup_newer`, 409 `restore_in_progress`, 507 `insufficient_storage` |
-| `POST /v1/rotate-secrets` | `{"keys":["session","invite","resume"],"vapid":false}` | 202 `{"rotated":[…],"restarting":true}` (the server restarts, §5.3) | 400 |
+| `POST /v1/rotate-secrets` | `{"keys":["session","invite","resume"],"vapid":true}` (the CLI always sends all four) | 202 `{"rotated":[…],"restarting":true}` (the server restarts, §5.3) | 400 |
 | `POST /v1/doctor` | `{"only": ["dns"]}` (optional) | `api.DoctorReport` (server-side checks) | – |
 | `POST /v1/log-level` | `{"level":"debug","for":"30m"}` | 204 | 400 |
 
-User, invite and setup operations call 03's service layer (§19); this doc only defines the socket surface.
+User, invite and setup operations call 03's service layer (§19); this doc only defines the socket surface. Statuses
+come from `api.StatusOf`; the four backup/restore codes are (04) rows in 03's code table. The CLI branches on `code`,
+never on the HTTP status, and maps codes to exit codes (e.g. `setup_unavailable` → 7 with the reset-password fix,
+§12.5).
 
 ### 12.3 Backup format
 
@@ -1622,10 +1802,17 @@ isshoni-backup-0.3.0-20260929T101500Z.tar.gz
 - CLI: `--out PATH` (default `./isshoni-backup-<ver>-<ts>.tar.gz`, created `0600`), or `--out -` for stdout. The CLI
   prints "This file contains your server's keys. Keep it private."
 - In a container there is no useful working directory, so `--out` is required; the error prints the Docker form:
-  `docker compose exec -T isshoni isshoni admin backup --out - > isshoni-backup.tar.gz`.
-- `--offline` (server stopped, §12.6): the CLI opens the DB read-only and runs the same `VACUUM INTO`; if the DB can't
-  be opened (corrupt, or newer than this binary), it copies the raw files (`isshoni.db`, `-wal`, `-shm`) and sets
-  `"raw": true` in the manifest.
+  `(umask 077; docker compose exec -T isshoni isshoni admin backup --out - > isshoni-backup.tar.gz)`. The archive
+  holds `secrets.json` and the TLS private keys, and a plain host shell redirect would create the file with the host's
+  umask (usually `0644`, readable by every local user); the subshell's `umask 077` makes it `0600`. This is the only
+  documented Docker form (06 §6.4 and the Docker site page use it too).
+- `--out -` refuses to write to a terminal (exit 2: "stdout is a terminal; redirect it to a file") and prints the
+  Docker form above as the fix. This also catches `docker compose exec` without `-T`, whose pseudo-TTY would corrupt
+  the archive.
+- `--offline` (server stopped, §12.6): the CLI calls 03's `store.BackupFile(ctx, src, dst)` (a read-only open, then
+  `VACUUM INTO`; it never migrates or writes the source). A DB with a newer schema works too, because a read-only open
+  works on it. Only when `BackupFile` fails (for example on a corrupt DB) does it copy the raw files (`isshoni.db`,
+  `-wal`, `-shm`) and set `"raw": true` in the manifest.
 
 ### 12.4 Restore
 
@@ -1638,9 +1825,11 @@ Two inputs are accepted:
 Server side (or the CLI with `--offline`), after receiving the body into `restore/incoming`:
 1. **Validate**: gzip/tar well-formed; entries are regular files or directories only; names limited to the manifest's
    contents; no absolute paths or `..` (extraction goes through `os.OpenRoot(restore/new)`, Go 1.24+); ≤ 10,000
-   entries; SHA-256 matches; `schemaVersion` ≤ the binary's (`409 backup_newer`: "This backup is from isshoni 0.5.0;
-   install 0.5.0 or newer first"); `PRAGMA integrity_check` on the extracted DB (opened read-only). A bare DB file
-   gets the schema and integrity checks only.
+   entries; SHA-256 matches. Then, for every DB (from an archive, raw or not, or a bare `.db` file), call 03's
+   `store.InspectFile` (read-only; it never migrates or writes the file) and do not trust the manifest's
+   `schemaVersion` alone: `SchemaVersion > store.LatestSchemaVersion()` → `409 backup_newer` ("This backup is from
+   isshoni 0.5.0; install 0.5.0 or newer first", using `LastAppVersion`); `HistoryOK` false or `Integrity != nil`
+   (`PRAGMA integrity_check`) → `400 backup_invalid`. A bare DB file gets these DB checks only.
 2. Write `backups/pre-restore-<ts>.tar.gz` of the current state (keep the last 5).
 3. Write `restore/plan.json` `{"ts":…,"state":"swapping"}`.
 4. Graceful shutdown with reason `restore` (clients see the restart notice, §6.4); close the store with a
@@ -1660,12 +1849,15 @@ backup.tar.gz`) shows the manifest, asks for confirmation, streams the file, the
 
 ### 12.5 Setup URL, users, invites
 
-- `setup-url` works only while no admin exists (`409 admin_exists` otherwise, with the fix "use `isshoni admin users
-  reset-password <name>`"). Each call mints a **new** token and cancels earlier unused setup tokens, so only the most
-  recently printed link works (no stale links in scrollback). Token rules (hashed, single-use, 24 h, fragment) are
-  03's.
-- `reset-password` prints a one-time link (24 h, single use); using it revokes all of that user's sessions and devices
-  (plan: "A password reset revokes everything"). It is the recovery path for a forgotten admin password.
+- `setup-url` works only while no admin exists (03's `setup_unavailable` otherwise; the CLI exits 7 with the fix "use
+  `isshoni admin users reset-password <name>`"). Each call mints a **new** token and cancels earlier unused setup
+  tokens, so only the most recently printed link works (no stale links in scrollback). Token rules (hashed,
+  single-use, 24 h, fragment) are 03's.
+- `reset-password` prints a one-time link (24 h, single use); issuing it immediately clears the password and signs the
+  user out everywhere (sessions, devices, push subscriptions; 03 §7.10); the CLI prints this after the link (plan: "A
+  password reset revokes everything"). It is the recovery path for a forgotten admin password.
+- `invite create` sends only the flags the operator set; the server passes 0 for the others so 03's invite settings
+  apply (03 §9).
 - `set-role`/`disable` refuse to remove the last active admin (`409 last_admin`).
 - Deleting users is only offered in the admin UI (fewer destructive CLI verbs).
 
@@ -1673,13 +1865,18 @@ backup.tar.gz`) shows the manifest, asks for confirmation, streams the file, the
 
 `isshoni admin backup --offline` and `isshoni admin restore --offline PATH` act directly on `data_dir`, for when the
 server can't start at all (for example invalid config):
-- They refuse if the admin socket answers (`exit 7`: "the server is running; drop --offline").
+- They refuse if the admin socket answers (`exit 7`: "the server is running; drop --offline"). That check comes first
+  because its message is friendlier; then they take the data-directory lock (`data_dir/isshoni.lock`, §5.1)
+  non-blocking and exit 7 with the same message if it is held, which also works across containers that share the
+  volume.
 - They refuse to run as root outside a container (`exit 7`: "run as the service user: `sudo -u isshoni isshoni admin
   restore --offline PATH`"), which keeps root from creating DB files.
 - Docker: `docker compose stop`, then `docker compose run --rm isshoni admin restore --offline
   /var/lib/isshoni/backups/x.tar.gz` (or a `pre-*.db` file), then `docker compose up -d`.
-- They are the recovery path when the server refuses to start (§6.3). An offline restore doesn't re-exec anything;
-  the operator starts the service afterwards.
+- They are the recovery path when the server refuses to start (§6.3). On a newer schema, `serve` prints 03's message
+  followed by the exact command for its environment (systemd or Docker, §6.1 step 4), and offline doctor's `schema`
+  fix uses the same formatter. An offline restore doesn't re-exec anything; the operator starts the service
+  afterwards.
 
 ---
 
@@ -1690,11 +1887,17 @@ server can't start at all (for example invalid config):
 - **With a running server** (admin socket answers): the CLI calls `POST /v1/doctor`, so every check runs inside the
   server's process and namespace (it can read `/proc`, DMI and its own TLS state), then adds nothing else. Port checks
   are reported from the server's bound listeners.
-- **Without a server**: the CLI runs the same checks itself; checks that need live state (TLS status, transfer,
-  release) are `skip`; `schema` opens the DB read-only (so a refusal to start is explained); port checks try to bind
-  each port. install.sh runs `isshoni doctor --config /etc/isshoni/isshoni.toml --only dns,public_ip,clock` this way
-  before the first start (06 §4.8).
-- `--list-checks [--json]` prints the check ids of §13.2 (06's site has one troubleshooting anchor per id).
+- **Without a server** (the socket dial fails with `ENOENT` or `ECONNREFUSED`, §12.1; a permission error prints the
+  `sudo` message and exits 4 instead): the CLI runs the same checks itself; checks that need live state (TLS status, transfer,
+  release) are `skip`; port checks try to bind each port. `schema` (so a refusal to start is explained) reads the DB
+  through 03's `store.InspectFile` and `store.LatestSchemaVersion`, passed in by `cmd/isshoni` (§2), and opens it with
+  `file:<path>?mode=ro&immutable=1`, which never creates `-wal`/`-shm` files. So running `sudo isshoni doctor` while
+  the server is stopped can't leave root-owned DB files (plan: root never creates the WAL files). With a leftover WAL
+  the reported schema may be one step old; the server's own exit-78 message stays authoritative. Offline doctor never
+  creates database files. install.sh runs `isshoni doctor --config /etc/isshoni/isshoni.toml --only
+  dns,public_ip,clock` this way before the first start (06 §4.8).
+- `--list-checks` prints the check ids of §13.2 in table order, one per line; `--list-checks --json` prints them as a
+  JSON array (e.g. `["config","data_dir",…]`). 06's site has one troubleshooting anchor per id.
 - The server also runs doctor 20 s after startup and every 24 h, keeping the last report (03's `meta` key
   `ops.doctor_last`) for the dashboard. `POST /api/v1/admin/doctor` runs it on demand (one run at a time globally,
   at most one per 10 s: `429 doctor_busy`).
@@ -1709,9 +1912,27 @@ type Env struct { // all fakeable
 	Resolver  netx.Resolver
 	STUN      netx.STUNClient
 	HTTP      *http.Client           // clock check against the ACME directory's Date header
+	Adjtimex  func() (unsynced bool, err error) // Linux; EPERM/ENOSYS = sync state unknown (§13.2 clock)
+	DB        DBFiles                // offline `schema` check
 	Now       func() time.Time
 	GOOS      string
 	UID       int
+}
+
+// DBFiles carries 03's file-level store functions, which never migrate or write the source file. doctor and ops
+// may not import store (§2), so cmd/isshoni and the wiring fill it; ops's offline backup and restore validation
+// (§12.3, §12.4) use the same struct.
+type DBFiles struct {
+	LatestSchemaVersion func() int                                              // store.LatestSchemaVersion
+	Inspect             func(ctx context.Context, dbPath string) (DBInfo, error) // store.InspectFile (backupDir bound)
+	Backup              func(ctx context.Context, srcPath, dstPath string) error // store.BackupFile
+}
+type DBInfo struct { // store.FileInfo, copied field by field
+	SchemaVersion  int
+	LastAppVersion string
+	HistoryOK      bool
+	Integrity      error  // PRAGMA integrity_check
+	TooNewBackup   string // SchemaTooNewError.Backup, for the restore command of §6.1 step 4
 }
 
 func Run(ctx context.Context, env Env, in api.BandwidthInput, only []string) api.DoctorReport // only: nil = all
@@ -1730,12 +1951,12 @@ templates live in `messages_en.go` for the CLI; 05 renders the same codes from i
 | `config` | Loads and validates | config warnings | config errors |
 | `data_dir` | Exists, owned by the service uid, 0700, free space; in a container: is a mount (§5.1) | free < 1 GB; mode wider than 0700 | not writable; ephemeral in a container |
 | `secrets` | Present, 0600, parseable | mode wider (server fixes it) | unreadable or corrupt |
-| `schema` | DB schema vs binary | – | newer than binary (the server refuses to start; the fix names 03's backup) |
+| `schema` | DB schema vs binary (offline: through `DBFiles`, §13.1) | – | newer than binary (the server refuses to start; the fix is 03's message plus the restore command for the environment, from the same formatter as §6.1 step 4) |
 | `public_ip` | Detection result, method and NAT kind (§7.4) | `port_forward` ("forward TCP 80, 443, 7882 and UDP 7882 to {local}"); IPv6 missing (`info`) | `symmetric`, `cgnat_likely`, or no public IPv4/IPv6 |
 | `dns` | `auto`/`manual` with domain: A/AAAA via the system resolver vs public IPs; CAA allows `letsencrypt.org` | AAAA present but not this server | no A/AAAA, or A points elsewhere |
 | `tls` | Mode, names, issuer, `not_after`, next renewal, last ACME error code (§8.7) | renewal failing but cert valid; manual cert < 14 days | no cert after 10 min; expired; key mismatch |
-| `clock` | Linux `adjtimex` `STA_UNSYNC` flag (no network); in `auto`/`ip`, skew vs the `Date` header of the ACME directory | not synchronized, or skew 30 s–5 min | skew > 5 min |
-| `udp_buffers` | Linux: `net.core.rmem_max`/`wmem_max` ≥ `udp_buffer_bytes`; effective SO_RCVBUF on the media sockets | below target (fix: `sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608`, and in Docker "on the Docker host") | – |
+| `clock` | Linux `adjtimex` `STA_UNSYNC` flag (no network); in `auto`/`ip`, skew vs the `Date` header of the ACME directory. If `adjtimex` fails with EPERM or ENOSYS (systemd `ProtectClock=`/`SystemCallFilter=` in 06's unit, or a container seccomp profile), the sync flag is reported as unknown (no warn) and only the skew check against the ACME directory's `Date` header decides; in `manual`/`off` mode without that check the status is `info` | not synchronized, or skew 30 s–5 min | skew > 5 min |
+| `udp_buffers` | Linux: `net.core.rmem_max`/`wmem_max` ≥ `udp_buffer_bytes`; effective SO_RCVBUF on the media sockets | below target. Fix: if `/etc/sysctl.d/60-isshoni.conf` or `/usr/lib/sysctl.d/60-isshoni.conf` exists, `sudo sysctl --system`; otherwise `printf 'net.core.rmem_max=8388608\nnet.core.wmem_max=8388608\n' \| sudo tee /etc/sysctl.d/60-isshoni.conf && sudo sysctl --system` (06 §6.4); in Docker, "on the Docker host" | – |
 | `ports` | **Local only**: isshoni listening on 443/tcp, 80/tcp, 7882/udp, 7882/tcp (or, offline, whether they can be bound). The text always says: "This only checks this machine. The browser connection test checks from outside." | a port disabled by config | a port in use by another program (offline) |
 | `firewall_hint` | `info`: provider-specific text to open 80/tcp, 443/tcp, 7882/udp, 7882/tcp (§13.3); Docker bridge note that published ports bypass ufw | – | – |
 | `container` | Docker/Podman detected, network mode (bridge vs host), port numbers must match (§7.1) | – | – |
@@ -1745,7 +1966,10 @@ templates live in `messages_en.go` for the CLI; 05 renders the same codes from i
 | `nofile` | `info`: open-file limit | < 8192 | – |
 | `bandwidth` | `info`: calculator output (§13.4) and NIC speed from `/sys/class/net/<if>/speed` | estimate > 80 % of NIC speed | – |
 
-Text output (abbreviated):
+Text output (abbreviated). After every `warn`/`fail` line the text output adds a line
+`more: <version.DocsURL>troubleshooting#doctor-<id>` (indented like `fix:`); after `firewall_hint` with a provider
+other than `unknown` it adds `<version.DocsURL>install/vps#<provider>`. JSON output stays as in §13.5; 05 builds the same links from `id`
+and `env.provider`.
 
 ```
 isshoni doctor · 0.3.0 · server running · 2026-09-29 20:15 UTC
@@ -1753,9 +1977,11 @@ isshoni doctor · 0.3.0 · server running · 2026-09-29 20:15 UTC
 [ ok ] public_ip     203.0.113.7 (on interface eth0, confirmed by STUN)
 [ ok ] tls           ip certificate for 203.0.113.7, valid until 2026-10-05 10:00 UTC, renews 2026-10-02
 [warn] udp_buffers   net.core.rmem_max is 212992, isshoni wants 8388608
-       fix: sudo sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608
+       fix: printf 'net.core.rmem_max=8388608\nnet.core.wmem_max=8388608\n' | sudo tee /etc/sysctl.d/60-isshoni.conf && sudo sysctl --system
+       more: https://moonwx.github.io/isshoni/troubleshooting#doctor-udp_buffers
 [info] ports         listening on 443/tcp, 80/tcp, 7882/udp, 7882/tcp (local check only)
 [info] firewall_hint Hetzner: Cloud Console → Firewalls → allow TCP 80, 443, 7882 and UDP 7882
+       https://moonwx.github.io/isshoni/install/vps#hetzner
 [info] bandwidth     5 people, 2 sharing: ~41.5 Mbps egress (~44 on the wire), ~39 GB per 2-hour session
 12 ok · 1 warn · 0 fail
 ```
@@ -1781,7 +2007,8 @@ From DMI only (no metadata-service calls): `/sys/class/dmi/id/{sys_vendor,produc
 | `unknown` | otherwise |
 
 05 owns the fix text per provider id (catalog keys `fix.firewall.<provider>`); doctor's CLI uses English templates of
-the same content.
+the same content. The ids are `api.CloudProvider` constants in `internal/protocol/api/conntest.go` (§7.7), so `task
+gen` puts them in `api.gen.ts`; `netx` and `doctor` use that type instead of their own.
 
 ### 13.4 Bandwidth calculator
 
@@ -1834,7 +2061,7 @@ The admin UI calls `GET /api/v1/admin/bandwidth?people=5&sharing=2&thumbnails=8&
      "params": {"rmemMax": 212992, "want": 8388608},
      "message": "net.core.rmem_max is 212992, isshoni wants 8388608",
      "fixCode": "udp_buffers.fix_sysctl",
-     "fix": "sudo sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608",
+     "fix": "printf 'net.core.rmem_max=8388608\\nnet.core.wmem_max=8388608\\n' | sudo tee /etc/sysctl.d/60-isshoni.conf && sudo sysctl --system",
      "localOnly": false, "durationMs": 1}
   ],
   "bandwidth": {"input": {"people": 5, "sharing": 2, "thumbnails": 8, "quality": "1080p60", "preset": "auto", "hours": 2},
@@ -1936,8 +2163,8 @@ type Options struct {
 
 type Service struct{ /* … */ }
 
-func New(opts Options) (*Service, error)
-func (s *Service) Run(ctx context.Context) error          // workers + daily prune; at start: VAPID fingerprint check (§5.2)
+func New(ctx context.Context, opts Options) (*Service, error) // checks vapid_key_fp and purges before returning (§5.2)
+func (s *Service) Run(ctx context.Context) error          // workers + daily prune
 func (s *Service) ShareStarted(ev ShareStarted)           // non-blocking; drops when the queue is full
 func (s *Service) AdminAlert(a AdminAlert)                // non-blocking
 func (s *Service) VAPIDPublicKey() string                 // 03's httpapi.Push
@@ -1975,10 +2202,11 @@ type SendResult struct {
 The endpoint URL comes from a browser, so the server treats it as untrusted.
 
 At subscribe time (`ValidateEndpoint`, called by 03's handler; failures are `push_endpoint_rejected` with
-`params.reason`):
-- `https` scheme only; port 443 only (explicit or implicit); no userinfo; length ≤ 2048; host must be a DNS name, not
-  an IP literal; `keys.p256dh` decodes to 65 bytes and `keys.auth` to 16.
-- The host must currently resolve to at least one allowed address (below).
+`params.reason`). 03's handler checks the body shape first (endpoint length ≤ 2048: `too_long`; key lengths:
+`bad_keys`); `ValidateEndpoint` owns every URL and host rule:
+- `https` scheme only (`not_https`); port 443 only, explicit or implicit (`bad_port`); no userinfo (`userinfo`); host
+  must be a DNS name, any IP literal is rejected (`ip_literal`).
+- The host must currently resolve (`unresolvable`), and only to allowed addresses (below; `private_address`).
 
 At send time (the real guard, because DNS can change):
 - A dedicated `http.Client` whose `net.Dialer.Control` rejects the **actual IP being dialed** unless it is a public
@@ -2037,8 +2265,7 @@ type RecipientFilter struct {
 	AdminsOnly     bool
 	Pref           string // "share_started" | "admin_alerts" | ""
 	SessionID      string // push.test
-	SubscriptionIDs []string
-}
+} // fields map 1:1 to 03's PushFilter
 
 type Subscription struct {
 	ID, UserID, SessionID string
@@ -2056,11 +2283,20 @@ type Subscription struct {
 -ldflags "-s -w
   -X github.com/MoonWX/isshoni/internal/version.version={{.Version}}
   -X github.com/MoonWX/isshoni/internal/version.commit={{.FullCommit}}
-  -X github.com/MoonWX/isshoni/internal/version.date={{.Date}}"
+  -X github.com/MoonWX/isshoni/internal/version.date={{.CommitDate}}"
 ```
 
-- Without ldflags (`go run`, `go install …@v0.3.0`), `debug.ReadBuildInfo` supplies `Main.Version` and `vcs.revision`
-  / `vcs.modified`; otherwise `0.0.0-dev+<short commit>[-dirty]`.
+- `date` is the commit date, not the build time: it keeps builds reproducible and matches goreleaser's
+  `mod_timestamp` and the OCI `created` label (06). `BuildDate()` returns it (RFC 3339 in `BuildInfo.Date`).
+- `task build` and the dev tasks set the same three symbols from 06's `{{.VERSION}}` (06 §7.2); there is no other
+  ldflags variant.
+- Without ldflags (`go run`, `go build`), `debug.ReadBuildInfo` supplies `Main.Version` and `vcs.revision` /
+  `vcs.modified`; otherwise `0.0.0-dev+<short commit>[-dirty]`; without VCS info either, `0.0.0-dev`. A
+  `go install …@v0.3.0` binary builds without the web UI (module downloads don't contain `web/dist`) and is not a
+  supported server install.
+- `IsDev()` is true when the SemVer prerelease starts with `dev`: `0.0.0-dev`, `0.0.0-dev+1a2b3c4`,
+  `0.1.1-dev.1a2b3c4`, and goreleaser's snapshot default. 01 and 05 apply the same rule. CI builds get a non-dev
+  version (06), so the stale-build path is testable.
 
 ```go
 package version
@@ -2082,25 +2318,30 @@ type BuildInfo struct {
 func Info() BuildInfo // Protocol and Schema zero: this package imports nothing from internal/
 ```
 
-`isshoni version`: `isshoni 0.3.0 (commit 1a2b3c4, built 2026-09-29, go1.26.5, linux/amd64, protocol 1, schema 7)`;
-`--short` prints `0.3.0` (install.sh compares it); `--json` prints `BuildInfo` (camelCase keys). The SPA gets the same
-string at build time (06 passes `ISSHONI_VERSION` to Vite; §9.5 checks it). 06's goreleaser config and `task build`
-use exactly the ldflags above; there is no separate `buildinfo` package.
+`isshoni version`: `isshoni 0.3.0 (commit 1a2b3c4, built 2026-09-29, go1.27.x, linux/amd64, protocol 1, schema 7)`
+(the plan's toolchain: `go 1.26` directive, toolchain pinned to the latest go1.27 patch); `--short` prints `0.3.0`
+(install.sh compares it); `--json` prints `BuildInfo` (camelCase keys). The SPA gets the same string at build time:
+06 builds the SPA with `ISSHONI_VERSION` equal to the ldflags `version` in every task and in goreleaser (06 §7.2), so
+`dist/version.json` always equals `version.Version()`. The §9.5 startup comparison stays as a warning; a mismatch in a
+release build is a bug. There is no separate `buildinfo` package.
 
 ---
 
 ## 16. Privacy facts for the project site (06)
 
-What this part of the server sends to third parties, all documented on the privacy page:
+What this part of the server sends to third parties, all documented on the privacy page. This section is the single
+source for the outbound list; 06's `/privacy` page renders this table in full.
 
 | Destination | When | What | Off switch |
 |---|---|---|---|
-| STUN (Cloudflare, Google) | Startup and every 10 min | One UDP Binding request (reveals the server IP) | set `public_ip` (then one NAT check at startup only) |
-| Let's Encrypt | Issuance, renewal, clock check | ACME protocol; optional email | `tls.mode=manual` or `off` |
+| STUN (Cloudflare, Google) | Startup and every 10 min | One UDP Binding request (reveals the server IP) | `network.stun_servers = []` stops STUN entirely (set `public_ip` to a literal then); a literal `public_ip` alone leaves one NAT check at startup |
+| Let's Encrypt | Issuance, renewal; one HTTPS GET of the ACME directory for the clock check (doctor, also install.sh's pre-check; `auto`/`ip` modes) | ACME protocol; optional email | `tls.mode=manual` or `off` |
 | GitHub API | Daily | One GET with `User-Agent: isshoni/<ver>` | `updates.release_check=false` |
 | Browser push services (Google, Apple, Mozilla, Microsoft) | On notifications | Encrypted payload (RFC 8291); the service sees timing and size (padded) only | `push.enabled=false`, or users don't subscribe |
 
-Nothing else leaves the server. Logs contain no tokens, SDP, push endpoints or usernames.
+OCSP stapling is disabled in certmagic (`OCSP.DisableStapling=true`, §8.2), so the server makes no OCSP requests;
+manual certificates are loaded without certmagic and cause none either. Nothing else leaves the server. Logs contain
+no tokens, SDP, push endpoints or usernames.
 
 ---
 
@@ -2110,21 +2351,21 @@ Nothing else leaves the server. Logs contain no tokens, SDP, push endpoints or u
 
 | Package | Asserted |
 |---|---|
-| `config` | Precedence flag > env > file > default for every kind; policy `IsSet`; unknown file key → error with line/column and suggestion; unknown env → warning; list/duration/bool parsing; derived TLS mode; `off`-mode default of `listen.http`; each §4.5 rule produces the right key, source and fix; `config example` output re-parses to the defaults; registry has no duplicate env/flag names |
-| `config` secrets | First start creates 0600 with all keys; restart keeps them; missing registered key is added; wide mode fixed; wrong owner errors; corrupt → `secrets_corrupt`; atomic write leaves the old file on a simulated failure; `Rotate` changes only the chosen keys and runs hooks in order |
-| `netx` portmux | TLS ClientHello → `TLS()` and a full handshake (HTTP/1.1 and h2 ALPN); RFC 4571 STUN frame → `ICE()` with the byte replayed; `GET ` → 400 hint; `0xFF` → closed; silent client closed at the timeout (shortened in tests); 33rd pending conn per IP closed; per-IP open limit; `Close` unblocks both `Accept`s; `LocalAddr` is `*net.TCPAddr`; goleak clean |
-| `netx` transport | Counting `PacketConn` keeps `AddrPortReaderWriter`; byte counts match; port 0 reuse; interface filter globs; buffer read-back |
+| `config` | Precedence flag > env > file > default for every kind; policy `IsSet`; unknown file key → error with line/column and suggestion; unknown env → warning; list/duration/bool parsing; derived TLS mode; `off`-mode default of `listen.http`; `off`-mode default of `trusted_proxies` (loopback `listen.http` → `127.0.0.0/8`, `::1/128`; non-loopback → `[]` plus the §4.5 warning; an explicit `[]` wins); `config init --tls.mode off` with a loopback `listen.http` writes `trusted_proxies` into the file; each §4.5 rule produces the right key, source and fix; `config example` output re-parses to the defaults; registry has no duplicate env/flag names; empty env counts as unset: `ISSHONI_PUBLIC_IP=` and `ISSHONI_DOMAIN=` with no file → effective `public_ip="auto"`, derived tls mode `ip`, no validation error, `IsSet("public_ip")` false; reserved names of §4.2 ignored without a warning; `config init` ignores env and exits 78 without writing on invalid values; `Site.Dev` only for off mode + loopback `listen.http` + empty or loopback `public_url` |
+| `config` secrets | First start creates 0600 with all keys; restart keeps them; missing registered key is added; wide mode fixed; wrong owner → exit 78; corrupt → `secrets_corrupt`; atomic write leaves the old file on a simulated failure; `Rotate` changes only the chosen keys and runs hooks in order |
+| `netx` portmux | TLS ClientHello → `TLS()` and a full handshake (HTTP/1.1 and h2 ALPN); RFC 4571 STUN frame → `ICE()` with the byte replayed; `GET ` → 400 hint; `0xFF` → closed; silent client closed at the timeout (shortened in tests); 33rd pending conn per IP closed, also when the 33 come from different addresses in one IPv6 /64; with `MaxPending` reached a new connection is admitted and the oldest pending one is closed (`Limited`); `IPKey` table (IPv4, IPv4-mapped IPv6, two addresses in one /64, neighbouring /64s); per-IP open limit; `Close` unblocks both `Accept`s; `LocalAddr` is `*net.TCPAddr`; goleak clean |
+| `netx` transport | Counting `PacketConn` keeps `AddrPortReaderWriter`; byte counts match; port 0 reuse; interface filter globs; buffer read-back and the one warn line when it is below target; 7882/tcp per-IP ICE limit shared with 443 (65th connection across both closed, also from different addresses in one /64); `Advertised` holds post-rewrite addresses with `Via` `udp`/`tcp443`/`tcp7882`; a setter called after `Apply` wins |
 | `netx` public IP | Fake STUN (pion/stun) + fake interfaces: each row of §7.4's table; timeouts; literal config skips STUN for the result |
 | `netx` rewrite | Rules/filters for each row of §7.5 (direct, 1:1 NAT, Docker bridge, home LAN Append, IPv6 literal) |
 | `tlsmgr` | Manual: load, reload on file change and SIGHUP, bad new pair keeps the old, key mismatch, expiry warning; `HTTPHandler`: ACME path passthrough, 503 while not ready, 308 to config host (ignores request Host), off-mode passthrough; ACME problem → hint code table |
-| `httpapi` | Middleware order; security headers per response type; HSTS only with domain+TLS; host check incl. dev localhost; trusted-proxy XFF (right-most untrusted) and ignoring XFF in non-off modes; error envelope; `DecodeJSON` limits; SPA table of §9.5 (asset 404, dotted path 404, deep link → index 200, `/setup` → 404 via hook, ETag/304, `.br` negotiation, MIME types without `/etc/mime.types`) |
+| `httpapi` | Middleware order; read deadline: a request body trickled past it (shortened in tests) is cut, and `/ws` has no deadline after the upgrade; security headers per response type (`/sw.js` carries the HTML CSP, with `connect-src` including `'self'`; other non-HTML files carry `default-src 'none'`); HSTS only with domain+TLS; host check incl. dev localhost; trusted-proxy XFF (right-most untrusted) and ignoring XFF in non-off modes; error envelope; `DecodeJSON` limits; SPA table of §9.5 (asset 404, dotted path 404, deep link → index 200, `/setup` → 404 via hook, ETag/304, `.br` negotiation, MIME types without `/etc/mime.types`) |
 | `logx` | `Secret` redacted in text and JSON handlers, all fmt verbs, `json.Marshal`; `ReplaceAttr` key list; pion bridge drops SDP-like lines and rate-limits; format auto-detection |
-| `ops` | Health state machine (starting → ready → shutting_down); conntest handler (transport validation, `transport_disabled` in off mode, per-user rate limit, `sfu.probe_limit` → 429) with a fake `Prober`; transfer flush, month rollover at UTC midnight, 80/100 % alerts once; release parser (drafts, prereleases, semver order, security marker, ETag 304); dashboard JSON golden file |
-| `ops` admin | Peer-cred filter (injected creds); every endpoint via `httptest` over a real unix socket (short path under `/tmp`: macOS `sun_path` is 104 bytes); backup tar layout and manifest; restore validation rejects traversal, symlinks, extra names, bad hashes, newer schema; swap crash recovery from each `plan.json` state; old WAL never next to the new DB |
-| `doctor` | Each check with fake FS/resolver/STUN/clock/DMI; provider table; bandwidth numbers (plan example 10.53 Mbps/viewer and 105 Mbps; exit scenario 41.5 Mbps); JSON golden; text render; exit codes 0/5 and `--strict` |
-| `push` | `ValidateEndpoint` table (http, :8443, userinfo, IP literal, localhost, 10/8, [::1], fd00::/8, 169.254.169.254, 100.64/10, name resolving private → `push_endpoint_rejected` with the right `reason`); `Control` blocks a rebinding resolver; no redirects followed; recipient filter passed to the store (sharer and `PresentUserIDs` excluded, `Pref`); `admin.alert` payload per 03 alert kind; VAPID fingerprint change deletes all subscriptions at start; dedup window; per-recipient bucket; 404/410/401/403 prune; 429 retry with `Retry-After`; payload < 1 KB; round trip through a fake push service that **decrypts** `aes128gcm` with the test subscription's private key and checks the VAPID JWT (`aud`, `exp`, `sub`) |
+| `ops` | Health state machine (starting → ready → shutting_down); conntest function (transport validation, `transport_disabled` with `params.transport` for each transport without a listener, per-user rate limit, `sfu.probe_limit` → 429, `publicIp` `""` without a public IPv4, `container` value) with a fake `Prober`; transfer flush, month rollover at UTC midnight, 80/100 % alerts once; release parser (drafts, prereleases, semver order, security marker, ETag 304); dashboard JSON golden file |
+| `ops` admin | Peer-cred filter (injected creds); every endpoint via `httptest` over a real unix socket (short path under `/tmp`: macOS `sun_path` is 104 bytes); backup tar layout and manifest; offline backup falls back to raw files only when `BackupFile` fails; restore validation rejects traversal, symlinks, extra names, bad hashes, and (through `InspectFile`, whatever the manifest says) a newer schema, a history mismatch or a failed integrity check; offline commands exit 7 while the data-directory lock is held; swap crash recovery from each `plan.json` state; old WAL never next to the new DB |
+| `doctor` | Each check with fake FS/resolver/STUN/clock/DMI; `clock` with a fake `adjtimex` returning EPERM (sync unknown, no warn; skew check decides; `info` in `manual`/`off`); provider table; bandwidth numbers (plan example 10.53 Mbps/viewer and 105 Mbps; exit scenario 41.5 Mbps); JSON golden; text render; exit codes 0/5 and `--strict` |
+| `push` | `ValidateEndpoint` table (http, :8443, userinfo, IP literal, localhost, 10/8, [::1], fd00::/8, 169.254.169.254, 100.64/10, name resolving private → `push_endpoint_rejected` with the right `reason`); `Control` blocks a rebinding resolver; no redirects followed; recipient filter passed to the store (sharer and `PresentUserIDs` excluded, `Pref`); `admin.alert` payload per 03 alert kind; VAPID fingerprint change deletes all subscriptions before `push.New` returns; dedup window; per-recipient bucket; 404/410/401/403 prune; 429 retry with `Retry-After`; payload < 1 KB; round trip through a fake push service that **decrypts** `aes128gcm` with the test subscription's private key and checks the VAPID JWT (`aud`, `exp`, `sub`) |
 | `version` | Build with `-ldflags -X …` in a test and check `isshoni version --json`; BuildInfo fallback |
-| `cmd/isshoni` | `testscript` (rogpeppe/go-internal, test-only): every subcommand's usage, exit codes (incl. healthcheck 0/1 only), `--json` shapes, confirmation prompts and `--yes`, container `--out` requirement |
+| `cmd/isshoni` | `testscript` (rogpeppe/go-internal, test-only): every subcommand's usage, exit codes (incl. healthcheck 0/1 only), a permission case run as a non-root uid that is not the server's (a socket directory it can't enter, and a server whose peer-cred filter rejects it): `setup-url` and `admin status` exit 4 with the `sudo` message, `doctor` prints it and runs no offline checks (skipped when the tests run as root), `--json` shapes, confirmation prompts and `--yes`, container `--out` requirement, `admin backup --out -` refused with exit 2 and the umask Docker form when stdout is a terminal (testscript `ttyout`) |
 
 ### Integration (in-process, `servertest`)
 
@@ -2137,14 +2378,19 @@ Nothing else leaves the server. Logs contain no tokens, SDP, push endpoints or u
 - **Graceful shutdown**: connected clients receive `server.shutdown`, `error{server_shutdown}` and close code 1012
   within 2 s; REST gets 503 `server_shutdown`; `Run` returns within `shutdown_timeout`; goleak clean.
 - **Refusing to start**: seed a DB with a newer schema → `serve` exits 78 and prints 03's message with the backup
-  name; `admin restore --offline <pre-*.db>` → the next `serve` starts. A container without a data mount (fake
-  mountinfo) → exit 78.
+  name, followed by the restore command for the environment; `admin restore --offline <pre-*.db>` → the next `serve`
+  starts. A `store.Open` error without `store.ErrNeedsOperator` → exit 1. A container without a data mount (fake
+  mountinfo) → exit 78. A second `serve` on the same data dir → exit 1 (lock held).
+- **Offline doctor leaves no DB files**: `doctor` against a stopped data dir leaves the directory listing unchanged
+  (no `-wal`/`-shm` created), tested as a different uid than the data owner where the platform allows.
 - **Backup/restore round trip**: create users and a push subscription → backup → mutate → restore → state equals the
   backup; sessions from the backup still work.
-- **rotate-secrets**: the server restarts (tests call `Run` again instead of `exec`); web sessions invalid, invites
-  invalid, push rows gone only with `--include-vapid`.
-- **Wiring** (§6.6): every adapter has a table test; in-process, `logout-everywhere` closes that user's WebSocket
-  within 100 ms, and an admin settings change of `maxShareBitrateKbps` reaches `SFU.SetLimits`.
+- **rotate-secrets**: the server restarts (tests call `Run` again instead of `exec`); web sessions, device codes and
+  invites invalid; push rows gone (session cascade and VAPID purge) before the first request is served.
+- **Wiring** (§6.6): every adapter has a table test; a unit test asserts that the registry's policy defaults equal
+  03's `SettingsCache.Defaults()`; a unit test asserts that `netx.IPKey` and 03's limiter key (exported by `auth` for
+  this test) give the same key for the `IPKey` table of the netx tests; in-process, `logout-everywhere` closes that user's WebSocket within 100 ms, and an
+  admin settings change of `maxShareBitrateKbps` reaches `SFU.SetLimits`.
 - **ACME** (CI job with Pebble + challtestsrv as service containers; Pebble listens with `httpPort`/`tlsPort` matching
   our test listeners): `auto` for a test domain and `ip` for `127.0.0.1`-mapped IP identifiers with the `shortlived`
   profile; a no-SNI handshake gets the IP certificate; renewal fires under a shortened lifetime.
@@ -2155,8 +2401,8 @@ Nothing else leaves the server. Logs contain no tokens, SDP, push endpoints or u
 
 - TCP-only viewer: server with `listen.ice_udp=""`; Chrome viewer plays (`framesDecoded > 0`) and the selected
   candidate pair is TCP.
-- Connection test: wizard step 2 reports UDP ✓, TCP 443 ✓ (TLS test mode), TCP 7882 ✓ on localhost; with UDP disabled
-  it reports UDP ✗ and shows the provider fix text.
+- Connection test: wizard step 2 reports UDP ✓, TCP 443 ✓ (TLS test mode), TCP 7882 ✓ on localhost; in off mode the
+  TCP 443 row is hidden; with `listen.ice_udp = ""` the UDP row shows ✗ with the "UDP turned off" text.
 
 ### Manual (M1 exit)
 
@@ -2182,18 +2428,21 @@ Packages and names (exact):
   `limits.max_participants_per_room`, `limits.max_shares_per_room`, `limits.max_bitrate_kbps`,
   `limits.transfer_alert_gb`, `updates.release_check` with their 03 settings fields (§4.3); guard
   `limits.ws_handshakes_per_ip_per_minute`; `sfu.pause_unwatched_layers`.
-- `internal/server/netx`: `Transport` (`UDPMux`, `TCPMux`, `TCPMux443`, `TCPMux7882`, `Advertised`, `RcvBuf`,
-  `SndBuf`, `Apply(*webrtc.SettingEngine) error`, `Close`), `NewTransport`, `TransportOptions` (incl. `PacketConns`
-  for tests), `AdvertisedAddr`, `PublicAddrs`, `NATKind`, `DetectPublicAddrs`, `STUNClient`, `Resolver`, `PortMux`,
-  `TransferCounter`, `Path` consts.
+- `internal/server/netx`: `Transport` (`UDPMux`, `TCPMux`, `TCPMux443`, `TCPMux7882`, `NetworkTypes`,
+  `IncludeLoopback`, `Advertised`, `RcvBuf`, `SndBuf`, `Apply(*webrtc.SettingEngine) error`, `Close`), `NewTransport`,
+  `TransportOptions` (incl. `PacketConns` for tests), `AdvertisedAddr` (`Via`: `udp` | `tcp443` | `tcp7882`),
+  `PublicAddrs`, `DetectPublicAddrs`, `STUNClient`, `Resolver`, `PortMux` (`ICE().Close` idempotent), `IPKey`,
+  `TransferCounter`, `Path` consts. 02's `sfu` and `sfutest` may import `netx`; `netx` never imports `sfu` (§2).
 - `internal/server/httpapi` (router part): `Router` (`Handle`, `HandleFunc`, `Handler`), `RouterOptions` (`SPAStatus`,
-  `API`, `WS`), `ClientIP`, `IsSecure`, `RequestID`, `WriteJSON`, `WriteError(w, r, err)`, `DecodeJSON(w, r, dst,
-  maxBytes)`, `Gate`; the global middleware order of §9.3.
-- `internal/server/ops`: `Health` (`AddCheck`, …), `Metrics.Registerer()`, `LiveSource`, `AccountsSource`, `Prober`,
-  the dashboard and conntest handlers, admin socket API (§12.2) and client (`ops.DialAdmin(path) *AdminClient`).
-- `internal/server/ops/doctor`: `Run`, `Bandwidth`, `RenderText`, `CheckIDs`, `Env`.
-- `internal/server/push`: `Service` (`ShareStarted`, `AdminAlert`, `VAPIDPublicKey`, `ValidateEndpoint`, `SendTest`,
-  `Run`), `ShareStarted`, `AdminAlert`, `Store`, `RecipientFilter`, `Sender`, `Subscription`.
+  `API`, `WS`, `Observer`), `RouteObserver`, `ClientIP`, `IsSecure`, `RequestID`, `WriteJSON`,
+  `WriteError(w, r, err)`, `DecodeJSON(w, r, dst, maxBytes)`, `Gate`; the global middleware order of §9.3.
+- `internal/server/ops`: `Health` (`AddCheck`, …), `Metrics` (`Registerer()`, `ObserveRoute`), `LiveSource`,
+  `AccountsSource`, `Policy`, `Prober`, the typed dashboard, doctor, bandwidth and conntest functions (§2), admin
+  socket API (§12.2) and client (`ops.DialAdmin(path) *AdminClient`).
+- `internal/server/ops/doctor`: `Run`, `Bandwidth`, `RenderText`, `CheckIDs`, `Env`, `DBFiles`, `DBInfo`.
+- `internal/server/push`: `New(ctx, opts)`, `Service` (`ShareStarted`, `AdminAlert`, `VAPIDPublicKey`,
+  `ValidateEndpoint`, `SendTest`, `Run`), `ShareStarted`, `AdminAlert`, `Store`, `RecipientFilter`, `Sender`,
+  `Subscription`.
 - `internal/server`: `Server`, `New`, `Run`, `Shutdown`, `ShutdownReason`, `ErrRestartRequested`, `Deps`, and the
   wiring table of §6.6.
 - `internal/server/servertest`: `Start(t testing.TB, opts Options) *Server` with fields `URL`, `WSURL`, `Client`
@@ -2203,15 +2452,16 @@ Packages and names (exact):
   `ProcessInfo`, `TLSInfo`, `AdvertisedAddr`, `UpdateInfo`, `TransferInfo`, `MediaTotals`, `RoomLive`,
   `ParticipantLive`, `ConnectionLive`, `ShareLive`, `LayerLive`, `ViewerCounts`, `ClientVersionCount`,
   `DoctorSummary`, `Alert`), `ServerStatus`, `DoctorReport`, `DoctorCheck`, `DoctorStatus`, `DoctorEnv`,
-  `BandwidthInput`, `BandwidthEstimate`, `PushPayload`, `ConnTestRequest`, `ConnTestResponse`, `ConnTestServerInfo`;
-  the error codes added to 03's table (§9.4).
+  `BandwidthInput`, `BandwidthEstimate`, `PushPayload`, `ConnTestRequest`, `ConnTestResponse`, `ConnTestServerInfo`,
+  `CloudProvider` and `NATKind` (typed string constants); the error codes added to 03's table (§9.4).
 - `web` package: `web.Dist() fs.FS`.
 - HTTP: `/healthz`, `/readyz`, `/api/v1/conntest`, `/api/v1/admin/dashboard`, `/api/v1/admin/doctor`,
   `/api/v1/admin/bandwidth`; push payload types `share.started`, `admin.alert`, `push.test`.
 - CLI and ops contract for 06: subcommands and flags (§3.1: `config init`, `version --short`, `doctor --only
   --list-checks`, `healthcheck --ready --wait`, `setup-url --qr --wait --json`, `admin backup --out -`, `admin restore
   PATH|-` incl. `.db` files and `--offline`), exit codes (§3.2: 78 for "restart can't help"; healthcheck 0/1; setup-url
-  4 unreachable, 7 admin exists; doctor 0/5), env names (§4.2, §4.3 env-only switches), `SIGHUP` reload, re-exec after
+  4 unreachable, 7 `setup_unavailable`; doctor 0/5), env names (§4.2, including the empty-means-unset rule and the
+  reserved names; §4.3 env-only switches), the data-directory lock `isshoni.lock` (§5.1), `SIGHUP` reload, re-exec after
   restore and rotation, no `sd_notify` (unit `Type=exec`), Docker needs `/run/isshoni` writable by uid 65532 (tmpfs
   with a read-only root) and a data volume at `/var/lib/isshoni`, the release-note marker `<!-- isshoni:security -->`.
 
@@ -2230,21 +2480,38 @@ Packages and names (exact):
 - `internal/server/sfuplane` (01 §15.4), built by the wiring.
 
 **02-sfu**
-- `sfu.New(Config{Transport, …})` calls `Transport.Apply` on each `SettingEngine` and sets the 10 s DTLS timeout;
-  `SFU.Ready()`; `SFU.Snapshot()` and `Metrics()` (per-share and per-layer bitrate, resolution, fps, loss, viewers per
-  layer, ingress/egress, selected transport per PeerConnection) for `LiveSource` and the metrics adapter;
-  `SFU.Probe` for `/api/v1/conntest`; `SetLimits`; `Close()` for shutdown.
+- `sfu.New(Config{Transport, PauseUnwatchedLayers, Limits, …})` calls `Transport.Apply` on each `SettingEngine`
+  (probe engines: `Apply`, then its own setters) and sets the 10 s DTLS timeout; `SFU.Ready()`; `SFU.Snapshot()` and
+  `Metrics()` as Go types (02 §13: `RoomSnapshot.Shares`/`Conns`, `ShareSnapshot`, `ConnSummary`, `SnapshotTotals`
+  with `PCsByTransport`; every label's fixed value set; probe PCs left out of every PC count) for `LiveSource` and the
+  metrics collector; selected pairs labeled from `Transport.Advertised` (`udp` | `tcp443` | `tcp7882`).
+- `SFU.Probe` for `/api/v1/conntest`: one live probe per (user, transport), a new one replacing the old, 20 globally
+  (`sfu.probe_limit`); `sfu.transport_disabled` whenever that transport's mux is nil; a result channel buffered with
+  capacity 1 that is never waited on; IPv4 candidates only when a public IPv4 is known (02 §7.6).
+- `SetLimits`; `Close()` for shutdown, closing PCs concurrently and returning within 1 s.
 
 **03-accounts-and-store**
 - `store.Open` with pre-migration backups; `*store.SchemaTooNewError{DBVersion, BinaryVersion, LastAppVersion,
-  Backup}` (message printed, exit 78); migration and corruption errors distinguishable by type; `(*DB).BackupTo`,
-  `Close` with WAL checkpoint, `Ping` for readiness, `QuickCheck` and `Stats` for doctor; `meta` get/set; the tables
-  `push_subscriptions`, `push_preferences`, `transfer_months` and their `*Q` methods (03 §6).
-- Auth service calls used by the admin socket: `SetupAvailable`, `IssueSetupToken`, `UserByUsername`,
-  `IssuePasswordReset`, `UpdateUser` (role, status; last-admin guard), `CreateInvite`, `db.Read → ListUsers` (03 §12.6).
-- `httpapi.API` (the /api/v1 chain, `Handle`, `PrincipalFrom`, `DashboardAccounts`), `api.Error` and `api.StatusOf`;
-  `SettingsCache.Pin`, `Get`, `OnChange`; the `SPAStatus` hook (`/setup` → 404 after setup); `auth.ConnCloser`,
-  `auth.AdminAlerter`, `httpapi.Signal`, `httpapi.Push`, `httpapi.InfoSource` for the wiring.
+  Backup}` (its `Error()` states the problem, the versions and the backup path, with no command; 04 appends the
+  command, §6.1 step 4); the sentinel `store.ErrNeedsOperator`, wrapped by every `Open` failure that a restart can't
+  fix: `store.Open` errors for which `errors.Is(err, store.ErrNeedsOperator)` → print the error and exit 78; any other
+  `store.Open` error → exit 1. `(*DB).BackupTo`, `Close` with WAL checkpoint, `Ping` for readiness, `QuickCheck` and
+  `Stats` for doctor; `meta` get/set; the tables `push_subscriptions`, `push_preferences`, `transfer_months` and their
+  `*Q` methods (03 §6); `store.PushSubscription` (the wiring converts it to `push.Subscription`).
+- File-level functions that never migrate and never write the source file: `store.LatestSchemaVersion()`,
+  `store.InspectFile(ctx, dbPath, backupDir) (store.FileInfo, error)` and `store.BackupFile(ctx, srcPath, dstPath)`
+  (read-only; for offline commands, restore validation and doctor's `schema` check, which needs the
+  `mode=ro&immutable=1` open of §13.1), passed into `ops`/`ops/doctor` by `cmd/isshoni` and the wiring (§2).
+- Auth service calls used by the admin socket: `SetupAvailable`, `IssueSetupToken` (`setup_unavailable` once an admin
+  exists), `UserByUsername`, `IssuePasswordReset`, `UpdateUser` (role, status; last-admin guard), `CreateInvite`
+  (0 = setting default), `db.Read → ListUsers` / `UserRow` (03 §12.6, §16); audit with `store.CLIActor`.
+- `auth.Service.AuthenticateCookie(r)` (cookie only, `auth.ErrNoCookie`) for `/ws`; `Touch` for `Revalidate`.
+- `httpapi.API` (the /api/v1 chain with no-store and JSON 404/405 for every path under `/api/v1/`, `Handle`,
+  `PrincipalFrom`, `DashboardAccounts`), `api.Error` and `api.StatusOf` (with this doc's codes as (04) rows);
+  `SettingsCache.Pin` (errors carry the field code), `Get`, `OnChange`, `Defaults()`; the `SPAStatus` hook (`/setup`
+  → 404 after setup); `auth.ConnCloser`, `auth.AdminAlerter` (`auth.Options.Alerts`, may be nil), `httpapi.Signal`,
+  `httpapi.Push` (nil answers `push_unavailable`), `httpapi.InfoSource` for the wiring.
+- 03's handler checks a push subscription's body shape (`too_long`, `bad_keys`) before calling `ValidateEndpoint`.
 - 03's startup fingerprint purge honours the rotation contract of §5.2.
 
 **05-web-client**
@@ -2257,7 +2524,9 @@ Packages and names (exact):
   `server_shutdown`.
 
 **06-deploy-and-ci**
-- ldflags (§15); `go.mod` `ignore ./web/node_modules`; `web/dist/.gitkeep`.
+- ldflags (§15, `date` = commit date) and one VERSION per build, passed as ldflags `version` and as
+  `ISSHONI_VERSION` to the Vite build in every task and in goreleaser; `go.mod` `ignore ./web/node_modules` and
+  `ignore ./docs/node_modules`; `web/dist/.gitkeep`; the same reserved `ISSHONI_*` list as §4.2.
 - systemd unit: `Type=exec`, `RuntimeDirectory=isshoni`, `StateDirectory=isshoni` (`StateDirectoryMode=0700`),
   `ConfigurationDirectory=isshoni`, `AmbientCapabilities=CAP_NET_BIND_SERVICE`, `ExecReload=/bin/kill -HUP $MAINPID`,
   `TimeoutStopSec=20`, `Restart=on-failure`, `RestartPreventExitStatus=78`, `After=network-online.target`.
@@ -2271,8 +2540,8 @@ Packages and names (exact):
 - CI: Pebble + challtestsrv job, golangci-lint `depguard` rules of §2, license gate covers the new deps
   (`skip2/go-qrcode` MIT, `x/sys`, `x/mod`, `x/time` BSD, `go-internal` BSD test-only, zap MIT and acmez Apache via
   certmagic).
-- Release template marker `<!-- isshoni:security -->`; privacy page facts of §16; config reference from the registry
-  (`isshoni config example`), hand-written in M1.
+- Release template marker `<!-- isshoni:security -->`; the `/privacy` page renders §16's table in full; config
+  reference `/reference/config` from the registry (`isshoni config example`), hand-written in M1 (generated in M5).
 
 ---
 
@@ -2299,7 +2568,7 @@ with the other docs and adds the wiring slices of §6.6.
 | S11 | doctor | All checks, `--only`, `--list-checks`, provider table, bandwidth calculator, text/JSON output, `/api/v1/admin/doctor`, `/api/v1/admin/bandwidth`, periodic run | doctor unit tests; numbers of §13.4; `doctor --json` on a VPS all ok | S7, S8, S10 |
 | S12 | Web Push | VAPID, `httpapi.Push` methods, guarded sender, triggers, dedup, limits, pruning, VAPID fingerprint check | push unit tests incl. decrypting fake push service; manual iPhone and Android notification | S3, 03 tables |
 | S12b | Push wiring | push as `PushNotifier`, `AdminAlerter`, `httpapi.Push` | a share going live in `servertest` reaches the fake push service for an absent user only | S12, W2 |
-| S13 | Connection test | `/api/v1/conntest` handler on 02's `Probe` | Playwright wizard step 2 shows UDP/TCP443/TCP7882 ✓ locally, UDP ✗ when disabled | S7, 02 slice 14 |
+| S13 | Connection test | `/api/v1/conntest` handler on 02's `Probe` | Playwright wizard step 2 shows UDP ✓ and TCP 7882 ✓ locally with the TCP 443 row hidden (off mode); with `listen.ice_udp = ""` the UDP row shows ✗ with the "UDP turned off" text | S7, 02 slice 14 |
 | S14 | Hardening | SIGHUP, full shutdown with 01's notice, log canary, TCP-only e2e, `doctor` in Docker bridge and host modes | All integration and e2e tests of §17 pass; manual 2-hour session checklist | all above |
 
 ## Decisions taken at integration (formerly open questions)
