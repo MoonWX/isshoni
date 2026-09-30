@@ -40,7 +40,15 @@ type pubSection struct {
 // pubOffer is a pub offer that passed checkPubOffer.
 type pubOffer struct {
 	desc     *sdp.SessionDescription
-	sections []pubSection // the sending m-sections, in offer order
+	sections []pubSection // the bound sending m-sections, in offer order
+	// unbound holds the mids of the sending m-sections that tracks doesn't bind, in offer order: for example one whose
+	// share ended in a race, so the hub dropped its TrackRef (01 §9 rule 4). They carry no share, and their rids passed
+	// the same guard as a bound video section's (none on audio). The pub PC answers each one a=inactive
+	// (setAnswerInactive on the answer sent to the client), so a compliant client doesn't send on it. Pion's local
+	// description still receives on it, so a track that arrives on an unbound mid anyway is never attached to a share:
+	// the pub PC (S29) drains it (reads and discards its packets) or stops its receiver, and never leaves it unread,
+	// or its read buffers fill and stay allocated.
+	unbound []string
 }
 
 // checkPubOffer validates a pub offer before anything is applied (02 §8.4 step 1) and returns what the pub PC needs
@@ -49,17 +57,20 @@ type pubOffer struct {
 //   - sfu.bad_sdp: empty, larger than 64 KiB, unparsable, more than 8 m-lines, an m=application (data channel) or
 //     other non-media section, or an m-section without a unique mid (Pion's SetRemoteDescription refuses an offer
 //     with an m-section without a mid, rejected ones included);
-//   - sfu.unknown_track: a sending m-section whose mid isn't bound, is bound with the other kind, or is bound to a
-//     share that isn't this Conn's; or a second video or audio m-section for one share;
+//   - sfu.unknown_track: tracks binds one mid twice; a sending m-section is bound with the other kind, or to a share
+//     that isn't this Conn's; or a second video or audio m-section for one share;
 //   - sfu.no_h264: a sending video m-section without H.264 packetization-mode=1 in one of the five profiles of the
 //     PT table (any other profile can't be negotiated, 02 §8.1);
 //   - sfu.bad_rid: on a sending video m-section, an a=rid id outside {f,q}, a repeated one, more than 2, or an
 //     a=simulcast id without an a=rid line; on a sending audio m-section, any a=rid line or a=simulcast id.
 //
-// Sending means that Pion receives on the m-section: its direction is sendrecv or sendonly. Pion ignores the port
-// of an offer's m-section, so a port-0 m-section that still sends needs a binding too. Bindings for other
-// m-sections are ignored. Error.Share is set when the failing m-section maps to a share. Error messages hold
-// positions and counts, never SDP text.
+// A sending m-section without a binding is no error: it goes to pubOffer.unbound, and the pub PC answers it
+// a=inactive. Only its rids are checked, as above (sfu.bad_rid, without a share): Pion answers and receives every rid
+// of it all the same, and the rid guard (02 §12) bounds what one offer can make Pion allocate. Its codecs don't
+// matter. Sending means that Pion receives on the m-section: its direction is sendrecv or sendonly. Pion ignores the
+// port of an offer's m-section, so a port-0 m-section that still sends counts too. Bindings for other m-sections are
+// ignored. Error.Share is set when the failing m-section maps to a share. Error messages hold positions and counts,
+// never SDP text.
 func checkPubOffer(raw string, tracks []TrackBinding, ownShare func(ShareID) bool) (*pubOffer, error) {
 	if len(raw) > maxPubOfferBytes {
 		return nil, newError(CodeBadSDP, fmt.Sprintf("pub offer is %d bytes (max %d)", len(raw), maxPubOfferBytes))
@@ -92,10 +103,20 @@ func checkPubOffer(raw string, tracks []TrackBinding, ownShare func(ShareID) boo
 		}
 		kind := mediaKind(md)
 		mid, _ := md.Attribute(sdp.AttrKeyMID)
+		rids, ridErr := offerRIDs(md)
+		if kind == webrtc.RTPCodecTypeAudio && (len(rids) > 0 || ridErr != "") {
+			ridErr = "rids on an audio m-line"
+		}
 		b, ok := bound[mid]
 		switch {
 		case !ok:
-			return nil, newError(CodeUnknownTrack, fmt.Sprintf("m-line %d (%s) is sending but not in tracks", i, kind))
+			// Pion answers an unbound section's rids like any other's, and receives a layer on each, so the rid guard
+			// (02 §12) holds for it too. It maps to no share.
+			if ridErr != "" {
+				return nil, newError(CodeBadRID, fmt.Sprintf("m-line %d: %s", i, ridErr))
+			}
+			offer.unbound = append(offer.unbound, mid)
+			continue
 		case b.Kind != kind:
 			return nil, shareError(CodeUnknownTrack, b.Share, fmt.Sprintf("m-line %d (%s) is bound as %s", i, kind, b.Kind))
 		case ownShare == nil || !ownShare(b.Share):
@@ -114,18 +135,15 @@ func checkPubOffer(raw string, tracks []TrackBinding, ownShare func(ShareID) boo
 		}
 
 		s := pubSection{index: i, mid: mid, kind: kind, share: b.Share}
-		rids, ridErr := offerRIDs(md)
 		if kind == webrtc.RTPCodecTypeVideo {
 			s.profiles = offeredProfiles(md)
 			if len(s.profiles) == 0 {
 				return nil, shareError(CodeNoH264, b.Share, fmt.Sprintf("m-line %d offers no H.264 with packetization-mode=1", i))
 			}
-			if ridErr != "" {
-				return nil, shareError(CodeBadRID, b.Share, fmt.Sprintf("m-line %d: %s", i, ridErr))
-			}
 			s.rids = rids
-		} else if len(rids) > 0 || ridErr != "" {
-			return nil, shareError(CodeBadRID, b.Share, fmt.Sprintf("m-line %d: rids on an audio m-line", i))
+		}
+		if ridErr != "" {
+			return nil, shareError(CodeBadRID, b.Share, fmt.Sprintf("m-line %d: %s", i, ridErr))
 		}
 		offer.sections = append(offer.sections, s)
 	}
@@ -198,6 +216,48 @@ func setOpusAnswerParams(raw string, bitrates map[string]int) (string, error) {
 				md.Attributes = append(md.Attributes, sdp.Attribute{Key: "fmtp", Value: pt + " " + setFmtpParams("", set)})
 			}
 		}
+	}
+	out, err := desc.Marshal()
+	if err != nil {
+		return "", newError(CodeInternal, "marshal answer: "+err.Error())
+	}
+	return string(out), nil
+}
+
+// setAnswerInactive returns a copy of a pub answer for the client with the named m-sections (pubOffer.unbound) made
+// inactive: their direction attributes are replaced by one a=inactive, so the client sends nothing on them and keeps
+// the transceiver for a later offer that binds it. Other lines stay as they are. Like setOpusAnswerParams, it edits
+// the copy sent to the client; Pion's local description may keep its recvonly answer, so a track that still arrives
+// on such an m-section must be drained or its receiver stopped (pubOffer.unbound). No mids returns raw unchanged.
+func setAnswerInactive(raw string, mids []string) (string, error) {
+	if len(mids) == 0 {
+		return raw, nil
+	}
+	desc, err := parseSDP(raw)
+	if err != nil {
+		return "", err
+	}
+	for _, md := range desc.MediaDescriptions {
+		if mid, _ := md.Attribute(sdp.AttrKeyMID); !slices.Contains(mids, mid) {
+			continue
+		}
+		attrs := make([]sdp.Attribute, 0, len(md.Attributes)+1)
+		placed := false
+		for _, a := range md.Attributes {
+			switch a.Key {
+			case sdp.AttrKeySendRecv, sdp.AttrKeySendOnly, sdp.AttrKeyRecvOnly, sdp.AttrKeyInactive:
+				if !placed {
+					attrs = append(attrs, sdp.Attribute{Key: sdp.AttrKeyInactive})
+					placed = true
+				}
+				continue
+			}
+			attrs = append(attrs, a)
+		}
+		if !placed {
+			attrs = append(attrs, sdp.Attribute{Key: sdp.AttrKeyInactive})
+		}
+		md.Attributes = attrs
 	}
 	out, err := desc.Marshal()
 	if err != nil {
