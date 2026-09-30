@@ -8,9 +8,9 @@
 # yet (web/ before the web client lands, for example) is skipped too. The run summary of the
 # changes job says why each job runs or not.
 #
-# Jobs for parts that land later (licenses, e2e, docker-smoke, distro, goreleaser-check and
-# site of 06 §8.2) come with those parts: each adds a `decide` line to the changes job and,
-# when it gates the merge, its id to ci-ok's needs.
+# Jobs for parts that land later (e2e, docker-smoke, distro, goreleaser-check and site of
+# 06 §8.2) come with those parts: each adds a `decide` line to the changes job and, when it
+# gates the merge, its id to ci-ok's needs.
 #
 # Rules for every workflow (06 §8.1): a read-only token by default, with jobs raising their
 # own permissions; third-party actions pinned by full commit SHA with a version comment;
@@ -61,6 +61,7 @@ jobs:
       run-test-go: ${{ steps.plan.outputs.run-test-go }}
       run-web: ${{ steps.plan.outputs.run-web }}
       run-protocol: ${{ steps.plan.outputs.run-protocol }}
+      run-licenses: ${{ steps.plan.outputs.run-licenses }}
       run-build: ${{ steps.plan.outputs.run-build }}
       run-lint-deploy: ${{ steps.plan.outputs.run-lint-deploy }}
       run-govulncheck: ${{ steps.plan.outputs.run-govulncheck }}
@@ -133,6 +134,8 @@ jobs:
           fi
           go_or_web=false
           if [ "$go" = true ] || [ "$web" = true ]; then go_or_web=true; fi
+          go_web_or_site=$go_or_web
+          if [ "$site" = true ]; then go_web_or_site=true; fi
           {
             echo "go=$go"
             echo "web=$web"
@@ -177,6 +180,9 @@ jobs:
           # untracked files, and gen:check would fail on every go or web change.
           decide protocol "$go_or_web" Taskfile.yml .tool-versions tygo.yaml tools/go.mod \
             internal/protocol/gen/tsregistry
+          # The site's npm packages (docs/) join the check when docs/package.json lands.
+          decide licenses "$go_web_or_site" Taskfile.yml .tool-versions tools/go.mod tools/notices \
+            web/scripts/licenses.mjs web/package.json web/package-lock.json
           decide build true Taskfile.yml .tool-versions cmd/isshoni web/package.json web/package-lock.json
           decide lint-deploy "$deploy" Taskfile.yml .tool-versions
           decide govulncheck "$go" Taskfile.yml .tool-versions tools/go.mod
@@ -404,6 +410,73 @@ jobs:
       - name: task gen:check (generated TypeScript matches the Go types)
         run: task gen:check
 
+  licenses:
+    # The license gate of 06 §8.3: go-licenses over ./cmd/... for linux, darwin and windows,
+    # and web/scripts/licenses.mjs over web/ (and docs/ once the site lands). Only what ships
+    # is gated: the tools module (golangci-lint is GPL-3.0) is never linked into anything.
+    # The build job's `task notices` is the second half (tools/notices, 06 §8.4).
+    needs: changes
+    if: needs.changes.outputs.run-licenses == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # one cache per job below: setup-go's key is shared by every job
+
+      # Holds the build of go-licenses too, so a warm run only links it.
+      - name: Cache Go modules and builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum', '.tool-versions') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+
+      - name: Set up Node (version from .tool-versions)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Set up Task
+        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: ${{ needs.changes.outputs.task-version }}
+
+      # npm query reads the installed trees, so both projects are installed first.
+      - name: npm ci (web)
+        run: npm ci --prefix web --no-audit --no-fund
+
+      - name: npm ci (docs)
+        if: hashFiles('docs/package-lock.json') != ''
+        run: npm ci --prefix docs --no-audit --no-fund
+
+      - name: task licenses
+        run: task licenses
+
+      # The gate's own tests: a GPL-3.0 fixture dependency must fail both halves. The npm
+      # script's tests run under Node's test runner (Vitest covers src/ and build/ only), and
+      # the go-licenses test needs the .bin/go-licenses that task licenses just built (the
+      # test-go job skips it).
+      - name: The gate fails on a GPL-3.0 fixture dependency (npm)
+        working-directory: web
+        run: node --test scripts/licenses.test.mjs
+
+      - name: The gate fails on a GPL-3.0 fixture dependency (go-licenses)
+        run: |
+          ISSHONI_GO_LICENSES="$PWD/.bin/go-licenses" \
+            go -C tools test -count=1 -run 'TestGoLicensesGate' -v ./notices
+
   build:
     needs: [changes, web]
     if: needs.changes.outputs.run-build == 'true'
@@ -464,6 +537,29 @@ jobs:
           if [ "$size" -gt $(( 60 * 1048576 )) ]; then
             echo "::warning::bin/isshoni is $mib MiB, above the 60 MiB budget (06 §8.2)"
           fi
+
+      - name: Check that THIRD_PARTY_NOTICES covers bin/isshoni
+        # Every module that `go version -m` reports, and the Go runtime, has an entry (06 §8.4).
+        # task notices lists the modules with go list -deps for each shipped GOOS and GOARCH;
+        # this checks that list against what the build actually linked.
+        run: |
+          missing=0 count=0
+          while read -r path version; do
+            count=$((count + 1))
+            if ! awk -v p="$path" -v v="$version" '$1 == p && $2 == v { found = 1 } END { exit !found }' THIRD_PARTY_NOTICES; then
+              echo "::error::THIRD_PARTY_NOTICES has no entry for $path $version, which bin/isshoni links"
+              missing=1
+            fi
+          done < <(go version -m bin/isshoni | awk '$1 == "dep" { print $2, $3 }')
+          runtime=$(go version bin/isshoni | awk '{ print $2 }')
+          if ! grep -qxF "Go standard library and runtime ($runtime)" THIRD_PARTY_NOTICES; then
+            echo "::error::THIRD_PARTY_NOTICES has no entry for the Go runtime ($runtime)"
+            missing=1
+          fi
+          if [ "$missing" = 0 ]; then
+            echo "THIRD_PARTY_NOTICES lists the Go runtime ($runtime) and all $count modules that bin/isshoni links"
+          fi
+          exit "$missing"
 
       - name: Upload bin/isshoni
         # The e2e job downloads it (artifacts drop the mode bit: chmod +x after download).
@@ -589,7 +685,7 @@ jobs:
     # The only required check (06 §8.6). It fails when a gating job failed or was cancelled;
     # a skipped job counts as a pass. always(), so it also reports when a job it needs failed.
     if: always()
-    needs: [changes, lint-go, test-go, web, protocol, build, lint-deploy]
+    needs: [changes, lint-go, test-go, web, protocol, licenses, build, lint-deploy]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     permissions: {}
