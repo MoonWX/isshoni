@@ -18,3 +18,8 @@ cmp stdout version.txt
 exitcode 2 isshoni version --short --json
 ! stdout .
 stderr '^isshoni version: --short and --json can''t be combined$'
+
+# --version prints the version and nothing else: it must not swallow a command.
+exitcode 2 isshoni --version serve
+! stdout .
+stderr '^isshoni: --version takes no arguments; use ''isshoni version''$'

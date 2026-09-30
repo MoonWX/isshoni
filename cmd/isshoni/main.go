@@ -166,6 +166,9 @@ func dispatch(ctx context.Context, inv *invocation, cmd *command, args []string)
 		}
 		// A group: the root, or admin, admin users, …
 		if f := fs.Lookup("version"); f != nil && f.Value.String() == "true" { // isshoni --version
+			if len(args) > 0 { // "isshoni --version serve" must not exit 0 without serving
+				return cmd, usageErrorf("--version takes no arguments; use 'isshoni version'")
+			}
 			return cmd, printVersion(inv.stdout, buildInfo(), false, false)
 		}
 		if len(args) == 0 {
@@ -200,7 +203,17 @@ func flagMessage(err error) string {
 	return strings.NewReplacer(": -", ": --", "flag -", "flag --", "for -", "for --").Replace(msg)
 }
 
+// checkArgs checks a leaf's positional arguments. The flag package stops at the first argument, so a flag typed after
+// one arrives here as an argument; it gets its own hint. Only args[0] may look like a flag, so that "-- -file" still
+// works: none of the positional values of 04 §3.1 starts with '-' (usernames never do, 03 §7.1), except "-" alone.
 func checkArgs(cmd *command, args []string) error {
+	if cmd.maxArgs >= 0 {
+		for _, a := range args[min(1, len(args)):] {
+			if len(a) > 1 && strings.HasPrefix(a, "-") {
+				return usageErrorf("flag %s after an argument: flags go before arguments", a)
+			}
+		}
+	}
 	switch {
 	case len(args) < cmd.minArgs:
 		if cmd.minArgs == 1 {
@@ -208,13 +221,7 @@ func checkArgs(cmd *command, args []string) error {
 		}
 		return usageErrorf("missing arguments: want %s", cmd.args)
 	case cmd.maxArgs >= 0 && len(args) > cmd.maxArgs:
-		extra := args[cmd.maxArgs:]
-		for _, a := range extra {
-			if len(a) > 1 && strings.HasPrefix(a, "-") {
-				return usageErrorf("flag %s after an argument: flags go before arguments", a)
-			}
-		}
-		return usageErrorf("unexpected argument %q", extra[0])
+		return usageErrorf("unexpected argument %q", args[cmd.maxArgs])
 	}
 	return nil
 }

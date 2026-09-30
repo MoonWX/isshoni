@@ -165,6 +165,40 @@ func TestNotImplemented(t *testing.T) {
 	}
 }
 
+// Values at the edges of what the CLI accepts get past its checks (to the not-implemented stub for now).
+func TestAcceptedValues(t *testing.T) {
+	for _, args := range [][]string{
+		{"admin", "invite", "create", "--uses", "1", "--ttl", "1h"},
+		{"admin", "invite", "create", "--uses", "1000", "--ttl", "720h"},
+		{"admin", "invite", "create", "--ttl", "168h"},
+		{"admin", "invite", "create", "--uses", "0", "--ttl", "0"}, // 0 is the "not sent" value
+		{"admin", "log-level", "--for", "1s", "warn"},
+		{"admin", "restore", "-"},                                         // stdin
+		{"admin", "restore", "--", "-backup.tar.gz"},                      // an argument that starts with '-', after --
+		{"admin", "users", "set-role", "--socket", "/x", "alice", "user"}, // flags before the arguments
+	} {
+		code, _, stderr := runCLI(t, args...)
+		name := strings.Join(args, " ")
+		if want := "isshoni " + strings.Join(leafPath(args), " ") + ": not implemented in this build yet\n"; code != exitRuntime || stderr != want {
+			t.Errorf("isshoni %s: exit %d, stderr %q; want exit 1 and %q", name, code, stderr, want)
+		}
+	}
+}
+
+// leafPath returns the command words at the start of args: those before the first flag or argument.
+func leafPath(args []string) []string {
+	c := root()
+	var p []string
+	for _, a := range args {
+		s := c.sub(a)
+		if s == nil {
+			break
+		}
+		c, p = s, append(p, a)
+	}
+	return p
+}
+
 func TestUsageErrors(t *testing.T) {
 	tests := []struct {
 		args     []string
@@ -177,6 +211,8 @@ func TestUsageErrors(t *testing.T) {
 		{[]string{"bogus"}, exitUsage, `isshoni: unknown command "bogus"`},
 		{[]string{"sreve"}, exitUsage, `isshoni: unknown command "sreve" (did you mean "serve"?)`},
 		{[]string{"--", "--version"}, exitUsage, "isshoni: unknown flag --version"},
+		{[]string{"--version", "serve"}, exitUsage, "isshoni: --version takes no arguments; use 'isshoni version'"},
+		{[]string{"--version", "serve", "--bogus"}, exitUsage, "isshoni: --version takes no arguments; use 'isshoni version'"},
 		{[]string{"version", "--bogus"}, exitUsage, "isshoni version: unknown flag --bogus"},
 		{[]string{"version", "--short", "--json"}, exitUsage, "isshoni version: --short and --json can't be combined"},
 		{[]string{"version", "extra"}, exitUsage, `isshoni version: unexpected argument "extra"`},
@@ -188,12 +224,24 @@ func TestUsageErrors(t *testing.T) {
 		{[]string{"admin", "restore"}, exitUsage, "isshoni admin restore: missing argument PATH|-"},
 		{[]string{"admin", "restore", "a.tar.gz", "--yes"}, exitUsage, "isshoni admin restore: flag --yes after an argument: flags go before arguments"},
 		{[]string{"admin", "restore", "a.tar.gz", "b.tar.gz"}, exitUsage, `isshoni admin restore: unexpected argument "b.tar.gz"`},
+		{[]string{"admin", "users", "set-role", "alice", "--socket", "/x"}, exitUsage, "isshoni admin users set-role: flag --socket after an argument: flags go before arguments"},
+		{[]string{"admin", "users", "set-role", "alice", "--yes"}, exitUsage, "isshoni admin users set-role: flag --yes after an argument: flags go before arguments"},
+		{[]string{"admin", "users", "set-role", "alice", "-json", "admin"}, exitUsage, "isshoni admin users set-role: flag -json after an argument: flags go before arguments"},
+		{[]string{"version", "extra", "--json"}, exitUsage, "isshoni version: flag --json after an argument: flags go before arguments"},
 		{[]string{"admin", "users", "set-role", "alice"}, exitUsage, "isshoni admin users set-role: missing arguments: want NAME admin|user"},
 		{[]string{"admin", "users", "set-role", "alice", "root"}, exitUsage, `isshoni admin users set-role: role "root": want admin or user`},
 		{[]string{"admin", "log-level", "loud"}, exitUsage, `isshoni admin log-level: log level "loud": want debug, info, warn or error`},
 		{[]string{"admin", "log-level", "--for"}, exitUsage, "isshoni admin log-level: flag needs an argument: --for"},
 		{[]string{"admin", "log-level", "--for", "soon", "debug"}, exitUsage, `isshoni admin log-level: invalid value "soon" for flag --for: parse error`},
+		{[]string{"admin", "log-level", "--for", "-5m", "debug"}, exitUsage, "isshoni admin log-level: --for -5m0s: want a positive duration"},
+		{[]string{"admin", "log-level", "--for", "0s", "info"}, exitUsage, "isshoni admin log-level: --for 0s: want a positive duration"},
 		{[]string{"admin", "invite", "create", "--uses", "ten"}, exitUsage, `isshoni admin invite create: invalid value "ten" for flag --uses: parse error`},
+		{[]string{"admin", "invite", "create", "--uses", "-3"}, exitUsage, "isshoni admin invite create: --uses -3: want 1 to 1000"},
+		{[]string{"admin", "invite", "create", "--uses", "1001"}, exitUsage, "isshoni admin invite create: --uses 1001: want 1 to 1000"},
+		{[]string{"admin", "invite", "create", "--ttl", "90m"}, exitUsage, "isshoni admin invite create: --ttl 1h30m0s: want whole hours from 1h to 720h"},
+		{[]string{"admin", "invite", "create", "--ttl", "30m"}, exitUsage, "isshoni admin invite create: --ttl 30m0s: want whole hours from 1h to 720h"},
+		{[]string{"admin", "invite", "create", "--ttl", "1000h"}, exitUsage, "isshoni admin invite create: --ttl 1000h0m0s: want whole hours from 1h to 720h"},
+		{[]string{"admin", "invite", "create", "--ttl", "-24h"}, exitUsage, "isshoni admin invite create: --ttl -24h0m0s: want whole hours from 1h to 720h"},
 		{[]string{"setup-url", "--qr", "--no-qr"}, exitUsage, "isshoni setup-url: --qr and --no-qr can't be combined"},
 		{[]string{"doctor", "--quality", "720p30"}, exitUsage, `isshoni doctor: --quality "720p30": want 1080p60, 1440p60 or 2160p60`},
 		{[]string{"doctor", "--preset", "game"}, exitUsage, `isshoni doctor: --preset "game": want auto or movie`},

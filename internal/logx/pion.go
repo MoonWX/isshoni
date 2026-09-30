@@ -22,8 +22,10 @@ const (
 //   - Levels: trace and debug become slog debug; info, warn and error keep their level.
 //   - Pion's default is warn: its trace, debug and info lines are logged only while l is enabled for debug (config
 //     log.level = "debug", or the admin socket's log-level). Pion is chatty below warn.
-//   - Each scope (ice, dtls, pc, …) may log at most 20 lines per minute. The rest are dropped and counted, and the
-//     count is logged as "N messages suppressed" (at warn) with the scope's next line after the minute.
+//   - Each scope (ice, dtls, pc, …) may log at most 20 lines per minute. The first line over the limit logs
+//     "further messages suppressed" (at warn, with suppressed_until, the end of the minute). The rest are dropped
+//     and counted, and the count is logged as "N messages suppressed" (at warn) with the scope's next line after the
+//     minute.
 //   - A line that looks like SDP or an ICE candidate (an "a=" attribute or "candidate:") is dropped, so no session
 //     description, ICE credential or address reaches the log.
 //
@@ -93,12 +95,15 @@ func (p *pionLogger) write(level slog.Level, msg string) {
 	if looksLikeSDP(msg) {
 		return
 	}
-	ok, suppressed := p.lim.allow(time.Now())
-	if suppressed > 0 {
-		p.l.Log(noCtx, slog.LevelWarn, fmt.Sprintf("%d messages suppressed", suppressed), "suppressed", suppressed)
+	v := p.lim.allow(time.Now())
+	if v.reported > 0 {
+		p.l.Log(noCtx, slog.LevelWarn, fmt.Sprintf("%d messages suppressed", v.reported), "suppressed", v.reported)
 	}
-	if ok {
+	if v.ok {
 		p.l.Log(noCtx, level, msg)
+	}
+	if !v.quietUntil.IsZero() { // a burst followed by silence would otherwise never say that lines were dropped
+		p.l.Log(noCtx, slog.LevelWarn, "further messages suppressed", "suppressed_until", v.quietUntil)
 	}
 }
 

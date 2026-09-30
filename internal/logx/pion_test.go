@@ -128,6 +128,7 @@ func TestPionRateLimit(t *testing.T) {
 		ice := f.NewLogger("ice")
 		ice2 := f.NewLogger("ice") // Pion makes a logger per PeerConnection: the limit is per scope
 		dtls := f.NewLogger("dtls")
+		windowEnd := time.Now().Add(pionWindow)
 
 		for i := range 15 {
 			ice.Warnf("ice %d", i)
@@ -136,16 +137,21 @@ func TestPionRateLimit(t *testing.T) {
 		dtls.Warn("dtls still logs")
 		ice.Warn("a=candidate-like lines are dropped and not counted")
 
+		// 20 ice lines, the notice right after them (the 21st line), then dtls.
 		lines := jsonLines(t, &buf)
-		if len(lines) != pionLinesPerWindow+1 {
-			t.Fatalf("got %d lines in the first minute, want %d (20 ice + 1 dtls):\n%s", len(lines), pionLinesPerWindow+1, buf.String())
+		if len(lines) != pionLinesPerWindow+2 {
+			t.Fatalf("got %d lines in the first minute, want %d (20 ice + 1 notice + 1 dtls):\n%s", len(lines), pionLinesPerWindow+2, buf.String())
+		}
+		checkNotice(t, lines[pionLinesPerWindow], windowEnd)
+		if lines[pionLinesPerWindow+1]["msg"] != "dtls still logs" {
+			t.Errorf("last line = %v, want the dtls line", lines[pionLinesPerWindow+1])
 		}
 
 		time.Sleep(pionWindow - time.Second)
 		buf.Reset()
 		ice.Warn("still suppressed")
 		if buf.Len() != 0 {
-			t.Fatalf("logged before the minute was over:\n%s", buf.String())
+			t.Fatalf("logged before the minute was over (the notice comes only once per minute):\n%s", buf.String())
 		}
 
 		time.Sleep(time.Second)
@@ -162,38 +168,54 @@ func TestPionRateLimit(t *testing.T) {
 			t.Errorf("line = %v, want the new line", lines[1])
 		}
 
+		// The second minute started with "next minute": 19 more fit, the next two are dropped with one notice.
 		buf.Reset()
+		windowEnd = time.Now().Add(pionWindow)
 		for i := range pionLinesPerWindow - 1 {
 			ice.Warn(fmt.Sprint("more ", i))
 		}
 		ice.Warn("over the limit again")
-		if n := len(jsonLines(t, &buf)); n != pionLinesPerWindow-1 {
-			t.Errorf("second minute: %d lines, want %d", n, pionLinesPerWindow-1)
+		ice2.Warn("and again")
+		lines = jsonLines(t, &buf)
+		if len(lines) != pionLinesPerWindow {
+			t.Fatalf("second minute: %d lines, want %d (19 + 1 notice):\n%s", len(lines), pionLinesPerWindow, buf.String())
 		}
+		checkNotice(t, lines[pionLinesPerWindow-1], windowEnd)
 	})
+}
+
+// checkNotice checks the line a scope logs when it first goes over its limit.
+func checkNotice(t *testing.T, line map[string]any, windowEnd time.Time) {
+	t.Helper()
+	if line["msg"] != "further messages suppressed" || line["level"] != "WARN" || line["scope"] != "ice" {
+		t.Errorf("notice = %v, want a warn line \"further messages suppressed\" for scope ice", line)
+	}
+	until, err := time.Parse(time.RFC3339Nano, fmt.Sprint(line["suppressed_until"]))
+	if err != nil || !until.Equal(windowEnd) {
+		t.Errorf("notice suppressed_until = %v, want %v (the end of the minute)", line["suppressed_until"], windowEnd)
+	}
 }
 
 func TestLineLimiter(t *testing.T) {
 	start := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
 	l := newLineLimiter(3, time.Minute)
+	check := func(what string, now time.Time, want verdict) {
+		t.Helper()
+		if got := l.allow(now); got != want {
+			t.Fatalf("%s: allow = %+v, want %+v", what, got, want)
+		}
+	}
 	for i := range 3 {
-		if ok, s := l.allow(start.Add(time.Duration(i) * time.Second)); !ok || s != 0 {
-			t.Fatalf("line %d: allow = %v, %d; want true, 0", i, ok, s)
-		}
+		check(fmt.Sprint("line ", i), start.Add(time.Duration(i)*time.Second), verdict{ok: true})
 	}
-	for i := range 2 {
-		if ok, s := l.allow(start.Add(10 * time.Second)); ok || s != 0 {
-			t.Fatalf("extra line %d: allow = %v, %d; want false, 0", i, ok, s)
-		}
-	}
-	if ok, s := l.allow(start.Add(time.Minute)); !ok || s != 2 {
-		t.Fatalf("new window: allow = %v, %d; want true, 2", ok, s)
-	}
-	if ok, s := l.allow(start.Add(time.Minute + time.Second)); !ok || s != 0 {
-		t.Fatalf("count reported once: allow = %v, %d; want true, 0", ok, s)
-	}
+	check("first extra line", start.Add(10*time.Second), verdict{quietUntil: start.Add(time.Minute)})
+	check("second extra line", start.Add(20*time.Second), verdict{})
+	check("new window", start.Add(time.Minute), verdict{ok: true, reported: 2})
+	check("count reported once", start.Add(time.Minute+time.Second), verdict{ok: true})
 	// A quiet period longer than a window: nothing suppressed, a fresh window.
-	if ok, s := l.allow(start.Add(time.Hour)); !ok || s != 0 {
-		t.Fatalf("after an hour: allow = %v, %d; want true, 0", ok, s)
-	}
+	check("after an hour", start.Add(time.Hour), verdict{ok: true})
+	// Each window has its own notice: the first refused line of this one names this window's end.
+	check("hour +1s", start.Add(time.Hour+time.Second), verdict{ok: true})
+	check("hour +2s", start.Add(time.Hour+2*time.Second), verdict{ok: true})
+	check("hour +3s", start.Add(time.Hour+3*time.Second), verdict{quietUntil: start.Add(time.Hour + time.Minute)})
 }

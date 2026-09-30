@@ -200,7 +200,7 @@ func adminInviteCmd() *command {
 				"(Admin → Settings).",
 			config: true,
 			setup: leaf(func(fs *flag.FlagSet, o *inviteCreateOptions) {
-				fs.IntVar(&o.uses, "uses", 0, "how many accounts the link may create (default: the server's setting)")
+				fs.IntVar(&o.uses, "uses", 0, "how many accounts the link may create, 1 to 1000 (default: the server's setting)")
 				fs.DurationVar(&o.ttl, "ttl", 0, "how long the link works, in whole hours from 1h to 720h (default: the server's setting)")
 				o.register(fs)
 			}, runInviteCreate),
@@ -208,7 +208,19 @@ func adminInviteCmd() *command {
 	}
 }
 
-func runInviteCreate(context.Context, *invocation, inviteCreateOptions, []string) error {
+// Invite limits (04 §3.1, 03 §7.9). 0 is the flag's "not sent" value, so the server's setting applies.
+const (
+	inviteMaxUses = 1000
+	inviteMaxTTL  = 720 * time.Hour
+)
+
+func runInviteCreate(_ context.Context, _ *invocation, o inviteCreateOptions, _ []string) error {
+	if o.uses < 0 || o.uses > inviteMaxUses {
+		return usageErrorf("--uses %d: want 1 to %d", o.uses, inviteMaxUses)
+	}
+	if o.ttl != 0 && (o.ttl < time.Hour || o.ttl > inviteMaxTTL || o.ttl%time.Hour != 0) {
+		return usageErrorf("--ttl %s: want whole hours from 1h to 720h", o.ttl)
+	}
 	return errNotImplemented
 }
 
@@ -258,9 +270,12 @@ func adminLogLevelCmd() *command {
 	}
 }
 
-func runLogLevel(_ context.Context, _ *invocation, _ logLevelOptions, args []string) error {
+func runLogLevel(_ context.Context, _ *invocation, o logLevelOptions, args []string) error {
 	if !slices.Contains(logLevels, args[0]) {
 		return usageErrorf("log level %q: want debug, info, warn or error", args[0])
+	}
+	if o.forDur <= 0 {
+		return usageErrorf("--for %s: want a positive duration", o.forDur)
 	}
 	return errNotImplemented
 }
