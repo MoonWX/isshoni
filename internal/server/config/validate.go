@@ -59,7 +59,7 @@ func (v *validator) warnf(key, fix, format string, args ...any) {
 
 // modeText describes the effective TLS mode with its origin, e.g. `tls.mode "ip" (derived: domain is empty)`.
 func (v *validator) modeText() string {
-	if v.c.IsSet("tls.mode") {
+	if v.c.TLS.Mode != "" { // an explicitly empty tls.mode is still derived
 		return fmt.Sprintf("tls.mode = %s", tomlString(string(v.mode)))
 	}
 	if v.c.Domain != "" {
@@ -162,7 +162,7 @@ func (v *validator) publicAddrs() {
 		if class == "" {
 			return
 		}
-		if !v6 && v.c.IsSet("tls.mode") {
+		if !v6 && v.c.TLS.Mode != "" {
 			v.errorf("tls.mode", ipModeFix, "needs a public address, but public_ip = %s is %s", tomlString(val), class)
 			return
 		}
@@ -394,10 +394,11 @@ func (v *validator) network() {
 	}
 }
 
-// maxSocketPath is the longest unix socket path macOS accepts (sun_path).
-const maxSocketPath = 104
+// maxSocketPath is the longest unix socket path macOS accepts: sun_path is 104 bytes including the terminating NUL,
+// and Go rejects len >= 104.
+const maxSocketPath = 103
 
-// admin_socket is at most 104 bytes; data_dir is not empty.
+// admin_socket is at most 103 bytes; data_dir is not empty.
 func (v *validator) paths() {
 	switch s := v.c.Listen.AdminSocket; {
 	case s == "":

@@ -194,7 +194,7 @@ var registry = []Key{
 	},
 	{
 		Path: "listen.admin_socket", Kind: KindString, Default: "/run/isshoni/admin.sock", Consumer: "ops, cli",
-		Help:  "The admin socket of the isshoni CLI (at most 104 bytes).",
+		Help:  "The admin socket of the isshoni CLI (at most 103 bytes).",
 		field: func(c *Config) any { return &c.Listen.AdminSocket },
 	},
 

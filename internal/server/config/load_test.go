@@ -210,6 +210,12 @@ func TestUnknownFileKeys(t *testing.T) {
 		`stun = {servers = ["a:1"]}`,   // 10: inline table
 		`completely_unrelated = 1`,     // 11
 		`[empty]`,                      // 12: an empty unknown table
+		`[log]`,                        // 13
+		`public_ip = "8.8.8.8"`,        // 14: a top-level key below a section header
+		`admin_socket = "/x.sock"`,     // 15: a key of another section
+		`mode = "ip"`,                  // 16: a name two sections share
+		`[push]`,                       // 17
+		`domain = "watch.example.com"`, // 18: a top-level key below a section header
 		``,
 	}, "\n")
 	_, ve := testLoad(t, file, nil)
@@ -229,6 +235,10 @@ func TestUnknownFileKeys(t *testing.T) {
 		{"network.stun.servers", 10, 9, "did you mean network.stun_servers? (stun_servers = … under [network])"},
 		{"network.completely_unrelated", 11, 1, "remove it; 'isshoni config example' prints every key"},
 		{"empty", 12, 2, "remove it; 'isshoni config example' prints every key"},
+		{"log.public_ip", 14, 1, "public_ip is a top-level key: move the line above the first [section] header"},
+		{"log.admin_socket", 15, 1, "did you mean listen.admin_socket? (admin_socket = … under [listen])"},
+		{"log.mode", 16, 1, "remove it; 'isshoni config example' prints every key"},
+		{"push.domain", 18, 1, "domain is a top-level key: move the line above the first [section] header"},
 	}
 	for _, w := range want {
 		p, ok := findProblem(ve.Problems, w.key, "is not a config key")
@@ -242,6 +252,15 @@ func TestUnknownFileKeys(t *testing.T) {
 	}
 	if len(ve.Problems) != len(want) {
 		t.Errorf("%d problems, want %d:%s", len(ve.Problems), len(want), problemList(ve.Problems))
+	}
+	// The common case of the example file: a key that belongs above [tls] written below it.
+	_, ve2 := testLoad(t, "[tls]\nmode = \"auto\"\ndomain = \"watch.example.com\"\n", nil)
+	if ve2 == nil {
+		t.Fatal("tls.domain: no error")
+	}
+	if p, ok := findProblem(ve2.Problems, "tls.domain", "is not a config key"); !ok || p.Source.Line != 3 ||
+		p.Fix != "domain is a top-level key: move the line above the first [section] header" {
+		t.Errorf("tls.domain:%s", problemList(ve2.Problems))
 	}
 	p, _ := findProblem(ve.Problems, "tls.mdoe", "")
 	if !strings.HasPrefix(p.String(), "config error: tls.mdoe (file ") || !strings.Contains(p.String(), "isshoni.toml:4:1) is not a config key.\n  fix: did you mean tls.mode?") {
@@ -260,6 +279,30 @@ func TestSectionAsValue(t *testing.T) {
 		if !ok || p.Source.Line != 1 || !strings.Contains(p.Fix, "[tls]") {
 			t.Errorf("%q:%s", file, problemList(ve.Problems))
 		}
+	}
+}
+
+// A file that Windows Notepad saved, with a UTF-8 byte order mark and CRLF line ends, loads, and its line numbers
+// are the editor's.
+func TestFileBOMAndCRLF(t *testing.T) {
+	file := "\xef\xbb\xbf# isshoni\r\ndomain = \"watch.example.com\"\r\n\r\n[log]\r\nlevel = \"debug\"\r\n"
+	c := mustLoad(t, file, nil)
+	if c.Domain != "watch.example.com" || c.Log.Level != "debug" {
+		t.Errorf("values %q %q", c.Domain, c.Log.Level)
+	}
+	if s := c.Source("domain"); s.Kind != SourceFile || s.Line != 2 {
+		t.Errorf("domain source %+v", s)
+	}
+	if s := c.Source("log.level"); s.Line != 5 {
+		t.Errorf("log.level source %+v", s)
+	}
+	// A key on the first line keeps column 1 after the mark.
+	_, ve := testLoad(t, "\xef\xbb\xbfdomian = \"a\"\r\n", nil)
+	if ve == nil {
+		t.Fatal("no error")
+	}
+	if p, ok := findProblem(ve.Problems, "domian", "is not a config key"); !ok || p.Source.Line != 1 || p.Source.Column != 1 {
+		t.Errorf("problems:%s", problemList(ve.Problems))
 	}
 }
 

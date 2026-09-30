@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"sort"
@@ -25,7 +26,9 @@ type position struct{ line, col int }
 // go-toml/v2 decodes the document into a map first, which catches syntax errors and duplicate keys with their
 // position. The registry is then walked against that map, so every unknown key is reported in one run (a strict
 // decode into Config would stop at the first type error), and go-toml's parser supplies the line of every key.
+// A leading UTF-8 byte order mark, as Windows Notepad writes it, is dropped first.
 func parseFile(path string, data []byte) (map[string]fileValue, []Problem) {
+	data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))
 	var doc map[string]any
 	if err := toml.Unmarshal(data, &doc); err != nil {
 		src := Source{Kind: SourceFile, File: path}
@@ -121,7 +124,8 @@ func exampleLine(section string) string {
 }
 
 // unknownKey is the problem for a key the registry doesn't know, with a "did you mean" suggestion when a key is
-// within an edit distance of 2 (04 §4.2).
+// within an edit distance of 2 (04 §4.2). A key that landed in the wrong table, typically a top-level key written
+// below a [section] header (log.public_ip), is pointed at its right place instead of being called unknown.
 func unknownKey(path, file string, p position) Problem {
 	var names []string
 	for _, k := range registry {
@@ -129,9 +133,12 @@ func unknownKey(path, file string, p position) Problem {
 	}
 	fix := "remove it; 'isshoni config example' prints every key"
 	if s := suggest(strings.ToLower(path), names); s != "" {
-		fix = "did you mean " + s + "?"
-		if k := registry[keyByPath[s]]; k.Section() != "" {
-			fix += fmt.Sprintf(" (%s = … under [%s])", k.Name(), k.Section())
+		fix = didYouMean(s)
+	} else if s := misplacedKey(strings.ToLower(path)); s != "" {
+		if k := registry[keyByPath[s]]; k.Section() == "" {
+			fix = s + " is a top-level key: move the line above the first [section] header"
+		} else {
+			fix = didYouMean(s)
 		}
 	}
 	return Problem{
@@ -141,6 +148,39 @@ func unknownKey(path, file string, p position) Problem {
 		Message:  "is not a config key",
 		Fix:      fix,
 	}
+}
+
+// didYouMean is the fix that suggests the registered key path, with its section form for a key in a section.
+func didYouMean(path string) string {
+	fix := "did you mean " + path + "?"
+	if k := registry[keyByPath[path]]; k.Section() != "" {
+		fix += fmt.Sprintf(" (%s = … under [%s])", k.Name(), k.Section())
+	}
+	return fix
+}
+
+// misplacedKey returns the registered key that an unknown path most likely meant to set from the wrong table, or "":
+// the path without its first element when that is a key (tls.domain → domain, log.listen.http → listen.http), else
+// the only key whose name is the path's last element (log.admin_socket → listen.admin_socket).
+func misplacedKey(path string) string {
+	_, rest, ok := strings.Cut(path, ".")
+	if !ok {
+		return ""
+	}
+	if _, ok := keyByPath[rest]; ok {
+		return rest
+	}
+	name := path[strings.LastIndexByte(path, '.')+1:]
+	found := ""
+	for _, k := range registry {
+		if k.Name() == name {
+			if found != "" {
+				return "" // ambiguous, like mode (tls.mode, registration.mode)
+			}
+			found = k.Path
+		}
+	}
+	return found
 }
 
 // keyPositions returns the line and column of the first appearance of every key path in the document, table

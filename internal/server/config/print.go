@@ -42,15 +42,20 @@ func (c *Config) PrintText(w io.Writer) error {
 
 // derivedNote explains a default that depends on other keys.
 func (c *Config) derivedNote(k *Key) string {
+	if k.Path == "tls.mode" { // an explicitly empty tls.mode is still derived
+		switch {
+		case c.TLS.Mode != "":
+			return ""
+		case c.Domain != "":
+			return " (derived: auto, because domain is set)"
+		default:
+			return " (derived: ip, because domain is empty)"
+		}
+	}
 	if c.IsSet(k.Path) {
 		return ""
 	}
 	switch {
-	case k.Path == "tls.mode":
-		if c.Domain != "" {
-			return " (derived: auto, because domain is set)"
-		}
-		return " (derived: ip, because domain is empty)"
 	case k.Path == "listen.http" && c.EffectiveTLSMode() == TLSOff:
 		return ` (tls.mode = "off")`
 	case k.Path == "network.trusted_proxies" && c.derivedTrustedProxies():

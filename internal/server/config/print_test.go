@@ -30,6 +30,33 @@ func TestPrintText(t *testing.T) {
 	}
 }
 
+// An explicitly empty tls.mode is still derived, and print says so.
+func TestPrintTextEmptyTLSMode(t *testing.T) {
+	for _, domain := range []string{"", "watch.example.com"} {
+		c := mustLoad(t, "[tls]\nmode = \"\"\n", []string{"ISSHONI_DOMAIN=" + domain, "ISSHONI_PUBLIC_IP=8.8.8.8"})
+		var b bytes.Buffer
+		if err := c.PrintText(&b); err != nil {
+			t.Fatal(err)
+		}
+		want := "isshoni.toml:2 (derived: ip, because domain is empty)\n"
+		if domain != "" {
+			want = "isshoni.toml:2 (derived: auto, because domain is set)\n"
+		}
+		if !strings.Contains(b.String(), want) {
+			t.Errorf("domain %q: print lacks %q:\n%s", domain, want, b.String())
+		}
+	}
+	// A mode that is set has no note.
+	c := mustLoad(t, "", nil, "--tls.mode=off")
+	var b bytes.Buffer
+	if err := c.PrintText(&b); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(b.String(), "derived:") {
+		t.Errorf("print of a set mode has a derived note:\n%s", b.String())
+	}
+}
+
 // The text form is TOML: the effective values load back.
 func TestPrintTextIsTOML(t *testing.T) {
 	c := mustLoad(t, "", nil, "--tls.mode=off", "--log.format=json")

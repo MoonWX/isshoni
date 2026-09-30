@@ -46,6 +46,10 @@ func TestRules(t *testing.T) {
 			`needs a public address, but public_ip = "192.168.1.20" is private`, "Let's Encrypt only issues IP certificates for public addresses"},
 		{"ip mode CGNAT (derived mode)", "", []string{"ISSHONI_PUBLIC_IP=100.64.1.2"}, nil, SeverityError, "public_ip", env("ISSHONI_PUBLIC_IP"),
 			`is a shared (CGNAT) address, but tls.mode "ip" (derived: domain is empty) needs a public address`, `tls.mode = "off"`},
+		{"ip mode private (explicitly empty mode is derived)", "", nil, []string{"--tls.mode=", "--public-ip=10.1.2.3"}, SeverityError, "public_ip", flag("public-ip"),
+			`is private, but tls.mode "ip" (derived: domain is empty) needs a public address`, "Use a VPS"},
+		{"ip mode private (empty mode in the file)", "[tls]\nmode = \"\"\n", []string{"ISSHONI_PUBLIC_IP=10.1.2.3"}, nil, SeverityError, "public_ip", env("ISSHONI_PUBLIC_IP"),
+			`is private, but tls.mode "ip" (derived: domain is empty) needs a public address`, "Use a VPS"},
 		{"ip mode loopback", "", nil, []string{"--public-ip=127.0.0.1"}, SeverityError, "public_ip", flag("public-ip"), "is loopback", "Use a VPS"},
 		{"ip mode documentation", "", nil, []string{"--public-ip=203.0.113.7"}, SeverityError, "public_ip", flag("public-ip"), "is a documentation address", "Use a VPS"},
 		{"ip mode link-local v6", "", nil, []string{"--public-ip=fe80::1"}, SeverityError, "public_ip", flag("public-ip"), "is link-local", "Use a VPS"},
@@ -90,7 +94,8 @@ func TestRules(t *testing.T) {
 		{"udp buffer too big", "", nil, []string{"--network.udp-buffer-bytes=67108865"}, SeverityError, "network.udp_buffer_bytes", flag("network.udp-buffer-bytes"), "is out of range", "8388608"},
 
 		// Paths.
-		{"admin socket too long", "", nil, []string{"--listen.admin-socket=/" + strings.Repeat("s", 104)}, SeverityError, "listen.admin_socket", flag("listen.admin-socket"), "is 105 bytes long", "shorter path"},
+		{"admin socket too long", "", nil, []string{"--listen.admin-socket=/" + strings.Repeat("s", 103)}, SeverityError, "listen.admin_socket", flag("listen.admin-socket"),
+			"is 104 bytes long, but a unix socket path can have at most 103 (macOS)", "shorter path"},
 		{"admin socket empty", "", nil, []string{"--listen.admin-socket="}, SeverityError, "listen.admin_socket", flag("listen.admin-socket"), "is empty", "/run/isshoni/admin.sock"},
 		{"data_dir empty", "data_dir = \"\"\n", nil, nil, SeverityError, "data_dir", Source{Kind: SourceFile, Line: 1}, "is empty", "/var/lib/isshoni"},
 
@@ -158,7 +163,7 @@ func TestRulesAccept(t *testing.T) {
 		{"--network.udp-buffer-bytes=1048576"},
 		{"--network.udp-buffer-bytes=67108864"},
 		{"--network.stun-servers=[2001:db8::1]:3478,stun.example.com:3478"},
-		{"--listen.admin-socket=/" + strings.Repeat("s", 103)},
+		{"--listen.admin-socket=/" + strings.Repeat("s", 102)}, // 103 bytes: macOS sun_path is 104 with the NUL
 	} {
 		c, ve := testLoad(t, "", nil, args...)
 		if ve != nil || len(c.Problems()) != 0 {
