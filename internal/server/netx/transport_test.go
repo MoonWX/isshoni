@@ -151,8 +151,11 @@ func TestTransportSharedICELimit(t *testing.T) {
 	if _, err := second.Read(make([]byte, 1)); err == nil {
 		t.Error("the 65th connection was not closed")
 	}
-	if got := tr.tcpLn.limited.Load(); got != 1 {
-		t.Errorf("limited = %d, want 1", got)
+	if got := pm.iceConns.refused.Load(); got != 1 {
+		t.Errorf("refused = %d, want 1", got)
+	}
+	if got := pm.Stats().Limited; got != 1 {
+		t.Errorf("PortMux.Stats().Limited = %d, want 1 (the 7882/tcp refusal of the shared limit)", got)
 	}
 	if got := pm.iceConns.open(key); got != DefaultMaxICEConnsPerIP {
 		t.Errorf("open = %d, want %d", got, DefaultMaxICEConnsPerIP)

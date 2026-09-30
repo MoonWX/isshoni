@@ -51,7 +51,9 @@ func ListenPortMux(opts PortMuxOptions) (*PortMux, error) {
 func (m *PortMux) TLS() net.Listener { return m.tls }
 
 // ICE returns the listener of connections that start with an RFC 4571 frame. Its Addr() is the *net.TCPAddr of
-// :443, and its Close is idempotent (Transport.Close closes it, then PortMux.Close again).
+// :443, and its Close is idempotent (Transport.Close closes it, then PortMux.Close again). Close must also close
+// every connection it handed out that is still open; pion's TCPMuxDefault.Close otherwise waits up to
+// FirstStunBindTimeout. (Transport wraps it in an iceListener that does this as well.)
 func (m *PortMux) ICE() net.Listener { return m.ice }
 
 // Addr returns the raw listener's address.
@@ -70,8 +72,17 @@ func (m *PortMux) Close() error {
 	return errors.Join(errs...)
 }
 
-// Stats returns the accepted-connection outcomes so far.
-func (m *PortMux) Stats() PortMuxStats { return PortMuxStats{} }
+// Stats returns the accepted-connection outcomes so far. Limited includes m.iceConns.refused: the 7882/tcp ICE
+// connections that the shared ICE limit refused (04 §7.3), so they appear in
+// isshoni_portmux_conns_total{result="limited"} whenever the limit is shared. README S26 adds the 443 outcomes; a 443
+// refusal is counted once, either in m.iceConns.refused or in PortMux's own count.
+func (m *PortMux) Stats() PortMuxStats {
+	var s PortMuxStats
+	if m.iceConns != nil {
+		s.Limited = m.iceConns.refused.Load()
+	}
+	return s
+}
 
 // iceLimiter returns the per-IPKey ICE connection count that Transport's 7882/tcp listener shares.
 func (m *PortMux) iceLimiter() *connLimiter { return m.iceConns }

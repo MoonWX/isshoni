@@ -306,16 +306,36 @@ func TestCloseWithSilentTCPClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var d net.Dialer
-	c, err := d.DialContext(context.Background(), "tcp4", tr.tcpLn.Addr().String())
+	closeWithSilentClient(t, tr, tr.tcpLn)
+}
+
+// TestCloseWithSilent443Client: the same on 443, whatever PortMux's ICE sub-listener does on Close (fakePortMux's is
+// a plain TCP listener, which leaves the connections it accepted open).
+func TestCloseWithSilent443Client(t *testing.T) {
+	pm := fakePortMux(t, 0)
+	tr, err := NewTransport(context.Background(), TransportOptions{
+		PortMux: pm, IncludeLoopback: true, Interfaces: &fakeIfaces{ifs: []Interface{loIface()}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeWithSilentClient(t, tr, tr.ln443)
+}
+
+// closeWithSilentClient connects a client to ln that never sends anything, waits until ln has handed it to pion,
+// then checks that Transport.Close returns quickly and closes the client's connection.
+func closeWithSilentClient(t *testing.T, tr *Transport, ln *iceListener) {
+	t.Helper()
+	var d net.Dialer
+	c, err := d.DialContext(context.Background(), "tcp4", ln.Addr().String())
+	if err != nil {
+		_ = tr.Close()
+		t.Fatal(err)
+	}
 	defer func() { _ = c.Close() }()
-	// Wait until the listener has handed the connection to pion.
-	key := IPKey(netip.MustParseAddr("127.0.0.1"))
-	for deadline := time.Now().Add(5 * time.Second); tr.tcpLn.limiter.open(key) == 0; {
+	for deadline := time.Now().Add(5 * time.Second); ln.handedOut() == 0; {
 		if time.Now().After(deadline) {
+			_ = tr.Close()
 			t.Fatal("the connection was not accepted")
 		}
 		time.Sleep(5 * time.Millisecond)

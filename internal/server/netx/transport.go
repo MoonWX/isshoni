@@ -71,9 +71,13 @@ type Transport struct {
 	IPFilter        func(ip net.IP) bool
 	IncludeLoopback bool
 	Advertised      []AdvertisedAddr // every advertised address with its final address:port after rewrite rules
-	RcvBuf, SndBuf  int              // effective socket buffers read back with getsockopt (the smallest over the UDP sockets)
+	// RcvBuf and SndBuf are the effective socket buffers read back with getsockopt (the smallest over the UDP
+	// sockets). On Linux the kernel reports twice the usable size; the value is halved so it compares directly with
+	// network.udp_buffer_bytes (and net.core.rmem_max).
+	RcvBuf, SndBuf int
 
 	tcpLn     *iceListener // the 7882/tcp listener; nil if listen.ice_tcp is ""
+	ln443     *iceListener // PortMux's ICE sub-listener, wrapped so Close closes its connections; nil in off mode
 	closers   []io.Closer  // what Close closes, in order
 	closeOnce sync.Once
 	closeErr  error
@@ -357,7 +361,10 @@ func (t *Transport) buildTCP(ctx context.Context, opts TransportOptions, plan ad
 		if ln == nil {
 			return nil, nil, errors.New("netx: PortMux has no ICE listener")
 		}
-		if err := addListener(ln, ViaTCP443); err != nil {
+		// PortMux already limits and counts these connections. The wrapper makes Close close the ones pion still
+		// holds (see iceListener), whatever PortMux's own Close does, so a silent client can't hold shutdown.
+		t.ln443 = newICEListener(ln, nil, nil, log)
+		if err := addListener(t.ln443, ViaTCP443); err != nil {
 			return nil, nil, err
 		}
 	}

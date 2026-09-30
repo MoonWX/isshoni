@@ -19,6 +19,10 @@ const DefaultMaxICEConnsPerIP = 64
 type connLimiter struct {
 	max int
 
+	// refused counts the connections closed because their IPKey was at the limit or could not be keyed. Transport's
+	// 7882/tcp listener adds to it, and PortMux.Stats reports it in Limited (04 §7.3).
+	refused atomic.Uint64
+
 	mu     sync.Mutex
 	counts map[netip.Prefix]int
 }
@@ -82,8 +86,10 @@ const (
 	acceptRetryMax = time.Second
 )
 
-// iceListener wraps the 7882/tcp listener for ice.TCPMuxDefault: at most limiter.max open connections per IPKey
-// (the excess is closed at once and counted), and every accepted connection counts its bytes on PathMediaTCP.
+// iceListener wraps an ICE-TCP listener for ice.TCPMuxDefault. On 7882/tcp it allows at most limiter.max open
+// connections per IPKey (the excess is closed at once and counted in limiter.refused), and every accepted connection
+// counts its bytes on PathMediaTCP. With a nil limiter and a nil counter (PortMux's 443 ICE sub-listener, which PortMux
+// already limits and counts) it only tracks the connections for Close.
 //
 // Accept never returns a transient error: pion's TCPMuxDefault stops accepting for good on the first error, so
 // transient errors are retried here and only a closed listener ends Accept.
@@ -93,11 +99,9 @@ const (
 // request would otherwise hold shutdown for up to FirstStunBindTimeout (10 s).
 type iceListener struct {
 	net.Listener
-	limiter *connLimiter
+	limiter *connLimiter // nil: no limit
 	counter *TransferCounter
 	log     *slog.Logger
-
-	limited atomic.Uint64 // connections closed because their IPKey was at the limit
 
 	mu        sync.Mutex
 	live      map[*countingConn]struct{} // handed out and not closed yet; nil once the listener is closed
@@ -116,7 +120,9 @@ func newICEListener(ln net.Listener, limiter *connLimiter, counter *TransferCoun
 func (l *iceListener) track(c net.Conn, key netip.Prefix) net.Conn {
 	var cc *countingConn
 	cc = newCountingConn(c, l.counter, PathMediaTCP, func() {
-		l.limiter.release(key)
+		if l.limiter != nil {
+			l.limiter.release(key)
+		}
 		l.mu.Lock()
 		delete(l.live, cc)
 		l.mu.Unlock()
@@ -159,18 +165,29 @@ func (l *iceListener) Accept() (net.Conn, error) {
 			continue
 		}
 		delay = 0
-		key, ok := remoteKey(c)
-		if !ok || !l.limiter.acquire(key) {
-			l.limited.Add(1)
-			_ = c.Close()
-			l.log.Debug("ICE-TCP connection over the per-IP limit closed", "max", l.limiter.max)
-			continue
+		var key netip.Prefix
+		if l.limiter != nil {
+			k, ok := remoteKey(c)
+			if !ok || !l.limiter.acquire(k) {
+				l.limiter.refused.Add(1)
+				_ = c.Close()
+				l.log.Debug("ICE-TCP connection over the per-IP limit closed", "max", l.limiter.max)
+				continue
+			}
+			key = k
 		}
 		if cc := l.track(c, key); cc != nil {
 			return cc, nil
 		}
 		return nil, net.ErrClosed
 	}
+}
+
+// handedOut returns the number of connections handed out and not closed yet (for tests).
+func (l *iceListener) handedOut() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.live)
 }
 
 // Close closes the listener and every connection still open; later calls do nothing and return nil (pion's

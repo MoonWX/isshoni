@@ -107,8 +107,39 @@ func TestSTUNClientMapped(t *testing.T) {
 		t.Errorf("Mapped = %v, want the socket's own address %v", got, want)
 	}
 	// The socket is usable afterwards: no read deadline is left behind for its owner.
+	ownerReads(t, sock)
 	if got, err := c.Mapped(ctx, sock, srv.addr()); err != nil || got != udpAddrPortOf(sock) {
 		t.Errorf("second Mapped = %v, %v", got, err)
+	}
+	ownerReads(t, sock)
+}
+
+// ownerReads sends one datagram to sock and reads it the way the socket's owner would after Mapped, without setting
+// a read deadline first: a deadline that Mapped left in the past would fail the read at once with a timeout.
+func ownerReads(t *testing.T, sock *net.UDPConn) {
+	t.Helper()
+	peer := listenUDP(t)
+	if _, err := peer.WriteTo([]byte("owner"), sock.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		n   int
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		n, _, err := sock.ReadFrom(make([]byte, 64))
+		done <- result{n, err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil || r.n != len("owner") {
+			t.Errorf("the owner's read after Mapped = %d bytes, %v; want the datagram", r.n, r.err)
+		}
+	case <-time.After(5 * time.Second):
+		_ = sock.Close() // ends the read
+		<-done
+		t.Fatal("the owner's read after Mapped got nothing")
 	}
 }
 

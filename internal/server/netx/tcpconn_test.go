@@ -119,8 +119,8 @@ func TestICEListenerLimitPerSlash64(t *testing.T) {
 		}
 		accepted = append(accepted, c)
 	}
-	if got := l.limited.Load(); got != 1 {
-		t.Errorf("limited = %d, want 1", got)
+	if got := lim.refused.Load(); got != 1 {
+		t.Errorf("refused = %d, want 1", got)
 	}
 	// The refused connection was closed: its client end reads EOF.
 	_ = clients[3].SetReadDeadline(time.Now().Add(time.Second))
@@ -147,7 +147,8 @@ func TestICEListenerLimitPerSlash64(t *testing.T) {
 // TestICEListenerRefusesUnknownRemote: a connection without an IP remote address can't be keyed, so it is refused.
 func TestICEListenerRefusesUnknownRemote(t *testing.T) {
 	fl := newFakeListener()
-	l := newICEListener(fl, newConnLimiter(0), nil, discardLog())
+	lim := newConnLimiter(0)
+	l := newICEListener(fl, lim, nil, discardLog())
 	defer func() { _ = l.Close() }()
 	s, c := net.Pipe() // RemoteAddr is "pipe"
 	defer func() { _ = c.Close() }()
@@ -159,13 +160,44 @@ func TestICEListenerRefusesUnknownRemote(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if l.limited.Load() != 1 {
-		t.Errorf("limited = %d, want 1", l.limited.Load())
+	if got := lim.refused.Load(); got != 1 {
+		t.Errorf("refused = %d, want 1", got)
 	}
 	if k, ok := remoteKey(got); !ok || k != netip.MustParsePrefix("192.0.2.1/32") {
 		t.Errorf("remoteKey = %v, %v", k, ok)
 	}
 	_ = got.Close()
+}
+
+// TestICEListenerNoLimit: with a nil limiter (PortMux's 443 ICE sub-listener, which PortMux limits itself) every
+// connection is handed out, even one without an IP remote address, and Close still closes the ones handed out.
+func TestICEListenerNoLimit(t *testing.T) {
+	fl := newFakeListener()
+	l := newICEListener(fl, nil, nil, discardLog())
+	var clients []net.Conn
+	for range 3 {
+		s, c := net.Pipe() // RemoteAddr is "pipe"
+		t.Cleanup(func() { _ = s.Close(); _ = c.Close() })
+		fl.conns <- s
+		clients = append(clients, c)
+	}
+	for i := range clients {
+		if _, err := l.Accept(); err != nil {
+			t.Fatalf("Accept %d: %v", i+1, err)
+		}
+	}
+	if got := l.handedOut(); got != len(clients) {
+		t.Errorf("handedOut = %d, want %d", got, len(clients))
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for i, c := range clients {
+		_ = c.SetReadDeadline(time.Now().Add(time.Second))
+		if _, err := c.Read(make([]byte, 1)); !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe) {
+			t.Errorf("client %d read %v after Close, want EOF", i+1, err)
+		}
+	}
 }
 
 func TestICEListenerRetriesTransientErrors(t *testing.T) {

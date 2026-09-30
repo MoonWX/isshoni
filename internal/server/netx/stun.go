@@ -37,6 +37,10 @@ var errSTUNFailed = errors.New("netx: STUN Binding failed")
 // retries). Mapped may be called concurrently on one socket: the client reads the socket while calls are
 // running and hands each response to the call with the matching transaction ID, which is how 04 §7.4 queries
 // both servers in parallel from one socket.
+//
+// Mapped owns the socket's read deadline while it runs: it clears any deadline the owner set and, when the last
+// call on the socket returns, leaves it cleared (no deadline). The owner must not read the socket meanwhile, and
+// sets its own deadline again afterwards if it needs one.
 func NewSTUNClient(r Resolver) STUNClient {
 	if r == nil {
 		r = net.DefaultResolver
@@ -175,9 +179,10 @@ func (c *stunClient) acquire(ctx context.Context, conn net.PacketConn, id [stun.
 	}
 }
 
-// release removes the waiter for id. The last one stops the reader (a read deadline in the past wakes it) and
-// waits until it has exited, so every reader has an owner that waits for it. A reader that already gave up on a
-// failing socket is no longer registered; its deadline is left alone, since a newer reader may own the socket.
+// release removes the waiter for id. The last one stops the reader (a read deadline in the past wakes it; the reader
+// clears it again on its way out) and waits until it has exited, so every reader has an owner that waits for it. A
+// reader that already gave up on a failing socket is no longer registered; its deadline is left alone, since a newer
+// reader may own the socket.
 func (c *stunClient) release(s *stunSocket, id [stun.TransactionIDSize]byte) {
 	c.mu.Lock()
 	delete(s.waiters, id)
@@ -199,7 +204,9 @@ func (c *stunClient) release(s *stunSocket, id [stun.TransactionIDSize]byte) {
 const maxReadErrors = 100
 
 // read reads Binding responses from s.conn and hands each to the waiter with its transaction ID. Anything else
-// (other traffic, unknown IDs, late answers) is dropped.
+// (other traffic, unknown IDs, late answers) is dropped. On exit a still-registered reader clears the read deadline
+// that release set to wake it, so none is left behind for the socket's owner; a new reader can register only after
+// the delete, under the same lock, so it never loses its deadline to this one.
 func (c *stunClient) read(s *stunSocket) {
 	defer close(s.done)
 	buf := make([]byte, 1500)
@@ -209,6 +216,7 @@ func (c *stunClient) read(s *stunSocket) {
 		c.mu.Lock()
 		if s.stopping || errors.Is(err, net.ErrClosed) || errs >= maxReadErrors {
 			if c.socks[s.conn] == s {
+				_ = s.conn.SetReadDeadline(time.Time{})
 				delete(c.socks, s.conn)
 			}
 			c.mu.Unlock()
