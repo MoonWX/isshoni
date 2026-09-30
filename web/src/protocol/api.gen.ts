@@ -143,7 +143,7 @@ export interface DoctorCheck {
   id: string;
   status: DoctorStatus;
   code: string; // message template key, e.g. "udp_buffers.low"
-  params?: { [key: string]: any};
+  params?: { [key: string]: unknown };
   message: string; // English, for the CLI
   fixCode?: string;
   fix?: string; // English, for the CLI
@@ -208,7 +208,7 @@ export interface BandwidthPerViewer {
 export interface Error {
   code: string;
   fields?: { [key: string]: string}; // validation_failed: field JSON name → Field* code
-  params?: { [key: string]: any}; // e.g. {"limit": "rooms"} (Param* keys); never prose
+  params?: { [key: string]: unknown }; // e.g. {"limit": "rooms"} (Param* keys); never prose
   retryAfter?: number /* int */; // seconds; also sent as the Retry-After header
   requestId?: string; // 04's request ID, set on 500 internal (bug reports)
 }
@@ -539,7 +539,7 @@ export interface DoctorSummary {
 export interface Alert {
   code: AlertCode;
   severity: AlertSeverity;
-  params?: { [key: string]: any};
+  params?: { [key: string]: unknown };
 }
 /**
  * ServerStatus is the admin socket's GET /v1/status (04 §12.2, isshoni admin status --json) and doctor's view of a
@@ -1163,7 +1163,7 @@ export interface AuditEntry {
   actor: AuditRef;
   target?: AuditRef; // absent when the action has no target
   ip?: string;
-  detail: { [key: string]: any}; // small, never secrets; {} when empty
+  detail: { [key: string]: unknown }; // small, never secrets; {} when empty
 }
 /**
  * AuditRef is an audit row's actor or target. Actor kinds: user, cli, system, anonymous. Target kinds: user,

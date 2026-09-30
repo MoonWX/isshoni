@@ -171,7 +171,8 @@ export interface Empty {
 /**
  * Error is the payload of an error message (01 §8.13). It is a reply when Re is set on the envelope (scope request),
  * otherwise a notification. It carries codes, never English text; Params holds machine-readable values for i18n
- * interpolation.
+ * interpolation. Its tstype tag types Params as unknown values in TypeScript, not any (tygo splits a tag at its
+ * commas, so the tag spells Record<string, unknown> as an index signature).
  */
 export interface Error {
   code: ErrorCode;
@@ -183,7 +184,7 @@ export interface Error {
   pc?: PCKind;
   gen?: number /* uint32 */;
   neg?: number /* uint32 */;
-  params?: { [key: string]: any}; // machine-readable values for i18n interpolation; never prose
+  params?: { [key: string]: unknown }; // machine-readable values for i18n interpolation; never prose
 }
 /**
  * ErrorScope says what an error affects, and so what an older client does with a code it doesn't know (01 §12.3).
