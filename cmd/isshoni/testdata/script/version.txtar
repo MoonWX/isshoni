@@ -1,0 +1,25 @@
+# This binary has no -ldflags, so it reports the build-info fallback: a dev version.
+# (TestVersionLdflags checks a build with -ldflags -X.)
+exec isshoni version --short
+stdout '^0\.0\.0-dev\S*$'
+! stderr .
+
+exec isshoni version --json
+stdout '^\{"version":"0\.0\.0-dev[^"]*","commit":"[0-9a-f]*","date":"[^"]*","go":"go[^"]+","os":"[a-z0-9]+","arch":"[a-z0-9]+"\}$'
+! stderr .
+
+exec isshoni version
+stdout '^isshoni 0\.0\.0-dev\S* \(.*go.*, [a-z0-9]+/[a-z0-9]+\)$'
+cp stdout version.txt
+
+exec isshoni --version
+cmp stdout version.txt
+
+exitcode 2 isshoni version --short --json
+! stdout .
+stderr '^isshoni version: --short and --json can''t be combined$'
+
+# --version prints the version and nothing else: it must not swallow a command.
+exitcode 2 isshoni --version serve
+! stdout .
+stderr '^isshoni: --version takes no arguments; use ''isshoni version''$'
