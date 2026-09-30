@@ -474,7 +474,7 @@ jobs:
 
       - name: The gate fails on a GPL-3.0 fixture dependency (go-licenses)
         run: |
-          ISSHONI_GO_LICENSES="$PWD/.bin/go-licenses" \
+          GO_LICENSES_BIN="$PWD/.bin/go-licenses" \
             go -C tools test -count=1 -run 'TestGoLicensesGate' -v ./notices
 
   build:

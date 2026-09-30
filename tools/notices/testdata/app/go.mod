@@ -10,6 +10,7 @@ require (
 	example.com/custom v0.1.0
 	example.com/gpl v1.0.0
 	example.com/mit v1.0.0
+	example.com/mixed v1.0.0
 	example.com/mpl v0.2.0
 	example.com/nolicense v0.1.0
 	example.com/winonly v1.1.0
@@ -21,6 +22,7 @@ replace (
 	example.com/custom => ../mods/custom
 	example.com/gpl => ../mods/gpl
 	example.com/mit => ../mods/mit
+	example.com/mixed => ../mods/mixed
 	example.com/mpl => ../mods/mpl
 	example.com/nolicense => ../mods/nolicense
 	example.com/winonly => ../mods/winonly

@@ -324,6 +324,19 @@ describe('licenses.mjs on fixture projects', () => {
     assert.ok(!text.includes(tmp), 'no local paths');
   });
 
+  // npm query prints `***` for every UUID-shaped segment of a package's absolute path and realpath.
+  it('writes licenses.txt when the project sits under a UUID-named directory', async () => {
+    const dir = path.join(tmp, '123e4567-e89b-12d3-a456-426614174000', 'app');
+    await makeProject(dir, base());
+    const out = path.join(tmp, 'uuid-licenses.txt');
+    const r = await cli(['notices', '--dir', dir, '--overrides', noOverrides, '--out', out]);
+    assert.equal(r.code, 0, r.stderr);
+    const text = await readFile(out, 'utf8');
+    assert.ok(text.includes('\ngood 1.0.0\nLicense: MIT\n'));
+    assert.ok(text.includes('\n== LICENSE ==\n\nMIT License\n'));
+    assert.ok(text.includes('\n== NOTICE ==\n\ngood\nCopyright 2026\n'));
+  });
+
   it('fails when node_modules is not installed', async () => {
     const dir = path.join(tmp, 'not-installed');
     await makeProject(dir, { deps: { missing: '1.0.0' }, packages: [] });

@@ -152,6 +152,29 @@ func TestGPLDependencyFailsTheGate(t *testing.T) {
 	}
 }
 
+// TestGPLInASecondaryLicenseFileFailsTheGate: example.com/mixed has an MIT LICENSE, which go-licenses reads, and a
+// GPL-3.0 LICENSE-GPL beside it. Neither the allowlist nor the coverage rule applies to such a file, but a license
+// that may never be shipped does fail the gate there.
+func TestGPLInASecondaryLicenseFileFailsTheGate(t *testing.T) {
+	res, err := generate(t.Context(), fixtureConfig(t, "./cmd/mixedapp"))
+	var gate *gateError
+	if !errors.As(err, &gate) {
+		t.Fatalf("err = %v, want a *gateError", err)
+	}
+	if res.text != nil {
+		t.Error("the gate failed but generate returned a text")
+	}
+	want := "example.com/mixed v1.0.0: LICENSE-GPL names GPL-3.0-or-later, which may not be shipped"
+	if !slices.Contains(gate.problems, want) {
+		t.Errorf("problems = %q, want %q", gate.problems, want)
+	}
+	for _, p := range gate.problems {
+		if strings.Contains(p, "MIT") && !strings.HasPrefix(p, "The shipped allowlist is: ") {
+			t.Errorf("unexpected problem for the MIT LICENSE: %q", p)
+		}
+	}
+}
+
 func TestUnrecognizedAndMissingLicensesFailTheGate(t *testing.T) {
 	_, err := generate(t.Context(), fixtureConfig(t, "./cmd/badapp"))
 	var gate *gateError
@@ -264,8 +287,10 @@ func TestReadLicenseFiles(t *testing.T) {
 		dir  string
 		want []file
 	}{
-		// A primary LICENSE: other LICENSE* files are reproduced, not gated. NOTICE files come last.
-		{filepath.Join(td, "mods", "bsd"), []file{{"LICENSE", true, "BSD-3-Clause"}, {"LICENSE-THIRD-PARTY.md", false, ""}}},
+		// A primary LICENSE: other LICENSE* files are reproduced and scanned, not gated. NOTICE files come last and
+		// are not scanned.
+		{filepath.Join(td, "mods", "bsd"), []file{{"LICENSE", true, "BSD-3-Clause"}, {"LICENSE-THIRD-PARTY.md", false, "MPL-2.0"}}},
+		{filepath.Join(td, "mods", "mixed"), []file{{"LICENSE", true, "MIT"}, {"LICENSE-GPL", false, "GPL-3.0-or-later"}}},
 		{filepath.Join(td, "mods", "apache"), []file{{"LICENSE", true, "Apache-2.0"}, {"NOTICE", false, ""}}},
 		{filepath.Join(td, "mods", "mit"), []file{{"LICENSE.txt", true, "MIT"}}},
 		{filepath.Join(td, "mods", "winonly"), []file{{"COPYING", true, "ISC"}}},
@@ -289,6 +314,9 @@ func TestLicensesOf(t *testing.T) {
 	gated := func(name string, coverage float64, ids ...string) licenseFile {
 		return licenseFile{name: name, gated: true, ids: ids, coverage: coverage}
 	}
+	secondary := func(name string, coverage float64, ids ...string) licenseFile {
+		return licenseFile{name: name, ids: ids, coverage: coverage}
+	}
 	none := func(string) bool { return false }
 	mpl := func(id string) bool { return id == "MPL-2.0" }
 	for _, tc := range []struct {
@@ -311,6 +339,16 @@ func TestLicensesOf(t *testing.T) {
 		{"lgpl", []licenseFile{gated("COPYING.LESSER", 100, "LGPL-3.0")}, func(string) bool { return true }, "LGPL-3.0",
 			[]string{"LGPL-3.0 may not be shipped"}},
 		{"agpl", []licenseFile{gated("LICENSE", 100, "AGPL-3.0")}, none, "AGPL-3.0", []string{"AGPL-3.0 may not be shipped"}},
+		// Other license files: no allowlist, no coverage rule, but never GPL, AGPL, LGPL, SSPL or BUSL. Their
+		// licenses are not the component's.
+		{"secondary mpl and unrecognized", []licenseFile{
+			gated("LICENSE", 100, "BSD-3-Clause"), secondary("LICENSE-3RD-PARTY.md", 74, "MPL-2.0"), secondary("LICENSE-SQLITE", 0),
+		}, none, "BSD-3-Clause", nil},
+		{"secondary gpl", []licenseFile{gated("LICENSE", 100, "MIT"), secondary("LICENSE-GPL", 100, "GPL-3.0-or-later")},
+			func(string) bool { return true }, "MIT", []string{"LICENSE-GPL names GPL-3.0-or-later, which may not be shipped"}},
+		{"secondary lgpl among others", []licenseFile{
+			gated("LICENSE", 100, "MIT"), secondary("COPYING.LESSER", 30, "LGPL-2.1", "MIT"), {name: "NOTICE", notice: true},
+		}, none, "MIT", []string{"COPYING.LESSER names LGPL-2.1, which may not be shipped"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ids, problems := licensesOf(tc.files, tc.exception)
@@ -526,15 +564,15 @@ func TestRun(t *testing.T) {
 
 // TestGoLicensesGate runs the first gate, go-licenses with the flags of `task licenses` (06 §8.3), over the
 // fixtures: the GPL-3.0 dependency fails it and the app passes (MPL-2.0 is "reciprocal", which it allows; notices
-// is the gate for MPL). It needs the pinned go-licenses: ISSHONI_GO_LICENSES, or .bin/go-licenses after
-// `task tools`; the CI licenses job runs it with that variable set.
+// is the gate for MPL). It needs the pinned go-licenses: GO_LICENSES_BIN, or .bin/go-licenses after
+// `task tools`; the CI licenses job runs it with that variable set, which makes the test mandatory (no skip).
 //
 // go-licenses does not identify a license from the short notices the fixtures carry, so the test runs it over a
 // copy of the fixtures with the full GPL-3.0, MPL-2.0 and Apache-2.0 texts, taken from the license assets of
 // github.com/google/licenseclassifier/v2 (go-licenses' own classifier, pinned through tools/go.mod). The repository
 // itself holds no GPL text.
 func TestGoLicensesGate(t *testing.T) {
-	bin := os.Getenv("ISSHONI_GO_LICENSES")
+	bin := os.Getenv("GO_LICENSES_BIN")
 	if bin == "" {
 		exe := ""
 		if runtime.GOOS == "windows" {
@@ -542,8 +580,10 @@ func TestGoLicensesGate(t *testing.T) {
 		}
 		bin = filepath.Join("..", "..", ".bin", "go-licenses"+exe)
 		if _, err := os.Stat(bin); err != nil { //nolint:gosec // G703: the repository's own .bin/
-			t.Skip("go-licenses is not built: run task tools:go-licenses, or set ISSHONI_GO_LICENSES")
+			t.Skip("go-licenses is not built: run task tools:go-licenses, or set GO_LICENSES_BIN")
 		}
+	} else if _, err := os.Stat(bin); err != nil { //nolint:gosec // G703: the binary the developer or CI named
+		t.Fatalf("GO_LICENSES_BIN is set, so the test must run: %v", err)
 	}
 	bin, err := filepath.Abs(bin)
 	if err != nil {
@@ -583,7 +623,7 @@ func TestGoLicensesGate(t *testing.T) {
 	}
 
 	check := func(pkg string) (string, error) {
-		//nolint:gosec // G702: bin is the go-licenses binary the developer or CI named in ISSHONI_GO_LICENSES
+		//nolint:gosec // G702: bin is the go-licenses binary the developer or CI named in GO_LICENSES_BIN
 		cmd := exec.CommandContext(t.Context(), bin, "check", pkg, "--ignore", "example.com/app",
 			"--disallowed_types=forbidden,restricted,unknown")
 		cmd.Dir = filepath.Join(dir, "app")

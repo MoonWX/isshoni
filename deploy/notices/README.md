@@ -16,5 +16,7 @@ gitignored, never committed) from:
 
 The license gate has two halves. `task licenses` runs go-licenses over `./cmd/...` and the npm check of
 `web/scripts/licenses.mjs`; `task notices` then fails for any linked module whose license files licensecheck cannot
-identify, or whose license is neither allowlisted nor excepted here. Tools we only run (golangci-lint, ShellCheck)
-are not dependencies: they live in `tools/go.mod` or come from a package manager, and nothing we ship links them.
+identify, whose license is neither allowlisted nor excepted here, or any of whose other license files
+(`LICENSE-GPL`, `COPYING.LESSER`, ...) names GPL, AGPL, LGPL, SSPL or BUSL. Tools we only run (golangci-lint,
+ShellCheck) are not dependencies: they live in `tools/go.mod` or come from a package manager, and nothing we ship
+links them.

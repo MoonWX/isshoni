@@ -56,10 +56,11 @@ export const ALLOWLIST = Object.freeze([
 export const DENIED = /^(GPL|AGPL|SSPL|BUSL)-/;
 
 /**
- * A node of `npm query` output: the package's package.json fields, plus npm's own.
+ * A node of `npm query` output: the package's package.json fields, plus npm's own. Only `location`, relative to the
+ * project, is used to find a package: npm redacts UUID-shaped path segments to `***` in the absolute `path` and
+ * `realpath`, so they do not exist on disk when the checkout sits under such a directory.
  * @typedef {{ name?: string, version?: string, license?: unknown, licenses?: unknown, location: string,
- *   path?: string, realpath?: string, from?: string[], dependencies?: Record<string, string>,
- *   devDependencies?: Record<string, string> }} QueryNode
+ *   from?: string[], dependencies?: Record<string, string>, devDependencies?: Record<string, string> }} QueryNode
  * @typedef {Record<string, { license: string, reason: string }>} Overrides
  * @typedef {{ id: string, license: string | null, why: string, path: string[] }} Problem
  * @typedef {{ license: string } | { conjunction: 'and' | 'or', left: SpdxNode, right: SpdxNode }} SpdxNode
@@ -312,8 +313,10 @@ const RULE = '-'.repeat(80);
  * Renders licenses.txt for the shipped packages: one entry per name@version, sorted.
  * @param {QueryNode[]} shipped
  * @param {Overrides} overrides
+ * @param {string} projectDir the directory npm query ran in; each package is at its `location` below it (a linked
+ *   package's location is node_modules/<name>, and reading it follows the link)
  */
-export async function renderNotices(shipped, overrides) {
+export async function renderNotices(shipped, overrides, projectDir) {
   /** @type {Map<string, QueryNode>} */
   const unique = new Map();
   for (const node of shipped) {
@@ -328,7 +331,7 @@ export async function renderNotices(shipped, overrides) {
       'license (an SPDX expression), and reproduces the license and notice files that come with it.\n',
   ];
   for (const node of nodes) {
-    const dir = node.realpath ?? node.path ?? '';
+    const dir = path.join(projectDir, node.location);
     const names = (await readdir(dir, { withFileTypes: true }))
       .filter((e) => e.isFile() && LICENSE_FILE.test(e.name) && !CODE_EXT.test(e.name))
       .map((e) => e.name)
@@ -396,7 +399,7 @@ export async function main(argv) {
       return 0;
     }
     await mkdir(path.dirname(out), { recursive: true });
-    await writeFile(out, await renderNotices(shipped, overrides));
+    await writeFile(out, await renderNotices(shipped, overrides, dir));
     const shown = path.relative(ROOT, out);
     console.log(`licenses: wrote ${shown.startsWith('..') ? out : shown} (${String(result.shipped)} packages)`);
     return 0;

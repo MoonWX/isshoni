@@ -51,7 +51,8 @@ var (
 	noticeFileRE = regexp.MustCompile(`(?i)^notice`)
 	// primaryFileRE matches a module's own license files: LICENSE, LICENCE, COPYING or UNLICENSE, optionally with
 	// a text extension. Other license files (LICENSE-3RD-PARTY.md, LICENSE-GO, ...) usually describe bundled or
-	// related material; they are reproduced, and classified only when a module has no primary file.
+	// related material: they are reproduced and scanned, but the allowlist and the coverage rule apply to them only
+	// when a module has no primary file. A GPL, AGPL, LGPL, SSPL or BUSL license in any of them fails the gate.
 	primaryFileRE = regexp.MustCompile(`(?i)^((un)?licen[cs]e|copying)(\.(txt|md|markdown|rst))?$`)
 )
 
@@ -59,14 +60,15 @@ var (
 type licenseFile struct {
 	name     string   // file name, relative to the module root
 	text     string   // normalized text
-	notice   bool     // a NOTICE file
-	gated    bool     // classified, and subject to the gate
-	ids      []string // licenses found in it (gated files only)
-	coverage float64  // percent of the text that matches known licenses (gated files only)
+	notice   bool     // a NOTICE file, reproduced but not scanned
+	gated    bool     // the module's license file, subject to the whole gate
+	ids      []string // licenses found in it (every file but NOTICE files)
+	coverage float64  // percent of the text that matches known licenses (every file but NOTICE files)
 }
 
 // readLicenseFiles reads and classifies the license and notice files in dir, license files first, each group
-// sorted by name.
+// sorted by name. Every file but the NOTICE files is scanned with licensecheck; the gated ones are the primary
+// files, or every license file when there is no primary one.
 func readLicenseFiles(dir string) ([]licenseFile, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -90,10 +92,10 @@ func readLicenseFiles(dir string) ([]licenseFile, error) {
 	}
 	for i := range files {
 		f := &files[i]
-		if f.notice || (hasPrimary && !primaryFileRE.MatchString(f.name)) {
+		if f.notice {
 			continue
 		}
-		f.gated = true
+		f.gated = !hasPrimary || primaryFileRE.MatchString(f.name)
 		cov := licensecheck.Scan([]byte(f.text))
 		f.coverage = cov.Percent
 		for _, m := range cov.Match {
@@ -132,10 +134,23 @@ func normalize(s string) string {
 // licensesOf applies the gate to one component's files. It returns the licenses found in the gated files, sorted,
 // and one problem per failed rule. exceptionFor reports whether the component may ship under a license that is not
 // on the allowlist.
+//
+// The other license files (LICENSE-3RD-PARTY.md, LICENSE-GPL, COPYING.LESSER, ...) get neither the allowlist nor
+// the coverage rule: they often list bundled material under other licenses (modernc.org/sqlite's
+// LICENSE-3RD-PARTY.md names MPL-2.0, at 74% coverage) or are not license texts at all (its LICENSE-SQLITE). But a
+// license that may never be shipped fails the gate there too, whatever the primary file says.
 func licensesOf(files []licenseFile, exceptionFor func(id string) bool) (ids, problems []string) {
 	gated := 0
 	for _, f := range files {
+		if f.notice {
+			continue
+		}
 		if !f.gated {
+			for _, id := range f.ids {
+				if neverExcepted(id) {
+					problems = append(problems, fmt.Sprintf("%s names %s, which may not be shipped", f.name, id))
+				}
+			}
 			continue
 		}
 		gated++
