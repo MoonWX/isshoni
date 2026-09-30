@@ -359,7 +359,8 @@ func (p *Publisher) tracks() []*track {
 
 // Start starts sending: the send loop pulls from the Source once the PeerConnection is connected (so the first frame,
 // a keyframe, isn't lost to the DTLS handshake), one RTCP reader per track handles PLI, FIR, NACK and REMB, and a
-// ticker writes the sender reports. Everything stops when ctx ends or at Close.
+// ticker writes the sender reports. The send loop and the SR ticker stop when ctx ends; the RTCP readers, which
+// block in Pion reads that only closing the PeerConnection ends, stop at Close, which waits for every goroutine.
 func (p *Publisher) Start(ctx context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -391,7 +392,8 @@ func (p *Publisher) Start(ctx context.Context) error {
 }
 
 // Close stops the loops, closes the PeerConnection and waits for every goroutine. The Source stays open, so a new
-// Publisher can take it over (a pub PC rebuild). Close is idempotent.
+// Publisher can take it over (a pub PC rebuild); a fake.Source then resumes at most 200 ms behind real time instead
+// of handing out, in one burst, all the media due while nobody pulled. Close is idempotent.
 func (p *Publisher) Close() error {
 	p.mu.Lock()
 	if p.closed {

@@ -368,6 +368,17 @@ func TestNextStops(t *testing.T) {
 		if _, err := s.Next(ctx); !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("Next = %v, want the deadline", err)
 		}
+		// A canceled ctx wins over a packet that is overdue (frames 1 and 2 after a 2 s stall), and consumes nothing.
+		time.Sleep(2 * time.Second)
+		canceled, cancel2 := context.WithCancel(t.Context())
+		cancel2()
+		if p, err := s.Next(canceled); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Next(canceled) = packet at %d ns, %v; want context.Canceled", p.CaptureNS, err)
+		}
+		if p, err := s.Next(t.Context()); err != nil || p.CaptureNS != int64(time.Second) {
+			t.Fatalf("Next after the canceled one = packet at %d ns, %v; want frame 1", p.CaptureNS, err)
+		}
+		// Frame 1 came 1.1 s late, so the clock skipped 0.9 s: frame 2 is due in 0.8 s and the next Next waits.
 		done := make(chan error)
 		go func() {
 			_, err := s.Next(t.Context())
@@ -384,6 +395,81 @@ func TestNextStops(t *testing.T) {
 			t.Fatalf("Next after Close = %v", err)
 		}
 		_ = s.Close()
+	})
+}
+
+// TestNextBoundsLag: after a 2 s stall the consumer gets at most maxLag of media at once, then real-time pacing
+// again, with every stream's frame indices and capture times continuous across the stall.
+func TestNextBoundsLag(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, err := New(Config{Audio: true, Seed: 5})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		// Per layer ("" is the audio): the next frame index, and frames (packets) per second.
+		next := map[string]uint32{}
+		rate := map[string]int64{"": int64(time.Second / AudioPacketDuration)}
+		for _, l := range DefaultLayers() {
+			rate[l.RID] = int64(l.FPS)
+		}
+		pull := func() Packet {
+			t.Helper()
+			p, err := s.Next(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var m Marker
+			var ok bool
+			if p.Kind == Audio {
+				m, ok = ParseAudioMarker(p.Data)
+			} else {
+				nals := splitAnnexB(t, p.Data)
+				m, ok = ParseVideoMarker(nals[len(nals)-1][1:])
+			}
+			i := next[p.Layer]
+			if !ok || m.Frame != i || p.CaptureNS != int64(i)*int64(time.Second)/rate[p.Layer] {
+				t.Fatalf("%s %q: frame %d (marker %v) at %d ns, want frame %d", p.Kind, p.Layer, m.Frame, ok,
+					p.CaptureNS, i)
+			}
+			next[p.Layer]++
+			return p
+		}
+		var p Packet
+		for p.CaptureNS < int64(500*time.Millisecond) {
+			p = pull()
+		}
+		time.Sleep(2 * time.Second)
+		stallEnd := time.Now()
+		var burst []Packet
+		for {
+			p = pull()
+			if time.Now().After(stallEnd) {
+				break
+			}
+			burst = append(burst, p)
+		}
+		if len(burst) == 0 {
+			t.Fatal("nothing overdue after a 2 s stall")
+		}
+		span := time.Duration(burst[len(burst)-1].CaptureNS - burst[0].CaptureNS)
+		t.Logf("%d packets at once after the stall, %v of media", len(burst), span)
+		if span > maxLag || span < maxLag-AudioPacketDuration {
+			t.Errorf("%v of media at once after a 2 s stall, want %v", span, maxLag)
+		}
+		// Paced again: every later packet comes exactly when due, with the media at capture time start due at
+		// stallEnd.
+		start := burst[0].CaptureNS + int64(maxLag)
+		for {
+			if due := stallEnd.Add(time.Duration(p.CaptureNS - start)); !time.Now().Equal(due) {
+				t.Fatalf("%s %q at %d ns came %v after the stall, due %v after it", p.Kind, p.Layer, p.CaptureNS,
+					time.Since(stallEnd), due.Sub(stallEnd))
+			}
+			if p.CaptureNS >= start+int64(time.Second) {
+				break
+			}
+			p = pull()
+		}
 	})
 }
 

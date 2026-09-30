@@ -99,6 +99,8 @@ const (
 	AudioPacketSize = 160
 	maxLayers       = 4
 	maxFPS          = 240
+	// maxLag is the most media Next hands out at once to a consumer that fell behind; see Next.
+	maxLag = 200 * time.Millisecond
 )
 
 var (
@@ -122,7 +124,7 @@ type Source struct {
 
 	mu      sync.Mutex // guards streams' state, started and origin
 	started bool
-	origin  time.Time
+	origin  time.Time // the first Next, moved forward by every skip (see Next)
 }
 
 // stream is one video layer or the audio.
@@ -232,18 +234,26 @@ func isAlnum(c byte) bool {
 	return '0' <= c && c <= '9' || 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z'
 }
 
-// Next returns the next packet once it is due: at the Source's first Next plus its capture time. A consumer that
-// falls behind gets the overdue packets at once, in order; none is skipped. It returns ctx.Err() when ctx ends
-// first and ErrClosed after Close.
+// Next returns the next packet once it is due: at the Source's first Next plus its capture time, plus any time the
+// clock has skipped. A consumer that falls behind gets the overdue packets at once, in order, but never more than
+// maxLag (200 ms) of media: when the next packet is more than maxLag overdue, the clock skips the excess, so every
+// stream resumes maxLag behind the current time. Like a capture engine, the Source does not pile up media for a
+// consumer that stopped pulling (a pub PC rebuild); unlike one, it drops no frame: indices and capture times stay
+// continuous, and CaptureNS falls behind the time since the first Next by the skipped time. Next returns ctx.Err()
+// when ctx has ended or ends before the packet is due, and ErrClosed after Close.
 func (s *Source) Next(ctx context.Context) (Packet, error) {
 	select {
 	case <-s.closed:
 		return Packet{}, ErrClosed
 	default:
 	}
+	if err := ctx.Err(); err != nil {
+		return Packet{}, err
+	}
 	s.mu.Lock()
+	now := time.Now()
 	if !s.started {
-		s.started, s.origin = true, time.Now()
+		s.started, s.origin = true, now
 	}
 	st := s.streams[0]
 	for _, o := range s.streams[1:] {
@@ -252,6 +262,10 @@ func (s *Source) Next(ctx context.Context) (Packet, error) {
 		}
 	}
 	due := s.origin.Add(time.Duration(st.next))
+	if lag := now.Sub(due); lag > maxLag {
+		s.origin = s.origin.Add(lag - maxLag)
+		due = now.Add(-maxLag)
+	}
 	s.mu.Unlock()
 
 	if d := time.Until(due); d > 0 {
