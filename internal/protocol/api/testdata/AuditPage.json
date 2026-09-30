@@ -1,0 +1,40 @@
+{
+  "entries": [
+    {
+      "id": 4811,
+      "action": "user.role_changed",
+      "outcome": "ok",
+      "actor": {
+        "kind": "user",
+        "id": "k3m9p2qxw7ht",
+        "name": "Alex"
+      },
+      "target": {
+        "kind": "user",
+        "id": "b8f2n4r6t0vz",
+        "name": "Sam"
+      },
+      "ip": "203.0.113.7",
+      "detail": {
+        "from": "user",
+        "to": "admin"
+      },
+      "at": "2026-10-03T19:22:05.114Z"
+    },
+    {
+      "id": 4810,
+      "action": "auth.throttled",
+      "outcome": "denied",
+      "actor": {
+        "kind": "anonymous"
+      },
+      "ip": "198.51.100.23",
+      "detail": {
+        "key": "198.51.100.23",
+        "scope": "ip"
+      },
+      "at": "2026-10-03T19:01:44.020Z"
+    }
+  ],
+  "nextBefore": 4810
+}

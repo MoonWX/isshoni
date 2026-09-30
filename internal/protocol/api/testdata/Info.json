@@ -1,0 +1,27 @@
+{
+  "server": {
+    "name": "Alex's server",
+    "version": "0.1.0",
+    "publicUrl": "https://watch.example.com"
+  },
+  "protocol": {
+    "current": 1,
+    "min": 1
+  },
+  "minClientVersion": "0.1.0",
+  "registration": "invite",
+  "setupRequired": false,
+  "features": [
+    "push",
+    "passwordReset"
+  ],
+  "accountRules": {
+    "usernameMinLength": 2,
+    "usernameMaxLength": 32,
+    "passwordMinLength": 8,
+    "passwordMaxLength": 128
+  },
+  "push": {
+    "vapidPublicKey": "BEXAMPLEvapidPublicKey0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXY"
+  }
+}

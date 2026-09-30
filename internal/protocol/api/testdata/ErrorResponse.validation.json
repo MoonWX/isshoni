@@ -1,0 +1,9 @@
+{
+  "error": {
+    "code": "validation_failed",
+    "fields": {
+      "password": "too_common",
+      "username": "invalid"
+    }
+  }
+}

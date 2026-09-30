@@ -1,0 +1,18 @@
+{
+  "input": {
+    "people": 5,
+    "sharing": 2,
+    "thumbnails": 8,
+    "quality": "1080p60",
+    "preset": "auto",
+    "hours": 2
+  },
+  "perViewerMbps": {
+    "sharer": 8.13,
+    "viewer": 8.43
+  },
+  "egressMediaMbps": 41.54,
+  "egressWireMbps": 43.61,
+  "ingressMediaMbps": 16.86,
+  "transferPerSessionGb": 39.2
+}

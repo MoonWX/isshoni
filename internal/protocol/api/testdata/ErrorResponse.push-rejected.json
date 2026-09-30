@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": "push_endpoint_rejected",
+    "params": {
+      "reason": "private_address"
+    }
+  }
+}
