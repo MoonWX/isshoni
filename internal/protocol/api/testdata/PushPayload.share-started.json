@@ -1,0 +1,16 @@
+{
+  "v": 1,
+  "type": "share.started",
+  "ts": 1790712000000,
+  "tag": "share:lounge:k3m9p2qxw7ht",
+  "url": "/r/lounge?focus=s_q7m2x9c4v8b1n5k3",
+  "room": {
+    "id": "lounge",
+    "name": "Lounge"
+  },
+  "user": {
+    "id": "k3m9p2qxw7ht",
+    "name": "Alex"
+  },
+  "shareId": "s_q7m2x9c4v8b1n5k3"
+}

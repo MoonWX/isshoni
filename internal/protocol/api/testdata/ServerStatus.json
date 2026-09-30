@@ -1,0 +1,80 @@
+{
+  "version": "0.3.0",
+  "startedAt": "2026-09-29T18:00:00Z",
+  "uptimeS": 8045,
+  "origin": "https://203.0.113.7",
+  "tls": {
+    "mode": "ip",
+    "names": [
+      "203.0.113.7"
+    ],
+    "ready": true,
+    "issuer": "Let's Encrypt",
+    "notBefore": "2026-09-28T18:00:00Z",
+    "notAfter": "2026-10-05T10:00:00Z",
+    "nextRenewal": "2026-10-02T12:00:00Z",
+    "lastErrorCode": "tls.acme_unreachable",
+    "lastErrorAt": "2026-09-28T17:58:30Z"
+  },
+  "publicIpv4": "203.0.113.7",
+  "publicIpv6": "",
+  "nat": "none",
+  "advertised": [
+    {
+      "proto": "udp",
+      "addr": "203.0.113.7:7882",
+      "via": "udp"
+    },
+    {
+      "proto": "tcp",
+      "addr": "203.0.113.7:443",
+      "via": "tcp443"
+    }
+  ],
+  "listeners": [
+    {
+      "key": "listen.https",
+      "network": "tcp",
+      "addr": "[::]:443"
+    },
+    {
+      "key": "listen.http",
+      "network": "tcp",
+      "addr": "[::]:80"
+    },
+    {
+      "key": "listen.ice_udp",
+      "network": "udp",
+      "addr": "203.0.113.7:7882"
+    },
+    {
+      "key": "listen.ice_tcp",
+      "network": "tcp",
+      "addr": "[::]:7882"
+    },
+    {
+      "key": "listen.admin_socket",
+      "network": "unix",
+      "addr": "/run/isshoni/admin.sock"
+    }
+  ],
+  "rooms": 1,
+  "participants": 3,
+  "shares": 1,
+  "schemaVersion": 1,
+  "transfer": {
+    "month": "2026-09",
+    "egressBytes": 412000000000,
+    "ingressBytes": 98000000000,
+    "alertGb": 1000,
+    "projectedEgressBytes": 428000000000,
+    "egressBps": 41500000,
+    "ingressBps": 17000000
+  },
+  "update": {
+    "latest": "0.3.1",
+    "url": "https://github.com/MoonWX/isshoni/releases/tag/v0.3.1",
+    "security": true,
+    "checkedAt": "2026-09-29T09:12:00Z"
+  }
+}

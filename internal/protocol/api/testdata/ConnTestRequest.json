@@ -1,0 +1,4 @@
+{
+  "transport": "udp",
+  "offer": "v=0\r\no=- 4611731400430051336 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+}

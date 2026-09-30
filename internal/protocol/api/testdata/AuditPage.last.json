@@ -1,0 +1,16 @@
+{
+  "entries": [
+    {
+      "id": 1,
+      "at": "2026-10-01T11:58:00Z",
+      "action": "setup.token_issued",
+      "outcome": "ok",
+      "actor": {
+        "kind": "cli",
+        "name": "cli"
+      },
+      "detail": {}
+    }
+  ],
+  "nextBefore": null
+}

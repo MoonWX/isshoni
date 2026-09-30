@@ -1,0 +1,15 @@
+{
+  "answer": "v=0\r\no=- 1 1 IN IP4 203.0.113.7\r\ns=-\r\nt=0 0\r\nm=application 7882 UDP/DTLS/SCTP webrtc-datachannel\r\n",
+  "expiresInS": 20,
+  "server": {
+    "publicIp": "203.0.113.7",
+    "provider": "hetzner",
+    "container": "none",
+    "udpPort": 7882,
+    "tcpPorts": [
+      443,
+      7882
+    ],
+    "nat": "none"
+  }
+}

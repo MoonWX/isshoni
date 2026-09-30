@@ -1,0 +1,64 @@
+{
+  "schema": 1,
+  "version": "0.3.0",
+  "ranAt": "2026-09-29T20:15:00Z",
+  "mode": "server",
+  "summary": {
+    "ok": 12,
+    "warn": 1,
+    "fail": 0,
+    "skip": 0,
+    "info": 4
+  },
+  "env": {
+    "os": "linux",
+    "arch": "amd64",
+    "kernel": "6.8.0-45-generic",
+    "container": "none",
+    "systemd": true,
+    "provider": "hetzner",
+    "user": "isshoni"
+  },
+  "checks": [
+    {
+      "id": "udp_buffers",
+      "status": "warn",
+      "code": "udp_buffers.low",
+      "params": {
+        "rmemMax": 212992,
+        "want": 8388608
+      },
+      "message": "net.core.rmem_max is 212992, isshoni wants 8388608",
+      "fixCode": "udp_buffers.fix_sysctl",
+      "fix": "printf 'net.core.rmem_max=8388608\\nnet.core.wmem_max=8388608\\n' | sudo tee /etc/sysctl.d/60-isshoni.conf && sudo sysctl --system",
+      "localOnly": false,
+      "durationMs": 1
+    },
+    {
+      "id": "ports",
+      "status": "info",
+      "code": "ports.listening",
+      "message": "listening on 443/tcp, 80/tcp, 7882/udp, 7882/tcp (local check only)",
+      "localOnly": true,
+      "durationMs": 0
+    }
+  ],
+  "bandwidth": {
+    "input": {
+      "people": 5,
+      "sharing": 2,
+      "thumbnails": 8,
+      "quality": "1080p60",
+      "preset": "auto",
+      "hours": 2
+    },
+    "perViewerMbps": {
+      "sharer": 8.13,
+      "viewer": 8.43
+    },
+    "egressMediaMbps": 41.54,
+    "egressWireMbps": 43.61,
+    "ingressMediaMbps": 16.86,
+    "transferPerSessionGb": 39.2
+  }
+}

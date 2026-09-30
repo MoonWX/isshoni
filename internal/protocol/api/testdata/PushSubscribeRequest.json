@@ -1,0 +1,7 @@
+{
+  "endpoint": "https://fcm.googleapis.com/fcm/send/dx1EXAMPLE",
+  "keys": {
+    "p256dh": "BNcRdEXAMPLEp256dhKey0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXY",
+    "auth": "tBHItJI5svbpez7KI4CCXg"
+  }
+}

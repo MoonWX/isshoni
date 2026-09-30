@@ -1,0 +1,41 @@
+{
+  "users": {
+    "active": 6,
+    "pending": 1,
+    "disabled": 0,
+    "admins": 1
+  },
+  "invites": {
+    "active": 2
+  },
+  "sessions": {
+    "active": 9
+  },
+  "devices": {
+    "linked": 0
+  },
+  "registrationMode": "invite",
+  "securityEvents": [
+    {
+      "id": 4811,
+      "at": "2026-10-03T19:22:05.114Z",
+      "action": "user.role_changed",
+      "outcome": "ok",
+      "actor": {
+        "kind": "user",
+        "id": "k3m9p2qxw7ht",
+        "name": "Alex"
+      },
+      "target": {
+        "kind": "user",
+        "id": "b8f2n4r6t0vz",
+        "name": "Sam"
+      },
+      "ip": "203.0.113.7",
+      "detail": {
+        "from": "user",
+        "to": "admin"
+      }
+    }
+  ]
+}

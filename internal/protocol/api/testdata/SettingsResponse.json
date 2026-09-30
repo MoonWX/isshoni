@@ -1,0 +1,33 @@
+{
+  "settings": {
+    "serverName": "Alex's server",
+    "registrationMode": "approval",
+    "inviteDefaultTtlHours": 168,
+    "inviteDefaultMaxUses": 10,
+    "membersCanInvite": false,
+    "maxParticipantsPerRoom": 0,
+    "maxSharesPerRoom": 4,
+    "maxShareBitrateKbps": 0,
+    "transferAlertGb": 0,
+    "updateCheck": true,
+    "minClientVersion": "",
+    "setupWizardDone": true
+  },
+  "defaults": {
+    "serverName": "",
+    "registrationMode": "invite",
+    "inviteDefaultTtlHours": 168,
+    "inviteDefaultMaxUses": 10,
+    "membersCanInvite": false,
+    "maxParticipantsPerRoom": 0,
+    "maxSharesPerRoom": 0,
+    "maxShareBitrateKbps": 0,
+    "transferAlertGb": 0,
+    "updateCheck": true,
+    "minClientVersion": "",
+    "setupWizardDone": false
+  },
+  "locked": [
+    "updateCheck"
+  ]
+}

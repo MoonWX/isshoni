@@ -1,0 +1,14 @@
+{
+  "devices": [
+    {
+      "id": "d2f4h6k8m0p2",
+      "name": "Alex-PC",
+      "clientKind": "desktop",
+      "os": "windows",
+      "appVersion": "0.2.0",
+      "createdAt": "2026-11-01T10:00:00Z",
+      "lastSeenAt": "2026-11-02T21:45:10.3Z",
+      "lastIp": "203.0.113.7"
+    }
+  ]
+}

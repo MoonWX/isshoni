@@ -1,0 +1,17 @@
+{
+  "invite": {
+    "id": "h6j8k0m2n4p6",
+    "note": "for Sam",
+    "createdBy": {
+      "id": "k3m9p2qxw7ht",
+      "username": "Alex"
+    },
+    "createdAt": "2026-10-01T12:00:00Z",
+    "expiresAt": "2026-10-08T12:00:00Z",
+    "maxUses": 10,
+    "uses": 0,
+    "state": "active",
+    "redeemedBy": []
+  },
+  "url": "https://watch.example.com/invite#EXAMPLEinviteTOKEN0123456789abcd"
+}
