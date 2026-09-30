@@ -1,6 +1,6 @@
 // ESLint flat config (05 §2). TypeScript files get typescript-eslint's strict type-checked rules (through the
-// project service and the tsconfig.*.json projects), React hooks and jsx-a11y (strict). JavaScript files (this file,
-// scripts/, public/boot-check.js) use ESLint's own parser.
+// project service and the tsconfig.*.json projects); every TS file under src/ gets React hooks, TSX files jsx-a11y
+// (strict). JavaScript files (this file, scripts/, public/boot-check.js) use ESLint's own parser.
 import js from '@eslint/js';
 import { defineConfig, globalIgnores } from 'eslint/config';
 import i18next from 'eslint-plugin-i18next';
@@ -22,9 +22,14 @@ export default defineConfig(
       parserOptions: { projectService: true, tsconfigRootDir: import.meta.dirname },
     },
   },
+  // Hooks rules on every app source file: custom hooks live in .ts files too (auth/useMe.ts, viewer/useVisibility.ts).
+  {
+    files: ['src/**/*.{ts,tsx}'],
+    extends: [reactHooks.configs.flat.recommended],
+  },
   {
     files: ['**/*.tsx'],
-    extends: [reactHooks.configs.flat.recommended, jsxA11y.flatConfigs.strict],
+    extends: [jsxA11y.flatConfigs.strict],
   },
 
   {
@@ -46,12 +51,24 @@ export default defineConfig(
       'no-restricted-globals': ['error', 'localStorage', 'sessionStorage'],
     },
   },
+  // No UI strings: tests and the shared test support (src/test/, src/**/testing/: the Vitest setup file, fakes, MSW
+  // handlers), tooling and the service worker.
   {
-    files: ['**/*.test.*', 'e2e/**', 'scripts/**', 'build/**', 'src/sw/**', 'public/boot-check.js'],
+    files: [
+      '**/*.test.*',
+      'src/test/**',
+      'src/**/testing/**',
+      'e2e/**',
+      'scripts/**',
+      'build/**',
+      'src/sw/**',
+      'public/boot-check.js',
+    ],
     rules: { 'i18next/no-literal-string': 'off' },
   },
+  // Web Storage directly: the platform wrapper itself, tests and the shared test support.
   {
-    files: ['src/platform/browser/storage.ts', '**/*.test.*', 'e2e/**'],
+    files: ['src/platform/browser/storage.ts', '**/*.test.*', 'src/test/**', 'src/**/testing/**', 'e2e/**'],
     rules: { 'no-restricted-globals': 'off' },
   },
 

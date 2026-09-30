@@ -1,7 +1,7 @@
 // @vitest-environment node
 // scripts/check-i18n.mjs, rule 1 (05 §16.5): a t('…') literal key missing from en.json fails the check.
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -34,10 +34,36 @@ describe('scanSource', () => {
     expect(prefixes).toEqual([]);
   });
 
-  it('reports keyPrefix', () => {
-    const { prefixes } = scanSource('a.ts', "const { t } = useTranslation(undefined, { keyPrefix: 'room' });");
+  it.each([
+    ["const { t } = useTranslation(undefined, { keyPrefix: 'room' });", 1, 43],
+    ["const { t } = useTranslation('ns', { keyPrefix } as const);", 1, 38],
+    ["export default withTranslation('ns', { keyPrefix: 'room' })(Page);", 1, 40],
+    ["t('title', { count: 1, keyPrefix: 'room' });", 1, 24],
+    ["i18n.t('title', ({ keyPrefix: 'room' }));", 1, 20],
+    ["const t = i18n.getFixedT(null, 'ns', 'room');", 1, 38],
+    ["const t = i18next.getFixedT('en', undefined, prefix);", 1, 46],
+    ["i18next.use(initReactI18next).init({ lng: 'en', react: { keyPrefix: 'room' } });", 1, 58],
+    ["const i = i18next.createInstance({ react: { useSuspense: false, keyPrefix: 'room' } });", 1, 65],
+    ["const a = <Translation keyPrefix='room'>{(t) => t('title')}</Translation>;", 1, 24],
+    ["const a = <Trans i18nKey='room.title' tOptions={{ keyPrefix: 'x' }} />;", 1, 51],
+  ])('reports the keyPrefix in %s', (src, line, column) => {
+    const { prefixes } = scanSource('a.tsx', src);
     expect(prefixes).toHaveLength(1);
+    expect(prefixes[0]).toMatchObject({ file: 'a.tsx', line, column });
     expect(prefixes[0]?.message).toMatch(/keyPrefix/);
+  });
+
+  it.each([
+    "const storage = createStorage({ keyPrefix: 'isshoni.' });",
+    "const keyPrefix = 'isshoni.'; const opts = { keyPrefix };",
+    "cache.init({ keyPrefix: 'isshoni.' });",
+    "i18next.init({ keyPrefix: 'room' });", // not an init option: only `react.keyPrefix` is read
+    "const r = { react: { keyPrefix: 'room' } };",
+    "const t = i18n.getFixedT(null, 'ns'); const u = i18n.getFixedT('en', 'ns', undefined);",
+    "const a = <Store keyPrefix='isshoni.' />;",
+    "const a = <Trans i18nKey='room.title' values={{ keyPrefix: 'x' }} />;",
+  ])('ignores a keyPrefix that i18next does not read: %s', (src) => {
+    expect(scanSource('a.tsx', src).prefixes).toEqual([]);
   });
 });
 
@@ -113,6 +139,25 @@ describe('check-i18n.mjs', () => {
     const err = (await failed.catch((e: unknown) => e)) as { stderr: string };
     expect(err.stderr).toMatch(/Other\.ts:2:26: message key "room\.title" missing in /);
     expect(err.stderr).toMatch(/check:i18n: 1 problem\(s\)/);
+  });
+
+  it('fails through a symlinked path to the script (import.meta.main, not argv[1])', async (ctx) => {
+    // Node resolves the main module's symlinks but not process.argv[1]; comparing the two used to skip main() and
+    // exit 0 without checking anything.
+    await writeFile(path.join(srcDir, 'app', 'Other.ts'), "export const x = () => t('room.title');\n");
+    const link = path.join(dir, 'link', 'check-i18n.mjs');
+    await mkdir(path.dirname(link));
+    try {
+      await symlink(SCRIPT, link, 'file');
+    } catch (err) {
+      // Windows without Developer Mode can't create symlinks.
+      if ((err as NodeJS.ErrnoException).code === 'EPERM') ctx.skip();
+      throw err;
+    }
+    const failed = run(process.execPath, [link, '--src', srcDir, '--catalog', catalogPath]);
+    await expect(failed).rejects.toMatchObject({ code: 1 });
+    const err = (await failed.catch((e: unknown) => e)) as { stderr: string };
+    expect(err.stderr).toMatch(/Other\.ts:1:26: message key "room\.title" missing in /);
   });
 
   it('exits 2 on an unknown option', async () => {

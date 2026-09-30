@@ -84,6 +84,8 @@ async function main() {
   console.log('check:size: ok');
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// import.meta.main, not a comparison with process.argv[1]: that path isn't resolved through symlinks, junctions or
+// subst drives, and a check that silently skips main() would pass without checking anything.
+if (import.meta.main) {
   await main();
 }

@@ -1,8 +1,11 @@
 // @vitest-environment node
 // The build plugins (05 §17.1, §17.3) and scripts/check-size.mjs, on a small fixture app built with the real Vite.
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import zlib from 'node:zlib';
 
 import { build } from 'vite';
@@ -14,6 +17,9 @@ import { COMPRESS_MIN_BYTES, compressPlugin, shouldCompress } from './compress-p
 import { type BuildReport, reportPlugin } from './report-plugin.ts';
 import { resolveShell } from './shell.ts';
 import { DEFAULT_VERSION, PROTOCOL_VERSION, resolveBuildVersion, versionPlugin } from './version-plugin.ts';
+
+const CHECK_SIZE = fileURLToPath(new URL('../scripts/check-size.mjs', import.meta.url));
+const run = promisify(execFile);
 
 const exists = (p: string) =>
   access(p).then(
@@ -102,6 +108,28 @@ describe('checkSize', () => {
 
   it('rejects an unknown report format', () => {
     expect(checkSize({ ...report(1, [], 1), format: 2 }).errors[0]).toMatch(/format 2/);
+  });
+
+  it('fails over budget when run through a symlinked path to the script (import.meta.main, not argv[1])', async (ctx) => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'isshoni-check-size-'));
+    try {
+      const reportPath = path.join(dir, 'build-report.json');
+      await writeFile(reportPath, JSON.stringify(report(BUDGETS.initialJs + 1, [], 1)));
+      const link = path.join(dir, 'check-size.mjs');
+      try {
+        await symlink(CHECK_SIZE, link, 'file');
+      } catch (err) {
+        // Windows without Developer Mode can't create symlinks.
+        if ((err as NodeJS.ErrnoException).code === 'EPERM') ctx.skip();
+        throw err;
+      }
+      const failed = run(process.execPath, [link, '--report', reportPath]);
+      await expect(failed).rejects.toMatchObject({ code: 1 });
+      const err = (await failed.catch((e: unknown) => e)) as { stderr: string };
+      expect(err.stderr).toMatch(/check:size: initial JS is 200\.0 KB, over the 200\.0 KB budget/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 
