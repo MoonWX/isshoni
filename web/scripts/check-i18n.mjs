@@ -5,14 +5,20 @@
 // 1. (S09) Every literal key in a t('…') call, and in an i18nKey="…" attribute, is a string in en.json: at its path,
 //    or as a plural form (key_one/key_other …, key_ordinal_…). Keys are written in full: a `keyPrefix` that i18next
 //    or react-i18next reads would hide them from this check, so it is an error too (see keyPrefixSite).
-// 2. (S27) Every ErrorCode (types.gen.ts) and api Code… constant (api.gen.ts) has an errors.<code> entry.
+// 2. (S27) Every ErrorCode (types.gen.ts, 01) and every api Code… constant (api.gen.ts, 03 and 04) has an
+//    errors.<code> entry: a string, plural forms, or an object with messages below it (errors.rate_limited.wait).
+//    Some codes need one sub-key per value of a constant list: errors.limit_reached.<LimitKind> (SUB_KEYED). The
+//    constants are read from the generated union types (`export type ErrorCode = typeof A | typeof B …`), so a code
+//    added in Go and regenerated with `task gen` fails the check until en.json has its text. A src tree without
+//    protocol/types.gen.ts and protocol/api.gen.ts (test fixtures) skips the rule with a note; one without the other
+//    is a problem.
 // 3. (S37) Every CloudProvider has fix.firewall.<provider>, every NATKind has conntest.nat.<nat>.
 // 4. (S93) Unused keys are warnings.
 //
 // Usage: node scripts/check-i18n.mjs [--src <dir>] [--catalog <en.json>]
 // Paths default to this package's src/ and src/i18n/en.json, so it runs the same from the repo root and from web/.
 // Exit 0 when clean, 1 with one line per problem, 2 on bad usage.
-import { readdir, readFile } from 'node:fs/promises';
+import { access, readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -240,9 +246,177 @@ async function sourceFiles(dir) {
 }
 
 /**
+ * @typedef {{ name: string, value: string, file: string, line: number, column: number }} Constant
+ *   A string constant of a generated union type, at its declaration.
+ */
+
+/**
+ * The string constants of a union type in a generated file: for `export type T = typeof A | typeof B;` the values of
+ * `export const A = "a";` and `export const B = "b";` (with or without a type annotation), in union order. Returns
+ * undefined when the file declares no type alias of that name; union members that aren't `typeof <string const>`
+ * become problems.
+ * @param {string} file shown in problems
+ * @param {string} text the generated source
+ * @param {string} typeName
+ * @returns {{ constants: Constant[], problems: Problem[] } | undefined}
+ */
+export function unionConstants(file, text, typeName) {
+  const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  /** @param {ts.Node} node */
+  const at = (node) => {
+    const { line, character } = sf.getLineAndCharacterOfPosition(node.getStart(sf));
+    return { file, line: line + 1, column: character + 1 };
+  };
+  /** @type {Map<string, Constant>} */
+  const consts = new Map();
+  /** @type {ts.TypeAliasDeclaration | undefined} */
+  let alias;
+  for (const stmt of sf.statements) {
+    if (ts.isVariableStatement(stmt)) {
+      for (const decl of stmt.declarationList.declarations) {
+        if (ts.isIdentifier(decl.name) && decl.initializer && ts.isStringLiteralLike(decl.initializer)) {
+          consts.set(decl.name.text, { name: decl.name.text, value: decl.initializer.text, ...at(decl.name) });
+        }
+      }
+    } else if (ts.isTypeAliasDeclaration(stmt) && stmt.name.text === typeName) {
+      alias = stmt;
+    }
+  }
+  if (!alias) return undefined;
+  const members = ts.isUnionTypeNode(alias.type) ? alias.type.types : [alias.type];
+  /** @type {Constant[]} */
+  const constants = [];
+  /** @type {Problem[]} */
+  const problems = [];
+  for (const m of members) {
+    const name = ts.isTypeQueryNode(m) && ts.isIdentifier(m.exprName) ? m.exprName.text : undefined;
+    const c = name === undefined ? undefined : consts.get(name);
+    if (c) {
+      constants.push(c);
+    } else {
+      problems.push({ ...at(m), message: `${typeName} member is not \`typeof\` a string constant in this file` });
+    }
+  }
+  return { constants, problems };
+}
+
+/**
+ * Error codes whose errors.<code> entry needs one sub-key per constant of a union in api.gen.ts (05 §16.5):
+ * limit_reached shows errors.limit_reached.<params.limit>.
+ * @type {Readonly<Record<string, string>>}
+ */
+export const SUB_KEYED = Object.freeze({ limit_reached: 'LimitKind' });
+
+/**
+ * Whether a catalog node holds at least one message (a string leaf).
+ * @param {string | Catalog | undefined} node
+ * @returns {boolean}
+ */
+function hasMessages(node) {
+  if (typeof node === 'string') return true;
+  if (node === undefined) return false;
+  return Object.values(node).some(hasMessages);
+}
+
+/**
+ * Why errors.<code> can't show a code, or null when it can: a string, plural forms, or an object with messages.
+ * With subKeys, the entry must be an object with a string at every errors.<code>.<subKey>.
+ * @param {Catalog} catalog
+ * @param {string} code
+ * @param {string[]} [subKeys]
+ * @returns {string | null}
+ */
+export function errorEntryProblem(catalog, code, subKeys) {
+  const key = `errors.${code}`;
+  if (subKeys) {
+    const missing = subKeys.filter((s) => typeof lookup(catalog, `${key}.${s}`) !== 'string');
+    return missing.length === 0 ? null : `needs ${missing.map((s) => `${key}.${s}`).join(', ')}`;
+  }
+  if (keyProblem(catalog, key) === null) return null;
+  return hasMessages(lookup(catalog, key)) ? null : `has no ${key}`;
+}
+
+/**
+ * @param {string} p
+ * @returns {Promise<boolean>}
+ */
+async function exists(p) {
+  try {
+    await access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Rule 2: every ErrorCode (protocol/types.gen.ts) and api Code (protocol/api.gen.ts) has an errors.<code> entry.
+ * @param {{ srcDir: string, catalog: Catalog, catalogName: string }} opts
+ * @returns {Promise<{ problems: Problem[], codes: number | null }>} codes: the distinct codes checked, or null when
+ *   the src tree has neither generated file (the rule is skipped)
+ */
+export async function checkErrorCodes({ srcDir, catalog, catalogName }) {
+  const typesPath = path.join(srcDir, 'protocol', 'types.gen.ts');
+  const apiPath = path.join(srcDir, 'protocol', 'api.gen.ts');
+  const [hasTypes, hasApi] = await Promise.all([exists(typesPath), exists(apiPath)]);
+  if (!hasTypes && !hasApi) return { problems: [], codes: null };
+  /** @type {Problem[]} */
+  const problems = [];
+  /** @param {string} p */
+  const shown = (p) => path.relative(process.cwd(), p) || p;
+  /**
+   * @param {string} p
+   * @param {boolean} present
+   * @param {string[]} typeNames
+   * @returns {Promise<Map<string, Constant[]>>}
+   */
+  const read = async (p, present, typeNames) => {
+    /** @type {Map<string, Constant[]>} */
+    const out = new Map();
+    if (!present) {
+      problems.push({ file: shown(p), line: 1, column: 1, message: 'generated file missing: run `task gen`' });
+      return out;
+    }
+    const text = await readFile(p, 'utf8');
+    for (const typeName of typeNames) {
+      const res = unionConstants(shown(p), text, typeName);
+      if (!res) {
+        problems.push({ file: shown(p), line: 1, column: 1, message: `no \`export type ${typeName}\` union found` });
+        continue;
+      }
+      problems.push(...res.problems);
+      out.set(typeName, res.constants);
+    }
+    return out;
+  };
+  const wire = await read(typesPath, hasTypes, ['ErrorCode']);
+  const rest = await read(apiPath, hasApi, ['Code', ...new Set(Object.values(SUB_KEYED))]);
+
+  /** @type {Set<string>} */
+  const seen = new Set();
+  for (const c of [...(wire.get('ErrorCode') ?? []), ...(rest.get('Code') ?? [])]) {
+    if (seen.has(c.value)) continue; // a code shared by 01 and 03 (bad_request, internal, …) needs one entry
+    seen.add(c.value);
+    const subType = Object.hasOwn(SUB_KEYED, c.value) ? SUB_KEYED[c.value] : undefined;
+    const subKeys = subType === undefined ? undefined : (rest.get(subType) ?? []).map((s) => s.value);
+    const why = errorEntryProblem(catalog, c.value, subKeys);
+    if (why) {
+      problems.push({
+        file: c.file,
+        line: c.line,
+        column: c.column,
+        message: `error code "${c.value}" (${c.name}) ${why} in ${catalogName}`,
+      });
+    }
+  }
+  return { problems, codes: seen.size };
+}
+
+/**
  * Runs every rule.
  * @param {{ srcDir: string, catalogPath: string }} opts
- * @returns {Promise<{ problems: Problem[], keysUsed: number, files: number }>}
+ * @returns {Promise<{ problems: Problem[], keysUsed: number, files: number, errorCodes: number | null }>}
+ *   errorCodes: the distinct error codes rule 2 checked, or null when it was skipped
  */
 export async function checkI18n({ srcDir, catalogPath }) {
   /** @type {Catalog} */
@@ -269,7 +443,9 @@ export async function checkI18n({ srcDir, catalogPath }) {
       }
     }
   }
-  return { problems, keysUsed, files: files.length };
+  const errorCodes = await checkErrorCodes({ srcDir, catalog, catalogName });
+  problems.push(...errorCodes.problems);
+  return { problems, keysUsed, files: files.length, errorCodes: errorCodes.codes };
 }
 
 async function main() {
@@ -284,13 +460,18 @@ async function main() {
   }
   const srcDir = path.resolve(values.src ?? path.join(WEB_ROOT, 'src'));
   const catalogPath = path.resolve(values.catalog ?? path.join(WEB_ROOT, 'src', 'i18n', 'en.json'));
-  const { problems, keysUsed, files } = await checkI18n({ srcDir, catalogPath });
+  const { problems, keysUsed, files, errorCodes } = await checkI18n({ srcDir, catalogPath });
   for (const p of problems) console.error(`${p.file}:${p.line}:${p.column}: ${p.message}`);
   if (problems.length > 0) {
     console.error(`check:i18n: ${problems.length} problem(s)`);
     process.exit(1);
   }
-  console.log(`check:i18n: ok (${keysUsed} message keys in ${files} files)`);
+  if (errorCodes === null) {
+    console.log('check:i18n: note: no protocol/*.gen.ts under the src dir, error-code rule skipped');
+    console.log(`check:i18n: ok (${keysUsed} message keys in ${files} files)`);
+  } else {
+    console.log(`check:i18n: ok (${keysUsed} message keys in ${files} files), ${errorCodes} error codes`);
+  }
 }
 
 // import.meta.main, not a comparison with process.argv[1]: that path isn't resolved through symlinks, junctions or

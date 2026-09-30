@@ -1,0 +1,151 @@
+.screen {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  padding: calc(var(--space-6) + var(--safe-top)) calc(var(--space-4) + var(--safe-right))
+    calc(var(--space-6) + var(--safe-bottom)) calc(var(--space-4) + var(--safe-left));
+}
+
+.brand {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  align-self: stretch;
+  max-width: var(--content-max);
+  margin-inline: auto;
+  width: 100%;
+  font-weight: var(--weight-bold);
+  letter-spacing: -0.01em;
+  color: var(--color-text-muted);
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  align-items: flex-start;
+  width: 100%;
+  max-width: 32rem;
+  margin: auto;
+  padding-block: var(--space-7);
+}
+
+.icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 3.5rem;
+  height: 3.5rem;
+  margin-bottom: var(--space-2);
+  border-radius: var(--radius-lg);
+}
+
+.icon svg {
+  width: 1.75rem;
+  height: 1.75rem;
+  stroke-width: 1.75;
+}
+
+.neutral {
+  color: var(--color-accent);
+  background-color: var(--color-surface-2); /* iOS 15: no color-mix */
+  background-color: color-mix(in srgb, var(--color-accent) 14%, transparent);
+}
+
+.warning {
+  color: var(--color-warning);
+  background-color: var(--color-surface-2); /* iOS 15: no color-mix */
+  background-color: color-mix(in srgb, var(--color-warning) 16%, transparent);
+}
+
+.danger {
+  color: var(--color-danger);
+  background-color: var(--color-surface-2); /* iOS 15: no color-mix */
+  background-color: color-mix(in srgb, var(--color-danger) 14%, transparent);
+}
+
+.title {
+  font-size: var(--text-2xl);
+  font-weight: var(--weight-bold);
+  letter-spacing: -0.02em;
+  text-wrap: balance;
+}
+
+.title:focus {
+  outline: none;
+}
+
+.body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  width: 100%;
+  color: var(--color-text-muted);
+  text-wrap: pretty;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  margin-top: var(--space-2);
+}
+
+.footnote {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-text-muted);
+}
+
+.command {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  width: 100%;
+  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-4);
+  color: var(--color-text);
+  background-color: var(--color-surface-2);
+  border-radius: var(--radius-md);
+}
+
+.command pre {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  /* Wrap long commands on phones instead of scrolling them; Copy still gives one line. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.copy {
+  display: inline-flex;
+  flex: none;
+  gap: var(--space-1);
+  align-items: center;
+  min-height: 2.25rem;
+  padding: 0 var(--space-3);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--color-text);
+  background-color: var(--color-surface);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.copy:hover {
+  border-color: var(--color-border-strong);
+}
+
+.copy svg {
+  width: 1rem;
+  height: 1rem;
+}
+
+@media (min-width: 40rem) {
+  .card {
+    padding-block: var(--space-8);
+  }
+}

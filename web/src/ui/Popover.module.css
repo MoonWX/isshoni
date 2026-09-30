@@ -1,0 +1,32 @@
+.root {
+  position: relative;
+  display: inline-flex;
+}
+
+.panel {
+  position: absolute;
+  top: calc(100% + var(--space-2));
+  z-index: var(--z-popover);
+  min-width: 14rem;
+  max-width: min(22rem, calc(100vw - 2 * var(--space-4)));
+  max-height: 60vh;
+  padding: var(--space-3);
+  overflow-y: auto;
+  color: var(--color-text);
+  background-color: var(--color-surface);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-2);
+}
+
+.panel:focus-visible {
+  outline-offset: 0;
+}
+
+.start {
+  inset-inline-start: 0;
+}
+
+.end {
+  inset-inline-end: 0;
+}

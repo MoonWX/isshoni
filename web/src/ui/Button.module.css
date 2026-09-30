@@ -1,0 +1,101 @@
+.button {
+  display: inline-flex;
+  gap: var(--space-2);
+  align-items: center;
+  justify-content: center;
+  min-height: var(--tap-target);
+  padding: 0 var(--space-4);
+  font-weight: var(--weight-medium);
+  line-height: var(--leading-tight);
+  text-align: center;
+  text-decoration: none;
+  white-space: nowrap;
+  border: var(--border-width) solid transparent;
+  border-radius: var(--radius-md);
+  transition:
+    background-color var(--duration-fast) var(--easing-standard),
+    border-color var(--duration-fast) var(--easing-standard),
+    color var(--duration-fast) var(--easing-standard);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.button:disabled {
+  opacity: 0.55;
+}
+
+.sm {
+  min-height: 2rem;
+  padding: 0 var(--space-3);
+  font-size: var(--text-sm);
+  border-radius: var(--radius-sm);
+}
+
+.block {
+  display: flex;
+  width: 100%;
+}
+
+.primary {
+  color: var(--color-on-accent);
+  background-color: var(--color-accent);
+}
+
+.primary:hover:not(:disabled) {
+  background-color: var(--color-accent-hover);
+}
+
+.secondary {
+  color: var(--color-text);
+  background-color: var(--color-surface);
+  border-color: var(--color-border-strong);
+}
+
+.secondary:hover:not(:disabled) {
+  background-color: var(--color-surface-2);
+}
+
+.ghost {
+  color: var(--color-text);
+  background-color: transparent;
+}
+
+.ghost:hover:not(:disabled) {
+  background-color: var(--color-surface-2);
+}
+
+.danger {
+  color: var(--color-on-danger);
+  background-color: var(--color-danger-strong);
+}
+
+.danger:hover:not(:disabled) {
+  filter: brightness(0.92);
+}
+
+.loading {
+  cursor: progress;
+}
+
+.icon {
+  display: inline-flex;
+  flex: none;
+}
+
+.icon svg {
+  width: 1.125rem;
+  height: 1.125rem;
+}
+
+.label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Windows High Contrast: fills disappear, so every variant needs a visible border. */
+@media (forced-colors: active) {
+  .button {
+    border-color: ButtonText;
+  }
+}
