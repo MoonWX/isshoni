@@ -538,7 +538,7 @@ type conn struct {
 
 	// Guarded by h.mu.
 	slotUser string // the user whose per-user slot the connection holds
-	roomID   string // the room the connection is in; "" = none (rooms come with README S19)
+	roomID   string // the id of the room the connection is in, for Notify; "" = none. Set by attach and detach
 
 	// Owned by the actor.
 	sock         *socket // nil while detached (README S28)
@@ -550,6 +550,12 @@ type conn struct {
 	idle         *time.Timer
 	revalidating bool // a periodic Revalidate call is running
 	closed       bool
+
+	room      *room              // the room the connection is in; nil = none (01 §4.1: at most one)
+	peer      MediaPeer          // the media side in that room (MediaPlane.NewPeer at room.join)
+	peerSeq   uint64             // numbers the connection's MediaPeers, so the actor drops a previous peer's events
+	stateRev  uint64             // the rev of the last room.state sent for the room; older snapshots are skipped
+	endReason protocol.EndReason // set by revoke and shutdown: why the connection's shares end when it closes
 }
 
 func newConn(h *Hub, s *socket, id Identity, hello *protocol.Hello, version int) *conn {
@@ -694,16 +700,102 @@ func (c *conn) socketEnded(s *socket, code int) {
 }
 
 // close ends the connection after its socket has ended; the actor then exits and the hub forgets it. code is the
-// socket's close code. With rooms and shares (README S19, S40) it also leaves the room, ends the connection's
-// shares and closes its MediaPeer.
+// socket's close code. The connection leaves its room (01 §4.2): its shares end, its MediaPeer closes, and its
+// participant leaves with its last connection, with the reason of closeReason.
 func (c *conn) close(code int) {
 	if c.closed {
 		return
 	}
 	c.closed = true
+	c.leaveRoom(c.closeReason(code))
 	c.h.metrics.connClosed(c.client.Kind, c.role, code)
 	c.h.log.Info("connection closed", slog.String("conn_id", c.id), slog.String("user_id", c.userID),
 		slog.Int("code", code))
+}
+
+// closeReason is the EndReason of a connection that closes with its socket's close code (01 §4.2, §8.6): the one
+// revoke or shutdown set (left, server_shutdown), left when the client closed on purpose (1000, 1001; the hub never
+// closes with those), else disconnected. From README S28 on, a connection gets here with disconnected only after
+// its grace.
+func (c *conn) closeReason(code int) protocol.EndReason {
+	switch {
+	case c.endReason != "":
+		return c.endReason
+	case code == int(protocol.CloseCodeNormal) || code == int(protocol.CloseCodeGoingAway):
+		return protocol.EndReasonLeft
+	}
+	return protocol.EndReasonDisconnected
+}
+
+// leaveRoom takes the connection out of its room, if any (01 §8.4): the hub detaches it, then its MediaPeer ends the
+// connection's shares there and closes. Nothing is locked while the MediaPeer is called.
+func (c *conn) leaveRoom(reason protocol.EndReason) {
+	r, peer := c.room, c.peer
+	if r == nil {
+		return
+	}
+	c.room, c.peer = nil, nil
+	ended := c.h.detach(c, r, reason)
+	closePeer(peer, ended, reason)
+}
+
+// closePeer ends the shares at the MediaPeer, then closes it ("the hub has already ended the peer's shares").
+func closePeer(peer MediaPeer, ended []string, reason protocol.EndReason) {
+	if peer == nil {
+		return
+	}
+	for _, id := range ended {
+		peer.EndShare(id, reason)
+	}
+	peer.Close()
+}
+
+// roomClosed handles CloseRoom for the connection: it leaves the room, whose shares end with room_closed, and gets
+// error{room_closed, scope room} with the room's id (01 §12.1). A connection that has left the room already gets
+// nothing.
+func (c *conn) roomClosed(r *room) {
+	if c.room != r {
+		return
+	}
+	c.leaveRoom(protocol.EndReasonRoomClosed)
+	e := protocol.NewError(protocol.ErrorCodeRoomClosed, protocol.ErrorScopeRoom)
+	e.RoomID = r.id
+	c.sendError(e, "")
+}
+
+// currentPeer reports whether the MediaPeer numbered seq is the connection's current one.
+func (c *conn) currentPeer(seq uint64) bool { return c.peer != nil && c.peerSeq == seq }
+
+// sendRoomState sends a broadcast snapshot of room r with rev. Nothing is sent when the connection is no longer in r
+// or already has that rev or a newer one (the snapshot after its room.join, for example).
+func (c *conn) sendRoomState(r *room, rev uint64, msg []byte) {
+	if c.room != r || rev <= c.stateRev {
+		return
+	}
+	c.stateRev = rev
+	c.sendEncoded(protocol.MessageTypeRoomState, msg)
+}
+
+// sendRoomEvent sends a room.event of room r, unless the connection has left r.
+func (c *conn) sendRoomEvent(r *room, msg []byte) {
+	if c.room == r {
+		c.sendEncoded(protocol.MessageTypeRoomEvent, msg)
+	}
+}
+
+// sendStateNow sends the current snapshot of the connection's room to this connection alone: right after the ok of
+// a room.join, before any other room traffic (01 §7), and after a resumed welcome (README S28).
+func (c *conn) sendStateNow() {
+	r := c.room
+	r.mu.Lock()
+	b, ok := r.encodeStateLocked()
+	rev := r.rev
+	r.mu.Unlock()
+	if !ok {
+		return
+	}
+	c.stateRev = max(c.stateRev, rev)
+	c.sendEncoded(protocol.MessageTypeRoomState, b)
 }
 
 // send queues a message on the current socket; while detached, messages are dropped (resync replaces them).
@@ -736,26 +828,33 @@ func (c *conn) fail(e protocol.Error) {
 }
 
 // revoke closes the connection for a revocation (01 §3.2): error{session_revoked|account_disabled, scope session}
-// and 4401/4403. From README S28 on it also skips grace, and the connection's shares end with left.
+// and 4401/4403. Its shares end with left, and so does its participant with its last connection (01 §4.2). From
+// README S28 on it also skips grace.
 func (c *conn) revoke(e protocol.Error) {
 	c.h.log.Info("connection revoked", slog.String("conn_id", c.id), slog.String("user_id", c.userID),
 		slog.String("code", string(e.Code)))
+	c.endReason = protocol.EndReasonLeft
 	c.fail(e)
 }
 
-// shutdown sends the shutdown notice and closes the socket with 1012 (04 §6.4). With shares (README S40) it also ends
-// them with server_shutdown.
+// shutdown sends the shutdown notice and closes the socket with 1012 (04 §6.4); the connection's shares end with
+// server_shutdown when it closes.
 func (c *conn) shutdown(reason protocol.ShutdownReason) {
+	c.endReason = protocol.EndReasonServerShutdown
 	if c.sock != nil {
 		c.sock.shutdown(reason)
 	}
 }
 
-// setUser applies a rename or role change. README S19 also refreshes room.state.
+// setUser applies a rename or role change (UpdateUser, Revalidate): the identity, and the participant's name in the
+// connection's room.
 func (c *conn) setUser(name string, admin bool) {
 	id := c.identity()
 	id.Name, id.Admin = name, admin
 	c.ident.Store(&id)
+	if c.room != nil {
+		c.room.rename(c.userID, name)
+	}
 }
 
 // checkIdle closes a socket from which no frame (message, ping or pong) arrived for IdleTimeout with

@@ -1,6 +1,7 @@
 package signal
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -200,11 +201,10 @@ func (c *conn) notImplemented(env protocol.Envelope) {
 		slog.String("conn_id", c.id), slog.String("type", string(env.Type))))
 }
 
-// inRoom reports whether the connection is in a room. The actor is the only writer of roomID, so it reads it
-// without the hub lock.
-func (c *conn) inRoom() bool { return c.roomID != "" }
+// inRoom reports whether the connection is in a room.
+func (c *conn) inRoom() bool { return c.room != nil }
 
-// requireRoom answers not_in_room outside a room (01 §12.1); inside one, the handling comes with README S19/S40.
+// requireRoom answers not_in_room outside a room (01 §12.1); inside one, the handling comes with README S40.
 func (c *conn) requireRoom(env protocol.Envelope) {
 	if !c.inRoom() {
 		c.reject(env, protocol.NewError(protocol.ErrorCodeNotInRoom, protocol.ErrorScopeRequest))
@@ -222,24 +222,90 @@ func (c *conn) onPing(env protocol.Envelope) {
 	c.send(protocol.MessageTypePong, "", protocol.Pong{T: p.T, ServerTimeMs: time.Now().UnixMilli()})
 }
 
-// onRoomJoin handles room.join (01 §8.4). A malformed room id gets room_not_found; joining comes with README S19.
+// onRoomJoin handles room.join (01 §8.4). The room must exist (GetRoom; a malformed id also gets room_not_found)
+// and the user may join it (CanJoin, else forbidden). Joining the connection's own room again replies ok and resends
+// room.state. Otherwise the connection attaches to the room's participant for its user (room_full when a new
+// participant would pass Policy().MaxRoomParticipants; room_not_found when CloseRoom got there first), leaves its
+// previous room (its shares there end with left) and gets a new MediaPeer. The ok carries the room and is followed
+// at once by a room.state for this connection alone.
 func (c *conn) onRoomJoin(env protocol.Envelope) {
-	if _, ok := decode[protocol.RoomJoin](c, env); !ok {
+	v, ok := decode[protocol.RoomJoin](c, env)
+	if !ok {
 		return
 	}
-	c.notImplemented(env)
+	info, e := c.lookupRoom(v.RoomID)
+	if e != nil {
+		c.reject(env, *e)
+		return
+	}
+	res := protocol.RoomJoinResult{Room: protocol.RoomInfo{ID: v.RoomID, Name: info.Name}}
+	if c.room != nil && c.room.id == v.RoomID {
+		c.reply(env, res)
+		c.sendStateNow()
+		return
+	}
+	r, e := c.h.attach(c, res.Room, c.h.policy().MaxRoomParticipants)
+	if e != nil {
+		c.reject(env, *e)
+		return
+	}
+	c.leaveRoom(protocol.EndReasonLeft) // the previous room; the SFU sees one peer per connection at a time
+	c.room = r
+	c.peerSeq++
+	peer, err := c.h.deps.Media.NewPeer(PeerParams{
+		ConnectionID: c.id,
+		UserID:       c.userID,
+		RoomID:       r.id,
+		Role:         c.role,
+		Caps:         c.caps,
+		Client:       c.client,
+	}, &peerSink{c: c, seq: c.peerSeq})
+	if err != nil {
+		c.room = nil
+		c.h.detach(c, r, protocol.EndReasonLeft) // no shares yet
+		c.reject(env, c.h.internalError(fmt.Errorf("new media peer: %w", err), protocol.ErrorScopeRequest,
+			slog.String("conn_id", c.id), slog.String("room_id", r.id)))
+		return
+	}
+	c.peer = peer
+	c.reply(env, res)
+	c.sendStateNow()
+	c.h.log.Debug("joined room", slog.String("conn_id", c.id), slog.String("user_id", c.userID),
+		slog.String("room_id", r.id))
 }
 
-// onRoomLeave handles room.leave: it replies ok, also when the connection is in no room (01 §8.4). Leaving a room
-// comes with README S19.
+// lookupRoom reads the room for a room.join from the RoomDirectory: room_not_found for an unknown room, forbidden
+// when CanJoin refuses, internal (with a logged ref) when the directory fails. It runs on the actor, which handles
+// the connection's messages in order; the call is bounded by depTimeout.
+func (c *conn) lookupRoom(roomID string) (protocol.RoomInfo, *protocol.Error) {
+	ctx, cancel := context.WithTimeout(c.h.ctx, depTimeout)
+	defer cancel()
+	info, err := c.h.deps.Rooms.GetRoom(ctx, roomID)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		e := protocol.NewError(protocol.ErrorCodeRoomNotFound, protocol.ErrorScopeRequest)
+		return info, &e
+	case err != nil:
+		e := c.h.internalError(fmt.Errorf("get room: %w", err), protocol.ErrorScopeRequest,
+			slog.String("conn_id", c.id), slog.String("room_id", roomID))
+		return info, &e
+	}
+	if err := c.h.deps.Rooms.CanJoin(ctx, c.identity(), roomID); err != nil {
+		c.h.log.Debug("room.join refused", slog.String("conn_id", c.id), slog.String("room_id", roomID),
+			slog.Any("err", err))
+		e := protocol.NewError(protocol.ErrorCodeForbidden, protocol.ErrorScopeRequest)
+		return info, &e
+	}
+	return info, nil
+}
+
+// onRoomLeave handles room.leave (01 §8.4): the connection's shares end with left, its MediaPeer closes and it
+// leaves its participant. It replies ok, also when the connection is in no room.
 func (c *conn) onRoomLeave(env protocol.Envelope) {
 	if _, ok := decode[protocol.Empty](c, env); !ok {
 		return
 	}
-	if c.inRoom() {
-		c.notImplemented(env)
-		return
-	}
+	c.leaveRoom(protocol.EndReasonLeft)
 	c.reply(env, nil)
 }
 
