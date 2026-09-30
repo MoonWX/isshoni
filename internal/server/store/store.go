@@ -29,6 +29,10 @@ import (
 // slowWrite is the Write duration above which a WARN names the caller (03 §4.2).
 const slowWrite = 250 * time.Millisecond
 
+// unknownAppVersion is recorded in schema_migrations and meta.last_app_version when Options.AppVersion is empty (a
+// build without injected version data). SchemaTooNewError treats it like a missing version.
+const unknownAppVersion = "unknown"
+
 // busyTimeoutMS is SQLite's busy_timeout. The writer is one connection, so it only matters for other processes
 // (offline CLI commands) and the readers during a checkpoint.
 const busyTimeoutMS = 5000
@@ -55,7 +59,7 @@ func (o Options) withDefaults() (Options, error) {
 		o.BackupDir = filepath.Join(filepath.Dir(o.Path), "backups")
 	}
 	if o.AppVersion == "" {
-		o.AppVersion = "unknown"
+		o.AppVersion = unknownAppVersion
 	}
 	if o.Readers <= 0 {
 		o.Readers = min(4, runtime.NumCPU())

@@ -503,13 +503,17 @@ func ensureDir(dir string) error {
 }
 
 // ensureDBFile creates the database file with mode 0600 if it is missing (SQLite then gives -wal and -shm the same
-// mode) and tightens an existing one.
+// mode) and tightens an existing one. An existing path that is not a regular file (a directory, a socket, …) is an
+// error and keeps its mode.
 func ensureDBFile(name string) error {
 	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // path from config
 	switch {
 	case err == nil:
 		return f.Close()
 	case errors.Is(err, os.ErrExist):
+		if err := isRegularFile(name); err != nil {
+			return err
+		}
 		return tighten(name, 0o600)
 	default:
 		return fmt.Errorf("store: create %s: %w", name, err)

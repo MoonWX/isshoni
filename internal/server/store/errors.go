@@ -65,10 +65,10 @@ type SchemaTooNewError struct {
 func (e *SchemaTooNewError) Error() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "database schema %d is newer than this isshoni build supports (%d); ", e.DBVersion, e.BinaryVersion)
-	if e.LastAppVersion != "" {
-		fmt.Fprintf(&b, "it was last used by isshoni %s. Install isshoni %s or newer", e.LastAppVersion, e.LastAppVersion)
-	} else {
+	if e.LastAppVersion == "" || e.LastAppVersion == unknownAppVersion {
 		b.WriteString("it was last used by a newer isshoni. Install a newer isshoni")
+	} else {
+		fmt.Fprintf(&b, "it was last used by isshoni %s. Install isshoni %s or newer", e.LastAppVersion, e.LastAppVersion)
 	}
 	switch {
 	case e.Backup != "":

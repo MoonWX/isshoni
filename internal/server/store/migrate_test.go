@@ -448,11 +448,14 @@ func TestSchemaTooNew(t *testing.T) {
 
 func TestSchemaTooNewMessageWithoutVersion(t *testing.T) {
 	t.Parallel()
-	e := &SchemaTooNewError{DBVersion: 5, BinaryVersion: 4}
 	want := "database schema 5 is newer than this isshoni build supports (4); it was last used by a newer isshoni. " +
 		"Install a newer isshoni; no backup for schema 4 was found"
-	if e.Error() != want {
-		t.Errorf("message:\n%s\nwant:\n%s", e.Error(), want)
+	// "" is a DB without meta.last_app_version; "unknown" is what a build without version data records.
+	for _, last := range []string{"", unknownAppVersion} {
+		e := &SchemaTooNewError{DBVersion: 5, BinaryVersion: 4, LastAppVersion: last}
+		if e.Error() != want {
+			t.Errorf("LastAppVersion %q, message:\n%s\nwant:\n%s", last, e.Error(), want)
+		}
 	}
 }
 

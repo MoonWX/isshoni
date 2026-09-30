@@ -140,6 +140,37 @@ func TestOpenTightensModes(t *testing.T) {
 	}
 }
 
+func TestOpenRefusesNonRegularPath(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	// A misconfigured path that names a directory: Open fails and leaves the directory as it was.
+	if err := os.Mkdir(e.dbPath(), 0o755); err != nil { //nolint:gosec // a normal directory mode on purpose
+		t.Fatal(err)
+	}
+	if err := os.Chmod(e.dbPath(), 0o755); err != nil { //nolint:gosec // undo the umask
+		t.Fatal(err)
+	}
+	before, err := os.Stat(e.dbPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open(context.Background(), e.opts(nil))
+	if err == nil {
+		_ = db.Close()
+		t.Fatal("Open succeeded on a directory")
+	}
+	if !strings.Contains(err.Error(), "is not a regular file") {
+		t.Errorf("Open = %v, want a not-a-regular-file error", err)
+	}
+	after, err := os.Stat(e.dbPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.IsDir() || after.Mode().Perm() != before.Mode().Perm() {
+		t.Errorf("after Open: %v, want the directory with mode %o", after.Mode(), before.Mode().Perm())
+	}
+}
+
 func TestReopenIsNoop(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
@@ -315,11 +346,24 @@ func (h *captureHandler) Handle(_ context.Context, r slog.Record) error {
 func (h *captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h *captureHandler) WithGroup(string) slog.Handler      { return h }
 
-func (h *captureHandler) find(msg string) (slog.Record, bool) {
+// findByCaller returns the first record with message msg whose "caller" attribute ends in suffix. Matching by
+// caller keeps a WARN from Open's own writes (caller "…store.Open", slow on a busy machine) from counting.
+func (h *captureHandler) findByCaller(msg, suffix string) (slog.Record, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for _, r := range h.recs {
-		if r.Message == msg {
+		if r.Message != msg {
+			continue
+		}
+		found := false
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == "caller" && strings.HasSuffix(a.Value.String(), suffix) {
+				found = true
+				return false
+			}
+			return true
+		})
+		if found {
 			return r, true
 		}
 	}
@@ -337,8 +381,9 @@ func TestSlowWriteLogsCaller(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
-	if _, ok := h.find("slow write transaction"); ok {
-		t.Fatal("slow-write warning before any slow write")
+	const msg, caller = "slow write transaction", "store.TestSlowWriteLogsCaller"
+	if _, ok := h.findByCaller(msg, caller); ok {
+		t.Fatal("slow-write warning naming the test before its slow write")
 	}
 	err = db.Write(context.Background(), func(q *Q) error {
 		time.Sleep(slowWrite + 20*time.Millisecond)
@@ -347,22 +392,12 @@ func TestSlowWriteLogsCaller(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, ok := h.find("slow write transaction")
+	r, ok := h.findByCaller(msg, caller)
 	if !ok {
-		t.Fatal("no slow-write warning")
+		t.Fatal("no slow-write warning naming the test function as the caller")
 	}
 	if r.Level != slog.LevelWarn {
 		t.Errorf("level = %v", r.Level)
-	}
-	var caller string
-	r.Attrs(func(a slog.Attr) bool {
-		if a.Key == "caller" {
-			caller = a.Value.String()
-		}
-		return true
-	})
-	if !strings.HasSuffix(caller, "store.TestSlowWriteLogsCaller") {
-		t.Errorf("caller = %q, want the test function", caller)
 	}
 }
 
