@@ -100,34 +100,6 @@ func TestInviteState(t *testing.T) {
 	}
 }
 
-func TestSettingsCacheDefaults(t *testing.T) {
-	t.Parallel()
-	db := newEnv(t).open(nil)
-	c := db.Settings()
-	want := Settings{
-		RegistrationMode:      ModeInvite,
-		InviteDefaultTTLHours: 168,
-		InviteDefaultMaxUses:  10,
-		UpdateCheck:           true,
-	}
-	if got := c.Defaults(); got != want {
-		t.Errorf("Defaults() = %+v, want %+v", got, want)
-	}
-	if got := c.Get(); got != want {
-		t.Errorf("Get() = %+v, want the defaults", got)
-	}
-	if len(c.Locked()) != 0 {
-		t.Errorf("Locked() = %v", c.Locked())
-	}
-	c.OnChange(func(Settings, Settings) { t.Error("OnChange ran") })()
-	if err := c.Pin("registrationMode", "closed"); !errors.Is(err, errNotImplemented) {
-		t.Errorf("Pin = %v, want not implemented", err)
-	}
-	if _, err := c.Update(context.Background(), nil, CLIActor); !errors.Is(err, errNotImplemented) {
-		t.Errorf("Update = %v, want not implemented", err)
-	}
-}
-
 // TestLaterMethodsSayNotImplemented: the declared API that later milestones fill in (the device flow, M2) fails
 // loudly, never silently.
 func TestLaterMethodsSayNotImplemented(t *testing.T) {

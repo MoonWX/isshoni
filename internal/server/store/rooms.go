@@ -19,7 +19,7 @@ type Room struct {
 }
 
 // The default room as EnsureDefaultRoom creates it. defaultRoomNameKey is precis.Nickname.CompareKey("Lounge"),
-// written out because the store does not depend on the PRECIS package.
+// written out as a constant (TestDefaultRoomNameKey checks it).
 const (
 	defaultRoomName    = "Lounge"
 	defaultRoomNameKey = "lounge"
