@@ -104,6 +104,16 @@ type sdpCand struct {
 	tcpType string // "passive", "active" or ""
 }
 
+// String formats c for test failures ("tcp 127.0.0.1:7882 host passive"); fmt can't print the unexported fields'
+// addresses itself.
+func (c sdpCand) String() string {
+	s := c.proto + " " + c.addr.String() + " " + c.typ
+	if c.tcpType != "" {
+		s += " " + c.tcpType
+	}
+	return s
+}
+
 // sdpCandidatesOf returns the component-1 candidates of an SDP without repeats (Pion lists them in every bundled
 // m-section).
 func sdpCandidatesOf(t *testing.T, raw string) []sdpCand {
@@ -164,15 +174,15 @@ func checkCompleteSDP(t *testing.T, a *apis, tr *netx.Transport, raw string, wan
 		via := viaOfCand(a, c)
 		switch {
 		case c.typ != "host":
-			t.Errorf("candidate %+v is not a host candidate", c)
+			t.Errorf("candidate %v is not a host candidate", c)
 		case c.proto == "tcp" && c.tcpType != "passive":
-			t.Errorf("TCP candidate %+v is not passive", c)
+			t.Errorf("TCP candidate %v is not passive", c)
 		case !slices.ContainsFunc(tr.Advertised, func(adv netx.AdvertisedAddr) bool {
 			return adv.Proto == c.proto && adv.Addr == c.addr
 		}):
-			t.Errorf("candidate %+v is not in Advertised %+v", c, tr.Advertised)
+			t.Errorf("candidate %v is not in Advertised %+v", c, tr.Advertised)
 		case !slices.Contains(wantVias, via):
-			t.Errorf("candidate %+v is on transport %q, want only %v", c, via, wantVias)
+			t.Errorf("candidate %v is on transport %q, want only %v", c, via, wantVias)
 		}
 		gotVias[via] = true
 	}
@@ -307,6 +317,16 @@ func TestConnectThroughTransport(t *testing.T) {
 		{
 			name: "sub/udp/srtp-fallback", serverOffers: true, nt: webrtc.NetworkTypeUDP4, filter: a.filter,
 			profiles: []dtls.SRTPProtectionProfile{dtls.SRTP_AES128_CM_HMAC_SHA1_80}, wantVia: netx.ViaUDP,
+		},
+		// A client with AES-128-GCM only connects too: on sub the SFU is the DTLS server (it answers the client's
+		// profile list), on pub the DTLS client (it offers its own).
+		{
+			name: "sub/udp/srtp-gcm-only", serverOffers: true, nt: webrtc.NetworkTypeUDP4, filter: a.filter,
+			profiles: []dtls.SRTPProtectionProfile{dtls.SRTP_AEAD_AES_128_GCM}, wantVia: netx.ViaUDP,
+		},
+		{
+			name: "pub/udp/srtp-gcm-only", nt: webrtc.NetworkTypeUDP4, filter: a.filter,
+			profiles: []dtls.SRTPProtectionProfile{dtls.SRTP_AEAD_AES_128_GCM}, wantVia: netx.ViaUDP,
 		},
 		// Every client candidate is filtered out (loopback without include_loopback): the server still learns the
 		// client's address as a peer-reflexive candidate from its checks, and connects.
@@ -603,7 +623,7 @@ func TestProbeAPIsIPv4Only(t *testing.T) {
 	subCands := sdpCandidatesOf(t, completeDescription(t, pc, offer))
 	for _, want := range append(slices.Clone(v4), v6[slices.IndexFunc(v6, func(c sdpCand) bool { return c.proto == "udp" })]) {
 		if !slices.ContainsFunc(subCands, func(c sdpCand) bool { return c.proto == want.proto && c.addr == want.addr }) {
-			t.Errorf("sub offer: no %s %v candidate in %+v", want.proto, want.addr, subCands)
+			t.Errorf("sub offer: no %s %v candidate in %v", want.proto, want.addr, subCands)
 		}
 	}
 
@@ -786,12 +806,15 @@ func TestNewAPIsNeedsTransport(t *testing.T) {
 
 // TestCandidateFilterAddrs is the remote-candidate filter table of 02 §7.3 (01 §17), for the three server setups
 // that change it: the default (a public server), network.include_loopback (development) and a server that
-// advertises a private address itself (04's LAN/Append case).
+// advertises a private address itself (04's LAN/Append case). Each advertises the addresses in own.
 func TestCandidateFilterAddrs(t *testing.T) {
+	own := []netip.Addr{
+		netip.MustParseAddr("198.51.100.9"), netip.MustParseAddr("2001:db8::9"), netip.MustParseAddr("192.168.1.30"),
+	}
 	var (
-		public   = candidateFilter{}
-		loopback = candidateFilter{loopback: true}
-		lan      = candidateFilter{private: true}
+		public   = candidateFilter{own: own}
+		loopback = candidateFilter{loopback: true, own: own}
+		lan      = candidateFilter{private: true, own: own}
 	)
 	for _, tc := range []struct {
 		addr                  string
@@ -822,6 +845,14 @@ func TestCandidateFilterAddrs(t *testing.T) {
 		{"fec0::1", dropPrivate, dropPrivate, keepCandidate},
 		{"::ffff:10.0.0.1", dropPrivate, dropPrivate, keepCandidate},
 		{"64:ff9b::a00:1", dropPrivate, dropPrivate, keepCandidate}, // NAT64 of 10.0.0.1
+		// The server's own addresses, on any port: only with include_loopback (checks to them stay on the host).
+		{"198.51.100.9", dropOwnAddr, keepCandidate, dropOwnAddr},
+		{"::ffff:198.51.100.9", dropOwnAddr, keepCandidate, dropOwnAddr},
+		{"64:ff9b::c633:6409", dropOwnAddr, keepCandidate, dropOwnAddr}, // NAT64 of 198.51.100.9
+		{"2001:db8::9", dropOwnAddr, keepCandidate, dropOwnAddr},
+		{"192.168.1.30", dropPrivate, dropPrivate, dropOwnAddr},
+		{"198.51.100.10", keepCandidate, keepCandidate, keepCandidate},
+		{"2001:db8::a", keepCandidate, keepCandidate, keepCandidate},
 		// Always dropped.
 		{"169.254.1.1", dropLinkLocal, dropLinkLocal, dropLinkLocal},
 		{"fe80::1", dropLinkLocal, dropLinkLocal, dropLinkLocal},
@@ -834,6 +865,14 @@ func TestCandidateFilterAddrs(t *testing.T) {
 		{"0.1.2.3", dropUnspecified, dropUnspecified, dropUnspecified},
 		{"::", dropUnspecified, dropUnspecified, dropUnspecified},
 		{"255.255.255.255", dropBroadcast, dropBroadcast, dropBroadcast},
+		// IPv4-compatible IPv6 (::/96, deprecated): never, whatever IPv4 address is inside (a sit tunnel reaches it).
+		{"::a00:1", dropIPv4Compat, dropIPv4Compat, dropIPv4Compat},     // ::10.0.0.1
+		{"::c0a8:114", dropIPv4Compat, dropIPv4Compat, dropIPv4Compat},  // ::192.168.1.20
+		{"::cb00:7107", dropIPv4Compat, dropIPv4Compat, dropIPv4Compat}, // ::203.0.113.7
+		{"::7f00:1", dropIPv4Compat, dropIPv4Compat, dropIPv4Compat},    // ::127.0.0.1
+		{"::c633:6409", dropIPv4Compat, dropIPv4Compat, dropIPv4Compat}, // ::198.51.100.9 (own)
+		{"::2", dropIPv4Compat, dropIPv4Compat, dropIPv4Compat},
+		{"::1:0:0", keepCandidate, keepCandidate, keepCandidate}, // just above ::/96 (and not ::ffff:0:0/96)
 	} {
 		a := netip.MustParseAddr(tc.addr)
 		for _, f := range []struct {
@@ -854,7 +893,7 @@ func TestCandidateFilterAddrs(t *testing.T) {
 // TestCandidateFilterCandidates: the filter reads a candidate as Pion does (with or without the "candidate:" prefix)
 // and judges only its connection address.
 func TestCandidateFilterCandidates(t *testing.T) {
-	f := candidateFilter{} // a public server
+	f := candidateFilter{own: []netip.Addr{netip.MustParseAddr("192.0.2.10")}} // a public server on 192.0.2.10
 	for _, tc := range []struct {
 		cand string
 		want dropReason
@@ -877,6 +916,9 @@ func TestCandidateFilterCandidates(t *testing.T) {
 		{"candidate:14 1 udp 2122260223 5b4e0f3a-8b2c-4a0e-9d1a-0c6a2e1f7b3d.local 54321 typ host", dropHostname},
 		{"candidate:15 1 udp 2122260223 media.example.com 54321 typ host", dropUnparsable},
 		{"candidate:16 1 udp 2122260223 203.0.113.7 54321 typ bogus", dropUnparsable},
+		{"candidate:17 1 udp 1 192.0.2.10 11211 typ host", dropOwnAddr},
+		{"candidate:18 1 tcp 1518280447 192.0.2.10 9 typ host tcptype active", dropOwnAddr},
+		{"candidate:19 1 udp 2122260223 ::a00:1 54321 typ host", dropIPv4Compat},
 		{"candidate:garbage", dropUnparsable},
 		{"", dropUnparsable},
 	} {
@@ -890,20 +932,33 @@ func TestNewCandidateFilter(t *testing.T) {
 	lanAdv := []netx.AdvertisedAddr{
 		{Proto: "udp", Addr: netip.MustParseAddrPort("192.168.1.20:7882"), Via: netx.ViaUDP, LAN: true},
 		{Proto: "udp", Addr: netip.MustParseAddrPort("198.51.100.9:7882"), Via: netx.ViaUDP},
+		{Proto: "tcp", Addr: netip.MustParseAddrPort("192.168.1.20:7882"), Via: netx.ViaTCP7882, LAN: true},
 	}
 	publicAdv := []netx.AdvertisedAddr{
 		{Proto: "udp", Addr: netip.MustParseAddrPort("203.0.113.7:7882"), Via: netx.ViaUDP},
+		{Proto: "tcp", Addr: netip.MustParseAddrPort("[::ffff:203.0.113.7]:443"), Via: netx.ViaTCP443},
+		{Proto: "udp", Addr: netip.MustParseAddrPort("[2001:db8::7]:7882"), Via: netx.ViaUDP},
 	}
+	lanOwn := []netip.Addr{netip.MustParseAddr("192.168.1.20"), netip.MustParseAddr("198.51.100.9")}
+	publicOwn := []netip.Addr{netip.MustParseAddr("203.0.113.7"), netip.MustParseAddr("2001:db8::7")}
 	for _, tc := range []struct {
 		tr   *netx.Transport
 		want candidateFilter
 	}{
-		{&netx.Transport{Advertised: publicAdv}, candidateFilter{}},
-		{&netx.Transport{Advertised: publicAdv, IncludeLoopback: true}, candidateFilter{loopback: true}},
-		{&netx.Transport{Advertised: lanAdv}, candidateFilter{private: true}},
-		{&netx.Transport{Advertised: lanAdv, IncludeLoopback: true}, candidateFilter{loopback: true, private: true}},
+		{&netx.Transport{Advertised: publicAdv}, candidateFilter{own: publicOwn}},
+		{
+			&netx.Transport{Advertised: publicAdv, IncludeLoopback: true},
+			candidateFilter{loopback: true, own: publicOwn},
+		},
+		{&netx.Transport{Advertised: lanAdv}, candidateFilter{private: true, own: lanOwn}},
+		{
+			&netx.Transport{Advertised: lanAdv, IncludeLoopback: true},
+			candidateFilter{loopback: true, private: true, own: lanOwn},
+		},
+		{&netx.Transport{}, candidateFilter{}},
 	} {
-		if got := newCandidateFilter(tc.tr); got != tc.want {
+		got := newCandidateFilter(tc.tr)
+		if got.loopback != tc.want.loopback || got.private != tc.want.private || !slices.Equal(got.own, tc.want.own) {
 			t.Errorf("Transport %+v: %+v, want %+v", tc.tr.Advertised, got, tc.want)
 		}
 	}
@@ -1079,7 +1134,8 @@ func FuzzFilterSDP(f *testing.F) {
 				}
 				ip = ip.Unmap()
 				if ip.IsUnspecified() || ip.IsMulticast() || ip.IsLinkLocalUnicast() ||
-					(ip.IsLoopback() && !filter.loopback) || (ip.IsPrivate() && !filter.private) {
+					(ip.IsLoopback() && !filter.loopback) || (ip.IsPrivate() && !filter.private) ||
+					(ip.Is6() && netip.MustParsePrefix("::/96").Contains(ip) && !ip.IsLoopback()) {
 					t.Fatalf("a kept candidate has the address %v (filter %+v)", ip, filter)
 				}
 			}
@@ -1115,7 +1171,7 @@ func TestCandidateFilterTrickled(t *testing.T) {
 }
 
 // FuzzCandidateFilter: a trickled candidate the filter keeps for a public server is one Pion parses, with an IP
-// address a public server may probe.
+// address a public server may probe (not its own).
 func FuzzCandidateFilter(f *testing.F) {
 	for _, s := range []string{
 		"candidate:1 1 udp 2122260223 203.0.113.7 54321 typ host",
@@ -1124,11 +1180,14 @@ func FuzzCandidateFilter(f *testing.F) {
 		"candidate:4 1 udp 2122260223 64:ff9b::a00:1 54321 typ host",
 		"candidate:5 1 udp 2122260223 abc.local 54321 typ host",
 		"candidate:candidate:6 1 udp 2122260223 ::ffff:127.0.0.1 1 typ host",
+		"candidate:7 1 udp 2122260223 ::a00:1 54321 typ host",
+		"candidate:8 1 udp 1 198.51.100.9 11211 typ host",
 	} {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, s string) {
-		public := candidateFilter{}
+		own := netip.MustParseAddr("198.51.100.9")
+		public := candidateFilter{own: []netip.Addr{own}}
 		v := strings.TrimPrefix(s, "candidate:")
 		if public.trickled(webrtc.ICECandidateInit{Candidate: s}) != keepCandidate || v == "" {
 			return
@@ -1143,7 +1202,7 @@ func FuzzCandidateFilter(f *testing.F) {
 		}
 		ip = ip.Unmap()
 		if ip.IsUnspecified() || ip.IsMulticast() || ip.IsLinkLocalUnicast() || ip.IsLoopback() || ip.IsPrivate() ||
-			cgnatPrefix.Contains(ip) {
+			cgnatPrefix.Contains(ip) || (ip.Is6() && netip.MustParsePrefix("::/96").Contains(ip)) || ip == own {
 			t.Fatalf("kept the address %v", ip)
 		}
 	})

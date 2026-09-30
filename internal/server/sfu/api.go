@@ -329,6 +329,8 @@ const (
 	dropLinkLocal   dropReason = "link_local"  // 169.254.0.0/16, fe80::/10
 	dropLoopback    dropReason = "loopback"    // 127.0.0.0/8, ::1, unless network.include_loopback
 	dropPrivate     dropReason = "private"     // RFC 1918, CGNAT, ULA or site-local, unless the server is on a LAN
+	dropIPv4Compat  dropReason = "ipv4_compat" // ::/96 other than :: and ::1 (IPv4-compatible IPv6, deprecated)
+	dropOwnAddr     dropReason = "own_address" // an address of Transport.Advertised, unless network.include_loopback
 )
 
 var (
@@ -336,35 +338,52 @@ var (
 	thisNetwork      = netip.MustParsePrefix("0.0.0.0/8")     // RFC 1122 "this network": never a destination
 	siteLocalV6      = netip.MustParsePrefix("fec0::/10")     // deprecated site-local (RFC 3879): private like ULA
 	nat64WellKnown   = netip.MustParsePrefix("64:ff9b::/96")  // RFC 6052: a NAT64 gateway forwards to the IPv4 inside
+	ipv4Compatible   = netip.MustParsePrefix("::/96")         // RFC 4291 §2.5.5.1, deprecated; RFC 8445 §5.1.1.1
 	limitedBroadcast = netip.MustParseAddr("255.255.255.255")
 )
 
 // candidateFilter is the remote-candidate filter of 02 §7.3. With full ICE the server sends connectivity checks to
 // every remote candidate a client signals, so without it a client could make the server probe its own loopback or
 // internal networks (01 §17). It applies to everything a client signals: trickled candidates (trickled, in
-// Conn.AddICECandidate) and the candidates of its SDP (filterSDP, before SetRemoteDescription: a browser's re-offer
-// or answer can carry the candidates it has gathered). It never applies to peer-reflexive candidates: those are the
+// Conn.AddICECandidate) and the candidates of its SDP (filterSDP, before SetRemoteDescription: a browser's pub offer,
+// sub answer or re-offer can carry the candidates it has gathered, and so can a connection-test probe offer, SFU.Probe
+// of 02 §7.6, which any signed-in user may send). It never applies to peer-reflexive candidates: those are the
 // source addresses of checks that already reached the server, and the server learns every client address it needs
 // that way. That is also why Pion's SettingEngine.SetRemoteIPFilter isn't used: Pion applies it to peer-reflexive
 // candidates too. Each candidate is read with Pion's own parser (ice.UnmarshalCandidate) from exactly the string Pion
 // will read, so the filter and Pion never disagree on a candidate's address.
 //
-// Always dropped: unparsable candidates, host names (mDNS or not), unspecified, broadcast, multicast and link-local
-// addresses. Loopback is kept only with Transport.IncludeLoopback (development). RFC 1918, CGNAT (100.64.0.0/10),
-// ULA (fc00::/7) and site-local IPv6 addresses are kept only when the server itself advertises a private address
-// (04's LAN/Append case: LAN friends connect to it directly). IPv4-mapped IPv6 addresses are judged as IPv4, and a
-// NAT64 address (64:ff9b::/96) by the IPv4 address inside it.
+// Always dropped: unparsable candidates, host names (mDNS or not), unspecified, broadcast, multicast, link-local and
+// IPv4-compatible IPv6 (::/96) addresses. Loopback, and any address the server advertises itself
+// (Transport.Advertised, on any port), are kept only with Transport.IncludeLoopback (development). RFC 1918, CGNAT
+// (100.64.0.0/10), ULA (fc00::/7) and site-local IPv6 addresses are kept only when the server itself advertises a
+// private address (04's LAN/Append case: LAN friends connect to it directly). IPv4-mapped IPv6 addresses are judged
+// as IPv4, and a NAT64 address (64:ff9b::/96) by the IPv4 address inside it.
+//
+// The IPv4-compatible and own-address drops add to the table of 02 §7.3, for the reason of its loopback rule.
+// IPv4-compatible addresses: RFC 8445 §5.1.1.1 rules them out as candidates, and a Linux host with the sit module
+// loaded tunnels a check to one to the IPv4 address inside it, which may be internal or loopback. The server's own
+// addresses: a check to one is delivered locally (or hairpinned by Docker's bridge) and reaches whatever listens on
+// that port, as loopback would. No client needs either; a client on the server's host or behind its NAT is still
+// learned as peer-reflexive.
 type candidateFilter struct {
-	loopback bool // Transport.IncludeLoopback (network.include_loopback)
-	private  bool // any Transport.Advertised[].LAN
+	loopback bool         // Transport.IncludeLoopback (network.include_loopback)
+	private  bool         // any Transport.Advertised[].LAN
+	own      []netip.Addr // the addresses of Transport.Advertised, unmapped, without repeats
 }
 
 // newCandidateFilter returns the filter for the server's own addresses.
 func newCandidateFilter(tr *netx.Transport) candidateFilter {
-	return candidateFilter{
+	f := candidateFilter{
 		loopback: tr.IncludeLoopback,
 		private:  slices.ContainsFunc(tr.Advertised, func(a netx.AdvertisedAddr) bool { return a.LAN }),
 	}
+	for _, adv := range tr.Advertised {
+		if a := adv.Addr.Addr().Unmap().WithZone(""); a.IsValid() && !slices.Contains(f.own, a) {
+			f.own = append(f.own, a)
+		}
+	}
+	return f
 }
 
 // trickled judges a trickled candidate the way Pion's PeerConnection.AddICECandidate reads it: the candidate field
@@ -417,16 +436,21 @@ func (f candidateFilter) addr(a netip.Addr) dropReason {
 		if !f.loopback {
 			return dropLoopback
 		}
+	case ipv4Compatible.Contains(a): // after :: and ::1, which keep their own reasons
+		return dropIPv4Compat
 	case a.IsPrivate(), cgnatPrefix.Contains(a), siteLocalV6.Contains(a):
 		if !f.private {
 			return dropPrivate
 		}
 	}
+	if !f.loopback && slices.Contains(f.own, a) {
+		return dropOwnAddr
+	}
 	return keepCandidate
 }
 
-// filterSDP returns a remote description (a pub offer or a sub answer) without the candidate attributes the filter
-// drops, at session or media level, and how many it dropped.
+// filterSDP returns a remote description (a pub offer, a sub answer or a probe offer: SFU.Probe, 02 §7.6) without
+// the candidate attributes the filter drops, at session or media level, and how many it dropped.
 //
 // It reads the SDP with pion/sdp, the parser of Pion's SetRemoteDescription, and judges each candidate attribute by
 // its value, exactly the string Pion's parser reads (webrtc's extractICEDetails → ice.UnmarshalCandidate), so every
