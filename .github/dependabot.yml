@@ -1,0 +1,47 @@
+# Weekly version updates (docs/m1/06-deploy-and-ci.md §8.1, "06" below). Minor and patch
+# updates are grouped per ecosystem; a major update gets a pull request of its own.
+#
+# Not covered here: the tools pinned in .tool-versions (bumped by hand, monthly: 06 §7.1) and
+# spikes/, which is throwaway.
+
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directories:
+      - /
+      - /tools
+    schedule:
+      interval: weekly
+    groups:
+      go-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directories:
+      - /web
+      - /docs
+    schedule:
+      interval: weekly
+    groups:
+      npm-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directory: /deploy/docker
+    schedule:
+      interval: weekly
+    groups:
+      docker-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
