@@ -5,10 +5,6 @@ import (
 	"fmt"
 )
 
-// ErrNotImplemented is returned by the parts of the package that a later slice fills in (the 443 multiplexer,
-// README S26).
-var ErrNotImplemented = errors.New("netx: not implemented")
-
 // ErrNoTransport is returned by NewTransport when no ICE transport is left: UDP and 7882/tcp are both turned off
 // (listen.ice_udp and listen.ice_tcp are "") and there is no 443 multiplexer, or UDP found no usable local address.
 var ErrNoTransport = errors.New("netx: no ICE transport")

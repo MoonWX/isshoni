@@ -251,17 +251,33 @@ func TestConnectTCP7882(t *testing.T) {
 	}
 }
 
-// TestConnectTCP443 connects through the 443 part (TCPMux443) with a stand-in PortMux; README S29 repeats this
-// with the real multiplexer.
+// TestConnectTCP443 connects through the 443 multiplexer's ICE side (TCPMux443): the client dials the passive
+// candidate on the mux's port, the mux routes its RFC 4571 frames to ICE() and counts the media_tcp bytes both ways
+// (the Transport does not count them again).
 func TestConnectTCP443(t *testing.T) {
-	pm := fakePortMux(t, 0)
-	tr := newTestTransport(t, TransportOptions{PortMux: pm, IncludeLoopback: true})
+	var counter TransferCounter
+	pm := newTestPortMux(t, PortMuxOptions{Counter: &counter})
+	tr := newTestTransport(t, TransportOptions{PortMux: pm, IncludeLoopback: true, Counter: &counter})
 	if tr.UDPMux != nil || tr.TCPMux7882 != nil || tr.TCPMux443 == nil {
 		t.Fatalf("muxes: udp %v, 7882 %v, 443 %v", tr.UDPMux, tr.TCPMux7882, tr.TCPMux443)
 	}
 	local := connectPair(t, tr, clientAPI(webrtc.NetworkTypeTCP4))
 	if via := viaOf(tr, "tcp", candidateAddr(t, local)); via != ViaTCP443 {
 		t.Errorf("selected pair labeled %q, want %q", via, ViaTCP443)
+	}
+	if local.Port != tcpPortOf(pm.ICE()) {
+		t.Errorf("selected local port %d, want the mux's %d", local.Port, tcpPortOf(pm.ICE()))
+	}
+	st := pm.Stats()
+	if st.ICE == 0 || st.TLS != 0 || st.Garbage != 0 || st.Limited != 0 {
+		t.Errorf("Stats = %+v, want only ICE connections", st)
+	}
+	totals := counter.Totals()
+	if c := totals[PathMediaTCP]; c.Egress == 0 || c.Ingress == 0 {
+		t.Errorf("media_tcp = %+v, want bytes both ways", c)
+	}
+	if w := totals[PathWeb]; w.Egress != 0 || w.Ingress != 0 {
+		t.Errorf("web = %+v, want nothing on an ICE connection", w)
 	}
 }
 
@@ -306,25 +322,25 @@ func TestCloseWithSilentTCPClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	closeWithSilentClient(t, tr, tr.tcpLn)
+	closeWithSilentClient(t, tr, tr.tcpLn, nil)
 }
 
-// TestCloseWithSilent443Client: the same on 443, whatever PortMux's ICE sub-listener does on Close (fakePortMux's is
-// a plain TCP listener, which leaves the connections it accepted open).
+// TestCloseWithSilent443Client: the same on 443. The client sends only the first byte of an RFC 4571 header, so
+// the mux hands it to pion, which then waits for the rest of its first frame.
 func TestCloseWithSilent443Client(t *testing.T) {
-	pm := fakePortMux(t, 0)
+	pm := newTestPortMux(t, PortMuxOptions{})
 	tr, err := NewTransport(context.Background(), TransportOptions{
 		PortMux: pm, IncludeLoopback: true, Interfaces: &fakeIfaces{ifs: []Interface{loIface()}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	closeWithSilentClient(t, tr, tr.ln443)
+	closeWithSilentClient(t, tr, tr.ln443, []byte{0x00})
 }
 
-// closeWithSilentClient connects a client to ln that never sends anything, waits until ln has handed it to pion,
-// then checks that Transport.Close returns quickly and closes the client's connection.
-func closeWithSilentClient(t *testing.T, tr *Transport, ln *iceListener) {
+// closeWithSilentClient connects a client to ln that sends first (it may be nil) and then nothing, waits until ln
+// has handed it to pion, then checks that Transport.Close returns quickly and closes the client's connection.
+func closeWithSilentClient(t *testing.T, tr *Transport, ln *iceListener, first []byte) {
 	t.Helper()
 	var d net.Dialer
 	c, err := d.DialContext(context.Background(), "tcp4", ln.Addr().String())
@@ -333,6 +349,10 @@ func closeWithSilentClient(t *testing.T, tr *Transport, ln *iceListener) {
 		t.Fatal(err)
 	}
 	defer func() { _ = c.Close() }()
+	if _, err := c.Write(first); err != nil {
+		_ = tr.Close()
+		t.Fatal(err)
+	}
 	for deadline := time.Now().Add(5 * time.Second); ln.handedOut() == 0; {
 		if time.Now().After(deadline) {
 			_ = tr.Close()
