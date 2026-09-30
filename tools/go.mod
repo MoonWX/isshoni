@@ -1,6 +1,8 @@
 // Pinned Go tools, built into .bin/ by `task tools`, and the repository's own tool programs (tools/<name>/).
-// A separate module, so the tools' dependencies stay out of the server's module graph. Keep the Task and
-// golangci-lint versions equal to .tool-versions (`task lint:pins` checks).
+// A separate module, so the tools' dependencies stay out of the server's module graph. Keep the Task,
+// golangci-lint and shfmt (mvdan.cc/sh/v3, which Task's shell uses too) versions equal to .tool-versions
+// (`task lint:pins` checks). actionlint is not here: v1.7.12 does not compile against the go.yaml.in/yaml/v4
+// release candidate that golangci-lint's gosec needs, so it comes from mise or a package manager, like ShellCheck.
 module github.com/MoonWX/isshoni/tools
 
 go 1.26.0
@@ -13,6 +15,7 @@ tool (
 	github.com/google/go-licenses/v2
 	github.com/gzuidhof/tygo
 	golang.org/x/vuln/cmd/govulncheck
+	mvdan.cc/sh/v3/cmd/shfmt
 )
 
 require golang.org/x/mod v0.41.0
@@ -162,6 +165,7 @@ require (
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/go-licenses/v2 v2.0.1 // indirect
 	github.com/google/licenseclassifier/v2 v2.0.0 // indirect
+	github.com/google/renameio/v2 v2.0.2 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.20 // indirect
@@ -325,8 +329,9 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	honnef.co/go/tools v0.8.1 // indirect
 	k8s.io/klog/v2 v2.90.1 // indirect
+	mvdan.cc/editorconfig v0.3.0 // indirect
 	mvdan.cc/gofumpt v0.12.0 // indirect
 	mvdan.cc/sh/moreinterp v0.0.0-20260817215856-d6550df7ed8d // indirect
-	mvdan.cc/sh/v3 v3.13.2-0.20260817215856-d6550df7ed8d // indirect
+	mvdan.cc/sh/v3 v3.14.1 // indirect
 	mvdan.cc/unparam v0.0.0-20260823230713-2fa3d841b0c8 // indirect
 )

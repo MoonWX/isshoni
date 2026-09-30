@@ -18,6 +18,7 @@ var pinnedTools = []struct {
 }{
 	{name: "task", module: "github.com/go-task/task/v3"},
 	{name: "golangci-lint", module: "github.com/golangci/golangci-lint/v2"},
+	{name: "shfmt", module: "mvdan.cc/sh/v3"},
 }
 
 // checkPins compares .tool-versions with go.mod and tools/go.mod. It reports every difference at once.

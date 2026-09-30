@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -57,6 +58,10 @@ func checkKeys(root string) (note string, err error) {
 	if err != nil {
 		return "", err
 	}
+	// Git for Windows checks text files out with CRLF line ends by default (core.autocrlf), while the committed
+	// files, and so the installer that ships, have LF. Compare the content, not the checkout's line ends.
+	script = bytes.ReplaceAll(script, []byte("\r\n"), []byte("\n"))
+	want = bytes.ReplaceAll(want, []byte("\r\n"), []byte("\n"))
 	if strings.ContainsRune(string(want), '\'') {
 		return "", errors.New("deploy/keys/allowed_signers contains a single quote, which the shell block cannot hold")
 	}

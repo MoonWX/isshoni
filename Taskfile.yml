@@ -27,16 +27,11 @@ vars:
   VERSION: '{{.ISSHONI_VERSION | default .DEV_VERSION}}'
   VERSION_PKG: github.com/MoonWX/isshoni/internal/version
 
-  # The pinned Go tools of tools/go.mod, built into .bin/ by `task tools`.
-  TOOL_PKGS: >-
-    github.com/go-task/task/v3/cmd/task
-    github.com/golangci/golangci-lint/v2/cmd/golangci-lint
-    github.com/google/go-licenses/v2
-    github.com/gzuidhof/tygo
-    golang.org/x/vuln/cmd/govulncheck
+  # The pinned Go tools of tools/go.mod, built into .bin/ by `task tools` (one tools:<name> task each).
   GOLANGCI_LINT: '.bin/golangci-lint{{exeExt}}'
   GO_LICENSES: '.bin/go-licenses{{exeExt}}'
   TYGO: '.bin/tygo{{exeExt}}'
+  SHFMT: '.bin/shfmt{{exeExt}}'
 
 tasks:
   # ---------------------------------------------------------------------------------------------------------------
@@ -68,22 +63,69 @@ tasks:
         if: '[ -f web/package.json ]'
 
   tools:
-    desc: Build the pinned Go tools of tools/go.mod into .bin/ (task, golangci-lint, tygo, go-licenses, govulncheck)
-    run: once
-    env:
-      # None of the tools needs cgo; without it no C toolchain is involved (golangci-lint's plugin loader is off).
-      CGO_ENABLED: '0'
-    sources:
-      - tools/go.mod # its toolchain line picks the Go version that builds the tools
-      - tools/go.sum
-    generates:
-      - '.bin/task{{exeExt}}'
-      - '.bin/golangci-lint{{exeExt}}'
-      - '.bin/go-licenses{{exeExt}}'
-      - '.bin/tygo{{exeExt}}'
-      - '.bin/govulncheck{{exeExt}}'
+    desc: >-
+      Build the pinned Go tools of tools/go.mod into .bin/ (task, golangci-lint, tygo, go-licenses, govulncheck,
+      shfmt)
     cmds:
-      - go -C tools build -o ../.bin/ {{.TOOL_PKGS}}
+      # One after the other, so the tools' shared dependencies are compiled once.
+      - task: tools:task
+      - task: tools:golangci-lint
+      - task: tools:tygo
+      - task: tools:go-licenses
+      - task: tools:govulncheck
+      - task: tools:shfmt
+
+  # One task per tool, so a task that needs one tool (gen, licenses, lint:*) builds only that one on a cold cache.
+  # Each rebuilds its binary when tools/go.mod or tools/go.sum changes (its toolchain line picks the Go version that
+  # builds the tools) or the binary is missing. None of the tools needs cgo; without it no C toolchain is involved
+  # (golangci-lint's plugin loader is off).
+  tools:task:
+    run: once
+    env: {CGO_ENABLED: '0'}
+    sources: [tools/go.mod, tools/go.sum]
+    generates: ['.bin/task{{exeExt}}']
+    cmds:
+      - go -C tools build -o ../.bin/ github.com/go-task/task/v3/cmd/task
+
+  tools:golangci-lint:
+    run: once
+    env: {CGO_ENABLED: '0'}
+    sources: [tools/go.mod, tools/go.sum]
+    generates: ['{{.GOLANGCI_LINT}}']
+    cmds:
+      - go -C tools build -o ../.bin/ github.com/golangci/golangci-lint/v2/cmd/golangci-lint
+
+  tools:tygo:
+    run: once
+    env: {CGO_ENABLED: '0'}
+    sources: [tools/go.mod, tools/go.sum]
+    generates: ['{{.TYGO}}']
+    cmds:
+      - go -C tools build -o ../.bin/ github.com/gzuidhof/tygo
+
+  tools:go-licenses:
+    run: once
+    env: {CGO_ENABLED: '0'}
+    sources: [tools/go.mod, tools/go.sum]
+    generates: ['{{.GO_LICENSES}}']
+    cmds:
+      - go -C tools build -o ../.bin/ github.com/google/go-licenses/v2
+
+  tools:govulncheck:
+    run: once
+    env: {CGO_ENABLED: '0'}
+    sources: [tools/go.mod, tools/go.sum]
+    generates: ['.bin/govulncheck{{exeExt}}']
+    cmds:
+      - go -C tools build -o ../.bin/ golang.org/x/vuln/cmd/govulncheck
+
+  tools:shfmt:
+    run: once
+    env: {CGO_ENABLED: '0'}
+    sources: [tools/go.mod, tools/go.sum]
+    generates: ['{{.SHFMT}}']
+    cmds:
+      - go -C tools build -o ../.bin/ mvdan.cc/sh/v3/cmd/shfmt
 
   # ---------------------------------------------------------------------------------------------------------------
   # Development
@@ -126,7 +168,7 @@ tasks:
 
   gen:
     desc: Generate the TypeScript protocol types (tygo, tygo.yaml) and the message registry into web/src/protocol/
-    deps: [tools]
+    deps: [tools:tygo]
     cmds:
       - cmd: "echo 'gen: note: internal/protocol and internal/protocol/api do not both exist yet, skipping tygo'"
         silent: true
@@ -163,17 +205,21 @@ tasks:
       - task: test:sh
 
   test:go:
-    desc: Run the Go tests with the race detector, for the main module and tools/ (the race detector needs cgo)
+    desc: >-
+      Run the Go tests with the race detector (it needs cgo) for the main module and tools/; `task test:go -- ARGS`
+      passes ARGS to the main module's run (CI: -coverprofile=coverage.out -covermode=atomic)
     env:
       CGO_ENABLED: '1'
     vars:
+      # Empty only while the main module has no packages. When go list itself fails, the real command runs and
+      # prints go's error.
       GO_PKGS:
-        sh: go list -e ./... 2>/dev/null
+        sh: go list -e ./... 2>/dev/null || echo 'go list failed'
     cmds:
       - cmd: "echo 'test:go: note: the main module has no Go packages yet'"
         silent: true
         if: '{{if .GO_PKGS}}false{{else}}true{{end}}'
-      - cmd: go test -race -count=1 -timeout 15m ./...
+      - cmd: go test -race -count=1 -timeout 15m {{.CLI_ARGS}} ./...
         if: '{{if .GO_PKGS}}true{{else}}false{{end}}'
       - go -C tools test -race -count=1 -timeout 15m ./...
 
@@ -216,10 +262,11 @@ tasks:
 
   lint:go:
     desc: golangci-lint, go mod tidy -diff, and go vet for GOOS darwin and windows (the main module and tools/)
-    deps: [tools]
+    deps: [tools:golangci-lint]
     vars:
+      # As in test:go: empty only while the main module has no packages.
       GO_PKGS:
-        sh: go list -e ./... 2>/dev/null
+        sh: go list -e ./... 2>/dev/null || echo 'go list failed'
     cmds:
       - cmd: "echo 'lint:go: note: the main module has no Go packages yet, skipping golangci-lint and go vet for it'"
         silent: true
@@ -247,7 +294,8 @@ tasks:
         if: '[ -f web/package.json ]'
 
   lint:sh:
-    desc: Check the shell scripts under deploy/ with shellcheck (POSIX sh) and shfmt
+    desc: Check the shell scripts under deploy/ with shellcheck (POSIX sh) and shfmt (.bin/shfmt)
+    deps: [tools:shfmt]
     cmds:
       - cmd: |
           set -- deploy/**/*.sh
@@ -255,13 +303,12 @@ tasks:
             echo 'lint:sh: skipped, there are no shell scripts under deploy/ yet'
             exit 0
           fi
-          for tool in shellcheck shfmt; do
-            command -v $tool >/dev/null || { echo "lint:sh: $tool is not installed: run \"mise install\" (see .tool-versions)" >&2; exit 1; }
-          done
+          # ShellCheck is not a Go program, so it comes from mise or a package manager, not from tools/go.mod.
+          command -v shellcheck >/dev/null || { echo 'lint:sh: shellcheck is not installed: run "mise install" or install ShellCheck (see .tool-versions)' >&2; exit 1; }
           echo "lint:sh: shellcheck --shell=sh and shfmt -p -i 2 -d over $# scripts"
           status=0
           shellcheck --shell=sh "$@" || status=1
-          shfmt -p -i 2 -d "$@" || status=1
+          {{.SHFMT}} -p -i 2 -d "$@" || status=1
           exit $status
         silent: true
         shopt: [globstar, nullglob]
@@ -272,7 +319,12 @@ tasks:
       - cmd: "echo 'lint:actions: skipped, .github/workflows does not exist yet'"
         silent: true
         if: '[ ! -d .github/workflows ]'
-      - cmd: actionlint
+      # actionlint comes from mise or a package manager (tools/go.mod says why it is not built into .bin/).
+      - cmd: |
+          command -v actionlint >/dev/null || { echo 'lint:actions: actionlint is not installed: run "mise install" or install actionlint (see .tool-versions)' >&2; exit 1; }
+          echo 'lint:actions: actionlint over .github/workflows'
+          actionlint
+        silent: true
         if: '[ -d .github/workflows ]'
 
   lint:keys:
@@ -369,7 +421,7 @@ tasks:
           -ldflags "-s -w
           -X {{.VERSION_PKG}}.version={{.VERSION}}
           -X {{.VERSION_PKG}}.commit=$(git rev-parse HEAD)
-          -X {{.VERSION_PKG}}.date=$(git log -1 --format=%cI)"
+          -X {{.VERSION_PKG}}.date=$(TZ=UTC0 git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd)"
           -o bin/isshoni{{exeExt}} ./cmd/isshoni
         if: '[ -d cmd/isshoni ]'
 
@@ -394,7 +446,7 @@ tasks:
 
   licenses:
     desc: The license gate - go-licenses for linux, darwin and windows, and the npm license check of web/ and docs/
-    deps: [tools]
+    deps: [tools:go-licenses]
     cmds:
       - cmd: "echo 'licenses: note: cmd/ does not exist yet, skipping go-licenses'"
         silent: true
@@ -544,7 +596,14 @@ tasks:
   # ---------------------------------------------------------------------------------------------------------------
 
   clean:
-    desc: Remove build output (bin/, dist/, dist-extra/, web/dist/* except .gitkeep), the tools in .bin/ and .dev/
+    desc: >-
+      Remove build output (bin/, dist/, dist-extra/, web/dist/* except .gitkeep), .dev/, and the pinned tools in .bin/
+      except task
     cmds:
-      - rm -rf bin .bin dist dist-extra .dev .task
+      # .bin/task stays (06 §7.2 says .bin/): it is often the Task running this command, and deleting it would leave
+      # a contributor without the go-built Task (Windows cannot delete a running .exe anyway). `task tools` builds
+      # the others again.
+      - rm -rf bin dist dist-extra .dev .task
+      - >-
+        rm -rf {{.GOLANGCI_LINT}} {{.TYGO}} {{.GO_LICENSES}} .bin/govulncheck{{exeExt}} {{.SHFMT}}
       - rm -rf web/dist/*

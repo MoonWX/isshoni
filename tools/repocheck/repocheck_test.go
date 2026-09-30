@@ -14,6 +14,8 @@ golang 1.27.1
 nodejs 26.5.0
 task 3.53.1   # trailing comment
 golangci-lint 2.14.0
+shfmt 3.14.1
+actionlint 1.7.12
 `
 	goodMainMod = `module github.com/MoonWX/isshoni
 
@@ -32,6 +34,7 @@ tool github.com/go-task/task/v3/cmd/task
 require (
 	github.com/go-task/task/v3 v3.53.1 // indirect
 	github.com/golangci/golangci-lint/v2 v2.14.0 // indirect
+	mvdan.cc/sh/v3 v3.14.1 // indirect
 )
 `
 	signers = `isshoni-release namespaces="isshoni-checksums" ssh-ed25519 AAAAone isshoni-release-1
@@ -61,6 +64,11 @@ func writeTree(t *testing.T, files map[string]string) string {
 		}
 	}
 	return root
+}
+
+// crlf converts LF line ends to CRLF, as a Git for Windows checkout does.
+func crlf(s string) string {
+	return strings.ReplaceAll(s, "\n", "\r\n")
 }
 
 func pinTree(toolVersions, mainMod, toolsMod string) map[string]string {
@@ -103,6 +111,16 @@ func TestCheckPins(t *testing.T) {
 			wantErr: []string{"tools/go.mod has github.com/go-task/task/v3 v3.53.1 but .tool-versions pins task 3.52.0"},
 		},
 		{
+			name:    "shfmt pin differs (MVS raised mvdan.cc/sh/v3 for Task)",
+			files:   pinTree(goodToolVersions, goodMainMod, strings.Replace(goodToolsMod, "sh/v3 v3.14.1", "sh/v3 v3.15.0", 1)),
+			wantErr: []string{"tools/go.mod has mvdan.cc/sh/v3 v3.15.0 but .tool-versions pins shfmt 3.14.1"},
+		},
+		{
+			name:    "no shfmt pin",
+			files:   pinTree(strings.Replace(goodToolVersions, "shfmt 3.14.1\n", "", 1), goodMainMod, goodToolsMod),
+			wantErr: []string{".tool-versions has no shfmt line"},
+		},
+		{
 			name: "golangci-lint missing from tools/go.mod, several problems at once",
 			files: pinTree(goodToolVersions, strings.Replace(goodMainMod, "go1.27.1", "go1.27.2", 1),
 				strings.Replace(goodToolsMod, "\tgithub.com/golangci/golangci-lint/v2 v2.14.0 // indirect\n", "", 1)),
@@ -113,8 +131,8 @@ func TestCheckPins(t *testing.T) {
 		},
 		{
 			name:    "tool without version",
-			files:   pinTree(goodToolVersions+"shfmt\n", goodMainMod, goodToolsMod),
-			wantErr: []string{`"shfmt" has no version`},
+			files:   pinTree(goodToolVersions+"goreleaser\n", goodMainMod, goodToolsMod),
+			wantErr: []string{`"goreleaser" has no version`},
 		},
 		{
 			name:    "tool listed twice",
@@ -168,6 +186,36 @@ func TestCheckKeys(t *testing.T) {
 		{
 			name:  "equal",
 			files: map[string]string{"deploy/install.sh": goodScript, "deploy/keys/allowed_signers": signers},
+		},
+		{
+			// A Git for Windows checkout (core.autocrlf=true) has CRLF line ends in both files.
+			name: "equal with CRLF line ends",
+			files: map[string]string{
+				"deploy/install.sh":           crlf(goodScript),
+				"deploy/keys/allowed_signers": crlf(signers),
+			},
+		},
+		{
+			name: "only the script has CRLF line ends",
+			files: map[string]string{
+				"deploy/install.sh":           crlf(goodScript),
+				"deploy/keys/allowed_signers": signers,
+			},
+		},
+		{
+			name: "only the key file has CRLF line ends",
+			files: map[string]string{
+				"deploy/install.sh":           goodScript,
+				"deploy/keys/allowed_signers": crlf(signers),
+			},
+		},
+		{
+			name: "second key differs with CRLF line ends",
+			files: map[string]string{
+				"deploy/install.sh":           crlf(strings.Replace(goodScript, "AAAAtwo", "AAAAxyz", 1)),
+				"deploy/keys/allowed_signers": crlf(signers),
+			},
+			wantErr: "differs from deploy/keys/allowed_signers at line 2",
 		},
 		{
 			name: "second key differs",

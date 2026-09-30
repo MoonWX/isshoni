@@ -4,7 +4,7 @@
 //	go -C tools run ./repocheck [-root DIR] pins|keys
 //
 // pins: the Go version pinned in .tool-versions equals the toolchain directive of go.mod and of tools/go.mod, and
-// the Task and golangci-lint pins equal the versions that tools/go.mod builds into .bin/.
+// the Task, golangci-lint and shfmt pins equal the versions that tools/go.mod builds into .bin/.
 //
 // keys: the allowed-signers block embedded in deploy/install.sh equals deploy/keys/allowed_signers byte for byte.
 // While either file does not exist yet, it prints a note and succeeds.

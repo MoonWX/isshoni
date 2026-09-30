@@ -1,8 +1,10 @@
 # golangci-lint v2 (pinned in tools/go.mod and .tool-versions). Run it through `task lint:go`.
 # Linters and formatters: docs/m1/06-deploy-and-ci.md §8.2. The depguard rules encode the import table of
-# docs/m1/04-server-platform.md §2, the single source for which package of this repository may import which:
-# change that table first, then the rules here. The rules cover non-test files and packages of this repository only;
-# third-party modules are governed by the license gate (`task licenses`).
+# docs/m1/04-server-platform.md §2, the single source for which package of this repository may import which, plus
+# what that table leaves to 01, 02 and 03 (internal/protocol, internal/protocol/api, sfu) and the cmd/isshoni rule
+# of 02 §15.1: change those docs first, then the rules here. The rules cover packages of this repository (and
+# Prometheus for the SFU) in non-test files, unless a rule says "test files too"; third-party modules are governed
+# by the license gate (`task licenses`).
 version: "2"
 
 linters:
@@ -24,12 +26,24 @@ linters:
   settings:
     depguard:
       rules:
-        protocol:
+        protocol: # test files too (06 §8.2)
           list-mode: lax
-          files: ["**/internal/protocol/*.go", "**/internal/protocol/**/*.go", "!$test"]
+          files: ["**/internal/protocol/*.go", "**/internal/protocol/**/*.go"]
           deny:
             - pkg: github.com/MoonWX/isshoni/internal/server
               desc: internal/protocol must not import internal/server/... (06 §8.2)
+        protocol-stdlib:
+          list-mode: lax
+          files: ["**/internal/protocol/*.go", "!$test"]
+          deny:
+            - pkg: github.com/MoonWX/isshoni
+              desc: internal/protocol imports only the standard library (01 D12, §15.1)
+        protocol-api:
+          list-mode: lax
+          files: ["**/internal/protocol/api/*.go", "!$test"]
+          deny:
+            - pkg: github.com/MoonWX/isshoni
+              desc: internal/protocol/api imports only the standard library (03 §2.1)
         version:
           list-mode: lax
           files: ["**/internal/version/*.go", "!$test"]
@@ -126,6 +140,24 @@ linters:
           files: ["**/internal/server/push/*.go", "!$test"]
           allow: *opsImports
           deny: *opsDeny
+        sfu:
+          list-mode: lax
+          files: ["**/internal/server/sfu/*.go", "**/internal/server/sfu/**/*.go", "!$test"]
+          deny:
+            - pkg: github.com/MoonWX/isshoni/internal/protocol
+              desc: sfu and sfutest never import internal/protocol (or its api); 01's sfuplane translates (02 §2)
+            - pkg: github.com/MoonWX/isshoni/internal/server/signal
+              desc: sfu and sfutest never import signal; signal drives the SFU through 01's sfuplane (02 §2)
+            - pkg: github.com/MoonWX/isshoni/internal/server/sfuplane
+              desc: sfu and sfutest never import sfuplane, the adapter that imports sfu (02 §2)
+            - pkg: github.com/prometheus
+              desc: the SFU does not import Prometheus; 04 adapts sfu.Metrics (02 §4, §13)
+        cmd: # test files too
+          list-mode: lax
+          files: ["**/cmd/isshoni/*.go", "**/cmd/isshoni/**/*.go"]
+          deny:
+            - pkg: github.com/MoonWX/isshoni/internal/media/fake
+              desc: internal/media/fake is test code that no release artifact contains; cmd/isshoni never imports it (02 §15.1)
         config-importers:
           list-mode: lax
           files:
@@ -157,12 +189,6 @@ linters:
         - pattern: \.SetNAT1To1IPs$
           msg: use SettingEngine.SetICEAddressRewriteRules (docs/PLAN.md)
 
-    gosec:
-      excludes:
-        # Integer conversions that may overflow: RTP and RTCP code converts between widths on purpose, because
-        # sequence numbers and timestamps wrap by design.
-        - G115
-
   exclusions:
     presets:
       - std-error-handling
@@ -171,6 +197,11 @@ linters:
       - linters: [forbidigo]
         path-except: ^internal/server/
         text: internal/server logs through log/slog
+      # G115 (an integer conversion may overflow) is off only for the media code: RTP and RTCP code converts between
+      # widths on purpose, because sequence numbers and timestamps wrap by design. It stays on everywhere else.
+      - linters: [gosec]
+        path: ^internal/(server/sfu|media|client/publish)/
+        text: G115
 
 issues:
   max-issues-per-linter: 0

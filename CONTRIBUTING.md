@@ -22,9 +22,9 @@ go -C tools build -o ../.bin/ github.com/go-task/task/v3/cmd/task
 .bin/task setup
 ```
 
-`task setup` builds the other pinned Go tools into `.bin/` too (golangci-lint, tygo, go-licenses, govulncheck). The
-shell and workflow linters (shellcheck, shfmt, actionlint) and goreleaser then come from your package manager, at the
-versions in `.tool-versions`.
+`task setup` builds the other pinned Go tools into `.bin/` too (golangci-lint, tygo, go-licenses, govulncheck,
+shfmt), and the tasks run them from there. ShellCheck, actionlint and goreleaser then come from your package manager,
+at the versions in `.tool-versions`; only `task lint:sh`, `task lint:actions` and `task release:snapshot` need them.
 
 Dev notes:
 - The dev server runs in `tls.mode = "off"` with `deploy/dev/isshoni.dev.toml`; its data lives in `.dev/`
@@ -46,7 +46,7 @@ Dev notes:
 | `task test` | every test suite (Go with the race detector, Vitest, install.sh) |
 | `task build` | `bin/isshoni` with the web app embedded; `task build:go` alone needs `web/dist/index.html` |
 | `task e2e` | Playwright end-to-end tests against the built binary (run `task setup:e2e` once first) |
-| `task clean` | remove build output, `.bin/` and `.dev/` |
+| `task clean` | remove build output, `.dev/` and the pinned tools in `.bin/` except `task` (`task tools` builds them again) |
 
 Tasks run through Task's built-in POSIX shell, so they work on macOS, Linux and Windows. `lint:unit`, `test:sh`,
 `deploy:test` and `docker:smoke` need Linux (or containers). A task whose inputs do not exist yet prints a note and
@@ -77,8 +77,9 @@ protocol version, changes are additive only (`docs/m1/01-protocol.md` §14).
 
 **Tool versions.** `.tool-versions` (read by mise and asdf) pins Go, Node, Task and the linters. `go.mod` has the
 language version (`go 1.26`) and the Go toolchain (`toolchain go<the .tool-versions pin>`); CI reads the Go version from
-`go.mod`. `tools/go.mod` pins the Go tools that `task tools` builds into `.bin/`, and holds our own tool programs in
-`tools/<name>/`. `task lint:pins` fails when these pins disagree, so bump them together, in one pull request.
+`go.mod`. `tools/go.mod` pins the Go tools that `task tools` builds into `.bin/` (Task, golangci-lint and shfmt at the
+`.tool-versions` versions), and holds our own tool programs in `tools/<name>/`. `task lint:pins` fails when these pins
+disagree, so bump them together, in one pull request.
 
 **Spikes.** `spikes/` holds throwaway experiments from the prototype phase, each with its own `go.mod` and a README
 of results. They are not part of the main module, CI does not build or test them, and nothing ships from them.
