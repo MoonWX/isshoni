@@ -57,6 +57,10 @@ const extraRows: [fmtp: string, want: string][] = [
   ['packetization-mode;profile-level-id=42e01f', ''],
   ['packetization-mode=01;profile-level-id=42e01f', ''],
   ['packetization-mode=1;profile-level-id=+42e01', ''],
+  // White space is Go's (unicode.IsSpace), not String.prototype.trim's: U+0085 is trimmed, U+FEFF is not.
+  ['packetization-mode=1\u0085;\u2003profile-level-id=42e01f\u3000', constrainedBaseline],
+  ['\uFEFFpacketization-mode=1;profile-level-id=42e01f', ''],
+  ['packetization-mode=1;profile-level-id=42e01f\uFEFF', ''],
 ];
 
 /** The Node built-ins readRepoFile needs, typed here: the app's tsconfig has no Node types. */
@@ -88,6 +92,7 @@ function readRepoFile(fromHere: string): string {
 /**
  * The rows of Go's TestParseH264CodecKey, {"<fmtp>", <CodecH264… constant or "">}. The fmtp is a Go string literal
  * that JSON.parse reads; each constant resolves through types.gen.ts, which tygo generates from the same Go consts.
+ * It throws when a row (a line starting with two tabs and "{") has another form, so no row is skipped silently.
  */
 function parseGoTable(src: string): [string, string][] {
   const start = src.indexOf('func TestParseH264CodecKey(');
@@ -95,16 +100,21 @@ function parseGoTable(src: string): [string, string][] {
     throw new Error('TestParseH264CodecKey not found');
   }
   const end = src.indexOf('\nfunc ', start + 1);
+  const body = src.slice(start, end < 0 ? undefined : end);
   const consts = types as unknown as Record<string, unknown>;
   const rows: [string, string][] = [];
-  for (const [, fmtp = '', want = ''] of src
-    .slice(start, end < 0 ? undefined : end)
-    .matchAll(/\{("(?:[^"\\]|\\.)*"),\s*(\w+|"")\}/g)) {
+  for (const [, fmtp = '', want = ''] of body.matchAll(/\{("(?:[^"\\]|\\.)*"),\s*(\w+|"")\}/g)) {
     const value = want === '""' ? '' : consts[want];
     if (typeof value !== 'string') {
       throw new Error(`${want} is not a string constant of types.gen.ts`);
     }
     rows.push([JSON.parse(fmtp) as string, value]);
+  }
+  const starts = body.match(/^\t\t\{/gm)?.length ?? 0;
+  if (starts !== rows.length) {
+    throw new Error(
+      `parsed ${String(rows.length)} of ${String(starts)} rows of TestParseH264CodecKey: extend parseGoTable`,
+    );
   }
   return rows;
 }
@@ -256,11 +266,14 @@ describe('detectCaps', () => {
   });
 
   it(`never lists more than MaxCodecs (${String(types.MaxCodecs)}) keys, which the server would reject`, () => {
-    const many = Array.from({ length: 50 }, (_, i) => h264(`64${i.toString(16).padStart(2, '0')}1f`));
+    const profile = (i: number) => `64${i.toString(16).padStart(2, '0')}`;
+    const many = Array.from({ length: 50 }, (_, i) => h264(`${profile(i)}1f`));
     stubSide('RTCRtpReceiver', { video: many, audio: chromeAudio });
-    const { decode } = detectCaps();
-    expect(decode).toHaveLength(types.MaxCodecs);
-    expect(new Set(decode).size).toBe(types.MaxCodecs);
-    expect(decode[0]).toBe('h264/6400');
+    stubSide('RTCRtpSender', { video: many });
+    const first = Array.from({ length: types.MaxCodecs }, (_, i) => `h264/${profile(i)}`);
+    const { decode, encode } = detectCaps();
+    // The last H.264 profiles give way, never opus; without Opus every slot is H.264.
+    expect(decode).toStrictEqual([...first.slice(0, -1), types.CodecOpus]);
+    expect(encode).toStrictEqual(first);
   });
 });

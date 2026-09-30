@@ -15,7 +15,8 @@ import (
 var committedFile = filepath.Join("..", "..", "..", "..", "web", "src", "protocol", "registry.gen.ts")
 
 // TestCommittedFileIsCurrent is the registry half of `task gen:check` inside `go test`: a Registry change without
-// `task gen` fails here too.
+// `task gen` fails here too. Line endings do not count: a checkout with core.autocrlf (Git for Windows' default) has
+// CRLF where the generator writes LF, and git diff, so `task gen:check`, ignores that as well.
 func TestCommittedFileIsCurrent(t *testing.T) {
 	want, err := Generate(protocol.Registry)
 	if err != nil {
@@ -25,6 +26,7 @@ func TestCommittedFileIsCurrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	got = bytes.ReplaceAll(got, []byte("\r\n"), []byte("\n"))
 	if !bytes.Equal(got, want) {
 		t.Errorf("%s is not what the generator writes for protocol.Registry: run task gen and commit the result",
 			committedFile)
@@ -60,7 +62,8 @@ func TestGenerateRegistry(t *testing.T) {
 		// requests: payload, result, reply
 		"  hello: { data: P.Hello; result: P.Welcome; reply: 'welcome' };\n",
 		"  'room.join': { data: P.RoomJoin; result: P.RoomJoinResult; reply: 'ok' };\n",
-		"  'room.leave': { data: P.Empty; result: P.Empty; reply: 'ok' };\n",
+		"  'room.leave': { data: Record<string, never>; result: Record<string, never>; reply: 'ok' };\n",
+		"  /** Roles: full, publisher, agent. */\n  'share.stop': { data: P.ShareStop; result: Record<string, never>; reply: 'ok' };\n",
 		"  /** Roles: full, publisher, agent. */\n  'share.start': { data: P.ShareStart; result: P.ShareParams; reply: 'ok' };\n",
 		"  /** Feature agent.relay. */\n  'agent.send': { data: P.AgentSend; result: P.AgentSendResult; reply: 'ok' };\n",
 		// notifications and server messages; stats has a payload per direction
@@ -68,7 +71,7 @@ func TestGenerateRegistry(t *testing.T) {
 		"  stats: P.ClientStats;\n",
 		"  stats: P.ServerStats;\n",
 		"  'pc.close': P.PCClose;\n",
-		"  ok: P.RoomJoinResult | P.Empty | P.ShareParams | P.SubscribeResult | P.AgentSendResult;\n",
+		"  ok: P.RoomJoinResult | Record<string, never> | P.ShareParams | P.SubscribeResult | P.AgentSendResult;\n",
 		"  error: P.Error;\n",
 		"  /** Milestone M2. Feature user.connections. */\n  'user.connections': P.UserConnections;\n",
 		// runtime values
@@ -80,6 +83,10 @@ func TestGenerateRegistry(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("output lacks %q", want)
 		}
+	}
+	// protocol.Empty is only {}: tygo's `interface Empty {}` would accept any value.
+	if strings.Contains(out, "P.Empty") {
+		t.Error("output uses P.Empty, not Record<string, never>")
 	}
 	// pc.close is client->server only; pc.offer goes both ways.
 	if n := strings.Count(out, "  'pc.close': P.PCClose;\n"); n != 1 {
@@ -171,7 +178,7 @@ func TestGenerateSmallRegistry(t *testing.T) {
 	}
 	out := string(src)
 	for _, want := range []string{
-		"  /** Since protocol version 2. Roles: viewer. */\n  'x.do': { data: P.Empty; result: P.Pong; reply: 'done' };\n",
+		"  /** Since protocol version 2. Roles: viewer. */\n  'x.do': { data: Record<string, never>; result: P.Pong; reply: 'done' };\n",
 		"export interface ClientNotifications {\n}\n",
 		"  done: P.Pong;\n  news: P.Invalidate;\n",
 		"export const clientNotificationTypes = [] as const satisfies readonly P.MessageType[];\n",

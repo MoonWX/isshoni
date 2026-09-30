@@ -6,6 +6,13 @@ import { CodecOpus, MaxCodecs, type Caps, type CodecKey } from './types.gen';
 const h264Prefix = 'h264/';
 const hex6 = /^[0-9a-f]{6}$/i;
 
+/** A run of white space as Go's unicode.IsSpace sees it: String.prototype.trim keeps U+0085 and strips U+FEFF. */
+const goSpace = String.raw`[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+`;
+const goTrim = new RegExp(`^${goSpace}|${goSpace}$`, 'g');
+
+/** Go's strings.TrimSpace. */
+const trimSpace = (s: string) => s.replace(goTrim, '');
+
 /**
  * Maps an H.264 fmtp line to its CodecKey: "h264/" and the first 4 hex digits of profile-level-id in lowercase
  * (profile_idc and the constraint byte; the level is ignored, so Chrome's High 640034 is "h264/6400"). It returns ""
@@ -23,8 +30,8 @@ export function h264Key(fmtp: string): CodecKey {
   let profile = '';
   for (const param of params.split(';')) {
     const eq = param.indexOf('=');
-    const name = (eq < 0 ? param : param.slice(0, eq)).trim().toLowerCase();
-    const value = eq < 0 ? '' : param.slice(eq + 1).trim();
+    const name = trimSpace(eq < 0 ? param : param.slice(0, eq)).toLowerCase();
+    const value = eq < 0 ? '' : trimSpace(param.slice(eq + 1));
     if (name === 'packetization-mode') {
       mode1 = value === '1';
     } else if (name === 'profile-level-id') {
@@ -62,20 +69,22 @@ function codecsOf(source: CapabilitiesSource | undefined, kind: 'audio' | 'video
 /**
  * The CodecKeys of one side (receiver: decode, sender: encode): every H.264 profile with packetization-mode=1 in the
  * browser's order, each once, then "opus" when the browser has Opus. At most MaxCodecs entries (the server rejects
- * longer lists).
+ * longer lists): the last H.264 profiles give way, never opus, so a long video list cannot cost the audio.
  */
 function codecKeys(source: CapabilitiesSource | undefined): CodecKey[] {
-  const keys = new Set<CodecKey>();
+  const video = new Set<CodecKey>();
   for (const c of codecsOf(source, 'video')) {
     const key = c.mimeType.toLowerCase() === 'video/h264' ? h264Key(c.sdpFmtpLine ?? '') : '';
     if (key !== '') {
-      keys.add(key);
+      video.add(key);
     }
   }
-  if (codecsOf(source, 'audio').some((c) => c.mimeType.toLowerCase() === 'audio/opus')) {
-    keys.add(CodecOpus);
+  const hasOpus = codecsOf(source, 'audio').some((c) => c.mimeType.toLowerCase() === 'audio/opus');
+  const keys = [...video].slice(0, hasOpus ? MaxCodecs - 1 : MaxCodecs);
+  if (hasOpus) {
+    keys.push(CodecOpus);
   }
-  return [...keys].slice(0, MaxCodecs);
+  return keys;
 }
 
 /**

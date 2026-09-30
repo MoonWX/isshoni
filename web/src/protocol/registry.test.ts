@@ -153,6 +153,20 @@ describe('generated types', () => {
     expectTypeOf<ClientRequests['share.start']['result']>().toEqualTypeOf<types.ShareParams>();
   });
 
+  it('accept only {} for a payload without fields (protocol.Empty)', () => {
+    // tygo's `interface Empty {}` would accept anything but null and undefined.
+    expectTypeOf<ClientRequests['room.leave']>().toEqualTypeOf<{
+      data: Record<string, never>;
+      result: Record<string, never>;
+      reply: 'ok';
+    }>();
+    expectTypeOf({}).toExtend<ClientRequests['room.leave']['data']>();
+    expectTypeOf<string>().not.toExtend<ClientRequests['room.leave']['data']>();
+    expectTypeOf<{ roomId: string }>().not.toExtend<ClientRequests['room.leave']['data']>();
+    expectTypeOf<ClientRequests['share.stop']['result']>().toEqualTypeOf<Record<string, never>>();
+    expectTypeOf<ClientRequests['stats.watch']['result']>().toEqualTypeOf<Record<string, never>>();
+  });
+
   it('map notifications and server messages to their payloads, per direction', () => {
     expectTypeOf<ClientNotifications['stats']>().toEqualTypeOf<types.ClientStats>();
     expectTypeOf<ServerMessages['stats']>().toEqualTypeOf<types.ServerStats>();
@@ -163,6 +177,9 @@ describe('generated types', () => {
     expectTypeOf<ServerMessages['welcome']>().toEqualTypeOf<types.Welcome>();
     expectTypeOf<types.RoomJoinResult>().toExtend<ServerMessages['ok']>();
     expectTypeOf<types.AgentSendResult>().toExtend<ServerMessages['ok']>();
+    expectTypeOf<ClientRequests['room.leave']['result']>().toExtend<ServerMessages['ok']>();
+    expectTypeOf<string>().not.toExtend<ServerMessages['ok']>();
+    expectTypeOf<types.Welcome>().not.toExtend<ServerMessages['ok']>(); // welcome is hello's reply, not an ok
   });
 
   it('discriminate envelopes by type', () => {
