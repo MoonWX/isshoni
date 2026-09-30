@@ -224,10 +224,10 @@ func (c *conn) onPing(env protocol.Envelope) {
 
 // onRoomJoin handles room.join (01 §8.4). The room must exist (GetRoom; a malformed id also gets room_not_found)
 // and the user may join it (CanJoin, else forbidden). Joining the connection's own room again replies ok and resends
-// room.state. Otherwise the connection attaches to the room's participant for its user (room_full when a new
-// participant would pass Policy().MaxRoomParticipants; room_not_found when CloseRoom got there first), leaves its
-// previous room (its shares there end with left) and gets a new MediaPeer. The ok carries the room and is followed
-// at once by a room.state for this connection alone.
+// room.state, and the room's name for Snapshot becomes the one GetRoom just read. Otherwise the connection attaches
+// to the room's participant for its user (room_full when a new participant would pass Policy().MaxRoomParticipants;
+// room_not_found when CloseRoom got there first), leaves its previous room (its shares there end with left) and gets
+// a new MediaPeer. The ok carries the room and is followed at once by a room.state for this connection alone.
 func (c *conn) onRoomJoin(env protocol.Envelope) {
 	v, ok := decode[protocol.RoomJoin](c, env)
 	if !ok {
@@ -239,7 +239,8 @@ func (c *conn) onRoomJoin(env protocol.Envelope) {
 		return
 	}
 	res := protocol.RoomJoinResult{Room: protocol.RoomInfo{ID: v.RoomID, Name: info.Name}}
-	if c.room != nil && c.room.id == v.RoomID {
+	if r := c.room; r != nil && r.id == v.RoomID {
+		r.setName(info.Name)
 		c.reply(env, res)
 		c.sendStateNow()
 		return

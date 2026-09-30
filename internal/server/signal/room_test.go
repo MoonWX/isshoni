@@ -2,6 +2,8 @@ package signal_test
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -618,6 +620,56 @@ func TestRoomLeaveReasons(t *testing.T) {
 	})
 }
 
+// Shutdown with people in a room (01 §4.2, 04 §6.4): each connection's shares end with server_shutdown at its
+// MediaPeer, which closes; the room goes with its last participant, and a room.state that is still scheduled doesn't
+// hold Shutdown up.
+func TestRoomShutdown(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newEnv(t)
+		defer e.close()
+		cookieA, a := e.user(false)
+		cookieB, b := e.user(false)
+		ca, wa := e.connect(cookieA, signaltest.DefaultHello())
+		cb, wb := e.connect(cookieB, signaltest.DefaultHello())
+		join(t, ca, "lounge")
+		join(t, cb, "lounge")
+		settle()
+		shareA := protocol.ShareInfo{ID: "s_aaaaaaaaaaaaaaaa", UserID: a.UserID, ConnectionID: wa.ConnectionID,
+			Kind: protocol.ShareKindScreen, Preset: protocol.PresetAuto, Status: protocol.ShareStatusLive,
+			StartedAt: time.Now()}
+		signal.AddShare(e.hub, "lounge", shareA) // its snapshot goes out at once
+		e.hub.UpdateUser(b.UserID, "bea", false) // this one is scheduled 200 ms later
+		synctest.Wait()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		start := time.Now()
+		if err := e.hub.Shutdown(ctx, protocol.ShutdownReasonRestart); err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+		if d := time.Since(start); d != 0 {
+			t.Errorf("Shutdown took %v, want no wait for the scheduled room.state", d)
+		}
+		calls := e.media.Peer(wa.ConnectionID).Calls()
+		if len(calls) != 2 || calls[0].Method != "EndShare" || calls[0].Args[0] != shareA.ID ||
+			calls[0].Args[1] != protocol.EndReasonServerShutdown || calls[1].Method != "Close" {
+			t.Errorf("A's peer calls %+v, want EndShare(%s, server_shutdown), Close", calls, shareA.ID)
+		}
+		if !e.media.Peer(wb.ConnectionID).Closed() {
+			t.Error("B's peer not closed")
+		}
+		if snap := e.hub.Snapshot(); len(snap.Rooms) != 0 {
+			t.Errorf("snapshot %+v, want no rooms", snap)
+		}
+		if r, n := e.metric("isshoni_rooms"), e.metric("isshoni_participants"); r != 0 || n != 0 {
+			t.Errorf("rooms %v, participants %v; want 0, 0", r, n)
+		}
+		for _, c := range []*signaltest.Client{ca, cb} {
+			expectClose(t, c, protocol.CloseCodeServiceRestart)
+		}
+	})
+}
+
 // CloseRoom (01 §15.2, §19): room_closed (scope room, with the room id) to that room's connections only; their
 // shares end with room_closed and their MediaPeers close; no room.state or room.event follows; the room is gone from
 // the snapshot, and joining it again gets room_not_found for the rest of the process.
@@ -649,8 +701,16 @@ func TestCloseRoom(t *testing.T) {
 			t.Fatalf("snapshot %+v", snap)
 		}
 
+		// Two renames: the first snapshot goes out at once, the second is still scheduled when CloseRoom comes, and
+		// never goes out.
+		e.hub.UpdateUser(b.UserID, "bea1", false)
+		e.hub.UpdateUser(b.UserID, "bea2", false)
+		synctest.Wait()
 		e.hub.CloseRoom(room1.ID)
 		for _, c := range []*signaltest.Client{ca, cb} {
+			if st := expectState(t, c, room1.ID); st.Participants[1].Name != "bea1" {
+				t.Errorf("names %+v, want the first rename", st.Participants)
+			}
 			pe, re := expectError(t, c, protocol.ErrorCodeRoomClosed, protocol.ErrorScopeRoom)
 			if pe.RoomID != room1.ID || re != "" || pe.Retryable {
 				t.Errorf("room_closed %+v re %q", pe, re)
@@ -800,24 +860,59 @@ func TestRoomSwitch(t *testing.T) {
 		old.Sink().Error(protocol.NewError(protocol.ErrorCodeSDPInvalid, protocol.ErrorScopePC))
 		synctest.Wait()
 		expectOpen(t, ca)
+		// The SFU may reuse its slices, maps and pointers once a call returns: what goes out is the value of the call.
 		sink := cur.Sink()
-		sink.Offer(protocol.PCOffer{PC: protocol.PCKindSub, Gen: 1, Neg: 1, SDP: signaltest.FakeSDP,
-			Tracks: []protocol.TrackRef{}})
-		sink.ICE(protocol.PCICE{PC: protocol.PCKindSub, Gen: 1})
+		tracks := []protocol.TrackRef{{MID: "0", ShareID: "s_x", Kind: protocol.TrackKindVideo}}
+		sink.Offer(protocol.PCOffer{PC: protocol.PCKindSub, Gen: 1, Neg: 1, SDP: signaltest.FakeSDP, Tracks: tracks})
+		tracks[0].ShareID = "s_reused"
+		cand := &protocol.ICECandidate{Candidate: "candidate:x"}
+		sink.ICE(protocol.PCICE{PC: protocol.PCKindSub, Gen: 1, Candidate: cand})
+		cand.Candidate = "reused"
 		sink.RestartRequest(protocol.PCRestart{PC: protocol.PCKindPub, Gen: 1, Mode: protocol.RestartModeRebuild,
 			Reason: protocol.RestartReasonFailed})
-		sink.SubscriptionStatus([]protocol.SubscriptionStatus{{ShareID: "s_x", Video: protocol.VideoLayerLow,
-			Audio: protocol.AudioStateOn, RequestedVideo: protocol.VideoLayerHigh, Reason: protocol.StatusReasonBandwidth}})
-		sink.QualityHint(protocol.QualityHint{ShareID: "s_x", Reason: protocol.HintReasonViewers})
-		sink.Error(protocol.NewError(protocol.ErrorCodeSDPInvalid, protocol.ErrorScopePC))
+		subs := []protocol.SubscriptionStatus{{ShareID: "s_x", Video: protocol.VideoLayerLow,
+			Audio: protocol.AudioStateOn, RequestedVideo: protocol.VideoLayerHigh, Reason: protocol.StatusReasonBandwidth}}
+		sink.SubscriptionStatus(subs)
+		subs[0].ShareID = "s_reused"
+		encs := []protocol.Encoding{{RID: protocol.RIDHigh, Layer: protocol.VideoLayerHigh, Active: true}}
+		sink.QualityHint(protocol.QualityHint{ShareID: "s_x", Reason: protocol.HintReasonViewers, Encodings: encs})
+		encs[0].Active = false
+		pcErr := protocol.NewError(protocol.ErrorCodeSDPInvalid, protocol.ErrorScopePC)
+		pcErr.Params = map[string]any{"reason": "x"}
+		sink.Error(pcErr)
+		pcErr.Params["reason"] = "reused"
 		sink.ShareMedia("s_x", signal.ShareMediaEvent{Kind: signal.ShareMediaLive})
-		for _, typ := range []protocol.MessageType{protocol.MessageTypePCOffer, protocol.MessageTypePCICE,
-			protocol.MessageTypePCRestart, protocol.MessageTypeSubscribeStatus, protocol.MessageTypeQualityHint,
-			protocol.MessageTypeError} {
-			expectType(t, ca, typ)
+		var offer protocol.PCOffer
+		var ice protocol.PCICE
+		var status protocol.SubscribeStatus
+		var hint protocol.QualityHint
+		var gotErr protocol.Error
+		for _, m := range []struct {
+			typ protocol.MessageType
+			v   any // nil: not checked
+		}{
+			{protocol.MessageTypePCOffer, &offer}, {protocol.MessageTypePCICE, &ice}, {protocol.MessageTypePCRestart, nil},
+			{protocol.MessageTypeSubscribeStatus, &status}, {protocol.MessageTypeQualityHint, &hint},
+			{protocol.MessageTypeError, &gotErr},
+		} {
+			env := expectType(t, ca, m.typ)
+			if m.v != nil {
+				if err := json.Unmarshal(env.Data, m.v); err != nil {
+					t.Fatalf("%s: %v", m.typ, err)
+				}
+			}
+		}
+		if len(offer.Tracks) != 1 || offer.Tracks[0].ShareID != "s_x" || ice.Candidate == nil ||
+			ice.Candidate.Candidate == "reused" || len(status.Subs) != 1 || status.Subs[0].ShareID != "s_x" ||
+			len(hint.Encodings) != 1 || !hint.Encodings[0].Active || gotErr.Params["reason"] != "x" {
+			t.Errorf("sent %+v, %+v, %+v, %+v, %+v: want the values at the time of the calls",
+				offer.Tracks, ice.Candidate, status.Subs, hint.Encodings, gotErr.Params)
 		}
 		synctest.Wait()
 		expectOpen(t, ca)
+		if got := e.metric("isshoni_ws_errors_total", "code", string(protocol.ErrorCodeSDPInvalid)); got != 1 {
+			t.Errorf("errors sent (sdp_invalid) %v, want 1", got)
+		}
 		if e.logs.count("level=WARN", "share media event not handled", "share_id=s_x") != 1 {
 			t.Errorf("no WARN line for ShareMedia:\n%s", e.logs)
 		}
@@ -919,12 +1014,22 @@ func TestSnapshot(t *testing.T) {
 			c2.LastStats.IntervalMs != 10000 {
 			t.Errorf("connection 2 %+v", c2)
 		}
+		// shareA has no layers yet: still [], not nil.
 		if len(lounge.Shares) != 1 || lounge.Shares[0].Info.ID != shareA.ID || lounge.Shares[0].Info.Watchers == nil ||
-			len(lounge.Shares[0].Info.Watchers) != 0 || lounge.Shares[0].Layers == nil {
+			len(lounge.Shares[0].Info.Watchers) != 0 || lounge.Shares[0].Info.Layers == nil ||
+			len(lounge.Shares[0].Info.Layers) != 0 || lounge.Shares[0].Layers == nil {
 			t.Errorf("lounge shares %+v", lounge.Shares)
 		}
 		if r := snap.Rooms[1]; len(r.Participants) != 1 || r.Participants[0].UserID != b.UserID || r.Shares == nil {
 			t.Errorf("room1 %+v", r)
+		}
+
+		// A rename in the directory reaches the snapshot with the next room.join, the same room's included.
+		renamed := protocol.RoomInfo{ID: room1.ID, Name: "Film night"}
+		e.rooms.Add(renamed)
+		join(t, cb, room1.ID)
+		if snap := e.hub.Snapshot(); len(snap.Rooms) != 2 || snap.Rooms[1].Name != renamed.Name {
+			t.Errorf("rooms %+v after a re-join, want room1 named %q", snap.Rooms, renamed.Name)
 		}
 	})
 }

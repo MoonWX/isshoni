@@ -112,7 +112,8 @@ type MediaPeer interface {
 	Close() // closes both PCs; the hub has already ended the peer's shares
 }
 
-// MediaSink receives a peer's events. Implementations never block.
+// MediaSink receives a peer's events. Implementations never block, and they copy whatever they keep of a call's
+// arguments before returning, so the caller may reuse its slices, maps and pointers once a call returns.
 type MediaSink interface {
 	Offer(o protocol.PCOffer) // sub PC offers
 	ICE(c protocol.PCICE)

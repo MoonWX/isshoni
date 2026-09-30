@@ -1,6 +1,7 @@
 package signaltest
 
 import (
+	"maps"
 	"slices"
 	"sync"
 
@@ -30,7 +31,9 @@ type ShareMediaCall struct {
 	Event   signal.ShareMediaEvent
 }
 
-// Sink is a fake signal.MediaSink that records every event, for tests of MediaPlane implementations (sfuplane).
+// Sink is a fake signal.MediaSink that records every event, for tests of MediaPlane implementations (sfuplane). As the
+// MediaSink contract says, it copies the slices, maps and pointers of each argument, so a recorded event keeps the
+// value of its call when the caller reuses them.
 type Sink struct {
 	mu     sync.Mutex
 	events []Event
@@ -50,10 +53,21 @@ func (s *Sink) Events() []Event {
 }
 
 // Offer implements signal.MediaSink.
-func (s *Sink) Offer(o protocol.PCOffer) { s.record("Offer", o) }
+func (s *Sink) Offer(o protocol.PCOffer) {
+	o.Tracks = slices.Clone(o.Tracks)
+	s.record("Offer", o)
+}
 
 // ICE implements signal.MediaSink.
-func (s *Sink) ICE(c protocol.PCICE) { s.record("ICE", c) }
+func (s *Sink) ICE(c protocol.PCICE) {
+	if c.Candidate != nil {
+		cand := *c.Candidate
+		cand.SDPMid, cand.SDPMLineIndex = clonePtr(cand.SDPMid), clonePtr(cand.SDPMLineIndex)
+		cand.UsernameFragment = clonePtr(cand.UsernameFragment)
+		c.Candidate = &cand
+	}
+	s.record("ICE", c)
+}
 
 // RestartRequest implements signal.MediaSink.
 func (s *Sink) RestartRequest(r protocol.PCRestart) { s.record("RestartRequest", r) }
@@ -64,12 +78,28 @@ func (s *Sink) SubscriptionStatus(st []protocol.SubscriptionStatus) {
 }
 
 // QualityHint implements signal.MediaSink.
-func (s *Sink) QualityHint(h protocol.QualityHint) { s.record("QualityHint", h) }
+func (s *Sink) QualityHint(h protocol.QualityHint) {
+	h.Encodings = slices.Clone(h.Encodings)
+	s.record("QualityHint", h)
+}
 
 // ShareMedia implements signal.MediaSink.
 func (s *Sink) ShareMedia(shareID string, ev signal.ShareMediaEvent) {
+	ev.Layers = slices.Clone(ev.Layers)
 	s.record("ShareMedia", ShareMediaCall{ShareID: shareID, Event: ev})
 }
 
 // Error implements signal.MediaSink.
-func (s *Sink) Error(e protocol.Error) { s.record("Error", e) }
+func (s *Sink) Error(e protocol.Error) {
+	e.Params = maps.Clone(e.Params)
+	s.record("Error", e)
+}
+
+// clonePtr returns a pointer to a copy of *p, or nil.
+func clonePtr[T any](p *T) *T {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}

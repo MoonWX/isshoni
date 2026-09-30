@@ -24,8 +24,11 @@ type room struct {
 	h  *Hub
 	id string
 
-	mu           sync.Mutex
-	name         string                  // from the latest join's GetRoom, for Snapshot (room.state has no name)
+	mu sync.Mutex
+	// name is the name the room's latest room.join read with GetRoom, for Snapshot only (room.state has no name). It
+	// can be stale after a rename (03 §8), which has no hook. Everything else reads the name with GetRoom when it
+	// needs one: PushShareStarted.RoomName (README S40) never comes from here ("the hub never caches room names").
+	name         string
 	participants map[string]*participant // by user id
 	shares       map[string]*share       // by share id; share.start adds them (README S40)
 	rev          uint64                  // the rev of the current state (Hub.nextRev)
@@ -217,10 +220,11 @@ func (r *room) stateLocked() protocol.RoomState {
 	return st
 }
 
-// shareInfo returns what room.state shows about the share, with its watchers among parts (sorted participants).
+// shareInfo returns what room.state shows about the share, with its watchers among parts (sorted participants). Its
+// slices are its own and never nil (Snapshot); slices.Clone would keep a nil Layers nil.
 func (s *share) shareInfo(parts []*participant) protocol.ShareInfo {
 	si := s.info
-	si.Layers = slices.Clone(si.Layers)
+	si.Layers = append([]protocol.VideoLayer{}, si.Layers...)
 	si.Watchers = watchers(s, parts)
 	return si
 }
@@ -333,6 +337,13 @@ func (r *room) endShareLocked(o *outbox, s *share, reason protocol.EndReason, no
 		Reason:  reason,
 		At:      now,
 	}, nil)
+}
+
+// setName records the room's name that a room.join just read with GetRoom, for Snapshot.
+func (r *room) setName(name string) {
+	r.mu.Lock()
+	r.name = name
+	r.mu.Unlock()
 }
 
 // rename changes a participant's name (UpdateUser, Revalidate), which room.state shows.
@@ -499,6 +510,11 @@ func (r *room) liveLocked() LiveRoom {
 // connection's actor, which drops the events of a peer that is no longer the connection's (after a room.leave or a
 // join elsewhere). The server→client notifications go out as they are; README S40 adds the share lifecycle
 // (ShareMedia) and ends a share on codec_not_supported.
+//
+// A notification is encoded before it is posted, on the caller's goroutine, so the actor never reads the slices,
+// maps or pointers of the caller's value (PCOffer.Tracks, QualityHint.Encodings, PCICE.Candidate, Error.Params),
+// which the SFU may reuse once the call returns. Whatever the actor keeps of an event it handles itself
+// (ShareMediaEvent.Layers, README S40) must be copied the same way.
 type peerSink struct {
 	c   *conn
 	seq uint64 // the connection's peerSeq when the peer was created
@@ -517,7 +533,7 @@ func (s *peerSink) RestartRequest(r protocol.PCRestart) { s.forward(protocol.Mes
 
 // SubscriptionStatus implements MediaSink: subscribe.status.
 func (s *peerSink) SubscriptionStatus(st []protocol.SubscriptionStatus) {
-	s.forward(protocol.MessageTypeSubscribeStatus, protocol.SubscribeStatus{Subs: slices.Clone(st)})
+	s.forward(protocol.MessageTypeSubscribeStatus, protocol.SubscribeStatus{Subs: st})
 }
 
 // QualityHint implements MediaSink: quality.hint.
@@ -536,19 +552,26 @@ func (s *peerSink) ShareMedia(shareID string, ev ShareMediaEvent) {
 
 // Error implements MediaSink: an error with scope pc or share goes out as a notification.
 func (s *peerSink) Error(e protocol.Error) {
-	c := s.c
-	c.post(func() {
-		if c.currentPeer(s.seq) {
-			c.sendError(e, "")
-		}
-	})
+	c, code := s.c, e.Code
+	s.post(protocol.MessageTypeError, e, func() { c.h.metrics.errorSent(code) })
 }
 
-func (s *peerSink) forward(t protocol.MessageType, data any) {
+// forward sends a notification of type t with payload data.
+func (s *peerSink) forward(t protocol.MessageType, data any) { s.post(t, data, nil) }
+
+// post encodes a notification at once and posts it to the actor, which sends it while the peer is the connection's
+// current one, then calls sent (nil: nothing) when the message was queued.
+func (s *peerSink) post(t protocol.MessageType, data any, sent func()) {
 	c := s.c
+	b, err := protocol.Marshal(t, "", "", data)
+	if err != nil {
+		c.h.log.Error("encode message", slog.String("conn_id", c.id), slog.String("type", string(t)),
+			slog.Any("err", err))
+		return
+	}
 	c.post(func() {
-		if c.currentPeer(s.seq) {
-			c.send(t, "", data)
+		if c.currentPeer(s.seq) && c.sendEncoded(t, b) && sent != nil {
+			sent()
 		}
 	})
 }

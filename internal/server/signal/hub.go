@@ -512,8 +512,9 @@ func (h *Hub) CloseRoom(roomID string) {
 
 // Snapshot returns the live state for presence counts (03) and the admin dashboard (04): every room with at least
 // one participant, sorted by id, with participants and shares in room.state order. Slices are never nil. A room's
-// Name is the one its latest room.join read with GetRoom. LiveShare.Layers is empty and EgressBitrate 0 until the
-// stats forwarding of README S40 keeps each MediaPeer's Stats for the snapshot.
+// Name is the one its latest room.join read with GetRoom, so it lags a rename (03 §8) until the next join: 04's
+// dashboard adapter prefers the store's current name. LiveShare.Layers is empty and EgressBitrate 0 until the stats
+// forwarding of README S40 keeps each MediaPeer's Stats for the snapshot.
 func (h *Hub) Snapshot() LiveSnapshot {
 	h.mu.Lock()
 	rooms := make([]*room, 0, len(h.rooms))

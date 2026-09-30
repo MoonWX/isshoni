@@ -11,7 +11,8 @@ type LiveSnapshot struct {
 	Rooms []LiveRoom
 }
 
-// LiveRoom is one room with at least one participant.
+// LiveRoom is one room with at least one participant. Name is the one the room's latest room.join read with GetRoom
+// (Hub.Snapshot): it lags a rename, so readers that show it prefer the store's current name.
 type LiveRoom struct {
 	ID, Name     string
 	Participants []LiveParticipant
