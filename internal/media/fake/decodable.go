@@ -66,6 +66,13 @@ const (
 	decodableRateQ = 900_000
 )
 
+// decodableMinLevel is the lowest level_idc of a Decodable SPS: level 3.0. Frame size and macroblock rate alone put
+// the default q layer (320×180@15) at level 1.2, whose MaxBR (384 kbit/s, 460.8 kbit/s for the NAL HRD) its I_PCM
+// IDR frames exceed twice over. Level 3.0 (MaxBR 10 Mbit/s, MaxCPB 10 Mbit) holds both default layers' rates and a
+// 640×360 I_PCM IDR frame (about 2.9 Mbit), and stays within the 42e01f the SFU offers (02 §8.1). The I_PCM IDR
+// frames still break the level's MinCR, by design.
+const decodableMinLevel = 30
+
 // yuv is one colour, BT.601 limited range.
 type yuv struct{ y, cb, cr byte }
 

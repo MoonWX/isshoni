@@ -92,7 +92,8 @@ func (c *decodableCheck) check(p Packet) {
 	c.checkRTP(p, m)
 }
 
-// checkSPS parses a keyframe's SPS with the SFU's parser and with the test's reader.
+// checkSPS parses a keyframe's SPS with the SFU's parser and with the test's reader. Its level is the lowest that
+// fits the layer, but at least decodableMinLevel.
 func (c *decodableCheck) checkSPS(nal []byte) {
 	t := c.t
 	t.Helper()
@@ -100,7 +101,8 @@ func (c *decodableCheck) checkSPS(nal []byte) {
 	if err != nil {
 		t.Fatalf("%s: the SFU's parseSPS: %v", c.l.RID, err)
 	}
-	level, _ := levelFor((c.l.Width+15)/16, (c.l.Height+15)/16, c.l.FPS)
+	level, _ := levelFor((c.l.Width+15)/16, (c.l.Height+15)/16, c.l.FPS, 0)
+	level = max(level, decodableMinLevel)
 	if want := fmt.Sprintf("%s%02x", DecodableProfile, level); info.profileLevelID() != want ||
 		info.width != c.l.Width || info.height != c.l.Height {
 		t.Fatalf("%s: the SFU reads %s %dx%d, want %s %dx%d", c.l.RID, info.profileLevelID(), info.width,

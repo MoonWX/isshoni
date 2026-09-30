@@ -220,7 +220,7 @@ func TestSyntheticAU(t *testing.T) {
 				if got := sps.profileKey(); got != prof || sps.width != l.Width || sps.height != l.Height {
 					t.Fatalf("%s: SPS %+v, want %s %dx%d", p.Layer, sps, prof, l.Width, l.Height)
 				}
-				if lvl, _ := levelFor((l.Width+15)/16, (l.Height+15)/16, l.FPS); sps.level != lvl {
+				if lvl, _ := levelFor((l.Width+15)/16, (l.Height+15)/16, l.FPS, 0); sps.level != lvl {
 					t.Errorf("%s: level %d, want %d", p.Layer, sps.level, lvl)
 				}
 			}
@@ -232,14 +232,20 @@ func TestSyntheticAU(t *testing.T) {
 func TestLevels(t *testing.T) {
 	for _, tc := range []struct {
 		w, h, fps int
-		want      uint8
+		min, want uint8
 	}{
-		{1920, 1080, 60, 42}, {1920, 1080, 30, 40}, {640, 360, 15, 22}, {1280, 720, 30, 31}, {1280, 720, 60, 32},
-		{3840, 2160, 60, 52}, {320, 180, 15, 12}, {7680, 4320, 60, 61},
+		{1920, 1080, 60, 0, 42}, {1920, 1080, 30, 0, 40}, {640, 360, 15, 0, 22}, {1280, 720, 30, 0, 31},
+		{1280, 720, 60, 0, 32}, {3840, 2160, 60, 0, 52}, {320, 180, 15, 0, 12}, {7680, 4320, 60, 0, 61},
+		// Decodable's floor: raised below it, kept above it; a floor between table entries takes the next one.
+		{320, 180, 15, decodableMinLevel, 30}, {640, 360, 30, decodableMinLevel, 30},
+		{1920, 1080, 60, decodableMinLevel, 42}, {320, 180, 15, 14, 20}, {2, 2, 1, 62, 62},
 	} {
-		if got, ok := levelFor((tc.w+15)/16, (tc.h+15)/16, tc.fps); !ok || got != tc.want {
-			t.Errorf("%dx%d@%d: level %d %v, want %d", tc.w, tc.h, tc.fps, got, ok, tc.want)
+		if got, ok := levelFor((tc.w+15)/16, (tc.h+15)/16, tc.fps, tc.min); !ok || got != tc.want {
+			t.Errorf("%dx%d@%d from %d: level %d %v, want %d", tc.w, tc.h, tc.fps, tc.min, got, ok, tc.want)
 		}
+	}
+	if got, ok := levelFor(1, 1, 1, 63); ok {
+		t.Errorf("floor 63: level %d, want none", got)
 	}
 }
 

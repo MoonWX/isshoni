@@ -208,6 +208,10 @@ func New(cfg Config) (*Source, error) {
 	if cfg.FlashEvery > 0 {
 		s.flashEvery = int64(cfg.FlashEvery)
 	}
+	var minLevel uint8
+	if cfg.Mode == Decodable {
+		minLevel = decodableMinLevel
+	}
 	seen := map[string]bool{}
 	for i, l := range cfg.Layers {
 		if err := checkLayer(l, cfg.Mode); err != nil {
@@ -217,7 +221,7 @@ func New(cfg Config) (*Source, error) {
 			return nil, fmt.Errorf("%w: layer %q twice", ErrInvalidConfig, l.RID)
 		}
 		seen[l.RID] = true
-		sps, err := buildSPS(prof, l)
+		sps, err := buildSPS(prof, l, minLevel)
 		if err != nil {
 			return nil, err
 		}
