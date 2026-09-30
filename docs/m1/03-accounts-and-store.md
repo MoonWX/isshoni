@@ -135,9 +135,13 @@ All tokens come from crypto/rand and are encoded as base64url without padding.
 
 ### 3.3 Time, IPs, text
 
-- **DB**: INTEGER unix milliseconds, UTC. **JSON**: RFC 3339 UTC strings with milliseconds
-  (`2026-10-01T12:00:00.000Z`). Durations in JSON are integer seconds, with the unit implied by the name (`expiresIn`,
-  `retryAfter`).
+- **DB**: INTEGER unix milliseconds, UTC. **JSON**: RFC 3339 UTC strings with exactly three fractional digits and a
+  `Z` suffix (`2026-10-01T12:00:00.000Z`), the same fixed form as 01's signaling timestamps (01 §5): fixed width, so
+  they also sort as text, and one parser in the SPA for both. `api.WireTime` is that form; `internal/protocol/api`
+  encodes every DTO timestamp through it whatever the location and precision of the `time.Time` (the fraction is
+  truncated, not rounded), and 04's admin socket uses it for its own JSON. Readers accept any RFC 3339 form. The one
+  exception is the Web Push payload's `ts` (unix ms, 04 §14.3). Durations in JSON are integer seconds, with the unit
+  implied by the name (`expiresIn`, `retryAfter`).
 - **IPs** come only from `ClientIP(r)` (04), which honours `X-Forwarded-For` only from trusted proxy CIDRs. They are
   stored as `netip.Addr.String()`, with IPv4-mapped addresses unmapped.
 - **Text columns** hold valid UTF-8, NFC-normalized by the PRECIS profiles below. Control characters are rejected.
@@ -251,9 +255,13 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   files plus one per schema version the server has ever migrated from, which is a handful of small DB copies.
 - `db.BackupTo(ctx, path)` also uses `VACUUM INTO`, for `isshoni admin backup` (04).
 - **File-level functions** (§6), for 04's offline backup, its restore validation of archives and bare `.db` files,
-  and offline doctor's schema check. None of them migrates, creates `backups/` or writes `meta`. `InspectFile` and
-  `BackupFile` open the source read-only (`mode=ro`); `LatestSchemaVersion` opens nothing (it reads the embedded
-  migrations). `ops` may not import `store`, so `cmd/isshoni` and the wiring pass them to 04 as functions.
+  and offline doctor's schema check. None of them migrates, creates `backups/` or writes `meta`. `InspectFile` opens
+  the file read-only and immutable (`file:<path>?mode=ro&immutable=1`, as 04 §13.1 says), so it never creates
+  `-wal`/`-shm` files, even when root runs offline doctor; with a WAL left by a crash its answer may be one step old.
+  `BackupFile` opens the source `mode=ro`, plus `immutable=1` when there is no `-wal` file (after a clean shutdown), so
+  it leaves no `-wal`/`-shm` files behind either; a `-wal` left by a crash is read, so the copy holds every committed
+  transaction. `LatestSchemaVersion` opens nothing (it reads the embedded migrations). `ops` may not import `store`,
+  so `cmd/isshoni` and the wiring pass them to 04 as functions.
   - `LatestSchemaVersion()` is the highest schema version this binary knows.
   - `InspectFile(ctx, dbPath, backupDir)` returns `FileInfo`: the schema version, `meta.last_app_version`, whether the
     migration history matches the embedded files (`HistoryOK`), the `PRAGMA integrity_check` result (`Integrity`,
@@ -765,9 +773,11 @@ type PruneStats struct{ Sessions, Tokens, Invites, Pending, DeviceCodes, DeviceT
 
 // ---- file-level (§4.4): never migrate, never create backups/, never write meta ----
 func LatestSchemaVersion() int // highest version in the embedded migrations; opens nothing
-// InspectFile opens dbPath read-only (mode=ro). backupDir is only read, to fill TooNew.Backup.
+// InspectFile opens dbPath read-only and immutable (mode=ro&immutable=1, 04 §13.1): no -wal/-shm files are created.
+// backupDir is only read, to fill TooNew.Backup.
 func InspectFile(ctx context.Context, dbPath, backupDir string) (FileInfo, error)
-// BackupFile opens src read-only (mode=ro) and runs VACUUM INTO dst; fails if dst exists.
+// BackupFile opens src read-only (mode=ro, plus immutable=1 when src has no -wal file) and runs VACUUM INTO dst;
+// fails if dst exists.
 func BackupFile(ctx context.Context, src, dst string) error
 
 type FileInfo struct {
@@ -920,10 +930,14 @@ from §12.2.
 
 1. The input may be at most 128 bytes → otherwise `too_long`.
 2. `display = precis.UsernameCasePreserved.String(strings.TrimSpace(in))`. This maps fullwidth to halfwidth, applies
-   NFC, and rejects spaces, controls, symbols and emoji → otherwise `invalid`.
+   NFC, and rejects spaces, controls, symbols and emoji → otherwise `invalid`. Empty input (after trimming) →
+   `required`. The display form must map to itself again (a fixed point, so a stored name normalizes unchanged) →
+   otherwise `invalid`.
 3. The display form has 2–32 runes → otherwise `too_short` or `too_long`.
-4. Every rune is a letter (L\*), a mark (M\*), a decimal digit (Nd), `_`, `-` or `.`. The first and last runes are a
-   letter or digit, and two punctuation runes never touch → otherwise `invalid`.
+4. Every rune is a letter (L\*), a mark (M\*), a decimal digit (Nd), `_`, `-` or `.`. The first rune is a letter or
+   digit, and so is the last **base** rune: a combining mark counts as part of the letter or digit it follows, so a
+   name that ends in a vowel sign (`राजे`) is valid. A mark never starts the name or follows punctuation, and two
+   punctuation runes never touch → otherwise `invalid`.
 5. `key = precis.UsernameCaseMapped.CompareKey(display)`. Uniqueness, login and the reserved check all use the key.
 6. The reserved keys `isshoni`, `system`, `everyone` and `here` → `reserved`. `admin` is allowed, because the first
    admin often picks it.
@@ -932,17 +946,19 @@ from §12.2.
 - An admin can rename any user (§12). Users can't rename themselves (*later*).
 - Mixed-script confusable checks come *later (M6 hardening)*. Admins see every new user in the approval queue or the
   audit log.
-- Examples: `Ａｌｅｘ` becomes the display `Alex` with key `alex`; `太郎`, `Ёжик` and `sam_k.99` are valid; `a`
-  (too short), `-sam` and `sam..k` are invalid.
+- Examples: `Ａｌｅｘ` becomes the display `Alex` with key `alex`; `太郎`, `Ёжик`, `राजे` and `sam_k.99` are valid; `a`
+  (too short), `-sam`, `sam-` and `sam..k` are invalid; `   ` is `required`.
 
 ### 7.2 Passwords and hashing
 
 `auth.CheckPassword(pw, usernameKey) (normalized string, err error)` applies these rules in order:
 1. The input may be at most 1024 bytes → otherwise `too_long`, before any other work.
 2. `precis.OpaqueString.String(pw)`: NFC, and non-ASCII spaces become U+0020. Controls are rejected → `invalid`.
+   Empty input → `required`.
 3. 8–128 runes → otherwise `too_short` or `too_long`.
 4. The lowercased password must not be in the embedded common list → otherwise `too_common`.
-5. It must not equal the username key after case folding → otherwise `same_as_username`.
+5. It must not be the username, compared as username keys (`precis.UsernameCaseMapped.CompareKey(password)` equals
+   the username key, so case and width don't matter) → otherwise `same_as_username`.
 
 There are no composition rules, no expiry and no forced periodic changes. Pasting and password managers stay allowed
 (05). The minimum of 8 is lower than NIST SP 800-63B-4's 15 for single-factor passwords. Online guessing is capped at
@@ -1070,17 +1086,20 @@ Set-Cookie: __Host-isshoni_session=<43-char token>; Path=/; Max-Age=2592000; Htt
 
 ### 7.5 CSRF and Origin checks (REST)
 
-- **Cross-origin check**: every unsafe method (POST, PUT, PATCH, DELETE) under `/api/v1` passes through
-  `http.CrossOriginProtection`, which Go has had since 1.25.
+- **Cross-origin check**: every unsafe method under `/api/v1` (every method but GET, HEAD and OPTIONS, as
+  `http.CrossOriginProtection` counts them: POST, PUT, PATCH, DELETE) passes through `http.CrossOriginProtection`,
+  which Go has had since 1.25.
   - With `Sec-Fetch-Site`, only `same-origin` and `none` pass.
   - Without it, the Origin host must match `Host`.
   - A request with neither header comes from a non-browser client and passes.
   - Every origin in `Origins.Public` is added with `AddTrustedOrigin`.
   - A denied request gets 403 `csrf_failed` through `SetDenyHandler`.
-- **Content type**: every unsafe request must also send `Content-Type: application/json` (a charset is optional), even
-  with an empty body. Otherwise the server answers 415 `unsupported_media_type`. HTML forms can't send this type, and
-  a cross-origin fetch with it needs a preflight, which the server never grants to a browser origin.
-- **Safe methods**: GET and HEAD never change state. The only writes a GET may cause are session bookkeeping
+- **Content type**: every unsafe request must also send exactly one `Content-Type` header, `application/json`, even
+  with an empty body. A `charset` parameter is optional; if present it must be `utf-8` (any case). Other parameters
+  are ignored. Otherwise (no header, two headers, another type, another charset) the server answers 415
+  `unsupported_media_type`. HTML forms can't send this type, and a cross-origin fetch with it needs a preflight, which
+  the server never grants to a browser origin.
+- **Safe methods**: GET, HEAD and OPTIONS never change state. The only writes a GET may cause are session bookkeeping
   (touch, §7.4 rotation), which gives a cross-site caller nothing. Code review checks this, and a test (§15) covers it.
 - **M1 has no bearer tokens**: any `Authorization` header gets 401 `unauthenticated`.
 - *Later (M2)*: a request with `Authorization: Bearer isa_…` **ignores cookies completely** and skips the cross-origin
@@ -1737,8 +1756,9 @@ session cache.
 
 - **Base**: `/api/v1`. 04 mounts `httpapi.API` at `/api/v1/`. Changes within v1 are additive only: clients ignore
   unknown fields, and the server ignores unknown request fields (no `DisallowUnknownFields`).
-- **Encoding**: requests and responses are JSON, and response field names are camelCase. Responses send
-  `Content-Type: application/json; charset=utf-8`. A 204 has no body.
+- **Encoding**: requests and responses are JSON, and response field names are camelCase. Timestamps have the fixed
+  form of §3.3 (`2026-10-01T12:00:00.000Z`). Responses send `Content-Type: application/json; charset=utf-8`. A 204
+  has no body.
 - **Headers on every `/api/v1` response**, errors included: `Cache-Control: no-store`. It covers the plan's "auth
   responses", and applies everywhere because every response is per-user. `X-Content-Type-Options: nosniff` comes from
   04's global middleware.
@@ -2421,10 +2441,11 @@ SPA removes the fragment right after reading it (05).
   wait over 10 s (fake clock) also gets `server_busy`.
 - **Dummy hash**: a login for an unknown user calls the hasher exactly once. A counting hasher asserts this, not
   timing.
-- **Username table tests**: fullwidth input, case, `太郎`, Cyrillic, emoji rejected, edge punctuation, length in
-  runes, reserved names, and the 128-byte limit. `FuzzNormalizeUsername`: output is idempotent and the key is stable.
-- **Password rules**: the length counts runes, OpaqueString handles non-ASCII spaces, a common password is caught
-  regardless of case, and a password equal to the username is rejected.
+- **Username table tests**: fullwidth input, case, `太郎`, Cyrillic, a name ending in a combining mark (`राजे`),
+  emoji rejected, edge punctuation, a mark after punctuation, empty or blank input (`required`), length in runes,
+  reserved names, and the 128-byte limit. `FuzzNormalizeUsername`: output is idempotent and the key is stable.
+- **Password rules**: the length counts runes, OpaqueString handles non-ASCII spaces, an empty password is
+  `required`, a common password is caught regardless of case, and a password equal to the username is rejected.
 - **Limiter**: burst and refill (fake clock); IPv6 addresses in one /64 share a key (`IPKey` table: IPv4,
   IPv4-mapped IPv6, two addresses in one /64, neighbouring /64s); the map cap evicts full buckets
   first; a successful login refills that address's `auth-user-ip` bucket and leaves `auth-user` as it was.
@@ -2435,7 +2456,8 @@ SPA removes the fragment right after reading it (05).
   no Secure).
 - **Rotation**: after 24 h a REST request rotates, a WebSocket upgrade never does, and the old token works for 60 s.
 - **CSRF matrix**: `Sec-Fetch-Site` values (`same-origin`, `none`, `same-site`, `cross-site`) × Origin
-  (match, mismatch, absent) × method × Content-Type.
+  (match, mismatch, absent) × method × Content-Type (absent, `text/plain`, `application/json` alone, with a `utf-8`
+  charset and with another charset such as `iso-8859-1`, and two `Content-Type` headers).
 - **WebSocket credentials** (the Origin matrix is 01's test now): `AuthenticateCookie` on an upgrade request with a
   valid cookie returns the principal and never rotates, and ignores an `Authorization` header; no cookie →
   `ErrNoCookie`; a disabled or pending user → unauthenticated; `Touch` on a revoked or expired session →
@@ -2560,8 +2582,9 @@ above; "a logout in tab A redirects tab B" by S33's component test; and mobile s
   - every endpoint in §12.3 and its JSON in §12.4;
   - the error envelope `{"error":{code,fields?,params?,retryAfter?,requestId?}}` (the only REST error shape, 04 uses
     it too), the codes and statuses in §12.2 (`api.StatusOf`), and `api.User{id, username, role}`;
+  - the timestamp form of §3.3 and `api.WireTime` (04's admin socket JSON uses it too);
   - the cookie name `__Host-isshoni_session` (`isshoni_session` for http dev);
-  - the CSRF rule (JSON Content-Type on unsafe methods);
+  - the CSRF rule (exactly one `Content-Type: application/json`, charset `utf-8` if any, on unsafe methods; §7.5);
   - the fragment URLs `/setup#t`, `/invite#t`, `/reset#t`, and `/link?code=` (M2).
 
 ---
@@ -2651,19 +2674,20 @@ slice.
    no-store, the CSRF wrapper and Content-Type rule); `GET /info` with fake InfoSource and Push.
    *Acceptance*: the golden tests pass; the CSRF and Content-Type matrix tests pass; `/info` returns the §12.4.1 shape;
    every response has `no-store`.
-4. **Auth primitives**: token generation and keyed hashes, key fingerprints and purge, `NormalizeUsername`,
-   `CheckPassword` with the embedded list, the argon2 hasher (PHC, semaphore, dummy), the limiter (with `auth-hash`),
-   and `DescribeUserAgent`.
+4. **Auth primitives**: token generation and keyed hashes, key fingerprints and the rotation check (the purge needs
+   the store and comes with `New` in slice 6), `NormalizeUsername`, `CheckPassword` with the embedded list, the
+   argon2 hasher (PHC, semaphore, dummy), the limiter (with `auth-hash`), and `DescribeUserAgent`.
    *Acceptance*: the auth unit tests for these parts, including fuzz targets running for 30 s in CI.
 5. **Settings**: `SettingsCache` (typed struct, validation, `Pin`, `OnChange`, audit), plus
    `GET/PATCH /admin/settings` (behind a temporary admin fixture).
    *Acceptance*: the settings unit and integration tests.
    *Depends on*: 2, 3.
-6. **Sessions and login**: `Authenticate`, `AuthenticateCookie`, the cookie helpers, `MaybeRotate`, the cache,
-   `Touch`; `login`, `logout` and `me`, with throttles and audit.
-   *Acceptance*: the login, rotation and throttle integration tests; the hasher counter proves there is no hashing
-   while throttled; logout and the login-with-an-old-cookie row call `ConnCloser` with that session and the §7.7
-   reason (fake `ConnCloser`).
+6. **Sessions and login**: `New` with the key-rotation purge (§4.6: the deleted rows, the `secrets.rotated` audit
+   row and the `secrets_rotated` alert), `Authenticate`, `AuthenticateCookie`, the cookie helpers, `MaybeRotate`, the
+   cache, `Touch`; `login`, `logout` and `me`, with throttles and audit.
+   *Acceptance*: the key-fingerprint tests of §15; the login, rotation and throttle integration tests; the hasher
+   counter proves there is no hashing while throttled; logout and the login-with-an-old-cookie row call `ConnCloser`
+   with that session and the §7.7 reason (fake `ConnCloser`).
    *Depends on*: 3, 4.
 7. **Setup**: `SetupAvailable`, `IssueSetupToken` (exported for 04's CLI), and `setup/check` and `setup/complete`.
    *Acceptance*: the setup integration tests, including the parallel-complete race.
