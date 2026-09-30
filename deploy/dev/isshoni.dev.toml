@@ -1,0 +1,28 @@
+# isshoni server configuration for `task dev` (docs/m1/06-deploy-and-ci.md §7.3). Not for production.
+#
+# The server runs in off mode (plain HTTP) on 127.0.0.1:8080; Vite serves the web app on http://localhost:5173 and
+# proxies /api and /ws here, so the public URL is the Vite origin. localhost is a secure context, so screen capture,
+# service workers and Secure cookies work in Chrome, Edge and Firefox. Relative paths are resolved against the
+# working directory (the repository root under Task); the server creates .dev/ on first start.
+
+public_url = "http://localhost:5173"
+data_dir   = ".dev/data"
+
+[listen]
+http         = "127.0.0.1:8080"
+ice_udp      = ":7882"
+ice_tcp      = ":7882"
+admin_socket = ".dev/admin.sock"
+
+[tls]
+mode = "off"
+
+[network]
+include_loopback = true # same-machine ICE: the browser and the server share the loopback interface
+stun_servers     = []   # no STUN in dev; the public IP stays unknown, which off mode allows
+
+[log]
+format = "text"
+
+[updates]
+release_check = false

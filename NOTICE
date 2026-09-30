@@ -1,0 +1,14 @@
+isshoni
+Copyright 2026 The isshoni authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Release archives, packages and container images also contain THIRD_PARTY_NOTICES, which lists the third-party
+modules and packages built into them, with their licenses and notices.
+
+Adapted source code
+-------------------
+
+Files adapted from other projects keep their original copyright headers and say what was changed. They are:
+
+(none yet)
