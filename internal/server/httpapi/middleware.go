@@ -23,7 +23,7 @@ import (
 // WriteError). It is created before the first step and shared by pointer, so the outer steps (recover, transfer) see
 // what the inner ones set even after r.WithContext copies.
 type reqState struct {
-	route  string       // mux pattern serving the request
+	route  string       // mux pattern serving the request; the API's route step narrows "/api/v1/" to its own
 	log    *slog.Logger // router logger
 	id     string       // step 2
 	ip     netip.Addr   // step 7
