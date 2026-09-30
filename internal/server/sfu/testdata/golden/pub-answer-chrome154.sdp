@@ -1,0 +1,55 @@
+m=video 9 UDP/TLS/RTP/SAVPF 102 103 108 109 116 117 118 119
+mid:0
+rtcp-mux
+rid:f recv
+rid:q recv
+simulcast:recv f;q
+recvonly
+rtpmap:102 H264/90000
+fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f
+rtcp-fb:102 goog-remb
+rtcp-fb:102 transport-cc
+rtcp-fb:102 ccm fir
+rtcp-fb:102 nack
+rtcp-fb:102 nack pli
+rtpmap:103 rtx/90000
+fmtp:103 apt=102
+rtpmap:108 H264/90000
+fmtp:108 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
+rtcp-fb:108 goog-remb
+rtcp-fb:108 transport-cc
+rtcp-fb:108 ccm fir
+rtcp-fb:108 nack
+rtcp-fb:108 nack pli
+rtpmap:109 rtx/90000
+fmtp:109 apt=108
+rtpmap:116 H264/90000
+fmtp:116 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=4d001f
+rtcp-fb:116 goog-remb
+rtcp-fb:116 transport-cc
+rtcp-fb:116 ccm fir
+rtcp-fb:116 nack
+rtcp-fb:116 nack pli
+rtpmap:117 rtx/90000
+fmtp:117 apt=116
+rtpmap:118 H264/90000
+fmtp:118 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=64001f
+rtcp-fb:118 goog-remb
+rtcp-fb:118 transport-cc
+rtcp-fb:118 ccm fir
+rtcp-fb:118 nack
+rtcp-fb:118 nack pli
+rtpmap:119 rtx/90000
+fmtp:119 apt=118
+extmap:4 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01
+extmap:9 urn:ietf:params:rtp-hdrext:sdes:mid
+extmap:10 urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id
+extmap:11 urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id
+m=audio 9 UDP/TLS/RTP/SAVPF 111
+mid:1
+rtcp-mux
+recvonly
+rtpmap:111 opus/48000/2
+fmtp:111 minptime=10;useinbandfec=1
+rtcp-fb:111 transport-cc
+extmap:4 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01
