@@ -1,0 +1,9 @@
+{
+  "type": "pc.answer",
+  "data": {
+    "pc": "pub",
+    "gen": 1,
+    "neg": 1,
+    "sdp": "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=pub-answer\r\nt=0 0\r\n"
+  }
+}

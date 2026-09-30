@@ -1,0 +1,10 @@
+{
+  "type": "ok",
+  "re": "2",
+  "data": {
+    "room": {
+      "id": "lounge",
+      "name": "Lounge"
+    }
+  }
+}

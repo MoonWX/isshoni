@@ -1,0 +1,9 @@
+{
+  "type": "pc.restart",
+  "data": {
+    "pc": "pub",
+    "gen": 1,
+    "mode": "rebuild",
+    "reason": "failed"
+  }
+}

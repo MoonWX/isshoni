@@ -1,0 +1,8 @@
+{
+  "type": "error",
+  "data": {
+    "code": "session_revoked",
+    "retryable": false,
+    "scope": "session"
+  }
+}

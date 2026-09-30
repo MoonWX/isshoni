@@ -1,0 +1,32 @@
+{
+  "type": "stats",
+  "data": {
+    "downlinkEstimate": 24000000,
+    "subs": [
+      {
+        "shareId": "s_q7m2x9c4v8b1n5k3",
+        "kind": "video",
+        "layer": "high",
+        "bitrate": 7600000,
+        "lossPct": 0.2,
+        "dropped": 0
+      },
+      {
+        "shareId": "s_q7m2x9c4v8b1n5k3",
+        "kind": "audio",
+        "bitrate": 128000,
+        "lossPct": 0,
+        "dropped": 0
+      }
+    ],
+    "layers": [
+      {
+        "shareId": "s_z1x2c3v4b5n6m7k8",
+        "kind": "video",
+        "rid": "f",
+        "bitrate": 7800000,
+        "lossPct": 0.1
+      }
+    ]
+  }
+}

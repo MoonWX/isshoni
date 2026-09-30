@@ -1,0 +1,27 @@
+{
+  "type": "ok",
+  "re": "5",
+  "data": {
+    "shareId": "s_q7m2x9c4v8b1n5k3",
+    "codec": "h264/6400",
+    "encodings": [
+      {
+        "rid": "f",
+        "layer": "high",
+        "active": true,
+        "maxBitrate": 8000000,
+        "maxFramerate": 60,
+        "maxPixels": 2073600
+      },
+      {
+        "rid": "q",
+        "layer": "low",
+        "active": true,
+        "maxBitrate": 300000,
+        "maxFramerate": 15,
+        "maxPixels": 230400
+      }
+    ],
+    "audioBitrate": 128000
+  }
+}

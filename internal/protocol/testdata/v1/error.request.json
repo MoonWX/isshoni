@@ -1,0 +1,13 @@
+{
+  "type": "error",
+  "re": "5",
+  "data": {
+    "code": "share_limit",
+    "retryable": false,
+    "scope": "request",
+    "params": {
+      "limit": 4,
+      "per": "user"
+    }
+  }
+}

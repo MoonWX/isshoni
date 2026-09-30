@@ -1,0 +1,12 @@
+{
+  "type": "room.event",
+  "data": {
+    "kind": "share.stopped",
+    "roomId": "lounge",
+    "userId": "k3m9p2qxw7ht",
+    "name": "Alex",
+    "shareId": "s_q7m2x9c4v8b1n5k3",
+    "reason": "media_timeout",
+    "at": "2026-10-12T19:40:00.000Z"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "type": "caps.update",
+  "data": {
+    "caps": {
+      "decode": [
+        "h264/42e0",
+        "h264/4200",
+        "opus"
+      ]
+    }
+  }
+}

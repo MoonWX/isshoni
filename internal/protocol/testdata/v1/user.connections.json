@@ -1,0 +1,24 @@
+{
+  "type": "user.connections",
+  "data": {
+    "connections": [
+      {
+        "id": "c_k3v9q2m7xw4pa8d1",
+        "kind": "web",
+        "role": "full",
+        "status": "online",
+        "os": "macos",
+        "version": "0.2.0",
+        "roomId": "lounge"
+      },
+      {
+        "id": "c_m2n4b6v8c0x2z4l6",
+        "kind": "desktop",
+        "role": "publisher",
+        "status": "online",
+        "os": "windows",
+        "version": "0.2.0"
+      }
+    ]
+  }
+}

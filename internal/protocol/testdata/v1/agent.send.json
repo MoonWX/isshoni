@@ -1,0 +1,11 @@
+{
+  "type": "agent.send",
+  "id": "30",
+  "data": {
+    "toRole": "agent",
+    "kind": "share.request",
+    "payload": {
+      "preset": "game"
+    }
+  }
+}

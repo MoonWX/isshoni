@@ -1,0 +1,10 @@
+{
+  "type": "agent.recv",
+  "data": {
+    "from": "c_k3v9q2m7xw4pa8d1",
+    "kind": "share.request",
+    "payload": {
+      "preset": "game"
+    }
+  }
+}
