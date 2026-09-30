@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"maps"
 	"os"
+	"os/user"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -128,7 +129,7 @@ func OpenSecrets(path string, log *slog.Logger) (*SecretStore, error) {
 			return nil, &OperatorError{
 				Reason: ReasonSecretsOwner, Path: path,
 				Message: fmt.Sprintf("%s is owned by uid %d, but isshoni runs as uid %d", path, uid, geteuid()),
-				Fix:     ownerFix(Host{}, path, false),
+				Fix:     secretsOwnerFix(Host{}, path, uid),
 			}
 		}
 		if perm := fi.Mode().Perm(); perm&^0o600 != 0 {
@@ -179,6 +180,23 @@ func InspectSecrets(path string) error {
 		return secretsCorrupt(path, err.Error(), err)
 	}
 	return nil
+}
+
+// secretsOwnerFix is the fix for a secrets.json owned by uid owner, not by the process. Root outside a container
+// that meets a file of the service user (`sudo isshoni serve` on a systemd install) should run as that user: giving
+// the file to root would make the next `systemctl start isshoni` fail the same way, and §5.1 warns against root
+// there anyway. Every other case gives the file to the process (ownerFix); in a container 0:0 is right for
+// compose.host.yaml.
+func secretsOwnerFix(h Host, path string, owner int) string {
+	if geteuid() != 0 || owner == 0 || h.Container() != ContainerNone {
+		return ownerFix(h, path, false)
+	}
+	name, sudoUser := strconv.Itoa(owner), "'#"+strconv.Itoa(owner)+"'" // sudo -u takes a uid as #uid
+	if usr, err := user.LookupId(name); err == nil && usr.Username != "" {
+		name, sudoUser = usr.Username, usr.Username
+	}
+	return fmt.Sprintf("run isshoni as the file's owner %s: sudo systemctl start isshoni (or sudo -u %s isshoni serve)",
+		name, sudoUser)
 }
 
 // secretsCorrupt is the *OperatorError for a secrets.json that can't be used; what follows the path.

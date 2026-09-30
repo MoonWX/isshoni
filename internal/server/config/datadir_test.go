@@ -388,6 +388,68 @@ func TestPrepareDataDirNotWritable(t *testing.T) {
 	})
 }
 
+// An admin socket directory that can't be created is a refusal (exit 78) too: a restart can't create it.
+func TestPrepareDataDirAdminSocketDir(t *testing.T) {
+	assertRefused := func(t *testing.T, err error, sockDir string, want ...string) {
+		t.Helper()
+		if !errors.Is(err, ErrNeedsOperator) || ReasonOf(err) != ReasonAdminSocketDir {
+			t.Fatalf("PrepareDataDir = %v, want %s", err, ReasonAdminSocketDir)
+		}
+		msg := err.Error()
+		ids := fmt.Sprintf("uid %d, gid %d", os.Getuid(), os.Getgid())
+		if runtime.GOOS == "windows" {
+			ids = "the current user"
+		}
+		for _, s := range append([]string{sockDir + " (the directory of listen.admin_socket) can't be created", ids}, want...) {
+			if !strings.Contains(msg, s) {
+				t.Errorf("error lacks %q:\n%s", s, msg)
+			}
+		}
+	}
+
+	t.Run("a file in the way", func(t *testing.T) {
+		file := filepath.Join(t.TempDir(), "run")
+		if err := os.WriteFile(file, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		sockDir := filepath.Join(file, "isshoni")
+		c := &Config{DataDir: t.TempDir(), Listen: Listen{AdminSocket: filepath.Join(sockDir, "admin.sock")}}
+		err := PrepareDataDir(t.Context(), c, fakeHost(t), nil)
+		want := []string{"fix: set listen.admin_socket to a path in a directory isshoni can write"}
+		if runtime.GOOS != "windows" {
+			want = append(want, "(not a directory)")
+		}
+		assertRefused(t, err, sockDir, want...)
+	})
+
+	t.Run("under a directory isshoni can't write", func(t *testing.T) {
+		skipOnWindows(t, "Unix modes")
+		if geteuid() == 0 {
+			t.Skip("root can write anywhere")
+		}
+		dataDir := realDir(t, "data")
+		parent := filepath.Join(t.TempDir(), "run")
+		if err := os.Mkdir(parent, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(parent, 0o700) }) //nolint:gosec // so TempDir can clean up
+		sockDir := filepath.Join(parent, "isshoni")
+		c := &Config{DataDir: dataDir, Listen: Listen{AdminSocket: filepath.Join(sockDir, "admin.sock")}}
+		names := ownerNames(os.Getuid(), os.Getgid())
+
+		err := PrepareDataDir(t.Context(), c, fakeHost(t), nil)
+		assertRefused(t, err, sockDir, "(permission denied)",
+			"fix: run: sudo mkdir -p "+sockDir+" && sudo chown "+names+" "+sockDir+
+				", or set listen.admin_socket to a path in a directory isshoni can write")
+
+		// In a container (a read-only root without the tmpfs of 06's compose files looks the same): mount a tmpfs.
+		err = PrepareDataDir(t.Context(), c, containerHost(t, nil, dataDir), nil)
+		ids := fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
+		assertRefused(t, err, sockDir, "fix: mount a tmpfs at "+sockDir+" writable by "+ids+" (see compose.yaml), e.g. --tmpfs "+
+			sockDir+fmt.Sprintf(":uid=%d,gid=%d,mode=0750", os.Getuid(), os.Getgid()))
+	})
+}
+
 func assertNotWritable(t *testing.T, err error, dir, what string) {
 	t.Helper()
 	if !errors.Is(err, ErrNeedsOperator) || ReasonOf(err) != ReasonDataDirNotWritable {
@@ -527,6 +589,38 @@ func TestLockDataDir(t *testing.T) {
 	missing := (&Config{DataDir: filepath.Join(t.TempDir(), "missing")}).Paths()
 	if _, err := LockDataDir(t.Context(), missing); err == nil || errors.Is(err, ErrDataDirLocked) {
 		t.Errorf("LockDataDir without a data dir = %v", err)
+	}
+}
+
+// A lock file the process may not open (a root run created it 0600) is a refusal (exit 78), not "locked" (exit 1):
+// a restart can't fix it.
+func TestLockDataDirPermissionDenied(t *testing.T) {
+	skipOnWindows(t, "Unix modes")
+	if geteuid() == 0 {
+		t.Skip("root can open anything")
+	}
+	p := testPaths(t)
+	l, err := LockDataDir(t.Context(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Close()
+	if err := os.Chmod(p.Lock, 0); err != nil {
+		t.Fatal(err)
+	}
+	_, err = LockDataDir(t.Context(), p)
+	if !errors.Is(err, ErrNeedsOperator) || errors.Is(err, ErrDataDirLocked) || ReasonOf(err) != ReasonDataDirNotWritable {
+		t.Fatalf("LockDataDir = %v, want %s", err, ReasonDataDirNotWritable)
+	}
+	msg := err.Error()
+	for _, s := range []string{
+		p.Lock + " can't be opened (permission denied); isshoni runs as " + fmt.Sprintf("uid %d, gid %d", os.Getuid(), os.Getgid()),
+		// LockDataDir looks at the real machine, which may be a container (TestOwnerFix covers both forms).
+		"fix: " + ownerFix(Host{}, p.DataDir, true), "sudo chown -R ",
+	} {
+		if !strings.Contains(msg, s) {
+			t.Errorf("error lacks %q:\n%s", s, msg)
+		}
 	}
 }
 

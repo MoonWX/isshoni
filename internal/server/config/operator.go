@@ -6,10 +6,10 @@ import (
 )
 
 // ErrNeedsOperator is wrapped by every error of the data-directory checks and of OpenSecrets that a restart can't
-// fix (§5.1, §5.2, §6.3): a container without a data volume, a data directory the process can't write, a corrupt or
-// wrongly owned secrets.json. serve exits 78 exactly when errors.Is(err, ErrNeedsOperator), like
-// store.ErrNeedsOperator, so systemd's RestartPreventExitStatus=78 ends the restart loop. Such an error is always an
-// *OperatorError.
+// fix (§5.1, §5.2, §6.3): a container without a data volume, a data directory (or lock file) the process can't
+// write, an admin socket directory that can't be created, a corrupt or wrongly owned secrets.json. serve exits 78
+// exactly when errors.Is(err, ErrNeedsOperator), like store.ErrNeedsOperator, so systemd's
+// RestartPreventExitStatus=78 ends the restart loop. Such an error is always an *OperatorError.
 var ErrNeedsOperator = errors.New("config: needs operator action")
 
 // Reason is the code of a refusal to start (§6.3). It is used in logs and by doctor; it never changes once released.
@@ -20,9 +20,12 @@ const (
 	// ReasonDataNotMounted: in a container, data_dir is not a mounted volume, so the data would be lost with the
 	// container (§5.1).
 	ReasonDataNotMounted Reason = "data_not_mounted"
-	// ReasonDataDirNotWritable: data_dir can't be created, is not a directory, or the process can't write to it
-	// (§5.1).
+	// ReasonDataDirNotWritable: data_dir can't be created, is not a directory, or the process can't write to it or
+	// open its lock file (§5.1).
 	ReasonDataDirNotWritable Reason = "data_dir_not_writable"
+	// ReasonAdminSocketDir: the directory of listen.admin_socket can't be created (§5.1), for example /run/isshoni in
+	// a container with a read-only root filesystem and no tmpfs there.
+	ReasonAdminSocketDir Reason = "admin_socket_dir"
 	// ReasonSecretsCorrupt: secrets.json can't be parsed or holds an invalid key. It is never regenerated, because a
 	// new session key would log everyone out (§5.2).
 	ReasonSecretsCorrupt Reason = "secrets_corrupt"

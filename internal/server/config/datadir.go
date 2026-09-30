@@ -177,12 +177,11 @@ func SetPrivateUmask() (previous int) { return setUmask(0o077) }
 //   - data_dir must be a directory. If the process owns it and it is wider than 0700, it is chmod-ed to 0700 with a
 //     warning;
 //   - the process must be able to create files in it;
-//   - the admin socket's parent directory is created (0700) if missing;
+//   - the admin socket's parent directory is created (0700) if missing (ReasonAdminSocketDir when it can't be);
 //   - running as root outside a container logs a warning.
 //
 // A failed check returns an *OperatorError (it wraps ErrNeedsOperator: serve exits 78, restarting can't help) whose
-// fix names the process's uid:gid in the form for the environment. Only a cancelled ctx and a failure to create the
-// admin socket's directory return other errors.
+// fix names the process's uid:gid in the form for the environment. Only a cancelled ctx returns another error.
 func PrepareDataDir(ctx context.Context, c *Config, h Host, log *slog.Logger) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -233,11 +232,40 @@ func PrepareDataDir(ctx context.Context, c *Config, h Host, log *slog.Logger) er
 		return dataDirError(h, dir, "is not writable by isshoni", err)
 	}
 	if sock := c.Listen.AdminSocket; sock != "" {
-		if err := os.MkdirAll(filepath.Dir(sock), 0o700); err != nil {
-			return fmt.Errorf("config: creating the admin socket's directory: %w", err)
+		sockDir := filepath.Dir(sock)
+		if err := os.MkdirAll(sockDir, 0o700); err != nil {
+			return adminSocketDirError(h, sockDir, err)
 		}
 	}
 	return nil
+}
+
+// adminSocketDirError is the *OperatorError for an admin socket directory that MkdirAll can't create. MkdirAll
+// succeeds on an existing directory, so dir (or one of its parents) is missing, and chown alone can't fix it.
+func adminSocketDirError(h Host, dir string, err error) error {
+	cause := err
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		cause = pe.Err // "read-only file system", "permission denied", "not a directory"
+	}
+	elsewhere := "set listen.admin_socket to a path in a directory isshoni can write"
+	fix := elsewhere
+	uid, gid := getuid(), getgid()
+	switch {
+	case uid < 0:
+	case h.Container() != ContainerNone && (errors.Is(err, fs.ErrPermission) || isReadOnlyFS(err)):
+		// 06's compose files mount a tmpfs at /run/isshoni; a read-only root filesystem without it lands here.
+		fix = fmt.Sprintf("mount a tmpfs at %s writable by %d:%d (see compose.yaml), e.g. --tmpfs %s:uid=%d,gid=%d,mode=0750",
+			dir, uid, gid, dir, uid, gid)
+	case errors.Is(err, fs.ErrPermission):
+		fix = fmt.Sprintf("run: sudo mkdir -p %s && sudo chown %s %s, or %s", dir, ownerNames(uid, gid), dir, elsewhere)
+	}
+	return &OperatorError{
+		Reason: ReasonAdminSocketDir, Path: dir, Err: err,
+		Message: fmt.Sprintf("%s (the directory of listen.admin_socket) can't be created (%v); isshoni runs as %s",
+			dir, cause, processIDs()),
+		Fix: fix,
+	}
 }
 
 // checkMounted is PrepareDataDir's container check: an *OperatorError with ReasonDataNotMounted unless dir is on a
@@ -363,12 +391,20 @@ type DataDirLock struct {
 
 // LockDataDir takes the data-directory lock p.Lock without waiting. The lock file is created (0600) if missing and
 // never removed. When another process, or another DataDirLock of this process, holds the lock, the error wraps
-// ErrDataDirLocked.
+// ErrDataDirLocked. A lock file the process may not open (a root run created it) is an *OperatorError with
+// ReasonDataDirNotWritable (serve exits 78, §3.2): restarting can't fix it.
 func LockDataDir(ctx context.Context, p Paths) (*DataDirLock, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	f, err := os.OpenFile(p.Lock, os.O_RDWR|os.O_CREATE, 0o600)
+	if errors.Is(err, fs.ErrPermission) {
+		return nil, &OperatorError{
+			Reason: ReasonDataDirNotWritable, Path: p.Lock, Err: err,
+			Message: p.Lock + " can't be opened (permission denied); isshoni runs as " + processIDs(),
+			Fix:     ownerFix(Host{}, p.DataDir, true),
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("config: opening the data-directory lock: %w", err)
 	}

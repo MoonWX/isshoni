@@ -347,6 +347,64 @@ func TestSecretsWrongOwner(t *testing.T) {
 		t.Error("the file changed")
 	}
 	assertMode(t, path, 0o644)
+
+	// `sudo isshoni serve` on a systemd install: the fix is to run as the file's owner, not to give the file to root
+	// (the next `systemctl start isshoni` would fail the same way).
+	t.Run("root outside a container", func(t *testing.T) {
+		if real == 0 {
+			t.Skip("the test's file must belong to a user other than root")
+		}
+		if (Host{}).Container() != ContainerNone {
+			t.Skip("OpenSecrets looks at the real machine, which is a container here")
+		}
+		geteuid = func() int { return 0 }
+		_, err := OpenSecrets(path, nil)
+		if !errors.Is(err, ErrNeedsOperator) || ReasonOf(err) != ReasonSecretsOwner {
+			t.Fatalf("OpenSecrets = %v, want %s", err, ReasonSecretsOwner)
+		}
+		msg := err.Error()
+		for _, s := range []string{"fix: run isshoni as the file's owner ", "sudo systemctl start isshoni", "isshoni serve)"} {
+			if !strings.Contains(msg, s) {
+				t.Errorf("error lacks %q:\n%s", s, msg)
+			}
+		}
+		if strings.Contains(msg, "chown") {
+			t.Errorf("the fix gives the file to root:\n%s", msg)
+		}
+		if !bytes.Equal(before, readBytes(t, path)) {
+			t.Error("the file changed")
+		}
+	})
+}
+
+func TestSecretsOwnerFix(t *testing.T) {
+	defer func(e, u, g func() int) { geteuid, getuid, getgid = e, u, g }(geteuid, getuid, getgid)
+	geteuid = func() int { return 0 }
+	getuid = func() int { return 0 }
+	getgid = func() int { return 0 }
+	const path = "/var/lib/isshoni/secrets.json"
+	docker := fakeHost(t)
+	writeHostFile(t, docker, "/.dockerenv", "")
+
+	// Root outside a container, a file of an account without a name: sudo -u takes the uid as '#uid'.
+	if got, want := secretsOwnerFix(fakeHost(t), path, 3999999),
+		"run isshoni as the file's owner 3999999: sudo systemctl start isshoni (or sudo -u '#3999999' isshoni serve)"; got != want {
+		t.Errorf("root fix = %q, want %q", got, want)
+	}
+	// Root in a container (compose.host.yaml runs as 0:0): give the file to the process.
+	if got, want := secretsOwnerFix(docker, path, 65532), ownerFix(docker, path, false); got != want {
+		t.Errorf("container fix = %q, want %q", got, want)
+	}
+	// Not root: give the file to the process, whoever owns it.
+	geteuid = func() int { return 998 }
+	getuid = func() int { return 998 }
+	getgid = func() int { return 998 }
+	for _, owner := range []int{0, 1000} {
+		if got, want := secretsOwnerFix(fakeHost(t), path, owner), ownerFix(fakeHost(t), path, false); got != want ||
+			!strings.Contains(got, "sudo chown ") {
+			t.Errorf("owner %d: fix = %q, want %q", owner, got, want)
+		}
+	}
 }
 
 // validSecrets returns the content of a valid secrets.json as generic JSON.
