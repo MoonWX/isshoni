@@ -22,7 +22,7 @@ type RoomInfo struct {
 // in the room gets byte-identical snapshots.
 type RoomState struct {
 	RoomID       string            `json:"roomId"`
-	Rev          uint64            `json:"rev"`          // +1 per change in this server process; clients reset on every welcome
+	Rev          uint64            `json:"rev"`          // grows with every change in this server process; clients reset on every welcome
 	Participants []ParticipantInfo `json:"participants"` // sorted by joinedAt, then userId
 	Shares       []ShareInfo       `json:"shares"`       // sorted by startedAt, then id
 }

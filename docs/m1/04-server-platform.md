@@ -88,7 +88,7 @@ governed by the license gate (06).
 | `internal/logx` | `version` | `internal/server/...` |
 | `config` | `logx`, `version` | any other `internal/server/...` package |
 | `netx` | `logx`, `version`, `internal/protocol/api` (for `api.NATKind`, `api.CloudProvider`); plus pion | `config` (it takes plain option structs, so `doctor` and tests can use it freely), `sfu` |
-| 03's `store` | `internal/protocol/api` only (plus the standard library and modernc) | anything else |
+| 03's `store` | `internal/protocol/api` only (plus the standard library, modernc and `golang.org/x/text/secure/precis`) | anything else |
 | 03's `auth` | `store`, `internal/protocol/api` | anything else |
 | `httpapi` (this router and 03's `API`) | `config`, `logx`, `version`, `store`, `auth`, `internal/protocol`, `internal/protocol/api` | `ops`, `push`, `netx`, `tlsmgr`, `signal`, `sfu`, `sfuplane` |
 | `tlsmgr`, `ops`, `ops/doctor`, `push` | `config`, `logx`, `version`, `netx`, `internal/protocol`, `internal/protocol/api` (and `ops` → `ops/doctor`) | `httpapi`, `store`, `auth`, `signal`, `sfu`, `sfuplane` |
@@ -767,8 +767,10 @@ its environment (§6.1 step 4):
   `docker compose run --rm isshoni admin restore --offline /var/lib/isshoni/backups/…`, then `docker compose up -d`.
 - Offline `isshoni doctor` shows the same reason (check `schema` or `secrets`).
 
-Reasons (codes, used in logs and doctor): `schema_newer`, `migration_failed`, `db_corrupt`, `secrets_corrupt`,
-`data_not_mounted`.
+Reasons (codes, used in logs and doctor): `schema_newer`, `migration_failed`, `db_corrupt` (03's store),
+`secrets_corrupt`, `secrets_owner` (a `secrets.json` owned by another uid), `data_not_mounted`,
+`data_dir_not_writable` (the data directory can't be created or written, or its lock file can't be opened) and
+`admin_socket_dir` (the admin socket's directory can't be created). `config.ReasonOf(err)` returns config's codes.
 
 ### 6.4 Graceful shutdown: what clients see
 
@@ -855,7 +857,7 @@ type PortMuxOptions struct {
 	ClassifyTimeout  time.Duration // 10 s: time allowed for the first byte
 	MaxPending       int           // 1024 connections waiting for their first byte; when full, the oldest is closed
 	MaxPendingPerIP  int           // 32 per IPKey
-	MaxConnsPerIP    int           // limits.conns_per_ip (256): open TLS + ICE connections per IPKey
+	MaxConnsPerIP    int           // limits.conns_per_ip (256): every open connection per IPKey, accept to close
 	MaxICEConnsPerIP int           // 64 per IPKey; one count across 443 and 7882/tcp (§7.3)
 	QueueLen         int           // 128 per sub-listener; a full queue for 1 s drops the connection
 	PublicHost       string        // for the plain-HTTP hint response
@@ -870,7 +872,9 @@ func (m *PortMux) TLS() net.Listener // conns whose first byte was 0x16; the byt
 func (m *PortMux) ICE() net.Listener // conns that start with an RFC 4571 frame; Addr() is the *net.TCPAddr of :443;
                                      // its Close is idempotent (Transport.Close closes it, then PortMux.Close again)
 func (m *PortMux) Addr() net.Addr
-func (m *PortMux) Close() error      // raw listener and both sub-listeners; Accept then returns net.ErrClosed
+func (m *PortMux) Close() error      // raw listener and both sub-listeners (Accept then returns net.ErrClosed),
+                                     // then every conn that came through it and is still open; call it after
+                                     // http.Server.Shutdown (§6.4): hijacked WebSockets, stuck handshakes
 func (m *PortMux) Stats() PortMuxStats
 
 type PortMuxStats struct {
@@ -894,7 +898,7 @@ Classification:
 | `0x16` | TLS | TLS handshake record type |
 | `0x00`–`0x02` | ICE | RFC 4571 length prefix. pion's `TCPMuxDefault.handleConn` reads the first frame into a 512-byte buffer, so a valid first frame is ≤ `0x0200` bytes; a TLS record can never start with these values |
 | `A`–`Z` | Plain HTTP on the TLS port | Reply `HTTP/1.1 400 Bad Request` with `This port speaks HTTPS. Use https://<host>/` and close |
-| anything else | close | Counted as `Garbage` |
+| anything else | close | Counted as `Garbage`, like a connection that closes or resets before its first byte |
 
 Handoff:
 - `TLS()` goes to `http.Server.ServeTLS(listener, "", "")` with the tlsmgr `TLSConfig`. Go's server uses the smallest
@@ -908,12 +912,15 @@ Handoff:
   address. netx may not import 03's `auth` (§2), so it has its own few-line function; a wiring unit test (§17) pins
   `netx.IPKey` and 03's limiter key to the same result.
 - Per-IP counts are decremented when a connection closes (the wrapper's `Close` hook). Exceeding a per-IP limit closes
-  the new connection immediately and counts it as `Limited`.
+  the new connection immediately and counts it as `Limited`. `MaxConnsPerIP` counts every connection of an IPKey from
+  accept to close, including ones still waiting for their first byte or getting the plain-HTTP hint, so it bounds all
+  the sockets one IP holds on 443.
 - A full pending pool works the other way round: when `MaxPending` connections are waiting for their first byte, the
   **oldest** pending connection is closed (counted as `Limited`) and the new one is admitted (after the per-IP pending
   check, which still closes the new one when its key already has 32 pending). Silent sockets then only
   push each other out; they can't lock friends out of 443. Pending connections sit in a FIFO list under the mux's
-  mutex; closing one makes its classifier goroutine's `Read` fail, which removes it.
+  mutex; the evicted one is taken off the list under the mutex when it is chosen (so a burst evicts one waiting
+  connection per new one), and closing it makes its classifier goroutine's `Read` fail.
 - Byte counters (`Counter`) wrap both routes: ICE → path `media_tcp`, TLS → path `web`.
 
 HTTP/2, ALPN and WebSocket:
@@ -2379,7 +2386,7 @@ no tokens, SDP, push endpoints or usernames.
 | Package | Asserted |
 |---|---|
 | `config` | Precedence flag > env > file > default for every kind; policy `IsSet`; unknown file key → error with line/column and suggestion; unknown env → warning; list/duration/bool parsing; derived TLS mode; `off`-mode default of `listen.http`; `off`-mode default of `trusted_proxies` (loopback `listen.http` → `127.0.0.0/8`, `::1/128`; non-loopback → `[]` plus the §4.5 warning; an explicit `[]` wins); `config init --tls.mode off` with a loopback `listen.http` writes `trusted_proxies` into the file; each §4.5 rule produces the right key, source and fix; `config example` output re-parses to the defaults; registry has no duplicate env/flag names; empty env counts as unset: `ISSHONI_PUBLIC_IP=` and `ISSHONI_DOMAIN=` with no file → effective `public_ip="auto"`, derived tls mode `ip`, no validation error, `IsSet("public_ip")` false; reserved names of §4.2 ignored without a warning; `config init` ignores env and exits 78 without writing on invalid values; `Site.Dev` only for off mode + loopback `listen.http` + empty or loopback `public_url` |
-| `config` secrets | First start creates 0600 with all keys; restart keeps them; missing registered key is added; wide mode fixed; wrong owner → exit 78; corrupt → `secrets_corrupt`; atomic write leaves the old file on a simulated failure; `Rotate` changes only the chosen keys and runs hooks in order |
+| `config` secrets | First start creates 0600 with all keys; restart keeps them; missing registered key is added; wide mode fixed; wrong owner → exit 78; corrupt → `secrets_corrupt`; atomic write leaves the old file on a simulated failure; `Rotate` changes only the chosen keys and writes the file atomically (no hooks: consumers compare key fingerprints at the next start, §5.3) |
 | `netx` portmux | TLS ClientHello → `TLS()` and a full handshake (HTTP/1.1 and h2 ALPN); RFC 4571 STUN frame → `ICE()` with the byte replayed; `GET ` → 400 hint; `0xFF` → closed; silent client closed at the timeout (shortened in tests); 33rd pending conn per IP closed, also when the 33 come from different addresses in one IPv6 /64; with `MaxPending` reached a new connection is admitted and the oldest pending one is closed (`Limited`); `IPKey` table (IPv4, IPv4-mapped IPv6, two addresses in one /64, neighbouring /64s); per-IP open limit; `Close` unblocks both `Accept`s; `LocalAddr` is `*net.TCPAddr`; goleak clean |
 | `netx` transport | Counting `PacketConn` keeps `AddrPortReaderWriter`; byte counts match; port 0 reuse; interface filter globs; buffer read-back and the one warn line when it is below target; 7882/tcp per-IP ICE limit shared with 443 (65th connection across both closed, also from different addresses in one /64); `Advertised` holds post-rewrite addresses with `Via` `udp`/`tcp443`/`tcp7882`; a setter called after `Apply` wins |
 | `netx` public IP | Fake STUN (pion/stun) + fake interfaces: each row of §7.4's table; timeouts; literal config skips STUN for the result |
@@ -2461,11 +2468,14 @@ Packages and names (exact):
   `NewZapBridge`; attribute names of §10.
 - `internal/server/config`: `Config` (+ sections), `Load`, `(*Config).IsSet/Source/EffectiveTLSMode/Paths/Warnings`,
   `TLSMode` consts, `Site` + `NewSite` + `(Site).URL`, `SecretStore` (`Key`, `KeyID`, `VAPID`, `Rotate`), `KeyName`
-  consts `KeySession|KeyInvite|KeyResume`, `RotateResult`, `VAPIDKeys`; the key registry in `keys.go` (other docs add
-  keys there); env/flag naming rule; policy keys `registration.mode`, `clients.min_version`,
-  `limits.max_participants_per_room`, `limits.max_shares_per_room`, `limits.max_bitrate_kbps`,
-  `limits.transfer_alert_gb`, `updates.release_check` with their 03 settings fields (§4.3); guard
-  `limits.ws_handshakes_per_ip_per_minute`; `sfu.pause_unwatched_layers`.
+  consts `KeySession|KeyInvite|KeyResume`, `RotateResult`, `VAPIDKeys`, `OpenSecrets`, `InspectSecrets`, `KeyNames`,
+  `ErrUnknownKey`; the data directory and refusals of §5.1 and §6.3 (`SetPrivateUmask`, `PrepareDataDir`,
+  `LockDataDir`/`DataDirLock`/`ErrDataDirLocked`, `ApplyMemoryLimit`, `Host` with `Container`, `AllowEphemeralData`,
+  `DataDirMounted` and `CgroupMemoryLimit`, `ContainerKind`, `ErrNeedsOperator`, `OperatorError`, `Reason` and
+  `ReasonOf`); the key registry in `keys.go` (other docs add keys there); env/flag naming rule; policy keys
+  `registration.mode`, `clients.min_version`, `limits.max_participants_per_room`, `limits.max_shares_per_room`,
+  `limits.max_bitrate_kbps`, `limits.transfer_alert_gb`, `updates.release_check` with their 03 settings fields
+  (§4.3); guard `limits.ws_handshakes_per_ip_per_minute`; `sfu.pause_unwatched_layers`.
 - `internal/server/netx`: `Transport` (`UDPMux`, `TCPMux`, `TCPMux443`, `TCPMux7882`, `NetworkTypes`,
   `IncludeLoopback`, `Advertised`, `RcvBuf`, `SndBuf`, `Apply(*webrtc.SettingEngine) error`, `Close`), `NewTransport`,
   `TransportOptions` (incl. `PacketConns` for tests), `AdvertisedAddr` (`Via`: `udp` | `tcp443` | `tcp7882`),

@@ -60,8 +60,7 @@ type Deps struct {
 	Info InfoSource
 	// Site is 04's site (config.NewSite); required, New panics on an empty Origin. GET /info reports Site.Origin as
 	// server.publicUrl and falls back to its host name for server.name when the serverName setting is empty
-	// (03 §12.4.1). Not in 03 §12.5's field list, which has no other way to reach the public origin; the wiring
-	// passes the RouterOptions.Site value.
+	// (03 §12.4.1). The wiring passes the RouterOptions.Site value.
 	Site Site
 	// ClientIP is 04's httpapi.ClientIP (trusted-proxy aware); nil means ClientIP.
 	ClientIP func(*http.Request) netip.Addr

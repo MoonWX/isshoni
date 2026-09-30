@@ -27,7 +27,7 @@ type PortMuxOptions struct {
 	ClassifyTimeout  time.Duration // 10 s: time allowed for the first byte
 	MaxPending       int           // 1024 connections waiting for their first byte; when full, the oldest is closed
 	MaxPendingPerIP  int           // 32 per IPKey
-	MaxConnsPerIP    int           // limits.conns_per_ip (256): open TLS + ICE connections per IPKey
+	MaxConnsPerIP    int           // limits.conns_per_ip (256): every open connection per IPKey, accept to close
 	MaxICEConnsPerIP int           // 64 per IPKey; one count across 443 and 7882/tcp (§7.3)
 	QueueLen         int           // 128 per sub-listener; a full queue for 1 s drops the connection
 	PublicHost       string        // for the plain-HTTP hint response

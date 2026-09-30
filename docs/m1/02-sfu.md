@@ -623,7 +623,7 @@ connect directly. `SetNAT1To1IPs` and srflx rewrites are never used.
 | `Transport.Apply(se)` (04) | UDP/TCP muxes, network types, interface and IP filters, rewrite rules, loopback (dev), mDNS disabled | §7.1 |
 | `DisableActiveTCP(true)` | | the server never dials out |
 | `SetLite(false)` | full ICE | S4 tested full ICE; no reason to change |
-| Remote-candidate filter (in `AddICECandidate`) | drop loopback unless `Transport.IncludeLoopback` (04's `network.include_loopback`); drop link-local, multicast and unspecified addresses always; drop RFC 1918, CGNAT and ULA addresses unless any `Transport.Advertised[].LAN` is true (the server itself advertises a private address, 04's LAN/Append case) | 01 §17: a client must not make the server probe internal networks. Client addresses are learned as prflx from incoming checks anyway |
+| Remote-candidate filter (in `AddICECandidate`, and on the candidates inside every remote SDP: pub offers, sub answers and probe offers, before `SetRemoteDescription`) | drop loopback and the server's own advertised addresses unless `Transport.IncludeLoopback` (04's `network.include_loopback`); drop unparsable candidates, host names (mDNS or not), link-local, multicast, broadcast, unspecified (`0.0.0.0/8`, `::`) and IPv4-compatible IPv6 (`::/96`) addresses always; drop RFC 1918, CGNAT, ULA and site-local (`fec0::/10`) addresses unless any `Transport.Advertised[].LAN` is true (the server itself advertises a private address, 04's LAN/Append case). IPv4-mapped and NAT64 (`64:ff9b::/96`) addresses are judged by the IPv4 address inside. Pion's `SetRemoteIPFilter` is not used: Pion also applies it to prflx candidates, which the server must keep learning | 01 §17: a client must not make the server probe internal networks. Client addresses are learned as prflx from incoming checks anyway |
 | `SetICETimeouts(5 s, 15 s, 2 s)` | disconnected, failed, keepalive | the client drives restarts after 3 s; the server only cleans up |
 | `SetPrflxAcceptanceMinWait(300 ms)`, `SetSrflxAcceptanceMinWait(0)`, `SetHostAcceptanceMinWait(0)` | | when controlling (sub PC), browser pairs are prflx. Pion's default 1 s wait delays the first frame. 300 ms lets a UDP pair win over TCP |
 | `SetDTLSConnectContextMaker` | 10 s timeout | plan guard |
@@ -666,9 +666,11 @@ func (s *SFU) Probe(ctx context.Context, user UserID, t ProbeTransport, offerSDP
   (`Transport.UDPMux`), TCP 443 (`Transport.TCPMux443`) and TCP 7882 (`Transport.TCPMux7882`). Each has an empty
   MediaEngine and SCTP on. Its SettingEngine is built in these steps: `Transport.Apply(se)`; then
   `se.SetNetworkTypes` with the udp or tcp subset of `Transport.NetworkTypes` (IP family: next bullet); for
-  tcp443 and tcp7882 also `se.SetICETCPMux(Transport.TCPMux443)` or `se.SetICETCPMux(Transport.TCPMux7882)`. The UDP
-  mux is left in place, because UDP network types are off in a TCP probe. 04 guarantees that `Apply` only calls
-  SettingEngine setters, so a later setter call wins.
+  tcp443 and tcp7882 also `se.SetICETCPMux(Transport.TCPMux443)` or `se.SetICETCPMux(Transport.TCPMux7882)`. Each
+  probe keeps only its own transport's mux: a TCP probe gets no UDP mux and the UDP probe no TCP mux, because Pion
+  (ice v4.4) gathers a host candidate on every address of a UDP mux whatever the network types. For the same reason
+  an IPv4-only UDP probe (next bullet) gets a view of `Transport.UDPMux` that lists only its IPv4 sockets. 04
+  guarantees that `Apply` only calls SettingEngine setters, so a later setter call wins.
 - IP family: when 04's `Public.V4` is set (the SFU sees it as a non-LAN IPv4 entry in `Transport.Advertised`), the
   probe APIs use only `udp4`/`tcp4`, so a pass reflects the path most friends use. IPv6 is used only on IPv6-only
   servers.
@@ -1388,7 +1390,7 @@ No code from GPL projects (Screego, OBS) and none from AGPL.
 | Pre-encoded H.264 files generated at build time | Rejected. CI would need an encoder binary: x264 is GPL (banned), and FFmpeg or OpenH264 adds a native toolchain and download step. Fixed resolutions and several MB of blobs per profile in git |
 | A real encoder in Go | None exists. cgo encoders break `CGO_ENABLED=0` |
 | **Chosen: synthetic codec-shaped H.264 for load, plus a tiny pure-Go I_PCM/P_Skip encoder when frames must decode** | The SFU reads only NAL headers and SPS, so synthetic streams give accurate packet rates, sizes and keyframe bursts at almost no CPU. The load generator then measures the SFU, not an encoder. The decodable mode (about 400 lines, written from the H.264 spec) is deterministic, any resolution, and license-clean |
-| Opus | A committed 1 s asset of 50 packets (about 8 KB), generated once with `opusenc` (opus-tools and libopus, BSD) by `testdata/gen-opus.sh` plus a pure-Go Ogg page reader. CI never needs opus-tools. There is no pure-Go Opus encoder |
+| Opus | A committed 2 s asset (101 packets, about 20 KB), generated once with `opusenc` (opus-tools and libopus, BSD) by `testdata/gen-opus.sh` plus a pure-Go Ogg page reader; the source loops its second second (packets 50–99), which has a full second of encoder state behind it, so the loop point is seamless. CI never needs opus-tools. There is no pure-Go Opus encoder |
 
 `internal/media/fake` is test code: `cmd/isshoni` never imports it and no release artifact contains it (06's build
 checks that).
@@ -1439,10 +1441,11 @@ func (s *Source) Close() error
   - P frames: P_Skip everywhere (every motion vector predicts to zero) except the changed macroblocks, which are I_PCM
     (mb_type 30): a moving 32×32 box, a frame counter drawn as blocks, and a 64×64 flash square in the corner on flash
     frames.
-  - Default 640×360@30 for `f` and 320×180@15 for `q`. About 4 Mbps for `f` (dominated by the I_PCM IDR). Browsers
-    decode it everywhere.
-- **Opus**: the asset loops (a 440 Hz bed with whole cycles per second, so the loop is phase-continuous, plus a 1 kHz
-  beep in the first 100 ms of each second). The beep packet is packet 0, in sync with the flash frame.
+  - Default 640×360@30 for `f` and 320×180@15 for `q`. About 2.3 Mbps for `f` with the default 3 s GOP (about
+    4 Mbps with a 1 s GOP), dominated by the I_PCM IDR. Browsers decode it everywhere.
+- **Opus**: the asset loops in both modes (a 440 Hz bed with whole cycles per second, so the loop is
+  phase-continuous, plus a 1 kHz beep in the first 100 ms of each second; `gen-opus.sh` shifts the tone by libopus's
+  312-sample pre-skip). The beep starts at loop packet 0, in sync with the flash frame.
 
 `internal/client/publish` (M1 subset): `Publisher{PC, Source}` creates one video TrackLocal per rid, stamping the
 mid/rid extensions itself (Pion's built-in tracks don't for simulcast senders, as S4 found), plus one audio track. It

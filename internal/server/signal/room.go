@@ -68,7 +68,7 @@ func newRoom(h *Hub, id string) *room {
 }
 
 // nextRev returns the next room.state rev. The counter is the hub's, so a room's rev only grows, also across a room
-// that empties and fills again ("+1 per change in this server process", 01 §8.5).
+// that empties and fills again, though its revs may skip numbers (01 §8.5).
 func (h *Hub) nextRev() uint64 { return h.revs.Add(1) }
 
 // outbox collects the messages of a room change, to post to the connections' actors once the locks are released.

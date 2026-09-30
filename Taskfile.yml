@@ -182,14 +182,16 @@ tasks:
         if: '[ -d internal/protocol/gen/tsregistry ]'
 
   gen:check:
-    desc: Fail when web/src/protocol/ differs from what `task gen` writes (the CI drift check)
+    desc: Fail when web/src/protocol/*.gen.ts differs from what `task gen` writes (the CI drift check)
     cmds:
       - task: gen
+      # Only the generated files: uncommitted hand-written files next to them (signal-client.ts, rest.ts, ...) are
+      # not drift.
       - cmd: |
-          drift=$(git status --porcelain -- web/src/protocol/)
+          drift=$(git status --porcelain -- 'web/src/protocol/*.gen.ts')
           if [ -n "$drift" ]; then
             echo "$drift"
-            echo 'gen:check: the generated TypeScript in web/src/protocol/ is out of date: run "task gen" and commit the result' >&2
+            echo 'gen:check: the generated TypeScript in web/src/protocol/*.gen.ts is out of date: run "task gen" and commit the result' >&2
             exit 1
           fi
         silent: true
@@ -224,13 +226,16 @@ tasks:
       - go -C tools test -race -count=1 -timeout 15m ./...
 
   test:web:
-    desc: Run the web unit tests (Vitest)
+    desc: Run the web unit tests (Vitest, and Node's test runner for the license script's tests)
     cmds:
       - cmd: "echo 'test:web: skipped, web/package.json does not exist yet'"
         silent: true
         if: '[ ! -f web/package.json ]'
       - cmd: npm --prefix web test -- --run
         if: '[ -f web/package.json ]'
+      # Vitest covers src/ and build/ only; CI runs this file in its licenses job.
+      - cmd: cd web && node --test scripts/licenses.test.mjs
+        if: '[ -f web/scripts/licenses.test.mjs ]'
 
   test:sh:
     desc: Run the install.sh unit tests under dash, bash --posix and busybox sh
