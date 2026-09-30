@@ -69,53 +69,54 @@ func decodeMarker(b []byte) (Marker, bool) {
 	return m, true
 }
 
-// ParseVideoMarker returns the Marker of a synthetic slice: body is the slice NAL unit after its one-byte header, as
-// sent (with emulation prevention). Only its first bytes are read, so the start of a fragmented NAL unit (the payload
-// of the first FU-A packet after its two FU bytes) is enough. ok is false when body holds no Marker.
+// ParseVideoMarker returns the Marker of a fake slice: body is the slice NAL unit after its one-byte header, as sent
+// (with emulation prevention). Only its first bytes are read, so the start of a fragmented NAL unit (the payload of
+// the first FU-A packet after its two FU bytes) is enough. It reads both modes: a synthetic slice starts with the
+// Marker, a decodable one carries it in the first luma samples of its first macroblock. ok is false when body holds
+// no Marker.
 func ParseVideoMarker(body []byte) (m Marker, ok bool) {
-	var raw [MarkerSize]byte
-	n, zeros := 0, 0
+	var buf [markerPrefix]byte
+	rbsp := unescapePrefix(buf[:0], body)
+	if m, ok := decodeMarker(rbsp); ok {
+		return m, true
+	}
+	return parseDecodableMarker(rbsp)
+}
+
+// markerPrefix is how much RBSP ParseVideoMarker reads: enough for a decodable slice header and macroblock 0's
+// mb_type (at most 9 bytes with a 16-bit idr_pic_id), then its 36 marker samples.
+const markerPrefix = 64
+
+// unescapePrefix appends body's RBSP (emulation prevention removed) to dst, up to dst's capacity.
+func unescapePrefix(dst, body []byte) []byte {
+	zeros := 0
 	for _, c := range body {
-		if n == MarkerSize {
+		if len(dst) == cap(dst) {
 			break
 		}
 		if zeros >= 2 && c == 3 {
 			zeros = 0
 			continue
 		}
-		raw[n] = c
-		n++
+		dst = append(dst, c)
 		if c == 0 {
 			zeros++
 		} else {
 			zeros = 0
 		}
 	}
-	if n < MarkerSize {
-		return Marker{}, false
-	}
-	return decodeMarker(raw[:])
+	return dst
 }
 
-// Opus packet framing of the synthetic audio (RFC 6716 §3): code 3 with one CBR frame and padding, and the Marker at
-// the start of the padding. Decoders ignore padding, so the packets stay valid Opus. The TOC is config 31 (CELT-only,
-// fullband, 20 ms), stereo.
-const (
-	opusTOC        = 31<<3 | 1<<2 | 3 // config 31, s = 1, c = 3
-	opusCountByte  = 0x40 | 1         // v = 0 (CBR), p = 1 (padding), M = 1 frame
-	opusHeaderSize = 3                // TOC, frame count, one padding-length byte
-)
-
-// syntheticOpus makes one AudioPacketSize-byte Opus packet whose frame is seeded filler and whose padding is m.
-func syntheticOpus(m Marker, rng *rand.Rand) []byte {
-	b := make([]byte, 0, AudioPacketSize)
-	b = append(b, opusTOC, opusCountByte, MarkerSize)
-	b = appendFiller(b, AudioPacketSize-opusHeaderSize-MarkerSize, rng)
-	return appendMarker(b, m)
+// opusWithMarker returns one packet of the Opus asset as a code 3 packet whose padding is m (RFC 6716 §3.2.5).
+// Decoders ignore padding, so the audio is the asset's.
+func opusWithMarker(p opusPacket, m Marker) []byte {
+	var pad [MarkerSize]byte
+	return appendOpusPadded(make([]byte, 0, 4+len(p.frames)*2+p.bytes()+MarkerSize), p, appendMarker(pad[:0], m))
 }
 
-// ParseAudioMarker returns the Marker in the padding of a synthetic Opus packet. ok is false for any other packet,
-// including valid Opus without the Marker.
+// ParseAudioMarker returns the Marker at the start of a fake Opus packet's padding. ok is false for any other
+// packet, including valid Opus without the Marker.
 func ParseAudioMarker(opus []byte) (m Marker, ok bool) {
 	if len(opus) < 2 || opus[0]&3 != 3 || opus[1]&0x40 == 0 || opus[1]&0x3f == 0 {
 		return Marker{}, false
