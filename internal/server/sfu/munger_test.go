@@ -417,6 +417,61 @@ func TestMungerLatePackets(t *testing.T) {
 		}
 	})
 
+	t.Run("from before a pause: dropped", func(t *testing.T) {
+		m := videoMunger(SlotF)
+		feed(m, t0, vp(f, 10, 0, true), vp(f, 12, 3000, false)) // 11 is late
+		m.setTarget(SlotF, false)
+		m.setTarget(SlotF, true)
+		// Even a keyframe from before the pause doesn't restart the output: it would go back in time.
+		if _, _, v := m.process(vp(f, 11, 3000, true), t0+oneSecond); v != verdictDrop || m.n != 1 {
+			t.Fatalf("late packet after a resume: verdict %d, %d epochs", v, m.n)
+		}
+		if _, _, v := m.process(vp(f, 13, 6000, false), t0+oneSecond); v != verdictWaitKeyframe {
+			t.Fatalf("the next packet after a resume: verdict %d", v)
+		}
+		if _, _, v := m.process(vp(f, 14, 9000, true), t0+oneSecond); v != verdictNewEpoch {
+			t.Fatalf("the next keyframe after a resume: verdict %d", v)
+		}
+	})
+
+	t.Run("a long pause: seqs aren't compared", func(t *testing.T) {
+		// After more than nackLookback without output, the upstream seq may have wrapped past lastU: a keyframe that
+		// looks behind it starts an epoch as usual, with or without a new profile.
+		const behind = 1<<16 + 10 - 100 // 100 behind seq 10
+		for _, p := range []*packet{vp(f, behind, 900000, true), cb(f, behind, 900000, true), vp(f, 10, 900000, true)} {
+			m := videoMunger(SlotF)
+			feed(m, t0, vp(f, 10, 0, true))
+			m.setTarget(SlotF, false)
+			m.setTarget(SlotF, true)
+			if _, _, v := m.process(p, t0+int64(nackLookback)+tick); v != verdictNewEpoch || m.newest().profile != p.profile {
+				t.Fatalf("seq %d (%s) after a long pause: verdict %d", p.seq, p.profile, v)
+			}
+		}
+	})
+
+	t.Run("media with the seq of in-order padding: dropped", func(t *testing.T) {
+		m := videoMunger(SlotF)
+		out := feed(m, t0, vp(f, 10, 0, true), vp(f, 11, 0, false))
+		m.skipPadding(pad(f, 12), t0)
+		epoch := *m.newest()
+		// A publisher that reuses the padding's seq for media: own seq 11+1 would be sent twice.
+		if _, _, v := m.process(vp(f, 12, 3000, false), t0); v != verdictDrop || *m.newest() != epoch {
+			t.Fatalf("media with the padding's seq: verdict %d, epoch %+v, was %+v", v, *m.newest(), epoch)
+		}
+		out = append(out, feed(m, t0, vp(f, 13, 3000, false))...)
+		assertContinuous(t, out)
+		// After the next packet it is a late one, which collides with the padding epoch's first own seq.
+		if _, _, v := m.process(vp(f, 12, 3000, false), t0); v != verdictDrop {
+			t.Fatalf("late media with the padding's seq: verdict %d", v)
+		}
+		// The same for a repeat of the newest seq right after an epoch starts.
+		m.setTarget(SlotQ, true)
+		feed(m, t0, vp(q, 300, 0, true))
+		if _, _, v := m.process(vp(q, 300, 0, false), t0); v != verdictDrop {
+			t.Fatalf("a repeat of the epoch's first seq: verdict %d", v)
+		}
+	})
+
 	t.Run("more than maxLateSeq behind: dropped", func(t *testing.T) {
 		m := videoMunger(SlotF)
 		feed(m, t0, vp(f, 0, 0, true))
@@ -631,12 +686,33 @@ func TestMungerProfileChangeWaitsForKeyframe(t *testing.T) {
 	})
 	t.Run("a late packet with the old profile", func(t *testing.T) {
 		m := videoMunger(SlotF)
-		feed(m, t0, vp(f, 10, 0, true), vp(f, 11, 3000, false), cb(f, 13, 6000, true)) // 12 is late
-		if _, _, v := m.process(vp(f, 12, 3000, false), t0); v != verdictWaitKeyframe || !m.forwarding {
+		feed(m, t0, vp(f, 10, 0, true), vp(f, 12, 3000, false), cb(f, 13, 6000, true)) // 11 is late
+		// Neither a keyframe request (the CB epoch is running) nor a switch back to High.
+		if _, _, v := m.process(vp(f, 11, 3000, false), t0); v != verdictDrop || !m.forwarding {
 			t.Fatalf("late old-profile packet: verdict %d, forwarding %v", v, m.forwarding)
+		}
+		// The SPS of the last High keyframe, recovered by RTX after the CB epoch started.
+		if _, _, v := m.process(vp(f, 11, 3000, true), t0); v != verdictDrop || m.n != 2 ||
+			m.newest().profile != ProfileConstrainedBaseline {
+			t.Fatalf("late old-profile keyframe: verdict %d, %d epochs, profile %s", v, m.n, m.newest().profile)
 		}
 		if _, _, v := m.process(cb(f, 14, 6000, false), t0); v != verdictForward {
 			t.Fatalf("the CB epoch goes on: verdict %d", v)
+		}
+	})
+	t.Run("a late packet with the old profile after the change ended forwarding", func(t *testing.T) {
+		m := videoMunger(SlotF)
+		feed(m, t0, vp(f, 10, 0, true), vp(f, 12, 3000, false))
+		if _, _, v := m.process(cb(f, 13, 6000, false), t0); v != verdictWaitKeyframe || m.forwarding { // 11 is late
+			t.Fatalf("the new profile's first packet: verdict %d, forwarding %v", v, m.forwarding)
+		}
+		for _, p := range []*packet{vp(f, 11, 3000, true), vp(f, 12, 3000, false)} {
+			if _, _, v := m.process(p, t0); v != verdictDrop || m.n != 1 || m.forwarding {
+				t.Fatalf("late old-profile packet %d: verdict %d, %d epochs", p.seq, v, m.n)
+			}
+		}
+		if _, _, v := m.process(cb(f, 14, 9000, true), t0); v != verdictNewEpoch || m.newest().profile != ProfileConstrainedBaseline {
+			t.Fatalf("the CB keyframe: verdict %d", v)
 		}
 	})
 	t.Run("the old layer during a switch", func(t *testing.T) {
@@ -808,7 +884,7 @@ type fuzzSource struct {
 	tsBase  uint32 // RTP ts at capture time 0
 	frame   int64  // capture time of the current frame, in ticks
 	profile ProfileKey
-	held    []*packet // media packets lost upstream, delivered later (loose mode)
+	held    []*packet // media packets lost upstream (or reusing a padding seq), delivered later (loose mode)
 }
 
 func (s *fuzzSource) next(key bool) *packet {
@@ -818,8 +894,8 @@ func (s *fuzzSource) next(key bool) *packet {
 }
 
 // FuzzMunger drives a munger with random interleavings of three video layers (f, q, and a rebuilt f), keyframes,
-// padding, target changes, pauses, profile changes, sender reports (consistent or not) and time steps, and checks
-// the forwarded stream (02 §17):
+// padding (and media that reuses a padding seq, which the cache can't catch), target changes, pauses, profile
+// changes, sender reports (consistent or not) and time steps, and checks the forwarded stream (02 §17):
 //   - every own seq is forwarded at most once, and a NACK lookup of it maps back to the same Layer and upstream seq;
 //   - an epoch starts only on a keyframe of the target slot, right after the highest own seq, with a timestamp after
 //     the highest own ts; nothing is forwarded while paused, and other forwarded packets are of the current epoch's
@@ -835,6 +911,14 @@ func FuzzMunger(f *testing.F) {
 	f.Add([]byte{0, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
 		0x99, 0xaa, 0xbb, 0xcc, 9, 0, 1, 9, 1, 1, 0, 0, 0x80, 3, 0, 40, 7, 1, 1, 1, 0, 1, 1, 0x80, 8, 20, 4, 0, 0, 0,
 		11, 7, 2, 7, 0, 10, 0, 0, 2, 0x80, 12, 2, 4})
+	// Media 11, padding 12, media 12 on f (strict), then the same with the reuse held and delivered late (loose).
+	for _, mode := range []byte{0, 1} {
+		seed := append([]byte{mode}, make([]byte, 24)...)
+		seed[7], seed[8] = 0, 10 // f starts at seq 10
+		// f: key 10, 11, padding 12 with media 12 (held in loose mode), 13, then the held one.
+		seed = append(seed, 0, 0, 0, 0x30, 5, 0xa2, 0, 0x30, 7, 0)
+		f.Add(seed)
+	}
 	f.Fuzz(func(t *testing.T, data []byte) {
 		r := &fuzzReader{data: data}
 		strict := r.byte()&1 == 0
@@ -936,6 +1020,16 @@ func FuzzMunger(f *testing.F) {
 				p := s.next(false)
 				p.padding = true
 				m.skipPadding(p, now)
+				if arg&0x80 != 0 {
+					// A non-compliant publisher reuses the padding's seq for media: right away, or later in loose mode.
+					// The cache never holds padding, so the munger gets it.
+					reuse := &packet{layer: s.layer, seq: p.seq, ts: p.ts, profile: s.profile, keyStart: arg&0x40 != 0}
+					if strict || arg&0x20 == 0 {
+						deliver(reuse)
+					} else {
+						s.held = append(s.held, reuse)
+					}
+				}
 			case 6: // upstream loss: the packet arrives later (loose), or now (strict)
 				p := s.next(arg&0x40 == 0)
 				if strict {

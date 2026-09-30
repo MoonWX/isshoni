@@ -235,9 +235,10 @@ func pubAcceptCases(t *testing.T) []acceptCase {
 			owns(shareA), wantUnbound(1, "1")},
 		{"no tracks at all", chrome, nil, owns(shareA), wantUnbound(0, "0", "1")},
 		{"no tracks and no ownShare func", chrome, nil, nil, wantUnbound(0, "0", "1")},
-		{"an unbound section isn't checked further", edit(t, chrome, "a=rid:q send", "a=rid:h send",
-			"a=simulcast:send f;q", "a=simulcast:send f;h;x"), tracksA[1:], owns(shareA), wantUnbound(1, "0")},
+		// Only an unbound section's rids are checked (TestCheckPubOfferCodes), not its codecs.
 		{"an unbound video section without H.264", edit(t, chrome, "H264/90000", "VP8/90000"), tracksA[1:], owns(shareA),
+			wantUnbound(1, "0")},
+		{"an unbound single-layer video section", edit(t, chrome, simulcast, ""), tracksA[1:], owns(shareA),
 			wantUnbound(1, "0")},
 		{"one share bound, one unbound", chrome + withMID(t, videoSec, "0", "2") + withMID(t, audioSec, "1", "3"),
 			append(slices.Clone(tracksA), TrackBinding{MID: "3", Share: shareB, Kind: audio}), owns(shareA, shareB),
@@ -356,6 +357,27 @@ func TestCheckPubOfferCodes(t *testing.T) {
 		{"a receive simulcast rid without an a=rid line", edit(t, chrome, "a=simulcast:send f;q", "a=simulcast:send f;q recv h"),
 			tracksA, owns(shareA), CodeBadRID, shareA},
 		{"an empty rid", edit(t, chrome, "a=rid:q send", "a=rid: send"), tracksA, owns(shareA), CodeBadRID, shareA},
+
+		// An unbound sending section maps to no share, but Pion answers and receives its rids all the same: the rid
+		// guard holds for it too.
+		{"an unbound section with bad rids", edit(t, chrome, "a=rid:q send", "a=rid:h send",
+			"a=simulcast:send f;q", "a=simulcast:send f;h;x"), tracksA[1:], owns(shareA), CodeBadRID, ""},
+		{"an unbound section with many rids", edit(t, chrome, simulcast,
+			strings.Repeat("a=rid:f send\r\n", 400)+"a=simulcast:send f\r\n"), tracksA[1:], owns(shareA), CodeBadRID, ""},
+		{"an unbound section without H.264 and with bad rids", edit(t, chrome, "H264/90000", "VP8/90000",
+			"a=rid:q send", "a=rid:x send", "a=simulcast:send f;q", "a=simulcast:send f;x"), nil, nil, CodeBadRID, ""},
+		{"a simulcast rid without an a=rid line, unbound", edit(t, chrome, "a=simulcast:send f;q", "a=simulcast:send f;q;z"),
+			tracksA[1:], owns(shareA), CodeBadRID, ""},
+		{"rids on unbound audio", edit(t, chrome, "a=mid:1\r\n", "a=mid:1\r\na=rid:f send\r\n"), tracksA[:1], owns(shareA),
+			CodeBadRID, ""},
+		{"a=simulcast on unbound audio", edit(t, chrome, "a=mid:1\r\n", "a=mid:1\r\na=simulcast:send f\r\n"), tracksA[:1],
+			owns(shareA), CodeBadRID, ""},
+		{"a bad unbound section before a bad bound one", edit(t, chrome, "a=rid:q send", "a=rid:h send",
+			"a=simulcast:send f;q", "a=simulcast:send f;h", "a=mid:1\r\n", "a=mid:1\r\na=rid:f send\r\n"), tracksA[1:],
+			owns(shareA), CodeBadRID, ""},
+		{"a bad bound section before a bad unbound one", edit(t, chrome, "a=rid:q send", "a=rid:h send",
+			"a=simulcast:send f;q", "a=simulcast:send f;h", "a=mid:1\r\n", "a=mid:1\r\na=rid:f send\r\n"), tracksA[:1],
+			owns(shareA), CodeBadRID, shareA},
 	}
 	for _, c := range cases {
 		o, err := checkPubOffer(c.sdp, c.tracks, c.own)
@@ -611,6 +633,10 @@ func TestCheckPubOfferMatchesPion(t *testing.T) {
 					unbound)
 			}
 			if k < 0 {
+				// Pion answers an unbound section's rids too (unless it rejects the section): the guard holds for them.
+				if unbound && !guardedRIDs(mediaKind(md), ridIDs(md)) {
+					t.Errorf("%s: m-line %d: Pion answers rids %q on an unbound section", c.name, i, ridIDs(md))
+				}
 				continue
 			}
 			if got := ridIDs(md); !slices.Equal(got, o.sections[k].rids) {
@@ -1123,6 +1149,10 @@ func checkAcceptedAsPion(t *testing.T, offer *pubOffer) {
 		}
 		if unbound {
 			unboundSeen++
+			// Pion receives on every rid of an unbound section too: the rid guard holds for it.
+			if !guardedRIDs(mediaKind(md), ridIDs(md)) {
+				t.Fatalf("unbound m-line %d (%s): rids %q accepted", i, md.MediaName.Media, ridIDs(md))
+			}
 		}
 	}
 	if unboundSeen != len(offer.unbound) {
@@ -1138,7 +1168,7 @@ func checkAcceptedAsPion(t *testing.T, offer *pubOffer) {
 		}
 		switch s.kind {
 		case video:
-			if len(s.profiles) == 0 || len(ids) > maxRIDs {
+			if len(s.profiles) == 0 {
 				t.Fatalf("video section %+v", s)
 			}
 			for _, p := range s.profiles {
@@ -1146,17 +1176,29 @@ func checkAcceptedAsPion(t *testing.T, offer *pubOffer) {
 					t.Fatalf("profile %q accepted", p)
 				}
 			}
-			for i, r := range ids {
-				if r != ridFull && r != ridPreview || slices.Contains(ids[:i], r) {
-					t.Fatalf("rids %q accepted", ids)
-				}
-			}
 		case audio:
-			if len(ids) != 0 {
-				t.Fatalf("audio section %+v with rids %q", s, ids)
-			}
 		default:
 			t.Fatalf("section kind %v", s.kind)
 		}
+		if !guardedRIDs(s.kind, ids) {
+			t.Fatalf("%s section %+v: rids %q accepted", s.kind, s, ids)
+		}
 	}
+}
+
+// guardedRIDs reports whether rids (Pion's reading of a sending m-section's a=rid lines) pass the rid guard of 02 §12:
+// on video at most 2, from {f,q}, without repeats; on audio none.
+func guardedRIDs(kind webrtc.RTPCodecType, ids []string) bool {
+	if kind != video {
+		return len(ids) == 0
+	}
+	if len(ids) > maxRIDs {
+		return false
+	}
+	for i, r := range ids {
+		if r != ridFull && r != ridPreview || slices.Contains(ids[:i], r) {
+			return false
+		}
+	}
+	return true
 }

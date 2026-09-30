@@ -115,8 +115,10 @@ func (m *munger) waitingForKeyframe() bool {
 //     current layer keeps flowing, and target packets return verdictWaitKeyframe;
 //   - a newer packet of the current Layer with another profile ends forwarding: the old profile's stream is over, and
 //     skipping ahead within the same Layer would leave a sequence gap that NACKs can't fill with the right profile;
+//   - a late packet of the newest epoch's Layer (lateForNewest) never starts an epoch: one with the old profile after
+//     a profile change, or one from before a pause, is dropped;
 //   - a packet of the current epoch's Layer and profile is mapped by the epoch's offsets. lastS and lastTS only move
-//     forward, so reordered packets keep their mapped numbers;
+//     forward, so reordered packets keep their mapped numbers. A repeat of the newest upstream seq is dropped;
 //   - a late packet from before the current epoch's first upstream seq is mapped through an earlier epoch of the same
 //     Layer (padding and resume epochs), unless its own seq would collide with a later epoch's, or a different Layer
 //     comes first;
@@ -131,11 +133,16 @@ func (m *munger) process(p *packet, now int64) (seq uint16, ts uint32, v verdict
 		cur = m.newest()
 		if cur.layer == p.layer && cur.profile != p.profile && int16(p.seq-m.lastU) > 0 {
 			// The current layer moved on to another profile: its epoch is over, and the output restarts with a
-			// keyframe. (A late packet with the old profile after the switch is only dropped.)
+			// keyframe. (A late packet with the old profile after the switch is only dropped: lateForNewest.)
 			m.forwarding, cur = false, nil
 		}
 	}
 	if p.layer.slot == m.target && (cur == nil || cur.layer != p.layer || cur.profile != p.profile) {
+		if m.lateForNewest(p, now) {
+			// A late packet from the newest epoch's Layer, from before a profile change or a pause: switching to it
+			// would take the output back (to the old profile, which the next packet of the new one then ends).
+			return 0, 0, verdictDrop
+		}
 		if !p.keyStart {
 			return 0, 0, verdictWaitKeyframe
 		}
@@ -148,7 +155,11 @@ func (m *munger) process(p *packet, now int64) (seq uint16, ts uint32, v verdict
 
 	behind := int16(m.lastU - p.seq)
 	switch {
-	case behind <= 0: // in order, or a jump ahead
+	case behind == 0:
+		// A repeat of the newest upstream seq that the cache couldn't catch: media reusing the seq of an in-order
+		// padding packet (padding is never cached). Mapping it would send a second packet with the same own seq.
+		return 0, 0, verdictDrop
+	case behind < 0: // in order, or a jump ahead
 		m.lastU = p.seq
 		if span := m.lastU - cur.startU; span > maxEpochSpan {
 			// Keep the start within int16 reach of the newest packet. Packets and NACKs for the seqs it passes are
@@ -324,6 +335,18 @@ func (m *munger) lateEpoch(p *packet) (*epoch, bool) {
 		next = e.startS
 	}
 	return nil, false
+}
+
+// lateForNewest reports whether p is a late packet of the newest epoch's Layer: not ahead of lastU, the newest upstream
+// seq processed in that epoch. process asks only for a packet that would otherwise start an epoch (or wait for a
+// keyframe to start one): one with another profile than the current epoch's (a late packet from before a profile
+// change), or one that arrives while nothing is forwarded (from before a profile change that ended forwarding, or
+// before a pause). The comparison with lastU is trusted only while the upstream seq can't have wrapped past it: while
+// forwarding, lastU follows every packet of the Layer; otherwise at most nackLookback after lastTS last moved. After a
+// longer pause the Layer's packets start an epoch as usual, whatever their seq.
+func (m *munger) lateForNewest(p *packet, now int64) bool {
+	return m.n > 0 && m.newest().layer == p.layer && int16(p.seq-m.lastU) <= 0 &&
+		(m.forwarding || now-m.lastAt <= int64(nackLookback))
 }
 
 // push adds an epoch to the ring as the newest.
