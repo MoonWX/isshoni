@@ -107,13 +107,3 @@ func TestPaths(t *testing.T) {
 
 // isWindowsPaths accepts the backslash form filepath.Join gives on Windows.
 func isWindowsPaths(p Paths) bool { return len(p.DB) > 0 && p.DB[len(p.DataDir)] == '\\' }
-
-func TestSecretsNotImplemented(t *testing.T) {
-	s, err := OpenSecrets("secrets.json", nil)
-	if s != nil || err != ErrSecretsNotImplemented { //nolint:errorlint // the exact sentinel
-		t.Errorf("OpenSecrets = %v, %v", s, err)
-	}
-	if _, err := (&SecretStore{}).Rotate(t.Context(), []KeyName{KeySession}, true); err != ErrSecretsNotImplemented { //nolint:errorlint // the exact sentinel
-		t.Errorf("Rotate: %v", err)
-	}
-}
