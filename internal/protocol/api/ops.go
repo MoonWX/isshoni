@@ -210,24 +210,37 @@ type Alert struct {
 
 // ServerStatus is the admin socket's GET /v1/status (04 §12.2, isshoni admin status --json) and doctor's view of a
 // running server (doctor.Env.Live): version, uptime, site, TLS, public addresses, listeners, live counts, schema
-// version, and the transfer and release state that doctor's transfer and release checks need.
+// version, and the live state that only the running process knows and doctor's checks need: the public IP detection
+// (public_ip, 04 §7.4 netx.PublicAddrs), the effective media socket buffers (udp_buffers, 04 §7.3 netx.Transport),
+// and the transfer and release state (transfer, release).
 type ServerStatus struct {
-	Version       string           `json:"version"`
-	StartedAt     time.Time        `json:"startedAt"`
-	UptimeS       int64            `json:"uptimeS"`
-	Origin        string           `json:"origin"`
-	TLS           TLSInfo          `json:"tls"`
-	PublicIPv4    string           `json:"publicIpv4"`
-	PublicIPv6    string           `json:"publicIpv6"`
-	NAT           NATKind          `json:"nat"`
-	Advertised    []AdvertisedAddr `json:"advertised"`
-	Listeners     []ListenerInfo   `json:"listeners"`
-	Rooms         int              `json:"rooms"`
-	Participants  int              `json:"participants"`
-	Shares        int              `json:"shares"`
-	SchemaVersion int              `json:"schemaVersion"`
-	Transfer      *TransferInfo    `json:"transfer,omitempty"`
-	Update        *UpdateInfo      `json:"update,omitempty"`
+	Version    string    `json:"version"`
+	StartedAt  time.Time `json:"startedAt"`
+	UptimeS    int64     `json:"uptimeS"`
+	Origin     string    `json:"origin"`
+	TLS        TLSInfo   `json:"tls"`
+	PublicIPv4 string    `json:"publicIpv4"`
+	PublicIPv6 string    `json:"publicIpv6"`
+	// PublicIPv4Method and PublicIPv6Method say how netx found each address (netx.Method): "config", "interface",
+	// "stun" or "none".
+	PublicIPv4Method string `json:"publicIpv4Method,omitempty"`
+	PublicIPv6Method string `json:"publicIpv6Method,omitempty"`
+	// LocalIPv4 is the IPv4 of the default-route interface (netx.PublicAddrs.LocalV4; may equal PublicIPv4), the
+	// {local} of public_ip's port_forward fix text.
+	LocalIPv4  string           `json:"localIpv4,omitempty"`
+	NAT        NATKind          `json:"nat"`
+	Advertised []AdvertisedAddr `json:"advertised"`
+	Listeners  []ListenerInfo   `json:"listeners"`
+	// UDPRcvBufBytes and UDPSndBufBytes are the effective SO_RCVBUF and SO_SNDBUF of the media sockets, read back
+	// with getsockopt (netx.Transport.RcvBuf and SndBuf); absent when UDP is off.
+	UDPRcvBufBytes int           `json:"udpRcvBufBytes,omitempty"`
+	UDPSndBufBytes int           `json:"udpSndBufBytes,omitempty"`
+	Rooms          int           `json:"rooms"`
+	Participants   int           `json:"participants"`
+	Shares         int           `json:"shares"`
+	SchemaVersion  int           `json:"schemaVersion"`
+	Transfer       *TransferInfo `json:"transfer,omitempty"`
+	Update         *UpdateInfo   `json:"update,omitempty"`
 }
 
 // ListenerInfo is one bound listener of a running server.

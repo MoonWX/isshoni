@@ -74,7 +74,7 @@ const (
 // ConnTestRequest is POST /api/v1/conntest (04 §7.7): a real ICE check on one transport.
 type ConnTestRequest struct {
 	Transport Transport `json:"transport"`
-	Offer     string    `json:"offer"` // SDP with one data channel; never logged
+	Offer     string    `json:"offer"` // SDP with one data channel; fmt and slog show only its length (secret.go)
 }
 
 // ConnTestResponse is the reply to POST /api/v1/conntest. Errors: 400 bad_sdp, 409 transport_disabled

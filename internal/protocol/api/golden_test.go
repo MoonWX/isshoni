@@ -138,6 +138,8 @@ func goldenCases() []goldenCase {
 		{"InviteInfo", InviteInfo{
 			ServerName: "Alex's server", InvitedBy: "Alex", ExpiresAt: at("2026-10-08T12:00:00Z"), UsesLeft: 9,
 		}},
+		// Created with isshoni admin invite create (or its creator was deleted): no invitedBy.
+		{"InviteInfo.cli", InviteInfo{ServerName: "Alex's server", ExpiresAt: at("2026-10-08T12:00:00Z"), UsesLeft: 10}},
 		{"SetupCompleteRequest", SetupCompleteRequest{
 			Token: "EXAMPLEsetupTOKEN0123456789abcdefghijklmnop", Username: "Alex",
 			Password: "correct horse battery", ServerName: "Alex's server",
@@ -368,7 +370,8 @@ func goldenCases() []goldenCase {
 				NextRenewal: at("2026-10-02T12:00:00Z"), LastErrorCode: "tls.acme_unreachable",
 				LastErrorAt: at("2026-09-28T17:58:30Z"),
 			},
-			PublicIPv4: "203.0.113.7", NAT: NATKindNone, Advertised: advertised,
+			PublicIPv4: "203.0.113.7", PublicIPv4Method: "interface", PublicIPv6Method: "none",
+			LocalIPv4: "203.0.113.7", NAT: NATKindNone, Advertised: advertised,
 			Listeners: []ListenerInfo{
 				{Key: "listen.https", Network: "tcp", Addr: "[::]:443"},
 				{Key: "listen.http", Network: "tcp", Addr: "[::]:80"},
@@ -376,6 +379,8 @@ func goldenCases() []goldenCase {
 				{Key: "listen.ice_tcp", Network: "tcp", Addr: "[::]:7882"},
 				{Key: "listen.admin_socket", Network: "unix", Addr: "/run/isshoni/admin.sock"},
 			},
+			// Linux reports twice the value set with setsockopt, capped at twice rmem_max/wmem_max (212992 here).
+			UDPRcvBufBytes: 425984, UDPSndBufBytes: 425984,
 			Rooms: 1, Participants: 3, Shares: 1, SchemaVersion: 1,
 			Transfer: &transfer, Update: updateInfo,
 		}},

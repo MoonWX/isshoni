@@ -18,7 +18,6 @@
   "securityEvents": [
     {
       "id": 4811,
-      "at": "2026-10-03T19:22:05.114Z",
       "action": "user.role_changed",
       "outcome": "ok",
       "actor": {
@@ -35,7 +34,8 @@
       "detail": {
         "from": "user",
         "to": "admin"
-      }
+      },
+      "at": "2026-10-03T19:22:05.114Z"
     }
   ]
 }

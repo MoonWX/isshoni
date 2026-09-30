@@ -3,14 +3,14 @@
     "id": "k3m9p2qxw7ht",
     "username": "Alex",
     "role": "admin",
-    "createdAt": "2026-10-01T12:00:00Z"
+    "createdAt": "2026-10-01T12:00:00.000Z"
   },
   "session": {
     "id": "q1w2e3r4t5y6",
     "name": "Chrome on Windows",
-    "createdAt": "2026-10-01T12:00:00Z",
-    "expiresAt": "2027-03-30T12:00:00Z",
-    "current": true
+    "current": true,
+    "createdAt": "2026-10-01T12:00:00.000Z",
+    "expiresAt": "2027-03-30T12:00:00.000Z"
   },
   "permissions": {
     "admin": true,

@@ -7,7 +7,6 @@ import (
 	"slices"
 	"strings"
 	"testing"
-	"time"
 )
 
 // TestJSONNamesCamelCase walks every DTO type by reflection (the golden cases reach every exported struct, see
@@ -123,26 +122,6 @@ func TestValueLists(t *testing.T) {
 	}
 	if len(providers) != 13 || len(nats) != 6 {
 		t.Errorf("got %d providers and %d NAT kinds, want 13 (04 §13.3) and 6 (04 §7.4)", len(providers), len(nats))
-	}
-}
-
-func TestWireTime(t *testing.T) {
-	if !WireTime(time.Time{}).IsZero() {
-		t.Error("WireTime(zero) is not zero")
-	}
-	in := time.Date(2026, 10, 1, 14, 0, 0, 123_456_789, time.FixedZone("CEST", 2*60*60))
-	got := WireTime(in)
-	if want := time.Date(2026, 10, 1, 12, 0, 0, 123_000_000, time.UTC); !got.Equal(want) || got.Location() != time.UTC {
-		t.Errorf("WireTime = %v, want %v in UTC", got, want)
-	}
-	b, err := json.Marshal(struct {
-		At time.Time `json:"at"`
-	}{got})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(b) != `{"at":"2026-10-01T12:00:00.123Z"}` {
-		t.Errorf("encoded %s", b)
 	}
 }
 

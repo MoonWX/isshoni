@@ -169,10 +169,12 @@ type TokenRequest struct {
 
 // InviteInfo is the reply to POST /api/v1/auth/invite/check (#6).
 type InviteInfo struct {
-	ServerName string    `json:"serverName"`
-	InvitedBy  string    `json:"invitedBy"` // the creator's username
-	ExpiresAt  time.Time `json:"expiresAt"`
-	UsesLeft   int       `json:"usesLeft"`
+	ServerName string `json:"serverName"`
+	// InvitedBy is the creator's username. It is absent when the invite was created from the CLI or its creator was
+	// deleted (invites.created_by is NULL, 03 §5), like Invite.CreatedBy.
+	InvitedBy string    `json:"invitedBy,omitempty"`
+	ExpiresAt time.Time `json:"expiresAt"`
+	UsesLeft  int       `json:"usesLeft"`
 }
 
 // SetupCompleteRequest is POST /api/v1/auth/setup/complete (#8); the reply is UserResponse.

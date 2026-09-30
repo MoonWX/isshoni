@@ -1,7 +1,6 @@
 {
   "schema": 1,
   "version": "0.3.0",
-  "ranAt": "2026-09-29T20:15:00Z",
   "mode": "server",
   "summary": {
     "ok": 12,
@@ -60,5 +59,6 @@
     "egressWireMbps": 43.61,
     "ingressMediaMbps": 16.86,
     "transferPerSessionGb": 39.2
-  }
+  },
+  "ranAt": "2026-09-29T20:15:00.000Z"
 }

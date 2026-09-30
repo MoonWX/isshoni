@@ -6,12 +6,12 @@
       "id": "k3m9p2qxw7ht",
       "username": "Alex"
     },
-    "createdAt": "2026-10-01T12:00:00Z",
-    "expiresAt": "2026-10-08T12:00:00Z",
     "maxUses": 10,
     "uses": 0,
     "state": "active",
-    "redeemedBy": []
+    "redeemedBy": [],
+    "createdAt": "2026-10-01T12:00:00.000Z",
+    "expiresAt": "2026-10-08T12:00:00.000Z"
   },
   "url": "https://watch.example.com/invite#EXAMPLEinviteTOKEN0123456789abcd"
 }

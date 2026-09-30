@@ -1,8 +1,6 @@
 {
-  "generatedAt": "2026-09-29T18:00:03.5Z",
   "server": {
     "version": "0.3.0",
-    "startedAt": "2026-09-29T18:00:00Z",
     "origin": "http://localhost:8080",
     "process": {
       "cpuSeconds": 0.4,
@@ -18,7 +16,8 @@
     "publicIpv4": "",
     "publicIpv6": "",
     "nat": "unknown",
-    "advertised": []
+    "advertised": [],
+    "startedAt": "2026-09-29T18:00:00.000Z"
   },
   "transfer": {
     "month": "2026-09",
@@ -48,5 +47,6 @@
         "source": "accounts"
       }
     }
-  ]
+  ],
+  "generatedAt": "2026-09-29T18:00:03.500Z"
 }

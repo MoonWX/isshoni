@@ -3,18 +3,18 @@
     {
       "id": "q1w2e3r4t5y6",
       "name": "Chrome on Windows",
-      "createdAt": "2026-10-01T12:00:00Z",
-      "lastSeenAt": "2026-10-03T19:20:00.042Z",
       "lastIp": "203.0.113.7",
-      "current": true
+      "current": true,
+      "createdAt": "2026-10-01T12:00:00.000Z",
+      "lastSeenAt": "2026-10-03T19:20:00.042Z"
     },
     {
       "id": "z9x8c7v6b5n4",
       "name": "Safari on iPhone",
-      "createdAt": "2026-10-02T08:15:30.5Z",
-      "lastSeenAt": "2026-10-03T07:00:00Z",
       "lastIp": "198.51.100.23",
-      "current": false
+      "current": false,
+      "createdAt": "2026-10-02T08:15:30.500Z",
+      "lastSeenAt": "2026-10-03T07:00:00.000Z"
     }
   ]
 }

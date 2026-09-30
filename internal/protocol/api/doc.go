@@ -10,13 +10,17 @@
 //     tygo generates web/src/protocol/api.gen.ts from it (01 §14.4).
 //   - JSON names are camelCase; enum values are lowercase strings; error codes are snake_case and never carry English
 //     text (the SPA maps a code to errors.<code> and a field code to fieldErrors.<field>.<code>).
-//   - Timestamps are time.Time (tygo maps them to string), sent as RFC 3339 UTC strings with millisecond precision,
-//     like 01's. Producers pass them through WireTime. encoding/json drops trailing zeros of the fraction, so
-//     "2026-10-01T12:00:00Z" and "2026-10-01T12:00:00.5Z" are both valid, and readers accept any RFC 3339 form.
-//     Durations are integer seconds, with the unit in the name (expiresIn, retryAfter, expiresInS). PushPayload.TS is
-//     the one timestamp sent as unix milliseconds (04 §14.3).
+//   - Timestamps are time.Time (tygo maps them to string) and go on the wire as RFC 3339 UTC strings with exactly
+//     three fractional digits, "2026-10-01T12:00:00.000Z" (03 §3.3), like 01's: fixed width, so they also sort as
+//     text. The MarshalJSON methods in encode.go convert any location and truncate any precision for every encoder;
+//     readers accept any RFC 3339 form. Durations are integer seconds, with the unit in the name (expiresIn,
+//     retryAfter, expiresInS). PushPayload.TS is the one timestamp sent as unix milliseconds (04 §14.3).
 //   - Optional fields carry omitempty or omitzero, and their zero value means "absent". Lists are always present
-//     ([] rather than null); the only null on the wire is AuditPage.NextBefore on the last page.
+//     ([] rather than null, and AuditEntry.Detail is {} when empty), also when a producer leaves a slice nil: the
+//     same MarshalJSON methods replace nil collections. The only null on the wire is AuditPage.NextBefore on the last
+//     page.
+//   - Passwords, tokens, SDP, push endpoints and token links are redacted in fmt and log/slog output (secret.go);
+//     JSON carries them unchanged.
 //   - Within v1 every change is additive (03 §12.1): a field is never renamed, removed or retyped, and an error code is
 //     never reused with another meaning. Clients ignore unknown fields and the server ignores unknown request fields.
 //   - Enum constants are declared in const groups named <Type><Value>, which tygo turns into TypeScript unions.
@@ -25,14 +29,3 @@
 // Golden JSON for every DTO lives in testdata/; go test -run TestGolden -update rewrites it from the samples in
 // golden_test.go.
 package api
-
-import "time"
-
-// WireTime returns t as the API sends it: in UTC and truncated to whole milliseconds. The zero time stays zero, so
-// omitzero fields stay absent.
-func WireTime(t time.Time) time.Time {
-	if t.IsZero() {
-		return time.Time{}
-	}
-	return t.UTC().Truncate(time.Millisecond)
-}
