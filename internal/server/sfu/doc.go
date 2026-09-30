@@ -12,7 +12,11 @@
 //   - layer.go: Slot, packet, srInfo and the part of Layer that the munger and the packet cache use (02 §9.1);
 //   - munger.go: the per-DownTrack seq/ts rewrite with epochs (the sequence map NACKs go through), keyframe-aligned
 //     switches, SR-aligned timestamps and closed padding gaps (02 §9.4);
-//   - packetcache.go: the per-Layer ring of recent packets that serves every viewer's NACKs (02 §9.2).
+//   - packetcache.go: the per-Layer ring of recent packets that serves every viewer's NACKs (02 §9.2);
+//   - api.go: the publish, subscribe and connection-test probe webrtc.APIs on 04's netx.Transport (its muxes and
+//     filters via Transport.Apply, then the SettingEngine of 02 §7.3), ProbeTransport, the remote-candidate filter
+//     for trickled candidates and remote SDP (02 §7.3, 01 §17), the selected-pair label from Transport.Advertised
+//     and the complete-SDP helper: the SFU never trickles (02 §7.1–7.3, §7.6).
 //
 // The SFU never imports signal or protocol: 01's sfuplane adapter is the only translator between this package and
 // the wire.
