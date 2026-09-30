@@ -5,7 +5,7 @@ import (
 	"strconv"
 )
 
-// H.264 NAL unit headers of the synthetic stream (nal_ref_idc and nal_unit_type, H.264 7.3.1).
+// H.264 NAL unit headers of the fake video (nal_ref_idc and nal_unit_type, H.264 7.3.1); every frame is a reference.
 const (
 	nalSPS      = 0x67 // nal_ref_idc 3, type 7
 	nalPPS      = 0x68 // nal_ref_idc 3, type 8
@@ -208,11 +208,24 @@ func (w *bitWriter) se(v int64) {
 	}
 }
 
-// trailing writes rbsp_trailing_bits and returns the RBSP.
-func (w *bitWriter) trailing() []byte {
-	w.u(1, 1)
+// align writes zero bits up to the next byte boundary (pcm_alignment_zero_bit, H.264 7.3.5).
+func (w *bitWriter) align() {
 	if w.nbit != 0 {
 		w.u(8-w.nbit, 0)
 	}
+}
+
+// bytes writes whole bytes; the writer must be at a byte boundary.
+func (w *bitWriter) bytes(p []byte) {
+	if w.nbit != 0 {
+		panic("fake: bitWriter.bytes off a byte boundary")
+	}
+	w.b = append(w.b, p...)
+}
+
+// trailing writes rbsp_trailing_bits and returns the RBSP.
+func (w *bitWriter) trailing() []byte {
+	w.u(1, 1)
+	w.align()
 	return w.b
 }

@@ -33,7 +33,14 @@ func TestNewConfig(t *testing.T) {
 		{"all known profiles", Config{Profile: "4d00"}, nil},
 		{"audio only", Config{Layers: []VideoLayer{}, Audio: true}, nil},
 		{"nothing", Config{Layers: []VideoLayer{}}, ErrInvalidConfig},
-		{"decodable", Config{Mode: Decodable}, ErrNotImplemented},
+		{"decodable", Config{Mode: Decodable, Audio: true}, nil},
+		{"decodable 42e0", Config{Mode: Decodable, Profile: "42e0"}, nil},
+		{"decodable high", Config{Mode: Decodable, Profile: "6400"}, ErrInvalidConfig},
+		{"decodable without bitrate", Config{Mode: Decodable, Layers: with(func(l *VideoLayer) { l.Bitrate = 0 })}, nil},
+		{"decodable odd width", Config{Mode: Decodable, Layers: with(func(l *VideoLayer) { l.Width = 99 })}, ErrInvalidConfig},
+		{"decodable above level 6.2", Config{Mode: Decodable, Layers: with(func(l *VideoLayer) {
+			l.Width, l.Height = 16384, 8704
+		})}, ErrInvalidConfig},
 		{"unknown mode", Config{Mode: 7}, ErrInvalidConfig},
 		{"upper-case profile", Config{Profile: "42E0"}, ErrInvalidConfig},
 		{"short profile", Config{Profile: "640"}, ErrInvalidConfig},
@@ -145,8 +152,11 @@ func TestSyntheticBitrate(t *testing.T) {
 				continue
 			}
 			if m, ok := ParseAudioMarker(p.Data); !ok || m.Frame != uint32(audio) || m.Beep != p.Beep ||
-				m.CaptureNS != p.CaptureNS || len(p.Data) != AudioPacketSize {
+				m.CaptureNS != p.CaptureNS {
 				t.Fatalf("audio packet %d: marker %+v %v, packet %+v", audio, m, ok, p)
+			}
+			if op, err := parseOpus(p.Data); err != nil || op.samples() != audioPacketSamples {
+				t.Fatalf("audio packet %d: %v, %d samples", audio, err, op.samples())
 			}
 			if p.CaptureNS != int64(audio)*int64(AudioPacketDuration) {
 				t.Fatalf("audio packet %d at %d ns", audio, p.CaptureNS)
@@ -260,44 +270,6 @@ func TestMarkerEscaping(t *testing.T) {
 	}
 	if _, ok := ParseVideoMarker([]byte("ISHN")); ok {
 		t.Error("short input parsed as a marker")
-	}
-}
-
-func TestAudioMarker(t *testing.T) {
-	m := Marker{Beep: true, Frame: 50, CaptureNS: int64(time.Second)}
-	pkt := syntheticOpus(m, newTestRand())
-	if pkt[0] != 0xff || pkt[1] != 0x41 || pkt[2] != MarkerSize || len(pkt) != AudioPacketSize {
-		t.Fatalf("header %x, len %d", pkt[:3], len(pkt))
-	}
-	if got, ok := ParseAudioMarker(pkt); !ok || got != m {
-		t.Fatalf("ParseAudioMarker = %+v %v, want %+v", got, ok, m)
-	}
-	// A long padding: 255 means 254 bytes plus another length byte.
-	long := []byte{opusTOC, opusCountByte, 255, 255, 2}
-	long = append(long, make([]byte, 7)...) // the frame
-	long = append(long, make([]byte, 254+254+2-MarkerSize)...)
-	long = appendMarker(long, m)
-	if got, ok := ParseAudioMarker(long); ok {
-		t.Errorf("marker at the end of the padding parsed: %+v", got)
-	}
-	long = []byte{opusTOC, opusCountByte, 255, 255, 2}
-	long = append(long, make([]byte, 7)...)
-	long = appendMarker(long, m)
-	long = append(long, make([]byte, 254+254+2-MarkerSize)...)
-	if got, ok := ParseAudioMarker(long); !ok || got != m {
-		t.Errorf("long padding: %+v %v", got, ok)
-	}
-	for _, bad := range [][]byte{
-		nil, {0xfc}, {0xfc, 1, 2, 3}, // code 0
-		{0xff, 0x01, 18},  // no padding flag
-		{0xff, 0x40, 18},  // zero frames
-		{0xff, 0x41, 17},  // padding shorter than a marker
-		{0xff, 0x41, 255}, // runs out
-		append([]byte{0xff, 0x41, 200}, make([]byte, 50)...), // padding longer than the packet
-	} {
-		if m, ok := ParseAudioMarker(bad); ok {
-			t.Errorf("ParseAudioMarker(%x) = %+v, want no marker", bad, m)
-		}
 	}
 }
 
@@ -503,6 +475,15 @@ func TestDeterministic(t *testing.T) {
 func FuzzParseVideoMarker(f *testing.F) {
 	f.Add(appendEscaped(nil, appendMarker(nil, Marker{RID: "f", Frame: 1, CaptureNS: 2})))
 	f.Add([]byte("ISHN\x00\x00\x03\x00\x00\x03"))
+	// Decodable slices: an IDR and a P slice (the body after the NAL header), and their first bytes.
+	d := newDecodable(VideoLayer{RID: "q", Width: 64, Height: 48, FPS: 10})
+	for i, key := range []bool{true, false} {
+		m := Marker{RID: "q", Keyframe: key, Frame: uint32(i), CaptureNS: int64(i) * int64(100*time.Millisecond)}
+		au := d.accessUnit(key, m, m.CaptureNS, nil, nil)
+		body := au[bytes.LastIndex(au, startCode[:])+len(startCode)+1:]
+		f.Add(body)
+		f.Add(body[:markerPrefix])
+	}
 	f.Fuzz(func(t *testing.T, body []byte) {
 		m, ok := ParseVideoMarker(body)
 		if !ok {
@@ -517,7 +498,11 @@ func FuzzParseVideoMarker(f *testing.F) {
 }
 
 func FuzzParseAudioMarker(f *testing.F) {
-	f.Add(syntheticOpus(Marker{Beep: true, Frame: 3, CaptureNS: 60_000_000}, newTestRand()))
+	loop, err := audioLoop()
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(opusWithMarker(loop[0], Marker{Beep: true, Frame: 3, CaptureNS: 60_000_000}))
 	f.Add([]byte{0xff, 0x41, 0xff, 0xff, 0x05})
 	f.Fuzz(func(t *testing.T, pkt []byte) {
 		if m, ok := ParseAudioMarker(pkt); ok && m.RID != "" && len(m.RID) != 1 {

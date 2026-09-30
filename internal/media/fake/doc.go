@@ -7,12 +7,17 @@
 // seeded filler bytes, all with standard emulation prevention. The SFU reads only NAL headers and the SPS, so these
 // streams give the SFU accurate packet rates, sizes and keyframe bursts at almost no CPU. They do not decode.
 //
-// Audio is one Opus-shaped packet every 20 ms: a valid Opus packet (code 3, one CELT frame) whose padding, which
-// decoders ignore, holds the same Marker. Flash frames (one per layer) and the beep packet share one capture instant
-// every FlashEvery, which is how the A/V checks pair them.
+// The Decodable mode (decodable.go) is a tiny pure-Go encoder written from the H.264 spec: Constrained Baseline
+// ("42e0") with I_PCM and P_Skip macroblocks only, deterministic, any even size, license-clean and CGO-free. Browsers
+// decode it: an IDR frame is all I_PCM, a delta frame codes as I_PCM only the macroblocks that changed (a moving box,
+// a frame counter, a flash square and the marker macroblock, whose samples carry the same Marker) and skips the
+// rest. Its default layers are f 640×360@30 and q 320×180@15 (DefaultDecodableLayers).
 //
-// The Decodable mode (a pure-Go I_PCM/P_Skip encoder that browsers decode) and the committed Opus asset are README
-// slice S22; until then New refuses Mode Decodable with ErrNotImplemented and audio stays Opus-shaped filler.
+// Audio is one Opus packet every 20 ms from a committed asset (opus.go, testdata/tone.opus, made once with opusenc
+// by testdata/gen-opus.sh): a 440 Hz tone with a 1 kHz beep in the first 100 ms of every second, looped. Each packet
+// is the asset's packet reframed as code 3 with the same Marker in its padding, which decoders ignore. Flash frames
+// (one per layer) and Beep packets share one capture instant every FlashEvery, which is how the A/V checks pair them.
+// ParseVideoMarker and ParseAudioMarker read the Markers back from RTP payloads (sfutest.Viewer).
 //
 // This is test code: cmd/isshoni never imports it and no release artifact contains it (06's build checks that).
 package fake

@@ -47,8 +47,8 @@ type Mode uint8
 const (
 	// Synthetic makes codec-shaped H.264 that the SFU forwards like real video but no decoder can show.
 	Synthetic Mode = iota
-	// Decodable makes Constrained Baseline H.264 (I_PCM and P_Skip macroblocks) that browsers decode. Not
-	// implemented yet: README slice S22.
+	// Decodable makes Constrained Baseline H.264 of I_PCM and P_Skip macroblocks that browsers decode: a test
+	// picture with a moving box, a frame counter and the flash square (decodable.go).
 	Decodable
 )
 
@@ -56,7 +56,9 @@ const (
 type VideoLayer struct {
 	RID                string // one letter or digit: it is one byte of the Marker ("f", "q"; "h" only for guard tests)
 	Width, Height, FPS int    // even width and height; FPS 1–240
-	Bitrate            int    // bps (Synthetic), the average over a GOP; SetBitrate changes it
+	// Bitrate is the average bitrate over a GOP in bps: a positive setting in Synthetic, which SetBitrate changes.
+	// Decodable ignores it (its rate follows from the picture); DefaultDecodableLayers fills in the approximate rate.
+	Bitrate int
 }
 
 // Config configures a Source. The zero value is valid: Synthetic, High profile, the default layers, 3 s GOPs, no
@@ -64,27 +66,41 @@ type VideoLayer struct {
 type Config struct {
 	Mode Mode
 	// Profile is the H.264 profile key of the SPS: Synthetic "6400" (default) or "42e0" (to exercise the codec
-	// policy), or another profile the SFU knows ("4200", "4d00", "640c"). Decodable is always "42e0".
+	// policy), or another profile the SFU knows ("4200", "4d00", "640c"). Decodable is always "42e0" ("" or
+	// "42e0" here; anything else is an error).
 	Profile string
-	// Layers are the video layers, in the order the publisher sends them. nil means DefaultLayers(); an empty,
-	// non-nil slice means no video (then Audio must be on).
+	// Layers are the video layers, in the order the publisher sends them. nil means DefaultLayers() (Synthetic) or
+	// DefaultDecodableLayers() (Decodable); an empty, non-nil slice means no video (then Audio must be on).
 	Layers []VideoLayer
 	GOP    time.Duration // default 3 s; a keyframe request starts a new GOP
-	Audio  bool
+	// Audio adds one Opus packet every 20 ms from the committed asset (opus.go): a 440 Hz tone with a 1 kHz beep in
+	// the first 100 ms of every second, looped.
+	Audio bool
 	// FlashEvery puts one flash frame on every layer and one beep in the audio at the same capture instant, every
 	// FlashEvery (default 1 s; negative: none). The instants are k·FlashEvery for k = 0, 1, 2, …; the flash frame is
 	// the first frame at or after each instant, so flash and beep share their capture time exactly when FlashEvery is
-	// a multiple of 20 ms and of every layer's frame interval (as with the defaults).
+	// a multiple of 20 ms and of every layer's frame interval (as with the defaults). The flags are what the Markers
+	// say; the asset's audible beep comes every second, so it matches the Beep flags when FlashEvery is 1 s.
 	FlashEvery time.Duration
-	Seed       uint64 // filler bytes and frame-size jitter are a function of the seed alone
+	Seed       uint64 // Synthetic's filler bytes and frame-size jitter are a function of the seed alone
 }
 
-// DefaultLayers returns the layers of a Config without Layers: f 1920×1080@60 at 8 Mbps and q 640×360@15 at
-// 0.3 Mbps, the Auto preset's encodings (02 §8.6).
+// DefaultLayers returns the layers of a Synthetic Config without Layers: f 1920×1080@60 at 8 Mbps and q 640×360@15
+// at 0.3 Mbps, the Auto preset's encodings (02 §8.6).
 func DefaultLayers() []VideoLayer {
 	return []VideoLayer{
 		{RID: "f", Width: 1920, Height: 1080, FPS: 60, Bitrate: 8_000_000},
 		{RID: "q", Width: 640, Height: 360, FPS: 15, Bitrate: 300_000},
+	}
+}
+
+// DefaultDecodableLayers returns the layers of a Decodable Config without Layers: f 640×360@30 and q 320×180@15
+// (02 §15.1). Their Bitrate is the approximate average with the default GOP and flashes, which the I_PCM IDR
+// frames and the moving box dominate; Decodable does not use it.
+func DefaultDecodableLayers() []VideoLayer {
+	return []VideoLayer{
+		{RID: "f", Width: 640, Height: 360, FPS: 30, Bitrate: decodableRateF},
+		{RID: "q", Width: 320, Height: 180, FPS: 15, Bitrate: decodableRateQ},
 	}
 }
 
@@ -93,12 +109,12 @@ const (
 	DefaultGOP        = 3 * time.Second
 	DefaultFlashEvery = time.Second
 	DefaultProfile    = "6400"
+	// DecodableProfile is the SPS profile of Decodable: Constrained Baseline.
+	DecodableProfile = "42e0"
 	// AudioPacketDuration is the duration of one audio packet (48 kHz, 960 samples).
 	AudioPacketDuration = 20 * time.Millisecond
-	// AudioPacketSize is the size of a synthetic Opus packet: about 64 kbps, like the committed asset of S22.
-	AudioPacketSize = 160
-	maxLayers       = 4
-	maxFPS          = 240
+	maxLayers           = 4
+	maxFPS              = 240
 	// maxLag is the most media Next hands out at once to a consumer that fell behind; see Next.
 	maxLag = 200 * time.Millisecond
 )
@@ -106,8 +122,6 @@ const (
 var (
 	// ErrClosed is returned by Next after Close.
 	ErrClosed = errors.New("fake: source closed")
-	// ErrNotImplemented is returned by New for a mode that a later slice adds.
-	ErrNotImplemented = errors.New("fake: not implemented yet")
 	// ErrInvalidConfig is wrapped by every New error about the Config.
 	ErrInvalidConfig = errors.New("fake: invalid config")
 )
@@ -139,30 +153,41 @@ type stream struct {
 	sinceKey  int    // frames since the last keyframe (video)
 	forceKey  bool
 	nextFlash int64
-	jitter    float64 // the last odd delta frame's jitter, which the next even one mirrors (video)
+	jitter    float64 // the last odd delta frame's jitter, which the next even one mirrors (Synthetic video)
 	rng       *rand.Rand
-	sps, pps  []byte // NAL units with header and emulation prevention (video)
-	scratch   []byte // RBSP buffer, reused
+	sps, pps  []byte       // NAL units with header and emulation prevention (video)
+	scratch   []byte       // RBSP buffer, reused (Synthetic video)
+	dec       *decodable   // the encoder (Decodable video)
+	opus      []opusPacket // the asset's loop (audio)
 }
 
 // New checks cfg, applies its defaults and returns a Source.
 func New(cfg Config) (*Source, error) {
 	switch cfg.Mode {
 	case Synthetic:
+		if cfg.Profile == "" {
+			cfg.Profile = DefaultProfile
+		}
+		if cfg.Layers == nil {
+			cfg.Layers = DefaultLayers()
+		}
 	case Decodable:
-		return nil, fmt.Errorf("%w: Mode Decodable (README S22)", ErrNotImplemented)
+		if cfg.Profile == "" {
+			cfg.Profile = DecodableProfile
+		}
+		if cfg.Profile != DecodableProfile {
+			return nil, fmt.Errorf("%w: Profile %q: Decodable is always %q", ErrInvalidConfig, cfg.Profile,
+				DecodableProfile)
+		}
+		if cfg.Layers == nil {
+			cfg.Layers = DefaultDecodableLayers()
+		}
 	default:
 		return nil, fmt.Errorf("%w: unknown Mode %d", ErrInvalidConfig, cfg.Mode)
-	}
-	if cfg.Profile == "" {
-		cfg.Profile = DefaultProfile
 	}
 	prof, err := parseProfile(cfg.Profile)
 	if err != nil {
 		return nil, err
-	}
-	if cfg.Layers == nil {
-		cfg.Layers = DefaultLayers()
 	}
 	if len(cfg.Layers) > maxLayers {
 		return nil, fmt.Errorf("%w: %d layers, at most %d", ErrInvalidConfig, len(cfg.Layers), maxLayers)
@@ -185,7 +210,7 @@ func New(cfg Config) (*Source, error) {
 	}
 	seen := map[string]bool{}
 	for i, l := range cfg.Layers {
-		if err := checkLayer(l); err != nil {
+		if err := checkLayer(l, cfg.Mode); err != nil {
 			return nil, err
 		}
 		if seen[l.RID] {
@@ -197,13 +222,21 @@ func New(cfg Config) (*Source, error) {
 			return nil, err
 		}
 		gop := int((cfg.GOP*time.Duration(l.FPS) + time.Second/2) / time.Second)
-		s.streams = append(s.streams, &stream{
+		st := &stream{
 			kind: Video, rid: l.RID, fps: l.FPS, gopFrames: max(gop, 1), bitrate: l.Bitrate,
 			rng: newRand(cfg.Seed, uint64(i)), sps: sps, pps: buildPPS(),
-		})
+		}
+		if cfg.Mode == Decodable {
+			st.dec = newDecodable(l)
+		}
+		s.streams = append(s.streams, st)
 	}
 	if cfg.Audio {
-		s.streams = append(s.streams, &stream{kind: Audio, rng: newRand(cfg.Seed, maxLayers)})
+		loop, err := audioLoop()
+		if err != nil {
+			return nil, fmt.Errorf("fake: the Opus asset: %w", err)
+		}
+		s.streams = append(s.streams, &stream{kind: Audio, opus: loop})
 	}
 	return s, nil
 }
@@ -214,7 +247,7 @@ func newRand(seed, stream uint64) *rand.Rand {
 }
 
 // checkLayer validates one VideoLayer (the level check is buildSPS's).
-func checkLayer(l VideoLayer) error {
+func checkLayer(l VideoLayer, mode Mode) error {
 	if len(l.RID) != 1 || !isAlnum(l.RID[0]) {
 		return fmt.Errorf("%w: layer RID %q is not one letter or digit", ErrInvalidConfig, l.RID)
 	}
@@ -224,7 +257,7 @@ func checkLayer(l VideoLayer) error {
 	if l.FPS < 1 || l.FPS > maxFPS {
 		return fmt.Errorf("%w: layer %q: FPS %d not in 1–%d", ErrInvalidConfig, l.RID, l.FPS, maxFPS)
 	}
-	if l.Bitrate <= 0 {
+	if l.Bitrate <= 0 && mode == Synthetic {
 		return fmt.Errorf("%w: layer %q: Bitrate %d is not positive", ErrInvalidConfig, l.RID, l.Bitrate)
 	}
 	return nil
@@ -303,7 +336,8 @@ func (s *Source) RequestKeyframe(layer string) {
 	}
 }
 
-// SetBitrate changes a layer's average bitrate from its next frame on. An unknown layer or bps ≤ 0 is ignored.
+// SetBitrate changes a Synthetic layer's average bitrate from its next frame on. An unknown layer and bps ≤ 0 are
+// ignored, and so is every call in Decodable, which has no rate control.
 func (s *Source) SetBitrate(layer string, bps int) {
 	if bps <= 0 {
 		return
@@ -347,9 +381,13 @@ func (st *stream) videoFrame(flashEvery int64) Packet {
 	key := st.index == 0 || st.forceKey || st.sinceKey >= st.gopFrames
 	capture := st.next
 	flash := st.flash(capture, flashEvery)
-	size := st.frameSize(key)
 	m := Marker{RID: st.rid, Keyframe: key, Flash: flash, Frame: st.index, CaptureNS: capture}
-	data := st.syntheticAU(key, m, size)
+	var data []byte
+	if st.dec != nil {
+		data = st.dec.accessUnit(key, m, capture, st.sps, st.pps)
+	} else {
+		data = st.syntheticAU(key, m, st.frameSize(key))
+	}
 	if key {
 		st.sinceKey, st.forceKey = 1, false
 	} else {
@@ -380,12 +418,13 @@ func (st *stream) frameSize(key bool) int {
 	return int(p*(1+j) + 0.5)
 }
 
-// audioPacket makes the next audio packet and advances the stream.
+// audioPacket makes the next audio packet, the asset loop's next packet with the Marker in its padding, and
+// advances the stream.
 func (st *stream) audioPacket(flashEvery int64) Packet {
 	capture := st.next
 	beep := st.flash(capture, flashEvery)
 	m := Marker{Beep: beep, Frame: st.index, CaptureNS: capture}
-	data := syntheticOpus(m, st.rng)
+	data := opusWithMarker(st.opus[st.index%uint32(len(st.opus))], m)
 	st.index++
 	st.next = int64(st.index) * int64(AudioPacketDuration)
 	return Packet{Kind: Audio, CaptureNS: capture, Data: data, Beep: beep}
