@@ -160,10 +160,11 @@ keyframe.
   returns its `tracks` binding (mid → share, kind), which the viewer uses to map `ontrack` (01 §9 rule 4); the msid
   is a debugging aid.
 - Publish side: every pub offer carries 01's `tracks` binding (mid → share, kind) for each sending m-section. The SFU
-  maps tracks to shares by that binding, read afresh on every offer. A sending m-section without a binding (the hub
-  dropped the TrackRefs of a share that ended while the offer was in flight) carries no share and is answered
-  `a=inactive` (§8.4). A rebuilt pub PC has new mids but lists the same
-  `shareId`s, so its tracks attach to the existing Shares. The msid stream id the browser chose is ignored.
+  maps tracks to shares by that binding, read afresh on every offer. A sending m-section without a binding, or bound
+  to a share that isn't a `pending`/`live`/`stalled` share of this Conn (the share ended while the offer was in
+  flight: the hub drops such TrackRefs, and the SFU treats one it still gets the same way, 01 §9 rule 4), carries no
+  share and is answered `a=inactive` (§8.4). A rebuilt pub PC has new mids but lists the same `shareId`s, so its
+  tracks attach to the existing Shares. The msid stream id the browser chose is ignored.
 - Rids: `f` = full (source, ≤1080p60 by default), `q` = preview (360p15, about 0.3 Mbps). In M1 a video m-line carries
   a subset of {`f`, `q`} (at most 2 rids) or no rids, which means a single `f` layer. Any other rid is rejected with
   `sfu.bad_rid`, and so is `h` (medium): it is accepted only once the M5 `layer.mid` feature exists.
@@ -755,11 +756,12 @@ compatible one in the order `6400, 640c, 4d00, 42e0, 4200`.
 `HandleOffer(PCPub)` runs these steps in the actor:
 1. **Validate** the parsed offer (`sdpcheck.go`), before anything is applied: ≤64 KiB, ≤8 m-lines, no
    `m=application`. A sending m-line (`sendrecv` or `sendonly`) carries a share when its mid is bound in `tracks` to a
-   share of this Conn in `pending`, `live` or `stalled`. A sending m-line with no binding, or bound to any other share
-   (one that ended while the offer was in flight: the hub already dropped its TrackRefs, 01 §9 rule 4), carries no
-   share: it is not an error, skips every check below, gets `a=inactive` in step 5, and the SFU attaches nothing that
-   arrives on it. `tracks` binding one mid twice, a binding of this Conn's share whose kind isn't its m-line's, or a
-   share's second video or audio m-line is `sfu.unknown_track` (per share: at most one video and one audio m-line).
+   share of this Conn in `pending`, `live` or `stalled`. A sending m-line with no binding (the hub drops the TrackRefs
+   of a share that ended while the offer was in flight, 01 §9 rule 4), or bound to any other share (the same race
+   when the caller kept the binding, or another Conn's share), carries no share: it is not an error, skips every
+   check below (the kind check too), gets `a=inactive` in step 5, and the SFU attaches nothing that arrives on it.
+   `tracks` binding one mid twice, a binding of this Conn's share whose kind isn't its m-line's, or a share's second
+   video or audio m-line is `sfu.unknown_track` (per share: at most one video and one audio m-line).
    Video offers H.264 packetization-mode=1. Rids ⊆ {f,q}, at most 2, or none (one `f` layer). A violation returns its
    §6.3 code (with `Error.Share` set when the failing m-section maps to a share) and changes nothing. Before all this,
    a lower `gen` or a lower `neg` in the current `gen` returns `sfu.stale_offer`, and a repeated `neg` gets the stored
@@ -1548,8 +1550,9 @@ through `export_test.go`; integration tests use real time unless noted.
   arriving at 20 Mbps adds less than 20 ms; the same frame injected all at once leaves at the configured rate
   (20 Mbps for an 8 Mbps `f`, ± 10%).
 - `sdpcheck_test`: each validation code; a sending m-section without a binding, or bound to a share that isn't this
-  Conn's, carries no share and is no error (and skips the per-share checks); the Opus edit per m-line (stereo and
-  `maxaveragebitrate`) and `a=inactive` on the m-lines without a share; the answer check for m-lines without H.264.
+  Conn's, carries no share and is no error (and skips the per-share checks, the kind check included); the Opus edit
+  per m-line (stereo and `maxaveragebitrate`) and `a=inactive` on the m-lines without a share; the answer check for
+  m-lines without H.264.
 - `policy_test` (fake clock): high → cb at once; cb → high after 60 s; conns without H.264 ignored.
 - `api_test`: with a loopback `netx.Transport` (04) that has a fake 443 ICE listener, a sub offer contains UDP 7882,
   passive TCP 443 and 7882 candidates and no trickle; the probe APIs each advertise only their transport; the

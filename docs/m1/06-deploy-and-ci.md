@@ -1979,7 +1979,8 @@ Anything beyond these, such as a reload, a second tap, a re-join or a second log
 
   Any new `ISSHONI_*` name that is not a config key must be added to 04 §4.2's reserved list. 04's own env-only names
   (`ISSHONI_CONFIG`, `ISSHONI_IN_CONTAINER`, `ISSHONI_ALLOW_EPHEMERAL_DATA`) are read by 04 and are not on this list.
-- **Tools:** `tools/go.mod` (tygo, go-licenses v2, govulncheck); `.bin/` output; `tygo.yaml` at the repo root.
+- **Tools:** `tools/go.mod` (tygo, go-licenses v2, govulncheck, Task, golangci-lint, shfmt); `.bin/` output;
+  `tygo.yaml` at the repo root.
 - **Release assets and names** (section 3), Docker tags (section 3), the signing namespace `isshoni-checksums` and
   principal `isshoni-release`, `deploy/keys/allowed_signers`, and the cosign identity
   `https://github.com/MoonWX/isshoni/.github/workflows/release.yml@refs/tags/v<v>` with issuer
