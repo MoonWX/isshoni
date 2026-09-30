@@ -29,17 +29,29 @@ func TestParseH264Fmtp(t *testing.T) {
 		{"level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640c1f", "640c", true},
 		{"packetization-mode=1;profile-level-id=4d0032", "4d00", true},
 		{"PROFILE-LEVEL-ID=42E01F;Packetization-Mode=1", "42e0", true}, // case
-		{"profile-level-id=64001F; packetization-mode = 1 ", "6400", true},
-		{" packetization-mode=1 ; profile-level-id= 42001f", "4200", true},
+		// Pion trims each item as a whole, not the name or the value on their own (TestOfferedProfilesMatchPion).
+		{" packetization-mode=1 ; profile-level-id=64001F ", "6400", true},
+		{"profile-level-id=64001F; packetization-mode = 1 ", "6400", false},
+		{"packetization-mode =1;profile-level-id=64001f", "6400", false},
+		{" packetization-mode=1 ; profile-level-id= 42001f", "", true},
+		{"packetization-mode= 1;profile-level-id=42001f", "4200", false},
 		{"profile-level-id=42e01f", "42e0", false},                      // packetization-mode missing: mode 0
 		{"packetization-mode=0;profile-level-id=42e01f", "42e0", false}, // mode 0
 		{"packetization-mode=2;profile-level-id=42e01f", "42e0", false}, // mode 2 isn't supported
-		{"level-asymmetry-allowed=1;packetization-mode=1", "", true},    // profile-level-id missing
-		{"packetization-mode=1;profile-level-id=42e", "", true},         // too short
-		{"packetization-mode=1;profile-level-id=zz001f", "", true},      // not hex
-		{"packetization-mode=1;profile-level-id=4-e01f", "", true},      // not hex
-		{"packetization-mode=1;profile-level-id=42e0", "42e0", true},    // no level: still a key
-		{"packetization-mode=1;profile-level-id", "", true},             // no value
+		{"packetization-mode=01;profile-level-id=42e01f", "42e0", false},
+		{"level-asymmetry-allowed=1;packetization-mode=1", "", true}, // profile-level-id missing
+		{"packetization-mode=1;profile-level-id=42e", "", true},      // too short
+		{"packetization-mode=1;profile-level-id=zz001f", "", true},   // not hex
+		{"packetization-mode=1;profile-level-id=4-e01f", "", true},   // not hex
+		{"packetization-mode=1;profile-level-id=42e0zz", "", true},   // Pion decodes the whole value
+		{"packetization-mode=1;profile-level-id=42e01", "", true},    // odd length
+		{"packetization-mode=1;profile-level-id=42e0", "42e0", true}, // no level: still a key
+		{"packetization-mode=1;profile-level-id=42e01f00", "42e0", true},
+		{"packetization-mode=1;profile-level-id", "", true}, // no value
+		// A repeated name keeps its last value, as in Pion.
+		{"packetization-mode=1;profile-level-id=42e01f;packetization-mode=0", "42e0", false},
+		{"packetization-mode=1;profile-level-id=zz;profile-level-id=64001f", "6400", true},
+		{"packetization-mode=1;profile-level-id=64001f;profile-level-id=zz", "", true},
 		{"", "", false},
 		{";;;", "", false},
 		{"apt=96", "", false},

@@ -30,8 +30,9 @@ type pubSection struct {
 	mid   string
 	kind  webrtc.RTPCodecType
 	share ShareID
-	// Video only: the simulcast rids in offer order (empty means a single "f" layer), and the H.264 profiles of the
-	// PT table offered with packetization-mode=1, in offer order without repeats.
+	// Video only: the simulcast rids, the ids of the a=rid lines in offer order as Pion reads them (empty means a
+	// single "f" layer), and the H.264 profiles of the PT table offered with packetization-mode=1, in offer order
+	// without repeats.
 	rids     []string
 	profiles []ProfileKey
 }
@@ -46,16 +47,19 @@ type pubOffer struct {
 // from it. tracks is the offer's binding (01's TrackRefs, already filtered by the hub); ownShare reports whether a
 // share belongs to this Conn and is pending, live or stalled. The checks, in order:
 //   - sfu.bad_sdp: empty, larger than 64 KiB, unparsable, more than 8 m-lines, an m=application (data channel) or
-//     other non-media section, or an m-section that isn't rejected and has no unique mid;
+//     other non-media section, or an m-section without a unique mid (Pion's SetRemoteDescription refuses an offer
+//     with an m-section without a mid, rejected ones included);
 //   - sfu.unknown_track: a sending m-section whose mid isn't bound, is bound with the other kind, or is bound to a
 //     share that isn't this Conn's; or a second video or audio m-section for one share;
 //   - sfu.no_h264: a sending video m-section without H.264 packetization-mode=1 in one of the five profiles of the
 //     PT table (any other profile can't be negotiated, 02 §8.1);
-//   - sfu.bad_rid: a video rid outside {f,q} or more than 2 rids, or any rid on audio.
+//   - sfu.bad_rid: on a sending video m-section, an a=rid id outside {f,q}, a repeated one, more than 2, or an
+//     a=simulcast id without an a=rid line; on a sending audio m-section, any a=rid line or a=simulcast id.
 //
-// Sending means sendrecv or sendonly and not rejected (port 0 without bundle-only). Bindings for other m-sections
-// are ignored. Error.Share is set when the failing m-section maps to a share. Error messages hold positions and
-// counts, never SDP text.
+// Sending means that Pion receives on the m-section: its direction is sendrecv or sendonly. Pion ignores the port
+// of an offer's m-section, so a port-0 m-section that still sends needs a binding too. Bindings for other
+// m-sections are ignored. Error.Share is set when the failing m-section maps to a share. Error messages hold
+// positions and counts, never SDP text.
 func checkPubOffer(raw string, tracks []TrackBinding, ownShare func(ShareID) bool) (*pubOffer, error) {
 	if len(raw) > maxPubOfferBytes {
 		return nil, newError(CodeBadSDP, fmt.Sprintf("pub offer is %d bytes (max %d)", len(raw), maxPubOfferBytes))
@@ -110,7 +114,7 @@ func checkPubOffer(raw string, tracks []TrackBinding, ownShare func(ShareID) boo
 		}
 
 		s := pubSection{index: i, mid: mid, kind: kind, share: b.Share}
-		rids, ridErr := sendRIDs(md)
+		rids, ridErr := offerRIDs(md)
 		if kind == webrtc.RTPCodecTypeVideo {
 			s.profiles = offeredProfiles(md)
 			if len(s.profiles) == 0 {
@@ -120,7 +124,7 @@ func checkPubOffer(raw string, tracks []TrackBinding, ownShare func(ShareID) boo
 				return nil, shareError(CodeBadRID, b.Share, fmt.Sprintf("m-line %d: %s", i, ridErr))
 			}
 			s.rids = rids
-		} else if len(rids) > 0 {
+		} else if len(rids) > 0 || ridErr != "" {
 			return nil, shareError(CodeBadRID, b.Share, fmt.Sprintf("m-line %d: rids on an audio m-line", i))
 		}
 		offer.sections = append(offer.sections, s)
@@ -249,9 +253,10 @@ func parseSDP(raw string) (*sdp.SessionDescription, error) {
 	return desc, nil
 }
 
-// checkSections rejects data channels and other non-media sections (bad_sdp). With requireMID it also rejects
-// m-sections that aren't rejected and have no unique mid, which the pub offer's tracks binding relies on. A rejected
-// m-section may lack a mid (Pion writes none).
+// checkSections rejects data channels and other non-media sections (bad_sdp). With requireMID it also rejects an
+// m-section without a unique, non-empty mid, rejected ones included: the pub offer's tracks binding relies on mids,
+// and Pion's SetRemoteDescription refuses an offer with any m-section without a mid. An answer's rejected m-sections
+// may lack a mid (Pion writes none), so checkSubAnswer doesn't ask for them.
 func checkSections(desc *sdp.SessionDescription, requireMID bool) error {
 	mids := make(map[string]bool, len(desc.MediaDescriptions))
 	for i, md := range desc.MediaDescriptions {
@@ -261,7 +266,7 @@ func checkSections(desc *sdp.SessionDescription, requireMID bool) error {
 		case mediaKind(md) == 0:
 			return newError(CodeBadSDP, fmt.Sprintf("m-line %d is neither audio nor video", i))
 		}
-		if !requireMID || isRejected(md) {
+		if !requireMID {
 			continue
 		}
 		mid, ok := md.Attribute(sdp.AttrKeyMID)
@@ -284,27 +289,15 @@ func mediaKind(md *sdp.MediaDescription) webrtc.RTPCodecType {
 	return 0
 }
 
-// isSending reports whether the offerer sends media on an m-section: its direction is sendrecv or sendonly, and it
-// isn't rejected (port 0 without bundle-only). The direction is read the way Pion reads it: the first direction
-// attribute at media level, else at session level, else sendrecv.
+// isSending reports whether the offerer sends media on an m-section, the way Pion decides whether it receives on it:
+// its direction is sendrecv or sendonly, whatever its port. The direction is read as Pion reads it (getPeerDirection):
+// the first direction attribute at media level, else at session level, else sendrecv.
 func isSending(desc *sdp.SessionDescription, md *sdp.MediaDescription) bool {
-	if isRejected(md) {
-		return false
-	}
 	dir := direction(md.Attributes)
 	if dir == "" {
 		dir = direction(desc.Attributes)
 	}
 	return dir == "" || dir == sdp.AttrKeySendRecv || dir == sdp.AttrKeySendOnly
-}
-
-// isRejected reports whether an m-section is rejected: port 0 without bundle-only (RFC 8843 §6).
-func isRejected(md *sdp.MediaDescription) bool {
-	if md.MediaName.Port.Value != 0 {
-		return false
-	}
-	_, bundleOnly := md.Attribute("bundle-only")
-	return !bundleOnly
 }
 
 // direction returns the first direction attribute in attrs, or "".
@@ -318,67 +311,57 @@ func direction(attrs []sdp.Attribute) string {
 	return ""
 }
 
-// sendRIDs returns the send-direction rids of an m-section (a=rid lines and a=simulcast:send, RFC 8851 and 8853),
-// in order without repeats, and a description of the first rule they break: a rid outside {f,q}, or more than 2.
-func sendRIDs(md *sdp.MediaDescription) (rids []string, problem string) {
-	add := func(id string) {
-		if id != "" && !slices.Contains(rids, id) {
-			rids = append(rids, id)
+// offerRIDs returns the simulcast rids of an m-section the way Pion reads them (getRids): the first space-separated
+// field of every a=rid line, in order, whatever its direction and without removing repeats. Pion's answer lists each
+// one as a receive rid, and the publisher may then send a layer for each, so problem describes the first rule they
+// break, and rids stops there: an id outside {f,q}, a repeated id, more than 2, or an id of an a=simulcast send or
+// recv list (paused or an alternative) without an a=rid line (RFC 8853 §5.1). The work per id is constant.
+func offerRIDs(md *sdp.MediaDescription) (rids []string, problem string) {
+	for _, a := range md.Attributes {
+		if a.Key != "rid" {
+			continue
 		}
+		id, _, _ := strings.Cut(a.Value, " ")
+		switch {
+		case id != ridFull && id != ridPreview:
+			return rids, "a rid outside {f,q}"
+		case slices.Contains(rids, id):
+			return rids, "a repeated rid"
+		case len(rids) == maxRIDs: // unreachable while f and q are the only names; it matters once M5 adds h
+			return rids, fmt.Sprintf("more than %d rids", maxRIDs)
+		}
+		rids = append(rids, id)
 	}
 	for _, a := range md.Attributes {
-		switch a.Key {
-		case "rid":
-			fields := strings.Fields(a.Value)
-			if len(fields) >= 2 && fields[1] == "send" {
-				add(fields[0])
+		if a.Key != "simulcast" {
+			continue
+		}
+		for field := range strings.FieldsSeq(a.Value) {
+			if field == "send" || field == "recv" {
+				continue
 			}
-		case "simulcast":
-			fields := strings.Fields(a.Value)
-			for i := 0; i+1 < len(fields); i += 2 {
-				if fields[i] != "send" {
-					continue
-				}
-				for stream := range strings.SplitSeq(fields[i+1], ";") {
-					for alt := range strings.SplitSeq(stream, ",") {
-						add(strings.TrimPrefix(alt, "~"))
+			for stream := range strings.SplitSeq(field, ";") {
+				for alt := range strings.SplitSeq(stream, ",") {
+					if !slices.Contains(rids, strings.TrimPrefix(alt, "~")) {
+						return rids, "an a=simulcast rid without an a=rid line"
 					}
 				}
 			}
 		}
 	}
-	for _, id := range rids {
-		if id != ridFull && id != ridPreview {
-			return rids, "a rid outside {f,q}"
-		}
-	}
-	// Unreachable while f and q are the only names; it matters once M5 adds h.
-	if len(rids) > maxRIDs {
-		return rids, fmt.Sprintf("%d rids (max %d)", len(rids), maxRIDs)
-	}
 	return rids, ""
 }
 
 // offeredProfiles returns the H.264 profiles of the PT table (ProfileKey.known) that an m-section lists with
-// packetization-mode=1, in the order of the m-line's formats, without repeats. For a PT with several fmtp lines the
-// first one counts.
+// packetization-mode=1, in the order of the m-line's formats, without repeats. Codecs are read as Pion reads them
+// (sdpCodecs).
 func offeredProfiles(md *sdp.MediaDescription) []ProfileKey {
 	var out []ProfileKey
-	h264 := rtpmapPTs(md, "h264")
-	if len(h264) == 0 {
-		return nil
-	}
-	fmtps := make(map[string]string, len(h264))
-	for _, a := range md.Attributes {
-		if a.Key == "fmtp" {
-			pt, params, _ := strings.Cut(a.Value, " ")
-			if _, dup := fmtps[pt]; !dup {
-				fmtps[pt] = params
-			}
+	for _, c := range sdpCodecs(md) {
+		if !strings.EqualFold(c.name, "h264") {
+			continue
 		}
-	}
-	for _, pt := range h264 {
-		key, mode1 := parseH264Fmtp(fmtps[pt])
+		key, mode1 := parseH264Fmtp(c.fmtp)
 		if mode1 && key.known() && !slices.Contains(out, key) {
 			out = append(out, key)
 		}
@@ -386,25 +369,67 @@ func offeredProfiles(md *sdp.MediaDescription) []ProfileKey {
 	return out
 }
 
-// rtpmapPTs returns the payload types of the m-line's formats whose rtpmap names the codec (without case), in the
-// m-line's format order.
+// rtpmapPTs returns the payload types of the m-line's formats whose codec name (sdpCodecs) is codec, without case, in
+// the m-line's format order.
 func rtpmapPTs(md *sdp.MediaDescription, codec string) []string {
-	named := make(map[string]bool)
-	for _, a := range md.Attributes {
-		if a.Key != "rtpmap" {
-			continue
-		}
-		pt, enc, _ := strings.Cut(a.Value, " ")
-		name, _, _ := strings.Cut(enc, "/")
-		if strings.EqualFold(name, codec) {
-			named[pt] = true
+	var out []string
+	for _, c := range sdpCodecs(md) {
+		if strings.EqualFold(c.name, codec) {
+			out = append(out, c.pt)
 		}
 	}
-	var out []string
-	for _, f := range md.MediaName.Formats {
-		if named[f] && !slices.Contains(out, f) {
-			out = append(out, f)
+	return out
+}
+
+// sdpCodec is one format of an m-line with its codec name and fmtp parameters.
+type sdpCodec struct {
+	pt         string // as the m-line writes it
+	name, fmtp string
+}
+
+// sdpCodecs returns the m-line's formats, in order and without repeats, with the codec each one names the way Pion
+// builds a remote m-section's codecs (codecsFromMediaDescription, pion/sdp GetCodecMap): payload types are compared as
+// numbers; the first rtpmap line of a PT that parses ("<pt> <name>[/<clock rate>[/<parameters>]]", a single space,
+// a numeric clock rate) names it, and the first fmtp line with parameters gives them. PTs 0, 8 and 9 are named
+// statically (PCMU, PCMA, G722). A format that isn't a PT number is left out.
+func sdpCodecs(md *sdp.MediaDescription) []sdpCodec {
+	var names, fmtps [256]string
+	names[0], names[8], names[9] = "PCMU", "PCMA", "G722"
+	for _, a := range md.Attributes {
+		switch a.Key {
+		case "rtpmap":
+			ptStr, enc, ok := strings.Cut(a.Value, " ")
+			pt, err := strconv.ParseUint(ptStr, 10, 8)
+			if !ok || err != nil || strings.Contains(enc, " ") {
+				continue
+			}
+			name, rest, hasRate := strings.Cut(enc, "/")
+			if hasRate {
+				rate, _, _ := strings.Cut(rest, "/")
+				if _, err := strconv.ParseUint(rate, 10, 32); err != nil {
+					continue
+				}
+			}
+			if names[pt] == "" {
+				names[pt] = name
+			}
+		case "fmtp":
+			ptStr, params, ok := strings.Cut(a.Value, " ")
+			pt, err := strconv.ParseUint(ptStr, 10, 8)
+			if ok && err == nil && fmtps[pt] == "" {
+				fmtps[pt] = params
+			}
 		}
+	}
+	var seen [256]bool
+	var out []sdpCodec
+	for _, f := range md.MediaName.Formats {
+		pt, err := strconv.ParseUint(f, 10, 8)
+		if err != nil || seen[pt] {
+			continue
+		}
+		seen[pt] = true
+		out = append(out, sdpCodec{pt: f, name: names[pt], fmtp: fmtps[pt]})
 	}
 	return out
 }

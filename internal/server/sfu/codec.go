@@ -70,41 +70,40 @@ func compatible(viewer, stream ProfileKey) bool {
 	return false
 }
 
-// parseH264Fmtp returns the ProfileKey of an H.264 fmtp line and whether it asks for packetization-mode=1. The key
-// is "" when profile-level-id is missing or its first 4 characters aren't hex digits. RFC 6184 would infer Baseline
-// level 1.0 for a missing profile-level-id, but Pion never matches such a codec, so it can't be negotiated here.
-// Parameter names are matched without case and surrounding spaces, as Pion does.
+// parseH264Fmtp returns the ProfileKey of an H.264 fmtp line and whether it asks for packetization-mode=1. It reads
+// the line the way Pion's H.264 fmtp matcher does (webrtc/v4 internal/fmtp), so that what counts as H.264 mode 1 here
+// is what Pion negotiates: each ";" item is trimmed and cut at its first "=", the name is lowercased, the value is
+// taken as it is, and a repeated name keeps its last value. mode1 needs the value "1" exactly. The key is "" when
+// profile-level-id is missing or its value isn't hex of even length with at least 4 digits (profileKeyOf). RFC 6184
+// would infer Baseline level 1.0 for a missing profile-level-id, but Pion never matches such a codec, so it can't be
+// negotiated here.
 func parseH264Fmtp(fmtp string) (key ProfileKey, mode1 bool) {
 	for param := range strings.SplitSeq(fmtp, ";") {
 		name, value, _ := strings.Cut(strings.TrimSpace(param), "=")
-		switch strings.ToLower(strings.TrimSpace(name)) {
+		switch strings.ToLower(name) {
 		case "profile-level-id":
-			key = profileKeyOf(strings.TrimSpace(value))
+			key = profileKeyOf(value)
 		case "packetization-mode":
-			mode1 = strings.TrimSpace(value) == "1"
+			mode1 = value == "1"
 		}
 	}
 	return key, mode1
 }
 
-// profileKeyOf returns the lowercased first 4 hex digits of a profile-level-id value, or "".
+// profileKeyOf returns the lowercased first 4 hex digits of a profile-level-id value, or "" unless the whole value
+// is hex of even length with at least 4 digits: Pion hex-decodes the value and compares its first two bytes.
 func profileKeyOf(plid string) ProfileKey {
-	if len(plid) < 4 {
+	if len(plid) < 4 || len(plid)%2 != 0 {
 		return ""
 	}
-	var b [4]byte
-	for i := range b {
-		c := plid[i]
-		switch {
-		case '0' <= c && c <= '9', 'a' <= c && c <= 'f':
-		case 'A' <= c && c <= 'F':
-			c += 'a' - 'A'
+	for i := range len(plid) {
+		switch c := plid[i]; {
+		case '0' <= c && c <= '9', 'a' <= c && c <= 'f', 'A' <= c && c <= 'F':
 		default:
 			return ""
 		}
-		b[i] = c
 	}
-	return ProfileKey(b[:])
+	return ProfileKey(strings.ToLower(plid[:4]))
 }
 
 // codecProfile returns the ProfileKey of an H.264 codec with packetization-mode=1, and false for anything else

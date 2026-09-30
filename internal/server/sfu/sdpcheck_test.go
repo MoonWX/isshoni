@@ -4,11 +4,15 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pion/interceptor"
+	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -32,7 +36,7 @@ func owns(ids ...ShareID) func(ShareID) bool {
 }
 
 // edit applies old → new replacements to an SDP (each old must occur) and returns it.
-func edit(t *testing.T, sdp string, pairs ...string) string {
+func edit(t testing.TB, sdp string, pairs ...string) string {
 	t.Helper()
 	for i := 0; i+1 < len(pairs); i += 2 {
 		if !strings.Contains(sdp, pairs[i]) {
@@ -98,17 +102,23 @@ func TestCheckPubOfferChrome(t *testing.T) {
 	}
 }
 
-func TestCheckPubOfferAccepts(t *testing.T) {
+// acceptCase is a pub offer that checkPubOffer accepts, with an optional check of the result.
+type acceptCase struct {
+	name   string
+	sdp    string
+	tracks []TrackBinding
+	own    func(ShareID) bool
+	check  func(*pubOffer) error
+}
+
+// pubAcceptCases are the offers TestCheckPubOfferAccepts expects to pass. TestCheckPubOfferMatchesPion answers each
+// with the pub engine to check that Pion reads them the same way.
+func pubAcceptCases(t *testing.T) []acceptCase {
+	t.Helper()
 	chrome := readSDP(t, "sdp/chrome154-pub-offer.sdp")
 	videoSec, audioSec := section(t, chrome, "0"), section(t, chrome, "1")
 	simulcast := "a=rid:f send\r\na=rid:q send\r\na=simulcast:send f;q\r\n"
-	cases := []struct {
-		name   string
-		sdp    string
-		tracks []TrackBinding
-		own    func(ShareID) bool
-		check  func(*pubOffer) error
-	}{
+	return []acceptCase{
 		{"single layer (no rids)", edit(t, chrome, simulcast, ""), tracksA, owns(shareA), func(o *pubOffer) error {
 			if len(o.sections[0].rids) != 0 {
 				return fmt.Errorf("rids %v", o.sections[0].rids)
@@ -122,8 +132,23 @@ func TestCheckPubOfferAccepts(t *testing.T) {
 				}
 				return nil
 			}},
-		{"paused rid and receive rids are fine", edit(t, chrome, simulcast,
-			"a=rid:f send\r\na=rid:q send\r\na=rid:h recv\r\na=simulcast:send f;~q recv h\r\n"), tracksA, owns(shareA), nil},
+		{"a paused rid", edit(t, chrome, "a=simulcast:send f;q", "a=simulcast:send f;~q"), tracksA, owns(shareA), nil},
+		{"rid parameters and alternatives", edit(t, chrome, simulcast,
+			"a=rid:f send pt=118;max-width=1920\r\na=rid:q send\r\na=simulcast:send f,q\r\n"), tracksA, owns(shareA),
+			func(o *pubOffer) error {
+				if !slices.Equal(o.sections[0].rids, []string{"f", "q"}) {
+					return fmt.Errorf("rids %v", o.sections[0].rids)
+				}
+				return nil
+			}},
+		{"the rid direction is ignored, as in Pion", edit(t, chrome, simulcast,
+			"a=rid:q recv\r\na=rid:f recv\r\na=simulcast:recv q;f\r\n"), tracksA, owns(shareA), func(o *pubOffer) error {
+			if !slices.Equal(o.sections[0].rids, []string{"q", "f"}) {
+				return fmt.Errorf("rids %v", o.sections[0].rids)
+			}
+			return nil
+		}},
+		{"rids without a=simulcast", edit(t, chrome, "a=simulcast:send f;q\r\n", ""), tracksA, owns(shareA), nil},
 		{"video only", edit(t, chrome, audioSec, "", "a=group:BUNDLE 0 1", "a=group:BUNDLE 0"),
 			tracksA[:1], owns(shareA), nil},
 		{"audio recvonly needs no binding", edit(t, chrome, "a=sendonly\r\n"+audioMsid, "a=recvonly\r\n"+audioMsid),
@@ -135,7 +160,20 @@ func TestCheckPubOfferAccepts(t *testing.T) {
 			}},
 		{"audio inactive after its share ended", edit(t, chrome, "a=sendonly\r\n"+audioMsid, "a=inactive\r\n"+audioMsid),
 			tracksA[:1], owns(shareA), nil},
-		{"rejected audio (port 0)", edit(t, chrome, "m=audio 9 ", "m=audio 0 "), tracksA[:1], owns(shareA), nil},
+		{"stopped audio (port 0, inactive)", edit(t, chrome, "m=audio 9 ", "m=audio 0 ", "a=sendonly\r\n"+audioMsid,
+			"a=inactive\r\n"+audioMsid), tracksA[:1], owns(shareA), func(o *pubOffer) error {
+			if len(o.sections) != 1 {
+				return fmt.Errorf("%d sections", len(o.sections))
+			}
+			return nil
+		}},
+		{"port 0 without bundle-only still sends, as in Pion", edit(t, chrome, "m=audio 9 ", "m=audio 0 "), tracksA,
+			owns(shareA), func(o *pubOffer) error {
+				if len(o.sections) != 2 {
+					return fmt.Errorf("%d sections", len(o.sections))
+				}
+				return nil
+			}},
 		{"session-level recvonly", strings.Replace(edit(t, chrome, "a=sendonly\r\n", ""), "t=0 0\r\n", "t=0 0\r\na=recvonly\r\n", 1),
 			nil, nil, func(o *pubOffer) error {
 				if len(o.sections) != 0 {
@@ -171,10 +209,8 @@ func TestCheckPubOfferAccepts(t *testing.T) {
 				}
 				return nil
 			}},
-		{"rejected section without a mid", edit(t, chrome, "m=audio 9 ", "m=audio 0 ", "a=mid:1\r\n", ""),
-			tracksA[:1], owns(shareA), nil},
-		{"two rejected sections without mids", chrome + "m=video 0 UDP/TLS/RTP/SAVPF 0\r\nc=IN IP4 0.0.0.0\r\n" +
-			"m=audio 0 UDP/TLS/RTP/SAVPF 0\r\nc=IN IP4 0.0.0.0\r\n", tracksA, owns(shareA), nil},
+		{"two stopped sections", chrome + "m=video 0 UDP/TLS/RTP/SAVPF 0\r\nc=IN IP4 0.0.0.0\r\na=mid:2\r\na=inactive\r\n" +
+			"m=audio 0 UDP/TLS/RTP/SAVPF 0\r\nc=IN IP4 0.0.0.0\r\na=mid:3\r\na=inactive\r\n", tracksA, owns(shareA), nil},
 		{"unknown profiles are left out", edit(t, chrome, "profile-level-id=4d001f", "profile-level-id=f4001f"),
 			tracksA, owns(shareA), func(o *pubOffer) error {
 				if !slices.Equal(o.sections[0].profiles, []ProfileKey{"6400", "4200", "42e0"}) {
@@ -191,7 +227,10 @@ func TestCheckPubOfferAccepts(t *testing.T) {
 			}},
 		{"LF line endings", strings.ReplaceAll(chrome, "\r\n", "\n"), tracksA, owns(shareA), nil},
 	}
-	for _, c := range cases {
+}
+
+func TestCheckPubOfferAccepts(t *testing.T) {
+	for _, c := range pubAcceptCases(t) {
 		o, err := checkPubOffer(c.sdp, c.tracks, c.own)
 		if err != nil {
 			t.Errorf("%s: %v", c.name, err)
@@ -232,12 +271,20 @@ func TestCheckPubOfferCodes(t *testing.T) {
 			tracksA, owns(shareA), CodeBadSDP, ""},
 		{"text section", chrome + "m=text 9 RTP/AVP 98\r\na=mid:2\r\n", tracksA, owns(shareA), CodeBadSDP, ""},
 		{"missing mid", edit(t, chrome, "a=mid:1\r\n", ""), tracksA, owns(shareA), CodeBadSDP, ""},
+		// Pion's SetRemoteDescription refuses any m-section without a mid, rejected ones included.
+		{"rejected section without a mid", edit(t, chrome, "m=audio 9 ", "m=audio 0 ", "a=mid:1\r\n", ""),
+			tracksA[:1], owns(shareA), CodeBadSDP, ""},
+		{"two rejected sections without mids", chrome + "m=video 0 UDP/TLS/RTP/SAVPF 0\r\nc=IN IP4 0.0.0.0\r\n" +
+			"m=audio 0 UDP/TLS/RTP/SAVPF 0\r\nc=IN IP4 0.0.0.0\r\n", tracksA, owns(shareA), CodeBadSDP, ""},
 		{"missing mid on an inactive section", edit(t, chrome, "a=mid:1\r\n", "", "a=sendonly\r\n"+audioMsid, "a=inactive\r\n"+audioMsid),
 			tracksA[:1], owns(shareA), CodeBadSDP, ""},
 		{"repeated mid", edit(t, chrome, "a=mid:1\r\n", "a=mid:0\r\n"), tracksA, owns(shareA), CodeBadSDP, ""},
 		{"empty mid", edit(t, chrome, "a=mid:1\r\n", "a=mid:\r\n"), tracksA, owns(shareA), CodeBadSDP, ""},
 
 		{"sending audio not in tracks", chrome, tracksA[:1], owns(shareA), CodeUnknownTrack, ""},
+		// Pion ignores the port of an offer's m-section and receives on it all the same.
+		{"sending audio with port 0 not in tracks", edit(t, chrome, "m=audio 9 ", "m=audio 0 "), tracksA[:1], owns(shareA),
+			CodeUnknownTrack, ""},
 		{"no tracks at all", chrome, nil, owns(shareA), CodeUnknownTrack, ""},
 		{"bound with the other kind", chrome, []TrackBinding{tracksA[0], {MID: "1", Share: shareA, Kind: video}},
 			owns(shareA), CodeUnknownTrack, shareA},
@@ -271,6 +318,23 @@ func TestCheckPubOfferCodes(t *testing.T) {
 		{"Chrome's default rid names", edit(t, chrome, simulcast, "a=rid:0 send\r\na=rid:1 send\r\na=simulcast:send 0;1\r\n"),
 			tracksA, owns(shareA), CodeBadRID, shareA},
 		{"rids on audio", edit(t, chrome, "a=mid:1\r\n", "a=mid:1\r\na=rid:f send\r\n"), tracksA, owns(shareA), CodeBadRID, shareA},
+		// Pion takes every a=rid line, whatever its direction, and answers each as a receive rid.
+		{"receive rids count", edit(t, chrome, simulcast,
+			"a=rid:f send\r\na=rid:q send\r\na=rid:h recv\r\na=simulcast:send f;~q recv h\r\n"), tracksA, owns(shareA),
+			CodeBadRID, shareA},
+		{"three receive rids after f and q", edit(t, chrome, "a=simulcast:send f;q\r\n",
+			"a=rid:h recv\r\na=rid:x recv\r\na=rid:y recv\r\na=simulcast:send f;q\r\n"), tracksA, owns(shareA), CodeBadRID, shareA},
+		{"a repeated rid", edit(t, chrome, simulcast, "a=rid:f send\r\na=rid:f send\r\na=rid:f send\r\na=simulcast:send f\r\n"),
+			tracksA, owns(shareA), CodeBadRID, shareA},
+		{"a receive rid on audio", edit(t, chrome, "a=mid:1\r\n", "a=mid:1\r\na=rid:f recv\r\n"), tracksA, owns(shareA),
+			CodeBadRID, shareA},
+		{"a=simulcast on audio", edit(t, chrome, "a=mid:1\r\n", "a=mid:1\r\na=simulcast:send f\r\n"), tracksA, owns(shareA),
+			CodeBadRID, shareA},
+		{"a=simulcast without a=rid lines", edit(t, chrome, "a=rid:f send\r\na=rid:q send\r\n", ""), tracksA, owns(shareA),
+			CodeBadRID, shareA},
+		{"a receive simulcast rid without an a=rid line", edit(t, chrome, "a=simulcast:send f;q", "a=simulcast:send f;q recv h"),
+			tracksA, owns(shareA), CodeBadRID, shareA},
+		{"an empty rid", edit(t, chrome, "a=rid:q send", "a=rid: send"), tracksA, owns(shareA), CodeBadRID, shareA},
 	}
 	for _, c := range cases {
 		o, err := checkPubOffer(c.sdp, c.tracks, c.own)
@@ -424,20 +488,180 @@ a=rtpmap:109 opus/48000/2
 // pubAnswer returns the pub engine's answer to the Chrome fixture.
 func pubAnswer(t *testing.T) string {
 	t.Helper()
+	a, err := pionPubAnswer(t, readSDP(t, "sdp/chrome154-pub-offer.sdp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a.SDP
+}
+
+// pionPubAnswer answers an offer with a new PC of the pub engine: what Pion makes of an offer.
+func pionPubAnswer(t *testing.T, offer string) (webrtc.SessionDescription, error) {
+	t.Helper()
 	m, ir, err := newPubEngine()
 	if err != nil {
 		t.Fatal(err)
 	}
 	pc := newTestPC(t, testAPI(m, ir))
-	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer,
-		SDP: readSDP(t, "sdp/chrome154-pub-offer.sdp")}); err != nil {
-		t.Fatal(err)
+	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: offer}); err != nil {
+		return webrtc.SessionDescription{}, fmt.Errorf("SetRemoteDescription: %w", err)
 	}
 	a, err := pc.CreateAnswer(nil)
 	if err != nil {
-		t.Fatal(err)
+		return webrtc.SessionDescription{}, fmt.Errorf("CreateAnswer: %w", err)
 	}
-	return a.SDP
+	return a, nil
+}
+
+// ridIDs returns the ids of an m-section's a=rid lines, read as Pion reads them: the first space-separated field.
+func ridIDs(md *sdp.MediaDescription) []string {
+	var ids []string
+	for _, a := range md.Attributes {
+		if a.Key == "rid" {
+			ids = append(ids, strings.Split(a.Value, " ")[0])
+		}
+	}
+	return ids
+}
+
+// TestPionRefusesSectionsWithoutMid pins down why checkPubOffer asks every m-section for a mid, rejected ones
+// included: Pion's SetRemoteDescription would fail after the pub PC was created (sfu.internal, retryable) instead of
+// the offer being refused with nothing changed (sfu.bad_sdp).
+func TestPionRefusesSectionsWithoutMid(t *testing.T) {
+	chrome := readSDP(t, "sdp/chrome154-pub-offer.sdp")
+	offer := edit(t, chrome, "m=audio 9 ", "m=audio 0 ", "a=mid:1\r\n", "")
+	if _, err := pionPubAnswer(t, offer); err == nil {
+		t.Error("Pion accepts a rejected m-section without a mid: checkPubOffer may allow it again")
+	}
+	_, err := checkPubOffer(offer, tracksA[:1], owns(shareA))
+	wantCode(t, "rejected section without a mid", err, CodeBadSDP, "")
+}
+
+// TestCheckPubOfferMatchesPion answers every offer of pubAcceptCases with the pub engine and checks that Pion reads
+// it the way checkPubOffer did: Pion receives (answers recvonly) on exactly the m-sections in offer.sections, the
+// rids it answers on each are the section's rids, and each video section's answer keeps an H.264 codec.
+func TestCheckPubOfferMatchesPion(t *testing.T) {
+	for _, c := range pubAcceptCases(t) {
+		o, err := checkPubOffer(c.sdp, c.tracks, c.own)
+		if err != nil {
+			t.Errorf("%s: %v", c.name, err)
+			continue
+		}
+		a, err := pionPubAnswer(t, c.sdp)
+		if err != nil {
+			t.Errorf("%s: Pion refuses an accepted offer: %v", c.name, err)
+			continue
+		}
+		answer, err := parseSDP(a.SDP)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if len(answer.MediaDescriptions) != len(o.desc.MediaDescriptions) {
+			t.Errorf("%s: %d answer m-sections for %d offered", c.name, len(answer.MediaDescriptions),
+				len(o.desc.MediaDescriptions))
+			continue
+		}
+		for i, md := range answer.MediaDescriptions {
+			k := slices.IndexFunc(o.sections, func(s pubSection) bool { return s.index == i })
+			dir := direction(md.Attributes)
+			receives := dir == sdp.AttrKeyRecvOnly || dir == sdp.AttrKeySendRecv
+			if receives != (k >= 0) {
+				t.Errorf("%s: m-line %d: Pion answers %s, checkPubOffer counts it as sending: %v", c.name, i, dir, k >= 0)
+				continue
+			}
+			if k < 0 {
+				continue
+			}
+			if got := ridIDs(md); !slices.Equal(got, o.sections[k].rids) {
+				t.Errorf("%s: m-line %d: Pion answers rids %q, checkPubOffer read %q", c.name, i, got, o.sections[k].rids)
+			}
+			if o.sections[k].kind == video && len(rtpmapPTs(md, "h264")) == 0 {
+				t.Errorf("%s: m-line %d: Pion's answer has no H.264", c.name, i)
+			}
+		}
+	}
+}
+
+// TestOfferedProfilesMatchPion checks that offeredProfiles reads rtpmap and fmtp lines the way Pion negotiates them:
+// for each variant of one H.264 payload type (120), offeredProfiles of a video m-line with only that PT is non-empty
+// exactly when Pion's answer keeps PT 120 (and checkPubOffer returns sfu.no_h264 exactly when it doesn't). The offer
+// Pion answers also carries a control PT (125, Constrained Baseline) that always matches: Pion falls back to a partial
+// match (name and clock rate only) when no offered codec matches exactly, and the control turns that fallback off.
+func TestOfferedProfilesMatchPion(t *testing.T) {
+	chrome := readSDP(t, "sdp/chrome154-pub-offer.sdp")
+	start, end := strings.Index(chrome, "a=rtpmap:118 "), strings.Index(chrome, "a=rid:f send")
+	head, tail := chrome[:start], chrome[end:]
+	mline := "m=video 9 UDP/TLS/RTP/SAVPF 118 119 102 103 108 109 116 117\r\n"
+	build := func(formats, codecLines string) string {
+		return edit(t, head, mline, "m=video 9 UDP/TLS/RTP/SAVPF "+formats+"\r\n") + crlf(codecLines) + tail
+	}
+	const control = "a=rtpmap:125 H264/90000\na=fmtp:125 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\n"
+	variants := []struct {
+		name, lines string
+		want        bool
+	}{
+		{"Chrome's High", "a=rtpmap:120 H264/90000\na=fmtp:120 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=64001f\n", true},
+		{"lowercase name and parameters", "a=rtpmap:120 h264/90000\na=fmtp:120 PACKETIZATION-MODE=1;PROFILE-LEVEL-ID=4D001F\n", true},
+		{"no clock rate", "a=rtpmap:120 H264\na=fmtp:120 packetization-mode=1;profile-level-id=64001f\n", true},
+		{"spaces around items", "a=rtpmap:120 H264/90000\na=fmtp:120  packetization-mode=1 ; profile-level-id=640c1f \n", true},
+		{"space before =", "a=rtpmap:120 H264/90000\na=fmtp:120 packetization-mode =1;profile-level-id=64001f\n", false},
+		{"space after =", "a=rtpmap:120 H264/90000\na=fmtp:120 packetization-mode= 1;profile-level-id=64001f\n", false},
+		{"space in profile-level-id", "a=rtpmap:120 H264/90000\na=fmtp:120 packetization-mode=1;profile-level-id= 64001f\n", false},
+		{"odd profile-level-id", "a=rtpmap:120 H264/90000\na=fmtp:120 packetization-mode=1;profile-level-id=64001\n", false},
+		{"non-hex level", "a=rtpmap:120 H264/90000\na=fmtp:120 packetization-mode=1;profile-level-id=6400zz\n", false},
+		{"profile without level", "a=rtpmap:120 H264/90000\na=fmtp:120 packetization-mode=1;profile-level-id=4200\n", true},
+		{"profile outside the table", "a=rtpmap:120 H264/90000\na=fmtp:120 packetization-mode=1;profile-level-id=f4001f\n", false},
+		{"packetization-mode 0", "a=rtpmap:120 H264/90000\na=fmtp:120 packetization-mode=0;profile-level-id=42e01f\n", false},
+		{"packetization-mode 01", "a=rtpmap:120 H264/90000\na=fmtp:120 packetization-mode=01;profile-level-id=42e01f\n", false},
+		{"no fmtp", "a=rtpmap:120 H264/90000\n", false},
+		{"the last repeated parameter wins",
+			"a=rtpmap:120 H264/90000\na=fmtp:120 packetization-mode=0;profile-level-id=42e01f;packetization-mode=1\n", true},
+		{"the first fmtp line wins", "a=rtpmap:120 H264/90000\na=fmtp:120 packetization-mode=0;profile-level-id=42e01f\n" +
+			"a=fmtp:120 packetization-mode=1;profile-level-id=42e01f\n", false},
+		{"an empty fmtp line doesn't count", "a=rtpmap:120 H264/90000\na=fmtp:120 \n" +
+			"a=fmtp:120 packetization-mode=1;profile-level-id=42e01f\n", true},
+		{"the first rtpmap line wins (VP8)", "a=rtpmap:120 VP8/90000\na=rtpmap:120 H264/90000\n" +
+			"a=fmtp:120 packetization-mode=1;profile-level-id=42e01f\n", false},
+		{"the first rtpmap line wins (H.264)", "a=rtpmap:120 H264/90000\na=rtpmap:120 VP8/90000\n" +
+			"a=fmtp:120 packetization-mode=1;profile-level-id=42e01f\n", true},
+		{"an rtpmap that doesn't parse doesn't count", "a=rtpmap:120 H264/fast\na=rtpmap:120 VP8/90000\n" +
+			"a=fmtp:120 packetization-mode=1;profile-level-id=42e01f\n", false},
+		{"an rtpmap with two spaces doesn't count", "a=rtpmap:120  H264/90000\na=rtpmap:120 H264/90000 x\n" +
+			"a=rtpmap:120 H264/90000\na=fmtp:120 packetization-mode=1;profile-level-id=42e01f\n", true},
+		{"a PT number with a leading zero", "a=rtpmap:0120 H264/90000\na=fmtp:120 packetization-mode=1;profile-level-id=42e01f\n", true},
+	}
+	for _, v := range variants {
+		alone := build("120", v.lines)
+		desc, err := parseSDP(alone)
+		if err != nil {
+			t.Fatalf("%s: %v", v.name, err)
+		}
+		if got := len(offeredProfiles(desc.MediaDescriptions[0])) > 0; got != v.want {
+			t.Errorf("%s: offeredProfiles says H.264 %v, want %v", v.name, got, v.want)
+		}
+		_, err = checkPubOffer(alone, tracksA, owns(shareA))
+		if v.want && err != nil {
+			t.Errorf("%s: %v", v.name, err)
+		} else if !v.want {
+			wantCode(t, v.name, err, CodeNoH264, shareA)
+		}
+		a, err := pionPubAnswer(t, build("120 125", v.lines+control))
+		if err != nil {
+			t.Errorf("%s: %v", v.name, err)
+			continue
+		}
+		answer, err := parseSDP(a.SDP)
+		if err != nil {
+			t.Fatal(err)
+		}
+		formats := answer.MediaDescriptions[0].MediaName.Formats
+		if !slices.Contains(formats, "125") {
+			t.Errorf("%s: Pion dropped the control PT: %v", v.name, formats)
+		}
+		if got := slices.Contains(formats, "120"); got != v.want {
+			t.Errorf("%s: Pion keeps PT 120: %v, want %v", v.name, got, v.want)
+		}
+	}
 }
 
 // lineDiff returns the lines of b that aren't in a, and the lines of a that aren't in b.
@@ -544,7 +768,11 @@ func TestSetFmtpParams(t *testing.T) {
 }
 
 func FuzzSDPCheck(f *testing.F) {
-	f.Add(readSDP(f, "sdp/chrome154-pub-offer.sdp"))
+	chrome := readSDP(f, "sdp/chrome154-pub-offer.sdp")
+	f.Add(chrome)
+	f.Add(strings.Replace(chrome, "a=simulcast:send f;q", "a=rid:h recv\r\na=simulcast:send f;q recv h", 1))
+	f.Add(strings.Replace(chrome, "m=audio 9 ", "m=audio 0 ", 1))
+	f.Add(strings.Replace(chrome, "a=mid:1\r\n", "a=mid:1\r\na=rid:f recv\r\n", 1))
 	f.Add("v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:0\r\n" +
 		"a=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1;profile-level-id=42e01f\r\na=rid:f send\r\n" +
 		"a=simulcast:send f;~q,h\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:1\r\na=rtpmap:111 opus/48000/2\r\n" +
@@ -563,31 +791,7 @@ func FuzzSDPCheck(f *testing.F) {
 				t.Fatalf("checkPubOffer: %v is not an *Error", err)
 			}
 		} else {
-			if len(offer.sections) > maxPubMLines {
-				t.Fatalf("%d sections", len(offer.sections))
-			}
-			for _, s := range offer.sections {
-				if s.share != shareA && s.share != shareB {
-					t.Fatalf("section bound to %q", s.share)
-				}
-				switch s.kind {
-				case video:
-					if len(s.profiles) == 0 || len(s.rids) > maxRIDs {
-						t.Fatalf("video section %+v", s)
-					}
-					for _, r := range s.rids {
-						if r != ridFull && r != ridPreview {
-							t.Fatalf("rid %q accepted", r)
-						}
-					}
-				case audio:
-					if len(s.rids) != 0 {
-						t.Fatalf("audio section %+v", s)
-					}
-				default:
-					t.Fatalf("section kind %v", s.kind)
-				}
-			}
+			checkAcceptedAsPion(t, offer)
 		}
 		if _, err := checkSubAnswer(raw); err != nil {
 			var e *Error
@@ -599,4 +803,156 @@ func FuzzSDPCheck(f *testing.F) {
 			_, _ = setOpusAnswerParams(raw, map[string]int{"0": 1, "1": 256000})
 		}
 	})
+}
+
+// worstCaseOffers are pub offers of just under 64 KiB built to make checkPubOffer work hard, with the code each gets.
+func worstCaseOffers(t testing.TB) []struct{ name, sdp, code string } {
+	t.Helper()
+	chrome := readSDP(t, "sdp/chrome154-pub-offer.sdp")
+	fill := func(prefix string, item func(i int) string, sep, suffix string) string {
+		var b strings.Builder
+		b.WriteString(prefix)
+		for i := 0; ; i++ {
+			next := item(i)
+			if len(chrome)+b.Len()+len(sep)+len(next)+len(suffix)+64 > maxPubOfferBytes {
+				break
+			}
+			if i > 0 {
+				b.WriteString(sep)
+			}
+			b.WriteString(next)
+		}
+		return b.String() + suffix
+	}
+	fq := func(i int) string { return [...]string{"f", "q"}[i%2] }
+	return []struct{ name, sdp, code string }{
+		// About 13k distinct ids: checking them one by one against all the others was quadratic.
+		{"a long a=simulcast list", edit(t, chrome, "a=simulcast:send f;q\r\n",
+			fill("a=simulcast:send f;q;", strconv.Itoa, ";", "\r\n")), CodeBadRID},
+		{"a long a=simulcast list of known rids", edit(t, chrome, "a=simulcast:send f;q\r\n",
+			fill("a=simulcast:send ", fq, ";", "\r\n")), ""},
+		{"many a=rid lines", edit(t, chrome, "a=simulcast:send f;q\r\n",
+			fill("", func(int) string { return "a=rid:f send" }, "\r\n", "\r\n")), CodeBadRID},
+		{"many formats", edit(t, chrome, "SAVPF 118 119 102", fill("SAVPF ", func(int) string { return "118" }, " ", " 119 102")), ""},
+		{"a long fmtp line", edit(t, chrome, "a=fmtp:118 ", fill("a=fmtp:118 ", func(int) string { return "x=1" }, ";", ";")), ""},
+	}
+}
+
+// TestCheckPubOfferWorstCase checks that checkPubOffer stays linear in the offer's size: it runs on the Conn actor
+// for every offer, and repeated negotiations within one gen aren't rate-limited. The yardstick is the time pion/sdp
+// takes to parse the same offer, which is linear and part of the check: each worst case takes at most about 12 times
+// that (3 times with -race). The bound only catches quadratic work: the long a=simulcast list once took about 1700
+// times the parse.
+func TestCheckPubOfferWorstCase(t *testing.T) {
+	best := func(f func()) time.Duration {
+		d := time.Duration(math.MaxInt64)
+		for range 5 {
+			start := time.Now()
+			f()
+			d = min(d, time.Since(start))
+		}
+		return d
+	}
+	for _, c := range worstCaseOffers(t) {
+		if len(c.sdp) > maxPubOfferBytes || len(c.sdp) < maxPubOfferBytes-200 {
+			t.Fatalf("%s: %d bytes", c.name, len(c.sdp))
+		}
+		_, err := checkPubOffer(c.sdp, tracksA, owns(shareA))
+		if c.code == "" && err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		} else if c.code != "" {
+			wantCode(t, c.name, err, c.code, shareA)
+		}
+		parse := best(func() { _, _ = parseSDP(c.sdp) })
+		check := best(func() { _, _ = checkPubOffer(c.sdp, tracksA, owns(shareA)) })
+		t.Logf("%s: parse %v, check %v", c.name, parse, check)
+		if bound := 20*parse + time.Millisecond; check > bound {
+			t.Errorf("%s: checkPubOffer took %v, parsing takes %v (max %v)", c.name, check, parse, bound)
+		}
+	}
+}
+
+func BenchmarkCheckPubOfferWorstCase(b *testing.B) {
+	for _, c := range worstCaseOffers(b) {
+		b.Run(strings.ReplaceAll(c.name, " ", "_"), func(b *testing.B) {
+			b.SetBytes(int64(len(c.sdp)))
+			for b.Loop() {
+				_, _ = checkPubOffer(c.sdp, tracksA, owns(shareA))
+			}
+		})
+	}
+}
+
+// checkAcceptedAsPion checks an offer that checkPubOffer accepted against the way Pion reads it, restated from Pion's
+// code (webrtc v4.2): every m-section has a unique, non-empty mid (SetRemoteDescription refuses one without a mid);
+// every m-section Pion receives on (getPeerDirection: sendrecv or sendonly, whatever the port) is a bound section;
+// and each section's rids are the first fields of all its a=rid lines (getRids): at most 2 from {f,q} without repeats
+// on video, none on audio. Video sections offer at least one profile of the PT table.
+func checkAcceptedAsPion(t *testing.T, offer *pubOffer) {
+	t.Helper()
+	desc := offer.desc
+	if len(offer.sections) > maxPubMLines {
+		t.Fatalf("%d sections", len(offer.sections))
+	}
+	mids := map[string]bool{}
+	for i, md := range desc.MediaDescriptions {
+		mid := ""
+		for _, a := range md.Attributes {
+			if a.Key == "mid" {
+				mid = a.Value
+				break
+			}
+		}
+		if mid == "" || mids[mid] {
+			t.Fatalf("m-line %d: mid %q accepted", i, mid)
+		}
+		mids[mid] = true
+
+		dir := "sendrecv"
+	find:
+		for _, attrs := range [][]sdp.Attribute{md.Attributes, desc.Attributes} {
+			for _, a := range attrs {
+				switch a.Key {
+				case "sendrecv", "sendonly", "recvonly", "inactive":
+					dir = a.Key
+					break find
+				}
+			}
+		}
+		bound := slices.ContainsFunc(offer.sections, func(s pubSection) bool { return s.index == i })
+		if (dir == "sendrecv" || dir == "sendonly") && !bound {
+			t.Fatalf("m-line %d is %s but not a bound section", i, dir)
+		}
+	}
+	for _, s := range offer.sections {
+		if s.share != shareA && s.share != shareB {
+			t.Fatalf("section bound to %q", s.share)
+		}
+		ids := ridIDs(desc.MediaDescriptions[s.index])
+		if !slices.Equal(ids, s.rids) {
+			t.Fatalf("m-line %d: rids %q, Pion reads %q", s.index, s.rids, ids)
+		}
+		switch s.kind {
+		case video:
+			if len(s.profiles) == 0 || len(ids) > maxRIDs {
+				t.Fatalf("video section %+v", s)
+			}
+			for _, p := range s.profiles {
+				if !p.known() {
+					t.Fatalf("profile %q accepted", p)
+				}
+			}
+			for i, r := range ids {
+				if r != ridFull && r != ridPreview || slices.Contains(ids[:i], r) {
+					t.Fatalf("rids %q accepted", ids)
+				}
+			}
+		case audio:
+			if len(ids) != 0 {
+				t.Fatalf("audio section %+v with rids %q", s, ids)
+			}
+		default:
+			t.Fatalf("section kind %v", s.kind)
+		}
+	}
 }
