@@ -18,7 +18,10 @@ tool (
 	mvdan.cc/sh/v3/cmd/shfmt
 )
 
-require golang.org/x/mod v0.41.0
+require (
+	github.com/google/licensecheck v0.3.1
+	golang.org/x/mod v0.41.0
+)
 
 require (
 	4d63.com/gocheckcompilerdirectives v1.4.0 // indirect
