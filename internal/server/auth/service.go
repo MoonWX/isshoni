@@ -12,12 +12,13 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/store"
 )
 
-// This file declares the whole Go API of 03 §7.13 (README S24, "interfaces first"): the Service with every method,
-// Options, New, Principal, ActorOf, ConnSelector, ConnCloser, LoginResult, RegisterResult, UserChange and the
-// smaller types. The bodies come later: sessions, login and setup with README S30, then invites and registration,
-// self-service, admin users and the janitor with the later auth slices (03 §18 slices 6–13). Until then every method
-// with an error result returns notImplemented(method): an error that names the method and wraps
-// *api.Error{internal}, so an HTTP handler that calls it answers 500 internal (api has no not_implemented code).
+// This file declares the whole Go API of 03 §7.13 (README S24, "interfaces first"): the Service with every M1 method
+// (the four M2 device-flow methods come with their DTOs, see "later (M2)" below), Options, New, Principal, ActorOf,
+// ConnSelector, ConnCloser, LoginResult, RegisterResult, UserChange and the smaller types. The bodies come later:
+// sessions, login and setup with README S30, then invites and registration, self-service, admin users and the
+// janitor with the later auth slices (03 §18 slices 6–13). Until then every method with an error result returns
+// notImplemented(method): an error that names the method and wraps *api.Error{internal}, so an HTTP handler that
+// calls it answers 500 internal (api has no not_implemented code).
 // The pure functions (Principal.IsAdmin, ActorOf, IPKey, NormalizeUsername, CheckPassword, DescribeUserAgent) work.
 //
 // All service errors are *api.Error (03 §12.2) carrying a stable code, so httpapi maps them to statuses in one
@@ -196,8 +197,9 @@ type LoginResult struct {
 // ---- HTTP integration (03 §7.4–7.6) ----
 
 // Authenticate returns the caller of a REST request: the session cookie in M1 (bearer tokens in M2). A missing,
-// invalid or expired credential, or a user who is not active, is *api.Error{unauthenticated}; in M1 so is any
-// Authorization header (03 §7.5).
+// invalid or expired credential, or a user who is not active, is *api.Error{unauthenticated}. In M1 so is any
+// Authorization header (03 §7.5): httpapi's /api/v1 chain already answers such a request with 401 before its CSRF
+// step, on every route, and Authenticate rejects the header too for any other caller.
 func (s *Service) Authenticate(r *http.Request) (Principal, error) {
 	return Principal{}, notImplemented("Authenticate")
 }
@@ -424,10 +426,11 @@ func (s *Service) RunJanitor(ctx context.Context) {
 
 // ---- later (M2) ----
 //
-// 03 §7.13 also lists StartDeviceFlow, DeviceToken, LookupUserCode and PasswordDeviceLogin. Their parameter and
-// result types (api.DeviceCodeRequest, DeviceCodeResponse, DeviceTokenRequest, DeviceTokenResponse, DeviceLookup,
-// DevicePasswordRequest) are M2 DTOs that internal/protocol/api does not declare yet (03 §12.5), so the methods come
-// with them.
+// 03 §7.13 also lists StartDeviceFlow, DeviceToken, LookupUserCode and PasswordDeviceLogin. They take and return the
+// device-flow DTOs of 03 §12.4.7 (api.DeviceCodeRequest, DeviceCodeResponse, DeviceTokenRequest,
+// DeviceTokenResponse, DeviceLookup, DevicePasswordRequest), which internal/protocol/api does not declare yet
+// (03 §12.5 lists them as later). The four methods come together with those DTOs in the device-flow slice
+// (03 §18 slice 15, M2); no M1 handler, adapter or fake calls them.
 
 // AuthenticateBearerToken authenticates a device access token from 01's hello.auth. Later (M2).
 func (s *Service) AuthenticateBearerToken(ctx context.Context, token string) (Principal, error) {

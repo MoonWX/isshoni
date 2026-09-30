@@ -20,9 +20,11 @@
 // The API part (api.go, deps.go, info.go; 03 §12):
 //   - API: 03's REST API, mounted by the router at /api/v1/. Its chain (03 §12.1): body limit (16 KiB for auth and
 //     device endpoints, 64 KiB elsewhere) → no-store on every response → route lookup (JSON 404 not_found, 405
-//     method_not_allowed with Allow) → CSRF (auth.Service.CSRF, 03 §7.5) → authenticate (User and Admin routes) →
-//     MaybeRotate → access check → handler. API.Handle registers other docs' routes behind the same chain, with an
-//     Access level (Public, User, Admin); PrincipalFrom gives a handler its caller.
+//     method_not_allowed with Allow; a matched route reports its own pattern to the RouteObserver) → any
+//     Authorization header is 401 unauthenticated (no bearer tokens in M1, 03 §7.5) → CSRF (auth.Service.CSRF,
+//     03 §7.5) → authenticate (User and Admin routes) → MaybeRotate → access check → handler. API.Handle registers
+//     other docs' routes behind the same chain, with an Access level (Public, User, Admin); PrincipalFrom gives a
+//     handler its caller.
 //   - The interfaces the wiring implements (04 §6.6): Signal (01's hub), Push (04's push service) and InfoSource
 //     (04's build information), each declared in full; nil Signal and Info have built-in defaults, nil Push means
 //     push is off.

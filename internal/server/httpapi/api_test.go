@@ -208,7 +208,7 @@ func TestAPICSRFBeforeAuthenticate(t *testing.T) {
 }
 
 // TestAPIChainOrder pins the /api/v1 chain of 03 §12.1 as far as it is observable: body limit → no-store → route
-// lookup → CSRF → authenticate → rotate → access → handler.
+// lookup → the M1 Authorization rejection → CSRF → authenticate → rotate → access → handler.
 func TestAPIChainOrder(t *testing.T) {
 	f := newAPIFixture(t, nil)
 	f.api.Handle("POST /api/v1/test/user", User, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -240,23 +240,149 @@ func TestAPIChainOrder(t *testing.T) {
 			t.Fatalf("the 403 lost the rotated cookie: Set-Cookie %q", sc)
 		}
 	})
-	t.Run("body limit before CSRF", func(t *testing.T) {
+	t.Run("Authorization before CSRF", func(t *testing.T) {
+		rec := f.do(http.MethodPost, "/api/v1/test/user", nil,
+			withCookie("user", "Sec-Fetch-Site", "cross-site", "Authorization", "Bearer isa_x")...)
+		wantError(t, rec, http.StatusUnauthorized, api.CodeUnauthenticated)
+		if calls := f.auth.take(); len(calls) != 0 {
+			t.Fatalf("calls %v; want none", calls)
+		}
+	})
+	t.Run("body limit before Authorization and CSRF", func(t *testing.T) {
 		body := strings.NewReader(strings.Repeat("x", authBodyLimit+1))
-		rec := f.do(http.MethodPost, "/api/v1/auth/test", body, "Sec-Fetch-Site", "cross-site")
+		rec := f.do(http.MethodPost, "/api/v1/auth/test", body, "Sec-Fetch-Site", "cross-site",
+			"Authorization", "Bearer isa_x")
 		wantError(t, rec, http.StatusRequestEntityTooLarge, api.CodePayloadTooLarge)
 		if calls := f.auth.take(); len(calls) != 0 {
 			t.Fatalf("calls %v; want none", calls)
 		}
 	})
-	t.Run("route lookup before CSRF", func(t *testing.T) {
-		rec := f.do(http.MethodPost, "/api/v1/test/nothing-here", nil, "Sec-Fetch-Site", "cross-site")
+	t.Run("route lookup before Authorization and CSRF", func(t *testing.T) {
+		rec := f.do(http.MethodPost, "/api/v1/test/nothing-here", nil, "Sec-Fetch-Site", "cross-site",
+			"Authorization", "Bearer isa_x")
 		wantError(t, rec, http.StatusNotFound, api.CodeNotFound)
-		rec = f.do(http.MethodDelete, "/api/v1/test/user", nil, "Sec-Fetch-Site", "cross-site")
+		rec = f.do(http.MethodDelete, "/api/v1/test/user", nil, "Sec-Fetch-Site", "cross-site",
+			"Authorization", "Bearer isa_x")
 		wantError(t, rec, http.StatusMethodNotAllowed, api.CodeMethodNotAllowed)
 		if calls := f.auth.take(); len(calls) != 0 {
 			t.Fatalf("calls %v; want none", calls)
 		}
 	})
+}
+
+// TestAPIAuthorizationHeader: M1 has no bearer tokens, so any Authorization header gets 401 unauthenticated on every
+// route, whatever its Access, before the CSRF check, the cookie and the rotation (03 §7.5; 03 §15 "an Authorization
+// header in M1 → 401").
+func TestAPIAuthorizationHeader(t *testing.T) {
+	f := newAPIFixture(t, nil)
+	reached := 0
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached++
+		w.WriteHeader(http.StatusNoContent)
+	})
+	f.api.Handle("POST /api/v1/test/public", Public, h)
+	f.api.Handle("GET /api/v1/test/user", User, h)
+	f.api.Handle("POST /api/v1/test/admin", Admin, h)
+
+	requests := []struct {
+		name, method, path string
+		header             []string
+		status             int // without the Authorization header
+	}{
+		{"GET /info", http.MethodGet, "/api/v1/info", nil, http.StatusOK},
+		{"Public POST, same-origin JSON", http.MethodPost, "/api/v1/test/public", sameOriginJSON, http.StatusNoContent},
+		{"Public POST, cross-site", http.MethodPost, "/api/v1/test/public",
+			[]string{"Sec-Fetch-Site", "cross-site", "Origin", "https://evil.example"}, http.StatusForbidden},
+		{"User GET with a valid cookie", http.MethodGet, "/api/v1/test/user", withCookie("user"), http.StatusNoContent},
+		{"Admin POST with a valid cookie", http.MethodPost, "/api/v1/test/admin", withCookie("admin", sameOriginJSON...),
+			http.StatusNoContent},
+	}
+	// Without the header the requests get their usual answers: the header alone makes the 401.
+	for _, rq := range requests {
+		if rec := f.do(rq.method, rq.path, nil, rq.header...); rec.Code != rq.status {
+			t.Fatalf("%s without Authorization: status %d, want %d (body %q)", rq.name, rec.Code, rq.status, rec.Body)
+		}
+	}
+	reached = 0
+	f.auth.take()
+
+	for _, authz := range []string{"Bearer isa_x", "Basic dTpw", "Bearer", ""} {
+		for _, rq := range requests {
+			name := fmt.Sprintf("%s, Authorization %q", rq.name, authz)
+			rec := f.do(rq.method, rq.path, nil, append(slices.Clone(rq.header), "Authorization", authz)...)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("%s: status %d, want 401 (body %q)", name, rec.Code, rec.Body)
+			}
+			wantError(t, rec, http.StatusUnauthorized, api.CodeUnauthenticated)
+			if cc := rec.Header().Values("Cache-Control"); !slices.Equal(cc, []string{cacheNoStore}) {
+				t.Errorf("%s: Cache-Control %q, want exactly no-store", name, cc)
+			}
+			if sc := rec.Header().Values("Set-Cookie"); len(sc) != 0 {
+				t.Errorf("%s: Set-Cookie %q", name, sc)
+			}
+			if calls := f.auth.take(); len(calls) != 0 {
+				t.Errorf("%s: auth calls %v; want none (no CSRF, authenticate or rotate)", name, calls)
+			}
+			if reached != 0 {
+				t.Fatalf("%s: the handler ran", name)
+			}
+		}
+	}
+}
+
+// TestAPIRoutePattern: a request that an API route serves reports the API's pattern to 04's RouteObserver and in the
+// 5xx log lines, whatever answers it (the handler or the chain); the API's own 404 and 405 report the router's
+// "/api/v1/", so the label set stays bounded (04 §9.3, §11.2).
+func TestAPIRoutePattern(t *testing.T) {
+	f := newAPIFixture(t, nil)
+	captureDefaultLog(t)
+	f.api.Handle("GET /api/v1/test/things/{id}", Public, noContent)
+	f.api.Handle("GET /api/v1/test/user", User, noContent)
+	f.api.Handle("GET /api/v1/test/panic", Public, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		panic("handler bug")
+	}))
+	f.api.Handle("GET /api/v1/test/error", Public, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		WriteError(w, r, errors.New("db down"))
+	}))
+	for _, tc := range []struct {
+		method, path string
+		header       []string
+		pattern      string
+		status       int
+	}{
+		{"GET", "/api/v1/info", nil, "GET /api/v1/info", 200},
+		{"HEAD", "/api/v1/info", nil, "GET /api/v1/info", 200},
+		{"GET", "/api/v1/test/things/x1", nil, "GET /api/v1/test/things/{id}", 204},
+		{"GET", "/api/v1/test/user", nil, "GET /api/v1/test/user", 401},
+		{"GET", "/api/v1/test/user", []string{"Authorization", "Bearer isa_x"}, "GET /api/v1/test/user", 401},
+		{"GET", "/api/v1/test/panic", nil, "GET /api/v1/test/panic", 500},
+		{"GET", "/api/v1/test/error", nil, "GET /api/v1/test/error", 500},
+		{"GET", "/api/v1/nope", nil, "/api/v1/", 404},
+		{"POST", "/api/v1/info", sameOriginJSON, "/api/v1/", 405},
+	} {
+		name := tc.method + " " + tc.path
+		rec := f.do(tc.method, tc.path, nil, tc.header...)
+		if rec.Code != tc.status {
+			t.Fatalf("%s: status %d, want %d (body %q)", name, rec.Code, tc.status, rec.Body)
+		}
+		obs := f.obs.all()
+		if last := obs[len(obs)-1]; last.pattern != tc.pattern || last.status != tc.status {
+			t.Errorf("%s: observed %q %d, want %q %d", name, last.pattern, last.status, tc.pattern, tc.status)
+		}
+	}
+	want := map[string]string{
+		"http handler panic":  "GET /api/v1/test/panic",
+		"http internal error": "GET /api/v1/test/error",
+	}
+	for _, r := range f.logs.records(t) {
+		msg, _ := r["msg"].(string)
+		if route, ok := want[msg]; ok && r["route"] == route {
+			delete(want, msg)
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("log lines without their API route %v:\n%s", want, f.logs)
+	}
 }
 
 // TestAPIAccess covers the access levels of 03 §12.1 and PrincipalFrom.
@@ -563,17 +689,25 @@ func TestAPIHandlePanics(t *testing.T) {
 // TestNew checks New's required dependencies and that it accepts auth's Service, whose methods later slices fill in.
 func TestNew(t *testing.T) {
 	db := openTestDB(t)
-	for _, d := range []Deps{{Auth: new(auth.Service)}, {DB: db}} {
+	for _, tc := range []struct {
+		d    Deps
+		want string
+	}{
+		{Deps{Auth: new(auth.Service), Site: domainSite()}, "Deps.DB is nil"},
+		{Deps{DB: db, Site: domainSite()}, "Deps.Auth is nil"},
+		{Deps{DB: db, Auth: new(auth.Service)}, "Deps.Site.Origin is empty"},
+		{Deps{DB: db, Auth: new(auth.Service), Site: Site{Hostname: testHost}}, "Deps.Site.Origin is empty"},
+	} {
 		func() {
 			defer func() {
-				if recover() == nil {
-					t.Errorf("New(%+v) did not panic", d)
+				if p := recover(); !strings.Contains(fmt.Sprint(p), tc.want) {
+					t.Errorf("New(%+v) panicked with %v, want %q", tc.d, p, tc.want)
 				}
 			}()
-			New(d)
+			New(tc.d)
 		}()
 	}
-	a := New(Deps{DB: db, Auth: new(auth.Service)})
+	a := New(Deps{DB: db, Auth: new(auth.Service), Site: domainSite()})
 	f := newFixture(t, func(o *RouterOptions) { o.API = a })
 	wantError(t, f.get("/api/v1/nope"), http.StatusNotFound, api.CodeNotFound)
 }

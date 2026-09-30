@@ -193,7 +193,7 @@ func TestInfoStoreError(t *testing.T) {
 	}
 	var logged bool
 	for _, r := range f.logs.records(t) {
-		if r["msg"] == "http internal error" && r["route"] == "/api/v1/" && r["request_id"] == e.RequestID {
+		if r["msg"] == "http internal error" && r["route"] == "GET /api/v1/info" && r["request_id"] == e.RequestID {
 			logged = true
 		}
 	}

@@ -58,9 +58,10 @@ type Deps struct {
 	Push Push
 	// Info is 04's build information; nil means this binary's version.Version() and protocol range.
 	Info InfoSource
-	// Site is 04's site (config.NewSite). GET /info reports Site.Origin as server.publicUrl and falls back to its
-	// host name for server.name when the serverName setting is empty (03 §12.4.1). Not in 03 §12.5's field list,
-	// which has no other way to reach the public origin; the wiring passes the RouterOptions.Site value.
+	// Site is 04's site (config.NewSite); required, New panics on an empty Origin. GET /info reports Site.Origin as
+	// server.publicUrl and falls back to its host name for server.name when the serverName setting is empty
+	// (03 §12.4.1). Not in 03 §12.5's field list, which has no other way to reach the public origin; the wiring
+	// passes the RouterOptions.Site value.
 	Site Site
 	// ClientIP is 04's httpapi.ClientIP (trusted-proxy aware); nil means ClientIP.
 	ClientIP func(*http.Request) netip.Addr
@@ -87,15 +88,18 @@ var _ authService = (*auth.Service)(nil)
 //     payload_too_large at once, and the body reader stops at the limit (DecodeJSON then answers the same);
 //  2. no-store: Cache-Control: no-store on every response, errors included, whatever a handler sets;
 //  3. route lookup: a path no route matches gets 404 not_found, a known path with another method 405
-//     method_not_allowed with an Allow header, both as 03's JSON envelope;
-//  4. CSRF: the route's unsafe methods (all but GET, HEAD and OPTIONS) pass Auth.CSRF, the cross-origin and
+//     method_not_allowed with an Allow header, both as 03's JSON envelope; a matched route reports its own pattern
+//     to 04's RouteObserver and 5xx log lines;
+//  4. no bearer tokens in M1: a request with any Authorization header gets 401 unauthenticated, whatever the
+//     route's Access (03 §7.5). It runs before CSRF because M2's bearer requests skip the cross-origin check there;
+//  5. CSRF: the route's unsafe methods (all but GET, HEAD and OPTIONS) pass Auth.CSRF, the cross-origin and
 //     Content-Type check of 03 §7.5 (403 csrf_failed, 415 unsupported_media_type);
-//  5. authenticate (User and Admin routes): Auth.Authenticate; its error is the answer (401 unauthenticated);
-//  6. rotate: Auth.MaybeRotate;
-//  7. access: an Admin route answers a non-admin 403 forbidden;
-//  8. the handler, with the principal in its context (PrincipalFrom).
+//  6. authenticate (User and Admin routes): Auth.Authenticate; its error is the answer (401 unauthenticated);
+//  7. rotate: Auth.MaybeRotate;
+//  8. access: an Admin route answers a non-admin 403 forbidden;
+//  9. the handler, with the principal in its context (PrincipalFrom).
 //
-// Steps 4–8 are per route, so a route registered with Handle gets them all.
+// Steps 4–9 are per route, so a route registered with Handle gets them all.
 type API struct {
 	d       Deps
 	auth    authService
@@ -103,14 +107,17 @@ type API struct {
 	handler http.Handler
 }
 
-// New builds the API and registers 03's routes. It panics when Deps.DB or Deps.Auth is nil, a programming error of
-// the wiring.
+// New builds the API and registers 03's routes. It panics when Deps.DB or Deps.Auth is nil or Deps.Site.Origin is
+// empty, a programming error of the wiring.
 func New(d Deps) *API {
 	if d.DB == nil {
 		panic("httpapi.New: Deps.DB is nil")
 	}
 	if d.Auth == nil {
 		panic("httpapi.New: Deps.Auth is nil")
+	}
+	if d.Site.Origin == "" {
+		panic("httpapi.New: Deps.Site.Origin is empty")
 	}
 	return newAPI(d, d.Auth)
 }
@@ -150,11 +157,11 @@ func (a *API) routes() {
 // /api/v1/.
 func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) { a.handler.ServeHTTP(w, r) }
 
-// Handle registers a route owned by another doc behind the same /api/v1 chain (body limit, no-store, CSRF, auth,
-// rotation, access), e.g. a.Handle("POST /api/v1/admin/doctor", httpapi.Admin, h). Patterns use Go 1.22+ ServeMux
-// syntax without a host, and their path starts with /api/v1/. A GET pattern also serves HEAD. Like
-// http.ServeMux.Handle, it panics on an invalid or conflicting pattern; it also panics on a path outside /api/v1/, an
-// unknown Access or a nil handler.
+// Handle registers a route owned by another doc behind the same /api/v1 chain (body limit, no-store, the M1
+// Authorization rejection, CSRF, auth, rotation, access), e.g. a.Handle("POST /api/v1/admin/doctor", httpapi.Admin,
+// h). Patterns use Go 1.22+ ServeMux syntax without a host, and their path starts with /api/v1/. A GET pattern also
+// serves HEAD. Like http.ServeMux.Handle, it panics on an invalid or conflicting pattern; it also panics on a path
+// outside /api/v1/, an unknown Access or a nil handler.
 func (a *API) Handle(pattern string, access Access, h http.Handler) {
 	if access > Admin {
 		panic(fmt.Sprintf("httpapi: API.Handle(%q): unknown %v", pattern, access))
@@ -172,7 +179,7 @@ func (a *API) Handle(pattern string, access Access, h http.Handler) {
 	if access != Public {
 		h = a.authenticate(access, h)
 	}
-	a.mux.Handle(pattern, a.auth.CSRF(h))
+	a.mux.Handle(pattern, rejectAuthorization(a.auth.CSRF(h)))
 }
 
 // DashboardAccounts builds the "accounts" object of 04's admin dashboard (03 §12.4.8). It comes with the audit and
@@ -259,9 +266,17 @@ func (w *noStoreWriter) Flush() {
 }
 
 // route is step 3: it hands a request to the route that matches it, or answers 404 or 405 with 03's envelope.
+//
+// The router resolved the request's route pattern as "/api/v1/" (its own mount). A matched request reports the API's
+// pattern instead ("GET /api/v1/info"), so 04's per-route metrics and the 5xx log lines tell the API's routes apart:
+// the transfer and recover steps read the shared request state after this returns. The 404 and 405 keep "/api/v1/",
+// so the label set stays bounded by the registered patterns.
 func (a *API) route(w http.ResponseWriter, r *http.Request) {
 	h, pattern := a.mux.Handler(r)
 	if pattern != "" {
+		if st := stateOf(r); st != nil {
+			st.route = pattern
+		}
 		a.mux.ServeHTTP(w, r) // sets r.Pattern and the path values
 		return
 	}
@@ -300,7 +315,20 @@ func (p *methodProbe) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-// authenticate is steps 5–7 for a User or Admin route.
+// rejectAuthorization is step 4: M1 has no bearer tokens, so any Authorization header gets 401 unauthenticated
+// (03 §7.5), on every route and before the CSRF check, the cookie and the rotation. In M2 this step becomes the
+// bearer branch, which also skips the cross-origin check.
+func rejectAuthorization(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := r.Header["Authorization"]; ok {
+			WriteError(w, r, api.NewError(api.CodeUnauthenticated))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// authenticate is steps 6–8 for a User or Admin route.
 func (a *API) authenticate(access Access, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p, err := a.auth.Authenticate(r)
