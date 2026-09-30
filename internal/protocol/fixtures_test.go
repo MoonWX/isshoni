@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -216,26 +217,6 @@ func TestCompatFixtures(t *testing.T) {
 	if len(dirs) == 0 {
 		t.Skip("no compat snapshots yet (task release:compat creates them before a release)")
 	}
-	var subset func(want, got any, path string) string
-	subset = func(want, got any, path string) string {
-		wm, ok := want.(map[string]any)
-		if !ok {
-			if !reflect.DeepEqual(want, got) {
-				return path
-			}
-			return ""
-		}
-		gm, ok := got.(map[string]any)
-		if !ok {
-			return path
-		}
-		for k, wv := range wm {
-			if p := subset(wv, gm[k], path+"."+k); p != "" {
-				return p
-			}
-		}
-		return ""
-	}
 	for _, dir := range dirs {
 		for _, f := range loadFixtures(t, dir) {
 			t.Run(filepath.Base(dir)+"/"+f.name, func(t *testing.T) {
@@ -251,10 +232,72 @@ func TestCompatFixtures(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if p := subset(envelopeTree(t, f.raw), envelopeTree(t, out), "$"); p != "" {
+				if p := jsonSubset(envelopeTree(t, f.raw), envelopeTree(t, out), "$"); p != "" {
 					t.Errorf("re-encoding lost or changed %s\nfixture: %s\nencoded: %s", p, f.raw, out)
 				}
 			})
+		}
+	}
+}
+
+// jsonSubset reports the path of the first value of want (a decoded JSON tree) that got lacks or holds differently,
+// or "" if got contains all of want. Objects may gain keys at every level, including inside array elements (a new
+// field of ShareInfo appears in every element of room.state's shares); arrays keep their length and order.
+func jsonSubset(want, got any, path string) string {
+	switch w := want.(type) {
+	case map[string]any:
+		g, ok := got.(map[string]any)
+		if !ok {
+			return path
+		}
+		for k, wv := range w {
+			gv, ok := g[k]
+			if !ok {
+				return path + "." + k
+			}
+			if p := jsonSubset(wv, gv, path+"."+k); p != "" {
+				return p
+			}
+		}
+		return ""
+	case []any:
+		g, ok := got.([]any)
+		if !ok || len(g) != len(w) {
+			return path
+		}
+		for i := range w {
+			if p := jsonSubset(w[i], g[i], fmt.Sprintf("%s[%d]", path, i)); p != "" {
+				return p
+			}
+		}
+		return ""
+	}
+	if !reflect.DeepEqual(want, got) {
+		return path
+	}
+	return ""
+}
+
+func TestJSONSubset(t *testing.T) {
+	for _, c := range []struct {
+		want, got, path string
+	}{
+		{`{"a":1}`, `{"a":1}`, ""},
+		{`{"a":1}`, `{"a":1,"b":[]}`, ""},
+		{`{"shares":[{"id":"s1"},{"id":"s2"}]}`, `{"shares":[{"id":"s1","tags":[]},{"id":"s2","tags":[]}]}`, ""},
+		{`{"a":[[{"x":1}]]}`, `{"a":[[{"x":1,"y":2}]]}`, ""},
+		{`{"a":null}`, `{"a":null}`, ""},
+		{`{"a":null}`, `{}`, "$.a"},
+		{`{"a":1}`, `{}`, "$.a"},
+		{`{"a":1}`, `{"a":"1"}`, "$.a"},
+		{`{"a":{"b":1}}`, `{"a":[]}`, "$.a"},
+		{`{"a":[1,2]}`, `{"a":[1,2,3]}`, "$.a"},
+		{`{"a":[1,2]}`, `{"a":[2,1]}`, "$.a[0]"},
+		{`{"a":[{"id":"s1"},{"id":"s2"}]}`, `{"a":[{"id":"s1"},{"id":"s3","x":1}]}`, "$.a[1].id"},
+		{`{"a":[{"id":"s1"}]}`, `{"a":[{"x":1}]}`, "$.a[0].id"},
+	} {
+		if p := jsonSubset(jsonTree(t, []byte(c.want)), jsonTree(t, []byte(c.got)), "$"); p != c.path {
+			t.Errorf("jsonSubset(%s, %s) = %q, want %q", c.want, c.got, p, c.path)
 		}
 	}
 }

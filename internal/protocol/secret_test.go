@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -15,9 +16,9 @@ const (
 	sdpValue    = "v=0\r\no=- 1 1 IN IP4 198.51.100.7\r\ns=-\r\nt=0 0\r\na=candidate:1 1 udp 1 198.51.100.7 7882 typ host\r\n"
 )
 
-// leaks reports whether out contains any recognizable part of the secret or the SDP.
+// leaks reports whether out contains any recognizable part of the secret, the SDP or a candidate.
 func leaks(out string) bool {
-	for _, s := range []string{"S3CR3T", "198.51.100.7", "candidate", "IN IP4"} {
+	for _, s := range []string{"S3CR3T", "198.51.100.7", "a=candidate", "typ host", "IN IP4"} {
 		if strings.Contains(out, s) {
 			return true
 		}
@@ -102,6 +103,98 @@ func TestSecretNeverLogged(t *testing.T) {
 	slog.New(slog.NewTextHandler(&buf, nil)).Info("hello", "msg", Hello{ResumeToken: s})
 	if leaks(buf.String()) {
 		t.Errorf("text handler leaks a struct field: %s", buf.String())
+	}
+}
+
+// TestPayloadsNeverLogged: payload structs that hold a Secret, an SDP or a candidate log a redacted summary through
+// both handlers. slog resolves LogValuer only for the attribute's own value, and the JSON handler encodes any other
+// struct with encoding/json, so without their own LogValue the nested fields would appear verbatim.
+func TestPayloadsNeverLogged(t *testing.T) {
+	s, sdp := Secret(secretValue), SDP(sdpValue)
+	candidate := "candidate:1 1 udp 2122260223 198.51.100.7 7882 typ host"
+	mid := "0"
+	hello := Hello{Protocol: 1, MinProtocol: 1, Features: []Feature{FeatureAgentRelay},
+		Client: ClientInfo{Kind: ClientKindTool, Version: "0.1.0", OS: ClientOSLinux}, Role: RoleFull,
+		ResumeToken: s, Auth: &HelloAuth{Scheme: AuthSchemeBearer, Token: "isa_" + s}}
+	welcome := Welcome{Protocol: 1, ConnectionID: "c_k3v9q2m7xw4pa8d1", ResumeToken: s, Resumed: true, RoomID: "lounge",
+		ICEServers: []ICEServer{{URLs: []string{"turn:turn.example.org"}, Username: "u_S3CR3T", Credential: s}},
+		User:       UserInfo{ID: "u_1", Name: "S3CR3T-username"}}
+	tracks := []TrackRef{{MID: "0", ShareID: "s_1", Kind: TrackKindVideo}, {MID: "1", ShareID: "s_1", Kind: TrackKindAudio}}
+	for _, c := range []struct {
+		name  string
+		value any
+		want  []string // substrings of the JSON handler's output
+	}{
+		{"hello", hello, []string{`"protocol":1`, `"role":"full"`, `"kind":"tool"`, `"resumeToken":"[redacted]"`,
+			`"auth":{"scheme":"bearer"}`, `"features":1`}},
+		{"hello pointer", &hello, []string{`"role":"full"`}},
+		{"hello without secrets", Hello{Role: RoleViewer}, []string{`"role":"viewer"`}},
+		{"welcome", welcome, []string{`"connectionId":"c_k3v9q2m7xw4pa8d1"`, `"resumed":true`, `"roomId":"lounge"`,
+			`"iceServers":1`}},
+		{"welcome pointer", &welcome, []string{`"resumed":true`}},
+		{"ice server", welcome.ICEServers[0], []string{`"urls":["turn:turn.example.org"]`}},
+		{"pub offer", PCOffer{PC: PCKindPub, Gen: 2, Neg: 3, SDP: sdp, Tracks: tracks},
+			[]string{`"pc":"pub"`, `"gen":2`, `"neg":3`, fmt.Sprintf(`"sdp":"[sdp %d B]"`, len(sdpValue)), `"tracks":2`}},
+		{"sub offer pointer", &PCOffer{PC: PCKindSub, Gen: 1, Neg: 1, SDP: sdp}, []string{`"pc":"sub"`, `"tracks":0`}},
+		{"answer", PCAnswer{PC: PCKindSub, Gen: 1, Neg: 4, SDP: sdp}, []string{`"neg":4`, `"sdp":"[sdp `}},
+		{"answer pointer", &PCAnswer{PC: PCKindPub, Gen: 1, Neg: 1, SDP: sdp}, []string{`"pc":"pub"`}},
+		{"candidate", PCICE{PC: PCKindPub, Gen: 1, Candidate: &ICECandidate{Candidate: candidate, SDPMid: &mid}},
+			[]string{`"pc":"pub"`, `"gen":1`, `"candidate":true`}},
+		{"end of candidates", &PCICE{PC: PCKindPub, Gen: 1}, []string{`"candidate":false`}},
+	} {
+		var jsonBuf, textBuf bytes.Buffer
+		slog.New(slog.NewJSONHandler(&jsonBuf, nil)).Info("x", "payload", c.value)
+		slog.New(slog.NewTextHandler(&textBuf, nil)).Info("x", slog.Any("payload", c.value), slog.Group("g", "v", c.value))
+		for name, out := range map[string]string{"json": jsonBuf.String(), "text": textBuf.String()} {
+			if leaks(out) || strings.Contains(out, "isa_") || strings.Contains(out, "LogValue panicked") {
+				t.Errorf("%s: %s handler leaks:\n%s", c.name, name, out)
+			}
+		}
+		for _, w := range c.want {
+			if !strings.Contains(jsonBuf.String(), w) {
+				t.Errorf("%s: JSON output lacks %s:\n%s", c.name, w, jsonBuf.String())
+			}
+		}
+	}
+}
+
+// TestSecretHoldersLogRedacted: every Registry struct that holds a Secret or an SDP, directly or through its fields,
+// implements slog.LogValuer on its value type, so a new payload with a token cannot reach the JSON handler verbatim.
+func TestSecretHoldersLogRedacted(t *testing.T) {
+	secretTypes := map[reflect.Type]bool{reflect.TypeFor[Secret](): true, reflect.TypeFor[SDP](): true}
+	logValuer := reflect.TypeFor[slog.LogValuer]()
+	memo := map[reflect.Type]bool{}
+	var holds func(reflect.Type) bool
+	holds = func(typ reflect.Type) bool {
+		switch typ.Kind() {
+		case reflect.Pointer, reflect.Slice, reflect.Array, reflect.Map:
+			return holds(typ.Elem())
+		case reflect.Struct:
+			if v, ok := memo[typ]; ok {
+				return v
+			}
+			memo[typ] = false // a cycle adds nothing
+			for i := range typ.NumField() {
+				if holds(typ.Field(i).Type) {
+					memo[typ] = true
+				}
+			}
+			return memo[typ]
+		}
+		return secretTypes[typ]
+	}
+	found := 0
+	for _, typ := range reachableStructs() {
+		if !holds(typ) {
+			continue
+		}
+		found++
+		if !typ.Implements(logValuer) {
+			t.Errorf("%v holds a Secret or an SDP but has no value-receiver LogValue method", typ)
+		}
+	}
+	if found < 6 { // Hello, HelloAuth, Welcome, ICEServer, PCOffer, PCAnswer
+		t.Errorf("found only %d structs holding secrets; the walk is broken", found)
 	}
 }
 

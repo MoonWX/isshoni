@@ -265,8 +265,8 @@ func TestValidatePC(t *testing.T) {
 		{"sdp too long", `{"pc":"pub","gen":1,"neg":1,"sdp":` + bigSDP + `}`, "sdp:too_long"},
 		{"pub 8 tracks", offer("pub", tracks(8)), ""},
 		{"pub 9 tracks", offer("pub", tracks(9)), "tracks:too_many"},
-		{"sub 128 tracks", offer("sub", tracks(128)), ""},
-		{"sub 129 tracks", offer("sub", tracks(129)), "tracks:too_many"},
+		{"sub 512 tracks", offer("sub", tracks(512)), ""},
+		{"sub 513 tracks", offer("sub", tracks(513)), "tracks:too_many"},
 		{"duplicate mid", offer("pub", "["+track("0", "s_1", "video")+","+track("0", "s_1", "audio")+"]"), "tracks:duplicate"},
 		{"pub: two videos of one share", offer("pub", "["+track("0", "s_1", "video")+","+track("1", "s_1", "video")+"]"), "tracks:duplicate"},
 		{"pub: two audios of one share", offer("pub", "["+track("0", "s_1", "audio")+","+track("1", "s_1", "audio")+"]"), "tracks:duplicate"},
@@ -372,16 +372,19 @@ func TestValidateClientStats(t *testing.T) {
 		{"inbound 129", many("inbound", 129, `{"shareId":"s_1","kind":"video","bitrate":1,"packetsLost":0}`), "inbound:too_many"},
 		{"outbound 17", many("outbound", 17, `{"shareId":"s_1","kind":"video","bitrate":1}`), "outbound:too_many"},
 		{"pc kind unknown", `{"intervalMs":1,"pcs":[{"pc":"x","gen":1,"state":"new"}]}`, "pcs[0].pc:invalid"},
+		{"pc kind missing", `{"intervalMs":1,"pcs":[{"pc":"sub","gen":1},{"gen":1,"state":"new"}]}`, "pcs[1].pc:required"},
 		{"pc rtt negative", `{"intervalMs":1,"pcs":[{"pc":"sub","gen":1,"state":"new","rttMs":-3}]}`, "pcs[0]:invalid"},
 		{"pc state too long", `{"intervalMs":1,"pcs":[{"pc":"sub","gen":1,"state":"` + strings.Repeat("s", 65) + `"}]}`, "pcs[0]:too_long"},
 		{"inbound valid", in(`"shareId":"s_1","kind":"audio","bitrate":128000,"packetsLost":-2,"totalSamples":10`), ""},
 		{"inbound share id missing", in(`"kind":"audio","bitrate":1,"packetsLost":0`), "inbound[0].shareId:required"},
 		{"inbound kind unknown", in(`"shareId":"s_1","kind":"data","bitrate":1,"packetsLost":0`), "inbound[0].kind:invalid"},
+		{"inbound kind missing", in(`"shareId":"s_1","bitrate":1,"packetsLost":0`), "inbound[0].kind:required"},
 		{"inbound negative counter", in(`"shareId":"s_1","kind":"video","bitrate":1,"packetsLost":0,"framesDecoded":-5`), "inbound[0]:invalid"},
 		{"inbound negative bitrate", in(`"shareId":"s_1","kind":"video","bitrate":-1,"packetsLost":0`), "inbound[0]:invalid"},
 		{"inbound decoder too long", in(`"shareId":"s_1","kind":"video","bitrate":1,"packetsLost":0,"decoder":"` + strings.Repeat("d", 65) + `"`), "inbound[0]:too_long"},
 		{"outbound negative fps", `{"intervalMs":1,"pcs":[],"outbound":[{"shareId":"s_1","kind":"video","bitrate":1,"fps":-1}]}`, "outbound[0]:invalid"},
-		{"outbound kind missing", `{"intervalMs":1,"pcs":[],"outbound":[{"shareId":"s_1","bitrate":1}]}`, "outbound[0].kind:invalid"},
+		{"outbound kind missing", `{"intervalMs":1,"pcs":[],"outbound":[{"shareId":"s_1","bitrate":1}]}`, "outbound[0].kind:required"},
+		{"outbound kind unknown", `{"intervalMs":1,"pcs":[],"outbound":[{"shareId":"s_1","kind":"data","bitrate":1}]}`, "outbound[0].kind:invalid"},
 	})
 	runValidation(t, StatsWatch{}, []vcase{
 		{"on", `{"on":true}`, ""},
@@ -407,8 +410,16 @@ func TestValidateAgentSend(t *testing.T) {
 		{"payload null is opaque", with(base, "payload", "null"), ""},
 		{"payload array is opaque", with(base, "payload", `[1,2,3]`), ""},
 		{"payload 16 KiB", with(base, "payload", jsonString(strings.Repeat("p", MaxAgentPayloadBytes-2))), ""},
-		{"payload over 16 KiB", with(base, "payload", jsonString(strings.Repeat("p", MaxAgentPayloadBytes-1))), "payload:too_long"},
 	})
+	// A payload over 16 KiB is message_too_large, not bad_request (01 §13, P12): a *Error, like room_not_found.
+	for _, n := range []int{MaxAgentPayloadBytes - 1, 17 << 10} {
+		data := with(base, "payload", jsonString(strings.Repeat("p", n)))
+		_, err := Decode[AgentSend](Envelope{Type: MessageTypeAgentSend, Data: json.RawMessage(data)})
+		var pe *Error
+		if !errors.As(err, &pe) || pe.Code != ErrorCodeMessageTooLarge || pe.Scope != ErrorScopeRequest || pe.Retryable {
+			t.Errorf("payload of %d bytes: got %#v, want message_too_large, scope request, not retryable", n+2, err)
+		}
+	}
 }
 
 // TestDecodeRejectsDeepNesting: a payload nested deeper than 32 levels is rejected before encoding/json sees it.

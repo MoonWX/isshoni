@@ -64,7 +64,7 @@ const (
 	ErrorCodeInternal            ErrorCode = "internal"               // unexpected server error; params {ref}
 	ErrorCodeBadRequest          ErrorCode = "bad_request"            // payload invalid; params {field, reason}
 	ErrorCodeUnknownType         ErrorCode = "unknown_type"           // a request type the server doesn't know
-	ErrorCodeMessageTooLarge     ErrorCode = "message_too_large"      // a non-SDP message over 64 KiB after hello
+	ErrorCodeMessageTooLarge     ErrorCode = "message_too_large"      // a non-SDP message over 64 KiB after hello; agent.send payload over 16 KiB
 	ErrorCodeForbidden           ErrorCode = "forbidden"              // role, ownership or CanJoin check failed
 	ErrorCodeFeatureDisabled     ErrorCode = "feature_disabled"       // a message behind a feature that isn't active
 	ErrorCodeNotInRoom           ErrorCode = "not_in_room"            // share or PC message without a room

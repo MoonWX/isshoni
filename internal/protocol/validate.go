@@ -27,7 +27,9 @@ const MaxSubs = 64 // subscribe.update items
 
 const MaxPubTracks = 8 // tracks of a pub offer (m-sections carrying a share)
 
-const MaxSubTracks = 2 * MaxSubs // tracks of a sub offer: video and audio of every subscription
+const MaxConnSubscriptions = 256 // subscriptions per connection (02 §12, sfu.too_many_subscriptions)
+
+const MaxSubTracks = 2 * MaxConnSubscriptions // tracks of a sub offer: video and audio of every subscription
 
 const MaxCandidateBytes = 512 // pc.ice candidate string
 
@@ -313,8 +315,10 @@ func (s *ShareStop) Validate() error {
 }
 
 // Validate checks an offer in either direction: pc, gen >= 1, neg >= 1, a non-empty SDP of at most MaxSDPBytes, and
-// tracks (at most 8 for pub, 128 for sub; unique non-empty mids; share ids; kind video or audio). Every tracks error
+// tracks (at most 8 for pub, 512 for sub; unique non-empty mids; share ids; kind video or audio). Every tracks error
 // has field "tracks" (01 §9 rule 4). The SFU checks the SDP itself (02: pub offers <= 64 KiB and <= 8 m-lines).
+// subscribe.update merges into the connection's wants, so a sub offer carries up to MaxConnSubscriptions shares,
+// not MaxSubs.
 func (o *PCOffer) Validate() error {
 	if err := checkPC(o.PC, o.Gen); err != nil {
 		return err
@@ -457,9 +461,10 @@ func (s *ClientStats) Validate() error {
 	}
 	for i, pc := range s.PCs {
 		p := indexed("pcs", i)
+		if err := checkEnum(p+".pc", string(pc.PC), pc.PC.Valid()); err != nil {
+			return err
+		}
 		switch {
-		case !pc.PC.Valid():
-			return fieldErr(p+".pc", FieldInvalid)
 		case pc.RTTMs < 0 || pc.OutgoingBitrate < 0:
 			return fieldErr(p, FieldInvalid)
 		case len(pc.State) > maxStatsStringLen || len(pc.CandidateType) > maxStatsStringLen ||
@@ -472,9 +477,10 @@ func (s *ClientStats) Validate() error {
 		if err := checkOpaqueID(p+".shareId", in.ShareID); err != nil {
 			return err
 		}
+		if err := checkEnum(p+".kind", string(in.Kind), in.Kind.Valid()); err != nil {
+			return err
+		}
 		switch {
-		case !in.Kind.Valid():
-			return fieldErr(p+".kind", FieldInvalid)
 		case in.Bitrate < 0 || in.JitterBufferMs < 0 || in.FPS < 0 || in.Width < 0 || in.Height < 0 ||
 			in.FreezeCount < 0 || in.FramesDecoded < 0 || in.FramesDropped < 0 || in.FreezeDurationMs < 0 ||
 			in.ConcealedSamples < 0 || in.TotalSamples < 0:
@@ -488,9 +494,10 @@ func (s *ClientStats) Validate() error {
 		if err := checkOpaqueID(p+".shareId", out.ShareID); err != nil {
 			return err
 		}
+		if err := checkEnum(p+".kind", string(out.Kind), out.Kind.Valid()); err != nil {
+			return err
+		}
 		switch {
-		case !out.Kind.Valid():
-			return fieldErr(p+".kind", FieldInvalid)
 		case out.Bitrate < 0 || out.FPS < 0 || out.Width < 0 || out.Height < 0:
 			return fieldErr(p, FieldInvalid)
 		case len(out.RID) > maxStatsStringLen || len(out.Encoder) > maxStatsStringLen ||
@@ -505,7 +512,8 @@ func (s *ClientStats) Validate() error {
 func (*StatsWatch) Validate() error { return nil }
 
 // Validate checks an agent.send (01 §8.14): exactly one of to (a connection id) and toRole (a known role); kind
-// [a-z.]{1,32}; a payload of 1 byte to 16 KiB.
+// [a-z.]{1,32}; a payload of 1 byte to 16 KiB. A payload over 16 KiB gets message_too_large, not bad_request (01 §13,
+// P12), so that error is a *Error, not a *FieldError.
 func (a *AgentSend) Validate() error {
 	switch {
 	case a.To == "" && a.ToRole == "":
@@ -531,7 +539,8 @@ func (a *AgentSend) Validate() error {
 	case len(a.Payload) == 0:
 		return fieldErr("payload", FieldRequired)
 	case len(a.Payload) > MaxAgentPayloadBytes:
-		return fieldErr("payload", FieldTooLong)
+		e := NewError(ErrorCodeMessageTooLarge, ErrorScopeRequest)
+		return &e
 	}
 	return nil
 }

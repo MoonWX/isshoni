@@ -103,9 +103,9 @@ func ParseEnvelope(b []byte) (Envelope, error) {
 // Validate method if it has one.
 //
 // Errors are a *FieldError (the hub answers bad_request with params {field, reason}) or, where the spec prescribes
-// another code, a *Error (RoomJoin: room_not_found). Before unmarshaling, Decode rejects data that is not valid
-// UTF-8 or nested deeper than 32 levels, and arrays longer than the payload's limits (for example subs > 64), so a
-// client->server message cannot make the decoder allocate much more than its own size.
+// another code, a *Error (RoomJoin: room_not_found; AgentSend: message_too_large). Before unmarshaling, Decode
+// rejects data that is not valid UTF-8 or nested deeper than 32 levels, and arrays longer than the payload's limits
+// (for example subs > 64), so a client->server message cannot make the decoder allocate much more than its own size.
 func Decode[T any](e Envelope) (T, error) {
 	var v T
 	err := DecodeInto(e, &v)
