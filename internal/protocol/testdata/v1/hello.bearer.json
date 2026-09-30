@@ -1,0 +1,38 @@
+{
+  "type": "hello",
+  "id": "1",
+  "data": {
+    "protocol": 1,
+    "minProtocol": 1,
+    "features": [
+      "agent.relay"
+    ],
+    "client": {
+      "kind": "desktop",
+      "version": "0.2.0",
+      "os": "windows"
+    },
+    "role": "publisher",
+    "auth": {
+      "scheme": "bearer",
+      "token": "isa_ZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1-f4CBgoM"
+    },
+    "caps": {
+      "decode": [
+        "h264/42e0",
+        "h264/4200",
+        "h264/4d00",
+        "h264/640c",
+        "h264/6400",
+        "opus"
+      ],
+      "encode": [
+        "h264/42e0",
+        "h264/6400",
+        "opus"
+      ],
+      "simulcast": true,
+      "displayCapture": true
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "type": "pc.answer",
+  "data": {
+    "pc": "sub",
+    "gen": 2,
+    "neg": 1,
+    "sdp": "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=sub-answer\r\nt=0 0\r\n"
+  }
+}

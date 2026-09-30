@@ -1,0 +1,18 @@
+{
+  "type": "subscribe.update",
+  "id": "14",
+  "data": {
+    "subs": [
+      {
+        "shareId": "s_q7m2x9c4v8b1n5k3",
+        "video": "low",
+        "audio": "off"
+      },
+      {
+        "shareId": "s_z1x2c3v4b5n6m7k8",
+        "video": "high",
+        "audio": "on"
+      }
+    ]
+  }
+}

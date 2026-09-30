@@ -1,0 +1,9 @@
+{
+  "type": "pc.restart",
+  "data": {
+    "pc": "sub",
+    "gen": 1,
+    "mode": "ice",
+    "reason": "disconnected"
+  }
+}

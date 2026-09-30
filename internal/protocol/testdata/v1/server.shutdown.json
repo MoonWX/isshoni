@@ -1,0 +1,7 @@
+{
+  "type": "server.shutdown",
+  "data": {
+    "reason": "restart",
+    "reconnectInMs": 1840
+  }
+}

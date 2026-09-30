@@ -1,0 +1,11 @@
+{
+  "type": "error",
+  "data": {
+    "code": "sdp_invalid",
+    "retryable": false,
+    "scope": "pc",
+    "pc": "sub",
+    "gen": 2,
+    "neg": 3
+  }
+}

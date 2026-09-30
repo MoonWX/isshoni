@@ -1,0 +1,14 @@
+{
+  "type": "error",
+  "re": "1",
+  "data": {
+    "code": "protocol_unsupported",
+    "retryable": false,
+    "scope": "connection",
+    "params": {
+      "serverMin": 1,
+      "serverMax": 1,
+      "serverVersion": "0.1.0"
+    }
+  }
+}

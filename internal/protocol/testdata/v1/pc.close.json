@@ -1,0 +1,7 @@
+{
+  "type": "pc.close",
+  "data": {
+    "pc": "pub",
+    "gen": 1
+  }
+}
