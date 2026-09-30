@@ -1,0 +1,11 @@
+.root {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* Headings that take focus programmatically (tabindex="-1") show no ring: they aren't controls. */
+.root h1[tabindex='-1']:focus {
+  outline: none;
+}
