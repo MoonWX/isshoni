@@ -226,6 +226,32 @@ func pubAcceptCases(t *testing.T) []acceptCase {
 				return nil
 			}},
 		{"LF line endings", strings.ReplaceAll(chrome, "\r\n", "\n"), tracksA, owns(shareA), nil},
+
+		// Sending m-sections without a TrackRef (their share ended in a race, 01 §9 rule 4) are answered inactive and
+		// otherwise ignored.
+		{"sending audio not in tracks", chrome, tracksA[:1], owns(shareA), wantUnbound(1, "1")},
+		// Pion ignores the port of an offer's m-section and receives on it all the same.
+		{"sending audio with port 0 not in tracks", edit(t, chrome, "m=audio 9 ", "m=audio 0 "), tracksA[:1],
+			owns(shareA), wantUnbound(1, "1")},
+		{"no tracks at all", chrome, nil, owns(shareA), wantUnbound(0, "0", "1")},
+		{"no tracks and no ownShare func", chrome, nil, nil, wantUnbound(0, "0", "1")},
+		{"an unbound section isn't checked further", edit(t, chrome, "a=rid:q send", "a=rid:h send",
+			"a=simulcast:send f;q", "a=simulcast:send f;h;x"), tracksA[1:], owns(shareA), wantUnbound(1, "0")},
+		{"an unbound video section without H.264", edit(t, chrome, "H264/90000", "VP8/90000"), tracksA[1:], owns(shareA),
+			wantUnbound(1, "0")},
+		{"one share bound, one unbound", chrome + withMID(t, videoSec, "0", "2") + withMID(t, audioSec, "1", "3"),
+			append(slices.Clone(tracksA), TrackBinding{MID: "3", Share: shareB, Kind: audio}), owns(shareA, shareB),
+			wantUnbound(3, "2")},
+	}
+}
+
+// wantUnbound returns a check that an offer has n bound sections and exactly the given unbound mids.
+func wantUnbound(n int, mids ...string) func(*pubOffer) error {
+	return func(o *pubOffer) error {
+		if len(o.sections) != n || !slices.Equal(o.unbound, mids) {
+			return fmt.Errorf("%d sections, unbound %q; want %d and %q", len(o.sections), o.unbound, n, mids)
+		}
+		return nil
 	}
 }
 
@@ -281,11 +307,6 @@ func TestCheckPubOfferCodes(t *testing.T) {
 		{"repeated mid", edit(t, chrome, "a=mid:1\r\n", "a=mid:0\r\n"), tracksA, owns(shareA), CodeBadSDP, ""},
 		{"empty mid", edit(t, chrome, "a=mid:1\r\n", "a=mid:\r\n"), tracksA, owns(shareA), CodeBadSDP, ""},
 
-		{"sending audio not in tracks", chrome, tracksA[:1], owns(shareA), CodeUnknownTrack, ""},
-		// Pion ignores the port of an offer's m-section and receives on it all the same.
-		{"sending audio with port 0 not in tracks", edit(t, chrome, "m=audio 9 ", "m=audio 0 "), tracksA[:1], owns(shareA),
-			CodeUnknownTrack, ""},
-		{"no tracks at all", chrome, nil, owns(shareA), CodeUnknownTrack, ""},
 		{"bound with the other kind", chrome, []TrackBinding{tracksA[0], {MID: "1", Share: shareA, Kind: video}},
 			owns(shareA), CodeUnknownTrack, shareA},
 		{"bound to another connection's share", chrome, tracksA, owns(shareB), CodeUnknownTrack, shareA},
@@ -538,8 +559,10 @@ func TestPionRefusesSectionsWithoutMid(t *testing.T) {
 }
 
 // TestCheckPubOfferMatchesPion answers every offer of pubAcceptCases with the pub engine and checks that Pion reads
-// it the way checkPubOffer did: Pion receives (answers recvonly) on exactly the m-sections in offer.sections, the
-// rids it answers on each are the section's rids, and each video section's answer keeps an H.264 codec.
+// it the way checkPubOffer did: Pion receives (answers recvonly) on exactly the m-sections in offer.sections and
+// offer.unbound (unless it rejects an unbound one it has no codec for), the rids it answers on each bound section are
+// the section's rids, and each bound video section's answer keeps an H.264 codec. After setAnswerInactive, the
+// answer receives on exactly the bound sections.
 func TestCheckPubOfferMatchesPion(t *testing.T) {
 	for _, c := range pubAcceptCases(t) {
 		o, err := checkPubOffer(c.sdp, c.tracks, c.own)
@@ -556,6 +579,14 @@ func TestCheckPubOfferMatchesPion(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", c.name, err)
 		}
+		edited, err := setAnswerInactive(a.SDP, o.unbound)
+		if err != nil {
+			t.Fatalf("%s: setAnswerInactive: %v", c.name, err)
+		}
+		client, err := parseSDP(edited)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
 		if len(answer.MediaDescriptions) != len(o.desc.MediaDescriptions) {
 			t.Errorf("%s: %d answer m-sections for %d offered", c.name, len(answer.MediaDescriptions),
 				len(o.desc.MediaDescriptions))
@@ -563,11 +594,21 @@ func TestCheckPubOfferMatchesPion(t *testing.T) {
 		}
 		for i, md := range answer.MediaDescriptions {
 			k := slices.IndexFunc(o.sections, func(s pubSection) bool { return s.index == i })
+			mid, _ := o.desc.MediaDescriptions[i].Attribute(sdp.AttrKeyMID)
+			unbound := slices.Contains(o.unbound, mid)
 			dir := direction(md.Attributes)
 			receives := dir == sdp.AttrKeyRecvOnly || dir == sdp.AttrKeySendRecv
-			if receives != (k >= 0) {
-				t.Errorf("%s: m-line %d: Pion answers %s, checkPubOffer counts it as sending: %v", c.name, i, dir, k >= 0)
+			if receives != (k >= 0 || unbound) && (!unbound || md.MediaName.Port.Value != 0) {
+				t.Errorf("%s: m-line %d: Pion answers %s, checkPubOffer counts it as sending: %v", c.name, i, dir,
+					k >= 0 || unbound)
 				continue
+			}
+			// An unbound m-section that Pion rejected (port 0, and no mid in Pion's answer) needs no a=inactive.
+			cdir := direction(client.MediaDescriptions[i].Attributes)
+			rejected := md.MediaName.Port.Value == 0 && dir == ""
+			if unbound && !rejected && cdir != sdp.AttrKeyInactive || !unbound && cdir != dir {
+				t.Errorf("%s: m-line %d: the client's answer says %q, Pion's %q (unbound: %v)", c.name, i, cdir, dir,
+					unbound)
 			}
 			if k < 0 {
 				continue
@@ -685,6 +726,106 @@ func lineDiff(a, b string) (added, removed []string) {
 	return added, removed
 }
 
+func TestSetAnswerInactive(t *testing.T) {
+	answer := pubAnswer(t)
+	if same, err := setAnswerInactive(answer, nil); err != nil || same != answer {
+		t.Errorf("no mids: the SDP must come back unchanged (%v)", err)
+	}
+	got, err := setAnswerInactive(answer, []string{"1", "9"}) // there is no mid 9
+	if err != nil {
+		t.Fatal(err)
+	}
+	added, removed := lineDiff(answer, got)
+	if !slices.Equal(added, []string{"a=inactive"}) || !slices.Equal(removed, []string{"a=recvonly"}) {
+		t.Errorf("the audio m-section must only turn inactive: added %q, removed %q", added, removed)
+	}
+	checkInactive(t, answer, []string{"1"})
+
+	// Without a direction attribute one is added; several become one a=inactive in the place of the first.
+	odd := crlf(`v=0
+o=- 1 2 IN IP4 127.0.0.1
+s=-
+t=0 0
+m=audio 9 UDP/TLS/RTP/SAVPF 111
+a=mid:0
+a=rtpmap:111 opus/48000/2
+m=video 9 UDP/TLS/RTP/SAVPF 96
+a=mid:1
+a=sendrecv
+a=rtpmap:96 H264/90000
+a=recvonly
+`)
+	got, err = setAnswerInactive(odd, []string{"0", "1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "a=rtpmap:111 opus/48000/2\r\na=inactive\r\n") ||
+		!strings.Contains(got, "a=mid:1\r\na=inactive\r\na=rtpmap:96 H264/90000\r\n") || strings.Contains(got, "only") {
+		t.Errorf("unexpected result:\n%s", got)
+	}
+	checkInactive(t, odd, []string{"0", "1"})
+	_, err = setAnswerInactive("nope", []string{"0"})
+	wantCode(t, "not SDP", err, CodeBadSDP, "")
+}
+
+// TestUnboundSectionPionRoundTrip plays the race of 01 §9 rule 4 with Pion on both sides: a publisher offers video and
+// audio, and the audio's share ended, so tracks binds only the video. checkPubOffer accepts the offer with the audio
+// unbound; the SFU's PC answers it (recvonly on both); the client's copy makes the audio inactive, and the publisher
+// accepts that answer.
+func TestUnboundSectionPionRoundTrip(t *testing.T) {
+	pm := &webrtc.MediaEngine{}
+	opus := webrtc.RTPCodecParameters{
+		RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
+		PayloadType:        111,
+	}
+	for _, c := range []struct {
+		codec webrtc.RTPCodecParameters
+		kind  webrtc.RTPCodecType
+	}{{h264(102, "42e01f"), video}, {opus, audio}} {
+		if err := pm.RegisterCodec(c.codec, c.kind); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pub := newTestPC(t, testAPI(pm, &interceptor.Registry{}))
+	for _, kind := range []webrtc.RTPCodecType{video, audio} {
+		sendonly := webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly}
+		if _, err := pub.AddTransceiverFromKind(kind, sendonly); err != nil {
+			t.Fatal(err)
+		}
+	}
+	offer, err := pub.CreateOffer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pub.SetLocalDescription(offer); err != nil {
+		t.Fatal(err)
+	}
+	o, err := checkPubOffer(offer.SDP, tracksA[:1], owns(shareA))
+	if err != nil || len(o.sections) != 1 || !slices.Equal(o.unbound, []string{"1"}) {
+		t.Fatalf("checkPubOffer: %v", err)
+	}
+
+	answer, err := pionPubAnswer(t, offer.SDP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := setAnswerInactive(answer.SDP, o.unbound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desc, err := parseSDP(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, a := direction(desc.MediaDescriptions[0].Attributes), direction(desc.MediaDescriptions[1].Attributes)
+	if v != sdp.AttrKeyRecvOnly || a != sdp.AttrKeyInactive {
+		t.Fatalf("client answer: video %s, audio %s", v, a)
+	}
+	if err := pub.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: client}); err != nil {
+		t.Fatalf("the publisher refuses the edited answer: %v", err)
+	}
+}
+
 func TestSetOpusAnswerParams(t *testing.T) {
 	answer := pubAnswer(t)
 	// Pion's answer carries Chrome's Opus fmtp, without stereo: this is why the edit sets stereo too.
@@ -792,6 +933,7 @@ func FuzzSDPCheck(f *testing.F) {
 			}
 		} else {
 			checkAcceptedAsPion(t, offer)
+			checkInactive(t, raw, offer.unbound)
 		}
 		if _, err := checkSubAnswer(raw); err != nil {
 			var e *Error
@@ -883,9 +1025,63 @@ func BenchmarkCheckPubOfferWorstCase(b *testing.B) {
 	}
 }
 
+// checkInactive runs setAnswerInactive for mids on an SDP that parses and checks that each named m-section ends up
+// with exactly one direction attribute, a=inactive, and every other m-section keeps its attributes.
+//
+// The check needs an SDP that pion/sdp round-trips (parse, marshal, parse) with the same attributes; fuzz inputs that
+// don't (a value holding a CR, say) are only checked for errors.
+func checkInactive(t *testing.T, raw string, mids []string) {
+	t.Helper()
+	out, err := setAnswerInactive(raw, mids)
+	if err != nil {
+		t.Fatalf("setAnswerInactive: %v", err)
+	}
+	before, err := parseSDP(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := before.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sameAttrs := func(a, b *sdp.MediaDescription) bool { return slices.Equal(a.Attributes, b.Attributes) }
+	ref, err := parseSDP(string(plain))
+	if err != nil || !slices.EqualFunc(ref.MediaDescriptions, before.MediaDescriptions, sameAttrs) {
+		return
+	}
+	after, err := parseSDP(out)
+	if err != nil {
+		t.Fatalf("setAnswerInactive's output doesn't parse: %v", err)
+	}
+	if len(after.MediaDescriptions) != len(before.MediaDescriptions) {
+		t.Fatalf("%d m-sections after setAnswerInactive, %d before", len(after.MediaDescriptions),
+			len(before.MediaDescriptions))
+	}
+	for i, md := range after.MediaDescriptions {
+		mid, _ := md.Attribute(sdp.AttrKeyMID)
+		if !slices.Contains(mids, mid) {
+			if !slices.Equal(md.Attributes, before.MediaDescriptions[i].Attributes) {
+				t.Fatalf("m-line %d changed", i)
+			}
+			continue
+		}
+		var dirs []string
+		for _, a := range md.Attributes {
+			switch a.Key {
+			case sdp.AttrKeySendRecv, sdp.AttrKeySendOnly, sdp.AttrKeyRecvOnly, sdp.AttrKeyInactive:
+				dirs = append(dirs, a.Key)
+			}
+		}
+		if !slices.Equal(dirs, []string{sdp.AttrKeyInactive}) {
+			t.Fatalf("m-line %d: directions %q after setAnswerInactive", i, dirs)
+		}
+	}
+}
+
 // checkAcceptedAsPion checks an offer that checkPubOffer accepted against the way Pion reads it, restated from Pion's
 // code (webrtc v4.2): every m-section has a unique, non-empty mid (SetRemoteDescription refuses one without a mid);
-// every m-section Pion receives on (getPeerDirection: sendrecv or sendonly, whatever the port) is a bound section;
+// every m-section Pion receives on (getPeerDirection: sendrecv or sendonly, whatever the port) is a bound section or
+// in offer.unbound, and no other one is;
 // and each section's rids are the first fields of all its a=rid lines (getRids): at most 2 from {f,q} without repeats
 // on video, none on audio. Video sections offer at least one profile of the PT table.
 func checkAcceptedAsPion(t *testing.T, offer *pubOffer) {
@@ -895,6 +1091,7 @@ func checkAcceptedAsPion(t *testing.T, offer *pubOffer) {
 		t.Fatalf("%d sections", len(offer.sections))
 	}
 	mids := map[string]bool{}
+	unboundSeen := 0
 	for i, md := range desc.MediaDescriptions {
 		mid := ""
 		for _, a := range md.Attributes {
@@ -920,9 +1117,16 @@ func checkAcceptedAsPion(t *testing.T, offer *pubOffer) {
 			}
 		}
 		bound := slices.ContainsFunc(offer.sections, func(s pubSection) bool { return s.index == i })
-		if (dir == "sendrecv" || dir == "sendonly") && !bound {
-			t.Fatalf("m-line %d is %s but not a bound section", i, dir)
+		unbound := slices.Contains(offer.unbound, mid)
+		if sending := dir == "sendrecv" || dir == "sendonly"; sending != (bound || unbound) || bound && unbound {
+			t.Fatalf("m-line %d is %s; bound %v, unbound %v", i, dir, bound, unbound)
 		}
+		if unbound {
+			unboundSeen++
+		}
+	}
+	if unboundSeen != len(offer.unbound) {
+		t.Fatalf("unbound %q for %d unbound m-lines", offer.unbound, unboundSeen)
 	}
 	for _, s := range offer.sections {
 		if s.share != shareA && s.share != shareB {
