@@ -1,0 +1,607 @@
+# CI: the gate for every change (docs/m1/06-deploy-and-ci.md §8.1–8.2, "06" below).
+#
+# There is one required check, ci-ok (06 D7). Path-filtered jobs live in this one workflow,
+# so a job with nothing to check is skipped, and ci-ok counts a skipped job as a pass.
+#
+# The changes job decides what runs. A pull request runs the jobs its changed paths touch; a
+# push to main and a merge-queue group run everything. A job whose inputs are not in the tree
+# yet (web/ before the web client lands, for example) is skipped too. The run summary of the
+# changes job says why each job runs or not.
+#
+# Jobs for parts that land later (licenses, e2e, docker-smoke, distro, goreleaser-check and
+# site of 06 §8.2) come with those parts: each adds a `decide` line to the changes job and,
+# when it gates the merge, its id to ci-ok's needs.
+#
+# Rules for every workflow (06 §8.1): a read-only token by default, with jobs raising their
+# own permissions; third-party actions pinned by full commit SHA with a version comment;
+# checkout without persisted credentials; timeout-minutes on every job.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # The SPA (web job) and the binary (build job) carry the same non-dev version (06 §8.2).
+  ISSHONI_VERSION: 0.0.0-ci.${{ github.run_number }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read # dorny/paths-filter lists a pull request's files through the API
+    outputs:
+      # The path filters of 06 §8.2, for the jobs here and for the ones added later.
+      go: ${{ steps.plan.outputs.go }}
+      web: ${{ steps.plan.outputs.web }}
+      deploy: ${{ steps.plan.outputs.deploy }}
+      docker: ${{ steps.plan.outputs.docker }}
+      release: ${{ steps.plan.outputs.release }}
+      site: ${{ steps.plan.outputs.site }}
+      # A part of go, for lint-go's step that only a tools/ change can fail.
+      tools: ${{ steps.plan.outputs.tools }}
+      # One flag per job: its filter matched and all of its inputs exist.
+      run-lint-go: ${{ steps.plan.outputs.run-lint-go }}
+      run-test-go: ${{ steps.plan.outputs.run-test-go }}
+      run-web: ${{ steps.plan.outputs.run-web }}
+      run-protocol: ${{ steps.plan.outputs.run-protocol }}
+      run-build: ${{ steps.plan.outputs.run-build }}
+      run-lint-deploy: ${{ steps.plan.outputs.run-lint-deploy }}
+      run-govulncheck: ${{ steps.plan.outputs.run-govulncheck }}
+      # Task's pin from .tool-versions (06 §7.1). Go comes from go.mod, Node from .tool-versions.
+      task-version: ${{ steps.plan.outputs.task-version }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Filter changed paths
+        id: filter
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          # A file counts when it matches a pattern and none of the '!' patterns.
+          predicate-quantifier: some-with-excludes
+          filters: |
+            go:
+              - '**/*.go'
+              - 'go.mod'
+              - 'go.sum'
+              - 'tools/**'
+              - 'internal/protocol/testdata/**'
+              - '.golangci.yml'
+              - 'tygo.yaml'
+            web:
+              - 'web/**'
+            deploy:
+              - 'deploy/**'
+              - '.github/workflows/**'
+              - 'Taskfile.yml'
+              - '.tool-versions'
+            docker:
+              - 'deploy/docker/**'
+              - 'deploy/compose*.yaml'
+            release:
+              - '.goreleaser.yaml'
+              - '.github/workflows/release.yml'
+              - 'deploy/packaging/**'
+            site:
+              - 'docs/**'
+              - 'web/src/conntest/codes.json'
+              - '!docs/PLAN.md'
+              - '!docs/m1/**'
+            tools:
+              - 'tools/**'
+
+      - name: Decide which jobs run
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          FILTER_GO: ${{ steps.filter.outputs.go }}
+          FILTER_WEB: ${{ steps.filter.outputs.web }}
+          FILTER_DEPLOY: ${{ steps.filter.outputs.deploy }}
+          FILTER_DOCKER: ${{ steps.filter.outputs.docker }}
+          FILTER_RELEASE: ${{ steps.filter.outputs.release }}
+          FILTER_SITE: ${{ steps.filter.outputs.site }}
+          FILTER_TOOLS: ${{ steps.filter.outputs.tools }}
+        run: |
+          # A pull request runs what its paths touch; a push to main and a merge-queue group
+          # run everything.
+          if [ "$EVENT" = pull_request ]; then
+            go=${FILTER_GO:-false} web=${FILTER_WEB:-false} deploy=${FILTER_DEPLOY:-false}
+            docker=${FILTER_DOCKER:-false} release=${FILTER_RELEASE:-false} site=${FILTER_SITE:-false}
+            tools=${FILTER_TOOLS:-false}
+          else
+            go=true web=true deploy=true docker=true release=true site=true tools=true
+          fi
+          go_or_web=false
+          if [ "$go" = true ] || [ "$web" = true ]; then go_or_web=true; fi
+          {
+            echo "go=$go"
+            echo "web=$web"
+            echo "deploy=$deploy"
+            echo "docker=$docker"
+            echo "release=$release"
+            echo "site=$site"
+            echo "tools=$tools"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### CI plan ($EVENT)"
+            echo
+            echo "Filters: go=$go, web=$web, deploy=$deploy, docker=$docker, release=$release, site=$site, tools=$tools"
+            echo
+            echo "| Job | Decision |"
+            echo "|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # decide JOB WHEN INPUT...: JOB runs when WHEN is true and every INPUT exists. A
+          # missing input is a part that has not landed yet, so its job is skipped (a pass).
+          decide() {
+            local job=$1 when=$2 missing='' input run why
+            shift 2
+            for input in "$@"; do
+              [ -e "$input" ] || missing="$missing $input"
+            done
+            if [ "$when" != true ]; then
+              run=false why='skipped: no matching changes'
+            elif [ -n "$missing" ]; then
+              run=false why="skipped: missing$missing"
+            else
+              run=true why='runs'
+            fi
+            echo "run-$job=$run" >> "$GITHUB_OUTPUT"
+            echo "| $job | $why |" >> "$GITHUB_STEP_SUMMARY"
+          }
+          decide lint-go "$go" go.mod .golangci.yml .tool-versions Taskfile.yml tools/go.mod
+          decide test-go "$go" go.mod Taskfile.yml .tool-versions
+          decide web true web/package.json web/package-lock.json .tool-versions
+          # The drift check needs the generator and the committed output, which land together
+          # (README S10). Before that, `task gen` would write web/src/protocol/*.gen.ts as new
+          # untracked files, and gen:check would fail on every go or web change.
+          decide protocol "$go_or_web" Taskfile.yml .tool-versions tygo.yaml tools/go.mod \
+            internal/protocol/gen/tsregistry
+          decide build true Taskfile.yml .tool-versions cmd/isshoni web/package.json web/package-lock.json
+          decide lint-deploy "$deploy" Taskfile.yml .tool-versions
+          decide govulncheck "$go" Taskfile.yml .tool-versions tools/go.mod
+
+          task_version=''
+          if [ -e .tool-versions ]; then
+            task_version=$(awk '$1 == "task" { sub(/^v/, "", $2); print $2; exit }' .tool-versions)
+          fi
+          if [ -e Taskfile.yml ] && [ -e .tool-versions ] && [ -z "$task_version" ]; then
+            echo "::error file=.tool-versions::.tool-versions needs a task pin, a line 'task <version>' (06 §7.1)"
+            exit 1
+          fi
+          echo "task-version=$task_version" >> "$GITHUB_OUTPUT"
+
+  lint-go:
+    # The checks of `task lint:go`, for the main module and the tools/ module, plus lint:pins:
+    # a go.mod or tools/go.mod change must not leave .tool-versions behind (06 §7.1), and
+    # only the go filter sees those files.
+    needs: changes
+    if: needs.changes.outputs.run-lint-go == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # one cache per job below: setup-go's key is shared by every job
+
+      - name: Cache Go modules and builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum', '.tool-versions') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+
+      - name: Set up Task
+        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: ${{ needs.changes.outputs.task-version }}
+
+      - name: golangci-lint run
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version-file: .tool-versions
+
+      - name: go mod tidy -diff
+        run: go mod tidy -diff
+
+      - name: go vet (darwin)
+        run: GOOS=darwin go vet ./...
+
+      - name: go vet (windows)
+        run: GOOS=windows go vet ./...
+
+      - name: golangci-lint run (tools module)
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          working-directory: tools
+          # Relative to working-directory. The action prefers the golangci-lint version that
+          # tools/go.mod requires, which lint:pins keeps equal to this pin.
+          version-file: ../.tool-versions
+
+      - name: go mod tidy -diff (tools module)
+        # Only a tools/ change can make tools/go.mod untidy, and tidy loads the tools' whole
+        # module graph (about 1.6 GB of modules), which every other go change would then
+        # download and cache.
+        if: needs.changes.outputs.tools == 'true'
+        run: go -C tools mod tidy -diff
+
+      - name: go vet (tools module)
+        run: go -C tools vet ./...
+
+      - name: task lint:pins
+        run: task lint:pins
+
+  test-go:
+    needs: changes
+    if: needs.changes.outputs.run-test-go == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # one cache per job below: setup-go's key is shared by every job
+
+      - name: Cache Go modules and builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum', '.tool-versions') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+
+      - name: Set up Task
+        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: ${{ needs.changes.outputs.task-version }}
+
+      - name: task test:go
+        env:
+          # test:go keeps the command line it has locally; coverage comes in through GOFLAGS,
+          # which only go test acts on. The path is relative, so each of test:go's go test
+          # runs writes its own profile where it runs: coverage.out for the main module and
+          # tools/coverage.out for tools/ (an absolute path would keep only the last one).
+          # .gitignore covers *.out.
+          GOFLAGS: -coverprofile=coverage.out
+        run: task test:go
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-go
+          path: |
+            coverage.out
+            tools/coverage.out
+          if-no-files-found: warn
+          retention-days: 14
+
+  web:
+    # Runs on every change: the build job always needs its web-dist artifact.
+    needs: changes
+    if: needs.changes.outputs.run-web == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+        working-directory: web
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node (version from .tool-versions)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: npm ci
+        run: npm ci --no-audit --no-fund
+
+      - name: npm run lint
+        run: npm run lint
+
+      - name: npm run typecheck
+        run: npm run typecheck
+
+      - name: npm test
+        run: npm test -- --run
+
+      - name: npm run check:i18n
+        run: npm run check:i18n
+
+      - name: npm run build
+        run: npm run build
+
+      - name: npm run check:size
+        run: npm run check:size
+
+      - name: Upload web/dist
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: web-dist
+          path: web/dist
+          if-no-files-found: error
+          retention-days: 7
+
+  protocol:
+    needs: changes
+    if: needs.changes.outputs.run-protocol == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # the tools cache below is the only one this job needs
+
+      # gen:check depends on `task tools`, which builds every pinned tool (golangci-lint and
+      # Task included) from source. This caches the built binaries in .bin/ and Task's checksum
+      # of tools/go.mod and tools/go.sum in .task/, so on a hit `task tools` is up to date and
+      # nothing is compiled. That is about 160 MB on disk, where the module and build caches
+      # for the same tools take close to 3 GB: a cold run saves it in seconds, within the
+      # 5-minute timeout, and it uses little of the repository's cache space. Shared with
+      # govulncheck (same key; when both save at once, one of them skips with a note). No
+      # restore-keys: binaries of other versions would only be rebuilt.
+      - name: Cache the pinned Go tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .bin
+            .task
+          key: tools-bin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/go.mod', 'tools/go.sum') }}
+
+      - name: Set up Task
+        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: ${{ needs.changes.outputs.task-version }}
+
+      - name: task gen:check (generated TypeScript matches the Go types)
+        run: task gen:check
+
+  build:
+    needs: [changes, web]
+    if: needs.changes.outputs.run-build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # No Node here: the SPA comes from the web job's artifact.
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # one cache per job below: setup-go's key is shared by every job
+
+      - name: Cache Go modules and builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum', '.tool-versions') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+
+      - name: Set up Task
+        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: ${{ needs.changes.outputs.task-version }}
+
+      - name: Download web/dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: web-dist
+          path: web/dist
+
+      - name: task notices
+        run: task notices
+
+      - name: task build:go
+        run: task build:go
+
+      - name: Check the version and the size of bin/isshoni
+        run: |
+          info=$(bin/isshoni version --json)
+          printf '%s\n' "$info"
+          commit=$(git rev-parse HEAD)
+          if ! jq -e --arg v "$ISSHONI_VERSION" --arg c "$commit" \
+            '.version == $v and .commit == $c' <<< "$info" > /dev/null; then
+            echo "::error::isshoni version --json must report version $ISSHONI_VERSION and commit $commit"
+            exit 1
+          fi
+          size=$(stat -c %s bin/isshoni)
+          mib=$(( (size + 1048575) / 1048576 ))
+          echo "bin/isshoni is $mib MiB"
+          if [ "$size" -gt $(( 60 * 1048576 )) ]; then
+            echo "::warning::bin/isshoni is $mib MiB, above the 60 MiB budget (06 §8.2)"
+          fi
+
+      - name: Upload bin/isshoni
+        # The e2e job downloads it (artifacts drop the mode bit: chmod +x after download).
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: isshoni-linux-amd64
+          path: bin/isshoni
+          if-no-files-found: error
+          retention-days: 7
+
+  lint-deploy:
+    needs: changes
+    if: needs.changes.outputs.run-lint-deploy == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # one cache per job below: setup-go's key is shared by every job
+
+      - name: Cache Go modules and builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum', '.tool-versions') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+
+      - name: Set up Task
+        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: ${{ needs.changes.outputs.task-version }}
+
+      - name: Install the pinned shellcheck, shfmt and actionlint
+        run: |
+          # The versions are the .tool-versions pins, as with mise on a dev machine (06 §7.1).
+          pin() { awk -v tool="$1" '$1 == tool { sub(/^v/, "", $2); print $2; exit }' .tool-versions; }
+          shellcheck_v=$(pin shellcheck) shfmt_v=$(pin shfmt) actionlint_v=$(pin actionlint)
+          for entry in "shellcheck=$shellcheck_v" "shfmt=$shfmt_v" "actionlint=$actionlint_v"; do
+            if [ -z "${entry#*=}" ]; then
+              echo "::error file=.tool-versions::.tool-versions needs a ${entry%%=*} pin, a line '${entry%%=*} <version>' (06 §7.1)"
+              exit 1
+            fi
+          done
+          bin=$RUNNER_TEMP/bin
+          mkdir -p "$bin"
+          GOBIN=$bin go install "github.com/rhysd/actionlint/cmd/actionlint@v$actionlint_v"
+          GOBIN=$bin go install "mvdan.cc/sh/v3/cmd/shfmt@v$shfmt_v"
+          curl -fsSL --retry 3 \
+            "https://github.com/koalaman/shellcheck/releases/download/v$shellcheck_v/shellcheck-v$shellcheck_v.linux.x86_64.tar.xz" |
+            tar -xJ -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/shellcheck-v$shellcheck_v/shellcheck" "$bin/shellcheck"
+          echo "$bin" >> "$GITHUB_PATH"
+          "$bin/shellcheck" --version
+          "$bin/shfmt" --version
+          "$bin/actionlint" -version
+
+      - name: Install busybox (test:sh runs the install.sh unit tests under it)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends busybox
+
+      - name: task lint:sh lint:actions lint:keys lint:unit lint:pins test:sh
+        run: task lint:sh lint:actions lint:keys lint:unit lint:pins test:sh
+
+  govulncheck:
+    needs: changes
+    if: needs.changes.outputs.run-govulncheck == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Not gating (and not in ci-ok's needs): a newly published vulnerability must not block
+    # unrelated pull requests. The nightly and release workflows gate on it (06 §8.2, §8.5).
+    continue-on-error: true
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # one cache per job below: setup-go's key is shared by every job
+
+      - name: Cache Go modules and builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum', '.tool-versions') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+
+      - name: Cache the pinned Go tools (shared with the protocol job, see there)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .bin
+            .task
+          key: tools-bin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/go.mod', 'tools/go.sum') }}
+
+      - name: Set up Task
+        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: ${{ needs.changes.outputs.task-version }}
+
+      - name: task tools (the pinned govulncheck into .bin/)
+        run: task tools
+
+      - name: govulncheck ./...
+        run: .bin/govulncheck ./...
+
+  ci-ok:
+    # The only required check (06 §8.6). It fails when a gating job failed or was cancelled;
+    # a skipped job counts as a pass. always(), so it also reports when a job it needs failed.
+    if: always()
+    needs: [changes, lint-go, test-go, web, protocol, build, lint-deploy]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Check the results of the gating jobs
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$NEEDS"
+          bad=$(jq -r '[to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | .key] | join(", ")' <<< "$NEEDS")
+          if [ -n "$bad" ]; then
+            echo "::error::these gating jobs failed or were cancelled: $bad"
+            exit 1
+          fi
+          echo "Every gating job passed or was skipped."
