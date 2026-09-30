@@ -76,8 +76,8 @@ protocol version, changes are additive only (`docs/m1/01-protocol.md` §14).
   `NOTICE`.
 
 **Tool versions.** `.tool-versions` (read by mise and asdf) pins Go, Node, Task and the linters. `go.mod` has the
-language version (`go 1.26`) and the Go toolchain (`toolchain go<the .tool-versions pin>`); CI reads the Go version from
-`go.mod`. `tools/go.mod` pins the Go tools that `task tools` builds into `.bin/` (Task, golangci-lint and shfmt at the
+language version (`go 1.26.0`) and the Go toolchain (`toolchain go<the .tool-versions pin>`); CI reads the Go version
+from `go.mod`. `tools/go.mod` pins the Go tools that `task tools` builds into `.bin/` (Task, golangci-lint and shfmt at the
 `.tool-versions` versions), and holds our own tool programs in `tools/<name>/`. `task lint:pins` fails when these pins
 disagree, so bump them together, in one pull request.
 
