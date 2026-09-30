@@ -49,6 +49,7 @@ type Options struct {
 	// Test hooks; nil means the production behavior.
 	migrations []migration                                        // default: the embedded migrations
 	freeSpace  func(dir string) (free uint64, ok bool, err error) // default: statfs; ok=false skips the check
+	newID      func() string                                      // default: NewID
 }
 
 func (o Options) withDefaults() (Options, error) {
@@ -77,6 +78,9 @@ func (o Options) withDefaults() (Options, error) {
 	if o.freeSpace == nil {
 		o.freeSpace = diskFree
 	}
+	if o.newID == nil {
+		o.newID = NewID
+	}
 	return o, nil
 }
 
@@ -95,6 +99,9 @@ type DB struct {
 	active    sync.WaitGroup // running Read, Write, Ping, … calls
 	closeOnce sync.Once
 	closeErr  error
+
+	maintMu     sync.Mutex // serializes Prune's maintenance step
+	optimizedAt time.Time  // last PRAGMA optimize (Open's, then Prune's daily one)
 }
 
 // Open opens (creating if needed) the database at o.Path and brings it to this binary's schema (03 §4.3):
@@ -190,6 +197,7 @@ func Open(ctx context.Context, o Options) (_ *DB, err error) {
 	if _, err := writer.ExecContext(ctx, "PRAGMA optimize=0x10002"); err != nil {
 		return nil, openErr(ctx, o.Path, "store: PRAGMA optimize", err)
 	}
+	db.optimizedAt = now
 	return db, nil
 }
 
@@ -268,7 +276,7 @@ func (db *DB) Read(ctx context.Context, fn func(q *Q) error) error {
 		return fmt.Errorf("store: begin read: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	return fn(&Q{ctx: ctx, tx: tx})
+	return fn(db.newQ(ctx, tx, false))
 }
 
 // Write runs fn in a BEGIN IMMEDIATE transaction on the single writer connection. It commits if fn returns nil and
@@ -296,7 +304,7 @@ func (db *DB) Write(ctx context.Context, fn func(q *Q) error) error {
 			db.log.Warn("slow write transaction", "caller", callerName(2), "duration", d)
 		}
 	}()
-	if err := fn(&Q{ctx: ctx, tx: tx, writable: true}); err != nil {
+	if err := fn(db.newQ(ctx, tx, true)); err != nil {
 		return err
 	}
 	done = true
@@ -506,10 +514,22 @@ func (db *DB) Settings() *SettingsCache { return db.settings }
 
 // Q is one transaction, handed to the callback of DB.Read or DB.Write. It must not be used after the callback
 // returns. Read methods work in both; write methods fail inside Read.
+//
+// Conventions of the query methods (03 §6): times are stored as UTC milliseconds, so a Create method rounds the times
+// of the struct it is given to milliseconds (the struct then equals the row read back), and fills a zero CreatedAt
+// with the store's clock (Options.Clock). A zero optional time, "" and an empty hash are NULL in the DB and come back
+// as the zero value. A method that changes one row by ID returns ErrNotFound when there is no such row. A UNIQUE
+// violation of a user-visible column returns *ConflictError.
 type Q struct {
 	ctx      context.Context
 	tx       *sql.Tx
 	writable bool
+	now      func() time.Time // the store's clock, for defaults and the "active" filter of ListInvites
+	newID    func() string    // NewID, or a test hook
+}
+
+func (db *DB) newQ(ctx context.Context, tx *sql.Tx, writable bool) *Q {
+	return &Q{ctx: ctx, tx: tx, writable: writable, now: db.now, newID: db.opts.newID}
 }
 
 // exec runs a statement that changes the database; it fails inside Read.

@@ -39,19 +39,65 @@ type DeviceCode struct {
 	DecidedAt                              time.Time
 }
 
-// ListDevices returns a user's linked devices.
-func (q *Q) ListDevices(u UserID) ([]Device, error) { return nil, notImplemented("ListDevices") }
+// deviceCols are the columns scanned by deviceScan, in its order.
+const deviceCols = `id, user_id, name, client_kind, os, app_version, linked_via, created_at, last_seen_at, last_ip`
 
-// DeleteDevice deletes one of the user's devices and reports whether it existed.
-func (q *Q) DeleteDevice(u UserID, id DeviceID) (bool, error) {
-	return false, notImplemented("DeleteDevice")
+type deviceScan struct {
+	d             Device
+	id, user      string
+	created, seen int64
 }
 
-// DeleteDevices deletes all of the user's devices and returns their IDs.
-func (q *Q) DeleteDevices(u UserID) ([]DeviceID, error) { return nil, notImplemented("DeleteDevices") }
+func (s *deviceScan) dest() []any {
+	return []any{&s.id, &s.user, &s.d.Name, &s.d.ClientKind, &s.d.OS, &s.d.AppVersion, &s.d.LinkedVia, &s.created,
+		&s.seen, &s.d.LastIP}
+}
 
-// DeleteDeviceCodesOf deletes the device codes the user approved or denied.
-func (q *Q) DeleteDeviceCodesOf(u UserID) error { return notImplemented("DeleteDeviceCodesOf") }
+func (s *deviceScan) device() Device {
+	out := s.d
+	out.ID = DeviceID(s.id)
+	out.UserID = UserID(s.user)
+	out.CreatedAt = fromMS(s.created)
+	out.LastSeenAt = fromMS(s.seen)
+	return out
+}
+
+// ListDevices returns a user's linked devices, the most recently seen first (empty in M1: linking is M2).
+func (q *Q) ListDevices(u UserID) ([]Device, error) {
+	var out []Device
+	err := q.queryAll("list devices", `SELECT `+deviceCols+` FROM devices WHERE user_id = ?
+		ORDER BY last_seen_at DESC, created_at DESC, rowid DESC`, []any{string(u)}, func(r scanner) error {
+		var d deviceScan
+		if err := r.Scan(d.dest()...); err != nil {
+			return err
+		}
+		out = append(out, d.device())
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// DeleteDevice deletes one of the user's devices and reports whether it existed. Its tokens and push subscriptions
+// go with it.
+func (q *Q) DeleteDevice(u UserID, id DeviceID) (bool, error) {
+	n, err := q.execCount("delete device", `DELETE FROM devices WHERE id = ? AND user_id = ?`, string(id), string(u))
+	return n > 0, err
+}
+
+// DeleteDevices deletes all of the user's devices and returns their IDs, sorted.
+func (q *Q) DeleteDevices(u UserID) ([]DeviceID, error) {
+	return deleteReturningIDs[DeviceID](q, "delete devices", `DELETE FROM devices WHERE user_id = ? RETURNING id`,
+		string(u))
+}
+
+// DeleteDeviceCodesOf deletes the device codes the user approved or denied (03 §7.7: they go with the devices).
+func (q *Q) DeleteDeviceCodesOf(u UserID) error {
+	_, err := q.execCount("delete device codes", `DELETE FROM device_codes WHERE user_id = ?`, string(u))
+	return err
+}
 
 // CreateDeviceCode inserts a pending device code. Later (M2).
 func (q *Q) CreateDeviceCode(dc DeviceCode) error { return notImplemented("CreateDeviceCode") }

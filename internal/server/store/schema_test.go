@@ -155,14 +155,9 @@ func TestGoldenMatchesSpec(t *testing.T) {
 	}
 }
 
-// fkWithoutIndex lists the foreign key child columns of 03 §5 that have no index. All are ON DELETE SET NULL
-// references to users in small tables, so deleting a user scans them; the schema is frozen as 03 §5 gives it.
-var fkWithoutIndex = []string{
-	"invites.revoked_by",
-	"password_resets.created_by",
-	"rooms.created_by",
-	"users.approved_by",
-}
+// fkWithoutIndex lists the foreign key child columns of 03 §5 that have no index. It is empty: every child column
+// is indexed (03 §15), so deleting a parent row never scans a child table. A new exception needs a reason here.
+var fkWithoutIndex []string
 
 // TestSchemaStrictAndIndexedForeignKeys: every table is STRICT, and every foreign key child column is the first
 // column of an index (except the documented list above).

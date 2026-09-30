@@ -128,33 +128,25 @@ func TestSettingsCacheDefaults(t *testing.T) {
 	}
 }
 
-// TestLaterMethodsSayNotImplemented: the declared API that later slices fill in fails loudly, never silently.
+// TestLaterMethodsSayNotImplemented: the declared API that later milestones fill in (the device flow, M2) fails
+// loudly, never silently.
 func TestLaterMethodsSayNotImplemented(t *testing.T) {
 	t.Parallel()
 	db := newEnv(t).open(nil)
 	ctx := context.Background()
 	now := time.Now()
-	if _, err := db.Prune(ctx, now); !errors.Is(err, errNotImplemented) {
-		t.Errorf("Prune = %v", err)
-	}
 	err := db.Write(ctx, func(q *Q) error {
 		calls := map[string]error{}
-		calls["CreateUser"] = q.CreateUser(&User{})
-		_, calls["UserByID"] = q.UserByID("x")
-		_, calls["ListUsers"] = q.ListUsers("")
-		calls["CreateSession"] = q.CreateSession(&Session{})
-		_, _, calls["SessionByTokenHash"] = q.SessionByTokenHash(nil, now)
-		_, calls["ListDevices"] = q.ListDevices("x")
-		calls["ReplaceSetupToken"] = q.ReplaceSetupToken(nil, now, now)
-		calls["UseInvite"] = q.UseInvite("x", now)
-		calls["ReplacePasswordReset"] = q.ReplacePasswordReset(PasswordReset{})
-		_, calls["ListRooms"] = q.ListRooms()
-		_, calls["RoomByID"] = q.RoomByID(DefaultRoomID)
-		_, calls["UpsertPushSubscription"] = q.UpsertPushSubscription(&PushSubscription{})
-		_, calls["ListPushSubscriptions"] = q.ListPushSubscriptions(PushFilter{})
-		calls["AddTransfer"] = q.AddTransfer("2026-10", 1, 1, now)
-		calls["AppendAudit"] = q.AppendAudit(AuditEntry{})
-		_, calls["SecurityEvents"] = q.SecurityEvents(now, 10)
+		calls["CreateDeviceCode"] = q.CreateDeviceCode(DeviceCode{})
+		_, calls["DeviceCodeByHash"] = q.DeviceCodeByHash([]byte{1})
+		_, calls["DeviceCodeByUserCode"] = q.DeviceCodeByUserCode([]byte{1})
+		calls["DecideDeviceCode"] = q.DecideDeviceCode([]byte{1}, "approved", "x", now)
+		calls["PollDeviceCode"] = q.PollDeviceCode([]byte{1}, now, time.Second)
+		calls["CreateDevice"] = q.CreateDevice(&Device{})
+		calls["InsertDeviceToken"] = q.InsertDeviceToken(DeviceToken{})
+		_, _, _, calls["DeviceTokenByHash"] = q.DeviceTokenByHash([]byte{1}, "access", now)
+		calls["SpendRefreshToken"] = q.SpendRefreshToken([]byte{1}, []byte{2}, now)
+		calls["TouchDevice"] = q.TouchDevice("x", "", "", now)
 		for name, err := range calls {
 			if !errors.Is(err, errNotImplemented) || !strings.Contains(err.Error(), name) {
 				t.Errorf("%s = %v, want a not-implemented error naming it", name, err)

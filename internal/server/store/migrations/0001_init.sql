@@ -23,6 +23,7 @@ CREATE TABLE users (
 ) STRICT;
 CREATE INDEX users_status_created ON users(status, created_at);
 CREATE INDEX users_invite         ON users(invite_id);
+CREATE INDEX users_approved_by    ON users(approved_by);
 
 CREATE TABLE sessions (                                  -- web sessions (cookie)
   id               TEXT PRIMARY KEY,                     -- stable across rotations
@@ -106,6 +107,7 @@ CREATE TABLE invites (
   CHECK (uses BETWEEN 0 AND max_uses)
 ) STRICT;
 CREATE INDEX invites_created_by ON invites(created_by);
+CREATE INDEX invites_revoked_by ON invites(revoked_by);
 CREATE INDEX invites_expiry     ON invites(expires_at);
 
 CREATE TABLE setup_tokens (                              -- at most one row: issuing a new token deletes the others
@@ -121,6 +123,7 @@ CREATE TABLE password_resets (                           -- one live link per us
   created_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL
 ) STRICT;
+CREATE INDEX password_resets_created_by ON password_resets(created_by);
 
 CREATE TABLE rooms (
   id         TEXT PRIMARY KEY,                           -- 'lounge' for the default room
@@ -132,6 +135,7 @@ CREATE TABLE rooms (
   updated_at INTEGER NOT NULL
 ) STRICT;
 CREATE UNIQUE INDEX rooms_one_default ON rooms(is_default) WHERE is_default = 1;
+CREATE INDEX rooms_created_by ON rooms(created_by);
 -- The Lounge row is inserted by store.EnsureDefaultRoom at every Open (idempotent), not by this file.
 
 CREATE TABLE push_subscriptions (
