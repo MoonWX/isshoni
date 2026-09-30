@@ -1,0 +1,10 @@
+{
+  "printWidth": 120,
+  "singleQuote": true,
+  "overrides": [
+    {
+      "files": "public/boot-check.js",
+      "options": { "trailingComma": "es5" }
+    }
+  ]
+}

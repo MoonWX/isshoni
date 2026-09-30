@@ -1,0 +1,144 @@
+/*
+ * The only global rules (05 §2 "Styling"): a small reset, the page base, focus rings, reduced motion, and the static
+ * boot message that /boot-check.js and <noscript> show. Everything else is a CSS module next to its component.
+ * Values come from tokens.css.
+ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  -webkit-tap-highlight-color: transparent;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  min-height: 100dvh;
+  font-family: var(--font-sans);
+  font-size: var(--text-md);
+  line-height: var(--leading);
+  color: var(--color-text);
+  background-color: var(--color-bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+p,
+figure,
+blockquote,
+dl,
+dd,
+ul,
+ol {
+  margin: 0;
+}
+
+h1,
+h2,
+h3 {
+  line-height: var(--leading-tight);
+}
+
+ul,
+ol {
+  padding: 0;
+}
+
+img,
+svg,
+video,
+canvas {
+  display: block;
+  max-width: 100%;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+  letter-spacing: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+a {
+  color: var(--color-link);
+  text-underline-offset: 0.15em;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+/* Keyboard focus: always visible. Components may restyle it but never remove it. */
+:focus-visible {
+  outline: var(--focus-ring-width) solid var(--color-focus);
+  outline-offset: var(--focus-ring-offset);
+}
+
+dialog::backdrop {
+  background-color: var(--color-backdrop);
+}
+
+/* Windows High Contrast and other forced-colour modes keep the focus ring (05 §16.6). */
+@media (forced-colors: active) {
+  :focus-visible {
+    outline-color: Highlight;
+  }
+}
+
+/* No layout transitions, no sliding toasts; spinners become static indicators (05 §16.6). */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* The static message of /boot-check.js ("too old") and <noscript>: plain HTML, no React. */
+.boot-message {
+  max-width: var(--form-max);
+  margin: auto;
+  padding: var(--space-6) var(--space-4);
+  text-align: center;
+}
+
+.boot-message h1 {
+  margin-bottom: var(--space-3);
+  font-size: var(--text-xl);
+}
+
+.boot-message p {
+  color: var(--color-text-muted);
+}
