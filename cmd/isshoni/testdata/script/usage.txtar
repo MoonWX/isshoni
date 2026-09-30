@@ -74,4 +74,4 @@ Flags:
   -h, --help     show this help
 
 Config flags: --config PATH (default /etc/isshoni/isshoni.toml, env ISSHONI_CONFIG) and one
-flag per config key, such as --tls.mode or --public-ip. See 'isshoni config example'.
+flag per config key, such as --tls.mode or --public-ip. See 'isshoni help serve'.

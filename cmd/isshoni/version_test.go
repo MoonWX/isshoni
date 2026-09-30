@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -9,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MoonWX/isshoni/internal/protocol"
+	"github.com/MoonWX/isshoni/internal/server/store"
 	"github.com/MoonWX/isshoni/internal/version"
 )
 
@@ -54,6 +57,7 @@ func TestVersionLdflags(t *testing.T) {
 	want := version.BuildInfo{
 		Version: wantVersion, Commit: wantCommit, Date: wantDate,
 		Go: runtime.Version(), OS: runtime.GOOS, Arch: runtime.GOARCH,
+		Protocol: protocol.Version, Schema: store.LatestSchemaVersion(),
 	}
 	if got != want {
 		t.Errorf("version --json = %+v\nwant            %+v", got, want)
@@ -66,7 +70,8 @@ func TestVersionLdflags(t *testing.T) {
 		t.Errorf("version --short = %q, want %q", out, wantVersion+"\n")
 	}
 
-	line := "isshoni 9.8.7-rc.1 (commit 0123456, built 2026-09-29, " + runtime.Version() + ", " + runtime.GOOS + "/" + runtime.GOARCH + ")\n"
+	line := fmt.Sprintf("isshoni 9.8.7-rc.1 (commit 0123456, built 2026-09-29, %s, %s/%s, protocol %d, schema %d)\n",
+		runtime.Version(), runtime.GOOS, runtime.GOARCH, protocol.Version, store.LatestSchemaVersion())
 	if out := cli("version"); out != line {
 		t.Errorf("version = %q, want %q", out, line)
 	}
@@ -87,11 +92,14 @@ func TestVersionCommand(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &got); err != nil || code != exitOK {
 		t.Fatalf("version --json: exit %d, %q: %v", code, out, err)
 	}
-	if got != version.Info() {
-		t.Errorf("version --json = %+v, want %+v", got, version.Info())
+	want := version.Info()
+	want.Protocol, want.Schema = protocol.Version, store.LatestSchemaVersion()
+	if got != want {
+		t.Errorf("version --json = %+v, want %+v", got, want)
 	}
-	if strings.Contains(out, "protocol") || strings.Contains(out, "schema") {
-		t.Errorf("version --json = %s: protocol and schema are left out while unknown", out)
+	// The numbers come from 01 and 03, not zero (which would leave them out of the JSON).
+	if got.Protocol < 1 || got.Schema < 1 || !strings.Contains(out, fmt.Sprintf(`"protocol":%d,"schema":%d}`, protocol.Version, store.LatestSchemaVersion())) {
+		t.Errorf("version --json = %s: want protocol %d and schema %d", out, protocol.Version, store.LatestSchemaVersion())
 	}
 
 	_, line, _ := runCLI(t, "version")

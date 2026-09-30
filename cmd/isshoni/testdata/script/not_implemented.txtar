@@ -15,6 +15,6 @@ stderr '^isshoni admin backup: not implemented in this build yet$'
 exitcode 1 isshoni healthcheck --ready
 stderr '^isshoni healthcheck: not implemented in this build yet$'
 
-exitcode 1 isshoni config init --path isshoni.toml
-stderr '^isshoni config init: not implemented in this build yet$'
-! exists isshoni.toml
+# Commands that read the config accept the config flags.
+exitcode 1 isshoni admin status --listen.admin-socket /tmp/isshoni-test.sock --json
+stderr '^isshoni admin status: not implemented in this build yet$'

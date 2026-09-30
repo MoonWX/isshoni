@@ -16,6 +16,8 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+
+	"github.com/MoonWX/isshoni/internal/server/config"
 )
 
 // Process exit codes (04 §3.2).
@@ -36,15 +38,22 @@ func main() {
 	// serve adds its own SIGTERM and SIGHUP handling (04 §6.4, §6.5).
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	context.AfterFunc(ctx, stop)
-	code := run(ctx, &invocation{stdout: os.Stdout, stderr: os.Stderr}, os.Args[1:])
+	code := run(ctx, &invocation{stdout: os.Stdout, stderr: os.Stderr, environ: os.Environ()}, os.Args[1:])
 	stop()
 	os.Exit(code)
 }
 
-// invocation carries the process's streams to the commands, so tests can run them in-process.
+// invocation carries the process's streams and environment to the commands, so tests can run them in-process.
 type invocation struct {
-	stdout io.Writer
-	stderr io.Writer
+	stdout  io.Writer
+	stderr  io.Writer
+	environ []string // os.Environ form; config commands read the ISSHONI_* names (04 §4.2)
+
+	// For a command that reads the config, dispatch loads it before the command runs: cfg is always set then, and
+	// cfgErr holds its errors (the command decides: serve and config exit 78, the offline admin commands only need
+	// data_dir and the socket path).
+	cfg    *config.Config
+	cfgErr *config.ValidationError
 }
 
 // runFunc runs a leaf command with its positional arguments, after its flags are parsed.
@@ -62,8 +71,12 @@ type command struct {
 
 	// config marks commands that read the server config (04 §3.1): they take --config PATH (env ISSHONI_CONFIG)
 	// and one flag per config key. The config package registers those flags through config.Load (04 §4.7), which
-	// also parses the command line; its help shows them as [config flags].
-	config bool
+	// also parses the command line; its help shows them as [config flags]. With configFlagsOnly (config example and
+	// config init) the values come from the flags alone: no --config, no file, no environment (config.LoadFlags).
+	// listConfigFlags lists every config flag in the command's help (serve, example, init); the others point there.
+	config          bool
+	configFlagsOnly bool
+	listConfigFlags bool
 
 	// zeroOrOne makes every failure, a usage error included, exit 1 (healthcheck, for Docker's HEALTHCHECK).
 	zeroOrOne bool
@@ -154,7 +167,7 @@ func run(ctx context.Context, inv *invocation, args []string) int {
 func dispatch(ctx context.Context, inv *invocation, cmd *command, args []string) (*command, error) {
 	for {
 		fs, runCmd := cmd.flagSet()
-		if err := fs.Parse(args); err != nil {
+		if err := cmd.parse(inv, fs, args); err != nil {
 			return cmd, parseError(cmd, inv, err)
 		}
 		args = fs.Args()
@@ -180,6 +193,28 @@ func dispatch(ctx context.Context, inv *invocation, cmd *command, args []string)
 		}
 		cmd, args = next, args[1:]
 	}
+}
+
+// parse parses a command's flags. For a command that reads the config, the config package registers the config
+// flags on fs and parses args itself, then loads the config into inv (04 §4.7); a config with errors is not a parse
+// error.
+func (c *command) parse(inv *invocation, fs *flag.FlagSet, args []string) error {
+	if !c.config {
+		return fs.Parse(args)
+	}
+	var cfg *config.Config
+	var err error
+	if c.configFlagsOnly {
+		cfg, err = config.LoadFlags(fs, args)
+	} else {
+		cfg, err = config.Load(fs, args, inv.environ)
+	}
+	var ve *config.ValidationError
+	if err != nil && !errors.As(err, &ve) {
+		return err
+	}
+	inv.cfg, inv.cfgErr = cfg, ve
+	return nil
 }
 
 // parseError turns a flag parsing error into a usage error, or prints the help for -h/--help.

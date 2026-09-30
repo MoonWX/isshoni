@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/MoonWX/isshoni/internal/server/config"
 	"github.com/MoonWX/isshoni/internal/version"
 )
 
@@ -65,10 +66,13 @@ func writeHelp(w io.Writer, c *command, full bool) error {
 	b.WriteString("\nFlags:\n")
 	writeRows(&b, rows)
 
-	if c.config {
+	switch {
+	case c.listConfigFlags:
+		writeConfigFlags(&b, !c.configFlagsOnly)
+	case c.config:
 		// The config package registers these through config.Load (04 §4.2, §4.7).
-		b.WriteString("\nConfig flags: --config PATH (default /etc/isshoni/isshoni.toml, env ISSHONI_CONFIG) and one\n" +
-			"flag per config key, such as --tls.mode or --public-ip. See 'isshoni config example'.\n")
+		b.WriteString("\nConfig flags: --config PATH (default " + config.DefaultPath + ", env " + config.EnvConfig + ") and one\n" +
+			"flag per config key, such as --tls.mode or --public-ip. See 'isshoni help serve'.\n")
 	}
 
 	switch {
@@ -121,6 +125,79 @@ func writeRows(b *bytes.Buffer, rows [][2]string) {
 	}
 	for _, r := range rows {
 		fmt.Fprintf(b, "  %-*s  %s\n", width, r[0], r[1])
+	}
+}
+
+// writeConfigFlags lists the config flags of the key registry (04 §4.2): --config (when withConfig), then one flag
+// per key with its help, default and env variable. Hidden keys (tests only) are left out.
+func writeConfigFlags(b *bytes.Buffer, withConfig bool) {
+	if withConfig {
+		b.WriteString("\nConfig flags (each also an ISSHONI_* environment variable; flags win over the environment, which wins\nover the file):\n")
+	} else {
+		b.WriteString("\nConfig flags (the values to write; the environment and any existing file are ignored):\n")
+	}
+	var rows [][2]string
+	if withConfig {
+		rows = append(rows, [2]string{"--config PATH", "the config file (default " + config.DefaultPath + ", env " + config.EnvConfig + ")"})
+	}
+	for _, k := range config.Keys() {
+		if k.Hidden {
+			continue
+		}
+		left := "--" + k.FlagName()
+		if p := placeholder(k.Kind); p != "" {
+			left += " " + p
+		}
+		right := strings.TrimSuffix(k.Help, ".")
+		var def []string
+		switch d := k.DefaultText(); {
+		case d == "" && k.DefaultNote != "":
+			def = append(def, "default "+k.DefaultNote)
+		case d != "" && d != "0" && d != "false":
+			def = append(def, "default "+d)
+			if k.DefaultNote != "" {
+				def = append(def, k.DefaultNote)
+			}
+		}
+		if withConfig {
+			def = append(def, "env "+k.EnvName())
+		}
+		if len(def) > 0 {
+			right += " (" + strings.Join(def, "; ") + ")"
+		}
+		rows = append(rows, [2]string{left, right})
+	}
+	writeWrappedRows(b, rows, 110)
+}
+
+// placeholder is the value name of a config flag in the help.
+func placeholder(k config.Kind) string {
+	switch k {
+	case config.KindBool:
+		return ""
+	case config.KindInt:
+		return "N"
+	case config.KindDuration:
+		return "DUR"
+	case config.KindStringList:
+		return "LIST"
+	case config.KindCIDRList:
+		return "CIDRS"
+	default:
+		return "VALUE"
+	}
+}
+
+// writeWrappedRows is writeRows with the right column wrapped at width.
+func writeWrappedRows(b *bytes.Buffer, rows [][2]string, width int) {
+	left := 0
+	for _, r := range rows {
+		left = max(left, len(r[0]))
+	}
+	indent := strings.Repeat(" ", 2+left+2)
+	for _, r := range rows {
+		text := wrap(r[1], max(40, width-len(indent)))
+		fmt.Fprintf(b, "  %-*s  %s\n", left, r[0], strings.ReplaceAll(text, "\n", "\n"+indent))
 	}
 }
 
