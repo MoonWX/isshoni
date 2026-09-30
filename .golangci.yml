@@ -1,0 +1,186 @@
+# golangci-lint v2 (pinned in tools/go.mod and .tool-versions). Run it through `task lint:go`.
+# Linters and formatters: docs/m1/06-deploy-and-ci.md §8.2. The depguard rules encode the import table of
+# docs/m1/04-server-platform.md §2, the single source for which package of this repository may import which:
+# change that table first, then the rules here. The rules cover non-test files and packages of this repository only;
+# third-party modules are governed by the license gate (`task licenses`).
+version: "2"
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose
+    - depguard
+    - errorlint
+    - forbidigo
+    - gosec
+    - misspell
+    - nilerr
+    - noctx
+    - rowserrcheck
+    - sqlclosecheck
+    - unconvert
+    - usestdlibvars
+
+  settings:
+    depguard:
+      rules:
+        protocol:
+          list-mode: lax
+          files: ["**/internal/protocol/*.go", "**/internal/protocol/**/*.go", "!$test"]
+          deny:
+            - pkg: github.com/MoonWX/isshoni/internal/server
+              desc: internal/protocol must not import internal/server/... (06 §8.2)
+        version:
+          list-mode: lax
+          files: ["**/internal/version/*.go", "!$test"]
+          deny:
+            - pkg: github.com/MoonWX/isshoni
+              desc: internal/version is a leaf and imports no package of this repository (04 §2)
+        logx:
+          list-mode: lax
+          files: ["**/internal/logx/*.go", "!$test"]
+          allow:
+            - github.com/MoonWX/isshoni/internal/version
+          deny:
+            - pkg: github.com/MoonWX/isshoni
+              desc: internal/logx may import only internal/version from this repository (04 §2)
+        config:
+          list-mode: lax
+          files: ["**/internal/server/config/*.go", "!$test"]
+          allow:
+            - github.com/MoonWX/isshoni/internal/logx
+            - github.com/MoonWX/isshoni/internal/version
+          deny:
+            - pkg: github.com/MoonWX/isshoni
+              desc: config may import only logx and version from this repository (04 §2)
+        netx:
+          list-mode: lax
+          files: ["**/internal/server/netx/*.go", "!$test"]
+          allow:
+            - github.com/MoonWX/isshoni/internal/logx
+            - github.com/MoonWX/isshoni/internal/version
+            - github.com/MoonWX/isshoni/internal/protocol/api
+          deny:
+            - pkg: github.com/MoonWX/isshoni
+              desc: netx may import only logx, version and internal/protocol/api from this repository; it takes plain option structs, never config (04 §2)
+        store:
+          list-mode: lax
+          files: ["**/internal/server/store/*.go", "!$test"]
+          allow:
+            - github.com/MoonWX/isshoni/internal/protocol/api
+          deny:
+            - pkg: github.com/MoonWX/isshoni
+              desc: store may import only internal/protocol/api from this repository (04 §2)
+        auth:
+          list-mode: lax
+          files: ["**/internal/server/auth/*.go", "!$test"]
+          allow:
+            - github.com/MoonWX/isshoni/internal/server/store
+            - github.com/MoonWX/isshoni/internal/protocol/api
+          deny:
+            - pkg: github.com/MoonWX/isshoni
+              desc: auth may import only store and internal/protocol/api from this repository (04 §2)
+        httpapi:
+          list-mode: lax
+          files: ["**/internal/server/httpapi/*.go", "!$test"]
+          allow:
+            - github.com/MoonWX/isshoni/internal/server/config
+            - github.com/MoonWX/isshoni/internal/logx
+            - github.com/MoonWX/isshoni/internal/version
+            - github.com/MoonWX/isshoni/internal/server/store
+            - github.com/MoonWX/isshoni/internal/server/auth
+            - github.com/MoonWX/isshoni/internal/protocol
+          deny:
+            - pkg: github.com/MoonWX/isshoni
+              desc: httpapi may import only config, logx, version, store, auth and internal/protocol(/api); ops, push, netx, tlsmgr, signal, sfu and sfuplane reach it through interfaces (04 §2)
+        tlsmgr:
+          list-mode: lax
+          files: ["**/internal/server/tlsmgr/*.go", "!$test"]
+          allow: &opsImports
+            - github.com/MoonWX/isshoni/internal/server/config
+            - github.com/MoonWX/isshoni/internal/logx
+            - github.com/MoonWX/isshoni/internal/version
+            - github.com/MoonWX/isshoni/internal/server/netx
+            - github.com/MoonWX/isshoni/internal/protocol
+          deny: &opsDeny
+            - pkg: github.com/MoonWX/isshoni
+              desc: tlsmgr, ops, ops/doctor and push may import only config, logx, version, netx and internal/protocol(/api); the wiring adapts store, auth, signal and sfu to their interfaces (04 §2)
+        ops:
+          list-mode: lax
+          files: ["**/internal/server/ops/*.go", "!$test"]
+          allow:
+            - github.com/MoonWX/isshoni/internal/server/config
+            - github.com/MoonWX/isshoni/internal/logx
+            - github.com/MoonWX/isshoni/internal/version
+            - github.com/MoonWX/isshoni/internal/server/netx
+            - github.com/MoonWX/isshoni/internal/protocol
+            - github.com/MoonWX/isshoni/internal/server/ops/doctor
+          deny: *opsDeny
+        doctor:
+          list-mode: lax
+          files: ["**/internal/server/ops/doctor/*.go", "!$test"]
+          allow: *opsImports
+          deny: *opsDeny
+        push:
+          list-mode: lax
+          files: ["**/internal/server/push/*.go", "!$test"]
+          allow: *opsImports
+          deny: *opsDeny
+        config-importers:
+          list-mode: lax
+          files:
+            - $all
+            - "!$test"
+            - "!**/cmd/isshoni/**"
+            - "!**/internal/server/*.go"
+            - "!**/internal/server/config/**"
+            - "!**/internal/server/httpapi/**"
+            - "!**/internal/server/tlsmgr/**"
+            - "!**/internal/server/ops/**"
+            - "!**/internal/server/push/**"
+            - "!**/internal/server/servertest/**"
+          deny:
+            - pkg: github.com/MoonWX/isshoni/internal/server/config
+              desc: only cmd/isshoni, the wiring, httpapi, tlsmgr, ops and push read config; pass a plain option struct instead (04 §2)
+        # Later (M2): internal/client may import only Pion, x/net and internal/protocol (06 §8.2).
+
+    forbidigo:
+      analyze-types: true
+      forbid:
+        # Scoped to internal/server by the exclusion rule below.
+        - pattern: ^fmt\.Print(f|ln)?$
+          msg: internal/server logs through log/slog (internal/logx), never fmt.Print*
+        - pattern: ^log\.
+          pkg: ^log$
+          msg: internal/server logs through log/slog (internal/logx), never the log package
+        # Everywhere.
+        - pattern: \.SetNAT1To1IPs$
+          msg: use SettingEngine.SetICEAddressRewriteRules (docs/PLAN.md)
+
+    gosec:
+      excludes:
+        # Integer conversions that may overflow: RTP and RTCP code converts between widths on purpose, because
+        # sequence numbers and timestamps wrap by design.
+        - G115
+
+  exclusions:
+    presets:
+      - std-error-handling
+      - common-false-positives
+    rules:
+      - linters: [forbidigo]
+        path-except: ^internal/server/
+        text: internal/server logs through log/slog
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/MoonWX/isshoni
