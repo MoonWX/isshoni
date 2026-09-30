@@ -2,6 +2,7 @@ package auth
 
 import (
 	"fmt"
+	"math"
 	"net/netip"
 	"sync"
 	"time"
@@ -24,7 +25,9 @@ func IPKey(a netip.Addr) netip.Prefix {
 }
 
 // HashBudget is the server-wide auth-hash bucket (03 §7.3): at most Burst anonymous hashes at once, refilled at
-// PerSecond. The zero value means DefaultHashBudget; only tests change it.
+// PerSecond. The zero value means DefaultHashBudget; only tests change it. Both must be at least 1, PerSecond at most
+// 1e9 (one token per nanosecond), and the time to refill an empty bucket, Burst ÷ PerSecond seconds, at most about
+// 146 years (maxWindow). A test that wants no budget sets something like {Burst: 1 << 20, PerSecond: 1 << 20}.
 type HashBudget struct{ Burst, PerSecond int }
 
 // DefaultHashBudget allows a burst of 20 anonymous hashes and 5 per second after that: about a quarter of one core.
@@ -37,13 +40,35 @@ func (b HashBudget) rate() (rate, error) {
 	if b.Burst < 1 || b.PerSecond < 1 {
 		return rate{}, fmt.Errorf("auth: hash budget %+v: burst and rate must be at least 1", b)
 	}
-	return rate{Burst: b.Burst, Every: time.Second / time.Duration(b.PerSecond)}, nil
+	if int64(b.PerSecond) > int64(time.Second) {
+		return rate{}, fmt.Errorf("auth: hash budget %+v: the rate may be at most %d per second", b, time.Second)
+	}
+	r := rate{Burst: b.Burst, Every: time.Second / time.Duration(b.PerSecond)}
+	if err := r.validate(); err != nil {
+		return rate{}, fmt.Errorf("auth: hash budget %+v: %w", b, err)
+	}
+	return r, nil
 }
 
 // rate is a token bucket's shape: at most Burst tokens, one more every Every.
 type rate struct {
 	Burst int
 	Every time.Duration
+}
+
+// maxWindow bounds a bucket's window, Burst × Every (about 146 years). Every ≤ window, so the limiter's sums of a
+// window and Every never overflow a time.Duration.
+const maxWindow = time.Duration(math.MaxInt64 / 2)
+
+// validate reports a rate the limiter can't use: Burst or Every below 1, or a window beyond maxWindow.
+func (r rate) validate() error {
+	if r.Burst < 1 || r.Every <= 0 {
+		return fmt.Errorf("auth: limiter rate %+v: burst and interval must be positive", r)
+	}
+	if int64(r.Burst) > int64(maxWindow/r.Every) { // Burst × Every > maxWindow, without the overflow
+		return fmt.Errorf("auth: limiter rate %+v: burst × interval exceeds %v", r, maxWindow)
+	}
+	return nil
 }
 
 // verdict is a bucket's answer.
@@ -93,14 +118,16 @@ type bucket[K comparable] struct {
 	prev, next *bucket[K]
 }
 
+// newLimiter panics on an invalid rate: the rates are constants, and HashBudget.rate validates the only one that
+// comes from outside.
 func newLimiter[K comparable](r rate, maxKeys int, now func() time.Time) *limiter[K] {
-	if r.Burst < 1 || r.Every <= 0 {
-		panic(fmt.Sprintf("auth: bad limiter rate %+v", r)) // only reached through a programming error
+	if err := r.validate(); err != nil {
+		panic(err.Error()) // only reached through a programming error
 	}
 	return &limiter[K]{rate: r, maxKeys: max(maxKeys, 1), now: now, m: make(map[K]*bucket[K])}
 }
 
-// window is how far tat may run ahead of now: Burst tokens.
+// window is how far tat may run ahead of now: Burst tokens. It is at least Every and at most maxWindow (validate).
 func (l *limiter[K]) window() time.Duration { return time.Duration(l.rate.Burst) * l.rate.Every }
 
 // take consumes one token for key if there is one. It is the check for buckets that count every attempt
@@ -118,7 +145,7 @@ func (l *limiter[K]) take(key K) verdict {
 		}
 	}
 	if wait := start.Add(l.rate.Every).Sub(now) - l.window(); wait > 0 {
-		return l.refuse(b, wait) // b is non-nil: an absent key is full and always passes
+		return l.refuse(b, wait) // b is non-nil: an absent key is full (window ≥ Every) and always passes
 	}
 	if b == nil {
 		b = l.insert(key, now)
@@ -139,9 +166,10 @@ func (l *limiter[K]) check(key K) verdict {
 	}
 	l.touch(b)
 	now := l.now()
-	// A token is left while tat is less than one full window ahead of now.
-	if wait := b.tat.Sub(now) - l.window() + l.rate.Every; wait > 0 {
-		return l.refuse(b, wait)
+	// A token is left while tat is at most window − Every ahead of now. (Comparing first keeps a tat far in the past
+	// from overflowing the subtraction.)
+	if ahead, limit := b.tat.Sub(now), l.window()-l.rate.Every; ahead > limit {
+		return l.refuse(b, ahead-limit)
 	}
 	b.refused = false
 	return verdict{OK: true}

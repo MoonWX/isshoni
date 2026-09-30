@@ -15,7 +15,8 @@ import (
 // (and, in M2, device codes, user codes and bearer tokens); Invite hashes setup, invite and password-reset tokens.
 // Rotating one key invalidates exactly the tokens it protects (§4.6).
 //
-// Keys never print: every fmt verb and slog show a redacted placeholder.
+// Keys never print: every fmt verb, slog (a top-level attribute or a field of a logged struct, in the text and the
+// JSON handler), encoding/json and every encoding.TextMarshaler user (TOML, XML) show a redacted placeholder.
 type Keys struct{ Session, Invite []byte }
 
 // keySize is the required length of each key in Keys.
@@ -36,7 +37,18 @@ func (k Keys) validate() error {
 func (k Keys) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, "auth.Keys{REDACTED}") }
 
 // LogValue implements slog.LogValuer so that a Keys value logged by mistake shows no key bytes.
-func (k Keys) LogValue() slog.Value { return slog.StringValue("REDACTED") }
+func (k Keys) LogValue() slog.Value { return slog.StringValue(redacted) }
+
+// MarshalJSON implements json.Marshaler. slog's JSON handler (the production log format) encodes a struct that holds
+// Keys, such as the service's Options, with encoding/json, which would otherwise print both keys in base64.
+func (k Keys) MarshalJSON() ([]byte, error) { return []byte(`"` + redacted + `"`), nil }
+
+// MarshalText implements encoding.TextMarshaler for the encoders that use it, such as TOML and encoding/xml. (slog's
+// text handler prints a struct that holds Keys with %+v, which Format covers.)
+func (k Keys) MarshalText() ([]byte, error) { return []byte(redacted), nil }
+
+// redacted replaces key material wherever Keys is printed or encoded.
+const redacted = "REDACTED"
 
 // Random sizes of the M1 tokens, in bytes (03 §3.2). Every token is base64url without padding: 32 bytes are
 // 43 characters, 24 bytes are 32 characters.

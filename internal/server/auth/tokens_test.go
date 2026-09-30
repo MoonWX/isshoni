@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -180,5 +182,46 @@ func TestKeysNeverPrint(t *testing.T) {
 	slog.New(slog.NewJSONHandler(&buf, nil)).Info("x", "keys", k)
 	if !strings.Contains(buf.String(), `"keys":"REDACTED"`) {
 		t.Errorf("slog output %q does not redact Keys", buf.String())
+	}
+
+	// Keys as a field of a logged struct (the service's Options holds one): slog's JSON handler encodes the struct
+	// with encoding/json and its text handler with encoding.TextMarshaler or %+v, never through LogValue.
+	b64Session := base64.StdEncoding.EncodeToString(k.Session)[:8] // "ERERERER"
+	b64Invite := base64.StdEncoding.EncodeToString(k.Invite)[:8]   // "IiIiIiIi"
+	leaks := func(out string) bool {
+		return strings.Contains(out, b64Session) || strings.Contains(out, b64Invite) ||
+			strings.Contains(out, hexKey) || strings.Contains(out, "17,17")
+	}
+	type options struct {
+		Name string
+		Keys Keys
+	}
+	opts := options{Name: "isshoni", Keys: k}
+	outputs := map[string]string{}
+	for name, h := range map[string]func(*bytes.Buffer) slog.Handler{
+		"json": func(b *bytes.Buffer) slog.Handler { return slog.NewJSONHandler(b, nil) },
+		"text": func(b *bytes.Buffer) slog.Handler { return slog.NewTextHandler(b, nil) },
+	} {
+		var b bytes.Buffer
+		slog.New(h(&b)).Info("x", "opts", opts, "ptr", &opts, "group", slog.GroupValue(slog.Any("keys", k)))
+		outputs["slog "+name+" handler"] = b.String()
+	}
+	for name, v := range map[string]any{"Keys": k, "*Keys": &k, "struct": opts, "*struct": &opts} {
+		j, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("json.Marshal(%s): %v", name, err)
+		}
+		outputs["json.Marshal "+name] = string(j)
+	}
+	if j, _ := json.Marshal(opts); string(j) != `{"Name":"isshoni","Keys":"REDACTED"}` {
+		t.Errorf("json.Marshal of a struct holding Keys = %s", j)
+	}
+	if txt, err := k.MarshalText(); err != nil || string(txt) != "REDACTED" {
+		t.Errorf("MarshalText = %q, %v", txt, err)
+	}
+	for name, out := range outputs {
+		if leaks(out) || !strings.Contains(out, "REDACTED") {
+			t.Errorf("%s printed key material or no placeholder: %s", name, out)
+		}
 	}
 }

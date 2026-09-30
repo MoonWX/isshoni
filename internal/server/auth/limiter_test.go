@@ -3,6 +3,7 @@ package auth
 import (
 	"crypto/rand"
 	"fmt"
+	"math"
 	"net/netip"
 	"slices"
 	"sync"
@@ -299,13 +300,79 @@ func TestHashBudget(t *testing.T) {
 	if err != nil || r != (rate{Burst: 20, Every: 200 * time.Millisecond}) {
 		t.Fatalf("zero HashBudget rate = %+v, %v; want DefaultHashBudget", r, err)
 	}
-	for _, b := range []HashBudget{{Burst: 0, PerSecond: 5}, {Burst: 5, PerSecond: 0}, {Burst: -1, PerSecond: -1}} {
-		if _, err := b.rate(); err == nil {
-			t.Errorf("%+v.rate() = nil error", b)
+	for _, b := range []HashBudget{
+		{Burst: 0, PerSecond: 5},
+		{Burst: 5, PerSecond: 0},
+		{Burst: -1, PerSecond: -1},
+		{Burst: 1, PerSecond: int(time.Second) + 1}, // Every would be 0
+		{Burst: math.MaxInt, PerSecond: math.MaxInt},
+		{Burst: 1 << 40, PerSecond: 1}, // Burst × Every overflows a time.Duration
+		{Burst: math.MaxInt, PerSecond: int(time.Second)},
+	} {
+		if r, err := b.rate(); err == nil {
+			t.Errorf("%+v.rate() = %+v, nil error", b, r)
 		}
 		if _, err := newThrottles(time.Now, b); err == nil {
 			t.Errorf("newThrottles(%+v) = nil error", b)
 		}
+	}
+
+	// Large budgets that fit work: a test that wants no hash budget sets one, and the bucket never refuses it.
+	for _, b := range []HashBudget{
+		{Burst: 1 << 20, PerSecond: 1 << 20},
+		{Burst: 1, PerSecond: int(time.Second)},
+		{Burst: int(maxWindow / time.Second), PerSecond: 1},
+		{Burst: int(maxWindow), PerSecond: int(time.Second)},
+	} {
+		clk := newFakeClock()
+		th, err := newThrottles(clk.now, b)
+		if err != nil {
+			t.Fatalf("newThrottles(%+v) = %v", b, err)
+		}
+		for i := range min(b.Burst, 1000) {
+			if v := th.authHash.take(struct{}{}); !v.OK {
+				t.Fatalf("%+v: take %d = %+v", b, i+1, v)
+			}
+		}
+	}
+}
+
+func TestNewLimiterRejectsBadRates(t *testing.T) {
+	for _, r := range []rate{
+		{Burst: 0, Every: time.Second},
+		{Burst: 1, Every: 0},
+		{Burst: 1, Every: -time.Second},
+		{Burst: 1 << 40, Every: time.Second},         // the window overflows a time.Duration
+		{Burst: 3, Every: maxWindow/3 + 1},           // just past maxWindow
+		{Burst: math.MaxInt, Every: time.Nanosecond}, // past maxWindow
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("newLimiter(%+v) did not panic", r)
+				}
+			}()
+			newLimiter[string](r, 10, time.Now)
+		}()
+	}
+	// The largest window: a new key passes, and once empty the bucket answers with a finite wait.
+	clk := newFakeClock()
+	l := newLimiter[string](rate{Burst: 2, Every: maxWindow / 2}, 10, clk.now)
+	for i := range 2 {
+		if v := l.take("k"); !v.OK {
+			t.Fatalf("take %d = %+v", i+1, v)
+		}
+	}
+	if v := l.take("k"); v.OK || v.RetryAfter != maxWindow/2 {
+		t.Fatalf("take 3 = %+v, want a refusal with RetryAfter %v", v, maxWindow/2)
+	}
+	l.spend("u")
+	if v := l.check("u"); !v.OK {
+		t.Fatalf("check after one failure = %+v", v)
+	}
+	l.spend("u")
+	if v := l.check("u"); v.OK || v.RetryAfter != maxWindow/2 {
+		t.Fatalf("check after two failures = %+v, want a refusal with RetryAfter %v", v, maxWindow/2)
 	}
 }
 
