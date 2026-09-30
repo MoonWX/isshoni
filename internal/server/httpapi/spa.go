@@ -214,16 +214,14 @@ func lastSegmentHasDot(name string) bool {
 // (index.html as 404 for /setup) sends the body with that status and no validators.
 func (s *spa) serveFile(w http.ResponseWriter, r *http.Request, f *spaFile, cacheControl string, status int) {
 	h := w.Header()
-	v := f
+	v, encoding := f, ""
 	if f.br != nil || f.gz != nil {
 		h.Add("Vary", "Accept-Encoding")
-		switch pickEncoding(r.Header.Get("Accept-Encoding"), f.br != nil, f.gz != nil) {
+		switch encoding = pickEncoding(r.Header.Get("Accept-Encoding"), f.br != nil, f.gz != nil); encoding {
 		case "br":
 			v = f.br
-			h.Set("Content-Encoding", "br")
 		case "gzip":
 			v = f.gz
-			h.Set("Content-Encoding", "gzip")
 		}
 	}
 	s.setTypeHeaders(h, f, cacheControl)
@@ -245,8 +243,14 @@ func (s *spa) serveFile(w http.ResponseWriter, r *http.Request, f *spaFile, cach
 			rs = bytes.NewReader(b)
 		}
 		h.Set("ETag", v.etag)
+		if encoding != "" {
+			w = &encodingWriter{ResponseWriter: w, encoding: encoding}
+		}
 		http.ServeContent(w, r, "", time.Time{}, rs)
 		return
+	}
+	if encoding != "" {
+		h.Set("Content-Encoding", encoding)
 	}
 	h.Set("Content-Length", strconv.FormatInt(v.size, 10))
 	w.WriteHeader(status)
@@ -254,6 +258,25 @@ func (s *spa) serveFile(w http.ResponseWriter, r *http.Request, f *spaFile, cach
 		_, _ = io.Copy(w, file) // a failed write means the client is gone
 	}
 }
+
+// encodingWriter sets Content-Encoding when http.ServeContent sends a precompressed variant's bytes (200, 206), not
+// before. ServeContent leaves Content-Length out when Content-Encoding is already set (it expects a writer that
+// compresses on the fly), which would send every .br/.gz chunked and HEAD without a length. Its 304, 412 and 416
+// answers don't carry the variant, so they get no encoding (and no length of it) either.
+type encodingWriter struct {
+	http.ResponseWriter
+	encoding string
+}
+
+func (w *encodingWriter) WriteHeader(code int) {
+	if code == http.StatusOK || code == http.StatusPartialContent {
+		w.Header().Set("Content-Encoding", w.encoding)
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// Unwrap returns the wrapped writer, for http.ResponseController.
+func (w *encodingWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 // serveBuiltin sends an in-memory file (the built-in robots.txt) like serveFile does.
 func (s *spa) serveBuiltin(w http.ResponseWriter, r *http.Request, f *spaFile, content []byte) {

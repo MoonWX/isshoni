@@ -1,10 +1,13 @@
 package httpapi
 
 import (
+	"io"
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -102,14 +105,24 @@ func TestSPATable(t *testing.T) {
 	}
 }
 
-// TestSPAHeadMatchesGet: HEAD sends the same headers as GET, without the body.
+// TestSPAHeadMatchesGet: HEAD sends the same headers as GET, without the body, also for a precompressed variant.
 func TestSPAHeadMatchesGet(t *testing.T) {
 	f := newFixture(t, nil)
 	for _, path := range []string{"/" + testJS, "/r/lounge", "/sw.js"} {
-		get, head := f.get(path), f.serve(newReq(http.MethodHead, path))
-		for _, k := range []string{"Content-Type", "Content-Length", "Cache-Control", "ETag", "Vary", "Content-Security-Policy"} {
-			if get.Header().Get(k) != head.Header().Get(k) {
-				t.Errorf("%s %s: GET %q, HEAD %q", path, k, get.Header().Get(k), head.Header().Get(k))
+		for _, accept := range []string{"", "br", "gzip"} {
+			get := f.get(path, "Accept-Encoding", accept)
+			head := f.serve(newReq(http.MethodHead, path, "Accept-Encoding", accept))
+			if head.Body.Len() != 0 {
+				t.Errorf("HEAD %s (%q) sent a body", path, accept)
+			}
+			if cl := get.Header().Get("Content-Length"); cl != strconv.Itoa(get.Body.Len()) {
+				t.Errorf("GET %s (%q): Content-Length %q, body %d bytes", path, accept, cl, get.Body.Len())
+			}
+			for _, k := range []string{"Content-Type", "Content-Length", "Content-Encoding", "Cache-Control", "ETag", "Vary",
+				"Content-Security-Policy"} {
+				if get.Header().Get(k) != head.Header().Get(k) {
+					t.Errorf("%s (%q) %s: GET %q, HEAD %q", path, accept, k, get.Header().Get(k), head.Header().Get(k))
+				}
 			}
 		}
 	}
@@ -181,6 +194,10 @@ func TestSPAPrecompressed(t *testing.T) {
 		if h.Get("Vary") != "Accept-Encoding" {
 			t.Errorf("%s with %q: Vary %q", tt.path, tt.accept, h.Get("Vary"))
 		}
+		// ServeContent leaves Content-Length out once Content-Encoding is set; the variants must still carry it.
+		if cl := h.Get("Content-Length"); cl != strconv.Itoa(len(tt.body)) {
+			t.Errorf("%s with %q: Content-Length %q, want %d", tt.path, tt.accept, cl, len(tt.body))
+		}
 		if !strings.HasPrefix(h.Get("Content-Type"), "text/") {
 			t.Errorf("%s: Content-Type %q is not the original's", tt.path, h.Get("Content-Type"))
 		}
@@ -192,8 +209,50 @@ func TestSPAPrecompressed(t *testing.T) {
 	if br == gz || br == id || gz == id {
 		t.Errorf("variants share an ETag: br %s gzip %s identity %s", br, gz, id)
 	}
-	if rec := f.get("/"+testJS, "Accept-Encoding", "br", "If-None-Match", br); rec.Code != http.StatusNotModified {
-		t.Errorf("br variant revalidation: %d", rec.Code)
+	if rec := f.get("/"+testJS, "Accept-Encoding", "br", "If-None-Match", br); rec.Code != http.StatusNotModified ||
+		rec.Header().Get("Content-Length") != "" || rec.Header().Get("Content-Encoding") != "" || rec.Body.Len() != 0 {
+		t.Errorf("br variant revalidation: %d %v %q", rec.Code, rec.Header(), rec.Body)
+	}
+	// A failed If-Match has no body: no length or encoding of the variant (a stale length would break the connection).
+	if rec := f.get("/"+testJS, "Accept-Encoding", "br", "If-Match", `"0000000000000000"`); rec.Code != http.StatusPreconditionFailed ||
+		rec.Header().Get("Content-Length") != "" || rec.Header().Get("Content-Encoding") != "" || rec.Body.Len() != 0 {
+		t.Errorf("br variant with a failed If-Match: %d %v %q", rec.Code, rec.Header(), rec.Body)
+	}
+	// A range of the variant is a range of its encoded bytes.
+	if rec := f.get("/"+testJS, "Accept-Encoding", "br", "Range", "bytes=1-2"); rec.Code != http.StatusPartialContent ||
+		rec.Body.String() != "R:" || rec.Header().Get("Content-Encoding") != "br" || rec.Header().Get("Content-Length") != "2" ||
+		rec.Header().Get("Content-Range") != "bytes 1-2/5" {
+		t.Errorf("br variant range: %d %v %q", rec.Code, rec.Header(), rec.Body)
+	}
+	if rec := f.get("/"+testJS, "Accept-Encoding", "br", "Range", "bytes=9-"); rec.Code != http.StatusRequestedRangeNotSatisfiable ||
+		rec.Header().Get("Content-Encoding") != "" {
+		t.Errorf("br variant unsatisfiable range: %d %v", rec.Code, rec.Header())
+	}
+	// Over the wire the variants go out with their length, not chunked, for GET and HEAD.
+	d := newFixture(t, func(o *RouterOptions) { o.Site = devSite() })
+	srv := httptest.NewServer(d.rt.Handler())
+	defer srv.Close()
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		req, err := http.NewRequestWithContext(t.Context(), method, srv.URL+"/"+testJS, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Accept-Encoding", "br")
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		want := "BR:js"
+		if method == http.MethodHead {
+			want = ""
+		}
+		if err != nil || resp.StatusCode != http.StatusOK || resp.ContentLength != int64(len("BR:js")) || len(resp.TransferEncoding) != 0 ||
+			resp.Header.Get("Content-Encoding") != "br" || string(body) != want {
+			t.Errorf("%s over the wire: %d, length %d, transfer %v, %v, body %q, err %v", method, resp.StatusCode,
+				resp.ContentLength, resp.TransferEncoding, resp.Header, body, err)
+		}
 	}
 	// A file without siblings: no Vary, no encoding. A .gz without an original is a file of its own.
 	if rec := f.get("/sw.js", "Accept-Encoding", "br, gzip"); rec.Header().Get("Vary") != "" || rec.Header().Get("Content-Encoding") != "" {

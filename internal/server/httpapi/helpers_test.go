@@ -152,7 +152,6 @@ func newFixture(t *testing.T, mod func(*RouterOptions)) *fixture {
 	f := &fixture{obs: &recObserver{}, gate: &Gate{}, logs: &syncBuffer{}}
 	opts := RouterOptions{
 		Site:     domainSite(),
-		HSTS:     true,
 		SPA:      testFS(),
 		Gate:     f.gate,
 		Observer: f.obs,

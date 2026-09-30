@@ -123,6 +123,25 @@ func TestWriteErrorEdgeCases(t *testing.T) {
 			&api.Error{Code: api.CodeLimitReached, Params: map[string]any{"limit": func() {}}})
 		wantError(t, rec, 500, api.CodeInternal)
 	})
+	t.Run("a code without a status becomes internal", func(t *testing.T) {
+		logs := captureDefaultLog(t)
+		rec := httptest.NewRecorder()
+		WriteError(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil),
+			fmt.Errorf("rooms: %w", &api.Error{Code: "no_such_code", Params: map[string]any{"x": 1}, RetryAfter: 3}))
+		e := wantError(t, rec, 500, api.CodeInternal)
+		if e.Params != nil || e.RetryAfter != 0 || rec.Header().Get("Retry-After") != "" || !requestIDPattern.MatchString(e.RequestID) {
+			t.Fatalf("envelope %+v, headers %v", e, rec.Header())
+		}
+		if strings.Contains(rec.Body.String(), "no_such_code") {
+			t.Fatalf("the unknown code reached the client: %q", rec.Body)
+		}
+		// The log keeps the original code, next to the request ID the client quotes.
+		recs := logs.records(t)
+		if len(recs) != 1 || recs[0]["level"] != "ERROR" || recs[0]["request_id"] != e.RequestID ||
+			!strings.Contains(fmt.Sprint(recs[0]["err"]), `"no_such_code"`) {
+			t.Fatalf("logs:\n%s", logs)
+		}
+	})
 	t.Run("nil error and nil *api.Error", func(t *testing.T) {
 		for _, err := range []error{nil, (*api.Error)(nil)} {
 			rec := httptest.NewRecorder()
@@ -260,6 +279,47 @@ func TestDecodeJSON(t *testing.T) {
 	var ae *api.Error
 	if err == nil || errors.As(err, &ae) {
 		t.Fatalf("non-pointer dst: err = %v", err)
+	}
+}
+
+// TestDecodeJSONLimitClosesConnection runs a real server: a body cut by the limit while reading gets 413, and
+// net/http closes the connection after it instead of draining the rest, also through the router's wrapped writers.
+func TestDecodeJSONLimitClosesConnection(t *testing.T) {
+	f := newFixture(t, func(o *RouterOptions) { o.Site = devSite() })
+	f.rt.HandleFunc("POST /decode", func(w http.ResponseWriter, r *http.Request) {
+		var dst map[string]any
+		if err := DecodeJSON(w, r, &dst, 16); err != nil {
+			WriteError(w, r, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	srv := httptest.NewServer(f.rt.Handler())
+	defer srv.Close()
+
+	// post returns the status and whether the server closes the connection (resp.Close reports its Connection: close,
+	// a header the client removes itself).
+	post := func(t *testing.T, body string) (status int, closes bool) {
+		t.Helper()
+		// Hiding the length makes the client send the body chunked, so only the reader's limit can catch it.
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, srv.URL+"/decode", struct{ io.Reader }{strings.NewReader(body)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return resp.StatusCode, resp.Close
+	}
+	if status, closes := post(t, `{"a":1}`); status != http.StatusNoContent || closes {
+		t.Fatalf("within the limit: %d, close %v", status, closes)
+	}
+	if status, closes := post(t, `{"a":"`+strings.Repeat("x", 100)+`"}`); status != http.StatusRequestEntityTooLarge || !closes {
+		t.Fatalf("over the limit: %d, close %v; want 413 and the connection closed", status, closes)
 	}
 }
 

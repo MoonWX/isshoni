@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -13,7 +14,7 @@ import (
 
 // WriteError writes 03's envelope {"error": {…}} (03 §12.2, 04 §9.4):
 //   - an *api.Error (also wrapped) is sent with the status api.StatusOf(code), and a Retry-After header when
-//     RetryAfter is set;
+//     RetryAfter is set; a code the table doesn't know is a bug and goes out as 500 internal (its code is logged);
 //   - an *http.MaxBytesError (a body over its limit) becomes payload_too_large;
 //   - any other error becomes 500 internal with the request ID in requestId, and is logged with the route pattern
 //     and the request ID (at debug level when the client has gone away). The error text never reaches the client.
@@ -39,11 +40,12 @@ func WriteError(w http.ResponseWriter, r *http.Request, err error) {
 		status = http.StatusInternalServerError
 	}
 	if status == http.StatusInternalServerError {
-		code := out.Code
-		if encErr != nil {
-			code = api.CodeInternal
+		// A 500 is always internal: a code without a row in the table (a typo, a code added without its StatusOf
+		// row) is a bug, and the SPA has no text for it. The log keeps the original code.
+		if out.Code != api.CodeInternal && encErr == nil {
+			err = fmt.Errorf("httpapi.WriteError: code %q has no HTTP status: %w", out.Code, err)
 		}
-		out = api.Error{Code: code, RequestID: RequestID(r)}
+		out = api.Error{Code: api.CodeInternal, RequestID: RequestID(r)}
 		if out.RequestID == "" {
 			out.RequestID = newRequestID() // not through the router: still give the report something to quote
 		}

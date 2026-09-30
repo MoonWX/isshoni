@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/netip"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -41,9 +42,10 @@ type RouterOptions struct {
 	// TrustedProxies are the peers whose X-Forwarded-For and X-Forwarded-Proto are honored; only used when
 	// Site.TLSMode is off (04 §8.5). The wiring passes config's effective network.trusted_proxies.
 	TrustedProxies []netip.Prefix
-	// HSTS is config tls.hsts: send Strict-Transport-Security on TLS responses when the site is a domain (04 §9.6).
-	// Not in 04 §9.2's field list, which has no other way to reach the key.
-	HSTS bool
+	// DisableHSTS is the negation of config tls.hsts. Its zero value sends Strict-Transport-Security on TLS
+	// responses when the site is a domain (04 §9.6), as tls.hsts defaults to true (04 §4.3), so a wiring that fills
+	// only 04 §9.2's field list keeps HSTS on. Not in that list, which has no other way to reach the key.
+	DisableHSTS bool
 	// SPA is the built web app, web.Dist(). nil serves the "web UI not built" page.
 	SPA fs.FS
 	// SPAStatus is 03's hook for the status of an index.html fallback (404 for "/setup" once an admin exists). nil
@@ -65,9 +67,9 @@ type RouterOptions struct {
 // RouteObserver receives one call per response from the transfer/metrics middleware (04 §9.3).
 //
 // pattern is the http.ServeMux pattern that routes the request ("/api/v1/", "GET /ws", "GET /healthz", "/" for the
-// SPA), also for responses written before routing (the gate's 503, the Host check's 421). status is the final status
-// (101 for a WebSocket upgrade, 500 for a panic) and bytes the response body bytes written through the
-// ResponseWriter (not the bytes of a hijacked connection).
+// SPA and for the JSON 404 of reserved paths no route handles), also for responses written before routing (the
+// gate's 503, the Host check's 421). status is the final status (101 for a WebSocket upgrade, 500 for a panic) and
+// bytes the response body bytes written through the ResponseWriter (not the bytes of a hijacked connection).
 type RouteObserver interface {
 	ObserveRoute(pattern string, status int, bytes int64)
 }
@@ -101,7 +103,7 @@ func NewRouter(opts RouterOptions) *Router {
 		opts:        opts,
 		log:         log,
 		mux:         http.NewServeMux(),
-		sec:         newSecHeaders(opts.Site, opts.HSTS),
+		sec:         newSecHeaders(opts.Site, !opts.DisableHSTS),
 		readTimeout: defaultReadTimeout,
 	}
 	spa := newSPA(opts.SPA, opts.SPAStatus, rt.sec, log)
@@ -113,13 +115,17 @@ func NewRouter(opts RouterOptions) *Router {
 	if apiHandler == nil {
 		apiHandler = notFound
 	}
-	rt.mux.Handle("/", spa)
+	// Reserved paths that no route handles answer JSON 404, never index.html (04 §9.5). The check lives in the "/"
+	// handler rather than in mux patterns of their own, so Handle can still register "/healthz" as well as
+	// "GET /healthz" (the same pattern twice would panic).
+	rt.mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isReservedPath(r.URL.Path) {
+			notFound.ServeHTTP(w, r)
+			return
+		}
+		spa.ServeHTTP(w, r)
+	}))
 	rt.mux.Handle("/api/v1/", apiHandler)
-	// Reserved paths that no route handles answer JSON 404, never index.html (04 §9.5).
-	rt.mux.Handle("/api/", notFound)
-	rt.mux.Handle("/ws", notFound)
-	rt.mux.Handle("/healthz", notFound)
-	rt.mux.Handle("/readyz", notFound)
 	if opts.WS != nil {
 		rt.mux.Handle("GET /ws", rt.wsMount(opts.WS))
 	}
@@ -134,9 +140,21 @@ func NewRouter(opts RouterOptions) *Router {
 }
 
 // Handle registers a route on the router's mux, inside the global chain. Patterns use Go 1.22+ ServeMux syntax
-// ("GET /healthz"). Like http.ServeMux.Handle, it panics on an invalid or conflicting pattern. Routes under /api/v1/
-// are 03's: register them with API.Handle, which adds 03's chain.
+// ("GET /healthz"). Like http.ServeMux.Handle, it panics on an invalid or conflicting pattern; the router itself
+// holds only "/", "/api/v1/" and, with RouterOptions.WS, "GET /ws", so "/healthz", "/readyz" and "/api/…" can be
+// registered with or without a method. A request for a reserved path that no route matches (another method, say)
+// gets JSON 404 not_found. Routes under /api/v1/ are 03's: register them with API.Handle, which adds 03's chain.
 func (rt *Router) Handle(pattern string, h http.Handler) { rt.mux.Handle(pattern, h) }
+
+// isReservedPath reports a path that belongs to the server, not the SPA (04 §9.5): /api and everything under it
+// (the /api/v1/ mount aside), /ws, /healthz and /readyz.
+func isReservedPath(p string) bool {
+	switch p {
+	case "/api", "/ws", "/healthz", "/readyz":
+		return true
+	}
+	return strings.HasPrefix(p, "/api/")
+}
 
 // HandleFunc is Handle for a function.
 func (rt *Router) HandleFunc(pattern string, fn http.HandlerFunc) { rt.mux.Handle(pattern, fn) }

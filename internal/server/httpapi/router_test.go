@@ -294,6 +294,7 @@ func TestMounts(t *testing.T) {
 		t.Errorf("GET /ws: status %d, hub saw %q", rec.Code, wsPath)
 	}
 	for _, tc := range []struct{ method, path string }{
+		{http.MethodGet, "/api"},
 		{http.MethodGet, "/api/"},
 		{http.MethodGet, "/api/v2/info"},
 		{http.MethodPost, "/api/anything"},
@@ -318,6 +319,47 @@ func TestMounts(t *testing.T) {
 		t.Errorf("/healthz: status %d, Cache-Control %q; want 200 and no-store", rec.Code, rec.Header().Get("Cache-Control"))
 	}
 	wantError(t, bare.serve(newReq(http.MethodPost, "/healthz")), http.StatusNotFound, api.CodeNotFound)
+
+	// The reserved paths are not mux patterns of the router's own, so the server may register them without a
+	// method too; paths that merely start like them stay SPA routes.
+	own := newFixture(t, nil)
+	var seen []string
+	record := func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Method+" "+r.URL.Path)
+		w.WriteHeader(http.StatusNoContent)
+	}
+	for _, pattern := range []string{"/healthz", "GET /readyz", "/ws", "/api/"} {
+		func() {
+			defer func() {
+				if p := recover(); p != nil {
+					t.Fatalf("Handle(%q) panicked: %v", pattern, p)
+				}
+			}()
+			own.rt.HandleFunc(pattern, record)
+		}()
+	}
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodGet, "/healthz"}, {http.MethodPost, "/healthz"}, {http.MethodGet, "/readyz"}, {http.MethodGet, "/ws"},
+		{http.MethodPut, "/api/v2/x"},
+	} {
+		if rec := own.serve(newReq(tc.method, tc.path)); rec.Code != http.StatusNoContent {
+			t.Errorf("%s %s: status %d, want the registered route", tc.method, tc.path, rec.Code)
+		}
+	}
+	if want := []string{"GET /healthz", "POST /healthz", "GET /readyz", "GET /ws", "PUT /api/v2/x"}; !slices.Equal(seen, want) {
+		t.Errorf("routes saw %v, want %v", seen, want)
+	}
+	wantError(t, own.serve(newReq(http.MethodPost, "/readyz")), http.StatusNotFound, api.CodeNotFound)
+	// That reserved 404 is observed under the pattern that routed it, "/", like any other request "/" serves.
+	if obs := own.obs.all(); obs[len(obs)-1] != (observation{"/", http.StatusNotFound, int64(len(`{"error":{"code":"not_found"}}` + "\n"))}) {
+		t.Errorf("observation %+v", obs[len(obs)-1])
+	}
+	wantError(t, own.get("/api/v1/info"), http.StatusNotFound, api.CodeNotFound) // the /api/v1/ mount still wins
+	for _, path := range []string{"/apis", "/wsx", "/healthz/x", "/readyz-page", "/r/api"} {
+		if rec := bare.get(path); rec.Code != http.StatusOK || rec.Body.String() != indexHTML {
+			t.Errorf("%s: %d, want index.html", path, rec.Code)
+		}
+	}
 }
 
 func TestTransferObserver(t *testing.T) {

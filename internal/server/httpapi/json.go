@@ -60,7 +60,9 @@ func bodyAllowed(status int) bool {
 //   - Content-Type is application/json (parameters allowed; a charset other than utf-8 is refused) → otherwise
 //     *api.Error unsupported_media_type;
 //   - the body is at most maxBytes (≤ 0 means 64 KiB), by Content-Length up front and by an http.MaxBytesReader while
-//     reading (which also makes net/http close the connection) → otherwise payload_too_large;
+//     reading → otherwise payload_too_large. When the reader hits the limit, net/http closes the connection after
+//     the reply instead of draining the rest of the body; after the Content-Length check it drains up to 256 KiB
+//     of the unread body, or closes when there is more;
 //   - the body is exactly one JSON value, followed by nothing but white space → otherwise bad_request (empty body,
 //     malformed JSON, wrong types, trailing data, a failed read).
 //
@@ -79,7 +81,7 @@ func DecodeJSON(w http.ResponseWriter, r *http.Request, dst any, maxBytes int64)
 	if r.Body == nil {
 		return api.NewError(api.CodeBadRequest)
 	}
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBytes))
+	dec := json.NewDecoder(maxBytesReader(w, r.Body, maxBytes))
 	if err := dec.Decode(dst); err != nil {
 		return decodeError(err)
 	}
@@ -91,6 +93,24 @@ func DecodeJSON(w http.ResponseWriter, r *http.Request, dst any, maxBytes int64)
 		return decodeError(err)
 	}
 	return nil
+}
+
+// maxBytesReader is http.MaxBytesReader on the innermost ResponseWriter. net/http tells its own writer that the
+// limit was hit (so it sends Connection: close and closes after the reply) through a type assertion on the writer it
+// is given, which doesn't follow Unwrap; the router's wrappers would hide it. 03's body-limit step should use it too.
+func maxBytesReader(w http.ResponseWriter, body io.ReadCloser, n int64) io.ReadCloser {
+	for {
+		u, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			break
+		}
+		inner := u.Unwrap()
+		if inner == nil {
+			break
+		}
+		w = inner
+	}
+	return http.MaxBytesReader(w, body, n)
 }
 
 func decodeError(err error) error {

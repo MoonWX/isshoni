@@ -2,7 +2,9 @@ package httpapi
 
 import (
 	"crypto/tls"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -98,26 +100,27 @@ func TestHTMLCSPConnectSrc(t *testing.T) {
 	}
 }
 
-// TestHSTS: only on TLS responses for a domain with tls.hsts, never for IP hosts or plain HTTP (04 §9.6).
+// TestHSTS: only on TLS responses for a domain with tls.hsts, never for IP hosts or plain HTTP (04 §9.6). The zero
+// RouterOptions sends it, as tls.hsts defaults to true (04 §4.3).
 func TestHSTS(t *testing.T) {
 	ipSite := Site{Origin: "https://203.0.113.7", Host: "203.0.113.7", Hostname: "203.0.113.7", TLSMode: "ip"}
 	v6Site := Site{Origin: "https://[2001:db8::1]", Host: "[2001:db8::1]", Hostname: "2001:db8::1", TLSMode: "ip"}
 	tests := []struct {
-		name string
-		site Site
-		hsts bool
-		tls  bool
-		want bool
+		name    string
+		site    Site
+		disable bool
+		tls     bool
+		want    bool
 	}{
-		{"domain over TLS", domainSite(), true, true, true},
-		{"tls.hsts off", domainSite(), false, true, false},
-		{"plain HTTP (off mode behind a proxy)", domainSite(), true, false, false},
-		{"IPv4 host", ipSite, true, true, false},
-		{"IPv6 host", v6Site, true, true, false},
+		{"domain over TLS (default options)", domainSite(), false, true, true},
+		{"tls.hsts off", domainSite(), true, true, false},
+		{"plain HTTP (off mode behind a proxy)", domainSite(), false, false, false},
+		{"IPv4 host", ipSite, false, true, false},
+		{"IPv6 host", v6Site, false, true, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			f := newFixture(t, func(o *RouterOptions) { o.Site, o.HSTS = tt.site, tt.hsts })
+			f := newFixture(t, func(o *RouterOptions) { o.Site, o.DisableHSTS = tt.site, tt.disable })
 			for _, path := range []string{"/", "/" + testJS, "/api/v1/x"} {
 				req := newReq(http.MethodGet, path)
 				req.Host = tt.site.Host
@@ -131,5 +134,14 @@ func TestHSTS(t *testing.T) {
 				}
 			}
 		})
+	}
+	// A wiring that fills only 04 §9.2's fields keeps HSTS on.
+	rt := NewRouter(RouterOptions{Site: domainSite(), Logger: slog.New(slog.DiscardHandler)})
+	req := newReq(http.MethodGet, "/")
+	req.TLS = &tls.ConnectionState{}
+	rec := httptest.NewRecorder()
+	rt.Handler().ServeHTTP(rec, req)
+	if got := rec.Header().Get("Strict-Transport-Security"); got != hstsValue {
+		t.Errorf("zero RouterOptions: Strict-Transport-Security = %q, want %q", got, hstsValue)
 	}
 }
