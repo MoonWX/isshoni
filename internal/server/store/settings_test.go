@@ -14,6 +14,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/text/secure/precis"
 
@@ -258,6 +259,14 @@ func TestSettingsValidation(t *testing.T) {
 		{"serverName", "\"a\u200bb\"", nil, api.FieldInvalid}, // zero width space
 		{"serverName", `42`, nil, api.FieldInvalid},
 		{"serverName", `null`, nil, api.FieldInvalid},
+		// encoding/json would turn invalid UTF-8 and lone surrogates into U+FFFD, which PRECIS Nickname allows.
+		{"serverName", "\"ok\xffname\"", nil, api.FieldInvalid},
+		{"serverName", "\"ok\xff\xfename\"", nil, api.FieldInvalid},
+		{"serverName", `"a\udc00b"`, nil, api.FieldInvalid},
+		{"serverName", `"a\ud83db"`, nil, api.FieldInvalid},
+		{"serverName", `"a�b"`, nil, api.FieldInvalid},
+		{"serverName", "\"a�b\"", nil, api.FieldInvalid},
+		{"serverName", `"🎬 ok"`, "🎬 ok", ""}, // a valid surrogate pair
 
 		{"registrationMode", `"approval"`, ModeApproval, ""},
 		{"registrationMode", `"closed"`, ModeClosed, ""},
@@ -326,6 +335,8 @@ func TestSettingsValidation(t *testing.T) {
 		{"minClientVersion", `"01.2.3"`, nil, api.FieldInvalid},
 		{"minClientVersion", `"1.2.3-01"`, nil, api.FieldInvalid},
 		{"minClientVersion", `3`, nil, api.FieldInvalid},
+		{"minClientVersion", "\"1.2.3-a\xff\"", nil, api.FieldInvalid},
+		{"minClientVersion", `"1.2.3-a\udc00"`, nil, api.FieldInvalid},
 
 		{"setupWizardDone", `true`, true, ""},
 		{"setupWizardDone", `0`, nil, api.FieldInvalid},
@@ -858,7 +869,7 @@ func TestSettingsUpdateTx(t *testing.T) {
 }
 
 // TestSettingsLoadSkipsBadRows: Open keeps the default for a row with an unknown key or an invalid value, logs a
-// WARN naming the key, and leaves the row alone.
+// WARN naming the key, and leaves the row alone until an Update of that field replaces or removes it.
 func TestSettingsLoadSkipsBadRows(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
@@ -900,12 +911,90 @@ func TestSettingsLoadSkipsBadRows(t *testing.T) {
 	if n := len(settingsRows(t, db)); n != 5 {
 		t.Errorf("rows = %d, want the 5 left alone", n)
 	}
-	// An update replaces the bad row; its old value counts as the default.
+	// Sending the default for a field with a bad row removes the row (it would otherwise stay, and be logged at every
+	// Open), without an audit row or an OnChange call: the effective value stays the default.
+	var rec changeRecorder
+	db.Settings().OnChange(rec.fn)
+	got, err := db.Settings().Update(context.Background(), patch(t, "maxSharesPerRoom", 0), adminActor)
+	if err != nil || got != want {
+		t.Fatalf("Update(maxSharesPerRoom 0) = %+v, %v", got, err)
+	}
+	rows := settingsRows(t, db)
+	if _, ok := rows["limits.max_shares_per_room"]; ok || len(rows) != 4 {
+		t.Errorf("rows = %v, want the bad limits.max_shares_per_room row gone", rows)
+	}
+	if n := len(settingsAudit(t, db)); n != 0 {
+		t.Errorf("audit rows = %d, want 0", n)
+	}
+	if calls := rec.take(); len(calls) != 0 {
+		t.Errorf("OnChange ran %d times, want 0", len(calls))
+	}
+
+	// It works for several fields in one patch, whatever made the row bad (a wrong type, malformed JSON)...
+	mustExecW(t, db, `INSERT INTO settings (key, value, updated_at, updated_by) VALUES (?, ?, 0, 'cli')`,
+		"invites.default_max_uses", `"ten"`)
+	if _, err := db.Settings().Update(context.Background(), patch(t, "inviteDefaultMaxUses", 10,
+		"inviteDefaultTtlHours", 168), adminActor); err != nil {
+		t.Fatal(err)
+	}
+	rows = settingsRows(t, db)
+	if _, ok := rows["invites.default_max_uses"]; ok {
+		t.Errorf("rows = %v, want invites.default_max_uses gone", rows)
+	}
+	if _, ok := rows["invites.default_ttl_hours"]; ok {
+		t.Errorf("rows = %v, want invites.default_ttl_hours gone", rows)
+	}
+	// ...and a field whose valid row already holds the value, or that has no row, is left alone.
+	if _, err := db.Settings().Update(context.Background(), patch(t, "serverName", "Our place", "updateCheck", true),
+		adminActor); err != nil {
+		t.Fatal(err)
+	}
+	if rows = settingsRows(t, db); !maps.Equal(rows, map[string]string{"registration.mode": `"approval"`,
+		"server.name": `"Our place"`, "future.setting": "1"}) {
+		t.Errorf("rows = %v", rows)
+	}
+	var at int64
+	mustRead(t, db, func(q *Q) error {
+		return q.queryOne("test", `SELECT updated_at FROM settings WHERE key = 'server.name'`, nil, &at)
+	})
+	if at != 0 {
+		t.Errorf("server.name updated_at = %d, want the row untouched", at)
+	}
+	if n := len(settingsAudit(t, db)); n != 0 || len(rec.take()) != 0 {
+		t.Errorf("repairs wrote %d audit rows or ran OnChange", n)
+	}
+
+	// The next Open logs a WARN only for the unknown key left.
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var logs2 lockedBuffer
+	o = e.opts(nil)
+	o.Logger = slog.New(slog.NewTextHandler(&logs2, nil))
+	db, err = Open(context.Background(), o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	out = logs2.String()
+	if strings.Count(out, "level=WARN") != 1 || !strings.Contains(out, "key=future.setting") {
+		t.Errorf("after the repairs, want one WARN for future.setting, got:\n%s", out)
+	}
+	if got := db.Settings().Get(); got != want {
+		t.Errorf("after reopening Get = %+v, want %+v", got, want)
+	}
+
+	// An update to another value replaces a bad row; its old value counts as the default.
+	mustExecW(t, db, `INSERT INTO settings (key, value, updated_at, updated_by) VALUES (?, ?, 0, 'cli')`,
+		"limits.max_shares_per_room", `99999`)
 	if _, err := db.Settings().Update(context.Background(), patch(t, "maxSharesPerRoom", 5), adminActor); err != nil {
 		t.Fatal(err)
 	}
 	if got := detailJSON(t, settingsAudit(t, db)[0].Detail); got != `{"changes":{"maxSharesPerRoom":{"from":0,"to":5}}}` {
 		t.Errorf("detail = %s", got)
+	}
+	if got := settingsRows(t, db)["limits.max_shares_per_room"]; got != "5" {
+		t.Errorf("limits.max_shares_per_room = %s, want 5", got)
 	}
 }
 
@@ -928,7 +1017,7 @@ func (l *lockedBuffer) String() string {
 }
 
 // TestSettingsAuditDetailLimit: a settings.changed row that would pass 1 KiB shortens long text values and still
-// names every changed field.
+// names every changed field, even in the worst case of HTML-escaped text.
 func TestSettingsAuditDetailLimit(t *testing.T) {
 	t.Parallel()
 	db := newEnv(t).open(nil)
@@ -965,6 +1054,74 @@ func TestSettingsAuditDetailLimit(t *testing.T) {
 	})
 	if sec != 1 {
 		t.Errorf("security events = %d, want the registrationMode change", sec)
+	}
+
+	// The worst case: all 12 fields change, from and to at their longest. json.Marshal writes each '<' and '>' as a
+	// 6-byte escape, so 32 runes of them are 192 bytes; the detail still fits and names every field.
+	db = newEnv(t).open(nil)
+	version = "1.2.3-" + strings.Repeat("a", 100)
+	p = patch(t, "serverName", strings.Repeat("<", 64), "registrationMode", "approval", "inviteDefaultTtlHours", 720,
+		"inviteDefaultMaxUses", 1000, "membersCanInvite", true, "maxParticipantsPerRoom", 10000,
+		"maxSharesPerRoom", 1000, "maxShareBitrateKbps", 100000, "transferAlertGb", 1000000, "updateCheck", false,
+		"minClientVersion", version, "setupWizardDone", true)
+	if _, err := db.Settings().Update(context.Background(), p, adminActor); err != nil {
+		t.Fatal(err)
+	}
+	p = patch(t, "serverName", strings.Repeat(">", 64), "registrationMode", "closed", "inviteDefaultTtlHours", 100,
+		"inviteDefaultMaxUses", 100, "membersCanInvite", false, "maxParticipantsPerRoom", 1000,
+		"maxSharesPerRoom", 100, "maxShareBitrateKbps", 10000, "transferAlertGb", 100000, "updateCheck", true,
+		"minClientVersion", "1.2.3-"+strings.Repeat("b", 100), "setupWizardDone", false)
+	if _, err := db.Settings().Update(context.Background(), p, adminActor); err != nil {
+		t.Fatal(err)
+	}
+	var raw string
+	mustRead(t, db, func(q *Q) error {
+		return q.queryOne("test", `SELECT detail FROM audit_log WHERE action = 'settings.changed' ORDER BY id DESC
+			LIMIT 1`, nil, &raw)
+	})
+	if len(raw) > maxAuditDetail {
+		t.Errorf("stored detail is %d bytes, want ≤ %d", len(raw), maxAuditDetail)
+	}
+	d = settingsAudit(t, db)[0].Detail
+	changes, _ = d["changes"].(map[string]any)
+	if d["truncated"] != true || len(changes) != len(settingFields) {
+		t.Fatalf("detail = %s, want every field and truncated", raw)
+	}
+	if rm, _ := changes["registrationMode"].(map[string]any); rm["from"] != "approval" || rm["to"] != "closed" {
+		t.Errorf("registrationMode change = %v", rm)
+	}
+	mustRead(t, db, func(q *Q) error {
+		evs, err := q.SecurityEvents(longAgo, 0)
+		sec = len(evs)
+		return err
+	})
+	if sec != 2 {
+		t.Errorf("security events = %d, want both registrationMode changes", sec)
+	}
+
+	// settingsChangedDetail itself: with every field at its longest escaped text, the detail fits, and a short enough
+	// change stays whole.
+	all := map[string]settingChange{}
+	for _, f := range settingFields {
+		switch f.get(&Settings{}).(type) {
+		case string:
+			all[f.name] = settingChange{From: strings.Repeat("<", 200), To: strings.Repeat("&", 200)}
+		case int:
+			all[f.name] = settingChange{From: -1000000, To: 1000000}
+		case RegistrationMode:
+			all[f.name] = settingChange{From: ModeApproval, To: ModeApproval}
+		case bool:
+			all[f.name] = settingChange{From: false, To: false}
+		default:
+			t.Fatalf("%s: no worst case for %T", f.name, f.get(&Settings{}))
+		}
+	}
+	if b, _ := json.Marshal(settingsChangedDetail(all)); len(b) > maxAuditDetail {
+		t.Errorf("worst-case detail is %d bytes: %s", len(b), b)
+	}
+	small := map[string]settingChange{"serverName": {From: "a", To: "b"}}
+	if got := settingsChangedDetail(small); got["truncated"] != nil {
+		t.Errorf("a small detail was shortened: %v", got)
 	}
 }
 
@@ -1059,6 +1216,8 @@ func FuzzSettingValue(f *testing.F) {
 		`"0.3.0"`, `true`, "\" Ａ\u3000b \"", `1e3`, `null`, `"1.2.3-rc.1"`, `99999999999999999999`, `"\u0007"`} {
 		f.Add(uint8(i), []byte(s))
 	}
+	f.Add(uint8(0), []byte("\"ok\xffname\""))
+	f.Add(uint8(0), []byte(`"a\udc00b"`))
 	codes := []string{api.FieldInvalid, api.FieldOutOfRange, api.FieldTooLong}
 	f.Fuzz(func(t *testing.T, which uint8, raw []byte) {
 		fd := settingFields[int(which)%len(settingFields)]
@@ -1068,6 +1227,9 @@ func FuzzSettingValue(f *testing.F) {
 				t.Fatalf("%s(%q) = %v, %q", fd.name, raw, v, code)
 			}
 			return
+		}
+		if s, ok := v.(string); ok && (!utf8.ValidString(s) || strings.ContainsRune(s, utf8.RuneError)) {
+			t.Fatalf("%s(%q) = %q, which is not valid UTF-8 or has U+FFFD", fd.name, raw, s)
 		}
 		again, err := json.Marshal(v)
 		if err != nil {

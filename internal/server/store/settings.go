@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -63,7 +64,8 @@ func defaultSettings() Settings {
 // Value limits of 03 §9 that are not ranges in the registry.
 const (
 	serverNameMaxRunes = 64
-	// auditTextRunes is how long a text value stays in a settings.changed row that would pass the 1 KiB detail limit.
+	// auditTextRunes is how long a text value stays in a settings.changed row that would pass the 1 KiB detail limit
+	// (the first of auditTextCuts).
 	auditTextRunes = 32
 )
 
@@ -208,9 +210,15 @@ func decodeMinClientVersion(raw []byte) (string, string) {
 	return s, ""
 }
 
+// decodeServerName checks a serverName value. encoding/json silently turns invalid UTF-8 and lone surrogate escapes
+// (\udc00) into U+FFFD, which PRECIS Nickname allows (it is a symbol), so both are rejected here first: PRECIS works
+// only on valid UTF-8 (RFC 8264), and a server name has no use for U+FFFD.
 func decodeServerName(raw []byte) (string, string) {
+	if !utf8.Valid(raw) {
+		return "", api.FieldInvalid
+	}
 	s, ok := decodeString(raw)
-	if !ok {
+	if !ok || strings.ContainsRune(s, utf8.RuneError) {
 		return "", api.FieldInvalid
 	}
 	return normalizeServerName(s)
@@ -219,7 +227,7 @@ func decodeServerName(raw []byte) (string, string) {
 // normalizeServerName applies the PRECIS Nickname profile (RFC 8266: non-ASCII spaces become ASCII, leading and
 // trailing spaces go, inner runs collapse to one, NFKC), like room names (03 §8). Only spaces, or nothing, is "" (the
 // default: the host of the primary origin). Disallowed runes (controls, for example) are invalid, and more than 64
-// runes after normalization is too_long.
+// runes after normalization is too_long. s is valid UTF-8 without U+FFFD (decodeServerName).
 func normalizeServerName(s string) (string, string) {
 	if strings.TrimFunc(s, func(r rune) bool { return unicode.Is(unicode.Zs, r) }) == "" {
 		return "", ""
@@ -300,7 +308,8 @@ func newSettingsCache(db *DB) *SettingsCache {
 }
 
 // load reads the stored settings (Open). A row with an unknown key or a value that fails validation is skipped with
-// a WARN, so that field keeps its default; the row itself stays.
+// a WARN, so that field keeps its default; the row itself stays until an Update of that field replaces it, or
+// removes it when the value sent is the default.
 func (c *SettingsCache) load(ctx context.Context) error {
 	var (
 		s   Settings
@@ -376,7 +385,8 @@ func (c *SettingsCache) Pin(field string, value any) error {
 // The fields whose value differs are written in one Write together with the settings.changed audit row
 // ({changes: {field: {from, to}}}, actor a, target kind "settings"). A value equal to the default deletes its row,
 // so only non-default values are stored. After the commit the cache swaps and the OnChange callbacks run. A patch
-// that changes nothing writes nothing.
+// that changes nothing writes nothing, except that a field's row that load skipped as invalid is replaced (or
+// removed, for the default) without an audit row, since the effective value stays.
 func (c *SettingsCache) Update(ctx context.Context, patch map[string]json.RawMessage, a Actor) (Settings, error) {
 	vals, err := c.prepare(patch)
 	if err != nil {
@@ -479,12 +489,15 @@ func (c *SettingsCache) prepare(patch map[string]json.RawMessage) ([]settingValu
 // writeTx writes checked values in q: it reads the stored settings in the same transaction, writes the rows of the
 // fields that change and the audit row, and returns the new stored settings for apply.
 func (c *SettingsCache) writeTx(q *Q, vals []settingValue, a Actor) (settingsCommit, error) {
-	prev, _, err := q.storedSettings()
+	prev, bad, err := q.storedSettings()
 	if err != nil {
 		return settingsCommit{}, err
 	}
+	badKeys := make(map[string]bool, len(bad))
+	for _, b := range bad {
+		badKeys[b.key] = true
+	}
 	next := prev
-	defaults := defaultSettings()
 	now := normMS(q.now())
 	by := updatedBy(a)
 	changes := map[string]settingChange{}
@@ -492,25 +505,19 @@ func (c *SettingsCache) writeTx(q *Q, vals []settingValue, a Actor) (settingsCom
 		f := &settingFields[sv.i]
 		from := f.get(&prev)
 		if from == sv.v {
+			// The effective value stays, so there is no audit entry. A row that load skipped (its value is invalid,
+			// so from is the default) is still replaced or removed, or it would stay, and be logged at every Open,
+			// until the field changed to another value and back.
+			if badKeys[f.key] {
+				if err := q.writeSetting(f, sv.v, now, by); err != nil {
+					return settingsCommit{}, err
+				}
+			}
 			continue
 		}
 		f.set(&next, sv.v)
 		changes[f.name] = settingChange{From: from, To: sv.v}
-		if sv.v == f.get(&defaults) {
-			if _, err := q.execCount("delete setting", `DELETE FROM settings WHERE key = ?`, f.key); err != nil {
-				return settingsCommit{}, err
-			}
-			continue
-		}
-		value, err := json.Marshal(sv.v)
-		if err != nil {
-			return settingsCommit{}, fmt.Errorf("store: encode setting %s: %w", f.key, err)
-		}
-		_, err = q.execCount("store setting", `INSERT INTO settings (key, value, updated_at, updated_by)
-			VALUES (?, ?, ?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value,
-			updated_at = excluded.updated_at, updated_by = excluded.updated_by`,
-			f.key, string(value), unixMS(now), by)
-		if err != nil {
+		if err := q.writeSetting(f, sv.v, now, by); err != nil {
 			return settingsCommit{}, err
 		}
 	}
@@ -527,6 +534,25 @@ func (c *SettingsCache) writeTx(q *Q, vals []settingValue, a Actor) (settingsCom
 		}
 	}
 	return settingsCommit{seq: c.seq.Add(1), stored: next}, nil
+}
+
+// writeSetting stores v as field f's row, or deletes the row when v is the default, so only non-default values are
+// stored.
+func (q *Q) writeSetting(f *settingField, v any, now time.Time, by string) error {
+	defaults := defaultSettings()
+	if v == f.get(&defaults) {
+		_, err := q.execCount("delete setting", `DELETE FROM settings WHERE key = ?`, f.key)
+		return err
+	}
+	value, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Errorf("store: encode setting %s: %w", f.key, err)
+	}
+	_, err = q.execCount("store setting", `INSERT INTO settings (key, value, updated_at, updated_by)
+		VALUES (?, ?, ?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value,
+		updated_at = excluded.updated_at, updated_by = excluded.updated_by`,
+		f.key, string(value), unixMS(now), by)
+	return err
 }
 
 // apply puts a committed write's stored settings into the cache, unless a newer write is already there.
@@ -607,28 +633,40 @@ func updatedBy(a Actor) string {
 	return string(a.Kind)
 }
 
+// auditTextCuts are the lengths, in runes, that settingsChangedDetail tries in turn for text values; at 0 a text
+// value that is not empty becomes "…".
+var auditTextCuts = []int{auditTextRunes, 8, 0}
+
 // settingsChangedDetail is the settings.changed audit detail. When it would pass the 1 KiB limit (a long server
-// name among many changes), text values are cut to 32 runes and "truncated": true is added, so the row still names
-// every changed field (the security-event query looks for changes.registrationMode).
+// name among many changes), text values are cut to 32 runes, then to 8 and last to "…", until it fits, and
+// "truncated": true is added. The row so always names every changed field, since encodeDetail would otherwise drop
+// the whole changes key (the security-event query looks for changes.registrationMode). json.Marshal writes <, > and
+// & as 6-byte escapes, which is why a rune count alone is not enough.
 func settingsChangedDetail(changes map[string]settingChange) map[string]any {
 	d := map[string]any{"changes": changes}
 	if b, err := json.Marshal(d); err == nil && len(b) <= maxAuditDetail {
 		return d
 	}
-	short := make(map[string]settingChange, len(changes))
-	for name, ch := range changes {
-		short[name] = settingChange{From: shortenText(ch.From), To: shortenText(ch.To)}
+	for _, n := range auditTextCuts {
+		short := make(map[string]settingChange, len(changes))
+		for name, ch := range changes {
+			short[name] = settingChange{From: shortenText(ch.From, n), To: shortenText(ch.To, n)}
+		}
+		d = map[string]any{"changes": short, "truncated": true}
+		if b, err := json.Marshal(d); err == nil && len(b) <= maxAuditDetail {
+			break
+		}
 	}
-	return map[string]any{"changes": short, "truncated": true}
+	return d
 }
 
-// shortenText cuts a string value to auditTextRunes runes plus "…"; other values stay.
-func shortenText(v any) any {
+// shortenText cuts a string value to n runes plus "…"; other values stay.
+func shortenText(v any, n int) any {
 	s, ok := v.(string)
-	if !ok || utf8.RuneCountInString(s) <= auditTextRunes {
+	if !ok || utf8.RuneCountInString(s) <= n {
 		return v
 	}
-	return string([]rune(s)[:auditTextRunes]) + "…"
+	return string([]rune(s)[:n]) + "…"
 }
 
 // fieldErrors is the validation_failed error with its field codes.
