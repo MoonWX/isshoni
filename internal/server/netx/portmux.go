@@ -33,10 +33,6 @@ type PortMuxOptions struct {
 	PublicHost       string        // for the plain-HTTP hint response
 	Counter          *TransferCounter
 	Logger           *slog.Logger
-
-	// queueWait is how long a classified connection waits for room in a full sub-listener queue (1 s). Tests
-	// shorten it.
-	queueWait time.Duration
 }
 
 // Defaults of PortMuxOptions (04 §7.2, §7.8). The ICE default is DefaultMaxICEConnsPerIP.
@@ -46,8 +42,11 @@ const (
 	defaultMaxPendingPerIP = 32
 	defaultMaxConnsPerIP   = 256
 	defaultQueueLen        = 128
-	defaultQueueWait       = time.Second
 )
+
+// defaultQueueWait is how long a classified connection waits for room in a full sub-listener queue before it is
+// dropped (the "1 s" of QueueLen in 04 §7.2). It is not an option.
+const defaultQueueWait = time.Second
 
 // The plain-HTTP hint: the mux answers, then reads and discards what the client sent (at most hintDrainBytes,
 // within hintLinger for the whole exchange) before it closes. Closing with unread data would send a TCP reset,
@@ -130,7 +129,6 @@ func newPortMux(ln net.Listener, opts PortMuxOptions) *PortMux {
 	opts.MaxConnsPerIP = orDefault(opts.MaxConnsPerIP, defaultMaxConnsPerIP)
 	opts.MaxICEConnsPerIP = orDefault(opts.MaxICEConnsPerIP, DefaultMaxICEConnsPerIP)
 	opts.QueueLen = orDefault(opts.QueueLen, defaultQueueLen)
-	opts.queueWait = orDefault(opts.queueWait, defaultQueueWait)
 	log := opts.Logger
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -413,7 +411,7 @@ func (m *PortMux) handOut(c *prefixConn, sub *subListener, first byte) {
 	c.route = sub.route
 	m.mu.Unlock()
 
-	switch sub.put(c, m.opts.queueWait) {
+	switch sub.put(c, defaultQueueWait) {
 	case putOK:
 	case putFull:
 		m.limited.Add(1)
