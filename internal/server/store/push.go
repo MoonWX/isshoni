@@ -18,7 +18,7 @@ type PushSubscription struct {
 	P256dh        string    // base64url, 65-byte uncompressed P-256 point
 	Auth          string    // base64url, 16 bytes
 	Name          string    // "Safari on iPhone"
-	CreatedAt     time.Time
+	CreatedAt     time.Time // the latest subscribe (UpsertPushSubscription), not the first
 	LastSuccessAt time.Time
 	Failures      int
 }
@@ -77,12 +77,20 @@ func (s *pushScan) sub() PushSubscription {
 
 // UpsertPushSubscription inserts s and sets s.ID (created = true), or, when a row with s.Endpoint exists, rebinds
 // that row to s.UserID, s.SessionID and s.DeviceID, replaces its keys and name, resets its failure count and sets
-// s.ID to its ID (created = false). A rebind to another user also restarts the row's CreatedAt and clears its
-// LastSuccessAt, since it is a new subscription for that user. Exactly one of SessionID and DeviceID must be set
-// (a CHECK). A zero CreatedAt is the store's clock; s is updated with it.
+// s.ID to its ID (created = false). Exactly one of SessionID and DeviceID must be set (a CHECK). A zero CreatedAt is
+// the store's clock.
+//
+// Every upsert, a rebind included, sets the row's CreatedAt to s.CreatedAt: the SPA subscribes again at every app
+// start (03 §12.4.6), so CreatedAt is the latest subscription and TrimPushSubscriptions evicts the browsers that
+// have not re-subscribed for the longest time, not the ones that subscribed first. A rebind to the same user keeps
+// LastSuccessAt; a rebind to another user clears it, since it is a new subscription for that user. s is updated
+// from the stored row (ID, CreatedAt, LastSuccessAt, Failures).
 func (q *Q) UpsertPushSubscription(s *PushSubscription) (created bool, err error) {
 	s.CreatedAt = q.orNow(s.CreatedAt)
 	var gotID string
+	var gotCreated int64
+	var gotSuccess sql.NullInt64
+	var gotFailures int
 	newID, err := q.withNewID("push_subscriptions", func(id string) error {
 		return q.writeReturning("upsert push subscription", `INSERT INTO push_subscriptions
 				(id, user_id, session_id, device_id, endpoint, p256dh, auth_secret, name, created_at)
@@ -90,17 +98,20 @@ func (q *Q) UpsertPushSubscription(s *PushSubscription) (created bool, err error
 			ON CONFLICT (endpoint) DO UPDATE SET
 				user_id = excluded.user_id, session_id = excluded.session_id, device_id = excluded.device_id,
 				p256dh = excluded.p256dh, auth_secret = excluded.auth_secret, name = excluded.name, failures = 0,
-				created_at = CASE WHEN user_id = excluded.user_id THEN created_at ELSE excluded.created_at END,
+				created_at = excluded.created_at,
 				last_success_at = CASE WHEN user_id = excluded.user_id THEN last_success_at END
-			RETURNING id`,
+			RETURNING id, created_at, last_success_at, failures`,
 			[]any{id, string(s.UserID), strOrNull(string(s.SessionID)), strOrNull(string(s.DeviceID)), s.Endpoint,
 				s.P256dh, s.Auth, s.Name, unixMS(s.CreatedAt)},
-			func(r scanner) error { return r.Scan(&gotID) })
+			func(r scanner) error { return r.Scan(&gotID, &gotCreated, &gotSuccess, &gotFailures) })
 	})
 	if err != nil {
 		return false, err
 	}
 	s.ID = PushSubID(gotID)
+	s.CreatedAt = fromMS(gotCreated)
+	s.LastSuccessAt = fromNullMS(gotSuccess)
+	s.Failures = gotFailures
 	return gotID == newID, nil
 }
 
@@ -201,7 +212,8 @@ func (q *Q) RecordPushResult(id PushSubID, ok bool, now time.Time) error {
 		string(id))
 }
 
-// TrimPushSubscriptions keeps the user's keep newest subscriptions (by CreatedAt) and deletes the older ones.
+// TrimPushSubscriptions keeps the user's keep newest subscriptions by CreatedAt, which every re-subscribe moves
+// forward (UpsertPushSubscription), and deletes the older ones.
 func (q *Q) TrimPushSubscriptions(u UserID, keep int) error {
 	_, err := q.execCount("trim push subscriptions", `DELETE FROM push_subscriptions WHERE id IN (
 		SELECT id FROM push_subscriptions WHERE user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?)`,

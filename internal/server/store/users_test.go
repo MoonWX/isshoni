@@ -556,6 +556,29 @@ func TestSessionLifecycle(t *testing.T) {
 	if _, err := lookup("tok3", idle.Add(time.Millisecond)); !errors.Is(err, ErrNotFound) {
 		t.Errorf("1 ms past idle_expires_at: %v", err)
 	}
+	// A caller holding the stale session cannot revive it: a touch or rotation 1 ms (or 1 h) past idle_expires_at is
+	// ErrNotFound and changes nothing.
+	for _, late := range []time.Time{idle.Add(time.Millisecond), idle.Add(time.Hour)} {
+		mustWrite(t, db, func(q *Q) error {
+			if err := q.TouchSession(s.ID, "203.0.113.9", late, late.Add(30*24*time.Hour)); !errors.Is(err, ErrNotFound) {
+				t.Errorf("TouchSession %v past idle_expires_at = %v, want ErrNotFound", late.Sub(idle), err)
+			}
+			if err := q.RotateSession(s.ID, []byte("tok9"), late.Add(time.Minute), late); !errors.Is(err, ErrNotFound) {
+				t.Errorf("RotateSession %v past idle_expires_at = %v, want ErrNotFound", late.Sub(idle), err)
+			}
+			return nil
+		})
+		for _, h := range []string{"tok3", "tok9"} {
+			if _, err := lookup(h, late); !errors.Is(err, ErrNotFound) {
+				t.Errorf("%s after a refused touch at %v past idle_expires_at: %v, want ErrNotFound", h, late.Sub(idle),
+					err)
+			}
+		}
+	}
+	if got, err := lookup("tok3", idle); err != nil || !got.IdleExpiresAt.Equal(idle) || !got.LastSeenAt.Equal(t0) ||
+		got.LastIP != s.LastIP {
+		t.Errorf("session changed by a refused touch: %+v, %v", got, err)
+	}
 	// The previous token is also dead once the session idles out, grace or not.
 	mustWrite(t, db, func(q *Q) error { return q.RotateSession(s.ID, []byte("tok4"), idle.Add(time.Hour), idle) })
 	if _, err := lookup("tok3", idle.Add(time.Millisecond)); !errors.Is(err, ErrNotFound) {
@@ -587,6 +610,16 @@ func TestSessionLifecycle(t *testing.T) {
 	if _, err := lookup("tok4", s.ExpiresAt.Add(time.Millisecond)); !errors.Is(err, ErrNotFound) {
 		t.Errorf("1 ms past expires_at: %v", err)
 	}
+	mustWrite(t, db, func(q *Q) error {
+		past := s.ExpiresAt.Add(time.Millisecond)
+		if err := q.TouchSession(s.ID, "", past, past.Add(time.Hour)); !errors.Is(err, ErrNotFound) {
+			t.Errorf("TouchSession 1 ms past expires_at = %v, want ErrNotFound", err)
+		}
+		if err := q.RotateSession(s.ID, []byte("tok9"), past, past); !errors.Is(err, ErrNotFound) {
+			t.Errorf("RotateSession 1 ms past expires_at = %v, want ErrNotFound", err)
+		}
+		return nil
+	})
 	// An empty IP keeps the last one.
 	mustWrite(t, db, func(q *Q) error { return q.TouchSession(s.ID, "", touch.Add(time.Minute), touch) })
 	if got, _ := lookup("tok4", touch); got.LastIP != "198.51.100.23" || !got.IdleExpiresAt.Equal(touch) {

@@ -116,21 +116,28 @@ func (q *Q) SessionByTokenHash(h []byte, now time.Time) (Session, User, error) {
 }
 
 // RotateSession gives a session a new token hash. The current hash becomes the previous one, valid until
-// prevValidUntil (03 §7.4). ErrNotFound for an unknown session.
+// prevValidUntil (03 §7.4). ErrNotFound for an unknown session or one that is no longer live at now (the same rule
+// as SessionByTokenHash), so a caller holding a stale Session cannot revive it.
 func (q *Q) RotateSession(id SessionID, newHash []byte, prevValidUntil, now time.Time) error {
 	if err := requireBytes("RotateSession", "newHash", newHash); err != nil {
 		return err
 	}
+	ms := unixMS(now)
 	return q.execOne("rotate session", `UPDATE sessions SET prev_token_hash = token_hash, prev_valid_until = ?,
-		token_hash = ?, rotated_at = ? WHERE id = ?`, unixMS(prevValidUntil), newHash, unixMS(now), string(id))
+		token_hash = ?, rotated_at = ? WHERE id = ? AND idle_expires_at >= ? AND expires_at >= ?`,
+		unixMS(prevValidUntil), newHash, ms, string(id), ms, ms)
 }
 
 // TouchSession records a use of the session: last_seen_at, last_ip ("" keeps the old one) and idle_expires_at,
-// clamped to expires_at. ErrNotFound for an unknown session.
+// clamped to expires_at. ErrNotFound for an unknown session or one that is no longer live at now (the same rule as
+// SessionByTokenHash): auth's liveness check may come from its cache, so the store refuses to revive an expired
+// session itself.
 func (q *Q) TouchSession(id SessionID, ip string, now, idleExpires time.Time) error {
+	ms := unixMS(now)
 	return q.execOne("touch session", `UPDATE sessions SET last_seen_at = ?,
-		last_ip = CASE WHEN ? = '' THEN last_ip ELSE ? END, idle_expires_at = MIN(?, expires_at) WHERE id = ?`,
-		unixMS(now), ip, ip, unixMS(idleExpires), string(id))
+		last_ip = CASE WHEN ? = '' THEN last_ip ELSE ? END, idle_expires_at = MIN(?, expires_at)
+		WHERE id = ? AND idle_expires_at >= ? AND expires_at >= ?`,
+		ms, ip, ip, unixMS(idleExpires), string(id), ms, ms)
 }
 
 // ListSessions returns a user's sessions, the most recently seen first (expired ones the janitor has not pruned

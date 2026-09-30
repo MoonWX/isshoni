@@ -180,8 +180,8 @@ func TestUpsertPushSubscription(t *testing.T) {
 	mustWrite(t, db, func(q *Q) error { return q.RecordPushResult(f.pAlex.ID, true, t0.Add(time.Minute)) })
 	mustWrite(t, db, func(q *Q) error { return q.RecordPushResult(f.pAlex.ID, false, t0.Add(2*time.Minute)) })
 
-	// The same endpoint from a new session of the same user: rebound, keys replaced, failures reset, created_at and
-	// last_success_at kept, same ID.
+	// The same endpoint from a new session of the same user: rebound, keys replaced, failures reset, created_at moved
+	// to this subscribe, last_success_at kept, same ID; the caller's struct matches the stored row.
 	s2 := f.e.newSession(db, f.alex.ID, "a2", t0.Add(time.Hour))
 	again := PushSubscription{UserID: f.alex.ID, SessionID: s2.ID, Endpoint: f.pAlex.Endpoint, P256dh: "new-key",
 		Auth: "new-auth", Name: "Chrome on macOS", CreatedAt: t0.Add(time.Hour)}
@@ -198,10 +198,13 @@ func TestUpsertPushSubscription(t *testing.T) {
 			return err
 		}
 		want := PushSubscription{ID: f.pAlex.ID, UserID: f.alex.ID, SessionID: s2.ID, Endpoint: f.pAlex.Endpoint,
-			P256dh: "new-key", Auth: "new-auth", Name: "Chrome on macOS", CreatedAt: t0,
+			P256dh: "new-key", Auth: "new-auth", Name: "Chrome on macOS", CreatedAt: t0.Add(time.Hour),
 			LastSuccessAt: t0.Add(time.Minute), Failures: 0}
 		if len(subs) != 1 || !reflect.DeepEqual(subs[0], want) {
 			t.Errorf("after re-subscribe:\n got %+v\nwant %+v", subs, want)
+		}
+		if !reflect.DeepEqual(again, want) {
+			t.Errorf("caller's struct after re-subscribe:\n got %+v\nwant %+v", again, want)
 		}
 		return nil
 	})
@@ -229,6 +232,9 @@ func TestUpsertPushSubscription(t *testing.T) {
 		got := subs[1]
 		if got.ID != f.pAlex.ID || !got.CreatedAt.Equal(t0.Add(2*time.Hour)) || !got.LastSuccessAt.IsZero() {
 			t.Errorf("rebound to another user: %+v", got)
+		}
+		if !reflect.DeepEqual(moved, got) {
+			t.Errorf("caller's struct after a rebind to another user:\n got %+v\nwant %+v", moved, got)
 		}
 		return nil
 	})
@@ -352,12 +358,17 @@ func TestPushSubscriptionDeletes(t *testing.T) {
 		t.Errorf("subscriptions left = %d", n)
 	}
 
-	// Trim keeps the newest; DeleteAll counts.
-	for i := range 4 {
+	// Trim keeps the most recently subscribed: t0 subscribed first but re-subscribed last (an app start), so it
+	// survives and t1, t2 go. DeleteAll counts.
+	subscribe := func(i int, at time.Time) {
 		p := PushSubscription{UserID: f.sam.ID, SessionID: f.sSam.ID, Endpoint: "https://push.example/t" + itoa(i),
-			P256dh: "k", Auth: "a", Name: "n", CreatedAt: t0.Add(time.Duration(i) * time.Minute)}
+			P256dh: "k", Auth: "a", Name: "n", CreatedAt: at}
 		mustWrite(t, db, func(q *Q) error { _, err := q.UpsertPushSubscription(&p); return err })
 	}
+	for i := range 4 {
+		subscribe(i, t0.Add(time.Duration(i)*time.Minute))
+	}
+	subscribe(0, t0.Add(10*time.Minute))
 	mustWrite(t, db, func(q *Q) error { return q.TrimPushSubscriptions(f.sam.ID, 2) })
 	mustRead(t, db, func(q *Q) error {
 		subs, err := q.ListPushSubscriptions(PushFilter{})
@@ -365,7 +376,7 @@ func TestPushSubscriptionDeletes(t *testing.T) {
 		for _, s := range subs {
 			eps = append(eps, s.Endpoint)
 		}
-		if !slices.Equal(eps, []string{"https://push.example/t2", "https://push.example/t3"}) {
+		if !slices.Equal(eps, []string{"https://push.example/t3", "https://push.example/t0"}) {
 			t.Errorf("after trim: %v", eps)
 		}
 		return err
