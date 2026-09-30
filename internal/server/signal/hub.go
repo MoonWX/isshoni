@@ -182,8 +182,13 @@ type Hub struct {
 	metrics  *metrics           // nil without Deps.Metrics
 	features []protocol.Feature // features this server has enabled (welcome.features is the intersection with hello)
 
-	preAuthIP   *keyedLimiter // step 4 of the upgrade: pre-auth upgrades per client IP key
-	securityLog *keyedLimiter // at most one security-event log line per client IP key per minute (01 §17)
+	// Step 4 of the upgrade: pre-auth upgrades per client IP key.
+	preAuthIP *keyedLimiter
+	// Security-event log lines (01 §17), each kind with its own budget of one line per client IP key per minute:
+	// originLog for Origin 403s (step 2), throttleLog for pre-auth 429s (step 4) and, under allClientsKey, the
+	// server-wide pre-auth limit.
+	originLog   *keyedLimiter
+	throttleLog *keyedLimiter
 
 	// ctx is the hub's lifetime, for dependency calls and socket I/O after the upgrade. It is canceled when Shutdown
 	// has finished or gives up.
@@ -191,7 +196,7 @@ type Hub struct {
 	cancel context.CancelFunc
 
 	// wg counts every goroutine the hub owns: each ServeHTTP call past the first check (it runs the socket's
-	// reader), and each writer, pinger and connection actor. Shutdown waits for it.
+	// reader), and each writer, pinger, connection actor and periodic Revalidate call. Shutdown waits for it.
 	wg sync.WaitGroup
 
 	mu             sync.Mutex
@@ -255,7 +260,8 @@ func New(cfg Config, deps Deps) (*Hub, error) {
 		metrics:     m,
 		features:    serverFeatures,
 		preAuthIP:   newKeyedLimiter(perMinute(cfg.Limits.PreAuthPerIPPerMinute), maxLimiterKeys),
-		securityLog: newKeyedLimiter(perMinute(1), maxLimiterKeys),
+		originLog:   newKeyedLimiter(perMinute(1), maxLimiterKeys),
+		throttleLog: newKeyedLimiter(perMinute(1), maxLimiterKeys),
 		ctx:         ctx,
 		cancel:      cancel,
 		sockets:     make(map[*socket]struct{}),

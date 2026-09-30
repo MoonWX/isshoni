@@ -114,6 +114,44 @@ func TestRevalidateTick(t *testing.T) {
 	})
 }
 
+// A slow Revalidate (03's store busy) runs off the connection's actor: messages are answered at once while it runs,
+// its result is applied when it arrives, and a call that outlasts its 10 s budget is a transient error.
+func TestRevalidateSlow(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newEnv(t)
+		defer e.close()
+		cookie, a := e.user(false)
+		c, _ := e.connect(cookie, signaltest.DefaultHello())
+
+		release := e.auth.HoldRevalidate()
+		e.auth.SetUser(a.UserID, "promoted", true)
+		time.Sleep(5 * time.Minute)
+		synctest.Wait()
+		if n := e.auth.Revalidations(); n != 2 {
+			t.Fatalf("%d revalidations after one tick, want 2", n)
+		}
+		start := time.Now()
+		ping(t, c)
+		if d := time.Since(start); d != 0 {
+			t.Errorf("pong after %v while Revalidate runs, want at once", d)
+		}
+		release()
+		synctest.Wait()
+		e.hub.Notify(signal.Target{Admins: true}, protocol.TopicAdminUsers) // a is an admin now
+		expectInvalidate(t, c, protocol.TopicAdminUsers)
+
+		release = e.auth.HoldRevalidate()
+		defer release()
+		time.Sleep(5*time.Minute + 11*time.Second) // the next tick, and past the call's 10 s
+		synctest.Wait()
+		if e.logs.count("level=WARN", "msg=revalidate", "user_id="+a.UserID, "deadline exceeded") != 1 {
+			t.Errorf("no WARN line for the timed-out call:\n%s", e.logs)
+		}
+		expectOpen(t, c)
+		ping(t, c)
+	})
+}
+
 // expectInvalidate reads invalidate{topics}; nothing else may be queued before the next pong.
 func expectInvalidate(t *testing.T, c *signaltest.Client, topics ...protocol.Topic) {
 	t.Helper()

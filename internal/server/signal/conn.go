@@ -531,14 +531,15 @@ type conn struct {
 	roomID   string // the room the connection is in; "" = none (rooms come with README S19)
 
 	// Owned by the actor.
-	sock       *socket // nil while detached (README S28)
-	ip         netip.Addr
-	caps       protocol.Caps
-	limits     connLimits
-	statsWatch bool
-	tokenHash  [sha256.Size]byte // SHA-256 of the current resume token (01 §10.3)
-	idle       *time.Timer
-	closed     bool
+	sock         *socket // nil while detached (README S28)
+	ip           netip.Addr
+	caps         protocol.Caps
+	limits       connLimits
+	statsWatch   bool
+	tokenHash    [sha256.Size]byte // SHA-256 of the current resume token (01 §10.3)
+	idle         *time.Timer
+	revalidating bool // a periodic Revalidate call is running
+	closed       bool
 }
 
 func newConn(h *Hub, s *socket, id Identity, hello *protocol.Hello, version int) *conn {
@@ -762,14 +763,35 @@ func (c *conn) checkIdle() {
 	c.idle.Reset(c.h.cfg.IdleTimeout - idle)
 }
 
-// revalidate asks the Authenticator whether the connection's session or device is still valid (01 §3.2). Only
-// ErrInvalid closes the connection (session_revoked, 4401); any other error keeps it, and the next tick retries. A
-// changed name or admin flag is applied like UpdateUser.
+// revalidate asks the Authenticator whether the connection's session or device is still valid (01 §3.2), on the
+// RevalidateEvery tick. The call (03 Touch, a database write) runs on its own goroutine, so a slow store never
+// holds up the connection's messages; the actor applies the result when it arrives. A tick that comes while the
+// previous call is still running is skipped.
 func (c *conn) revalidate() {
-	id := c.identity()
-	ctx, cancel := context.WithTimeout(c.h.ctx, depTimeout)
-	nid, err := c.h.deps.Auth.Revalidate(ctx, id, c.ip)
-	cancel()
+	if c.revalidating {
+		return
+	}
+	c.revalidating = true
+	id, ip := c.identity(), c.ip
+	c.h.wg.Add(1) // the actor is counted, so the WaitGroup is above zero here
+	go func() {
+		defer c.h.wg.Done()
+		ctx, cancel := context.WithTimeout(c.h.ctx, depTimeout)
+		nid, err := c.h.deps.Auth.Revalidate(ctx, id, ip)
+		cancel()
+		// Wait for room in the inbox rather than close the connection as slow_connection for the hub's own call; the
+		// result is dropped once the actor has ended.
+		c.postWait(func() {
+			c.revalidating = false
+			c.applyRevalidation(id, nid, err)
+		})
+	}()
+}
+
+// applyRevalidation applies the result of Revalidate for identity id (01 §3.2). Only ErrInvalid closes the
+// connection (session_revoked, 4401); any other error keeps it, and the next tick retries. A changed name or admin
+// flag is applied like UpdateUser.
+func (c *conn) applyRevalidation(id, nid Identity, err error) {
 	switch {
 	case errors.Is(err, ErrInvalid):
 		c.revoke(protocol.NewError(protocol.ErrorCodeSessionRevoked, protocol.ErrorScopeSession))

@@ -29,17 +29,19 @@ func CookieHeader(value string) http.Header {
 //   - Revalidate: counts the calls; a revoked session or device → ErrInvalid; otherwise the identity with the name
 //     and admin flag of SetUser, if any.
 //
-// Each Fail* method injects an error that the method returns until it is called again with nil.
+// Each Fail* method injects an error that the method returns until it is called again with nil; HoldRevalidate
+// makes Revalidate slow.
 type Auth struct {
-	mu            sync.Mutex
-	sessions      map[string]signal.Identity // cookie value → identity
-	bearers       map[string]signal.Identity // token → identity
-	revoked       map[string]bool            // session and device ids
-	users         map[string]userInfo        // SetUser overrides
-	requestErr    error
-	bearerErr     error
-	revalidateErr error
-	revalidations int
+	mu             sync.Mutex
+	sessions       map[string]signal.Identity // cookie value → identity
+	bearers        map[string]signal.Identity // token → identity
+	revoked        map[string]bool            // session and device ids
+	users          map[string]userInfo        // SetUser overrides
+	requestErr     error
+	bearerErr      error
+	revalidateErr  error
+	revalidateGate chan struct{} // HoldRevalidate: Revalidate waits until it is closed
+	revalidations  int
 }
 
 type userInfo struct {
@@ -107,6 +109,26 @@ func (a *Auth) FailRevalidate(err error) {
 	a.revalidateErr = err
 }
 
+// HoldRevalidate makes the following Revalidate calls block, like a busy store, until release is called or the
+// call's context ends (then they return the context's error). release may be called more than once.
+func (a *Auth) HoldRevalidate() (release func()) {
+	gate := make(chan struct{})
+	a.mu.Lock()
+	a.revalidateGate = gate
+	a.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			a.mu.Lock()
+			if a.revalidateGate == gate {
+				a.revalidateGate = nil
+			}
+			a.mu.Unlock()
+			close(gate)
+		})
+	}
+}
+
 // Revalidations returns the number of Revalidate calls so far.
 func (a *Auth) Revalidations() int {
 	a.mu.Lock()
@@ -147,10 +169,20 @@ func (a *Auth) AuthenticateBearer(_ context.Context, token protocol.Secret) (sig
 }
 
 // Revalidate implements signal.Authenticator.
-func (a *Auth) Revalidate(_ context.Context, id signal.Identity, _ netip.Addr) (signal.Identity, error) {
+func (a *Auth) Revalidate(ctx context.Context, id signal.Identity, _ netip.Addr) (signal.Identity, error) {
+	a.mu.Lock()
+	a.revalidations++
+	gate := a.revalidateGate
+	a.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return signal.Identity{}, ctx.Err()
+		}
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.revalidations++
 	if a.revalidateErr != nil {
 		return signal.Identity{}, a.revalidateErr
 	}

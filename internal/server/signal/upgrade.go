@@ -175,7 +175,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Step 2.
 	origin := h.origins.classify(r.Header.Values("Origin"))
 	if origin == originBad {
-		h.securityEvent(key, ip, "websocket origin refused",
+		h.securityEvent(h.originLog, key, ip, "websocket origin refused",
 			slog.String("origin", truncate(r.Header.Get("Origin"), maxLoggedOrigin)))
 		refuse(w, http.StatusForbidden, 0)
 		return
@@ -190,7 +190,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if cookie && origin == originAllowed {
-		h.securityEvent(key, ip, "websocket origin refused for a cookie connection")
+		h.securityEvent(h.originLog, key, ip, "websocket origin refused for a cookie connection")
 		refuse(w, http.StatusForbidden, 0)
 		return
 	}
@@ -208,7 +208,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case !cookie && h.preAuth >= h.cfg.Limits.MaxPreAuthConns:
 		h.mu.Unlock()
-		if ok, _ := h.securityLog.allow(allClientsKey, time.Now()); ok { // one line per minute server-wide
+		if ok, _ := h.throttleLog.allow(allClientsKey, time.Now()); ok { // one line per minute server-wide
 			h.log.Warn("pre-auth websocket limit reached", slog.Int("limit", h.cfg.Limits.MaxPreAuthConns))
 		}
 		refuse(w, http.StatusServiceUnavailable, 2)
@@ -216,7 +216,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case !cookie:
 		if ok, wait := h.preAuthIP.allow(key, time.Now()); !ok {
 			h.mu.Unlock()
-			h.securityEvent(key, ip, "websocket pre-auth upgrades throttled")
+			h.securityEvent(h.throttleLog, key, ip, "websocket pre-auth upgrades throttled")
 			refuse(w, http.StatusTooManyRequests, retryAfterSeconds(wait))
 			return
 		}
@@ -264,10 +264,11 @@ func refuse(w http.ResponseWriter, status, retryAfter int) {
 	http.Error(w, http.StatusText(status), status)
 }
 
-// securityEvent logs a refused upgrade at WARN with the client IP (01 §17): at most once per client IP key per
-// minute, so a flood cannot flood the log.
-func (h *Hub) securityEvent(key netip.Prefix, ip netip.Addr, msg string, attrs ...any) {
-	if ok, _ := h.securityLog.allow(key, time.Now()); !ok {
+// securityEvent logs a refused upgrade at WARN with the client IP (01 §17). budget is the limiter of the event's
+// kind (Hub.originLog or Hub.throttleLog): each kind is logged at most once per client IP key per minute, so a
+// flood cannot flood the log, and one kind never hides the other.
+func (h *Hub) securityEvent(budget *keyedLimiter, key netip.Prefix, ip netip.Addr, msg string, attrs ...any) {
+	if ok, _ := budget.allow(key, time.Now()); !ok {
 		return
 	}
 	h.log.Warn(msg, append([]any{slog.String("remote_ip", ip.String())}, attrs...)...)

@@ -145,6 +145,49 @@ func TestUpgradePreAuthPerIP(t *testing.T) {
 	})
 }
 
+// Origin refusals and pre-auth throttling have separate log budgets (01 §17): one of each per client IP per minute,
+// in either order.
+func TestUpgradeSecurityLogPerKind(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newEnv(t)
+		defer e.close()
+		throttle := func(ip string) {
+			t.Helper()
+			for i := range 20 {
+				if _, err := e.dial(signaltest.DialOptions{Header: headers("", "", ip)}); err != nil {
+					t.Fatalf("upgrade %d: %v", i+1, err)
+				}
+			}
+			if re := e.refused(headers("", "", ip)); re.Status != http.StatusTooManyRequests {
+				t.Fatalf("21st upgrade: %d, want 429", re.Status)
+			}
+		}
+		refuseOrigin := func(ip string) {
+			t.Helper()
+			if re := e.refused(headers("", "https://evil.example.com", ip)); re.Status != http.StatusForbidden {
+				t.Fatalf("bad origin: %d, want 403", re.Status)
+			}
+		}
+
+		const first, second = "198.51.100.11", "2001:db8:5:6::1"
+		refuseOrigin(first) // an Origin 403, then a 429
+		throttle(first)
+		throttle(second) // a 429, then an Origin 403
+		refuseOrigin(second)
+		for _, ip := range []string{first, second} {
+			if n := e.logs.count("level=WARN", "websocket origin refused", "remote_ip="+ip); n != 1 {
+				t.Errorf("%s: %d origin log lines, want 1", ip, n)
+			}
+			if n := e.logs.count("level=WARN", "websocket pre-auth upgrades throttled", "remote_ip="+ip); n != 1 {
+				t.Errorf("%s: %d throttle log lines, want 1", ip, n)
+			}
+		}
+		if t.Failed() {
+			t.Logf("log:\n%s", e.logs)
+		}
+	})
+}
+
 // Pre-auth upgrades are keyed by the client's IPv6 /64 (01 §3.1, as 03 §7.3).
 func TestUpgradePreAuthIPv6Prefix(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
@@ -276,7 +319,7 @@ func TestUpgradeNotHijackable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := httptest.NewRequest(http.MethodGet, "/ws", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/ws", nil)
 	for k, v := range map[string]string{"Connection": "Upgrade", "Upgrade": "websocket", "Sec-WebSocket-Version": "13",
 		"Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ=="} {
 		req.Header.Set(k, v)

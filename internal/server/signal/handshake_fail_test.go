@@ -29,7 +29,8 @@ func TestHandshakeFailures(t *testing.T) {
 	}
 	cases := []struct {
 		name      string
-		cookie    bool
+		cookie    bool // a valid session cookie
+		badCookie bool // a cookie that authenticates nobody: the socket is pre-auth
 		frame     []byte
 		code      protocol.ErrorCode
 		scope     protocol.ErrorScope
@@ -66,6 +67,8 @@ func TestHandshakeFailures(t *testing.T) {
 			}},
 		{name: "no cookie and no bearer", frame: helloWith(func(*protocol.Hello) {}),
 			code: protocol.ErrorCodeUnauthenticated, scope: protocol.ErrorScopeSession},
+		{name: "bad cookie and no bearer", badCookie: true, frame: helloWith(func(*protocol.Hello) {}),
+			code: protocol.ErrorCodeUnauthenticated, scope: protocol.ErrorScopeSession},
 		{name: "cookie and bearer", cookie: true,
 			frame: helloWith(func(h *protocol.Hello) {
 				h.Auth = &protocol.HelloAuth{Scheme: protocol.AuthSchemeBearer, Token: "token"}
@@ -87,8 +90,11 @@ func TestHandshakeFailures(t *testing.T) {
 				e := newEnv(t)
 				defer e.close()
 				cookie := ""
-				if tc.cookie {
+				switch {
+				case tc.cookie:
 					cookie, _ = e.user(false)
+				case tc.badCookie:
+					cookie = "unknown-cookie"
 				}
 				c := e.mustDial(headers(cookie, testOrigin, ""))
 				if err := c.SendRaw(tc.frame); err != nil {
