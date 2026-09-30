@@ -218,7 +218,8 @@ func (s *socket) touch() { s.lastActivity.Store(time.Now().UnixNano()) }
 func (s *socket) lastActive() time.Time { return time.Unix(0, s.lastActivity.Load()) }
 
 // writeLoop writes the queued messages, one at a time with writeTimeout each, and closes the WebSocket when the
-// queue asks for it.
+// queue asks for it. It also takes them from the queue one at a time, so the queue's limits bound everything but the
+// write in progress (01 §3.3).
 func (s *socket) writeLoop() {
 	defer s.h.wg.Done()
 	defer close(s.writerDone)
@@ -229,11 +230,8 @@ func (s *socket) writeLoop() {
 			return
 		}
 		for {
-			msgs, fin := s.q.take()
-			for _, m := range msgs {
-				if s.q.aborted() { // slow_connection: nothing more is sent
-					break
-				}
+			m, fin := s.q.take()
+			if m != nil && !s.q.aborted() { // after an abort (slow_connection) nothing more is sent
 				if err := s.write(m); err != nil {
 					s.h.log.Debug("websocket write", slog.Any("err", err))
 					s.forceClose()
@@ -248,7 +246,7 @@ func (s *socket) writeLoop() {
 				}
 				return
 			}
-			if len(msgs) == 0 {
+			if m == nil {
 				break
 			}
 		}
@@ -476,13 +474,25 @@ func (q *sendQueue) abort(code websocket.StatusCode, reason string) bool {
 	return true
 }
 
-// take returns every queued message, and the close request once the queue has nothing left before it.
-func (q *sendQueue) take() ([][]byte, closeRequest) {
+// take removes and returns the oldest queued message (nil when none is left), and the close request once the queue
+// has nothing left before it. The message leaves the queue's count as the writer takes it, so a slow client holds
+// at most the queue's limits plus the one write in progress.
+func (q *sendQueue) take() ([]byte, closeRequest) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	msgs := q.msgs
-	q.msgs, q.bytes = nil, 0
-	return msgs, q.fin
+	if len(q.msgs) == 0 {
+		q.msgs = nil // release the backing array
+		return nil, q.fin
+	}
+	m := q.msgs[0]
+	q.msgs[0] = nil
+	q.msgs = q.msgs[1:]
+	q.bytes -= len(m)
+	if len(q.msgs) > 0 {
+		return m, closeRequest{}
+	}
+	q.msgs = nil
+	return m, q.fin
 }
 
 func (q *sendQueue) closing() bool {

@@ -78,6 +78,26 @@ func track(t *testing.T, v *Viewer, kind webrtc.RTPCodecType, rid string) *Recor
 	return r
 }
 
+// withoutPartialTail drops the packets of the newest frame when its last packet (the one with the RTP marker bit)
+// hasn't arrived yet: the stream still runs when the test takes its snapshot, which can land inside a frame.
+func withoutPartialTail(pkts []Packet) []Packet {
+	frames := Frames(pkts)
+	if len(frames) == 0 {
+		return pkts
+	}
+	last := frames[len(frames)-1]
+	if last.MarkerBits > 0 && last.MarkerOnLast {
+		return pkts
+	}
+	out := make([]Packet, 0, len(pkts))
+	for _, p := range pkts {
+		if p.TS != last.TS {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // keyframes counts the frames with a keyframe marker.
 func keyframes(r *Recorder) int {
 	n := 0
@@ -148,6 +168,7 @@ func TestLoopbackMedia(t *testing.T) {
 		if err := CheckStartsOnSPS(pkts); err != nil {
 			t.Errorf("%q: %v", rid, err)
 		}
+		pkts = withoutPartialTail(pkts)
 		if err := CheckVideoMarkers(pkts); err != nil {
 			t.Errorf("%q: %v", rid, err)
 		}

@@ -75,6 +75,7 @@ func TestHandshakeWelcome(t *testing.T) {
 		if got := e.metric("isshoni_ws_connections", "kind", "web", "role", "full"); got != 1 {
 			t.Errorf("isshoni_ws_connections %v, want 1", got)
 		}
+		synctest.Wait() // the actor logs "connection opened" right after it queues welcome
 		if e.logs.count("connection opened", w.ConnectionID, id.UserID) != 1 {
 			t.Errorf("no connection opened log line:\n%s", e.logs)
 		}

@@ -109,6 +109,8 @@ func TestHandshakeFailures(t *testing.T) {
 					tc.check(t, pe, re)
 				}
 				expectClose(t, c, protocol.CloseCodeFor(tc.code, tc.scope))
+				// fail counts the error after queueing it with the close, so the client can see the close first.
+				synctest.Wait()
 				if e.metric("isshoni_ws_errors_total", "code", string(tc.code)) != 1 {
 					t.Errorf("isshoni_ws_errors_total{code=%q} not counted", tc.code)
 				}

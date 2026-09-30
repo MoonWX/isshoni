@@ -864,7 +864,7 @@ type packet struct { // immutable after insert; shared by the cache and every Do
 
 - **RTP loop**: `track.Read(scratch)` into a reusable 1500-byte buffer, `rtp.Header.Unmarshal`, copy the payload into
   an exact-size slice (one allocation per incoming packet, none per viewer), build `packet`, `cache.insert` (§9.2).
-  If it returns false (a duplicate, or a packet more than a capacity late), count it and stop: no fan-out.
+  If it returns `duplicate` or `tooLate` (a packet a capacity or more late), count it and stop: no fan-out.
   Otherwise, for each DownTrack in the share's list for that kind: if `dt.interest&slotBit != 0`, `dt.enqueue(p)`.
   Padding-only packets are enqueued as padding markers (no payload) to DownTracks currently forwarding this layer.
   The loop ends on a read error: the Layer detaches and the Share re-evaluates its state.
@@ -896,10 +896,12 @@ type packet struct { // immutable after insert; shared by the cache and every Do
   layer, busy or idle.
 - Resizing is checked each second: grow at once when the wanted size is more than the current one; shrink only after
   10 s at a quarter of the current size or less, never below `floor`. A resize copies the entries still in the window.
-- `insert(p) bool`: false if `p.seq` is more than a capacity behind the highest seq (int16 arithmetic), or if the slot
-  already holds `p.seq` (a duplicate, §9.1: the slot is left as it is). Otherwise it overwrites the slot and returns
-  true. Out-of-order and late (RTX) packets land in their empty slots.
-- `get(seq) *packet`: nil if the slot holds another seq or `arrival` is older than 1.5 s.
+- `insert(p) cacheResult`: `tooLate` if `p.seq` is a capacity or more behind the highest seq (int16 arithmetic),
+  `duplicate` if the slot already holds `p.seq` (§9.1: the slot is left as it is). Otherwise it overwrites the slot
+  and returns `inserted`. Out-of-order and late (RTX) packets land in their empty slots. The Layer counts duplicates
+  (`isshoni_sfu_ingress_duplicates_total`) and too-late drops separately.
+- `get(seq, now) *packet`: nil if the slot holds another seq or `arrival` is older than 1.5 s before `now` (explicit
+  for deterministic tests).
 - Concurrency: one `sync.RWMutex` per cache. Writes come from the layer's RTP goroutine; reads from DownTrack RTCP
   goroutines on NACK.
 - There are no per-viewer copies. Payloads are immutable and garbage-collected once neither the cache nor any queue
@@ -1022,16 +1024,28 @@ Rules:
   same `tsOff`), so the next media packet closes the gap. Out-of-order padding is ignored; the viewer may NACK that
   seq, it misses the cache, and nothing is lost.
 - **Pause** (`off`): `active = false`. Nothing is forwarded. Resume follows the start rules (keyframe for video).
-- **Lookup for NACK** `lookup(S) (epoch, ok)`: walk from the newest epoch back to the first with
-  `int16(S − startS) ≥ 0`. Stop at epochs older than 2 s. `U = S − seqOff`.
+- **Lookup for NACK** `lookup(S, now) (epoch, ok)`: walk from the newest epoch back to the first with
+  `int16(S − startS) ≥ 0`. Don't walk past an epoch that started more than 2 s ago (every earlier epoch ended before
+  then); the current epoch always answers. `U = S − seqOff`.
 - **SR translation**: `translateSR(layer, sr) (rtp uint32, ok)` succeeds only when `layer` is the current epoch's
   layer: `rtp = sr.rtp + tsOff`.
 - Wraparound: all comparisons use int16 (seq) and int32 (ts) differences.
+- **Result**: `process(p, now) (seq, ts, verdict)`. The verdict is `drop`; `waitKeyframe` (a target-slot packet
+  while waiting for its keyframe: the DownTrack requests a throttled keyframe, §9.7); `forward`; or `newEpoch`
+  (forwarded and started an epoch: the writer sends the new layer's translated SR, §9.6). The random first seq and ts
+  are picked in `newMunger`.
+- **Further rules** (S12, each tested): a newer packet of the current Layer with another profile ends forwarding
+  until a keyframe, so a profile flip-back can't leave a seq gap that NACKs would fill with the wrong profile; a late
+  packet is also dropped when its own seq would collide with a later epoch's start (a same-layer resume after a
+  pause); packets more than 8192 behind are dropped, and an epoch's start is kept within 16384 of its newest packet
+  so int16 comparisons stay valid; a run of in-order padding extends one padding epoch instead of adding one each; a
+  wall-clock ts step is capped at 2^30 ticks; the monotonic ts guard also applies to a same-Layer resume, which then
+  falls back to the wall clock.
 
 ### 9.5 NACK and RTX (video and audio)
 
 For each lost own seq `S` in a `TransportLayerNack` (each NACK item names up to 17 seqs):
-1. `e, ok := m.lookup(S)`, then `U = S − e.seqOff` and `p := e.layer.cache.get(U)`. A miss is counted
+1. `e, ok := m.lookup(S, now)`, then `U = S − e.seqOff` and `p := e.layer.cache.get(U, now)`. A miss is counted
    (`nack_missed`) and skipped.
 2. Skip it if `S` was retransmitted in the last `max(20 ms, rtt/2)`, or 3 times already (ring of 1024 records keyed
    by `S`).

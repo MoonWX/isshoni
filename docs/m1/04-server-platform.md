@@ -8,7 +8,9 @@ Sibling specs, referenced instead of duplicated:
 [01-protocol](01-protocol.md) · [02-sfu](02-sfu.md) · [03-accounts-and-store](03-accounts-and-store.md) ·
 [05-web-client](05-web-client.md) · [06-deploy-and-ci](06-deploy-and-ci.md).
 
-Example addresses use documentation ranges (`203.0.113.0/24`, `2001:db8::/32`) and `watch.example.com`.
+Example addresses use documentation ranges (`203.0.113.0/24`, `2001:db8::/32`) and `watch.example.com`. In a command
+line such as `--public-ip 203.0.113.7`, the address stands for the server's real public IP: with `tls.mode=ip`,
+`config` rejects documentation ranges (§4.5), so the example exits 78 if run as written.
 
 Integration status: reconciled with 01–03, 05 and 06 by the integrator (`README.md`, "Integration decisions"). The main
 changes: no maintenance mode (unrecoverable states exit 78, recovery is offline); one REST error envelope and one JSON
@@ -227,14 +229,17 @@ drives the TOML decoder, env and flag parsing, `config print`, `config example` 
 keys only through this registry.**
 
 Unknown keys:
-- In the file: error 78, with position and a "did you mean" suggestion (edit distance ≤ 2), from go-toml/v2
-  `DisallowUnknownFields` (`*toml.StrictMissingError`).
+- In the file: error 78, with position and a "did you mean" suggestion (edit distance ≤ 2). go-toml/v2 decodes the
+  file into a map (syntax errors and duplicate keys come with their positions), the registry is walked against that
+  map, and go-toml's parser gives each key's line and column, so one run reports every unknown key and type error (a
+  strict `DisallowUnknownFields` decode would stop at the first).
 - In env: a warning with the same suggestion (env may hold unrelated variables).
 - Reserved non-key names are ignored without a warning. The list lives in `config/keys.go` next to the registry and
   matches 06's list; a new non-key `ISSHONI_*` name must be added to both: `ISSHONI_CONFIG`, `ISSHONI_VERSION`
   (install.sh target version and the Vite build version), `ISSHONI_YES`, `ISSHONI_NO_FIREWALL`,
   `ISSHONI_DOWNLOAD_BASE`, `ISSHONI_INSTALL_SOURCED`, `ISSHONI_INSTALLER_VERSION`, `ISSHONI_SNAPSHOT_VERSION`,
-  `ISSHONI_BIN`, `ISSHONI_DEV_SERVER`. The env-only switches of §4.3 are read, not ignored.
+  `ISSHONI_BIN`, `ISSHONI_DEV_SERVER`, `ISSHONI_LOADTEST_PASSWORD` (02's `isshoni-loadtest`). The env-only switches of
+  §4.3 are read, not ignored.
 
 ### 4.3 Key reference
 
@@ -319,8 +324,9 @@ The other reserved names of §4.2 (`ISSHONI_VERSION`, install.sh's and the dev t
 | `log.format` | `"auto"` | `auto` (text on a TTY, else JSON) \| `text` \| `json` |
 | `updates.release_url` | GitHub releases API URL of `MoonWX/isshoni` | Hidden; tests only |
 
-`isshoni config example --public-ip 203.0.113.7` prints (comments abbreviated here; `config init --path P` writes
-the same text; the `Reference` URL is built from `version.DocsURL`):
+`isshoni config example --public-ip 203.0.113.7` prints (203.0.113.7 stands for the server's real public IP, see the
+top of this document; comments abbreviated here; `config init --path P` writes the same text; the `Reference` URL is
+built from `version.DocsURL`):
 
 ```toml
 # isshoni server configuration. Every key also has an ISSHONI_* env variable and a --flag.
@@ -1351,6 +1357,7 @@ package httpapi
 type RouterOptions struct {
 	Site           config.Site
 	TrustedProxies []netip.Prefix // only used when Site.TLSMode == off
+	DisableHSTS    bool           // !tls.hsts; the zero value keeps HSTS on (§9.6)
 	SPA            fs.FS          // web.Dist()
 	SPAStatus      func(path string) int // 03 hook: 404 for "/setup" once an admin exists
 	Gate           *Gate          // shutting-down switch
@@ -1385,6 +1392,8 @@ func WriteError(w http.ResponseWriter, r *http.Request, err error)
 func DecodeJSON(w http.ResponseWriter, r *http.Request, dst any, maxBytes int64) error
 
 type Gate struct{ /* atomic state: serving | shutting_down */ }
+func (g *Gate) SetShuttingDown()
+func (g *Gate) ShuttingDown() bool // a nil *Gate is serving
 ```
 
 ### 9.3 Middleware chain (outermost first)

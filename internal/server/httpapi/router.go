@@ -11,30 +11,18 @@ import (
 
 	"github.com/MoonWX/isshoni/internal/logx"
 	"github.com/MoonWX/isshoni/internal/protocol/api"
+	"github.com/MoonWX/isshoni/internal/server/config"
 )
 
 // TLSMode is the effective TLS mode of the site (04 §4.4): "auto", "ip", "manual" or "off".
-//
-// It mirrors config.TLSMode, and Site mirrors config.Site field for field: S15's config package is built in the same
-// plan group as this router, so this package cannot import it yet. Once both are merged, the integrator replaces the
-// two declarations with `type TLSMode = config.TLSMode` and `type Site = config.Site`; nothing else changes.
-type TLSMode string
+type TLSMode = config.TLSMode
 
 // tlsOff is the mode in which X-Forwarded-For and X-Forwarded-Proto are honored from trusted proxies (04 §8.5).
-const tlsOff TLSMode = "off"
+const tlsOff = config.TLSOff
 
-// Site is how the outside world reaches this server (04 §4.4); see TLSMode.
-type Site struct {
-	Origin   string  // "https://watch.example.com", no trailing slash
-	Host     string  // "watch.example.com", "203.0.113.7", "[2001:db8::1]", with ":port" if not default
-	Hostname string  // without port and brackets
-	TLSMode  TLSMode // effective mode
-	// Dev is true in off mode with a loopback listen.http and an empty or loopback public_url: the Host check then
-	// accepts any localhost, 127.0.0.1 or [::1] host (the Vite proxy), and IsSecure is true.
-	Dev bool
-	// ExtraOrigins: later (M2) the Wails asset origins, added in code, not config. The router doesn't use it.
-	ExtraOrigins []string
-}
+// Site is how the outside world reaches this server (04 §4.4), as config.NewSite computes it. The router uses its
+// Origin, Host, Hostname, TLSMode and Dev fields.
+type Site = config.Site
 
 // RouterOptions configures NewRouter (04 §9.2).
 type RouterOptions struct {

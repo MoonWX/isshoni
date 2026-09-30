@@ -407,14 +407,15 @@ Press Enter to use this server's IP address instead:
 
 ```
 isshoni config init --path /etc/isshoni/isshoni.toml --domain share.example.com            # tls.mode derives to auto
-isshoni config init --path /etc/isshoni/isshoni.toml --tls.mode ip [--public-ip 203.0.113.7]
+isshoni config init --path /etc/isshoni/isshoni.toml --tls.mode ip [--public-ip 203.0.113.7]  # the real public IP
 isshoni config init --path … --tls.mode off --public-url https://share.example.com [--listen.http 127.0.0.1:8080]
 isshoni config init --path … --tls.mode manual --domain … --tls.cert-file … --tls.key-file …
                     [--tls.acme-email you@example.com]
 ```
 
 The flags are 04's config flags (04 §4.2: `--` plus the key path with `_` → `-`). Then `chown root:isshoni` and
-`chmod 0640`. `config init` refuses to overwrite an existing file (exit 7).
+`chmod 0640`. `config init` refuses to overwrite an existing file (exit 7). `203.0.113.7` above stands for the
+server's real public IP: in `ip` mode 04 rejects documentation ranges (04 §4.5).
 - With `--tls.mode off` and a loopback `listen.http` (the default), `config init` also writes
   `network.trusted_proxies = ["127.0.0.0/8", "::1/128"]` into the file (04 §4.4), so a reverse proxy on the same host
   passes the real client IPs and the admin sees the value. install.sh passes no flag for it.
@@ -1975,7 +1976,8 @@ Anything beyond these, such as a reload, a second tap, a re-join or a second log
     `ISSHONI_DOWNLOAD_BASE`, `ISSHONI_INSTALL_SOURCED` (unit tests);
   - goreleaser: `ISSHONI_SNAPSHOT_VERSION`;
   - e2e: `ISSHONI_BIN`;
-  - 05 dev and build: `ISSHONI_VERSION` (version stamped into the SPA), `ISSHONI_DEV_SERVER` (Vite proxy target).
+  - 05 dev and build: `ISSHONI_VERSION` (version stamped into the SPA), `ISSHONI_DEV_SERVER` (Vite proxy target);
+  - 02's load test: `ISSHONI_LOADTEST_PASSWORD` (the `isshoni-loadtest` admin password).
 
   Any new `ISSHONI_*` name that is not a config key must be added to 04 §4.2's reserved list. 04's own env-only names
   (`ISSHONI_CONFIG`, `ISSHONI_IN_CONTAINER`, `ISSHONI_ALLOW_EPHEMERAL_DATA`) are read by 04 and are not on this list.

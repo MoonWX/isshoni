@@ -2,6 +2,7 @@ package signal
 
 import (
 	"crypto/sha256"
+	"slices"
 	"strings"
 	"testing"
 
@@ -159,23 +160,48 @@ func TestSendQueue(t *testing.T) {
 	if r := q.push([]byte("d")); r != pushFull {
 		t.Errorf("4th message: %v, want full", r)
 	}
-	msgs, fin := q.take()
-	if len(msgs) != 3 || fin.set {
-		t.Fatalf("take: %d messages, fin %+v", len(msgs), fin)
+	// take hands the writer one message at a time; it leaves the queue's count at once.
+	m, fin := q.take()
+	if string(m) != "aaa" || fin.set {
+		t.Fatalf("take: %q, fin %+v", m, fin)
+	}
+	if r := q.push([]byte("x")); r != pushed {
+		t.Errorf("push after take: %v, want pushed", r)
+	}
+	if r := q.push([]byte("y")); r != pushFull {
+		t.Errorf("4th queued message: %v, want full", r)
 	}
 	if r := q.push([]byte("0123456789x")); r != pushFull {
 		t.Errorf("11 bytes: %v, want full", r)
 	}
-	q.push([]byte("x"))
 	if !q.finish(4400, "bad", []byte("err")) || q.finish(4401, "") {
 		t.Error("finish: the first call must win")
 	}
 	if r := q.push([]byte("late")); r != pushGone {
 		t.Errorf("push after finish: %v, want gone", r)
 	}
-	msgs, fin = q.take()
-	if len(msgs) != 2 || string(msgs[1]) != "err" || !fin.set || fin.code != 4400 {
-		t.Errorf("take: %q, %+v", msgs, fin)
+	// The close request comes with the last message, after every one queued before it.
+	var got []string
+	for {
+		m, fin := q.take()
+		if m != nil {
+			got = append(got, string(m))
+		}
+		if fin.set {
+			if fin.code != 4400 || m == nil {
+				t.Errorf("fin %+v with %q", fin, m)
+			}
+			break
+		}
+		if m == nil {
+			t.Fatal("queue empty before the close request")
+		}
+	}
+	if !slices.Equal(got, []string{"bbb", "ccc", "x", "err"}) {
+		t.Errorf("take order %q", got)
+	}
+	if m, fin := q.take(); m != nil || !fin.set {
+		t.Errorf("take after the last message: %q, %+v", m, fin)
 	}
 	if q.abort(websocket.StatusCode(protocol.CloseCodeSlowConnection), "") {
 		t.Error("abort after finish")
@@ -187,8 +213,8 @@ func TestSendQueue(t *testing.T) {
 	if !a.abort(4503, "slow_connection") || !a.aborted() || a.closeCode() != 4503 {
 		t.Error("abort")
 	}
-	if msgs, fin := a.take(); len(msgs) != 0 || fin.code != 4503 {
-		t.Errorf("after abort: %q, %+v", msgs, fin)
+	if m, fin := a.take(); m != nil || fin.code != 4503 {
+		t.Errorf("after abort: %q, %+v", m, fin)
 	}
 }
 

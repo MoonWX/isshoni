@@ -12,7 +12,7 @@ const (
 	CodeBadSDP               = "sfu.bad_sdp"                // unparsable, data channel, too many m-lines, too large
 	CodeNoH264               = "sfu.no_h264"                // a video m-line offers no H.264 packetization-mode=1
 	CodeBadRID               = "sfu.bad_rid"                // a rid outside {f,q} (M1), or more than 2
-	CodeUnknownTrack         = "sfu.unknown_track"          // a bad binding in tracks (a missing one isn't)
+	CodeUnknownTrack         = "sfu.unknown_track"          // a malformed binding in tracks (a missing or foreign one isn't)
 	CodeStaleAnswer          = "sfu.stale_answer"           // gen/neg don't match the outstanding sub offer
 	CodeStaleOffer           = "sfu.stale_offer"            // pub offer with a lower gen, or a lower neg in this gen
 	CodePCLimit              = "sfu.pc_limit"               // a third PC or a second PC of the same kind

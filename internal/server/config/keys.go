@@ -118,6 +118,7 @@ var reservedEnv = []string{
 	"ISSHONI_SNAPSHOT_VERSION",
 	"ISSHONI_BIN",
 	"ISSHONI_DEV_SERVER",
+	"ISSHONI_LOADTEST_PASSWORD", // 02's isshoni-loadtest admin password
 }
 
 // envOnly are the env-only switches of §4.3: read directly, never warned about.

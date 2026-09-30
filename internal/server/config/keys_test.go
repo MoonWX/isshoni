@@ -259,7 +259,7 @@ func TestReservedNames(t *testing.T) {
 	want := []string{
 		"ISSHONI_CONFIG", "ISSHONI_VERSION", "ISSHONI_YES", "ISSHONI_NO_FIREWALL", "ISSHONI_DOWNLOAD_BASE",
 		"ISSHONI_INSTALL_SOURCED", "ISSHONI_INSTALLER_VERSION", "ISSHONI_SNAPSHOT_VERSION", "ISSHONI_BIN",
-		"ISSHONI_DEV_SERVER",
+		"ISSHONI_DEV_SERVER", "ISSHONI_LOADTEST_PASSWORD",
 	}
 	if got := ReservedEnvNames(); !slices.Equal(got, want) {
 		t.Errorf("ReservedEnvNames = %v, want 04 §4.2's list %v", got, want)

@@ -1221,3 +1221,18 @@ export interface DashboardSessionCounts {
 export interface DashboardDeviceCounts {
   linked: number /* int */;
 }
+
+//////////
+// source: wiretime.go
+
+/**
+ * WireTime is a timestamp in the one JSON form of the API (03 §3.3): an RFC 3339 UTC string with exactly three
+ * fractional digits and a Z suffix, "2026-09-30T12:00:00.000Z", whatever the location and precision of the value
+ * (the fraction is truncated to the millisecond, not rounded). It is the fixed-width form of 01's signaling
+ * timestamps (01 §5, internal/protocol) and of JavaScript's Date.toISOString, so the strings also sort as text.
+ * DTO fields stay time.Time, which tygo maps to string: the MarshalJSON methods in encode.go encode each of them as a
+ * WireTime, so every encoder sends this form. Code that writes a timestamp into JSON outside these DTOs (04's admin
+ * socket, for example) declares the field as WireTime. Decoding accepts any RFC 3339 form, as time.Time does, and
+ * keeps the value as sent.
+ */
+export type WireTime = string;

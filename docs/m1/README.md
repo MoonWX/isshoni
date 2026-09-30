@@ -275,7 +275,7 @@ current release; later slices keep that version.
 | `go.uber.org/zap` v1.28.0 and `github.com/pion/logging` v0.2.4 (`logx`'s certmagic and Pion log bridges) | S05 |
 | `github.com/caddyserver/certmagic` (brings acmez; zap is already there from S05) | S44 |
 | `github.com/SherClockHolmes/webpush-go` | S32 |
-| `github.com/prometheus/client_golang` | S55 |
+| `github.com/prometheus/client_golang` v1.24.1 (the hub's `Deps.Metrics` is a `prometheus.Registerer`) | S11 |
 | `github.com/skip2/go-qrcode` | S43 |
 | `go.uber.org/goleak`, `github.com/rogpeppe/go-internal` (tests only); `golang.org/x/{sys,mod,time}` | first user |
 

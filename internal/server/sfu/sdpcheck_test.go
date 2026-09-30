@@ -235,6 +235,14 @@ func pubAcceptCases(t *testing.T) []acceptCase {
 			owns(shareA), wantUnbound(1, "1")},
 		{"no tracks at all", chrome, nil, owns(shareA), wantUnbound(0, "0", "1")},
 		{"no tracks and no ownShare func", chrome, nil, nil, wantUnbound(0, "0", "1")},
+		// A binding to a share that isn't a pending/live/stalled share of this Conn (it ended while the offer was in
+		// flight, or it is another Conn's) is treated like a missing one, kind check included (02 §8.4 step 1).
+		{"bound to another connection's share", chrome, tracksA, owns(shareB), wantUnbound(0, "0", "1")},
+		{"bound but no ownShare func", chrome, tracksA, nil, wantUnbound(0, "0", "1")},
+		{"another connection's share bound with the other kind", chrome,
+			[]TrackBinding{tracksA[0], {MID: "1", Share: shareB, Kind: video}}, owns(shareA), wantUnbound(1, "1")},
+		{"another connection's share without H.264", edit(t, chrome, "H264/90000", "VP8/90000"), tracksA, owns(shareB),
+			wantUnbound(0, "0", "1")},
 		// Only an unbound section's rids are checked (TestCheckPubOfferCodes), not its codecs.
 		{"an unbound video section without H.264", edit(t, chrome, "H264/90000", "VP8/90000"), tracksA[1:], owns(shareA),
 			wantUnbound(1, "0")},
@@ -310,8 +318,6 @@ func TestCheckPubOfferCodes(t *testing.T) {
 
 		{"bound with the other kind", chrome, []TrackBinding{tracksA[0], {MID: "1", Share: shareA, Kind: video}},
 			owns(shareA), CodeUnknownTrack, shareA},
-		{"bound to another connection's share", chrome, tracksA, owns(shareB), CodeUnknownTrack, shareA},
-		{"no ownShare func", chrome, tracksA, nil, CodeUnknownTrack, shareA},
 		{"one mid bound twice", chrome, append(slices.Clone(tracksA), TrackBinding{MID: "1", Share: shareB, Kind: audio}),
 			owns(shareA, shareB), CodeUnknownTrack, shareB},
 		{"second video m-line for a share", chrome + withMID(t, videoSec, "0", "2"),
@@ -362,6 +368,8 @@ func TestCheckPubOfferCodes(t *testing.T) {
 		// guard holds for it too.
 		{"an unbound section with bad rids", edit(t, chrome, "a=rid:q send", "a=rid:h send",
 			"a=simulcast:send f;q", "a=simulcast:send f;h;x"), tracksA[1:], owns(shareA), CodeBadRID, ""},
+		{"a section bound to another connection's share with bad rids", edit(t, chrome, "a=rid:q send", "a=rid:h send",
+			"a=simulcast:send f;q", "a=simulcast:send f;h;x"), tracksA, owns(shareB), CodeBadRID, ""},
 		{"an unbound section with many rids", edit(t, chrome, simulcast,
 			strings.Repeat("a=rid:f send\r\n", 400)+"a=simulcast:send f\r\n"), tracksA[1:], owns(shareA), CodeBadRID, ""},
 		{"an unbound section without H.264 and with bad rids", edit(t, chrome, "H264/90000", "VP8/90000",

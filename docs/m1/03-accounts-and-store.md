@@ -317,8 +317,10 @@ migration (06).
 
 ### 4.7 Janitor and pruning
 
-`auth.(*Service).RunJanitor(ctx)` runs at startup and then every hour. 04 starts it with `serve`. Each run does
-`db.Prune(ctx, now)` and `PRAGMA wal_checkpoint(PASSIVE)`, plus `PRAGMA optimize` once a day.
+`auth.(*Service).RunJanitor(ctx)` runs at startup and then every hour. 04 starts it with `serve`. Each run calls
+`db.Prune(ctx, now)`, which deletes the rows below in one `Write` and then does the upkeep itself:
+`PRAGMA wal_checkpoint(PASSIVE)`, plus `PRAGMA optimize` at most once per 24 h (auth has no way to run PRAGMAs on the
+store). When only the upkeep fails, `Prune` returns the error together with the counts of the committed deletions.
 
 | Rows | Deleted when |
 |---|---|
@@ -797,8 +799,9 @@ type FileInfo struct {
 ```
 
 `*Q` wraps the transaction. Read methods work in both `Read` and `Write`. Write methods fail inside `Read`, which a
-test covers. Every mutating method that the API exposes takes the audit entry in the same call, so the audit row and
-the change commit together (`q.AppendAudit` is also public for composite flows).
+test covers. The mutating methods do not take an audit entry: the caller calls `q.AppendAudit` in the same `Write`
+as the change, so the audit row and the change commit together. `Prune` is the exception and writes its own
+`user.signup_expired` rows.
 
 ```go
 // users
@@ -855,7 +858,7 @@ func (q *Q) DeleteSetupTokens() error
 func (q *Q) CreateInvite(inv *Invite) error
 func (q *Q) InviteByTokenHash(h []byte) (Invite, error)
 func (q *Q) InviteByID(id InviteID) (Invite, error)
-func (q *Q) ListInvites(createdBy UserID /* "" = all */, includeInactive bool) ([]Invite, error)
+func (q *Q) ListInvites(createdBy UserID /* "" = all */, includeInactive bool) ([]Invite, error) // active = at Options.Clock
 func (q *Q) CountActiveInvites(createdBy UserID /* "" = all */, now time.Time) (int, error)
 func (q *Q) RevokeInvite(id InviteID, by UserID, now time.Time) error
 // UseInvite: UPDATE … SET uses = uses + 1 WHERE id = ? AND revoked_at IS NULL AND expires_at > now AND uses < max_uses.
