@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -174,4 +175,73 @@ func queryInt(t *testing.T, db *DB, query string, args ...any) int {
 		t.Fatalf("%s: %v", query, err)
 	}
 	return n
+}
+
+// ---- query-method fixtures ----
+
+// testPHC stands in for an argon2id hash; the store treats it as opaque text.
+const testPHC = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0$aGFzaGhhc2hoYXNoaGFzaA"
+
+// mustWrite runs fn in a Write and fails the test on error.
+func mustWrite(t *testing.T, db *DB, fn func(q *Q) error) {
+	t.Helper()
+	if err := db.Write(context.Background(), fn); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// mustRead runs fn in a Read and fails the test on error.
+func mustRead(t *testing.T, db *DB, fn func(q *Q) error) {
+	t.Helper()
+	if err := db.Read(context.Background(), fn); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// newUser creates an active user named name (compare key: lower case), created at the env clock, with opts applied.
+func (e *testEnv) newUser(db *DB, name string, opts ...func(*User)) User {
+	e.t.Helper()
+	u := User{Username: name, UsernameKey: strings.ToLower(name), PasswordHash: testPHC, CreatedVia: "invite",
+		CreatedAt: e.clock.Now()}
+	for _, o := range opts {
+		o(&u)
+	}
+	mustWrite(e.t, db, func(q *Q) error { return q.CreateUser(&u) })
+	return u
+}
+
+// newSession creates a session of u with token hash h, created at, lasting 30 d idle and 180 d at most, with opts
+// applied.
+func (e *testEnv) newSession(db *DB, u UserID, h string, at time.Time, opts ...func(*Session)) Session {
+	e.t.Helper()
+	s := Session{UserID: u, TokenHash: []byte(h), Name: "Chrome on Windows", CreatedAt: at, LastIP: "192.0.2.1",
+		IdleExpiresAt: at.Add(30 * 24 * time.Hour), ExpiresAt: at.Add(180 * 24 * time.Hour)}
+	for _, o := range opts {
+		o(&s)
+	}
+	mustWrite(e.t, db, func(q *Q) error { return q.CreateSession(&s) })
+	return s
+}
+
+// newDevice inserts a linked device of u (CreateDevice is M2, so this uses SQL).
+func newDevice(t *testing.T, db *DB, id DeviceID, u UserID, lastSeen time.Time) {
+	t.Helper()
+	mustExecW(t, db, `INSERT INTO devices (id, user_id, name, client_kind, os, app_version, linked_via, created_at,
+		last_seen_at, last_ip) VALUES (?, ?, 'Alex-PC', 'desktop', 'windows', '0.2.0', 'password', ?, ?, '203.0.113.7')`,
+		string(id), string(u), lastSeen.UnixMilli(), lastSeen.UnixMilli())
+}
+
+// idSequence returns a NewID hook that hands out ids in order, then fresh random ones.
+func idSequence(ids ...string) func() string {
+	var mu sync.Mutex
+	return func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		if len(ids) == 0 {
+			return NewID()
+		}
+		id := ids[0]
+		ids = ids[1:]
+		return id
+	}
 }

@@ -45,12 +45,28 @@ func (q *Q) setMetaIfMissing(key, value string) error {
 
 // ---- transfer accounting (04 §11.3): socket-level byte totals per UTC month, no per-user data ----
 
-// AddTransfer adds byte counts to a UTC month ("2026-09") of 04's transfer accounting.
+// AddTransfer adds byte counts to a UTC month ("2026-09") of 04's transfer accounting, creating the month's row.
 func (q *Q) AddTransfer(month string, egress, ingress int64, now time.Time) error {
-	return notImplemented("AddTransfer")
+	if month == "" {
+		return errors.New("store: AddTransfer: month is required")
+	}
+	_, err := q.execCount("add transfer", `INSERT INTO transfer_months (month, egress_bytes, ingress_bytes, updated_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT (month) DO UPDATE SET egress_bytes = egress_bytes + excluded.egress_bytes,
+			ingress_bytes = ingress_bytes + excluded.ingress_bytes, updated_at = excluded.updated_at`,
+		month, egress, ingress, unixMS(now))
+	return err
 }
 
 // TransferMonth returns the byte counts of a month (zero when there is no row).
 func (q *Q) TransferMonth(month string) (egress, ingress int64, err error) {
-	return 0, 0, notImplemented("TransferMonth")
+	err = q.queryOne("transfer month", `SELECT egress_bytes, ingress_bytes FROM transfer_months WHERE month = ?`,
+		[]any{month}, &egress, &ingress)
+	if errors.Is(err, ErrNotFound) {
+		return 0, 0, nil
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	return egress, ingress, nil
 }
