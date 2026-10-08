@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -269,6 +271,74 @@ func TestPermissionDenied(t *testing.T) {
 	})
 }
 
+// A server that hangs up on a caller it would serve (here the socket's owner) is not refusing anyone: it is on its
+// way down, or it never got as far as serving. The commands say "not running", and the ones that wait keep trying
+// (04 §12.1).
+func TestServerGoesAway(t *testing.T) {
+	t.Parallel() // it waits
+	sock := socketPath(t)
+	env := []string{"ISSHONI_LISTEN_ADMIN_SOCKET=" + sock}
+	// goAway listens on the socket like a server that stops: it closes the first connection without an answer,
+	// then the listener, which removes the socket file. The channel closes when all that is done.
+	goAway := func() <-chan struct{} {
+		var lc net.ListenConfig
+		ln, err := lc.Listen(t.Context(), "unix", sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gone := make(chan struct{})
+		go func() {
+			defer close(gone)
+			if c, err := ln.Accept(); err == nil {
+				_ = c.Close()
+			}
+			_ = ln.Close()
+		}()
+		t.Cleanup(func() {
+			_ = ln.Close()
+			<-gone
+		})
+		return gone
+	}
+	notRunning := "isshoni is not running (no server on " + sock + ")\n"
+
+	// One try: "not running", never the sudo message.
+	for args, wantCode := range map[string]int{"healthcheck": exitRuntime, "setup-url": exitUnreachable, "admin status": exitUnreachable} {
+		gone := goAway()
+		if code, stdout, stderr := runCLIEnv(t, env, strings.Fields(args)...); code != wantCode || stdout != "" || stderr != notRunning {
+			t.Errorf("isshoni %s: exit %d, stdout %q, stderr %q; want exit %d and %q", args, code, stdout, stderr, wantCode, notRunning)
+		}
+		<-gone
+	}
+
+	// With --wait the command outlives that server and gets its answer from the next one.
+	for args, want := range map[string]string{"healthcheck --wait 30s": "ok\n", "setup-url --wait 30s": "https://watch.example.com/setup#token1\n"} {
+		gone := goAway()
+		started := make(chan *fakeServer, 1)
+		go func() {
+			<-gone
+			f, err := startFakeServer(sock, false)
+			if err != nil {
+				t.Errorf("starting the fake server: %v", err)
+			}
+			started <- f
+		}()
+		start := time.Now()
+		code, stdout, stderr := runCLIEnv(t, env, strings.Fields(args)...)
+		if code != exitOK || stdout != want || strings.Contains(stderr, "Permission denied") {
+			t.Errorf("isshoni %s: exit %d, stdout %q, stderr %q; want exit 0 and %q", args, code, stdout, stderr, want)
+		}
+		if d := time.Since(start); d > 15*time.Second {
+			t.Errorf("isshoni %s took %v", args, d)
+		}
+		if f := <-started; f != nil {
+			if err := f.stop(); err != nil {
+				t.Errorf("stopping the fake server: %v", err)
+			}
+		}
+	}
+}
+
 func TestHealthcheck(t *testing.T) {
 	t.Parallel() // it waits
 	f, env := startTestServer(t, false)
@@ -415,6 +485,18 @@ func TestUsersCommands(t *testing.T) {
 	}
 	if code, stdout, stderr := runCLIEnv(t, env, "admin", "users", "reset-password", "nobody"); code != exitRuntime || stdout != "" || !strings.Contains(stderr, `no user named "nobody"`) {
 		t.Errorf("reset-password for an unknown user: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+
+	// A NAME that can't be a path element ("", "." and "..") is no user either: the same answer as for any name
+	// the server does not know, not a complaint about the socket.
+	for _, name := range []string{"", ".", ".."} {
+		for _, cmd := range [][]string{{"reset-password", name}, {"set-role", name, "admin"}, {"disable", name}, {"enable", name}} {
+			code, stdout, stderr := runCLIEnv(t, env, append([]string{"admin", "users"}, cmd...)...)
+			want := fmt.Sprintf("isshoni admin users %s: there is no user named %q\n  fix: `isshoni admin users list` shows the accounts\n", cmd[0], name)
+			if code != exitRuntime || stdout != "" || stderr != want {
+				t.Errorf("isshoni admin users %s %q: exit %d, stdout %q, stderr %q; want exit 1 and %q", cmd[0], name, code, stdout, stderr, want)
+			}
+		}
 	}
 }
 

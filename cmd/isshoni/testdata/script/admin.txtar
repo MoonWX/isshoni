@@ -33,6 +33,21 @@ stderr '^isshoni admin users set-role: there is no user named "nobody"$'
 stderr '^  fix: `isshoni admin users list` shows the accounts$'
 exitcode 2 isshoni admin users set-role sam owner
 
+# "..", "." and an empty NAME can't be sent as a path element, and no user has such a name: the answer is the same
+# as for any unknown user, not "unexpected answer from the socket".
+exitcode 1 isshoni admin users disable ..
+! stdout .
+stderr '^isshoni admin users disable: there is no user named "\.\."$'
+stderr '^  fix: `isshoni admin users list` shows the accounts$'
+! stderr 'unexpected answer'
+exitcode 1 isshoni admin users set-role . admin
+stderr '^isshoni admin users set-role: there is no user named "\."$'
+exitcode 1 isshoni admin users reset-password ''
+! stdout .
+stderr '^isshoni admin users reset-password: there is no user named ""$'
+exitcode 1 isshoni admin users enable ..
+stderr '^isshoni admin users enable: there is no user named "\.\."$'
+
 # disable and enable.
 exec isshoni admin users disable alex
 stdout '^alex can no longer sign in and is signed out everywhere\.$'

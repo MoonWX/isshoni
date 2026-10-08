@@ -42,8 +42,12 @@ type AdminHealth struct {
 // AdminSetupURLRequest is the body of POST /v1/setup-url. With WaitReadyS > 0 the server first waits up to that
 // many seconds for readiness (`isshoni setup-url --wait`); it mints the link either way.
 type AdminSetupURLRequest struct {
-	WaitReadyS int `json:"waitReadyS"`
+	WaitReadyS int `json:"waitReadyS"` // 0 to AdminMaxWaitReady, in seconds
 }
+
+// AdminMaxWaitReady bounds AdminSetupURLRequest.WaitReadyS, so that a typo can't park a request for days. The CLI
+// checks `setup-url --wait` against it.
+const AdminMaxWaitReady = time.Hour
 
 // AdminSetupURL is the answer of POST /v1/setup-url, and what `isshoni setup-url --json` prints (04 §3.3).
 type AdminSetupURL struct {
@@ -133,9 +137,6 @@ type AdminErrorResponse struct {
 
 // adminMaxJSONBytes bounds a JSON request body on the socket.
 const adminMaxJSONBytes = 64 << 10
-
-// maxWaitReady bounds AdminSetupURLRequest.WaitReadyS, so that a typo can't park a request for days.
-const maxWaitReady = time.Hour
 
 // readyPollInterval is how often a waiting setup-url looks at the readiness checks.
 const readyPollInterval = 250 * time.Millisecond
@@ -309,8 +310,8 @@ func (s *AdminServer) handleSetupURL(w http.ResponseWriter, r *http.Request) err
 		return err
 	}
 	wait := time.Duration(in.WaitReadyS) * time.Second
-	if in.WaitReadyS < 0 || wait > maxWaitReady {
-		return badRequest("waitReadyS %d: want 0 to %d", in.WaitReadyS, int(maxWaitReady/time.Second))
+	if in.WaitReadyS < 0 || wait > AdminMaxWaitReady {
+		return badRequest("waitReadyS %d: want 0 to %d", in.WaitReadyS, int(AdminMaxWaitReady/time.Second))
 	}
 	if s.accounts == nil {
 		return unavailable("this server's admin socket has no accounts")
@@ -578,7 +579,7 @@ func describe(e *api.Error, r *http.Request) (message, fix string) {
 		return "setup is already done: an admin account exists, so there is no setup link",
 			"use `isshoni admin users reset-password <name>` to get back into an admin account"
 	case api.CodeUserNotFound:
-		return fmt.Sprintf("there is no user named %q", name), "`isshoni admin users list` shows the accounts"
+		return userNotFoundText(name)
 	case api.CodeLastAdmin:
 		return fmt.Sprintf("%q is the last active admin, and the server must keep one", name),
 			"make another user an admin first: `isshoni admin users set-role <name> admin`"
@@ -604,6 +605,12 @@ func describe(e *api.Error, r *http.Request) (message, fix string) {
 	default:
 		return "", ""
 	}
+}
+
+// userNotFoundText is the message and fix of user_not_found: the server's for a name it does not know, and the
+// client's for a name that it can't send (AdminClient.userCall).
+func userNotFoundText(name string) (message, fix string) {
+	return fmt.Sprintf("there is no user named %q", name), "`isshoni admin users list` shows the accounts"
 }
 
 // newRef returns the 8-character reference that ties an internal error's answer to its log line.

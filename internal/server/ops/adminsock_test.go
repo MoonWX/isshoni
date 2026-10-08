@@ -386,8 +386,34 @@ func TestDefaultPeerRule(t *testing.T) {
 	}
 }
 
+// Without the peer check the log says what still guards the socket: its file mode, or on Windows nothing (the mode
+// means nothing there, so the message must not promise it).
+func TestNoPeerCheckWarning(t *testing.T) {
+	windows := noPeerCheckWarning("windows")
+	if !strings.Contains(windows, "every local user who can open the socket can administer this server") ||
+		strings.Contains(windows, "only guard") {
+		t.Errorf("the Windows warning: %q", windows)
+	}
+	for _, goos := range []string{"freebsd", "openbsd", "netbsd"} {
+		if got := noPeerCheckWarning(goos); !strings.Contains(got, "its file mode (0600) is the only guard") {
+			t.Errorf("the %s warning: %q", goos, got)
+		}
+	}
+	// ListenAdmin writes it exactly when this platform has no check.
+	log, logs := testLogger()
+	ln, err := ListenAdmin(t.Context(), AdminListenOptions{Path: socketPath(t), Logger: log})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	if warned := strings.Contains(logs.String(), "can't check who connects to the admin socket"); warned == peerCredSupported {
+		t.Errorf("warned = %v on a platform where the peer check is %v:\n%s", warned, peerCredSupported, logs)
+	}
+}
+
 // The filter with injected credentials: the listener serves root and its own uid, and hangs up on everyone else
-// before the first response, which the client reports as ErrAdminPermission.
+// before the first response, which the client reports as ErrAdminPermission. The client is told that it may be
+// refused (AssumeStranger): by itself it knows that this process owns the socket file.
 func TestPeerCredFilter(t *testing.T) {
 	if !peerCredSupported {
 		t.Skipf("no peer credentials on %s", runtime.GOOS)
@@ -427,7 +453,7 @@ func TestPeerCredFilter(t *testing.T) {
 				<-served
 			}()
 
-			_, err = DialAdmin(path).Health(t.Context())
+			_, err = DialAdmin(path).AssumeStranger().Health(t.Context())
 			if tt.want {
 				if err != nil {
 					t.Fatalf("an admitted peer got %v", err)
@@ -468,6 +494,7 @@ func TestPeerCredReal(t *testing.T) {
 			return len(seen) == 1 // the first connection only
 		}
 	})
+	a.client.AssumeStranger() // the rule refuses the socket's owner, which the real one never does
 	if _, err := a.client.Health(t.Context()); err != nil {
 		t.Fatalf("first call: %v", err)
 	}

@@ -29,7 +29,7 @@ func setupURLCmd() *command {
 		setup: leaf(func(fs *flag.FlagSet, o *setupURLOptions) {
 			fs.BoolVar(&o.qr, "qr", false, "print the QR code even when stdout is not a terminal")
 			fs.BoolVar(&o.noQR, "no-qr", false, "never print the QR code")
-			fs.DurationVar(&o.wait, "wait", 0, "first wait up to `DUR` for the server to be ready (Docker and manual use)")
+			fs.DurationVar(&o.wait, "wait", 0, "first wait up to `DUR`, at most 1h, for the server to be ready (Docker and manual use)")
 			fs.BoolVar(&o.json, "json", false, "print {url, expiresAt, tlsReady} as JSON")
 			o.register(fs)
 		}, runSetupURL),
@@ -49,6 +49,9 @@ func runSetupURL(ctx context.Context, inv *invocation, o setupURLOptions, _ []st
 	}
 	if o.wait < 0 {
 		return usageErrorf("--wait %s: want a duration of zero or more", o.wait)
+	}
+	if o.wait > ops.AdminMaxWaitReady { // the server's limit; it would refuse the request by its wire field
+		return usageErrorf("--wait %s: want at most %s", o.wait, shortDuration(ops.AdminMaxWaitReady))
 	}
 	c := o.admin(inv)
 	res, err := setupURLWait(ctx, inv, c, o.wait)
@@ -85,9 +88,9 @@ func runSetupURL(ctx context.Context, inv *invocation, o setupURLOptions, _ []st
 	return printLink(inv, out)
 }
 
-// setupURLWait asks for the setup link. With wait > 0 it keeps trying while no server listens yet (a container that
-// has just started), and the server itself then waits for readiness before it mints the link; both together take
-// at most wait. Without it there is one try.
+// setupURLWait asks for the setup link. With wait > 0 it keeps trying while no server answers yet (a container
+// that has just started: nothing listens, or what listens goes away again), and the server itself then waits for
+// readiness before it mints the link; both together take at most wait. Without it there is one try.
 func setupURLWait(ctx context.Context, inv *invocation, c *ops.AdminClient, wait time.Duration) (ops.AdminSetupURL, error) {
 	type result struct {
 		res ops.AdminSetupURL

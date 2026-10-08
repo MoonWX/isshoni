@@ -31,6 +31,12 @@ stdout -count=17 '^[█▀▄ ]{33}$'
 stdout -count=1 '^█{33}$'
 exitcode 2 isshoni setup-url --qr --no-qr
 
+# --wait takes at most an hour, the server's limit: a longer one is a usage error, not the server's "waitReadyS".
+exitcode 2 isshoni setup-url --wait 2h
+! stdout .
+stderr '^isshoni setup-url: --wait 2h0m0s: want at most 1h$'
+! stderr 'waitReadyS'
+
 # The certificate is not there yet: the link is printed all the same, with a note.
 fakeserver set tls pending
 exec isshoni setup-url --json
@@ -49,6 +55,15 @@ exitcode 4 isshoni setup-url --wait 1s
 fakeserver after 1s start
 exec isshoni setup-url --wait 30s
 stdout '^https://watch\.example\.com/setup#token1$'
+
+# So does a server that has bound its socket and goes away before it serves it: the connection that waited for it
+# is cut, which is "not running" for a caller the server would not refuse, and --wait keeps trying.
+fakeserver stop
+fakeserver deaf
+fakeserver after 1s start
+exec isshoni setup-url --wait 30s
+stdout '^https://watch\.example\.com/setup#token1$'
+! stderr 'Permission denied'
 
 # Once an admin exists the setup link is gone: exit 7 with the fix, nothing on stdout, and no waiting.
 fakeserver set admin yes

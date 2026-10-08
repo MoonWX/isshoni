@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -220,7 +221,17 @@ func TestAdminSetupURL(t *testing.T) {
 		t.Error("setup_unavailable took as long as the wait")
 	}
 
-	for _, bad := range []string{`{"waitReadyS": -1}`, `{"waitReadyS": 999999}`, `{"waitReadyS": "soon"}`, `{`, `{} {}`} {
+	// The longest wait is AdminMaxWaitReady, which the CLI checks --wait against.
+	if AdminMaxWaitReady != time.Hour {
+		t.Errorf("AdminMaxWaitReady = %v, want 1h", AdminMaxWaitReady)
+	}
+	_, err = a.client.SetupURL(t.Context(), AdminMaxWaitReady)
+	wantCode(t, err, api.CodeSetupUnavailable) // accepted: the answer is about the setup, not about the wait
+	_, err = a.client.SetupURL(t.Context(), AdminMaxWaitReady+time.Second)
+	if ae := adminError(t, err, api.CodeBadRequest); !strings.Contains(ae.Message, "waitReadyS 3601: want 0 to 3600") {
+		t.Errorf("a wait over the limit: message %q", ae.Message)
+	}
+	for _, bad := range []string{`{"waitReadyS": -1}`, `{"waitReadyS": 3601}`, `{"waitReadyS": 999999}`, `{"waitReadyS": "soon"}`, `{`, `{} {}`} {
 		code, _, body := a.raw(t, http.MethodPost, "/v1/setup-url", bad)
 		if code != 400 || !strings.Contains(body, `"code":"bad_request"`) || !strings.Contains(body, `"message":"`) {
 			t.Errorf("POST /v1/setup-url %s = %d %s, want 400 bad_request with a message", bad, code, body)
@@ -394,6 +405,33 @@ func TestAdminUsers(t *testing.T) {
 	}
 	wantCode(t, a.client.SetDisabled(t.Context(), "alex", true), api.CodeLastAdmin)
 	wantCode(t, a.client.SetDisabled(t.Context(), "nobody", false), api.CodeUserNotFound)
+
+	// "", "." and ".." are no path elements: the router would redirect them, and the answer would read as "this
+	// is not isshoni's socket". They are no usernames either, so the client answers user_not_found itself, with
+	// the server's words.
+	for _, name := range []string{"", ".", ".."} {
+		calls := map[string]func() error{
+			"ResetLink": func() error { _, err := a.client.ResetLink(t.Context(), name); return err },
+			"SetRole":   func() error { return a.client.SetRole(t.Context(), name, api.RoleAdmin) },
+			"disable":   func() error { return a.client.SetDisabled(t.Context(), name, true) },
+			"enable":    func() error { return a.client.SetDisabled(t.Context(), name, false) },
+		}
+		for what, call := range calls {
+			ae := adminError(t, call(), api.CodeUserNotFound)
+			if want := fmt.Sprintf("there is no user named %q", name); ae.Message != want || ae.Status != 404 ||
+				ae.Fix != "`isshoni admin users list` shows the accounts" {
+				t.Errorf("%s(%q): %+v, want %q with the fix", what, name, ae, want)
+			}
+		}
+	}
+	// It is the client's answer, so it is the same without a server. A name with dots in it is a name.
+	offline := DialAdmin(socketPath(t))
+	wantCode(t, offline.SetDisabled(t.Context(), "..", true), api.CodeUserNotFound)
+	if err := offline.SetDisabled(t.Context(), "...", true); !errors.Is(err, ErrAdminNotRunning) {
+		t.Errorf(`SetDisabled("...") without a server: %v, want ErrAdminNotRunning`, err)
+	}
+	wantCode(t, a.client.SetDisabled(t.Context(), "a..b", true), api.CodeUserNotFound) // asked: the server does not know it
+	wantCode(t, a.client.SetDisabled(t.Context(), "...", true), api.CodeUserNotFound)
 }
 
 // invite create sends only what the operator set; the server passes 0 for the rest, so 03's settings apply

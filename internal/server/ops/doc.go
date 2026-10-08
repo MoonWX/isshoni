@@ -9,9 +9,14 @@
 //     CLI. adminsock.go has ListenAdmin (the socket file, mode 0600, and the peer-credential check of every
 //     connection: peercred_linux.go, peercred_darwin.go) and AdminServer with its lifecycle; adminapi.go has the
 //     endpoints and their wire documents; adminclient.go has AdminClient (DialAdmin), which classifies "not running"
-//     and "permission denied" for the CLI and doctor. Accounts reach the socket through the AdminAccounts
-//     interface, which the wiring implements over 03's auth service. loglevel.go has LogLevel, the runtime log level
-//     behind POST /v1/log-level.
+//     and "permission denied" for the CLI and doctor (connerr*.go has the error numbers behind the two, which
+//     Windows names differently). Accounts reach the socket through the AdminAccounts interface, which the wiring
+//     implements over 03's auth service. loglevel.go has LogLevel, the runtime log level behind POST /v1/log-level.
+//
+// A known limit: only Linux and macOS check peer credentials. The experimental Windows build (06 §3) serves every
+// connection to the admin socket, and file modes don't protect the socket there, so every local user who can open
+// it can administer the server; ListenAdmin logs a warning that says so (peercred_other.go). Checking the peer's
+// process token there, or refusing every connection, is an open decision.
 //
 // The socket's whole surface is declared: /v1/backup, /v1/restore, /v1/rotate-secrets and /v1/doctor answer "not
 // implemented in this build yet" until their slices fill them in (README S60, S65), and the client already has

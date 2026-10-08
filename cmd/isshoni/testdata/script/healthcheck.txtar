@@ -47,6 +47,20 @@ fakeserver after 1s start
 exec isshoni healthcheck --wait 30s
 stdout '^ok$'
 
+# And a server that has bound its socket and goes away before it serves it (it failed in between, or it is
+# stopping). The try that waited for it is cut off: "not running", not a refusal, so --wait keeps trying.
+fakeserver stop
+fakeserver deaf
+fakeserver after 1s stop
+exitcode 1 isshoni healthcheck --wait 0
+stderr '^isshoni is not running \(no server on .*admin\.sock\)$'
+! stderr 'Permission denied'
+fakeserver deaf
+fakeserver after 1s start
+exec isshoni healthcheck --wait 30s
+stdout '^ok$'
+! stderr .
+
 # A server that shuts down is not healthy.
 fakeserver set shutting-down
 exitcode 1 isshoni healthcheck

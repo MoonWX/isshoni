@@ -10,17 +10,44 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/rogpeppe/go-internal/testscript"
+	"go.uber.org/goleak"
 )
 
 var update = flag.Bool("update", false, "rewrite the expected output in testdata/script")
 
 func TestMain(m *testing.M) {
-	testscript.Main(m, map[string]func(){"isshoni": main})
+	testscript.Main(leakCheck{m}, map[string]func(){"isshoni": scriptMain})
+}
+
+// leakCheck fails a run that passed when a goroutine outlives the tests (goleak): the CLI's signal watcher, the
+// call that setup-url --wait runs on the side, and the fake admin servers of the tests must all have stopped.
+type leakCheck struct{ m *testing.M }
+
+func (l leakCheck) Run() int {
+	code := l.m.Run()
+	if code == 0 {
+		if err := goleak.Find(); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "goleak: goroutines are still running after the tests:\n%v\n", err)
+			return 1
+		}
+	}
+	return code
+}
+
+// scriptMain is the CLI as the test scripts and serve_test.go run it: this test binary under the name isshoni. It
+// is main, except that it honors strangerEnv.
+func scriptMain() {
+	inv := &invocation{stdout: os.Stdout, stderr: os.Stderr, environ: os.Environ()}
+	if os.Getenv(strangerEnv) == "1" {
+		inv.dialAdmin = dialAsStranger
+	}
+	os.Exit(runMain(inv))
 }
 
 // TestScripts runs testdata/script/*.txtar against the real binary (this test binary, re-executed as isshoni).
@@ -92,7 +119,7 @@ func runCLI(t *testing.T, args ...string) (code int, stdout, stderr string) {
 
 // runCLIEnv is runCLI with extra environment variables (os.Environ form). ISSHONI_CONFIG defaults to an empty file
 // and ISSHONI_LISTEN_ADMIN_SOCKET to a path where nothing listens, so a test never reads the machine's config or
-// talks to a server that runs on it.
+// talks to a server that runs on it. strangerEnv=1 is the test's own switch, as in the scripts.
 func runCLIEnv(t *testing.T, environ []string, args ...string) (code int, stdout, stderr string) {
 	t.Helper()
 	return runCLITTY(t, false, environ, args...)
@@ -111,6 +138,9 @@ func runCLITTY(t *testing.T, tty bool, environ []string, args ...string) (code i
 		stderr:  &errOut,
 		environ: append([]string{"ISSHONI_CONFIG=" + empty, "ISSHONI_LISTEN_ADMIN_SOCKET=" + socketPath(t)}, environ...),
 		isTTY:   func(w io.Writer) bool { return tty && w == io.Writer(&out) },
+	}
+	if slices.Contains(environ, strangerEnv+"=1") {
+		inv.dialAdmin = dialAsStranger
 	}
 	code = run(t.Context(), inv, args)
 	return code, out.String(), errOut.String()
@@ -368,6 +398,8 @@ func TestUsageErrors(t *testing.T) {
 		{[]string{"admin", "invite", "create", "--ttl", "-24h"}, exitUsage, "isshoni admin invite create: --ttl -24h0m0s: want whole hours from 1h to 720h"},
 		{[]string{"setup-url", "--qr", "--no-qr"}, exitUsage, "isshoni setup-url: --qr and --no-qr can't be combined"},
 		{[]string{"setup-url", "--wait", "-1s"}, exitUsage, "isshoni setup-url: --wait -1s: want a duration of zero or more"},
+		{[]string{"setup-url", "--wait", "2h"}, exitUsage, "isshoni setup-url: --wait 2h0m0s: want at most 1h"},
+		{[]string{"setup-url", "--json", "--wait", "1h0m1s"}, exitUsage, "isshoni setup-url: --wait 1h0m1s: want at most 1h"},
 		{[]string{"healthcheck", "--wait", "-1s"}, exitRuntime, "isshoni healthcheck: --wait -1s: want a duration of zero or more"},
 		{[]string{"doctor", "--quality", "720p30"}, exitUsage, `isshoni doctor: --quality "720p30": want 1080p60, 1440p60 or 2160p60`},
 		{[]string{"doctor", "--preset", "game"}, exitUsage, `isshoni doctor: --preset "game": want auto or movie`},

@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"github.com/MoonWX/isshoni/internal/server/config"
+	"github.com/MoonWX/isshoni/internal/server/ops"
 )
 
 // Process exit codes (04 §3.2).
@@ -34,13 +35,19 @@ const (
 )
 
 func main() {
+	os.Exit(runMain(&invocation{stdout: os.Stdout, stderr: os.Stderr, environ: os.Environ()}))
+}
+
+// runMain runs the process's command line with inv and returns the exit code. The test scripts start the CLI
+// through it too, with an invocation of their own.
+func runMain(inv *invocation) int {
 	// SIGINT cancels ctx. Once it has, the default handling is back, so a second Ctrl-C ends the process at once.
 	// serve adds its own handling of SIGTERM and of the second signal (04 §6.4); SIGHUP comes with README S90.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	context.AfterFunc(ctx, stop)
-	code := run(ctx, &invocation{stdout: os.Stdout, stderr: os.Stderr, environ: os.Environ()}, os.Args[1:])
+	code := run(ctx, inv, os.Args[1:])
 	stop()
-	os.Exit(code)
+	return code
 }
 
 // invocation carries the process's streams and environment to the commands, so tests can run them in-process.
@@ -54,6 +61,9 @@ type invocation struct {
 	args []string
 	// isTTY says whether a stream is a terminal (a QR code, the roomier layout). nil means: look at the file.
 	isTTY func(io.Writer) bool
+	// dialAdmin returns the client for the admin socket at a path. nil means ops.DialAdmin; the tests of a refused
+	// peer pass a client that expects to be refused (ops.AdminClient.AssumeStranger).
+	dialAdmin func(path string) *ops.AdminClient
 
 	// For a command that reads the config, dispatch loads it before the command runs: cfg is always set then, and
 	// cfgErr holds its errors (the command decides: serve and config exit 78, the offline admin commands only need

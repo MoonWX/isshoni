@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,6 +31,16 @@ import (
 // peerCreds says whether this platform checks peer credentials on the admin socket (ops has them for Linux and
 // macOS); the tests of a refused peer need them.
 var peerCreds = runtime.GOOS == "linux" || runtime.GOOS == "darwin"
+
+// strangerEnv is a switch of the tests, not of isshoni: with strangerEnv=1 in its environment the CLI under test
+// talks to the admin socket as a caller that the server may refuse (dialAsStranger). A fake server that refuses
+// its peers sets it (startTestServer, "fakeserver start -reject-peers"). The CLI by itself knows better: the
+// tests run it as the user who owns the socket, whom a real server always serves, so it would take a server that
+// hangs up for one that is going away. The name is not an ISSHONI_* one: the config would warn about those.
+const strangerEnv = "TEST_ADMIN_SOCKET_STRANGER"
+
+// dialAsStranger is the invocation's dialAdmin under strangerEnv.
+func dialAsStranger(path string) *ops.AdminClient { return ops.DialAdmin(path).AssumeStranger() }
 
 // newSocketDir returns a fresh directory with a short path: t.TempDir() and testscript's work directory are too
 // long for a unix socket path on macOS (sun_path is 104 bytes).
@@ -267,7 +279,8 @@ func fakeStatus() api.ServerStatus {
 }
 
 // startTestServer starts a fakeServer for a Go test, stopped when the test ends, and returns it with the
-// environment that points the CLI at it.
+// environment that points the CLI at it. With rejectPeers the environment also makes the CLI a caller that may be
+// refused (strangerEnv).
 func startTestServer(t *testing.T, rejectPeers bool) (*fakeServer, []string) {
 	t.Helper()
 	f, err := startFakeServer(socketPath(t), rejectPeers)
@@ -279,7 +292,11 @@ func startTestServer(t *testing.T, rejectPeers bool) (*fakeServer, []string) {
 			t.Errorf("stopping the fake server: %v", err)
 		}
 	})
-	return f, []string{"ISSHONI_LISTEN_ADMIN_SOCKET=" + f.path}
+	env := []string{"ISSHONI_LISTEN_ADMIN_SOCKET=" + f.path}
+	if rejectPeers {
+		env = append(env, strangerEnv+"=1")
+	}
+	return f, env
 }
 
 // scriptFake is the fake server of one test script, driven by the script command "fakeserver".
@@ -287,7 +304,8 @@ type scriptFake struct {
 	path string // the script's listen.admin_socket
 
 	mu     sync.Mutex
-	srv    *fakeServer // nil while no server runs
+	srv    *fakeServer  // nil while no server runs
+	deaf   net.Listener // "fakeserver deaf": listens and never accepts; nil otherwise
 	timers []*time.Timer
 	later  sync.WaitGroup // the "fakeserver after" actions that are running
 	closed bool
@@ -330,11 +348,20 @@ func (sf *scriptFake) close() {
 		_ = sf.srv.stop()
 		sf.srv = nil
 	}
+	if sf.deaf != nil {
+		_ = sf.deaf.Close()
+		sf.deaf = nil
+	}
 }
 
 // cmdFakeServer is the script command "fakeserver":
 //
-//	fakeserver start [-reject-peers]     serve the admin socket at $ISSHONI_LISTEN_ADMIN_SOCKET
+//	fakeserver start [-reject-peers]     serve the admin socket at $ISSHONI_LISTEN_ADMIN_SOCKET; with -reject-peers
+//	                                     the server turns every peer away, and the script's CLI knows that it
+//	                                     may be refused (strangerEnv) until the next start or stop
+//	fakeserver deaf                      listen on the socket without ever accepting: a server that has bound
+//	                                     its socket and does not serve it. stop makes it go away, which cuts
+//	                                     the connections that wait for it; start does too, then serves
 //	fakeserver stop
 //	fakeserver set admin yes             the setup is done: alex (admin) and sam exist
 //	fakeserver set tls ready|pending     the tls readiness check
@@ -355,6 +382,9 @@ func cmdFakeServer(ts *testscript.TestScript, neg bool, args []string) {
 		}
 		d, err := time.ParseDuration(args[1])
 		ts.Check(err)
+		if slices.Contains(args, "-reject-peers") {
+			ts.Fatalf("fakeserver after … start -reject-peers: start it directly, the script's environment changes with it")
+		}
 		sf.mu.Lock()
 		defer sf.mu.Unlock()
 		sf.later.Add(1)
@@ -365,6 +395,16 @@ func cmdFakeServer(ts *testscript.TestScript, neg bool, args []string) {
 		}))
 	default:
 		ts.Check(sf.do(args, ts.Stdout()))
+		switch args[0] {
+		case "start":
+			if slices.Contains(args, "-reject-peers") {
+				ts.Setenv(strangerEnv, "1")
+			} else {
+				ts.Setenv(strangerEnv, "")
+			}
+		case "stop", "deaf":
+			ts.Setenv(strangerEnv, "")
+		}
 	}
 }
 
@@ -384,6 +424,24 @@ func (sf *scriptFake) do(args []string, stdout io.Writer) error {
 		}
 		return ""
 	}
+	switch {
+	case args[0] == "deaf":
+		if sf.srv != nil || sf.deaf != nil || len(args) != 1 {
+			return errors.New("fakeserver deaf: takes no arguments, and nothing may be running")
+		}
+		var lc net.ListenConfig
+		ln, err := lc.Listen(context.Background(), "unix", sf.path)
+		if err != nil {
+			return err
+		}
+		sf.deaf = ln
+		return nil
+	case len(args) == 1 && args[0] == "stop" && sf.deaf != nil:
+		// Closing the listener cuts the connections that wait for it, and removes the socket file.
+		ln := sf.deaf
+		sf.deaf = nil
+		return ln.Close()
+	}
 	if args[0] == "start" {
 		if sf.srv != nil {
 			return errors.New("fakeserver start: already running")
@@ -391,6 +449,10 @@ func (sf *scriptFake) do(args []string, stdout io.Writer) error {
 		reject := arg(1) == "-reject-peers"
 		if len(args) > 2 || (len(args) == 2 && !reject) {
 			return errors.New("usage: fakeserver start [-reject-peers]")
+		}
+		if sf.deaf != nil { // it goes away, and a server that answers takes its place
+			_ = sf.deaf.Close()
+			sf.deaf = nil
 		}
 		srv, err := startFakeServer(sf.path, reject)
 		if err != nil {

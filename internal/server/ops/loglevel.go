@@ -2,6 +2,7 @@ package ops
 
 import (
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 )
@@ -86,9 +87,10 @@ func (l *LogLevel) expire(gen uint64) {
 		return
 	}
 	l.timer, l.until = nil, time.Time{}
-	// Before the switch: with a base of warn or error the line would not be written after it.
+	// Before the switch: with a base of warn or error the line would not be written after it. The attribute is
+	// log_level, as in the line that set the override: "level" is the record's own severity.
 	l.log.Info("the log level set through the admin socket has run out; back to the configured level",
-		slog.String("level", l.base.String()))
+		slog.String("log_level", strings.ToLower(l.base.String())))
 	l.v.Set(l.base)
 }
 

@@ -53,8 +53,14 @@ func TestLogLevelOverride(t *testing.T) {
 		if level, until := l.Level(); level != slog.LevelWarn || !until.IsZero() {
 			t.Errorf("Level() = %v, %v after the override ran out, want warn", level, until)
 		}
-		if !strings.Contains(logs.String(), "back to the configured level") {
-			t.Errorf("no log line for the end of the override:\n%s", logs)
+		// The line names the level that is back as log_level. "level" is the record's own severity, and a second
+		// member of that name would hide it from a JSON parser that keeps the last one.
+		line := logs.String()
+		if strings.Count(line, "\n") != 1 || !strings.Contains(line, "back to the configured level") {
+			t.Fatalf("want one log line for the end of the override:\n%s", line)
+		}
+		if n := strings.Count(line, `"level":`); n != 1 || !strings.Contains(line, `"level":"INFO"`) || !strings.Contains(line, `"log_level":"warn"`) {
+			t.Errorf("the line has %d \"level\" members, want one (INFO) and log_level=warn:\n%s", n, line)
 		}
 	})
 }

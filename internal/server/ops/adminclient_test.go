@@ -121,7 +121,8 @@ func TestAdminClientUnreachable(t *testing.T) {
 }
 
 // A server that hangs up before its first answer has refused the peer (04 §12.1), whether it closes before or after
-// it read the request.
+// it read the request. That holds for a caller it can refuse. This process owns the socket file (or is root), and
+// the server always serves that caller: for it the hang-up means that the server went away.
 func TestAdminClientHangup(t *testing.T) {
 	for _, readFirst := range []bool{false, true} {
 		path := socketPath(t)
@@ -141,14 +142,95 @@ func TestAdminClientHangup(t *testing.T) {
 				_ = c.Close()
 			}
 		}()
-		c := DialAdmin(path)
+		stranger, owner := DialAdmin(path).AssumeStranger(), DialAdmin(path)
 		for range 300 { // the two sides race: every outcome of the race must classify alike
-			if _, err := c.Users(t.Context()); !errors.Is(err, ErrAdminPermission) {
-				t.Errorf("readFirst=%v: %v, want ErrAdminPermission", readFirst, err)
+			if _, err := stranger.Users(t.Context()); !errors.Is(err, ErrAdminPermission) || errors.Is(err, ErrAdminNotRunning) {
+				t.Errorf("readFirst=%v, a caller the server can refuse: %v, want ErrAdminPermission", readFirst, err)
+			}
+			_, err := owner.Users(t.Context())
+			var ue *AdminUnreachableError
+			if !errors.Is(err, ErrAdminNotRunning) || errors.Is(err, ErrAdminPermission) || !errors.As(err, &ue) || ue.Err == nil {
+				t.Errorf("readFirst=%v, the socket's owner: %v, want ErrAdminNotRunning", readFirst, err)
+			}
+			if t.Failed() {
+				break // one report is enough
 			}
 		}
 		_ = ln.Close()
 		<-done
+	}
+}
+
+// A server that binds the socket and goes away before it serves it (it failed between the two, or it is stopping):
+// the connection was made, since a unix socket queues it for the listener, and then it is cut. The socket's owner
+// was not refused, so this is "not running", and `healthcheck --wait` and `setup-url --wait` keep trying.
+func TestAdminClientListenerGoesAway(t *testing.T) {
+	for _, stranger := range []bool{false, true} {
+		want := ErrAdminNotRunning
+		if stranger {
+			want = ErrAdminPermission
+		}
+		// The listener must close while the call waits for its answer. Nothing tells the test that the call got
+		// that far, so it gives it time, and looks at the error behind the result to see whether it did: a call
+		// that came too late failed to connect.
+		cut := false
+		for attempt := 0; attempt < 50 && !cut; attempt++ {
+			path := socketPath(t)
+			ln := listenUnix(t, path) // never accepts
+			c := DialAdmin(path)
+			if stranger {
+				c.AssumeStranger()
+			}
+			result := make(chan error, 1)
+			go func() {
+				_, err := c.Health(t.Context())
+				result <- err
+			}()
+			time.Sleep(time.Duration(attempt+1) * 20 * time.Millisecond)
+			_ = ln.Close()
+			err := <-result
+			var ue *AdminUnreachableError
+			if !errors.As(err, &ue) {
+				t.Fatalf("stranger=%v: %v, want an *AdminUnreachableError", stranger, err)
+			}
+			var op *net.OpError
+			if errors.As(ue.Err, &op) && op.Op == "dial" {
+				if !errors.Is(err, ErrAdminNotRunning) {
+					t.Fatalf("stranger=%v: a dial after the listener closed: %v, want ErrAdminNotRunning", stranger, err)
+				}
+				continue
+			}
+			cut = true
+			if !errors.Is(err, want) {
+				t.Errorf("stranger=%v: %v (%v), want %v", stranger, err, ue.Err, want)
+			}
+		}
+		if !cut {
+			t.Errorf("stranger=%v: no call was cut off by the closing listener", stranger)
+		}
+	}
+}
+
+// Who can be refused (04 §12.1): not root, not the owner of the socket file, and nobody once the file is gone.
+func TestCallerMayBeRefused(t *testing.T) {
+	if !peerCredSupported {
+		if callerMayBeRefused(socketPath(t)) || callerMayBeRefused(os.TempDir()) {
+			t.Errorf("a platform without the peer check refuses nobody")
+		}
+		return
+	}
+	path := socketPath(t)
+	if callerMayBeRefused(path) {
+		t.Error("no socket file: the server is gone, nobody was refused")
+	}
+	ln := listenUnix(t, path)
+	defer func() { _ = ln.Close() }()
+	if callerMayBeRefused(path) {
+		t.Error("this process owns the socket file (or is root): the server always serves it")
+	}
+	// A file of another user: the root directory belongs to root.
+	if got, want := callerMayBeRefused("/"), os.Geteuid() != 0; got != want {
+		t.Errorf("a file owned by root, as uid %d: may be refused = %v, want %v", os.Geteuid(), got, want)
 	}
 }
 

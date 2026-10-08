@@ -9,8 +9,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/MoonWX/isshoni/internal/logx"
@@ -21,6 +21,9 @@ import (
 // same machine. The socket file is 0600 and belongs to the server's user, and every connection's peer credentials
 // are checked: only root and the server's own uid are served. Root therefore never has to touch the data files:
 // `sudo isshoni admin …` only talks to the socket, and the server process does the reads and writes.
+//
+// Linux and macOS have the check. A build for another platform serves every connection and says so in the log
+// (peercred_other.go has what that means on Windows).
 //
 // The wiring uses it in three steps, which follow the startup sequence of 04 §6.1:
 //
@@ -35,7 +38,8 @@ type AdminListenOptions struct {
 	// Path is listen.admin_socket. Its directory must exist (config.PrepareDataDir creates it).
 	Path string
 	// Allow decides whether a peer with this uid is served. nil means the rule of 04 §12.1: root and the server's
-	// own uid. Tests pass another rule.
+	// own uid. Tests pass another rule, and one that refuses the test's own uid needs a client that expects it
+	// (AdminClient.AssumeStranger).
 	Allow func(uid uint32) bool
 	// Logger gets a line for each refused connection (rate-limited). nil means slog.Default().
 	Logger *slog.Logger
@@ -84,10 +88,20 @@ func ListenAdmin(ctx context.Context, o AdminListenOptions) (net.Listener, error
 		allow = defaultPeerRule(os.Geteuid())
 	}
 	if !peerCredSupported {
-		log.Warn("this platform can't check who connects to the admin socket; its file mode (0600) is the only guard",
-			slog.String("path", o.Path))
+		log.Warn(noPeerCheckWarning(runtime.GOOS), slog.String("path", o.Path))
 	}
 	return &adminListener{UnixListener: unixLn, allow: allow, peerUID: peerUID, checked: peerCredSupported, log: log}, nil
+}
+
+// noPeerCheckWarning is what ListenAdmin logs once on a platform without the peer-credential check (goos): every
+// connection is served there. Where file modes count, the socket's 0600 still keeps other users out. On Windows it
+// does not: the socket file has the access rights of its directory, so whoever can open it is an admin.
+func noPeerCheckWarning(goos string) string {
+	if goos == "windows" {
+		return "this platform can't check who connects to the admin socket, and the socket's file mode does not " +
+			"limit it either: every local user who can open the socket can administer this server"
+	}
+	return "this platform can't check who connects to the admin socket; its file mode (0600) is the only guard"
 }
 
 // defaultPeerRule is the rule of 04 §12.1: root and the server's own uid (self; -1 on Windows, which matches no
@@ -116,7 +130,7 @@ func clearStaleSocket(ctx context.Context, path string) error {
 		return fmt.Errorf("another process is listening on the admin socket %s (another isshoni?). Stop it, or set "+
 			"listen.admin_socket to another path", path)
 	}
-	if !errors.Is(err, syscall.ECONNREFUSED) {
+	if !isConnRefused(err) {
 		return fmt.Errorf("ops: admin socket %s (listen.admin_socket) is in the way: %w", path, err)
 	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {

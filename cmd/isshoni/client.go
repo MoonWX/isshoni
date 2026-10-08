@@ -32,11 +32,14 @@ func (o clientOptions) admin(inv *invocation) *ops.AdminClient {
 	if path == "" {
 		path = inv.cfg.Listen.AdminSocket
 	}
+	if inv.dialAdmin != nil {
+		return inv.dialAdmin(path)
+	}
 	return ops.DialAdmin(path)
 }
 
 // adminFailure turns the error of an admin socket call into the command's error (04 §3.2, §12.1):
-//   - no server on the socket: its message on stderr, exit 4;
+//   - no server on the socket, or one that went away before it answered: its message on stderr, exit 4;
 //   - permission denied: "Permission denied on PATH: run it with sudo (sudo isshoni <command as typed>)", exit 4;
 //   - an error answer of the server: its message and fix; exit 7 when the server refused because a precondition is
 //     not met (setup_unavailable, last_admin, …), 1 otherwise;

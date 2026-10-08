@@ -26,11 +26,15 @@ import (
 // errors.Is.
 var (
 	// ErrAdminNotRunning: there is no socket at the path (ENOENT, also for a missing /run/isshoni), or nobody
-	// listens on it (ECONNREFUSED: a stale socket file). The CLI exits 4; doctor runs its checks offline (04 §13.1).
+	// listens on it (ECONNREFUSED: a stale socket file), or the server went away between the connect and its first
+	// answer (it is stopping, or it failed right after it bound the socket) for a caller it would have served. The
+	// CLI exits 4; doctor runs its checks offline (04 §13.1).
 	ErrAdminNotRunning = errors.New("ops: no server on the admin socket")
 	// ErrAdminPermission: the caller may not use the socket: EACCES or EPERM on the way to it (the directory is
 	// 0750, the socket 0600), or the server closed the connection before its first answer, which is what it does
-	// to a peer that is neither root nor its own user. The CLI exits 4 with the sudo message; doctor runs nothing.
+	// to a peer that is neither root nor its own user. Only such a peer gets this error for a hang-up: root and
+	// the socket's owner are never refused (callerMayBeRefused). The CLI exits 4 with the sudo message; doctor runs
+	// nothing.
 	ErrAdminPermission = errors.New("ops: permission denied on the admin socket")
 )
 
@@ -53,7 +57,8 @@ func (e *AdminUnreachableError) Error() string {
 func (e *AdminUnreachableError) Unwrap() []error { return []error{e.Kind, e.Err} }
 
 // AdminError is an error answer of the server: 03's error with the socket's English text (AdminErrorResponse).
-// It unwraps to the *api.Error, so api.IsCode(err, api.CodeSetupUnavailable) works on it.
+// It unwraps to the *api.Error, so api.IsCode(err, api.CodeSetupUnavailable) works on it. For a username that
+// can't be sent, the client writes the server's user_not_found answer itself (userCall).
 type AdminError struct {
 	Status  int       // the HTTP status; callers branch on API.Code, never on this
 	API     api.Error // Code is "" when the answer was not the socket's error document
@@ -96,6 +101,8 @@ const (
 // that is not the socket's).
 type AdminClient struct {
 	path string
+	// stranger makes every hang-up before the first answer a refusal (AssumeStranger).
+	stranger bool
 }
 
 // DialAdmin returns a client for the admin socket at path (listen.admin_socket, or the CLI's --socket). It
@@ -104,6 +111,16 @@ func DialAdmin(path string) *AdminClient { return &AdminClient{path: path} }
 
 // Path returns the socket path.
 func (c *AdminClient) Path() string { return c.path }
+
+// AssumeStranger makes c read a server that hangs up before its first answer as a refusal of its credentials
+// (ErrAdminPermission), whoever the caller is. By itself c does that only for a caller the server can refuse:
+// one who is neither root nor the owner of the socket file. It is the client's side of AdminListenOptions.Allow,
+// for tests: a test can't connect as another user, so it gives the listener a rule that refuses its own uid, and
+// tells the client that this can happen. It returns c.
+func (c *AdminClient) AssumeStranger() *AdminClient {
+	c.stranger = true
+	return c
+}
 
 // Health asks GET /v1/health: liveness. A server that is shutting down answers too (StatusShuttingDown), so check
 // the Status, not only the error.
@@ -124,8 +141,8 @@ func (c *AdminClient) Status(ctx context.Context) (api.ServerStatus, error) {
 }
 
 // SetupURL asks POST /v1/setup-url for a new setup link; the earlier ones stop working. With waitReady > 0 the
-// server first waits up to that long (rounded up to a second) for readiness. Once an admin exists the error has the
-// code setup_unavailable.
+// server first waits up to that long (rounded up to a second) for readiness; it refuses more than
+// AdminMaxWaitReady. Once an admin exists the error has the code setup_unavailable.
 func (c *AdminClient) SetupURL(ctx context.Context, waitReady time.Duration) (AdminSetupURL, error) {
 	in := AdminSetupURLRequest{WaitReadyS: int((max(waitReady, 0) + time.Second - 1) / time.Second)}
 	var out AdminSetupURL
@@ -142,12 +159,12 @@ func (c *AdminClient) Users(ctx context.Context) (AdminUsers, error) {
 // password and signs the user out everywhere. Errors: user_not_found.
 func (c *AdminClient) ResetLink(ctx context.Context, username string) (AdminLink, error) {
 	var out AdminLink
-	return out, c.call(ctx, http.MethodPost, userPath(username, "reset-link"), nil, &out)
+	return out, c.userCall(ctx, username, "reset-link", nil, &out)
 }
 
 // SetRole asks POST /v1/users/{name}/role. Errors: user_not_found, last_admin.
 func (c *AdminClient) SetRole(ctx context.Context, username string, role api.Role) error {
-	return c.call(ctx, http.MethodPost, userPath(username, "role"), AdminRoleRequest{Role: role}, nil)
+	return c.userCall(ctx, username, "role", AdminRoleRequest{Role: role}, nil)
 }
 
 // SetDisabled asks POST /v1/users/{name}/disable or /enable. Errors: user_not_found, last_admin.
@@ -156,7 +173,7 @@ func (c *AdminClient) SetDisabled(ctx context.Context, username string, disabled
 	if disabled {
 		verb = "disable"
 	}
-	return c.call(ctx, http.MethodPost, userPath(username, verb), nil, nil)
+	return c.userCall(ctx, username, verb, nil, nil)
 }
 
 // CreateInvite asks POST /v1/invites for an invite link. uses and ttl are 0 for "the server's invite setting";
@@ -231,8 +248,19 @@ func (c *AdminClient) Restore(ctx context.Context, body io.Reader, contentType s
 	return out, c.decode(res, &out)
 }
 
-func userPath(username, verb string) string {
-	return "/v1/users/" + url.PathEscape(username) + "/" + verb
+// userCall is call for POST /v1/users/{name}/verb. An empty name, "." and ".." can't be the path element: the
+// server's router cleans such a path and answers with a redirect, which would read as "that is not isshoni's
+// socket". None of the three is a username (03 §7.1), so the client gives the server's answer for a name it does
+// not know, without asking.
+func (c *AdminClient) userCall(ctx context.Context, username, verb string, in, out any) error {
+	if username == "" || username == "." || username == ".." {
+		message, fix := userNotFoundText(username)
+		return &AdminError{
+			Status: api.StatusOf(api.CodeUserNotFound), API: api.Error{Code: api.CodeUserNotFound},
+			Message: message, Fix: fix,
+		}
+	}
+	return c.call(ctx, http.MethodPost, "/v1/users/"+url.PathEscape(username)+"/"+verb, in, out)
 }
 
 // health reads a health document, which the server sends with 200 and with 503 alike.
@@ -344,8 +372,8 @@ func (c *AdminClient) exchange(ctx context.Context, method, path, contentType st
 		stop()
 		_ = conn.Close()
 		// The server hung up before its first answer when the read finds the connection closed. After a failed
-		// write any error of the connection counts: the errno of a read on a socket that broke under a write
-		// varies. An answer that is not HTTP is something else: another program listens there.
+		// write any error of the connection counts: the error number of a read on a socket that broke under a
+		// write varies. An answer that is not HTTP is something else: another program listens there.
 		var netErr *net.OpError
 		hungUp := isHangup(err) || (writeErr != nil && errors.As(err, &netErr))
 		return nil, c.exchangeError(ctx, err, hungUp)
@@ -370,11 +398,9 @@ func (w *connWriter) Write(p []byte) (int, error) {
 }
 
 // isHangup reports whether a read error says that the other side closed the connection. Which one it is depends
-// on the platform and on who was faster: a clean end, a reset, or "not connected" (macOS).
+// on the platform and on who was faster: a clean end, or one of the platform's error numbers (isConnReset).
 func isHangup(err error) bool {
-	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
-		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) ||
-		errors.Is(err, syscall.ENOTCONN) || errors.Is(err, syscall.ECONNABORTED)
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || isConnReset(err)
 }
 
 // connBody closes the connection with the response body.
@@ -395,7 +421,7 @@ func (b *connBody) Close() error {
 // dialError classifies a failed dial (04 §12.1).
 func (c *AdminClient) dialError(ctx context.Context, err error) error {
 	switch {
-	case errors.Is(err, fs.ErrNotExist), errors.Is(err, syscall.ECONNREFUSED),
+	case errors.Is(err, fs.ErrNotExist), isConnRefused(err),
 		errors.Is(err, syscall.ENOTDIR), errors.Is(err, syscall.ENOTSOCK):
 		return &AdminUnreachableError{Path: c.path, Kind: ErrAdminNotRunning, Err: err}
 	case errors.Is(err, fs.ErrPermission):
@@ -407,14 +433,19 @@ func (c *AdminClient) dialError(ctx context.Context, err error) error {
 	}
 }
 
-// exchangeError classifies an exchange that failed after the dial: a server that hangs up before its first answer
-// (hungUp) has refused the peer's credentials (04 §12.1).
+// exchangeError classifies an exchange that failed after the dial. A server that hangs up before its first answer
+// (hungUp) has refused the peer's credentials (04 §12.1), if it can have: it never refuses root or its own user.
+// For those two the hang-up has another cause: the server stopped while the connection waited for it (Shutdown
+// closes the connections that have not sent a request), or it failed between binding the socket and serving it.
+// That is "not running", and a command that waits for the server keeps waiting.
 func (c *AdminClient) exchangeError(ctx context.Context, err error, hungUp bool) error {
 	switch {
 	case ctx.Err() != nil:
 		return fmt.Errorf("ops: no answer from the server on the admin socket %s: %w", c.path, ctx.Err())
-	case hungUp:
+	case hungUp && (c.stranger || callerMayBeRefused(c.path)):
 		return &AdminUnreachableError{Path: c.path, Kind: ErrAdminPermission, Err: err}
+	case hungUp:
+		return &AdminUnreachableError{Path: c.path, Kind: ErrAdminNotRunning, Err: err}
 	default:
 		return fmt.Errorf("ops: admin socket %s: %w", c.path, err)
 	}

@@ -57,8 +57,9 @@ func runHealthcheck(ctx context.Context, inv *invocation, o healthcheckOptions, 
 			_, err := fmt.Fprintln(inv.stdout, word)
 			return err
 		}
-		// Waiting does not help against a refusal, and not after an interrupt either. The last try is at the end
-		// of the wait.
+		// Waiting does not help against a refusal, and not after an interrupt either. It does help while no server
+		// answers, also when one hung up on a caller it would serve: it is on its way down, or up. The last try is
+		// at the end of the wait.
 		left := time.Until(deadline)
 		giveUp := errors.Is(err, ops.ErrAdminPermission) || ctx.Err() != nil || left <= 0
 		if giveUp || !sleep(ctx, min(healthPollEvery, left)) {
