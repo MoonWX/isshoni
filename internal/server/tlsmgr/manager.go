@@ -33,8 +33,8 @@ type Options struct {
 	// certificate's name in ip mode, and one of the addresses the domain should resolve to in auto mode. The zero
 	// Addr means none is known; an ip-mode manager then has nothing to ask a certificate for and stays not ready.
 	PublicIP netip.Addr
-	// PublicIPv6 is the server's public IPv6 address when it has one next to PublicIP. Only auto mode's DNS check
-	// reads it.
+	// PublicIPv6 is the server's public IPv6 address when it has one next to PublicIP. Auto mode reads it where it
+	// asks whether an address is this server's: in its DNS check, and for the hint of a failed validation.
 	PublicIPv6 netip.Addr
 	Email      string // optional ACME account contact
 	CA         string // the ACME directory; "" means Let's Encrypt
@@ -129,6 +129,9 @@ type Manager struct {
 	ctx    context.Context // ends at Shutdown; set by Start
 	cancel context.CancelFunc
 	wg     sync.WaitGroup // the manager's own goroutines; Add under mu while started
+	// stopped is made by the Shutdown that stops a started manager, and closed once everything of the manager's has
+	// ended and the storage is quiet. It stays nil on a manager that never started.
+	stopped chan struct{}
 
 	acme    atomic.Pointer[acmeState]  // auto, ip: set by Start
 	dnsOnce sync.Once                  // auto: the DNS check runs before the first order only
@@ -244,33 +247,53 @@ func (m *Manager) Start(ctx context.Context) error {
 //
 // It cancels what is in flight and waits, until ctx ends, for the manager's goroutines, for certmagic's maintenance
 // loop and for certmagic to let go of the storage. After a nil return nothing writes below StorageDir any more, so
-// the directory may be replaced (a restore, 04 §12.4). Shutdown on a manager that never started, or again, does
-// nothing.
+// the directory may be replaced (a restore, 04 §12.4). When ctx ends first, the error wraps ctx's and the manager
+// goes on stopping in the background.
+//
+// The first call stops the manager; a later or concurrent one starts nothing and waits, until its own ctx ends, for
+// that same stop. So a nil return means the same from every call, and a caller whose Shutdown ran out of time may
+// call again to wait for the rest. Shutdown on a manager that never started does nothing.
 func (m *Manager) Shutdown(ctx context.Context) error {
 	m.mu.Lock()
 	if m.state != stateStarted {
 		m.state = stateStopped
+		stopped := m.stopped
 		m.mu.Unlock()
-		return nil
+		if stopped == nil {
+			return nil // never started: there is nothing to wait for
+		}
+		return awaitStop(ctx, stopped)
 	}
 	m.state = stateStopped
+	stopped := make(chan struct{})
+	m.stopped = stopped
 	cancel, st := m.cancel, m.acme.Load()
 	m.mu.Unlock()
 
 	cancel()
-	done := make(chan struct{})
 	go func() {
-		defer close(done)
+		defer close(stopped)
 		m.wg.Wait()
 		if st != nil {
 			st.cache.Stop()
 			<-st.storage.close()
 		}
 	}()
+	return awaitStop(ctx, stopped)
+}
+
+// awaitStop waits for a shutdown to complete, or for ctx. A shutdown that is complete counts even when ctx has
+// ended as well.
+func awaitStop(ctx context.Context, stopped <-chan struct{}) error {
 	select {
-	case <-done:
+	case <-stopped:
 		return nil
 	case <-ctx.Done():
+	}
+	select {
+	case <-stopped:
+		return nil
+	default:
 		return fmt.Errorf("tlsmgr: shutdown: %w", ctx.Err())
 	}
 }
@@ -590,7 +613,10 @@ func (m *Manager) onEvent(_ context.Context, event string, data map[string]any) 
 			m.log.Debug("certificate request cancelled by the shutdown", slog.String("name", m.name), logx.Err(err))
 			return nil
 		}
-		h := hintFor(err, hintEnv{name: m.name, isIP: m.opts.Mode == config.TLSIP, publicIP: m.opts.PublicIP})
+		h := hintFor(err, hintEnv{
+			name: m.name, isIP: m.opts.Mode == config.TLSIP,
+			publicIP: m.opts.PublicIP, publicIPv6: m.opts.PublicIPv6,
+		})
 		m.setError(h)
 		msg := "could not get a certificate; trying again later"
 		if renewal {

@@ -20,6 +20,7 @@ func problem(kind, detail string) error {
 func TestHintFor(t *testing.T) {
 	domain := hintEnv{name: "watch.example.com", publicIP: netip.MustParseAddr("203.0.113.7")}
 	domainNoIP := hintEnv{name: "watch.example.com"}
+	dualStack := hintEnv{name: "watch.example.com", publicIP: netip.MustParseAddr("203.0.113.7"), publicIPv6: netip.MustParseAddr("2001:db8::7")}
 	ip := hintEnv{name: "203.0.113.7", isIP: true, publicIP: netip.MustParseAddr("203.0.113.7")}
 
 	tests := []struct {
@@ -37,6 +38,17 @@ func TestHintFor(t *testing.T) {
 			CodeDNSMissing, "watch.example.com doesn't resolve. Add an A record pointing to 203.0.113.7."},
 		{"dns, own address unknown", problem("dns", "DNS problem: NXDOMAIN looking up A for watch.example.com"), domainNoIP,
 			CodeDNSMissing, "watch.example.com doesn't resolve. Add an A record pointing to this server."},
+		{"dns, a name without an address record", problem("dns", "no valid A records found for watch.example.com; no valid AAAA records found for watch.example.com"), domain,
+			CodeDNSMissing, "watch.example.com doesn't resolve. Add an A record pointing to 203.0.113.7."},
+		{"dns, no address found", problem("dns", "No valid IP addresses found for watch.example.com"), domain,
+			CodeDNSMissing, "watch.example.com doesn't resolve. Add an A record pointing to 203.0.113.7."},
+		// The record may be there: the nameserver failed, so "add an A record" would be wrong advice.
+		{"dns SERVFAIL", problem("dns", "DNS problem: SERVFAIL looking up A for watch.example.com - the domain's nameservers may be malfunctioning"), domain,
+			CodeACMEFailed, "DNS problem: SERVFAIL looking up A for watch.example.com - the domain's nameservers may be malfunctioning"},
+		{"dns timeout", problem("dns", "DNS problem: query timed out looking up A for watch.example.com"), domain,
+			CodeACMEFailed, "DNS problem: query timed out looking up A for watch.example.com"},
+		{"dns, a failed CAA lookup", problem("dns", "DNS problem: SERVFAIL looking up CAA for example.com - the domain's nameservers may be malfunctioning"), domainNoIP,
+			CodeACMEFailed, "DNS problem: SERVFAIL looking up CAA for example.com - the domain's nameservers may be malfunctioning"},
 		{"unauthorized, another address", problem("unauthorized", "198.51.100.4: Invalid response from http://watch.example.com/.well-known/acme-challenge/x: 404"), domain,
 			CodeDNSWrong, "watch.example.com points to 198.51.100.4, but this server is 203.0.113.7."},
 		{"unauthorized, another IPv6 address", problem("unauthorized", "2001:db8::4: Invalid response from http://watch.example.com/.well-known/acme-challenge/x: 404"), domain,
@@ -49,6 +61,13 @@ func TestHintFor(t *testing.T) {
 			CodeDNSWrong, "watch.example.com doesn't point to this server."},
 		{"unauthorized, but the CA reached this server", problem("unauthorized", "203.0.113.7: Invalid response from http://watch.example.com/.well-known/acme-challenge/x: 404"), domain,
 			CodeACMEFailed, "203.0.113.7: Invalid response from http://watch.example.com/.well-known/acme-challenge/x: 404"},
+		// Let's Encrypt prefers IPv6 when the domain has an AAAA record.
+		{"unauthorized, but the CA reached this server's IPv6 address", problem("unauthorized", "2001:db8::7: Invalid response from http://watch.example.com/.well-known/acme-challenge/x: 404"), dualStack,
+			CodeACMEFailed, "2001:db8::7: Invalid response from http://watch.example.com/.well-known/acme-challenge/x: 404"},
+		{"unauthorized, but the CA reached this server's IPv4 address, dual stack", problem("unauthorized", "203.0.113.7: Invalid response from http://watch.example.com/.well-known/acme-challenge/x: 404"), dualStack,
+			CodeACMEFailed, "203.0.113.7: Invalid response from http://watch.example.com/.well-known/acme-challenge/x: 404"},
+		{"unauthorized, another IPv6 address, dual stack", problem("unauthorized", "2001:db8::4: Invalid response from http://watch.example.com/.well-known/acme-challenge/x: 404"), dualStack,
+			CodeDNSWrong, "watch.example.com points to 2001:db8::4, but this server is 203.0.113.7."},
 		{"unauthorized, ip mode", problem("unauthorized", "203.0.113.7: Invalid response from http://203.0.113.7/.well-known/acme-challenge/x: 404"), ip,
 			CodeACMEFailed, "203.0.113.7: Invalid response from http://203.0.113.7/.well-known/acme-challenge/x: 404"},
 		{"rateLimited with a time", problem("rateLimited", "too many certificates (5) already issued for this exact set of identifiers in the last 168h0m0s, retry after 2026-10-09 12:30:00 UTC: see https://letsencrypt.org/docs/rate-limits/"), domain,

@@ -549,6 +549,28 @@ func TestOnEvent(t *testing.T) {
 	}
 }
 
+// TestOnEventOwnAddresses: the hint of a failed validation knows both of the server's addresses. Let's Encrypt
+// prefers IPv6 when the domain has an AAAA record, and a failure at this server's own IPv6 address is no DNS problem.
+func TestOnEventOwnAddresses(t *testing.T) {
+	m, _ := newManager(t, Options{
+		Mode: config.TLSAuto, Domain: testDomain, StorageDir: t.TempDir(),
+		PublicIP: netip.MustParseAddr("203.0.113.7"), PublicIPv6: netip.MustParseAddr("2001:db8::7"),
+	})
+	for _, tc := range []struct{ reached, code string }{
+		{"2001:db8::7", CodeACMEFailed},
+		{"203.0.113.7", CodeACMEFailed},
+		{"2001:db8::4", CodeDNSWrong},
+	} {
+		detail := tc.reached + ": Invalid response from http://watch.example.com/.well-known/acme-challenge/x: 404"
+		if err := m.onEvent(context.Background(), eventFailed, map[string]any{"error": problem("unauthorized", detail)}); err != nil {
+			t.Fatal(err)
+		}
+		if st := m.Status(); st.LastErrorCode != tc.code {
+			t.Errorf("the CA reached %s: Status.LastErrorCode = %q (%s), want %q", tc.reached, st.LastErrorCode, st.LastError, tc.code)
+		}
+	}
+}
+
 // TestLifecycle: Start and Shutdown in every order.
 func TestLifecycle(t *testing.T) {
 	t.Run("shutdown before start", func(t *testing.T) {
@@ -594,6 +616,8 @@ func TestLifecycle(t *testing.T) {
 		start(t, m)
 		// Something of the manager's that does not end by itself.
 		release := make(chan struct{})
+		letGo := sync.OnceFunc(func() { close(release) })
+		defer letGo() // also when the test fails early: the cleanup's Shutdown waits for this goroutine
 		m.mu.Lock()
 		m.wg.Go(func() { <-release })
 		m.mu.Unlock()
@@ -602,6 +626,34 @@ func TestLifecycle(t *testing.T) {
 		if err := m.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
 			t.Errorf("Shutdown = %v, want the context's error", err)
 		}
-		close(release)
+		// A second call waits for the same stop: its nil would say that the storage is quiet, and it is not yet.
+		again, cancelAgain := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancelAgain()
+		if err := m.Shutdown(again); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("second Shutdown while the first stop is still running = %v, want the context's error", err)
+		}
+		// So does one that is already waiting when the stop completes.
+		waiting := make(chan error, 1)
+		go func() { waiting <- m.Shutdown(context.Background()) }()
+		select {
+		case err := <-waiting:
+			t.Fatalf("Shutdown returned %v while a goroutine of the manager's still runs", err)
+		case <-time.After(50 * time.Millisecond):
+		}
+		letGo()
+		select {
+		case err := <-waiting:
+			if err != nil {
+				t.Errorf("the waiting Shutdown = %v, want nil once everything has ended", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("the waiting Shutdown did not return after the manager's goroutine ended")
+		}
+		// Once the stop is complete it counts, whatever the caller's context says.
+		ended, cancelEnded := context.WithCancel(context.Background())
+		cancelEnded()
+		if err := m.Shutdown(ended); err != nil {
+			t.Errorf("Shutdown after the stop completed = %v, want nil", err)
+		}
 	})
 }

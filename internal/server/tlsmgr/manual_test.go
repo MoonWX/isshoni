@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -420,8 +421,9 @@ func TestManualNameMismatchWarns(t *testing.T) {
 
 // TestManualUnreadableFile: a file the service user may not read is an error with the fix (04 §8.4).
 func TestManualUnreadableFile(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root reads every file")
+	// Root reads every file, and on Windows a file mode keeps nobody out.
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("needs a file mode that keeps the owner out")
 	}
 	now := time.Now()
 	ca := newTestCA(t, now)

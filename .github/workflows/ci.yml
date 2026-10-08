@@ -88,6 +88,7 @@ jobs:
               - 'go.sum'
               - 'tools/**'
               - 'internal/protocol/testdata/**'
+              - 'internal/server/tlsmgr/testdata/**'
               - '.golangci.yml'
               - 'tygo.yaml'
             web:
@@ -137,6 +138,8 @@ jobs:
           if [ "$go" = true ] || [ "$web" = true ]; then go_or_web=true; fi
           go_web_or_site=$go_or_web
           if [ "$site" = true ]; then go_web_or_site=true; fi
+          go_or_deploy=false
+          if [ "$go" = true ] || [ "$deploy" = true ]; then go_or_deploy=true; fi
           {
             echo "go=$go"
             echo "web=$web"
@@ -186,7 +189,9 @@ jobs:
             web/scripts/licenses.mjs web/package.json web/package-lock.json
           decide build true Taskfile.yml .tool-versions cmd/isshoni web/package.json web/package-lock.json
           decide lint-deploy "$deploy" Taskfile.yml .tool-versions
-          decide acme "$go" go.mod internal/server/tlsmgr/testdata/pebble-config.json
+          # The job's own inputs count too: Pebble's config (the go filter's tlsmgr/testdata
+          # pattern) and this workflow, which pins the two images (the deploy filter).
+          decide acme "$go_or_deploy" go.mod internal/server/tlsmgr/testdata/pebble-config.json
           decide govulncheck "$go" Taskfile.yml .tool-versions tools/go.mod
 
           task_version=''

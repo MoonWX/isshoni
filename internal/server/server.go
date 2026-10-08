@@ -255,7 +255,7 @@ func (s *Server) Start(ctx context.Context) (err error) {
 	}
 	defer func() {
 		if err != nil {
-			s.release()
+			s.release(ctx)
 			s.state = stateStopped
 			close(s.stopping)
 			close(s.done)
@@ -626,11 +626,13 @@ func (s *Server) shutdownHTTP(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// release closes what a failed Start had opened, in reverse order. Nothing serves yet at that point.
-func (s *Server) release() {
+// release closes what a failed Start had opened, in reverse order. Nothing serves yet at that point. ctx is Start's:
+// the startup it bounds may be why Start failed, so the TLS manager's shutdown gets its budget whether ctx has ended
+// or not.
+func (s *Server) release(ctx context.Context) {
 	if s.tls != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), tailShutdownBudget)
-		_ = s.tls.Shutdown(ctx)
+		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tailShutdownBudget)
+		_ = s.tls.Shutdown(stopCtx)
 		cancel()
 	}
 	if s.httpLn != nil {

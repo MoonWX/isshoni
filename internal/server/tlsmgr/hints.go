@@ -16,7 +16,7 @@ import (
 // errors (04 §8.4), which that table does not have.
 const (
 	CodeACMEUnreachable = "tls.acme_unreachable" // the CA could not connect to this server on port 80 or 443
-	CodeDNSMissing      = "tls.dns_missing"      // the domain does not resolve
+	CodeDNSMissing      = "tls.dns_missing"      // the domain has no address record
 	CodeDNSWrong        = "tls.dns_wrong"        // the domain points to another machine
 	CodeRateLimited     = "tls.rate_limited"     // the CA's rate limit
 	CodeIPRejected      = "tls.ip_rejected"      // the CA refuses the IP address
@@ -37,9 +37,24 @@ type hint struct {
 
 // hintEnv is what the fix texts name.
 type hintEnv struct {
-	name     string     // the certificate's subject: the domain, or the IP address as text
-	isIP     bool       // name is an IP address (ip mode)
-	publicIP netip.Addr // this server's public address, when one is known
+	name       string     // the certificate's subject: the domain, or the IP address as text
+	isIP       bool       // name is an IP address (ip mode)
+	publicIP   netip.Addr // this server's public address, when one is known; the fix texts name it
+	publicIPv6 netip.Addr // its public IPv6 address next to publicIP, when it has one
+}
+
+// isOwn reports whether a is one of this server's public addresses.
+func (e hintEnv) isOwn(a netip.Addr) bool {
+	if !a.IsValid() {
+		return false
+	}
+	a = a.Unmap().WithZone("")
+	for _, own := range []netip.Addr{e.publicIP, e.publicIPv6} {
+		if own.IsValid() && own.Unmap().WithZone("") == a {
+			return true
+		}
+	}
+	return false
 }
 
 // maxDetail bounds the CA's own text in a tls.acme_failed fix.
@@ -53,10 +68,14 @@ var retryAfterRE = regexp.MustCompile(`(?i)retry after (\d{4}-\d{2}-\d{2}[ T]\d{
 // answer, RFC 8555 §6.7) is mapped by the problem's type; any other error, such as a CA that can't be reached from
 // here, is tls.acme_failed with the error's text.
 //
-// Two rows of the table are about one kind of name only, so the other kind falls through to tls.acme_failed with the
-// CA's detail: "unauthorized" is tls.dns_wrong for a domain (an IP address has no DNS record to fix), and
-// "rejectedIdentifier" is tls.ip_rejected for an IP address. "unauthorized" is tls.acme_failed too when the CA says
-// it did reach this server's address: then DNS is right and something else on this machine answered.
+// Some rows of the table are narrower than their problem type, and what they leave out falls through to
+// tls.acme_failed with the CA's detail:
+//   - "dns" is tls.dns_missing for a domain without an address record (the table's "dns, NXDOMAIN"). The CA uses
+//     the type for a nameserver that fails or does not answer too (SERVFAIL, a timeout, a failed CAA lookup): the
+//     record may well be there then, and "add an A record" would be wrong advice.
+//   - "unauthorized" is tls.dns_wrong for a domain (an IP address has no DNS record to fix), unless the CA says it
+//     did reach one of this server's addresses: then DNS is right and something else on this machine answered.
+//   - "rejectedIdentifier" is tls.ip_rejected for an IP address.
 func hintFor(err error, env hintEnv) hint {
 	var p acme.Problem
 	if !errors.As(err, &p) {
@@ -73,7 +92,7 @@ func hintFor(err error, env hintEnv) hint {
 		return hint{CodeACMEUnreachable, "Let's Encrypt couldn't connect to " + env.name +
 			" on port 80 or 443. Open TCP 80 and 443 in your cloud firewall."}
 	case "dns":
-		if env.isIP {
+		if env.isIP || !saysNoRecord(p.Detail) {
 			return failed
 		}
 		if ip == "" {
@@ -82,7 +101,7 @@ func hintFor(err error, env hintEnv) hint {
 		return hint{CodeDNSMissing, env.name + " doesn't resolve. Add an A record pointing to " + ip + "."}
 	case "unauthorized":
 		other := reachedAddr(p.Detail)
-		if env.isIP || (other.IsValid() && other == env.publicIP.Unmap()) {
+		if env.isIP || env.isOwn(other) {
 			return failed
 		}
 		switch {
@@ -111,6 +130,23 @@ func hintFor(err error, env hintEnv) hint {
 	default:
 		return failed
 	}
+}
+
+// noRecordPhrases are how a "dns" problem's detail says that the name has no address record, in lower case. Let's
+// Encrypt writes "DNS problem: NXDOMAIN looking up A for …" for a name that does not exist, and "no valid A records
+// found for …; no valid AAAA records found for …" or "No valid IP addresses found for …" for one that exists
+// without an address.
+var noRecordPhrases = []string{"nxdomain", "no valid a records", "no valid ip addresses found"}
+
+// saysNoRecord reports whether a "dns" problem's detail says that the name has no address record.
+func saysNoRecord(detail string) bool {
+	detail = strings.ToLower(detail)
+	for _, phrase := range noRecordPhrases {
+		if strings.Contains(detail, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 // reachedAddr returns the address the CA connected to, which Let's Encrypt puts in front of a validation
