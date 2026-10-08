@@ -187,7 +187,7 @@ func (s *Share) attach(l *Layer) (replaced *Layer, ok bool) {
 	replaced = s.layers[l.slot]
 	s.layers[l.slot] = l
 	s.changedLocked()
-	moved := s.retargetLocked(l.kind)
+	moved, _ := s.retargetLocked(l.kind, nil)
 	s.mu.Unlock()
 	for _, sub := range moved {
 		sub.changed()
@@ -196,16 +196,25 @@ func (s *Share) attach(l *Layer) (replaced *Layer, ok bool) {
 }
 
 // detach removes l from the share if it is still the Layer of its slot. The DownTracks that wanted it fall back to
-// what 02 §10.1 gives them without it, or pause.
+// what 02 §10.1 gives them without it, or pause. For a viewer who was getting l, the stream is over at once, and
+// goes on with a keyframe of the layer it falls back to: the publisher is asked for one here (02 §9.7), not only
+// when that layer's next packet comes, which on a still screen can take a second.
 func (s *Share) detach(l *Layer) {
 	s.mu.Lock()
-	var moved []*Subscription
+	var (
+		moved []*Subscription
+		ask   []*Layer
+	)
 	if s.layers[l.slot] == l {
 		s.layers[l.slot] = nil
 		s.changedLocked()
-		moved = s.retargetLocked(l.kind)
+		moved, ask = s.retargetLocked(l.kind, l)
 	}
 	s.mu.Unlock()
+	now := monoNow()
+	for _, fallback := range ask {
+		fallback.requestKeyframe(now)
+	}
 	for _, sub := range moved {
 		sub.changed()
 	}
@@ -232,21 +241,37 @@ func (s *Share) present() uint32 {
 
 // retargetLocked has the share's DownTracks of a kind choose their layer again, after a layer of that kind came or
 // went (02 §10.1): a viewer who asked for high gets the full layer as soon as it is there, and the preview layer for
-// as long as it is the only one. It returns the subscriptions whose DownTrack changed its target; the caller tells
-// their Conns once it has released s.mu (Subscription.changed), which never blocks. s.mu is held, and each
-// DownTrack's lock is taken under it, the order of doc.go.
-func (s *Share) retargetLocked(kind webrtc.RTPCodecType) []*Subscription {
+// as long as it is the only one. gone is the Layer that went, nil when one came: what a DownTrack was forwarding of
+// it is over (a stream doesn't go on from a track that has ended), so its viewer gets nothing until the keyframe of
+// the layer it has now.
+//
+// It returns the subscriptions for which something changed; the caller tells their Conns once it has released s.mu
+// (Subscription.changed), which never blocks. After a layer went it also returns the layers to ask for a keyframe,
+// each once: those that a DownTrack now waits for and whose viewer could get it (02 §9.7, a target change). A layer
+// that came needs none: its track's first packet starts a keyframe. s.mu is held, and each DownTrack's lock is taken
+// under it, the order of doc.go.
+func (s *Share) retargetLocked(kind webrtc.RTPCodecType, gone *Layer) (moved []*Subscription, ask []*Layer) {
 	present := s.presentLocked()
-	var moved []*Subscription
 	for _, dt := range s.downTracks(kind) {
 		dt.mu.Lock()
-		_, changed := dt.retargetLocked(present)
+		over := gone != nil && dt.m.forwards(gone)
+		if over {
+			dt.m.restart()
+		}
+		slot, changed := dt.retargetLocked(present)
+		waits := dt.m.waitingForKeyframe()
 		dt.mu.Unlock()
-		if changed {
-			moved = append(moved, dt.sub)
+		if !changed && !over {
+			continue
+		}
+		moved = append(moved, dt.sub)
+		if gone != nil && waits && kind == webrtc.RTPCodecTypeVideo && dt.binding.Load().sendable() {
+			if l := s.layers[slot]; !slices.Contains(ask, l) {
+				ask = append(ask, l)
+			}
 		}
 	}
-	return moved
+	return moved, ask
 }
 
 // layer returns the Layer attached for a slot, or nil.

@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -47,20 +48,20 @@ type subPC struct {
 	// good, and the next DownTrack of the kind takes one over instead of adding a new one, so the SDP doesn't grow
 	// with every share of a long session (02 §9.3).
 	spares []*spare
-	// dtls is the PC's DTLS transport, kept from its first sender: the sender of a DownTrack that takes over a spare
-	// transceiver is made on it.
-	dtls *webrtc.DTLSTransport
 }
 
 // spare is a transceiver of a sub PC without a DownTrack: RemoveTrack took its sender and made it inactive. It can
 // carry another DownTrack once the viewer knows its m-section as inactive, which is when the viewer has answered an
-// offer made after the DownTrack left. A new DownTrack on it before that would look to the viewer like the old
-// track with another SSRC and msid, without the inactive step that makes a browser fire `track` again (02 §18).
+// offer made after the DownTrack left, with the m-section inactive. A new DownTrack on it before that would look to
+// the viewer like the old track with another SSRC and msid, without the inactive step that makes a browser fire
+// `track` again (02 §18). (02 §9.3 would also reuse a transceiver whose current direction is recvonly. On a sub PC
+// that is an m-section the viewer answered as one it sends on, which no viewer may: it is left alone.)
 type spare struct {
 	tr *webrtc.RTPTransceiver
 	// neg is the neg of the first offer made since the DownTrack left; 0 until that offer.
 	neg uint32
-	// free: the viewer answered that offer.
+	// free: the viewer's last answer to that offer, or to a later one, left the m-section inactive. That is also
+	// what Pion goes by when it looks for a transceiver to reuse (takeSpare).
 	free bool
 }
 
@@ -96,10 +97,10 @@ func (c *Conn) ensureSubPC() (*subPC, error) {
 // addTrack puts dt on the sub PC: on the free transceiver of an ended share when there is one of its kind
 // (takeSpare), else on a new sendonly transceiver (viewers never send media on the sub PC). So the m-sections of a
 // sub PC are the most subscriptions its Conn ever had at once, not all it ever had (02 §9.3). It starts the reader
-// of the viewer's RTCP for the track, which runs until the sender stops. api is the SFU's subscribe API.
-func (s *subPC) addTrack(api *webrtc.API, dt *DownTrack, log *slog.Logger) error {
+// of the viewer's RTCP for the track, which runs until the sender stops.
+func (s *subPC) addTrack(dt *DownTrack, log *slog.Logger) error {
 	dt.pc.Store(s)
-	tr, sender := s.takeSpare(api, dt, log)
+	tr, sender := s.takeSpare(dt, log)
 	if tr == nil {
 		var err error
 		tr, err = s.pc.AddTransceiverFromTrack(dt,
@@ -108,50 +109,80 @@ func (s *subPC) addTrack(api *webrtc.API, dt *DownTrack, log *slog.Logger) error
 			return err
 		}
 		sender = tr.Sender()
-		if s.dtls == nil {
-			s.dtls = sender.Transport()
-		}
 	}
 	dt.transceiver, dt.sender = tr, sender
 	s.readers.Go(func() { dt.readRTCP(sender) })
 	return nil
 }
 
-// takeSpare gives dt a free spare transceiver of its kind, with a new sender: the m-section of an ended share then
-// carries dt, sendonly again, under dt's msid and a new SSRC. It returns nil when no spare is free.
+// takeSpare gives dt a free spare transceiver of its kind: the m-section of an ended share then carries dt, sendonly
+// again, under dt's msid and a new SSRC. It returns nil when the sub PC has none to give.
 //
-// This is what Pion's AddTrack does when it reuses a transceiver, made here on the transceiver the sub PC chose:
-// AddTrack picks by Pion's own view of the last answer, and when it finds none it adds a sendrecv transceiver, which
-// a sub PC must never have. A spare that isn't as RemoveTrack left it, or that takes no sender, is given up: it
-// stays an inactive m-section.
-func (s *subPC) takeSpare(api *webrtc.API, dt *DownTrack, log *slog.Logger) (*webrtc.RTPTransceiver, *webrtc.RTPSender) {
+// The reuse is Pion's AddTrack (02 §9.3), so the new sender is the PeerConnection's own, like the sender of a new
+// transceiver: Pion binds dt to the codecs and header extensions this viewer negotiated. (A sender made with the
+// SFU's subscribe API would bind it to everything the SFU offers, whatever the viewer answered.)
+//
+// AddTrack chooses the transceiver itself: the oldest one of dt's kind that has no sender and that the last answer
+// didn't leave sending. Only when it finds none does it add a transceiver, a sendrecv one, which a sub PC must never
+// have. A free spare is one it can take (spare.free), so it is called only while there is one, and what it took is
+// checked against the sub PC's own list:
+//   - a free spare, sendonly now: the reuse.
+//   - a spare that isn't free. Pion goes by the last answer alone: it also takes a transceiver that was reused and
+//     lost its DownTrack again before the viewer answered an offer with that DownTrack in it, or one whose m-section
+//     the viewer had refused. The transceiver goes back to what it was and dt gets a new one (addTrack): rare, and it
+//     costs one m-section.
+//   - a transceiver that Pion added. That can't happen while free means what it says. If it does, the transceiver is
+//     stopped, which makes it inactive before any offer shows it, and is a spare from now on; the spares Pion didn't
+//     take aren't free.
+func (s *subPC) takeSpare(dt *DownTrack, log *slog.Logger) (*webrtc.RTPTransceiver, *webrtc.RTPSender) {
 	if s.closed {
 		return nil, nil // nothing joins a closed PC: adding a transceiver fails, and so must this
 	}
-	for i := 0; i < len(s.spares); {
-		sp := s.spares[i]
-		if !sp.free || sp.tr.Kind() != dt.kind {
-			i++
-			continue
-		}
-		s.spares = slices.Delete(s.spares, i, i+1)
-		if sp.tr.Sender() != nil || sp.tr.Direction() != webrtc.RTPTransceiverDirectionInactive {
-			log.Warn("spare sub transceiver given up: not inactive", "mid", sp.tr.Mid())
-			continue
-		}
-		sender, err := api.NewRTPSender(dt, s.dtls)
-		if err == nil {
-			if err = sp.tr.SetSender(sender, dt); err != nil {
-				// Pion left the sender on the transceiver; RemoveTrack takes it off again.
-				_ = s.pc.RemoveTrack(sender)
-			}
-		}
-		if err != nil {
-			log.Warn("spare sub transceiver given up", "mid", sp.tr.Mid(), "err", err)
-			continue
-		}
-		return sp.tr, sender
+	free := func(sp *spare) bool {
+		return sp.free && sp.tr.Kind() == dt.kind && sp.tr.Sender() == nil &&
+			sp.tr.Direction() == webrtc.RTPTransceiverDirectionInactive
 	}
+	if !slices.ContainsFunc(s.spares, free) {
+		return nil, nil
+	}
+	sender, err := s.pc.AddTrack(dt)
+	if err != nil {
+		log.Warn("spare sub transceiver not taken", "err", err)
+		return nil, nil
+	}
+	var tr *webrtc.RTPTransceiver
+	for _, t := range s.pc.GetTransceivers() {
+		if t.Sender() == sender {
+			tr = t
+			break
+		}
+	}
+	i := slices.IndexFunc(s.spares, func(sp *spare) bool { return sp.tr == tr })
+	if i >= 0 && s.spares[i].free && tr.Direction() == webrtc.RTPTransceiverDirectionSendonly {
+		s.spares = slices.Delete(s.spares, i, i+1)
+		return tr, sender
+	}
+
+	// Pion took something else: undo it.
+	if err := s.pc.RemoveTrack(sender); err != nil {
+		log.Warn("sub track not taken off the transceiver Pion chose", "err", err)
+		return nil, nil // the PC is closing: a new transceiver fails too
+	}
+	if i >= 0 {
+		log.Debug("spare sub transceiver not taken: Pion chose one that isn't free yet", "mid", tr.Mid())
+		return nil, nil
+	}
+	// RemoveTrack found the sender on a transceiver, so tr is that one, and no spare.
+	log.Error("Pion added a sub transceiver instead of reusing a free one; it stays inactive", "kind", dt.kind.String())
+	if err := tr.Stop(); err != nil {
+		log.Warn("sub transceiver not stopped", "err", err)
+	}
+	for _, sp := range s.spares {
+		if free(sp) {
+			sp.free = false
+		}
+	}
+	s.spares = append(s.spares, &spare{tr: tr})
 	return nil, nil
 }
 
@@ -178,12 +209,31 @@ func (s *subPC) sparesOffered(neg uint32) {
 	}
 }
 
-// sparesAnswered notes that the viewer answered offer neg: the spares that offer, or an earlier one, showed as
-// inactive are free.
-func (s *subPC) sparesAnswered(neg uint32) {
+// sparesAnswered notes that the viewer answered offer neg with answer: a spare which that offer, or an earlier one,
+// showed as inactive is free if the answer leaves its m-section inactive, as JSEP has it. A viewer that answers such
+// an m-section with a direction keeps the spare from being used again, until an answer of its puts that right. The
+// direction is read as Pion reads it (getPeerDirection), because Pion decides by it too.
+func (s *subPC) sparesAnswered(neg uint32, answer string) {
+	if !slices.ContainsFunc(s.spares, func(sp *spare) bool { return sp.neg != 0 && sp.neg <= neg }) {
+		return
+	}
+	desc, err := parseSDP(answer)
+	if err != nil {
+		return // Pion has just taken it, so this can't be
+	}
+	inactive := map[string]bool{}
+	for _, md := range desc.MediaDescriptions {
+		dir := direction(md.Attributes)
+		if dir == "" {
+			dir = direction(desc.Attributes)
+		}
+		if mid, ok := md.Attribute(sdp.AttrKeyMID); ok && dir == sdp.AttrKeyInactive {
+			inactive[mid] = true
+		}
+	}
 	for _, sp := range s.spares {
 		if sp.neg != 0 && sp.neg <= neg {
-			sp.free = true
+			sp.free = inactive[sp.tr.Mid()]
 		}
 	}
 }
@@ -353,7 +403,7 @@ func (c *Conn) handleAnswer(kind PCKind, gen, neg uint32, raw string) error {
 	}
 	c.flushCandidates(PCSub, gen, s.pc)
 	s.offering = false
-	s.sparesAnswered(neg)
+	s.sparesAnswered(neg, filtered)
 	if s.dirty {
 		c.offerSub(s)
 	}

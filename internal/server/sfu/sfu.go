@@ -20,6 +20,9 @@ type SFU struct {
 	// commandWait is how long a signal call waits for room in a Conn's command queue: commandWait (5 s), shorter in
 	// tests. It is set before the first Join and never changes.
 	commandWait time.Duration
+	// subEventEvery is the least time between two SubscriptionStateEvents about one subscription that the media path
+	// caused: subEventInterval (250 ms), shorter in tests. It is set before the first Join and never changes.
+	subEventEvery time.Duration
 
 	// The ticker (02 §5.4): one goroutine, started by the first Join and stopped by Close. kick wakes it at once for a
 	// share's state change, tickStop ends it and tickDone says that it has ended.
@@ -64,6 +67,7 @@ func New(cfg Config, deps Deps) (*SFU, error) {
 		apis:           a,
 		pauseUnwatched: cfg.PauseUnwatchedLayers,
 		commandWait:    commandWait,
+		subEventEvery:  subEventInterval,
 		kick:           make(chan struct{}, 1),
 		tickStop:       make(chan struct{}),
 		tickDone:       make(chan struct{}),

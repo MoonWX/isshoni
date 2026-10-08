@@ -24,8 +24,9 @@ import (
 //
 // Which layer it forwards is 02 §10.1's choice: its subscription says what it wants (setWant), and the DownTrack
 // takes the best layer for that among the ones the share has (selectSlot), again whenever the share's layers change
-// (Share.retargetLocked). Whenever what the viewer gets changes, the subscriber's Conn hears of it
-// (Subscription.changed) and tells the client (SubscriptionStateEvent).
+// (Share.retargetLocked); a stream of a layer that has ended is over, and goes on with a keyframe of the layer
+// chosen then. Whenever what the viewer gets changes, the subscriber's Conn hears of it (Subscription.changed) and
+// tells the client (SubscriptionStateEvent).
 //
 // Later slices add the rest of 02 §9.3: the RTX queue, NACKs and forwarded sender reports (README S63), the pacer,
 // REMB and receiver reports (S84).

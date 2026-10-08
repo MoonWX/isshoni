@@ -33,7 +33,9 @@ type Event interface{ isEvent() }
 
 // SubscriptionStateEvent goes to the subscriber, only when Forwarded, Audio or Reason changes: not for a request
 // alone, and not for a new subscription that forwards nothing yet without a reason (02 §10.1). A switch to another
-// layer is reported when that layer's keyframe has arrived, a pause at once.
+// layer is reported when that layer's keyframe has arrived, a pause at once. Changes that the client didn't ask for
+// (the share's layers, the stream itself) come at most once per 250 ms and subscription, with the latest state:
+// states that came and went in between are left out.
 type SubscriptionStateEvent struct {
 	Share     ShareID
 	Requested Quality // the client's latest request
