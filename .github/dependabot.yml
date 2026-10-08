@@ -41,11 +41,11 @@ updates:
     target-branch: m1/server-web # switch to main after M1
     schedule:
       interval: weekly
-    # Major updates that wait for a lint tool (slice D01; npm registry as of 2026-10-08). Each one
-    # installs only with --force or --legacy-peer-deps, which we never use. Minor and patch
-    # updates still arrive in the group below. Drop an entry when the blocking package's published
-    # peerDependencies allow the new major, then take the update and bring the version table of
-    # docs/m1/05-web-client.md §2 in line. The entries apply to /docs as well.
+    # Major updates that wait for a lint tool (Dependabot PRs #3, #7 and #8; npm registry as of
+    # 2026-10-08). Each one installs only with --force or --legacy-peer-deps, which we never use.
+    # Minor and patch updates still arrive in the group below. Drop an entry when the blocking
+    # package's published peerDependencies allow the new major, then take the update and bring the
+    # version table of docs/m1/05-web-client.md §2 in line. The entries apply to /docs as well.
     ignore:
       # ESLint 10. eslint and @eslint/js move together (@eslint/js 10 has the peer eslint ^10).
       # Blocked by eslint-plugin-jsx-a11y: its latest release, 6.10.2, declares the peer range
