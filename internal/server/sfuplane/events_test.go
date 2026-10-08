@@ -1,7 +1,6 @@
 package sfuplane
 
 import (
-	"go/ast"
 	"log/slog"
 	"reflect"
 	"slices"
@@ -219,23 +218,14 @@ func TestEvents(t *testing.T) {
 	for _, tc := range tests {
 		covered[reflect.TypeOf(tc.ev).Name()] = true
 	}
-	declared := 0
-	for _, decl := range sfuFile(t, "events.go").Decls {
-		fd, ok := decl.(*ast.FuncDecl)
-		if !ok || fd.Name.Name != "isEvent" || fd.Recv == nil || len(fd.Recv.List) != 1 {
-			continue
-		}
-		id, ok := fd.Recv.List[0].Type.(*ast.Ident)
-		if !ok {
-			t.Fatalf("the SFU's isEvent has a receiver that is not a plain type: %T", fd.Recv.List[0].Type)
-		}
-		declared++
-		if !covered[id.Name] {
-			t.Errorf("the SFU's event %s has no row: handle it in SendEvent and add it here", id.Name)
+	declared := sfuEventTypes(t)
+	for _, name := range declared {
+		if !covered[name] {
+			t.Errorf("the SFU's event %s has no row: handle it in SendEvent and add it here", name)
 		}
 	}
-	if declared != len(covered) || declared == 0 {
-		t.Errorf("the SFU declares %d event types, the table covers %d", declared, len(covered))
+	if len(declared) != len(covered) || len(declared) == 0 {
+		t.Errorf("the SFU declares the event types %v, the table covers %d", declared, len(covered))
 	}
 
 	for _, tc := range tests {

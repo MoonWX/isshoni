@@ -82,15 +82,13 @@ func checkRef(t *testing.T, e protocol.Error) string {
 // TestErrorTable maps every error code that the SFU declares from every place an error can come from: a request, a
 // PC notification, a pub offer and the four scopes of an ErrorEvent.
 func TestErrorTable(t *testing.T) {
+	// An error code is an untyped Code* constant with an sfu.* value (02 §6.3), in whichever file of the package.
 	declared := 0
-	for _, c := range sfuConsts(t, "errors.go") {
-		if !strings.HasPrefix(c.Name, "Code") {
+	for _, c := range sfuConsts(t) {
+		if c.Type != "" || !strings.HasPrefix(c.Name, "Code") || !strings.HasPrefix(c.Value, "sfu.") {
 			continue
 		}
 		declared++
-		if !strings.HasPrefix(c.Value, "sfu.") {
-			t.Errorf("%s = %q is not an sfu.* code", c.Name, c.Value)
-		}
 		if _, ok := errTable[c.Value]; !ok {
 			t.Errorf("%s (%q) has no row: add it to wireCodes and to this table", c.Name, c.Value)
 		}

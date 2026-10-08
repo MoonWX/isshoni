@@ -172,7 +172,7 @@ func TestTrackKinds(t *testing.T) {
 // TestEndReasons: the end reasons are the same strings in both packages, so the adapter converts them as they are
 // (01 §15.4). Every reason the SFU declares is one of the wire's, and the other way round.
 func TestEndReasons(t *testing.T) {
-	declared := sfuConstsOf(t, "types.go", "EndReason")
+	declared := sfuConstsOf(t, "EndReason")
 	for _, v := range declared {
 		if !protocol.EndReason(v).Valid() {
 			t.Errorf("the SFU's end reason %q is not one of the wire's", v)
@@ -203,7 +203,7 @@ func TestCodecKeys(t *testing.T) {
 		sfu.ProfileConstrainedHigh:     protocol.CodecH264ConstrainedHigh,
 		sfu.ProfileHigh:                protocol.CodecH264High,
 	}
-	declared := sfuConstsOf(t, "codec.go", "ProfileKey")
+	declared := sfuConstsOf(t, "ProfileKey")
 	if len(declared) != len(want) {
 		t.Errorf("the SFU declares the profiles %v, the table has %d", declared, len(want))
 	}
@@ -260,7 +260,7 @@ func TestStatusReasons(t *testing.T) {
 		sfu.SubReasonNoPreviewLayer:     protocol.StatusReasonUnavailable,
 		sfu.SubReasonNoLayer:            protocol.StatusReasonUnavailable,
 	}
-	declared := sfuConstsOf(t, "types.go", "SubReason")
+	declared := sfuConstsOf(t, "SubReason")
 	if len(declared) != len(want) {
 		t.Errorf("the SFU declares the reasons %q, the table has %d", declared, len(want))
 	}
@@ -386,6 +386,10 @@ func TestStats(t *testing.T) {
 			{Share: "s_d", Requested: sfu.QualityHigh, Forwarded: sfu.QualityHigh, Layer: "h", Video: sfu.DownTrackStats{Drops: math.MaxUint64}},
 			// Audio only.
 			{Share: "s_e", Requested: sfu.QualityOff, Forwarded: sfu.QualityOff, AudioRequested: true, AudioForwarded: true},
+			// Audio that is asked for but not forwarded: no entry.
+			{Share: "s_f", Requested: sfu.QualityOff, Forwarded: sfu.QualityOff, AudioRequested: true},
+			// The rid names the layer, also where the forwarded quality says otherwise.
+			{Share: "s_g", Requested: sfu.QualityHigh, Forwarded: sfu.QualityHigh, Layer: "q", Video: sfu.DownTrackStats{Bitrate: 1}},
 		},
 		DownlinkEstimate: 24_000_000,
 	}
@@ -398,6 +402,7 @@ func TestStats(t *testing.T) {
 			{ShareID: "s_b", Kind: video, Layer: protocol.VideoLayerLow, Bitrate: 290_000},
 			{ShareID: "s_d", Kind: video, Layer: protocol.VideoLayerHigh, Dropped: math.MaxInt64},
 			{ShareID: "s_e", Kind: audio},
+			{ShareID: "s_g", Kind: video, Layer: protocol.VideoLayerLow, Bitrate: 1},
 		},
 		Layers: []protocol.ServerLayerStats{
 			{ShareID: "s_mine", Kind: video, RID: "f", Bitrate: 7_400_000, LossPct: 0.1},

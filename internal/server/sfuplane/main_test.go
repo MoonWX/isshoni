@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -53,7 +54,8 @@ type call struct {
 // fakeConn stands in for an *sfu.Conn (the conn interface): it records every call, checks that each one that takes
 // a context carries the 5 s deadline, and returns what the test set.
 type fakeConn struct {
-	t *testing.T
+	t    *testing.T
+	born time.Time // when the fake was made: before every call
 
 	mu          sync.Mutex
 	calls       []call
@@ -66,13 +68,21 @@ type fakeConn struct {
 
 var _ conn = (*fakeConn)(nil)
 
-// record notes a call that takes a context, which must carry the deadline of callTimeout, and returns the error set
-// for its method.
+// wantCallTimeout is the context that every call of the SFU gets (01 §15.4). The tests have their own copy of the
+// number, so that a change of the adapter's constant fails them.
+const wantCallTimeout = 5 * time.Second
+
+// record notes a call that takes a context, which must carry the deadline of wantCallTimeout, and returns the error
+// set for its method. The context is made after the fake and before this call, so its deadline is at least born +
+// 5 s and at most now + 5 s, however slowly the test runs. A longer timeout breaks the second bound; a shorter one
+// breaks the first, as long as the fake is younger than the difference, as it is in every test here.
 func (f *fakeConn) record(ctx context.Context, method string, args ...any) error {
 	f.t.Helper()
+	now := time.Now()
 	deadline, ok := ctx.Deadline()
-	if left := time.Until(deadline); !ok || left <= 0 || left > callTimeout {
-		f.t.Errorf("%s: the context's deadline is %v away (set: %v), want within %v", method, left, ok, callTimeout)
+	if !ok || deadline.After(now.Add(wantCallTimeout)) || deadline.Before(f.born.Add(wantCallTimeout)) {
+		f.t.Errorf("%s: the context's deadline is %v away (set: %v), want %v after the call began",
+			method, deadline.Sub(now), ok, wantCallTimeout)
 	}
 	return f.note(method, args...)
 }
@@ -260,7 +270,7 @@ func newTestPlane(t *testing.T) *testPlane {
 		if tp.joinErr != nil {
 			return nil, tp.joinErr
 		}
-		fc := &fakeConn{t: t, answer: "v=0\r\n", shareParams: sfu.ShareParams{
+		fc := &fakeConn{t: t, born: time.Now(), answer: "v=0\r\n", shareParams: sfu.ShareParams{
 			Profile:      sfu.ProfileHigh,
 			Encodings:    []sfu.EncodingParams{{RID: "f", Active: true}, {RID: "q", Active: true}},
 			AudioBitrate: 128_000,
@@ -314,63 +324,109 @@ type sfuConst struct {
 	Value string
 }
 
-// sfuFile parses a file of package sfu. The mapping tables of 01 §15.4 are complete only if they cover everything
-// the SFU declares, and Go has no way to list a package's constants at run time: so the tests read the declarations
-// and fail when one has no row here.
-func sfuFile(t *testing.T, name string) *ast.File {
+// sfuFiles parses the source of package sfu, without its tests. The mapping tables of 01 §15.4 are complete only if
+// they cover everything the SFU declares, and Go has no way to list a package's constants at run time: so the tests
+// read the declarations and fail when one has no row here. They read the whole package, so that it doesn't matter
+// which of its files declares what.
+func sfuFiles(t *testing.T) []*ast.File {
 	t.Helper()
-	f, err := parser.ParseFile(token.NewFileSet(), filepath.Join("..", "sfu", name), nil, parser.SkipObjectResolution)
+	names, err := filepath.Glob(filepath.Join("..", "sfu", "*.go"))
 	if err != nil {
 		t.Fatalf("read the SFU's declarations: %v", err)
 	}
-	return f
-}
-
-// sfuConsts returns the string constants that a file of package sfu declares.
-func sfuConsts(t *testing.T, file string) []sfuConst {
-	t.Helper()
-	var out []sfuConst
-	for _, decl := range sfuFile(t, file).Decls {
-		gd, ok := decl.(*ast.GenDecl)
-		if !ok || gd.Tok != token.CONST {
+	fset := token.NewFileSet()
+	var out []*ast.File
+	for _, name := range names {
+		if strings.HasSuffix(name, "_test.go") {
 			continue
 		}
-		for _, spec := range gd.Specs {
-			vs := spec.(*ast.ValueSpec)
-			typ := ""
-			if id, ok := vs.Type.(*ast.Ident); ok {
-				typ = id.Name
+		f, err := parser.ParseFile(fset, name, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("read the SFU's declarations: %v", err)
+		}
+		if f.Name.Name == "sfu" { // not a generator or another program kept in the directory
+			out = append(out, f)
+		}
+	}
+	if len(out) == 0 {
+		t.Fatal("read the SFU's declarations: package sfu has no source files next to this package")
+	}
+	return out
+}
+
+// sfuConsts returns the string constants that package sfu declares. A constant that two files declare alike, each
+// for its own build, counts once.
+func sfuConsts(t *testing.T) []sfuConst {
+	t.Helper()
+	var out []sfuConst
+	for _, f := range sfuFiles(t) {
+		for _, decl := range f.Decls {
+			gd, ok := decl.(*ast.GenDecl)
+			if !ok || gd.Tok != token.CONST {
+				continue
 			}
-			for i, name := range vs.Names {
-				if i >= len(vs.Values) {
-					continue
+			for _, spec := range gd.Specs {
+				vs := spec.(*ast.ValueSpec)
+				typ := ""
+				if id, ok := vs.Type.(*ast.Ident); ok {
+					typ = id.Name
 				}
-				lit, ok := vs.Values[i].(*ast.BasicLit)
-				if !ok || lit.Kind != token.STRING {
-					continue
+				for i, name := range vs.Names {
+					if i >= len(vs.Values) {
+						continue
+					}
+					lit, ok := vs.Values[i].(*ast.BasicLit)
+					if !ok || lit.Kind != token.STRING {
+						continue
+					}
+					v, err := strconv.Unquote(lit.Value)
+					if err != nil {
+						t.Fatalf("the SFU's constant %s: %v", name.Name, err)
+					}
+					if c := (sfuConst{Name: name.Name, Type: typ, Value: v}); !slices.Contains(out, c) {
+						out = append(out, c)
+					}
 				}
-				v, err := strconv.Unquote(lit.Value)
-				if err != nil {
-					t.Fatalf("%s: constant %s: %v", file, name.Name, err)
-				}
-				out = append(out, sfuConst{Name: name.Name, Type: typ, Value: v})
 			}
 		}
 	}
 	return out
 }
 
-// sfuConstsOf returns the values of the constants of one type that a file of package sfu declares.
-func sfuConstsOf(t *testing.T, file, typ string) []string {
+// sfuConstsOf returns the values of the constants of one type that package sfu declares.
+func sfuConstsOf(t *testing.T, typ string) []string {
 	t.Helper()
 	var out []string
-	for _, c := range sfuConsts(t, file) {
+	for _, c := range sfuConsts(t) {
 		if c.Type == typ {
 			out = append(out, c.Value)
 		}
 	}
 	if len(out) == 0 {
-		t.Fatalf("%s declares no constant of type %s: has it moved?", file, typ)
+		t.Fatalf("package sfu declares no constant of type %s: has it been renamed?", typ)
+	}
+	return out
+}
+
+// sfuEventTypes returns the names of the types that implement sfu.Event: the receivers of the isEvent methods that
+// package sfu declares.
+func sfuEventTypes(t *testing.T) []string {
+	t.Helper()
+	var out []string
+	for _, f := range sfuFiles(t) {
+		for _, decl := range f.Decls {
+			fd, ok := decl.(*ast.FuncDecl)
+			if !ok || fd.Name.Name != "isEvent" || fd.Recv == nil || len(fd.Recv.List) != 1 {
+				continue
+			}
+			id, ok := fd.Recv.List[0].Type.(*ast.Ident)
+			if !ok {
+				t.Fatalf("the SFU's isEvent has a receiver that is not a plain type: %T", fd.Recv.List[0].Type)
+			}
+			if !slices.Contains(out, id.Name) {
+				out = append(out, id.Name)
+			}
+		}
 	}
 	return out
 }
