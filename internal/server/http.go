@@ -104,19 +104,29 @@ func (s *Server) routerOptions() httpapi.RouterOptions {
 	if spa == nil {
 		spa = web.Dist()
 	}
-	return httpapi.RouterOptions{
+	opts := httpapi.RouterOptions{
 		Site: s.site,
 		// The effective network.trusted_proxies: in off mode the server sits behind a proxy, and without it every
 		// client would be the proxy's address (04 §8.5). The router ignores it in the TLS modes.
 		TrustedProxies: s.cfg.Network.TrustedProxies,
 		DisableHSTS:    !s.cfg.TLS.HSTS,
 		SPA:            spa,
-		// SPAStatus (03's "/setup is gone after setup" hook) and Observer (ops.Metrics) come with their components.
+		SPAStatus:      s.spaStatus, // /setup is gone once setup is done (03 §12.6)
+		// Observer is ops.Metrics, which comes with the ops routes (README S85).
 		Gate:   s.gate,
 		API:    s.deps.API,
 		WS:     s.deps.WS,
 		Logger: s.log,
 	}
+	// 03's API and 01's hub, unless a test put its own handler there. A server without a site has neither (wire.go):
+	// the fields stay nil then, and the router answers JSON 404.
+	if opts.API == nil && s.api != nil {
+		opts.API = s.api
+	}
+	if opts.WS == nil && s.hub != nil {
+		opts.WS = s.hub
+	}
+	return opts
 }
 
 // newRouter builds the main router and adds this package's routes to it.

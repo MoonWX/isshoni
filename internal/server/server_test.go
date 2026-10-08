@@ -24,6 +24,7 @@ import (
 
 	"github.com/MoonWX/isshoni/internal/protocol/api"
 	"github.com/MoonWX/isshoni/internal/server"
+	"github.com/MoonWX/isshoni/internal/server/auth"
 	"github.com/MoonWX/isshoni/internal/server/config"
 	"github.com/MoonWX/isshoni/internal/server/httpapi"
 	"github.com/MoonWX/isshoni/internal/server/servertest"
@@ -38,7 +39,16 @@ const (
 	// forwardedFor is a client address as a trusted proxy on this host would forward it. In off mode with a loopback
 	// listen.http the loopback proxies are trusted by default (04 §4.4), so the server sees this as the client.
 	forwardedFor = "203.0.113.9"
+
+	// checksOK is the "checks" object of /readyz on a ready off-mode server, as loopback clients see it: the
+	// database, the hub, and the certificate, which is the proxy's in off mode (04 §6.2). The media check joins them
+	// with the SFU.
+	checksOK = `"checks":{"db":"ok","signal":"ok","tls":"ok"}`
 )
+
+// testArgon is a password hash that costs next to nothing (64 KiB, one pass) in place of the real one, which takes a
+// good part of a second under the race detector. Tests that create accounts pass it as server.Deps.Argon.
+var testArgon = auth.ArgonParams{MemoryKiB: 64, Time: 1, Threads: 1, SaltLen: 16, KeyLen: 32}
 
 // testSPA is a small built web app as Vite lays it out (05 §17).
 func testSPA() fstest.MapFS {
@@ -143,12 +153,15 @@ func logRecords(t *testing.T, logs string) []map[string]any {
 }
 
 // TestStartIsReadyWithinASecond is the boot check of 04 §17: tls.mode = off, ephemeral ports, ready in under 1 s.
-// The best of three starts counts, so a busy CI machine doesn't fail it; a normal start takes a few milliseconds.
+// The best of three starts counts, so a busy CI machine doesn't fail it; a normal start takes some tens of
+// milliseconds: a new database with its schema, the keys, the listeners. The password hash that the account service
+// computes at its start has the tests' cost here: at the real cost it takes 25 ms in the shipped binary and most of
+// the second under the race detector.
 func TestStartIsReadyWithinASecond(t *testing.T) {
 	var took []time.Duration
 	for range 3 {
 		begin := time.Now()
-		srv := servertest.Start(t, servertest.Options{})
+		srv := servertest.Start(t, servertest.Options{Deps: server.Deps{Argon: testArgon}})
 		d := time.Since(begin)
 		took = append(took, d)
 
@@ -197,7 +210,7 @@ func TestHealthEndpoints(t *testing.T) {
 
 	t.Run("loopback clients see the checks", func(t *testing.T) {
 		// No X-Forwarded-For: the client is the TCP peer, 127.0.0.1. Off mode's tls check always passes (04 §6.2).
-		wantJSON(t, "/readyz", get(t, srv, "/readyz"), 200, `{"status":"ready","checks":{"tls":"ok"}}`+"\n")
+		wantJSON(t, "/readyz", get(t, srv, "/readyz"), 200, `{"status":"ready",`+checksOK+`}`+"\n")
 		wantJSON(t, "/healthz", get(t, srv, "/healthz"), 200, `{"status":"ok"}`+"\n")
 	})
 
@@ -262,7 +275,7 @@ func TestHealthEndpoints(t *testing.T) {
 		wantJSON(t, "public /readyz", get(t, srv, "/readyz", "X-Forwarded-For", forwardedFor), 503,
 			`{"status":"not_ready"}`+"\n")
 		wantJSON(t, "loopback /readyz", get(t, srv, "/readyz"), 503,
-			`{"status":"not_ready","checks":{"media":"waiting: no UDP socket is bound","tls":"ok"}}`+"\n")
+			`{"status":"not_ready","checks":{"db":"ok","media":"waiting: no UDP socket is bound","signal":"ok","tls":"ok"}}`+"\n")
 		// Liveness doesn't depend on the checks.
 		wantJSON(t, "/healthz", get(t, srv, "/healthz"), 200, `{"status":"ok"}`+"\n")
 
@@ -281,11 +294,12 @@ func TestReadyzNoDetailThroughUntrustedProxy(t *testing.T) {
 	wantJSON(t, "/readyz through the proxy", get(t, srv, "/readyz", "X-Forwarded-For", forwardedFor), 200,
 		`{"status":"ready"}`+"\n")
 	// The operator's own request, straight to the port, gets the checks as ever.
-	wantJSON(t, "/readyz from this machine", get(t, srv, "/readyz"), 200, `{"status":"ready","checks":{"tls":"ok"}}`+"\n")
+	wantJSON(t, "/readyz from this machine", get(t, srv, "/readyz"), 200, `{"status":"ready",`+checksOK+`}`+"\n")
 }
 
-// TestGracefulShutdown walks 04 §6.4 as far as this build goes: readiness and liveness off, the gate's 503 for
-// everything else while the listeners still accept, then the HTTP server stops and Run returns.
+// TestGracefulShutdown walks 04 §6.4 on the HTTP side: readiness and liveness off, the gate's 503 for everything
+// else while the listeners still accept, then the HTTP server stops and Run returns. TestHubShutdown has the hub's
+// step, with a connection that is told to come back.
 func TestGracefulShutdown(t *testing.T) {
 	srv := servertest.Start(t, servertest.Options{Deps: server.Deps{SPA: testSPA()}})
 	if res := get(t, srv, "/"); res.status != 200 {
@@ -309,7 +323,8 @@ func TestGracefulShutdown(t *testing.T) {
 	// Step 1: both health endpoints answer 503 shutting_down, without the Host check or the gate in their way.
 	wantJSON(t, "/readyz", get(t, srv, "/readyz", "X-Forwarded-For", forwardedFor), 503, `{"status":"shutting_down"}`+"\n")
 	wantJSON(t, "/healthz", get(t, srv, "/healthz", "X-Forwarded-For", forwardedFor), 503, `{"status":"shutting_down"}`+"\n")
-	wantJSON(t, "loopback /readyz", get(t, srv, "/readyz"), 503, `{"status":"shutting_down","checks":{"tls":"ok"}}`+"\n")
+	// The hub's turn is step 3, after this window: its check still passes.
+	wantJSON(t, "loopback /readyz", get(t, srv, "/readyz"), 503, `{"status":"shutting_down",`+checksOK+`}`+"\n")
 
 	// Step 2: every other request gets 503 server_shutdown with Retry-After: 5 (04 §9.3 step 5).
 	for _, path := range []string{"/", "/r/lounge", "/" + appJS, "/api/v1/info", "/ws"} {
@@ -969,8 +984,9 @@ func TestSPA(t *testing.T) {
 	})
 
 	t.Run("reserved paths", func(t *testing.T) {
-		// Until the wiring mounts 03's API and 01's hub, their paths answer JSON 404, never index.html.
-		for _, path := range []string{"/api/v1/info", "/api/v2/x", "/api", "/ws"} {
+		// A path of the server's that no route handles answers JSON 404, never index.html: 03's API for what is
+		// under /api/v1/, the router for the rest of /api.
+		for _, path := range []string{"/api/v1/nothing", "/api/v2/x", "/api", "/api/"} {
 			res := get(t, srv, path)
 			if res.status != 404 || errorCode(res.body) != api.CodeNotFound {
 				t.Errorf("GET %s = %d %q, want 404 not_found", path, res.status, res.body)
@@ -978,6 +994,10 @@ func TestSPA(t *testing.T) {
 			if got := res.header.Get("Cache-Control"); got != "no-store" {
 				t.Errorf("GET %s: Cache-Control = %q, want no-store", path, got)
 			}
+		}
+		// /ws is the hub's: a GET that is no WebSocket upgrade gets its refusal, not the web app.
+		if res := get(t, srv, "/ws"); res.status != http.StatusUpgradeRequired || strings.Contains(res.body, "<html") {
+			t.Errorf("GET /ws without an upgrade = %d %q, want 426", res.status, res.body)
 		}
 	})
 }
@@ -1359,7 +1379,7 @@ func TestRunningServerLimits(t *testing.T) {
 	}
 }
 
-// TestStubHandlers: Deps.API and Deps.WS are mounted where the wiring will mount 03's API and 01's hub.
+// TestStubHandlers: Deps.API and Deps.WS are mounted in place of 03's API and 01's hub.
 func TestStubHandlers(t *testing.T) {
 	stub := func(name string) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1380,14 +1400,16 @@ func TestStubHandlers(t *testing.T) {
 	}
 }
 
-// TestDataDirectory: a first start creates the data directory, its lock file and secrets.json, all private
-// (04 §5.1, §5.2).
+// TestDataDirectory: a first start creates the data directory, its lock file, secrets.json and the database, all
+// private (04 §5.1, §5.2).
 func TestDataDirectory(t *testing.T) {
 	srv := servertest.Start(t, servertest.Options{})
 	for name, want := range map[string]fs.FileMode{
 		"":             0o700 | fs.ModeDir,
 		"isshoni.lock": 0o600,
 		"secrets.json": 0o600,
+		"isshoni.db":   0o600,
+		"backups":      0o700 | fs.ModeDir,
 	} {
 		fi, err := os.Stat(filepath.Join(srv.DataDir, name))
 		if err != nil {
@@ -1398,9 +1420,9 @@ func TestDataDirectory(t *testing.T) {
 			t.Errorf("%q has mode %v, want %v", name, got, want)
 		}
 	}
-	// The admin socket's directory exists for the socket that the admin API will open there.
-	if fi, err := os.Stat(filepath.Dir(srv.AdminSocket)); err != nil || !fi.IsDir() {
-		t.Errorf("the admin socket's directory: %v", err)
+	// The admin socket is there, for the server's user alone (04 §12.1).
+	if fi, err := os.Stat(srv.AdminSocket); err != nil || fi.Mode()&fs.ModeSocket == 0 || fi.Mode().Perm() != 0o600 {
+		t.Errorf("the admin socket: %v, %v", fi, err)
 	}
 	// While the server runs, it holds the data-directory lock.
 	if _, err := config.LockDataDir(context.Background(), srv.Cfg.Paths()); !errors.Is(err, config.ErrDataDirLocked) {
@@ -1437,6 +1459,7 @@ func testDeps() server.Deps {
 	return server.Deps{
 		InProcess: true,
 		Host:      config.Host{Environ: append(os.Environ(), config.EnvAllowEphemeralData+"=1")},
+		Argon:     testArgon,
 	}
 }
 
