@@ -5,6 +5,8 @@ import (
 	"go/parser"
 	"go/token"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -98,6 +100,79 @@ func TestEmbeddedStructsExtend(t *testing.T) {
 				t.Errorf("%v embeds %v without the tag tstype:\",extends\"", typ, sf.Type)
 			}
 		}
+	}
+}
+
+// holdsAny reports whether a field's type expression has a Go any (or interface{}) in it: any, map[string]any,
+// []any, ... It does not look into a nested struct type, whose fields are fields of their own.
+func holdsAny(expr ast.Expr) bool {
+	found := false
+	ast.Inspect(expr, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.StructType:
+			return false
+		case *ast.Ident:
+			found = found || x.Name == "any"
+		case *ast.InterfaceType:
+			found = found || x.Methods == nil || len(x.Methods.List) == 0
+		}
+		return !found
+	})
+	return found
+}
+
+// TestNoTSAny: tygo v0.2.21 turns a Go any into a TypeScript any, which switches type checking off for everything
+// the value touches. So every struct field whose type has an any in it carries a tstype tag that names a checked
+// type instead: unknown (the Go-only registry Spec), or an index signature of unknown values (Params). tygo reads
+// the tag's value up to its first comma as the type and the rest as options, so the type itself has no comma
+// (Record<string, unknown> would be cut at it).
+func TestNoTSAny(t *testing.T) {
+	anyWord := regexp.MustCompile(`\bany\b`)
+	options := []string{"required", "readonly"}
+	checked := 0
+	for _, f := range parsePackage(t) {
+		typeName := "" // the enclosing type declaration, for the messages
+		ast.Inspect(f, func(n ast.Node) bool {
+			if ts, ok := n.(*ast.TypeSpec); ok {
+				typeName = ts.Name.Name
+			}
+			st, ok := n.(*ast.StructType)
+			if !ok {
+				return true
+			}
+			for _, field := range st.Fields.List {
+				if !holdsAny(field.Type) {
+					continue
+				}
+				checked++
+				name := typeName + ".(embedded)"
+				if len(field.Names) > 0 {
+					name = typeName + "." + field.Names[0].Name
+				}
+				tag := ""
+				if field.Tag != nil {
+					raw, _ := strconv.Unquote(field.Tag.Value)
+					tag = reflect.StructTag(raw).Get("tstype")
+				}
+				tsType, opts, _ := strings.Cut(tag, ",")
+				switch {
+				case tsType == "":
+					t.Errorf("%s holds an any and has no tstype tag: tygo would emit a TypeScript any", name)
+				case anyWord.MatchString(tsType):
+					t.Errorf("%s has the tstype %q, which is still any", name, tsType)
+				}
+				for _, o := range strings.Split(opts, ",") {
+					if o != "" && !slices.Contains(options, o) {
+						t.Errorf("%s: tstype %q has a comma in its type; tygo reads %q as an option", name, tag, o)
+					}
+				}
+			}
+			return true
+		})
+	}
+	// Spec.Payload, Spec.Result and Error.Params at least.
+	if checked < 3 {
+		t.Errorf("found %d fields holding an any, want at least 3: the check no longer sees them", checked)
 	}
 }
 

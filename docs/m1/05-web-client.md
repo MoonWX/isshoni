@@ -156,10 +156,12 @@ web/
 ├─ dist/.gitkeep             committed (06 §7.2); everything else in dist/ is build output
 ├─ e2e/                      Playwright (§19.3): global-setup.ts · fixtures.ts · stats.ts · tone.html · *.spec.ts
 └─ src/
-   ├─ main.tsx               boot sequence (§4)
-   ├─ app/                   router.tsx · layouts/ · guards.tsx · prefs.ts · screens/ (Offline, Unsupported, NeedsHttps,
-   │                         NotSetUp, VersionMismatch, Fatal) · ErrorBoundary.tsx · Announcer.tsx · Toasts.tsx ·
-   │                         UpdatePill.tsx
+   ├─ main.tsx               entry: calls startApp() of app/boot.tsx (§4)
+   ├─ app/                   boot.tsx (boot sequence, §4) · router.tsx · layouts/ · guards.tsx · me.ts (the ['me']
+   │                         query) · session.ts (logout BroadcastChannel) · info.ts (the ['info'] query) ·
+   │                         queryClient.ts · context.ts · uiStore.ts · prefs.ts · App.tsx · NotFound.tsx · screens/
+   │                         (Offline, Unsupported, NeedsHttps, NotSetUp, VersionMismatch, Fatal) · ErrorBoundary.tsx ·
+   │                         Announcer.tsx · Toasts.tsx · UpdatePill.tsx
    ├─ platform/              types.ts · detect.ts · browser/ (BrowserPlatform.ts, device.ts, storage.ts, pwa.ts,
    │                         push.ts, wakeLock.ts, displayMedia.ts, classify.ts, fakeDisplay.ts)
    ├─ protocol/              types.gen.ts · registry.gen.ts · api.gen.ts (tygo: 01's protocol; 03's and 04's REST DTOs) · signal-client.ts ·
@@ -172,7 +174,8 @@ web/
    ├─ share/                 BrowserSharing.ts (SharingProvider) · PublisherPC.ts · presets.ts · encodings.ts ·
    │                         codecPrefs.ts · shareStore.ts · ShareButton.tsx · ShareSheet.tsx · ScreenAudioWarning.tsx ·
    │                         SharePanel.tsx · LevelMeter.tsx · hints.ts
-   ├─ auth/                  LoginPage · InvitePage · SignupPage · PendingPage · ResetPage · fragmentToken.ts · useMe.ts
+   ├─ auth/                  LoginPage · InvitePage · SignupPage · PendingPage · ResetPage · AboutPage ·
+   │                         fragmentToken.ts · useMe.ts
    ├─ setup/                 SetupPage (step 1) · WelcomePage (steps 2–3) · InviteLinkCard · QrCode
    ├─ conntest/              probe.ts · runConnTest.ts · verdict.ts · fixText.ts · ConnTestPanel.tsx
    ├─ account/               AccountPage · DevicesPage · NotificationsPage · PushCard · InstallCard
@@ -189,7 +192,9 @@ web/
    └─ types/                 dom-extras.d.ts · globals.d.ts
 ```
 
-Components have a sibling `*.module.css` file (`Tile.tsx` + `Tile.module.css`); the tree above leaves them out.
+Components have a sibling `*.module.css` file (`Tile.tsx` + `Tile.module.css`); the tree above leaves them out. It
+also leaves out the entry module of each page folder: `rooms`, `auth`, `setup`, `account`, `admin` and `download`
+each have an `index.ts` that exports the folder's pages by name, which is how `router.tsx` finds them (§5).
 
 **Layering rule.** React components never touch `WebSocket` or `RTCPeerConnection`. Controllers (`RoomSession`,
 `SubscriberPC`, `PublisherPC`, `runConnTest`) and 01's `SignalClient` never import React. They talk through Zustand
@@ -214,20 +219,29 @@ checks the minimum the SPA needs: `window.RTCPeerConnection`, `RTCRtpTransceiver
 `#root` and sets `window.__ISSHONI_UNSUPPORTED__ = true`; `main.tsx` then does nothing. This catches old iOS versions
 that would otherwise show a blank page.
 
-`main.tsx`:
-0. If the path is `/setup`, `/invite` or `/reset` and `location.hash` is non-empty, `fragmentToken.ts` stores it in
-   `sessionStorage['isshoni.<setup|invite|reset>']` and calls `history.replaceState` to drop the fragment. This runs
-   before any request, including `/info`. The pages read the token from `sessionStorage` (§14.1, §15.1).
+`main.tsx` only finds `#root` and calls `startApp(container)`. The sequence itself is `startApp` in `app/boot.tsx`
+(S27), so the tests run it with a fake platform, location, history and router (`BootOptions`):
+0. If the path is `/setup`, `/invite` or `/reset` and `location.hash` is non-empty, `stashFragmentToken()` (in
+   `app/boot.tsx`) stores the fragment, percent-decoded, in `sessionStorage['isshoni.<setup|invite|reset>']` (the key
+   is `fragmentTokenKey(kind)`) and calls `history.replaceState` to drop the fragment. This runs before any request,
+   including `/info`. It writes through `platform.storage.session` (§8), so in the code it runs right after step 2:
+   the store's memory fallback must be the one the pages read later, and `detectPlatform()` makes no request. The
+   pages take the token from there through `auth/fragmentToken.ts`, which reads and clears it (§14.1, §15.1).
 1. If `!window.isSecureContext` → **NeedsHttps** screen ("isshoni needs HTTPS. Ask your admin to check the TLS
-   setup"). getDisplayMedia, the service worker, push and wake lock all need a secure context.
+   setup"). getDisplayMedia, the service worker, push and wake lock all need a secure context. Without
+   `RTCPeerConnection` → **Unsupported** (`boot-check.js` normally catches that first). Both screens need the
+   platform and i18n, so the code runs steps 2, 0 and 3 before this check; none of them makes a request.
 2. `platform = detectPlatform()` (§8).
 3. Initialize i18next with `en.json` (bundled, synchronous) and set `<html lang>`.
 4. `GET /api/v1/info` (03 §12.4.1; no auth; retried 3× after 1 s, 2 s, 4 s):
-   - network failure → **Offline** screen, auto-retry on the `online` event and every 10 s;
+   - no response, a 5xx, `server_busy` or `rate_limited` every time → **Offline** screen, auto-retry on the `online`
+     event and every 10 s;
+   - any other failure (a 4xx, or a body that isn't `Info`) → **Fatal**;
    - `setupRequired: true` and the path is not `/setup` → **NotSetUp** screen ("This server isn't set up yet. On the
      server run `sudo isshoni setup-url` (Docker: `docker compose exec isshoni isshoni setup-url`) and open the link
      it prints").
-5. Create the `QueryClient` (seeded with `info`) and the router; render.
+5. Create the `QueryClient` (seeded with `info`: `seedInfo` in `app/info.ts`; pages read it with `useInfo()`) and the
+   router; render. Boot also starts the cross-tab logout listener (`listenForLogout`, §6.2).
 6. After first render and only in production builds: register the service worker (§16.2) when the browser is idle.
 
 App-level screens (`src/app/screens/`): Offline, Unsupported (no WebRTC), NeedsHttps, NotSetUp, VersionMismatch
@@ -240,8 +254,8 @@ invite, login and room pages show it above their content.
 
 ## 5. Routes
 
-React Router data router; every page except the room is a lazy chunk. `RequireAuth` loads `useMe()` and redirects to
-`/login?next=<path>` on a 401 `unauthenticated` (§6.2). `RequireAdmin` also needs `me.user.role === "admin"` (else
+React Router data router; every page except the room is a lazy chunk. `RequireAuth` loads the `['me']` query and
+redirects to `/login?next=<path>` on a 401 `unauthenticated` (§6.2). `RequireAdmin` also needs `me.user.role === "admin"` (else
 NotFound, so admin pages aren't advertised). `RequireInviter` allows admins and users with
 `me.permissions.createInvites`, else NotFound; only `/admin/invites` uses it. `next` is accepted only if it starts with `/` and not `//` (open-redirect guard). No route segment
 contains a dot (04 §9.5 serves dotted paths as files).
@@ -257,8 +271,8 @@ contains a dot (04 §9.5 serves dotted paths as files).
 | `/reset` | ResetPage | public | auth | `/reset#<token>` (admin-issued reset links, 03 §7.10) |
 | `/setup` | SetupPage | public + token | setup | `/setup#<token>`, step 1 only. The server answers 404 once an admin exists (§14) |
 | `/admin/welcome` | WelcomePage | admin | setup | Wizard steps 2–3, re-enterable (§14) |
-| `/download` | DownloadPage | public | misc | M1 placeholder; per-OS installers are *later (M2)* |
-| `/about` | AboutPage | public | misc | Versions, trust model, links to the project site's privacy and code-signing pages, `/licenses.txt` |
+| `/download` | DownloadPage | public | download | M1 placeholder; per-OS installers are *later (M2)* |
+| `/about` | AboutPage | public | auth | Versions, trust model, links to the project site's privacy and code-signing pages, `/licenses.txt`. It loads from `auth/` (W3 writes it with the login page's trust-model lines); there is no `misc` chunk |
 | `/account` | AccountPage | user | account | Username, change password, delete account, sign out |
 | `/account/devices` | DevicesPage | user | account | Browser sessions and (from M2) linked devices, revoke |
 | `/account/notifications` | NotificationsPage | user | account | Web Push on this device, preferences, test |
@@ -275,6 +289,32 @@ contains a dot (04 §9.5 serves dotted paths as files).
 
 The server serves `index.html` for every path without a dot (04 §9.5), so it needs no route list; `/setup` is its only
 special case. Room IDs are opaque strings from the API.
+
+**Page folders (S27's contract with the page slices).** `app/router.tsx` declares every route above once, and no
+page slice edits it. Each route names one page component and the folder it comes from (`route.handle` is
+`{folder, page}`):
+
+| Folder | Named exports of `<folder>/index.ts` | Chunk |
+|---|---|---|
+| `rooms/` | `RootRedirect`, `RoomPage` | main (eager) |
+| `auth/` | `LoginPage`, `InvitePage`, `SignupPage`, `PendingPage`, `ResetPage`, `AboutPage` | `auth` |
+| `setup/` | `SetupPage`, `WelcomePage` | `setup` |
+| `account/` | `AccountPage`, `DevicesPage`, `NotificationsPage` | `account` |
+| `admin/` | `AdminLayout` (the layout route around the admin pages), `DashboardPage`, `UsersPage`, `ApprovalsPage`, `InvitesPage`, `RoomsPage`, `SettingsPage`, `AuditPage`, `DoctorPage` | `admin` |
+| `download/` | `DownloadPage` | `download` |
+
+- A page folder's entry module is `<folder>/index.ts` (or `index.tsx`), and it exports the folder's pages as **named**
+  exports with exactly these names. The router picks a page by its export name and reads no default export.
+- The router finds the entry modules with `import.meta.glob` (`../auth/index.{ts,tsx}` and so on): the lazy folders
+  as loaders, so each is one chunk fetched on the first visit to one of its routes, and `rooms/` with
+  `{eager: true}`, so the room is in the main chunk.
+- A folder that doesn't exist yet, or an export that is missing, renders `PageUnavailable` (a missing `AdminLayout`
+  renders just its child page). A page slice adds its folder's `index.ts` and exports, and its routes start working
+  with no change to `router.tsx`.
+- The guards are layout routes in `app/guards.tsx` (`RequireAuth`, `RequireAdmin`, `RequireInviter`, with `safeNext`
+  for the `next` rule and `loginPath`), placed around the routes in `router.tsx`, so a page doesn't guard itself. They
+  read the `['me']` query of `app/me.ts` (§6.2). The public routes sit outside every guard: the router asks for
+  `/api/v1/me` only on guarded routes, and a public page that needs to know reads `['me']` itself.
 
 ---
 
@@ -315,6 +355,18 @@ read it through `useShareMedia(shareId)`.
   mode, which public pages use). Other 401 codes
   (`invalid_credentials`) are ordinary form errors. A `BroadcastChannel('isshoni')` message `{type: 'logout'}` clears
   `['me']` in the user's other tabs, with the same redirect rule.
+- The guards, the `['me']` query and the logout channel live in `app/`, not in `auth/` (S27; the page slices use
+  them):
+  - `app/me.ts`: `fetchMe`, `meQueryOptions`, `useMeQuery` and `clearMe`. The query **resolves to `null`** when
+    `GET /api/v1/me` answers 401 `unauthenticated` (M2: `invalid_token`), so "signed out" is data, not an error. The
+    guards (`app/guards.tsx`, §5) redirect on `null`; a public page reads the same query and shows its form.
+    `auth/useMe.ts` builds on `meQueryOptions`. Any other failure of `/me` on a guarded route shows Offline (with "Try
+    now") when it is retryable, else Fatal.
+  - `clearMe(queryClient)` sets `['me']` to `null`. The query client's caches call it for a 401 `unauthenticated`
+    from any query or mutation (`app/queryClient.ts`), and boot's logout listener calls it too.
+  - `app/session.ts`: `broadcastLogout()` posts the message, and the logout flow calls it after
+    `POST /api/v1/auth/logout` succeeded (§15.1); `listenForLogout(fn)` is what boot registers. Both do nothing in a
+    browser without `BroadcastChannel`.
 - **01's `invalidate` message** refetches REST data (`protocol/invalidate.ts`):
 
   | Topic (01 §8.12) | Query keys invalidated |
@@ -444,7 +496,9 @@ The plan's adapter, as exact interfaces. `BrowserPlatform` is the only M1 implem
 
 ```ts
 // src/platform/types.ts
-import type { Caps, ClientInfo, HelloAuth, ShareKind, Preset, ShareParams } from '../protocol/types.gen';
+import type { ClientNotifications, ClientRequests, ServerEnvelope, ServerMessages } from '../protocol/registry.gen';
+import type { Caps, ClientInfo, HelloAuth, MessageTypeHello, ShareKind, Preset, ShareParams }
+  from '../protocol/types.gen';
 
 export type PlatformKind = 'browser' | 'desktop' | 'mobile';
 export type PushSupport = 'supported' | 'needs-install' | 'denied' | 'unsupported';
@@ -493,8 +547,21 @@ export interface PickedSource {
   release(): void;                              // stop tracks if the user backs out at the warning
 }
 
+// The part of 01's SignalClient (protocol/signal-client.ts) that sharing uses, as a structural type with
+// SignalClient's own signatures (01 §16): request() never sends hello, and a listener gets its own type's envelope.
+export interface SignalClientLike {
+  request<K extends Exclude<keyof ClientRequests, typeof MessageTypeHello>>(
+    type: K, data: ClientRequests[K]['data'], opts?: { timeoutMs?: number },
+  ): Promise<ClientRequests[K]['result']>;
+  notify<K extends keyof ClientNotifications>(type: K, data: ClientNotifications[K]): boolean;
+  on<K extends keyof ServerMessages>(
+    type: K, fn: (data: ServerMessages[K], env: ServerEnvelope<K>) => void,
+  ): () => void;
+  probe(): void;
+}
+
 export interface ShareContext {
-  signal: SignalClient;
+  signal: SignalClientLike;
   roomId: string;
 }
 
@@ -559,6 +626,11 @@ export function detectPlatform(): Platform {
   return new BrowserPlatform();
 }
 ```
+
+`ShareContext.signal` is the structural `SignalClientLike`, not the `SignalClient` class: `platform/` declares what
+sharing needs from the client (`request`, `notify`, `on`, `probe`) and imports only generated types. `SignalClient`
+satisfies it, which `platform/types.test.ts` checks at compile time, so callers pass the client as it is and a
+`SharingProvider` test passes a small fake.
 
 The global names `__ISSHONI_DESKTOP__` and `Capacitor` are reserved now. `DesktopPlatform` (M2) will use a bearer
 token in `apiFetch` and `hello.auth`, `serverOrigin` from the linked server and `role: 'viewer'`. So nothing in the SPA
@@ -1324,7 +1396,7 @@ TCP ✓), `no_media` (all ✗), `no_public_ip` (all ✗ with `server.publicIp` e
   `POST /api/v1/auth/reset/check` shows the username → new password → `POST /api/v1/auth/reset/complete` → logged in →
   `/`.
 - **Logout**: stop local shares; `SignalClient.stop()` (close 1000); `POST /api/v1/auth/logout` (the server deletes this
-  session and its push subscriptions, 03); then `PushSubscription.unsubscribe()` locally; `BroadcastChannel` logout;
+  session and its push subscriptions, 03); then `PushSubscription.unsubscribe()` locally; `broadcastLogout()` (`app/session.ts`, §6.2);
   `queryClient.clear()`.
 
 ### 15.2 Account pages
@@ -1645,7 +1717,7 @@ export default defineConfig({
 | `conntest/verdict.ts`, `fixText.ts` | status table; provider/nat/docker/macOS key selection (`server.container`, empty or private `publicIp`); empty `publicIp` with every tested probe ✗ → only `conntest.noPublicIp` (no provider, host firewall, Docker or macOS lines) and code `no_public_ip`; empty `publicIp` with a probe ✓ → the normal text; a disabled TCP row hidden, a disabled UDP row ✗ with `conntest.udpDisabled` and counted as UDP ✗; `rate_limited`/`server` probes "not tested" (no ✓/✗, out of the verdict, no fix text, the "Couldn't finish the test" line); the `port_forward` hint on a green result; non-admin text |
 | `sw/routes.ts`, `sw/push.ts` | strategy per URL class; payload → notification options for every known type; same-origin guard on click URLs; generic fallback |
 | `lib/ua.ts` | `inAppBrowser()` matches each known token (`FBAN`, `FBAV`, `Instagram`, `Line/`, `MicroMessenger`) and returns `null` for plain Safari, Chrome, iOS Chrome (`CriOS`), Firefox and Edge UAs |
-| `auth/fragmentToken.ts` | token read for `/setup`, `/invite` and `/reset`, fragment removed via `replaceState` before the first fetch (`/info` included), stored and cleared |
+| `app/boot.tsx` (`stashFragmentToken`), `auth/fragmentToken.ts` | boot step 0 stores the token for `/setup`, `/invite` and `/reset` and removes the fragment via `replaceState` before the first fetch (`/info` included); other paths and empty fragments are left alone; `fragmentToken.ts` reads the stored token and clears it |
 | i18n | every generated error code maps to an existing `en.json` key (also enforced by `check:i18n`) |
 
 01 owns the `SignalClient`, `codecs.ts` and registry tests (01 §19).
@@ -1786,7 +1858,7 @@ tests). The M1 exit check is the human session of 06 §12.
 | Connection-test client: three probes, `ProbeVerdict`, `ConnTestResult`, fix-text keys | §14.2 | 04 §7.7, 02 §7.6 |
 | i18n catalog `web/src/i18n/en.json`; key families `errors.<code>`, `errors.local.*`, `fieldErrors.<field>.<code>`, `doctor.<code>`, `doctor.fix.<fix_code>`, `fix.firewall.<provider>`, `conntest.nat.<nat>`, `push.<type>.*`, `push.adminAlert.<kind>`, `share.label.<kind>` | §16.5 | 01, 03, 04, M2 tray |
 | Service-worker push contract: every payload shows a notification; handled `type`s; `url` same-origin; `tag` used as given | §16.3 | 04 §14.3 |
-| Platform adapter types (`Platform`, `SharingProvider`, `ActiveShare`, `NotificationsProvider`, `PwaProvider`), reserved globals `__ISSHONI_DESKTOP__`, `Capacitor` | §8 | M2/M3 desktop, M4 agent |
+| Platform adapter types (`Platform`, `SharingProvider`, `ActiveShare`, `NotificationsProvider`, `PwaProvider`, and `SignalClientLike` for `ShareContext.signal`), reserved globals `__ISSHONI_DESKTOP__`, `Capacitor` | §8 | M2/M3 desktop, M4 agent |
 | e2e harness: `ISSHONI_BIN`, `ISSHONI_DATA_DIR`, `deploy/dev/isshoni.e2e.toml` (base config; ports come from the fixture, none fixed), `fixtures.ts` (`server` per worker, `startServer({overrides, setUp})` → `{url, admin, restart(), stop()}`), per-server logs `web/test-results/server-*.log`, spec list, `window.__isshoni` | §19.3 | 01 §19, 04 §17, 06 |
 | npm scripts `lint`, `typecheck`, `test`, `build`, `e2e`, `check:i18n`, `check:size`; env `ISSHONI_VERSION`, `ISSHONI_DEV_SERVER` | §2, §17 | 06 |
 
@@ -1839,8 +1911,8 @@ demo is possible after W7.
 | # | Slice | Size | Depends on | Acceptance |
 |---|---|---|---|---|
 | W1 | **Scaffold, build and embed**: npm project, Vite/React/TS 6 strict, ESLint (all plugins), Prettier, Vitest, i18n init with `en.json`, tokens and global CSS, `boot-check.js`, `embed.go`, build plugins (version, compress, report), `check:size`, `scripts/check-i18n.mjs` with its first rule (a `t('…')` literal key missing from `en.json`, §16.5); 06's license script wired into `build` | M | 06 S1 | `npm ci && npm run lint && npm run typecheck && npm test -- --run && npm run build && npm run check:size && npm run check:i18n` pass; a JSX literal string fails lint; a `t('…')` literal key missing from `en.json` fails `check:i18n`; `go build ./...` works on a fresh clone and embeds a real build after `task build:web`; `.br`/`.gz` siblings present; React Router 8 API names confirmed |
-| W2 | **Platform + REST + boot**: `types.ts`, `BrowserPlatform` (client info, caps via 01's `detectCaps`, role, storage, apiFetch), `rest.ts`/`ApiError`, query client, `invalidate.ts`, boot sequence, Offline/NeedsHttps/NotSetUp/Unsupported/Fatal screens; the `check:i18n` error-code rule (§16.5) and an `errors.<code>` key in `en.json` for every `ErrorCode` and api `Code…` constant | M | W1, 01 P2, 03 DTOs | Unit tests for `ApiError` (both envelopes) and the topic map; MSW tests for each boot branch; `role` is `viewer` with a mobile UA; `check:i18n` fails when an error code has no `errors.<code>` key; the i18n unit test of §19.1 passes |
-| W3 | **Auth and setup step 1**: login, invite, signup, pending, reset, logout, guards, `next` guard, BroadcastChannel logout, About/trust model; `/setup` step 1 (§14.1, `SetupPage`: fragment token, `setup/check`, create-admin form, `setup/complete`), navigating to `/` until W10 | M | W2, 03 auth | Component tests for each error code on each form; the fragment is removed before the first request (spy on fetch); a logout in tab A redirects tab B; `SetupPage` (MSW) reads the `/setup` fragment token, calls `setup/check`, and its form calls `setup/complete`, then navigates to `/` |
+| W2 | **Platform + REST + boot**: `types.ts`, `BrowserPlatform` (client info, caps via 01's `detectCaps`, role, storage, apiFetch), `rest.ts`/`ApiError`, query client, `invalidate.ts`, boot sequence (`app/boot.tsx`, with step 0's fragment stash), `router.tsx` with every §5 route and the page-folder contract, the guards with the `next` guard, the `['me']` query and the logout `BroadcastChannel` (`app/guards.tsx`, `me.ts`, `session.ts`), Offline/NeedsHttps/NotSetUp/Unsupported/Fatal screens; the `check:i18n` error-code rule (§16.5) and an `errors.<code>` key in `en.json` for every `ErrorCode` and api `Code…` constant | M | W1, 01 P2, 03 DTOs | Unit tests for `ApiError` (both envelopes) and the topic map; MSW tests for each boot branch; `role` is `viewer` with a mobile UA; `check:i18n` fails when an error code has no `errors.<code>` key; the i18n unit test of §19.1 passes |
+| W3 | **Auth and setup step 1**: login, invite, signup, pending, reset, logout (calling W2's `broadcastLogout()`), `useMe.ts` and `fragmentToken.ts` on W2's `['me']` query and stashed token, About/trust model (`AboutPage` in `auth/`), the pages exported from `auth/index.ts`; `/setup` step 1 (§14.1, `SetupPage`, exported from `setup/index.ts`: fragment token, `setup/check`, create-admin form, `setup/complete`), navigating to `/` until W10 | M | W2, 03 auth | Component tests for each error code on each form; the fragment is removed before the first request (spy on fetch); a logout in tab A redirects tab B; `SetupPage` (MSW) reads the `/setup` fragment token, calls `setup/check`, and its form calls `setup/complete`, then navigates to `/` |
 | W4 | **Signaling wiring**: `connection.ts` with 01's `SignalClient`, `connectionStore`, the §7.1 UI states, stale-build reload | S | W2, 01 P10 | Against a `task dev` server the page reaches `ready`; killing the server shows "Reconnecting…" after 2 s and recovers; a fake `staleBuild` reloads once |
 | W5 | **Room session and shell**: `RoomSession` join/leave/resync, `roomStore`, `room.event` announcements, RoomPage layout, header, people panel, switcher (`showRoomList`), `InRoomBar`, root redirect | M | W4, 01 P4–P5, 03 rooms | Two browsers in Lounge see each other within 1 s; closing a tab removes its presence at once (close 1000) while cutting its network keeps it for the grace period; the switcher appears only when `showRoomList` |
 | W6 | **Web sharer core**: ShareSheet, `pick()` with the §13.2 options and fallbacks, fake-display seam, `classify`, `ScreenAudioWarning`, `share.start`, `PublisherPC` (gen/neg, tracks), codec prefs, encodings from `ShareParams`, presets, stop and browser-stop | L | W5, 01 P7, 02 publish | `watch.spec`'s sharer half: `room.state` shows the share live with layers `high` and `low`; `warning.spec` passes; the tone-tab capture works in CI (xvfb) and the choice is recorded; unit tests for classify/codecPrefs/encodings |

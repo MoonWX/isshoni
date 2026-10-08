@@ -122,6 +122,34 @@ func TestUsableIfaceAddr(t *testing.T) {
 	}
 }
 
+// TestPionSkipsV6: the IPv6 addresses pion's interface scan drops (ice's isSupportedIPv6Partial): ::/96, with the
+// loopback ::1 in it, and site-local fec0::/10. IPv4 addresses, mapped ones included, are not its business.
+func TestPionSkipsV6(t *testing.T) {
+	for addr, want := range map[string]bool{
+		"::1":                true, // usable for UDP, never for ICE-TCP
+		"::":                 true,
+		"::203.0.113.7":      true, // IPv4-compatible
+		"::7f00:1":           true, // ::127.0.0.1
+		"fec0::1":            true, // site-local
+		"feff::1":            true,
+		"::1:0:0":            false, // just above ::/96
+		"2001:db8::7":        false,
+		"fd00::5":            false,
+		"fe80::1":            false, // link-local: dropped elsewhere (usableIfaceAddr)
+		"127.0.0.1":          false,
+		"203.0.113.7":        false,
+		"::ffff:127.0.0.1":   false,
+		"::ffff:203.0.113.7": false,
+	} {
+		if got := pionSkipsV6(netip.MustParseAddr(addr)); got != want {
+			t.Errorf("pionSkipsV6(%s) = %v, want %v", addr, got, want)
+		}
+	}
+	if pionSkipsV6(netip.Addr{}) {
+		t.Error("the zero address is not an IPv6 address")
+	}
+}
+
 func TestIsTailscale(t *testing.T) {
 	for name, want := range map[string]bool{"tailscale0": true, "utun4": true, "eth0": false, "wg0": false} {
 		if got := isTailscale(name); got != want {

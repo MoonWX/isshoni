@@ -283,7 +283,7 @@ Unknown keys:
 | `network.stun_servers` | `["stun.cloudflare.com:3478", "stun.l.google.com:19302"]` | Public IP detection only (§7.4) |
 | `network.ipv6` | `true` | Gather and advertise IPv6 media candidates when a global address exists |
 | `network.exclude_interfaces` | `["docker*","br-*","veth*","virbr*","cni*","flannel*","cali*","kube-*"]` | Glob list; never used for media |
-| `network.include_loopback` | `false` | Dev only: advertise 127.0.0.1 / ::1 candidates |
+| `network.include_loopback` | `false` | Dev only: advertise 127.0.0.1 / ::1 candidates (::1 with `network.ipv6`, and for UDP only, §7.6) |
 | `network.udp_buffer_bytes` | `8388608` | SO_RCVBUF/SO_SNDBUF requested on media sockets; needs sysctl ≥ this (§13) |
 | `network.trusted_proxies` | `[]`; `["127.0.0.0/8", "::1/128"]` when the effective mode is `off` and `listen.http` is loopback (§4.4) | CIDRs allowed to set `X-Forwarded-*` (`off` mode only, §8.5). `config init` writes the loopback default into the file explicitly |
 
@@ -571,18 +571,27 @@ type Paths struct {
 └─ restore/                   transient staging for restores
 ```
 
-Startup checks (fail → exit 78 with a fix line; restarting can't help):
+Startup checks (fail → exit 78 with a fix line; restarting can't help). After the umask, `config.PrepareDataDir`
+runs the four data-directory checks, from creating `data_dir` to the admin socket's directory, in the order given
+here (S25):
 - The server sets `umask 0077` first, so everything it creates is private.
-- `serve` creates `data_dir` (and the admin socket's parent directory) with mode 0700 if missing. If `data_dir` is
-  owned by the process and wider than 0700, it is chmod-ed to 0700 with a warning. It must then be writable by the
-  process; the fix line prints the process's real uid:gid (e.g. `sudo chown -R isshoni:isshoni /var/lib/isshoni` on
-  systemd, `sudo chown -R 65532:65532 <host path>` for a bind mount in bridge compose, `0:0` in `compose.host.yaml`).
+- `serve` creates `data_dir` with mode 0700 (and its parents) if missing.
 - **In a container, `data_dir` must be a mount** (checked in `/proc/self/mountinfo`: a mount point equal to `data_dir`
   or a parent other than `/`). The check runs after the directory is created, so a directory that `serve` just created
   in a container still exits 78: "Your data would be lost when the container is removed. Mount a volume at
   /var/lib/isshoni (see compose.yaml), e.g. `-v isshoni-data:/var/lib/isshoni`." `ISSHONI_ALLOW_EPHEMERAL_DATA=1`
   skips the check (tests only). Rationale: losing the admin account and certs on `docker compose down` is the worst
-  failure for a foolproof setup (a stricter form of the plan's "doctor fails").
+  failure for a foolproof setup (a stricter form of the plan's "doctor fails"). **This check runs before the
+  ownership and writable checks below**, and before the result of creating the directory is looked at: a container
+  without a volume, whose `data_dir` often can't be created or written either (a read-only root, uid 65532 on a
+  root-owned path), is told to mount a volume (`data_not_mounted`), not to `chown` a directory that would be lost
+  with the container. A mount table that can't be read fails the check with the same fix.
+- `data_dir` must be a directory. If it is owned by the process and wider than 0700, it is chmod-ed to 0700 with a
+  warning. It must then be writable by the process (`serve` creates and removes a file in it); the fix line prints
+  the process's real uid:gid (e.g. `sudo chown -R isshoni:isshoni /var/lib/isshoni` on systemd,
+  `sudo chown -R 65532:65532 <host path>` for a bind mount in bridge compose, `0:0` in `compose.host.yaml`). Reason
+  `data_dir_not_writable` (§6.3).
+- Last, the admin socket's parent directory is created with mode 0700 if missing (reason `admin_socket_dir`).
 - **Data-directory lock**: `serve` holds an exclusive `flock` (`LockFileEx` on Windows) on `data_dir/isshoni.lock` for
   its lifetime. If it can't get it, it exits 1: "another isshoni process is using <data_dir>". Offline commands take
   the same lock non-blocking (§12.6). The lock also works across containers that share the volume.
@@ -621,7 +630,11 @@ fsync, rename, fsync of the directory). Format:
 - File mode wider than 0600 → fixed to 0600 with a warning. Owner ≠ process uid → exit 78 ("run: sudo chown isshoni:
   isshoni /var/lib/isshoni/secrets.json"; restarting can't fix it). Corrupt JSON → exit 78 with reason `secrets_corrupt` and the fix "restore
   it: `isshoni admin restore --offline <backup>`" (never silently regenerated: that would log everyone out).
-- VAPID keys come from `webpush.GenerateVAPIDKeys()`.
+- VAPID keys are generated in `config` with the standard library: `ecdh.P256().GenerateKey(rand.Reader)`
+  (`crypto/ecdh`), stored in the form of webpush-go's `GenerateVAPIDKeys()` (the 65-byte uncompressed public point
+  and the 32-byte private scalar, base64url without padding), so `push` hands them to webpush-go as they are (§14.1)
+  and `config` does not import webpush-go (S25). A pair read from the file is checked with `crypto/ecdh` too: the
+  private key must be a P-256 key and the public key its point, else `secrets_corrupt`.
 
 What each key is for is 03's and 01's business; 04 fixes the **rotation contract**. Rotation always restarts the
 server (§5.3), so every consumer only has to handle "the key differs from last time" **at startup**:
@@ -708,8 +721,8 @@ var ErrRestartRequested = errors.New("server: restart requested") // cmd/isshoni
 ### 6.1 Startup sequence (`serve`)
 
 1. Parse config (exit 78 on errors). Build the logger (§10).
-2. `umask`, data dir checks (create with 0700, tighten, writable, container mount), the data-directory lock, memory
-   limit (§5.1).
+2. `umask`, data dir checks (create with 0700, container mount, tighten, writable, in that order), the
+   data-directory lock, memory limit (§5.1).
 3. Open `secrets.json` (create on first run; corrupt or wrong owner → exit 78).
 4. Open the store (03: migrations with the pre-migration backup). A `store.Open` error for which
    `errors.Is(err, store.ErrNeedsOperator)` (newer schema, history mismatch, failed migration, corrupt database, …) →
@@ -1012,7 +1025,8 @@ Construction details:
   `AliveDurationForConnFromStun` 30 s, `ReadBufferSize` 64, `WriteBufferSize` 4 MiB).
 - **Advertised**: `Advertised` holds every advertised address with its final address:port after the rewrite rules
   (§7.5). 02 uses it to label selected candidate pairs (`Via`); the same value set `udp` | `tcp443` | `tcp7882` is used
-  everywhere (dashboard, metrics).
+  everywhere (dashboard, metrics). It lists exactly what pion gathers, no more: a test compares it with the
+  candidates of a real offer. The one kept address that gets no TCP entry is the IPv6 loopback `::1` (§7.6).
 - Interfaces are enumerated once at startup (06: systemd `After=network-online.target`). Hot-plugged interfaces need a
   restart.
 
@@ -1099,6 +1113,13 @@ Append/LAN case and for local development; doctor shows it on macOS hosts (§13.
 
 - The UDP mux binds global IPv6 addresses when `network.ipv6` is true and one exists (ULA `fc00::/7`, link-local and
   temporary privacy addresses are skipped).
+- `::1` (development: `network.include_loopback` with `network.ipv6`) carries **UDP only**. pion gathers UDP
+  candidates from the UDP mux's sockets, so `[::1]:7882/udp` is gathered and advertised. It gathers passive TCP
+  candidates from its own interface scan, which drops every address in `::/96` as a deprecated IPv4-compatible one
+  (RFC 8445 §5.1.1.1), `::1` included, whatever `include_loopback` says. So `Transport` keeps `::1` out of the
+  addresses for ICE-TCP: `Advertised` has no `tcp` entry on `::1` (443 or 7882), `IPFilter` drops it, and `::1`
+  alone adds no `tcp6` network type. An ICE-TCP listener bound to `[::1]` alone advertises nothing; with no UDP
+  socket either, `NewTransport` fails with `ErrNoTransport`. Loopback TCP in development uses 127.0.0.1.
 - Docker bridge networks have no IPv6 by default; doctor reports "IPv6 media off (Docker bridge)".
 - `tls.mode=ip` certifies **one** address: the IPv4 if present, otherwise the IPv6. A second certificate for IPv6 is
   *later*.
@@ -2388,7 +2409,7 @@ no tokens, SDP, push endpoints or usernames.
 | `config` | Precedence flag > env > file > default for every kind; policy `IsSet`; unknown file key → error with line/column and suggestion; unknown env → warning; list/duration/bool parsing; derived TLS mode; `off`-mode default of `listen.http`; `off`-mode default of `trusted_proxies` (loopback `listen.http` → `127.0.0.0/8`, `::1/128`; non-loopback → `[]` plus the §4.5 warning; an explicit `[]` wins); `config init --tls.mode off` with a loopback `listen.http` writes `trusted_proxies` into the file; each §4.5 rule produces the right key, source and fix; `config example` output re-parses to the defaults; registry has no duplicate env/flag names; empty env counts as unset: `ISSHONI_PUBLIC_IP=` and `ISSHONI_DOMAIN=` with no file → effective `public_ip="auto"`, derived tls mode `ip`, no validation error, `IsSet("public_ip")` false; reserved names of §4.2 ignored without a warning; `config init` ignores env and exits 78 without writing on invalid values; `Site.Dev` only for off mode + loopback `listen.http` + empty or loopback `public_url` |
 | `config` secrets | First start creates 0600 with all keys; restart keeps them; missing registered key is added; wide mode fixed; wrong owner → exit 78; corrupt → `secrets_corrupt`; atomic write leaves the old file on a simulated failure; `Rotate` changes only the chosen keys and writes the file atomically (no hooks: consumers compare key fingerprints at the next start, §5.3) |
 | `netx` portmux | TLS ClientHello → `TLS()` and a full handshake (HTTP/1.1 and h2 ALPN); RFC 4571 STUN frame → `ICE()` with the byte replayed; `GET ` → 400 hint; `0xFF` → closed; silent client closed at the timeout (shortened in tests); 33rd pending conn per IP closed, also when the 33 come from different addresses in one IPv6 /64; with `MaxPending` reached a new connection is admitted and the oldest pending one is closed (`Limited`); `IPKey` table (IPv4, IPv4-mapped IPv6, two addresses in one /64, neighbouring /64s); per-IP open limit; `Close` unblocks both `Accept`s; `LocalAddr` is `*net.TCPAddr`; goleak clean |
-| `netx` transport | Counting `PacketConn` keeps `AddrPortReaderWriter`; byte counts match; port 0 reuse; interface filter globs; buffer read-back and the one warn line when it is below target; 7882/tcp per-IP ICE limit shared with 443 (65th connection across both closed, also from different addresses in one /64); `Advertised` holds post-rewrite addresses with `Via` `udp`/`tcp443`/`tcp7882`; a setter called after `Apply` wins |
+| `netx` transport | Counting `PacketConn` keeps `AddrPortReaderWriter`; byte counts match; port 0 reuse; interface filter globs; buffer read-back and the one warn line when it is below target; 7882/tcp per-IP ICE limit shared with 443 (65th connection across both closed, also from different addresses in one /64); `Advertised` holds post-rewrite addresses with `Via` `udp`/`tcp443`/`tcp7882`, and equals the candidates of a real pion offer; with `include_loopback` and `ipv6`, `::1` is advertised for UDP only (no `tcp` entry, no `tcp6` type from it alone, `IPFilter` drops it; §7.6); a setter called after `Apply` wins |
 | `netx` public IP | Fake STUN (pion/stun) + fake interfaces: each row of §7.4's table; timeouts; literal config skips STUN for the result |
 | `netx` rewrite | Rules/filters for each row of §7.5 (direct, 1:1 NAT, Docker bridge, home LAN Append, IPv6 literal) |
 | `tlsmgr` | Manual: load, reload on file change and SIGHUP, bad new pair keeps the old, key mismatch, expiry warning; `HTTPHandler`: ACME path passthrough, 503 while not ready, 308 to config host (ignores request Host), off-mode passthrough; ACME problem → hint code table |
@@ -2602,7 +2623,7 @@ with the other docs and adds the wiring slices of §6.6.
 |---|---|---|---|---|
 | S1 | CLI skeleton, version, logx | `cmd/isshoni` dispatch, help, exit codes (incl. 78); `internal/version` (+ `DocsURL`, `--short`); `internal/logx` (Secret, formats, ReplaceAttr) | `go build -ldflags -X…` → `isshoni version --json` shows the values and `--short` prints the version; logx unit tests; testscript for usage and exit 2 | – |
 | S2 | Config | Registry, TOML/env/flag loading, precedence, validation messages, `config check/print/example/init`, `Site` | All §17 config tests; `config example` round-trips; `config init` refuses to overwrite; errors show file:line and a fix | S1 |
-| S3 | Data dir and secrets | Layout checks, umask, container volume check (exit 78, escape env), `secrets.json` create/load/rotate | Secrets tests; container check with a fake mountinfo | S2 |
+| S3 | Data dir and secrets | In `internal/server/config` only (§5.1–5.2; `serve` calls it from S4 on): umask; `PrepareDataDir` (create 0700, container volume check with exit 78 and the escape env, tighten, writable, admin socket directory, root warning); container detection (`Host`); the data-directory lock; the cgroup memory limit (`ApplyMemoryLimit`); the refusals as `OperatorError` with the reason codes of §6.3; `secrets.json` create/load (owner, mode, corrupt), VAPID pair, `InspectSecrets`, and `Rotate`, which only writes the file (the `rotate-secrets` command and its restart are S9) | Secrets tests (create, load, permissions, rotate); container check with a fake mountinfo exits 78 and passes with `ISSHONI_ALLOW_EPHEMERAL_DATA=1` | S2 |
 | S4 | HTTP skeleton and SPA | `internal/server` with `off` mode, router, global middleware chain, JSON/error helpers on 03's `api.Error`, SPA handler, security headers, `/healthz` `/readyz`, graceful shutdown skeleton, `servertest` | httpapi tests; `servertest.Start` ready < 1 s; built SPA served with correct caching | S2, S3, 03 DTOs |
 | S5 | Public IP and ICE transports | `DetectPublicAddrs`, rewrite rules, UDP mux with counting conns, 7882/tcp mux, `Transport` (incl. `TCPMux443/7882`, `PacketConns`), `Transport.Apply`, `TransferCounter` | netx unit tests; a Pion PeerConnection pair connects through `Transport` over UDP and over TCP 7882 on loopback | S1 |
 | S6 | 443 multiplexer | `PortMux`, `prefixConn`, limits, ICE sub-listener into `TCPMuxDefault` | portmux tests (TLS, RFC 4571, plain HTTP hint, garbage, slow client, limits, Close); goleak clean | S5 |

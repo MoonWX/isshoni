@@ -97,6 +97,10 @@ const (
 // ice.TCPMuxDefault, combined in an ice.MultiTCPMuxDefault, so every kept address gets a passive TCP candidate on
 // 443 and on 7882. Which addresses are kept and how they are rewritten is the plan of 04 §7.5 (planAddrs).
 //
+// Advertised lists what pion really gathers. The one kept address without a TCP candidate is the IPv6 loopback
+// ::1 (development: include_loopback with network.ipv6): pion gathers UDP on it but never ICE-TCP (pionSkipsV6),
+// so it is advertised for UDP only and alone it adds no tcp6 network type.
+//
 // Interfaces are enumerated once, here; a hot-plugged interface needs a restart. NewTransport is the only code that
 // binds 7882: a busy port is a *ListenError. When the UDP buffers read back below UDPBufferBytes it logs one warn
 // line naming the sysctl fix.
@@ -307,8 +311,9 @@ type tcpPort struct {
 	via  string
 }
 
-// buildTCP builds the 443 and 7882 TCP muxes. It returns the local addresses pion may gather TCP candidates on
-// (IPFilter) and the listeners' ports in TCPMux order.
+// buildTCP builds the 443 and 7882 TCP muxes. It returns the local addresses pion gathers TCP candidates on
+// (IPFilter keeps them, and Advertised's TCP entries are these after the rewrite rules) and the listeners' ports in
+// TCPMux order.
 func (t *Transport) buildTCP(ctx context.Context, opts TransportOptions, plan addrPlan, pionLog logging.LeveledLogger,
 	log *slog.Logger,
 ) ([]netip.Addr, []tcpPort, error) {
@@ -393,9 +398,11 @@ func (t *Transport) buildTCP(ctx context.Context, opts TransportOptions, plan ad
 			allowed = append(allowed, h)
 		}
 	}
-	// pion never gathers on loopback without include_loopback, nor IPv6 without network.ipv6.
+	// pion never gathers on loopback without include_loopback, nor IPv6 without network.ipv6, and never a TCP
+	// candidate on ::1 (pionSkipsV6): with include_loopback and network.ipv6 both on, ::1 carries UDP only. Such an
+	// address is not advertised for TCP, and alone it gives no tcp6 network type.
 	allowed = slices.DeleteFunc(allowed, func(a netip.Addr) bool {
-		return (a.IsLoopback() && !opts.IncludeLoopback) || (a.Is6() && !opts.IPv6)
+		return (a.IsLoopback() && !opts.IncludeLoopback) || (a.Is6() && !opts.IPv6) || pionSkipsV6(a)
 	})
 	return allowed, ports, nil
 }
