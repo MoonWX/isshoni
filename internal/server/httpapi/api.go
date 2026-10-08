@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -104,6 +105,8 @@ type API struct {
 	auth    authService
 	mux     *http.ServeMux
 	handler http.Handler
+	// pushTests is the push-test bucket of POST /api/v1/push/test (03 §7.3).
+	pushTests *pushTestLimiter
 }
 
 // New builds the API and registers 03's routes. It panics when Deps.DB or Deps.Auth is nil or Deps.Site.Origin is
@@ -139,7 +142,7 @@ func newAPI(d Deps, au authService) *API {
 		d.Logger = slog.Default()
 	}
 	d.Logger = d.Logger.With(slog.String("component", "api"))
-	a := &API{d: d, auth: au, mux: http.NewServeMux()}
+	a := &API{d: d, auth: au, mux: http.NewServeMux(), pushTests: newPushTestLimiter(d.Clock)}
 	a.handler = a.bodyLimit(a.noStore(http.HandlerFunc(a.route)))
 	a.routes()
 	return a
@@ -156,14 +159,23 @@ func (a *API) routes() {
 	a.Handle("POST /api/v1/auth/setup/check", Public, http.HandlerFunc(a.postSetupCheck))         // #7
 	a.Handle("POST /api/v1/auth/setup/complete", Public, http.HandlerFunc(a.postSetupComplete))   // #8
 	a.Handle("GET /api/v1/me", User, http.HandlerFunc(a.getMe))                                   // #11
+	a.Handle("GET /api/v1/rooms", User, http.HandlerFunc(a.getRooms))                             // #19
 	a.Handle("GET /api/v1/invites", User, http.HandlerFunc(a.getInvites))                         // #21
 	a.Handle("POST /api/v1/invites", User, http.HandlerFunc(a.postInvite))                        // #22
 	a.Handle("DELETE /api/v1/invites/{id}", User, http.HandlerFunc(a.deleteInvite))               // #23
+	a.Handle("POST /api/v1/push/subscriptions", User, http.HandlerFunc(a.postPushSubscription))   // #24
+	a.Handle("POST /api/v1/push/unsubscribe", User, http.HandlerFunc(a.postPushUnsubscribe))      // #27
+	a.Handle("POST /api/v1/push/test", User, http.HandlerFunc(a.postPushTest))                    // #28
 	a.Handle("GET /api/v1/admin/approvals", Admin, http.HandlerFunc(a.getApprovals))              // #34
 	a.Handle("POST /api/v1/admin/approvals/{id}/approve", Admin, http.HandlerFunc(a.postApprove)) // #35
 	a.Handle("POST /api/v1/admin/approvals/{id}/reject", Admin, http.HandlerFunc(a.postReject))   // #36
+	a.Handle("POST /api/v1/admin/rooms", Admin, http.HandlerFunc(a.postRoom))                     // #37
+	a.Handle("PATCH /api/v1/admin/rooms/{id}", Admin, http.HandlerFunc(a.patchRoom))              // #38
+	a.Handle("DELETE /api/v1/admin/rooms/{id}", Admin, http.HandlerFunc(a.deleteRoom))            // #39
 	a.Handle("GET /api/v1/admin/settings", Admin, http.HandlerFunc(a.getSettings))                // #40
 	a.Handle("PATCH /api/v1/admin/settings", Admin, http.HandlerFunc(a.patchSettings))            // #41
+	a.Handle("GET /api/v1/push/preferences", User, http.HandlerFunc(a.getPushPreferences))        // #50
+	a.Handle("PUT /api/v1/push/preferences", User, http.HandlerFunc(a.putPushPreferences))        // #51
 }
 
 // ServeHTTP serves every request under /api/v1/ through the API's chain. After the no-store step it answers every
@@ -211,6 +223,17 @@ type principalKey struct{}
 func PrincipalFrom(ctx context.Context) (auth.Principal, bool) {
 	p, ok := ctx.Value(principalKey{}).(auth.Principal)
 	return p, ok
+}
+
+// opErr is the answer for a failed store call of a handler that works on the store itself (rooms, push): an
+// *api.Error that came out of the transaction goes out as it is, and anything else (the store, a cancelled request)
+// is wrapped with what was being done, for the log line of the 500 that WriteError makes of it.
+func opErr(op string, err error) error {
+	var ae *api.Error
+	if errors.As(err, &ae) {
+		return err
+	}
+	return fmt.Errorf("httpapi: %s: %w", op, err)
 }
 
 // bodyLimitFor returns the body limit of a request path (03 §12.1).
