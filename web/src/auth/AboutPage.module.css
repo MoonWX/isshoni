@@ -1,0 +1,77 @@
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.section + .section {
+  padding-top: var(--space-5);
+  border-top: var(--border-width) solid var(--color-border);
+}
+
+.heading {
+  font-size: var(--text-md);
+  font-weight: var(--weight-bold);
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding-inline-start: var(--space-5);
+  color: var(--color-text-muted);
+  text-wrap: pretty;
+}
+
+.list li::marker {
+  color: var(--color-border-strong);
+}
+
+.facts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.facts > div {
+  display: flex;
+  gap: var(--space-4);
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.facts dt {
+  color: var(--color-text-muted);
+}
+
+.facts dd {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  text-align: end;
+}
+
+.version {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+
+.links {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  list-style: none;
+}
+
+.external {
+  display: inline-flex;
+  gap: var(--space-1);
+  align-items: center;
+  /* A comfortable touch target without changing the line rhythm on desktop. */
+  min-height: 2rem;
+}
+
+.external svg {
+  flex: none;
+  width: 0.875rem;
+  height: 0.875rem;
+}

@@ -68,6 +68,136 @@
       }
     }
   },
+  "auth": {
+    "username": "Username",
+    "password": "Password",
+    "newPassword": "New password",
+    "showPassword": "Show password",
+    "usernameHint": "{{min}} to {{max}} characters: letters and numbers, with single dots, dashes or underscores in between.",
+    "passwordHint": "At least {{min}} characters. A few unrelated words work well.",
+    "serverBusyWait_one": "The server is busy. Try again in {{count}} second.",
+    "serverBusyWait_other": "The server is busy. Try again in {{count}} seconds.",
+    "sessionNotKept": "That worked, but this browser didn't keep you signed in. Allow cookies for this site, then log in.",
+    "checkingLink": "Checking the link",
+    "tryAgain": "Try again",
+    "haveAccount": "Already have an account? <a>Log in</a>",
+    "login": {
+      "title": "Log in to {{server}}",
+      "submit": "Log in",
+      "forgot": "Forgot your password? Ask an admin for a reset link.",
+      "needAccount": "Need an account? Ask a friend for an invite link.",
+      "needAccountApproval": "Need an account? <a>Request one</a>",
+      "trust": {
+        "heading": "Before you log in",
+        "server": "This server is trusted: whoever runs it could see the streams.",
+        "noRecording": "Nothing is recorded, and nobody watches unseen.",
+        "noTelemetry": "No telemetry.",
+        "more": "How isshoni handles privacy"
+      }
+    },
+    "invite": {
+      "title": "{{inviter}} invited you to {{server}}",
+      "titleNoInviter": "You're invited to {{server}}",
+      "lead": "Pick a username and a password to join.",
+      "submit": "Create account",
+      "signedIn": {
+        "title": "You're already in",
+        "body": "You're signed in as {{username}}.",
+        "go": "Go to isshoni",
+        "switch": "Sign out and create another account"
+      },
+      "noToken": {
+        "title": "This invite link is incomplete",
+        "body": "Open the whole link you were sent, including the part after the # sign."
+      },
+      "dead": {
+        "title": "This invite link doesn't work"
+      }
+    },
+    "signup": {
+      "title": "Request an account",
+      "lead": "An admin of {{server}} reviews every request before you can log in.",
+      "submit": "Send request"
+    },
+    "pending": {
+      "title": "Request sent",
+      "body": "An admin will review your request. Try logging in later.",
+      "back": "Back to log in"
+    },
+    "reset": {
+      "title": "Choose a new password",
+      "lead": "An admin of {{server}} made this link for you. Saving the new password logs you in.",
+      "submit": "Save and log in",
+      "noToken": {
+        "title": "This reset link is incomplete",
+        "body": "Open the whole link your admin sent you, including the part after the # sign."
+      },
+      "dead": {
+        "title": "This reset link doesn't work"
+      }
+    },
+    "logout": {
+      "failed": "Couldn't sign out. {{reason}}"
+    },
+    "about": {
+      "title": "About isshoni",
+      "lead": "Watch your friends' screens together, on a server one of you runs.",
+      "versions": {
+        "heading": "Versions",
+        "serverName": "Server",
+        "server": "Server version",
+        "page": "This page"
+      },
+      "trust": {
+        "heading": "Privacy and trust",
+        "server": "The server is trusted. Video and sound are encrypted on the way, but the server passes them on, so whoever runs it could see the streams.",
+        "noRecording": "There is no recording, and there are no hidden viewers: an admin who watches shows up in the viewer list like everyone else.",
+        "stored": "The server stores usernames and password hashes, your sign-ins with their last-seen time and IP address, invites, rooms, notification subscriptions, and a log of logins and admin actions that is pruned after 30 days.",
+        "local": "Window titles never leave your device. Friends see a share as a screen, a window or a tab.",
+        "noTelemetry": "No telemetry: the server reports nothing about you or itself to the isshoni project. The privacy page lists every connection the server makes."
+      },
+      "links": {
+        "heading": "More",
+        "privacy": "Privacy, in full",
+        "codeSigning": "Code-signing policy",
+        "licenses": "Open-source licenses",
+        "site": "Project site"
+      },
+      "back": "Back to isshoni"
+    }
+  },
+  "setup": {
+    "steps": {
+      "label": "Setup",
+      "admin": "Create the admin",
+      "conntest": "Connection test",
+      "invite": "Invite friends"
+    },
+    "admin": {
+      "title": "Create the admin account",
+      "lead": "This account runs the server: it invites friends and changes the settings.",
+      "serverName": "Server name",
+      "serverNameHint": "Optional. Friends see it on their invite. You can change it later.",
+      "submit": "Create account"
+    },
+    "noToken": {
+      "title": "Open the setup link",
+      "body": "This page needs the one-time setup link. On the server, run:",
+      "docker": "With Docker:",
+      "after": "Then open the link it prints."
+    },
+    "tokenInvalid": {
+      "title": "This setup link doesn't work anymore",
+      "body": "It was replaced or has expired. For a new one, run this on the server:",
+      "docker": "With Docker:",
+      "after": "Then open the link it prints."
+    },
+    "done": {
+      "title": "This server is already set up",
+      "body": "An admin account exists. Log in with it, or ask the admin for an invite.",
+      "logIn": "Log in"
+    }
+  },
   "a11y": {
     "notifications": "Notifications",
     "dismiss": "Dismiss",
@@ -171,6 +301,27 @@
       "h264_unavailable": "This browser can't send H.264 video. Use Chrome or Edge.",
       "webrtc_failed": "Couldn't set up the video connection.",
       "offline": "You're offline. Check your connection."
+    }
+  },
+  "fieldErrors": {
+    "username": {
+      "required": "Enter a username.",
+      "too_short": "That's too short for a username.",
+      "too_long": "That's too long for a username.",
+      "invalid": "Use letters and numbers, with single dots, dashes or underscores in between.",
+      "reserved": "That username is reserved. Pick another."
+    },
+    "password": {
+      "required": "Enter a password.",
+      "too_short": "That's too short for a password.",
+      "too_long": "That's too long for a password.",
+      "invalid": "That password has characters that can't be used.",
+      "too_common": "That password is too common. Pick one that's harder to guess.",
+      "same_as_username": "Your password can't be your username."
+    },
+    "serverName": {
+      "too_long": "That's too long for a name.",
+      "invalid": "That name has characters that can't be used."
     }
   }
 }
