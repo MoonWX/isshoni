@@ -2484,7 +2484,7 @@ Connection.
 | `Subscribe(wants)` | `UpdateSubscriptions(ctx, items)` | items failing with `sfu.share_not_found` become `ignored`; other per-item errors: below |
 | `SetCaps(c)` | `SetDecodeCaps(ctx, DecodeCaps{H264: profiles})` | `"h264/6400"` → `"6400"`; non-H.264 keys dropped |
 | `Resync()` | `Resync()` | |
-| `Stats()` | `Stats()` → `protocol.ServerStats` | |
+| `Stats()` | `Stats()` → `protocol.ServerStats` | `subs`: one entry per track forwarded now (the video with the layer of its rid, and the audio); `layers`: every attached video layer of the connection's own shares, and their audio |
 | `Close()` | `Close(protocol.EndReasonLeft)` | |
 
 **Events** (SFU → `MediaSink`):
@@ -2497,21 +2497,23 @@ Connection.
 | `QualityHintEvent{Share, Reason, MaxBitrate, Encodings}` | `QualityHint{shareId, reason: ev.Reason, maxBitrate, encodings converted 1:1}`; `Reason` is `admin` or `viewers`, and `Encodings` is the full current `f`/`q` list with the cap and pause state applied by the SFU |
 | `PCStateEvent{PCPub, Gen, failed}` | `RestartRequest{pc: pub, gen: ev.Gen, mode: rebuild, reason: failed}` (the SFU emits PCStateEvents only for the current PC of each kind) |
 | `PCStateEvent{PCSub, …}` | nothing: the client drives sub restarts (§10.4); the SFU ICE-restarts in `Resync()` and rebuilds sub PCs itself only for codec retries |
-| `ErrorEvent` | `Error` (code map below) |
+| `ErrorEvent` | `Error` (code map below) with the event's scope: `pc.pub`/`pc.sub` → scope `pc` with that `pc` (an event has no `gen` or `neg`); `share`/`subscription` → that scope with `shareId` = `Error.Share` |
 | `RoomEvents.ShareUpdated` | `ShareMedia` on the publishing connection's sink: `pending→live` or `stalled→live` = `Live`; `→stalled` = `Stalled`; a layer attached or ended, the profile changed, or audio changed while live = `Changed`. `Layers` is built from `ShareInfo.Layers` (every layer whose track is attached, paused ones included), ignoring `LayerInfo.Active` |
 | `RoomEvents.ShareEnded`, `CodecPolicyChanged` | ignored: the hub ends shares itself; per-connection `CodecPolicyEvent`s cover publishers |
 
 The SFU computes the content of every hint; `sfuplane` only converts types and keeps no encoding or share-list state.
 On `Resync()` the SFU re-sends one `CodecPolicyEvent` per share and the last `QualityHintEvent` per share, if one was
-sent.
+sent. The one thing `sfuplane` remembers is the state the SFU last reported for each share (`ShareUpdated` carries
+the share as it is now, not what changed): that tells `Live` from `Changed`, and is forgotten on `ShareEnded`.
 
 **Values**: `ShareKind` screen/window/tab ↔ `SourceScreen/Window/Tab`; `VideoLayer` high/low/off ↔
 `QualityHigh/Low/Off`; `AudioState` on ↔ `true`; `EndReason` strings are identical in both packages; `Role`,
-`ClientKind` and `PCKind` map by name.
+`ClientKind` and `PCKind` map by name. The SFU has no `tool` client kind: `tool`, and any kind the server doesn't
+know, becomes `ClientWeb`, as the hub treats them (§8.2).
 
 **Subscription reasons** (`sfu.SubReason` → `protocol.StatusReason`): `""` while forwarded < requested → `waiting`;
 `bandwidth`, `server_limit` → `bandwidth`; `codec_mismatch`, `decoder_unavailable`, `decoder_failed` → `codec`;
-`no_preview_layer`, `no_layer` → `unavailable`.
+`no_preview_layer`, `no_layer` → `unavailable`. A status that forwards what was requested has no reason (§8.9).
 
 **Error codes** (`sfu.*` never goes on the wire):
 
@@ -2523,7 +2525,7 @@ go out with scope `pc` plus the call's `pc`, `gen` and `neg`, keeping the mapped
 | `sfu` code | Wire |
 |---|---|
 | `sfu.role_forbidden`, `sfu.not_owner` | `forbidden` (scope request; pc from the PC methods) |
-| `sfu.bad_pc`, `sfu.pc_limit` | `bad_request` (scope request; pc from the PC methods) |
+| `sfu.bad_pc`, `sfu.pc_limit` | `bad_request`, `params {field: "pc", reason: "invalid"}` for `bad_pc` and `{field: "pc", reason: "too_many"}` for `pc_limit` (scope request; pc from the PC methods) |
 | `sfu.unknown_track` | `bad_request`, `params {field: "tracks", reason: "invalid"}` (scope pc). Only for a malformed binding (02 §6.3); an m-section of a share that ended in a race is answered `a=inactive`, with no error (§9 rule 4) |
 | `sfu.too_many_subscriptions` | `bad_request`, `params {field: "subs", reason: "too_many"}` |
 | `sfu.bad_sdp`, `sfu.bad_rid` | `sdp_invalid` (scope `pc`, with `pc`, `gen`, `neg`) |
@@ -2531,9 +2533,9 @@ go out with scope `pc` plus the call's `pc`, `gen` and `neg`, keeping the mapped
 | `sfu.no_h264` | `codec_not_supported` (scope `share`, `shareId` = `Error.Share`); the hub then ends that share with `stopped` |
 | `sfu.pc_rate_limited` | `rate_limited` (scope `pc`, `retryAfterMs` = `Error.RetryAfter`) |
 | `sfu.share_not_found` | `share_not_found` (or `ignored` in `subscribe.update`) |
-| `sfu.too_many_shares` | `share_limit` (`per: "user"`) |
-| `sfu.busy`, `sfu.internal` | `internal` (retryable; scope request, or pc from the PC methods) |
-| `sfu.closed` | `not_in_room` on `CreateShare`/`UpdateShare`/`Subscribe`; nothing on a notification path; logged at debug |
+| `sfu.too_many_shares` | `share_limit`, `params {limit: 4, per: "user"}` (the SFU's guard of 4 per participant, 02 §12) |
+| `sfu.busy`, `sfu.internal` | `internal` (scope request, or pc from the PC methods) with `params {ref}`: `sfuplane` makes the 8-char id and logs it with the SFU's error (§12.1). `retryable` = `Error.Retryable`, not the catalog's flag: yes for `sfu.busy` and for an unexpected Pion error; **no** for the two kinds of `sfu.internal` that a second try can't help (02 §6.3): a call that breaks the SFU's contract (a bug in the hub or in `sfuplane`, never something a client sent: the hub validates every payload first) and a method that a later slice implements. Logged at error, `sfu.busy` at warn. An `sfu.*` code that `sfuplane` has no row for is mapped the same way |
+| `sfu.closed` | `not_in_room` on `CreateShare`/`UpdateShare`/`Subscribe`, and on `HandleOffer` (scope `pc`), whose client waits for an answer; nothing on the other notification paths; logged at debug |
 | `sfu.stale_answer` | nothing is sent; logged at debug |
 | `sfu.probe_limit` | not signaling: 04's `/api/v1/conntest` answers 429 `rate_limited` |
 
