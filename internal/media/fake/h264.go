@@ -5,7 +5,7 @@ import (
 	"strconv"
 )
 
-// H.264 NAL unit headers of the synthetic stream (nal_ref_idc and nal_unit_type, H.264 7.3.1).
+// H.264 NAL unit headers of the fake video (nal_ref_idc and nal_unit_type, H.264 7.3.1); every frame is a reference.
 const (
 	nalSPS      = 0x67 // nal_ref_idc 3, type 7
 	nalPPS      = 0x68 // nal_ref_idc 3, type 8
@@ -49,12 +49,14 @@ var levels = [...]struct {
 	{60, 4177920, 139264}, {61, 8355840, 139264}, {62, 16711680, 139264},
 }
 
-// levelFor returns the lowest level_idc whose frame size, macroblock rate and dimension limits (A.3.1: each side at
-// most sqrt(8·MaxFS) macroblocks) fit a layer.
-func levelFor(widthMBs, heightMBs, fps int) (uint8, bool) {
+// levelFor returns the lowest level_idc of at least minLevel whose frame size, macroblock rate and dimension limits
+// (A.3.1: each side at most sqrt(8·MaxFS) macroblocks) fit a layer. The table has no bitrate limits: a caller whose
+// rate these limits don't cover passes a minLevel whose MaxBR and MaxCPB do (decodableMinLevel).
+func levelFor(widthMBs, heightMBs, fps int, minLevel uint8) (uint8, bool) {
 	fs := widthMBs * heightMBs
 	for _, l := range levels {
-		if fs <= l.maxFS && fs*fps <= l.maxMBPS && widthMBs*widthMBs <= 8*l.maxFS && heightMBs*heightMBs <= 8*l.maxFS {
+		if l.idc >= minLevel && fs <= l.maxFS && fs*fps <= l.maxMBPS && widthMBs*widthMBs <= 8*l.maxFS &&
+			heightMBs*heightMBs <= 8*l.maxFS {
 			return l.idc, true
 		}
 	}
@@ -63,10 +65,10 @@ func levelFor(widthMBs, heightMBs, fps int) (uint8, bool) {
 
 // buildSPS returns the SPS NAL unit (header, then RBSP with emulation prevention) of a layer: seq_parameter_set_id 0,
 // 4:2:0 8-bit, pic_order_cnt_type 2, one reference frame, frame macroblocks only, the size padded to whole
-// macroblocks and cropped back, no VUI (H.264 7.3.2.1.1).
-func buildSPS(p profile, l VideoLayer) ([]byte, error) {
+// macroblocks and cropped back, no VUI (H.264 7.3.2.1.1). Its level_idc is levelFor's, at least minLevel.
+func buildSPS(p profile, l VideoLayer, minLevel uint8) ([]byte, error) {
 	wMBs, hMBs := (l.Width+15)/16, (l.Height+15)/16
-	level, ok := levelFor(wMBs, hMBs, l.FPS)
+	level, ok := levelFor(wMBs, hMBs, l.FPS, minLevel)
 	if !ok {
 		return nil, fmt.Errorf("%w: layer %q: %dx%d@%d is above H.264 level 6.2", ErrInvalidConfig, l.RID,
 			l.Width, l.Height, l.FPS)
@@ -208,11 +210,24 @@ func (w *bitWriter) se(v int64) {
 	}
 }
 
-// trailing writes rbsp_trailing_bits and returns the RBSP.
-func (w *bitWriter) trailing() []byte {
-	w.u(1, 1)
+// align writes zero bits up to the next byte boundary (pcm_alignment_zero_bit, H.264 7.3.5).
+func (w *bitWriter) align() {
 	if w.nbit != 0 {
 		w.u(8-w.nbit, 0)
 	}
+}
+
+// bytes writes whole bytes; the writer must be at a byte boundary.
+func (w *bitWriter) bytes(p []byte) {
+	if w.nbit != 0 {
+		panic("fake: bitWriter.bytes off a byte boundary")
+	}
+	w.b = append(w.b, p...)
+}
+
+// trailing writes rbsp_trailing_bits and returns the RBSP.
+func (w *bitWriter) trailing() []byte {
+	w.u(1, 1)
+	w.align()
 	return w.b
 }

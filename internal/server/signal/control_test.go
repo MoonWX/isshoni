@@ -165,8 +165,8 @@ func expectInvalidate(t *testing.T, c *signaltest.Client, topics ...protocol.Top
 	ping(t, c)
 }
 
-// Notify targets (01 §19): all, a user, admins; admin topics reach admins only; a room target matches nothing
-// before rooms exist.
+// Notify targets (01 §19): all, a user, admins; admin topics reach admins only; a room target matches nobody outside
+// the room (TestNotifyRoom has room targets).
 func TestNotify(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		e := newEnv(t)
@@ -201,7 +201,7 @@ func TestNotify(t *testing.T) {
 		}
 
 		e.hub.Notify(signal.Target{UserID: c.UserID}, protocol.TopicAdminSettings) // not an admin
-		e.hub.Notify(signal.Target{RoomID: "lounge"}, protocol.TopicRooms)         // nobody is in a room yet
+		e.hub.Notify(signal.Target{RoomID: "lounge"}, protocol.TopicRooms)         // nobody is in a room (TestNotifyRoom)
 		e.hub.Notify(signal.Target{All: true})                                     // no topics
 		for _, cl := range all {
 			ping(t, cl)
@@ -217,7 +217,8 @@ func TestNotify(t *testing.T) {
 	})
 }
 
-// CloseRoom and Snapshot before rooms exist (README S19): the closed id is recorded, the snapshot is empty.
+// CloseRoom of a room nobody is in records the closed id (TestCloseRoom has the rest); the snapshot has no rooms
+// while nobody is in one.
 func TestCloseRoomAndSnapshot(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		e := newEnv(t)

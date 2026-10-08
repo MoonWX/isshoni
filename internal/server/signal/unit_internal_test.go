@@ -239,3 +239,18 @@ func TestShareMediaKindString(t *testing.T) {
 		}
 	}
 }
+
+// A connection that leaves with a share end reason makes its participant leave with the same reason, except
+// server_shutdown, which is for shares only (01 §8.6).
+func TestParticipantLeftReason(t *testing.T) {
+	for give, want := range map[protocol.EndReason]protocol.EndReason{
+		protocol.EndReasonLeft:           protocol.EndReasonLeft,
+		protocol.EndReasonDisconnected:   protocol.EndReasonDisconnected,
+		protocol.EndReasonRoomClosed:     protocol.EndReasonRoomClosed,
+		protocol.EndReasonServerShutdown: protocol.EndReasonDisconnected,
+	} {
+		if got := participantLeftReason(give); got != want {
+			t.Errorf("%s: %s, want %s", give, got, want)
+		}
+	}
+}

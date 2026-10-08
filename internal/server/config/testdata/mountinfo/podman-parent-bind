@@ -1,0 +1,7 @@
+612 580 0:52 / / rw,relatime - overlay overlay rw,lowerdir=/home/user/.local/share/containers/storage/overlay/l/CCCC,upperdir=/home/user/.local/share/containers/storage/overlay/1a2b/diff,workdir=/home/user/.local/share/containers/storage/overlay/1a2b/work,userxattr
+613 612 0:55 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw
+614 612 0:56 / /dev rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,uid=1000,gid=1000,inode64
+615 612 0:57 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs rw
+616 612 0:58 / /run/.containerenv rw,nosuid,nodev,relatime - tmpfs tmpfs rw,size=1591788k,nr_inodes=397947,mode=700,uid=1000,gid=1000,inode64
+617 612 253:2 /srv/isshoni\040state /var/lib rw,relatime - ext4 /dev/mapper/vg-root rw
+618 612 0:59 / /run/isshoni rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=1024k

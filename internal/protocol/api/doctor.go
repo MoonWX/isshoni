@@ -67,7 +67,7 @@ type DoctorCheck struct {
 	ID         string         `json:"id"`
 	Status     DoctorStatus   `json:"status"`
 	Code       string         `json:"code"` // message template key, e.g. "udp_buffers.low"
-	Params     map[string]any `json:"params,omitempty"`
+	Params     map[string]any `json:"params,omitempty" tstype:"{ [key: string]: unknown }"`
 	Message    string         `json:"message"` // English, for the CLI
 	FixCode    string         `json:"fixCode,omitempty"`
 	Fix        string         `json:"fix,omitempty"` // English, for the CLI

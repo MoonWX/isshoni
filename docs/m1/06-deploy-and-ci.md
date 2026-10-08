@@ -950,10 +950,10 @@ vars:
 | `dev:web` | `npm --prefix web run dev` with env `ISSHONI_VERSION={{.VERSION}}` | Vite on 5173; proxies `/api` and `/ws` to 127.0.0.1:8080 (`05` owns `vite.config.ts`) |
 | `dev:setup-url` | `go run ./cmd/isshoni setup-url --config deploy/dev/isshoni.dev.toml` | first-run admin link |
 | `gen` | `deps: [tools]`; `.bin/tygo generate` (config `tygo.yaml`, content owned by `01`; both `internal/protocol` and `internal/protocol/api`), then `go run ./internal/protocol/gen/tsregistry -o web/src/protocol/registry.gen.ts` | |
-| `gen:check` | `gen`, then fail if `git status --porcelain -- web/src/protocol/` prints anything (changed or new untracked files) | the CI drift check |
+| `gen:check` | `gen`, then fail if `git status --porcelain -- 'web/src/protocol/*.gen.ts'` prints anything (changed or new untracked generated files; hand-written files there are not checked) | the CI drift check |
 | `test` | `test:go`, `test:web`, `test:sh` | |
 | `test:go` | `CGO_ENABLED=1 go test -race -count=1 -timeout 15m ./...` | the race detector needs cgo; the shipped binary stays `CGO_ENABLED=0` |
-| `test:web` | `npm --prefix web test -- --run` | Vitest |
+| `test:web` | `npm --prefix web test -- --run`, then `node --test scripts/licenses.test.mjs` in `web/` | Vitest; the license script's tests run under Node's test runner (CI runs them in the `licenses` job) |
 | `test:sh` | `deploy/test/install_unit.sh` under dash, `bash --posix` and busybox | |
 | `lint` | `lint:go`, `lint:web`, `lint:sh`, `lint:actions`, `lint:keys`, `lint:pins`, `lint:unit` | |
 | `lint:go` | `golangci-lint run`, `go mod tidy -diff`, `GOOS=darwin go vet ./...`, `GOOS=windows go vet ./...` | |
@@ -1061,7 +1061,7 @@ task dev:setup-url        # in a second terminal: open the printed link, create 
 | `.github/workflows/nightly.yml` | `schedule: '17 3 * * *'`, `workflow_dispatch` | slow and flaky-prone checks (8.5) |
 | `.github/workflows/release.yml` | `push` tags `v*`, `workflow_dispatch` (dry run) | section 9 |
 | `.github/workflows/site.yml` | `push` to `main` (paths `docs/**`), `workflow_dispatch`, `workflow_call` | section 10 |
-| `.github/dependabot.yml` | weekly | `gomod` (`/`, `/tools`), `npm` (`/web`, `/docs`), `github-actions`, `docker` (`/deploy/docker`); minor and patch updates grouped per ecosystem; `target-branch: m1/server-web` for every ecosystem while M1 lands there (README §4), switched to `main` after M1. The tools pinned in `.tool-versions` (Task, golangci-lint, shfmt) are ignored in `/tools` and bumped by hand |
+| `.github/dependabot.yml` | weekly | `gomod` (`/`, `/tools`), `npm` (`/web`, `/docs`), `github-actions`, and `docker` (`/deploy/docker`) once S68 adds the Dockerfile (Dependabot's update job fails on a directory without one); minor and patch updates grouped per ecosystem; `target-branch: m1/server-web` for every ecosystem while M1 lands there (README §4), switched to `main` after M1. The tools pinned in `.tool-versions` (Task, golangci-lint, shfmt) are ignored in `/tools` and bumped by hand |
 
 **Rules for every workflow:**
 - Top-level `permissions: contents: read`; jobs raise permissions individually.
@@ -1922,7 +1922,7 @@ Anything beyond these, such as a reload, a second tap, a re-join or a second log
 | Level | Test | Asserts |
 |---|---|---|
 | Unit | `deploy/test/install_unit.sh` (11.1) | parsing, normalization, version order, checksum lookup, signature fail-closed cases, `ss` parsing, key block |
-| Unit | `web/scripts/licenses.test.mjs` (Vitest) | the SPDX `OR`/`AND` rules; a missing license fails; a GPL-only dev dep fails; `(MIT OR GPL-3.0)` passes; overrides apply |
+| Unit | `web/scripts/licenses.test.mjs` (Node's test runner: `task test:web` and the CI `licenses` job) | the SPDX `OR`/`AND` rules; a missing license fails; a GPL-only dev dep fails; `(MIT OR GPL-3.0)` passes; overrides apply |
 | Unit | `tools/notices` golden test on a fixture module tree | deterministic output; Apache `NOTICE` included; a non-allowlisted license fails; the Go runtime entry is present |
 | Unit | `tools/relserve` | `/latest` redirect format matches GitHub's; files served; the CA verifies |
 | Static | `lint-deploy` | shellcheck, shfmt, actionlint, `systemd-analyze verify`, the key block, `.tool-versions` = `go.mod` toolchain |

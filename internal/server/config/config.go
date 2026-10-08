@@ -1,5 +1,7 @@
-// Package config loads the server configuration (docs/m1/04-server-platform.md §4) and owns secrets.json and the
-// data-directory layout (§5).
+// Package config loads the server configuration (docs/m1/04-server-platform.md §4) and owns the data directory
+// (§5): its layout (Paths), serve's startup checks (SetPrivateUmask, PrepareDataDir, the container data-volume check,
+// ApplyMemoryLimit), the data-directory lock (LockDataDir) and secrets.json (OpenSecrets, SecretStore). A problem
+// there that a restart can't fix is an *OperatorError wrapping ErrNeedsOperator, on which serve exits 78.
 //
 // Values come from four sources, highest first: command-line flags, ISSHONI_* environment variables, the TOML file
 // and the built-in defaults (policy keys have a fifth, the admin UI setting in the database, §4.6). Every key is

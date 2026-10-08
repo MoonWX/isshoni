@@ -1,0 +1,15 @@
+1040 947 0:167 / / rw,relatime master:520 - overlay overlay rw,lowerdir=/var/lib/docker/overlay2/l/AAAA:/var/lib/docker/overlay2/l/BBBB,upperdir=/var/lib/docker/overlay2/0f1e/diff,workdir=/var/lib/docker/overlay2/0f1e/work
+1041 1040 0:170 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw
+1042 1040 0:171 / /dev rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755
+1043 1042 0:172 / /dev/pts rw,nosuid,noexec,relatime - devpts devpts rw,gid=5,mode=620,ptmxmode=666
+1044 1040 0:173 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs ro
+1045 1044 0:30 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw,nsdelegate,memory_recursiveprot
+1046 1042 0:169 / /dev/mqueue rw,nosuid,nodev,noexec,relatime - mqueue mqueue rw
+1047 1042 0:174 / /dev/shm rw,nosuid,nodev,noexec,relatime - tmpfs shm rw,size=65536k
+1048 1040 8:1 /var/lib/docker/containers/0f1e/resolv.conf /etc/resolv.conf rw,relatime - ext4 /dev/sda1 rw,discard
+1049 1040 8:1 /var/lib/docker/containers/0f1e/hostname /etc/hostname rw,relatime - ext4 /dev/sda1 rw,discard
+1050 1040 8:1 /var/lib/docker/containers/0f1e/hosts /etc/hosts rw,relatime - ext4 /dev/sda1 rw,discard
+1051 1040 0:175 / /run/isshoni rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=1024k,uid=65532,gid=65532
+948 1041 0:170 /bus /proc/bus ro,nosuid,nodev,noexec,relatime - proc proc rw
+949 1041 0:170 /sys /proc/sys ro,nosuid,nodev,noexec,relatime - proc proc rw
+950 1041 0:176 / /proc/acpi ro,relatime - tmpfs tmpfs ro

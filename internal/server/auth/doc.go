@@ -4,7 +4,8 @@
 // The package imports only the store and internal/protocol/api (04 §2). It never reads config: the wiring passes
 // plain option structs.
 //
-// What exists so far (README slice S08: 03 slice 4 and the origin.go part of 03 slice 3):
+// What exists so far (README slice S08: 03 slice 4 and the origin.go part of 03 slice 3; S24: the service.go
+// declarations):
 //   - tokens.go: random tokens, keyed HMAC-SHA-256 token hashes, key fingerprints and the rotation check (§3.2,
 //     §4.6);
 //   - username.go: NormalizeUsername, the PRECIS username rules (§7.1);
@@ -14,12 +15,12 @@
 //   - useragent.go: DescribeUserAgent (§7.4);
 //   - origin.go: CSRFGuard, the REST cross-origin and Content-Type check (§7.5);
 //   - errors.go: FieldError and the field codes of the rules, ErrNoCookie;
-//   - service.go: the types of §7.13 that do not depend on the store (Origins, Method, the Reason* codes,
-//     AdminAlert and AdminAlerter, ReqMeta, Link and the request inputs).
+//   - service.go: the whole Go API of §7.13 (README S24): Service with every M1 method, Options, New, Principal,
+//     ActorOf, ConnSelector/ConnCloser, the results and inputs. The bodies return a not-implemented error wrapping
+//     api internal until S30 and the later auth slices fill them in; the M2 device-flow methods come with their api
+//     DTOs in 03 slice 15.
 //
-// The Service (New, Options, Principal, ConnCloser, sessions, setup, invites, registration, revocation and the rest
-// of §7.13) needs the store and internal/protocol/api, which are built in parallel with this slice. It comes with the
-// sessions and login slice (README S30): New validates Keys, purges rows after a key rotation (rotatedKeys), builds
-// the hasher, the throttles and the CSRFGuard, and the service methods turn FieldError, errHashBusy and refused
-// throttles into *api.Error values (validation_failed, server_busy, rate_limited).
+// The sessions and login slice (README S30) fills in New: it validates Keys, purges rows after a key rotation
+// (rotatedKeys), builds the hasher, the throttles and the CSRFGuard, and the service methods turn FieldError,
+// errHashBusy and refused throttles into *api.Error values (validation_failed, server_busy, rate_limited).
 package auth

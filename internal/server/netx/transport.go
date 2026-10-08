@@ -26,8 +26,8 @@ import (
 type TransportOptions struct {
 	UDPAddr           string   // listen.ice_udp; "" = no UDP. A host binds only that address; none binds every kept one
 	TCPAddr           string   // listen.ice_tcp; "" = no 7882/tcp
-	PortMux           *PortMux // 443 ICE sub-listener; nil in off mode
-	MaxICEConnsPerIP  int      // 64 per IPKey (0 means 64); shares PortMux's ICE count when PortMux is set (one count for 443 and 7882)
+	PortMux           *PortMux // 443 ICE sub-listener (from ListenPortMux); nil in off mode
+	MaxICEConnsPerIP  int      // 64 per IPKey (0 means 64); ignored when PortMux is set: 7882/tcp then shares PortMux's ICE count (one count for 443 and 7882)
 	ExcludeInterfaces []string // network.exclude_interfaces globs ("docker*", "br-*", …)
 	IncludeLoopback   bool     // network.include_loopback (development)
 	IPv6              bool     // network.ipv6; the wiring passes false when public_ipv6 = "off"
@@ -357,13 +357,9 @@ func (t *Transport) buildTCP(ctx context.Context, opts TransportOptions, plan ad
 	}
 
 	if opts.PortMux != nil {
-		ln := opts.PortMux.ICE()
-		if ln == nil {
-			return nil, nil, errors.New("netx: PortMux has no ICE listener")
-		}
 		// PortMux already limits and counts these connections. The wrapper makes Close close the ones pion still
 		// holds (see iceListener), whatever PortMux's own Close does, so a silent client can't hold shutdown.
-		t.ln443 = newICEListener(ln, nil, nil, log)
+		t.ln443 = newICEListener(opts.PortMux.ICE(), nil, nil, log)
 		if err := addListener(t.ln443, ViaTCP443); err != nil {
 			return nil, nil, err
 		}
