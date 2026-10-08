@@ -1,6 +1,8 @@
 // viewerStore (05 §6.1): room.state snapshots become tiles and focus events; per-share state follows the shares.
+// The re-publish cases follow the snapshots the protocol produces (01 §10.5, §10.6, §11.6).
 import { describe, expect, it, vi } from 'vitest';
 
+import type { ShareInfo } from '../protocol/types.gen';
 import { room, SELF, shareInfo, status } from './testing';
 import { createViewerStore, type ViewerState } from './viewerStore';
 
@@ -13,6 +15,7 @@ describe('viewerStore: defaults', () => {
       focusedShareId: null,
       focusMode: 'auto',
       audibleShareId: null,
+      ended: [],
       audio: 'locked',
       volume: 1,
       fullscreen: false,
@@ -96,32 +99,168 @@ describe('viewerStore.syncRoom', () => {
     expect(store.getState()).toMatchObject({ focusedShareId: 's_c', audibleShareId: 's_c', focusMode: 'auto' });
   });
 
-  it('hands focus, audio and the tile position to a re-published share of the same user', () => {
-    const store = createViewerStore();
+  describe('re-published shares (01 §10.6)', () => {
     const a = shareInfo('s_a', 'u_bea', 1);
     const b = shareInfo('s_b', 'u_cy', 2);
-    store.getState().syncRoom(room(a, b), SELF);
-    store.getState().focusShare('s_a');
-    // The server restarted: both shares are back under new ids, each naming the one it replaces.
-    store
-      .getState()
-      .syncRoom(
-        room(shareInfo('s_b2', 'u_cy', 30, { replaces: 's_b' }), shareInfo('s_a2', 'u_bea', 31, { replaces: 's_a' })),
-        SELF,
-      );
-    const s = store.getState();
-    expect(ids(s)).toEqual(['s_b2', 's_a2']);
-    expect(s).toMatchObject({ focusedShareId: 's_a2', audibleShareId: 's_a2', focusMode: 'manual' });
-  });
+    const a2 = (overrides: Partial<ShareInfo> = {}) =>
+      shareInfo('s_a2', 'u_bea', 30, { replaces: 's_a', ...overrides });
+    const b2 = (overrides: Partial<ShareInfo> = {}) => shareInfo('s_b2', 'u_cy', 31, { replaces: 's_b', ...overrides });
 
-  it('carries nothing over when `replaces` names another user’s share', () => {
-    const store = createViewerStore();
-    store.getState().syncRoom(room(shareInfo('s_a', 'u_bea', 1)), SELF);
-    store.getState().focusShare('s_a');
-    store.getState().syncRoom(room(shareInfo('s_x', 'u_cy', 30, { replaces: 's_a' })), SELF);
-    // s_a ended (the pick with it), and s_x is just the newest share.
-    expect(store.getState()).toMatchObject({ focusedShareId: 's_x', focusMode: 'auto' });
-    expect(ids(store.getState())).toEqual(['s_x']);
+    /** A store that shows a and b, with the older one, a, picked. */
+    function picked() {
+      const store = createViewerStore();
+      const sync = (...shares: ShareInfo[]) => {
+        store.getState().syncRoom(room(...shares), SELF);
+      };
+      sync(a, b);
+      store.getState().focusShare('s_a');
+      return { store, sync };
+    }
+
+    it('keeps a pick and its sound across a server restart (01 §11.6)', () => {
+      const { store, sync } = picked();
+      // The new server's first room.state after room.join lists no shares.
+      sync();
+      expect(store.getState()).toMatchObject({ shares: [], focusedShareId: null, focusMode: 'auto' });
+      // Both sharers re-publish: a share in `starting` has no tile yet.
+      sync(a2({ status: 'starting', layers: [] }), b2({ status: 'starting', layers: [] }));
+      expect(store.getState()).toMatchObject({ shares: [], focusedShareId: null, audibleShareId: null });
+      sync(a2(), b2());
+      const s = store.getState();
+      expect(ids(s)).toEqual(['s_b2', 's_a2']);
+      expect(s).toMatchObject({ focusedShareId: 's_a2', audibleShareId: 's_a2', focusMode: 'manual', ended: [] });
+    });
+
+    it('keeps the pick whichever share is live again first', () => {
+      const { store, sync } = picked();
+      sync();
+      sync(a2({ status: 'starting' }), b2());
+      // Until the picked share is back, the stage shows what there is.
+      expect(store.getState()).toMatchObject({ focusedShareId: 's_b2', audibleShareId: 's_b2', focusMode: 'auto' });
+      sync(a2(), b2());
+      expect(store.getState()).toMatchObject({ focusedShareId: 's_a2', audibleShareId: 's_a2', focusMode: 'manual' });
+
+      // And the other way round.
+      const other = picked();
+      other.sync();
+      other.sync(a2(), b2({ status: 'starting' }));
+      other.sync(a2(), b2());
+      expect(other.store.getState()).toMatchObject({
+        focusedShareId: 's_a2',
+        audibleShareId: 's_a2',
+        focusMode: 'manual',
+      });
+    });
+
+    it('keeps the pick when the sharer was gone for a while and re-published (01 §10.5)', () => {
+      const { store, sync } = picked();
+      // The server ended a's share; later its sharer is back.
+      sync(b);
+      expect(store.getState()).toMatchObject({ focusedShareId: 's_b', audibleShareId: 's_b', focusMode: 'auto' });
+      sync(b, a2({ status: 'starting' }));
+      sync(b, a2());
+      const s = store.getState();
+      expect(s).toMatchObject({ focusedShareId: 's_a2', audibleShareId: 's_a2', focusMode: 'manual' });
+      expect(ids(s)).toEqual(['s_a2', 's_b']);
+    });
+
+    it('hands over, with the tile position, when one snapshot swaps the shares', () => {
+      const { store, sync } = picked();
+      // Here s_a2 re-published last, so it is the newest: each one still sits where the share it replaces was.
+      sync(b2(), a2({ startedAt: '2026-10-12T19:40:00.000Z' }));
+      const s = store.getState();
+      expect(ids(s)).toEqual(['s_b2', 's_a2']);
+      expect(s).toMatchObject({ focusedShareId: 's_a2', audibleShareId: 's_a2', focusMode: 'manual' });
+
+      const one = picked();
+      one.sync(b, a2());
+      expect(ids(one.store.getState())).toEqual(['s_b', 's_a2']);
+      expect(one.store.getState()).toMatchObject({ focusedShareId: 's_a2', focusMode: 'manual' });
+    });
+
+    it('hands over at once when the replaced share is still listed, and keeps the pick when that one ends', () => {
+      const { store, sync } = picked();
+      // The server still holds the sharer's old connection: the old share is stalled next to the new one.
+      const stalled = { ...a, status: 'stalled' as const };
+      sync(stalled, b, a2());
+      expect(ids(store.getState())).toEqual(['s_b', 's_a2', 's_a']);
+      expect(store.getState()).toMatchObject({ focusedShareId: 's_a2', audibleShareId: 's_a2', focusMode: 'manual' });
+      sync(b, a2());
+      expect(ids(store.getState())).toEqual(['s_b', 's_a2']);
+      expect(store.getState()).toMatchObject({ focusedShareId: 's_a2', audibleShareId: 's_a2', focusMode: 'manual' });
+    });
+
+    it('lets a pick made between the end and the re-publish win', () => {
+      const { store, sync } = picked();
+      sync(b);
+      store.getState().focusShare('s_b');
+      sync(b, a2());
+      const s = store.getState();
+      expect(s).toMatchObject({ focusedShareId: 's_b', audibleShareId: 's_b', focusMode: 'manual' });
+      expect(ids(s)).toEqual(['s_a2', 's_b']);
+    });
+
+    it('carries nothing over when `replaces` names another user’s share', () => {
+      const { store, sync } = picked();
+      sync(b, shareInfo('s_x', 'u_cy', 30, { replaces: 's_a' }));
+      // s_a ended (the pick with it), and s_x is just the newest share.
+      expect(store.getState()).toMatchObject({ focusedShareId: 's_x', audibleShareId: 's_x', focusMode: 'auto' });
+      expect(ids(store.getState())).toEqual(['s_x', 's_b']);
+
+      // The same when s_a ended in an earlier snapshot.
+      const later = picked();
+      later.sync(b);
+      later.sync(b, shareInfo('s_x', 'u_cy', 30, { replaces: 's_a' }));
+      expect(later.store.getState()).toMatchObject({ focusedShareId: 's_x', audibleShareId: 's_x', focusMode: 'auto' });
+    });
+
+    it('gives the sound back to a share heard through its speaker button, unless the user chose another since', () => {
+      const c = shareInfo('s_c', 'u_cy', 3);
+      const listening = () => {
+        const store = createViewerStore();
+        const sync = (...shares: ShareInfo[]) => {
+          store.getState().syncRoom(room(...shares), SELF);
+        };
+        sync(a, b, c);
+        store.getState().setAudible('s_a');
+        sync(b, c);
+        expect(store.getState()).toMatchObject({ focusedShareId: 's_c', audibleShareId: 's_c' });
+        return { store, sync };
+      };
+
+      const back = listening();
+      back.sync(b, c, a2());
+      expect(back.store.getState()).toMatchObject({ focusedShareId: 's_c', audibleShareId: 's_a2', focusMode: 'auto' });
+
+      const chosen = listening();
+      chosen.store.getState().setAudible('s_b');
+      chosen.sync(b, c, a2());
+      expect(chosen.store.getState()).toMatchObject({ focusedShareId: 's_c', audibleShareId: 's_b' });
+
+      // Pressing the speaker button of the share that plays already is a choice too.
+      const same = listening();
+      same.store.getState().setAudible('s_c');
+      same.sync(b, c, a2());
+      expect(same.store.getState()).toMatchObject({ focusedShareId: 's_c', audibleShareId: 's_c' });
+    });
+
+    it('keeps the pick when the page was in no room in between: syncRoom(null) is not reset()', () => {
+      const { store, sync } = picked();
+      store.getState().syncRoom(null, SELF);
+      expect(store.getState()).toMatchObject({ shares: [], focusedShareId: null, focusMode: 'auto' });
+      sync(a2(), b2());
+      expect(store.getState()).toMatchObject({ focusedShareId: 's_a2', audibleShareId: 's_a2', focusMode: 'manual' });
+    });
+
+    it('forgets the ended shares on reset()', () => {
+      const { store, sync } = picked();
+      sync();
+      expect(store.getState().ended).toHaveLength(2);
+      store.getState().reset();
+      expect(store.getState().ended).toEqual([]);
+      sync(a2());
+      expect(store.getState()).toMatchObject({ focusedShareId: 's_a2', focusMode: 'auto' });
+    });
   });
 
   it('keeps the entry of an unchanged share and replaces the one whose details changed', () => {
@@ -277,6 +416,7 @@ describe('viewerStore: actions', () => {
       focusMode: 'auto',
       audibleShareId: null,
       pendingFocusParam: null,
+      ended: [],
       fullscreen: false,
       pipShareId: null,
       visible: {},

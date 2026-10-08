@@ -404,7 +404,8 @@ describe('SubscriberPC: recovery (05 §9, 01 §10.4)', () => {
     await vi.advanceTimersByTimeAsync(14_999);
     expect(restarts()).toEqual([]);
     await vi.advanceTimersByTimeAsync(1);
-    expect(restarts()).toEqual([{ pc: 'sub', gen: 1, mode: 'rebuild', reason: 'disconnected' }]);
+    // The reason of 01 §10.4 and §11.5 C for an ICE restart that did not connect.
+    expect(restarts()).toEqual([{ pc: 'sub', gen: 1, mode: 'rebuild', reason: 'failed' }]);
   });
 
   it('starts the 15 s from the restart offer also when it had already sent its own request', async () => {
@@ -419,7 +420,7 @@ describe('SubscriberPC: recovery (05 §9, 01 §10.4)', () => {
     await vi.advanceTimersByTimeAsync(14_000);
     expect(restarts()).toEqual([ICE]);
     await vi.advanceTimersByTimeAsync(1000);
-    expect(restarts()).toEqual([ICE, { pc: 'sub', gen: 1, mode: 'rebuild', reason: 'disconnected' }]);
+    expect(restarts()).toEqual([ICE, { pc: 'sub', gen: 1, mode: 'rebuild', reason: 'failed' }]);
   });
 
   it('asks for no rebuild when the ICE restart connects within 15 s', async () => {
@@ -646,6 +647,88 @@ describe('SubscriberPC: negotiation failures (01 §9 rule 8)', () => {
     expect(restarts()).toEqual([REBUILD]);
   });
 
+  it('asks again every 10 s for the rebuild of a PC that stays connected, until the new PC comes', async () => {
+    await sub.handleOffer(offer(1, 1, AV_A));
+    const pc = lastPc();
+    pc.setConnectionState('connected');
+    // The offer that adds s_b can't be applied here. Media of s_a keeps flowing: the PC stays connected.
+    const withB = offer(1, 2, [...AV_A, { mid: '2', kind: 'video', share: 's_b' }]);
+    pc.failNext('setRemoteDescription', new DOMException('bad sdp', 'InvalidAccessError'));
+    await sub.handleOffer(withB);
+    expect(restarts()).toEqual([REBUILD]);
+
+    // That request is lost: no gen 2 comes, only the server's resends of the offer, which get no answer.
+    await vi.advanceTimersByTimeAsync(9_999);
+    await sub.handleOffer(withB);
+    expect(sent('pc.answer')).toHaveLength(1);
+    expect(restarts()).toEqual([REBUILD]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(restarts()).toEqual([REBUILD, REBUILD]);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(restarts()).toEqual([REBUILD, REBUILD, REBUILD]);
+    // Asking again is no second negotiation failure, and the PC still plays s_a.
+    expect(ui.getState().screen).toBeNull();
+    expect(sub.state).toBe('connected');
+    expect(viewer.registry.shareIds()).toEqual(['s_a']);
+
+    // The new PC's offer comes: nothing more is asked.
+    await sub.handleOffer(offer(2, 1, [...AV_A, { mid: '2', kind: 'video', share: 's_b' }], 'srv2'));
+    lastPc().setConnectionState('connected');
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(restarts()).toHaveLength(3);
+    expect(viewer.registry.shareIds()).toEqual(['s_a', 's_b']);
+  });
+
+  it('does not call the media port unreachable because a connected PC’s rebuild had to be asked for often', async () => {
+    await sub.handleOffer(offer(1, 1, AV_A));
+    lastPc().setConnectionState('connected');
+    server.error(sdpInvalid());
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(restarts()).toHaveLength(5);
+    expect(sub.state).toBe('connected');
+    // From the 5th request on they are 30 s apart.
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(restarts()).toHaveLength(5);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(restarts()).toHaveLength(6);
+
+    await sub.handleOffer(offer(2, 1, AV_A, 'srv2'));
+    expect(sub.state).toBe('reconnecting');
+    expect(viewer.store.getState().media).toBe('reconnecting');
+    lastPc().setConnectionState('connected');
+    expect(sub.state).toBe('connected');
+  });
+
+  it('asks again for a rebuild that went into a dying socket, once signaling is back', async () => {
+    await sub.handleOffer(offer(1, 1, AV_A));
+    lastPc().setConnectionState('connected');
+    server.error(sdpInvalid());
+    expect(restarts()).toEqual([REBUILD]);
+    // The socket drops and stays down past the 10 s spacing; the resumed welcome's Resync() brings no new PC.
+    server.autoOpen = false;
+    server.drop();
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(restarts()).toEqual([REBUILD]);
+    server.accept();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(signal.state).toBe('ready');
+    expect(server.welcomes.at(-1)?.resumed).toBe(true);
+    expect(restarts()).toEqual([REBUILD, REBUILD]);
+    expect(ui.getState().screen).toBeNull();
+  });
+
+  it('does not ask again for the rebuild of a connected PC that was asked for because of its ICE state', async () => {
+    await sub.handleOffer(offer(1, 1, AV_A));
+    const pc = lastPc();
+    pc.setConnectionState('connected');
+    pc.setConnectionState('failed');
+    expect(restarts()).toEqual([REBUILD]);
+    // It recovers by itself before the server rebuilt it.
+    pc.setConnectionState('connected');
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(restarts()).toEqual([REBUILD]);
+  });
+
   it('ignores stale_negotiation, errors of other scopes or PCs, and errors about an older gen', async () => {
     await sub.handleOffer(offer(2, 1, AV_A));
     server.error(makeError('stale_negotiation', 'pc', { pc: 'sub', gen: 2, neg: 1 }));
@@ -673,7 +756,7 @@ describe('SubscriberPC: negotiation failures (01 §9 rule 8)', () => {
   it('repeats a rate-limited restart request after retryAfterMs', async () => {
     await sub.handleOffer(offer(1, 1, AV_A));
     lastPc().setConnectionState('connected');
-    // An explicit rebuild of a connected PC: nothing but the rate-limit retry would ask again.
+    // An explicit rebuild of a connected PC. The server's wait is longer than the 10 s spacing: it decides.
     sub.requestRestart('rebuild', 'failed');
     expect(restarts()).toEqual([REBUILD]);
     sub.handleError(makeError('rate_limited', 'pc', { pc: 'sub', gen: 1, retryAfterMs: 12_000 }));
@@ -681,6 +764,32 @@ describe('SubscriberPC: negotiation failures (01 §9 rule 8)', () => {
     expect(restarts()).toEqual([REBUILD]);
     await vi.advanceTimersByTimeAsync(1);
     expect(restarts()).toEqual([REBUILD, REBUILD]);
+  });
+
+  it('keeps the 10 s spacing when the rate limit asks for a shorter wait', async () => {
+    await sub.handleOffer(offer(1, 1, AV_A));
+    lastPc().setConnectionState('connected');
+    sub.requestRestart('rebuild', 'failed');
+    sub.handleError(makeError('rate_limited', 'pc', { pc: 'sub', gen: 1, retryAfterMs: 2_000 }));
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(restarts()).toEqual([REBUILD]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(restarts()).toEqual([REBUILD, REBUILD]);
+  });
+
+  it('does not hold back the next PC’s requests with the rate-limit wait of the one before', async () => {
+    await sub.handleOffer(offer(1, 1, AV_A));
+    lastPc().setConnectionState('connected');
+    lastPc().setConnectionState('failed');
+    expect(restarts()).toEqual([REBUILD]);
+    sub.handleError(makeError('rate_limited', 'pc', { pc: 'sub', gen: 1, retryAfterMs: 60_000 }));
+    // The wait holds back the repeat that the 10 s spacing alone would allow.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(restarts()).toEqual([REBUILD]);
+    // The server makes a new PC for its own reasons (02 §8.5): gen 2 comes, and fails too.
+    await sub.handleOffer(offer(2, 1, AV_A, 'srv2'));
+    lastPc().setConnectionState('failed');
+    expect(restarts()).toEqual([REBUILD, { ...REBUILD, gen: 2 }]);
   });
 
   it('does not repeat a rate-limited ICE restart once the PC is connected again', async () => {

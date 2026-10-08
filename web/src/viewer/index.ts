@@ -11,6 +11,12 @@
 // room switch, a welcome that was not resumed):
 //   new SubscriberPC({ platform, signal, log, registry: viewer.registry, store: viewer.store, ui })
 //
+// Re-published shares (`replaces`, 01 §10.6): the store remembers the shares that ended, with what they had, so a
+// share that comes back under a new id gets the stage, the pick and the sound back, also after a server restart,
+// where the shares are gone for a few snapshots (01 §11.6). For that the session keeps calling syncRoom after every
+// welcome, resumed or not, and calls viewer.store.getState().reset() only when the user leaves the room. The
+// speaker button (S47) goes through the store's setAudible, which drops the remembered sound.
+//
 // Declared now, filled in by later slices ("interfaces first", docs/m1/README.md §4):
 // - audioOut.ts: createAudioOut() throws NotImplementedError until S47 (the one <audio> element, tap to unmute);
 // - layerPolicy.ts: desiredSubscriptions() throws NotImplementedError until S56.

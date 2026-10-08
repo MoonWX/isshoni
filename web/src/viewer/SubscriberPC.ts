@@ -18,10 +18,12 @@
 // - disconnected: signal.probe() at once; after 3 s still disconnected → pc.restart {mode: 'ice'}.
 // - A sub offer with a new ice-ufrag IS the ICE restart, whoever asked for it (this class, or the server's Resync()
 //   after a resumed welcome): it cancels the 3 s timer and starts a 15 s timer; still not connected then →
-//   pc.restart {mode: 'rebuild', reason: 'disconnected'}.
+//   pc.restart {mode: 'rebuild', reason: 'failed'} (the reason of 01 §10.4 and §11.5 C, which are normative here).
 // - failed → pc.restart {mode: 'rebuild', reason: 'failed'} at once.
-// - At most one ICE restart per 5 s and one rebuild per 10 s. After 5 rebuilds without connecting the state is
-//   'unreachable' ("Can't reach the server's media port") and rebuilds go on every 30 s.
+// - At most one ICE restart per 5 s and one rebuild per 10 s. A rebuild that brought no new PC is asked for again
+//   after that spacing while it is still needed: the PC is not connected, or the rebuild was for a negotiation
+//   failure or a caller's request. After 5 rebuilds without connecting the state is 'unreachable' ("Can't reach the
+//   server's media port") and rebuilds go on every 30 s.
 // - While signaling isn't ready, state changes are only recorded; the requests go out on `ready`. A resumed welcome
 //   by itself asks for nothing. A welcome that is not resumed means the server has no sub PC for this connection any
 //   more and gen starts at 1 again (01 §9 rule 2): the local PC is dropped.
@@ -316,7 +318,8 @@ export class SubscriberPC {
   /**
    * Asks the server (the sub PC's offerer) for an ICE restart or a rebuild: pc.restart {pc: 'sub', gen, mode,
    * reason}. The request waits for signaling to be ready and for the spacing of 05 §9 (one ICE restart per 5 s, one
-   * rebuild per 10 s); a rebuild outranks a pending ICE restart. A no-op without a PC.
+   * rebuild per 10 s); a rebuild outranks a pending ICE restart, and is asked for again after its spacing until the
+   * new PC's offer comes. A no-op without a PC.
    */
   requestRestart(mode: RestartMode, reason: RestartReason): void {
     if (!this.#pc || this.#fatal) return;
@@ -390,7 +393,8 @@ export class SubscriberPC {
     }
     if (o.neg === this.#neg) {
       // The same offer again (the server's resend after a resume, or every 15 s without an answer): replay. Without
-      // a stored answer this offer failed here, and the rebuild that was asked for is on its way.
+      // a stored answer this offer failed here: the rebuild was asked for, and is asked for again every 10 s until
+      // the new PC's offer comes (#pump).
       if (this.#lastAnswer) this.#answerSent = this.#signal.notify(MessageTypePCAnswer, this.#lastAnswer);
       return;
     }
@@ -439,6 +443,9 @@ export class SubscriberPC {
 
   /** Closes the current PC, if any, and makes the one of generation gen. */
   #replacePc(gen: number): void {
+    // Rebuilds count towards 'unreachable' while the PC doesn't connect. One that replaces a connected PC (after a
+    // negotiation failure), however often it had to be asked for, starts no such run.
+    if (this.#health === 'connected') this.#rebuilds = 0;
     this.#teardownPc();
     this.#gen = gen;
     // Candidates that came ahead of this gen's offer stay; older ones are of a PC that is gone.
@@ -493,6 +500,9 @@ export class SubscriberPC {
     this.#offPc = null;
     this.#disconnectTimer.clear();
     this.#iceRestartTimer.clear();
+    // A rate-limit wait ends with the PC it was about: the next PC asks when it needs to, and the server says so
+    // again if its limit still holds.
+    this.#rateLimitTimer.clear();
     this.#neg = 0;
     this.#lastAnswer = null;
     this.#answerSent = false;
@@ -631,7 +641,8 @@ export class SubscriberPC {
     this.#wants.ice = null;
     this.#iceRestartTimer.set(() => {
       if (this.#health === 'connected') return;
-      this.#wants.rebuild ??= RestartReasonDisconnected;
+      // 01 §10.4 (sub table) and §11.5 C: the reason is `failed`, as for a PC that failed.
+      this.#wants.rebuild ??= RestartReasonFailed;
       this.#pump();
     }, ICE_RESTART_TIMEOUT_MS);
   }
@@ -641,8 +652,11 @@ export class SubscriberPC {
     if (!this.#pc || this.#fatal || this.#signal.state !== 'ready') return;
     const reason = this.#wants.rebuild;
     if (reason !== null) {
-      if (this.#rebuildCooling) return;
-      if (!this.#send(RestartModeRebuild, reason, this.#wants.forced)) return;
+      // One rebuild per 10 s. And when the server rate-limited the last request (its limit on PC creations,
+      // 01 §12.1), none before retryAfterMs is over: that timer pumps.
+      if (this.#rebuildCooling || this.#rateLimitTimer.active) return;
+      const forced = this.#wants.forced;
+      if (!this.#send(RestartModeRebuild, reason, forced)) return;
       this.#wants = noWants();
       this.#disconnectTimer.clear();
       this.#iceRestartTimer.clear();
@@ -652,8 +666,14 @@ export class SubscriberPC {
       this.#rebuildCooldown.set(
         () => {
           this.#rebuildCooling = false;
-          // No new PC came and this one still isn't connected (a lost or refused request): ask again.
-          if (this.#pc && this.#gen === gen && this.#health !== 'connected') this.#wants.rebuild ??= reason;
+          // No new PC came (the request was lost or refused) and the rebuild is still needed: ask again. A forced
+          // one is needed whatever the ICE state: after a negotiation failure this PC can stay connected, yet it
+          // takes no further offer, and the server's resends of the failed one get no answer. Asking again for the
+          // same gen is no second negotiation failure.
+          if (this.#pc && this.#gen === gen && (forced || this.#health !== 'connected')) {
+            this.#wants.rebuild ??= reason;
+            this.#wants.forced ||= forced;
+          }
           this.#pump();
         },
         this.#rebuilds >= MAX_FAST_REBUILDS ? REBUILD_SLOW_SPACING_MS : REBUILD_SPACING_MS,

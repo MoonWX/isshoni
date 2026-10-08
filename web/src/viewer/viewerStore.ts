@@ -2,7 +2,8 @@
 // import React write it (RoomSession feeds it room.state through syncRoom, SubscriberPC its connection state); the
 // components read it with useViewer() (viewer/context.ts).
 //
-// It holds the shares that have a tile, in tile order, with the focus state of autoFocus.ts; the audio unlock state
+// It holds the shares that have a tile, in tile order, with the focus state of autoFocus.ts (which also remembers
+// the shares that ended, so that a re-published share gets back the stage and the sound); the audio unlock state
 // and volume (05 §10.3, filled in by S47's audioOut); fullscreen, PiP and visibility (05 §12.4–§12.5, S56); what the
 // server forwards per share (subscribe.status, 05 §10.4); and the state of the sub PC (05 §9).
 import { createStore, type StoreApi } from 'zustand/vanilla';
@@ -13,7 +14,14 @@ import {
   type ShareInfo,
   type SubscriptionStatus,
 } from '../protocol/types.gen';
-import { focusReducer, initialFocusState, type FocusEvent, type FocusShare, type FocusState } from './autoFocus';
+import {
+  focusReducer,
+  initialFocusState,
+  withoutRememberedSound,
+  type FocusEvent,
+  type FocusShare,
+  type FocusState,
+} from './autoFocus';
 
 /** A share that has a tile: live or stalled (shares in `starting` get none, 01 §4.4). */
 export interface ViewerShare extends FocusShare {
@@ -75,9 +83,10 @@ export interface ViewerData extends FocusState<ViewerShare> {
 
 export interface ViewerActions {
   /**
-   * Takes a room.state snapshot (null: not in a room): shares that went live get a tile, ended ones lose theirs, a
-   * re-published share takes the place of the one it replaces, and the focus follows 05 §12.2. Per-share state of
-   * shares that are gone is dropped.
+   * Takes a room.state snapshot (null: not in a room): shares that went live get a tile, ended ones lose theirs, and
+   * the focus follows 05 §12.2. A re-published share gets what the share it replaces had (01 §10.6), also when that
+   * one ended in an earlier snapshot, as it does after a server restart: the ended shares are remembered until
+   * reset(). Per-share state of shares that are gone is dropped.
    */
   syncRoom(room: RoomSnapshot | null, self: ViewerSelf): void;
   /** Runs one focus event through the reducer (autoFocus.ts). */
@@ -96,7 +105,9 @@ export interface ViewerActions {
   applyStatus(subs: readonly SubscriptionStatus[]): void;
   setMedia(media: SubMediaState): void;
   /**
-   * Back to the state of a page that is in no room: no shares, auto-focus, nothing per share, no fullscreen or PiP.
+   * Back to the state of a page that is in no room: no shares, auto-focus, nothing per share, no fullscreen or PiP,
+   * no memory of ended shares. Call it when the user leaves the room, not for a reconnect: after a welcome that was
+   * not resumed the room's snapshots keep going to syncRoom, so that re-published shares take over (01 §10.6).
    * What belongs to the page stays: the volume, the audio unlock, the sub PC's state (SubscriberPC.close() resets
    * that one) and the page's visibility.
    */
@@ -136,6 +147,7 @@ function focusOf(s: ViewerData): FocusState<ViewerShare> {
     focusMode: s.focusMode,
     audibleShareId: s.audibleShareId,
     pendingFocusParam: s.pendingFocusParam,
+    ended: s.ended,
   };
 }
 
@@ -172,7 +184,10 @@ function sameShare(a: ViewerShare, info: ShareInfo, ownerName: string, self: Vie
   );
 }
 
-/** The focus events that turn the known shares into the snapshot's: replacements, then ends, then new ones. */
+/**
+ * The focus events that turn the known shares into the snapshot's: re-published shares first (one whose replaced
+ * share goes in this snapshot takes its place before it goes), then the shares that went, then the new ones.
+ */
 function roomEvents(
   known: readonly ViewerShare[],
   room: RoomSnapshot | null,
@@ -186,7 +201,6 @@ function roomEvents(
 
   const replaced: FocusEvent<ViewerShare>[] = [];
   const live: FocusEvent<ViewerShare>[] = [];
-  const handedOver = new Set<string>();
   for (const info of tiled) {
     const ownerName = names.get(info.userId) ?? '';
     const before = knownById.get(info.id);
@@ -200,19 +214,18 @@ function roomEvents(
       info,
       ownerName,
     };
-    // A re-publish (01 §10.6) hands over only when this page saw the replaced share, of the same user, and that
-    // share is gone now; otherwise the new share is simply new, and the old one ends on its own.
-    const old = info.replaces === undefined || before ? undefined : knownById.get(info.replaces);
-    if (old && old.userId === info.userId && !tiledIds.has(old.id) && !handedOver.has(old.id)) {
-      handedOver.add(old.id);
-      replaced.push({ type: 'shareReplaced', share, replaces: old.id });
+    // A re-publish (01 §10.6) that gets its tile now. The reducer knows what the replaced share had, whether it
+    // still has its tile or ended in an earlier snapshot (after a server restart the first room.state has no
+    // shares, and the new share is `starting` before it is live), and checks that both are of the same user.
+    if (!before && info.replaces !== undefined && info.replaces !== '') {
+      replaced.push({ type: 'shareReplaced', share, replaces: info.replaces });
     } else {
       live.push({ type: 'shareLive', share });
     }
   }
-  const ended: FocusEvent<ViewerShare>[] = known
-    .filter((s) => !tiledIds.has(s.id) && !handedOver.has(s.id))
-    .map((s) => ({ type: 'shareEnded', shareId: s.id }));
+  // One event for all that went, so each is remembered as it was before this snapshot.
+  const gone = known.filter((s) => !tiledIds.has(s.id)).map((s) => s.id);
+  const ended: FocusEvent<ViewerShare>[] = gone.length > 0 ? [{ type: 'shareEnded', shareIds: gone }] : [];
   // New shares oldest first: room.state lists them by startedAt, and each one that is newer takes the focus in turn.
   return [...replaced, ...ended, ...live];
 }
@@ -255,10 +268,12 @@ export function createViewerStore(opts: ViewerStoreOptions = {}): ViewerStore {
       },
       setAudible(shareId) {
         const s = get();
-        if (s.audibleShareId === shareId) return;
         // Only a share with a tile that this page receives can be heard: never the own preview.
         if (shareId !== null && !s.shares.some((share) => share.id === shareId && !share.local)) return;
-        set({ audibleShareId: shareId });
+        // The user chose what to hear: a share that comes back later doesn't take the sound from that choice.
+        const ended = withoutRememberedSound(s.ended);
+        if (s.audibleShareId === shareId && ended === s.ended) return;
+        set({ audibleShareId: shareId, ended });
       },
       setAudio(audio) {
         set({ audio });
