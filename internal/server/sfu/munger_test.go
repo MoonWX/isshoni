@@ -142,6 +142,46 @@ func TestMungerPauseResumeKeepsContinuity(t *testing.T) {
 	}
 }
 
+// restart ends forwarding without a pause (the DownTrack calls it when a packet never left the server): the output
+// goes on with the next keyframe of the target, right after the last own seq and with the layer's timestamp offset,
+// and packets from before the restart are not replayed.
+func TestMungerRestart(t *testing.T) {
+	f := newLayer(SlotF, video)
+	m := videoMunger(SlotF)
+	if _, ok := m.current(); ok {
+		t.Fatal("a munger that forwards nothing has a current slot")
+	}
+	out := feed(m, t0, vp(f, 10, 100, true), vp(f, 11, 3100, false))
+	if slot, ok := m.current(); !ok || slot != SlotF {
+		t.Fatalf("current = %v, %v; want f", slot, ok)
+	}
+
+	m.restart()
+	if _, ok := m.current(); ok || !m.active || !m.waitingForKeyframe() {
+		t.Fatalf("after restart: current %v, active %v, waiting %v; want an active munger that waits for a keyframe", ok,
+			m.active, m.waitingForKeyframe())
+	}
+	_, _, v := m.process(vp(f, 12, 6100, false), t0+3*tick)
+	if v != verdictWaitKeyframe {
+		t.Fatalf("a delta packet after restart: verdict %d, want it to wait for a keyframe", v)
+	}
+	if _, _, v := m.process(vp(f, 11, 3100, false), t0+3*tick); v != verdictDrop {
+		t.Fatalf("a packet from before the restart: verdict %d, want it dropped", v)
+	}
+	out2 := feed(m, t0+4*tick, vp(f, 13, 9100, true), vp(f, 14, 12100, false))
+	if len(out2) != 2 || out2[0].v != verdictNewEpoch {
+		t.Fatalf("after restart the next keyframe starts an epoch, got %+v", out2)
+	}
+	assertContinuous(t, append(out, out2...))
+	if tsOff := out[0].ts - 100; out2[0].ts != 9100+tsOff {
+		t.Fatalf("restart on the same layer: ts %d, want upstream ts + the old offset %d", out2[0].ts, 9100+tsOff)
+	}
+	m.setTarget(SlotF, false)
+	if _, ok := m.current(); ok {
+		t.Fatal("a paused munger has a current slot")
+	}
+}
+
 // S4 port: TestMungerDropsReorderedPacketsFromBeforeSwitch.
 func TestMungerDropsReorderedPacketsFromBeforeSwitch(t *testing.T) {
 	f, q := newLayer(SlotF, video), newLayer(SlotQ, video)

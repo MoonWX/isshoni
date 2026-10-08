@@ -14,8 +14,7 @@ type Subscription struct {
 	conn         *Conn
 	share        *Share
 	video, audio *DownTrack
-	// What the client asked for. Which layer and whether audio is actually forwarded is the media path's (README S41,
-	// S52), which also sends the SubscriptionStateEvents.
+	// What the client asked for; apply turns it into what the DownTracks forward.
 	reqVideo Quality
 	reqAudio bool
 }
@@ -23,10 +22,28 @@ type Subscription struct {
 // tracks returns the subscription's DownTracks, video first.
 func (s *Subscription) tracks() [2]*DownTrack { return [2]*DownTrack{s.video, s.audio} }
 
-// detach takes the subscription's DownTracks off the share's fan-out lists.
+// apply makes the DownTracks follow what the client asked for. In this slice a request names its layer directly:
+// high is the full layer f, low the preview layer q, off nothing, and audio flows while Audio is set. A layer the
+// publisher doesn't send simply forwards nothing. The fallbacks of 02 §10.1 (high from q when there is no f), the
+// reasons and the SubscriptionStateEvents are README S52's; the caps of the allocator and the codec state S84's and
+// S69's.
+func (s *Subscription) apply() {
+	switch s.reqVideo {
+	case QualityHigh:
+		s.video.setTarget(SlotF, true)
+	case QualityLow:
+		s.video.setTarget(SlotQ, true)
+	default:
+		s.video.setTarget(SlotF, false)
+	}
+	s.audio.setTarget(SlotAudio, s.reqAudio)
+}
+
+// detach takes the subscription's DownTracks off the share's fan-out lists and ends their writers.
 func (s *Subscription) detach() {
 	for _, dt := range s.tracks() {
 		s.share.removeDownTrack(dt)
+		dt.stop()
 	}
 }
 
@@ -70,6 +87,7 @@ func (c *Conn) updateSubscriptions(items []SubscriptionUpdate) ([]error, error) 
 		}
 		created = created || made
 		sub.reqVideo, sub.reqAudio = it.Video, it.Audio
+		sub.apply()
 	}
 	if created {
 		c.subChanged()
@@ -77,7 +95,8 @@ func (c *Conn) updateSubscriptions(items []SubscriptionUpdate) ([]error, error) 
 	return errs, nil
 }
 
-// subscription returns the Conn's subscription to a share, creating it (and the sub PC) when it is new.
+// subscription returns the Conn's subscription to a share, creating it (and the sub PC) when it is new. A new
+// subscription's DownTracks are paused, on the share's fan-out lists and on the sub PC, with their writers running.
 func (c *Conn) subscription(id ShareID) (sub *Subscription, created bool, err error) {
 	if sub := c.subs[id]; sub != nil {
 		return sub, false, nil
@@ -112,6 +131,9 @@ func (c *Conn) subscription(id ShareID) (sub *Subscription, created bool, err er
 			}
 			return nil, false, newError(CodeInternal, "the sub PC refused a track")
 		}
+	}
+	for _, dt := range sub.tracks() {
+		c.writers.Go(func() { dt.run(c.stop) })
 	}
 	c.subs[id] = sub
 	return sub, true, nil

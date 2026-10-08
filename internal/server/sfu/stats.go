@@ -9,10 +9,11 @@ import (
 )
 
 // This file declares what the SFU reports about itself (02 §6.2, §13): ShareInfo for the hub, ConnStats for 01's
-// stats message, Snapshot for the admin dashboard and Metrics for 04's Prometheus adapter. The core slice (README
-// S29) fills in what the object model knows: rooms, Conns, shares with their attached layers, and subscriptions.
-// Rates, loss, sizes, transports, RTT and every counter stay zero until the media path (S41) and the observability
-// slice (S79) measure them; the types don't change then.
+// stats message, Snapshot for the admin dashboard and Metrics for 04's Prometheus adapter. ShareInfo is complete: the
+// media path measures each layer (size, frame rate, bitrate, loss, activity) and knows a share's profile and its
+// viewers. Snapshot, ConnStats and Metrics hold what the object model knows: rooms, Conns, and shares with their
+// ShareInfo. Their rates, viewer counts, transports, RTTs and counters stay zero until the observability slice
+// (README S79) sums up what the Layers and DownTracks count; the types don't change then.
 
 // ShareInfo describes a share (02 §6.2). Ended shares are never listed.
 type ShareInfo struct {
@@ -249,8 +250,8 @@ func (s *SFU) Snapshot() Snapshot {
 	return snap
 }
 
-// Metrics returns the counters and gauges of 02 §13 with every label value present. In this slice only the Conn and
-// share gauges count; the media path (README S41 and later) and S79 fill in the rest.
+// Metrics returns the counters and gauges of 02 §13 with every label value present. Only the Conn and share gauges
+// count so far; README S79 fills in the rest from what the Layers and DownTracks count.
 func (s *SFU) Metrics() Metrics {
 	m := newMetrics()
 	s.mu.Lock()
@@ -270,8 +271,8 @@ func (s *SFU) Metrics() Metrics {
 	return m
 }
 
-// Stats returns the Conn's media view (02 §13). In this slice it lists the shares the Conn publishes, with their
-// attached layers; PCs, subscriptions and the downlink estimate are README S79's.
+// Stats returns the Conn's media view (02 §13). It lists the shares the Conn publishes, with what the SFU measures
+// of their video layers; PCs, subscriptions, the audio numbers and the downlink estimate are README S79's.
 func (c *Conn) Stats() ConnStats {
 	var st ConnStats
 	for _, info := range c.room.shareInfos() {

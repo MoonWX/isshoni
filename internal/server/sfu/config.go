@@ -67,5 +67,21 @@ const (
 	closeTimeout     = time.Second           // SFU.Close gives the Conns this long to close their PCs
 )
 
-// rtpReadBuffer holds one incoming RTP or RTCP packet (Pion's receive MTU is 1460).
-const rtpReadBuffer = 1500
+// The media path (02 §5.4, §9).
+const (
+	// rtpReadBuffer holds one incoming RTP or RTCP packet (Pion's receive MTU is 1460).
+	rtpReadBuffer = 1500
+	// A DownTrack's queue: packets waiting for its writer. A full queue drops the packet (counted), so a writer that
+	// falls behind never holds up the layer's read loop or other viewers (02 §9.3).
+	videoQueueLen = 1024
+	audioQueueLen = 256
+	// pliInterval is the least time between two keyframe requests for one layer (02 §9.7).
+	pliInterval = 500 * time.Millisecond
+	// tickInterval is the SFU ticker's period, and the least time between two debounced ShareUpdated calls for one
+	// share; every statsEvery-th tick does the once-a-second work (02 §5.4).
+	tickInterval = 250 * time.Millisecond
+	statsEvery   = int(time.Second / tickInterval)
+	// A layer's rates are 2 s moving averages, and a layer without a packet for 2 s isn't active (02 §9.1).
+	rateWindow  = 2 * time.Second
+	activeAfter = 2 * time.Second
+)

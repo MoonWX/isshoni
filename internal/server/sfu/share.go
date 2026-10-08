@@ -22,6 +22,12 @@ type Share struct {
 	source    SourceKind
 	startedAt time.Time
 
+	// notify orders the share's RoomEvents calls: the ticker holds it while it reports ShareUpdated, and SFU.endShare
+	// while it ends the share and reports ShareEnded, so nothing is ever reported about a share after its end. It is
+	// the one lock held across a RoomEvents call (which never blocks); it is taken before mu, and never while mu or
+	// another lock of doc.go's order is held.
+	notify sync.Mutex
+
 	mu      sync.Mutex // guards the fields below
 	preset  Preset
 	state   ShareState
@@ -29,6 +35,17 @@ type Share struct {
 	liveAt  time.Time
 	profile ProfileKey
 	layers  [SlotAudio + 1]*Layer // by Slot; nil while no track is attached
+	// What the ticker still has to report with ShareUpdated (02 §6.2): updates are the share as it was at each state
+	// change, oldest first, none of which is ever merged away; dirty says that a layer, the profile or the audio
+	// changed since the last report while the share was live; notified is when the last report went out (monoNow),
+	// for the 250 ms debounce of those changes.
+	updates  []ShareInfo
+	dirty    bool
+	notified int64
+
+	// awaitsKeyframe is true while the share is pending: until its first keyframe, its video layers ask the publisher
+	// for one whenever another packet arrives (Layer.handleRTP). The layers' read loops read it without a lock.
+	awaitsKeyframe atomic.Bool
 
 	// The fan-out lists: the DownTracks of every subscription to this share, by kind. They are copied on write (under
 	// mu), so the media path reads them without a lock (02 §5.4).
@@ -87,20 +104,42 @@ func (s *Share) info() (ShareInfo, bool) {
 	return s.infoLocked(), !s.ended
 }
 
-// infoLocked builds the ShareInfo; s.mu is held.
+// infoLocked builds the ShareInfo; s.mu is held. The layers' numbers and the viewers come from atomics, so no other
+// lock is taken.
 func (s *Share) infoLocked() ShareInfo {
 	info := ShareInfo{
 		ID: s.id, Room: s.room.id, Participant: s.part.id, User: s.part.user, Conn: s.conn.id,
 		Source: s.source, Preset: s.preset, State: s.state, Profile: s.profile,
 		Audio:     s.layers[SlotAudio] != nil,
+		Viewers:   s.viewers(),
 		StartedAt: s.startedAt, LiveAt: s.liveAt,
 	}
+	now := monoNow()
 	for _, slot := range [...]Slot{SlotF, SlotH, SlotQ} {
 		if l := s.layers[slot]; l != nil {
-			info.Layers = append(info.Layers, LayerInfo{RID: slot.String()})
+			info.Layers = append(info.Layers, l.info(now))
 		}
 	}
 	return info
+}
+
+// viewers returns the participants a DownTrack of this share forwards to now, sorted and without repeats
+// (ShareInfo.Viewers).
+func (s *Share) viewers() []ParticipantID {
+	var out []ParticipantID
+	for _, list := range [...]*atomic.Pointer[[]*DownTrack]{&s.video, &s.audio} {
+		dts := list.Load()
+		if dts == nil {
+			continue
+		}
+		for _, dt := range *dts {
+			if id := dt.sub.conn.part.id; dt.forwarding.Load() && !slices.Contains(out, id) {
+				out = append(out, id)
+			}
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 // liveState returns the share's state, and false once it has ended.
@@ -145,6 +184,7 @@ func (s *Share) attach(l *Layer) (replaced *Layer, ok bool) {
 	}
 	replaced = s.layers[l.slot]
 	s.layers[l.slot] = l
+	s.changedLocked()
 	return replaced, true
 }
 
@@ -154,19 +194,117 @@ func (s *Share) detach(l *Layer) {
 	defer s.mu.Unlock()
 	if s.layers[l.slot] == l {
 		s.layers[l.slot] = nil
+		s.changedLocked()
 	}
 }
 
-// end marks the share ended, detaches its layers and empties its fan-out lists. It returns the last ShareInfo and
-// the Conns that subscribed to the share, without repeats. Only SFU.endShare calls it, once, after taking the share
-// out of the registry.
-func (s *Share) end() (ShareInfo, []*Conn) {
+// layer returns the Layer attached for a slot, or nil.
+func (s *Share) layer(slot Slot) *Layer {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	info := s.infoLocked()
+	return s.layers[slot]
+}
+
+// attached returns the Layers attached now.
+func (s *Share) attached() []*Layer {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*Layer
+	for _, l := range s.layers {
+		if l != nil {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// requestKeyframe asks the publisher for a keyframe on the layer attached for slot, at most once per 500 ms and
+// layer (02 §9.7, Layer.requestKeyframe). Without a layer there it does nothing: the layer's first packets ask.
+func (s *Share) requestKeyframe(slot Slot) {
+	if l := s.layer(slot); l != nil {
+		l.requestKeyframe(monoNow())
+	}
+}
+
+// keyframe notes that a packet starting a keyframe arrived on video layer l, in the given profile (the layer's read
+// loop calls it). The first one makes a pending share live (02 §5.3); it reports whether this one did. The profile
+// of the newest keyframe is the share's. A Layer that was detached meanwhile changes nothing.
+func (s *Share) keyframe(l *Layer, profile ProfileKey) (wentLive bool) {
+	s.mu.Lock()
+	if s.ended || s.layers[l.slot] != l {
+		s.mu.Unlock()
+		return false
+	}
+	if s.profile != profile {
+		s.profile = profile
+		s.changedLocked()
+	}
+	// SharePending is the only state a keyframe ends in this slice; README S57 adds stalled, which the first keyframe
+	// of a reconnected pub PC ends the same way.
+	if s.state == SharePending {
+		s.state, s.liveAt = ShareLive, time.Now()
+		s.awaitsKeyframe.Store(false)
+		s.stateChangedLocked()
+		wentLive = true
+	}
+	s.mu.Unlock()
+	if wentLive {
+		s.conn.sfu.shareLive(s)
+	}
+	return wentLive
+}
+
+// stateChangedLocked queues a ShareUpdated for a state change, with the share as it is now; s.mu is held. A state
+// change is reported at once and never merged with another (02 §6.2). It also covers every change made before it.
+func (s *Share) stateChangedLocked() {
+	s.updates = append(s.updates, s.infoLocked())
+	s.dirty = false
+}
+
+// changedLocked notes that a layer, the profile or the audio changed; s.mu is held. That is reported only while the
+// share is live, and debounced to one ShareUpdated per 250 ms (02 §5.3, §6.2).
+func (s *Share) changedLocked() {
+	if s.state == ShareLive {
+		s.dirty = true
+	}
+}
+
+// takeUpdates returns what the ticker reports with ShareUpdated now, oldest first: every queued state change, or
+// else, when the share changed otherwise and its last report is at least 250 ms old, the share as it is. So a change
+// that follows a state change closely waits its 250 ms like any other. An ended share reports nothing more. The
+// caller holds s.notify.
+func (s *Share) takeUpdates(now int64) []ShareInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := s.updates
+	s.updates = nil
+	switch {
+	case s.ended:
+		return nil
+	case len(out) > 0:
+	case s.dirty && now-s.notified >= int64(tickInterval):
+		out = append(out, s.infoLocked())
+		s.dirty = false
+	default:
+		return nil
+	}
+	s.notified = now
+	return out
+}
+
+// end marks the share ended, detaches its layers and empties its fan-out lists. It returns the last ShareInfo, the
+// state changes the ticker hadn't reported yet (they are still reported, before the end: none is ever merged away)
+// and the Conns that subscribed to the share, without repeats. Only SFU.endShare calls it, once, after taking the
+// share out of the registry and holding s.notify.
+func (s *Share) end() (info ShareInfo, unreported []ShareInfo, subscribers []*Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	info = s.infoLocked()
+	unreported = s.updates
 	s.ended = true
 	s.layers = [SlotAudio + 1]*Layer{}
-	var subscribers []*Conn
+	s.updates, s.dirty = nil, false
+	s.awaitsKeyframe.Store(false)
 	for _, list := range []*atomic.Pointer[[]*DownTrack]{&s.video, &s.audio} {
 		if dts := list.Swap(nil); dts != nil {
 			for _, dt := range *dts {
@@ -176,7 +314,7 @@ func (s *Share) end() (ShareInfo, []*Conn) {
 			}
 		}
 	}
-	return info, subscribers
+	return info, unreported, subscribers
 }
 
 // fanOut returns the share's fan-out list for a kind.

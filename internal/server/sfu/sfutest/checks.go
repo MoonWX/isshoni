@@ -70,6 +70,26 @@ func Frames(pkts []Packet) []Frame {
 	return frames
 }
 
+// WithoutPartialTail drops the packets of the newest video frame when its last packet (the one with the RTP marker
+// bit) hasn't arrived yet: a test that takes its snapshot while the stream still runs can land inside a frame.
+func WithoutPartialTail(pkts []Packet) []Packet {
+	frames := Frames(pkts)
+	if len(frames) == 0 {
+		return pkts
+	}
+	last := frames[len(frames)-1]
+	if last.MarkerBits > 0 && last.MarkerOnLast {
+		return pkts
+	}
+	out := make([]Packet, 0, len(pkts))
+	for _, p := range pkts {
+		if p.TS != last.TS {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // CheckContinuous checks that the packets form one continuous stream (the S4 check): in sequence-number order, no
 // sequence number is missing or received twice, and timestamps never go back.
 func CheckContinuous(pkts []Packet) error {

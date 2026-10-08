@@ -101,6 +101,19 @@ func (m *munger) setTarget(slot Slot, active bool) bool {
 	return changed
 }
 
+// restart ends the current epoch without pausing: the output starts again, right after the last own seq, with the
+// next keyframe of the target. The DownTrack calls it when a packet the munger numbered never left the server
+// (02 §9.3): to the viewer the stream then simply begins, or goes on, with a keyframe, as after a pause.
+func (m *munger) restart() { m.forwarding = false }
+
+// current returns the slot of the layer forwarded now, and false while nothing is forwarded.
+func (m *munger) current() (Slot, bool) {
+	if !m.active || !m.forwarding {
+		return 0, false
+	}
+	return m.newest().layer.slot, true
+}
+
 // waitingForKeyframe reports whether the munger waits for a keyframe of the target slot before it forwards it: it is
 // active and forwards nothing, or another slot. The DownTrack requests a keyframe when this becomes true. (A new
 // Layer instance or a new profile in the target slot is noticed only when its packets arrive: process then returns

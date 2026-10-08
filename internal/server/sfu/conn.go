@@ -46,6 +46,9 @@ type Conn struct {
 	subGen uint32 // the gen of the newest sub PC; 0 before the first
 	subs   map[ShareID]*Subscription
 	cands  [PCSub + 1]remoteCandidates // by PCKind
+	// writers are the writer goroutines of the Conn's DownTracks. Each ends when its subscription goes
+	// (DownTrack.stop), and at the latest when the Conn closes (stop); teardown waits for all of them.
+	writers sync.WaitGroup
 }
 
 // newConn builds a Conn; SFU.Join registers it and starts its actor.
@@ -220,8 +223,10 @@ func (c *Conn) run() {
 	}
 }
 
-// teardown runs on the actor after Close: it drops the queued events, takes the Conn's DownTracks off their shares
-// and closes both PCs, concurrently, waiting for the pub PC's readers. Commands still queued get sfu.closed from do.
+// teardown runs on the actor after Close: it drops the queued events, takes the Conn's DownTracks off their shares,
+// which ends their writers, and closes both PCs, concurrently, waiting for the pub PC's track readers and the sub
+// PC's RTCP readers. When it returns the Conn has no goroutine left but the actor. Commands still queued get
+// sfu.closed from do.
 func (c *Conn) teardown() {
 	c.events.close()
 	for id, sub := range c.subs {
@@ -238,6 +243,9 @@ func (c *Conn) teardown() {
 		wg.Go(func() { s.close(c.log) })
 	}
 	wg.Wait()
+	// The writers end with their subscriptions, and at the latest with the Conn (c.stop). A write never blocks
+	// (02 §5.4), so none of them is far from seeing it.
+	c.writers.Wait()
 }
 
 // ---- PeerConnection state, shared by both kinds ----
@@ -266,9 +274,21 @@ func (c *Conn) onPCState(kind PCKind, gen uint32, pc *webrtc.PeerConnection) {
 	switch state {
 	case webrtc.PeerConnectionStateConnected:
 		if kind == PCSub {
-			// The DTLS-ready gate (02 §9.3): Pion drops RTP written before DTLS is up, so DownTracks of this PC forward
-			// only from now on. README S41 adds the keyframe requests that go with it.
+			// The DTLS-ready gate (02 §9.3, S4 finding 1): Pion drops RTP written before DTLS is up, so the DownTracks
+			// of this PC forward only from now on, and each video one asks its publisher for a keyframe to start with.
 			c.sub.ready.Store(true)
+			for _, sub := range c.subs {
+				sub.video.requestKeyframe()
+			}
+		} else {
+			// Connected again after a drop or an ICE restart: what the viewers missed meanwhile is gone, so every
+			// video layer of this PC gets a keyframe request (02 §9.7). On the first connect no track has arrived yet.
+			now := monoNow()
+			for _, t := range c.pub.tracks {
+				if l := t.layer.Load(); l != nil {
+					l.requestKeyframe(now)
+				}
+			}
 		}
 	case webrtc.PeerConnectionStateDisconnected, webrtc.PeerConnectionStateFailed:
 	case webrtc.PeerConnectionStateClosed:

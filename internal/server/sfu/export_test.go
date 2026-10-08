@@ -61,6 +61,9 @@ type SubscriptionState struct {
 	VideoBound, AudioBound bool
 	// VideoPTs maps the H.264 profiles the viewer can receive to its payload types (the video binding's ptFor).
 	VideoPTs map[ProfileKey]uint8
+	// VideoSent and AudioSent count the RTP packets written to the viewer; VideoDrops and AudioDrops those a full
+	// DownTrack queue dropped.
+	VideoSent, AudioSent, VideoDrops, AudioDrops uint64
 }
 
 // Subscriptions returns the Conn's subscriptions, sorted by share id.
@@ -73,6 +76,8 @@ func (c *Conn) Subscriptions(ctx context.Context) ([]SubscriptionState, error) {
 				st.VideoBound, st.VideoPTs = true, b.ptFor
 			}
 			st.AudioBound = sub.audio.binding.Load() != nil
+			st.VideoSent, st.VideoDrops = sub.video.stats.packets.Load(), sub.video.stats.drops.Load()
+			st.AudioSent, st.AudioDrops = sub.audio.stats.packets.Load(), sub.audio.stats.drops.Load()
 			out = append(out, st)
 		}
 		return nil

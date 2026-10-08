@@ -141,6 +141,9 @@ func TestRoomEventLog(t *testing.T) {
 		evs[2].Kind != ShareEnded || evs[2].Reason != sfu.EndReasonStopped || evs[2].Room != "r" {
 		t.Errorf("Events = %+v", evs)
 	}
+	if evs[0].At.IsZero() || evs[1].At.Before(evs[0].At) || evs[2].At.Before(evs[1].At) || time.Since(evs[2].At) > time.Minute {
+		t.Errorf("the calls' times: %v, %v, %v", evs[0].At, evs[1].At, evs[2].At)
+	}
 	ev, err := l.Wait(context.Background(), func(ev RoomEvent) bool { return ev.Kind == ShareEnded })
 	if err != nil || ev.Share.ID != "s_1" {
 		t.Errorf("Wait = %+v, %v", ev, err)
