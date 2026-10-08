@@ -685,7 +685,7 @@ func TestProbeAPIsIPv4Only(t *testing.T) {
 			v6 = append(v6, c)
 		}
 	}
-	if len(v4) != 2 || len(v6) != 2 {
+	if len(v4) != 2 || len(v6) != 1 {
 		t.Skipf("no dual-stack loopback here: Advertised %+v", tr.Advertised)
 	}
 	a := newTestAPIs(t, tr)

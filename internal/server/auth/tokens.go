@@ -12,7 +12,6 @@ import (
 	"io"
 	"log/slog"
 	"slices"
-	"time"
 
 	"github.com/MoonWX/isshoni/internal/server/store"
 )
@@ -158,7 +157,7 @@ func (s *Service) syncKeyFingerprints(ctx context.Context) ([]string, error) {
 			return nil
 		}
 		rotated = s.keys.rotatedKeys(storedSession, storedInvite)
-		if err := purgeRotated(q, rotated, now); err != nil {
+		if err := purgeRotated(q, rotated); err != nil {
 			return err
 		}
 		if len(rotated) > 0 {
@@ -190,22 +189,9 @@ func metaOrEmpty(q *store.Q, key string) (string, error) {
 
 // purgeRotated removes what the changed keys protected (03 §4.6), inside New's Write:
 //   - session: every web session (their push subscriptions cascade), every device (its tokens and push subscriptions
-//     cascade) and the device codes a user decided;
-//   - invite: every setup token and password reset link, and every invite.
-//
-// Two of these rows cannot be deleted through the store's API (03 §6), which has no method for them, so the purge
-// does the closest thing the API offers:
-//   - invites are revoked (RevokeInvite), not deleted: they show as revoked on the Invites page, stop counting
-//     against the active-invite limits, and the janitor prunes them 30 days later (03 §4.7). Their tokens can never
-//     match again either way;
-//   - device codes nobody decided yet have no user, and DeleteDeviceCodesOf selects by user. None can exist in M1
-//     (the device flow is M2); such a row lives 10 minutes and Prune deletes it an hour after that.
-//
-// Deleting both, as 03 §4.6 says, needs two store methods that 03 §6 does not declare: one that deletes every
-// invite and one that deletes every device code (as DeleteAllPushSubscriptions does for the VAPID key). They belong
-// to the store, which this slice (README S30) does not touch; with them, the invite loop and the per-user
-// DeleteDeviceCodesOf call below become one call each.
-func purgeRotated(q *store.Q, rotated []string, now time.Time) error {
+//     cascade) and every device code, the ones nobody decided yet included;
+//   - invite: every setup token, every password reset link and every invite. The accounts made with an invite stay.
+func purgeRotated(q *store.Q, rotated []string) error {
 	if len(rotated) == 0 {
 		return nil
 	}
@@ -221,9 +207,9 @@ func purgeRotated(q *store.Q, rotated []string, now time.Time) error {
 			if _, err := q.DeleteDevices(u.ID); err != nil {
 				return err
 			}
-			if err := q.DeleteDeviceCodesOf(u.ID); err != nil {
-				return err
-			}
+		}
+		if _, err := q.DeleteAllDeviceCodes(); err != nil {
+			return err
 		}
 	}
 	if slices.Contains(rotated, keyNameInvite) {
@@ -235,14 +221,8 @@ func purgeRotated(q *store.Q, rotated []string, now time.Time) error {
 				return err
 			}
 		}
-		invites, err := q.ListInvites("", true)
-		if err != nil {
+		if _, err := q.DeleteAllInvites(); err != nil {
 			return err
-		}
-		for _, inv := range invites {
-			if err := q.RevokeInvite(inv.ID, "", now); err != nil {
-				return err
-			}
 		}
 	}
 	return nil

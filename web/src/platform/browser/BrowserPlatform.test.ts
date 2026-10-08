@@ -103,10 +103,10 @@ describe('BrowserPlatform role (05 §8)', () => {
     expect(canShareHere({ decode: [], displayCapture: true }, env(UA.safariIPhone))).toBe(false);
   });
 
-  it('the stub sharing provider rejects with NotImplementedError (S35/S46 fill it in)', async () => {
+  it('wires the in-page sharing provider (S35; its pick() is tested in share/displayMedia.test.ts)', () => {
     uninstall = sharingCapableBrowser();
     const p = new BrowserPlatform({ env: env(UA.chromeMac) });
-    await expect(p.sharing?.pick({ preset: 'auto' })).rejects.toBeInstanceOf(NotImplementedError);
+    expect(p.sharing?.mode).toBe('in-page');
   });
 });
 

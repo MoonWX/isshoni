@@ -7,8 +7,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AppProviders } from '../app/App';
 import { clearMe } from '../app/me';
+import { logout } from '../auth/logout';
 import { queryKeys } from '../protocol/queryKeys';
-import { ApiError } from '../protocol/rest';
+import { ApiError, NetworkError } from '../protocol/rest';
 import { BackoffMaxMs } from '../protocol/signal-client';
 import { makeError } from '../protocol/testing';
 import { connectionBanner } from './connection';
@@ -289,6 +290,62 @@ describe('the runtime', () => {
       expect(h.hub.joins).toEqual(['lounge', 'lounge']);
       expect(room()).toMatchObject({ roomId: 'lounge', joinState: 'joined' });
       expect(h.toasts()).toEqual([]);
+    });
+
+    // The runtime registers those calls as the logout flow's 'shares' and 'signal' steps (auth/logout.ts).
+    it('logout() runs both steps before its request: share.stop while ready, then close 1000', async () => {
+      const share = await sharingInLounge();
+      const socket = h.server.socket;
+      const seen: string[] = [];
+      const stop = share.stop.bind(share);
+      share.stop = () => {
+        seen.push(`share.stop while ${h.runtime.signal.state}`);
+        return stop();
+      };
+      vi.spyOn(h.platform, 'apiFetch').mockImplementation((path) => {
+        seen.push(`${path} while ${h.runtime.signal.state}, close ${String(socket.clientClose?.code)}`);
+        return Promise.resolve(new Response(null, { status: 204 }));
+      });
+
+      await logout({ queryClient: h.services.queryClient });
+      expect(seen).toEqual(['share.stop while ready', '/api/v1/auth/logout while stopped, close 1000']);
+      await tick();
+      expect(h.services.queryClient.getQueryData(queryKeys.me)).toBeNull();
+      expect(room()).toMatchObject({ roomId: null, joinState: 'idle', state: null });
+      expect(h.runtime.stores.connection.getState()).toMatchObject({ state: 'stopped', stopReason: null });
+      expect(h.toasts()).toEqual([]);
+      expect(h.server.sockets).toHaveLength(1);
+    });
+
+    it('logout() that cannot reach the server starts the client again: still signed in, back in the room', async () => {
+      await sharingInLounge();
+      vi.spyOn(h.platform, 'apiFetch').mockRejectedValue(new TypeError('Failed to fetch'));
+
+      await expect(logout({ queryClient: h.services.queryClient })).rejects.toBeInstanceOf(NetworkError);
+      await tick();
+      expect(h.services.queryClient.getQueryData(queryKeys.me)).toEqual({ user: { id: 'k3m9p2qxw7ht' } });
+      expect(h.hub.joins).toEqual(['lounge', 'lounge']);
+      expect(room()).toMatchObject({ roomId: 'lounge', joinState: 'joined' });
+    });
+
+    it('a failed logout() leaves a client that was not running stopped', async () => {
+      vi.spyOn(h.platform, 'apiFetch').mockRejectedValue(new TypeError('Failed to fetch'));
+
+      await expect(logout({ queryClient: h.services.queryClient })).rejects.toBeInstanceOf(NetworkError);
+      await tick();
+      expect(h.runtime.signal.state).toBe('stopped');
+      expect(h.server.sockets).toEqual([]);
+    });
+
+    it('dispose() takes the steps out of the logout flow', async () => {
+      await sharingInLounge();
+      h.runtime.dispose();
+      const start = vi.spyOn(h.runtime.signal, 'start');
+      vi.spyOn(h.platform, 'apiFetch').mockRejectedValue(new TypeError('Failed to fetch'));
+
+      await expect(logout({ queryClient: h.services.queryClient })).rejects.toBeInstanceOf(NetworkError);
+      // No 'signal' step ran, so there is nothing to undo.
+      expect(start).not.toHaveBeenCalled();
     });
   });
 

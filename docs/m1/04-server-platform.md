@@ -701,22 +701,47 @@ type Deps struct { // test seams; zero values = real implementations
 	Now        func() time.Time
 	STUN       netx.STUNClient
 	Resolver   netx.Resolver
-	PushSender push.Sender
+	PushSender push.Sender // joins the struct with the push wiring (README S71)
 	ReleaseHTTP *http.Client
+	Host       config.Host  // the machine as the data-directory checks see it (§5.1); zero = the running process
+	SPA        fs.FS        // the built web app; nil = web.Dist()
+	API, WS    http.Handler // /api/v1/ and GET /ws; nil = the real ones once wired (README S54), JSON 404 before
+	InProcess  bool         // servertest: leave the process-wide umask and Go memory limit alone
 }
 
 type Server struct{ /* … */ }
 
+// New checks cfg and builds the server. It takes no ctx, so it opens and starts nothing.
 func New(cfg *config.Config, log *slog.Logger, deps Deps) (*Server, error)
+// Start runs the startup sequence of §6.1 from step 2 on and returns once the listeners serve; Site and Addrs are
+// known from then on. Run calls it unless the caller already did (servertest needs the bound port before Run
+// blocks). On an error everything it opened is released again.
+func (s *Server) Start(ctx context.Context) error
 // Run blocks until ctx is cancelled (then shuts down gracefully) or a restore requests a restart.
 func (s *Server) Run(ctx context.Context) error
 func (s *Server) Shutdown(ctx context.Context, reason ShutdownReason) error
 func (s *Server) Site() config.Site
+func (s *Server) Addrs() Addrs // as bound: a configured port 0 shows as the port the kernel picked
+
+type Addrs struct{ HTTP net.Addr } // later slices add the 443 mux, the ICE ports and the metrics listener
 
 type ShutdownReason string // "stop" | "restart" | "restore"
 
 var ErrRestartRequested = errors.New("server: restart requested") // cmd/isshoni re-execs on this
+// A shutdown step ran out of time and closed by force what it still had (§6.4 step 7). Shutdown returns it whatever
+// the reason; Run only after a stop, where it is no failure: the warning is logged already.
+var ErrShutdownForced = errors.New("server: shutdown finished by force")
+
+// NeedsOperator reports whether err, from New, Start or Run, is a refusal of §6.3 (exit 78).
+func NeedsOperator(err error) bool
 ```
+
+`cmd/isshoni` maps `Run`'s result to the exit code (§3.2): nil → 0; `NeedsOperator(err)` → 78; `ErrRestartRequested`
+→ re-exec (§6.5; 75 where there is none); `ErrShutdownForced` → 0; anything else → 1. The server returns a refusal
+without logging it, so `cmd/isshoni` prints the one actionable message; `Start` logs the config warnings.
+
+A request handler that asks for a restart (the admin socket's restore and `rotate-secrets`) calls `Shutdown` in a
+goroutine and does not wait for it: its own request would hold up the HTTP step.
 
 ### 6.1 Startup sequence (`serve`)
 
@@ -799,6 +824,10 @@ and for a restore or `rotate-secrets` restart:
 | 5. `http.Server.Shutdown` on all servers, then `PortMux.Close()` (closes the raw :443 listener and both sub-listeners; the ICE sub-listener may already be closed by `Transport.Close`, which is harmless) | ≤ 5 s | Idle keep-alives close |
 | 6. Flush transfer counters, drain the push queue (≤ 2 s), close the admin socket, close the store (WAL checkpoint) | ≤ 2 s | |
 | 7. Exit 0 (or re-exec, §6.5) | total ≤ `shutdown_timeout` (10 s) | |
+
+A step that runs out of its budget closes by force what it still has (a request that won't finish, say), and the
+shutdown goes on: everything is released all the same. The server logs a warning, `Shutdown` returns an error
+wrapping `ErrShutdownForced`, and after a stop the process still exits 0.
 
 A second SIGTERM/SIGINT exits immediately with code 1. 06 sets systemd `TimeoutStopSec=20` and compose
 `stop_grace_period: 20s`.
@@ -1603,10 +1632,17 @@ Rules:
 | Endpoint | 200 | 503 |
 |---|---|---|
 | `GET /healthz` | `{"status":"ok"}` | `{"status":"shutting_down"}` |
-| `GET /readyz` | `{"status":"ready"}` | `{"status":"not_ready"}` |
+| `GET /readyz` | `{"status":"ready"}` | `{"status":"not_ready"}`, or `{"status":"shutting_down"}` once a shutdown began (§6.4 step 1) |
 
-Public responses carry no detail. Requests from loopback (and the admin socket's `/v1/ready`) add
-`"checks": {"db":"ok","tls":"waiting: obtaining certificate for 203.0.113.7","media":"ok"}`.
+Both answer `GET` and `HEAD` (405 otherwise) with `Cache-Control: no-store`, and keep answering during a shutdown;
+the router exempts them from its Host check (§9.3).
+
+Public responses carry no detail. On `/readyz`, requests from loopback (and the admin socket's `/v1/ready`) add
+`"checks": {"db":"ok","tls":"waiting: obtaining certificate for 203.0.113.7","media":"ok"}`. A request counts as
+loopback when its client address is a loopback address and it carries no forwarding header (`Forwarded`,
+`X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Real-Ip`, `Via`): in off mode every proxied request
+arrives from loopback, and the public must not see the checks through the proxy. The client address is the TCP peer
+unless the wiring passes `httpapi.ClientIP` with `SetClientIP` (`ops` may not import `httpapi`).
 
 ```go
 package ops
@@ -1617,6 +1653,7 @@ func NewHealth() *Health
 func (h *Health) AddCheck(name string, fn func() (ok bool, detail string))
 func (h *Health) SetMaintenance(reason string)
 func (h *Health) SetShuttingDown()
+func (h *Health) SetClientIP(fn func(*http.Request) netip.Addr) // nil = the TCP peer
 func (h *Health) Live() (ok bool, state string)
 func (h *Health) Ready() (ok bool, checks map[string]string)
 func (h *Health) Handlers() (healthz, readyz http.Handler)
@@ -2512,11 +2549,16 @@ Packages and names (exact):
 - `internal/server/push`: `New(ctx, opts)`, `Service` (`ShareStarted`, `AdminAlert`, `VAPIDPublicKey`,
   `ValidateEndpoint`, `SendTest`, `Run`), `ShareStarted`, `AdminAlert`, `Store`, `RecipientFilter`, `Sender`,
   `Subscription`.
-- `internal/server`: `Server`, `New`, `Run`, `Shutdown`, `ShutdownReason`, `ErrRestartRequested`, `Deps`, and the
-  wiring table of §6.6.
-- `internal/server/servertest`: `Start(t testing.TB, opts Options) *Server` with fields `URL`, `WSURL`, `Client`
-  (`*http.Client`, trusts the test CA when `Options.TLS`), `AdminSocket`, `UDPPort`, `TCPPort`, `DataDir`, `Cfg`,
-  `Srv`; methods `Restart(t)`, `Stop(t)`; `Options{TLS bool; Config func(*config.Config); Deps server.Deps}`.
+- `internal/server`: `Server`, `New`, `Start`, `Run`, `Shutdown`, `Site`, `Addrs`, `ShutdownReason`,
+  `ErrRestartRequested`, `ErrShutdownForced`, `NeedsOperator`, `Deps`, and the wiring table of §6.6.
+- `internal/server/servertest`: `Start(t testing.TB, opts Options) *Server` with fields `URL` (`http://` plus the
+  site's host; `Client` dials the listener whatever host the URL names), `WSURL`, `Client` (`*http.Client`, keeps
+  cookies, trusts the test CA when `Options.TLS`), `AdminSocket`, `UDPPort`, `TCPPort` (0 until README S59), `DataDir`,
+  `Cfg`, `Srv`; methods `Restart(t)`, `Stop(t)`, `Wait(t) error` (the result of `Run` after a shutdown the test
+  began itself) and `Logs()`; `Try(t, opts) (*Server, error)` for a server that is expected to refuse;
+  `Options{TLS bool; Flags []string; Config func(*config.Config); Deps server.Deps; DataDir string}`. `Flags` are
+  `serve` flags, so a key set there counts as set by the operator (`config.IsSet`, which pins a policy key, §4.6); a
+  change made in `Config` does not. `TLS` fails the test until README S44.
 - `internal/protocol/api` (TS via tygo, next to 03's DTOs): `OpsDashboard` and its parts (`ServerInfo`,
   `ProcessInfo`, `TLSInfo`, `AdvertisedAddr`, `UpdateInfo`, `TransferInfo`, `MediaTotals`, `RoomLive`,
   `ParticipantLive`, `ConnectionLive`, `ShareLive`, `LayerLive`, `ViewerCounts`, `ClientVersionCount`,

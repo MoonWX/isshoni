@@ -9,11 +9,12 @@
 //   (05 §7 "Intentional leave"), and the session lets go of its room. This is the net under every way of being
 //   signed out, not the logout flow: a logout started in this tab makes ['me'] null only after its request, and by
 //   then the server has closed the socket itself (session_revoked). 05 §15.1's order (stop the share, stop the
-//   client, then the request) is the logout flow's, which runs session.stopShare() and signal.stop() of this
-//   runtime as its first steps, and signal.start() again when the request fails: the session keeps its desired
-//   room through a stop(), so that start rejoins it;
+//   client, then the request) is the logout flow's (auth/logout.ts): the runtime registers its two steps there
+//   with addLogoutStep, session.stopShare() and signal.stop(), and signal.start() as the undo when the request
+//   fails: the session keeps its desired room through a stop(), so that start rejoins it;
 // - a REST call answered 503 server_shutdown tells the banner that the outage is a restart (05 §7.1).
 import type { AppServices } from '../app/context';
+import { addLogoutStep } from '../auth/logout';
 import { createLogger } from '../lib/log';
 import { CodeServerShutdown } from '../protocol/api.gen';
 import { applyInvalidate } from '../protocol/invalidate';
@@ -71,6 +72,17 @@ export function createRoomRuntime(services: AppServices, opts: RoomRuntimeOption
     void session.leave();
   };
 
+  // 05 §15.1 steps 1 and 2 of a logout started in this tab: the share stops while signaling can still say
+  // share.stop, then the client closes with 1000. A client that wasn't running stays stopped when the logout fails.
+  const offLogoutShares = addLogoutStep('shares', () => session.stopShare().then(() => undefined));
+  const offLogoutSignal = addLogoutStep('signal', () => {
+    if (signal.state === 'stopped') return undefined;
+    signal.stop();
+    return () => {
+      signal.start();
+    };
+  });
+
   const offInvalidate = signal.on(MessageTypeInvalidate, (msg) => {
     applyInvalidate(queryClient, msg).catch((err: unknown) => {
       log.warn('invalidate failed', { error: err });
@@ -112,6 +124,8 @@ export function createRoomRuntime(services: AppServices, opts: RoomRuntimeOption
     },
     stop,
     dispose() {
+      offLogoutShares();
+      offLogoutSignal();
       offInvalidate();
       offQueries();
       offMutations();

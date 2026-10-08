@@ -687,7 +687,7 @@ outside `platform/` may read cookies or `location.origin` or build `/api` URLs b
   | Condition | pub (client offers) | sub (server offers) |
   |---|---|---|
   | ICE `disconnected` for 3 s (timer cancelled if it recovers) | `restartIce()` and a new offer, same `gen` | `pc.restart {pc:'sub', gen, mode:'ice', reason:'disconnected'}` |
-  | ICE restart not `connected` within 15 s | rebuild: new PC, `gen + 1`, same tracks and shareIds | 15 s from the sub offer with a new `ice-ufrag` (below): `pc.restart {pc:'sub', gen, mode:'rebuild', reason:'disconnected'}`; the server offers `gen + 1` |
+  | ICE restart not `connected` within 15 s | rebuild: new PC, `gen + 1`, same tracks and shareIds | 15 s from the sub offer with a new `ice-ufrag` (below): `pc.restart {pc:'sub', gen, mode:'rebuild', reason:'failed'}` (the reason of 01 §10.4); the server offers `gen + 1` |
   | PC `failed` | rebuild at once | `pc.restart {pc:'sub', gen, mode:'rebuild', reason:'failed'}` |
   | after a resumed `welcome`, the PC isn't `connected` | ICE restart | nothing: the server's `Resync()` sends an ICE-restart offer, which counts as the ICE restart (below); the timers above keep running |
   | server sends `pc.restart {pc:'pub', mode:'rebuild'}` | rebuild | — |
@@ -1470,26 +1470,50 @@ service workers aren't universal), with build-time constants:
 - `__SHELL__`: `/`, the entry chunk, its static imports and CSS, `/boot-check.js`, `/manifest.webmanifest`,
   `/icons/icon-192.png`. Lazy route chunks are not precached; they're cached on first use. The shell version hash
   covers `/boot-check.js`, so a new worker refreshes it (04 serves it `no-cache`).
-- `__SHELL_VERSION__`: the first 12 hex digits of SHA-256 over the shell files' contents.
+- `__SHELL_VERSION__`: the first 12 hex digits of SHA-256 over the shell files' contents; `version.json` carries
+  the same value as `shell` (§17.1).
 - `__PUSH_STRINGS__`: the `push` section of `en.json`.
 
+The logic lives in modules that are tested against fakes: `routes.ts` (the pure router), `shell.ts` (precache and
+the fetch strategies), `push.ts` (the notification of a payload), `worker.ts` (the event handlers) and `contract.ts`
+(the cache name and message types, shared with `platform/browser/pwa.ts`); `sw.ts` only binds them to the worker's
+globals.
+
 Behaviour:
-- `install`: `caches.open('isshoni-shell-' + version).addAll(__SHELL__)`. No automatic `skipWaiting`.
+- `install`: `caches.open('isshoni-shell-' + version).addAll(…)` with one `Request` per shell file: hashed
+  `/assets/*` files as they are, the files that keep their name across builds (`/`, `/boot-check.js`, the manifest,
+  the icon) with `cache: 'no-cache'`, so a new worker never stores an old copy. No automatic `skipWaiting`.
 - `activate`: delete other `isshoni-shell-*` caches; `clients.claim()`.
 - `fetch` uses the pure `route(url, mode, method, origin)` from `sw/routes.ts`:
 
   | Request | Strategy |
   |---|---|
   | not GET, other origin, `/api/*`, `/ws`, `/healthz`, `/readyz`, `/download*`, `/install*` | not handled (network) |
-  | navigation | network first, 4 s timeout, then the cached `/` (the SPA shows the Offline screen) |
+  | navigation whose last path segment has a dot (`/licenses.txt`, `/version.json`) | not handled (network): a file, not an SPA route |
+  | navigation | network first, 4 s timeout, then the cached `/` (the SPA shows the Offline screen). A `502`, `503` or `504` answer counts like a network failure: an installed app behind a reverse proxy shows the Offline screen while the server restarts |
   | `/assets/*` (hashed), `/boot-check.js` | cache first, then network (and cache it) |
   | `/icons/*`, `/manifest.webmanifest` | stale-while-revalidate |
 
 - `message {type: 'SKIP_WAITING'}` → `skipWaiting()`.
 - Registration: `navigator.serviceWorker.register('/sw.js', {scope: '/', updateViaCache: 'none'})`, production only.
   04 serves `/sw.js` with `no-cache` at the root (§17.2).
-- Updates: when `registration.waiting` appears, `UpdatePill` offers "Update ready · Reload" (not while sharing). A
-  stale build seen at `welcome` triggers §16.4.
+- Updates: when `registration.waiting` appears and the page runs an older build, `UpdatePill` offers "Update
+  ready · Reload"; while sharing it says "Update ready. Reload after you stop sharing." with no button. Applying
+  sends `SKIP_WAITING` and reloads on `controllerchange` (or after 3 s). A stale build seen at `welcome` triggers
+  §16.4.
+  - A waiting worker whose build the page already runs (the tab was reloaded after the server update: its entry
+    chunk is in the cache named after `version.json`'s `shell`) is told to take over at once, with no pill and no
+    reload. That includes a rebuild that left the page's JavaScript unchanged (only CSS, `index.html` or a public
+    shell file differ). A tab whose worker was replaced from another tab is judged the same way, once.
+  - Browsers look for a new worker only on a page load and at most daily after that, so `pwa.ts` polls
+    `/version.json`: at registration, every 15 min while the tab is visible, and when it becomes visible after at
+    least 1 min. A changed `shell` calls `registration.update()`, and the pill follows the waiting worker. Without
+    a service worker a changed `version.json` is itself "update ready", and applying it is a plain reload.
+- Install: `beforeinstallprompt` is kept for `PwaProvider.promptInstall()` and its default is prevented, so
+  Chrome's own mini-infobar does not show; the Install entry is §16.3's.
+- Push: `worker.ts` handles `push`, `notificationclick` and `pushsubscriptionchange`; `push.ts` maps a payload to
+  its notification and never stays silent (an unknown or unreadable payload gets the generic `push.generic.*`
+  one). A click focuses an open tab and posts `{type: 'open', url}` to it, or opens a window.
 - Nothing user-specific is ever cached, so logout needs no cache cleanup.
 
 ### 16.3 Web Push
@@ -1564,7 +1588,7 @@ and, on Android, in the room's one-time card. iOS: the Home Screen sheet above, 
 
 | Trigger | Web behaviour |
 |---|---|
-| `ready` with `staleBuild` (01 §6.1: `welcome.serverVersion` ≠ build version; neither is a dev build, which 04 §15 defines as a SemVer prerelease that starts with `dev`) | The shell is stale (a cached PWA; the server always serves a matching SPA). Ask the service worker to update and reload once, guarded by `sessionStorage['isshoni.reloadedFor'] = serverVersion`. While sharing, show the UpdatePill instead of reloading |
+| `ready` with `staleBuild` (01 §6.1: `welcome.serverVersion` ≠ build version; neither is a dev build, which 04 §15 defines as a SemVer prerelease that starts with `dev`) | The shell is stale (a cached PWA; the server always serves a matching SPA). Reload once, before the room is joined, guarded by `sessionStorage['isshoni.reloadedFor'] = serverVersion`. A plain `platform.versionActions().reload()` is enough: navigations are network-first (§16.2), and the new worker that the reloaded page finds waiting is let in without a pill. While sharing, show the UpdatePill instead of reloading (`ui.updateReady`; with no waiting worker, applying it is a plain reload). When the one reload didn't help, the app keeps running and logs a warning: the handshake worked |
 | `stopped` with `protocol_unsupported` (`params {serverMin, serverMax, serverVersion}`) | VersionMismatch screen: "This page is out of date. [Reload]", or "Ask your admin to update the server" when the server is older. Desktop (M2): "Update the app" + "Open in browser" via `platform.versionActions()` |
 | a reload didn't help | the screen stays, with both version numbers |
 

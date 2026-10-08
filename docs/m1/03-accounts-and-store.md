@@ -842,6 +842,7 @@ func (q *Q) ListDevices(u UserID) ([]Device, error)
 func (q *Q) DeleteDevice(u UserID, id DeviceID) (bool, error)
 func (q *Q) DeleteDevices(u UserID) ([]DeviceID, error)
 func (q *Q) DeleteDeviceCodesOf(u UserID) error
+func (q *Q) DeleteAllDeviceCodes() (int, error) // §4.6: session key rotated; also the codes nobody decided
 func (q *Q) CreateDeviceCode(dc DeviceCode) error                                  // later (M2)
 func (q *Q) DeviceCodeByHash(h []byte) (DeviceCode, error)                         // later (M2)
 func (q *Q) DeviceCodeByUserCode(h []byte) (DeviceCode, error)                     // later (M2)
@@ -865,6 +866,7 @@ func (q *Q) InviteByID(id InviteID) (Invite, error)
 func (q *Q) ListInvites(createdBy UserID /* "" = all */, includeInactive bool) ([]Invite, error) // active = at Options.Clock
 func (q *Q) CountActiveInvites(createdBy UserID /* "" = all */, now time.Time) (int, error)
 func (q *Q) RevokeInvite(id InviteID, by UserID, now time.Time) error
+func (q *Q) DeleteAllInvites() (int, error) // §4.6: invite key rotated; users.invite_id becomes NULL
 // UseInvite: UPDATE … SET uses = uses + 1 WHERE id = ? AND revoked_at IS NULL AND expires_at > now AND uses < max_uses.
 // 0 rows → ErrInviteUnusable. Callers run it in the same Write as CreateUser.
 func (q *Q) UseInvite(id InviteID, now time.Time) error
@@ -1462,7 +1464,15 @@ type AdminAlerter interface {
 type ReqMeta struct {
 	IP        netip.Addr
 	UserAgent string // only turned into a session name
+	// The session cookie the request arrived with, "" for none. The calls that open a session (Login and
+	// CompleteSetup; later Register and CompletePasswordReset) take no request, so the old cookie travels here: they
+	// delete that session in the Write that creates the new one and close its connections (§7.4, §7.7). Never
+	// printed, logged or marshalled.
+	SessionToken string `json:"-"`
 }
+
+// RequestMeta builds the ReqMeta of r (Options.ClientIP, the User-Agent header, the session cookie). Handlers use it.
+func (s *Service) RequestMeta(r *http.Request) ReqMeta
 
 type Link struct {
 	URL       string

@@ -204,6 +204,13 @@ func (q *Q) RevokeInvite(id InviteID, by UserID, now time.Time) error {
 	return err
 }
 
+// DeleteAllInvites deletes every invite, whatever its state (03 §4.6: the invite key changed, so no token can match
+// its hash again), and returns how many there were. Accounts created with an invite stay and lose the reference
+// (users.invite_id is ON DELETE SET NULL), so they no longer show who invited them.
+func (q *Q) DeleteAllInvites() (int, error) {
+	return q.execCount("delete all invites", `DELETE FROM invites`)
+}
+
 // UseInvite counts one use: UPDATE … SET uses = uses + 1 WHERE id = ? AND revoked_at IS NULL AND expires_at > now
 // AND uses < max_uses. No row (an unknown invite too) → ErrInviteUnusable. Callers run it in the same Write as
 // CreateUser, so concurrent registrations never exceed max_uses.

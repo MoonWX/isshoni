@@ -252,16 +252,12 @@ func TestKeyFingerprints(t *testing.T) {
 	rotatedAt := e.clk.now()
 	e.restart(nil, func(o *Options) { o.Keys.Session = otherKey(0x33) })
 	got := e.rowCounts()
-	for table, want := range map[string]int{"sessions": 0, "devices": 0, "device_tokens": 0, "push_subscriptions": 0,
-		"invites": 2, "setup_tokens": 1, "password_resets": 1, "users": 2} {
+	// Both device codes are gone: the one a user decided and the one nobody decided yet.
+	for table, want := range map[string]int{"sessions": 0, "devices": 0, "device_tokens": 0, "device_codes": 0,
+		"push_subscriptions": 0, "invites": 2, "setup_tokens": 1, "password_resets": 1, "users": 2} {
 		if got[table] != want {
 			t.Errorf("after a session-key change: %d %s rows, want %d", got[table], table, want)
 		}
-	}
-	// The device code a user decided is gone. The one nobody decided has no user to select it by, and the store has
-	// no method that deletes it (purgeRotated); it expires in 10 minutes and the janitor prunes it.
-	if got["device_codes"] != 1 {
-		t.Errorf("after a session-key change: %d device_codes rows, want only the undecided one", got["device_codes"])
 	}
 	if n := e.activeInvites(); n != 1 {
 		t.Errorf("a session-key change touched the invites: %d active, want 1", n)
@@ -299,12 +295,14 @@ func TestKeyFingerprints(t *testing.T) {
 		t.Fatalf("a second start with the rotated key: %d rows, %d alerts", len(rows), len(alerts))
 	}
 
-	// A new invite key: the setup token and the reset link go and no invite works any more; the sessions stay.
+	// A new invite key: the setup token, the reset link and every invite go, the already revoked one too; the
+	// sessions and the accounts stay.
 	alex := e.login("Alex", ipA)
 	e.advance(time.Minute)
 	e.restart(nil, func(o *Options) { o.Keys.Session, o.Keys.Invite = otherKey(0x33), otherKey(0x44) })
 	got = e.rowCounts()
-	for table, want := range map[string]int{"setup_tokens": 0, "password_resets": 0, "sessions": 1, "users": 2} {
+	for table, want := range map[string]int{"invites": 0, "setup_tokens": 0, "password_resets": 0, "sessions": 1,
+		"users": 2} {
 		if got[table] != want {
 			t.Errorf("after an invite-key change: %d %s rows, want %d", got[table], table, want)
 		}
@@ -312,22 +310,10 @@ func TestKeyFingerprints(t *testing.T) {
 	if n := e.activeInvites(); n != 0 {
 		t.Errorf("after an invite-key change: %d invites still work, want 0", n)
 	}
-	// The store's API cannot delete an invite, so the purge revokes them (purgeRotated): both rows are still there,
-	// revoked, the already revoked one with its first revocation.
 	e.read(func(q *store.Q) error {
-		invites, err := q.ListInvites("", true)
-		if err != nil {
-			return err
-		}
-		if len(invites) != 2 {
-			t.Errorf("%d invite rows, want 2", len(invites))
-		}
-		for _, inv := range invites {
-			if inv.State(e.clk.now()) != "revoked" {
-				t.Errorf("invite %s is %s, want revoked", inv.ID, inv.State(e.clk.now()))
-			}
-			if inv.ID == f.revoked.ID && inv.RevokedBy != f.alex.ID {
-				t.Errorf("the purge overwrote an earlier revocation: %+v", inv)
+		for _, id := range []store.InviteID{f.invite.ID, f.revoked.ID} {
+			if _, err := q.InviteByID(id); !errors.Is(err, store.ErrNotFound) {
+				t.Errorf("invite %s after an invite-key change: %v, want ErrNotFound", id, err)
 			}
 		}
 		return nil
