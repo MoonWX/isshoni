@@ -49,8 +49,8 @@ type participant struct {
 // member is one connection in a room: what room.state shows about it, and its desired subscriptions.
 type member struct {
 	c *conn
-	// detached: the connection's socket is gone and it waits for a resume within grace (README S28). room.state
-	// shows it as reconnecting.
+	// detached: the connection's socket is gone and it waits for a resume within grace (conn.startGrace, conn.resume).
+	// room.state shows it as reconnecting.
 	detached bool
 	// subs are the connection's desired subscriptions by share id (subscribe.update, README S40). Watchers are
 	// computed from them (01 §4.1). A subscription goes when its share ends or the connection leaves the room.
@@ -352,6 +352,21 @@ func (r *room) rename(userID, name string) {
 	r.mu.Lock()
 	if p := r.participants[userID]; p != nil && p.name != name {
 		p.name = name
+		r.changedLocked(&o)
+	}
+	r.mu.Unlock()
+	o.send()
+}
+
+// setDetached records that connection c lost its socket (true) or resumed on a new one (false). room.state shows it
+// as the connection's status, and as the participant's when all of the user's connections in the room are detached
+// (01 §4.3). It is a change of state only: nobody gets a room.event, so a participant that recovers within grace
+// never looks like one that left and joined (01 §8.6).
+func (r *room) setDetached(c *conn, detached bool) {
+	var o outbox
+	r.mu.Lock()
+	if m := r.memberLocked(c); m != nil && m.detached != detached {
+		m.detached = detached
 		r.changedLocked(&o)
 	}
 	r.mu.Unlock()

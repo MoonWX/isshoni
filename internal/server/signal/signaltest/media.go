@@ -84,16 +84,17 @@ type Call struct {
 // Peer is a fake signal.MediaPeer. It records every call. By default CreateShare and UpdateShare return
 // ShareParamsFor(shareID), HandleOffer answers with FakeSDP and the offer's pc, gen and neg, Subscribe ignores no
 // share, Stats is empty, and everything else succeeds. Fail makes a method return an error; tests emit the peer's
-// events through Sink.
+// events through Sink, and OnResync lets them do so from inside Resync, as a real peer does.
 type Peer struct {
 	Params signal.PeerParams
 	sink   signal.MediaSink
 
-	mu      sync.Mutex
-	calls   []Call
-	fail    map[string]error
-	ignored []string
-	closed  bool
+	mu       sync.Mutex
+	calls    []Call
+	fail     map[string]error
+	ignored  []string
+	onResync func()
+	closed   bool
 }
 
 // Sink returns the hub's MediaSink for this peer.
@@ -206,8 +207,25 @@ func (p *Peer) Subscribe(wants []protocol.SubscriptionWant) ([]string, error) {
 // SetCaps implements signal.MediaPeer.
 func (p *Peer) SetCaps(c protocol.Caps) { _ = p.record("SetCaps", c) }
 
+// OnResync sets a function that Resync calls after recording the call; nil removes it. Like every MediaPeer method,
+// it runs on the connection's actor. A real peer re-emits its pending sub offer, its subscription statuses and its
+// quality hints there (01 §10.5): a test does the same through Sink.
+func (p *Peer) OnResync(f func()) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.onResync = f
+}
+
 // Resync implements signal.MediaPeer.
-func (p *Peer) Resync() { _ = p.record("Resync") }
+func (p *Peer) Resync() {
+	_ = p.record("Resync")
+	p.mu.Lock()
+	f := p.onResync
+	p.mu.Unlock()
+	if f != nil {
+		f()
+	}
+}
 
 // Stats implements signal.MediaPeer.
 func (p *Peer) Stats() protocol.ServerStats {

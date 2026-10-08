@@ -254,3 +254,68 @@ func TestParticipantLeftReason(t *testing.T) {
 		}
 	}
 }
+
+// Which socket closes end the connection at once, and which leave it detached for the grace (01 §4.2, §12.2).
+func TestEndsWith(t *testing.T) {
+	const (
+		left         = protocol.EndReasonLeft
+		disconnected = protocol.EndReasonDisconnected
+		shutdown     = protocol.EndReasonServerShutdown
+	)
+	for _, tc := range []struct {
+		name      string
+		endReason protocol.EndReason // set by revoke or shutdown
+		code      protocol.CloseCode
+		byHub     bool
+		want      protocol.EndReason // "": the connection stays, detached
+	}{
+		{"the client closed with 1000", "", protocol.CloseCodeNormal, false, left},
+		{"the client closed with 1001", "", protocol.CloseCodeGoingAway, false, left},
+		{"the web client dropped the socket to reconnect", "", 4000, false, ""},
+		{"no close frame", "", protocol.CloseCodeAbnormal, false, ""},
+		{"a message over the read limit", "", protocol.CloseCodeMessageTooBig, false, ""},
+		{"a client's own 4400", "", protocol.CloseCodeProtocolViolation, false, ""},
+		{"idle timeout", "", protocol.CloseCodeTimeout, true, ""},
+		{"slow connection", "", protocol.CloseCodeSlowConnection, true, ""},
+		{"flood", "", protocol.CloseCodeRateLimited, true, ""},
+		{"internal error", "", protocol.CloseCodeInternalError, true, ""},
+		{"bad_message or a second hello", "", protocol.CloseCodeProtocolViolation, true, disconnected},
+		{"binary frame", "", protocol.CloseCodeUnsupportedData, true, disconnected},
+		{"a revocation that only reached the socket", "", protocol.CloseCodeUnauthenticated, true, left},
+		{"account disabled, the same", "", protocol.CloseCodeForbidden, true, left},
+		{"revoked", left, protocol.CloseCodeUnauthenticated, true, left},
+		{"revoked while the socket closed for another reason", left, protocol.CloseCodeTimeout, true, left},
+		{"revoked as the socket dropped", left, protocol.CloseCodeAbnormal, false, left},
+		{"shutdown", shutdown, protocol.CloseCodeServiceRestart, true, shutdown},
+		{"shutdown, the socket was forced closed", shutdown, protocol.CloseCodeAbnormal, false, shutdown},
+	} {
+		c := &conn{endReason: tc.endReason}
+		reason, ends := c.endsWith(int(tc.code), tc.byHub)
+		if reason != tc.want || ends != (tc.want != "") {
+			t.Errorf("%s: endsWith(%d, byHub %v) = %q, %v; want %q", tc.name, tc.code, tc.byHub, reason, ends, tc.want)
+		}
+	}
+}
+
+func TestCapsEqual(t *testing.T) {
+	base := protocol.Caps{Decode: []protocol.CodecKey{protocol.CodecH264High, protocol.CodecOpus},
+		Encode: []protocol.CodecKey{protocol.CodecOpus}, Simulcast: true, DisplayCapture: true}
+	same := base
+	same.Decode = slices.Clone(base.Decode)
+	if !capsEqual(base, same) {
+		t.Error("equal caps differ")
+	}
+	for name, mut := range map[string]func(*protocol.Caps){
+		"decode":         func(c *protocol.Caps) { c.Decode = c.Decode[:1] },
+		"decode order":   func(c *protocol.Caps) { c.Decode = []protocol.CodecKey{protocol.CodecOpus, protocol.CodecH264High} },
+		"encode":         func(c *protocol.Caps) { c.Encode = nil },
+		"simulcast":      func(c *protocol.Caps) { c.Simulcast = false },
+		"displayCapture": func(c *protocol.Caps) { c.DisplayCapture = false },
+	} {
+		other := base
+		mut(&other)
+		if capsEqual(base, other) {
+			t.Errorf("%s: different caps are equal", name)
+		}
+	}
+}

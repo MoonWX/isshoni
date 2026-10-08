@@ -43,7 +43,7 @@ func newMetrics(reg prometheus.Registerer) (*metrics, error) {
 	}
 	m := &metrics{
 		connections: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "isshoni_ws_connections", Help: "Open signaling connections.",
+			Name: "isshoni_ws_connections", Help: "Open signaling connections, including detached ones within their resume grace.",
 		}, []string{"kind", "role"}),
 		messages: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "isshoni_ws_messages_total", Help: "Signaling messages received (dir=in) and queued (dir=out).",
@@ -55,7 +55,7 @@ func newMetrics(reg prometheus.Registerer) (*metrics, error) {
 			Name: "isshoni_ws_resume_total", Help: "Hellos with a resume token, by result.",
 		}, []string{"result"}),
 		closes: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "isshoni_ws_close_total", Help: "Closed signaling connections, by WebSocket close code.",
+			Name: "isshoni_ws_close_total", Help: "Closed WebSockets of signaling connections, by close code.",
 		}, []string{"code"}),
 		rooms: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "isshoni_rooms", Help: "Rooms with at least one participant.",
@@ -128,9 +128,17 @@ func (m *metrics) connOpened(k protocol.ClientKind, r protocol.Role) {
 	}
 }
 
-func (m *metrics) connClosed(k protocol.ClientKind, r protocol.Role, code int) {
+// connClosed counts a connection out of isshoni_ws_connections: when it closes, not when it loses a socket.
+func (m *metrics) connClosed(k protocol.ClientKind, r protocol.Role) {
 	if m != nil {
 		m.connections.WithLabelValues(kindLabel(k), string(r)).Dec()
+	}
+}
+
+// socketClosed counts one closed WebSocket of a connection in isshoni_ws_close_total. A connection that resumes
+// has several over its lifetime, the replaced ones (4409) included.
+func (m *metrics) socketClosed(code int) {
+	if m != nil {
 		m.closes.WithLabelValues(strconv.Itoa(code)).Inc()
 	}
 }

@@ -391,11 +391,13 @@ func TestRoomWatchers(t *testing.T) {
 			t.Errorf("share %+v", got)
 		}
 
-		// B's connection drops: its share ends with disconnected, then B leaves.
+		// B's connection drops and nothing resumes it: after the grace its share ends with disconnected, then B leaves
+		// (TestResume* have the grace itself).
 		for _, cl := range []*signaltest.Client{a1, a2} {
 			drain(t, cl)
 		}
 		cb.Close()
+		time.Sleep(grace)
 		settle()
 		for _, cl := range []*signaltest.Client{a1, a2, cc} {
 			evs, last := drain(t, cl)
@@ -557,8 +559,8 @@ func TestRoomRename(t *testing.T) {
 	})
 }
 
-// Why a participant left (01 §4.2, §8.6): a deliberate close (1000, 1001) and a revocation are left; a dropped
-// socket and a close by the hub (idle timeout) are disconnected.
+// Why a participant left (01 §4.2, §8.6): a deliberate close (1000, 1001) and a revocation are left, at once; a
+// dropped socket and a close by the hub (idle timeout) are disconnected, once the grace has expired.
 func TestRoomLeaveReasons(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		e := newEnv(t)
@@ -577,15 +579,17 @@ func TestRoomLeaveReasons(t *testing.T) {
 				0, protocol.EndReasonLeft},
 			{"1001", false, func(c *signaltest.Client, _ signal.Identity) { _ = c.CloseWith(websocket.StatusGoingAway) },
 				0, protocol.EndReasonLeft},
-			{"dropped", false, func(c *signaltest.Client, _ signal.Identity) { c.Close() }, 0,
-				protocol.EndReasonDisconnected},
+			{"dropped", false, func(c *signaltest.Client, _ signal.Identity) {
+				c.Close()
+				time.Sleep(grace)
+			}, 0, protocol.EndReasonDisconnected},
 			{"revoked", false, func(_ *signaltest.Client, id signal.Identity) {
 				e.hub.CloseConnections(signal.ConnSelector{UserID: id.UserID}, protocol.ErrorCodeSessionRevoked)
 			}, protocol.CloseCodeUnauthenticated, protocol.EndReasonLeft},
 			{"account disabled", false, func(_ *signaltest.Client, id signal.Identity) {
 				e.hub.CloseConnections(signal.ConnSelector{UserID: id.UserID}, protocol.ErrorCodeAccountDisabled)
 			}, protocol.CloseCodeForbidden, protocol.EndReasonLeft},
-			{"idle", true, func(*signaltest.Client, signal.Identity) { time.Sleep(46 * time.Second) },
+			{"idle", true, func(*signaltest.Client, signal.Identity) { time.Sleep(46*time.Second + grace) },
 				protocol.CloseCodeTimeout, protocol.EndReasonDisconnected},
 		} {
 			cookie, id := e.user(false)

@@ -72,8 +72,9 @@ func (h *Hub) internalError(err error, scope protocol.ErrorScope, attrs ...any) 
 	return e
 }
 
-// socket is one accepted WebSocket, from Accept until its reader ends. A connection uses one socket at a time; from
-// README S28 on it survives socket reconnects.
+// socket is one accepted WebSocket, from Accept until its reader ends. A connection uses one socket at a time and
+// outlives it: when the socket is lost, the connection waits Config.Grace for a hello with its resume token on a new
+// socket (resume.go).
 //
 // Goroutines: the reader (ServeHTTP's goroutine: the hello handshake, then every frame for the connection's actor),
 // the writer (drains the send queue, then closes), and, after the handshake, the pinger. The reader waits for the
@@ -101,6 +102,7 @@ type socket struct {
 	// Guarded by h.mu.
 	preAuth  bool   // counted in h.preAuth
 	slotUser string // the user whose per-user slot this socket holds ("" = none)
+	overUser string // the user at whose cap this socket waits for its hello, which may only resume ("" = none)
 }
 
 func newSocket(h *Hub, ip netip.Addr, cookie bool, id Identity) *socket {
@@ -159,7 +161,7 @@ var errActorEnded = errors.New("signal: connection closed")
 // end finishes the socket after its reader has ended: it tells the connection, stops the writer and the pinger, and
 // releases the WebSocket.
 func (s *socket) end(c *conn, err error) {
-	code := s.endCode(err)
+	code, byHub := s.endCode(err)
 	if websocket.CloseStatus(err) == -1 {
 		// No close frame arrived: the network connection failed, or the read limit was hit (coder/websocket has
 		// sent 1009). Release it at once; that also ends a close handshake the writer may be waiting in.
@@ -168,7 +170,8 @@ func (s *socket) end(c *conn, err error) {
 	s.q.finish(0, "") // nothing more is queued
 	close(s.dead)
 	if c != nil {
-		c.postWait(func() { c.socketEnded(s, code) })
+		s.h.metrics.socketClosed(code)
+		c.postWait(func() { c.socketEnded(s, code, byHub) })
 	}
 	<-s.writerDone
 	if s.pingerDone != nil {
@@ -178,19 +181,19 @@ func (s *socket) end(c *conn, err error) {
 	s.h.log.Debug("websocket closed", slog.Int("code", code))
 }
 
-// endCode is the socket's close code for logs and metrics: the code the hub closed with, else the peer's, else
-// 1009 for a message over the read limit, else 1006 (no close frame).
-func (s *socket) endCode(err error) int {
+// endCode is the socket's close code for logs and metrics: the code the hub closed with (byHub), else the peer's,
+// else 1009 for a message over the read limit, else 1006 (no close frame).
+func (s *socket) endCode(err error) (code int, byHub bool) {
 	if code := s.q.closeCode(); code != 0 {
-		return int(code)
+		return int(code), true
 	}
 	if code := websocket.CloseStatus(err); code != -1 {
-		return int(code)
+		return int(code), false
 	}
 	if errors.Is(err, websocket.ErrMessageTooBig) {
-		return int(protocol.CloseCodeMessageTooBig)
+		return int(protocol.CloseCodeMessageTooBig), false
 	}
-	return int(protocol.CloseCodeAbnormal)
+	return int(protocol.CloseCodeAbnormal), false
 }
 
 func (s *socket) setRaw(c net.Conn) {
@@ -374,12 +377,18 @@ func (s *socket) shutdown(reason protocol.ShutdownReason) {
 	}
 }
 
-// overflow closes the socket as slow_connection: the queued messages are dropped, nothing more is sent, and the
-// writer closes with 4503 once its current write returns (01 §3.3).
+// overflow closes the socket, whose send queue is full, as slow_connection (01 §3.3).
 func (s *socket) overflow() {
-	if s.q.abort(websocket.StatusCode(protocol.CloseCodeSlowConnection), string(protocol.ErrorCodeSlowConnection)) {
+	if s.closeSlow() {
 		s.h.log.Debug("send queue full", slog.Int("limit_messages", s.q.maxMsgs), slog.Int("limit_bytes", s.q.maxBytes))
 	}
+}
+
+// closeSlow closes the socket as slow_connection: the queued messages are dropped, nothing more is sent, and the
+// writer closes with 4503 once its current write returns (01 §3.3). It reports whether the socket was not closing
+// yet.
+func (s *socket) closeSlow() bool {
+	return s.q.abort(websocket.StatusCode(protocol.CloseCodeSlowConnection), string(protocol.ErrorCodeSlowConnection))
 }
 
 // sendQueue is a socket's bounded send queue (01 §3.3): at most maxMsgs messages and maxBytes bytes. It ends with a
@@ -516,6 +525,11 @@ func (q *sendQueue) closeCode() websocket.StatusCode {
 // conn is a Connection (01 §4.1): one client instance, from welcome until it closes. Its actor goroutine owns its
 // state and handles, in order, the socket's messages, its timers and the hub's control calls (01 §15.2). Other
 // goroutines reach it only through post and postWait.
+//
+// States (01 §4.2): ready while it has a socket; detached once the socket is lost, for at most Config.Grace, with
+// its room membership, shares, subscriptions and MediaPeer kept; closed after that, or at once when the client left
+// on purpose or the hub closed the connection for good. A hello with the connection's resume token moves it to a
+// new socket, from either of the first two states (resume.go).
 type conn struct {
 	h         *Hub
 	id        string
@@ -533,22 +547,26 @@ type conn struct {
 	done  chan struct{} // closed when the actor has ended
 
 	ident     atomic.Pointer[Identity] // Name and Admin change; the ids never do
-	sockP     atomic.Pointer[socket]   // the current socket, for other goroutines (overflow)
+	sockP     atomic.Pointer[socket]   // the current socket, for other goroutines (post)
 	lastStats atomic.Pointer[protocol.ClientStats]
+	lost      atomic.Bool                    // the full inbox dropped a post: the connection closes for good (post)
+	revoked   atomic.Pointer[protocol.Error] // CloseConnections' error, set before the post that applies it
 
 	// Guarded by h.mu.
 	slotUser string // the user whose per-user slot the connection holds
 	roomID   string // the id of the room the connection is in, for Notify; "" = none. Set by attach and detach
 
 	// Owned by the actor.
-	sock         *socket // nil while detached (README S28)
+	sock         *socket // nil while detached
 	ip           netip.Addr
 	caps         protocol.Caps
 	limits       connLimits
 	statsWatch   bool
-	tokenHash    [sha256.Size]byte // SHA-256 of the current resume token (01 §10.3)
+	tokenHash    [sha256.Size]byte // SHA-256 of the current resume token (01 §10.3); every welcome rotates it
 	idle         *time.Timer
-	revalidating bool // a periodic Revalidate call is running
+	grace        *time.Timer // runs while detached: the connection closes when it fires (01 §10.3)
+	lastCode     int         // the close code of the connection's last socket, for the close log line
+	revalidating bool        // a periodic Revalidate call is running
 	closed       bool
 
 	room      *room              // the room the connection is in; nil = none (01 §4.1: at most one)
@@ -596,30 +614,49 @@ func activeFeatures(client, server []protocol.Feature) []protocol.Feature {
 
 func (c *conn) identity() Identity { return *c.ident.Load() }
 
-// run is the actor. first runs before anything else (attach, which sends welcome).
+// run is the actor. first runs before anything else (attach, which sends welcome). The actor runs through every
+// socket of the connection and through its grace, until the connection closes.
 func (c *conn) run(first func()) {
 	defer c.h.wg.Done()
 	defer close(c.done)
 	c.idle = time.NewTimer(c.h.cfg.IdleTimeout)
 	defer c.idle.Stop()
+	c.grace = time.NewTimer(c.h.cfg.Grace)
+	c.grace.Stop() // armed when the connection loses its socket (startGrace)
+	defer c.grace.Stop()
 	reval := time.NewTicker(c.h.cfg.RevalidateEvery)
 	defer reval.Stop()
+	down := c.h.down
 	first()
 	for !c.closed {
+		// post sets lost, on another goroutine; the actor looks at it between any two things it handles.
+		if c.lost.Load() && c.lostPost() {
+			break
+		}
 		select {
 		case f := <-c.inbox:
 			f()
 		case <-c.idle.C:
 			c.checkIdle()
+		case <-c.grace.C:
+			c.graceExpired()
 		case <-reval.C:
 			c.revalidate()
+		case <-down:
+			// Shutdown has begun. It reaches the actor here and not through the inbox, which can be full: a detached
+			// connection has no socket whose close would end it, and would hold Shutdown up for its grace.
+			down = nil
+			c.shutdown(c.h.shutdownReasonNow())
 		}
 	}
 	c.h.removeConn(c)
 }
 
-// post queues f for the actor without blocking. When the inbox is full the connection can't keep up and is closed
-// as slow_connection (01 §15.2). post returns false when f was not queued.
+// post queues f for the actor without blocking. It returns false when f was not queued: the actor has ended, or the
+// inbox is full. A full inbox means that the connection can't keep up, and it closes the connection for good, as
+// slow_connection (01 §15.2): f is dropped, and nobody knows what the connection has missed with it, a revocation,
+// the close of its room or a share's media state. The socket is closed with 4503 here, at once; the actor does the
+// rest when it gets there (lostPost), without grace, and nothing resumes the connection meanwhile.
 func (c *conn) post(f func()) bool {
 	select {
 	case <-c.done:
@@ -630,11 +667,37 @@ func (c *conn) post(f func()) bool {
 	case c.inbox <- f:
 		return true
 	default:
-		if s := c.sockP.Load(); s != nil {
-			s.overflow()
-		}
-		return false
 	}
+	if c.lost.CompareAndSwap(false, true) {
+		c.h.log.Warn("connection inbox full", slog.String("conn_id", c.id), slog.String("user_id", c.userID),
+			slog.Int("limit", inboxSize))
+	}
+	if s := c.sockP.Load(); s != nil {
+		s.closeSlow()
+	}
+	// The actor looks at lost after each thing it handles. It may have emptied the inbox since the send above failed
+	// and be waiting now: this wakes it. If the inbox is still full, the actor has work left and needs no waking.
+	select {
+	case c.inbox <- func() {}:
+	default:
+	}
+	return false
+}
+
+// lostPost ends the connection after the full inbox dropped a post (post). It runs on the actor and reports whether
+// the connection is closed. A revocation is never lost with its post: it is applied here. Then a detached connection
+// closes at once, and an attached one closes with its socket (endsWith), which post has closed already; it is closed
+// here too, for a socket that a resume attached while post ran.
+func (c *conn) lostPost() bool {
+	c.applyRevocation()
+	switch {
+	case c.closed:
+	case c.sock == nil:
+		c.close(protocol.EndReasonDisconnected)
+	default:
+		c.sock.closeSlow()
+	}
+	return c.closed
 }
 
 // postWait queues f for the actor, waiting while the inbox is full. The socket reader uses it, so a client that
@@ -648,16 +711,23 @@ func (c *conn) postWait(f func()) bool {
 	}
 }
 
-// attach makes s the connection's socket and sends welcome, the reply to hello request re (01 §8.2 step 6).
-func (c *conn) attach(s *socket, re, defaultRoom string, pol Policy) {
+// attach makes s the connection's socket and sends welcome, the reply to hello request re (01 §8.2 step 6): for a
+// new connection, and for one that resumes on s (resumed; conn.resume), whose welcome names the room it is in. Every
+// welcome carries a new resume token, and the connection keeps only that token's hash, so an older token of the same
+// connection resumes nothing (01 §10.3).
+func (c *conn) attach(s *socket, re, defaultRoom string, pol Policy, resumed bool) {
 	c.sock = s
 	c.sockP.Store(s)
-	c.ip = s.ip
+	c.ip = s.ip // a resume from another address is allowed (Wi-Fi to LTE)
 	c.idle.Reset(c.h.cfg.IdleTimeout)
 	token, hash := mintResumeToken(c.h.cfg.ResumeKey, c.idRaw)
 	c.tokenHash = hash
 	id := c.identity()
 	cfg := &c.h.cfg
+	roomID := ""
+	if resumed && c.room != nil {
+		roomID = c.room.id
+	}
 	c.send(protocol.MessageTypeWelcome, re, protocol.Welcome{
 		Protocol:         c.version,
 		ServerVersion:    cfg.ServerVersion,
@@ -679,52 +749,56 @@ func (c *conn) attach(s *socket, re, defaultRoom string, pol Policy) {
 		ICEServers:    cfg.ICEServers,
 		ConnectionID:  c.id,
 		ResumeToken:   token,
-		Resumed:       false,
+		Resumed:       resumed,
+		RoomID:        roomID,
 		DefaultRoomID: defaultRoom,
 		User:          protocol.UserInfo{ID: id.UserID, Name: id.Name, Admin: id.Admin},
 		ServerTime:    time.Now(),
 	})
-	c.h.log.Info("connection opened", slog.String("conn_id", c.id), slog.String("user_id", c.userID),
-		slog.Bool("resumed", false), slog.String("kind", string(c.client.Kind)), slog.String("role", string(c.role)))
+	msg := "connection opened"
+	if resumed {
+		msg = "connection resumed"
+	}
+	c.h.log.Info(msg, slog.String("conn_id", c.id), slog.String("user_id", c.userID),
+		slog.Bool("resumed", resumed), slog.String("kind", string(c.client.Kind)), slog.String("role", string(c.role)))
 }
 
-// socketEnded handles the end of socket s. The connection closes with its socket; README S28 keeps it detached for
-// Config.Grace instead, unless the client closed on purpose (1000, 1001) or the hub closed it for good.
-func (c *conn) socketEnded(s *socket, code int) {
+// socketEnded handles the end of socket s, which closed with code (byHub: the hub chose the code). When s was the
+// connection's socket, the connection ends with it or stays detached for Config.Grace, as endsWith decides
+// (01 §4.2).
+func (c *conn) socketEnded(s *socket, code int, byHub bool) {
 	if s != c.sock {
-		return // an earlier socket
+		return // an earlier socket: the connection has resumed on another one, which replaced this one
 	}
 	c.sock = nil
 	c.sockP.Store(nil)
-	c.close(code)
+	c.idle.Stop()
+	c.lastCode = code
+	// A revocation whose post is still behind this one in the inbox counts already: it closes the connection here.
+	if c.applyRevocation(); c.closed {
+		return
+	}
+	if reason, ends := c.endsWith(code, byHub); ends {
+		c.close(reason)
+		return
+	}
+	c.startGrace()
 }
 
-// close ends the connection after its socket has ended; the actor then exits and the hub forgets it. code is the
-// socket's close code. The connection leaves its room (01 §4.2): its shares end, its MediaPeer closes, and its
-// participant leaves with its last connection, with the reason of closeReason.
-func (c *conn) close(code int) {
+// close ends the connection: its socket has ended for good, its grace has expired, or it was revoked or shut down
+// while detached. The actor then exits and the hub forgets the connection. The connection leaves its room
+// (01 §4.2): its shares end, its MediaPeer closes, and its participant leaves with its last connection, all with
+// reason.
+func (c *conn) close(reason protocol.EndReason) {
 	if c.closed {
 		return
 	}
 	c.closed = true
-	c.leaveRoom(c.closeReason(code))
-	c.h.metrics.connClosed(c.client.Kind, c.role, code)
+	c.grace.Stop()
+	c.leaveRoom(reason)
+	c.h.metrics.connClosed(c.client.Kind, c.role)
 	c.h.log.Info("connection closed", slog.String("conn_id", c.id), slog.String("user_id", c.userID),
-		slog.Int("code", code))
-}
-
-// closeReason is the EndReason of a connection that closes with its socket's close code (01 §4.2, §8.6): the one
-// revoke or shutdown set (left, server_shutdown), left when the client closed on purpose (1000, 1001; the hub never
-// closes with those), else disconnected. From README S28 on, a connection gets here with disconnected only after
-// its grace.
-func (c *conn) closeReason(code int) protocol.EndReason {
-	switch {
-	case c.endReason != "":
-		return c.endReason
-	case code == int(protocol.CloseCodeNormal) || code == int(protocol.CloseCodeGoingAway):
-		return protocol.EndReasonLeft
-	}
-	return protocol.EndReasonDisconnected
+		slog.Int("code", c.lastCode), slog.String("reason", string(reason)))
 }
 
 // leaveRoom takes the connection out of its room, if any (01 §8.4): the hub detaches it, then its MediaPeer ends the
@@ -784,7 +858,7 @@ func (c *conn) sendRoomEvent(r *room, msg []byte) {
 }
 
 // sendStateNow sends the current snapshot of the connection's room to this connection alone: right after the ok of
-// a room.join, before any other room traffic (01 §7), and after a resumed welcome (README S28).
+// a room.join, before any other room traffic (01 §7), and after a resumed welcome (01 §10.5).
 func (c *conn) sendStateNow() {
 	r := c.room
 	r.mu.Lock()
@@ -798,7 +872,8 @@ func (c *conn) sendStateNow() {
 	c.sendEncoded(protocol.MessageTypeRoomState, b)
 }
 
-// send queues a message on the current socket; while detached, messages are dropped (resync replaces them).
+// send queues a message on the current socket. While detached, messages are dropped: a resume is a resync, never a
+// replay (01 §10.5).
 func (c *conn) send(t protocol.MessageType, re string, data any) bool {
 	if c.sock == nil {
 		return false
@@ -828,22 +903,38 @@ func (c *conn) fail(e protocol.Error) {
 }
 
 // revoke closes the connection for a revocation (01 §3.2): error{session_revoked|account_disabled, scope session}
-// and 4401/4403. Its shares end with left, and so does its participant with its last connection (01 §4.2). From
-// README S28 on it also skips grace.
+// and 4401/4403. Its shares end with left, and so does its participant with its last connection (01 §4.2). There is
+// no grace: the connection closes with its socket, and a detached one closes at once.
 func (c *conn) revoke(e protocol.Error) {
 	c.h.log.Info("connection revoked", slog.String("conn_id", c.id), slog.String("user_id", c.userID),
 		slog.String("code", string(e.Code)))
 	c.endReason = protocol.EndReasonLeft
+	if c.sock == nil {
+		c.close(c.endReason)
+		return
+	}
 	c.fail(e)
 }
 
+// applyRevocation revokes the connection when CloseConnections has asked for it and the actor has not done it yet.
+// CloseConnections records the revocation on the connection before it posts this call, so a revocation does not
+// depend on room in the inbox: the actor also looks for it when the connection's socket ends (socketEnded) and when
+// the inbox has dropped a post (lostPost).
+func (c *conn) applyRevocation() {
+	if e := c.revoked.Load(); e != nil && c.endReason == "" {
+		c.revoke(*e)
+	}
+}
+
 // shutdown sends the shutdown notice and closes the socket with 1012 (04 §6.4); the connection's shares end with
-// server_shutdown when it closes.
+// server_shutdown when it closes. A detached connection closes at once: Shutdown never waits for a grace.
 func (c *conn) shutdown(reason protocol.ShutdownReason) {
 	c.endReason = protocol.EndReasonServerShutdown
-	if c.sock != nil {
-		c.sock.shutdown(reason)
+	if c.sock == nil {
+		c.close(c.endReason)
+		return
 	}
+	c.sock.shutdown(reason)
 }
 
 // setUser applies a rename or role change (UpdateUser, Revalidate): the identity, and the participant's name in the

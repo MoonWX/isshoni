@@ -34,10 +34,16 @@ func ClientIP(r *http.Request) netip.Addr {
 // that Dial and HTTPClient open. Operations on a pipe block until the other end reads or writes, and inside a
 // testing/synctest bubble they are durably blocking, so the bubble's fake clock runs. Create and use a PipeNet inside
 // one bubble.
+//
+// Sever breaks every open connection at once, like a network path that fails: the way to kill sockets under clients
+// that don't close them themselves (a resume test of the Go client, for example).
 type PipeNet struct {
 	conns  chan net.Conn
 	closed chan struct{}
 	once   sync.Once
+
+	mu   sync.Mutex
+	open []net.Conn // both ends of every pipe dialed since the last Sever
 }
 
 // NewPipeNet returns an open PipeNet.
@@ -74,6 +80,9 @@ func (n *PipeNet) Dial(ctx context.Context, _, _ string) (net.Conn, error) {
 	client, server := net.Pipe()
 	select {
 	case n.conns <- server:
+		n.mu.Lock()
+		n.open = append(n.open, client, server)
+		n.mu.Unlock()
 		return client, nil
 	case <-n.closed:
 	case <-ctx.Done():
@@ -81,6 +90,19 @@ func (n *PipeNet) Dial(ctx context.Context, _, _ string) (net.Conn, error) {
 	_ = client.Close()
 	_ = server.Close()
 	return nil, errors.New("signaltest: pipe network closed or dial canceled")
+}
+
+// Sever closes both ends of every connection dialed so far, like a network path that fails: reads and writes fail
+// on either side, and no WebSocket close frame arrives (the hub sees 1006 and starts the connection's grace). The
+// network stays open: clients can dial again.
+func (n *PipeNet) Sever() {
+	n.mu.Lock()
+	open := n.open
+	n.open = nil
+	n.mu.Unlock()
+	for _, c := range open {
+		_ = c.Close()
+	}
 }
 
 // HTTPClient returns an HTTP client whose requests go to the listener, whatever the URL's host. Keep-alives are off,
