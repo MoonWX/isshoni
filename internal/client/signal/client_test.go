@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -140,6 +141,103 @@ func TestHelloFeatures(t *testing.T) {
 		if len(h.Features) != 2 || h.Features[0] != protocol.FeatureAgentRelay || h.Role != protocol.RoleViewer {
 			t.Errorf("hello %+v", h)
 		}
+	})
+}
+
+// The caps of a hello are the client's current ones (01 §10.3): those of Options until the caller sends a
+// caps.update, then those, whatever Go type the caller built the message from. A caps.update that was not sent
+// changes nothing.
+func TestHelloCapsFollowCapsUpdate(t *testing.T) {
+	bubble(t, func(t *testing.T, f *fakeServer) {
+		o := f.options()
+		o.Caps = protocol.Caps{Decode: []protocol.CodecKey{protocol.CodecOpus}}
+		c, fc := ready(t, f, o)
+		defer c.Close()
+		// redial drops the socket and returns the caps of the hello on the next one.
+		redial := func() string {
+			t.Helper()
+			fc.kill()
+			_, _, fc = reconnected(t, f, c)
+			b, err := json.Marshal(fc.hello().Caps)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return string(b)
+		}
+		if got, want := redial(), `{"decode":["opus"]}`; got != want {
+			t.Errorf("hello caps %s before any caps.update, want %s", got, want)
+		}
+
+		// A value: the client keeps its own copy.
+		decode := []protocol.CodecKey{protocol.CodecH264ConstrainedBaseline, protocol.CodecOpus}
+		if err := c.Send(protocol.MessageTypeCapsUpdate, protocol.CapsUpdate{Caps: protocol.Caps{Decode: decode}}); err != nil {
+			t.Fatalf("Send caps.update: %v", err)
+		}
+		u, err := protocol.Decode[protocol.CapsUpdate](fc.expect(protocol.MessageTypeCapsUpdate))
+		if err != nil || len(u.Caps.Decode) != 2 {
+			t.Errorf("the server got caps.update %+v, %v", u, err)
+		}
+		decode[0] = "changed"
+		const h264 = `{"decode":["h264/42e0","opus"]}`
+		for i := range 2 {
+			if got := redial(); got != h264 {
+				t.Errorf("hello %d after the caps.update has caps %s, want %s", i, got, h264)
+			}
+		}
+
+		// A pointer, and a payload that is no CapsUpdate at all.
+		const capture = `{"decode":["opus"],"displayCapture":true}`
+		const full = `{"decode":["h264/42e0","h264/4200","opus"],"encode":["opus"],"simulcast":true,"displayCapture":true}`
+		for _, tc := range []struct {
+			data any
+			want string
+		}{
+			{&protocol.CapsUpdate{Caps: protocol.Caps{Decode: []protocol.CodecKey{protocol.CodecOpus}, DisplayCapture: true}}, capture},
+			{json.RawMessage(`{"caps":` + full + `}`), full},
+		} {
+			if err := c.Send(protocol.MessageTypeCapsUpdate, tc.data); err != nil {
+				t.Fatalf("Send caps.update (%T): %v", tc.data, err)
+			}
+			fc.expect(protocol.MessageTypeCapsUpdate)
+			if got := redial(); got != tc.want {
+				t.Errorf("hello caps %s after a caps.update given as %T, want %s", got, tc.data, tc.want)
+			}
+		}
+		// A new connection gets them too.
+		f.noResume.Store(true)
+		if got := redial(); got != full || c.Welcome().Resumed {
+			t.Errorf("hello caps %s on a new connection (resumed %v), want %s", got, c.Welcome().Resumed, full)
+		}
+		f.noResume.Store(false)
+
+		// What the server would answer with bad_request is an error, and is neither sent nor kept: a hello with
+		// such caps would stop the client.
+		many := protocol.CapsUpdate{Caps: protocol.Caps{Decode: make([]protocol.CodecKey, protocol.MaxCodecs+1)}}
+		for i := range many.Caps.Decode {
+			many.Caps.Decode[i] = protocol.CodecOpus
+		}
+		for _, data := range []any{many, protocol.CapsUpdate{Caps: protocol.Caps{Decode: []protocol.CodecKey{"H264 High"}}}} {
+			var fe *protocol.FieldError
+			if err := c.Send(protocol.MessageTypeCapsUpdate, data); !errors.As(err, &fe) || !strings.HasPrefix(fe.Field, "caps.decode") {
+				t.Errorf("Send of an invalid caps.update = %v, want a field error for caps.decode", err)
+			}
+		}
+		if err := c.Send(protocol.MessageTypeStats, protocol.ClientStats{}); err != nil {
+			t.Fatalf("Send stats: %v", err)
+		}
+		fc.expect(protocol.MessageTypeStats) // and nothing before it
+		// Nor is one kept that could not be sent: the caller sends it again once the client is ready.
+		fc.kill()
+		expectStates(t, c, signal.StateBackoff)
+		opus := protocol.CapsUpdate{Caps: protocol.Caps{Decode: []protocol.CodecKey{protocol.CodecOpus}}}
+		if err := c.Send(protocol.MessageTypeCapsUpdate, opus); !errors.Is(err, signal.ErrConnectionLost) {
+			t.Errorf("Send caps.update while backing off: %v, want ErrConnectionLost", err)
+		}
+		expectStates(t, c, signal.StateConnecting, signal.StateHandshaking, signal.StateReady)
+		if b, _ := json.Marshal(f.conn().hello().Caps); string(b) != full {
+			t.Errorf("hello caps %s after caps.updates that were not sent, want %s", b, full)
+		}
+		noStates(t, c)
 	})
 }
 
@@ -1404,7 +1502,7 @@ func TestRateLimitWait(t *testing.T) {
 		{0, 30 * time.Second},
 		{1000, 30 * time.Second},
 		{45000, 45 * time.Second},
-		{1 << 40, 5 * time.Minute}, // a bug on the server must not park the client for years
+		{math.MaxInt32, 5 * time.Minute}, // a bug on the server must not park the client for weeks
 		{-5, 30 * time.Second},
 	} {
 		bubble(t, func(t *testing.T, f *fakeServer) {
@@ -1466,9 +1564,9 @@ func TestShutdownWait(t *testing.T) {
 		{1840, true, 1840 * time.Millisecond},
 		{500, true, 500 * time.Millisecond},
 		{3000, true, 3 * time.Second},
-		{0, true, 0},                     // at once
-		{-1, false, 0},                   // no server sends this: the normal sequence
-		{1 << 40, true, 5 * time.Minute}, // a bug on the server must not park the client for years
+		{0, true, 0},                           // at once
+		{-1, false, 0},                         // no server sends this: the normal sequence
+		{math.MaxInt32, true, 5 * time.Minute}, // a bug on the server must not park the client for weeks
 	} {
 		bubble(t, func(t *testing.T, f *fakeServer) {
 			c, fc := ready(t, f, f.options())

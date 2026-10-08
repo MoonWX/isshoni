@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -29,6 +30,9 @@ type socket struct {
 	stop  chan struct{} // closed by halt: the reader stops delivering and ends
 	done  chan struct{} // closed when the reader has ended
 	once  sync.Once
+	// over is set by the reader when the socket itself is over: Read failed, or the server's error ended it. A reader
+	// also ends on a socket that lives (halt, a welcome it can't use), so done does not say this.
+	over atomic.Bool
 
 	welcomed bool // the welcome arrived; the reader's own
 
@@ -71,6 +75,7 @@ func (s *socket) read() {
 		typ, b, err := s.ws.Read(s.c.base)
 		if err != nil {
 			s.readErr = err
+			s.over.Store(true)
 			return
 		}
 		if typ != websocket.MessageText {
@@ -82,6 +87,9 @@ func (s *socket) read() {
 			continue
 		}
 		if !s.handle(env) {
+			if s.srvErr != nil {
+				s.over.Store(true) // the server closes the socket after its error (01 §12.2)
+			}
 			return
 		}
 	}

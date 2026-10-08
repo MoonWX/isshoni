@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"strconv"
 	"time"
 
@@ -66,7 +67,6 @@ func (c *Client) connection() ending {
 		Features:    c.o.Features,
 		Client:      c.o.Client,
 		Role:        c.o.Role,
-		Caps:        c.o.Caps,
 	}
 	if c.o.Token != nil {
 		tok, err := c.o.Token(ctx)
@@ -83,6 +83,7 @@ func (c *Client) connection() ending {
 
 	s := newSocket(c, ws, strconv.FormatUint(c.ids.Add(1), 10))
 	c.mu.Lock()
+	hello.Caps = c.caps // the current ones: a resume replaces the connection's with them (01 §10.3)
 	if c.welcomed {
 		hello.ResumeToken = c.welcome.ResumeToken // 01 §10.3
 	}
@@ -253,16 +254,17 @@ func (c *Client) heartbeat(s *socket) error {
 // end the connection without its grace period (01 §4.2), and returns the handshake's error. Every other drop just
 // closes the network connection: the server sees a socket that went away (1006) and keeps the connection for the
 // grace period, so the next hello can resume it.
+//
+// Only a socket that is over has nobody to tell. A reader that has ended says nothing about that: halt itself ends
+// one that waits for a caller who receives no more, on a socket that is alive, and its server must hear of the close.
 func (c *Client) drop(s *socket, normal bool) error {
 	s.halt()
 	var err error
-	if normal {
-		select {
-		case <-s.done: // the socket is gone already: there is nobody to tell
-		default:
-			if cerr := s.ws.Close(websocket.StatusNormalClosure, ""); cerr != nil {
-				err = fmt.Errorf("signal: close: %w", cerr)
-			}
+	if normal && !s.over.Load() {
+		// net.ErrClosed: the server's close frame arrived in this moment and the reader answered it. That is a
+		// closed socket, not a close without an answer.
+		if cerr := s.ws.Close(websocket.StatusNormalClosure, ""); cerr != nil && !errors.Is(cerr, net.ErrClosed) {
+			err = fmt.Errorf("signal: close: %w", cerr)
 		}
 	}
 	_ = s.ws.CloseNow()

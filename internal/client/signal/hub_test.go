@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -645,7 +646,78 @@ func TestRequestsAgainstHub(t *testing.T) {
 		if err := c.Send(protocol.MessageTypeHello, protocol.Hello{}); err == nil {
 			t.Error("Send(hello) succeeded")
 		}
+		// A request given to Send and a notification given to Request never leave the client: the hub ends the
+		// connection over a request without an id (bad_message, 4400), and it never answers a notification.
+		start := time.Now()
+		if err := c.Send(protocol.MessageTypeRoomLeave, protocol.Empty{}); err == nil || !strings.Contains(err.Error(), "use Request") {
+			t.Errorf("Send(room.leave) = %v, want an error that names Request", err)
+		}
+		err = c.Request(ctxT(t), protocol.MessageTypeStats, protocol.ClientStats{}, nil)
+		if err == nil || !strings.Contains(err.Error(), "use Send") {
+			t.Errorf("Request(stats) = %v, want an error that names Send", err)
+		}
+		if got := time.Since(start); got != 0 {
+			t.Errorf("the two calls took %v, want no wait for a reply", got)
+		}
+		// A type this build doesn't know may be a newer server's and goes out either way (01 §8.13): this hub answers
+		// such a request with unknown_type and ignores such a notification.
+		err = c.Request(ctxT(t), "from.the.future", protocol.Empty{}, nil)
+		if !errors.As(err, &pe) || pe.Code != protocol.ErrorCodeUnknownType {
+			t.Errorf("a request of an unknown type: %v, want unknown_type", err)
+		}
+		if err := c.Send("from.the.future", protocol.Empty{}); err != nil {
+			t.Errorf("a notification of an unknown type: %v", err)
+		}
+		// None of it touched the connection: it is still in its room, on its first socket.
+		synctest.Wait()
+		if conns := e.connections(a.UserID); len(conns) != 1 || conns[0].ID != w.ConnectionID ||
+			conns[0].Status != protocol.ConnectionStatusOnline {
+			t.Errorf("the hub's connections of A: %+v, want the first one, online", conns)
+		}
 		noStates(t, c)
+	})
+}
+
+// A caps.update outlasts a resume (01 §8.10, §10.3, §11.7): the hello that resumes carries the caps the client sent
+// last, not the ones Dial got, so the hub does not put the connection back to those.
+func TestCapsUpdateOutlastsResume(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newHubEnv(t)
+		defer e.close()
+		cookie, _ := e.user()
+		o := e.options(cookie)
+		atDial := protocol.Caps{Decode: []protocol.CodecKey{protocol.CodecOpus}} // no H.264 yet
+		o.Caps = atDial
+		c := e.dial(o)
+		expectStates(t, c, signal.StateConnecting, signal.StateHandshaking, signal.StateReady)
+		join(t, c, "lounge")
+		peer := e.cur.Load().media.Peer(c.Welcome().ConnectionID)
+		if peer == nil || !slices.Equal(peer.Params.Caps.Decode, atDial.Decode) {
+			t.Fatalf("the connection's peer %+v, want one with the caps of Dial", peer)
+		}
+
+		// H.264 became available.
+		now := protocol.Caps{Decode: []protocol.CodecKey{protocol.CodecH264ConstrainedBaseline, protocol.CodecOpus}}
+		if err := c.Send(protocol.MessageTypeCapsUpdate, protocol.CapsUpdate{Caps: now}); err != nil {
+			t.Fatalf("Send caps.update: %v", err)
+		}
+		synctest.Wait()
+		for range 2 {
+			e.srv.Net.Sever()
+			expectBackoff(t, c)
+			if sc := expectStates(t, c, signal.StateHandshaking, signal.StateReady); !sc.Resumed {
+				t.Fatalf("ready after the drop %+v, want resumed", sc)
+			}
+			settle()
+		}
+		if n := len(peer.CallsTo("Resync")); n != 2 {
+			t.Errorf("Resync was called %d times, want once per resume", n)
+		}
+		for _, call := range peer.CallsTo("SetCaps") {
+			if got, ok := call.Args[0].(protocol.Caps); !ok || !slices.Equal(got.Decode, now.Decode) {
+				t.Errorf("the hub set the peer's caps to %+v, want only ever %+v", call.Args[0], now)
+			}
+		}
 	})
 }
 

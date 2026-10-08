@@ -33,7 +33,8 @@ type Options struct {
 	// with unauthenticated.
 	Token func(ctx context.Context) (protocol.Secret, error)
 	// Client, Role, Caps and Features go into every hello (01 §8.2). A resume keeps the connection's client info,
-	// role and features and takes the caps anew (01 §10.3).
+	// role and features and takes the caps anew (01 §10.3). Caps are therefore the client's first ones only: once
+	// the caller sends a caps.update (Send), its caps go into the hellos that follow.
 	Client   protocol.ClientInfo
 	Role     protocol.Role
 	Caps     protocol.Caps
@@ -143,6 +144,7 @@ type Client struct {
 	sock     *socket // the socket of the current attempt: it may make the client ready, or the client is ready on it
 	welcome  protocol.Welcome
 	welcomed bool                  // welcome is set: its resume token goes into the next hello
+	caps     protocol.Caps         // the next hello's: Options.Caps, then the last caps.update's; never changed in place
 	pending  map[string]chan reply // requests waiting for their reply, by id
 	limited  bool                  // the current backoff is a rate-limit wait, which RetryNow doesn't shorten
 	failure  error                 // why the last attempt failed, for Dial's error
@@ -215,6 +217,7 @@ func newClient(ctx context.Context, o Options) *Client {
 		closing: make(chan struct{}),
 		retry:   make(chan struct{}, 1),
 		probe:   make(chan struct{}, 1),
+		caps:    o.Caps,
 		pending: make(map[string]chan reply),
 	}
 	c.life, c.cancel = context.WithCancel(c.base)
@@ -239,7 +242,8 @@ func (c *Client) Welcome() protocol.Welcome {
 
 // Request sends request t with payload data and waits for its reply. The payload of the ok is decoded into result,
 // a pointer to a zero value of t's reply type (protocol.Registry has it; nil drops the payload). The client sends
-// hello itself; every other request goes through here (01 §7).
+// hello itself; every other request goes through here (01 §7). A notification is not one and is an error: no reply
+// would come. A type this build doesn't know is sent, since a newer server may know it.
 //
 // When the server answers with an error message, the error is that *protocol.Error. Otherwise it wraps
 // ErrConnectionLost (the client is not ready, or its socket went away before the reply), ErrRequestTimeout (no
@@ -249,6 +253,9 @@ func (c *Client) Welcome() protocol.Welcome {
 func (c *Client) Request(ctx context.Context, t protocol.MessageType, data, result any) error {
 	if t == protocol.MessageTypeHello {
 		return errors.New("signal: request: the client sends hello itself")
+	}
+	if spec, ok := protocol.Lookup(t, protocol.DirClientToServer); ok && spec.Kind != protocol.KindRequest {
+		return fmt.Errorf("signal: request: %s is a notification: use Send", t)
 	}
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("signal: request %s: %w", t, context.Cause(ctx))
@@ -301,17 +308,38 @@ func (c *Client) Request(ctx context.Context, t protocol.MessageType, data, resu
 }
 
 // Send sends notification t with payload data: no id, no reply (01 §7). The error wraps ErrConnectionLost while the
-// client is not ready (nothing is queued for later) and ErrNotReady once it is stopped.
+// client is not ready (nothing is queued for later) and ErrNotReady once it is stopped. A request is not a
+// notification and is an error: without an id the server would end the connection over it. A type this build
+// doesn't know is sent, since a newer server may know it.
+//
+// The client keeps the caps of a caps.update (01 §8.10) that it sends: they go into every later hello in place of
+// Options.Caps, because a resume would otherwise put the connection back to the old ones (01 §10.3). So a
+// caps.update is first checked the way the server checks it: one that the server would refuse is an error (a
+// *protocol.FieldError) and is not sent.
 func (c *Client) Send(t protocol.MessageType, data any) error {
 	if t == protocol.MessageTypeHello {
 		return errors.New("signal: send: the client sends hello itself")
+	}
+	if spec, ok := protocol.Lookup(t, protocol.DirClientToServer); ok && spec.Kind == protocol.KindRequest {
+		return fmt.Errorf("signal: send: %s is a request: use Request", t)
 	}
 	b, err := protocol.Marshal(t, "", "", data)
 	if err != nil {
 		return fmt.Errorf("signal: send: %w", err)
 	}
+	var caps *protocol.Caps
+	if t == protocol.MessageTypeCapsUpdate {
+		if caps, err = capsIn(b); err != nil {
+			return fmt.Errorf("signal: send %s: %w", t, err)
+		}
+	}
 	c.mu.Lock()
 	s, err := c.readyLocked()
+	if err == nil && caps != nil {
+		// Kept as the socket is chosen, not after the write: every later socket's hello takes its caps under this
+		// lock, so none carries older caps than this message. When the write fails, the next hello delivers them.
+		c.caps = *caps
+	}
 	c.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("signal: send %s: %w", t, err)
@@ -321,6 +349,20 @@ func (c *Client) Send(t protocol.MessageType, data any) error {
 	}
 	c.log.Debug("send", slog.String("type", string(t)))
 	return nil
+}
+
+// capsIn returns the caps of the marshaled caps.update b as the server will read them, whatever Go type the caller
+// made the payload from, in memory of their own. The error is the one the server answers with bad_request.
+func capsIn(b []byte) (*protocol.Caps, error) {
+	env, err := protocol.ParseEnvelope(b)
+	if err != nil {
+		return nil, err
+	}
+	u, err := protocol.Decode[protocol.CapsUpdate](env)
+	if err != nil {
+		return nil, err
+	}
+	return &u.Caps, nil
 }
 
 // Events returns the server's notifications, in the order they arrived: room.state, room.event, pc.*,

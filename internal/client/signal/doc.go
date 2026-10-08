@@ -14,7 +14,8 @@
 // What to do after a welcome (01 §10.5) is the caller's: States reports every welcome as StateReady with Resumed,
 // and Welcome has the room the server resumed the connection into. A caller that was not resumed joins its room
 // again, publishes its shares again with replaces and sends its subscriptions; a resumed one sends its full
-// subscription set and re-sends a pending pub offer. PeerConnections are the caller's too (01 §9, §10.4): the client
+// subscription set and re-sends a pending pub offer. Neither sends its caps again: every hello carries the ones of
+// the last caps.update the caller sent (01 §10.3). PeerConnections are the caller's too (01 §9, §10.4): the client
 // only carries their pc.* messages. Probe and RetryNow are for what such a caller knows and the client doesn't: a
 // PeerConnection that became disconnected, a network that is back (01 §3.4, §10.2).
 //
