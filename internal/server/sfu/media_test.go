@@ -19,9 +19,9 @@ import (
 )
 
 // The media path's unit tests (README S41): the Layer's read loop and rates (02 §9.1), the DownTrack's writer and
-// RTCP handling (02 §9.3), keyframe requests and their throttle (02 §9.7), and a share's ShareUpdated calls
-// (02 §5.3, §6.2). They build Layers and DownTracks by hand on a real SFU, feed them packets and look at what comes
-// out; the test with real PeerConnections and media is TestBasicForwarding (forwarding_test.go).
+// RTCP handling (02 §9.3), keyframe requests (02 §9.7; their throttle is throttle_test.go's), and a share's
+// ShareUpdated calls (02 §5.3, §6.2). They build Layers and DownTracks by hand on a real SFU, feed them packets and
+// look at what comes out; the test with real PeerConnections and media is TestBasicForwarding (forwarding_test.go).
 
 // rtcpRecorder is a Layer's pub PC for a test: it records the RTCP the SFU writes to the publisher.
 type rtcpRecorder struct {
@@ -247,9 +247,9 @@ func TestLayerHandleRTP(t *testing.T) {
 	for _, d := range []*DownTrack{wantsF, wantsQ, paused, wantsA} {
 		d.binding.Store(nil) // not negotiated yet: this test is about what reaches the queues
 	}
-	wantsF.setTarget(SlotF, true)
-	wantsQ.setTarget(SlotQ, true)
-	wantsA.setTarget(SlotAudio, true)
+	wantsF.setWant(QualityHigh)
+	wantsQ.setWant(QualityLow)
+	wantsA.setWant(QualityHigh)
 	queued := func(d *DownTrack) []*packet {
 		var out []*packet
 		for {
@@ -490,63 +490,6 @@ func TestLayerTick(t *testing.T) {
 	}
 }
 
-// TestKeyframeThrottle is 02 §17's throttle_test: a hundred concurrent keyframe requests for one layer make one PLI,
-// and the next one goes out 500 ms later, not before (02 §9.7).
-func TestKeyframeThrottle(t *testing.T) {
-	s, _ := newTicklessSFU(t)
-	sh := testShare(t, s, "s_1")
-	l, pub := testLayer(t, sh, SlotF, 0xf00)
-	now := t0
-
-	var wg sync.WaitGroup
-	sent := make(chan bool, 100)
-	for range 100 {
-		wg.Go(func() { sent <- l.requestKeyframe(now) })
-	}
-	wg.Wait()
-	close(sent)
-	wrote := 0
-	for ok := range sent {
-		if ok {
-			wrote++
-		}
-	}
-	if n := len(pub.plis()); n != 1 || wrote != 1 || l.stats.pliSent.Load() != 1 || l.stats.pliThrottled.Load() != 99 {
-		t.Fatalf("100 concurrent requests: %d PLIs written, %d callers told so, %d counted sent and %d throttled; want 1, "+
-			"1, 1 and 99", n, wrote, l.stats.pliSent.Load(), l.stats.pliThrottled.Load())
-	}
-	if l.requestKeyframe(now+int64(pliInterval)-1) || len(pub.plis()) != 1 {
-		t.Error("a second PLI before 500 ms had passed")
-	}
-	if !l.requestKeyframe(now+int64(pliInterval)) || len(pub.plis()) != 2 {
-		t.Fatal("no PLI 500 ms after the last one")
-	}
-	if got, want := pub.plis()[1], (rtcp.PictureLossIndication{SenderSSRC: 0x5f5f5f5f, MediaSSRC: 0xf00}); got != want {
-		t.Errorf("PLI = %+v, want %+v", got, want)
-	}
-
-	// Share.requestKeyframe finds the layer of a slot: nothing for a slot without one.
-	sh.requestKeyframe(SlotQ)
-	if n := len(pub.plis()); n != 2 {
-		t.Errorf("%d PLIs after a request for a layer the share doesn't have", n)
-	}
-	q, pubQ := testLayer(t, sh, SlotQ, 0xa00)
-	sh.requestKeyframe(SlotQ)
-	if plis := pubQ.plis(); len(plis) != 1 || plis[0].MediaSSRC != 0xa00 {
-		t.Errorf("PLIs for q = %+v", plis)
-	}
-	// A pub PC that can't send (not connected, closing): the request is spent, and whoever waits asks again in 500 ms.
-	pubQ.err = errors.New("not connected")
-	later := monoNow() + int64(pliInterval)
-	if q.requestKeyframe(later) || q.stats.pliSent.Load() != 1 {
-		t.Error("a PLI the pub PC refused counts as sent")
-	}
-	pubQ.err = nil
-	if q.requestKeyframe(later+1) || !q.requestKeyframe(later+int64(pliInterval)) {
-		t.Error("after a refused PLI the next request must wait its 500 ms, and then go out")
-	}
-}
-
 // TestDownTrackWrite: the writer of 02 §9.3. Nothing is written, and the munger not even asked, before the viewer
 // negotiated the track and its sub PC's DTLS is up; then the stream starts on a keyframe start, which the DownTrack
 // has the publisher asked for; every packet goes out under a fresh header.
@@ -581,7 +524,7 @@ func TestDownTrackWrite(t *testing.T) {
 	// The DTLS-ready gate is closed (S4 finding 1): packets are dropped before the munger sees them, keyframes
 	// included, and nobody is asked for a keyframe the viewer couldn't get.
 	b.pc.ready.Store(false)
-	d.setTarget(SlotF, true)
+	d.setWant(QualityHigh)
 	if d.interest.Load() != 1<<SlotF {
 		t.Fatalf("interest = %b, want the bit of f", d.interest.Load())
 	}
@@ -739,7 +682,7 @@ func TestDownTrackWrite(t *testing.T) {
 	// Pause: at once, and nothing is asked for.
 	forget()
 	written = len(w.hdrs)
-	d.setTarget(SlotF, false)
+	d.setWant(QualityOff)
 	if n := send(key, ProfileHigh, false); n != written || d.interest.Load() != 0 || d.forwarding.Load() || len(sh.viewers()) != 0 {
 		t.Errorf("paused: %d more written, interest %b, forwarding %v", n-written, d.interest.Load(), d.forwarding.Load())
 	}
@@ -749,7 +692,7 @@ func TestDownTrackWrite(t *testing.T) {
 	}
 	// Resume: the publisher is asked at once (the viewer can receive), and the stream goes on with the keyframe,
 	// right after the last seq.
-	d.setTarget(SlotF, true)
+	d.setWant(QualityHigh)
 	if n := len(pub.plis()); n != 1 {
 		t.Errorf("%d PLIs on resume, want 1", n)
 	}
@@ -791,7 +734,7 @@ func TestDownTrackUnsentStart(t *testing.T) {
 	f, pub := testLayer(t, sh, SlotF, 0xf00)
 	sh.keyframe(f, ProfileHigh)
 	d, w := testDownTrack(t, viewer, sh, webrtc.RTPCodecTypeVideo)
-	d.setTarget(SlotF, true) // asks for a keyframe: the viewer can receive
+	d.setWant(QualityHigh) // asks for a keyframe: the viewer can receive
 	pub.forget()
 	f.lastPLI.Store(-int64(pliInterval))
 	var state rtpWriteState
@@ -836,7 +779,7 @@ func TestDownTrackUnsentMidStream(t *testing.T) {
 	f, pub := testLayer(t, sh, SlotF, 0xf00)
 	sh.keyframe(f, ProfileHigh)
 	d, w := testDownTrack(t, viewer, sh, webrtc.RTPCodecTypeVideo)
-	d.setTarget(SlotF, true)
+	d.setWant(QualityHigh)
 	forget := func() { pub.forget(); f.lastPLI.Store(-int64(pliInterval)) } // as if the last PLI were long ago
 	var state rtpWriteState
 	now, seq := t0, uint16(10)
@@ -898,7 +841,7 @@ func TestDownTrackNeverSends(t *testing.T) {
 	f, pub := testLayer(t, sh, SlotF, 0xf00)
 	sh.keyframe(f, ProfileHigh)
 	d, w := testDownTrack(t, viewer, sh, webrtc.RTPCodecTypeVideo)
-	d.setTarget(SlotF, true)
+	d.setWant(QualityHigh)
 	pub.forget()
 	var state rtpWriteState
 	now, seq := t0, uint16(10)
@@ -954,8 +897,8 @@ func TestDownTrackNeverSends(t *testing.T) {
 		t.Fatalf("once Pion sends: %d written, forwarding %v; want the keyframe start and what follows", len(w.hdrs),
 			d.forwarding.Load())
 	}
-	d.setTarget(SlotF, false)
-	d.setTarget(SlotF, true)
+	d.setWant(QualityOff)
+	d.setWant(QualityHigh)
 	pub.forget()
 	for range 3 {
 		f.lastPLI.Store(-int64(pliInterval))
@@ -1026,7 +969,7 @@ func TestDownTrackGate(t *testing.T) {
 		}
 	}
 
-	d.setTarget(SlotF, true)
+	d.setWant(QualityHigh)
 	send(f, keyPayload(t))
 	send(f, deltaPayload)
 	pc.follow(webrtc.PeerConnectionStateDisconnected) // ICE may recover: the stream goes on
@@ -1034,7 +977,7 @@ func TestDownTrackGate(t *testing.T) {
 		t.Fatalf("while the sub PC is disconnected: %d written, forwarding %v; want the stream to go on", n, d.forwarding.Load())
 	}
 	// The viewer asked for the other layer just before its PC failed: the switch was waiting for q's keyframe.
-	d.setTarget(SlotQ, true)
+	d.setWant(QualityLow)
 	forget()
 	pc.follow(webrtc.PeerConnectionStateFailed)
 	epochs := d.m.n
@@ -1107,11 +1050,11 @@ func TestDownTrackForwardingFlag(t *testing.T) {
 		wg.Wait()
 	}()
 	for i := range 5000 {
-		d.setTarget(SlotF, true)
+		d.setWant(QualityHigh)
 		for !d.forwarding.Load() {
 			runtime.Gosched()
 		}
-		d.setTarget(SlotF, false)
+		d.setWant(QualityOff)
 		if d.forwarding.Load() {
 			t.Fatalf("pause %d: the DownTrack counts as forwarding right after it was paused", i)
 		}
@@ -1145,7 +1088,7 @@ func TestDownTrackSwitch(t *testing.T) {
 		drain(d, &state)
 	}
 
-	d.setTarget(SlotF, true)
+	d.setWant(QualityHigh)
 	send(q, keyPayload(t)) // not wanted: never queued
 	send(f, keyPayload(t))
 	send(f, deltaPayload)
@@ -1153,7 +1096,7 @@ func TestDownTrackSwitch(t *testing.T) {
 		t.Fatalf("on f: %d written, %d PLIs for f, %d for q", len(w.hdrs), len(pubF.plis()), len(pubQ.plis()))
 	}
 
-	d.setTarget(SlotQ, true)
+	d.setWant(QualityLow)
 	if d.interest.Load() != 1<<SlotF|1<<SlotQ {
 		t.Fatalf("interest during the switch = %b, want f and q", d.interest.Load())
 	}
@@ -1250,7 +1193,7 @@ func TestForwardingAllocations(t *testing.T) {
 	for range 3 {
 		d, _ := testDownTrack(t, viewer, sh, webrtc.RTPCodecTypeVideo)
 		d.binding.Load().writer = discardWriter{}
-		d.setTarget(SlotF, true)
+		d.setWant(QualityHigh)
 		dts = append(dts, d)
 	}
 	states := make([]rtpWriteState, len(dts)) // a writer's state is its DownTrack's

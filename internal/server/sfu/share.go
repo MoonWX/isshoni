@@ -175,27 +175,78 @@ func (s *Share) setPreset(p Preset) bool {
 }
 
 // attach makes l the share's Layer for its slot and returns the Layer it replaces, if any (a track whose SSRC
-// changed). ok is false when the share has ended: nothing attaches to an ended share.
+// changed). ok is false when the share has ended: nothing attaches to an ended share. The share's DownTracks choose
+// their layer again before attach returns (retargetLocked), so a caller that attaches a track before it starts to
+// read it loses none of its packets for any viewer.
 func (s *Share) attach(l *Layer) (replaced *Layer, ok bool) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.ended {
+		s.mu.Unlock()
 		return nil, false
 	}
 	replaced = s.layers[l.slot]
 	s.layers[l.slot] = l
 	s.changedLocked()
+	moved := s.retargetLocked(l.kind)
+	s.mu.Unlock()
+	for _, sub := range moved {
+		sub.changed()
+	}
 	return replaced, true
 }
 
-// detach removes l from the share if it is still the Layer of its slot.
+// detach removes l from the share if it is still the Layer of its slot. The DownTracks that wanted it fall back to
+// what 02 §10.1 gives them without it, or pause.
 func (s *Share) detach(l *Layer) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	var moved []*Subscription
 	if s.layers[l.slot] == l {
 		s.layers[l.slot] = nil
 		s.changedLocked()
+		moved = s.retargetLocked(l.kind)
 	}
+	s.mu.Unlock()
+	for _, sub := range moved {
+		sub.changed()
+	}
+}
+
+// presentLocked returns the slot bits of the layers attached now: what 02 §10.1 chooses among. A layer is there from
+// the moment its track arrives until the track ends, whether or not packets flow on it. s.mu is held.
+func (s *Share) presentLocked() uint32 {
+	var bits uint32
+	for slot, l := range s.layers {
+		if l != nil {
+			bits |= 1 << slot
+		}
+	}
+	return bits
+}
+
+// present returns the slot bits of the layers attached now.
+func (s *Share) present() uint32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.presentLocked()
+}
+
+// retargetLocked has the share's DownTracks of a kind choose their layer again, after a layer of that kind came or
+// went (02 §10.1): a viewer who asked for high gets the full layer as soon as it is there, and the preview layer for
+// as long as it is the only one. It returns the subscriptions whose DownTrack changed its target; the caller tells
+// their Conns once it has released s.mu (Subscription.changed), which never blocks. s.mu is held, and each
+// DownTrack's lock is taken under it, the order of doc.go.
+func (s *Share) retargetLocked(kind webrtc.RTPCodecType) []*Subscription {
+	present := s.presentLocked()
+	var moved []*Subscription
+	for _, dt := range s.downTracks(kind) {
+		dt.mu.Lock()
+		_, changed := dt.retargetLocked(present)
+		dt.mu.Unlock()
+		if changed {
+			moved = append(moved, dt.sub)
+		}
+	}
+	return moved
 }
 
 // layer returns the Layer attached for a slot, or nil.

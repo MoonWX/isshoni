@@ -90,6 +90,40 @@ func WithoutPartialTail(pkts []Packet) []Packet {
 	return out
 }
 
+// WithoutCutFrames drops the packets of every video frame that a layer switch cut short: a frame whose last packet
+// (the one with the RTP marker bit) didn't arrive, right before a frame of another layer. An SFU switches on the
+// first packet of the new layer's keyframe (02 §9.4). The two layers are read by different goroutines, so that
+// packet can reach a viewer's queue between two packets of the old layer's current frame; the rest of that frame is
+// then no longer forwarded, and a decoder drops what it got of it. The sequence numbers stay continuous
+// (CheckContinuous sees the cut frame's packets too); only the checks of whole frames must leave it out.
+func WithoutCutFrames(pkts []Packet) []Packet {
+	frames := Frames(pkts)
+	cut := map[uint32]bool{}
+	rid, known := "", false // the layer of the newest frame with a marker
+	for i, f := range frames {
+		if f.HasMark {
+			rid, known = f.Mark.RID, true
+		}
+		whole := f.MarkerBits > 0 && f.MarkerOnLast
+		if whole || !known || i+1 == len(frames) {
+			continue
+		}
+		if next := frames[i+1]; next.HasMark && next.Mark.RID != rid {
+			cut[f.TS] = true
+		}
+	}
+	if len(cut) == 0 {
+		return pkts
+	}
+	out := make([]Packet, 0, len(pkts))
+	for _, p := range pkts {
+		if !cut[p.TS] {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // CheckContinuous checks that the packets form one continuous stream (the S4 check): in sequence-number order, no
 // sequence number is missing or received twice, and timestamps never go back.
 func CheckContinuous(pkts []Packet) error {

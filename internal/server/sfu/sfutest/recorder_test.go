@@ -184,6 +184,85 @@ func TestRecorderChecks(t *testing.T) {
 	}
 }
 
+// TestWithoutCutFrames: a layer switch may cut the old layer's last frame short. WithoutCutFrames leaves out exactly
+// such a frame, with or without its fake marker, so that the checks of whole frames pass; a frame that lost a packet
+// anywhere else stays, and still fails them.
+func TestWithoutCutFrames(t *testing.T) {
+	media := fakeMedia(t, 2*time.Second)
+	f, q := recordLayer(media, fake.Video, "f", 0).Packets(), recordLayer(media, fake.Video, "q", 0).Packets()
+	// keyStarts returns the indices of the packets that start a keyframe (GOP 500 ms: at 0, 0.5, 1 and 1.5 s).
+	keyStarts := func(p []Packet) []int {
+		var out []int
+		for i := range p {
+			if p[i].KeyStart {
+				out = append(out, i)
+			}
+		}
+		return out
+	}
+	fKeys, qKeys := keyStarts(f), keyStarts(q)
+	if len(fKeys) != 4 || len(qKeys) != 4 {
+		t.Fatalf("%d and %d keyframes, want 4 each", len(fKeys), len(qKeys))
+	}
+	// switched is what a viewer gets when the SFU goes from f to q's keyframe at 1.5 s after the first n packets of
+	// f: one stream, renumbered.
+	switched := func(n int) []Packet {
+		out := append(append([]Packet(nil), f[:n]...), q[qKeys[3]:]...)
+		for i := range out {
+			out[i].Seq = uint16(65000 + i)
+		}
+		return out
+	}
+	// midFrame: f up to the first packet of a delta frame of several packets, which carries the frame's marker.
+	midFrame := -1
+	for i := fKeys[1]; i+1 < fKeys[2]; i++ {
+		if f[i].HasMark && !f[i].Mark.Keyframe && !f[i].Marker {
+			midFrame = i + 1
+			break
+		}
+	}
+	if midFrame < 0 {
+		t.Fatal("no delta frame of more than one packet")
+	}
+	for name, pkts := range map[string][]Packet{
+		"cut in a delta frame":                     switched(midFrame),
+		"cut in a keyframe, before its marker":     switched(fKeys[2] + 1),
+		"a clean switch":                           switched(fKeys[2]),
+		"a stream of one layer":                    f,
+		"a stream whose last frame is still short": f[:midFrame],
+	} {
+		if err := CheckContinuous(pkts); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+		whole := WithoutCutFrames(pkts)
+		cut := strings.HasPrefix(name, "cut")
+		if got := len(pkts) - len(whole); (got > 0) != cut {
+			t.Errorf("%s: %d packets left out", name, got)
+		}
+		if err := CheckVideoMarkers(pkts); (err != nil) != (cut || strings.Contains(name, "short")) {
+			t.Errorf("%s: CheckVideoMarkers = %v before the cut frame is left out", name, err)
+		}
+		if strings.Contains(name, "short") {
+			continue // WithoutPartialTail's
+		}
+		for _, check := range []func([]Packet) error{CheckVideoMarkers, CheckStartsOnSPS} {
+			if err := check(whole); err != nil {
+				t.Errorf("%s: %v", name, err)
+			}
+		}
+	}
+	// A frame of the old layer that lost its last packet earlier is no cut frame.
+	lossy := switched(fKeys[2])
+	lossy = append(lossy[:midFrame:midFrame], lossy[midFrame+1:]...)
+	for lossy[midFrame-1].TS == lossy[midFrame].TS {
+		lossy = append(lossy[:midFrame:midFrame], lossy[midFrame+1:]...)
+	}
+	if got := WithoutCutFrames(lossy); len(got) != len(lossy) || CheckVideoMarkers(got) == nil {
+		t.Errorf("a frame that lost packets in mid-stream: %d of %d packets kept, CheckVideoMarkers = %v", len(got),
+			len(lossy), CheckVideoMarkers(got))
+	}
+}
+
 // firstDelta returns the index of the first packet of the first delta frame that carries a marker.
 func firstDelta(p []Packet) int {
 	for i := range p {

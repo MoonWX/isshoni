@@ -31,14 +31,20 @@ type RoomEvents interface {
 // CodecPolicyEvent, QualityHintEvent, PCStateEvent or ErrorEvent.
 type Event interface{ isEvent() }
 
-// SubscriptionStateEvent goes to the subscriber, only when Forwarded, Audio or Reason changes.
+// SubscriptionStateEvent goes to the subscriber, only when Forwarded, Audio or Reason changes: not for a request
+// alone, and not for a new subscription that forwards nothing yet without a reason (02 §10.1). A switch to another
+// layer is reported when that layer's keyframe has arrived, a pause at once.
 type SubscriptionStateEvent struct {
 	Share     ShareID
-	Requested Quality
-	Forwarded Quality // what the SFU actually sends
-	Audio     bool    // audio actually forwarded
+	Requested Quality // the client's latest request
+	// Forwarded is what the SFU actually sends: high for the full layer, low for the preview layer, off for none.
+	// For the moment a switch down takes (the old layer flows until the new one's keyframe), it is above Requested.
+	Forwarded Quality
+	Audio     bool // audio actually forwarded: the client asked for it and the share's audio flows
 	// Reason says why Forwarded < Requested. It is "" when they are equal, or while Forwarded < Requested only
 	// because the sub PC isn't connected yet or the target layer's keyframe hasn't arrived (01 maps that to waiting).
+	// A request for high that gets the preview layer because the share has no fuller one is Forwarded low with
+	// SubReasonNoLayer, as is one that gets nothing because the share has no video layer yet.
 	Reason SubReason
 }
 

@@ -20,10 +20,15 @@ import (
 // Media reaches it from the share's Layers: a Layer's read loop puts every packet of a slot the DownTrack is
 // interested in on its queue (enqueue, never blocking), and the DownTrack's writer goroutine takes them off, gives
 // them their place in the viewer's stream (the munger) and writes them to the sub PC. A second goroutine reads the
-// viewer's RTCP for the track. Which slot the DownTrack wants is its subscription's (setTarget).
+// viewer's RTCP for the track.
+//
+// Which layer it forwards is 02 §10.1's choice: its subscription says what it wants (setWant), and the DownTrack
+// takes the best layer for that among the ones the share has (selectSlot), again whenever the share's layers change
+// (Share.retargetLocked). Whenever what the viewer gets changes, the subscriber's Conn hears of it
+// (Subscription.changed) and tells the client (SubscriptionStateEvent).
 //
 // Later slices add the rest of 02 §9.3: the RTX queue, NACKs and forwarded sender reports (README S63), the pacer,
-// REMB and receiver reports (S84), and the caps of 02 §10.1 with their reasons (S52, S69, S84).
+// REMB and receiver reports (S84).
 type DownTrack struct {
 	share *Share
 	sub   *Subscription
@@ -45,8 +50,17 @@ type DownTrack struct {
 	done     chan struct{} // closed by stop: the writer ends
 	stopOnce sync.Once
 
-	mu sync.Mutex // guards m; the last lock in doc.go's order, never held across a call that takes another
+	// mu guards m, want and noted. It is the last lock in doc.go's order, never held across a call that takes another.
+	mu sync.Mutex
 	m  *munger
+	// want is what the subscription asks of the track (setWant): for video the quality to forward, the client's
+	// request under the caps of 02 §10.1; for audio QualityHigh while the client wants the share's audio, else
+	// QualityOff. Which layer serves it depends on the layers the share has, so every change of want or of those
+	// layers chooses again (retargetLocked), with the share's lock held: it keeps the choice in step with the layers.
+	want Quality
+	// noted is the munger's state (current) as the subscriber's Conn last heard of it: 0 while nothing is forwarded,
+	// else 1 + the slot of the layer forwarded (noteLocked).
+	noted uint8
 
 	// forwarding: the writer forwards a layer to the viewer now (ShareInfo.Viewers). It is the munger's state
 	// (current), written only while mu is held so that the actor and the writer can't leave it stale, and read
@@ -204,8 +218,11 @@ func (d *DownTrack) Bind(ctx webrtc.TrackLocalContext) (webrtc.RTPCodecParameter
 func (d *DownTrack) Unbind(webrtc.TrackLocalContext) error {
 	d.mu.Lock()
 	d.binding.Store(nil)
-	d.restartLocked()
+	changed := d.restartLocked()
 	d.mu.Unlock()
+	if changed {
+		d.sub.changed()
+	}
 	return nil
 }
 
@@ -220,31 +237,60 @@ func (b *binding) sendable() bool {
 
 // ---- what the DownTrack forwards ----
 
-// setTarget sets the slot the viewer should get and whether anything is forwarded at all; the Conn's actor calls it
-// when the subscription changes. A pause is immediate. A new target keeps the layer forwarded now flowing until the
-// new one's keyframe arrives, so the interest mask holds both until then, and the publisher is asked for that
-// keyframe (02 §10.1) unless the viewer can't get it yet: then the sub PC's connected state, or Bind, asks.
-func (d *DownTrack) setTarget(slot Slot, active bool) {
+// setWant sets what the subscription asks of the track, and has the DownTrack choose its layer for it among the ones
+// the share has now (02 §10.1); the Conn's actor calls it when the subscription changes (Subscription.apply).
+// QualityOff, or a request that no layer of the share can serve, pauses the track at once. A new layer keeps the one
+// forwarded now flowing until its own keyframe arrives, so the interest mask holds both until then, and the publisher
+// is asked for that keyframe unless the viewer can't get it yet: then the sub PC's connected state, or Bind, asks.
+func (d *DownTrack) setWant(q Quality) {
+	sh := d.share
+	var ask *Layer
+	sh.mu.Lock()
 	d.mu.Lock()
-	changed := d.m.setTarget(slot, active)
-	waiting := d.m.waitingForKeyframe()
-	d.interest.Store(d.interestLocked())
-	if _, forwarding := d.m.current(); !forwarding {
-		d.setForwarding(false)
+	d.want = q
+	slot, changed := d.retargetLocked(sh.presentLocked())
+	if changed && d.kind == webrtc.RTPCodecTypeVideo && d.m.waitingForKeyframe() {
+		ask = sh.layers[slot]
 	}
 	d.mu.Unlock()
-	if changed && waiting && d.kind == webrtc.RTPCodecTypeVideo && d.binding.Load().sendable() {
-		d.share.requestKeyframe(slot)
+	sh.mu.Unlock()
+	if ask != nil && d.binding.Load().sendable() {
+		ask.requestKeyframe(monoNow())
 	}
+}
+
+// retargetLocked chooses the layer for what the subscription wants among the layers a share has (present holds their
+// slot bits) and makes it the munger's target; without such a layer the track is paused until the share has one. It
+// returns the slot chosen, which means nothing when none was, and whether the target changed. d.mu is held, and so is
+// the share's lock, by both callers: setWant on the subscriber's actor, and Share.retargetLocked wherever a layer of
+// the share comes or goes. The second one is why a viewer misses nothing of a layer that arrives: its track's first
+// packet, the start of a keyframe, is read only after the DownTracks that want the layer have it as their target.
+func (d *DownTrack) retargetLocked(present uint32) (slot Slot, changed bool) {
+	slot, ok := selectSlot(d.kind, d.want, present)
+	changed = d.m.setTarget(slot, ok)
+	d.interest.Store(d.interestLocked())
+	d.noteLocked()
+	return slot, changed
+}
+
+// forwarded returns the quality of the layer the viewer gets now: QualityOff while it gets none, and for audio
+// QualityHigh while it flows.
+func (d *DownTrack) forwarded() Quality {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if slot, ok := d.m.current(); ok {
+		return slot.quality()
+	}
+	return QualityOff
 }
 
 // restartLocked ends what the DownTrack forwards now without pausing it: the munger's epoch is over, the interest
 // mask is the target's alone, and the viewer no longer counts as one. The stream goes on with the next keyframe of
-// the target (munger.restart). d.mu is held.
-func (d *DownTrack) restartLocked() {
+// the target (munger.restart). It reports whether that changed what the viewer gets (noteLocked). d.mu is held.
+func (d *DownTrack) restartLocked() bool {
 	d.m.restart()
 	d.interest.Store(d.interestLocked())
-	d.setForwarding(false)
+	return d.noteLocked()
 }
 
 // interestLocked returns the interest mask for the munger's state: the target's bit and the bit of the layer
@@ -275,13 +321,23 @@ func (d *DownTrack) requestKeyframe() {
 	}
 }
 
-// setForwarding records whether the DownTrack forwards now. It writes only on a change: the writer calls it per
-// packet. d.mu is held, so the flag is always the munger's state as the last holder left it: without the lock, a
-// writer that stored "forwarding" just after the actor paused the track would leave a paused viewer listed for good.
-func (d *DownTrack) setForwarding(on bool) {
-	if d.forwarding.Load() != on {
-		d.forwarding.Store(on)
+// noteLocked brings the forwarding flag in line with the munger and reports whether what the viewer gets changed since
+// the last call: forwarding began or ended, or went to another layer. Whoever gets true tells the subscriber's Conn
+// once it has released the lock (Subscription.changed); the actor's own callers need not, they look at the
+// subscription themselves. It writes only on a change: the writer calls it per packet. d.mu is held, so the flag is
+// always the munger's state as the last holder left it: without the lock, a writer that stored "forwarding" just
+// after the actor paused the track would leave a paused viewer listed for good.
+func (d *DownTrack) noteLocked() bool {
+	state := uint8(0)
+	if slot, ok := d.m.current(); ok {
+		state = 1 + uint8(slot)
 	}
+	if state == d.noted {
+		return false
+	}
+	d.noted = state
+	d.forwarding.Store(state != 0)
+	return true
 }
 
 // ---- the writer (02 §9.3) ----
@@ -352,7 +408,18 @@ type rtpWriteState struct {
 //  5. the write, which never blocks (02 §5.4). A packet that Pion takes without sending it is unsent's.
 //
 // A padding marker only moves the munger (skipPadding).
+//
+// When the packet changed what the viewer gets (its stream began or ended, or went on in another layer), the
+// subscriber's Conn hears of it, after the write: a start that Pion took without sending has by then been taken back,
+// so the client isn't told of a stream it never saw.
 func (d *DownTrack) write(w *rtpWriteState, p *packet) {
+	if d.forward(w, p) {
+		d.sub.changed()
+	}
+}
+
+// forward is write without the notice: it reports whether what the viewer gets changed.
+func (d *DownTrack) forward(w *rtpWriteState, p *packet) (changed bool) {
 	b := d.binding.Load()
 	if b != w.binding {
 		w.binding, w.sent, w.unsentStarts = b, false, 0
@@ -362,17 +429,17 @@ func (d *DownTrack) write(w *rtpWriteState, p *packet) {
 		w.sent, w.unsentStarts = false, 0
 		d.mu.Lock()
 		if _, forwarding := d.m.current(); forwarding {
-			d.restartLocked()
+			changed = d.restartLocked()
 		}
 		d.mu.Unlock()
-		return
+		return changed
 	}
 	now := monoNow()
 	if p.padding {
 		d.mu.Lock()
 		d.m.skipPadding(p, now)
 		d.mu.Unlock()
-		return
+		return false
 	}
 	pt, ok := b.ptFor[p.profile]
 	if !ok {
@@ -384,10 +451,10 @@ func (d *DownTrack) write(w *rtpWriteState, p *packet) {
 		d.mu.Lock()
 		if d.m.unforwardable(p) {
 			d.interest.Store(d.interestLocked())
-			d.setForwarding(false)
+			changed = d.noteLocked()
 		}
 		d.mu.Unlock()
-		return
+		return changed
 	}
 
 	d.mu.Lock()
@@ -395,22 +462,21 @@ func (d *DownTrack) write(w *rtpWriteState, p *packet) {
 	if v == verdictNewEpoch {
 		d.interest.Store(d.interestLocked()) // a switch is done: the old layer's packets are no longer wanted
 	}
-	_, forwarding := d.m.current()
-	d.setForwarding(forwarding)
+	changed = d.noteLocked()
 	d.mu.Unlock()
 	switch v {
 	case verdictWaitKeyframe:
 		if w.unsentStarts >= unsentStartLimit {
 			// Nothing has left through this binding yet, start after start: the next try can wait.
 			if now-w.askedAt < int64(unsentStartBackoff) {
-				return
+				return changed
 			}
 			w.askedAt = now
 		}
 		p.layer.requestKeyframe(now)
-		return
+		return changed
 	case verdictDrop:
-		return
+		return changed
 	case verdictNewEpoch:
 		d.stats.switches.Add(1)
 	case verdictForward:
@@ -429,12 +495,15 @@ func (d *DownTrack) write(w *rtpWriteState, p *packet) {
 	case err != nil:
 		d.stats.writeErrors.Add(1) // the sender stopped or the PC is closing: Unbind follows
 	case n == 0:
-		d.unsent(w, now)
+		if d.unsent(w, now) {
+			changed = true
+		}
 	default:
 		w.sent, w.unsentStarts = true, 0
 		d.stats.packets.Add(1)
 		d.stats.bytes.Add(uint64(len(p.payload)))
 	}
+	return changed
 }
 
 // unsent handles a packet that Pion took without sending it and without an error. Pion does that in two situations
@@ -450,10 +519,12 @@ func (d *DownTrack) write(w *rtpWriteState, p *packet) {
 //     just failed, until its gate closes), or a full write buffer on ICE-TCP (a slow viewer). That is an ordinary
 //     lost packet, like one lost on the network: the viewer sees the gap and asks for what it needs (a NACK, or a
 //     PLI). Restarting here would turn every such packet into a keyframe for all viewers of the layer.
-func (d *DownTrack) unsent(w *rtpWriteState, now int64) {
+//
+// It reports whether it changed what the viewer gets (the first case).
+func (d *DownTrack) unsent(w *rtpWriteState, now int64) bool {
 	d.stats.unsent.Add(1)
 	if w.sent {
-		return
+		return false
 	}
 	if w.unsentStarts < unsentStartLimit {
 		if w.unsentStarts++; w.unsentStarts == unsentStartLimit {
@@ -461,8 +532,9 @@ func (d *DownTrack) unsent(w *rtpWriteState, now int64) {
 		}
 	}
 	d.mu.Lock()
-	d.restartLocked()
+	changed := d.restartLocked()
 	d.mu.Unlock()
+	return changed
 }
 
 // putAbsSendTime writes the abs-send-time header extension for t: the 24 bits of NTP time around the binary point,

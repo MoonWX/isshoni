@@ -3,6 +3,7 @@ package sfu
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,8 +15,9 @@ import (
 // glare. Its negotiation is the state machine of 02 §5.3: idle or offering, with changes made while an offer is
 // outstanding folded into one follow-up offer. Everything but ready belongs to the Conn's actor.
 //
-// This slice has the states idle and offering, the 50 ms debounce and the answer. README S57 adds the rest of the
-// table: the 15 s re-send, ICE restarts, ResetPC and the rebuild from closed; S69 the codec rebuilds.
+// So far it has the states idle and offering, the 50 ms debounce, the answer, and the reuse of the m-sections of
+// ended shares. README S57 adds the rest of the table: the 15 s re-send, ICE restarts, ResetPC and the rebuild from
+// closed; S69 the codec rebuilds.
 type subPC struct {
 	gen uint32
 	pc  *webrtc.PeerConnection
@@ -40,6 +42,26 @@ type subPC struct {
 	offer subOffer
 	// lastState is the last connection state onPCState handled, so that each state is reported once.
 	lastState webrtc.PeerConnectionState
+
+	// spares are the transceivers whose DownTrack has left (its share ended): their m-sections stay in the SDP for
+	// good, and the next DownTrack of the kind takes one over instead of adding a new one, so the SDP doesn't grow
+	// with every share of a long session (02 §9.3).
+	spares []*spare
+	// dtls is the PC's DTLS transport, kept from its first sender: the sender of a DownTrack that takes over a spare
+	// transceiver is made on it.
+	dtls *webrtc.DTLSTransport
+}
+
+// spare is a transceiver of a sub PC without a DownTrack: RemoveTrack took its sender and made it inactive. It can
+// carry another DownTrack once the viewer knows its m-section as inactive, which is when the viewer has answered an
+// offer made after the DownTrack left. A new DownTrack on it before that would look to the viewer like the old
+// track with another SSRC and msid, without the inactive step that makes a browser fire `track` again (02 §18).
+type spare struct {
+	tr *webrtc.RTPTransceiver
+	// neg is the neg of the first offer made since the DownTrack left; 0 until that offer.
+	neg uint32
+	// free: the viewer answered that offer.
+	free bool
 }
 
 // subOffer is a sub offer as the Signaler got it.
@@ -71,31 +93,99 @@ func (c *Conn) ensureSubPC() (*subPC, error) {
 	return s, nil
 }
 
-// addTrack gives dt a sendonly transceiver of its own: viewers never send media on the sub PC. Reusing the inactive
-// transceiver of an ended share, so that the SDP doesn't grow over a long session, comes with README S52 (02 §9.3).
-// It starts the reader of the viewer's RTCP for the track, which runs until the sender stops.
-func (s *subPC) addTrack(dt *DownTrack) error {
+// addTrack puts dt on the sub PC: on the free transceiver of an ended share when there is one of its kind
+// (takeSpare), else on a new sendonly transceiver (viewers never send media on the sub PC). So the m-sections of a
+// sub PC are the most subscriptions its Conn ever had at once, not all it ever had (02 §9.3). It starts the reader
+// of the viewer's RTCP for the track, which runs until the sender stops. api is the SFU's subscribe API.
+func (s *subPC) addTrack(api *webrtc.API, dt *DownTrack, log *slog.Logger) error {
 	dt.pc.Store(s)
-	tr, err := s.pc.AddTransceiverFromTrack(dt,
-		webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly})
-	if err != nil {
-		return err
+	tr, sender := s.takeSpare(api, dt, log)
+	if tr == nil {
+		var err error
+		tr, err = s.pc.AddTransceiverFromTrack(dt,
+			webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly})
+		if err != nil {
+			return err
+		}
+		sender = tr.Sender()
+		if s.dtls == nil {
+			s.dtls = sender.Transport()
+		}
 	}
-	sender := tr.Sender()
 	dt.transceiver, dt.sender = tr, sender
 	s.readers.Go(func() { dt.readRTCP(sender) })
 	return nil
 }
 
-// removeTrack stops dt's sender, which makes its m-section inactive in the next offer.
+// takeSpare gives dt a free spare transceiver of its kind, with a new sender: the m-section of an ended share then
+// carries dt, sendonly again, under dt's msid and a new SSRC. It returns nil when no spare is free.
+//
+// This is what Pion's AddTrack does when it reuses a transceiver, made here on the transceiver the sub PC chose:
+// AddTrack picks by Pion's own view of the last answer, and when it finds none it adds a sendrecv transceiver, which
+// a sub PC must never have. A spare that isn't as RemoveTrack left it, or that takes no sender, is given up: it
+// stays an inactive m-section.
+func (s *subPC) takeSpare(api *webrtc.API, dt *DownTrack, log *slog.Logger) (*webrtc.RTPTransceiver, *webrtc.RTPSender) {
+	if s.closed {
+		return nil, nil // nothing joins a closed PC: adding a transceiver fails, and so must this
+	}
+	for i := 0; i < len(s.spares); {
+		sp := s.spares[i]
+		if !sp.free || sp.tr.Kind() != dt.kind {
+			i++
+			continue
+		}
+		s.spares = slices.Delete(s.spares, i, i+1)
+		if sp.tr.Sender() != nil || sp.tr.Direction() != webrtc.RTPTransceiverDirectionInactive {
+			log.Warn("spare sub transceiver given up: not inactive", "mid", sp.tr.Mid())
+			continue
+		}
+		sender, err := api.NewRTPSender(dt, s.dtls)
+		if err == nil {
+			if err = sp.tr.SetSender(sender, dt); err != nil {
+				// Pion left the sender on the transceiver; RemoveTrack takes it off again.
+				_ = s.pc.RemoveTrack(sender)
+			}
+		}
+		if err != nil {
+			log.Warn("spare sub transceiver given up", "mid", sp.tr.Mid(), "err", err)
+			continue
+		}
+		return sp.tr, sender
+	}
+	return nil, nil
+}
+
+// removeTrack stops dt's sender, which makes its m-section inactive in the next offer, and keeps the transceiver as
+// a spare for a later DownTrack.
 func (s *subPC) removeTrack(dt *DownTrack, log *slog.Logger) {
 	if dt.sender == nil {
 		return
 	}
 	if err := s.pc.RemoveTrack(dt.sender); err != nil {
-		log.Debug("sub track not removed", "err", err)
+		log.Debug("sub track not removed", "err", err) // the PC is closed, or the sender didn't stop: no spare
+	} else if dt.transceiver != nil {
+		s.spares = append(s.spares, &spare{tr: dt.transceiver})
 	}
 	dt.sender, dt.transceiver = nil, nil
+}
+
+// sparesOffered notes that offer neg was made: it shows the viewer every spare of the PC as inactive.
+func (s *subPC) sparesOffered(neg uint32) {
+	for _, sp := range s.spares {
+		if sp.neg == 0 {
+			sp.neg = neg
+		}
+	}
+}
+
+// sparesAnswered notes that the viewer answered offer neg: the spares that offer, or an earlier one, showed as
+// inactive are free.
+func (s *subPC) sparesAnswered(neg uint32) {
+	for _, sp := range s.spares {
+		if sp.neg != 0 && sp.neg <= neg {
+			sp.free = true
+		}
+	}
 }
 
 // bindings returns the tracks binding of the offer just set: one entry per m-section that carries a share, in
@@ -212,6 +302,7 @@ func (c *Conn) offerSub(s *subPC) {
 	}
 	s.neg++
 	s.offering, s.dirty = true, false
+	s.sparesOffered(s.neg)
 	s.offer = subOffer{neg: s.neg, sdp: local, tracks: s.bindings()}
 	c.sig.SendOffer(PCSub, s.gen, s.neg, s.offer.sdp, s.offer.tracks)
 }
@@ -262,6 +353,7 @@ func (c *Conn) handleAnswer(kind PCKind, gen, neg uint32, raw string) error {
 	}
 	c.flushCandidates(PCSub, gen, s.pc)
 	s.offering = false
+	s.sparesAnswered(neg)
 	if s.dirty {
 		c.offerSub(s)
 	}

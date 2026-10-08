@@ -12,7 +12,10 @@
 //   - it sends its own sender reports every second per SSRC: NTP = wall clock at the capture of the last frame sent,
 //     RTP = that frame's timestamp (the plan's native path; no report.SenderInterceptor);
 //   - PLI and FIR ask the Source for a keyframe of that layer; NACKs are answered by Pion's NACK responder; the TWCC
-//     header-extension interceptor numbers every packet, so the SFU's feedback generator does real work.
+//     header-extension interceptor numbers every packet, so the SFU's feedback generator does real work;
+//   - it can offer again on the same PeerConnection (the next neg of its gen), and every offer it hands out lists
+//     its simulcast rids once, as the ones it sends: Pion's own re-offer repeats the rids of the last answer as
+//     receive rids, which the SFU refuses like any rid listed twice (sendOnlySimulcast).
 //
 // There is no rate control in M1: REMB from the SFU is only recorded in Stats.
 package publish
