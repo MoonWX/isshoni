@@ -1,0 +1,179 @@
+.table {
+  width: 100%;
+  font-size: var(--text-sm);
+  text-align: start;
+  border-spacing: 0;
+  border-collapse: separate;
+  background-color: var(--color-surface);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-lg);
+}
+
+.table caption {
+  /* The caption only names the table for screen readers; it takes no room. */
+  height: 0;
+}
+
+.table th,
+.table td {
+  padding: var(--space-3) var(--space-4);
+  font-weight: var(--weight-normal);
+  text-align: start;
+  vertical-align: top;
+  /* A long word wraps only when it can't fit a line of its own: a column never shrinks to break "Member". */
+  overflow-wrap: break-word;
+}
+
+.table thead th {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
+.table tbody th,
+.table tbody td {
+  border-top: var(--border-width) solid var(--color-border);
+}
+
+.table tbody th {
+  font-size: var(--text-md);
+  font-weight: var(--weight-medium);
+}
+
+.value {
+  min-width: 0;
+}
+
+.lines {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  align-items: flex-start;
+}
+
+.note {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-normal);
+  color: var(--color-text-muted);
+}
+
+.inline {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+/* The column of row actions: as narrow as its buttons, at the end of the row. */
+.actions {
+  width: 1%;
+  white-space: nowrap;
+}
+
+.buttons {
+  display: flex;
+  gap: var(--space-2);
+  justify-content: flex-end;
+}
+
+/*
+ * Phones: each row is a card and each cell a line "Column: value". The header row stays in the accessibility tree
+ * (clipped, not display: none), so cells are still announced with their column.
+ */
+@media (max-width: 48rem) {
+  .table,
+  .table tbody,
+  .table tr,
+  .table th,
+  .table td {
+    display: block;
+  }
+
+  .table {
+    background: none;
+    border: 0;
+    border-radius: 0;
+  }
+
+  .table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .table tbody {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  .table tbody tr {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-4);
+    background-color: var(--color-surface);
+    border: var(--border-width) solid var(--color-border);
+    border-radius: var(--radius-lg);
+  }
+
+  .table tbody th,
+  .table tbody td {
+    padding: 0;
+    border: 0;
+  }
+
+  .table tbody td:not(.actions) {
+    display: grid;
+    grid-template-columns: 7.5rem minmax(0, 1fr);
+    gap: var(--space-3);
+  }
+
+  .table tbody td:not(.actions)::before {
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    line-height: calc(var(--text-sm) * var(--leading));
+    color: var(--color-text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    content: attr(data-label);
+  }
+
+  /* A cell without a value has no line. */
+  .table tbody td.empty {
+    display: none;
+  }
+
+  /* The row's actions close the card. */
+  .table tbody td.actions {
+    width: auto;
+    padding-top: var(--space-1);
+  }
+
+  .buttons {
+    flex-wrap: wrap;
+  }
+
+  /* Or, for a single menu button: beside the row's name, in the card's corner. */
+  .corner tbody tr {
+    position: relative;
+  }
+
+  .corner tbody th {
+    padding-inline-end: var(--tap-target);
+  }
+
+  .corner tbody td.actions {
+    position: absolute;
+    inset-block-start: var(--space-2);
+    inset-inline-end: var(--space-2);
+    padding: 0;
+  }
+}

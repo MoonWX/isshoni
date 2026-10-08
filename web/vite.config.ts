@@ -40,5 +40,7 @@ export default defineConfig({
     environment: 'jsdom',
     setupFiles: ['src/test/setup.ts'],
     include: ['src/**/*.test.{ts,tsx}', 'build/**/*.test.ts'],
+    // Room for the waits of src/test/setup.ts (4 s each) on a busy machine; the default is 5 s.
+    testTimeout: 15_000,
   },
 });

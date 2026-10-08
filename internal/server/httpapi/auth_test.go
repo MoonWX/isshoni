@@ -648,8 +648,14 @@ func TestGETsDoNotChangeTheDB(t *testing.T) {
 		}
 		return v
 	}
+	// Something for the lists to show: an invite, and a pending sign-up.
+	f.createInvite(cookie, `{}`)
+	f.write(func(q *store.Q) error {
+		return q.CreateUser(&store.User{Username: "Sam", UsernameKey: "sam", Status: store.StatusPending, CreatedVia: "signup"})
+	})
 	before := version()
-	for _, path := range []string{"/api/v1/info", "/api/v1/me", "/api/v1/nope"} {
+	for _, path := range []string{"/api/v1/info", "/api/v1/me", "/api/v1/nope", "/api/v1/invites", "/api/v1/invites?state=all",
+		"/api/v1/admin/approvals", "/api/v1/admin/settings"} {
 		for _, method := range []string{http.MethodGet, http.MethodHead} {
 			for _, session := range []reqOpt{with(cookie), with(nil), cookieValue(sessionCookieName, strings.Repeat("A", 43))} {
 				f.call(method, path, "", session)

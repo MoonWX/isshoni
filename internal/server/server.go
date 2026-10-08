@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/netip"
 	"slices"
 	"strings"
 	"sync"
@@ -19,6 +18,7 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/httpapi"
 	"github.com/MoonWX/isshoni/internal/server/netx"
 	"github.com/MoonWX/isshoni/internal/server/ops"
+	"github.com/MoonWX/isshoni/internal/server/tlsmgr"
 	"github.com/MoonWX/isshoni/internal/version"
 )
 
@@ -28,8 +28,8 @@ type Deps struct {
 	// Now is the clock of the time-dependent components. nil means time.Now.
 	Now func() time.Time
 	// STUN and Resolver are what public-address detection asks (04 §7.4). nil means netx.NewSTUNClient and
-	// net.DefaultResolver. Off mode needs no detection for its site; the wiring uses them for the media addresses
-	// (README S54, S59).
+	// net.DefaultResolver. Resolver also answers the TLS manager's look at its own domain (04 §8.7). Off mode needs
+	// no detection for its site; the wiring uses them there for the media addresses (README S59).
 	STUN     netx.STUNClient
 	Resolver netx.Resolver
 	// ReleaseHTTP is the HTTP client of the release check (04 §11.5). nil means a client of the server's own.
@@ -82,25 +82,28 @@ var ErrShutdownForced = errors.New("server: shutdown finished by force")
 // ever served: one Server is one life.
 var errStopped = errors.New("server: already shut down; build a new Server")
 
-// errUnsupportedMode marks New's error for a TLS mode this build can't serve yet.
-var errUnsupportedMode = errors.New("server: tls mode not implemented")
-
 // NeedsOperator reports whether err, from New, Start or Run, is a refusal to start that a restart can't fix
 // (04 §6.3): an invalid config, a container without a data volume, a data directory or lock file the process can't
 // write, an admin socket directory it can't create, a corrupt or wrongly owned secrets.json. cmd/isshoni prints
 // such an error (it carries its own fix line) and exits 78, on which systemd stops restarting. Any other error is a
 // runtime error (exit 1): a busy port, a data directory locked by another isshoni (config.ErrDataDirLocked).
 // config.ReasonOf(err) gives the reason code for the data-directory and secrets refusals.
+//
+// A certificate that can't be had is neither: the server starts, and is not ready until it has one (04 §6.2, §8.4).
 func NeedsOperator(err error) bool {
 	var ve *config.ValidationError
-	return errors.Is(err, config.ErrNeedsOperator) || errors.As(err, &ve) || errors.Is(err, errUnsupportedMode)
+	return errors.Is(err, config.ErrNeedsOperator) || errors.As(err, &ve)
 }
 
 // Addrs are the addresses the server listens on, as bound: a configured port 0 (tests) shows as the port the
-// kernel picked. Later slices add the 443 multiplexer, the ICE ports and the metrics listener.
+// kernel picked. Later slices add the ICE ports and the metrics listener.
 type Addrs struct {
-	// HTTP is the listener on listen.http: the app itself in off mode.
+	// HTTP is the listener on listen.http: the app itself in off mode; in the other modes the plain-HTTP port,
+	// which answers ACME http-01 challenges and redirects everything else to HTTPS (04 §8.3).
 	HTTP net.Addr
+	// HTTPS is the 443 multiplexer on listen.https: HTTPS and WSS, and ICE-TCP by the first byte (04 §7.2). nil in
+	// off mode, where a proxy owns that port.
+	HTTPS net.Addr
 }
 
 // lifecycle states of a Server; they only move forward.
@@ -148,26 +151,32 @@ type Server struct {
 	failErr  error         // set before failed is closed
 
 	// What Start builds, in startup order; Shutdown releases it in reverse (04 §6.4).
-	lock    *config.DataDirLock
-	secrets *config.SecretStore // read by the wiring (README S54): the session, invite and resume keys, the VAPID pair
-	health  *ops.Health
-	gate    *httpapi.Gate
-	httpLn  net.Listener
-	httpSrv *http.Server
-	pending pendingConns   // the HTTP connections without a request yet; the shutdown closes them
-	serving sync.WaitGroup // the Serve goroutines; Shutdown waits for them
+	lock     *config.DataDirLock
+	secrets  *config.SecretStore // read by the wiring (README S54): the session, invite and resume keys, the VAPID pair
+	public   netx.PublicAddrs    // the detected public addresses; zero in off mode until the SFU needs them (README S59)
+	mux      *netx.PortMux       // the 443 multiplexer on listen.https; nil in off mode
+	httpLn   net.Listener        // listen.http
+	tls      *tlsmgr.Manager     // the certificate, in every mode (off: a manager with nothing to do)
+	health   *ops.Health
+	gate     *httpapi.Gate
+	httpSrv  *http.Server   // the main server: on httpLn in off mode, on the multiplexer's TLS side otherwise
+	plainSrv *http.Server   // the port 80 server on httpLn (04 §8.3); nil in off mode
+	pending  pendingConns   // the HTTP connections without a request yet; the shutdown closes them
+	serving  sync.WaitGroup // the Serve goroutines; Shutdown waits for them
 
 	// hookDraining, set by tests (under life), runs in Shutdown once readiness is off and the gate is closed, while
 	// the listeners still accept: the window in which the hub and the SFU say goodbye (steps 3 and 4).
 	hookDraining func()
+	// hookDetect, set by tests before Start, stands in for the public-address detection (04 §7.4), which reads
+	// the machine's interfaces: a test says what the server finds.
+	hookDetect func() netx.PublicAddrs
 }
 
 // New checks cfg and builds the server. It opens nothing and starts nothing; Run or Start does. cfg is copied: later
 // changes to it don't reach the server. A nil log means slog.Default().
 //
-// Errors, all of which satisfy NeedsOperator:
-//   - a *config.ValidationError when cfg has errors (Load's, or those of values changed since);
-//   - an error for a TLS mode other than "off", which this build can't serve yet (README S44).
+// Its error is a *config.ValidationError when cfg has errors (Load's, or those of values changed since); it
+// satisfies NeedsOperator.
 func New(cfg *config.Config, log *slog.Logger, deps Deps) (*Server, error) {
 	if cfg == nil {
 		return nil, errors.New("server: New: nil config")
@@ -178,10 +187,6 @@ func New(cfg *config.Config, log *slog.Logger, deps Deps) (*Server, error) {
 	problems, warnings := configProblems(cfg)
 	if len(problems) > len(warnings) {
 		return nil, &config.ValidationError{Problems: problems}
-	}
-	if mode := cfg.EffectiveTLSMode(); mode != config.TLSOff {
-		return nil, fmt.Errorf(`%w: tls.mode %q comes with the TLS manager (README S44); until then run isshoni behind `+
-			`your own HTTPS proxy with tls.mode = "off"`, errUnsupportedMode, mode)
 	}
 	return &Server{
 		cfg:      *cfg,
@@ -250,7 +255,7 @@ func (s *Server) Start(ctx context.Context) (err error) {
 	}
 	defer func() {
 		if err != nil {
-			s.release()
+			s.release(ctx)
 			s.state = stateStopped
 			close(s.stopping)
 			close(s.done)
@@ -280,43 +285,97 @@ func (s *Server) Start(ctx context.Context) (err error) {
 	}
 
 	// Step 4 (README S54): open the store, then pin the policy keys the config sets (cfg.IsSet, 04 §4.6).
-	// Step 5 (README S54, S59): detect the public addresses. Off mode needs none for its site.
 
-	// Step 6: bind the listeners. Off mode has one: the app on listen.http. The 443 multiplexer and port 80 come
-	// with the TLS manager (README S44), the admin socket with S43, the ICE transports with the SFU (S59).
-	if s.httpLn, err = listenHTTP(ctx, s.cfg.Listen.HTTP); err != nil {
+	// Step 5: detect the public addresses (04 §7.4; at most 5 s). The TLS modes need them now: ip mode's site and
+	// certificate are the address, manual mode's site is it too when there is no domain, and auto mode compares its
+	// domain's DNS records with it. Off mode takes its site from public_url, or localhost in dev; the media
+	// addresses there come with the SFU (README S59).
+	mode := s.cfg.EffectiveTLSMode()
+	switch {
+	case mode == config.TLSOff:
+	case s.hookDetect != nil:
+		s.public = s.hookDetect()
+	default:
+		s.public = s.detectPublicAddrs(ctx)
+	}
+
+	// Step 6: bind the listeners: the 443 multiplexer (not in off mode), then listen.http. The admin socket comes
+	// with S43, the ICE transports with the SFU (S59).
+	if mode != config.TLSOff {
+		if s.mux, err = s.listenHTTPS(); err != nil {
+			return err
+		}
+		s.addrs.HTTPS = s.mux.Addr()
+		s.cfg.Listen.HTTPS = withBoundPort(s.cfg.Listen.HTTPS, s.addrs.HTTPS)
+	}
+	if s.httpLn, err = listenHTTP(ctx, s.cfg.Listen.HTTP, mode); err != nil {
 		return err
 	}
 	s.addrs.HTTP = s.httpLn.Addr()
-	// With port 0 (tests) the site needs the port the kernel picked.
+	// With port 0 (tests) the site needs the ports the kernel picked.
 	s.cfg.Listen.HTTP = withBoundPort(s.cfg.Listen.HTTP, s.addrs.HTTP)
-	// Off mode takes its site from public_url, or localhost in dev, so it needs no public address.
-	if s.site, err = config.NewSite(&s.cfg, netip.Addr{}, netip.Addr{}); err != nil {
+	if s.site, err = s.newSite(mode); err != nil {
+		return err
+	}
+
+	// Step 7: the TLS manager. The certificate arrives in the background (04 §8): the listeners serve before it is
+	// there, and the readiness check "tls" says when it is.
+	if s.tls, err = tlsmgr.New(s.tlsOptions(mode, paths)); err != nil {
+		return fmt.Errorf("server: %w", err)
+	}
+	if err := s.tls.Start(ctx); err != nil {
 		return fmt.Errorf("server: %w", err)
 	}
 
-	// Step 7 (README S44): start the TLS manager.
-
-	// Step 8: build the components and register the readiness checks (04 §6.2). db, media, signal and public_ip
-	// come with their components.
+	// Step 8: build the components and register the readiness checks (04 §6.2). db, media and signal come with
+	// their components.
 	s.health = ops.NewHealth()
 	s.health.SetClientIP(httpapi.ClientIP)
-	s.health.AddCheck("tls", func() (bool, string) { return true, "" }) // off mode: the proxy has the certificate
+	s.health.AddCheck("tls", s.tls.Ready) // off mode: always ready, the proxy has the certificate
+	if siteIsAddress(&s.cfg, mode) {
+		known := s.site.Origin != ""
+		s.health.AddCheck("public_ip", func() (bool, string) {
+			if !known {
+				return false, "no public IP address found; set public_ip and restart"
+			}
+			return true, ""
+		})
+	}
 	s.gate = &httpapi.Gate{}
 	s.httpSrv = newMainServer(s.newRouter().Handler(), s.log, &s.pending)
+	if mode != config.TLSOff {
+		s.httpSrv.TLSConfig = s.tls.TLSConfig()
+		s.plainSrv = newPlainServer(s.tls.HTTPHandler(nil), s.log, &s.pending)
+	}
 	if s.cfg.Metrics.Enabled {
 		s.log.Warn("metrics.enabled is set, but this build has no metrics endpoint yet; nothing listens on metrics.listen",
 			slog.String("component", "ops"))
 	}
 
-	// Step 9: start the HTTP servers.
-	s.serve(s.httpSrv, s.httpLn)
+	// Step 9: start the HTTP servers. The multiplexer's ICE side, s.mux.ICE(), has no reader yet: netx.NewTransport
+	// takes the multiplexer when the SFU runs in the server (README S59), and no candidate names port 443 before
+	// that. An ICE-TCP connection that arrives all the same waits in the multiplexer's queue, within its limits,
+	// until its client gives up or the server stops.
+	if mode == config.TLSOff {
+		s.serve(s.httpSrv, s.httpLn)
+	} else {
+		s.serveTLS(s.httpSrv, s.mux.TLS())
+		s.serve(s.plainSrv, newLimitListener(s.httpLn, s.cfg.Limits.ConnsPerIP))
+	}
 	s.state, s.served = stateServing, true
 
 	// Step 10: one line that says where the server is. The media ports join it with the SFU (README S59), and the
 	// "finish setup" hint with auth (S54).
-	s.log.Info(fmt.Sprintf("isshoni %s ready: %s (tls=%s)", version.Version(), s.site.Origin, s.site.TLSMode),
-		slog.String("listen", s.addrs.HTTP.String()))
+	listen := []any{slog.String("listen", s.addrs.HTTP.String())}
+	if mode != config.TLSOff {
+		listen = []any{slog.String("listen", s.addrs.HTTPS.String()), slog.String("listen_http", s.addrs.HTTP.String())}
+	}
+	if s.site.Origin == "" {
+		s.log.Warn(fmt.Sprintf("isshoni %s started without a public IP address (tls=%s) and is not ready: set public_ip "+
+			"to this server's public address, or set domain, and restart", version.Version(), s.site.TLSMode), listen...)
+		return nil
+	}
+	s.log.Info(fmt.Sprintf("isshoni %s ready: %s (tls=%s)", version.Version(), s.site.Origin, s.site.TLSMode), listen...)
 	return nil
 }
 
@@ -342,6 +401,17 @@ func (s *Server) logConfigWarnings(ctx context.Context) {
 func (s *Server) serve(srv *http.Server, ln net.Listener) {
 	s.serving.Go(func() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.fail(fmt.Errorf("server: serving %s: %w", ln.Addr(), err))
+		}
+	})
+}
+
+// serveTLS is serve for the main server behind the 443 multiplexer: srv speaks TLS on ln with its TLSConfig, which
+// carries the TLS manager's certificate (04 §7.2). net/http takes the smallest of the server's timeouts as the limit
+// of a handshake: ReadHeaderTimeout, 10 s.
+func (s *Server) serveTLS(srv *http.Server, ln net.Listener) {
+	s.serving.Go(func() {
+		if err := srv.ServeTLS(ln, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			s.fail(fmt.Errorf("server: serving %s: %w", ln.Addr(), err))
 		}
 	})
@@ -500,11 +570,12 @@ func (s *Server) shutdown(ctx context.Context, reason ShutdownReason, draining f
 	// a stop from a restart.
 	// Step 4 (README S59), within mediaShutdownBudget: SFU.Close, then Transport.Close.
 
-	// Step 5: the HTTP servers; then, with the TLS manager, PortMux.Close (README S44).
+	// Step 5: the HTTP servers, then the 443 multiplexer.
 	step("http", httpShutdownBudget, s.shutdownHTTP)
 
-	// Step 6 (README S43, S54, S71), within tailShutdownBudget: flush the transfer counters, drain the push queue,
-	// close the admin socket, close the store.
+	// Step 6, within tailShutdownBudget: the TLS manager, now that nothing handshakes any more. With README S43, S54
+	// and S71 also: flush the transfer counters, drain the push queue, close the admin socket, close the store.
+	step("tls", tailShutdownBudget, s.tls.Shutdown)
 
 	// Last: the data-directory lock, so that the process that follows (a re-exec, the next start) can take it.
 	if err := s.lock.Close(); err != nil {
@@ -523,27 +594,52 @@ func stepError(stepCtx context.Context, name string, err error) error {
 	return fmt.Errorf("server: shutdown: %s: %w", name, err)
 }
 
-// shutdownHTTP stops the main server: no new connections, idle ones closed, requests in flight may finish until ctx
-// ends; what is left then is closed by force. Connections that have not sent a request yet are closed right away:
-// net/http alone would wait up to 5 s for each (see pendingConns). Hijacked connections (WebSockets) are the hub's,
-// closed in step 3.
+// shutdownHTTP stops the HTTP servers: no new connections, idle ones closed, requests in flight may finish until ctx
+// ends; what is left then is closed by force. Connections that have not sent a request yet (or not finished their
+// TLS handshake) are closed right away: net/http alone would wait up to 5 s for each (see pendingConns). Hijacked
+// connections (WebSockets) are the hub's, closed in step 3.
+//
+// The 443 multiplexer closes last: its raw listener, both sub-listeners and every connection that came through it
+// and is still open (04 §6.4 step 5).
 func (s *Server) shutdownHTTP(ctx context.Context) error {
 	s.pending.closeAll()
-	err := s.httpSrv.Shutdown(ctx)
-	if err != nil {
-		_ = s.httpSrv.Close()
-		if ctx.Err() != nil { // out of time; any other error is the listener's own, from closing it
-			err = fmt.Errorf("requests still running were cut off: %w", err)
+	var errs []error
+	for _, srv := range []*http.Server{s.httpSrv, s.plainSrv} {
+		if srv == nil {
+			continue
+		}
+		err := srv.Shutdown(ctx)
+		if err != nil {
+			_ = srv.Close()
+			if ctx.Err() != nil { // out of time; any other error is the listener's own, from closing it
+				err = fmt.Errorf("requests still running were cut off: %w", err)
+			}
+			errs = append(errs, err)
+		}
+	}
+	if s.mux != nil {
+		if err := s.mux.Close(); err != nil {
+			errs = append(errs, err)
 		}
 	}
 	s.serving.Wait()
-	return err
+	return errors.Join(errs...)
 }
 
-// release closes what a failed Start had opened, in reverse order. Nothing serves yet at that point.
-func (s *Server) release() {
+// release closes what a failed Start had opened, in reverse order. Nothing serves yet at that point. ctx is Start's:
+// the startup it bounds may be why Start failed, so the TLS manager's shutdown gets its budget whether ctx has ended
+// or not.
+func (s *Server) release(ctx context.Context) {
+	if s.tls != nil {
+		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tailShutdownBudget)
+		_ = s.tls.Shutdown(stopCtx)
+		cancel()
+	}
 	if s.httpLn != nil {
 		_ = s.httpLn.Close()
+	}
+	if s.mux != nil {
+		_ = s.mux.Close()
 	}
 	if s.lock != nil {
 		_ = s.lock.Close()

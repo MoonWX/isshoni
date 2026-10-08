@@ -1,0 +1,24 @@
+# serve exits 78 for what a restart can't fix, so that systemd stops retrying (04 §3.2, §6.3). The tests that run
+# a server to the end (healthz, SIGTERM, exit 0, exit 1 for a busy port or a locked data directory) are Go tests:
+# serve_test.go.
+
+# A config with errors: every problem is printed (config.txtar has the details).
+exitcode 78 isshoni serve --tls.mode auto
+! stdout .
+stderr '^config error: tls\.mode = "auto" \(flag --tls\.mode\) needs a domain\.$'
+
+# A data directory that can't be created: one message that says what is wrong and what to do. The tests may run in
+# a container, where a data directory outside a volume would be refused first.
+env ISSHONI_ALLOW_EPHEMERAL_DATA=1
+exitcode 78 isshoni serve --tls.mode off --listen.http 127.0.0.1:0 --data-dir blocker/data --listen.admin-socket $SOCKDIR/admin.sock
+! stdout .
+stderr '^isshoni serve: blocker/data \(data_dir\) can''t be created; isshoni runs as '
+stderr '^  fix: check that blocker/data is a writable directory with free space$'
+! exists blocker/data
+
+# serve takes no arguments.
+exitcode 2 isshoni serve extra
+stderr '^isshoni serve: unexpected argument "extra"$'
+
+-- blocker --
+A file where the data directory's parent should be.

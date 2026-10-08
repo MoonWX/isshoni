@@ -1,0 +1,14 @@
+/*
+ * While the connection test's panel loads, and when it couldn't be loaded: about the height of the panel's first
+ * view, so the dialog doesn't jump when the panel arrives.
+ */
+
+.waiting {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  align-items: center;
+  justify-content: center;
+  min-height: 8rem;
+  text-align: center;
+}

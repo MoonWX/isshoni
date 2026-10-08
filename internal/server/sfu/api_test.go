@@ -375,9 +375,11 @@ func TestSRTPProfilesRestricted(t *testing.T) {
 		if s == webrtc.PeerConnectionStateConnected {
 			t.Fatal("the SFU connected with a client that has no SRTP profile of its list")
 		}
+		// Pion runs every state callback in a goroutine of its own, so on a busy machine the one for ICE connected
+		// can still be on its way when the one for the failure has arrived.
 		select {
 		case <-iceConnected: // ICE worked; DTLS-SRTP is what failed
-		default:
+		case <-time.After(2 * time.Second):
 			t.Error("the PC failed before ICE connected")
 		}
 	case <-time.After(dtlsConnectTimeout + 5*time.Second):

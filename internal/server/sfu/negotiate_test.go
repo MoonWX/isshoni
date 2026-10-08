@@ -27,8 +27,8 @@ import (
 
 // The core slice's acceptance tests (README S29), through sfutest.Harness: a real SFU on loopback, a
 // publish.Publisher with fake media and an sfutest.Viewer negotiate the pub and sub PCs with gen, neg and tracks.
-// Media forwarding is the next slice's (S41), so these tests stop at connected PCs, attached layers and bound
-// DownTracks.
+// They stop at connected PCs, attached layers and bound DownTracks; what flows through them is forwarding_test.go's
+// (README S41).
 
 func newHarness(t *testing.T, o sfutest.HarnessOptions) *sfutest.Harness {
 	t.Helper()
@@ -323,18 +323,28 @@ func TestPublishAndSubscribe(t *testing.T) {
 			}
 		}
 	}
+	// Negotiated, but no media yet: the share is pending, and nothing was reported about it.
+	if info, ok := h.SFU.Share(share); !ok || info.State != sfu.SharePending || len(info.Layers) != 0 {
+		t.Errorf("the share before its media = %+v, %v; want pending without layers", info, ok)
+	}
+	if evs := h.Events.Events(); len(evs) != 0 {
+		t.Errorf("room events before any media: %+v", evs)
+	}
 	if err := pub.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if err := pubSig.WaitPCState(ctx, sfu.PCPub, 1, "connected"); err != nil {
 		t.Fatalf("pub PC: %v (events %+v)", err, pubSig.Events())
 	}
-	// The tracks attach to the share their m-sections are bound to: both simulcast layers and the audio.
-	info := waitShare(t, h.SFU, share, func(i sfu.ShareInfo) bool { return len(i.Layers) == 2 && i.Audio })
+	// The tracks attach to the share their m-sections are bound to: both simulcast layers and the audio. The first
+	// keyframe makes the share live.
+	info := waitShare(t, h.SFU, share, func(i sfu.ShareInfo) bool {
+		return len(i.Layers) == 2 && i.Audio && i.State == sfu.ShareLive
+	})
 	if got := layerRIDs(info); !slices.Equal(got, []string{"f", "q"}) {
 		t.Errorf("share layers = %v, want f then q", got)
 	}
-	if info.State != sfu.SharePending || info.Conn != "c-pub" || info.Preset != sfu.PresetMovie {
+	if info.Conn != "c-pub" || info.Preset != sfu.PresetMovie || info.Profile != sfu.ProfileHigh || info.LiveAt.IsZero() {
 		t.Errorf("ShareInfo = %+v", info)
 	}
 	tracks, err := pubConn.PubTracks(ctx)
@@ -428,8 +438,15 @@ func TestPublishAndSubscribe(t *testing.T) {
 			}
 		}
 	}
-	if evs := h.Events.Events(); len(evs) != 0 {
-		t.Errorf("room events without a state change: %+v", evs)
+	// The room heard that the share went live, and of its layers since; nothing else.
+	if evs := h.Events.Events(); len(evs) == 0 {
+		t.Error("no room event for the share going live")
+	} else {
+		for _, ev := range evs {
+			if ev.Kind != sfutest.ShareUpdated || ev.Room != "lounge" || ev.Share.ID != share || ev.Share.State != sfu.ShareLive {
+				t.Errorf("room event %+v, want only ShareUpdated for the live share", ev)
+			}
+		}
 	}
 
 	// ---- the publisher leaves: the share ends, and the viewer's m-sections go inactive ----
@@ -479,7 +496,8 @@ func TestPublishAndSubscribe(t *testing.T) {
 	}
 	for _, want := range []string{
 		`msg="connection joined"`, `msg="share started"`, "conn_id=c-pub room_id=lounge user_id=alice pc=pub gen=1 state=connected",
-		"conn_id=c-view room_id=lounge user_id=bob pc=sub gen=1 state=connected", `msg="share ended"`, `msg="connection left"`,
+		`msg="share live"`, "conn_id=c-view room_id=lounge user_id=bob pc=sub gen=1 state=connected", `msg="share ended"`,
+		`msg="connection left"`,
 	} {
 		if !strings.Contains(logs.String(), want) {
 			t.Errorf("the logs lack %s (%d SFU lines)", want, sfuLines)
@@ -592,8 +610,10 @@ func TestPubOfferGenAndNeg(t *testing.T) {
 	if err := sig.WaitPCState(ctx, sfu.PCPub, 2, "connected"); err != nil {
 		t.Fatal(err)
 	}
+	// The share went live on the first PC and stays so in this slice; the stalled state between two pub PCs is README
+	// S57's.
 	info := waitShare(t, h.SFU, share, func(i sfu.ShareInfo) bool { return len(i.Layers) == 2 && i.Audio })
-	if info.ID != share || info.State != sfu.SharePending {
+	if info.ID != share || info.State != sfu.ShareLive {
 		t.Errorf("the share after the rebuild = %+v", info)
 	}
 	stale(1, 3) // the old gen is over, whatever its neg
@@ -605,8 +625,10 @@ func TestPubOfferGenAndNeg(t *testing.T) {
 			t.Errorf("the replaced PC reported %+v", st)
 		}
 	}
-	if evs := h.Events.Events(); len(evs) != 0 {
-		t.Errorf("room events: %+v, want none: a pub PC rebuild doesn't end the share", evs)
+	for _, ev := range h.Events.Events() {
+		if ev.Kind != sfutest.ShareUpdated || ev.Share.ID != share {
+			t.Errorf("room event %+v, want only ShareUpdated: a pub PC rebuild doesn't end the share", ev)
+		}
 	}
 
 	// The client closes its current pub PC (Pion closes the server side on the DTLS close_notify): the SFU reports

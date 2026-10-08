@@ -1,0 +1,141 @@
+# The admin commands of this build against a real admin socket with fake accounts (fake_test.go): status, users,
+# invite create and log-level.
+
+# No server: exit 4 for each of them.
+exitcode 4 isshoni admin status
+stderr '^isshoni is not running \(no server on .*admin\.sock\)$'
+exitcode 4 isshoni admin users list --json
+! stdout .
+exitcode 4 isshoni admin invite create
+exitcode 4 isshoni admin log-level debug
+
+fakeserver start
+fakeserver set admin yes
+
+# users list: a table, or with --json the one document of 04 §12.2.
+exec isshoni admin users list
+cmp stdout users.txt
+! stderr .
+exec isshoni admin users list --json
+cmp stdout users.json
+! stderr .
+
+# set-role; the last active admin can't be demoted (exit 7), and an unknown user is an error (exit 1).
+exec isshoni admin users set-role sam admin
+stdout '^sam is now an admin\.$'
+exec isshoni admin users set-role alex user
+stdout '^alex is now a regular user\.$'
+exitcode 7 isshoni admin users set-role sam user
+! stdout .
+cmp stderr last-admin.txt
+exitcode 1 isshoni admin users set-role nobody admin
+stderr '^isshoni admin users set-role: there is no user named "nobody"$'
+stderr '^  fix: `isshoni admin users list` shows the accounts$'
+exitcode 2 isshoni admin users set-role sam owner
+
+# "..", "." and an empty NAME can't be sent as a path element, and no user has such a name: the answer is the same
+# as for any unknown user, not "unexpected answer from the socket".
+exitcode 1 isshoni admin users disable ..
+! stdout .
+stderr '^isshoni admin users disable: there is no user named "\.\."$'
+stderr '^  fix: `isshoni admin users list` shows the accounts$'
+! stderr 'unexpected answer'
+exitcode 1 isshoni admin users set-role . admin
+stderr '^isshoni admin users set-role: there is no user named "\."$'
+exitcode 1 isshoni admin users reset-password ''
+! stdout .
+stderr '^isshoni admin users reset-password: there is no user named ""$'
+exitcode 1 isshoni admin users enable ..
+stderr '^isshoni admin users enable: there is no user named "\.\."$'
+
+# disable and enable.
+exec isshoni admin users disable alex
+stdout '^alex can no longer sign in and is signed out everywhere\.$'
+exec isshoni admin users list --json
+stdout '"username":"alex","role":"user","status":"disabled"'
+exec isshoni admin users enable alex
+stdout '^alex can sign in again\.$'
+exitcode 7 isshoni admin users disable sam
+stderr '^isshoni admin users disable: "sam" is the last active admin, and the server must keep one$'
+
+# reset-password prints a one-time link and says what issuing it did.
+exec isshoni admin users reset-password alex
+stdout '^https://watch\.example\.com/reset#reset-alex$'
+stderr '^Password-reset link for alex \(valid 24 hours, works once\):$'
+stderr '^A password reset revokes everything: alex''s old password no longer works, and alex is signed out$'
+exitcode 1 isshoni admin users reset-password nobody
+! stdout .
+
+# invite create sends only the flags that were set: the server's invite settings apply to the rest.
+exec isshoni admin invite create
+stdout '^https://watch\.example\.com/invite#invite1$'
+stderr '^Invite link \(valid 7 days\):$'
+exec isshoni admin invite create --uses 10 --ttl 48h
+stdout '^https://watch\.example\.com/invite#invite2$'
+stderr '^Invite link \(valid 48 hours\):$'
+exec isshoni admin invite create --ttl 720h
+exec isshoni admin invite create --uses 1
+fakeserver show invites
+cmp stdout invites.txt
+exitcode 2 isshoni admin invite create --ttl 90m
+exitcode 2 isshoni admin invite create --uses 1001
+fakeserver set registration closed
+exitcode 7 isshoni admin invite create
+! stdout .
+stderr '^isshoni admin invite create: registration is closed, so an invite link would not work$'
+fakeserver set registration open
+
+# log-level changes the server's level for --for (30 minutes unless given), then the configured one is back.
+fakeserver show level
+stdout '^info$'
+exec isshoni admin log-level debug
+stdout '^The log level is debug for 30m, then back to the configured level\.$'
+fakeserver show level
+stdout '^debug$'
+exec isshoni admin log-level --for 2s warn
+stdout '^The log level is warn for 2s, then back to the configured level\.$'
+fakeserver show level
+stdout '^warn$'
+fakeserver wait level info
+exitcode 2 isshoni admin log-level loud
+exitcode 2 isshoni admin log-level --for 0s debug
+
+# status: a summary, or with --json the server's document.
+exec isshoni admin status
+cmp stdout status.txt
+exec isshoni admin status --json
+stdout '^\{"version":"0\.3\.0",.*"uptimeS":11520,.*"schemaVersion":7,.*"startedAt":"2026-09-29T10:00:00\.000Z"\}$'
+! stderr .
+
+# A server that shuts down still tells its status; everything else is refused until it is back.
+fakeserver set shutting-down
+exec isshoni admin status
+exitcode 1 isshoni admin users list
+stderr '^isshoni admin users list: the server is shutting down$'
+stderr '^  fix: try again once it is back$'
+
+-- users.txt --
+NAME  ROLE   STATUS  CREATED               LAST SEEN
+alex  admin  active  2026-09-30 10:00 UTC  2026-10-01 12:00 UTC
+sam   user   active  2026-10-01 08:30 UTC  never
+-- users.json --
+{"users":[{"id":"0123456789ab","username":"alex","role":"admin","status":"active","createdAt":"2026-09-30T10:00:00.000Z","lastSeenAt":"2026-10-01T12:00:00.000Z"},{"id":"cdefghjkmnpq","username":"sam","role":"user","status":"active","createdAt":"2026-10-01T08:30:00.000Z"}]}
+-- last-admin.txt --
+isshoni admin users set-role: "sam" is the last active admin, and the server must keep one
+  fix: make another user an admin first: `isshoni admin users set-role <name> admin`
+-- invites.txt --
+uses=0 ttlHours=0
+uses=10 ttlHours=48
+uses=0 ttlHours=720
+uses=1 ttlHours=0
+-- status.txt --
+isshoni 0.3.0, up 3h12m (since 2026-09-29 10:00 UTC)
+  site        https://203.0.113.7
+  tls         ip: certificate ready, expires 2026-10-06
+  public IP   203.0.113.7 (stun); NAT: none
+  listening   tcp [::]:443, unix /run/isshoni/admin.sock
+  media       udp 203.0.113.7:7882, tcp 203.0.113.7:443
+  live        1 room, 3 participants, 2 shares
+  database    schema 7
+  transfer    2026-09: 12.3 GB out, 0.4 GB in
+  update      0.3.1 is available (security release): https://github.com/MoonWX/isshoni/releases/tag/v0.3.1

@@ -10,19 +10,32 @@
 // fails the test if Run returns an error. The server logs at debug level into a buffer (Logs), which a failed test
 // prints.
 //
+// With Options.TLS the server runs in tls.mode = "manual" with a certificate from a private CA made for the test
+// (04 §8.6): HTTPS, WSS and ICE-TCP on one port behind the 443 multiplexer, and the plain-HTTP port that redirects
+// to it. The site is https://isshoni.test:<port> (TLSDomain); Client trusts the CA and dials the listener whatever
+// the URL says, as in off mode.
+//
 // The harness runs the server in the test's process, so it sets server.Deps.InProcess: the server leaves the
 // umask and the Go memory limit alone. It also turns off the container data-volume check, so the tests pass inside
-// a container.
+// a container, and it configures no STUN servers, so no test asks the public ones for the machine's address.
 package servertest
 
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
@@ -37,11 +50,19 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/config"
 )
 
+// TLSDomain is the domain of a server started with Options.TLS. The .test names never resolve (RFC 6761); Client
+// reaches the server all the same.
+const TLSDomain = "isshoni.test"
+
 // Options configures Start. The zero value is a plain off-mode server.
 type Options struct {
 	// TLS serves HTTPS and WSS through the 443 multiplexer with a private test CA in manual mode, and makes Client
-	// trust that CA (04 §8.6, §17). It comes with the TLS manager (README S44); until then Start fails the test.
+	// trust that CA (04 §8.6, §17). The certificate is for TLSDomain, localhost, 127.0.0.1 and ::1; its files are
+	// Cfg.TLS.CertFile and Cfg.TLS.KeyFile, which a test may replace.
 	TLS bool
+	// Roots are further roots that Client trusts: the issuing root of an ACME test server, for a test that puts
+	// the server in tls.mode = "auto" through Flags.
+	Roots *x509.CertPool
 	// Flags are extra config flags in the form `isshoni serve` takes them ("--registration.mode=closed"), applied
 	// after the harness's own, so they win. A key set this way counts as set by the operator (config.IsSet), which
 	// pins a policy key (04 §4.6); a change made in Config does not.
@@ -63,14 +84,19 @@ type Server struct {
 	// URL is where the test sends its requests: "http://" plus the site's host. For the default dev site that is
 	// the site's origin, http://localhost:<port>, so it also serves as the Origin header of a browser. With a
 	// public_url in the config (a reverse-proxy install) it is http://<public host>: the test plays the proxy, and
-	// adds X-Forwarded-Proto and X-Forwarded-For itself.
+	// adds X-Forwarded-Proto and X-Forwarded-For itself. In a TLS mode it is the site's origin,
+	// https://isshoni.test:<port> with Options.TLS.
 	URL string
-	// WSURL is the WebSocket endpoint: URL with the ws scheme, plus /ws.
+	// WSURL is the WebSocket endpoint: URL with the ws scheme (wss in a TLS mode), plus /ws.
 	WSURL string
-	// Client sends every request to this server's listener, whatever host the URL names (so a test may also probe
-	// the Host check with another name). It keeps cookies like a browser and asks for no compression on its own.
-	// With Options.TLS it trusts the test CA.
+	// Client sends every request to this server's main listener, whatever host the URL names (so a test may also
+	// probe the Host check with another name). It keeps cookies like a browser and asks for no compression on its
+	// own. In a TLS mode it speaks HTTP/2 where a browser would (a WebSocket upgrade gets an HTTP/1.1 connection of
+	// its own), and it trusts Roots.
 	Client *http.Client
+	// Roots is what Client trusts in a TLS mode: the test CA with Options.TLS, plus Options.Roots. nil in off
+	// mode. A test that dials the HTTPS port by itself (Srv.Addrs().HTTPS) verifies the server with it.
+	Roots *x509.CertPool
 	// AdminSocket is listen.admin_socket: a short path, because a unix socket path is limited to 104 bytes on
 	// macOS. Nothing listens there until the admin socket exists (README S43).
 	AdminSocket string
@@ -87,9 +113,12 @@ type Server struct {
 	opts Options
 	logs *logBuffer
 
-	mu       sync.Mutex
-	run      *run   // the current Run call; nil once Wait or Stop has collected it
-	httpAddr string // the bound listen.http address: Client dials it, Restart binds it again
+	certFile, keyFile string // Options.TLS: the test certificate and its key
+
+	mu        sync.Mutex
+	run       *run   // the current Run call; nil once Wait or Stop has collected it
+	httpAddr  string // the bound listen.http address: Client dials it in off mode, Restart binds it again
+	httpsAddr string // the bound listen.https address ("" in off mode): Client dials it, Restart binds it again
 }
 
 // run is one server.Run call in its goroutine.
@@ -122,45 +151,55 @@ func Start(t testing.TB, opts Options) *Server {
 // with server.NeedsOperator, errors.Is(err, config.ErrDataDirLocked), …) instead of failing the test.
 func Try(t testing.TB, opts Options) (*Server, error) {
 	t.Helper()
-	if opts.TLS {
-		t.Fatal("servertest: Options.TLS needs the TLS manager, which this build doesn't have yet (README S44)")
-	}
 	s := &Server{opts: opts, logs: &logBuffer{}, DataDir: opts.DataDir}
 	if s.DataDir == "" {
 		// The server creates it, private, as on a first run.
 		s.DataDir = filepath.Join(t.TempDir(), "data")
 	}
 	s.AdminSocket = filepath.Join(socketDir(t), "admin.sock")
+	if opts.Roots != nil {
+		s.Roots = opts.Roots.Clone()
+	}
+	if opts.TLS {
+		if s.Roots == nil {
+			s.Roots = x509.NewCertPool()
+		}
+		s.certFile, s.keyFile = writeTestCertificate(t, s.Roots)
+	}
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		t.Fatalf("servertest: cookie jar: %v", err)
 	}
-	s.Client = &http.Client{
-		Jar: jar,
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				var d net.Dialer
-				return d.DialContext(ctx, "tcp", s.boundAddr())
-			},
-			DisableCompression: true, // tests see the encoding the server chose for the headers they sent
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", s.boundAddr())
 		},
+		DisableCompression: true, // tests see the encoding the server chose for the headers they sent
 	}
+	if s.Roots != nil {
+		transport.TLSClientConfig = &tls.Config{RootCAs: s.Roots, MinVersion: tls.VersionTLS12}
+		// A transport with its own dialer offers HTTP/2 only when asked to. A request that upgrades to a WebSocket
+		// still gets an HTTP/1.1 connection, as in a browser (04 §7.2).
+		transport.ForceAttemptHTTP2 = true
+	}
+	s.Client = &http.Client{Jar: jar, Transport: transport}
 	t.Cleanup(func() {
 		s.Stop(t)
 		if t.Failed() {
 			t.Logf("servertest: server log:\n%s", s.Logs())
 		}
 	})
-	if err := s.start(t, "127.0.0.1:0"); err != nil {
+	if err := s.start(t, "127.0.0.1:0", "127.0.0.1:0"); err != nil {
 		return nil, err
 	}
 	return s, nil
 }
 
-// start builds a server on httpAddr, starts it and waits for readiness.
-func (s *Server) start(t testing.TB, httpAddr string) error {
+// start builds a server on httpAddr (and, with Options.TLS, httpsAddr), starts it and waits for readiness.
+func (s *Server) start(t testing.TB, httpAddr, httpsAddr string) error {
 	t.Helper()
-	cfg, err := s.loadConfig(httpAddr)
+	cfg, err := s.loadConfig(httpAddr, httpsAddr)
 	if err != nil {
 		t.Fatalf("servertest: config flags: %v", err)
 	}
@@ -188,21 +227,29 @@ func (s *Server) start(t testing.TB, httpAddr string) error {
 		defer close(r.done)
 		r.err = srv.Run(runCtx)
 	}()
+	addrs := srv.Addrs()
 	s.mu.Lock()
 	s.run = r
-	s.httpAddr = srv.Addrs().HTTP.String()
+	s.httpAddr, s.httpsAddr = addrs.HTTP.String(), ""
+	if addrs.HTTPS != nil {
+		s.httpsAddr = addrs.HTTPS.String()
+	}
 	s.mu.Unlock()
 
 	site := srv.Site()
 	s.Srv, s.Cfg = srv, cfg
 	s.URL = "http://" + site.Host
 	s.WSURL = "ws://" + site.Host + "/ws"
+	if site.TLSMode != config.TLSOff {
+		s.URL = "https://" + site.Host
+		s.WSURL = "wss://" + site.Host + "/ws"
+	}
 	return s.waitReady(startCtx)
 }
 
 // loadConfig builds the config from flags alone, as `isshoni config init` does: no file and no environment, so
 // the developer's machine can't leak into a test.
-func (s *Server) loadConfig(httpAddr string) (*config.Config, error) {
+func (s *Server) loadConfig(httpAddr, httpsAddr string) (*config.Config, error) {
 	args := []string{
 		"--tls.mode=off",
 		"--listen.http=" + httpAddr,
@@ -210,8 +257,20 @@ func (s *Server) loadConfig(httpAddr string) (*config.Config, error) {
 		"--listen.ice-tcp=127.0.0.1:0",
 		"--listen.admin-socket=" + s.AdminSocket,
 		"--network.include-loopback=true",
+		// No STUN: public-address detection then looks at the interfaces only. A test of the detection passes
+		// its own servers with a fake server.Deps.STUN.
+		"--network.stun-servers=",
 		"--data-dir=" + s.DataDir,
 		"--log.level=debug",
+	}
+	if s.opts.TLS {
+		args = append(args,
+			"--tls.mode=manual",
+			"--domain="+TLSDomain,
+			"--tls.cert-file="+s.certFile,
+			"--tls.key-file="+s.keyFile,
+			"--listen.https="+httpsAddr,
+		)
 	}
 	args = append(args, s.opts.Flags...)
 	set := flag.NewFlagSet("servertest", flag.ContinueOnError)
@@ -299,21 +358,81 @@ func (s *Server) Stop(t testing.TB) {
 }
 
 // Restart stops the server if it still runs and starts a new one with the same options on the same data directory,
-// admin socket path and port, so URL stays valid and Client keeps its cookies, as a browser does across a server
+// admin socket path and ports, so URL stays valid and Client keeps its cookies, as a browser does across a server
 // restart. It stands in for the re-exec after a restore or rotate-secrets (04 §6.5). Cfg and Srv are replaced.
 func (s *Server) Restart(t testing.TB) {
 	t.Helper()
 	s.Stop(t)
-	if err := s.start(t, s.boundAddr()); err != nil {
+	s.mu.Lock()
+	httpAddr, httpsAddr := s.httpAddr, s.httpsAddr
+	s.mu.Unlock()
+	if err := s.start(t, httpAddr, httpsAddr); err != nil {
 		t.Fatalf("servertest: restart: %v", err)
 	}
 }
 
-// boundAddr returns the address of the server's HTTP listener ("127.0.0.1:<port>").
+// boundAddr returns the address of the server's main listener ("127.0.0.1:<port>"): the 443 multiplexer in a TLS
+// mode, listen.http in off mode.
 func (s *Server) boundAddr() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.httpsAddr != "" {
+		return s.httpsAddr
+	}
 	return s.httpAddr
+}
+
+// writeTestCertificate makes a private CA and a certificate for the test server (04 §8.6: tests bring their own
+// CA; there is no self-signed mode), adds the CA to roots and returns the files with the chain and the key, as an
+// operator would give them to tls.cert_file and tls.key_file.
+func writeTestCertificate(t testing.TB, roots *x509.CertPool) (certFile, keyFile string) {
+	t.Helper()
+	fail := func(err error) {
+		if err != nil {
+			t.Fatalf("servertest: test certificate: %v", err)
+		}
+	}
+	now := time.Now()
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	fail(err)
+	caTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{Organization: []string{"isshoni servertest"}, CommonName: "Test Root"},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(30 * 24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	fail(err)
+	caCert, err := x509.ParseCertificate(caDER)
+	fail(err)
+	roots.AddCert(caCert)
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	fail(err)
+	leafTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: TLSDomain},
+		NotBefore:    now.Add(-time.Hour),
+		// More than the 14 days below which the TLS manager warns.
+		NotAfter:    now.Add(30 * 24 * time.Hour),
+		KeyUsage:    x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:    []string{TLSDomain, "localhost"},
+		IPAddresses: []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, leafTmpl, caCert, &key.PublicKey, caKey)
+	fail(err)
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	fail(err)
+
+	dir := t.TempDir()
+	certFile, keyFile = filepath.Join(dir, "fullchain.pem"), filepath.Join(dir, "privkey.pem")
+	fail(os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600))
+	fail(os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600))
+	return certFile, keyFile
 }
 
 // Logs returns everything the server has logged so far (JSON lines, debug level), across restarts.

@@ -574,6 +574,16 @@ type conn struct {
 	peerSeq   uint64             // numbers the connection's MediaPeers, so the actor drops a previous peer's events
 	stateRev  uint64             // the rev of the last room.state sent for the room; older snapshots are skipped
 	endReason protocol.EndReason // set by revoke and shutdown: why the connection's shares end when it closes
+
+	// The connection's media in its room (share.go, stats.go); all of it goes when the connection leaves the room.
+	shareTimer *time.Timer // fires at the earliest deadline of the shares the connection publishes (armShareTimer)
+	statsTimer *time.Timer // fires every statsInterval while statsOn (armStats)
+	statsOn    bool
+	// pubGen is the highest gen of the pub offers that the current MediaPeer was given. It only tells a pub offer
+	// that creates a PeerConnection from a renegotiation, for the rate limit on the former (01 §13): the SFU owns
+	// the gen and neg bookkeeping and decides what is stale (01 §9 rule 2).
+	pubGen  uint32
+	inbound map[inboundKey]inboundCounters // the cumulative counters of the last stats report, per inbound track
 }
 
 func newConn(h *Hub, s *socket, id Identity, hello *protocol.Hello, version int) *conn {
@@ -624,6 +634,12 @@ func (c *conn) run(first func()) {
 	c.grace = time.NewTimer(c.h.cfg.Grace)
 	c.grace.Stop() // armed when the connection loses its socket (startGrace)
 	defer c.grace.Stop()
+	c.shareTimer = time.NewTimer(time.Hour)
+	c.shareTimer.Stop() // armed while a share of the connection has a deadline (armShareTimer)
+	defer c.shareTimer.Stop()
+	c.statsTimer = time.NewTimer(time.Hour)
+	c.statsTimer.Stop() // armed while the connection has media in its room or watches the stats (armStats)
+	defer c.statsTimer.Stop()
 	reval := time.NewTicker(c.h.cfg.RevalidateEvery)
 	defer reval.Stop()
 	down := c.h.down
@@ -640,6 +656,10 @@ func (c *conn) run(first func()) {
 			c.checkIdle()
 		case <-c.grace.C:
 			c.graceExpired()
+		case <-c.shareTimer.C:
+			c.shareTimeouts()
+		case <-c.statsTimer.C:
+			c.statsTick()
 		case <-reval.C:
 			c.revalidate()
 		case <-down:
@@ -802,13 +822,17 @@ func (c *conn) close(reason protocol.EndReason) {
 }
 
 // leaveRoom takes the connection out of its room, if any (01 §8.4): the hub detaches it, then its MediaPeer ends the
-// connection's shares there and closes. Nothing is locked while the MediaPeer is called.
+// connection's shares there and closes. Nothing is locked while the MediaPeer is called. What the connection kept
+// about its media in the room goes with it: both PeerConnections are closed (01 §9 rule 10).
 func (c *conn) leaveRoom(reason protocol.EndReason) {
 	r, peer := c.room, c.peer
 	if r == nil {
 		return
 	}
 	c.room, c.peer = nil, nil
+	c.shareTimer.Stop()
+	c.stopStats()
+	c.pubGen, c.inbound = 0, nil
 	ended := c.h.detach(c, r, reason)
 	closePeer(peer, ended, reason)
 }

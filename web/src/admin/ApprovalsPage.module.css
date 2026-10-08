@@ -1,0 +1,15 @@
+.list {
+  min-width: 0;
+}
+
+.ip {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  /*
+   * Room for any IPv4 address on one line. An IPv6 address has no spaces: it may wrap anywhere past that, and
+   * doesn't widen its column.
+   */
+  display: inline-block;
+  min-width: 15ch;
+  overflow-wrap: anywhere;
+}

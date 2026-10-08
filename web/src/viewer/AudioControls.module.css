@@ -1,0 +1,101 @@
+/* The sound controls sit on the stage's black: in the stage's toolbar, or over a tile's video. */
+
+/* A touch target of its own (05 §12.1). What is drawn is smaller: the icon, or the chip around it. */
+.icon,
+.speaker,
+.listenHere {
+  display: inline-flex;
+  gap: var(--space-2);
+  align-items: center;
+  justify-content: center;
+  min-width: var(--tap-target);
+  min-height: var(--tap-target);
+  padding: 0 var(--space-2);
+  font-size: var(--text-sm);
+  line-height: var(--leading-tight);
+  color: inherit;
+  white-space: nowrap;
+  background: none;
+  border: 0;
+  border-radius: var(--radius-md);
+}
+
+/* In the toolbar: no box until it is hovered. */
+.icon:hover {
+  background-color: var(--color-stage-overlay);
+}
+
+/* Muted. */
+.icon[aria-pressed='true'] {
+  color: var(--color-stage);
+  background-color: var(--color-on-stage);
+}
+
+/* On a tile, over the video: a small dark chip, so the icon reads on any picture. */
+.speaker {
+  padding: 0;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-1);
+  background-color: var(--color-stage-overlay);
+  border-radius: var(--radius-sm);
+}
+
+.speaker:hover .chip {
+  background-color: var(--color-stage);
+}
+
+/* The share that is heard: the accent colour, which stands out on a white picture as well as on a dark one. */
+.speaker[aria-pressed='true'] .chip {
+  color: var(--color-on-accent);
+  background-color: var(--color-accent);
+}
+
+.speaker[aria-pressed='true']:hover .chip {
+  background-color: var(--color-accent-hover);
+}
+
+/* The indicator says what is wrong at a glance, so it always has its box. */
+.listenHere {
+  padding: 0 var(--space-3);
+  background-color: var(--color-stage-overlay);
+  border: var(--border-width) solid currentcolor;
+}
+
+.listenHere:hover {
+  background-color: var(--color-stage);
+}
+
+/* On the stage's black the page's focus colour is too dark to see; inside, because a tile clips its edges. */
+.icon:focus-visible,
+.speaker:focus-visible,
+.listenHere:focus-visible,
+.volume:focus-visible {
+  outline-color: var(--color-on-stage);
+  outline-offset: calc(-1 * var(--focus-ring-width));
+}
+
+.icon svg,
+.speaker svg,
+.listenHere svg {
+  flex: none;
+  width: 1.125rem;
+  height: 1.125rem;
+}
+
+.volume {
+  width: 6rem;
+  min-height: var(--tap-target);
+  accent-color: var(--color-on-stage);
+}
+
+/* Phones have their own volume buttons, and the toolbar has little room. */
+@media (max-width: 40rem) {
+  .volume {
+    display: none;
+  }
+}

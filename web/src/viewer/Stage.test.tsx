@@ -1,5 +1,5 @@
 // Stage (05 §12.1, §16.6): the focused share as a region named "Now watching: …", its state, who shares what and
-// how many watch, and a toolbar for the controls later slices add.
+// how many watch, and a toolbar with the sound controls and the ones later slices add.
 import { act, render, screen, within } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -30,6 +30,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  viewer.dispose();
   media.restore();
   vi.unstubAllGlobals();
 });
@@ -111,13 +112,35 @@ describe('Stage', () => {
     expect(screen.getByRole('status')).toBeEmptyDOMElement();
   });
 
-  it('has a toolbar only when it has controls', () => {
+  it('has a toolbar with the sound controls, and the caller’s controls after them', () => {
     const { s_a: share } = shares(shareInfo('s_a', 'u_bea', 1));
+    const { rerender } = render(inViewer(<Stage share={share ?? null} />));
+    const toolbar = screen.getByRole('toolbar', { name: 'Stage controls' });
+    expect(within(toolbar).getByRole('button', { name: 'Mute' })).toBeInTheDocument();
+    expect(within(toolbar).getByRole('slider', { name: 'Volume' })).toBeInTheDocument();
+
+    rerender(inViewer(<Stage share={share ?? null} controls={<button type="button">Fullscreen</button>} />));
+    const controls = within(screen.getByRole('toolbar')).getAllByRole('button');
+    expect(controls.map((b) => b.getAttribute('aria-label') ?? b.textContent)).toEqual(['Mute', 'Fullscreen']);
+  });
+
+  it('has a toolbar for a preview only when it has controls: the preview has no sound', () => {
+    const { s_mine: share } = shares(shareInfo('s_mine', 'u_alex', 1, { connectionId: 'c_me' }));
     const { rerender } = render(inViewer(<Stage share={share ?? null} />));
     expect(screen.queryByRole('toolbar')).not.toBeInTheDocument();
     rerender(inViewer(<Stage share={share ?? null} controls={<button type="button">Fullscreen</button>} />));
     const toolbar = screen.getByRole('toolbar', { name: 'Stage controls' });
-    expect(within(toolbar).getByRole('button', { name: 'Fullscreen' })).toBeInTheDocument();
+    expect(within(toolbar).getAllByRole('button')).toEqual([screen.getByRole('button', { name: 'Fullscreen' })]);
+  });
+
+  it('counts its share as shown while it is mounted (the layer policy’s `visible`, 05 §12.4)', () => {
+    const all = shares(shareInfo('s_a', 'u_bea', 1), shareInfo('s_b', 'u_cy', 2));
+    const { rerender, unmount } = render(inViewer(<Stage share={all['s_a'] ?? null} />));
+    expect(viewer.store.getState().visible).toEqual({ s_a: true });
+    rerender(inViewer(<Stage share={all['s_b'] ?? null} />));
+    expect(viewer.store.getState().visible).toEqual({ s_a: false, s_b: true });
+    unmount();
+    expect(viewer.store.getState().visible).toEqual({ s_a: false, s_b: false });
   });
 
   it('gives each share its own video element, so no frame of the previous one is left', () => {

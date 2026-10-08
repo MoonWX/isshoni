@@ -188,6 +188,14 @@ handshaking ────────► ready ◄──────────�
   - the connection's inbox overflowed (§15.2): closed at once, `disconnected`;
   - everything else keeps the grace: the hub's retryable closes (`4408` idle timeout, `4503` send queue full, `4429`
     flood, `1011`), a message over the read limit (`1009`) and a socket that just went away (`1006`).
+  - **A flood close keeps the 30 s grace** (decided after group 4). `error{rate_limited, scope: connection}` with
+    `4429` ends the socket, not the connection: it stays `detached` with its shares and subscriptions, and its media
+    keeps flowing, like after any other retryable close. The rate limits apply again after the resume: a resumed
+    connection keeps its rate-limit buckets (§10.3) and, with them, the start of its flood (the 10 s of §12.1), so
+    a resume forgives nothing. The buckets refill while the socket is gone, and the flood is over once a message
+    passes with both global buckets at least half full. A client that resumes at once and still floods is closed
+    with `4429` again at its first refused message. A client that follows §10.2 waits at least 30 s after `4429`,
+    which is the whole grace, so its `hello` normally opens a new connection (`resumed: false`) and it rejoins.
 - `closed`: subscriptions removed, own shares ended (`disconnected` or the specific reason), MediaPeer closed,
   participant removed if it was the last connection (`room.event participant.left`). A connection closed by 03
   revocation (`CloseConnections`) skips grace and uses `EndReason left` for its shares and, if it was the last
@@ -2707,6 +2715,12 @@ In `internal/server/signal`, with `signaltest` fakes and `httptest`:
   - a 200 KiB `pc.answer` (sub) after welcome → accepted by the hub; a 70 KiB `stats` → `message_too_large`.
 - **Rate limits**: a burst of 101 messages → `rate_limited` with `retryAfterMs`; continuous flood → 4429.
   `share.start` 11×/min → `rate_limited`. `stats` twice within 5 s → the second is dropped silently.
+  - After the 4429 the connection is `detached` for the grace: `room.state` shows it `reconnecting`, and its shares
+    stay. A `hello` with its resume token within the grace resumes it (`resumed: true`). If it goes on flooding, it
+    is closed with 4429 again at its first refused message, not 10 s later: the buckets and the flood's start
+    survive the resume (§4.2).
+  - Group 4's tests stop at the close code (`TestRateLimitFlood`), and nothing resumes after a flood. The next
+    slice that changes `internal/server/signal` adds this case.
 - **Roles**: a table test of every client message × every role against §6.3.
 - **Rooms**:
   - two connections of one user → one participant with two connections; watchers merged (max video, any audio);

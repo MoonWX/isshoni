@@ -283,6 +283,8 @@ var (
 	// per hour.
 	rateLoginFailedAudit = rate{Burst: 600, Every: 6 * time.Second}
 	rateGlobalThrottled  = rate{Burst: 1, Every: time.Hour}
+	// The signup_pending admin alert: at most one per 10 min, however many sign-ups arrive (03 §7.9).
+	rateSignupAlert = rate{Burst: 1, Every: 10 * time.Minute}
 )
 
 // throttles are the in-memory buckets of 03 §7.3. Each is checked before any hashing or DB access; the service
@@ -300,6 +302,7 @@ type throttles struct {
 	blockLog             *limiter[netip.Prefix] // the warn line of a blocked attempt, by IPKey
 	loginFailedAudit     *limiter[struct{}]     // auth.login_failed rows
 	globalThrottledAudit *limiter[struct{}]     // the auth.throttled {scope:"global"} row past that cap
+	signupAlert          *limiter[struct{}]     // the signup_pending admin alert
 }
 
 func newThrottles(now func() time.Time, hb HashBudget) (*throttles, error) {
@@ -317,5 +320,6 @@ func newThrottles(now func() time.Time, hb HashBudget) (*throttles, error) {
 		blockLog:             newLimiter[netip.Prefix](rateBlockLog, maxLimiterKeys, now),
 		loginFailedAudit:     newLimiter[struct{}](rateLoginFailedAudit, 1, now),
 		globalThrottledAudit: newLimiter[struct{}](rateGlobalThrottled, 1, now),
+		signupAlert:          newLimiter[struct{}](rateSignupAlert, 1, now),
 	}, nil
 }

@@ -1,0 +1,103 @@
+/* The eye with the count, on a tile or on the stage, and its panel. */
+
+.root {
+  display: inline-flex;
+}
+
+/* A touch target of its own (05 §12.1). What is drawn is the chip inside it. */
+.trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--tap-target);
+  min-height: var(--tap-target);
+  padding: 0;
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  line-height: var(--leading-tight);
+  color: inherit;
+  white-space: nowrap;
+  background: none;
+  border: 0;
+  border-radius: var(--radius-md);
+}
+
+.chip {
+  display: inline-flex;
+  gap: var(--space-1);
+  align-items: center;
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+}
+
+/* In the stage's bar: no box until it is hovered or open. */
+.trigger:hover .chip,
+.trigger[aria-expanded='true'] .chip {
+  background-color: var(--color-stage-overlay);
+}
+
+/* On a tile, over the video: always a dark chip, so the count reads on any picture. */
+.onVideo {
+  background-color: var(--color-stage-overlay);
+}
+
+.trigger:hover .onVideo,
+.trigger[aria-expanded='true'] .onVideo {
+  background-color: var(--color-stage);
+}
+
+/* On the stage's black the page's focus colour is too dark to see; inside, because a tile clips its edges. */
+.trigger:focus-visible {
+  outline-color: var(--color-on-stage);
+  outline-offset: calc(-1 * var(--focus-ring-width));
+}
+
+.eye {
+  flex: none;
+  width: 1em;
+  height: 1em;
+}
+
+/*
+ * Fixed, with its place set when it opens (WatchersPopover.tsx): a tile and the stage clip what they contain. It
+ * is a panel of the page, not of the stage: what it inherits from the dark video area is set back. placeAt() there
+ * knows the two widths below (MIN_WIDTH_REM, MAX_WIDTH_REM): change them together.
+ */
+.panel {
+  position: fixed;
+  z-index: var(--z-popover);
+  min-width: 10rem;
+  max-width: min(20rem, calc(100vw - 2 * var(--space-2)));
+  padding: var(--space-3);
+  overflow-y: auto;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-normal);
+  line-height: var(--leading);
+  color: var(--color-text);
+  text-align: start;
+  text-shadow: none;
+  white-space: normal;
+  background-color: var(--color-surface);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-2);
+}
+
+.panel:focus-visible {
+  outline-offset: 0;
+}
+
+.heading {
+  margin-bottom: var(--space-1);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  color: var(--color-text-muted);
+}
+
+.names {
+  list-style: none;
+}
+
+.names > li {
+  overflow-wrap: anywhere;
+}

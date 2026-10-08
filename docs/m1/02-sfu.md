@@ -137,9 +137,9 @@ SFU ── shared: pubAPI, subAPI, probe APIs (all on 04's netx.Transport: UDP m
 
 | Object | Owned by | Holds | Ends when |
 |---|---|---|---|
-| `Room` | SFU | participants, shares, codec policy | last Conn gone and no shares; `CloseRoom` |
+| `Room` | SFU | participants, shares, codec policy | last Conn gone and no shares (a Conn's shares end with it, so the room goes with its last Conn); `CloseRoom`, which closes those Conns (§6.1) |
 | `Participant` | Room | conns, shares (≤4) | last Conn closed |
-| `Conn` | Participant | ≤1 pubPC, ≤1 subPC, subscriptions, pending ICE, negotiation state | `Close` (signal: grace expired, leave, revocation, room closed); SFU shutdown |
+| `Conn` | Participant | ≤1 pubPC, ≤1 subPC, subscriptions, pending ICE, negotiation state | `Close` (signal: grace expired, leave, revocation, room closed); `CloseRoom`; SFU shutdown |
 | `Share` | Participant (source Conn referenced) | layers, audio layer, fan-out lists, state | `StopShare` from signal (01 owns the lifecycle and its timeouts); source Conn closed; `CloseRoom`; SFU `Close` |
 | `Layer` | Share | `TrackRemote`, receiver, packet cache, latest SR, rates | its track's read fails (PC closed, transceiver stopped) |
 | `Subscription` | subscriber Conn | video and audio `DownTrack`, requested quality | share ended; subscriber Conn closed |
@@ -203,7 +203,7 @@ so aborted shares never notify (04 push, 01), and ends shares that stay `pending
 | `offering` | every 15 s without an answer | send the same offer again (same `gen` and `neg`) |
 | `idle`, `offering` | `Resync()` | if `offering`, send the same offer again; ICE-restart a sub PC that isn't `connected` (01 §10.5), unless an ICE restart is already under way (below) |
 | any | `ResetPC(sub)` or a codec rebuild (§8.5) | close PC; new PC with `gen + 1`, `neg = 1`; add all DownTracks again; offer → `offering` |
-| `closed` (closed by the SFU after the `failed` grace or a fatal error, or never built), while the Conn has subscriptions | `ResetPC`, `RestartICE`, `Resync()` or a subscription change | new PC with `gen + 1`, `neg = 1`; add all DownTracks; offer → `offering` |
+| `closed` (closed by the SFU after the `failed` grace or a fatal error, by Pion because the client closed its side (below), or never built), while the Conn has subscriptions | `ResetPC`, `RestartICE`, `Resync()` or a subscription change | new PC with `gen + 1`, `neg = 1`; add all DownTracks; offer → `offering` |
 
 `gen` and `neg` are 01's counters (01 §9): per Conn and PC kind, `gen` counts PC generations (the SFU increments it
 for `sub`, the client for `pub`) and `neg` counts offers within a `gen`. The SFU is the only owner of this state for
@@ -231,6 +231,24 @@ same rule covers the Go client. The client treats the sub offer with a new `ice-
 - `failed`: send `PCStateEvent`, start a 30 s PC grace. With no restart or reset by then, close the PC. For pub, its
   shares stay `stalled` until the pub PC is connected again and a keyframe arrives (Share diagram above), or the hub's
   30 s timeout ends them.
+- `closed` without a call from signal: Pion closes a PeerConnection when its peer closes its side (the DTLS
+  `close_notify` alert), so the SFU sees a current PC go `closed` with no `pc.close` message behind it. A client
+  that closes before its own DTLS side is connected sends no alert; the SFU then only sees ICE fail. S29 keeps
+  Pion's behaviour and reports it: `PCStateEvent{closed}`, for the current PC only (a PC that the SFU replaced or
+  tore down is no longer current when its `closed` arrives, and sends nothing).
+  - **pub**: the PC is gone. Its tracks have ended, so its shares lose their layers but live on (the hub owns their
+    lifecycle and its 30 s timeout). A later offer with that `gen` returns `sfu.bad_pc`; only an offer with a higher
+    `gen` brings a new pub PC.
+  - **sub**: the PC stays the Conn's sub PC, in the `closed` state of the table above, and the Conn keeps its
+    subscriptions. Nothing more is offered on it, an answer for its `gen` returns `sfu.bad_pc`, and a subscription
+    whose share ends is removed without an offer. The same state follows a **fatal error**: a sub offer that Pion
+    can't create or set (the client gets `ErrorEvent{sfu.internal, pc.sub}`), or an answer that Pion refuses after
+    taking it (`HandleAnswer` returns `sfu.bad_sdp`; Pion has no rollback, so that PC can't negotiate again).
+    Building the successor (`gen + 1`) from `closed` is slice 9 (README S57). Until then the subscriptions wait, and
+    a new subscription on that Conn fails with a retryable `sfu.internal`.
+
+  Two S29 tests pin this (`TestSubPCClosedByClient`, and the end of `TestPubOfferGenAndNeg`). S57, which adds
+  `ClosePC` (the `pc.close` path), decides whether Pion's close on `close_notify` stays.
 - PCStateEvents are sent only for the current PC of each kind, never for one already replaced by a higher `gen`.
 - The SFU never starts an ICE restart or a rebuild because of its own ICE state. Its only unsolicited actions are the
   pub rebuild request (via `PCStateEvent`), the sub ICE restart in `Resync()`, and the codec rebuilds of §8.5
@@ -295,6 +313,7 @@ type (
 	                         // 01's CodecKey without the "h264/" prefix)
 )
 
+// The first three start at 1 and have no valid zero value; the next four start at 0 ("Enum values" below).
 type Role uint8       // RoleFull (publish+subscribe) | RoleViewer | RolePublisher (M2 desktop core) | RoleAgent (M4)
 type ClientKind uint8 // ClientWeb | ClientDesktop | ClientMobile (later)
 type PCKind uint8     // PCPub (client offers) | PCSub (server offers)
@@ -303,7 +322,8 @@ type Preset uint8     // PresetAuto | PresetGame | PresetMovie | PresetText
 type SourceKind uint8 // SourceUnknown | SourceScreen | SourceWindow | SourceTab
 type ShareState uint8 // SharePending | ShareLive | ShareStalled (media facts only; §5.3)
 type EndReason string // 01's protocol.EndReason values, passed through: "stopped" "left" "disconnected"
-                      // "media_timeout" "room_closed" "server_shutdown" ("kicked" reserved)
+                      // "media_timeout" "room_closed" "server_shutdown" ("kicked" reserved); constants
+                      // EndReasonStopped … EndReasonServerShutdown
 type SubReason string // "" "bandwidth" "server_limit" (later) "codec_mismatch" "decoder_unavailable"
                       // "decoder_failed" "no_preview_layer" "no_layer"; 01 §15.4 maps them to the wire
 
@@ -339,7 +359,8 @@ func (s *SFU) Shares(room RoomID) []ShareInfo       // live snapshot, sorted by 
 func (s *SFU) Share(id ShareID) (ShareInfo, bool)
 func (s *SFU) CodecPolicy(room RoomID) ProfileKey    // "6400" (high) or "42e0" (cb)
 func (s *SFU) StopShare(id ShareID, r EndReason) error // any Conn; the hub normally uses Conn.StopShare
-func (s *SFU) CloseRoom(room RoomID, r EndReason)
+func (s *SFU) CloseRoom(room RoomID, r EndReason)      // ends the room's shares with r, then closes its Conns
+                                                       // (Conn.Close(r)); for callers without a hub (below)
 func (s *SFU) SetLimits(l Limits)                    // admin soft limits, applied live (wiring: 03 settings OnChange)
 // later: func (s *SFU) SetRoomLimits(room RoomID, l RoomLimits)
 func (s *SFU) Snapshot() Snapshot                    // §13
@@ -410,6 +431,34 @@ type SubscriptionUpdate struct {
 `UpdateSubscriptions` applies items in order. The first slice holds one error per item (nil = applied), for example
 `sfu.share_not_found` for a share that just ended. The second is a Conn-level error (role, closed, busy). Creating
 subscriptions triggers one debounced renegotiation for the whole batch. Changing quality never renegotiates.
+
+**Enum values** (S29). `Role`, `ClientKind` and `PCKind` start at 1 (`iota + 1`), so they have no valid zero value: a
+value that the adapter forgot to set is refused instead of meaning `full`, `web` or `pub`. `Join` refuses a `Role`
+or `ClientKind` outside its constants as a contract violation (§6.3), and `HandleOffer`, `HandleAnswer` and
+`AddICECandidate` return `sfu.bad_pc` for a `PCKind` that isn't theirs, the zero value included. `Quality`,
+`Preset`, `SourceKind` and `ShareState` start at 0, where the zero value is the natural default: `QualityOff`,
+`PresetAuto`, `SourceUnknown`, `SharePending`. The numbers are this package's own and may change: sfuplane maps
+every enum by name (01 §15.4). Each of the seven types has a `String()` with the lower-case name (`full`, `web`,
+`pub`, `high`, `auto`, `window`, `live`, …); for `Role`, `PCKind`, `Quality` and `ShareState` these are the
+`Metrics` label values of §13.
+
+**`CloseRoom`** (S29) ends every share of the room with `r` (`ShareEnded(r)` each, in `StartedAt` order) and then
+closes every Conn of the room with `Close(r)`; the room is removed with its last Conn. It is the direct way for a
+caller without a hub (tests, tools). The hub does not use it: a deleted room reaches the SFU through the hub's
+connections, each of which ends its shares with its own reason and closes its peer (`Conn.Close`; §19 here,
+01 §15.2). `Conn.Close` is idempotent, so the two ways never conflict. An unknown room is a no-op.
+
+**`StartShare` and `UpdateShare`** exist from S29 on with the numbers of §8.6 (they are not stubs until slice 7):
+- `StartShare` creates the share `pending` under the hub's id and returns `ShareParams` for its preset: `f` then `q`,
+  both `Active`, `f.MaxBitrate` under the admin cap, `AudioBitrate` by preset, and `Profile` = the room's codec
+  policy (`6400` for every room until slice 10 adds the policy). Errors: `sfu.role_forbidden`,
+  `sfu.too_many_shares`, and the contract violations of §6.3 (an empty or reused share id, an unknown preset).
+- `UpdateShare(id, ShareUpdate{Preset})` stores the new preset and returns the share's new `ShareParams`; a nil
+  `Preset` changes nothing and returns the current ones. The encodings apply at once (the client sets them); the
+  audio bitrate reaches the publisher with the next pub offer's answer (§8.4 step 5 reads the share's preset when it
+  writes `maxaveragebitrate`). Errors: `sfu.share_not_found`, `sfu.not_owner`.
+- `SetLimits` replaces the cap for every `ShareParams` returned from then on; an invalid value (a negative number)
+  is logged and ignored. Telling running shares (REMB on the pub PC, a `QualityHintEvent`) is slice 13 (§11).
 
 ### 6.2 SFU → signal
 
@@ -512,9 +561,24 @@ type Error struct {
 	RetryAfter time.Duration // set for pc_rate_limited (§12), busy (1 s) and probe_limit (until the oldest running
 	                         // probe's 20 s lifetime ends)
 	msg        string        // logs only, never sent
+	cause      error         // what Unwrap returns: ErrNotImplemented, or nil
 }
-func (e *Error) Error() string
+func (e *Error) Error() string          // the code, and ": " + msg when there is one
+func (e *Error) Unwrap() error          // ErrNotImplemented for a method that a later slice fills in, else nil
+func (e *Error) Is(target error) bool   // errors.Is(err, &sfu.Error{Code: sfu.CodeBadSDP}) matches by Code alone
+
+// One constant per code of the table below: CodeClosed = "sfu.closed", CodeBusy, CodeRoleForbidden, CodeBadPC,
+// CodeBadSDP, CodeNoH264, CodeBadRID, CodeUnknownTrack, CodeStaleAnswer, CodeStaleOffer, CodePCLimit,
+// CodePCRateLimited, CodeShareNotFound, CodeNotOwner, CodeTooManyShares, CodeTooManySubscriptions, CodeProbeLimit,
+// CodeTransportDisabled, CodeInternal.
+
+// ErrNotImplemented is wrapped by the error of an API method that a later slice of README §5 fills in.
+var ErrNotImplemented = errors.New("sfu: not implemented yet")
 ```
+
+Every exported method that can fail returns an `*Error` (`New` returns plain errors: a nil `Config.Transport`, a
+negative limit). Callers match it with `errors.As` and switch on `Code`, or with `errors.Is` against an `*Error`
+that has only `Code` set.
 
 | Code | Returned by | Retryable | Meaning |
 |---|---|---|---|
@@ -536,7 +600,25 @@ func (e *Error) Error() string
 | `sfu.too_many_subscriptions` | UpdateSubscriptions | no | guard: 256 per Conn, 64 items per call |
 | `sfu.probe_limit` | Probe | yes | 20 probes per server already running (a user's new probe of the same transport replaces the old one, §7.6) |
 | `sfu.transport_disabled` | Probe | no | the requested transport has no mux: `udp` with `listen.ice_udp` = "", `tcp443` in `tls.mode=off`, `tcp7882` with `listen.ice_tcp` = "" (04 answers 409 `transport_disabled`) |
-| `sfu.internal` | any | yes | unexpected Pion error (logged with details) |
+| `sfu.internal` | any | yes; no for the two cases below | unexpected Pion error (logged with details). Also, with `Retryable` false: a call that breaks the API's contract, and a method that isn't implemented yet |
+
+**`sfu.internal` that is not retryable** (S29). Two kinds of error use the code with `Retryable: false`, because
+trying again can't help:
+- **A contract violation**: the caller, not the client, got it wrong. `Join` with an empty `Room`, `Participant`,
+  `User` or `Conn`, a `Role` or `ClientKind` outside its constants, a nil `Signaler`, a `Conn` id that is already
+  joined, or a `Participant` that belongs to another `User`; `StartShare` with an empty share id, an id of a share
+  that exists, or an unknown preset; `UpdateShare` with an unknown preset; an `UpdateSubscriptions` item with an
+  unknown quality (a per-item error). These are bugs in the hub or sfuplane, so they get no code of their own: the
+  log message names the call.
+- **A method of a later slice** ("interfaces first", README §4): the whole §6.1 API is declared from S29 on, and a
+  method whose slice hasn't landed returns an `*Error{sfu.internal}` whose `Unwrap` is `ErrNotImplemented`
+  (`errors.Is(err, sfu.ErrNotImplemented)`); the message names the method and its README slice. After S29 these are
+  `RestartICE`, `ResetPC` and `ClosePC` (S57), `SetDecodeCaps` (S69) and `Probe` (S76). `Resync()` has no error to
+  return and only logs at debug until S57. The sentinel goes away with the last such method.
+
+sfuplane needs no special case for either: both are `sfu.internal`, which it maps to 01's `internal` (01 §15.4).
+So until its slice lands, a call that reaches one of these methods is answered `internal` on the wire: a client's
+`pc.close`, `pc.restart` or `caps.update`, for example.
 
 01 owns the error envelope (`error{code, retryable, scope}`); `sfuplane` maps these codes to 01's catalog (01 §15.4)
 and uses `Share` and `RetryAfter` when it builds the wire error. A §8.4 violation changes nothing, so a share whose
@@ -824,6 +906,8 @@ the same numbers.
 
 - `f.MaxBitrate = min(preset, Limits.MaxShareKbps × 1000)` when the admin cap is set; `q` is never capped below
   0.3 Mbps.
+- S29 already returns this table from `StartShare` and `UpdateShare` (`share.go`; §6.1), ahead of slice 7: `q` is
+  never touched by the cap, and a cap at or above 8000 kbps changes nothing.
 - Both encodings start `Active: true`. Layer pausing (§11) later sends `quality.hint` with `f` inactive.
 - `Profile` is the room's codec policy (§8.3): `6400` or `42e0`.
 - Advanced sizes (1440p60, 4K60) are later (M3, native senders); the table grows additively.
@@ -948,6 +1032,14 @@ type binding struct {
   Otherwise it calls `AddTransceiverFromTrack(dt, {Direction: sendonly})`. After a share ends, `RemoveTrack` sets the
   m-line inactive, and the next share reuses it, so the SDP doesn't grow over a 2-hour session. Viewers can never send
   media on the sub PC.
+
+  **Not in S29 yet**: the core slice gives every DownTrack a new sendonly transceiver
+  (`AddTransceiverFromTrack`), and never looks for a free one. `RemoveTrack` already makes the m-line of an ended
+  share inactive in the next offer, but nothing takes it again, so until the reuse lands a sub PC's SDP only grows
+  (two m-lines per subscription the Conn ever had; the sub answer limit is 256 KiB, 01 §13). The reuse comes with
+  slice 7 (README S52), whose integration 10 checks that the m-line count stays the same over 5 share cycles.
+  Clients must not rely on either behaviour: they map tracks by the offer's `tracks`, re-read on every offer
+  (01 §9 rule 4).
 - **Bind**: builds `ptFor` from `ctx.CodecParameters()` (§8.2), finds the RTX PTs (`apt=`), and gets `ctx.SSRC()`,
   `ctx.SSRCRetransmission()` and the abs-send-time extension ID from `ctx.HeaderExtensions()`. It returns the codec for
   the share's current profile (or the first negotiated codec of its kind) and never an error while one exists. It
@@ -1312,7 +1404,56 @@ type SnapshotTotals struct {
 
 - `(*Conn).Stats() ConnStats`: per PC (state, selected transport, RTT), per own share (layers, bitrates, loss), per
   subscription (requested, forwarded, reason, layer, bitrate, NACKs served, drops, profile), and the downlink
-  estimate. Signal sends it as `stats` (01) every 2 s while the client asks for it.
+  estimate. Signal sends it as `stats` (01) every 2 s while the client asks for it. S29 fixed its shape
+  (`stats.go`); sfuplane converts it to `protocol.ServerStats` (01 §8.11, §15.4):
+
+```go
+type ConnStats struct {
+	PCs              []PCStats           // pub first, then sub; only the PCs that exist
+	Shares           []OwnShareStats     // the shares this Conn publishes, by StartedAt
+	Subscriptions    []SubscriptionStats // by share id
+	DownlinkEstimate int64               // bit/s for the sub PC, from the downlink allocator (§10.2); 0 while unknown
+}
+type PCStats struct {
+	Kind      PCKind
+	Gen       uint32
+	State     string        // a webrtc.PeerConnectionState string
+	Transport string        // "udp" | "tcp443" | "tcp7882" | "" while not connected (§7.1)
+	RTT       time.Duration // of the selected candidate pair
+}
+type OwnShareStats struct { // the ingress of one share the Conn publishes
+	Share        ShareID
+	State        ShareState
+	Layers       []LayerInfo // the video layers, as in ShareInfo
+	Audio        bool        // an audio track is attached
+	AudioBitrate int         // bps, 2 s EWMA
+	AudioLossPct float64
+}
+type SubscriptionStats struct {
+	Share          ShareID
+	Requested      Quality
+	Forwarded      Quality
+	Reason         SubReason
+	Layer          string     // rid of the video layer forwarded now; "" when none
+	Profile        ProfileKey // H.264 profile of the forwarded video; "" when none
+	AudioRequested bool
+	AudioForwarded bool
+	Video          DownTrackStats
+	Audio          DownTrackStats
+}
+type DownTrackStats struct { // the egress numbers of one DownTrack
+	Bitrate     int     // bps, 2 s EWMA
+	LossPct     float64 // from the viewer's receiver reports
+	NACKsServed uint64
+	Drops       uint64 // packets dropped by the DownTrack's queues
+}
+```
+
+  The types don't change when the numbers arrive. Until then `Stats`, `Snapshot` and `Metrics` hold what the
+  object model knows: after S29, `Stats` lists the Conn's own shares with their attached layers (`RID` only), and
+  `PCs`, `Subscriptions` and `DownlinkEstimate` are empty; `Snapshot` lists rooms, shares and Conns without rates,
+  viewer counts, transports or totals; `Metrics` has every label value of the table below present, with only
+  `Conns` and `Shares` counting. The media path (slice 6, README S41) and slice 12 (README S79) fill in the rest.
 - `(*SFU).Metrics() Metrics`: plain atomics, cheap to read. 04 maps them to Prometheus (optional, off by default):
 
 | Metric | Type | Labels | Label values |
@@ -1659,12 +1800,16 @@ milestone gate before the M1 exit test). `-scenario smoke` runs as a Go test in 
   `ShareUpdate`, `SubscriptionUpdate`, `DecodeCaps`, `ProfileKey`, `Role`, `ClientKind`, `PCKind`, `Quality`,
   `Preset`, `SourceKind`, `ShareState`, `EndReason`, `SubReason`, `ShareInfo`, `LayerInfo`, `Signaler`,
   `RoomEvents`, `Event` and its types (`SubscriptionStateEvent`, `CodecPolicyEvent`, `QualityHintEvent`,
-  `PCStateEvent`, `ErrorEvent`), `Error` (with `Share` and `RetryAfter`) and the `sfu.*` codes, `ConnStats`,
+  `PCStateEvent`, `ErrorEvent`), `Error` (with `Share` and `RetryAfter`; `Unwrap` and `Is`) and the `sfu.*` codes
+  (`Code…` constants), `ErrNotImplemented` (§6.3), `ConnStats` and its types (`PCStats`, `OwnShareStats`,
+  `SubscriptionStats`, `DownTrackStats`),
   `Snapshot` and its types (`RoomSnapshot`, `ShareSnapshot`, `ViewerCounts`, `ConnSummary`, `SnapshotTotals`),
   `Metrics` and its label values (§13), `ProbeTransport`, `ProbeResult`. Later: `RoomLimits`, `SetRoomLimits`.
+  `Role`, `ClientKind` and `PCKind` have no valid zero value (§6.1).
 - **Wire-visible conventions** (through 01's `sfuplane`): rids `f`/`q`, at most 2, or none (`h` rejected until M5);
   share ids from the hub; sub msid = share id and track ids `v-`/`a-`+share id (debugging aid; mapping is by
-  `tracks`); transceivers are reused (a `track` event fires again on reuse); the server sends complete SDP and never
+  `tracks`); transceivers are reused from README S52 on (a `track` event fires again on reuse; before that every
+  subscription gets new m-sections, §9.3); the server sends complete SDP and never
   trickles; `gen`/`neg` on offers and answers; the publish answer's Opus `maxaveragebitrate` follows the preset; the
   sub offer's Opus has `stereo=1` (the viewer must add `stereo=1` to its answer).
 - **Static PT table** (§8.1). **Codec policy** semantics (§8.3). **Encodings per preset** (§8.6).
@@ -1697,7 +1842,8 @@ milestone gate before the M1 exit test). `-scenario smoke` runs as a Go test in 
   `POST /api/v1/auth/register` with the invite token (it returns the session cookie, so no second login), and
   `DELETE /api/v1/admin/users/{id}`. Invite registrations don't consume 03's `register-ip` bucket; the load test still
   paces registrations at `-login-interval` (default 3 s) for the `auth-ip` bucket (burst 20, 1 per 15 s).
-- Room deletion reaches the SFU through the hub (`Conn.Close`), not directly.
+- Room deletion reaches the SFU through the hub (`Conn.Close`), not directly (`SFU.CloseRoom`, which also closes
+  the room's Conns, is for callers without a hub, §6.1).
 
 **04-server-platform.md**
 - `netx.Transport` (04 §7.3) with `UDPMux` (nil if `listen.ice_udp` = ""), `TCPMux` (combined), `TCPMux443` (nil in
@@ -1759,6 +1905,13 @@ doc's.
 | 14 | Connection-test probe | `probe.go`, probe APIs, echo channel | Integration 18; limits enforced |
 | 15 | Decodable fake and load test | decodable H.264 and the Opus asset; `cmd/isshoni-loadtest` (setup through 03's REST, scenarios, measurements, JSON, exit codes) on 01's `internal/client/signal`; `web/e2e/decodable.spec.ts` | `fake` tests; `smoke` passes as a Go test against an in-process server (S89); `decodable.spec` (S89, not a 05 slice) runs `isshoni-loadtest -scenario smoke -decodable -publishers 1 -subscribers 0` against 05's e2e server fixture, and a Chrome viewer shows `framesDecoded > 0` |
 | 16 | Load gate | run `focus` on a 4 vCPU VPS from a second VM; fix what fails | every §15.2 criterion passes; `all-high` knee recorded in the release notes draft |
+
+**What README S29 built** (the first part of slice 6: the model, the Conn actor and both PCs, without a media
+path). It declares the whole §6 and §13 API. From slice 7 it brought forward `StartShare` and `UpdateShare` with the
+§8.6 numbers, and the part of `UpdateSubscriptions` that the sub PC's offers need (subscriptions with their two
+DownTracks, the 256 and 64 guards); layer selection, `SubscriptionStateEvent` and transceiver reuse stay in slice 7
+(§9.3). The methods of slices 9, 10 and 14 return the not-implemented error of §6.3, and shares stay `pending`
+until the media path of README S41 sees a keyframe.
 
 ## Decisions taken at integration (formerly open questions)
 

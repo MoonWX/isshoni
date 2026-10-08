@@ -3,6 +3,7 @@ package signal
 import (
 	"cmp"
 	"log/slog"
+	"maps"
 	"slices"
 	"sync"
 	"time"
@@ -27,10 +28,10 @@ type room struct {
 	mu sync.Mutex
 	// name is the name the room's latest room.join read with GetRoom, for Snapshot only (room.state has no name). It
 	// can be stale after a rename (03 §8), which has no hook. Everything else reads the name with GetRoom when it
-	// needs one: PushShareStarted.RoomName (README S40) never comes from here ("the hub never caches room names").
+	// needs one: PushShareStarted.RoomName never comes from here ("the hub never caches room names").
 	name         string
 	participants map[string]*participant // by user id
-	shares       map[string]*share       // by share id; share.start adds them (README S40)
+	shares       map[string]*share       // by share id, from share.start until the share ends (share.go)
 	rev          uint64                  // the rev of the current state (Hub.nextRev)
 	closed       bool                    // the hub has let go of the room: emptied, or CloseRoom; nothing more is sent
 	sentAt       time.Time               // when the last broadcast went out; zero before the first
@@ -52,15 +53,13 @@ type member struct {
 	// detached: the connection's socket is gone and it waits for a resume within grace (conn.startGrace, conn.resume).
 	// room.state shows it as reconnecting.
 	detached bool
-	// subs are the connection's desired subscriptions by share id (subscribe.update, README S40). Watchers are
-	// computed from them (01 §4.1). A subscription goes when its share ends or the connection leaves the room.
+	// subs are the connection's desired subscriptions by share id (subscribe.update). Watchers are computed from
+	// them (01 §4.1). A subscription goes when its share ends or the connection leaves the room.
 	subs map[string]protocol.SubscriptionWant
-}
-
-// share is one share in a room (01 §4.4). info holds what room.state shows, except Watchers, which each snapshot
-// computes from the members' desired subscriptions. share.start and the share lifecycle come with README S40.
-type share struct {
-	info protocol.ShareInfo
+	// media is the connection's last MediaPeer.Stats, for Snapshot (LiveShare); nil while the connection has no
+	// media in the room. The connection's actor replaces it every statsInterval (stats.go) and never changes a value
+	// it has stored.
+	media *protocol.ServerStats
 }
 
 func newRoom(h *Hub, id string) *room {
@@ -323,6 +322,7 @@ func (r *room) eventLocked(o *outbox, ev protocol.RoomEvent, skip *conn) {
 // records the change (changedLocked).
 func (r *room) endShareLocked(o *outbox, s *share, reason protocol.EndReason, now time.Time) {
 	delete(r.shares, s.info.ID)
+	r.h.metrics.shareStatus(s.info.Status, "")
 	r.membersLocked(func(m *member) { delete(m.subs, s.info.ID) })
 	name := ""
 	if p := r.participants[s.info.UserID]; p != nil {
@@ -443,6 +443,7 @@ func (h *Hub) detach(c *conn, r *room, reason protocol.EndReason) []string {
 	now := time.Now()
 	var o outbox
 	var ended []string
+	var shares []*share
 	h.mu.Lock()
 	if c.roomID == r.id {
 		c.roomID = ""
@@ -452,6 +453,7 @@ func (h *Hub) detach(c *conn, r *room, reason protocol.EndReason) []string {
 		if s.info.ConnectionID == c.id {
 			r.endShareLocked(&o, s, reason, now)
 			ended = append(ended, s.info.ID)
+			shares = append(shares, s)
 		}
 	}
 	if p := r.participants[c.userID]; p != nil {
@@ -483,6 +485,9 @@ func (h *Hub) detach(c *conn, r *room, reason protocol.EndReason) []string {
 	r.mu.Unlock()
 	h.mu.Unlock()
 	o.send()
+	for _, s := range shares {
+		h.logShareEnded(r, s, reason)
+	}
 	return ended
 }
 
@@ -514,22 +519,41 @@ func (r *room) liveLocked() LiveRoom {
 		lr.Participants = append(lr.Participants, lp)
 	}
 	for _, s := range r.sortedSharesLocked() {
-		// Layers and EgressBitrate come from the publishing connection's MediaPeer.Stats, which only its actor may
-		// call; the stats forwarding of README S40 keeps them for the snapshot.
-		lr.Shares = append(lr.Shares, LiveShare{Info: s.shareInfo(parts), Layers: []protocol.ServerLayerStats{}})
+		// Layers and EgressBitrate come from MediaPeer.Stats, which only a connection's actor may call: each actor
+		// keeps its last Stats on its membership (member.media).
+		ls := LiveShare{Info: s.shareInfo(parts), Layers: []protocol.ServerLayerStats{}}
+		r.membersLocked(func(m *member) {
+			if m.media == nil {
+				return
+			}
+			if m.c.id == s.info.ConnectionID {
+				for _, l := range m.media.Layers {
+					if l.ShareID == s.info.ID {
+						ls.Layers = append(ls.Layers, l)
+					}
+				}
+			}
+			for _, sub := range m.media.Subs {
+				if sub.ShareID == s.info.ID {
+					ls.EgressBitrate += sub.Bitrate
+				}
+			}
+		})
+		lr.Shares = append(lr.Shares, ls)
 	}
 	return lr
 }
 
 // peerSink is the MediaSink of one MediaPeer (01 §15.2). Its methods never block: they post the event to the
 // connection's actor, which drops the events of a peer that is no longer the connection's (after a room.leave or a
-// join elsewhere). The server→client notifications go out as they are; README S40 adds the share lifecycle
-// (ShareMedia) and ends a share on codec_not_supported.
+// join elsewhere). The server→client notifications go out as they are: sub offers, candidates, pub restart
+// requests, subscribe.status, quality.hint and errors. ShareMedia drives the share lifecycle (share.go), and an
+// error with scope share is acted on as well: codec_not_supported ends its share.
 //
 // A notification is encoded before it is posted, on the caller's goroutine, so the actor never reads the slices,
 // maps or pointers of the caller's value (PCOffer.Tracks, QualityHint.Encodings, PCICE.Candidate, Error.Params),
-// which the SFU may reuse once the call returns. Whatever the actor keeps of an event it handles itself
-// (ShareMediaEvent.Layers, README S40) must be copied the same way.
+// which the SFU may reuse once the call returns. What the actor keeps of an event it handles itself
+// (ShareMediaEvent.Layers, the Params of an error with scope share) is copied the same way.
 type peerSink struct {
 	c   *conn
 	seq uint64 // the connection's peerSeq when the peer was created
@@ -554,20 +578,31 @@ func (s *peerSink) SubscriptionStatus(st []protocol.SubscriptionStatus) {
 // QualityHint implements MediaSink: quality.hint.
 func (s *peerSink) QualityHint(h protocol.QualityHint) { s.forward(protocol.MessageTypeQualityHint, h) }
 
-// ShareMedia implements MediaSink. The share lifecycle it drives comes with README S40.
+// ShareMedia implements MediaSink: a media fact about a share that the connection publishes (conn.onShareMedia).
 func (s *peerSink) ShareMedia(shareID string, ev ShareMediaEvent) {
 	c := s.c
+	ev.Layers = slices.Clone(ev.Layers)
 	c.post(func() {
 		if c.currentPeer(s.seq) {
-			c.h.log.Warn("share media event not handled", slog.String("conn_id", c.id),
-				slog.String("share_id", shareID), slog.String("kind", ev.Kind.String()), slog.Any("err", errNotImplemented))
+			c.onShareMedia(shareID, ev)
 		}
 	})
 }
 
-// Error implements MediaSink: an error with scope pc or share goes out as a notification.
+// Error implements MediaSink: an error with scope pc or share goes out as a notification. One with scope share is
+// also acted on (conn.shareError): codec_not_supported ends its share.
 func (s *peerSink) Error(e protocol.Error) {
-	c, code := s.c, e.Code
+	c := s.c
+	if e.Scope == protocol.ErrorScopeShare {
+		e.Params = maps.Clone(e.Params)
+		c.post(func() {
+			if c.currentPeer(s.seq) {
+				c.shareError(e)
+			}
+		})
+		return
+	}
+	code := e.Code
 	s.post(protocol.MessageTypeError, e, func() { c.h.metrics.errorSent(code) })
 }
 

@@ -389,6 +389,7 @@ func (d *DirectSignaler) Close() {
 // RoomEvent is one call of the SFU's RoomEvents.
 type RoomEvent struct {
 	Kind   RoomEventKind
+	At     time.Time // when the call came
 	Room   sfu.RoomID
 	Share  sfu.ShareInfo  // ShareUpdated, ShareEnded
 	Reason sfu.EndReason  // ShareEnded
@@ -427,6 +428,7 @@ func (l *RoomEventLog) CodecPolicyChanged(room sfu.RoomID, p sfu.ProfileKey) {
 }
 
 func (l *RoomEventLog) add(ev RoomEvent) {
+	ev.At = time.Now()
 	l.mu.Lock()
 	l.events = append(l.events, ev)
 	l.mu.Unlock()

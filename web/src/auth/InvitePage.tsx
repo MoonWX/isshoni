@@ -21,6 +21,7 @@ import { Button, buttonClass } from '../ui/Button';
 import { AccountFields, checkAccount, type AccountValues } from './AccountFields';
 import { Actions, AuthForm, Prose, SmallPrint } from './AuthForm';
 import { useFragmentToken, type FragmentToken } from './fragmentToken';
+import { InAppBrowserBanner } from './InAppBrowserBanner';
 import { CheckFailed, CheckingLink, HaveAccount, LinkProblem, useFocusHeadingWhen } from './LinkStates';
 import { useLinkCheck } from './useLinkCheck';
 import { useLogout } from './useLogout';
@@ -168,6 +169,7 @@ function Invite({ token, clear }: FragmentToken) {
           : t('auth.invite.titleNoInviter', { server: invite.serverName })
       }
       lead={t('auth.invite.lead')}
+      banner={<InAppBrowserBanner inviteToken={token} />}
       footer={footer}
     >
       <AuthForm

@@ -15,8 +15,8 @@
 // Harness is a real sfu.SFU on a loopback netx.Transport (UDP, and on request the ICE-TCP listener and 04's 443
 // multiplexer, all on ephemeral ports of 127.0.0.1), without a hub: each joined Conn gets a DirectSignaler, which
 // records the Conn's sub offers and events and can answer the offers with a Viewer, and a RoomEventLog records the
-// SFU's RoomEvents. Publish runs a publish.Publisher's side of a pub negotiation, with its tracks bound to a share
-// (Bindings). The SFU's in-process integration tests (02 §17) are written on these.
+// SFU's RoomEvents with the time of each call. Publish runs a publish.Publisher's side of a pub negotiation, with
+// its tracks bound to a share (Bindings). The SFU's in-process integration tests (02 §17) are written on these.
 //
 // Later slices add the rest of the package from 02 §4 and §17 with the first test that needs each part: a FaultConn
 // under the Harness's UDP socket (README S57, S63), REMB from the rembsim model and a FaultConn rate limit (S84).

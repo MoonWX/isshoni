@@ -1,0 +1,25 @@
+.prose {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  text-wrap: pretty;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
+.actions svg {
+  flex: none;
+  width: 1rem;
+  height: 1rem;
+}
+
+/* Phones: the link is a full-width touch target. */
+@media (max-width: 30rem) {
+  .actions > * {
+    width: 100%;
+  }
+}

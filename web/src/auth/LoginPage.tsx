@@ -21,6 +21,7 @@ import { TextField } from '../ui/Field';
 import { PageSpinner } from '../ui/Spinner';
 import { AuthForm, SmallPrint } from './AuthForm';
 import { fieldCodes } from './formErrors';
+import { InAppBrowserBanner } from './InAppBrowserBanner';
 import { loginNoticeCode } from './loginNotice';
 import styles from './LoginPage.module.css';
 import { Notice } from './Notice';
@@ -101,6 +102,7 @@ export function LoginPage() {
   return (
     <CenteredPage
       title={t('auth.login.title', { server: info?.server.name ?? t('common.appName') })}
+      banner={<InAppBrowserBanner />}
       footer={<Trust />}
     >
       <AuthForm

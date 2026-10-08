@@ -1,0 +1,48 @@
+/* Over the whole stage; only the button takes clicks, so the stage's controls under the cover stay usable. */
+.cover {
+  position: absolute;
+  inset: 0;
+  z-index: var(--z-stage-controls);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-4);
+  pointer-events: none;
+}
+
+.tap {
+  display: inline-flex;
+  gap: var(--space-3);
+  align-items: center;
+  justify-content: center;
+  min-height: calc(var(--tap-target) + var(--space-4));
+  padding: var(--space-3) var(--space-5);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-medium);
+  line-height: var(--leading-tight);
+  color: var(--color-on-accent);
+  pointer-events: auto;
+  background-color: var(--color-accent);
+  border: 0;
+  border-radius: var(--radius-full);
+  box-shadow: var(--shadow-2);
+}
+
+.tap:hover {
+  background-color: var(--color-accent-hover);
+}
+
+/* On the stage's black the page's focus colour is too dark to see. */
+.tap:focus-visible {
+  outline-color: var(--color-on-stage);
+}
+
+.tap svg {
+  flex: none;
+  width: 1.5rem;
+  height: 1.5rem;
+}
+
+.pill {
+  border-radius: var(--radius-full);
+}

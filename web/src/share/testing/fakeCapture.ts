@@ -61,7 +61,7 @@ export function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void; r
   return { promise, resolve, reject };
 }
 
-/** The part of AudioContext the fake display uses. */
+/** The part of AudioContext the fake display and the Share click (levelAudio's primeLevelAudio) use. */
 export class FakeAudioContext {
   static instances: FakeAudioContext[] = [];
   state: AudioContextState = 'suspended';
@@ -85,10 +85,15 @@ export class FakeAudioContext {
     return { stream: new FakeMediaStream([this.track]) };
   }
 
-  resume(): Promise<void> {
+  readonly resume = vi.fn((): Promise<void> => {
     this.state = 'running';
     return Promise.resolve();
-  }
+  });
+
+  readonly suspend = vi.fn((): Promise<void> => {
+    this.state = 'suspended';
+    return Promise.resolve();
+  });
 
   close(): Promise<void> {
     this.state = 'closed';

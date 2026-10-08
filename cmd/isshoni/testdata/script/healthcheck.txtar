@@ -1,0 +1,82 @@
+# healthcheck exits only 0 or 1 (Docker reserves 2 in HEALTHCHECK). "fakeserver" serves a real admin socket with
+# fake accounts inside the test (fake_test.go); the script's listen.admin_socket points at it.
+
+# No server: exit 1, not the 4 of the other client commands, with the same message.
+exitcode 1 isshoni healthcheck
+! stdout .
+stderr '^isshoni is not running \(no server on .*admin\.sock\)$'
+exitcode 1 isshoni healthcheck --ready
+stderr '^isshoni is not running \(no server on .*admin\.sock\)$'
+
+fakeserver start
+exec isshoni healthcheck
+stdout '^ok$'
+! stderr .
+exec isshoni healthcheck --ready
+stdout '^ready$'
+! stderr .
+
+# The socket is found through --socket, --listen.admin-socket or the config; --socket wins.
+env SOCK=$ISSHONI_LISTEN_ADMIN_SOCKET
+env ISSHONI_LISTEN_ADMIN_SOCKET=$SOCKDIR/nobody-listens.sock
+exitcode 1 isshoni healthcheck
+stderr 'no server on .*nobody-listens\.sock\)$'
+exec isshoni healthcheck --socket $SOCK
+exec isshoni healthcheck --listen.admin-socket $SOCK
+exec isshoni healthcheck --listen.admin-socket /nowhere/admin.sock --socket $SOCK
+env ISSHONI_LISTEN_ADMIN_SOCKET=$SOCK
+
+# Alive but not ready: liveness passes, readiness fails and names the check that holds it back.
+fakeserver set tls pending
+exec isshoni healthcheck
+exitcode 1 isshoni healthcheck --ready
+! stdout .
+stderr '^isshoni healthcheck: not ready: tls: waiting: obtaining certificate for 203\.0\.113\.7$'
+
+# --wait polls until the server is ready (install.sh waits this way), or gives up when the time is over.
+fakeserver after 1s set tls ready
+exec isshoni healthcheck --ready --wait 30s
+stdout '^ready$'
+fakeserver set tls pending
+exitcode 1 isshoni healthcheck --ready --wait 1s
+stderr '^isshoni healthcheck: not ready: tls: '
+
+# --wait also covers a server that has not started yet.
+fakeserver stop
+fakeserver after 1s start
+exec isshoni healthcheck --wait 30s
+stdout '^ok$'
+
+# And a server that has bound its socket and goes away before it serves it (it failed in between, or it is
+# stopping). The try that waited for it is cut off: "not running", not a refusal, so --wait keeps trying.
+fakeserver stop
+fakeserver deaf
+fakeserver after 1s stop
+exitcode 1 isshoni healthcheck --wait 0
+stderr '^isshoni is not running \(no server on .*admin\.sock\)$'
+! stderr 'Permission denied'
+fakeserver deaf
+fakeserver after 1s start
+exec isshoni healthcheck --wait 30s
+stdout '^ok$'
+! stderr .
+
+# A server that shuts down is not healthy.
+fakeserver set shutting-down
+exitcode 1 isshoni healthcheck
+stderr '^isshoni healthcheck: the server is shutting down$'
+exitcode 1 isshoni healthcheck --ready
+stderr '^isshoni healthcheck: the server is shutting down$'
+
+# Permission denied prints the sudo message, and the exit code is still 1. Waiting would not help: it returns at once.
+fakeserver stop
+[peercred] fakeserver start -reject-peers
+[peercred] exitcode 1 isshoni healthcheck --ready --wait 30s
+[peercred] ! stdout .
+[peercred] stderr '^Permission denied on .*admin\.sock: run it with sudo \(sudo isshoni healthcheck --ready --wait 30s\)$'
+
+# Usage errors exit 1 too.
+exitcode 1 isshoni healthcheck --bogus
+exitcode 1 isshoni healthcheck --wait -5s
+stderr '^isshoni healthcheck: --wait -5s: want a duration of zero or more$'
+exitcode 1 isshoni healthcheck extra

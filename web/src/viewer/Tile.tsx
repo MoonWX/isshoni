@@ -1,17 +1,19 @@
 // A tile of the "others" list (05 §12.1, §12.6, §16.6): one share's video (the low layer, or the local preview of
 // a share this page publishes) with its sharer, what is shared, and how many watch. The main area is one <button>
-// named "Watch alex's window, 3 watching"; whatever else a tile gets (the speaker and watchers buttons, S47) sits
-// next to it, never inside.
-import { Eye } from 'lucide-react';
+// named "Watch alex's window, 3 watching". Next to it, never inside: the eye with the viewer count, which opens
+// the watchers popover (05 §12.6), and the speaker button, "Listen to alex" (05 §12.3).
 import { useId, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { Spinner } from '../ui/Spinner';
+import { SpeakerButton } from './AudioControls';
 import { useShareMedia, useViewer } from './context';
 import { ShareVideo } from './ShareVideo';
 import { badgeText, overlayText, shareTitle, shareView, shareWhat, sharerName, watchingText } from './shareView';
 import styles from './Tile.module.css';
+import { useVisibility } from './useVisibility';
 import type { ViewerShare } from './viewerStore';
+import { WatchersPopover } from './WatchersPopover';
 
 export interface TileProps {
   share: ViewerShare;
@@ -19,7 +21,7 @@ export interface TileProps {
   preview?: MediaStream | null | undefined;
   /** The user picked this tile (click, tap, Enter or Space). */
   onPick: (shareId: string) => void;
-  /** Controls next to the main area (S47: the speaker and watchers buttons). */
+  /** More controls next to the main area, after the watchers and speaker buttons. */
   actions?: ReactNode;
 }
 
@@ -28,6 +30,8 @@ export function Tile({ share, preview, onPick, actions }: TileProps) {
   const media = useShareMedia(share.id);
   const status = useViewer((s) => s.status[share.id]);
   const stateId = useId();
+  // The tile is shown: the layer policy gives it the low layer only while it is (05 §12.4).
+  useVisibility(share.id);
 
   const stream = share.local ? preview : undefined;
   const track = share.local ? undefined : media.video;
@@ -68,11 +72,8 @@ export function Tile({ share, preview, onPick, actions }: TileProps) {
         </span>
       </button>
       <div className={styles.aside}>
-        {/* The count is in the button's name too; S47 turns this into the watchers popover's button. */}
-        <span className={styles.watchers} aria-hidden="true">
-          <Eye className={styles.eye} />
-          {share.info.watchers.length}
-        </span>
+        <WatchersPopover share={share} />
+        <SpeakerButton share={share} />
         {actions}
       </div>
     </li>

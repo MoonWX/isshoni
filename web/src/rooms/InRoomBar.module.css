@@ -1,0 +1,58 @@
+/* A slim bar above another page's content: which room the tab is still in, and the two ways out of that. */
+
+.bar {
+  flex: none;
+  color: var(--color-text);
+  background-color: var(--color-surface-2);
+  border-bottom: var(--border-width) solid var(--color-border);
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: center;
+  min-height: var(--tap-target);
+  padding: var(--space-1) calc(var(--space-4) + var(--safe-right)) var(--space-1)
+    calc(var(--space-4) + var(--safe-left));
+  font-size: var(--text-sm);
+}
+
+.text {
+  display: flex;
+  flex: 1;
+  gap: var(--space-2);
+  align-items: center;
+  min-width: 0;
+}
+
+.room {
+  overflow: hidden;
+  font-weight: var(--weight-medium);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* "sharing", with the live dot: this tab still publishes. */
+.sharing {
+  display: inline-flex;
+  flex: none;
+  gap: var(--space-1);
+  align-items: center;
+  color: var(--color-danger);
+}
+
+.sharing::before {
+  width: 0.5rem;
+  height: 0.5rem;
+  content: '';
+  background-color: currentcolor;
+  border-radius: var(--radius-full);
+}
+
+/* Windows High Contrast: the bar's fill disappears, so its edge must stay visible. */
+@media (forced-colors: active) {
+  .bar {
+    border-bottom-color: CanvasText;
+  }
+}

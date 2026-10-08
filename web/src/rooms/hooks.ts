@@ -1,11 +1,13 @@
 // React's side of the room runtime (05 §3 "Layering rule": components read the stores and call the controllers,
 // never the WebSocket). Pages and components inside <AppProviders> use these hooks.
-import { useEffect } from 'react';
+import { useCallback, useEffect, useReducer, useSyncExternalStore } from 'react';
 import { useNavigate } from 'react-router';
 import { useStore } from 'zustand';
 
 import { useApp } from '../app/context';
+import type { ActiveShare } from '../platform/types';
 import type { ConnectionState } from './connection';
+import type { RoomSession } from './RoomSession';
 import type { RoomStoreState } from './roomStore';
 import { getRoomRuntime, type RoomRuntime } from './runtime';
 
@@ -30,6 +32,24 @@ export function useRoom<T>(selector: (s: RoomStoreState) => T): T {
 /** The path of a room's page (05 §5). */
 export function roomPath(roomId: string): string {
   return `/r/${encodeURIComponent(roomId)}`;
+}
+
+/** Whether a location's path is a room's page: there the page itself shows the session, elsewhere InRoomBar does. */
+export function isRoomPath(pathname: string): boolean {
+  return /^\/r\/[^/]+\/?$/.test(pathname);
+}
+
+/**
+ * The share this tab publishes (session.share), null while it shares nothing. Re-renders when the share starts or
+ * ends, and when it changes in place: a re-publish gives it a new shareId (01 §10.6), which ActiveShare reports as
+ * a state change (05 §8).
+ */
+export function useLocalShare(session: RoomSession): ActiveShare | null {
+  const subscribe = useCallback((onChange: () => void) => session.on('share', onChange), [session]);
+  const share = useSyncExternalStore(subscribe, () => session.share);
+  const [, changed] = useReducer((n: number) => n + 1, 0);
+  useEffect(() => share?.on('state', changed), [share]);
+  return share;
 }
 
 /**

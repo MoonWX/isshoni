@@ -225,8 +225,9 @@ func TestServeConfigErrors(t *testing.T) {
 		t.Errorf("bad flag value: exit %d, want 78", code)
 	}
 	// Commands that only talk to the server don't stop at config errors (the offline admin commands are the way out
-	// of a config the server refuses).
-	if code, _, stderr = runCLIEnv(t, []string{"ISSHONI_TLS_MODE=auto"}, "admin", "status"); code != exitRuntime || !strings.Contains(stderr, "not implemented") {
+	// of a config the server refuses): they go on to the admin socket, where no server answers in this test.
+	if code, _, stderr = runCLIEnv(t, []string{"ISSHONI_TLS_MODE=auto"}, "admin", "status"); code != exitUnreachable ||
+		!strings.HasPrefix(stderr, "isshoni is not running (no server on ") || strings.Contains(stderr, "needs a domain") {
 		t.Errorf("admin status with a bad config: exit %d, stderr %q", code, stderr)
 	}
 }

@@ -51,18 +51,23 @@ describe('uiStore', () => {
     expect(ui.getState().announcements.assertive?.text).toBe("You're live");
   });
 
-  it('holds the app-level screen, install and update flags', () => {
+  it('holds the app-level screen, install, update and sharing flags', () => {
     const ui = createUiStore();
+    expect(ui.getState()).toMatchObject({ screen: null, installAvailable: false, updateReady: false, sharing: false });
     ui.getState().showScreen({ kind: 'fatal', reason: 'account_disabled' });
     ui.getState().setInstallAvailable(true);
     ui.getState().setUpdateReady(true);
+    ui.getState().setSharing(true);
     expect(ui.getState()).toMatchObject({
       screen: { kind: 'fatal', reason: 'account_disabled' },
       installAvailable: true,
       updateReady: true,
+      sharing: true,
     });
     ui.getState().showScreen(null);
     expect(ui.getState().screen).toBeNull();
+    ui.getState().setSharing(false);
+    expect(ui.getState().sharing).toBe(false);
   });
 });
 
