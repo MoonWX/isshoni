@@ -1,6 +1,9 @@
 package sfu
 
-import "time"
+import (
+	"errors"
+	"time"
+)
 
 // Error codes (02 §6.3). They are stable and never sent on the wire: 01's sfuplane maps each one to a protocol
 // ErrorCode. A code is never renamed or reused.
@@ -36,7 +39,33 @@ type Error struct {
 	// RetryAfter is set for pc_rate_limited, busy (1 s) and probe_limit.
 	RetryAfter time.Duration
 
-	msg string // for logs only; never sent, never holds SDP, candidates or other client data
+	msg   string // for logs only; never sent, never holds SDP, candidates or other client data
+	cause error  // what Unwrap returns: ErrNotImplemented, or nil
+}
+
+// ErrNotImplemented is wrapped by the error of an API method that a later slice of the plan fills in (README §4
+// "Interfaces first"): the whole interface of 02 §6 is declared from the first core slice on, so adapters never
+// chase a moving one. The error itself is an *Error with CodeInternal that is not retryable, so 01's sfuplane needs
+// no special case. The sentinel goes away with the last such method.
+var ErrNotImplemented = errors.New("sfu: not implemented yet")
+
+// errNotImplemented returns the error of a method that the named README slice implements.
+func errNotImplemented(method, slice string) *Error {
+	return &Error{
+		Code:  CodeInternal,
+		msg:   method + " is not implemented yet (README " + slice + ")",
+		cause: ErrNotImplemented,
+	}
+}
+
+// errClosed is the error of every Conn method after Close, and of Join after SFU.Close.
+func errClosed(what string) *Error { return newError(CodeClosed, what+" is closed") }
+
+// errBusy is the error of a signal call that could not reach the Conn's actor in time (02 §5.4).
+func errBusy() *Error {
+	e := newError(CodeBusy, "the connection's command queue is full")
+	e.RetryAfter = busyRetryAfter
+	return e
 }
 
 // newError returns an *Error for code with the retryable flag of 02 §6.3 and a log message.
@@ -60,6 +89,9 @@ func (e *Error) Error() string {
 	}
 	return e.Code + ": " + e.msg
 }
+
+// Unwrap returns ErrNotImplemented for the error of a method that a later slice fills in, else nil.
+func (e *Error) Unwrap() error { return e.cause }
 
 // Is makes errors.Is(err, &sfu.Error{Code: sfu.CodeBadSDP}) match any *Error with that code.
 func (e *Error) Is(target error) bool {
