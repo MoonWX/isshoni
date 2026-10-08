@@ -1,5 +1,5 @@
 // `?focus=<shareId>` on the room page (05 §5, §12.2): the layout, inside a router, focuses that share once it is
-// live, waits up to 5 s for it, and then drops the parameter from the URL.
+// live, waits up to 5 s for it from the room's first snapshot, and then drops the parameter from the URL.
 import { act, render } from '@testing-library/react';
 import { createMemoryRouter, RouterProvider, type DataRouter } from 'react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -73,6 +73,35 @@ describe('?focus=<shareId>', () => {
   it('gives up after 5 s and drops the parameter all the same', async () => {
     syncRoom(viewer, room(CY), SELF);
     open('/r/lounge?focus=s_gone');
+    await flush(FOCUS_PARAM_WAIT_MS - 1);
+    expect(url()).toBe('/r/lounge?focus=s_gone');
+    await flush(1);
+    expect(url()).toBe('/r/lounge');
+    expect(state()).toMatchObject({ focusedShareId: 's_cy', focusMode: 'auto', pendingFocusParam: null });
+  });
+
+  it('keeps the link while the page is still joining: the 5 s start with the room’s first snapshot', async () => {
+    // A push link opened the app: the room page shows the layout before the session has a room.state.
+    open('/r/lounge?focus=s_bea');
+    await flush(FOCUS_PARAM_WAIT_MS + 1_000);
+    expect(url()).toBe('/r/lounge?focus=s_bea');
+    expect(state().pendingFocusParam).toBe('s_bea');
+
+    act(() => {
+      syncRoom(viewer, room(BEA, CY), SELF);
+    });
+    await flush();
+    // Not the newest share, which auto-focus would have shown.
+    expect(state()).toMatchObject({ focusedShareId: 's_bea', focusMode: 'manual', audibleShareId: 's_bea' });
+    expect(url()).toBe('/r/lounge');
+  });
+
+  it('drops a link whose share the room doesn’t have, 5 s after the room’s first snapshot', async () => {
+    open('/r/lounge?focus=s_gone');
+    await flush(FOCUS_PARAM_WAIT_MS + 1_000);
+    act(() => {
+      syncRoom(viewer, room(CY), SELF);
+    });
     await flush(FOCUS_PARAM_WAIT_MS - 1);
     expect(url()).toBe('/r/lounge?focus=s_gone');
     await flush(1);

@@ -3,7 +3,8 @@
 // components read it with useViewer() (viewer/context.ts).
 //
 // It holds the shares that have a tile, in tile order, with the focus state of autoFocus.ts (which also remembers
-// the shares that ended, so that a re-published share gets back the stage and the sound); the audio unlock state
+// the shares that ended, so that a re-published share gets back the stage and the sound), and whether a room.state
+// stands behind them (inRoom: the wait for a `?focus=` share starts with it, focusParam.ts); the audio unlock state
 // and volume (05 §10.3, written by audioOut.ts) and whether a tile's video was refused (videoPlayback.ts);
 // fullscreen and PiP (05 §12.5: fullscreen.ts, pip.ts), which tiles are in view (useVisibility.ts) and since when
 // the page is hidden (page.ts), all of which the layer policy reads (05 §12.4); what the server forwards per share
@@ -81,6 +82,11 @@ export type AudioUnlockState = 'locked' | 'playing' | 'blocked' | 'muted';
 export type SubMediaState = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'unreachable' | 'failed';
 
 export interface ViewerData extends FocusState<ViewerShare> {
+  /**
+   * The last syncRoom had a room.state: `shares` are that room's, also when it has none. False before the room's
+   * first snapshot (the page is still connecting or joining) and after the page left its room.
+   */
+  readonly inRoom: boolean;
   readonly audio: AudioUnlockState;
   /**
    * The browser refused to play a tile's (muted) video: iOS Low Power Mode. TapToStart then says "Tap to start
@@ -138,11 +144,11 @@ export interface ViewerActions {
   setMedia(media: SubMediaState): void;
   /**
    * Back to the state of a page that is in no room: no shares, auto-focus, nothing per share, no fullscreen or PiP,
-   * no memory of ended shares. (fullscreen.ts and pip.ts follow: they leave the browser's fullscreen and close its
-   * PiP window when the store says so.) Call it when the user leaves the room, not for a reconnect: after a welcome that was
-   * not resumed the room's snapshots keep going to syncRoom, so that re-published shares take over (01 §10.6).
-   * What belongs to the page stays: the volume, the audio unlock and the refused videos, the sub PC's state
-   * (SubscriberPC.close() resets that one) and the page's visibility.
+   * no memory of ended shares, `inRoom` false. (fullscreen.ts and pip.ts follow: they leave the browser's
+   * fullscreen and close its PiP window when the store says so.) Call it when the user leaves the room, not for a
+   * reconnect: after a welcome that was not resumed the room's snapshots keep going to syncRoom, so that
+   * re-published shares take over (01 §10.6). What belongs to the page stays: the volume, the audio unlock and the
+   * refused videos, the sub PC's state (SubscriberPC.close() resets that one) and the page's visibility.
    */
   reset(): void;
 }
@@ -162,6 +168,7 @@ function clamp01(v: number): number {
 function initialData(volume: number): ViewerData {
   return {
     ...initialFocusState<ViewerShare>(),
+    inRoom: false,
     audio: 'locked',
     videoBlocked: false,
     volume,
@@ -291,15 +298,18 @@ function pruned<T>(map: Readonly<Record<string, T>>, keep: ReadonlySet<string>):
 
 export function createViewerStore(opts: ViewerStoreOptions = {}): ViewerStore {
   return createStore<ViewerState>()((set, get) => {
-    const dispatchAll = (events: readonly FocusEvent<ViewerShare>[]): void => {
-      if (events.length === 0) return;
+    /** Runs the events through the reducer; `inRoom` is given by a snapshot, and stays as it is without one. */
+    const dispatchAll = (events: readonly FocusEvent<ViewerShare>[], inRoom?: boolean): void => {
       set((s) => {
+        const room = inRoom ?? s.inRoom;
         const before = focusOf(s);
         const after = events.reduce<FocusState<ViewerShare>>((state, event) => focusReducer(state, event), before);
-        if (after === before) return s;
+        // Nothing changed: the same state, so that nobody is told.
+        if (after === before) return room === s.inRoom ? s : { inRoom: room };
         const ids = new Set(after.shares.map((share) => share.id));
         return {
           ...after,
+          inRoom: room,
           visible: pruned(s.visible, ids),
           status: pruned(s.status, ids),
           frozen: pruned(s.frozen, ids),
@@ -312,7 +322,8 @@ export function createViewerStore(opts: ViewerStoreOptions = {}): ViewerStore {
       ...initialData(clamp01(opts.volume ?? 1)),
 
       syncRoom(room, self) {
-        dispatchAll(roomEvents(get().shares, room, self));
+        // One update: who waits for the room's first snapshot sees its shares with it.
+        dispatchAll(roomEvents(get().shares, room, self), room !== null);
       },
       dispatch(event) {
         dispatchAll([event]);
@@ -381,6 +392,7 @@ export function createViewerStore(opts: ViewerStoreOptions = {}): ViewerStore {
       reset() {
         set({
           ...initialFocusState<ViewerShare>(),
+          inRoom: false,
           fullscreen: false,
           pipShareId: null,
           visible: {},

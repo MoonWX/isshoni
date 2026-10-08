@@ -30,8 +30,10 @@
 // - While the room page shows the layout (ViewerLayout.tsx), each only where the platform can do it (05 §8):
 //   fullscreen (F, a double click or tap on the stage, its button; fullscreen.ts), picture-in-picture (pip.ts), the
 //   screen wake lock while a share is watched (wakeLock.ts), the keyboard (keyboard.ts: the tiles as one tab stop,
-//   the shortcuts and their dialog), `?focus=<shareId>` from the URL (focusParam.ts), what plays for the system's
-//   media notification (mediaSession.ts), and the one-time hint on iOS (IosHint.tsx).
+//   the shortcuts and their dialog), `?focus=<shareId>` from the URL (focusParam.ts: the share is waited for 5 s
+//   from the room's first snapshot, viewerStore.inRoom, so a link that opens the app cold is not dropped while the
+//   page joins), what plays for the system's media notification (mediaSession.ts), and the one-time hint on iOS
+//   (IosHint.tsx).
 // - When the page comes back (05 §12.8): iOS suspended it, and every video and the audio element are played
 //   again; a refusal shows TapToStart.
 //

@@ -29,6 +29,8 @@
 // - Letters are matched without Shift, so Caps Lock doesn't matter and Shift+F stays free. On a layout without
 //   Latin letters (Cyrillic, Greek, …) the key's position counts instead (KeyboardEvent.code). "?" and the digits
 //   are matched as characters, whatever keys the layout needs for them (AZERTY types digits with Shift).
+// - Not every `keydown` is a key press: Chrome's autofill and password-manager extensions dispatch a plain Event of
+//   that name on the field they fill. It has no `key`, and is no shortcut.
 
 export type ShortcutAction =
   /** Arrow keys, Home, End: move the keyboard focus among the tiles. */
@@ -46,7 +48,8 @@ export type MoveTo = 'next' | 'previous' | 'first' | 'last';
 
 /** The parts of a KeyboardEvent the map reads. */
 export interface KeyLike {
-  readonly key: string;
+  /** Absent on a `keydown` that is not a KeyboardEvent (see the rules above). */
+  readonly key?: string;
   /** The physical key ("KeyF"): what a letter shortcut goes by when `key` is not a Latin letter. */
   readonly code?: string;
   readonly shiftKey?: boolean;
@@ -67,27 +70,30 @@ const MOVES: Readonly<Record<string, MoveTo>> = {
 };
 
 /** The Latin letter of a key press, in lower case: the character it types, else the letter of its position. */
-function letterOf(e: KeyLike): string | null {
-  if (/^[a-z]$/i.test(e.key)) return e.key.toLowerCase();
+function letterOf(key: string, code: string | undefined): string | null {
+  if (/^[a-z]$/i.test(key)) return key.toLowerCase();
   // Only for characters outside ASCII: "é" on the 2 key or ";" where QWERTY has no letter are not shortcuts.
-  if (e.key.charCodeAt(0) < 128) return null;
-  const code = /^Key([A-Z])$/.exec(e.code ?? '');
-  return code?.[1]?.toLowerCase() ?? null;
+  if (key.charCodeAt(0) < 128) return null;
+  const position = /^Key([A-Z])$/.exec(code ?? '');
+  return position?.[1]?.toLowerCase() ?? null;
 }
 
 /** The action of a key press, or null when the key is not a shortcut (05 §12.7). */
 export function shortcutFor(e: KeyLike): ShortcutAction | null {
+  const { key } = e;
+  // Not a key press. This is the first check: attachShortcuts hears every keydown of the page, text fields included.
+  if (typeof key !== 'string') return null;
   if (e.ctrlKey === true || e.metaKey === true || e.altKey === true || e.isComposing === true) return null;
   const shift = e.shiftKey === true;
-  const to = MOVES[e.key];
+  const to = MOVES[key];
   if (to !== undefined) return shift ? null : { type: 'move', to };
   // A held key repeats: one press is one toggle.
   if (e.repeat === true) return null;
-  if (e.key === 'Escape') return { type: 'escape' };
-  if (e.key === '?') return { type: 'help' };
-  if (e.key.length !== 1) return null;
-  if (e.key >= '1' && e.key <= '9') return { type: 'focusNth', index: Number(e.key) - 1 };
-  switch (letterOf(e)) {
+  if (key === 'Escape') return { type: 'escape' };
+  if (key === '?') return { type: 'help' };
+  if (key.length !== 1) return null;
+  if (key >= '1' && key <= '9') return { type: 'focusNth', index: Number(key) - 1 };
+  switch (letterOf(key, e.code)) {
     case 'f':
       return shift ? null : { type: 'fullscreen' };
     case 'm':

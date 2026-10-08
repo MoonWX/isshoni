@@ -16,6 +16,7 @@ describe('viewerStore: defaults', () => {
       focusMode: 'auto',
       audibleShareId: null,
       ended: [],
+      inRoom: false,
       audio: 'locked',
       videoBlocked: false,
       volume: 1,
@@ -362,6 +363,31 @@ describe('viewerStore.syncRoom', () => {
     expect(store.getState().focusMode).toBe('auto');
   });
 
+  it('knows whether a room.state stands behind the shares (inRoom), and says it with them in one update', () => {
+    const store = createViewerStore();
+    const seen: [boolean, number][] = [];
+    store.subscribe((s) => seen.push([s.inRoom, s.shares.length]));
+
+    // A room without a share is a room: its first snapshot is what a `?focus=` link waits for.
+    store.getState().syncRoom(room(), SELF);
+    expect(store.getState().inRoom).toBe(true);
+    store.getState().syncRoom(room(), SELF); // nothing new: nobody is told
+    store.getState().syncRoom(room(shareInfo('s_a', 'u_bea', 1)), SELF);
+    store.getState().dispatch({ type: 'userFocus', shareId: 's_a' }); // an event without a snapshot leaves it
+    expect(store.getState().inRoom).toBe(true);
+    store.getState().syncRoom(null, SELF);
+    expect(store.getState().inRoom).toBe(false);
+    store.getState().syncRoom(null, SELF);
+    store.getState().syncRoom(room(shareInfo('s_b', 'u_cy', 2)), SELF);
+    expect(seen).toEqual([
+      [true, 0],
+      [true, 1],
+      [true, 1], // the pick
+      [false, 0],
+      [true, 1],
+    ]);
+  });
+
   it('uses an empty name for a sharer the snapshot does not list', () => {
     const store = createViewerStore();
     store.getState().syncRoom({ shares: [shareInfo('s_a', 'u_ghost', 1)], participants: [] }, SELF);
@@ -516,6 +542,7 @@ describe('viewerStore: actions', () => {
     store.getState().setMedia('connected');
     store.getState().setPageHidden(99);
 
+    expect(store.getState().inRoom).toBe(true);
     store.getState().reset();
     expect(store.getState()).toMatchObject({
       shares: [],
@@ -524,6 +551,7 @@ describe('viewerStore: actions', () => {
       audibleShareId: null,
       pendingFocusParam: null,
       ended: [],
+      inRoom: false,
       fullscreen: false,
       pipShareId: null,
       visible: {},

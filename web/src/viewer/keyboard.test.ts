@@ -104,6 +104,13 @@ describe('shortcutFor: the table of 05 §12.7', () => {
     expect(shortcutFor(key('D', { shiftKey: true, repeat: true }))).toBeNull();
     expect(shortcutFor(key('ArrowDown', { repeat: true }))).toEqual({ type: 'move', to: 'next' });
   });
+
+  it('is no shortcut without a key: a keydown that is not a KeyboardEvent has none', () => {
+    expect(shortcutFor({})).toBeNull();
+    expect(shortcutFor({ code: 'KeyF' })).toBeNull();
+    expect(shortcutFor(new Event('keydown') as KeyboardEvent)).toBeNull();
+    expect(shortcutFor(key(''))).toBeNull();
+  });
 });
 
 describe('isTextField', () => {
@@ -343,5 +350,28 @@ describe('attachShortcuts', () => {
     press(el('popover'), { key: 'Escape' });
     expect(run).not.toHaveBeenCalled();
     off();
+  });
+
+  it('ignores a keydown that is no key press: the plain Event that autofill and password managers dispatch', () => {
+    const run = vi.fn(() => true);
+    // A listener that throws doesn't stop dispatchEvent: the page gets an `error` event instead.
+    const errors = vi.fn<(e: ErrorEvent) => void>((e) => {
+      e.preventDefault();
+    });
+    window.addEventListener('error', errors);
+    const off = attachShortcuts({ run });
+    try {
+      const el = page('<input id="name"><button id="b"></button>');
+      for (const target of [el('name'), el('b'), document]) {
+        const e = new Event('keydown', { bubbles: true, cancelable: true });
+        target.dispatchEvent(e);
+        expect(e.defaultPrevented).toBe(false);
+      }
+      expect(errors).not.toHaveBeenCalled();
+      expect(run).not.toHaveBeenCalled();
+    } finally {
+      off();
+      window.removeEventListener('error', errors);
+    }
   });
 });

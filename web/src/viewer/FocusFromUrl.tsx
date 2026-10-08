@@ -2,6 +2,9 @@
 // (focusParam.ts), then dropped from the URL with a replace, so the Back button doesn't bring it back. ViewerLayout
 // renders this inside a router; it shows nothing. A link that arrives while the page is open (a notification's
 // click navigates the open tab) changes the location, and the new share is followed.
+//
+// The room page shows the layout while it is still joining, so this mounts before the room's shares are known:
+// the 5 s start with the room's first snapshot, and the parameter stays in the URL until then.
 import { useEffect, useEffectEvent } from 'react';
 import { useSearchParams } from 'react-router';
 
