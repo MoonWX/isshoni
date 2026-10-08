@@ -405,19 +405,46 @@ export const STATS_REPORT_INTERVAL_MS = 10_000;
 const int = (v: number | undefined): number | undefined => (v === undefined ? undefined : Math.round(v));
 
 /**
+ * The longest diagnostic string the server takes, in bytes of UTF-8 (maxStatsStringLen in
+ * internal/protocol/validate.go). One longer string fails the whole report, and the hub drops it without a word.
+ */
+const MAX_STATS_STRING_BYTES = 64;
+
+/**
+ * A browser's string cut to what the server takes. Decoder and encoder names do get longer: Chrome's software
+ * fallback is "FFmpeg (fallback from: ExternalDecoder (VideoToolboxVideoDecoder))", and a simulcast encoder lists
+ * the encoder of every layer. The names are ASCII in practice; anything else is cut between characters.
+ */
+function clip(v: string): string;
+function clip(v: string | undefined): string | undefined;
+function clip(v: string | undefined): string | undefined {
+  if (v === undefined) return undefined;
+  let bytes = 0;
+  let out = '';
+  for (const ch of v) {
+    const code = ch.codePointAt(0) ?? 0;
+    bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+    if (bytes > MAX_STATS_STRING_BYTES) break;
+    out += ch;
+  }
+  return out;
+}
+
+/**
  * A sample in 01's ClientStats shape, for the `stats` notification (05 §10.7's table). Go decodes most of these
- * fields into integers, so they are rounded here; `fps` stays a fraction.
+ * fields into integers, so they are rounded here; `fps` stays a fraction. The strings are cut to the server's
+ * limit: the sample itself (the overlay, __isshoni.stats()) keeps them whole.
  */
 export function toClientStats(sample: StatsSample, intervalMs: number = STATS_REPORT_INTERVAL_MS): ClientStats {
   const pcs = sample.pcs.map((p): PCStats =>
     compact({
       pc: p.pc,
       gen: p.gen,
-      state: p.state,
+      state: clip(p.state),
       rttMs: int(p.rttMs),
       outgoingBitrate: int(p.availableOutgoingBitrate),
-      candidateType: p.candidateType,
-      transport: p.transport,
+      candidateType: clip(p.candidateType),
+      transport: clip(p.transport),
     }),
   );
 
@@ -436,7 +463,7 @@ export function toClientStats(sample: StatsSample, intervalMs: number = STATS_RE
           width: int(v.frameWidth),
           height: int(v.frameHeight),
           freezeCount: int(v.freezeCount),
-          decoder: v.decoderImplementation,
+          decoder: clip(v.decoderImplementation),
           hwDecoder: v.powerEfficientDecoder,
           // 01's CodecKey names H.264 profiles only.
           codec: v.codec?.startsWith('h264/') === true ? v.codec : undefined,
@@ -467,14 +494,14 @@ export function toClientStats(sample: StatsSample, intervalMs: number = STATS_RE
     compact({
       shareId: o.shareId,
       kind: o.kind,
-      rid: o.rid,
+      rid: clip(o.rid),
       bitrate: Math.round(o.kbps * 1000),
       fps: o.framesPerSecond,
       width: int(o.frameWidth),
       height: int(o.frameHeight),
-      encoder: o.encoderImplementation,
+      encoder: clip(o.encoderImplementation),
       hwEncoder: o.powerEfficientEncoder,
-      qualityLimitation: o.qualityLimitationReason,
+      qualityLimitation: clip(o.qualityLimitationReason),
     }),
   );
 

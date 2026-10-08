@@ -201,6 +201,103 @@ describe('WatchersPopover', () => {
     expect(panel()?.style.bottom).toBe('');
   });
 
+  it('stays inside the viewport’s start edge on a phone: the first tile of the strip', async () => {
+    render(inViewer(<WatchersPopover share={watched('u_cy')} />));
+    vi.spyOn(document.documentElement, 'clientWidth', 'get').mockReturnValue(375);
+    vi.spyOn(document.documentElement, 'clientHeight', 'get').mockReturnValue(667);
+    const rect = (right: number) =>
+      ({ top: 560, bottom: 604, left: right - 44, right, width: 44, height: 44, x: right - 44, y: 560 }) as DOMRect;
+
+    // The eye ends 129px in: the panel's 10rem don't fit before it, so it starts at the viewport's edge.
+    const spy = vi.spyOn(eye(), 'getBoundingClientRect').mockReturnValue(rect(129));
+    await userEvent.click(eye());
+    expect(panel()).toHaveStyle({ left: '8px', bottom: '115px' });
+    expect(panel()?.style.right).toBe('');
+    expect(panel()?.style.maxWidth).toBe(''); // the stylesheet's: min(20rem, the viewport less the gaps)
+    await userEvent.click(eye());
+
+    // 200px in they fit: end-aligned again, and no wider than the room up to the start edge.
+    spy.mockReturnValue(rect(200));
+    await userEvent.click(eye());
+    expect(panel()).toHaveStyle({ right: '175px', maxWidth: '192px' });
+    expect(panel()?.style.left).toBe('');
+    await userEvent.click(eye());
+
+    // Exactly 10rem of room is enough.
+    spy.mockReturnValue(rect(168));
+    await userEvent.click(eye());
+    expect(panel()).toHaveStyle({ right: '207px', maxWidth: '160px' });
+    await userEvent.click(eye());
+    spy.mockReturnValue(rect(167));
+    await userEvent.click(eye());
+    expect(panel()).toHaveStyle({ left: '8px' });
+    expect(panel()?.style.right).toBe('');
+  });
+
+  it('is at most 20rem wide where there is room, and follows the page’s font size', async () => {
+    render(inViewer(<WatchersPopover share={watched('u_cy')} />));
+    vi.spyOn(document.documentElement, 'clientWidth', 'get').mockReturnValue(1000);
+    vi.spyOn(document.documentElement, 'clientHeight', 'get').mockReturnValue(800);
+    const rect = (right: number) =>
+      ({ top: 700, bottom: 744, left: right - 44, right, width: 44, height: 44, x: right - 44, y: 700 }) as DOMRect;
+    const spy = vi.spyOn(eye(), 'getBoundingClientRect').mockReturnValue(rect(900));
+    await userEvent.click(eye());
+    expect(panel()).toHaveStyle({ right: '100px', maxWidth: '320px' });
+    await userEvent.click(eye());
+
+    // A reader with a 20px root font: 10rem are 200px, so 192px of room are not enough anymore.
+    document.documentElement.style.fontSize = '20px';
+    try {
+      spy.mockReturnValue(rect(200));
+      await userEvent.click(eye());
+      expect(panel()).toHaveStyle({ left: '8px' });
+      expect(panel()?.style.right).toBe('');
+      await userEvent.click(eye());
+
+      spy.mockReturnValue(rect(900));
+      await userEvent.click(eye());
+      expect(panel()).toHaveStyle({ right: '100px', maxWidth: '400px' });
+    } finally {
+      document.documentElement.style.fontSize = '';
+    }
+  });
+
+  it('keeps its Escape from a modal dialog around it: the "Shares" sheet stays open', async () => {
+    render(
+      inViewer(
+        <dialog open aria-label="Shares">
+          <WatchersPopover share={watched('u_cy')} />
+        </dialog>,
+      ),
+    );
+    const sheet = screen.getByRole('dialog', { name: 'Shares' });
+    const onSheetKeyDown = vi.fn();
+    sheet.addEventListener('keydown', onSheetKeyDown);
+    await userEvent.click(eye());
+    const dialog = panel();
+    if (!dialog) throw new Error('no popover');
+
+    // A browser closes a modal <dialog> on Escape unless the keydown is cancelled (jsdom has no such close request).
+    const escape = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true });
+    act(() => {
+      dialog.dispatchEvent(escape);
+    });
+    expect(escape.defaultPrevented).toBe(true);
+    expect(onSheetKeyDown).not.toHaveBeenCalled();
+    expect(panel()).not.toBeInTheDocument();
+    expect(sheet).toContainElement(eye());
+    expect(eye()).toHaveFocus();
+
+    // Any other key is left alone.
+    await userEvent.click(eye());
+    const other = new KeyboardEvent('keydown', { key: 'a', bubbles: true, cancelable: true });
+    act(() => {
+      panel()?.dispatchEvent(other);
+    });
+    expect(other.defaultPrevented).toBe(false);
+    expect(panel()).toBeInTheDocument();
+  });
+
   it('is the stage’s "3 watching", too', async () => {
     const share = watched('u_alex', 'u_cy', 'u_dee');
     render(inViewer(<Stage share={share} />));

@@ -10,11 +10,15 @@
 //      └──── play() NotAllowedError ──────┼──┼──────────────────────────────────────────────────────────┘
 //                                         │  └── unmute ── muted ◄── user mutes (M key / button)
 //                                         └── later play() rejects (iOS interruption) → blocked
+//   blocked or locked ──the element's own `playing` event (the browser resumed it by itself)──► playing
 //
 // - The element is made when it is first needed (a track, or a tap), not by createAudioOut: a page that never
 //   plays sound has none.
 // - A swap keeps the state: `playing` stays `playing` while the new stream starts.
 // - A muted element keeps playing, so unmuting is instant; the audio subscription stays on (05 §12.4 rule 1).
+// - The state follows the element, not only this module's own play() calls: WebKit resumes interrupted media by
+//   itself when a phone call or Siri ends, after it refused the play() that the pause triggered. The `playing`
+//   event then takes "Tap to unmute" away again.
 // - navigator.audioSession.type is NOT changed: 'playback' could interrupt a voice call on the same phone.
 // createViewer() (services.ts) makes the page's AudioOut and gives it the audible share's track and the volume.
 import type { Logger } from '../lib/log';
@@ -105,6 +109,16 @@ export function createAudioOut(deps: AudioOutDeps): AudioOut {
     void play().catch(() => undefined);
   };
 
+  /**
+   * The element plays, whoever started it: this module's play(), or the browser resuming it by itself after an
+   * interruption during which it refused one (the state is `blocked` then, with nothing left to tap for).
+   */
+  const onPlaying = (): void => {
+    if (disposed || track === null || el?.paused !== false) return;
+    unlocked = true;
+    setState(muted ? 'muted' : 'playing');
+  };
+
   const element = (): HTMLAudioElement => {
     if (el) return el;
     const parent = deps.parent ?? document.body;
@@ -114,6 +128,7 @@ export function createAudioOut(deps: AudioOutDeps): AudioOut {
     el.volume = volume;
     el.muted = muted;
     el.addEventListener('pause', onPause);
+    el.addEventListener('playing', onPlaying);
     parent.append(el);
     return el;
   };
@@ -218,6 +233,7 @@ export function createAudioOut(deps: AudioOutDeps): AudioOut {
       track = null;
       if (el) {
         el.removeEventListener('pause', onPause);
+        el.removeEventListener('playing', onPlaying);
         el.srcObject = null;
         el.remove();
         el = null;

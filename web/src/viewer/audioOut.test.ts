@@ -1,6 +1,6 @@
 // audioOut with a fake media element (05 §19.1): one <audio> element per page, and the unlock state machine of
 // 05 §10.3: locked → blocked on NotAllowedError → playing after the tap; a swap keeps playing; mute and unmute; an
-// interruption that the browser doesn't let it recover from.
+// interruption that the browser doesn't let it recover from, and one that the browser ends by itself.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -94,8 +94,8 @@ describe('audioOut: the one element', () => {
 
 describe('audioOut: the unlock state machine (05 §10.3)', () => {
   it('locked → playing when the browser lets the assigned track play', async () => {
+    expect(state()).toBe('locked');
     out.setTrack(track());
-    expect(state()).toBe('locked'); // until play() settles
     await settle();
     expect(state()).toBe('playing');
     expect(out.element?.paused).toBe(false);
@@ -279,6 +279,59 @@ describe('audioOut: interruptions (05 §10.3, §12.8)', () => {
     media.policy = 'allow';
     await out.unlock();
     expect(state()).toBe('playing');
+  });
+
+  it('follows the element when the browser resumes it by itself after refusing a play()', async () => {
+    out.setTrack(track());
+    await settle();
+    // A phone call: the browser pauses the element and refuses the play() that the pause leads to.
+    media.policy = 'block';
+    out.element?.pause();
+    await settle();
+    expect(state()).toBe('blocked');
+
+    // The call ends and the browser plays the element again; this module called nothing.
+    media.policy = 'allow';
+    await out.element?.play();
+    expect(state()).toBe('playing');
+  });
+
+  it('a first play() that was refused counts as unlocked once the browser plays the element by itself', async () => {
+    media.policy = 'block';
+    out.setTrack(track());
+    await settle();
+    expect(state()).toBe('blocked');
+    out.setMuted(true);
+    expect(state()).toBe('muted');
+
+    media.policy = 'allow';
+    await out.element?.play();
+    expect(state()).toBe('muted'); // the user's mute stays
+
+    const plays = media.played.length;
+    out.setMuted(false);
+    expect(state()).toBe('playing');
+    expect(media.played.length).toBe(plays); // it plays already
+  });
+
+  it('ignores a `playing` event of an element that is paused or has no track', async () => {
+    media.policy = 'block';
+    out.setTrack(track());
+    await settle();
+    const el = out.element;
+    if (!el) throw new Error('no element');
+    el.dispatchEvent(new Event('playing')); // a late one: the element is paused
+    expect(state()).toBe('blocked');
+
+    out.setTrack(null);
+    expect(state()).toBe('locked');
+    media.policy = 'allow';
+    await el.play();
+    expect(state()).toBe('locked');
+
+    out.dispose();
+    el.dispatchEvent(new Event('playing'));
+    expect(state()).toBe('locked');
   });
 
   it('doesn’t fight something that keeps pausing it: the second pause within a second waits for a tap', async () => {

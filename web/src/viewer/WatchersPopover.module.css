@@ -60,7 +60,8 @@
 
 /*
  * Fixed, with its place set when it opens (WatchersPopover.tsx): a tile and the stage clip what they contain. It
- * is a panel of the page, not of the stage: what it inherits from the dark video area is set back.
+ * is a panel of the page, not of the stage: what it inherits from the dark video area is set back. placeAt() there
+ * knows the two widths below (MIN_WIDTH_REM, MAX_WIDTH_REM): change them together.
  */
 .panel {
   position: fixed;

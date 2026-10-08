@@ -136,6 +136,25 @@ describe('the stage’s sound controls (05 §10.3, §12.3)', () => {
     expect(within(toolbar()).queryByRole('button', { name: /^Listen here/ })).not.toBeInTheDocument();
   });
 
+  it('says whose share is heard: someone the room no longer lists is not "your own share"', () => {
+    const gone = shareInfo('s_gone', 'u_gone', 1); // no participant entry: the share has no owner name
+    const laptop = shareInfo('s_laptop', 'u_alex', 2, { connectionId: 'c_laptop' });
+    render(<ViewerLayout viewer={viewer} />);
+    watch(gone, laptop, CY);
+    expect(state().focusedShareId).toBe('s_cy');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Listen to Someone' }));
+    expect(state().audibleShareId).toBe('s_gone');
+    const here = within(toolbar()).getByRole('button', { name: "Listen here. You're listening to Someone now." });
+    expect(here).toHaveAttribute('title', "Listen here. You're listening to Someone now.");
+
+    fireEvent.click(screen.getByRole('button', { name: 'Listen to your share' }));
+    expect(state().audibleShareId).toBe('s_laptop');
+    expect(
+      within(toolbar()).getByRole('button', { name: "Listen here. You're listening to your own share now." }),
+    ).toHaveAttribute('title', "Listen here. You're listening to your own share now.");
+  });
+
   it('offers the sound of a share that got the stage without it', () => {
     const laptop = shareInfo('s_laptop', 'u_alex', 3, { connectionId: 'c_laptop' });
     render(<ViewerLayout viewer={viewer} />);

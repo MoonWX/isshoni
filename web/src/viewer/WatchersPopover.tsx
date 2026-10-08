@@ -4,10 +4,10 @@
 //
 // The panel is not ui/Popover: a tile and the stage clip what they contain, and that panel opens below its
 // trigger, which sits at their bottom edge. This one is `position: fixed`, placed from the trigger's rectangle
-// when it opens (above it when there is more room there), so nothing clips it; it stays a descendant of the
-// stage, so it shows in fullscreen too (05 §12.5). Like ui/Popover it takes focus when it opens and closes on Esc
-// (focus back to the eye), on a press outside and when focus leaves it; and, being fixed, when the page scrolls or
-// resizes under it.
+// when it opens (above it when there is more room there, and always inside the viewport), so nothing clips it; it
+// stays a descendant of the stage, so it shows in fullscreen too (05 §12.5). Like ui/Popover it takes focus when it
+// opens and closes on Esc (focus back to the eye; a sheet around it stays open), on a press outside and when focus
+// leaves it; and, being fixed, when the page scrolls or resizes under it.
 import { Eye } from 'lucide-react';
 import { useEffect, useId, useRef, useState, type CSSProperties } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -20,17 +20,33 @@ import styles from './WatchersPopover.module.css';
 /** The space between the trigger and the panel, and between the panel and the viewport's edge (px). */
 const GAP = 8;
 
-/** Where the panel goes: its end edge under (or over) the trigger's, inside the viewport. */
+/** The panel's smallest and largest width in rem (.panel in WatchersPopover.module.css). */
+const MIN_WIDTH_REM = 10;
+const MAX_WIDTH_REM = 20;
+
+/**
+ * Where the panel goes, inside the viewport: over or under the trigger, whichever has more room, with its end edge
+ * at the trigger's. Where its smallest width doesn't fit between the viewport's start edge and there (the first
+ * tile of a phone's strip), it starts at the viewport's start edge instead, and the stylesheet's max-width keeps
+ * it inside.
+ */
 function placeAt(trigger: HTMLElement): CSSProperties {
   const r = trigger.getBoundingClientRect();
-  const width = document.documentElement.clientWidth;
-  const height = document.documentElement.clientHeight;
-  const right = Math.max(GAP, width - r.right);
+  const root = document.documentElement;
+  const width = root.clientWidth;
+  const height = root.clientHeight;
+  const rem = Number.parseFloat(getComputedStyle(root).fontSize) || 16;
+  // What an end-aligned panel may take: from the gap at the viewport's start edge to its own end edge.
+  const room = Math.min(r.right, width - GAP) - GAP;
+  const across: CSSProperties =
+    room >= MIN_WIDTH_REM * rem
+      ? { right: Math.max(GAP, width - r.right), maxWidth: Math.min(MAX_WIDTH_REM * rem, room) }
+      : { left: GAP };
   const above = r.top;
   const below = height - r.bottom;
   return above > below
-    ? { right, bottom: height - r.top + GAP, maxHeight: Math.max(0, above - 2 * GAP) }
-    : { right, top: r.bottom + GAP, maxHeight: Math.max(0, below - 2 * GAP) };
+    ? { ...across, bottom: height - r.top + GAP, maxHeight: Math.max(0, above - 2 * GAP) }
+    : { ...across, top: r.bottom + GAP, maxHeight: Math.max(0, below - 2 * GAP) };
 }
 
 export interface WatchersPopoverProps {
@@ -70,6 +86,9 @@ export function WatchersPopover({ share, withText = false, className }: Watchers
     };
     const onKeyDown = (e: KeyboardEvent): void => {
       if (e.key !== 'Escape') return;
+      // This Escape closes the panel only: unless the keydown is cancelled, the browser also closes a modal
+      // <dialog> around it (the phone's "Shares" sheet), and the eye that takes the focus back with it.
+      e.preventDefault();
       e.stopPropagation();
       close();
       triggerRef.current?.focus();

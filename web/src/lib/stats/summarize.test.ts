@@ -493,4 +493,99 @@ describe('toClientStats (05 §10.7, 01 §8.11)', () => {
     const empty = toClientStats(summarize([sub([])], 5_000).sample);
     expect(empty).toEqual({ intervalMs: 10_000, pcs: [{ pc: 'sub', gen: 1, state: 'connected' }] });
   });
+
+  // The server takes strings of at most 64 bytes (internal/protocol/validate.go) and drops a report with a longer
+  // one whole.
+  const utf8Bytes = (v: string | undefined): number => new TextEncoder().encode(v).length;
+
+  it('cuts a long decoder or encoder name to the 64 bytes the server takes; the sample keeps it whole', () => {
+    // Chrome's software fallback, and a simulcast encoder that lists every layer's encoder.
+    const decoder = 'FFmpeg (fallback from: ExternalDecoder (VideoToolboxVideoDecoder))';
+    const encoder = 'SimulcastEncoderAdapter (VideoToolbox, VideoToolbox, VideoToolbox)';
+    expect(decoder).toHaveLength(66);
+    expect(encoder).toHaveLength(66);
+    const { sample } = summarize(
+      [
+        sub([videoIn({ decoderImplementation: decoder })]),
+        {
+          pc: 'pub',
+          gen: 1,
+          state: 'connected',
+          report: report({
+            id: 'O1',
+            type: 'outbound-rtp',
+            kind: 'video',
+            mid: '0',
+            rid: 'f',
+            bytesSent: 1,
+            encoderImplementation: encoder,
+          }),
+          shareOf: () => 's_mine',
+        },
+      ],
+      5_000,
+    );
+    expect(sample.shares['s_a']?.video?.decoderImplementation).toBe(decoder);
+    expect(sample.outbound[0]?.encoderImplementation).toBe(encoder);
+
+    const stats = toClientStats(sample);
+    expect(stats.inbound?.[0]?.decoder).toBe('FFmpeg (fallback from: ExternalDecoder (VideoToolboxVideoDecoder');
+    expect(stats.inbound?.[0]?.decoder).toHaveLength(64);
+    expect(stats.outbound?.[0]?.encoder).toBe('SimulcastEncoderAdapter (VideoToolbox, VideoToolbox, VideoToolbo');
+    expect(stats.outbound?.[0]?.encoder).toHaveLength(64);
+  });
+
+  it('cuts every string of a report, and leaves one of exactly 64 bytes alone', () => {
+    const long = 'x'.repeat(65);
+    const fits = 'y'.repeat(64);
+    const { sample } = summarize(
+      [
+        sub(
+          [
+            { id: 'CP9', type: 'candidate-pair', localCandidateId: 'L9', selected: true },
+            { id: 'L9', type: 'local-candidate', candidateType: long, protocol: long },
+            videoIn({ decoderImplementation: fits }),
+          ],
+          { state: long },
+        ),
+        {
+          pc: 'pub',
+          gen: 1,
+          state: 'connected',
+          report: report({
+            id: 'O1',
+            type: 'outbound-rtp',
+            kind: 'video',
+            mid: '0',
+            rid: long,
+            bytesSent: 1,
+            qualityLimitationReason: long,
+            encoderImplementation: fits,
+          }),
+          shareOf: () => 's_mine',
+        },
+      ],
+      5_000,
+    );
+    const stats = toClientStats(sample);
+    const cut = 'x'.repeat(64);
+    expect(stats.pcs[0]).toMatchObject({ state: cut, candidateType: cut, transport: cut });
+    expect(stats.inbound?.[0]?.decoder).toBe(fits);
+    expect(stats.outbound?.[0]).toMatchObject({ rid: cut, qualityLimitation: cut, encoder: fits });
+  });
+
+  it('counts bytes, not characters, and cuts between characters', () => {
+    const cases: [name: string, sent: string][] = [
+      ['é'.repeat(40), 'é'.repeat(32)], // 2 bytes each
+      [`a${'é'.repeat(40)}`, `a${'é'.repeat(31)}`], // 63 bytes: the next é would make 65
+      ['解'.repeat(30), '解'.repeat(21)], // 3 bytes each
+      ['🎬'.repeat(20), '🎬'.repeat(16)], // 4 bytes each, a surrogate pair in UTF-16
+    ];
+    for (const [name, sent] of cases) {
+      const { sample } = summarize([sub([videoIn({ decoderImplementation: name })])], 5_000);
+      const decoder = toClientStats(sample).inbound?.[0]?.decoder;
+      expect(decoder).toBe(sent);
+      expect(utf8Bytes(decoder)).toBeLessThanOrEqual(64);
+    }
+  });
 });

@@ -64,22 +64,21 @@ export function StageSound({ share }: StageSoundProps) {
   const { t } = useTranslation();
   const viewer = useViewerServices();
   const audibleId = useViewer((s) => s.audibleShareId);
-  const audibleName = useViewer((s) => {
-    const other = s.shares.find((x) => x.id === s.audibleShareId);
-    return other === undefined ? null : other.own ? '' : other.ownerName;
-  });
+  const audibleShare = useViewer((s) => s.shares.find((x) => x.id === s.audibleShareId));
   const muted = useViewer((s) => s.audio === 'muted');
   const volume = useViewer((s) => s.volume);
   // Asked once: iOS ignores `volume`, and a slider that does nothing is hidden (05 §10.3).
   const [adjustable] = useState(() => canSetVolume());
 
   const elsewhere = hasSound(share) && audibleId !== share.id;
+  // Nothing is heard, or the share that is: the user's own, or someone's (a name the snapshot may not list).
   let elsewhereLabel = t('viewer.sound.here');
-  if (elsewhere && audibleId !== null) {
-    elsewhereLabel =
-      audibleName !== null && audibleName !== ''
-        ? t('viewer.sound.elsewhere', { name: audibleName })
-        : t('viewer.sound.elsewhereOwn');
+  if (elsewhere && audibleShare) {
+    elsewhereLabel = audibleShare.own
+      ? t('viewer.sound.elsewhereOwn')
+      : t('viewer.sound.elsewhere', {
+          name: audibleShare.ownerName !== '' ? audibleShare.ownerName : t('viewer.someone'),
+        });
   }
   const showMute = audibleId !== null || muted;
 
