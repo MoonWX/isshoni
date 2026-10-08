@@ -1,0 +1,10 @@
+/* A share's video: the whole picture, never cropped (05 §12.1), on the stage's black. */
+
+.video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background-color: var(--color-stage);
+  pointer-events: none;
+}

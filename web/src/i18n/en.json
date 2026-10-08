@@ -68,6 +68,58 @@
       }
     }
   },
+  "viewer": {
+    "shares": "Shares",
+    "sharesButton": "Shares ({{count}})",
+    "watching_one": "{{count}} watching",
+    "watching_other": "{{count}} watching",
+    "you": "You",
+    "someone": "Someone",
+    "empty": "Nobody is sharing yet.",
+    "live": "You're live · {{watching}}",
+    "pick": "Pick a share to watch.",
+    "kind": {
+      "screen": "Screen",
+      "window": "Window",
+      "tab": "Tab"
+    },
+    "title": {
+      "screen": "{{name}}'s screen",
+      "window": "{{name}}'s window",
+      "tab": "{{name}}'s tab",
+      "ownScreen": "Your screen",
+      "ownWindow": "Your window",
+      "ownTab": "Your tab",
+      "labeled": "{{name}}: {{label}}"
+    },
+    "tile": {
+      "watch": "Watch {{title}}, {{watching}}",
+      "watchOwn": "Watch your share from another device, {{watching}}",
+      "preview": "Show your preview on the stage, {{watching}}"
+    },
+    "stage": {
+      "watching": "Now watching: {{title}}",
+      "preview": "Your preview: {{title}}",
+      "none": "Stage",
+      "controls": "Stage controls"
+    },
+    "state": {
+      "connecting": "Connecting…",
+      "stalled": "Connection unstable",
+      "codec": "Your browser is still getting its video decoder (Firefox does this once, about a minute). Retrying…",
+      "bandwidth": "Lower quality (your connection)",
+      "unavailable": "The sharer isn't sending this quality right now",
+      "reduced": "Lower quality"
+    },
+    "media": {
+      "unreachable": "Can't reach the server's media port. isshoni keeps trying.",
+      "test": "Test my connection"
+    },
+    "toast": {
+      "started": "{{name}} started sharing",
+      "watch": "Watch"
+    }
+  },
   "a11y": {
     "notifications": "Notifications",
     "dismiss": "Dismiss",
