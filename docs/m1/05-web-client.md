@@ -166,18 +166,23 @@ web/
    │                         push.ts, wakeLock.ts, displayMedia.ts, classify.ts, fakeDisplay.ts)
    ├─ protocol/              types.gen.ts · registry.gen.ts · api.gen.ts (tygo: 01's protocol; 03's and 04's REST DTOs) · signal-client.ts ·
    │                         codecs.ts · errors.ts · index.ts (01) · rest.ts · queryKeys.ts · invalidate.ts (05)
-   ├─ rooms/                 connection.ts · RoomSession.ts · roomStore.ts · RoomPage.tsx · RoomHeader.tsx ·
-   │                         PeoplePanel.tsx · RoomSwitcher.tsx · InRoomBar.tsx
-   ├─ viewer/                SubscriberPC.ts · mediaRegistry.ts · viewerStore.ts · layerPolicy.ts · autoFocus.ts ·
-   │                         audioOut.ts · ViewerLayout.tsx · Stage.tsx · Tile.tsx · TapToStart.tsx ·
-   │                         WatchersPopover.tsx · fullscreen.ts · keyboard.ts · useVisibility.ts
+   ├─ rooms/                 connection.ts (connectionStore, createConnection, the banner's rule) ·
+   │                         ConnectionBanner.tsx · runtime.ts (one connection and session per app) · hooks.ts ·
+   │                         RoomSession.ts · subscriptionSync.ts · roomStore.ts · roomEvents.ts · RoomPage.tsx ·
+   │                         RoomHeader.tsx · PeoplePanel.tsx · RoomSwitcher.tsx · InRoomBar.tsx
+   ├─ viewer/                SubscriberPC.ts · mediaRegistry.ts · viewerStore.ts · services.ts (createViewer, syncRoom,
+   │                         attachViewer) · context.ts · shareView.ts · watchToast.ts · layerPolicy.ts ·
+   │                         autoFocus.ts · audioOut.ts · ViewerLayout.tsx · Stage.tsx · Tile.tsx · ShareVideo.tsx ·
+   │                         TapToStart.tsx · WatchersPopover.tsx · fullscreen.ts · keyboard.ts · useVisibility.ts
    ├─ share/                 BrowserSharing.ts (SharingProvider) · PublisherPC.ts · presets.ts · encodings.ts ·
    │                         codecPrefs.ts · shareStore.ts · ShareButton.tsx · ShareSheet.tsx · ScreenAudioWarning.tsx ·
-   │                         SharePanel.tsx · LevelMeter.tsx · hints.ts
+   │                         notes.ts · elsewhere.ts · SharePanel.tsx · LevelMeter.tsx · hints.ts
    ├─ auth/                  LoginPage · InvitePage · SignupPage · PendingPage · ResetPage · AboutPage ·
-   │                         fragmentToken.ts · useMe.ts
+   │                         fragmentToken.ts · useMe.ts · session.ts (startSession, endSession) · logout.ts ·
+   │                         useLogout.ts · loginNotice.ts · the form pieces (AuthForm, AccountFields, PasswordField, …)
    ├─ setup/                 SetupPage (step 1) · WelcomePage (steps 2–3) · InviteLinkCard · QrCode
-   ├─ conntest/              probe.ts · runConnTest.ts · verdict.ts · fixText.ts · ConnTestPanel.tsx
+   ├─ conntest/              probe.ts · runConnTest.ts · verdict.ts · fixText.ts · links.ts · codes.json ·
+   │                         ConnTestPanel.tsx
    ├─ account/               AccountPage · DevicesPage · NotificationsPage · PushCard · InstallCard
    ├─ admin/                 AdminLayout · DashboardPage · UsersPage · ApprovalsPage · InvitesPage · RoomsPage ·
    │                         SettingsPage · AuditPage · DoctorPage
@@ -195,6 +200,17 @@ web/
 Components have a sibling `*.module.css` file (`Tile.tsx` + `Tile.module.css`); the tree above leaves them out. It
 also leaves out the entry module of each page folder: `rooms`, `auth`, `setup`, `account`, `admin` and `download`
 each have an `index.ts` that exports the folder's pages by name, which is how `router.tsx` finds them (§5).
+
+Three placements differ from what the names suggest (group 4):
+- `SubscriptionSync` is `rooms/subscriptionSync.ts`, not a viewer file: the session owns it (§11.1) and the viewer
+  only gives it the desired set (§12.4).
+- `classify.ts`, `displayMedia.ts` and `fakeDisplay.ts` are in `platform/browser/`, because only `platform/` may
+  touch `getDisplayMedia` (§8). Their tests are in `share/` (`share/classify.test.ts` and so on), the folder of the
+  slice that wrote them (S35).
+- A lazy page folder's `index.ts` exports only pages. Code that the main chunk needs from such a folder is imported
+  from its own file, never through `index.ts`, so that it doesn't pull the pages in: `auth/logout.ts`,
+  `auth/useLogout.ts`, `auth/session.ts`, `auth/useMe.ts`, `auth/fragmentToken.ts` and the form pieces that
+  `setup/SetupPage` and the account pages share.
 
 **Layering rule.** React components never touch `WebSocket` or `RTCPeerConnection`. Controllers (`RoomSession`,
 `SubscriberPC`, `PublisherPC`, `runConnTest`) and 01's `SignalClient` never import React. They talk through Zustand
@@ -324,10 +340,10 @@ page slice edits it. Each route names one page component and the folder it comes
 
 | Store | File | Holds | Written by |
 |---|---|---|---|
-| `connectionStore` | `rooms/connection.ts` | 01's `SignalState`, `welcome` (server version, limits, features, user, default room), `resumed`, `downSince`, `stopReason` | `SignalClient.onState` |
-| `roomStore` | `rooms/roomStore.ts` | `roomId`, `joinState`, the last `room.state` (participants, shares, `rev`), own `connectionId` and `userId` | RoomSession |
-| `viewerStore` | `viewer/viewerStore.ts` | `focusedShareId`, `focusMode` (auto, manual), `audibleShareId`, `audio` (locked, playing, blocked, muted), `volume`, `fullscreen`, `pipShareId`, `visible` per share, `pageHiddenSince`, `status` per share (from `subscribe.status`) | viewer components, RoomSession, SubscriberPC |
-| `shareStore` | `share/shareStore.ts` | local share state machine (§13.1), `preset`, `withAudio`, `picked` classification, latest `ShareParams`, `hints` | BrowserSharing, SharePanel |
+| `connectionStore` | `rooms/connection.ts` | `state` (01's `SignalState`), `welcome` (server version, limits, features, user, default room), `resumed`, `staleBuild`, `downSince`, `stopReason`, `shutdown`, `retryAt`, `rateLimited` (§7, §7.1) | `createConnection`, through the store's actions: `signalChanged(state, info)` from `SignalClient.onState`, `welcomed(w)` for every welcome, `serverRestarting()` for a REST 503 `server_shutdown` |
+| `roomStore` | `rooms/roomStore.ts` | `roomId` (the desired room), `joinState` (`idle`, `joining`, `joined`, `failed`), `joinError`, `room` (id and name, from the join's `ok`), `state` (the last `room.state`: participants, shares, `rev`), own `connectionId` and `userId`, `redirect` (the room the server sent the user to, §6.3) | RoomSession; the room page calls `clearRedirect()` |
+| `viewerStore` | `viewer/viewerStore.ts` | `shares` (the tiled ones, each with `own` and `local`, §12.2), `focusedShareId`, `focusMode` (auto, manual), `audibleShareId`, `pendingFocusParam`, `ended` (for re-published shares), `audio` (locked, playing, blocked, muted), `volume`, `fullscreen`, `pipShareId`, `visible` per share, `pageHiddenSince`, `status` per share (from `subscribe.status`), `media` (the sub PC's state, §10.1) | viewer components, `syncRoom` with every `room.state`, SubscriberPC |
+| `shareStore` | `share/shareStore.ts` | local share state machine (`phase`, §13.1), `preset`, `withAudio`, `picked` classification, latest `params` (`ShareParams`), `hint`, `error`, `hostId` | its own actions (`pick`, `confirm`, `cancel`, `dismiss`, `attach`), called by the Share buttons; the publisher (S46) for `starting` and after |
 | `uiStore` | `app/` | toasts, announcer queue, install availability, `updateReady` | many |
 | `prefsStore` | `app/prefs.ts` | persisted per device: `volume`, `lastRoomId`, `preset`, dismissed hints, `debug` | settings UI |
 
@@ -336,6 +352,15 @@ blocked). `lastRoomId` uses the key `isshoni.lastRoomId`, which 01 §10.5 reads 
 setup/invite/reset token, the reload guard, debug flags) use `platform.storage.session`. Media tracks are not kept in
 stores: `viewer/mediaRegistry.ts` maps `shareId → {video?, audio?: MediaStreamTrack}` with a subscribe API, and tiles
 read it through `useShareMedia(shareId)`.
+
+**How many of each** (group 4). `connectionStore` and `roomStore` are made by the room runtime, one per app
+(`getRoomRuntime(services)`, §7); React reads them with `useConnection(selector)` and `useRoom(selector)`
+(`rooms/hooks.ts`). The viewer's store and registry come from `createViewer()` (`viewer/services.ts`), once per
+page, and reach the components through `ViewerLayout`'s context (`useViewer`, `useShareMedia`). **`shareStore` is a
+module singleton**, `export const shareStore = createShareStore()`: M1 has one local share per page (§13.1), and the
+page's Share buttons share its flow. Tests make their own with `createShareStore()`, and `ShareButton` takes a
+`store` prop for them. The picked `MediaStream` is never in its state: it lives in the store's closure from the pick
+until `start` takes it, and the state holds only the classification (`picked`).
 
 ### 6.2 REST (TanStack Query)
 
@@ -448,20 +473,57 @@ timers therefore stays connected; 05 needs no keep-alive of its own.
 
 ```ts
 // src/rooms/connection.ts
-export function createConnection(platform: Platform, stores: Stores): SignalClient {
-  const { url, auth } = platform.signaling();            // auth: later (M2), bearer in hello.auth (01 D2)
+export interface Stores {                                // what the room's controllers write
+  connection: ConnectionStore; room: RoomStore; ui: UiStore; prefs: PrefsStore;
+  session?: RoomSession;                                 // set by the runtime once the session exists
+}
+export interface ConnectionOptions {
+  queryClient?: QueryClient;                             // a connection stopped for its session clears ['me'] in it
+  log?: Logger;
+  buildVersion?: string;                                 // default: this build's; tests set it
+}
+export function createConnection(platform: Platform, stores: Stores, opts: ConnectionOptions = {}): SignalClient {
+  const { url } = platform.signaling();                  // auth: later (M2), bearer in hello.auth (01 D2)
   const client = new SignalClient({
     url,
     client: platform.client,                             // 01 ClientInfo {kind:'web', version, os, browser}
     role: platform.role,                                 // 'full' if the platform can share, else 'viewer' (01 §6.3)
     caps: () => platform.capsNow(),                      // 01 detectCaps(), re-read on every (re)connect
     features: [],                                        // later: 'share.pause' (M2), 'layer.mid' (M5)
-    onResync: (w) => stores.session?.resync(w),          // RoomSession, §11.1
+    onResync: (w) => {
+      stores.connection.getState().welcomed(w);          // every welcome, before its `ready` reaches the store
+      if (reloadIfStale(w)) return undefined;            // §16.4: decided before the room is joined
+      return stores.session?.resync(w);                  // RoomSession, §11.1
+    },
+    buildVersion,
   });
-  client.onState((s, info) => stores.connection.setState(s, info));   // UI, §7.1
+  client.onState((state, info) => {
+    stores.connection.getState().signalChanged(state, info);   // UI, §7.1
+    // then: `stopped` with an error → where the user goes (§7.1); `ready` after a banner → announce "Reconnected"
+  });
   return client;
 }
 ```
+
+As S34 built it:
+- **Store actions, not `setState`.** `connectionStore` has three: `signalChanged(state, info)` mirrors one
+  `SignalClient` state change (it keeps `downSince`, `retryAt`, `rateLimited`, `shutdown` and `stopReason` right);
+  `welcomed(w)` stores every welcome; `serverRestarting()` marks an outage as a restart (§7.1).
+- **The third argument** is `ConnectionOptions`. With `queryClient`, a connection that the server stopped for its
+  session (`unauthenticated`, `session_revoked`, and any session-scope code this build doesn't know, 01 §12.3) shows
+  the error's text as a toast and sets `['me']` to `null` (`clearMe`), which sends guarded routes to
+  `/login?next=…` (§6.2). Without it only the stores change. `buildVersion` is what `welcome.serverVersion` is
+  compared with, here and in the `SignalClient` (01 §6.1).
+- **`createConnection` doesn't start the client.** The room runtime does (`rooms/runtime.ts`):
+  `getRoomRuntime(services)` makes, once per app, the two stores, the client and the `RoomSession`, and returns
+  `{signal, session, stores, start(), stop(), dispose()}`. The room page calls `useRoomSession(roomId)`
+  (`rooms/hooks.ts`), which makes `roomId` the desired room (`session.join`), then calls `start()`, and navigates
+  when `roomStore.redirect` is set. It never leaves the room on unmount (§11.1).
+- The runtime also wires what belongs to neither the client nor the session: 01's `invalidate` messages go to
+  `applyInvalidate` (§6.2); a REST call answered 503 `server_shutdown` (any attempt of a query or a mutation) calls
+  `serverRestarting()`; `['me']` becoming `null` stops the client and makes the session let go of its room (the net
+  under every way of being signed out: a logout in another tab, a 401, a revoked session); and it registers the
+  logout flow's `shares` and `signal` steps (§15.1).
 
 - **One connection per tab**, created on the first RoomPage mount and kept until logout or tab close (§11.1).
 - **Intentional leave**: 01's client closes with 1000 on `pagehide`; logout calls `stop()`. Both make the server skip
@@ -478,7 +540,7 @@ export function createConnection(platform: Platform, stores: Stores): SignalClie
 | `ready` with `staleBuild` | §16.4 (reload once) |
 | `stopped` (`unauthenticated`, `session_revoked`) | `/login?next=…` |
 | `stopped` (`account_disabled`) | Fatal screen "Your account was disabled" |
-| `stopped` (`protocol_unsupported`) | VersionMismatch (§16.4) |
+| `stopped` (`protocol_unsupported`, `client_outdated`) | VersionMismatch (§16.4) |
 | `stopped` (`too_many_connections`) | Fatal screen "Close other isshoni tabs" with Reload |
 | `stopped` (`replaced`) | nothing (another socket took over) |
 | `stopped` (`bad_message`) | Fatal screen with Reload |
@@ -486,6 +548,27 @@ export function createConnection(platform: Platform, stores: Stores): SignalClie
 
 "Retry now" calls 01's `SignalClient.retryNow()`. During a rate-limit wait (01 §10.2), `retryNow()` has no effect, and
 the button is disabled with the remaining seconds. The banner is an `aria-live="polite"` region.
+
+**Banner timing** (S34; `connectionBanner(state, now)` and `nextBannerChange` in `rooms/connection.ts`, both pure,
+rendered by `ConnectionBanner`):
+- The 2 s and the 30 s count from `downSince`, not from the current `backoff`: `downSince` is set by the first
+  `backoff` after the last `ready` (or after `start()`), stays through the attempts in between (`connecting`,
+  `handshaking`, the next `backoff`), and is cleared by `ready` and by `stopped`. So a server that stays down
+  shows one steady banner, not one that comes and goes with every attempt. The constants are
+  `RECONNECTING_AFTER_MS` (2000) and `UNREACHABLE_AFTER_MS` (30 000).
+- Nothing shows while `ready`, while `stopped` (the screens and the login page take over) and during the first
+  connect, before any `backoff`.
+- "Server restarting…" shows **at once**, without the 2 s wait, when the store knows of a shutdown: 01's
+  `server.shutdown`, or `serverRestarting()` while the connection is down (the socket can drop before it hears
+  `server.shutdown`; the call is ignored while `ready`, where the socket hears it itself, and while `stopped`). The
+  mark stays until the next `ready`. A server that isn't back 30 s after `downSince` gets the "Can't reach the
+  server" banner like any outage, because only that one has the Retry and Test buttons.
+- During a rate-limit wait the disabled Retry button counts the remaining seconds down
+  (`ConnectionBannerState.retryInSec`, from `retryAt`).
+- The live region is the banner's text alone, and it stays mounted while empty, so each text is heard when it
+  appears; the buttons are outside it (nobody wants the countdown read out). When the connection is `ready` again
+  after a banner, "Reconnected" goes to the app's announcer (§16.6), because a text that disappears is not heard.
+- "Test my connection" shows only when the banner is given `onTestConnection`.
 
 ---
 
@@ -717,11 +800,21 @@ outside `platform/` may read cookies or `location.origin` or build `/api` URLs b
 ### 10.1 `SubscriberPC`
 
 ```ts
+export interface SubscriberDeps {
+  platform: Pick<Platform, 'createPeerConnection'>;
+  signal: SubscriberSignal;                     // the SignalClient's state, welcome, notify, probe, onState and on
+  registry: MediaRegistry;
+  log: Logger;
+  store?: ViewerStore;                          // gets the PC's state as viewerStore.media
+  ui?: UiStore;                                 // shows the Fatal screen after two negotiation failures within 60 s
+}
 export class SubscriberPC {
-  constructor(deps: { platform: Platform; signal: SignalClient; registry: MediaRegistry; log: Logger });
-  readonly gen: number;
+  constructor(deps: SubscriberDeps);
+  readonly gen: number;                         // 0 while there is no PC
+  readonly state: SubMediaState;                // idle | connecting | connected | reconnecting | unreachable | failed
   handleOffer(o: PCOffer): Promise<void>;       // queued; higher gen → replace the PC; repeated neg → resend answer; new ice-ufrag = ICE restart (§9)
   handleIce(i: PCICE): Promise<void>;
+  handleError(e: WireError): void;              // 01's `error` payload, in scope `pc`, about the sub PC (§6.3)
   requestRestart(mode: RestartMode, reason: RestartReason): void;   // pc.restart {pc:'sub', gen, mode, reason}; reason 'disconnected' | 'failed'
   getStats(): Promise<RTCStatsReport | null>;
   close(): void;                                // closes the local PC; no message (room.leave closes the server side)
@@ -738,6 +831,37 @@ export class SubscriberPC {
   old mid; the registry replaces the entry.
 - Shares that end disappear from `room.state`; their tiles unmount and the registry entry is dropped. The client never
   removes transceivers itself.
+
+What S36 added to the class above (the rules are §9's; this is where they live):
+- **Deps by structure.** `platform` and `signal` are the parts the class uses, so tests pass a fake
+  `RTCPeerConnection` factory and a stand-in client. The room session makes the PC through its seam (§11.1) as
+  `new SubscriberPC({platform, signal, log, registry: viewer.registry, store: viewer.store, ui})`.
+- **`state` and `viewerStore.media`.** `idle`: no PC yet. `connecting`: the first PC isn't connected.
+  `connected`. `reconnecting`: it was connected and is being restarted or rebuilt. `unreachable`: 5 rebuilds
+  without connecting (§9's "Can't reach the server's media port", then one rebuild every 30 s). `failed`: two
+  negotiation failures within 60 s (the Fatal screen "Can't connect media", through `ui`). The PC's health is the
+  worse of `connectionState` and `iceConnectionState`.
+- **It hears its own errors.** While it has a PC, the class listens to the client's error notifications and to its
+  state itself; the session only routes `pc.offer` and `pc.ice`. `handleError` ignores other PCs, other scopes and
+  older `gen`s: `sdp_invalid` and `bad_request` are a negotiation failure (one rebuild; the second within 60 s is
+  fatal), and so is an offer that can't be applied locally; `stale_negotiation` is ignored; `rate_limited` repeats
+  the last restart request after `retryAfterMs` (1 s when the server names none), if it is still needed.
+- **A rebuild is asked for until it comes.** After its 10 s spacing (30 s once 5 didn't connect) a rebuild request
+  is repeated while the PC isn't connected. A rebuild asked for after a negotiation failure, or through
+  `requestRestart('rebuild', …)`, is repeated also while the PC stays connected, until the new PC's offer arrives:
+  such a PC takes no further offer. A rebuild that replaces a connected PC doesn't count towards `unreachable`. A
+  rebuild outranks a pending ICE restart.
+- **The registry follows `tracks`, not only `ontrack`.** After every applied offer the class brings the registry in
+  line with the offer's mapping: each mapped m-section's receiver track is its share's track, and what it had set
+  for a share that is no longer mapped is dropped. A transceiver that moves to another share within one offer
+  fires no `track` event, so `ontrack` alone would miss it.
+- **`close()` leaves the object usable.** It closes the local PC, takes its tracks out of the registry and resets
+  `gen` to 0; the next sub offer, of any `gen`, makes a new PC (after a room switch). After a `welcome` with
+  `resumed: false` the class closes itself the same way: the server has no sub PC for the new connection, and its
+  first offer is `gen` 1 again. A resumed `welcome` only sends what was recorded while signaling was down (the
+  stored answer, local candidates, a wanted restart).
+- Local candidates over 01's 512-byte limit are not sent; candidates and an answer that couldn't be sent while
+  signaling was down are kept (at most 64 candidates) and sent on `ready`.
 
 ### 10.2 Tile media and playback
 
@@ -851,7 +975,12 @@ in the debug overlay.
 
 ```ts
 export class RoomSession {
-  constructor(deps: { platform: Platform; signal: SignalClient; stores: Stores; log: Logger });
+  constructor(deps: { platform: Platform; signal: SignalClient; stores: Stores; log: Logger; media?: SessionMedia });
+  readonly subscriptions: SubscriptionSync;   // rooms/subscriptionSync.ts; the viewer gives it the desired set (§12.4)
+  readonly roomId: string | null;             // the desired room
+  readonly share: ActiveShare | null;         // the share this tab publishes; the M1 UI starts at most one
+  on(event: 'share', fn: (share: ActiveShare | null) => void): () => void;   // the local share started or is gone
+  onRoomEvent(tap: RoomEventTap): () => void; // sees room.events before they are announced
   join(roomId: string): Promise<void>;        // records the desired room; room.join when ready (ok is followed by room.state, 01 §7)
   leave(): Promise<void>;                     // stops local shares, pc.close {pub}, room.leave, closes the sub PC locally
   resync(w: Welcome): Promise<void>;          // 01 §10.5, called by the SignalClient's onResync
@@ -859,7 +988,67 @@ export class RoomSession {
   stopShare(): Promise<void>;
   dispose(): void;
 }
+
+// The seams (S34): rooms/ imports neither viewer/ nor share/, so it builds and tests without them.
+export interface SessionMedia {               // everything optional
+  createSubscriber?: (deps: SubscriberDeps) => SubscriberLike;   // viewer/: new SubscriberPC({...deps, registry, …})
+}
+export interface SubscriberDeps { platform: Platform; signal: SignalClient; log: Logger }
+export interface SubscriberLike {             // the part of SubscriberPC (§10.1) the session drives
+  handleOffer(o: PCOffer): Promise<void>;
+  handleIce(i: PCICE): Promise<void>;
+  close(): void;
+}
+export interface ShareRecovery {              // what a local share may add to ActiveShare (§8); each method optional
+  resync(ctx: ShareResyncContext): Promise<void>;
+  republish(): Promise<void>;
+  serverEnded(reason: EndReason | undefined): void | Promise<void>;
+}
+export interface ShareResyncContext { readonly welcome: Welcome; readonly roomId: string; readonly kept: boolean }
+export type RoomEventTap = (e: RoomEvent) => boolean | undefined;   // true: the tap announced it itself
 ```
+
+**Seams** (S34). The session ties the room's media to the room without importing it:
+- **`SessionMedia.createSubscriber`** makes the sub PC controller. The session calls it when the server's first sub
+  offer arrives, routes `pc.offer` and `pc.ice` with `pc: 'sub'` to it, and closes it when the server's side is
+  gone: `leave()`, a room switch, a `welcome` that wasn't resumed, a room-scope error, `dispose()`. It routes only
+  while it is in the room it wants. A `pc.offer` or `pc.ice` that arrives while a `room.join` is on its way, or
+  after a resumed `welcome` that still names another room, belongs to the MediaPeer that the join ends (01 §8.4)
+  and is dropped: a sub PC made from it would live on into the new room with the old `gen` and `neg`. Without the
+  seam the messages are ignored.
+- **`ShareRecovery`** is how a local share survives a reconnect. The session sees every `welcome`, `room.event` and
+  `room.state`, so only it can start these three transitions; share/'s in-page `ActiveShare` implements them
+  (`serverEnded` with the publisher, S46; `resync` and `republish` with the recovery slice, S81). Each is optional,
+  and without one the session falls back to stopping the share, which is always correct, just less kind.
+  - `resync(ctx)` runs after a `welcome`, once the session is in its room again. `ctx.kept` says whether the server
+    kept this connection's media: the `welcome` was resumed and the connection was still in `roomId`. Then: re-send
+    a pending pub offer (same `neg`), ICE-restart a pub PC that isn't connected, retry a `share.start` that failed
+    with `connection_lost` (same `ref`). `kept` is false after a `welcome` that wasn't resumed, and after a resumed
+    one that needed a `room.join` (joining gives the connection a new MediaPeer, 01 §8.4): the server then has
+    neither the share nor a pub PC, so `share.start {replaces, ref: new}` and a new pub PC with `gen` 1 (01 §10.6).
+    Without `resync`, a share that the server didn't keep is stopped.
+  - `republish()`: the first `room.state` after a resumed `welcome` doesn't list this share (it timed out while the
+    socket was down): publish it again with `replaces`. Without it the share is stopped.
+  - `serverEnded(reason)`: the server ended this share while signaling was `ready` (§13.1): `room.event
+    share.stopped` with its reason, or, with `reason` undefined, a newer `room.state` without it. Without it the
+    session calls `stop()`. A share that the page is stopping itself (`stopShare()`) never gets it.
+- **`onRoomEvent(tap)`** lets the viewer take an announcement over. Taps see every `room.event` of the session's
+  room, before the default toast, except the `share.stopped` of the local share (that one drives §13.1 and is never
+  announced). A tap that returns `true` has announced the event itself; the viewer's `createWatchToast` does that
+  for "bo started sharing [Watch]" (§12.2). Otherwise the session shows the default toast, unless the event is the
+  user's own or a `share.started` with `replaces`.
+- **Wiring.** `rooms/runtime.ts` passes the seams in (`createRoomRuntime(services, {media})`). The three folders
+  were built side by side in group 4, so until the room page plugs viewer/ and share/ in (§11.2),
+  `rooms/seams.test.ts` checks at compile time that `SubscriberPC`, `createWatchToast`, `syncRoom`, `attachViewer`
+  and share/'s `StartShare` fit them.
+
+**`SubscriptionSync` lives in `rooms/`** (`rooms/subscriptionSync.ts`, exported from `rooms/index.ts`), one per
+session as `session.subscriptions`. Its API is `set(wants)` (the complete desired set from the viewer's
+`layerPolicy`: every share not listed is `{off, off}`), `resend(kept)` (the session calls it after every `welcome`,
+once it is in its room again; with `kept`, as in `ShareResyncContext`, the re-send also turns off what the server
+still holds and the viewer no longer wants), `clear()` (the session left its room), `dispose()` and the `desired`
+getter. The batching rules are §12.4's. A `subscribe.update` answered `not_in_room` makes the session rejoin its
+room once per send run and then sends the full set, since leaving a room drops the subscriptions (01 §8.9).
 
 **Desired room.** `join(roomId)` first stores `roomId` as the desired room (the "memory" of 01 §10.5), before
 anything else. If signaling is `ready`, it sends `room.join`; otherwise it resolves when the next resync has joined,
@@ -890,7 +1079,22 @@ Other rules:
 - **`room.event`** drives toasts and `aria-live` only (01 §8.6): `participant.joined`/`left` and `share.started`/
   `stopped`, with the user's name. Events of the user's own id and `share.started` with `replaces` are not announced.
   `room.event share.stopped` of the own user is not announced as a toast, but when its `shareId` is a local share it
-  drives the share state machine (§13.1).
+  drives the share state machine (§13.1). The words are `rooms/roomEvents.ts`' (`room.event.*`): a
+  `participant.left` with reason `disconnected` (the grace ran out) reads "{name} disconnected", any other "{name}
+  left"; a `share.stopped` with reason `stopped`, `left` or none reads "{name} stopped sharing", any other "{name}'s
+  share ended". The name comes from the event, so it works after the person left the snapshot. An event kind this
+  build doesn't know is ignored (01 §8.13).
+- **A join the server refuses** stays in `roomStore` (`joinState: 'failed'`, `joinError`) for the room page to
+  render, and rejects `join()`'s promise; a lost connection never does (the next resync joins). `room_not_found`,
+  a room-scope error such as `room_closed`, and a room-scope code this build doesn't know send the UI to
+  `welcome.defaultRoomId` through `roomStore.redirect`, with a toast; when the room that failed is the default room
+  itself there is nowhere to go, and it shows as a failed join. `rate_limited` on a `room.join` is retried once
+  after `retryAfterMs`, `internal` and a request timeout once at once (§6.3).
+- **Leaving a room the server may still have the connection in.** After `leave()` or a room switch while offline,
+  the server keeps the connection in the old room with its MediaPeer, through the grace period too. A `room.join`
+  for the room the connection is already in only answers `ok` and keeps that MediaPeer (01 §8.4), whose page side
+  is gone. So the session remembers that room, and a join of the same room sends `room.leave` first; a `room.leave`
+  that fails there fails the join.
 - **Participant status** `reconnecting` dims the person in the people panel.
 
 ### 11.2 Room page layout
@@ -941,6 +1145,18 @@ you share.
 - **Re-published shares** (01 §10.6): when a new share's `replaces` names the focused or audible share and both have
   the same `userId`, focus, tile position and audio move to the new share.
 - The own share is never auto-focused and is never subscribed. Clicking it enlarges the local preview.
+- **"Own" and "local" are two things** (S36; `ViewerShare.own` and `ViewerShare.local`, set by `syncRoom` from
+  `room.state` and the page's `welcome`):
+  - **own**: a share of this user (`share.userId` is `welcome.user.id`), from this page or from another of the
+    user's tabs or devices. An own share is never focused automatically and never made audible by focus: a pick of
+    it moves the stage and leaves the sound where it was, because hearing one's own share from another device
+    would echo. The tile names the sharer "You".
+  - **local**: a share that this page publishes (`share.connectionId` is `welcome.connectionId`). Only a local
+    share is the "own share" of the bullet above: its tile and the stage show the capture's preview (the room page
+    passes the streams to `ViewerLayout` as `localPreviews`, by shareId), it is never subscribed, the speaker button
+    can't make it audible, and of the tile states only `stalled` applies to it.
+  - A share that is own but not local (the user also shares from another device) is watched like anyone's: it is
+    subscribed, its tracks come from the sub PC, and its speaker button works.
 - `autoFocus.ts` is a pure reducer `(state, event) → state` with events `shareLive`, `shareEnded`, `shareReplaced`,
   `userFocus`, `focusParam`, unit-tested.
 
@@ -960,7 +1176,8 @@ this "05 policy".
 ```ts
 import type { VideoLayer, AudioState, SubscriptionWant } from '../protocol/types.gen';
 export interface LayerInputs {
-  remoteShares: string[];                  // live or stalled, excluding own shares
+  remoteShares: string[];                  // live or stalled, excluding local shares (this page's own; an own
+                                           // share from another device is remote, §12.2)
   focused: string | null;
   audible: string | null;
   visible: Record<string, boolean>;        // IntersectionObserver, ≥ 10% visible
@@ -980,11 +1197,20 @@ Rules, in order:
 5. In fullscreen, every non-focused share → `off` (IntersectionObserver can't see that they're covered).
 6. Other shares: visible → `low`, not visible (off-screen, scrolled away, unmounted) → `off`.
 
-`SubscriptionSync` (in RoomSession) diffs the result against what it last sent and sends one `subscribe.update`
+`SubscriptionSync` (`rooms/subscriptionSync.ts`, owned by the RoomSession as `session.subscriptions`, §11.1) takes
+the result through `set(wants)`, diffs it against what the server acknowledged and sends one `subscribe.update`
 request with every changed share (at most 64 per message, 01 §13). Raising a layer is sent at once (debounced 150 ms to
 merge focus changes). Dropping to `off` because a tile left the viewport waits 1 s (no flapping while scrolling). The
 full desired set is re-sent after every `welcome` when it is non-empty, in chunks of at most 64 items (01 §8.9
 requires 1–64) (§11.1). `ok.ignored` ids are dropped from local state.
+
+As S34 built it: the 1 s wait is only for a share whose **one** change is video → `off` (its audio stays as the
+server has it); anything else that is pending goes after the 150 ms, and a set equal to the last one doesn't
+restart that debounce. `{off, off}` entries are never stored or sent for a share the server wasn't told about (it
+is the server's default). A failed batch isn't retried by itself: it waits for the next trigger (a `set()`, a
+timer, a `welcome`), except the request-scope actions of §6.3 (`rate_limited` once after `retryAfterMs`,
+`internal` once, `not_in_room` with one rejoin per send run). A request that the connection lost is not an error:
+the next `welcome` re-sends everything. The constants are `SUBSCRIBE_DEBOUNCE_MS` and `SUBSCRIBE_OFF_DELAY_MS`.
 
 ### 12.5 Fullscreen, PiP, wake lock
 
@@ -1090,6 +1316,43 @@ idle ─Share click─► picking ──cancelled──► idle
   sheet says "You're already sharing from another tab or device" with a **Stop it** button (`share.stop` on that
   share, allowed for the same user, 01 §4.1).
 
+How S35 built the first half of the machine (`share/shareStore.ts`; `idle`, `picking`, `confirming` and the
+hand-over to `start`):
+- **Actions.** `pick(picking, {preset, start})` follows a pick that the click handler already started: `picking` is
+  the promise of `platform.sharing.pick()`, called as the handler's first statement. `confirm(withAudio)` leaves
+  the warning, `cancel()` gives a pick up, `dismiss()` is `failed` → `idle`. `start` is the room session's
+  `startShare` (§11.1; the type is `StartShare`), which the room page gives each `ShareButton` as `onStart`. Each
+  action resolves with a `ShareFlowOutcome` (`cancelled`, `confirming`, `started` or `failed`), so the button that
+  asked can show its toast; the state has the rest. From `starting` on the publisher (S46) moves the machine
+  (`live`, `reconnecting`, `stopping`, `idle`, `failed`) and fills `params` and `hint` with `setState`.
+- **The flow belongs to the page, not to the button that was clicked: `attach(hostId)`.** The room page has two
+  Share buttons (§11.2), and the one in the empty state unmounts as soon as a friend starts sharing, possibly while
+  this user's picker or warning is open. So every mounted `ShareButton` attaches to the store as a host, under an id
+  of its own (React's `useId`), and detaches when it unmounts. `hostId` names the host attached longest, and that
+  button renders the `ScreenAudioWarning`, whichever one was clicked. A pick that hasn't started is cancelled only
+  when the last host detaches (the page is left): the capture must not outlive the UI that explains it. A share
+  that is `starting` or later is left alone.
+- **A capture that ends under the warning cancels the flow.** The browser's own "Stop sharing" bar is there from
+  the moment of the pick. While the warning shows, the store listens for `ended` on the picked video track; when it
+  fires there is nothing left to confirm, so the store releases the source and goes back to `idle`, and the dialog
+  closes. It stops listening once the share starts (the end of the capture is then the publisher's business,
+  §13.6) or the pick is given up.
+- **Picks that arrive late are released.** A source that resolves after `cancel()`, after a newer pick, or while a
+  share is already `starting` or later has its tracks stopped and starts nothing. "Pick something else" is `pick()`
+  from `confirming`: the current source is released first. When `start` rejects, the store releases the source and
+  goes to `failed`, unless the publisher has moved the machine on meanwhile.
+- **"Share without sound"** stops the audio track and takes it out of the stream at the click, before `start`.
+- **Focus** (§16.6). The sheet is unmounted while open, and its Share click disables the button that opened it, so
+  the focus would fall to `<body>`. When what a button's sheet started ends without a share (the sheet, the picker
+  or the warning was cancelled, the capture or the start failed), that button takes the focus back, unless the
+  focus has gone somewhere else meanwhile.
+- Until the share panel exists (S46), `ShareButton` reports how the flow ended: a failed capture or start as an
+  error toast, and the "no sound is shared" notes of §13.3 (`share/notes.ts`) as an info toast that stays 10 s.
+- "Already sharing from another tab or device" is `share/elsewhere.ts`: `findShareElsewhere(shares, {userId,
+  connectionId})` returns this user's share from another connection, in any status (a `starting` or `stalled` one
+  counts too: a second share would not replace it).
+- `BrowserSharing.start` and `PublisherPC` are declared and reject with `NotImplementedError` until S46.
+
 ### 13.2 `getDisplayMedia` options (plan values, feature-detected)
 
 ```ts
@@ -1130,6 +1393,11 @@ const options: DisplayMediaStreamOptions = {
 | `browser` | no | tab | none | Live, note "Tick 'Also share tab audio' to include sound" |
 | `monitor` | yes | screen | system | **Warning dialog** (below) |
 | `monitor` | no | screen | none | Live, note "No sound is shared" |
+
+A browser that reports no `displaySurface`, or a value this build doesn't know, is classified like `monitor` (S35):
+a whole screen is the widest capture, so sound that came with it gets the warning instead of slipping through as
+"just a window". The classification never reads the track label, which is a window title (01 §8.5).
+`PickedSource.warning` is `no-audio` for the three rows without sound.
 
 The warning (`ScreenAudioWarning`, a modal dialog): "Friends will hear everything on this computer, including your
 voice app (Discord, TeamSpeak…), so they'll hear themselves." One more line explains that browser screen sharing can't
@@ -1194,9 +1462,14 @@ that only the browser can set:
 ### 13.6 `PublisherPC` and server hints
 
 ```ts
+export interface PublisherPCDeps {
+  platform: Pick<Platform, 'createPeerConnection'>;   // PCs come from the platform, so tests inject fakes (§8)
+  signal: SignalClientLike;                           // ShareContext.signal: the client by its structural type (§8)
+  log: Logger;
+}
 export class PublisherPC {
-  constructor(deps: { platform: Platform; signal: SignalClient; log: Logger });
-  readonly gen: number;
+  constructor(deps: PublisherPCDeps);
+  readonly gen: number;                          // 1 for the first pub PC, + 1 on every rebuild
   addShare(shareId: string, stream: MediaStream, params: ShareParams, preset: Preset): Promise<void>;
   removeShare(shareId: string): Promise<void>;   // stops its transceivers; re-offers, or pc.close when none are left
   applyParams(shareId: string, p: Partial<ShareParams>): Promise<void>;  // encodings → setParameters; codec or
@@ -1212,6 +1485,12 @@ export class PublisherPC {
 
 - One pub PC per connection, created on the first share. The protocol allows several shares per user (01: up to
   `limits.maxSharesPerUser`); the UI offers one, and the class already keeps a `Map<shareId, {transceivers, params}>`.
+- **Deps types** (S35 declared the class; S46 writes its behaviour). `PublisherPC` takes what a `SharingProvider`
+  has, not the whole app: `signal` is the `SignalClientLike` of `ShareContext` (§8), not the `SignalClient` class,
+  and `platform` is only its `createPeerConnection`. `BrowserSharing` is built the same way
+  (`BrowserSharingDeps {capture(opts), platform}`): `platform/browser/displayMedia.ts` `createBrowserSharing()` hands
+  it the picker (`pickDisplayMedia`) and the `RTCPeerConnection` factory, the two things that only `platform/` may
+  touch.
 - Offers carry `tracks` for every m-section that carries a share (01 §9 rule 4).
 - **`quality.hint`** (01 §8.10) for one of our shares: `encodings` → `setParameters` within 1 s; `codec` → re-order the
   codec preferences with that profile first and re-offer (same `gen`, `neg + 1`); Chrome switches encoders with a
@@ -1305,9 +1584,30 @@ export interface ConnTestResult {
     publicIpKnown: boolean;                   // derived: server.publicIp non-empty
     publicIpPrivate: boolean;                 // derived: server.publicIp empty, private or loopback (the IP itself isn't kept)
   };
+  retryAfterSec?: number;                     // S37: the longest Retry-After (s) of the probes the server rate-limited
 }
 export function runConnTest(platform: Platform, opts?: { signal?: AbortSignal }): Promise<ConnTestResult>;
 ```
+
+As S37 built it (`conntest/`):
+- **`retryAfterSec`** is an addition to the interface: when the server answers a probe with 429 and a wait, the
+  result carries the longest such wait in seconds, so the panel can respect `Retry-After`. The panel then reads
+  "Couldn't finish the test. Try again in {n} seconds." and keeps "Test again" disabled until the wait is over.
+  Without a wait the text is the plain "Try again in a minute".
+- **`server`** is absent when no probe got a 200 (every transport disabled or not tested). Its fields come off the
+  wire and are read defensively: a missing provider or NAT kind reads as `unknown`, a missing container as `none`,
+  `udpPort` is 0 when UDP is off, and an empty `tcpPorts` (Go's `null`) is `[]`. A provider or NAT id that this
+  build doesn't know (a newer server's) stays in the result as it came and is treated as `unknown` when the fix
+  text is chosen.
+- **`runConnTest` resolves with a result** also when probes failed, are disabled or couldn't run: those are
+  verdicts. It rejects only when there is nothing to show: the `signal` aborted (its reason), the server says the
+  user is signed out (the `ApiError`, so the 401 rule of §6.2 runs), or this browser can't make a data-channel
+  offer (`LocalError` `webrtc_failed`). When it rejects, the probes still running are stopped, and every probe
+  closes its PC whatever happens.
+- **`ProbeVerdict.error`**: `timeout` is no connection within 8 s (✗). A failed probe without an `error` is one
+  whose ICE or channel failed outright before the 8 s were over (✗ as well). `rate_limited` is a 429. `server` is
+  every other way the request didn't produce a usable answer: `bad_sdp`, `not_ready`, a 5xx, a proxy's error page,
+  no network, no reply within 10 s, a 2xx without an answer, or an answer the browser can't apply.
 
 Per probe:
 1. `pc = platform.createPeerConnection({iceServers: [], bundlePolicy: 'max-bundle'})`;
@@ -1328,6 +1628,19 @@ A probe whose `error` is `rate_limited` or `server` is **not tested**: it shows 
 verdict table and produces no fix text. If any probe is not tested, the panel shows "Couldn't finish the test. Try
 again in a minute." (respecting `Retry-After`). "Test again" is disabled while a run is in progress.
 
+**Not-tested probes and the status** (S37, `verdict.ts`). A row has four states: ✓, ✗, off (`disabled`) and "Not
+tested"; a transport without a verdict counts as not tested. With probes not tested, a status is still given when
+they can't change it, and only then:
+- green needs just UDP ✓, whatever the TCP probes did;
+- amber needs UDP ✗ (or off) and one TCP ✓;
+- red says that nothing works, so it needs every TCP probe to be ✗ or off; with one TCP probe not tested and none
+  ✓ there is no status;
+- with UDP not tested there is no status at all.
+
+With no status the panel shows the rows and the "Couldn't finish the test" line, and none of the fix text that
+goes with amber and red. The round trip shown is the UDP probe's when it worked, else the fastest working TCP
+probe's.
+
 | UDP | any TCP | Status | Text |
 |---|---|---|---|
 | ✓ | any | green | "Friends get the best quality." |
@@ -1338,6 +1651,19 @@ RTT labels: ≤ 80 ms good, ≤ 200 ms OK, above that "high latency". Every resu
 `ConnTestResult`, no IP addresses).
 
 **Fix text** (`fixText.ts`, admins only; catalog keys owned here):
+- **The ports in the texts are the server's** (S37). Every fix text takes `{{udpPort}}` and `{{tcpPort}}` from the
+  result: `server.udpPort`, and the first of `server.tcpPorts` that isn't 443. Each falls back to 7882 when the
+  server didn't say (no probe got a reply, or that listener is off). 443 and 80 are fixed. So a server with
+  `listen.ice_udp = ":50000"` gets "Open UDP port 50000", `sudo ufw allow 50000/udp` and "publishes
+  `50000:50000/udp`". The rows name the same ports ("Media over UDP (port N)"; just "Media over UDP" when the
+  server has UDP off or didn't say), and the 7882 written in the lines below stands for them.
+- **Which lines show.** Fix text needs an amber or red status and at least one probe that ran and failed. The lines
+  about opening the UDP port (the amber "Open UDP port N", the two host-firewall commands, Docker's published port,
+  the blocked-network line) need a UDP probe that **failed**: with UDP turned off in the server config the row
+  itself says so (`conntest.udpDisabled`), and opening a port that nobody listens on fixes nothing. The order is: no
+  public address (alone), "Open UDP port N" on amber, provider, host firewall, NAT, Docker, macOS Local Network,
+  blocked network. The `port_forward` line about testing from the server's own network is the exception: it shows on
+  every result, green included.
 - **No public address** (checked first): when `server.publicIp` is empty (`publicIpKnown` false) and every tested
   probe failed, the probe answers carried no IPv4 candidates (04 §7.7, 02 §7.6), so the firewall is not the problem.
   This happens with a domain or off-mode server in a Docker bridge or behind a router when STUN is blocked, or with
@@ -1397,7 +1723,60 @@ TCP ✓), `no_media` (all ✗), `no_public_ip` (all ✗ with `server.publicIp` e
   `/`.
 - **Logout**: stop local shares; `SignalClient.stop()` (close 1000); `POST /api/v1/auth/logout` (the server deletes this
   session and its push subscriptions, 03); then `PushSubscription.unsubscribe()` locally; `broadcastLogout()` (`app/session.ts`, §6.2);
-  `queryClient.clear()`.
+  forget the user in this tab's REST cache (`endSession`, which keeps `['info']`; not a bare `queryClient.clear()`,
+  see below).
+
+**The logout flow as S33 built it** (`auth/logout.ts`, no React; `auth/useLogout.ts` for components). The six
+steps and their order are the bullet's; four things are decided beyond it:
+- **The realtime parts register steps 1 and 2.** `auth/` never imports `share/` or `rooms/`. A controller calls
+  `addLogoutStep('shares' | 'signal', fn)` and gets the function that removes the step; every `shares` step runs
+  before every `signal` step, whoever registered first, so the share stops while signaling can still say
+  `share.stop`. A step may return an undo function; a step that throws is logged and doesn't stop the logout.
+  **The room runtime registers both** (`rooms/runtime.ts`, group 4): `shares` is `session.stopShare()`, and
+  `signal` is `signal.stop()` with `signal.start()` as its undo (the session keeps its desired room through a
+  `stop()`, so that start rejoins it). A client that wasn't running registers no undo and stays stopped. Without a
+  runtime (no room page was opened in this tab) there are no steps.
+- **A failed logout keeps the user signed in.** The session cookie is HttpOnly, so only the server can end the
+  session, and pretending otherwise would leave a shared computer signed in. When `POST /api/v1/auth/logout` fails
+  (no network, a 5xx), `logout()` runs the undo functions in reverse order and rejects; nothing else changes. A 401
+  `unauthenticated` there counts as success: the session is gone all the same. After the request has succeeded,
+  the last three steps always run. Step 4 makes no request (the server deleted its copy with the session) and is
+  waited for at most 3 s (`PUSH_UNSUBSCRIBE_TIMEOUT_MS`), so a push service that doesn't answer can't keep this tab
+  showing the user or the other tabs from hearing about the logout.
+- **Step 6 keeps `['info']`.** It is `endSession(queryClient)` (`auth/session.ts`), not `queryClient.clear()`:
+  `['me']` is set to `null`, every other cached resource of the user is removed, and the mutation cache is
+  cleared. What stays is `['me']` itself (set, not dropped: a cleared `['me']` would leave mounted guards showing
+  the old user until they re-render), `['info']` (public and seeded at boot; clearing it would make the login page
+  load it again) and the token pages' own `['auth', …]` link checks (they are about a link, not a user).
+- **`useLogout()` does not navigate.** It returns `{logout, pending}`; `logout()` resolves `true` when the session
+  has ended and `false` when it couldn't be ended, after an error toast (`auth.logout.failed` with the reason). A
+  second call while one runs resolves `false`. The redirect follows from `['me']` being `null`, by the rule of
+  §6.2: a route under `RequireAuth` goes to `/login?next=<path>`, a public page stays where it is. The user's
+  other tabs follow the same rule when the `BroadcastChannel` message reaches them. The account menu, the account
+  page, the devices page's "Sign out" on this browser's row and the invite page's "Sign out and create another
+  account" all call it.
+
+**Signing in** is the other moment the cached identity changes (`auth/session.ts` `startSession(queryClient)`,
+called by the login, invite, reset and setup forms after their 2xx): it removes what a previous user of the tab
+left in the cache and loads `['me']` again before the page navigates, because `RequireAuth` would bounce a cached
+"signed out" back to `/login`. If `GET /api/v1/me` then still says signed out, the browser didn't keep the session
+cookie (cookies blocked, or an embedded browser that drops them): the form shows `auth.sessionNotKept` instead of
+navigating. If `/me` can't be reached the page navigates anyway, and the guard shows Offline with "Try now".
+
+The forms (S33): a field code shows under its control (`fieldErrors.<field>.<code>`) and `username_taken` under the
+username; `rate_limited` and `server_busy` show a wait that counts down, with the submit button off until it is
+over; everything else shows above the form. The token pages check their link first and say why it doesn't work; a
+check that couldn't finish (no network, an answer that isn't the DTO) offers "Try again" instead of retrying
+silently. The login page asks the server about a user it only finds cached before it sends anyone on to `?next=`
+(`useConfirmedMe`), so a navigation to `/login` made because the session just ended shows the form and its notice.
+The notice travels in the navigation's location state (`loginState(code)`, `auth/loginNotice.ts`), never in the
+URL. A new link of the same kind pasted into a tab that already shows `/invite`, `/reset` or `/setup` only changes
+the fragment and reloads nothing, so `useFragmentToken()` stashes it and drops it from the address bar as boot
+step 0 does (§4), and the page starts over with the new token.
+
+**The in-app browser banner on the invite and login pages** (§16.3) is not S33's: `web/src/auth/` gets the lines
+that show it from S48 (README; the account part of W11). S33's pages ship without it, and
+`auth/fragmentToken.ts` already exports `readFragmentToken()` for the banner's Copy link on the invite page.
 
 ### 15.2 Account pages
 
@@ -1542,6 +1921,10 @@ the Home Screen app, open this link in Safari" ("in Chrome" on Android, "in your
 - Dismissal lasts for the tab (`platform.storage.session`, `isshoni.inAppBannerDismissed`).
 - While the banner shows, the `needs-install` sheet and card stay hidden; they appear once the banner is dismissed,
   or when the page is opened in a real browser.
+- Who writes it: the banner belongs to W11, not to the auth pages' slice. S33 built the invite and login pages
+  without it, so **S48 adds the banner's lines to `web/src/auth/`** (the invite and login pages, §15.1) next to its
+  own account pages; `platform.inAppBrowser()` (S27) and the invite token for the copied link
+  (`auth/fragmentToken.ts` `readFragmentToken()`, S33) are already there.
 - The same tip goes on the project site's `/guide/` (06 §10.2) and in the exit-test run book (06 §12.2).
 
 **Enable** (from a click): `Notification.requestPermission()` → `pushManager.subscribe({userVisibleOnly: true,
@@ -1728,7 +2111,10 @@ export default defineConfig({
 |---|---|
 | `lib/sdp.ts` | Opus stereo munge adds `stereo=1;sprop-stereo=1` once, idempotent, leaves other fmtp intact |
 | `share/codecPrefs.ts` | `ShareParams.codec` first (Chrome `640034` matches `h264/6400`, Safari `640c1f`), then the fixed order, RTX kept, nothing else; no H.264 → error |
-| `share/classify.ts` | the table in §13.3, all 6 rows |
+| `platform/browser/classify.ts` (test file `share/classify.test.ts`: S35's tests of the three `platform/browser` capture files live in `share/`, its folder) | the table in §13.3, all 6 rows; a missing, empty or unknown `displaySurface` is a whole screen, so its sound gets the warning |
+| `platform/browser/displayMedia.ts` (`share/displayMedia.test.ts`) | the §13.2 options (the two audio constraints only where `getSupportedConstraints()` lists them; no width or height); `getDisplayMedia` is called before `pick()` returns (nothing awaited first); each fallback applied once (`TypeError`, `OverconstrainedError`, both in a row), `NotAllowedError` → `null`, every other error and a stream without a video track → `capture_failed`; content hints; `release()` stops every track; no window title is kept or logged |
+| `platform/browser/fakeDisplay.ts` (`share/fakeDisplay.test.ts`) | the values of the seam's key (§19.3); on only at `localhost` and `127.0.0.1`, and the key isn't read on another host; an unknown value throws instead of opening the real picker; the canvas and tone stream, and its cleanup when the tracks stop |
+| `share/shareStore.ts` | the first half of §13.1: `idle` → `picking` → `confirming` → `starting`, cancel and dismiss; "Share without sound" stops and removes the audio track at the click; the capture ending under the warning cancels the flow; hosts (`attach`: the longest-attached shows the warning, the last detach gives up a pick that hasn't started); late and overtaken picks are released |
 | `share/encodings.ts` | `ShareParams.encodings` (wire order `f`, `q`) → complete `sendEncodings` in ascending order (`q`, `f`), every field set (`rid`, `active`, `maxBitrate`, `maxFramerate`, `scaleResolutionDownBy`); `scaleResolutionDownBy` from 1080p, 1440p, 2160p and 3440×1440 sources; later `setParameters` edits match by rid, never index (a reversed `getParameters()` order still updates the right layer); a hint's `active` flags applied per rid |
 | `share/hints.ts` | upload hint after 3 limited samples, rounding, clears after 10 s |
 | `viewer/layerPolicy.ts` | each rule in §12.4, including PiP while hidden, fullscreen, the 10 s hidden rule |
@@ -1738,7 +2124,7 @@ export default defineConfig({
 | `rooms/RoomSession.ts` (fake SignalClient) | resync after resumed and not-resumed welcomes (01 §10.5): pending offer re-sent, full `subscribe.update` only when non-empty and in chunks of 64, re-publish with `replaces`, stray server share stopped; `join()` before `ready` joins on the next resync; a resumed welcome with a missing or other `roomId` re-joins the desired room; own `share.stopped` (each reason) and the `room.state` fallback drive §13.1 |
 | `protocol/invalidate.ts` | each topic → its query keys |
 | `protocol/rest.ts` | both error envelopes parse to the same `ApiError`; `Content-Type` always set on unsafe methods |
-| `conntest/verdict.ts`, `fixText.ts` | status table; provider/nat/docker/macOS key selection (`server.container`, empty or private `publicIp`); empty `publicIp` with every tested probe ✗ → only `conntest.noPublicIp` (no provider, host firewall, Docker or macOS lines) and code `no_public_ip`; empty `publicIp` with a probe ✓ → the normal text; a disabled TCP row hidden, a disabled UDP row ✗ with `conntest.udpDisabled` and counted as UDP ✗; `rate_limited`/`server` probes "not tested" (no ✓/✗, out of the verdict, no fix text, the "Couldn't finish the test" line); the `port_forward` hint on a green result; non-admin text |
+| `conntest/verdict.ts`, `fixText.ts` | status table; provider/nat/docker/macOS key selection (`server.container`, empty or private `publicIp`); empty `publicIp` with every tested probe ✗ → only `conntest.noPublicIp` (no provider, host firewall, Docker or macOS lines) and code `no_public_ip`; empty `publicIp` with a probe ✓ → the normal text; a disabled TCP row hidden, a disabled UDP row ✗ with `conntest.udpDisabled` and counted as UDP ✗; `rate_limited`/`server` probes "not tested" (no ✓/✗, out of the verdict, no fix text, the "Couldn't finish the test" line), and a status with not-tested probes only when they can't change it; `retryAfterSec` from a 429; the ports in the rows, the fix texts and the commands are the server's, with 7882 only as the fallback; the UDP-port lines only for a UDP probe that failed, not for one that is off; the `port_forward` hint on a green result; non-admin text |
 | `sw/routes.ts`, `sw/push.ts` | strategy per URL class; payload → notification options for every known type; same-origin guard on click URLs; generic fallback |
 | `lib/ua.ts` | `inAppBrowser()` matches each known token (`FBAN`, `FBAV`, `Instagram`, `Line/`, `MicroMessenger`) and returns `null` for plain Safari, Chrome, iOS Chrome (`CriOS`), Firefox and Edge UAs |
 | `app/boot.tsx` (`stashFragmentToken`), `auth/fragmentToken.ts` | boot step 0 stores the token for `/setup`, `/invite` and `/reset` and removes the fragment via `replaceState` before the first fetch (`/info` included); other paths and empty fragments are left alone; `fragmentToken.ts` reads the stored token and clears it |
@@ -1792,8 +2178,30 @@ table below). This is the rule for new specs too. The harness needs no TLS: the 
 covered in Go (04 §17, a `servertest` case with TLS).
 
 CI runs Chrome stable headful under `xvfb-run` with a PulseAudio null sink (06's `e2e` job). Chrome flags:
-`--auto-select-tab-capture-source-by-title=isshoni-e2e-tone`, `--use-fake-ui-for-media-stream`,
-`--allow-loopback-in-peer-connection`, and `--autoplay-policy=no-user-gesture-required` except in the unmute spec.
+`--auto-select-tab-capture-source-by-title=isshoni-e2e-tone`, `--allow-loopback-in-peer-connection`, and
+`--autoplay-policy=no-user-gesture-required` except in the unmute spec.
+
+**Not `--use-fake-ui-for-media-stream`** (S35's finding, checked again for this write-back with headful Chrome 154
+on macOS and the options of §13.2; an earlier version of this section listed the flag). With the flag Chrome shows
+no picker and answers `getDisplayMedia` at once, and the tone tab is never what it picks, with or without
+`--auto-select-tab-capture-source-by-title` next to it:
+- a request with `displaySurface: 'browser'` gets **the calling tab itself** (also with `selfBrowserSurface:
+  'exclude'`);
+- every other request (`'window'`, which is what the app asks for; `'monitor'`; none) rejects with
+  `NotReadableError` ("Could not start video source"), which the app reports as `capture_failed`.
+
+So under that flag the real Share button fails. The flag exists for `getUserMedia` prompts, and the app never
+calls `getUserMedia`, so the harness leaves it out. With the auto-select flag alone, the app's own request
+(`displaySurface: 'window'`) captures the tone tab, reported as `displaySurface: 'browser'` with an audio track.
+Both were observed on the Mac only; S61 and S66 confirm the flag list under xvfb, where the tone-tab capture is
+an acceptance item.
+
+**A second pick needs `page.bringToFront()`.** After a real pick of the tone tab, a second `getDisplayMedia` from
+the same sharer page rejects with `InvalidStateError` ("Invalid state"; `capture_failed` in the app), and works
+again once the spec has called `page.bringToFront()` on the sharer page: the pick leaves the captured tab in
+front. The page can't tell by itself (under Playwright `document.visibilityState` stays `visible` and
+`hasFocus()` true), so a spec that shares twice from one page (stop and share again, "Pick something else" with the
+real picker) brings the page to the front before the second click.
 
 **Capture source**: `e2e/tone.html` (served through `context.route`, title `isshoni-e2e-tone`) draws an animated canvas
 with a frame counter and plays a 1 kHz WebAudio tone. The sharer opens it in its own context and clicks the real
@@ -1802,6 +2210,14 @@ picker) is why CI runs headful. For local headless runs, and for whole-screen ca
 when `sessionStorage['isshoni.e2e.fakeDisplay']` is set **and** the host is `localhost` or `127.0.0.1`,
 `displayMedia.ts` skips `getDisplayMedia` and returns a canvas + WebAudio stream, reporting `displaySurface` from the
 value (`browser`, `window`, `monitor`, `monitor+audio`; `1` means `browser` with audio) to `classify.ts`.
+
+As S35 built the seam (`platform/browser/fakeDisplay.ts`): the value is a surface, `browser`, `window` or
+`monitor`, alone (no audio track) or with `+audio` (a 1 kHz tone as the audio track); `1` is short for
+`browser+audio`. Any other value throws at the first pick, so a typo in a spec fails there instead of opening the
+real picker. The host must be exactly `localhost` or `127.0.0.1` (`[::1]` and names that merely contain
+`localhost` don't count), and on any other host the key is not even read. The stream is a 1280×720 canvas at
+30 fps with a moving bar and a frame counter; it stops drawing and closes its `AudioContext` when its tracks are
+stopped.
 
 The tone tab has no flash/beep sync marker, and no browser spec measures the A/V offset. The plan's 45 ms target is
 checked by S63's Go integration test (02 int. 5, flash-to-beep offset ≤ 5 ms through the SFU) and by the exit
@@ -1938,13 +2354,13 @@ demo is possible after W7.
 | W2 | **Platform + REST + boot**: `types.ts`, `BrowserPlatform` (client info, caps via 01's `detectCaps`, role, storage, apiFetch), `rest.ts`/`ApiError`, query client, `invalidate.ts`, boot sequence (`app/boot.tsx`, with step 0's fragment stash), `router.tsx` with every §5 route and the page-folder contract, the guards with the `next` guard, the `['me']` query and the logout `BroadcastChannel` (`app/guards.tsx`, `me.ts`, `session.ts`), Offline/NeedsHttps/NotSetUp/Unsupported/Fatal screens; the `check:i18n` error-code rule (§16.5) and an `errors.<code>` key in `en.json` for every `ErrorCode` and api `Code…` constant | M | W1, 01 P2, 03 DTOs | Unit tests for `ApiError` (both envelopes) and the topic map; MSW tests for each boot branch; `role` is `viewer` with a mobile UA; `check:i18n` fails when an error code has no `errors.<code>` key; the i18n unit test of §19.1 passes |
 | W3 | **Auth and setup step 1**: login, invite, signup, pending, reset, logout (calling W2's `broadcastLogout()`), `useMe.ts` and `fragmentToken.ts` on W2's `['me']` query and stashed token, About/trust model (`AboutPage` in `auth/`), the pages exported from `auth/index.ts`; `/setup` step 1 (§14.1, `SetupPage`, exported from `setup/index.ts`: fragment token, `setup/check`, create-admin form, `setup/complete`), navigating to `/` until W10 | M | W2, 03 auth | Component tests for each error code on each form; the fragment is removed before the first request (spy on fetch); a logout in tab A redirects tab B; `SetupPage` (MSW) reads the `/setup` fragment token, calls `setup/check`, and its form calls `setup/complete`, then navigates to `/` |
 | W4 | **Signaling wiring**: `connection.ts` with 01's `SignalClient`, `connectionStore`, the §7.1 UI states, stale-build reload | S | W2, 01 P10 | Against a `task dev` server the page reaches `ready`; killing the server shows "Reconnecting…" after 2 s and recovers; a fake `staleBuild` reloads once |
-| W5 | **Room session and shell**: `RoomSession` join/leave/resync, `roomStore`, `room.event` announcements, RoomPage layout, header, people panel, switcher (`showRoomList`), `InRoomBar`, root redirect | M | W4, 01 P4–P5, 03 rooms | Two browsers in Lounge see each other within 1 s; closing a tab removes its presence at once (close 1000) while cutting its network keeps it for the grace period; the switcher appears only when `showRoomList` |
+| W5 | **Room session and shell**: `RoomSession` join/leave/resync, `roomStore`, `SubscriptionSync` (in `rooms/`, with the session that owns it), the seams for viewer/ and share/ (§11.1), `room.event` announcements, RoomPage layout, header, people panel, switcher (`showRoomList`), `InRoomBar`, root redirect | M | W4, 01 P4–P5, 03 rooms | Two browsers in Lounge see each other within 1 s; closing a tab removes its presence at once (close 1000) while cutting its network keeps it for the grace period; the switcher appears only when `showRoomList` |
 | W6 | **Web sharer core**: ShareSheet, `pick()` with the §13.2 options and fallbacks, fake-display seam, `classify`, `ScreenAudioWarning`, `share.start`, `PublisherPC` (gen/neg, tracks), codec prefs, encodings from `ShareParams`, presets, stop and browser-stop | L | W5, 01 P7, 02 publish | `watch.spec`'s sharer half: `room.state` shows the share live with layers `high` and `low`; `warning.spec` passes; the tone-tab capture works in CI (xvfb) and the choice is recorded; unit tests for classify/codecPrefs/encodings |
 | W7 | **Viewer core**: `SubscriberPC`, media registry, Stage/Tile/ViewerLayout, auto-focus, audio-follows-focus via `audioOut`, TapToStart, watchers popover, stats collector core and the `window.__isshoni` debug handle | L | W5, W6, 02 subscribe | `watch.spec`, `focus-audio.spec` and `unmute.spec` pass |
-| W8 | **Layers, fullscreen, keyboard, mobile**: `layerPolicy` + `SubscriptionSync`, IntersectionObserver and visibility, fullscreen/PiP/wake lock, shortcuts, phone layouts, iOS handling, media session, `?focus=` | M | W7 | `layers.spec` passes; policy unit tests; manual M-IOS-1 and M-AND-1 viewing checks pass |
+| W8 | **Layers, fullscreen, keyboard, mobile**: `layerPolicy` feeding W5's `SubscriptionSync`, IntersectionObserver and visibility, fullscreen/PiP/wake lock, shortcuts, phone layouts, iOS handling, media session, `?focus=` | M | W7 | `layers.spec` passes; policy unit tests; manual M-IOS-1 and M-AND-1 viewing checks pass |
 | W9 | **Resilience**: §9 recovery table, `resync` (resumed and not), re-publish with `replaces` and focus carry-over, 60 s capture hold, Firefox codec wait (caps polling and `caps.update` only), `quality.hint` (codec switch and layer `active` flags) | L | W7, W6, 01 P9 | `reconnect.spec` (a)(b)(c) pass; manual M-FF-1 and M-WIFI pass; a `quality.hint{codec}` makes the sharer re-offer and viewers keep decoding |
 | W10 | **Setup wizard steps 2–3 + connection test**: `/admin/welcome` (`WelcomePage` steps 2–3, `setupWizardDone`), W3's `SetupPage` now navigates to `/admin/welcome?step=2`; `runConnTest`, verdicts, fix text, `InviteLinkCard` with QR; the `check:i18n` `CloudProvider`/`NATKind` rule (§16.5) with every `fix.firewall.<provider>` and `conntest.nat.<nat>` text | L | W3, 04 conntest, 02 probe | `setup.spec` passes; `check:i18n` fails when a `CloudProvider` or `NATKind` constant has no text; on a test VPS with UDP 7882 blocked by the provider firewall the page shows ✗ UDP / ✓ TCP with that provider's text; a non-admin sees no fix text |
-| W11 | **Account + PWA + Web Push**: account and devices pages, the `/download` placeholder (§15.4, `DownloadPage`, exported from `download/index.ts`), manifest, SW (`sw-plugin`, routes, push), update pill, install prompts, notifications flow incl. iOS Home Screen guidance, the in-app browser banner and preferences | L | W3, 03 push REST, 04 push wiring | `/download` renders the §15.4 placeholder; `pwa.spec` passes; SW unit tests pass; manual M-IOS-2 and M-AND-1 push checks pass |
+| W11 | **Account + PWA + Web Push**: account and devices pages, the `/download` placeholder (§15.4, `DownloadPage`, exported from `download/index.ts`), manifest, SW (`sw-plugin`, routes, push), update pill, install prompts, notifications flow incl. iOS Home Screen guidance, the in-app browser banner (its lines on the invite and login pages go into `web/src/auth/`, W3's folder: README S48) and preferences | L | W3, 03 push REST, 04 push wiring | `/download` renders the §15.4 placeholder; `pwa.spec` passes; SW unit tests pass; manual M-IOS-2 and M-AND-1 push checks pass |
 | W12 | **Admin pages**: dashboard, users, approvals, invites, rooms, settings, audit, doctor + bandwidth | L | W3, W10, 03/04 admin | `admin.spec` passes; the dashboard updates every 2 s while visible and stops when hidden |
 | W13 | **Hardening**: debug overlay with `stats.watch`, `stats` notifications, sharer hints and level meter, announcer, reduced motion, `check:i18n` unused-key warnings (its other rules came in W1, W2 and W10), VersionMismatch, `a11y.spec`, `version.spec` | M | W7, W9 | Those specs pass; a test shows `check:i18n` fails when a key is removed, and the script warns about unused keys; the overlay shows per-tile stats with no IPs; the upload hint appears under Chrome DevTools network throttling (manual) |
 | W14 | **CI and exit checks**: full e2e in CI (06), manual matrix §19.4 | M | all | CI green on a PR; the matrix filled in; the 06 §12 exit session passes (5 friends, 2 hours, no manual fixes; iPhone and Android watch) |
