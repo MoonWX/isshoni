@@ -509,6 +509,34 @@ func TestInternalErrors(t *testing.T) {
 	if err := e.svc.CheckSetupToken(ctx, newToken(setupTokenBytes), meta(ipB)); !api.IsCode(err, api.CodeInternal) {
 		t.Errorf("CheckSetupToken on a closed store: %v", err)
 	}
+	// Invites, registration, the approval queue and the settings (README S42).
+	admin := store.Actor{Kind: store.ActorUser, UserID: res.User.ID, Name: "Alex", IP: ipA}
+	if _, _, err := e.svc.CreateInvite(ctx, admin, InviteInput{}); !api.IsCode(err, api.CodeInternal) {
+		t.Errorf("CreateInvite on a closed store: %v", err)
+	}
+	if err := e.svc.RevokeInvite(ctx, store.CLIActor, "h6j8k0m2n4p6"); !api.IsCode(err, api.CodeInternal) {
+		t.Errorf("RevokeInvite on a closed store: %v", err)
+	}
+	if _, err := e.svc.CheckInvite(ctx, newToken(inviteTokenBytes), meta(ipC)); !api.IsCode(err, api.CodeInternal) {
+		t.Errorf("CheckInvite on a closed store: %v", err)
+	}
+	_, err = e.svc.Register(ctx, RegisterInput{InviteToken: newToken(inviteTokenBytes), Username: "Sam", Password: testPassword}, meta(ipC))
+	if !api.IsCode(err, api.CodeInternal) {
+		t.Errorf("Register on a closed store: %v", err)
+	}
+	if _, err := e.svc.Approve(ctx, store.CLIActor, res.User.ID); !api.IsCode(err, api.CodeInternal) {
+		t.Errorf("Approve on a closed store: %v", err)
+	}
+	if err := e.svc.Reject(ctx, store.CLIActor, res.User.ID); !api.IsCode(err, api.CodeInternal) {
+		t.Errorf("Reject on a closed store: %v", err)
+	}
+	if _, err := e.svc.RejectAll(ctx, store.CLIActor); !api.IsCode(err, api.CodeInternal) {
+		t.Errorf("RejectAll on a closed store: %v", err)
+	}
+	_, err = e.svc.UpdateSettings(ctx, store.CLIActor, map[string]json.RawMessage{"maxSharesPerRoom": json.RawMessage("4")})
+	if !api.IsCode(err, api.CodeInternal) {
+		t.Errorf("UpdateSettings on a closed store: %v", err)
+	}
 }
 
 // TestLaterMethodsSayNotImplemented: the methods of the later auth slices still answer with an error that names
@@ -525,25 +553,13 @@ func TestLaterMethodsSayNotImplemented(t *testing.T) {
 		}
 	}
 	check("LogoutEverywhere", e.svc.LogoutEverywhere(ctx, p, m))
-	_, err := e.svc.CheckInvite(ctx, "", m)
-	check("CheckInvite", err)
-	_, err = e.svc.Register(ctx, RegisterInput{}, m)
-	check("Register", err)
-	_, err = e.svc.ChangePassword(ctx, p, "", "", m)
+	_, err := e.svc.ChangePassword(ctx, p, "", "", m)
 	check("ChangePassword", err)
 	check("DeleteSelf", e.svc.DeleteSelf(ctx, p, "", m))
 	check("RevokeSession", e.svc.RevokeSession(ctx, p, "", m))
 	_, err = e.svc.RevokeOtherSessions(ctx, p, m)
 	check("RevokeOtherSessions", err)
 	check("RevokeDevice", e.svc.RevokeDevice(ctx, p, "", m))
-	_, _, err = e.svc.CreateInvite(ctx, store.CLIActor, InviteInput{})
-	check("CreateInvite", err)
-	check("RevokeInvite", e.svc.RevokeInvite(ctx, store.CLIActor, ""))
-	_, err = e.svc.Approve(ctx, store.CLIActor, "")
-	check("Approve", err)
-	check("Reject", e.svc.Reject(ctx, store.CLIActor, ""))
-	_, err = e.svc.RejectAll(ctx, store.CLIActor)
-	check("RejectAll", err)
 	_, err = e.svc.UpdateUser(ctx, store.CLIActor, "", UserChange{})
 	check("UpdateUser", err)
 	check("DeleteUser", e.svc.DeleteUser(ctx, store.CLIActor, ""))

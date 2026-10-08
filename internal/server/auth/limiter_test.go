@@ -469,6 +469,7 @@ func TestThrottleRates(t *testing.T) {
 		{"block log line", 1, time.Minute, func() verdict { return th.blockLog.take(ip) }},
 		{"login_failed audit", 600, 6 * time.Second, func() verdict { return th.loginFailedAudit.take(struct{}{}) }},
 		{"global throttled audit", 1, time.Hour, func() verdict { return th.globalThrottledAudit.take(struct{}{}) }},
+		{"signup_pending alert", 1, 10 * time.Minute, func() verdict { return th.signupAlert.take(struct{}{}) }},
 		// The two buckets of failed password checks: the service takes before the hash and refunds what was no failure.
 		{"auth-user-ip", 5, 2 * time.Minute, func() verdict { return th.authUserIP.take(userIPKey{"alex", ip}) }},
 		{"auth-user", 30, 2 * time.Minute, func() verdict { return th.authUser.take("alex") }},
