@@ -5,7 +5,8 @@
 //   (+ errors.local), fieldErrors, push, a11y. Each slice adds keys under its own namespaces only, in the file that
 //   has the namespace.
 // - The catalog is split by who downloads it:
-//     en.json             the main bundle: every namespace that code in the entry chunk uses;
+//     en.json             the main bundle: every namespace that code in the entry chunk uses, and those that
+//                         could be lazy but are not yet (05 §16.5 lists them, and what each still needs);
 //     lazy/<ns>.en.json   a namespace that only lazy page folders use (account, admin, setup), with the key paths
 //                         it has in the code (`{"admin": {…}}`). It is in the chunk of the folders that use it.
 //   A page folder whose pages use a lazy namespace imports lazy/<ns>.ts in its entry module (admin/index.ts:

@@ -44,7 +44,10 @@ function scanFiles(files: Record<string, string>): { imports: Imports; uses: Use
 
 const ADMIN = { name: 'admin', file: 'i18n/lazy/admin.en.json' };
 
-/** An app like this one: an eager room page, a lazy admin folder that loads its namespace in its entry module. */
+/**
+ * An app with both kinds of page folder: a room page that is imported eagerly (as this app had it before the room
+ * became a lazy folder too), and a lazy admin folder that loads its namespace in its entry module.
+ */
 const APP = {
   'main.tsx': "import { startApp } from './app/boot';\nstartApp();\n",
   'app/boot.tsx':

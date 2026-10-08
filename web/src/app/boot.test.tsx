@@ -18,6 +18,19 @@ import { CHANNEL_NAME } from './session';
 import { useApp } from './context';
 import { useInfo } from './info';
 
+/** Calls of the router's preloadRoute, which still does its work: what boot asks for when nothing else is given. */
+const preloadSpy = vi.hoisted(() => vi.fn<(pathname: string) => void>());
+vi.mock('./router', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./router')>();
+  return {
+    ...actual,
+    preloadRoute: (pathname: string) => {
+      preloadSpy(pathname);
+      actual.preloadRoute(pathname);
+    },
+  };
+});
+
 /** A tiny app for boot tests: shows the path and the seeded server name. */
 function AppReady() {
   const { queryClient } = useApp();
@@ -37,12 +50,19 @@ interface MountOptions {
   hash?: string;
   routes?: () => RouteObject[];
   platform?: Platform;
+  preload?: (pathname: string) => void;
 }
 
 let started: StartedApp | undefined;
 let uninstallRTC: (() => void) | undefined;
 
-function mount({ path = '/', hash = '', routes = testRoutes, platform = createTestPlatform() }: MountOptions = {}) {
+function mount({
+  path = '/',
+  hash = '',
+  routes = testRoutes,
+  platform = createTestPlatform(),
+  preload,
+}: MountOptions = {}) {
   const container = document.createElement('div');
   document.body.append(container);
   const history = { state: null, replaceState: vi.fn() };
@@ -55,6 +75,7 @@ function mount({ path = '/', hash = '', routes = testRoutes, platform = createTe
       offlineRetryMs: 60_000,
       createRouter: (r) => createMemoryRouter(r, { initialEntries: [path] }),
       routes,
+      ...(preload ? { preload } : {}),
     });
   });
   return { container, history, platform, started: started as StartedApp };
@@ -62,6 +83,7 @@ function mount({ path = '/', hash = '', routes = testRoutes, platform = createTe
 
 beforeEach(() => {
   uninstallRTC = installFakeRTC();
+  preloadSpy.mockClear();
 });
 
 afterEach(() => {
@@ -225,6 +247,102 @@ describe('boot branches (05 §4)', () => {
     // The login page of the auth/ folder (S33), with the server name that boot seeded from /info.
     expect(await screen.findByRole('heading', { name: 'Log in to Test server' })).toBeInTheDocument();
     expect(app.services).not.toBeNull();
+  });
+});
+
+describe('the first page’s code (05 §5: every page is in a lazy chunk)', () => {
+  /** Boot's requests and its preload, in the order they were made. */
+  function recorded(platform: Platform) {
+    const order: string[] = [];
+    const original = platform.apiFetch.bind(platform);
+    vi.spyOn(platform, 'apiFetch').mockImplementation((p, init) => {
+      order.push(`fetch ${p}`);
+      return original(p, init);
+    });
+    const preload = vi.fn((pathname: string) => {
+      order.push(`preload ${pathname}`);
+    });
+    return { order, preload };
+  }
+
+  it.each(['/', '/r/lounge', '/login'])('is asked for before /info, with the path: %s', async (path) => {
+    const platform = createTestPlatform();
+    const { order, preload } = recorded(platform);
+    mount({ path, platform, preload });
+    // Asked for by startApp itself: before the request, not after its answer.
+    expect(order).toEqual([`preload ${path}`, 'fetch /api/v1/info']);
+    expect(await screen.findByRole('heading', { name: 'app ready' })).toBeInTheDocument();
+    expect(preload).toHaveBeenCalledOnce();
+  });
+
+  it('is asked for once, however often /info has to be retried', async () => {
+    let calls = 0;
+    server.use(
+      http.get(apiPath('/api/v1/info'), () => {
+        calls++;
+        return calls < 3 ? apiError(503, { code: 'server_busy', retryAfter: 1 }) : HttpResponse.json(infoFixture());
+      }),
+    );
+    const platform = createTestPlatform();
+    const { preload } = recorded(platform);
+    mount({ path: '/r/lounge', platform, preload });
+    expect(await screen.findByRole('heading', { name: 'app ready' })).toBeInTheDocument();
+    expect(calls).toBe(3);
+    expect(preload).toHaveBeenCalledOnce();
+  });
+
+  it('is not asked for while the browser says it is offline: a failed import() may not be tried again', async () => {
+    const onLine = vi.spyOn(window.navigator, 'onLine', 'get').mockReturnValue(false);
+    try {
+      const platform = createTestPlatform();
+      const { order, preload } = recorded(platform);
+      mount({ path: '/r/lounge', platform, preload });
+      // Boot itself goes on: /info decides whether the server can be reached.
+      expect(await screen.findByRole('heading', { name: 'app ready' })).toBeInTheDocument();
+      expect(preload).not.toHaveBeenCalled();
+      expect(order[0]).toBe('fetch /api/v1/info');
+    } finally {
+      onLine.mockRestore();
+    }
+  });
+
+  it('is not asked for on NeedsHttps: that screen leads to no page', () => {
+    Object.defineProperty(window, 'isSecureContext', { configurable: true, value: false });
+    try {
+      const preload = vi.fn();
+      mount({ path: '/r/lounge', preload });
+      expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('isshoni needs HTTPS');
+      expect(preload).not.toHaveBeenCalled();
+    } finally {
+      Object.defineProperty(window, 'isSecureContext', { configurable: true, value: true });
+    }
+  });
+
+  it('with the default routes it is preloadRoute of the router; a test’s own routes preload nothing', async () => {
+    // A test's own routes (every other test here): the router's folders are not touched.
+    mount({ path: '/pending' });
+    expect(await screen.findByRole('heading', { name: 'app ready' })).toBeInTheDocument();
+    expect(preloadSpy).not.toHaveBeenCalled();
+    act(() => {
+      started?.stop();
+    });
+    document.body.innerHTML = '';
+
+    // The defaults, as main.tsx starts the app: /pending is a page of auth/.
+    server.use(signedIn(null));
+    const container = document.createElement('div');
+    document.body.append(container);
+    act(() => {
+      started = startApp(container, {
+        platform: createTestPlatform(),
+        location: { pathname: '/pending', search: '', hash: '' },
+        history: { state: null, replaceState: vi.fn() },
+        retryDelaysMs: [],
+        createRouter: (r) => createMemoryRouter(r, { initialEntries: ['/pending'] }),
+      });
+    });
+    expect(preloadSpy).toHaveBeenCalledExactlyOnceWith('/pending');
+    expect(await screen.findByRole('heading', { level: 1, name: 'Request sent' })).toBeInTheDocument();
   });
 });
 

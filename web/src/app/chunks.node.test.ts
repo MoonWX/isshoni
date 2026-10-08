@@ -5,8 +5,10 @@
 // "Initial" is check:size's word: the entry chunk and everything it imports statically, which is what the first
 // page load downloads. The budget only says how big that may be; these tests say what must not be in it, so that
 // a module that is meant to load on demand can't move back unnoticed:
-// - the pages of the lazy folders and the room's media code (05 §5);
-// - the share publisher: BrowserSharing, PublisherPC and BrowserShare (platform/browser/displayMedia.ts loads it);
+// - the pages of the page folders, the room's among them, and the room's media code (05 §5). The router's module has
+//   a branch for Vitest that loads rooms/ with it (ROOMS_IN_TESTS); a build must drop that one too;
+// - the share publisher: BrowserSharing, PublisherPC and BrowserShare (platform/browser/displayMedia.ts loads it),
+//   which must not ride along with the room's media chunk either: it waits for the first pick;
 // - the lazy namespaces of the catalog, which come with the folders that use them (05 §16.5). In Vitest the i18n
 //   module loads them all up front; a build must drop that branch (i18n/index.ts).
 import path from 'node:path';
@@ -54,11 +56,23 @@ const chunksWith = (module: string): string[] =>
 let initial = new Set<string>();
 const initialModules = (): string[] => chunks.filter((c) => initial.has(c.fileName)).flatMap(modulesOf);
 
+/** The chunk that an import() of a source module gets: the one made for that module (a path under src/). */
+function chunkOf(module: string): Rolldown.OutputChunk {
+  const own = chunks.find((c) => c.isDynamicEntry && c.facadeModuleId === path.join(SRC, ...module.split('/')));
+  if (!own) throw new Error(`no chunk for ${module}`);
+  return own;
+}
+
 /** What the router's import of a page folder downloads: the folder's own chunk and its static imports. */
-function folderChunks(folder: string): Set<string> {
-  const own = chunks.find((c) => c.isDynamicEntry && c.facadeModuleId === path.join(SRC, folder, 'index.ts'));
-  if (!own) throw new Error(`no chunk for ${folder}/index.ts`);
-  return withStaticImports(own);
+const folderChunks = (folder: string): Set<string> => withStaticImports(chunkOf(`${folder}/index.ts`));
+
+/** How often the code of the initial chunks has an import() of a chunk. */
+function initialImportsOf(chunk: Rolldown.OutputChunk): number {
+  const name = path.posix.basename(chunk.fileName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const call = new RegExp(`\\bimport\\(\\s*[\`'"]\\./${name}[\`'"]\\s*\\)`, 'g');
+  return chunks
+    .filter((c) => initial.has(c.fileName))
+    .reduce((count, c) => count + (c.code.match(call)?.length ?? 0), 0);
 }
 
 beforeAll(async () => {
@@ -84,15 +98,14 @@ beforeAll(async () => {
 }, 120_000);
 
 describe('the production build', () => {
-  it('has the app shell, the room page and the main catalog in the initial chunks', () => {
+  it('has the app shell, the layout and the main catalog in the initial chunks', () => {
     const modules = initialModules();
     expect(modules).toEqual(
       expect.arrayContaining([
         'main.tsx',
         'app/boot.tsx',
         'app/router.tsx',
-        'rooms/RoomPage.tsx',
-        'rooms/RoomSession.ts',
+        'app/layouts/RootLayout.tsx',
         'platform/browser/displayMedia.ts',
         'i18n/index.ts',
         'i18n/en.json',
@@ -101,6 +114,13 @@ describe('the production build', () => {
   });
 
   it.each([
+    // The room's folder (rooms/index.ts): the page, the bar of the other pages, the session and its connection.
+    'rooms/RoomPage.tsx',
+    'rooms/RootRedirect.tsx',
+    'rooms/InRoomBar.tsx',
+    'rooms/RoomSession.ts',
+    'rooms/runtime.ts',
+    'protocol/signal-client.ts',
     'auth/LoginPage.tsx',
     'setup/SetupPage.tsx',
     'account/AccountPage.tsx',
@@ -116,6 +136,43 @@ describe('the production build', () => {
     const holders = chunksWith(module);
     expect(holders).toHaveLength(1);
     expect(holders.filter((file) => initial.has(file))).toEqual([]);
+  });
+
+  it('has nothing of rooms/, viewer/, share/ or conntest/ in the initial chunks but what the picker needs', () => {
+    // The whole room, not only the modules named above: a file of these folders that the entry chunk starts to
+    // import shows up here. share/presets.ts is the content hint that the picker's provider puts on a picked track
+    // (platform/browser/displayMedia.ts); add another file only if the shell needs it before a room is opened.
+    const inShell = initialModules().filter((m) => /^(rooms|viewer|share|conntest)\//.test(m));
+    expect(inShell.sort()).toEqual(['share/presets.ts']);
+  });
+
+  it('the router loads the room by import(), in one place: the branch that Vitest has is not in a build', () => {
+    const rooms = chunkOf('rooms/index.ts');
+    const [router] = chunksWith('app/router.tsx');
+    expect(router).toBeDefined();
+    if (router === undefined) return;
+    expect(initial.has(router)).toBe(true);
+    expect(byFile(router).dynamicImports).toContain(rooms.fileName);
+    // The page-folder loader. A second import() of the room would be router.tsx's `await import('../rooms/index')`,
+    // which a build must drop: it would fetch the room on every page, and hold the app's start until it is there.
+    expect(initialImportsOf(rooms)).toBe(1);
+    // A folder that never had such a branch gives the same count: the count finds a loader.
+    expect(initialImportsOf(chunkOf('auth/index.ts'))).toBe(1);
+  });
+
+  it('the room’s folder comes with one import: the page, the redirect, the bar and the session', () => {
+    const loaded = folderChunks('rooms');
+    for (const module of [
+      'rooms/RoomPage.tsx',
+      'rooms/RootRedirect.tsx',
+      'rooms/InRoomBar.tsx',
+      'rooms/RoomSession.ts',
+      'protocol/signal-client.ts',
+    ]) {
+      expect(chunksWith(module).every((file) => loaded.has(file))).toBe(true);
+    }
+    // And not the media chunk: the page asks for that as it renders (rooms/loadMedia.ts).
+    expect(loaded.has(chunkOf('rooms/media.ts').fileName)).toBe(false);
   });
 
   it.each(['share/BrowserSharing.ts', 'share/PublisherPC.ts', 'share/BrowserShare.ts'])(
@@ -141,6 +198,18 @@ describe('the production build', () => {
       expect(chunksWith(module).every((file) => loaded.has(file))).toBe(true);
     }
   });
+
+  it.each(['share/BrowserSharing.ts', 'share/PublisherPC.ts'])(
+    'keeps the publisher out of what the room page loads, the folder and the media chunk: %s waits for the first pick',
+    (module) => {
+      // The media chunk may import BrowserShare (shareUi.ts and SharePanel.tsx read its error classes), but not
+      // these two: through share/'s barrel, say, they would load with the stage on every visit to a room.
+      const withRoom = new Set([...folderChunks('rooms'), ...withStaticImports(chunkOf('rooms/media.ts'))]);
+      const holders = chunksWith(module);
+      expect(holders).toHaveLength(1);
+      expect(holders.filter((file) => withRoom.has(file))).toEqual([]);
+    },
+  );
 
   it.each([
     ['admin', ['admin']],
