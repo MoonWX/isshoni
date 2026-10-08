@@ -1,13 +1,23 @@
 // Package ops is the operator's side of the server (docs/m1/04-server-platform.md §11–§12): health, metrics,
 // transfer accounting, the admin dashboard, the release check and the admin socket.
 //
-// What exists so far (README slice S31, the health part of 04 slice S4):
-//   - health.go: Health, the liveness and readiness state behind GET /healthz and GET /readyz (04 §6.2, §11.1).
-//     The wiring registers one named check per component (db, tls, media, signal, public_ip) and calls
-//     SetShuttingDown as the first step of a graceful shutdown (04 §6.4).
+// What exists so far:
+//   - health.go (README slice S31): Health, the liveness and readiness state behind GET /healthz and GET /readyz
+//     (04 §6.2, §11.1). The wiring registers one named check per component (db, tls, media, signal, public_ip) and
+//     calls SetShuttingDown as the first step of a graceful shutdown (04 §6.4).
+//   - The admin socket (README slice S43, 04 §12.1–§12.2, §12.5): HTTP/1.1 over a unix socket for the operator's
+//     CLI. adminsock.go has ListenAdmin (the socket file, mode 0600, and the peer-credential check of every
+//     connection: peercred_linux.go, peercred_darwin.go) and AdminServer with its lifecycle; adminapi.go has the
+//     endpoints and their wire documents; adminclient.go has AdminClient (DialAdmin), which classifies "not running"
+//     and "permission denied" for the CLI and doctor. Accounts reach the socket through the AdminAccounts
+//     interface, which the wiring implements over 03's auth service. loglevel.go has LogLevel, the runtime log level
+//     behind POST /v1/log-level.
 //
-// The later ops slices add metrics.go, transfer.go, dashboard.go, release.go, conntest.go, the admin socket
-// (adminsock.go, adminapi.go, adminclient.go) and backup.go/restore.go.
+// The socket's whole surface is declared: /v1/backup, /v1/restore, /v1/rotate-secrets and /v1/doctor answer "not
+// implemented in this build yet" until their slices fill them in (README S60, S65), and the client already has
+// their methods.
+//
+// The later ops slices add metrics.go, transfer.go, dashboard.go, release.go, conntest.go and backup.go/restore.go.
 //
 // Imports (04 §2): config, logx, version, netx and internal/protocol(/api), plus ops/doctor; never httpapi, store,
 // auth, signal, sfu or sfuplane. The wiring (internal/server) adapts those to the small interfaces declared here,

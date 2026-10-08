@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,8 +27,21 @@ func TestMain(m *testing.M) {
 func TestScripts(t *testing.T) {
 	t.Parallel()
 	testscript.Run(t, testscript.Params{
-		Dir:                 "testdata/script",
-		Cmds:                map[string]func(*testscript.TestScript, bool, []string){"exitcode": cmdExitCode},
+		Dir: "testdata/script",
+		Cmds: map[string]func(*testscript.TestScript, bool, []string){
+			"exitcode":   cmdExitCode,
+			"fakeserver": cmdFakeServer,
+		},
+		Condition: func(cond string) (bool, error) {
+			switch cond {
+			case "root": // file modes don't keep root out
+				return os.Geteuid() == 0, nil
+			case "peercred": // the admin socket checks peer credentials on this platform
+				return peerCreds, nil
+			default:
+				return false, fmt.Errorf("unknown condition %q", cond)
+			}
+		},
 		RequireExplicitExec: true,
 		RequireUniqueNames:  true,
 		UpdateScripts:       *update,
@@ -37,7 +51,12 @@ func TestScripts(t *testing.T) {
 			// Never read the machine's /etc/isshoni/isshoni.toml: an empty config file unless a script sets another.
 			empty := filepath.Join(env.WorkDir, ".empty.toml")
 			env.Setenv("ISSHONI_CONFIG", empty)
-			return os.WriteFile(empty, nil, 0o600)
+			if err := os.WriteFile(empty, nil, 0o600); err != nil {
+				return err
+			}
+			// Never talk to the machine's /run/isshoni/admin.sock either: the script gets an admin socket path of
+			// its own, where "fakeserver start" serves a fake (fake_test.go).
+			return setupScriptFake(env)
 		},
 	})
 }
@@ -71,15 +90,28 @@ func runCLI(t *testing.T, args ...string) (code int, stdout, stderr string) {
 	return runCLIEnv(t, nil, args...)
 }
 
-// runCLIEnv is runCLI with extra environment variables (os.Environ form); ISSHONI_CONFIG defaults to an empty file.
+// runCLIEnv is runCLI with extra environment variables (os.Environ form). ISSHONI_CONFIG defaults to an empty file
+// and ISSHONI_LISTEN_ADMIN_SOCKET to a path where nothing listens, so a test never reads the machine's config or
+// talks to a server that runs on it.
 func runCLIEnv(t *testing.T, environ []string, args ...string) (code int, stdout, stderr string) {
+	t.Helper()
+	return runCLITTY(t, false, environ, args...)
+}
+
+// runCLITTY is runCLIEnv with stdout as a terminal (tty), or as a pipe.
+func runCLITTY(t *testing.T, tty bool, environ []string, args ...string) (code int, stdout, stderr string) {
 	t.Helper()
 	empty := filepath.Join(t.TempDir(), "empty.toml")
 	if err := os.WriteFile(empty, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	var out, errOut bytes.Buffer
-	inv := &invocation{stdout: &out, stderr: &errOut, environ: append([]string{"ISSHONI_CONFIG=" + empty}, environ...)}
+	inv := &invocation{
+		stdout:  &out,
+		stderr:  &errOut,
+		environ: append([]string{"ISSHONI_CONFIG=" + empty, "ISSHONI_LISTEN_ADMIN_SOCKET=" + socketPath(t)}, environ...),
+		isTTY:   func(w io.Writer) bool { return tty && w == io.Writer(&out) },
+	}
 	code = run(t.Context(), inv, args)
 	return code, out.String(), errOut.String()
 }
@@ -164,16 +196,24 @@ var validArgs = map[string][]string{
 	"admin log-level":            {"debug"},
 }
 
-// implemented are the leaves that work in this build.
-var implemented = map[string]bool{
-	"version": true, "help": true, "config check": true, "config print": true, "config example": true, "config init": true,
+// notImplemented are the leaves that a later slice of the M1 plan fills in (README S60: doctor; S65: backup,
+// restore, rotate-secrets).
+var notImplemented = map[string]bool{
+	"doctor": true, "admin backup": true, "admin restore": true, "admin rotate-secrets": true,
+}
+
+// clientCommands are the leaves that talk to the running server over its admin socket and work in this build.
+var clientCommands = map[string]bool{
+	"setup-url": true, "healthcheck": true, "admin status": true, "admin users list": true,
+	"admin users reset-password": true, "admin users set-role": true, "admin users disable": true,
+	"admin users enable": true, "admin invite create": true, "admin log-level": true,
 }
 
 // Each leaf a later slice fills in says so and exits 1.
 func TestNotImplemented(t *testing.T) {
 	for _, p := range leaves(root(), nil) {
 		name := strings.Join(p, " ")
-		if implemented[name] {
+		if !notImplemented[name] {
 			continue
 		}
 		code, stdout, stderr := runCLI(t, append(p, validArgs[name]...)...)
@@ -184,7 +224,53 @@ func TestNotImplemented(t *testing.T) {
 	}
 }
 
-// Values at the edges of what the CLI accepts get past its checks (to the not-implemented stub for now).
+// Every leaf is accounted for: a later slice's, a client command, or one that works on its own.
+func TestLeavesAreClassified(t *testing.T) {
+	standalone := map[string]bool{
+		"serve": true, "version": true, "help": true, "config check": true, "config print": true, "config example": true, "config init": true,
+	}
+	for _, p := range leaves(root(), nil) {
+		name := strings.Join(p, " ")
+		n := 0
+		for _, set := range []map[string]bool{notImplemented, clientCommands, standalone} {
+			if set[name] {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("isshoni %s is in %d of the test's command lists, want exactly 1", name, n)
+		}
+	}
+}
+
+// Without a server every client command exits 4 with the message of 04 §12.1 (healthcheck: 1), and prints nothing
+// on stdout.
+func TestClientCommandsWithoutServer(t *testing.T) {
+	for _, p := range leaves(root(), nil) {
+		name := strings.Join(p, " ")
+		if !clientCommands[name] {
+			continue
+		}
+		sock := socketPath(t)
+		code, stdout, stderr := runCLIEnv(t, []string{"ISSHONI_LISTEN_ADMIN_SOCKET=" + sock}, append(p, validArgs[name]...)...)
+		wantCode := exitUnreachable
+		if name == "healthcheck" {
+			wantCode = exitRuntime
+		}
+		if want := "isshoni is not running (no server on " + sock + ")\n"; code != wantCode || stdout != "" || stderr != want {
+			t.Errorf("isshoni %s: exit %d, stdout %q, stderr %q; want exit %d and %q", name, code, stdout, stderr, wantCode, want)
+		}
+		// --socket wins over listen.admin_socket.
+		other := filepath.Join(filepath.Dir(sock), "other.sock")
+		args := append(append(append([]string(nil), p...), "--socket", other), validArgs[name]...)
+		if _, _, stderr := runCLIEnv(t, []string{"ISSHONI_LISTEN_ADMIN_SOCKET=" + sock}, args...); !strings.Contains(stderr, "(no server on "+other+")") {
+			t.Errorf("isshoni %s --socket: stderr %q, want the --socket path", name, stderr)
+		}
+	}
+}
+
+// Values at the edges of what the CLI accepts get past its checks: to the admin socket (where no server answers
+// here: exit 4), or to the not-implemented stub of a later slice.
 func TestAcceptedValues(t *testing.T) {
 	for _, args := range [][]string{
 		{"admin", "invite", "create", "--uses", "1", "--ttl", "1h"},
@@ -195,11 +281,25 @@ func TestAcceptedValues(t *testing.T) {
 		{"admin", "restore", "-"},                                         // stdin
 		{"admin", "restore", "--", "-backup.tar.gz"},                      // an argument that starts with '-', after --
 		{"admin", "users", "set-role", "--socket", "/x", "alice", "user"}, // flags before the arguments
+		{"setup-url", "--wait", "0s", "--qr"},
+		{"healthcheck", "--ready", "--wait", "0"},
 	} {
-		code, _, stderr := runCLI(t, args...)
+		code, stdout, stderr := runCLI(t, args...)
 		name := strings.Join(args, " ")
-		if want := "isshoni " + strings.Join(leafPath(args), " ") + ": not implemented in this build yet\n"; code != exitRuntime || stderr != want {
-			t.Errorf("isshoni %s: exit %d, stderr %q; want exit 1 and %q", name, code, stderr, want)
+		leaf := strings.Join(leafPath(args), " ")
+		switch {
+		case notImplemented[leaf]:
+			if want := "isshoni " + leaf + ": not implemented in this build yet\n"; code != exitRuntime || stderr != want {
+				t.Errorf("isshoni %s: exit %d, stderr %q; want exit 1 and %q", name, code, stderr, want)
+			}
+		case leaf == "healthcheck":
+			if code != exitRuntime || stdout != "" || !strings.HasPrefix(stderr, "isshoni is not running (no server on ") {
+				t.Errorf("isshoni %s: exit %d, stdout %q, stderr %q; want exit 1 and \"isshoni is not running\"", name, code, stdout, stderr)
+			}
+		default:
+			if code != exitUnreachable || stdout != "" || !strings.HasPrefix(stderr, "isshoni is not running (no server on ") {
+				t.Errorf("isshoni %s: exit %d, stdout %q, stderr %q; want exit 4 and \"isshoni is not running\"", name, code, stdout, stderr)
+			}
 		}
 	}
 }
@@ -267,6 +367,8 @@ func TestUsageErrors(t *testing.T) {
 		{[]string{"admin", "invite", "create", "--ttl", "1000h"}, exitUsage, "isshoni admin invite create: --ttl 1000h0m0s: want whole hours from 1h to 720h"},
 		{[]string{"admin", "invite", "create", "--ttl", "-24h"}, exitUsage, "isshoni admin invite create: --ttl -24h0m0s: want whole hours from 1h to 720h"},
 		{[]string{"setup-url", "--qr", "--no-qr"}, exitUsage, "isshoni setup-url: --qr and --no-qr can't be combined"},
+		{[]string{"setup-url", "--wait", "-1s"}, exitUsage, "isshoni setup-url: --wait -1s: want a duration of zero or more"},
+		{[]string{"healthcheck", "--wait", "-1s"}, exitRuntime, "isshoni healthcheck: --wait -1s: want a duration of zero or more"},
 		{[]string{"doctor", "--quality", "720p30"}, exitUsage, `isshoni doctor: --quality "720p30": want 1080p60, 1440p60 or 2160p60`},
 		{[]string{"doctor", "--preset", "game"}, exitUsage, `isshoni doctor: --preset "game": want auto or movie`},
 		{[]string{"config", "init"}, exitUsage, "isshoni config init: --path is required"},
@@ -360,7 +462,7 @@ func TestInterrupted(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	var out, errOut bytes.Buffer
-	if code := run(ctx, &invocation{stdout: &out, stderr: &errOut}, []string{"serve"}); code != exitInterrupted {
+	if code := run(ctx, &invocation{stdout: &out, stderr: &errOut}, []string{"admin", "rotate-secrets"}); code != exitInterrupted {
 		t.Errorf("a failing command after SIGINT: exit %d, want %d", code, exitInterrupted)
 	}
 	if code := run(ctx, &invocation{stdout: &out, stderr: &errOut}, []string{"version"}); code != exitOK {

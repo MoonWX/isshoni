@@ -35,7 +35,7 @@ const (
 
 func main() {
 	// SIGINT cancels ctx. Once it has, the default handling is back, so a second Ctrl-C ends the process at once.
-	// serve adds its own SIGTERM and SIGHUP handling (04 §6.4, §6.5).
+	// serve adds its own handling of SIGTERM and of the second signal (04 §6.4); SIGHUP comes with README S90.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	context.AfterFunc(ctx, stop)
 	code := run(ctx, &invocation{stdout: os.Stdout, stderr: os.Stderr, environ: os.Environ()}, os.Args[1:])
@@ -48,6 +48,12 @@ type invocation struct {
 	stdout  io.Writer
 	stderr  io.Writer
 	environ []string // os.Environ form; config commands read the ISSHONI_* names (04 §4.2)
+
+	// args is the command line as typed, without the program name; run sets it. The "run it with sudo" message
+	// repeats it (04 §12.1).
+	args []string
+	// isTTY says whether a stream is a terminal (a QR code, the roomier layout). nil means: look at the file.
+	isTTY func(io.Writer) bool
 
 	// For a command that reads the config, dispatch loads it before the command runs: cfg is always set then, and
 	// cfgErr holds its errors (the command decides: serve and config exit 78, the offline admin commands only need
@@ -151,6 +157,7 @@ func (c *command) sub(name string) *command {
 
 // run executes the command line args (without the program name) and returns the exit code.
 func run(ctx context.Context, inv *invocation, args []string) int {
+	inv.args = args
 	cmd, err := dispatch(ctx, inv, root(), args)
 	code := exitCodeOf(ctx, err)
 	if err != nil {

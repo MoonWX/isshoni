@@ -25,6 +25,7 @@ require (
 	github.com/pion/webrtc/v4 v4.2.22
 	github.com/prometheus/client_golang v1.24.1
 	github.com/rogpeppe/go-internal v1.16.0
+	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	go.uber.org/goleak v1.3.0
 	go.uber.org/zap v1.28.0
 	golang.org/x/crypto v0.57.0
