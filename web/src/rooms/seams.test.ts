@@ -1,6 +1,7 @@
 // Compile-time checks of the seams between rooms/, viewer/ and share/ (npm run typecheck), like
-// platform/types.test.ts. The three folders were built side by side against each other's contracts, and nothing
-// plugs them together until the room page does (05 §11.2): these checks keep the contracts in step until then.
+// platform/types.test.ts. The three folders are built side by side against each other's contracts; the room runtime
+// and the room page plug them together (runtime.ts, connectViewer.ts, RoomPage.tsx; 05 §11.2). Those would stop
+// compiling too when a contract moves; these checks say which contract it was.
 import { describe, expectTypeOf, it } from 'vitest';
 
 import type { SignalClient } from '../protocol/signal-client';

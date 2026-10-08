@@ -188,7 +188,9 @@
       "retryIn_one": "Retry in {{count}} second",
       "retryIn_other": "Retry in {{count}} seconds",
       "testConnection": "Test my connection",
-      "reconnected": "Reconnected"
+      "reconnected": "Reconnected",
+      "testUnavailable": "Couldn't load the connection test. Check your connection, then try again or reload the page.",
+      "testRetry": "Try again"
     },
     "event": {
       "joined": "{{name}} joined",
@@ -197,6 +199,76 @@
       "shareStarted": "{{name}} started sharing",
       "shareStopped": "{{name}} stopped sharing",
       "shareEnded": "{{name}}'s share ended"
+    },
+    "title": {
+      "idle": "{{room}} · {{app}}",
+      "live_one": "● {{count}} live · {{room}} · {{app}}",
+      "live_other": "● {{count}} live · {{room}} · {{app}}",
+      "sharing": "● Sharing · {{room}} · {{app}}"
+    },
+    "header": {
+      "unnamed": "Room",
+      "people_one": "{{count}} here",
+      "people_other": "{{count}} here",
+      "peopleOpen_one": "{{count}} here. Show who",
+      "peopleOpen_other": "{{count}} here. Show who"
+    },
+    "share": {
+      "start": "Share",
+      "stop": "Stop sharing"
+    },
+    "switcher": {
+      "open": "Switch room",
+      "label": "Rooms",
+      "people_one": "{{count}} here",
+      "people_other": "{{count}} here",
+      "live_one": "{{count}} live",
+      "live_other": "{{count}} live",
+      "create": "Create room",
+      "confirm": {
+        "title": "Stop sharing and switch to {{room}}?",
+        "body": "Your share ends when you leave this room.",
+        "action": "Stop sharing and switch"
+      }
+    },
+    "people": {
+      "title_one": "{{count}} person here",
+      "title_other": "{{count}} people here",
+      "none": "Nobody is here yet.",
+      "you": "{{name}} (you)",
+      "admin": "Admin",
+      "sharing": "Sharing",
+      "reconnecting": "Reconnecting…",
+      "watch": "Watch {{name}}'s share",
+      "watchOwn": "Show your share on the stage"
+    },
+    "menu": {
+      "open": "Account menu, {{name}}",
+      "label": "Account menu",
+      "signedInAs": "Signed in as {{name}}",
+      "account": "Account",
+      "notifications": "Notifications",
+      "invite": "Invite friends",
+      "admin": "Admin",
+      "install": "Install app",
+      "about": "About isshoni",
+      "signOut": "Sign out"
+    },
+    "empty": {
+      "title": "Nobody is sharing yet.",
+      "share": "Share your screen"
+    },
+    "join": {
+      "joining": "Joining…",
+      "failed": "Couldn't join this room",
+      "retry": "Try again"
+    },
+    "bar": {
+      "label": "Your room",
+      "in": "In {{room}}",
+      "sharing": "sharing",
+      "back": "Back",
+      "leave": "Leave"
     }
   },
   "auth": {

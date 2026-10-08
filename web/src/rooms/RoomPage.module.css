@@ -1,0 +1,69 @@
+/*
+ * The room page fills the viewport, and nothing on it scrolls the document: the header keeps its height, and the
+ * stage and the tiles share what is left (viewer/ViewerLayout fills the box it is given and scrolls its own list).
+ */
+
+.page {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  height: 100vh;
+  height: 100dvh;
+  min-height: 0;
+}
+
+.main {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+/*
+ * Where the stage will be, while its chunk loads: the same box as viewer/ViewerLayout's stage (16:9 on top below
+ * 1024 px, the whole area from there up), in the stage's black.
+ */
+.stagePlaceholder {
+  flex: none;
+  aspect-ratio: 16 / 9;
+  max-height: calc(100% - 2 * var(--space-2));
+  margin: var(--space-2) max(var(--space-2), var(--safe-right)) var(--space-2) max(var(--space-2), var(--safe-left));
+  background-color: var(--color-stage);
+  border-radius: var(--radius-md);
+}
+
+@media (min-width: 1024px) {
+  .stagePlaceholder {
+    flex: 1;
+    aspect-ratio: auto;
+    max-height: none;
+    margin-bottom: max(var(--space-2), var(--safe-bottom));
+  }
+}
+
+/* A refused join: one message in the middle of the page, with the way to try again. */
+.failed {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  align-items: center;
+  max-width: 28rem;
+  padding: var(--space-6) var(--space-4);
+  margin: auto;
+  text-align: center;
+}
+
+.failedIcon {
+  width: 2.5rem;
+  height: 2.5rem;
+  color: var(--color-text-muted);
+  stroke-width: 1.5;
+}
+
+.failedTitle {
+  font-size: var(--text-xl);
+  font-weight: var(--weight-bold);
+  text-wrap: balance;
+}

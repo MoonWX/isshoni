@@ -1,0 +1,99 @@
+/* The switcher's button (an icon next to the room's name) and the list in its popover. */
+
+.trigger {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: var(--tap-target);
+  height: var(--tap-target);
+  padding: 0;
+  color: var(--color-text-muted);
+  background: none;
+  border: 0;
+  border-radius: var(--radius-md);
+}
+
+.trigger:hover,
+.trigger[aria-expanded='true'] {
+  color: var(--color-text);
+  background-color: var(--color-surface-2);
+}
+
+.trigger svg {
+  width: 1.125rem;
+  height: 1.125rem;
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: calc(-1 * var(--space-1));
+  list-style: none;
+}
+
+.room {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: var(--tap-target);
+  padding: var(--space-1) var(--space-2);
+  color: var(--color-text);
+  text-decoration: none;
+  border-radius: var(--radius-sm);
+}
+
+a.room:hover {
+  background-color: var(--color-surface-2);
+}
+
+/* The room the page is in. */
+.room[aria-current] {
+  box-shadow: inset 3px 0 0 var(--color-accent);
+}
+
+.name {
+  overflow: hidden;
+  font-weight: var(--weight-medium);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.counts {
+  display: flex;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-muted);
+}
+
+.live {
+  color: var(--color-danger);
+}
+
+.create {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  min-height: var(--tap-target);
+  padding: var(--space-1) var(--space-1) 0;
+  margin-top: var(--space-2);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  text-decoration: none;
+  border-top: var(--border-width) solid var(--color-border);
+}
+
+.create svg {
+  width: 1rem;
+  height: 1rem;
+}
+
+/* Windows High Contrast: the current room's marker is a box-shadow, which forced colours drop. */
+@media (forced-colors: active) {
+  .room[aria-current] {
+    outline: var(--border-width) solid CanvasText;
+    outline-offset: calc(-1 * var(--border-width));
+  }
+}
