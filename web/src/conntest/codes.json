@@ -1,0 +1,11 @@
+[
+  "udp_blocked",
+  "no_media",
+  "no_public_ip",
+  "tcp443_blocked",
+  "high_rtt",
+  "nat_port_forward",
+  "nat_cgnat",
+  "mac_local_network",
+  "docker_ports"
+]

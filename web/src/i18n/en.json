@@ -75,6 +75,93 @@
     "stepOf": "Step {{current}} of {{total}}:",
     "stepDoneOf": "Step {{current}} of {{total}}, done:"
   },
+  "conntest": {
+    "title": "Connection test",
+    "intro": "This checks whether video can travel between this device and the server, the same way it does in a room.",
+    "start": "Test my connection",
+    "again": "Test again",
+    "running": "Testing your connection… This takes up to 10 seconds.",
+    "rows": {
+      "udp": "Media over UDP (port {{port}})",
+      "udpNoPort": "Media over UDP",
+      "tcp": "Media over TCP (port {{port}})",
+      "rtt": "Round trip"
+    },
+    "state": {
+      "ok": "Works",
+      "failed": "Blocked",
+      "off": "Turned off",
+      "not_tested": "Not tested"
+    },
+    "udpDisabled": "UDP media is turned off in the server config (<code>listen.ice_udp</code>).",
+    "rtt": {
+      "good": "{{ms}} ms, good",
+      "ok": "{{ms}} ms, OK",
+      "high": "{{ms}} ms, high latency",
+      "none": "Not measured"
+    },
+    "status": {
+      "green": "Friends get the best quality.",
+      "amber": "Works, but video may stutter on weak networks.",
+      "red": "Friends can't receive video yet."
+    },
+    "incomplete": "Couldn't finish the test. Try again in a minute.",
+    "incompleteWait_one": "Couldn't finish the test. Try again in {{count}} second.",
+    "incompleteWait_other": "Couldn't finish the test. Try again in {{count}} seconds.",
+    "error": "The test couldn't run. {{message}}",
+    "fixTitle": "How to fix it",
+    "openUdp": "Open UDP port {{udpPort}}.",
+    "noPublicIp": "The server doesn't know its public address, so browsers can't reach its media ports. Set <code>public_ip</code> in <code>/etc/isshoni/isshoni.toml</code> (Docker: <code>ISSHONI_PUBLIC_IP</code> in <code>.env</code>) and restart.",
+    "nat": {
+      "none": "This server has its public address on its own network interface, so no router or NAT is in the way.",
+      "one_to_one": "This server is behind 1:1 NAT, as cloud servers and containers are. It passes every port, so only a firewall can be in the way.",
+      "port_forward": "Forward TCP 80, 443, {{tcpPort}} and UDP {{udpPort}} on your router to this machine.",
+      "symmetric": "This server has no public address; isshoni needs one (a VPS or a router port forward).",
+      "cgnat_likely": "This server has no public address; isshoni needs one (a VPS or a router port forward).",
+      "unknown": "isshoni couldn't tell how this server reaches the internet. Run <code>isshoni doctor</code> on the server for details."
+    },
+    "ownNetwork": "You may be testing from the server's own network. Test again from your phone's mobile data.",
+    "docker": "Check that compose publishes <code>{{udpPort}}:{{udpPort}}/udp</code>; published ports bypass ufw.",
+    "macLocalNetwork": "On a Mac, allow your browser Local Network access (System Settings → Privacy & Security → Local Network).",
+    "blockedNetwork": "If this network blocks UDP (some offices and hotels do), test from home or from your phone's mobile data.",
+    "sendToAdmin": "Send this to your admin:",
+    "copyResult": "Copy result",
+    "copyManually": "Couldn't copy for you. Select this text and copy it:",
+    "help": {
+      "title": "Troubleshooting",
+      "udp_blocked": "UDP is blocked",
+      "no_media": "No media connection at all",
+      "no_public_ip": "The server doesn't know its public address",
+      "tcp443_blocked": "TCP port 443 doesn't carry media",
+      "high_rtt": "High latency",
+      "nat_port_forward": "Port forwarding on a home router",
+      "nat_cgnat": "A server without a public address",
+      "mac_local_network": "Local Network access on a Mac",
+      "docker_ports": "Publishing ports from Docker"
+    }
+  },
+  "fix": {
+    "firewall": {
+      "aws": "In the AWS console, add inbound rules to this instance's security group: UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates.",
+      "gcp": "In the Google Cloud console, add a VPC firewall rule that allows incoming UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates.",
+      "azure": "In the Azure portal, add inbound rules to this VM's network security group: UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates.",
+      "oracle": "In the Oracle Cloud console, add ingress rules to the subnet's security list: UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates. Oracle's images also block these ports with their own iptables rules, so open them on the server too.",
+      "hetzner": "In the Hetzner Cloud console, check the Cloud Firewall attached to this server: allow incoming UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates.",
+      "digitalocean": "In the DigitalOcean control panel, check the Cloud Firewall assigned to this Droplet: allow incoming UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates.",
+      "vultr": "In the Vultr customer portal, check the Cloud Firewall group linked to this instance: allow incoming UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates.",
+      "linode": "In Akamai Cloud Manager, check the Cloud Firewall attached to this Linode: allow incoming UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates.",
+      "scaleway": "In the Scaleway console, add inbound rules to this instance's security group: UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates.",
+      "ovh": "In the OVHcloud control panel, add inbound rules to this instance's security group: UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates.",
+      "alibaba": "In the Alibaba Cloud console, add inbound rules to this instance's security group: UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates.",
+      "tencent": "In the Tencent Cloud console, add inbound rules to this instance's security group: UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates.",
+      "unknown": "Open these ports in your provider's firewall or security group: UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates."
+    },
+    "hostFirewall": {
+      "ufw": "On the server, if it uses ufw (Ubuntu, Debian):",
+      "firewalld": "On the server, if it uses firewalld (Fedora, RHEL):"
+    },
+    "providerGuide": "Firewall guide for this provider"
+  },
   "errors": {
     "unknown": "Something went wrong ({{code}}).",
     "withRef": "{{message}} Reference: {{ref}}",
