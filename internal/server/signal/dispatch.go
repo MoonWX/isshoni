@@ -89,7 +89,8 @@ func (c *conn) dispatch(env protocol.Envelope, size int, now time.Time) {
 	handle(c, env)
 }
 
-// handlers handle the client→server messages other than hello and pc.* (handlePC), after dispatch's checks.
+// handlers handle the client→server messages other than hello and pc.* (handlePC), after dispatch's checks. Those of
+// shares and subscriptions are in share.go, the relay's (agent.send) is in relay.go.
 var handlers = map[protocol.MessageType]func(*conn, protocol.Envelope){
 	protocol.MessageTypePing:            (*conn).onPing,
 	protocol.MessageTypeRoomJoin:        (*conn).onRoomJoin,
@@ -348,14 +349,6 @@ func (c *conn) onStatsWatch(env protocol.Envelope) {
 	c.reply(env, nil)
 	if v.On {
 		c.armStats()
-	}
-}
-
-// onAgentSend handles agent.send (01 §8.14), which the same-user relay (README S51) brings together with the
-// agent.relay feature. Until then the feature is off and dispatch answers feature_disabled.
-func (c *conn) onAgentSend(env protocol.Envelope) {
-	if _, ok := decode[protocol.AgentSend](c, env); ok {
-		c.notImplemented(env)
 	}
 }
 

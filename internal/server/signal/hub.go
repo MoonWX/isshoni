@@ -223,9 +223,8 @@ type Hub struct {
 	closedRooms    map[string]struct{}  // rooms closed by CloseRoom, for this process's lifetime
 }
 
-// serverFeatures are the features this server enables (01 §6.2). agent.relay joins the list with the same-user
-// relay (README S51).
-var serverFeatures = []protocol.Feature{}
+// serverFeatures are the features this server enables (01 §6.2): agent.relay, the same-user relay (relay.go).
+var serverFeatures = []protocol.Feature{protocol.FeatureAgentRelay}
 
 // New returns a hub. It validates cfg and deps, builds the metrics (registering them with deps.Metrics), and starts
 // nothing.
