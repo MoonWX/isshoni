@@ -159,8 +159,12 @@ const maxLoggedOrigin = 128
 //     ErrInvalid make it pre-auth; any other error gets 503 with Retry-After: 2.
 //  4. Pre-auth only: at most Limits.PreAuthPerIPPerMinute upgrades per client IP key per minute (429 with
 //     Retry-After) and Limits.MaxPreAuthConns pre-auth sockets at once (503 with Retry-After: 2).
-//  5. Cookie only: the user has fewer than Limits.MaxConnectionsPerUser connections, else the socket is accepted,
-//     gets error{too_many_connections, scope connection} and is closed with 4429.
+//  5. Cookie only: the user has fewer than Limits.MaxConnectionsPerUser connections and handshaking sockets, else
+//     the socket is accepted and gets error{too_many_connections, scope connection} and 4429, unless its hello
+//     resumes one of the user's connections. A resume needs no slot (the connection has its own), and the resume
+//     token only arrives with hello, so a socket at the cap waits for its hello (handshake): the error is then the
+//     reply to a hello that resumes nothing. At most MaxConnectionsPerUser sockets per user wait like this; beyond
+//     that the error comes at once.
 //  6. websocket.Accept without compression or subprotocols, and without coder/websocket's own Origin check (step 2
 //     did the exact one; the library's compares with r.Host, which breaks behind proxies that rewrite Host).
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -222,11 +226,16 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.preAuth++
 		s.preAuth = true
-	case h.userSlots[id.UserID] >= h.cfg.Limits.MaxConnectionsPerUser:
-		s.tooMany = true
-	default:
+	case h.userSlots[id.UserID] < h.cfg.Limits.MaxConnectionsPerUser:
 		h.userSlots[id.UserID]++
 		s.slotUser = id.UserID
+	case h.overCap[id.UserID] < h.cfg.Limits.MaxConnectionsPerUser:
+		// At the cap. The user's connections count, detached ones too, and so does the socket a client opens to
+		// resume one: the cap must not turn that socket away before its hello shows the resume token.
+		h.overCap[id.UserID]++
+		s.overUser = id.UserID
+	default:
+		s.tooMany = true
 	}
 	h.sockets[s] = struct{}{}
 	h.wg.Add(1)
@@ -316,7 +325,7 @@ func (t *hijackTap) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 func (t *hijackTap) Unwrap() http.ResponseWriter { return t.ResponseWriter }
 
 // dropSocket releases what a socket holds in the hub once its reader has ended: its place in the socket set, its
-// pre-auth count and its per-user slot (unless a connection took the slot over).
+// pre-auth count, and its per-user slot or its place at the cap (unless a connection took the slot over).
 func (h *Hub) dropSocket(s *socket) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -325,9 +334,23 @@ func (h *Hub) dropSocket(s *socket) {
 		h.preAuth--
 		s.preAuth = false
 	}
+	h.releaseSocketLocked(s)
+}
+
+// releaseSocketLocked gives back what socket s holds for a connection of its own: its per-user slot, or its place
+// among the sockets that wait at the user's cap.
+func (h *Hub) releaseSocketLocked(s *socket) {
 	if s.slotUser != "" {
 		h.releaseSlotLocked(s.slotUser)
 		s.slotUser = ""
+	}
+	if s.overUser != "" {
+		if n := h.overCap[s.overUser] - 1; n > 0 {
+			h.overCap[s.overUser] = n
+		} else {
+			delete(h.overCap, s.overUser)
+		}
+		s.overUser = ""
 	}
 }
 
@@ -340,24 +363,38 @@ func (h *Hub) releaseSlotLocked(userID string) {
 }
 
 // authenticated marks a pre-auth socket as authenticated by bearer at hello: it stops counting against the pre-auth
-// limit and takes a per-user slot, unless the user has Limits.MaxConnectionsPerUser already (false).
-func (h *Hub) authenticated(s *socket, userID string) bool {
+// limit.
+func (h *Hub) authenticated(s *socket) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if s.preAuth {
 		h.preAuth--
 		s.preAuth = false
 	}
+}
+
+// takeSlot gives socket s the per-user slot of the connection its hello is about to open, unless it has had one
+// since the upgrade. It fails when the user has Limits.MaxConnectionsPerUser connections and handshaking sockets
+// already: a bearer socket, which is not checked at the upgrade, or a cookie socket that has waited at the cap
+// (ServeHTTP step 5).
+func (h *Hub) takeSlot(s *socket, userID string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if s.slotUser != "" {
+		return true
+	}
 	if h.userSlots[userID] >= h.cfg.Limits.MaxConnectionsPerUser {
 		return false
 	}
+	h.releaseSocketLocked(s) // its place at the cap
 	h.userSlots[userID]++
 	s.slotUser = userID
 	return true
 }
 
-// handshake handles the first message of a socket (01 §8.2 steps 1–6). It returns the new connection, whose actor
-// sends welcome, or nil when the handshake failed and the socket is closing.
+// handshake handles the first message of a socket (01 §8.2 steps 1–7). It returns the socket's connection, whose
+// actor sends welcome: a new one, or the one that the hello's resume token resumed. It returns nil when the
+// handshake failed and the socket is closing.
 func (s *socket) handshake(b []byte) *conn {
 	h := s.h
 	env, err := protocol.ParseEnvelope(b)
@@ -406,13 +443,18 @@ func (s *socket) handshake(b []byte) *conn {
 			s.failInternal(fmt.Errorf("authenticate bearer: %w", err), env.ID)
 			return nil
 		}
-		if !h.authenticated(s, bid.UserID) {
-			s.fail(protocol.NewError(protocol.ErrorCodeTooManyConnections, protocol.ErrorScopeConnection), env.ID)
-			return nil
-		}
+		h.authenticated(s)
 		id = bid
 	default:
 		s.fail(protocol.NewError(protocol.ErrorCodeUnauthenticated, protocol.ErrorScopeSession), env.ID)
+		return nil
+	}
+	// The per-user cap (01 §3.1 step 5; §8.2 step 3 for bearer): a new connection needs a slot. A cookie socket has
+	// had one since the upgrade, unless the user was at the cap then. A hello with a resume token goes on without
+	// one: the connection it resumes has its own, so the token is checked first (step 5), and the cap after it when
+	// the token resumes nothing.
+	if hello.ResumeToken == "" && !h.takeSlot(s, id.UserID) {
+		s.fail(protocol.NewError(protocol.ErrorCodeTooManyConnections, protocol.ErrorScopeConnection), env.ID)
 		return nil
 	}
 	// Revalidate at connect: marks the session as seen and picks up a rename or role change (01 §3.2).
@@ -455,10 +497,26 @@ func (s *socket) handshake(b []byte) *conn {
 		return nil
 	}
 
-	// Step 5: a resume token (01 §10.3) resumes its connection from README S28 on; until then every hello starts a
-	// new connection (welcome.resumed false, which is not an error).
+	// Step 5: a resume token resumes its connection (01 §10.3): the connection's actor takes the socket and sends
+	// welcome{resumed: true}, then room.state and Resync (step 7). A token that resumes nothing is not an error: the
+	// hello opens a new connection (welcome.resumed false), if the user has a slot for one.
 	if hello.ResumeToken != "" {
-		h.metrics.resumeResult(false)
+		c := h.resume(hello.ResumeToken, resumeRequest{
+			sock: s, re: env.ID, id: id, role: hello.Role, version: chosen, caps: hello.Caps,
+			defaultRoom: defaultRoom, pol: pol,
+		})
+		h.metrics.resumeResult(c != nil)
+		if c != nil {
+			// Step 6 for a resumed connection. Only this goroutine reads from the socket, so the limit is up before
+			// the first read after welcome.
+			s.ws.SetReadLimit(protocol.MaxSDPBytes)
+			s.startPinger()
+			return c
+		}
+		if !h.takeSlot(s, id.UserID) {
+			s.fail(protocol.NewError(protocol.ErrorCodeTooManyConnections, protocol.ErrorScopeConnection), env.ID)
+			return nil
+		}
 	}
 
 	// Step 6: raise the read limit; the actor sends welcome as its first act.
@@ -469,7 +527,7 @@ func (s *socket) handshake(b []byte) *conn {
 	}
 	s.ws.SetReadLimit(protocol.MaxSDPBytes)
 	s.startPinger()
-	go c.run(func() { c.attach(s, env.ID, defaultRoom, pol) })
+	go c.run(func() { c.attach(s, env.ID, defaultRoom, pol, false) })
 	return c
 }
 
@@ -499,7 +557,8 @@ func (h *Hub) addConn(c *conn, s *socket) (protocol.ShutdownReason, bool) {
 	return "", true
 }
 
-// removeConn unregisters a closed connection and releases its per-user slot.
+// removeConn unregisters a closed connection and releases its per-user slot, which it has held since it opened,
+// through every socket and every grace.
 func (h *Hub) removeConn(c *conn) {
 	h.mu.Lock()
 	defer h.mu.Unlock()

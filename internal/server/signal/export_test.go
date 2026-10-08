@@ -15,12 +15,19 @@ func LastStats(h *Hub, connID string) *protocol.ClientStats {
 	return c.lastStats.Load()
 }
 
-// Counts returns the hub's bookkeeping: open connections, live sockets, pre-auth sockets, and the per-user slots
-// of userID.
+// Counts returns the hub's bookkeeping: open connections (detached ones too), live sockets, pre-auth sockets, and
+// the per-user slots of userID.
 func Counts(h *Hub, userID string) (conns, sockets, preAuth, slots int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return len(h.conns), len(h.sockets), h.preAuth, h.userSlots[userID]
+}
+
+// OverCap returns the number of userID's cookie sockets that wait at the per-user cap for their hello.
+func OverCap(h *Hub, userID string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.overCap[userID]
 }
 
 // AddShare puts a share into a room that has participants and records the change, as share.start will (README S40):

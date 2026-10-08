@@ -203,6 +203,10 @@ type Hub struct {
 	// broadcast. Shutdown waits for it.
 	wg sync.WaitGroup
 
+	// down is closed when Shutdown begins. Every connection's actor then shuts its connection down: an attached one
+	// through its socket, a detached one at once.
+	down chan struct{}
+
 	revs atomic.Uint64 // the last room.state rev (nextRev)
 
 	mu             sync.Mutex
@@ -210,8 +214,9 @@ type Hub struct {
 	shutdownReason protocol.ShutdownReason
 	stopped        chan struct{}        // closed once wg reaches zero after Shutdown began
 	sockets        map[*socket]struct{} // every accepted socket until its reader has ended
-	conns          map[string]*conn     // connections by id (ready; detached ones from S28 on)
-	userSlots      map[string]int       // per user: connections plus handshaking cookie sockets (01 §3.1 step 5)
+	conns          map[string]*conn     // connections by id, ready or detached, until they close
+	userSlots      map[string]int       // per user: connections (detached ones too) plus handshaking sockets (01 §3.1 step 5)
+	overCap        map[string]int       // per user: cookie sockets that wait at the cap for a hello that resumes (ServeHTTP)
 	preAuth        int                  // concurrent pre-auth sockets (01 §3.1 step 4)
 	rooms          map[string]*room     // rooms with at least one participant, by id
 	participants   int                  // participants over all rooms, CloseRoom's included until they are detached
@@ -272,9 +277,11 @@ func New(cfg Config, deps Deps) (*Hub, error) {
 		throttleLog: newKeyedLimiter(perMinute(1), maxLimiterKeys),
 		ctx:         ctx,
 		cancel:      cancel,
+		down:        make(chan struct{}),
 		sockets:     make(map[*socket]struct{}),
 		conns:       make(map[string]*conn),
 		userSlots:   make(map[string]int),
+		overCap:     make(map[string]int),
 		rooms:       make(map[string]*room),
 		closedRooms: make(map[string]struct{}),
 	}
@@ -300,9 +307,10 @@ func (h *Hub) Ready() bool {
 // to every connection, closes the sockets with 1012 and returns when they are closed or ctx ends (§11.6).
 // 04 maps its own reasons: stop → stop; restart and restore → restart.
 //
-// New upgrades get 503 from the moment Shutdown begins. When ctx ends first, Shutdown closes the remaining sockets
-// without a close handshake, waits for the hub's goroutines to end and returns ctx's error. Later calls wait the
-// same way and change nothing.
+// New upgrades get 503 from the moment Shutdown begins, and nothing resumes any more. A detached connection has no
+// socket to tell: it closes at once, so Shutdown never waits for a grace. When ctx ends first, Shutdown closes the
+// remaining sockets without a close handshake, waits for the hub's goroutines to end and returns ctx's error. Later
+// calls wait the same way and change nothing.
 func (h *Hub) Shutdown(ctx context.Context, reason protocol.ShutdownReason) error {
 	if !reason.Valid() {
 		h.log.Error("unknown shutdown reason, using restart", slog.String("reason", string(reason)))
@@ -310,15 +318,14 @@ func (h *Hub) Shutdown(ctx context.Context, reason protocol.ShutdownReason) erro
 	}
 	h.mu.Lock()
 	first := !h.closing
-	var conns []*conn
+	conns := 0
 	var socks []*socket
 	if first {
 		h.closing = true
 		h.shutdownReason = reason
 		h.stopped = make(chan struct{})
-		for _, c := range h.conns {
-			conns = append(conns, c)
-		}
+		conns = len(h.conns)
+		close(h.down) // every connection's actor shuts its connection down (conn.run)
 		for s := range h.sockets {
 			if s.conn.Load() == nil {
 				socks = append(socks, s)
@@ -329,10 +336,7 @@ func (h *Hub) Shutdown(ctx context.Context, reason protocol.ShutdownReason) erro
 	h.mu.Unlock()
 
 	if first {
-		h.log.Info("shutting down", slog.String("reason", string(reason)), slog.Int("connections", len(conns)))
-		for _, c := range conns {
-			c.post(func() { c.shutdown(reason) })
-		}
+		h.log.Info("shutting down", slog.String("reason", string(reason)), slog.Int("connections", conns))
 		for _, s := range socks {
 			s.shutdown(reason)
 		}
@@ -353,6 +357,13 @@ func (h *Hub) Shutdown(ctx context.Context, reason protocol.ShutdownReason) erro
 		<-stopped
 		return fmt.Errorf("signal: shutdown: %w", ctx.Err())
 	}
+}
+
+// shutdownReasonNow returns the reason of the Shutdown that has begun.
+func (h *Hub) shutdownReasonNow() protocol.ShutdownReason {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.shutdownReason
 }
 
 // forceClose cancels the hub's context and closes every socket's network connection, which ends every read,
@@ -428,7 +439,9 @@ func isAdminTopic(t protocol.Topic) bool { return strings.HasPrefix(string(t), "
 // The wiring implements 03's auth.ConnCloser with it (reason → code table in §15.4).
 //
 // Sockets of that user that were authenticated by cookie and are still in the handshake are closed the same way.
-// Closing is asynchronous: the sockets close right after the call returns.
+// Closing is asynchronous: the sockets close right after the call returns. A revocation skips grace (01 §4.2): each
+// connection ends with its socket, and a detached one, which has no socket to tell, ends at once (it is counted
+// too). Their shares end with left.
 func (h *Hub) CloseConnections(sel ConnSelector, code protocol.ErrorCode) int {
 	if sel.UserID == "" {
 		h.log.Error("CloseConnections without a user id: nothing closed")
