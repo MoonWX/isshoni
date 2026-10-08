@@ -3,12 +3,19 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"slices"
+	"strings"
+	"text/tabwriter"
 	"time"
+
+	"github.com/MoonWX/isshoni/internal/protocol/api"
+	"github.com/MoonWX/isshoni/internal/server/ops"
 )
 
 // The admin commands talk to the running server over its admin socket (04 §12). backup and restore also work
-// offline, on the data directory of a stopped server (04 §12.6). Later slices fill in the run functions.
+// offline, on the data directory of a stopped server (04 §12.6). backup, restore and rotate-secrets come with a
+// later slice of the M1 plan (README S65).
 
 func adminCmd() *command {
 	return &command{
@@ -49,8 +56,119 @@ func adminStatusCmd() *command {
 	}
 }
 
-func runAdminStatus(context.Context, *invocation, jsonOptions, []string) error {
-	return errNotImplemented
+// call runs one call to the admin socket under the CLI's timeout and turns its error into the command's
+// (adminFailure).
+func (o clientOptions) call(ctx context.Context, inv *invocation, fn func(ctx context.Context, c *ops.AdminClient) error) error {
+	c := o.admin(inv)
+	ctx, cancel := context.WithTimeout(ctx, adminCallTimeout)
+	defer cancel()
+	if err := fn(ctx, c); err != nil {
+		return adminFailure(inv, o, c, err)
+	}
+	return nil
+}
+
+// runAdminStatus prints GET /v1/status (04 §12.2): the document itself with --json, a summary otherwise.
+func runAdminStatus(ctx context.Context, inv *invocation, o jsonOptions, _ []string) error {
+	var st api.ServerStatus
+	err := o.call(ctx, inv, func(ctx context.Context, c *ops.AdminClient) (err error) {
+		st, err = c.Status(ctx)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	if o.json {
+		return printJSON(inv.stdout, st)
+	}
+	_, err = inv.stdout.Write([]byte(statusText(st)))
+	return err
+}
+
+// statusText is `isshoni admin status` for people: version, uptime, TLS, addresses, rooms and connections. A part
+// the server did not report is left out.
+func statusText(st api.ServerStatus) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "isshoni %s, up %s (since %s)\n", st.Version,
+		shortDuration((time.Duration(st.UptimeS) * time.Second).Round(time.Second)), clock(st.StartedAt))
+	row := func(name, format string, args ...any) {
+		fmt.Fprintf(&b, "  %-11s %s\n", name, fmt.Sprintf(format, args...))
+	}
+	if st.Origin != "" {
+		row("site", "%s", st.Origin)
+	}
+	if st.TLS.Mode != "" {
+		cert := "certificate not ready yet"
+		switch {
+		case st.TLS.Mode == api.TLSModeOff:
+			cert = "the proxy in front has the certificate"
+		case st.TLS.Ready && !st.TLS.NotAfter.IsZero():
+			cert = "certificate ready, expires " + st.TLS.NotAfter.UTC().Format(time.DateOnly)
+		case st.TLS.Ready:
+			cert = "certificate ready"
+		case st.TLS.LastErrorCode != "":
+			cert += " (" + st.TLS.LastErrorCode + ")"
+		}
+		row("tls", "%s: %s", st.TLS.Mode, cert)
+	}
+	var ips []string
+	if st.PublicIPv4 != "" {
+		ips = append(ips, withMethod(st.PublicIPv4, st.PublicIPv4Method))
+	}
+	if st.PublicIPv6 != "" {
+		ips = append(ips, withMethod(st.PublicIPv6, st.PublicIPv6Method))
+	}
+	if len(ips) > 0 {
+		nat := ""
+		if st.NAT != "" {
+			nat = "; NAT: " + string(st.NAT)
+		}
+		row("public IP", "%s%s", strings.Join(ips, ", "), nat)
+	}
+	if len(st.Listeners) > 0 {
+		parts := make([]string, len(st.Listeners))
+		for i, l := range st.Listeners {
+			parts[i] = l.Network + " " + l.Addr
+		}
+		row("listening", "%s", strings.Join(parts, ", "))
+	}
+	if len(st.Advertised) > 0 {
+		parts := make([]string, len(st.Advertised))
+		for i, a := range st.Advertised {
+			parts[i] = a.Proto + " " + a.Addr
+		}
+		row("media", "%s", strings.Join(parts, ", "))
+	}
+	row("live", "%s, %s, %s", count(st.Rooms, "room"), count(st.Participants, "participant"), count(st.Shares, "share"))
+	if st.SchemaVersion != 0 {
+		row("database", "schema %d", st.SchemaVersion)
+	}
+	if t := st.Transfer; t != nil {
+		row("transfer", "%s: %.1f GB out, %.1f GB in", t.Month, float64(t.EgressBytes)/1e9, float64(t.IngressBytes)/1e9)
+	}
+	if u := st.Update; u != nil && u.Latest != "" && u.Latest != st.Version {
+		security := ""
+		if u.Security {
+			security = " (security release)"
+		}
+		row("update", "%s is available%s: %s", u.Latest, security, u.URL)
+	}
+	return b.String()
+}
+
+func withMethod(ip, method string) string {
+	if method == "" {
+		return ip
+	}
+	return ip + " (" + method + ")"
+}
+
+// count is "1 room", "3 rooms".
+func count(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
 }
 
 type backupOptions struct {
@@ -160,27 +278,93 @@ func adminUsersCmd() *command {
 	}
 }
 
-func runUsersList(context.Context, *invocation, jsonOptions, []string) error {
-	return errNotImplemented
-}
-
-func runUsersResetPassword(context.Context, *invocation, clientOptions, []string) error {
-	return errNotImplemented
-}
-
-func runUsersSetRole(_ context.Context, _ *invocation, _ clientOptions, args []string) error {
-	if role := args[1]; role != "admin" && role != "user" {
-		return usageErrorf("role %q: want admin or user", role)
+// runUsersList prints GET /v1/users: the document itself with --json, a table otherwise.
+func runUsersList(ctx context.Context, inv *invocation, o jsonOptions, _ []string) error {
+	var users ops.AdminUsers
+	err := o.call(ctx, inv, func(ctx context.Context, c *ops.AdminClient) (err error) {
+		users, err = c.Users(ctx)
+		return err
+	})
+	if err != nil {
+		return err
 	}
-	return errNotImplemented
+	if o.json {
+		if users.Users == nil {
+			users.Users = []ops.AdminUser{} // "users": [], never null
+		}
+		return printJSON(inv.stdout, users)
+	}
+	if len(users.Users) == 0 {
+		_, err := fmt.Fprintln(inv.stdout, "No accounts yet. `isshoni setup-url` prints the link that creates the admin account.")
+		return err
+	}
+	tw := tabwriter.NewWriter(inv.stdout, 0, 0, 2, ' ', 0)
+	_, _ = fmt.Fprintln(tw, "NAME\tROLE\tSTATUS\tCREATED\tLAST SEEN")
+	for _, u := range users.Users {
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", u.Username, u.Role, u.Status,
+			clock(time.Time(u.CreatedAt)), clock(time.Time(u.LastSeenAt)))
+	}
+	return tw.Flush()
 }
 
-func runUsersDisable(context.Context, *invocation, clientOptions, []string) error {
-	return errNotImplemented
+// runUsersResetPassword prints a one-time password-reset link (04 §12.5). Issuing it has already cleared the
+// password and signed the user out everywhere, and the command says so: it is the plan's "a password reset revokes
+// everything".
+func runUsersResetPassword(ctx context.Context, inv *invocation, o clientOptions, args []string) error {
+	name := args[0]
+	var link ops.AdminLink
+	err := o.call(ctx, inv, func(ctx context.Context, c *ops.AdminClient) (err error) {
+		link, err = c.ResetLink(ctx, name)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	return printLink(inv, linkOutput{
+		heading: fmt.Sprintf("Password-reset link for %s (valid %s, works once):", name, validFor(time.Time(link.ExpiresAt))),
+		url:     link.URL,
+		notes: []string{
+			fmt.Sprintf("A password reset revokes everything: %s's old password no longer works, and %s is signed out", name, name),
+			"everywhere (browsers, devices and push notifications).",
+		},
+	})
 }
 
-func runUsersEnable(context.Context, *invocation, clientOptions, []string) error {
-	return errNotImplemented
+func runUsersSetRole(ctx context.Context, inv *invocation, o clientOptions, args []string) error {
+	name, role := args[0], api.Role(args[1])
+	if role != api.RoleAdmin && role != api.RoleUser {
+		return usageErrorf("role %q: want admin or user", args[1])
+	}
+	err := o.call(ctx, inv, func(ctx context.Context, c *ops.AdminClient) error { return c.SetRole(ctx, name, role) })
+	if err != nil {
+		return err
+	}
+	what := "a regular user"
+	if role == api.RoleAdmin {
+		what = "an admin"
+	}
+	_, err = fmt.Fprintf(inv.stdout, "%s is now %s.\n", name, what)
+	return err
+}
+
+func runUsersDisable(ctx context.Context, inv *invocation, o clientOptions, args []string) error {
+	name := args[0]
+	err := o.call(ctx, inv, func(ctx context.Context, c *ops.AdminClient) error { return c.SetDisabled(ctx, name, true) })
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(inv.stdout, "%s can no longer sign in and is signed out everywhere.\n", name)
+	return err
+}
+
+func runUsersEnable(ctx context.Context, inv *invocation, o clientOptions, args []string) error {
+	name := args[0]
+	err := o.call(ctx, inv, func(ctx context.Context, c *ops.AdminClient) error { return c.SetDisabled(ctx, name, false) })
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(inv.stdout, "%s can sign in again.\n", name)
+	return err
 }
 
 type inviteCreateOptions struct {
@@ -208,20 +392,27 @@ func adminInviteCmd() *command {
 	}
 }
 
-// Invite limits (04 §3.1, 03 §7.9). 0 is the flag's "not sent" value, so the server's setting applies.
-const (
-	inviteMaxUses = 1000
-	inviteMaxTTL  = 720 * time.Hour
-)
-
-func runInviteCreate(_ context.Context, _ *invocation, o inviteCreateOptions, _ []string) error {
-	if o.uses < 0 || o.uses > inviteMaxUses {
-		return usageErrorf("--uses %d: want 1 to %d", o.uses, inviteMaxUses)
+// runInviteCreate prints an invite link (04 §12.5). 0 is a flag's "not sent" value: the server's invite setting
+// applies then (03 §9). The limits are the socket's (04 §3.1, 03 §7.9).
+func runInviteCreate(ctx context.Context, inv *invocation, o inviteCreateOptions, _ []string) error {
+	if o.uses < 0 || o.uses > ops.AdminInviteMaxUses {
+		return usageErrorf("--uses %d: want 1 to %d", o.uses, ops.AdminInviteMaxUses)
 	}
-	if o.ttl != 0 && (o.ttl < time.Hour || o.ttl > inviteMaxTTL || o.ttl%time.Hour != 0) {
+	if o.ttl != 0 && (o.ttl < time.Hour || o.ttl > ops.AdminInviteMaxTTL || o.ttl%time.Hour != 0) {
 		return usageErrorf("--ttl %s: want whole hours from 1h to 720h", o.ttl)
 	}
-	return errNotImplemented
+	var link ops.AdminLink
+	err := o.call(ctx, inv, func(ctx context.Context, c *ops.AdminClient) (err error) {
+		link, err = c.CreateInvite(ctx, o.uses, o.ttl)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	return printLink(inv, linkOutput{
+		heading: fmt.Sprintf("Invite link (valid %s):", validFor(time.Time(link.ExpiresAt))),
+		url:     link.URL,
+	})
 }
 
 type confirmOptions struct {
@@ -253,8 +444,6 @@ type logLevelOptions struct {
 	forDur time.Duration
 }
 
-var logLevels = []string{"debug", "info", "warn", "error"}
-
 func adminLogLevelCmd() *command {
 	return &command{
 		name:    "log-level",
@@ -270,12 +459,19 @@ func adminLogLevelCmd() *command {
 	}
 }
 
-func runLogLevel(_ context.Context, _ *invocation, o logLevelOptions, args []string) error {
-	if !slices.Contains(logLevels, args[0]) {
-		return usageErrorf("log level %q: want debug, info, warn or error", args[0])
+// runLogLevel changes the running server's log level for a while (04 §3.1, §12.2).
+func runLogLevel(ctx context.Context, inv *invocation, o logLevelOptions, args []string) error {
+	level := args[0]
+	if !slices.Contains(ops.LogLevelNames, level) {
+		return usageErrorf("log level %q: want debug, info, warn or error", level)
 	}
 	if o.forDur <= 0 {
 		return usageErrorf("--for %s: want a positive duration", o.forDur)
 	}
-	return errNotImplemented
+	err := o.call(ctx, inv, func(ctx context.Context, c *ops.AdminClient) error { return c.SetLogLevel(ctx, level, o.forDur) })
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(inv.stdout, "The log level is %s for %s, then back to the configured level.\n", level, shortDuration(o.forDur))
+	return err
 }

@@ -1,0 +1,102 @@
+# setup-url mints a one-time link through the admin socket (04 §3.3, §12.5). "fakeserver" serves a real admin socket
+# with fake accounts inside the test; no admin exists at first, so the setup link is available.
+
+# No server: exit 4.
+exitcode 4 isshoni setup-url
+! stdout .
+stderr '^isshoni is not running \(no server on .*admin\.sock\)$'
+
+fakeserver start
+
+# Off a terminal stdout is the link alone, so a script can take it; what is for people goes to stderr.
+exec isshoni setup-url
+cmp stdout link1.txt
+stderr '^Open this link in your browser to create the admin account \(valid 24 hours, works once\):$'
+stderr '^Running `isshoni setup-url` again makes a new link and cancels this one\.$'
+
+# Each call mints a new link (the server cancels the earlier ones).
+exec isshoni setup-url --no-qr
+stdout '^https://watch\.example\.com/setup#token2$'
+
+# --json: exactly one JSON document on stdout.
+exec isshoni setup-url --json
+stdout '^\{"url":"https://watch\.example\.com/setup#token3","expiresAt":"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z","tlsReady":true\}$'
+! stderr .
+
+# --qr prints the QR code even though stdout is not a terminal (install.sh passes it on): the link first, then the
+# code in half blocks. This link makes a 29-module code; with the quiet zone of 2 that is 33 columns and 17 lines.
+exec isshoni setup-url --qr
+stdout '^https://watch\.example\.com/setup#token4$'
+stdout -count=17 '^[█▀▄ ]{33}$'
+stdout -count=1 '^█{33}$'
+exitcode 2 isshoni setup-url --qr --no-qr
+
+# --wait takes at most an hour, the server's limit: a longer one is a usage error, not the server's "waitReadyS".
+exitcode 2 isshoni setup-url --wait 2h
+! stdout .
+stderr '^isshoni setup-url: --wait 2h0m0s: want at most 1h$'
+! stderr 'waitReadyS'
+
+# The certificate is not there yet: the link is printed all the same, with a note.
+fakeserver set tls pending
+exec isshoni setup-url --json
+stdout '"url":"https://watch\.example\.com/setup#token5".*"tlsReady":false\}$'
+stderr '^The certificate isn''t ready yet\. The link works once it is; check with `isshoni doctor`\.$'
+
+# --wait first waits for the server to be ready.
+fakeserver after 1s set tls ready
+exec isshoni setup-url --json --wait 30s
+stdout '"url":"https://watch\.example\.com/setup#token6".*"tlsReady":true\}$'
+! stderr 'certificate'
+
+# --wait also covers a server that has not started yet (docker compose up -d, then setup-url --wait).
+fakeserver stop
+exitcode 4 isshoni setup-url --wait 1s
+fakeserver after 1s start
+exec isshoni setup-url --wait 30s
+stdout '^https://watch\.example\.com/setup#token1$'
+
+# So does a server that has bound its socket and goes away before it serves it: the connection that waited for it
+# is cut, which is "not running" for a caller the server would not refuse, and --wait keeps trying.
+fakeserver stop
+fakeserver deaf
+fakeserver after 1s start
+exec isshoni setup-url --wait 30s
+stdout '^https://watch\.example\.com/setup#token1$'
+! stderr 'Permission denied'
+
+# Once an admin exists the setup link is gone: exit 7 with the fix, nothing on stdout, and no waiting.
+fakeserver set admin yes
+exitcode 7 isshoni setup-url
+! stdout .
+cmp stderr setup-done.txt
+exitcode 7 isshoni setup-url --json --qr --wait 30s
+! stdout .
+cmp stderr setup-done.txt
+fakeserver show links
+stdout '^1$'
+
+# Permission denied: exit 4 with the sudo message, which repeats the command as typed.
+fakeserver stop
+[peercred] fakeserver start -reject-peers
+[peercred] exitcode 4 isshoni setup-url --json --wait 30s
+[peercred] ! stdout .
+[peercred] stderr '^Permission denied on .*admin\.sock: run it with sudo \(sudo isshoni setup-url --json --wait 30s\)$'
+[peercred] fakeserver stop
+
+# The same when the caller may not enter the socket's directory (/run/isshoni is 0750).
+[root] stop 'file modes do not keep root out'
+[windows] stop 'no file modes'
+fakeserver start
+chmod 000 $SOCKDIR
+exitcode 4 isshoni setup-url
+stderr '^Permission denied on .*admin\.sock: run it with sudo \(sudo isshoni setup-url\)$'
+exitcode 4 isshoni admin status --json
+stderr '^Permission denied on .*admin\.sock: run it with sudo \(sudo isshoni admin status --json\)$'
+chmod 700 $SOCKDIR
+
+-- link1.txt --
+https://watch.example.com/setup#token1
+-- setup-done.txt --
+isshoni setup-url: setup is already done: an admin account exists, so there is no setup link
+  fix: use `isshoni admin users reset-password <name>` to get back into an admin account
