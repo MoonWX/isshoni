@@ -47,6 +47,13 @@ describe('PeoplePanel', () => {
     expect(row('u_bo')).not.toHaveTextContent('(you)');
   });
 
+  it('lists nobody while it is closed (the page keeps it mounted, 05 §16.6)', () => {
+    renderPanel({ open: false });
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(document.querySelectorAll('li[data-user-id]')).toHaveLength(0);
+    expect(screen.queryByText('alex (you)')).not.toBeInTheDocument();
+  });
+
   it('counts one person as one', () => {
     renderPanel({ participants: [alex] });
     expect(screen.getByRole('dialog', { name: '1 person here' })).toBeInTheDocument();

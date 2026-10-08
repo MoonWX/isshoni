@@ -129,3 +129,34 @@ export async function preloadLazyChunks(): Promise<void> {
 }
 
 export const PRELOAD_TIMEOUT_MS = 60_000;
+
+/** What a <dialog>'s close() found: the dialog's title, and whether the dialog was still in the page. */
+export interface DialogClose {
+  title: string;
+  inPage: boolean;
+}
+
+/**
+ * Gives jsdom's <dialog> the showModal() and close() it lacks (ui/Dialog falls back to the open attribute without
+ * them) and records every close(). A native <dialog> gives the focus back to the control that opened it when it is
+ * closed while it is in the page; one that is removed from the page while open leaves the focus on <body>, and a
+ * keyboard user at the top of the page (05 §16.6). So `inPage` is what a test checks. Call restore() in afterEach.
+ */
+export function stubNativeDialog(): { closes: DialogClose[]; restore: () => void } {
+  const closes: DialogClose[] = [];
+  const proto = HTMLDialogElement.prototype as Partial<HTMLDialogElement>;
+  proto.showModal = function showModal(this: HTMLDialogElement) {
+    this.setAttribute('open', '');
+  };
+  proto.close = function close(this: HTMLDialogElement) {
+    closes.push({ title: this.querySelector('h2')?.textContent ?? '', inPage: this.isConnected });
+    this.removeAttribute('open');
+  };
+  return {
+    closes,
+    restore() {
+      delete proto.showModal;
+      delete proto.close;
+    },
+  };
+}

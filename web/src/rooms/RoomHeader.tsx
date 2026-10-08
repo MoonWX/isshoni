@@ -30,6 +30,8 @@ export interface RoomHeaderProps {
   sharing: boolean;
   /** The switcher's list opened. */
   onOpenRooms?: () => void;
+  /** Opens the connection test: the account menu's "Test my connection" (05 §14.2), there only when this is given. */
+  onTestConnection?: () => void;
   /** The share controls (the Share button where the platform can share, Stop while sharing). */
   children?: ReactNode;
 }
@@ -43,6 +45,7 @@ export function RoomHeader({
   me,
   sharing,
   onOpenRooms,
+  onTestConnection,
   children,
 }: RoomHeaderProps) {
   const { t } = useTranslation();
@@ -73,7 +76,7 @@ export function RoomHeader({
       </div>
       <div className={styles.actions}>
         {children}
-        {me != null && <AccountMenu me={me} />}
+        {me != null && <AccountMenu me={me} onTestConnection={onTestConnection} />}
       </div>
     </header>
   );

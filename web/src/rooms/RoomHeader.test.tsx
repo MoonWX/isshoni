@@ -1,9 +1,11 @@
 // The room header (05 §11.2): the room's name, the people count, the switcher (only when GET /api/v1/rooms says
 // showRoomList, and "Create room" only for admins then), and the account menu.
-import { screen, waitFor, within } from '@testing-library/react';
+import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
 import { describe, expect, it, vi } from 'vitest';
+import { useStore } from 'zustand';
+import { createStore } from 'zustand/vanilla';
 
 import type { PwaProvider } from '../platform/types';
 import { queryKeys } from '../protocol/queryKeys';
@@ -11,34 +13,42 @@ import { apiPath, meFixture, roomsFixture, server } from '../test/msw';
 import { createTestPlatform } from '../test/platform';
 import { createTestServices, renderRoute } from '../test/render';
 import { RoomHeader, type RoomHeaderProps } from './RoomHeader';
-import { twoRooms } from './testing/page';
+import { stubNativeDialog, twoRooms } from './testing/page';
 
 function renderHeader(props: Partial<RoomHeaderProps> = {}, pwa: PwaProvider | null = null) {
   const onOpenPeople = vi.fn();
   const onOpenRooms = vi.fn();
   const services = createTestServices({ platform: createTestPlatform({ pwa }) });
-  const header = (
-    <RoomHeader
-      roomId="lounge"
-      name="Lounge"
-      peopleCount={5}
-      onOpenPeople={onOpenPeople}
-      rooms={roomsFixture()}
-      me={meFixture()}
-      sharing={false}
-      onOpenRooms={onOpenRooms}
-      {...props}
-    />
-  );
+  // The header's props are in a store, so that a test can render it again with other ones (setProps), as the page
+  // does on every room.state.
+  const current = createStore<RoomHeaderProps>(() => ({
+    roomId: 'lounge',
+    name: 'Lounge',
+    peopleCount: 5,
+    onOpenPeople,
+    rooms: roomsFixture(),
+    me: meFixture(),
+    sharing: false,
+    onOpenRooms,
+    ...props,
+  }));
+  function Header() {
+    return <RoomHeader {...useStore(current)} />;
+  }
   const result = renderRoute({
     path: '/r/lounge',
     services,
     routes: [
-      { path: '/r/:roomId', element: header },
+      { path: '/r/:roomId', Component: Header },
       { path: '*', element: <h1>Another page</h1> },
     ],
   });
-  return { ...result, onOpenPeople, onOpenRooms };
+  const setProps = (next: Partial<RoomHeaderProps>): void => {
+    act(() => {
+      current.setState(next);
+    });
+  };
+  return { ...result, onOpenPeople, onOpenRooms, setProps };
 }
 
 const openSwitcher = () => userEvent.click(screen.getByRole('button', { name: 'Switch room' }));
@@ -128,6 +138,25 @@ describe('the room switcher (05 §11.2: only when showRoomList)', () => {
     expect(router.state.location.pathname).toBe('/r/lounge');
   });
 
+  it('Cancel closes the question in place, with the focus on the switcher’s button to return to (05 §16.6)', async () => {
+    // A native <dialog> gives the focus back to where it was when it opened, if it is closed while in the page.
+    const dialogs = stubNativeDialog();
+    try {
+      renderHeader({ rooms: twoRooms(), sharing: true });
+      await openSwitcher();
+      await userEvent.click(screen.getByRole('link', { name: /Games/ }));
+      const confirm = screen.getByRole('dialog', { name: 'Stop sharing and switch to Games?' });
+      // The link went with the list: the focus is on something that stays when the question opens.
+      expect(screen.getByRole('button', { name: 'Switch room' })).toHaveFocus();
+
+      await userEvent.click(within(confirm).getByRole('button', { name: 'Cancel' }));
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      expect(dialogs.closes).toEqual([{ title: 'Stop sharing and switch to Games?', inPage: true }]);
+    } finally {
+      dialogs.restore();
+    }
+  });
+
   it('switches once the user confirmed', async () => {
     const { router } = renderHeader({ rooms: twoRooms(), sharing: true });
     await openSwitcher();
@@ -150,6 +179,29 @@ describe('the room switcher (05 §11.2: only when showRoomList)', () => {
     await openSwitcher();
     expect(screen.getByRole('dialog', { name: 'Rooms' })).toBeInTheDocument();
     expect(screen.queryByRole('link', { name: 'Create room' })).not.toBeInTheDocument();
+  });
+
+  it('leaves the keyboard focus on a room’s link when the header renders again', async () => {
+    const { setProps, onOpenRooms } = renderHeader({ rooms: twoRooms() });
+    await openSwitcher();
+    const games = screen.getByRole('link', { name: /Games/ });
+    games.focus();
+    expect(games).toHaveFocus();
+    // What the page does on every room.state, and when the list it refetched on opening arrives.
+    setProps({ peopleCount: 6, rooms: twoRooms() });
+    expect(screen.getByRole('button', { name: /^6 here/ })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Games/ })).toHaveFocus();
+    expect(screen.getByRole('dialog', { name: 'Rooms' })).toBeInTheDocument();
+    expect(onOpenRooms).toHaveBeenCalledOnce();
+  });
+
+  it('tells the page’s newest onOpenRooms that the list opened', async () => {
+    const { setProps, onOpenRooms } = renderHeader({ rooms: twoRooms() });
+    const newest = vi.fn();
+    setProps({ onOpenRooms: newest });
+    await openSwitcher();
+    expect(newest).toHaveBeenCalledOnce();
+    expect(onOpenRooms).not.toHaveBeenCalled();
   });
 });
 
@@ -213,6 +265,24 @@ describe('the account menu', () => {
     await openMenu();
     await userEvent.click(screen.getByRole('button', { name: 'Install app' }));
     expect(promptInstall).toHaveBeenCalledOnce();
+  });
+
+  it('has no "Test my connection" unless the page offers the test', async () => {
+    renderHeader();
+    await openMenu();
+    expect(screen.queryByRole('button', { name: 'Test my connection' })).not.toBeInTheDocument();
+  });
+
+  it('"Test my connection" (05 §14.2) closes the menu, asks the page for the test, and leaves the focus on the menu’s button', async () => {
+    const onTestConnection = vi.fn();
+    renderHeader({ onTestConnection });
+    await openMenu();
+    await userEvent.click(screen.getByRole('button', { name: 'Test my connection' }));
+    expect(onTestConnection).toHaveBeenCalledOnce();
+    expect(screen.queryByRole('dialog', { name: 'Account menu' })).not.toBeInTheDocument();
+    // The entry went with the menu. The test's dialog returns the focus to where it was when it opened, so that
+    // must be something that stays: the menu's button.
+    expect(screen.getByRole('button', { name: /^Account menu/ })).toHaveFocus();
   });
 
   it('Sign out runs the logout flow: the session ends on the server and the user is forgotten here', async () => {

@@ -7,8 +7,10 @@
 //   InviteLinkCard of 05 §14.1, arrives with that card (the setup wizard's step 3).
 // - "Admin" shows to admins only: other users would get NotFound there (05 §5).
 // - "Install app" shows while the browser offers an install prompt (05 §16.3).
-import { Bell, CircleUser, Download, Info, LogOut, Settings, ShieldCheck, UserPlus } from 'lucide-react';
-import type { ReactNode } from 'react';
+// - "Test my connection" opens the page's connection test (05 §14.2): the way to it while no banner offers it,
+//   for a user whose video is poor on a connection that is up.
+import { Activity, Bell, CircleUser, Download, Info, LogOut, Settings, ShieldCheck, UserPlus } from 'lucide-react';
+import { useRef, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Link } from 'react-router';
 
@@ -22,6 +24,8 @@ import styles from './AccountMenu.module.css';
 export interface AccountMenuProps {
   /** GET /api/v1/me; the guard around the room loaded it. */
   me: Me;
+  /** Opens the connection test (05 §14.2). The "Test my connection" entry shows only when this is given. */
+  onTestConnection?: () => void;
 }
 
 /** A link of the menu; a click on it closes the menu. */
@@ -46,18 +50,29 @@ function MenuLink({
   );
 }
 
-export function AccountMenu({ me }: AccountMenuProps) {
+export function AccountMenu({ me, onTestConnection }: AccountMenuProps) {
   const { t } = useTranslation();
   const { platform } = useApp();
   const { logout, pending } = useLogout();
   const name = me.user.username;
+  /** The menu's button, which is also the Popover's: an entry that opens a dialog hands the focus back to it. */
+  const menuButton = useRef<HTMLButtonElement | null>(null);
 
   return (
     <Popover
       label={t('room.menu.label')}
       align="end"
-      trigger={(props) => (
-        <button type="button" {...props} className={styles.trigger} aria-label={t('room.menu.open', { name })}>
+      trigger={({ ref, ...props }) => (
+        <button
+          type="button"
+          {...props}
+          ref={(el) => {
+            ref.current = el;
+            menuButton.current = el;
+          }}
+          className={styles.trigger}
+          aria-label={t('room.menu.open', { name })}
+        >
           <CircleUser aria-hidden="true" />
           <span className={styles.who}>{name}</span>
         </button>
@@ -96,6 +111,24 @@ export function AccountMenu({ me }: AccountMenuProps) {
                 >
                   <Download aria-hidden="true" />
                   {t('room.menu.install')}
+                </button>
+              </li>
+            )}
+            {onTestConnection && (
+              <li>
+                <button
+                  type="button"
+                  className={styles.item}
+                  onClick={() => {
+                    close();
+                    // This entry goes with the menu, and the test's dialog returns the focus to where it was when
+                    // it opened (05 §16.6): that has to be something that stays, the menu's button.
+                    menuButton.current?.focus();
+                    onTestConnection();
+                  }}
+                >
+                  <Activity aria-hidden="true" />
+                  {t('room.connection.testConnection')}
                 </button>
               </li>
             )}

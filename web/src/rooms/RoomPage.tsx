@@ -8,10 +8,15 @@
 //   it to the stage, with the local preview of this page's share;
 // - the Share buttons publish through session.startShare, and know about this user's share on another tab or
 //   device (findShareElsewhere), which the share sheet offers to stop;
-// - "Test my connection" (the connection banner, the stage's media banner) opens the connection test.
+// - "Test my connection" (the account menu, the connection banner, the stage's media banner) opens the connection
+//   test (05 §14.2).
 //
 // The stage, the Share button and the connection test are lazy chunks (lazyMedia.ts, ConnTestDialog.tsx). The page
 // asks for the first two as it renders, with placeholders of their shape, so the header is there at once.
+//
+// The people panel and the connection test stay mounted and are closed through their `open` prop: a native
+// <dialog> gives the focus back to the control that opened it only when it is closed while still in the page
+// (05 §16.6).
 //
 // Still to come, each with its slice: the in-app browser banner above the page and the notifications card in the
 // empty state (05 §16.3); the share panel, which takes over the Stop button here (05 §13.7); ?focus=<shareId>
@@ -129,6 +134,7 @@ export function RoomPage() {
         onOpenRooms={() => {
           void rooms.refetch();
         }}
+        onTestConnection={openTest}
       >
         {platform.sharing !== null && !failed && (
           // The same button until the chunk is there, so the header doesn't move. No button for a room that
@@ -171,30 +177,26 @@ export function RoomPage() {
           </Suspense>
         )}
       </main>
-      {peopleOpen && state !== null && (
-        <PeoplePanel
-          open
-          onClose={() => {
-            setPeopleOpen(false);
-          }}
-          participants={state.participants}
-          shares={state.shares}
-          selfUserId={userId}
-          selfIsAdmin={me.data != null && isAdmin(me.data)}
-          onWatch={(id) => {
-            // A pick, like a click on the tile: it holds until that share ends (05 §12.2).
-            viewer.store.getState().focusShare(id);
-          }}
-        />
-      )}
-      {testOpen && (
-        <ConnTestDialog
-          open
-          onClose={() => {
-            setTestOpen(false);
-          }}
-        />
-      )}
+      <PeoplePanel
+        open={peopleOpen && state !== null}
+        onClose={() => {
+          setPeopleOpen(false);
+        }}
+        participants={state?.participants ?? []}
+        shares={state?.shares ?? []}
+        selfUserId={userId}
+        selfIsAdmin={me.data != null && isAdmin(me.data)}
+        onWatch={(id) => {
+          // A pick, like a click on the tile: it holds until that share ends (05 §12.2).
+          viewer.store.getState().focusShare(id);
+        }}
+      />
+      <ConnTestDialog
+        open={testOpen}
+        onClose={() => {
+          setTestOpen(false);
+        }}
+      />
     </div>
   );
 }

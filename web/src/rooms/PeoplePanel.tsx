@@ -4,6 +4,9 @@
 //
 // The admin badge shows on the user's own row only: room.state says who is in the room, not who is an admin (01
 // §8.5), so the page knows it of nobody but its own user (GET /api/v1/me).
+//
+// The page keeps the panel mounted and closes it with `open`, so that the browser gives the focus back to the
+// people count when it closes (05 §16.6). Closed, it lists nobody: the rows are rendered only while it shows.
 import { MonitorUp, ShieldCheck } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
@@ -57,9 +60,8 @@ export function PeoplePanel({
   const { t } = useTranslation();
   return (
     <Sheet open={open} onClose={onClose} side="end" title={t('room.people.title', { count: participants.length })}>
-      {participants.length === 0 ? (
-        <p className={styles.none}>{t('room.people.none')}</p>
-      ) : (
+      {open && participants.length === 0 && <p className={styles.none}>{t('room.people.none')}</p>}
+      {open && participants.length > 0 && (
         <ul className={styles.list}>
           {participants.map((p) => {
             const self = p.userId === selfUserId;

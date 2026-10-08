@@ -5,8 +5,11 @@
 //
 // Switching is a navigation to the other room's page, whose session then joins it. Joining another room ends this
 // page's share (01 §8.4), so while sharing the switcher asks first: "Stop sharing and switch to <room>?" (05 §11.1).
+// That question's dialog stays mounted and is closed through `open`, and it opens with the focus on the switcher's
+// button: a native <dialog> gives the focus back to where it was when it opened, if it is closed while in the page
+// (05 §16.6), and the link that was clicked is gone with the list by then.
 import { ChevronsUpDown, Plus } from 'lucide-react';
-import { useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Link, useNavigate } from 'react-router';
 
@@ -33,8 +36,22 @@ export interface RoomSwitcherProps {
 export function RoomSwitcher({ rooms, currentId, isAdmin, sharing, onOpen }: RoomSwitcherProps) {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  /** The room a switch away from a running share waits to be confirmed for. */
-  const [asking, setAsking] = useState<Room | null>(null);
+  /** The room the question is (or was last) about: a switch away from a running share waits to be confirmed. */
+  const [asked, setAsked] = useState<Room | null>(null);
+  const [asking, setAsking] = useState(false);
+  /** The switcher's button, which is also the Popover's. */
+  const button = useRef<HTMLButtonElement | null>(null);
+
+  // One callback for the component's life. Popover takes the focus into its panel whenever onOpenChange changes,
+  // and the page renders this again on every room.state, and when the list it refetched on opening arrives: a
+  // new function each time would pull the focus off the room a keyboard user had reached.
+  const onOpenRef = useRef(onOpen);
+  useEffect(() => {
+    onOpenRef.current = onOpen;
+  });
+  const onOpenChange = useCallback((open: boolean) => {
+    if (open) onOpenRef.current?.();
+  }, []);
 
   if (rooms?.showRoomList !== true) return null;
 
@@ -42,11 +59,18 @@ export function RoomSwitcher({ rooms, currentId, isAdmin, sharing, onOpen }: Roo
     <>
       <Popover
         label={t('room.switcher.label')}
-        onOpenChange={(open) => {
-          if (open) onOpen?.();
-        }}
-        trigger={(props) => (
-          <button type="button" {...props} className={styles.trigger} aria-label={t('room.switcher.open')}>
+        onOpenChange={onOpenChange}
+        trigger={({ ref, ...props }) => (
+          <button
+            type="button"
+            {...props}
+            ref={(el) => {
+              ref.current = el;
+              button.current = el;
+            }}
+            className={styles.trigger}
+            aria-label={t('room.switcher.open')}
+          >
             <ChevronsUpDown aria-hidden="true" />
           </button>
         )}
@@ -81,7 +105,9 @@ export function RoomSwitcher({ rooms, currentId, isAdmin, sharing, onOpen }: Roo
                           close();
                           if (!sharing) return;
                           e.preventDefault();
-                          setAsking(room);
+                          button.current?.focus();
+                          setAsked(room);
+                          setAsking(true);
                         }}
                       >
                         {counts}
@@ -100,19 +126,20 @@ export function RoomSwitcher({ rooms, currentId, isAdmin, sharing, onOpen }: Roo
           </>
         )}
       </Popover>
-      {asking !== null && (
+      {asked !== null && (
+        // From the first question on it stays, closed.
         <Dialog
-          open
+          open={asking}
           size="sm"
-          title={t('room.switcher.confirm.title', { room: asking.name })}
+          title={t('room.switcher.confirm.title', { room: asked.name })}
           onClose={() => {
-            setAsking(null);
+            setAsking(false);
           }}
           footer={
             <>
               <Button
                 onClick={() => {
-                  setAsking(null);
+                  setAsking(false);
                 }}
               >
                 {t('common.cancel')}
@@ -120,8 +147,8 @@ export function RoomSwitcher({ rooms, currentId, isAdmin, sharing, onOpen }: Roo
               <Button
                 variant="danger"
                 onClick={() => {
-                  setAsking(null);
-                  void navigate(roomPath(asking.id));
+                  setAsking(false);
+                  void navigate(roomPath(asked.id));
                 }}
               >
                 {t('room.switcher.confirm.action')}

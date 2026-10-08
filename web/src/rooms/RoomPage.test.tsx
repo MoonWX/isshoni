@@ -25,6 +25,7 @@ import {
   PRELOAD_TIMEOUT_MS,
   preloadLazyChunks,
   renderRoomApp,
+  stubNativeDialog,
   stubRest,
   twoRooms,
   type RestAnswers,
@@ -344,6 +345,20 @@ describe('RoomPage (05 §11.2)', () => {
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 
+  it('the account menu’s "Test my connection" opens the connection test (05 §14.2)', async () => {
+    setup();
+    await open();
+    // No outage and no banner: the menu is the way to the test.
+    expect(screen.getByTestId('connection-banner')).not.toHaveAttribute('data-kind');
+    fireEvent.click(screen.getByRole('button', { name: 'Account menu, alex' }));
+    const menu = screen.getByRole('dialog', { name: 'Account menu' });
+    fireEvent.click(within(menu).getByRole('button', { name: 'Test my connection' }));
+    await advance();
+    expect(screen.queryByRole('dialog', { name: 'Account menu' })).not.toBeInTheDocument();
+    const dialog = screen.getByRole('dialog', { name: 'Test my connection' });
+    expect(within(dialog).getByRole('button', { name: 'Test my connection' })).toBeEnabled();
+  });
+
   it('has the account menu of the signed-in user', async () => {
     setup({ me: meFixture({ admin: true }) });
     await open();
@@ -351,6 +366,80 @@ describe('RoomPage (05 §11.2)', () => {
     const menu = screen.getByRole('dialog', { name: 'Account menu' });
     expect(within(menu).getByText('Signed in as admin')).toBeInTheDocument();
     expect(within(menu).getByRole('link', { name: 'Admin' })).toHaveAttribute('href', '/admin');
+  });
+});
+
+describe('RoomPage: its dialogs and the keyboard focus (05 §16.6)', () => {
+  // A native <dialog> gives the focus back to the control that opened it only when it is closed while it is in the
+  // page. jsdom has no native dialog: the stub records what each close() found.
+  let dialogs: ReturnType<typeof stubNativeDialog>;
+
+  beforeEach(() => {
+    dialogs = stubNativeDialog();
+  });
+
+  afterEach(() => {
+    dialogs.restore();
+  });
+
+  it('closes the people panel in place', async () => {
+    setup();
+    await open();
+    sendState({ participants: [alex, bo] });
+    fireEvent.click(screen.getByRole('button', { name: /^2 here/ }));
+    const panel = screen.getByRole('dialog', { name: '2 people here' });
+    fireEvent.click(within(panel).getByRole('button', { name: 'Close' }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(dialogs.closes).toEqual([{ title: '2 people here', inPage: true }]);
+  });
+
+  it('closes the people panel in place when a click on a person closes it', async () => {
+    setup();
+    await open();
+    sendState({ participants: [alex, bo], shares: [shareInfo('s_bo', 'u_bo', 'c_bo')] });
+    fireEvent.click(screen.getByRole('button', { name: /^2 here/ }));
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: /bo/ }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(dialogs.closes).toEqual([{ title: '2 people here', inPage: true }]);
+  });
+
+  it('closes the people panel in place when the room’s snapshot goes', async () => {
+    setup({ rooms: twoRooms() });
+    const { router } = await open();
+    sendState({ participants: [alex, bo] });
+    fireEvent.click(screen.getByRole('button', { name: /^2 here/ }));
+    expect(screen.getByRole('dialog', { name: '2 people here' })).toBeInTheDocument();
+
+    // Another room: the list of the one before is gone, and the panel with it. It doesn't come back by itself.
+    await act(() => router.navigate('/r/games'));
+    await advance();
+    expect(screen.getByRole('heading', { level: 1, name: 'Games' })).toBeInTheDocument();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(dialogs.closes.map((c) => c.inPage)).toEqual([true]);
+  });
+
+  it('closes the connection test in place', async () => {
+    setup();
+    await open();
+    fireEvent.click(screen.getByRole('button', { name: 'Account menu, alex' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Test my connection' }));
+    await advance();
+    const dialog = screen.getByRole('dialog', { name: 'Test my connection' });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(dialogs.closes).toEqual([{ title: 'Test my connection', inPage: true }]);
+  });
+
+  it('lists nobody in the closed people panel', async () => {
+    setup();
+    await open();
+    sendState({ participants: [alex, bo] });
+    // The drawer is in the page all the time, closed: its rows must not be found there by a search for a name.
+    expect(screen.queryByText('alex (you)')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /^2 here/ }));
+    expect(screen.getByText('alex (you)')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+    expect(screen.queryByText('alex (you)')).not.toBeInTheDocument();
   });
 });
 

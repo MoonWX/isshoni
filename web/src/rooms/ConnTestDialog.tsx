@@ -8,6 +8,11 @@
 //
 // The test runs when the user presses the panel's button, not when the dialog opens: it makes peer connections to
 // the server, which the server limits per user (04 §7.7).
+//
+// The page keeps this dialog mounted and closes it with `open`, so that the browser gives the focus back to the
+// button that opened it (05 §16.6). The panel is there only while the dialog shows: closing it ends a test that is
+// running and drops its result, and each opening starts with a fresh panel (and with a new try at a chunk that
+// could not be loaded the last time).
 import { useEffect, useState, type ComponentType } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -42,16 +47,26 @@ export function ConnTestDialog({ open, onClose, load = loadPanel }: ConnTestDial
   /** Grows with every "Try again". */
   const [attempt, setAttempt] = useState(0);
 
+  // A load that failed is the news of that opening, not of the next one: the effect below loads again then.
+  const [wasOpen, setWasOpen] = useState(open);
+  if (wasOpen !== open) {
+    setWasOpen(open);
+    if (open && panel.status === 'failed') setPanel({ status: 'loading' });
+  }
+
   useEffect(() => {
     if (!open) return undefined;
     let current = true;
     load().then(
       (Panel) => {
-        if (current) setPanel({ status: 'ready', Panel });
+        // Nothing new when a later opening finds the panel it already has.
+        if (current)
+          setPanel((was) => (was.status === 'ready' && was.Panel === Panel ? was : { status: 'ready', Panel }));
       },
       (err: unknown) => {
         log.warn('the connection test could not be loaded', { error: err });
-        if (current) setPanel({ status: 'failed' });
+        // A panel from an opening before still works.
+        if (current) setPanel((was) => (was.status === 'ready' ? was : { status: 'failed' }));
       },
     );
     return () => {
@@ -61,13 +76,13 @@ export function ConnTestDialog({ open, onClose, load = loadPanel }: ConnTestDial
 
   return (
     <Dialog open={open} onClose={onClose} size="lg" title={t('room.connection.testConnection')}>
-      {panel.status === 'ready' && <panel.Panel />}
-      {panel.status === 'loading' && (
+      {open && panel.status === 'ready' && <panel.Panel />}
+      {open && panel.status === 'loading' && (
         <div className={styles.waiting}>
           <Spinner />
         </div>
       )}
-      {panel.status === 'failed' && (
+      {open && panel.status === 'failed' && (
         <div className={styles.waiting}>
           <p role="alert">{t('room.connection.testUnavailable')}</p>
           <Button

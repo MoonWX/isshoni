@@ -3,12 +3,21 @@
 import { act, fireEvent, screen, within } from '@testing-library/react';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { makeError } from '../protocol/testing';
 import { shareStore } from '../share/shareStore';
 import { createTestServices } from '../test/render';
 import { isRoomPath } from './hooks';
 import { peekRoomRuntime } from './runtime';
 import { createHarness, FakeShare, pickedSource, refuseConnections, type Harness } from './testing/harness';
-import { advance, PRELOAD_TIMEOUT_MS, preloadLazyChunks, renderRoomApp, stubRest } from './testing/page';
+import {
+  advance,
+  PRELOAD_TIMEOUT_MS,
+  preloadLazyChunks,
+  renderRoomApp,
+  stubRest,
+  twoRooms,
+  type RestAnswers,
+} from './testing/page';
 
 let h: Harness | undefined;
 
@@ -31,9 +40,9 @@ afterEach(() => {
 const bar = (): HTMLElement | null => screen.queryByRole('region', { name: 'Your room' });
 
 /** The app in the Lounge, on the room page. */
-async function inLounge() {
+async function inLounge(rest: RestAnswers = {}) {
   h = createHarness();
-  stubRest(h.platform);
+  stubRest(h.platform, rest);
   const app = renderRoomApp(h.services, '/r/lounge');
   await advance();
   expect(h.runtime.stores.room.getState()).toMatchObject({ roomId: 'lounge', joinState: 'joined' });
@@ -110,6 +119,53 @@ describe('InRoomBar (05 §11.1)', () => {
     });
     await advance(2_000);
     expect(within(bar() as HTMLElement).getByTestId('connection-banner')).toHaveTextContent('Reconnecting…');
+  });
+
+  it('is not there for a room that refused the user: they are in no room', async () => {
+    h = createHarness();
+    stubRest(h.platform, { rooms: twoRooms() });
+    h.server.handle('room.join', () => ({ error: makeError('room_full', 'request') }));
+    const { router } = renderRoomApp(h.services, '/r/games');
+    await advance();
+    expect(screen.getByRole('alert')).toHaveTextContent('This room is full.');
+    // The refused room is still the session's desired one, for the page's "Try again".
+    expect(h.runtime.stores.room.getState()).toMatchObject({ roomId: 'games', joinState: 'failed' });
+
+    await act(() => router.navigate('/account'));
+    await advance();
+    expect(screen.getByRole('heading', { name: 'Account page' })).toBeInTheDocument();
+    // Nothing to go back to, and nothing to leave.
+    expect(bar()).not.toBeInTheDocument();
+  });
+
+  it('names the room from the room list while the join is still under way', async () => {
+    // No welcome yet: the join waits for it, and the session has no name for its room.
+    h = createHarness({ server: { autoWelcome: false } });
+    stubRest(h.platform, { rooms: twoRooms() });
+    const { router } = renderRoomApp(h.services, '/r/games');
+    await advance();
+    expect(h.runtime.stores.room.getState()).toMatchObject({ roomId: 'games', joinState: 'joining', room: null });
+
+    await act(() => router.navigate('/account'));
+    await advance();
+    expect(bar()).toHaveTextContent('In Games');
+    expect(bar()).not.toHaveTextContent('In Room');
+  });
+
+  it('shows the room’s name of today after a rename, as the room’s page does', async () => {
+    let name = 'Lounge';
+    const lounge = twoRooms().rooms[0];
+    if (lounge === undefined) throw new Error('twoRooms() has no rooms');
+    const { router, h } = await inLounge({ rooms: () => twoRooms({ rooms: [{ ...lounge, name }] }) });
+    await act(() => router.navigate('/account'));
+    expect(bar()).toHaveTextContent('In Lounge');
+
+    name = 'Living room';
+    act(() => {
+      h.server.send('invalidate', { topics: ['rooms'] });
+    });
+    await advance();
+    expect(bar()).toHaveTextContent('In Living room');
   });
 
   it('is not there while the session is in no room', async () => {
