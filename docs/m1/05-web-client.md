@@ -1043,6 +1043,10 @@ with W9 (until then it throws). `stats()` resolves with a fresh `StatsSample` (`
 `{connection: {state, resumed, connectionId}, room: {roomId, joinState, rev, participants}, viewer}`, where `viewer`
 is `viewerDebugState` (`focusedShareId`, `audibleShareId`, `audio`, `audioPlaying`, `media`, `subGen`, `shares[]`).
 
+Since the group 6 integration the tiles' freeze watch (§12.6, `viewer/freeze.ts`) reads the same collector:
+`connectStats` calls `attachFreezeWatch(viewer, collector)` when the collector exists and ends it with the runtime.
+It comes with the media chunk (`rooms/media.ts`), like the collector.
+
 ---
 
 ## 11. Room session and presence (`src/rooms/`)
@@ -1336,6 +1340,12 @@ the next `welcome` re-sends everything. The constants are `SUBSCRIBE_DEBOUNCE_MS
 - Fullscreen: `requestFullscreen()` on the stage container, so overlays stay visible. iPhone:
   `video.webkitEnterFullscreen()` (audio keeps playing from the `<audio>` element). Otherwise a CSS pseudo-fullscreen
   overlay. Toggle with `F`, double-click or double-tap on the stage, or the button.
+  - The app's toasts are outside that container, and a browser draws nothing outside the fullscreen element. So
+    while an element is fullscreen, `app/Toasts.tsx` renders its region into it (a portal into
+    `document.fullscreenElement`, or the prefixed one, followed with `fullscreenchange`), and back in its own place
+    afterwards: "bo started sharing [Watch]" (§12.2) reaches the friend who watches fullscreen. It stays where it is
+    for a fullscreen `<video>` or `<iframe>`, which show no children. A toast that is on screen when fullscreen
+    begins or ends starts its time again.
 - PiP (`requestPictureInPicture` on the stage video): desktop only. It's hidden on iOS in M1 (plan: PiP unreliable).
 - Wake lock: `navigator.wakeLock.request('screen')` while a share is being watched and the page is visible. It's
   released when hidden and re-requested on `visibilitychange → visible`.
@@ -1381,7 +1391,8 @@ The tile list is a roving-tabindex group (one tab stop). Shortcuts are active wh
 - A one-time hint on iOS: "Keep isshoni open while watching. Video pauses when you switch apps." (dismissal stored).
 - No PiP on iOS in M1; fullscreen is the native video player on iPhone.
 - Android Chrome: background audio keeps playing (rule 1 in §12.4). `navigator.mediaSession.metadata` is set to
-  `{title: "bo's window", artist: "<room>"}` so the notification shade shows what's playing.
+  `{title: "bo's window", artist: "<room>"}` so the notification shade shows what's playing. The room page gives
+  the layout the room's name for it (`RoomStage`'s `roomName`, the name the header shows).
 
 ---
 

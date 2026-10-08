@@ -10,7 +10,7 @@
 //   The session routes pc.offer and pc.ice {pc: 'sub'} to the PC's handleOffer and handleIce, and calls close()
 //   when the server's side is gone. The viewer remembers the PC for the stats (stats.ts).
 //
-// This module is in the app's initial bundle (the room runtime makes the viewer before any page shows), and
+// This module is in the room folder's chunk (the room runtime makes the viewer before the page shows), and
 // SubscriberPC is not: its class comes with the room's media chunk (rooms/media.ts), so createSubscriber takes it
 // from the caller, and it is only a type here.
 import type { Logger } from '../lib/log';

@@ -22,8 +22,9 @@
 // <dialog> gives the focus back to the control that opened it only when it is closed while still in the page
 // (05 §16.6).
 //
-// Still to come, each with its slice: the in-app browser banner above the page and the notifications card in the
-// empty state (05 §16.3); ?focus=<shareId> (05 §12.2).
+// ?focus=<shareId> (05 §12.2) is the viewer's: its layout reads the link and picks the share. Still to come, each
+// with its slice: the in-app browser banner above the page and the notifications card in the empty state
+// (05 §16.3).
 import { DoorClosed, MonitorUp } from 'lucide-react';
 import { Suspense, useCallback, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -174,6 +175,7 @@ export function RoomPage() {
               onStartShare={startShare}
               shareElsewhere={shareElsewhere}
               onTestConnection={openTest}
+              roomName={name}
             />
           </Suspense>
         )}

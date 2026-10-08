@@ -1,7 +1,7 @@
 // The stats' side of the room runtime (05 §10.7): the collector samples the viewer's sub PC while the session is in
 // a room, and window.__isshoni exists in a tab with the debug flag, with a fresh sample per tile and the page's
-// state. The runtime's own media is used (no fakes for the sub PC), so this also checks that the viewer knows the
-// session's sub PC.
+// state. The viewer's freeze watch reads the same samples (05 §12.6). The runtime's own media is used (no fakes for
+// the sub PC), so this also checks that the viewer knows the session's sub PC.
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { DEBUG_FLAG_KEY } from '../lib/stats/debugHandle';
@@ -171,5 +171,44 @@ describe('the stats collector follows the room (05 §10.7)', () => {
     const getStats = vi.spyOn(pc, 'getStats');
     await tick(2_000);
     expect(getStats).toHaveBeenCalled();
+  });
+});
+
+describe('the tiles’ freeze watch reads the collector (05 §12.6)', () => {
+  it('a shown share whose frame count stands still for 3 s is frozen, until frames arrive again', async () => {
+    await start(false);
+    const pc = await watching();
+    const viewer = runtime.viewer.store;
+    viewer.getState().setVisible('s_bo', true); // the stage shows it, as the mounted layout says
+    pc.stats = report(10);
+    await tick(2_000);
+    expect(viewer.getState().frozen).toEqual({});
+    await tick(4_000);
+    expect(viewer.getState().frozen).toEqual({ s_bo: true });
+
+    pc.stats = report(20);
+    await tick(2_000);
+    expect(viewer.getState().frozen).toEqual({});
+  });
+
+  it('a share that nothing shows is never frozen', async () => {
+    await start(false);
+    const pc = await watching();
+    pc.stats = report(10);
+    await tick(10_000);
+    expect(runtime.viewer.store.getState().frozen).toEqual({});
+  });
+
+  it('ends with the runtime', async () => {
+    await start(false);
+    const pc = await watching();
+    const viewer = runtime.viewer.store;
+    viewer.getState().setVisible('s_bo', true);
+    pc.stats = report(10);
+    await tick(6_000);
+    expect(viewer.getState().frozen).toEqual({ s_bo: true });
+
+    runtime.dispose();
+    expect(viewer.getState().frozen).toEqual({});
   });
 });

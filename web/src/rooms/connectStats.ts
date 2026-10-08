@@ -7,6 +7,9 @@
 //   a room's snapshot and stops when it has none anymore (leave(), a room switch, a room the server closed), which
 //   also forgets its samples.
 // - Its sources are the viewer's sub PC (viewer/stats.ts). The pub PC joins them when share/ has its source.
+// - The viewer's freeze watch (viewer/freeze.ts, 05 §12.6) reads the collector's samples from the moment the
+//   collector exists until the runtime goes: it is what puts "Waiting for video…" on a tile whose picture stands
+//   still. It comes with the same chunk.
 // - The handle exists only in a tab with sessionStorage['isshoni.debug'] === '1' (lib/stats/debugHandle.ts). Its
 //   state() has ids and states and no names: nothing the page doesn't show. dropSocket() arrives with the web
 //   recovery slice, which gives the SignalClient its hook.
@@ -54,12 +57,15 @@ export function connectStats(deps: ConnectStatsDeps): () => void {
   const { viewer, room, log } = deps;
   let collector: StatsCollector | null = null;
   let loading: Promise<StatsCollector> | null = null;
+  let offFreeze: (() => void) | null = null;
   let disconnected = false;
 
   const get = (): Promise<StatsCollector> => {
     loading ??= loadRoomMedia().then(
-      ({ createStatsCollector }) => {
+      ({ createStatsCollector, attachFreezeWatch }) => {
         collector = createStatsCollector({ sources: () => viewerStatsSources(viewer), log });
+        // A runtime that is gone by now never starts the collector, so there is nothing to watch either.
+        if (!disconnected) offFreeze = attachFreezeWatch(viewer, collector);
         return collector;
       },
       (err: unknown) => {
@@ -105,6 +111,8 @@ export function connectStats(deps: ConnectStatsDeps): () => void {
     disconnected = true;
     offRoom();
     uninstall();
+    offFreeze?.();
+    offFreeze = null;
     collector?.stop();
   };
 }

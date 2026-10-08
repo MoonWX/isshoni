@@ -753,6 +753,9 @@ type Deps struct { // test seams; zero values = real implementations
 	SPA        fs.FS        // the built web app; nil = web.Dist()
 	API, WS    http.Handler // /api/v1/ and GET /ws; nil = the real ones once wired (README S54), JSON 404 before
 	InProcess  bool         // servertest: leave the process-wide umask and Go memory limit alone
+	LogLevel   *slog.LevelVar   // the logger's level variable; with it `admin log-level` works (§12). cmd/isshoni
+	                            // and servertest pass theirs; nil: the command answers that the level is fixed
+	Argon      auth.ArgonParams // the cost of a password hash (03 §7.2); zero = auth.DefaultArgon. Tests lower it
 }
 
 type Server struct{ /* … */ }
@@ -2959,7 +2962,10 @@ Packages and names (exact):
   began itself) and `Logs()`; `Try(t, opts) (*Server, error)` for a server that is expected to refuse;
   `Options{TLS bool; Roots *x509.CertPool; Flags []string; Config func(*config.Config); Deps server.Deps; DataDir
   string}`. `Flags` are `serve` flags, so a key set there counts as set by the operator (`config.IsSet`, which pins
-  a policy key, §4.6); a change made in `Config` does not.
+  a policy key, §4.6); a change made in `Config` does not. Since the wiring (README S54) the admin socket is live
+  on `AdminSocket` (`ops.DialAdmin`), and the harness fills two of `Deps` when the test leaves them zero:
+  `LogLevel` is the level variable of its own logger, and `Argon` is a hash of 64 KiB and one pass, because the
+  server computes one hash at startup and the real cost is a good part of a second under the race detector.
   - **`Options.TLS`** (S44) runs the server in `tls.mode = "manual"` with a certificate from a private CA made for
     the test (§8.6): HTTPS, WSS and ICE-TCP on one port behind the 443 multiplexer, and the plain port that
     redirects to it. The certificate is for `TLSDomain`, `localhost`, `127.0.0.1` and `::1`; its files are

@@ -47,6 +47,7 @@ import (
 
 	"github.com/MoonWX/isshoni/internal/logx"
 	"github.com/MoonWX/isshoni/internal/server"
+	"github.com/MoonWX/isshoni/internal/server/auth"
 	"github.com/MoonWX/isshoni/internal/server/config"
 )
 
@@ -71,7 +72,9 @@ type Options struct {
 	// The server validates the result.
 	Config func(*config.Config)
 	// Deps are the server's test seams (fake STUN, a test SPA, stub handlers, …). The harness sets InProcess, and
-	// a zero Host becomes the process's environment with the container data-volume check off.
+	// a zero Host becomes the process's environment with the container data-volume check off. A nil LogLevel
+	// becomes the level variable of the harness's logger, so `admin log-level` works against a test server, and a
+	// zero Argon becomes a hash that costs next to nothing.
 	Deps server.Deps
 	// DataDir is the data directory. "" means a fresh one under t.TempDir(). A test passes its own to seed files
 	// before the start (a secrets.json, a database), or to run a second server on a directory in use.
@@ -98,7 +101,7 @@ type Server struct {
 	// mode. A test that dials the HTTPS port by itself (Srv.Addrs().HTTPS) verifies the server with it.
 	Roots *x509.CertPool
 	// AdminSocket is listen.admin_socket: a short path, because a unix socket path is limited to 104 bytes on
-	// macOS. Nothing listens there until the admin socket exists (README S43).
+	// macOS. The server listens there from Start to shutdown (04 §12); ops.DialAdmin(AdminSocket) reaches it.
 	AdminSocket string
 	// UDPPort and TCPPort are the bound ICE ports (listen.ice_udp, listen.ice_tcp). 0 until the SFU runs in the
 	// server (README S59).
@@ -128,6 +131,11 @@ type run struct {
 	err    error // set before done is closed
 	grace  time.Duration
 }
+
+// testArgon is the password hash of a test server unless Options.Deps.Argon names another: 64 KiB and one pass.
+// The real one (auth.DefaultArgon) takes a good part of a second under the race detector, and the server computes
+// one hash when it starts.
+var testArgon = auth.ArgonParams{MemoryKiB: 64, Time: 1, Threads: 1, SaltLen: 16, KeyLen: 32}
 
 // How long the harness waits before it gives up and fails the test. A healthy start takes milliseconds; the bounds
 // only keep a broken server from hanging the test run.
@@ -211,6 +219,12 @@ func (s *Server) start(t testing.TB, httpAddr, httpsAddr string) error {
 	level := new(slog.LevelVar)
 	level.Set(slog.LevelDebug)
 	log := logx.New(logx.Options{Level: level, Format: "json", Out: s.logs})
+	if deps.LogLevel == nil {
+		deps.LogLevel = level
+	}
+	if deps.Argon == (auth.ArgonParams{}) {
+		deps.Argon = testArgon
+	}
 
 	srv, err := server.New(cfg, log, deps)
 	if err != nil {

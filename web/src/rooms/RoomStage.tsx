@@ -30,6 +30,8 @@ export interface RoomStageProps {
   shareElsewhere: ShareElsewhere | null;
   /** Opens the connection test (the "can't reach the media port" banner's button). */
   onTestConnection: () => void;
+  /** The room's name, for the media notification of the share that plays (05 §12.8); the app's name without it. */
+  roomName?: string | undefined;
 }
 
 export function RoomStage({
@@ -39,6 +41,7 @@ export function RoomStage({
   onStartShare,
   shareElsewhere,
   onTestConnection,
+  roomName,
 }: RoomStageProps) {
   return (
     <ViewerLayout
@@ -46,6 +49,7 @@ export function RoomStage({
       localPreviews={localPreviews}
       empty={placeholder ?? <EmptyRoom onStartShare={onStartShare} shareElsewhere={shareElsewhere} />}
       onTestConnection={onTestConnection}
+      roomName={roomName}
     />
   );
 }

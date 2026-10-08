@@ -2038,7 +2038,7 @@ Forbidden:
 
   ```
   hello.web.json  hello.resume.json  hello.bearer.json  welcome.json  welcome.resumed.json
-  ping.json  pong.json  room.join.json  ok.room.join.json  room.leave.json  room.state.json
+  ping.json  pong.json  room.join.json  ok.room.join.json  room.leave.json  room.state.json  room.state.admin.json
   room.event.share.started.json  room.event.share.stopped.json  room.event.participant.left.json
   share.start.json  ok.share.start.json  share.update.json  share.stop.json
   pc.offer.pub.json  pc.answer.pub.json  pc.offer.sub.json  pc.answer.sub.json  pc.ice.json  pc.ice.end.json

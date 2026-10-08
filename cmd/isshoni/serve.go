@@ -40,15 +40,15 @@ func runServe(ctx context.Context, inv *invocation, _ []string) error {
 	if err := configInvalid(inv); err != nil {
 		return err
 	}
-	// The level is a variable: `isshoni admin log-level` changes it at runtime through the admin socket, once the
-	// wiring hands it to ops.NewLogLevel (README S54 starts the admin socket in the server).
+	// The level is a variable: `isshoni admin log-level` changes it at runtime through the admin socket. The server
+	// gets the variable as Deps.LogLevel and hands it to ops.NewLogLevel.
 	level := new(slog.LevelVar)
 	if l, ok := ops.ParseLogLevel(inv.cfg.Log.Level); ok { // validated by config; anything else stays at info
 		level.Set(l)
 	}
 	log := logx.New(logx.Options{Level: level, Format: inv.cfg.Log.Format, Out: inv.stderr})
 
-	srv, err := server.New(inv.cfg, log, server.Deps{})
+	srv, err := server.New(inv.cfg, log, server.Deps{LogLevel: level})
 	if err != nil {
 		return serveExit(inv, err)
 	}

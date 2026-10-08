@@ -13,7 +13,7 @@ import (
 // minimumFixtures is the fixture set 01 §14.3 requires for M1.
 var minimumFixtures = strings.Fields(`
 	hello.web hello.resume hello.bearer welcome welcome.resumed
-	ping pong room.join ok.room.join room.leave room.state
+	ping pong room.join ok.room.join room.leave room.state room.state.admin
 	room.event.share.started room.event.share.stopped room.event.participant.left
 	share.start ok.share.start share.update share.stop
 	pc.offer.pub pc.answer.pub pc.offer.sub pc.answer.sub pc.ice pc.ice.end

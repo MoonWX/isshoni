@@ -225,6 +225,31 @@ describe('RoomPage (05 §11.2)', () => {
     expect(screen.getByText('Nobody is sharing yet.')).toBeInTheDocument();
   });
 
+  it('names the room in the system’s "now playing" for the share that is heard (05 §12.8)', async () => {
+    // jsdom has no Media Session API: a stand-in for the two globals the viewer looks for.
+    class Metadata {
+      readonly title: string;
+      readonly artist: string;
+      constructor(init: { title?: string; artist?: string } = {}) {
+        this.title = init.title ?? '';
+        this.artist = init.artist ?? '';
+      }
+    }
+    const mediaSession: { metadata: Metadata | null } = { metadata: null };
+    vi.stubGlobal('MediaMetadata', Metadata);
+    Object.defineProperty(navigator, 'mediaSession', { value: mediaSession, configurable: true });
+    try {
+      setup();
+      await open();
+      expect(mediaSession.metadata).toBeNull();
+      sendState({ participants: [alex, bo], shares: [shareInfo('s_bo', 'u_bo', 'c_bo')] });
+      expect(mediaSession.metadata).toMatchObject({ title: "bo's window", artist: 'Lounge' });
+    } finally {
+      Reflect.deleteProperty(navigator, 'mediaSession');
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('gives the title back when the page is left', async () => {
     setup();
     document.title = 'isshoni';
