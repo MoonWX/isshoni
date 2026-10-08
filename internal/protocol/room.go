@@ -29,8 +29,12 @@ type RoomState struct {
 
 // ParticipantInfo merges all connections of one user in one room.
 type ParticipantInfo struct {
-	UserID      string            `json:"userId"`
-	Name        string            `json:"name"`
+	UserID string `json:"userId"`
+	Name   string `json:"name"`
+	// Admin says that the user is an admin (03's role), for the people panel's badge. It follows a role change like
+	// Name follows a rename. Absent means a member, as in welcome.user; a server from before the field never sends
+	// it (additive, 01 §14.1).
+	Admin       bool              `json:"admin,omitempty"`
 	Status      ParticipantStatus `json:"status"`
 	JoinedAt    time.Time         `json:"joinedAt"`
 	Connections []ConnectionInfo  `json:"connections"`

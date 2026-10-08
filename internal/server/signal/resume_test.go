@@ -983,9 +983,9 @@ func TestResumeResync(t *testing.T) {
 			t.Fatalf("welcome resumed %v, user %+v; want alex, an admin", w2.Resumed, w2.User)
 		}
 		st := expectState(t, c2, "lounge")
-		if pa, po := participantOf(t, &st, a.UserID), participantOf(t, &st, o.UserID); pa.Name != "alex" ||
-			pa.Status != protocol.ParticipantStatusPresent || po.Name != "olga" {
-			t.Errorf("state after the resume: A %+v, the observer %+v; want alex (present) and olga", pa, po)
+		if pa, po := participantOf(t, &st, a.UserID), participantOf(t, &st, o.UserID); pa.Name != "alex" || !pa.Admin ||
+			pa.Status != protocol.ParticipantStatusPresent || po.Name != "olga" || po.Admin {
+			t.Errorf("state after the resume: A %+v, the observer %+v; want alex (present, an admin) and olga", pa, po)
 		}
 		// After the state comes the resync's offer, not the one from while the connection was away. Nothing else was
 		// kept: the pong is the next message.
@@ -1009,9 +1009,9 @@ func TestResumeResync(t *testing.T) {
 		e.hub.Notify(signal.Target{Admins: true}, protocol.TopicAdminUsers)
 		expectInvalidate(t, c2, protocol.TopicAdminUsers)
 		settle()
-		if _, st := drain(t, obs); participantOf(t, st, a.UserID).Name != "alex" ||
+		if _, st := drain(t, obs); participantOf(t, st, a.UserID).Name != "alex" || !participantOf(t, st, a.UserID).Admin ||
 			participantOf(t, st, a.UserID).Status != protocol.ParticipantStatusPresent {
-			t.Errorf("the observer's state %+v, want alex present", st)
+			t.Errorf("the observer's state %+v, want alex present, an admin", st)
 		}
 		expectOpen(t, c2)
 
