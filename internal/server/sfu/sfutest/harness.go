@@ -185,10 +185,8 @@ func Bindings(pub *publish.Publisher, share sfu.ShareID) []sfu.TrackBinding {
 // goes to conn.HandleOffer with gen and neg, and the answer back to the Publisher. It returns the answer. The
 // Publisher's media starts with Publisher.Start.
 //
-// A second negotiation on the same Publisher (a re-offer, neg + 1) works for a Publisher with one video layer. With
-// simulcast, Pion's re-offer lists every rid twice ("a=rid:f recv" from the SFU's answer next to "a=rid:f send"),
-// which the SFU refuses as sfu.bad_rid like any repeated rid: publish.Publisher has to leave the recv lines out of
-// the offers it sends before a simulcast Publisher can renegotiate.
+// A second negotiation on the same Publisher is a re-offer: the next neg of the same gen, also with simulcast
+// (Publisher.Offer leaves out the receive rids that Pion repeats from the SFU's last answer).
 func Publish(ctx context.Context, conn *sfu.Conn, pub *publish.Publisher, gen, neg uint32, share sfu.ShareID,
 ) (answerSDP string, err error) {
 	offer, err := pub.Offer(ctx)
@@ -223,6 +221,7 @@ type DirectSignaler struct {
 	offers   []Offer
 	events   []sfu.Event
 	answered int     // offers[:answered] went to the Viewer
+	settled  int     // offers[:settled] are done with: the Conn has their answer, or the answer loop its error
 	errs     []error // what the answer loop ran into
 	attached bool
 	closed   bool
@@ -295,6 +294,29 @@ func (d *DirectSignaler) WaitOffer(ctx context.Context, match func(Offer) bool) 
 	}
 }
 
+// WaitAnswered waits until the attached Viewer's answer to the sub offer with o's gen and neg has been applied by
+// the Conn (Conn.HandleAnswer has returned), or the answer loop has given up on that offer (see Errs). From then on
+// the Conn knows what the viewer made of the offer: an m-section that the offer showed as inactive, for one, can
+// carry the Conn's next subscription (02 §9.3).
+func (d *DirectSignaler) WaitAnswered(ctx context.Context, o Offer) error {
+	tick := time.NewTicker(pollInterval)
+	defer tick.Stop()
+	for {
+		d.mu.Lock()
+		i := slices.IndexFunc(d.offers, func(sent Offer) bool { return sent.Gen == o.Gen && sent.Neg == o.Neg })
+		done := i >= 0 && i < d.settled
+		d.mu.Unlock()
+		if done {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("sfutest: sub offer gen %d neg %d not answered: %w", o.Gen, o.Neg, ctx.Err())
+		case <-tick.C:
+		}
+	}
+}
+
 // WaitEvent waits for an event that match accepts and returns the first one.
 func (d *DirectSignaler) WaitEvent(ctx context.Context, match func(sfu.Event) bool) (sfu.Event, error) {
 	tick := time.NewTicker(pollInterval)
@@ -348,11 +370,13 @@ func (d *DirectSignaler) answerLoop(ctx context.Context, conn *sfu.Conn, v *View
 			o := d.offers[d.answered]
 			d.answered++
 			d.mu.Unlock()
-			if err := answerOffer(ctx, conn, v, o); err != nil && ctx.Err() == nil {
-				d.mu.Lock()
+			err := answerOffer(ctx, conn, v, o)
+			d.mu.Lock()
+			if err != nil && ctx.Err() == nil {
 				d.errs = append(d.errs, fmt.Errorf("sub offer gen %d neg %d: %w", o.Gen, o.Neg, err))
-				d.mu.Unlock()
 			}
+			d.settled++
+			d.mu.Unlock()
 		}
 		select {
 		case <-ctx.Done():

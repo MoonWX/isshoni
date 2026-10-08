@@ -87,6 +87,10 @@ const (
 	// share; every statsEvery-th tick does the once-a-second work (02 §5.4).
 	tickInterval = 250 * time.Millisecond
 	statsEvery   = int(time.Second / tickInterval)
+	// subEventInterval is the least time between two SubscriptionStateEvents about one subscription that the media
+	// path caused: a publisher decides how often what its viewers get changes, and must not decide how many events
+	// they are sent (02 §6.2). What the client itself asked for is reported at once.
+	subEventInterval = 250 * time.Millisecond
 	// A layer's rates are 2 s moving averages, and a layer without a packet for 2 s isn't active (02 §9.1).
 	rateWindow  = 2 * time.Second
 	activeAfter = 2 * time.Second

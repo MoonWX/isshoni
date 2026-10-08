@@ -265,13 +265,17 @@ func (c *Conn) onPubTrack(p *pubPC, track *webrtc.TrackRemote, recv *webrtc.RTPR
 		}
 	}
 	t := &pubTrack{key: trackKey{mid, track.RID()}, kind: track.Kind(), track: track, recv: recv}
-	if old := p.tracks[t.key]; old != nil {
-		// The same m-section and rid with a new SSRC: Pion stopped the old receiver, whose readers end by themselves.
-		old.detach()
-	}
+	old := p.tracks[t.key]
 	p.tracks[t.key] = t
 	c.log.Debug("pub track", "gen", p.gen, "kind", t.kind.String(), "rid", t.key.rid)
 	c.bindTrack(p, t)
+	if old != nil {
+		// The same m-section and rid with a new SSRC: Pion stopped the old receiver, whose readers end by themselves.
+		// Its Layer goes only now that the new track's Layer has taken its slot, so the viewers of the layer wait for
+		// the new track's keyframe instead of falling back to another layer for a moment. (When the new track carries
+		// no share, this is what takes the old Layer off its share.)
+		old.detach()
+	}
 	p.readers.Add(2)
 	go func() {
 		defer p.readers.Done()

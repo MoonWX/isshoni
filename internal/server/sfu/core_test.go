@@ -1269,9 +1269,21 @@ func TestUpdateSubscriptions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantSubs := []SubscriptionState{{Share: "s_1", Video: QualityHigh, Audio: true}, {Share: "s_2", Video: QualityLow}}
+	// Both shares are pending, without a track: nothing can serve either request yet (02 §10.1), and the client was
+	// told so for each item that was applied.
+	wantSubs := []SubscriptionState{
+		{Share: "s_1", Video: QualityHigh, Audio: true, Reason: SubReasonNoLayer},
+		{Share: "s_2", Video: QualityLow, Reason: SubReasonNoPreviewLayer},
+	}
 	if !reflect.DeepEqual(subs, wantSubs) {
 		t.Errorf("subscriptions = %+v, want %+v", subs, wantSubs)
+	}
+	wantEvents := []SubscriptionStateEvent{
+		{Share: "s_1", Requested: QualityHigh, Reason: SubReasonNoLayer},
+		{Share: "s_2", Requested: QualityLow, Reason: SubReasonNoPreviewLayer},
+	}
+	if evs := sig.subEvents(); !slices.Equal(evs, wantEvents) {
+		t.Errorf("SubscriptionStateEvents = %+v, want %+v", evs, wantEvents)
 	}
 	for _, id := range []ShareID{"s_1", "s_2"} {
 		if v, a, ok := s.FanOut(id); !ok || v != 1 || a != 1 {

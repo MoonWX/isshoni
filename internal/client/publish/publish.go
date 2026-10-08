@@ -301,7 +301,11 @@ func (p *Publisher) addTracks(layers []string, audio bool, profile, stream strin
 func (p *Publisher) PC() *webrtc.PeerConnection { return p.pc }
 
 // Offer creates the offer, sets it as the local description and returns it with every ICE candidate in it (no
-// trickle), which is what the SFU expects.
+// trickle), which is what the SFU expects. Call it again for a re-offer on the same PeerConnection (the next neg of
+// the same gen).
+//
+// What it returns is the copy to send, which differs from the local description in a re-offer of simulcast video:
+// see sendOnlySimulcast.
 func (p *Publisher) Offer(ctx context.Context) (webrtc.SessionDescription, error) {
 	offer, err := p.pc.CreateOffer(nil)
 	if err != nil {
@@ -316,7 +320,55 @@ func (p *Publisher) Offer(ctx context.Context) (webrtc.SessionDescription, error
 	case <-ctx.Done():
 		return webrtc.SessionDescription{}, ctx.Err()
 	}
-	return *p.pc.LocalDescription(), nil
+	local := *p.pc.LocalDescription()
+	local.SDP = sendOnlySimulcast(local.SDP)
+	return local, nil
+}
+
+// sendOnlySimulcast returns an offer without the receive side of its simulcast attributes: the "a=rid:<id> recv"
+// lines, and the recv list of "a=simulcast" (the whole line when it has no send list).
+//
+// Once a simulcast m-section has been answered, Pion's next offer repeats the rids of that answer as its own
+// receive rids ("a=rid:f recv", "a=simulcast:recv f;q") next to the ones it sends ("a=rid:f send",
+// "a=simulcast:send f;q"). A Publisher receives nothing, and no browser offers that. The SFU reads every a=rid line
+// of an offer as a layer the publisher may send (as Pion's own answerer does), so it refuses a rid that is listed
+// twice as sfu.bad_rid. These attributes only tell the remote side what to do, so the local description keeps its
+// own and the copy that goes out loses them.
+func sendOnlySimulcast(offer string) string {
+	var out strings.Builder
+	out.Grow(len(offer))
+	for line := range strings.SplitAfterSeq(offer, "\n") {
+		text := strings.TrimRight(line, "\r\n")
+		eol := line[len(text):]
+		switch {
+		case strings.HasPrefix(text, "a=rid:"):
+			if fields := strings.Fields(text); len(fields) > 1 && fields[1] == "recv" {
+				continue
+			}
+		case strings.HasPrefix(text, "a=simulcast:"):
+			// RFC 8853 §5.1: one or two "<direction> <list>" pairs.
+			fields := strings.Fields(strings.TrimPrefix(text, "a=simulcast:"))
+			var kept []string
+			recv := false
+			for i := 0; i+1 < len(fields); i += 2 {
+				if fields[i] == "recv" {
+					recv = true
+					continue
+				}
+				kept = append(kept, fields[i], fields[i+1])
+			}
+			switch {
+			case !recv: // nothing to drop: the line stays as it is
+			case len(kept) == 0:
+				continue
+			default:
+				text = "a=simulcast:" + strings.Join(kept, " ")
+			}
+		}
+		out.WriteString(text)
+		out.WriteString(eol)
+	}
+	return out.String()
 }
 
 // SetAnswer applies the remote answer. Pion binds the tracks here.

@@ -58,6 +58,12 @@ type SubscriptionState struct {
 	Share ShareID
 	Video Quality
 	Audio bool
+	// Forwarded, AudioForwarded and Reason are what the subscription gets now, as a SubscriptionStateEvent says it;
+	// Layer is the rid of the video layer forwarded, "" when none is.
+	Forwarded      Quality
+	AudioForwarded bool
+	Reason         SubReason
+	Layer          string
 	// VideoBound and AudioBound report whether Pion has bound the DownTrack to a negotiated sender.
 	VideoBound, AudioBound bool
 	// VideoPTs maps the H.264 profiles the viewer can receive to its payload types (the video binding's ptFor).
@@ -73,6 +79,13 @@ func (c *Conn) Subscriptions(ctx context.Context) ([]SubscriptionState, error) {
 	err := c.do(ctx, func(context.Context) error {
 		for id, sub := range c.subs {
 			st := SubscriptionState{Share: id, Video: sub.reqVideo, Audio: sub.reqAudio}
+			now := sub.state()
+			st.Forwarded, st.AudioForwarded, st.Reason = now.forwarded, now.audio, now.reason
+			sub.video.mu.Lock()
+			if slot, ok := sub.video.m.current(); ok {
+				st.Layer = slot.String()
+			}
+			sub.video.mu.Unlock()
 			if b := sub.video.binding.Load(); b != nil {
 				st.VideoBound, st.VideoPTs = true, b.ptFor
 			}
