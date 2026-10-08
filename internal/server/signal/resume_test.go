@@ -722,6 +722,7 @@ func TestResumeKeyRotation(t *testing.T) {
 					t.Errorf("%s: token %q resumed", tc.name, tok.Reveal())
 				}
 			}
+			synctest.Wait() // each socket's reader counts its resume result after the actor has sent the welcome
 			if r, n := e.metric("isshoni_ws_resume_total", "result", "resumed"),
 				e.metric("isshoni_ws_resume_total", "result", "not_resumed"); r != 1 || n != 5 {
 				t.Errorf("%s: isshoni_ws_resume_total resumed %v, not_resumed %v; want 1 and 5", tc.name, r, n)
@@ -829,6 +830,7 @@ func TestResumeLosesToClose(t *testing.T) {
 		if err := c.CloseWith(websocket.StatusNormalClosure); err != nil {
 			t.Fatal(err)
 		}
+		synctest.Wait() // the socket's end is in the actor's inbox, before the hello gets there
 		c2 := e.mustDial(headers(cookie, testOrigin, ""))
 		reqID := request(t, c2, protocol.MessageTypeHello, resumeHello(w.ResumeToken))
 		synctest.Wait() // the hello waits for the actor, behind the socket's end

@@ -20,8 +20,9 @@ import (
 
 // Rooms and participants (01 §4, §8.4–8.6, §19 "Rooms"): room.join and room.leave, participants that merge a user's
 // connections, coalesced byte-identical room.state, room.event, CloseRoom, the room_full policy and the live
-// snapshot. Shares and subscriptions come with share.start and subscribe.update (README S40); until then the tests
-// put them in place with the AddShare and SetWants hooks.
+// snapshot. These tests set their scene with the AddShare and SetWants hooks, which put shares and desired
+// subscriptions into a room without a MediaPeer call; share.start, subscribe.update and the share lifecycle have
+// their own tests (share_test.go).
 
 var room1 = protocol.RoomInfo{ID: "room1", Name: "Movie night"}
 
@@ -917,8 +918,9 @@ func TestRoomSwitch(t *testing.T) {
 		if got := e.metric("isshoni_ws_errors_total", "code", string(protocol.ErrorCodeSDPInvalid)); got != 1 {
 			t.Errorf("errors sent (sdp_invalid) %v, want 1", got)
 		}
-		if e.logs.count("level=WARN", "share media event not handled", "share_id=s_x") != 1 {
-			t.Errorf("no WARN line for ShareMedia:\n%s", e.logs)
+		// A media event about a share that the connection doesn't publish is dropped (TestShare* have the lifecycle).
+		if e.logs.count("level=DEBUG", "share media event dropped", "share_id=s_x") != 1 {
+			t.Errorf("no DEBUG line for ShareMedia:\n%s", e.logs)
 		}
 
 		// After room.leave, the peer that was current is a previous one too.

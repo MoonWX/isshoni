@@ -151,8 +151,8 @@ func (l *keyedLimiter) size() int {
 const floodWindow = 10 * time.Second
 
 // typeRates are the per-type rate limits of 01 §13, per connection. Excess stats are dropped silently; the others
-// get rate_limited. pc.restart has 12 per minute per PC kind (pcRestartRate). The limit on pub offers with a new
-// gen (6 per minute) belongs to the pc.offer routing (README S40), which tracks the gen.
+// get rate_limited. pc.restart has 12 per minute per PC kind (pcRestartRate), and pub offers with a new gen have 6
+// per minute (pubGenRate): both are charged where the pc.* messages are routed (handlePC).
 var typeRates = map[protocol.MessageType]rate{
 	protocol.MessageTypeRoomJoin:   perMinute(10),
 	protocol.MessageTypeShareStart: perMinute(10),
@@ -163,6 +163,12 @@ var typeRates = map[protocol.MessageType]rate{
 
 // pcRestartRate limits pc.restart per PC kind (01 §13).
 var pcRestartRate = perMinute(12)
+
+// pubGenRate limits the pub offers with a new gen, each of which makes the SFU build a PeerConnection (01 §13).
+// Offers that renegotiate the current gen are not counted. pubGenKey is its bucket in connLimits.
+var pubGenRate = perMinute(6)
+
+const pubGenKey = "pc.offer/pub/gen"
 
 // connLimits are one connection's rate limits (01 §13): the global message and byte buckets, and the per-type
 // buckets. Owned by the connection's actor.

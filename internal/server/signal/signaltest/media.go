@@ -44,7 +44,7 @@ func (m *Media) NewPeer(p signal.PeerParams, sink signal.MediaSink) (signal.Medi
 	if m.newPeerErr != nil {
 		return nil, m.newPeerErr
 	}
-	peer := &Peer{Params: p, sink: sink, fail: make(map[string]error)}
+	peer := &Peer{Params: p, sink: sink, fail: make(map[string]error), hooks: make(map[string]func())}
 	m.peers = append(m.peers, peer)
 	return peer, nil
 }
@@ -83,18 +83,24 @@ type Call struct {
 
 // Peer is a fake signal.MediaPeer. It records every call. By default CreateShare and UpdateShare return
 // ShareParamsFor(shareID), HandleOffer answers with FakeSDP and the offer's pc, gen and neg, Subscribe ignores no
-// share, Stats is empty, and everything else succeeds. Fail makes a method return an error; tests emit the peer's
-// events through Sink, and OnResync lets them do so from inside Resync, as a real peer does.
+// share, Stats is empty, and everything else succeeds. Fail makes a method return an error, SetShareParams and
+// SetStats set what the share methods and Stats return; tests emit the peer's events through Sink, and OnCall lets
+// them act from inside a method (OnResync: from inside Resync, where a real peer re-emits its events).
+//
+// The hub reads Stats every 2 s while the connection has media in its room or watches the server's stats, so Calls
+// has a "Stats" entry for each of those: CallsTo and MediaCalls leave them aside.
 type Peer struct {
 	Params signal.PeerParams
 	sink   signal.MediaSink
 
-	mu       sync.Mutex
-	calls    []Call
-	fail     map[string]error
-	ignored  []string
-	onResync func()
-	closed   bool
+	mu          sync.Mutex
+	calls       []Call
+	fail        map[string]error
+	hooks       map[string]func()
+	ignored     []string
+	stats       protocol.ServerStats
+	shareParams func(shareID string) protocol.ShareParams
+	closed      bool
 }
 
 // Sink returns the hub's MediaSink for this peer.
@@ -114,6 +120,19 @@ func (p *Peer) CallsTo(method string) []Call {
 	var out []Call
 	for _, c := range p.calls {
 		if c.Method == method {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// MediaCalls returns the recorded calls without the periodic Stats reads, in order.
+func (p *Peer) MediaCalls() []Call {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var out []Call
+	for _, c := range p.calls {
+		if c.Method != "Stats" {
 			out = append(out, c)
 		}
 	}
@@ -146,11 +165,46 @@ func (p *Peer) SetIgnored(shareIDs []string) {
 	p.ignored = slices.Clone(shareIDs)
 }
 
-func (p *Peer) record(method string, args ...any) error {
+// OnCall sets a function that the named method (for example "CreateShare") calls once it has recorded the call,
+// before it returns; nil removes it. Like every MediaPeer method it runs on the connection's actor, which holds no
+// lock then: a test can change the hub's state in the middle of a request there.
+func (p *Peer) OnCall(method string, f func()) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if f == nil {
+		delete(p.hooks, method)
+		return
+	}
+	p.hooks[method] = f
+}
+
+func (p *Peer) record(method string, args ...any) error {
+	p.mu.Lock()
 	p.calls = append(p.calls, Call{Method: method, Args: args})
-	return p.fail[method]
+	err, hook := p.fail[method], p.hooks[method]
+	p.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return err
+}
+
+// SetShareParams sets the function whose result CreateShare and UpdateShare return from now on; nil restores
+// ShareParamsFor.
+func (p *Peer) SetShareParams(f func(shareID string) protocol.ShareParams) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.shareParams = f
+}
+
+func (p *Peer) paramsFor(shareID string) protocol.ShareParams {
+	p.mu.Lock()
+	f := p.shareParams
+	p.mu.Unlock()
+	if f == nil {
+		return ShareParamsFor(shareID)
+	}
+	return f(shareID)
 }
 
 // CreateShare implements signal.MediaPeer.
@@ -158,15 +212,16 @@ func (p *Peer) CreateShare(shareID string, meta protocol.ShareStart) (protocol.S
 	if err := p.record("CreateShare", shareID, meta); err != nil {
 		return protocol.ShareParams{}, err
 	}
-	return ShareParamsFor(shareID), nil
+	return p.paramsFor(shareID), nil
 }
 
-// UpdateShare implements signal.MediaPeer.
+// UpdateShare implements signal.MediaPeer. The recorded update has its own copy of the label.
 func (p *Peer) UpdateShare(shareID string, meta protocol.ShareUpdate) (protocol.ShareParams, error) {
+	meta.Label = clonePtr(meta.Label)
 	if err := p.record("UpdateShare", shareID, meta); err != nil {
 		return protocol.ShareParams{}, err
 	}
-	return ShareParamsFor(shareID), nil
+	return p.paramsFor(shareID), nil
 }
 
 // EndShare implements signal.MediaPeer.
@@ -176,6 +231,7 @@ func (p *Peer) EndShare(shareID string, reason protocol.EndReason) {
 
 // HandleOffer implements signal.MediaPeer.
 func (p *Peer) HandleOffer(o protocol.PCOffer) (protocol.PCAnswer, error) {
+	o.Tracks = slices.Clone(o.Tracks)
 	if err := p.record("HandleOffer", o); err != nil {
 		return protocol.PCAnswer{}, err
 	}
@@ -207,30 +263,31 @@ func (p *Peer) Subscribe(wants []protocol.SubscriptionWant) ([]string, error) {
 // SetCaps implements signal.MediaPeer.
 func (p *Peer) SetCaps(c protocol.Caps) { _ = p.record("SetCaps", c) }
 
-// OnResync sets a function that Resync calls after recording the call; nil removes it. Like every MediaPeer method,
-// it runs on the connection's actor. A real peer re-emits its pending sub offer, its subscription statuses and its
-// quality hints there (01 §10.5): a test does the same through Sink.
-func (p *Peer) OnResync(f func()) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.onResync = f
-}
+// OnResync sets a function that Resync calls after recording the call; nil removes it (OnCall for "Resync"). A real
+// peer re-emits its pending sub offer, its subscription statuses and its quality hints there (01 §10.5): a test does
+// the same through Sink.
+func (p *Peer) OnResync(f func()) { p.OnCall("Resync", f) }
 
 // Resync implements signal.MediaPeer.
-func (p *Peer) Resync() {
-	_ = p.record("Resync")
+func (p *Peer) Resync() { _ = p.record("Resync") }
+
+// SetStats sets what Stats returns from now on.
+func (p *Peer) SetStats(st protocol.ServerStats) {
 	p.mu.Lock()
-	f := p.onResync
-	p.mu.Unlock()
-	if f != nil {
-		f()
-	}
+	defer p.mu.Unlock()
+	st.Subs, st.Layers = slices.Clone(st.Subs), slices.Clone(st.Layers)
+	p.stats = st
 }
 
-// Stats implements signal.MediaPeer.
+// Stats implements signal.MediaPeer: the stats of SetStats, empty by default. The slices are never nil.
 func (p *Peer) Stats() protocol.ServerStats {
 	_ = p.record("Stats")
-	return protocol.ServerStats{Subs: []protocol.ServerSubStats{}, Layers: []protocol.ServerLayerStats{}}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	st := p.stats
+	st.Subs = append([]protocol.ServerSubStats{}, st.Subs...)
+	st.Layers = append([]protocol.ServerLayerStats{}, st.Layers...)
+	return st
 }
 
 // Close implements signal.MediaPeer.

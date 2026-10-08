@@ -50,8 +50,9 @@ func OverCap(h *Hub, userID string) int {
 	return h.overCap[userID]
 }
 
-// AddShare puts a share into a room that has participants and records the change, as share.start will (README S40):
-// the hub's side only, without a MediaPeer call. It reports whether the room exists.
+// AddShare puts a share into a room that has participants and records the change, as share.start does: the hub's
+// side only, in the given status, without a MediaPeer call, a limit check or a timeout. Tests of rooms and resume
+// use it to set a scene; the share tests go through share.start. It reports whether the room exists.
 func AddShare(h *Hub, roomID string, info protocol.ShareInfo) bool {
 	h.mu.Lock()
 	r := h.rooms[roomID]
@@ -62,14 +63,15 @@ func AddShare(h *Hub, roomID string, info protocol.ShareInfo) bool {
 	var o outbox
 	r.mu.Lock()
 	r.shares[info.ID] = &share{info: info}
+	h.metrics.shareStatus("", info.Status)
 	r.changedLocked(&o)
 	r.mu.Unlock()
 	o.send()
 	return true
 }
 
-// SetWants merges desired subscriptions into a connection's and records the change, as subscribe.update will
-// (README S40). It reports whether the connection is in a room.
+// SetWants merges desired subscriptions into a connection's and records the change, as subscribe.update does: the
+// hub's side only, without a MediaPeer call. It reports whether the connection is in a room.
 func SetWants(h *Hub, connID string, wants ...protocol.SubscriptionWant) bool {
 	h.mu.Lock()
 	c := h.conns[connID]
