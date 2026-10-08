@@ -1,0 +1,146 @@
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  max-width: 44rem;
+}
+
+.text {
+  max-width: 28rem;
+}
+
+.number {
+  max-width: 20rem;
+}
+
+/* A pinned text or number field keeps its value readable and focusable, and looks like it can't be typed in. */
+.form input[readonly] {
+  color: var(--color-text-muted);
+  background-color: var(--color-surface-2);
+}
+
+/* Two short number fields side by side. */
+.pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-4);
+  align-items: start;
+}
+
+/* A checkbox or radio with its label and help beside it. */
+.check {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--space-3);
+  align-items: start;
+}
+
+.check input {
+  width: 1.125rem;
+  height: 1.125rem;
+  /* Lines the box up with the first line of its label. */
+  margin: 0.1875rem 0 0;
+  accent-color: var(--color-accent);
+}
+
+.checkText {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.checkText label {
+  font-weight: var(--weight-medium);
+}
+
+.hint {
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+  text-wrap: pretty;
+}
+
+.hint:empty {
+  display: none;
+}
+
+.error {
+  font-weight: var(--weight-medium);
+  color: var(--color-danger);
+}
+
+.modes {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+  padding: 0;
+  margin: 0;
+  border: 0;
+}
+
+.legend {
+  padding: 0;
+  margin-bottom: var(--space-3);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+}
+
+.modes:disabled label {
+  color: var(--color-text-muted);
+}
+
+/* "Set in isshoni.toml": the reason a field can't be changed here. */
+.locked {
+  display: inline-flex;
+  gap: var(--space-1);
+  align-items: baseline;
+  font-weight: var(--weight-medium);
+  color: var(--color-text);
+}
+
+.locked svg {
+  flex: none;
+  align-self: center;
+  width: 0.875rem;
+  height: 0.875rem;
+}
+
+.locked code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  overflow-wrap: anywhere;
+}
+
+/* Save stays in reach while the form scrolls under it. */
+.bar {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  /* A little wider than the cards that scroll under it, so their side borders don't show beside it. */
+  padding: var(--space-3) var(--space-1) calc(var(--space-3) + var(--safe-bottom));
+  margin-inline: calc(-1 * var(--space-1));
+  background-color: var(--color-bg);
+  border-top: var(--border-width) solid var(--color-border);
+}
+
+.buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.unsaved {
+  margin-inline-end: auto;
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}
+
+@media (max-width: 30rem) {
+  .pair {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

@@ -1,0 +1,37 @@
+.link {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.failed {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--color-danger);
+}
+
+/* The live region stays in the page while empty (display: none would take it out); it only gives up its gap. */
+.failed:empty {
+  margin-top: calc(-1 * var(--space-2));
+}
+
+.row {
+  display: flex;
+  gap: var(--space-2);
+  align-items: stretch;
+}
+
+.url {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  /* 16 px keeps iOS Safari from zooming in on focus. */
+  font-size: max(var(--text-sm), 16px);
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 30rem) {
+  .row {
+    flex-direction: column;
+  }
+}

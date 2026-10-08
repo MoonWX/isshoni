@@ -1,0 +1,78 @@
+.filters {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 14rem)) auto;
+  gap: var(--space-3) var(--space-4);
+  align-items: end;
+}
+
+.clear {
+  justify-self: start;
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  /*
+   * Room for any IPv4 address on one line. An IPv6 address has no spaces: it may wrap anywhere past that, and
+   * doesn't widen its column.
+   */
+  display: inline-block;
+  min-width: 15ch;
+  overflow-wrap: anywhere;
+}
+
+/* A name that filters the log by it: reads as text, acts as a button. */
+.who {
+  padding: 0;
+  font-weight: inherit;
+  color: var(--color-link);
+  text-align: start;
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 0.2em;
+  background: none;
+  border: 0;
+  border-radius: var(--radius-sm);
+}
+
+.who:hover {
+  text-decoration-style: solid;
+}
+
+.detail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  list-style: none;
+}
+
+.more {
+  display: flex;
+  justify-content: center;
+}
+
+.end {
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+  text-align: center;
+}
+
+.end:focus {
+  outline: none;
+}
+
+.failed {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--color-danger);
+  text-align: center;
+}
+
+@media (max-width: 48rem) {
+  .filters {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+  }
+}
