@@ -622,6 +622,7 @@ describe('PublisherPC: candidates', () => {
 
   it('keeps local candidates while signaling is down and sends them on the resumed ready', async () => {
     await publish('s_a');
+    connect();
     server.drop();
     await tick();
     lastPc().emitIceCandidate({ candidate: 'candidate:2 1 udp 1 192.0.2.2 5000 typ host', sdpMid: '0' });
@@ -647,6 +648,40 @@ describe('PublisherPC: candidates', () => {
     // With the remote description set they are added at once.
     await pub.handleIce({ pc: 'pub', gen: 1, candidate: { candidate: 'candidate:late' } });
     expect(lastPc().remoteCandidates.at(-1)).toMatchObject({ candidate: 'candidate:late', sdpMLineIndex: 0 });
+  });
+
+  it('a candidate still being added when the PC is replaced does not hold up what comes after it', async () => {
+    await publish('s_a');
+    // An operation on a closed RTCPeerConnection may never settle.
+    vi.spyOn(lastPc(), 'addIceCandidate').mockReturnValue(new Promise<void>(() => undefined));
+    const done = { ice: false, rebuild: false, remove: false };
+    void pub.handleIce({ pc: 'pub', gen: 1, candidate: { candidate: 'candidate:1' } }).then(() => {
+      done.ice = true;
+    });
+    await tick();
+    expect(done.ice).toBe(false);
+
+    // The PC is replaced from outside the queue, and the share is stopped right after.
+    void pub.rebuild().then(() => {
+      done.rebuild = true;
+    });
+    void pub.removeShare('s_a').then(() => {
+      done.remove = true;
+    });
+    await tick();
+    expect(done).toEqual({ ice: true, rebuild: true, remove: true });
+    expect(pubOffers(server).at(-1)).toMatchObject({ gen: 2, neg: 1 });
+    expect(sent<PCClose>('pc.close')).toEqual([{ pc: 'pub', gen: 2 }]);
+    expect(pub.state).toBe('idle');
+  });
+
+  it('a candidate the PC refuses is logged and nothing more', async () => {
+    await publish('s_a');
+    lastPc().failNext('addIceCandidate');
+    await pub.handleIce({ pc: 'pub', gen: 1, candidate: { candidate: 'candidate:bad' } });
+    await pub.handleIce({ pc: 'pub', gen: 1, candidate: { candidate: 'candidate:good' } });
+    expect(lastPc().remoteCandidates.map((c) => c.candidate)).toEqual(['candidate:good']);
+    expect(pub.gen).toBe(1);
   });
 });
 
@@ -910,6 +945,8 @@ describe('PublisherPC: signaling drops (01 §10.4, §10.5)', () => {
     const offers = pubOffers(server);
     expect(offers).toHaveLength(2);
     expect(offers[1]).toEqual(offers[0]);
+    // The PC isn't connected, but it waits for that answer: nothing is wrong with its ICE yet.
+    expect(lastPc().restartIceCalls).toBe(0);
     await answerLast();
     expect(lastPc().signalingState).toBe('stable');
   });
@@ -927,6 +964,44 @@ describe('PublisherPC: signaling drops (01 §10.4, §10.5)', () => {
     expect(signal.state).toBe('ready');
     expect(lastPc().restartIceCalls).toBe(1);
     expect(pubOffers(server).at(-1)).toMatchObject({ gen: 1, neg: 2 });
+  });
+
+  it('a PC that is still connecting although its offer was answered restarts ICE on the resumed ready too', async () => {
+    // The network changed under the first checks: the answer is applied, and ICE never gets anywhere.
+    await publish('s_a');
+    lastPc().setConnectionState('connecting');
+    lastPc().setIceConnectionState('checking');
+    expect(pub.state).toBe('connecting');
+    server.drop();
+    await tick(1000);
+    expect(signal.state).toBe('ready');
+    expect(signal.welcome?.resumed).toBe(true);
+
+    expect(lastPc().restartIceCalls).toBe(1);
+    expect(FakeRTCPeerConnection.instances).toHaveLength(1);
+    expect(pubOffers(server).at(-1)).toMatchObject({ gen: 1, neg: 2 });
+    // From here it is an ICE restart like any other: not connected after 15 s → rebuild.
+    await answerLast();
+    await tick(ICE_RESTART_TIMEOUT_MS);
+    expect(pub.gen).toBe(2);
+  });
+
+  it('an ICE restart that is under way when signaling resumes is left to its 15 s timer', async () => {
+    await publish('s_a');
+    connect();
+    lastPc().setIceConnectionState('disconnected');
+    await tick(DISCONNECTED_GRACE_MS);
+    await answerLast();
+    expect(lastPc().restartIceCalls).toBe(1);
+
+    server.drop();
+    await tick(1000);
+    expect(signal.state).toBe('ready');
+    // Also once the 5 s spacing is over: no second restart was wanted.
+    await tick(ICE_RESTART_SPACING_MS);
+    expect(lastPc().restartIceCalls).toBe(1);
+    expect(pubOffers(server)).toHaveLength(2);
+    expect(pub.gen).toBe(1);
   });
 
   it('a failure while signaling is down is acted on at ready', async () => {
@@ -973,6 +1048,37 @@ describe('PublisherPC: signaling drops (01 §10.4, §10.5)', () => {
       neg: 1,
       tracks: [{ shareId: 's_b' }, { shareId: 's_b' }],
     });
+  });
+
+  it('gen starts at 1 again also when no PC exists at that welcome: the last share was stopped before it', async () => {
+    await publish('s_a');
+    await pub.removeShare('s_a');
+    expect(sent<PCClose>('pc.close')).toEqual([{ pc: 'pub', gen: 1 }]);
+
+    server.restart();
+    server.drop();
+    await tick(1000);
+    expect(signal.state).toBe('ready');
+    expect(signal.welcome?.resumed).toBe(false);
+
+    // On the same connection this would be gen 2; on the new one the server starts counting at 1 (01 §9 rule 2).
+    await pub.addShare('s_b', asStream(capture()), shareParams('s_b'), 'auto');
+    expect(pub.gen).toBe(1);
+    expect(pubOffers(server).at(-1)).toMatchObject({
+      gen: 1,
+      neg: 1,
+      tracks: [{ shareId: 's_b' }, { shareId: 's_b' }],
+    });
+  });
+
+  it('a resumed welcome between two shares changes nothing: the next PC has the next gen', async () => {
+    await publish('s_a');
+    await pub.removeShare('s_a');
+    server.drop();
+    await tick(1000);
+    expect(signal.welcome?.resumed).toBe(true);
+    await pub.addShare('s_b', asStream(capture()), shareParams('s_b'), 'auto');
+    expect(pubOffers(server).at(-1)).toMatchObject({ gen: 2, neg: 1 });
   });
 
   it('after that welcome, rebuild() puts the parked shares on a new PC of gen 1, set up as before', async () => {

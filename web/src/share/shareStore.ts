@@ -113,8 +113,8 @@ export interface ShareFields {
    */
   readonly hostId: string | null;
   /**
-   * How many SharePanels are mounted. A panel shows a failed share and the "no sound is shared" note itself, so
-   * while one is there the Share buttons leave those to it (and say them as toasts otherwise).
+   * How many SharePanels are mounted. A panel shows a failed share itself, and the "no sound is shared" note in its
+   * bar, so while one is there the Share buttons leave those to it (and say them as toasts otherwise).
    */
   readonly panels: number;
 }

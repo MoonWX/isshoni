@@ -61,6 +61,10 @@ const tick = (ms: number): void => {
     vi.advanceTimersByTime(ms);
   });
 };
+/** Lets the promises of resume() and suspend() settle. */
+const settled = async (): Promise<void> => {
+  await vi.advanceTimersByTimeAsync(0);
+};
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -160,12 +164,68 @@ describe('LevelMeter (05 §13.7)', () => {
 });
 
 describe('levelAudio', () => {
-  it('primeLevelAudio (the Share click) makes one context for the page and resumes it', () => {
+  it('primeLevelAudio (the Share click) makes one context for the page and resumes it inside the click', () => {
     primeLevelAudio();
+    const [ctx] = FakeAudioContext.instances;
+    // Synchronously: this is what a browser counts as "inside the user gesture".
+    expect(ctx?.resume).toHaveBeenCalledOnce();
     primeLevelAudio();
     expect(FakeAudioContext.instances).toHaveLength(1);
-    expect(FakeAudioContext.instances[0]?.resume).toHaveBeenCalledOnce();
-    expect(FakeAudioContext.instances[0]?.state).toBe('running');
+  });
+
+  it('with nothing metered the context is suspended again once the click has unlocked it', async () => {
+    primeLevelAudio();
+    const [ctx] = FakeAudioContext.instances;
+    expect(ctx?.suspend).not.toHaveBeenCalled();
+    await settled();
+    // A sharer who never opens the settings (or shares without sound) keeps no audio thread running.
+    expect(ctx?.suspend).toHaveBeenCalledOnce();
+    expect(ctx?.state).toBe('suspended');
+
+    // The meter opens later: the unlocked context runs again, and stops with the meter.
+    const tap = openLevelTap(track());
+    expect(ctx?.resume).toHaveBeenCalledTimes(2);
+    expect(ctx?.state).toBe('running');
+    tap?.close();
+    expect(ctx?.suspend).toHaveBeenCalledTimes(2);
+    expect(ctx?.state).toBe('suspended');
+  });
+
+  it('a context that started by itself (made inside a gesture) is suspended just the same', async () => {
+    primeLevelAudio();
+    const [ctx] = FakeAudioContext.instances;
+    if (!ctx) throw new Error('no context');
+    await settled();
+    ctx.state = 'running';
+    primeLevelAudio();
+    await settled();
+    expect(ctx.state).toBe('suspended');
+  });
+
+  it('a meter that opens before the click’s resume has settled keeps the context running', async () => {
+    primeLevelAudio();
+    const [ctx] = FakeAudioContext.instances;
+    const tap = openLevelTap(track());
+    await settled();
+    expect(ctx?.suspend).not.toHaveBeenCalled();
+    expect(ctx?.state).toBe('running');
+
+    // Another Share click while it meters (a second share's pick) changes nothing either.
+    primeLevelAudio();
+    await settled();
+    expect(ctx?.suspend).not.toHaveBeenCalled();
+    expect(ctx?.state).toBe('running');
+    tap?.close();
+  });
+
+  it('the context runs until the last of several taps is closed', () => {
+    const first = openLevelTap(track());
+    const second = openLevelTap(track());
+    const [ctx] = FakeAudioContext.instances;
+    first?.close();
+    expect(ctx?.suspend).not.toHaveBeenCalled();
+    second?.close();
+    expect(ctx?.suspend).toHaveBeenCalledOnce();
   });
 
   it('a tap reads the peak, and 0 after it was closed; closing twice is harmless', () => {

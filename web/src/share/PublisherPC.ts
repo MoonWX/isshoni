@@ -18,7 +18,8 @@
 //   answer came. An answer of another gen, or whose neg isn't the outstanding one, is ignored.
 // - createOffer, setLocalDescription, setRemoteDescription and setParameters never interleave: one promise queue.
 // - Local candidates are trickled with pc.ice; remote ones (the M1 server sends none) are buffered until the remote
-//   description is set, at most 64.
+//   description is set, at most 64. addIceCandidate waits in the same queue, and like every other operation on the
+//   PC it is given up when the PC is closed or replaced meanwhile.
 //
 // Recovery (the pub column of 05 §9, 01 §10.4):
 // - disconnected: signal.probe() at once; still disconnected after 3 s → restartIce() and a new offer, same gen.
@@ -27,9 +28,12 @@
 // - At most one ICE restart per 5 s and one rebuild per 10 s; after 5 rebuilds without connecting the state is
 //   'unreachable' and rebuilds are 30 s apart.
 // - While signaling isn't ready, changes are only recorded. On `ready` after a resumed welcome the outstanding offer
-//   goes out again (same neg), unsent candidates follow, and a PC that is disconnected restarts ICE. After a welcome
-//   that was not resumed the server has no pub PC and gen starts at 1 again: the local PC is dropped without a
-//   message, and the shares stay known here, parked, until they are removed or published again (the recovery slice).
+//   goes out again (same neg), unsent candidates follow, and a PC that isn't connected restarts ICE: a disconnected
+//   one, and one that is still connecting although its offer was answered. (One whose offer is outstanding waits for
+//   the answer to the offer that just went out again; a failed one is rebuilt.) After a welcome that was not resumed
+//   the server has no pub PC and gen starts at 1 again, whether a PC exists here at that moment or not: the local PC
+//   is dropped without a message, and the shares stay known here, parked, until they are removed or published again
+//   (the recovery slice).
 // - sdp_invalid or bad_request about this PC, or an offer or answer that can't be applied here: one rebuild; a second
 //   failure within 60 s ends it: state 'failed' (01 §9 rule 8), and whoever owns the shares ends them.
 // - close() closes the PC on purpose and says so: pc.close {pc: 'pub', gen} (01 §9 rule 10).
@@ -253,8 +257,6 @@ export class PublisherPC {
   #offPc: (() => void) | null = null;
   /** Rejects when #pc is closed or replaced, so a step in flight on it ends (see #step). */
   #gone: { promise: Promise<never>; reject: (err: PcGoneError) => void } | null = null;
-  /** Stops listening to the signaling state. */
-  #offSignal: (() => void) | null = null;
   #gen = 1;
   /** A PC of generation #gen exists or existed: the next one is #gen + 1. */
   #made = false;
@@ -302,6 +304,9 @@ export class PublisherPC {
     this.#signal = deps.signal;
     this.#log = deps.log;
     this.#capabilities = deps.capabilities ?? browserCapabilities;
+    // For the object's lifetime, like the listeners of whoever routes the server's messages here (BrowserSharing's
+    // link): a welcome that was not resumed starts gen at 1 again, also while no PC exists (01 §9 rule 2).
+    this.#signal.onState?.(this.#onSignalState);
   }
 
   /** The generation of the current pub PC: 1 for the first, + 1 for every PC after it (01 §9, 05 §11.1). */
@@ -581,7 +586,6 @@ export class PublisherPC {
       if (this.#signal.notify(MessageTypePCClose, closing)) this.#log.info('pub PC closed', { gen: closing.gen });
       else this.#unsentClose = closing;
     }
-    if (this.#unsentClose === null) this.#unlisten();
     this.#updateState();
   }
 
@@ -648,7 +652,6 @@ export class PublisherPC {
     promise.catch(() => undefined);
     this.#gone = { promise, reject };
     this.#pc = pc;
-    this.#offSignal ??= this.#signal.onState?.(this.#onSignalState) ?? null;
     // A pc.close that never went out is about a PC this one replaces (a higher gen does that, 01 §9 rule 2).
     this.#unsentClose = null;
     this.#log.info('pub PC created', { gen: this.#gen });
@@ -699,11 +702,6 @@ export class PublisherPC {
     this.#fatal = false;
     if (this.#sizeTimer !== undefined) clearInterval(this.#sizeTimer);
     this.#sizeTimer = undefined;
-  }
-
-  #unlisten(): void {
-    this.#offSignal?.();
-    this.#offSignal = null;
   }
 
   // ---- A share's transceivers ----
@@ -899,13 +897,14 @@ export class PublisherPC {
     }
   }
 
+  /** Never rejects: a candidate the PC doesn't take is logged, and one for a PC that is gone is nobody's. */
   async #addCandidate(pc: RTCPeerConnection, candidate: RTCIceCandidateInit | null): Promise<void> {
     try {
       // No argument: end of candidates.
-      if (candidate) await pc.addIceCandidate(candidate);
-      else await pc.addIceCandidate();
+      await this.#step(pc, () => (candidate ? pc.addIceCandidate(candidate) : pc.addIceCandidate()));
     } catch (err) {
-      if (this.#pc === pc) this.#log.warn('a remote candidate was not accepted', { err, gen: this.#gen });
+      if (err instanceof PcGoneError || this.#pc !== pc) return;
+      this.#log.warn('a remote candidate was not accepted', { err, gen: this.#gen });
     }
   }
 
@@ -1044,26 +1043,29 @@ export class PublisherPC {
       // A new connection: the server has neither the shares nor a pub PC, and gen starts at 1 again (01 §9 rule 2).
       this.#unsentClose = null;
       this.#announced = false;
-      if (this.#pc || this.#made) this.#log.info('the connection was not resumed: dropping the pub PC');
+      if (this.#pc) this.#log.info('the connection was not resumed: dropping the pub PC');
       this.#teardownPc();
       this.#resetRecovery();
       this.#gen = 1;
       this.#made = false;
-      if (this.#shares.size === 0) this.#unlisten();
       this.#updateState();
       return;
     }
-    if (this.#unsentClose !== null) {
-      if (this.#signal.notify(MessageTypePCClose, this.#unsentClose)) this.#unsentClose = null;
-      if (!this.#pc && this.#unsentClose === null) this.#unlisten();
+    if (this.#unsentClose !== null && this.#signal.notify(MessageTypePCClose, this.#unsentClose)) {
+      this.#unsentClose = null;
     }
     if (!this.#pc) return;
     this.#resendPending();
     const unsent = this.#localCandidates;
     this.#localCandidates = [];
     for (const msg of unsent) this.#signal.notify(MessageTypePCICE, msg);
-    // 01 §10.4: after a resumed welcome, a pub PC that isn't connected restarts ICE, without the 3 s wait.
-    if (this.#health === 'disconnected' && !this.#iceRestartTimer.active) this.#wantsIce = true;
+    // 01 §10.4: after a resumed welcome, a pub PC that isn't connected restarts ICE, without the 3 s wait. That is
+    // a disconnected one, and one that is still connecting although its offer was answered (the network changed
+    // under its first checks: without this it would have to run into `failed` first). Not while an ICE restart is
+    // under way (its 15 s timer decides), not a failed PC (it is rebuilt), and not one that waits for an answer:
+    // its offer just went out again, and nothing is wrong with its ICE yet.
+    const stuck = this.#health === 'pending' && this.#neg > 0 && this.#pending === null;
+    if ((this.#health === 'disconnected' || stuck) && !this.#iceRestartTimer.active) this.#wantsIce = true;
     this.#pump();
   };
 

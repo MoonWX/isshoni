@@ -1,5 +1,5 @@
-// The notes of 05 §13.3: what to tell the sharer when a pick came without sound. Shown once the share starts
-// (ShareButton's toast), and by the share panel while live.
+// The notes of 05 §13.3: what to tell the sharer when a pick came without sound. Shown from the moment the share
+// starts: in the share panel's bar while the share lasts, or as ShareButton's toast on a page without a panel.
 import type { TFunction } from 'i18next';
 
 import { ShareKindTab, ShareKindWindow } from '../protocol/types.gen';

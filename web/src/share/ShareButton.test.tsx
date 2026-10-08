@@ -722,7 +722,14 @@ describe('ShareButton: the share state and the rest of the app', () => {
         within(screen.getByRole('dialog', { name: 'Share your screen' })).getByRole('button', { name: 'Share' }),
       );
       expect(FakeAudioContext.instances).toHaveLength(1);
-      expect(FakeAudioContext.instances[0]?.state).toBe('running');
+      const [ctx] = FakeAudioContext.instances;
+      // resume() inside the click is what unlocks it. Nothing is metered yet, so it doesn't keep running: the
+      // audio thread is for the level meter, which may never be opened.
+      expect(ctx?.resume).toHaveBeenCalledOnce();
+      await waitFor(() => {
+        expect(ctx?.suspend).toHaveBeenCalledOnce();
+      });
+      expect(ctx?.state).toBe('suspended');
     } finally {
       resetLevelAudio();
       vi.unstubAllGlobals();
@@ -756,10 +763,25 @@ describe('ShareButton on a page with a SharePanel: the panel reports what it sho
     expect(store.getState().phase).toBe('idle');
   });
 
-  it('the "no sound is shared" note is the panel’s too', async () => {
+  it('the "no sound is shared" note is the panel’s too: no toast, but it is still said once for screen readers', async () => {
     const store = createShareStore();
     store.getState().attachPanel();
-    const { onStart, toasts } = renderButton({ store, sharing: fakeSharing(fakePick('monitor', false)) });
+    const { onStart, toasts, services } = renderButton({ store, sharing: fakeSharing(fakePick('monitor', false)) });
+    await shareFromSheet();
+    await waitFor(() => {
+      expect(onStart).toHaveBeenCalledOnce();
+    });
+    // The panel shows the note in its bar (SharePanel.test.tsx), which is no live region.
+    await waitFor(() => {
+      expect(services.ui.getState().announcements.polite?.text).toBe('No sound is shared');
+    });
+    expect(toasts()).toEqual([]);
+  });
+
+  it('a share with sound has nothing to say there either', async () => {
+    const store = createShareStore();
+    store.getState().attachPanel();
+    const { onStart, toasts, services } = renderButton({ store, sharing: fakeSharing(fakePick('window', true)) });
     await shareFromSheet();
     await waitFor(() => {
       expect(onStart).toHaveBeenCalledOnce();
@@ -768,5 +790,6 @@ describe('ShareButton on a page with a SharePanel: the panel reports what it sho
       await Promise.resolve();
     });
     expect(toasts()).toEqual([]);
+    expect(services.ui.getState().announcements.polite).toBeNull();
   });
 });

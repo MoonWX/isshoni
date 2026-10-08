@@ -23,9 +23,10 @@
 //   complete encodings, codec preferences, gen and neg, recovery). It routes what the server sends about the pub PC
 //   and about its shares itself; the room session only starts and stops the share and tells it when the server
 //   ended it (BrowserShare.serverEnded, the session's ShareRecovery seam).
-// - uiStore.sharing ("no Reload in the update pill while sharing", 05 §16.2) and the toast of a share that was
-//   stopped from another tab follow the share state through linkShareUi, which every Share button and panel sets up
-//   when it mounts. It keeps working after the room page is left.
+// - uiStore.sharing ("no Reload in the update pill while sharing", 05 §16.2), the toast of a share that was stopped
+//   from another tab, and the app's "Can't connect media" screen when the pub PC's negotiation failed twice within
+//   a minute (05 §9) follow the share state through linkShareUi, which every Share button and panel sets up when
+//   it mounts. It keeps working after the room page is left.
 //
 // Arriving with later slices, inside this folder: following a reconnect (BrowserShare.resync and republish with
 // `replaces`, the 60 s capture hold: the web recovery slice). Until then the room session stops a share whose
@@ -33,6 +34,7 @@
 export {
   BrowserShare,
   END_NOTICE_GRACE_MS,
+  PubNegotiationFailedError,
   ShareEndedError,
   STATS_SAMPLE_MS,
   type BrowserShareDeps,

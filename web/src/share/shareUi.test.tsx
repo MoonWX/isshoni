@@ -1,5 +1,5 @@
 // The share state in the app-wide UI: uiStore.sharing and the update pill (05 §16.2), the "stopped elsewhere" toast
-// (05 §13.1), and the texts of a failed share.
+// (05 §13.1), the "Can't connect media" screen when the pub PC gave up (05 §9), and the texts of a failed share.
 import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { createMemoryRouter } from 'react-router';
@@ -15,13 +15,13 @@ import type { ShareStop } from '../protocol/types.gen';
 import { FAKE_AUDIO_CODECS, FAKE_VIDEO_CODECS } from '../test/FakeRTCPeerConnection';
 import { createTestPlatform } from '../test/platform';
 import { createTestServices } from '../test/render';
-import { ShareEndedError } from './BrowserShare';
+import { PubNegotiationFailedError, ShareEndedError } from './BrowserShare';
 import { BrowserSharing } from './BrowserSharing';
 import { ShareButton } from './ShareButton';
 import { createShareStore, shareStore, type SharePhase } from './shareStore';
 import { linkShareUi, shareErrorMessage } from './shareUi';
 import { fakePick } from './testing/fakeCapture';
-import { FakeShareHub, shareInfo, shareParams } from './testing/publish';
+import { FakeShareHub, pubOffers, shareInfo, shareParams } from './testing/publish';
 
 const WINDOW = { kind: 'window', audioScope: 'window', warning: null } as const;
 
@@ -95,6 +95,32 @@ describe('linkShareUi', () => {
     store.getState().finish();
     expect(toasts()).toHaveLength(2);
   });
+
+  it('only a share that ended because the pub PC gave up becomes the "Can’t connect media" screen', () => {
+    const store = createShareStore();
+    const ui = createUiStore();
+    linkShareUi(store, ui);
+    const publish = (): void => {
+      store.getState().publishing({ picked: WINDOW, preset: 'auto', withAudio: true, params: shareParams('s_1') });
+    };
+
+    // A start that failed once and a share the server ended are failed shares: the share panel shows them, and
+    // Share can be clicked again.
+    for (const error of [new LocalError('webrtc_failed'), new ShareEndedError('media_timeout', 'media_timeout')]) {
+      publish();
+      store.getState().finish({ error });
+      expect(store.getState().phase).toBe('failed');
+      expect(ui.getState().screen).toBeNull();
+    }
+    publish();
+    store.getState().finish();
+    expect(ui.getState().screen).toBeNull();
+
+    publish();
+    store.getState().finish({ error: new PubNegotiationFailedError() });
+    expect(store.getState().phase).toBe('failed');
+    expect(ui.getState().screen).toEqual({ kind: 'fatal', reason: 'media' });
+  });
 });
 
 describe('shareErrorMessage', () => {
@@ -119,7 +145,7 @@ describe('shareErrorMessage', () => {
 // The shell as boot builds it: <App> with the pill it mounts itself, a page with a Share button, the page's own
 // share store and a real in-page sharer on a fake server. Nothing here is told that a share is under way; it has
 // to find out from the share state.
-describe('the shell’s update pill while this page shares (05 §16.2)', () => {
+describe('the shell while this page shares', () => {
   let server: FakeSignalServer | undefined;
   let signal: SignalClient | undefined;
 
@@ -128,11 +154,14 @@ describe('the shell’s update pill while this page shares (05 §16.2)', () => {
     server?.uninstall();
     signal = undefined;
     server = undefined;
+    // The page's store is the module's: a share that failed in one test must not be the next one's.
+    shareStore.getState().dismiss();
   });
 
-  it('offers no Reload from the moment the share starts until it has stopped', async () => {
-    server = FakeSignalServer.install();
-    const hub = new FakeShareHub(server);
+  async function mountShell() {
+    const fake = FakeSignalServer.install();
+    server = fake;
+    const hub = new FakeShareHub(fake);
     const src = fakePick('window', true);
     const sharing = new BrowserSharing({
       capture: () => Promise.resolve(src),
@@ -153,20 +182,36 @@ describe('the shell’s update pill while this page shares (05 §16.2)', () => {
     });
 
     const services = createTestServices({ platform });
-    let started: Awaited<ReturnType<BrowserSharing['start']>> | undefined;
+    const started: Awaited<ReturnType<BrowserSharing['start']>>[] = [];
     const router = createMemoryRouter([
       {
         path: '*',
         element: (
           <ShareButton
             onStart={async (picked, opts) => {
-              started = await sharing.start(picked, opts, { signal: client, roomId: 'lounge' });
+              started.push(await sharing.start(picked, opts, { signal: client, roomId: 'lounge' }));
             }}
           />
         ),
       },
     ]);
     render(<App services={services} router={router} />);
+    return { server: fake, hub, services, started };
+  }
+
+  /** Share → the sheet → Share: the picker "returns" a window, and the share starts. */
+  async function shareAWindow(): Promise<void> {
+    await userEvent.click(screen.getByRole('button', { name: 'Share' }));
+    await userEvent.click(
+      within(screen.getByRole('dialog', { name: 'Share your screen' })).getByRole('button', { name: 'Share' }),
+    );
+    await waitFor(() => {
+      expect(shareStore.getState().phase).toBe('starting');
+    });
+  }
+
+  it('the update pill offers no Reload from the moment the share starts until it has stopped (05 §16.2)', async () => {
+    const { hub, services, started } = await mountShell();
 
     // An update is ready before anything is shared: the shell offers the reload.
     act(() => {
@@ -175,14 +220,7 @@ describe('the shell’s update pill while this page shares (05 §16.2)', () => {
     const pill = screen.getByRole('region', { name: 'App update' });
     expect(within(pill).getByRole('button', { name: 'Reload' })).toBeInTheDocument();
 
-    // Share → the sheet → Share: the picker "returns" a window, and the share starts.
-    await userEvent.click(screen.getByRole('button', { name: 'Share' }));
-    await userEvent.click(
-      within(screen.getByRole('dialog', { name: 'Share your screen' })).getByRole('button', { name: 'Share' }),
-    );
-    await waitFor(() => {
-      expect(shareStore.getState().phase).toBe('starting');
-    });
+    await shareAWindow();
     expect(services.ui.getState().sharing).toBe(true);
     expect(within(pill).queryByRole('button', { name: 'Reload' })).not.toBeInTheDocument();
     expect(pill).toHaveTextContent('Update ready. Reload after you stop sharing.');
@@ -197,12 +235,44 @@ describe('the shell’s update pill while this page shares (05 §16.2)', () => {
 
     // The share stops: the reload is offered again.
     await act(async () => {
-      await started?.stop();
+      await started[0]?.stop();
     });
     expect(hub.requests<ShareStop>('share.stop')).toEqual([{ shareId: 's_1' }]);
     expect(shareStore.getState().phase).toBe('idle');
     expect(services.ui.getState().sharing).toBe(false);
     expect(within(pill).getByRole('button', { name: 'Reload' })).toBeInTheDocument();
     expect(pill).toHaveTextContent('Update ready');
+  });
+
+  it('sdp_invalid for the pub PC twice within a minute: "Can’t connect media" with Reload (05 §9)', async () => {
+    const { server: fake, hub, services } = await mountShell();
+    await shareAWindow();
+    await waitFor(() => {
+      expect(pubOffers(fake)).toHaveLength(1);
+    });
+
+    // The first one: the pub PC is rebuilt once (gen 2), and the share goes on.
+    act(() => {
+      fake.error(makeError('sdp_invalid', 'pc', { pc: 'pub', gen: 1, neg: 1 }));
+    });
+    await waitFor(() => {
+      expect(pubOffers(fake).at(-1)).toMatchObject({ gen: 2, neg: 1 });
+    });
+    expect(shareStore.getState().phase).toBe('starting');
+    expect(services.ui.getState().screen).toBeNull();
+
+    // The second one ends it: not a failed share with Dismiss, but the app's screen with Reload.
+    act(() => {
+      fake.error(makeError('sdp_invalid', 'pc', { pc: 'pub', gen: 2, neg: 1 }));
+    });
+    await waitFor(() => {
+      expect(services.ui.getState().screen).toEqual({ kind: 'fatal', reason: 'media' });
+    });
+    expect(screen.getByRole('heading', { name: "Can't connect media" })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Reload' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Share' })).not.toBeInTheDocument();
+    // The share itself is over, on the server too.
+    expect(hub.requests<ShareStop>('share.stop')).toEqual([{ shareId: 's_1' }]);
+    expect(services.ui.getState().sharing).toBe(false);
   });
 });

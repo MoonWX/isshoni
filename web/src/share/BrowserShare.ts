@@ -12,8 +12,10 @@
 //   capture stops and the transceivers go, nothing is published again, and the reason decides what the user sees:
 //   stopped or left → "Sharing was stopped from another tab or device"; media_timeout → failed, "no video reached
 //   the server"; room_closed → nothing here (the session shows the room's end); anything else → failed;
-// - an error notification in scope `share` about it (codec_not_supported), or a pub PC that failed for good →
-//   failed, with that error.
+// - an error notification in scope `share` about it (codec_not_supported) → failed, with that error;
+// - a pub PC whose negotiation failed twice within a minute (01 §9 rule 8) → failed with PubNegotiationFailedError,
+//   which the app turns into its "Can't connect media" screen with Reload (05 §9; shareUi.ts does, it has the
+//   uiStore).
 //
 // Not here yet (the web recovery slice): following a reconnect (resync, re-publishing with `replaces`) and the 60 s
 // capture hold. Without them the room session stops a share whose server side is gone.
@@ -71,6 +73,20 @@ export class ShareEndedError extends Error {
     super(`the server ended the share (${reason ?? 'no reason'})`);
     this.kind = kind;
     this.reason = reason;
+  }
+}
+
+/**
+ * The pub PC gave up: its negotiation failed twice within a minute (sdp_invalid or bad_request from the server, or an
+ * offer or answer that couldn't be applied here: 01 §9 rule 8). That is not shown as a failed share that can be
+ * started again: the app shows "Can't connect media" with Reload (05 §9).
+ *
+ * It is a LocalError `webrtc_failed` for whoever only reads the code. A start that fails once is a plain LocalError
+ * with that code, and stays a failed share.
+ */
+export class PubNegotiationFailedError extends LocalError {
+  constructor() {
+    super('webrtc_failed');
   }
 }
 
@@ -405,8 +421,9 @@ export class BrowserShare implements ActiveShare {
         if (this.#state === 'live') this.#setState('reconnecting');
         break;
       case 'failed':
-        // Negotiation failed twice within a minute (01 §9 rule 8): nothing more is tried for this PC.
-        void this.#end('error', true, { error: new LocalError('webrtc_failed') });
+        // Negotiation failed twice within a minute (01 §9 rule 8): nothing more is tried for this PC, and the app
+        // says so on its "Can't connect media" screen (05 §9).
+        void this.#end('error', true, { error: new PubNegotiationFailedError() });
         break;
       case 'idle':
       case 'connecting':

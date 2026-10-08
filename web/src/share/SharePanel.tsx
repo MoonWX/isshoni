@@ -1,6 +1,8 @@
 // SharePanel (05 §13.7): the sharer's bar at the bottom of the room page while this page shares. A red dot,
 // "You're live · Window · Movie · 3 watching", Stop, and an expander with the preset picker, the sound switch, the
-// level meter and the list of who is watching. The upload and CPU hints show in the bar itself.
+// level meter and the list of who is watching. The upload and CPU hints show in the bar itself, and so does the note
+// of a pick that came without sound (05 §13.3: "Live, with the note"): friends hear nothing, and the sharer has to
+// see that without opening anything. With the expander open, the note is where the sound switch would be.
 //
 // The room page mounts it once:
 //   <SharePanel
@@ -13,6 +15,11 @@
 // It is a view of shareStore's second half (05 §13.1): nothing while idle or picking; "Starting…" with Stop; the
 // live bar; "Reconnecting…" while the pub PC recovers; and a failed share with its error until it is dismissed.
 // While a panel is mounted, the Share buttons leave a failed start and the "no sound is shared" note to it.
+//
+// Stop acts on the session's share, which exists once share.start was answered and the offer is made. Until then
+// (`share` is null and the phase is `starting`) there is nothing the session could stop, so the button is disabled:
+// a click must not look like it worked while the share goes live anyway. (The browser's own "Stop sharing" bar
+// works throughout.)
 import { ChevronDown, ChevronUp } from 'lucide-react';
 import { useEffect, useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -163,7 +170,10 @@ export function SharePanel({
       watching: t('share.panel.watching', { count }),
     });
   }
-  const note = picked !== null ? noAudioNote(picked, t) : null;
+  const note = picked !== null && !withAudio ? noAudioNote(picked, t) : null;
+  const detailsOpen = published && open;
+  // In the bar from the start, so it is seen without opening anything; the open settings show it themselves.
+  const noteInBar = note !== null && phase !== 'stopping' && !detailsOpen;
   const audioTrack = share?.preview?.getAudioTracks()[0] ?? null;
 
   return (
@@ -195,6 +205,7 @@ export function SharePanel({
             variant="danger"
             size="sm"
             loading={phase === 'stopping'}
+            disabled={share === null && phase === 'starting'}
             aria-label={t('share.panel.stopSharing')}
             onClick={() => {
               void onStop();
@@ -211,7 +222,8 @@ export function SharePanel({
             : t('share.panel.hint.cpu')}
         </p>
       )}
-      {published && open && (
+      {noteInBar && <p className={styles.hint}>{note}</p>}
+      {detailsOpen && (
         <div id={detailsId} className={styles.details}>
           <fieldset className={styles.presets} disabled={share === null || changingPreset}>
             <legend className={styles.legend}>{t('share.preset.legend')}</legend>

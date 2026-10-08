@@ -4,35 +4,65 @@
 //
 // Why "in the Share click": a browser lets an AudioContext run only once the page had a user gesture, and Safari
 // only when it is created or resumed inside one. The Share click is that gesture (the click that opens the picker),
-// so ShareButton calls primeLevelAudio() there; a meter that opens later finds the context running.
+// so ShareButton calls primeLevelAudio() there. From then on the context may run whenever it is asked to.
+//
+// It runs only while something is metered. The click's resume() is what unlocks it; as soon as that has happened it
+// is suspended again, until a meter opens (the share panel's settings), and again when the last meter closes. A
+// sharer who never opens the settings, or shares without sound, has no audio thread and no open output device left
+// behind by the click.
 
 type AudioContextCtor = new () => AudioContext;
 
 let context: AudioContext | null = null;
-/** The open taps: the context is suspended while there are none. */
+/** The open taps: the context runs while there are some and is suspended while there are none. */
 let taps = 0;
 
-function contextCtor(): AudioContextCtor | undefined {
-  const ctor = (globalThis as { AudioContext?: AudioContextCtor }).AudioContext;
-  return typeof ctor === 'function' ? ctor : undefined;
-}
-
-function resume(ctx: AudioContext): void {
-  if (ctx.state === 'suspended') void ctx.resume().catch(() => undefined);
+/** The page's AudioContext, made on first use; null where WebAudio is missing or refuses. */
+function ensureContext(): AudioContext | null {
+  if (context !== null) return context;
+  const Ctor = (globalThis as { AudioContext?: AudioContextCtor }).AudioContext;
+  if (typeof Ctor !== 'function') return null;
+  try {
+    context = new Ctor();
+  } catch {
+    context = null;
+  }
+  return context;
 }
 
 /**
- * Creates the page's AudioContext, or resumes it. Call it from a click handler (the Share click). A no-op where
- * WebAudio is missing; the level meter then shows nothing.
+ * Asks the context for the state the taps need: running while something is metered, suspended otherwise. It asks
+ * every time instead of reading `state` first: the state follows a resume() or suspend() only later, and of the
+ * requests a context got, the last one counts.
+ */
+function settle(ctx: AudioContext): void {
+  if (ctx.state === 'closed') return;
+  try {
+    void (taps > 0 ? ctx.resume() : ctx.suspend()).catch(() => undefined);
+  } catch {
+    // A context that can't be suspended or resumed stays as it is; the meter then reads what it gets.
+  }
+}
+
+/**
+ * Creates the page's AudioContext and unlocks it: resume() inside a user gesture. Call it from a click handler (the
+ * Share click). While nothing is metered the context is suspended again once it has run. A no-op where WebAudio is
+ * missing; the level meter then shows nothing.
  */
 export function primeLevelAudio(): void {
-  const Ctor = contextCtor();
-  if (Ctor === undefined) return;
+  const ctx = ensureContext();
+  if (ctx === null || ctx.state === 'closed') return;
   try {
-    context ??= new Ctor();
-    resume(context);
+    // Also when it runs already: a context made inside a gesture may start by itself, and that one is suspended
+    // just the same when nothing is metered.
+    void ctx.resume().then(
+      () => {
+        settle(ctx);
+      },
+      () => undefined,
+    );
   } catch {
-    context = null;
+    // As in settle().
   }
 }
 
@@ -48,8 +78,7 @@ export interface LevelTap {
  * The track is neither cloned nor changed, and what it carries is not played.
  */
 export function openLevelTap(track: MediaStreamTrack): LevelTap | null {
-  primeLevelAudio();
-  const ctx = context;
+  const ctx = ensureContext();
   if (ctx === null || typeof globalThis.MediaStream !== 'function') return null;
   try {
     const source = ctx.createMediaStreamSource(new MediaStream([track]));
@@ -58,7 +87,7 @@ export function openLevelTap(track: MediaStreamTrack): LevelTap | null {
     source.connect(analyser);
     const samples = new Float32Array(analyser.fftSize);
     taps++;
-    resume(ctx);
+    settle(ctx);
     let open = true;
     return {
       read() {
@@ -77,8 +106,8 @@ export function openLevelTap(track: MediaStreamTrack): LevelTap | null {
           // Already disconnected.
         }
         taps--;
-        // Nothing to measure: no reason to keep the audio thread running. The next tap resumes it.
-        if (taps === 0 && ctx.state === 'running') void ctx.suspend().catch(() => undefined);
+        // The last one: nothing to measure, no reason to keep the audio thread running. The next tap resumes it.
+        if (taps === 0) settle(ctx);
       },
     };
   } catch {

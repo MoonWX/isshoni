@@ -143,6 +143,28 @@ describe('SharePanel', () => {
     expect(onStop).toHaveBeenCalledOnce();
   });
 
+  it('starting, before the session has the share: Stop can’t be used yet, and can as soon as the share is there', async () => {
+    // share.start is on its way: the session has nothing it could stop, and the share would go live all the same.
+    const { onStop, rerender } = renderPanel({ phase: 'starting', share: null });
+    const stop = (): HTMLElement => screen.getByRole('button', { name: 'Stop sharing' });
+    expect(stop()).toBeDisabled();
+    await userEvent.click(stop());
+    expect(onStop).not.toHaveBeenCalled();
+
+    rerender({ share: fakeShare() });
+    expect(panel()).toHaveTextContent('Starting your share…');
+    expect(stop()).toBeEnabled();
+    await userEvent.click(stop());
+    expect(onStop).toHaveBeenCalledOnce();
+  });
+
+  it('once the share is live Stop works whatever the page knows of the share object', async () => {
+    const { onStop } = renderPanel({ share: null });
+    expect(screen.getByRole('button', { name: 'Stop sharing' })).toBeEnabled();
+    await userEvent.click(screen.getByRole('button', { name: 'Stop sharing' }));
+    expect(onStop).toHaveBeenCalledOnce();
+  });
+
   it('reconnecting: says so; when the media port can’t be reached, that, with [Test my connection]', async () => {
     const onTestConnection = vi.fn();
     const { store } = renderPanel({ phase: 'reconnecting', onTestConnection });
@@ -175,6 +197,58 @@ describe('SharePanel', () => {
       store.getState().finish();
     });
     expect(screen.queryByRole('region', { name: 'Your share' })).not.toBeInTheDocument();
+  });
+});
+
+describe('SharePanel: a share without sound says so in the bar (05 §13.3 "Live, with the note")', () => {
+  const NOTES = [
+    ['window', "This window's sound isn't shared (needs Windows 11 or macOS 14.2+ and a current Chrome/Edge)"],
+    ['browser', "Tick 'Also share tab audio' to include sound"],
+    ['monitor', 'No sound is shared'],
+  ] as const;
+
+  it.each(NOTES)('a %s picked without sound: its note shows without opening anything', (surface, note) => {
+    renderPanel({ src: fakePick(surface, false) });
+    expect(screen.getByRole('button', { name: 'Share settings' })).toHaveAttribute('aria-expanded', 'false');
+    expect(within(panel()).getByText(note)).toBeInTheDocument();
+  });
+
+  it('from the start of the share, through a reconnect, until it stops', () => {
+    const note = NOTES[0][1];
+    const { store } = renderPanel({ phase: 'starting', src: fakePick('window', false) });
+    expect(panel()).toHaveTextContent('Starting your share…');
+    expect(screen.getByText(note)).toBeInTheDocument();
+    act(() => {
+      store.getState().advance('live');
+    });
+    expect(screen.getByText(note)).toBeInTheDocument();
+    act(() => {
+      store.getState().advance('reconnecting');
+    });
+    expect(screen.getByText(note)).toBeInTheDocument();
+    act(() => {
+      store.getState().advance('stopping');
+    });
+    expect(screen.queryByText(note)).not.toBeInTheDocument();
+  });
+
+  it('with the settings open the note is there once, where the sound switch would be', async () => {
+    const note = NOTES[1][1];
+    renderPanel({ src: fakePick('browser', false) });
+    await openDetails();
+    expect(screen.getAllByText(note)).toHaveLength(1);
+    await openDetails();
+    expect(screen.getAllByText(note)).toHaveLength(1);
+  });
+
+  it('no note for a share with sound', () => {
+    renderPanel();
+    expect(screen.queryByText(/sound/i)).not.toBeInTheDocument();
+  });
+
+  it('nor for a whole screen shared "without sound": that was the sharer’s choice', () => {
+    renderPanel({ src: fakePick('monitor', true), withAudio: false });
+    expect(screen.queryByText('No sound is shared')).not.toBeInTheDocument();
   });
 });
 

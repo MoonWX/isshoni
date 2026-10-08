@@ -1,26 +1,28 @@
 // The share state's part in the app-wide UI (uiStore), and the texts of a share that ended.
 //
 // linkShareUi keeps uiStore.sharing equal to "this page shares a screen right now", so the UpdatePill offers no
-// Reload meanwhile (05 §16.2: a reload would end the share), and shows the toast of a share that the server ended
-// without a failure ("Sharing was stopped from another tab or device", 05 §13.1).
+// Reload meanwhile (05 §16.2: a reload would end the share), shows the toast of a share that the server ended
+// without a failure ("Sharing was stopped from another tab or device", 05 §13.1), and puts up the app's "Can't
+// connect media" screen when the pub PC's negotiation failed twice within a minute (05 §9, 01 §9 rule 8).
 //
-// Why a link and not a component: the share outlives the room page (the session is app-level, 05 §11.1), so both
-// have to work on /account and /admin too, where nothing of share/ is mounted. A share can only start from a Share
+// Why a link and not a component: the share outlives the room page (the session is app-level, 05 §11.1), so all of
+// it has to work on /account and /admin too, where nothing of share/ is mounted. A share can only start from a Share
 // button, so each button makes the link when it mounts; from then on the link stays, whatever page is shown.
 import type { TFunction } from 'i18next';
 
 import type { UiStore } from '../app/uiStore';
 import { i18n } from '../i18n';
 import { errorMessage } from '../lib/errorText';
-import { ShareEndedError } from './BrowserShare';
+import { PubNegotiationFailedError, ShareEndedError } from './BrowserShare';
 import { isSharingPhase, type ShareStore } from './shareStore';
 
 const linked = new WeakMap<ShareStore, WeakSet<UiStore>>();
 
 /**
  * Links a share store to the app's uiStore, for good: ui.sharing follows the store's phase (starting, live,
- * reconnecting and stopping count as sharing), and a notice of the store becomes a toast. Linking the same pair
- * again does nothing.
+ * reconnecting and stopping count as sharing), a notice of the store becomes a toast, and a share that failed with
+ * PubNegotiationFailedError becomes the Fatal screen "Can't connect media", whose Reload is the way on. Linking the
+ * same pair again does nothing.
  */
 export function linkShareUi(store: ShareStore, ui: UiStore): void {
   let uis = linked.get(store);
@@ -41,6 +43,10 @@ export function linkShareUi(store: ShareStore, ui: UiStore): void {
     if (state.notice !== null && state.notice !== before.notice) {
       // One kind so far; a switch when there are more.
       ui.getState().toast({ kind: 'info', message: i18n.t('share.ended.elsewhere') });
+    }
+    // Any other failed share (a start that failed once, a share the server ended) stays the share panel's to show.
+    if (state.phase === 'failed' && state.error !== before.error && state.error instanceof PubNegotiationFailedError) {
+      ui.getState().showScreen({ kind: 'fatal', reason: 'media' });
     }
   });
 }

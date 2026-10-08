@@ -25,7 +25,13 @@ import {
   parseSdpSections,
 } from '../test/FakeRTCPeerConnection';
 import { createTestPlatform } from '../test/platform';
-import { BrowserShare, END_NOTICE_GRACE_MS, ShareEndedError, STATS_SAMPLE_MS } from './BrowserShare';
+import {
+  BrowserShare,
+  END_NOTICE_GRACE_MS,
+  PubNegotiationFailedError,
+  ShareEndedError,
+  STATS_SAMPLE_MS,
+} from './BrowserShare';
 import { BrowserSharing, type BrowserSharingDeps } from './BrowserSharing';
 import { createShareStore, ShareCancelledError, type ShareStore } from './shareStore';
 import { fakePick, type FakePick } from './testing/fakeCapture';
@@ -276,6 +282,8 @@ describe('start: share.start, then the pub offer (05 §13.4)', () => {
     const src = fakePick('window', true);
     const err: unknown = await start({ src }).catch((e: unknown) => e);
     expect(err).toMatchObject({ name: 'LocalError', code: 'webrtc_failed' });
+    // A start that failed once is a failed share, not the end of media on this page.
+    expect(err).not.toBeInstanceOf(PubNegotiationFailedError);
     await tick();
     expect(wire()).toEqual(['share.start', 'share.stop']);
     expect(hub.requests<ShareStop>('share.stop')).toEqual([{ shareId: 's_1' }]);
@@ -621,17 +629,24 @@ describe('the server ends the share (05 §13.1)', () => {
     expect(share.state).toBe('live');
   });
 
-  it('a pub PC whose negotiation failed twice within a minute fails the share with webrtc_failed', async () => {
-    const { share, ended } = await start();
+  it('a pub PC whose negotiation failed twice within a minute ends the share with PubNegotiationFailedError', async () => {
+    const { share, src, ended } = await start();
     server.error(makeError('sdp_invalid', 'pc', { pc: 'pub', gen: 1, neg: 1 }));
     await tick();
     expect(pubOffers(server).at(-1)).toMatchObject({ gen: 2, neg: 1 });
+    expect(share.state).toBe('starting');
     server.error(makeError('sdp_invalid', 'pc', { pc: 'pub', gen: 2, neg: 1 }));
     await tick();
     expect(share.state).toBe('ended');
     expect(ended).toEqual(['error']);
-    expect(store.getState()).toMatchObject({ phase: 'failed', error: { name: 'LocalError', code: 'webrtc_failed' } });
+    // Not a plain failed share: the app shows "Can't connect media" for this one (05 §9; shareUi.test.tsx).
+    const { phase, error } = store.getState();
+    expect(phase).toBe('failed');
+    expect(error).toBeInstanceOf(PubNegotiationFailedError);
+    expect(error).toMatchObject({ name: 'LocalError', code: 'webrtc_failed' });
     expect(hub.requests<ShareStop>('share.stop')).toEqual([{ shareId: 's_1' }]);
+    expect(hub.requests<PCClose>('pc.close')).toEqual([{ pc: 'pub', gen: 2 }]);
+    expect(src.release).toHaveBeenCalledOnce();
   });
 });
 

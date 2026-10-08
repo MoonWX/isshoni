@@ -16,7 +16,8 @@
 // button unmounts.
 //
 // How the flow ended is told here as toasts: a failed capture always; a failed start and the "no sound is shared"
-// notes of 05 §13.3 only on a page without a SharePanel, which shows both itself.
+// notes of 05 §13.3 only on a page without a SharePanel, which shows both itself (the note in its bar, for as long
+// as the share lasts). The note is still said once for screen readers then: the panel's bar is no live region.
 //
 // Each button also links the share state to the app's uiStore when it mounts (shareUi.ts): a share can only start
 // from a Share button, and what the rest of the app needs to know about it (the update pill must not offer a reload
@@ -110,9 +111,12 @@ export function ShareButton({
       if (outcome.step === 'failed') {
         if (panels > 0 && now === 'failed') return;
         ui.getState().toast({ kind: 'error', message: errorMessage(outcome.error, t) });
-      } else if (outcome.step === 'started' && panels === 0) {
+      } else if (outcome.step === 'started') {
         const note = noAudioNote(outcome.picked, t);
-        if (note !== null) ui.getState().toast({ kind: 'info', message: note, durationMs: NOTE_TOAST_MS });
+        if (note === null) return;
+        // A toast announces itself; the panel's bar doesn't.
+        if (panels > 0) ui.getState().announce(note);
+        else ui.getState().toast({ kind: 'info', message: note, durationMs: NOTE_TOAST_MS });
       }
     });
   };
