@@ -446,6 +446,57 @@ describe('runProbe: no result at all', () => {
     expect(s.pc.signalingState).toBe('closed');
   });
 
+  // Both waits (for the connection, for the echoes) listen for an abort that comes later. One that came just before
+  // they started fires no event any more, so they must look at the signal first.
+  it('an abort while the answer is being applied is not missed: no 8 s wait, the PC is closed at once', async () => {
+    const ctl = new AbortController();
+    const reason = new Error('left the page');
+    const platform = createTestPlatform({
+      createPeerConnection: (config) => {
+        const pc = new FakeRTCPeerConnection(config);
+        const apply = pc.setRemoteDescription.bind(pc);
+        pc.setRemoteDescription = async (desc) => {
+          await apply(desc);
+          ctl.abort(reason); // lands while runProbe awaits this call
+        };
+        return pc as unknown as RTCPeerConnection;
+      },
+    });
+    const settled = vi.fn();
+    const promise = runProbe(platform, 'udp', {
+      request: () => Promise.resolve(connTestReply()),
+      signal: ctl.signal,
+    });
+    promise.then(settled, settled);
+    await flush(); // the clock does not move
+
+    expect(ctl.signal.aborted).toBe(true);
+    const pc = FakeRTCPeerConnection.last;
+    expect(pc?.remoteDescription).toMatchObject({ type: 'answer' }); // the answer was applied
+    expect(settled).toHaveBeenCalledTimes(1);
+    await expect(promise).rejects.toBe(reason);
+    expect(pc?.signalingState).toBe('closed');
+    expect(vi.getTimerCount()).toBe(0); // the 8 s timer never started
+  });
+
+  it('an abort in the same tick as the connection is not missed: no ping is sent', async () => {
+    const ctl = new AbortController();
+    const reason = new Error('left the page');
+    const s = await start('udp', undefined, ctl.signal);
+    const settled = vi.fn();
+    s.promise.then(settled, settled);
+    s.pc.setConnectionState('connected');
+    s.dc.open();
+    ctl.abort(reason);
+    await flush(); // the clock does not move
+
+    expect(s.dc.sent).toEqual([]);
+    expect(settled).toHaveBeenCalledTimes(1);
+    await expect(s.promise).rejects.toBe(reason);
+    expect(s.pc.signalingState).toBe('closed');
+    expect(vi.getTimerCount()).toBe(0); // no ping timer either
+  });
+
   it('aborting while it connects, and during the pings, closes the PC and rejects', async () => {
     const a = new AbortController();
     const connecting = await start('udp', undefined, a.signal);

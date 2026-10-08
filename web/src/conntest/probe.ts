@@ -119,7 +119,8 @@ type ConnectResult = 'connected' | 'failed' | 'timeout';
 
 /**
  * Resolves when the PC is connected and the channel open ("connected"), when either can't get there any more
- * ("failed"), or after timeoutMs ("timeout"). Rejects when the signal aborts.
+ * ("failed"), or after timeoutMs ("timeout"). Rejects when the signal aborts, or has aborted already: a signal fires
+ * "abort" once, so a listener added afterwards would never run.
  */
 function waitConnected(
   pc: RTCPeerConnection,
@@ -128,6 +129,10 @@ function waitConnected(
   signal: AbortSignal | undefined,
 ): Promise<ConnectResult> {
   return new Promise<ConnectResult>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError(signal));
+      return;
+    }
     const cleanup = (): void => {
       clearTimeout(timer);
       pc.removeEventListener('connectionstatechange', check);
@@ -186,10 +191,14 @@ function echoIndex(data: unknown): number | undefined {
 /**
  * Sends the pings and collects the round-trip time of each echo, in ms. Resolves when every ping was echoed, when
  * the channel closes, or ECHO_WAIT_MS after the last ping, with what arrived (possibly nothing). Rejects when the
- * signal aborts.
+ * signal aborts, or has aborted already (then no ping is sent).
  */
 function measureEchoes(dc: RTCDataChannel, signal: AbortSignal | undefined): Promise<number[]> {
   return new Promise<number[]>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError(signal));
+      return;
+    }
     const sentAt = new Map<number, number>();
     const samples: number[] = [];
     let next = 0;
@@ -347,6 +356,7 @@ export async function runProbe(
       throwIfAborted(signal);
       return withServer({ transport, result: 'failed', error: 'server' });
     }
+    throwIfAborted(signal);
 
     const connected = await waitConnected(pc, dc, CONNECT_TIMEOUT_MS, signal);
     if (connected === 'timeout') return withServer({ transport, result: 'failed', error: 'timeout' });

@@ -114,7 +114,7 @@
     "noPublicIp": "The server doesn't know its public address, so browsers can't reach its media ports. Set <code>public_ip</code> in <code>/etc/isshoni/isshoni.toml</code> (Docker: <code>ISSHONI_PUBLIC_IP</code> in <code>.env</code>) and restart.",
     "nat": {
       "none": "This server has its public address on its own network interface, so no router or NAT is in the way.",
-      "one_to_one": "This server is behind 1:1 NAT, as cloud servers and containers are. It passes every port, so only a firewall can be in the way.",
+      "one_to_one": "This server is behind 1:1 NAT (a cloud network or a container). Open the ports in the provider's firewall. In a container, also publish them. At home, also forward TCP 80, 443, {{tcpPort}} and UDP {{udpPort}} on your router to this machine.",
       "port_forward": "Forward TCP 80, 443, {{tcpPort}} and UDP {{udpPort}} on your router to this machine.",
       "symmetric": "This server has no public address; isshoni needs one (a VPS or a router port forward).",
       "cgnat_likely": "This server has no public address; isshoni needs one (a VPS or a router port forward).",

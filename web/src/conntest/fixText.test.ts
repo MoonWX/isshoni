@@ -126,6 +126,17 @@ describe('NAT text', () => {
     }
   });
 
+  // 04 §7.4 and §7.5 put three servers under one_to_one: a cloud VM, a container on a VPS (a bridge passes only
+  // published ports) and a container at home behind a router. The text must not rule any of them out.
+  it('one_to_one names everything that can be in the way: the firewall, published ports, a home router', () => {
+    const server = { udpPort: 5000, tcpPorts: [443, 5001], nat: 'one_to_one', container: 'docker' };
+    const shown = text(byId(fix({ ...udpBlocked, server }).lines, 'nat') as FixLine);
+    expect(shown).toMatch(/provider's firewall/);
+    expect(shown).toMatch(/In a container, also publish them/);
+    expect(shown).toContain('forward TCP 80, 443, 5001 and UDP 5000 on your router to this machine');
+    expect(shown).not.toMatch(/\bonly\b/);
+  });
+
   it('falls back to "unknown" for a kind this build does not know', () => {
     expect(byId(fix({ ...udpBlocked, server: { nat: 'double' } }).lines, 'nat')?.key).toBe('conntest.nat.unknown');
     expect(knownNat('toString')).toBe('unknown');
