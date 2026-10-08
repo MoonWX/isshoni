@@ -1,5 +1,5 @@
 // The room page's header (05 §11.2): the room's name (the page's <h1>), the switcher when there is more than one
-// room, the people count ("5 here", which opens the people panel), the share controls the page passes in, and the
+// room, the people count ("5 here", which opens the people panel), the controls the page passes in, and the
 // account menu.
 import { Users } from 'lucide-react';
 import type { ReactNode } from 'react';
@@ -32,7 +32,7 @@ export interface RoomHeaderProps {
   onOpenRooms?: () => void;
   /** Opens the connection test: the account menu's "Test my connection" (05 §14.2), there only when this is given. */
   onTestConnection?: () => void;
-  /** The share controls (the Share button where the platform can share, Stop while sharing). */
+  /** The page's controls: "Tap to unmute" while the browser wants a tap, the Share button where it can share. */
   children?: ReactNode;
 }
 

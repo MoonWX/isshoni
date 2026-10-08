@@ -1,7 +1,7 @@
 // What an admin form shows after a failed change (05 §6.3): the server sends codes, never English.
 // - validation_failed (422) names fields: each code shows under its control. A field with a text of its own in
-//   fieldErrors.<field>.<code> (username, serverName) uses it; the others get the admin pages' text for the code,
-//   and the numbers that go with it (a range, a length) are in the hint under the control;
+//   fieldErrors.<field>.<code> (username, serverName, currentPassword) uses it; the others get the admin pages' text
+//   for the code, and the numbers that go with it (a range, a length) are in the hint under the control;
 // - some codes are about one field without naming it: wrong_password is the admin's own password,
 //   username_taken and room_name_taken the name that was typed. The form says which (codeFields);
 // - everything else is one message above the form, from errors.<code> (lib/errorText.ts).

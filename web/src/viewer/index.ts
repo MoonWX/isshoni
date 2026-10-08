@@ -2,7 +2,8 @@
 //
 // Wiring, for the room's controllers and page (05 §11):
 //   const viewer = createViewer({ volume: prefs.volume, onVolume: prefs.setVolume });  // once per page
-//   new RoomSession({ …, media: { createSubscriber: (deps) => viewer.createSubscriber({ ...deps, ui }) } });
+//   new RoomSession({ …, media: { createSubscriber } });                   // 05 §10.1, with
+//     createSubscriber = (deps) => viewer.createSubscriber({ ...deps, ui }, SubscriberPC)
 //   const detach = attachViewer(signal, viewer);                           // subscribe.status → viewerStore.status
 //   const unsync = attachSubscriptions(viewer, session.subscriptions);     // the desired set → subscribe.update
 //   syncRoom(viewer, roomState, { userId, connectionId });                 // on every room.state; null after leaving
@@ -49,7 +50,14 @@ export {
 export { ViewerContext, useShareMedia, useViewer, useViewerServices } from './context';
 export { desiredSubscriptions, PAGE_HIDDEN_OFF_MS, type LayerInputs } from './layerPolicy';
 export { createMediaRegistry, NO_MEDIA, type MediaRegistry, type ShareMedia } from './mediaRegistry';
-export { attachViewer, createViewer, syncRoom, type ViewerOptions, type ViewerServices } from './services';
+export {
+  attachViewer,
+  createViewer,
+  syncRoom,
+  type SubscriberClass,
+  type ViewerOptions,
+  type ViewerServices,
+} from './services';
 export { ShareVideo, type ShareVideoProps } from './ShareVideo';
 export { Stage, type StageProps } from './Stage';
 export { viewerDebugState, viewerStatsSources, type ViewerDebugState } from './stats';

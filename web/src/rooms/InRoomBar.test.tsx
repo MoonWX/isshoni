@@ -3,6 +3,7 @@
 import { act, fireEvent, screen, within } from '@testing-library/react';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { createAppRoutes } from '../app/router';
 import { makeError } from '../protocol/testing';
 import { shareStore } from '../share/shareStore';
 import { createTestServices } from '../test/render';
@@ -21,8 +22,11 @@ import {
 
 let h: Harness | undefined;
 
-// The room page's lazy chunks, loaded before the clock is faked.
-beforeAll(preloadLazyChunks, PRELOAD_TIMEOUT_MS);
+// The room page's lazy chunks, loaded before the clock is faked; and the folder of /about, for the app's routes.
+beforeAll(async () => {
+  await preloadLazyChunks();
+  await import('../auth');
+}, PRELOAD_TIMEOUT_MS);
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -50,6 +54,31 @@ async function inLounge(rest: RestAnswers = {}) {
 }
 
 describe('InRoomBar (05 §11.1)', () => {
+  it('is in the app’s own layout: above another page of the real routes, and not on the room’s page', async () => {
+    h = createHarness();
+    stubRest(h.platform);
+    const { router } = renderRoomApp(h.services, '/r/lounge', createAppRoutes());
+    await advance();
+    expect(screen.getByRole('heading', { level: 1, name: 'Lounge' })).toBeInTheDocument();
+    expect(bar()).not.toBeInTheDocument();
+
+    // /about is a page for everyone.
+    await act(() => router.navigate('/about'));
+    await advance();
+    const region = bar();
+    expect(region).toHaveTextContent('In Lounge');
+    expect(within(region as HTMLElement).getByRole('link', { name: 'Back' })).toHaveAttribute('href', '/r/lounge');
+    // The bar is above the page, not inside it.
+    const page = screen.getByRole('heading', { level: 1 });
+    expect((region as HTMLElement).compareDocumentPosition(page) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(h.runtime.signal.state).toBe('ready');
+
+    fireEvent.click(within(region as HTMLElement).getByRole('button', { name: 'Leave' }));
+    await advance();
+    expect(bar()).not.toBeInTheDocument();
+    expect(h.hub.sent('room.leave')).toHaveLength(1);
+  });
+
   it('is not there on the room’s own page', async () => {
     await inLounge();
     expect(screen.getByRole('heading', { level: 1, name: 'Lounge' })).toBeInTheDocument();

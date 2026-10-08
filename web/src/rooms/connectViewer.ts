@@ -8,11 +8,15 @@
 // - When the session has no snapshot anymore, the user is out of that room (leave(), a room switch, a room the
 //   server closed or refused): the viewer goes back to its empty state, and forgets the shares it remembered.
 // - subscribe.status reaches viewerStore.status (attachViewer).
+// - What the viewer shows and plays is what the session asks the server for (attachSubscriptions, 05 §12.3–§12.4):
+//   the viewer's desired set goes to session.subscriptions, which sends one subscribe.update per change. Away from
+//   the room page no tile is shown, so every video goes off while the audible share keeps playing (05 §11.1).
 // - "bo started sharing [Watch]" (createWatchToast) takes the session's announcement over while the user has picked
 //   a tile (owner decision, 05 §24.1).
 import type { UiStore } from '../app/uiStore';
 import type { SignalClient } from '../protocol/signal-client';
 import { attachViewer, syncRoom, type ViewerServices } from '../viewer/services';
+import { attachSubscriptions } from '../viewer/subscriptions';
 import type { ViewerSelf } from '../viewer/viewerStore';
 import { createWatchToast } from '../viewer/watchToast';
 import type { RoomSession } from './RoomSession';
@@ -21,7 +25,7 @@ import type { RoomStore, RoomStoreState } from './roomStore';
 export interface ConnectViewerDeps {
   viewer: ViewerServices;
   signal: Pick<SignalClient, 'on'>;
-  session: Pick<RoomSession, 'onRoomEvent'>;
+  session: Pick<RoomSession, 'onRoomEvent' | 'subscriptions'>;
   room: RoomStore;
   ui: UiStore;
 }
@@ -47,6 +51,7 @@ export function connectViewer({ viewer, signal, session, room, ui }: ConnectView
   const offs = [
     room.subscribe(sync),
     attachViewer(signal, viewer),
+    attachSubscriptions(viewer, session.subscriptions),
     session.onRoomEvent(createWatchToast({ viewer, ui, selfUserId: () => room.getState().userId })),
   ];
   return () => {

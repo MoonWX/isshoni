@@ -1,9 +1,13 @@
 // The root route's layout: renders the page and moves focus to the page's <h1> after each navigation (05 §16.6),
 // so screen readers start at the new page. Pages own their structure (<main>, headers); the shell's toasts,
 // announcer and update pill live outside the router (App.tsx).
+//
+// Above the page it shows the room the tab is still in while the user is on another page (rooms/InRoomBar,
+// 05 §11.1). The bar renders nothing on a room's page, without a room, and in an app that never opened one.
 import { useEffect, useRef } from 'react';
 import { Outlet, useLocation } from 'react-router';
 
+import { InRoomBar } from '../../rooms/InRoomBar';
 import styles from './RootLayout.module.css';
 
 /** Focuses the page heading: the first <h1> inside <main>, else the first <h1>. */
@@ -27,6 +31,7 @@ export function RootLayout() {
   }, [pathname]);
   return (
     <div className={styles.root}>
+      <InRoomBar />
       <Outlet />
     </div>
   );

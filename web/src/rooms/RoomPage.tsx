@@ -5,23 +5,26 @@
 //
 // What plugs the room, the viewer and the sharer together (05 §11.1, §12, §13.1):
 // - the runtime made the viewer and keeps it in step with room.state (runtime.ts, connectViewer.ts); the page hands
-//   it to the stage, with the local preview of this page's share;
+//   it to the stage, with the local preview of this page's share, and to the header's "Tap to unmute" pill
+//   (05 §10.3);
 // - the Share buttons publish through session.startShare, and know about this user's share on another tab or
 //   device (findShareElsewhere), which the share sheet offers to stop;
-// - "Test my connection" (the account menu, the connection banner, the stage's media banner) opens the connection
-//   test (05 §14.2).
+// - the share panel under the stage (05 §13.7) shows this page's share, with who watches it (room.state), and its
+//   Stop is session.stopShare;
+// - "Test my connection" (the account menu, the connection banner, the stage's media banner, the share panel)
+//   opens the connection test (05 §14.2).
 //
-// The stage, the Share button and the connection test are lazy chunks (lazyMedia.ts, ConnTestDialog.tsx). The page
-// asks for the first two as it renders, with placeholders of their shape, so the header is there at once.
+// The stage, the Share button, the share panel, the pill and the connection test are lazy chunks (lazyMedia.ts,
+// ConnTestDialog.tsx). The page asks for the media chunk as it renders, with placeholders of the stage's and the
+// button's shape, so the header is there at once.
 //
 // The people panel and the connection test stay mounted and are closed through their `open` prop: a native
 // <dialog> gives the focus back to the control that opened it only when it is closed while still in the page
 // (05 §16.6).
 //
 // Still to come, each with its slice: the in-app browser banner above the page and the notifications card in the
-// empty state (05 §16.3); the share panel, which takes over the Stop button here (05 §13.7); ?focus=<shareId>
-// (05 §12.2).
-import { CircleStop, DoorClosed, MonitorUp } from 'lucide-react';
+// empty state (05 §16.3); ?focus=<shareId> (05 §12.2).
+import { DoorClosed, MonitorUp } from 'lucide-react';
 import { Suspense, useCallback, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useParams } from 'react-router';
@@ -35,12 +38,13 @@ import { MessageTypeShareStop } from '../protocol/types.gen';
 import { findShareElsewhere } from '../share/elsewhere';
 import type { ShareElsewhere } from '../share/ShareSheet';
 import type { StartShare } from '../share/shareStore';
+import { shareWatchers } from '../share/watchers';
 import { Button } from '../ui/Button';
 import { Spinner } from '../ui/Spinner';
 import { ConnectionBanner } from './ConnectionBanner';
 import { ConnTestDialog } from './ConnTestDialog';
 import { useLocalShare, useRoom, useRoomSession } from './hooks';
-import { RoomStage, ShareButton } from './lazyMedia';
+import { RoomStage, ShareButton, SharePanel, TapToStartPill } from './lazyMedia';
 import { PeoplePanel } from './PeoplePanel';
 import { RoomHeader } from './RoomHeader';
 import styles from './RoomPage.module.css';
@@ -72,7 +76,6 @@ export function RoomPage() {
   const sharing = share !== null;
   const [peopleOpen, setPeopleOpen] = useState(false);
   const [testOpen, setTestOpen] = useState(false);
-  const [stopping, setStopping] = useState(false);
 
   // The people panel shows room.state: it goes when the snapshot does, and stays closed when one comes back.
   if (peopleOpen && state === null) setPeopleOpen(false);
@@ -102,21 +105,21 @@ export function RoomPage() {
     [shareId, preview],
   );
 
+  // Who watches this page's share (05 §13.7): the names of room.state, new only with a new snapshot or share.
+  const watchers = useMemo(() => shareWatchers(state, shareId), [state, shareId]);
+
   const openTest = useCallback(() => {
     setTestOpen(true);
   }, []);
 
-  const stopShare = (): void => {
-    setStopping(true);
-    session
-      .stopShare()
-      .catch((err: unknown) => {
+  // The share panel's Stop. The panel shows the share stopping (shareStore); a stop that failed is said here.
+  const stopShare = useCallback(
+    () =>
+      session.stopShare().catch((err: unknown) => {
         ui.getState().toast({ kind: 'error', message: errorMessage(err, t) });
-      })
-      .finally(() => {
-        setStopping(false);
-      });
-  };
+      }),
+    [session, ui, t],
+  );
 
   return (
     <div className={styles.page}>
@@ -136,6 +139,10 @@ export function RoomPage() {
         }}
         onTestConnection={openTest}
       >
+        {/* Nothing until the browser refuses to play, so no placeholder either. */}
+        <Suspense fallback={null}>
+          <TapToStartPill viewer={viewer} />
+        </Suspense>
         {platform.sharing !== null && !failed && (
           // The same button until the chunk is there, so the header doesn't move. No button for a room that
           // refused the user: there is nothing to share into.
@@ -148,11 +155,6 @@ export function RoomPage() {
           >
             <ShareButton onStart={startShare} elsewhere={shareElsewhere} label={t('room.share.start')} />
           </Suspense>
-        )}
-        {sharing && (
-          <Button variant="danger" icon={<CircleStop />} loading={stopping} onClick={stopShare}>
-            {t('room.share.stop')}
-          </Button>
         )}
       </RoomHeader>
       <main className={styles.main}>
@@ -177,6 +179,13 @@ export function RoomPage() {
           </Suspense>
         )}
       </main>
+      {platform.sharing !== null && (
+        // Mounted while the page is: it shows a share from "Starting…" on, and one that failed until it is
+        // dismissed. Nothing while the page shares nothing, so no placeholder either.
+        <Suspense fallback={null}>
+          <SharePanel share={share} onStop={stopShare} watchers={watchers} onTestConnection={openTest} />
+        </Suspense>
+      )}
       <PeoplePanel
         open={peopleOpen && state !== null}
         onClose={() => {

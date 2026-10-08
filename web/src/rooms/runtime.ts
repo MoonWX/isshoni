@@ -3,9 +3,13 @@
 // room page, and kept until logout or tab close; pages reach it through the hooks in rooms/hooks.ts.
 //
 // Besides creating the parts it wires what belongs to none of them:
-// - the viewer (05 §10, §12): viewer/'s store and media registry are made here, once per page, and follow the
-//   session from here on (connectViewer.ts): every room.state, subscribe.status, and the "bo started sharing
-//   [Watch]" toast. The session's sub PC is viewer/'s SubscriberPC on that registry and store (defaultMedia);
+// - the viewer (05 §10, §12): viewer/'s store, media registry and <audio> element are made here, once per page,
+//   and follow the session from here on (connectViewer.ts): every room.state, subscribe.status, the "bo started
+//   sharing [Watch]" toast, and the subscriptions the viewer wants (session.subscriptions). The session's sub PC is
+//   viewer/'s SubscriberPC, made by the viewer on that registry and store (defaultMedia); a volume the user sets
+//   is remembered on the device (prefsStore);
+// - the stats (05 §10.7): the collector that samples the PCs while the session is in a room, and the debug handle
+//   of the e2e tests (connectStats.ts);
 // - 01's `invalidate` messages refetch REST data (protocol/invalidate.ts, 05 §6.2);
 // - signing out stops the connection: when ['me'] becomes null (a logout here or in another tab, a 401, a session
 //   the server revoked: app/me.ts), the client stops, which closes with 1000 so the server skips the grace period
@@ -28,6 +32,7 @@ import type { SignalClient } from '../protocol/signal-client';
 import { MessageTypeInvalidate } from '../protocol/types.gen';
 import { createViewer, type ViewerServices } from '../viewer/services';
 import { createConnection, createConnectionStore, type Stores } from './connection';
+import { connectStats } from './connectStats';
 import { connectViewer } from './connectViewer';
 import { lazySubscriber } from './lazySubscriber';
 import { loadRoomMedia } from './loadMedia';
@@ -39,8 +44,8 @@ export interface RoomRuntime {
   readonly session: RoomSession;
   readonly stores: Stores;
   /**
-   * The viewer's store and media registry (viewer/'s createViewer), made once per page: what the room page gives
-   * its ViewerLayout, and what the session's sub PC writes.
+   * The viewer's store, media registry and audio (viewer/'s createViewer), made once per page: what the room page
+   * gives its ViewerLayout, and what the session's sub PC writes.
    */
   readonly viewer: ViewerServices;
   /** Connects, unless the client already runs: the first room page calls it, and so does one after a new login. */
@@ -60,9 +65,10 @@ export interface RoomRuntimeOptions {
 
 /**
  * The media seams of this build: the session's sub PC is viewer/'s SubscriberPC (05 §10.1), writing the page's
- * media registry and viewerStore.media, and showing the Fatal screen "Can't connect media" through uiStore. Its
- * code is in the room's media chunk, so it is loaded with the first sub offer (lazySubscriber.ts); the room page
- * has usually fetched that chunk by then. The local share needs no entry: it comes from platform.sharing (05 §8).
+ * media registry and viewerStore.media, and showing the Fatal screen "Can't connect media" through uiStore. The
+ * viewer makes it (viewer.createSubscriber), so it knows the PC for the stats. Its code is in the room's media
+ * chunk, so it is loaded with the first sub offer (lazySubscriber.ts); the room page has usually fetched that chunk
+ * by then. The local share needs no entry: it comes from platform.sharing (05 §8).
  */
 function defaultMedia(viewer: ViewerServices, ui: UiStore): SessionMedia {
   return {
@@ -71,7 +77,7 @@ function defaultMedia(viewer: ViewerServices, ui: UiStore): SessionMedia {
         loadRoomMedia().then(
           ({ SubscriberPC }) =>
             () =>
-              new SubscriberPC({ ...deps, registry: viewer.registry, store: viewer.store, ui }),
+              viewer.createSubscriber({ ...deps, ui }, SubscriberPC),
         ),
       ),
   };
@@ -86,10 +92,24 @@ export function createRoomRuntime(services: AppServices, opts: RoomRuntimeOption
     log: log.child('signal'),
     ...(opts.buildVersion !== undefined ? { buildVersion: opts.buildVersion } : {}),
   });
-  const viewer = createViewer({ volume: prefs.getState().volume });
+  const viewer = createViewer({
+    volume: prefs.getState().volume,
+    // The stage's volume slider: the device remembers it (05 §10.3).
+    onVolume: (volume) => {
+      prefs.getState().setVolume(volume);
+    },
+    log: log.child('viewer'),
+  });
   const session = new RoomSession({ platform, signal, stores, log, media: opts.media ?? defaultMedia(viewer, ui) });
   stores.session = session;
   const offViewer = connectViewer({ viewer, signal, session, room: stores.room, ui });
+  const offStats = connectStats({
+    viewer,
+    room: stores.room,
+    connection: stores.connection,
+    storage: platform.storage.session,
+    log: log.child('stats'),
+  });
 
   const stop = (): void => {
     signal.stop();
@@ -150,6 +170,7 @@ export function createRoomRuntime(services: AppServices, opts: RoomRuntimeOption
     },
     stop,
     dispose() {
+      offStats();
       offViewer();
       offLogoutShares();
       offLogoutSignal();
@@ -158,6 +179,8 @@ export function createRoomRuntime(services: AppServices, opts: RoomRuntimeOption
       offMutations();
       signal.stop();
       session.dispose();
+      // The page's <audio> element goes with the runtime.
+      viewer.dispose();
     },
   };
 }

@@ -240,7 +240,8 @@ describe('UsersPage', () => {
       await pickAction(user, 'sam', 'Make admin');
       const box = within(dialog('Make sam an admin?'));
       await user.click(box.getByRole('button', { name: 'Make admin' }));
-      expect(box.getByLabelText('Your password')).toHaveAccessibleDescription("This can't be empty.");
+      // The field's own text (fieldErrors.currentPassword.required), not the admin pages' generic one.
+      expect(box.getByLabelText('Your password')).toHaveAccessibleDescription('Enter your current password.');
       expect(patched).toEqual([]);
     });
 
@@ -413,7 +414,7 @@ describe('UsersPage', () => {
       const password = ask.getByLabelText('Your password');
 
       await user.click(ask.getByRole('button', { name: 'Create link' }));
-      expect(password).toHaveAccessibleDescription("This can't be empty.");
+      expect(password).toHaveAccessibleDescription('Enter your current password.');
       expect(posted).toEqual([]);
 
       await user.type(password, 'nope');
@@ -461,7 +462,7 @@ describe('UsersPage', () => {
 
       // From here on it is the dialog for an admin: the password is required, and a wrong one shows under it.
       await user.click(ask.getByRole('button', { name: 'Create link' }));
-      expect(password).toHaveAccessibleDescription("This can't be empty.");
+      expect(password).toHaveAccessibleDescription('Enter your current password.');
       await user.type(password, 'nope');
       await user.click(ask.getByRole('button', { name: 'Create link' }));
       await waitFor(() => {

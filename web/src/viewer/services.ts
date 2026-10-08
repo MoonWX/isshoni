@@ -8,12 +8,16 @@
 // - viewer.createSubscriber() makes the session's sub PC (05 §10.1, §11.1): it is SessionMedia.createSubscriber.
 //   The session routes pc.offer and pc.ice {pc: 'sub'} to the PC's handleOffer and handleIce, and calls close()
 //   when the server's side is gone. The viewer remembers the PC for the stats (stats.ts).
+//
+// This module is in the app's initial bundle (the room runtime makes the viewer before any page shows), and
+// SubscriberPC is not: its class comes with the room's media chunk (rooms/media.ts), so createSubscriber takes it
+// from the caller, and it is only a type here.
 import type { Logger } from '../lib/log';
 import type { SignalClient } from '../protocol/signal-client';
 import { MessageTypeSubscribeStatus } from '../protocol/types.gen';
 import { createAudioOut, type AudioOut } from './audioOut';
 import { createMediaRegistry, type MediaRegistry } from './mediaRegistry';
-import { SubscriberPC, type SubscriberDeps } from './SubscriberPC';
+import type { SubscriberDeps, SubscriberPC } from './SubscriberPC';
 import { createVideoPlayback, type VideoPlayback } from './videoPlayback';
 import {
   createViewerStore,
@@ -22,6 +26,9 @@ import {
   type ViewerStore,
   type ViewerStoreOptions,
 } from './viewerStore';
+
+/** The SubscriberPC class, as createSubscriber takes it. */
+export type SubscriberClass = new (deps: SubscriberDeps) => SubscriberPC;
 
 export interface ViewerServices {
   readonly store: ViewerStore;
@@ -34,9 +41,10 @@ export interface ViewerServices {
   readonly subscriber: SubscriberPC | null;
   /**
    * Makes the session's sub PC, with the viewer's registry and store: SessionMedia.createSubscriber (05 §10.1),
-   * `(deps) => viewer.createSubscriber({ ...deps, ui })`. `ui` shows the Fatal screen "Can't connect media".
+   * `(deps) => viewer.createSubscriber({ ...deps, ui }, SubscriberPC)`. `ui` shows the Fatal screen "Can't connect
+   * media". The class is the second argument, so that this module doesn't import it.
    */
-  createSubscriber(deps: Omit<SubscriberDeps, 'registry' | 'store'>): SubscriberPC;
+  createSubscriber(deps: Omit<SubscriberDeps, 'registry' | 'store'>, Subscriber: SubscriberClass): SubscriberPC;
   /**
    * The tap of TapToStart (05 §10.3): audio.play() and play() on every refused video, synchronously, so call it
    * inside the user gesture. It picks nothing: the unmute tap is not a manual focus (05 §12.2).
@@ -96,8 +104,8 @@ export function createViewer(opts: ViewerOptions = {}): ViewerServices {
     get subscriber() {
       return subscriber;
     },
-    createSubscriber(deps) {
-      subscriber = new SubscriberPC({ ...deps, registry, store });
+    createSubscriber(deps, Subscriber) {
+      subscriber = new Subscriber({ ...deps, registry, store });
       return subscriber;
     },
     unlock() {

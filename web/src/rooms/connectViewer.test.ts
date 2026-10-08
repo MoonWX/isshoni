@@ -5,9 +5,10 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 
 import { buildSdp, FakeRTCPeerConnection } from '../test/FakeRTCPeerConnection';
 import { FakeSignalServer } from '../protocol/testing';
-import type { PCOffer, SubscriptionStatus } from '../protocol/types.gen';
+import type { PCOffer, SubscriptionStatus, SubscriptionWant } from '../protocol/types.gen';
 import { createTestServices } from '../test/render';
 import { createRoomRuntime, getRoomRuntime, type RoomRuntime } from './runtime';
+import { SUBSCRIBE_DEBOUNCE_MS } from './subscriptionSync';
 import { createHarness, FakeHub, participant, shareInfo, tick, type Harness } from './testing/harness';
 import { PRELOAD_TIMEOUT_MS, preloadLazyChunks } from './testing/page';
 
@@ -16,6 +17,10 @@ const ME = 'k3m9p2qxw7ht';
 const people = [participant(ME, 'alex'), participant('u_bo', 'bo'), participant('u_cy', 'cy')];
 const boShare = shareInfo('s_bo', 'u_bo', 'c_bo', { startedAt: '2026-10-12T19:02:30.000Z' });
 const cyShare = shareInfo('s_cy', 'u_cy', 'c_cy', { startedAt: '2026-10-12T19:05:00.000Z' });
+
+/** One subscribe.update's subs by share: their order in the message means nothing. */
+const sorted = (subs: readonly SubscriptionWant[] = []): SubscriptionWant[] =>
+  [...subs].sort((a, b) => a.shareId.localeCompare(b.shareId));
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -52,7 +57,38 @@ describe('the viewer follows the session', () => {
     const other = createRoomRuntime(services);
     expect(other.viewer).not.toBe(h.runtime.viewer);
     expect(other.viewer.store.getState().volume).toBe(0.4);
+    // … and remembers the one the user sets on the stage (05 §10.3).
+    other.viewer.store.getState().setVolume(0.7);
+    expect(services.prefs.getState().volume).toBe(0.7);
     other.dispose();
+  });
+
+  it('asks the server for what the viewer shows and plays, one subscribe.update per change (05 §12.3)', async () => {
+    h.hub.sendState('lounge', { participants: people, shares: [boShare, cyShare] });
+    await tick(SUBSCRIBE_DEBOUNCE_MS);
+    // No tile is mounted here (no room page): no video, and the sound of the share on the stage (05 §11.1).
+    expect(h.hub.subscribes).toEqual([[{ shareId: 's_cy', video: 'off', audio: 'on' }]]);
+
+    // The room page shows both: the stage's share in high, the other tile in low.
+    const store = h.runtime.viewer.store.getState();
+    store.setVisible('s_cy', true);
+    store.setVisible('s_bo', true);
+    await tick(SUBSCRIBE_DEBOUNCE_MS);
+    expect(sorted(h.hub.subscribes.at(-1))).toEqual([
+      { shareId: 's_bo', video: 'low', audio: 'off' },
+      { shareId: 's_cy', video: 'high', audio: 'on' },
+    ]);
+
+    // A click on bo's tile is one message with both shares: the sound moves in the same step.
+    const before = h.hub.subscribes.length;
+    store.focusShare('s_bo');
+    await tick(SUBSCRIBE_DEBOUNCE_MS);
+    expect(h.hub.subscribes.slice(before).map(sorted)).toEqual([
+      [
+        { shareId: 's_bo', video: 'high', audio: 'on' },
+        { shareId: 's_cy', video: 'low', audio: 'off' },
+      ],
+    ]);
   });
 
   it('gets every room.state: tiles, whose share is this page’s, and the newest share on the stage', () => {
@@ -247,6 +283,8 @@ describe('the session’s sub PC (05 §10.1)', () => {
     expect(runtime.viewer.store.getState().media).toBe('connecting');
     expect(runtime.viewer.registry.shareIds()).toEqual(['s_bo']);
     expect(runtime.viewer.registry.get('s_bo').video).toBeDefined();
+    // The viewer made it (viewer.createSubscriber), so it knows the PC for the stats (05 §10.7).
+    expect(runtime.viewer.subscriber?.gen).toBe(1);
   });
 
   it('gets the candidates that came right behind the offer, after it', async () => {

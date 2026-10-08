@@ -265,8 +265,7 @@
       "peopleOpen_other": "{{count}} here. Show who"
     },
     "share": {
-      "start": "Share",
-      "stop": "Stop sharing"
+      "start": "Share"
     },
     "switcher": {
       "open": "Switch room",

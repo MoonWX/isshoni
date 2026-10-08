@@ -14,7 +14,7 @@ import { buildSdp, FakeRTCPeerConnection } from '../test/FakeRTCPeerConnection';
 import { createTestPlatform } from '../test/platform';
 import { createViewer, syncRoom, type ViewerServices } from './services';
 import { viewerDebugState, viewerStatsSources } from './stats';
-import type { SubscriberPC } from './SubscriberPC';
+import { SubscriberPC } from './SubscriberPC';
 import { room, SELF, shareInfo, status } from './testing';
 
 interface Section {
@@ -140,7 +140,7 @@ beforeEach(async () => {
   });
   viewer = createViewer();
   // As the room's wiring does it (viewer/index.ts, lib/stats/index.ts).
-  sub = viewer.createSubscriber({ platform, signal, log: createLogger('sub-pc') });
+  sub = viewer.createSubscriber({ platform, signal, log: createLogger('sub-pc') }, SubscriberPC);
   collector = createStatsCollector({ sources: () => viewerStatsSources(viewer) });
   uninstall = installDebugHandle({
     storage: createMemoryStorage({ 'isshoni.debug': '1' }),

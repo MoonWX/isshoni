@@ -274,7 +274,7 @@ describe('viewer.createSubscriber (05 §10.1)', () => {
     });
     const deps = { platform, signal, log: createLogger('sub-pc'), ui: createUiStore() };
 
-    const first = viewer.createSubscriber(deps);
+    const first = viewer.createSubscriber(deps, SubscriberPC);
     expect(first).toBeInstanceOf(SubscriberPC);
     expect(viewer.subscriber).toBe(first);
     expect(first.gen).toBe(0);
@@ -283,7 +283,7 @@ describe('viewer.createSubscriber (05 §10.1)', () => {
     expect(FakeRTCPeerConnection.instances).toHaveLength(0); // the PC is made on the first sub offer
 
     // After a welcome that was not resumed the session makes a new one.
-    const second = viewer.createSubscriber(deps);
+    const second = viewer.createSubscriber(deps, SubscriberPC);
     expect(viewer.subscriber).toBe(second);
     first.close();
     second.close();

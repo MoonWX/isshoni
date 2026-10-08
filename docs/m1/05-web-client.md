@@ -168,8 +168,11 @@ web/
    │                         codecs.ts · errors.ts · index.ts (01) · rest.ts · queryKeys.ts · invalidate.ts (05)
    ├─ rooms/                 connection.ts (connectionStore, createConnection, the banner's rule) ·
    │                         ConnectionBanner.tsx · runtime.ts (one connection and session per app) · hooks.ts ·
+   │                         connectViewer.ts · connectStats.ts (the runtime's viewer and stats wiring, §11.1) ·
    │                         RoomSession.ts · subscriptionSync.ts · roomStore.ts · roomEvents.ts · RoomPage.tsx ·
-   │                         RoomHeader.tsx · PeoplePanel.tsx · RoomSwitcher.tsx · InRoomBar.tsx
+   │                         RoomHeader.tsx · PeoplePanel.tsx · RoomSwitcher.tsx · InRoomBar.tsx · RoomStage.tsx ·
+   │                         media.ts (the room's lazy media chunk, §5) · loadMedia.ts · lazyMedia.ts ·
+   │                         lazySubscriber.ts
    ├─ viewer/                SubscriberPC.ts · mediaRegistry.ts · viewerStore.ts · services.ts (createViewer, syncRoom,
    │                         attachViewer) · context.ts · shareView.ts · watchToast.ts · layerPolicy.ts ·
    │                         autoFocus.ts · audioOut.ts · ViewerLayout.tsx · Stage.tsx · Tile.tsx · ShareVideo.tsx ·
@@ -188,8 +191,8 @@ web/
    ├─ admin/                 AdminLayout · DashboardPage · UsersPage · ApprovalsPage · InvitesPage · RoomsPage ·
    │                         SettingsPage · AuditPage · DoctorPage
    ├─ download/              DownloadPage.tsx (M1 placeholder)
-   ├─ lib/                   sdp.ts · stats/ (collector.ts, summarize.ts) · log.ts · emitter.ts · time.ts ·
-   │                         clipboard.ts · ua.ts
+   ├─ lib/                   sdp.ts · stats/ (collector.ts, summarize.ts, debugHandle.ts) · log.ts · emitter.ts ·
+   │                         time.ts · clipboard.ts · ua.ts
    ├─ ui/                    Button · Dialog (native <dialog>) · Sheet · Popover · Field · Stepper · Spinner ·
    │                         VisuallyHidden · tokens.css · global.css
    ├─ i18n/                  index.ts · en.json
@@ -326,6 +329,15 @@ page slice edits it. Each route names one page component and the folder it comes
 - The router finds the entry modules with `import.meta.glob` (`../auth/index.{ts,tsx}` and so on): the lazy folders
   as loaders, so each is one chunk fetched on the first visit to one of its routes, and `rooms/` with
   `{eager: true}`, so the room is in the main chunk.
+- **The room's media chunk** (`rooms/media.ts`; S45, group 5 integration). The room page, its header and the session
+  are in the main chunk; the code that only a joined room needs is one lazy chunk, so the initial JS stays inside
+  §17.3's budget: the stage with its tiles (`RoomStage`, `ViewerLayout`), `ShareButton` with its sheet and warning,
+  `SharePanel`, `TapToStartPill`, `SubscriberPC` and the stats collector. The room page asks for it as it renders
+  (`loadMedia.ts`, `lazyMedia.ts`), and the runtime with the first sub offer (`lazySubscriber.ts`) and the first
+  `room.state` (`connectStats.ts`). A module of `viewer/`, `share/` or `lib/stats` that the main chunk imports itself
+  (`viewer/services.ts`, the stores, `lib/stats/debugHandle.ts`) must not import any of these: `createViewer` gets
+  the `SubscriberPC` class from its caller for that reason. `share/`'s publisher (`BrowserSharing`, `PublisherPC`)
+  is still in the main chunk, through `platform/browser/displayMedia.ts`.
 - A folder that doesn't exist yet, or an export that is missing, renders `PageUnavailable` (a missing `AdminLayout`
   renders just its child page). A page slice adds its folder's `index.ts` and exports, and its routes start working
   with no change to `router.tsx`.
@@ -969,6 +981,14 @@ socket with code 3000 so the server treats it as a network drop) exists only whe
 `sessionStorage['isshoni.debug'] === '1'`, which e2e sets with `addInitScript`. It exposes nothing the user can't see
 in the debug overlay.
 
+As wired so far (`rooms/connectStats.ts`, group 5 integration): the collector starts with the first `room.state` of a
+room and stops when the session has no room anymore, which also drops its samples. Its only source is the sub PC
+(`viewer/stats.ts`); the pub PC's source, the `stats` notification and the overlay come with W13, and `dropSocket()`
+with W9 (until then it throws). `stats()` resolves with a fresh `StatsSample` (`pcs`, `shares[shareId].video|audio`,
+`outbound`), and `state()` returns ids and states, no names:
+`{connection: {state, resumed, connectionId}, room: {roomId, joinState, rev, participants}, viewer}`, where `viewer`
+is `viewerDebugState` (`focusedShareId`, `audibleShareId`, `audio`, `audioPlaying`, `media`, `subGen`, `shares[]`).
+
 ---
 
 ## 11. Room session and presence (`src/rooms/`)
@@ -993,7 +1013,7 @@ export class RoomSession {
 
 // The seams (S34): rooms/ imports neither viewer/ nor share/, so it builds and tests without them.
 export interface SessionMedia {               // everything optional
-  createSubscriber?: (deps: SubscriberDeps) => SubscriberLike;   // viewer/: new SubscriberPC({...deps, registry, …})
+  createSubscriber?: (deps: SubscriberDeps) => SubscriberLike;   // viewer.createSubscriber({...deps, ui}, SubscriberPC)
 }
 export interface SubscriberDeps { platform: Platform; signal: SignalClient; log: Logger }
 export interface SubscriberLike {             // the part of SubscriberPC (§10.1) the session drives

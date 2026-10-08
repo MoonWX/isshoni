@@ -8,6 +8,7 @@ import { createAppRoutes } from '../app/router';
 import { LocalErrorCodeRequestTimeout, ProtocolError } from '../protocol/errors';
 import { makeError } from '../protocol/testing';
 import { shareStore } from '../share/shareStore';
+import { shareParams } from '../share/testing/publish';
 import { meFixture } from '../test/msw';
 import type { RoomHeaderProps } from './RoomHeader';
 import {
@@ -85,6 +86,33 @@ async function open(path = '/r/lounge') {
 
 /** The connection's own id, as the fake server's welcome gave it. */
 const ownConnection = (): string => h.runtime.stores.room.getState().connectionId ?? '';
+
+/**
+ * The publisher's half of the page's share store (share/shareStore.ts), which share/'s provider drives and the
+ * harness's fake share does not: the share was published and is live.
+ */
+function shareIsLive(shareId: string): void {
+  act(() => {
+    const store = shareStore.getState();
+    store.publishing({
+      picked: { kind: 'window', audioScope: 'window', warning: null },
+      preset: 'auto',
+      withAudio: true,
+      params: shareParams(shareId),
+    });
+    store.advance('live');
+  });
+}
+
+/** … and it is over. Every test that called shareIsLive() ends with this: the store follows one share at a time. */
+function shareIsOver(): void {
+  act(() => {
+    shareStore.getState().finish();
+  });
+}
+
+/** The sharer's panel under the stage (05 §13.7). */
+const sharePanel = () => within(screen.getByRole('region', { name: 'Your share' }));
 
 function sendState(overrides: Parameters<Harness['hub']['sendState']>[1] = {}): void {
   act(() => {
@@ -190,13 +218,15 @@ describe('RoomPage (05 §11.2)', () => {
     expect(document.title).toBe('isshoni');
   });
 
-  it('Share publishes through the session, and Stop sharing ends it', async () => {
+  it('Share publishes through the session, and the share panel’s Stop ends it', async () => {
     setup();
     const share = new FakeShare('s_mine');
     h.sharing.next.push(share);
     h.sharing.pick = () => Promise.resolve(pickedSource);
     await open();
     sendState({ participants: [alex] });
+    // No panel while the page shares nothing.
+    expect(screen.queryByRole('region', { name: 'Your share' })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Share' }));
     const sheet = screen.getByRole('dialog', { name: 'Share your screen' });
@@ -207,13 +237,61 @@ describe('RoomPage (05 §11.2)', () => {
     expect(h.sharing.starts[0]?.ctx).toMatchObject({ signal: h.runtime.signal, roomId: 'lounge' });
     expect(h.runtime.session.share).toBe(share);
     expect(document.title).toBe('● Sharing · Lounge · isshoni');
+    // The panel shows the share from the start on (05 §13.7), with the session's share to act on.
+    expect(sharePanel().getByText('Starting your share…')).toBeInTheDocument();
+    expect(sharePanel().getByRole('button', { name: 'Stop sharing' })).toBeEnabled();
+    // The header has no Stop of its own.
+    expect(screen.getAllByRole('button', { name: 'Stop sharing' })).toHaveLength(1);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Stop sharing' }));
+    shareIsLive('s_mine');
+    fireEvent.click(sharePanel().getByRole('button', { name: 'Stop sharing' }));
     await advance();
     expect(share.calls).toEqual(['stop']);
     expect(h.runtime.session.share).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Stop sharing' })).not.toBeInTheDocument();
+    shareIsOver();
+    expect(screen.queryByRole('region', { name: 'Your share' })).not.toBeInTheDocument();
     expect(document.title).toBe('Lounge · isshoni');
+  });
+
+  it('the header offers "Tap to unmute" while the browser refuses to play, and the tap is the viewer’s unlock', async () => {
+    setup();
+    await open();
+    sendState({ participants: [alex, bo], shares: [shareInfo('s_bo', 'u_bo', 'c_bo')] });
+    const header = within(screen.getByRole('banner'));
+    expect(header.queryByRole('button', { name: 'Tap to unmute' })).not.toBeInTheDocument();
+
+    const unlock = vi.spyOn(h.runtime.viewer, 'unlock').mockImplementation(() => undefined);
+    act(() => {
+      h.runtime.viewer.store.getState().setAudio('blocked');
+    });
+    fireEvent.click(header.getByRole('button', { name: 'Tap to unmute' }));
+    expect(unlock).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      h.runtime.viewer.store.getState().setAudio('playing');
+    });
+    expect(header.queryByRole('button', { name: 'Tap to unmute' })).not.toBeInTheDocument();
+  });
+
+  it('the share panel names who watches this page’s share, from room.state', async () => {
+    setup();
+    h.sharing.next.push(new FakeShare('s_mine'));
+    await open();
+    await act(() => h.runtime.session.startShare(pickedSource, { preset: 'auto', withAudio: true }));
+    shareIsLive('s_mine');
+    sendState({ participants: [alex, bo], shares: [shareInfo('s_mine', ME, ownConnection())] });
+    expect(sharePanel().getByText("You're live · Window · Auto · 0 watching")).toBeInTheDocument();
+
+    sendState({
+      participants: [alex, bo],
+      shares: [
+        shareInfo('s_mine', ME, ownConnection(), { watchers: [{ userId: 'u_bo', video: 'high', audio: 'on' }] }),
+      ],
+    });
+    expect(sharePanel().getByText("You're live · Window · Auto · 1 watching")).toBeInTheDocument();
+    fireEvent.click(sharePanel().getByRole('button', { name: 'Share settings' }));
+    expect(within(sharePanel().getByRole('list')).getByText('bo')).toBeInTheDocument();
+    shareIsOver();
   });
 
   it('tells the user when stopping the share failed', async () => {
@@ -223,9 +301,11 @@ describe('RoomPage (05 §11.2)', () => {
     h.sharing.next.push(share);
     await open();
     await act(() => h.runtime.session.startShare(pickedSource, { preset: 'auto', withAudio: true }));
-    fireEvent.click(screen.getByRole('button', { name: 'Stop sharing' }));
+    shareIsLive('s_mine');
+    fireEvent.click(sharePanel().getByRole('button', { name: 'Stop sharing' }));
     await advance();
     expect(h.toasts()).toEqual(["The server didn't answer in time."]);
+    shareIsOver();
   });
 
   it('the share sheet knows about this user’s share on another device, and "Stop it" stops that share', async () => {
