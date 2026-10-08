@@ -446,7 +446,7 @@ func TestThrottleRates(t *testing.T) {
 
 // TestHashBudgetCapsAnonymousHashes is 03 §15's hash-budget case at the bucket level: 1000 logins for random
 // usernames from 1000 random /64s over 10 simulated seconds reach the hash at most 20 + 5 × 10 = 70 times. (The
-// service-level version, with the counting hasher and the 503 answer, comes with Login.)
+// service-level version, with the counting hasher and the 503 answer, is TestHashBudgetCapsLogins.)
 func TestHashBudgetCapsAnonymousHashes(t *testing.T) {
 	clk := newFakeClock()
 	th, err := newThrottles(clk.now, HashBudget{})
