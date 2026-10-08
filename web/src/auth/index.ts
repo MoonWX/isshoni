@@ -10,6 +10,8 @@
 //   useLogout.ts     useLogout()                 (menus, the account and devices pages)
 //   loginNotice.ts   loginState()                (a navigation to /login that explains itself)
 //   fragmentToken.ts useFragmentToken(), readFragmentToken()   (setup/SetupPage; the in-app browser banner's link)
+//   InAppBrowserBanner.tsx  <InAppBrowserBanner />   (05 §16.3: the login and invite pages here, and the room page)
+//   inAppBanner.ts   useInAppBanner()            (whether the banner shows: the Home Screen sheet and card wait for it)
 //   PasswordField.tsx, AccountFields.tsx, AuthForm.tsx, Notice.tsx, useSubmit.ts, formErrors.ts
 //                    the form pieces, shared with setup/SetupPage and the account pages
 export { AboutPage } from './AboutPage';

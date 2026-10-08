@@ -1,0 +1,79 @@
+.facts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.facts > div {
+  display: flex;
+  gap: var(--space-4);
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.facts dt {
+  color: var(--color-text-muted);
+}
+
+.facts dd {
+  min-width: 0;
+  font-weight: var(--weight-medium);
+  overflow-wrap: anywhere;
+  text-align: end;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
+/* The password form keeps the width of the sign-in forms, however wide the card is. */
+.form {
+  width: 100%;
+  max-width: var(--form-max);
+}
+
+/* "Password changed": takes focus when it appears (it isn't a control, so no ring). */
+.done {
+  display: flex;
+  gap: var(--space-2);
+  align-items: flex-start;
+  font-weight: var(--weight-medium);
+  color: var(--color-success);
+  text-wrap: pretty;
+}
+
+.done:focus {
+  outline: none;
+}
+
+.done svg {
+  flex: none;
+  width: 1.125rem;
+  height: 1.125rem;
+  margin-top: 0.1875rem;
+}
+
+/* The delete confirmation: what will happen, a message if it didn't, the password. */
+.confirm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.confirm > p {
+  color: var(--color-text-muted);
+  text-wrap: pretty;
+}
+
+/* Phones: one action per row, each a full-width touch target. */
+@media (max-width: 30rem) {
+  .actions {
+    flex-direction: column;
+  }
+
+  .actions > * {
+    width: 100%;
+  }
+}
