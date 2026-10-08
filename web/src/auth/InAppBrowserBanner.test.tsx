@@ -193,7 +193,12 @@ describe('the in-app browser banner on /login', () => {
     const first = renderLogin(UA.instagramIPhone);
     await screen.findByRole('heading', { name: LOGIN_HEADING });
     fireEvent.click(within(screen.getByRole('region', { name: BANNER })).getByRole('button', { name: 'Dismiss' }));
-    expect(screen.queryByRole('region', { name: BANNER })).not.toBeInTheDocument();
+    // The router mounted the page outside act(), so on a busy machine this click can land before the banner has
+    // subscribed to its store (a passive effect); React then sees the dismissal when that effect runs. So this
+    // waits; "gone with the click" is the useInAppBanner() test below, which renders inside act().
+    await waitFor(() => {
+      expect(screen.queryByRole('region', { name: BANNER })).not.toBeInTheDocument();
+    });
     expect(first.platform.storage.session.get('isshoni.inAppBannerDismissed')).not.toBeNull();
     // Nothing else of the page changed.
     expect(screen.getByRole('heading', { name: LOGIN_HEADING })).toBeInTheDocument();
@@ -306,6 +311,25 @@ describe('useInAppBanner()', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
     expect(screen.queryByRole('region', { name: BANNER })).not.toBeInTheDocument();
+    expect(screen.getByText('Add isshoni to your Home Screen')).toBeInTheDocument();
+  });
+
+  it('does not know whether the page renders the banner: a page that waits for it must render it too', () => {
+    // `showing` describes the tab. Without <InAppBrowserBanner /> on the page it stays true and there is nothing to
+    // dismiss, so the Home Screen guidance would never appear.
+    const platform = platformFor(UA.instagramIPhone);
+    render(
+      <AppProviders services={createTestServices({ platform })}>
+        <NeedsInstall />
+      </AppProviders>,
+    );
+    expect(screen.queryByRole('region', { name: BANNER })).not.toBeInTheDocument();
+    expect(screen.queryByText('Add isshoni to your Home Screen')).not.toBeInTheDocument();
+
+    // A dismissal on a page that has the banner (login, invite, room) reaches this reader as well.
+    act(() => {
+      dismissInAppBanner(platform.storage.session);
+    });
     expect(screen.getByText('Add isshoni to your Home Screen')).toBeInTheDocument();
   });
 

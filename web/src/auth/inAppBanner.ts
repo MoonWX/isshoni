@@ -6,9 +6,13 @@
 // login and room pages then show the banner until the friend dismisses it. Dismissal lasts for the tab
 // (platform.storage.session['isshoni.inAppBannerDismissed']).
 //
-// While the banner shows, the Home Screen sheet and card of the `needs-install` push state stay hidden; they appear
-// once it is dismissed or the page is opened in a real browser. They read `useInAppBanner().showing` for that, and
-// every reader re-renders when the banner is dismissed anywhere on the page.
+// Until the banner is dismissed, the Home Screen sheet and card of the `needs-install` push state stay hidden; they
+// appear once it is dismissed or the page is opened in a real browser. They read `useInAppBanner().showing` for that,
+// and every reader re-renders when the banner is dismissed anywhere on the page.
+//
+// `showing` describes the tab, not the page: an in-app browser, and the banner not dismissed in this tab, whether or
+// not the current page renders <InAppBrowserBanner />. A page that hides its needs-install sheet or card on this flag
+// must render the banner itself (login, invite and room do), otherwise the user has nothing to dismiss.
 import { useCallback, useSyncExternalStore } from 'react';
 
 import { usePlatform } from '../app/context';
@@ -67,8 +71,9 @@ export interface InAppBanner {
   /** The chat or social app whose built-in browser this is (platform.inAppBrowser()), else null. */
   readonly app: string | null;
   /**
-   * The banner shows: an in-app browser, and not dismissed in this tab. While true, the `needs-install` sheet and
-   * card stay hidden (05 §16.3).
+   * An in-app browser, and the banner not dismissed in this tab, whether or not the current page renders
+   * <InAppBrowserBanner />. A page that hides its `needs-install` sheet or card on this flag (05 §16.3) must render
+   * the banner itself (login, invite and room do), otherwise the user has nothing to dismiss.
    */
   readonly showing: boolean;
   /** Hides the banner for the rest of this tab's life. */
