@@ -1,0 +1,59 @@
+/* Top centre, above everything: toasts own the bottom of the screen. Only the pill itself takes clicks. */
+.region {
+  position: fixed;
+  inset-inline: 0;
+  top: calc(var(--space-2) + var(--safe-top));
+  z-index: var(--z-toast);
+  display: flex;
+  justify-content: center;
+  padding-inline: calc(var(--space-4) + var(--safe-left)) calc(var(--space-4) + var(--safe-right));
+  pointer-events: none;
+}
+
+.pill {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  max-width: 100%;
+  min-height: 2.5rem;
+  padding-block: var(--space-1);
+  padding-inline: var(--space-3) var(--space-1);
+  font-size: var(--text-sm);
+  color: var(--color-text);
+  background-color: var(--color-surface);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-full);
+  box-shadow: var(--shadow-2);
+  pointer-events: auto;
+  animation: drop-in var(--duration-normal) var(--easing-standard);
+}
+
+/* Without the button the text needs the same room on both sides. */
+.passive {
+  padding-inline-end: var(--space-3);
+}
+
+.icon {
+  flex: none;
+  width: 1rem;
+  height: 1rem;
+  color: var(--color-accent);
+}
+
+.text {
+  min-width: 0;
+  font-weight: var(--weight-medium);
+}
+
+.pill .reload {
+  flex: none;
+  border-radius: var(--radius-full);
+}
+
+/* Durations are zero under prefers-reduced-motion (tokens.css): the pill then appears without sliding. */
+@keyframes drop-in {
+  from {
+    opacity: 0;
+    transform: translateY(-0.5rem);
+  }
+}

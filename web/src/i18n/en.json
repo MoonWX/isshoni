@@ -21,6 +21,12 @@
       "title": "Something went wrong",
       "body": "This page stopped working. Reload to try again."
     },
+    "update": {
+      "label": "App update",
+      "ready": "Update ready",
+      "afterSharing": "Update ready. Reload after you stop sharing.",
+      "announce": "A new version of isshoni is ready. Reload to update."
+    },
     "screens": {
       "offline": {
         "title": "Can't reach the server",
@@ -329,6 +335,12 @@
     "loading": "Loading",
     "stepOf": "Step {{current}} of {{total}}:",
     "stepDoneOf": "Step {{current}} of {{total}}, done:"
+  },
+  "push": {
+    "generic": {
+      "title": "isshoni",
+      "body": "Something new on your server. Tap to open isshoni."
+    }
   },
   "conntest": {
     "title": "Connection test",

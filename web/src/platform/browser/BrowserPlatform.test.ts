@@ -176,12 +176,16 @@ describe('BrowserPlatform basics', () => {
     });
   });
 
-  it('has no wake lock in jsdom, and the stub PWA never offers an update', async () => {
+  it('has no wake lock in jsdom, and the PWA provider has nothing to install or update there', async () => {
     const p = new BrowserPlatform();
     await expect(p.requestWakeLock()).resolves.toBeNull();
     expect(p.pwa?.installState()).toBe('none');
     await expect(p.pwa?.promptInstall()).resolves.toBe('unavailable');
-    expect(() => p.pwa?.applyUpdate()).toThrow(NotImplementedError);
+    const onUpdateReady = vi.fn();
+    const off = p.pwa?.onUpdateReady(onUpdateReady);
+    await Promise.resolve();
+    expect(onUpdateReady).not.toHaveBeenCalled();
+    off?.();
     await expect(p.notifications.enable()).rejects.toBeInstanceOf(NotImplementedError);
   });
 
