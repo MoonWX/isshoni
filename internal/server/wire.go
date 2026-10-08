@@ -334,13 +334,16 @@ func (s *Server) setupHint(ctx context.Context) {
 // dbCheck is the readiness check "db" (04 §6.2): store.DB.Ping, a SELECT 1 on the writer and on a reader. /readyz is
 // public and a ping takes the store's one writer connection, so an answer is kept for dbPingEvery: however many
 // requests ask, the database sees one ping per interval, and callers that arrive during a ping wait for its answer.
+// The interval counts from the answer, not from the question: a ping that took its whole timeout would otherwise
+// leave an answer that is stale already, and every caller that waited for it would send a ping of its own, one after
+// the other.
 type dbCheck struct {
 	ctx  context.Context // the server's life: a ping never outlives it
 	ping func(context.Context) error
 	now  func() time.Time
 
 	mu     sync.Mutex
-	at     time.Time // of the last ping; zero before the first
+	at     time.Time // when the last ping's answer came; zero before the first
 	ok     bool
 	detail string
 }
@@ -353,16 +356,16 @@ func newDBCheck(ctx context.Context, ping func(context.Context) error, now func(
 func (c *dbCheck) ready() (ok bool, detail string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	now := c.now()
-	if !c.at.IsZero() && now.Sub(c.at) < dbPingEvery && !now.Before(c.at) {
+	if now := c.now(); !c.at.IsZero() && now.Sub(c.at) < dbPingEvery && !now.Before(c.at) {
 		return c.ok, c.detail
 	}
 	ctx, cancel := context.WithTimeout(c.ctx, dbPingTimeout)
 	defer cancel()
-	c.at, c.ok, c.detail = now, true, ""
+	c.ok, c.detail = true, ""
 	if err := c.ping(ctx); err != nil {
 		c.ok, c.detail = false, "the database does not answer: "+err.Error()
 	}
+	c.at = c.now()
 	return c.ok, c.detail
 }
 

@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,8 +44,7 @@ var wireArgon = auth.ArgonParams{MemoryKiB: 64, Time: 1, Threads: 1, SaltLen: 16
 
 var wireClientIP = netip.MustParseAddr("203.0.113.9")
 
-// openTestStore opens a new database in the test's directory and closes it with the test. closeNow closes it early,
-// for the "store is gone" rows.
+// openTestStore opens a new database in the test's directory and closes it with the test.
 func openTestStore(t *testing.T) *store.DB {
 	t.Helper()
 	db, err := store.Open(context.Background(), store.Options{
@@ -1378,5 +1378,69 @@ func TestDBCheck(t *testing.T) {
 	gone := newDBCheck(ended, func(ctx context.Context) error { return ctx.Err() }, time.Now)
 	if ok, _ := gone.ready(); ok {
 		t.Error("ready after the server's context ended")
+	}
+}
+
+// TestDBCheckBehindASlowPing: a database that does not answer costs one ping, not one for each caller. The answer
+// of a ping that took its whole timeout is kept from the moment it came, so the callers that waited for it take it
+// instead of each waiting out a ping of their own, one after the other.
+//
+// The clock is the test's, and a ping moves it on by the timeout it uses up: the check holds its mutex over the
+// ping, and testing/synctest does not move its time on while a goroutine waits for a mutex.
+func TestDBCheckBehindASlowPing(t *testing.T) {
+	start := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC)
+	var elapsed atomic.Int64 // what the check's clock shows, in nanoseconds after start
+	var pings atomic.Int32
+	out, queued := make(chan struct{}), make(chan struct{})
+	check := newDBCheck(context.Background(), func(context.Context) error {
+		if pings.Add(1) == 1 {
+			close(out)
+			<-queued // the first ping is out while the other callers come
+		}
+		elapsed.Add(int64(dbPingTimeout)) // no answer: the ping gives up when its time is over
+		return context.DeadlineExceeded
+	}, func() time.Time { return start.Add(time.Duration(elapsed.Load())) })
+
+	const callers = 8
+	type answer struct {
+		ok     bool
+		detail string
+	}
+	answers := make(chan answer, callers)
+	for range callers {
+		go func() {
+			ok, detail := check.ready()
+			answers <- answer{ok, detail}
+		}()
+	}
+	select {
+	case <-out:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no ping went out")
+	}
+	close(queued)
+	want := answer{false, "the database does not answer: context deadline exceeded"}
+	for range callers {
+		select {
+		case got := <-answers:
+			if got != want {
+				t.Errorf("ready = %+v, want %+v", got, want)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("a caller got no answer")
+		}
+	}
+	if n := pings.Load(); n != 1 {
+		t.Errorf("%d callers of a database that does not answer sent %d pings, want one", callers, n)
+	}
+
+	// The answer is as old as its arrival: the database is asked again one interval after that, not sooner.
+	elapsed.Add(int64(dbPingEvery - time.Millisecond))
+	if ok, _ := check.ready(); ok || pings.Load() != 1 {
+		t.Errorf("just before the interval is over: ready = %v after %d pings, want the kept answer", ok, pings.Load())
+	}
+	elapsed.Add(int64(time.Millisecond))
+	if ok, _ := check.ready(); ok || pings.Load() != 2 {
+		t.Errorf("one interval after the answer: ready = %v after %d pings, want a second ping", ok, pings.Load())
 	}
 }

@@ -27,8 +27,9 @@ import (
 	"github.com/MoonWX/isshoni/internal/version"
 )
 
-// Deps are the server's test seams. The zero value of every field means the real implementation, so cmd/isshoni
-// passes Deps{}.
+// Deps are what the server takes from its caller besides the config and the logger: the test seams, and LogLevel.
+// The zero value of every seam means the real implementation, so cmd/isshoni passes only LogLevel, the level
+// variable of the logger it built, and leaves the rest zero.
 type Deps struct {
 	// Now is the clock of the time-dependent components (the store, the account service, the REST API). nil means
 	// time.Now.
@@ -132,15 +133,16 @@ const (
 	stateStopped               // Shutdown finished, or Start failed
 )
 
-// Budgets of the shutdown steps (04 §6.4). They add up to the default shutdown_timeout of 10 s, which bounds the
-// whole shutdown whatever the steps would like.
+// Budgets of the shutdown steps (04 §6.4). Those of steps 3 to 6 add up to the default shutdown_timeout of 10 s,
+// which bounds the whole shutdown whatever the steps would like; only the store's close may go beyond it.
 const (
 	hubShutdownBudget   = 2 * time.Second // step 3: the hub's server.shutdown and close 1012
 	mediaShutdownBudget = 1 * time.Second // step 4: SFU.Close, then Transport.Close (README S59)
 	httpShutdownBudget  = 5 * time.Second // step 5: http.Server.Shutdown on every server
-	tailShutdownBudget  = 2 * time.Second // step 6: the TLS manager, the admin socket and the store, together
-	// storeCloseBudget is what closing the store may take when the time above is used up: the one thing a shutdown
-	// that is out of time still waits for (see shutdown).
+	tailShutdownBudget  = 2 * time.Second // step 6: the TLS manager and the admin socket
+	// storeCloseBudget is the store's own, at the end of step 6 and outside tailShutdownBudget: what closing it may
+	// take, also when the time above is used up. It is the one thing a shutdown that is out of time still waits for
+	// (see shutdown).
 	storeCloseBudget = 1 * time.Second
 )
 
@@ -343,7 +345,8 @@ func (s *Server) Start(ctx context.Context) (err error) {
 	// certificate are the address, manual mode's site is it too when there is no domain, and auto mode compares its
 	// domain's DNS records with it. Off mode takes its site from public_url, or localhost in dev; the media
 	// addresses there come with the SFU (README S59), which detects in off mode too. A server that has detected
-	// looks again every ten minutes while it runs (startBackground).
+	// looks again every ten minutes while it runs (startBackground starts that ticker only when s.detected is set,
+	// so the off-mode detection sets it as the cases here do).
 	mode := s.cfg.EffectiveTLSMode()
 	switch {
 	case mode == config.TLSOff:

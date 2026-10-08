@@ -487,12 +487,16 @@ func TestAdminSocket(t *testing.T) {
 }
 
 // TestLogLevelNeedsTheLevelVar: without Deps.LogLevel the level can't change while the server runs, and the socket
-// says so instead of pretending.
+// says so instead of pretending. The test builds the server itself, so that Deps.LogLevel is nil whatever the
+// harness passes for a test that leaves it out.
 func TestLogLevelNeedsTheLevelVar(t *testing.T) {
-	srv := servertest.Start(t, servertest.Options{Deps: wiredDeps()})
-	admin, ctx := adminSocket(t, srv)
+	cfg := testConfig(t)
+	startDirect(t, cfg, testDeps(), netx.PublicAddrs{})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
 	var ae *ops.AdminError
-	if err := admin.SetLogLevel(ctx, "debug", time.Minute); !errors.As(err, &ae) || !strings.Contains(ae.Message, "log level") {
+	err := ops.DialAdmin(cfg.Listen.AdminSocket).SetLogLevel(ctx, "debug", time.Minute)
+	if !errors.As(err, &ae) || !strings.Contains(ae.Message, "log level") {
 		t.Errorf("log-level without a level variable: %v", err)
 	}
 }
@@ -534,8 +538,11 @@ func TestHubShutdown(t *testing.T) {
 	c := dialWS(t, srv)
 	joinLounge(t, c, signaltest.DefaultHello())
 
+	// The shutdown runs beside the test, which reads the socket meanwhile; Run's result is the test's to collect,
+	// below (srv.Stop in a goroutine would take it away, and could report to a test that is over).
 	begin := time.Now()
-	go srv.Stop(t)
+	shutdownErr := make(chan error, 1)
+	go func() { shutdownErr <- srv.Srv.Shutdown(context.Background(), server.ShutdownStop) }()
 	notice, err := protocol.Decode[protocol.ServerShutdown](nextOf(t, c, protocol.MessageTypeServerShutdown))
 	// SIGTERM can't tell a stop from a restart: the wire always says restart, and clients reconnect.
 	if err != nil || notice.Reason != protocol.ShutdownReasonRestart || notice.ReconnectInMs < 500 || notice.ReconnectInMs > 3000 {
@@ -554,9 +561,12 @@ func TestHubShutdown(t *testing.T) {
 	if err := srv.Wait(t); err != nil {
 		t.Errorf("Run after the stop = %v", err)
 	}
-	// Nothing was forced: every step finished in its budget.
-	if strings.Contains(srv.Logs(), "shutdown finished by force") {
-		t.Error("the shutdown had to use force")
+	// Run has returned, so the shutdown is over. Nothing was forced: every step finished in its budget.
+	if err := <-shutdownErr; err != nil {
+		t.Errorf("Shutdown = %v", err)
+	}
+	if logs := srv.Logs(); !strings.Contains(logs, "shutdown complete") || strings.Contains(logs, "shutdown finished by force") {
+		t.Error("the log does not end the shutdown with \"shutdown complete\": a step was forced or failed")
 	}
 }
 
