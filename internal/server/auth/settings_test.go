@@ -180,3 +180,61 @@ func TestUpdateSettingsParallel(t *testing.T) {
 			changed, len(alerts), len(rows))
 	}
 }
+
+// TestUpdateSettingsActorAtTheChange: the acting admin is read in the Write that changes the settings (actingAdmin),
+// so an admin who is disabled or demoted while their patch waits for the writer changes nothing and raises no alert.
+func TestUpdateSettingsActorAtTheChange(t *testing.T) {
+	e := newSvcEnv(t)
+	ctx := context.Background()
+	before := e.db.Settings().Get()
+	cases := []struct {
+		name   string
+		revoke func(q *store.Q, id store.UserID) error
+	}{
+		{"Alex", func(q *store.Q, id store.UserID) error { return q.SetStatus(id, store.StatusDisabled, e.clk.now()) }},
+		{"Kim", func(q *store.Q, id store.UserID) error { return q.SetRole(id, store.RoleUser, e.clk.now()) }},
+	}
+	for _, tc := range cases {
+		admin := e.addAdmin(tc.name)
+		errc := make(chan error, 1)
+		// The test holds the one writer while it takes the admin's rights away. Until that commits, every reader still
+		// sees an active admin, and the patch can only queue for the writer.
+		e.write(func(q *store.Q) error {
+			if err := tc.revoke(q, admin.ID); err != nil {
+				return err
+			}
+			go func() {
+				_, err := e.svc.UpdateSettings(ctx, actorFor(admin, ipA), settingsPatch("registrationMode", `"approval"`))
+				errc <- err
+			}()
+			// Time for the call to get as far as it can before the commit. The outcome does not depend on it: a call
+			// that starts after the commit finds the admin's rights gone as well.
+			time.Sleep(50 * time.Millisecond)
+			return nil
+		})
+		if err := <-errc; !api.IsCode(err, api.CodeForbidden) {
+			t.Errorf("UpdateSettings as %s, who lost the admin's rights before the write: %v, want forbidden", tc.name, err)
+		}
+	}
+	if got := e.db.Settings().Get(); got != before {
+		t.Errorf("settings = %+v after refused patches, want them unchanged", got)
+	}
+
+	// The actor comes first: someone who is not an admin doesn't learn whether a value is valid or a field is pinned.
+	if err := e.db.Settings().Pin("maxSharesPerRoom", 2); err != nil {
+		t.Fatal(err)
+	}
+	sam := e.addUser("Sam")
+	for _, p := range []map[string]json.RawMessage{
+		settingsPatch("registrationMode", `"open"`),
+		settingsPatch("maxSharesPerRoom", `2`),
+		settingsPatch(),
+	} {
+		if _, err := e.svc.UpdateSettings(ctx, actorFor(sam, ipB), p); !api.IsCode(err, api.CodeForbidden) {
+			t.Errorf("UpdateSettings as a member with %v: %v, want forbidden", p, err)
+		}
+	}
+	if e.auditCount("settings.changed") != 0 || len(e.alerts.take()) != 0 {
+		t.Error("a refused patch wrote an audit row or raised an alert")
+	}
+}
