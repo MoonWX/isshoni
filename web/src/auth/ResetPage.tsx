@@ -12,7 +12,7 @@ import { TextField } from '../ui/Field';
 import { AuthForm, SmallPrint } from './AuthForm';
 import { checkNewPassword, fieldCodes } from './formErrors';
 import { useFragmentToken, type FragmentToken } from './fragmentToken';
-import { CheckFailed, CheckingLink, HaveAccount, LinkProblem } from './LinkStates';
+import { CheckFailed, CheckingLink, HaveAccount, LinkProblem, useFocusHeadingWhen } from './LinkStates';
 import { PasswordField } from './PasswordField';
 import { useLinkCheck } from './useLinkCheck';
 import { startSession } from './session';
@@ -44,6 +44,7 @@ function Reset({ token, clear }: FragmentToken) {
   const [password, setPassword] = useState('');
   /** The link stopped working between the check and the submit. */
   const [diedOnSubmit, setDiedOnSubmit] = useState<ApiError | null>(null);
+  useFocusHeadingWhen(diedOnSubmit !== null);
   const check = useLinkCheck('reset', token);
 
   const form = useSubmit<'password', string, UserResponse>({

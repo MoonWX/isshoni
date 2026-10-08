@@ -2,7 +2,7 @@
 //   1. stop local shares;
 //   2. SignalClient.stop() (close 1000, so the server drops this tab's presence at once, 05 §7);
 //   3. POST /api/v1/auth/logout (the server deletes this session and its push subscriptions, 03 §12.4.2);
-//   4. PushSubscription.unsubscribe() locally;
+//   4. PushSubscription.unsubscribe() locally (waited for at most PUSH_UNSUBSCRIBE_TIMEOUT_MS);
 //   5. BroadcastChannel logout, so the user's other tabs go to the login page too (05 §6.2);
 //   6. forget the user in this tab's REST cache (session.ts endSession).
 //
@@ -76,6 +76,27 @@ async function unsubscribePushLocally(): Promise<void> {
   }
 }
 
+/**
+ * How long logout() waits for step 4. PushSubscription.unsubscribe() asks the browser's push service, and by then
+ * the session has ended on the server: a push service that doesn't answer must not leave this tab showing the user,
+ * or keep the other tabs from hearing about the logout.
+ */
+export const PUSH_UNSUBSCRIBE_TIMEOUT_MS = 3000;
+
+/** Waits until work settles, but no longer than ms. Resolves false when the time ran out first. */
+function settledWithin(work: Promise<unknown>, ms: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      resolve(false);
+    }, ms);
+    const done = (): void => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    work.then(done, done);
+  });
+}
+
 /** What logout() needs from the app's services. */
 export interface LogoutServices {
   readonly queryClient: QueryClient;
@@ -114,7 +135,10 @@ export async function logout({ queryClient }: LogoutServices): Promise<void> {
     }
   }
 
-  await unsubscribePushLocally();
+  // From here on the session is gone, whatever happens below: steps 5 and 6 always follow.
+  if (!(await settledWithin(unsubscribePushLocally(), PUSH_UNSUBSCRIBE_TIMEOUT_MS))) {
+    log.warn('the push subscription was not dropped in time');
+  }
   broadcastLogout();
   endSession(queryClient);
 }

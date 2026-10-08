@@ -135,6 +135,16 @@ export const COMMON_ERRORS: readonly ErrorRow[] = [
   ['a code this build does not know', 418, { code: 'brand_new_code' }, 'Something went wrong (brand_new_code).'],
 ];
 
+/**
+ * 2xx answers to a link check that aren't the server's: something between the browser and the server answered (a
+ * captive portal's page, a proxy), or the body isn't the DTO.
+ */
+export const NOT_THE_ANSWER: readonly (readonly [name: string, respond: () => Response])[] = [
+  ['a web page', () => new HttpResponse('<html></html>', { status: 200, headers: { 'Content-Type': 'text/html' } })],
+  ['JSON null', () => HttpResponse.json(null)],
+  ['JSON of something else', () => HttpResponse.json({ ok: true })],
+];
+
 /** One row of a field table: the field code the server (or the form's own check) gives, and the text under it. */
 export type FieldRow = readonly [code: string, shown: string];
 

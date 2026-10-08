@@ -1,5 +1,5 @@
 import { EyeOff, Server, ShieldCheck } from 'lucide-react';
-import { useId, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { Trans, useTranslation } from 'react-i18next';
 import { Link, Navigate, useLocation, useNavigate, useSearchParams } from 'react-router';
 
@@ -7,6 +7,7 @@ import { useApp } from '../app/context';
 import { safeNext } from '../app/guards';
 import { useInfo } from '../app/info';
 import { CenteredPage } from '../app/layouts/CenteredPage';
+import { focusPageHeading } from '../app/layouts/RootLayout';
 import { errorMessage } from '../lib/errorText';
 import {
   CodeAccountPending,
@@ -17,6 +18,7 @@ import {
 } from '../protocol/api.gen';
 import { api, isApiError } from '../protocol/rest';
 import { TextField } from '../ui/Field';
+import { PageSpinner } from '../ui/Spinner';
 import { AuthForm, SmallPrint } from './AuthForm';
 import { fieldCodes } from './formErrors';
 import { loginNoticeCode } from './loginNotice';
@@ -24,7 +26,7 @@ import styles from './LoginPage.module.css';
 import { Notice } from './Notice';
 import { PasswordField } from './PasswordField';
 import { startSession } from './session';
-import { useMe } from './useMe';
+import { useConfirmedMe } from './useMe';
 import { useSubmit } from './useSubmit';
 
 /**
@@ -41,7 +43,8 @@ export function afterLogin(next: string | null): string {
  * - invalid_credentials, account_disabled and anything unexpected show above the form; rate_limited (429) and
  *   server_busy (503) show the wait and count it down; account_pending goes to /pending.
  * - A navigation here may carry a notice in its location state (loginNotice.ts): "You were signed out".
- * - Someone who is already signed in goes straight on.
+ * - Someone who is already signed in goes straight on, once the server has said so: a user this tab only has in its
+ *   cache is asked for again first (useConfirmedMe), because the session may be what just ended.
  * - Below the form: where passwords and accounts come from (03 §7.10, §7.9), and the trust model in three lines
  *   with a link to /about (05 §6.3).
  */
@@ -53,7 +56,7 @@ export function LoginPage() {
   const [params] = useSearchParams();
   const next = afterLogin(params.get('next'));
   const info = useInfo().data;
-  const me = useMe();
+  const me = useConfirmedMe();
   const [values, setValues] = useState<LoginRequest>({ username: '', password: '' });
 
   const form = useSubmit<'username' | 'password', LoginRequest, UserResponse>({
@@ -77,7 +80,22 @@ export function LoginPage() {
   });
 
   // Already signed in (a bookmark, the back button). After a submit, onSuccess navigates instead.
-  if (me.data && !form.busy) return <Navigate to={next} replace />;
+  const signedIn = Boolean(me.data) && !form.busy;
+  // The user came from the cache and the server hasn't confirmed it yet: neither the form nor the way on.
+  const confirming = signedIn && me.isFetching;
+  // When the form follows the spinner, the focus move after the navigation (RootLayout, 05 §16.6) found no heading.
+  const spinnerShown = useRef(false);
+  useEffect(() => {
+    if (confirming) {
+      spinnerShown.current = true;
+    } else if (spinnerShown.current && !signedIn) {
+      spinnerShown.current = false;
+      focusPageHeading();
+    }
+  }, [confirming, signedIn]);
+
+  if (confirming) return <PageSpinner />;
+  if (signedIn) return <Navigate to={next} replace />;
 
   const notice = loginNoticeCode(location.state);
   return (

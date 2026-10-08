@@ -11,7 +11,7 @@ import { AccountFields, checkAccount, type AccountValues } from '../auth/Account
 import { Actions, AuthForm } from '../auth/AuthForm';
 import { checkServerName, fieldCodes, SERVER_NAME_MAX_LENGTH } from '../auth/formErrors';
 import { useFragmentToken, type FragmentToken } from '../auth/fragmentToken';
-import { CheckFailed, CheckingLink, LinkProblem } from '../auth/LinkStates';
+import { CheckFailed, CheckingLink, LinkProblem, useFocusHeadingWhen } from '../auth/LinkStates';
 import { useLinkCheck } from '../auth/useLinkCheck';
 import { startSession } from '../auth/session';
 import { useAccountRules, useSubmit } from '../auth/useSubmit';
@@ -83,6 +83,7 @@ function Setup({ token, clear }: FragmentToken) {
   const [values, setValues] = useState<SetupValues>({ username: '', password: '', serverName: '' });
   /** The link died, or another tab created the admin, between the check and the submit. */
   const [problemOnSubmit, setProblemOnSubmit] = useState<SetupProblem | null>(null);
+  useFocusHeadingWhen(problemOnSubmit !== null);
   const check = useLinkCheck('setup', token);
 
   const form = useSubmit<'username' | 'password' | 'serverName', SetupValues, UserResponse>({

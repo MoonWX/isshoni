@@ -14,6 +14,7 @@ import {
   networkError,
   noContent,
   onPost,
+  NOT_THE_ANSWER,
   PASSWORD_CODES,
   renderPage,
   ROOM_HEADING,
@@ -152,6 +153,19 @@ describe('InvitePage', () => {
       expect(screen.getByRole('button', { name: 'Try again' })).toBeInTheDocument();
       expect(screen.queryByRole('heading', { name: DEAD_HEADING })).not.toBeInTheDocument();
     });
+
+    it.each(NOT_THE_ANSWER)('a 200 that is not the answer (%s): the check could not finish', async (_name, respond) => {
+      mockSession();
+      let inTheWay = true;
+      const checked = onPost('/api/v1/auth/invite/check', () => (inTheWay ? respond() : HttpResponse.json(INVITE)));
+      renderInvite();
+      expect(await screen.findByRole('alert')).toHaveTextContent('Something went wrong (unknown).');
+      expect(screen.queryByRole('heading', { name: DEAD_HEADING })).not.toBeInTheDocument();
+      inTheWay = false;
+      await userEvent.click(screen.getByRole('button', { name: 'Try again' }));
+      expect(await screen.findByRole('heading', { name: FORM_HEADING })).toBeInTheDocument();
+      expect(checked).toHaveLength(2);
+    });
   });
 
   describe('error codes of POST /api/v1/auth/register', () => {
@@ -161,9 +175,14 @@ describe('InvitePage', () => {
       onPost('/api/v1/auth/register', () => apiError(status, error));
       renderInvite();
       await submitAccount();
-      expect(await screen.findByRole('heading', { name: DEAD_HEADING })).toBeInTheDocument();
+      const heading = await screen.findByRole('heading', { name: DEAD_HEADING });
       expect(screen.getByText(shown)).toBeInTheDocument();
       expect(screen.queryByLabelText('Username')).not.toBeInTheDocument();
+      // The button that had focus went with the form: focus moves to the new heading, so the change is heard.
+      expect(heading).toBe(screen.getByRole('heading', { level: 1 }));
+      await waitFor(() => {
+        expect(heading).toHaveFocus();
+      });
     });
 
     it('username_taken: under the username, which takes focus', async () => {

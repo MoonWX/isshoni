@@ -82,6 +82,33 @@ describe('LoginPage', () => {
     expect(router.state.location.pathname).toBe('/account');
   });
 
+  it('asks the server about a user it only has cached before it sends them on', async () => {
+    const session = mockSession(meFixture());
+    const { router } = renderPage({ path: '/account' });
+    await screen.findByRole('heading', { name: 'account' });
+    const asked = session.meCalls;
+    await act(() => router.navigate('/login?next=%2Faccount%3Ftab%3Dpw'));
+    await waitFor(() => {
+      expect(router.state.location.pathname + router.state.location.search).toBe('/account?tab=pw');
+    });
+    expect(await screen.findByRole('heading', { name: 'account' })).toBeInTheDocument();
+    // The cache was fresh, and the page asked all the same.
+    expect(session.meCalls).toBe(asked + 1);
+  });
+
+  it('shows the form when the server no longer knows the cached user, instead of sending them back', async () => {
+    const session = mockSession(meFixture());
+    const { router } = renderPage({ path: '/account' });
+    await screen.findByRole('heading', { name: 'account' });
+    // The session ended on the server (an admin revoked it); this tab's cache hasn't heard.
+    session.me = null;
+    const asked = session.meCalls;
+    await act(() => router.navigate('/login?next=%2Faccount'));
+    expect(await screen.findByRole('heading', { name: HEADING })).toBeInTheDocument();
+    expect(router.state.location.pathname + router.state.location.search).toBe('/login?next=%2Faccount');
+    expect(session.meCalls).toBe(asked + 1);
+  });
+
   it.each(['/login', '/login?next=%2Flogin', '/login/', '/login#x'])(
     'a next that points back at the login page (%s) goes to the room instead',
     async (next) => {
@@ -314,6 +341,23 @@ describe('LoginPage', () => {
       expect(screen.queryByRole('status')).not.toBeInTheDocument();
       await act(() => router.navigate('/login', { state: loginState('session_revoked') }));
       expect(await screen.findByRole('status')).toHaveTextContent('You were signed out.');
+    });
+
+    it('shows it when the session ended under a tab that still has the user cached', async () => {
+      // 05 §6.3: a `session`-scope error ends the session, and the connection wiring navigates here with the notice.
+      // Nothing has told this tab's ['me'] yet.
+      const session = mockSession(meFixture());
+      const { router } = renderPage({ path: '/account' });
+      await screen.findByRole('heading', { name: 'account' });
+      session.me = null;
+      await act(() => router.navigate('/login?next=%2Faccount', { state: loginState('session_revoked') }));
+      const heading = await screen.findByRole('heading', { name: HEADING });
+      expect(screen.getByRole('status')).toHaveTextContent('You were signed out.');
+      expect(router.state.location.pathname).toBe('/login');
+      // Focus is on the page heading, as after any navigation (05 §16.6), although the form came after the answer.
+      await waitFor(() => {
+        expect(heading).toHaveFocus();
+      });
     });
 
     it('reads only a notice code from the location state; whatever else history holds is ignored', async () => {

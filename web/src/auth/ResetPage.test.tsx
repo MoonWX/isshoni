@@ -10,6 +10,7 @@ import {
   COMMON_ERRORS,
   mockSession,
   networkError,
+  NOT_THE_ANSWER,
   onPost,
   PASSWORD_CODES,
   renderPage,
@@ -115,6 +116,21 @@ describe('ResetPage', () => {
       expect(await screen.findByLabelText('New password')).toBeInTheDocument();
       expect(checked).toHaveLength(2);
     });
+
+    it.each(NOT_THE_ANSWER)('a 200 that is not the answer (%s): the check could not finish', async (_name, respond) => {
+      mockSession();
+      let inTheWay = true;
+      const checked = onPost('/api/v1/auth/reset/check', () =>
+        inTheWay ? respond() : HttpResponse.json({ username: 'Sam' }),
+      );
+      renderReset();
+      expect(await screen.findByRole('alert')).toHaveTextContent('Something went wrong (unknown).');
+      expect(screen.queryByRole('heading', { name: DEAD_HEADING })).not.toBeInTheDocument();
+      inTheWay = false;
+      await userEvent.click(screen.getByRole('button', { name: 'Try again' }));
+      expect(await screen.findByLabelText('Username')).toHaveValue('Sam');
+      expect(checked).toHaveLength(2);
+    });
   });
 
   describe('error codes of POST /api/v1/auth/reset/complete', () => {
@@ -124,8 +140,13 @@ describe('ResetPage', () => {
       onPost('/api/v1/auth/reset/complete', () => apiError(404, { code: 'reset_token_invalid' }));
       renderReset();
       await submitPassword();
-      expect(await screen.findByRole('heading', { name: DEAD_HEADING })).toBeInTheDocument();
+      const heading = await screen.findByRole('heading', { name: DEAD_HEADING });
       expect(screen.getByText(DEAD_TEXT)).toBeInTheDocument();
+      // The button that had focus went with the form: focus moves to the new heading, so the change is heard.
+      expect(heading).toBe(screen.getByRole('heading', { level: 1 }));
+      await waitFor(() => {
+        expect(heading).toHaveFocus();
+      });
     });
 
     it.each(PASSWORD_CODES)('validation_failed, password %s', async (code, shown) => {

@@ -21,7 +21,7 @@ import { Button, buttonClass } from '../ui/Button';
 import { AccountFields, checkAccount, type AccountValues } from './AccountFields';
 import { Actions, AuthForm, Prose, SmallPrint } from './AuthForm';
 import { useFragmentToken, type FragmentToken } from './fragmentToken';
-import { CheckFailed, CheckingLink, HaveAccount, LinkProblem } from './LinkStates';
+import { CheckFailed, CheckingLink, HaveAccount, LinkProblem, useFocusHeadingWhen } from './LinkStates';
 import { useLinkCheck } from './useLinkCheck';
 import { useLogout } from './useLogout';
 import { startSession } from './session';
@@ -66,6 +66,7 @@ function Invite({ token, clear }: FragmentToken) {
   const [values, setValues] = useState<AccountValues>({ username: '', password: '' });
   /** The invite stopped working between the check and the submit (used up, revoked, expired). */
   const [diedOnSubmit, setDiedOnSubmit] = useState<ApiError | null>(null);
+  useFocusHeadingWhen(diedOnSubmit !== null);
 
   const form = useSubmit<'username' | 'password', AccountValues, RegisterResponse>({
     fields: ['username', 'password'],

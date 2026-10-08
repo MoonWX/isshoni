@@ -15,7 +15,7 @@ import { installFakeRTC } from '../test/FakeRTCPeerConnection';
 import { apiError, apiPath, infoFixture, meFixture, roomsFixture, server } from '../test/msw';
 import { createTestPlatform } from '../test/platform';
 import { createTestServices, renderRoute } from '../test/render';
-import { addLogoutStep, logout, type LogoutPhase, type LogoutStep } from './logout';
+import { addLogoutStep, logout, PUSH_UNSUBSCRIBE_TIMEOUT_MS, type LogoutPhase, type LogoutStep } from './logout';
 import { mockSession, networkError, noContent, onPost, pageSources } from './testing/harness';
 import { useLogout } from './useLogout';
 import { endSession, startSession, SessionNotKeptError } from './session';
@@ -55,6 +55,7 @@ describe('logout()', () => {
     removers = [];
     other.close();
     vi.unstubAllGlobals();
+    vi.useRealTimers();
   });
 
   function step(phase: LogoutPhase, fn: LogoutStep): void {
@@ -118,6 +119,40 @@ describe('logout()', () => {
     await expect(logout(signedInServices())).resolves.toBeUndefined();
     vi.stubGlobal('navigator', { serviceWorker: { getRegistration: () => Promise.reject(new Error('blocked')) } });
     await expect(logout(signedInServices())).resolves.toBeUndefined();
+  });
+
+  it('a push service that never answers holds the rest up only until the time limit', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    onPost('/api/v1/auth/logout', noContent);
+    const services = signedInServices();
+    const unsubscribe = vi.fn(() => new Promise<boolean>(() => undefined));
+    vi.stubGlobal('navigator', {
+      serviceWorker: {
+        getRegistration: () =>
+          Promise.resolve({ pushManager: { getSubscription: () => Promise.resolve({ unsubscribe }) } }),
+      },
+    });
+
+    let settled = false;
+    const running = logout(services).finally(() => {
+      settled = true;
+    });
+    await vi.waitFor(() => {
+      expect(unsubscribe).toHaveBeenCalledOnce();
+    });
+    // The order of 05 §15.1 holds while there is still time: step 4 comes before the other tabs and the cache.
+    await vi.advanceTimersByTimeAsync(PUSH_UNSUBSCRIBE_TIMEOUT_MS / 2);
+    expect(settled).toBe(false);
+    expect(services.queryClient.getQueryData(queryKeys.me)).toEqual(meFixture());
+    expect(other.messages).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(PUSH_UNSUBSCRIBE_TIMEOUT_MS / 2);
+    await expect(running).resolves.toBeUndefined();
+    expect(services.queryClient.getQueryData(queryKeys.me)).toBeNull();
+    expect(services.queryClient.getQueryData(queryKeys.rooms)).toBeUndefined();
+    await vi.waitFor(() => {
+      expect(other.messages).toEqual([{ type: 'logout' }]);
+    });
   });
 
   it('a step that throws does not keep the user signed in', async () => {

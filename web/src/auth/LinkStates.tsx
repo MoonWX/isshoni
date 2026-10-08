@@ -1,10 +1,11 @@
 // The states a token page (/invite, /reset, /setup) is in before its form shows: checking the link, a check that
 // couldn't finish, a link that doesn't work.
-import type { ReactNode } from 'react';
+import { useEffect, type ReactNode } from 'react';
 import { Trans, useTranslation } from 'react-i18next';
 import { Link } from 'react-router';
 
 import { CenteredPage, type CenteredPageProps } from '../app/layouts/CenteredPage';
+import { focusPageHeading } from '../app/layouts/RootLayout';
 import { errorMessage } from '../lib/errorText';
 import { Button } from '../ui/Button';
 import { Spinner } from '../ui/Spinner';
@@ -73,4 +74,17 @@ export function LinkProblem({ title, width, footer, children, actions }: LinkPro
       {actions}
     </CenteredPage>
   );
+}
+
+/**
+ * For a page whose submit can end in LinkProblem (the link died between the check and the submit): pass true once
+ * that has happened. The form is gone then, and with it the button that had focus, and no live region says what
+ * took its place, while every other failed submit is heard (useSubmit.ts). So focus moves to the new heading, as it
+ * does after a navigation (05 §16.6). A link that was already dead when the page opened is the page's first
+ * content and moves nothing.
+ */
+export function useFocusHeadingWhen(diedOnSubmit: boolean): void {
+  useEffect(() => {
+    if (diedOnSubmit) focusPageHeading();
+  }, [diedOnSubmit]);
 }

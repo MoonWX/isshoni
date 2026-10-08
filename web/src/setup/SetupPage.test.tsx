@@ -210,8 +210,13 @@ describe('SetupPage', () => {
       onPost('/api/v1/auth/setup/complete', () => apiError(404, { code: 'setup_unavailable' }));
       renderSetup();
       await submitAdmin();
-      expect(await screen.findByRole('heading', { name: ALREADY })).toBeInTheDocument();
+      const heading = await screen.findByRole('heading', { name: ALREADY });
       expect(screen.getByRole('link', { name: 'Log in' })).toHaveAttribute('href', '/login');
+      // The button that had focus went with the form: focus moves to the new heading, so the change is heard.
+      expect(heading).toBe(screen.getByRole('heading', { level: 1 }));
+      await waitFor(() => {
+        expect(heading).toHaveFocus();
+      });
     });
 
     it('setup_token_invalid: a newer link replaced this one in the meantime', async () => {
@@ -220,8 +225,12 @@ describe('SetupPage', () => {
       onPost('/api/v1/auth/setup/complete', () => apiError(404, { code: 'setup_token_invalid' }));
       renderSetup();
       await submitAdmin();
-      expect(await screen.findByRole('heading', { name: INVALID })).toBeInTheDocument();
+      const heading = await screen.findByRole('heading', { name: INVALID });
       expect(screen.getByText('sudo isshoni setup-url')).toBeInTheDocument();
+      expect(heading).toBe(screen.getByRole('heading', { level: 1 }));
+      await waitFor(() => {
+        expect(heading).toHaveFocus();
+      });
     });
 
     it.each([

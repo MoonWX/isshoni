@@ -6,6 +6,9 @@
 //   navigate(loginPath(location), { state: loginState('session_revoked') });
 //
 // The login page shows errors.<code> for it (lib/errorText.ts); an unknown code falls back to errors.unknown.
+// The caller doesn't have to clear ['me'] first: the login page asks the server about a user it finds cached
+// (useMe.ts useConfirmedMe) before it sends anyone on to ?next=, so a session that just ended shows the form and the
+// notice.
 
 /** The location state of a navigation to /login. */
 export interface LoginLocationState {
