@@ -201,8 +201,10 @@ func metaOrEmpty(q *store.Q, key string) (string, error) {
 //   - device codes nobody decided yet have no user, and DeleteDeviceCodesOf selects by user. None can exist in M1
 //     (the device flow is M2); such a row lives 10 minutes and Prune deletes it an hour after that.
 //
-// Deleting both needs two store methods (delete every invite, delete every device code), which belong to the store
-// slice.
+// Deleting both, as 03 §4.6 says, needs two store methods that 03 §6 does not declare: one that deletes every
+// invite and one that deletes every device code (as DeleteAllPushSubscriptions does for the VAPID key). They belong
+// to the store, which this slice (README S30) does not touch; with them, the invite loop and the per-user
+// DeleteDeviceCodesOf call below become one call each.
 func purgeRotated(q *store.Q, rotated []string, now time.Time) error {
 	if len(rotated) == 0 {
 		return nil

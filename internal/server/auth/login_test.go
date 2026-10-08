@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +25,66 @@ import (
 func (e *svcEnv) tryLogin(name, password, ip string) error {
 	_, err := e.svc.Login(context.Background(), name, password, meta(ip))
 	return err
+}
+
+// heldTokens returns how many keys hold tokens in the auth-user-ip and in the auth-user bucket. A bucket whose
+// tokens all went back has no entry, so {0, 0} means that no attempt has anything reserved or spent.
+func (e *svcEnv) heldTokens() [2]int {
+	return [2]int{e.svc.throttle.authUserIP.size(), e.svc.throttle.authUser.size()}
+}
+
+// gatedDerive counts its calls like countingDerive and holds each one until gate closes, so a test decides how long
+// the password checks stay in flight.
+func gatedDerive(n *atomic.Int32, gate <-chan struct{}) deriveFunc {
+	return func(pw, salt []byte, t, m uint32, p uint8, k uint32) []byte {
+		n.Add(1)
+		<-gate
+		return argon2.IDKey(pw, salt, t, m, p, k)
+	}
+}
+
+// guessInParallel sends one wrong password for name from each address at the same time, while every password check
+// hangs in the hasher. It waits for wantRefused answers, which can only come from attempts that were not verified,
+// then lets the hasher go and returns how many attempts ended with each error code. e.hashes then holds the number
+// of attempts that reached the hasher.
+func (e *svcEnv) guessInParallel(name string, ips []string, wantRefused int) map[string]int {
+	e.t.Helper()
+	gate := make(chan struct{})
+	e.svc.hasher.derive = gatedDerive(&e.hashes, gate)
+	e.hashes.Store(0)
+	errs := make(chan error, len(ips))
+	for _, ip := range ips {
+		go func() { errs <- e.tryLogin(name, "not the password", ip) }()
+	}
+	codes := map[string]int{}
+	count := func(err error) {
+		var ae *api.Error
+		if errors.As(err, &ae) {
+			codes[ae.Code]++
+		} else {
+			codes[fmt.Sprint(err)]++
+		}
+	}
+	early := 0
+	timeout := time.After(10 * time.Second)
+	for waiting := true; waiting && early < wantRefused; {
+		select {
+		case err := <-errs:
+			count(err)
+			early++
+		case <-timeout:
+			waiting = false
+		}
+	}
+	close(gate)
+	for range len(ips) - early {
+		count(<-errs)
+	}
+	if early != wantRefused {
+		e.t.Fatalf("%d of %d parallel attempts answered while the others were being hashed, want %d refused; "+
+			"in the end %v with %d hashes", early, len(ips), wantRefused, codes, e.hashes.Load())
+	}
+	return codes
 }
 
 func TestLogin(t *testing.T) {
@@ -71,7 +133,7 @@ func TestLogin(t *testing.T) {
 	}
 	if r := rows[0]; r.Actor != (store.Actor{Kind: store.ActorUser, UserID: alex.ID, Name: "Alex", IP: ipA}) ||
 		r.TargetKind != "session" || r.TargetID != string(res.Session.ID) || r.TargetName != "Chrome on Windows" ||
-		len(r.Detail) != 0 || !r.At.Equal(now) {
+		len(r.Detail) != 0 || !r.At.Equal(now) || r.Outcome != "ok" {
 		t.Errorf("auth.login row = %+v", r)
 	}
 	if calls := e.conns.take(); len(calls) != 0 {
@@ -135,8 +197,9 @@ func TestLoginFailures(t *testing.T) {
 			t.Fatalf("%s: %d auth.login_failed rows, want %d", tc.name, len(rows), before+1)
 		}
 		r := rows[len(rows)-1]
-		if r.Actor != (store.Actor{Kind: store.ActorAnonymous, IP: ip}) || fmt.Sprint(r.Detail) != "map[reason:"+tc.reason+"]" {
-			t.Errorf("%s: auth.login_failed row = %+v", tc.name, r)
+		if r.Actor != (store.Actor{Kind: store.ActorAnonymous, IP: ip}) ||
+			fmt.Sprint(r.Detail) != "map[reason:"+tc.reason+"]" || r.Outcome != "denied" {
+			t.Errorf("%s: auth.login_failed row = %+v, want outcome denied", tc.name, r)
 		}
 		if tc.target == "" {
 			// The name tried for an unknown account is never stored (a typo there is often the password).
@@ -265,6 +328,10 @@ func TestLoginRecheckInWrite(t *testing.T) {
 		wantCode(t, e.tryLogin("Alex", testPassword, ipA), tc.code)
 		if n := e.rawCount("sessions"); n != 0 {
 			t.Errorf("%s between the check and the write: %d sessions were created", tc.name, n)
+		}
+		// The password was right when it was checked: not a failed check, so the attempt keeps no token.
+		if got := e.heldTokens(); got != [2]int{} {
+			t.Errorf("%s between the check and the write: %v keys with tokens taken, want none", tc.name, got)
 		}
 	}
 }
@@ -424,7 +491,7 @@ func TestLogout(t *testing.T) {
 	}
 	if r := rows[0]; r.Actor != (store.Actor{Kind: store.ActorUser, UserID: alex.ID, Name: "Alex", IP: ipC}) ||
 		r.TargetKind != "session" || r.TargetID != string(res.Session.ID) || r.TargetName != "Chrome on Windows" ||
-		!r.At.Equal(now) || len(r.Detail) != 0 {
+		!r.At.Equal(now) || len(r.Detail) != 0 || r.Outcome != "ok" {
 		t.Errorf("auth.logout row = %+v", r)
 	}
 	// The cached session is gone at once, on both paths; the other session is untouched.
@@ -531,8 +598,16 @@ func TestLoginThrottles(t *testing.T) {
 		t.Fatalf("%d auth.throttled rows, want 1: %+v", len(rows), rows)
 	}
 	if r := rows[0]; r.Actor != (store.Actor{Kind: store.ActorAnonymous, IP: ipC}) ||
-		fmt.Sprint(r.Detail) != "map[key:Alex scope:username]" || r.TargetID != "" {
+		fmt.Sprint(r.Detail) != "map[key:Alex scope:username]" || r.TargetID != "" || r.Outcome != "denied" {
 		t.Errorf("auth.throttled row = %+v", r)
+	}
+	// The outcome column (03 §5): every refused attempt is "denied", and every other row, the 4 logins here, "ok".
+	if n := e.rawInt(`SELECT count(*) FROM audit_log WHERE (action IN ('auth.login_failed', 'auth.throttled')) <>
+		(outcome = 'denied')`); n != 0 {
+		t.Errorf("%d audit rows with the wrong outcome", n)
+	}
+	if n := e.rawInt(`SELECT count(*) FROM audit_log WHERE action = 'auth.login' AND outcome = 'ok'`); n != 4 {
+		t.Errorf("%d auth.login rows with outcome ok, want 4", n)
 	}
 
 	// An expired session's address is not a known IP: when every session is gone, B waits like everyone else.
@@ -604,6 +679,139 @@ func TestLoginSuccessRefillsAddressOnly(t *testing.T) {
 	}
 }
 
+// TestLoginParallelGuesses: the two per-username buckets hold while passwords are being hashed (03 §7.3). An attempt
+// reserves its tokens before the hash, so of the guesses sent at the same time no more reach the hasher than the
+// bucket has tokens; the others get 429 without a hash. (A bucket that was only looked at before the hash and spent
+// after the verdict would let all of them through.)
+func TestLoginParallelGuesses(t *testing.T) {
+	t.Run("one address", func(t *testing.T) {
+		e := newSvcEnv(t)
+		e.addUser("Alex")
+		// 20 guesses for one username from one address: auth-user-ip has 5 tokens. (auth-ip allows all 20.)
+		codes := e.guessInParallel("Alex", slices.Repeat([]string{ipA}, 20), 15)
+		if codes[api.CodeInvalidCredentials] != 5 || codes[api.CodeRateLimited] != 15 || len(codes) != 2 {
+			t.Errorf("answers = %v, want 5 invalid_credentials and 15 rate_limited", codes)
+		}
+		if n := e.hashes.Load(); n != 5 {
+			t.Errorf("%d attempts reached the hasher, want exactly the 5 the bucket allows", n)
+		}
+		if n := e.auditCount(auditLoginFailed); n != 5 {
+			t.Errorf("%d auth.login_failed rows, want 5", n)
+		}
+		// The 5 failures keep their tokens: the address stays blocked, also for the right password. (15 s bring one
+		// auth-ip token back; auth-user-ip is still 105 s away from its next one.)
+		e.advance(15 * time.Second)
+		ae := wantCode(t, e.tryLogin("Alex", testPassword, ipA), api.CodeRateLimited)
+		if ae.RetryAfter != 105 || e.hashes.Load() != 5 {
+			t.Errorf("after the burst: retryAfter %d s and %d hashes, want the auth-user-ip block (105 s) and no hash",
+				ae.RetryAfter, e.hashes.Load())
+		}
+		// The refused attempts took nothing from auth-user: it counted the 5 failures, so 25 more empty it.
+		failures := 0
+		for i := 0; ; i++ {
+			err := e.tryLogin("Alex", "not the password", fmt.Sprintf("192.0.2.%d", 10+i/5))
+			if api.IsCode(err, api.CodeRateLimited) {
+				break
+			}
+			wantCode(t, err, api.CodeInvalidCredentials)
+			failures++
+		}
+		if failures != 25 {
+			t.Errorf("auth-user allowed %d more failures, want 30 - 5 = 25", failures)
+		}
+	})
+
+	t.Run("many addresses", func(t *testing.T) {
+		e := newSvcEnv(t)
+		e.addUser("Alex")
+		// 29 failures from 29 addresses leave one auth-user token.
+		for i := range 29 {
+			wantCode(t, e.tryLogin("Alex", "not the password", fmt.Sprintf("192.0.2.%d", i+1)), api.CodeInvalidCredentials)
+		}
+		// 30 guesses from 30 new addresses, each with a full auth-user-ip bucket.
+		ips := make([]string, 30)
+		for i := range ips {
+			ips[i] = fmt.Sprintf("198.51.100.%d", i+1)
+		}
+		codes := e.guessInParallel("Alex", ips, 29)
+		if codes[api.CodeInvalidCredentials] != 1 || codes[api.CodeRateLimited] != 29 || len(codes) != 2 {
+			t.Errorf("answers = %v, want 1 invalid_credentials and 29 rate_limited", codes)
+		}
+		if n := e.hashes.Load(); n != 1 {
+			t.Errorf("%d attempts reached the hasher, want exactly the 1 the bucket allows", n)
+		}
+		// A refused attempt holds nothing: the 29 addresses got their auth-user-ip token back. What is left are the
+		// 30 failed checks (29 before, 1 now).
+		if got := e.heldTokens(); got != [2]int{30, 1} {
+			t.Errorf("keys with tokens taken (auth-user-ip, auth-user) = %v, want [30 1]", got)
+		}
+		if n := e.auditCount(auditLoginFailed); n != 30 {
+			t.Errorf("%d auth.login_failed rows, want 30", n)
+		}
+		// One episode, one auth.throttled row, however many attempts were refused at once.
+		rows := e.audit(auditThrottled)
+		if len(rows) != 1 || fmt.Sprint(rows[0].Detail) != "map[key:Alex scope:username]" {
+			t.Errorf("auth.throttled rows = %+v, want one {scope: username}", rows)
+		}
+	})
+}
+
+// TestLoginGivesTokensBack: only a failed password check costs a token of the two per-username buckets (03 §7.3).
+// An attempt takes its tokens before the hash; every end that is not a failure leaves both buckets as they were.
+func TestLoginGivesTokensBack(t *testing.T) {
+	none := [2]int{}
+	e := newSvcEnv(t, func(o *Options) { o.Hashes = HashBudget{Burst: 4, PerSecond: 1} })
+	e.addUser("Alex")
+	e.addUser("Pending", func(u *store.User) { u.Status = store.StatusPending })
+	e.addUser("Disabled", func(u *store.User) { u.Status = store.StatusDisabled })
+
+	e.login("Alex", ipA)
+	if got := e.heldTokens(); got != none {
+		t.Errorf("after a login: %v keys with tokens taken, want none", got)
+	}
+	wantCode(t, e.tryLogin("Pending", testPassword, ipA), api.CodeAccountPending)
+	wantCode(t, e.tryLogin("Disabled", testPassword, ipA), api.CodeAccountDisabled)
+	if got := e.heldTokens(); got != none {
+		t.Errorf("after a correct password for an account that is not active: %v, want none", got)
+	}
+	// A failure is what the buckets count.
+	wantCode(t, e.tryLogin("Alex", "not the password", ipA), api.CodeInvalidCredentials)
+	failed := [2]int{1, 1}
+	if got := e.heldTokens(); got != failed {
+		t.Fatalf("after a wrong password: %v, want %v", got, failed)
+	}
+	// The hash budget is empty now (4 hashes): 503, and the attempts, for other names, keep nothing.
+	e.hashes.Store(0)
+	wantCode(t, e.tryLogin("Pending", testPassword, ipB), api.CodeServerBusy)
+	wantCode(t, e.tryLogin("Nobody", testPassword, ipB), api.CodeServerBusy)
+	if got := e.heldTokens(); got != failed || e.hashes.Load() != 0 {
+		t.Errorf("after two attempts without a hash budget: %v with %d hashes, want %v and none",
+			got, e.hashes.Load(), failed)
+	}
+	// A store that fails is no verdict either.
+	e.advance(time.Second) // one hash token
+	if err := e.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wantCode(t, e.tryLogin("Sam", testPassword, ipB), api.CodeInternal)
+	if got := e.heldTokens(); got != failed {
+		t.Errorf("after a store error: %v, want %v", got, failed)
+	}
+
+	// Giving a token back is not a refill: a correct password for a pending account leaves the address's earlier
+	// failures in its bucket. (A login refills it: TestLoginSuccessRefillsAddressOnly.)
+	e = newSvcEnv(t)
+	e.addUser("Pending", func(u *store.User) { u.Status = store.StatusPending })
+	for range 3 {
+		wantCode(t, e.tryLogin("Pending", "not the password", ipA), api.CodeInvalidCredentials)
+	}
+	wantCode(t, e.tryLogin("Pending", testPassword, ipA), api.CodeAccountPending)
+	for range 2 {
+		wantCode(t, e.tryLogin("Pending", "not the password", ipA), api.CodeInvalidCredentials)
+	}
+	wantCode(t, e.tryLogin("Pending", testPassword, ipA), api.CodeRateLimited)
+}
+
 // TestLoginIPBucket: the auth-ip bucket blocks the 21st attempt of an address, before any other work.
 func TestLoginIPBucket(t *testing.T) {
 	e := newSvcEnv(t)
@@ -627,8 +835,8 @@ func TestLoginIPBucket(t *testing.T) {
 	// The first block of the episode writes one auth.throttled {scope: ip} row; the later ones write none.
 	rows := e.audit(auditThrottled)
 	if len(rows) != 1 || fmt.Sprint(rows[0].Detail) != "map[key:"+ipA+" scope:ip]" ||
-		rows[0].Actor != (store.Actor{Kind: store.ActorAnonymous, IP: ipA}) {
-		t.Fatalf("auth.throttled rows = %+v, want one for the address", rows)
+		rows[0].Actor != (store.Actor{Kind: store.ActorAnonymous, IP: ipA}) || rows[0].Outcome != "denied" {
+		t.Fatalf("auth.throttled rows = %+v, want one for the address with outcome denied", rows)
 	}
 	if n := strings.Count(e.logs.String(), "auth attempt throttled"); n != 1 {
 		t.Errorf("%d warn lines for 3 blocked attempts in one minute, want 1", n)
@@ -687,8 +895,8 @@ func TestLoginHashBudgetEmpty(t *testing.T) {
 	// A refused field never reaches the budget, and neither does an attempt another bucket blocks.
 	wantCode(t, e.tryLogin("", "", "192.0.2.20"), api.CodeValidationFailed)
 	rows := e.audit(auditThrottled)
-	if len(rows) != 1 || fmt.Sprint(rows[0].Detail) != "map[scope:hash]" {
-		t.Fatalf("auth.throttled rows = %+v, want one {scope: hash}", rows)
+	if len(rows) != 1 || fmt.Sprint(rows[0].Detail) != "map[scope:hash]" || rows[0].Outcome != "denied" {
+		t.Fatalf("auth.throttled rows = %+v, want one {scope: hash} with outcome denied", rows)
 	}
 	e.advance(500 * time.Millisecond)
 	e.login("Alex", "192.0.2.30")
@@ -748,8 +956,8 @@ func TestLoginFailedAuditCap(t *testing.T) {
 		t.Errorf("%d auth.login_failed rows, want the cap of 600", n)
 	}
 	rows := e.audit(auditThrottled)
-	if len(rows) != 1 || fmt.Sprint(rows[0].Detail) != "map[scope:global]" {
-		t.Fatalf("auth.throttled rows = %+v, want one {scope: global}", rows)
+	if len(rows) != 1 || fmt.Sprint(rows[0].Detail) != "map[scope:global]" || rows[0].Outcome != "denied" {
+		t.Fatalf("auth.throttled rows = %+v, want one {scope: global} with outcome denied", rows)
 	}
 	// The cap refills at 600 per hour: 6 s later one more row fits.
 	e.advance(6 * time.Second)
@@ -798,6 +1006,9 @@ func TestHashQueueFull(t *testing.T) {
 	// A busy queue is not a failed password check: no bucket was spent and no row written.
 	if n := e.auditCount(auditLoginFailed); n != 0 {
 		t.Errorf("%d auth.login_failed rows for attempts that never hashed", n)
+	}
+	if got := e.heldTokens(); got != [2]int{} {
+		t.Errorf("attempts that never hashed left %v keys with tokens taken, want none", got)
 	}
 	close(gate)
 	wg.Wait()

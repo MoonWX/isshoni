@@ -23,7 +23,9 @@
 //     cache, Touch (the hub's Revalidate), MaybeRotate (the daily token rotation with its 60 s grace), the CSRF
 //     wrapper, and the after-commit steps of a revocation: cache first, then ConnCloser (§7.4–7.7);
 //   - login.go (README S30): Login and Logout with the throttles of §7.3 in their order (auth-ip, auth-user-ip,
-//     auth-user with the known-IP rule, auth-hash) and the audit rows of §10;
+//     auth-user with the known-IP rule, auth-hash) and the audit rows of §10. A login takes its tokens of the two
+//     per-username buckets before the hash and gets them back unless the password check failed, so parallel
+//     guesses cannot outrun the limits;
 //   - setup.go (README S30): SetupAvailable, IssueSetupToken, CheckSetupToken and CompleteSetup (§7.8);
 //   - alerts.go: admin alerts (§7.11).
 //

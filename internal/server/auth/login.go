@@ -46,6 +46,10 @@ const (
 	targetSession = "session"
 )
 
+// outcomeDenied is the outcome of the audit rows of a refused attempt: every auth.login_failed and auth.throttled
+// row (03 §5, §10). The other rows keep the store's default, "ok".
+const outcomeDenied = string(api.AuditOutcomeDenied)
+
 // hashBusyRetryAfter is the Retry-After of a full hash queue, in seconds (03 §7.2).
 const hashBusyRetryAfter = 5
 
@@ -132,8 +136,8 @@ func (s *Service) takeAuthIP(ctx context.Context, m ReqMeta) error {
 		return nil
 	}
 	if v.First {
-		s.auditAlone(ctx, store.AuditEntry{At: s.now(), Action: auditThrottled, Actor: anonymous(m),
-			Detail: map[string]any{"scope": scopeIP, "key": ipKeyText(m.IP)}})
+		s.auditAlone(ctx, store.AuditEntry{At: s.now(), Action: auditThrottled, Outcome: outcomeDenied,
+			Actor: anonymous(m), Detail: map[string]any{"scope": scopeIP, "key": ipKeyText(m.IP)}})
 	}
 	s.logBlocked(ctx, m, "auth-ip")
 	return rateLimited(v)
@@ -148,13 +152,59 @@ func (s *Service) takeHashBudget(ctx context.Context, m ReqMeta) error {
 		return nil
 	}
 	if v.First {
-		s.auditAlone(ctx, store.AuditEntry{At: s.now(), Action: auditThrottled, Actor: anonymous(m),
-			Detail: map[string]any{"scope": scopeHash}})
+		s.auditAlone(ctx, store.AuditEntry{At: s.now(), Action: auditThrottled, Outcome: outcomeDenied,
+			Actor: anonymous(m), Detail: map[string]any{"scope": scopeHash}})
 	}
 	return &api.Error{Code: api.CodeServerBusy, RetryAfter: v.retryAfterSeconds()}
 }
 
-// checkPasswordBuckets checks the two per-username buckets of failed password checks before any hashing:
+// passwordAttempt is the place one login holds in the two per-username buckets of failed password checks while its
+// password is verified (03 §7.3). The buckets count failures, but an attempt takes its tokens before the hash, not
+// after the verdict: attempts that arrive while earlier ones are still hashing then find those in the buckets, so
+// guesses sent in parallel cannot outrun the limits. How the attempt ends decides what becomes of the tokens:
+//   - a wrong password or an unknown username keeps them (failed);
+//   - a completed login gives the auth-user token back and refills this address's auth-user-ip bucket (loggedIn);
+//   - every other end gives both back (release): an empty hash budget, a full hash queue, a store or context error,
+//     and a correct password for an account that is not active. None of them is a failed password check.
+type passwordAttempt struct {
+	t      *throttles
+	userIP userIPKey
+	user   string
+	// holdsUser is false for a known IP that went on while auth-user was empty: it took no auth-user token.
+	holdsUser bool
+	settled   bool
+}
+
+// failed keeps the tokens: the attempt was a failed password check.
+func (a *passwordAttempt) failed() { a.settled = true }
+
+// loggedIn ends an attempt that became a session: auth-user is as it was before the attempt, so a friend's login
+// never hands an attacker a fresh budget, and this address's auth-user-ip bucket for the username is full again.
+func (a *passwordAttempt) loggedIn() {
+	if a.settled {
+		return
+	}
+	a.settled = true
+	if a.holdsUser {
+		a.t.authUser.refund(a.user)
+	}
+	a.t.authUserIP.reset(a.userIP)
+}
+
+// release gives the tokens back unless failed or loggedIn settled the attempt. Login defers it, so no exit can leave
+// a token behind for an attempt that was not a failed password check.
+func (a *passwordAttempt) release() {
+	if a.settled {
+		return
+	}
+	a.settled = true
+	a.t.authUserIP.refund(a.userIP)
+	if a.holdsUser {
+		a.t.authUser.refund(a.user)
+	}
+}
+
+// reservePasswordAttempt takes the attempt's tokens from the two per-username buckets before any hashing:
 //   - auth-user-ip (this username from this address): a hard block. It writes no auth.throttled row: the
 //     auth.login_failed rows before it already show the address, and a row per pair would let a stranger with many
 //     addresses flood the log;
@@ -162,24 +212,29 @@ func (s *Service) takeHashBudget(ctx context.Context, m ReqMeta) error {
 //     last_ip (IPv4) or its /64 (IPv6) of that user's live sessions. That is one indexed read, done only while the
 //     bucket is empty. The first refusal of an episode writes auth.throttled {scope: username, key: <username>},
 //     and only if that user exists.
-func (s *Service) checkPasswordBuckets(ctx context.Context, key string, isKey bool, m ReqMeta) error {
+//
+// A refused attempt holds no token: the auth-user-ip token goes back when auth-user refuses.
+func (s *Service) reservePasswordAttempt(ctx context.Context, key string, isKey bool, m ReqMeta) (passwordAttempt, error) {
 	now := s.now()
-	if v := s.throttle.authUserIP.check(userIPKey{user: key, ip: IPKey(m.IP)}); !v.OK {
+	a := passwordAttempt{t: s.throttle, userIP: userIPKey{user: key, ip: IPKey(m.IP)}, user: key}
+	if v := s.throttle.authUserIP.take(a.userIP); !v.OK {
 		s.logBlocked(ctx, m, "auth-user-ip")
-		return rateLimited(v)
+		return passwordAttempt{}, rateLimited(v)
 	}
-	v := s.throttle.authUser.check(key)
+	v := s.throttle.authUser.take(key)
 	if v.OK {
-		return nil
+		a.holdsUser = true
+		return a, nil
 	}
 	if v.First && isKey {
 		s.auditUsernameThrottled(ctx, key, m, now)
 	}
 	if isKey && s.fromKnownIP(ctx, key, m.IP, now) {
-		return nil
+		return a, nil
 	}
+	s.throttle.authUserIP.refund(a.userIP)
 	s.logBlocked(ctx, m, "auth-user")
-	return rateLimited(v)
+	return passwordAttempt{}, rateLimited(v)
 }
 
 // auditUsernameThrottled writes auth.throttled {scope: username, key: <the account's username>} if an account with
@@ -193,8 +248,8 @@ func (s *Service) auditUsernameThrottled(ctx context.Context, key string, m ReqM
 		if err != nil {
 			return err
 		}
-		return q.AppendAudit(store.AuditEntry{At: now, Action: auditThrottled, Actor: anonymous(m),
-			Detail: map[string]any{"scope": scopeUsername, "key": u.Username}})
+		return q.AppendAudit(store.AuditEntry{At: now, Action: auditThrottled, Outcome: outcomeDenied,
+			Actor: anonymous(m), Detail: map[string]any{"scope": scopeUsername, "key": u.Username}})
 	})
 	if err != nil {
 		s.log.LogAttrs(ctx, slog.LevelWarn, "could not write an audit row",
@@ -228,14 +283,6 @@ func (s *Service) fromKnownIP(ctx context.Context, key string, ip netip.Addr, no
 	return false
 }
 
-// passwordFailed spends the two per-username buckets after a failed password check and writes the
-// auth.login_failed row. target is the account, if it exists.
-func (s *Service) passwordFailed(ctx context.Context, key string, target *store.User, reason string, m ReqMeta) {
-	s.throttle.authUserIP.spend(userIPKey{user: key, ip: IPKey(m.IP)})
-	s.throttle.authUser.spend(key)
-	s.auditLoginFailed(ctx, target, reason, m)
-}
-
 // auditLoginFailed writes an auth.login_failed {reason} row: actor anonymous with the IP, target the account only
 // if it exists. The rows have a server-wide cap of 600 per hour; beyond it, one auth.throttled {scope: global} row
 // is written per hour (03 §7.3).
@@ -243,12 +290,12 @@ func (s *Service) auditLoginFailed(ctx context.Context, target *store.User, reas
 	now := s.now()
 	if !s.throttle.loginFailedAudit.take(struct{}{}).OK {
 		if s.throttle.globalThrottledAudit.take(struct{}{}).OK {
-			s.auditAlone(ctx, store.AuditEntry{At: now, Action: auditThrottled, Actor: anonymous(m),
-				Detail: map[string]any{"scope": scopeGlobal}})
+			s.auditAlone(ctx, store.AuditEntry{At: now, Action: auditThrottled, Outcome: outcomeDenied,
+				Actor: anonymous(m), Detail: map[string]any{"scope": scopeGlobal}})
 		}
 		return
 	}
-	e := store.AuditEntry{At: now, Action: auditLoginFailed, Actor: anonymous(m),
+	e := store.AuditEntry{At: now, Action: auditLoginFailed, Outcome: outcomeDenied, Actor: anonymous(m),
 		Detail: map[string]any{"reason": reason}}
 	if target != nil {
 		e.TargetKind, e.TargetID, e.TargetName = targetUser, string(target.ID), target.Username
@@ -279,18 +326,19 @@ func loginKey(username string) (key string, isKey bool) {
 //  2. the two fields: a missing username or password is required, more than 128 bytes of username or 1024 bytes of
 //     password is too_long, a password PRECIS refuses (a control character) is invalid → 422 validation_failed;
 //  3. the auth-user-ip and auth-user buckets of this username → 429, with no hashing and no DB access other than
-//     the known-IP read;
+//     the known-IP read. The attempt takes one token from each here, before the hash (passwordAttempt), and gets
+//     them back at every exit below that is not a failed password check;
 //  4. the auth-hash budget → 503 server_busy;
 //  5. exactly one password verification: against the account's hash, or against the dummy hash for an unknown
 //     username and for an account whose hash is NULL (an admin reset is pending), so every attempt costs the same;
-//  6. a wrong password or unknown username → 401 invalid_credentials, the same answer for both; it spends the two
-//     username buckets and writes auth.login_failed;
+//  6. a wrong password or unknown username → 401 invalid_credentials, the same answer for both; it keeps the two
+//     tokens and writes auth.login_failed;
 //  7. only after a correct password: a pending account → 403 account_pending, a disabled one → 403
 //     account_disabled;
 //  8. one Write: the new hash if the stored one had other argon2 parameters (computed before the transaction), the
 //     last-login time, the session (openSession: the old cookie's session goes, the cap of 50 applies) and the
-//     auth.login row. Afterwards this address's auth-user-ip bucket for the username is refilled; auth-user is not,
-//     so a friend's login never hands an attacker a fresh budget.
+//     auth.login row. Afterwards this address's auth-user-ip bucket for the username is refilled; auth-user is as
+//     it was before the attempt, so a friend's login never hands an attacker a fresh budget.
 //
 // The returned token is the raw cookie value; httpapi sets it with SetSessionCookie.
 func (s *Service) Login(ctx context.Context, username, password string, m ReqMeta) (LoginResult, error) {
@@ -322,9 +370,11 @@ func (s *Service) Login(ctx context.Context, username, password string, m ReqMet
 	}
 
 	key, isKey := loginKey(username)
-	if err := s.checkPasswordBuckets(ctx, key, isKey, m); err != nil {
+	attempt, err := s.reservePasswordAttempt(ctx, key, isKey, m)
+	if err != nil {
 		return LoginResult{}, err
 	}
+	defer attempt.release()
 	if err := s.takeHashBudget(ctx, m); err != nil {
 		return LoginResult{}, err
 	}
@@ -346,7 +396,6 @@ func (s *Service) Login(ctx context.Context, username, password string, m ReqMet
 	}
 
 	var ok, rehash bool
-	var err error
 	if found && user.PasswordHash != "" {
 		ok, rehash, err = s.hasher.verify(ctx, pw, user.PasswordHash)
 		if errors.Is(err, errBadHash) {
@@ -363,10 +412,11 @@ func (s *Service) Login(ctx context.Context, username, password string, m ReqMet
 		return LoginResult{}, hashErr("login", err)
 	}
 	if !ok {
+		attempt.failed()
 		if found {
-			s.passwordFailed(ctx, key, &user, failWrongPassword, m)
+			s.auditLoginFailed(ctx, &user, failWrongPassword, m)
 		} else {
-			s.passwordFailed(ctx, key, nil, failUnknownUser, m)
+			s.auditLoginFailed(ctx, nil, failUnknownUser, m)
 		}
 		return LoginResult{}, api.NewError(api.CodeInvalidCredentials)
 	}
@@ -426,7 +476,7 @@ func (s *Service) Login(ctx context.Context, username, password string, m ReqMet
 	if err != nil {
 		return LoginResult{}, serviceErr("login", err)
 	}
-	s.throttle.authUserIP.reset(userIPKey{user: key, ip: IPKey(m.IP)})
+	attempt.loggedIn()
 	s.sessionOpened(&ns)
 	return ns.result, nil
 }

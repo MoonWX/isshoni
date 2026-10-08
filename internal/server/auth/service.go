@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/netip"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/MoonWX/isshoni/internal/protocol/api"
@@ -297,6 +298,9 @@ const (
 
 // ReqMeta is what the service needs to know about the HTTP request behind a call. RequestMeta builds it from a
 // request.
+//
+// It carries a live credential, so it never prints it (README §4: tokens and cookies are never logged): every fmt
+// verb and log/slog show "[redacted]" in place of a session token, and encoding/json leaves the field out.
 type ReqMeta struct {
 	IP        netip.Addr // from 04's ClientIP (trusted-proxy aware)
 	UserAgent string     // only turned into a session name (DescribeUserAgent)
@@ -304,7 +308,44 @@ type ReqMeta struct {
 	// setup or reset completion deletes that old session in the transaction that creates the new one, and then closes
 	// the old session's connections with ReasonSessionRevoked (03 §7.4, §7.7). It is an addition to the two fields of
 	// 03 §7.13: those calls take no request, so the cookie has to travel with them.
-	SessionToken string
+	SessionToken string `json:"-"`
+}
+
+// redactedToken stands for a token wherever a ReqMeta is printed or logged, as in the api DTOs (an empty token
+// stays empty).
+const redactedToken = "[redacted]"
+
+// redact returns m without its session token.
+func (m ReqMeta) redact() ReqMeta {
+	if m.SessionToken != "" {
+		m.SessionToken = redactedToken
+	}
+	return m
+}
+
+// Format implements fmt.Formatter so that no verb (%v, %+v, %#v, %s …) prints the session token: directly, through
+// a pointer, or as a field of another printed value.
+func (m ReqMeta) Format(f fmt.State, verb rune) {
+	type plain ReqMeta // without methods, so that printing it cannot come back here
+	p := plain(m.redact())
+	if verb == 'v' && f.Flag('#') {
+		// %#v names the type: put ReqMeta's name back in place of the local one.
+		_, fields, _ := strings.Cut(fmt.Sprintf("%#v", p), "{")
+		_, _ = fmt.Fprintf(f, "%T{%s", m, fields)
+		return
+	}
+	_, _ = fmt.Fprintf(f, fmt.FormatString(f, verb), p)
+}
+
+// LogValue implements slog.LogValuer: a ReqMeta logged as an attribute is a group of its fields, with the session
+// token redacted. (As a field of a logged struct it goes through Format in the text handler and through
+// encoding/json in the JSON handler.)
+func (m ReqMeta) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("remote_ip", ipString(m.IP)),
+		slog.String("user_agent", m.UserAgent),
+		slog.String("session_token", m.redact().SessionToken),
+	)
 }
 
 // RequestMeta returns the ReqMeta of r: the client IP (Options.ClientIP), the User-Agent header and the value of the

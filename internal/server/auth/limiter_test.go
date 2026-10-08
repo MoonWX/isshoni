@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"net/netip"
+	"runtime"
 	"slices"
 	"sync"
 	"testing"
@@ -104,38 +105,94 @@ func TestLimiterBurstAndRefill(t *testing.T) {
 	}
 }
 
-func TestLimiterCheckSpendReset(t *testing.T) {
+// TestLimiterRefundAndReset: a token that take consumed can be given back (the buckets of failed password checks
+// reserve before the hash, 03 §7.3), and reset refills a bucket.
+func TestLimiterRefundAndReset(t *testing.T) {
 	clk := newFakeClock()
 	l := newLimiter[string](rate{Burst: 5, Every: 2 * time.Minute}, 100, clk.now)
-	if v := l.check("u"); !v.OK || l.size() != 0 {
-		t.Fatalf("check on a new key = %+v with %d keys; want OK and no entry", v, l.size())
+
+	// A token taken and given back leaves no trace: a full bucket has no entry.
+	if v := l.take("u"); !v.OK || l.size() != 1 {
+		t.Fatalf("take on a new key = %+v with %d keys; want OK and one entry", v, l.size())
 	}
-	for i := range 5 {
-		if v := l.check("u"); !v.OK {
-			t.Fatalf("check before failure %d refused", i+1)
-		}
-		l.spend("u")
+	l.refund("u")
+	if l.size() != 0 {
+		t.Fatalf("%d keys after the only token went back, want none", l.size())
 	}
-	v := l.check("u")
-	if v.OK || v.RetryAfter != 2*time.Minute || !v.First {
-		t.Fatalf("check after 5 failures = %+v, want a first refusal with RetryAfter 2m", v)
-	}
-	if v := l.check("u"); v.OK || v.First {
-		t.Fatalf("second check = %+v, want a refusal of the same episode", v)
-	}
-	l.spend("u") // spending an empty bucket keeps it empty, not deeper
-	clk.advance(2 * time.Minute)
-	if v := l.check("u"); !v.OK {
-		t.Fatalf("check after 2m = %+v, want OK", v)
-	}
-	l.spend("u")
-	if v := l.check("u"); v.OK || !v.First {
-		t.Fatalf("check after the next failure = %+v, want a first refusal of a new episode", v)
+	l.refund("u") // nothing to give back
+	l.refund("absent")
+	if l.size() != 0 {
+		t.Fatalf("a refund without a take left %d keys", l.size())
 	}
 
+	// Held tokens count: 5 of them refuse the 6th take, and one given back lets exactly one more through.
+	for i := range 5 {
+		if v := l.take("u"); !v.OK {
+			t.Fatalf("take %d refused: %+v", i+1, v)
+		}
+	}
+	v := l.take("u")
+	if v.OK || v.RetryAfter != 2*time.Minute || !v.First {
+		t.Fatalf("6th take = %+v, want a first refusal with RetryAfter 2m", v)
+	}
+	if v := l.take("u"); v.OK || v.First {
+		t.Fatalf("7th take = %+v, want a refusal of the same episode", v)
+	}
+	l.refund("u")
+	if v := l.take("u"); !v.OK {
+		t.Fatalf("take after a refund = %+v, want OK", v)
+	}
+	if v := l.take("u"); v.OK || v.RetryAfter != 2*time.Minute || !v.First {
+		t.Fatalf("take after the refunded token was used = %+v, want a first refusal of a new episode", v)
+	}
+
+	// The refund is exact whenever it comes: a minute later the bucket is still one minute short of a token, with
+	// or without a take and its refund in between.
+	clk.advance(time.Minute)
+	if v := l.take("u"); v.OK || v.RetryAfter != time.Minute {
+		t.Fatalf("a minute later: %+v, want a refusal with RetryAfter 1m", v)
+	}
+	l.refund("u") // one of the 5 held tokens
+	if v := l.take("u"); !v.OK {
+		t.Fatalf("take after a refund = %+v, want OK", v)
+	}
+	if v := l.take("u"); v.OK || v.RetryAfter != time.Minute {
+		t.Fatalf("after taking the refunded token again: %+v, want RetryAfter 1m as before", v)
+	}
+
+	// Refunds never overfill: more of them than tokens taken leave a full bucket, which still holds only its burst.
+	for range 10 {
+		l.refund("u")
+	}
+	if l.size() != 0 {
+		t.Fatalf("%d keys after every token went back, want none", l.size())
+	}
+	for i := range 5 {
+		if v := l.take("u"); !v.OK {
+			t.Fatalf("take %d of a refilled bucket refused", i+1)
+		}
+	}
+	if v := l.take("u"); v.OK {
+		t.Fatal("the bucket held more than its burst after refunds")
+	}
+
+	// A refund that arrives after the bucket refilled by itself only drops the entry.
+	clk.advance(time.Hour)
+	l.refund("u")
+	if l.size() != 0 {
+		t.Fatalf("%d keys after a late refund, want none", l.size())
+	}
+
+	// reset refills whatever is held.
+	for range 6 {
+		l.take("u")
+	}
 	l.reset("u")
-	if v := l.check("u"); !v.OK || l.size() != 0 {
-		t.Fatalf("after reset: %+v with %d keys", v, l.size())
+	if l.size() != 0 {
+		t.Fatalf("after reset: %d keys", l.size())
+	}
+	if v := l.take("u"); !v.OK {
+		t.Fatalf("take after reset = %+v", v)
 	}
 	l.reset("absent") // no-op
 }
@@ -168,12 +225,12 @@ func TestLimiterEvictsFullBucketsFirst(t *testing.T) {
 	for range 3 {
 		l.take("a") // a: empty, full again in 3 minutes
 	}
-	l.take("b") // b: one token short, full again in a minute
 	for range 3 {
 		l.take("c")
 	}
+	// b: one token short, full again in a minute. It is the most recently used key, and a the least.
+	l.take("b")
 	clk.advance(time.Minute + time.Second) // b is full now; a and c are not
-	l.check("b")                           // b becomes the most recently used key; a is the least
 	if got := keysOf(l); !slices.Equal(got, []string{"b", "c", "a"}) {
 		t.Fatalf("LRU order %v, want [b c a]", got)
 	}
@@ -222,12 +279,10 @@ func TestLimiterListStaysConsistent(t *testing.T) {
 	for i := range 5000 {
 		k := next(80)
 		switch next(4) {
-		case 0:
+		case 0, 1:
 			l.take(k)
-		case 1:
-			l.check(k)
 		case 2:
-			l.spend(k)
+			l.refund(k)
 		case 3:
 			l.reset(k)
 		}
@@ -252,9 +307,10 @@ func TestLimiterConcurrent(t *testing.T) {
 	clk := newFakeClock()
 	l := newLimiter[string](rate{Burst: 100, Every: time.Hour}, 1000, clk.now)
 	small := newLimiter[string](rate{Burst: 2, Every: time.Second}, 10, clk.now) // evicts all the time
+	held := newLimiter[string](rate{Burst: 3, Every: time.Hour}, 10, clk.now)    // tokens are reserved, then refunded
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	passed := 0
+	passed, holders, mostHolders := 0, 0, 0
 	for g := range 8 {
 		wg.Go(func() {
 			for i := range 200 {
@@ -263,11 +319,21 @@ func TestLimiterConcurrent(t *testing.T) {
 					passed++
 					mu.Unlock()
 				}
-				l.check("shared")
+				if held.take("shared").OK {
+					mu.Lock()
+					holders++
+					mostHolders = max(mostHolders, holders)
+					mu.Unlock()
+					runtime.Gosched() // hold the token for a moment
+					mu.Lock()
+					holders--
+					mu.Unlock()
+					held.refund("shared")
+				}
 				key := fmt.Sprint(g, i%20)
 				small.take(key)
-				small.spend(key)
-				small.check(key)
+				small.take(key)
+				small.refund(key)
 				if i%50 == 0 {
 					small.reset(key)
 					clk.advance(time.Second)
@@ -278,6 +344,13 @@ func TestLimiterConcurrent(t *testing.T) {
 	wg.Wait()
 	if passed != 100 {
 		t.Fatalf("%d takes passed, want exactly the burst of 100", passed)
+	}
+	// Reserved tokens: never more holders at once than the burst, and with every token refunded the bucket is full.
+	if mostHolders > 3 || mostHolders == 0 {
+		t.Fatalf("%d goroutines held a token at once, want at most the burst of 3 (and at least 1)", mostHolders)
+	}
+	if held.size() != 0 {
+		t.Fatalf("%d keys left after every reserved token was refunded, want none", held.size())
 	}
 }
 
@@ -366,13 +439,12 @@ func TestNewLimiterRejectsBadRates(t *testing.T) {
 	if v := l.take("k"); v.OK || v.RetryAfter != maxWindow/2 {
 		t.Fatalf("take 3 = %+v, want a refusal with RetryAfter %v", v, maxWindow/2)
 	}
-	l.spend("u")
-	if v := l.check("u"); !v.OK {
-		t.Fatalf("check after one failure = %+v", v)
+	l.refund("k")
+	if v := l.take("k"); !v.OK {
+		t.Fatalf("take after a refund = %+v", v)
 	}
-	l.spend("u")
-	if v := l.check("u"); v.OK || v.RetryAfter != maxWindow/2 {
-		t.Fatalf("check after two failures = %+v, want a refusal with RetryAfter %v", v, maxWindow/2)
+	if v := l.take("k"); v.OK || v.RetryAfter != maxWindow/2 {
+		t.Fatalf("take after the refunded token was used = %+v, want a refusal with RetryAfter %v", v, maxWindow/2)
 	}
 }
 
@@ -397,6 +469,9 @@ func TestThrottleRates(t *testing.T) {
 		{"block log line", 1, time.Minute, func() verdict { return th.blockLog.take(ip) }},
 		{"login_failed audit", 600, 6 * time.Second, func() verdict { return th.loginFailedAudit.take(struct{}{}) }},
 		{"global throttled audit", 1, time.Hour, func() verdict { return th.globalThrottledAudit.take(struct{}{}) }},
+		// The two buckets of failed password checks: the service takes before the hash and refunds what was no failure.
+		{"auth-user-ip", 5, 2 * time.Minute, func() verdict { return th.authUserIP.take(userIPKey{"alex", ip}) }},
+		{"auth-user", 30, 2 * time.Minute, func() verdict { return th.authUser.take("alex") }},
 	}
 	for _, tc := range takes {
 		for i := range tc.burst {
@@ -408,39 +483,14 @@ func TestThrottleRates(t *testing.T) {
 			t.Errorf("%s: take %d = %+v, want a refusal with RetryAfter %v", tc.name, tc.burst+1, v, tc.every)
 		}
 	}
-	failures := []struct {
-		name         string
-		burst        int
-		every        time.Duration
-		check        func() verdict
-		spend        func()
-		otherKeyIsOK func() bool
-	}{
-		{"auth-user-ip", 5, 2 * time.Minute,
-			func() verdict { return th.authUserIP.check(userIPKey{"alex", ip}) },
-			func() { th.authUserIP.spend(userIPKey{"alex", ip}) },
-			func() bool {
-				other := IPKey(netip.MustParseAddr("203.0.113.9"))
-				return th.authUserIP.check(userIPKey{"alex", other}).OK && th.authUserIP.check(userIPKey{"sam", ip}).OK
-			}},
-		{"auth-user", 30, 2 * time.Minute,
-			func() verdict { return th.authUser.check("alex") },
-			func() { th.authUser.spend("alex") },
-			func() bool { return th.authUser.check("sam").OK }},
+	// An emptied bucket blocks its own key only: another address for the same username, another username at the
+	// same address, another username.
+	other := IPKey(netip.MustParseAddr("203.0.113.9"))
+	if !th.authUserIP.take(userIPKey{"alex", other}).OK || !th.authUserIP.take(userIPKey{"sam", ip}).OK {
+		t.Error("auth-user-ip: another key is blocked too")
 	}
-	for _, tc := range failures {
-		for range tc.burst {
-			if v := tc.check(); !v.OK {
-				t.Fatalf("%s: refused before %d failures", tc.name, tc.burst)
-			}
-			tc.spend()
-		}
-		if v := tc.check(); v.OK || v.RetryAfter != tc.every {
-			t.Errorf("%s: after %d failures = %+v, want a refusal with RetryAfter %v", tc.name, tc.burst, v, tc.every)
-		}
-		if !tc.otherKeyIsOK() {
-			t.Errorf("%s: another key is blocked too", tc.name)
-		}
+	if !th.authUser.take("sam").OK {
+		t.Error("auth-user: another key is blocked too")
 	}
 }
 
@@ -460,7 +510,7 @@ func TestHashBudgetCapsAnonymousHashes(t *testing.T) {
 		_, _ = rand.Read(a[2:8]) // a random /64 in 2001::/16
 		ip := IPKey(netip.AddrFrom16(a))
 		user := "user-" + rand.Text()
-		if !th.authIP.take(ip).OK || !th.authUserIP.check(userIPKey{user, ip}).OK || !th.authUser.check(user).OK {
+		if !th.authIP.take(ip).OK || !th.authUserIP.take(userIPKey{user, ip}).OK || !th.authUser.take(user).OK {
 			t.Fatal("a fresh address and username was throttled")
 		}
 		if v := th.authHash.take(struct{}{}); v.OK {

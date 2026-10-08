@@ -3,9 +3,12 @@ package auth
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -388,6 +391,87 @@ func TestNewWithoutAlerter(t *testing.T) {
 	}
 	if !strings.Contains(e.logs.String(), "kind=secrets_rotated") {
 		t.Errorf("the alert was not logged:\n%s", e.logs.String())
+	}
+}
+
+// TestReqMetaNeverPrintsTheToken: a ReqMeta carries the raw session cookie, and no fmt verb, slog handler or JSON
+// encoding shows it (README §4: tokens and cookies are never logged). The other two fields stay readable.
+func TestReqMetaNeverPrintsTheToken(t *testing.T) {
+	token := newToken(sessionTokenBytes)
+	m := ReqMeta{IP: netip.MustParseAddr(ipA), UserAgent: "TestBrowser/1.0", SessionToken: token}
+	type call struct {
+		Name string
+		Meta ReqMeta
+	}
+	nested := call{Name: "login", Meta: m}
+	leaks := func(out string) bool {
+		return strings.Contains(out, token) || strings.Contains(out, token[:12]) ||
+			strings.Contains(strings.ToLower(out), hex.EncodeToString([]byte(token))[:24])
+	}
+
+	outputs := map[string]string{}
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%x", "%X", "%d"} {
+		for name, v := range map[string]any{"ReqMeta": m, "*ReqMeta": &m, "struct": nested, "*struct": &nested,
+			"slice": []ReqMeta{m}, "map": map[string]ReqMeta{"k": m}} {
+			outputs["fmt "+verb+" "+name] = fmt.Sprintf(verb, v)
+		}
+	}
+	for name, h := range map[string]func(*bytes.Buffer) slog.Handler{
+		"json": func(b *bytes.Buffer) slog.Handler { return slog.NewJSONHandler(b, nil) },
+		"text": func(b *bytes.Buffer) slog.Handler { return slog.NewTextHandler(b, nil) },
+	} {
+		var b bytes.Buffer
+		slog.New(h(&b)).Info("x", "meta", m, "ptr", &m, "call", nested, "callptr", &nested,
+			"group", slog.GroupValue(slog.Any("meta", m)))
+		outputs["slog "+name+" handler"] = b.String()
+	}
+	for name, v := range map[string]any{"ReqMeta": m, "*ReqMeta": &m, "struct": nested} {
+		j, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("json.Marshal(%s): %v", name, err)
+		}
+		outputs["json.Marshal "+name] = string(j)
+	}
+	for name, out := range outputs {
+		if leaks(out) {
+			t.Errorf("%s printed the session token: %s", name, out)
+		}
+	}
+
+	// What is printed instead: the placeholder, next to the address and the User-Agent.
+	if got, want := fmt.Sprintf("%v", m), "{"+ipA+" TestBrowser/1.0 [redacted]}"; got != want {
+		t.Errorf("%%v = %s, want %s", got, want)
+	}
+	if got, want := fmt.Sprintf("%+v", &nested),
+		"&{Name:login Meta:{IP:"+ipA+" UserAgent:TestBrowser/1.0 SessionToken:[redacted]}}"; got != want {
+		t.Errorf("%%+v of a struct that holds one = %s, want %s", got, want)
+	}
+	if got := fmt.Sprintf("%#v", m); !strings.HasPrefix(got, "auth.ReqMeta{IP:") ||
+		!strings.HasSuffix(got, `UserAgent:"TestBrowser/1.0", SessionToken:"[redacted]"}`) {
+		t.Errorf("%%#v = %s", got)
+	}
+	if got, want := outputs["json.Marshal ReqMeta"], `{"IP":"`+ipA+`","UserAgent":"TestBrowser/1.0"}`; got != want {
+		t.Errorf("json.Marshal = %s, want %s", got, want)
+	}
+	var b bytes.Buffer
+	slog.New(slog.NewTextHandler(&b, &slog.HandlerOptions{ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+		if a.Key == slog.TimeKey {
+			return slog.Attr{}
+		}
+		return a
+	}})).Info("x", "meta", m)
+	if got, want := b.String(), "level=INFO msg=x meta.remote_ip="+ipA+
+		" meta.user_agent=TestBrowser/1.0 meta.session_token=[redacted]\n"; got != want {
+		t.Errorf("slog text = %q, want %q", got, want)
+	}
+
+	// No cookie, no placeholder: an empty token stays empty.
+	m.SessionToken = ""
+	if got, want := fmt.Sprintf("%+v", m), "{IP:"+ipA+" UserAgent:TestBrowser/1.0 SessionToken:}"; got != want {
+		t.Errorf("%%+v without a token = %s, want %s", got, want)
+	}
+	if got := m.LogValue().String(); strings.Contains(got, "redacted") {
+		t.Errorf("LogValue without a token = %s", got)
 	}
 }
 
