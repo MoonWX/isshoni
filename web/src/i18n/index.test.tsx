@@ -3,7 +3,14 @@ import { useTranslation } from 'react-i18next';
 import { describe, expect, it } from 'vitest';
 
 import en from './en.json';
-import { DEFAULT_LANGUAGE, i18n, initI18n } from './index';
+import { addMessages, DEFAULT_LANGUAGE, i18n, initI18n, type Messages } from './index';
+
+/** The lazy namespaces' files (lazy/<ns>.en.json), by namespace. */
+const lazyFiles = Object.fromEntries(
+  Object.entries(import.meta.glob<Messages>('./lazy/*.en.json', { eager: true, import: 'default' })).map(
+    ([file, messages]) => [file.replace(/^\.\/lazy\/(\w+)\.en\.json$/, '$1'), messages],
+  ),
+);
 
 describe('initI18n', () => {
   it('is ready as soon as it returns (bundled catalog, no async init)', () => {
@@ -37,8 +44,49 @@ describe('initI18n', () => {
   });
 });
 
-describe('en.json', () => {
-  it('has only non-empty strings as leaves', () => {
+describe('initI18n in tests', () => {
+  it('loads every lazy namespace up front: a test renders a page without its folder’s entry module', () => {
+    expect(Object.keys(lazyFiles).sort()).toEqual(['account', 'admin', 'setup']);
+    expect(i18n.t('admin.title')).toBe('Admin');
+    expect(i18n.t('account.back')).toBe('Back to isshoni');
+    expect(i18n.t('setup.steps.label')).toBe('Setup');
+  });
+});
+
+describe('addMessages', () => {
+  it('adds messages under their full keys and leaves the rest of the catalog alone', () => {
+    expect(i18n.exists('itestAdd.hello')).toBe(false);
+    addMessages({ itestAdd: { hello: 'Hello', nested: { one: 'One' } } });
+    expect(i18n.t('itestAdd.hello')).toBe('Hello');
+    expect(i18n.t('itestAdd.nested.one')).toBe('One');
+    expect(i18n.t('common.appName')).toBe('isshoni');
+  });
+
+  it('merges into a namespace that is there, replacing the keys it brings', () => {
+    addMessages({ itestMerge: { kept: 'Kept', nested: { one: 'One' }, text: 'Old' } });
+    addMessages({ itestMerge: { nested: { two: 'Two' }, text: 'New' } });
+    expect(i18n.t('itestMerge.kept')).toBe('Kept');
+    expect(i18n.t('itestMerge.nested.one')).toBe('One');
+    expect(i18n.t('itestMerge.nested.two')).toBe('Two');
+    expect(i18n.t('itestMerge.text')).toBe('New');
+  });
+
+  it('adding the same messages again changes nothing', () => {
+    const admin = lazyFiles['admin'];
+    expect(admin).toBeDefined();
+    const before = JSON.stringify(i18n.getResourceBundle(DEFAULT_LANGUAGE, 'translation'));
+    if (admin) addMessages(admin);
+    expect(JSON.stringify(i18n.getResourceBundle(DEFAULT_LANGUAGE, 'translation'))).toBe(before);
+  });
+});
+
+describe('the catalog files', () => {
+  const files: [string, unknown][] = [
+    ['en.json', en],
+    ...Object.entries(lazyFiles).map(([ns, m]) => [`lazy/${ns}.en.json`, m] as [string, unknown]),
+  ];
+
+  it.each(files)('%s has only non-empty strings as leaves', (_file, catalog) => {
     const bad: string[] = [];
     const walk = (node: unknown, path: string): void => {
       if (typeof node === 'string') {
@@ -49,8 +97,15 @@ describe('en.json', () => {
         bad.push(path);
       }
     };
-    walk(en, '');
+    walk(catalog, '');
     expect(bad).toEqual([]);
+  });
+
+  it('a lazy file holds its own namespace, which en.json leaves to it', () => {
+    for (const [ns, messages] of Object.entries(lazyFiles)) {
+      expect(Object.keys(messages)).toEqual([ns]);
+      expect(Object.keys(en)).not.toContain(ns);
+    }
   });
 });
 

@@ -6,6 +6,11 @@
 // SettingsPage, AuditPage and DoctorPage. DashboardPage (/admin) and DoctorPage (/admin/doctor) join the others
 // when they exist (the dashboard, doctor and bandwidth slice); until then their routes render the router's
 // PageUnavailable inside AdminLayout, whose navigation already lists them.
+//
+// The pages' texts, the `admin` namespace, come with this chunk and not with the main bundle (05 §16.5): the import
+// below adds them to the catalog before the router has any of the pages.
+import '../i18n/lazy/admin';
+
 export { AdminLayout } from './AdminLayout';
 export { ApprovalsPage } from './ApprovalsPage';
 export { AuditPage } from './AuditPage';

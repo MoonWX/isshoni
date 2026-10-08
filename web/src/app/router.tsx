@@ -15,6 +15,10 @@
 // no route here changes. A lazy folder is one chunk, loaded on the first visit to one of its routes; rooms/ is
 // bundled eagerly (the room is the main page, 05 §5).
 //
+// A lazy folder's texts can come with it: its entry module imports the lazy namespaces its pages use
+// (i18n/lazy/<ns>.ts, 05 §16.5), and those are in the catalog once the entry module has run. A route's `lazy`
+// below resolves only after that, so a page is never rendered without its texts and the routes need no code for it.
+//
 // No route segment contains a dot: 04 §9.5 serves dotted paths as files.
 import type { ComponentType } from 'react';
 import { Outlet, type RouteObject } from 'react-router';
