@@ -1,11 +1,15 @@
 package auth
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/netip"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/MoonWX/isshoni/internal/protocol/api"
@@ -14,28 +18,49 @@ import (
 
 // This file declares the whole Go API of 03 §7.13 (README S24, "interfaces first"): the Service with every M1 method
 // (the four M2 device-flow methods come with their DTOs, see "later (M2)" below), Options, New, Principal, ActorOf,
-// ConnSelector, ConnCloser, LoginResult, RegisterResult, UserChange and the smaller types. The bodies come later:
-// sessions, login and setup with README S30, then invites and registration, self-service, admin users and the
-// janitor with the later auth slices (03 §18 slices 6–13). Until then every method with an error result returns
-// notImplemented(method): an error that names the method and wraps *api.Error{internal}, so an HTTP handler that
-// calls it answers 500 internal (api has no not_implemented code).
-// The pure functions (Principal.IsAdmin, ActorOf, IPKey, NormalizeUsername, CheckPassword, DescribeUserAgent) work.
+// ConnSelector, ConnCloser, LoginResult, RegisterResult, UserChange and the smaller types.
+//
+// README S30 filled in New (this file; the key-rotation purge is in tokens.go), the sessions and the CSRF wrapper
+// (session.go), login and logout (login.go) and setup (setup.go). The methods still declared below come with the
+// later auth slices (03 §18 slices 8–13: invites and registration, self-service, admin users, the janitor). Until
+// then each one with an error result returns notImplemented(method): an error that names the method and wraps
+// *api.Error{internal}, so an HTTP handler that calls it answers 500 internal (api has no not_implemented code).
 //
 // All service errors are *api.Error (03 §12.2) carrying a stable code, so httpapi maps them to statuses in one
-// table. The one exception is ErrNoCookie, which only the /ws adapter sees (03 §7.6); AuthenticateCookie returns
-// *api.Error{unauthenticated} for an invalid, expired or non-active session and passes any other error through.
+// table: an unexpected failure (the store, a cancelled context) wraps both its cause and *api.Error{internal}
+// (internalErr). The one exception is ErrNoCookie, which only the /ws adapter sees (03 §7.6); AuthenticateCookie
+// returns *api.Error{unauthenticated} for an invalid, expired or non-active session.
 
 // notImplemented is the error of a Service method whose slice has not landed yet.
 func notImplemented(method string) error {
 	return fmt.Errorf("auth: %s not implemented: %w", method, api.NewError(api.CodeInternal))
 }
 
+// internalErr wraps an unexpected failure of op. The result is an *api.Error{internal} for errors.As (03 §7.13) and
+// keeps err for errors.Is and for the log line of httpapi.WriteError; the cause never reaches the client.
+func internalErr(op string, err error) error {
+	return fmt.Errorf("auth: %s: %w (%w)", op, err, api.NewError(api.CodeInternal))
+}
+
+// serviceErr returns err as a service error: an *api.Error stays as it is, anything else becomes internalErr.
+func serviceErr(op string, err error) error {
+	var ae *api.Error
+	if errors.As(err, &ae) {
+		return err
+	}
+	return internalErr(op, err)
+}
+
+// errUnauthenticated is the answer for a missing, invalid or expired credential and for a user who is not active.
+func errUnauthenticated() error { return api.NewError(api.CodeUnauthenticated) }
+
 // ---- construction ----
 
 // Origins are the server's public origins (04's Site.Origin). They are fixed for the process lifetime: config changes
 // need a restart (04 §4).
 type Origins struct {
-	// Primary builds the setup, invite, reset and (M2) link URLs, e.g. "https://watch.example.com".
+	// Primary builds the setup, invite, reset and (M2) link URLs, e.g. "https://watch.example.com". Its scheme also
+	// picks the session cookie: __Host-isshoni_session with Secure for https, isshoni_session for plain http (dev).
 	Primary string
 	// Public are the origins trusted by the REST CSRF check: [Site.Origin] in M1, since 04's Host check admits no
 	// other host. Dev needs nothing extra: task dev sets public_url to the Vite origin (06 §7.3). 01's WebSocket
@@ -48,9 +73,10 @@ type Options struct {
 	// Keys are the token-hashing keys from secrets.json (04), 32 bytes each.
 	Keys Keys
 	// Origins returns 04's Site.Origin as Origins. It is fixed for the process lifetime (config changes need a
-	// restart, 04 §4); 01's WebSocket allowlist (Config.PublicOrigin) uses the same Site.Origin.
+	// restart, 04 §4), so New calls it once; 01's WebSocket allowlist (Config.PublicOrigin) uses the same
+	// Site.Origin. Required.
 	Origins func() Origins
-	// ClientIP is 04's trusted-proxy-aware httpapi.ClientIP.
+	// ClientIP is 04's trusted-proxy-aware httpapi.ClientIP. nil means the TCP peer of the request.
 	ClientIP func(*http.Request) netip.Addr
 	// Conns closes WebSocket connections on revocation (03 §7.7): the wiring's adapter over 01's
 	// Hub.CloseConnections. nil is a no-op, only in unit tests and offline CLI commands (admin-socket commands run in
@@ -64,21 +90,120 @@ type Options struct {
 	Hashes HashBudget
 	// Clock is the service's clock; nil means time.Now.
 	Clock func() time.Time
-	// Logger is the server logger; nil means slog.Default().
+	// Logger is the server logger; the service adds component=auth. nil means slog.Default().
 	Logger *slog.Logger
 }
 
 // Service is 03's account service: sessions, setup, login, registration, invites, self-service, admin actions and the
 // janitor (03 §7). Build it with New. It is safe for concurrent use.
 type Service struct {
-	// The state (store, keys, hasher, throttles, CSRF guard, session cache) comes with README S30.
+	db       *store.DB
+	keys     Keys
+	origins  Origins // Primary is normalized (normalizeOrigin)
+	clientIP func(*http.Request) netip.Addr
+	conns    ConnCloser   // nil: no connections to close
+	alerts   AdminAlerter // nil: alerts are only logged
+	now      func() time.Time
+	log      *slog.Logger
+
+	hasher   *hasher
+	throttle *throttles
+	csrf     *CSRFGuard
+	cookie   sessionCookie
+	sessions *sessionCache
 }
 
-// New builds the service (03 §7.13): it validates the keys, checks their fingerprints and purges the rows a rotated
-// key invalidated (§4.6: the deleted rows, the secrets.rotated audit row and the secrets_rotated alert), and computes
-// the dummy hash. It starts no goroutine; RunJanitor is the service's only long-running call.
+// New builds the service (03 §7.13): it validates the keys and the origins, computes the dummy hash, then checks the
+// key fingerprints and purges the rows a rotated key invalidated (§4.6: the purged rows, the secrets.rotated audit
+// row and the secrets_rotated alert). It starts no goroutine; RunJanitor is the service's only long-running call.
+//
+// The wiring calls it once at startup, before serving (04 §6.6). Its errors are plain errors (a bad option, or the
+// store), not *api.Error.
 func New(ctx context.Context, db *store.DB, o Options) (*Service, error) {
-	return nil, notImplemented("New")
+	if db == nil {
+		return nil, errors.New("auth: New: the store is nil")
+	}
+	if err := o.Keys.validate(); err != nil {
+		return nil, err
+	}
+	if o.Origins == nil {
+		return nil, errors.New("auth: New: Options.Origins is nil")
+	}
+	origins := o.Origins()
+	primary, err := normalizeOrigin(origins.Primary)
+	if err != nil {
+		return nil, fmt.Errorf("auth: New: the primary origin is not usable: %w", err)
+	}
+	csrf, err := NewCSRFGuard(origins.Public)
+	if err != nil {
+		return nil, err
+	}
+	clock := o.Clock
+	if clock == nil {
+		clock = time.Now
+	}
+	log := o.Logger
+	if log == nil {
+		log = slog.Default()
+	}
+	clientIP := o.ClientIP
+	if clientIP == nil {
+		clientIP = peerIP
+	}
+	throttle, err := newThrottles(clock, o.Hashes)
+	if err != nil {
+		return nil, err
+	}
+	// The last of the option checks, and the slow one: it computes the dummy hash with the configured parameters.
+	h, err := newHasher(o.Argon, 0, nil)
+	if err != nil {
+		return nil, err
+	}
+	s := &Service{
+		db: db,
+		// Copies, so that the caller may wipe its own key slices.
+		keys:     Keys{Session: bytes.Clone(o.Keys.Session), Invite: bytes.Clone(o.Keys.Invite)},
+		origins:  Origins{Primary: primary, Public: slices.Clone(origins.Public)},
+		clientIP: clientIP,
+		conns:    o.Conns,
+		alerts:   o.Alerts,
+		now:      clock,
+		log:      log.With(slog.String("component", "auth")),
+		hasher:   h,
+		throttle: throttle,
+		csrf:     csrf,
+		cookie:   cookieFor(primary),
+		sessions: newSessionCache(),
+	}
+	rotated, err := s.syncKeyFingerprints(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(rotated) > 0 {
+		// After the commit (03 §7.11). No connection exists yet, so there is none to close (03 §7.7).
+		s.log.LogAttrs(ctx, slog.LevelWarn, "token keys changed since the last start; the tokens they protected are gone",
+			slog.Any("keys", rotated))
+		s.alert(ctx, AdminAlert{Kind: AlertSecretsRotated, Actor: store.SystemActor.Name, At: s.now()})
+	}
+	return s, nil
+}
+
+// peerIP is the ClientIP of a nil Options.ClientIP: the TCP peer, unmapped and without a zone; the zero Addr when
+// RemoteAddr is not an IP address.
+func peerIP(r *http.Request) netip.Addr {
+	if ap, err := netip.ParseAddrPort(r.RemoteAddr); err == nil {
+		return ap.Addr().Unmap().WithZone("")
+	}
+	return netip.Addr{}
+}
+
+// ipString is an IP in the form the store keeps (03 §3.3): netip.Addr.String() with IPv4-mapped addresses unmapped
+// and no zone; "" for the zero Addr (an unknown peer).
+func ipString(ip netip.Addr) string {
+	if !ip.IsValid() {
+		return ""
+	}
+	return ip.Unmap().WithZone("").String()
 }
 
 // ---- principals ----
@@ -109,11 +234,7 @@ func (p Principal) IsAdmin() bool { return p.Role == store.RoleAdmin }
 // stored in the form of 03 §3.3 (netip.Addr.String(), IPv4-mapped addresses unmapped, no zone); the zero Addr (an
 // unknown peer) is stored as "".
 func ActorOf(p Principal, ip netip.Addr) store.Actor {
-	a := store.Actor{Kind: store.ActorUser, UserID: p.UserID, Name: p.Username}
-	if ip.IsValid() {
-		a.IP = ip.Unmap().WithZone("").String()
-	}
-	return a
+	return store.Actor{Kind: store.ActorUser, UserID: p.UserID, Name: p.Username, IP: ipString(ip)}
 }
 
 // ---- revocation (03 §7.7) ----
@@ -175,10 +296,66 @@ const (
 
 // ---- request metadata, links and results ----
 
-// ReqMeta is what the service needs to know about the HTTP request behind a call.
+// ReqMeta is what the service needs to know about the HTTP request behind a call. RequestMeta builds it from a
+// request.
+//
+// It carries a live credential, so it never prints it (README §4: tokens and cookies are never logged): every fmt
+// verb and log/slog show "[redacted]" in place of a session token, and encoding/json leaves the field out.
 type ReqMeta struct {
 	IP        netip.Addr // from 04's ClientIP (trusted-proxy aware)
 	UserAgent string     // only turned into a session name (DescribeUserAgent)
+	// SessionToken is the value of the session cookie the request arrived with, "" for none. A login, registration,
+	// setup or reset completion deletes that old session in the transaction that creates the new one, and then closes
+	// the old session's connections with ReasonSessionRevoked (03 §7.4, §7.7). It is an addition to the two fields of
+	// 03 §7.13: those calls take no request, so the cookie has to travel with them.
+	SessionToken string `json:"-"`
+}
+
+// redactedToken stands for a token wherever a ReqMeta is printed or logged, as in the api DTOs (an empty token
+// stays empty).
+const redactedToken = "[redacted]"
+
+// redact returns m without its session token.
+func (m ReqMeta) redact() ReqMeta {
+	if m.SessionToken != "" {
+		m.SessionToken = redactedToken
+	}
+	return m
+}
+
+// Format implements fmt.Formatter so that no verb (%v, %+v, %#v, %s …) prints the session token: directly, through
+// a pointer, or as a field of another printed value.
+func (m ReqMeta) Format(f fmt.State, verb rune) {
+	type plain ReqMeta // without methods, so that printing it cannot come back here
+	p := plain(m.redact())
+	if verb == 'v' && f.Flag('#') {
+		// %#v names the type: put ReqMeta's name back in place of the local one.
+		_, fields, _ := strings.Cut(fmt.Sprintf("%#v", p), "{")
+		_, _ = fmt.Fprintf(f, "%T{%s", m, fields)
+		return
+	}
+	_, _ = fmt.Fprintf(f, fmt.FormatString(f, verb), p)
+}
+
+// LogValue implements slog.LogValuer: a ReqMeta logged as an attribute is a group of its fields, with the session
+// token redacted. (As a field of a logged struct it goes through Format in the text handler and through
+// encoding/json in the JSON handler.)
+func (m ReqMeta) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("remote_ip", ipString(m.IP)),
+		slog.String("user_agent", m.UserAgent),
+		slog.String("session_token", m.redact().SessionToken),
+	)
+}
+
+// RequestMeta returns the ReqMeta of r: the client IP (Options.ClientIP), the User-Agent header and the value of the
+// session cookie, if the request has one.
+func (s *Service) RequestMeta(r *http.Request) ReqMeta {
+	m := ReqMeta{IP: s.clientIP(r), UserAgent: r.UserAgent()}
+	if tok, ok := s.cookie.read(r); ok {
+		m.SessionToken = tok
+	}
+	return m
 }
 
 // Link is a one-time URL with a token in its fragment: /setup#t, /invite#t, /reset#t.
@@ -195,87 +372,20 @@ type LoginResult struct {
 }
 
 // ---- HTTP integration (03 §7.4–7.6) ----
-
-// Authenticate returns the caller of a REST request: the session cookie in M1 (bearer tokens in M2). A missing,
-// invalid or expired credential, or a user who is not active, is *api.Error{unauthenticated}. In M1 so is any
-// Authorization header (03 §7.5): httpapi's /api/v1 chain already answers such a request with 401 before its CSRF
-// step, on every route, and Authenticate rejects the header too for any other caller.
-func (s *Service) Authenticate(r *http.Request) (Principal, error) {
-	return Principal{}, notImplemented("Authenticate")
-}
-
-// AuthenticateCookie is Authenticate for /ws only (03 §7.6): the session cookie, never rotated, ignoring
-// Authorization. A request without the cookie returns ErrNoCookie; an invalid, expired or non-active session returns
-// *api.Error{unauthenticated}; any other error is passed through.
-func (s *Service) AuthenticateCookie(r *http.Request) (Principal, error) {
-	return Principal{}, notImplemented("AuthenticateCookie")
-}
-
-// Touch is the hub's Revalidate (03 §7.4, §7.6): it checks on every call that the session (or, in M2, the device) and
-// the user are still valid, and records the use at most once per 5 min, best effort. Only *api.Error{unauthenticated}
-// means the credential is gone.
-func (s *Service) Touch(ctx context.Context, p Principal, ip netip.Addr) error {
-	return notImplemented("Touch")
-}
-
-// MaybeRotate is the REST chain's rotation step (03 §7.4): once a session's token is 24 h old, it issues a new token
-// and sets the cookie. Not implemented yet: it rotates nothing.
-func (s *Service) MaybeRotate(w http.ResponseWriter, p Principal) {}
-
-// SetSessionCookie sets the session cookie (03 §7.4): __Host-isshoni_session for an https origin, isshoni_session
-// without Secure for a plain-http dev origin; Max-Age is the time left until idleExpires. Not implemented yet: it
-// sets nothing.
-func (s *Service) SetSessionCookie(w http.ResponseWriter, token string, idleExpires time.Time) {}
-
-// ClearSessionCookie expires the session cookie. Not implemented yet: it sets nothing.
-func (s *Service) ClearSessionCookie(w http.ResponseWriter) {}
-
-// CSRF wraps next in the REST cross-origin and Content-Type check (03 §7.5), a CSRFGuard built from
-// Options.Origins().Public. Not implemented yet: the returned handler fails closed and answers every request with
-// 500 {"error":{"code":"internal"}}, without calling next.
-func (s *Service) CSRF(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		writeErrorEnvelope(w, http.StatusInternalServerError, api.CodeInternal)
-	})
-}
+//
+// Authenticate, AuthenticateCookie, Touch, MaybeRotate, SetSessionCookie, ClearSessionCookie and CSRF are in
+// session.go.
 
 // ---- setup (03 §7.8) ----
-
-// SetupAvailable is true while no admin row exists, whatever its status.
-func (s *Service) SetupAvailable(ctx context.Context) (bool, error) {
-	return false, notImplemented("SetupAvailable")
-}
-
-// IssueSetupToken replaces every setup token with a new one valid for 24 h and returns its /setup#token link; with an
-// admin present it returns *api.Error{setup_unavailable}. 04's `isshoni setup-url` calls it with store.CLIActor.
-func (s *Service) IssueSetupToken(ctx context.Context, a store.Actor) (Link, error) {
-	return Link{}, notImplemented("IssueSetupToken")
-}
-
-// CheckSetupToken answers POST /api/v1/auth/setup/check: nil for a live token.
-func (s *Service) CheckSetupToken(ctx context.Context, token string, m ReqMeta) error {
-	return notImplemented("CheckSetupToken")
-}
-
-// CompleteSetup creates the first admin and its session (POST /api/v1/auth/setup/complete).
-func (s *Service) CompleteSetup(ctx context.Context, in SetupInput, m ReqMeta) (LoginResult, error) {
-	return LoginResult{}, notImplemented("CompleteSetup")
-}
+//
+// SetupAvailable, IssueSetupToken, CheckSetupToken and CompleteSetup are in setup.go.
 
 // SetupInput is the body of POST /api/v1/auth/setup/complete.
 type SetupInput struct{ Token, Username, Password, ServerName string }
 
 // ---- login, registration (03 §7.4, §7.9) ----
-
-// Login checks a username and password and creates a session.
-func (s *Service) Login(ctx context.Context, username, password string, m ReqMeta) (LoginResult, error) {
-	return LoginResult{}, notImplemented("Login")
-}
-
-// Logout deletes the principal's session (or, in M2, device) and closes its WebSockets with ReasonLoggedOut.
-func (s *Service) Logout(ctx context.Context, p Principal, m ReqMeta) error {
-	return notImplemented("Logout")
-}
+//
+// Login and Logout are in login.go.
 
 // LogoutEverywhere deletes every session and device of the principal's user.
 func (s *Service) LogoutEverywhere(ctx context.Context, p Principal, m ReqMeta) error {
