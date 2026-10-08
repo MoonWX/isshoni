@@ -1,0 +1,59 @@
+/*
+ * The room header: one row, with the room on the left (its name, the switcher, the people count) and the actions
+ * on the right. When it gets tight the room's name gives way first (it truncates); when even that isn't enough, on
+ * a narrow window with the share controls, the actions wrap below.
+ */
+
+.header {
+  position: relative;
+  z-index: var(--z-header);
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-2);
+  align-items: center;
+  min-height: calc(var(--tap-target) + 2 * var(--space-2));
+  padding: calc(var(--space-2) + var(--safe-top)) calc(var(--space-3) + var(--safe-right)) var(--space-2)
+    calc(var(--space-3) + var(--safe-left));
+  background-color: var(--color-surface);
+  border-bottom: var(--border-width) solid var(--color-border);
+}
+
+/* Its basis is a floor, not the name's width: a long name doesn't push the actions to a second row. */
+.lead {
+  display: flex;
+  flex: 1 1 14rem;
+  gap: var(--space-2);
+  align-items: center;
+  min-width: 0;
+}
+
+.mark {
+  flex: none;
+}
+
+.name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-bold);
+  letter-spacing: -0.01em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Two classes, so the colour wins over the button's own whatever order the stylesheets load in. */
+.header .people {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-muted);
+}
+
+.actions {
+  display: flex;
+  flex: none;
+  gap: var(--space-2);
+  align-items: center;
+  margin-inline-start: auto;
+}

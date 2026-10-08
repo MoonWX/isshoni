@@ -1,0 +1,12 @@
+/* The room's empty state, on the stage's black (viewer/Stage centres it in a column). */
+
+.title {
+  font-size: var(--text-lg);
+  font-weight: var(--weight-medium);
+  text-wrap: balance;
+}
+
+.note {
+  font-size: var(--text-sm);
+  opacity: 0.85;
+}
