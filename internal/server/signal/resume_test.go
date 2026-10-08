@@ -829,6 +829,7 @@ func TestResumeLosesToClose(t *testing.T) {
 		if err := c.CloseWith(websocket.StatusNormalClosure); err != nil {
 			t.Fatal(err)
 		}
+		synctest.Wait() // the socket's end is in the actor's inbox, before the hello gets there
 		c2 := e.mustDial(headers(cookie, testOrigin, ""))
 		reqID := request(t, c2, protocol.MessageTypeHello, resumeHello(w.ResumeToken))
 		synctest.Wait() // the hello waits for the actor, behind the socket's end

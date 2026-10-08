@@ -2,6 +2,7 @@ package signal_test
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -125,19 +126,6 @@ func TestMessageRules(t *testing.T) {
 			t.Errorf("re %q", re)
 		}
 
-		// share.start in a room is the shares slice's (README S40): error{internal} with a ref, logged at WARN.
-		join(t, c, "lounge")
-		id = request(t, c, protocol.MessageTypeShareStart, protocol.ShareStart{Kind: protocol.ShareKindScreen,
-			Preset: protocol.PresetAuto, Ref: "r3"})
-		pe, re = expectError(t, c, protocol.ErrorCodeInternal, protocol.ErrorScopeRequest)
-		ref, _ := pe.Params["ref"].(string)
-		if re != id || len(ref) != 8 || !pe.Retryable {
-			t.Errorf("re %q, ref %q, retryable %v", re, ref, pe.Retryable)
-		}
-		if e.logs.count("level=WARN", "not implemented yet", "ref="+ref, "type=share.start") != 1 {
-			t.Errorf("no WARN line for ref %s:\n%s", ref, e.logs)
-		}
-
 		// Notifications with bad payloads are dropped; a pc.* notification gets bad_request with scope pc.
 		if err := c.SendRaw([]byte(`{"type":"caps.update","data":{"caps":{"decode":"opus"}}}`)); err != nil {
 			t.Fatal(err)
@@ -181,40 +169,53 @@ func TestMessageBadEnvelope(t *testing.T) {
 	}
 }
 
-// Every client message × every role against 01 §6.3: a disallowed message gets forbidden (scope request, or pc for
-// pc.*); an allowed one never does.
+// Every client message × every role against 01 §6.3, outside a room and in one, against the fake MediaPlane: a
+// disallowed message gets forbidden (scope request, or pc for pc.*) and never reaches the MediaPeer; an allowed one
+// is never forbidden, and in a room it makes the MediaPeer call that belongs to it.
 func TestRoleMatrix(t *testing.T) {
 	type msg struct {
 		typ  protocol.MessageType
 		pc   protocol.PCKind // pc.* only
 		data any
+		call string // the MediaPeer method that the message reaches in a room when it is allowed; "" = none
 	}
 	sdp := protocol.SDP("v=0\r\n")
 	msgs := []msg{
 		{typ: protocol.MessageTypePing, data: protocol.Ping{T: 1}},
 		{typ: protocol.MessageTypeRoomJoin, data: protocol.RoomJoin{RoomID: "lounge"}},
-		{typ: protocol.MessageTypeRoomLeave, data: protocol.Empty{}},
 		{typ: protocol.MessageTypeShareStart, data: protocol.ShareStart{Kind: protocol.ShareKindScreen,
-			Preset: protocol.PresetAuto, Ref: "r1"}},
+			Preset: protocol.PresetAuto, Ref: "r1"}, call: "CreateShare"},
+		// The share doesn't exist: share_not_found and ok, without a MediaPeer call (TestShare* have the real ones).
 		{typ: protocol.MessageTypeShareUpdate, data: protocol.ShareUpdate{ShareID: "s_x", Preset: protocol.PresetMovie}},
 		{typ: protocol.MessageTypeShareStop, data: protocol.ShareStop{ShareID: "s_x"}},
 		{typ: protocol.MessageTypeSubscribeUpdate, data: protocol.SubscribeUpdate{Subs: []protocol.SubscriptionWant{
 			{ShareID: "s_x", Video: protocol.VideoLayerHigh, Audio: protocol.AudioStateOn}}}},
 		{typ: protocol.MessageTypeCapsUpdate, data: protocol.CapsUpdate{Caps: protocol.Caps{
-			Decode: []protocol.CodecKey{protocol.CodecOpus}}}},
+			Decode: []protocol.CodecKey{protocol.CodecOpus}}}, call: "SetCaps"},
 		{typ: protocol.MessageTypeStats, data: protocol.ClientStats{IntervalMs: 10000}},
-		{typ: protocol.MessageTypeStatsWatch, data: protocol.StatsWatch{On: true}},
+		{typ: protocol.MessageTypeStatsWatch, data: protocol.StatsWatch{On: false}},
 	}
+	// The pc.* messages that a client may send for each PC kind reach the MediaPeer; the others (a sub offer, a pub
+	// answer, a pub restart request) are bad_request for the roles that may use that PC, and pc.close for sub is
+	// ignored (01 §8.8, §9 rule 1).
 	for _, pc := range []protocol.PCKind{protocol.PCKindPub, protocol.PCKindSub} {
+		call := func(pubCall, subCall string) string {
+			if pc == protocol.PCKindPub {
+				return pubCall
+			}
+			return subCall
+		}
 		msgs = append(msgs,
-			msg{protocol.MessageTypePCOffer, pc, protocol.PCOffer{PC: pc, Gen: 1, Neg: 1, SDP: sdp}},
-			msg{protocol.MessageTypePCAnswer, pc, protocol.PCAnswer{PC: pc, Gen: 1, Neg: 1, SDP: sdp}},
-			msg{protocol.MessageTypePCICE, pc, protocol.PCICE{PC: pc, Gen: 1}},
+			msg{protocol.MessageTypePCOffer, pc, protocol.PCOffer{PC: pc, Gen: 1, Neg: 1, SDP: sdp}, call("HandleOffer", "")},
+			msg{protocol.MessageTypePCAnswer, pc, protocol.PCAnswer{PC: pc, Gen: 1, Neg: 1, SDP: sdp}, call("", "HandleAnswer")},
+			msg{protocol.MessageTypePCICE, pc, protocol.PCICE{PC: pc, Gen: 1}, "AddICE"},
 			msg{protocol.MessageTypePCRestart, pc, protocol.PCRestart{PC: pc, Gen: 1, Mode: protocol.RestartModeICE,
-				Reason: protocol.RestartReasonDisconnected}},
-			msg{protocol.MessageTypePCClose, pc, protocol.PCClose{PC: pc, Gen: 1}},
+				Reason: protocol.RestartReasonDisconnected}, call("", "Restart")},
+			msg{protocol.MessageTypePCClose, pc, protocol.PCClose{PC: pc, Gen: 1}, call("ClosePC", "")},
 		)
 	}
+	// room.leave comes last: it takes the connection out of the room.
+	msgs = append(msgs, msg{typ: protocol.MessageTypeRoomLeave, data: protocol.Empty{}, call: "Close"})
 	// Every client→server type of the registry is covered (agent.send is behind a feature that is off).
 	covered := map[protocol.MessageType]bool{protocol.MessageTypeHello: true, protocol.MessageTypeAgentSend: true}
 	for _, m := range msgs {
@@ -227,53 +228,83 @@ func TestRoleMatrix(t *testing.T) {
 	}
 
 	for _, role := range []protocol.Role{protocol.RoleFull, protocol.RoleViewer, protocol.RolePublisher, protocol.RoleAgent} {
-		t.Run(string(role), func(t *testing.T) {
-			synctest.Test(t, func(t *testing.T) {
-				e := newEnv(t)
-				defer e.close()
-				cookie, _ := e.user(false)
-				h := signaltest.DefaultHello()
-				h.Role = role
-				c, _ := e.connect(cookie, h)
-				for _, m := range msgs {
-					spec, _ := protocol.Lookup(m.typ, protocol.DirClientToServer)
-					id := ""
-					if spec.Kind == protocol.KindRequest {
-						id = c.NextID()
+		for _, inRoom := range []bool{false, true} {
+			name := string(role)
+			if inRoom {
+				name += " in a room"
+			}
+			t.Run(name, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					e := newEnv(t)
+					defer e.close()
+					cookie, _ := e.user(false)
+					h := signaltest.DefaultHello()
+					h.Role = role
+					c, w := e.connect(cookie, h)
+					// calls returns the MediaPeer calls so far.
+					calls := func() []string { return nil }
+					if inRoom {
+						join(t, c, "lounge")
+						peer := e.media.Peer(w.ConnectionID)
+						calls = func() []string { return methods(peer.MediaCalls()) }
 					}
-					if err := c.Send(m.typ, id, m.data); err != nil {
-						t.Fatal(err)
-					}
-					allowed := protocol.Allowed(role, m.typ, m.pc)
-					if !allowed {
-						scope := protocol.ErrorScopeRequest
-						if m.pc != "" {
-							scope = protocol.ErrorScopePC
+					for _, m := range msgs {
+						spec, _ := protocol.Lookup(m.typ, protocol.DirClientToServer)
+						id := ""
+						if spec.Kind == protocol.KindRequest {
+							id = c.NextID()
 						}
-						pe, re := expectError(t, c, protocol.ErrorCodeForbidden, scope)
-						if re != id || pe.PC != m.pc {
-							t.Errorf("%s %s: re %q, pc %q", m.typ, m.pc, re, pe.PC)
+						before := calls()
+						if err := c.Send(m.typ, id, m.data); err != nil {
+							t.Fatal(err)
 						}
-						continue
-					}
-					// Whatever the answer (ok, pong, not_in_room, internal, nothing), it is not forbidden.
-					if err := c.Send(protocol.MessageTypePing, "", protocol.Ping{T: 99}); err != nil {
-						t.Fatal(err)
-					}
-					for {
-						env := recv(t, c)
-						if env.Type == protocol.MessageTypePong {
-							if p, _ := protocol.Decode[protocol.Pong](env); p.T == 99 {
-								break
+						if !protocol.Allowed(role, m.typ, m.pc) {
+							scope := protocol.ErrorScopeRequest
+							if m.pc != "" {
+								scope = protocol.ErrorScopePC
+							}
+							pe, re := expectError(t, c, protocol.ErrorCodeForbidden, scope)
+							if re != id || pe.PC != m.pc {
+								t.Errorf("%s %s: re %q, pc %q", m.typ, m.pc, re, pe.PC)
+							}
+							if got := calls(); !slices.Equal(got, before) {
+								t.Errorf("%s %s: forbidden, but the MediaPeer was called: %v", m.typ, m.pc, got[len(before):])
 							}
 							continue
 						}
-						if pe, _ := protocol.Decode[protocol.Error](env); pe.Code == protocol.ErrorCodeForbidden {
-							t.Errorf("%s %s: forbidden for %s", m.typ, m.pc, role)
+						// Whatever the answer (ok, pong, an answer, not_in_room, share_not_found, bad_request, nothing),
+						// it is not forbidden.
+						if err := c.Send(protocol.MessageTypePing, "", protocol.Ping{T: 99}); err != nil {
+							t.Fatal(err)
+						}
+						for {
+							env := recv(t, c)
+							if env.Type == protocol.MessageTypePong {
+								if p, _ := protocol.Decode[protocol.Pong](env); p.T == 99 {
+									break
+								}
+								continue
+							}
+							if pe, _ := protocol.Decode[protocol.Error](env); pe.Code == protocol.ErrorCodeForbidden {
+								t.Errorf("%s %s: forbidden for %s", m.typ, m.pc, role)
+							}
+						}
+						var want []string
+						switch {
+						case !inRoom && m.typ == protocol.MessageTypeRoomJoin:
+							leave(t, c) // the rest of this run is outside a room
+						case !inRoom || m.call == "":
+						case m.typ == protocol.MessageTypeRoomLeave && role.CanPublish():
+							want = []string{"EndShare", "Close"} // the share of the share.start above ends with left
+						default:
+							want = []string{m.call}
+						}
+						if got := calls()[len(before):]; !slices.Equal(got, want) {
+							t.Errorf("%s %s: MediaPeer calls %v, want %v", m.typ, m.pc, got, want)
 						}
 					}
-				}
+				})
 			})
-		})
+		}
 	}
 }

@@ -16,8 +16,7 @@ const (
 	dirOut = "out"
 )
 
-// metrics are the hub's Prometheus series (01 §18). A nil *metrics (no Deps.Metrics) records nothing. The share and
-// client-stats series are registered now and fed by the slice that brings shares and stats forwarding (README S40).
+// metrics are the hub's Prometheus series (01 §18). A nil *metrics (no Deps.Metrics) records nothing.
 type metrics struct {
 	connections *prometheus.GaugeVec   // isshoni_ws_connections{kind,role}
 	messages    *prometheus.CounterVec // isshoni_ws_messages_total{type,dir}
@@ -165,6 +164,40 @@ func (m *metrics) roomCounts(rooms, participants int) {
 		m.rooms.Set(float64(rooms))
 		m.participants.Set(float64(participants))
 	}
+}
+
+// shareStatus moves one share from status from to status to in isshoni_shares{status}; "" stands for no share: a
+// new one (from) or one that has ended (to).
+func (m *metrics) shareStatus(from, to protocol.ShareStatus) {
+	if m == nil || from == to {
+		return
+	}
+	if from != "" {
+		m.shares.WithLabelValues(string(from)).Dec()
+	}
+	if to != "" {
+		m.shares.WithLabelValues(string(to)).Inc()
+	}
+}
+
+// clientInbound adds what one inbound track of a client's stats report gained since the previous report to the
+// isshoni_client_* counters (01 §8.11). kind is a known track kind (protocol.ClientStats.Validate).
+func (m *metrics) clientInbound(kind protocol.TrackKind, d inboundCounters) {
+	if m == nil {
+		return
+	}
+	// A counter panics on a negative value. The deltas are never negative; a report must not be able to change that.
+	add := func(c prometheus.Counter, v float64) {
+		if v > 0 {
+			c.Add(v)
+		}
+	}
+	add(m.clientFramesDecoded, float64(d.framesDecoded))
+	add(m.clientFramesDropped, float64(d.framesDropped))
+	add(m.clientFreezeSeconds, float64(d.freezeMs)/1000)
+	add(m.clientPacketsLost.WithLabelValues(string(kind)), float64(d.packetsLost))
+	add(m.clientAudioSamples, float64(d.totalSamples))
+	add(m.clientAudioConcealedSmp, float64(d.concealedSamples))
 }
 
 func (m *metrics) resumeResult(resumed bool) {

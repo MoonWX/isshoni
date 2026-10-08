@@ -201,16 +201,14 @@ func (c *conn) notImplemented(env protocol.Envelope) {
 		slog.String("conn_id", c.id), slog.String("type", string(env.Type))))
 }
 
-// inRoom reports whether the connection is in a room.
-func (c *conn) inRoom() bool { return c.room != nil }
-
-// requireRoom answers not_in_room outside a room (01 §12.1); inside one, the handling comes with README S40.
-func (c *conn) requireRoom(env protocol.Envelope) {
-	if !c.inRoom() {
-		c.reject(env, protocol.NewError(protocol.ErrorCodeNotInRoom, protocol.ErrorScopeRequest))
-		return
+// requireRoom reports whether the connection is in a room. Outside one it answers a share, subscription or pc.*
+// message with not_in_room (01 §12.1).
+func (c *conn) requireRoom(env protocol.Envelope) bool {
+	if c.room != nil {
+		return true
 	}
-	c.notImplemented(env)
+	c.reject(env, protocol.NewError(protocol.ErrorCodeNotInRoom, protocol.ErrorScopeRequest))
+	return false
 }
 
 // onPing answers ping with pong, echoing t (01 §8.3).
@@ -271,6 +269,9 @@ func (c *conn) onRoomJoin(env protocol.Envelope) {
 	c.peer = peer
 	c.reply(env, res)
 	c.sendStateNow()
+	if c.statsWatch {
+		c.armStats() // a client that watches the server's stats gets those of its new MediaPeer
+	}
 	c.h.log.Debug("joined room", slog.String("conn_id", c.id), slog.String("user_id", c.userID),
 		slog.String("room_id", r.id))
 }
@@ -310,55 +311,34 @@ func (c *conn) onRoomLeave(env protocol.Envelope) {
 	c.reply(env, nil)
 }
 
-// onShareStart handles share.start (01 §8.7; README S40).
-func (c *conn) onShareStart(env protocol.Envelope) {
-	if _, ok := decode[protocol.ShareStart](c, env); ok {
-		c.requireRoom(env)
-	}
-}
-
-// onShareUpdate handles share.update (01 §8.7; README S40).
-func (c *conn) onShareUpdate(env protocol.Envelope) {
-	if _, ok := decode[protocol.ShareUpdate](c, env); ok {
-		c.requireRoom(env)
-	}
-}
-
-// onShareStop handles share.stop (01 §8.7; README S40).
-func (c *conn) onShareStop(env protocol.Envelope) {
-	if _, ok := decode[protocol.ShareStop](c, env); ok {
-		c.requireRoom(env)
-	}
-}
-
-// onSubscribeUpdate handles subscribe.update (01 §8.9; README S40).
-func (c *conn) onSubscribeUpdate(env protocol.Envelope) {
-	if _, ok := decode[protocol.SubscribeUpdate](c, env); ok {
-		c.requireRoom(env)
-	}
-}
-
-// onCapsUpdate records the client's new capabilities (01 §8.10). README S40 passes them to the MediaPeer.
+// onCapsUpdate handles caps.update (01 §8.10): the client's capabilities changed (a codec became available,
+// 01 §11.7). The connection keeps them for its next MediaPeer, and its current one gets them at once: the SFU
+// updates the room's codec safe set and retries the subscriptions that the codec blocked.
 func (c *conn) onCapsUpdate(env protocol.Envelope) {
 	v, ok := decode[protocol.CapsUpdate](c, env)
 	if !ok {
 		return
 	}
 	c.caps = v.Caps
+	if c.peer != nil {
+		c.peer.SetCaps(v.Caps)
+	}
 }
 
-// onStats keeps the client's last stats report for the live snapshot (01 §8.11). README S40 adds the client
-// metrics from its counters.
+// onStats handles a client's stats report (01 §8.11): the hub keeps the last one for the live snapshot and counts
+// the growth of its inbound counters in the isshoni_client_* metrics.
 func (c *conn) onStats(env protocol.Envelope) {
 	v, ok := decode[protocol.ClientStats](c, env)
 	if !ok {
 		return
 	}
 	c.lastStats.Store(&v)
+	c.countClientStats(&v)
 }
 
-// onStatsWatch records whether the client watches the server's stats and replies ok (01 §8.11). README S40 sends
-// the ServerStats every 2 s while watched.
+// onStatsWatch handles stats.watch (01 §8.11): while on, the connection gets the server's stats of its MediaPeer
+// every statsInterval (statsTick), until {on: false} or the connection closes. It replies ok. Outside a room there
+// is nothing to send; the stats start with the next room.join.
 func (c *conn) onStatsWatch(env protocol.Envelope) {
 	v, ok := decode[protocol.StatsWatch](c, env)
 	if !ok {
@@ -366,6 +346,9 @@ func (c *conn) onStatsWatch(env protocol.Envelope) {
 	}
 	c.statsWatch = v.On
 	c.reply(env, nil)
+	if v.On {
+		c.armStats()
+	}
 }
 
 // onAgentSend handles agent.send (01 §8.14), which the same-user relay (README S51) brings together with the
@@ -376,49 +359,142 @@ func (c *conn) onAgentSend(env protocol.Envelope) {
 	}
 }
 
-// handlePC handles the pc.* notifications (01 §8.8): validation, the PC-kind role check (01 §6.3), the pc.restart
-// limit (01 §13), then the room. Routing to the MediaPeer comes with README S40. Every error has scope pc.
+// handlePC handles the pc.* notifications (01 §8.8, §9) and routes them to the connection's MediaPeer. Each one
+// passes pcCheck, the rate limits of 01 §13 and the room check (not_in_room) first. Every error has scope pc, with
+// the message's pc, gen and neg.
+//
+// The hub checks the role and the ownership of what a message names; it keeps no PeerConnection state. Whether a
+// gen or a neg is current is the SFU's to say (01 §9 rule 2): its answers come back through the MediaPeer.
 func (c *conn) handlePC(env protocol.Envelope, now time.Time) {
-	var pc protocol.PCKind
-	var err error
 	switch env.Type {
-	case protocol.MessageTypePCOffer:
-		var v protocol.PCOffer
-		v, err = protocol.Decode[protocol.PCOffer](env)
-		pc = v.PC
-	case protocol.MessageTypePCAnswer:
-		var v protocol.PCAnswer
-		v, err = protocol.Decode[protocol.PCAnswer](env)
-		pc = v.PC
+	case protocol.MessageTypePCOffer: // the client offers on pub only
+		v, err := protocol.Decode[protocol.PCOffer](env)
+		if c.pcCheck(env, err, v.PC, protocol.PCKindPub) && c.requireRoom(env) {
+			c.onPCOffer(env, v, now)
+		}
+	case protocol.MessageTypePCAnswer: // and answers on sub only
+		v, err := protocol.Decode[protocol.PCAnswer](env)
+		if c.pcCheck(env, err, v.PC, protocol.PCKindSub) && c.requireRoom(env) {
+			c.pcResult(env, "handle answer", c.peer.HandleAnswer(v))
+		}
 	case protocol.MessageTypePCICE:
-		var v protocol.PCICE
-		v, err = protocol.Decode[protocol.PCICE](env)
-		pc = v.PC
-	case protocol.MessageTypePCRestart:
-		var v protocol.PCRestart
-		v, err = protocol.Decode[protocol.PCRestart](env)
-		pc = v.PC
-	case protocol.MessageTypePCClose:
-		var v protocol.PCClose
-		v, err = protocol.Decode[protocol.PCClose](env)
-		pc = v.PC
-	}
-	if err != nil {
-		c.rejectDecode(env, err)
-		return
-	}
-	if !protocol.Allowed(c.role, env.Type, pc) {
-		c.reject(env, protocol.NewError(protocol.ErrorCodeForbidden, protocol.ErrorScopePC))
-		return
-	}
-	switch {
-	case env.Type == protocol.MessageTypePCRestart:
-		if ok, wait := c.limits.typed(now, string(env.Type)+"/"+string(pc), pcRestartRate); !ok {
+		v, err := protocol.Decode[protocol.PCICE](env)
+		if c.pcCheck(env, err, v.PC, "") && c.requireRoom(env) {
+			c.pcResult(env, "add ice candidate", c.peer.AddICE(v))
+		}
+	case protocol.MessageTypePCRestart: // sub only: the client restarts its pub PC with an offer of its own
+		v, err := protocol.Decode[protocol.PCRestart](env)
+		if !c.pcCheck(env, err, v.PC, protocol.PCKindSub) {
+			return
+		}
+		if ok, wait := c.limits.typed(now, string(env.Type)+"/"+string(v.PC), pcRestartRate); !ok {
 			c.reject(env, rateLimited(wait))
 			return
 		}
-	case env.Type == protocol.MessageTypePCClose && pc == protocol.PCKindSub:
-		return // M1 clients send pc.close only for pub; the hub ignores sub (01 §8.8)
+		if c.requireRoom(env) {
+			c.pcResult(env, "restart", c.peer.Restart(v))
+		}
+	case protocol.MessageTypePCClose:
+		v, err := protocol.Decode[protocol.PCClose](env)
+		if !c.pcCheck(env, err, v.PC, "") || v.PC == protocol.PCKindSub {
+			return // M1 clients send pc.close only for pub; the hub ignores sub (01 §8.8)
+		}
+		if c.requireRoom(env) {
+			c.onPCClose(env, v)
+		}
 	}
-	c.requireRoom(env)
+}
+
+// pcCheck runs the checks that every pc.* notification passes before anything else: its payload is valid
+// (bad_request with the field), the connection's role may use that PeerConnection (forbidden, 01 §6.3), and the
+// message goes the way the protocol fixes for it (01 §9 rule 1). only is the one PC kind that a client may send the
+// message for, "" for either: an offer, an answer or a restart request for the other kind is bad_request with
+// params {field: "pc", reason: "invalid"}. err is the payload's decode error. It reports whether the message passed.
+func (c *conn) pcCheck(env protocol.Envelope, err error, pc, only protocol.PCKind) bool {
+	switch {
+	case err != nil:
+		c.rejectDecode(env, err)
+	case !protocol.Allowed(c.role, env.Type, pc):
+		c.reject(env, protocol.NewError(protocol.ErrorCodeForbidden, protocol.ErrorScopePC))
+	case only != "" && pc != only:
+		fe := protocol.FieldError{Field: "pc", Reason: protocol.FieldInvalid}
+		c.reject(env, fe.BadRequest(protocol.ErrorScopePC))
+	default:
+		return true
+	}
+	return false
+}
+
+// pcResult answers a pc.* notification whose MediaPeer call failed. The adapter's *protocol.Error (01 §15.4) goes
+// out with scope pc and the message's pc, gen and neg, whichever row its code comes from (01 §12.1). The exception
+// is an error with scope share, codec_not_supported: it names a share, which then ends (shareError). Any other error
+// is internal, with a logged ref.
+func (c *conn) pcResult(env protocol.Envelope, call string, err error) {
+	if err == nil {
+		return
+	}
+	var pe *protocol.Error
+	switch {
+	case !errors.As(err, &pe):
+		c.reject(env, c.h.internalError(fmt.Errorf("%s: %w", call, err), protocol.ErrorScopePC,
+			slog.String("conn_id", c.id), slog.String("type", string(env.Type))))
+	case pe.Scope == protocol.ErrorScopeShare:
+		c.shareError(*pe)
+	default:
+		c.reject(env, *pe)
+	}
+}
+
+// onPCOffer handles a pub offer (01 §8.8, §9 rules 4 and 7):
+//
+//   - an offer with a new gen asks for a new PeerConnection, which is limited to pubGenRate (rate_limited, scope pc);
+//   - of its tracks, only those of shares that this connection publishes go on: a TrackRef of any other share (one
+//     that ended in a race, or somebody else's) is dropped, and the server still answers;
+//   - each share of this connection that an earlier pub offer bound and that this one no longer lists ends with
+//     stopped, before the MediaPeer sees the offer (01 §8.7). A starting share that no offer has bound yet is left
+//     alone: its start timeout covers it;
+//   - the MediaPeer's answer goes back as pc.answer, and the shares that the offer lists are bound from now on. When
+//     the MediaPeer refuses the offer, nothing is bound.
+func (c *conn) onPCOffer(env protocol.Envelope, o protocol.PCOffer, now time.Time) {
+	if o.Gen > c.pubGen {
+		if ok, wait := c.limits.typed(now, pubGenKey, pubGenRate); !ok {
+			c.reject(env, rateLimited(wait))
+			return
+		}
+		c.pubGen = o.Gen
+	}
+	r := c.room
+	listed := make(map[string]bool, len(o.Tracks))
+	var tracks []protocol.TrackRef
+	r.mu.Lock()
+	for _, t := range o.Tracks {
+		if s := r.shares[t.ShareID]; s != nil && s.info.ConnectionID == c.id {
+			tracks = append(tracks, t)
+			listed[t.ShareID] = true
+		}
+	}
+	r.mu.Unlock()
+	o.Tracks = tracks
+	c.endOwn(protocol.EndReasonStopped, func(s *share) bool { return s.bound && !listed[s.info.ID] })
+	answer, err := c.peer.HandleOffer(o)
+	if err != nil {
+		c.pcResult(env, "handle offer", err)
+		return
+	}
+	r.mu.Lock()
+	for id := range listed {
+		if s := r.shares[id]; s != nil && s.info.ConnectionID == c.id {
+			s.bound = true
+		}
+	}
+	r.mu.Unlock()
+	c.send(protocol.MessageTypePCAnswer, "", answer)
+}
+
+// onPCClose handles pc.close for the pub PC (01 §8.8, §9 rule 10): the client closed it on purpose. The shares it
+// carried, those that a pub offer bound, end with stopped, then the MediaPeer closes its side. A starting share that
+// no offer has bound yet was never on that PeerConnection and is left to its start timeout, as in onPCOffer.
+func (c *conn) onPCClose(env protocol.Envelope, v protocol.PCClose) {
+	c.endOwn(protocol.EndReasonStopped, func(s *share) bool { return s.bound })
+	c.pcResult(env, "close pc", c.peer.ClosePC(v))
 }
