@@ -1350,8 +1350,9 @@ invite's use back, and the session of a cookie the request arrived with is delet
     notification (§12.5). An audit row "rejected 0 sign-ups" would only be noise, and two admins who press the
     button at the same moment get one row with the count, not two.
   - No body, `{}` and `{"all": false}` are not the request: `all` is then looked up as a user ID, which no user
-    has (IDs are 12 characters), and gets 404 `user_not_found`. A body that is not a JSON object is 400
-    `bad_request`.
+    has (IDs are 12 characters), and gets 404 `user_not_found`. `null` reads like an absent value, as the body
+    and as `all`'s value. 400 `bad_request` is for a body that is not JSON, for a JSON array, string, number or
+    boolean, and for an `all` of another type than a boolean.
 - **Approve** and **Reject** of a user that doesn't exist, or isn't pending any more (another admin answered
   first), are 404 `user_not_found`. Approve answers 200 with the user as the admin list shows it; Reject 204.
 - **Expiry**: pending rows expire after 14 days (janitor).

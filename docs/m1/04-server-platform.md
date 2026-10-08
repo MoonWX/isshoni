@@ -854,7 +854,7 @@ What the operator sees on such a server:
 
 | Where | What |
 |---|---|
-| The log | WARN `public address detection failed` from `netx` when the detection itself failed, then its INFO line `public addresses` with `nat=unknown` and no address; in ip mode WARN from `tls`: `tls.mode "ip" has no public IP address to get a certificate for; set public_ip and restart`; and in place of the "ready" line of §6.1 step 10, WARN `isshoni 0.3.0 started without a public IP address (tls=ip) and is not ready: set public_ip to this server's public address, or set domain, and restart` |
+| The log | WARN `public address detection failed` from `netx` when the detection itself failed, then its INFO line `public addresses` with neither a `public_ipv4` nor a `public_ipv6` attribute (`nat=unknown`, or `nat=cgnat_likely` when the default route's interface has a carrier-NAT address and no STUN server answered); in ip mode WARN from `tls`: `tls.mode "ip" has no public IP address to get a certificate for; set public_ip and restart`; and in place of the "ready" line of §6.1 step 10, WARN `isshoni 0.3.0 started without a public IP address (tls=ip) and is not ready: set public_ip to this server's public address, or set domain, and restart` |
 | Readiness | `public_ip`: "no public IP address found; set public_ip and restart". In ip mode also `tls`: "no public IP address to get a certificate for" (there is no name to order a certificate for, so no ACME request is made). Liveness is true: the process is healthy, and Docker's `HEALTHCHECK` passes |
 | `isshoni healthcheck --ready`, the admin socket's `/v1/ready` | not ready (exit 1), with the two checks. install.sh's wait for readiness ends at its timeout and prints the journal's last lines and doctor's output (06 §4.10) |
 | Port 80 | **503** with `Retry-After: 30` and the waiting page (§8.3) for every request outside `/.well-known/acme-challenge/`: there is no origin to redirect to |
@@ -864,11 +864,17 @@ What the operator sees on such a server:
 The server does not take a site later in the same process: the origin, the Host check, the certificate's name and
 the ICE rewrite rules are made once, at startup (§7.4's rationale for "restart to apply"). So the way out is a
 restart with an address to find: `public_ip` set to the address (the fix every message names), `domain` set, or
-simply `sudo systemctl restart isshoni` once the network is up. The periodic detection of §7.4 keeps trying
-meanwhile, every 10 minutes, and reports an address that shows up the way it reports any change: a warning in the
-log that says to restart isshoni to apply it (the dashboard's `public_ip.changed` alert is the same event, but
-nobody can open the dashboard of a server without a site). That periodic detection is not wired yet after S44,
-whose `Start` detects once and only in the TLS modes; it comes with the wiring (README S54).
+simply `sudo systemctl restart isshoni` once the network is up.
+
+**Nothing restarts such a server by itself.** systemd's `Restart=on-failure` and Docker's restart policy act on a
+process that ended, not on one that runs and is not ready, and Docker's `HEALTHCHECK` is liveness, which passes.
+So a cause that was gone a minute after boot still leaves the server not ready until the operator restarts it.
+What staying up gives is a server that says why, in every place of the table above. The periodic detection of
+§7.4 does not change this. It is not wired yet after S44, whose `Start` detects once and only in the TLS modes;
+it comes with the wiring (README S54). From then on it looks again every 10 minutes and reports an address that
+shows up the way it reports any change: a warning in the log that says to restart isshoni to apply it (the
+dashboard's `public_ip.changed` alert is the same event, but nobody can open the dashboard of a server without a
+site).
 
 ### 6.3 Refusing to start
 
@@ -1205,11 +1211,13 @@ startup and then every 10 minutes; a change is logged as a warning and shown on 
 A to B; restart isshoni to apply"). Rationale: rewrite rules are fixed per `webrtc.API`; a hot swap is *later*. VPS
 addresses rarely change.
 
-**"Nothing found" at startup** (the table's last row; S44, kept after group 5): `DetectPublicAddrs` returns what
-it found, and an error next to it when a step failed; neither stops the start. In ip mode, and in manual mode
+**"Nothing found" at startup** (the table's last row, and its `cgnat_likely` row when no STUN server answered:
+no address then either, with the NAT kind `cgnat_likely`; S44, kept after group 5): `DetectPublicAddrs` returns
+what it found, and an error next to it when a step failed; neither stops the start. In ip mode, and in manual mode
 without a domain, the server then starts without a site and is not ready; §6.2 lists what the operator sees and
-why it is not an exit 78. The 10-minute detection goes on for such a server as for any other. An address it finds
-later is a change like "A to B": logged, shown, and applied by a restart.
+why it is not an exit 78. Once the periodic detection is wired (README S54; §6.2), it goes on for such a server
+as for any other. An address it finds later is a change like "A to B": logged, and applied only by a restart.
+The server does not take it by itself, and nothing restarts it (§6.2).
 
 Privacy: STUN contacts Cloudflare and Google at startup and every 10 minutes (one UDP packet each). Setting `public_ip`
 limits this to one NAT check at startup; `network.stun_servers = []` stops STUN entirely (set `public_ip` to a literal
@@ -1333,16 +1341,17 @@ Both challenge types stay enabled, so issuance works when only one of 80 or 443 
 
 ### 8.2 certmagic version and setup
 
-- **Pin `github.com/caddyserver/certmagic v0.25.4`** (June 2026). Needed features: ACME `Profile` (since v0.22.0);
-  IP identifiers allowed for Let's Encrypt in `ACMEIssuer.PreCheck` (PR #345, merged July 2025, first in v0.24.0);
-  HTTP-01 for IPv6 literals fixed in v0.25.3. Caddy issue #7399 (Dec 2025) reported a PreCheck refusal for IP
-  certificates with an older build, so slice S7 must issue a real staging IP certificate on a VPS before M1 is done.
+- **`github.com/caddyserver/certmagic` v0.25.4 or newer** (v0.25.4 is from June 2026). Needed features: ACME
+  `Profile` (since v0.22.0); IP identifiers allowed for Let's Encrypt in `ACMEIssuer.PreCheck` (PR #345, merged
+  July 2025, first in v0.24.0); HTTP-01 for IPv6 literals fixed in v0.25.3. Caddy issue #7399 (Dec 2025) reported
+  a PreCheck refusal for IP certificates with an older build, so slice S7 must issue a real staging IP certificate
+  on a VPS before M1 is done.
   - **Built with v0.25.6, not v0.25.4** (README S44; `go.mod`, with `github.com/mholt/acmez/v3` v3.1.7). README
     §5's rule for shared modules is that the first slice to need a module adds it at the current release, and
-    that is where v0.25.6 comes from. Every feature listed here is in it: they all arrived by v0.25.3. So the
-    version above is the oldest that works, not a pin to hold: Dependabot moves the module from here on, and the
-    Pebble job (a domain and an IP certificate over http-01 and tls-alpn-01, a renewal, `serve` in auto mode) is
-    what a bump has to pass.
+    that is where v0.25.6 comes from. Every feature listed here is in it: they all arrived by v0.25.3. So
+    v0.25.4 is a floor, not a pin to hold: Dependabot moves the module from here on, and the Pebble job (a domain
+    and an IP certificate over http-01 and tls-alpn-01, a renewal, `serve` in auto mode) is what a bump has to
+    pass.
 - certmagic logs through `*zap.Logger`; `logx.NewZapBridge(slog)` is a ~60-line `zapcore.Core` that forwards to slog
   (component `tls`).
 
@@ -3102,8 +3111,11 @@ with the other docs and adds the wiring slices of §6.6.
 Decided after group 5 (an engineering call the owner delegated; README §6):
 
 4. **An ip-mode server that finds no public address starts and is not ready; it does not exit 78.** The cause is
-   often transient at boot (the network or STUN isn't there yet), and exit 78 would stop systemd from ever trying
-   again. The server stays up, port 80 answers 503 with the waiting page, the readiness checks `public_ip` and
-   `tls` and doctor say what is missing, and the detection keeps trying (§6.2, §7.4, §8.2, §8.3, §13.2). The same
-   holds for manual mode without a domain. A `public_ip` literal that is not a public address stays a config
-   error (exit 78, §4.5).
+   often transient at boot (the network or STUN isn't there yet), and exit 78 is for what a restart can't fix
+   (§3.2); here a restart once the network is up is the fix. The server stays up, port 80 answers 503 with the
+   waiting page, and the readiness checks `public_ip` and `tls` and doctor say what is missing (§6.2, §7.4, §8.2,
+   §8.3, §13.2). It does not recover by itself: the site, the Host check, the certificate's name and the ICE
+   rewrite rules are fixed at startup, so an address that the 10-minute detection finds later (wired by README
+   S54) is only logged, and the operator restarts isshoni (§6.2). systemd does not restart a running server, and
+   Docker's `HEALTHCHECK` passes meanwhile because it checks liveness. The same holds for manual mode without a
+   domain. A `public_ip` literal that is not a public address stays a config error (exit 78, §4.5).

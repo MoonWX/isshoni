@@ -1519,7 +1519,8 @@ These rules bind the web client (05), the Go test and load-test clients, the SFU
    receivers must ask for stereo themselves).
 7. **Publishing codec.** The client offers every H.264 profile it can encode (packetization-mode 1) plus RTX, with
    `ShareParams.codec` (or the latest `quality.hint.codec`) first. It offers no VP8/VP9/AV1 in v1. If the offer has no
-   usable H.264, the hub ends the share with `stopped` and sends `error{codec_not_supported, scope: share, shareId}`.
+   usable H.264, the hub sends `error{codec_not_supported, scope: share, shareId}` and then ends the share with
+   `stopped`: the error goes first, so the client knows why before it sees the share end (S40; §15.4).
 8. **Failures while applying.**
    - An SDP that can't be applied gets `error{sdp_invalid, scope: pc, pc, gen, neg}`. The PC's owner rebuilds it once
      (`gen + 1`, or `pc.restart{rebuild}` for sub).
@@ -2548,9 +2549,10 @@ version of this section left open:
   10 s) is retried with the backoff of §10.2 like any later one, until `ctx` ends; `Dial` then stops the client and
   returns `ctx`'s error together with the last attempt's. When the server answers with an error that reconnecting
   can't fix (scope `session`; scope `connection` or the answer to `hello`, unless `retryable`: `unauthenticated`,
-  `protocol_unsupported`, `too_many_connections`, …), `Dial` returns that `*protocol.Error` at once. With
-  `Options.NoReconnect` the first failure of any kind is returned. `ctx` bounds `Dial` only: the client keeps
-  `ctx`'s values and outlives its cancellation, until `Close`.
+  `protocol_unsupported`, `too_many_connections`, …), `Dial` returns at once with an error that wraps that
+  `*protocol.Error` (`signal: dial: …`): read it with `errors.As`, a type assertion does not find it. With
+  `Options.NoReconnect` the first failure of any kind is returned, wrapped the same way. `ctx` bounds `Dial` only:
+  the client keeps `ctx`'s values and outlives its cancellation, until `Close`.
 - **`Options.Token`** is called before every `hello`, the resuming ones too, with a context that ends after
   `ConnectTimeout`: the place to refresh an access token that is about to expire (§3.2). An error from it fails that
   attempt like a failed connect. The token goes nowhere but into `hello.auth`. An `unauthenticated` answer stops the
@@ -2562,11 +2564,12 @@ version of this section left open:
   `Dial`.
 - **`Request`** takes requests only (a notification type is an error: no reply would come), `Send` notifications
   only, and neither takes `hello`. A type this build doesn't know is sent: a newer server may know it. The error is
-  the server's `*protocol.Error`, or it wraps a sentinel: `ErrConnectionLost` while the client is connecting or
-  backing off, or when the socket went away before the reply; `ErrRequestTimeout` after `RequestTimeout`;
-  `ErrNotReady` once the client is stopped (only a new `Dial` helps); or `ctx`'s error, which ends the wait and never
-  the socket. Nothing is queued while the client is not ready, and nothing is retried: after `ErrConnectionLost` or
-  `ErrRequestTimeout` the caller can't tell whether the server acted, and applies §10.5 after the next `welcome`.
+  the server's `*protocol.Error` itself, not wrapped (unlike `Dial`'s), or it wraps a sentinel: `ErrConnectionLost`
+  while the client is connecting or backing off, or when the socket went away before the reply;
+  `ErrRequestTimeout` after `RequestTimeout`; `ErrNotReady` once the client is stopped (only a new `Dial` helps);
+  or `ctx`'s error, which ends the wait and never the socket. Nothing is queued while the client is not ready, and
+  nothing is retried: after `ErrConnectionLost` or `ErrRequestTimeout` the caller can't tell whether the server
+  acted, and applies §10.5 after the next `welcome`.
 - **`Events` must be received: a caller that doesn't drain it stops the client.** The channel carries every server
   notification in the order it arrived (`room.state`, `room.event`, `pc.*`, `subscribe.status`, `quality.hint`,
   `stats`, `invalidate`, `server.shutdown`, `agent.recv`, and the `error` messages that answer no request: scopes

@@ -1149,12 +1149,12 @@ the stats into it, §5 and §10.7). Where it differs from the list above, or set
   the browser offers an install prompt, §16.3; read when the menu opens), Test my connection (opens the
   connection test of §14.2 in a dialog, for a user whose video is poor on a connection that is up), About, and Sign
   out (the logout flow of §15.1; the page doesn't navigate, the guard does once `['me']` is `null`).
-- **The admin badge shows on the user's own row only.** `room.state` said who is in the room, not who is an admin
-  (01 §8.5), so the page knew it of nobody but its own user (`GET /api/v1/me`). **Decided after group 5: the badge
-  shows on every participant who is an admin**, as the list above says. `ParticipantInfo` gains the additive field
-  `admin` (01 §8.5), which the hub fills from the user's role, and the panel reads it per row; README F02 does
-  both. A snapshot without the field (an older server) reads as "nobody is an admin". The badge is a label, never
-  a permission: admin actions are REST calls the server checks.
+- **The admin badge shows on every participant who is an admin** (decided after group 5; README F02), as the list
+  above says. S45 could show it on the user's own row only, because `room.state` said who is in the room, not who
+  is an admin (01 §8.5), and the page knew the role of nobody but its own user (`GET /api/v1/me`).
+  `ParticipantInfo` gains the additive field `admin` (01 §8.5), which the hub fills from the user's role, and the
+  panel reads it per row; README F02 does both. A snapshot without the field (an older server) reads as "nobody
+  is an admin". The badge is a label, never a permission: admin actions are REST calls the server checks.
 - **People panel.** A drawer (`Sheet`) opened by the people count. A person who is `reconnecting` is dimmed and
   says so (§11.1). A person who shares has the "Sharing" badge; a click on them focuses their newest share that
   has a tile (not one that is still `starting`, 01 §4.4) and closes the panel. The user's own row reads
@@ -1442,10 +1442,10 @@ How S46 built the second half (`starting` to the end; `share/BrowserSharing.ts`,
   closing), by `serverEnded(reason)`, by an error in scope `share` about it, or when the pub PC gives up. Every end
   runs in the order of the diagram: `share.stop` first (when the server is to be told), then the transceivers (a
   re-offer, or `pc.close` when no share is left), then the capture tracks. `stop()` never rejects.
-- **"Stopped from another tab or device" waits 300 ms** (`END_NOTICE_GRACE_MS`). The hub ends a share whose offer
-  had no usable H.264 with `stopped` and then sends `codec_not_supported` (01 §9 rule 7), so after a `stopped` or
-  `left` the notice waits that long for an error about the share; if one comes, the share is `failed` with that
-  error and the notice isn't shown.
+- **"Stopped from another tab or device" waits 300 ms** (`END_NOTICE_GRACE_MS`). For a share whose offer had no
+  usable H.264 the hub sends `codec_not_supported` (scope `share`) and then ends the share with `stopped` (01 §9
+  rule 7, §15.4). The page does not depend on that order: after a `stopped` or `left` the notice waits that long
+  for an error about the share; if one comes, the share is `failed` with that error and the notice isn't shown.
 - **What the user sees for each end**: `stopped` or `left` → `idle` with the toast (`share.ended.elsewhere`);
   `media_timeout` → `failed` with a `ShareEndedError` of kind `media_timeout` and [Test my connection]; any other
   reason, and the `room.state` fallback → `failed` with kind `server`; `room_closed` → nothing here (the session
