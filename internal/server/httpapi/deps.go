@@ -38,15 +38,19 @@ type NotifyTarget struct {
 }
 
 // Push is implemented by the wiring's adapter over 04's push service (it converts store.PushSubscription to
-// push.Subscription). Deps.Push is nil when push is off (push.enabled = false, 04 §6.6): the push endpoints then
-// answer 503 push_unavailable and GET /info omits push.
+// push.Subscription). Deps.Push is nil when push is off (push.enabled = false, 04 §6.6): subscribing and the test
+// notification then answer 503 push_unavailable and GET /info omits push, and so they do for a Push without a VAPID
+// key. Unsubscribing and the preferences need no push service (push.go).
 type Push interface {
 	// VAPIDPublicKey is the server's VAPID public key: base64url, an uncompressed P-256 point.
 	VAPIDPublicKey() string
 	// ValidateEndpoint checks a subscription endpoint (every URL and host rule of 03 §12.4.6, including the DNS
-	// check): nil, or *api.Error{push_endpoint_rejected} with params.reason.
+	// check): nil, or *api.Error{push_endpoint_rejected} with params.reason. The subscribe handler calls it after
+	// its own checks of the body's shape (the endpoint's length, the keys) and outside any transaction.
 	ValidateEndpoint(ctx context.Context, endpoint string) error
-	// SendTest sends the test notification to the given subscriptions.
+	// SendTest sends the test notification to the given subscriptions, the ones of the caller's session; the
+	// handler never calls it with none. It only queues (04 §14.2): an *api.Error it returns (server_busy,
+	// server_shutdown) is the answer of POST /api/v1/push/test.
 	SendTest(ctx context.Context, subs []store.PushSubscription) error
 }
 
