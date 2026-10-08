@@ -2715,6 +2715,12 @@ In `internal/server/signal`, with `signaltest` fakes and `httptest`:
   - a 200 KiB `pc.answer` (sub) after welcome → accepted by the hub; a 70 KiB `stats` → `message_too_large`.
 - **Rate limits**: a burst of 101 messages → `rate_limited` with `retryAfterMs`; continuous flood → 4429.
   `share.start` 11×/min → `rate_limited`. `stats` twice within 5 s → the second is dropped silently.
+  - After the 4429 the connection is `detached` for the grace: `room.state` shows it `reconnecting`, and its shares
+    stay. A `hello` with its resume token within the grace resumes it (`resumed: true`). If it goes on flooding, it
+    is closed with 4429 again at its first refused message, not 10 s later: the buckets and the flood's start
+    survive the resume (§4.2).
+  - Group 4's tests stop at the close code (`TestRateLimitFlood`), and nothing resumes after a flood. The next
+    slice that changes `internal/server/signal` adds this case.
 - **Roles**: a table test of every client message × every role against §6.3.
 - **Rooms**:
   - two connections of one user → one participant with two connections; watchers merged (max video, any audio);

@@ -424,7 +424,7 @@ Rules (E = error, W = warning):
 | `trusted_proxies` entries are CIDRs; `stun_servers` are `host:port` | E |
 | `admin_socket` ≤ 104 bytes; `data_dir` not empty | E |
 | Durations > 0; `udp_buffer_bytes` between 1 MiB and 64 MiB | E |
-| `push.subject` starts with `mailto:` or `https:` | E |
+| `push.subject` starts with `mailto:` or `https:` (only the prefix is checked; `push.New` also refuses a bare `mailto:` or `https:`, §14.1) | E |
 | `clients.min_version` is SemVer | E |
 | Policy key value accepted by 03's `SettingsCache.Pin` (ranges of 03 §9) | E (at serve startup; reported like other config errors, exit 78) |
 | `metrics.listen` not loopback | W |
@@ -2181,8 +2181,13 @@ The admin UI calls `GET /api/v1/admin/bandwidth?people=5&sharing=2&thumbnails=8&
   else `"mailto:" + tls.acme_email` when that is set, else the public origin. The claim must be a `mailto:` or an
   `https:` URL (RFC 8292 §2.1), so **an `http://` origin** (off mode without a proxy that says https, a development
   server) **is given as `https://`** with the same host: the claim only names a contact, and nothing connects to it.
-  `New` refuses any other subject, with the rule `config` applies to `push.subject` (§4.5), so a config that
-  validates never fails there.
+  `New` refuses any other subject: it must start with `mailto:` or `https:` and have something after the prefix.
+  `config` checks only the prefix (§4.5), so a bare `mailto:` or `https:` in `push.subject` passes config validation
+  and is refused by `New` at startup (§6.1 step 8; with `push.enabled = false` `New` isn't called, §6.6). The
+  derived forms always pass: `mailto:` with a non-empty address, or the origin that `config.NewSite` built, which
+  has a host. Making the config rule as strict as `New`'s, and correcting the comment on `validSubject` (it says
+  the two rules are the same), is a code follow-up for a slice that may touch `internal/server/config` and
+  `internal/server/push`.
 - The key pair comes from `Options.VAPID()` (`SecretStore.VAPID`), read once in `New`, which checks that it is a
   pair: a 65-byte uncompressed P-256 point that belongs to the 32-byte private scalar (`crypto/ecdh`), else `New`
   fails. `VAPIDPublicKey()` returns the point in base64url without padding.

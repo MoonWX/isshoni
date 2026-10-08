@@ -180,6 +180,7 @@ web/
    ├─ auth/                  LoginPage · InvitePage · SignupPage · PendingPage · ResetPage · AboutPage ·
    │                         fragmentToken.ts · useMe.ts · session.ts (startSession, endSession) · logout.ts ·
    │                         useLogout.ts · loginNotice.ts · the form pieces (AuthForm, AccountFields, PasswordField, …)
+   │                         · InAppBrowserBanner.tsx · inAppBanner.ts (the in-app browser banner, §16.3)
    ├─ setup/                 SetupPage (step 1) · WelcomePage (steps 2–3) · InviteLinkCard · QrCode
    ├─ conntest/              probe.ts · runConnTest.ts · verdict.ts · fixText.ts · links.ts · codes.json ·
    │                         ConnTestPanel.tsx
@@ -210,7 +211,8 @@ Three placements differ from what the names suggest (group 4):
 - A lazy page folder's `index.ts` exports only pages. Code that the main chunk needs from such a folder is imported
   from its own file, never through `index.ts`, so that it doesn't pull the pages in: `auth/logout.ts`,
   `auth/useLogout.ts`, `auth/session.ts`, `auth/useMe.ts`, `auth/fragmentToken.ts` and the form pieces that
-  `setup/SetupPage` and the account pages share.
+  `setup/SetupPage` and the account pages share. Another page folder follows the same rule: the room page takes
+  the in-app browser banner from `auth/InAppBrowserBanner.tsx` (§16.3).
 
 **Layering rule.** React components never touch `WebSocket` or `RTCPeerConnection`. Controllers (`RoomSession`,
 `SubscriberPC`, `PublisherPC`, `runConnTest`) and 01's `SignalClient` never import React. They talk through Zustand
@@ -1774,9 +1776,10 @@ URL. A new link of the same kind pasted into a tab that already shows `/invite`,
 the fragment and reloads nothing, so `useFragmentToken()` stashes it and drops it from the address bar as boot
 step 0 does (§4), and the page starts over with the new token.
 
-**The in-app browser banner on the invite and login pages** (§16.3) is not S33's: `web/src/auth/` gets the lines
-that show it from S48 (README; the account part of W11). S33's pages ship without it, and
-`auth/fragmentToken.ts` already exports `readFragmentToken()` for the banner's Copy link on the invite page.
+**The in-app browser banner on the invite and login pages** (§16.3) is not S33's: `web/src/auth/` gets the
+component (`InAppBrowserBanner.tsx`, with `inAppBanner.ts`) and the lines that show it on the two pages from S48
+(README; the account part of W11). S33's pages ship without it, and `auth/fragmentToken.ts` already exports
+`readFragmentToken()` for the banner's Copy link on the invite page. The room page gets its line from S77 (§16.3).
 
 ### 15.2 Account pages
 
@@ -1921,10 +1924,19 @@ the Home Screen app, open this link in Safari" ("in Chrome" on Android, "in your
 - Dismissal lasts for the tab (`platform.storage.session`, `isshoni.inAppBannerDismissed`).
 - While the banner shows, the `needs-install` sheet and card stay hidden; they appear once the banner is dismissed,
   or when the page is opened in a real browser.
-- Who writes it: the banner belongs to W11, not to the auth pages' slice. S33 built the invite and login pages
-  without it, so **S48 adds the banner's lines to `web/src/auth/`** (the invite and login pages, §15.1) next to its
-  own account pages; `platform.inAppBrowser()` (S27) and the invite token for the copied link
-  (`auth/fragmentToken.ts` `readFragmentToken()`, S33) are already there.
+- Who writes it: the banner belongs to W11, not to the slices of the pages that show it.
+  - **The component: S48, in `web/src/auth/`**, the folder of two of its three pages:
+    `auth/InAppBrowserBanner.tsx`, with its state apart in `auth/inAppBanner.ts` (`useInAppBanner()`: whether the
+    banner shows, and the dismissal), so that code which only waits for the banner doesn't pull the component in.
+    Both are imported from their own files, never through `auth/index.ts` (§3). `platform.inAppBrowser()` (S27) and
+    the invite token for the copied link (`auth/fragmentToken.ts`, S33) are already there.
+  - **The invite and login pages: S48.** S33 built them without the banner, so S48 adds the lines that mount it
+    (§15.1) next to its own account pages.
+  - **The room page: S77, not S45.** `web/src/rooms/` is S45's in the group in which S48 writes the component, and
+    a slice can't import what another slice of its group is still writing, so S45's `RoomPage` ships without the
+    banner. S77 (the Web Push flow, five groups later) adds the line that mounts it to `web/src/rooms/`, with the
+    lines for its own notifications card and Home Screen sheet, which are the ones that wait for the banner
+    (README S77).
 - The same tip goes on the project site's `/guide/` (06 §10.2) and in the exit-test run book (06 §12.2).
 
 **Enable** (from a click): `Notification.requestPermission()` → `pushManager.subscribe({userVisibleOnly: true,
@@ -2139,8 +2151,8 @@ tile shows the viewer count and opens the watchers popover; TapToStart appears w
 after a click; ScreenAudioWarning's three buttons call the right actions; the switcher and the admin's "Create room"
 link follow `showRoomList`;
 invites show the link once; locked settings are read-only; with an Instagram UA the invite page shows the in-app
-banner and its Copy link includes `#<token>`, and in the room (iOS UA) the Home Screen sheet stays hidden until the
-banner is dismissed.
+banner and its Copy link includes `#<token>` (S48, which also tests it on the login page and its dismissal), and in
+the room (iOS UA) the banner shows and the Home Screen sheet stays hidden until the banner is dismissed (S77).
 
 ### 19.3 End-to-end (Playwright, Google Chrome)
 
@@ -2360,7 +2372,7 @@ demo is possible after W7.
 | W8 | **Layers, fullscreen, keyboard, mobile**: `layerPolicy` feeding W5's `SubscriptionSync`, IntersectionObserver and visibility, fullscreen/PiP/wake lock, shortcuts, phone layouts, iOS handling, media session, `?focus=` | M | W7 | `layers.spec` passes; policy unit tests; manual M-IOS-1 and M-AND-1 viewing checks pass |
 | W9 | **Resilience**: §9 recovery table, `resync` (resumed and not), re-publish with `replaces` and focus carry-over, 60 s capture hold, Firefox codec wait (caps polling and `caps.update` only), `quality.hint` (codec switch and layer `active` flags) | L | W7, W6, 01 P9 | `reconnect.spec` (a)(b)(c) pass; manual M-FF-1 and M-WIFI pass; a `quality.hint{codec}` makes the sharer re-offer and viewers keep decoding |
 | W10 | **Setup wizard steps 2–3 + connection test**: `/admin/welcome` (`WelcomePage` steps 2–3, `setupWizardDone`), W3's `SetupPage` now navigates to `/admin/welcome?step=2`; `runConnTest`, verdicts, fix text, `InviteLinkCard` with QR; the `check:i18n` `CloudProvider`/`NATKind` rule (§16.5) with every `fix.firewall.<provider>` and `conntest.nat.<nat>` text | L | W3, 04 conntest, 02 probe | `setup.spec` passes; `check:i18n` fails when a `CloudProvider` or `NATKind` constant has no text; on a test VPS with UDP 7882 blocked by the provider firewall the page shows ✗ UDP / ✓ TCP with that provider's text; a non-admin sees no fix text |
-| W11 | **Account + PWA + Web Push**: account and devices pages, the `/download` placeholder (§15.4, `DownloadPage`, exported from `download/index.ts`), manifest, SW (`sw-plugin`, routes, push), update pill, install prompts, notifications flow incl. iOS Home Screen guidance, the in-app browser banner (its lines on the invite and login pages go into `web/src/auth/`, W3's folder: README S48) and preferences | L | W3, 03 push REST, 04 push wiring | `/download` renders the §15.4 placeholder; `pwa.spec` passes; SW unit tests pass; manual M-IOS-2 and M-AND-1 push checks pass |
+| W11 | **Account + PWA + Web Push**: account and devices pages, the `/download` placeholder (§15.4, `DownloadPage`, exported from `download/index.ts`), manifest, SW (`sw-plugin`, routes, push), update pill, install prompts, notifications flow incl. iOS Home Screen guidance, the in-app browser banner (the component and its lines on the invite and login pages go into `web/src/auth/`, W3's folder: README S48; its line on the room page into `web/src/rooms/`, W5's folder: README S77) and preferences | L | W3, 03 push REST, 04 push wiring | `/download` renders the §15.4 placeholder; `pwa.spec` passes; SW unit tests pass; manual M-IOS-2 and M-AND-1 push checks pass |
 | W12 | **Admin pages**: dashboard, users, approvals, invites, rooms, settings, audit, doctor + bandwidth | L | W3, W10, 03/04 admin | `admin.spec` passes; the dashboard updates every 2 s while visible and stops when hidden |
 | W13 | **Hardening**: debug overlay with `stats.watch`, `stats` notifications, sharer hints and level meter, announcer, reduced motion, `check:i18n` unused-key warnings (its other rules came in W1, W2 and W10), VersionMismatch, `a11y.spec`, `version.spec` | M | W7, W9 | Those specs pass; a test shows `check:i18n` fails when a key is removed, and the script warns about unused keys; the overlay shows per-tile stats with no IPs; the upload hint appears under Chrome DevTools network throttling (manual) |
 | W14 | **CI and exit checks**: full e2e in CI (06), manual matrix §19.4 | M | all | CI green on a PR; the matrix filled in; the 06 §12 exit session passes (5 friends, 2 hours, no manual fixes; iPhone and Android watch) |
