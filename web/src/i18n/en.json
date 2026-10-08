@@ -68,6 +68,26 @@
       }
     }
   },
+  "room": {
+    "connection": {
+      "reconnecting": "Reconnecting…",
+      "unreachable": "Can't reach the server. Retrying…",
+      "restarting": "Server restarting…",
+      "retryNow": "Retry now",
+      "retryIn_one": "Retry in {{count}} second",
+      "retryIn_other": "Retry in {{count}} seconds",
+      "testConnection": "Test my connection",
+      "reconnected": "Reconnected"
+    },
+    "event": {
+      "joined": "{{name}} joined",
+      "left": "{{name}} left",
+      "disconnected": "{{name}} disconnected",
+      "shareStarted": "{{name}} started sharing",
+      "shareStopped": "{{name}} stopped sharing",
+      "shareEnded": "{{name}}'s share ended"
+    }
+  },
   "a11y": {
     "notifications": "Notifications",
     "dismiss": "Dismiss",
