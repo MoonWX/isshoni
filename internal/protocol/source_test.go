@@ -16,7 +16,13 @@ import (
 // parsePackage parses the package's non-test Go files.
 func parsePackage(t *testing.T) []*ast.File {
 	t.Helper()
-	paths, err := filepath.Glob("*.go")
+	return parseDir(t, ".")
+}
+
+// parseDir parses the non-test Go files of dir.
+func parseDir(t *testing.T, dir string) []*ast.File {
+	t.Helper()
+	paths, err := filepath.Glob(filepath.Join(dir, "*.go"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,15 +132,38 @@ func holdsAny(expr ast.Expr) bool {
 // type instead: unknown (the Go-only registry Spec), or an index signature of unknown values (Params). tygo reads
 // the tag's value up to its first comma as the type and the rest as options, so the type itself has no comma
 // (Record<string, unknown> would be cut at it).
+//
+// The rule holds for both packages tygo reads (01 §14.4), so the test also parses the sources of the REST DTOs in
+// internal/protocol/api, where later slices add most types.
 func TestNoTSAny(t *testing.T) {
+	// The fields known today, as a floor: a check that finds fewer no longer sees them.
+	for _, pkg := range []struct {
+		dir   string
+		floor int
+	}{
+		{".", 3},   // Spec.Payload, Spec.Result, Error.Params
+		{"api", 4}, // the Params of Error, DoctorCheck and Alert, and AuditEntry.Detail
+	} {
+		checked := checkNoTSAny(t, pkg.dir)
+		if checked < pkg.floor {
+			t.Errorf("%s: found %d fields holding an any, want at least %d: the check no longer sees them",
+				pkg.dir, checked, pkg.floor)
+		}
+	}
+}
+
+// checkNoTSAny runs TestNoTSAny's check on the non-test sources of dir and returns the number of fields it looked
+// at.
+func checkNoTSAny(t *testing.T, dir string) int {
+	t.Helper()
 	anyWord := regexp.MustCompile(`\bany\b`)
 	options := []string{"required", "readonly"}
 	checked := 0
-	for _, f := range parsePackage(t) {
-		typeName := "" // the enclosing type declaration, for the messages
+	for _, f := range parseDir(t, dir) {
+		typeName := f.Name.Name // the package, then the enclosing type declaration, for the messages
 		ast.Inspect(f, func(n ast.Node) bool {
 			if ts, ok := n.(*ast.TypeSpec); ok {
-				typeName = ts.Name.Name
+				typeName = f.Name.Name + "." + ts.Name.Name
 			}
 			st, ok := n.(*ast.StructType)
 			if !ok {
@@ -170,10 +199,7 @@ func TestNoTSAny(t *testing.T) {
 			return true
 		})
 	}
-	// Spec.Payload, Spec.Result and Error.Params at least.
-	if checked < 3 {
-		t.Errorf("found %d fields holding an any, want at least 3: the check no longer sees them", checked)
-	}
+	return checked
 }
 
 // typedConst is one constant declared with an explicit type.

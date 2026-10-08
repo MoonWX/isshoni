@@ -284,8 +284,8 @@ func TestTransportTCPOnIPv6LoopbackOnly(t *testing.T) {
 	bad, err := NewTransport(context.Background(), TransportOptions{
 		TCPAddr: "[::1]:0", IncludeLoopback: true, IPv6: true, Interfaces: lo,
 	})
-	if !errors.Is(err, ErrNoTransport) {
-		t.Errorf("TCP on ::1 only: %v, want ErrNoTransport", err)
+	if !errors.Is(err, ErrNoTransport) || !strings.Contains(err.Error(), "[::1] never carries ICE-TCP") {
+		t.Errorf("TCP on ::1 only: %v, want ErrNoTransport saying that [::1] never carries ICE-TCP", err)
 	}
 	if bad != nil {
 		_ = bad.Close()
@@ -361,8 +361,9 @@ func TestTransportErrors(t *testing.T) {
 	lo := &fakeIfaces{ifs: []Interface{loIface()}}
 	ctx := context.Background()
 
-	if _, err := NewTransport(ctx, TransportOptions{Interfaces: lo}); !errors.Is(err, ErrNoTransport) {
-		t.Errorf("nothing enabled: %v, want ErrNoTransport", err)
+	_, err := NewTransport(ctx, TransportOptions{Interfaces: lo})
+	if !errors.Is(err, ErrNoTransport) || !strings.Contains(err.Error(), "both off") {
+		t.Errorf("nothing enabled: %v, want ErrNoTransport saying that UDP and ICE-TCP are both off", err)
 	}
 	// Only loopback addresses and include_loopback off: no UDP address.
 	if _, err := NewTransport(ctx, TransportOptions{UDPAddr: ":0", Interfaces: lo}); !errors.Is(err, ErrNoTransport) {
@@ -385,7 +386,7 @@ func TestTransportErrors(t *testing.T) {
 
 	// Busy ports are *ListenError wrapping EADDRINUSE; the UDP socket bound before the failure is released.
 	busyUDP := listenUDP(t)
-	_, err := NewTransport(ctx, TransportOptions{UDPAddr: busyUDP.LocalAddr().String(), Interfaces: lo})
+	_, err = NewTransport(ctx, TransportOptions{UDPAddr: busyUDP.LocalAddr().String(), Interfaces: lo})
 	var le *ListenError
 	if !errors.As(err, &le) || le.Proto != "udp" || !errors.Is(err, syscall.EADDRINUSE) {
 		t.Fatalf("busy UDP port: %v, want a udp *ListenError with EADDRINUSE", err)

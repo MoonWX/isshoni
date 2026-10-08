@@ -175,7 +175,13 @@ func NewTransport(ctx context.Context, opts TransportOptions) (_ *Transport, err
 		}
 	}
 	if len(t.NetworkTypes) == 0 {
-		return nil, fmt.Errorf("%w: no UDP socket and no usable address for ICE-TCP", ErrNoTransport)
+		if t.TCPMux == nil {
+			return nil, fmt.Errorf("%w: listen.ice_udp and listen.ice_tcp are both off and there is no 443 multiplexer",
+				ErrNoTransport)
+		}
+		return nil, fmt.Errorf("%w: no UDP socket and no usable address for ICE-TCP (loopback needs "+
+			"network.include_loopback, IPv6 needs network.ipv6, and [::1] never carries ICE-TCP: use 127.0.0.1)",
+			ErrNoTransport)
 	}
 
 	for _, ap := range udpLocal {

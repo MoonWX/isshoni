@@ -1988,7 +1988,7 @@ Forbidden:
     `Spec.Result` (tygo emits the Go-only registry `Spec` too, although it is never on the wire). tygo reads the tag
     up to its first comma as the type and the rest as options (`,extends`, `,required`), so the type is written
     without a comma (an index signature, not `Record<string, unknown>`). The generated files contain no `any`;
-    `TestNoTSAny` checks the tags of `internal/protocol`.
+    `TestNoTSAny` checks the tags of `internal/protocol` and `internal/protocol/api`.
 
   Enum const groups need at least 2 members and names prefixed by the type name; anything else stays a plain
   `string` in TS. `CodecKey` uses single-line consts on purpose: it must stay an open `string`.
