@@ -9,7 +9,8 @@
 // a PWA provider (the desktop app, M2) it is the platform's reload action.
 //
 // While the user shares their screen a reload would end the share, so the pill only says that an update waits and
-// offers no button (§16.2 "not while sharing"); it gets its button back when the share ends.
+// offers no button (§16.2 "not while sharing"); it gets its button back when the share ends. "Sharing" is
+// uiStore.sharing, which share/ keeps equal to its share state (share/shareUi.ts).
 import { RefreshCw } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -19,15 +20,11 @@ import { cx } from '../ui/cx';
 import { useApp, useUi } from './context';
 import styles from './UpdatePill.module.css';
 
-export interface UpdatePillProps {
-  /** The user is sharing their screen right now. Default false. */
-  sharing?: boolean;
-}
-
-export function UpdatePill({ sharing = false }: UpdatePillProps) {
+export function UpdatePill() {
   const { t } = useTranslation();
   const { platform, ui } = useApp();
   const ready = useUi((s) => s.updateReady);
+  const sharing = useUi((s) => s.sharing);
   const [reloading, setReloading] = useState(false);
 
   useEffect(

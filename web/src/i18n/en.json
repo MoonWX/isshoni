@@ -177,6 +177,37 @@
     },
     "unavailable": {
       "phone": "Sharing from phones needs the app (coming later)"
+    },
+    "panel": {
+      "label": "Your share",
+      "starting": "Starting your share…",
+      "live": "You're live · {{what}} · {{preset}} · {{watching}}",
+      "reconnecting": "Reconnecting your share…",
+      "unreachable": "Can't reach the server's media port. isshoni keeps trying.",
+      "stopping": "Stopping your share…",
+      "stop": "Stop",
+      "stopSharing": "Stop sharing",
+      "details": "Share settings",
+      "watching_one": "{{count}} watching",
+      "watching_other": "{{count}} watching",
+      "sound": "Share sound",
+      "soundOff": "No sound is shared",
+      "level": "Sound level",
+      "noSound": "No sound captured",
+      "watchers": "Watching now",
+      "nobodyWatching": "Nobody is watching yet.",
+      "someone": "Someone",
+      "testConnection": "Test my connection",
+      "dismiss": "Dismiss",
+      "hint": {
+        "upload": "Your upload allows about {{height}}p",
+        "cpu": "Your computer is struggling to encode. Try the Text preset or share a smaller window."
+      }
+    },
+    "ended": {
+      "elsewhere": "Sharing was stopped from another tab or device",
+      "mediaTimeout": "Sharing stopped: no video reached the server",
+      "generic": "Sharing stopped by the server"
     }
   },
   "room": {

@@ -1,6 +1,5 @@
 // ShareSheet (05 §13.1): what the Share button opens. A preset picker, the tip that steers towards a window with
 // its own sound, and the Share button that opens the browser's picker.
-import type { TFunction } from 'i18next';
 import { Lightbulb, MonitorUp } from 'lucide-react';
 import { useId, useState } from 'react';
 import { Trans, useTranslation } from 'react-i18next';
@@ -9,10 +8,11 @@ import { Link } from 'react-router';
 import { useApp, usePrefs } from '../app/context';
 import { errorMessage } from '../lib/errorText';
 import type { PickedSource, SharingProvider } from '../platform/types';
-import { PresetGame, PresetMovie, PresetText, type Preset } from '../protocol/types.gen';
+import type { Preset } from '../protocol/types.gen';
 import { Button } from '../ui/Button';
 import { Sheet } from '../ui/Sheet';
 import { PRESETS } from './presets';
+import { presetText } from './presetText';
 import styles from './ShareSheet.module.css';
 
 /**
@@ -36,20 +36,6 @@ export interface ShareSheetProps {
   onPick: (picking: Promise<PickedSource | null>, preset: Preset) => void;
   /** Set while room.state has a share of this user from another tab or device. */
   elsewhere?: ShareElsewhere | null;
-}
-
-/** A preset's name and its one line. Literal keys, so check:i18n sees each one. */
-function presetText(preset: Preset, t: TFunction): { name: string; hint: string } {
-  switch (preset) {
-    case PresetGame:
-      return { name: t('share.preset.game.name'), hint: t('share.preset.game.hint') };
-    case PresetMovie:
-      return { name: t('share.preset.movie.name'), hint: t('share.preset.movie.hint') };
-    case PresetText:
-      return { name: t('share.preset.text.name'), hint: t('share.preset.text.hint') };
-    default:
-      return { name: t('share.preset.auto.name'), hint: t('share.preset.auto.hint') };
-  }
 }
 
 function ElsewhereNotice({ elsewhere }: { elsewhere: ShareElsewhere }) {
