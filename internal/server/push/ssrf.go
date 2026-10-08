@@ -144,22 +144,33 @@ func (g *guard) control(_, address string, _ syscall.RawConn) error {
 
 // parseEndpoint applies the URL rules of 04 §14.5 to a subscription endpoint: https only, port 443 (explicit or
 // implicit), no userinfo, and a host that is a DNS name, never an IP literal in any spelling. It returns the URL,
-// or the reason it is refused. With lax (tests only, guard.allowPrivate) any port and an IP literal pass.
+// or the reason it is refused. The rules are checked in that order (the one 03 §12.4.6 lists), so an endpoint
+// that breaks several of them is refused with the reason of the first. With lax (tests only, guard.allowPrivate)
+// any port and an IP literal pass.
 func parseEndpoint(raw string, lax bool) (*url.URL, api.PushRejectReason) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		// Not a URL at all. With an https:// prefix the scheme is not the problem: the port is not a number, or
-		// the rest can't name a host.
+		// Not a URL at all. With an https:// prefix the scheme is not the problem, and the reason follows the
+		// order of the checks below: the port is not a number, there is userinfo, or the rest can't name a host.
 		if len(raw) < 8 || !strings.EqualFold(raw[:8], "https://") {
 			return nil, api.PushRejectReasonNotHTTPS
 		}
-		if hasBadPort(raw[8:]) {
+		userinfo, hostport := splitAuthority(raw[8:])
+		if hasBadPort(hostport) {
 			return nil, api.PushRejectReasonBadPort
+		}
+		if userinfo {
+			return nil, api.PushRejectReasonUserinfo
 		}
 		return nil, api.PushRejectReasonUnresolvable
 	}
 	if u.Scheme != "https" || u.Opaque != "" {
 		return nil, api.PushRejectReasonNotHTTPS
+	}
+	if !lax {
+		if port := u.Port(); (port != "" && port != "443") || strings.HasSuffix(u.Host, ":") {
+			return nil, api.PushRejectReasonBadPort
+		}
 	}
 	if u.User != nil {
 		return nil, api.PushRejectReasonUserinfo
@@ -170,9 +181,6 @@ func parseEndpoint(raw string, lax bool) (*url.URL, api.PushRejectReason) {
 	}
 	if lax {
 		return u, ""
-	}
-	if port := u.Port(); (port != "" && port != "443") || strings.HasSuffix(u.Host, ":") {
-		return nil, api.PushRejectReasonBadPort
 	}
 	if strings.HasPrefix(u.Host, "[") || endsInNumber(host) {
 		return nil, api.PushRejectReasonIPLiteral
@@ -189,18 +197,25 @@ func parseEndpoint(raw string, lax bool) (*url.URL, api.PushRejectReason) {
 	return u, ""
 }
 
-// hasBadPort reports whether the authority at the start of rest (a URL without its scheme and "//") ends in a
-// port that is not a number: net/url refuses such a URL as a whole, and the port is the reason to give.
-func hasBadPort(rest string) bool {
+// splitAuthority takes the authority at the start of rest (a URL without its scheme and "//", one that net/url
+// refuses as a whole) apart the way net/url does: it ends at the first "/", "?" or "#", and its last "@" separates
+// the userinfo from the host and port. It reports whether there is userinfo, and returns the host and port.
+func splitAuthority(rest string) (userinfo bool, hostport string) {
 	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
 		rest = rest[:i]
 	}
-	rest = rest[strings.LastIndexByte(rest, '@')+1:]
-	i := strings.LastIndexByte(rest, ':')
-	if i < 0 || strings.HasSuffix(rest, "]") {
+	at := strings.LastIndexByte(rest, '@')
+	return at >= 0, rest[at+1:]
+}
+
+// hasBadPort reports whether hostport (the host and port of a URL that net/url refuses as a whole) ends in a port
+// that is not a number: the port is then the reason to give.
+func hasBadPort(hostport string) bool {
+	i := strings.LastIndexByte(hostport, ':')
+	if i < 0 || strings.HasSuffix(hostport, "]") {
 		return false
 	}
-	for _, c := range []byte(rest[i+1:]) {
+	for _, c := range []byte(hostport[i+1:]) {
 		if c < '0' || c > '9' {
 			return true
 		}

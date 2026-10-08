@@ -107,6 +107,26 @@ func TestValidateEndpoint(t *testing.T) {
 		{"https://@push.example.com/", userinfo, noLookup},
 		{"https://push.example.com@10.0.0.1/", userinfo, noLookup},
 
+		// An endpoint that breaks several rules gets the reason of the first, in the order scheme, port, userinfo,
+		// IP literal (03 §12.4.6), whether net/url can parse it or not.
+		{"http://user@10.0.0.1:8443/x", notHTTPS, noLookup},
+		{"http://user@push.example.com:abc/x", notHTTPS, noLookup},
+		{"https://user@push.example.com:8443/x", badPort, noLookup},
+		{"https://user@push.example.com:/x", badPort, noLookup},
+		{"https://user@push.example.com:abc/x", badPort, noLookup},
+		{"https://user@10.0.0.1:8443/x", badPort, noLookup},
+		{"https://user@[::1]:8443/x", badPort, noLookup},
+		{"https://user@exa mple.com:abc/x", badPort, noLookup},
+		{"https://:8443/x", badPort, noLookup},
+		{"https://user@push.example.com:443/x", userinfo, noLookup},
+		{"https://user@10.0.0.1/x", userinfo, noLookup},
+		{"https://user@[::1]:443/x", userinfo, noLookup},
+		{"https://user@localhost/x", userinfo, noLookup},
+		{"https://user:8443@push.example.com/x", userinfo, noLookup},
+		{"https://user@exa mple.com/x", userinfo, noLookup},
+		{"https://us er@push.example.com/x", userinfo, noLookup},
+		{"https://user@/x", userinfo, noLookup},
+
 		// IP literals, in every spelling.
 		{"https://93.184.216.34/send/abc", ipLiteral, noLookup},
 		{"https://93.184.216.34./send/abc", ipLiteral, noLookup},
@@ -350,6 +370,7 @@ func TestParseEndpointLax(t *testing.T) {
 	for endpoint, want := range map[string]api.PushRejectReason{
 		"http://127.0.0.1:49152/push/abc": api.PushRejectReasonNotHTTPS,
 		"https://user@127.0.0.1/":         api.PushRejectReasonUserinfo,
+		"https://user@127.0.0.1:49152/x":  api.PushRejectReasonUserinfo, // the port rule is off, the next one is not
 		"https:///x":                      api.PushRejectReasonUnresolvable,
 	} {
 		if _, reason := parseEndpoint(endpoint, true); reason != want {

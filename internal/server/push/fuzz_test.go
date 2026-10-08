@@ -23,6 +23,8 @@ func FuzzParseEndpoint(f *testing.F) {
 		"https://push.example.com:/x",
 		"https://push.example.com:abc/x",
 		"https://user:pw@push.example.com/x",
+		"https://user@push.example.com:8443/x",
+		"https://us er@exa mple.com:abc/x",
 		"https://127.0.0.1/x",
 		"https://[::1]/x",
 		"https://[fe80::1%25eth0]/x",
