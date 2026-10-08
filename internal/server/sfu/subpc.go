@@ -3,6 +3,7 @@ package sfu
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -18,9 +19,14 @@ import (
 type subPC struct {
 	gen uint32
 	pc  *webrtc.PeerConnection
-	// ready is the DTLS-ready gate (02 §9.3): true once this PC has been connected. A rebuilt sub PC is a new subPC
-	// with its own gate, so a stale "ready" can never leak.
+	// ready is the DTLS-ready gate (02 §9.3): true while this PC can send (follow). Its DownTracks forward nothing
+	// while it is false, because Pion drops RTP written before DTLS is up (S4 finding 1), and RTP written to a PC that
+	// has failed or closed, without an error. A rebuilt sub PC is a new subPC with its own gate, so a stale "ready"
+	// can never leak.
 	ready atomic.Bool
+	// readers are the RTCP readers of the PC's DownTracks, one per sender; each ends when its sender stops, all of
+	// them when the PC closes.
+	readers sync.WaitGroup
 
 	// closed: the PeerConnection is closed, by Pion because the client closed its side, or by the SFU after a fatal
 	// error (subFatal). Nothing is offered on it any more, and no offer is outstanding or waiting (markClosed); README
@@ -67,6 +73,7 @@ func (c *Conn) ensureSubPC() (*subPC, error) {
 
 // addTrack gives dt a sendonly transceiver of its own: viewers never send media on the sub PC. Reusing the inactive
 // transceiver of an ended share, so that the SDP doesn't grow over a long session, comes with README S52 (02 §9.3).
+// It starts the reader of the viewer's RTCP for the track, which runs until the sender stops.
 func (s *subPC) addTrack(dt *DownTrack) error {
 	dt.pc.Store(s)
 	tr, err := s.pc.AddTransceiverFromTrack(dt,
@@ -74,7 +81,9 @@ func (s *subPC) addTrack(dt *DownTrack) error {
 	if err != nil {
 		return err
 	}
-	dt.transceiver, dt.sender = tr, tr.Sender()
+	sender := tr.Sender()
+	dt.transceiver, dt.sender = tr, sender
+	s.readers.Go(func() { dt.readRTCP(sender) })
 	return nil
 }
 
@@ -105,9 +114,27 @@ func (s *subPC) bindings() []TrackBinding {
 	return out
 }
 
-// markClosed puts s into the closed state of 02 §5.3: no offer is outstanding or waiting, and none follows.
+// follow makes the DTLS-ready gate follow the PC's connection state; the actor calls it for every state it handles
+// (onPCState). The gate opens when the PC is connected. It stays as it is while the PC is disconnected: the selected
+// pair is still there, packets may get through, and ICE often recovers by itself. In every other state it is closed:
+// a failed or closed PC sends nothing, and Pion takes what is written to it without an error for as long as it stays
+// that way, as it does before DTLS is up; a PC that is connecting again (an ICE restart, README S57) opens the gate
+// anew when it is connected, with a keyframe request for each video DownTrack.
+func (s *subPC) follow(state webrtc.PeerConnectionState) {
+	switch state {
+	case webrtc.PeerConnectionStateConnected:
+		s.ready.Store(true)
+	case webrtc.PeerConnectionStateDisconnected:
+	default:
+		s.ready.Store(false)
+	}
+}
+
+// markClosed puts s into the closed state of 02 §5.3: no offer is outstanding or waiting, and none follows. Its
+// gate is shut for good.
 func (s *subPC) markClosed() {
 	s.closed = true
+	s.ready.Store(false)
 	s.offering, s.dirty = false, false
 	if s.debounce != nil {
 		s.debounce.Stop()
@@ -115,12 +142,14 @@ func (s *subPC) markClosed() {
 	}
 }
 
-// close stops the debounce timer and closes the PeerConnection.
+// close stops the debounce timer, closes the PeerConnection and waits for the RTCP readers of its DownTracks, which
+// end when Pion stops their senders.
 func (s *subPC) close(log *slog.Logger) {
 	s.markClosed()
 	if err := s.pc.Close(); err != nil {
 		log.Debug("sub PC close", "gen", s.gen, "err", err)
 	}
+	s.readers.Wait()
 }
 
 // subFatal closes sub PC s after an error it can't negotiate past: an offer Pion couldn't make or set, or an answer

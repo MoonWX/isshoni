@@ -21,19 +21,26 @@ type SFU struct {
 	// tests. It is set before the first Join and never changes.
 	commandWait time.Duration
 
-	mu     sync.Mutex // guards the fields below; lock order: SFU.mu → Room.mu → Share.mu (doc.go)
-	closed bool
-	limits Limits
-	rooms  map[RoomID]*Room
-	conns  map[ConnID]*Conn   // joined and not closed
-	shares map[ShareID]*Share // every share that hasn't ended
+	// The ticker (02 §5.4): one goroutine, started by the first Join and stopped by Close. kick wakes it at once for a
+	// share's state change, tickStop ends it and tickDone says that it has ended.
+	kick     chan struct{} // capacity 1
+	tickStop chan struct{}
+	tickDone chan struct{}
+
+	mu      sync.Mutex // guards the fields below; lock order: SFU.mu → Room.mu → Share.mu → DownTrack.mu (doc.go)
+	closed  bool
+	ticking bool // the ticker goroutine was started
+	limits  Limits
+	rooms   map[RoomID]*Room
+	conns   map[ConnID]*Conn   // joined and not closed
+	shares  map[ShareID]*Share // every share that hasn't ended
 	// actors are the Conns whose actor goroutine still runs: the joined ones, and closed ones until their PCs are
 	// closed. Close waits for them.
 	actors map[*Conn]struct{}
 }
 
 // New checks cfg and builds the SFU's APIs on cfg.Transport, whose sockets 04 has already bound. It starts no
-// goroutine; each Join starts its Conn's actor.
+// goroutine: the first Join starts the ticker, and each Join its Conn's actor.
 func New(cfg Config, deps Deps) (*SFU, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -57,6 +64,9 @@ func New(cfg Config, deps Deps) (*SFU, error) {
 		apis:           a,
 		pauseUnwatched: cfg.PauseUnwatchedLayers,
 		commandWait:    commandWait,
+		kick:           make(chan struct{}, 1),
+		tickStop:       make(chan struct{}),
+		tickDone:       make(chan struct{}),
 		limits:         cfg.Limits,
 		rooms:          map[RoomID]*Room{},
 		conns:          map[ConnID]*Conn{},
@@ -76,9 +86,9 @@ func (s *SFU) Ready() error {
 	return nil
 }
 
-// Close ends every share with server_shutdown and closes every Conn, their PeerConnections concurrently. It returns
-// within 1 s: Conns still closing their PCs then are abandoned (they finish on their own) and counted in a warning.
-// It is safe to call twice and never closes the Transport, which is 04's.
+// Close ends every share with server_shutdown, closes every Conn, their PeerConnections concurrently, and stops the
+// ticker. It returns within 1 s: Conns still closing their PCs then are abandoned (they finish on their own) and
+// counted in a warning. It is safe to call twice and never closes the Transport, which is 04's.
 func (s *SFU) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -86,6 +96,7 @@ func (s *SFU) Close() error {
 		return nil
 	}
 	s.closed = true
+	ticking := s.ticking
 	shares := make([]*Share, 0, len(s.shares))
 	for _, sh := range s.shares {
 		shares = append(shares, sh)
@@ -107,9 +118,19 @@ func (s *SFU) Close() error {
 	for _, c := range conns {
 		c.Close(EndReasonServerShutdown)
 	}
+	close(s.tickStop)
 
 	deadline := time.NewTimer(closeTimeout)
 	defer deadline.Stop()
+	if ticking {
+		select {
+		case <-s.tickDone:
+		case <-deadline.C:
+			// Only a RoomEvents call that blocks, against its contract, can keep the ticker this long.
+			s.log.Warn("the ticker was still reporting when the SFU closed", "timeout", closeTimeout)
+			return nil
+		}
+	}
 	for i, c := range actors {
 		select {
 		case <-c.done:
@@ -130,6 +151,72 @@ func (s *SFU) Close() error {
 		}
 	}
 	return nil
+}
+
+// ---- the ticker (02 §5.4) ----
+
+// runTicker is the SFU's ticker goroutine. Every 250 ms, and at once when a share changes state (kick), it makes the
+// ShareUpdated calls that are due; once a second it turns the layers' counters into rates and sizes their packet
+// caches. Later slices add the rest of 02 §5.4's ticker work (README S57, S69, S84, S88).
+func (s *SFU) runTicker() {
+	defer close(s.tickDone)
+	tick := time.NewTicker(tickInterval)
+	defer tick.Stop()
+	for n := 1; ; {
+		select {
+		case <-s.tickStop:
+			return
+		case <-s.kick:
+		case <-tick.C:
+			if n%statsEvery == 0 {
+				s.everySecond(monoNow())
+			}
+			n++
+		}
+		s.reportShares(monoNow())
+	}
+}
+
+// liveShares returns the shares that haven't ended.
+func (s *SFU) liveShares() []*Share {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	shares := make([]*Share, 0, len(s.shares))
+	for _, sh := range s.shares {
+		shares = append(shares, sh)
+	}
+	return shares
+}
+
+// reportShares makes the ShareUpdated calls that are due (Share.takeUpdates). Only the ticker goroutine calls it, so
+// one share's reports keep their order, and Share.notify keeps them ahead of its ShareEnded.
+func (s *SFU) reportShares(now int64) {
+	for _, sh := range s.liveShares() {
+		sh.notify.Lock()
+		for _, info := range sh.takeUpdates(now) {
+			s.events.ShareUpdated(info.Room, info)
+		}
+		sh.notify.Unlock()
+	}
+}
+
+// everySecond is the ticker's once-a-second work on the media path: each layer's rates and cache size (02 §9.1).
+func (s *SFU) everySecond(now int64) {
+	for _, sh := range s.liveShares() {
+		for _, l := range sh.attached() {
+			l.tick(now)
+		}
+	}
+}
+
+// shareLive runs when a share's first keyframe has made it live (the layer's read loop calls it): the ticker reports
+// the state change at once.
+func (s *SFU) shareLive(sh *Share) {
+	s.log.Info("share live", "share_id", string(sh.id), "room_id", string(sh.room.id), "conn_id", string(sh.conn.id))
+	select {
+	case s.kick <- struct{}{}:
+	default: // a kick is already waiting, and the ticker looks at every share when it takes it
+	}
 }
 
 // errCaller is the error of a call that breaks the API's contract (an empty id, a nil Signaler, a share id used
@@ -189,6 +276,10 @@ func (s *SFU) addConn(p JoinParams) (*Conn, error) {
 	s.conns[c.id] = c
 	s.actors[c] = struct{}{}
 	go c.run()
+	if !s.ticking {
+		s.ticking = true
+		go s.runTicker()
+	}
 	return c, nil
 }
 
@@ -252,6 +343,7 @@ func (s *SFU) addShare(c *Conn, p StartShareParams) (*Share, error) {
 		id: p.ID, room: c.room, part: c.part, conn: c, source: p.Source, startedAt: time.Now(),
 		preset: p.Preset, state: SharePending,
 	}
+	sh.awaitsKeyframe.Store(true)
 	s.shares[sh.id] = sh
 	c.room.shares[sh.id] = sh
 	c.part.shares[sh.id] = sh
@@ -269,7 +361,8 @@ func (s *SFU) lookupShare(id ShareID) *Share {
 // publishing Conn (its tracks stop feeding the share) and every subscriber (its subscription and DownTracks go, and
 // its sub PC renegotiates). The Conns hear it on their internal event queues, so endShare never waits for an actor
 // and returns once the share is gone and the posts are queued (02 §5.4). It returns false when the share had already
-// ended; ShareEnded fires once per share.
+// ended. ShareEnded fires once per share and is the last thing reported about it: a state change that the ticker
+// hadn't reported yet is reported here first, and nothing follows.
 func (s *SFU) endShare(sh *Share, r EndReason) bool {
 	s.mu.Lock()
 	if s.shares[sh.id] != sh {
@@ -283,10 +376,15 @@ func (s *SFU) endShare(sh *Share, r EndReason) bool {
 	sh.room.mu.Unlock()
 	s.mu.Unlock()
 
-	info, subscribers := sh.end()
+	sh.notify.Lock()
+	info, unreported, subscribers := sh.end()
 	s.log.Info("share ended", "share_id", string(sh.id), "room_id", string(info.Room), "conn_id", string(info.Conn),
 		"reason", string(r))
+	for _, u := range unreported {
+		s.events.ShareUpdated(u.Room, u)
+	}
 	s.events.ShareEnded(info.Room, info, r)
+	sh.notify.Unlock()
 	sh.conn.post(func() { sh.conn.detachShare(sh) })
 	for _, sub := range subscribers {
 		sub.post(func() { sub.subscribedShareEnded(sh) })

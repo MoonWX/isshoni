@@ -1333,6 +1333,7 @@ func TestUpdateSubscriptions(t *testing.T) {
 			sub.audio = newDownTrack(sub, webrtc.RTPCodecTypeAudio)
 			viewer.subs[ShareID(fmt.Sprintf("s_fill%d", i))] = sub
 		}
+		viewer.subs["s_2"].detach() // as when its share ends: off the fan-out lists, its writers stopped
 		delete(viewer.subs, "s_2")
 		viewer.subs["s_fill_last"] = viewer.subs["s_fill2"]
 		return nil

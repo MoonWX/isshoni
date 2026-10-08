@@ -3,9 +3,12 @@ package sfu
 import (
 	"context"
 	"log/slog"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 
+	"github.com/pion/rtcp"
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -15,6 +18,9 @@ import (
 type pubPC struct {
 	gen uint32
 	pc  *webrtc.PeerConnection
+	// rtcpSSRC is the sender SSRC of the RTCP the SFU writes to the publisher on this PC (PLI now, REMB with README
+	// S88): random and never 0. Receivers match such feedback by its media SSRC; the sender SSRC only names the SFU.
+	rtcpSSRC uint32
 	// neg is the last negotiation answered in this gen and answer what it got: a repeated neg gets answer again, a
 	// lower one is stale (01 §9 rule 3).
 	neg    uint32
@@ -37,12 +43,12 @@ type pubPC struct {
 // trackKey names one incoming RTP stream of a pub PC: an m-section and, for simulcast, a rid.
 type trackKey struct{ mid, rid string }
 
-// pubTrack is one incoming RTP stream of a pub PC with its two readers (RTP and RTCP). The readers run for as long
-// as Pion delivers the track, whether or not it carries a share: a track that nobody reads fills Pion's buffers.
-// What they read goes to the Layer the track is attached to. The media path (README S41) adds what a Layer does
-// with a packet (02 §9.1); until then, and whenever layer is nil (the m-section carries no share: 02 §8.4 step 1),
-// the packets are counted and discarded. When the RTP read fails the track has ended: its Layer ends with it
-// (02 §5.1) and the track leaves its PC's table, so no later offer binds it to a share.
+// pubTrack is one incoming RTP stream of a pub PC with its two readers (RTP and RTCP): the Layer RTP and RTCP loops
+// of 02 §5.4. The readers run for as long as Pion delivers the track, whether or not it carries a share: a track
+// that nobody reads fills Pion's buffers. What they read goes to the Layer the track is attached to (Layer.handleRTP,
+// Layer.handleSR: 02 §9.1); while layer is nil (the m-section carries no share: 02 §8.4 step 1) the packets are
+// counted and discarded. When the RTP read fails the track has ended: its Layer ends with it (02 §5.1) and the
+// track leaves its PC's table, so no later offer binds it to a share.
 type pubTrack struct {
 	key   trackKey
 	kind  webrtc.RTPCodecType
@@ -219,7 +225,7 @@ func (c *Conn) newPubPC(gen uint32) (*pubPC, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &pubPC{gen: gen, pc: pc, tracks: map[trackKey]*pubTrack{}}
+	p := &pubPC{gen: gen, pc: pc, rtcpSSRC: rand.Uint32() | 1, tracks: map[trackKey]*pubTrack{}} //nolint:gosec // not a secret
 	pc.OnTrack(func(track *webrtc.TrackRemote, recv *webrtc.RTPReceiver) {
 		// Pion hands the track over once: if the Conn is closing and drops the post, the PC is closing too.
 		c.post(func() { c.onPubTrack(p, track, recv) })
@@ -243,8 +249,10 @@ func (p *pubPC) close(log *slog.Logger) {
 	p.readers.Wait()
 }
 
-// onPubTrack takes a track Pion delivers on pub PC p (posted by OnTrack): it starts the track's readers and attaches
-// it to the share its m-section is bound to, if any.
+// onPubTrack takes a track Pion delivers on pub PC p (posted by OnTrack): it attaches it to the share its m-section
+// is bound to, if any, and then starts the track's readers. In that order, because Pion delivers a track with its
+// first packet, which is the start of the stream's first keyframe: read before the Layer is attached it would be
+// discarded, and the share would stay pending until the next keyframe.
 func (c *Conn) onPubTrack(p *pubPC, track *webrtc.TrackRemote, recv *webrtc.RTPReceiver) {
 	if c.pub != p {
 		return // p was replaced or closed: its tracks have ended
@@ -262,6 +270,8 @@ func (c *Conn) onPubTrack(p *pubPC, track *webrtc.TrackRemote, recv *webrtc.RTPR
 		old.detach()
 	}
 	p.tracks[t.key] = t
+	c.log.Debug("pub track", "gen", p.gen, "kind", t.kind.String(), "rid", t.key.rid)
+	c.bindTrack(p, t)
 	p.readers.Add(2)
 	go func() {
 		defer p.readers.Done()
@@ -273,8 +283,6 @@ func (c *Conn) onPubTrack(p *pubPC, track *webrtc.TrackRemote, recv *webrtc.RTPR
 		defer p.readers.Done()
 		t.readRTCP()
 	}()
-	c.log.Debug("pub track", "gen", p.gen, "kind", t.kind.String(), "rid", t.key.rid)
-	c.bindTrack(p, t)
 }
 
 // pubTrackEnded runs on the actor when the RTP read of t, a track of pub PC p, has failed: p closed, or Pion stopped
@@ -319,7 +327,8 @@ func (c *Conn) bindTrack(p *pubPC, t *pubTrack) {
 		return
 	}
 	l := newLayer(slot, t.kind)
-	l.share, l.rid, l.track, l.recv, l.pubPC, l.ssrc = target, t.key.rid, t.track, t.recv, p.pc, uint32(t.track.SSRC())
+	l.share, l.rid, l.track, l.recv, l.ssrc = target, t.key.rid, t.track, t.recv, uint32(t.track.SSRC())
+	l.pubPC, l.rtcpSSRC = p.pc, p.rtcpSSRC
 	if l.kind == webrtc.RTPCodecTypeVideo && l.rid == "" {
 		l.rid = ridFull
 	}
@@ -357,33 +366,75 @@ func (t *pubTrack) detach() {
 	}
 }
 
-// readRTP reads the track's RTP until the track ends (the PC closed, or Pion stopped the receiver). Its caller then
-// tells the actor (pubTrackEnded).
+// readRTP is the Layer RTP loop of 02 §9.1: it reads the track's RTP into one reusable buffer until the track ends
+// (the PC closed, or Pion stopped the receiver), and hands each packet to the Layer the track is attached to. Its
+// caller then tells the actor (pubTrackEnded). Packets that Pion recovered from the publisher's RTX stream come out
+// of the same Read, late and with their original sequence number.
+//
+// A video packet's profile comes from its payload type through the codecs negotiated on the pub PC: Pion keeps the
+// track's codec in step with the payload type of the packet it just returned, so the lookup runs only when the
+// payload type changes (the publisher switched profiles after a codec policy change), and for packets in a payload
+// type that is no H.264 the SFU forwards, which the Layer drops.
 func (t *pubTrack) readRTP() {
 	buf := make([]byte, rtpReadBuffer)
+	var (
+		pkt     rtp.Packet // reused: Unmarshal keeps the header's slices
+		pt      uint8
+		profile ProfileKey // of payload type pt; "" before the first packet
+	)
+	video := t.kind == webrtc.RTPCodecTypeVideo
 	for {
-		if _, _, err := t.track.Read(buf); err != nil {
+		n, _, err := t.track.Read(buf)
+		if err != nil {
 			return
 		}
 		t.packets.Add(1)
-		// README S41: hand the packet to t.layer (parse, cache, fan-out: 02 §9.1). Without a Layer it is discarded.
+		l := t.layer.Load()
+		if l == nil {
+			continue // the m-section carries no share: read and discarded
+		}
+		if err := pkt.Unmarshal(buf[:n]); err != nil {
+			continue // a malformed packet (bad padding or extension lengths): nothing to forward
+		}
+		if video && (profile == "" || pkt.PayloadType != pt) {
+			pt = pkt.PayloadType
+			profile, _ = codecProfile(t.track.Codec())
+		}
+		l.handleRTP(&pkt, profile, monoNow())
 	}
 }
 
-// readRTCP reads the RTCP of the track's stream until it ends: per rid for simulcast (S4 finding 2). Reading is what
-// keeps the publish side's interceptors (NACK generator, receiver reports, TWCC) running. README S41 adds the sender
-// reports (02 §9.1).
+// readRTCP is the Layer RTCP loop of 02 §9.1: it reads the RTCP of the track's stream until it ends, per rid for
+// simulcast (S4 finding 2), and hands the publisher's sender reports to the Layer. Reading is also what keeps the
+// publish side's interceptors (NACK generator, receiver reports, TWCC) running.
 func (t *pubTrack) readRTCP() {
 	buf := make([]byte, rtpReadBuffer)
 	for {
-		var err error
+		var (
+			n   int
+			err error
+		)
 		if t.key.rid != "" {
-			_, _, err = t.recv.ReadSimulcast(buf, t.key.rid)
+			n, _, err = t.recv.ReadSimulcast(buf, t.key.rid)
 		} else {
-			_, _, err = t.recv.Read(buf)
+			n, _, err = t.recv.Read(buf)
 		}
 		if err != nil {
 			return
+		}
+		l := t.layer.Load()
+		if l == nil {
+			continue
+		}
+		pkts, err := rtcp.Unmarshal(buf[:n])
+		if err != nil {
+			continue
+		}
+		now := monoNow()
+		for _, pkt := range pkts {
+			if sr, ok := pkt.(*rtcp.SenderReport); ok {
+				l.handleSR(sr, now)
+			}
 		}
 	}
 }
