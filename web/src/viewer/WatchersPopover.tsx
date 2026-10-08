@@ -53,10 +53,12 @@ export interface WatchersPopoverProps {
   share: ViewerShare;
   /** Show "3 watching" next to the eye (the stage) instead of the bare count (a tile). */
   withText?: boolean;
+  /** The eye's tabindex: -1 in a tile that is not its list's tab stop (05 §12.7). */
+  tabIndex?: number | undefined;
   className?: string | undefined;
 }
 
-export function WatchersPopover({ share, withText = false, className }: WatchersPopoverProps) {
+export function WatchersPopover({ share, withText = false, tabIndex, className }: WatchersPopoverProps) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const [place, setPlace] = useState<CSSProperties>({});
@@ -126,6 +128,7 @@ export function WatchersPopover({ share, withText = false, className }: Watchers
         aria-haspopup="dialog"
         aria-expanded={open}
         aria-controls={id}
+        tabIndex={tabIndex}
         onClick={() => {
           if (!open && triggerRef.current) setPlace(placeAt(triggerRef.current));
           setOpen(!open);

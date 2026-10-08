@@ -9,6 +9,8 @@
   min-height: 0;
   overflow: hidden;
   color: var(--color-on-stage);
+  /* A double tap is the fullscreen toggle (05 §12.5), not the browser's zoom. */
+  touch-action: manipulation;
   background-color: var(--color-stage);
   border-radius: var(--radius-md);
 }
@@ -71,6 +73,15 @@
   min-height: var(--tap-target);
   padding: var(--space-5) var(--space-3) var(--space-2);
   background: linear-gradient(transparent, var(--color-stage-overlay));
+}
+
+/*
+ * The stage reaches the screen's edges (fullscreen, a phone held sideways): the bar keeps clear of the notch, the
+ * rounded corners and the home indicator, as the badge does at the top.
+ */
+.edge .bar {
+  padding-inline: max(var(--space-3), var(--safe-left)) max(var(--space-3), var(--safe-right));
+  padding-bottom: max(var(--space-2), var(--safe-bottom));
 }
 
 .title {

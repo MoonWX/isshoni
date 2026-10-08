@@ -1,6 +1,5 @@
-// What a tile and the stage say about a share: its names (05 §12.6, §16.6) and the state it is in (05 §10.4, the
-// rows of §12.6 that need no stats). Pure functions of the store's data, with every message key written out so
-// check:i18n sees it.
+// What a tile and the stage say about a share: its names (05 §12.6, §16.6) and the state it is in (05 §10.4,
+// §12.6). Pure functions of the store's data, with every message key written out so check:i18n sees it.
 import type { TFunction } from 'i18next';
 
 import {
@@ -73,8 +72,11 @@ export function watchingText(t: TFunction, share: ViewerShare): string {
   return t('viewer.watching', { count: share.info.watchers.length });
 }
 
-/** What covers the video: a spinner while connecting, a notice while the sharer's connection is down, the codec wait. */
-export type ShareOverlay = 'connecting' | 'stalled' | 'codec';
+/**
+ * What covers the video: a spinner while connecting, a notice while the sharer's connection is down, the codec
+ * wait, and "Waiting for video…" over a picture that stopped moving.
+ */
+export type ShareOverlay = 'connecting' | 'stalled' | 'codec' | 'frozen';
 /** A small label on a playing video: why it isn't the quality that was asked for. */
 export type ShareBadge = 'bandwidth' | 'unavailable' | 'reduced';
 
@@ -88,11 +90,18 @@ export interface ShareView {
  * - the server's `codec` reason: this browser can't decode the video yet; audio keeps playing (05 §10.6);
  * - the share is `stalled`: the sharer's connection dropped; the last frame stays;
  * - no video track yet, or the `waiting` reason: connecting;
+ * - `frozen` (viewerStore.frozen: no frame decoded for 3 s while video is asked for and the share is live): the
+ *   last frame stays under "Waiting for video…";
  * - the `bandwidth` or `unavailable` reason: a badge; a reason this build doesn't know: a badge without a specific
  *   reason (01 §8.13).
  * A share this page publishes shows its preview; only `stalled` applies to it.
  */
-export function shareView(share: ViewerShare, status: SubscriptionStatus | undefined, hasVideo: boolean): ShareView {
+export function shareView(
+  share: ViewerShare,
+  status: SubscriptionStatus | undefined,
+  hasVideo: boolean,
+  frozen = false,
+): ShareView {
   const stalled = share.info.status === ShareStatusStalled;
   if (share.local) return { overlay: stalled ? 'stalled' : null, badge: null };
   const reason: string | undefined = status?.reason;
@@ -103,6 +112,7 @@ export function shareView(share: ViewerShare, status: SubscriptionStatus | undef
   else if (reason !== undefined && reason !== '' && reason !== StatusReasonWaiting) badge = 'reduced';
   if (stalled) return { overlay: 'stalled', badge };
   if (!hasVideo || reason === StatusReasonWaiting) return { overlay: 'connecting', badge: null };
+  if (frozen) return { overlay: 'frozen', badge };
   return { overlay: null, badge };
 }
 
@@ -114,6 +124,8 @@ export function overlayText(t: TFunction, overlay: ShareOverlay): string {
       return t('viewer.state.stalled');
     case 'codec':
       return t('viewer.state.codec');
+    case 'frozen':
+      return t('viewer.state.frozen');
   }
 }
 

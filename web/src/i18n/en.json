@@ -110,7 +110,8 @@
       "codec": "Your browser is still getting its video decoder (Firefox does this once, about a minute). Retrying…",
       "bandwidth": "Lower quality (your connection)",
       "unavailable": "The sharer isn't sending this quality right now",
-      "reduced": "Lower quality"
+      "reduced": "Lower quality",
+      "frozen": "Waiting for video…"
     },
     "media": {
       "unreachable": "Can't reach the server's media port. isshoni keeps trying.",
@@ -144,6 +145,44 @@
       "unmute": "Unmute",
       "volume": "Volume",
       "volumeValue": "{{percent}}%"
+    },
+    "fullscreen": {
+      "enter": "Fullscreen",
+      "exit": "Exit fullscreen"
+    },
+    "pip": {
+      "enter": "Picture in picture",
+      "exit": "Close picture in picture"
+    },
+    "shortcuts": {
+      "open": "Keyboard shortcuts",
+      "title": "Keyboard shortcuts",
+      "keys": {
+        "move": "Arrow keys",
+        "pick": "Enter or Space",
+        "nth": "1 to 9",
+        "fullscreen": "F",
+        "mute": "M",
+        "listen": "L",
+        "escape": "Esc",
+        "help": "?",
+        "debug": "Shift+D"
+      },
+      "actions": {
+        "move": "Move between shares",
+        "pick": "Watch the selected share",
+        "nth": "Watch a share by its position, newest first",
+        "fullscreen": "Fullscreen on or off",
+        "mute": "Mute or unmute",
+        "listen": "Listen to the selected share",
+        "escape": "Leave fullscreen, close dialogs",
+        "help": "Show this list",
+        "debug": "Debug overlay on or off"
+      }
+    },
+    "iosHint": {
+      "text": "Keep isshoni open while watching. Video pauses when you switch apps.",
+      "dismiss": "Got it"
     }
   },
   "share": {
