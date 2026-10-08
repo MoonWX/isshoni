@@ -10,6 +10,8 @@
 //   reloads the page when it has (controllerchange), so the page and its cache switch to the new shell together;
 // - the page already runs the worker's build (it was reloaded after the server was updated, and navigations go to
 //   the network first): there is nothing to reload. The worker is told to take over at once, and no pill shows.
+//   That includes a rebuild that left the page's JavaScript as it was (only CSS, index.html or a public shell file
+//   changed): an open tab keeps what it has loaded until its next reload.
 // A tab whose worker was replaced from another tab is judged the same way: an old page gets the pill, a current one
 // carries on.
 //
@@ -75,7 +77,10 @@ function browserCaches(): CacheStorage | null {
   return 'caches' in globalThis ? globalThis.caches : null;
 }
 
-/** index.html has one module script: the entry chunk, whose hashed name is different in every build. */
+/**
+ * index.html has one module script: the entry chunk. Its hashed name changes whenever the JavaScript or the build
+ * version changes.
+ */
 function entryScriptUrl(): string | null {
   return globalThis.document.querySelector<HTMLScriptElement>('script[type="module"][src]')?.src ?? null;
 }
@@ -99,6 +104,8 @@ export class BrowserPwa implements PwaProvider {
   #controlled = false;
   /** Waiting workers that were already judged (or are being judged). */
   readonly #judged = new WeakSet<ServiceWorker>();
+  /** The worker this page told to take over because the page already runs its build. */
+  #letIn: ServiceWorker | null = null;
   #ready = false;
   readonly #readyListeners = new Set<() => void>();
   #applying = false;
@@ -106,7 +113,7 @@ export class BrowserPwa implements PwaProvider {
 
   /** The `shell` of the last /version.json poll; null before the first. */
   #shell: string | null = null;
-  /** A poll showed a build that isn't this page's. */
+  /** A read of /version.json showed a build that isn't this page's, and its worker is still to be fetched. */
   #newBuild = false;
   #checking = false;
   #lastCheck = 0;
@@ -278,6 +285,8 @@ export class BrowserPwa implements PwaProvider {
         return;
       }
       log.info('the page is current: the new worker takes over without a reload');
+      this.#letIn = waiting;
+      this.#newBuild = false; // the build a read of /version.json saw is this page's: nothing is left to fetch
       waiting.postMessage({ type: SKIP_WAITING } satisfies SkipWaitingMessage);
     });
   }
@@ -293,25 +302,37 @@ export class BrowserPwa implements PwaProvider {
     const replaced = this.#controlled;
     this.#controlled = true;
     if (!replaced || this.#ready) return;
+    // The worker this page let in: the page was judged current a moment ago. Judging it again needs another read of
+    // /version.json, and one that fails (the server has just been redeployed) would put the pill on a current page.
+    if (this.#letIn !== null && this.#sw?.controller === this.#letIn) return;
     void this.#pageIsCurrent().then((current) => {
       if (!current) this.#markReady();
     });
   }
 
   /**
-   * Whether this page already runs the build that the server has now: a worker of that build has precached its shell
-   * into the cache named after /version.json's `shell`, and the page's entry chunk (whose hashed name changes with
-   * every build) is in it. False whenever that can't be shown (offline, no Cache API, another build's chunk): the
-   * pill and a reload are always a safe answer.
+   * Whether this page already runs the build that the server has now: see #runsShell, asked about /version.json's
+   * `shell`. False whenever that can't be shown (offline, no Cache API, another build's chunk): the pill and a reload
+   * are always a safe answer.
    */
   async #pageIsCurrent(): Promise<boolean> {
+    if (!this.#caches || !this.#entryUrl()) return false; // it can't be shown: don't read the file for nothing
+    const file = await this.#fetchVersion();
+    return file !== null && (await this.#runsShell(file.shell));
+  }
+
+  /**
+   * Whether this page runs the build with that shell version: a worker of that build has precached its shell into
+   * the cache named after the version, and the page's entry chunk is in it. The chunk's hashed name changes whenever
+   * the JavaScript or the build version changes; a rebuild that only changes CSS, index.html or a public shell file
+   * can keep it, and an open tab then counts as current for that build: its worker is let in without a pill.
+   */
+  async #runsShell(shell: string): Promise<boolean> {
     const caches = this.#caches;
     const entry = this.#entryUrl();
     if (!caches || !entry) return false;
-    const file = await this.#fetchVersion();
-    if (!file) return false;
     try {
-      const cached = await caches.match(entry, { cacheName: shellCacheName(file.shell), ignoreVary: true });
+      const cached = await caches.match(entry, { cacheName: shellCacheName(shell), ignoreVary: true });
       return cached !== undefined;
     } catch {
       return false;
@@ -356,7 +377,9 @@ export class BrowserPwa implements PwaProvider {
   /**
    * Reads /version.json and, when it shows a new build, starts the update. The first read compares the file's
    * `version` with this page's (a page started from a stale cache differs at once); later reads compare `shell`
-   * with the previous read, which also catches a rebuild under the same version.
+   * with the previous read, which also catches a rebuild under the same version. A build stays "new", and its
+   * worker is asked for again at every read (a failed download or install is retried), until the pill shows or the
+   * page turns out to run that build.
    */
   async #checkVersion(): Promise<void> {
     if (this.#checking || this.#ready) return;
@@ -368,6 +391,9 @@ export class BrowserPwa implements PwaProvider {
       const known = this.#shell;
       this.#shell = file.shell;
       if (known === null ? file.version !== this.#buildVersion : file.shell !== known) this.#newBuild = true;
+      // Not new for this page when a worker of that build has installed its shell and the page runs it: the worker
+      // was let in already, after an earlier read or before this one (the browser found it at another tab's load).
+      if (this.#newBuild && (await this.#runsShell(file.shell))) this.#newBuild = false;
       if (this.#newBuild) await this.#fetchUpdate();
     } finally {
       this.#checking = false;

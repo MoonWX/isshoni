@@ -119,11 +119,14 @@ function deployB(version = BUILD): void {
   versionFile = { version, protocol: 1, shell: B.shell };
 }
 
-/** The browser fetched build B's worker: it installs (precaching B's shell) and waits. */
-function workerBWaits(container: FakeContainer): FakeWorker {
+/**
+ * The browser fetched build B's worker: it installs (precaching B's shell) and waits. With `entry` set to A's, B is a
+ * rebuild that left the JavaScript as it was (only CSS, index.html or a public shell file changed).
+ */
+function workerBWaits(container: FakeContainer, entry = B.entry): FakeWorker {
   deployB();
   container.registration.startInstall();
-  shellCaches.set(`isshoni-shell-${B.shell}`, [`${location.origin}/`, B.entry]);
+  shellCaches.set(`isshoni-shell-${B.shell}`, [`${location.origin}/`, entry]);
   return container.registration.finishInstall();
 }
 
@@ -341,6 +344,25 @@ describe('a page that already runs the new build (reloaded after the server was 
     expect(reload).not.toHaveBeenCalled();
   });
 
+  it('does not judge the page again when the worker it let in takes over', async () => {
+    const container = controlledContainer();
+    const { pwa, reload, ready } = makePwa({ container, entryUrl: () => B.entry });
+    await pwa.register();
+    await flush();
+    const waiting = workerBWaits(container);
+    await flush();
+    expect(waiting.messages).toEqual([{ type: 'SKIP_WAITING' }]);
+
+    // The server was redeployed a moment ago: a read of /version.json may well fail right now.
+    const reads = fetchMock.mock.calls.length;
+    fetchMock.mockImplementation(() => Promise.reject(new TypeError('Failed to fetch')));
+    container.takeControl(waiting);
+    await flush();
+    expect(ready).not.toHaveBeenCalled();
+    expect(reload).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(reads);
+  });
+
   it('stays quiet when another tab lets the worker in', async () => {
     const container = controlledContainer();
     const { pwa, reload, ready } = makePwa({ container, entryUrl: () => B.entry });
@@ -499,6 +521,45 @@ describe('/version.json: a tab that stays open learns of a new build', () => {
     await vi.advanceTimersByTimeAsync(VERSION_POLL_MS); // the same shell as the last read: still a new build
     expect(container.registration.updateCalls).toBe(2);
     expect(ready).toHaveBeenCalledOnce();
+  });
+
+  it('stops asking once the worker it fetched was let in (a rebuild that left the page’s JavaScript as it was)', async () => {
+    const container = controlledContainer();
+    const { pwa, reload, ready } = makePwa({ container }); // the page runs A's entry chunk
+    await pwa.register();
+    await flush();
+    deployB();
+    container.registration.onUpdate = () => {
+      workerBWaits(container, A.entry);
+    };
+    await vi.advanceTimersByTimeAsync(VERSION_POLL_MS);
+    expect(container.registration.updateCalls).toBe(1);
+    const waiting = container.registration.waiting;
+    if (!waiting) throw new Error('no worker waits');
+    expect(waiting.messages).toEqual([{ type: 'SKIP_WAITING' }]);
+    container.takeControl(waiting);
+
+    container.registration.onUpdate = () => undefined;
+    await vi.advanceTimersByTimeAsync(VERSION_POLL_MS * 3); // the same version.json three more times
+    expect(container.registration.updateCalls).toBe(1);
+    expect(ready).not.toHaveBeenCalled();
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it('asks for nothing when the new shell’s worker was let in before a read saw the new shell', async () => {
+    const container = controlledContainer();
+    const { pwa, ready } = makePwa({ container });
+    await pwa.register();
+    await flush();
+    // The browser found the worker itself (a page load in another tab), not this tab's read of /version.json.
+    const waiting = workerBWaits(container, A.entry);
+    await flush();
+    expect(waiting.messages).toEqual([{ type: 'SKIP_WAITING' }]);
+    container.takeControl(waiting);
+
+    await vi.advanceTimersByTimeAsync(VERSION_POLL_MS * 3); // the first of these reads sees the new shell
+    expect(container.registration.updateCalls).toBe(0);
+    expect(ready).not.toHaveBeenCalled();
   });
 
   it('without a service worker, a changed version.json is the update, and applying it reloads', async () => {
