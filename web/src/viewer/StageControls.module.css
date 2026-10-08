@@ -1,0 +1,48 @@
+/* The stage's own controls, in its toolbar on the stage's black: the look of the sound controls next to them. */
+
+/* A touch target of its own (05 §12.1). What is drawn is smaller: the icon. */
+.icon,
+.keyboard {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--tap-target);
+  min-height: var(--tap-target);
+  padding: 0 var(--space-2);
+  color: inherit;
+  background: none;
+  border: 0;
+  border-radius: var(--radius-md);
+}
+
+.icon:hover,
+.keyboard:hover {
+  background-color: var(--color-stage-overlay);
+}
+
+/* The picture-in-picture window is open. */
+.icon[data-on] {
+  color: var(--color-stage);
+  background-color: var(--color-on-stage);
+}
+
+/* On the stage's black the page's focus colour is too dark to see. */
+.icon:focus-visible,
+.keyboard:focus-visible {
+  outline-color: var(--color-on-stage);
+  outline-offset: calc(-1 * var(--focus-ring-width));
+}
+
+.icon svg,
+.keyboard svg {
+  flex: none;
+  width: 1.125rem;
+  height: 1.125rem;
+}
+
+/* Shortcuts need a keyboard: no button on a device that only has touch, where the toolbar has little room. */
+@media (hover: none) {
+  .keyboard {
+    display: none;
+  }
+}

@@ -55,6 +55,8 @@ export function viewerDebugState(viewer: Pick<ViewerServices, 'store' | 'audio' 
     volume: s.volume,
     fullscreen: s.fullscreen,
     pipShareId: s.pipShareId,
+    /** The tab is in the background (after 10 s of it every video is off, 05 §12.4). */
+    pageHidden: s.pageHiddenSince !== null,
     media: s.media,
     subGen: viewer.subscriber?.gen ?? 0,
     shares: s.shares.map((share) => ({
@@ -67,6 +69,7 @@ export function viewerDebugState(viewer: Pick<ViewerServices, 'store' | 'audio' 
       layers: [...share.info.layers],
       watchers: share.info.watchers.length,
       visible: s.visible[share.id] === true,
+      frozen: s.frozen[share.id] === true,
       subscription: s.status[share.id] ?? null,
     })),
   };

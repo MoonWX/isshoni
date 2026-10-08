@@ -117,8 +117,25 @@ describe('shareView (05 §10.4, §12.6)', () => {
     });
   });
 
+  it('says "waiting for video" over a picture that stopped moving, under the states that explain more', () => {
+    expect(shareView(live, undefined, true, true)).toEqual({ overlay: 'frozen', badge: null });
+    // The badge stays known under it.
+    expect(shareView(live, status('s_a', { video: 'low', reason: 'bandwidth' }), true, true)).toEqual({
+      overlay: 'frozen',
+      badge: 'bandwidth',
+    });
+    // Connecting, stalled and the decoder wait say why there are no frames.
+    expect(shareView(live, undefined, false, true).overlay).toBe('connecting');
+    expect(shareView(live, status('s_a', { reason: 'waiting' }), true, true).overlay).toBe('connecting');
+    expect(shareView(stalled, undefined, true, true).overlay).toBe('stalled');
+    expect(shareView(live, status('s_a', { video: 'off', reason: 'codec' }), true, true).overlay).toBe('codec');
+    // Not frozen unless someone says so.
+    expect(shareView(live, undefined, true, false).overlay).toBeNull();
+  });
+
   it('shows a preview of this page’s share as it is; only `stalled` applies', () => {
     const mine = viewerShare({ own: true, local: true });
+    expect(shareView(mine, undefined, true, true)).toEqual({ overlay: null, badge: null });
     expect(shareView(mine, undefined, false)).toEqual({ overlay: null, badge: null });
     expect(shareView(mine, status('s_a', { reason: 'waiting' }), true)).toEqual({ overlay: null, badge: null });
     const mineStalled = viewerShare({ own: true, local: true }, shareInfo('s_a', 'u_alex', 1, { status: 'stalled' }));
@@ -129,6 +146,7 @@ describe('shareView (05 §10.4, §12.6)', () => {
     expect(overlayText(t, 'connecting')).toBe('Connecting…');
     expect(overlayText(t, 'stalled')).toBe('Connection unstable');
     expect(overlayText(t, 'codec')).toContain('video decoder');
+    expect(overlayText(t, 'frozen')).toBe('Waiting for video…');
     expect(badgeText(t, 'bandwidth')).toBe('Lower quality (your connection)');
     expect(badgeText(t, 'unavailable')).toBe("The sharer isn't sending this quality right now");
     expect(badgeText(t, 'reduced')).toBe('Lower quality');

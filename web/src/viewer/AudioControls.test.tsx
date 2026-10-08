@@ -229,7 +229,9 @@ describe('the stage’s sound controls (05 §10.3, §12.3)', () => {
     watch(mine);
     fireEvent.click(screen.getByRole('button', { name: /^Show your preview on the stage/ }));
     expect(stage()).toHaveAccessibleName('Your preview: Your window');
-    expect(within(stage()).queryByRole('toolbar')).not.toBeInTheDocument();
+    // The toolbar has the layout's own controls (fullscreen), and nothing about sound.
+    expect(within(toolbar()).queryByRole('button', { name: /Mute|Unmute|Listen/ })).not.toBeInTheDocument();
+    expect(within(toolbar()).queryByRole('slider')).not.toBeInTheDocument();
   });
 
   it('keeps mute on the stage while the preview is enlarged and another share is heard', () => {

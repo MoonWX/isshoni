@@ -308,6 +308,7 @@ describe('window.__isshoni (05 §10.7)', () => {
         volume: 1,
         fullscreen: false,
         pipShareId: null,
+        pageHidden: false,
         media: 'connected',
         subGen: 1,
         shares: [
@@ -321,6 +322,7 @@ describe('window.__isshoni (05 §10.7)', () => {
             layers: ['high', 'low'],
             watchers: 0,
             visible: false,
+            frozen: false,
             subscription: null,
           },
           {
@@ -333,6 +335,7 @@ describe('window.__isshoni (05 §10.7)', () => {
             layers: ['high', 'low'],
             watchers: 0,
             visible: false,
+            frozen: false,
             subscription: { shareId: 's_cy', video: 'low', audio: 'off', requestedVideo: 'low' },
           },
         ],

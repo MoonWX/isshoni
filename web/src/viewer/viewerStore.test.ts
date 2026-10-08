@@ -24,6 +24,7 @@ describe('viewerStore: defaults', () => {
       visible: {},
       pageHiddenSince: null,
       status: {},
+      frozen: {},
       media: 'idle',
     });
     expect(createViewerStore({ volume: 0.4 }).getState().volume).toBe(0.4);
@@ -341,12 +342,14 @@ describe('viewerStore.syncRoom', () => {
     store.getState().setVisible('s_a', true);
     store.getState().setVisible('s_b', true);
     store.getState().applyStatus([status('s_a', { reason: 'waiting' }), status('s_b')]);
+    store.getState().setFrozen(['s_a', 's_b']);
     store.getState().setPip('s_a');
 
     store.getState().syncRoom(room(b), SELF);
     const s = store.getState();
     expect(s.visible).toEqual({ s_b: true });
     expect(Object.keys(s.status)).toEqual(['s_b']);
+    expect(s.frozen).toEqual({ s_b: true });
     expect(s.pipShareId).toBeNull();
   });
 
@@ -424,6 +427,44 @@ describe('viewerStore: actions', () => {
     expect(store.getState().status).toEqual({ s_a: status('s_a'), s_b: status('s_b') });
   });
 
+  it('setFrozen takes the complete set of frozen tiles, and only shares that have one', () => {
+    const store = createViewerStore();
+    store.getState().syncRoom(room(shareInfo('s_a', 'u_bea', 1), shareInfo('s_b', 'u_cy', 2)), SELF);
+    store.getState().setFrozen(['s_a', 's_gone']);
+    expect(store.getState().frozen).toEqual({ s_a: true });
+    store.getState().setFrozen(['s_b']);
+    expect(store.getState().frozen).toEqual({ s_b: true });
+
+    // The same set again is no change: nothing that reads the store runs.
+    const changes = vi.fn();
+    const off = store.subscribe(changes);
+    store.getState().setFrozen(['s_b']);
+    store.getState().setFrozen(['s_b', 's_gone']);
+    expect(changes).not.toHaveBeenCalled();
+    store.getState().setFrozen([]);
+    expect(changes).toHaveBeenCalledTimes(1);
+    expect(store.getState().frozen).toEqual({});
+    off();
+  });
+
+  it('says nothing when a value is set to what it is: fullscreen, PiP, the hidden page', () => {
+    const store = createViewerStore();
+    const changes = vi.fn();
+    const off = store.subscribe(changes);
+    store.getState().setFullscreen(false);
+    store.getState().setPip(null);
+    store.getState().setPageHidden(null);
+    expect(changes).not.toHaveBeenCalled();
+    store.getState().setFullscreen(true);
+    store.getState().setFullscreen(true);
+    store.getState().setPip('s_a');
+    store.getState().setPip('s_a');
+    store.getState().setPageHidden(5);
+    store.getState().setPageHidden(5);
+    expect(changes).toHaveBeenCalledTimes(3);
+    off();
+  });
+
   it('keeps the simple values', () => {
     const store = createViewerStore();
     const s = store.getState();
@@ -467,7 +508,9 @@ describe('viewerStore: actions', () => {
     store.getState().focusShare('s_a');
     store.getState().applyStatus([status('s_a')]);
     store.getState().setVisible('s_a', true);
+    store.getState().setFrozen(['s_a']);
     store.getState().setFullscreen(true);
+    store.getState().setPip('s_a');
     store.getState().setAudio('playing');
     store.getState().setVideoBlocked(true);
     store.getState().setMedia('connected');
@@ -485,6 +528,7 @@ describe('viewerStore: actions', () => {
       pipShareId: null,
       visible: {},
       status: {},
+      frozen: {},
       // The page's own:
       volume: 0.5,
       audio: 'playing',

@@ -1,6 +1,7 @@
 // The viewer's objects and how the rest of the app connects them (no React here, 05 §3):
 // - createViewer() makes the store, the media registry and the page's one <audio> element, once per page; the
-//   element plays the audible share by itself (audio follows focus, 05 §12.3);
+//   element plays the audible share by itself (audio follows focus, 05 §12.3), and the store knows when the page
+//   is hidden (page.ts: no video after 10 s, and everything plays again when an iPhone comes back, 05 §12.8);
 // - syncRoom() gives them each room.state (RoomSession calls it, so focus and audio stay right while the room page
 //   is not mounted, 05 §11.1);
 // - attachViewer() gives the store the server's subscribe.status messages;
@@ -17,6 +18,7 @@ import type { SignalClient } from '../protocol/signal-client';
 import { MessageTypeSubscribeStatus } from '../protocol/types.gen';
 import { createAudioOut, type AudioOut } from './audioOut';
 import { createMediaRegistry, type MediaRegistry } from './mediaRegistry';
+import { attachPage } from './page';
 import type { SubscriberDeps, SubscriberPC } from './SubscriberPC';
 import { createVideoPlayback, type VideoPlayback } from './videoPlayback';
 import {
@@ -50,7 +52,10 @@ export interface ViewerServices {
    * inside the user gesture. It picks nothing: the unmute tap is not a manual focus (05 §12.2).
    */
   unlock(): void;
-  /** Stops the audio from following the store and removes its element. Tests only: the page keeps its viewer. */
+  /**
+   * Stops the audio from following the store and removes its element, and stops following the page's visibility.
+   * Tests only: the page keeps its viewer.
+   */
   dispose(): void;
 }
 
@@ -59,6 +64,8 @@ export interface ViewerOptions extends ViewerStoreOptions {
   onVolume?: (volume: number) => void;
   /** Where the <audio> element is appended; default document.body. */
   audioParent?: HTMLElement;
+  /** Whose visibility the viewer follows (page.ts); default the global document. */
+  document?: Document;
   log?: Logger;
 }
 
@@ -94,6 +101,9 @@ export function createViewer(opts: ViewerOptions = {}): ViewerServices {
   });
   followAudible();
 
+  // The page's visibility, for as long as the viewer lives: the room page comes and goes (05 §11.1).
+  const offPage = attachPage({ store, videos, audio, ...(opts.document ? { doc: opts.document } : {}) });
+
   let subscriber: SubscriberPC | null = null;
 
   return {
@@ -114,6 +124,7 @@ export function createViewer(opts: ViewerOptions = {}): ViewerServices {
       videos.retry();
     },
     dispose() {
+      offPage();
       offStore();
       offTrack?.();
       offTrack = null;

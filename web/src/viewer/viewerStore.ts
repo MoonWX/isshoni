@@ -5,8 +5,10 @@
 // It holds the shares that have a tile, in tile order, with the focus state of autoFocus.ts (which also remembers
 // the shares that ended, so that a re-published share gets back the stage and the sound); the audio unlock state
 // and volume (05 §10.3, written by audioOut.ts) and whether a tile's video was refused (videoPlayback.ts);
-// fullscreen, PiP and visibility (05 §12.4–§12.5, S56); what the server forwards per share (subscribe.status,
-// 05 §10.4); and the state of the sub PC (05 §9).
+// fullscreen and PiP (05 §12.5: fullscreen.ts, pip.ts), which tiles are in view (useVisibility.ts) and since when
+// the page is hidden (page.ts), all of which the layer policy reads (05 §12.4); what the server forwards per share
+// (subscribe.status, 05 §10.4); the tiles whose video stopped arriving (freeze.ts, 05 §12.6); and the state of the
+// sub PC (05 §9).
 import { createStore, type StoreApi } from 'zustand/vanilla';
 
 import {
@@ -95,6 +97,11 @@ export interface ViewerData extends FocusState<ViewerShare> {
   readonly pageHiddenSince: number | null;
   /** Per share: the last subscribe.status entry (05 §10.4). Absent = nothing reported: normal. */
   readonly status: Readonly<Record<string, SubscriptionStatus>>;
+  /**
+   * The shares whose video is asked for and has decoded no frame for 3 s (05 §12.6, freeze.ts): their tiles say
+   * "Waiting for video…". Absent = frames arrive, or nobody measures.
+   */
+  readonly frozen: Readonly<Record<string, true>>;
   readonly media: SubMediaState;
 }
 
@@ -126,10 +133,13 @@ export interface ViewerActions {
   setPageHidden(since: number | null): void;
   /** Merges subscribe.status entries: only the subscriptions whose status changed are sent (01 §8.9). */
   applyStatus(subs: readonly SubscriptionStatus[]): void;
+  /** The complete set of frozen shares (05 §12.6); shares without a tile are left out. */
+  setFrozen(shareIds: readonly string[]): void;
   setMedia(media: SubMediaState): void;
   /**
    * Back to the state of a page that is in no room: no shares, auto-focus, nothing per share, no fullscreen or PiP,
-   * no memory of ended shares. Call it when the user leaves the room, not for a reconnect: after a welcome that was
+   * no memory of ended shares. (fullscreen.ts and pip.ts follow: they leave the browser's fullscreen and close its
+   * PiP window when the store says so.) Call it when the user leaves the room, not for a reconnect: after a welcome that was
    * not resumed the room's snapshots keep going to syncRoom, so that re-published shares take over (01 §10.6).
    * What belongs to the page stays: the volume, the audio unlock and the refused videos, the sub PC's state
    * (SubscriberPC.close() resets that one) and the page's visibility.
@@ -160,6 +170,7 @@ function initialData(volume: number): ViewerData {
     visible: {},
     pageHiddenSince: null,
     status: {},
+    frozen: {},
     media: 'idle',
   };
 }
@@ -291,6 +302,7 @@ export function createViewerStore(opts: ViewerStoreOptions = {}): ViewerStore {
           ...after,
           visible: pruned(s.visible, ids),
           status: pruned(s.status, ids),
+          frozen: pruned(s.frozen, ids),
           pipShareId: s.pipShareId !== null && !ids.has(s.pipShareId) ? null : s.pipShareId,
         };
       });
@@ -336,17 +348,17 @@ export function createViewerStore(opts: ViewerStoreOptions = {}): ViewerStore {
         set({ volume: clamp01(volume) });
       },
       setFullscreen(fullscreen) {
-        set({ fullscreen });
+        if (get().fullscreen !== fullscreen) set({ fullscreen });
       },
       setPip(pipShareId) {
-        set({ pipShareId });
+        if (get().pipShareId !== pipShareId) set({ pipShareId });
       },
       setVisible(shareId, visible) {
         if ((get().visible[shareId] ?? false) === visible) return;
         set((s) => ({ visible: { ...s.visible, [shareId]: visible } }));
       },
       setPageHidden(pageHiddenSince) {
-        set({ pageHiddenSince });
+        if (get().pageHiddenSince !== pageHiddenSince) set({ pageHiddenSince });
       },
       applyStatus(subs) {
         if (subs.length === 0) return;
@@ -356,11 +368,25 @@ export function createViewerStore(opts: ViewerStoreOptions = {}): ViewerStore {
           return { status };
         });
       },
+      setFrozen(shareIds) {
+        const s = get();
+        const next = shareIds.filter((id) => s.shares.some((share) => share.id === id));
+        const before = Object.keys(s.frozen);
+        if (next.length === before.length && next.every((id) => s.frozen[id] === true)) return;
+        set({ frozen: Object.fromEntries(next.map((id): [string, true] => [id, true])) });
+      },
       setMedia(media) {
         if (get().media !== media) set({ media });
       },
       reset() {
-        set({ ...initialFocusState<ViewerShare>(), fullscreen: false, pipShareId: null, visible: {}, status: {} });
+        set({
+          ...initialFocusState<ViewerShare>(),
+          fullscreen: false,
+          pipShareId: null,
+          visible: {},
+          status: {},
+          frozen: {},
+        });
       },
     };
   });

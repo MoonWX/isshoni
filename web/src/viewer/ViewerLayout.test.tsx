@@ -134,16 +134,22 @@ describe('ViewerLayout: stage and others', () => {
     expect(tileNames()).toEqual(['Watch your share from another device, 0 watching']);
   });
 
-  it('passes the stage controls and the tiles’ extra controls through', () => {
+  it('passes the stage controls and the tiles’ extra controls through, after its own', () => {
     syncRoom(viewer, room(BEA, CY), SELF);
     render(
       <ViewerLayout
         viewer={viewer}
-        stageControls={<button type="button">Fullscreen</button>}
+        stageControls={<button type="button">Stats</button>}
         tileActions={(share) => <button type="button">{`Pin ${share.ownerName}`}</button>}
       />,
     );
-    expect(within(screen.getByRole('toolbar')).getByRole('button', { name: 'Fullscreen' })).toBeInTheDocument();
+    const controls = within(screen.getByRole('toolbar')).getAllByRole('button');
+    expect(controls.map((b) => b.getAttribute('aria-label') ?? b.textContent)).toEqual([
+      'Mute',
+      'Keyboard shortcuts',
+      'Fullscreen',
+      'Stats',
+    ]);
     expect(screen.getByRole('button', { name: 'Pin Bea' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Pin Cy' })).not.toBeInTheDocument();
   });

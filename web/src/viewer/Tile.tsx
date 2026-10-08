@@ -2,6 +2,9 @@
 // a share this page publishes) with its sharer, what is shared, and how many watch. The main area is one <button>
 // named "Watch alex's window, 3 watching". Next to it, never inside: the eye with the viewer count, which opens
 // the watchers popover (05 §12.6), and the speaker button, "Listen to alex" (05 §12.3).
+//
+// In ViewerLayout's list the tiles are a roving-tabindex group (05 §12.7): one tile is the list's tab stop, the
+// arrow keys move between tiles (keyboard.ts), and the controls of the other tiles are reached through their tile.
 import { useId, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -23,19 +26,26 @@ export interface TileProps {
   onPick: (shareId: string) => void;
   /** More controls next to the main area, after the watchers and speaker buttons. */
   actions?: ReactNode;
+  /**
+   * Whether the Tab key stops at this tile's controls (05 §12.7). Default true; in a roving-tabindex list only the
+   * list's current tile has it, and the others are reached with the arrow keys.
+   */
+  tabStop?: boolean;
 }
 
-export function Tile({ share, preview, onPick, actions }: TileProps) {
+export function Tile({ share, preview, onPick, actions, tabStop = true }: TileProps) {
   const { t } = useTranslation();
   const media = useShareMedia(share.id);
   const status = useViewer((s) => s.status[share.id]);
+  const frozen = useViewer((s) => s.frozen[share.id] === true);
   const stateId = useId();
-  // The tile is shown: the layer policy gives it the low layer only while it is (05 §12.4).
-  useVisibility(share.id);
+  // The tile is shown while it is in view: the layer policy gives it the low layer only then (05 §12.4).
+  const shown = useVisibility(share.id);
+  const tabIndex = tabStop ? 0 : -1;
 
   const stream = share.local ? preview : undefined;
   const track = share.local ? undefined : media.video;
-  const view = shareView(share, status, stream != null || track !== undefined);
+  const view = shareView(share, status, stream != null || track !== undefined, frozen);
   const watching = watchingText(t, share);
   let label: string;
   if (share.local) label = t('viewer.tile.preview', { watching });
@@ -44,12 +54,14 @@ export function Tile({ share, preview, onPick, actions }: TileProps) {
   const state = view.overlay ? overlayText(t, view.overlay) : view.badge ? badgeText(t, view.badge) : null;
 
   return (
-    <li className={styles.tile} data-share-id={share.id}>
+    <li ref={shown} className={styles.tile} data-share-id={share.id}>
       <button
         type="button"
         className={styles.main}
         aria-label={label}
         aria-describedby={state !== null ? stateId : undefined}
+        tabIndex={tabIndex}
+        data-tile-main=""
         onClick={() => {
           onPick(share.id);
         }}
@@ -57,7 +69,7 @@ export function Tile({ share, preview, onPick, actions }: TileProps) {
         <ShareVideo track={track} stream={stream} />
         {view.overlay && (
           <span className={styles.overlay} id={stateId}>
-            {view.overlay === 'connecting' && <Spinner size="md" label={null} />}
+            {(view.overlay === 'connecting' || view.overlay === 'frozen') && <Spinner size="md" label={null} />}
             <span className={styles.overlayText}>{overlayText(t, view.overlay)}</span>
           </span>
         )}
@@ -72,8 +84,8 @@ export function Tile({ share, preview, onPick, actions }: TileProps) {
         </span>
       </button>
       <div className={styles.aside}>
-        <WatchersPopover share={share} />
-        <SpeakerButton share={share} />
+        <WatchersPopover share={share} tabIndex={tabIndex} />
+        <SpeakerButton share={share} tabIndex={tabIndex} />
         {actions}
       </div>
     </li>

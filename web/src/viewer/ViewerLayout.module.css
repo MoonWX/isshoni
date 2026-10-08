@@ -1,7 +1,7 @@
 /*
  * The viewer's layout (05 §12.1). It fills the box the room page gives it. Narrow first: the stage on top, the
  * others in a strip below; from 1024 px the others are a column at the inline end; on a phone held sideways and in
- * fullscreen only the stage is left.
+ * fullscreen only the stage is left, and in fullscreen the layout covers the page (05 §12.5).
  */
 
 .layout {
@@ -30,6 +30,11 @@
   border: var(--border-width) solid var(--color-border);
   border-inline-start: 4px solid var(--color-warning);
   border-radius: var(--radius-md);
+}
+
+/* The one-time hint (IosHint): above the stage, like the banner. */
+.hint {
+  flex: none;
 }
 
 .main {
@@ -120,7 +125,22 @@
   border-radius: 0;
 }
 
+/*
+ * Fullscreen (05 §12.5): the layout covers the page, above the room's header. This is the whole of the CSS
+ * pseudo-fullscreen, for browsers without element fullscreen. Where the browser has it, this same element is the
+ * fullscreen element (fullscreen.ts), and the browser's own rules for it say the same with more weight.
+ */
+.fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: calc(var(--z-header) + 1);
+  width: auto;
+  height: auto;
+  background-color: var(--color-stage);
+}
+
 .phoneLandscape .banner,
+.phoneLandscape .hint,
 .fullscreen .banner {
   position: absolute;
   inset: var(--safe-top) var(--safe-right) auto var(--safe-left);
@@ -129,7 +149,8 @@
 }
 
 /* Below the "Shares (N)" button, which has the top corner. */
-.phoneLandscape .banner {
+.phoneLandscape .banner,
+.phoneLandscape .hint {
   top: calc(var(--safe-top) + var(--tap-target) + var(--space-2));
 }
 
