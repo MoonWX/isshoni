@@ -58,6 +58,9 @@
 //   - WriteRTP and WriteRTCP are media calls, not signaling calls: the media goroutines make them, and so may any
 //     actor, also for another Conn's pub PC (a keyframe request). Pion allows them from any goroutine and they
 //     never block. Keyframe requests are throttled per layer by a compare-and-swap, so callers need no lock.
+//   - Bind and Unbind of a DownTrack are called by Pion with the sender's lock held. They read the negotiation and
+//     store the result, taking DownTrack.mu for a moment; that lock is never held across a Pion call, so the two
+//     are only ever taken in this order.
 //   - Pion callbacks (OnTrack, OnConnectionStateChange) only append to the Conn's internal event queue. They never
 //     block, so a Pion call made by the actor can't deadlock on its own callback. Pion runs each callback in a
 //     goroutine of its own, so their order means nothing: a state callback carries no state, and the actor reads
@@ -92,11 +95,13 @@
 //     share: its packets are copied once, kept in the per-Layer ring of recent packets (02 §9.2) and queued to the
 //     DownTracks that want the layer; it measures its rates and asks its publisher for keyframes, at most one PLI
 //     per 500 ms (02 §9.7). A DownTrack is one viewer's video or audio of a share (02 §9.3): its writer forwards
-//     nothing before the viewer negotiated the track and its sub PC is connected (S4 finding 1: Pion drops RTP
-//     written earlier, silently), starts on a packet that carries an SPS, and gives every packet its place in the
-//     viewer's stream (the munger, 02 §9.4) under a fresh header. The viewer gets a keyframe requested for it when
-//     its sub PC connects, when a DownTrack is bound on a connected PC, when its target layer changes, on its own
-//     PLI or FIR, and for as long as packets of the layer it waits for arrive without one;
+//     nothing before the viewer negotiated the track and its sub PC is connected, and nothing once that PC has
+//     failed or closed (S4 finding 1: Pion drops RTP written then, silently); it starts on a packet that carries an
+//     SPS, again after every such interruption, and gives every packet its place in the viewer's stream (the
+//     munger, 02 §9.4) under a fresh header. The viewer gets a keyframe requested for it when its sub PC connects,
+//     when a DownTrack is bound on a connected PC, when its target layer changes, on its own PLI or FIR, and for as
+//     long as packets of the layer it waits for arrive without one (only every 5 s for a viewer whose stream Pion
+//     has taken twice in a row without sending any of it);
 //   - events.go, errors.go, types.go, config.go, stats.go, probe.go: the whole interface of 02 §6 and §13;
 //   - api.go: the publish, subscribe and connection-test probe webrtc.APIs on 04's netx.Transport, the
 //     remote-candidate filter (02 §7.3, 01 §17), the selected-pair label and the complete-SDP helper: the SFU never

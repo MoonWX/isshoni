@@ -102,9 +102,25 @@ func (m *munger) setTarget(slot Slot, active bool) bool {
 }
 
 // restart ends the current epoch without pausing: the output starts again, right after the last own seq, with the
-// next keyframe of the target. The DownTrack calls it when a packet the munger numbered never left the server
-// (02 §9.3): to the viewer the stream then simply begins, or goes on, with a keyframe, as after a pause.
+// next keyframe of the target. The DownTrack calls it when the viewer didn't get what the munger numbered, or can't
+// get what comes next (02 §9.3): the start of its stream never left the server, its sub PC is no longer connected,
+// or its track was unbound. To the viewer the stream then simply begins, or goes on, with a keyframe, as after a
+// pause.
 func (m *munger) restart() { m.forwarding = false }
+
+// unforwardable tells the munger of a packet that process never sees, because the viewer has no payload type for its
+// profile. If it is a newer packet of the Layer forwarded now, that Layer has moved on without the viewer and the
+// current epoch is over, as it is when process meets another profile (02 §9.4, "Further rules"): going on within the
+// Layer later would leave a sequence gap that NACKs fill from the cache, with packets the viewer can't decode under
+// the old profile's payload type. The output then starts again with the next keyframe the viewer has a payload type
+// for. It reports whether it ended the epoch. A late packet, or one of another Layer, changes nothing.
+func (m *munger) unforwardable(p *packet) bool {
+	if !m.active || !m.forwarding || m.newest().layer != p.layer || int16(p.seq-m.lastU) <= 0 {
+		return false
+	}
+	m.forwarding = false
+	return true
+}
 
 // current returns the slot of the layer forwarded now, and false while nothing is forwarded.
 func (m *munger) current() (Slot, bool) {

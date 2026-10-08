@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/pion/webrtc/v4"
 )
@@ -93,4 +94,13 @@ func (s *SFU) FanOut(id ShareID) (video, audio int, ok bool) {
 		return 0, 0, false
 	}
 	return len(sh.downTracks(webrtc.RTPCodecTypeVideo)), len(sh.downTracks(webrtc.RTPCodecTypeAudio)), true
+}
+
+// SetMediaICETimeouts replaces the ICE timeouts of the pub and sub PCs of every SFU built from now on, and returns
+// the function that puts the real ones back (02 §7.3: 5 s to disconnected, 15 s more to failed). A test that needs a
+// PC to fail can't wait that long.
+func SetMediaICETimeouts(disconnected, failed, keepalive time.Duration) (restore func()) {
+	old := mediaICETimeouts
+	mediaICETimeouts = iceTimeouts{disconnected: disconnected, failed: failed, keepalive: keepalive}
+	return func() { mediaICETimeouts = old }
 }

@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -668,10 +670,56 @@ func TestDownTrackWrite(t *testing.T) {
 		t.Errorf("header without abs-send-time negotiated: %+v", w.hdrs[n-1])
 	}
 
+	forget := func() { pub.forget(); f.lastPLI.Store(-int64(pliInterval)) } // as if the last PLI were long ago
+
+	// The layer moves to a profile the viewer has no payload type for (02 §9.4): what the viewer was getting is over,
+	// and nobody is asked for a keyframe it couldn't decode. When the layer comes back to the old profile, a delta
+	// packet doesn't go on from before the gap, whose own seqs a NACK would fill from the other profile's packets:
+	// it waits, and the next keyframe start continues the own seq without a gap.
+	forget()
+	written := len(w.hdrs)
+	last := w.hdrs[written-1].SequenceNumber
+	b.ptFor = map[ProfileKey]uint8{ProfileHigh: 104}
+	noCodec := d.stats.noCodec.Load()
+	send(key, ProfileConstrainedBaseline, false)
+	if d.forwarding.Load() || len(sh.viewers()) != 0 || d.interest.Load() != 1<<SlotF {
+		t.Errorf("after the layer left for a profile without a payload type: forwarding %v, viewers %v, interest %b; want "+
+			"the stream over and f still wanted", d.forwarding.Load(), sh.viewers(), d.interest.Load())
+	}
+	send(deltaPayload, ProfileConstrainedBaseline, false)
+	if n := send(deltaPayload, ProfileConstrainedBaseline, true); n != written || d.stats.noCodec.Load() != noCodec+3 ||
+		len(pub.plis()) != 0 {
+		t.Fatalf("three packets in a profile without a payload type: %d written, %d counted, %d PLIs; want 0, 3, 0",
+			n-written, d.stats.noCodec.Load()-noCodec, len(pub.plis()))
+	}
+	if n := send(deltaPayload, ProfileHigh, false); n != written || len(pub.plis()) != 1 || d.forwarding.Load() {
+		t.Fatalf("a delta packet back in the old profile: %d written, %d PLIs, forwarding %v; want it to wait for a "+
+			"keyframe and ask for one", n-written, len(pub.plis()), d.forwarding.Load())
+	}
+	late := seq // a packet from before the keyframe that is still on its way
+	seq++
+	if n := send(key, ProfileHigh, false); n != written+1 || w.hdrs[written].SequenceNumber != last+1 ||
+		w.hdrs[written].PayloadType != 104 || !d.forwarding.Load() {
+		t.Fatalf("the keyframe start back in the old profile: %d written, seq %d; want 1, seq %d right after the last "+
+			"one", n-written, w.hdrs[n-1].SequenceNumber, last+1)
+	}
+	// A late packet in such a profile, from before the keyframe, ends nothing.
+	now += tick
+	f.handleRTP(rtpPkt(late, ts, false, deltaPayload), ProfileConstrainedBaseline, now)
+	drain(d, &state)
+	if d.stats.noCodec.Load() != noCodec+4 || !d.forwarding.Load() {
+		t.Errorf("a late packet without a payload type: %d counted, forwarding %v; want it counted and nothing ended",
+			d.stats.noCodec.Load()-noCodec, d.forwarding.Load())
+	}
+	if n := send(deltaPayload, ProfileHigh, false); n != written+2 || w.hdrs[n-1].SequenceNumber != last+2 {
+		t.Errorf("after a late packet without a payload type: %d written, seq %d; want the stream to go on with seq %d",
+			n-written, w.hdrs[n-1].SequenceNumber, last+2)
+	}
+	b.ptFor = chromePTs
+
 	// The viewer's PLI and FIR for this track's SSRC become a keyframe request for the layer forwarded now;
 	// feedback that names another SSRC, or no keyframe, does nothing.
 	now += oneSecond
-	forget := func() { pub.forget(); f.lastPLI.Store(-int64(pliInterval)) } // as if the last PLI were long ago
 	forget()
 	d.handleRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: 0x9999}, &rtcp.ReceiverReport{}})
 	d.handleRTCP([]rtcp.Packet{&rtcp.FullIntraRequest{FIR: []rtcp.FIREntry{{SSRC: 0x9999}}}})
@@ -690,7 +738,7 @@ func TestDownTrackWrite(t *testing.T) {
 
 	// Pause: at once, and nothing is asked for.
 	forget()
-	written := len(w.hdrs)
+	written = len(w.hdrs)
 	d.setTarget(SlotF, false)
 	if n := send(key, ProfileHigh, false); n != written || d.interest.Load() != 0 || d.forwarding.Load() || len(sh.viewers()) != 0 {
 		t.Errorf("paused: %d more written, interest %b, forwarding %v", n-written, d.interest.Load(), d.forwarding.Load())
@@ -705,7 +753,7 @@ func TestDownTrackWrite(t *testing.T) {
 	if n := len(pub.plis()); n != 1 {
 		t.Errorf("%d PLIs on resume, want 1", n)
 	}
-	last := w.hdrs[written-1].SequenceNumber
+	last = w.hdrs[written-1].SequenceNumber
 	send(deltaPayload, ProfileHigh, false)
 	if n := send(key, ProfileHigh, false); n != written+1 || w.hdrs[written].SequenceNumber != last+1 {
 		t.Errorf("after the resume: %d more written, seq %d; want 1 and %d", n-written, w.hdrs[n-1].SequenceNumber, last+1)
@@ -717,9 +765,19 @@ func TestDownTrackWrite(t *testing.T) {
 	if n := send(deltaPayload, ProfileHigh, false); n != written || d.stats.writeErrors.Load() != 1 || !d.forwarding.Load() {
 		t.Errorf("a failed write: %d more written, %d errors counted", n-written, d.stats.writeErrors.Load())
 	}
-	// Unbind: the track is no longer forwarded.
-	if err := d.Unbind(nil); err != nil || d.forwarding.Load() {
-		t.Errorf("Unbind: %v, forwarding %v", err, d.forwarding.Load())
+	// Unbind: the track is no longer forwarded, and what the viewer was getting is over. Bound again, the stream
+	// starts on a keyframe start, not in the middle of the old one.
+	if err := d.Unbind(nil); err != nil || d.forwarding.Load() || d.binding.Load() != nil || len(sh.viewers()) != 0 {
+		t.Errorf("Unbind: %v, forwarding %v, viewers %v", err, d.forwarding.Load(), sh.viewers())
+	}
+	w.err = nil
+	d.binding.Store(b)
+	written = len(w.hdrs)
+	if n := send(deltaPayload, ProfileHigh, false); n != written || d.forwarding.Load() {
+		t.Errorf("bound again: a delta packet was forwarded (%d written), want the stream to wait for a keyframe", n-written)
+	}
+	if n := send(key, ProfileHigh, false); n != written+1 || !isKeyframeStart(w.payloads[written]) || !d.forwarding.Load() {
+		t.Errorf("bound again: %d written after a keyframe start, want it to start the stream", n-written)
 	}
 }
 
@@ -763,6 +821,306 @@ func TestDownTrackUnsentStart(t *testing.T) {
 	}
 	if !isKeyframeStart(w.payloads[0]) || !d.forwarding.Load() {
 		t.Error("the first packet the viewer got doesn't start a keyframe")
+	}
+}
+
+// TestDownTrackUnsentMidStream: once a packet has left through the binding, a packet that Pion takes without sending
+// is an ordinary lost packet. Pion does that for as long as the ICE transport can't send: a PC that has just failed,
+// a full ICE-TCP write buffer. The stream goes on, with the gap the viewer would see for any lost packet, and nobody
+// asks the publisher for a keyframe: restarting on each such packet would cost every other viewer of the layer two
+// keyframes a second. A new binding starts again: its first packet has to leave.
+func TestDownTrackUnsentMidStream(t *testing.T) {
+	s, _ := newTicklessSFU(t)
+	viewer, _ := join(t, s, "lounge", "bob", "c-b", RoleViewer)
+	sh := testShare(t, s, "s_1")
+	f, pub := testLayer(t, sh, SlotF, 0xf00)
+	sh.keyframe(f, ProfileHigh)
+	d, w := testDownTrack(t, viewer, sh, webrtc.RTPCodecTypeVideo)
+	d.setTarget(SlotF, true)
+	forget := func() { pub.forget(); f.lastPLI.Store(-int64(pliInterval)) } // as if the last PLI were long ago
+	var state rtpWriteState
+	now, seq := t0, uint16(10)
+	send := func(payload []byte) {
+		now += tick
+		f.handleRTP(rtpPkt(seq, uint32(seq)*3000, false, payload), ProfileHigh, now)
+		seq++
+		drain(d, &state)
+	}
+
+	send(keyPayload(t))
+	send(deltaPayload)
+	forget()
+	w.taken = 3
+	for range 3 {
+		send(deltaPayload)
+	}
+	if len(w.hdrs) != 2 || d.stats.unsent.Load() != 3 || d.stats.packets.Load() != 2 {
+		t.Fatalf("three packets that Pion took in mid-stream: %d written, %d counted unsent, %d sent; want 2, 3, 2",
+			len(w.hdrs), d.stats.unsent.Load(), d.stats.packets.Load())
+	}
+	if !d.forwarding.Load() || !slices.Equal(sh.viewers(), []ParticipantID{"bob"}) || d.m.n != 1 || len(pub.plis()) != 0 {
+		t.Fatalf("after them: forwarding %v, viewers %v, %d epochs, %d PLIs; want the stream to go on and nobody asked",
+			d.forwarding.Load(), sh.viewers(), d.m.n, len(pub.plis()))
+	}
+	send(deltaPayload)
+	if len(w.hdrs) != 3 || w.hdrs[2].SequenceNumber != d.m.seq0+5 || isKeyframeStart(w.payloads[2]) || len(pub.plis()) != 0 {
+		t.Fatalf("the next packet: %d written, seq %d, %d PLIs; want the delta packet with seq %d, after the gap of three",
+			len(w.hdrs), w.hdrs[len(w.hdrs)-1].SequenceNumber, len(pub.plis()), d.m.seq0+5)
+	}
+
+	// A new binding (the track on a rebuilt sub PC, say) has sent nothing yet: there a taken packet is a lost start.
+	next := *d.binding.Load()
+	if err := d.Unbind(nil); err != nil {
+		t.Fatal(err)
+	}
+	d.binding.Store(&next)
+	w.taken = 1
+	send(keyPayload(t))
+	send(deltaPayload)
+	if len(w.hdrs) != 3 || d.forwarding.Load() || len(pub.plis()) != 1 {
+		t.Fatalf("a start that Pion took on a new binding: %d written, forwarding %v, %d PLIs; want the stream to start "+
+			"again with a keyframe that is asked for", len(w.hdrs)-3, d.forwarding.Load(), len(pub.plis()))
+	}
+	send(keyPayload(t))
+	if len(w.hdrs) != 4 || !isKeyframeStart(w.payloads[3]) {
+		t.Fatalf("the next keyframe on the new binding: %d written", len(w.hdrs)-3)
+	}
+}
+
+// TestDownTrackNeverSends: a binding that never gets a packet out. Every keyframe start is taken by Pion and sent
+// nowhere, so the stream starts again each time; the publisher is asked for the first new start as usual, and from
+// the second lost start in a row only once per unsentStartBackoff, however many packets wait and however often the
+// layer's own 500 ms throttle would let a request through. One packet that leaves ends the caution.
+func TestDownTrackNeverSends(t *testing.T) {
+	s, _ := newTicklessSFU(t)
+	viewer, _ := join(t, s, "lounge", "bob", "c-b", RoleViewer)
+	sh := testShare(t, s, "s_1")
+	f, pub := testLayer(t, sh, SlotF, 0xf00)
+	sh.keyframe(f, ProfileHigh)
+	d, w := testDownTrack(t, viewer, sh, webrtc.RTPCodecTypeVideo)
+	d.setTarget(SlotF, true)
+	pub.forget()
+	var state rtpWriteState
+	now, seq := t0, uint16(10)
+	send := func(payload []byte) {
+		now += tick
+		f.handleRTP(rtpPkt(seq, uint32(seq)*3000, false, payload), ProfileHigh, now)
+		seq++
+		drain(d, &state)
+	}
+	// round is one answer of the publisher: a keyframe start, and delta packets that wait for the next one over
+	// several of the layer's throttle intervals. It returns the PLIs the round caused.
+	round := func() int {
+		before := len(pub.plis())
+		send(keyPayload(t))
+		for range 4 {
+			f.lastPLI.Store(-int64(pliInterval)) // 500 ms later
+			send(deltaPayload)
+			send(deltaPayload)
+		}
+		return len(pub.plis()) - before
+	}
+
+	w.taken = math.MaxInt
+	// The first lost start: the waiting packets ask as fast as the layer lets them, which heals a lost PLI.
+	if n := round(); n != 4 {
+		t.Fatalf("%d PLIs after the first start that never left, want 4: one per throttle interval", n)
+	}
+	// The second in a row, and all that follow: nobody asks.
+	asked := 0
+	for range 10 {
+		asked += round()
+	}
+	if asked != 0 || len(w.hdrs) != 0 || d.forwarding.Load() || d.stats.unsent.Load() != 11 || d.stats.switches.Load() != 11 {
+		t.Fatalf("ten more starts that never left: %d PLIs, %d written, forwarding %v, %d unsent, %d epochs; want no PLI "+
+			"and every keyframe tried", asked, len(w.hdrs), d.forwarding.Load(), d.stats.unsent.Load(), d.stats.switches.Load())
+	}
+	// 5 s later one request goes out, and then again none.
+	state.askedAt -= int64(unsentStartBackoff)
+	if n := round() + round() + round(); n != 1 {
+		t.Fatalf("%d PLIs in the rounds after the backoff had passed, want 1", n)
+	}
+	state.askedAt -= int64(unsentStartBackoff) - int64(time.Second)
+	if n := round(); n != 0 {
+		t.Fatalf("%d PLIs 4 s after the last one, want none before 5 s", n)
+	}
+
+	// Pion sends at last: the keyframe start is the first packet the viewer gets, and the caution is over. After a
+	// pause, the packets that wait for the resume's keyframe ask as fast as the layer lets them again.
+	w.taken = 0
+	send(keyPayload(t))
+	send(deltaPayload)
+	if len(w.hdrs) != 2 || !isKeyframeStart(w.payloads[0]) || !d.forwarding.Load() {
+		t.Fatalf("once Pion sends: %d written, forwarding %v; want the keyframe start and what follows", len(w.hdrs),
+			d.forwarding.Load())
+	}
+	d.setTarget(SlotF, false)
+	d.setTarget(SlotF, true)
+	pub.forget()
+	for range 3 {
+		f.lastPLI.Store(-int64(pliInterval))
+		send(deltaPayload)
+	}
+	if n := len(pub.plis()); n != 3 || len(w.hdrs) != 2 {
+		t.Errorf("after a packet had left: %d PLIs from three packets that wait for a keyframe, %d more written; want 3 "+
+			"and none", n, len(w.hdrs)-2)
+	}
+}
+
+// TestDownTrackGate: the DTLS-ready gate follows the sub PC (02 §9.3). It is closed until the PC is connected, stays
+// open while the PC is disconnected, and closes again when the PC has failed or closed: Pion takes what is written
+// to such a PC without an error, so the DownTrack would never know. A gate that closes ends what the viewer was
+// getting, takes the viewer off the share's list and asks nobody for anything; when it opens again the stream starts
+// on a keyframe start, right after the last own seq.
+func TestDownTrackGate(t *testing.T) {
+	type state = webrtc.PeerConnectionState
+	for _, tc := range []struct {
+		state        state
+		closed, open bool // the gate after the state, when it was closed and when it was open before
+	}{
+		{webrtc.PeerConnectionStateNew, false, false},
+		{webrtc.PeerConnectionStateConnecting, false, false},
+		{webrtc.PeerConnectionStateConnected, true, true},
+		{webrtc.PeerConnectionStateDisconnected, false, true},
+		{webrtc.PeerConnectionStateFailed, false, false},
+		{webrtc.PeerConnectionStateClosed, false, false},
+	} {
+		for _, was := range []bool{false, true} {
+			pc := &subPC{}
+			pc.ready.Store(was)
+			pc.follow(tc.state)
+			if want := map[bool]bool{false: tc.closed, true: tc.open}[was]; pc.ready.Load() != want {
+				t.Errorf("the gate after %s, when it was %v before: %v, want %v", tc.state, was, pc.ready.Load(), want)
+			}
+		}
+	}
+	closedPC := &subPC{}
+	closedPC.ready.Store(true)
+	closedPC.markClosed()
+	if closedPC.ready.Load() {
+		t.Error("the gate of a sub PC in the closed state is open")
+	}
+
+	s, _ := newTicklessSFU(t)
+	viewer, _ := join(t, s, "lounge", "bob", "c-b", RoleViewer)
+	sh := testShare(t, s, "s_1")
+	f, pubF := testLayer(t, sh, SlotF, 0xf00)
+	q, pubQ := testLayer(t, sh, SlotQ, 0xa00)
+	sh.keyframe(f, ProfileHigh)
+	d, w := testDownTrack(t, viewer, sh, webrtc.RTPCodecTypeVideo)
+	pc := d.binding.Load().pc
+	var ws rtpWriteState
+	now := t0
+	seqs := map[*Layer]uint16{f: 100, q: 7000}
+	send := func(l *Layer, payload []byte) int {
+		now += tick
+		l.handleRTP(rtpPkt(seqs[l], uint32(now/int64(time.Millisecond))*90, false, payload), ProfileHigh, now)
+		seqs[l]++
+		drain(d, &ws)
+		return len(w.hdrs)
+	}
+	forget := func() {
+		for l, rec := range map[*Layer]*rtcpRecorder{f: pubF, q: pubQ} {
+			rec.forget()
+			l.lastPLI.Store(-int64(pliInterval))
+		}
+	}
+
+	d.setTarget(SlotF, true)
+	send(f, keyPayload(t))
+	send(f, deltaPayload)
+	pc.follow(webrtc.PeerConnectionStateDisconnected) // ICE may recover: the stream goes on
+	if n := send(f, deltaPayload); n != 3 || !d.forwarding.Load() {
+		t.Fatalf("while the sub PC is disconnected: %d written, forwarding %v; want the stream to go on", n, d.forwarding.Load())
+	}
+	// The viewer asked for the other layer just before its PC failed: the switch was waiting for q's keyframe.
+	d.setTarget(SlotQ, true)
+	forget()
+	pc.follow(webrtc.PeerConnectionStateFailed)
+	epochs := d.m.n
+	send(f, deltaPayload)
+	send(q, deltaPayload)
+	send(q, keyPayload(t))
+	if n := send(f, keyPayload(t)); n != 3 || d.m.n != epochs || d.stats.unsent.Load() != 0 {
+		t.Fatalf("with the gate closed again: %d more written, %d more epochs; want nothing written or numbered", n-3,
+			d.m.n-epochs)
+	}
+	if d.forwarding.Load() || len(sh.viewers()) != 0 || d.interest.Load() != 1<<SlotQ {
+		t.Errorf("with the gate closed again: forwarding %v, viewers %v, interest %b; want the stream over and only the "+
+			"target wanted", d.forwarding.Load(), sh.viewers(), d.interest.Load())
+	}
+	if n := len(pubF.plis()) + len(pubQ.plis()); n != 0 {
+		t.Errorf("%d PLIs for a viewer whose sub PC has failed", n)
+	}
+	// Connected again (an ICE restart): the stream starts on a keyframe start of the target, with the next own seq.
+	pc.follow(webrtc.PeerConnectionStateConnected)
+	last := w.hdrs[2].SequenceNumber
+	if n := send(q, deltaPayload); n != 3 || len(pubQ.plis()) != 1 {
+		t.Fatalf("after the gate reopened, a delta packet: %d more written, %d PLIs for q; want it to wait and ask", n-3,
+			len(pubQ.plis()))
+	}
+	if n := send(q, keyPayload(t)); n != 4 || !isKeyframeStart(w.payloads[3]) || w.hdrs[3].SequenceNumber != last+1 ||
+		!d.forwarding.Load() {
+		t.Fatalf("after the gate reopened, a keyframe start: %d more written, seq %d; want it forwarded with seq %d", n-3,
+			w.hdrs[len(w.hdrs)-1].SequenceNumber, last+1)
+	}
+	if n := send(q, deltaPayload); n != 5 || len(pubF.plis()) != 0 {
+		t.Errorf("after the restart: %d more written, %d PLIs for the old layer", n-3, len(pubF.plis()))
+	}
+}
+
+// TestDownTrackForwardingFlag: the flag behind ShareInfo.Viewers is written by the Conn's actor (a pause) and by the
+// writer (with every packet). Both write it while they hold the DownTrack's lock, so it is the munger's state as the
+// last of them left it: once a pause has returned the viewer is not listed, whatever the writer was doing. Written
+// after the lock is released, a writer's "forwarding" can land behind the actor's "paused" and stay there, because a
+// paused DownTrack gets no packet that would correct it. (That is a race a few instructions wide: with it, this test
+// fails within some hundred pauses in most runs, not in every one.)
+func TestDownTrackForwardingFlag(t *testing.T) {
+	s, _ := newTicklessSFU(t)
+	viewer, _ := join(t, s, "lounge", "bob", "c-b", RoleViewer)
+	sh := testShare(t, s, "s_1")
+	f, _ := testLayer(t, sh, SlotF, 0xf00)
+	sh.keyframe(f, ProfileHigh)
+	d, _ := testDownTrack(t, viewer, sh, webrtc.RTPCodecTypeVideo)
+	d.binding.Load().writer = discardWriter{}
+	key := keyPayload(t)
+	var (
+		wg     sync.WaitGroup
+		stop   atomic.Bool
+		rounds atomic.Uint64 // the writer's loop count: two more, and a write that had begun is over
+	)
+	// The writer, fed as a Layer feeds it: only while the DownTrack wants the layer. Every packet starts a keyframe,
+	// so every resume forwards at once.
+	wg.Go(func() {
+		var w rtpWriteState
+		for seq := uint16(0); !stop.Load(); rounds.Add(1) {
+			if d.interest.Load()&(1<<SlotF) == 0 {
+				runtime.Gosched()
+				continue
+			}
+			seq++
+			d.write(&w, &packet{layer: f, seq: seq, ts: uint32(seq) * 3000, profile: ProfileHigh, keyStart: true, payload: key})
+		}
+	})
+	defer func() {
+		stop.Store(true)
+		wg.Wait()
+	}()
+	for i := range 5000 {
+		d.setTarget(SlotF, true)
+		for !d.forwarding.Load() {
+			runtime.Gosched()
+		}
+		d.setTarget(SlotF, false)
+		if d.forwarding.Load() {
+			t.Fatalf("pause %d: the DownTrack counts as forwarding right after it was paused", i)
+		}
+		for until := rounds.Load() + 2; rounds.Load() < until; {
+			runtime.Gosched()
+		}
+		if d.forwarding.Load() || len(sh.viewers()) != 0 {
+			t.Fatalf("pause %d: the paused DownTrack counts as forwarding once its writer has settled", i)
+		}
 	}
 }
 
@@ -895,7 +1253,8 @@ func TestForwardingAllocations(t *testing.T) {
 		d.setTarget(SlotF, true)
 		dts = append(dts, d)
 	}
-	var state rtpWriteState
+	states := make([]rtpWriteState, len(dts)) // a writer's state is its DownTrack's
+	state := &states[0]
 	seq, now := uint16(0), t0
 	pkt := rtpPkt(0, 0, false, keyPayload(t))
 	payload := make([]byte, 1100)
@@ -908,8 +1267,8 @@ func TestForwardingAllocations(t *testing.T) {
 		now += tick
 	}
 	step() // the keyframe start: every DownTrack starts forwarding
-	for _, d := range dts {
-		drain(d, &state)
+	for i, d := range dts {
+		drain(d, &states[i])
 	}
 	if n := testing.AllocsPerRun(200, step); n > 2 {
 		t.Errorf("an incoming packet for 3 viewers allocates %v times, want 2: the packet and its payload", n)
@@ -918,7 +1277,7 @@ func TestForwardingAllocations(t *testing.T) {
 	if queued < 200 {
 		t.Fatalf("%d packets queued, want the 200 just read", queued)
 	}
-	if n := testing.AllocsPerRun(queued-1, func() { dts[0].write(&state, <-dts[0].queue) }); n != 0 {
+	if n := testing.AllocsPerRun(queued-1, func() { dts[0].write(state, <-dts[0].queue) }); n != 0 {
 		t.Errorf("forwarding a packet to a viewer allocates %v times, want 0", n)
 	}
 	if got := dts[0].stats.packets.Load(); got < 200 {

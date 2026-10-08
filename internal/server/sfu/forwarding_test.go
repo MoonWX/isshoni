@@ -2,6 +2,7 @@ package sfu_test
 
 import (
 	"fmt"
+	"net"
 	"runtime"
 	"slices"
 	"strings"
@@ -450,5 +451,110 @@ func basicForwarding(t *testing.T, layers ...string) {
 	}
 	if leaks != nil {
 		t.Errorf("goroutines left after everything closed: %v", leaks)
+	}
+}
+
+// TestFailedViewerCostsNoKeyframes: a viewer that vanishes without a word (its network is gone) must cost the others
+// nothing. Its sub PC fails after the ICE timeouts, and Pion then takes every packet written to it without an error
+// and sends none. The DTLS-ready gate follows the PC: the viewer's DownTracks stop, the viewer leaves the share's
+// list, and nobody asks the publisher for anything on its behalf. (Before, each packet that went nowhere restarted
+// the viewer's stream, and the packets waiting for its keyframe asked the publisher for one every 500 ms, which every
+// other viewer of the layer got.)
+func TestFailedViewerCostsNoKeyframes(t *testing.T) {
+	t.Cleanup(sfu.SetMediaICETimeouts(time.Second, time.Second, 200*time.Millisecond))
+	h := newHarness(t, sfutest.HarnessOptions{})
+	ctx := testCtx(t)
+	pubConn, pubSig := join(t, h, "alice", "c-pub", sfu.RoleFull)
+	const share = sfu.ShareID("s_gone")
+	startShare(t, pubConn, share, sfu.PresetAuto)
+	pub := newPublisher(t, newLongGOPSource(t), sfutest.LoopbackSettings(), "f")
+	if _, err := sfutest.Publish(ctx, pubConn, pub, 1, 1, share); err != nil {
+		t.Fatalf("publish negotiation: %v", err)
+	}
+	if err := pub.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Two viewers of the one layer. The second one's only socket goes through a FaultConn.
+	var lc net.ListenConfig
+	sock, err := lc.ListenPacket(ctx, "udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire := sfutest.NewFaultConn(sock)
+	mux := webrtc.NewICEUDPMux(nil, wire)
+	t.Cleanup(func() { _ = mux.Close() }) // after the viewer's cleanup, which runs first
+	lossy := sfutest.LoopbackSettings()
+	lossy.SetICEUDPMux(mux)
+	stayConn, staySig := join(t, h, "bob", "c-stay", sfu.RoleViewer)
+	goneConn, goneSig := join(t, h, "carol", "c-gone", sfu.RoleViewer)
+	stay, gone := newViewer(t, sfutest.LoopbackSettings()), newViewer(t, lossy)
+	staySig.Attach(stayConn, stay)
+	goneSig.Attach(goneConn, gone)
+	for _, c := range []*sfu.Conn{stayConn, goneConn} {
+		errs, err := c.UpdateSubscriptions(ctx, []sfu.SubscriptionUpdate{{Share: share, Video: sfu.QualityHigh, Audio: true}})
+		if err != nil || errs[0] != nil {
+			t.Fatalf("UpdateSubscriptions = %v, %v", errs, err)
+		}
+	}
+	stayVideo, goneVideo := waitTrack(t, stay, webrtc.RTPCodecTypeVideo), waitTrack(t, gone, webrtc.RTPCodecTypeVideo)
+	for _, r := range []*sfutest.Recorder{stayVideo, goneVideo} {
+		if err := r.Wait(ctx, func(r *sfutest.Recorder) bool { return len(sfutest.Frames(r.Packets())) >= 30 }); err != nil {
+			t.Fatalf("%v (answer errors %v, %v)", err, staySig.Errs(), goneSig.Errs())
+		}
+	}
+	waitShare(t, h.SFU, share, func(i sfu.ShareInfo) bool {
+		return slices.Equal(i.Viewers, []sfu.ParticipantID{"bob", "carol"})
+	})
+	// Both streams have run for a second since their keyframes: whatever was asked for to start them is done.
+	before, stayKeys := layerStats(t, pub, "f"), stayVideo.Stats().Keyframes
+
+	// The network of the second viewer goes away: nothing in, nothing out, no goodbye.
+	wire.SetDrop(func(sfutest.Direction, net.Addr, []byte) bool { return true })
+	if err := goneSig.WaitPCState(ctx, sfu.PCSub, 1, "failed"); err != nil {
+		t.Fatalf("the vanished viewer's sub PC: %v", err)
+	}
+	failedAt := time.Now()
+	// The gate closed with the PC: the viewer no longer counts as one.
+	waitShare(t, h.SFU, share, func(i sfu.ShareInfo) bool {
+		return slices.Equal(i.Viewers, []sfu.ParticipantID{"bob"})
+	})
+	subs, err := goneConn.Subscriptions(ctx)
+	if err != nil || len(subs) != 1 {
+		t.Fatalf("the vanished viewer's subscriptions = %+v, %v", subs, err)
+	}
+	// Four of the layer's throttle intervals with the PC failed.
+	time.Sleep(time.Until(failedAt.Add(2 * time.Second)))
+
+	// A PC of the others that dropped out for a moment (a machine too busy for 1 s ICE timeouts) asks for a keyframe
+	// when it is back, rightly: then this run says nothing about the failed viewer.
+	for name, sig := range map[string]*sfutest.DirectSignaler{"publisher": pubSig, "staying viewer": staySig} {
+		for _, ev := range sig.Events() {
+			if st, ok := ev.(sfu.PCStateEvent); ok && st.State != "connected" {
+				t.Skipf("the %s's PC went %s during the test: the machine is too slow for its ICE timeouts", name, st.State)
+			}
+		}
+	}
+	after := layerStats(t, pub, "f")
+	if after.PLIs != before.PLIs || after.Keyframes != before.Keyframes {
+		t.Errorf("while a viewer's sub PC was failed for 2 s the publisher got %d PLIs and made %d keyframes, want none: "+
+			"its packets go nowhere, and a keyframe wouldn't change that", after.PLIs-before.PLIs,
+			after.Keyframes-before.Keyframes)
+	}
+	if info, _ := h.SFU.Share(share); !slices.Equal(info.Viewers, []sfu.ParticipantID{"bob"}) || info.State != sfu.ShareLive {
+		t.Errorf("the share = %+v, want it live and watched by bob alone", info)
+	}
+	later, err := goneConn.Subscriptions(ctx)
+	if err != nil || len(later) != 1 || later[0].VideoSent != subs[0].VideoSent || later[0].AudioSent != subs[0].AudioSent {
+		t.Errorf("the vanished viewer's subscription went from %+v to %+v (%v), want nothing more sent to it", subs, later, err)
+	}
+	// The viewer that stayed never noticed.
+	vp := sfutest.WithoutPartialTail(stayVideo.Packets())
+	if err := sfutest.CheckContinuous(vp); err != nil {
+		t.Errorf("the staying viewer's video: %v", err)
+	}
+	if st := stayVideo.Stats(); st.Gaps != 0 || st.Lost != 0 || st.Keyframes != stayKeys || time.Since(st.Last) > time.Second {
+		t.Errorf("the staying viewer's video stats = %+v, want a stream that still runs, without a gap and with the %d "+
+			"keyframes it had before the other viewer vanished", st, stayKeys)
 	}
 }

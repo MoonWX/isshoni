@@ -48,7 +48,9 @@ type DownTrack struct {
 	mu sync.Mutex // guards m; the last lock in doc.go's order, never held across a call that takes another
 	m  *munger
 
-	// forwarding: the writer forwards a layer to the viewer now (ShareInfo.Viewers).
+	// forwarding: the writer forwards a layer to the viewer now (ShareInfo.Viewers). It is the munger's state
+	// (current), written only while mu is held so that the actor and the writer can't leave it stale, and read
+	// without a lock.
 	forwarding atomic.Bool
 	stats      dtStats
 }
@@ -59,7 +61,7 @@ type dtStats struct {
 	bytes       atomic.Uint64 // their payload bytes
 	drops       atomic.Uint64 // packets a full queue dropped
 	noCodec     atomic.Uint64 // packets in a profile the viewer negotiated no payload type for
-	unsent      atomic.Uint64 // packets Pion took before it could send: the stream restarts on a keyframe
+	unsent      atomic.Uint64 // packets Pion took without sending them (WriteRTP returned 0 and no error)
 	writeErrors atomic.Uint64
 	switches    atomic.Uint64 // epochs started: the first keyframe, layer switches, resumes
 	keyRequests atomic.Uint64 // PLIs and FIRs from the viewer
@@ -197,16 +199,21 @@ func (d *DownTrack) Bind(ctx webrtc.TrackLocalContext) (webrtc.RTPCodecParameter
 }
 
 // Unbind implements webrtc.TrackLocal: the sender stopped (the subscription went away, or the PC closed). The writer
-// drops packets until the next Bind.
+// drops packets until the next Bind, and what the viewer was getting is over: after a Bind the stream starts on a
+// keyframe again. Like Bind it only stores, under the DownTrack's own lock, and never blocks.
 func (d *DownTrack) Unbind(webrtc.TrackLocalContext) error {
+	d.mu.Lock()
 	d.binding.Store(nil)
-	d.setForwarding(false)
+	d.restartLocked()
+	d.mu.Unlock()
 	return nil
 }
 
 // sendable reports whether a packet written through the binding can reach the viewer: the viewer negotiated a codec
 // the SFU forwards, and the DTLS-ready gate of the binding's sub PC is open (02 §9.3, S4 finding 1: Pion drops RTP
-// written before DTLS is up, without an error).
+// written before DTLS is up, without an error). The gate follows the PC: it is open while the PC is connected (or
+// disconnected, which may pass) and closed again once it has failed or closed, when Pion drops everything the same
+// silent way.
 func (b *binding) sendable() bool {
 	return b != nil && !b.unsupported && b.pc != nil && b.pc.ready.Load()
 }
@@ -222,14 +229,22 @@ func (d *DownTrack) setTarget(slot Slot, active bool) {
 	changed := d.m.setTarget(slot, active)
 	waiting := d.m.waitingForKeyframe()
 	d.interest.Store(d.interestLocked())
-	_, forwarding := d.m.current()
-	d.mu.Unlock()
-	if !forwarding {
+	if _, forwarding := d.m.current(); !forwarding {
 		d.setForwarding(false)
 	}
+	d.mu.Unlock()
 	if changed && waiting && d.kind == webrtc.RTPCodecTypeVideo && d.binding.Load().sendable() {
 		d.share.requestKeyframe(slot)
 	}
+}
+
+// restartLocked ends what the DownTrack forwards now without pausing it: the munger's epoch is over, the interest
+// mask is the target's alone, and the viewer no longer counts as one. The stream goes on with the next keyframe of
+// the target (munger.restart). d.mu is held.
+func (d *DownTrack) restartLocked() {
+	d.m.restart()
+	d.interest.Store(d.interestLocked())
+	d.setForwarding(false)
 }
 
 // interestLocked returns the interest mask for the munger's state: the target's bit and the bit of the layer
@@ -260,7 +275,9 @@ func (d *DownTrack) requestKeyframe() {
 	}
 }
 
-// setForwarding records whether the DownTrack forwards now. It writes only on a change: the writer calls it per packet.
+// setForwarding records whether the DownTrack forwards now. It writes only on a change: the writer calls it per
+// packet. d.mu is held, so the flag is always the munger's state as the last holder left it: without the lock, a
+// writer that stored "forwarding" just after the actor paused the track would leave a paused viewer listed for good.
 func (d *DownTrack) setForwarding(on bool) {
 	if d.forwarding.Load() != on {
 		d.forwarding.Store(on)
@@ -300,17 +317,31 @@ func (d *DownTrack) stop() {
 	d.stopOnce.Do(func() { close(d.done) })
 }
 
-// rtpWriteState is what the writer reuses from packet to packet, so that forwarding allocates nothing: the header,
-// whose extension list keeps its capacity, and the bytes of the abs-send-time extension.
+// rtpWriteState is the writer's own state, one per DownTrack. Part of it is reused from packet to packet so that
+// forwarding allocates nothing: the header, whose extension list keeps its capacity, and the bytes of the
+// abs-send-time extension. The rest follows how the stream's start goes on the current binding.
 type rtpWriteState struct {
 	hdr         rtp.Header
 	absSendTime [3]byte
+
+	// binding is the binding the fields below are about: a new one starts them again.
+	binding *binding
+	// sent: a packet has left through binding since its gate last opened. Until then a packet that Pion takes
+	// without sending is a start the viewer never saw, and the stream starts again; after it, such a packet is an
+	// ordinary lost packet.
+	sent bool
+	// unsentStarts counts the starts in a row that never left, up to unsentStartLimit. From there on the DownTrack
+	// has a keyframe asked for only every unsentStartBackoff; askedAt is the monoNow it last did, or reached the
+	// limit.
+	unsentStarts int
+	askedAt      int64
 }
 
 // write forwards one queued packet, the steps of 02 §9.3:
-//  1. the gate and the binding: nothing is written, and the munger isn't even asked, before the viewer negotiated
-//     the track and its sub PC's DTLS is up, so the first packet a viewer gets is the keyframe start that the
-//     munger's first epoch begins with;
+//  1. the gate and the binding: nothing is written, and the munger isn't asked for a place, before the viewer
+//     negotiated the track and its sub PC's DTLS is up, so the first packet a viewer gets is the keyframe start that
+//     the munger's first epoch begins with. A gate that closes again (the PC failed or closed) or an Unbind ends
+//     what was forwarded, so what follows a reopened gate or the next Bind starts on a keyframe too;
 //  2. the munger gives the packet its place in the viewer's stream, or drops it, or waits for a keyframe of the
 //     target layer and has the publisher asked for one (throttled; every waiting packet asks again, which heals a
 //     lost PLI);
@@ -318,13 +349,22 @@ type rtpWriteState struct {
 //     SSRC, the publisher's marker bit and nothing else of the publisher's header (no CSRCs, no padding, none of its
 //     extensions, whose ids are the pub PC's); abs-send-time when the viewer negotiated it;
 //  4. pacing is README S84's;
-//  5. the write, which never blocks (02 §5.4).
+//  5. the write, which never blocks (02 §5.4). A packet that Pion takes without sending it is unsent's.
 //
 // A padding marker only moves the munger (skipPadding).
 func (d *DownTrack) write(w *rtpWriteState, p *packet) {
 	b := d.binding.Load()
+	if b != w.binding {
+		w.binding, w.sent, w.unsentStarts = b, false, 0
+	}
 	if !b.sendable() {
-		d.setForwarding(false)
+		// The viewer gets nothing now, and missed what it was getting: the stream it had is over.
+		w.sent, w.unsentStarts = false, 0
+		d.mu.Lock()
+		if _, forwarding := d.m.current(); forwarding {
+			d.restartLocked()
+		}
+		d.mu.Unlock()
 		return
 	}
 	now := monoNow()
@@ -337,8 +377,16 @@ func (d *DownTrack) write(w *rtpWriteState, p *packet) {
 	pt, ok := b.ptFor[p.profile]
 	if !ok {
 		// The viewer negotiated no payload type that carries this profile. README S69 reports it (codec_mismatch) and
-		// has the room's codec policy fix it; until a packet in a profile the viewer takes arrives, nothing flows.
+		// has the room's codec policy fix it; until a packet in a profile the viewer takes arrives, nothing flows. If
+		// the layer forwarded now has moved to this profile, what the viewer was getting is over (02 §9.4). Nobody is
+		// asked for a keyframe: the viewer couldn't decode it.
 		d.stats.noCodec.Add(1)
+		d.mu.Lock()
+		if d.m.unforwardable(p) {
+			d.interest.Store(d.interestLocked())
+			d.setForwarding(false)
+		}
+		d.mu.Unlock()
 		return
 	}
 
@@ -348,10 +396,17 @@ func (d *DownTrack) write(w *rtpWriteState, p *packet) {
 		d.interest.Store(d.interestLocked()) // a switch is done: the old layer's packets are no longer wanted
 	}
 	_, forwarding := d.m.current()
-	d.mu.Unlock()
 	d.setForwarding(forwarding)
+	d.mu.Unlock()
 	switch v {
 	case verdictWaitKeyframe:
+		if w.unsentStarts >= unsentStartLimit {
+			// Nothing has left through this binding yet, start after start: the next try can wait.
+			if now-w.askedAt < int64(unsentStartBackoff) {
+				return
+			}
+			w.askedAt = now
+		}
 		p.layer.requestKeyframe(now)
 		return
 	case verdictDrop:
@@ -374,19 +429,40 @@ func (d *DownTrack) write(w *rtpWriteState, p *packet) {
 	case err != nil:
 		d.stats.writeErrors.Add(1) // the sender stopped or the PC is closing: Unbind follows
 	case n == 0:
-		// Pion took the packet and sent nothing: the sub PC reports connected a moment before its SRTP session is
-		// usable, and a sender's write path opens a moment after Bind. The viewer never saw this packet, so the
-		// stream starts again with the next keyframe, which the packets that now wait for it ask for.
-		d.mu.Lock()
-		d.m.restart()
-		d.interest.Store(d.interestLocked())
-		d.mu.Unlock()
-		d.setForwarding(false)
-		d.stats.unsent.Add(1)
+		d.unsent(w, now)
 	default:
+		w.sent, w.unsentStarts = true, 0
 		d.stats.packets.Add(1)
 		d.stats.bytes.Add(uint64(len(p.payload)))
 	}
+}
+
+// unsent handles a packet that Pion took without sending it and without an error. Pion does that in two situations
+// that have nothing in common:
+//
+//   - Before anything has left through the binding: a sub PC reports connected a moment before its SRTP session is
+//     usable (S4 finding 1), and a sender's write path opens a moment after Bind. The viewer never saw the packet, a
+//     keyframe start, so the stream must not go on from it: it starts again with the next keyframe, which the packets
+//     that now wait for it ask for. A binding that never gets a packet out would keep that up at the layer's two
+//     keyframes a second, for every viewer of the layer, so from the second start in a row on the DownTrack asks only
+//     once per unsentStartBackoff.
+//   - In mid-stream, whenever the ICE transport can't send right now: no selected candidate pair (a PC that has
+//     just failed, until its gate closes), or a full write buffer on ICE-TCP (a slow viewer). That is an ordinary
+//     lost packet, like one lost on the network: the viewer sees the gap and asks for what it needs (a NACK, or a
+//     PLI). Restarting here would turn every such packet into a keyframe for all viewers of the layer.
+func (d *DownTrack) unsent(w *rtpWriteState, now int64) {
+	d.stats.unsent.Add(1)
+	if w.sent {
+		return
+	}
+	if w.unsentStarts < unsentStartLimit {
+		if w.unsentStarts++; w.unsentStarts == unsentStartLimit {
+			w.askedAt = now
+		}
+	}
+	d.mu.Lock()
+	d.restartLocked()
+	d.mu.Unlock()
 }
 
 // putAbsSendTime writes the abs-send-time header extension for t: the 24 bits of NTP time around the binary point,

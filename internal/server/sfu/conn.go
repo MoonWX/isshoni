@@ -271,12 +271,16 @@ func (c *Conn) onPCState(kind PCKind, gen uint32, pc *webrtc.PeerConnection) {
 	}
 	*last = state
 	c.log.Info("PeerConnection state", "pc", kind.String(), "gen", gen, "state", state.String())
+	if kind == PCSub {
+		// The DTLS-ready gate (02 §9.3, S4 finding 1): Pion drops RTP written before DTLS is up, and RTP written to a
+		// PC that has failed, so the DownTracks of this PC forward only while it can send.
+		c.sub.follow(state)
+	}
 	switch state {
 	case webrtc.PeerConnectionStateConnected:
 		if kind == PCSub {
-			// The DTLS-ready gate (02 §9.3, S4 finding 1): Pion drops RTP written before DTLS is up, so the DownTracks
-			// of this PC forward only from now on, and each video one asks its publisher for a keyframe to start with.
-			c.sub.ready.Store(true)
+			// The gate is open: each video DownTrack asks its publisher for a keyframe to start with, or to go on with
+			// after what its viewer missed.
 			for _, sub := range c.subs {
 				sub.video.requestKeyframe()
 			}

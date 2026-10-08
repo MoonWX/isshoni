@@ -182,6 +182,65 @@ func TestMungerRestart(t *testing.T) {
 	}
 }
 
+// unforwardable is how the munger hears of a packet the DownTrack can't forward for lack of a payload type, so that
+// process never sees it. A newer packet of the Layer forwarded now ends the epoch: the Layer moved on to a profile
+// the viewer can't take. Without that, a flip back to the old profile would go on in the old epoch across a gap,
+// and a NACK for the gap would map to the cached packets of the other profile (02 §9.4, "Further rules").
+func TestMungerUnforwardable(t *testing.T) {
+	f, q := newLayer(SlotF, video), newLayer(SlotQ, video)
+	m := videoMunger(SlotF)
+	if m.unforwardable(cb(f, 9, 0, true)) {
+		t.Fatal("a munger that forwards nothing ended an epoch")
+	}
+	out := feed(m, t0, vp(f, 10, 100, true), vp(f, 11, 3100, false), vp(f, 12, 6100, false))
+	epochs := m.n
+
+	// Nothing ends for a late packet, for a repeat of the newest one, or for a packet of another Layer.
+	for name, p := range map[string]*packet{
+		"late": cb(f, 11, 3100, false), "repeated": cb(f, 12, 6100, false), "of q": cb(q, 500, 0, true),
+	} {
+		if m.unforwardable(p) {
+			t.Fatalf("a %s packet ended the epoch", name)
+		}
+	}
+	if slot, ok := m.current(); !ok || slot != SlotF {
+		t.Fatalf("current = %v, %v; want f still forwarded", slot, ok)
+	}
+
+	// The Layer goes on in a profile without a payload type: three packets the munger only hears of.
+	if !m.unforwardable(cb(f, 13, 9100, true)) {
+		t.Fatal("a newer packet of the current Layer did not end the epoch")
+	}
+	if m.unforwardable(cb(f, 14, 9100, false)) || m.unforwardable(cb(f, 15, 12100, false)) {
+		t.Fatal("an epoch ended twice")
+	}
+	if _, ok := m.current(); ok || !m.active || !m.waitingForKeyframe() || m.n != epochs {
+		t.Fatalf("after the Layer moved on: current %v, active %v, waiting %v, %d epochs; want an active munger that "+
+			"waits for a keyframe", ok, m.active, m.waitingForKeyframe(), m.n)
+	}
+	// Back in the old profile. A delta packet must not go on from before the gap: own seqs lastS+1 … would stand for
+	// upstream 13–15, which the cache holds in the other profile.
+	if _, _, v := m.process(vp(f, 16, 15100, false), t0+7*tick); v != verdictWaitKeyframe {
+		t.Fatalf("a delta packet back in the old profile: verdict %d, want it to wait for a keyframe", v)
+	}
+	if _, _, v := m.process(vp(f, 12, 6100, false), t0+7*tick); v != verdictDrop {
+		t.Fatalf("a packet from before the Layer moved on: verdict %d, want it dropped", v)
+	}
+	out2 := feed(m, t0+8*tick, vp(f, 17, 18100, true), vp(f, 18, 21100, false))
+	if len(out2) != 2 || out2[0].v != verdictNewEpoch {
+		t.Fatalf("the next keyframe in the old profile starts an epoch, got %+v", out2)
+	}
+	assertContinuous(t, append(out, out2...))
+	// The own seqs sent map back to what was sent, and none of them to a packet of the other profile.
+	assertLookup(t, m, t0+10*tick, append(out, out2...))
+
+	// Paused, the munger has nothing to end.
+	m.setTarget(SlotF, false)
+	if m.unforwardable(cb(f, 20, 27100, true)) {
+		t.Fatal("a paused munger ended an epoch")
+	}
+}
+
 // S4 port: TestMungerDropsReorderedPacketsFromBeforeSwitch.
 func TestMungerDropsReorderedPacketsFromBeforeSwitch(t *testing.T) {
 	f, q := newLayer(SlotF, video), newLayer(SlotQ, video)

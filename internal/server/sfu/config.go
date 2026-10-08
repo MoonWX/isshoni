@@ -77,6 +77,12 @@ const (
 	audioQueueLen = 256
 	// pliInterval is the least time between two keyframe requests for one layer (02 §9.7).
 	pliInterval = 500 * time.Millisecond
+	// A start of a viewer's stream that Pion takes without sending it is repeated with the next keyframe, which the
+	// DownTrack has the publisher asked for. After unsentStartLimit such starts in a row it asks only once per
+	// unsentStartBackoff until a packet leaves, so a viewer that nothing reaches can't cost the other viewers of the
+	// layer two keyframes a second (02 §9.3, §9.7).
+	unsentStartLimit   = 2
+	unsentStartBackoff = 5 * time.Second
 	// tickInterval is the SFU ticker's period, and the least time between two debounced ShareUpdated calls for one
 	// share; every statsEvery-th tick does the once-a-second work (02 §5.4).
 	tickInterval = 250 * time.Millisecond
