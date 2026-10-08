@@ -1,0 +1,315 @@
+[
+  {
+    "url": "https://api.github.com/repos/MoonWX/isshoni/releases/1012",
+    "assets_url": "https://api.github.com/repos/MoonWX/isshoni/releases/1012/assets",
+    "upload_url": "https://uploads.github.com/repos/MoonWX/isshoni/releases/1012/assets{?name,label}",
+    "html_url": "https://github.com/MoonWX/isshoni/releases/tag/untagged-0123456789abcdef",
+    "id": 1012,
+    "author": {
+      "login": "github-actions[bot]",
+      "id": 41898282,
+      "type": "Bot",
+      "site_admin": false
+    },
+    "node_id": "RE_example1012",
+    "tag_name": "v0.12.0",
+    "target_commitish": "main",
+    "name": "v0.12.0",
+    "draft": true,
+    "prerelease": false,
+    "created_at": "2027-04-20T09:00:00Z",
+    "published_at": null,
+    "assets": [],
+    "tarball_url": "https://api.github.com/repos/MoonWX/isshoni/tarball/v0.12.0",
+    "zipball_url": "https://api.github.com/repos/MoonWX/isshoni/zipball/v0.12.0",
+    "body": "## Draft\r\n\r\nNot published yet.\r\n\r\n<!-- isshoni:security -->"
+  },
+  {
+    "url": "https://api.github.com/repos/MoonWX/isshoni/releases/1011",
+    "assets_url": "https://api.github.com/repos/MoonWX/isshoni/releases/1011/assets",
+    "upload_url": "https://uploads.github.com/repos/MoonWX/isshoni/releases/1011/assets{?name,label}",
+    "html_url": "https://github.com/MoonWX/isshoni/releases/tag/v0.11.0-rc.1",
+    "id": 1011,
+    "author": {
+      "login": "github-actions[bot]",
+      "id": 41898282,
+      "type": "Bot",
+      "site_admin": false
+    },
+    "node_id": "RE_example1011",
+    "tag_name": "v0.11.0-rc.1",
+    "target_commitish": "main",
+    "name": "v0.11.0-rc.1",
+    "draft": false,
+    "prerelease": true,
+    "created_at": "2027-04-10T09:00:00Z",
+    "published_at": "2027-04-10T09:00:00Z",
+    "assets": [
+      {
+        "url": "https://api.github.com/repos/MoonWX/isshoni/releases/assets/101101",
+        "id": 101101,
+        "name": "isshoni_0.11.0-rc.1_linux_amd64.tar.gz",
+        "content_type": "application/gzip",
+        "state": "uploaded",
+        "size": 18874368,
+        "download_count": 42,
+        "browser_download_url": "https://github.com/MoonWX/isshoni/releases/download/v0.11.0-rc.1/isshoni_0.11.0-rc.1_linux_amd64.tar.gz"
+      }
+    ],
+    "tarball_url": "https://api.github.com/repos/MoonWX/isshoni/tarball/v0.11.0-rc.1",
+    "zipball_url": "https://api.github.com/repos/MoonWX/isshoni/zipball/v0.11.0-rc.1",
+    "body": "## Release candidate\r\n\r\nPlease test."
+  },
+  {
+    "url": "https://api.github.com/repos/MoonWX/isshoni/releases/1010",
+    "assets_url": "https://api.github.com/repos/MoonWX/isshoni/releases/1010/assets",
+    "upload_url": "https://uploads.github.com/repos/MoonWX/isshoni/releases/1010/assets{?name,label}",
+    "html_url": "https://github.com/MoonWX/isshoni/releases/tag/v0.9.1",
+    "id": 1010,
+    "author": {
+      "login": "github-actions[bot]",
+      "id": 41898282,
+      "type": "Bot",
+      "site_admin": false
+    },
+    "node_id": "RE_example1010",
+    "tag_name": "v0.9.1",
+    "target_commitish": "main",
+    "name": "v0.9.1",
+    "draft": false,
+    "prerelease": false,
+    "created_at": "2027-03-20T09:00:00Z",
+    "published_at": "2027-03-20T09:00:00Z",
+    "assets": [
+      {
+        "url": "https://api.github.com/repos/MoonWX/isshoni/releases/assets/101001",
+        "id": 101001,
+        "name": "isshoni_0.9.1_linux_amd64.tar.gz",
+        "content_type": "application/gzip",
+        "state": "uploaded",
+        "size": 18874368,
+        "download_count": 42,
+        "browser_download_url": "https://github.com/MoonWX/isshoni/releases/download/v0.9.1/isshoni_0.9.1_linux_amd64.tar.gz"
+      }
+    ],
+    "tarball_url": "https://api.github.com/repos/MoonWX/isshoni/tarball/v0.9.1",
+    "zipball_url": "https://api.github.com/repos/MoonWX/isshoni/zipball/v0.9.1",
+    "body": "<!-- isshoni:security -->\r\n## Security\r\n\r\nFixes a problem in session handling. Update now.\r\n"
+  },
+  {
+    "url": "https://api.github.com/repos/MoonWX/isshoni/releases/1009",
+    "assets_url": "https://api.github.com/repos/MoonWX/isshoni/releases/1009/assets",
+    "upload_url": "https://uploads.github.com/repos/MoonWX/isshoni/releases/1009/assets{?name,label}",
+    "html_url": "https://github.com/MoonWX/isshoni/releases/tag/v0.10.0",
+    "id": 1009,
+    "author": {
+      "login": "github-actions[bot]",
+      "id": 41898282,
+      "type": "Bot",
+      "site_admin": false
+    },
+    "node_id": "RE_example1009",
+    "tag_name": "v0.10.0",
+    "target_commitish": "main",
+    "name": "v0.10.0",
+    "draft": false,
+    "prerelease": false,
+    "created_at": "2027-03-02T10:00:00Z",
+    "published_at": "2027-03-02T10:00:00Z",
+    "assets": [
+      {
+        "url": "https://api.github.com/repos/MoonWX/isshoni/releases/assets/100901",
+        "id": 100901,
+        "name": "isshoni_0.10.0_linux_amd64.tar.gz",
+        "content_type": "application/gzip",
+        "state": "uploaded",
+        "size": 18874368,
+        "download_count": 42,
+        "browser_download_url": "https://github.com/MoonWX/isshoni/releases/download/v0.10.0/isshoni_0.10.0_linux_amd64.tar.gz"
+      }
+    ],
+    "tarball_url": "https://api.github.com/repos/MoonWX/isshoni/tarball/v0.10.0",
+    "zipball_url": "https://api.github.com/repos/MoonWX/isshoni/zipball/v0.10.0",
+    "body": "## What's new\r\n\r\n- Sharper thumbnails\r\n- `isshoni doctor` checks the clock\r\n"
+  },
+  {
+    "url": "https://api.github.com/repos/MoonWX/isshoni/releases/1008",
+    "assets_url": "https://api.github.com/repos/MoonWX/isshoni/releases/1008/assets",
+    "upload_url": "https://uploads.github.com/repos/MoonWX/isshoni/releases/1008/assets{?name,label}",
+    "html_url": "https://github.com/MoonWX/isshoni/releases/tag/nightly",
+    "id": 1008,
+    "author": {
+      "login": "github-actions[bot]",
+      "id": 41898282,
+      "type": "Bot",
+      "site_admin": false
+    },
+    "node_id": "RE_example1008",
+    "tag_name": "nightly",
+    "target_commitish": "main",
+    "name": "Nightly build",
+    "draft": false,
+    "prerelease": true,
+    "created_at": "2027-03-01T03:00:00Z",
+    "published_at": "2027-03-01T03:00:00Z",
+    "assets": [
+      {
+        "url": "https://api.github.com/repos/MoonWX/isshoni/releases/assets/100801",
+        "id": 100801,
+        "name": "isshoni_nightly_linux_amd64.tar.gz",
+        "content_type": "application/gzip",
+        "state": "uploaded",
+        "size": 18874368,
+        "download_count": 42,
+        "browser_download_url": "https://github.com/MoonWX/isshoni/releases/download/nightly/isshoni_nightly_linux_amd64.tar.gz"
+      }
+    ],
+    "tarball_url": "https://api.github.com/repos/MoonWX/isshoni/tarball/nightly",
+    "zipball_url": "https://api.github.com/repos/MoonWX/isshoni/zipball/nightly",
+    "body": "Built from main every night."
+  },
+  {
+    "url": "https://api.github.com/repos/MoonWX/isshoni/releases/1007",
+    "assets_url": "https://api.github.com/repos/MoonWX/isshoni/releases/1007/assets",
+    "upload_url": "https://uploads.github.com/repos/MoonWX/isshoni/releases/1007/assets{?name,label}",
+    "html_url": "https://github.com/MoonWX/isshoni/releases/tag/v0.9.0",
+    "id": 1007,
+    "author": {
+      "login": "github-actions[bot]",
+      "id": 41898282,
+      "type": "Bot",
+      "site_admin": false
+    },
+    "node_id": "RE_example1007",
+    "tag_name": "v0.9.0",
+    "target_commitish": "main",
+    "name": "v0.9.0",
+    "draft": false,
+    "prerelease": false,
+    "created_at": "2027-02-01T10:00:00Z",
+    "published_at": "2027-02-01T10:00:00Z",
+    "assets": [
+      {
+        "url": "https://api.github.com/repos/MoonWX/isshoni/releases/assets/100701",
+        "id": 100701,
+        "name": "isshoni_0.9.0_linux_amd64.tar.gz",
+        "content_type": "application/gzip",
+        "state": "uploaded",
+        "size": 18874368,
+        "download_count": 42,
+        "browser_download_url": "https://github.com/MoonWX/isshoni/releases/download/v0.9.0/isshoni_0.9.0_linux_amd64.tar.gz"
+      }
+    ],
+    "tarball_url": "https://api.github.com/repos/MoonWX/isshoni/tarball/v0.9.0",
+    "zipball_url": "https://api.github.com/repos/MoonWX/isshoni/zipball/v0.9.0",
+    "body": "## What's new\r\n\r\n- Per-room invites\r\n"
+  },
+  {
+    "url": "https://api.github.com/repos/MoonWX/isshoni/releases/1004",
+    "assets_url": "https://api.github.com/repos/MoonWX/isshoni/releases/1004/assets",
+    "upload_url": "https://uploads.github.com/repos/MoonWX/isshoni/releases/1004/assets{?name,label}",
+    "html_url": "https://github.com/MoonWX/isshoni/releases/tag/v0.3.1",
+    "id": 1004,
+    "author": {
+      "login": "github-actions[bot]",
+      "id": 41898282,
+      "type": "Bot",
+      "site_admin": false
+    },
+    "node_id": "RE_example1004",
+    "tag_name": "v0.3.1",
+    "target_commitish": "main",
+    "name": "v0.3.1",
+    "draft": false,
+    "prerelease": false,
+    "created_at": "2026-11-12T10:00:00Z",
+    "published_at": "2026-11-12T10:00:00Z",
+    "assets": [
+      {
+        "url": "https://api.github.com/repos/MoonWX/isshoni/releases/assets/100401",
+        "id": 100401,
+        "name": "isshoni_0.3.1_linux_amd64.tar.gz",
+        "content_type": "application/gzip",
+        "state": "uploaded",
+        "size": 18874368,
+        "download_count": 42,
+        "browser_download_url": "https://github.com/MoonWX/isshoni/releases/download/v0.3.1/isshoni_0.3.1_linux_amd64.tar.gz"
+      }
+    ],
+    "tarball_url": "https://api.github.com/repos/MoonWX/isshoni/tarball/v0.3.1",
+    "zipball_url": "https://api.github.com/repos/MoonWX/isshoni/zipball/v0.3.1",
+    "body": "## Security\r\n\r\nFixes a problem in the invite flow.\r\n\r\n<!-- isshoni:security -->\r\n"
+  },
+  {
+    "url": "https://api.github.com/repos/MoonWX/isshoni/releases/1003",
+    "assets_url": "https://api.github.com/repos/MoonWX/isshoni/releases/1003/assets",
+    "upload_url": "https://uploads.github.com/repos/MoonWX/isshoni/releases/1003/assets{?name,label}",
+    "html_url": "https://github.com/MoonWX/isshoni/releases/tag/v0.3.0",
+    "id": 1003,
+    "author": {
+      "login": "github-actions[bot]",
+      "id": 41898282,
+      "type": "Bot",
+      "site_admin": false
+    },
+    "node_id": "RE_example1003",
+    "tag_name": "v0.3.0",
+    "target_commitish": "main",
+    "name": "v0.3.0",
+    "draft": false,
+    "prerelease": false,
+    "created_at": "2026-10-30T10:00:00Z",
+    "published_at": "2026-10-30T10:00:00Z",
+    "assets": [
+      {
+        "url": "https://api.github.com/repos/MoonWX/isshoni/releases/assets/100301",
+        "id": 100301,
+        "name": "isshoni_0.3.0_linux_amd64.tar.gz",
+        "content_type": "application/gzip",
+        "state": "uploaded",
+        "size": 18874368,
+        "download_count": 42,
+        "browser_download_url": "https://github.com/MoonWX/isshoni/releases/download/v0.3.0/isshoni_0.3.0_linux_amd64.tar.gz"
+      }
+    ],
+    "tarball_url": "https://api.github.com/repos/MoonWX/isshoni/tarball/v0.3.0",
+    "zipball_url": "https://api.github.com/repos/MoonWX/isshoni/zipball/v0.3.0",
+    "body": "## What's new\r\n\r\nFirst public release.\r\n"
+  },
+  {
+    "url": "https://api.github.com/repos/MoonWX/isshoni/releases/1002",
+    "assets_url": "https://api.github.com/repos/MoonWX/isshoni/releases/1002/assets",
+    "upload_url": "https://uploads.github.com/repos/MoonWX/isshoni/releases/1002/assets{?name,label}",
+    "html_url": "https://github.com/MoonWX/isshoni/releases/tag/v0.2.0-beta.1",
+    "id": 1002,
+    "author": {
+      "login": "github-actions[bot]",
+      "id": 41898282,
+      "type": "Bot",
+      "site_admin": false
+    },
+    "node_id": "RE_example1002",
+    "tag_name": "v0.2.0-beta.1",
+    "target_commitish": "main",
+    "name": "v0.2.0-beta.1",
+    "draft": false,
+    "prerelease": false,
+    "created_at": "2026-10-01T10:00:00Z",
+    "published_at": "2026-10-01T10:00:00Z",
+    "assets": [
+      {
+        "url": "https://api.github.com/repos/MoonWX/isshoni/releases/assets/100201",
+        "id": 100201,
+        "name": "isshoni_0.2.0-beta.1_linux_amd64.tar.gz",
+        "content_type": "application/gzip",
+        "state": "uploaded",
+        "size": 18874368,
+        "download_count": 42,
+        "browser_download_url": "https://github.com/MoonWX/isshoni/releases/download/v0.2.0-beta.1/isshoni_0.2.0-beta.1_linux_amd64.tar.gz"
+      }
+    ],
+    "tarball_url": "https://api.github.com/repos/MoonWX/isshoni/tarball/v0.2.0-beta.1",
+    "zipball_url": "https://api.github.com/repos/MoonWX/isshoni/zipball/v0.2.0-beta.1",
+    "body": "Early beta."
+  }
+]
