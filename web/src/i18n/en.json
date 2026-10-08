@@ -68,6 +68,59 @@
       }
     }
   },
+  "share": {
+    "button": "Share",
+    "label": {
+      "screen": "Screen",
+      "window": "Window",
+      "tab": "Tab"
+    },
+    "preset": {
+      "legend": "What are you sharing?",
+      "auto": {
+        "name": "Auto",
+        "hint": "A good balance for most things"
+      },
+      "game": {
+        "name": "Game",
+        "hint": "Smooth motion comes first"
+      },
+      "movie": {
+        "name": "Movie",
+        "hint": "Smooth motion, and better sound"
+      },
+      "text": {
+        "name": "Text",
+        "hint": "Sharp text comes first"
+      }
+    },
+    "sheet": {
+      "title": "Share your screen",
+      "tip": "Recommended: pick a <b>Window</b> and keep <b>Share audio</b> on. Friends hear only that window.",
+      "bestInChrome": "Sharing works best in Chrome or Edge.",
+      "desktopApp": "Get the desktop app (keeps Discord out of your audio)",
+      "share": "Share",
+      "elsewhere": "You're already sharing from another tab or device",
+      "stopElsewhere": "Stop it"
+    },
+    "warning": {
+      "title": "Share all sound on this computer?",
+      "body": "Friends will hear everything on this computer, including your voice app (Discord, TeamSpeak…), so they'll hear themselves.",
+      "why": "Screen sharing in a browser can't leave apps out: Discord's own screen share on the web has the same problem. The isshoni desktop app keeps voice apps out of the sound.",
+      "withoutSound": "Share without sound",
+      "withSound": "Share with sound anyway",
+      "pickAgain": "Pick something else",
+      "desktopApp": "Get the desktop app"
+    },
+    "note": {
+      "windowNoAudio": "This window's sound isn't shared (needs Windows 11 or macOS 14.2+ and a current Chrome/Edge)",
+      "tabNoAudio": "Tick 'Also share tab audio' to include sound",
+      "screenNoAudio": "No sound is shared"
+    },
+    "unavailable": {
+      "phone": "Sharing from phones needs the app (coming later)"
+    }
+  },
   "room": {
     "connection": {
       "reconnecting": "Reconnecting…",
