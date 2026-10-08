@@ -275,7 +275,8 @@ invite, login and room pages show it above their content.
 
 ## 5. Routes
 
-React Router data router; every page except the room is a lazy chunk. `RequireAuth` loads the `['me']` query and
+React Router data router; every page is in a lazy chunk, the room too ("The room is a lazy folder" below).
+`RequireAuth` loads the `['me']` query and
 redirects to `/login?next=<path>` on a 401 `unauthenticated` (§6.2). `RequireAdmin` also needs `me.user.role === "admin"` (else
 NotFound, so admin pages aren't advertised). `RequireInviter` allows admins and users with
 `me.permissions.createInvites`, else NotFound; only `/admin/invites` uses it. `next` is accepted only if it starts with `/` and not `//` (open-redirect guard). No route segment
@@ -283,8 +284,8 @@ contains a dot (04 §9.5 serves dotted paths as files).
 
 | Path | Page | Access | Chunk | Notes |
 |---|---|---|---|---|
-| `/` | RootRedirect | user | main | → `/r/<lastRoomId>` if that room still exists, else `/r/<defaultRoomId>` (from `GET /api/v1/rooms`) |
-| `/r/:roomId` | RoomPage | user | main (eager) | Lounge by default (§11–§13). `?focus=<shareId>` focuses that share (push links, 04 §14.3) |
+| `/` | RootRedirect | user | rooms | → `/r/<lastRoomId>` if that room still exists, else `/r/<defaultRoomId>` (from `GET /api/v1/rooms`) |
+| `/r/:roomId` | RoomPage | user | rooms | Lounge by default (§11–§13). `?focus=<shareId>` focuses that share (push links, 04 §14.3) |
 | `/login` | LoginPage | public | auth | `?next=`; trust-model lines (§6.3); "Forgot your password? Ask an admin for a reset link." (03 §7.10) |
 | `/invite` | InvitePage | public | auth | Token in the fragment: `/invite#<token>` |
 | `/signup` | SignupPage | public | auth | Only when `info.registration === "approval"`; otherwise redirects to `/login` |
@@ -317,7 +318,7 @@ page slice edits it. Each route names one page component and the folder it comes
 
 | Folder | Named exports of `<folder>/index.ts` | Chunk |
 |---|---|---|
-| `rooms/` | `RootRedirect`, `RoomPage` | main (eager) |
+| `rooms/` | `RootRedirect`, `RoomPage`; and `InRoomBar`, which the layout shows above the other pages (§11.1) | `rooms` |
 | `auth/` | `LoginPage`, `InvitePage`, `SignupPage`, `PendingPage`, `ResetPage`, `AboutPage` | `auth` |
 | `setup/` | `SetupPage`, `WelcomePage` | `setup` |
 | `account/` | `AccountPage`, `DevicesPage`, `NotificationsPage` | `account` |
@@ -325,19 +326,72 @@ page slice edits it. Each route names one page component and the folder it comes
 | `download/` | `DownloadPage` | `download` |
 
 - A page folder's entry module is `<folder>/index.ts` (or `index.tsx`), and it exports the folder's pages as **named**
-  exports with exactly these names. The router picks a page by its export name and reads no default export.
-- The router finds the entry modules with `import.meta.glob` (`../auth/index.{ts,tsx}` and so on): the lazy folders
-  as loaders, so each is one chunk fetched on the first visit to one of its routes, and `rooms/` with
-  `{eager: true}`, so the room is in the main chunk.
+  exports with exactly these names. The router picks a page by its export name and reads no default export. The
+  entry module also imports the lazy namespaces that the folder's pages use ("Lazy namespaces" below).
+- The router finds the entry modules with `import.meta.glob` (`../auth/index.{ts,tsx}` and so on), all of them as
+  loaders, so each folder is one chunk fetched on the first visit to one of its routes.
+- **The room is a lazy folder** (W00, group 6). Until group 6 `rooms/` was imported with `{eager: true}` and the
+  room was part of the entry chunk. But the page, the session and the signaling client are about 24 KB gzip, and
+  `/login`, `/invite` and `/setup`, where a friend first arrives, need none of it. Three things go with the move:
+  - **The first page is asked for early.** `preloadRoute(pathname)` of `app/router.tsx` calls the loaders of the
+    folders that the path's routes name, which is exactly what the router will load for that path. `startApp` calls
+    it with the first path just before `GET /api/v1/info` (§4 step 4): the router, which would ask, only exists
+    once `/info` has answered, so without this every first page would wait one more round trip, and the room would
+    be slower than before. The chunk and `/info` now travel together, for every page. Boot skips it while
+    `navigator.onLine` is false: a failed `import()` is not tried again by every browser, and the router's own
+    import of the same chunk would fail with it once the server is back. A folder that can't be loaded is the
+    router's to report (`RouteErrorBoundary`, "Something went wrong" with Reload).
+  - **`InRoomBar` comes with the folder.** `RootLayout` no longer imports `rooms/`: the router gives it the
+    `InRoomBar` export of `rooms/index.ts` as `above`, from the moment the folder is loaded. Before that, no page
+    of this page load has made the room's runtime, and the bar would render nothing anyway (§11.1), so no page
+    fetches the room's code to show an empty bar. Nothing in the entry chunk may import `rooms/`, `viewer/` or
+    `share/` statically; `share/presets.ts`, the content hint that the picker's provider sets
+    (`platform/browser/displayMedia.ts`), is the one file of them there.
+  - **Vitest still has the room up front.** The tests of `rooms/` render the app's routes under a faked clock and
+    look for the room after one tick (`rooms/testing/page.tsx`). A lazy route can't do that: its page is there one
+    render later, and a first `import()` takes real time. So in the `test` mode `router.tsx` loads `rooms/` with
+    its own module (a top-level `await import()` behind `import.meta.env.MODE === 'test'`) and `defaultSources()`
+    gives it as `AppRouteSources.eager`, the same seam the page tests use for their stand-in of the room: such a
+    folder's routes have their `Component` from the start and no `lazy`. A build drops the branch. What a build
+    does is tested with named sources and in the `production` mode (`app/router.test.tsx`) and on the build itself
+    (`app/chunks.node.test.ts`). Once the tests of `rooms/` load the folder themselves and wait for the route,
+    this branch can go.
 - **The room's media chunk** (`rooms/media.ts`; S45, group 5 integration). The room page, its header and the session
-  are in the main chunk; the code that only a joined room needs is one lazy chunk, so the initial JS stays inside
-  §17.3's budget: the stage with its tiles (`RoomStage`, `ViewerLayout`), `ShareButton` with its sheet and warning,
-  `SharePanel`, `TapToStartPill`, `SubscriberPC` and the stats collector. The room page asks for it as it renders
-  (`loadMedia.ts`, `lazyMedia.ts`), and the runtime with the first sub offer (`lazySubscriber.ts`) and the first
-  `room.state` (`connectStats.ts`). A module of `viewer/`, `share/` or `lib/stats` that the main chunk imports itself
-  (`viewer/services.ts`, the stores, `lib/stats/debugHandle.ts`) must not import any of these: `createViewer` gets
-  the `SubscriberPC` class from its caller for that reason. `share/`'s publisher (`BrowserSharing`, `PublisherPC`)
-  is still in the main chunk, through `platform/browser/displayMedia.ts`.
+  are in the `rooms` chunk; the code that only a joined room needs is a second lazy chunk: the stage with its tiles
+  (`RoomStage`, `ViewerLayout`), `ShareButton` with its sheet and warning, `SharePanel`, `TapToStartPill`,
+  `SubscriberPC` and the stats collector. The room page asks for it as it renders (`loadMedia.ts`, `lazyMedia.ts`),
+  and the runtime with the first sub offer (`lazySubscriber.ts`) and the first `room.state` (`connectStats.ts`). A
+  module of `viewer/`, `share/` or `lib/stats` that the `rooms` chunk imports itself (`viewer/services.ts`, the
+  stores, `lib/stats/debugHandle.ts`) must not import any of these: `createViewer` gets the `SubscriberPC` class
+  from its caller for that reason.
+- **The publisher chunk** (W00, group 6). `share/`'s publisher (`BrowserSharing` with its `PublisherPC` and
+  `BrowserShare`) is a lazy chunk too: most friends watch, so most visits never need it. The main chunk keeps only
+  the picker. `platform.sharing` (§8) is `createBrowserSharing()` of `platform/browser/displayMedia.ts`, the same
+  `SharingProvider` as before, whose two calls split the work:
+  - `pick()` opens the picker itself, with nothing awaited before `getDisplayMedia` (the click's transient
+    activation, §13.1), and then asks for the publisher's code without waiting for it, so the chunk arrives while
+    the user chooses what to share;
+  - `start()` waits for the publisher and hands over to it. The publisher is made once and kept: it owns the pub PC,
+    one per signaling client (§13.6). When the chunk can't be fetched, `start()` rejects with `LocalError`
+    `offline` before anything is sent, and the next pick or start fetches it again.
+
+  `BrowserShare` is also a static import of the media chunk (`shareUi.ts` and `SharePanel.tsx` read its error
+  classes), so the room page loads it with the stage; `BrowserSharing` and `PublisherPC` wait for the first pick.
+  Nothing in the main chunk may import one of the three, and neither the `rooms` chunk nor the media chunk may
+  import `BrowserSharing` or `PublisherPC` (through `share/`'s barrel, say): they would load on every visit to a
+  room.
+- **Lazy namespaces** (W00, group 6; §16.5). The texts of a namespace that only lazy folders use are not in the main
+  chunk either. A page folder's entry module imports `i18n/lazy/<ns>.ts` for each such namespace its pages use
+  (`admin/` → `admin`; `account/` and `download/` → `account`; `setup/` → `setup`), which puts the namespace's
+  file in that folder's chunk, or in a small chunk the folders share, and adds it to the catalog when the chunk
+  runs. The router has a page only once its folder's entry module has run, so a lazy route waits for its namespace
+  without any code of its own, and no page shows a bare key.
+- `app/chunks.node.test.ts` builds the app in memory and fails when one of these modules is in the initial chunks
+  again: the page folders' pages, the room's among them, with its session and signaling client (and any other file
+  of `rooms/`, `viewer/`, `share/` or `conntest/`), the media chunk's modules, the publisher, and the lazy
+  namespaces (each of which must also come with the folders that use it). It also fails when the publisher is part
+  of what a room visit loads (the `rooms` chunk, the media chunk and their static imports), and when the entry
+  chunk has more than the one `import()` of the `rooms` chunk, which is how Vitest's branch would show in a build.
 - A folder that doesn't exist yet, or an export that is missing, renders `PageUnavailable` (a missing `AdminLayout`
   renders just its child page). A page slice adds its folder's `index.ts` and exports, and its routes start working
   with no change to `router.tsx`.
@@ -2318,25 +2372,66 @@ and, on Android, in the room's one-time card. iOS: the Home Screen sheet above, 
 
 ### 16.5 i18n
 
-- `src/i18n/en.json`, one namespace, nested keys: `common`, `auth`, `setup`, `conntest`, `room`, `viewer`, `share`,
-  `account`, `admin`, `doctor`, `fix`, `errors` (+ `errors.local`), `fieldErrors`, `push`, `a11y`. Plurals use
-  i18next suffixes (`viewer.watching_one`, `viewer.watching_other`). Dates and numbers use `Intl` with
-  `i18n.language`.
+- One i18next namespace (`translation`), nested keys. The first segment of a key is the catalog's own namespace:
+  `common`, `auth`, `setup`, `conntest`, `room`, `viewer`, `share`, `account`, `admin`, `doctor`, `fix`, `errors`
+  (+ `errors.local`), `fieldErrors`, `push`, `a11y`. Plurals use i18next suffixes (`viewer.watching_one`,
+  `viewer.watching_other`). Dates and numbers use `Intl` with `i18n.language`.
+- **Catalog files** (W00, group 6). The catalog is split by who downloads it:
+  - `src/i18n/en.json` is the main bundle's part: every namespace that code of the entry chunk uses, and those
+    that could be lazy but are not yet (below). `initI18n()` gives it to i18next synchronously (boot step 3, §4).
+    `build/sw-plugin.ts` reads its `push` section (§16.2).
+  - `src/i18n/lazy/<ns>.en.json` holds one **lazy namespace**, a namespace that only lazy page folders use, under
+    the key paths the code has: `{"admin": {…}}` and nothing else. M1 has `account`, `admin` and `setup`. Next to
+    it, `lazy/<ns>.ts` imports the file and calls `addMessages()`, which merges it into the catalog with i18next's
+    `addResourceBundle`. A page folder imports that module in its entry module for every lazy namespace its pages
+    use (§5 "Lazy namespaces"): the texts are then in the folder's chunk and in the catalog before the router has
+    any of its pages. No loader, no Suspense, no request of its own: a namespace is as lazy as the code that uses
+    it. Call sites don't change (`t('admin.users.title')`, no `useTranslation('admin')`).
+  - A namespace is lazy only when nothing in the entry chunk uses it, and every folder that uses it has to import
+    its `lazy/<ns>.ts`. Six more namespaces could move and stay in `en.json` for now, because the move needs files
+    that W00 does not touch (about 6 KB gzip of texts together):
+    - `conntest` and `fix`. Only the connection test's lazy panel uses them, but the room page opens that panel
+      past `conntest/index.ts` (`import('../conntest/ConnTestPanel')`, §14.2), so `ConnTestPanel.tsx` itself has
+      to import the two modules, and the connection test's own tests (`links.test.ts`, `fixText.test.ts`,
+      `checkI18nFixTexts.node.test.ts`) read both namespaces from `en.json`.
+    - `room`, `viewer`, `share` and `auth`. With the room in a lazy folder (§5), the entry chunk's code has no
+      literal key of them left, but `rooms/index.ts` would have to import all four (the room's account menu signs
+      out with `auth/useLogout.ts`, and the room page will show the in-app browser banner, §16.3), `auth/index.ts`
+      the fourth, and `auth/formErrors.test.ts` reads its texts from `en.json`.
+  - Vitest renders a page without its folder's entry module, so in the `test` mode `initI18n()` adds every lazy
+    namespace up front (`import.meta.glob`, behind `import.meta.env.MODE === 'test'`; a build drops the branch and
+    with it the files from the entry chunk). `i18n/lazy.test.ts` and `app/lazyNamespaces.test.tsx` run in the
+    `production` mode instead and show that a namespace is absent until its folder is loaded and that a lazy route
+    never renders a bare key.
+  - Each slice adds keys under its own namespaces only, in the file that has the namespace. To make a namespace
+    lazy, move it to `lazy/<ns>.en.json`, add `lazy/<ns>.ts`, and import that from the entry module of every
+    folder that uses it; `check:i18n` then says where it is still missing.
 - `i18next/no-literal-string` fails the lint on JSX text and on user-visible attributes.
-- `scripts/check-i18n.mjs` fails CI when:
-  - a `t('…')` literal key is missing from `en.json`;
+- `scripts/check-i18n.mjs` reads `en.json` and the lazy files as one catalog (a lazy file that holds anything but its
+  own namespace, or a namespace that is in both, is a problem) and fails CI when:
+  - a `t('…')` literal key is missing from the catalog; the message names the file the key belongs in;
   - an `ErrorCode` from `types.gen.ts` (01) or a `Code…` constant from `api.gen.ts` (03) has no `errors.<code>`
     entry. An `errors.<code>` object with sub-keys counts: `limit_reached` has one per `params.limit` (`rooms`,
     `invites`, `member_invites`, `pending_signups`), and the check requires those;
   - a `CloudProvider` constant in `api.gen.ts` (04 §13.3) has no `fix.firewall.<provider>` entry, or a `NATKind`
-    constant there has no `conntest.nat.<nat>` entry. The script reads both constant lists from `api.gen.ts`.
+    constant there has no `conntest.nat.<nat>` entry. The script reads both constant lists from `api.gen.ts`;
+  - a literal key of a lazy namespace could be asked for before the namespace is in the catalog. The script follows
+    the imports from `main.tsx`: those that run before the importer's own code (`import`, `export … from`, an eager
+    `import.meta.glob`) and those that it runs later (`import()`, a lazy `import.meta.glob`, which is how the router
+    loads the page folders). The key's file must not be reachable from the entry without passing a module that
+    depends on `lazy/<ns>.ts` through imports of the first kind. That covers a folder whose entry module forgot the
+    import, a key of a lazy namespace in the main bundle's code, and a file that another chunk loads past its
+    folder's entry module. The tests can't see any of these, because Vitest has every namespace;
+  - a lazy namespace is in the main bundle after all (the entry depends on its `lazy/<ns>.ts` through imports of
+    the first kind), or a lazy file has no `lazy/<ns>.ts`.
 
   Unused keys are warnings.
 
   CI runs `check:i18n` on every PR from the first web slice on, so each rule arrives with the slice that makes it
   checkable (§23): W1 writes the script with the `t('…')` rule; W2 adds the error-code rule and every `errors.<code>`
-  key; W10 adds the `CloudProvider`/`NATKind` rule and its `fix.firewall.*` and `conntest.nat.*` texts; W13 adds the
-  unused-key warnings and a test that a removed key fails the check.
+  key; W10 adds the `CloudProvider`/`NATKind` rule and its `fix.firewall.*` and `conntest.nat.*` texts; W00 adds the
+  lazy files and the two lazy-namespace rules; W13 adds the unused-key warnings and a test that a removed key fails
+  the check.
 - The catalog is the single source for Go-rendered strings later (plan): *later (M2)* the tray embeds it. 04's doctor
   CLI keeps its own English templates of the same codes (04 §13.2).
 
@@ -2421,6 +2516,19 @@ export default defineConfig({
   getDisplayMedia works (plan). Safari and phones need HTTPS: test them against a VPS prerelease (06).
 - **Size budget** (`check:size`, from `build-report.json`): initial JS (entry + static imports) ≤ 200 KB gzip; each lazy
   chunk ≤ 120 KB gzip; CSS ≤ 30 KB gzip.
+- **What stays out of the initial JS** (§5): every page folder, the room's among them, the room's media chunk, the
+  connection test's panel, the share publisher and the catalog's lazy namespaces (§16.5). The budget only
+  measures; `app/chunks.node.test.ts` names the modules, so one of them moving back into the entry chunk fails
+  `npm test` even while the total is still under 200 KB.
+- **Where the initial JS stands.** 158.4 KB in 8 files after W00 (group 6; 194.6 KB in 5 files before). Of the
+  36 KB, the room is 24.1 KB (the page, the session and the signaling client: the `rooms` chunk), the publisher
+  8.5 KB and the lazy namespaces 3.7 KB. React, React Router, i18next, TanStack Query and Zustand are about 125 KB
+  of what is left by themselves, measured in a build of nothing else; the namespaces that could still leave
+  `en.json` (§16.5) are about 6 KB. A first visit to a room downloads the 158.4 KB, the `rooms` folder (27.7 KB in
+  8 files: its chunk and the small chunks it shares with other folders) and then the media chunk (24 KB with its
+  own imports): 186 KB before the stage, where the initial JS was 182.5 KB in 10 files with the room inside. So
+  the room pays about 4 KB and six more requests for the split, in parallel with `/info` (§5), and every other
+  first page (`/login`, `/invite`, `/setup`) downloads 24 KB less.
 
 ---
 

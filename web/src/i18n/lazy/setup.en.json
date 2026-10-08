@@ -1,0 +1,34 @@
+{
+  "setup": {
+    "steps": {
+      "label": "Setup",
+      "admin": "Create the admin",
+      "conntest": "Connection test",
+      "invite": "Invite friends"
+    },
+    "admin": {
+      "title": "Create the admin account",
+      "lead": "This account runs the server: it invites friends and changes the settings.",
+      "serverName": "Server name",
+      "serverNameHint": "Optional. Friends see it on their invite. You can change it later.",
+      "submit": "Create account"
+    },
+    "noToken": {
+      "title": "Open the setup link",
+      "body": "This page needs the one-time setup link. On the server, run:",
+      "docker": "With Docker:",
+      "after": "Then open the link it prints."
+    },
+    "tokenInvalid": {
+      "title": "This setup link doesn't work anymore",
+      "body": "It was replaced or has expired. For a new one, run this on the server:",
+      "docker": "With Docker:",
+      "after": "Then open the link it prints."
+    },
+    "done": {
+      "title": "This server is already set up",
+      "body": "An admin account exists. Log in with it, or ask the admin for an invite.",
+      "logIn": "Log in"
+    }
+  }
+}

@@ -10,5 +10,10 @@
 // dismissed, on every page, including one that renders no banner. If NotificationsPage hides its `needs-install` card
 // on that flag, it must also render <InAppBrowserBanner /> (import it from '../auth/InAppBrowserBanner'); otherwise a
 // friend in a chat app's browser gets neither the Home Screen steps nor a banner to dismiss.
+//
+// The pages' texts, the `account` namespace, come with this chunk and not with the main bundle (05 §16.5): the
+// import below adds them to the catalog before the router has any of the pages.
+import '../i18n/lazy/account';
+
 export { AccountPage } from './AccountPage';
 export { DevicesPage } from './DevicesPage';

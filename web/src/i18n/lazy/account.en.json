@@ -1,0 +1,72 @@
+{
+  "account": {
+    "back": "Back to isshoni",
+    "signOut": "Sign out",
+    "nav": {
+      "label": "Account",
+      "account": "Account",
+      "devices": "Devices",
+      "notifications": "Notifications"
+    },
+    "title": "Your account",
+    "profile": {
+      "heading": "Profile",
+      "role": "Role",
+      "admin": "Admin",
+      "member": "Member"
+    },
+    "password": {
+      "heading": "Change password",
+      "note": "Changing your password signs you out on your other devices.",
+      "current": "Current password",
+      "submit": "Change password",
+      "done": "Password changed. Your other devices were signed out."
+    },
+    "delete": {
+      "heading": "Delete account",
+      "body": "This removes your account from {{server}} and signs you out everywhere. It can't be undone.",
+      "open": "Delete account",
+      "title": "Delete your account?",
+      "confirmBody": "Enter your password to delete the account {{username}} for good.",
+      "confirm": "Delete my account",
+      "lastAdmin": "You're the only admin, and this server needs one. Make someone else an admin first, then delete your account.",
+      "done": "Your account was deleted."
+    },
+    "devices": {
+      "title": "Devices",
+      "browsers": {
+        "heading": "Browsers",
+        "lead": "Every browser where you're signed in to {{server}}."
+      },
+      "thisBrowser": "This browser",
+      "activeNow": "Active now",
+      "lastSeen": "Last active {{when}}",
+      "revoke": "Revoke",
+      "revoked": "Signed out {{name}}.",
+      "revokeFailed": "Couldn't revoke {{name}}. {{reason}}",
+      "others": {
+        "action": "Sign out other browsers",
+        "done_one": "Signed out {{count}} other browser.",
+        "done_other": "Signed out {{count}} other browsers.",
+        "none": "No other browser was signed in.",
+        "failed": "Couldn't sign out the other browsers. {{reason}}"
+      },
+      "everywhere": {
+        "action": "Log out everywhere",
+        "title": "Log out everywhere?",
+        "body": "This signs you out in every browser and every linked app, this one included.",
+        "confirm": "Log out everywhere"
+      },
+      "linked": {
+        "heading": "Linked devices",
+        "empty": "Nothing is linked yet. Apps you sign in to with this account, like the isshoni desktop app when it arrives, show up here."
+      }
+    },
+    "download": {
+      "title": "Desktop app",
+      "coming": "The isshoni desktop app is coming (Windows first). It keeps Discord and other voice apps out of what friends hear.",
+      "untilThen": "Until then, share from Chrome or Edge: pick a Window and keep Share audio on.",
+      "site": "Project site"
+    }
+  }
+}

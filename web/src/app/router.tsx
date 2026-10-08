@@ -1,23 +1,36 @@
 // Every route of 05 §5, declared once here (README "Shared files": S27 owns this file; page slices fill only their
-// folder). React Router data router: every page except the room is a lazy chunk.
+// folder). React Router data router: every page is in a lazy chunk, the room too.
 //
 // Page folders. Each route loads one page component, by name, from its folder's entry module `<folder>/index.ts`
 // (or index.tsx), which exports the folder's pages:
-//   auth/      LoginPage InvitePage SignupPage PendingPage ResetPage AboutPage      (S33; lazy chunk)
-//   setup/     SetupPage WelcomePage                                              (S33, S87; lazy chunk)
-//   account/   AccountPage DevicesPage NotificationsPage                          (S48, S77; lazy chunk)
-//   admin/     AdminLayout DashboardPage UsersPage ApprovalsPage InvitesPage       (S49, S91; lazy chunk)
+//   auth/      LoginPage InvitePage SignupPage PendingPage ResetPage AboutPage      (S33)
+//   setup/     SetupPage WelcomePage                                              (S33, S87)
+//   account/   AccountPage DevicesPage NotificationsPage                          (S48, S77)
+//   admin/     AdminLayout DashboardPage UsersPage ApprovalsPage InvitesPage       (S49, S91)
 //              RoomsPage SettingsPage AuditPage DoctorPage
-//   download/  DownloadPage                                                       (later; lazy chunk)
-//   rooms/     RootRedirect RoomPage                                              (S34, S45; main chunk)
+//   download/  DownloadPage                                                       (later)
+//   rooms/     RootRedirect RoomPage, and InRoomBar for the layout                 (S34, S45)
 // The folders are found with import.meta.glob, so a folder that doesn't exist yet is simply absent: its routes
 // render PageUnavailable (a missing AdminLayout renders just its child page) until the slice adds the export, and
-// no route here changes. A lazy folder is one chunk, loaded on the first visit to one of its routes; rooms/ is
-// bundled eagerly (the room is the main page, 05 §5).
+// no route here changes. A folder is one chunk, loaded on the first visit to one of its routes.
+//
+// The room is a lazy folder like the others (W00): the page, the session and the signaling client are about 24 KB
+// gzip, and /login, /invite and /setup, where a friend first arrives, need none of it. Two things go with that:
+// - preloadRoute(): boot asks for the folders of the first path while GET /api/v1/info is still on its way (the
+//   router, which would ask, is only made once /info has answered), so the first page waits for no round trip of
+//   its own;
+// - the layout shows rooms/'s InRoomBar (05 §11.1) only once rooms/ is loaded. Before that no page has made the
+//   room's runtime, and the bar would render nothing anyway: no page fetches the room's code to show an empty bar.
+//
+// A lazy folder's texts can come with it: its entry module imports the lazy namespaces its pages use
+// (i18n/lazy/<ns>.ts, 05 §16.5), and those are in the catalog once the entry module has run. A route's `lazy`
+// below resolves only after that, so a page is never rendered without its texts and the routes need no code for it.
 //
 // No route segment contains a dot: 04 §9.5 serves dotted paths as files.
 import type { ComponentType } from 'react';
-import { Outlet, type RouteObject } from 'react-router';
+import { matchRoutes, Outlet, type RouteObject } from 'react-router';
+import { useStore } from 'zustand';
+import { createStore } from 'zustand/vanilla';
 
 import { RouteErrorBoundary } from './ErrorBoundary';
 import { RequireAdmin, RequireAuth, RequireInviter } from './guards';
@@ -28,9 +41,7 @@ import { PageSpinner } from '../ui/Spinner';
 /** A page folder's entry module: page components by export name. */
 export type FolderModule = Readonly<Record<string, unknown>>;
 
-export type LazyFolder = 'auth' | 'setup' | 'account' | 'admin' | 'download';
-export type EagerFolder = 'rooms';
-export type PageFolder = LazyFolder | EagerFolder;
+export type PageFolder = 'auth' | 'setup' | 'account' | 'admin' | 'download' | 'rooms';
 
 /** What each route loads, for tests and debugging: route.handle. */
 export interface RouteHandle {
@@ -39,11 +50,30 @@ export interface RouteHandle {
 }
 
 export interface AppRouteSources {
-  /** Loaders of the lazy folders; a missing folder renders PageUnavailable. */
-  lazy: Partial<Record<LazyFolder, () => Promise<FolderModule>>>;
-  /** Modules of the eager folders. */
-  eager: Partial<Record<EagerFolder, FolderModule>>;
+  /** Loaders of the page folders; a missing folder renders PageUnavailable. */
+  lazy: Partial<Record<PageFolder, () => Promise<FolderModule>>>;
+  /**
+   * Folders that are there without loading, for tests: such a folder's routes have their page from the start (no
+   * `lazy`), and its loader is never called. A build has none.
+   */
+  eager?: Partial<Record<PageFolder, FolderModule>>;
 }
+
+/**
+ * Vitest only: rooms/, loaded with this module, which defaultSources() then gives as an eager folder.
+ *
+ * The tests of rooms/ render the app's routes under a faked clock and look for the room after one tick
+ * (rooms/testing/page.tsx's advance()). They were written while the room was part of the entry chunk, and a lazy
+ * route can't do that: its page is there one render later, and a first import() takes real time besides. So in
+ * Vitest the room's routes are as they were. What a build does is tested where the test says which folders there
+ * are and in the `production` mode (router.test.tsx), and on the build itself (chunks.node.test.ts). When the
+ * tests of rooms/ load the folder themselves and wait for the route, this constant can go.
+ *
+ * Written as this very comparison on purpose: Vite puts the mode in at build time and the bundler drops the branch,
+ * the import() and the await with it (chunks.node.test.ts checks that the entry asks for the room in one place only).
+ */
+const ROOMS_IN_TESTS: FolderModule | undefined =
+  import.meta.env.MODE === 'test' ? await import('../rooms/index') : undefined;
 
 const FOLDER_OF_PATH = /^\.\.\/(\w+)\/index\.tsx?$/;
 
@@ -65,10 +95,10 @@ export function defaultSources(): AppRouteSources {
       '../account/index.{ts,tsx}',
       '../admin/index.{ts,tsx}',
       '../download/index.{ts,tsx}',
+      '../rooms/index.{ts,tsx}',
     ]),
   );
-  const eager = byFolder(import.meta.glob<FolderModule>('../rooms/index.{ts,tsx}', { eager: true }));
-  return { lazy, eager };
+  return ROOMS_IN_TESTS === undefined ? { lazy } : { lazy, eager: { rooms: ROOMS_IN_TESTS } };
 }
 
 function isComponent(v: unknown): v is ComponentType {
@@ -81,32 +111,49 @@ function OutletOnly() {
   return <Outlet />;
 }
 
+/** Renders a component that a folder exports; nothing while the folder is not loaded, or has no such export. */
+function Exported({ component: Component }: { component: unknown }) {
+  return isComponent(Component) ? <Component /> : null;
+}
+
 export function createAppRoutes(sources: AppRouteSources = defaultSources()): RouteObject[] {
-  /** A lazy page route's `lazy` and `handle`. */
-  const page = (folder: LazyFolder, name: string, fallback: ComponentType = PageUnavailable) => ({
-    handle: { folder, page: name } satisfies RouteHandle,
-    lazy: async () => {
-      const load = sources.lazy[folder];
-      const mod = load ? await load() : undefined;
+  /** The folders that are loaded so far, by name: the layout shows a part of one of them (Root, below). */
+  const loaded = createStore<Partial<Record<PageFolder, FolderModule>>>(() => ({ ...sources.eager }));
+
+  /** A page route's `handle` and its `lazy`; for a folder that is there already, its Component instead. */
+  const page = (folder: PageFolder, name: string, fallback: ComponentType = PageUnavailable) => {
+    const handle: RouteHandle = { folder, page: name };
+    const pick = (mod: FolderModule | undefined): ComponentType => {
       const Component = mod?.[name];
-      return { Component: isComponent(Component) ? Component : fallback };
-    },
-  });
-  /** A lazy layout route: renders only its child until the folder has the layout. */
-  const layout = (folder: LazyFolder, name: string) => page(folder, name, OutletOnly);
-  /** An eager page route's Component and handle. */
-  const eager = (folder: EagerFolder, name: string) => {
-    const Component = sources.eager[folder]?.[name];
+      return isComponent(Component) ? Component : fallback;
+    };
+    const eager = sources.eager?.[folder];
+    if (eager !== undefined) return { handle, Component: pick(eager) };
     return {
-      handle: { folder, page: name } satisfies RouteHandle,
-      Component: isComponent(Component) ? Component : PageUnavailable,
+      handle,
+      lazy: async () => {
+        const mod = await sources.lazy[folder]?.();
+        if (mod !== undefined) loaded.setState({ [folder]: mod });
+        return { Component: pick(mod) };
+      },
     };
   };
+  /** A layout route: renders only its child until the folder has the layout. */
+  const layout = (folder: PageFolder, name: string) => page(folder, name, OutletOnly);
+
+  /**
+   * The root route's layout, with rooms/'s InRoomBar above the pages from the moment rooms/ is loaded: the first
+   * visit to `/` or to a room loads it, and only a room's page makes the runtime that the bar shows.
+   */
+  function Root() {
+    const bar = useStore(loaded, (s) => s.rooms?.['InRoomBar']);
+    return <RootLayout above={<Exported component={bar} />} />;
+  }
 
   return [
     {
       id: 'root',
-      Component: RootLayout,
+      Component: Root,
       ErrorBoundary: RouteErrorBoundary,
       HydrateFallback: PageSpinner,
       children: [
@@ -131,9 +178,9 @@ export function createAppRoutes(sources: AppRouteSources = defaultSources()): Ro
               Component: RequireAuth,
               children: [
                 // → /r/<lastRoomId> if that room still exists, else /r/<defaultRoomId>.
-                { index: true, ...eager('rooms', 'RootRedirect') },
+                { index: true, ...page('rooms', 'RootRedirect') },
                 // ?focus=<shareId> focuses that share (push links, 04 §14.3).
-                { path: 'r/:roomId', ...eager('rooms', 'RoomPage') },
+                { path: 'r/:roomId', ...page('rooms', 'RoomPage') },
                 { path: 'account', ...page('account', 'AccountPage') },
                 { path: 'account/devices', ...page('account', 'DevicesPage') },
                 { path: 'account/notifications', ...page('account', 'NotificationsPage') },
@@ -190,4 +237,19 @@ export function createAppRoutes(sources: AppRouteSources = defaultSources()): Ro
       ],
     },
   ];
+}
+
+/**
+ * Asks for the page folders of a path's routes without waiting for them: what the router loads for that path, one
+ * round trip earlier. Boot calls it with the first path before it asks for /api/v1/info (05 §4), so the first
+ * page's chunk and /info travel together. A folder that is loaded already answers the router's own import() at
+ * once; one that can't be loaded here is the router's to report when it gets to the route (RouteErrorBoundary).
+ */
+export function preloadRoute(pathname: string, sources: AppRouteSources = defaultSources()): void {
+  const folders = new Set<PageFolder>();
+  for (const { route } of matchRoutes(createAppRoutes(sources), pathname) ?? []) {
+    const handle = route.handle as RouteHandle | undefined;
+    if (handle !== undefined && sources.eager?.[handle.folder] === undefined) folders.add(handle.folder);
+  }
+  for (const folder of folders) sources.lazy[folder]?.().catch(() => undefined);
 }

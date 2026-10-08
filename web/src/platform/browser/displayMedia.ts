@@ -1,9 +1,13 @@
 // Screen capture for the in-page sharer (05 §13.2, §13.3): getDisplayMedia with the plan's options, its fallbacks,
 // the classification of what was picked, and the loopback-only fake-display seam (§19.3).
 //
-// BrowserPlatform calls createBrowserSharing() once, only on a device that may share (05 §8). The provider is
-// share/'s BrowserSharing; this file gives it what only platform/ may touch: the picker and the RTCPeerConnection
-// factory. Publishing (start) is BrowserSharing's (S46).
+// BrowserPlatform calls createBrowserSharing() once, only on a device that may share (05 §8). The provider it gets
+// is this file's: pick() is the picker below, and start() hands over to share/'s BrowserSharing (S46), which this
+// file gives what only platform/ may touch: the picker and the RTCPeerConnection factory.
+//
+// The publisher is not in the initial bundle (05 §5, §17.3): BrowserSharing, with its PublisherPC and BrowserShare,
+// is a chunk of its own that most visits never need, since most friends watch. It is fetched with the first pick,
+// while the browser's picker is open, so start() usually finds it there.
 //
 // Why these options: isshoni's point is that friends in a voice call don't hear themselves echoed back (PLAN).
 // A browser can't leave single apps out of system audio, so the sharer steers towards captures that can't echo:
@@ -15,9 +19,8 @@
 import { LocalError } from '../../lib/errors';
 import { createLogger } from '../../lib/log';
 import type { Preset } from '../../protocol/types.gen';
-import { BrowserSharing } from '../../share/BrowserSharing';
 import { applyVideoContentHint } from '../../share/presets';
-import type { KeyValueStore, PickedSource, SharingProvider } from '../types';
+import type { ActiveShare, KeyValueStore, PickedSource, ShareContext, SharingProvider } from '../types';
 import { classify } from './classify';
 import { createFakeDisplay, fakeDisplayRequest } from './fakeDisplay';
 import { createWebStorage } from './storage';
@@ -185,10 +188,72 @@ export async function pickDisplayMedia(
   return stream ? toPickedSource(stream, opts.preset) : null;
 }
 
-/** The in-page SharingProvider of BrowserPlatform: BrowserSharing over this page's picker and peer connections. */
-export function createBrowserSharing(): SharingProvider {
-  return new BrowserSharing({
-    capture: (opts) => pickDisplayMedia(opts),
-    platform: { createPeerConnection: (config) => new RTCPeerConnection(config) },
-  });
+/** What start() needs from share/'s BrowserSharing. */
+export type Publisher = Pick<SharingProvider, 'start'>;
+
+export interface BrowserSharingOptions {
+  /** Opens the picker and classifies the pick. Default: pickDisplayMedia on this page. */
+  capture?: (opts: { preset: Preset }) => Promise<PickedSource | null>;
+  /**
+   * Fetches the publisher's code and makes the page's one publisher. Default: share/'s BrowserSharing, a chunk of
+   * its own, over this page's picker and peer connections. Tests pass their own.
+   */
+  load?: () => Promise<Publisher>;
+}
+
+/**
+ * The in-page SharingProvider of BrowserPlatform (05 §8): this page's picker, and share/'s BrowserSharing behind
+ * start().
+ *
+ * BrowserSharing is loaded when it is first needed and made once: it keeps the page's pub PC, one per signaling
+ * client, for every later share (05 §13.6).
+ * - pick() opens the picker at once (the click's transient activation), then asks for the publisher's code without
+ *   waiting for it: it arrives while the user chooses what to share.
+ * - start() waits for the publisher and hands over. When its code can't be fetched (the server is out of reach),
+ *   start() rejects with LocalError `offline` before anything is sent, and the next pick or start fetches again: a
+ *   chunk that didn't arrive once may arrive the next time. The source stays the caller's to release, as on every
+ *   rejection of start().
+ */
+export function createBrowserSharing(opts: BrowserSharingOptions = {}): SharingProvider {
+  const capture = opts.capture ?? ((o: { preset: Preset }) => pickDisplayMedia(o));
+  const load =
+    opts.load ??
+    (async (): Promise<Publisher> => {
+      const { BrowserSharing } = await import('../../share/BrowserSharing');
+      return new BrowserSharing({
+        capture,
+        platform: { createPeerConnection: (config) => new RTCPeerConnection(config) },
+      });
+    });
+
+  let publisher: Promise<Publisher> | null = null;
+  const loaded = (): Promise<Publisher> => {
+    // load() runs at once, inside an async function: whatever it throws becomes a rejection, never pick()'s throw.
+    publisher ??= (async () => load())().catch((err: unknown) => {
+      publisher = null;
+      throw err;
+    });
+    return publisher;
+  };
+
+  return {
+    mode: 'in-page',
+    pick(o: { preset: Preset }): Promise<PickedSource | null> {
+      // First, with nothing before it: getDisplayMedia needs the click's transient activation.
+      const picked = capture(o);
+      // A load that fails here is start()'s to report.
+      loaded().catch(() => undefined);
+      return picked;
+    },
+    async start(src: PickedSource, o: { preset: Preset; withAudio: boolean }, ctx: ShareContext): Promise<ActiveShare> {
+      let ready: Publisher;
+      try {
+        ready = await loaded();
+      } catch (err) {
+        log.warn("the publisher's code could not be loaded", { err });
+        throw new LocalError('offline', { cause: err });
+      }
+      return ready.start(src, o, ctx);
+    },
+  };
 }
