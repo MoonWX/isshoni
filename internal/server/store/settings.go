@@ -179,16 +179,18 @@ func intRange(lo, hi int, zeroOK bool) func([]byte) (int, string) {
 		if !ok || strings.ContainsAny(string(n), ".eE") {
 			return 0, api.FieldInvalid
 		}
-		i, err := strconv.ParseInt(string(n), 10, 64)
+		// Atoi parses straight to int, so there is no narrowing conversion: a value too large for int
+		// fails here, like any other value outside lo..hi.
+		i, err := strconv.Atoi(string(n))
 		switch {
 		case err != nil: // a valid JSON integer fails only by overflowing
 			return 0, api.FieldOutOfRange
 		case i == 0 && zeroOK:
 			return 0, ""
-		case i < int64(lo) || i > int64(hi):
+		case i < lo || i > hi:
 			return 0, api.FieldOutOfRange
 		}
-		return int(i), ""
+		return i, ""
 	}
 }
 

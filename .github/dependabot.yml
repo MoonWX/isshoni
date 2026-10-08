@@ -55,12 +55,6 @@ updates:
         patterns: ["*"]
         update-types: [minor, patch]
 
-  - package-ecosystem: docker
-    directory: /deploy/docker
-    target-branch: m1/server-web # switch to main after M1
-    schedule:
-      interval: weekly
-    groups:
-      docker-minor-patch:
-        patterns: ["*"]
-        update-types: [minor, patch]
+  # The docker ecosystem (directory /deploy/docker) is added back by slice S68, together with the
+  # Dockerfile. Dependabot's update job fails ("No Dockerfiles nor Kubernetes YAML found") for a
+  # directory that has no Dockerfile yet, and that failure shows up as a red check on the branch.
