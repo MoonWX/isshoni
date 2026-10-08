@@ -20,6 +20,11 @@
 //
 // Media stays out of the state (05 §6.1): the picked source lives in the store's closure from the pick until
 // `start` takes it, and the state holds only its classification.
+//
+// The flow belongs to the page, not to the Share button that was clicked. The room page has two (05 §11.2), and
+// the one in the empty state goes away as soon as a friend starts sharing, possibly while this user's picker or
+// warning is open. So every mounted button attaches as a host: one of them (`hostId`) shows the warning, and a pick
+// is given up only when the last one is gone.
 import { createStore, type StoreApi } from 'zustand/vanilla';
 
 import type { PickedSource, ShareHint } from '../platform/types';
@@ -63,10 +68,10 @@ export interface ShareFields {
   /** Why the phase is `failed`; null otherwise. */
   readonly error: unknown;
   /**
-   * Counts the picks this store has followed. A component remembers the value of the pick it started, and shows
-   * that pick's warning only while the value is still current (the room page has two Share buttons).
+   * The attached host that shows the ScreenAudioWarning: the one attached longest; null while none is attached.
+   * Whichever button's click started the pick, exactly one mounted button shows its warning.
    */
-  readonly pickId: number;
+  readonly hostId: string | null;
 }
 
 export interface ShareActions {
@@ -91,13 +96,20 @@ export interface ShareActions {
   cancel(): void;
   /** failed → idle. */
   dismiss(): void;
+  /**
+   * A Share button mounts: registers it as a host under an id of its own (React's useId) and returns its detach,
+   * for the unmount. Detaching leaves the flow alone while another host is attached; the next in line becomes
+   * `hostId`. When the last one detaches (the page is left), a pick that hasn't started is cancelled: the capture
+   * must not outlive the UI that explains it. A share that is starting or live is left alone, as cancel() does.
+   */
+  attach(hostId: string): () => void;
 }
 
 export type ShareState = ShareFields & ShareActions;
 export type ShareStore = StoreApi<ShareState>;
 
-/** Everything but the preset, which outlives a share, and the pick counter. */
-const IDLE: Omit<ShareFields, 'preset' | 'pickId'> = Object.freeze({
+/** Everything but the preset, which outlives a share, and the host, which is about the page and not the share. */
+const IDLE: Omit<ShareFields, 'preset' | 'hostId'> = Object.freeze({
   phase: 'idle',
   withAudio: false,
   picked: null,
@@ -124,6 +136,8 @@ export function createShareStore(): ShareStore {
   let waiting: Waiting | null = null;
   /** Bumped whenever the flow moves on, so a pick or a start that settles late knows it was overtaken. */
   let flow = 0;
+  /** The attached hosts, oldest first. One entry per attach(), so a detach removes exactly its own. */
+  const hosts: { readonly id: string }[] = [];
 
   return createStore<ShareState>()((set, get) => {
     /** Takes the waiting source out of the store; the caller starts it or releases it. */
@@ -169,7 +183,7 @@ export function createShareStore(): ShareStore {
     return {
       ...IDLE,
       preset: PresetAuto,
-      pickId: 0,
+      hostId: null,
 
       async pick(picking, opts) {
         const { phase } = get();
@@ -182,7 +196,7 @@ export function createShareStore(): ShareStore {
         }
         const mine = ++flow;
         takeWaiting()?.src.release();
-        set({ ...IDLE, phase: 'picking', preset: opts.preset, pickId: get().pickId + 1 });
+        set({ ...IDLE, phase: 'picking', preset: opts.preset });
 
         let src: PickedSource | null;
         try {
@@ -231,6 +245,20 @@ export function createShareStore(): ShareStore {
 
       dismiss() {
         if (get().phase === 'failed') set(IDLE);
+      },
+
+      attach(hostId) {
+        const host = { id: hostId };
+        hosts.push(host);
+        if (get().hostId === null) set({ hostId });
+        return () => {
+          const at = hosts.indexOf(host);
+          if (at < 0) return;
+          hosts.splice(at, 1);
+          if (hosts.length === 0) get().cancel();
+          const next = hosts[0]?.id ?? null;
+          if (get().hostId !== next) set({ hostId: next });
+        };
       },
     };
   });

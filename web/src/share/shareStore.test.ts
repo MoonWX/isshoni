@@ -4,8 +4,8 @@ import type { PickedSource } from '../platform/types';
 import { createShareStore, shareStore, type ShareFields, type ShareStore, type StartShare } from './shareStore';
 import { deferred, fakePick } from './testing/fakeCapture';
 
-/** The machine's state without the pick counter, which has its own tests. */
-type Fields = Omit<ShareFields, 'pickId'>;
+/** The machine's state without the host, which has its own tests. */
+type Fields = Omit<ShareFields, 'hostId'>;
 
 const fields = (store: ShareStore): Fields => {
   const { phase, preset, withAudio, picked, params, hint, error } = store.getState();
@@ -250,26 +250,117 @@ describe('shareStore: the whole-screen warning (05 §13.3)', () => {
   });
 });
 
-describe('shareStore: pickId', () => {
-  it('counts the picks it follows, so a component can tell its own pick from a newer one', async () => {
+describe('shareStore: hosts (the mounted Share buttons)', () => {
+  it('names the host attached longest; the next in line takes over; null when none is left', () => {
     const store = createShareStore();
-    expect(store.getState().pickId).toBe(0);
-    const first = store.getState().pick(Promise.resolve(null), { preset: 'auto', start: started() });
-    expect(store.getState().pickId).toBe(1);
-    await first;
-    expect(store.getState().pickId).toBe(1);
-    await store.getState().pick(Promise.resolve(fakePick('monitor', true)), { preset: 'auto', start: started() });
-    expect(store.getState()).toMatchObject({ pickId: 2, phase: 'confirming' });
-    store.getState().cancel();
-    expect(store.getState().pickId).toBe(2);
+    expect(store.getState().hostId).toBeNull();
+    const detachA = store.getState().attach('a');
+    const detachB = store.getState().attach('b');
+    const detachC = store.getState().attach('c');
+    expect(store.getState().hostId).toBe('a');
+    detachB();
+    expect(store.getState().hostId).toBe('a');
+    detachA();
+    expect(store.getState().hostId).toBe('c');
+    detachC();
+    expect(store.getState().hostId).toBeNull();
+    store.getState().attach('d');
+    expect(store.getState().hostId).toBe('d');
   });
 
-  it('does not count a pick it refuses', async () => {
+  it('a detach counts once, and removes only its own host', () => {
     const store = createShareStore();
-    store.setState({ phase: 'live' });
-    await store.getState().pick(Promise.resolve(null), { preset: 'auto', start: started() });
-    expect(store.getState().pickId).toBe(0);
+    const detachA = store.getState().attach('a');
+    store.getState().attach('b');
+    detachA();
+    detachA();
+    expect(store.getState().hostId).toBe('b');
   });
+
+  it('the host stays through a pick, a cancel and a failed start', async () => {
+    const store = createShareStore();
+    store.getState().attach('a');
+    await store.getState().pick(Promise.resolve(fakePick('monitor', true)), { preset: 'auto', start: started() });
+    expect(store.getState()).toMatchObject({ phase: 'confirming', hostId: 'a' });
+    store.getState().cancel();
+    expect(store.getState()).toMatchObject({ phase: 'idle', hostId: 'a' });
+    await store.getState().pick(Promise.resolve(fakePick('window', true)), {
+      preset: 'auto',
+      start: () => Promise.reject(new Error('nope')),
+    });
+    expect(store.getState()).toMatchObject({ phase: 'failed', hostId: 'a' });
+    store.getState().dismiss();
+    expect(store.getState()).toMatchObject({ phase: 'idle', hostId: 'a' });
+  });
+
+  it('a host detaching while the picker is open leaves the pick alone as long as another is attached', async () => {
+    const store = createShareStore();
+    const start = started();
+    store.getState().attach('header');
+    const detachEmptyState = store.getState().attach('empty-state');
+    const picking = deferred<PickedSource | null>();
+    const flow = store.getState().pick(picking.promise, { preset: 'auto', start });
+    detachEmptyState();
+    expect(store.getState()).toMatchObject({ phase: 'picking', hostId: 'header' });
+    const src = fakePick('window', true);
+    picking.resolve(src);
+    await expect(flow).resolves.toMatchObject({ step: 'started' });
+    expect(start).toHaveBeenCalledExactlyOnceWith(src, { preset: 'auto', withAudio: true });
+    expect(src.release).not.toHaveBeenCalled();
+  });
+
+  it('a host detaching under the warning leaves it up as long as another is attached', async () => {
+    const store = createShareStore();
+    const start = started();
+    const detachHeader = store.getState().attach('header');
+    store.getState().attach('empty-state');
+    const src = fakePick('monitor', true);
+    await store.getState().pick(Promise.resolve(src), { preset: 'auto', start });
+    detachHeader();
+    expect(store.getState()).toMatchObject({ phase: 'confirming', hostId: 'empty-state' });
+    expect(src.release).not.toHaveBeenCalled();
+    await expect(store.getState().confirm(false)).resolves.toMatchObject({ step: 'started', withAudio: false });
+    expect(start).toHaveBeenCalledExactlyOnceWith(src, { preset: 'auto', withAudio: false });
+  });
+
+  it('the last host detaching while the picker is open gives the pick up: what arrives later is released', async () => {
+    const store = createShareStore();
+    const start = started();
+    const detachA = store.getState().attach('a');
+    const detachB = store.getState().attach('b');
+    const picking = deferred<PickedSource | null>();
+    const flow = store.getState().pick(picking.promise, { preset: 'auto', start });
+    detachA();
+    expect(store.getState().phase).toBe('picking');
+    detachB();
+    expect(store.getState()).toMatchObject({ phase: 'idle', hostId: null });
+    const src = fakePick('window', true);
+    picking.resolve(src);
+    await expect(flow).resolves.toEqual({ step: 'cancelled' });
+    expect(src.release).toHaveBeenCalledOnce();
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it('the last host detaching under the warning releases the capture', async () => {
+    const store = createShareStore();
+    const detach = store.getState().attach('a');
+    const src = fakePick('monitor', true);
+    await store.getState().pick(Promise.resolve(src), { preset: 'auto', start: started() });
+    detach();
+    expect(store.getState()).toMatchObject({ phase: 'idle', hostId: null });
+    expect(src.release).toHaveBeenCalledOnce();
+  });
+
+  it.each(['starting', 'live', 'reconnecting', 'stopping', 'failed'] as const)(
+    'the last host detaching while %s leaves the share to the publisher',
+    (phase) => {
+      const store = createShareStore();
+      const detach = store.getState().attach('a');
+      store.setState({ phase });
+      detach();
+      expect(store.getState()).toMatchObject({ phase, hostId: null });
+    },
+  );
 });
 
 describe('shareStore: picks that arrive late', () => {
