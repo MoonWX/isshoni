@@ -1,0 +1,126 @@
+/* A 16:9 tile on the stage's black (05 §12.1). The button fills it; the caption and the aside lie over the video. */
+
+.tile {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  min-height: var(--tap-target);
+  overflow: hidden;
+  color: var(--color-on-stage);
+  list-style: none;
+  background-color: var(--color-stage);
+  border-radius: var(--radius-md);
+}
+
+.main {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  text-align: start;
+  background: none;
+  border: 0;
+  border-radius: inherit;
+}
+
+/* The tile clips what lies outside it, so the focus ring goes inside. */
+.main:focus-visible {
+  outline-offset: calc(-1 * var(--focus-ring-width));
+}
+
+.overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-2) var(--space-2) var(--space-6);
+  font-size: var(--text-sm);
+  line-height: var(--leading-tight);
+  text-align: center;
+  background-color: var(--color-stage-overlay);
+}
+
+.overlayText {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+}
+
+.badge {
+  position: absolute;
+  top: var(--space-1);
+  inset-inline-start: var(--space-1);
+  max-width: calc(100% - 2 * var(--space-1));
+  padding: 0 var(--space-2);
+  overflow: hidden;
+  font-size: var(--text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background-color: var(--color-stage-overlay);
+  border-radius: var(--radius-sm);
+}
+
+.caption {
+  position: absolute;
+  inset-inline: 0;
+  bottom: 0;
+  display: flex;
+  gap: var(--space-2);
+  align-items: baseline;
+  /* Room for the aside at the inline end. */
+  padding: var(--space-4) 4.5rem var(--space-1) var(--space-2);
+  font-size: var(--text-sm);
+  background: linear-gradient(transparent, var(--color-stage-overlay));
+}
+
+.name {
+  overflow: hidden;
+  font-weight: var(--weight-medium);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.what {
+  flex: none;
+  max-width: 50%;
+  overflow: hidden;
+  font-size: var(--text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.85;
+}
+
+.aside {
+  position: absolute;
+  inset-inline-end: var(--space-2);
+  bottom: var(--space-1);
+  display: flex;
+  gap: var(--space-1);
+  align-items: center;
+  /* Clicks between its controls go to the tile's button. */
+  pointer-events: none;
+}
+
+.aside > * {
+  pointer-events: auto;
+}
+
+.watchers {
+  display: inline-flex;
+  gap: var(--space-1);
+  align-items: center;
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
+.eye {
+  width: 1em;
+  height: 1em;
+}
