@@ -23,7 +23,7 @@ import (
 //
 // Share records live in their room, under the room's lock. Everything that calls a MediaPeer for a share runs on the
 // actor of the share's publishing connection, which is the only goroutine that may call that peer: a request from
-// another connection of the user is handed to that actor (endAtOwner, updateShareOn).
+// another connection of the user is handed to that actor (endAtOwner, updateShareAt), and no actor waits for another.
 
 // newShareID returns a new share id, "s_" + 16 base32 characters (80 random bits, 01 §4.1). Ids are random, not
 // sequential, so a stale id from before a server restart never matches a new share.
@@ -270,7 +270,8 @@ func (c *conn) onShareStart(env protocol.Envelope) {
 
 // onShareUpdate handles share.update (01 §8.7): it changes the label or the preset of a share of the connection's
 // user in its room (share_not_found; forbidden for another user's) and replies with the new ShareParams, which the
-// share's publishing connection's MediaPeer computes.
+// share's publishing connection's MediaPeer computes: on this actor for the connection's own share, where the reply
+// goes out before the room.state with the change, else on the publishing connection's (updateShareAt).
 func (c *conn) onShareUpdate(env protocol.Envelope) {
 	v, ok := decode[protocol.ShareUpdate](c, env)
 	if !ok || !c.requireRoom(env) {
@@ -290,16 +291,30 @@ func (c *conn) onShareUpdate(env protocol.Envelope) {
 		owner, seq = r.connLocked(s.info.UserID, s.info.ConnectionID), s.peerSeq
 	}
 	r.mu.Unlock()
-	if code != "" {
+	switch {
+	case code != "":
 		c.reject(env, protocol.NewError(code, protocol.ErrorScopeRequest))
+	case owner == c:
+		c.replyShareUpdate(env, c.updateShare(r, v))
+	default:
+		c.updateShareAt(owner, r, seq, env, v)
+	}
+}
+
+// shareUpdated is the outcome of a share.update at the share's publishing connection: the new ShareParams, or why
+// the update was not applied.
+type shareUpdated struct {
+	params protocol.ShareParams
+	err    error
+}
+
+// replyShareUpdate answers share.update request env with its outcome.
+func (c *conn) replyShareUpdate(env protocol.Envelope, res shareUpdated) {
+	if res.err != nil {
+		c.rejectMedia(env, "update share", res.err)
 		return
 	}
-	params, err := c.updateShareOn(owner, r, seq, v)
-	if err != nil {
-		c.rejectMedia(env, "update share", err)
-		return
-	}
-	c.reply(env, params)
+	c.reply(env, res.params)
 }
 
 // errShareGone is share.update's error when the share ended, or its publishing connection left, before the update
@@ -312,73 +327,84 @@ func errShareGone() error {
 // errOwnerBusy is share.update's error when the share's publishing connection did not get to it in time.
 var errOwnerBusy = errors.New("signal: the share's connection did not answer in time")
 
-// updateShareOn applies share.update v on the actor of owner, the share's publishing connection, and returns the new
-// ShareParams. For the connection's own share that is this actor. For a share that another connection of the user
-// publishes, this actor hands the update over and waits for the result, so the connection's messages stay in order
-// and the request gets exactly one reply. It does not wait forever: when the owner's actor has ended or the hub
-// shuts down (share_not_found: the share ends with its connection), or when the owner does not get to the update
-// within depTimeout (internal: it is busy, or it waits for this actor in turn, two connections updating each
-// other's shares at once), the update is given up, and the owner drops it if it gets there later.
-func (c *conn) updateShareOn(owner *conn, r *room, seq uint64, v protocol.ShareUpdate) (protocol.ShareParams, error) {
-	if owner == c {
-		return c.updateShare(r, v)
-	}
-	if owner == nil {
-		return protocol.ShareParams{}, errShareGone()
-	}
-	type result struct {
-		params protocol.ShareParams
-		err    error
-	}
-	res := make(chan result, 1)
+// updateShareAt hands share.update v, request env of this connection, to owner: another connection of the user,
+// which publishes the share and whose actor alone may call its MediaPeer. This actor does not wait for the outcome.
+// An actor that waits for another one handles nothing meanwhile (no pong, no room.state, no media event, no timer),
+// and two connections that update each other's shares at once would wait for each other. A goroutine waits instead
+// and posts the outcome back, and this actor replies then. The request still gets exactly one reply, but the
+// connection may handle later messages before it, and the room.state with the change may come first; replies are
+// matched by id.
+//
+// The wait is bounded. When the owner's actor has ended or the hub shuts down, the reply is share_not_found (the
+// share ends with its connection). When the owner does not get to the update within depTimeout, it is internal, and
+// the owner drops the update if it gets there later. The reply is for the socket that the request came on: it is
+// dropped when the connection has lost that socket meanwhile, as the client has given the request up with it, and a
+// resumed client may use the id again.
+func (c *conn) updateShareAt(owner *conn, r *room, seq uint64, env protocol.Envelope, v protocol.ShareUpdate) {
+	res := make(chan shareUpdated, 1)
 	var gaveUp atomic.Bool
-	if !owner.post(func() {
+	if owner == nil || !owner.post(func() {
 		switch {
 		case gaveUp.Load():
 		case !owner.currentPeer(seq):
-			res <- result{err: errShareGone()}
+			res <- shareUpdated{err: errShareGone()}
 		default:
-			p, err := owner.updateShare(r, v)
-			res <- result{params: p, err: err}
+			res <- owner.updateShare(r, v)
 		}
 	}) {
-		return protocol.ShareParams{}, errShareGone() // the owner is closing: its shares end with it
+		// The owner has left the room or is closing: its shares end with it.
+		c.replyShareUpdate(env, shareUpdated{err: errShareGone()})
+		return
 	}
-	t := time.NewTimer(depTimeout)
-	defer t.Stop()
-	select {
-	case x := <-res:
-		return x.params, x.err
-	case <-owner.done:
+	h, sock := c.h, c.sock
+	h.wg.Add(1) // the actor is counted, so the WaitGroup is above zero here
+	go func() {
+		defer h.wg.Done()
+		t := time.NewTimer(depTimeout)
+		defer t.Stop()
+		var out shareUpdated
 		select {
-		case x := <-res: // it ran the update before it ended
-			return x.params, x.err
-		default:
-			return protocol.ShareParams{}, errShareGone()
+		case out = <-res:
+		case <-owner.done:
+			select {
+			case out = <-res: // it ran the update before it ended
+			default:
+				out.err = errShareGone()
+			}
+		case <-h.down: // Shutdown has begun: nothing waits for the owner any more
+			gaveUp.Store(true)
+			out.err = errShareGone()
+		case <-t.C:
+			gaveUp.Store(true)
+			out.err = errOwnerBusy
 		}
-	case <-c.h.down: // Shutdown has begun: it must not wait for this
-		gaveUp.Store(true)
-		return protocol.ShareParams{}, errShareGone()
-	case <-t.C:
-		gaveUp.Store(true)
-		return protocol.ShareParams{}, errOwnerBusy
-	}
+		// Wait for room in the inbox rather than close the connection as slow_connection for the hub's own call; the
+		// outcome is dropped once the actor has ended.
+		c.postWait(func() {
+			if c.sock != sock {
+				h.log.Debug("share.update reply dropped: the request's socket is gone", slog.String("conn_id", c.id),
+					slog.String("share_id", v.ShareID), slog.Any("err", out.err))
+				return
+			}
+			c.replyShareUpdate(env, out)
+		})
+	}()
 }
 
 // updateShare applies share.update v to a share that this connection publishes in room r: the MediaPeer returns the
 // new ShareParams, then the label and the preset change in room.state. It runs on the connection's actor, with r its
 // room.
-func (c *conn) updateShare(r *room, v protocol.ShareUpdate) (protocol.ShareParams, error) {
+func (c *conn) updateShare(r *room, v protocol.ShareUpdate) shareUpdated {
 	r.mu.Lock()
 	s := r.shares[v.ShareID]
 	mine := s != nil && s.info.ConnectionID == c.id
 	r.mu.Unlock()
 	if !mine {
-		return protocol.ShareParams{}, errShareGone()
+		return shareUpdated{err: errShareGone()}
 	}
 	params, err := c.peer.UpdateShare(v.ShareID, v)
 	if err != nil {
-		return protocol.ShareParams{}, err
+		return shareUpdated{err: err}
 	}
 	params.ShareID = v.ShareID
 	var o outbox
@@ -400,7 +426,7 @@ func (c *conn) updateShare(r *room, v protocol.ShareUpdate) (protocol.ShareParam
 	}
 	r.mu.Unlock()
 	o.send()
-	return params, nil
+	return shareUpdated{params: params}
 }
 
 // onShareStop handles share.stop (01 §8.7). It is idempotent: an unknown or already ended share replies ok. Stopping
@@ -677,6 +703,9 @@ func (c *conn) onSubscribeUpdate(env protocol.Envelope) {
 	r.mu.Unlock()
 	o.send()
 	if len(wants) > 0 {
+		// Before the call, not after it: a request that the MediaPeer refuses leaves its wants in the room, and the
+		// items before the failing one stay applied (01 §8.9), so the connection's stats are read from here on.
+		c.armStats()
 		ignored, err := c.peer.Subscribe(wants)
 		if err != nil {
 			c.rejectMedia(env, "subscribe", err)
@@ -685,7 +714,6 @@ func (c *conn) onSubscribeUpdate(env protocol.Envelope) {
 		for _, id := range ignored {
 			unknown[id] = true
 		}
-		c.armStats()
 	}
 	res := protocol.SubscribeResult{Ignored: []string{}}
 	for _, w := range v.Subs { // in the request's order

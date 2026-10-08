@@ -56,8 +56,11 @@
 // like the others. Lock order: hub → room → connection.
 //
 // A MediaPeer is called only from its connection's actor. A share belongs to its user, so another connection of the
-// user may stop or update it: that connection's actor changes the room's state itself and hands the MediaPeer call
-// to the actor of the connection that publishes the share (share.stop: posted; share.update: it waits for the new
-// ShareParams, for at most 10 s). The share timeouts and the stats reads are timers of the publishing connection's
-// actor, so they run on while the connection is detached.
+// user may stop or update it, and its actor hands the MediaPeer call to the actor of the connection that publishes
+// the share. For share.stop it ends the share in the room itself, replies and posts EndShare. For share.update it
+// posts the whole update, since the reply carries the MediaPeer's new ShareParams: the publishing connection's actor
+// applies it, and a goroutine waits for the outcome, for at most 10 s, and posts it back to the requesting actor,
+// which replies then. No actor ever waits for another one: the requesting connection handles its later messages
+// meanwhile, and two connections may update each other's shares at once. The share timeouts and the stats reads are
+// timers of the publishing connection's actor, so they run on while the connection is detached.
 package signal

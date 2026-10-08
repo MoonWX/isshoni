@@ -228,6 +228,22 @@ func TestSnapshotMedia(t *testing.T) {
 		if got := e.hub.Snapshot().Rooms[0].Shares; len(got) != 1 || len(got[0].Layers) != 0 || got[0].EgressBitrate != 0 {
 			t.Errorf("snapshot shares %+v, want no layers and no egress kept from the ended share", got)
 		}
+
+		// A subscribe.update that the MediaPeer refuses leaves the stated wants in the room, and the SFU keeps what
+		// it applied before the failing item (01 §8.9). So the hub reads that connection's stats as well, also when
+		// the refused request was the connection's first subscribe.update.
+		tooMany := protocol.NewError(protocol.ErrorCodeBadRequest, protocol.ErrorScopeRequest)
+		peerD.Fail("Subscribe", &tooMany)
+		refused(t, cd, protocol.MessageTypeSubscribeUpdate, protocol.SubscribeUpdate{
+			Subs: []protocol.SubscriptionWant{want(s1, high, audioOn)}}, protocol.ErrorCodeBadRequest)
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		if n := statsCalls(peerD); n != 1 {
+			t.Errorf("%d Stats calls for a connection whose first subscribe.update was refused, want 1 within 2 s", n)
+		}
+		if got := e.hub.Snapshot().Rooms[0].Shares[0].EgressBitrate; got != 1 {
+			t.Errorf("egress %d, want what D's MediaPeer reports for the share", got)
+		}
 	})
 }
 

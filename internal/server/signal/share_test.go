@@ -929,11 +929,18 @@ func TestShareUpdate(t *testing.T) {
 		p := startShare(t, a1, v)
 		quiet(t, a1, a2, cb)
 
-		// update sends share.update on c and returns the reply's ShareParams.
+		// update sends share.update on c and returns the reply's ShareParams. The publishing connection gets its ok
+		// before the room.state with the change. Another connection's ok comes when the publishing one hands the
+		// outcome back, which may be after that room.state.
 		update := func(c *signaltest.Client, u protocol.ShareUpdate) protocol.ShareParams {
 			t.Helper()
 			id := request(t, c, protocol.MessageTypeShareUpdate, u)
-			env := expectType(t, c, protocol.MessageTypeOK)
+			var env protocol.Envelope
+			if c == a1 {
+				env = expectType(t, c, protocol.MessageTypeOK)
+			} else {
+				env = okReply(t, c, id)
+			}
 			got, err := protocol.Decode[protocol.ShareParams](env)
 			if err != nil || env.Re != id {
 				t.Fatalf("share.update reply re %q (want %q) %s, %v", env.Re, id, env.Data, err)
@@ -1022,13 +1029,18 @@ func TestShareUpdate(t *testing.T) {
 		}
 
 		// The publishing connection's actor is busy (a slow dependency call): the other connection's request waits
-		// for it, gives up after 10 s with internal, and the update is not applied later.
+		// for it, gives up after 10 s with internal, and the update is not applied later. The requesting connection
+		// is not held up meanwhile: it answers a ping at once.
 		release := signal.Stall(e.hub, wa1.ConnectionID)
 		start := time.Now()
-		request(t, a2, protocol.MessageTypeShareUpdate, protocol.ShareUpdate{ShareID: p.ShareID, Preset: protocol.PresetText})
-		pe, _ = expectError(t, a2, protocol.ErrorCodeInternal, protocol.ErrorScopeRequest)
-		if d := time.Since(start); d != 10*time.Second || !pe.Retryable {
-			t.Errorf("gave up after %v (retryable %v), want 10 s", d, pe.Retryable)
+		id = request(t, a2, protocol.MessageTypeShareUpdate, protocol.ShareUpdate{ShareID: p.ShareID, Preset: protocol.PresetText})
+		ping(t, a2)
+		if d := time.Since(start); d != 0 {
+			t.Errorf("the pong came after %v, want at once: the connection doesn't wait for the other one", d)
+		}
+		pe, re := expectError(t, a2, protocol.ErrorCodeInternal, protocol.ErrorScopeRequest)
+		if d := time.Since(start); d != 10*time.Second || !pe.Retryable || re != id {
+			t.Errorf("gave up after %v (retryable %v, re %q); want 10 s, for request %s", d, pe.Retryable, re, id)
 		}
 		release()
 		ping(t, a1)
@@ -1040,6 +1052,107 @@ func TestShareUpdate(t *testing.T) {
 		if snap := e.hub.Snapshot(); snap.Rooms[0].Shares[0].Info.Preset != protocol.PresetMovie {
 			t.Errorf("preset %s, want movie", snap.Rooms[0].Shares[0].Info.Preset)
 		}
+	})
+}
+
+// Two connections of a user update each other's shares at the same moment (01 §4.1: a share belongs to its user, so
+// each of the user's connections may update it). Neither actor waits for the other one: both updates are applied,
+// and both requests get their ok at once.
+func TestShareUpdateCrossed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newEnv(t)
+		defer e.close()
+		cookie, _ := e.user(false)
+		a1, w1 := e.connect(cookie, signaltest.DefaultHello())
+		a2, w2 := e.connect(cookie, signaltest.DefaultHello())
+		join(t, a1, "lounge")
+		join(t, a2, "lounge")
+		s1 := startShare(t, a1, screen("r1")).ShareID
+		time.Sleep(time.Second) // shares are in startedAt order
+		s2 := startShare(t, a2, screen("r1")).ShareID
+		quiet(t, a1, a2)
+		peer1, peer2 := e.media.Peer(w1.ConnectionID), e.media.Peer(w2.ConnectionID)
+
+		// Both actors are held until each has its request in its inbox: each then hands its update to the other one
+		// before it gets to the update that the other one handed to it.
+		release1, release2 := signal.Stall(e.hub, w1.ConnectionID), signal.Stall(e.hub, w2.ConnectionID)
+		start := time.Now()
+		id1 := request(t, a1, protocol.MessageTypeShareUpdate, protocol.ShareUpdate{ShareID: s2, Preset: protocol.PresetMovie})
+		id2 := request(t, a2, protocol.MessageTypeShareUpdate, protocol.ShareUpdate{ShareID: s1, Preset: protocol.PresetGame})
+		synctest.Wait()
+		release1()
+		release2()
+		for _, tc := range []struct {
+			c       *signaltest.Client
+			id      string
+			shareID string
+		}{{a1, id1, s2}, {a2, id2, s1}} {
+			env := okReply(t, tc.c, tc.id)
+			if got, err := protocol.Decode[protocol.ShareParams](env); err != nil || got.ShareID != tc.shareID {
+				t.Errorf("share.update reply %s (%v), want the ShareParams of %s", env.Data, err, tc.shareID)
+			}
+		}
+		if d := time.Since(start); d != 0 {
+			t.Errorf("the replies came after %v, want at once", d)
+		}
+		for _, tc := range []struct {
+			peer    *signaltest.Peer
+			shareID string
+			preset  protocol.Preset
+		}{{peer1, s1, protocol.PresetGame}, {peer2, s2, protocol.PresetMovie}} {
+			calls := tc.peer.CallsTo("UpdateShare")
+			if len(calls) != 1 || calls[0].Args[0] != tc.shareID || calls[0].Args[1].(protocol.ShareUpdate).Preset != tc.preset {
+				t.Errorf("UpdateShare calls %+v, want one for %s with preset %s", calls, tc.shareID, tc.preset)
+			}
+		}
+		settle()
+		for _, c := range []*signaltest.Client{a1, a2} {
+			_, st := drain(t, c)
+			if p1, p2 := mustShare(t, st, s1).Preset, mustShare(t, st, s2).Preset; p1 != protocol.PresetGame || p2 != protocol.PresetMovie {
+				t.Errorf("presets %s and %s, want game and movie", p1, p2)
+			}
+		}
+	})
+}
+
+// The reply to a share.update that went to another connection's actor is for the socket that the request came on.
+// A connection that has resumed on a new socket by then gets no reply: the client gave the request up with the old
+// socket, and may use its id again on the new one. The update itself is applied.
+func TestShareUpdateReplyAfterResume(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newEnv(t)
+		defer e.close()
+		cookie, _ := e.user(false)
+		a1, w1 := e.connect(cookie, signaltest.DefaultHello())
+		a2, w2 := e.connect(cookie, signaltest.DefaultHello())
+		join(t, a1, "lounge")
+		join(t, a2, "lounge")
+		p := startShare(t, a1, screen("r1"))
+		quiet(t, a1, a2)
+
+		release := signal.Stall(e.hub, w1.ConnectionID)
+		request(t, a2, protocol.MessageTypeShareUpdate, protocol.ShareUpdate{ShareID: p.ShareID, Preset: protocol.PresetMovie})
+		ping(t, a2) // the update is with the publishing connection
+		a2.Close()
+		synctest.Wait()
+		a3, w3 := e.resume(cookie, w2.ResumeToken)
+		if !w3.Resumed || w3.ConnectionID != w2.ConnectionID {
+			t.Fatalf("welcome resumed %v, connectionId %s (want %s)", w3.Resumed, w3.ConnectionID, w2.ConnectionID)
+		}
+		expectState(t, a3, "lounge")
+		release()
+		settle()
+		// drain fails on anything but room traffic: no ok reaches the new socket.
+		if _, st := drain(t, a3); mustShare(t, st, p.ShareID).Preset != protocol.PresetMovie {
+			t.Errorf("state %+v, want the preset of the update", st)
+		}
+		if n := len(e.media.Peer(w1.ConnectionID).CallsTo("UpdateShare")); n != 1 {
+			t.Errorf("%d UpdateShare calls, want 1", n)
+		}
+		if e.logs.count("level=DEBUG", "share.update reply dropped", "conn_id="+w2.ConnectionID) != 1 {
+			t.Errorf("no DEBUG line for the dropped reply:\n%s", e.logs)
+		}
+		ping(t, a3)
 	})
 }
 
@@ -1257,6 +1370,7 @@ func TestShareEnds(t *testing.T) {
 			ev.Reason != protocol.EndReasonStopped {
 			t.Errorf("share.stopped %+v", ev)
 		}
+		synctest.Wait() // the room is told first; A's actor then ends the share at its MediaPeer
 		if calls := peerA.CallsTo("EndShare"); len(calls) != 2 || calls[1].Args[0] != p2.ShareID {
 			t.Errorf("EndShare calls %+v", calls)
 		}
