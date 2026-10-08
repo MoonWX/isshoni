@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -27,8 +28,9 @@ const (
 // newMainServer builds the main http.Server (04 §9.1) around the router's handler: HTTP/1.1, and HTTP/2 once the
 // listener speaks TLS (README S44; a plain-HTTP listener never negotiates it). net/http's own error lines (a failed
 // handshake, a broken connection: scanners make them constant) go to the log at debug level, so they show only
-// with log.level = "debug".
-func newMainServer(h http.Handler, log *slog.Logger) *http.Server {
+// with log.level = "debug". pending follows the server's connections until their first request header is in, so
+// that the shutdown can close the ones that never sent it.
+func newMainServer(h http.Handler, log *slog.Logger, pending *pendingConns) *http.Server {
 	var protocols http.Protocols
 	protocols.SetHTTP1(true)
 	protocols.SetHTTP2(true)
@@ -38,7 +40,60 @@ func newMainServer(h http.Handler, log *slog.Logger) *http.Server {
 		IdleTimeout:       idleTimeout,
 		MaxHeaderBytes:    maxHeaderBytes,
 		Protocols:         &protocols,
+		ConnState:         pending.track,
 		ErrorLog:          slog.NewLogLogger(log.With(slog.String("component", "http")).Handler(), slog.LevelDebug),
+	}
+}
+
+// pendingConns are the connections that net/http has accepted and that have not delivered a complete request header
+// yet (http.StateNew): a browser's spare connection, a port scanner, a request cut in half.
+//
+// http.Server.Shutdown waits for such a connection until it is 5 s old, which is the whole budget of the shutdown's
+// HTTP step (04 §6.4 step 5): a single one would make every stop take 5 s and end by force. So the server closes
+// them itself when the shutdown reaches that step. No answer is lost: a request that completed its header then
+// would only get the 503 of the shutdown gate.
+//
+// One pendingConns serves every http.Server of a Server. The zero value is ready to use.
+type pendingConns struct {
+	mu      sync.Mutex
+	closing bool // closeAll ran: nothing is tracked any more
+	conns   map[net.Conn]struct{}
+}
+
+// track is the servers' http.Server.ConnState hook. Every connection starts in StateNew and leaves it for good
+// with its first request header, or when it closes.
+func (p *pendingConns) track(c net.Conn, state http.ConnState) {
+	p.mu.Lock()
+	if state != http.StateNew {
+		delete(p.conns, c)
+		p.mu.Unlock()
+		return
+	}
+	closing := p.closing
+	if !closing {
+		if p.conns == nil {
+			p.conns = make(map[net.Conn]struct{})
+		}
+		p.conns[c] = struct{}{}
+	}
+	p.mu.Unlock()
+	if closing {
+		// Accepted between closeAll and the moment the listener closed.
+		_ = c.Close()
+	}
+}
+
+// closeAll closes every pending connection, and makes track close the ones that are still accepted afterwards.
+// net/http's goroutine of a closed connection sees the read fail and lets go of it at once. The shutdown calls it
+// right before http.Server.Shutdown.
+func (p *pendingConns) closeAll() {
+	p.mu.Lock()
+	p.closing = true
+	conns := p.conns
+	p.conns = nil
+	p.mu.Unlock()
+	for c := range conns {
+		_ = c.Close()
 	}
 }
 

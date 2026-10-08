@@ -201,6 +201,26 @@ func TestHealthEndpoints(t *testing.T) {
 		wantJSON(t, "/healthz", get(t, srv, "/healthz"), 200, `{"status":"ok"}`+"\n")
 	})
 
+	t.Run("a forwarded request never sees the checks", func(t *testing.T) {
+		// Behind the trusted proxy on this host, each of these X-Forwarded-For values makes the client address a
+		// loopback one: an entry that doesn't parse leaves the proxy's own address, and a proxy that passes the
+		// header on unchanged lets the client name any address. The request came through a proxy all the same.
+		for _, xff := range []string{"garbage", "127.0.0.1", "::1", forwardedFor + ", 127.0.0.1", ""} {
+			wantJSON(t, "/readyz with X-Forwarded-For: "+xff, get(t, srv, "/readyz", "X-Forwarded-For", xff), 200,
+				`{"status":"ready"}`+"\n")
+		}
+		// The other forwarding headers count for nothing in the client address (04 §8.5), but they show a proxy too.
+		for name, value := range map[string]string{
+			"Forwarded":         "for=127.0.0.1;proto=https",
+			"X-Forwarded-Proto": "https",
+			"X-Forwarded-Host":  "watch.example.com",
+			"X-Real-IP":         "127.0.0.1",
+			"Via":               "1.1 proxy.example.net",
+		} {
+			wantJSON(t, "/readyz with "+name, get(t, srv, "/readyz", name, value), 200, `{"status":"ready"}`+"\n")
+		}
+	})
+
 	t.Run("HEAD", func(t *testing.T) {
 		for _, path := range []string{"/healthz", "/readyz"} {
 			res := do(t, srv, http.MethodHead, path)
@@ -253,13 +273,15 @@ func TestHealthEndpoints(t *testing.T) {
 	})
 }
 
-// TestReadyzDetailNeedsTrustedProxy: without trusted proxies X-Forwarded-For counts for nothing, so a request
-// through a proxy on this host looks local and gets the checks. That is the documented cost of an off-mode install
-// whose proxy is not trusted (04 §4.5 warns about it for a non-loopback listen.http).
-func TestReadyzDetailNeedsTrustedProxy(t *testing.T) {
+// TestReadyzNoDetailThroughUntrustedProxy: without trusted proxies X-Forwarded-For counts for nothing in the client
+// address, so a request through a proxy on this host looks local. The header still shows that it came through a
+// proxy: public responses carry no detail (04 §11.1).
+func TestReadyzNoDetailThroughUntrustedProxy(t *testing.T) {
 	srv := servertest.Start(t, servertest.Options{Flags: []string{"--network.trusted-proxies="}})
-	wantJSON(t, "/readyz", get(t, srv, "/readyz", "X-Forwarded-For", forwardedFor), 200,
-		`{"status":"ready","checks":{"tls":"ok"}}`+"\n")
+	wantJSON(t, "/readyz through the proxy", get(t, srv, "/readyz", "X-Forwarded-For", forwardedFor), 200,
+		`{"status":"ready"}`+"\n")
+	// The operator's own request, straight to the port, gets the checks as ever.
+	wantJSON(t, "/readyz from this machine", get(t, srv, "/readyz"), 200, `{"status":"ready","checks":{"tls":"ok"}}`+"\n")
 }
 
 // TestGracefulShutdown walks 04 §6.4 as far as this build goes: readiness and liveness off, the gate's 503 for
@@ -398,20 +420,24 @@ func TestStopReturnsQuickly(t *testing.T) {
 	}
 }
 
-// TestShutdownReturnsInTime: a request that never finishes can't hold the shutdown past shutdown_timeout. The
-// connection is cut, Shutdown says so, and the server is stopped all the same.
-func TestShutdownReturnsInTime(t *testing.T) {
-	const timeout = 300 * time.Millisecond
+// hungRequest starts a server whose API never answers, with one request stuck in it. shutdownTimeout is the
+// server's shutdown_timeout; 0 keeps the default of 10 s. The channel gets the client's error once the server has
+// cut the connection (nil if the request was answered after all).
+func hungRequest(t *testing.T, shutdownTimeout time.Duration) (*servertest.Server, <-chan error) {
+	t.Helper()
 	started := make(chan struct{})
 	hang := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		close(started)
 		<-r.Context().Done() // ends when the server cuts the connection
 	})
 	srv := servertest.Start(t, servertest.Options{
-		Deps:   server.Deps{API: hang},
-		Config: func(c *config.Config) { c.ShutdownTimeout = config.Duration{Duration: timeout} },
+		Deps: server.Deps{API: hang},
+		Config: func(c *config.Config) {
+			if shutdownTimeout > 0 {
+				c.ShutdownTimeout = config.Duration{Duration: shutdownTimeout}
+			}
+		},
 	})
-
 	clientErr := make(chan error, 1)
 	go func() {
 		_, err := tryDo(srv, http.MethodGet, "/api/v1/hang")
@@ -422,16 +448,12 @@ func TestShutdownReturnsInTime(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the request did not reach its handler")
 	}
+	return srv, clientErr
+}
 
-	begin := time.Now()
-	err := srv.Srv.Shutdown(context.Background(), server.ShutdownStop)
-	took := time.Since(begin)
-	if took < timeout || took > timeout+2*time.Second {
-		t.Errorf("Shutdown took %v with shutdown_timeout = %v", took, timeout)
-	}
-	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "shutdown: http") {
-		t.Errorf("Shutdown = %v, want the http step's deadline error", err)
-	}
+// wantCutOff checks that the hung request of hungRequest was cut off, not answered.
+func wantCutOff(t *testing.T, clientErr <-chan error) {
+	t.Helper()
 	select {
 	case err := <-clientErr:
 		if err == nil {
@@ -440,9 +462,32 @@ func TestShutdownReturnsInTime(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the hung request was not cut off")
 	}
-	// Run reports the same forced shutdown.
-	if runErr := srv.Wait(t); !errors.Is(runErr, context.DeadlineExceeded) {
-		t.Errorf("Run = %v, want the forced shutdown's error", runErr)
+}
+
+// TestShutdownReturnsInTime: a request that never finishes can't hold the shutdown past shutdown_timeout. The
+// connection is cut, Shutdown says so with ErrShutdownForced, and the server is stopped all the same.
+func TestShutdownReturnsInTime(t *testing.T) {
+	const timeout = 300 * time.Millisecond
+	srv, clientErr := hungRequest(t, timeout)
+
+	begin := time.Now()
+	err := srv.Srv.Shutdown(context.Background(), server.ShutdownStop)
+	took := time.Since(begin)
+	if took < timeout || took > timeout+2*time.Second {
+		t.Errorf("Shutdown took %v with shutdown_timeout = %v", took, timeout)
+	}
+	if !errors.Is(err, server.ErrShutdownForced) || !errors.Is(err, context.DeadlineExceeded) ||
+		!strings.Contains(err.Error(), "http: requests still running were cut off") {
+		t.Errorf("Shutdown = %v, want ErrShutdownForced with the http step's deadline error", err)
+	}
+	wantCutOff(t, clientErr)
+	// After a stop, Run reports the same forced shutdown: the one error for which cmd/isshoni exits 0.
+	if runErr := srv.Wait(t); !errors.Is(runErr, server.ErrShutdownForced) || server.NeedsOperator(runErr) ||
+		errors.Is(runErr, server.ErrRestartRequested) {
+		t.Errorf("Run = %v, want ErrShutdownForced and nothing else", runErr)
+	}
+	if !strings.Contains(srv.Logs(), `"msg":"shutdown finished by force"`) {
+		t.Errorf("no \"shutdown finished by force\" line in the log:\n%s", srv.Logs())
 	}
 	// Stopped all the same: the data directory is free again.
 	again := servertest.Start(t, servertest.Options{DataDir: srv.DataDir})
@@ -451,18 +496,7 @@ func TestShutdownReturnsInTime(t *testing.T) {
 
 // TestShutdownHonorsCallerContext: the caller's context can cut the shutdown shorter than shutdown_timeout.
 func TestShutdownHonorsCallerContext(t *testing.T) {
-	started := make(chan struct{})
-	hang := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		close(started)
-		<-r.Context().Done()
-	})
-	srv := servertest.Start(t, servertest.Options{Deps: server.Deps{API: hang}}) // shutdown_timeout = 10 s
-	clientErr := make(chan error, 1)
-	go func() {
-		_, err := tryDo(srv, http.MethodGet, "/api/v1/hang")
-		clientErr <- err
-	}()
-	<-started
+	srv, clientErr := hungRequest(t, 0) // shutdown_timeout = 10 s
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
@@ -471,12 +505,94 @@ func TestShutdownHonorsCallerContext(t *testing.T) {
 	if took := time.Since(begin); took > 3*time.Second {
 		t.Errorf("Shutdown took %v with a 200 ms context", took)
 	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("Shutdown = %v, want a deadline error", err)
+	if !errors.Is(err, server.ErrShutdownForced) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Shutdown = %v, want ErrShutdownForced with a deadline error", err)
 	}
-	<-clientErr
-	if err := srv.Wait(t); !errors.Is(err, context.DeadlineExceeded) {
+	wantCutOff(t, clientErr)
+	if err := srv.Wait(t); !errors.Is(err, server.ErrShutdownForced) {
 		t.Errorf("Run = %v, want the forced shutdown's error", err)
+	}
+}
+
+// TestForcedShutdownIsRunsResultOnlyAfterAStop: ErrShutdownForced in Run's result means "stopped, exit 0". A restart
+// request and a dead listener keep their own results when their shutdown had to use force; the force is then in
+// the log and in Shutdown's result.
+func TestForcedShutdownIsRunsResultOnlyAfterAStop(t *testing.T) {
+	const timeout = 300 * time.Millisecond
+	forcedLine := `"msg":"shutdown finished by force"`
+
+	t.Run("restart", func(t *testing.T) {
+		srv, clientErr := hungRequest(t, timeout)
+		if err := srv.Srv.Shutdown(context.Background(), server.ShutdownRestart); !errors.Is(err, server.ErrShutdownForced) {
+			t.Errorf("Shutdown = %v, want ErrShutdownForced", err)
+		}
+		wantCutOff(t, clientErr)
+		if err := srv.Wait(t); !errors.Is(err, server.ErrRestartRequested) || errors.Is(err, server.ErrShutdownForced) {
+			t.Errorf("Run = %v, want ErrRestartRequested alone", err)
+		}
+		if !strings.Contains(srv.Logs(), forcedLine) {
+			t.Errorf("the forced shutdown is not in the log:\n%s", srv.Logs())
+		}
+	})
+
+	t.Run("listener failure", func(t *testing.T) {
+		srv, clientErr := hungRequest(t, timeout)
+		if err := srv.Srv.CloseHTTPListener(); err != nil {
+			t.Fatal(err)
+		}
+		// Exit 1, so that systemd starts the server again: never the forced shutdown's exit 0.
+		if err := srv.Wait(t); !errors.Is(err, net.ErrClosed) || errors.Is(err, server.ErrShutdownForced) {
+			t.Errorf("Run = %v, want the listener's error alone", err)
+		}
+		wantCutOff(t, clientErr)
+		if err := srv.Srv.Shutdown(context.Background(), server.ShutdownStop); !errors.Is(err, server.ErrShutdownForced) {
+			t.Errorf("Shutdown after the run = %v, want the shutdown's own result, ErrShutdownForced", err)
+		}
+		if !strings.Contains(srv.Logs(), forcedLine) {
+			t.Errorf("the forced shutdown is not in the log:\n%s", srv.Logs())
+		}
+	})
+}
+
+// TestShutdownClosesSilentConnections: a connection that has sent no request, or only a part of one, doesn't hold
+// the shutdown (04 §6.4 step 5). net/http alone waits until such a connection is 5 s old, the whole budget of the
+// step: a browser's spare connection or a port scanner would make every stop take 5 s and end by force.
+func TestShutdownClosesSilentConnections(t *testing.T) {
+	for name, sent := range map[string]string{
+		"nothing sent":  "",
+		"half a header": "GET /healthz HTTP/1.1\r\nHost: localhost\r\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := servertest.Start(t, servertest.Options{})
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			var d net.Dialer
+			conn, err := d.DialContext(ctx, "tcp", srv.Srv.Addrs().HTTP.String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = conn.Close() }()
+			if _, err := io.WriteString(conn, sent); err != nil {
+				t.Fatal(err)
+			}
+			// The server has accepted the connection and waits for its request. (The harness's own connection has
+			// had its request answered.)
+			waitFor(t, "the server to accept the connection", func() bool { return srv.Srv.PendingConns() == 1 })
+
+			begin := time.Now()
+			err = srv.Srv.Shutdown(context.Background(), server.ShutdownStop)
+			if took := time.Since(begin); err != nil || took > time.Second {
+				t.Errorf("Shutdown = %v after %v, want nil within a second", err, took)
+			}
+			if err := srv.Wait(t); err != nil {
+				t.Errorf("Run = %v, want nil", err)
+			}
+			// The server closed the connection without an answer.
+			_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if b, err := io.ReadAll(conn); len(b) != 0 || errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Errorf("the connection after the shutdown: read %q, %v; want it closed without an answer", b, err)
+			}
+		})
 	}
 }
 
@@ -519,8 +635,8 @@ func TestRestartRequested(t *testing.T) {
 	}
 }
 
-// TestShutdownTwice: the first Shutdown decides; concurrent and later calls wait for it and return its result, and a
-// stopped Server can't be started again.
+// TestShutdownTwice: the first Shutdown decides; concurrent and later calls wait for it and return its result. A
+// stopped Server can't be started again, and Run on it only repeats how it ended.
 func TestShutdownTwice(t *testing.T) {
 	srv := servertest.Start(t, servertest.Options{})
 	s := srv.Srv
@@ -548,9 +664,95 @@ func TestShutdownTwice(t *testing.T) {
 	if err := s.Start(context.Background()); err == nil {
 		t.Error("Start on a stopped server succeeded")
 	}
-	if err := s.Run(context.Background()); err == nil || errors.Is(err, server.ErrRestartRequested) {
-		t.Errorf("Run on a stopped server = %v, want an error", err)
+	// Run starts nothing again either: it reports how this server ended, as it did the first time.
+	if err := s.Run(context.Background()); err != nil {
+		t.Errorf("Run on a server that served and was stopped = %v, want nil again", err)
 	}
+	if _, err := tryDo(srv, http.MethodGet, "/healthz"); err == nil {
+		t.Error("the stopped server answers after another Run")
+	}
+}
+
+// TestRunReportsEarlierShutdown: a caller that starts the server itself and calls Run afterwards, as servertest
+// does in a goroutine, gets the shutdown's result from Run even when the shutdown began before Run did.
+func TestRunReportsEarlierShutdown(t *testing.T) {
+	start := func(t *testing.T) *server.Server {
+		t.Helper()
+		s, err := server.New(testConfig(t), discardLog(), testDeps())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	for reason, want := range map[server.ShutdownReason]error{
+		server.ShutdownStop:    nil,
+		server.ShutdownRestart: server.ErrRestartRequested,
+		server.ShutdownRestore: server.ErrRestartRequested,
+	} {
+		t.Run("finished: "+string(reason), func(t *testing.T) {
+			s := start(t)
+			if err := s.Shutdown(context.Background(), reason); err != nil {
+				t.Fatalf("Shutdown: %v", err)
+			}
+			for range 2 {
+				if err := s.Run(context.Background()); !errors.Is(err, want) {
+					t.Errorf("Run after a finished shutdown for %q = %v, want %v", reason, err, want)
+				}
+			}
+		})
+	}
+
+	t.Run("still running", func(t *testing.T) {
+		s := start(t)
+		draining, release := make(chan struct{}), make(chan struct{})
+		s.SetDrainingHook(func() {
+			close(draining)
+			<-release
+		})
+		shutdownErr := make(chan error, 1)
+		go func() { shutdownErr <- s.Shutdown(context.Background(), server.ShutdownRestart) }()
+		select {
+		case <-draining:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the shutdown did not reach its draining window")
+		}
+
+		runErr := make(chan error, 1)
+		go func() { runErr <- s.Run(context.Background()) }()
+		select {
+		case err := <-runErr:
+			t.Fatalf("Run returned (%v) before the shutdown finished", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+		close(release)
+		select {
+		case err := <-runErr:
+			if !errors.Is(err, server.ErrRestartRequested) {
+				t.Errorf("Run = %v, want ErrRestartRequested", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("Run did not return after the shutdown")
+		}
+		if err := <-shutdownErr; err != nil {
+			t.Errorf("Shutdown: %v", err)
+		}
+	})
+
+	t.Run("listener failure", func(t *testing.T) {
+		s := start(t)
+		if err := s.CloseHTTPListener(); err != nil {
+			t.Fatal(err)
+		}
+		// Whether Run finds the failed server still up or already shut down by an earlier Run, the result is the same.
+		for range 2 {
+			if err := s.Run(context.Background()); !errors.Is(err, net.ErrClosed) {
+				t.Errorf("Run after the listener failed = %v, want the listener's error", err)
+			}
+		}
+	})
 }
 
 // TestShutdownBeforeStart: giving up a Server that never started opens nothing and leaves it unusable.
@@ -568,6 +770,10 @@ func TestShutdownBeforeStart(t *testing.T) {
 	}
 	if err := s.Start(context.Background()); err == nil {
 		t.Error("Start after Shutdown succeeded")
+	}
+	// There is no run to report: Run refuses like Start.
+	if err := s.Run(context.Background()); err == nil {
+		t.Error("Run on a server that was shut down before it served returned nil")
 	}
 	if _, err := os.Stat(cfg.DataDir); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("the data directory exists (%v): New and Shutdown must not create it", err)
@@ -1225,6 +1431,18 @@ func listenLoopback(t *testing.T) net.Listener {
 	}
 	t.Cleanup(func() { _ = ln.Close() })
 	return ln
+}
+
+// waitFor polls cond until it holds.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 // waitForAddr waits until a server that Run is starting has bound its HTTP listener.

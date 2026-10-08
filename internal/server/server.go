@@ -72,7 +72,14 @@ func (r ShutdownReason) restarts() bool { return r == ShutdownRestart || r == Sh
 // cmd/isshoni then re-execs the binary; the PID stays the same, so systemd and Docker see no exit (04 §6.5).
 var ErrRestartRequested = errors.New("server: restart requested")
 
-// errStopped is returned by Start and Run for a Server that was shut down: one Server is one life.
+// ErrShutdownForced marks the error of a shutdown in which a step ran out of time and closed by force what it
+// still had: a request that would not finish, say. The server is stopped and everything is released all the same.
+// Shutdown returns such an error whatever the reason; Run returns it only after a stop, which makes it the one
+// error of Run that is no failure: Shutdown has logged the warning, and cmd/isshoni exits 0 (04 §6.4 step 7).
+var ErrShutdownForced = errors.New("server: shutdown finished by force")
+
+// errStopped is returned by Start for a Server that was shut down, and by Run for one that was shut down before it
+// ever served: one Server is one life.
 var errStopped = errors.New("server: already shut down; build a new Server")
 
 // errUnsupportedMode marks New's error for a TLS mode this build can't serve yet.
@@ -127,6 +134,7 @@ type Server struct {
 	// startup, so a Shutdown that arrives meanwhile waits for the startup to finish.
 	life        sync.Mutex
 	state       state
+	served      bool           // Start succeeded once: the shutdown that followed, or follows, is Run's to report
 	reason      ShutdownReason // of the first Shutdown call
 	shutdownErr error          // set before done is closed
 	site        config.Site
@@ -146,6 +154,7 @@ type Server struct {
 	gate    *httpapi.Gate
 	httpLn  net.Listener
 	httpSrv *http.Server
+	pending pendingConns   // the HTTP connections without a request yet; the shutdown closes them
 	serving sync.WaitGroup // the Serve goroutines; Shutdown waits for them
 
 	// hookDraining, set by tests (under life), runs in Shutdown once readiness is off and the gate is closed, while
@@ -223,7 +232,8 @@ func (s *Server) Addrs() Addrs {
 
 // Start runs the startup sequence of 04 §6.1 from step 2 on (step 1, loading the config and building the logger, is
 // cmd/isshoni's) and returns once the listeners serve. ctx bounds the startup only; it does not stop the server
-// later. After a nil return the caller owns a running server: Run waits on it, Shutdown stops it.
+// later. After a nil return the caller owns a running server: Run waits on it, Shutdown stops it. Run reports how
+// the server ended even when a shutdown began before Run was called.
 //
 // On an error everything Start had opened is released again, the server counts as shut down, and NeedsOperator
 // tells whether a restart could help. Start on a running server does nothing and returns nil; after a shutdown it
@@ -247,7 +257,7 @@ func (s *Server) Start(ctx context.Context) (err error) {
 		}
 	}()
 
-	s.logConfigWarnings()
+	s.logConfigWarnings(ctx)
 
 	// Step 2: umask, the data directory checks, the data-directory lock, the memory limit (04 §5.1).
 	if !s.deps.InProcess {
@@ -293,7 +303,7 @@ func (s *Server) Start(ctx context.Context) (err error) {
 	s.health.SetClientIP(httpapi.ClientIP)
 	s.health.AddCheck("tls", func() (bool, string) { return true, "" }) // off mode: the proxy has the certificate
 	s.gate = &httpapi.Gate{}
-	s.httpSrv = newMainServer(s.newRouter().Handler(), s.log)
+	s.httpSrv = newMainServer(s.newRouter().Handler(), s.log, &s.pending)
 	if s.cfg.Metrics.Enabled {
 		s.log.Warn("metrics.enabled is set, but this build has no metrics endpoint yet; nothing listens on metrics.listen",
 			slog.String("component", "ops"))
@@ -301,7 +311,7 @@ func (s *Server) Start(ctx context.Context) (err error) {
 
 	// Step 9: start the HTTP servers.
 	s.serve(s.httpSrv, s.httpLn)
-	s.state = stateServing
+	s.state, s.served = stateServing, true
 
 	// Step 10: one line that says where the server is. The media ports join it with the SFU (README S59), and the
 	// "finish setup" hint with auth (S54).
@@ -312,7 +322,7 @@ func (s *Server) Start(ctx context.Context) (err error) {
 
 // logConfigWarnings writes the config's warnings to the log, one line each with the key and the fix, so they reach
 // the journal in the log's format (04 §4.5). Errors never get here: New refuses them.
-func (s *Server) logConfigWarnings() {
+func (s *Server) logConfigWarnings(ctx context.Context) {
 	log := s.log.With(slog.String("component", "config"))
 	for _, p := range s.warnings {
 		line, _, _ := strings.Cut(p.String(), "\n") // "config warning: key = value (source) what is wrong."
@@ -323,7 +333,7 @@ func (s *Server) logConfigWarnings() {
 		if p.Fix != "" {
 			attrs = append(attrs, slog.String("fix", p.Fix))
 		}
-		log.LogAttrs(context.Background(), slog.LevelWarn, line, attrs...)
+		log.LogAttrs(ctx, slog.LevelWarn, line, attrs...)
 	}
 }
 
@@ -348,17 +358,27 @@ func (s *Server) fail(err error) {
 
 // Run runs the server: Start (unless the caller already did), then it blocks until ctx is cancelled, a Shutdown
 // from elsewhere begins (a restore or rotate-secrets through the admin socket), or a listener fails. In each case
-// it finishes the graceful shutdown of 04 §6.4, within shutdown_timeout, before it returns:
+// it finishes the graceful shutdown of 04 §6.4, within shutdown_timeout, before it returns. Its result says one
+// thing, so that cmd/isshoni can map it to an exit code:
 //   - nil after a stop (ctx cancelled: SIGTERM or SIGINT in cmd/isshoni);
-//   - ErrRestartRequested after a shutdown for ShutdownRestart or ShutdownRestore;
+//   - an error that wraps ErrShutdownForced after a stop that ran out of time and closed the rest by force. The
+//     server is stopped all the same: exit 0;
+//   - ErrRestartRequested after a shutdown for ShutdownRestart or ShutdownRestore, forced or not;
 //   - Start's error when the server could not start (see NeedsOperator);
-//   - the listener's error when one failed.
+//   - the listener's error when one failed, whatever the shutdown after it had to do.
 //
-// A shutdown that ran out of time and closed the rest by force adds its error to the result (errors.Is still finds
-// ErrRestartRequested).
+// What the shutdown itself ran into is Run's result only after a stop. In the other cases it is in the log, and
+// Shutdown returns it to whoever asks.
+//
+// On a server that the caller started and that a Shutdown has stopped since, Run returns the same as if it had been
+// waiting when that shutdown began.
 func (s *Server) Run(ctx context.Context) error {
 	if err := s.Start(ctx); err != nil {
-		return err
+		// errStopped from a server that has served is no start error: the caller started it, and a shutdown has
+		// begun since. Run reports that shutdown below.
+		if !errors.Is(err, errStopped) || !s.hasServed() {
+			return err
+		}
 	}
 	select {
 	case <-ctx.Done():
@@ -366,41 +386,39 @@ func (s *Server) Run(ctx context.Context) error {
 	case <-s.failed:
 	}
 	// The run context is gone or about to be; the shutdown gets shutdown_timeout of its own. If a shutdown is
-	// already running, this waits for it and returns its result.
+	// already running or done, this waits for it and returns its result.
 	err := s.Shutdown(context.WithoutCancel(ctx), ShutdownStop)
 
 	select {
 	case <-s.failed:
-		return joinErr(s.failErr, err)
+		return s.failErr
 	default:
 	}
 	s.life.Lock()
 	reason := s.reason
 	s.life.Unlock()
 	if reason.restarts() {
-		return joinErr(ErrRestartRequested, err)
+		return ErrRestartRequested
 	}
 	return err
 }
 
-// joinErr returns first alone when there is no second error, so that Run's plain results stay comparable
-// (err == ErrRestartRequested), and both joined otherwise.
-func joinErr(first, second error) error {
-	if second == nil {
-		return first
-	}
-	return errors.Join(first, second)
+// hasServed reports whether Start has succeeded on this server.
+func (s *Server) hasServed() bool {
+	s.life.Lock()
+	defer s.life.Unlock()
+	return s.served
 }
 
 // Shutdown stops the server gracefully, in the order of 04 §6.4, and returns when everything is closed and the
 // data-directory lock is released. The whole shutdown takes at most shutdown_timeout (10 s), less if ctx ends
 // sooner; a step that runs out of time closes what it has by force and the shutdown goes on, so Shutdown always
-// leaves the server stopped. Its error names the steps that had to do so.
+// leaves the server stopped. Its error then wraps ErrShutdownForced and names the steps that had to do so.
 //
-// reason is what Run reports afterwards: ErrRestartRequested for ShutdownRestart and ShutdownRestore, nil for
-// ShutdownStop (an unknown reason counts as a stop). The first call decides; later and concurrent calls wait for
-// that shutdown to finish, or for their own ctx, and return its result. On a server that never started it only
-// marks the server as shut down.
+// reason is what Run reports afterwards: ErrRestartRequested for ShutdownRestart and ShutdownRestore; for
+// ShutdownStop (an unknown reason counts as a stop) nil, or this shutdown's error. The first call decides; later
+// and concurrent calls wait for that shutdown to finish, or for their own ctx, and return its result. On a server
+// that never started it only marks the server as shut down.
 //
 // A request handler of this server that asks for a shutdown (the admin socket's restore and rotate-secrets) must not
 // wait for it: its own request would hold the HTTP step until the budget runs out. It starts Shutdown in a
@@ -438,10 +456,14 @@ func (s *Server) Shutdown(ctx context.Context, reason ShutdownReason) error {
 	defer cancel()
 	start := time.Now()
 	err := s.shutdown(ctx, reason, draining)
-	if err != nil {
-		s.log.Warn("shutdown finished by force", slog.Duration("took", time.Since(start)), logx.Err(err))
-	} else {
-		s.log.Info("shutdown complete", slog.Duration("took", time.Since(start)))
+	took := slog.Duration("took", time.Since(start))
+	switch {
+	case err == nil:
+		s.log.Info("shutdown complete", took)
+	case errors.Is(err, ErrShutdownForced):
+		s.log.Warn("shutdown finished by force", took, logx.Err(err))
+	default:
+		s.log.Error("shutdown finished with errors", took, logx.Err(err))
 	}
 
 	s.life.Lock()
@@ -452,7 +474,8 @@ func (s *Server) Shutdown(ctx context.Context, reason ShutdownReason) error {
 }
 
 // shutdown is the sequence of 04 §6.4. Each step gets its budget, cut short by ctx; an error doesn't stop the
-// sequence, because the later steps release what the earlier ones depend on.
+// sequence, because the later steps release what the earlier ones depend on. A step whose time runs out closes by
+// force what it still has and returns its context's error (see stepError).
 func (s *Server) shutdown(ctx context.Context, reason ShutdownReason, draining func()) error {
 	// Steps 1 and 2: /readyz and /healthz answer 503 shutting_down, so monitors and load balancers stop sending;
 	// every other request and new /ws upgrade gets 503 server_shutdown with Retry-After: 5.
@@ -468,7 +491,7 @@ func (s *Server) shutdown(ctx context.Context, reason ShutdownReason, draining f
 		stepCtx, cancel := context.WithTimeout(ctx, budget)
 		defer cancel()
 		if err := fn(stepCtx); err != nil {
-			errs = append(errs, fmt.Errorf("server: shutdown: %s: %w", name, err))
+			errs = append(errs, stepError(stepCtx, name, err))
 		}
 	}
 
@@ -490,13 +513,28 @@ func (s *Server) shutdown(ctx context.Context, reason ShutdownReason, draining f
 	return errors.Join(errs...)
 }
 
+// stepError names the shutdown step that returned err. A step that returns the error of its ended context ran out
+// of time and closed by force what it still had: its error wraps ErrShutdownForced. Any other error is a failure of
+// the step itself.
+func stepError(stepCtx context.Context, name string, err error) error {
+	if ctxErr := stepCtx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
+		return fmt.Errorf("%w: %s: %w", ErrShutdownForced, name, err)
+	}
+	return fmt.Errorf("server: shutdown: %s: %w", name, err)
+}
+
 // shutdownHTTP stops the main server: no new connections, idle ones closed, requests in flight may finish until ctx
-// ends; what is left then is closed by force. Hijacked connections (WebSockets) are the hub's, closed in step 3.
+// ends; what is left then is closed by force. Connections that have not sent a request yet are closed right away:
+// net/http alone would wait up to 5 s for each (see pendingConns). Hijacked connections (WebSockets) are the hub's,
+// closed in step 3.
 func (s *Server) shutdownHTTP(ctx context.Context) error {
+	s.pending.closeAll()
 	err := s.httpSrv.Shutdown(ctx)
 	if err != nil {
 		_ = s.httpSrv.Close()
-		err = fmt.Errorf("requests still running were cut off: %w", err)
+		if ctx.Err() != nil { // out of time; any other error is the listener's own, from closing it
+			err = fmt.Errorf("requests still running were cut off: %w", err)
+		}
 	}
 	s.serving.Wait()
 	return err

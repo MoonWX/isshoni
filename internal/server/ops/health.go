@@ -54,7 +54,8 @@ func NewHealth() *Health {
 // AddCheck registers a named readiness check (04 §6.2: db, tls, media, signal, public_ip). fn runs on every Ready
 // call and every /readyz request, so it must be quick and must not block; it returns whether the component is ready
 // and, when it is not, a short detail for the operator ("waiting: obtaining certificate for 203.0.113.7"). The
-// detail is shown only to loopback clients and on the admin socket, but keep secrets out of it all the same.
+// detail is shown only to clients on this machine (see Handlers) and on the admin socket, but keep secrets out of it
+// all the same.
 //
 // It panics on an empty or reserved name ("maintenance"), a nil fn or a name added before: each is a wiring bug.
 func (h *Health) AddCheck(name string, fn func() (ok bool, detail string)) {
@@ -96,7 +97,8 @@ func (h *Health) SetShuttingDown() {
 // SetClientIP sets how the handlers find a request's client address, which decides whether /readyz may show the
 // checks (loopback clients only). The default is the TCP peer. The wiring passes httpapi.ClientIP, so that in off
 // mode a request that a trusted proxy on this host forwards counts as its real client, not as loopback (04 §8.5).
-// A nil fn restores the default. Call it before serving.
+// A request with a forwarding header never gets the checks, whatever fn says (see Handlers). A nil fn restores the
+// default. Call it before serving.
 func (h *Health) SetClientIP(fn func(*http.Request) netip.Addr) {
 	if fn == nil {
 		fn = peerIP
@@ -175,9 +177,18 @@ type healthBody struct {
 //
 // Public responses carry no detail. A /readyz request from a loopback client (see SetClientIP) also gets
 // "checks": {"db":"ok","tls":"waiting: obtaining certificate for 203.0.113.7"}; an operator on the machine, or a
-// monitor next to the server, may see which check holds readiness back. Both answer GET and HEAD (405 otherwise)
-// with Cache-Control: no-store. The main router and the metrics listener mount them; the router exempts both paths
-// from its shutdown gate and its Host check (04 §9.3), so they keep answering while everything else gets 503.
+// monitor next to the server, may see which check holds readiness back.
+//
+// A request that carries a forwarding header (Forwarded, X-Forwarded-For and the like) came through a proxy, so it
+// is not one of those and gets no checks, whatever its client address resolves to. That matters in off mode, where
+// every request arrives from the proxy on this machine: the address alone says "loopback" when the proxy is not a
+// trusted one (network.trusted_proxies = []), or when the X-Forwarded-For it passes on is unusable or names a
+// loopback address. Only a proxy that adds no forwarding header at all can't be told from a local client; behind
+// such a proxy the public sees the checks.
+//
+// Both answer GET and HEAD (405 otherwise) with Cache-Control: no-store. The main router and the metrics listener
+// mount them; the router exempts both paths from its shutdown gate and its Host check (04 §9.3), so they keep
+// answering while everything else gets 503.
 func (h *Health) Handlers() (healthz, readyz http.Handler) {
 	healthz = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !allowRead(w, r) {
@@ -200,8 +211,20 @@ func (h *Health) Handlers() (healthz, readyz http.Handler) {
 	return healthz, readyz
 }
 
-// fromLoopback reports whether the request's client is this machine.
+// forwardingHeaders are the request headers with which a proxy says for whom, and how, it forwards a request.
+// Clients on this machine that talk to the server directly (curl, a monitor) send none of them.
+var forwardingHeaders = [...]string{
+	"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-Ip", "Via",
+}
+
+// fromLoopback reports whether the request comes straight from a client on this machine: it has no forwarding
+// header (an empty one counts as present) and its client address is a loopback address.
 func (h *Health) fromLoopback(r *http.Request) bool {
+	for _, name := range forwardingHeaders {
+		if _, forwarded := r.Header[name]; forwarded {
+			return false
+		}
+	}
 	h.mu.Lock()
 	clientIP := h.clientIP
 	h.mu.Unlock()

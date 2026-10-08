@@ -281,7 +281,9 @@ func (s *Server) Wait(t testing.TB) error {
 
 // Stop shuts the server down gracefully, as SIGTERM does (it cancels Run's context), and waits for Run to return.
 // It fails the test when Run returns an error other than server.ErrRestartRequested or takes longer than
-// shutdown_timeout plus a few seconds. Calling it again does nothing; the test's cleanup calls it too.
+// shutdown_timeout plus a few seconds. A shutdown that had to use force (server.ErrShutdownForced) is such an
+// error: a request that hangs in a test is a bug, unless the test collects that result itself with Wait. Calling
+// Stop again does nothing; the test's cleanup calls it too.
 func (s *Server) Stop(t testing.TB) {
 	t.Helper()
 	s.mu.Lock()

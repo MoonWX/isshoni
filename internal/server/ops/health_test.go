@@ -132,6 +132,40 @@ func TestReadyzDetailOnlyForLoopback(t *testing.T) {
 			t.Errorf("peer %q: /readyz = %d %q, want 503 %q", tc.remote, code, body, tc.want)
 		}
 	}
+	// A request with a forwarding header came through a proxy, so its loopback peer is the proxy and not the
+	// operator: no detail, whatever the header says.
+	for _, header := range [][2]string{
+		{"X-Forwarded-For", "203.0.113.9"},
+		{"X-Forwarded-For", "127.0.0.1"},
+		{"X-Forwarded-For", "not an address"},
+		{"X-Forwarded-For", ""},
+		{"x-forwarded-for", "::1"},
+		{"Forwarded", "for=127.0.0.1"},
+		{"X-Forwarded-Proto", "https"},
+		{"X-Forwarded-Host", "watch.example.com"},
+		{"X-Real-IP", "127.0.0.1"},
+		{"Via", "1.1 proxy.example.net"},
+	} {
+		r := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/readyz", nil)
+		r.RemoteAddr = loopbackPeer
+		r.Header.Set(header[0], header[1])
+		w := httptest.NewRecorder()
+		readyz.ServeHTTP(w, r)
+		if w.Code != 503 || w.Body.String() != bare {
+			t.Errorf("loopback peer with %s: %q: /readyz = %d %q, want 503 %q", header[0], header[1], w.Code, w.Body.String(), bare)
+		}
+	}
+	// Other headers don't count.
+	r := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/readyz", nil)
+	r.RemoteAddr = loopbackPeer
+	r.Header.Set("User-Agent", "curl/8.7.1")
+	r.Header.Set("X-Request-Id", "0123456789abcdef")
+	w := httptest.NewRecorder()
+	readyz.ServeHTTP(w, r)
+	if w.Body.String() != detailed {
+		t.Errorf("loopback peer with a User-Agent: /readyz = %q, want %q", w.Body.String(), detailed)
+	}
+
 	// Liveness has no checks, whoever asks.
 	if code, _, body := get(t, healthz, http.MethodGet, loopbackPeer); code != 200 || body != `{"status":"ok"}`+"\n" {
 		t.Errorf("/healthz from loopback = %d %q", code, body)
@@ -177,6 +211,16 @@ func TestSetClientIP(t *testing.T) {
 	}
 	if got := req("not an address"); got != bare {
 		t.Errorf("unknown client: %q, want %q", got, bare)
+	}
+	// The resolver doesn't get the last word on a request that shows its proxy.
+	forwarded := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/readyz", nil)
+	forwarded.RemoteAddr = loopbackPeer
+	forwarded.Header.Set("X-Test-Client", "127.0.0.1")
+	forwarded.Header.Set("X-Forwarded-For", "127.0.0.1")
+	w := httptest.NewRecorder()
+	readyz.ServeHTTP(w, forwarded)
+	if got := w.Body.String(); got != bare {
+		t.Errorf("forwarded request that resolves to loopback: %q, want %q", got, bare)
 	}
 
 	// nil restores the TCP peer.

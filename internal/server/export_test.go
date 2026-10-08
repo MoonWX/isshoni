@@ -36,3 +36,10 @@ func (s *Server) MainServer() *http.Server {
 	defer s.life.Unlock()
 	return s.httpSrv
 }
+
+// PendingConns returns how many accepted connections have not delivered their first request header yet.
+func (s *Server) PendingConns() int {
+	s.pending.mu.Lock()
+	defer s.pending.mu.Unlock()
+	return len(s.pending.conns)
+}

@@ -10,9 +10,12 @@
 //     data directory the process can't write, a corrupt or wrongly owned secrets.json, an invalid config) satisfies
 //     NeedsOperator: cmd/isshoni prints it and exits 78, so systemd stops retrying (04 §6.3).
 //   - Run is Start (unless it was called), then waiting for the context to end, and then the graceful shutdown.
+//     Its result tells cmd/isshoni how the server ended: stopped (nil, or ErrShutdownForced: exit 0), to be
+//     restarted (ErrRestartRequested), or failed.
 //   - Shutdown stops the server in the order of 04 §6.4: readiness and liveness off, the shutdown gate (503
 //     server_shutdown for every new request), then the components, then the HTTP server, and last the
-//     data-directory lock. It finishes within shutdown_timeout (10 s); what is still open then is closed by force.
+//     data-directory lock. It finishes within shutdown_timeout (10 s); what is still open then is closed by force,
+//     and its error says so with ErrShutdownForced.
 //
 // What exists so far (README slice S31, the server part of 04 slice S4): tls.mode = "off". The app is served over
 // plain HTTP on listen.http (behind the operator's HTTPS proxy, or on localhost for development, 04 §8.5) with
