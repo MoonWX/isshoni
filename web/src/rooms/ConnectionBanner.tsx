@@ -1,8 +1,9 @@
 // The connection banner (05 §7.1): nothing while the connection is fine or for a blip under 2 s, then
 // "Reconnecting…", after 30 s "Can't reach the server. Retrying… [Retry now] [Test my connection]", and "Server
-// restarting…" after the server announced its shutdown. An aria-live="polite" region that stays mounted, so screen
-// readers hear each text when it appears. The room page mounts it at its top, and so does whatever shows the
-// session on other pages (InRoomBar): media keeps playing below it while the PCs are healthy.
+// restarting…" after the server announced its shutdown. Its text is an aria-live="polite" region that stays mounted,
+// so screen readers hear each text when it appears; the buttons are outside it. The room page mounts it at its top,
+// and so does whatever shows the session on other pages (InRoomBar): media keeps playing below it while the PCs are
+// healthy.
 import { ServerCog, WifiOff } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -29,7 +30,9 @@ export function useConnectionBanner(store: ConnectionStore): ConnectionBannerSta
       setBanner((prev) => (prev?.kind === next?.kind && prev?.retryInSec === next?.retryInSec ? prev : next));
       arm();
     };
-    arm();
+    // Not just arm(): the first value is from render time, and the clock or the store may have moved on since (a
+    // mark passed, the connection came back). Nothing else would tell: the next store change may be far away.
+    update();
     const off = store.subscribe(update);
     return () => {
       off();
@@ -50,43 +53,45 @@ export function ConnectionBanner({ onTestConnection }: ConnectionBannerProps) {
   const { t } = useTranslation();
   const { signal, stores } = useRoomRuntime();
   const banner = useConnectionBanner(stores.connection);
+  const kind = banner?.kind;
   return (
-    <div className={styles.region} aria-live="polite" data-testid="connection-banner">
-      {banner?.kind === 'reconnecting' && (
-        <div className={styles.banner} data-kind="reconnecting">
-          <Spinner size="sm" label={null} />
-          <p className={styles.text}>{t('room.connection.reconnecting')}</p>
-        </div>
-      )}
-      {banner?.kind === 'restarting' && (
-        <div className={styles.banner} data-kind="restarting">
-          <ServerCog className={styles.icon} aria-hidden="true" />
-          <p className={styles.text}>{t('room.connection.restarting')}</p>
-        </div>
-      )}
+    <div
+      className={cx(styles.region, kind !== undefined && styles.banner, kind === 'unreachable' && styles.unreachable)}
+      data-kind={kind}
+      data-testid="connection-banner"
+    >
+      {kind === 'reconnecting' && <Spinner size="sm" label={null} />}
+      {kind === 'restarting' && <ServerCog className={styles.icon} aria-hidden="true" />}
+      {kind === 'unreachable' && <WifiOff className={styles.icon} aria-hidden="true" />}
+      {/*
+        The live region is the text alone, and it stays mounted while it is empty, so that each text is heard when
+        it appears. The buttons are its siblings: the Retry label counts a rate-limit wait down every second, which
+        nobody wants read out.
+      */}
+      <p className={styles.text} aria-live="polite">
+        {kind === 'reconnecting' && t('room.connection.reconnecting')}
+        {kind === 'restarting' && t('room.connection.restarting')}
+        {kind === 'unreachable' && t('room.connection.unreachable')}
+      </p>
       {banner?.kind === 'unreachable' && (
-        <div className={cx(styles.banner, styles.unreachable)} data-kind="unreachable">
-          <WifiOff className={styles.icon} aria-hidden="true" />
-          <p className={styles.text}>{t('room.connection.unreachable')}</p>
-          <div className={styles.actions}>
-            <Button
-              size="sm"
-              // A rate-limit wait can't be skipped (01 §10.2): the button counts it down instead.
-              disabled={banner.retryInSec !== null}
-              onClick={() => {
-                signal.retryNow();
-              }}
-            >
-              {banner.retryInSec !== null
-                ? t('room.connection.retryIn', { count: banner.retryInSec })
-                : t('room.connection.retryNow')}
+        <div className={styles.actions}>
+          <Button
+            size="sm"
+            // A rate-limit wait can't be skipped (01 §10.2): the button counts it down instead.
+            disabled={banner.retryInSec !== null}
+            onClick={() => {
+              signal.retryNow();
+            }}
+          >
+            {banner.retryInSec !== null
+              ? t('room.connection.retryIn', { count: banner.retryInSec })
+              : t('room.connection.retryNow')}
+          </Button>
+          {onTestConnection && (
+            <Button size="sm" variant="ghost" onClick={onTestConnection}>
+              {t('room.connection.testConnection')}
             </Button>
-            {onTestConnection && (
-              <Button size="sm" variant="ghost" onClick={onTestConnection}>
-                {t('room.connection.testConnection')}
-              </Button>
-            )}
-          </div>
+          )}
         </div>
       )}
     </div>

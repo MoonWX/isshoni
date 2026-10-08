@@ -1,6 +1,6 @@
 /*
- * The live region stays in the page (and in the accessibility tree) while it is empty; an empty block takes no
- * space, so only a banner inside it does.
+ * The root and the live region inside it (.text) stay in the page, and in the accessibility tree, while there is
+ * nothing to say: empty blocks take no space. The root looks like a banner (.banner) only while it has a text.
  */
 .region {
   flex: none;

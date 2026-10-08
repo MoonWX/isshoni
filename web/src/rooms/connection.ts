@@ -1,7 +1,7 @@
 // Signaling wiring (05 §7): one 01 SignalClient per tab, mirrored into connectionStore for the UI, with the
 // reactions of 05 §7.1 that aren't a banner: where a stopped connection sends the user (the login page, a Fatal
-// screen, VersionMismatch) and the one reload for a stale build (05 §16.4). The banner itself is ConnectionBanner,
-// which renders connectionBanner() of this store.
+// screen, VersionMismatch) and the one reload for a stale build (05 §16.4), decided with the welcome, before the
+// session joins a room. The banner itself is ConnectionBanner, which renders connectionBanner() of this store.
 //
 // 01 owns the client's behaviour (heartbeat, backoff, resume, close codes; 01 §3.4, §10, §16); nothing here repeats
 // it. No React in this file (05 §3 "Layering rule").
@@ -16,7 +16,7 @@ import { errorMessage } from '../lib/errorText';
 import { createLogger, type Logger } from '../lib/log';
 import type { Platform } from '../platform/types';
 import type { ProtocolError } from '../protocol/errors';
-import { SignalClient, type SignalState, type SignalStateInfo } from '../protocol/signal-client';
+import { isStaleBuild, SignalClient, type SignalState, type SignalStateInfo } from '../protocol/signal-client';
 import {
   ErrorCodeAccountDisabled,
   ErrorCodeClientOutdated,
@@ -235,17 +235,53 @@ export interface ConnectionOptions {
    */
   queryClient?: QueryClient;
   log?: Logger;
-  /** Passed to the SignalClient: the build version compared with welcome.serverVersion. Tests set it. */
+  /**
+   * The build version compared with welcome.serverVersion, here and in the SignalClient (01 §6.1). Default: this
+   * build's. Tests set it.
+   */
   buildVersion?: string;
 }
 
 /**
  * Creates the tab's SignalClient (05 §7) and wires it: its states into stores.connection, every welcome into the
- * session's resync, and the reactions of 05 §7.1 and §16.4. It doesn't start the client; the first room page does
- * (rooms/runtime.ts).
+ * session's resync (unless the page reloads for it), and the reactions of 05 §7.1 and §16.4. It doesn't start the
+ * client; the first room page does (rooms/runtime.ts).
  */
 export function createConnection(platform: Platform, stores: Stores, opts: ConnectionOptions = {}): SignalClient {
   const log = opts.log ?? createLogger('signal');
+  const { ui } = stores;
+  const buildVersion = opts.buildVersion ?? __ISSHONI_VERSION__;
+
+  /**
+   * A welcome from a server of another version than this build (05 §16.4): the shell is stale (a cached PWA; the
+   * server always serves a matching SPA). Reload once per server version. A plain reload is enough to update: the
+   * service worker answers navigations from the network first (05 §16.2), and the browser checks for a new worker
+   * on that navigation. Returns true when the page reloads now.
+   */
+  const reloadIfStale = (welcome: Welcome): boolean => {
+    // The welcome is JSON from the server: a missing version is an unknown one, which is never stale.
+    const version: unknown = welcome.serverVersion;
+    const serverVersion = typeof version === 'string' ? version : '';
+    if (!isStaleBuild(serverVersion, buildVersion)) return false;
+    const session = platform.storage.session;
+    if (session.get(RELOADED_FOR_KEY) === serverVersion) {
+      // The reload didn't help. The handshake worked, so the app keeps running rather than blocking the user.
+      log.warn('still a stale build after reloading', { serverVersion, buildVersion });
+      return false;
+    }
+    if (stores.session?.share != null) {
+      // Not while sharing: a reload would end the share. The UpdatePill offers it instead.
+      ui.getState().setUpdateReady(true);
+      return false;
+    }
+    const reload = platform.versionActions().reload;
+    if (reload === undefined) return false;
+    session.set(RELOADED_FOR_KEY, serverVersion);
+    log.info('stale build: reloading', { serverVersion });
+    reload();
+    return true;
+  };
+
   const { url } = platform.signaling(); // auth: later (M2), a bearer in hello.auth (01 D2)
   const client = new SignalClient({
     url,
@@ -255,12 +291,14 @@ export function createConnection(platform: Platform, stores: Stores, opts: Conne
     features: [], // later: 'share.pause' (M2), 'layer.mid' (M5)
     onResync: (w) => {
       stores.connection.getState().welcomed(w);
+      // The stale-build reload comes before the room. A page that joined first would join, leave (the reload's
+      // pagehide closes with 1000, 05 §7) and join again after it: after a server upgrade, everyone in the room
+      // would be told twice for every tab with a cached shell.
+      if (reloadIfStale(w)) return undefined;
       return stores.session?.resync(w); // RoomSession, 05 §11.1
     },
-    ...(opts.buildVersion !== undefined ? { buildVersion: opts.buildVersion } : {}),
+    buildVersion,
   });
-
-  const { ui } = stores;
 
   /** unauthenticated, session_revoked and session-scope codes this build doesn't know: the login page (01 §12.3). */
   const signedOut = (error: ProtocolError): void => {
@@ -312,30 +350,6 @@ export function createConnection(platform: Platform, stores: Stores, opts: Conne
     ui.getState().showScreen({ kind: 'fatal', reason: 'generic', code: error.code });
   };
 
-  /**
-   * ready with staleBuild (05 §16.4): the shell is stale (a cached PWA; the server always serves a matching SPA).
-   * Reload once per server version. A plain reload is enough to update: the service worker answers navigations
-   * from the network first (05 §16.2), and the browser checks for a new worker on that navigation.
-   */
-  const staleBuild = (serverVersion: string): void => {
-    const session = platform.storage.session;
-    if (session.get(RELOADED_FOR_KEY) === serverVersion) {
-      // The reload didn't help. The handshake worked, so the app keeps running rather than blocking the user.
-      log.warn('still a stale build after reloading', { serverVersion, buildVersion: platform.client.version });
-      return;
-    }
-    if (stores.session?.share != null) {
-      // Not while sharing: a reload would end the share. The UpdatePill offers it instead.
-      ui.getState().setUpdateReady(true);
-      return;
-    }
-    const reload = platform.versionActions().reload;
-    if (reload === undefined) return;
-    session.set(RELOADED_FOR_KEY, serverVersion);
-    log.info('stale build: reloading', { serverVersion });
-    reload();
-  };
-
   client.onState((state, info) => {
     const before = stores.connection.getState();
     const hadBanner = connectionBanner(before, Date.now()) !== null;
@@ -345,7 +359,7 @@ export function createConnection(platform: Platform, stores: Stores, opts: Conne
     } else if (state === 'ready') {
       // The banner is a live region, but its text just disappears: say that the outage is over (05 §16.6).
       if (hadBanner) ui.getState().announce(i18n.t('room.connection.reconnected'));
-      if (info.staleBuild === true) staleBuild(client.welcome?.serverVersion ?? '');
+      // ready with staleBuild (05 §16.4) was dealt with when its welcome came: reloadIfStale().
     }
   });
   return client;

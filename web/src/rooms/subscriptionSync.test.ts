@@ -307,6 +307,29 @@ describe('errors (05 §6.3, scope request)', () => {
     expect(signal.updates.slice(1)).toEqual([[want('b', 'low')], [want('a', 'high', 'on'), want('b', 'low')]]);
   });
 
+  it('not_in_room again after the rejoin: gives up until the next trigger, which may rejoin once more', async () => {
+    // A server that answers ok to room.join and not_in_room to every subscribe.update (a bug there, or a kick).
+    signal.answer = () => wireError('not_in_room');
+    sync.set([want('a', 'low')]);
+    await tick(60_000);
+    // The update, one rejoin, the full set: no loop of rejoins and full sets.
+    expect(rejoin).toHaveBeenCalledOnce();
+    expect(signal.updates).toEqual([[want('a', 'low')], [want('a', 'low')]]);
+
+    sync.set([want('a', 'low'), want('b', 'low')]);
+    await tick(60_000);
+    expect(rejoin).toHaveBeenCalledTimes(2);
+    expect(signal.updates).toHaveLength(4);
+    // Once the server has the room again, the full set goes through.
+    signal.answer = () => ({ ignored: [] });
+    sync.resend(true);
+    await tick();
+    expect(signal.updates[4]).toEqual([want('a', 'low'), want('b', 'low')]);
+    await tick(60_000);
+    expect(signal.updates).toHaveLength(5);
+    expect(rejoin).toHaveBeenCalledTimes(2);
+  });
+
   it('not_in_room with a rejoin that fails: gives up', async () => {
     rejoin.mockResolvedValue(false);
     signal.answer = () => wireError('not_in_room');

@@ -51,7 +51,9 @@ export interface SubscriptionSyncDeps {
   log: Logger;
   /**
    * subscribe.update was answered not_in_room (05 §6.3): rejoin the desired room. Resolves true once the session is
-   * in it again; the full desired set is then sent, because leaving a room drops the subscriptions (01 §8.9).
+   * in it again; the full desired set is then sent, because leaving a room drops the subscriptions (01 §8.9). It is
+   * called at most once per run of the send loop: a server that still answers not_in_room after the rejoin gets no
+   * second one before the next trigger (a set(), a timer, a welcome).
    */
   rejoin?: () => Promise<boolean>;
 }
@@ -234,6 +236,11 @@ export class SubscriptionSync {
   async #run(): Promise<void> {
     /** How the loop ended: nothing left to send, a failed batch, or no connection to send on. */
     let end: 'idle' | 'failed' | 'down' = 'down';
+    /**
+     * This run already rejoined for a not_in_room. "Rejoin and retry once" (05 §6.3): a second not_in_room fails the
+     * batch, or a server that keeps saying it would get a rejoin and a full set per reply, in a tight loop.
+     */
+    let rejoined = false;
     try {
       for (;;) {
         this.#wake = false;
@@ -244,7 +251,9 @@ export class SubscriptionSync {
           end = 'idle';
           return;
         }
-        if (await this.#send(batch)) continue;
+        const sent = await this.#send(batch, !rejoined);
+        if (sent === 'rejoined') rejoined = true;
+        if (sent !== 'failed') continue;
         if (full && this.#alive()) this.#fullPending = true; // the next trigger sends the full set again
         // A failed batch waits for the next trigger (set(), a timer, a welcome): retrying by itself could loop.
         if (!this.#woken()) {
@@ -312,20 +321,26 @@ export class SubscriptionSync {
     this.#armSlow(due !== undefined && due > now ? due : undefined, now);
   }
 
-  /** Sends a batch in chunks of at most 64 and applies each ok. false: a chunk failed. */
-  async #send(batch: readonly SubscriptionWant[]): Promise<boolean> {
+  /**
+   * Sends a batch in chunks of at most 64 and applies each ok. failed: a chunk failed. rejoined: a chunk was
+   * answered not_in_room and the session joined its room again (only with allowRejoin), so the full set is due.
+   */
+  async #send(batch: readonly SubscriptionWant[], allowRejoin: boolean): Promise<'sent' | 'rejoined' | 'failed'> {
     const epoch = this.#epoch;
     for (let i = 0; i < batch.length; i += MaxSubs) {
       const chunk = batch.slice(i, i + MaxSubs);
-      const result = await this.#request(chunk, epoch);
-      if (epoch !== this.#epoch) return true; // cleared or re-sent meanwhile: the reply is about another state
+      const result = await this.#request(chunk, epoch, allowRejoin);
       if (result === 'rejoined') {
-        // Leaving a room dropped every subscription: start over with the full set.
-        this.#sent.clear();
-        this.#fullPending = true;
-        return true;
+        // Leaving a room dropped every subscription: start over with the full set (unless a clear() or a welcome
+        // already started over meanwhile).
+        if (epoch === this.#epoch) {
+          this.#sent.clear();
+          this.#fullPending = true;
+        }
+        return 'rejoined';
       }
-      if (result === undefined) return false;
+      if (epoch !== this.#epoch) return 'sent'; // cleared or re-sent meanwhile: the reply is about another state
+      if (result === undefined) return 'failed';
       const ignored = new Set(result.ignored);
       for (const w of chunk) {
         if (ignored.has(w.shareId)) {
@@ -340,14 +355,19 @@ export class SubscriptionSync {
         }
       }
     }
-    return true;
+    return 'sent';
   }
 
   /**
    * One subscribe.update with the client actions of 05 §6.3 (scope request): rate_limited and internal are retried
-   * once, not_in_room rejoins. undefined: it failed (a lost connection is not logged; the next welcome re-sends).
+   * once, not_in_room rejoins when allowRejoin says so. undefined: it failed (a lost connection is not logged; the
+   * next welcome re-sends).
    */
-  async #request(subs: SubscriptionWant[], epoch: number): Promise<SubscribeResult | 'rejoined' | undefined> {
+  async #request(
+    subs: SubscriptionWant[],
+    epoch: number,
+    allowRejoin: boolean,
+  ): Promise<SubscribeResult | 'rejoined' | undefined> {
     for (let attempt = 0; ; attempt++) {
       // A retry after a wait: the room may be another one by now (clear()), and these shares not its own.
       if (epoch !== this.#epoch) return undefined;
@@ -358,7 +378,7 @@ export class SubscriptionSync {
         if (err.local && (err.code === LocalErrorCodeConnectionLost || err.code === LocalErrorCodeNotReady)) {
           return undefined;
         }
-        if (err.code === ErrorCodeNotInRoom && this.#rejoin !== undefined && attempt === 0) {
+        if (err.code === ErrorCodeNotInRoom && this.#rejoin !== undefined && attempt === 0 && allowRejoin) {
           if (await this.#rejoin()) return 'rejoined';
           return undefined;
         }

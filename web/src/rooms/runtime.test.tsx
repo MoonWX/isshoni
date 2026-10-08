@@ -14,7 +14,7 @@ import { makeError } from '../protocol/testing';
 import { connectionBanner } from './connection';
 import { roomPath, useConnection, useRoom, useRoomRuntime, useRoomSession } from './hooks';
 import { getRoomRuntime } from './runtime';
-import { createHarness, refuseConnections, tick, type Harness } from './testing/harness';
+import { createHarness, FakeShare, pickedSource, refuseConnections, tick, type Harness } from './testing/harness';
 
 let h: Harness;
 
@@ -237,6 +237,59 @@ describe('the runtime', () => {
     await again;
     expect(h.server.welcomes.at(-1)?.resumed).toBe(false);
     expect(room()).toMatchObject({ roomId: 'games', joinState: 'joined' });
+  });
+
+  // 05 §15.1: the logout flow stops the share and the client before its request. Its steps are these calls.
+  describe('a logout that stops the share and the client before its request (05 §15.1)', () => {
+    async function sharingInLounge(): Promise<FakeShare> {
+      h.services.queryClient.setQueryData(queryKeys.me, { user: { id: 'k3m9p2qxw7ht' } });
+      const joined = h.runtime.session.join('lounge');
+      await h.connect();
+      await joined;
+      const share = new FakeShare('s_local');
+      h.sharing.next.push(share);
+      await h.runtime.session.startShare(pickedSource, { preset: 'auto', withAudio: true });
+      return share;
+    }
+
+    it('closes with 1000 before the server revokes the session: no "You were signed out." notice', async () => {
+      const share = await sharingInLounge();
+      const socket = h.server.socket;
+      let stateWhenShareStopped = '';
+      const stop = share.stop.bind(share);
+      share.stop = () => {
+        stateWhenShareStopped = h.runtime.signal.state;
+        return stop();
+      };
+
+      await h.runtime.session.stopShare();
+      h.runtime.signal.stop();
+      // The share ended while signaling could still say share.stop; then the close, with nothing from the server.
+      expect(stateWhenShareStopped).toBe('ready');
+      expect(socket.clientClose?.code).toBe(1000);
+      // The request would go out now. The room stays wanted until it succeeded.
+      expect(h.runtime.session.roomId).toBe('lounge');
+
+      clearMe(h.services.queryClient);
+      await tick();
+      expect(room()).toMatchObject({ roomId: null, joinState: 'idle', state: null });
+      expect(h.runtime.stores.connection.getState()).toMatchObject({ state: 'stopped', stopReason: null });
+      expect(h.toasts()).toEqual([]);
+      expect(h.server.sockets).toHaveLength(1);
+    });
+
+    it('a logout that failed starts the client again, and the session is back in its room', async () => {
+      await sharingInLounge();
+      await h.runtime.session.stopShare();
+      h.runtime.signal.stop();
+      // The request failed: the user is still signed in.
+      h.runtime.signal.start();
+      await tick();
+      expect(h.server.welcomes.at(-1)?.resumed).toBe(false);
+      expect(h.hub.joins).toEqual(['lounge', 'lounge']);
+      expect(room()).toMatchObject({ roomId: 'lounge', joinState: 'joined' });
+      expect(h.toasts()).toEqual([]);
+    });
   });
 
   it('a session the server revoked ends the same way, with the notice', async () => {

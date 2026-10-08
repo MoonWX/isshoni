@@ -1,12 +1,15 @@
 // The connection banner (05 §7.1) on a real SignalClient against the fake signaling server: nothing for a blip,
-// "Reconnecting…" after 2 s and recovery, "Can't reach the server" with its buttons after 30 s, "Server restarting…".
-import { act, fireEvent, render, screen, within } from '@testing-library/react';
+// "Reconnecting…" after 2 s and recovery, "Can't reach the server" with its buttons after 30 s, "Server restarting…";
+// what of it is a live region; and the hook's first value when the clock or the store moved before its effect ran.
+import { act, fireEvent, render, renderHook, screen, within } from '@testing-library/react';
+import { useLayoutEffect } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AppProviders } from '../app/App';
 import { BackoffMaxMs } from '../protocol/signal-client';
 import { makeError } from '../protocol/testing';
-import { ConnectionBanner } from './ConnectionBanner';
+import { createConnectionStore, RECONNECTING_AFTER_MS } from './connection';
+import { ConnectionBanner, useConnectionBanner } from './ConnectionBanner';
 import type { RoomRuntime } from './runtime';
 import { createHarness, refuseConnections, type Harness } from './testing/harness';
 
@@ -51,22 +54,51 @@ function drop(): void {
   });
 }
 
+/** The live region inside the banner: its text. */
+function liveRegion(region: HTMLElement): HTMLElement {
+  const live = region.querySelector<HTMLElement>('[aria-live]');
+  if (live === null) throw new Error('the banner has no live region');
+  return live;
+}
+
+/** No banner on screen: no text, no icon, no buttons, and nothing that styles the (still mounted) root as one. */
+function expectNoBanner(region: HTMLElement): void {
+  expect(region).not.toHaveAttribute('data-kind');
+  expect(liveRegion(region)).toBeEmptyDOMElement();
+  expect(region.children).toHaveLength(1);
+}
+
 describe('ConnectionBanner (05 §7.1)', () => {
   it('is an empty polite live region while the connection is fine', async () => {
     const region = await renderConnected();
-    expect(region).toHaveAttribute('aria-live', 'polite');
-    expect(region).toBeEmptyDOMElement();
+    expect(liveRegion(region)).toHaveAttribute('aria-live', 'polite');
+    expectNoBanner(region);
+  });
+
+  it('keeps one live region mounted, and each text appears inside it', async () => {
+    const region = await renderConnected();
+    const live = liveRegion(region);
+    refuseConnections(h.server);
+    drop();
+    await advance(2_000);
+    expect(live).toHaveTextContent('Reconnecting…');
+    await advance(28_000);
+    expect(live).toHaveTextContent("Can't reach the server. Retrying…");
+    // The same element all along: a region that is mounted together with its text is not announced.
+    expect(liveRegion(region)).toBe(live);
+    expect(region.querySelectorAll('[aria-live]')).toHaveLength(1);
   });
 
   it('shows nothing for a blip, "Reconnecting…" after 2 s, and clears on recovery', async () => {
     const region = await renderConnected();
     const restore = refuseConnections(h.server);
     drop();
-    expect(region).toBeEmptyDOMElement();
+    expectNoBanner(region);
     await advance(1_999);
-    expect(region).toBeEmptyDOMElement();
+    expectNoBanner(region);
     await advance(1);
     expect(region).toHaveTextContent('Reconnecting…');
+    expect(region).toHaveAttribute('data-kind', 'reconnecting');
     expect(within(region).queryByRole('button')).not.toBeInTheDocument();
 
     // It stays through the failed attempts in between.
@@ -76,7 +108,7 @@ describe('ConnectionBanner (05 §7.1)', () => {
     restore();
     await advance(BackoffMaxMs);
     expect(runtime.signal.state).toBe('ready');
-    expect(region).toBeEmptyDOMElement();
+    expectNoBanner(region);
   });
 
   it('a drop that recovers within 2 s never shows', async () => {
@@ -85,7 +117,7 @@ describe('ConnectionBanner (05 §7.1)', () => {
     await advance(500);
     expect(runtime.signal.state).toBe('ready');
     await advance(2_000);
-    expect(region).toBeEmptyDOMElement();
+    expectNoBanner(region);
   });
 
   it('after 30 s: "Can’t reach the server" with Retry now, which skips the wait', async () => {
@@ -95,7 +127,8 @@ describe('ConnectionBanner (05 §7.1)', () => {
     await advance(29_999);
     expect(region).toHaveTextContent('Reconnecting…');
     await advance(1);
-    expect(region).toHaveTextContent("Can't reach the server. Retrying…");
+    expect(liveRegion(region)).toHaveTextContent("Can't reach the server. Retrying…");
+    expect(region).toHaveAttribute('data-kind', 'unreachable');
     // No connection test to open here: only Retry.
     expect(
       within(region)
@@ -112,7 +145,7 @@ describe('ConnectionBanner (05 §7.1)', () => {
     expect(h.server.sockets).toHaveLength(sockets + 1);
     await advance();
     expect(runtime.signal.state).toBe('ready');
-    expect(region).toBeEmptyDOMElement();
+    expectNoBanner(region);
   });
 
   it('offers "Test my connection" when the page can open the test', async () => {
@@ -141,7 +174,28 @@ describe('ConnectionBanner (05 §7.1)', () => {
     // The wait is over: the client connects by itself.
     await advance(1_000);
     expect(runtime.signal.state).toBe('ready');
-    expect(region).toBeEmptyDOMElement();
+    expectNoBanner(region);
+  });
+
+  it('keeps the buttons out of the live region: the countdown is not read out every second', async () => {
+    const region = await renderConnected(() => undefined);
+    act(() => {
+      h.server.error(makeError('rate_limited', 'connection', { retryAfterMs: 45_000 }));
+    });
+    await advance(30_000);
+    const live = liveRegion(region);
+    // The banner's text is the polite live region (05 §7.1)…
+    expect(screen.getByText("Can't reach the server. Retrying…").closest('[aria-live]')).toBe(live);
+    expect(live).toHaveAttribute('aria-live', 'polite');
+    // …and the countdown, which changes every second for at least 30 s (01 §10.2), is outside every live region.
+    const retry = within(region).getByRole('button', { name: 'Retry in 15 seconds' });
+    for (const button of within(region).getAllByRole('button')) {
+      expect(button.closest('[aria-live]')).toBeNull();
+    }
+    const said = live.textContent;
+    await advance(3_000);
+    expect(retry).toHaveTextContent('Retry in 12 seconds');
+    expect(live.textContent).toBe(said);
   });
 
   it('reads "Server restarting…" at once after a server.shutdown, until ready', async () => {
@@ -151,13 +205,13 @@ describe('ConnectionBanner (05 §7.1)', () => {
       h.server.shutdown(1_000);
     });
     expect(region).toHaveTextContent('Server restarting…');
-    expect(region.querySelector('[data-kind="restarting"]')).toBeInTheDocument();
+    expect(region).toHaveAttribute('data-kind', 'restarting');
     await advance(8_000);
     expect(region).toHaveTextContent('Server restarting…');
     restore();
     await advance(BackoffMaxMs);
     expect(runtime.signal.state).toBe('ready');
-    expect(region).toBeEmptyDOMElement();
+    expectNoBanner(region);
   });
 
   it('shows nothing once the connection is stopped: screens and the login page take over', async () => {
@@ -169,6 +223,46 @@ describe('ConnectionBanner (05 §7.1)', () => {
     act(() => {
       runtime.signal.stop();
     });
-    expect(region).toBeEmptyDOMElement();
+    expectNoBanner(region);
+  });
+});
+
+describe('useConnectionBanner', () => {
+  /**
+   * Renders the hook on a store whose connection went down `downFor` ms ago, and runs `between` after the hook's
+   * first value was computed (during render) and before its effect: a layout effect, which React runs first.
+   */
+  function renderBetween(downFor: number, between: (store: ReturnType<typeof createConnectionStore>) => void) {
+    const store = createConnectionStore();
+    store.getState().signalChanged('backoff', { delayMs: 60_000 });
+    vi.setSystemTime(Date.now() + downFor);
+    return renderHook(() => {
+      const banner = useConnectionBanner(store);
+      useLayoutEffect(() => {
+        between(store);
+      }, []);
+      return banner;
+    });
+  }
+
+  it('shows "Reconnecting…" when the 2 s mark passes between its first render and its effect', async () => {
+    const { result } = renderBetween(RECONNECTING_AFTER_MS - 1, () => {
+      vi.setSystemTime(Date.now() + 5);
+    });
+    // Not at the next mark (30 s) or the next store change: now.
+    expect(result.current?.kind).toBe('reconnecting');
+    await advance(27_000);
+    expect(result.current?.kind).toBe('reconnecting');
+    await advance(1_000);
+    expect(result.current?.kind).toBe('unreachable');
+  });
+
+  it('shows nothing when the connection comes back between its first render and its effect', async () => {
+    const { result } = renderBetween(5_000, (store) => {
+      store.getState().signalChanged('ready', {});
+    });
+    expect(result.current).toBeNull();
+    await advance(60_000);
+    expect(result.current).toBeNull();
   });
 });

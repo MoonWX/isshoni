@@ -65,6 +65,25 @@ async function reconnect(opts: { resumed?: boolean; roomId?: string } = {}): Pro
   expect(h.server.welcomes.at(-1)?.resumed).toBe(opts.resumed !== false);
 }
 
+/**
+ * Drops the socket and reconnects up to the hello. The test then sends the welcome itself (h.server.welcome()), and
+ * what the server sends right behind it, before the client's answers to that welcome are read.
+ */
+async function reconnectToHello(): Promise<void> {
+  h.server.autoWelcome = false;
+  h.server.drop();
+  await tick(1_000);
+  expect(h.runtime.signal.state).toBe('handshaking');
+  h.server.autoWelcome = true;
+}
+
+/** The session's own messages on the newest socket, in order (no hello, no pings). */
+const sentOnSocket = (): string[] =>
+  h.server
+    .messages(undefined, h.server.socket)
+    .map((m) => m.type)
+    .filter((type) => type !== 'hello' && type !== 'ping');
+
 async function startShare(share?: FakeShare): Promise<FakeShare> {
   const s = share ?? new FakeShare('s_local');
   h.sharing.next.push(s);
@@ -260,6 +279,54 @@ describe('join', () => {
     expect(h.platform.storage.local.get('isshoni.lastRoomId')).toBe('games');
   });
 
+  it('back to the room before the switch away got through: room.leave first, so the join makes a new MediaPeer', async () => {
+    await inRoom('lounge');
+    h.server.send('pc.offer', subOffer(3));
+    h.server.handle('room.join', (data) =>
+      data.roomId === 'games'
+        ? { error: makeError('rate_limited', 'request', { retryAfterMs: 3_000 }) }
+        : { ok: { room: { id: data.roomId, name: 'Lounge' } } },
+    );
+    // The switch ended lounge's media on the page; on the server the connection is still in lounge.
+    void session().join('games');
+    await tick(1_000);
+    expect(h.subscribers[0]?.closed).toBe(true);
+
+    const back = session().join('lounge');
+    // What lounge's old MediaPeer still sends is not for the next sub PC.
+    h.server.send('pc.offer', subOffer(3, 2));
+    await back;
+    // A room.join alone would have been answered ok with the old MediaPeer kept (01 §8.4).
+    expect(sentOnSocket().slice(-2)).toEqual(['room.leave', 'room.join']);
+    expect(room()).toMatchObject({ roomId: 'lounge', joinState: 'joined' });
+    expect(h.subscribers).toHaveLength(1);
+    h.server.send('pc.offer', subOffer(1));
+    expect(h.subscribers[1]?.offers).toEqual([subOffer(1)]);
+  });
+
+  it('a room.leave that fails before such a join fails the join, and the next try leaves first again', async () => {
+    await inRoom('lounge');
+    h.server.handle('room.join', (data) =>
+      data.roomId === 'games'
+        ? { error: makeError('rate_limited', 'request', { retryAfterMs: 3_000 }) }
+        : { ok: { room: { id: data.roomId, name: 'Lounge' } } },
+    );
+    void session().join('games');
+    await tick(1_000);
+    h.server.handle('room.leave', () => ({ error: makeError('internal', 'request', { params: { ref: 'a1b2c3d4' } }) }));
+    const back = track(session().join('lounge'));
+    await tick();
+    expect((back.error as ProtocolError).code).toBe('internal');
+    expect(room()).toMatchObject({ roomId: 'lounge', joinState: 'failed' });
+    // No room.join went out: it would have kept the MediaPeer whose page side is gone.
+    expect(h.hub.joins).toEqual(['lounge', 'games']);
+
+    h.server.handle('room.leave', () => ({ ok: {} }));
+    await session().join('lounge');
+    expect(sentOnSocket().slice(-2)).toEqual(['room.leave', 'room.join']);
+    expect(room().joinState).toBe('joined');
+  });
+
   it('switching rooms ends the old room’s media: the share, the sub PC, the subscriptions', async () => {
     await inRoom('lounge');
     const share = await startShare();
@@ -383,6 +450,20 @@ describe('leave', () => {
     expect(h.hub.sent('room.leave')).toEqual([]);
     expect(room()).toMatchObject({ roomId: 'games', joinState: 'joined' });
   });
+
+  it('a join() of the same room during leave(): one room.leave, before its room.join', async () => {
+    await inRoom();
+    await startShare();
+    h.server.send('pc.offer', subOffer(2));
+    const left = session().leave();
+    const joined = session().join('lounge');
+    await Promise.all([left, joined]);
+    // leave() ended the room's media on the page, so the server's MediaPeer has to go too (01 §8.4).
+    expect(sentOnSocket().slice(-2)).toEqual(['room.leave', 'room.join']);
+    expect(h.hub.sent('room.leave')).toHaveLength(1);
+    expect(room()).toMatchObject({ roomId: 'lounge', joinState: 'joined' });
+    expect(h.subscribers[0]?.closed).toBe(true);
+  });
 });
 
 describe('resync (01 §10.5)', () => {
@@ -478,6 +559,70 @@ describe('resync (01 §10.5)', () => {
       // The join comes before the media.
       const types = h.server.messages(undefined, h.server.socket).map((m) => m.type);
       expect(types.indexOf('room.join')).toBeLessThan(types.indexOf('subscribe.update'));
+    });
+
+    it.each<[string, () => Promise<void>]>([
+      [
+        'leave() and the same room again',
+        async () => {
+          await session().leave();
+          void session().join('lounge');
+        },
+      ],
+      [
+        'a switch to another room and back',
+        () => {
+          void session().join('games');
+          void session().join('lounge');
+          return Promise.resolve();
+        },
+      ],
+    ])('after %s while offline: room.leave, then room.join, and the media starts over', async (_name, away) => {
+      await inRoom();
+      const share = await startShare();
+      h.server.send('pc.offer', subOffer(4));
+      session().subscriptions.set(wants(3));
+      await tick(SUBSCRIBE_DEBOUNCE_MS);
+
+      await reconnectToHello();
+      await away();
+      // The page ended the room's media: the share, the sub PC, the subscriptions.
+      expect(share.calls).toEqual(['stop']);
+      expect(h.subscribers[0]?.closed).toBe(true);
+      session().subscriptions.set(wants(2));
+      expect(h.hub.sent('room.leave')).toEqual([]);
+
+      // The server kept the connection in lounge through the grace period, with the MediaPeer of before: its sub PC
+      // at gen 4 and the three subscriptions (01 §10.3). Its Resync() follows the welcome (01 §10.5).
+      const w = h.server.welcome({ roomId: 'lounge' });
+      expect(w.resumed).toBe(true);
+      h.server.send('pc.offer', subOffer(4, 2));
+      await tick();
+
+      // Joining the room it is already in would only answer ok and keep that MediaPeer (01 §8.4).
+      expect(sentOnSocket()).toEqual(['room.leave', 'room.join', 'subscribe.update']);
+      expect(room()).toMatchObject({ roomId: 'lounge', joinState: 'joined' });
+      // The new MediaPeer holds nothing: only what is wanted now goes out, with no off for the third share.
+      expect(h.hub.subscribes.at(-1)).toEqual(wants(2));
+      // The old MediaPeer's offer made no sub PC; the new one's first offer does.
+      expect(h.subscribers).toHaveLength(1);
+      h.server.send('pc.offer', subOffer(1));
+      expect(h.subscribers[1]?.offers).toEqual([subOffer(1)]);
+      // Not a resumed room: the snapshot after the join is not searched for strays (the room.leave ended them).
+      h.hub.sendState('lounge', { shares: [shareInfo('s_local', ownUser, ownConnection())] });
+      expect(h.hub.sent('share.stop')).toEqual([]);
+    });
+
+    it('a switch to another room while offline needs no room.leave: only the room.join', async () => {
+      await inRoom();
+      h.server.send('pc.offer', subOffer(4));
+      await reconnectToHello();
+      void session().join('games');
+      h.server.welcome({ roomId: 'lounge' });
+      await tick();
+      // Joining another room closes lounge's MediaPeer by itself (01 §8.4).
+      expect(sentOnSocket()).toEqual(['room.join']);
+      expect(room()).toMatchObject({ roomId: 'games', joinState: 'joined' });
     });
 
     it('stops a server share of this connection that the page no longer has', async () => {
@@ -616,6 +761,31 @@ describe('resync (01 §10.5)', () => {
       await reconnect({ resumed: false });
       expect(room().joinState).toBe('joined');
     });
+  });
+});
+
+describe('subscriptions', () => {
+  it('not_in_room: rejoins the desired room and sends the full set', async () => {
+    await inRoom();
+    let calls = 0;
+    h.server.handle('subscribe.update', () =>
+      calls++ === 0 ? { error: makeError('not_in_room', 'request') } : { ok: { ignored: [] } },
+    );
+    session().subscriptions.set(wants(2));
+    await tick(SUBSCRIBE_DEBOUNCE_MS);
+    expect(h.hub.joins).toEqual(['lounge', 'lounge']);
+    expect(h.hub.subscribes).toEqual([wants(2), wants(2)]);
+    expect(room().joinState).toBe('joined');
+  });
+
+  it('a server that keeps answering not_in_room gets one rejoin and one more try, not a loop (05 §6.3)', async () => {
+    await inRoom();
+    h.server.handle('subscribe.update', () => ({ error: makeError('not_in_room', 'request') }));
+    session().subscriptions.set(wants(2));
+    await tick(60_000);
+    expect(h.hub.subscribes).toEqual([wants(2), wants(2)]);
+    expect(h.hub.joins).toEqual(['lounge', 'lounge']);
+    expect(room()).toMatchObject({ roomId: 'lounge', joinState: 'joined' });
   });
 });
 
@@ -880,6 +1050,54 @@ describe('the sub PC', () => {
     expect(h.subscribers[0]?.candidates).toEqual([ice]);
     // It is made with what SubscriberPC needs besides its registry (05 §10.1).
     expect(h.subscribers[0]?.deps).toMatchObject({ platform: h.platform, signal: h.runtime.signal });
+  });
+
+  it('gets nothing while a room.join is on its way: those are the old room’s messages (01 §8.4)', async () => {
+    await inRoom();
+    h.server.send('pc.offer', subOffer(1));
+    const joined = session().join('games');
+    // lounge's MediaPeer was still negotiating when the switch came: its offer and a candidate are ahead of the ok.
+    h.server.send('pc.offer', subOffer(1, 2));
+    h.server.send('pc.ice', { pc: 'sub', gen: 1 });
+    expect(h.subscribers).toHaveLength(1);
+    await joined;
+    expect(h.subscribers).toHaveLength(1);
+
+    // games' MediaPeer starts over at gen 1, neg 1, in a sub PC of its own.
+    h.server.send('pc.offer', subOffer(1));
+    expect(h.subscribers).toHaveLength(2);
+    expect(h.subscribers[0]).toMatchObject({ closed: true, offers: [subOffer(1)], candidates: [] });
+    expect(h.subscribers[1]).toMatchObject({ closed: false, offers: [subOffer(1)], candidates: [] });
+  });
+
+  it('gets nothing after a resumed welcome that still has the room the user switched away from', async () => {
+    await inRoom();
+    h.server.send('pc.offer', subOffer(3));
+    await reconnectToHello();
+    void session().join('games');
+    // The server's Resync() ICE-restarts lounge's sub PC right behind the welcome, before it reads the room.join
+    // (01 §10.5).
+    h.server.welcome({ roomId: 'lounge' });
+    h.server.send('pc.offer', subOffer(3, 2));
+    expect(h.subscribers).toHaveLength(1);
+    await tick();
+    expect(room()).toMatchObject({ roomId: 'games', joinState: 'joined' });
+    h.server.send('pc.offer', subOffer(1));
+    expect(h.subscribers).toHaveLength(2);
+    expect(h.subscribers[1]?.offers).toEqual([subOffer(1)]);
+  });
+
+  it('is not made from a late offer when the join is refused', async () => {
+    await inRoom();
+    h.server.send('pc.offer', subOffer(1));
+    h.server.handle('room.join', () => ({ error: makeError('room_full', 'request') }));
+    const joined = track(session().join('games'));
+    h.server.send('pc.offer', subOffer(1, 2)); // ahead of the refusal
+    await tick();
+    expect((joined.error as ProtocolError).code).toBe('room_full');
+    h.server.send('pc.offer', subOffer(1, 3)); // and behind it
+    expect(h.subscribers).toHaveLength(1);
+    expect(h.subscribers[0]).toMatchObject({ closed: true, offers: [subOffer(1)] });
   });
 
   it('is not made without a room, and the session runs without a viewer', async () => {

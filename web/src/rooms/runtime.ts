@@ -6,7 +6,12 @@
 // - 01's `invalidate` messages refetch REST data (protocol/invalidate.ts, 05 §6.2);
 // - signing out stops the connection: when ['me'] becomes null (a logout here or in another tab, a 401, a session
 //   the server revoked: app/me.ts), the client stops, which closes with 1000 so the server skips the grace period
-//   (05 §7 "Intentional leave"), and the session lets go of its room;
+//   (05 §7 "Intentional leave"), and the session lets go of its room. This is the net under every way of being
+//   signed out, not the logout flow: a logout started in this tab makes ['me'] null only after its request, and by
+//   then the server has closed the socket itself (session_revoked). 05 §15.1's order (stop the share, stop the
+//   client, then the request) is the logout flow's, which runs session.stopShare() and signal.stop() of this
+//   runtime as its first steps, and signal.start() again when the request fails: the session keeps its desired
+//   room through a stop(), so that start rejoins it;
 // - a REST call answered 503 server_shutdown tells the banner that the outage is a restart (05 §7.1).
 import type { AppServices } from '../app/context';
 import { createLogger } from '../lib/log';

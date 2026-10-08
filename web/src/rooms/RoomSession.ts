@@ -53,9 +53,11 @@ import { SubscriptionSync } from './subscriptionSync';
 // ---- Seams for the media folders ----
 
 /**
- * The part of viewer/SubscriberPC (05 §10.1) the session drives. The session makes one when the server's first sub
- * offer arrives, routes pc.offer and pc.ice {pc: 'sub'} to it, and closes it when the server's side is gone: leave(),
- * a room switch, a welcome that wasn't resumed (a new one, so gen starts again), a room-scope error, dispose().
+ * The part of viewer/SubscriberPC (05 §10.1) the session drives. While the session is in its room, it makes one when
+ * the server's first sub offer arrives and routes pc.offer and pc.ice {pc: 'sub'} to it; at any other time (a
+ * room.join on its way, no room) those messages are a MediaPeer's that is about to end, and are dropped. The session
+ * closes it when the server's side is gone: leave(), a room switch, a welcome that wasn't resumed (a new one, so gen
+ * starts again), a room-scope error, dispose().
  */
 export interface SubscriberLike {
   handleOffer(o: PCOffer): Promise<void>;
@@ -170,8 +172,19 @@ export class RoomSession {
 
   /** The desired room: the "memory" of 01 §10.5. */
   #desired: string | null = null;
-  /** The room the server has this connection in, as far as the client knows. */
+  /**
+   * The room the session is in: the server has this connection in it, as far as the client knows, and its MediaPeer
+   * there is this page's (not #staleRoom's).
+   */
   #joined: string | null = null;
+  /**
+   * The room whose media the page ended (leave(), a switch to another room) while the server may still have this
+   * connection in it, with the MediaPeer of before: its sub PC at its old gen and its subscriptions, through the
+   * grace period too (01 §10.3). Joining that room again would keep that MediaPeer, because a room.join for the room
+   * the connection is already in only answers ok (01 §8.4); so a room.leave goes first (#runJoin). Null once the
+   * server answered a room.leave or a room.join, or a welcome says the connection isn't in that room anymore.
+   */
+  #staleRoom: string | null = null;
   /** The room.join on its way. */
   #joinOp: JoinOp | null = null;
   #waiters: JoinWaiter[] = [];
@@ -229,6 +242,7 @@ export class RoomSession {
         // Stopped: the connection is gone for good, and with it the server's memory of this tab's room.
         if (state === 'stopped') {
           this.#joined = null;
+          this.#staleRoom = null;
           this.#joinOp = null;
         }
       }),
@@ -277,7 +291,10 @@ export class RoomSession {
     const room = this.#stores.room;
     if (previous !== roomId) {
       this.#settleOthers(roomId);
-      if (previous !== null) this.#dropMedia();
+      if (previous !== null) {
+        this.#markStale();
+        this.#dropMedia();
+      }
       this.#lastRev = undefined;
       room.setState({ roomId, joinState: 'joining', joinError: null, room: null, state: null, redirect: null });
     } else if (this.#joined === roomId && room.getState().joinState === 'joined') {
@@ -295,10 +312,12 @@ export class RoomSession {
   /**
    * Leaves the room and clears the desired room: stops the local share (share.stop; share/ sends pc.close {pub} when
    * it was the last one), sends room.leave, closes the sub PC locally. Offline it only cleans up; the server ends
-   * the rest when the grace period runs out, or the next resumed welcome sends the room.leave.
+   * the rest when the grace period runs out, or the next resumed welcome sends the room.leave (also when the same
+   * room is wanted again by then: its join leaves first).
    */
   async leave(): Promise<void> {
     const onServer = this.#joined !== null || this.#joinOp !== null;
+    this.#markStale();
     this.#desired = null;
     this.#mayPickRoom = false;
     this.#joined = null;
@@ -342,10 +361,13 @@ export class RoomSession {
       room.setState({ connectionId: w.connectionId, userId: w.user.id });
       if (w.resumed) {
         this.#joined = w.roomId !== undefined && w.roomId !== '' ? w.roomId : null;
+        // The welcome says where the server has the connection: the media of any other room is gone there.
+        if (this.#staleRoom !== this.#joined) this.#staleRoom = null;
       } else {
         // A new connection: the server has neither PC. Discard the sub PC, so the next one starts at gen 1; the
         // pub PC goes with the share's own resync.
         this.#joined = null;
+        this.#staleRoom = null;
         this.#closeSubscriber();
       }
 
@@ -368,6 +390,10 @@ export class RoomSession {
         return;
       }
 
+      // The server kept the connection in roomId, but the page ended that room's media while the socket was down
+      // (leave() and the same room again, or a switch away and back): the server's MediaPeer has no page side
+      // anymore. The session is not in the room then, and its join leaves first (#runJoin).
+      if (this.#staleRoom === roomId) this.#joined = null;
       // Whether the server still has this connection's media: its MediaPeer lives as long as the connection stays
       // in the room (01 §8.4).
       const kept = this.#joined === roomId;
@@ -485,9 +511,20 @@ export class RoomSession {
   async #runJoin(op: JoinOp): Promise<boolean> {
     const { roomId } = op;
     try {
+      if (this.#staleRoom === roomId) {
+        // The server may still have the connection in this room, with the MediaPeer whose page side is gone, and a
+        // room.join alone would keep it (01 §8.4). Out first, so that the join makes a new one; a room.leave that
+        // fails fails the join. (When leave()'s own room.leave isn't answered yet this is a second one, which the
+        // server answers ok all the same.) Until the join's ok the session is in no room: whatever the old
+        // MediaPeer still sends is not for the next sub PC.
+        this.#joined = null;
+        await this.#requestLeave();
+        if (!this.#isCurrent(op)) return false;
+      }
       const result = await this.#requestJoin(op);
       if (result === null || !this.#isCurrent(op)) return false;
       this.#joined = roomId;
+      this.#staleRoom = null; // joining closed the MediaPeer of the room before (01 §8.4)
       this.#stores.room.setState({ joinState: 'joined', joinError: null, room: result.room });
       this.#stores.prefs.getState().setLastRoomId(roomId);
       this.#settle(roomId);
@@ -554,10 +591,21 @@ export class RoomSession {
     return this.#joinNow(roomId);
   }
 
+  /** The page is about to end the media of the room it is in: the server's MediaPeer may outlive it (#staleRoom). */
+  #markStale(): void {
+    if (this.#joined !== null) this.#staleRoom = this.#joined;
+  }
+
+  /** room.leave. Its ok says the server has the connection in no room, so no MediaPeer of before is left. */
+  async #requestLeave(): Promise<void> {
+    await this.#signal.request(MessageTypeRoomLeave, {});
+    this.#staleRoom = null;
+  }
+
   /** Sends room.leave; the caller has already forgotten the room. A failure is only logged. */
   async #leaveOnServer(): Promise<void> {
     try {
-      await this.#signal.request(MessageTypeRoomLeave, {});
+      await this.#requestLeave();
     } catch (err) {
       // The server ends the membership by itself when the connection is gone.
       if (!(isProtocolError(err) && err.local)) this.#log.warn('room.leave failed', { error: err });
@@ -691,7 +739,11 @@ export class RoomSession {
   // ---- Media ----
 
   #toSubscriber(handle: (sub: SubscriberLike) => Promise<void>): void {
-    if (this.#desired === null) return;
+    // Only once the session is in the room it wants. While a room.join is on its way, and after a resumed welcome
+    // that still has another room, the server's sub PC is the one that join ends (01 §8.4): a sub PC made from its
+    // messages would live on into the new room with the old gen and neg. The new MediaPeer sends its first offer
+    // after the join's ok.
+    if (this.#joined === null || this.#joined !== this.#desired) return;
     this.#subscriber ??=
       this.#media.createSubscriber?.({
         platform: this.#platform,

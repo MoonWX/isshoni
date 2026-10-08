@@ -378,12 +378,57 @@ describe('a stale build (05 §16.4)', () => {
     expect(connection().staleBuild).toBe(true);
     expect(reload).toHaveBeenCalledTimes(1);
     expect(screen()).toBeNull();
+    expect(h.hub.joins).toEqual(['lounge']);
 
     // A newer server version later is a new reason.
     stalePage('0.3.0');
     await h.connect();
     expect(reload).toHaveBeenCalledTimes(2);
     expect(h.platform.storage.session.get(RELOADED_FOR_KEY)).toBe('0.3.0');
+  });
+
+  it('reloads before the session joins a room: no join, leave and join again around the reload', async () => {
+    stalePage('0.2.0');
+    const wanted = h.runtime.session.join('lounge');
+    wanted.catch(() => undefined);
+    let sentAtReload: string[] | undefined;
+    reload.mockImplementationOnce(() => {
+      sentAtReload = h.server.messages().map((m) => m.type);
+    });
+    await h.connect();
+    expect(sentAtReload).toEqual(['hello']);
+    // Nothing follows either: the page is going away, and the one after it joins.
+    expect(h.hub.joins).toEqual([]);
+    expect(h.runtime.stores.room.getState()).toMatchObject({ roomId: 'lounge', joinState: 'joining' });
+
+    // A page that is still here at the next welcome (the reload didn't happen) joins then.
+    h.server.drop();
+    await tick(BackoffMaxMs);
+    await wanted;
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(h.hub.joins).toEqual(['lounge']);
+  });
+
+  it('a welcome without a server version is not stale, and the session resyncs', async () => {
+    stalePage('0.2.0');
+    h.server.welcomeDefaults = { serverVersion: undefined };
+    await h.connect();
+    expect(connection().staleBuild).toBe(false);
+    expect(reload).not.toHaveBeenCalled();
+    expect(h.hub.joins).toEqual(['lounge']);
+  });
+
+  it('a platform without a reload action carries on: the session joins', async () => {
+    h.close();
+    h = createHarness({
+      server: { welcome: { serverVersion: '0.2.0' } },
+      platform: { versionActions: () => ({}) },
+      runtime: { buildVersion: '0.1.0' },
+    });
+    await h.connect();
+    expect(connection().staleBuild).toBe(true);
+    expect(h.platform.storage.session.get(RELOADED_FOR_KEY)).toBeNull();
+    expect(h.hub.joins).toEqual(['lounge']);
   });
 
   it('does nothing when the versions match, or when one is a dev build', async () => {
