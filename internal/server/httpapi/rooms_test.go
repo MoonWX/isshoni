@@ -138,6 +138,9 @@ func TestRoomsOverREST(t *testing.T) {
 		strings.Repeat("🎬", 41): api.FieldTooLong,
 		"Movie\nnight":          api.FieldInvalid,
 		"Movie\x00night":        api.FieldInvalid,
+		// Emoji written with U+FE0F or a zero-width joiner (normalizeRoomName): a red heart, a man technologist.
+		"\u2764\ufe0f Chill":             api.FieldInvalid,
+		"\U0001f468\u200d\U0001f4bb Dev": api.FieldInvalid,
 	} {
 		e := wantError(t, f.createRoom(cookie, name), http.StatusUnprocessableEntity, api.CodeValidationFailed)
 		if fmt.Sprint(e.Fields) != "map[name:"+code+"]" {
@@ -528,6 +531,21 @@ func TestNormalizeRoomName(t *testing.T) {
 		{"a\ufffdb", "", "", api.FieldInvalid},   // what a JSON decoder leaves of bad bytes
 		{"a\xffb", "", "", api.FieldInvalid},     // not UTF-8
 		{string([]byte{0xed, 0xa0, 0x80}), "", "", api.FieldInvalid},
+		// Emoji: the profile takes the ones that are plain code points and refuses the ones that are written with
+		// the variation selector U+FE0F or with a zero-width joiner between them. The invisible code points are
+		// spelled out here.
+		{"\u2764 Chill", "\u2764 Chill", "\u2764 chill", ""},                                           // red heart without its selector
+		{"\u2615 Coffee", "\u2615 Coffee", "\u2615 coffee", ""},                                        // hot beverage
+		{"\U0001f44d\U0001f3fd Nice", "\U0001f44d\U0001f3fd Nice", "\U0001f44d\U0001f3fd nice", ""},    // thumbs up with a skin tone
+		{"\U0001f1ef\U0001f1f5 Anime", "\U0001f1ef\U0001f1f5 Anime", "\U0001f1ef\U0001f1f5 anime", ""}, // a flag: two regional indicators
+		{"1\u20e3 First", "1\u20e3 First", "1\u20e3 first", ""},                                        // keycap without its selector
+		{"\u2764\ufe0f Chill", "", "", api.FieldInvalid},                                               // red heart as keyboards type it
+		{"\u2615\ufe0f Coffee", "", "", api.FieldInvalid},                                              // U+FE0F after an emoji that needs none
+		{"\U0001f39e\ufe0f Movies", "", "", api.FieldInvalid},                                          // film frames
+		{"1\ufe0f\u20e3 First", "", "", api.FieldInvalid},                                              // keycap 1
+		{"a\ufe0eb", "", "", api.FieldInvalid},                                                         // the text selector U+FE0E too
+		{"\U0001f468\u200d\U0001f4bb Dev", "", "", api.FieldInvalid},                                   // man technologist: man, ZWJ, laptop
+		{"\U0001f3f3\ufe0f\u200d\U0001f308 Pride", "", "", api.FieldInvalid},                           // rainbow flag: both
 	} {
 		name, key, code := normalizeRoomName(c.in)
 		if name != c.name || key != c.key || code != c.code {
@@ -552,7 +570,8 @@ func TestNormalizeRoomName(t *testing.T) {
 // valid UTF-8 and normalizes to itself with the same key.
 func FuzzNormalizeRoomName(f *testing.F) {
 	for _, s := range []string{"Lounge", "🎬 Movie night", "  Games   night  ", "Ｇａｍｅｓ", "", " ", "a\nb", "a\xffb", "a\ufffdb",
-		strings.Repeat("x", 41), strings.Repeat("ﬁ", 21), "\u0301abc", "İstanbul", "ǅ", "a\u00adb", "\u200d", "ﷺ", "e\u0301"} {
+		strings.Repeat("x", 41), strings.Repeat("ﬁ", 21), "\u0301abc", "İstanbul", "ǅ", "a\u00adb", "\u200d", "ﷺ", "e\u0301",
+		"\u2764\ufe0f Chill", "\U0001f468\u200d\U0001f4bb Dev", "1\u20e3 First", "\U0001f44d\U0001f3fd", "\U0001f1ef\U0001f1f5"} {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, in string) {

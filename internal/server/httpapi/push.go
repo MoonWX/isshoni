@@ -342,7 +342,9 @@ const pushTestEvery = 10 * time.Second
 //
 // It lives here and not with auth's throttles (03 §7.3) because the handler is its only user and auth.Service has
 // no call for it. Memory only, like every throttle: a restart forgets it. The map holds only the users who tested
-// within the last two windows; older entries mean the same as none and are swept.
+// within the last two windows; older entries mean the same as none and are swept. So it needs no cap on its keys
+// (auth's maps hold at most 100,000): only a user with a subscription gets as far as taking a token, and the map
+// can't outgrow the users who did so in 20 s.
 type pushTestLimiter struct {
 	now func() time.Time
 

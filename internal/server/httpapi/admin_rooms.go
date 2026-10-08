@@ -50,6 +50,12 @@ const (
 //  5. key = Nickname.CompareKey(name), the case-insensitive form that is unique among the rooms.
 //
 // Both outputs are stable: normalizeRoomName(name) returns the same name and key.
+//
+// Not every emoji passes rule 3. Emoji that need U+FE0F or a ZWJ are refused by the profile: it disallows the
+// variation selector U+FE0F (the red heart is U+2764 U+FE0F, a keycap is a digit, U+FE0F, U+20E3) and lets the
+// zero-width joiner U+200D through only after a virama, so not between emoji (the profession and family sequences).
+// An emoji of one code point, one with a skin tone and a flag of two regional indicators pass. That is the profile
+// 03 §8 names, taken as it is; letting those emoji in would be a change to that rule.
 func normalizeRoomName(in string) (name, key, code string) {
 	if !utf8.ValidString(in) || strings.ContainsRune(in, utf8.RuneError) {
 		return "", "", api.FieldInvalid
