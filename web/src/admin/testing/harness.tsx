@@ -122,6 +122,15 @@ export function serve(path: `/api/${string}`, read: () => JsonBodyType): Sent[] 
   return on('get', path, () => HttpResponse.json(read()));
 }
 
+/** Where a handler waits (`await gate.opened`) until the test calls open(): a request that is on its way. */
+export function gate(): { readonly opened: Promise<void>; open(): void } {
+  let open = (): void => undefined;
+  const opened = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  return { opened, open };
+}
+
 /** A copy without one field: an invite whose creator was deleted, a user who was never seen. */
 export function without<T extends object, K extends keyof T>(value: T, key: K): Omit<T, K> {
   return Object.fromEntries(Object.entries(value).filter(([name]) => name !== key)) as Omit<T, K>;

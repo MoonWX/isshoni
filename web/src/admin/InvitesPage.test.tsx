@@ -8,6 +8,7 @@ import type { Invite } from '../protocol/api.gen';
 import { apiError, meFixture } from '../test/msw';
 import {
   dialog,
+  gate,
   invite,
   noContent,
   on,
@@ -59,6 +60,20 @@ async function openInvites({ invites = [invite()], member = false, registration 
     expect(gets.length).toBeGreaterThan(0);
   });
   return { state, gets, settingsGets, ...page };
+}
+
+/** The texts of a <select>'s options, in order. */
+function optionsOf(select: HTMLElement): (string | null)[] {
+  return within(select)
+    .getAllByRole('option')
+    .map((o) => o.textContent);
+}
+
+/** The admin's form once GET /api/v1/admin/settings has arrived: both selects show a value. */
+async function defaultsShown(): Promise<void> {
+  await waitFor(() => {
+    expect(screen.getByLabelText('Expires after')).not.toHaveValue('');
+  });
 }
 
 /** POST /api/v1/invites that adds the invite to the list and answers with its link. */
@@ -131,36 +146,69 @@ describe('InvitesPage', () => {
         expect(expires).toHaveValue('168');
       });
       expect(uses).toHaveValue('10');
-      expect(
-        within(expires)
-          .getAllByRole('option')
-          .map((o) => o.textContent),
-      ).toEqual(['1 hour', '1 day', '7 days', '30 days']);
-      expect(
-        within(uses)
-          .getAllByRole('option')
-          .map((o) => o.textContent),
-      ).toEqual(['1 time', '10 times', '50 times']);
+      expect(optionsOf(expires)).toEqual(['1 hour', '1 day', '7 days', '30 days']);
+      expect(optionsOf(uses)).toEqual(['1 time', '10 times', '50 times']);
     });
 
-    it("starts with the server's invite defaults when an admin changed them", async () => {
-      await openInvites({ settings: settingsResponse({ inviteDefaultTtlHours: 48, inviteDefaultMaxUses: 3 }) });
+    it("starts with the server's invite defaults when an admin changed them, and keeps them on offer", async () => {
+      const { user, state } = await openInvites({
+        settings: settingsResponse({ inviteDefaultTtlHours: 48, inviteDefaultMaxUses: 3 }),
+      });
       const expires = screen.getByLabelText('Expires after');
       await waitFor(() => {
         expect(expires).toHaveValue('48');
       });
-      expect(
-        within(expires)
-          .getAllByRole('option')
-          .map((o) => o.textContent),
-      ).toEqual(['1 hour', '1 day', '2 days', '7 days', '30 days']);
+      const expiryOptions = ['1 hour', '1 day', '2 days', '7 days', '30 days'];
+      expect(optionsOf(expires)).toEqual(expiryOptions);
       const uses = screen.getByLabelText('Can be used');
       expect(uses).toHaveValue('3');
-      expect(
-        within(uses)
-          .getAllByRole('option')
-          .map((o) => o.textContent),
-      ).toEqual(['1 time', '3 times', '10 times', '50 times']);
+      const usesOptions = ['1 time', '3 times', '10 times', '50 times'];
+      expect(optionsOf(uses)).toEqual(usesOptions);
+
+      // Picking something else doesn't take the server's default off the list: it can be picked again.
+      await user.selectOptions(expires, '30 days');
+      await user.selectOptions(uses, '50 times');
+      expect(optionsOf(expires)).toEqual(expiryOptions);
+      expect(optionsOf(uses)).toEqual(usesOptions);
+      await user.selectOptions(expires, '2 days');
+      await user.selectOptions(uses, '3 times');
+      expect(expires).toHaveValue('48');
+      expect(uses).toHaveValue('3');
+
+      // An admin's form sends what it shows.
+      const posted = createWorks(state);
+      await user.click(screen.getByRole('button', { name: 'Create link' }));
+      await screen.findByRole('region', { name: 'Invite link created' });
+      expect(posted.map((p) => p.body)).toEqual([{ expiresInHours: 48, maxUses: 3 }]);
+    });
+
+    it("leaves expiry and uses to the server for as long as the settings haven't arrived", async () => {
+      const settings = gate();
+      const invites = [invite()];
+      serve('/api/v1/invites', () => ({ invites }));
+      on('get', '/api/v1/admin/settings', async () => {
+        await settings.opened;
+        return HttpResponse.json(settingsResponse({ inviteDefaultTtlHours: 48, inviteDefaultMaxUses: 3 }));
+      });
+      const { user } = renderAdmin({ path: '/admin/invites' });
+      await screen.findByRole('row', { name: /^for Sam/ });
+      const expires = screen.getByLabelText('Expires after');
+      const uses = screen.getByLabelText('Can be used');
+      // The form doesn't know the defaults yet: it doesn't make any up.
+      expect(expires).toHaveDisplayValue('Server default');
+      expect(uses).toHaveDisplayValue('Server default');
+      const posted = createWorks({ invites });
+      await user.click(screen.getByRole('button', { name: 'Create link' }));
+      await screen.findByRole('region', { name: 'Invite link created' });
+      expect(posted.map((p) => p.body)).toEqual([{}]);
+
+      settings.open();
+      await waitFor(() => {
+        expect(expires).toHaveDisplayValue('2 days');
+      });
+      expect(uses).toHaveDisplayValue('3 times');
+      expect(optionsOf(expires)).not.toContain('Server default');
+      expect(optionsOf(uses)).not.toContain('Server default');
     });
 
     it('creates the invite and shows its link once', async () => {
@@ -193,6 +241,7 @@ describe('InvitesPage', () => {
 
     it('leaves the note out when there is none', async () => {
       const { user, state } = await openInvites();
+      await defaultsShown();
       const posted = createWorks(state);
       await user.click(screen.getByRole('button', { name: 'Create link' }));
       await screen.findByRole('region', { name: 'Invite link created' });
@@ -288,17 +337,47 @@ describe('InvitesPage', () => {
   });
 
   describe('for a member who may invite', () => {
-    it('shows their invites and the stock defaults, without asking for the settings', async () => {
+    it("shows their invites and leaves expiry and uses to the server's defaults, without asking for the settings", async () => {
       const { settingsGets, user, state } = await openInvites({ member: true });
       expect(await screen.findByRole('row', { name: /^for Sam/ })).toBeInTheDocument();
       expect(screen.getByText(/^Your invite links\./)).toBeInTheDocument();
-      expect(screen.getByLabelText('Expires after')).toHaveValue('168');
-      expect(screen.getByLabelText('Can be used')).toHaveValue('10');
+      // A member can't read the settings, so the form can't name the defaults: the server applies them.
+      const expires = screen.getByLabelText('Expires after');
+      const uses = screen.getByLabelText('Can be used');
+      expect(expires).toHaveDisplayValue('Server default');
+      expect(uses).toHaveDisplayValue('Server default');
+      expect(optionsOf(expires)).toEqual(['Server default', '1 hour', '1 day', '7 days', '30 days']);
+      expect(optionsOf(uses)).toEqual(['Server default', '1 time', '10 times', '50 times']);
       const posted = createWorks(state);
+      await user.type(screen.getByLabelText('Note'), 'for Kim');
       await user.click(screen.getByRole('button', { name: 'Create link' }));
       await screen.findByRole('region', { name: 'Invite link created' });
-      expect(posted.map((p) => p.body)).toEqual([{ expiresInHours: 168, maxUses: 10 }]);
+      expect(posted.map((p) => p.body)).toEqual([{ note: 'for Kim' }]);
       expect(settingsGets).toEqual([]);
+    });
+
+    it('sends what the member picked, and nothing again for a choice put back to the default', async () => {
+      const { user, state } = await openInvites({ member: true });
+      const expires = screen.getByLabelText('Expires after');
+      const uses = screen.getByLabelText('Can be used');
+      const posted = createWorks(state);
+      await user.selectOptions(expires, '1 day');
+      await user.selectOptions(uses, '50 times');
+      // "Server default" stays on offer.
+      expect(optionsOf(expires)).toEqual(['Server default', '1 hour', '1 day', '7 days', '30 days']);
+      const submit = screen.getByRole('button', { name: 'Create link' });
+      await user.click(submit);
+      await screen.findByRole('region', { name: 'Invite link created' });
+      // The form takes the next submit once this one is through.
+      await waitFor(() => {
+        expect(submit).not.toHaveAttribute('aria-busy');
+      });
+      await user.selectOptions(uses, 'Server default');
+      await user.click(submit);
+      await waitFor(() => {
+        expect(posted).toHaveLength(2);
+      });
+      expect(posted.map((p) => p.body)).toEqual([{ expiresInHours: 24, maxUses: 50 }, { expiresInHours: 24 }]);
     });
 
     it('says that links are dead while registration is closed, without the way to Settings', async () => {

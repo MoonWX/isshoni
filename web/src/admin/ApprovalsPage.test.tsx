@@ -78,8 +78,34 @@ describe('ApprovalsPage', () => {
       expect.objectContaining({ url: '/api/v1/admin/approvals/b0b0b0b0b0b0/reject', body: {} }),
     ]);
     expect(toasts(services)).toEqual(["bo's request was rejected."]);
-    // The last row left: the one that is last now gets the focus.
-    expect(screen.getByRole('button', { name: 'Approve kim' })).toHaveFocus();
+    // The last row left: the one that is last now gets the focus, on the same button.
+    expect(screen.getByRole('button', { name: 'Reject kim' })).toHaveFocus();
+  });
+
+  it('works through the queue from the keyboard without ever landing on Approve', async () => {
+    const { user, state } = await openApprovals();
+    const rejected = on('post', '/api/v1/admin/approvals/:id/reject', ({ params }) => {
+      state.pending = state.pending.filter((p) => p.id !== params['id']);
+      return noContent();
+    });
+    const approved = on('post', '/api/v1/admin/approvals/:id/approve', () => HttpResponse.json({ user: {} }));
+    screen.getByRole('button', { name: 'Reject sam_k' }).focus();
+    await user.keyboard('{Enter}');
+    await waitFor(() => {
+      expect(screen.queryByRole('row', { name: /^sam_k/ })).not.toBeInTheDocument();
+    });
+    // kim moved up; Enter again answers kim the same way.
+    expect(screen.getByRole('button', { name: 'Reject kim' })).toHaveFocus();
+    await user.keyboard('{Enter}');
+    await waitFor(() => {
+      expect(screen.queryByRole('row', { name: /^kim/ })).not.toBeInTheDocument();
+    });
+    expect(screen.getByRole('button', { name: 'Reject bo' })).toHaveFocus();
+    expect(rejected.map((r) => r.url)).toEqual([
+      '/api/v1/admin/approvals/p1p2p3p4p5p6/reject',
+      '/api/v1/admin/approvals/k1k1k1k1k1k1/reject',
+    ]);
+    expect(approved).toEqual([]);
   });
 
   it('moves focus to the heading when the last sign-up is answered', async () => {

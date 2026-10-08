@@ -37,15 +37,24 @@ import { When } from './When';
 export const EXPIRY_CHOICES: readonly number[] = [1, 24, 168, 720];
 /** The use-count choices of 05 §15.3. */
 export const USES_CHOICES: readonly number[] = [1, 10, 50];
-/** What the form starts with when the server's defaults aren't known (a member's view): 03 §9's defaults. */
-const STOCK_EXPIRY_HOURS = 168;
-const STOCK_MAX_USES = 10;
 /** An invite's note holds at most 64 characters (03 §5). */
 export const NOTE_MAX_LENGTH = 64;
+/** The value of the <option> that leaves a choice to the server. */
+const SERVER_DEFAULT = '';
 
-/** The choices, with the value in force added when it isn't one of them (an admin set another default). */
-function withChoice(choices: readonly number[], value: number): number[] {
-  return choices.includes(value) ? [...choices] : [...choices, value].sort((a, b) => a - b);
+/**
+ * The choices, with the server's default and the value in force added when they aren't among them (an admin set
+ * another default). Each stays listed whatever is selected, so it can be picked again.
+ */
+function withChoices(choices: readonly number[], ...values: readonly (number | null | undefined)[]): number[] {
+  const all = new Set(choices);
+  for (const value of values) if (typeof value === 'number') all.add(value);
+  return [...all].sort((a, b) => a - b);
+}
+
+/** A <select>'s value as a choice: null for "Server default". */
+function choiceOf(value: string): number | null {
+  return value === SERVER_DEFAULT ? null : Number(value);
 }
 
 /** "1 hour", "7 days": whole days as days, anything else as hours. */
@@ -79,8 +88,9 @@ function stateLabel(state: string, t: TFunction): string {
 }
 
 interface CreateValues {
-  expiresInHours: number;
-  maxUses: number;
+  /** null: left to the server. */
+  expiresInHours: number | null;
+  maxUses: number | null;
   note: string;
 }
 
@@ -90,6 +100,11 @@ interface CreateValues {
  *
  * The link shows once, right after creation: the server keeps only its hash. The list asks for every state
  * (?state=all) and hides the invites that no longer work unless the box is ticked.
+ *
+ * A new invite starts with the server's defaults for expiry and uses (the settings of 03 §9). An admin's form reads
+ * them from the settings and shows them as values. A member can't read the settings: their form says "Server
+ * default" and leaves the field out of the request, and the server applies its setting (03 §7.9). The same goes
+ * for an admin for as long as the settings haven't arrived.
  */
 export function InvitesPage() {
   const { t, i18n } = useTranslation();
@@ -98,11 +113,12 @@ export function InvitesPage() {
   const admin = me ? isAdmin(me) : false;
   const info = useInfo().data;
   const invites = useQuery(invitesQueryOptions());
-  // The invite defaults are settings (03 §9), which only admins can read; a member's form starts with the stock ones.
+  // The invite defaults are settings (03 §9), which only admins can read.
   const settings = useQuery({ ...settingsQueryOptions(), enabled: admin }).data?.settings;
 
-  /** What the admin picked; a choice left alone follows the server's default. */
-  const [picked, setPicked] = useState<{ expiresInHours?: number; maxUses?: number }>({});
+  /** What was picked; null for a choice left alone, which follows the server's default. */
+  const [pickedExpiry, setPickedExpiry] = useState<number | null>(null);
+  const [pickedUses, setPickedUses] = useState<number | null>(null);
   const [note, setNote] = useState('');
   const [created, setCreated] = useState<CreateInviteResponse | null>(null);
   const [showInactive, setShowInactive] = useState(false);
@@ -111,17 +127,24 @@ export function InvitesPage() {
   const buttonGone = useHeadingFocusAfter(revoking !== null);
   const showInactiveId = useId();
 
-  const expiresInHours = picked.expiresInHours ?? settings?.inviteDefaultTtlHours ?? STOCK_EXPIRY_HOURS;
-  const maxUses = picked.maxUses ?? settings?.inviteDefaultMaxUses ?? STOCK_MAX_USES;
+  // The server's defaults; undefined while this form doesn't know them.
+  const defaultExpiry = settings?.inviteDefaultTtlHours;
+  const defaultUses = settings?.inviteDefaultMaxUses;
+  // What the form shows and sends; null is "Server default": nothing picked, and the default's number not known.
+  const expiresInHours = pickedExpiry ?? defaultExpiry ?? null;
+  const maxUses = pickedUses ?? defaultUses ?? null;
+  const expiryChoices = withChoices(EXPIRY_CHOICES, defaultExpiry, expiresInHours);
+  const usesChoices = withChoices(USES_CHOICES, defaultUses, maxUses);
 
   const create = useAction<CreateValues, CreateInviteResponse, 'note' | 'expiresInHours' | 'maxUses'>({
     fields: ['note', 'expiresInHours', 'maxUses'],
     validate: (v) => fieldCodes({ note: runeLength(v.note.trim()) > NOTE_MAX_LENGTH ? FieldTooLong : null }),
     request: (v) => {
       const trimmed = v.note.trim();
+      // Every field is optional (03 §12.4.5): one that is left out gets the setting's default.
       const body: CreateInviteRequest = {
-        expiresInHours: v.expiresInHours,
-        maxUses: v.maxUses,
+        ...(v.expiresInHours !== null ? { expiresInHours: v.expiresInHours } : {}),
+        ...(v.maxUses !== null ? { maxUses: v.maxUses } : {}),
         ...(trimmed !== '' ? { note: trimmed } : {}),
       };
       return adminApi.createInvite(body);
@@ -191,12 +214,15 @@ export function InvitesPage() {
                 {...control}
                 className={inputClass}
                 name="expiresInHours"
-                value={expiresInHours}
+                value={expiresInHours ?? SERVER_DEFAULT}
                 onChange={(e) => {
-                  setPicked({ ...picked, expiresInHours: Number(e.target.value) });
+                  setPickedExpiry(choiceOf(e.target.value));
                 }}
               >
-                {withChoice(EXPIRY_CHOICES, expiresInHours).map((hours) => (
+                {defaultExpiry === undefined && (
+                  <option value={SERVER_DEFAULT}>{t('admin.invites.create.serverDefault')}</option>
+                )}
+                {expiryChoices.map((hours) => (
                   <option key={hours} value={hours}>
                     {expiryLabel(hours, t)}
                   </option>
@@ -210,12 +236,15 @@ export function InvitesPage() {
                 {...control}
                 className={inputClass}
                 name="maxUses"
-                value={maxUses}
+                value={maxUses ?? SERVER_DEFAULT}
                 onChange={(e) => {
-                  setPicked({ ...picked, maxUses: Number(e.target.value) });
+                  setPickedUses(choiceOf(e.target.value));
                 }}
               >
-                {withChoice(USES_CHOICES, maxUses).map((uses) => (
+                {defaultUses === undefined && (
+                  <option value={SERVER_DEFAULT}>{t('admin.invites.create.serverDefault')}</option>
+                )}
+                {usesChoices.map((uses) => (
                   <option key={uses} value={uses}>
                     {t('admin.invites.create.times', { count: uses })}
                   </option>

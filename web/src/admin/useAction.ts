@@ -64,6 +64,10 @@ export function useAction<V, R, F extends string = never>(opts: ActionOptions<F,
   const mutation = useMutation({
     // The values (the admin's password among them) are not kept after the form unmounts.
     gcTime: 0,
+    // Sent at once, also when the browser says it is offline: the request then fails and the form says so. The
+    // default would hold it back until the connection returns, with a spinner (and an ActionDialog that can't be
+    // left) for as long as that takes, and then make the change long after it was asked for.
+    networkMode: 'always',
     mutationFn: async (values: V) => {
       await opts.onSuccess(await opts.request(values), values);
     },

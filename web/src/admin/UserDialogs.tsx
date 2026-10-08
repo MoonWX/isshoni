@@ -4,8 +4,8 @@
 // The rules they follow:
 // - making someone an admin asks for the acting admin's password (currentPassword), so a stolen admin cookie alone
 //   can't mint a second admin; wrong_password shows under the field;
-// - a reset link for an admin asks for it too (the link would hand over that admin account). The link is shown
-//   once, in the dialog;
+// - a reset link for an admin asks for it too (the link would hand over that admin account), also when the server
+//   is the first to say that the target is an admin. The link is shown once, in the dialog;
 // - last_admin, self_action_forbidden and the rest show above the buttons, from errors.<code>.
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -26,6 +26,7 @@ import {
   type PasswordResetRequest,
   type ResetLink,
 } from '../protocol/api.gen';
+import { isApiError } from '../protocol/rest';
 import { TopicAdminUsers, TopicMe } from '../protocol/types.gen';
 import { Button } from '../ui/Button';
 import { Dialog } from '../ui/Dialog';
@@ -262,18 +263,23 @@ export function DeleteUserDialog({ user, self, onClose, onRowGone }: UserDialogP
 /**
  * "Create reset link" (03 §7.10): the question first, with the admin's password when the target is an admin, then
  * the link, once. Closing the dialog forgets it.
+ *
+ * Whether the target is an admin comes from the row, which may be behind: someone made them an admin since the
+ * list loaded. The server then answers wrong_password to a request without one, and the dialog asks for the
+ * password after all.
  */
 export function ResetLinkDialog({ user, onClose }: UserDialogProps) {
   const { t, i18n } = useTranslation();
   const { queryClient } = useApp();
-  const targetIsAdmin = user.role === RoleAdmin;
+  const rowSaysAdmin = user.role === RoleAdmin;
+  const [needsPassword, setNeedsPassword] = useState(rowSaysAdmin);
   const [password, setPassword] = useState('');
   const [link, setLink] = useState<ResetLink | null>(null);
   const action = useAction({
     fields: ['currentPassword'],
-    validate: (v: string) => fieldCodes({ currentPassword: targetIsAdmin && v === '' ? FieldRequired : null }),
+    validate: (v: string) => fieldCodes({ currentPassword: needsPassword && v === '' ? FieldRequired : null }),
     request: (v) => {
-      const body: PasswordResetRequest = targetIsAdmin ? { currentPassword: v } : {};
+      const body: PasswordResetRequest = needsPassword ? { currentPassword: v } : {};
       return adminApi.resetPassword(user.id, body);
     },
     onSuccess: (res) => {
@@ -282,7 +288,22 @@ export function ResetLinkDialog({ user, onClose }: UserDialogProps) {
       setLink(res);
     },
     codeFields: { [CodeWrongPassword]: 'currentPassword' },
+    onError: (err) => {
+      if (needsPassword || !isApiError(err, CodeWrongPassword)) return;
+      // No password was sent, so none was wrong: the target is an admin by now. Show the field instead of a
+      // message for a field that isn't there, and fetch the list that turned out to be behind.
+      setNeedsPassword(true);
+      action.clear('currentPassword');
+      refresh(queryClient, TopicAdminUsers);
+    },
   });
+
+  // A password field that shows up late gets the focus, like one that was there when the dialog opened.
+  const { formRef } = action;
+  const askedLate = needsPassword && !rowSaysAdmin;
+  useEffect(() => {
+    if (askedLate) formRef.current?.querySelector('input')?.focus();
+  }, [askedLate, formRef]);
 
   // The link is why the dialog is open: focus goes to it, selected, ready to copy.
   const linkBox = useRef<HTMLDivElement>(null);
@@ -336,7 +357,7 @@ export function ResetLinkDialog({ user, onClose }: UserDialogProps) {
       submitLabel={t('admin.users.reset.submit')}
     >
       <DialogText>{t('admin.users.reset.body', { username: user.username })}</DialogText>
-      {targetIsAdmin && (
+      {needsPassword && (
         <>
           <DialogText>{t('admin.users.reset.bodyAdmin', { username: user.username })}</DialogText>
           <YourPassword value={password} onChange={setPassword} error={action.fieldErrors.currentPassword} />

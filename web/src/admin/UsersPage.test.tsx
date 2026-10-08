@@ -1,5 +1,6 @@
 // /admin/users (05 §15.3) against MSW: the list, each row action with the request it sends (03 §12.4.8), what the
 // own row leaves out, and the error codes of 03 §12.3 #30–#33.
+import { onlineManager } from '@tanstack/react-query';
 import { fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { HttpResponse } from 'msw';
 import { describe, expect, it, vi } from 'vitest';
@@ -9,6 +10,7 @@ import { apiError } from '../test/msw';
 import {
   adminUser,
   dialog,
+  gate,
   networkError,
   noContent,
   on,
@@ -23,6 +25,8 @@ import {
 } from './testing/harness';
 
 const SAM = 'b8f2n4r6t0vz';
+/** A reset link as POST …/password-reset answers it. */
+const LINK = 'https://watch.example.com/reset#EXAMPLEresetTOKEN0123456789abcdef';
 
 /** GET /api/v1/admin/users over a list the test changes. */
 function usersApi(initial: AdminUser[] = [selfUser(), adminUser()]) {
@@ -338,8 +342,6 @@ describe('UsersPage', () => {
   });
 
   describe('reset link', () => {
-    const LINK = 'https://watch.example.com/reset#EXAMPLEresetTOKEN0123456789abcdef';
-
     it('creates the link for a member without a password, and shows it once', async () => {
       const { user, gets } = await openUsers();
       const posted = on('post', '/api/v1/admin/users/:id/password-reset', () =>
@@ -424,6 +426,130 @@ describe('UsersPage', () => {
       await user.click(ask.getByRole('button', { name: 'Create link' }));
       expect(await screen.findByRole('dialog', { name: 'Reset link for sam' })).toBeInTheDocument();
       expect(posted.map((p) => p.body)).toEqual([{ currentPassword: 'nope' }, { currentPassword: 'correct horse' }]);
+    });
+
+    it('asks for the password after all when the user became an admin since the list loaded', async () => {
+      const { user, state, gets } = await openUsers();
+      const posted = on('post', '/api/v1/admin/users/:id/password-reset', ({ body }) =>
+        (body as { currentPassword?: string }).currentPassword === 'correct horse'
+          ? HttpResponse.json({ url: LINK, expiresAt: '2026-10-04T12:00:00.000Z' }, { status: 201 })
+          : apiError(403, { code: 'wrong_password' }),
+      );
+      // Another admin made sam an admin; this page still shows a member.
+      state.users = [selfUser(), adminUser({ role: 'admin' })];
+      await pickAction(user, 'sam', 'Create reset link');
+      const ask = within(dialog('Create a reset link for sam?'));
+      expect(ask.queryByLabelText('Your password')).not.toBeInTheDocument();
+      const listed = gets.length;
+      await user.click(ask.getByRole('button', { name: 'Create link' }));
+
+      // The server wants the password: the field shows up with the reason, focused, and without an error (no
+      // password was sent, so none was wrong).
+      const password = await ask.findByLabelText('Your password');
+      expect(ask.getByText('sam is an admin, so enter your password to confirm.')).toBeInTheDocument();
+      expect(password).toHaveFocus();
+      expect(password).not.toHaveAttribute('aria-invalid', 'true');
+      expect(password).not.toHaveAccessibleDescription();
+      expect(ask.queryByRole('alert')).not.toBeInTheDocument();
+      // The list that was behind is asked for again.
+      await waitFor(() => {
+        expect(gets.length).toBeGreaterThan(listed);
+      });
+      await waitFor(() => {
+        expect(within(rowOf(/^sam/)).getByText('Admin')).toBeInTheDocument();
+      });
+
+      // From here on it is the dialog for an admin: the password is required, and a wrong one shows under it.
+      await user.click(ask.getByRole('button', { name: 'Create link' }));
+      expect(password).toHaveAccessibleDescription("This can't be empty.");
+      await user.type(password, 'nope');
+      await user.click(ask.getByRole('button', { name: 'Create link' }));
+      await waitFor(() => {
+        expect(password).toHaveAccessibleDescription("Your current password isn't right.");
+      });
+      await typeInto(user, password, 'correct horse');
+      await user.click(ask.getByRole('button', { name: 'Create link' }));
+      expect(await screen.findByRole('dialog', { name: 'Reset link for sam' })).toBeInTheDocument();
+      expect(posted.map((p) => p.body)).toEqual([
+        {},
+        { currentPassword: 'nope' },
+        { currentPassword: 'correct horse' },
+      ]);
+    });
+  });
+
+  describe('while a change is on its way', () => {
+    it("can't be left: no Cancel, no Close, no Esc, and the reset link still shows when the answer arrives", async () => {
+      const { user } = await openUsers();
+      const answer = gate();
+      const posted = on('post', '/api/v1/admin/users/:id/password-reset', async () => {
+        await answer.opened;
+        return HttpResponse.json({ url: LINK, expiresAt: '2026-10-04T12:00:00.000Z' }, { status: 201 });
+      });
+      await pickAction(user, 'sam', 'Create reset link');
+      const box = dialog('Create a reset link for sam?');
+      const ask = within(box);
+      expect(ask.getByRole('button', { name: 'Cancel' })).toBeEnabled();
+      expect(ask.getByRole('button', { name: 'Close' })).toBeInTheDocument();
+      await user.click(ask.getByRole('button', { name: 'Create link' }));
+      await waitFor(() => {
+        expect(posted).toHaveLength(1);
+      });
+
+      // The server has already cleared sam's password: the link must not get lost.
+      await waitFor(() => {
+        expect(ask.getByRole('button', { name: 'Cancel' })).toBeDisabled();
+      });
+      expect(ask.getByRole('button', { name: 'Create link' })).toHaveAttribute('aria-busy', 'true');
+      expect(ask.queryByRole('button', { name: 'Close' })).not.toBeInTheDocument();
+      // What the browser sends a <dialog> for Esc.
+      fireEvent(box, new Event('cancel', { cancelable: true }));
+      // A click beside the dialog (on its backdrop) arrives at the <dialog> element itself.
+      fireEvent.click(box);
+      expect(box).toBeInTheDocument();
+
+      answer.open();
+      const shown = within(await screen.findByRole('dialog', { name: 'Reset link for sam' }));
+      expect(shown.getByLabelText('Reset link')).toHaveValue(LINK);
+    });
+
+    it('lets go again when the change failed', async () => {
+      const { user } = await openUsers();
+      const answer = gate();
+      on('patch', '/api/v1/admin/users/:id', async () => {
+        await answer.opened;
+        return apiError(409, { code: 'last_admin' });
+      });
+      await pickAction(user, 'sam', 'Disable');
+      const box = within(dialog('Disable sam?'));
+      await user.click(box.getByRole('button', { name: 'Disable' }));
+      await waitFor(() => {
+        expect(box.getByRole('button', { name: 'Cancel' })).toBeDisabled();
+      });
+      answer.open();
+      expect(await box.findByRole('alert')).toHaveTextContent('The server needs at least one active admin.');
+      expect(await box.findByRole('button', { name: 'Close' })).toBeInTheDocument();
+      await user.click(box.getByRole('button', { name: 'Cancel' }));
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
+
+    it('sends the change at once while the browser says it is offline, and says why it failed', async () => {
+      const { user } = await openUsers();
+      const patched = on('patch', '/api/v1/admin/users/:id', networkError);
+      onlineManager.setOnline(false);
+      try {
+        await pickAction(user, 'sam', 'Disable');
+        const box = within(dialog('Disable sam?'));
+        await user.click(box.getByRole('button', { name: 'Disable' }));
+        // Not held back until the connection returns, with a dialog that can't be left meanwhile.
+        expect(await box.findByRole('alert')).toHaveTextContent("You're offline.");
+        expect(patched).toHaveLength(1);
+        await waitFor(() => {
+          expect(box.getByRole('button', { name: 'Cancel' })).toBeEnabled();
+        });
+      } finally {
+        onlineManager.setOnline(true);
+      }
     });
   });
 
