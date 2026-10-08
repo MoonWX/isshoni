@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/MoonWX/isshoni/internal/server/config"
 	"github.com/MoonWX/isshoni/internal/server/httpapi"
 	"github.com/MoonWX/isshoni/web"
 )
@@ -25,11 +26,11 @@ const (
 	maxHeaderBytes    = 16 << 10
 )
 
-// newMainServer builds the main http.Server (04 §9.1) around the router's handler: HTTP/1.1, and HTTP/2 once the
-// listener speaks TLS (README S44; a plain-HTTP listener never negotiates it). net/http's own error lines (a failed
-// handshake, a broken connection: scanners make them constant) go to the log at debug level, so they show only
-// with log.level = "debug". pending follows the server's connections until their first request header is in, so
-// that the shutdown can close the ones that never sent it.
+// newMainServer builds the main http.Server (04 §9.1) around the router's handler: HTTP/1.1, and HTTP/2 where the
+// listener speaks TLS (behind the 443 multiplexer; a plain-HTTP listener never negotiates it, so off mode stays on
+// HTTP/1.1). net/http's own error lines (a failed handshake, a broken connection: scanners make them constant) go
+// to the log at debug level, so they show only with log.level = "debug". pending follows the server's connections
+// until their first request header is in, so that the shutdown can close the ones that never sent it.
 func newMainServer(h http.Handler, log *slog.Logger, pending *pendingConns) *http.Server {
 	var protocols http.Protocols
 	protocols.SetHTTP1(true)
@@ -132,23 +133,31 @@ func (s *Server) newRouter() *httpapi.Router {
 	return rt
 }
 
-// listenHTTP binds the TCP listener of listen.http. Its errors are for the operator (04 §6.1 step 6): a busy port
-// names the port and the two ways out. They are runtime errors (exit 1), not refusals: stopping the other program
-// and restarting helps.
-func listenHTTP(ctx context.Context, addr string) (net.Listener, error) {
+// listenHTTP binds the TCP listener of listen.http: the app itself in off mode, the plain-HTTP port of 04 §8.3 in
+// the other modes. Its errors are for the operator (04 §6.1 step 6): a busy port names the port and the ways out.
+// They are runtime errors (exit 1), not refusals: stopping the other program and restarting helps.
+func listenHTTP(ctx context.Context, addr string, mode config.TLSMode) (net.Listener, error) {
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", addr)
 	if err == nil {
 		return ln, nil
 	}
 	_, port, _ := net.SplitHostPort(addr)
+	off := mode == config.TLSOff
 	switch {
-	case errors.Is(err, syscall.EADDRINUSE):
+	case errors.Is(err, syscall.EADDRINUSE) && off:
 		return nil, fmt.Errorf("port %s is in use (another isshoni, or another web server?). Stop it, or change "+
 			"listen.http (now %q): %w", port, addr, err)
-	case errors.Is(err, fs.ErrPermission):
+	case errors.Is(err, syscall.EADDRINUSE):
+		return nil, fmt.Errorf("port %s is in use (another web server?). isshoni answers certificate challenges there "+
+			`and redirects to HTTPS. Stop the other program, or run isshoni behind it with tls.mode = "off" (listen.http `+
+			"is %q): %w", port, addr, err)
+	case errors.Is(err, fs.ErrPermission) && off:
 		return nil, fmt.Errorf("isshoni may not listen on listen.http = %q (a port below 1024 needs "+
 			`CAP_NET_BIND_SERVICE). With tls.mode = "off" use a high port such as "127.0.0.1:8080": %w`, addr, err)
+	case errors.Is(err, fs.ErrPermission):
+		return nil, fmt.Errorf("isshoni may not listen on listen.http = %q (a port below 1024 needs "+
+			"CAP_NET_BIND_SERVICE, which the systemd unit and the container image grant): %w", addr, err)
 	default:
 		return nil, fmt.Errorf("server: listen on listen.http = %q: %w", addr, err)
 	}

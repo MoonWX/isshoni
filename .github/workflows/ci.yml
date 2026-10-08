@@ -64,6 +64,7 @@ jobs:
       run-licenses: ${{ steps.plan.outputs.run-licenses }}
       run-build: ${{ steps.plan.outputs.run-build }}
       run-lint-deploy: ${{ steps.plan.outputs.run-lint-deploy }}
+      run-acme: ${{ steps.plan.outputs.run-acme }}
       run-govulncheck: ${{ steps.plan.outputs.run-govulncheck }}
       # Task's pin from .tool-versions (06 §7.1). Go comes from go.mod, Node from .tool-versions.
       task-version: ${{ steps.plan.outputs.task-version }}
@@ -87,6 +88,7 @@ jobs:
               - 'go.sum'
               - 'tools/**'
               - 'internal/protocol/testdata/**'
+              - 'internal/server/tlsmgr/testdata/**'
               - '.golangci.yml'
               - 'tygo.yaml'
             web:
@@ -136,6 +138,8 @@ jobs:
           if [ "$go" = true ] || [ "$web" = true ]; then go_or_web=true; fi
           go_web_or_site=$go_or_web
           if [ "$site" = true ]; then go_web_or_site=true; fi
+          go_or_deploy=false
+          if [ "$go" = true ] || [ "$deploy" = true ]; then go_or_deploy=true; fi
           {
             echo "go=$go"
             echo "web=$web"
@@ -185,6 +189,9 @@ jobs:
             web/scripts/licenses.mjs web/package.json web/package-lock.json
           decide build true Taskfile.yml .tool-versions cmd/isshoni web/package.json web/package-lock.json
           decide lint-deploy "$deploy" Taskfile.yml .tool-versions
+          # The job's own inputs count too: Pebble's config (the go filter's tlsmgr/testdata
+          # pattern) and this workflow, which pins the two images (the deploy filter).
+          decide acme "$go_or_deploy" go.mod internal/server/tlsmgr/testdata/pebble-config.json
           decide govulncheck "$go" Taskfile.yml .tool-versions tools/go.mod
 
           task_version=''
@@ -633,6 +640,91 @@ jobs:
       - name: task lint:sh lint:actions lint:keys lint:unit lint:pins test:sh
         run: task lint:sh lint:actions lint:keys lint:unit lint:pins test:sh
 
+  acme:
+    # The ACME tests of docs/m1/04-server-platform.md §17: the TLS manager, and `isshoni serve`
+    # in auto mode, against Pebble with pebble-challtestsrv as its DNS. Pebble issues for a
+    # domain and for an IP address (the shortlived profile), through http-01 and through
+    # tls-alpn-01, and a certificate with a shortened lifetime is renewed.
+    #
+    # Pebble validates on 127.0.0.1:5002 (http-01) and 127.0.0.1:5001 (tls-alpn-01), the two
+    # ports of internal/server/tlsmgr/testdata/pebble-config.json, where the tests listen. So
+    # the two containers share the runner's network (--network host) and are started by a
+    # step: a service container gets a network of its own and takes no arguments.
+    needs: changes
+    if: needs.changes.outputs.run-acme == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      # Pebble v2.10.1, both images by the digest of their multi-arch index.
+      PEBBLE_IMAGE: ghcr.io/letsencrypt/pebble@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199
+      CHALLTESTSRV_IMAGE: ghcr.io/letsencrypt/pebble-challtestsrv@sha256:12ce21884def456bcf9786542113949e1f19dc7738d2c70e156c2d0c38a1405b
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # one cache per job below: setup-go's key is shared by every job
+
+      - name: Cache Go modules and builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum', '.tool-versions') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+
+      - name: Start Pebble and pebble-challtestsrv
+        run: |
+          # challtestsrv is Pebble's DNS only: every name resolves to 127.0.0.1, and its own
+          # challenge servers stay off, because the tests answer the challenges themselves.
+          docker run -d --name challtestsrv --network host "$CHALLTESTSRV_IMAGE" \
+            -defaultIPv4 127.0.0.1 -defaultIPv6 "" -http01 "" -https01 "" -tlsalpn01 "" -doh ""
+          # No random waits before a validation and no rejected nonces: the tests are about
+          # isshoni, not about a client's patience.
+          docker run -d --name pebble --network host \
+            -e PEBBLE_VA_NOSLEEP=1 -e PEBBLE_WFE_NONCEREJECT=0 \
+            -v "$PWD/internal/server/tlsmgr/testdata/pebble-config.json:/test/config/isshoni.json:ro" \
+            "$PEBBLE_IMAGE" -config /test/config/isshoni.json -dnsserver 127.0.0.1:8053
+          # The CA behind Pebble's own HTTPS endpoints (tls.acme_ca_root).
+          docker cp pebble:/test/certs/pebble.minica.pem "$RUNNER_TEMP/pebble.minica.pem"
+          for _ in $(seq 1 60); do
+            if curl -fsS --cacert "$RUNNER_TEMP/pebble.minica.pem" -o /dev/null https://127.0.0.1:14000/dir; then
+              echo "Pebble is up"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "::error::Pebble did not answer on https://127.0.0.1:14000/dir within 30 s"
+          exit 1
+
+      - name: go test -run ACME (the TLS manager, then the server)
+        env:
+          # The env names of the config keys tls.acme_ca and tls.acme_ca_root; the ACME tests
+          # run when both are set and are skipped otherwise.
+          ISSHONI_TLS_ACME_CA: https://127.0.0.1:14000/dir
+          ISSHONI_TLS_ACME_CA_ROOT: ${{ runner.temp }}/pebble.minica.pem
+        run: |
+          # -p 1: both packages listen on Pebble's two validation ports.
+          go test -race -count=1 -p 1 -run ACME -v ./internal/server/tlsmgr ./internal/server 2>&1 |
+            tee "$RUNNER_TEMP/acme.log"
+          # A skipped ACME test would leave this job green without having tested anything.
+          if grep -E '^[[:space:]]*--- SKIP' "$RUNNER_TEMP/acme.log"; then
+            echo "::error::an ACME test was skipped; this job exists to run them"
+            exit 1
+          fi
+
+      - name: Show the logs of Pebble and pebble-challtestsrv
+        if: failure()
+        run: |
+          docker logs pebble || true
+          docker logs challtestsrv || true
+
   govulncheck:
     needs: changes
     if: needs.changes.outputs.run-govulncheck == 'true'
@@ -685,7 +777,7 @@ jobs:
     # The only required check (06 §8.6). It fails when a gating job failed or was cancelled;
     # a skipped job counts as a pass. always(), so it also reports when a job it needs failed.
     if: always()
-    needs: [changes, lint-go, test-go, web, protocol, licenses, build, lint-deploy]
+    needs: [changes, lint-go, test-go, web, protocol, licenses, build, lint-deploy, acme]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     permissions: {}

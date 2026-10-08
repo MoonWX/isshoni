@@ -1162,25 +1162,46 @@ func TestNewRejects(t *testing.T) {
 		}
 	})
 
-	t.Run("TLS modes", func(t *testing.T) {
-		for mode, flags := range map[config.TLSMode][]string{
-			config.TLSAuto:   {"--tls.mode=auto", "--domain=watch.example.com"},
-			config.TLSIP:     {"--tls.mode=ip", "--public-ip=8.8.8.8"}, // a public address, as config's tests use
-			config.TLSManual: {"--tls.mode=manual", "--domain=watch.example.com", "--tls.cert-file=/etc/isshoni/cert.pem", "--tls.key-file=/etc/isshoni/key.pem"},
+	t.Run("a TLS mode without what it needs", func(t *testing.T) {
+		for name, flags := range map[string][]string{
+			"auto without a domain":   {"--tls.mode=auto"},
+			"manual without files":    {"--tls.mode=manual", "--domain=watch.example.com"},
+			"ip on a private address": {"--tls.mode=ip", "--public-ip=192.168.1.20"},
 		} {
-			cfg := testConfig(t, flags...)
-			if got := cfg.EffectiveTLSMode(); got != mode {
-				t.Fatalf("flags %v give tls mode %q, want %q", flags, got, mode)
-			}
-			_, err := server.New(cfg, discardLog(), server.Deps{})
-			if err == nil || !strings.Contains(err.Error(), `tls.mode "`+string(mode)+`"`) || !strings.Contains(err.Error(), `tls.mode = "off"`) {
-				t.Errorf("New with tls.mode %q = %v, want a not-implemented error that names the mode and the way out", mode, err)
-			}
-			if !server.NeedsOperator(err) {
-				t.Errorf("tls.mode %q: a restart can't fix a missing TLS manager, yet NeedsOperator is false", mode)
+			_, err := server.New(testConfig(t, flags...), discardLog(), server.Deps{})
+			var ve *config.ValidationError
+			if !errors.As(err, &ve) || !server.NeedsOperator(err) {
+				t.Errorf("%s: New = %v, want a *config.ValidationError that needs the operator", name, err)
 			}
 		}
 	})
+}
+
+// TestNewAcceptsEveryTLSMode: New builds a server for each mode of 04 §8.1, and opens nothing for it: no listener,
+// no certificate file, no ACME order.
+func TestNewAcceptsEveryTLSMode(t *testing.T) {
+	for mode, flags := range map[config.TLSMode][]string{
+		config.TLSOff:    nil,
+		config.TLSAuto:   {"--tls.mode=auto", "--domain=watch.example.com"},
+		config.TLSIP:     {"--tls.mode=ip", "--public-ip=8.8.8.8"}, // a public address, as config's tests use
+		config.TLSManual: {"--tls.mode=manual", "--domain=watch.example.com", "--tls.cert-file=/nowhere/cert.pem", "--tls.key-file=/nowhere/key.pem"},
+	} {
+		cfg := testConfig(t, flags...)
+		if got := cfg.EffectiveTLSMode(); got != mode {
+			t.Fatalf("flags %v give tls mode %q, want %q", flags, got, mode)
+		}
+		s, err := server.New(cfg, discardLog(), server.Deps{})
+		if err != nil {
+			t.Errorf("New with tls.mode %q = %v", mode, err)
+			continue
+		}
+		if a := s.Addrs(); a.HTTP != nil || a.HTTPS != nil {
+			t.Errorf("tls.mode %q: New bound %+v", mode, a)
+		}
+		if _, err := os.Stat(cfg.DataDir); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("tls.mode %q: New touched the data directory (%v)", mode, err)
+		}
+	}
 }
 
 func TestNeedsOperator(t *testing.T) {
