@@ -115,6 +115,9 @@ func (f *fakePush) SendTest(context.Context, []store.PushSubscription) error { r
 type fakeSignal struct {
 	mu    sync.Mutex
 	calls []string
+	// notes are the Notify calls again, each with its target: "admins [admin.invites]", "user <id> [devices]",
+	// "all [me]" (takeNotes).
+	notes []string
 }
 
 func (f *fakeSignal) record(call string) {
@@ -137,8 +140,33 @@ func (f *fakeSignal) UserChanged(id store.UserID, _ string, _ bool) {
 	f.record("user_changed " + string(id))
 }
 
-func (f *fakeSignal) Notify(_ NotifyTarget, topics ...protocol.Topic) {
+func (f *fakeSignal) Notify(t NotifyTarget, topics ...protocol.Topic) {
 	f.record(fmt.Sprint("notify ", topics))
+	var target string
+	switch t {
+	case NotifyTarget{}:
+		target = "nobody" // no handler means that
+	case NotifyTarget{Admins: true}:
+		target = "admins"
+	case NotifyTarget{All: true}:
+		target = "all"
+	case NotifyTarget{UserID: t.UserID}:
+		target = "user " + string(t.UserID)
+	default:
+		target = fmt.Sprintf("%+v", t) // more than one of the three: no handler means that either
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.notes = append(f.notes, fmt.Sprint(target, " ", topics))
+}
+
+// takeNotes returns the Notify calls recorded so far, each with its target, and clears them (and the hook list).
+func (f *fakeSignal) takeNotes() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := f.notes
+	f.notes, f.calls = nil, nil
+	return out
 }
 
 var (

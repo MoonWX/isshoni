@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MoonWX/isshoni/internal/protocol/api"
@@ -21,10 +22,12 @@ import (
 // ConnSelector, ConnCloser, LoginResult, RegisterResult, UserChange and the smaller types.
 //
 // README S30 filled in New (this file; the key-rotation purge is in tokens.go), the sessions and the CSRF wrapper
-// (session.go), login and logout (login.go) and setup (setup.go). The methods still declared below come with the
-// later auth slices (03 §18 slices 8–13: invites and registration, self-service, admin users, the janitor). Until
-// then each one with an error result returns notImplemented(method): an error that names the method and wraps
-// *api.Error{internal}, so an HTTP handler that calls it answers 500 internal (api has no not_implemented code).
+// (session.go), login and logout (login.go) and setup (setup.go). README S42 filled in the invites (invite.go),
+// registration and the approval queue (register.go), and added UpdateSettings (settings.go). The methods still
+// declared below come with the later auth slices (03 §18 slices 9, 10 and 13: self-service, admin users and password
+// resets, the janitor). Until then each one with an error result returns notImplemented(method): an error that names
+// the method and wraps *api.Error{internal}, so an HTTP handler that calls it answers 500 internal (api has no
+// not_implemented code).
 //
 // All service errors are *api.Error (03 §12.2) carrying a stable code, so httpapi maps them to statuses in one
 // table: an unexpected failure (the store, a cancelled context) wraps both its cause and *api.Error{internal}
@@ -111,6 +114,9 @@ type Service struct {
 	csrf     *CSRFGuard
 	cookie   sessionCookie
 	sessions *sessionCache
+
+	// settingsMu serializes UpdateSettings, so that each call sees exactly its own change (settings.go).
+	settingsMu sync.Mutex
 }
 
 // New builds the service (03 §7.13): it validates the keys and the origins, computes the dummy hash, then checks the
@@ -235,6 +241,60 @@ func (p Principal) IsAdmin() bool { return p.Role == store.RoleAdmin }
 // unknown peer) is stored as "".
 func ActorOf(p Principal, ip netip.Addr) store.Actor {
 	return store.Actor{Kind: store.ActorUser, UserID: p.UserID, Name: p.Username, IP: ipString(ip)}
+}
+
+// acting is the account behind a store.Actor, as actingAs reads it inside the transaction of the change.
+type acting struct {
+	// user is the acting account; the zero User for the CLI.
+	user store.User
+	// admin is true for the CLI and for an active admin account.
+	admin bool
+}
+
+// id is the acting user's ID, "" for the CLI: the value of the created_by, revoked_by and approved_by columns.
+func (a acting) id() store.UserID { return a.user.ID }
+
+// actingAs resolves who a call acts for. The service's methods take a store.Actor, which names an account but not
+// its role, and the admin socket calls them with store.CLIActor (03 §12.6), so each one reads the account in its own
+// transaction:
+//   - the CLI acts as an admin (the admin socket has checked its peer, 04 §12.1);
+//   - a user actor is its account as stored now. An account that is gone or not active is *api.Error{forbidden}:
+//     it was deleted or disabled after the request was authenticated;
+//   - every other actor (system, anonymous) is forbidden.
+//
+// Reading the row in the transaction also keeps the foreign keys of created_by, revoked_by and approved_by from
+// failing for an account that was deleted a moment ago.
+func actingAs(q *store.Q, a store.Actor) (acting, error) {
+	switch a.Kind {
+	case store.ActorCLI:
+		return acting{admin: true}, nil
+	case store.ActorUser:
+		u, err := q.UserByID(a.UserID)
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			return acting{}, api.NewError(api.CodeForbidden)
+		case err != nil:
+			return acting{}, err
+		case u.Status != store.StatusActive:
+			return acting{}, api.NewError(api.CodeForbidden)
+		}
+		return acting{user: u, admin: u.Role == store.RoleAdmin}, nil
+	}
+	return acting{}, api.NewError(api.CodeForbidden)
+}
+
+// actingAdmin is actingAs for the admin-only calls: anyone but the CLI and an active admin is
+// *api.Error{forbidden}. The REST routes of these calls are Admin routes already (03 §12.1); this is the same rule
+// at the moment of the change.
+func actingAdmin(q *store.Q, a store.Actor) (acting, error) {
+	who, err := actingAs(q, a)
+	if err != nil {
+		return acting{}, err
+	}
+	if !who.admin {
+		return acting{}, api.NewError(api.CodeForbidden)
+	}
+	return who, nil
 }
 
 // ---- revocation (03 §7.7) ----
@@ -385,24 +445,15 @@ type SetupInput struct{ Token, Username, Password, ServerName string }
 
 // ---- login, registration (03 §7.4, §7.9) ----
 //
-// Login and Logout are in login.go.
+// Login and Logout are in login.go, CheckInvite is in invite.go and Register in register.go.
 
 // LogoutEverywhere deletes every session and device of the principal's user.
 func (s *Service) LogoutEverywhere(ctx context.Context, p Principal, m ReqMeta) error {
 	return notImplemented("LogoutEverywhere")
 }
 
-// CheckInvite answers POST /api/v1/auth/invite/check.
-func (s *Service) CheckInvite(ctx context.Context, token string, m ReqMeta) (InviteInfo, error) {
-	return InviteInfo{}, notImplemented("CheckInvite")
-}
-
-// Register creates an account in the current registration mode: active with a session, or pending approval.
-func (s *Service) Register(ctx context.Context, in RegisterInput, m ReqMeta) (RegisterResult, error) {
-	return RegisterResult{}, notImplemented("Register")
-}
-
-// RegisterInput is the body of POST /api/v1/auth/register.
+// RegisterInput is the body of POST /api/v1/auth/register. An empty InviteToken is a public sign-up, which only the
+// approval mode takes.
 type RegisterInput struct{ InviteToken, Username, Password string }
 
 // RegisterResult is the outcome of Register: an active account with its session, or a pending sign-up.
@@ -411,7 +462,8 @@ type RegisterResult struct {
 	Login   *LoginResult // nil when Pending
 }
 
-// InviteInfo answers POST /api/v1/auth/invite/check.
+// InviteInfo answers POST /api/v1/auth/invite/check: what the invite page shows before its form. InvitedBy is the
+// creator's username, "" for an invite from the CLI or one whose creator was deleted.
 type InviteInfo struct {
 	ServerName, InvitedBy string
 	ExpiresAt             time.Time
@@ -447,40 +499,20 @@ func (s *Service) RevokeDevice(ctx context.Context, p Principal, id store.Device
 }
 
 // ---- invites (03 §7.9) ----
+//
+// CreateInvite and RevokeInvite are in invite.go.
 
-// CreateInvite creates an invite and returns it with its /invite#token link.
-func (s *Service) CreateInvite(ctx context.Context, a store.Actor, in InviteInput) (store.Invite, Link, error) {
-	return store.Invite{}, Link{}, notImplemented("CreateInvite")
-}
-
-// RevokeInvite revokes an invite.
-func (s *Service) RevokeInvite(ctx context.Context, a store.Actor, id store.InviteID) error {
-	return notImplemented("RevokeInvite")
-}
-
-// InviteInput creates an invite.
+// InviteInput creates an invite (the body of POST /api/v1/invites, and the flags of `isshoni admin invite create`).
 type InviteInput struct {
-	Note           string
-	ExpiresInHours int // 0 = setting default
-	MaxUses        int // 0 = setting default
+	Note           string // free text, at most 64 characters
+	ExpiresInHours int    // 1–720; 0 = the setting inviteDefaultTtlHours
+	MaxUses        int    // 1–1000; 0 = the setting inviteDefaultMaxUses
 }
 
 // ---- admin (03 §7.9–7.11; also used by the admin socket with store.CLIActor) ----
-
-// Approve activates a pending sign-up.
-func (s *Service) Approve(ctx context.Context, a store.Actor, id store.UserID) (store.User, error) {
-	return store.User{}, notImplemented("Approve")
-}
-
-// Reject deletes a pending sign-up.
-func (s *Service) Reject(ctx context.Context, a store.Actor, id store.UserID) error {
-	return notImplemented("Reject")
-}
-
-// RejectAll deletes every pending sign-up and returns how many (03 §7.9); one audit row carries the count.
-func (s *Service) RejectAll(ctx context.Context, a store.Actor) (int, error) {
-	return 0, notImplemented("RejectAll")
-}
+//
+// Approve, Reject and RejectAll (the approval queue, 03 §7.9) are in register.go. UpdateSettings (settings.go) is
+// the settings patch of 03 §9 together with the registration_mode_changed alert of 03 §7.11.
 
 // UpdateUser renames a user or changes its role or status, with the last-admin and self rules.
 func (s *Service) UpdateUser(ctx context.Context, a store.Actor, id store.UserID, ch UserChange) (store.User, error) {

@@ -12,6 +12,7 @@ const (
 	FieldReserved       = "reserved"
 	FieldTooCommon      = "too_common"
 	FieldSameAsUsername = "same_as_username"
+	FieldOutOfRange     = "out_of_range"
 )
 
 // FieldError reports why one input field failed a rule. Field is the JSON field the rule checks by default

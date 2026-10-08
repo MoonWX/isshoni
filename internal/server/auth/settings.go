@@ -1,0 +1,61 @@
+package auth
+
+import (
+	"context"
+	"encoding/json"
+
+	"github.com/MoonWX/isshoni/internal/server/store"
+)
+
+// The settings patch of an admin (03 §9), with the admin alert of 03 §7.11.
+
+// SettingsChange is the outcome of UpdateSettings: the effective settings before and after the patch. They are
+// equal when the patch changed nothing.
+type SettingsChange struct{ Before, After store.Settings }
+
+// UpdateSettings applies an admin's settings patch (PATCH /api/v1/admin/settings, 03 §9; JSON name → JSON value,
+// only the fields present change) and raises the registration_mode_changed admin alert when it changed
+// registrationMode (03 §7.11), with the actor's name. a is an admin or store.CLIActor (actingAdmin).
+//
+// The patch is store.SettingsCache.Update's: a pinned field in it is *api.Error{setting_locked} with params.field
+// (409), whatever value is sent; a bad value, null too, is *api.Error{validation_failed} with a code per field
+// (422); unknown names are ignored. The changed fields and the settings.changed audit row are written in one Write
+// (a row that changes registrationMode is a security event, 03 §10), then the cache swaps and its OnChange callbacks
+// run. A patch that changes nothing writes nothing and raises no alert.
+//
+// It is an addition to the API of 03 §7.13, where the settings have no service call: the alert needs the actor,
+// which the cache's OnChange callbacks don't get, and only auth holds the AdminAlerter. Calls are serialized, so
+// Before and After are exactly this call's change, also when two admins save at once.
+func (s *Service) UpdateSettings(ctx context.Context, a store.Actor, patch map[string]json.RawMessage) (SettingsChange, error) {
+	err := s.db.Read(ctx, func(q *store.Q) error {
+		_, err := actingAdmin(q, a)
+		return err
+	})
+	if err != nil {
+		return SettingsChange{}, serviceErr("update settings", err)
+	}
+	ch, err := s.patchSettings(ctx, a, patch)
+	if err != nil {
+		return SettingsChange{}, serviceErr("update settings", err)
+	}
+	if ch.Before.RegistrationMode != ch.After.RegistrationMode {
+		// After the commit (03 §7.11), and whether or not the client is still connected.
+		s.alert(context.WithoutCancel(ctx), AdminAlert{Kind: AlertRegistrationModeChanged, Actor: a.Name, At: s.now()})
+	}
+	return ch, nil
+}
+
+// patchSettings runs one settings update at a time and returns the settings around it. No other path changes a
+// setting an admin can patch while the server serves: setup/complete sets only the server name, before any admin
+// exists, and config pins its fields before the listeners start.
+func (s *Service) patchSettings(ctx context.Context, a store.Actor, patch map[string]json.RawMessage) (SettingsChange, error) {
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
+	cache := s.db.Settings()
+	before := cache.Get()
+	after, err := cache.Update(ctx, patch, a)
+	if err != nil {
+		return SettingsChange{}, err
+	}
+	return SettingsChange{Before: before, After: after}, nil
+}

@@ -148,12 +148,22 @@ func newAPI(d Deps, au authService) *API {
 // routes registers 03's endpoints (03 §12.3; the numbers are the rows of its table). The later slices add theirs
 // here.
 func (a *API) routes() {
-	a.Handle("GET /api/v1/info", Public, http.HandlerFunc(a.getInfo))                           // #1
-	a.Handle("POST /api/v1/auth/login", Public, http.HandlerFunc(a.postLogin))                  // #2
-	a.Handle("POST /api/v1/auth/logout", Public, http.HandlerFunc(a.postLogout))                // #3
-	a.Handle("POST /api/v1/auth/setup/check", Public, http.HandlerFunc(a.postSetupCheck))       // #7
-	a.Handle("POST /api/v1/auth/setup/complete", Public, http.HandlerFunc(a.postSetupComplete)) // #8
-	a.Handle("GET /api/v1/me", User, http.HandlerFunc(a.getMe))                                 // #11
+	a.Handle("GET /api/v1/info", Public, http.HandlerFunc(a.getInfo))                             // #1
+	a.Handle("POST /api/v1/auth/login", Public, http.HandlerFunc(a.postLogin))                    // #2
+	a.Handle("POST /api/v1/auth/logout", Public, http.HandlerFunc(a.postLogout))                  // #3
+	a.Handle("POST /api/v1/auth/register", Public, http.HandlerFunc(a.postRegister))              // #5
+	a.Handle("POST /api/v1/auth/invite/check", Public, http.HandlerFunc(a.postInviteCheck))       // #6
+	a.Handle("POST /api/v1/auth/setup/check", Public, http.HandlerFunc(a.postSetupCheck))         // #7
+	a.Handle("POST /api/v1/auth/setup/complete", Public, http.HandlerFunc(a.postSetupComplete))   // #8
+	a.Handle("GET /api/v1/me", User, http.HandlerFunc(a.getMe))                                   // #11
+	a.Handle("GET /api/v1/invites", User, http.HandlerFunc(a.getInvites))                         // #21
+	a.Handle("POST /api/v1/invites", User, http.HandlerFunc(a.postInvite))                        // #22
+	a.Handle("DELETE /api/v1/invites/{id}", User, http.HandlerFunc(a.deleteInvite))               // #23
+	a.Handle("GET /api/v1/admin/approvals", Admin, http.HandlerFunc(a.getApprovals))              // #34
+	a.Handle("POST /api/v1/admin/approvals/{id}/approve", Admin, http.HandlerFunc(a.postApprove)) // #35
+	a.Handle("POST /api/v1/admin/approvals/{id}/reject", Admin, http.HandlerFunc(a.postReject))   // #36
+	a.Handle("GET /api/v1/admin/settings", Admin, http.HandlerFunc(a.getSettings))                // #40
+	a.Handle("PATCH /api/v1/admin/settings", Admin, http.HandlerFunc(a.patchSettings))            // #41
 }
 
 // ServeHTTP serves every request under /api/v1/ through the API's chain. After the no-store step it answers every

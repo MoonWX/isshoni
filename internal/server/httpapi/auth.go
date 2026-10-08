@@ -10,9 +10,9 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/store"
 )
 
-// The auth endpoints of 03 §12.3 that exist so far (README S30): login (#2), logout (#3), setup/check (#7) and
-// setup/complete (#8). All four are Public: the chain's CSRF step still applies, and the throttles are auth's
-// (03 §7.3). Registration, invites and reset links come with the later account slices.
+// The auth endpoints of 03 §12.3 that exist so far: login (#2), logout (#3), setup/check (#7) and setup/complete
+// (#8) (README S30), and register (#5) and invite/check (#6) (README S42). All are Public: the chain's CSRF step
+// still applies, and the throttles are auth's (03 §7.3). The reset links come with the admin users slice.
 
 // apiUser is the public identity shape {id, username, role} of a user (03 §12.4.2).
 func apiUser(u store.User) api.User {
@@ -104,4 +104,63 @@ func (a *API) postSetupComplete(w http.ResponseWriter, r *http.Request) {
 	a.d.Auth.SetSessionCookie(w, res.Token, res.Session.IdleExpiresAt)
 	a.sessionChanged(res.User.ID)
 	WriteJSON(w, http.StatusCreated, api.UserResponse{User: apiUser(res.User)})
+}
+
+// postInviteCheck is POST /api/v1/auth/invite/check (03 §12.3 #6, §12.4.2): {token} → 200 InviteInfo, what the
+// invite page shows before its form. Errors, each saying why the link doesn't work: 403 registration_closed, 404
+// invite_invalid, 410 invite_expired, invite_used_up or invite_revoked; and 429 rate_limited.
+func (a *API) postInviteCheck(w http.ResponseWriter, r *http.Request) {
+	var req api.TokenRequest
+	if err := DecodeJSON(w, r, &req, authBodyLimit); err != nil {
+		WriteError(w, r, err)
+		return
+	}
+	info, err := a.d.Auth.CheckInvite(r.Context(), req.Token, a.d.Auth.RequestMeta(r))
+	if err != nil {
+		WriteError(w, r, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, api.InviteInfo{
+		ServerName: info.ServerName,
+		InvitedBy:  info.InvitedBy,
+		ExpiresAt:  info.ExpiresAt,
+		UsesLeft:   info.UsesLeft,
+	})
+}
+
+// postRegister is POST /api/v1/auth/register (03 §12.3 #5, §7.9): {inviteToken?, username, password}.
+//   - With an invite: 201 {status: "active", user} with the session cookie; the SPA lands in the default room.
+//   - Without one (approval mode only): 202 {status: "pending"} and no cookie; an admin approves or rejects.
+//
+// Errors: 403 registration_closed or invite_required, 404 invite_invalid, 410 invite_expired, invite_used_up or
+// invite_revoked, 409 username_taken or limit_reached {limit: pending_signups}, 422 validation_failed, 429
+// rate_limited, 503 server_busy. A request that arrives with a session cookie loses that old session when it
+// creates an account (03 §7.4).
+func (a *API) postRegister(w http.ResponseWriter, r *http.Request) {
+	var req api.RegisterRequest
+	if err := DecodeJSON(w, r, &req, authBodyLimit); err != nil {
+		WriteError(w, r, err)
+		return
+	}
+	res, err := a.d.Auth.Register(r.Context(), auth.RegisterInput{
+		InviteToken: req.InviteToken,
+		Username:    req.Username,
+		Password:    req.Password,
+	}, a.d.Auth.RequestMeta(r))
+	if err != nil {
+		WriteError(w, r, err)
+		return
+	}
+	if res.Login == nil {
+		// A sign-up was requested: every admin's approval queue and user list changed (03 §12.5).
+		a.d.Signal.Notify(NotifyTarget{Admins: true}, protocol.TopicAdminApprovals, protocol.TopicAdminUsers)
+		WriteJSON(w, http.StatusAccepted, api.RegisterResponse{Status: api.UserStatusPending})
+		return
+	}
+	a.d.Auth.SetSessionCookie(w, res.Login.Token, res.Login.Session.IdleExpiresAt)
+	a.sessionChanged(res.Login.User.ID)
+	// The invite was used, and there is one more user.
+	a.inviteChanged(r, res.Login.User.InviteID, protocol.TopicAdminInvites, protocol.TopicAdminUsers)
+	user := apiUser(res.Login.User)
+	WriteJSON(w, http.StatusCreated, api.RegisterResponse{Status: api.UserStatusActive, User: &user})
 }
