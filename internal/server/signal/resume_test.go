@@ -1281,3 +1281,218 @@ func TestResumeAtTheCap(t *testing.T) {
 		counts("the waiting socket connected", limit, limit, limit, 0)
 	})
 }
+
+// floodInbox sends userID's connections more notifications than an inbox takes (1024). A connection whose actor is
+// held meanwhile takes the first ones into its inbox, and the hub drops the others.
+func floodInbox(e *env, userID string) {
+	for range 2000 {
+		e.hub.Notify(signal.Target{UserID: userID}, protocol.TopicMe)
+	}
+}
+
+// A full inbox ends the connection for good (01 §15.2). The actor is held by a slow room lookup while 2000
+// notifications arrive: the hub drops the ones over the inbox's 1024 and closes the socket with 4503. What it posts
+// next is dropped too, here a revocation or the close of the connection's room. So the connection must not live on,
+// with its room, its MediaPeer and its slot: it closes when the actor is back, without grace, a revoked one with
+// left, and its token resumes nothing.
+func TestResumeNotAfterInboxOverflow(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		drop    func(e *env, id signal.Identity) // a control call whose post the full inbox drops
+		reason  protocol.EndReason
+		revoked int // "connection revoked" lines
+	}{
+		{"revocation", func(e *env, id signal.Identity) {
+			if n := e.hub.CloseConnections(signal.ConnSelector{UserID: id.UserID}, protocol.ErrorCodeSessionRevoked); n != 1 {
+				e.t.Errorf("closed %d, want 1", n)
+			}
+		}, protocol.EndReasonLeft, 1},
+		{"room closed", func(e *env, _ signal.Identity) { e.hub.CloseRoom(room1.ID) }, protocol.EndReasonDisconnected, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				e := newEnv(t)
+				defer e.close()
+				e.rooms.Add(room1)
+				cookie, id := e.user(false)
+				c, w := e.connect(cookie, signaltest.DefaultHello())
+				join(t, c, room1.ID)
+				peer := e.media.Peer(w.ConnectionID)
+
+				release := e.rooms.HoldGetRoom()
+				defer release()
+				request(t, c, protocol.MessageTypeRoomJoin, protocol.RoomJoin{RoomID: room1.ID})
+				synctest.Wait() // the actor waits for GetRoom
+				floodInbox(e, id.UserID)
+				expectClose(t, c, protocol.CloseCodeSlowConnection) // at once, whatever the actor does
+				tc.drop(e, id)
+				synctest.Wait()
+				if conns, _, _, slots := signal.Counts(e.hub, id.UserID); conns != 1 || slots != 1 {
+					t.Fatalf("conns %d, slots %d while the actor is held; want 1, 1", conns, slots)
+				}
+
+				release()
+				synctest.Wait()
+				if conns, socks, _, slots := signal.Counts(e.hub, id.UserID); conns+socks+slots != 0 {
+					t.Errorf("conns %d, sockets %d, slots %d once the actor is back; want none", conns, socks, slots)
+				}
+				if e.logs.count("connection detached") != 0 || e.logs.count("level=INFO", "connection closed",
+					w.ConnectionID, "code=4503", "reason="+string(tc.reason)) != 1 {
+					t.Errorf("want a close line with code=4503 and reason=%s, and no detach line:\n%s", tc.reason, e.logs)
+				}
+				if n := e.logs.count("level=INFO", "connection revoked", w.ConnectionID, "code=session_revoked"); n != tc.revoked {
+					t.Errorf("%d revocation lines for the connection, want %d", n, tc.revoked)
+				}
+				if e.logs.count("level=WARN", "connection inbox full", w.ConnectionID, "user_id="+id.UserID) != 1 ||
+					e.logs.count("send queue full") != 0 {
+					t.Errorf("want one WARN line about the full inbox, and none about the send queue:\n%s", e.logs)
+				}
+				if calls := peer.Calls(); len(calls) != 1 || calls[0].Method != "Close" {
+					t.Errorf("MediaPeer calls %+v, want Close", calls)
+				}
+				if snap := e.hub.Snapshot(); len(snap.Rooms) != 0 {
+					t.Errorf("snapshot %+v, want no rooms", snap)
+				}
+				if r, p, n := e.metric("isshoni_rooms"), e.metric("isshoni_participants"),
+					e.metric("isshoni_ws_connections", "kind", "web", "role", "full"); r > 0 || p > 0 || n > 0 {
+					t.Errorf("isshoni_rooms %v, isshoni_participants %v, isshoni_ws_connections %v; want none", r, p, n)
+				}
+
+				// The hello opens a new connection, in no room. (The hub alone was told of the revocation: the fake's
+				// session is still valid.)
+				c2, w2 := e.resume(cookie, w.ResumeToken)
+				if w2.Resumed || w2.ConnectionID == w.ConnectionID || w2.RoomID != "" {
+					t.Errorf("resumed %v, same connection %v, roomId %q; want a new connection in no room", w2.Resumed,
+						w2.ConnectionID == w.ConnectionID, w2.RoomID)
+				}
+				ping(t, c2)
+			})
+		})
+	}
+}
+
+// The same for a detached connection, which has no socket that the hub could close: it closes as soon as its actor
+// is back, not at the end of its grace, and a revocation that the full inbox dropped still closes it with left.
+func TestResumeNotAfterInboxOverflowDetached(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		revoke bool
+		reason protocol.EndReason
+	}{
+		{"notifications", false, protocol.EndReasonDisconnected},
+		{"revocation", true, protocol.EndReasonLeft},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				e := newEnv(t)
+				defer e.close()
+				cookieA, a := e.user(false)
+				cookieO, o := e.user(false)
+				ca, wa := e.connect(cookieA, signaltest.DefaultHello())
+				obs, _ := e.connect(cookieO, signaltest.DefaultHello())
+				join(t, ca, "lounge")
+				join(t, obs, "lounge")
+				share := liveShare("s_aaaaaaaaaaaaaaaa", a.UserID, wa.ConnectionID)
+				signal.AddShare(e.hub, "lounge", share)
+				settle()
+				ca.Close()
+				settle()
+				drain(t, obs)
+				if e.logs.count("connection detached", wa.ConnectionID) != 1 {
+					t.Fatalf("the connection is not detached:\n%s", e.logs)
+				}
+
+				release := signal.Stall(e.hub, wa.ConnectionID)
+				if release == nil {
+					t.Fatal("no connection to hold")
+				}
+				defer release()
+				floodInbox(e, a.UserID)
+				revoked := 0
+				if tc.revoke {
+					revoked = e.hub.CloseConnections(signal.ConnSelector{UserID: a.UserID}, protocol.ErrorCodeSessionRevoked)
+					if revoked != 1 {
+						t.Errorf("closed %d, want the detached connection", revoked)
+					}
+				}
+				synctest.Wait()
+				if conns, _, _, slots := signal.Counts(e.hub, a.UserID); conns != 2 || slots != 1 {
+					t.Fatalf("conns %d, A's slots %d while the actor is held; want 2, 1", conns, slots)
+				}
+
+				back := time.Now()
+				release()
+				settle()
+				evs, st := drain(t, obs)
+				if len(evs) != 2 || evs[0].Kind != protocol.RoomEventKindShareStopped || evs[0].Reason != tc.reason ||
+					evs[1].Kind != protocol.RoomEventKindParticipantLeft || evs[1].UserID != a.UserID ||
+					evs[1].Reason != tc.reason || !evs[1].At.Equal(back) {
+					t.Errorf("events %+v, want share.stopped and participant.left with %s, at once", evs, tc.reason)
+				}
+				if st == nil || !slices.Equal(userIDs(*st), []string{o.UserID}) || len(st.Shares) != 0 {
+					t.Errorf("state %+v, want the observer alone", st)
+				}
+				calls := e.media.Peer(wa.ConnectionID).Calls()
+				if len(calls) != 2 || calls[0].Method != "EndShare" || calls[0].Args[1] != tc.reason ||
+					calls[1].Method != "Close" {
+					t.Errorf("MediaPeer calls %+v, want EndShare(%s), Close", calls, tc.reason)
+				}
+				if conns, _, _, slots := signal.Counts(e.hub, a.UserID); conns != 1 || slots != 0 {
+					t.Errorf("conns %d, A's slots %d; want 1, 0", conns, slots)
+				}
+				if e.logs.count("level=INFO", "connection closed", wa.ConnectionID, "code=1006",
+					"reason="+string(tc.reason)) != 1 {
+					t.Errorf("no close line with reason=%s:\n%s", tc.reason, e.logs)
+				}
+				if n := e.logs.count("level=INFO", "connection revoked", wa.ConnectionID); n != revoked {
+					t.Errorf("%d revocation lines for the connection, want %d", n, revoked)
+				}
+				if _, w := e.resume(cookieA, wa.ResumeToken); w.Resumed {
+					t.Error("the token resumed a connection that had lost a post")
+				}
+			})
+		})
+	}
+}
+
+// A connection that has lost a post resumes nothing while its socket lingers: here the client reads nothing more,
+// the close frame included, so the socket lasts until the hub gives the close handshake up.
+func TestResumeWhileInboxOverflowed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newEnv(t)
+		defer e.close()
+		cookie, id := e.user(false)
+		c, w := e.connect(cookie, signaltest.DefaultHello())
+		c.Pause()
+		ping(t, c) // the pong is the last frame that the reader takes
+
+		release := signal.Stall(e.hub, w.ConnectionID)
+		if release == nil {
+			t.Fatal("no connection to hold")
+		}
+		defer release()
+		floodInbox(e, id.UserID)
+		release()
+		synctest.Wait()
+		if conns, socks, _, _ := signal.Counts(e.hub, id.UserID); conns != 1 || socks != 1 {
+			t.Fatalf("conns %d, sockets %d; want the connection, still closing its socket", conns, socks)
+		}
+		c2, w2 := e.resume(cookie, w.ResumeToken)
+		if w2.Resumed || w2.ConnectionID == w.ConnectionID {
+			t.Errorf("resumed %v: a connection that had lost a post was resumed", w2.Resumed)
+		}
+		if e.logs.count("level=DEBUG", "resume token not resumed", "reason=closing") != 1 {
+			t.Errorf("no DEBUG line with reason=closing:\n%s", e.logs)
+		}
+		ping(t, c2)
+		time.Sleep(11 * time.Second) // the old socket's close handshake times out
+		synctest.Wait()
+		if conns, socks, _, slots := signal.Counts(e.hub, id.UserID); conns != 1 || socks != 1 || slots != 1 {
+			t.Errorf("conns %d, sockets %d, slots %d; want only the new connection", conns, socks, slots)
+		}
+		if e.logs.count("connection detached") != 0 ||
+			e.logs.count("connection closed", w.ConnectionID, "reason=disconnected") != 1 {
+			t.Errorf("want a close line with reason=disconnected for the old connection, and no detach line:\n%s", e.logs)
+		}
+	})
+}

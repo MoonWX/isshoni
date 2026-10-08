@@ -39,11 +39,12 @@
 //
 // Each connection is one actor goroutine that owns the connection's state, from its first welcome through every
 // socket and every grace until it closes; other goroutines reach it through its inbox (post never blocks; a full
-// inbox closes the connection's socket as slow_connection). Each socket has a reader (the ServeHTTP goroutine), a
-// writer that drains the send queue, and a pinger. A reader whose hello resumes a connection hands its socket to
-// that connection's actor and waits for the answer. The hub lock guards the maps of sockets, connections and rooms;
-// each room's lock guards its participants, shares and snapshot state. No lock is held while calling a dependency (a
-// MediaPeer included), writing to a socket, or sending on a channel that can block: a room change collects its
-// messages and posts them to the connections' actors after unlocking. A scheduled room.state broadcast runs on its
-// timer's goroutine, counted like the others. Lock order: hub → room → connection.
+// inbox drops the post and closes the connection as slow_connection, without grace: nothing resumes a connection
+// that has missed a post). Each socket has a reader (the ServeHTTP goroutine), a writer that drains the send queue,
+// and a pinger. A reader whose hello resumes a connection hands its socket to that connection's actor and waits for
+// the answer. The hub lock guards the maps of sockets, connections and rooms; each room's lock guards its
+// participants, shares and snapshot state. No lock is held while calling a dependency (a MediaPeer included),
+// writing to a socket, or sending on a channel that can block: a room change collects its messages and posts them to
+// the connections' actors after unlocking. A scheduled room.state broadcast runs on its timer's goroutine, counted
+// like the others. Lock order: hub → room → connection.
 package signal

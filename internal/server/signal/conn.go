@@ -377,12 +377,18 @@ func (s *socket) shutdown(reason protocol.ShutdownReason) {
 	}
 }
 
-// overflow closes the socket as slow_connection: the queued messages are dropped, nothing more is sent, and the
-// writer closes with 4503 once its current write returns (01 §3.3).
+// overflow closes the socket, whose send queue is full, as slow_connection (01 §3.3).
 func (s *socket) overflow() {
-	if s.q.abort(websocket.StatusCode(protocol.CloseCodeSlowConnection), string(protocol.ErrorCodeSlowConnection)) {
+	if s.closeSlow() {
 		s.h.log.Debug("send queue full", slog.Int("limit_messages", s.q.maxMsgs), slog.Int("limit_bytes", s.q.maxBytes))
 	}
+}
+
+// closeSlow closes the socket as slow_connection: the queued messages are dropped, nothing more is sent, and the
+// writer closes with 4503 once its current write returns (01 §3.3). It reports whether the socket was not closing
+// yet.
+func (s *socket) closeSlow() bool {
+	return s.q.abort(websocket.StatusCode(protocol.CloseCodeSlowConnection), string(protocol.ErrorCodeSlowConnection))
 }
 
 // sendQueue is a socket's bounded send queue (01 §3.3): at most maxMsgs messages and maxBytes bytes. It ends with a
@@ -541,8 +547,10 @@ type conn struct {
 	done  chan struct{} // closed when the actor has ended
 
 	ident     atomic.Pointer[Identity] // Name and Admin change; the ids never do
-	sockP     atomic.Pointer[socket]   // the current socket, for other goroutines (overflow)
+	sockP     atomic.Pointer[socket]   // the current socket, for other goroutines (post)
 	lastStats atomic.Pointer[protocol.ClientStats]
+	lost      atomic.Bool                    // the full inbox dropped a post: the connection closes for good (post)
+	revoked   atomic.Pointer[protocol.Error] // CloseConnections' error, set before the post that applies it
 
 	// Guarded by h.mu.
 	slotUser string // the user whose per-user slot the connection holds
@@ -621,6 +629,10 @@ func (c *conn) run(first func()) {
 	down := c.h.down
 	first()
 	for !c.closed {
+		// post sets lost, on another goroutine; the actor looks at it between any two things it handles.
+		if c.lost.Load() && c.lostPost() {
+			break
+		}
 		select {
 		case f := <-c.inbox:
 			f()
@@ -640,8 +652,11 @@ func (c *conn) run(first func()) {
 	c.h.removeConn(c)
 }
 
-// post queues f for the actor without blocking. When the inbox is full the connection can't keep up and is closed
-// as slow_connection (01 §15.2). post returns false when f was not queued.
+// post queues f for the actor without blocking. It returns false when f was not queued: the actor has ended, or the
+// inbox is full. A full inbox means that the connection can't keep up, and it closes the connection for good, as
+// slow_connection (01 §15.2): f is dropped, and nobody knows what the connection has missed with it, a revocation,
+// the close of its room or a share's media state. The socket is closed with 4503 here, at once; the actor does the
+// rest when it gets there (lostPost), without grace, and nothing resumes the connection meanwhile.
 func (c *conn) post(f func()) bool {
 	select {
 	case <-c.done:
@@ -652,11 +667,37 @@ func (c *conn) post(f func()) bool {
 	case c.inbox <- f:
 		return true
 	default:
-		if s := c.sockP.Load(); s != nil {
-			s.overflow()
-		}
-		return false
 	}
+	if c.lost.CompareAndSwap(false, true) {
+		c.h.log.Warn("connection inbox full", slog.String("conn_id", c.id), slog.String("user_id", c.userID),
+			slog.Int("limit", inboxSize))
+	}
+	if s := c.sockP.Load(); s != nil {
+		s.closeSlow()
+	}
+	// The actor looks at lost after each thing it handles. It may have emptied the inbox since the send above failed
+	// and be waiting now: this wakes it. If the inbox is still full, the actor has work left and needs no waking.
+	select {
+	case c.inbox <- func() {}:
+	default:
+	}
+	return false
+}
+
+// lostPost ends the connection after the full inbox dropped a post (post). It runs on the actor and reports whether
+// the connection is closed. A revocation is never lost with its post: it is applied here. Then a detached connection
+// closes at once, and an attached one closes with its socket (endsWith), which post has closed already; it is closed
+// here too, for a socket that a resume attached while post ran.
+func (c *conn) lostPost() bool {
+	c.applyRevocation()
+	switch {
+	case c.closed:
+	case c.sock == nil:
+		c.close(protocol.EndReasonDisconnected)
+	default:
+		c.sock.closeSlow()
+	}
+	return c.closed
 }
 
 // postWait queues f for the actor, waiting while the inbox is full. The socket reader uses it, so a client that
@@ -733,6 +774,10 @@ func (c *conn) socketEnded(s *socket, code int, byHub bool) {
 	c.sockP.Store(nil)
 	c.idle.Stop()
 	c.lastCode = code
+	// A revocation whose post is still behind this one in the inbox counts already: it closes the connection here.
+	if c.applyRevocation(); c.closed {
+		return
+	}
 	if reason, ends := c.endsWith(code, byHub); ends {
 		c.close(reason)
 		return
@@ -869,6 +914,16 @@ func (c *conn) revoke(e protocol.Error) {
 		return
 	}
 	c.fail(e)
+}
+
+// applyRevocation revokes the connection when CloseConnections has asked for it and the actor has not done it yet.
+// CloseConnections records the revocation on the connection before it posts this call, so a revocation does not
+// depend on room in the inbox: the actor also looks for it when the connection's socket ends (socketEnded) and when
+// the inbox has dropped a post (lostPost).
+func (c *conn) applyRevocation() {
+	if e := c.revoked.Load(); e != nil && c.endReason == "" {
+		c.revoke(*e)
+	}
 }
 
 // shutdown sends the shutdown notice and closes the socket with 1012 (04 §6.4); the connection's shares end with

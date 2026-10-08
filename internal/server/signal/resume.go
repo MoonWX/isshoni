@@ -23,7 +23,8 @@ import (
 // Config.Grace without a resume the connection closes, with disconnected.
 //
 // There is no grace when the client left on purpose (close 1000 or 1001), and none when the hub closed the
-// connection for good: a revocation, a shutdown, or an error after which the client stops (endsWith).
+// connection for good: a revocation, a shutdown, an error after which the client stops, or a full inbox, after
+// which the connection has missed something the hub can't send again (endsWith).
 //
 // Resume tokens:
 //
@@ -93,27 +94,27 @@ func resumeMAC(key, id, nonce []byte) []byte {
 //     other code from the client keeps the grace (the web client drops a socket it wants to replace with 4000);
 //   - the hub closed the socket after an error that makes the client stop (01 §12.2), so nothing will resume the
 //     connection: a protocol violation (4400: bad_message, a second hello) or a binary frame (1003): disconnected.
-//     4401 and 4403 are revocations that reached the socket before the connection was marked: left.
+//     4401 and 4403 are revocations that reached the socket before the connection was marked: left;
+//   - the connection's full inbox dropped a post (conn.post, which closed the socket with 4503): the connection has
+//     missed something that the hub can't send again, and a resume would bring back a connection in a wrong state:
+//     disconnected (01 §15.2).
 //
 // The hub's other closes are retryable for the client, which reconnects and resumes: the idle timeout (4408), a
 // full send queue (4503), a flood (4429) and an internal error (1011). So are a message over the read limit (1009)
 // and a socket that just went away (1006).
 func (c *conn) endsWith(code int, byHub bool) (reason protocol.EndReason, ends bool) {
-	if c.endReason != "" {
-		return c.endReason, true
-	}
 	cc := protocol.CloseCode(code)
-	if !byHub {
-		if cc == protocol.CloseCodeNormal || cc == protocol.CloseCodeGoingAway {
-			return protocol.EndReasonLeft, true
-		}
-		return "", false
-	}
-	switch cc {
-	case protocol.CloseCodeProtocolViolation, protocol.CloseCodeUnsupportedData:
-		return protocol.EndReasonDisconnected, true
-	case protocol.CloseCodeUnauthenticated, protocol.CloseCodeForbidden:
+	switch {
+	case c.endReason != "":
+		return c.endReason, true
+	case !byHub && (cc == protocol.CloseCodeNormal || cc == protocol.CloseCodeGoingAway):
 		return protocol.EndReasonLeft, true
+	case byHub && (cc == protocol.CloseCodeProtocolViolation || cc == protocol.CloseCodeUnsupportedData):
+		return protocol.EndReasonDisconnected, true
+	case byHub && (cc == protocol.CloseCodeUnauthenticated || cc == protocol.CloseCodeForbidden):
+		return protocol.EndReasonLeft, true
+	case c.lost.Load():
+		return protocol.EndReasonDisconnected, true
 	}
 	return "", false
 }
@@ -222,9 +223,10 @@ func (h *Hub) tryResume(tok protocol.Secret, req *resumeRequest) (*conn, string)
 
 // resume moves the connection to the socket of a hello with its resume token, on the actor. It returns "", or why
 // it refused. It refuses a token that is not the connection's current one: an older token of the same connection,
-// which a welcome has rotated since. It also refuses when the connection is closing for good (revoked or shutting
-// down), and when the hello asks for another role or negotiated another protocol version than the connection has:
-// both are fixed for a connection's lifetime, so such a hello is another client and opens a connection of its own.
+// which a welcome has rotated since. It also refuses when the connection is closing for good (revoked, shutting
+// down, or its inbox dropped a post), and when the hello asks for another role or negotiated another protocol
+// version than the connection has: both are fixed for a connection's lifetime, so such a hello is another client and
+// opens a connection of its own.
 //
 // Otherwise (01 §10.3, §10.5):
 //
@@ -240,7 +242,7 @@ func (h *Hub) tryResume(tok protocol.Secret, req *resumeRequest) (*conn, string)
 // which can have changed while it was away (a codec that became available, 01 §11.7).
 func (c *conn) resume(req *resumeRequest) string {
 	switch {
-	case c.closed, c.endReason != "":
+	case c.closed, c.endReason != "", c.revoked.Load() != nil, c.lost.Load():
 		return noResumeClosing
 	case subtle.ConstantTimeCompare(req.hash[:], c.tokenHash[:]) != 1:
 		return noResumeRotated

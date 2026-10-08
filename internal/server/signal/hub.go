@@ -441,7 +441,8 @@ func isAdminTopic(t protocol.Topic) bool { return strings.HasPrefix(string(t), "
 // Sockets of that user that were authenticated by cookie and are still in the handshake are closed the same way.
 // Closing is asynchronous: the sockets close right after the call returns. A revocation skips grace (01 §4.2): each
 // connection ends with its socket, and a detached one, which has no socket to tell, ends at once (it is counted
-// too). Their shares end with left.
+// too). Their shares end with left. A revocation is recorded on the connection before its actor is told, so it holds
+// even when the actor's inbox is full.
 func (h *Hub) CloseConnections(sel ConnSelector, code protocol.ErrorCode) int {
 	if sel.UserID == "" {
 		h.log.Error("CloseConnections without a user id: nothing closed")
@@ -468,7 +469,8 @@ func (h *Hub) CloseConnections(sel ConnSelector, code protocol.ErrorCode) int {
 
 	e := protocol.NewError(code, protocol.ErrorScopeSession)
 	for _, c := range conns {
-		c.post(func() { c.revoke(e) })
+		c.revoked.Store(&e) // first: a full inbox can drop the post, but never the revocation
+		c.post(c.applyRevocation)
 	}
 	for _, s := range socks {
 		s.fail(e, "")
