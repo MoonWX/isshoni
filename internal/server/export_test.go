@@ -3,7 +3,9 @@ package server
 import (
 	"net/http"
 
+	"github.com/MoonWX/isshoni/internal/server/netx"
 	"github.com/MoonWX/isshoni/internal/server/ops"
+	"github.com/MoonWX/isshoni/internal/server/tlsmgr"
 )
 
 // Hooks for the tests in package server_test.
@@ -23,11 +25,40 @@ func (s *Server) Health() *ops.Health {
 	return s.health
 }
 
-// CloseHTTPListener closes the main listener under the running server, as a failing socket would.
+// CloseHTTPListener closes the listen.http listener under the running server, as a failing socket would.
 func (s *Server) CloseHTTPListener() error {
 	s.life.Lock()
 	defer s.life.Unlock()
 	return s.httpLn.Close()
+}
+
+// SetPublicAddrs makes Start find these public addresses instead of looking at the machine's interfaces and asking
+// STUN servers (04 §7.4). Call it before Start.
+func (s *Server) SetPublicAddrs(pub netx.PublicAddrs) {
+	s.life.Lock()
+	defer s.life.Unlock()
+	s.hookDetect = func() netx.PublicAddrs { return pub }
+}
+
+// PortMux returns the running server's 443 multiplexer (nil in off mode), for a look at its counters.
+func (s *Server) PortMux() *netx.PortMux {
+	s.life.Lock()
+	defer s.life.Unlock()
+	return s.mux
+}
+
+// TLSManager returns the running server's TLS manager.
+func (s *Server) TLSManager() *tlsmgr.Manager {
+	s.life.Lock()
+	defer s.life.Unlock()
+	return s.tls
+}
+
+// PlainServer returns the running server's port 80 http.Server (nil in off mode), for a look at its limits.
+func (s *Server) PlainServer() *http.Server {
+	s.life.Lock()
+	defer s.life.Unlock()
+	return s.plainSrv
 }
 
 // MainServer returns the running server's main http.Server, for a look at its limits.
