@@ -809,6 +809,12 @@ const (
   who is an admin and absent on members, like `welcome.user.admin`.
   - The hub takes it from the connection's `Identity`, so a role change reaches the room like a rename: `UpdateUser`
     or a `Revalidate` result (§3.2) changes the participant and sends a new snapshot.
+  - A participant has one name and one role for all of the user's connections in the room (§4.1), at first those of
+    the connection that created it. A connection that joins later can know more, because a change that only
+    `Revalidate` reports (the admin CLI) reaches each connection at its own tick and a new connection at its
+    handshake. So at every revalidation tick of a connection in the room, a successful `Revalidate` applies that
+    connection's identity to the participant again, changed or not: `room.state` is right within 5 min of such a
+    change, whichever of the user's connections come and go. A participant that is already in line sends nothing.
   - The field is additive (§14.1): a client that doesn't know it ignores it, and a client that does reads a snapshot
     without it as "members only". Fixture `room.state.admin.json` holds it; `room.state.json` stays as it was.
   - It is a label, not a permission. Admin actions are REST calls that the server checks against the store (03).

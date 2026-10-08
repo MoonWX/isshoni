@@ -43,7 +43,9 @@ type room struct {
 type participant struct {
 	userID string
 	// name and admin are the user's name and role when the participant was created (the identity of its first
-	// connection); then they follow UpdateUser, Revalidate and a resume (room.setUser).
+	// connection); then they follow UpdateUser, Revalidate and a resume (room.setUser). A connection that joins later
+	// doesn't change them, though its identity can be the newer one: every revalidation tick of a connection in the
+	// room applies that connection's identity again (conn.applyRevalidation), so they are right after the next one.
 	name     string
 	admin    bool
 	joinedAt time.Time
@@ -351,8 +353,8 @@ func (r *room) setName(name string) {
 }
 
 // setUser changes a participant's name and role (UpdateUser, Revalidate, a resume), which room.state shows as name
-// and admin (01 §8.5). Each of the user's connections in the room applies the change; only the first one finds
-// something to change, so the room gets one new snapshot.
+// and admin (01 §8.5). Each of the user's connections in the room applies the change, and every revalidation tick of
+// one applies its identity again; only the first call finds something to change, so the room gets one new snapshot.
 func (r *room) setUser(userID, name string, admin bool) {
 	var o outbox
 	r.mu.Lock()

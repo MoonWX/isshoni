@@ -696,6 +696,95 @@ func TestRoomAdmin(t *testing.T) {
 	})
 }
 
+// A participant with several connections (01 §4.1) can have its name and role from a connection that knew less than
+// the ones that stay. A change that only the store has (the admin CLI) reaches a new connection at its handshake,
+// but the participant it joins was made by an older connection, which goes before its own revalidation; after that
+// no connection's own identity ever changes. So every revalidation of a connection in the room applies that
+// connection's identity to the participant (01 §3.2, §8.5): room.state is right after the next tick, in both
+// directions and for the name too. A revalidation that finds the participant in line sends nothing, and a Revalidate
+// result that is older than an UpdateUser doesn't take the room back.
+func TestRoomAdminAcrossConnections(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newEnv(t)
+		defer e.close()
+		cookieO, _ := e.user(false)
+		cookieA, a := e.user(false)
+		obs, _ := e.connect(cookieO, signaltest.DefaultHello())
+		a1, _ := e.connect(cookieA, signaltest.DefaultHello())
+		join(t, obs, "lounge")
+		join(t, a1, "lounge")
+		// expectUser reads the one room.state that a tick brought to each client, with A as given, and nothing else.
+		expectUser := func(name string, admin bool, clients ...*signaltest.Client) {
+			t.Helper()
+			var admins []string
+			if admin {
+				admins = []string{a.UserID}
+			}
+			for i, cl := range clients {
+				st := expectAdmins(t, cl, "lounge", admins...)
+				if p := participantOf(t, &st, a.UserID); p.Name != name {
+					t.Errorf("client %d: A is %q, want %q", i, p.Name, name)
+				}
+				expectOpen(t, cl)
+			}
+		}
+
+		// A becomes an admin with a new name, in the store only. A's second connection has both from its handshake;
+		// the first one leaves the room before its revalidation.
+		time.Sleep(time.Minute)
+		e.auth.SetUser(a.UserID, "alex", true)
+		a2, w := e.connect(cookieA, signaltest.DefaultHello())
+		if w.User.Name != "alex" || !w.User.Admin {
+			t.Fatalf("the second connection's welcome.user %+v, want alex, an admin", w.User)
+		}
+		join(t, a2, "lounge")
+		settle()
+		drain(t, a1)
+		leave(t, a1)
+		settle()
+		drain(t, obs)
+		drain(t, a2)
+		time.Sleep(5 * time.Minute) // every connection's revalidation tick
+		settle()
+		expectUser("alex", true, obs, a2)
+
+		// The other way, and the older connection closes: A is a member again.
+		e.auth.SetUser(a.UserID, "al", false)
+		a3, _ := e.connect(cookieA, signaltest.DefaultHello())
+		join(t, a3, "lounge")
+		settle()
+		if err := a2.CloseWith(websocket.StatusNormalClosure); err != nil {
+			t.Fatal(err)
+		}
+		settle()
+		drain(t, obs)
+		drain(t, a3)
+		time.Sleep(5 * time.Minute)
+		settle()
+		expectUser("al", false, obs, a3)
+
+		// In line: the next ticks send nothing.
+		time.Sleep(5 * time.Minute)
+		settle()
+		expectOpen(t, obs)
+		expectOpen(t, a3)
+
+		// An UpdateUser while a tick's Revalidate runs: the result, read before the change, equals the identity the
+		// call began with, and the room keeps what UpdateUser gave it.
+		release := e.auth.HoldRevalidate()
+		defer release()
+		time.Sleep(5 * time.Minute)
+		synctest.Wait()
+		e.hub.UpdateUser(a.UserID, "alexa", true)
+		settle()
+		expectUser("alexa", true, obs, a3)
+		release()
+		settle()
+		expectOpen(t, obs)
+		expectOpen(t, a3)
+	})
+}
+
 // Why a participant left (01 §4.2, §8.6): a deliberate close (1000, 1001) and a revocation are left, at once; a
 // dropped socket and a close by the hub (idle timeout) are disconnected, once the grace has expired.
 func TestRoomLeaveReasons(t *testing.T) {

@@ -1015,6 +1015,11 @@ func (c *conn) revalidate() {
 // applyRevalidation applies the result of Revalidate for identity id (01 §3.2). Only ErrInvalid closes the
 // connection (session_revoked, 4401); any other error keeps it, and the next tick retries. A changed name or admin
 // flag is applied like UpdateUser.
+//
+// An unchanged result still goes to the connection's room. The participant there can have its name and role from
+// another of the user's connections, one that knew less than this one and has left since (a change that only
+// Revalidate reports reaches each connection at its own tick, and a new connection at its handshake). No identity
+// changes after that, so without this the room would keep the older values for good (01 §8.5).
 func (c *conn) applyRevalidation(id, nid Identity, err error) {
 	switch {
 	case errors.Is(err, ErrInvalid):
@@ -1024,5 +1029,10 @@ func (c *conn) applyRevalidation(id, nid Identity, err error) {
 			slog.Any("err", err))
 	case nid.Name != id.Name || nid.Admin != id.Admin:
 		c.setUser(nid.Name, nid.Admin)
+	case c.room != nil:
+		// The connection's identity as it is now, not nid: an UpdateUser that arrived while the call ran is newer
+		// than the call's result. room.setUser does nothing when the participant is in line, which is the usual case.
+		cur := c.identity()
+		c.room.setUser(c.userID, cur.Name, cur.Admin)
 	}
 }
