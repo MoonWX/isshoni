@@ -74,7 +74,7 @@ internal/server/
   ops/               health.go metrics.go transfer.go dashboard.go release.go conntest.go
                      adminsock.go adminapi.go adminclient.go backup.go restore.go peercred_linux.go peercred_darwin.go
   ops/doctor/        doctor.go checks_*.go bandwidth.go render.go messages_en.go
-  push/              service.go sender.go ssrf.go limits.go prune.go
+  push/              service.go sender.go ssrf.go limits.go prune.go payload.go store.go
   servertest/        servertest.go
 ```
 
@@ -316,7 +316,7 @@ The other reserved names of §4.2 (`ISSHONI_VERSION`, install.sh's and the dev t
 | Key | Default | Notes |
 |---|---|---|
 | `push.enabled` | `true` | Web Push (§14) |
-| `push.subject` | `""` = derived | VAPID `sub`: `mailto:<tls.acme_email>` if set, else the public origin. Must start with `mailto:` or `https:` |
+| `push.subject` | `""` = derived | VAPID `sub`: `mailto:<tls.acme_email>` if set, else the public origin (an `http://` origin is given as `https://`, §14.1). Must start with `mailto:` or `https:` |
 | `metrics.enabled` | `false` | Prometheus endpoint (§11.2) |
 | `metrics.listen` | `"127.0.0.1:9469"` | Warning if not loopback: metrics are unauthenticated |
 | `metrics.pprof` | `false` | `/debug/pprof/*` on the metrics listener |
@@ -424,7 +424,7 @@ Rules (E = error, W = warning):
 | `trusted_proxies` entries are CIDRs; `stun_servers` are `host:port` | E |
 | `admin_socket` ≤ 104 bytes; `data_dir` not empty | E |
 | Durations > 0; `udp_buffer_bytes` between 1 MiB and 64 MiB | E |
-| `push.subject` starts with `mailto:` or `https:` | E |
+| `push.subject` starts with `mailto:` or `https:` (only the prefix is checked; `push.New` also refuses a bare `mailto:` or `https:`, §14.1) | E |
 | `clients.min_version` is SemVer | E |
 | Policy key value accepted by 03's `SettingsCache.Pin` (ranges of 03 §9) | E (at serve startup; reported like other config errors, exit 78) |
 | `metrics.listen` not loopback | W |
@@ -865,8 +865,9 @@ The only place (with `cmd/isshoni` and `servertest`, §2) that imports 01's `sig
 | `ops.Policy` (`TransferAlertGB() int`, `ReleaseCheck() bool`) | 03's `SettingsCache.Get()` | `transferAlertGb`, `updateCheck`; read on every tick (§11.3, §11.5) |
 | `ops.LiveSource`, `ops.AccountsSource`, `ops.Prober` | hub + SFU, 03's `API.DashboardAccounts`, `SFU.Probe` | §11.4, §7.7 |
 | Offline DB functions of `ops` (backup, restore) and `ops/doctor` (`schema`) | 03's `store.LatestSchemaVersion`, `store.InspectFile`, `store.BackupFile` | passed as function values (§2); `cmd/isshoni` does the same for offline commands (§12.3, §12.4, §13.1) |
-| `push.Store` | 03's store | §14.7 |
-| `push.enabled=false` | – | the wiring passes `httpapi.Deps.Push = nil` and `auth.Options.Alerts = nil`, and does not start `push.Service`; 03 then answers `push_unavailable` and omits `push` from `/info` |
+| `push.Store` | 03's store | §14.7; `store.ErrNotFound` becomes nil in `RecordResult` and `Delete`, and `""` with a nil error in `Meta` |
+| `push.Options` | built by the wiring | `Subject` = `push.DeriveSubject(push.subject, tls.acme_email, Site.Origin)`; `VAPID` = `SecretStore.VAPID`; `OwnAddrs` = the detected `PublicAddrs.V4` and `V6`; `Metrics` = `ops.Metrics.Registerer()` (§14.1, §14.3) |
+| `push.enabled=false` | – | the wiring passes `httpapi.Deps.Push = nil` and `auth.Options.Alerts = nil`, and does not build or start `push.Service`: it never calls `push.New`, which refuses `Options.Enabled == false` with `push.ErrDisabled` (§14.3); 03 then answers `push_unavailable` and omits `push` from `/info` |
 | REST routes of `ops` and `push` | 03's `API.Handle` | each typed `ops`/`push` function is wrapped with `httpapi.DecodeJSON`/`WriteJSON`/`WriteError` and registered through `API.Handle` with the principal from `httpapi.PrincipalFrom` (§2): `POST /api/v1/conntest` (User), `GET /api/v1/admin/dashboard`, `GET\|POST /api/v1/admin/doctor`, `GET /api/v1/admin/bandwidth` (Admin) |
 | Admin socket handlers | 03's `auth.Service`, `store.DB` | 03 §12.6 table |
 | Metrics | `ops.Metrics.Registerer()` to 01; a `prometheus.Collector` over `SFU.Metrics()` | §11.2 |
@@ -2175,6 +2176,21 @@ The admin UI calls `GET /api/v1/admin/bandwidth?people=5&sharing=2&thumbnails=8&
 - VAPID key pair from `secrets.json` (§5.2), public key published base64url (65-byte uncompressed P-256 point).
 - `sub` claim = `push.subject` or derived (§4.3). Apple rejects tokens with an invalid `sub`, so the iPhone check in the
   M1 exit test covers the derived IP-origin form.
+- The derivation is `push.DeriveSubject(pushSubject, acmeEmail, origin string) string` (S32), which the wiring calls
+  with `push.subject`, `tls.acme_email` and `Site.Origin` to fill `Options.Subject`: `push.subject` when it is set,
+  else `"mailto:" + tls.acme_email` when that is set, else the public origin. The claim must be a `mailto:` or an
+  `https:` URL (RFC 8292 §2.1), so **an `http://` origin** (off mode without a proxy that says https, a development
+  server) **is given as `https://`** with the same host: the claim only names a contact, and nothing connects to it.
+  `New` refuses any other subject: it must start with `mailto:` or `https:` and have something after the prefix.
+  `config` checks only the prefix (§4.5), so a bare `mailto:` or `https:` in `push.subject` passes config validation
+  and is refused by `New` at startup (§6.1 step 8; with `push.enabled = false` `New` isn't called, §6.6). The
+  derived forms always pass: `mailto:` with a non-empty address, or the origin that `config.NewSite` built, which
+  has a host. Making the config rule as strict as `New`'s, and correcting the comment on `validSubject` (it says
+  the two rules are the same), is a code follow-up for a slice that may touch `internal/server/config` and
+  `internal/server/push`.
+- The key pair comes from `Options.VAPID()` (`SecretStore.VAPID`), read once in `New`, which checks that it is a
+  pair: a 65-byte uncompressed P-256 point that belongs to the 32-byte private scalar (`crypto/ecdh`), else `New`
+  fails. `VAPIDPublicKey()` returns the point in base64url without padding.
 - JWT expiry 12 h (webpush-go `VapidExpiration`); library `github.com/SherClockHolmes/webpush-go v1.4.0`
   (`SendNotificationWithContext`, RFC 8291 `aes128gcm`, RFC 8292 VAPID).
 
@@ -2188,7 +2204,11 @@ there is no separate config endpoint. This service implements what those handler
 - `VAPIDPublicKey() string`;
 - `ValidateEndpoint(ctx, endpoint) error`: the subscribe-time checks of §14.5 (https, port 443, no userinfo, DNS name
   that currently resolves only to allowed addresses), returning `*api.Error{push_endpoint_rejected, params.reason}`;
-- `SendTest(ctx, subs)`: queues a `push.test` payload to the given subscriptions.
+- `SendTest(ctx, subs)`: queues a `push.test` payload to the given subscriptions and doesn't wait for the delivery.
+  With no subscriptions it does nothing and returns nil (03's handler answers 404 for that case itself). It returns
+  `*api.Error{server_busy, retryAfter: 5}` when the queue took none of them, and
+  `*api.Error{server_shutdown, retryAfter: 5}` once `Run`'s context has ended; both are 503 through
+  `httpapi.WriteError` (03 §12.3 #28). The per-recipient bucket of §14.4 does not apply to it.
 
 05 posts its subscription on every app start when permission is granted, and re-subscribes when the key in `/info`
 differs from the subscription's `applicationServerKey`.
@@ -2240,23 +2260,37 @@ type AdminAlert struct { // the wiring converts 03's auth.AdminAlert
 	At                  time.Time
 }
 
-type Options struct {
-	Enabled      bool                    // push.enabled
-	VAPID        func() config.VAPIDKeys
-	Subject      string
+type Options struct { // only Enabled, VAPID, Subject and Store are required
+	Enabled      bool                    // push.enabled; New refuses a disabled service (ErrDisabled)
+	VAPID        func() config.VAPIDKeys // SecretStore.VAPID; read once, in New
+	Subject      string                  // the VAPID sub claim: a mailto: or https: URL (DeriveSubject, §14.1)
 	Store        Store
-	Sender       Sender        // real: webpush-go with the guarded client (§14.5)
-	Workers      int           // 4
-	QueueLen     int           // 1024
-	Now          func() time.Time
-	Logger       *slog.Logger
-	allowPrivate bool          // tests only (set through an internal test hook)
+	Sender       Sender           // nil: the real one, webpush-go with the guarded client (§14.5)
+	Workers      int              // 0: 4
+	QueueLen     int              // 0: 1024
+	Now          func() time.Time // nil: time.Now
+	Logger       *slog.Logger     // nil: discard; the service adds component=push
+	Resolver     netx.Resolver    // resolves an endpoint's host in ValidateEndpoint; nil: net.DefaultResolver
+	OwnAddrs     []netip.Addr     // the server's public addresses (netx.PublicAddrs.V4 and V6): the guard refuses
+	                              // them, so that an endpoint can't make the server call itself; zero values ignored
+	Metrics      prometheus.Registerer // ops.Metrics.Registerer(): gets isshoni_push_sent_total{result} (§11.2),
+	                                   // every result exported at 0 from the start; nil: no metric
+	allowPrivate bool             // tests only: turns off the guard's address, port and IP-literal rules. Unexported,
+	                              // so only this package's tests can set it
+	rootCAs      *x509.CertPool   // tests only: replaces the system roots in the real sender
 }
+
+// ErrDisabled is New's error for Options.Enabled == false. With push.enabled = false the wiring doesn't call New
+// at all (§6.6).
+var ErrDisabled = errors.New("push: disabled by push.enabled = false")
 
 type Service struct{ /* … */ }
 
-func New(ctx context.Context, opts Options) (*Service, error) // checks vapid_key_fp and purges before returning (§5.2)
-func (s *Service) Run(ctx context.Context) error          // workers + daily prune
+func New(ctx context.Context, opts Options) (*Service, error) // checks vapid_key_fp and purges before returning (§5.2);
+                                                          // starts no goroutine
+func DeriveSubject(pushSubject, acmeEmail, origin string) string // §14.1
+func (s *Service) Run(ctx context.Context) error          // workers, dispatcher and the daily prune; blocks until ctx
+                                                          // ends, drains for ≤ 2 s, returns nil; callable once
 func (s *Service) ShareStarted(ev ShareStarted)           // non-blocking; drops when the queue is full
 func (s *Service) AdminAlert(a AdminAlert)                // non-blocking
 func (s *Service) VAPIDPublicKey() string                 // 03's httpapi.Push
@@ -2264,24 +2298,39 @@ func (s *Service) ValidateEndpoint(ctx context.Context, endpoint string) error
 func (s *Service) SendTest(ctx context.Context, subs []Subscription) error
 
 type Sender interface {
+	// The push service's answer comes back as a SendResult with a nil error, whatever the status. An error means no
+	// answer arrived and is retried like a 5xx, unless it wraps ErrUndeliverable. Errors never contain the endpoint.
 	Send(ctx context.Context, sub Subscription, payload []byte, o SendOptions) (SendResult, error)
 }
 type SendOptions struct {
 	TTL     time.Duration
-	Urgency string // "very-low" | "low" | "normal" | "high"
+	Urgency string // "very-low" | "low" | "normal" | "high" (UrgencyVeryLow … UrgencyHigh)
 	Topic   string
 }
 type SendResult struct {
 	Status     int
-	RetryAfter time.Duration
+	RetryAfter time.Duration // from a Retry-After header (seconds or an HTTP date); 0 when there was none
 }
+
+var ErrUndeliverable = errors.New("push: the message can't be delivered to this subscription") // never retried (§14.5)
+var ErrBlockedAddress = fmt.Errorf("%w: the SSRF guard refused the address", ErrUndeliverable)
 ```
+
+`ShareStarted`, `AdminAlert` and `SendTest` only queue. They may be called before `Run` and from any goroutine, and
+are ignored (`SendTest`: `server_shutdown`) once `Run`'s context has ended. `push` imports
+`github.com/prometheus/client_golang` for the one counter; like every component it registers through the
+`Registerer` it is handed (§11.2), and a nil `Metrics` keeps tests free of it.
 
 ### 14.4 Dedup and rate limits
 
 - `share.started`: at most once per (room, sharer) per **10 minutes**, whatever the number of connections the sharer
   has (web plus desktop). A share that resumes within 01's 30 s grace period is the same share and sends nothing.
-- Per recipient: token bucket, burst 3, refill 1 per 10 minutes; excess is dropped and counted (`dropped`).
+- Per recipient: token bucket, burst 3, refill 1 per 10 minutes; excess is dropped and counted (`dropped`). A
+  recipient is a user: one event costs one token, whatever the number of that user's subscriptions, and a user
+  without a token gets it on none of them. The bucket covers `share.started` and `admin.alert`.
+- **`push.test` is exempt from the bucket** (S32): 03 limits the endpoint itself (1 per 10 s per user, 03 §7.3
+  `push-test`), and a test that silently sends nothing would look like broken notifications. A test doesn't take a
+  token either, so it never uses up the budget of real notifications.
 - `Topic` header per (room, sharer): `s` + first 22 chars of base64url(SHA-256(roomID + "/" + userID)) (≤ 32
   URL-safe chars), so a phone that was offline receives only the latest notification per sharer.
 - `admin.alert`: 03 already coalesces `signup_pending` (one per 10 min); transfer alerts fire once per threshold per
@@ -2300,6 +2349,35 @@ At subscribe time (`ValidateEndpoint`, called by 03's handler; failures are `pus
   must be a DNS name, any IP literal is rejected (`ip_literal`).
 - The host must currently resolve (`unresolvable`), and only to allowed addresses (below; `private_address`).
 
+How S32 reads these rules, where the two lines above leave room (it is stricter in each case, and only
+`params.reason` depends on it):
+- **Order.** The URL rules are checked in the order scheme, port, userinfo, IP literal, and an endpoint that breaks
+  several is refused with the reason of the first: `https://user@push.example.com:8443/x` is `bad_port`.
+- **Scheme**: also `not_https` for an opaque URL (`https:push.example.com`) and for anything that isn't a URL and
+  doesn't start with `https://`. A string that starts with `https://` but that `net/url` can't parse follows the
+  same order: a port that isn't a number is `bad_port`, then userinfo is `userinfo`, anything else is
+  `unresolvable`.
+- **Port**: an empty port (`https://push.example.com:/x`) is `bad_port` too.
+- **IP literal, in every spelling**: a bracketed IPv6 address, dotted decimal, and the IPv4 spellings that C
+  resolvers and browsers also accept (`2130706433`, `127.1`, `0x7f.0.0.1`, `0177.0.0.1`). The rule is WHATWG's: a
+  host whose last label is a number (decimal, or hex after `0x`) is an IPv4 address. No DNS top-level domain is
+  numeric, so nothing real is refused.
+- **A host that is no DNS name** is `unresolvable` without a lookup: an empty host, a label that is empty or over 63
+  bytes, a name over 253 bytes, or a character other than a letter, a digit, `-` or `_` (browsers send an
+  internationalized name as punycode). One trailing dot is allowed.
+- **`localhost` and every name under `.localhost`** are `private_address` without a lookup, whatever the resolver
+  says (RFC 6761).
+- **Resolution**: `Options.Resolver.LookupNetIP(ctx, "ip", host)` with a 5 s timeout. An error or an empty answer is
+  `unresolvable`. Every address of the answer must be allowed, IPv4 and IPv6 alike: one private address among public
+  ones is `private_address`.
+- **Allowed addresses** are public unicast addresses that are not in `Options.OwnAddrs`. IPv4: everything outside
+  the blocks listed below, to which S32 adds `192.88.99.0/24` (6to4 relay anycast) and `240.0.0.0/4` (reserved,
+  with the broadcast address). IPv6 is checked the other way round: only `2000::/3` is global unicast, so loopback,
+  link-local, ULA, site-local, multicast and the discard prefix are refused without a list; inside `2000::/3`,
+  `2001::/23` (Teredo, benchmarking, ORCHID), `2001:db8::/32` and `3fff::/20` (documentation) and `2002::/16` (6to4)
+  are refused. An IPv4-mapped address and an address in the NAT64 prefix `64:ff9b::/96` are judged by the IPv4
+  address inside. An address with a zone is refused.
+
 At send time (the real guard, because DNS can change):
 - A dedicated `http.Client` whose `net.Dialer.Control` rejects the **actual IP being dialed** unless it is a public
   unicast address. Rejected: unspecified, loopback, private (RFC 1918), CGNAT `100.64.0.0/10`, link-local (incl.
@@ -2309,6 +2387,12 @@ At send time (the real guard, because DNS can change):
 - `Proxy: nil` (environment proxies ignored), `CheckRedirect` returns `http.ErrUseLastResponse` (no redirects),
   timeout 10 s, response body read ≤ 4 KiB.
 - `webpush.Options{HTTPClient: guarded, Subscriber: subject, VAPIDPublicKey, VAPIDPrivateKey, TTL, Urgency, Topic}`.
+- S32's guard also refuses, in `Control`, any port other than 443, and before each send it runs the stored endpoint
+  through the URL rules above again, so a row written in any other way never reaches the client. Both refusals
+  are `ErrBlockedAddress` or `ErrUndeliverable`: the subscription counts a failure and nothing is retried. The
+  endpoint goes to webpush-go with its origin in the form of RFC 6454 (lower-case host, no `:443`), because the
+  VAPID token's `aud` claim is built from the URL as written. Errors and logs carry only the endpoint's host
+  (`push_host`), never the URL.
 
 Results:
 
@@ -2321,6 +2405,23 @@ Results:
 | 429, 5xx, network error | retry at 5 s and 30 s (or `Retry-After` ≤ 60 s) while still within the TTL, then `failures++` |
 
 Queue: 1024 jobs, 4 workers; a full queue drops the job (`dropped`).
+
+How S32 reads the table (every status has a row, and the `isshoni_push_sent_total` result is named):
+- **ok**: every 2xx, not only 200, 201 and 202.
+- **gone** (404, 410) and **rejected** (401, 403): as above, the subscription is deleted.
+- **error, not retried**: 400, 413 and every other answer that a retry can't change (any 3xx, since no redirect is
+  followed, and any 4xx that has no row of its own), and a send that fails with `ErrUndeliverable` (the
+  subscription's keys don't decode, its endpoint breaks the URL rules, or the guard refused the address). One
+  warning, `failures++`.
+- **transient**: 408, 429, every 5xx, and no answer at all (a network error, a timeout). At most two retries, 5 s
+  after the first attempt and 30 s after the second; a `Retry-After` of at most 60 s replaces that wait. There is no
+  retry when the push service asks for more than 60 s, or when the wait would end at or after the end of the
+  message's TTL (which runs from the moment the dispatcher takes the event): the message is then an **error**
+  (`failures++`) at once, as it is after the third attempt. A retry asks the push service to keep the message only
+  for what is left of its TTL, and it holds no worker while it waits.
+- **dropped** (never sent, no `failures++`): the queue is full, the recipient has no token (§14.4), the TTL ran out
+  while the job was queued, or the server is shutting down (the retries that wait are given up, and what is
+  still queued after the 2 s drain of §6.4). Drops are logged at most once a minute, with their count.
 
 ### 14.6 Pruning
 
@@ -2355,7 +2456,7 @@ type Store interface { // wiring adapter over 03's store (03 §6)
 type RecipientFilter struct {
 	ExcludeUserIDs []string
 	AdminsOnly     bool
-	Pref           string // "share_started" | "admin_alerts" | ""
+	Pref           string // PrefShareStarted ("share_started") | PrefAdminAlerts ("admin_alerts") | ""
 	SessionID      string // push.test
 } // fields map 1:1 to 03's PushFilter
 
@@ -2455,7 +2556,7 @@ no tokens, SDP, push endpoints or usernames.
 | `ops` | Health state machine (starting → ready → shutting_down); conntest function (transport validation, `transport_disabled` with `params.transport` for each transport without a listener, per-user rate limit, `sfu.probe_limit` → 429, `publicIp` `""` without a public IPv4, `container` value) with a fake `Prober`; transfer flush, month rollover at UTC midnight, 80/100 % alerts once; release parser (drafts, prereleases, semver order, security marker, ETag 304); dashboard JSON golden file |
 | `ops` admin | Peer-cred filter (injected creds); every endpoint via `httptest` over a real unix socket (short path under `/tmp`: macOS `sun_path` is 104 bytes); backup tar layout and manifest; offline backup falls back to raw files only when `BackupFile` fails; restore validation rejects traversal, symlinks, extra names, bad hashes, and (through `InspectFile`, whatever the manifest says) a newer schema, a history mismatch or a failed integrity check; offline commands exit 7 while the data-directory lock is held; swap crash recovery from each `plan.json` state; old WAL never next to the new DB |
 | `doctor` | Each check with fake FS/resolver/STUN/clock/DMI; `tls` with no certificate is `warn` with `fixCode` = the §8.7 code right after one failed ACME attempt and `fail` after 10 min; `public_ip` in `ip` mode with DMI `aws`/`gcp` adds the `public_ip.ephemeral` info (not in `auto` mode or on other providers); `clock` with a fake `adjtimex` returning EPERM (sync unknown, no warn; skew check decides; `info` in `manual`/`off`); provider table; bandwidth numbers (plan example 10.53 Mbps/viewer and 105 Mbps; exit scenario 41.5 Mbps); JSON golden; text render; exit codes 0/5 and `--strict` |
-| `push` | `ValidateEndpoint` table (http, :8443, userinfo, IP literal, localhost, 10/8, [::1], fd00::/8, 169.254.169.254, 100.64/10, name resolving private → `push_endpoint_rejected` with the right `reason`); `Control` blocks a rebinding resolver; no redirects followed; recipient filter passed to the store (sharer and `PresentUserIDs` excluded, `Pref`); `admin.alert` payload per 03 alert kind; VAPID fingerprint change deletes all subscriptions before `push.New` returns; dedup window; per-recipient bucket; 404/410/401/403 prune; 429 retry with `Retry-After`; payload < 1 KB; round trip through a fake push service that **decrypts** `aes128gcm` with the test subscription's private key and checks the VAPID JWT (`aud`, `exp`, `sub`) |
+| `push` | `ValidateEndpoint` table (http, :8443, userinfo, IP literal, localhost, 10/8, [::1], fd00::/8, 169.254.169.254, 100.64/10, name resolving private → `push_endpoint_rejected` with the right `reason`; also the order of the reasons for an endpoint that breaks several rules, the IPv4 spellings `2130706433`, `127.1` and `0x7f.0.0.1`, a host that is no DNS name, an empty port, the server's own address, and a fuzz target for the URL rules: §14.5); `Control` blocks a rebinding resolver and any port but 443; no redirects followed; the result table per status (every 2xx ok; 3xx and other 4xx an error without a retry; 408 retried; a `Retry-After` over 60 s and a wait past the TTL end the retries); `push.test` is not rate-limited per recipient; `New` with `Enabled: false` → `ErrDisabled`; `DeriveSubject` (an `http://` origin becomes `https://`); recipient filter passed to the store (sharer and `PresentUserIDs` excluded, `Pref`); `admin.alert` payload per 03 alert kind; VAPID fingerprint change deletes all subscriptions before `push.New` returns; dedup window; per-recipient bucket; 404/410/401/403 prune; 429 retry with `Retry-After`; payload < 1 KB; round trip through a fake push service that **decrypts** `aes128gcm` with the test subscription's private key and checks the VAPID JWT (`aud`, `exp`, `sub`) |
 | `version` | Build with `-ldflags -X …` in a test and check `isshoni version --json`; BuildInfo fallback |
 | `cmd/isshoni` | `testscript` (rogpeppe/go-internal, test-only): every subcommand's usage, exit codes (incl. healthcheck 0/1 only), a permission case run as a non-root uid that is not the server's (a socket directory it can't enter, and a server whose peer-cred filter rejects it): `setup-url` and `admin status` exit 4 with the `sudo` message, `doctor` prints it and runs no offline checks (skipped when the tests run as root), `--json` shapes, confirmation prompts and `--yes`, the no-TTY refusal without `--yes` (exit 2, printing the `--yes` command in the systemd form and, with container detection faked, the `docker compose exec -T` form), container `--out` requirement, `admin backup --out -` refused with exit 2 and the umask Docker form when stdout is a terminal (testscript `ttyout`) |
 
@@ -2546,9 +2647,11 @@ Packages and names (exact):
   `AccountsSource`, `Policy`, `Prober`, the typed dashboard, doctor, bandwidth and conntest functions (§2), admin
   socket API (§12.2) and client (`ops.DialAdmin(path) *AdminClient`).
 - `internal/server/ops/doctor`: `Run`, `Bandwidth`, `RenderText`, `CheckIDs`, `Env`, `DBFiles`, `DBInfo`.
-- `internal/server/push`: `New(ctx, opts)`, `Service` (`ShareStarted`, `AdminAlert`, `VAPIDPublicKey`,
-  `ValidateEndpoint`, `SendTest`, `Run`), `ShareStarted`, `AdminAlert`, `Store`, `RecipientFilter`, `Sender`,
-  `Subscription`.
+- `internal/server/push`: `New(ctx, opts)`, `Options` (with `Resolver`, `OwnAddrs`, `Metrics`), `ErrDisabled`,
+  `DeriveSubject`, `Service` (`ShareStarted`, `AdminAlert`, `VAPIDPublicKey`,
+  `ValidateEndpoint`, `SendTest`, `Run`), `ShareStarted`, `AdminAlert`, `Store`, `RecipientFilter`
+  (`PrefShareStarted`, `PrefAdminAlerts`), `Sender`, `SendOptions`, `SendResult`, `ErrUndeliverable`,
+  `ErrBlockedAddress`, `Subscription`.
 - `internal/server`: `Server`, `New`, `Start`, `Run`, `Shutdown`, `Site`, `Addrs`, `ShutdownReason`,
   `ErrRestartRequested`, `ErrShutdownForced`, `NeedsOperator`, `Deps`, and the wiring table of §6.6.
 - `internal/server/servertest`: `Start(t testing.TB, opts Options) *Server` with fields `URL` (`http://` plus the

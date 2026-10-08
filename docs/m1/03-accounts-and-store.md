@@ -1028,6 +1028,14 @@ The throttles are in-memory token buckets (decision 8), in `auth/limiter.go`. Ev
   A signed long-lived device cookie that would let such a browser through comes *later (M6 hardening)*.
 - A successful login refills that username's `auth-user-ip` bucket for that IP. It doesn't touch `auth-user`, so a
   friend's login never hands an attacker a fresh budget.
+- **The two per-username buckets count failures, but a login takes its tokens before the hash** (S30), one from
+  each, and gets them back unless the password check failed. Charging after the verdict would let guesses sent in
+  parallel all see the bucket as it was. A wrong password or an unknown username keeps both tokens. A login that
+  succeeds gets the `auth-user` token back and its `auth-user-ip` bucket refilled (the bullet above). Every other
+  end gives both back, because none is a failed password check: an empty `auth-hash` budget, a full hash queue, a
+  store or context error, and a correct password for an account that isn't `active`. An attempt that `auth-user`
+  refuses holds no `auth-user-ip` token either; a known IP that goes on while `auth-user` is empty takes none from
+  it.
 - **`auth-hash`** caps the total rate of anonymous argon2 hashes, which the per-IP and per-username buckets can't: a
   stranger with many addresses (IPv6 /64s are cheap) could otherwise keep every hash slot busy with random usernames,
   and the SFU would compete for CPU. 5 hashes per second at about 50 ms each use a quarter of one core, about 1/8 of a
@@ -1077,6 +1085,15 @@ Set-Cookie: __Host-isshoni_session=<43-char token>; Path=/; Max-Age=2592000; Htt
     working.
   - The session ID stays the same, and so do the push subscriptions tied to it. The SPA calls `GET /api/v1/me` at
     start, which guarantees a rotation at least daily for an active user.
+  - `MaybeRotate(w, p)` has no request and so no context (§7.13). Its one `Write` runs under
+    `context.Background()` with a **5 s timeout** of its own (S30): the rotation doesn't depend on the client
+    staying connected, and it can't hold a request for longer. This is the one use of `context.Background()` in
+    `auth` outside tests (README §4).
+  - It decides from the cached session (`rotated_at` ≥ 24 h ago) and checks again inside the `Write`, so of several
+    parallel requests with an old token exactly one rotates; the others keep the old token, valid for its 60 s, and
+    the browser replaces it when that one response arrives. The rotation counts as a use (`last_seen_at` and
+    `idle_expires_at` move, and `Max-Age` is the new idle time). A failed write is logged at WARN and the request
+    goes on with its current token; the next request tries again.
 - **Login** always issues a new token, so session fixation is impossible. A login or registration that arrives with a
   session cookie deletes that old session first.
 - **Touch**:
@@ -1195,8 +1212,9 @@ reason to its `error{code, retryable:false}` message and close code (01 §12.1, 
 - **Flow**: the SPA reads the token from `location.hash` and removes the fragment with `history.replaceState` (05).
   1. `POST /api/v1/auth/setup/check {token}` → 204. It lets the page show "link expired" before the form is filled
      in.
-  2. `POST /api/v1/auth/setup/complete {token, username, password, serverName?}`. The steps are: throttle, validate,
-     hash (outside the transaction), then one `Write`:
+  2. `POST /api/v1/auth/setup/complete {token, username, password, serverName?}`. The steps are: throttle
+     (`auth-ip`), **check the token** (S30, below), validate, hash (the `auth-hash` budget, then the hash, outside
+     the transaction), then one `Write`:
      - check the token hash is unexpired and **no admin exists**;
      - create the user (`role=admin`, `created_via=setup`) and a session;
      - delete all setup tokens and set `server.name` if it was given, with `db.Settings().UpdateTx` in the same
@@ -1206,6 +1224,17 @@ reason to its `error{code, retryable:false}` message and close code (01 §12.1, 
      
      The response is 201 with the session cookie. A race between two tabs leaves exactly one admin: the loser gets 404
      `setup_unavailable`.
+
+     **The token is checked before anything is hashed** (S30). After the `auth-ip` bucket, `CompleteSetup` runs the
+     read-only check of `setup/check` (an admin exists → 404 `setup_unavailable`; a token of the wrong shape, or one
+     that is unknown, replaced or expired → 404 `setup_token_invalid`). Only a request with a live token goes on to
+     the field rules, the `auth-hash` budget and argon2, so a stranger without the link can neither spend hashes nor
+     learn from a 422 which usernames or passwords the server would take. The answers follow from that order: a dead
+     token with bad fields is 404, not 422; a live token with bad fields is 422 `validation_failed` with a code per
+     field (`username` and `password` are both checked before it answers), and it takes no `auth-hash` token. The
+     `Write` checks the token and the admin again, which is what decides the race above. A `serverName` that the
+     settings refuse is 422 from `UpdateTx` inside the `Write` (§9), after the hash; a username that another account
+     already has is 409 `username_taken`, also from the `Write`.
 - The wizard's next steps (connection test, first invite) run as that logged-in admin. The SPA sets
   `setupWizardDone` when the admin finishes the wizard; step progress lives in the URL (05 §14.1).
 
@@ -1492,7 +1521,9 @@ func (s *Service) AuthenticateCookie(r *http.Request) (Principal, error) // /ws 
 // Touch is the hub's Revalidate: validates session/device + user every call; write throttled and best effort; only
 // unauthenticated means gone (§7.4, §7.6).
 func (s *Service) Touch(ctx context.Context, p Principal, ip netip.Addr) error
-func (s *Service) MaybeRotate(w http.ResponseWriter, p Principal)    // REST middleware (§7.4)
+func (s *Service) MaybeRotate(w http.ResponseWriter, p Principal)    // REST middleware (§7.4); it takes no ctx: its
+                                                                     // write runs under context.Background() with a
+                                                                     // 5 s timeout, and a failure is only logged
 func (s *Service) SetSessionCookie(w http.ResponseWriter, token string, idleExpires time.Time)
 func (s *Service) ClearSessionCookie(w http.ResponseWriter)
 func (s *Service) CSRF(next http.Handler) http.Handler               // §7.5
@@ -1582,8 +1613,23 @@ func (s *Service) PasswordDeviceLogin(ctx context.Context, in api.DevicePassword
 
 All service errors are `*api.Error` (§12.2) carrying a stable code, so httpapi maps them to status codes in one table.
 The one exception is `ErrNoCookie`, which only the /ws adapter sees (§7.6); `AuthenticateCookie` returns
-`*api.Error{unauthenticated}` for an invalid, expired or non-`active` session and passes any other error through
-as-is.
+`*api.Error{unauthenticated}` for an invalid, expired or non-`active` session, and any other failure (the store) as
+the wrapped `internal` error below, which is not `unauthenticated`.
+
+**Unexpected failures wrap `*api.Error{internal}`** (S30). A failure that has no code of its own (the store, a
+cancelled or expired context, a hasher error other than a full queue) is returned as
+
+```go
+fmt.Errorf("auth: %s: %w (%w)", op, err, api.NewError(api.CodeInternal)) // op: "login", "complete setup", …
+```
+
+so `errors.As` finds an `*api.Error` with code `internal` (`httpapi.WriteError` answers 500 with the request ID),
+and `errors.Is` still finds the cause (`context.Canceled`, a store sentinel), which `WriteError` logs and which never
+reaches the client. An `*api.Error` that comes out of a `Write` (for example `setup_unavailable`, or
+`validation_failed` from `SettingsCache.UpdateTx`) passes through unchanged. The methods that later slices fill in
+return the same kind of error until then: `fmt.Errorf("auth: %s not implemented: %w", method,
+api.NewError(api.CodeInternal))` (README S24). `New` is the exception: it runs before anything serves, and its errors
+(a bad option, the store) are plain errors.
 
 ---
 
@@ -1939,13 +1985,13 @@ Common errors are not repeated per row: `bad_request`, `payload_too_large`, `uns
 | # | Method and path | Access | Success | Endpoint-specific errors | M |
 |---|---|---|---|---|---|
 | 1 | `GET /api/v1/info` | Public | 200 `Info` | — | M1 |
-| 2 | `POST /api/v1/auth/login` | Public | 200 `{user}` + cookie | 401 `invalid_credentials`, 403 `account_pending`/`account_disabled`, 422, 503 `server_busy` | M1 |
+| 2 | `POST /api/v1/auth/login` | Public | 200 `{user}` + cookie | 401 `invalid_credentials` (also for a username no account can have, §12.4.2), 403 `account_pending`/`account_disabled`, 422, 503 `server_busy` | M1 |
 | 3 | `POST /api/v1/auth/logout` | Public | 204, cookie cleared | — (idempotent) | M1 |
 | 4 | `POST /api/v1/auth/logout-everywhere` | User | 204, cookie cleared | — | M1 |
 | 5 | `POST /api/v1/auth/register` | Public | 201 `{status:"active", user}` + cookie · 202 `{status:"pending"}` | 403 `registration_closed`/`invite_required`, 404 `invite_invalid`, 410 `invite_*`, 409 `username_taken`/`limit_reached`, 422, 503 | M1 |
 | 6 | `POST /api/v1/auth/invite/check` | Public | 200 `InviteInfo` | 403 `registration_closed`, 404 `invite_invalid`, 410 `invite_*` | M1 |
 | 7 | `POST /api/v1/auth/setup/check` | Public | 204 | 404 `setup_unavailable`/`setup_token_invalid` | M1 |
-| 8 | `POST /api/v1/auth/setup/complete` | Public | 201 `{user}` + cookie | 404 `setup_unavailable`/`setup_token_invalid`, 422, 503 | M1 |
+| 8 | `POST /api/v1/auth/setup/complete` | Public | 201 `{user}` + cookie | 404 `setup_unavailable`/`setup_token_invalid` (checked first, before the fields and the hash, §7.8), 409 `username_taken`, 422, 503 | M1 |
 | 9 | `POST /api/v1/auth/reset/check` | Public | 200 `{username}` | 404 `reset_token_invalid` | M1 |
 | 10 | `POST /api/v1/auth/reset/complete` | Public | 200 `{user}` + cookie | 404 `reset_token_invalid`, 422, 503 | M1 |
 | 11 | `GET /api/v1/me` | User | 200 `Me` (may rotate the cookie) | — | M1 |
@@ -1962,7 +2008,7 @@ Common errors are not repeated per row: `bad_request`, `payload_too_large`, `uns
 | 23 | `DELETE /api/v1/invites/{id}` | Admin, or the creator | 204 | 404 `not_found` | M1 |
 | 24 | `POST /api/v1/push/subscriptions` | User | 201 `{id}` (new) · 200 `{id}` (existing) | 422 `push_endpoint_rejected`, 503 `push_unavailable` | M1 |
 | 27 | `POST /api/v1/push/unsubscribe` | User | 204 (idempotent, by endpoint) | — | M1 |
-| 28 | `POST /api/v1/push/test` | User | 202 (this session's subscriptions) | 404 `not_found` (none), 429 (1 per 10 s), 503 `push_unavailable` | M1 |
+| 28 | `POST /api/v1/push/test` | User | 202 (this session's subscriptions) | 404 `not_found` (none), 429 (1 per 10 s), 503 `push_unavailable`, 503 `server_busy` (04's queue is full; `Push.SendTest`'s error, 04 §14.2) | M1 |
 | 29 | `GET /api/v1/admin/users` | Admin | 200 `{users}` (`?status=active\|pending\|disabled`) | — | M1 |
 | 30 | `PATCH /api/v1/admin/users/{id}` | Admin | 200 `{user}` | 404 `user_not_found`, 409 `username_taken`/`last_admin`/`self_action_forbidden`, 403 `wrong_password`, 422 | M1 |
 | 31 | `DELETE /api/v1/admin/users/{id}` | Admin | 204 | 404, 409 `last_admin`/`self_action_forbidden` | M1 |
@@ -2028,6 +2074,19 @@ Examples use `watch.example.com` and documentation IPs. IDs are illustrative.
 ```
 
 This `user` object (`api.User`: `{id, username, role}`) is the public identity shape that other docs reuse.
+
+**What a login validates** (S30). A login applies none of the registration rules of §7.1 and §7.2. It answers 422
+`validation_failed` only for a request that can't be a login at all: `username` empty after trimming (`required`)
+or over 128 bytes (`too_long`); `password` empty (`required`), over 1024 bytes (`too_long`) or refused by PRECIS
+(`invalid`: a control character). Every other username is looked up by its comparison key (§7.1 rule 5), without the
+shape rules. So **a username that no account can have** (one character, a reserved name, `-sam`, a string PRECIS
+refuses) **is answered like an unknown one: 401 `invalid_credentials`**, after the same throttles and exactly one
+dummy hash, with an `auth.login_failed {reason: "unknown_user"}` row. A 422 `username: invalid` there would tell a
+stranger which names can't exist, and would answer faster than a real attempt. A name that PRECIS refuses has no
+key: no account is looked up, and its trimmed text (marked so that it never equals a real key) keys the two
+per-username buckets of §7.3, so it is throttled like any other name. The order is §7.3's: `auth-ip`, the 422
+checks, `auth-user-ip` and `auth-user`, `auth-hash`, one verification, and only after a correct password the
+account's status (403 `account_pending` or `account_disabled`).
 
 `POST /api/v1/auth/register`:
 
@@ -2157,7 +2216,10 @@ for 30 days.
 3. then `Push.ValidateEndpoint` (04) checks the scheme (`https` only, `not_https`), the port (443, `bad_port`), no
    userinfo (`userinfo`), a DNS name rather than an IP literal (`ip_literal`), and that the name resolves
    (`unresolvable`) only to public addresses (`private_address`, the plan's rule). 04's sender re-checks at dial time
-   against DNS rebinding.
+   against DNS rebinding. The rules are checked in that order, and an endpoint that breaks several gets the reason
+   of the first. 04 §14.5 has the exact readings (S32): an IPv4 address in any spelling (`2130706433`, `127.1`) is
+   `ip_literal`, a host that is no DNS name is `unresolvable`, and `localhost` names and the server's own addresses
+   are `private_address`.
 
 The handler checks only the body shape; every URL and host rule is 04's.
 
@@ -2172,7 +2234,10 @@ endpoint. The SPA re-subscribes when the key differs from its subscription's `ap
 **Other endpoints**:
 - `POST /api/v1/push/unsubscribe` `{"endpoint": "…"}` → 204.
 - `POST /api/v1/push/test` → 202. It sends a `push.test` notification to **this session's** subscriptions (this
-  browser) through `Push.SendTest`. At most 1 per 10 s per user (`push-test` bucket).
+  browser) through `Push.SendTest`. At most 1 per 10 s per user (`push-test` bucket); that bucket is the only limit
+  on tests, because 04's per-recipient bucket leaves `push.test` out (04 §14.4). `SendTest` only queues: an
+  `*api.Error` it returns (`server_busy`, or `server_shutdown` while the server stops) goes out through
+  `WriteError`.
 - `GET /api/v1/push/preferences` → `{"shareStarted": "all", "adminAlerts": true}`; `PUT` with the same shape → 200.
   `shareStarted` is `all` or `off`; `adminAlerts` matters for admins only. 04's sender reads them through
   `PushFilter.Pref`.
@@ -2528,7 +2593,8 @@ SPA removes the fragment right after reading it (05).
 **Integration: httpapi** (`httptest.Server`, real store and auth, fake Signal/Push/ConnCloser/AdminAlerter; `goleak`):
 - **Setup**: the CLI path issues a token; `setup/check` → 204; `complete` → 201 with the cookie; a second `complete`
   → 404 `setup_unavailable`; `SetupAvailable` becomes false; issuing again → `setup_unavailable`. Two parallel
-  `complete` calls leave exactly one admin.
+  `complete` calls leave exactly one admin. A `complete` without a live token → 404 before the fields are checked
+  and with no hash (the hasher counter doesn't move, §7.8).
 - **Invite mode**: create an invite (the URL has a fragment and the DB holds no plaintext token); check; register 10
   users; the 11th → 410 `invite_used_up`; revoked → 410 `invite_revoked`; expired (clock) → 410 `invite_expired`;
   register without an invite → 403 `invite_required`; a taken username → 409 without using the invite.
@@ -2546,7 +2612,10 @@ SPA removes the fragment right after reading it (05).
     without a hash; from B, which is the `last_ip` of a live session → 200; and from another address in the /64 of a
     live session's IPv6 `last_ip` → 200;
   - the IP bucket blocks the 21st attempt;
-  - an unknown username costs exactly one hash;
+  - an unknown username costs exactly one hash, and so does one that no account can have (the reserved `system`;
+    `sam smith`, which PRECIS refuses): 401 `invalid_credentials`, never 422, and the name isn't stored (§12.4.2);
+  - guesses sent in parallel can't outrun the two per-username buckets (20 at once from one address reach the
+    hasher 5 times), and every end that is no failed password check leaves the buckets as they were (§7.3);
   - with the `auth-hash` bucket empty, a login → 503 `server_busy` with `Retry-After`, and
     the hasher counter doesn't move;
   - the audit holds `auth.login_failed` rows without unknown usernames, one `auth.throttled` row per scope hit
