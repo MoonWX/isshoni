@@ -113,6 +113,13 @@ func clampInt64(u uint64) int64 {
 	return int64(u)
 }
 
+// monthEnd is a month that ended before its last bytes could be stored: what the counter had counted up to the
+// reading upTo, and what no flush had stored by then, belongs to month.
+type monthEnd struct {
+	month string
+	upTo  byteCount
+}
+
 // rateSample is one reading of the counter for the current rate.
 type rateSample struct {
 	at    time.Time
@@ -141,6 +148,9 @@ type Transfer struct {
 	loaded  bool      // stored was read from the store for month
 	stored  byteCount // month's totals in the store, as far as this process knows them
 	flushed byteCount // the counter's reading at the last flush that reached the store
+	// closed are the months that ended while the store failed, oldest first. A flush stores their bytes before any
+	// others, so they do not end up in a later month. Empty unless the store fails across the start of a month.
+	closed []monthEnd
 	// The alert state: the highest threshold alerted in sentMonth. sentKnown is false until the meta key was read.
 	sentKnown bool
 	sentMonth string
@@ -182,7 +192,8 @@ func NewTransfer(o TransferOptions) *Transfer {
 // counted bytes every 60 s and at the first instant of each month (UTC), so that a month's row holds the
 // bytes counted before the month ended, and checks the alert thresholds after every flush. When ctx ends it
 // stores what is left, for at most 2 s (04 §6.4 step 6), and returns nil. A store that fails is logged and tried
-// again at the next flush; the bytes stay counted until they are stored. Run can be called once.
+// again at the next flush; the bytes stay counted until they are stored, and those of a month that ends in the
+// meantime still go to that month. Run can be called once.
 func (t *Transfer) Run(ctx context.Context) error {
 	if !t.running.CompareAndSwap(false, true) {
 		return errors.New("ops: Transfer.Run called more than once")
@@ -256,6 +267,10 @@ func (t *Transfer) Flush(ctx context.Context) error {
 // flush adds the bytes counted since the last flush to a month's row, and makes sure the totals in memory are
 // those of the month of now. The bytes go to the month closing when the flush is the one at a month's end, and to
 // the month of now otherwise.
+//
+// A flush at a month's end that the store refuses must not leave that month's bytes to the next flush, which
+// would add them to the new month. The month is remembered in t.closed with the counter's reading instead, and
+// every flush first stores what is remembered there, in order, before it stores anything for the month of now.
 func (t *Transfer) flush(ctx context.Context, now time.Time, closing string, timeout time.Duration) error {
 	t.flushMu.Lock()
 	defer t.flushMu.Unlock()
@@ -263,27 +278,31 @@ func (t *Transfer) flush(ctx context.Context, now time.Time, closing string, tim
 	defer cancel()
 
 	current := monthKey(now)
-	target := closing
-	if target == "" {
-		target = current
-	}
-
 	reading := t.read()
 	t.mu.Lock()
-	delta := reading.since(t.flushed)
+	if closing != "" {
+		t.closed = append(t.closed, monthEnd{month: closing, upTo: reading})
+	}
+	ended := append([]monthEnd(nil), t.closed...) // only flush changes it, and flushMu is held
 	t.mu.Unlock()
 
 	var errs []error
-	if !delta.isZero() {
-		if err := t.store.AddTransfer(ctx, target, delta.egress, delta.ingress, now); err != nil {
-			errs = append(errs, fmt.Errorf("ops: adding transfer to %s: %w", target, err))
-		} else {
-			t.mu.Lock()
-			t.flushed = reading
-			if t.loaded && t.month == target {
-				t.stored = t.stored.add(delta)
-			}
-			t.mu.Unlock()
+	for _, end := range ended {
+		if err := t.add(ctx, end.month, end.upTo, now); err != nil {
+			errs = append(errs, err)
+			break // the months after it wait too: their bytes come after this one's
+		}
+		t.mu.Lock()
+		t.closed = t.closed[1:]
+		if len(t.closed) == 0 {
+			t.closed = nil
+		}
+		t.mu.Unlock()
+	}
+	if len(errs) == 0 {
+		// The rest is the month's of now. Nothing is left after the flush at a month's end.
+		if err := t.add(ctx, current, reading, now); err != nil {
+			errs = append(errs, err)
 		}
 	}
 
@@ -304,6 +323,27 @@ func (t *Transfer) flush(ctx context.Context, now time.Time, closing string, tim
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// add stores the bytes counted between the last flush that reached the store and the reading upTo in month's row.
+// flush calls it with flushMu held.
+func (t *Transfer) add(ctx context.Context, month string, upTo byteCount, now time.Time) error {
+	t.mu.Lock()
+	delta := upTo.since(t.flushed)
+	t.mu.Unlock()
+	if delta.isZero() {
+		return nil
+	}
+	if err := t.store.AddTransfer(ctx, month, delta.egress, delta.ingress, now); err != nil {
+		return fmt.Errorf("ops: adding transfer to %s: %w", month, err)
+	}
+	t.mu.Lock()
+	t.flushed = upTo
+	if t.loaded && t.month == month {
+		t.stored = t.stored.add(delta)
+	}
+	t.mu.Unlock()
+	return nil
 }
 
 // read returns the counter's totals over all paths.
@@ -347,19 +387,34 @@ func (t *Transfer) alertLimit() int {
 // the whole month and the current rate. The totals of the month before the first flush read the store are the
 // bytes counted since the server started; the rate is zero until Run has sampled for a second.
 func (t *Transfer) Info() api.TransferInfo {
+	info, _ := t.current()
+	return info
+}
+
+// current is Info, and whether the month's totals are known: its row was read from the store. While they are not,
+// the totals are too low by what the row holds.
+func (t *Transfer) current() (info api.TransferInfo, known bool) {
 	now := t.now()
 	reading := t.read()
 
 	t.mu.Lock()
-	month := t.month
-	total := t.stored.add(reading.since(t.flushed))
+	month, known := t.month, t.loaded
+	// What waits for the store is this month's, except what was counted before an earlier month ended.
+	unstored := t.flushed
+	for _, end := range t.closed {
+		if end.month == month {
+			break // the month is ending in a flush that is under way: its last bytes are still its own
+		}
+		unstored = end.upTo
+	}
+	total := t.stored.add(reading.since(unstored))
 	egressBps, ingressBps := t.egressBps, t.ingressBps
 	t.mu.Unlock()
 	if month == "" {
 		month = monthKey(now)
 	}
 
-	info := api.TransferInfo{
+	info = api.TransferInfo{
 		Month:        month,
 		EgressBytes:  total.egress,
 		IngressBytes: total.ingress,
@@ -370,7 +425,7 @@ func (t *Transfer) Info() api.TransferInfo {
 	if month == monthKey(now) {
 		info.ProjectedEgressBytes = projectMonth(total.egress, now)
 	}
-	return info
+	return info, known
 }
 
 // projectMonth projects a month-to-date count to the whole month: mtd × days in the month / days elapsed
@@ -413,7 +468,7 @@ func thresholdCrossed(egress int64, limitGB int) int {
 // Alerts returns the dashboard alert of the current month (04 §11.4): transfer.100 once the month's egress has
 // reached the limit, transfer.80 from 80 % of it, none below that or without a limit. It follows the current
 // numbers and the current limit, so it goes away when an admin raises the limit; the push message, in contrast,
-// is sent once per threshold and month.
+// is sent once per threshold and month (checkAlerts).
 func (t *Transfer) Alerts() []api.Alert {
 	info := t.Info()
 	params := map[string]any{"month": info.Month, "alertGb": info.AlertGB}
@@ -431,39 +486,47 @@ func (t *Transfer) Alerts() []api.Alert {
 // not alerted this month yet: each threshold once per month (04 §11.3). A month that jumps past both gets the 100 %
 // alert only. The threshold is remembered before the alert goes out, so a store that fails delays an alert but
 // never repeats one.
+//
+// The thresholds are those of the limit as it is now. An admin who raises the limit, as the 100 % alert suggests,
+// has new ones further up: when the month is found below a threshold it was alerted for, that is forgotten, and
+// the alert for it goes out again when the month gets there. 80 % of the new limit is not alerted when the month
+// is past it already at the first check after the change.
 func (t *Transfer) checkAlerts(ctx context.Context, now time.Time) {
 	limit := t.alertLimit()
 	if limit == 0 {
 		return
 	}
-	// While the month's row can't be read, Info has only the bytes counted since the server started: an alert can
-	// then come late, but never without cause.
-	info := t.Info()
+	// While the month's row can't be read, the totals are only the bytes counted since the server started: an
+	// alert can then come late, but never without cause.
+	info, known := t.current()
 	level := thresholdCrossed(info.EgressBytes, limit)
-	if level == 0 {
-		return
-	}
 	ctx, cancel := context.WithTimeout(ctx, transferStoreTimeout)
 	defer cancel()
 	if !t.loadSent(ctx) {
 		return
 	}
 	t.mu.Lock()
-	due := t.sentMonth != info.Month || t.sentLevel < level
+	sentMonth, sentLevel := t.sentMonth, t.sentLevel
 	t.mu.Unlock()
-	if !due {
+	if sentMonth != info.Month {
+		sentLevel = 0 // what was alerted in another month does not count
+	}
+	switch {
+	case level < sentLevel:
+		// A month's egress only grows, so it is the limit that went up. Unless the totals are not known: they are
+		// too low then, and forgetting the threshold now would alert it a second time once they are read.
+		if known && t.rememberSent(ctx, info.Month, level) {
+			t.log.LogAttrs(ctx, slog.LevelInfo, "this month's outgoing transfer is below a threshold of the transfer "+
+				"alert that it had reached; that threshold will alert again",
+				slog.String("month", info.Month), slog.Int("alert_gb", limit))
+		}
+		return
+	case level == sentLevel:
+		return // nothing new; this is also every check below 80 %
+	}
+	if !t.rememberSent(ctx, info.Month, level) {
 		return
 	}
-	if t.meta != nil {
-		if err := t.meta.SetMeta(ctx, MetaTransferAlertSent, encodeAlertSent(info.Month, level)); err != nil {
-			t.log.LogAttrs(ctx, slog.LevelWarn, "transfer alert: could not remember the threshold; the alert waits "+
-				"for the next flush", logx.Err(err))
-			return
-		}
-	}
-	t.mu.Lock()
-	t.sentMonth, t.sentLevel = info.Month, level
-	t.mu.Unlock()
 
 	t.log.LogAttrs(ctx, slog.LevelWarn, fmt.Sprintf("this month's outgoing transfer has reached %d %% of the transfer alert", level),
 		slog.String("month", info.Month), slog.Int64("egress_bytes", info.EgressBytes), slog.Int("alert_gb", limit))
@@ -475,6 +538,22 @@ func (t *Transfer) checkAlerts(ctx context.Context, now time.Time) {
 			At:     now,
 		})
 	}
+}
+
+// rememberSent stores level as the highest threshold alerted in month, in the meta table and then in memory, and
+// reports whether it did. When the meta table can't be written nothing changes, and the next flush tries again.
+func (t *Transfer) rememberSent(ctx context.Context, month string, level int) bool {
+	if t.meta != nil {
+		if err := t.meta.SetMeta(ctx, MetaTransferAlertSent, encodeAlertSent(month, level)); err != nil {
+			t.log.LogAttrs(ctx, slog.LevelWarn, "transfer alert: could not remember the threshold; trying again at "+
+				"the next flush", logx.Err(err))
+			return false
+		}
+	}
+	t.mu.Lock()
+	t.sentMonth, t.sentLevel = month, level
+	t.mu.Unlock()
+	return true
 }
 
 // loadSent reads the remembered threshold from the meta table, once. It reports whether the alert state is known:
@@ -503,7 +582,8 @@ func (t *Transfer) loadSent(ctx context.Context) bool {
 	return true
 }
 
-// encodeAlertSent is the value of MetaTransferAlertSent: the JSON string "2026-09:80".
+// encodeAlertSent is the value of MetaTransferAlertSent: the JSON string "2026-09:80". Level 0, "2026-09:0", is a
+// month whose alerts were forgotten because the limit was raised: nothing is alerted for it.
 func encodeAlertSent(month string, level int) string {
 	b, _ := json.Marshal(month + ":" + strconv.Itoa(level)) // a string always encodes
 	return string(b)
@@ -524,7 +604,7 @@ func decodeAlertSent(value string) (month string, level int) {
 		return "", 0
 	}
 	level, err := strconv.Atoi(percent)
-	if err != nil || (level != transferWarnPercent && level != transferFullPercent) {
+	if err != nil || (level != 0 && level != transferWarnPercent && level != transferFullPercent) {
 		return "", 0
 	}
 	return month, level

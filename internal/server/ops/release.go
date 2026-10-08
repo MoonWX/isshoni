@@ -1,6 +1,7 @@
 package ops
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -37,6 +38,9 @@ import (
 //	User-Agent: isshoni/<version>
 //	If-None-Match: <the ETag of the last answer>      (when there is one)
 //
+// Next to them go the headers of any HTTP client, which name nothing of ours: Host, Accept-Encoding: gzip and,
+// from the check's own client, Connection: close.
+//
 // The setting updateCheck (policy key updates.release_check) switches it off; it is read through Policy before
 // every request, so an admin's switch needs no restart, and with it off nothing is sent at all. A redirect is
 // followed only to the same host over the same scheme, which is how GitHub answers for a repository that was
@@ -57,9 +61,16 @@ const (
 	releaseFirstMax = 60 * time.Minute
 	releaseEvery    = 24 * time.Hour
 	releaseJitter   = time.Hour
-	// releaseTimeout covers one check from the connection to the last byte; releaseMaxBytes is the most it reads.
-	releaseTimeout  = 10 * time.Second
+	// releaseTimeout covers one check from the connection to the last byte.
+	releaseTimeout = 10 * time.Second
+	// releaseMaxBytes is the most one answer may be on the wire (04 §11.5), compressed as GitHub sends it. The
+	// limit can't count the JSON itself: GitHub describes every asset of every release in about 2 kB, so a page of
+	// 20 releases with 22 assets each (06 §3) is about 1 MB of JSON. Compressed it is less than a tenth of that.
 	releaseMaxBytes = 1 << 20
+	// releaseMaxDecodedBytes is the most an answer may be once it is decompressed: the bound on an answer that is
+	// made to expand without end, and room for some 350 assets per release. It is read as a stream, one release
+	// at a time, never as a whole.
+	releaseMaxDecodedBytes = 16 << 20
 	// releasePerPage is how many releases one check looks at, newest first.
 	releasePerPage      = 20
 	releaseMaxRedirects = 3
@@ -67,6 +78,8 @@ const (
 	releaseMaxTagLen  = 64
 	releaseMaxURLLen  = 512
 	releaseMaxETagLen = 200
+	// releaseMaxEncodingLen is how much of a Content-Encoding the check does not know goes into the log.
+	releaseMaxEncodingLen = 32
 	// releaseStateVersion is the version of the JSON in MetaReleaseCheck.
 	releaseStateVersion = 1
 	// releaseStoreTimeout bounds one read or write of the meta key.
@@ -263,10 +276,14 @@ func (r *ReleaseCheck) check(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("ops: release check: %w", err)
 	}
-	// Everything that is sent (04 §11.5). net/http adds Host and Accept-Encoding, which name nothing of ours.
+	// Everything that is sent (04 §11.5). net/http adds Host, which names nothing of ours.
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	req.Header.Set("User-Agent", "isshoni/"+r.version)
+	// This is the Accept-Encoding net/http sends by itself, so the request is the same. Set here, it makes the
+	// transport hand over the body as it came instead of decompressing it out of sight, and readReleaseFeed can
+	// count the bytes on the wire.
+	req.Header.Set("Accept-Encoding", "gzip")
 	conditional := prev.checked() && prev.ETag != ""
 	if conditional {
 		req.Header.Set("If-None-Match", prev.ETag)
@@ -284,14 +301,7 @@ func (r *ReleaseCheck) check(ctx context.Context) error {
 			return errors.New("ops: release check: 304 Not Modified to a request without If-None-Match")
 		}
 	case http.StatusOK:
-		data, err := io.ReadAll(io.LimitReader(res.Body, releaseMaxBytes+1))
-		if err != nil {
-			return fmt.Errorf("ops: release check: reading the feed: %w", err)
-		}
-		if len(data) > releaseMaxBytes {
-			return fmt.Errorf("ops: release check: the feed is larger than %d bytes", releaseMaxBytes)
-		}
-		releases, err := parseReleaseFeed(data)
+		releases, err := readReleaseFeed(res)
 		if err != nil {
 			return err
 		}
@@ -309,6 +319,63 @@ func (r *ReleaseCheck) check(ctx context.Context) error {
 	return nil
 }
 
+// readReleaseFeed reads and parses the body of a 200 answer within the two size limits: releaseMaxBytes for the
+// body as it is on the wire, which is 04 §11.5's response limit, and releaseMaxDecodedBytes for what a compressed
+// body expands to. The body is read to its end, so a compressed one is checked against its checksum, and a body
+// over a limit is refused however much of it parsed.
+func readReleaseFeed(res *http.Response) ([]knownRelease, error) {
+	wire := &io.LimitedReader{R: res.Body, N: releaseMaxBytes + 1}
+	var plain io.Reader = wire
+	switch encoding := strings.ToLower(strings.TrimSpace(strings.Join(res.Header.Values("Content-Encoding"), ","))); encoding {
+	case "", "identity":
+		// As it is: a server or a proxy that does not compress.
+	case "gzip", "x-gzip":
+		unzip, err := gzip.NewReader(wire)
+		if err != nil {
+			return nil, fmt.Errorf("ops: release check: the feed is not the gzip its header says: %w", err)
+		}
+		defer func() { _ = unzip.Close() }()
+		plain = unzip
+	default:
+		// Only gzip was asked for. What this is can't be told, so it is not parsed.
+		if len(encoding) > releaseMaxEncodingLen {
+			encoding = encoding[:releaseMaxEncodingLen]
+		}
+		return nil, fmt.Errorf("ops: release check: the feed has the content encoding %q, which was not asked for", encoding)
+	}
+	source := &failingReader{r: plain}
+	decoded := &io.LimitedReader{R: source, N: releaseMaxDecodedBytes + 1}
+
+	releases, err := parseReleaseFeed(decoded)
+	// The parser's error says what it found where the body stopped. Why the body stopped there is the cause:
+	switch {
+	case wire.N <= 0:
+		// The limit cut it off, or the list was complete in a body that is too large all the same.
+		return nil, fmt.Errorf("ops: release check: the feed is larger than %d bytes", releaseMaxBytes)
+	case decoded.N <= 0:
+		return nil, fmt.Errorf("ops: release check: the feed is larger than %d bytes decompressed", releaseMaxDecodedBytes)
+	case source.err != nil:
+		// The connection, the 10 s, or a compressed body that is cut off or damaged.
+		return nil, fmt.Errorf("ops: release check: reading the feed: %w", source.err)
+	}
+	return releases, err
+}
+
+// failingReader passes reads through and keeps the first error that is not the end of the stream, so that a body
+// which could not be read is not reported as one that could not be parsed.
+type failingReader struct {
+	r   io.Reader
+	err error
+}
+
+func (f *failingReader) Read(p []byte) (int, error) {
+	n, err := f.r.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) && f.err == nil {
+		f.err = err
+	}
+	return n, err
+}
+
 // feedRelease is one element of GitHub's "list releases" answer; the other fields are not read.
 type feedRelease struct {
 	TagName    string `json:"tag_name"`
@@ -318,29 +385,69 @@ type feedRelease struct {
 	Body       string `json:"body"`
 }
 
-// parseReleaseFeed reads the feed's JSON, a list of releases, and returns the published ones with a SemVer tag,
-// newest version first and each version once. Drafts are left out (04 §11.5), and so is a release whose tag is not
-// a version ("nightly"). At most releasePerPage come back.
-func parseReleaseFeed(data []byte) ([]knownRelease, error) {
-	var feed []feedRelease
-	if err := json.Unmarshal(data, &feed); err != nil {
-		return nil, fmt.Errorf("ops: release check: the feed is not a JSON list of releases: %w", err)
+// parseReleaseFeed reads the feed's JSON, a list of releases, to its end and returns the published ones with a
+// SemVer tag, newest version first and each version once. Drafts are left out (04 §11.5), and so is a release
+// whose tag is not a version ("nightly"). At most releasePerPage come back.
+//
+// The list is decoded one release at a time, and what is kept of it is cut down as it grows, so the memory in use
+// is that of the largest release (most of which is the description of its assets, which is skipped), not that of
+// the feed.
+func parseReleaseFeed(feed io.Reader) ([]knownRelease, error) {
+	notAList := func(err error) error {
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF // the feed ended where more of it had to follow
+		}
+		return fmt.Errorf("ops: release check: the feed is not a JSON list of releases: %w", err)
 	}
-	releases := make([]knownRelease, 0, min(len(feed), releasePerPage))
-	for _, f := range feed {
-		if f.Draft {
-			continue
+	// Not what was found instead: that is as long as the feed makes it.
+	errNoList := errors.New("ops: release check: the feed is not a JSON list of releases")
+	dec := json.NewDecoder(feed)
+	releases := make([]knownRelease, 0, 2*releasePerPage)
+
+	start, err := dec.Token()
+	if err != nil {
+		return nil, notAList(err)
+	}
+	switch start {
+	case nil:
+		// null: no list is an empty list.
+	case json.Delim('['):
+		for dec.More() {
+			var f feedRelease
+			if err := dec.Decode(&f); err != nil {
+				return nil, notAList(err)
+			}
+			if f.Draft {
+				continue
+			}
+			v, ok := tagVersion(f.TagName)
+			if !ok {
+				continue
+			}
+			releases = append(releases, knownRelease{
+				Version:    v,
+				URL:        cleanReleaseURL(f.HTMLURL),
+				Prerelease: f.Prerelease || semver.Prerelease("v"+v) != "",
+				Security:   strings.Contains(f.Body, SecurityMarker),
+			})
+			if len(releases) >= 2*releasePerPage {
+				// More than a page: keep the newest page of what came so far. A version that is cut here has a
+				// page of newer ones before it, so it would not be in the result anyway.
+				releases = orderReleases(releases)
+			}
 		}
-		v, ok := tagVersion(f.TagName)
-		if !ok {
-			continue
+		if _, err := dec.Token(); err != nil { // the closing bracket
+			return nil, notAList(err)
 		}
-		releases = append(releases, knownRelease{
-			Version:    v,
-			URL:        cleanReleaseURL(f.HTMLURL),
-			Prerelease: f.Prerelease || semver.Prerelease("v"+v) != "",
-			Security:   strings.Contains(f.Body, SecurityMarker),
-		})
+	default:
+		return nil, errNoList // GitHub's error document, a number, a string
+	}
+	// Nothing may follow the list. Reading on to the end is also what makes the caller's size limits exact.
+	switch _, err := dec.Token(); {
+	case err == nil:
+		return nil, errNoList
+	case !errors.Is(err, io.EOF):
+		return nil, notAList(err)
 	}
 	return orderReleases(releases), nil
 }

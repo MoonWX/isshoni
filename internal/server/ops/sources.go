@@ -62,7 +62,7 @@ type MetaStore interface {
 // The meta keys of ops (03 §5 lists them as 04's internal state).
 const (
 	// MetaTransferAlertSent remembers the highest transfer threshold that was alerted and its month, as the JSON
-	// string "2026-09:80" (04 §11.3).
+	// string "2026-09:80" (04 §11.3); "2026-09:0" after the limit was raised above what the month has used.
 	MetaTransferAlertSent = "ops.transfer_alert_sent"
 	// MetaReleaseCheck holds the last release check as a JSON object: when it ran, the feed's ETag and the releases
 	// it listed (04 §11.5).

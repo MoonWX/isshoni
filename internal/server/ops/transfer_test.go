@@ -3,6 +3,7 @@ package ops
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"strconv"
@@ -24,6 +25,11 @@ type fakeTransferStore struct {
 	meta    map[string]string
 	adds    []transferAdd
 	failAdd error // returned by AddTransfer when set
+	// failAddMonth limits failAdd to the calls for this month; "" means all of them.
+	failAddMonth string
+	// onAdd, when set, runs at the start of every AddTransfer call with its month: a look at the state in the
+	// middle of a flush.
+	onAdd   func(month string)
 	failGet error // returned by TransferMonth when set
 	failSet error // returned by SetMeta when set
 	failGM  error // returned by Meta when set
@@ -43,7 +49,10 @@ func newFakeTransferStore() *fakeTransferStore {
 func (s *fakeTransferStore) AddTransfer(_ context.Context, month string, egress, ingress int64, now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.failAdd != nil {
+	if s.onAdd != nil {
+		s.onAdd(month)
+	}
+	if s.failAdd != nil && (s.failAddMonth == "" || s.failAddMonth == month) {
 		return s.failAdd
 	}
 	s.adds = append(s.adds, transferAdd{month, egress, ingress, now})
@@ -287,8 +296,18 @@ func TestTransferMonthRollover(t *testing.T) {
 		if info := r.tr.Info(); info.Month != "2026-09" || info.EgressBytes != 1030 || info.IngressBytes != 103 {
 			t.Errorf("Info at 23:59:59 = %+v, want September with 1030 / 103", info)
 		}
+		// Somebody looks at the dashboard while the flush that closes September is in the store: September
+		// is still the month, with all of its bytes.
+		var during []api.TransferInfo
+		store.fail(func(s *fakeTransferStore) {
+			s.onAdd = func(string) { during = append(during, r.tr.Info()) }
+		})
 		time.Sleep(time.Second) // 00:00:00 UTC, October 1: the flush that closes September
 		synctest.Wait()
+		store.fail(func(s *fakeTransferStore) { s.onAdd = nil })
+		if len(during) != 1 || during[0].Month != "2026-09" || during[0].EgressBytes != 1030 || during[0].IngressBytes != 103 {
+			t.Errorf("Info during the flush at midnight = %+v, want September with 1030 / 103 once", during)
+		}
 		if got := store.month("2026-09"); got != (byteCount{1030, 103}) {
 			t.Errorf("September at midnight = %+v, want {1030 103}: its last seconds belong to it", got)
 		}
@@ -329,8 +348,183 @@ func TestTransferMonthRollover(t *testing.T) {
 	})
 }
 
+// TestTransferMonthEndStoreFailure: a store that fails across the start of a month moves no bytes into the new
+// month. What was counted before midnight is stored for the month that ended once the store works again, and Info
+// shows the new month without it in the meantime.
+func TestTransferMonthEndStoreFailure(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := newFakeTransferStore()
+		store.months["2026-09"] = byteCount{egress: 1000, ingress: 100}
+		r := newTransferRig(t, clockAt(time.Date(2026, 9, 30, 23, 58, 30, 0, time.UTC)), store)
+		r.run()
+		october := func(when string, egress, ingress int64) {
+			t.Helper()
+			if info := r.tr.Info(); info.Month != "2026-10" || info.EgressBytes != egress || info.IngressBytes != ingress {
+				t.Errorf("Info %s = %+v, want October with %d / %d", when, info, egress, ingress)
+			}
+		}
+
+		// The store fails from 23:59 on: the regular flush at 23:59:30 already.
+		r.egress(10)
+		store.fail(func(s *fakeTransferStore) { s.failAdd = errors.New("database is locked") })
+		time.Sleep(60 * time.Second) // 23:59:30
+		synctest.Wait()
+		r.egress(20)
+		r.ingress(3)
+		// Info in the middle of every flush from here on: the totals never jump while the bytes change places.
+		var during []string
+		store.fail(func(s *fakeTransferStore) {
+			s.onAdd = func(month string) {
+				info := r.tr.Info()
+				during = append(during, fmt.Sprintf("%s: %s %d/%d", month, info.Month, info.EgressBytes, info.IngressBytes))
+			}
+		})
+		time.Sleep(30 * time.Second) // 00:00:00 UTC, October 1: the flush that closes September fails too
+		synctest.Wait()
+		if got := store.addCount(); got != 0 {
+			t.Fatalf("%d AddTransfer calls succeeded while the store fails", got)
+		}
+		october("at midnight, with September's last bytes not stored", 0, 0)
+
+		r.egress(500)
+		r.ingress(50)
+		october("in October", 500, 50)
+		time.Sleep(60 * time.Second) // 00:01:00: still failing
+		synctest.Wait()
+		october("after a failed flush in October", 500, 50)
+		if err := r.tr.Flush(t.Context()); err == nil {
+			t.Error("Flush returned nil while the store fails")
+		}
+
+		store.fail(func(s *fakeTransferStore) { s.failAdd = nil })
+		r.egress(7)
+		time.Sleep(60 * time.Second) // 00:02:00
+		synctest.Wait()
+		if got := store.month("2026-09"); got != (byteCount{1030, 103}) {
+			t.Errorf("September once the store works = %+v, want {1030 103}: all that was counted before midnight", got)
+		}
+		if got := store.month("2026-10"); got != (byteCount{507, 50}) {
+			t.Errorf("October once the store works = %+v, want {507 50}: only what was counted after midnight", got)
+		}
+		october("once the store works", 507, 50)
+		r.stop()
+
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		wantDuring := []string{
+			"2026-09: 2026-09 1030/103", // midnight: September is ending, and the store refuses its last bytes
+			"2026-09: 2026-10 500/50",   // 00:01:00, and Flush right after it
+			"2026-09: 2026-10 500/50",
+			"2026-09: 2026-10 507/50", // 00:02:00: September's bytes go through,
+			"2026-10: 2026-10 507/50", // then October's
+		}
+		if !reflect.DeepEqual(during, wantDuring) {
+			t.Errorf("Info in the middle of the flushes:\n got %q\nwant %q", during, wantDuring)
+		}
+		var got []string
+		for _, add := range store.adds {
+			got = append(got, add.month+"@"+add.at.UTC().Format("15:04:05"))
+		}
+		if want := []string{"2026-09@00:02:00", "2026-10@00:02:00"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("flushes = %v, want %v", got, want)
+		}
+	})
+
+	// A shutdown before the store has worked again: the last flush stores both months, each with its own bytes.
+	synctest.Test(t, func(t *testing.T) {
+		store := newFakeTransferStore()
+		r := newTransferRig(t, clockAt(time.Date(2026, 12, 31, 23, 59, 30, 0, time.UTC)), store)
+		r.run()
+		r.egress(40)
+		store.fail(func(s *fakeTransferStore) { s.failAdd = errors.New("database is locked") })
+		time.Sleep(30 * time.Second) // midnight, January 1
+		synctest.Wait()
+		r.egress(2)
+		time.Sleep(10 * time.Second)
+		store.fail(func(s *fakeTransferStore) { s.failAdd = nil })
+		r.stop()
+		if dec, jan := store.month("2026-12"), store.month("2027-01"); dec.egress != 40 || jan.egress != 2 {
+			t.Errorf("after the shutdown: December %+v, January %+v; want 40 and 2 bytes out", dec, jan)
+		}
+	})
+}
+
+// A store that fails for more than a month owes more than one month its last bytes. They are stored in order, and
+// a month that was stored is not stored again when the one after it fails.
+func TestTransferSeveralMonthEndsPending(t *testing.T) {
+	store := newFakeTransferStore()
+	counter := new(netx.TransferCounter)
+	log, _ := testLogger()
+	clock := time.Date(2026, 9, 30, 23, 59, 0, 0, time.UTC)
+	tr := NewTransfer(TransferOptions{Counter: counter, Store: store, Now: func() time.Time { return clock }, Logger: log})
+	flush := func(at time.Time, closing string) error {
+		clock = at
+		return tr.flush(t.Context(), at, closing, transferStoreTimeout)
+	}
+	wantInfo := func(when, month string, egress int64) {
+		t.Helper()
+		if info := tr.Info(); info.Month != month || info.EgressBytes != egress {
+			t.Errorf("Info %s = %+v, want %s with %d bytes out", when, info, month, egress)
+		}
+	}
+	wantStore := func(when string, sep, oct, nov int64) {
+		t.Helper()
+		if got := [3]int64{store.month("2026-09").egress, store.month("2026-10").egress, store.month("2026-11").egress}; got != [3]int64{sep, oct, nov} {
+			t.Errorf("store %s: September, October, November = %v, want [%d %d %d]", when, got, sep, oct, nov)
+		}
+	}
+
+	if err := flush(clock, ""); err != nil {
+		t.Fatal(err)
+	}
+	counter.Add(netx.PathWeb, true, 100) // September's
+	store.fail(func(s *fakeTransferStore) { s.failAdd = errors.New("disk full") })
+	if err := flush(time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), "2026-09"); err == nil {
+		t.Error("the flush at the end of September returned nil while the store fails")
+	}
+	wantInfo("on October 1", "2026-10", 0)
+	counter.Add(netx.PathWeb, true, 200) // October's
+	if err := flush(time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC), ""); err == nil {
+		t.Error("a flush in October returned nil while the store fails")
+	}
+	wantInfo("in October", "2026-10", 200)
+	if err := flush(time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC), "2026-10"); err == nil {
+		t.Error("the flush at the end of October returned nil while the store fails")
+	}
+	wantInfo("on November 1", "2026-11", 0)
+	counter.Add(netx.PathWeb, true, 400) // November's
+	wantInfo("in November", "2026-11", 400)
+	wantStore("while it fails", 0, 0, 0)
+
+	// The store takes September's row and refuses October's: September is done, the rest waits.
+	store.fail(func(s *fakeTransferStore) { s.failAddMonth = "2026-10" })
+	if err := flush(time.Date(2026, 11, 1, 0, 1, 0, 0, time.UTC), ""); err == nil || !strings.Contains(err.Error(), "2026-10") {
+		t.Errorf("a flush that could store September only returned %v, want an error about 2026-10", err)
+	}
+	wantStore("after September went through", 100, 0, 0)
+	wantInfo("with October still owed", "2026-11", 400)
+
+	store.fail(func(s *fakeTransferStore) { s.failAdd = nil })
+	if err := flush(time.Date(2026, 11, 1, 0, 2, 0, 0, time.UTC), ""); err != nil {
+		t.Errorf("the flush once the store works: %v", err)
+	}
+	wantStore("once the store works", 100, 200, 400)
+	wantInfo("once the store works", "2026-11", 400)
+
+	// Nothing is owed any more: the next bytes are November's, once.
+	counter.Add(netx.PathWeb, true, 1)
+	if err := flush(time.Date(2026, 11, 1, 0, 3, 0, 0, time.UTC), ""); err != nil {
+		t.Errorf("a flush after all was stored: %v", err)
+	}
+	wantStore("after one more flush", 100, 200, 401)
+	if got := store.addCount(); got != 4 {
+		t.Errorf("%d AddTransfer calls went through, want 4: one for each month and one for the last byte", got)
+	}
+}
+
 // TestTransferAlertsOnce: the admins are alerted when the month's egress crosses 80 % and 100 % of the setting,
-// each threshold once per month, also across a restart; a new month starts again (04 §11.3, §17).
+// each threshold once per month, also across a restart; a new month starts again (04 §11.3, §17). A limit that is
+// raised has its own thresholds.
 func TestTransferAlertsOnce(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		store := newFakeTransferStore()
@@ -430,17 +624,115 @@ func TestTransferAlertsOnce(t *testing.T) {
 		}
 		wantAlerts("after more ticks at 200 %", "100")
 
-		// An admin raises the limit: the dashboard alert goes away, and nothing is pushed for thresholds that
-		// were alerted this month already.
-		r.policy.alertGB.Store(4) // 2 GB of 4: 50 %
+		// An admin raises the limit, as the alert suggests: the dashboard alert goes away at once, and the
+		// thresholds of the new limit are alerted when the month gets there, each once.
+		r.policy.alertGB.Store(10) // 2 GB of 10: 20 %
 		if got := dashboard(); got != "" {
 			t.Errorf("dashboard alerts after raising the limit: %s", got)
 		}
-		r.egress(gb * 3 / 2) // 3.5 GB of 4: 87 %
 		minute()
-		wantAlerts("80 % of a raised limit, 100 % was sent this month", "100")
+		wantAlerts("after raising the limit", "100")
+		if got := store.metaValue(MetaTransferAlertSent); got != `"2026-09:0"` {
+			t.Errorf("meta %s = %s after raising the limit, want \"2026-09:0\": nothing is alerted for the new limit", MetaTransferAlertSent, got)
+		}
+		r.egress(6*gb - 1)
+		minute()
+		wantAlerts("one byte below 80 % of the raised limit", "100")
+		r.egress(1)
+		minute()
+		wantAlerts("at 80 % of the raised limit", "100", "80")
+		if got := store.metaValue(MetaTransferAlertSent); got != `"2026-09:80"` {
+			t.Errorf("meta %s = %s, want \"2026-09:80\"", MetaTransferAlertSent, got)
+		}
+		r.egress(gb)
+		for range 5 {
+			minute()
+		}
+		wantAlerts("after more ticks at 90 % of the raised limit", "100", "80")
+
+		// A restart does not bring back what was forgotten, nor forget what was alerted since.
+		r.stop()
+		r = newTransferRig(t, now, store)
+		r.policy.alertGB.Store(10)
+		r.run()
+		minute()
+		wantAlerts("after a restart at 90 % of the raised limit")
+		r.egress(gb)
+		minute()
+		wantAlerts("at 100 % of the raised limit", "100")
+		r.egress(gb)
+		for range 5 {
+			minute()
+		}
+		wantAlerts("after more ticks at 110 % of the raised limit", "100")
+
+		// Raised again, and this time the month is past 80 % of the new limit when the next flush looks: the
+		// admin set that limit a moment ago, knowing the numbers, and is told nothing. 100 % is alerted.
+		r.policy.alertGB.Store(12) // 11 GB of 12: 91 %
+		minute()
+		wantAlerts("at 91 % of a limit raised a moment ago", "100")
 		if got := dashboard(); got != "transfer.80" {
-			t.Errorf("dashboard alerts at 87 %% of the raised limit = %q, want transfer.80", got)
+			t.Errorf("dashboard alerts at 91 %% of the raised limit = %q, want transfer.80", got)
+		}
+		if got := store.metaValue(MetaTransferAlertSent); got != `"2026-09:80"` {
+			t.Errorf("meta %s = %s, want \"2026-09:80\"", MetaTransferAlertSent, got)
+		}
+		r.egress(gb)
+		for range 3 {
+			minute()
+		}
+		wantAlerts("at 100 % of the limit raised a second time", "100", "100")
+
+		// Lowered below what the month has used: that limit is reached, and 100 % was alerted already.
+		r.policy.alertGB.Store(5)
+		minute()
+		wantAlerts("after lowering the limit", "100", "100")
+		// Switched off and on again: the same thresholds, nothing new.
+		r.policy.alertGB.Store(0)
+		minute()
+		r.policy.alertGB.Store(12)
+		minute()
+		wantAlerts("after switching the alert off and on", "100", "100")
+		r.stop()
+	})
+}
+
+// While the month's row can't be read, the totals are only what was counted since the start and look low. That
+// is not a limit that went up: the alerted threshold stays alerted, and nothing goes out twice.
+func TestTransferAlertKeptWhileTotalsUnknown(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := newFakeTransferStore()
+		store.months["2026-09"] = byteCount{egress: 2 * gb}
+		store.meta[MetaTransferAlertSent] = `"2026-09:100"`
+		store.fail(func(s *fakeTransferStore) { s.failGet = errors.New("database is locked") })
+		r := newTransferRig(t, clockAt(time.Date(2026, 9, 10, 8, 0, 0, 0, time.UTC)), store)
+		r.policy.alertGB.Store(1)
+		r.run()
+		r.egress(1000)
+		for range 3 {
+			time.Sleep(transferFlushEvery)
+			synctest.Wait()
+		}
+		if info := r.tr.Info(); info.EgressBytes >= gb*8/10 {
+			t.Fatalf("Info while the month's row can't be read = %+v: this test needs totals that look low", info)
+		}
+		if got := store.metaValue(MetaTransferAlertSent); got != `"2026-09:100"` {
+			t.Errorf("meta %s = %s while the totals are unknown, want it unchanged", MetaTransferAlertSent, got)
+		}
+
+		store.fail(func(s *fakeTransferStore) { s.failGet = nil })
+		for range 3 {
+			time.Sleep(transferFlushEvery)
+			synctest.Wait()
+		}
+		if info := r.tr.Info(); info.EgressBytes != 2*gb+1000 {
+			t.Errorf("Info once the row is read = %+v, want 2 GB and 1000 bytes", info)
+		}
+		if got := r.alerter.targets(); len(got) != 0 {
+			t.Errorf("alerts = %v: 100 %% was alerted before the restart", got)
+		}
+		if got := store.metaValue(MetaTransferAlertSent); got != `"2026-09:100"` {
+			t.Errorf("meta %s = %s, want it unchanged", MetaTransferAlertSent, got)
 		}
 		r.stop()
 	})
@@ -739,12 +1031,16 @@ func TestAlertSentCodec(t *testing.T) {
 	if got := encodeAlertSent("2026-09", 80); got != `"2026-09:80"` {
 		t.Errorf("encodeAlertSent = %s, want the JSON string \"2026-09:80\" (04 §11.3)", got)
 	}
+	if got := encodeAlertSent("2026-09", 0); got != `"2026-09:0"` {
+		t.Errorf("encodeAlertSent = %s, want the JSON string \"2026-09:0\"", got)
+	}
 	for value, want := range map[string]struct {
 		month string
 		level int
 	}{
 		`"2026-09:80"`:   {"2026-09", 80},
 		`"2026-12:100"`:  {"2026-12", 100},
+		`"2026-09:0"`:    {"2026-09", 0}, // forgotten after the limit was raised
 		``:               {},
 		`null`:           {},
 		`2026-09:80`:     {}, // not JSON

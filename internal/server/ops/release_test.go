@@ -1,11 +1,16 @@
 package ops
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -14,8 +19,10 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -48,10 +55,11 @@ type feedTransport struct {
 
 // feedAnswer is what the feed says to one request.
 type feedAnswer struct {
-	status int
-	etag   string
-	body   string
-	err    error // no answer at all: the transport's error
+	status   int
+	etag     string
+	body     string
+	encoding string // the Content-Encoding of body; "" sends none
+	err      error  // no answer at all: the transport's error
 	// silent: the server accepts the request and never answers. stalled: it sends the header and then no body.
 	// Both last until the request is cancelled.
 	silent, stalled bool
@@ -77,6 +85,9 @@ func (f *feedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	h := http.Header{"Content-Type": {"application/json; charset=utf-8"}}
 	if a.etag != "" {
 		h.Set("ETag", a.etag)
+	}
+	if a.encoding != "" {
+		h.Set("Content-Encoding", a.encoding)
 	}
 	res := &http.Response{
 		StatusCode: a.status, Status: fmt.Sprintf("%d %s", a.status, http.StatusText(a.status)),
@@ -122,6 +133,143 @@ func answerStatus(status int, body string) func(*http.Request) feedAnswer {
 	return func(*http.Request) feedAnswer { return feedAnswer{status: status, body: body} }
 }
 
+// answerEncoded returns a feedTransport answer: 200 with a body that is said to be in a content encoding.
+func answerEncoded(encoding string, body []byte) func(*http.Request) feedAnswer {
+	return func(*http.Request) feedAnswer {
+		return feedAnswer{status: http.StatusOK, body: string(body), encoding: encoding}
+	}
+}
+
+// gzipped compresses data as a server does for Content-Encoding: gzip. gzip.NoCompression gives a body that is as
+// large on the wire as it is decoded.
+func gzipped(t testing.TB, data []byte, level int) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w, err := gzip.NewWriterLevel(&buf, level)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// readFeedBody reads body as the body of a 200 answer with a Content-Encoding ("" sends none), as check does.
+func readFeedBody(encoding string, body []byte) ([]knownRelease, error) {
+	res := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(body))}
+	if encoding != "" {
+		res.Header.Set("Content-Encoding", encoding)
+	}
+	return readReleaseFeed(res)
+}
+
+// paddedFeed returns a feed of exactly size bytes: one release, v9.9.9, and white space.
+func paddedFeed(size int) []byte {
+	const head, tail = `[{"tag_name":"v9.9.9"}`, `]`
+	return []byte(head + strings.Repeat(" ", size-len(head)-len(tail)) + tail)
+}
+
+// fullShapeFeed returns a "list releases" answer the size of a real one: every release and every asset as GitHub
+// describes them, with the author and the uploader in full, which is most of the bytes. The asset names are those
+// of 06 §3, then invented ones. It is indented, as GitHub sends it to some clients. The newest release is
+// v0.<releases>.0, and the fourth newest is a security release.
+func fullShapeFeed(t testing.TB, releases, assets, notesBytes int) []byte {
+	t.Helper()
+	const repo = "https://api.github.com/repos/MoonWX/isshoni"
+	bot := map[string]any{
+		"login": "github-actions[bot]", "id": 41898282, "node_id": "MDM6Qm90NDE4OTgyODI=",
+		"avatar_url": "https://avatars.githubusercontent.com/in/15368?v=4", "gravatar_id": "",
+		"url":                 "https://api.github.com/users/github-actions%5Bbot%5D",
+		"html_url":            "https://github.com/apps/github-actions",
+		"followers_url":       "https://api.github.com/users/github-actions%5Bbot%5D/followers",
+		"following_url":       "https://api.github.com/users/github-actions%5Bbot%5D/following{/other_user}",
+		"gists_url":           "https://api.github.com/users/github-actions%5Bbot%5D/gists{/gist_id}",
+		"starred_url":         "https://api.github.com/users/github-actions%5Bbot%5D/starred{/owner}{/repo}",
+		"subscriptions_url":   "https://api.github.com/users/github-actions%5Bbot%5D/subscriptions",
+		"organizations_url":   "https://api.github.com/users/github-actions%5Bbot%5D/orgs",
+		"repos_url":           "https://api.github.com/users/github-actions%5Bbot%5D/repos",
+		"events_url":          "https://api.github.com/users/github-actions%5Bbot%5D/events{/privacy}",
+		"received_events_url": "https://api.github.com/users/github-actions%5Bbot%5D/received_events",
+		"type":                "Bot", "user_view_type": "public", "site_admin": false,
+	}
+	names := func(v string) []string {
+		out := []string{
+			"install.sh", "compose.yaml", "compose.host.yaml",
+			"checksums.txt", "checksums.txt.sig", "checksums.txt.sigstore.json",
+			"isshoni_" + v + "_amd64.deb", "isshoni_" + v + "_arm64.deb",
+			"isshoni-" + v + "-1.x86_64.rpm", "isshoni-" + v + "-1.aarch64.rpm",
+		}
+		for _, archive := range []string{
+			"linux_amd64.tar.gz", "linux_arm64.tar.gz", "darwin_amd64.tar.gz", "darwin_arm64.tar.gz",
+			"windows_amd64.zip", "windows_arm64.zip",
+		} {
+			out = append(out, "isshoni_"+v+"_"+archive, "isshoni_"+v+"_"+archive+".sbom.json")
+		}
+		for i := len(out); i < assets; i++ {
+			out = append(out, "isshoni-desktop_"+v+"_"+strconv.Itoa(i)+".zip")
+		}
+		return out[:assets]
+	}
+	// Release notes that compress like prose, not like one repeated line.
+	random := rand.New(rand.NewPCG(1, 2)) //nolint:gosec // G404: the same text in every run, not a secret
+	words := strings.Fields("share screen viewer room invite bitrate layer fixes adds the a of for when with admin " +
+		"dashboard transfer certificate update simulcast keyframe reconnect push audio focus thumbnail doctor")
+	notes := func() string {
+		var b strings.Builder
+		b.WriteString("## What's new\r\n\r\n")
+		for b.Len() < notesBytes {
+			b.WriteString("- ")
+			for range 6 + random.IntN(10) {
+				b.WriteString(words[random.IntN(len(words))] + " ")
+			}
+			b.WriteString("(#" + strconv.Itoa(random.IntN(3000)) + ")\r\n")
+		}
+		return b.String()
+	}
+
+	feed := make([]map[string]any, 0, releases)
+	for i := range releases {
+		v := "0." + strconv.Itoa(releases-i) + ".0"
+		id := 300000000 - i*1000
+		stamp := time.Date(2027, 6, 1, 9, 0, 0, 0, time.UTC).AddDate(0, 0, -14*i).Format(time.RFC3339)
+		list := make([]map[string]any, 0, assets)
+		for n, name := range names(v) {
+			digest := sha256.Sum256([]byte("v" + v + "/" + name))
+			list = append(list, map[string]any{
+				"url": repo + "/releases/assets/" + strconv.Itoa(id+n), "id": id + n,
+				"node_id": "RA_kwDOExample" + hex.EncodeToString(digest[:6]), "name": name, "label": "",
+				"uploader": bot, "content_type": "application/octet-stream", "state": "uploaded",
+				"size": 1000 + int(digest[0])*70000, "digest": "sha256:" + hex.EncodeToString(digest[:]),
+				"download_count": int(digest[1]) * 13, "created_at": stamp, "updated_at": stamp,
+				"browser_download_url": "https://github.com/MoonWX/isshoni/releases/download/v" + v + "/" + name,
+			})
+		}
+		body := notes()
+		if i == 3 {
+			body += "\r\n" + SecurityMarker + "\r\n"
+		}
+		feed = append(feed, map[string]any{
+			"url": repo + "/releases/" + strconv.Itoa(id), "assets_url": repo + "/releases/" + strconv.Itoa(id) + "/assets",
+			"upload_url": "https://uploads.github.com/repos/MoonWX/isshoni/releases/" + strconv.Itoa(id) + "/assets{?name,label}",
+			"html_url":   "https://github.com/MoonWX/isshoni/releases/tag/v" + v,
+			"id":         id, "author": bot, "node_id": "RE_kwDOExample" + strconv.Itoa(id),
+			"tag_name": "v" + v, "target_commitish": "main", "name": "v" + v,
+			"draft": false, "immutable": true, "prerelease": false,
+			"created_at": stamp, "updated_at": stamp, "published_at": stamp, "assets": list,
+			"tarball_url": repo + "/tarball/v" + v, "zipball_url": repo + "/zipball/v" + v, "body": body,
+		})
+	}
+	data, err := json.MarshalIndent(feed, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
 // newTestRelease builds a ReleaseCheck that runs as `running`, switched on, over transport.
 func newTestRelease(t *testing.T, running string, transport http.RoundTripper, meta MetaStore) (*ReleaseCheck, *fakePolicy, *syncBuffer) {
 	t.Helper()
@@ -140,7 +288,7 @@ func newTestRelease(t *testing.T, running string, transport http.RoundTripper, m
 // TestParseReleaseFeed: the parser keeps the published releases with a SemVer tag, in SemVer order, and finds
 // the security marker (04 §11.5, §17).
 func TestParseReleaseFeed(t *testing.T) {
-	got, err := parseReleaseFeed(readFeed(t))
+	got, err := parseReleaseFeed(bytes.NewReader(readFeed(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,6 +318,7 @@ func TestParseReleaseFeedEdges(t *testing.T) {
 		want []knownRelease
 	}{
 		{"no releases yet", `[]`, []knownRelease{}},
+		{"white space around the list", " \r\n[ ]\n\t", []knownRelease{}},
 		{"null", `null`, []knownRelease{}},
 		{"null elements", `[null, {}]`, []knownRelease{}},
 		{"a tag without v", `[{"tag_name":"0.4.0"}]`, []knownRelease{{Version: "0.4.0"}}},
@@ -194,7 +343,7 @@ func TestParseReleaseFeedEdges(t *testing.T) {
 		{"numeric order, not text order", `[{"tag_name":"v0.9.0"},{"tag_name":"v0.10.0"},{"tag_name":"v0.10.0-rc.2"},{"tag_name":"v0.10.0-rc.10"}]`,
 			[]knownRelease{{Version: "0.10.0"}, {Version: "0.10.0-rc.10", Prerelease: true}, {Version: "0.10.0-rc.2", Prerelease: true}, {Version: "0.9.0"}}},
 	} {
-		got, err := parseReleaseFeed([]byte(c.feed))
+		got, err := parseReleaseFeed(strings.NewReader(c.feed))
 		if err != nil {
 			t.Errorf("%s: %v", c.name, err)
 			continue
@@ -204,15 +353,32 @@ func TestParseReleaseFeedEdges(t *testing.T) {
 		}
 	}
 
-	// What is not a list of releases is an error: GitHub's error document, HTML from a captive portal, a cut-off body.
+	// What is not a list of releases is an error: GitHub's error document, HTML from a captive portal, a cut-off
+	// body, a list with something after it.
 	for _, bad := range []string{
 		`{"message":"API rate limit exceeded","documentation_url":"https://docs.github.com/rest"}`,
 		`<html><body>Sign in to the hotel Wi-Fi</body></html>`,
 		`[{"tag_name":"v1.0.0"`,
+		`[{"tag_name":"v1.0.0"}`,
+		`[{"tag_name":"v1.0.0"},`,
+		`[{"tag_name":"v1.0.0"},]`,
+		`[{"tag_name":"v1.0.0"} {"tag_name":"v2.0.0"}]`,
+		`[{"tag_name":"v1.0.0"}}`,
 		`[{"tag_name":17}]`,
+		`["v1.0.0"]`,
+		`[`,
+		`"v1.0.0"`,
+		`17`,
+		`true`,
+		`[{"tag_name":"v1.0.0"}] [{"tag_name":"v2.0.0"}]`,
+		`[{"tag_name":"v1.0.0"}]]`,
+		`[{"tag_name":"v1.0.0"}] trailing`,
+		`null null`,
+		`nul`,
 		``,
+		`   `,
 	} {
-		if got, err := parseReleaseFeed([]byte(bad)); err == nil {
+		if got, err := parseReleaseFeed(strings.NewReader(bad)); err == nil {
 			t.Errorf("parseReleaseFeed(%q) = %+v, want an error", bad, got)
 		}
 	}
@@ -222,7 +388,7 @@ func TestParseReleaseFeedEdges(t *testing.T) {
 	for i := range 50 {
 		many = append(many, fmt.Sprintf(`{"tag_name":"v1.%d.0"}`, i))
 	}
-	got, err := parseReleaseFeed([]byte("[" + strings.Join(many, ",") + "]"))
+	got, err := parseReleaseFeed(strings.NewReader("[" + strings.Join(many, ",") + "]"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,12 +396,32 @@ func TestParseReleaseFeedEdges(t *testing.T) {
 		t.Errorf("50 releases: kept %d, from %s to %s; want the newest %d, 1.49.0 to 1.30.0",
 			len(got), got[0].Version, got[len(got)-1].Version, releasePerPage)
 	}
+
+	// The list is cut down while it is read. That changes nothing: the newest version keeps the link of its first
+	// entry and takes the marker of an entry several pages later, and versions come back in order from any order.
+	many = []string{`{"tag_name":"v1.199.0","html_url":"https://example.org/first"}`}
+	for i := range 199 {
+		n := i * 7 % 199 // every number below 199 once, in no order
+		many = append(many, fmt.Sprintf(`{"tag_name":"v1.%d.0","html_url":"https://example.org/%d"}`, n, n))
+	}
+	many = append(many, `{"tag_name":"1.199.0","html_url":"https://example.org/last","body":"<!-- isshoni:security -->"}`)
+	got, err = parseReleaseFeed(strings.NewReader("[" + strings.Join(many, ",") + "]"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []knownRelease{{Version: "1.199.0", URL: "https://example.org/first", Security: true}}
+	for n := 198; n > 198-(releasePerPage-1); n-- {
+		want = append(want, knownRelease{Version: fmt.Sprintf("1.%d.0", n), URL: fmt.Sprintf("https://example.org/%d", n)})
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("201 releases:\n got %+v\nwant %+v", got, want)
+	}
 }
 
 // TestViewReleases: what the fixture's releases mean to each running version (04 §11.5): prereleases count only
 // for a prerelease, and the security flag is about the releases newer than the running one.
 func TestViewReleases(t *testing.T) {
-	releases, err := parseReleaseFeed(readFeed(t))
+	releases, err := parseReleaseFeed(bytes.NewReader(readFeed(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -347,7 +533,8 @@ func TestReleaseCheckRequest(t *testing.T) {
 		"Accept":               {"application/vnd.github+json"},
 		"X-Github-Api-Version": {"2022-11-28"},
 		"User-Agent":           {"isshoni/0.9.0"},
-		// net/http's own: the transport asks for gzip and, with one request a day, closes the connection.
+		// Any HTTP client's: gzip, which is what net/http asks for by itself, and, with one request a day, a
+		// connection that is closed.
 		"Accept-Encoding": {"gzip"},
 		"Connection":      {"close"},
 	}
@@ -401,6 +588,8 @@ func TestReleaseCheckSendsNoCookies(t *testing.T) {
 		"Accept":               {"application/vnd.github+json"},
 		"X-Github-Api-Version": {"2022-11-28"},
 		"User-Agent":           {"isshoni/0.9.0"},
+		// What net/http sends by itself. The check sets it, so the limit can count the body as it is on the wire.
+		"Accept-Encoding": {"gzip"},
 	}
 	if !reflect.DeepEqual(req.Header, want) {
 		t.Errorf("headers = %v, want %v", req.Header, want)
@@ -677,6 +866,17 @@ func TestReleaseAlerts(t *testing.T) {
 func TestReleaseCheckFailures(t *testing.T) {
 	good := answerWith("", `[{"tag_name":"v0.10.0","html_url":"https://example.org/v0.10.0"}]`)
 	status := answerStatus
+	// A release of 9.9.9 that must never be shown: in a body over the 1 MiB that may be on the wire, and in one
+	// that is small there and over the 16 MiB that it may expand to.
+	overWire := []byte(`[{"tag_name":"v9.9.9","body":"` + strings.Repeat("a", releaseMaxBytes) + `"}]`)
+	overDecoded := []byte(`[{"tag_name":"v9.9.9","body":"` + strings.Repeat("a", releaseMaxDecodedBytes) + `"}]`)
+	bomb := gzipped(t, overDecoded, gzip.BestSpeed)
+	if len(bomb) > releaseMaxBytes/10 {
+		t.Fatalf("the oversized feed is %d bytes compressed: too large for a test of the other limit", len(bomb))
+	}
+	small := gzipped(t, []byte(`[{"tag_name":"v9.9.9","html_url":"https://example.org/v9.9.9"}]`), gzip.DefaultCompression)
+	damaged := bytes.Clone(small)
+	damaged[len(damaged)-8] ^= 0xff // the first byte of the checksum
 	for _, c := range []struct {
 		name    string
 		answer  func(*http.Request) feedAnswer
@@ -689,7 +889,15 @@ func TestReleaseCheckFailures(t *testing.T) {
 		{"a 304 nobody asked for", status(http.StatusNotModified, ""), "304 Not Modified to a request without If-None-Match"},
 		{"not JSON", status(http.StatusOK, "<html>Sign in to the Wi-Fi</html>"), "not a JSON list of releases"},
 		{"an error document with 200", status(http.StatusOK, `{"message":"hello"}`), "not a JSON list of releases"},
-		{"larger than 1 MiB", status(http.StatusOK, `[{"tag_name":"v9.9.9","body":"`+strings.Repeat("a", releaseMaxBytes)+`"}]`), "larger than 1048576 bytes"},
+		{"larger than 1 MiB", status(http.StatusOK, string(overWire)), `larger than 1048576 bytes"`},
+		{"larger than 1 MiB compressed", answerEncoded("gzip", gzipped(t, overWire, gzip.NoCompression)), `larger than 1048576 bytes"`},
+		{"larger than 16 MiB once decompressed", answerEncoded("gzip", bomb), "larger than 16777216 bytes decompressed"},
+		{"an encoding nobody asked for", answerEncoded("br", small), "which was not asked for"},
+		{"two encodings", answerEncoded("gzip, gzip", gzipped(t, small, gzip.DefaultCompression)), "which was not asked for"},
+		{"gzip in the header only", answerEncoded("gzip", []byte(`[{"tag_name":"v9.9.9"}]`)), "not the gzip its header says"},
+		{"a compressed body that is cut off", answerEncoded("gzip", small[:len(small)-12]), "reading the feed"},
+		{"a compressed body with a wrong checksum", answerEncoded("gzip", damaged), "reading the feed"},
+		{"compressed, and not JSON", answerEncoded("gzip", gzipped(t, []byte("<html>"), gzip.DefaultCompression)), "not a JSON list of releases"},
 		{"no network", func(*http.Request) feedAnswer { return feedAnswer{err: errors.New("dial tcp: no route to host")} }, "no route to host"},
 	} {
 		transport := &feedTransport{answer: c.answer}
@@ -726,6 +934,116 @@ func TestReleaseCheckFailures(t *testing.T) {
 		if got := meta.metaValue(MetaReleaseCheck); got != stored {
 			t.Errorf("%s: a failed check changed the stored result", c.name)
 		}
+	}
+}
+
+// TestReleaseCheckFullSizeFeed: the 1 MiB of 04 §11.5 is the answer on the wire, where GitHub compresses it. As
+// JSON a page of 20 releases is larger than that once a release has a few dozen assets, and such a page is read
+// like any other, through real sockets on 127.0.0.1 and the client the server uses.
+func TestReleaseCheckFullSizeFeed(t *testing.T) {
+	// 40 assets: the 22 of 06 §3 and the desktop builds that later milestones add to the same release.
+	feed := fullShapeFeed(t, releasePerPage, 40, 4000)
+	wire := gzipped(t, feed, gzip.DefaultCompression)
+	t.Logf("a page of %d releases with 40 assets each: %d bytes of JSON, %d bytes compressed", releasePerPage, len(feed), len(wire))
+	if len(feed) <= releaseMaxBytes {
+		t.Fatalf("the feed is %d bytes of JSON: this test needs one over the %d of the limit", len(feed), releaseMaxBytes)
+	}
+	if len(wire) > releaseMaxBytes/4 {
+		t.Errorf("the feed is %d bytes compressed: a real page must stay well below the limit of %d", len(wire), releaseMaxBytes)
+	}
+
+	var compress atomic.Bool
+	compress.Store(true)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		if !compress.Load() || r.Header.Get("Accept-Encoding") != "gzip" {
+			_, _ = w.Write(feed)
+			return
+		}
+		w.Header().Set("Content-Encoding", "gzip")
+		_, _ = w.Write(wire)
+	}))
+	defer srv.Close()
+
+	check := func() (*ReleaseCheck, *syncBuffer) {
+		t.Helper()
+		policy := new(fakePolicy)
+		policy.releaseCheck.Store(true)
+		log, logs := testLogger()
+		r, err := NewReleaseCheck(ReleaseCheckOptions{Policy: policy, URL: srv.URL, Version: "0.16.0", Logger: log})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.tick(t.Context())
+		return r, logs
+	}
+
+	r, logs := check()
+	got := r.Update()
+	if got == nil {
+		t.Fatalf("Update after a full-size feed = nil; the check said:\n%s", logs.String())
+	}
+	// 0.17.0 is the security release, and the running version is the one before it.
+	if got.Latest != "0.20.0" || got.URL != "https://github.com/MoonWX/isshoni/releases/tag/v0.20.0" || !got.Security {
+		t.Errorf("Update = %+v, want 0.20.0 with the security flag", got)
+	}
+	if alerts := r.Alerts(); len(alerts) != 1 || alerts[0].Code != api.AlertCodeReleaseSecurityUpdate {
+		t.Errorf("Alerts = %+v, want release.security_update", alerts)
+	}
+
+	// The same page from a server or through a proxy that does not compress is over the limit on the wire.
+	compress.Store(false)
+	r, logs = check()
+	if got := r.Update(); got != nil {
+		t.Errorf("Update after %d bytes on the wire = %+v, want nil", len(feed), got)
+	}
+	if !strings.Contains(logs.String(), "larger than 1048576 bytes") {
+		t.Errorf("no debug line about the size:\n%s", logs.String())
+	}
+}
+
+// TestReleaseFeedLimits: the two limits to the byte. On the wire a body may be 1 MiB, whatever it expands to;
+// decompressed it may be 16 MiB.
+func TestReleaseFeedLimits(t *testing.T) {
+	want := []knownRelease{{Version: "9.9.9"}}
+	// A compressed body may be several gzip members in a row. With enough empty ones it is over the limit on the
+	// wire and expands to a hundred bytes.
+	empty := gzipped(t, nil, gzip.BestSpeed)
+	members := append(gzipped(t, paddedFeed(100), gzip.BestSpeed), bytes.Repeat(empty, releaseMaxBytes/len(empty)+1)...)
+	fourTimes := gzipped(t, paddedFeed(4*releaseMaxBytes), gzip.BestSpeed)
+	for _, c := range []struct {
+		name     string
+		encoding string
+		body     []byte
+		wantErr  string // "" means the feed is read
+	}{
+		{"1 MiB as it is", "", paddedFeed(releaseMaxBytes), ""},
+		{"1 MiB and a byte", "", paddedFeed(releaseMaxBytes + 1), "larger than 1048576 bytes"},
+		{"1 MiB, said to be as it is", "Identity", paddedFeed(releaseMaxBytes), ""},
+		{"more than 1 MiB that expands to less", "gzip", members, "larger than 1048576 bytes"},
+		{"more than 1 MiB, not compressed inside", "gzip", gzipped(t, paddedFeed(releaseMaxBytes), gzip.NoCompression), "larger than 1048576 bytes"},
+		{"more than 1 MiB of JSON in less on the wire", "gzip", fourTimes, ""},
+		{"the same under the old name of gzip", "X-GZIP", fourTimes, ""},
+		{"16 MiB decompressed", "gzip", gzipped(t, paddedFeed(releaseMaxDecodedBytes), gzip.BestSpeed), ""},
+		{"16 MiB and a byte decompressed", "gzip", gzipped(t, paddedFeed(releaseMaxDecodedBytes+1), gzip.BestSpeed), "larger than 16777216 bytes decompressed"},
+		{"two members", "gzip", append(gzipped(t, []byte(`[{"tag_name":`), gzip.BestSpeed), gzipped(t, []byte(`"v9.9.9"}]`), gzip.BestSpeed)...), ""},
+		{"something after the compressed body", "gzip", append(gzipped(t, paddedFeed(100), gzip.BestSpeed), "more"...), "reading the feed"},
+		{"an empty compressed body", "gzip", gzipped(t, nil, gzip.BestSpeed), "not a JSON list of releases"},
+		{"no body", "gzip", nil, "not the gzip its header says"},
+	} {
+		got, err := readFeedBody(c.encoding, c.body)
+		switch {
+		case c.wantErr == "" && (err != nil || !reflect.DeepEqual(got, want)):
+			t.Errorf("%s (%d bytes on the wire): %+v, %v; want it read", c.name, len(c.body), got, err)
+		case c.wantErr != "" && (err == nil || !strings.Contains(err.Error(), c.wantErr) || got != nil):
+			t.Errorf("%s (%d bytes on the wire): %+v, %v; want an error with %q", c.name, len(c.body), got, err, c.wantErr)
+		}
+	}
+
+	// An encoding from the network goes into the log, so only the start of it does.
+	_, err := readFeedBody(strings.Repeat("z", 5000), []byte("[]"))
+	if err == nil || len(err.Error()) > 200 || !strings.Contains(err.Error(), "which was not asked for") {
+		t.Errorf("an endless Content-Encoding: %v", err)
 	}
 }
 
@@ -994,7 +1312,18 @@ func FuzzParseReleaseFeed(f *testing.F) {
 		f.Add([]byte(seed))
 	}
 	f.Fuzz(func(t *testing.T, data []byte) {
-		releases, err := parseReleaseFeed(data)
+		releases, err := parseReleaseFeed(bytes.NewReader(data))
+		// As the body of an answer, as it is and compressed, the feed reads the same; and bytes that are only said
+		// to be compressed are refused or read, without a panic.
+		if len(data) <= releaseMaxBytes {
+			for encoding, wire := range map[string][]byte{"identity": data, "gzip": gzipped(t, data, gzip.BestSpeed)} {
+				got, gotErr := readFeedBody(encoding, wire)
+				if (gotErr == nil) != (err == nil) || !reflect.DeepEqual(got, releases) {
+					t.Fatalf("as a body with the encoding %s: %+v, %v; parsed directly: %+v, %v", encoding, got, gotErr, releases, err)
+				}
+			}
+			_, _ = readFeedBody("gzip", data)
+		}
 		if err != nil {
 			return
 		}
