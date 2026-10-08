@@ -1,9 +1,14 @@
 // The one <video> of a tile or of the stage (05 §10.2): `autoplay playsinline muted disableRemotePlayback`, with a
 // srcObject that holds only that share's video. Videos are ALWAYS muted, so they autoplay everywhere, iOS included;
 // every share's sound comes from the single <audio> element of audioOut.ts.
-import { useEffect, useMemo, useRef } from 'react';
+//
+// Autoplay can still be refused: iOS Low Power Mode blocks even muted video (05 §10.3). Inside a ViewerLayout the
+// element is therefore also started through the viewer's VideoPlayback, which notices a refusal, so that TapToStart
+// can ask for the tap that starts it. Outside one, the `autoplay` attribute is all there is.
+import { useContext, useEffect, useMemo, useRef } from 'react';
 
 import { cx } from '../ui/cx';
+import { ViewerContext } from './context';
 import styles from './ShareVideo.module.css';
 
 export interface ShareVideoProps {
@@ -16,21 +21,27 @@ export interface ShareVideoProps {
 
 export function ShareVideo({ track, stream, className }: ShareVideoProps) {
   const ref = useRef<HTMLVideoElement>(null);
+  const videos = useContext(ViewerContext)?.videos;
   // One MediaStream per track: a new track (the SFU reused a transceiver, or the sub PC was rebuilt) is a new source.
   const source = useMemo(() => stream ?? (track ? new MediaStream([track]) : null), [stream, track]);
 
   useEffect(() => {
     const el = ref.current;
-    if (el && el.srcObject !== source) el.srcObject = source;
-  }, [source]);
+    if (!el || el.srcObject === source) return;
+    el.srcObject = source;
+    if (source) videos?.play(el);
+    else videos?.forget(el);
+  }, [source, videos]);
 
   // Let go of the stream when the tile unmounts (the share ended, or the room page was left).
   useEffect(() => {
     const el = ref.current;
     return () => {
-      if (el) el.srcObject = null;
+      if (!el) return;
+      el.srcObject = null;
+      videos?.forget(el);
     };
-  }, []);
+  }, [videos]);
 
   return (
     <video

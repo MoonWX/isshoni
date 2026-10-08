@@ -336,6 +336,19 @@ export class SubscriberPC {
     return this.#pc ? this.#pc.getStats() : Promise.resolve(null);
   }
 
+  /** The current PC's connectionState, for the stats (05 §10.7); 'closed' while there is no PC. */
+  get connectionState(): RTCPeerConnectionState {
+    return this.#pc?.connectionState ?? 'closed';
+  }
+
+  /**
+   * The share and kind the newest offer's `tracks` give an m-section (05 §9), for the stats, which name received
+   * streams by mid; undefined for an m-section that carries no share now.
+   */
+  trackOf(mid: string): TrackRef | undefined {
+    return this.#tracks.get(mid);
+  }
+
   /**
    * Closes the local PC and forgets everything about it; no message is sent (room.leave closes the server side, and
    * pc.close is for the pub PC, 01 §9 rule 10). Its tracks leave the registry. The object stays usable: the next

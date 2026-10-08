@@ -9,7 +9,9 @@
 // | fullscreen            | only the stage           | not rendered                                            |
 //
 // It is a view of viewerStore: RoomSession gives the store each room.state (syncRoom), and a pick on a tile goes
-// back to it (focusShare), which holds that share on the stage until it ends (05 §12.2).
+// back to it (focusShare), which holds that share on the stage until it ends (05 §12.2). The stage and the tiles
+// bring their own controls: the sound (the speaker button of a tile, mute and volume on the stage, 05 §12.3), the
+// watchers popover (05 §12.6) and TapToStart over the stage while the browser wants a tap (05 §10.3).
 import { Layers } from 'lucide-react';
 import { useState, useSyncExternalStore, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -44,7 +46,7 @@ function useMediaQuery(query: string): boolean {
 }
 
 export interface ViewerLayoutProps {
-  /** The viewer's store and media registry (createViewer()). */
+  /** The viewer's store, media registry and playback (createViewer()). */
   viewer: ViewerServices;
   /** The local preview streams of the shares this page publishes, by shareId (share/'s ActiveShare.preview). */
   localPreviews?: Readonly<Record<string, MediaStream | null | undefined>>;
@@ -52,9 +54,9 @@ export interface ViewerLayoutProps {
   empty?: ReactNode;
   /** Opens the connection test. Without it, the "can't reach the media port" banner has no button. */
   onTestConnection?: () => void;
-  /** The stage toolbar's controls (S47, S56). */
+  /** More controls for the stage's toolbar, after the sound controls (S56: fullscreen, PiP). */
   stageControls?: ReactNode;
-  /** Controls next to a tile's main area (S47: the speaker and watchers buttons). */
+  /** More controls next to a tile's main area, after its watchers and speaker buttons. */
   tileActions?: (share: ViewerShare) => ReactNode;
 }
 
