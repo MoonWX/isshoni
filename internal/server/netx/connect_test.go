@@ -315,6 +315,53 @@ func TestAdvertisedMatchesPion(t *testing.T) {
 	}
 }
 
+// TestAdvertisedMatchesPionDualStackLoopback: with include_loopback and network.ipv6 both on (development), the
+// candidates Pion puts in an offer are exactly Transport.Advertised: UDP on 127.0.0.1 and on ::1, TCP on 127.0.0.1
+// only. Pion gathers no TCP candidate on ::1 (its interface scan takes ::/96 for IPv4-compatible addresses), so
+// the Transport advertises none. If a later Pion gathers one, this test fails and pionSkipsV6 needs another look.
+func TestAdvertisedMatchesPionDualStackLoopback(t *testing.T) {
+	var lc net.ListenConfig
+	probe, err := lc.ListenPacket(context.Background(), "udp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("no IPv6 loopback here: %v", err)
+	}
+	_ = probe.Close()
+	tr := newTestTransport(t, TransportOptions{
+		UDPAddr: ":0", TCPAddr: ":0", IncludeLoopback: true, IPv6: true,
+		Interfaces: &fakeIfaces{ifs: []Interface{loIface()}},
+	})
+	var se webrtc.SettingEngine
+	if err := tr.Apply(&se); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, c := range sdpCandidates(gatherOffer(t, webrtc.NewAPI(webrtc.WithSettingEngine(se)))) {
+		got = append(got, c.proto+" "+c.addr.String())
+	}
+	var want []string
+	lo4, lo6 := netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("::1")
+	seen := map[string]bool{}
+	for _, a := range tr.Advertised {
+		want = append(want, a.Proto+" "+a.Addr.String())
+		switch a.Addr.Addr() {
+		case lo4:
+			seen[a.Proto+"4"] = true
+		case lo6:
+			seen[a.Proto+"6"] = true
+		default:
+			t.Errorf("Advertised %+v: want only loopback addresses", a)
+		}
+	}
+	if !seen["udp4"] || !seen["udp6"] || !seen["tcp4"] || seen["tcp6"] {
+		t.Errorf("Advertised %+v: want UDP on 127.0.0.1 and ::1, TCP on 127.0.0.1 only", tr.Advertised)
+	}
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("offer candidates %v, Advertised %v", got, want)
+	}
+}
+
 // TestCloseWithSilentTCPClient: a client that connects to 7882/tcp and never sends its first STUN request does not
 // hold Transport.Close for pion's 10 s first-request timeout.
 func TestCloseWithSilentTCPClient(t *testing.T) {

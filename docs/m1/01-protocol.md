@@ -1982,7 +1982,13 @@ Forbidden:
   Checked with tygo v0.2.21 on a scratch package:
   - defined string types with a `<Type><Value>` const group become `export type X = typeof XA | typeof XB`;
   - `omitempty`/`omitzero` fields become optional (`?`);
-  - `uint32` becomes `number`.
+  - `uint32` becomes `number`;
+  - a Go `any` becomes a TypeScript `any`, so every struct field that holds one has a `tstype` tag naming a checked
+    type: `tstype:"{ [key: string]: unknown }"` on the `Params` maps, and `tstype:"unknown"` on `Spec.Payload` and
+    `Spec.Result` (tygo emits the Go-only registry `Spec` too, although it is never on the wire). tygo reads the tag
+    up to its first comma as the type and the rest as options (`,extends`, `,required`), so the type is written
+    without a comma (an index signature, not `Record<string, unknown>`). The generated files contain no `any`;
+    `TestNoTSAny` checks the tags of `internal/protocol` and `internal/protocol/api`.
 
   Enum const groups need at least 2 members and names prefixed by the type name; anything else stays a plain
   `string` in TS. `CodecKey` uses single-line consts on purpose: it must stay an open `string`.
@@ -2073,14 +2079,14 @@ const (
 )
 
 // Spec describes one message type (and direction); Registry is the single list used by the hub's dispatcher,
-// the tests (every Spec has a fixture) and the TS generator.
+// the tests (every Spec has a fixture) and the TS generator. The tstype tags keep any out of types.gen.ts (§14.4).
 type Spec struct {
 	Type      MessageType
 	Dir       Direction
 	Kind      MsgKind
-	Payload   any         // zero value of the payload type, e.g. RoomJoin{}
+	Payload   any         `tstype:"unknown"` // zero value of the payload type, e.g. RoomJoin{}
 	Reply     MessageType // requests: MessageTypeOK, or MessageTypeWelcome for hello
-	Result    any         // requests: zero value of the reply payload (Empty{} if none)
+	Result    any         `tstype:"unknown"` // requests: zero value of the reply payload (Empty{} if none)
 	Roles     []Role      // client->server: allowed roles; nil = all
 	Feature   Feature     // "" = baseline
 	Since     int         // protocol version that introduced it

@@ -670,7 +670,9 @@ func (s *SFU) Probe(ctx context.Context, user UserID, t ProbeTransport, offerSDP
   probe keeps only its own transport's mux: a TCP probe gets no UDP mux and the UDP probe no TCP mux, because Pion
   (ice v4.4) gathers a host candidate on every address of a UDP mux whatever the network types. For the same reason
   an IPv4-only UDP probe (next bullet) gets a view of `Transport.UDPMux` that lists only its IPv4 sockets. 04
-  guarantees that `Apply` only calls SettingEngine setters, so a later setter call wins.
+  guarantees that `Apply` only calls SettingEngine setters, so a later setter call wins. TCP candidates come from
+  Pion's interface scan instead, which never returns `::1`; so on a dual-stack loopback Transport (development) IPv6
+  shows on UDP only, and `Transport.Advertised` lists `::1` for UDP only (04 §7.6).
 - IP family: when 04's `Public.V4` is set (the SFU sees it as a non-LAN IPv4 entry in `Transport.Advertised`), the
   probe APIs use only `udp4`/`tcp4`, so a pass reflects the path most friends use. IPv6 is used only on IPv6-only
   servers.

@@ -183,7 +183,8 @@ func isLANAddr(a netip.Addr) bool {
 
 // usableIfaceAddr reports whether an interface address may carry media at all, whatever the plan: no
 // unspecified, multicast or link-local address, no IPv6 temporary address, and no IPv4-compatible or site-local
-// IPv6 address (pion rejects those too, RFC 8445 §5.1.1.1).
+// IPv6 address (pion rejects those too, RFC 8445 §5.1.1.1). The loopback ::1 is usable: it carries UDP, though
+// never ICE-TCP (pionSkipsV6).
 func usableIfaceAddr(ia InterfaceAddr) bool {
 	a := ia.Addr.Unmap()
 	switch {
@@ -191,16 +192,24 @@ func usableIfaceAddr(ia InterfaceAddr) bool {
 		return false
 	case a.Is6() && ia.Temporary:
 		return false
-	case a.Is6() && !a.IsLoopback():
-		b := a.As16()
-		if [12]byte(b[:12]) == [12]byte{} {
-			return false // IPv4-compatible
-		}
-		if b[0] == 0xfe && b[1]&0xc0 == 0xc0 {
-			return false // site-local
-		}
+	case !a.IsLoopback() && pionSkipsV6(a):
+		return false
 	}
 	return true
+}
+
+// pionSkipsV6 reports an IPv6 address that pion's interface scan (ice's localInterfaces) never returns: one in
+// ::/96, which it takes for a deprecated IPv4-compatible address, or a site-local one, fec0::/10 (RFC 8445
+// §5.1.1.1). The loopback ::1 is in ::/96. Pion gathers its passive TCP candidates from that scan, so such an
+// address never gets one, whatever include_loopback says; UDP candidates come from the UDP mux's sockets instead,
+// so ::1 still carries UDP.
+func pionSkipsV6(a netip.Addr) bool {
+	a = a.Unmap()
+	if !a.Is6() {
+		return false
+	}
+	b := a.As16()
+	return [12]byte(b[:12]) == [12]byte{} || (b[0] == 0xfe && b[1]&0xc0 == 0xc0)
 }
 
 // isTailscale reports a Tailscale interface: tailscale* (Linux) or utun* (macOS, whose Tailscale addresses are
