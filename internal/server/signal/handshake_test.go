@@ -3,6 +3,7 @@ package signal_test
 import (
 	"encoding/json"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -38,8 +39,9 @@ func TestHandshakeWelcome(t *testing.T) {
 			t.Errorf("welcome protocol %d, serverVersion %q, minClientVersion %q", w.Protocol, w.ServerVersion,
 				w.MinClientVersion)
 		}
-		if len(w.Features) != 0 {
-			t.Errorf("features %v, want none (the server enables none yet)", w.Features)
+		// The intersection of the hello's features and the server's (01 §6.2): the server has agent.relay only.
+		if !slices.Equal(w.Features, []protocol.Feature{protocol.FeatureAgentRelay}) {
+			t.Errorf("features %v, want agent.relay alone", w.Features)
 		}
 		want := protocol.Limits{
 			MaxMessageBytes: 65536, MaxSDPBytes: 262144, MaxSharesPerUser: 4, MaxRoomParticipants: 8,

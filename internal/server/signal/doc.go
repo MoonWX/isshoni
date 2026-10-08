@@ -7,7 +7,7 @@
 // wiring (04 §6.6) adapts each one; package signaltest has fakes for tests. The hub never imports config, store,
 // auth or sfu.
 //
-// # What exists so far (README slices S11, S19, S28 and S40; 01 slices P3 to P5 and P7)
+// # What exists so far (README slices S11, S19, S28, S40 and S51; 01 slices P3 to P5, P7 and P12)
 //
 //   - upgrade.go: the six upgrade checks of 01 §3.1 (shutdown, the exact Origin allowlist, cookie authentication,
 //     pre-auth limits per IP key and server-wide, 16 connections per user, Accept) and the hello handshake of
@@ -31,6 +31,9 @@
 //     share; and subscribe.update (01 §8.9), the desired subscriptions from which room.state computes the watchers;
 //   - stats.go: stats (01 §8.11): the client metrics from the counters of the clients' reports, and the MediaPeer's
 //     stats, read every 2 s for stats.watch and kept for the live snapshot;
+//   - relay.go: the same-user relay (01 §8.14, feature agent.relay): agent.send goes out as agent.recv to the
+//     user's other connections that are online and have the feature, by connection id or by role, and never to
+//     another user's;
 //   - room.go: rooms and participants (01 §4.1, §8.4–8.6): a participant merges a user's connections in a room;
 //     room.state snapshots are coalesced (at most one broadcast per StateCoalesce per room) and encoded once per
 //     broadcast; room.events; watchers from the desired subscriptions; the room_full policy; the MediaPeer of each
@@ -38,9 +41,6 @@
 //   - ratelimit.go: token buckets, the global message and byte limits with the flood rule, per-type limits;
 //   - metrics.go: the Prometheus series of 01 §18;
 //   - hub.go: Config, Deps, Policy, New, Ready, Shutdown, Notify, CloseConnections, UpdateUser, CloseRoom, Snapshot.
-//
-// One later slice fills in the rest of the declared interface: the same-user relay (S51), whose agent.relay feature
-// is off until then (agent.send gets feature_disabled).
 //
 // # Concurrency
 //

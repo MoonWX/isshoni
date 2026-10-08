@@ -216,7 +216,8 @@ func TestRoleMatrix(t *testing.T) {
 	}
 	// room.leave comes last: it takes the connection out of the room.
 	msgs = append(msgs, msg{typ: protocol.MessageTypeRoomLeave, data: protocol.Empty{}, call: "Close"})
-	// Every client→server type of the registry is covered (agent.send is behind a feature that is off).
+	// Every client→server type of the registry is covered (agent.send, which takes the agent.relay feature and a
+	// second connection of the user, has its row of the table in TestRelayRoles).
 	covered := map[protocol.MessageType]bool{protocol.MessageTypeHello: true, protocol.MessageTypeAgentSend: true}
 	for _, m := range msgs {
 		covered[m.typ] = true
