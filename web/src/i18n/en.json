@@ -84,11 +84,6 @@
     "empty": "Nobody is sharing yet.",
     "live": "You're live · {{watching}}",
     "pick": "Pick a share to watch.",
-    "kind": {
-      "screen": "Screen",
-      "window": "Window",
-      "tab": "Tab"
-    },
     "title": {
       "screen": "{{name}}'s screen",
       "window": "{{name}}'s window",
@@ -124,6 +119,31 @@
     "toast": {
       "started": "{{name}} started sharing",
       "watch": "Watch"
+    },
+    "tap": {
+      "unmute": "Tap to unmute",
+      "video": "Tap to start video"
+    },
+    "watchers": {
+      "button": "{{watching}}. Show who is watching",
+      "title": "Watching now",
+      "heading": "Watching",
+      "none": "Nobody is watching yet.",
+      "you": "you"
+    },
+    "listen": {
+      "to": "Listen to {{name}}",
+      "own": "Listen to your share"
+    },
+    "sound": {
+      "listenHere": "Listen here",
+      "here": "Listen here. This share's sound is off.",
+      "elsewhere": "Listen here. You're listening to {{name}} now.",
+      "elsewhereOwn": "Listen here. You're listening to your own share now.",
+      "mute": "Mute",
+      "unmute": "Unmute",
+      "volume": "Volume",
+      "volumeValue": "{{percent}}%"
     }
   },
   "share": {

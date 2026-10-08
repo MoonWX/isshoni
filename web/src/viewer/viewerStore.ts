@@ -4,8 +4,9 @@
 //
 // It holds the shares that have a tile, in tile order, with the focus state of autoFocus.ts (which also remembers
 // the shares that ended, so that a re-published share gets back the stage and the sound); the audio unlock state
-// and volume (05 §10.3, filled in by S47's audioOut); fullscreen, PiP and visibility (05 §12.4–§12.5, S56); what the
-// server forwards per share (subscribe.status, 05 §10.4); and the state of the sub PC (05 §9).
+// and volume (05 §10.3, written by audioOut.ts) and whether a tile's video was refused (videoPlayback.ts);
+// fullscreen, PiP and visibility (05 §12.4–§12.5, S56); what the server forwards per share (subscribe.status,
+// 05 §10.4); and the state of the sub PC (05 §9).
 import { createStore, type StoreApi } from 'zustand/vanilla';
 
 import {
@@ -23,12 +24,23 @@ import {
   type FocusState,
 } from './autoFocus';
 
+/** Someone who watches a share (ShareInfo.watchers, 01 §8.5), with the name the watchers popover shows. */
+export interface ViewerWatcher {
+  readonly userId: string;
+  /** From room.state's participants; '' when the snapshot has none. */
+  readonly name: string;
+  /** This user: listed as "you". */
+  readonly self: boolean;
+}
+
 /** A share that has a tile: live or stalled (shares in `starting` get none, 01 §4.4). */
 export interface ViewerShare extends FocusShare {
   /** The share as the last room.state had it. */
   readonly info: ShareInfo;
   /** The sharer's name from room.state's participants; '' when the snapshot has none. */
   readonly ownerName: string;
+  /** info.watchers with their names, in the server's order. Nobody watches unseen (05 §12.6). */
+  readonly watchers: readonly ViewerWatcher[];
   /**
    * Published by this page: its tile shows the local preview and it is never subscribed (05 §12.2). A share of
    * the same user from another device is `own` but not `local`: it is watched like anyone's.
@@ -68,6 +80,11 @@ export type SubMediaState = 'idle' | 'connecting' | 'connected' | 'reconnecting'
 
 export interface ViewerData extends FocusState<ViewerShare> {
   readonly audio: AudioUnlockState;
+  /**
+   * The browser refused to play a tile's (muted) video: iOS Low Power Mode. TapToStart then says "Tap to start
+   * video" (05 §10.3).
+   */
+  readonly videoBlocked: boolean;
   /** 0–1; persisted in prefsStore.volume (05 §10.3). */
   readonly volume: number;
   readonly fullscreen: boolean;
@@ -95,7 +112,13 @@ export interface ViewerActions {
   focusShare(shareId: string): void;
   /** The speaker button (05 §12.3): hear this share without moving the focus; null for silence. */
   setAudible(shareId: string | null): void;
+  /**
+   * A press on a tile's speaker button: hear that share; pressed while it is the one heard, the sound goes back to
+   * the share on the stage (silence when that is a share of this user, which focus never makes audible).
+   */
+  toggleAudible(shareId: string): void;
   setAudio(audio: AudioUnlockState): void;
+  setVideoBlocked(blocked: boolean): void;
   setVolume(volume: number): void;
   setFullscreen(fullscreen: boolean): void;
   setPip(shareId: string | null): void;
@@ -108,8 +131,8 @@ export interface ViewerActions {
    * Back to the state of a page that is in no room: no shares, auto-focus, nothing per share, no fullscreen or PiP,
    * no memory of ended shares. Call it when the user leaves the room, not for a reconnect: after a welcome that was
    * not resumed the room's snapshots keep going to syncRoom, so that re-published shares take over (01 §10.6).
-   * What belongs to the page stays: the volume, the audio unlock, the sub PC's state (SubscriberPC.close() resets
-   * that one) and the page's visibility.
+   * What belongs to the page stays: the volume, the audio unlock and the refused videos, the sub PC's state
+   * (SubscriberPC.close() resets that one) and the page's visibility.
    */
   reset(): void;
 }
@@ -130,6 +153,7 @@ function initialData(volume: number): ViewerData {
   return {
     ...initialFocusState<ViewerShare>(),
     audio: 'locked',
+    videoBlocked: false,
     volume,
     fullscreen: false,
     pipShareId: null,
@@ -161,11 +185,27 @@ function sameWatchers(a: ShareInfo, b: ShareInfo): boolean {
   );
 }
 
+function watchersOf(info: ShareInfo, names: ReadonlyMap<string, string>, self: ViewerSelf): ViewerWatcher[] {
+  return info.watchers.map((w) => ({
+    userId: w.userId,
+    name: names.get(w.userId) ?? '',
+    self: w.userId === self.userId,
+  }));
+}
+
 /** Whether a tile would render the same from both: the entry of an unchanged share is kept, so tiles don't re-render. */
-function sameShare(a: ViewerShare, info: ShareInfo, ownerName: string, self: ViewerSelf): boolean {
+function sameShare(
+  a: ViewerShare,
+  info: ShareInfo,
+  ownerName: string,
+  watchers: readonly ViewerWatcher[],
+  self: ViewerSelf,
+): boolean {
   const b = a.info;
   return (
     a.ownerName === ownerName &&
+    a.watchers.length === watchers.length &&
+    a.watchers.every((w, i) => w.name === watchers[i]?.name && w.self === watchers[i].self) &&
     a.own === (info.userId === self.userId) &&
     a.local === (info.connectionId === self.connectionId) &&
     b.userId === info.userId &&
@@ -203,8 +243,9 @@ function roomEvents(
   const live: FocusEvent<ViewerShare>[] = [];
   for (const info of tiled) {
     const ownerName = names.get(info.userId) ?? '';
+    const watchers = watchersOf(info, names, self);
     const before = knownById.get(info.id);
-    if (before && sameShare(before, info, ownerName, self)) continue;
+    if (before && sameShare(before, info, ownerName, watchers, self)) continue;
     const share: ViewerShare = {
       id: info.id,
       userId: info.userId,
@@ -213,6 +254,7 @@ function roomEvents(
       local: info.connectionId === self.connectionId,
       info,
       ownerName,
+      watchers,
     };
     // A re-publish (01 §10.6) that gets its tile now. The reducer knows what the replaced share had, whether it
     // still has its tile or ended in an earlier snapshot (after a server restart the first room.state has no
@@ -275,8 +317,20 @@ export function createViewerStore(opts: ViewerStoreOptions = {}): ViewerStore {
         if (s.audibleShareId === shareId && ended === s.ended) return;
         set({ audibleShareId: shareId, ended });
       },
+      toggleAudible(shareId) {
+        const s = get();
+        if (s.audibleShareId !== shareId) {
+          s.setAudible(shareId);
+          return;
+        }
+        const focused = s.shares.find((share) => share.id === s.focusedShareId);
+        s.setAudible(focused && !focused.own && focused.id !== shareId ? focused.id : null);
+      },
       setAudio(audio) {
-        set({ audio });
+        if (get().audio !== audio) set({ audio });
+      },
+      setVideoBlocked(videoBlocked) {
+        if (get().videoBlocked !== videoBlocked) set({ videoBlocked });
       },
       setVolume(volume) {
         set({ volume: clamp01(volume) });

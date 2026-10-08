@@ -93,22 +93,12 @@
   opacity: 0.85;
 }
 
-.watching {
-  display: inline-flex;
-  gap: var(--space-1);
-  align-items: center;
-  font-size: var(--text-sm);
-  font-variant-numeric: tabular-nums;
-}
-
-.eye {
-  width: 1em;
-  height: 1em;
-}
-
+/* The sound controls, then the caller's. They wrap under the title on a narrow stage. */
 .controls {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--space-1);
   align-items: center;
+  justify-content: flex-end;
   margin-inline-start: auto;
 }

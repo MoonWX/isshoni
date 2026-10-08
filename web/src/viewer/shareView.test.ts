@@ -25,6 +25,7 @@ function viewerShare(overrides: Partial<ViewerShare> = {}, info = shareInfo('s_a
     own: false,
     local: false,
     ownerName: 'Bea',
+    watchers: [],
     info,
     ...overrides,
   };

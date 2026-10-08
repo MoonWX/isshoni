@@ -1,14 +1,20 @@
 // The viewer's objects and how the rest of the app connects them (no React here, 05 §3):
-// - createViewer() makes the store and the media registry, once per page;
+// - createViewer() makes the store, the media registry and the page's one <audio> element, once per page; the
+//   element plays the audible share by itself (audio follows focus, 05 §12.3);
 // - syncRoom() gives them each room.state (RoomSession calls it, so focus and audio stay right while the room page
 //   is not mounted, 05 §11.1);
-// - attachViewer() gives the store the server's subscribe.status messages.
-// The sub PC is the session's to make and to feed (05 §10.1, §11.1): `new SubscriberPC({platform, signal, log,
-// registry: viewer.registry, store: viewer.store, ui})`, with pc.offer and pc.ice {pc: 'sub'} routed to its
-// handleOffer and handleIce, and close() when the server's side is gone.
+// - attachViewer() gives the store the server's subscribe.status messages;
+// - attachSubscriptions() (subscriptions.ts) gives the session's SubscriptionSync the desired set;
+// - viewer.createSubscriber() makes the session's sub PC (05 §10.1, §11.1): it is SessionMedia.createSubscriber.
+//   The session routes pc.offer and pc.ice {pc: 'sub'} to the PC's handleOffer and handleIce, and calls close()
+//   when the server's side is gone. The viewer remembers the PC for the stats (stats.ts).
+import type { Logger } from '../lib/log';
 import type { SignalClient } from '../protocol/signal-client';
 import { MessageTypeSubscribeStatus } from '../protocol/types.gen';
+import { createAudioOut, type AudioOut } from './audioOut';
 import { createMediaRegistry, type MediaRegistry } from './mediaRegistry';
+import { SubscriberPC, type SubscriberDeps } from './SubscriberPC';
+import { createVideoPlayback, type VideoPlayback } from './videoPlayback';
 import {
   createViewerStore,
   type RoomSnapshot,
@@ -20,17 +26,103 @@ import {
 export interface ViewerServices {
   readonly store: ViewerStore;
   readonly registry: MediaRegistry;
+  /** The page's one <audio> element (05 §10.2). It follows viewerStore.audibleShareId and .volume by itself. */
+  readonly audio: AudioOut;
+  /** The tiles' <video> elements: which of them the browser refused to play (05 §10.3). */
+  readonly videos: VideoPlayback;
+  /** The sub PC that createSubscriber() made last; null before the first. */
+  readonly subscriber: SubscriberPC | null;
+  /**
+   * Makes the session's sub PC, with the viewer's registry and store: SessionMedia.createSubscriber (05 §10.1),
+   * `(deps) => viewer.createSubscriber({ ...deps, ui })`. `ui` shows the Fatal screen "Can't connect media".
+   */
+  createSubscriber(deps: Omit<SubscriberDeps, 'registry' | 'store'>): SubscriberPC;
+  /**
+   * The tap of TapToStart (05 §10.3): audio.play() and play() on every refused video, synchronously, so call it
+   * inside the user gesture. It picks nothing: the unmute tap is not a manual focus (05 §12.2).
+   */
+  unlock(): void;
+  /** Stops the audio from following the store and removes its element. Tests only: the page keeps its viewer. */
+  dispose(): void;
 }
 
-export function createViewer(opts: ViewerStoreOptions = {}): ViewerServices {
-  return { store: createViewerStore(opts), registry: createMediaRegistry() };
+export interface ViewerOptions extends ViewerStoreOptions {
+  /** The user changed the volume: prefsStore.setVolume (05 §10.3). */
+  onVolume?: (volume: number) => void;
+  /** Where the <audio> element is appended; default document.body. */
+  audioParent?: HTMLElement;
+  log?: Logger;
+}
+
+export function createViewer(opts: ViewerOptions = {}): ViewerServices {
+  const store = createViewerStore(opts);
+  const registry = createMediaRegistry();
+  const audio = createAudioOut({
+    store,
+    ...(opts.audioParent ? { parent: opts.audioParent } : {}),
+    ...(opts.log ? { log: opts.log } : {}),
+  });
+  const videos = createVideoPlayback({ store });
+
+  // Audio follows focus (05 §12.3): the element plays the audio track of the audible share, whichever comes
+  // first, the choice or the track.
+  let offTrack: (() => void) | null = null;
+  const playAudible = (): void => {
+    const shareId = store.getState().audibleShareId;
+    audio.setTrack(shareId === null ? null : (registry.get(shareId).audio ?? null));
+  };
+  const followAudible = (): void => {
+    offTrack?.();
+    const shareId = store.getState().audibleShareId;
+    offTrack = shareId === null ? null : registry.subscribe(shareId, playAudible);
+    playAudible();
+  };
+  const offStore = store.subscribe((s, prev) => {
+    if (s.audibleShareId !== prev.audibleShareId) followAudible();
+    if (s.volume !== prev.volume) {
+      audio.setVolume(s.volume);
+      opts.onVolume?.(s.volume);
+    }
+  });
+  followAudible();
+
+  let subscriber: SubscriberPC | null = null;
+
+  return {
+    store,
+    registry,
+    audio,
+    videos,
+    get subscriber() {
+      return subscriber;
+    },
+    createSubscriber(deps) {
+      subscriber = new SubscriberPC({ ...deps, registry, store });
+      return subscriber;
+    },
+    unlock() {
+      // Both synchronously: the gesture covers every play() made before the handler returns.
+      void audio.unlock().catch(() => undefined); // still refused: the state stays `blocked`
+      videos.retry();
+    },
+    dispose() {
+      offStore();
+      offTrack?.();
+      offTrack = null;
+      audio.dispose();
+    },
+  };
 }
 
 /**
  * Takes a room.state snapshot (01 §8.5), or null when the page is in no room: the store updates its tiles and the
  * focus (05 §12.2), and the registry drops the tracks of shares that are gone (05 §10.1).
  */
-export function syncRoom(viewer: ViewerServices, room: RoomSnapshot | null, self: ViewerSelf): void {
+export function syncRoom(
+  viewer: Pick<ViewerServices, 'store' | 'registry'>,
+  room: RoomSnapshot | null,
+  self: ViewerSelf,
+): void {
   viewer.store.getState().syncRoom(room, self);
   viewer.registry.retain(room?.shares.map((s) => s.id) ?? []);
 }

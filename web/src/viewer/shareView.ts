@@ -17,21 +17,17 @@ import {
 import type { ViewerShare } from './viewerStore';
 
 /**
- * "Screen", "Window" or "Tab". A kind this build doesn't know reads as a screen (01 §8.13).
- *
- * The catalog's key family for this is share.label.<kind> (05 §12.6, §16.5), in the `share` namespace, which the
- * sharer's slice (S35) owns and adds; a slice writes only its own namespaces in en.json. Until both are merged the
- * viewer reads the same three words from viewer.kind.<kind>. Then these keys become share.label.* and viewer.kind
- * goes (S47 works in this folder next).
+ * "Screen", "Window" or "Tab": the catalog's share.label.<kind> (05 §12.6, §16.5), the key family the sharer's
+ * pages and the desktop tray use too. A kind this build doesn't know reads as a screen (01 §8.13).
  */
 export function kindLabel(t: TFunction, kind: ShareKind): string {
   switch (kind as string) {
     case ShareKindWindow:
-      return t('viewer.kind.window');
+      return t('share.label.window');
     case ShareKindTab:
-      return t('viewer.kind.tab');
+      return t('share.label.tab');
     default:
-      return t('viewer.kind.screen');
+      return t('share.label.screen');
   }
 }
 

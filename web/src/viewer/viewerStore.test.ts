@@ -17,6 +17,7 @@ describe('viewerStore: defaults', () => {
       audibleShareId: null,
       ended: [],
       audio: 'locked',
+      videoBlocked: false,
       volume: 1,
       fullscreen: false,
       pipShareId: null,
@@ -290,6 +291,39 @@ describe('viewerStore.syncRoom', () => {
     expect(store.getState().focusedShareId).toBe('s_b');
   });
 
+  it('names who watches each share, for the watchers popover (05 §12.6)', () => {
+    const store = createViewerStore();
+    const watchedBy = (...userIds: string[]) =>
+      room(
+        shareInfo('s_a', 'u_bea', 1, {
+          watchers: userIds.map((userId) => ({ userId, video: 'low' as const, audio: 'off' as const })),
+        }),
+      );
+    store.getState().syncRoom(watchedBy('u_cy', 'u_alex', 'u_gone'), SELF);
+    const first = store.getState().shares[0];
+    expect(first?.watchers).toEqual([
+      { userId: 'u_cy', name: 'Cy', self: false },
+      { userId: 'u_alex', name: 'Alex', self: true },
+      { userId: 'u_gone', name: '', self: false }, // someone the snapshot doesn't list
+    ]);
+
+    // The same watchers again: the entry is kept, so the tile doesn't render again.
+    store.getState().syncRoom(watchedBy('u_cy', 'u_alex', 'u_gone'), SELF);
+    expect(store.getState().shares[0]).toBe(first);
+
+    // A watcher's name changed (or arrived with a later snapshot): a new entry.
+    const renamed = watchedBy('u_cy', 'u_alex', 'u_gone');
+    store.getState().syncRoom(
+      {
+        ...renamed,
+        participants: [...renamed.participants.filter((p) => p.userId !== 'u_cy'), { userId: 'u_cy', name: 'Cyrus' }],
+      },
+      SELF,
+    );
+    expect(store.getState().shares[0]).not.toBe(first);
+    expect(store.getState().shares[0]?.watchers.map((w) => w.name)).toEqual(['Cyrus', 'Alex', '']);
+  });
+
   it('re-reads whose share it is when this page’s identity changes', () => {
     const store = createViewerStore();
     const mine = shareInfo('s_mine', 'u_alex', 1, { connectionId: 'c_me' });
@@ -354,6 +388,33 @@ describe('viewerStore: actions', () => {
     expect(store.getState().audibleShareId).toBeNull();
   });
 
+  it('toggleAudible is the speaker button: hear that share; pressed again, the sound goes back to the stage', () => {
+    const store = createViewerStore();
+    const laptop = shareInfo('s_laptop', 'u_alex', 3, { connectionId: 'c_laptop' });
+    store.getState().syncRoom(room(shareInfo('s_a', 'u_bea', 1), shareInfo('s_b', 'u_cy', 2), laptop), SELF);
+    expect(store.getState()).toMatchObject({ focusedShareId: 's_b', audibleShareId: 's_b' });
+
+    store.getState().toggleAudible('s_a');
+    expect(store.getState()).toMatchObject({ focusedShareId: 's_b', audibleShareId: 's_a', focusMode: 'auto' });
+    // Another tile's button: exactly one share is heard.
+    store.getState().toggleAudible('s_laptop');
+    expect(store.getState().audibleShareId).toBe('s_laptop');
+    store.getState().toggleAudible('s_laptop');
+    expect(store.getState()).toMatchObject({ focusedShareId: 's_b', audibleShareId: 's_b', focusMode: 'auto' });
+
+    // On the stage's own share it turns the sound off and on.
+    store.getState().toggleAudible('s_b');
+    expect(store.getState().audibleShareId).toBeNull();
+    store.getState().toggleAudible('s_b');
+    expect(store.getState().audibleShareId).toBe('s_b');
+
+    // With a share of this user on the stage there is nothing to go back to: focus never makes it audible.
+    store.getState().focusShare('s_laptop');
+    expect(store.getState()).toMatchObject({ focusedShareId: 's_laptop', audibleShareId: 's_b' });
+    store.getState().toggleAudible('s_b');
+    expect(store.getState().audibleShareId).toBeNull();
+  });
+
   it('applyStatus merges entries by share (only changed subscriptions are sent)', () => {
     const store = createViewerStore();
     store.getState().syncRoom(room(shareInfo('s_a', 'u_bea', 1), shareInfo('s_b', 'u_cy', 2)), SELF);
@@ -367,6 +428,7 @@ describe('viewerStore: actions', () => {
     const store = createViewerStore();
     const s = store.getState();
     s.setAudio('blocked');
+    s.setVideoBlocked(true);
     s.setVolume(-3);
     s.setFullscreen(true);
     s.setPip('s_a');
@@ -376,6 +438,7 @@ describe('viewerStore: actions', () => {
     s.setVisible('s_a', true);
     expect(store.getState()).toMatchObject({
       audio: 'blocked',
+      videoBlocked: true,
       volume: 0,
       fullscreen: true,
       pipShareId: 's_a',
@@ -406,6 +469,7 @@ describe('viewerStore: actions', () => {
     store.getState().setVisible('s_a', true);
     store.getState().setFullscreen(true);
     store.getState().setAudio('playing');
+    store.getState().setVideoBlocked(true);
     store.getState().setMedia('connected');
     store.getState().setPageHidden(99);
 
@@ -424,6 +488,7 @@ describe('viewerStore: actions', () => {
       // The page's own:
       volume: 0.5,
       audio: 'playing',
+      videoBlocked: true,
       media: 'connected',
       pageHiddenSince: 99,
     });

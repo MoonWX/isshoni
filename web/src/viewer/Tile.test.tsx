@@ -1,5 +1,6 @@
 // Tile (05 §10.2, §12.6, §16.6): one muted video with only that share's video track, a button named after the
-// share and its watchers, the viewer count, and the share's state.
+// share and its watchers, the viewer count (the eye, which opens the watchers popover), the speaker button, and
+// the share's state.
 import { act, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ReactNode } from 'react';
@@ -31,6 +32,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  viewer.dispose();
   media.restore();
   vi.unstubAllGlobals();
 });
@@ -57,8 +59,11 @@ const video = (): HTMLVideoElement => {
   return el;
 };
 
+/** The tile's main area: the button that picks its share. */
+const mainButton = (): HTMLElement => screen.getByRole('button', { name: /^(Watch|Show your preview)/ });
+
 describe('Tile', () => {
-  it('is one button named after the share and its watchers, with the sharer, the kind and the viewer count', () => {
+  it('is a button named after the share and its watchers, with the sharer, the kind and the viewer count', () => {
     const share = synced(
       's_a',
       shareInfo('s_a', 'u_bea', 1, { watchers: [watcher('u_alex'), watcher('u_cy'), watcher('u_dee')] }),
@@ -66,12 +71,24 @@ describe('Tile', () => {
     renderTile(<Tile share={share} onPick={vi.fn()} />);
     const item = screen.getByRole('listitem');
     const button = within(item).getByRole('button', { name: "Watch Bea's window, 3 watching" });
-    expect(within(item).getAllByRole('button')).toEqual([button]);
     expect(within(button).getByText('Bea')).toBeInTheDocument();
     expect(within(button).getByText('Window')).toBeInTheDocument();
-    // The count is shown next to the button, not inside it (the button's name already says it).
-    const count = within(item).getByText('3');
-    expect(button).not.toContainElement(count);
+    // Next to the main button, never inside it: the eye with the count, then the speaker button.
+    const eye = within(item).getByRole('button', { name: '3 watching. Show who is watching' });
+    const speaker = within(item).getByRole('button', { name: 'Listen to Bea' });
+    expect(within(item).getAllByRole('button')).toEqual([button, eye, speaker]);
+    expect(eye).toHaveTextContent('3');
+    expect(button).not.toContainElement(eye);
+    expect(button).not.toContainElement(speaker);
+  });
+
+  it('counts as shown while it is mounted (the layer policy’s `visible`, 05 §12.4)', () => {
+    const share = synced('s_a', shareInfo('s_a', 'u_bea', 1));
+    expect(viewer.store.getState().visible).toEqual({});
+    const { unmount } = renderTile(<Tile share={share} onPick={vi.fn()} />);
+    expect(viewer.store.getState().visible).toEqual({ s_a: true });
+    unmount();
+    expect(viewer.store.getState().visible).toEqual({ s_a: false });
   });
 
   it('names a labeled share by its label and a single watcher in the singular form', () => {
@@ -108,14 +125,14 @@ describe('Tile', () => {
     renderTile(<Tile share={share} onPick={vi.fn()} />);
     expect(video().srcObject).toBeNull();
     expect(screen.getByText('Connecting…')).toBeInTheDocument();
-    expect(screen.getByRole('button')).toHaveAccessibleDescription('Connecting…');
+    expect(mainButton()).toHaveAccessibleDescription('Connecting…');
 
     const first = track('video');
     act(() => {
       viewer.registry.set('s_a', 'video', first);
     });
     expect(screen.queryByText('Connecting…')).not.toBeInTheDocument();
-    expect(screen.getByRole('button')).not.toHaveAttribute('aria-describedby');
+    expect(mainButton()).not.toHaveAttribute('aria-describedby');
     const stream = video().srcObject as unknown as FakeMediaStream;
     expect(stream.getTracks()).toEqual([first]);
 
@@ -149,9 +166,9 @@ describe('Tile', () => {
     const share = synced('s_a', shareInfo('s_a', 'u_bea', 1));
     const onPick = vi.fn();
     renderTile(<Tile share={share} onPick={onPick} />);
-    await userEvent.click(screen.getByRole('button'));
+    await userEvent.click(mainButton());
     expect(onPick).toHaveBeenLastCalledWith('s_a');
-    screen.getByRole('button').focus();
+    mainButton().focus();
     await userEvent.keyboard('{Enter}');
     await userEvent.keyboard(' ');
     expect(onPick).toHaveBeenCalledTimes(3);
@@ -173,7 +190,7 @@ describe('Tile', () => {
     report('bandwidth');
     expect(screen.queryByText('Connecting…')).not.toBeInTheDocument();
     expect(screen.getByText('Lower quality (your connection)')).toBeInTheDocument();
-    expect(screen.getByRole('button')).toHaveAccessibleDescription('Lower quality (your connection)');
+    expect(mainButton()).toHaveAccessibleDescription('Lower quality (your connection)');
     report('unavailable');
     expect(screen.getByText("The sharer isn't sending this quality right now")).toBeInTheDocument();
     report('codec');
@@ -210,10 +227,12 @@ describe('Tile', () => {
 
   it('puts extra controls next to the button, never inside it', () => {
     const share = synced('s_a', shareInfo('s_a', 'u_bea', 1));
-    renderTile(<Tile share={share} onPick={vi.fn()} actions={<button type="button">Listen to Bea</button>} />);
+    renderTile(<Tile share={share} onPick={vi.fn()} actions={<button type="button">More</button>} />);
     const main = screen.getByRole('button', { name: /^Watch/ });
-    const extra = screen.getByRole('button', { name: 'Listen to Bea' });
+    const extra = screen.getByRole('button', { name: 'More' });
     expect(main).not.toContainElement(extra);
     expect(screen.getByRole('listitem')).toContainElement(extra);
+    // After the tile's own controls.
+    expect(within(screen.getByRole('listitem')).getAllByRole('button').at(-1)).toBe(extra);
   });
 });

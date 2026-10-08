@@ -52,9 +52,10 @@
   line-clamp: 3;
 }
 
+/* Just above the caption's line of text: the top corner has the eye and the speaker button. */
 .badge {
   position: absolute;
-  top: var(--space-1);
+  bottom: calc(var(--text-sm) * var(--leading) + 2 * var(--space-1));
   inset-inline-start: var(--space-1);
   max-width: calc(100% - 2 * var(--space-1));
   padding: 0 var(--space-2);
@@ -73,8 +74,7 @@
   display: flex;
   gap: var(--space-2);
   align-items: baseline;
-  /* Room for the aside at the inline end. */
-  padding: var(--space-4) 4.5rem var(--space-1) var(--space-2);
+  padding: var(--space-4) var(--space-2) var(--space-1);
   font-size: var(--text-sm);
   background: linear-gradient(transparent, var(--color-stage-overlay));
 }
@@ -96,12 +96,17 @@
   opacity: 0.85;
 }
 
+/*
+ * The eye and the speaker button in the top corner: the caption keeps the tile's width, which on a phone is
+ * little. Each is a touch target of its own (05 §12.1) around a small dark chip, so they read on any picture and
+ * cover little of it. (No `filter` or `transform` here: it would trap the watchers popover's fixed panel inside
+ * the tile.)
+ */
 .aside {
   position: absolute;
-  inset-inline-end: var(--space-2);
-  bottom: var(--space-1);
+  top: 0;
+  inset-inline-end: 0;
   display: flex;
-  gap: var(--space-1);
   align-items: center;
   /* Clicks between its controls go to the tile's button. */
   pointer-events: none;
@@ -109,18 +114,4 @@
 
 .aside > * {
   pointer-events: auto;
-}
-
-.watchers {
-  display: inline-flex;
-  gap: var(--space-1);
-  align-items: center;
-  font-size: var(--text-sm);
-  font-variant-numeric: tabular-nums;
-  pointer-events: none;
-}
-
-.eye {
-  width: 1em;
-  height: 1em;
 }

@@ -32,6 +32,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  viewer.dispose();
   media.restore();
   vi.unstubAllGlobals();
 });
@@ -139,12 +140,34 @@ describe('ViewerLayout: stage and others', () => {
       <ViewerLayout
         viewer={viewer}
         stageControls={<button type="button">Fullscreen</button>}
-        tileActions={(share) => <button type="button">{`Listen to ${share.ownerName}`}</button>}
+        tileActions={(share) => <button type="button">{`Pin ${share.ownerName}`}</button>}
       />,
     );
     expect(within(screen.getByRole('toolbar')).getByRole('button', { name: 'Fullscreen' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Listen to Bea' })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Listen to Cy' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Pin Bea' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Pin Cy' })).not.toBeInTheDocument();
+  });
+
+  it('brings the sound controls and the watchers along: a speaker button and an eye per tile', () => {
+    syncRoom(viewer, room(BEA, CY, MINE), SELF);
+    render(<ViewerLayout viewer={viewer} />);
+    const list = screen.getByRole('list', { name: 'Shares' });
+    // The own preview has no sound to listen to; who watches it is shown all the same.
+    expect(within(list).getAllByRole('button', { name: /^Listen to/ })).toEqual([
+      screen.getByRole('button', { name: 'Listen to Bea' }),
+    ]);
+    expect(within(list).getAllByRole('button', { name: /Show who is watching$/ })).toHaveLength(2);
+    const stage = screen.getByRole('region', { name: "Now watching: Cy's tab" });
+    expect(within(stage).getByRole('button', { name: 'Mute' })).toBeInTheDocument();
+    expect(within(stage).getByRole('button', { name: '0 watching. Show who is watching' })).toBeInTheDocument();
+  });
+
+  it('marks what it shows, so that nothing else is subscribed with video (05 §12.4)', () => {
+    syncRoom(viewer, room(BEA, CY), SELF);
+    const { unmount } = render(<ViewerLayout viewer={viewer} />);
+    expect(viewer.store.getState().visible).toEqual({ s_cy: true, s_bea: true });
+    unmount();
+    expect(viewer.store.getState().visible).toEqual({ s_cy: false, s_bea: false });
   });
 });
 
