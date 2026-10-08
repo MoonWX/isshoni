@@ -41,6 +41,17 @@ func (c *Conn) PubTracks(ctx context.Context) ([]PubTrackState, error) {
 	return out, err
 }
 
+// PubStuck reports whether the Conn's current pub PC is stuck: an offer failed inside Pion after Pion had taken it,
+// so the PC takes no other one. It is false without a pub PC.
+func (c *Conn) PubStuck(ctx context.Context) (bool, error) {
+	var stuck bool
+	err := c.do(ctx, func(context.Context) error {
+		stuck = c.pub != nil && c.pub.stuck
+		return nil
+	})
+	return stuck, err
+}
+
 // SubscriptionState describes one subscription of a Conn.
 type SubscriptionState struct {
 	Share ShareID

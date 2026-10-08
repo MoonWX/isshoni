@@ -649,17 +649,7 @@ func newRawPublisher(t *testing.T, kinds ...webrtc.RTPCodecType) *rawPublisher {
 	})
 	p := &rawPublisher{pc: pc}
 	for i, kind := range kinds {
-		codec := webrtc.RTPCodecCapability{
-			MimeType: webrtc.MimeTypeH264, ClockRate: 90000,
-			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
-		}
-		if kind == webrtc.RTPCodecTypeAudio {
-			codec = webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2}
-		}
-		track, err := webrtc.NewTrackLocalStaticRTP(codec, fmt.Sprintf("t%d", i), "raw")
-		if err != nil {
-			t.Fatal(err)
-		}
+		track := rawTrack(t, kind, fmt.Sprintf("t%d", i))
 		init := webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly}
 		if _, err := pc.AddTransceiverFromTrack(track, init); err != nil {
 			t.Fatal(err)
@@ -667,6 +657,51 @@ func newRawPublisher(t *testing.T, kinds ...webrtc.RTPCodecType) *rawPublisher {
 		p.tracks = append(p.tracks, track)
 	}
 	return p
+}
+
+// rawTrack returns a local track of a kind for a raw publisher: H.264 constrained baseline, or stereo Opus.
+func rawTrack(t *testing.T, kind webrtc.RTPCodecType, id string) *webrtc.TrackLocalStaticRTP {
+	t.Helper()
+	codec := webrtc.RTPCodecCapability{
+		MimeType: webrtc.MimeTypeH264, ClockRate: 90000,
+		SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+	}
+	if kind == webrtc.RTPCodecTypeAudio {
+		codec = webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2}
+	}
+	track, err := webrtc.NewTrackLocalStaticRTP(codec, id, "raw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return track
+}
+
+// sendUntil writes one RTP packet on track every 20 ms until cond holds; it fails the test with what after 15 s.
+func sendUntil(t *testing.T, track *webrtc.TrackLocalStaticRTP, cond func() bool, what string) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for seq := uint16(1); !cond(); seq++ {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out: %s", what)
+		}
+		pkt := &rtp.Packet{
+			Header:  rtp.Header{Version: 2, SequenceNumber: seq, Timestamp: uint32(seq) * 3000},
+			Payload: []byte{0x41, 0x9a, 0x00, 0x01},
+		}
+		_ = track.WriteRTP(pkt) // errors before the PC is connected are expected
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// withoutLines returns an SDP without the lines that start with prefix.
+func withoutLines(raw, prefix string) string {
+	var b strings.Builder
+	for line := range strings.Lines(raw) {
+		if !strings.HasPrefix(line, prefix) {
+			b.WriteString(line)
+		}
+	}
+	return b.String()
 }
 
 // offer creates the next offer with every candidate in it and records the tracks' mids.
@@ -847,6 +882,204 @@ func TestPubOfferForStoppedShare(t *testing.T) {
 	}
 }
 
+// TestPubSectionReuse: a client that stops a share takes its track off the m-section, which goes inactive, and gives
+// the same m-section to its next share, as browsers do (02 §8.4 step 5). The inactive offer ends the first share's
+// track (Pion stops its receiver, 02 §5.1): it leaves the pub PC, so the offer that binds the m-section to the next
+// share finds nothing to attach. That share gets its layer from the track Pion delivers once its media flows.
+func TestPubSectionReuse(t *testing.T) {
+	h := newHarness(t, sfutest.HarnessOptions{})
+	ctx := testCtx(t)
+	conn, sig := join(t, h, "alice", "c-pub", sfu.RoleFull)
+	const first, second = sfu.ShareID("s_first"), sfu.ShareID("s_second")
+	startShare(t, conn, first, sfu.PresetAuto)
+
+	video := webrtc.RTPCodecTypeVideo
+	pub := newRawPublisher(t, video)
+	offer := pub.offer(t, ctx)
+	mid := pub.mids[0]
+	bind := func(share sfu.ShareID) []sfu.TrackBinding {
+		return []sfu.TrackBinding{{MID: mid, Share: share, Kind: video}}
+	}
+	// negotiate hands an offer to the SFU and its answer to the client, and returns the answer's direction for mid.
+	negotiate := func(neg uint32, offer string, tracks []sfu.TrackBinding) string {
+		t.Helper()
+		answer, err := conn.HandleOffer(ctx, sfu.PCPub, 1, neg, offer, tracks)
+		if err != nil {
+			t.Fatalf("pub offer neg %d: %v", neg, err)
+		}
+		pub.apply(t, answer)
+		return directionOf(section(t, parse(t, answer), mid))
+	}
+	pubTracks := func() []sfu.PubTrackState {
+		t.Helper()
+		tracks, err := conn.PubTracks(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tracks
+	}
+	layers := func(id sfu.ShareID) []string {
+		info, _ := h.SFU.Share(id)
+		return layerRIDs(info)
+	}
+
+	negotiate(1, offer, bind(first))
+	if err := sig.WaitPCState(ctx, sfu.PCPub, 1, "connected"); err != nil {
+		t.Fatal(err)
+	}
+	sendUntil(t, pub.tracks[0], func() bool { return len(layers(first)) == 1 }, "the first share has no layer")
+	if tracks := pubTracks(); len(tracks) != 1 || tracks[0].MID != mid || tracks[0].Share != first {
+		t.Fatalf("pub tracks = %+v, want one on mid %s feeding %s", tracks, mid, first)
+	}
+
+	// The share stops and the client removes its track: the m-section is inactive in the next offer.
+	if err := conn.StopShare(ctx, first, sfu.EndReasonStopped); err != nil {
+		t.Fatal(err)
+	}
+	if err := pub.pc.RemoveTrack(pub.pc.GetTransceivers()[0].Sender()); err != nil {
+		t.Fatal(err)
+	}
+	offer = pub.offer(t, ctx)
+	if dir := directionOf(section(t, parse(t, offer), mid)); dir != sdp.AttrKeyInactive {
+		t.Fatalf("the client's offer after RemoveTrack: m-section %s is %s, want inactive", mid, dir)
+	}
+	if dir := negotiate(2, offer, nil); dir != sdp.AttrKeyInactive {
+		t.Errorf("answer to the inactive m-section is %s, want inactive", dir)
+	}
+	var tracks []sfu.PubTrackState
+	eventually(t, func() bool {
+		tracks = pubTracks()
+		return len(tracks) == 0
+	}, func() string {
+		return fmt.Sprintf("pub tracks after the m-section went inactive = %+v, want none: its track has ended", tracks)
+	})
+
+	// The next share takes the m-section over, with a new track.
+	startShare(t, conn, second, sfu.PresetAuto)
+	next := rawTrack(t, video, "t-next")
+	if _, err := pub.pc.AddTrack(next); err != nil {
+		t.Fatal(err)
+	}
+	offer = pub.offer(t, ctx)
+	if dir := directionOf(section(t, parse(t, offer), mid)); len(pub.mids) != 1 || dir != sdp.AttrKeySendOnly {
+		t.Fatalf("the client's offer after AddTrack: mids %v, m-section %s is %s; want the m-section reused, sendonly",
+			pub.mids, mid, dir)
+	}
+	if dir := negotiate(3, offer, bind(second)); dir != sdp.AttrKeyRecvOnly {
+		t.Errorf("answer to the reused m-section is %s, want recvonly", dir)
+	}
+	// Before the new track's first packet nothing feeds the share: the ended track is not bound to it.
+	if got := layers(second); len(got) != 0 {
+		t.Errorf("the next share before its media has layers %v, want none: the first share's track has ended", got)
+	}
+	if tracks := pubTracks(); len(tracks) != 0 {
+		t.Errorf("pub tracks before the next share's media = %+v, want none", tracks)
+	}
+	sendUntil(t, next, func() bool {
+		tracks = pubTracks()
+		return slices.Equal(layers(second), []string{"f"}) && len(tracks) == 1 && tracks[0].Packets > 0
+	}, "the next share has no f layer from its own track")
+	if tracks[0].MID != mid || tracks[0].Share != second {
+		t.Errorf("pub tracks = %+v, want one on mid %s feeding %s", tracks, mid, second)
+	}
+}
+
+// TestPubOfferRefusedByPion: an offer that passes the SFU's checks but that Pion refuses after taking it as its
+// remote offer leaves the pub PC unable to negotiate: Pion has no rollback. The PC and its media stay, every further
+// offer of its gen is sfu.bad_sdp (01's sdp_invalid, on which the client rebuilds), and the gen + 1 offer replaces it.
+// An offer the SFU's own checks refuse changes nothing.
+func TestPubOfferRefusedByPion(t *testing.T) {
+	h := newHarness(t, sfutest.HarnessOptions{})
+	ctx := testCtx(t)
+	conn, sig := join(t, h, "alice", "c-pub", sfu.RoleFull)
+	const share = sfu.ShareID("s_1")
+	startShare(t, conn, share, sfu.PresetAuto)
+
+	video := webrtc.RTPCodecTypeVideo
+	pub := newRawPublisher(t, video)
+	offer := pub.offer(t, ctx)
+	bindings := []sfu.TrackBinding{{MID: pub.mids[0], Share: share, Kind: video}}
+	first, err := conn.HandleOffer(ctx, sfu.PCPub, 1, 1, offer, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub.apply(t, first)
+	pub.send(t)
+	if err := sig.WaitPCState(ctx, sfu.PCPub, 1, "connected"); err != nil {
+		t.Fatal(err)
+	}
+	waitShare(t, h.SFU, share, func(i sfu.ShareInfo) bool { return len(i.Layers) == 1 })
+
+	wantStuck := func(want bool, when string) {
+		t.Helper()
+		if stuck, err := conn.PubStuck(ctx); err != nil || stuck != want {
+			t.Fatalf("%s: the pub PC is stuck: %v, %v; want %v", when, stuck, err, want)
+		}
+	}
+
+	// Refused by the SFU's own checks, before Pion sees it: the same neg is fine afterwards.
+	_, err = conn.HandleOffer(ctx, sfu.PCPub, 1, 2, "v=nonsense", bindings)
+	wantCode(t, err, sfu.CodeBadSDP)
+	wantStuck(false, "after an offer the SFU's checks refused")
+	second, err := conn.HandleOffer(ctx, sfu.PCPub, 1, 2, pub.offer(t, ctx), bindings)
+	if err != nil {
+		t.Fatalf("the re-offer after one the SFU's checks refused: %v", err)
+	}
+	pub.apply(t, second)
+
+	// Refused by Pion: the offer lost its ICE user name, which Pion looks for only after it has taken the offer.
+	offer = pub.offer(t, ctx)
+	_, err = conn.HandleOffer(ctx, sfu.PCPub, 1, 3, withoutLines(offer, "a=ice-ufrag:"), bindings)
+	wantCode(t, err, sfu.CodeBadSDP)
+	wantStuck(true, "after an offer Pion refused")
+	// Pion still holds that offer, so the right one can't be applied either, nor can any later one of this gen.
+	for _, neg := range []uint32{3, 4} {
+		_, err = conn.HandleOffer(ctx, sfu.PCPub, 1, neg, offer, bindings)
+		wantCode(t, err, sfu.CodeBadSDP)
+	}
+	// The answered negs are as before: the last one gets its stored answer, an older one is stale.
+	if again, err := conn.HandleOffer(ctx, sfu.PCPub, 1, 2, "replayed", nil); err != nil || again != second {
+		t.Errorf("repeated neg 2 on the stuck PC: err %v, the same answer: %v", err, again == second)
+	}
+	_, err = conn.HandleOffer(ctx, sfu.PCPub, 1, 1, offer, bindings)
+	wantCode(t, err, sfu.CodeStaleOffer)
+	// The PC and its media stay: the track still feeds the share and is still read.
+	before, err := conn.PubTracks(ctx)
+	if err != nil || len(before) != 1 || before[0].Share != share {
+		t.Fatalf("pub tracks on the stuck PC = %+v, %v; want the share's track", before, err)
+	}
+	eventually(t, func() bool {
+		now, err := conn.PubTracks(ctx)
+		return err == nil && len(now) == 1 && now[0].Share == share && now[0].Packets > before[0].Packets+5
+	}, func() string { return "the stuck PC's track is no longer read" })
+	if info, ok := h.SFU.Share(share); !ok || len(info.Layers) != 1 {
+		t.Errorf("the share on the stuck PC = %+v, %v; want its layer kept", info, ok)
+	}
+
+	// The client rebuilds: gen 2 replaces the stuck PC and negotiates as usual, re-offers included.
+	pub2 := newRawPublisher(t, video)
+	offer = pub2.offer(t, ctx)
+	bindings = []sfu.TrackBinding{{MID: pub2.mids[0], Share: share, Kind: video}}
+	answer, err := conn.HandleOffer(ctx, sfu.PCPub, 2, 1, offer, bindings)
+	if err != nil {
+		t.Fatalf("gen 2 after the stuck gen 1: %v", err)
+	}
+	wantStuck(false, "after the rebuild")
+	pub2.apply(t, answer)
+	pub2.send(t)
+	if err := sig.WaitPCState(ctx, sfu.PCPub, 2, "connected"); err != nil {
+		t.Fatal(err)
+	}
+	waitShare(t, h.SFU, share, func(i sfu.ShareInfo) bool { return len(i.Layers) == 1 })
+	if answer, err = conn.HandleOffer(ctx, sfu.PCPub, 2, 2, pub2.offer(t, ctx), bindings); err != nil {
+		t.Fatalf("the re-offer on gen 2: %v", err)
+	}
+	pub2.apply(t, answer)
+	if evs := h.Events.Events(); len(evs) != 0 {
+		t.Errorf("room events: %+v, want none: the share lives through all of it", evs)
+	}
+}
+
 // TestSubNegotiation: the sub PC's negotiation states (02 §5.3): one offer outstanding at a time, changes made
 // meanwhile folded into one follow-up offer, answers matched by gen and neg, and inactive m-sections when a share
 // ends.
@@ -909,7 +1142,8 @@ func TestSubNegotiation(t *testing.T) {
 	wantCode(t, viewConn.HandleAnswer(ctx, sfu.PCSub, 2, 1, answer1), sfu.CodeStaleAnswer)
 	wantCode(t, viewConn.HandleAnswer(ctx, sfu.PCSub, 0, 1, answer1), sfu.CodeStaleAnswer)
 	wantCode(t, viewConn.HandleAnswer(ctx, sfu.PCPub, 1, 1, answer1), sfu.CodeBadPC)
-	// An answer the SFU can't use leaves the offer outstanding.
+	// An answer the SFU's own checks refuse leaves the offer outstanding (one that Pion refuses closes the PC:
+	// TestSubAnswerRefusedByPion).
 	wantCode(t, viewConn.HandleAnswer(ctx, sfu.PCSub, 1, 1, "v=nonsense"), sfu.CodeBadSDP)
 	wantCode(t, viewConn.HandleAnswer(ctx, sfu.PCSub, 1, 1, strings.Replace(answer1, "m=video", "m=application", 1)),
 		sfu.CodeBadSDP)
@@ -997,6 +1231,10 @@ func TestSubPCClosedByClient(t *testing.T) {
 	if err := sig.WaitPCState(ctx, sfu.PCSub, 1, "connected"); err != nil {
 		t.Fatalf("%v (answer errors %v)", err, sig.Errs())
 	}
+	// The SFU is the DTLS server, whose handshake is done one flight before the client's: a viewer closed before its
+	// own side is connected has no DTLS connection to send a close_notify on, and the SFU would only see ICE fail.
+	eventually(t, func() bool { return viewer.PC().ConnectionState() == webrtc.PeerConnectionStateConnected },
+		func() string { return "the viewer's PC is " + viewer.PC().ConnectionState().String() })
 
 	if err := viewer.Close(); err != nil {
 		t.Fatal(err)
@@ -1032,6 +1270,64 @@ func TestSubPCClosedByClient(t *testing.T) {
 	}
 	if _, err := viewConn.Subscriptions(ctx); err != nil {
 		t.Errorf("the Conn after its sub PC closed: %v", err)
+	}
+}
+
+// TestSubAnswerRefusedByPion: an answer that passes the SFU's checks but that Pion refuses after taking it is fatal
+// for the sub PC (02 §5.3, the closed row): Pion has no rollback, so the right answer could not be applied either.
+// The SFU closes the PC and offers nothing more on it; the Conn and its subscriptions stay for the rebuild, which is
+// README S57's. An answer the SFU's own checks refuse leaves the offer outstanding (TestSubNegotiation).
+func TestSubAnswerRefusedByPion(t *testing.T) {
+	h := newHarness(t, sfutest.HarnessOptions{})
+	ctx := testCtx(t)
+	pubConn, _ := join(t, h, "alice", "c-pub", sfu.RoleFull)
+	viewConn, sig := join(t, h, "bob", "c-view", sfu.RoleViewer)
+	startShare(t, pubConn, "s_1", sfu.PresetAuto)
+	startShare(t, pubConn, "s_2", sfu.PresetAuto)
+	viewer := newViewer(t, sfutest.LoopbackSettings()) // answered by hand: no Attach
+	subscribe := func(id sfu.ShareID) error {
+		t.Helper()
+		errs, err := viewConn.UpdateSubscriptions(ctx, []sfu.SubscriptionUpdate{{Share: id, Video: sfu.QualityLow}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return errs[0]
+	}
+	if err := subscribe("s_1"); err != nil {
+		t.Fatal(err)
+	}
+	offer, err := sig.WaitOffer(ctx, func(o sfutest.Offer) bool { return o.Neg == 1 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	answer, err := viewer.Answer(ctx, webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: offer.SDP})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The answer lost its ICE user name, which Pion looks for only after it has taken the answer.
+	wantCode(t, viewConn.HandleAnswer(ctx, sfu.PCSub, 1, 1, withoutLines(answer.SDP, "a=ice-ufrag:")), sfu.CodeBadSDP)
+	// The PC is closed, in the same call: the right answer finds nothing to apply to.
+	wantCode(t, viewConn.HandleAnswer(ctx, sfu.PCSub, 1, 1, answer.SDP), sfu.CodeBadPC)
+	if err := sig.WaitPCState(ctx, sfu.PCSub, 1, "closed"); err != nil {
+		t.Fatalf("%v (events %+v)", err, sig.Events())
+	}
+
+	// Like a sub PC the client closed: the subscription stays, a new one fails until the rebuild exists, and nothing
+	// more is offered.
+	wantCode(t, subscribe("s_2"), sfu.CodeInternal)
+	time.Sleep(200 * time.Millisecond) // four debounce periods
+	if n := len(sig.Offers()); n != 1 {
+		t.Errorf("%d sub offers, want only the first: nothing is offered on a closed PC", n)
+	}
+	subs, err := viewConn.Subscriptions(ctx)
+	if err != nil || len(subs) != 1 || subs[0].Share != "s_1" {
+		t.Errorf("subscriptions after the sub PC closed = %+v, %v; want the one to s_1 kept for the rebuild", subs, err)
+	}
+	for _, ev := range sig.Events() {
+		if st, ok := ev.(sfu.PCStateEvent); !ok || st.PC != sfu.PCSub || st.Gen != 1 || st.State != "closed" {
+			t.Errorf("the viewer got %+v, want only the closed state: HandleAnswer returned the error", ev)
+		}
 	}
 }
 

@@ -43,7 +43,12 @@
 //     briefly and never across a Pion call, a Signaler or RoomEvents call, or a channel send that can block.
 //   - A Conn's PCs, subscriptions, negotiation state and candidate buffers belong to its actor and have no lock.
 //   - Pion callbacks (OnTrack, OnConnectionStateChange) only append to the Conn's internal event queue. They never
-//     block, so a Pion call made by the actor can't deadlock on its own callback.
+//     block, so a Pion call made by the actor can't deadlock on its own callback. Pion runs each callback in a
+//     goroutine of its own, so their order means nothing: a state callback carries no state, and the actor reads
+//     the PC's state when it handles the post (onPCState).
+//   - A pubTrack reader whose RTP read fails posts the track's end to the actor, which detaches the track and takes
+//     it out of pubPC.tracks (pubTrackEnded). The table holds only tracks that are still read, so an offer never
+//     binds an ended track to a share.
 //   - Work for another Conn, and timer work, is posted to that Conn's internal event queue, never to its bounded
 //     command queue, so no actor ever waits on another. StopShare therefore returns once the share is removed and the
 //     posts are queued, however busy the subscribers are.
@@ -59,9 +64,12 @@
 //     StopShare, CloseRoom, SetLimits; StartShare, UpdateShare and the encodings per preset (02 §8.6);
 //   - conn.go: the Conn actor with its two queues, Close and Done, PC state events, the remote-candidate buffer;
 //   - pubpc.go: the publish PC: HandleOffer (gen and neg, validation, the answer with its Opus and a=inactive edits,
-//     the stored answer for a repeated neg), incoming tracks bound to shares by the tracks binding;
+//     the stored answer for a repeated neg), incoming tracks bound to shares by the tracks binding until they end,
+//     and the stuck state of a PC that Pion left holding an offer it refused (it takes no other offer of its gen);
 //   - subpc.go, subscription.go, downtrack.go: the subscribe PC's offers with gen, neg and tracks, the 50 ms
-//     debounce, HandleAnswer; UpdateSubscriptions; DownTrack as a webrtc.TrackLocal with its binding (02 §9.3);
+//     debounce, HandleAnswer, and the closed state: a sub PC the client closed, or one the SFU closed after a fatal
+//     error (an offer it couldn't make, an answer Pion refused); UpdateSubscriptions; DownTrack as a
+//     webrtc.TrackLocal with its binding (02 §9.3);
 //   - events.go, errors.go, types.go, config.go, stats.go, probe.go: the whole interface of 02 §6 and §13;
 //   - api.go: the publish, subscribe and connection-test probe webrtc.APIs on 04's netx.Transport, the
 //     remote-candidate filter (02 §7.3, 01 §17), the selected-pair label and the complete-SDP helper: the SFU never
@@ -77,11 +85,13 @@
 // (RestartICE, ResetPC, ClosePC, SetDecodeCaps, Probe), or does nothing yet (Resync). In README order:
 //   - S41, the media path: what the pubTrack readers do with a packet (cache, fan-out), the DownTrack writer with
 //     its munger and the DTLS-ready gate, keyframe requests, a share going pending → live with ShareUpdated and its
-//     250 ms debounce, ShareInfo.Viewers and Profile;
+//     250 ms debounce, ShareInfo.Viewers and Profile. It keeps this: a track that ended leaves pubPC.tracks
+//     (pubTrackEnded), which is also where a Layer's end is reported;
 //   - S52: simulcast layer selection, SubscriptionStateEvent, audio follows focus, and reusing the transceivers of
 //     ended shares (until then every DownTrack gets a new sendonly transceiver, so a sub PC's SDP only grows);
 //   - S57: the stalled state, RestartICE, ResetPC, ClosePC, Resync, the 15 s sub offer re-send, the rebuild of a sub
-//     PC that closed, the 10 s handshake timer, the 30 s grace after failed, sfu.pc_limit and sfu.pc_rate_limited;
+//     PC that closed (subPC.closed, whoever closed it: until then its subscriptions wait and new ones fail with
+//     sfu.internal), the 10 s handshake timer, the 30 s grace after failed, sfu.pc_limit and sfu.pc_rate_limited;
 //   - S63: NACK/RTX from the cache, sender-report forwarding, padding;
 //   - S69: the room codec policy with its hysteresis (CodecPolicy is ProfileHigh until then), the codec filter of
 //     the pub answer, SetDecodeCaps, viewers without H.264;

@@ -242,15 +242,26 @@ func (c *Conn) teardown() {
 
 // ---- PeerConnection state, shared by both kinds ----
 
-// onPCState handles a connection state change of pc, posted by its Pion callback. Only the current PC of a kind
-// counts: one already replaced by a higher gen, or closed, sends no event (02 §5.3).
-func (c *Conn) onPCState(kind PCKind, gen uint32, pc *webrtc.PeerConnection, state webrtc.PeerConnectionState) {
+// onPCState handles a connection state change of pc. Its Pion callback posts it without the state: Pion runs every
+// callback in a goroutine of its own, so two changes close together can reach the queue in either order. The state
+// is read here instead, on the actor, and each one is handled once: what the Conn reports last is always the PC's
+// real state, and a state that came and went between two posts is skipped. Only the current PC of a kind counts: one
+// already replaced by a higher gen, or a pub PC that has closed and gone, sends nothing more (02 §5.3).
+func (c *Conn) onPCState(kind PCKind, gen uint32, pc *webrtc.PeerConnection) {
+	var last *webrtc.PeerConnectionState
 	switch {
-	case kind == PCPub && (c.pub == nil || c.pub.pc != pc):
-		return
-	case kind == PCSub && (c.sub == nil || c.sub.pc != pc):
+	case kind == PCPub && c.pub != nil && c.pub.pc == pc:
+		last = &c.pub.lastState
+	case kind == PCSub && c.sub != nil && c.sub.pc == pc:
+		last = &c.sub.lastState
+	default:
 		return
 	}
+	state := pc.ConnectionState()
+	if state == *last {
+		return
+	}
+	*last = state
 	c.log.Info("PeerConnection state", "pc", kind.String(), "gen", gen, "state", state.String())
 	switch state {
 	case webrtc.PeerConnectionStateConnected:
@@ -261,16 +272,17 @@ func (c *Conn) onPCState(kind PCKind, gen uint32, pc *webrtc.PeerConnection, sta
 		}
 	case webrtc.PeerConnectionStateDisconnected, webrtc.PeerConnectionStateFailed:
 	case webrtc.PeerConnectionStateClosed:
-		// The SFU didn't close this PC (it would no longer be the current one): Pion did, because the client closed
-		// its side (a DTLS close_notify). A closed pub PC is gone: its tracks have ended, and only an offer with a
-		// higher gen brings a new one. A closed sub PC stays, without further offers, until README S57 rebuilds it
-		// from closed (02 §5.3); until then new subscriptions on this Conn fail with sfu.internal.
+		// A current PC is closed by Pion, because the client closed its side (a DTLS close_notify), or, for a sub PC,
+		// by the SFU after a fatal error (subFatal). A PC the SFU replaces or tears down is no longer current when its
+		// state arrives. A closed pub PC is gone: its tracks have ended, and only an offer with a higher gen brings a
+		// new one. A closed sub PC stays, without further offers, until README S57 rebuilds it from closed (02 §5.3);
+		// until then new subscriptions on this Conn fail with sfu.internal.
 		if kind == PCPub {
 			p := c.pub
 			c.pub = nil
 			p.close(c.log)
 		} else {
-			c.sub.closed = true
+			c.sub.markClosed()
 		}
 	default:
 		return // new and connecting are not reported

@@ -90,6 +90,44 @@ func (r *recSignaler) sent() []subOffer {
 	return slices.Clone(r.offers)
 }
 
+// pcStates returns the PCStateEvents the Signaler got, in order, as "sub/1:connected".
+func (r *recSignaler) pcStates() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []string
+	for _, ev := range r.events {
+		if st, ok := ev.(PCStateEvent); ok {
+			out = append(out, fmt.Sprintf("%s/%d:%s", st.PC, st.Gen, st.State))
+		}
+	}
+	return out
+}
+
+// errorEvents returns the ErrorEvents the Signaler got, in order.
+func (r *recSignaler) errorEvents() []ErrorEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []ErrorEvent
+	for _, ev := range r.events {
+		if e, ok := ev.(ErrorEvent); ok {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// waitPCStates waits until the Signaler has got exactly these PCStateEvents (see pcStates).
+func (r *recSignaler) waitPCStates(t *testing.T, want ...string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !slices.Equal(r.pcStates(), want) {
+		if time.Now().After(deadline) {
+			t.Fatalf("PC states = %v, want %v", r.pcStates(), want)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // waitOffers waits until the Signaler has got n offers and returns them.
 func (r *recSignaler) waitOffers(t *testing.T, n int) []subOffer {
 	t.Helper()
@@ -1044,6 +1082,152 @@ func TestSubCandidates(t *testing.T) {
 	if st := candState(t, viewer, PCSub); st.count != 3 || len(st.pending) != 0 {
 		t.Errorf("a candidate after the answer: %+v, want it applied at once", st)
 	}
+}
+
+// TestPCStateReadOnActor: Pion runs every OnConnectionStateChange callback in a goroutine of its own, so two changes
+// close together can reach the actor in either order. A callback therefore only says that something changed: the
+// actor reads the state, reports each one once, and what it reports last is the PC's real state (02 §5.3).
+func TestPCStateReadOnActor(t *testing.T) {
+	s, _ := newTestSFU(t)
+	ctx := testCtx(t)
+	pub, _ := join(t, s, "lounge", "alice", "c-a", RoleFull)
+	viewer, sig := join(t, s, "lounge", "bob", "c-b", RoleViewer)
+	startShare(t, pub, "s_1")
+	if _, err := viewer.UpdateSubscriptions(ctx, []SubscriptionUpdate{{Share: "s_1", Video: QualityLow}}); err != nil {
+		t.Fatal(err)
+	}
+	offer := sig.waitOffers(t, 1)[0]
+	client := newTestPC(t, loopbackClientAPI(t, webrtc.NetworkTypeUDP4))
+	if err := client.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: offer.sdp}); err != nil {
+		t.Fatal(err)
+	}
+	answer, err := client.CreateAnswer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := viewer.HandleAnswer(ctx, PCSub, 1, 1, completeDescription(t, client, answer)); err != nil {
+		t.Fatal(err)
+	}
+	sig.waitPCStates(t, "sub/1:connected")
+
+	// lateCallbacks is what the actor gets from callbacks that Pion started earlier, for whatever state.
+	lateCallbacks := func() {
+		t.Helper()
+		if err := viewer.do(ctx, func(context.Context) error {
+			for range 3 {
+				viewer.onPCState(PCSub, 1, viewer.sub.pc)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lateCallbacks()
+	sig.waitPCStates(t, "sub/1:connected") // nothing new: the state is the one already reported
+
+	// The PC closes while the actor is busy, so no callback for it has been handled yet. The next one to be handled
+	// reports closed, even though Pion started it for an older state.
+	if err := viewer.do(ctx, func(context.Context) error {
+		sub := viewer.sub
+		if !sub.ready.Load() {
+			return errors.New("the DTLS-ready gate of the sub PC was not set when it connected")
+		}
+		if err := sub.pc.Close(); err != nil {
+			return err
+		}
+		viewer.onPCState(PCSub, 1, sub.pc)
+		if !sub.closed || sub.lastState != webrtc.PeerConnectionStateClosed {
+			return fmt.Errorf("after a callback on the closed PC: closed %v, last state %s", sub.closed, sub.lastState)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Pion's own callbacks for the close, and any older one that arrives after them, change nothing: connected is
+	// not reported after closed, and closed not twice.
+	time.Sleep(100 * time.Millisecond)
+	lateCallbacks()
+	sig.waitPCStates(t, "sub/1:connected", "sub/1:closed")
+}
+
+// TestSubOfferFailure: a sub offer that Pion can't make is fatal for the sub PC (02 §5.3, the closed row). The SFU
+// closes the PC at once, so nothing is left idle with a change that was never offered, and tells the client with an
+// ErrorEvent (sfu.internal). The subscriptions stay for the sub PC that README S57 builds from closed.
+func TestSubOfferFailure(t *testing.T) {
+	s, _ := newTestSFU(t)
+	ctx := testCtx(t)
+	pub, _ := join(t, s, "lounge", "alice", "c-a", RoleFull)
+	viewer, sig := join(t, s, "lounge", "bob", "c-b", RoleViewer)
+	startShare(t, pub, "s_1")
+
+	// One actor turn: subscribe (which starts the debounce), break the PeerConnection so that CreateOffer fails, and do
+	// what the debounce does. Pion's closed state can't arrive in between, so offerSub meets a PC it thinks is fine.
+	if err := viewer.do(ctx, func(context.Context) error {
+		errs, err := viewer.updateSubscriptions([]SubscriptionUpdate{{Share: "s_1", Video: QualityLow}})
+		if err != nil {
+			return err
+		}
+		if errs[0] != nil {
+			return errs[0]
+		}
+		sub := viewer.sub
+		if sub.debounce == nil || sub.closed {
+			return fmt.Errorf("before the offer: debounce pending %v, closed %v", sub.debounce != nil, sub.closed)
+		}
+		if err := sub.pc.Close(); err != nil {
+			return err
+		}
+		viewer.offerSub(sub)
+		if !sub.closed || sub.offering || sub.dirty || sub.debounce != nil || sub.neg != 0 {
+			return fmt.Errorf("after the failed offer: closed %v, offering %v, dirty %v, debounce pending %v, neg %d; "+
+				"want a closed PC with nothing outstanding", sub.closed, sub.offering, sub.dirty, sub.debounce != nil, sub.neg)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sig.waitPCStates(t, "sub/1:closed")
+	wantErrorEvent := func() {
+		t.Helper()
+		evs := sig.errorEvents()
+		if len(evs) != 1 || evs[0].Scope != ScopePCSub {
+			t.Fatalf("error events = %+v, want one for the sub PC", evs)
+		}
+		if e := errOf(t, evs[0].Err, CodeInternal); !e.Retryable {
+			t.Error("the sub offer's sfu.internal is not retryable")
+		}
+	}
+	wantErrorEvent()
+
+	// The Conn goes on with a closed sub PC: the subscription is kept, answers have nothing to apply to, and a later
+	// change (the share ends) neither offers nor fails again.
+	if subs, err := viewer.Subscriptions(ctx); err != nil || len(subs) != 1 || subs[0].Share != "s_1" {
+		t.Errorf("subscriptions after the failed offer = %+v, %v; want the one to s_1 kept for the rebuild", subs, err)
+	}
+	wantErr(t, viewer.HandleAnswer(ctx, PCSub, 1, 1, "v=0"), CodeBadPC)
+	if err := pub.StopShare(ctx, "s_1", EndReasonStopped); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		subs, err := viewer.Subscriptions(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(subs) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the subscription to the ended share is still there: %+v", subs)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(4 * subOfferDebounce)
+	if n := len(sig.sent()); n != 0 {
+		t.Errorf("%d sub offers on a PC that never made one, want none", n)
+	}
+	wantErrorEvent()
+	sig.waitPCStates(t, "sub/1:closed")
 }
 
 // TestUpdateSubscriptions: the role, the guards and the per-item errors of 02 §6.1 and §12; a batch that creates

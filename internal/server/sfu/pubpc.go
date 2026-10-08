@@ -19,11 +19,18 @@ type pubPC struct {
 	// lower one is stale (01 §9 rule 3).
 	neg    uint32
 	answer string
+	// stuck: an offer failed inside Pion after Pion had taken it as its remote offer (offerFailed). The PC then takes
+	// no other offer; it and its media stay until an offer with a higher gen replaces it.
+	stuck bool
+	// lastState is the last connection state onPCState handled, so that each state is reported once.
+	lastState webrtc.PeerConnectionState
 	// bound maps the mids of the latest offer's sending m-sections that carry a share to that share and kind. A
 	// track on any other mid feeds nothing.
-	bound  map[string]TrackBinding
+	bound map[string]TrackBinding
+	// tracks are the incoming tracks that are still being read: one whose read failed (the PC closed, or Pion stopped
+	// its receiver because an offer made its m-section inactive) has left the table (pubTrackEnded).
 	tracks map[trackKey]*pubTrack
-	// readers are the tracks' read goroutines; they end when the PC closes.
+	// readers are the tracks' read goroutines; each ends with its track, all of them when the PC closes.
 	readers sync.WaitGroup
 }
 
@@ -34,7 +41,8 @@ type trackKey struct{ mid, rid string }
 // as Pion delivers the track, whether or not it carries a share: a track that nobody reads fills Pion's buffers.
 // What they read goes to the Layer the track is attached to. The media path (README S41) adds what a Layer does
 // with a packet (02 §9.1); until then, and whenever layer is nil (the m-section carries no share: 02 §8.4 step 1),
-// the packets are counted and discarded.
+// the packets are counted and discarded. When the RTP read fails the track has ended: its Layer ends with it
+// (02 §5.1) and the track leaves its PC's table, so no later offer binds it to a share.
 type pubTrack struct {
 	key   trackKey
 	kind  webrtc.RTPCodecType
@@ -51,6 +59,10 @@ type pubTrack struct {
 // nothing (02 §8.4). A higher gen replaces the pub PC: the client rebuilt it. A lower gen, or a lower neg in the
 // current gen, returns sfu.stale_offer and changes nothing; a repeated neg gets the stored answer again (02 §5.3).
 // Offers are only valid for PCPub.
+//
+// An offer the SFU's own checks refuse changes nothing. One that Pion refuses changes nothing when it starts a new
+// gen (the old PC stays). On the current PC it can leave Pion holding the offer for good: every later offer of that
+// gen is then sfu.bad_sdp, the PC's media goes on, and the client's rebuild (gen + 1, 01 §9 rule 8) replaces it.
 func (c *Conn) HandleOffer(ctx context.Context, pc PCKind, gen, neg uint32, sdp string, tracks []TrackBinding,
 ) (answerSDP string, err error) {
 	err = c.do(ctx, func(ctx context.Context) error {
@@ -65,7 +77,7 @@ func (c *Conn) HandleOffer(ctx context.Context, pc PCKind, gen, neg uint32, sdp 
 }
 
 // handleOffer is 02 §8.4 on the actor. Everything that can refuse the offer for what it says (steps 0–1) runs before
-// anything changes.
+// anything changes. What Pion refuses after that is offerFailed's.
 func (c *Conn) handleOffer(ctx context.Context, kind PCKind, gen, neg uint32, raw string, tracks []TrackBinding,
 ) (string, error) {
 	switch {
@@ -85,6 +97,9 @@ func (c *Conn) handleOffer(ctx context.Context, kind PCKind, gen, neg uint32, ra
 		return "", newError(CodeStaleOffer, "a pub offer with an older neg")
 	case gen == c.pubGen && neg == cur.neg:
 		return cur.answer, nil
+	case gen == c.pubGen && cur.stuck:
+		// No Pion call: it would only fail again. sfu.bad_sdp is 01's sdp_invalid, which has the client rebuild.
+		return "", newError(CodeBadSDP, "the pub PC takes no more offers: an earlier one failed inside Pion")
 	}
 
 	// Step 1: validate, and drop the candidates the server must not probe (02 §7.3).
@@ -100,8 +115,9 @@ func (c *Conn) handleOffer(ctx context.Context, kind PCKind, gen, neg uint32, ra
 		c.log.Debug("remote candidates dropped from a pub offer", "count", dropped)
 	}
 
-	// Step 2: the PC of this gen. A new one replaces the old one only once it has taken the offer, so an offer Pion
-	// refuses changes nothing either.
+	// Step 2: the PC of this gen. A new one replaces the old one only once it has taken the offer, so an offer of a new
+	// gen that Pion refuses changes nothing: the new PC goes and the old one stays. The current PC has no such way
+	// back (offerFailed).
 	p := cur
 	if gen > c.pubGen {
 		if p, err = c.newPubPC(gen); err != nil {
@@ -111,10 +127,12 @@ func (c *Conn) handleOffer(ctx context.Context, kind PCKind, gen, neg uint32, ra
 	}
 	remote := webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: filtered}
 	if err := p.pc.SetRemoteDescription(remote); err != nil {
-		c.log.Debug("pub offer refused by SetRemoteDescription", "gen", gen, "neg", neg, "err", err)
 		if p != cur {
 			p.close(c.log)
+		} else {
+			p.offerFailed()
 		}
+		c.log.Debug("pub offer refused by SetRemoteDescription", "gen", gen, "neg", neg, "stuck", p.stuck, "err", err)
 		return "", newError(CodeBadSDP, "the pub offer can't be applied")
 	}
 	if p != cur {
@@ -136,15 +154,18 @@ func (c *Conn) handleOffer(ctx context.Context, kind PCKind, gen, neg uint32, ra
 	// Step 3, the codec filter by room policy (SetCodecPreferences on each video transceiver), is README S69's: until
 	// then the policy is always high, which allows all five profiles.
 
-	// Step 4: the answer, with every candidate in it.
+	// Step 4: the answer, with every candidate in it. A failure here leaves the offer without an answer; the error is
+	// the retryable sfu.internal, and the retry of a stuck PC gets sfu.bad_sdp, so the client rebuilds.
 	answer, err := p.pc.CreateAnswer(nil)
 	if err != nil {
-		c.log.Warn("pub answer not created", "gen", gen, "neg", neg, "err", err)
+		p.offerFailed()
+		c.log.Warn("pub answer not created", "gen", gen, "neg", neg, "stuck", p.stuck, "err", err)
 		return "", newError(CodeInternal, "the pub answer could not be created")
 	}
 	local, complete, err := setLocalComplete(ctx, p.pc, answer)
 	if err != nil {
-		c.log.Warn("pub answer not applied", "gen", gen, "neg", neg, "err", err)
+		p.offerFailed() // not stuck when only the wait for the candidates was cut short: the answer is set
+		c.log.Warn("pub answer not applied", "gen", gen, "neg", neg, "stuck", p.stuck, "err", err)
 		return "", newError(CodeInternal, "the pub answer could not be applied")
 	}
 	if !complete {
@@ -174,6 +195,17 @@ func (c *Conn) handleOffer(ctx context.Context, kind PCKind, gen, neg uint32, ra
 	return out, nil
 }
 
+// offerFailed notes that Pion refused a step of an offer on p, a pub PC that stays. Pion takes the offer as its
+// remote description (signaling state have-remote-offer) before it checks the rest of it, and has no way back: it
+// refuses every rollback, and from have-remote-offer it accepts nothing but its own answer. So unless the failure
+// came before that point, or after the answer was set, p is stuck: it can take neither this offer again nor another
+// one. Nothing else changes: its tracks keep feeding their shares.
+func (p *pubPC) offerFailed() {
+	if p.pc.SignalingState() != webrtc.SignalingStateStable {
+		p.stuck = true
+	}
+}
+
 // ownsShare reports whether id is a share this Conn publishes that hasn't ended (pending, live or stalled): what a
 // pub offer's tracks may bind (02 §5.2).
 func (c *Conn) ownsShare(id ShareID) bool {
@@ -192,8 +224,9 @@ func (c *Conn) newPubPC(gen uint32) (*pubPC, error) {
 		// Pion hands the track over once: if the Conn is closing and drops the post, the PC is closing too.
 		c.post(func() { c.onPubTrack(p, track, recv) })
 	})
-	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		c.post(func() { c.onPCState(PCPub, gen, pc, state) })
+	pc.OnConnectionStateChange(func(webrtc.PeerConnectionState) {
+		// Only "something changed": Pion runs each callback in a goroutine of its own, so their order means nothing.
+		c.post(func() { c.onPCState(PCPub, gen, pc) })
 	})
 	return p, nil
 }
@@ -233,6 +266,8 @@ func (c *Conn) onPubTrack(p *pubPC, track *webrtc.TrackRemote, recv *webrtc.RTPR
 	go func() {
 		defer p.readers.Done()
 		t.readRTP()
+		// The track has ended. A closing Conn drops the post: its teardown detaches every track.
+		c.post(func() { c.pubTrackEnded(p, t) })
 	}()
 	go func() {
 		defer p.readers.Done()
@@ -240,6 +275,19 @@ func (c *Conn) onPubTrack(p *pubPC, track *webrtc.TrackRemote, recv *webrtc.RTPR
 	}()
 	c.log.Debug("pub track", "gen", p.gen, "kind", t.kind.String(), "rid", t.key.rid)
 	c.bindTrack(p, t)
+}
+
+// pubTrackEnded runs on the actor when the RTP read of t, a track of pub PC p, has failed: p closed, or Pion stopped
+// t's receiver (an offer made its m-section inactive, or the stream came back with another SSRC). The Layer t fed
+// ends with it (02 §5.1), and t leaves p's table: a client reuses the m-section for its next share (02 §8.4 step 5),
+// and that share must get the track Pion delivers then, not this one. For a p that was closed or replaced meanwhile
+// there is nothing left to do.
+func (c *Conn) pubTrackEnded(p *pubPC, t *pubTrack) {
+	t.detach()
+	if p.tracks[t.key] == t { // not when a newer track of the same m-section and rid has taken its place
+		delete(p.tracks, t.key)
+		c.log.Debug("pub track ended", "gen", p.gen, "kind", t.kind.String(), "rid", t.key.rid)
+	}
 }
 
 // rebindTracks maps every known track of p by the binding of the offer just applied: the mapping is read afresh on
@@ -309,7 +357,8 @@ func (t *pubTrack) detach() {
 	}
 }
 
-// readRTP reads the track's RTP until the track ends (the PC closed, or Pion stopped the receiver).
+// readRTP reads the track's RTP until the track ends (the PC closed, or Pion stopped the receiver). Its caller then
+// tells the actor (pubTrackEnded).
 func (t *pubTrack) readRTP() {
 	buf := make([]byte, rtpReadBuffer)
 	for {
