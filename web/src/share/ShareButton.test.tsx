@@ -10,8 +10,10 @@ import type { PickedSource } from '../platform/types';
 import { createTestPlatform } from '../test/platform';
 import { createTestServices, renderRoute } from '../test/render';
 import { NOTE_TOAST_MS, ShareButton, ShareUnavailableNote, type ShareButtonProps } from './ShareButton';
+import { resetLevelAudio } from './levelAudio';
 import { createShareStore, type StartShare } from './shareStore';
-import { deferred, fakePick, fakeSharing, type FakeSharing } from './testing/fakeCapture';
+import { deferred, FakeAudioContext, fakePick, fakeSharing, type FakeSharing } from './testing/fakeCapture';
+import { shareParams } from './testing/publish';
 
 const WARNING = 'Share all sound on this computer?';
 
@@ -152,7 +154,7 @@ describe('ShareButton', () => {
   it('a start that fails shows its message, releases the capture, and leaves Share usable', async () => {
     const src = fakePick('window', true);
     const { onStart, store, toasts } = renderButton({ sharing: fakeSharing(src) });
-    // What platform.sharing.start does until S46.
+    // Any error will do: this one has no text of its own.
     onStart.mockRejectedValueOnce(new NotImplementedError('sharing.start', 'S46'));
     await shareFromSheet();
     await waitFor(() => {
@@ -667,14 +669,127 @@ describe('ShareButton: focus comes back to the button', () => {
     await waitFor(() => {
       expect(onStart).toHaveBeenCalledOnce();
     });
-    // What the publisher does (S46): live, then stopped.
+    // What the publisher does: live, then stopped.
     act(() => {
-      store.setState({ phase: 'live' });
+      store.getState().advance('live');
     });
     act(() => {
-      store.setState({ phase: 'idle' });
+      store.getState().finish();
     });
     expect(share()).toBeEnabled();
     expect(document.body).toHaveFocus();
+  });
+});
+
+describe('ShareButton: the share state and the rest of the app', () => {
+  it('links the share state to uiStore when it mounts, and the link outlives the button (05 §16.2)', () => {
+    const { store, services, remove } = renderButton();
+    expect(services.ui.getState().sharing).toBe(false);
+    act(() => {
+      store.getState().publishing({
+        picked: { kind: 'window', audioScope: 'window', warning: null },
+        preset: 'auto',
+        withAudio: true,
+        params: shareParams('s_1'),
+      });
+    });
+    expect(services.ui.getState().sharing).toBe(true);
+    // The room page is left (/account): the share goes on, and so does the flag.
+    remove('header');
+    expect(services.ui.getState().sharing).toBe(true);
+    act(() => {
+      store.getState().finish();
+    });
+    expect(services.ui.getState().sharing).toBe(false);
+  });
+
+  it('where the platform can’t share there is nothing to link', () => {
+    const { store, services } = renderButton({ sharing: null });
+    act(() => {
+      store.setState({ phase: 'live' });
+    });
+    expect(services.ui.getState().sharing).toBe(false);
+  });
+
+  it('opens the level meter’s AudioContext inside the Share click (05 §13.7)', async () => {
+    FakeAudioContext.instances = [];
+    vi.stubGlobal('AudioContext', FakeAudioContext);
+    try {
+      renderButton({ sharing: fakeSharing(fakePick('window', true)) });
+      await userEvent.click(screen.getByRole('button', { name: 'Share' }));
+      expect(FakeAudioContext.instances).toHaveLength(0);
+      await userEvent.click(
+        within(screen.getByRole('dialog', { name: 'Share your screen' })).getByRole('button', { name: 'Share' }),
+      );
+      expect(FakeAudioContext.instances).toHaveLength(1);
+      const [ctx] = FakeAudioContext.instances;
+      // resume() inside the click is what unlocks it. Nothing is metered yet, so it doesn't keep running: the
+      // audio thread is for the level meter, which may never be opened.
+      expect(ctx?.resume).toHaveBeenCalledOnce();
+      await waitFor(() => {
+        expect(ctx?.suspend).toHaveBeenCalledOnce();
+      });
+      expect(ctx?.state).toBe('suspended');
+    } finally {
+      resetLevelAudio();
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe('ShareButton on a page with a SharePanel: the panel reports what it shows', () => {
+  it('a failed start is the panel’s to show: no toast', async () => {
+    const store = createShareStore();
+    const detach = store.getState().attachPanel();
+    const { onStart, toasts } = renderButton({ store, sharing: fakeSharing(fakePick('window', true)) });
+    const failure = new LocalError('webrtc_failed');
+    onStart.mockRejectedValueOnce(failure);
+    await shareFromSheet();
+    await waitFor(() => {
+      expect(store.getState()).toMatchObject({ phase: 'failed', error: failure });
+    });
+    expect(toasts()).toEqual([]);
+    detach();
+  });
+
+  it('a failed capture is still a toast: the panel shows nothing for it', async () => {
+    const store = createShareStore();
+    store.getState().attachPanel();
+    const { toasts } = renderButton({ store, sharing: fakeSharing(new LocalError('capture_failed')) });
+    await shareFromSheet();
+    await waitFor(() => {
+      expect(toasts()).toEqual([{ kind: 'error', message: "Couldn't capture that. Another app may be blocking it." }]);
+    });
+    expect(store.getState().phase).toBe('idle');
+  });
+
+  it('the "no sound is shared" note is the panel’s too: no toast, but it is still said once for screen readers', async () => {
+    const store = createShareStore();
+    store.getState().attachPanel();
+    const { onStart, toasts, services } = renderButton({ store, sharing: fakeSharing(fakePick('monitor', false)) });
+    await shareFromSheet();
+    await waitFor(() => {
+      expect(onStart).toHaveBeenCalledOnce();
+    });
+    // The panel shows the note in its bar (SharePanel.test.tsx), which is no live region.
+    await waitFor(() => {
+      expect(services.ui.getState().announcements.polite?.text).toBe('No sound is shared');
+    });
+    expect(toasts()).toEqual([]);
+  });
+
+  it('a share with sound has nothing to say there either', async () => {
+    const store = createShareStore();
+    store.getState().attachPanel();
+    const { onStart, toasts, services } = renderButton({ store, sharing: fakeSharing(fakePick('window', true)) });
+    await shareFromSheet();
+    await waitFor(() => {
+      expect(onStart).toHaveBeenCalledOnce();
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(toasts()).toEqual([]);
+    expect(services.ui.getState().announcements.polite).toBeNull();
   });
 });

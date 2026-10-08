@@ -15,8 +15,13 @@
 // store as a host, the store names one of them to show the warning, and a pick is given up only when the last
 // button unmounts.
 //
-// Until the share panel exists (S46), this component also reports how the flow ended: a failed capture or a failed
-// start as an error toast, and the "no sound is shared" notes of 05 §13.3 as an info toast.
+// How the flow ended is told here as toasts: a failed capture always; a failed start and the "no sound is shared"
+// notes of 05 §13.3 only on a page without a SharePanel, which shows both itself (the note in its bar, for as long
+// as the share lasts). The note is still said once for screen readers then: the panel's bar is no live region.
+//
+// Each button also links the share state to the app's uiStore when it mounts (shareUi.ts): a share can only start
+// from a Share button, and what the rest of the app needs to know about it (the update pill must not offer a reload
+// while sharing) has to go on when this page is left.
 import { MonitorUp } from 'lucide-react';
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -27,10 +32,12 @@ import { errorMessage } from '../lib/errorText';
 import type { PickedSource } from '../platform/types';
 import type { Preset } from '../protocol/types.gen';
 import { Button, type ButtonStyleProps } from '../ui/Button';
+import { primeLevelAudio } from './levelAudio';
 import { noAudioNote } from './notes';
 import { ScreenAudioWarning } from './ScreenAudioWarning';
 import { ShareSheet, type ShareElsewhere } from './ShareSheet';
 import { shareStore, type ShareFlowOutcome, type ShareStore, type StartShare } from './shareStore';
+import { linkShareUi } from './shareUi';
 
 /** How long the "no sound is shared" note stays: longer than a plain toast, it tells the sharer what to change. */
 export const NOTE_TOAST_MS = 10_000;
@@ -73,6 +80,11 @@ export function ShareButton({
   // capture must not outlive the UI that explains it.
   useEffect(() => (sharing ? store.getState().attach(id) : undefined), [store, sharing, id]);
 
+  // uiStore.sharing follows the share state from here on, also after this button is gone (05 §16.2).
+  useEffect(() => {
+    if (sharing) linkShareUi(store, ui);
+  }, [store, sharing, ui]);
+
   // Focus (05 §16.6). The sheet takes the focus, and it is unmounted while open: by its own Cancel, or by its Share
   // click, which also disables this button until the pick is settled. Either way the focus falls to <body>, and a
   // keyboard user would start again from the top of the page. So when what this button's sheet started is over
@@ -94,16 +106,25 @@ export function ShareButton({
 
   const follow = (step: Promise<ShareFlowOutcome>): void => {
     void step.then((outcome) => {
+      // A mounted SharePanel shows a failed share (phase failed) and the note of a share without sound.
+      const { panels, phase: now } = store.getState();
       if (outcome.step === 'failed') {
+        if (panels > 0 && now === 'failed') return;
         ui.getState().toast({ kind: 'error', message: errorMessage(outcome.error, t) });
       } else if (outcome.step === 'started') {
         const note = noAudioNote(outcome.picked, t);
-        if (note !== null) ui.getState().toast({ kind: 'info', message: note, durationMs: NOTE_TOAST_MS });
+        if (note === null) return;
+        // A toast announces itself; the panel's bar doesn't.
+        if (panels > 0) ui.getState().announce(note);
+        else ui.getState().toast({ kind: 'info', message: note, durationMs: NOTE_TOAST_MS });
       }
     });
   };
 
   const pick = (picking: Promise<PickedSource | null>, withPreset: Preset): void => {
+    // Still inside the Share click (the sheet's, or the warning's "Pick something else"), after the picker was
+    // opened: the level meter's AudioContext needs a user gesture to run (05 §13.7).
+    primeLevelAudio();
     setSheetOpen(false);
     follow(store.getState().pick(picking, { preset: withPreset, start: onStart }));
   };

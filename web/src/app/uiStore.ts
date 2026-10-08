@@ -62,6 +62,11 @@ export interface UiState {
   readonly installAvailable: boolean;
   /** A new service worker waits: the UpdatePill offers "Update ready · Reload" (05 §16.2). */
   readonly updateReady: boolean;
+  /**
+   * This page shares a screen right now (share/ sets it from its share state, on whatever page the user is). A
+   * reload would end the share, so the UpdatePill offers none meanwhile (05 §16.2).
+   */
+  readonly sharing: boolean;
   /** When set, this screen replaces the router. */
   readonly screen: AppScreen | null;
 
@@ -75,6 +80,7 @@ export interface UiState {
   announce(text: string, politeness?: Politeness): void;
   setInstallAvailable(available: boolean): void;
   setUpdateReady(ready: boolean): void;
+  setSharing(sharing: boolean): void;
   showScreen(screen: AppScreen | null): void;
 }
 
@@ -92,6 +98,7 @@ export function createUiStore(): UiStore {
     announcements: { polite: null, assertive: null },
     installAvailable: false,
     updateReady: false,
+    sharing: false,
     screen: null,
 
     toast(t) {
@@ -121,6 +128,9 @@ export function createUiStore(): UiStore {
     },
     setUpdateReady(updateReady) {
       set({ updateReady });
+    },
+    setSharing(sharing) {
+      set({ sharing });
     },
     showScreen(screen) {
       set({ screen });

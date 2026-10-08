@@ -1,6 +1,7 @@
 import { act, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { StrictMode } from 'react';
+import { createMemoryRouter } from 'react-router';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { BrowserPwa, VERSION_POLL_MS } from '../platform/browser/pwa';
@@ -8,7 +9,7 @@ import type { PwaProvider } from '../platform/types';
 import { createTestPlatform } from '../test/platform';
 import { createTestServices, renderWithApp } from '../test/render';
 import { Announcer } from './Announcer';
-import { AppProviders } from './App';
+import { App, AppProviders } from './App';
 import { UpdatePill } from './UpdatePill';
 
 /** A PwaProvider whose update the test makes ready. */
@@ -95,26 +96,37 @@ describe('UpdatePill (05 §16.2)', () => {
     expect(reload).toHaveBeenCalledOnce();
   });
 
-  it('while sharing it only says that an update waits: a reload would end the share', () => {
-    const { pwa, makeReady } = fakePwa();
+  it('while sharing (uiStore.sharing) it only says that an update waits: a reload would end the share', () => {
+    const { pwa, applyUpdate, makeReady } = fakePwa();
     const services = createTestServices({ platform: createTestPlatform({ pwa }) });
-    const { rerender } = render(
-      <AppProviders services={services}>
-        <UpdatePill sharing />
-      </AppProviders>,
-    );
+    services.ui.getState().setSharing(true);
+    renderWithApp(<UpdatePill />, { services });
     makeReady();
     expect(screen.getByRole('region', { name: 'App update' })).toHaveTextContent(
       'Update ready. Reload after you stop sharing.',
     );
     expect(screen.queryByRole('button', { name: 'Reload' })).not.toBeInTheDocument();
 
-    rerender(
-      <AppProviders services={services}>
-        <UpdatePill sharing={false} />
-      </AppProviders>,
-    );
+    // The share ended: the button is back.
+    act(() => {
+      services.ui.getState().setSharing(false);
+    });
+    expect(screen.getByRole('region', { name: 'App update' })).toHaveTextContent('Update ready');
     expect(screen.getByRole('button', { name: 'Reload' })).toBeInTheDocument();
+    expect(applyUpdate).not.toHaveBeenCalled();
+  });
+
+  it('a share that starts while the pill shows takes the Reload button away', () => {
+    const { pwa, makeReady } = fakePwa();
+    const services = createTestServices({ platform: createTestPlatform({ pwa }) });
+    renderWithApp(<UpdatePill />, { services });
+    makeReady();
+    expect(screen.getByRole('button', { name: 'Reload' })).toBeInTheDocument();
+    act(() => {
+      services.ui.getState().setSharing(true);
+    });
+    expect(screen.queryByRole('button', { name: 'Reload' })).not.toBeInTheDocument();
+    expect(screen.getByText('Update ready. Reload after you stop sharing.')).toBeInTheDocument();
   });
 
   it('announces once, also under StrictMode with the update ready before it mounts, and unsubscribes', () => {
@@ -135,6 +147,34 @@ describe('UpdatePill (05 §16.2)', () => {
     expect(announce).toHaveBeenCalledOnce();
     unmount();
     expect(listeners.size).toBe(0);
+  });
+});
+
+describe('the shell’s pill (App mounts it without props: it reads uiStore)', () => {
+  const router = () => createMemoryRouter([{ path: '*', element: <h1>page</h1> }]);
+
+  it('offers Reload for an update, and none while the page shares', async () => {
+    const { pwa, applyUpdate, makeReady } = fakePwa();
+    const services = createTestServices({ platform: createTestPlatform({ pwa }) });
+    render(<App services={services} router={router()} />);
+    expect(screen.getByRole('heading', { name: 'page' })).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'App update' })).not.toBeInTheDocument();
+
+    // A share is under way when the update arrives.
+    act(() => {
+      services.ui.getState().setSharing(true);
+    });
+    makeReady();
+    const pill = screen.getByRole('region', { name: 'App update' });
+    expect(pill).toHaveTextContent('Update ready. Reload after you stop sharing.');
+    expect(screen.queryByRole('button', { name: 'Reload' })).not.toBeInTheDocument();
+
+    // It ends: now the shell offers the reload, and it applies the update.
+    act(() => {
+      services.ui.getState().setSharing(false);
+    });
+    await userEvent.click(screen.getByRole('button', { name: 'Reload' }));
+    expect(applyUpdate).toHaveBeenCalledOnce();
   });
 });
 

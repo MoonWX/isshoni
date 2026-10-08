@@ -15,9 +15,11 @@ import {
 import { FAKE_DISPLAY_KEY } from '../platform/browser/fakeDisplay';
 import { createMemoryStorage } from '../platform/browser/storage';
 import type { PickedSource, ShareContext } from '../platform/types';
-import { installFakeRTC } from '../test/FakeRTCPeerConnection';
+import { FakeRTCPeerConnection, installFakeRTC } from '../test/FakeRTCPeerConnection';
 import { FakeMediaStream } from '../test/fakeMedia';
-import { captureStream, installFakeCanvas, type FakeCanvasControl } from './testing/fakeCapture';
+import { shareStore } from './shareStore';
+import { captureStream, fakePick, installFakeCanvas, type FakeCanvasControl } from './testing/fakeCapture';
+import { shareParams } from './testing/publish';
 
 type GetDisplayMedia = (options?: DisplayMediaStreamOptions) => Promise<MediaStream>;
 
@@ -392,14 +394,43 @@ describe('createBrowserSharing', () => {
     expect(stream.getVideoTracks()[0]?.contentHint).toBe('motion');
   });
 
-  it('start() is the publisher of S46: not implemented yet', async () => {
-    const sharing = createBrowserSharing();
-    const src = {} as PickedSource;
-    const ctx = {} as ShareContext;
-    await expect(sharing.start(src, { preset: 'auto', withAudio: true }, ctx)).rejects.toMatchObject({
-      name: 'NotImplementedError',
-      member: 'sharing.start',
-      slice: 'S46',
-    });
+  it("start() publishes on this page's RTCPeerConnection, with the browser's own codec capabilities", async () => {
+    uninstall = installFakeRTC({ displayMedia: true });
+    const request = vi.fn((type: string) => Promise.resolve(type === 'share.start' ? shareParams('s_1') : {}));
+    const notify = vi.fn(() => true);
+    const ctx = {
+      signal: { request, notify, on: () => () => undefined, probe: vi.fn() },
+      roomId: 'lounge',
+    } as unknown as ShareContext;
+    const src: PickedSource = fakePick('window', true);
+
+    const share = await createBrowserSharing().start(src, { preset: 'auto', withAudio: true }, ctx);
+    try {
+      expect(request).toHaveBeenCalledWith('share.start', expect.objectContaining({ kind: 'window', audio: true }));
+      expect(FakeRTCPeerConnection.instances).toHaveLength(1);
+      // RTCRtpSender.getCapabilities('video'): H.264 with packetization-mode 1 and RTX, the server's profile first.
+      expect(FakeRTCPeerConnection.last?.transceivers[0]?.codecPreferences.map((c) => c.mimeType)).toEqual([
+        'video/H264',
+        'video/H264',
+        'video/rtx',
+      ]);
+      expect(notify).toHaveBeenCalledWith('pc.offer', expect.objectContaining({ pc: 'pub', gen: 1, neg: 1 }));
+      // The page's share state machine follows (the default store).
+      expect(shareStore.getState().phase).toBe('starting');
+    } finally {
+      await share.stop();
+    }
+    expect(shareStore.getState().phase).toBe('idle');
+    expect(notify).toHaveBeenLastCalledWith('pc.close', { pc: 'pub', gen: 1 });
+  });
+
+  it('start() without an H.264 encoder says so before anything is sent', async () => {
+    uninstall = installFakeRTC({ h264: false, displayMedia: true });
+    const request = vi.fn();
+    const ctx = { signal: { request }, roomId: 'lounge' } as unknown as ShareContext;
+    await expect(
+      createBrowserSharing().start(fakePick('window', true), { preset: 'auto', withAudio: true }, ctx),
+    ).rejects.toMatchObject({ name: 'LocalError', code: 'h264_unavailable' });
+    expect(request).not.toHaveBeenCalled();
   });
 });
