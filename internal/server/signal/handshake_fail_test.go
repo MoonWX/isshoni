@@ -197,6 +197,20 @@ func TestHandshakeBearer(t *testing.T) {
 		}
 		expectFail(t, c2, protocol.ErrorCodeTooManyConnections, protocol.ErrorScopeConnection)
 
+		// At the cap a bearer hello still resumes the device's connection: a resume needs no slot (01 §10.3).
+		hr := h
+		hr.ResumeToken = w.ResumeToken
+		cr := e.mustDial(headers("", "", ""))
+		wr, err := cr.Hello(ctxT(t), hr)
+		if err != nil || !wr.Resumed || wr.ConnectionID != w.ConnectionID {
+			t.Fatalf("bearer resume at the cap: %v, resumed %v", err, wr.Resumed)
+		}
+		expectFail(t, c, protocol.ErrorCodeReplaced, protocol.ErrorScopeConnection)
+		synctest.Wait()
+		if _, _, preAuth, slots := signal.Counts(e.hub, id.UserID); preAuth != 0 || slots != 16 {
+			t.Errorf("pre-auth %d, slots %d after the resume; want 0 and 16", preAuth, slots)
+		}
+
 		// A transient bearer error is internal (1011), not unauthenticated.
 		e.auth.FailBearer(errors.New("database is locked"))
 		c3 := e.mustDial(headers("", "", ""))
@@ -304,26 +318,5 @@ func TestHandshakeSecondHello(t *testing.T) {
 			t.Errorf("re %q, want %q", re, id)
 		}
 		expectClose(t, c, protocol.CloseCodeProtocolViolation)
-	})
-}
-
-// A resume token is accepted but resumes nothing yet (README S28): a new connection, resumed false.
-func TestHandshakeResumeTokenNotResumed(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		e := newEnv(t)
-		defer e.close()
-		cookie, _ := e.user(false)
-		c, w := e.connect(cookie, signaltest.DefaultHello())
-		c.Close()
-		h := signaltest.DefaultHello()
-		h.ResumeToken = w.ResumeToken
-		_, w2 := e.connect(cookie, h)
-		if w2.Resumed || w2.ConnectionID == w.ConnectionID || w2.ResumeToken == w.ResumeToken {
-			t.Errorf("resumed %v, same id %v, same token %v", w2.Resumed, w2.ConnectionID == w.ConnectionID,
-				w2.ResumeToken == w.ResumeToken)
-		}
-		if got := e.metric("isshoni_ws_resume_total", "result", "not_resumed"); got != 1 {
-			t.Errorf("isshoni_ws_resume_total{not_resumed} %v, want 1", got)
-		}
 	})
 }

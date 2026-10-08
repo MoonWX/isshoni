@@ -1,0 +1,57 @@
+/*
+ * The root and the live region inside it (.text) stay in the page, and in the accessibility tree, while there is
+ * nothing to say: empty blocks take no space. The root looks like a banner (.banner) only while it has a text.
+ */
+.region {
+  flex: none;
+}
+
+.banner {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-3);
+  align-items: center;
+  justify-content: center;
+  min-height: var(--tap-target);
+  padding: var(--space-2) calc(var(--space-4) + var(--safe-right)) var(--space-2)
+    calc(var(--space-4) + var(--safe-left));
+  font-size: var(--text-sm);
+  color: var(--color-text);
+  background-color: var(--color-surface-2);
+  border-bottom: var(--border-width) solid var(--color-border);
+}
+
+/* Only "Can't reach the server" is styled as a problem; "Server restarting…" and "Reconnecting…" are not. */
+.unreachable {
+  border-bottom-color: var(--color-warning);
+}
+
+.unreachable .icon {
+  color: var(--color-warning);
+}
+
+.icon {
+  flex: none;
+  width: 1.125rem;
+  height: 1.125rem;
+  color: var(--color-text-muted);
+}
+
+.text {
+  min-width: 0;
+  font-weight: var(--weight-medium);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+/* Windows High Contrast: the background fill disappears, so the edge must stay visible. */
+@media (forced-colors: active) {
+  .banner {
+    border-bottom-color: CanvasText;
+  }
+}

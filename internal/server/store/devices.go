@@ -99,6 +99,12 @@ func (q *Q) DeleteDeviceCodesOf(u UserID) error {
 	return err
 }
 
+// DeleteAllDeviceCodes deletes every device code, the ones nobody decided included (03 §4.6: the session key
+// changed, so no code can turn into a token that still works), and returns how many there were.
+func (q *Q) DeleteAllDeviceCodes() (int, error) {
+	return q.execCount("delete all device codes", `DELETE FROM device_codes`)
+}
+
 // CreateDeviceCode inserts a pending device code. Later (M2).
 func (q *Q) CreateDeviceCode(dc DeviceCode) error { return notImplemented("CreateDeviceCode") }
 

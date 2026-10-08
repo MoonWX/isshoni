@@ -9,6 +9,8 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/coder/websocket"
+
 	"github.com/MoonWX/isshoni/internal/protocol"
 	"github.com/MoonWX/isshoni/internal/server/signal"
 	"github.com/MoonWX/isshoni/internal/server/signal/signaltest"
@@ -243,7 +245,9 @@ func TestUpgradePreAuthGlobal(t *testing.T) {
 	})
 }
 
-// The 17th cookie upgrade of one user is accepted and then gets too_many_connections and 4429.
+// The 17th cookie upgrade of one user is accepted and then gets too_many_connections and 4429. The error is the
+// reply to the socket's hello: the hub waits for the hello, because one that resumes a connection of the user needs
+// no slot (TestResumeAtTheCap).
 func TestUpgradeConnectionsPerUser(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		e := newEnv(t)
@@ -260,19 +264,38 @@ func TestUpgradeConnectionsPerUser(t *testing.T) {
 			clients = append(clients, c)
 		}
 		c17 := e.mustDial(headers(cookie, testOrigin, ""))
-		e17 := expectFail(t, c17, protocol.ErrorCodeTooManyConnections, protocol.ErrorScopeConnection)
-		if e17.Retryable {
-			t.Errorf("too_many_connections is retryable")
+		synctest.Wait()
+		expectOpen(t, c17) // nothing before its hello
+		if slots, over := slotsOf(e, id), signal.OverCap(e.hub, id.UserID); slots != 16 || over != 1 {
+			t.Errorf("%d slots, %d sockets waiting at the cap; want 16 and 1", slots, over)
 		}
-		if _, _, _, slots := signal.Counts(e.hub, id.UserID); slots != 16 {
-			t.Errorf("%d slots, want 16", slots)
+		reqID := request(t, c17, protocol.MessageTypeHello, signaltest.DefaultHello())
+		e17, re := expectError(t, c17, protocol.ErrorCodeTooManyConnections, protocol.ErrorScopeConnection)
+		if e17.Retryable || re != reqID {
+			t.Errorf("too_many_connections retryable %v, re %q (want %q)", e17.Retryable, re, reqID)
+		}
+		expectClose(t, c17, protocol.CloseCodeRateLimited)
+		synctest.Wait()
+		if slots, over := slotsOf(e, id), signal.OverCap(e.hub, id.UserID); slots != 16 || over != 0 {
+			t.Errorf("%d slots, %d sockets waiting at the cap; want 16 and 0", slots, over)
 		}
 
-		// Another user is not affected, and a closed connection frees a slot.
+		// Another user is not affected. A connection whose socket just drops keeps its slot for the grace; one that
+		// the client closes on purpose frees it at once.
 		other, _ := e.user(false)
 		e.connect(other, signaltest.DefaultHello())
 		clients[0].Close()
 		synctest.Wait()
+		if slots := slotsOf(e, id); slots != 16 {
+			t.Errorf("%d slots after a socket dropped, want 16 (the connection is detached)", slots)
+		}
+		if err := clients[1].CloseWith(websocket.StatusNormalClosure); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if slots := slotsOf(e, id); slots != 15 {
+			t.Errorf("%d slots after a deliberate close, want 15", slots)
+		}
 		c, err := e.dial(signaltest.DialOptions{Header: headers(cookie, testOrigin, "")})
 		if err != nil {
 			t.Fatal(err)
@@ -280,7 +303,25 @@ func TestUpgradeConnectionsPerUser(t *testing.T) {
 		if _, err := c.Hello(ctxT(t), signaltest.DefaultHello()); err != nil {
 			t.Fatalf("hello after a slot was freed: %v", err)
 		}
+		// The six sockets that never said hello give their slots back at the hello timeout, the dropped connection
+		// when its grace ends.
+		time.Sleep(11 * time.Second)
+		synctest.Wait()
+		if slots := slotsOf(e, id); slots != 10 {
+			t.Errorf("%d slots after the hello timeout, want 10", slots)
+		}
+		time.Sleep(grace - 11*time.Second)
+		synctest.Wait()
+		if slots := slotsOf(e, id); slots != 9 {
+			t.Errorf("%d slots after the grace, want 9", slots)
+		}
 	})
+}
+
+// slotsOf returns the per-user slots that id's connections and handshaking sockets hold.
+func slotsOf(e *env, id signal.Identity) int {
+	_, _, _, slots := signal.Counts(e.hub, id.UserID)
+	return slots
 }
 
 // A transient authentication error gets 503; a hub that shuts down refuses upgrades with 503.

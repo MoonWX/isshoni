@@ -817,6 +817,23 @@ func TestDevicesM1(t *testing.T) {
 	if n := queryInt(t, db, "SELECT count(*) FROM devices WHERE id = 'd4'"); n != 1 {
 		t.Error("Sam's device was deleted")
 	}
+
+	// DeleteAllDeviceCodes (03 §4.6, a changed session key) also takes the code nobody decided; devices stay.
+	mustWrite(t, db, func(q *Q) error {
+		if n, err := q.DeleteAllDeviceCodes(); err != nil || n != 2 {
+			t.Errorf("DeleteAllDeviceCodes = %d, %v, want 2", n, err)
+		}
+		if n, err := q.DeleteAllDeviceCodes(); err != nil || n != 0 {
+			t.Errorf("a second DeleteAllDeviceCodes = %d, %v, want 0", n, err)
+		}
+		return nil
+	})
+	if n := queryInt(t, db, "SELECT count(*) FROM device_codes"); n != 0 {
+		t.Errorf("device codes left = %d, want 0", n)
+	}
+	if n := queryInt(t, db, "SELECT count(*) FROM devices WHERE id = 'd4'"); n != 1 {
+		t.Error("DeleteAllDeviceCodes deleted a device")
+	}
 }
 
 func TestSetupTokens(t *testing.T) {
@@ -965,19 +982,21 @@ func TestReadRejectsEveryWrite(t *testing.T) {
 				return q.CreateSession(&Session{UserID: alex.ID, TokenHash: []byte("x"), IdleExpiresAt: now,
 					ExpiresAt: now})
 			},
-			"RotateSession":       func() error { return q.RotateSession(s.ID, []byte("y"), now, now) },
-			"TouchSession":        func() error { return q.TouchSession(s.ID, "", now, now) },
-			"DeleteSession":       func() error { _, err := q.DeleteSession(alex.ID, s.ID); return err },
-			"DeleteSessions":      func() error { _, err := q.DeleteSessions(alex.ID, ""); return err },
-			"TrimSessions":        func() error { _, err := q.TrimSessions(alex.ID, 0); return err },
-			"DeleteDevice":        func() error { _, err := q.DeleteDevice(alex.ID, "d"); return err },
-			"DeleteDevices":       func() error { _, err := q.DeleteDevices(alex.ID); return err },
-			"DeleteDeviceCodesOf": func() error { return q.DeleteDeviceCodesOf(alex.ID) },
-			"ReplaceSetupToken":   func() error { return q.ReplaceSetupToken([]byte("s"), now, now) },
-			"DeleteSetupTokens":   func() error { return q.DeleteSetupTokens() },
-			"CreateInvite":        func() error { return q.CreateInvite(&inv) },
-			"RevokeInvite":        func() error { return q.RevokeInvite("i", alex.ID, now) },
-			"UseInvite":           func() error { return q.UseInvite("i", now) },
+			"RotateSession":        func() error { return q.RotateSession(s.ID, []byte("y"), now, now) },
+			"TouchSession":         func() error { return q.TouchSession(s.ID, "", now, now) },
+			"DeleteSession":        func() error { _, err := q.DeleteSession(alex.ID, s.ID); return err },
+			"DeleteSessions":       func() error { _, err := q.DeleteSessions(alex.ID, ""); return err },
+			"TrimSessions":         func() error { _, err := q.TrimSessions(alex.ID, 0); return err },
+			"DeleteDevice":         func() error { _, err := q.DeleteDevice(alex.ID, "d"); return err },
+			"DeleteDevices":        func() error { _, err := q.DeleteDevices(alex.ID); return err },
+			"DeleteDeviceCodesOf":  func() error { return q.DeleteDeviceCodesOf(alex.ID) },
+			"DeleteAllDeviceCodes": func() error { _, err := q.DeleteAllDeviceCodes(); return err },
+			"ReplaceSetupToken":    func() error { return q.ReplaceSetupToken([]byte("s"), now, now) },
+			"DeleteSetupTokens":    func() error { return q.DeleteSetupTokens() },
+			"CreateInvite":         func() error { return q.CreateInvite(&inv) },
+			"RevokeInvite":         func() error { return q.RevokeInvite("i", alex.ID, now) },
+			"DeleteAllInvites":     func() error { _, err := q.DeleteAllInvites(); return err },
+			"UseInvite":            func() error { return q.UseInvite("i", now) },
 			"ReplacePasswordReset": func() error {
 				return q.ReplacePasswordReset(PasswordReset{TokenHash: []byte("r"), UserID: alex.ID, ExpiresAt: now})
 			},

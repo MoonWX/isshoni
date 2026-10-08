@@ -593,15 +593,17 @@ export const KindReply: MsgKind = 2; // welcome, ok and error (an error without 
 export const KindNotification: MsgKind = 3; // no id, no reply
 /**
  * Spec describes one message type (and direction); Registry is the single list used by the hub's dispatcher,
- * the tests (every Spec has a fixture) and the TS generator.
+ * the tests (every Spec has a fixture) and the TS generator. Spec is Go-only and never on the wire (the web app
+ * uses registry.gen.ts), but tygo still emits it into types.gen.ts: the tstype tags type Payload and Result as
+ * unknown there, not any.
  */
 export interface Spec {
   Type: MessageType;
   Dir: Direction;
   Kind: MsgKind;
-  Payload: any; // zero value of the payload type, e.g. RoomJoin{}; nil for ok (the request's Result applies)
+  Payload: unknown; // zero value of the payload type, e.g. RoomJoin{}; nil for ok (the request's Result applies)
   Reply: MessageType; // requests: MessageTypeOK, or MessageTypeWelcome for hello
-  Result: any; // requests: zero value of the reply payload (Empty{} if none)
+  Result: unknown; // requests: zero value of the reply payload (Empty{} if none)
   Roles: Role[]; // client->server: allowed roles; nil = all (for pc.* the PC kind decides: Role.AllowsPC)
   Feature: Feature; // "" = baseline
   Since: number /* int */; // protocol version that introduced it

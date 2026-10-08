@@ -21,6 +21,12 @@
       "title": "Something went wrong",
       "body": "This page stopped working. Reload to try again."
     },
+    "update": {
+      "label": "App update",
+      "ready": "Update ready",
+      "afterSharing": "Update ready. Reload after you stop sharing.",
+      "announce": "A new version of isshoni is ready. Reload to update."
+    },
     "screens": {
       "offline": {
         "title": "Can't reach the server",
@@ -68,12 +74,360 @@
       }
     }
   },
+  "viewer": {
+    "shares": "Shares",
+    "sharesButton": "Shares ({{count}})",
+    "watching_one": "{{count}} watching",
+    "watching_other": "{{count}} watching",
+    "you": "You",
+    "someone": "Someone",
+    "empty": "Nobody is sharing yet.",
+    "live": "You're live · {{watching}}",
+    "pick": "Pick a share to watch.",
+    "kind": {
+      "screen": "Screen",
+      "window": "Window",
+      "tab": "Tab"
+    },
+    "title": {
+      "screen": "{{name}}'s screen",
+      "window": "{{name}}'s window",
+      "tab": "{{name}}'s tab",
+      "ownScreen": "Your screen",
+      "ownWindow": "Your window",
+      "ownTab": "Your tab",
+      "labeled": "{{name}}: {{label}}"
+    },
+    "tile": {
+      "watch": "Watch {{title}}, {{watching}}",
+      "watchOwn": "Watch your share from another device, {{watching}}",
+      "preview": "Show your preview on the stage, {{watching}}"
+    },
+    "stage": {
+      "watching": "Now watching: {{title}}",
+      "preview": "Your preview: {{title}}",
+      "none": "Stage",
+      "controls": "Stage controls"
+    },
+    "state": {
+      "connecting": "Connecting…",
+      "stalled": "Connection unstable",
+      "codec": "Your browser is still getting its video decoder (Firefox does this once, about a minute). Retrying…",
+      "bandwidth": "Lower quality (your connection)",
+      "unavailable": "The sharer isn't sending this quality right now",
+      "reduced": "Lower quality"
+    },
+    "media": {
+      "unreachable": "Can't reach the server's media port. isshoni keeps trying.",
+      "test": "Test my connection"
+    },
+    "toast": {
+      "started": "{{name}} started sharing",
+      "watch": "Watch"
+    }
+  },
+  "share": {
+    "button": "Share",
+    "label": {
+      "screen": "Screen",
+      "window": "Window",
+      "tab": "Tab"
+    },
+    "preset": {
+      "legend": "What are you sharing?",
+      "auto": {
+        "name": "Auto",
+        "hint": "A good balance for most things"
+      },
+      "game": {
+        "name": "Game",
+        "hint": "Smooth motion comes first"
+      },
+      "movie": {
+        "name": "Movie",
+        "hint": "Smooth motion, and better sound"
+      },
+      "text": {
+        "name": "Text",
+        "hint": "Sharp text comes first"
+      }
+    },
+    "sheet": {
+      "title": "Share your screen",
+      "tip": "Recommended: pick a <b>Window</b> and keep <b>Share audio</b> on. Friends hear only that window.",
+      "bestInChrome": "Sharing works best in Chrome or Edge.",
+      "desktopApp": "Get the desktop app (keeps Discord out of your audio)",
+      "share": "Share",
+      "elsewhere": "You're already sharing from another tab or device",
+      "stopElsewhere": "Stop it"
+    },
+    "warning": {
+      "title": "Share all sound on this computer?",
+      "body": "Friends will hear everything on this computer, including your voice app (Discord, TeamSpeak…), so they'll hear themselves.",
+      "why": "Screen sharing in a browser can't leave apps out: Discord's own screen share on the web has the same problem. The isshoni desktop app keeps voice apps out of the sound.",
+      "withoutSound": "Share without sound",
+      "withSound": "Share with sound anyway",
+      "pickAgain": "Pick something else",
+      "desktopApp": "Get the desktop app"
+    },
+    "note": {
+      "windowNoAudio": "This window's sound isn't shared (needs Windows 11 or macOS 14.2+ and a current Chrome/Edge)",
+      "tabNoAudio": "Tick 'Also share tab audio' to include sound",
+      "screenNoAudio": "No sound is shared"
+    },
+    "unavailable": {
+      "phone": "Sharing from phones needs the app (coming later)"
+    }
+  },
+  "room": {
+    "connection": {
+      "reconnecting": "Reconnecting…",
+      "unreachable": "Can't reach the server. Retrying…",
+      "restarting": "Server restarting…",
+      "retryNow": "Retry now",
+      "retryIn_one": "Retry in {{count}} second",
+      "retryIn_other": "Retry in {{count}} seconds",
+      "testConnection": "Test my connection",
+      "reconnected": "Reconnected"
+    },
+    "event": {
+      "joined": "{{name}} joined",
+      "left": "{{name}} left",
+      "disconnected": "{{name}} disconnected",
+      "shareStarted": "{{name}} started sharing",
+      "shareStopped": "{{name}} stopped sharing",
+      "shareEnded": "{{name}}'s share ended"
+    }
+  },
+  "auth": {
+    "username": "Username",
+    "password": "Password",
+    "newPassword": "New password",
+    "showPassword": "Show password",
+    "usernameHint": "{{min}} to {{max}} characters: letters and numbers, with single dots, dashes or underscores in between.",
+    "passwordHint": "At least {{min}} characters. A few unrelated words work well.",
+    "serverBusyWait_one": "The server is busy. Try again in {{count}} second.",
+    "serverBusyWait_other": "The server is busy. Try again in {{count}} seconds.",
+    "sessionNotKept": "That worked, but this browser didn't keep you signed in. Allow cookies for this site, then log in.",
+    "checkingLink": "Checking the link",
+    "tryAgain": "Try again",
+    "haveAccount": "Already have an account? <a>Log in</a>",
+    "login": {
+      "title": "Log in to {{server}}",
+      "submit": "Log in",
+      "forgot": "Forgot your password? Ask an admin for a reset link.",
+      "needAccount": "Need an account? Ask a friend for an invite link.",
+      "needAccountApproval": "Need an account? <a>Request one</a>",
+      "trust": {
+        "heading": "Before you log in",
+        "server": "This server is trusted: whoever runs it could see the streams.",
+        "noRecording": "Nothing is recorded, and nobody watches unseen.",
+        "noTelemetry": "No telemetry.",
+        "more": "How isshoni handles privacy"
+      }
+    },
+    "invite": {
+      "title": "{{inviter}} invited you to {{server}}",
+      "titleNoInviter": "You're invited to {{server}}",
+      "lead": "Pick a username and a password to join.",
+      "submit": "Create account",
+      "signedIn": {
+        "title": "You're already in",
+        "body": "You're signed in as {{username}}.",
+        "go": "Go to isshoni",
+        "switch": "Sign out and create another account"
+      },
+      "noToken": {
+        "title": "This invite link is incomplete",
+        "body": "Open the whole link you were sent, including the part after the # sign."
+      },
+      "dead": {
+        "title": "This invite link doesn't work"
+      }
+    },
+    "signup": {
+      "title": "Request an account",
+      "lead": "An admin of {{server}} reviews every request before you can log in.",
+      "submit": "Send request"
+    },
+    "pending": {
+      "title": "Request sent",
+      "body": "An admin will review your request. Try logging in later.",
+      "back": "Back to log in"
+    },
+    "reset": {
+      "title": "Choose a new password",
+      "lead": "An admin of {{server}} made this link for you. Saving the new password logs you in.",
+      "submit": "Save and log in",
+      "noToken": {
+        "title": "This reset link is incomplete",
+        "body": "Open the whole link your admin sent you, including the part after the # sign."
+      },
+      "dead": {
+        "title": "This reset link doesn't work"
+      }
+    },
+    "logout": {
+      "failed": "Couldn't sign out. {{reason}}"
+    },
+    "about": {
+      "title": "About isshoni",
+      "lead": "Watch your friends' screens together, on a server one of you runs.",
+      "versions": {
+        "heading": "Versions",
+        "serverName": "Server",
+        "server": "Server version",
+        "page": "This page"
+      },
+      "trust": {
+        "heading": "Privacy and trust",
+        "server": "The server is trusted. Video and sound are encrypted on the way, but the server passes them on, so whoever runs it could see the streams.",
+        "noRecording": "There is no recording, and there are no hidden viewers: an admin who watches shows up in the viewer list like everyone else.",
+        "stored": "The server stores usernames and password hashes, your sign-ins with their last-seen time and IP address, invites, rooms, notification subscriptions, and a log of logins and admin actions that is pruned after 30 days.",
+        "local": "Window titles never leave your device. Friends see a share as a screen, a window or a tab.",
+        "noTelemetry": "No telemetry: the server reports nothing about you or itself to the isshoni project. The privacy page lists every connection the server makes."
+      },
+      "links": {
+        "heading": "More",
+        "privacy": "Privacy, in full",
+        "codeSigning": "Code-signing policy",
+        "licenses": "Open-source licenses",
+        "site": "Project site"
+      },
+      "back": "Back to isshoni"
+    }
+  },
+  "setup": {
+    "steps": {
+      "label": "Setup",
+      "admin": "Create the admin",
+      "conntest": "Connection test",
+      "invite": "Invite friends"
+    },
+    "admin": {
+      "title": "Create the admin account",
+      "lead": "This account runs the server: it invites friends and changes the settings.",
+      "serverName": "Server name",
+      "serverNameHint": "Optional. Friends see it on their invite. You can change it later.",
+      "submit": "Create account"
+    },
+    "noToken": {
+      "title": "Open the setup link",
+      "body": "This page needs the one-time setup link. On the server, run:",
+      "docker": "With Docker:",
+      "after": "Then open the link it prints."
+    },
+    "tokenInvalid": {
+      "title": "This setup link doesn't work anymore",
+      "body": "It was replaced or has expired. For a new one, run this on the server:",
+      "docker": "With Docker:",
+      "after": "Then open the link it prints."
+    },
+    "done": {
+      "title": "This server is already set up",
+      "body": "An admin account exists. Log in with it, or ask the admin for an invite.",
+      "logIn": "Log in"
+    }
+  },
   "a11y": {
     "notifications": "Notifications",
     "dismiss": "Dismiss",
     "loading": "Loading",
     "stepOf": "Step {{current}} of {{total}}:",
     "stepDoneOf": "Step {{current}} of {{total}}, done:"
+  },
+  "push": {
+    "generic": {
+      "title": "isshoni",
+      "body": "Something new on your server. Tap to open isshoni."
+    }
+  },
+  "conntest": {
+    "title": "Connection test",
+    "intro": "This checks whether video can travel between this device and the server, the same way it does in a room.",
+    "start": "Test my connection",
+    "again": "Test again",
+    "running": "Testing your connection… This takes up to 10 seconds.",
+    "rows": {
+      "udp": "Media over UDP (port {{port}})",
+      "udpNoPort": "Media over UDP",
+      "tcp": "Media over TCP (port {{port}})",
+      "rtt": "Round trip"
+    },
+    "state": {
+      "ok": "Works",
+      "failed": "Blocked",
+      "off": "Turned off",
+      "not_tested": "Not tested"
+    },
+    "udpDisabled": "UDP media is turned off in the server config (<code>listen.ice_udp</code>).",
+    "rtt": {
+      "good": "{{ms}} ms, good",
+      "ok": "{{ms}} ms, OK",
+      "high": "{{ms}} ms, high latency",
+      "none": "Not measured"
+    },
+    "status": {
+      "green": "Friends get the best quality.",
+      "amber": "Works, but video may stutter on weak networks.",
+      "red": "Friends can't receive video yet."
+    },
+    "incomplete": "Couldn't finish the test. Try again in a minute.",
+    "incompleteWait_one": "Couldn't finish the test. Try again in {{count}} second.",
+    "incompleteWait_other": "Couldn't finish the test. Try again in {{count}} seconds.",
+    "error": "The test couldn't run. {{message}}",
+    "fixTitle": "How to fix it",
+    "openUdp": "Open UDP port {{udpPort}}.",
+    "noPublicIp": "The server doesn't know its public address, so browsers can't reach its media ports. Set <code>public_ip</code> in <code>/etc/isshoni/isshoni.toml</code> (Docker: <code>ISSHONI_PUBLIC_IP</code> in <code>.env</code>) and restart.",
+    "nat": {
+      "none": "This server has its public address on its own network interface, so no router or NAT is in the way.",
+      "one_to_one": "This server is behind 1:1 NAT (a cloud network or a container). Open the ports in the provider's firewall. In a container, also publish them. At home, also forward TCP 80, 443, {{tcpPort}} and UDP {{udpPort}} on your router to this machine.",
+      "port_forward": "Forward TCP 80, 443, {{tcpPort}} and UDP {{udpPort}} on your router to this machine.",
+      "symmetric": "This server has no public address; isshoni needs one (a VPS or a router port forward).",
+      "cgnat_likely": "This server has no public address; isshoni needs one (a VPS or a router port forward).",
+      "unknown": "isshoni couldn't tell how this server reaches the internet. Run <code>isshoni doctor</code> on the server for details."
+    },
+    "ownNetwork": "You may be testing from the server's own network. Test again from your phone's mobile data.",
+    "docker": "Check that compose publishes <code>{{udpPort}}:{{udpPort}}/udp</code>; published ports bypass ufw.",
+    "macLocalNetwork": "On a Mac, allow your browser Local Network access (System Settings → Privacy & Security → Local Network).",
+    "blockedNetwork": "If this network blocks UDP (some offices and hotels do), test from home or from your phone's mobile data.",
+    "sendToAdmin": "Send this to your admin:",
+    "copyResult": "Copy result",
+    "copyManually": "Couldn't copy for you. Select this text and copy it:",
+    "help": {
+      "title": "Troubleshooting",
+      "udp_blocked": "UDP is blocked",
+      "no_media": "No media connection at all",
+      "no_public_ip": "The server doesn't know its public address",
+      "tcp443_blocked": "TCP port 443 doesn't carry media",
+      "high_rtt": "High latency",
+      "nat_port_forward": "Port forwarding on a home router",
+      "nat_cgnat": "A server without a public address",
+      "mac_local_network": "Local Network access on a Mac",
+      "docker_ports": "Publishing ports from Docker"
+    }
+  },
+  "fix": {
+    "firewall": {
+      "aws": "In the AWS console, add inbound rules to this instance's security group: UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates.",
+      "gcp": "In the Google Cloud console, add a VPC firewall rule that allows incoming UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates.",
+      "azure": "In the Azure portal, add inbound rules to this VM's network security group: UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates.",
+      "oracle": "In the Oracle Cloud console, add ingress rules to the subnet's security list: UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates. Oracle's images also block these ports with their own iptables rules, so open them on the server too.",
+      "hetzner": "In the Hetzner Cloud console, check the Cloud Firewall attached to this server: allow incoming UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates.",
+      "digitalocean": "In the DigitalOcean control panel, check the Cloud Firewall assigned to this Droplet: allow incoming UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates.",
+      "vultr": "In the Vultr customer portal, check the Cloud Firewall group linked to this instance: allow incoming UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates.",
+      "linode": "In Akamai Cloud Manager, check the Cloud Firewall attached to this Linode: allow incoming UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates.",
+      "scaleway": "In the Scaleway console, add inbound rules to this instance's security group: UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates.",
+      "ovh": "In the OVHcloud control panel, add inbound rules to this instance's security group: UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates.",
+      "alibaba": "In the Alibaba Cloud console, add inbound rules to this instance's security group: UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates.",
+      "tencent": "In the Tencent Cloud console, add inbound rules to this instance's security group: UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates.",
+      "unknown": "Open these ports in your provider's firewall or security group: UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates."
+    },
+    "hostFirewall": {
+      "ufw": "On the server, if it uses ufw (Ubuntu, Debian):",
+      "firewalld": "On the server, if it uses firewalld (Fedora, RHEL):"
+    },
+    "providerGuide": "Firewall guide for this provider"
   },
   "errors": {
     "unknown": "Something went wrong ({{code}}).",
@@ -171,6 +525,27 @@
       "h264_unavailable": "This browser can't send H.264 video. Use Chrome or Edge.",
       "webrtc_failed": "Couldn't set up the video connection.",
       "offline": "You're offline. Check your connection."
+    }
+  },
+  "fieldErrors": {
+    "username": {
+      "required": "Enter a username.",
+      "too_short": "That's too short for a username.",
+      "too_long": "That's too long for a username.",
+      "invalid": "Use letters and numbers, with single dots, dashes or underscores in between.",
+      "reserved": "That username is reserved. Pick another."
+    },
+    "password": {
+      "required": "Enter a password.",
+      "too_short": "That's too short for a password.",
+      "too_long": "That's too long for a password.",
+      "invalid": "That password has characters that can't be used.",
+      "too_common": "That password is too common. Pick one that's harder to guess.",
+      "same_as_username": "Your password can't be your username."
+    },
+    "serverName": {
+      "too_long": "That's too long for a name.",
+      "invalid": "That name has characters that can't be used."
     }
   }
 }

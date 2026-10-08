@@ -84,8 +84,9 @@ export interface Platform {
 /**
  * The part of 01's SignalClient (protocol/signal-client.ts, S20) that sharing uses, as a structural type: SignalClient
  * satisfies it, and platform/ doesn't depend on the class. The signatures are SignalClient's own (01 §16): request()
- * never sends hello (the client does), and a listener gets the envelope of its own message type. Once
- * signal-client.ts is on this branch, ShareContext.signal can be SignalClient itself (05 §8).
+ * never sends hello (the client does), and a listener gets the envelope of its own message type.
+ * ShareContext.signal stays this structural type (05 §8); types.test.ts checks at compile time that SignalClient
+ * fits it.
  */
 export interface SignalClientLike {
   request<K extends Exclude<keyof ClientRequests, typeof MessageTypeHello>>(

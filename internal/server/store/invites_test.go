@@ -97,6 +97,58 @@ func TestInviteCRUD(t *testing.T) {
 	})
 }
 
+// TestDeleteAllInvites: every invite goes, whatever its state (03 §4.6, a changed invite key); the accounts made
+// with one stay and lose the reference.
+func TestDeleteAllInvites(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	db := e.open(nil)
+	t0 := e.clock.Now()
+	alex := e.newUser(db, "Alex", func(u *User) { u.Role = RoleAdmin })
+	active := Invite{TokenHash: []byte("a"), CreatedBy: &UserRef{ID: alex.ID, Username: "Alex"},
+		ExpiresAt: t0.Add(time.Hour), MaxUses: 5}
+	revoked := Invite{TokenHash: []byte("b"), ExpiresAt: t0.Add(time.Hour), MaxUses: 5}
+	expired := Invite{TokenHash: []byte("c"), ExpiresAt: t0, MaxUses: 5}
+	mustWrite(t, db, func(q *Q) error {
+		for _, inv := range []*Invite{&active, &revoked, &expired} {
+			if err := q.CreateInvite(inv); err != nil {
+				return err
+			}
+		}
+		if err := q.UseInvite(active.ID, t0); err != nil {
+			return err
+		}
+		return q.RevokeInvite(revoked.ID, alex.ID, t0)
+	})
+	sam := e.newUser(db, "Sam", func(u *User) { u.InviteID = active.ID })
+
+	mustWrite(t, db, func(q *Q) error {
+		if n, err := q.DeleteAllInvites(); err != nil || n != 3 {
+			t.Errorf("DeleteAllInvites = %d, %v, want 3", n, err)
+		}
+		if list, err := q.ListInvites("", true); err != nil || len(list) != 0 {
+			t.Errorf("invites left: %+v, %v", list, err)
+		}
+		if _, err := q.InviteByTokenHash([]byte("a")); !errors.Is(err, ErrNotFound) {
+			t.Errorf("InviteByTokenHash after the delete = %v, want ErrNotFound", err)
+		}
+		got, err := q.UserByID(sam.ID)
+		if err != nil {
+			return err
+		}
+		if got.InviteID != "" || got.CreatedVia != "invite" || got.Status != StatusActive {
+			t.Errorf("the invited user after the delete: %+v, want the account kept without its invite", got)
+		}
+		if n, err := q.DeleteAllInvites(); err != nil || n != 0 {
+			t.Errorf("a second DeleteAllInvites = %d, %v, want 0", n, err)
+		}
+		return nil
+	})
+	if n := queryInt(t, db, "SELECT count(*) FROM users"); n != 2 {
+		t.Errorf("%d users after DeleteAllInvites, want 2", n)
+	}
+}
+
 func TestUseInvite(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)

@@ -1,0 +1,43 @@
+/* Under the card, left-aligned (the footer of CenteredPage centers its children). */
+.trust {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  align-self: stretch;
+  padding-inline: var(--space-2);
+  text-align: start;
+}
+
+/* Only as wide as its text: the row beside a link isn't a click target. */
+.trust > a {
+  align-self: flex-start;
+}
+
+.heading {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.lines {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  list-style: none;
+}
+
+.lines li {
+  display: flex;
+  gap: var(--space-2);
+  align-items: flex-start;
+  text-wrap: pretty;
+}
+
+.lines svg {
+  flex: none;
+  width: 1rem;
+  height: 1rem;
+  /* Lines the icon up with the first line of text. */
+  margin-top: 0.1875rem;
+}

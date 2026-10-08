@@ -842,6 +842,7 @@ func (q *Q) ListDevices(u UserID) ([]Device, error)
 func (q *Q) DeleteDevice(u UserID, id DeviceID) (bool, error)
 func (q *Q) DeleteDevices(u UserID) ([]DeviceID, error)
 func (q *Q) DeleteDeviceCodesOf(u UserID) error
+func (q *Q) DeleteAllDeviceCodes() (int, error) // §4.6: session key rotated; also the codes nobody decided
 func (q *Q) CreateDeviceCode(dc DeviceCode) error                                  // later (M2)
 func (q *Q) DeviceCodeByHash(h []byte) (DeviceCode, error)                         // later (M2)
 func (q *Q) DeviceCodeByUserCode(h []byte) (DeviceCode, error)                     // later (M2)
@@ -865,6 +866,7 @@ func (q *Q) InviteByID(id InviteID) (Invite, error)
 func (q *Q) ListInvites(createdBy UserID /* "" = all */, includeInactive bool) ([]Invite, error) // active = at Options.Clock
 func (q *Q) CountActiveInvites(createdBy UserID /* "" = all */, now time.Time) (int, error)
 func (q *Q) RevokeInvite(id InviteID, by UserID, now time.Time) error
+func (q *Q) DeleteAllInvites() (int, error) // §4.6: invite key rotated; users.invite_id becomes NULL
 // UseInvite: UPDATE … SET uses = uses + 1 WHERE id = ? AND revoked_at IS NULL AND expires_at > now AND uses < max_uses.
 // 0 rows → ErrInviteUnusable. Callers run it in the same Write as CreateUser.
 func (q *Q) UseInvite(id InviteID, now time.Time) error
@@ -1462,7 +1464,15 @@ type AdminAlerter interface {
 type ReqMeta struct {
 	IP        netip.Addr
 	UserAgent string // only turned into a session name
+	// The session cookie the request arrived with, "" for none. The calls that open a session (Login and
+	// CompleteSetup; later Register and CompletePasswordReset) take no request, so the old cookie travels here: they
+	// delete that session in the Write that creates the new one and close its connections (§7.4, §7.7). Never
+	// printed, logged or marshalled.
+	SessionToken string `json:"-"`
 }
+
+// RequestMeta builds the ReqMeta of r (Options.ClientIP, the User-Agent header, the session cookie). Handlers use it.
+func (s *Service) RequestMeta(r *http.Request) ReqMeta
 
 type Link struct {
 	URL       string
@@ -1653,10 +1663,32 @@ Fields:{...}}`, and a pinned field gets 409 `setting_locked`. The new values and
 (with `{changes:{field:{from,to}}}`) are written in one `Write`. After the commit, the cache swaps and `OnChange`
 callbacks run.
 
+What a patch does in the cases the paragraph above leaves open (S23's choices; `UpdateTx` behaves the same):
+- **`null` is invalid.** A field sent as `null` gets the field code `invalid`, like a value of the wrong type. PATCH
+  is a merge: an absent field keeps its value, and a field is reset by sending its default, which deletes its row
+  (only non-default values are stored). Unknown names are ignored (§12.1).
+- **A pinned field is refused even with the same value.** A patch that names a pinned field gets 409
+  `setting_locked` with `params.field`, whatever value it sends, also the value in force. This is checked before
+  any value, so it wins over `validation_failed`; with several pinned fields the first in the struct's order is
+  named. Clients leave pinned fields out of a patch (05 shows them read-only from `locked`).
+- **A no-op patch writes no audit row.** Only the fields whose value differs are written and listed in `changes`.
+  A patch that changes nothing (empty, only unknown names, or only values already in force) writes no row and no
+  `settings.changed` entry, runs no `OnChange` callback and returns the current settings. One repair rides on it:
+  a stored row whose value fails validation (`Open` skips it with a WARN and the default applies) is removed when a
+  patch sends that field's default, without an audit row, since the effective value stays.
+- **The audit detail stays within 1 KiB** (§6 `AuditEntry.Detail`). When `{changes: …}` would be larger (a long
+  server name among many changes), the text values are cut to 32 runes plus `…` and `"truncated": true` is added;
+  if that is still too large they are cut to 8 runes and then to `…` alone. Numbers and booleans stay. Every changed
+  field so stays in `changes`, and the security-event query still finds `changes.registrationMode` (§10).
+
 `Pin` runs the same validation as `Update`. On failure it returns
 `*api.Error{validation_failed, Fields:{<json name>: <field code>}}`, which 04 reports as a config error naming the TOML
-key, its source and the field code (exit 78). `Defaults()` is the single source of policy defaults: 04's config
-registry repeats them only for documentation and `config example`, and a wiring test checks that they match.
+key, its source and the field code (exit 78). An unknown field name is a plain error. **`Pin` runs the `OnChange`
+callbacks** when it changes the effective settings, like a committed `Update`; pinning the value already in force
+runs none. `Pin` never writes the DB: the stored value stays and applies again once config no longer pins the field
+(04 §4.6), and pinning a field again replaces the pinned value. `Defaults()` is the single source of policy
+defaults: 04's config registry repeats them only for documentation and `config example`, and a wiring test checks
+that they match.
 
 | Field | Type, range | Default | Read by (enforced in) |
 |---|---|---|---|
@@ -2213,6 +2245,8 @@ pending users go through the approval endpoints (otherwise 422 with `fields.stat
 `{"settings": {Settings…}, "defaults": {Settings…}, "locked": ["updateCheck"]}`.
 
 `PATCH /api/v1/admin/settings` `{"registrationMode": "approval", "maxSharesPerRoom": 4}` → 200, same shape as GET.
+A `null` value is 422 `validation_failed` (field code `invalid`), and a field listed in `locked` is 409
+`setting_locked` whatever value is sent (§9).
 
 `GET /api/v1/admin/audit?before=4812&limit=50&action=user.&actor=k3m9p2qxw7ht&target=b8f2n4r6t0vz` →
 
@@ -2450,9 +2484,11 @@ SPA removes the fragment right after reading it (05).
   sessions past `idle_expires_at` or `expires_at`.
 - `Prune`: each rule in §4.7 is checked at `t−1ms` and `t+1ms`.
 - A write inside `Read` fails.
-- `SettingsCache`: defaults, validation per field, `Pin` → `setting_locked`, `OnChange` receives old and new values,
-  and the audit row is written in the same transaction (a failure injected after the audit insert leaves no settings
-  change).
+- `SettingsCache`: defaults, validation per field (`null` is `invalid`), `Pin` → `setting_locked` (also for the
+  value in force), `OnChange` receives old and new values (from `Update` and from `Pin`; not for a no-op), and the
+  audit row is written in the same transaction (a failure injected after the audit insert leaves no settings
+  change). A no-op patch writes no audit row; a `settings.changed` detail over 1 KiB keeps every changed field with
+  its text cut and `truncated: true` (§9).
 
 **Unit: auth**:
 - **PHC**: encoding round-trips and parses foreign parameters. `Verify` works for right and wrong passwords, and the

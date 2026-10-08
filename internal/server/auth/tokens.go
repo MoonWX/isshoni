@@ -1,14 +1,19 @@
 package auth
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
+
+	"github.com/MoonWX/isshoni/internal/server/store"
 )
 
 // Keys are the token-hashing keys from 04's secrets.json: 32 bytes each (03 §3.2). Session hashes session tokens
@@ -116,4 +121,109 @@ func (k Keys) rotatedKeys(storedSessionFP, storedInviteFP string) []string {
 		changed = append(changed, keyNameInvite)
 	}
 	return changed
+}
+
+// Meta keys that hold the key fingerprints (03 §4.6, §5).
+const (
+	metaSessionKeyFP = "session_key_fp"
+	metaInviteKeyFP  = "invite_key_fp"
+)
+
+// auditSecretsRotated is the audit action of a key rotation found at startup (03 §10; a security event).
+const auditSecretsRotated = "secrets.rotated"
+
+// syncKeyFingerprints is New's startup check of 03 §4.6, the only purge path (`isshoni admin rotate-secrets` writes
+// the new keys and restarts the server, 04 §5.3). In one Write it compares the fingerprints in meta with the current
+// keys, purges the rows each changed key protects, writes one secrets.rotated {keys: [...]} audit row (actor
+// system) and stores the current fingerprints. It returns the names of the changed keys, in the order session,
+// invite; New then raises the secrets_rotated alert. A first start (no fingerprint stored yet) only stores them.
+//
+// Rows hashed with an old key can never match again, so removing them keeps the Devices and Invites pages honest.
+// No connection is closed: none exists before the server serves (03 §7.7).
+func (s *Service) syncKeyFingerprints(ctx context.Context) ([]string, error) {
+	sessionFP, inviteFP := keyFingerprint(s.keys.Session), keyFingerprint(s.keys.Invite)
+	now := s.now()
+	var rotated []string
+	err := s.db.Write(ctx, func(q *store.Q) error {
+		storedSession, err := metaOrEmpty(q, metaSessionKeyFP)
+		if err != nil {
+			return err
+		}
+		storedInvite, err := metaOrEmpty(q, metaInviteKeyFP)
+		if err != nil {
+			return err
+		}
+		if storedSession == sessionFP && storedInvite == inviteFP {
+			return nil
+		}
+		rotated = s.keys.rotatedKeys(storedSession, storedInvite)
+		if err := purgeRotated(q, rotated); err != nil {
+			return err
+		}
+		if len(rotated) > 0 {
+			err := q.AppendAudit(store.AuditEntry{At: now, Action: auditSecretsRotated, Actor: store.SystemActor,
+				Detail: map[string]any{"keys": rotated}})
+			if err != nil {
+				return err
+			}
+		}
+		if err := q.SetMeta(metaSessionKeyFP, sessionFP); err != nil {
+			return err
+		}
+		return q.SetMeta(metaInviteKeyFP, inviteFP)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("auth: key fingerprints: %w", err)
+	}
+	return rotated, nil
+}
+
+// metaOrEmpty reads a meta key; a missing key is "".
+func metaOrEmpty(q *store.Q, key string) (string, error) {
+	v, err := q.GetMeta(key)
+	if errors.Is(err, store.ErrNotFound) {
+		return "", nil
+	}
+	return v, err
+}
+
+// purgeRotated removes what the changed keys protected (03 §4.6), inside New's Write:
+//   - session: every web session (their push subscriptions cascade), every device (its tokens and push subscriptions
+//     cascade) and every device code, the ones nobody decided yet included;
+//   - invite: every setup token, every password reset link and every invite. The accounts made with an invite stay.
+func purgeRotated(q *store.Q, rotated []string) error {
+	if len(rotated) == 0 {
+		return nil
+	}
+	users, err := q.ListUsers("") // every status: a disabled or pending user may still have rows
+	if err != nil {
+		return err
+	}
+	if slices.Contains(rotated, keyNameSession) {
+		for _, u := range users {
+			if _, err := q.DeleteSessions(u.ID, ""); err != nil {
+				return err
+			}
+			if _, err := q.DeleteDevices(u.ID); err != nil {
+				return err
+			}
+		}
+		if _, err := q.DeleteAllDeviceCodes(); err != nil {
+			return err
+		}
+	}
+	if slices.Contains(rotated, keyNameInvite) {
+		if err := q.DeleteSetupTokens(); err != nil {
+			return err
+		}
+		for _, u := range users {
+			if err := q.DeletePasswordReset(u.ID); err != nil {
+				return err
+			}
+		}
+		if _, err := q.DeleteAllInvites(); err != nil {
+			return err
+		}
+	}
+	return nil
 }

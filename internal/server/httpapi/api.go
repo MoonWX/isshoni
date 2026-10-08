@@ -70,8 +70,8 @@ type Deps struct {
 	Logger *slog.Logger
 }
 
-// authService is the part of *auth.Service that the /api/v1 chain calls. Tests replace it with a fake; the handlers
-// of later slices call Deps.Auth directly.
+// authService is the part of *auth.Service that the /api/v1 chain calls. Tests of the chain replace it with a fake;
+// the handlers (auth.go) call Deps.Auth directly.
 type authService interface {
 	Authenticate(r *http.Request) (auth.Principal, error)
 	MaybeRotate(w http.ResponseWriter, p auth.Principal)
@@ -145,9 +145,15 @@ func newAPI(d Deps, au authService) *API {
 	return a
 }
 
-// routes registers 03's endpoints (03 §12.3). The later slices add theirs here.
+// routes registers 03's endpoints (03 §12.3; the numbers are the rows of its table). The later slices add theirs
+// here.
 func (a *API) routes() {
-	a.Handle("GET /api/v1/info", Public, http.HandlerFunc(a.getInfo))
+	a.Handle("GET /api/v1/info", Public, http.HandlerFunc(a.getInfo))                           // #1
+	a.Handle("POST /api/v1/auth/login", Public, http.HandlerFunc(a.postLogin))                  // #2
+	a.Handle("POST /api/v1/auth/logout", Public, http.HandlerFunc(a.postLogout))                // #3
+	a.Handle("POST /api/v1/auth/setup/check", Public, http.HandlerFunc(a.postSetupCheck))       // #7
+	a.Handle("POST /api/v1/auth/setup/complete", Public, http.HandlerFunc(a.postSetupComplete)) // #8
+	a.Handle("GET /api/v1/me", User, http.HandlerFunc(a.getMe))                                 // #11
 }
 
 // ServeHTTP serves every request under /api/v1/ through the API's chain. After the no-store step it answers every

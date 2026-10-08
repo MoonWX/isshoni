@@ -1,0 +1,235 @@
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  width: 100%;
+}
+
+.intro {
+  color: var(--color-text-muted);
+  text-wrap: pretty;
+}
+
+.running {
+  display: flex;
+  gap: var(--space-3);
+  align-items: center;
+  color: var(--color-text-muted);
+}
+
+.error {
+  color: var(--color-danger);
+}
+
+/* The rows: one per transport and one for the round trip. */
+.rows {
+  display: flex;
+  flex-direction: column;
+  list-style: none;
+  background-color: var(--color-surface);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.row {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: var(--space-1) var(--space-3);
+  align-items: center;
+  padding: var(--space-3) var(--space-4);
+}
+
+.row + .row {
+  border-top: var(--border-width) solid var(--color-border);
+}
+
+.mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: var(--radius-full);
+}
+
+.mark svg {
+  width: 1rem;
+  height: 1rem;
+  stroke-width: 2.5;
+}
+
+/* The state is always written out next to the mark, so colour is never the only signal. */
+.ok {
+  color: var(--color-success);
+}
+
+.failed,
+.off {
+  color: var(--color-danger);
+}
+
+.not_tested {
+  color: var(--color-text-muted);
+}
+
+.rowLabel {
+  min-width: 0;
+  font-weight: var(--weight-medium);
+}
+
+.rowState {
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-muted);
+  text-align: end;
+}
+
+.rowNote {
+  grid-column: 2 / -1;
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}
+
+/* The status line. */
+.status {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+  padding: var(--space-3) var(--space-4);
+  font-weight: var(--weight-medium);
+  border-radius: var(--radius-md);
+}
+
+.statusIcon {
+  flex: none;
+  margin-top: 0.125rem;
+}
+
+.statusIcon svg {
+  width: 1.25rem;
+  height: 1.25rem;
+}
+
+.green {
+  color: var(--color-success);
+  background-color: var(--color-surface-2); /* iOS 15: no color-mix */
+  background-color: color-mix(in srgb, var(--color-success) 12%, transparent);
+}
+
+.amber {
+  color: var(--color-warning);
+  background-color: var(--color-surface-2); /* iOS 15: no color-mix */
+  background-color: color-mix(in srgb, var(--color-warning) 14%, transparent);
+}
+
+.red {
+  color: var(--color-danger);
+  background-color: var(--color-surface-2); /* iOS 15: no color-mix */
+  background-color: color-mix(in srgb, var(--color-danger) 12%, transparent);
+}
+
+.incomplete,
+.hint {
+  color: var(--color-text-muted);
+  text-wrap: pretty;
+}
+
+/* Fix text and troubleshooting links. */
+.fix,
+.help {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.sectionTitle {
+  font-size: var(--text-md);
+  font-weight: var(--weight-bold);
+}
+
+.fixList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding-inline-start: var(--space-5);
+}
+
+.fixItem {
+  text-wrap: pretty;
+}
+
+.fixItem > * + * {
+  margin-top: var(--space-2);
+}
+
+.helpList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  list-style: none;
+}
+
+.panel code {
+  padding: 0.05em 0.15em;
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  overflow-wrap: anywhere;
+  background-color: var(--color-surface-2);
+  border-radius: var(--radius-sm);
+}
+
+/* Commands sit in CommandBlock, which has its own background. */
+.panel pre code {
+  padding: 0;
+  font-size: inherit;
+  background-color: transparent;
+}
+
+.link {
+  display: inline-flex;
+  gap: var(--space-1);
+  align-items: center;
+  font-size: var(--text-sm);
+}
+
+.link svg {
+  flex: none;
+  width: 0.875rem;
+  height: 0.875rem;
+}
+
+.send {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: center;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: center;
+}
+
+/* The result to copy by hand, when the browser refuses the clipboard: a full-width row of its own. */
+.manual {
+  display: flex;
+  flex-basis: 100%;
+  flex-direction: column;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}
+
+.manual textarea {
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-text);
+  resize: vertical;
+  background-color: var(--color-surface);
+  border: var(--border-width) solid var(--color-border-strong);
+  border-radius: var(--radius-sm);
+}

@@ -91,7 +91,8 @@ func (v verdict) retryAfterSeconds() int {
 const maxLimiterKeys = 100_000
 
 // limiter is a map of token buckets with one rate, kept in memory only (03 decision 8). A key without an entry has
-// a full bucket; entries go away when they are refilled on purpose (reset) or evicted.
+// a full bucket; entries go away when they are refilled on purpose (reset), when a refund fills them, or when they
+// are evicted.
 //
 // Each bucket is a GCRA: tat, its "theoretical arrival time", is when the bucket will be full again, and each token
 // taken moves it Every into the future. A request passes when that stays within Burst × Every of now. Integer time
@@ -130,8 +131,10 @@ func newLimiter[K comparable](r rate, maxKeys int, now func() time.Time) *limite
 // window is how far tat may run ahead of now: Burst tokens. It is at least Every and at most maxWindow (validate).
 func (l *limiter[K]) window() time.Duration { return time.Duration(l.rate.Burst) * l.rate.Every }
 
-// take consumes one token for key if there is one. It is the check for buckets that count every attempt
-// (auth-ip, register-ip, auth-hash, push-test).
+// take consumes one token for key if there is one. Buckets that count every attempt (auth-ip, register-ip, auth-hash,
+// push-test) only take. The buckets of failed password checks (auth-user-ip, auth-user) take the token before the
+// password is hashed and give it back with refund when the attempt was not a failure, so attempts that arrive while
+// earlier ones are still hashing see those in the bucket.
 func (l *limiter[K]) take(key K) verdict {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -155,45 +158,19 @@ func (l *limiter[K]) take(key K) verdict {
 	return verdict{OK: true}
 }
 
-// check reports whether key has a token, without taking it. It is the check for buckets that count only failures
-// (auth-user-ip, auth-user): the caller checks before hashing and calls spend after a wrong password.
-func (l *limiter[K]) check(key K) verdict {
+// refund gives back the one token a take for key consumed: the bucket is as it was before that take. A bucket that
+// is full again loses its entry. When the entry is gone (reset refilled the bucket, or it was evicted) the bucket is
+// full already and there is nothing to give back.
+func (l *limiter[K]) refund(key K) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	b := l.m[key]
 	if b == nil {
-		return verdict{OK: true}
+		return
 	}
-	l.touch(b)
-	now := l.now()
-	// A token is left while tat is at most window − Every ahead of now. (Comparing first keeps a tat far in the past
-	// from overflowing the subtraction.)
-	if ahead, limit := b.tat.Sub(now), l.window()-l.rate.Every; ahead > limit {
-		return l.refuse(b, ahead-limit)
-	}
-	b.refused = false
-	return verdict{OK: true}
-}
-
-// spend takes one token for key after a failure. It never refuses: an empty bucket stays empty.
-func (l *limiter[K]) spend(key K) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	now := l.now()
-	b := l.m[key]
-	if b == nil {
-		b = l.insert(key, now)
-		b.tat = now
-	} else {
-		l.touch(b)
-	}
-	start := now
-	if b.tat.After(now) {
-		start = b.tat
-	}
-	b.tat = start.Add(l.rate.Every)
-	if limit := now.Add(l.window()); b.tat.After(limit) {
-		b.tat = limit
+	b.tat = b.tat.Add(-l.rate.Every)
+	if !b.tat.After(l.now()) {
+		l.remove(b)
 	}
 }
 
@@ -311,9 +288,11 @@ var (
 // throttles are the in-memory buckets of 03 §7.3. Each is checked before any hashing or DB access; the service
 // decides the order (auth-ip first, auth-hash last).
 type throttles struct {
-	authIP     *limiter[netip.Prefix] // every public auth attempt, by IPKey
-	authUserIP *limiter[userIPKey]    // failed password checks, by username key and IPKey; a hard block
-	authUser   *limiter[string]       // failed password checks from any IP, by username key; known IPs pass
+	authIP *limiter[netip.Prefix] // every public auth attempt, by IPKey
+	// The two buckets of failed password checks. An attempt takes its tokens before the hash and gets them back when
+	// it was no failure (passwordAttempt in login.go).
+	authUserIP *limiter[userIPKey]    // by username key and IPKey; a hard block
+	authUser   *limiter[string]       // from any IP, by username key; known IPs pass
 	registerIP *limiter[netip.Prefix] // sign-ups without an invite, by IPKey
 	authHash   *limiter[struct{}]     // every public request that reaches the hash, server-wide
 	pushTest   *limiter[string]       // POST /push/test, by user ID

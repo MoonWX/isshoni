@@ -12,7 +12,13 @@
 //    added in Go and regenerated with `task gen` fails the check until en.json has its text. A src tree without
 //    protocol/types.gen.ts and protocol/api.gen.ts (test fixtures) skips the rule with a note; one without the other
 //    is a problem.
-// 3. (S37) Every CloudProvider has fix.firewall.<provider>, every NATKind has conntest.nat.<nat>.
+// 3. (S37) Every CloudProvider constant (api.gen.ts, 04 §13.3) has a fix.firewall.<provider> message and every
+//    NATKind constant (04 §7.4) a conntest.nat.<nat> message: the connection test's fix text (05 §14.2), whose keys
+//    are built from the server's ids and so never appear as t('…') literals (CONSTANT_KEYED). The constants are read
+//    from the generated unions like rule 2's, so a provider added in Go and regenerated with `task gen` fails the
+//    check until en.json has its text. A src tree that has neither union in api.gen.ts nor either message family in
+//    its catalog (test fixtures) skips the rule with a note. Anything in between is a problem: a union missing next
+//    to the other one, or next to a catalog that has these texts (a renamed Go type must not turn the rule off).
 // 4. (S93) Unused keys are warnings.
 //
 // Usage: node scripts/check-i18n.mjs [--src <dir>] [--catalog <en.json>]
@@ -413,10 +419,68 @@ export async function checkErrorCodes({ srcDir, catalog, catalogName }) {
 }
 
 /**
+ * Rule 3: the message families that have one key per constant of a union in api.gen.ts (05 §16.5). `what` names a
+ * constant in problems and, with an "s", the count in the summary line.
+ * @type {readonly Readonly<{ typeName: string, prefix: string, what: string }>[]}
+ */
+export const CONSTANT_KEYED = Object.freeze([
+  Object.freeze({ typeName: 'CloudProvider', prefix: 'fix.firewall', what: 'cloud provider' }),
+  Object.freeze({ typeName: 'NATKind', prefix: 'conntest.nat', what: 'NAT kind' }),
+]);
+
+/**
+ * Rule 3: every CloudProvider constant has a fix.firewall.<provider> message and every NATKind constant a
+ * conntest.nat.<nat> message (a string, or plural forms: these keys are shown as they are).
+ * @param {{ srcDir: string, catalog: Catalog, catalogName: string }} opts
+ * @returns {Promise<{ problems: Problem[], counts: Record<string, number> | null }>} counts: the constants checked
+ *   per union type name, or null when the rule was skipped: no protocol/api.gen.ts (rule 2 reports a lone missing
+ *   file), or one that declares none of the unions while the catalog has none of the families either
+ */
+export async function checkConstantKeys({ srcDir, catalog, catalogName }) {
+  const apiPath = path.join(srcDir, 'protocol', 'api.gen.ts');
+  if (!(await exists(apiPath))) return { problems: [], counts: null };
+  const shown = path.relative(process.cwd(), apiPath) || apiPath;
+  const text = await readFile(apiPath, 'utf8');
+  const unions = CONSTANT_KEYED.map((family) => ({ family, res: unionConstants(shown, text, family.typeName) }));
+  const inCatalog = CONSTANT_KEYED.some((family) => lookup(catalog, family.prefix) !== undefined);
+  if (unions.every((u) => u.res === undefined) && !inCatalog) return { problems: [], counts: null };
+  /** @type {Problem[]} */
+  const problems = [];
+  /** @type {Record<string, number>} */
+  const counts = {};
+  for (const { family, res } of unions) {
+    if (!res) {
+      problems.push({ file: shown, line: 1, column: 1, message: `no \`export type ${family.typeName}\` union found` });
+      continue;
+    }
+    problems.push(...res.problems);
+    counts[family.typeName] = res.constants.length;
+    for (const c of res.constants) {
+      const key = `${family.prefix}.${c.value}`;
+      const why = keyProblem(catalog, key);
+      if (why) {
+        problems.push({
+          file: c.file,
+          line: c.line,
+          column: c.column,
+          message:
+            why === 'missing'
+              ? `${family.what} "${c.value}" (${c.name}) has no ${key} in ${catalogName}`
+              : `${family.what} "${c.value}" (${c.name}): ${key} ${why} in ${catalogName}`,
+        });
+      }
+    }
+  }
+  return { problems, counts };
+}
+
+/**
  * Runs every rule.
  * @param {{ srcDir: string, catalogPath: string }} opts
- * @returns {Promise<{ problems: Problem[], keysUsed: number, files: number, errorCodes: number | null }>}
- *   errorCodes: the distinct error codes rule 2 checked, or null when it was skipped
+ * @returns {Promise<{ problems: Problem[], keysUsed: number, files: number, errorCodes: number | null,
+ *   constantKeys: Record<string, number> | null }>}
+ *   errorCodes: the distinct error codes rule 2 checked, or null when it was skipped; constantKeys: the constants
+ *   rule 3 checked per union type name (CloudProvider, NATKind), or null when it was skipped
  */
 export async function checkI18n({ srcDir, catalogPath }) {
   /** @type {Catalog} */
@@ -445,7 +509,15 @@ export async function checkI18n({ srcDir, catalogPath }) {
   }
   const errorCodes = await checkErrorCodes({ srcDir, catalog, catalogName });
   problems.push(...errorCodes.problems);
-  return { problems, keysUsed, files: files.length, errorCodes: errorCodes.codes };
+  const constantKeys = await checkConstantKeys({ srcDir, catalog, catalogName });
+  problems.push(...constantKeys.problems);
+  return {
+    problems,
+    keysUsed,
+    files: files.length,
+    errorCodes: errorCodes.codes,
+    constantKeys: constantKeys.counts,
+  };
 }
 
 async function main() {
@@ -460,18 +532,26 @@ async function main() {
   }
   const srcDir = path.resolve(values.src ?? path.join(WEB_ROOT, 'src'));
   const catalogPath = path.resolve(values.catalog ?? path.join(WEB_ROOT, 'src', 'i18n', 'en.json'));
-  const { problems, keysUsed, files, errorCodes } = await checkI18n({ srcDir, catalogPath });
+  const { problems, keysUsed, files, errorCodes, constantKeys } = await checkI18n({ srcDir, catalogPath });
   for (const p of problems) console.error(`${p.file}:${p.line}:${p.column}: ${p.message}`);
   if (problems.length > 0) {
     console.error(`check:i18n: ${problems.length} problem(s)`);
     process.exit(1);
   }
+  let summary = `check:i18n: ok (${keysUsed} message keys in ${files} files)`;
   if (errorCodes === null) {
     console.log('check:i18n: note: no protocol/*.gen.ts under the src dir, error-code rule skipped');
-    console.log(`check:i18n: ok (${keysUsed} message keys in ${files} files)`);
   } else {
-    console.log(`check:i18n: ok (${keysUsed} message keys in ${files} files), ${errorCodes} error codes`);
+    summary += `, ${errorCodes} error codes`;
   }
+  if (constantKeys === null) {
+    const unions = CONSTANT_KEYED.map((f) => f.typeName).join(' or ');
+    const families = CONSTANT_KEYED.map((f) => `${f.prefix}.*`).join(' or ');
+    console.log(`check:i18n: note: no ${unions} in protocol/api.gen.ts and no ${families} text, fix-text rule skipped`);
+  } else {
+    for (const f of CONSTANT_KEYED) summary += `, ${constantKeys[f.typeName] ?? 0} ${f.what}s`;
+  }
+  console.log(summary);
 }
 
 // import.meta.main, not a comparison with process.argv[1]: that path isn't resolved through symlinks, junctions or

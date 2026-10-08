@@ -69,7 +69,7 @@ in-band.
 | 2 | `Origin` header absent (non-browser client), or exactly equal (scheme, host case-insensitive, port with defaults normalized) to `Config.PublicOrigin` (04's `Site.Origin`) or an entry of `Config.AllowedOrigins`. `AllowedOrigins` is empty in M1 and is not a config key; M2 adds the Wails asset origins in code, accepted only for bearer connections | `403` |
 | 3 | `Authenticator.AuthenticateRequest(r)` on every upgrade (the hub never parses cookie names; 03 owns them). Success → the connection is **cookie-authenticated**. `ErrNoCredentials` or `ErrInvalid` → **pre-auth** | any other error: `503`, `Retry-After: 2` |
 | 4 | Pre-auth only: ≤ 20 pre-auth upgrades per client IP (IPv4 address; IPv6 keyed by its /64, as in 03 §7.3) per minute (plan guard; 04 key `limits.ws_handshakes_per_ip_per_minute`), ≤ 500 concurrent pre-auth sockets server-wide | `429` with `Retry-After`, or `503` |
-| 5 | Cookie-authenticated only: the user has < 16 open connections (constant). Bearer connections are checked at `hello` (`too_many_connections`) | accept, send `error{too_many_connections, scope: connection}`, close `4429` (so browsers can show the notice) |
+| 5 | Cookie-authenticated only: the user has < 16 connections (constant; detached connections and sockets still in the handshake count). Bearer connections are checked at `hello` (`too_many_connections`) | accept (so browsers can show the notice), then wait for `hello`: a resume needs no slot, because the connection it resumes has its own, and the resume token only arrives with `hello`. A `hello` that resumes a connection goes on; any other is answered `error{too_many_connections, scope: connection}` and closed `4429`. At most 16 sockets per user wait at the cap like this; one more gets the error right after accept |
 | 6 | `websocket.Accept` with `CompressionMode: CompressionDisabled`, no subprotocols, and `InsecureSkipVerify: true`: step 2 already did the exact Origin check (coder/websocket's own check compares Origin with `r.Host`, which breaks behind proxies that rewrite `Host`) | — |
 
 The hub owns every upgrade-time check for `/ws` (Origin, pre-auth limits, per-user cap). 03's auth only validates
@@ -116,7 +116,8 @@ Rules:
 - Compression: off (`CompressionDisabled`, also coder/websocket's default).
 - Writes: one writer goroutine per socket, 10 s write timeout per message. The send queue holds at most 512 messages or
   8 MiB; when it overflows, the hub sends nothing more and closes with `4503` (`slow_connection`). The connection then
-  enters grace like any other drop.
+  enters grace like any other drop. (An overflow of the connection actor's inbox also closes with `4503`, but ends
+  the connection for good: §15.2.)
 
 ### 3.4 Heartbeat (M1)
 
@@ -177,6 +178,16 @@ handshaking ────────► ready ◄──────────�
 - Close codes `1000` and `1001` **from the client** mean it left on purpose (logout, page unload); the web client
   sends 1000, and 1001 comes from browsers' automatic close on unload and from Go clients. The hub skips grace and
   closes immediately, so a reloaded sharer's frozen share disappears at once.
+- What the end of its socket means for a connection:
+  - a client close with `1000` or `1001`: closed at once, `EndReason left` (above). Any other client close code,
+    the reconnect code `4000` included, keeps the grace;
+  - the "fatal error" of the diagram: the hub closed the socket with `4400` (`bad_message`, a second `hello`) or
+    `1003` (a binary frame). The client stops on these (§12.2), so nothing would resume the connection: closed at
+    once, `disconnected`;
+  - a revocation (`4401`, `4403`): closed, `left`; a shutdown (`1012`): closed, `server_shutdown`;
+  - the connection's inbox overflowed (§15.2): closed at once, `disconnected`;
+  - everything else keeps the grace: the hub's retryable closes (`4408` idle timeout, `4503` send queue full, `4429`
+    flood, `1011`), a message over the read limit (`1009`) and a socket that just went away (`1006`).
 - `closed`: subscriptions removed, own shares ended (`disconnected` or the specific reason), MediaPeer closed,
   participant removed if it was the last connection (`room.event participant.left`). A connection closed by 03
   revocation (`CloseConnections`) skips grace and uses `EndReason left` for its shares and, if it was the last
@@ -595,10 +606,14 @@ Server behavior on `hello`:
    `hello_required`, close `4400`.
 2. Validate: `client.kind` matches `[a-z]{1,16}` (unknown kinds are accepted and treated like `web` for limits),
    `role` is known, `features` ≤ 32 entries, `caps.decode` ≤ 32 entries.
-3. Authenticate (§3.2). Failure: `unauthenticated` (scope session), close `4401`. A bearer-authenticated user
-   with 16 connections already open gets `too_many_connections`, close `4429`.
+3. Authenticate (§3.2). Failure: `unauthenticated` (scope session), close `4401`. A `hello` without a
+   `resumeToken` then needs a connection slot: a bearer-authenticated user with 16 connections already gets
+   `too_many_connections`, close `4429`, and so does a cookie socket that was accepted at the cap (§3.1 step 5).
+   With a `resumeToken` the cap is checked in step 5, after the token.
 4. Negotiate the version (§6.1), then check `Policy().MinClientVersion` for non-web kinds.
-5. Resume (§10.3) if `resumeToken` is set and valid; else create a new connection.
+5. Resume (§10.3) if `resumeToken` is set and valid; else create a new connection. A token that resumes nothing
+   opens a new connection when the user has a slot for one, and gets `too_many_connections`, close `4429`, when
+   not.
 6. Raise the read limit to 256 KiB and send `welcome`.
 7. If resumed into a room: send `room.state`, then call `MediaPeer.Resync()`.
 
@@ -1506,14 +1521,19 @@ These rules bind the web client (05), the Go test and load-test clients, the SFU
   - the connection exists in this process (ready or detached);
   - the token hash matches;
   - the authenticated identity has the same user and the same session (cookie) or device (bearer) as the
-    connection.
+    connection;
+  - the `hello` has the connection's `role` and negotiates its protocol version.
 
   Otherwise `welcome.resumed = false`. That is not an error.
+- A resumed connection keeps its client info, features and rate-limit buckets: the resuming `hello`'s `client` and
+  `features` are ignored. Its `caps` replace the connection's, since they can have changed while the client was away
+  (§11.7); when they differ, the hub calls `MediaPeer.SetCaps` before `Resync()`.
 - If the connection's old socket is still attached (half-open), the hub sends it `error{replaced}`, closes it with
   `4409`, then attaches the new socket.
 - **Grace**: 30 s (`limits.graceMs`) from detachment. The Connection, its Participant slot, its shares (status
   unchanged while their media flows), its subscriptions and both PCs are kept. When grace expires, the connection is
-  closed (§4.2).
+  closed (§4.2). A detached connection still counts toward the user's 16 connections and shows as `reconnecting` in
+  `Hub.Snapshot`; `CloseConnections` and `Shutdown` close it at once, without waiting for the grace.
 - Resuming from another IP address (Wi-Fi to LTE) is allowed.
 
 ### 10.4 PeerConnection recovery
@@ -1982,7 +2002,13 @@ Forbidden:
   Checked with tygo v0.2.21 on a scratch package:
   - defined string types with a `<Type><Value>` const group become `export type X = typeof XA | typeof XB`;
   - `omitempty`/`omitzero` fields become optional (`?`);
-  - `uint32` becomes `number`.
+  - `uint32` becomes `number`;
+  - a Go `any` becomes a TypeScript `any`, so every struct field that holds one has a `tstype` tag naming a checked
+    type: `tstype:"{ [key: string]: unknown }"` on the `Params` maps, and `tstype:"unknown"` on `Spec.Payload` and
+    `Spec.Result` (tygo emits the Go-only registry `Spec` too, although it is never on the wire). tygo reads the tag
+    up to its first comma as the type and the rest as options (`,extends`, `,required`), so the type is written
+    without a comma (an index signature, not `Record<string, unknown>`). The generated files contain no `any`;
+    `TestNoTSAny` checks the tags of `internal/protocol` and `internal/protocol/api`.
 
   Enum const groups need at least 2 members and names prefixed by the type name; anything else stays a plain
   `string` in TS. `CodecKey` uses single-line consts on purpose: it must stay an open `string`.
@@ -2073,14 +2099,14 @@ const (
 )
 
 // Spec describes one message type (and direction); Registry is the single list used by the hub's dispatcher,
-// the tests (every Spec has a fixture) and the TS generator.
+// the tests (every Spec has a fixture) and the TS generator. The tstype tags keep any out of types.gen.ts (§14.4).
 type Spec struct {
 	Type      MessageType
 	Dir       Direction
 	Kind      MsgKind
-	Payload   any         // zero value of the payload type, e.g. RoomJoin{}
+	Payload   any         `tstype:"unknown"` // zero value of the payload type, e.g. RoomJoin{}
 	Reply     MessageType // requests: MessageTypeOK, or MessageTypeWelcome for hello
-	Result    any         // requests: zero value of the reply payload (Empty{} if none)
+	Result    any         `tstype:"unknown"` // requests: zero value of the reply payload (Empty{} if none)
 	Roles     []Role      // client->server: allowed roles; nil = all
 	Feature   Feature     // "" = baseline
 	Since     int         // protocol version that introduced it
@@ -2115,7 +2141,14 @@ Files:
 - Room state is guarded by a per-room mutex, held only for short sections. Lock order: hub → room → connection.
 - **No lock is held while calling a `MediaPeer`.**
 - `MediaSink` methods never block: they enqueue to the actor. If the actor's 1024-slot inbox overflows, the connection
-  is closed as `slow_connection`.
+  is closed as `slow_connection` (`4503`) for good, without grace: the dropped call is lost (a share's media state,
+  the close of its room), so a resume would bring back a connection in a wrong state. Its shares end with
+  `disconnected`, and no resume token resumes it meanwhile.
+  - A revocation is never lost this way: `CloseConnections` marks the connection before it posts to the inbox, and
+    the actor applies the mark when its socket ends or a post was dropped.
+  - The reader goroutine waits for room in the inbox instead of dropping (a flooding client slows itself down).
+  - `Shutdown` reaches the actors through a channel they all select on, not through the inbox, so a detached
+    connection can't hold it up for its grace. It is therefore not ordered after calls already queued in an inbox.
 
 ```go
 package signal
@@ -2620,15 +2653,18 @@ Behavior (normative):
 
 - **slog attributes**: README's names `conn_id`, `user_id`, `room_id`, `share_id`, plus `pc`, `gen`, `code`.
   `remote_ip` only on the §17 security events.
-  - `info`: connect, resume (`resumed=true|false`), close (with code), share start/end (with reason), kick,
-    revocation. None of them carries `remote_ip`.
-  - `debug`: every message type in and out.
+  - `info`: connect, detach (with the socket's close code), resume (`resumed=true|false`), close (with the last
+    socket's code and the end reason), share start/end (with reason), kick, revocation. None of them carries
+    `remote_ip`.
+  - `debug`: every message type in and out; a resume token that resumed nothing, with the reason and never the
+    token.
 - **Prometheus** (only when `Deps.Metrics` is set, 04):
-  - `isshoni_ws_connections{kind,role}` gauge;
+  - `isshoni_ws_connections{kind,role}` gauge: connections, detached ones included;
   - `isshoni_ws_messages_total{type,dir}`;
   - `isshoni_ws_errors_total{code}`;
   - `isshoni_ws_resume_total{result="resumed|not_resumed"}`;
-  - `isshoni_ws_close_total{code}`;
+  - `isshoni_ws_close_total{code}`: closed sockets, so a resumed connection counts once per socket (`4409` for a
+    replaced one);
   - `isshoni_rooms`, `isshoni_participants`, `isshoni_shares{status}` (01 owns these three; 02 and 04 don't
     register them);
   - from client `stats` deltas (§8.11), for the exit test: `isshoni_client_frames_decoded_total`,
@@ -2658,9 +2694,9 @@ In `internal/server/signal`, with `signaltest` fakes and `httptest`:
 - **Upgrade** (the Origin matrix moved here from 03): bad Origin → 403; Origin that differs only in host case or an
   explicit default port → OK; missing Origin + cookie → OK (non-browser); an M2 Wails origin with a cookie → 403;
   21st pre-auth upgrade per IP per minute → 429; 21 pre-auth upgrades within a minute from different addresses in
-  one IPv6 /64 → the 21st gets 429; a 17th cookie upgrade of one user → accepted, then
-  `error{too_many_connections}` + 4429; `AuthenticateRequest` failing with a non-credential error → 503; shutting
-  down → 503.
+  one IPv6 /64 → the 21st gets 429; a 17th cookie upgrade of one user → accepted, and its `hello` is answered
+  `error{too_many_connections}` + 4429 unless it resumes one of the user's connections (the cap never blocks a
+  resume); `AuthenticateRequest` failing with a non-credential error → 503; shutting down → 503.
 - **Handshake**:
   - non-hello first → `hello_required` + 4400;
   - no hello in `HelloTimeout` → 4408;
@@ -2699,7 +2735,9 @@ In `internal/server/signal`, with `signaltest` fakes and `httptest`:
   - an old token after rotation → `resumed: false`;
   - another user's token → `resumed: false`;
   - resume while the old socket is still attached → old socket gets `replaced` + 4409;
-  - client close 1000 or 1001 → no grace.
+  - client close 1000 or 1001 → no grace; 4000 keeps it;
+  - a resume at the per-user cap succeeds; a `hello` with another role → `resumed: false`;
+  - after an inbox overflow, attached or detached: no grace, no resume, shares end with `disconnected`.
 - **Revocation**: `CloseConnections({UserID, SessionID})` → `session_revoked` + 4401 only on connections of that
   session; `{UserID, ExceptSessionID}` keeps the excepted session; a selector with empty `UserID` closes nothing;
   `account_disabled` → 4403; `Revalidate` returning `ErrInvalid` on the 5 min tick (a shortened interval in tests) →
@@ -2712,7 +2750,7 @@ In `internal/server/signal`, with `signaltest` fakes and `httptest`:
 - **Adapter** (`sfuplane`): table tests for every row of §15.4 (calls, events, values, reasons, error codes) against a
   fake `*sfu.Conn` recorder.
 - **Slow consumer**: a client that never reads → `slow_connection` / 4503 and no hub goroutine blocked (with
-  `goleak`).
+  `goleak`); the connection is then detached and can resume (§3.3).
 - **Leaks**: `goleak.VerifyNone` in every test package.
 
 **Integration (Go, in-process server, real SFU from 02 through `sfuplane`, Pion clients via

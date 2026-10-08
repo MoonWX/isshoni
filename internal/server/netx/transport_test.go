@@ -206,6 +206,104 @@ func TestTransportPortZeroReuse(t *testing.T) {
 	}
 }
 
+// TestTransportIPv6LoopbackUDPOnly: with include_loopback and network.ipv6 both on (development), ::1 carries UDP
+// but never ICE-TCP, because pion gathers no TCP candidate on it (pionSkipsV6). So Advertised lists ::1 for UDP
+// only, the IP filter (pion's TCP gathering) drops it, and alone it gives no tcp6 network type. A global IPv6
+// address next to it keeps its TCP entry. The interfaces and the UDP sockets are fakes; the wildcard TCP listener
+// is real.
+func TestTransportIPv6LoopbackUDPOnly(t *testing.T) {
+	const udpPort = 7882
+	udp4, udp6 := webrtc.NetworkTypeUDP4, webrtc.NetworkTypeUDP6
+	tcp4, tcp6 := webrtc.NetworkTypeTCP4, webrtc.NetworkTypeTCP6
+	for _, tc := range []struct {
+		name      string
+		ifs       []Interface
+		udp       []string // the UDP sockets' addresses
+		wantTCP   []string // the addresses advertised for TCP
+		wantTypes []webrtc.NetworkType
+	}{
+		{
+			name:      "loopback only",
+			ifs:       []Interface{loIface()},
+			udp:       []string{"127.0.0.1", "::1"},
+			wantTCP:   []string{"127.0.0.1"},
+			wantTypes: []webrtc.NetworkType{udp4, udp6, tcp4},
+		},
+		{
+			name:      "loopback and a global address",
+			ifs:       []Interface{loIface(), iface("eth0", 0, "203.0.113.7", "2001:db8::7")},
+			udp:       []string{"127.0.0.1", "203.0.113.7", "::1", "2001:db8::7"},
+			wantTCP:   []string{"127.0.0.1", "203.0.113.7", "2001:db8::7"},
+			wantTypes: []webrtc.NetworkType{udp4, udp6, tcp4, tcp6},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var conns []net.PacketConn
+			var want []AdvertisedAddr
+			for _, a := range tc.udp {
+				ap := netip.AddrPortFrom(netip.MustParseAddr(a), udpPort)
+				conns = append(conns, newMemPacketConn(ap.String()))
+				want = append(want, AdvertisedAddr{Proto: "udp", Addr: ap, Via: ViaUDP})
+			}
+			tr := newTestTransport(t, TransportOptions{
+				TCPAddr: ":0", IncludeLoopback: true, IPv6: true,
+				PacketConns: conns, Interfaces: &fakeIfaces{ifs: tc.ifs},
+			})
+			for _, a := range tc.wantTCP {
+				ap := netip.AddrPortFrom(netip.MustParseAddr(a), tcpPortOf(tr.tcpLn))
+				want = append(want, AdvertisedAddr{Proto: "tcp", Addr: ap, Via: ViaTCP7882})
+			}
+			if !slices.Equal(tr.Advertised, want) {
+				t.Errorf("Advertised =\n%+v\nwant\n%+v", tr.Advertised, want)
+			}
+			if !slices.Equal(tr.NetworkTypes, tc.wantTypes) {
+				t.Errorf("NetworkTypes = %v, want %v", tr.NetworkTypes, tc.wantTypes)
+			}
+			if tr.IPFilter(net.ParseIP("::1")) {
+				t.Error("IPFilter keeps ::1: pion never gathers a TCP candidate on it")
+			}
+			for _, a := range tc.wantTCP {
+				if !tr.IPFilter(net.ParseIP(a)) {
+					t.Errorf("IPFilter drops %s", a)
+				}
+			}
+		})
+	}
+}
+
+// TestTransportTCPOnIPv6LoopbackOnly: an ICE-TCP listener bound to ::1 alone has no address pion gathers on. With
+// no UDP socket either, NewTransport says so instead of advertising a candidate that never appears.
+func TestTransportTCPOnIPv6LoopbackOnly(t *testing.T) {
+	var lc net.ListenConfig
+	probe, err := lc.Listen(context.Background(), "tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("no IPv6 loopback here: %v", err)
+	}
+	_ = probe.Close()
+	lo := &fakeIfaces{ifs: []Interface{loIface()}}
+	bad, err := NewTransport(context.Background(), TransportOptions{
+		TCPAddr: "[::1]:0", IncludeLoopback: true, IPv6: true, Interfaces: lo,
+	})
+	if !errors.Is(err, ErrNoTransport) || !strings.Contains(err.Error(), "[::1] never carries ICE-TCP") {
+		t.Errorf("TCP on ::1 only: %v, want ErrNoTransport saying that [::1] never carries ICE-TCP", err)
+	}
+	if bad != nil {
+		_ = bad.Close()
+	}
+	// With a UDP socket the Transport starts, and advertises UDP only.
+	tr := newTestTransport(t, TransportOptions{
+		TCPAddr: "[::1]:0", IncludeLoopback: true, IPv6: true, Interfaces: lo,
+		PacketConns: []net.PacketConn{newMemPacketConn("[::1]:7882")},
+	})
+	want := []AdvertisedAddr{{Proto: "udp", Addr: netip.MustParseAddrPort("[::1]:7882"), Via: ViaUDP}}
+	if !slices.Equal(tr.Advertised, want) {
+		t.Errorf("Advertised = %+v, want %+v", tr.Advertised, want)
+	}
+	if wantTypes := []webrtc.NetworkType{webrtc.NetworkTypeUDP6}; !slices.Equal(tr.NetworkTypes, wantTypes) {
+		t.Errorf("NetworkTypes = %v, want %v", tr.NetworkTypes, wantTypes)
+	}
+}
+
 // warnLines returns the JSON log lines at level WARN.
 func warnLines(t *testing.T, buf *bytes.Buffer) []map[string]any {
 	t.Helper()
@@ -263,8 +361,9 @@ func TestTransportErrors(t *testing.T) {
 	lo := &fakeIfaces{ifs: []Interface{loIface()}}
 	ctx := context.Background()
 
-	if _, err := NewTransport(ctx, TransportOptions{Interfaces: lo}); !errors.Is(err, ErrNoTransport) {
-		t.Errorf("nothing enabled: %v, want ErrNoTransport", err)
+	_, err := NewTransport(ctx, TransportOptions{Interfaces: lo})
+	if !errors.Is(err, ErrNoTransport) || !strings.Contains(err.Error(), "both off") {
+		t.Errorf("nothing enabled: %v, want ErrNoTransport saying that UDP and ICE-TCP are both off", err)
 	}
 	// Only loopback addresses and include_loopback off: no UDP address.
 	if _, err := NewTransport(ctx, TransportOptions{UDPAddr: ":0", Interfaces: lo}); !errors.Is(err, ErrNoTransport) {
@@ -287,7 +386,7 @@ func TestTransportErrors(t *testing.T) {
 
 	// Busy ports are *ListenError wrapping EADDRINUSE; the UDP socket bound before the failure is released.
 	busyUDP := listenUDP(t)
-	_, err := NewTransport(ctx, TransportOptions{UDPAddr: busyUDP.LocalAddr().String(), Interfaces: lo})
+	_, err = NewTransport(ctx, TransportOptions{UDPAddr: busyUDP.LocalAddr().String(), Interfaces: lo})
 	var le *ListenError
 	if !errors.As(err, &le) || le.Proto != "udp" || !errors.Is(err, syscall.EADDRINUSE) {
 		t.Fatalf("busy UDP port: %v, want a udp *ListenError with EADDRINUSE", err)

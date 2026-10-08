@@ -147,10 +147,12 @@ describe('describeError / errorMessage (05 §6.3)', () => {
 
   it('field errors use fieldErrors.<field>.<code>, else errors.validation_failed', () => {
     expect(fieldErrorKey('username', 'too_short')).toBe('fieldErrors.username.too_short');
-    expect(fieldErrorMessage('username', 'too_short')).toBe('Check the highlighted fields.');
-    i18n.addResource('en', 'translation', 'fieldErrors.username.too_short', 'Too short.');
+    // en.json has the auth forms' texts (S33); a field without one falls back.
+    expect(fieldErrorMessage('username', 'too_short')).toBe("That's too short for a username.");
+    expect(fieldErrorMessage('nickname', 'too_short')).toBe('Check the highlighted fields.');
+    i18n.addResource('en', 'translation', 'fieldErrors.nickname.too_short', 'Too short.');
     try {
-      expect(fieldErrorMessage('username', 'too_short')).toBe('Too short.');
+      expect(fieldErrorMessage('nickname', 'too_short')).toBe('Too short.');
     } finally {
       i18n.removeResourceBundle('en', 'translation');
       i18n.addResourceBundle('en', 'translation', en);

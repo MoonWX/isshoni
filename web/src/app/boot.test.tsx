@@ -222,8 +222,8 @@ describe('boot branches (05 §4)', () => {
   it('App: the real routes start at the path (a guarded route without a session goes to /login)', async () => {
     server.use(signedIn(null));
     const { started: app } = mount({ path: '/account', routes: createAppRoutes });
-    // No auth/ folder yet: /login renders the "not in this build" page (S33 fills it).
-    expect(await screen.findByRole('heading', { name: 'Not in this build yet' })).toBeInTheDocument();
+    // The login page of the auth/ folder (S33), with the server name that boot seeded from /info.
+    expect(await screen.findByRole('heading', { name: 'Log in to Test server' })).toBeInTheDocument();
     expect(app.services).not.toBeNull();
   });
 });

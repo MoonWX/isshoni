@@ -686,9 +686,13 @@ func TestAPIHandlePanics(t *testing.T) {
 	}
 }
 
-// TestNew checks New's required dependencies and that it accepts auth's Service, whose methods later slices fill in.
+// TestNew checks New's required dependencies, and that it builds the API over auth's real Service.
 func TestNew(t *testing.T) {
 	db := openTestDB(t)
+	svc, err := auth.New(context.Background(), db, testAuthOptions(newManualClock()))
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, tc := range []struct {
 		d    Deps
 		want string
@@ -707,9 +711,21 @@ func TestNew(t *testing.T) {
 			New(tc.d)
 		}()
 	}
-	a := New(Deps{DB: db, Auth: new(auth.Service), Site: domainSite()})
+	a := New(Deps{DB: db, Auth: svc, Site: domainSite()})
 	f := newFixture(t, func(o *RouterOptions) { o.API = a })
 	wantError(t, f.get("/api/v1/nope"), http.StatusNotFound, api.CodeNotFound)
+	// Every optional dependency has a default: a routed request works with the three required ones.
+	if rec := f.get("/api/v1/info"); rec.Code != http.StatusOK {
+		t.Fatalf("GET /info with the default dependencies: status %d (body %q)", rec.Code, rec.Body)
+	}
+
+	// A Service that auth.New did not build has no CSRF guard: its routes fail closed with 500 instead of running
+	// unguarded.
+	a = New(Deps{DB: db, Auth: new(auth.Service), Site: domainSite()})
+	f = newFixture(t, func(o *RouterOptions) { o.API = a })
+	if rec := f.get("/api/v1/info"); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("GET /info over a zero auth.Service: status %d, want 500", rec.Code)
+	}
 }
 
 func TestDashboardAccountsNotImplemented(t *testing.T) {
