@@ -1,6 +1,7 @@
 package signal_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -450,6 +451,45 @@ func TestRelayClosingTarget(t *testing.T) {
 	})
 }
 
+// A target whose actor is stuck takes what its inbox holds (1024, 01 §15.2). The message after that is not handed
+// over, so it is not counted: the sender gets agent_target_not_found. And the target is closed for good as
+// slow_connection, without grace, like any connection whose inbox overflows (conn.post).
+func TestRelayTargetInboxFull(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newEnv(t)
+		defer e.close()
+		cookie, id := e.user(false)
+		page, _ := e.relayConn(cookie, protocol.RoleFull)
+		agent, agentID := e.relayConn(cookie, protocol.RoleAgent)
+		release := signal.Stall(e.hub, agentID)
+		if release == nil {
+			t.Fatal("no such connection")
+		}
+		defer release()
+		for i := range 1024 {
+			if n := relayed(t, page, toConn(agentID, "share.request")); n != 1 {
+				t.Fatalf("message %d: delivered %d, want 1", i+1, n)
+			}
+			time.Sleep(100 * time.Millisecond) // 10 per second
+		}
+		notRelayed(t, page, toConn(agentID, "share.request"), protocol.ErrorCodeAgentTargetNotFound)
+		if n := e.logs.count("level=WARN", "connection inbox full", "conn_id="+agentID); n != 1 {
+			t.Errorf("%d log lines for the full inbox, want 1", n)
+		}
+		// Its socket is closing, so it is no target any more, by its role either.
+		notRelayed(t, page, toRole(protocol.RoleAgent, "share.request"), protocol.ErrorCodeAgentTargetNotFound)
+
+		release()
+		expectClose(t, agent, protocol.CloseCodeSlowConnection)
+		synctest.Wait()
+		if conns, _, _, _ := signal.Counts(e.hub, id.UserID); conns != 1 {
+			t.Errorf("%d connections, want 1: the target is closed without grace", conns)
+		}
+		notRelayed(t, page, toConn(agentID, "share.request"), protocol.ErrorCodeAgentTargetNotFound)
+		nothingFor(t, page)
+	})
+}
+
 // Every role may send agent.send (01 §6.3), and a connection of any role is a target by that role. One user has a
 // connection of each role; each sends to each role, its own included, where it finds nobody: the sender is not its
 // own target.
@@ -517,8 +557,9 @@ func TestRelayBadRequest(t *testing.T) {
 	})
 }
 
-// The payload is opaque to the hub (01 §8.14): any JSON value goes through as that value, whatever is in it, and it
-// is never logged (01 §17).
+// The payload is opaque to the hub (01 §8.14): any JSON value goes through as it came in, whatever is in it, but
+// for the white space between its tokens, and it is never logged (01 §17). The characters that encoding/json escapes
+// for HTML are not escaped: a target is sent no more bytes than the sender sent.
 func TestRelayPayloadOpaque(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		e := newEnv(t)
@@ -533,6 +574,7 @@ func TestRelayPayloadOpaque(t *testing.T) {
 			`{"html":"<b>a&b</b>","escaped":"\u003c\u2028\"\\","text":"héllo 日本語 🎬"}`,
 			`{ "spaced" : [ 1 , 2 ] ,` + "\n\t" + `"type" : "ok" , "from" : "c_0000000000000000" }`,
 			`[1,"two",{"three":3}]`,
+			"[\"<>&\", \"\u2028\u2029\"]",
 			`"` + canary + `"`,
 			`42`,
 			`true`,
@@ -556,13 +598,17 @@ func TestRelayPayloadOpaque(t *testing.T) {
 			if !reflect.DeepEqual(have, want) {
 				t.Errorf("payload %s was relayed as %s", payload, got)
 			}
+			var compact bytes.Buffer
+			if err := json.Compact(&compact, []byte(payload)); err != nil || !bytes.Equal(got, compact.Bytes()) {
+				t.Errorf("payload %s was relayed as %s, want %s (%v)", payload, got, compact.Bytes(), err)
+			}
 		}
 		nothingFor(t, page, agent)
 		if logs := e.logs.String(); strings.Contains(logs, canary) || strings.Contains(logs, "héllo") {
 			t.Errorf("a payload is in the log:\n%s", logs)
 		}
-		if n := e.logs.count("level=DEBUG", "msg=relay", "kind=exclusions.set"); n != 8 {
-			t.Errorf("%d relay log lines, want 8", n)
+		if n := e.logs.count("level=DEBUG", "msg=relay", "kind=exclusions.set"); n != 9 {
+			t.Errorf("%d relay log lines, want 9", n)
 		}
 	})
 }

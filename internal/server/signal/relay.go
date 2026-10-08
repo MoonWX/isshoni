@@ -1,7 +1,9 @@
 package signal
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -17,8 +19,8 @@ import (
 // sender's connection id, which a target answers to with an agent.send{to} of its own. The sender gets
 // ok{delivered}, the number of targets.
 //
-// The hub never looks into the payload: it goes out as the JSON value that came in (encodeAgentRecv). The kinds are
-// a registry of the M2 and M4 docs; the hub checks their form only.
+// The hub never looks into the payload: it goes out as the JSON value that came in, in no more bytes than came in
+// (encodeAgentRecv). The kinds are a registry of the M2 and M4 docs; the hub checks their form only.
 //
 // Targets are connections of the sender's own user and of nobody else, whatever their session or device:
 //
@@ -37,6 +39,10 @@ import (
 // delivered counts the connections whose actor was handed the message while their socket was open. It is not an
 // acknowledgment: a socket can still fail before the message is written, or the connection can detach before its
 // actor gets to it. Kinds that need an answer define one (share.request and share.status, M4).
+//
+// A target whose actor's inbox is full is not handed the message and is not counted. It is closed for good as
+// slow_connection, without grace (conn.post, 01 §15.2), like any connection that cannot keep up with what the hub
+// has for it: its shares end, and no resume brings it back.
 //
 // What comes before the handler (dispatch.go): the frame is at most 64 KiB, the connection has the agent.relay
 // feature (else feature_disabled), and its per-type bucket has a token (typeRates: 10 per second per connection,
@@ -83,15 +89,40 @@ func (c *conn) onAgentSend(env protocol.Envelope) {
 // encodeAgentRecv encodes the agent.recv that takes a relayed message to its targets: from is the sender's
 // connection id, kind and payload are the agent.send's.
 //
-// The payload goes out as the JSON value that came in, not byte for byte: encoding/json drops the white space
-// between its tokens and writes <, >, &, U+2028 and U+2029 as \u escapes, six bytes each. So the message is at most
-// six times the payload plus the envelope, under 100 KiB for the largest payload (16 KiB), which is far below what
-// a socket's send queue takes (Limits.SendQueueBytes) and what the clients read. A payload that passed
-// protocol.ParseEnvelope and AgentSend.Validate always encodes, and the result is as deeply nested as the agent.send
-// was, so it passes the receiving side's ParseEnvelope too (FuzzRelayEncode).
+// The payload goes out as it came in, but for the white space between its tokens, which is dropped (json.Compact).
+// So the message is never more than the payload plus an envelope of about a hundred bytes: what a sender is charged
+// for (16 KiB of payload, 10 per second) is the most that each target is sent, and agent.recv stays far below the
+// 64 KiB of a message (protocol.MaxMessageBytes).
+//
+// That is why the payload does not go through protocol.Marshal, as the rest of the message does. encoding/json
+// escapes what it marshals for JSON inside a web page, which a WebSocket message is not: every <, >, &, U+2028 and
+// U+2029 of the payload would go out as a \u escape of six bytes, up to six times what came in. For a payload
+// without those characters the message is the very one that Marshal makes (TestRelayEncodeMatchesProtocol).
+//
+// A payload that passed protocol.ParseEnvelope and AgentSend.Validate always encodes, and the result is as deeply
+// nested as the agent.send was, so it passes the receiving side's ParseEnvelope too (FuzzRelayEncode).
 func encodeAgentRecv(from, kind string, payload json.RawMessage) ([]byte, error) {
-	return protocol.Marshal(protocol.MessageTypeAgentRecv, "", "",
-		protocol.AgentRecv{From: from, Kind: kind, Payload: payload})
+	// The message as the protocol encodes it with a null for its payload, which is the last thing in it. The payload
+	// takes the null's place.
+	const placeholder, tail = "null", "}}"
+	msg, err := protocol.Marshal(protocol.MessageTypeAgentRecv, "", "",
+		protocol.AgentRecv{From: from, Kind: kind, Payload: json.RawMessage(placeholder)})
+	if err != nil {
+		return nil, err
+	}
+	head, ok := bytes.CutSuffix(msg, []byte(placeholder+tail))
+	if !ok {
+		return nil, fmt.Errorf("agent.recv does not end with its payload: %s", msg)
+	}
+	var b bytes.Buffer
+	b.Grow(len(head) + len(payload) + len(tail))
+	b.Write(head)
+	if err := json.Compact(&b, payload); err != nil {
+		// Without the error's text, which quotes a character of the payload: the payload is never logged (01 §17).
+		return nil, errors.New("the payload is not JSON")
+	}
+	b.WriteString(tail)
+	return b.Bytes(), nil
 }
 
 // relayTargets returns the connections that an agent.send of connection from reaches right now (see the top of this

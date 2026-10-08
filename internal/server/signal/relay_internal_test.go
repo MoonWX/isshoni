@@ -29,9 +29,17 @@ func jsonValue(b []byte) (any, error) {
 	return v, err
 }
 
+// htmlEscaped reports whether encoding/json's escaping for HTML would change the JSON text: it has a <, a > or a &,
+// or a U+2028 or U+2029.
+func htmlEscaped(b []byte) bool {
+	return bytes.ContainsAny(b, "<>&\u2028\u2029")
+}
+
 // checkRelayEncoding relays an agent.send frame's message as encodeAgentRecv does and checks what a target gets: a
-// frame that parses, from the sender, with the kind, a payload of the same JSON value, and at most six times the
-// payload's size plus the envelope. It reports whether the frame was a valid agent.send at all.
+// frame that parses, from the sender, with the kind and the payload. The payload is the one that came in, byte for
+// byte but for the white space between its tokens, so the message is never larger than the payload plus the
+// envelope; and unless the payload has a character that encoding/json escapes for HTML, the message is the very one
+// that protocol.Marshal makes. It reports whether the frame was a valid agent.send at all.
 func checkRelayEncoding(t *testing.T, frame []byte) bool {
 	t.Helper()
 	env, err := protocol.ParseEnvelope(frame)
@@ -50,8 +58,15 @@ func checkRelayEncoding(t *testing.T, frame []byte) bool {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if limit := len(empty) - 1 + 6*len(v.Payload); len(out) > limit {
+	if limit := len(empty) - 1 + len(v.Payload); len(out) > limit {
 		t.Fatalf("a payload of %d bytes makes a message of %d, over the limit of %d", len(v.Payload), len(out), limit)
+	}
+	if !htmlEscaped(v.Payload) {
+		same, err := protocol.Marshal(protocol.MessageTypeAgentRecv, "", "",
+			protocol.AgentRecv{From: relayFrom, Kind: v.Kind, Payload: v.Payload})
+		if err != nil || !bytes.Equal(out, same) {
+			t.Fatalf("relayed as %s, but protocol.Marshal makes %s (%v)", out, same, err)
+		}
 	}
 	got, err := protocol.ParseEnvelope(out)
 	if err != nil || got.Type != protocol.MessageTypeAgentRecv || got.ID != "" || got.Re != "" {
@@ -69,11 +84,74 @@ func checkRelayEncoding(t *testing.T, frame []byte) bool {
 	if err != nil || !reflect.DeepEqual(have, want) {
 		t.Fatalf("payload %s was relayed as %s (%v)", v.Payload, r.Payload, err)
 	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, v.Payload); err != nil || !bytes.Equal(r.Payload, compact.Bytes()) {
+		t.Fatalf("payload %s was relayed as %s, want it unchanged but for its white space (%v)", v.Payload, r.Payload, err)
+	}
 	return true
 }
 
-// The largest message the relay sends: a 16 KiB payload of characters that encoding/json escapes with six bytes
-// each stays under 100 KiB, and a payload without them goes out no larger than it came in.
+// The relay puts the payload into the agent.recv itself (encodeAgentRecv), and the message must not drift from the
+// protocol's: for a payload that HTML escaping leaves alone it is protocol.Marshal's, byte for byte, and the spec's
+// example (01 §8.14). With a character that Marshal would escape, the two differ in that character's form only.
+func TestRelayEncodeMatchesProtocol(t *testing.T) {
+	marshal := func(kind, payload string) []byte {
+		t.Helper()
+		b, err := protocol.Marshal(protocol.MessageTypeAgentRecv, "", "",
+			protocol.AgentRecv{From: relayFrom, Kind: kind, Payload: json.RawMessage(payload)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	for _, tc := range []struct{ kind, payload string }{
+		{"share.request", `{"preset":"game"}`},
+		{"share.status", `{}`},
+		{"playback.stop", `[1,2.5,-3e2,1E400,true,false,null,"x"]`},
+		{"exclusions.set", ` { "spaced" : [ 1 , 2 ] ,` + "\n\t" + `"type" : "ok" , "from" : "c_0000000000000000" } `},
+		{"exclusions.get", `{"escaped":"\u003c\u2028\ud800\"\\","text":"héllo 日本語 🎬"}`},
+		{"x", `"text"`},
+		{"x", `0`},
+		{"x", `null`},
+	} {
+		if htmlEscaped([]byte(tc.payload)) {
+			t.Fatalf("payload %s has a character that is escaped for HTML", tc.payload)
+		}
+		got, err := encodeAgentRecv(relayFrom, tc.kind, json.RawMessage(tc.payload))
+		if want := marshal(tc.kind, tc.payload); err != nil || !bytes.Equal(got, want) {
+			t.Errorf("payload %s: encoded as %s (%v), protocol.Marshal makes %s", tc.payload, got, err, want)
+		}
+	}
+	const example = `{"type":"agent.recv","data":{"from":"c_k3v9q2m7xw4pa8d1","kind":"share.request","payload":{"preset":"game"}}}`
+	if got, err := encodeAgentRecv(relayFrom, "share.request", json.RawMessage(`{"preset":"game"}`)); err != nil ||
+		string(got) != example {
+		t.Errorf("encoded as %s (%v), want the spec's example %s", got, err, example)
+	}
+
+	// With characters that Marshal escapes, the relay's message has them as they came in. Marshal's is the same JSON
+	// value in more bytes: five more for each <, > and &, three more for each U+2028 and U+2029. (Should Marshal stop
+	// escaping, encodeAgentRecv can go back to it.)
+	const html = "{\"html\":\"<b>a&b</b>\",\"sep\":\"\u2028\u2029\"}"
+	got, err := encodeAgentRecv(relayFrom, "exclusions.set", json.RawMessage(html))
+	if err != nil || !bytes.HasSuffix(got, []byte(`"payload":`+html+`}}`)) {
+		t.Errorf("encoded as %s (%v), want the payload %s as it is", got, err, html)
+	}
+	escaped := marshal("exclusions.set", html)
+	if want := len(got) + 5*5 + 2*3; len(escaped) != want {
+		t.Errorf("protocol.Marshal makes %d bytes, want %d (the relay's %d and the escapes): %s", len(escaped), want,
+			len(got), escaped)
+	}
+	a, errA := jsonValue(got)
+	b, errB := jsonValue(escaped)
+	if errA != nil || errB != nil || !reflect.DeepEqual(a, b) {
+		t.Errorf("%s and %s are not the same JSON value (%v, %v)", got, escaped, errA, errB)
+	}
+}
+
+// The largest message the relay sends is the largest payload, 16 KiB, plus the envelope, whatever the payload is
+// made of: the characters that encoding/json would escape for HTML with six bytes each go out as they came in. So a
+// target is sent what the sender was charged for, and agent.recv stays far under the 64 KiB of a message
+// (protocol.MaxMessageBytes).
 func TestRelayEncodeSize(t *testing.T) {
 	text := func(n int, c string) []byte { // a JSON string of n bytes
 		return []byte(`"` + strings.Repeat(c, (n-2)/len(c)) + `"`)
@@ -85,8 +163,8 @@ func TestRelayEncodeSize(t *testing.T) {
 	}{
 		{"plain", text(protocol.MaxAgentPayloadBytes, "x"), protocol.MaxAgentPayloadBytes + 128},
 		{"spaced", []byte(`[` + strings.Repeat(" 1 ,\n", 3000) + `2]`), protocol.MaxAgentPayloadBytes},
-		{"html", text(protocol.MaxAgentPayloadBytes, "<"), 100 << 10},
-		{"line separators", text(protocol.MaxAgentPayloadBytes, "\u2028"), 2*protocol.MaxAgentPayloadBytes + 128},
+		{"html", text(protocol.MaxAgentPayloadBytes, "<"), protocol.MaxAgentPayloadBytes + 128},
+		{"line separators", text(protocol.MaxAgentPayloadBytes, "\u2028"), protocol.MaxAgentPayloadBytes + 128},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if len(tc.payload) > protocol.MaxAgentPayloadBytes {
