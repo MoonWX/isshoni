@@ -26,8 +26,8 @@ import (
 // The api_test of 02 §17 on a loopback netx.Transport (04): the sub offer and the pub answer are complete (every
 // advertised candidate, UDP and passive TCP 7882, and end-of-candidates: no trickle), PCs on both APIs connect over
 // UDP and over TCP 7882, the probe APIs each advertise only their transport, and the remote-candidate filter drops
-// what 02 §7.3 lists. The TCP 443 candidate needs 04's real 443 multiplexer (netx.ListenPortMux), so that case lands
-// with README S29.
+// what 02 §7.3 lists. The TCP 443 candidates come from 04's real 443 multiplexer (netx.ListenPortMux on 127.0.0.1:0,
+// TestCandidatesWithTCP443); a whole Conn negotiating and connecting through it is in negotiate_test.go.
 
 // loopbackIfaces is a netx.InterfaceLister with only a loopback interface (127.0.0.1, and ::1 with v6), so the
 // Transport's address plan doesn't depend on the host. (Pion still enumerates the host's interfaces itself; the
@@ -581,6 +581,82 @@ func TestProbeAPIs(t *testing.T) {
 				t.Errorf("selected pair labeled %q, want %q", got, tc.pt)
 			}
 		})
+	}
+}
+
+// TestCandidatesWithTCP443: on a Transport that has 04's 443 multiplexer (netx.ListenPortMux on 127.0.0.1:0, as
+// tls.mode != off gives it), a sub offer and a pub answer hold the UDP candidate and passive TCP candidates on 443 and
+// on 7882, complete and without trickle, and there is a third probe API whose offer holds only the 443 candidate.
+func TestCandidatesWithTCP443(t *testing.T) {
+	pm, err := netx.ListenPortMux(netx.PortMuxOptions{Addr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := pm.Close(); err != nil {
+			t.Errorf("close the 443 multiplexer: %v", err)
+		}
+	})
+	tr, err := netx.NewTransport(context.Background(), netx.TransportOptions{
+		UDPAddr: "127.0.0.1:0", TCPAddr: "127.0.0.1:0", PortMux: pm, IncludeLoopback: true, Interfaces: loopbackIfaces{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := tr.Close(); err != nil {
+			t.Errorf("close transport: %v", err)
+		}
+	})
+	a := newTestAPIs(t, tr)
+	all := []string{netx.ViaUDP, netx.ViaTCP443, netx.ViaTCP7882}
+
+	sub := newTestPC(t, a.sub)
+	addSendonly(t, sub, h264Track(t, "s_443"), opusTrack(t, "a-s_443"))
+	offer, err := sub.CreateOffer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subOffer := completeDescription(t, sub, offer)
+	checkCompleteSDP(t, a, tr, subOffer, all...)
+	port443 := pm.Addr().(*net.TCPAddr).AddrPort().Port()
+	want := sdpCand{
+		proto: "tcp", addr: netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port443), typ: "host", tcpType: "passive",
+	}
+	if !slices.Contains(sdpCandidatesOf(t, subOffer), want) {
+		t.Errorf("the sub offer has no candidate %v on the multiplexer's port:\n%v", want, sdpCandidatesOf(t, subOffer))
+	}
+
+	client := newTestPC(t, loopbackClientAPI(t, webrtc.NetworkTypeUDP4))
+	addSendonly(t, client, h264Track(t, "s_pub443"), opusTrack(t, "a-s_pub443"))
+	offer, err = client.CreateOffer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := newTestPC(t, a.pub)
+	remote := webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: completeDescription(t, client, offer)}
+	if err := pub.SetRemoteDescription(remote); err != nil {
+		t.Fatal(err)
+	}
+	answer, err := pub.CreateAnswer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkCompleteSDP(t, a, tr, completeDescription(t, pub, answer), all...)
+
+	if got := slices.Sorted(maps.Keys(a.probe)); !slices.Equal(got, []ProbeTransport{ProbeTCP443, ProbeTCP7882, ProbeUDP}) {
+		t.Fatalf("probe APIs %v, want all three", got)
+	}
+	for _, pt := range []ProbeTransport{ProbeUDP, ProbeTCP443, ProbeTCP7882} {
+		pc := newTestPC(t, a.probe[pt])
+		if _, err := pc.CreateDataChannel("probe", nil); err != nil {
+			t.Fatal(err)
+		}
+		offer, err := pc.CreateOffer(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkCompleteSDP(t, a, tr, completeDescription(t, pc, offer), string(pt))
 	}
 }
 
