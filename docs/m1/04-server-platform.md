@@ -170,6 +170,23 @@ Conventions:
 **Exception, `healthcheck`**: exits only **0** (healthy) or **1** (unhealthy, unreachable, or any error), because
 Docker reserves exit code 2 in `HEALTHCHECK`.
 
+**Exit 7 for the admin socket's error codes** (as README S43 built `refusalExit`; later slices add to it). A client
+command branches on the `code` of the server's error, never on the HTTP status (§12.2). Six codes mean "refused:
+a precondition is not met, and repeating the command won't change that" and exit **7**:
+
+| Code | From | The precondition |
+|---|---|---|
+| `setup_unavailable` | `setup-url` | an admin already exists (fix: `isshoni admin users reset-password NAME`) |
+| `last_admin` | `admin users set-role NAME user`, `admin users disable NAME` | it would remove the last active admin |
+| `registration_closed` | `admin invite create` | `registration.mode` is `closed`: no invite can be made or used |
+| `limit_reached` | `admin invite create` | the server has its 100 active invites (03 §7.9) |
+| `backup_newer` | `admin restore` | the backup is from a newer isshoni than this binary |
+| `restore_in_progress` | `admin restore` | another restore is running |
+
+Every other error answer of the server exits **1**: `user_not_found`, `validation_failed`, `bad_request`,
+`server_shutdown` (§12.2), `internal`. In both cases the command prints the socket's `message` and, when there is
+one, a line `fix: …` (§12.1). No server on the socket, and permission denied on it, are exit 4 as in the table.
+
 ### 3.3 Output examples
 
 `isshoni setup-url` on a TTY:
@@ -191,8 +208,37 @@ When the certificate is not ready yet, the link is still printed with a note: "T
 link works once it is; check with `isshoni doctor`." `--wait 180s` first waits for readiness; it is for Docker and
 manual use. install.sh waits with `isshoni healthcheck --ready` and then calls `setup-url` once (06).
 
-QR rendering uses `github.com/skip2/go-qrcode` (MIT) `ToSmallString`: half-block characters, 2-module quiet zone.
-It is a new dependency (permissive) added for this command only.
+QR rendering uses `github.com/skip2/go-qrcode` (MIT) for the code's modules and draws them in the style of its
+`ToSmallString`: half-block characters, with a 2-module quiet zone (below). It is a new dependency (permissive)
+added for this command only.
+
+**As README S43 built the output** (`cmd/isshoni/client.go` `printLink`, `qr.go`):
+
+- **Off a terminal, stdout carries the bare link.** When stdout is not a terminal (a pipe, a file,
+  `docker compose exec -T`), stdout gets the link alone on its first line, with no heading and no indentation, so a
+  script takes it as it is: `url=$(isshoni setup-url)`. The heading ("Open this link…") and the notes ("The
+  certificate isn't ready yet…", "Running `isshoni setup-url` again…") go to stderr. On a terminal everything goes
+  to stdout in the layout above. `admin users reset-password` and `admin invite create` print their links the same
+  way (without a QR code).
+- **The QR code** is drawn by default only when stdout is a terminal. `--no-qr` never draws it; `--qr` draws it
+  also off a terminal, where it follows the link on stdout (the link stays the first line). `--qr` with `--no-qr`
+  is a usage error (exit 2). With `--json`, stdout is the one JSON document and the code of `--qr`, like the
+  certificate note, goes to stderr. A link too long for a QR code prints `isshoni: no QR code: …` on stderr and
+  the link all the same.
+- **The quiet zone is 2 modules, and the CLI draws the code itself.** go-qrcode's `ToSmallString` has a fixed
+  border of 4 modules (the standard's quiet zone), which makes the code of a setup link wider and taller than it
+  needs to be on an 80-column terminal. So `qr.go` takes the module bitmap from the library with its border off
+  (error correction level Medium) and draws it with the same half-block characters, two rows of modules per line,
+  and a 2-module border; phone cameras read it. Light modules are drawn (`█`) and dark ones left blank, as
+  `ToSmallString` and `qrencode` do: right on the usual dark terminal, and the negative on a light one, which
+  phones read as well. On a terminal the code is indented like the link.
+- "valid 24 hours" is computed from the answer's `expiresAt` (days from three days on, hours below, minutes below
+  an hour), so the text stays right if 03's token lifetime changes.
+- **`--wait DUR`** takes at most 1 h (`ops.AdminMaxWaitReady`, the server's own limit for `waitReadyS`); more is a
+  usage error. While no server answers yet (a container that has just started), the command tries again every
+  500 ms; once a server answers, the server itself waits for readiness; both together take at most `DUR`. After
+  2 s of waiting it says so once on stderr ("Waiting for the server to be ready (up to 3m)…"). Running out of time
+  on the server's side is no error: the link is minted and `tlsReady` says whether the certificate is there.
 
 ---
 
@@ -723,7 +769,10 @@ func (s *Server) Shutdown(ctx context.Context, reason ShutdownReason) error
 func (s *Server) Site() config.Site
 func (s *Server) Addrs() Addrs // as bound: a configured port 0 shows as the port the kernel picked
 
-type Addrs struct{ HTTP net.Addr } // later slices add the 443 mux, the ICE ports and the metrics listener
+type Addrs struct {
+	HTTP  net.Addr // listen.http: the app in off mode; else the plain port (ACME http-01, redirect; §8.3)
+	HTTPS net.Addr // listen.https: the 443 multiplexer (S44); nil in off mode
+} // later slices add the ICE ports and the metrics listener
 
 type ShutdownReason string // "stop" | "restart" | "restore"
 
@@ -759,7 +808,8 @@ goroutine and does not wait for it: its own request would hold up the HTTP step.
 
    Offline doctor's `schema` fix uses the same formatter (§13.2). Then pin the policy settings that the config sets
    (§4.6); a value that `Pin` rejects → exit 78.
-5. Detect public addresses (§7.4; ≤ 5 s).
+5. Detect public addresses (§7.4; ≤ 5 s). A detection that finds nothing is no error: the server goes on, and
+   where its site is the address it starts without a site and is not ready (§6.2).
 6. Bind listeners: 443 `PortMux`, 80, metrics, admin socket; then `netx.NewTransport` binds 7882/udp (per local IP)
    and 7882/tcp. `NewTransport` is the only code that binds 7882. A busy port → exit 1 with the owner if known
    ("port 443 is in use (another web server?). Stop it, or run isshoni behind it with `tls.mode = "off"`"; "port
@@ -784,9 +834,47 @@ goroutine and does not wait for it: its own request would hold up the HTTP step.
 | `tls` | tlsmgr | A valid certificate for the site name is loaded (`off`: always) |
 | `media` | netx + 02 | ≥ 1 UDP socket bound (or UDP disabled and a TCP mux up) and `SFU.Ready()` |
 | `signal` | 01 | `Hub.Ready()` |
-| `public_ip` | netx | `ip` mode only: a public address is known |
+| `public_ip` | netx | only where the site is the server's address (`ip` mode, and `manual` mode without a `domain`): a public address is known |
 
 Liveness is false after shutdown began. Endpoints: §11.1.
+
+**A server whose site is its address and that finds none starts, and is not ready** (as README S44 built it;
+kept, decided after group 5). The site is the public address in ip mode and in manual mode without a `domain`
+(§4.4); the check `public_ip` exists in exactly those two cases. When `public_ip = "auto"` finds nothing at
+startup (§7.4: no public address on an interface and no STUN answer within 5 s), `serve` does **not** exit 78: the
+cause is often gone a minute later (the network isn't up yet when the unit starts at boot, a DHCP lease or the
+cloud's address is still on its way, STUN is briefly unreachable), and 78 means "a restart can't fix this", after
+which systemd stops trying for good (§3.2, `RestartPreventExitStatus=78`). A literal `public_ip` that is not a
+public address is a different case and stays a config error with exit 78 (§4.5). install.sh runs doctor's
+`public_ip` check before the first start (06 §4.8), so a fresh install hears of a missing address there. This rule
+is about a later start that finds none: after a reboot, or in Docker, where an unset `ISSHONI_PUBLIC_IP` means
+`auto` and nothing checked beforehand.
+
+What the operator sees on such a server:
+
+| Where | What |
+|---|---|
+| The log | WARN `public address detection failed` from `netx` when the detection itself failed, then its INFO line `public addresses` with neither a `public_ipv4` nor a `public_ipv6` attribute (`nat=unknown`, or `nat=cgnat_likely` when the default route's interface has a carrier-NAT address and no STUN server answered); in ip mode WARN from `tls`: `tls.mode "ip" has no public IP address to get a certificate for; set public_ip and restart`; and in place of the "ready" line of §6.1 step 10, WARN `isshoni 0.3.0 started without a public IP address (tls=ip) and is not ready: set public_ip to this server's public address, or set domain, and restart` |
+| Readiness | `public_ip`: "no public IP address found; set public_ip and restart". In ip mode also `tls`: "no public IP address to get a certificate for" (there is no name to order a certificate for, so no ACME request is made). Liveness is true: the process is healthy, and Docker's `HEALTHCHECK` passes |
+| `isshoni healthcheck --ready`, the admin socket's `/v1/ready` | not ready (exit 1), with the two checks. install.sh's wait for readiness ends at its timeout and prints the journal's last lines and doctor's output (06 §4.10) |
+| Port 80 | **503** with `Retry-After: 30` and the waiting page (§8.3) for every request outside `/.well-known/acme-challenge/`: there is no origin to redirect to |
+| Port 443 | ip mode: the TLS handshake fails, there is no certificate. Manual mode without a domain: the operator's certificate serves, and every request but `/healthz` and `/readyz` gets 421 from the Host check (§9.3), because no host is the site's |
+| `isshoni doctor` | `public_ip` is `fail` with this state's own text and fix (§13.2) |
+
+The server does not take a site later in the same process: the origin, the Host check, the certificate's name and
+the ICE rewrite rules are made once, at startup (§7.4's rationale for "restart to apply"). So the way out is a
+restart with an address to find: `public_ip` set to the address (the fix every message names), `domain` set, or
+simply `sudo systemctl restart isshoni` once the network is up.
+
+**Nothing restarts such a server by itself.** systemd's `Restart=on-failure` and Docker's restart policy act on a
+process that ended, not on one that runs and is not ready, and Docker's `HEALTHCHECK` is liveness, which passes.
+So a cause that was gone a minute after boot still leaves the server not ready until the operator restarts it.
+What staying up gives is a server that says why, in every place of the table above. The periodic detection of
+§7.4 does not change this. It is not wired yet after S44, whose `Start` detects once and only in the TLS modes;
+it comes with the wiring (README S54). From then on it looks again every 10 minutes and reports an address that
+shows up the way it reports any change: a warning in the log that says to restart isshoni to apply it (the
+dashboard's `public_ip.changed` alert is the same event, but nobody can open the dashboard of a server without a
+site).
 
 ### 6.3 Refusing to start
 
@@ -810,6 +898,12 @@ Reasons (codes, used in logs and doctor): `schema_newer`, `migration_failed`, `d
 `data_dir_not_writable` (the data directory can't be created or written, or its lock file can't be opened) and
 `admin_socket_dir` (the admin socket's directory can't be created). `config.ReasonOf(err)` returns config's codes.
 
+**Not refusals** (S44): what the server lacks from outside never stops the start. A certificate that can't be had
+yet, in any mode, and a public address that the detection didn't find leave a running server that is not ready
+(§6.2, §8.2), where the admin socket and doctor can say why. The certificate then arrives by itself once its
+cause is gone (certmagic retries, manual files are polled); the address takes the restart of §6.2. Exit 78 is for
+what only the operator can change on this machine.
+
 ### 6.4 Graceful shutdown: what clients see
 
 On SIGTERM/SIGINT (systemd stop and restart both send SIGTERM, so every shutdown is treated as a possible restart),
@@ -822,7 +916,7 @@ and for a restore or `rotate-secrets` restart:
 | 3. `Hub.Shutdown(ctx, reason)` (01): every connection gets `server.shutdown{reason, reconnectInMs}` and `error{code: "server_shutdown", retryable: true, scope: "connection"}`, then WebSocket close **1012 (Service Restart)**. The wire reason is `restart` for SIGTERM, restore and rotation (SIGTERM can't tell stop from restart) | ≤ 2 s | The SPA shows "Server restarting… reconnecting" and reconnects after `reconnectInMs`; after the restart it rejoins and re-publishes (01 §10.5–§10.6) |
 | 4. `SFU.Close()` closes all PeerConnections (concurrently; 02 guarantees it returns within 1 s); then `Transport.Close()` closes the muxes | ≤ 1 s | |
 | 5. `http.Server.Shutdown` on all servers, then `PortMux.Close()` (closes the raw :443 listener and both sub-listeners; the ICE sub-listener may already be closed by `Transport.Close`, which is harmless) | ≤ 5 s | Idle keep-alives close |
-| 6. Flush transfer counters, drain the push queue (≤ 2 s), close the admin socket, close the store (WAL checkpoint) | ≤ 2 s | |
+| 6. Stop the TLS manager (`tlsmgr.Manager.Shutdown`, §8.2: no order, renewal or reload writes the certificate storage after it; S44), flush transfer counters, drain the push queue (≤ 2 s), close the admin socket, close the store (WAL checkpoint) | ≤ 2 s | |
 | 7. Exit 0 (or re-exec, §6.5) | total ≤ `shutdown_timeout` (10 s) | |
 
 A step that runs out of its budget closes by force what it still has (a request that won't finish, say), and the
@@ -1117,6 +1211,14 @@ startup and then every 10 minutes; a change is logged as a warning and shown on 
 A to B; restart isshoni to apply"). Rationale: rewrite rules are fixed per `webrtc.API`; a hot swap is *later*. VPS
 addresses rarely change.
 
+**"Nothing found" at startup** (the table's last row, and its `cgnat_likely` row when no STUN server answered:
+no address then either, with the NAT kind `cgnat_likely`; S44, kept after group 5): `DetectPublicAddrs` returns
+what it found, and an error next to it when a step failed; neither stops the start. In ip mode, and in manual mode
+without a domain, the server then starts without a site and is not ready; §6.2 lists what the operator sees and
+why it is not an exit 78. Once the periodic detection is wired (README S54; §6.2), it goes on for such a server
+as for any other. An address it finds later is a change like "A to B": logged, and applied only by a restart.
+The server does not take it by itself, and nothing restarts it (§6.2).
+
 Privacy: STUN contacts Cloudflare and Google at startup and every 10 minutes (one UDP packet each). Setting `public_ip`
 limits this to one NAT check at startup; `network.stun_servers = []` stops STUN entirely (set `public_ip` to a literal
 then). The privacy page says so (§16).
@@ -1239,10 +1341,17 @@ Both challenge types stay enabled, so issuance works when only one of 80 or 443 
 
 ### 8.2 certmagic version and setup
 
-- **Pin `github.com/caddyserver/certmagic v0.25.4`** (June 2026). Needed features: ACME `Profile` (since v0.22.0);
-  IP identifiers allowed for Let's Encrypt in `ACMEIssuer.PreCheck` (PR #345, merged July 2025, first in v0.24.0);
-  HTTP-01 for IPv6 literals fixed in v0.25.3. Caddy issue #7399 (Dec 2025) reported a PreCheck refusal for IP
-  certificates with an older build, so slice S7 must issue a real staging IP certificate on a VPS before M1 is done.
+- **`github.com/caddyserver/certmagic` v0.25.4 or newer** (v0.25.4 is from June 2026). Needed features: ACME
+  `Profile` (since v0.22.0); IP identifiers allowed for Let's Encrypt in `ACMEIssuer.PreCheck` (PR #345, merged
+  July 2025, first in v0.24.0); HTTP-01 for IPv6 literals fixed in v0.25.3. Caddy issue #7399 (Dec 2025) reported
+  a PreCheck refusal for IP certificates with an older build, so slice S7 must issue a real staging IP certificate
+  on a VPS before M1 is done.
+  - **Built with v0.25.6, not v0.25.4** (README S44; `go.mod`, with `github.com/mholt/acmez/v3` v3.1.7). README
+    §5's rule for shared modules is that the first slice to need a module adds it at the current release, and
+    that is where v0.25.6 comes from. Every feature listed here is in it: they all arrived by v0.25.3. So
+    v0.25.4 is a floor, not a pin to hold: Dependabot moves the module from here on, and the Pebble job (a domain
+    and an IP certificate over http-01 and tls-alpn-01, a renewal, `serve` in auto mode) is what a bump has to
+    pass.
 - certmagic logs through `*zap.Logger`; `logx.NewZapBridge(slog)` is a ~60-line `zapcore.Core` that forwards to slog
   (component `tls`).
 
@@ -1262,6 +1371,12 @@ type Options struct {
 	StorageDir  string // <data_dir>/certmagic
 	HSTS        bool
 	Logger      *slog.Logger
+
+	// Added by README S44; the manager needs them from the wiring (below).
+	PublicIPv6          netip.Addr    // the public IPv6 address next to PublicIP, when there is one
+	Site                config.Site   // Origin: the redirect target of port 80; Hostname: manual mode's SAN warning
+	HTTPAddr, HTTPSAddr string        // the bound "host:port" of the port 80 and the 443 listener
+	Resolver            netx.Resolver // auto mode's DNS check (§8.7); nil = net.DefaultResolver
 }
 
 type Status struct {
@@ -1281,12 +1396,59 @@ type Manager struct{ /* … */ }
 
 func New(opts Options) (*Manager, error)
 func (m *Manager) Start(ctx context.Context) error   // ManageAsync / load files / start file watcher
+func (m *Manager) Shutdown(ctx context.Context) error // S44: ends the work; nil = nothing writes StorageDir any more
 func (m *Manager) TLSConfig() *tls.Config            // nil in off mode
 func (m *Manager) HTTPHandler(app http.Handler) http.Handler // port 80 (§8.3); app is used only in off mode
 func (m *Manager) Reload() error                     // manual: re-read files (SIGHUP)
 func (m *Manager) Status() Status
 func (m *Manager) Ready() (bool, string)             // readiness check "tls"
 ```
+
+**The manager as README S44 built it** (`tlsmgr/manager.go`), beyond the block above:
+
+- **`Options` has four more fields**, all filled by the wiring from the site and the listeners it bound
+  (`internal/server/tls.go`):
+  - `PublicIPv6`. `PublicIP` is the one address that stands for the server (the IPv4 one, or the IPv6 one on an
+    IPv6-only host, §7.6): the certificate's name in ip mode. A dual-stack server also has `PublicIPv6`, which auto
+    mode reads wherever it asks "is this address mine?": in its DNS check and for the hint of a failed validation
+    (§8.7).
+  - `Site`. The port 80 handler redirects to `Site.Origin` (never to the request's `Host`, §8.3), and manual mode
+    warns when the certificate doesn't cover `Site.Hostname` (§8.4).
+  - `HTTPAddr` and `HTTPSAddr`. certmagic binds a challenge port only when it finds it free. The manager names the
+    two bound listeners to its ACME issuer (`ListenHost`, `AltHTTPPort`, `AltTLSALPNPort`), which finds them taken
+    and opens none of its own: the challenges arrive at `HTTPHandler` and `TLSConfig`. Empty means ports 80 and 443
+    on every address.
+  - `Resolver`, for the DNS check; the wiring passes `server.Deps.Resolver`, so tests fake it.
+
+  `HSTS` stays in the struct and the manager doesn't use it: `Strict-Transport-Security` belongs to HTTPS
+  responses, which the router writes (§9.6), never to a response on port 80 (RFC 6797 §7.2). A nil `Logger` means
+  `slog.Default()`; the manager adds `component=tls`.
+- **`Shutdown(ctx)`** is new. It cancels the orders and renewals in flight and the file watcher, then waits, until
+  `ctx` ends, for the manager's goroutines, for certmagic's maintenance loop and for certmagic to let go of the
+  storage directory (a wrapper around `certmagic.FileStorage` counts what goes on in it). After a nil return
+  nothing writes below `StorageDir`, so a restore may replace the directory (§12.4 step 5). When `ctx` ends first
+  the error wraps `ctx`'s and the stop goes on in the background; a later or concurrent call waits for that same
+  stop, so nil means the same from every call. The certificate that is loaded keeps serving the handshakes of
+  connections still open. The server calls it in step 6 of the shutdown (§6.4), after the HTTP servers, when
+  nothing handshakes any more. A `Manager` is not started again: `Start` after `Shutdown` is an error.
+- **`New` starts nothing and reads no file.** It refuses only what can't be a configuration: auto mode without a
+  domain, manual mode without both files, auto or ip mode without a `StorageDir`. `Start` returns at once; its only
+  errors are a `StorageDir` that can't be created and a `CARootFile` that can't be used. `TLSConfig`, `HTTPHandler`,
+  `Status` and `Ready` work before `Start` and after `Shutdown`.
+- **A certificate that can't be had is never a failed start.** The server runs without it and is not ready
+  (§6.2), so that doctor and the admin socket can say why. That covers a manual pair that can't be loaded (§8.4),
+  an ACME order that keeps failing (§8.7), and **ip mode without a public address** (`PublicIP` is the zero
+  `Addr`): the manager then has no name to ask a certificate for. It starts no ACME work, logs one warning, and
+  `Ready` answers false with "no public IP address to get a certificate for" (§6.2 has what the operator sees).
+- **`Ready`** is true when a certificate is loaded and the clock is inside its validity; an expired one, or one
+  that isn't valid yet, is not ready and says which. While there is none, the detail names what the manager waits
+  for, with the last error's code: "getting a certificate for 203.0.113.7 (tls.acme_unreachable)". `Status.Names`
+  is never null; in manual mode it lists the certificate's own names.
+- **certmagic setup**, in addition to the listing below: `ShouldEmitFunc` lets through only `cert_obtaining`,
+  `cert_obtained` and `cert_failed` (certmagic would build an event for every handshake otherwise); the first
+  `cert_obtaining` that isn't a renewal starts auto mode's DNS check (§8.7); a `cert_failed` that the shutdown
+  caused is logged at debug and sets no error. `Staging` selects Let's Encrypt's staging directory only when `CA`
+  is empty or Let's Encrypt's production one; it has no effect on another CA.
 
 certmagic configuration (auto and ip):
 
@@ -1333,6 +1495,13 @@ cfg.ManageAsync(ctx, []string{name}) // name = domain, or the IP string
 4. Otherwise `308` to `Site.Origin` + path + query. The target host comes from config, never from the request `Host`
    (no open redirect).
 
+As S44 built it (`tlsmgr/redirect.go`): a request under `/.well-known/acme-challenge/` that is no open challenge
+is a 404, never a redirect. The page of step 3 reloads itself every 30 s (`<meta http-equiv="refresh">`) and is
+sent with `Cache-Control: no-store`. **A server without a site** (ip mode, or manual mode without a domain, that
+found no public address, §6.2) has no origin to redirect to: it answers every other request with the same 503
+page, in manual mode too. The port 80 server speaks HTTP/1.1 only, bounds every exchange at 30 s, and applies
+`limits.conns_per_ip` like the 443 multiplexer (§7.8).
+
 ### 8.4 Manual mode
 
 - Load with `tls.LoadX509KeyPair`; keep it in an `atomic.Pointer[tls.Certificate]`; `GetCertificate` returns it.
@@ -1340,6 +1509,28 @@ cfg.ManageAsync(ctx, []string{name}) // name = domain, or the IP string
   new pair is rejected and logged; the old one keeps serving.
 - Checks at load (errors keep the server not ready; warnings go to doctor): key matches cert; not expired; SANs cover
   `Site.Hostname` (warning); expires within 14 days (warning); files readable by the service user (error with fix).
+
+As S44 built it (`tlsmgr/manual.go`). A load that fails sets `Status.LastErrorCode` to one of three codes of its
+own (§8.7 lists them with their fix texts), and the readiness check `tls` fails while no valid certificate serves:
+
+| What the load finds | Code | What serves |
+|---|---|---|
+| a file is missing, may not be read by the service user, or can't be read | `tls.cert_unreadable` | the pair loaded before, if any |
+| the two files are not a certificate with its private key, or the first certificate can't be parsed | `tls.cert_invalid` | the pair loaded before, if any |
+| the certificate is expired, or not valid yet | `tls.cert_expired` | the old pair while that one is still valid; otherwise the new one, although the server is not ready: a browser then says "expired", which tells more than a failed handshake |
+
+- A failed load at startup is no error of `Start`: the server runs without a certificate, not ready, until good
+  files appear. A load that failed is not repeated until a file changes again, so a broken pair is logged once and
+  not every minute.
+- The poll compares each file's modification time and size with what the last load saw (taken before reading, so
+  a file replaced during the read is caught by the next poll). A tool that replaces the two files one after the
+  other may be caught in between: that load is rejected (`tls.cert_invalid`), the old pair keeps serving, and the
+  next poll finds the second file changed.
+- The two warnings are log lines with a `fix` attribute: the certificate doesn't cover `Site.Hostname` ("browsers
+  will show a warning"), and fewer than 14 days are left. Neither touches readiness or `Status.LastError`.
+- `Reload()` returns the load's error, which says what is wrong with the files and how to fix it. `serve` calls it
+  on SIGHUP once the hardening slice handles that signal (§6.5, README S90); until then the 60 s poll is what
+  picks up new files.
 
 ### 8.5 Off mode and trusted proxies
 
@@ -1375,6 +1566,45 @@ used by logs, `Status.LastErrorCode` and doctor:
 
 In `auto` mode, before the first order, tlsmgr resolves the domain and logs `tls.dns_wrong` early if no A/AAAA record
 matches the public IP (it still tries: DNS may be split-horizon).
+
+**As S44 built the hints** (`tlsmgr/hints.go`; the codes are constants there: `CodeACMEUnreachable` …
+`CodeCertExpired`).
+
+*Three rows are narrower than their ACME problem type.* The CA uses one type for several causes, and a fix text
+must not send the operator the wrong way. What a row leaves out is `tls.acme_failed` with the CA's own `detail`:
+
+| ACME problem | The row applies when | Otherwise `tls.acme_failed`, because |
+|---|---|---|
+| `dns` | the name is a domain and the CA's detail says it has no address record (`NXDOMAIN`, "no valid A records", "No valid IP addresses found") → `tls.dns_missing` | the CA also says `dns` for SERVFAIL, a timeout and a failed CAA lookup. The record may well be there then, and "add an A record" would be wrong advice |
+| `unauthorized` | the name is a domain, and the address the CA reached (the head of its detail, "203.0.113.9: Invalid response…") is not one of this server's (`PublicIP`, `PublicIPv6`), or the detail names none → `tls.dns_wrong` | when the CA did reach this server, DNS is right and something else on this machine answered the challenge; and an IP address (ip mode) has no DNS record to fix |
+| `rejectedIdentifier` | the name is an IP address → `tls.ip_rejected` | a refused domain is not an address problem |
+
+`connection`, `rateLimited` and `caa` map as the table above says. An error that carries no ACME problem at all
+(the CA can't be reached from here, a broken directory URL) is `tls.acme_failed` with the error's text.
+
+*The fix texts take what is known.* `tls.dns_missing` ends "pointing to {ip}", or "pointing to this server" when no
+public address is known. `tls.dns_wrong` has four forms, from "{domain} points to {other}, but this server is
+{ip}" down to "{domain} doesn't point to this server" when neither address is known. `tls.rate_limited` names the
+time when the CA's detail has one ("retry after 2026-10-09 12:30:00 UTC") and says "rate limit reached" otherwise.
+`{detail}` is the CA's own text, cut to one line of at most 300 bytes.
+
+*Three more codes, for manual mode* (§8.4). They are `Status.LastErrorCode` values like the seven above, so logs,
+the dashboard (`api.TLSInfo.lastErrorCode`) and doctor's `tls` check carry them, and 05 needs a text for each when
+it shows them (README S91):
+
+| Code | Cause | Fix text |
+|---|---|---|
+| `tls.cert_unreadable` | `tls.cert_file` or `tls.key_file` is missing, or the service user may not read it | "tls.key_file = /etc/ssl/k.pem does not exist. Check the path." · "isshoni may not read tls.key_file = …. Let the user that isshoni runs as read it, for example: sudo chgrp isshoni … && sudo chmod 640 …" · "isshoni can't read tls.key_file = …." |
+| `tls.cert_invalid` | the files are not a certificate with its private key | "tls.cert_file and tls.key_file are not a certificate with its private key (…). Put the full chain in tls.cert_file and the matching key in tls.key_file, both as PEM." |
+| `tls.cert_expired` | the certificate is past `notAfter`, or before `notBefore` | "The certificate in tls.cert_file expired on 2026-10-01. Replace it and its key; isshoni loads new files within a minute." · "… is not valid before 2026-10-20. Check the server's clock, or use a certificate that is valid now." |
+
+*The DNS check* runs once, when certmagic begins the first order that isn't a renewal, with a 5 s timeout and
+`Options.Resolver`. It compares the domain's A and AAAA records with `PublicIP` and `PublicIPv6` and only logs:
+`tls.dns_missing` when the name doesn't resolve, `tls.dns_wrong` when no record is one of this server's
+addresses. It never sets `Status.LastError`, which the CA's answer decides, and it is skipped when no public
+address is known. An attempt that fails logs one WARN line with the code and the fix ("could not get a
+certificate; trying again later", or "could not renew…"); certmagic retries with its own backoff, and a success
+clears the error.
 
 ---
 
@@ -1837,10 +2067,12 @@ type Policy interface {
     "isshoni is not running (no server on /run/isshoni/admin.sock)"; `doctor` runs offline (§13.1).
   - *Permission denied*: `EACCES`/`EPERM` on stat or connect (for example `/run/isshoni` is `0750` and the caller is
     neither root nor in the `isshoni` group, or the socket is `0600`), or the server closes the connection before the
-    first response (the peer-cred refusal above). Exit 4 with "Permission denied on /run/isshoni/admin.sock: run it
-    with sudo (sudo isshoni <command>)", using the real socket path and the command as typed. `doctor` prints the same
-    message and runs no checks: offline checks as an ordinary user would only show a wall of false failures (config and
-    data dir unreadable, ports "in use" by the running server). `healthcheck` prints it too and still exits 1.
+    first response (the peer-cred refusal above; only for a caller the server can refuse: for root and the socket
+    file's owner such a hang-up is *not running*, §12.2). Exit 4 with "Permission denied on
+    /run/isshoni/admin.sock: run it with sudo (sudo isshoni <command>)", using the real socket path and the command
+    as typed. `doctor` prints the same message and runs no checks: offline checks as an ordinary user would only
+    show a wall of false failures (config and data dir unreadable, ports "in use" by the running server).
+    `healthcheck` prints it too and still exits 1.
 - Base URL for the client: `http://isshoni/v1/…` with a `DialContext` to the socket. Errors use a socket-only response
   wrapper around 03's envelope: `{"error": api.Error, "message": "…", "fix": "…"}`, where `message` and `fix` are
   English for the CLI to print. They are never added to `api.Error` itself. The socket passes 03's service errors
@@ -1864,6 +2096,37 @@ type Policy interface {
 | `POST /v1/rotate-secrets` | `{"keys":["session","invite","resume"],"vapid":true}` (the CLI always sends all four) | 202 `{"rotated":[…],"restarting":true}` (the server restarts, §5.3) | 400 |
 | `POST /v1/doctor` | `{"only": ["dns"]}` (optional) | `api.DoctorReport` (server-side checks) | – |
 | `POST /v1/log-level` | `{"level":"debug","for":"30m"}` | 204 | 400 |
+
+**The socket as README S43 built it** (`ops/adminsock.go`, `adminapi.go`, `adminclient.go`), where the table
+leaves a case open:
+
+- **During a shutdown the socket answers 503, like every API call** (§6.4 step 2). From the moment liveness goes
+  false until the socket closes (step 6):
+  - `GET /v1/health`, `/v1/ready` and `/v1/status` keep answering: health and ready with 503
+    `{"status":"shutting_down"}`, status with 200. `isshoni healthcheck` exits 1, and `admin status` still prints.
+  - Every other endpoint answers **503 `server_shutdown`** with the message "the server is shutting down" and the
+    fix "try again once it is back". The CLI exits 1 on it (§3.2): it is no refusal, a retry after the restart
+    works.
+  - A `setup-url` that is waiting for readiness (`waitReadyS`) stops waiting and gets the same 503; no link is
+    minted.
+  - Connections that have not sent a request yet are closed. A client that is root or the socket's owner reads
+    such a hang-up as "not running" (exit 4), so `healthcheck --wait` and `setup-url --wait` keep polling across a
+    restart. Only a caller the server could have refused reads a hang-up before the first answer as the
+    peer-credential refusal of §12.1 ("Permission denied… run it with sudo").
+- **`/v1/ready`** always carries the `checks` object, also with 503 `{"status":"not_ready","checks":{…}}`: whoever
+  reaches the socket is the operator (the public `/readyz` shows them to loopback only, §11.1).
+- **Methods and paths.** A `GET` route also answers `HEAD`; any other method is 405 `method_not_allowed` with an
+  `Allow` header. A path the server doesn't have is 404 `not_found` with the fix "the running server and this
+  isshoni binary may be different versions: restart the server after an upgrade", which is what the operator has
+  when a new CLI talks to an old server. A user name that is empty, `.` or `..` never reaches the server: the
+  client answers `user_not_found` itself, because the router would redirect such a path.
+- **Endpoints of later slices** are routed from the start: `GET /v1/backup`, `POST /v1/restore` and
+  `POST /v1/rotate-secrets` (README S65) and `POST /v1/doctor` (S60) answer 500 `internal` with "… over the admin
+  socket is not implemented in this build yet" until then.
+- **`waitReadyS`** is 0 to 3600. A handler that panics is answered 500 `internal` with a `ref` that is also in the
+  log, with the stack.
+- **Platforms without the peer-credential check** (anything but Linux and macOS; Windows is compile-only in M1)
+  serve every connection and say so in the log at startup.
 
 User, invite and setup operations call 03's service layer (§19); this doc only defines the socket surface. Timestamps
 in these bodies (`expiresAt`, `createdAt`, `lastSeenAt`) have 03 §3.3's fixed form, `2026-09-30T10:00:00.000Z`, the
@@ -1944,7 +2207,11 @@ its environment (06 §6.4 documents the Docker form above, and `task docker:smok
 - `setup-url` works only while no admin exists (03's `setup_unavailable` otherwise; the CLI exits 7 with the fix "use
   `isshoni admin users reset-password <name>`"). Each call mints a **new** token and cancels earlier unused setup
   tokens, so only the most recently printed link works (no stale links in scrollback). Token rules (hashed,
-  single-use, 24 h, fragment) are 03's.
+  single-use, 24 h, fragment) are 03's. With `waitReadyS` the server asks whether setup is still available before
+  it waits, so after setup the answer is `setup_unavailable` at once; `tlsReady` in the answer is the readiness
+  check `tls` (§6.2) at the moment the link is minted (S43).
+- The other refusals of these commands exit 7 too (§3.2): `last_admin` from `set-role` and `disable`, and
+  `registration_closed` and `limit_reached` from `invite create`.
 - `reset-password` prints a one-time link (24 h, single use); issuing it immediately clears the password and signs the
   user out everywhere (sessions, devices, push subscriptions; 03 §7.10); the CLI prints this after the link (plan: "A
   password reset revokes everything"). It is the recovery path for a forgotten admin password.
@@ -2057,6 +2324,29 @@ templates live in `messages_en.go` for the CLI; 05 renders the same codes from i
 | `release` | Running vs latest release | newer release, or security release | – |
 | `nofile` | `info`: open-file limit | < 8192 | – |
 | `bandwidth` | `info`: calculator output (§13.4) and NIC speed from `/sys/class/net/<if>/speed` | estimate > 80 % of NIC speed | – |
+
+**When no public address was found** (decided after group 5; the server then runs and is not ready, §6.2). Doctor
+is where the operator reads why, so the two checks say it in these words:
+
+- `public_ip` is `fail` with the code `public_ip.none`: "No public IP address found: no public address on a network
+  interface, and no STUN answer." In `ip` mode, and in `manual` mode without a domain, it goes on: "isshoni is
+  running but not ready, and nobody can open it" (offline: "isshoni will start, but it won't be ready"). The fix
+  names both ways out: "Set public_ip to this server's public address (Docker: ISSHONI_PUBLIC_IP in .env), or set
+  domain, then restart isshoni. If the network just wasn't up yet when isshoni started, restarting is enough: sudo
+  systemctl restart isshoni (Docker: docker compose restart)." With a domain (`auto`, or `manual` with one) the
+  check is `fail` too, since media needs the address, but the site and the certificate don't wait for it.
+- `tls` in `ip` mode is `fail` with "No certificate: there is no public IP address to get one for" and points at
+  `public_ip`'s fix. It carries no `fixCode` of §8.7 (no ACME request was made, so there is no ACME error) and
+  does not wait 10 minutes to turn from `warn` to `fail`: nothing is under way.
+
+```
+[fail] public_ip     no public IP address found (no public address on an interface, no STUN answer)
+       isshoni is running but not ready, and nobody can open it
+       fix: set public_ip to this server's public address, or set domain, then restart isshoni
+            (if the network wasn't up yet when isshoni started: sudo systemctl restart isshoni)
+       more: https://moonwx.github.io/isshoni/troubleshooting#doctor-public_ip
+[fail] tls           no certificate: there is no public IP address to get one for (see public_ip)
+```
 
 Text output (abbreviated). After every `warn`/`fail` line the text output adds a line
 `more: <version.DocsURL>troubleshooting#doctor-<id>` (indented like `fix:`); after `firewall_hint` with a provider
@@ -2652,16 +2942,38 @@ Packages and names (exact):
   `ValidateEndpoint`, `SendTest`, `Run`), `ShareStarted`, `AdminAlert`, `Store`, `RecipientFilter`
   (`PrefShareStarted`, `PrefAdminAlerts`), `Sender`, `SendOptions`, `SendResult`, `ErrUndeliverable`,
   `ErrBlockedAddress`, `Subscription`.
-- `internal/server`: `Server`, `New`, `Start`, `Run`, `Shutdown`, `Site`, `Addrs`, `ShutdownReason`,
-  `ErrRestartRequested`, `ErrShutdownForced`, `NeedsOperator`, `Deps`, and the wiring table of §6.6.
+- `internal/server`: `Server`, `New`, `Start`, `Run`, `Shutdown`, `Site`, `Addrs` (`HTTP`, and `HTTPS` from S44
+  on: the 443 multiplexer, nil in off mode), `ShutdownReason`, `ErrRestartRequested`, `ErrShutdownForced`,
+  `NeedsOperator`, `Deps`, and the wiring table of §6.6.
+- `internal/server/tlsmgr` (S44; §8.2): `Options` (with `PublicIPv6`, `Site`, `HTTPAddr`, `HTTPSAddr`, `Resolver`),
+  `New`, `Manager` (`Start`, `Shutdown`, `TLSConfig`, `HTTPHandler`, `Reload`, `Status`, `Ready`), `Status`, and the
+  ten `Code…` constants of `Status.LastErrorCode`: the seven ACME hints of §8.7 (`tls.acme_unreachable`,
+  `tls.dns_missing`, `tls.dns_wrong`, `tls.rate_limited`, `tls.ip_rejected`, `tls.caa_forbids`, `tls.acme_failed`)
+  and manual mode's `tls.cert_unreadable`, `tls.cert_invalid`, `tls.cert_expired`. The dashboard carries the code
+  as `api.TLSInfo.lastErrorCode`, so 05's dashboard page (README S91) needs a text for all ten, and doctor's `tls`
+  check (S60) uses them as `fixCode`.
 - `internal/server/servertest`: `Start(t testing.TB, opts Options) *Server` with fields `URL` (`http://` plus the
   site's host; `Client` dials the listener whatever host the URL names), `WSURL`, `Client` (`*http.Client`, keeps
   cookies, trusts the test CA when `Options.TLS`), `AdminSocket`, `UDPPort`, `TCPPort` (0 until README S59), `DataDir`,
   `Cfg`, `Srv`; methods `Restart(t)`, `Stop(t)`, `Wait(t) error` (the result of `Run` after a shutdown the test
   began itself) and `Logs()`; `Try(t, opts) (*Server, error)` for a server that is expected to refuse;
-  `Options{TLS bool; Flags []string; Config func(*config.Config); Deps server.Deps; DataDir string}`. `Flags` are
-  `serve` flags, so a key set there counts as set by the operator (`config.IsSet`, which pins a policy key, §4.6); a
-  change made in `Config` does not. `TLS` fails the test until README S44.
+  `Options{TLS bool; Roots *x509.CertPool; Flags []string; Config func(*config.Config); Deps server.Deps; DataDir
+  string}`. `Flags` are `serve` flags, so a key set there counts as set by the operator (`config.IsSet`, which pins
+  a policy key, §4.6); a change made in `Config` does not.
+  - **`Options.TLS`** (S44) runs the server in `tls.mode = "manual"` with a certificate from a private CA made for
+    the test (§8.6): HTTPS, WSS and ICE-TCP on one port behind the 443 multiplexer, and the plain port that
+    redirects to it. The certificate is for `TLSDomain`, `localhost`, `127.0.0.1` and `::1`; its files are
+    `Cfg.TLS.CertFile` and `Cfg.TLS.KeyFile`, which a test may replace (the reload tests do).
+  - **`TLSDomain`** is the constant `"isshoni.test"`, the `domain` of such a server, so its site is
+    `https://isshoni.test:<port>` and `URL` and `WSURL` (`wss://…/ws`) use it. `.test` names never resolve
+    (RFC 6761); `Client` reaches the server all the same, because it dials the bound listener whatever the URL
+    says. In a TLS mode `Client` speaks HTTP/2 where a browser would, and a WebSocket upgrade gets an HTTP/1.1
+    connection of its own.
+  - **`Options.Roots`** are further roots that `Client` trusts: the issuing root of an ACME test server, for a
+    test that puts the server into `tls.mode = "auto"` through `Flags` (the Pebble tests). **`Server.Roots`** is
+    what `Client` trusts in a TLS mode, the test CA plus `Options.Roots`, and nil in off mode; a test that dials the
+    HTTPS port by itself (`Srv.Addrs().HTTPS`) verifies the server with it.
+  - No harness config has STUN servers, so no test asks the public ones for the machine's address.
 - `internal/protocol/api` (TS via tygo, next to 03's DTOs): `OpsDashboard` and its parts (`ServerInfo`,
   `ProcessInfo`, `TLSInfo`, `AdvertisedAddr`, `UpdateInfo`, `TransferInfo`, `MediaTotals`, `RoomLive`,
   `ParticipantLive`, `ConnectionLive`, `ShareLive`, `LayerLive`, `ViewerCounts`, `ClientVersionCount`,
@@ -2674,10 +2986,12 @@ Packages and names (exact):
 - CLI and ops contract for 06: subcommands and flags (§3.1: `config init`, `version --short`, `doctor --only
   --list-checks`, `healthcheck --ready --wait`, `setup-url --qr --wait --json`, `admin backup --out -`, `admin restore
   PATH|-` incl. `.db` files and `--offline`), exit codes (§3.2: 78 for "restart can't help"; healthcheck 0/1; setup-url
-  4 unreachable, 7 `setup_unavailable`; doctor 0/5), env names (§4.2, including the empty-means-unset rule and the
-  reserved names; §4.3 env-only switches), the data-directory lock `isshoni.lock` (§5.1), `SIGHUP` reload, re-exec after
-  restore and rotation, no `sd_notify` (unit `Type=exec`), Docker needs `/run/isshoni` writable by uid 65532 (tmpfs
-  with a read-only root) and a data volume at `/var/lib/isshoni`, the release-note marker `<!-- isshoni:security -->`.
+  4 unreachable, 7 `setup_unavailable`; doctor 0/5), the output of the link commands (§3.3: off a terminal the bare
+  link is the first line of stdout and everything else is on stderr), env names (§4.2, including the
+  empty-means-unset rule and the reserved names; §4.3 env-only switches), the data-directory lock `isshoni.lock`
+  (§5.1), `SIGHUP` reload, re-exec after restore and rotation, no `sd_notify` (unit `Type=exec`), Docker needs
+  `/run/isshoni` writable by uid 65532 (tmpfs with a read-only root) and a data volume at `/var/lib/isshoni`, the
+  release-note marker `<!-- isshoni:security -->`.
 
 ---
 
@@ -2793,3 +3107,15 @@ with the other docs and adds the wiring slices of §6.6.
    "Alex started streaming"); each user can switch these notifications off (`shareStarted: off`).
 3. **Docker without a data volume**: a hard refusal (exit 78) with the exact fix, plus `ISSHONI_ALLOW_EPHEMERAL_DATA=1`
    for tests. Both 04 and 06 recommended it; it is a stricter form of the plan's "doctor fails".
+
+Decided after group 5 (an engineering call the owner delegated; README §6):
+
+4. **An ip-mode server that finds no public address starts and is not ready; it does not exit 78.** The cause is
+   often transient at boot (the network or STUN isn't there yet), and exit 78 is for what a restart can't fix
+   (§3.2); here a restart once the network is up is the fix. The server stays up, port 80 answers 503 with the
+   waiting page, and the readiness checks `public_ip` and `tls` and doctor say what is missing (§6.2, §7.4, §8.2,
+   §8.3, §13.2). It does not recover by itself: the site, the Host check, the certificate's name and the ICE
+   rewrite rules are fixed at startup, so an address that the 10-minute detection finds later (wired by README
+   S54) is only logged, and the operator restarts isshoni (§6.2). systemd does not restart a running server, and
+   Docker's `HEALTHCHECK` passes meanwhile because it checks liveness. The same holds for manual mode without a
+   domain. A `public_ip` literal that is not a public address stays a config error (exit 78, §4.5).

@@ -274,6 +274,13 @@ already ended every share with its own reason.
 Rules:
 - Lock order: `SFU.mu` → `Room.mu` → `Share.mu` → `DownTrack.mu`. Each is held briefly and never across a Pion call,
   a `Signaler`/`RoomEvents` call or a blocking channel send.
+- **One exception: `Share.notify`** (README S41). It is a mutex per share that is outside the order above and is
+  the one lock held across a `RoomEvents` call. It only puts a share's reports in order: the ticker holds it while
+  it makes the share's `ShareUpdated` calls, and `SFU.endShare` holds it while it ends the share, reports the state
+  changes the ticker hadn't reported yet and then `ShareEnded`. So every `ShareUpdated` comes before the
+  `ShareEnded`, and nothing is reported about a share after its end (§6.2). It is safe because `RoomEvents` calls
+  never block (the last rule below), `Share.mu` is the only lock taken inside it, and whoever takes it holds no
+  other lock.
 - Pion callbacks (`OnTrack`, `OnConnectionStateChange`, `OnICEConnectionStateChange`) only append to the Conn's
   unbounded internal event queue. They never block, so a Pion call made by the actor can't deadlock on its own
   callback.
@@ -1048,6 +1055,22 @@ type binding struct {
 - **DTLS-ready gate** (S4 finding 1): the writer forwards only when `binding.pc.ready` is true. The sub PC sets it on
   `connected` and then requests a keyframe for every video DownTrack. A rebuilt sub PC is a new `subPC` with its own
   gate, so a stale "ready" can never leak.
+
+  **The gate follows the PC, not only its first `connected`** (README S41, `subPC.follow`). Pion takes RTP written
+  to a PC that has failed or closed the same silent way it does before DTLS is up: no error, nothing sent. So the
+  actor moves the gate with every connection state it handles:
+
+  | Sub PC state | Gate |
+  |---|---|
+  | `connected` | open; a keyframe request for every video DownTrack |
+  | `disconnected` | unchanged: the selected pair is still there, packets may get through, and ICE often recovers |
+  | `failed`, `closed`, and `connecting` again (an ICE restart, README S57) | closed |
+
+  A gate that closes ends what the DownTrack was forwarding, and so does `Unbind`: the munger's epoch is over, the
+  viewer leaves `ShareInfo.Viewers`, and the stream starts on a keyframe again when the gate reopens or the track
+  is bound anew. While the gate is closed or there is no usable binding (none, or `unsupported`), the writer drops
+  what it takes off its queue and never asks the munger for a place, so the first packet a viewer gets is always the
+  keyframe start its first epoch begins with.
 - **Writer loop**: `rtxQueue` first, then `queue`. For an RTP item:
   1. check gate and binding;
   2. `m.process(p, now)` → `(outSeq, outTS, ok)`, or wait for a keyframe (which triggers a throttled keyframe request
@@ -1068,6 +1091,62 @@ type binding struct {
   - `ReceiverReport` blocks for our SSRC → `fractionLost` → DownTrack loss EWMA and `allocator.onLoss`.
 - **RTT** for the sub PC comes from the nominated ICE candidate pair (`pc.GetStats()`, sampled every 5 s). RR-based RTT
   is meaningless here because the forwarded SRs carry the publisher's NTP clock (§9.6).
+
+**What README S41 built** (the media path with one layer; `layer.go`, `downtrack.go`, and the ticker in `sfu.go`).
+The writer runs steps 1, 2, 3 and 5 of the loop above; a subscription forwards what it names (`high` is `f`, `low`
+is `q`, `off` nothing, audio while `Audio` is set), and the fallbacks and events of §10.1 are slice 7's. Beyond the
+text above it settled five things:
+
+- **`Share.notify`, a lock held across `RoomEvents` calls.** The media path is what makes a share `live`, on a
+  layer's read loop, and signal may end the same share in the same moment. The ticker reports the first and
+  `SFU.endShare` the second, and a per-share mutex keeps every `ShareUpdated` ahead of the `ShareEnded`. It is the
+  one exception to the lock rules, written out in §5.4.
+- **The gate follows the sub PC's state** (the table above).
+- **A packet that Pion takes without sending it: `WriteRTP` returns `(0, nil)`.** Pion does that in two situations
+  that have nothing in common, and the writer tells them apart by whether anything has left through the binding
+  since its gate last opened:
+  - *Nothing has left yet.* A sub PC reports `connected` a moment before its SRTP session is usable (S4 finding 1),
+    and a sender's write path opens a moment after `Bind`. The viewer never saw the packet, which was a keyframe
+    start, so the stream must not go on from it: the DownTrack **restarts** (the munger's epoch ends, the interest
+    mask is the target's alone, the viewer is not counted) and starts again on the next keyframe, which the packets
+    that now wait for it request (§9.7). A binding that never gets a packet out would repeat that at the layer's two
+    keyframes a second for every viewer of the layer, so after two such starts in a row the DownTrack asks only once
+    per 5 s until a packet leaves.
+  - *In mid-stream.* The ICE transport can't send right now: no selected pair (a PC that has just failed, until its
+    gate closes), or a full ICE-TCP write buffer (a slow viewer; 04's TCP muxes drop when their 4 MiB buffer is
+    full, §5.4). That is an ordinary lost packet, counted and nothing more: the viewer sees the gap and sends a NACK
+    or a PLI. Restarting here would turn every such packet into a keyframe for all viewers of the layer (a viewer
+    whose sub PC had failed cost its publisher a PLI every 500 ms before this rule; `TestFailedViewerCostsNoKeyframes`
+    pins it).
+
+  A `WriteRTP` error (the sender stopped, the PC is closing) is counted; `Unbind` follows.
+- **A profile the viewer has no payload type for** (`ptFor` has no entry): the packet is counted and dropped, and
+  nobody is asked for a keyframe the viewer couldn't decode. If the layer forwarded now has moved to that profile,
+  what the viewer was getting is over (`munger.unforwardable`): a flip back to the old profile then waits for a
+  keyframe instead of going on across a gap that a NACK would fill with the other profile's packets. Reporting it
+  (`codec_mismatch`) and fixing it through the room's codec policy is slice 10 (README S69).
+- **Done here, ahead of slice 8** (README S63, "repair and sync"), because the one-layer path needs it or gets it
+  for nothing:
+  - the **duplicate and too-late drop** at the cache insert (§9.1, §9.2), with both counters: a packet that isn't
+    cached isn't forwarded, so Chrome's redundant RTX copies cost no egress from the first slice on;
+  - **padding**: a padding-only packet is never cached and goes out as a marker, and the writer hands it to
+    `munger.skipPadding`, so the viewer's sequence numbers have no gap where the publisher probed;
+  - **abs-send-time** on every forwarded packet when the viewer negotiated it (step 3; the three bytes are reused,
+    so forwarding allocates nothing);
+  - the **latest sender report per layer** (`Layer.lastSR`, from the track's RTCP reader), which the munger's
+    SR-aligned timestamp rule (§9.4) reads at a layer switch.
+
+  Still slice 8's: the RTX queue and NACK handling (§9.5), forwarding translated SRs to the viewers (§9.6: the
+  layer keeps the report, nothing sends it on yet), and its integration tests (4, 5, 6 and 19), which include the
+  ones for padding and for the publisher's redundant RTX.
+
+`DownTrack` as built differs from the struct above in what later slices add: there is no `rtxQueue` (slice 8), no
+`requested`/`capQ`/`capReason` (slices 7, 10 and 11: the subscription sets the munger's target directly) and no
+pacer (slice 11). It has `pc atomic.Pointer[subPC]` (set by the actor before Pion can call `Bind`, so the binding
+gets its gate), `forwarding atomic.Bool` (the writer forwards a layer now: `ShareInfo.Viewers`; written only with
+`DownTrack.mu` held, so a writer can't leave a paused viewer listed) and `stats` with packets, bytes, queue drops,
+packets without a payload type, unsent packets, write errors, epochs started and the viewer's keyframe requests.
+The RTCP reader handles PLI and FIR only; NACK is slice 8's, REMB and receiver reports slice 11's.
 
 ### 9.4 Munger and the sequence map
 
@@ -1182,6 +1261,27 @@ cache and every forwarding DownTrack as a late packet.
   returning to `connected` (one request per video layer of its shares); a target change; a viewer's PLI or FIR (translated to PLI upstream); and, while a DownTrack waits for a keyframe, every packet
   of the target layer. The last one re-requests every 500 ms until the keyframe arrives, which heals a lost PLI.
 - There is no keyframe cache or replay: P-frames after an old keyframe don't decode.
+
+**As README S41 built it** (`Layer.requestKeyframe`; `Share.requestKeyframe(slot)` finds the layer and calls it):
+
+- **A pending share asks for its own first keyframe.** A share goes `live` on its first SPS keyframe (§5.3), but
+  nothing above requests one while the share has no viewer: no DownTrack exists yet to wait for it. A pub PC whose
+  first keyframe was lost, or a track that was already running when a later offer bound it to the share, would then
+  leave the share `pending` until the hub's 30 s timeout ends it. So while a share is `pending`
+  (`Share.awaitsKeyframe`), every video packet of its layers that is cached and is not a keyframe start asks for
+  one, throttled like every other request to one PLI per 500 ms and layer. The first keyframe clears the flag (and
+  so does the share's end); a share that has been live never asks this way again.
+- **The callers as built**: `Bind` on a sub PC whose gate is open (§9.3); the sub PC reaching `connected` (every
+  video DownTrack that isn't paused); the pub PC reaching `connected` again (every video layer attached to its
+  tracks; on the first connect no track has arrived yet); a new target of a DownTrack that waits for the target's
+  keyframe, when its binding can send; the viewer's PLI or FIR, for the layer forwarded now (else the target);
+  every target-layer packet that arrives while the DownTrack waits for a keyframe; and the pending share above.
+  A DownTrack whose stream Pion has taken twice in a row without sending any of it asks through the waiting packets
+  only once per 5 s (§9.3), so a viewer nothing reaches can't cost the others two keyframes a second.
+- **No lock, any goroutine.** The throttle is a compare-and-swap on the layer's `lastPLI`, so DownTrack writers and
+  RTCP readers, the layer's own read loop and any Conn's actor call it directly; a caller that loses the race is
+  counted as throttled. When the write fails (the pub PC isn't connected, or is closing), nothing is retried:
+  whoever still waits asks again after 500 ms. Audio layers never ask.
 
 ### 9.8 Pacing (keyframe bursts)
 
@@ -1912,6 +2012,12 @@ path). It declares the whole §6 and §13 API. From slice 7 it brought forward `
 DownTracks, the 256 and 64 guards); layer selection, `SubscriptionStateEvent` and transceiver reuse stay in slice 7
 (§9.3). The methods of slices 9, 10 and 14 return the not-implemented error of §6.3, and shares stay `pending`
 until the media path of README S41 sees a keyframe.
+
+**What README S41 built** (the rest of slice 6: `Layer`, `DownTrack`, the ticker; integration 1). §9.3 and §9.7 say
+how: the DTLS-ready gate follows the sub PC's state, a stream that Pion took without sending restarts on a
+keyframe, a pending share asks for its own first keyframe, and `Share.notify` is the one lock held across a
+`RoomEvents` call (§5.4). From slice 8 it brought forward the duplicate and too-late drop, padding markers,
+abs-send-time and the per-layer sender report; NACK/RTX and SR forwarding stay in slice 8 (§9.3).
 
 ## Decisions taken at integration (formerly open questions)
 
