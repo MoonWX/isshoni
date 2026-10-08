@@ -1,0 +1,39 @@
+{
+  "type": "room.state",
+  "data": {
+    "roomId": "lounge",
+    "rev": 43,
+    "participants": [
+      {
+        "userId": "k3m9p2qxw7ht",
+        "name": "Alex",
+        "admin": true,
+        "status": "present",
+        "joinedAt": "2026-10-12T19:00:01.000Z",
+        "connections": [
+          {
+            "id": "c_k3v9q2m7xw4pa8d1",
+            "kind": "web",
+            "role": "full",
+            "status": "online"
+          }
+        ]
+      },
+      {
+        "userId": "b8f2n4r6t0vz",
+        "name": "Bea",
+        "status": "present",
+        "joinedAt": "2026-10-12T19:01:12.000Z",
+        "connections": [
+          {
+            "id": "c_7d2m9x4k1q8v3p6z",
+            "kind": "web",
+            "role": "viewer",
+            "status": "online"
+          }
+        ]
+      }
+    ],
+    "shares": []
+  }
+}

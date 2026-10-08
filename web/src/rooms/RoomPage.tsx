@@ -30,7 +30,6 @@ import { useTranslation } from 'react-i18next';
 import { useParams } from 'react-router';
 
 import { useApp } from '../app/context';
-import { isAdmin } from '../app/guards';
 import { useMeQuery } from '../app/me';
 import { errorMessage } from '../lib/errorText';
 import type { ProtocolError } from '../protocol/errors';
@@ -194,7 +193,6 @@ export function RoomPage() {
         participants={state?.participants ?? []}
         shares={state?.shares ?? []}
         selfUserId={userId}
-        selfIsAdmin={me.data != null && isAdmin(me.data)}
         onWatch={(id) => {
           // A pick, like a click on the tile: it holds until that share ends (05 §12.2).
           viewer.store.getState().focusShare(id);

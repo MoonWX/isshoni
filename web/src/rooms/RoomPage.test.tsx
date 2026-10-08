@@ -156,6 +156,22 @@ describe('RoomPage (05 §11.2)', () => {
     expect(within(panel).getByText('bo')).toBeInTheDocument();
   });
 
+  it('marks the admins in the people panel as room.state names them, for a member too', async () => {
+    setup(); // GET /me: a member
+    await open();
+    sendState({ participants: [alex, participant('u_bo', 'bo', { admin: true })] });
+    fireEvent.click(screen.getByRole('button', { name: /^2 here/ }));
+    const panel = screen.getByRole('dialog', { name: '2 people here' });
+    const person = (name: string) => within(panel).getByText(name).closest('li');
+    expect(person('bo')).toHaveTextContent('Admin');
+    expect(person('alex (you)')).not.toHaveTextContent('Admin');
+
+    // A role change is a new room.state (01 §8.5): the open panel follows it.
+    sendState({ participants: [participant(ME, 'alex', { admin: true }), bo] });
+    expect(person('alex (you)')).toHaveTextContent('Admin');
+    expect(person('bo')).not.toHaveTextContent('Admin');
+  });
+
   it('a click on a person who shares puts their share on the stage, as a pick', async () => {
     setup();
     await open();

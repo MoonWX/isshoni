@@ -961,14 +961,14 @@ func (c *conn) shutdown(reason protocol.ShutdownReason) {
 	c.sock.shutdown(reason)
 }
 
-// setUser applies a rename or role change (UpdateUser, Revalidate): the identity, and the participant's name in the
-// connection's room.
+// setUser applies a rename or role change (UpdateUser, Revalidate): the identity, and the participant's name and
+// admin flag in the connection's room.
 func (c *conn) setUser(name string, admin bool) {
 	id := c.identity()
 	id.Name, id.Admin = name, admin
 	c.ident.Store(&id)
 	if c.room != nil {
-		c.room.rename(c.userID, name)
+		c.room.setUser(c.userID, name, admin)
 	}
 }
 

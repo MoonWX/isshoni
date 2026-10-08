@@ -482,8 +482,8 @@ func (h *Hub) CloseConnections(sel ConnSelector, code protocol.ErrorCode) int {
 }
 
 // UpdateUser applies a rename or role change to the user's open connections: their Identity (admin topics of Notify
-// follow the flag) and the participant's name in the room.state of every room they are in. Each connection's actor
-// applies it; the snapshots with the new name go out coalesced like any change.
+// follow the flag) and the participant's name and admin flag in the room.state of every room they are in. Each
+// connection's actor applies it; the snapshots with the new name or role go out coalesced like any change.
 func (h *Hub) UpdateUser(userID, name string, admin bool) {
 	h.mu.Lock()
 	var conns []*conn

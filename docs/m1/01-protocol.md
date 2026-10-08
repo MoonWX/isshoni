@@ -697,7 +697,8 @@ Every connection in the room gets byte-identical snapshots: one encode per broad
   "roomId": "lounge",
   "rev": 42,
   "participants": [
-    {"userId": "k3m9p2qxw7ht", "name": "Alex", "status": "present", "joinedAt": "2026-10-12T19:00:01.000Z",
+    {"userId": "k3m9p2qxw7ht", "name": "Alex", "admin": true, "status": "present",
+     "joinedAt": "2026-10-12T19:00:01.000Z",
      "connections": [{"id": "c_k3v9q2m7xw4pa8d1", "kind": "web", "role": "full", "status": "online"}]},
     {"userId": "b8f2n4r6t0vz", "name": "Bea", "status": "reconnecting", "joinedAt": "2026-10-12T19:01:12.000Z",
      "connections": [{"id": "c_7d2m9x4k1q8v3p6z", "kind": "web", "role": "viewer", "status": "reconnecting"}]}
@@ -723,6 +724,7 @@ type RoomState struct {
 type ParticipantInfo struct {
 	UserID      string            `json:"userId"`
 	Name        string            `json:"name"`
+	Admin       bool              `json:"admin,omitempty"` // the user is an admin (03's role); absent: a member
 	Status      ParticipantStatus `json:"status"`
 	JoinedAt    time.Time         `json:"joinedAt"`
 	Connections []ConnectionInfo  `json:"connections"`
@@ -803,6 +805,13 @@ const (
 - Share labels default to nothing on the wire. Viewers show the localized "Screen", "Window" or "Tab", so no English
   goes over the wire and window titles never leave the device (plan, privacy).
 - "N watching" for the sharer is `len(share.watchers)`.
+- `admin` is the user's role (03), for the people panel's admin badge (05 §11.2). It is `true` on every participant
+  who is an admin and absent on members, like `welcome.user.admin`.
+  - The hub takes it from the connection's `Identity`, so a role change reaches the room like a rename: `UpdateUser`
+    or a `Revalidate` result (§3.2) changes the participant and sends a new snapshot.
+  - The field is additive (§14.1): a client that doesn't know it ignores it, and a client that does reads a snapshot
+    without it as "members only". Fixture `room.state.admin.json` holds it; `room.state.json` stays as it was.
+  - It is a label, not a permission. Admin actions are REST calls that the server checks against the store (03).
 
 ### 8.6 `room.event` (M1)
 
