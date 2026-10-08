@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -9,19 +8,18 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"os"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/MoonWX/isshoni/internal/logx"
 	"github.com/MoonWX/isshoni/internal/server/config"
 	"github.com/MoonWX/isshoni/internal/server/netx"
 	"github.com/MoonWX/isshoni/internal/server/tlsmgr"
 )
 
-// This file is the wiring of the TLS modes (04 §8; README S44): the public addresses the site and the certificate
-// are made of, the 443 multiplexer, the port 80 server and the options of the TLS manager.
+// This file is the wiring of the TLS modes (04 §8; README S44): the site the public addresses make, the 443
+// multiplexer, the port 80 server and the options of the TLS manager. The detection of the public addresses is in
+// public.go.
 
 // Limits of the port 80 server (04 §7.8). Unlike the main server it carries no WebSocket and no upload, so every
 // exchange is bounded as a whole as well.
@@ -30,39 +28,6 @@ const (
 	plainIdleTimeout       = 30 * time.Second
 	plainExchangeTimeout   = 30 * time.Second // a request with its body; the answer
 )
-
-// detectPublicAddrs finds the server's public addresses (04 §7.4). It takes at most 5 s: STUN gets 2 s and one
-// retry. A detection that fails is no error here: the result holds what was found, and an ip-mode server without an
-// address starts and is not ready (04 §6.2).
-func (s *Server) detectPublicAddrs(ctx context.Context) netx.PublicAddrs {
-	stun := s.deps.STUN
-	if stun == nil {
-		stun = netx.NewSTUNClient(s.deps.Resolver)
-	}
-	pub, err := netx.DetectPublicAddrs(ctx, netx.DetectOptions{
-		PublicIP:      s.cfg.PublicIP,
-		PublicIPv6:    s.cfg.PublicIPv6,
-		STUNServers:   s.cfg.Network.STUNServers,
-		IPv6:          s.cfg.Network.IPv6,
-		STUN:          stun,
-		CloudProvider: netx.DetectCloudProvider(os.DirFS(netx.DMIDir)),
-		InContainer:   s.deps.Host.Container() != config.ContainerNone,
-	})
-	log := s.log.With(slog.String("component", "netx"))
-	if err != nil {
-		log.Warn("public address detection failed", logx.Err(err))
-	}
-	// The server's own address is no secret of a user's: it is what friends type.
-	attrs := []any{slog.String("nat", string(pub.NAT))}
-	if pub.V4.IsValid() {
-		attrs = append(attrs, slog.String("public_ipv4", pub.V4.String()), slog.String("method", string(pub.V4Method)))
-	}
-	if pub.V6.IsValid() {
-		attrs = append(attrs, slog.String("public_ipv6", pub.V6.String()))
-	}
-	log.Info("public addresses", attrs...)
-	return pub
-}
 
 // siteIsAddress reports whether the site is the server's public IP address rather than a name: ip mode, and manual
 // mode without a domain (04 §4.4).
