@@ -75,7 +75,7 @@ func TestShutdownWithMedia(t *testing.T) {
 		if err := json.Unmarshal([]byte(line), &rec); err != nil {
 			t.Fatalf("log line %q: %v", line, err)
 		}
-		if level := rec["level"]; rec["scope"] == nil && (level == "ERROR" || level == "WARN") {
+		if level := rec["level"]; rec["scope"] == nil && (level == "ERROR" || level == "WARN") && !hostWarning(rec) {
 			t.Errorf("the server logged %v", rec)
 		}
 		complete = complete || rec["msg"] == "shutdown complete"
@@ -83,4 +83,21 @@ func TestShutdownWithMedia(t *testing.T) {
 	if !complete {
 		t.Errorf("the server's log has no \"shutdown complete\":\n%s", w.srv.Logs())
 	}
+}
+
+// hostWarning reports whether a log record is one of the warnings a server makes at start about the machine it runs
+// on, not about itself. Which of them appear depends on where the tests run, so a test that checks the server's own
+// log must not count them:
+//   - with the stock Linux sysctls (a CI runner) the kernel grants smaller UDP buffers than
+//     network.udp_buffer_bytes asks for, and netx says which sysctls to raise;
+//   - inside a container (the tests in Docker) the harness turns the data-volume check off, and config says so.
+func hostWarning(rec map[string]any) bool {
+	msg, _ := rec["msg"].(string)
+	switch rec["component"] {
+	case "netx":
+		return strings.HasPrefix(msg, "UDP socket buffers are smaller than network.udp_buffer_bytes")
+	case "config":
+		return strings.HasPrefix(msg, "the container data-volume check is off")
+	}
+	return false
 }
