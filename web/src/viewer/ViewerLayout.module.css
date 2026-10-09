@@ -46,10 +46,15 @@
   min-height: 0;
 }
 
-/* < 1024 px, portrait: full width, 16:9, on top. */
+/*
+ * < 1024 px, portrait: full width, 16:9, on top. It may shrink (`flex: 0 1 auto` with no minimum height): in a
+ * window too low for a 16:9 stage plus the strip, the stage gives up height, so the strip stays inside the layout
+ * instead of lying over the sharer's bar below it (README S66). The picture keeps its shape inside the stage.
+ */
 .stage {
-  flex: none;
+  flex: 0 1 auto;
   width: 100%;
+  min-height: 0;
   max-height: 100%;
   aspect-ratio: 16 / 9;
 }

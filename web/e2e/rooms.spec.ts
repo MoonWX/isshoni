@@ -214,6 +214,9 @@ test('two people in the lounge see each other within a second', async ({ startSe
       }),
     friend.account.id,
   );
+  // Awaited below. A test that fails before it gets there ends with this evaluate still pending, and Playwright
+  // would report its rejection ("page.evaluate: Test ended.") as a second error next to the real one.
+  adminSawFriendAt.catch(() => undefined);
 
   await friend.page.goto(`${server.url}/`);
   const marks = await friend.page
