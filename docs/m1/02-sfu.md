@@ -268,7 +268,7 @@ already ended every share with its own reason.
 | Layer RTCP reader | 1 per incoming layer | `ReadSimulcastRTCP(rid)` / `ReadRTCP()` → SR store, SR items to DownTracks | Pion read |
 | DownTrack writer | 1 per DownTrack | RTX first, then munge, pace, write RTP, forward SRs | its queues |
 | DownTrack RTCP reader | 1 per DownTrack | PLI/FIR, NACK, REMB, RR from the viewer | `RTPSender.ReadRTCP` |
-| Ticker | 1 per SFU | 250 ms: event debounce. 1 s: rates, cache sizing, stalled checks, allocator ticks, codec-policy timers, uplink policy | time |
+| Ticker | 1 per SFU | 250 ms: event debounce (the `ShareUpdated` calls; `SubscriptionStateEvent`s are paced by their Conn's actor, below). 1 s: rates, cache sizing, stalled checks, allocator ticks, codec-policy timers, uplink policy | time |
 | Probe | 1 per probe PC | 20 s lifetime | timer |
 
 Rules:
@@ -281,6 +281,29 @@ Rules:
   `ShareEnded`, and nothing is reported about a share after its end (§6.2). It is safe because `RoomEvents` calls
   never block (the last rule below), `Share.mu` is the only lock taken inside it, and whoever takes it holds no
   other lock.
+- **The layer choice is made under `Share.mu`, then `DownTrack.mu`** (README S52; the order above). Which layer a
+  DownTrack forwards (§10.1) is chosen with both held:
+  - by the subscriber's actor when the request or the server's cap changes (`DownTrack.setWant`);
+  - by whoever attaches or detaches a layer of the share, before that returns (`Share.attach`, `Share.detach`,
+    which walk the share's DownTracks: `retargetLocked`). That is the publishing Conn's actor both times: for a
+    track that arrived, and for one whose reader posted its end.
+
+  So the choice always fits the layers the share has, and a DownTrack already wants a new layer when its track's
+  first packet is read: a viewer who was subscribed before the layer arrived gets it from its first keyframe,
+  without a PLI.
+- **What a subscription gets is reported by the subscriber's actor alone, from a notice** (README S52). Whoever
+  changes it elsewhere (a DownTrack writer whose stream began, ended or moved to another layer; Pion's `Unbind`;
+  an `attach` or `detach`) releases its locks first and then calls `Subscription.changed`, which posts to that
+  actor's internal event queue and never blocks. Two bounds keep a publisher from flooding its viewers:
+  - **One notice per subscription.** An atomic flag says that a notice is queued and not looked at yet. The actor
+    clears it before it looks, so a change that finds a notice queued is seen by that look, and one that comes
+    later queues the next. A stream that begins and ends with every frame (a publisher that alternates between two
+    profiles, §9.4) therefore adds one entry to the unbounded queue, not thousands a second.
+  - **One event per 250 ms** for what the media path changed (`SubscriptionStateEvent`, §6.2). The wait is a timer
+    per subscription whose callback posts to the actor again; it is not the SFU ticker's work.
+- `Bind` and `Unbind` of a DownTrack are called by Pion with the sender's lock held. They read the negotiation and
+  store the result, taking `DownTrack.mu` for a moment. That lock is never held across a Pion call, so the two are
+  only ever taken in this order.
 - Pion callbacks (`OnTrack`, `OnConnectionStateChange`, `OnICEConnectionStateChange`) only append to the Conn's
   unbounded internal event queue. They never block, so a Pion call made by the actor can't deadlock on its own
   callback.
@@ -300,7 +323,9 @@ Rules:
 - Fan-out lists (`Share.video`, `Share.audio`) are `atomic.Pointer[[]*DownTrack]`, copied on write, so the read path
   takes no lock.
 - DownTrack munger state is guarded by `DownTrack.mu`. The writer goroutine takes it once per packet (uncontended).
-  Control calls (`setRequested`, `setCap`) take it briefly.
+  Control calls take it briefly. As built there is one, `setWant`: the subscription works out `min(requested, cap)`
+  itself and hands the DownTrack the result (§10.1), so the `setRequested` and `setCap` of the first design are
+  one call.
 - `Signaler` and `RoomEvents` implementations must not block and must not call into the SFU synchronously.
 
 ## 6. The signal ↔ sfu interface (M1)
@@ -526,6 +551,43 @@ The SFU computes the content of every hint; sfuplane only converts types (01 §1
 - On `Resync()` the SFU re-sends one `CodecPolicyEvent` per share the Conn publishes and the last `QualityHintEvent`
   per share, if one was sent. A client re-offers only when the hinted codec differs from the one it last applied (05),
   so the re-send costs nothing.
+
+**`SubscriptionStateEvent` as README S52 built it** (`subscription.go`; the layer choice itself is §10.1).
+
+- **When.** The subscriber's actor compares what the subscription gets now (`Forwarded`, `Audio`, `Reason`) with
+  what the client last heard and sends an event only when they differ: never for a request alone, and not for a
+  new subscription that forwards nothing yet without a reason, which the client knows without being told. A
+  subscription that is gone, or whose share has ended, reports nothing more: the hub tells clients that a share
+  ended.
+- **`Requested`** is the client's latest request, whatever the server's cap.
+- **`Forwarded`** is the layer the viewer gets at this moment: `high` for the full layer `f`, `low` for the
+  preview layer `q` (and for the M5 middle layer `h`, until a `QualityMedium` exists), `off` for none. It follows
+  the stream, not the target: a switch is reported when the new layer's keyframe has arrived, so for the moment a
+  switch down takes `Forwarded` is above `Requested`, and a viewer whose stream has not begun (it waits for its
+  sub PC, or for the first keyframe) has `off`.
+- **`Audio`** is true while the client asked for the share's audio and it flows to this viewer.
+- **`Reason`** is set only while `Forwarded < Requested`, and then says why time alone won't change that:
+  1. the server's cap, with the cap's own reason, when the cap is below the request (§10.1; no cap is set before
+     slices 10 and 11);
+  2. else `""` when the share has a layer that serves the request in full: what the viewer still lacks is on its
+     way (the sub PC's connection, the layer's keyframe; 01 maps this to `waiting`);
+  3. else `no_preview_layer` for a request of `low`, and `no_layer` for a request of `high`.
+
+  So `no_layer` does not imply `Forwarded: off`: a request for `high` that gets the preview layer, because the
+  share has no fuller one, is `Forwarded: low` with `no_layer`, and so is one that gets nothing because the share
+  has no video layer yet. 01 maps both reasons to `unavailable`.
+- **At once, or paced at 250 ms.** A publisher decides how often what its viewers get changes; it must not decide
+  how many events they are sent.
+  - What the client asked for itself is reported **at once**, before `UpdateSubscriptions` returns: a pause, and a
+    request that the share's layers can't serve. So is a cap the server sets (`capSubscription`).
+  - What the **media path** changed (a layer came or went, a DownTrack's stream began, ended or moved to another
+    layer) is reported **at most once per 250 ms and subscription** (`subEventInterval`). A change that comes
+    sooner after the subscription's last event, whichever kind that was, waits for the rest of the interval, and
+    what is sent then is the state at that time. The client always ends up knowing the latest state, never hears
+    more than four unasked states a second, and states that came and went in between are left out.
+  - A report that is waiting is dropped when its subscription goes.
+- The interval is not the ticker's (§5.4): each subscription has its own timer, and a subscription has at most one
+  notice in its actor's queue.
 
 `ShareInfo`:
 
@@ -1040,12 +1102,42 @@ type binding struct {
   m-line inactive, and the next share reuses it, so the SDP doesn't grow over a 2-hour session. Viewers can never send
   media on the sub PC.
 
-  **Not in S29 yet**: the core slice gives every DownTrack a new sendonly transceiver
-  (`AddTransceiverFromTrack`), and never looks for a free one. `RemoveTrack` already makes the m-line of an ended
-  share inactive in the next offer, but nothing takes it again, so until the reuse lands a sub PC's SDP only grows
-  (two m-lines per subscription the Conn ever had; the sub answer limit is 256 KiB, 01 §13). The reuse comes with
-  slice 7 (README S52), whose integration 10 checks that the m-line count stays the same over 5 share cycles.
-  Clients must not rely on either behaviour: they map tracks by the offer's `tracks`, re-read on every offer
+  **The reuse as README S52 built it** (`subpc.go`: `subPC.spares`, `takeSpare`). The sub PC keeps **its own list
+  of spare transceivers** and lets Pion's `AddTrack` do the reuse only when that list says a spare is free. Both
+  halves are needed:
+  - *Why a list of its own.* Pion exports no "current direction" of a transceiver, and "inactive in our offer" is
+    not enough: a new DownTrack on an m-section that the viewer doesn't know as inactive yet would look to it like
+    the old track with another SSRC and msid, without the inactive step that makes a browser fire `track` again
+    (§18). So a spare, a transceiver whose DownTrack left with `RemoveTrack`, remembers the `neg` of the first
+    offer made since, and is **free** once the viewer has answered that offer, or a later one, with the m-section
+    `inactive` (read from the answer as Pion reads it). `sfutest.DirectSignaler.WaitAnswered` lets a test wait
+    for that moment.
+  - *Why `AddTrack` all the same.* Its sender is the PeerConnection's own, so Pion binds the track to the codecs
+    and header extensions **this viewer** negotiated, as it does on a new transceiver. The slice's first version
+    made the sender itself (`NewRTPSender` on the subscribe API, then `SetSender`); that bound the track to
+    everything the SFU offers, so from a viewer's second share on a viewer with a codec subset was sent payload
+    types, an RTX stream and abs-send-time it never accepted. The review took it out
+    (`TestSubTransceiverReuseBinding`).
+  - *Keeping `AddTrack` in check.* It picks the transceiver itself (the oldest of the kind without a sender that
+    the last answer didn't leave sending), and when it finds none it adds a **sendrecv** one, which a sub PC must
+    never have. So it is called only while the list has a free spare of the DownTrack's kind, and what it took is
+    checked against the list:
+
+    | `AddTrack` took | Then |
+    |---|---|
+    | a free spare, now sendonly | the reuse: the m-section carries the new DownTrack under its msid and a new SSRC |
+    | a spare that isn't free. Pion goes by the last answer alone, so it also takes one that was reused and lost its DownTrack again before the viewer answered, or one whose m-section the viewer refused | `RemoveTrack` puts it back as it was, and the DownTrack gets a new sendonly transceiver (`AddTransceiverFromTrack`): rare, and it costs one m-section (`TestSubSpareNotFreeYet`) |
+    | a transceiver it added. That can't happen while "free" means what it says | the transceiver is stopped, which makes it inactive before any offer shows it, and kept as a spare; the spares Pion passed over are no longer free; an ERROR line |
+
+  - Two cases of the text above are left out on purpose. A transceiver whose current direction is `recvonly` is not
+    reused: on a sub PC that is an m-section the viewer answered as one it sends on, which no viewer may. And an
+    answer that gives a spare's m-section a direction (against JSEP) does not free it, until an answer of that
+    viewer puts it right (`TestSubSpareNotInactive`).
+  - The result: a sub PC has as many m-sections as its Conn had subscriptions **at once**, at most, not as many as
+    it ever had. Integration 10 runs five shares in a row through one viewer's two m-sections (§17). Nothing joins
+    a sub PC that has closed.
+
+  Clients must not rely on any of this: they map tracks by the offer's `tracks`, re-read on every offer
   (01 §9 rule 4).
 - **Bind**: builds `ptFor` from `ctx.CodecParameters()` (§8.2), finds the RTX PTs (`apt=`), and gets `ctx.SSRC()`,
   `ctx.SSRCRetransmission()` and the abs-send-time extension ID from `ctx.HeaderExtensions()`. It returns the codec for
@@ -1094,8 +1186,8 @@ type binding struct {
 
 **What README S41 built** (the media path with one layer; `layer.go`, `downtrack.go`, and the ticker in `sfu.go`).
 The writer runs steps 1, 2, 3 and 5 of the loop above; a subscription forwards what it names (`high` is `f`, `low`
-is `q`, `off` nothing, audio while `Audio` is set), and the fallbacks and events of §10.1 are slice 7's. Beyond the
-text above it settled five things:
+is `q`, `off` nothing, audio while `Audio` is set), and the fallbacks and events of §10.1 are slice 7's (README
+S52 has added them since: §10.1, §6.2). Beyond the text above it settled five things:
 
 - **`Share.notify`, a lock held across `RoomEvents` calls.** The media path is what makes a share `live`, on a
   layer's read loop, and signal may end the same share in the same moment. The ticker reports the first and
@@ -1140,13 +1232,18 @@ text above it settled five things:
   layer keeps the report, nothing sends it on yet), and its integration tests (4, 5, 6 and 19), which include the
   ones for padding and for the publisher's redundant RTX.
 
-`DownTrack` as built differs from the struct above in what later slices add: there is no `rtxQueue` (slice 8), no
-`requested`/`capQ`/`capReason` (slices 7, 10 and 11: the subscription sets the munger's target directly) and no
-pacer (slice 11). It has `pc atomic.Pointer[subPC]` (set by the actor before Pion can call `Bind`, so the binding
+`DownTrack` as built differs from the struct above in what later slices add: there is no `rtxQueue` (slice 8) and
+no pacer (slice 11). It has `pc atomic.Pointer[subPC]` (set by the actor before Pion can call `Bind`, so the binding
 gets its gate), `forwarding atomic.Bool` (the writer forwards a layer now: `ShareInfo.Viewers`; written only with
 `DownTrack.mu` held, so a writer can't leave a paused viewer listed) and `stats` with packets, bytes, queue drops,
 packets without a payload type, unsent packets, write errors, epochs started and the viewer's keyframe requests.
 The RTCP reader handles PLI and FIR only; NACK is slice 8's, REMB and receiver reports slice 11's.
+
+Since slice 7 (README S52) the request and the cap are the **Subscription's**, not the DownTrack's: `reqVideo`,
+`reqAudio`, `capQ` and `capReason` belong to the subscriber's actor and need no lock. The DownTrack has one field
+for them, `want` (under `DownTrack.mu`): what its subscription asks of it, the video quality under the cap, or for
+audio "on" or "off". It chooses its layer for that among the layers the share has (§10.1), again whenever those
+change. `sender` and `transceiver` are the actor's too: the m-section the DownTrack is on (the reuse above).
 
 ### 9.4 Munger and the sequence map
 
@@ -1316,6 +1413,36 @@ cache and every forwarding DownTrack as a late packet.
 - A change of target sets the interest mask to target|current, requests a keyframe, and keeps forwarding the old layer
   until the new one's keyframe arrives (S4: 42–106 ms). Pause is immediate.
 - `SubscriptionStateEvent` is sent only when `Forwarded`, `Audio` or `Reason` changes, not on each request.
+
+**As README S52 built it** (`subscription.go`, `downtrack.go`, `share.go`).
+
+- **A layer "exists" from the moment its track is attached until that track ends**, whether or not packets flow on
+  it. The table is one function, `selectSlot(kind, want, present)`, over the slot bits of the attached layers.
+- **The choice is made again whenever a layer comes or goes**, not only on a request, with the locks of §5.4:
+  - *A layer arrives.* Every DownTrack that would rather have it gets it as its target before the track's first
+    packet is read, so a viewer who subscribed early gets each layer from its first keyframe and the publisher is
+    never asked for one. A viewer who asked for `high` may get the preview layer for a moment, while it is the
+    only one there; a thumbnail viewer never gets the full layer (`TestSimulcastFromTheFirstPacket`).
+  - *The forwarded layer ends while the share has another one.* The viewer's stream is over at once: a stream does
+    not go on from a track that has ended. Nothing is forwarded, the viewer leaves `ShareInfo.Viewers`, and the
+    client hears `off` with its reason, until the keyframe of the layer the DownTrack falls back to. The publisher
+    is asked for that keyframe right away, once however many viewers wait for it and not at all for a viewer whose
+    sub PC can't send, instead of with that layer's next packet, which on a still screen can take a second
+    (`TestForwardedLayerEnds`). Viewers of another layer notice nothing.
+  - *A track that Pion delivers again with another SSRC* attaches its Layer before the old one is taken off, so
+    its viewers wait for the new track's keyframe and don't fall back.
+- **The cap exists and nothing sets it yet.** `Conn.capSubscription(sub, q, reason)` stores the cap and its reason
+  on the subscription, applies `min(requested, cap)` and reports at once; its callers are the codec state (slice
+  10) and the allocator (slice 11). `server_limit` is later.
+- **Reasons**: the two of the table's last column, with one reading the table doesn't spell out. `no_layer` is
+  the reason whenever a request for `high` is not served in full: with nothing forwarded, and also while the
+  preview layer is forwarded in its place (`Forwarded: low`). A viewer who only waits (for its sub PC, or for the
+  keyframe of a layer that serves the request) has no reason (§6.2).
+- **Audio** needs no reason: `Audio` in the event is true while the client asked for it and the share's audio
+  layer flows to this viewer. Toggling it never renegotiates, and the viewer's sequence numbers are continuous
+  across the pause (integration 3).
+- **Events** follow §6.2: what the client asked for is answered before `UpdateSubscriptions` returns, what the
+  media path changes is reported at most once per 250 ms and subscription.
 
 ### 10.2 Downlink allocator (one per subscriber Conn, Galene-style)
 
@@ -1792,6 +1919,22 @@ through `export_test.go`; integration tests use real time unless noted.
   10 s of an idle 1 fps layer, the first packet of a 300-packet frame is still served 200 ms later; concurrent
   insert/get under `-race`; benchmark insert+get < 100 ns.
 - `throttle_test`: 100 concurrent `requestKeyframe` → 1 PLI; another after 500 ms, not before.
+  As README S52 wrote it (`throttle_test.go`, two tests on layers with a recording pub PC):
+  - `TestKeyframeThrottle`: the hundred requests make one PLI, with one caller told so and 99 counted as
+    throttled; the next goes out 500 ms after it and not a nanosecond before; a request for a slot the share has
+    no layer in does nothing; a PLI that the pub PC refuses (not connected, closing) is spent all the same, so
+    whoever waits asks again 500 ms later.
+  - `TestKeyframeThrottlePerLayer`: the throttle is each layer's own. Twenty viewers who switch to the preview
+    layer in the same moment, and whose DownTracks then ask again with every packet that is no keyframe, cost the
+    publisher one PLI for `q` per 500 ms; a request for `f` right after goes out, because `q`'s PLI doesn't
+    throttle it.
+- `subscription_test` (README S52): the table of §10.1 (`TestSelectSlot`) and its reasons (`TestShortfall`); the
+  events and their order (`TestSubscriptionStateEvents`, `TestSubscriptionOfPendingShare`); the pacing of §6.2
+  (`TestSubscriptionEventsPaced`: a thousand notices leave one entry in a busy actor's queue, and a stream that
+  alternates between two profiles, 802 changes in a few milliseconds, makes two events: that it began, and 250 ms
+  later how it ended); a forwarded layer that ends (`TestForwardedLayerEnds`); and the
+  transceiver reuse of §9.3 with its three corner cases (`TestSubTransceiverReuse`, `…ReuseBinding`,
+  `TestSubSpareNotFreeYet`, `TestSubSpareNotInactive`).
 - `rtx_test`: RTX packet layout (OSN, SSRC, PT); per-seq limits; budget rate and depth (after 10 s of an idle
   8 Mbps `f`, NACKs for 30 packets of one large frame are all served).
 - `allocator_test` (fake clock): scripted REMB and RR sequences → state changes, backoff doubling up to 120 s and
@@ -1873,6 +2016,24 @@ with `fake.Source`, `sfutest.Viewer`)**
     already delivered on its RTX stream, as Chrome does for padding and probes; each viewer receives every seq exactly
     once and sends no extra NACKs; `isshoni_sfu_ingress_duplicates_total` counts the copies. A packet dropped on the
     publish side and then recovered by RTX still reaches every viewer once.
+
+**The frame checks and a layer switch** (README S52, `sfutest/checks.go`). An SFU switches on the first packet of
+the new layer's keyframe (§9.4), and the two layers are read by different goroutines, so that packet can reach a
+viewer's queue between two packets of the old layer's current frame. The rest of that frame is then no longer
+forwarded, and a decoder drops what it got of it. That is correct, and the checks say so:
+- `CheckContinuous` and `CheckStartsOnSPS` see every packet, the cut frame's included: the viewer's sequence
+  numbers have no gap, and every change of layer starts on an SPS.
+- The checks of whole frames (`CheckVideoMarkers`, `Frames`) run on `sfutest.WithoutCutFrames(pkts)`, which leaves
+  out exactly the frames that a switch cut short: a frame whose last packet (the marker bit) didn't arrive, right
+  before a frame of another layer. A frame that is short for any other reason still fails. `WithoutPartialTail`
+  does the same for the one frame the recording itself may have cut at its end.
+
+Integration 2, 3, 10 and 17 are `simulcast_test.go`, with two more of README S52's next to them:
+`TestSimulcastFromTheFirstPacket` (§10.1: viewers who were subscribed before a simulcast publisher sent anything
+get each layer from its first packet, and the publisher is asked for no keyframe) and `TestSimulcastReoffer` (a
+simulcast publisher offers again in the same `gen`: the answer is as before, no layer is attached anew, no
+keyframe is asked for, and the viewer's stream has no gap). For the second, `publish.Publisher`'s offer no longer
+repeats the last answer's rids as receive rids, which the SFU refuses as `sfu.bad_rid`.
 
 **Browser e2e (owned by 05, relies on this doc)**: Chrome only (Playwright with Google Chrome, 05 §19.3). Chrome
 sharer (canvas) → SFU → Chrome viewers: `framesDecoded > 0`, audio energy, switches. No browser spec measures the A/V
@@ -2018,6 +2179,15 @@ how: the DTLS-ready gate follows the sub PC's state, a stream that Pion took wit
 keyframe, a pending share asks for its own first keyframe, and `Share.notify` is the one lock held across a
 `RoomEvents` call (§5.4). From slice 8 it brought forward the duplicate and too-late drop, padding markers,
 abs-send-time and the per-layer sender report; NACK/RTX and SR forwarding stay in slice 8 (§9.3).
+
+**What README S52 built** (slice 7; integration 2, 3, 10 and 17). Layer selection is §10.1 with what it settled:
+the choice is made again whenever a layer of the share comes or goes, under `Share.mu` and then `DownTrack.mu`
+(§5.4), and a forwarded layer that ends is over at once. `SubscriptionStateEvent` is §6.2: sent only on a change,
+at once for what the client asked for, and at most once per 250 ms and subscription for what the media path did,
+with `no_layer` also for a request for `high` that gets the preview layer. Transceiver reuse is §9.3: the sub PC's
+own list of spares decides when Pion's `AddTrack` may take one. The server's cap on a subscription is in place
+for slices 10 and 11. The tests are in §17 (`throttle_test.go`, `subscription_test.go`, `simulcast_test.go`,
+`sfutest.WithoutCutFrames`).
 
 ## Decisions taken at integration (formerly open questions)
 

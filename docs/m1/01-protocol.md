@@ -1444,11 +1444,11 @@ type AgentSend struct {
 	To      string          `json:"to,omitempty"`     // a connectionId of the same user, or
 	ToRole  Role            `json:"toRole,omitempty"` // all the user's connections with this role (exactly one of To/ToRole)
 	Kind    string          `json:"kind"`             // [a-z.]{1,32}; registry in 04/M2 docs
-	Payload json.RawMessage `json:"payload"`          // <= 16 KiB, opaque to the server
+	Payload json.RawMessage `json:"payload"`          // any JSON value but null (below), <= 16 KiB; opaque to the server
 }
 
 type AgentSendResult struct {
-	Delivered int `json:"delivered"`
+	Delivered int `json:"delivered"` // >= 1: the targets that were handed the message; not an acknowledgment (below)
 }
 
 type AgentRecv struct {
@@ -1473,11 +1473,62 @@ type OwnConnection struct {
 Rules:
 - The server delivers only to connections of the **same user**. An unknown target, or one of another user, gets
   `agent_target_not_found`, so other users' connection ids are never confirmed.
-- 10 messages per second per connection.
+- 10 messages per second per connection, refused ones included (below).
 - Reserved `kind` names: `share.request`, `share.status` (M4); `playback.stop` ("Now watching in the isshoni app",
   M2); `exclusions.get`, `exclusions.set` (M2).
 - The plan's `share.request` signaling message is this relay kind, not a top-level message type: only the user's
   own connections ever see it.
+
+**As README S51 built it** (`signal/relay.go`). The rules above stand; these are the ones they left open.
+
+- **Who is a target.** With `to`, the one connection of that id; with `toRole`, every connection of the user with
+  that role. In both cases a target is a connection that
+  - belongs to the sender's user, whatever its session or device;
+  - is **not the sender**: a connection never relays to itself, neither by its own id nor by its own role;
+  - has the **`agent.relay` feature** active (§6.2): a client that didn't ask for it doesn't know `agent.recv`;
+  - is **online**: it has a socket that still takes messages. A detached connection (§4.2) is no target, because
+    what the hub sends it is dropped and never replayed (§10.5), and the sender had better hear that nobody got
+    the message.
+- **`ok` always has `delivered >= 1`.** Without a target the reply is `agent_target_not_found`, for every reason
+  alike: an unknown id, another user's connection, the sender's own id, a connection without the feature, one
+  that is detached, a role that none of the user's other connections has. So the relay never confirms that
+  another user's connection id exists, and never answers `ok {delivered: 0}`.
+- **`delivered` is a count, not an acknowledgment.** It counts the connections whose actor was handed the message
+  while their socket was open. A socket can still fail before the message is written, and a connection can detach
+  before its actor gets to it. Kinds that need an answer define one (`share.request` and `share.status`, M4).
+  - The message is encoded once and posted to each target's actor, which queues it on its socket in order with
+    that connection's other messages. The sender's actor never waits for a target's: a target that is busy or
+    stuck costs the sender nothing, and two connections may relay to each other at once.
+  - A target whose actor's inbox is full is not handed the message and is not counted. It is closed for good as
+    `slow_connection`, without grace, like any connection whose inbox overflows (§15.2).
+- **The payload is relayed as the same JSON value.** The server never parses it: `agent.recv.payload` is the value
+  that came in, byte for byte but for the white space between its tokens, which is dropped. In particular the hub
+  does not escape it the way `encoding/json` escapes text for a web page (`<`, `>`, `&`, U+2028 and U+2029 as six
+  bytes each), so an `agent.recv` is never more than its payload plus an envelope of about a hundred bytes: what a
+  sender is charged for (16 KiB, 10 per second) is the most each target is sent, and `agent.recv` stays far below
+  the 64 KiB of a message. `from` is the sender's `connectionId`, which a target answers with an `agent.send {to}`
+  of its own. The payload is never logged (§17); the debug line has the `kind` and the count.
+- **Order of the checks, and what costs a token.**
+  1. The frame is at most 64 KiB (`message_too_large`) and the connection has the `agent.relay` feature
+     (`feature_disabled`). Every role may send (§6.3). Neither refusal costs a token of the `agent.send` bucket
+     (the global message rate of §13 counts every frame).
+  2. The `agent.send` bucket (§13): 10 per second per connection, else `rate_limited` with `retryAfterMs`. It is
+     charged here, **whatever becomes of the message afterwards**: a send that is then refused costs its token
+     like one that is delivered. So a connection also gets at most ten answers per second about connection ids.
+  3. The payload of the request (`protocol.AgentSend.Validate`): exactly one of `to` and `toRole`, a known role,
+     the form of `kind`, and a `payload` (`bad_request` with the field; a missing `payload` is `{field: "payload",
+     reason: "required"}`). A `payload` over 16 KiB is `message_too_large` in scope `request`, not `bad_request`.
+  4. The targets. Validation comes first, so an oversized message to nobody is `message_too_large`.
+
+**`payload: null` is `bad_request`** (decided after group 6; README F03 implements it). As S51 merged it, a `null`
+payload passed step 3, being a JSON value of four bytes, and was relayed as `agent.recv {payload: null}`. That is
+the one way a client could make the hub send a `null`, which nothing on this wire does (§5: absent means `{}`, and
+a test asserts that no hub output holds one), and it reads the same as a payload that was left out, which is
+refused. So `payload` must be a JSON value other than `null`: `agent.send {payload: null}` gets `error{bad_request,
+scope: request}` with `params {field: "payload", reason: "required"}`, the answer for a missing one, reaches
+nobody, and costs its token like every refused send. That is the one thing the server reads of a payload. A
+`null` inside one (`{"a": null}`, `[null]`) stays the sender's business, like everything else in it, and a kind
+with nothing to say sends `{}`.
 
 ## 9. WebRTC negotiation rules (M1)
 
@@ -1549,6 +1600,18 @@ These rules bind the web client (05), the Go test and load-test clients, the SFU
     - The sub PC closes server-side on `room.leave` or a `room.join` elsewhere; the client closes its local sub PC
       without sending anything. The server ignores `pc.close{pc: sub}` (reserved).
     - The server never asks to rebuild a pub PC that carries no live share. `room.leave` closes both PCs server-side.
+      - **The server enforces this, and `sfuplane` is where** (decided after group 6; README F03 implements it).
+        The request in question is `pc.restart{pc: pub, mode: rebuild, reason: failed}`, which is made of the
+        SFU's `PCStateEvent{PCPub, failed}` (§15.4). As group 6 merged it, every such event became a request, also
+        for a pub PC whose connection publishes nothing any more: the last share was stopped or timed out, and
+        the PC failed before the client's `pc.close` reached the server, or the client never sent one. That
+        client would build and negotiate a PeerConnection that carries nothing.
+      - The rule: the request goes out only while the failed PC's connection has a share that has not ended,
+        one that is `starting`, `live` or `stalled` (to the SFU: pending, or live with a stalled one included).
+        A `starting` share waits for the new PC's first keyframe and a `stalled` one for its media to come back,
+        each under its 30 s timeout (§4.4), so both need the rebuild. Without such a share nothing is sent.
+      - A share that starts later needs no request: its pub offer comes with a `gen` the client chooses, and a
+        client whose pub PC has failed offers `gen + 1` (§10.4).
 
 ## 10. Reconnect and recovery (M1)
 
@@ -1650,7 +1713,7 @@ client's sub PC has been `disconnected` for 3 s when the socket resumes, so its 
 
 **Server**: it starts exactly three actions on its own:
 1. `pc.restart{pc: pub, gen, mode: rebuild, reason: failed}` when the current pub PC reaches `failed`, or when a new
-   pub PC misses its 10 s handshake (02);
+   pub PC misses its 10 s handshake (02); only while that connection has a share that has not ended (§9 rule 10);
 2. inside `Resync()` (§10.5), an ICE-restart offer for a sub PC that isn't connected;
 3. SFU-internal sub rebuilds for codec recovery (§11.7, 02 §8.5).
 
@@ -1909,10 +1972,10 @@ forever: a code is never renamed or reused with another meaning. 05 maps each to
 | `slow_connection` | connection | yes | send queue overflow | backoff | 4503 |
 | `replaced` | connection | no | the same connection resumed on another socket | stop silently | 4409 |
 | `server_shutdown` | connection | yes | the hub is stopping (after `server.shutdown`) | wait `reconnectInMs` | 1012 |
-| `internal` | request or connection | yes | unexpected server error; `params {ref}` is an 8-char id also written to the server log, so a user can report it | retry once / backoff | 1011 if connection |
+| `internal` | request or connection; pc for a `pc.*` notification; from the SFU with the scope of what failed: request, pc, share or subscription (§15.4) | yes; **no** when the SFU says a retry can't help (§15.4: a call that broke its contract, a method that isn't implemented yet) | unexpected server error; `params {ref}` is an 8-char id also written to the server log, so a user can report it | retry once / backoff; no retry when `retryable` is false | 1011 if connection |
 | `bad_request` | request; pc for `pc.*` notifications; connection for a second `hello` | no | payload invalid; `params {field, reason}` with reason `required`, `invalid`, `too_long`, `too_many` or `duplicate` | generic error (a bug) | 4400 if connection |
 | `unknown_type` | request | no | a request type the server doesn't know | generic error | — |
-| `message_too_large` | request | no | a non-SDP message over 64 KiB after `hello` | generic error | — |
+| `message_too_large` | request | no | a non-SDP message over 64 KiB after `hello`; an `agent.send` whose `payload` is over 16 KiB (§8.14) | generic error | — |
 | `forbidden` | request | no | role, ownership or `CanJoin` check failed | generic "not allowed" | — |
 | `feature_disabled` | request | no | a message behind a feature that isn't active | hide the feature | — |
 | `not_in_room` | request | no | share or PC message without a room | rejoin, then retry | — |
@@ -1926,7 +1989,7 @@ forever: a code is never renamed or reused with another meaning. 05 maps each to
 | `codec_not_supported` | share | no | publisher offered no usable H.264 | "This browser can't share in a format friends can watch; use Chrome/Edge or the desktop app" | — |
 | `sdp_invalid` | pc | no | SDP failed to apply (`pc`, `gen`, `neg`) | rebuild that PC once (§9 rule 8) | — |
 | `stale_negotiation` | pc | no | pub offer with an older `gen`, or an older `neg` in the current `gen` (`pc`, `gen`, `neg`) | ignore (the client already moved on) | — |
-| `agent_target_not_found` | request | no | no same-user connection matches | "Your helper isn't running" (M2/M4) | — |
+| `agent_target_not_found` | request | no | no same-user connection matches: none of the user's other connections that is online and has `agent.relay` (§8.14); the same answer for another user's connection id | "Your helper isn't running" (M2/M4) | — |
 
 Scope `request` is used only for messages that have an `id`. An error caused by a `pc.*` notification always has
 scope `pc` with `pc`, `gen` and `neg`, whichever row its code comes from.
@@ -1997,7 +2060,16 @@ made while `stopped`).
 | Room soft limits | participants, shares: 0 = none (03 settings `maxParticipantsPerRoom`, `maxSharesPerRoom`, read through `Deps.Policy`) | §8.7 |
 | Global message rate | 20/s refill, burst 100; 512 KiB/s refill, burst 1 MiB | server |
 | Per type | `room.join` 10/min · `share.start` 10/min · `pc.restart` 12/min per PC · pub offers with a new `gen` 6/min · `caps.update` 12/min · `stats` 1 per 5 s (excess dropped silently) · `agent.send` 10/s | server |
-| Field sizes | `id`/`ref` ≤ 32; `label` ≤ 40 code points; room/user ids ≤ 64; `subs` ≤ 64; `tracks` ≤ 8 (pub offers); pub offer SDP ≤ 64 KiB and ≤ 8 m-lines (02 §12); sub answer ≤ 256 KiB; candidate ≤ 512 B; buffered candidates ≤ 64 per PC per gen (later ones dropped); `agent.send.payload` ≤ 16 KiB; `stats` ≤ 16 KiB; `features`, `caps.decode` ≤ 32 entries | `protocol` validation |
+| Field sizes | `id`/`ref` ≤ 32; `label` ≤ 40 code points; room/user ids ≤ 64; `subs` ≤ 64; `tracks` ≤ 8 (pub offers); pub offer SDP ≤ 64 KiB and ≤ 8 m-lines (02 §12); sub answer ≤ 256 KiB; candidate ≤ 512 B; buffered candidates ≤ 64 per PC per gen (later ones dropped); `agent.send.payload` ≤ 16 KiB (above it `message_too_large`, not `bad_request`); `stats` ≤ 16 KiB; `features`, `caps.decode` ≤ 32 entries | `protocol` validation |
+
+The per-type limits are token buckets per connection that start full: `n` per minute or per second is a burst of
+`n` that refills evenly, so the 11th `agent.send` in one instant is refused with `retryAfterMs: 100`, and a steady
+ten per second is never refused. The buckets of `room.join`, `share.start`, `caps.update`, `stats` and `agent.send`
+are charged after the checks that refuse a message outright (its size, an inactive feature, the role) and **before
+the handler reads the payload**: the token is spent whatever the handler then answers. For `agent.send` that means
+a send refused as `bad_request`, as `message_too_large` for its payload, or with `agent_target_not_found` costs a
+token like a delivered one (README S51; §8.14). `agent.recv` costs its receiver nothing: the limits are on what a
+client sends. The two `pc.*` limits are charged where those messages are routed, in the order of §9 rule 1.
 
 Why 256 KiB for SDP: a Chrome sub answer is about 2.7 KB per video m-section when the offer lists 5 H.264 profiles
 plus RTX, and about 0.6 KB per audio m-section. That is about 3.3 KB per watched share, so 64 KiB would stop a viewer at
@@ -2210,12 +2282,30 @@ Files:
 - `dispatch.go`;
 - `room.go`: participants, snapshots, coalescing;
 - `share.go`;
+- `relay.go`: the same-user relay, `agent.send` and `agent.recv` (§8.14; README S51);
 - `resume.go`;
 - `ratelimit.go`;
+- `stats.go`: `stats` and `stats.watch` in both directions (§8.11);
+- `metrics.go`: the hub's series (§18); `semver.go`: the comparison behind `Policy.MinClientVersion` (§6.1);
 - `interfaces.go`;
 - `snapshot.go`;
-- `signaltest/`: a fake `MediaPlane`, `Authenticator` and `RoomDirectory` for tests (also used by 02 and 04, and by
-  the first server wiring slice before the real SFU is wired).
+- `signaltest/`: a fake `MediaPlane`, `Authenticator` and `RoomDirectory` for tests (also used by 02 and 04).
+
+**The server before the SFU is wired** (README S54). The first wiring slice did not put `signaltest`'s fake
+`MediaPlane` into `serve`, which would have made a test package part of the binary. `internal/server/wire.go`
+has its own placeholder, `noMedia`, until README S59 passes `sfuplane`'s `Plane` instead. With it signaling is complete
+(connections join rooms, see each other and resume) and everything that needs media is refused:
+
+| `MediaPeer` method | `noMedia` |
+|---|---|
+| `CreateShare`, `UpdateShare` | `error{feature_disabled, scope: request}`: `share.start` and `share.update` fail |
+| `HandleOffer`, `HandleAnswer`, `AddICE`, `Restart` | `error{feature_disabled, scope: pc}` with the message's `pc`, `gen` and `neg` |
+| `Subscribe` | every share is `ignored`: without media no share exists |
+| `EndShare`, `ClosePC`, `SetCaps`, `Resync`, `Close` | nothing |
+| `Stats` | an empty `ServerStats` (`subs: []`, `layers: []`) |
+
+It keeps no state. `feature_disabled` is the catalog's "hide the feature" (§12.1), which is what a client should do
+with sharing on such a server. No release runs this way: the placeholder exists only between README S54 and S59.
 
 **Concurrency model:**
 - Each connection is one actor goroutine. It owns the connection state and handles, in order: parsed client messages
@@ -2620,7 +2710,10 @@ version of this section left open:
 ### 15.4 `internal/server/sfuplane` (M1): `MediaPlane` over 02's SFU
 
 02 keeps its own Go types and never imports `signal` or `protocol` (02 §2). This package is the only place that knows
-both. It is about 400 lines of mapping, and table tests cover every row below.
+both. It is mapping and nothing else, and table tests cover every row below (README S50): `plane.go` (the `Plane`,
+its peers and the `RoomEvents`), `peer.go` (the calls and the events), `convert.go` (the values) and `errors.go`
+(the error table). The tests read the SFU's declared error codes, end reasons, subscription reasons, profiles and
+event types from its source, so a new one without a row here fails them.
 
 ```go
 package sfuplane // imports internal/protocol, internal/server/signal, internal/server/sfu
@@ -2663,7 +2756,7 @@ Connection.
 | `SubscriptionStateEvent` | `SubscriptionStatus` (reason map below) |
 | `CodecPolicyEvent{Share, Profile}` (one per share this connection publishes) | `QualityHint{shareId, reason: codec, codec: "h264/"+Profile}` with no encodings (a profile switch doesn't change them) |
 | `QualityHintEvent{Share, Reason, MaxBitrate, Encodings}` | `QualityHint{shareId, reason: ev.Reason, maxBitrate, encodings converted 1:1}`; `Reason` is `admin` or `viewers`, and `Encodings` is the full current `f`/`q` list with the cap and pause state applied by the SFU |
-| `PCStateEvent{PCPub, Gen, failed}` | `RestartRequest{pc: pub, gen: ev.Gen, mode: rebuild, reason: failed}` (the SFU emits PCStateEvents only for the current PC of each kind) |
+| `PCStateEvent{PCPub, Gen, failed}` | `RestartRequest{pc: pub, gen: ev.Gen, mode: rebuild, reason: failed}` (the SFU emits PCStateEvents only for the current PC of each kind). As README S50 merged it, for every such event; from README F03 on only while the connection has a share that has not ended, the rule of §9 rule 10 (decided after group 6) |
 | `PCStateEvent{PCSub, …}` | nothing: the client drives sub restarts (§10.4); the SFU ICE-restarts in `Resync()` and rebuilds sub PCs itself only for codec retries |
 | `ErrorEvent` | `Error` (code map below) with the event's scope: `pc.pub`/`pc.sub` → scope `pc` with that `pc` (an event has no `gen` or `neg`); `share`/`subscription` → that scope with `shareId` = `Error.Share` |
 | `RoomEvents.ShareUpdated` | `ShareMedia` on the publishing connection's sink: `pending→live` or `stalled→live` = `Live`; `→stalled` = `Stalled`; a layer attached or ended, the profile changed, or audio changed while live = `Changed`. `Layers` is built from `ShareInfo.Layers` (every layer whose track is attached, paused ones included), ignoring `LayerInfo.Active` |
@@ -3153,3 +3246,11 @@ Decided after group 5 (engineering calls the owner delegated; README §6):
 6. **A `share.update` from another connection does not reach the publishing client in M1** (§8.7): `room.state`
    and the SFU get the new preset, the publishing connection gets no `quality.hint`, and `HintReasonPreset` is not
    emitted. It arrives with the M2 desktop handoff.
+
+Decided after group 6 (engineering calls the owner delegated; README §6; README F03 implements both):
+
+7. **An `agent.send` with `payload: null` is `bad_request`** (§8.14), like one without a payload. The hub then never
+   relays a `null`, which nothing on this wire sends (§5).
+8. **The server asks for no pub PC rebuild that §9 rule 10 forbids, and `sfuplane` is where that is enforced**: a
+   failed pub PC whose connection has no share that has not ended gets no `pc.restart{rebuild}` (§9 rule 10,
+   §15.4).
