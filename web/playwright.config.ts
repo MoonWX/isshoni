@@ -9,9 +9,10 @@
 //   share through the fake-display seam. For windows and the real picker, run
 //   `ISSHONI_BIN=bin/isshoni npm run e2e -- --headed` in web/ (`task e2e` leaves its binary in bin/).
 // - A failed test keeps its trace in test-results/, next to the servers' logs (server-<worker>-<n>.log), and the
-//   HTML report goes to playwright-report/. CI also keeps the video of a failed test and uploads all of it when
-//   the job fails. Video is off outside CI: it needs Playwright's own ffmpeg (`npx playwright install ffmpeg`),
-//   which a machine that already had Chrome doesn't have, and the trace shows every step anyway.
+//   HTML report goes to playwright-report/. CI also keeps the video of a failed test, and uploads both
+//   directories after every run, green or red (see `retries` below). Video is off outside CI: it needs
+//   Playwright's own ffmpeg (`npx playwright install ffmpeg`), which a machine that already had Chrome doesn't
+//   have, and the trace shows every step anyway.
 // - Service workers are blocked: a production build registers one, and it would answer navigations from its
 //   cache. The PWA spec turns them on for itself (`test.use({ serviceWorkers: 'allow' })`).
 import { defineConfig } from '@playwright/test';
@@ -32,7 +33,9 @@ export default defineConfig({
   // lists the display's windows: when a window of another worker goes away at that moment, Chrome logs an X
   // BadWindow error and getDisplayMedia never answers (about one pick in 25 with two workers, none with one).
   ...(ci ? { workers: 1 } : {}),
-  // One retry in CI: a test that passes the second time is reported as flaky, with the trace of its failure.
+  // One retry in CI. A test that passes the second time is reported as flaky and leaves the job green; the
+  // trace, the video and the server log of its failed attempt stay in test-results/, which is why the job uploads
+  // its results after a green run too.
   retries: ci ? 1 : 0,
   // The CI job has 20 minutes: a run that hangs ends here, as a failure, in time for its upload.
   globalTimeout: ci ? 15 * 60_000 : 0,

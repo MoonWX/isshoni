@@ -2,6 +2,11 @@
 // is completed through `isshoni setup-url --json`, and a browser logs in and reaches the room. It proves the
 // plumbing that every other spec stands on: the server fixtures, the accounts, the debug handle that stats.ts
 // reads, and, in a headful run, Chrome's flag that picks the tone tab. Nobody shares through the app here.
+//
+// The worker's server is shared with every other spec of the worker, and a person whose connection dropped stays
+// in the room for 30 s more (01's grace). So on that server these tests only say what also holds with other
+// people and their shares in the lounge; what a page reads in an empty room is checked on a server of the test's
+// own.
 import { expect, test, TONE_TAB_TITLE } from './fixtures.ts';
 import { readState, readStats, waitForRoom, waitForState } from './stats.ts';
 
@@ -42,6 +47,51 @@ test('the admin logs in and lands in the lounge', async ({ server, page }) => {
   const state = await waitForRoom(page, 'lounge');
   expect(state.connection.connectionId).not.toBeNull();
   expect(state.room.participants).toBeGreaterThanOrEqual(1);
+});
+
+test('a second person, in a browser context of their own, joins the same room', async ({
+  server,
+  context,
+  page,
+  asUser,
+}) => {
+  const admin = server.admin;
+  if (!admin) throw new Error('the worker server has no admin');
+  await server.signIn(context, admin);
+  await page.goto(`${server.url}/`);
+  const before = await waitForRoom(page, 'lounge');
+
+  const friend = await asUser(server);
+  await friend.page.goto(`${server.url}/`);
+  const theirs = await waitForRoom(friend.page, 'lounge');
+  expect(theirs.connection.connectionId).not.toBe(before.connection.connectionId);
+
+  // The admin's page hears of it: a newer room.state. Its count of people is not compared with the one before:
+  // on a shared server that count also falls, when someone an earlier spec left behind is gone.
+  await waitForState(page, (s) => (s.room.rev ?? 0) > (before.room.rev ?? 0), {
+    message: "a newer room.state on the admin's page",
+  });
+  expect((await readState(friend.page)).room.participants).toBeGreaterThanOrEqual(2);
+
+  // And the page shows who is there: the people panel lists both.
+  await page.getByRole('button', { name: /here\. Show who/ }).click();
+  const people = page.getByRole('dialog');
+  await expect(people.getByText(`${admin.username} (you)`)).toBeVisible();
+  await expect(people.getByText(friend.account.username, { exact: true })).toBeVisible();
+});
+
+test('alone on a server of its own, a page reads the state and the stats of an empty room', async ({
+  startServer,
+  context,
+  page,
+}) => {
+  const own = await startServer();
+  const admin = own.admin;
+  if (!admin) throw new Error('the server has no admin');
+  await own.signIn(context, admin);
+  await page.goto(`${own.url}/`);
+  const state = await waitForRoom(page, 'lounge');
+  expect(state.room.participants).toBe(1);
 
   // The shape stats.ts declares for state(): a page that has just joined, with nothing shared.
   expect(state.viewer).toMatchObject({
@@ -67,38 +117,6 @@ test('the admin logs in and lands in the lounge', async ({ server, page }) => {
   expect(Array.isArray(sample.pcs)).toBe(true);
   expect(sample.shares).toEqual({});
   expect(sample.outbound).toEqual([]);
-});
-
-test('a second person, in a browser context of their own, joins the same room', async ({
-  server,
-  context,
-  page,
-  asUser,
-}) => {
-  const admin = server.admin;
-  if (!admin) throw new Error('the worker server has no admin');
-  await server.signIn(context, admin);
-  await page.goto(`${server.url}/`);
-  const alone = await waitForRoom(page, 'lounge');
-
-  const friend = await asUser(server);
-  await friend.page.goto(`${server.url}/`);
-  const theirs = await waitForRoom(friend.page, 'lounge');
-  expect(theirs.connection.connectionId).not.toBe(alone.connection.connectionId);
-
-  // The admin's page hears of it: a newer room.state with one more person.
-  await waitForState(
-    page,
-    (s) => s.room.participants > alone.room.participants && (s.room.rev ?? 0) > (alone.room.rev ?? 0),
-    { message: 'the friend in the room of the admin' },
-  );
-  expect((await readState(friend.page)).room.participants).toBeGreaterThanOrEqual(2);
-
-  // And the page shows it: the people panel lists both.
-  await page.getByRole('button', { name: /here\. Show who/ }).click();
-  const people = page.getByRole('dialog');
-  await expect(people.getByText(`${admin.username} (you)`)).toBeVisible();
-  await expect(people.getByText(friend.account.username, { exact: true })).toBeVisible();
 });
 
 test('a server of its own waits for the setup and takes config overrides', async ({ startServer, page, request }) => {

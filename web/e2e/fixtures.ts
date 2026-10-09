@@ -153,7 +153,10 @@ export interface TestFixtures {
    * debug flag set. Its video is kept like the default context's; it is closed when the test ends.
    */
   asUser: (server: E2EServer, account?: Account) => Promise<UserSession>;
-  /** Attaches the logs of the servers a failed test could have used to its report. */
+  /**
+   * Attaches the logs of the servers a failed test could have used to its report, and notes there (annotation
+   * "e2e server") which of them exited by itself.
+   */
   serverLogs: undefined;
 }
 
@@ -402,6 +405,11 @@ function alive(child: ChildProcess): boolean {
 class Server implements E2EServer {
   url = '';
   admin: Account | null = null;
+  /**
+   * How the process ended when neither stop() nor restart() ended it: "exit code 1", "SIGKILL". Null while it
+   * runs, and after an end that the harness asked for.
+   */
+  exitedBy: string | null = null;
 
   private ports: Ports | null = null;
   private proc: Process | null = null;
@@ -416,8 +424,9 @@ class Server implements E2EServer {
     private readonly overrides: Readonly<Record<string, ConfigValue>>,
   ) {}
 
-  get isRunning(): boolean {
-    return this.proc !== null && alive(this.proc.child);
+  /** stop() was called: the test or the worker is done with this server. */
+  get wasStopped(): boolean {
+    return this.stopped;
   }
 
   /**
@@ -442,8 +451,14 @@ class Server implements E2EServer {
         outcome === 'exited'
           ? 'exited before it was ready'
           : `was not ready within ${String(READY_TIMEOUT_MS / 1000)} s`;
-      const tail = log.trimEnd().split('\n').slice(-20).join('\n');
-      throw new Error(`the e2e server ${why}. The end of ${path.basename(this.logPath)}:\n${tail}`);
+      // The reason is at one end of what this start logged: a usage error is the first line, with the flag help
+      // after it; an error of the startup is the last one.
+      const lines = log.trimEnd().split('\n');
+      const shown =
+        lines.length > 25
+          ? [...lines.slice(0, 5), `… (${String(lines.length - 20)} more lines)`, ...lines.slice(-15)]
+          : lines;
+      throw new Error(`the e2e server ${why}. It logged (${path.basename(this.logPath)}):\n${shown.join('\n')}`);
     }
   }
 
@@ -474,9 +489,13 @@ class Server implements E2EServer {
     } finally {
       fs.closeSync(log);
     }
+    this.exitedBy = null;
     const gone = new Promise<void>((resolve) => {
-      child.once('exit', () => {
+      child.once('exit', (code, signal) => {
         running.delete(child);
+        // terminate() forgets the process before it signals it: an exit of a process that is still this
+        // server's is one that nobody here asked for.
+        if (this.proc?.child === child) this.exitedBy = signal ?? `exit code ${String(code)}`;
         resolve();
       });
       // The binary could not be started at all: there is no exit event then.
@@ -704,10 +723,18 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
       const before = started.length;
       await use(undefined);
       if (testInfo.status === testInfo.expectedStatus) return;
-      // The servers this test started, and the ones that run now (the worker's). attach() copies the file.
-      const logs = started.filter((server, i) => i >= before || server.isRunning).map((server) => server.logPath);
-      for (const file of logs) {
-        if (fs.existsSync(file)) await testInfo.attach(path.basename(file), { path: file, contentType: 'text/plain' });
+      // The servers this test started, and the older ones that nobody stopped: the worker's, also when it died
+      // under the test, which is when its log matters most. attach() copies the file.
+      const used = started.filter((server, i) => i >= before || !server.wasStopped);
+      for (const server of used) {
+        const name = path.basename(server.logPath);
+        if (server.exitedBy !== null) {
+          const description = `${name}: the server exited by itself (${server.exitedBy})`;
+          testInfo.annotations.push({ type: 'e2e server', description });
+        }
+        if (fs.existsSync(server.logPath)) {
+          await testInfo.attach(name, { path: server.logPath, contentType: 'text/plain' });
+        }
       }
     },
     { auto: true },

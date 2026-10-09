@@ -5,10 +5,11 @@
 //
 // The handle belongs to the room runtime, so it appears some time after a navigation, and it is new after each
 // one. Every function here therefore waits for it first; a page that never installs it (it is not signed in, or
-// it has no debug flag) fails that wait with a message that says so.
+// it has no debug flag) fails that wait with a message that says so. A read or a wait may span a navigation: when
+// the page navigates under a read, the read waits for the next page's handle and reads that.
 //
 // The waits poll from Node on a timer, not on the page's animation frames: a tab in the background has none.
-import type { Page } from '@playwright/test';
+import { errors, type Page } from '@playwright/test';
 
 import type { DebugHandle } from '../src/lib/stats/debugHandle';
 import type { AudioInSample, PCSample, StatsSample, VideoInSample } from '../src/lib/stats/summarize';
@@ -84,67 +85,128 @@ export interface DebugShare {
 
 /** How long a page may take to install the handle after a navigation. */
 const HANDLE_TIMEOUT_MS = 15_000;
+/** A read waits at least this long for the handle, whatever time its caller has left: one answer of the page. */
+const MIN_HANDLE_WAIT_MS = 1_000;
 const POLL_INTERVAL_MS = 100;
 const STATS_POLL_INTERVAL_MS = 250;
 
-/** Resolves when the page has window.__isshoni. */
-export async function debugReady(page: Page, timeout = HANDLE_TIMEOUT_MS): Promise<void> {
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Whether the page has window.__isshoni within `timeout` ms. It throws when the page is closed meanwhile. */
+async function handleWithin(page: Page, timeout: number): Promise<boolean> {
   try {
     await page.waitForFunction(() => window.__isshoni !== undefined, undefined, { timeout, polling: POLL_INTERVAL_MS });
+    return true;
   } catch (err) {
-    throw new Error(
-      `${page.url()} has no window.__isshoni after ${String(timeout)} ms: the page is not signed in, ` +
-        'or its context lacks the debug flag (enableDebug in fixtures.ts)',
-      { cause: err },
-    );
+    if (err instanceof errors.TimeoutError) return false;
+    throw err;
   }
 }
 
-/** state() of the page, once it has the handle. */
-export async function readState(page: Page): Promise<DebugState> {
-  await debugReady(page);
-  const state = await page.evaluate(() => {
-    const handle: DebugHandle | undefined = window.__isshoni;
-    if (!handle) throw new Error('window.__isshoni is gone');
-    return handle.state();
-  });
-  return state as DebugState;
+function noHandle(page: Page, waited: number): Error {
+  return new Error(
+    `${page.url()} has no window.__isshoni after ${String(waited)} ms: the page is not signed in, ` +
+      'or its context lacks the debug flag (enableDebug in fixtures.ts)',
+  );
 }
 
-/** A fresh stats() sample of the page, once it has the handle. The first call loads the page's media code. */
-export async function readStats(page: Page): Promise<StatsSample> {
-  await debugReady(page);
-  return page.evaluate(() => {
-    const handle: DebugHandle | undefined = window.__isshoni;
-    if (!handle) throw new Error('window.__isshoni is gone');
-    return handle.stats();
+/** Resolves when the page has window.__isshoni. */
+export async function debugReady(page: Page, timeout = HANDLE_TIMEOUT_MS): Promise<void> {
+  if (!(await handleWithin(page, timeout))) throw noHandle(page, timeout);
+}
+
+/**
+ * A call that lost its handle: the page navigated under it (Playwright's message), or the room runtime ended
+ * between the wait for the handle and the call (the message of the calls below).
+ */
+function handleLost(err: unknown): boolean {
+  return err instanceof Error && /Execution context was destroyed|window\.__isshoni is gone/.test(err.message);
+}
+
+/**
+ * Waits for the page's handle and runs `call`, which uses it in the page. When the handle goes away under the
+ * call, this starts over with the next handle, as long as `timeout` ms have not passed.
+ */
+async function withHandle<T>(page: Page, timeout: number, call: () => Promise<T>): Promise<T> {
+  const start = Date.now();
+  const deadline = start + timeout;
+  for (;;) {
+    if (!(await handleWithin(page, Math.max(deadline - Date.now(), MIN_HANDLE_WAIT_MS)))) {
+      throw noHandle(page, Date.now() - start);
+    }
+    try {
+      return await call();
+    } catch (err) {
+      if (!handleLost(err) || Date.now() >= deadline) throw err;
+    }
+  }
+}
+
+/** state() of the page, once it has the handle; `timeout` is how long that may take. */
+export function readState(page: Page, timeout = HANDLE_TIMEOUT_MS): Promise<DebugState> {
+  return withHandle(page, timeout, async () => {
+    const state = await page.evaluate(() => {
+      const handle: DebugHandle | undefined = window.__isshoni;
+      if (!handle) throw new Error('window.__isshoni is gone');
+      return handle.state();
+    });
+    return state as DebugState;
   });
+}
+
+/**
+ * A fresh stats() sample of the page, once it has the handle; `timeout` is how long that may take. The first call
+ * loads the page's media code.
+ */
+export function readStats(page: Page, timeout = HANDLE_TIMEOUT_MS): Promise<StatsSample> {
+  return withHandle(page, timeout, () =>
+    page.evaluate(() => {
+      const handle: DebugHandle | undefined = window.__isshoni;
+      if (!handle) throw new Error('window.__isshoni is gone');
+      return handle.stats();
+    }),
+  );
 }
 
 export interface WaitOptions {
-  /** Default 10 s. */
+  /** Default 10 s. It includes the wait for the handle. */
   timeout?: number;
   /** For the error: what was waited for. */
   message?: string;
 }
 
-/** Calls `read` until `pick` returns something other than undefined, null or false, and returns that. */
+/**
+ * Calls `read` until `pick` returns something other than undefined, null or false, and returns that. Each read
+ * gets the time it may wait for the handle: what is left of `timeout`, and no more than a page takes to install one.
+ */
 async function poll<S, T>(
-  read: () => Promise<S>,
+  read: (handleTimeout: number) => Promise<S>,
   pick: (value: S) => T | undefined | null | false,
   what: string,
   timeout: number,
   interval: number,
 ): Promise<T> {
   const deadline = Date.now() + timeout;
+  let last = 'nothing';
   for (;;) {
-    const value = await read();
-    const got = pick(value);
-    if (got !== undefined && got !== null && got !== false) return got;
-    if (Date.now() >= deadline) {
-      throw new Error(`${what}: not within ${String(timeout)} ms. Last read: ${JSON.stringify(value)}`);
+    let lost: unknown;
+    try {
+      const value = await read(Math.min(deadline - Date.now(), HANDLE_TIMEOUT_MS));
+      const got = pick(value);
+      if (got !== undefined && got !== null && got !== false) return got;
+      last = JSON.stringify(value);
+    } catch (err) {
+      // A page that kept navigating for as long as the read had: the next read is of the page it becomes.
+      if (!handleLost(err)) throw err;
+      lost = err;
     }
-    await new Promise((resolve) => setTimeout(resolve, interval));
+    if (Date.now() >= deadline) {
+      const message = `${what}: not within ${String(timeout)} ms. Last read: ${last}`;
+      throw new Error(message, lost === undefined ? {} : { cause: lost });
+    }
+    await sleep(interval);
   }
 }
 
@@ -159,7 +221,7 @@ export function waitForState<T>(
   options: WaitOptions = {},
 ): Promise<T> {
   const { message = 'the page state', timeout = 10_000 } = options;
-  return poll(() => readState(page), pick, message, timeout, POLL_INTERVAL_MS);
+  return poll((handleTimeout) => readState(page, handleTimeout), pick, message, timeout, POLL_INTERVAL_MS);
 }
 
 /**
@@ -174,7 +236,7 @@ export function waitForStats<T>(
 ): Promise<T> {
   const { message = 'the page stats', timeout = 10_000 } = options;
   // Each read is a getStats() of the page's PeerConnections: not as often as the state.
-  return poll(() => readStats(page), pick, message, timeout, STATS_POLL_INTERVAL_MS);
+  return poll((handleTimeout) => readStats(page, handleTimeout), pick, message, timeout, STATS_POLL_INTERVAL_MS);
 }
 
 /**

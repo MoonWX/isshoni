@@ -664,7 +664,11 @@ jobs:
       - name: Upload the traces, the videos, the server logs and the report
         # web/test-results has a failed test's trace and video and each server's log
         # (server-<worker>-<n>.log, JSON lines); web/playwright-report shows them together.
-        if: failure()
+        # Not only when the job failed: a test that fails and then passes its one retry
+        # (web/playwright.config.ts) leaves the job green, and the trace, the video and the
+        # server log of its failed attempt are how the flake gets found. A run without any
+        # failure uploads only the logs and the report, which are small.
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-results
