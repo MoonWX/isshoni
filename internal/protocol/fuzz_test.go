@@ -174,6 +174,11 @@ func FuzzDecode(f *testing.F) {
 	f.Add(targetIndex(targets, AgentSend{}), []byte(`{"toRole":"agent","kind":"a.b","payload":null,"payload":[null]}`))
 	f.Add(targetIndex(targets, ShareStart{}), []byte(`{"kind":"tab","label":"`+jsonEsc("202e")+` `+jsonEsc("0041")+` ","preset":"game","ref":"r"}`))
 	f.Add(targetIndex(targets, Error{}), []byte(`{"code":"x","params":{"a":[1,[2,{"b":null}]],"c":1e308}}`))
+	// Payloads that break off after a long key (F04): encoding/json's syntax error allocated 8 to 14 times their
+	// size, so Decode finds the error first.
+	f.Add(targetIndex(targets, RoomJoin{}), []byte(`{"`+strings.Repeat("~", 8000)+`":`))
+	f.Add(targetIndex(targets, SubscribeUpdate{}), []byte(`{"subs":[{"shareId":"s_1","`+strings.Repeat("k/", 4000)+`":`))
+	f.Add(targetIndex(targets, ClientStats{}), []byte(`{"pcs":[],"`+strings.Repeat("k", 8000)+`":x}`))
 	f.Fuzz(func(t *testing.T, idx uint8, data []byte) {
 		tg := targets[int(idx)%len(targets)]
 		var v reflect.Value

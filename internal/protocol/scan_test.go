@@ -309,44 +309,57 @@ func TestParseEnvelopeRules(t *testing.T) {
 	}
 }
 
+// mutationPieces are what a mutation puts in: JSON's own characters, and pieces that make or break its tokens.
+var mutationPieces = []string{
+	`{`, `}`, `[`, `]`, `"`, `:`, `,`, `\`, ` `, "\n", "\t", "\x00", `0`, `1`, `-`, `.`, `e`, `E`, `+`, `a`, `n`, `t`, `f`, `u`, `é`, `😀`,
+	`null`, `true`, `false`, `""`, `{}`, `[]`, `"type":`, `"id":`, `"re":`, `"data":`, `"TYPE":"z",`, `"Data":null,`, `"id":"7",`,
+	`"x":1,`, `,"x":[{}]`, jsonEsc("0041"), jsonEsc("d83d"), jsonEsc("de00"), jsonEsc("00"), `\n`, `\"`, `\/`, `\x`,
+}
+
+// newMutations returns the source of a test's mutations: the same ones in every run.
+func newMutations(seed uint64) *rand.Rand {
+	return rand.New(rand.NewPCG(seed, 2026)) //nolint:gosec // G404: the same mutations in every run, not a secret
+}
+
+// mutateJSON returns a copy of b that is broken in one to three small ways: a deterministic sample of what the
+// fuzzer does.
+func mutateJSON(rng *rand.Rand, b []byte) []byte {
+	b = bytes.Clone(b)
+	for n := 1 + rng.IntN(3); n > 0 && len(b) > 0; n-- {
+		at := rng.IntN(len(b))
+		piece := mutationPieces[rng.IntN(len(mutationPieces))]
+		switch rng.IntN(6) {
+		case 0: // insert
+			b = append(b[:at:at], append([]byte(piece), b[at:]...)...)
+		case 1: // replace one byte
+			b = append(b[:at:at], append([]byte(piece), b[at+1:]...)...)
+		case 2: // delete one byte
+			b = append(b[:at:at], b[at+1:]...)
+		case 3: // break off
+			b = b[:at]
+		case 4: // delete a stretch
+			end := min(len(b), at+1+rng.IntN(12))
+			b = append(b[:at:at], b[end:]...)
+		case 5: // double a stretch
+			end := min(len(b), at+1+rng.IntN(12))
+			b = append(b[:end:end], b[at:]...)
+		}
+	}
+	return b
+}
+
 // TestParseEnvelopeMutations compares the scanner with encoding/json on the golden fixtures, each broken in many
-// small ways: a deterministic sample of what the fuzzer does, in every run of the tests.
+// small ways, in every run of the tests.
 func TestParseEnvelopeMutations(t *testing.T) {
 	rounds := 400
 	if testing.Short() {
 		rounds = 40
 	}
-	// What a mutation puts in: JSON's own characters, and pieces that make or break its tokens.
-	pieces := []string{
-		`{`, `}`, `[`, `]`, `"`, `:`, `,`, `\`, ` `, "\n", "\t", "\x00", `0`, `1`, `-`, `.`, `e`, `E`, `+`, `a`, `n`, `t`, `f`, `u`, `é`, `😀`,
-		`null`, `true`, `false`, `""`, `{}`, `[]`, `"type":`, `"id":`, `"re":`, `"data":`, `"TYPE":"z",`, `"Data":null,`, `"id":"7",`,
-		`"x":1,`, `,"x":[{}]`, jsonEsc("0041"), jsonEsc("d83d"), jsonEsc("de00"), jsonEsc("00"), `\n`, `\"`, `\/`, `\x`,
-	}
-	rng := rand.New(rand.NewPCG(4, 2026)) //nolint:gosec // G404: the same mutations in every run, not a secret
+	rng := newMutations(4)
 	accepted, rejected := 0, 0
 	for _, fx := range loadFixtures(t, fixtureDir) {
 		for range rounds {
-			b := bytes.Clone(fx.raw)
-			for n := 1 + rng.IntN(3); n > 0 && len(b) > 0; n-- {
-				at := rng.IntN(len(b))
-				piece := pieces[rng.IntN(len(pieces))]
-				switch rng.IntN(6) {
-				case 0: // insert
-					b = append(b[:at:at], append([]byte(piece), b[at:]...)...)
-				case 1: // replace one byte
-					b = append(b[:at:at], append([]byte(piece), b[at+1:]...)...)
-				case 2: // delete one byte
-					b = append(b[:at:at], b[at+1:]...)
-				case 3: // break off
-					b = b[:at]
-				case 4: // delete a stretch
-					end := min(len(b), at+1+rng.IntN(12))
-					b = append(b[:at:at], b[end:]...)
-				case 5: // double a stretch
-					end := min(len(b), at+1+rng.IntN(12))
-					b = append(b[:end:end], b[at:]...)
-				}
-			}
+			b := mutateJSON(rng, fx.raw)
 			if !utf8.Valid(b) {
 				continue // cutting through a rune: rejected before the scanner runs
 			}
@@ -448,15 +461,8 @@ func TestParseEnvelopeAllocations(t *testing.T) {
 // TestSkipValue: the scanner's value check on its own, against encoding/json's.
 func TestSkipValue(t *testing.T) {
 	for _, in := range jsonValues() {
-		b := []byte(in)
-		if !utf8.Valid(b) {
-			continue
-		}
-		start := skipSpace(b, 0)
-		end, err := skipValue(b, start, 0)
-		valid := err == nil && skipSpace(b, end) == len(b)
-		if valid != json.Valid(b) {
-			t.Errorf("skipValue(%q) = %d, %v; json.Valid = %v", in, end, err, !valid)
+		if b := []byte(in); utf8.Valid(b) && validJSON(b) != json.Valid(b) {
+			t.Errorf("validJSON(%q) = %v; json.Valid = %v", in, validJSON(b), json.Valid(b))
 		}
 	}
 	// Depth counts the containers around the value too.
@@ -470,6 +476,127 @@ func TestSkipValue(t *testing.T) {
 	// It stops after the value, wherever that is.
 	if end, err := skipValue([]byte(`[1,{"a":"]"}] ,2`), 0, 1); err != nil || end != 13 {
 		t.Errorf("skipValue stopped at %d, %v; want 13", end, err)
+	}
+}
+
+// unmarshalDataJSON is unmarshalData as it was before it checked a payload's syntax itself: encoding/json finds the
+// syntax errors. It is the reference of TestDecodeSyntaxCheck.
+func unmarshalDataJSON(data json.RawMessage, v any) error {
+	if len(data) == 0 || bytes.Equal(data, jsonNull) {
+		return nil
+	}
+	if !utf8.Valid(data) {
+		return &FieldError{Field: "data", Reason: FieldInvalid}
+	}
+	if err := scanJSON(data, arrayLimitsOf(v)); err != nil {
+		var fe *FieldError
+		if errors.As(err, &fe) {
+			return fe
+		}
+		return &FieldError{Field: "data", Reason: FieldInvalid}
+	}
+	if err := json.Unmarshal(data, v); err != nil {
+		var ute *json.UnmarshalTypeError
+		if errors.As(err, &ute) && ute.Field != "" {
+			return &FieldError{Field: ute.Field, Reason: FieldInvalid}
+		}
+		return &FieldError{Field: "data", Reason: FieldInvalid}
+	}
+	return nil
+}
+
+func arrayLimitsOf(v any) *limitNode {
+	if l, ok := v.(arrayLimiter); ok {
+		return l.arrayLimits()
+	}
+	return nil
+}
+
+// TestDecodeSyntaxCheck: Decode checks a payload's syntax before encoding/json reads it, and that changes no result.
+// A payload that is valid JSON decodes to what it decoded to before, or fails with the same error. One that is not
+// is refused as before, with the field "data", only without encoding/json's error, which costs many times the
+// length of a long key. (Every payload that the hub decodes has passed ParseEnvelope and is valid JSON.)
+func TestDecodeSyntaxCheck(t *testing.T) {
+	rounds := 200
+	if testing.Short() {
+		rounds = 20
+	}
+	dataInvalid := FieldError{Field: "data", Reason: FieldInvalid}
+	valid, malformed := 0, 0
+	check := func(zero any, data []byte) {
+		t.Helper()
+		got, want := reflect.New(reflect.TypeOf(zero)), reflect.New(reflect.TypeOf(zero))
+		err, wantErr := unmarshalData(data, got.Interface()), unmarshalDataJSON(data, want.Interface())
+		var fe, wantFE *FieldError
+		switch {
+		case len(data) == 0: // absent data: the zero value
+			if err != nil || wantErr != nil || !reflect.DeepEqual(got.Elem().Interface(), zero) {
+				t.Fatalf("%T from no data: %+v, %v", zero, got.Elem().Interface(), err)
+			}
+		case utf8.Valid(data) && !json.Valid(data) && scanJSON(data, arrayLimitsOf(want.Interface())) == nil:
+			malformed++
+			if !errors.As(err, &fe) || *fe != dataInvalid {
+				t.Fatalf("%T from %q: %v, want data: invalid", zero, data, err)
+			}
+			if !reflect.DeepEqual(got.Elem().Interface(), zero) {
+				t.Fatalf("%T from %q: the refused payload left %+v behind", zero, data, got.Elem().Interface())
+			}
+		case (err == nil) != (wantErr == nil), errors.As(err, &fe) != errors.As(wantErr, &wantFE), fe != nil && *fe != *wantFE:
+			t.Fatalf("%T from %q: %v; before the syntax check: %v", zero, data, err, wantErr)
+		case !reflect.DeepEqual(got.Interface(), want.Interface()):
+			t.Fatalf("%T from %q:\n got %+v\nwant %+v", zero, data, got.Elem().Interface(), want.Elem().Interface())
+		default:
+			if json.Valid(data) {
+				valid++
+			}
+		}
+	}
+
+	rng := newMutations(5)
+	for _, fx := range loadFixtures(t, fixtureDir) {
+		zero, _, err := fixturePayload(fx)
+		if err != nil || len(fx.env.Data) == 0 {
+			continue
+		}
+		check(zero, fx.env.Data)
+		for range rounds {
+			check(zero, mutateJSON(rng, fx.env.Data))
+		}
+	}
+	// Values of every kind and long keys, as the payload of every type and inside one.
+	long := strings.Repeat("~/", 4000)
+	for _, tg := range decodeTargets() {
+		zero := reflect.Zero(tg.typ).Interface()
+		for _, v := range append(jsonValues(), `{"`+long+`":`, `{"`+long+`":1}`, `{"`+long+`":{"subs":`, `{"`+long+`":x}`) {
+			check(zero, []byte(v))
+			check(zero, []byte(`{"u":`+v+`}`))
+			check(zero, []byte(`{"subs":[`+v+`],"roomId":`+v+`,"caps":{"decode":`+v+`}}`))
+		}
+	}
+	if valid < 1000 || malformed < 1000 {
+		t.Errorf("%d valid payloads, %d malformed ones; the sample should hold plenty of both kinds", valid, malformed)
+	}
+}
+
+// TestDecodeMalformedAllocations: a payload that is not valid JSON costs Decode its error and nothing else,
+// whatever it holds. encoding/json's own error for these allocated 8 to 14 times their size.
+func TestDecodeMalformedAllocations(t *testing.T) {
+	for _, c := range []struct{ name, data string }{
+		{"breaks off after a long key", `{"` + strings.Repeat("~", 8000) + `":`},
+		{"breaks off after a long key in a list", `{"subs":[{"shareId":"s_1","` + strings.Repeat("k/", 4000) + `":`},
+		{"garbage after a long key", `{"subs":[],"` + strings.Repeat("k", 20000) + `":x}`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			env := Envelope{Type: MessageTypeSubscribeUpdate, Data: []byte(c.data)}
+			var v SubscribeUpdate
+			var fe *FieldError
+			if err := DecodeInto(env, &v); !errors.As(err, &fe) || fe.Field != "data" || fe.Reason != FieldInvalid {
+				t.Fatalf("DecodeInto: %v, want data: invalid", err)
+			}
+			if got := testing.AllocsPerRun(100, func() { _ = DecodeInto(env, &v) }); got > 1 {
+				t.Errorf("%v allocations, want the error's own at most", got)
+			}
+		})
 	}
 }
 

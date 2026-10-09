@@ -110,8 +110,9 @@ func ParseEnvelope(b []byte) (Envelope, error) {
 //
 // Errors are a *FieldError (the hub answers bad_request with params {field, reason}) or, where the spec prescribes
 // another code, a *Error (RoomJoin: room_not_found; AgentSend: message_too_large). Before unmarshaling, Decode
-// rejects data that is not valid UTF-8 or nested deeper than 32 levels, and arrays longer than the payload's limits
-// (for example subs > 64), so a client->server message cannot make the decoder allocate much more than its own size.
+// rejects data that is not valid UTF-8, not valid JSON or nested deeper than 32 levels, and arrays longer than the
+// payload's limits (for example subs > 64), so a client->server message cannot make the decoder allocate much more
+// than its own size.
 func Decode[T any](e Envelope) (T, error) {
 	var v T
 	err := DecodeInto(e, &v)
@@ -159,6 +160,13 @@ func unmarshalData(data json.RawMessage, v any) error {
 		if errors.As(err, &fe) {
 			return fe
 		}
+		return &FieldError{Field: "data", Reason: FieldInvalid}
+	}
+	if !validJSON(data) {
+		// encoding/json must not be the one to find a syntax error: its error names the place by a JSON Pointer, and
+		// for that it copies the keys on the way there, up to 14 times the length of a long one. Data that came
+		// through ParseEnvelope always passes (the same scanner has read it), so this costs such data one more look
+		// and nothing else.
 		return &FieldError{Field: "data", Reason: FieldInvalid}
 	}
 	if err := json.Unmarshal(data, v); err != nil {

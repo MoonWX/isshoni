@@ -172,7 +172,7 @@ type scanFrame struct {
 // scanJSON walks b once and fails when containers nest deeper than maxDepth or when an array named in root has more
 // elements than allowed (a *FieldError with reason too_many). It allocates nothing (escaped keys are unescaped into
 // a stack buffer). It is not a validator: on malformed JSON it returns nil and leaves the syntax error to
-// encoding/json, which the caller runs next. Decode scans a payload with it; the envelope around the payload has a
+// validJSON, which Decode runs next, before encoding/json reads the payload. The envelope around the payload has a
 // strict scanner of its own (scanEnvelope, below) and is never read by encoding/json.
 func scanJSON(b []byte, root *limitNode) error {
 	var stack [maxDepth]scanFrame
@@ -495,6 +495,13 @@ func skipValue(b []byte, i, depth int) (int, error) {
 			}
 		}
 	}
+}
+
+// validJSON reports whether b (valid UTF-8) is one JSON value, nested at most maxDepth levels deep, with nothing
+// but whitespace around it: what encoding/json accepts, found out without allocating.
+func validJSON(b []byte) bool {
+	end, err := skipValue(b, skipSpace(b, 0), 0)
+	return err == nil && skipSpace(b, end) == len(b)
 }
 
 // skipSpace returns the index of the first byte of b at or after i that is not JSON whitespace.
