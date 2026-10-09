@@ -175,7 +175,8 @@ func TestEvents(t *testing.T) {
 		{"the admin's cap", sfu.QualityHintEvent{Share: "s_a", Reason: "admin", MaxBitrate: 2_500_000, Encodings: encodings},
 			[]signaltest.Event{{Method: "QualityHint", Arg: protocol.QualityHint{ShareID: "s_a", Reason: protocol.HintReasonAdmin, Encodings: wireEncs, MaxBitrate: 2_500_000}}}},
 
-		// PCStateEvent: only a failed pub PC makes the server act.
+		// PCStateEvent: only a failed pub PC makes the server act. The adapter passes each one on; the hub's sink
+		// drops the request of a connection that publishes no share (01 §9 rule 10, TestPubPCFailed).
 		{"the pub PC failed", sfu.PCStateEvent{PC: sfu.PCPub, Gen: 3, State: "failed"}, restart},
 		{"a new pub PC missed its handshake", sfu.PCStateEvent{PC: sfu.PCPub, Gen: 3, State: "failed", Reason: "handshake_timeout"}, restart},
 		{"the pub PC connected", sfu.PCStateEvent{PC: sfu.PCPub, Gen: 3, State: "connected"}, nil},

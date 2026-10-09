@@ -20,7 +20,9 @@ import (
 // ok{delivered}, the number of targets.
 //
 // The hub never looks into the payload: it goes out as the JSON value that came in, in no more bytes than came in
-// (encodeAgentRecv). The kinds are a registry of the M2 and M4 docs; the hub checks their form only.
+// (encodeAgentRecv). The one value it takes no message for is null, which is no payload at all: such an agent.send is
+// refused like one without a payload and reaches nobody, so no agent.recv ever has a null for its payload (01 §5).
+// The kinds are a registry of the M2 and M4 docs; the hub checks their form only.
 //
 // Targets are connections of the sender's own user and of nobody else, whatever their session or device:
 //
@@ -48,8 +50,9 @@ import (
 // feature (else feature_disabled), and its per-type bucket has a token (typeRates: 10 per second per connection,
 // else rate_limited with retryAfterMs). Every role may send (01 §6.3). The bucket is charged whatever becomes of the
 // message, so a connection gets ten answers per second about connection ids, too. Then the payload is validated
-// (protocol.AgentSend.Validate): exactly one of to and toRole, the form of kind, and a payload of at most 16 KiB
-// (message_too_large above it, bad_request for the rest).
+// (protocol.AgentSend.Validate): exactly one of to and toRole, the form of kind, and a payload that is there (not
+// missing, not null) of at most 16 KiB (message_too_large above it, bad_request for the rest). An agent.send that
+// fails here never gets as far as its targets.
 
 // onAgentSend handles agent.send (01 §8.14): it relays the message as agent.recv to its targets and replies
 // ok{delivered}, or agent_target_not_found when there is none.

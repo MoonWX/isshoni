@@ -10,7 +10,7 @@ type AgentSend struct {
 	To      string          `json:"to,omitempty"`     // a connectionId of the same user, or
 	ToRole  Role            `json:"toRole,omitempty"` // all the user's connections with this role (exactly one of To/ToRole)
 	Kind    string          `json:"kind"`             // [a-z.]{1,32}; registry in 04/M2 docs
-	Payload json.RawMessage `json:"payload"`          // <= 16 KiB, opaque to the server
+	Payload json.RawMessage `json:"payload"`          // any JSON value but null, <= 16 KiB; opaque to the server
 }
 
 // AgentSendResult is the ok payload of agent.send.
@@ -22,7 +22,7 @@ type AgentSendResult struct {
 type AgentRecv struct {
 	From    string          `json:"from"` // the sender's connectionId
 	Kind    string          `json:"kind"`
-	Payload json.RawMessage `json:"payload"`
+	Payload json.RawMessage `json:"payload"` // the agent.send's payload: never null
 }
 
 // UserConnections (later M2, feature user.connections): all of the user's connections, sent to each of them on change.

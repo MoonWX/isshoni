@@ -117,7 +117,9 @@ type MediaPeer interface {
 type MediaSink interface {
 	Offer(o protocol.PCOffer) // sub PC offers
 	ICE(c protocol.PCICE)
-	RestartRequest(r protocol.PCRestart) // ask the client to restart/rebuild its pub PC
+	// RestartRequest asks the client to rebuild its pub PC. The peer reports every failed pub PC; the hub passes
+	// the request on only while the connection publishes a share (§9 rule 10).
+	RestartRequest(r protocol.PCRestart)
 	SubscriptionStatus(s []protocol.SubscriptionStatus)
 	QualityHint(h protocol.QualityHint)
 	ShareMedia(shareID string, ev ShareMediaEvent)

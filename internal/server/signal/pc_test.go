@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/MoonWX/isshoni/internal/protocol"
+	"github.com/MoonWX/isshoni/internal/server/signal"
 	"github.com/MoonWX/isshoni/internal/server/signal/signaltest"
 )
 
@@ -698,6 +699,153 @@ func TestShareMediaWhileDetached(t *testing.T) {
 		}
 		if got := methods(peer.MediaCalls()); !slices.Equal(got, []string{"CreateShare", "HandleOffer", "Resync", "HandleOffer"}) {
 			t.Errorf("MediaPeer calls %v", got)
+		}
+	})
+}
+
+// The one thing the server asks about a pub PC, pc.restart{pub, rebuild, failed} (01 §10.4), is asked only of a
+// connection that publishes a share (01 §9 rule 10): the MediaPeer reports every pub PC that failed, and the hub
+// passes the request on while the connection has a share that is starting, live or stalled, and drops it when the
+// pub PC has nothing to carry: nothing was shared, the last share stopped or timed out, or the client closed the PC
+// on purpose. Somebody else's share does not count, nor one of the user's other connection.
+func TestPubRestartRequest(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newEnv(t)
+		defer e.close()
+		cookieA, _ := e.user(false)
+		cookieB, _ := e.user(false)
+		a1, wa1 := e.connect(cookieA, signaltest.DefaultHello())
+		a2, wa2 := e.connect(cookieA, signaltest.DefaultHello())
+		cb, wb := e.connect(cookieB, signaltest.DefaultHello())
+		all := []*signaltest.Client{a1, a2, cb}
+		for _, c := range all {
+			join(t, c, "lounge")
+		}
+		sinkA1 := e.media.Peer(wa1.ConnectionID).Sink()
+		sinkA2 := e.media.Peer(wa2.ConnectionID).Sink()
+		sinkB := e.media.Peer(wb.ConnectionID).Sink()
+
+		// failed reports that the pub PC behind sink failed, as the SFU's adapter does, once the room has settled,
+		// and checks who is asked for a new one: the client to, or nobody.
+		gen, asked, dropped := uint32(0), 0, 0
+		failed := func(what string, sink signal.MediaSink, to *signaltest.Client) {
+			t.Helper()
+			settle()
+			for _, c := range all {
+				drain(t, c) // room traffic only, so far
+			}
+			gen++
+			want := protocol.PCRestart{PC: pub, Gen: gen, Mode: protocol.RestartModeRebuild,
+				Reason: protocol.RestartReasonFailed}
+			sink.RestartRequest(want)
+			synctest.Wait()
+			for i, c := range all {
+				if c != to {
+					if n := c.Pending(); n != 0 {
+						env := recv(t, c)
+						t.Fatalf("%s: client %d got %s %s, want nothing", what, i, env.Type, env.Data)
+					}
+					continue
+				}
+				env := expectType(t, c, protocol.MessageTypePCRestart)
+				got, err := protocol.Decode[protocol.PCRestart](env)
+				if err != nil || env.ID != "" || env.Re != "" || got != want {
+					t.Errorf("%s: pc.restart id %q re %q %s (%v), want a notification with %+v", what, env.ID, env.Re,
+						env.Data, err, want)
+				}
+			}
+			if to == nil {
+				dropped++
+			} else {
+				asked++
+			}
+		}
+
+		var s1, s2, sB string
+		for _, st := range []struct {
+			name string
+			do   func()             // what happens before the pub PC fails; nil: nothing
+			sink signal.MediaSink   // the connection whose pub PC fails
+			to   *signaltest.Client // who gets the pc.restart; nil: nobody
+		}{
+			{"nothing is shared", nil, sinkA1, nil},
+			{"another user shares", func() {
+				sB = startShare(t, cb, screen("b1")).ShareID
+				goLive(e, wb.ConnectionID, sB)
+			}, sinkA1, nil},
+			{"the other user's own pub PC", nil, sinkB, cb},
+			{"a starting share", func() { s1 = startShare(t, a1, screen("r1")).ShareID }, sinkA1, a1},
+			{"the user's other connection publishes nothing", nil, sinkA2, nil},
+			{"a live share", func() { goLive(e, wa1.ConnectionID, s1) }, sinkA1, a1},
+			{"a stalled share", func() {
+				sinkA1.ShareMedia(s1, signal.ShareMediaEvent{Kind: signal.ShareMediaStalled})
+			}, sinkA1, a1},
+			{"a second share starts, the first one stops", func() {
+				s2 = startShare(t, a1, screen("r2")).ShareID
+				stopShare(t, a1, s1)
+			}, sinkA1, a1},
+			{"the last share stopped", func() { stopShare(t, a1, s2) }, sinkA1, nil},
+			{"a share that timed out without a first keyframe", func() {
+				startShare(t, a1, screen("r3"))
+				time.Sleep(30 * time.Second)
+			}, sinkA1, nil},
+			{"the pub PC was closed on purpose", func() {
+				id := startShare(t, a1, screen("r4")).ShareID
+				pubOffer(t, a1, 1, 1, videoTrack("0", id))
+				expectAnswer(t, a1, 1, 1)
+				notify(t, a1, protocol.MessageTypePCClose, protocol.PCClose{PC: pub, Gen: 1})
+			}, sinkA1, nil},
+			{"a share that the user's other connection stopped", func() {
+				id := startShare(t, a1, screen("r5")).ShareID
+				goLive(e, wa1.ConnectionID, id)
+				stopShare(t, a2, id)
+			}, sinkA1, nil},
+			{"the other user still shares", nil, sinkB, cb},
+		} {
+			if st.do != nil {
+				st.do()
+			}
+			failed(st.name, st.sink, st.to)
+		}
+
+		// What counts is the moment the connection's actor gets to the request: a share that ended while the request
+		// waited behind something else no longer needs a pub PC.
+		s6 := startShare(t, a1, screen("r6")).ShareID
+		goLive(e, wa1.ConnectionID, s6)
+		settle()
+		for _, c := range all {
+			drain(t, c)
+		}
+		release := signal.Stall(e.hub, wa1.ConnectionID)
+		sinkA1.RestartRequest(protocol.PCRestart{PC: pub, Gen: 99, Mode: protocol.RestartModeRebuild,
+			Reason: protocol.RestartReasonFailed})
+		stopShare(t, a2, s6)
+		release()
+		settle()
+		for _, c := range all {
+			drain(t, c) // a pc.restart among the room traffic fails here
+		}
+		dropped++
+
+		// A connection that left the room has no pub PC to rebuild, whatever its previous MediaPeer reports.
+		startShare(t, a1, screen("r7"))
+		quiet(t, all...)
+		leave(t, a1)
+		sinkA1.RestartRequest(protocol.PCRestart{PC: pub, Gen: 100, Mode: protocol.RestartModeRebuild,
+			Reason: protocol.RestartReasonFailed})
+		synctest.Wait()
+		expectOpen(t, a1)
+
+		if got := e.metric("isshoni_ws_messages_total", "type", "pc.restart", "dir", "out"); got != float64(asked) {
+			t.Errorf("isshoni_ws_messages_total{type=pc.restart,dir=out} = %v, want %d", got, asked)
+		}
+		// Each request that was not passed on left a DEBUG line with the connection; the one of a previous MediaPeer
+		// is dropped like its other events, without one.
+		if n := e.logs.count("level=DEBUG", "pub restart request dropped"); n != dropped {
+			t.Errorf("%d lines for dropped requests, want %d:\n%s", n, dropped, e.logs)
+		}
+		if n := e.logs.count("pub restart request dropped", "conn_id="+wa2.ConnectionID); n != 1 {
+			t.Errorf("%d lines for the request of the user's other connection, want 1", n)
 		}
 	})
 }

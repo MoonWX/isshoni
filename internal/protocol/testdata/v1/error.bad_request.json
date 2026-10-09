@@ -1,0 +1,13 @@
+{
+  "type": "error",
+  "re": "30",
+  "data": {
+    "code": "bad_request",
+    "retryable": false,
+    "scope": "request",
+    "params": {
+      "field": "payload",
+      "reason": "required"
+    }
+  }
+}

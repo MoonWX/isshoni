@@ -1098,6 +1098,8 @@ func TestRoomSwitch(t *testing.T) {
 		cand := &protocol.ICECandidate{Candidate: "candidate:x"}
 		sink.ICE(protocol.PCICE{PC: protocol.PCKindSub, Gen: 1, Candidate: cand})
 		cand.Candidate = "reused"
+		// A does not share: a request to rebuild its pub PC is not passed on (TestPubRestartRequest), so the
+		// subscribe.status is what follows the candidate.
 		sink.RestartRequest(protocol.PCRestart{PC: protocol.PCKindPub, Gen: 1, Mode: protocol.RestartModeRebuild,
 			Reason: protocol.RestartReasonFailed})
 		subs := []protocol.SubscriptionStatus{{ShareID: "s_x", Video: protocol.VideoLayerLow,
@@ -1119,17 +1121,15 @@ func TestRoomSwitch(t *testing.T) {
 		var gotErr protocol.Error
 		for _, m := range []struct {
 			typ protocol.MessageType
-			v   any // nil: not checked
+			v   any
 		}{
-			{protocol.MessageTypePCOffer, &offer}, {protocol.MessageTypePCICE, &ice}, {protocol.MessageTypePCRestart, nil},
+			{protocol.MessageTypePCOffer, &offer}, {protocol.MessageTypePCICE, &ice},
 			{protocol.MessageTypeSubscribeStatus, &status}, {protocol.MessageTypeQualityHint, &hint},
 			{protocol.MessageTypeError, &gotErr},
 		} {
 			env := expectType(t, ca, m.typ)
-			if m.v != nil {
-				if err := json.Unmarshal(env.Data, m.v); err != nil {
-					t.Fatalf("%s: %v", m.typ, err)
-				}
+			if err := json.Unmarshal(env.Data, m.v); err != nil {
+				t.Fatalf("%s: %v", m.typ, err)
 			}
 		}
 		if len(offer.Tracks) != 1 || offer.Tracks[0].ShareID != "s_x" || ice.Candidate == nil ||
