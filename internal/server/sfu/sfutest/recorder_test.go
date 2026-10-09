@@ -1,6 +1,7 @@
 package sfutest
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -306,6 +307,53 @@ func TestSeqTracker(t *testing.T) {
 	rec(6+maxMissing+11, false)
 	if s := r.Stats(); s.Lost != 2+10 || s.Gaps != 4+maxMissing+10 {
 		t.Errorf("after a jump: %+v", s)
+	}
+}
+
+// TestRecorderNACKs: what a Viewer asks for again, and when (NACKAfter, NACKEvery, NACKTries). A sequence number is
+// asked for once it has been missing for 10 ms, every 100 ms from then on while it stays missing, in order also
+// across the wraparound, and no more once it has arrived, on the track itself or through RTX, or counts as lost.
+func TestRecorderNACKs(t *testing.T) {
+	r := &Recorder{kind: webrtc.RTPCodecTypeVideo, keep: 16}
+	t0 := time.Now()
+	rec := func(seq uint16, after time.Duration, rtx bool) {
+		r.record(&rtp.Packet{Header: rtp.Header{SequenceNumber: seq}, Payload: []byte{byte(seq)}}, t0.Add(after), rtx)
+	}
+	nacks := func(after time.Duration, want ...uint16) {
+		t.Helper()
+		if got := r.nacks(t0.Add(after)); !slices.Equal(got, want) {
+			t.Fatalf("NACKs %v after: %v, want %v", after, got, want)
+		}
+	}
+	rec(65533, 0, false)
+	nacks(time.Second) // nothing is missing
+	rec(1, 0, false)   // 65534, 65535 and 0 are
+	nacks(NACKAfter - time.Millisecond)
+	nacks(NACKAfter, 65534, 65535, 0)
+	nacks(NACKAfter + NACKEvery - time.Millisecond)
+	rec(65535, 50*time.Millisecond, true) // repaired through RTX
+	rec(4, 60*time.Millisecond, false)    // 2 and 3 go missing later than the others
+	nacks(NACKAfter+NACKEvery, 65534, 0, 2, 3)
+	rec(2, 150*time.Millisecond, false) // a late packet
+	nacks(NACKAfter+2*NACKEvery, 65534, 0, 3)
+	if st := r.stats; st.NACKs != 10 || st.Recovered != 2 || st.RecoveredRTX != 1 {
+		t.Errorf("stats after three rounds: %+v", st)
+	}
+	// 65534 and 0 are asked for NACKTries times in all, the last time just before they count as lost.
+	for i := 3; i < NACKTries; i++ {
+		nacks(NACKAfter+time.Duration(i)*NACKEvery, 65534, 0, 3)
+	}
+	nacks(FinalLossAfter)
+	nacks(NACKAfter+NACKTries*NACKEvery, 3) // 3 went missing 60 ms later: its last time
+	// 65534, 0 and 3 were asked for NACKTries times each, 65535 and 2 once.
+	if st := r.Stats(); st.NACKs != 3*NACKTries+2 || st.Lost != 2 {
+		t.Errorf("stats at the end: %d NACKs, %d lost (%+v)", st.NACKs, st.Lost, st)
+	}
+
+	// The payload's hash is kept, and equal payloads have equal hashes.
+	pkts := r.Packets()
+	if len(pkts) == 0 || pkts[len(pkts)-1].Hash != PayloadHash([]byte{2}) || PayloadHash([]byte{2}) == PayloadHash([]byte{3}) {
+		t.Errorf("payload hashes: %+v", pkts)
 	}
 }
 

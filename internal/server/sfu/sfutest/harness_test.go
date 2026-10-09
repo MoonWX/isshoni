@@ -24,6 +24,8 @@ func TestHarness(t *testing.T) {
 		{"udp", HarnessOptions{}, []string{netx.ViaUDP}},
 		{"all", HarnessOptions{TCP: true, TCP443: true}, []string{netx.ViaTCP443, netx.ViaTCP7882, netx.ViaUDP}},
 		{"tcp443 only", HarnessOptions{NoUDP: true, TCP443: true}, []string{netx.ViaTCP443}},
+		{"udp behind a FaultConn", HarnessOptions{FaultyUDP: true}, []string{netx.ViaUDP}},
+		{"no udp to put a FaultConn under", HarnessOptions{NoUDP: true, FaultyUDP: true, TCP: true}, []string{netx.ViaTCP7882}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h, err := NewHarness(context.Background(), tc.opts)
@@ -36,6 +38,13 @@ func TestHarness(t *testing.T) {
 					t.Errorf("advertised %v is not on loopback", a.Addr)
 				}
 				vias = append(vias, a.Via)
+				// The FaultConn is the socket the SFU advertises.
+				if h.Wire != nil && a.Via == netx.ViaUDP && a.Addr.String() != h.Wire.LocalAddr().String() {
+					t.Errorf("the SFU advertises UDP on %v, its FaultConn is on %v", a.Addr, h.Wire.LocalAddr())
+				}
+			}
+			if wired := tc.opts.FaultyUDP && !tc.opts.NoUDP; (h.Wire != nil) != wired {
+				t.Errorf("Wire %v with options %+v", h.Wire != nil, tc.opts)
 			}
 			slices.Sort(vias)
 			if !slices.Equal(vias, tc.vias) {

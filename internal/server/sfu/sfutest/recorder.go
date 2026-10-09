@@ -3,6 +3,7 @@ package sfutest
 import (
 	"context"
 	"fmt"
+	"hash/maphash"
 	"slices"
 	"sync"
 	"time"
@@ -14,13 +15,14 @@ import (
 	"github.com/MoonWX/isshoni/internal/media/fake"
 )
 
-// Packet is one received RTP packet as a Recorder keeps it (no payload).
+// Packet is one received RTP packet as a Recorder keeps it: without its payload, but with the payload's hash.
 type Packet struct {
 	Seq     uint16
 	TS      uint32
 	PT      uint8
-	Marker  bool // the RTP marker bit
-	Size    int  // payload bytes
+	Marker  bool   // the RTP marker bit
+	Size    int    // payload bytes
+	Hash    uint64 // PayloadHash of the payload: equal payloads, equal hashes
 	Arrival time.Time
 	RTX     bool // Pion unwrapped it from the RTX stream
 	Dup     bool // a copy of a sequence number already received
@@ -56,11 +58,20 @@ type RecorderStats struct {
 	// Gaps counts sequence numbers found missing when a later one arrived; Recovered those that arrived afterwards
 	// (RecoveredRTX of them through RTX); Lost those still missing after FinalLossAfter (the final loss).
 	Gaps, Recovered, RecoveredRTX, Lost int
-	Keyframes                           int // video: packets that start a keyframe
-	SRs                                 int // sender reports received
-	PLIs                                int // PLIs the Viewer sent for this track
-	First, Last                         time.Time
+	// NACKs counts the sequence numbers the Viewer asked for again, each one as often as it asked.
+	NACKs       int
+	Keyframes   int // video: packets that start a keyframe
+	SRs         int // sender reports received
+	PLIs        int // PLIs the Viewer sent for this track
+	First, Last time.Time
 }
+
+// hashSeed is the seed of PayloadHash: one per test binary.
+var hashSeed = maphash.MakeSeed()
+
+// PayloadHash returns the hash a Recorder keeps of a packet's payload, for a test that knows what the payload should
+// be. Hashes compare only within one process.
+func PayloadHash(payload []byte) uint64 { return maphash.Bytes(hashSeed, payload) }
 
 // Recorder records one received track.
 type Recorder struct {
@@ -139,7 +150,7 @@ func (r *Recorder) Wait(ctx context.Context, cond func(*Recorder) bool) error {
 func (r *Recorder) record(pkt *rtp.Packet, at time.Time, rtx bool) {
 	p := Packet{
 		Seq: pkt.SequenceNumber, TS: pkt.Timestamp, PT: pkt.PayloadType, Marker: pkt.Marker, Size: len(pkt.Payload),
-		Arrival: at, RTX: rtx,
+		Hash: PayloadHash(pkt.Payload), Arrival: at, RTX: rtx,
 	}
 	switch r.kind {
 	case webrtc.RTPCodecTypeVideo:
@@ -171,6 +182,25 @@ func (r *Recorder) record(pkt *rtp.Packet, at time.Time, rtx bool) {
 		}
 		r.pkts = append(r.pkts, p)
 	}
+}
+
+// nacks returns the sequence numbers to ask for again at now, in order, and counts them: those that have been
+// missing for NACKAfter and weren't asked for in the last NACKEvery, NACKTries times at most. What has been missing
+// for FinalLossAfter counts as lost and is not asked for any more.
+func (r *Recorder) nacks(now time.Time) []uint16 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seq.expire(now, &r.stats)
+	due := r.seq.due(now)
+	if len(due) == 0 {
+		return nil
+	}
+	r.stats.NACKs += len(due)
+	out := make([]uint16, len(due))
+	for i, ext := range due {
+		out[i] = uint16(ext)
+	}
+	return out
 }
 
 // recordSR adds one sender report.
@@ -237,10 +267,17 @@ func stapAHasSPS(payload []byte) bool {
 // seqTracker unwraps sequence numbers and follows missing ones until they arrive or count as lost.
 type seqTracker struct {
 	started    bool
-	first, max int64               // extended sequence numbers
-	seen       [seenWindow]int64   // ext+1 of the packet last seen in each slot; 0 = empty
-	missing    map[int64]time.Time // ext → when it went missing
-	queue      []int64             // missing sequence numbers in the order they went missing
+	first, max int64                // extended sequence numbers
+	seen       [seenWindow]int64    // ext+1 of the packet last seen in each slot; 0 = empty
+	missing    map[int64]missingSeq // by ext
+	queue      []int64              // missing sequence numbers in the order they went missing
+}
+
+// missingSeq is what a seqTracker knows of a sequence number that hasn't arrived.
+type missingSeq struct {
+	since time.Time // when it went missing: a later one arrived
+	asked int       // NACKs sent for it
+	last  time.Time // when the last one went out
 }
 
 const (
@@ -256,7 +293,7 @@ func (s *seqTracker) add(seq uint16, at time.Time, rtx bool, st *RecorderStats) 
 		s.started = true
 		s.first = extOrigin + int64(seq)
 		s.max = s.first
-		s.missing = map[int64]time.Time{}
+		s.missing = map[int64]missingSeq{}
 		s.seen[s.first%seenWindow] = s.first + 1
 		return false
 	}
@@ -297,16 +334,33 @@ func (s *seqTracker) markMissing(from, to int64, at time.Time, st *RecorderStats
 		from = to - maxMissing
 	}
 	for m := from; m < to; m++ {
-		s.missing[m] = at
+		s.missing[m] = missingSeq{since: at}
 		s.queue = append(s.queue, m)
 	}
+}
+
+// due returns the missing sequence numbers a NACK should ask for at now, in order, and notes that it did: those
+// missing for NACKAfter that were asked for less than NACKTries times, the last time NACKEvery ago or longer.
+func (s *seqTracker) due(now time.Time) []int64 {
+	var out []int64
+	for ext, m := range s.missing {
+		if now.Sub(m.since) < NACKAfter || m.asked >= NACKTries || (m.asked > 0 && now.Sub(m.last) < NACKEvery) {
+			continue
+		}
+		m.asked, m.last = m.asked+1, now
+		s.missing[ext] = m
+		out = append(out, ext)
+	}
+	slices.Sort(out)
+	return out
 }
 
 // expire counts sequence numbers missing for FinalLossAfter as lost.
 func (s *seqTracker) expire(now time.Time, st *RecorderStats) {
 	for len(s.queue) > 0 {
 		m := s.queue[0]
-		when, ok := s.missing[m]
+		gap, ok := s.missing[m]
+		when := gap.since
 		if ok && now.Sub(when) < FinalLossAfter {
 			return
 		}

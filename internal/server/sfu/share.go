@@ -164,6 +164,25 @@ func (s *Share) audioTarget() int {
 	return presetAudioBitrate(s.preset)
 }
 
+// maxBitrate returns what a layer of the share in slot is meant to carry at most, in bit/s (02 §8.6): for video the
+// encoding's MaxBitrate after the admin cap (the middle layer of M5 counts as the full one), for audio the preset's
+// Opus bitrate. The retransmission budget of the layer's DownTracks follows it (02 §9.5).
+func (s *Share) maxBitrate(slot Slot) int {
+	if slot == SlotAudio {
+		return s.audioTarget()
+	}
+	rid := ridFull
+	if slot == SlotQ {
+		rid = ridPreview
+	}
+	for _, e := range shareParams(PresetAuto, s.conn.sfu.currentLimits(), "").Encodings {
+		if e.RID == rid {
+			return e.MaxBitrate
+		}
+	}
+	return 0
+}
+
 // setPreset changes the preset; false when the share has ended.
 func (s *Share) setPreset(p Preset) bool {
 	s.mu.Lock()

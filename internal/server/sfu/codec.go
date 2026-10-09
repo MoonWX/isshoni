@@ -280,6 +280,14 @@ const (
 	pubNACKSize     = 2048
 	pubNACKInterval = 50 * time.Millisecond
 	pubRRInterval   = time.Second
+	// pubNACKTries is how often the SFU asks a publisher for one missing packet: every pubNACKInterval, so for half a
+	// second. Pion's NACK generator never learns that a packet came back on the RTX stream (Pion's receiver hands
+	// those to the track past the generator), so without a limit it goes on asking for every packet a browser
+	// repaired until the sequence number leaves its window of pubNACKSize packets: 45 times at 900 packets a second,
+	// and well over a thousand times, for more than a minute, on the 30 a second of a still screen. A browser answers
+	// each of those NACKs with the packet again, which the cache then drops as a duplicate (02 §9.1). A packet that
+	// ten requests didn't bring back is of no use to anybody any more: the viewers have asked for a keyframe.
+	pubNACKTries = 10
 )
 
 // RTCP feedback per side and kind (02 §8.1). The subscribe side has no transport-cc in v1: downlink adaptation uses
@@ -345,7 +353,8 @@ func newSubEngine() (*webrtc.MediaEngine, *interceptor.Registry, error) {
 
 // pubInterceptors returns the publish side's interceptor factories in registration order.
 func pubInterceptors() ([]interceptor.Factory, error) {
-	gen, err := nack.NewGeneratorInterceptor(nack.GeneratorSize(pubNACKSize), nack.GeneratorInterval(pubNACKInterval))
+	gen, err := nack.NewGeneratorInterceptor(nack.GeneratorSize(pubNACKSize), nack.GeneratorInterval(pubNACKInterval),
+		nack.GeneratorMaxNacksPerPacket(pubNACKTries))
 	if err != nil {
 		return nil, fmt.Errorf("sfu: nack generator: %w", err)
 	}

@@ -3,6 +3,8 @@ package sfutest
 import (
 	"context"
 	"math"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,12 +23,14 @@ func loopback(t *testing.T, src *fake.Source, po publish.Options) (*publish.Publ
 	return loopbackWith(t, src, po, LoopbackSettings())
 }
 
-// loopbackWith is loopback with the Publisher's Pion settings.
+// loopbackWith is loopback with the Publisher's Pion settings. A test that wraps src sets po.Source itself.
 func loopbackWith(t *testing.T, src *fake.Source, po publish.Options, se webrtc.SettingEngine) (
 	*publish.Publisher, *Viewer,
 ) {
 	t.Helper()
-	po.Source = src
+	if po.Source == nil {
+		po.Source = src
+	}
 	po.Settings = se
 	pub, err := publish.New(po)
 	if err != nil {
@@ -232,7 +236,47 @@ func checkSRs(t *testing.T, rid string, r *Recorder) {
 	}
 }
 
+// pliSource is a publish.Source that notes, for every keyframe request, the capture time of the newest frame of the
+// layer that the Publisher had pulled when the request came. A request waits for the Next that is under way, so
+// which frames came before a request and which after is a fact of the Source, whatever the scheduler does to the
+// goroutines around it.
+type pliSource struct {
+	src   *fake.Source
+	mu    sync.Mutex
+	last  map[string]int64   // layer → capture ns of the newest frame pulled
+	asked map[string][]int64 // layer → last[layer] at each keyframe request
+}
+
+func (s *pliSource) Next(ctx context.Context) (fake.Packet, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, err := s.src.Next(ctx)
+	if err == nil && p.Kind == fake.Video {
+		s.last[p.Layer] = p.CaptureNS
+	}
+	return p, err
+}
+
+func (s *pliSource) RequestKeyframe(layer string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.asked[layer] = append(s.asked[layer], s.last[layer])
+	s.src.RequestKeyframe(layer)
+}
+
+// requests returns the notes of the keyframe requests for a layer so far.
+func (s *pliSource) requests(layer string) []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.asked[layer])
+}
+
 // TestLoopbackKeyframeOnPLI: a PLI from the viewer gets a keyframe within one frame, on each layer.
+//
+// "Within one frame" is counted in the publisher's frames, by their markers: of the frames captured after the newest
+// one the Publisher had pulled when it handled the PLI, at most one comes before the keyframe. Arrival times at the
+// viewer say nothing about that: a reader that was held up for a moment gets frames that left before the PLI
+// stamped after it.
 func TestLoopbackKeyframeOnPLI(t *testing.T) {
 	layers := []fake.VideoLayer{
 		{RID: "f", Width: 1280, Height: 720, FPS: 30, Bitrate: 2_000_000},
@@ -242,7 +286,8 @@ func TestLoopbackKeyframeOnPLI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pub, v := loopback(t, src, publish.Options{})
+	noted := &pliSource{src: src, last: map[string]int64{}, asked: map[string][]int64{}}
+	pub, v := loopback(t, src, publish.Options{Source: noted})
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
 	for _, rid := range []string{"f", "q"} {
@@ -255,33 +300,36 @@ func TestLoopbackKeyframeOnPLI(t *testing.T) {
 			if err := v.RequestKeyframe(r); err != nil {
 				t.Fatal(err)
 			}
-			var after []Frame
+			// The Publisher has handled the PLI once the Source has its request: every frame captured after the one
+			// noted then is a frame after the PLI.
+			if err := r.Wait(ctx, func(*Recorder) bool { return len(noted.requests(rid)) > i }); err != nil {
+				t.Fatalf("%q PLI %d never reached the source: %v", rid, i, err)
+			}
+			asked := noted.requests(rid)[i]
+			var key Frame
+			before := 0
 			err := r.Wait(ctx, func(r *Recorder) bool {
-				after = after[:0]
+				before = 0
 				for _, f := range Frames(r.Packets()) {
-					if f.First.After(sent) {
-						after = append(after, f)
-					}
-				}
-				for _, f := range after {
-					if f.Mark.Keyframe {
+					switch {
+					case !f.HasMark || f.Mark.CaptureNS <= asked:
+					case f.Mark.Keyframe:
+						key = f
 						return true
+					default:
+						before++
 					}
 				}
 				return false
 			})
 			if err != nil {
-				t.Fatalf("%q PLI %d: %v", rid, i, err)
+				t.Fatalf("%q PLI %d: no keyframe: %v", rid, i, err)
 			}
-			for n, f := range after {
-				if !f.Mark.Keyframe {
-					continue
-				}
-				t.Logf("%q PLI %d: keyframe %v after the PLI, %d frames before it", rid, i, f.First.Sub(sent), n)
-				if n > 1 {
-					t.Errorf("%q PLI %d: %d frames before the keyframe, want at most 1", rid, i, n)
-				}
-				break
+			t.Logf("%q PLI %d: keyframe %d (captured %v after the newest frame before the request) arrived %v after "+
+				"the PLI, %d frames before it", rid, i, key.Mark.Frame, time.Duration(key.Mark.CaptureNS-asked),
+				key.First.Sub(sent), before)
+			if before > 1 {
+				t.Errorf("%q PLI %d: %d frames before the keyframe, want at most 1", rid, i, before)
 			}
 			time.Sleep(300 * time.Millisecond)
 		}

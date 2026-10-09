@@ -124,6 +124,33 @@ func WithoutCutFrames(pkts []Packet) []Packet {
 	return out
 }
 
+// InSeqOrder returns the packets in the order of their sequence numbers, as a jitter buffer hands them to a decoder.
+// The checks of frames (Frames, CheckVideoMarkers, WithoutPartialTail) take packets in arrival order, which is the
+// stream's order as long as nothing was lost; a stream with repairs, whose retransmissions arrive after newer frames
+// began, is put in order with this first. A second copy of a sequence number stays right behind the first.
+func InSeqOrder(pkts []Packet) []Packet {
+	if len(pkts) == 0 {
+		return nil
+	}
+	type ext struct {
+		n int64
+		p Packet
+	}
+	all := make([]ext, 0, len(pkts))
+	last := int64(extOrigin) + int64(pkts[0].Seq)
+	for _, p := range pkts {
+		n := last + int64(int16(p.Seq-uint16(last)))
+		all = append(all, ext{n, p})
+		last = max(last, n)
+	}
+	slices.SortStableFunc(all, func(a, b ext) int { return int(a.n - b.n) })
+	out := make([]Packet, len(all))
+	for i, e := range all {
+		out[i] = e.p
+	}
+	return out
+}
+
 // CheckContinuous checks that the packets form one continuous stream (the S4 check): in sequence-number order, no
 // sequence number is missing or received twice, and timestamps never go back.
 func CheckContinuous(pkts []Packet) error {

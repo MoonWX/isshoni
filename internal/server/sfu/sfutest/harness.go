@@ -23,6 +23,9 @@ import (
 type HarnessOptions struct {
 	// NoUDP leaves out the SFU's UDP socket (the stand-in for 7882/udp), as listen.ice_udp = "" does.
 	NoUDP bool
+	// FaultyUDP puts the SFU's UDP socket behind a FaultConn (Harness.Wire), so that a test can lose chosen packets
+	// between the SFU and one client: FaultConn's filter gets the client's address with every datagram.
+	FaultyUDP bool
 	// TCP adds the SFU's ICE-TCP listener (the stand-in for 7882/tcp).
 	TCP bool
 	// TCP443 adds 04's 443 multiplexer (netx.ListenPortMux) on 127.0.0.1:0; its ICE side gives the SFU's passive
@@ -42,6 +45,7 @@ type Harness struct {
 	SFU       *sfu.SFU
 	Transport *netx.Transport
 	PortMux   *netx.PortMux // nil without HarnessOptions.TCP443
+	Wire      *FaultConn    // the SFU's UDP socket; nil without HarnessOptions.FaultyUDP
 	Events    *RoomEventLog
 
 	mu        sync.Mutex // guards signalers
@@ -70,7 +74,17 @@ func (loopbackOnly) RouteSource(context.Context, netip.Addr) (netip.Addr, error)
 func NewHarness(ctx context.Context, o HarnessOptions) (*Harness, error) {
 	h := &Harness{Events: &RoomEventLog{}}
 	opts := netx.TransportOptions{IncludeLoopback: true, Interfaces: loopbackOnly{}, Logger: o.Logger}
-	if !o.NoUDP {
+	switch {
+	case o.NoUDP:
+	case o.FaultyUDP:
+		var lc net.ListenConfig
+		sock, err := lc.ListenPacket(ctx, "udp4", "127.0.0.1:0")
+		if err != nil {
+			return nil, fmt.Errorf("sfutest: UDP socket: %w", err)
+		}
+		h.Wire = NewFaultConn(sock)
+		opts.PacketConns = []net.PacketConn{h.Wire} // the Transport closes it
+	default:
 		opts.UDPAddr = "127.0.0.1:0"
 	}
 	if o.TCP {
@@ -79,6 +93,9 @@ func NewHarness(ctx context.Context, o HarnessOptions) (*Harness, error) {
 	if o.TCP443 {
 		pm, err := netx.ListenPortMux(netx.PortMuxOptions{Addr: "127.0.0.1:0", Logger: o.Logger})
 		if err != nil {
+			if h.Wire != nil {
+				_ = h.Wire.Close()
+			}
 			return nil, fmt.Errorf("sfutest: 443 multiplexer: %w", err)
 		}
 		h.PortMux, opts.PortMux = pm, pm
@@ -87,6 +104,9 @@ func NewHarness(ctx context.Context, o HarnessOptions) (*Harness, error) {
 	if err != nil {
 		if h.PortMux != nil {
 			_ = h.PortMux.Close()
+		}
+		if h.Wire != nil {
+			_ = h.Wire.Close() // closed twice if the Transport got as far as taking it, which does no harm
 		}
 		return nil, fmt.Errorf("sfutest: transport: %w", err)
 	}

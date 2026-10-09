@@ -71,6 +71,49 @@ type SubscriptionState struct {
 	// VideoSent and AudioSent count the RTP packets written to the viewer; VideoDrops and AudioDrops those a full
 	// DownTrack queue dropped.
 	VideoSent, AudioSent, VideoDrops, AudioDrops uint64
+	// VideoRepair and AudioRepair are what the DownTracks did about the viewer's NACKs, and the sender reports they
+	// forwarded.
+	VideoRepair, AudioRepair RepairState
+}
+
+// RepairState are a DownTrack's repair counters (02 §9.5): of the sequence numbers the viewer's NACKs asked for
+// (NACKs), how many were retransmitted (Served), were no longer in a cache (Missed), were skipped (asked for again
+// too soon or too often, or over budget) or met a full RTX queue (Dropped). SRs counts the sender reports forwarded
+// to the viewer (02 §9.6).
+type RepairState struct {
+	NACKs, Served, Missed, Skipped, Dropped uint64
+	SRs                                     uint64
+}
+
+func (d *DownTrack) repairState() RepairState {
+	return RepairState{
+		NACKs: d.stats.nackReceived.Load(), Served: d.stats.nackServed.Load(), Missed: d.stats.nackMissed.Load(),
+		Skipped: d.stats.rtxSkipped.Load(), Dropped: d.stats.rtxDrops.Load(), SRs: d.stats.srs.Load(),
+	}
+}
+
+// LayerState are the ingress counters of one attached layer of a share.
+type LayerState struct {
+	// Packets counts the RTP packets read; Duplicates the copies of a packet the cache already held (the publisher's
+	// redundant RTX, 02 §9.1: isshoni_sfu_ingress_duplicates_total), which were not forwarded; TooLate the packets a
+	// cache capacity or more behind.
+	Packets, Duplicates, TooLate uint64
+}
+
+// Ingress returns the counters of the layers attached to a share now, by rid ("audio" for the audio layer); nil for
+// an unknown or ended share.
+func (s *SFU) Ingress(id ShareID) map[string]LayerState {
+	sh := s.lookupShare(id)
+	if sh == nil {
+		return nil
+	}
+	out := map[string]LayerState{}
+	for _, l := range sh.attached() {
+		out[l.slot.String()] = LayerState{
+			Packets: l.stats.packets.Load(), Duplicates: l.stats.duplicates.Load(), TooLate: l.stats.tooLate.Load(),
+		}
+	}
+	return out
 }
 
 // Subscriptions returns the Conn's subscriptions, sorted by share id.
@@ -92,6 +135,7 @@ func (c *Conn) Subscriptions(ctx context.Context) ([]SubscriptionState, error) {
 			st.AudioBound = sub.audio.binding.Load() != nil
 			st.VideoSent, st.VideoDrops = sub.video.stats.packets.Load(), sub.video.stats.drops.Load()
 			st.AudioSent, st.AudioDrops = sub.audio.stats.packets.Load(), sub.audio.stats.drops.Load()
+			st.VideoRepair, st.AudioRepair = sub.video.repairState(), sub.audio.repairState()
 			out = append(out, st)
 		}
 		return nil
@@ -121,6 +165,9 @@ type PCState struct {
 	Closed, Offering bool
 	// HandshakeTimer and GraceTimer report whether the PC's handshake timeout and its grace after failed are running.
 	HandshakeTimer, GraceTimer bool
+	// RTT is the sub PC's round-trip time as its DownTracks' RTCP readers last read it from the selected candidate
+	// pair (02 §9.3); 0 while unknown, and for the pub PC.
+	RTT time.Duration
 }
 
 // PC returns the state of the Conn's PeerConnection of a kind.
@@ -141,6 +188,7 @@ func (c *Conn) PC(ctx context.Context, kind PCKind) (PCState, error) {
 			st = PCState{
 				Exists: true, Gen: s.gen, State: s.pc.ConnectionState().String(), Closed: s.closed, Offering: s.offering,
 				Neg: s.neg, HandshakeTimer: s.handshake.pending(), GraceTimer: s.grace.pending(),
+				RTT: time.Duration(s.rtt.Load()),
 			}
 		}
 		return nil
