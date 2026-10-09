@@ -109,6 +109,79 @@ func (s *SFU) FanOut(id ShareID) (video, audio int, ok bool) {
 	return len(sh.downTracks(webrtc.RTPCodecTypeVideo)), len(sh.downTracks(webrtc.RTPCodecTypeAudio)), true
 }
 
+// PCState describes one of a Conn's two PeerConnections as its actor has it.
+type PCState struct {
+	Exists bool   // the Conn has a PC of the kind (a closed sub PC exists; a closed pub PC is gone)
+	Gen    uint32 // of that PC; for pub without a PC, the highest gen accepted
+	// State is the PeerConnection's connection state as Pion has it now ("" without a PC).
+	State string
+	// Neg is the neg of the last offer: the last one answered on the pub PC, the last one sent on the sub PC. Closed
+	// and Offering are the sub PC's negotiation state: closed for good, an offer outstanding.
+	Neg              uint32
+	Closed, Offering bool
+	// HandshakeTimer and GraceTimer report whether the PC's handshake timeout and its grace after failed are running.
+	HandshakeTimer, GraceTimer bool
+}
+
+// PC returns the state of the Conn's PeerConnection of a kind.
+func (c *Conn) PC(ctx context.Context, kind PCKind) (PCState, error) {
+	var st PCState
+	err := c.do(ctx, func(context.Context) error {
+		switch {
+		case kind == PCPub && c.pub != nil:
+			p := c.pub
+			st = PCState{
+				Exists: true, Gen: p.gen, State: p.pc.ConnectionState().String(), Neg: p.neg,
+				HandshakeTimer: p.handshake.pending(), GraceTimer: p.grace.pending(),
+			}
+		case kind == PCPub:
+			st.Gen = c.pubGen
+		case kind == PCSub && c.sub != nil:
+			s := c.sub
+			st = PCState{
+				Exists: true, Gen: s.gen, State: s.pc.ConnectionState().String(), Closed: s.closed, Offering: s.offering,
+				Neg: s.neg, HandshakeTimer: s.handshake.pending(), GraceTimer: s.grace.pending(),
+			}
+		}
+		return nil
+	})
+	return st, err
+}
+
+// Timings are the durations of PeerConnection recovery that a test may shorten (config.go): the handshake timeout
+// (10 s), the grace after failed (30 s), the sub offer re-send (15 s), the ICE restart spacing (5 s), the window of
+// the PC creation limit (1 min) and the stalled threshold (2 s).
+type Timings struct {
+	Handshake, Grace, OfferResend, ICERestart, PCWindow, Stalled time.Duration
+}
+
+// SetTimings replaces the durations of t that aren't zero. Call it before the SFU's first Join.
+func (s *SFU) SetTimings(t Timings) {
+	for _, d := range []struct {
+		to   *time.Duration
+		from time.Duration
+	}{
+		{&s.timing.handshake, t.Handshake}, {&s.timing.grace, t.Grace}, {&s.timing.offerResend, t.OfferResend},
+		{&s.timing.iceRestart, t.ICERestart}, {&s.timing.pcWindow, t.PCWindow}, {&s.timing.stalled, t.Stalled},
+	} {
+		if d.from != 0 {
+			*d.to = d.from
+		}
+	}
+}
+
+// DefaultTimings returns the durations an SFU uses unless a test shortens them: the numbers of 02 §12.
+func DefaultTimings() Timings {
+	d := defaultTimings()
+	return Timings{
+		Handshake: d.handshake, Grace: d.grace, OfferResend: d.offerResend, ICERestart: d.iceRestart,
+		PCWindow: d.pcWindow, Stalled: d.stalled,
+	}
+}
+
+// MaxPCCreations is the number of PeerConnections of one kind a client may make a Conn create within a minute.
+const MaxPCCreations = maxPCCreations
+
 // SetMediaICETimeouts replaces the ICE timeouts of the pub and sub PCs of every SFU built from now on, and returns
 // the function that puts the real ones back (02 §7.3: 5 s to disconnected, 15 s more to failed). A test that needs a
 // PC to fail can't wait that long.

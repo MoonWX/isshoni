@@ -205,6 +205,24 @@ func (c *Conn) report(sub *Subscription, paced bool) {
 	})
 }
 
+// resendSubscription tells the client what a subscription gets now, whether or not that differs from what it last
+// heard: signal may have dropped the event that said so while the client's WebSocket was down (Conn.Resync). It runs
+// on the Conn's actor. A report that was held back is sent with it.
+func (c *Conn) resendSubscription(sub *Subscription) {
+	if _, live := sub.share.liveState(); !live {
+		return
+	}
+	if sub.held != nil {
+		sub.held.Stop()
+		sub.held = nil
+	}
+	st := sub.state()
+	sub.told, sub.quiet = st, monoNow()+int64(c.sfu.subEventEvery)
+	c.sig.SendEvent(SubscriptionStateEvent{
+		Share: sub.share.id, Requested: sub.reqVideo, Forwarded: st.forwarded, Audio: st.audio, Reason: st.reason,
+	})
+}
+
 // detach takes the subscription's DownTracks off the share's fan-out lists and ends their writers. A report that
 // was held back is dropped. The Conn's actor calls it when the subscription goes.
 func (s *Subscription) detach() {
@@ -228,6 +246,10 @@ func (s *Subscription) detach() {
 // What each subscription then gets follows 02 §10.1, and the client hears of it through SubscriptionStateEvents: a
 // pause, and a request that the share's layers can't serve, before UpdateSubscriptions returns; everything else when
 // it happens, or up to 250 ms later when it follows another event closely (report).
+//
+// On a Conn whose sub PC has closed (02 §5.3), a call that applies an item is the Conn needing a sub PC again: the
+// successor is built with every subscription, the new ones included, and offered at once. If that is one PC too
+// many within a minute (02 §12) the items are applied all the same, and the subscriptions wait for the next request.
 func (c *Conn) UpdateSubscriptions(ctx context.Context, items []SubscriptionUpdate) ([]error, error) {
 	var errs []error
 	err := c.do(ctx, func(context.Context) error {
@@ -249,7 +271,7 @@ func (c *Conn) updateSubscriptions(items []SubscriptionUpdate) ([]error, error) 
 		return nil, newError(CodeTooManySubscriptions, "more than 64 items in one call")
 	}
 	errs := make([]error, len(items))
-	created := false
+	created, applied := false, false
 	for i, it := range items {
 		if !it.Video.valid() {
 			errs[i] = errCaller("UpdateSubscriptions: unknown quality")
@@ -260,19 +282,29 @@ func (c *Conn) updateSubscriptions(items []SubscriptionUpdate) ([]error, error) 
 			errs[i] = err
 			continue
 		}
-		created = created || made
+		created, applied = created || made, true
 		sub.reqVideo, sub.reqAudio = it.Video, it.Audio
 		sub.apply()
 		c.reportSubscription(sub)
 	}
-	if created {
+	switch s := c.sub; {
+	case s == nil:
+	case s.closed:
+		if applied {
+			if err := c.rebuildClosedSub("a subscription changed", false); err != nil {
+				c.log.Debug("sub PC not rebuilt for a subscription change", "err", err)
+			}
+		}
+	case created:
 		c.subChanged()
 	}
 	return errs, nil
 }
 
-// subscription returns the Conn's subscription to a share, creating it (and the sub PC) when it is new. A new
-// subscription's DownTracks are paused, on the share's fan-out lists and on the sub PC, with their writers running.
+// subscription returns the Conn's subscription to a share, creating it (and the Conn's first sub PC) when it is new.
+// A new subscription's DownTracks are paused, on the share's fan-out lists and on the sub PC, with their writers
+// running. While the sub PC is closed they are on no PC: the PC that rebuildSub builds takes them, with all the
+// others.
 func (c *Conn) subscription(id ShareID) (sub *Subscription, created bool, err error) {
 	if sub := c.subs[id]; sub != nil {
 		return sub, false, nil
@@ -298,14 +330,16 @@ func (c *Conn) subscription(id ShareID) (sub *Subscription, created bool, err er
 			return nil, false, newError(CodeShareNotFound, "the share ended")
 		}
 	}
-	for _, dt := range sub.tracks() {
-		if err := pc.addTrack(dt, c.log); err != nil {
-			c.log.Warn("DownTrack not added to the sub PC", "share_id", string(id), "err", err)
-			sub.detach()
-			for _, added := range sub.tracks() {
-				pc.removeTrack(added, c.log)
+	if !pc.closed {
+		for _, dt := range sub.tracks() {
+			if err := pc.addTrack(dt, c.log); err != nil {
+				c.log.Warn("DownTrack not added to the sub PC", "share_id", string(id), "err", err)
+				sub.detach()
+				for _, added := range sub.tracks() {
+					pc.removeTrack(added, c.log)
+				}
+				return nil, false, newError(CodeInternal, "the sub PC refused a track")
 			}
-			return nil, false, newError(CodeInternal, "the sub PC refused a track")
 		}
 	}
 	for _, dt := range sub.tracks() {

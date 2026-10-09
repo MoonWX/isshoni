@@ -189,7 +189,20 @@ func Bindings(pub *publish.Publisher, share sfu.ShareID) []sfu.TrackBinding {
 // (Publisher.Offer leaves out the receive rids that Pion repeats from the SFU's last answer).
 func Publish(ctx context.Context, conn *sfu.Conn, pub *publish.Publisher, gen, neg uint32, share sfu.ShareID,
 ) (answerSDP string, err error) {
-	offer, err := pub.Offer(ctx)
+	return publishWith(ctx, conn, pub, pub.Offer, gen, neg, share)
+}
+
+// PublishICERestart is Publish with an offer that restarts ICE (Publisher.OfferICERestart): what a client does for a
+// pub PC whose ICE has been disconnected for 3 s (01 §10.4), with the next neg of the same gen.
+func PublishICERestart(ctx context.Context, conn *sfu.Conn, pub *publish.Publisher, gen, neg uint32, share sfu.ShareID,
+) (answerSDP string, err error) {
+	return publishWith(ctx, conn, pub, pub.OfferICERestart, gen, neg, share)
+}
+
+func publishWith(ctx context.Context, conn *sfu.Conn, pub *publish.Publisher,
+	makeOffer func(context.Context) (webrtc.SessionDescription, error), gen, neg uint32, share sfu.ShareID,
+) (answerSDP string, err error) {
+	offer, err := makeOffer(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -214,12 +227,19 @@ type Offer struct {
 }
 
 // DirectSignaler is an sfu.Signaler without a hub or a WebSocket: it records the offers and events a Conn sends and,
-// once Attach gave it a Viewer, answers the Conn's sub offers with it. Like every Signaler it never blocks and never
-// calls the SFU from the Conn's actor: the answers come from its own goroutine.
+// once Attach gave it a Viewer, answers the Conn's sub offers with it, the way a client does (01 §9): a sub offer of
+// a new gen gets a new PeerConnection (Viewer.Rebuild), a repeated one the answer it got before, an older one
+// nothing. Like every Signaler it never blocks and never calls the SFU from the Conn's actor: the answers come from
+// its own goroutine.
+//
+// SetDown stands in for a WebSocket that is down: what the Conn sends meanwhile is lost, as the hub may drop it, and
+// only what Conn.Resync sends again after the resume arrives.
 type DirectSignaler struct {
 	mu       sync.Mutex // guards the fields below
 	offers   []Offer
 	events   []sfu.Event
+	lost     []Offer // the offers sent while down
+	down     bool
 	answered int     // offers[:answered] went to the Viewer
 	settled  int     // offers[:settled] are done with: the Conn has their answer, or the answer loop its error
 	errs     []error // what the answer loop ran into
@@ -238,8 +258,14 @@ func NewDirectSignaler() *DirectSignaler {
 
 // SendOffer implements sfu.Signaler.
 func (d *DirectSignaler) SendOffer(pc sfu.PCKind, gen, neg uint32, sdp string, tracks []sfu.TrackBinding) {
+	o := Offer{PC: pc, Gen: gen, Neg: neg, SDP: sdp, Tracks: slices.Clone(tracks)}
 	d.mu.Lock()
-	d.offers = append(d.offers, Offer{PC: pc, Gen: gen, Neg: neg, SDP: sdp, Tracks: slices.Clone(tracks)})
+	if d.down {
+		d.lost = append(d.lost, o)
+		d.mu.Unlock()
+		return
+	}
+	d.offers = append(d.offers, o)
 	d.mu.Unlock()
 	select {
 	case d.wake <- struct{}{}:
@@ -250,11 +276,30 @@ func (d *DirectSignaler) SendOffer(pc sfu.PCKind, gen, neg uint32, sdp string, t
 // SendEvent implements sfu.Signaler.
 func (d *DirectSignaler) SendEvent(ev sfu.Event) {
 	d.mu.Lock()
-	d.events = append(d.events, ev)
-	d.mu.Unlock()
+	defer d.mu.Unlock()
+	if !d.down {
+		d.events = append(d.events, ev)
+	}
 }
 
-// Offers returns the offers sent so far, in order.
+// SetDown makes the signaling go down (true) or come back (false). While it is down the offers and events the Conn
+// sends are lost: the offers are kept apart (Lost), the events are gone. Coming back sends nothing by itself: the
+// test calls Conn.Resync, as the hub does on a resume.
+func (d *DirectSignaler) SetDown(down bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.down = down
+}
+
+// Lost returns the offers that were sent while the signaling was down, in order.
+func (d *DirectSignaler) Lost() []Offer {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return slices.Clone(d.lost)
+}
+
+// Offers returns the offers that arrived so far, in order: every one sent while the signaling was up, a re-sent one
+// each time it was sent.
 func (d *DirectSignaler) Offers() []Offer {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -345,7 +390,8 @@ func (d *DirectSignaler) WaitPCState(ctx context.Context, pc sfu.PCKind, gen uin
 }
 
 // Attach makes v answer conn's sub offers, the ones already recorded first, each with Viewer.Answer and
-// Conn.HandleAnswer, in order, until Close. A DirectSignaler takes one Viewer.
+// Conn.HandleAnswer, in order, until Close. A DirectSignaler takes one Viewer. For an offer of a higher gen than the
+// last one answered, v first replaces its PeerConnection (Viewer.Rebuild).
 func (d *DirectSignaler) Attach(conn *sfu.Conn, v *Viewer) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -360,6 +406,7 @@ func (d *DirectSignaler) Attach(conn *sfu.Conn, v *Viewer) {
 }
 
 func (d *DirectSignaler) answerLoop(ctx context.Context, conn *sfu.Conn, v *Viewer) {
+	var last answered
 	for {
 		for {
 			d.mu.Lock()
@@ -370,7 +417,7 @@ func (d *DirectSignaler) answerLoop(ctx context.Context, conn *sfu.Conn, v *View
 			o := d.offers[d.answered]
 			d.answered++
 			d.mu.Unlock()
-			err := answerOffer(ctx, conn, v, o)
+			err := last.answer(ctx, conn, v, o)
 			d.mu.Lock()
 			if err != nil && ctx.Err() == nil {
 				d.errs = append(d.errs, fmt.Errorf("sub offer gen %d neg %d: %w", o.Gen, o.Neg, err))
@@ -386,12 +433,36 @@ func (d *DirectSignaler) answerLoop(ctx context.Context, conn *sfu.Conn, v *View
 	}
 }
 
-// answerOffer applies one sub offer on the Viewer and gives its answer to the Conn.
-func answerOffer(ctx context.Context, conn *sfu.Conn, v *Viewer, o Offer) error {
+// answered is the last sub offer a DirectSignaler's Viewer answered, and its answer.
+type answered struct {
+	gen, neg uint32
+	sdp      string
+}
+
+// answer handles one sub offer as a client does (01 §9 rules 2 and 3). A new offer is applied on the Viewer, on a new
+// PeerConnection when it starts a new gen, and its answer goes to the Conn. A repeated offer (the SFU sent it again
+// because no answer had come, or after a resume) gets the stored answer once more, which the Conn drops as stale if
+// it has it already. An older offer is ignored.
+func (a *answered) answer(ctx context.Context, conn *sfu.Conn, v *Viewer, o Offer) error {
+	switch {
+	case o.Gen < a.gen || (o.Gen == a.gen && o.Neg < a.neg):
+		return nil
+	case o.Gen == a.gen && o.Neg == a.neg:
+		err := conn.HandleAnswer(ctx, o.PC, o.Gen, o.Neg, a.sdp)
+		if errors.Is(err, &sfu.Error{Code: sfu.CodeStaleAnswer}) {
+			return nil
+		}
+		return err
+	case o.Gen > a.gen && a.gen != 0:
+		if err := v.Rebuild(); err != nil {
+			return err
+		}
+	}
 	answer, err := v.Answer(ctx, webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: o.SDP})
 	if err != nil {
 		return err
 	}
+	*a = answered{gen: o.Gen, neg: o.Neg, sdp: answer.SDP}
 	return conn.HandleAnswer(ctx, o.PC, o.Gen, o.Neg, answer.SDP)
 }
 

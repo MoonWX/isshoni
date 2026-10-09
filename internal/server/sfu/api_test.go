@@ -1227,8 +1227,103 @@ func FuzzFilterSDP(f *testing.F) {
 			if again, n2, err := filter.filterSDP(out); err != nil || n2 != 0 || again != out {
 				t.Fatalf("filtering twice changed the SDP: %d dropped, %v", n2, err)
 			}
+
+			// With a cap on the candidates' addresses (02 §12; two here, 64 for a Conn's PC): what comes out is
+			// sfu.bad_sdp, or holds only admitted addresses, at most two, and is left alone when it is limited again.
+			seen := map[candidateAddr]bool{}
+			admit := func(a candidateAddr) bool {
+				if !seen[a] && len(seen) < 2 {
+					seen[a] = true
+				}
+				return seen[a]
+			}
+			limited, _, err := filter.limitSDP(raw, admit)
+			if err != nil {
+				var e *Error
+				if !errors.As(err, &e) || e.Code != CodeBadSDP {
+					t.Fatalf("error %v is not sfu.bad_sdp", err)
+				}
+				continue
+			}
+			capped := &sdp.SessionDescription{}
+			if err := capped.UnmarshalString(limited); err != nil {
+				t.Fatalf("pion/sdp can't read the limited SDP: %v", err)
+			}
+			left := map[candidateAddr]bool{}
+			attrs = slices.Clone(capped.Attributes)
+			for _, md := range capped.MediaDescriptions {
+				attrs = append(attrs, md.Attributes...)
+			}
+			for _, a := range attrs {
+				if !a.IsICECandidate() {
+					continue
+				}
+				addr, r := filter.judge(a.Value)
+				if r != keepCandidate || !seen[addr] {
+					t.Fatalf("a candidate that was dropped (%q) or not admitted is left in the limited SDP", r)
+				}
+				left[addr] = true
+			}
+			if len(left) > 2 {
+				t.Fatalf("%d candidate addresses are left, want at most 2", len(left))
+			}
+			if again, n2, err := filter.limitSDP(limited, admit); err != nil || n2 != 0 || again != limited {
+				t.Fatalf("limiting twice changed the SDP: %d dropped, %v", n2, err)
+			}
 		}
 	})
+}
+
+// TestLimitSDP: the candidates of a remote description count toward the cap on remote candidates like trickled ones
+// (02 §12). Past the cap they are dropped from the SDP; an address that was admitted before stays, however often it
+// comes.
+func TestLimitSDP(t *testing.T) {
+	const head = "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n"
+	section := func(mid string, ports ...int) string {
+		s := "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:" + mid + "\r\n"
+		for i, port := range ports {
+			s += fmt.Sprintf("a=candidate:%d 1 udp 2122260223 203.0.113.7 %d typ host\r\n", i, port)
+		}
+		return s
+	}
+	filter := candidateFilter{}
+	var budget remoteCandidates
+	budget.seen = map[candidateAddr]struct{}{}
+	for port := range maxRemoteCandidates - 2 { // the trickled ones so far
+		budget.admit(candidateAddr{addr: netip.AddrPortFrom(netip.MustParseAddr("198.51.100.1"), uint16(1000+port))})
+	}
+	// Two places are left. The first m-section repeats port 5000 and brings a loopback candidate, which the filter
+	// drops before it can count; the second m-section's port 5000 is the address already admitted.
+	raw := head + section("0", 5000, 5000, 5001, 5002) + "a=candidate:9 1 udp 1 127.0.0.1 1 typ host\r\n" + section("1", 5000, 5003)
+	out, dropped, err := filter.limitSDP(raw, budget.admit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := head + section("0", 5000, 5000, 5001) + section("1", 5000)
+	if dropped != 3 || budget.count() != maxRemoteCandidates {
+		t.Errorf("dropped %d candidates with %d addresses admitted, want 3 and %d", dropped, budget.count(), maxRemoteCandidates)
+	}
+	wantDesc, err := parseSDP(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBytes, err := wantDesc.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != string(wantBytes) {
+		t.Errorf("limited SDP:\n%s\nwant:\n%s", out, wantBytes)
+	}
+	// The same description again (a re-offer): its candidates are known, and nothing more is dropped than before.
+	again, dropped, err := filter.limitSDP(raw, budget.admit)
+	if err != nil || dropped != 3 || again != out {
+		t.Errorf("the same SDP again: %d dropped, %v, the same result %v", dropped, err, again == out)
+	}
+	// Without a cap it is filterSDP.
+	plain, dropped, err := filter.limitSDP(raw, nil)
+	if viaFilter, n, _ := filter.filterSDP(raw); err != nil || dropped != 1 || plain != viaFilter || n != 1 {
+		t.Errorf("without a cap: %d dropped, %v; filterSDP dropped %d, the same result %v", dropped, err, n, plain == viaFilter)
+	}
 }
 
 // TestCandidateFilterTrickled: a trickled candidate is read the way Pion's AddICECandidate reads it.

@@ -389,29 +389,46 @@ func newCandidateFilter(tr *netx.Transport) candidateFilter {
 // trickled judges a trickled candidate the way Pion's PeerConnection.AddICECandidate reads it: the candidate field
 // without its "candidate:" prefix. The end-of-candidates marker (an empty candidate) is kept: Pion ignores it.
 func (f candidateFilter) trickled(init webrtc.ICECandidateInit) dropReason {
+	_, reason := f.judgeTrickled(init)
+	return reason
+}
+
+// judgeTrickled is trickled with the transport address of a candidate it keeps, which is what the cap on remote
+// candidates counts (02 §12, remoteCandidates).
+func (f candidateFilter) judgeTrickled(init webrtc.ICECandidateInit) (candidateAddr, dropReason) {
 	v := strings.TrimPrefix(init.Candidate, "candidate:")
 	if v == "" {
-		return keepCandidate
+		return candidateAddr{}, keepCandidate
 	}
-	return f.candidate(v)
+	return f.judge(v)
 }
 
 // candidate judges one candidate string as ice.UnmarshalCandidate reads it (the value of a candidate attribute, or a
 // trickled candidate as trickled passes it). A value with a CR or LF in it is dropped as unparsable: no valid
 // candidate has one, and pion/sdp wouldn't read it back unchanged after filterSDP re-marshals the SDP.
 func (f candidateFilter) candidate(value string) dropReason {
+	_, reason := f.judge(value)
+	return reason
+}
+
+// judge is candidate with the transport address of a candidate it keeps: where the server would send its checks.
+func (f candidateFilter) judge(value string) (candidateAddr, dropReason) {
 	if strings.ContainsAny(value, "\r\n") {
-		return dropUnparsable
+		return candidateAddr{}, dropUnparsable
 	}
 	c, err := ice.UnmarshalCandidate(value)
 	if err != nil {
-		return dropUnparsable
+		return candidateAddr{}, dropUnparsable
 	}
 	ip, err := netip.ParseAddr(c.Address())
 	if err != nil {
-		return dropHostname
+		return candidateAddr{}, dropHostname
 	}
-	return f.addr(ip)
+	if reason := f.addr(ip); reason != keepCandidate {
+		return candidateAddr{}, reason
+	}
+	port := uint16(c.Port()) //nolint:gosec // Pion's parser takes only ports up to 65535
+	return candidateAddr{tcp: c.NetworkType().IsTCP(), addr: netip.AddrPortFrom(ip.Unmap().WithZone(""), port)}, keepCandidate
 }
 
 // addr judges a candidate's connection address.
@@ -461,11 +478,20 @@ func (f candidateFilter) addr(a netip.Addr) dropReason {
 // in it makes the SDP sfu.bad_sdp, as does an SDP pion/sdp can't parse (SetRemoteDescription would refuse it too).
 // Browser and Pion descriptions never hit either case.
 func (f candidateFilter) filterSDP(raw string) (string, int, error) {
+	return f.limitSDP(raw, nil)
+}
+
+// limitSDP is filterSDP for the remote description of a Conn's PC, whose candidates count toward the PC's cap on
+// remote candidates like trickled ones (02 §12): a candidate that the filter keeps but admit refuses is dropped too.
+// admit gets the transport address of each kept candidate, in the SDP's order, and must give the same answer when
+// it is asked about an address again (remoteCandidates.admit does: an address it admitted stays admitted), because
+// the SDP that comes out is read once more.
+func (f candidateFilter) limitSDP(raw string, admit func(candidateAddr) bool) (string, int, error) {
 	desc, err := parseSDP(raw)
 	if err != nil {
 		return "", 0, err
 	}
-	dropped := f.dropCandidates(desc)
+	dropped := f.dropCandidates(desc, admit)
 	if dropped == 0 {
 		return raw, 0, nil
 	}
@@ -474,18 +500,22 @@ func (f candidateFilter) filterSDP(raw string) (string, int, error) {
 		return "", 0, newError(CodeBadSDP, "SDP can't be written back after dropping candidates")
 	}
 	out := string(b)
-	if again, err := parseSDP(out); err != nil || f.dropCandidates(again) != 0 {
+	if again, err := parseSDP(out); err != nil || f.dropCandidates(again, admit) != 0 {
 		return "", 0, newError(CodeBadSDP, "malformed lines around candidates")
 	}
 	return out, dropped, nil
 }
 
-// dropCandidates removes the candidate attributes the filter drops from desc, at session and media level, and
-// returns how many it removed.
-func (f candidateFilter) dropCandidates(desc *sdp.SessionDescription) int {
+// dropCandidates removes the candidate attributes the filter drops from desc, at session and media level, and those
+// that admit refuses when there is one, and returns how many it removed.
+func (f candidateFilter) dropCandidates(desc *sdp.SessionDescription, admit func(candidateAddr) bool) int {
 	dropped := 0
 	drop := func(a sdp.Attribute) bool {
-		if a.IsICECandidate() && f.candidate(a.Value) != keepCandidate {
+		if !a.IsICECandidate() {
+			return false
+		}
+		addr, reason := f.judge(a.Value)
+		if reason != keepCandidate || (admit != nil && !admit(addr)) {
 			dropped++
 			return true
 		}

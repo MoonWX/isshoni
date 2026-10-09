@@ -54,13 +54,16 @@ const (
 )
 
 // Viewer is a Pion subscriber that records what it receives. NewViewer creates its PeerConnection; tracks are
-// recorded from the first packet on, until Close.
+// recorded from the first packet on, until Close. Rebuild replaces the PeerConnection with a new one, as a client
+// does for a sub offer of a new gen (01 §9 rule 2); the Recorders of the old one stay, and stop growing.
 type Viewer struct {
-	pc   *webrtc.PeerConnection
+	api  *webrtc.API
+	cfg  webrtc.Configuration
 	log  *slog.Logger
 	keep int
 
 	mu       sync.Mutex // guards the fields below
+	pc       *webrtc.PeerConnection
 	recs     []*Recorder
 	rtcpRead map[rtcpKey]bool
 	closed   bool
@@ -91,21 +94,54 @@ func NewViewer(o ViewerOptions) (*Viewer, error) {
 	ir := &interceptor.Registry{}
 	ir.Add(gen)
 	ir.Add(rr)
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(ir),
-		webrtc.WithSettingEngine(o.Settings))
-	pc, err := api.NewPeerConnection(webrtc.Configuration{ICEServers: o.ICEServers})
-	if err != nil {
-		return nil, fmt.Errorf("sfutest: new PeerConnection: %w", err)
+	v := &Viewer{
+		api: webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(ir),
+			webrtc.WithSettingEngine(o.Settings)),
+		cfg: webrtc.Configuration{ICEServers: o.ICEServers},
+		log: o.Logger, keep: o.KeepPackets, rtcpRead: map[rtcpKey]bool{},
 	}
-	v := &Viewer{pc: pc, log: o.Logger, keep: o.KeepPackets, rtcpRead: map[rtcpKey]bool{}}
 	if v.log == nil {
 		v.log = slog.Default()
 	}
 	if v.keep == 0 {
 		v.keep = DefaultKeepPackets
 	}
-	pc.OnTrack(v.onTrack)
+	if v.pc, err = v.newPC(); err != nil {
+		return nil, err
+	}
 	return v, nil
+}
+
+// newPC creates a PeerConnection of the Viewer's API whose tracks the Viewer records.
+func (v *Viewer) newPC() (*webrtc.PeerConnection, error) {
+	pc, err := v.api.NewPeerConnection(v.cfg)
+	if err != nil {
+		return nil, fmt.Errorf("sfutest: new PeerConnection: %w", err)
+	}
+	pc.OnTrack(func(tr *webrtc.TrackRemote, recv *webrtc.RTPReceiver) { v.onTrack(pc, tr, recv) })
+	return pc, nil
+}
+
+// Rebuild closes the Viewer's PeerConnection and gives it a new one with the same settings: what a client does when
+// the SFU offers a sub PC of a new gen (01 §9 rule 2). The tracks of the new PeerConnection get new Recorders.
+func (v *Viewer) Rebuild() error {
+	v.mu.Lock()
+	if v.closed {
+		v.mu.Unlock()
+		return errors.New("sfutest: rebuild of a closed viewer")
+	}
+	pc, err := v.newPC()
+	if err != nil {
+		v.mu.Unlock()
+		return err
+	}
+	old := v.pc
+	v.pc = pc
+	v.mu.Unlock()
+	if err := old.Close(); err != nil {
+		return fmt.Errorf("sfutest: close the replaced PeerConnection: %w", err)
+	}
+	return nil
 }
 
 // viewerEngine registers H.264 (with RTX unless NoRTX) and Opus with a browser's feedback, and the header extensions
@@ -186,21 +222,27 @@ func LoopbackSettings() webrtc.SettingEngine {
 	return se
 }
 
-// PC returns the Viewer's PeerConnection, for signaling and state callbacks. Close closes it.
-func (v *Viewer) PC() *webrtc.PeerConnection { return v.pc }
+// PC returns the Viewer's PeerConnection, for signaling and state callbacks: the current one, which Rebuild
+// replaces. Close closes it.
+func (v *Viewer) PC() *webrtc.PeerConnection {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.pc
+}
 
 // Answer applies a remote offer and returns the answer, set as the local description, with every ICE candidate in it
-// (no trickle).
+// (no trickle). An offer with new ICE credentials restarts ICE, as on any WebRTC client.
 func (v *Viewer) Answer(ctx context.Context, offer webrtc.SessionDescription) (webrtc.SessionDescription, error) {
-	if err := v.pc.SetRemoteDescription(offer); err != nil {
+	pc := v.PC()
+	if err := pc.SetRemoteDescription(offer); err != nil {
 		return webrtc.SessionDescription{}, fmt.Errorf("sfutest: set remote description: %w", err)
 	}
-	answer, err := v.pc.CreateAnswer(nil)
+	answer, err := pc.CreateAnswer(nil)
 	if err != nil {
 		return webrtc.SessionDescription{}, fmt.Errorf("sfutest: create answer: %w", err)
 	}
-	gathered := webrtc.GatheringCompletePromise(v.pc)
-	if err := v.pc.SetLocalDescription(answer); err != nil {
+	gathered := webrtc.GatheringCompletePromise(pc)
+	if err := pc.SetLocalDescription(answer); err != nil {
 		return webrtc.SessionDescription{}, fmt.Errorf("sfutest: set local description: %w", err)
 	}
 	select {
@@ -208,13 +250,14 @@ func (v *Viewer) Answer(ctx context.Context, offer webrtc.SessionDescription) (w
 	case <-ctx.Done():
 		return webrtc.SessionDescription{}, ctx.Err()
 	}
-	return *v.pc.LocalDescription(), nil
+	return *pc.LocalDescription(), nil
 }
 
-// onTrack starts recording a new track: an RTP reader for the track and, once per receiver and rid, an RTCP reader.
-func (v *Viewer) onTrack(tr *webrtc.TrackRemote, recv *webrtc.RTPReceiver) {
+// onTrack starts recording a new track of pc: an RTP reader for the track and, once per receiver and rid, an RTCP
+// reader.
+func (v *Viewer) onTrack(pc *webrtc.PeerConnection, tr *webrtc.TrackRemote, recv *webrtc.RTPReceiver) {
 	mid := ""
-	for _, t := range v.pc.GetTransceivers() {
+	for _, t := range pc.GetTransceivers() {
 		if t.Receiver() == recv {
 			mid = t.Mid()
 			break
@@ -329,7 +372,7 @@ func (v *Viewer) WaitRecorder(ctx context.Context, match func(*Recorder) bool) (
 
 // RequestKeyframe sends a PLI for the Recorder's SSRC.
 func (v *Viewer) RequestKeyframe(r *Recorder) error {
-	if err := v.pc.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: r.ssrc}}); err != nil {
+	if err := v.PC().WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: r.ssrc}}); err != nil {
 		return fmt.Errorf("sfutest: PLI: %w", err)
 	}
 	r.mu.Lock()
@@ -350,7 +393,7 @@ func (v *Viewer) SendREMB(bps float32) error {
 		return errors.New("sfutest: REMB: no video track yet")
 	}
 	remb := &rtcp.ReceiverEstimatedMaximumBitrate{Bitrate: bps, SSRCs: ssrcs}
-	if err := v.pc.WriteRTCP([]rtcp.Packet{remb}); err != nil {
+	if err := v.PC().WriteRTCP([]rtcp.Packet{remb}); err != nil {
 		return fmt.Errorf("sfutest: REMB: %w", err)
 	}
 	return nil
@@ -364,8 +407,9 @@ func (v *Viewer) Close() error {
 		return nil
 	}
 	v.closed = true
+	pc := v.pc
 	v.mu.Unlock()
-	err := v.pc.Close()
+	err := pc.Close()
 	v.wg.Wait()
 	if err != nil {
 		return fmt.Errorf("sfutest: close viewer: %w", err)

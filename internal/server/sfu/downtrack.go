@@ -84,6 +84,9 @@ type dtStats struct {
 
 // binding is one negotiated attachment of a DownTrack to a sub PC's sender (02 §9.3).
 type binding struct {
+	// id is the id of the sender's TrackLocalContext, one per sender: Unbind ends the binding only when Pion ends
+	// that sender, not when the stop of an older sender (of the sub PC before a rebuild) arrives late.
+	id            string
 	pc            *subPC // the generation: its ready flag is the DTLS gate
 	writer        webrtc.TrackLocalWriter
 	ssrc, rtxSSRC uint32
@@ -145,6 +148,7 @@ func (d *DownTrack) Kind() webrtc.RTPCodecType { return d.kind }
 // publisher for a keyframe: the viewer can't decode anything before one (02 §9.7).
 func (d *DownTrack) Bind(ctx webrtc.TrackLocalContext) (webrtc.RTPCodecParameters, error) {
 	b := &binding{
+		id:       ctx.ID(),
 		pc:       d.pc.Load(),
 		writer:   ctx.WriteStream(),
 		ssrc:     uint32(ctx.SSRC()),
@@ -216,10 +220,16 @@ func (d *DownTrack) Bind(ctx webrtc.TrackLocalContext) (webrtc.RTPCodecParameter
 // Unbind implements webrtc.TrackLocal: the sender stopped (the subscription went away, or the PC closed). The writer
 // drops packets until the next Bind, and what the viewer was getting is over: after a Bind the stream starts on a
 // keyframe again. Like Bind it only stores, under the DownTrack's own lock, and never blocks.
-func (d *DownTrack) Unbind(webrtc.TrackLocalContext) error {
+//
+// It ends the binding of the sender that stopped and no other. A sub PC that Pion closes by itself (the client's
+// DTLS close_notify) stops its senders from a goroutine of Pion's, some time after the PC counts as closed: by then
+// a rebuilt sub PC may have bound the DownTrack to its own sender, and that binding stays.
+func (d *DownTrack) Unbind(ctx webrtc.TrackLocalContext) error {
 	d.mu.Lock()
-	d.binding.Store(nil)
-	changed := d.restartLocked()
+	changed := false
+	if b := d.binding.Load(); b != nil && b.id == ctx.ID() && d.binding.CompareAndSwap(b, nil) {
+		changed = d.restartLocked()
+	}
 	d.mu.Unlock()
 	if changed {
 		d.sub.changed()

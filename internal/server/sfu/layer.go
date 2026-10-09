@@ -227,9 +227,11 @@ func (l *Layer) handleRTP(pkt *rtp.Packet, profile ProfileKey, now int64) {
 	if video {
 		if p.keyStart {
 			l.keyframe(p)
-		} else if l.share.awaitsKeyframe.Load() {
-			// The share is still pending and this isn't the keyframe it waits for: its start was lost, or the track
-			// was already running when it was bound to the share. Ask, at most every 500 ms.
+		} else if l.share.awaitsKeyframe.Load() && l.share.conn.pubUp.Load() {
+			// The share is pending or stalled and this isn't the keyframe it waits for: its start was lost, the track
+			// was already running when it was bound to the share, or the keyframe came before the Conn's actor had
+			// seen the pub PC connected again. Ask, at most every 500 ms; not while the actor has the PC as away, when
+			// a keyframe wouldn't end stalled and the actor asks anyway once the PC is back (Conn.onPCState).
 			l.requestKeyframe(now)
 		}
 	}

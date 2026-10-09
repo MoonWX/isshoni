@@ -28,8 +28,8 @@ type pubPC struct {
 	// stuck: an offer failed inside Pion after Pion had taken it as its remote offer (offerFailed). The PC then takes
 	// no other offer; it and its media stay until an offer with a higher gen replaces it.
 	stuck bool
-	// lastState is the last connection state onPCState handled, so that each state is reported once.
-	lastState webrtc.PeerConnectionState
+	// pcState has the last connection state handled, the handshake timeout and the grace after failed.
+	pcState
 	// bound maps the mids of the latest offer's sending m-sections that carry a share to that share and kind. A
 	// track on any other mid feeds nothing.
 	bound map[string]TrackBinding
@@ -62,9 +62,20 @@ type pubTrack struct {
 // HandleOffer applies a pub offer and returns the answer synchronously, with every candidate in it (gathering is
 // instant with the muxes, capped at 2 s; the SFU never trickles). tracks binds each sending m-section to a share of
 // this Conn; an m-section it doesn't bind, or binds to a share that has ended, is answered a=inactive and carries
-// nothing (02 §8.4). A higher gen replaces the pub PC: the client rebuilt it. A lower gen, or a lower neg in the
-// current gen, returns sfu.stale_offer and changes nothing; a repeated neg gets the stored answer again (02 §5.3).
-// Offers are only valid for PCPub.
+// nothing (02 §8.4). A higher gen replaces the pub PC: the client rebuilt it. Its shares live on: they are stalled
+// from the moment the old PC's tracks end until the new PC is connected and a keyframe has arrived on one of its
+// tracks (02 §5.3), and their viewers need no new offer. A lower gen, or a lower neg in the current gen, returns
+// sfu.stale_offer and changes nothing; a repeated neg gets the stored answer again (02 §5.3). An offer with new ICE
+// credentials in the current gen restarts ICE (Pion does, and answers with new credentials of its own): that is how
+// a client recovers a pub PC whose ICE is disconnected (02 §6.5).
+//
+// Offers are only valid for PCPub: PCSub and the zero value are sfu.bad_pc. A PCKind beyond the two would be a third
+// PeerConnection on a Conn that has one of each kind: sfu.pc_limit (02 §12). A second PC of one kind can't be asked
+// for: a new gen replaces the PC of the old one. More than 10 new gens within a minute are sfu.pc_rate_limited,
+// with the time to wait in the error's RetryAfter.
+//
+// A new pub PC has 10 s from its first answer to get connected (02 §12). After that it is closed and reported
+// failed with PCReasonHandshakeTimeout, which has the client offer the next gen.
 //
 // An offer the SFU's own checks refuse changes nothing. One that Pion refuses changes nothing when it starts a new
 // gen (the old PC stays). On the current PC it can leave Pion holding the offer for good: every later offer of that
@@ -87,6 +98,8 @@ func (c *Conn) HandleOffer(ctx context.Context, pc PCKind, gen, neg uint32, sdp 
 func (c *Conn) handleOffer(ctx context.Context, kind PCKind, gen, neg uint32, raw string, tracks []TrackBinding,
 ) (string, error) {
 	switch {
+	case kind > PCSub:
+		return "", newError(CodePCLimit, "a connection has one pub and one sub PC: there is no third")
 	case kind != PCPub:
 		return "", newError(CodeBadPC, "an offer is only valid for the pub PC")
 	case !c.role.canPublish():
@@ -108,12 +121,14 @@ func (c *Conn) handleOffer(ctx context.Context, kind PCKind, gen, neg uint32, ra
 		return "", newError(CodeBadSDP, "the pub PC takes no more offers: an earlier one failed inside Pion")
 	}
 
-	// Step 1: validate, and drop the candidates the server must not probe (02 §7.3).
+	// Step 1: validate, and drop the candidates the server must not probe (02 §7.3) and those past the 64 addresses of
+	// this PC and gen (02 §12). What the offer's candidates use of the 64 counts only once Pion has taken the offer.
 	offer, err := checkPubOffer(raw, tracks, c.ownsShare)
 	if err != nil {
 		return "", err
 	}
-	filtered, dropped, err := c.sfu.apis.filter.filterSDP(raw)
+	budget := c.cands[PCPub].forGen(gen)
+	filtered, dropped, err := c.sfu.apis.filter.limitSDP(raw, budget.admit)
 	if err != nil {
 		return "", err
 	}
@@ -123,9 +138,12 @@ func (c *Conn) handleOffer(ctx context.Context, kind PCKind, gen, neg uint32, ra
 
 	// Step 2: the PC of this gen. A new one replaces the old one only once it has taken the offer, so an offer of a new
 	// gen that Pion refuses changes nothing: the new PC goes and the old one stays. The current PC has no such way
-	// back (offerFailed).
+	// back (offerFailed). Every PC made here counts as one the client caused, whether or not Pion takes its offer.
 	p := cur
 	if gen > c.pubGen {
+		if err := c.admitPC(PCPub); err != nil {
+			return "", err
+		}
 		if p, err = c.newPubPC(gen); err != nil {
 			c.log.Warn("pub PC not created", "err", err)
 			return "", newError(CodeInternal, "the pub PC could not be created")
@@ -143,19 +161,20 @@ func (c *Conn) handleOffer(ctx context.Context, kind PCKind, gen, neg uint32, ra
 	}
 	if p != cur {
 		if cur != nil {
+			// The old PC's tracks end here: the shares they fed are stalled until the new PC's tracks bring a keyframe.
 			c.log.Info("pub PC replaced", "gen", gen, "old_gen", cur.gen)
-			c.pub = nil
-			cur.close(c.log)
+			c.dropPub()
 		}
 		c.pub, c.pubGen = p, gen
-		c.resetCandidates(PCPub, gen)
+		// The client can start ICE and DTLS as soon as it has the answer.
+		c.startHandshake(PCPub, gen, p.pc, &p.pcState)
 	}
 	p.bound = make(map[string]TrackBinding, len(offer.sections))
 	for _, sec := range offer.sections {
 		p.bound[sec.mid] = TrackBinding{MID: sec.mid, Share: sec.share, Kind: sec.kind}
 	}
 	c.rebindTracks(p)
-	c.flushCandidates(PCPub, gen, p.pc)
+	c.commitCandidates(PCPub, budget, p.pc)
 
 	// Step 3, the codec filter by room policy (SetCodecPreferences on each video transceiver), is README S69's: until
 	// then the policy is always high, which allows all five profiles.
@@ -237,9 +256,10 @@ func (c *Conn) newPubPC(gen uint32) (*pubPC, error) {
 	return p, nil
 }
 
-// close detaches the PC's tracks from their shares, closes the PeerConnection and waits for the track readers, which
-// end when their reads fail.
+// close stops the PC's timers, detaches its tracks from their shares, closes the PeerConnection and waits for the
+// track readers, which end when their reads fail.
 func (p *pubPC) close(log *slog.Logger) {
+	p.stopTimers()
 	for _, t := range p.tracks {
 		t.detach()
 	}
@@ -256,6 +276,13 @@ func (p *pubPC) close(log *slog.Logger) {
 func (c *Conn) onPubTrack(p *pubPC, track *webrtc.TrackRemote, recv *webrtc.RTPReceiver) {
 	if c.pub != p {
 		return // p was replaced or closed: its tracks have ended
+	}
+	// A track arrives on a connected PC, but Pion's callbacks come in no order: if the actor hasn't seen that state
+	// yet, it looks now. Otherwise the keyframe this track starts with would find the PC still "away", and a stalled
+	// share would have to wait for the next one (Share.keyframe).
+	c.onPCState(PCPub, p.gen, p.pc)
+	if c.pub != p {
+		return // that look found p closed
 	}
 	mid := ""
 	for _, tr := range p.pc.GetTransceivers() {

@@ -619,10 +619,12 @@ func TestPubOfferGenAndNeg(t *testing.T) {
 	if err := sig.WaitPCState(ctx, sfu.PCPub, 2, "connected"); err != nil {
 		t.Fatal(err)
 	}
-	// The share went live on the first PC and stays so in this slice; the stalled state between two pub PCs is README
-	// S57's.
-	info := waitShare(t, h.SFU, share, func(i sfu.ShareInfo) bool { return len(i.Layers) == 2 && i.Audio })
-	if info.ID != share || info.State != sfu.ShareLive {
+	// The share went live on the first PC, was stalled between the two (TestPubPCRebuild) and is live again with the
+	// first keyframe of the new one.
+	info := waitShare(t, h.SFU, share, func(i sfu.ShareInfo) bool {
+		return len(i.Layers) == 2 && i.Audio && i.State == sfu.ShareLive
+	})
+	if info.ID != share {
 		t.Errorf("the share after the rebuild = %+v", info)
 	}
 	stale(1, 3) // the old gen is over, whatever its neg
@@ -648,7 +650,9 @@ func TestPubOfferGenAndNeg(t *testing.T) {
 	if err := sig.WaitPCState(ctx, sfu.PCPub, 2, "closed"); err != nil {
 		t.Fatalf("%v (events %+v)", err, sig.Events())
 	}
-	waitShare(t, h.SFU, share, func(i sfu.ShareInfo) bool { return len(i.Layers) == 0 && !i.Audio })
+	waitShare(t, h.SFU, share, func(i sfu.ShareInfo) bool {
+		return len(i.Layers) == 0 && !i.Audio && i.State == sfu.ShareStalled
+	})
 	_, err = conn.HandleOffer(ctx, sfu.PCPub, 2, 2, offer.SDP, bindings)
 	wantCode(t, err, sfu.CodeBadPC)
 	stale(1, 1)
@@ -1244,9 +1248,10 @@ func TestSubNegotiation(t *testing.T) {
 	}
 }
 
-// TestSubPCClosedByClient: a viewer closes its sub PC (Pion closes the server side on the DTLS close_notify). The
-// SFU reports it and offers nothing more on that PC; the Conn and its subscriptions stay. Building a new sub PC from
-// closed is README S57's, so until then a new subscription fails with a retryable sfu.internal.
+// TestSubPCClosedByClient: a viewer closes its sub PC (Pion closes the server side on the DTLS close_notify: 02 §5.3
+// keeps that). The SFU reports it and offers nothing more on that PC; the Conn and its subscriptions stay, and a
+// subscription whose share ends just goes. When the client asks for something again, here with a new subscription,
+// the Conn gets a new sub PC with the next gen (TestSubPCRebuild has the other ways out of closed).
 func TestSubPCClosedByClient(t *testing.T) {
 	h := newHarness(t, sfutest.HarnessOptions{})
 	ctx := testCtx(t)
@@ -1267,22 +1272,18 @@ func TestSubPCClosedByClient(t *testing.T) {
 	eventually(t, func() bool { return viewer.PC().ConnectionState() == webrtc.PeerConnectionStateConnected },
 		func() string { return "the viewer's PC is " + viewer.PC().ConnectionState().String() })
 
-	if err := viewer.Close(); err != nil {
+	if err := viewer.PC().Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := sig.WaitPCState(ctx, sfu.PCSub, 1, "closed"); err != nil {
 		t.Fatalf("%v (events %+v)", err, sig.Events())
 	}
 	wantCode(t, viewConn.HandleAnswer(ctx, sfu.PCSub, 1, 1, "v=0"), sfu.CodeBadPC)
-	errs, err := viewConn.UpdateSubscriptions(ctx, []sfu.SubscriptionUpdate{{Share: "s_2", Video: sfu.QualityLow}})
-	if err != nil {
-		t.Fatal(err)
+	if err := viewConn.AddICECandidate(ctx, sfu.PCSub, 1, webrtc.ICECandidateInit{Candidate: "candidate:1 1 udp 1 127.0.0.1 9 typ host"}); err != nil {
+		t.Errorf("a candidate for the closed PC = %v, want it ignored", err)
 	}
-	wantCode(t, errs[0], sfu.CodeInternal)
-	if v, a, ok := h.SFU.FanOut("s_2"); !ok || v != 0 || a != 0 {
-		t.Errorf("FanOut(s_2) after the refused subscription = %d, %d, %v; want nothing left behind", v, a, ok)
-	}
-	// The share ends: the subscription goes, without an offer on the closed PC and without an error event.
+	// The share ends: the subscription goes, without an offer on the closed PC, without a new PC (nobody asked for
+	// anything) and without an error event.
 	if err := pubConn.StopShare(ctx, "s_1", sfu.EndReasonStopped); err != nil {
 		t.Fatal(err)
 	}
@@ -1294,20 +1295,46 @@ func TestSubPCClosedByClient(t *testing.T) {
 	if n := len(sig.Offers()); n != 1 {
 		t.Errorf("%d sub offers, want only the first: nothing is offered on a closed PC", n)
 	}
+	if st, err := viewConn.PC(ctx, sfu.PCSub); err != nil || st.Gen != 1 || !st.Closed {
+		t.Errorf("the sub PC = %+v, %v; want gen 1, closed, and no successor while the Conn has nothing to carry", st, err)
+	}
+
+	// A new subscription: the Conn needs a sub PC again, and gets the next gen with what it subscribes to now.
+	errs, err := viewConn.UpdateSubscriptions(ctx, []sfu.SubscriptionUpdate{{Share: "s_2", Video: sfu.QualityLow}})
+	if err != nil || errs[0] != nil {
+		t.Fatalf("a subscription on a Conn whose sub PC closed: %v, %v", errs, err)
+	}
+	offer, err := sig.WaitOffer(ctx, func(o sfutest.Offer) bool { return o.Gen == 2 })
+	if err != nil {
+		t.Fatalf("%v (offers %d)", err, len(sig.Offers()))
+	}
+	wantTracks := []sfu.TrackBinding{
+		{MID: "0", Share: "s_2", Kind: webrtc.RTPCodecTypeVideo}, {MID: "1", Share: "s_2", Kind: webrtc.RTPCodecTypeAudio},
+	}
+	if offer.Neg != 1 || !slices.Equal(offer.Tracks, wantTracks) {
+		t.Errorf("the new sub PC's offer: neg %d, tracks %+v; want neg 1 and %+v", offer.Neg, offer.Tracks, wantTracks)
+	}
+	if err := sig.WaitPCState(ctx, sfu.PCSub, 2, "connected"); err != nil {
+		t.Fatalf("%v (answer errors %v)", err, sig.Errs())
+	}
+	if v, a, ok := h.SFU.FanOut("s_2"); !ok || v != 1 || a != 1 {
+		t.Errorf("FanOut(s_2) = %d, %d, %v; want the viewer's two DownTracks", v, a, ok)
+	}
 	for _, ev := range sig.Events() {
 		if _, ok := ev.(sfu.ErrorEvent); ok {
 			t.Errorf("the viewer got %+v", ev)
 		}
 	}
-	if _, err := viewConn.Subscriptions(ctx); err != nil {
-		t.Errorf("the Conn after its sub PC closed: %v", err)
+	if errs := sig.Errs(); len(errs) != 0 {
+		t.Errorf("answering the sub offers: %v", errs)
 	}
 }
 
 // TestSubAnswerRefusedByPion: an answer that passes the SFU's checks but that Pion refuses after taking it is fatal
 // for the sub PC (02 §5.3, the closed row): Pion has no rollback, so the right answer could not be applied either.
-// The SFU closes the PC and offers nothing more on it; the Conn and its subscriptions stay for the rebuild, which is
-// README S57's. An answer the SFU's own checks refuse leaves the offer outstanding (TestSubNegotiation).
+// The SFU closes the PC and offers nothing more on it; the Conn and its subscriptions stay for the rebuild that the
+// client asks for after 01's sdp_invalid (01 §9 rule 8). An answer the SFU's own checks refuse leaves the offer
+// outstanding (TestSubNegotiation).
 func TestSubAnswerRefusedByPion(t *testing.T) {
 	h := newHarness(t, sfutest.HarnessOptions{})
 	ctx := testCtx(t)
@@ -1344,9 +1371,7 @@ func TestSubAnswerRefusedByPion(t *testing.T) {
 		t.Fatalf("%v (events %+v)", err, sig.Events())
 	}
 
-	// Like a sub PC the client closed: the subscription stays, a new one fails until the rebuild exists, and nothing
-	// more is offered.
-	wantCode(t, subscribe("s_2"), sfu.CodeInternal)
+	// Like a sub PC the client closed: the subscription stays, and nothing more is offered until the client asks.
 	time.Sleep(200 * time.Millisecond) // four debounce periods
 	if n := len(sig.Offers()); n != 1 {
 		t.Errorf("%d sub offers, want only the first: nothing is offered on a closed PC", n)
@@ -1363,6 +1388,38 @@ func TestSubAnswerRefusedByPion(t *testing.T) {
 			(!ok || st.PC != sfu.PCSub || st.Gen != 1 || st.State != "closed") {
 			t.Errorf("the viewer got %+v, want only the closed state: HandleAnswer returned the error", ev)
 		}
+	}
+
+	// The Conn gets a new sub PC when its client asks for something again: here a subscription (the client's own
+	// answer to sdp_invalid, pc.restart{sub, rebuild}, is TestSubPCRebuild's). Gen 2 carries the subscription that
+	// waited and the new one, and the right kind of answer connects it.
+	if err := subscribe("s_2"); err != nil {
+		t.Fatalf("a subscription while the sub PC is closed: %v", err)
+	}
+	second, err := sig.WaitOffer(ctx, func(o sfutest.Offer) bool { return o.Gen == 2 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bound []sfu.ShareID
+	for _, b := range second.Tracks {
+		bound = append(bound, b.Share)
+	}
+	if second.Neg != 1 || !slices.Equal(bound, []sfu.ShareID{"s_1", "s_1", "s_2", "s_2"}) {
+		t.Errorf("the new sub PC's offer: neg %d, binding %v; want neg 1 with both subscriptions", second.Neg, bound)
+	}
+	if err := viewer.Rebuild(); err != nil {
+		t.Fatal(err)
+	}
+	answer, err = viewer.Answer(ctx, webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: second.SDP})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCode(t, viewConn.HandleAnswer(ctx, sfu.PCSub, 1, 1, answer.SDP), sfu.CodeStaleAnswer) // gen 1 is over
+	if err := viewConn.HandleAnswer(ctx, sfu.PCSub, 2, 1, answer.SDP); err != nil {
+		t.Fatalf("the answer to the new sub PC's offer: %v", err)
+	}
+	if err := sig.WaitPCState(ctx, sfu.PCSub, 2, "connected"); err != nil {
+		t.Fatal(err)
 	}
 }
 

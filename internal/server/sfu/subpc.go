@@ -3,6 +3,7 @@ package sfu
 import (
 	"context"
 	"log/slog"
+	"maps"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -13,12 +14,13 @@ import (
 )
 
 // subPC is a Conn's subscribe PeerConnection of one generation (02 §5.3): the SFU always offers, so there is never
-// glare. Its negotiation is the state machine of 02 §5.3: idle or offering, with changes made while an offer is
-// outstanding folded into one follow-up offer. Everything but ready belongs to the Conn's actor.
+// glare. Its negotiation is the state machine of 02 §5.3. It is idle or offering, with changes made while an offer
+// is outstanding folded into one follow-up offer; an offer without an answer goes out again every 15 s; an ICE
+// restart is one more reason for an offer, with new ICE credentials; and it is closed for good once its
+// PeerConnection is, until the Conn builds its successor with the next gen (rebuildSub). Everything but ready belongs
+// to the Conn's actor.
 //
-// So far it has the states idle and offering, the 50 ms debounce, the answer, and the reuse of the m-sections of
-// ended shares. README S57 adds the rest of the table: the 15 s re-send, ICE restarts, ResetPC and the rebuild from
-// closed; S69 the codec rebuilds.
+// README S69 adds the codec rebuilds.
 type subPC struct {
 	gen uint32
 	pc  *webrtc.PeerConnection
@@ -31,18 +33,30 @@ type subPC struct {
 	// them when the PC closes.
 	readers sync.WaitGroup
 
-	// closed: the PeerConnection is closed, by Pion because the client closed its side, or by the SFU after a fatal
-	// error (subFatal). Nothing is offered on it any more, and no offer is outstanding or waiting (markClosed); README
-	// S57 replaces it with a new gen when the Conn needs a sub PC again (02 §5.3, the closed row).
+	// pcState has the last connection state handled, the handshake timeout and the grace after failed.
+	pcState
+
+	// closed: the PeerConnection is closed: by Pion because the client closed its side, or by the SFU after a fatal
+	// error (subFatal), a handshake that took too long, 30 s of failed, or because signal said so (ClosePC, ResetPC
+	// without subscriptions). Nothing is offered on it any more, and no offer is outstanding or waiting (markClosed).
+	// It stays the Conn's sub PC until the Conn needs one again: ResetPC, RestartICE, Resync and a subscription change
+	// then build its successor with the next gen (02 §5.3, the closed row).
 	closed   bool
 	neg      uint32      // the last offer's neg; 0 before the first
 	offering bool        // an offer is outstanding: neg is waiting for its answer
 	dirty    bool        // something changed while offering: offer again after the answer
 	debounce *time.Timer // a change is waiting for its offer; nil when none is
-	// offer is the last offer sent, as sent: what Resync and the 15 s re-send repeat while offering (README S57).
+	// offer is the last offer sent, as sent: what Resync and the 15 s re-send repeat while offering.
 	offer subOffer
-	// lastState is the last connection state onPCState handled, so that each state is reported once.
-	lastState webrtc.PeerConnectionState
+	// resend sends the outstanding offer again every 15 s; it runs while offering.
+	resend actorTimer
+	// answered: the client has answered an offer of this PC, so ICE has started.
+	answered bool
+	// restartQueued: an ICE restart waits for its offer, behind the debounce or the answer to the outstanding offer.
+	restartQueued bool
+	// restartAt is the monoNow at which the last ICE-restart offer went out, and 0 once ICE has connected or failed
+	// since, or before the first: within 5 s of it a restart is still under way (requestICERestart).
+	restartAt int64
 
 	// spares are the transceivers whose DownTrack has left (its share ended): their m-sections stay in the SDP for
 	// good, and the next DownTrack of the kind takes one over instead of adding a new one, so the SDP doesn't grow
@@ -70,13 +84,24 @@ type subOffer struct {
 	neg    uint32
 	sdp    string
 	tracks []TrackBinding
+	// restart: the offer restarts ICE. Until its answer arrives, that restart is still under way.
+	restart bool
 }
 
-// ensureSubPC returns the Conn's sub PC, creating the first one (gen 1) when a subscription needs it.
+// ensureSubPC returns the Conn's sub PC, creating the first one (gen 1) when a subscription needs it. It may be a
+// closed one: its successor is rebuildSub's.
 func (c *Conn) ensureSubPC() (*subPC, error) {
 	if c.sub != nil {
 		return c.sub, nil
 	}
+	// The Conn's first sub PC is one of the PCs its client caused, and never one too many (02 §12).
+	c.pcs[PCSub].admit(monoNow(), c.sfu.timing.pcWindow)
+	return c.newSubPC()
+}
+
+// newSubPC creates the Conn's sub PC of the next gen and makes it the current one. Its Pion callback only posts to
+// the actor (02 §5.4).
+func (c *Conn) newSubPC() (*subPC, error) {
 	pc, err := c.sfu.apis.sub.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		c.log.Warn("sub PC not created", "err", err)
@@ -90,8 +115,61 @@ func (c *Conn) ensureSubPC() (*subPC, error) {
 		c.post(func() { c.onPCState(PCSub, gen, pc) })
 	})
 	c.sub = s
-	c.resetCandidates(PCSub, gen)
+	c.cands[PCSub] = remoteCandidates{gen: gen}
 	return s, nil
+}
+
+// rebuildSub replaces the Conn's sub PC with one of the next gen that carries every subscription, and offers it at
+// once as neg 1 (02 §5.3): what ResetPC does, and the way out of the closed state. The old PC is closed first, which
+// unbinds its DownTracks; nothing more is reported about it, because it is no longer the Conn's sub PC when its
+// closed state arrives. The DownTracks keep their place in their viewer's streams: each goes on, with a new SSRC,
+// when the new PC is connected and the keyframe it asks for then has come.
+//
+// If the new PeerConnection can't be made, the Conn keeps the old one, closed, and the next request tries again.
+func (c *Conn) rebuildSub(cause string) error {
+	if old := c.sub; old != nil {
+		old.lastState = webrtc.PeerConnectionStateClosed
+		old.close(c.log)
+	}
+	for _, sub := range c.subs {
+		for _, dt := range sub.tracks() {
+			dt.sender, dt.transceiver = nil, nil
+		}
+	}
+	s, err := c.newSubPC()
+	if err != nil {
+		return err
+	}
+	c.log.Info("sub PC rebuilt", "gen", s.gen, "cause", cause, "subscriptions", len(c.subs))
+	for _, id := range slices.Sorted(maps.Keys(c.subs)) {
+		for _, dt := range c.subs[id].tracks() {
+			if err := s.addTrack(dt, c.log); err != nil {
+				c.log.Warn("DownTrack not added to the rebuilt sub PC", "share_id", string(id), "err", err)
+				c.subFatal(s)
+				return newError(CodeInternal, "the rebuilt sub PC refused a track")
+			}
+		}
+	}
+	c.offerSub(s)
+	return nil
+}
+
+// rebuildClosedSub builds the successor of the Conn's closed sub PC when the Conn has subscriptions for it to carry
+// (02 §5.3, the closed row), and does nothing when it has none. Every such PC counts as one the client caused
+// (02 §12): it follows a PC that the client closed or made the SFU close, at the client's next request. One too many
+// in a minute isn't built, and the subscriptions wait for the next request; the error says so (sfu.pc_rate_limited),
+// for the callers that have a client to tell.
+func (c *Conn) rebuildClosedSub(cause string, explicit bool) error {
+	if len(c.subs) == 0 {
+		return nil
+	}
+	if err := c.admitPC(PCSub); err != nil {
+		if !explicit {
+			c.log.Debug("closed sub PC not rebuilt yet", "cause", cause)
+		}
+		return err
+	}
+	return c.rebuildSub(cause)
 }
 
 // addTrack puts dt on the sub PC: on the free transceiver of an ended share when there is one of its kind
@@ -187,7 +265,8 @@ func (s *subPC) takeSpare(dt *DownTrack, log *slog.Logger) (*webrtc.RTPTransceiv
 }
 
 // removeTrack stops dt's sender, which makes its m-section inactive in the next offer, and keeps the transceiver as
-// a spare for a later DownTrack.
+// a spare for a later DownTrack. A DownTrack that never got onto this PC (its subscription was made while the PC was
+// closed) has no sender to stop.
 func (s *subPC) removeTrack(dt *DownTrack, log *slog.Logger) {
 	if dt.sender == nil {
 		return
@@ -258,8 +337,9 @@ func (s *subPC) bindings() []TrackBinding {
 // (onPCState). The gate opens when the PC is connected. It stays as it is while the PC is disconnected: the selected
 // pair is still there, packets may get through, and ICE often recovers by itself. In every other state it is closed:
 // a failed or closed PC sends nothing, and Pion takes what is written to it without an error for as long as it stays
-// that way, as it does before DTLS is up; a PC that is connecting again (an ICE restart, README S57) opens the gate
-// anew when it is connected, with a keyframe request for each video DownTrack.
+// that way, as it does before DTLS is up; a PC that is connecting again (an ICE restart: Pion drops the selected
+// pair when the restart's offer is made) opens the gate anew when it is connected, with a keyframe request for each
+// video DownTrack.
 func (s *subPC) follow(state webrtc.PeerConnectionState) {
 	switch state {
 	case webrtc.PeerConnectionStateConnected:
@@ -270,20 +350,22 @@ func (s *subPC) follow(state webrtc.PeerConnectionState) {
 	}
 }
 
-// markClosed puts s into the closed state of 02 §5.3: no offer is outstanding or waiting, and none follows. Its
-// gate is shut for good.
+// markClosed puts s into the closed state of 02 §5.3: no offer is outstanding or waiting, none follows, and no timer
+// runs. Its gate is shut for good.
 func (s *subPC) markClosed() {
 	s.closed = true
 	s.ready.Store(false)
-	s.offering, s.dirty = false, false
+	s.offering, s.dirty, s.restartQueued, s.restartAt = false, false, false, 0
 	if s.debounce != nil {
 		s.debounce.Stop()
 		s.debounce = nil
 	}
+	s.resend.stop()
+	s.stopTimers()
 }
 
-// close stops the debounce timer, closes the PeerConnection and waits for the RTCP readers of its DownTracks, which
-// end when Pion stops their senders.
+// close stops the timers, closes the PeerConnection and waits for the RTCP readers of its DownTracks, which end when
+// Pion stops their senders.
 func (s *subPC) close(log *slog.Logger) {
 	s.markClosed()
 	if err := s.pc.Close(); err != nil {
@@ -294,15 +376,16 @@ func (s *subPC) close(log *slog.Logger) {
 
 // subFatal closes sub PC s after an error it can't negotiate past: an offer Pion couldn't make or set, or an answer
 // Pion refused (it keeps the answer it refused, has no rollback, and so takes no other one). This is the "fatal
-// error" of 02 §5.3's closed row: s stays the Conn's sub PC, closed, with the Conn's subscriptions intact, and README
-// S57 builds its successor (gen + 1) on ResetPC, RestartICE, Resync or the next subscription change. The caller
-// tells the client; Pion's closed state follows as a PCStateEvent.
+// error" of 02 §5.3's closed row: s stays the Conn's sub PC, closed, with the Conn's subscriptions intact, and its
+// successor (gen + 1) follows ResetPC, RestartICE, Resync or the next subscription change. The caller tells the
+// client; Pion's closed state follows as a PCStateEvent.
 func (c *Conn) subFatal(s *subPC) {
 	s.close(c.log)
 }
 
-// subChanged notes that the sub PC's tracks changed (02 §5.3): while idle it starts the 50 ms debounce, so one user
-// action that changes several subscriptions makes one offer; while an offer is outstanding it marks the PC dirty.
+// subChanged notes that the sub PC needs a new offer (02 §5.3): its tracks changed, or an ICE restart was asked for
+// (requestICERestart). While idle it starts the 50 ms debounce, so one user action that changes several
+// subscriptions makes one offer; while an offer is outstanding it marks the PC dirty.
 func (c *Conn) subChanged() {
 	s := c.sub
 	switch {
@@ -321,11 +404,44 @@ func (c *Conn) subChanged() {
 	}
 }
 
+// restartSubICE asks for an ICE restart of sub PC s: for the client (RestartICE), or on a resume for a PC that isn't
+// connected (Resync). A PC whose first offer has no answer yet has no ICE to restart: that offer starts it. And one
+// restart runs at a time (02 §5.3): the usual case after a network switch is that the client's request and the
+// resume both ask, within moments, and a second restart would throw away the checks already under way.
+func (c *Conn) restartSubICE(s *subPC, cause string) {
+	switch {
+	case !s.answered:
+		c.log.Debug("sub ICE restart skipped: the first offer is still out", "gen", s.gen, "cause", cause)
+	case s.restartUnderWay(monoNow(), c.sfu.timing.iceRestart):
+		c.log.Debug("sub ICE restart skipped: one is under way", "gen", s.gen, "cause", cause)
+	default:
+		c.log.Info("sub ICE restart", "gen", s.gen, "cause", cause)
+		s.restartQueued = true
+		c.subChanged()
+	}
+}
+
+// restartUnderWay reports whether an ICE restart of s is under way at now (02 §5.3): one is waiting for its offer,
+// its offer has no answer yet, or its offer went out less than spacing ago and ICE has neither connected nor failed
+// since (onPCState).
+func (s *subPC) restartUnderWay(now int64, spacing time.Duration) bool {
+	switch {
+	case s.restartQueued, s.offering && s.offer.restart:
+		return true
+	default:
+		return s.restartAt != 0 && time.Duration(now-s.restartAt) < spacing
+	}
+}
+
 // offerSub creates the next offer of s, sets it with every candidate in it (the SFU never trickles) and sends it
-// with its tracks binding. A failure is fatal for s (subFatal): an idle PC whose change was never offered would
-// leave the viewer without those tracks until something else changed. The client hears of it as an ErrorEvent with
-// sfu.internal, which is 01's retryable `internal`, not sdp_invalid: no rule of 01 has the client ask for a rebuild
-// on it, so the tracks come back with the sub PC that README S57 builds from the closed state.
+// with its tracks binding. When an ICE restart is waiting, the offer is the restart: Pion gathers anew and the offer
+// carries new ICE credentials, which is how the client knows it (01 §10.4). From the moment Pion makes that offer
+// the PC has no selected pair, so nothing flows until the client has answered and ICE is connected again.
+//
+// A failure is fatal for s (subFatal): an idle PC whose change was never offered would leave the viewer without
+// those tracks until something else changed. The client hears of it as an ErrorEvent with sfu.internal, which is
+// 01's retryable `internal`, not sdp_invalid: no rule of 01 has the client ask for a rebuild on it, so the tracks
+// come back with the sub PC that the Conn's next request builds from the closed state.
 func (c *Conn) offerSub(s *subPC) {
 	if s.closed {
 		return
@@ -335,7 +451,12 @@ func (c *Conn) offerSub(s *subPC) {
 		c.subFatal(s)
 		c.sig.SendEvent(ErrorEvent{Err: newError(CodeInternal, "the sub offer could not be "+what), Scope: ScopePCSub})
 	}
-	offer, err := s.pc.CreateOffer(nil)
+	restart := s.restartQueued
+	var opts *webrtc.OfferOptions
+	if restart {
+		opts = &webrtc.OfferOptions{ICERestart: true}
+	}
+	offer, err := s.pc.CreateOffer(opts)
 	if err != nil {
 		fail("created", err)
 		return
@@ -351,19 +472,36 @@ func (c *Conn) offerSub(s *subPC) {
 		c.log.Warn("ICE gathering did not finish in time; the sub offer may lack candidates", "gen", s.gen)
 	}
 	s.neg++
-	s.offering, s.dirty = true, false
+	s.offering, s.dirty, s.restartQueued = true, false, false
+	if restart {
+		s.restartAt = max(monoNow(), 1)
+	}
 	s.sparesOffered(s.neg)
-	s.offer = subOffer{neg: s.neg, sdp: local, tracks: s.bindings()}
-	c.sig.SendOffer(PCSub, s.gen, s.neg, s.offer.sdp, s.offer.tracks)
+	s.offer = subOffer{neg: s.neg, sdp: local, tracks: s.bindings(), restart: restart}
+	c.sendSubOffer(s)
+}
+
+// sendSubOffer sends the outstanding offer of s, for the first time or again, and sets the timer that sends it once
+// more if no answer comes within 15 s (02 §5.3): the same offer, with the same gen and neg.
+func (c *Conn) sendSubOffer(s *subPC) {
+	c.sig.SendOffer(PCSub, s.gen, s.offer.neg, s.offer.sdp, s.offer.tracks)
+	c.after(&s.resend, c.sfu.timing.offerResend, func() {
+		if c.sub == s && s.offering && !s.closed {
+			c.log.Debug("sub offer sent again: no answer yet", "gen", s.gen, "neg", s.offer.neg)
+			c.sendSubOffer(s)
+		}
+	})
 }
 
 // HandleAnswer applies the client's answer to the outstanding sub offer. Its gen and neg must be that offer's:
 // anything else is sfu.stale_answer, which 01's sfuplane drops silently. If something changed while the offer was
-// outstanding, the next offer follows at once. Answers are only valid for PCSub.
+// outstanding, or an ICE restart was asked for, the next offer follows at once. Answers are only valid for PCSub.
 //
 // An answer the SFU's own checks refuse (sfu.bad_sdp) leaves the offer outstanding. One that Pion refuses is
 // sfu.bad_sdp too, and closes the sub PC (subFatal): the client asks for a rebuild after 01's sdp_invalid anyway
 // (01 §9 rule 8), and every later answer for this gen is sfu.bad_pc.
+//
+// The first answer of a sub PC starts its handshake: 10 s to get connected (02 §12).
 func (c *Conn) HandleAnswer(ctx context.Context, pc PCKind, gen, neg uint32, sdp string) error {
 	return c.do(ctx, func(context.Context) error { return c.handleAnswer(pc, gen, neg, sdp) })
 }
@@ -384,7 +522,8 @@ func (c *Conn) handleAnswer(kind PCKind, gen, neg uint32, raw string) error {
 	if _, err := checkSubAnswer(raw); err != nil {
 		return err
 	}
-	filtered, dropped, err := c.sfu.apis.filter.filterSDP(raw)
+	budget := c.cands[PCSub].forGen(gen)
+	filtered, dropped, err := c.sfu.apis.filter.limitSDP(raw, budget.admit)
 	if err != nil {
 		return err
 	}
@@ -401,10 +540,15 @@ func (c *Conn) handleAnswer(kind PCKind, gen, neg uint32, raw string) error {
 		c.subFatal(s)
 		return newError(CodeBadSDP, "the sub answer can't be applied")
 	}
-	c.flushCandidates(PCSub, gen, s.pc)
+	c.commitCandidates(PCSub, budget, s.pc)
 	s.offering = false
+	s.resend.stop()
+	if !s.answered {
+		s.answered = true
+		c.startHandshake(PCSub, gen, s.pc, &s.pcState)
+	}
 	s.sparesAnswered(neg, filtered)
-	if s.dirty {
+	if s.dirty || s.restartQueued {
 		c.offerSub(s)
 	}
 	return nil

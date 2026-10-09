@@ -66,13 +66,25 @@ type QualityHintEvent struct {
 	Encodings []EncodingParams
 }
 
-// PCStateEvent reports a state of the Conn's current PC of a kind; never of one a higher gen already replaced.
+// PCStateEvent reports a state of the Conn's current PC of a kind; never of one a higher gen already replaced, and
+// never the closed state of one the SFU closed because signal asked (ClosePC, ResetPC).
+//
+// A state with a Reason is the SFU's own doing, and the last event about that PC: failed with
+// PCReasonHandshakeTimeout for a new PC that wasn't connected within 10 s, and closed with PCReasonGraceExpired for
+// one that stayed failed for 30 s. The SFU has closed the PC in both cases. For a pub PC, failed (with or without a
+// reason) is what 01's sfuplane turns into pc.restart{pub, rebuild}.
 type PCStateEvent struct {
 	PC     PCKind
 	Gen    uint32 // generation of the PC this state belongs to
 	State  string // "connected" "disconnected" "failed" "closed"
-	Reason string // "" | "handshake_timeout" | "pc_grace_expired"
+	Reason string // "" | PCReasonHandshakeTimeout | PCReasonGraceExpired
 }
+
+// PCStateEvent reasons.
+const (
+	PCReasonHandshakeTimeout = "handshake_timeout"
+	PCReasonGraceExpired     = "pc_grace_expired"
+)
 
 // ErrorEvent reports a failure that no call returns, for example a sub offer that couldn't be created.
 type ErrorEvent struct {
