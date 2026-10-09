@@ -1,0 +1,4 @@
+[isshoni]
+title=isshoni
+description=isshoni screen sharing server (HTTPS, ACME, WebRTC media)
+ports=80,443,7882/tcp|7882/udp
