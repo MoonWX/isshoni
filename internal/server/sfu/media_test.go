@@ -133,9 +133,11 @@ func testShare(t *testing.T, s *SFU, id ShareID) *Share {
 	return s.lookupShare(id)
 }
 
-// testLayer attaches a Layer to sh as a pub PC's track would, with a recorder in place of the pub PC.
+// testLayer attaches a Layer to sh as a pub PC's track would, with a recorder in place of the pub PC. A track
+// arrives on a connected pub PC, so the publishing Conn counts as having one from now on (Conn.pubUp).
 func testLayer(t *testing.T, sh *Share, slot Slot, ssrc uint32) (*Layer, *rtcpRecorder) {
 	t.Helper()
+	sh.conn.pubUp.Store(true)
 	kind := webrtc.RTPCodecTypeVideo
 	if slot == SlotAudio {
 		kind = webrtc.RTPCodecTypeAudio
@@ -190,7 +192,7 @@ func testDownTrack(t *testing.T, viewer *Conn, sh *Share, kind webrtc.RTPCodecTy
 	pc := &subPC{gen: 1}
 	pc.ready.Store(true)
 	w := &captureWriter{}
-	b := &binding{pc: pc, writer: w, ssrc: 0x7000, ptFor: chromePTs, absSendTimeID: 3}
+	b := &binding{id: fakeTrackContext{}.ID(), pc: pc, writer: w, ssrc: 0x7000, ptFor: chromePTs, absSendTimeID: 3}
 	if kind == webrtc.RTPCodecTypeAudio {
 		b.ssrc, b.ptFor, b.absSendTimeID = 0x7001, map[ProfileKey]uint8{"": 111}, 0
 	}
@@ -710,7 +712,7 @@ func TestDownTrackWrite(t *testing.T) {
 	}
 	// Unbind: the track is no longer forwarded, and what the viewer was getting is over. Bound again, the stream
 	// starts on a keyframe start, not in the middle of the old one.
-	if err := d.Unbind(nil); err != nil || d.forwarding.Load() || d.binding.Load() != nil || len(sh.viewers()) != 0 {
+	if err := d.Unbind(fakeTrackContext{}); err != nil || d.forwarding.Load() || d.binding.Load() != nil || len(sh.viewers()) != 0 {
 		t.Errorf("Unbind: %v, forwarding %v, viewers %v", err, d.forwarding.Load(), sh.viewers())
 	}
 	w.err = nil
@@ -813,8 +815,8 @@ func TestDownTrackUnsentMidStream(t *testing.T) {
 
 	// A new binding (the track on a rebuilt sub PC, say) has sent nothing yet: there a taken packet is a lost start.
 	next := *d.binding.Load()
-	if err := d.Unbind(nil); err != nil {
-		t.Fatal(err)
+	if err := d.Unbind(fakeTrackContext{}); err != nil || d.binding.Load() != nil {
+		t.Fatalf("Unbind: %v, still bound: %v", err, d.binding.Load() != nil)
 	}
 	d.binding.Store(&next)
 	w.taken = 1
@@ -1303,7 +1305,8 @@ func TestShareUpdates(t *testing.T) {
 	}
 
 	// State changes are never merged away: two between two reports are both reported, in order, each with the share
-	// as it was. (Stalled is README S57's; the queue doesn't care which states it carries.)
+	// as it was. (How a share gets stalled and live again is TestShareStalled's; the queue doesn't care which states
+	// it carries.)
 	sh.mu.Lock()
 	sh.state = ShareStalled
 	sh.stateChangedLocked()

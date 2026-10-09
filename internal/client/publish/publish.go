@@ -307,7 +307,21 @@ func (p *Publisher) PC() *webrtc.PeerConnection { return p.pc }
 // What it returns is the copy to send, which differs from the local description in a re-offer of simulcast video:
 // see sendOnlySimulcast.
 func (p *Publisher) Offer(ctx context.Context) (webrtc.SessionDescription, error) {
-	offer, err := p.pc.CreateOffer(nil)
+	return p.offer(ctx, nil)
+}
+
+// OfferICERestart is Offer for an ICE restart: the offer has new ICE credentials and newly gathered candidates, and
+// the SFU's answer brings its own new ones. It is how a client recovers a publish PeerConnection whose ICE has been
+// disconnected for 3 s (01 §10.4): the next neg of the same gen, with the tracks and their SSRCs as they are. Pion
+// drops the selected candidate pair when it makes the offer, so nothing is sent until ICE is connected again; the
+// send loop goes on pulling from the Source meanwhile, and the SFU asks for a keyframe when it sees the
+// PeerConnection connected.
+func (p *Publisher) OfferICERestart(ctx context.Context) (webrtc.SessionDescription, error) {
+	return p.offer(ctx, &webrtc.OfferOptions{ICERestart: true})
+}
+
+func (p *Publisher) offer(ctx context.Context, opts *webrtc.OfferOptions) (webrtc.SessionDescription, error) {
+	offer, err := p.pc.CreateOffer(opts)
 	if err != nil {
 		return webrtc.SessionDescription{}, fmt.Errorf("publish: create offer: %w", err)
 	}

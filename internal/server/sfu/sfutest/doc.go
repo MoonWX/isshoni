@@ -9,18 +9,23 @@
 // CheckStartsOnSPS), plus the marker checks, the GOP bitrate and Viewer.AVOffset (flash against beep, both mapped to
 // NTP through the last sender reports). WithoutPartialTail and WithoutCutFrames leave out the frames that may be
 // short by design: the newest one of a running stream, and the old layer's last one at a layer switch. REMBs are
-// fixed values a test sends with Viewer.SendREMB.
+// fixed values a test sends with Viewer.SendREMB. Viewer.Rebuild gives it a new PeerConnection, as a client does
+// for a sub PC of a new gen; an offer with new ICE credentials restarts ICE on the one it has.
 //
 // FaultConn wraps a UDP socket to lose chosen datagrams or black-hole a peer; tests inject it as the SFU's socket
-// through 04's netx.TransportOptions.PacketConns, or under a Go client through webrtc.NewICEUDPMux.
+// through 04's netx.TransportOptions.PacketConns, or under a Go client through webrtc.NewICEUDPMux, which is how the
+// recovery tests take a client's network away.
 //
 // Harness is a real sfu.SFU on a loopback netx.Transport (UDP, and on request the ICE-TCP listener and 04's 443
 // multiplexer, all on ephemeral ports of 127.0.0.1), without a hub: each joined Conn gets a DirectSignaler, which
 // records the Conn's sub offers and events and can answer the offers with a Viewer (WaitAnswered tells when the Conn
-// has an answer), and a RoomEventLog records the SFU's RoomEvents with the time of each call. Publish runs a
-// publish.Publisher's side of a pub negotiation, the first one or a re-offer, with its tracks bound to a share
-// (Bindings). The SFU's in-process integration tests (02 §17) are written on these.
+// has an answer), and a RoomEventLog records the SFU's RoomEvents with the time of each call. The DirectSignaler
+// answers as a client does (01 §9): an offer of a new gen on a new PeerConnection, a repeated one with the answer
+// it gave before. SetDown stands in for a WebSocket that is down: what the Conn sends meanwhile is lost, and the
+// test calls Conn.Resync when it is back. Publish runs a publish.Publisher's side of a pub negotiation, the first
+// one or a re-offer, with its tracks bound to a share (Bindings); PublishICERestart, the re-offer that restarts ICE.
+// The SFU's in-process integration tests (02 §17) are written on these.
 //
 // Later slices add the rest of the package from 02 §4 and §17 with the first test that needs each part: a FaultConn
-// under the Harness's UDP socket (README S57, S63), REMB from the rembsim model and a FaultConn rate limit (S84).
+// under the Harness's UDP socket (README S63), REMB from the rembsim model and a FaultConn rate limit (S84).
 package sfutest

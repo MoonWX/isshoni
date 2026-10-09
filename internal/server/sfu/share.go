@@ -43,8 +43,9 @@ type Share struct {
 	dirty    bool
 	notified int64
 
-	// awaitsKeyframe is true while the share is pending: until its first keyframe, its video layers ask the publisher
-	// for one whenever another packet arrives (Layer.handleRTP). The layers' read loops read it without a lock.
+	// awaitsKeyframe is true while the share is pending or stalled: until the keyframe that makes it live, its video
+	// layers ask the publisher for one whenever another packet arrives (Layer.handleRTP). The layers' read loops read
+	// it without a lock.
 	awaitsKeyframe atomic.Bool
 
 	// The fan-out lists: the DownTracks of every subscription to this share, by kind. They are copied on write (under
@@ -199,16 +200,23 @@ func (s *Share) attach(l *Layer) (replaced *Layer, ok bool) {
 // what 02 §10.1 gives them without it, or pause. For a viewer who was getting l, the stream is over at once, and
 // goes on with a keyframe of the layer it falls back to: the publisher is asked for one here (02 §9.7), not only
 // when that layer's next packet comes, which on a still screen can take a second.
+//
+// A live share that loses its last video layer is stalled at once (02 §5.3): its pub PC closed, or a new gen
+// replaced it. The tracks of the next pub PC attach to the same share, and their first keyframe makes it live again.
 func (s *Share) detach(l *Layer) {
 	s.mu.Lock()
 	var (
-		moved []*Subscription
-		ask   []*Layer
+		moved   []*Subscription
+		ask     []*Layer
+		stalled bool
 	)
 	if s.layers[l.slot] == l {
 		s.layers[l.slot] = nil
 		s.changedLocked()
 		moved, ask = s.retargetLocked(l.kind, l)
+		if l.kind == webrtc.RTPCodecTypeVideo && !s.hasVideoLocked() {
+			stalled = s.stallLocked()
+		}
 	}
 	s.mu.Unlock()
 	now := monoNow()
@@ -218,6 +226,38 @@ func (s *Share) detach(l *Layer) {
 	for _, sub := range moved {
 		sub.changed()
 	}
+	if stalled {
+		s.conn.sfu.shareStateChanged(s, ShareStalled, "its video tracks have ended")
+	}
+}
+
+// hasVideoLocked reports whether a video layer is attached. s.mu is held.
+func (s *Share) hasVideoLocked() bool {
+	return s.layers[SlotF] != nil || s.layers[SlotH] != nil || s.layers[SlotQ] != nil
+}
+
+// stall makes a live share stalled (02 §5.3): its media has stopped, because its pub PC hasn't been connected for
+// 2 s (the ticker), has failed (Conn.stallShares), or is gone with every video track (detach). A share that is
+// pending, stalled already or ended stays as it is. The hub hears of it at once, and ends a share that stays
+// stalled for 30 s; the SFU only waits for the keyframe that makes the share live again.
+func (s *Share) stall(cause string) {
+	s.mu.Lock()
+	stalled := s.stallLocked()
+	s.mu.Unlock()
+	if stalled {
+		s.conn.sfu.shareStateChanged(s, ShareStalled, cause)
+	}
+}
+
+// stallLocked is stall with s.mu held, without telling anybody: it reports whether the state changed.
+func (s *Share) stallLocked() bool {
+	if s.ended || s.state != ShareLive {
+		return false
+	}
+	s.state = ShareStalled
+	s.awaitsKeyframe.Store(true)
+	s.stateChangedLocked()
+	return true
 }
 
 // presentLocked returns the slot bits of the layers attached now: what 02 §10.1 chooses among. A layer is there from
@@ -303,8 +343,14 @@ func (s *Share) requestKeyframe(slot Slot) {
 }
 
 // keyframe notes that a packet starting a keyframe arrived on video layer l, in the given profile (the layer's read
-// loop calls it). The first one makes a pending share live (02 §5.3); it reports whether this one did. The profile
+// loop calls it). The first one makes a pending share live, and a stalled share is live again with the first one
+// that arrives while its pub PC is connected (02 §5.3); it reports whether this one made the share live. The profile
 // of the newest keyframe is the share's. A Layer that was detached meanwhile changes nothing.
+//
+// "Connected" is what the publishing Conn's actor has seen of the PC (Conn.pubUp), the same view the stalled check
+// goes by, so the two can't disagree and flap. A keyframe that overtakes the actor's look at a PC that has just
+// reconnected isn't lost: the actor asks every layer of the PC for a keyframe when it sees the PC connected, and
+// until one makes the share live, each further packet asks again (Layer.handleRTP).
 func (s *Share) keyframe(l *Layer, profile ProfileKey) (wentLive bool) {
 	s.mu.Lock()
 	if s.ended || s.layers[l.slot] != l {
@@ -315,17 +361,21 @@ func (s *Share) keyframe(l *Layer, profile ProfileKey) (wentLive bool) {
 		s.profile = profile
 		s.changedLocked()
 	}
-	// SharePending is the only state a keyframe ends in this slice; README S57 adds stalled, which the first keyframe
-	// of a reconnected pub PC ends the same way.
-	if s.state == SharePending {
+	switch {
+	case s.state == SharePending:
 		s.state, s.liveAt = ShareLive, time.Now()
+		wentLive = true
+	case s.state == ShareStalled && s.conn.pubUp.Load():
+		s.state = ShareLive // liveAt stays: it is when the share first went live
+		wentLive = true
+	}
+	if wentLive {
 		s.awaitsKeyframe.Store(false)
 		s.stateChangedLocked()
-		wentLive = true
 	}
 	s.mu.Unlock()
 	if wentLive {
-		s.conn.sfu.shareLive(s)
+		s.conn.sfu.shareStateChanged(s, ShareLive, "")
 	}
 	return wentLive
 }

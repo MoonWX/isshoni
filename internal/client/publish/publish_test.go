@@ -333,8 +333,41 @@ func TestReoffer(t *testing.T) {
 	if err := p.SetAnswer(again); err != nil {
 		t.Errorf("the second answer: %v", err)
 	}
-	if tracks := p.Tracks(); len(tracks) != 3 || tracks[0].MID != tracks[1].MID || tracks[0].MID == "" {
+	tracks := p.Tracks()
+	if len(tracks) != 3 || tracks[0].MID != tracks[1].MID || tracks[0].MID == "" {
 		t.Errorf("tracks after the re-offer = %+v", tracks)
+	}
+
+	// An ICE restart is one more re-offer: new ICE credentials, and everything else as it was (01 §10.4).
+	ufrag := func(raw string) string {
+		for line := range strings.Lines(raw) {
+			if v, ok := strings.CutPrefix(strings.TrimSpace(line), "a=ice-ufrag:"); ok {
+				return v
+			}
+		}
+		t.Fatal("no a=ice-ufrag in the description")
+		return ""
+	}
+	restart, err := p.OfferICERestart(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ufrag(restart.SDP) == ufrag(second.SDP) || ufrag(second.SDP) != ufrag(first.SDP) {
+		t.Errorf("ICE user names: first %q, re-offer %q, restart %q; want only the restart's to be new", ufrag(first.SDP),
+			ufrag(second.SDP), ufrag(restart.SDP))
+	}
+	if got := rids(restart.SDP); !slices.Equal(got, sendSide) || !strings.Contains(restart.SDP, "a=candidate:") {
+		t.Errorf("the ICE-restart offer's rids = %v, want only the send side %v, and its candidates", got, sendSide)
+	}
+	last := answer(restart)
+	if ufrag(last.SDP) == ufrag(again.SDP) {
+		t.Error("the receiver answered the ICE restart with the ICE user name it had")
+	}
+	if err := p.SetAnswer(last); err != nil {
+		t.Errorf("the answer to the ICE-restart offer: %v", err)
+	}
+	if got := p.Tracks(); !slices.Equal(got, tracks) {
+		t.Errorf("tracks after the ICE restart = %+v, want them as before: %+v", got, tracks)
 	}
 }
 

@@ -129,6 +129,62 @@ func TestDirectSignaler(t *testing.T) {
 	}
 }
 
+// TestDirectSignalerDown: while the signaling is down, what the Conn sends is lost: offers are kept apart, events
+// are gone. What comes after it is back arrives as before.
+func TestDirectSignalerDown(t *testing.T) {
+	d := NewDirectSignaler()
+	d.SendOffer(sfu.PCSub, 1, 1, "sdp-1", nil)
+	d.SetDown(true)
+	d.SendOffer(sfu.PCSub, 1, 2, "sdp-2", []sfu.TrackBinding{{MID: "0", Share: "s_1", Kind: webrtc.RTPCodecTypeVideo}})
+	d.SendEvent(sfu.PCStateEvent{PC: sfu.PCSub, Gen: 1, State: "disconnected"})
+	if offers, lost := d.Offers(), d.Lost(); len(offers) != 1 || len(lost) != 1 || lost[0].Neg != 2 || lost[0].SDP != "sdp-2" ||
+		len(lost[0].Tracks) != 1 || len(d.Events()) != 0 {
+		t.Errorf("while down: offers %+v, lost %+v, events %+v; want the second offer lost and no event", offers, lost, d.Events())
+	}
+	d.SetDown(false)
+	d.SendOffer(sfu.PCSub, 1, 2, "sdp-2", nil) // the SFU sends it again
+	d.SendEvent(sfu.PCStateEvent{PC: sfu.PCSub, Gen: 1, State: "connected"})
+	if offers := d.Offers(); len(offers) != 2 || offers[1].Neg != 2 || len(d.Lost()) != 1 || len(d.Events()) != 1 {
+		t.Errorf("after it is back: offers %+v, lost %+v, events %+v", offers, d.Lost(), d.Events())
+	}
+	d.Close()
+}
+
+// TestViewerRebuild: Rebuild gives a Viewer a new PeerConnection and closes the old one; a closed Viewer has none
+// to give.
+func TestViewerRebuild(t *testing.T) {
+	v, err := NewViewer(ViewerOptions{Settings: LoopbackSettings()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := v.PC()
+	if err := v.Rebuild(); err != nil {
+		t.Fatal(err)
+	}
+	second := v.PC()
+	if second == first || first.ConnectionState() != webrtc.PeerConnectionStateClosed ||
+		second.ConnectionState() != webrtc.PeerConnectionStateNew {
+		t.Errorf("after Rebuild: the same PC %v, the old one %s, the new one %s; want a new PC and the old one closed",
+			second == first, first.ConnectionState(), second.ConnectionState())
+	}
+	// A PeerConnection that is closed already (its peer closed it) is replaced like any other.
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Rebuild(); err != nil || v.PC() == second {
+		t.Errorf("Rebuild of a Viewer whose PC is closed: %v, a new PC %v", err, v.PC() != second)
+	}
+	if err := v.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Rebuild(); err == nil {
+		t.Error("Rebuild of a closed Viewer succeeded")
+	}
+	if v.PC().ConnectionState() != webrtc.PeerConnectionStateClosed {
+		t.Errorf("the closed Viewer's PC is %s", v.PC().ConnectionState())
+	}
+}
+
 // TestRoomEventLog: every RoomEvents call is recorded, in order.
 func TestRoomEventLog(t *testing.T) {
 	l := &RoomEventLog{}

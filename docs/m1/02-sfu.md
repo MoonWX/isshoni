@@ -244,11 +244,20 @@ same rule covers the Go client. The client treats the sub offer with a new `ice-
     whose share ends is removed without an offer. The same state follows a **fatal error**: a sub offer that Pion
     can't create or set (the client gets `ErrorEvent{sfu.internal, pc.sub}`), or an answer that Pion refuses after
     taking it (`HandleAnswer` returns `sfu.bad_sdp`; Pion has no rollback, so that PC can't negotiate again).
-    Building the successor (`gen + 1`) from `closed` is slice 9 (README S57). Until then the subscriptions wait, and
-    a new subscription on that Conn fails with a retryable `sfu.internal`.
+    The successor (`gen + 1`) is built when the Conn needs a sub PC again (the `closed` row of the table above,
+    README S57); the subscriptions wait until then, and one made meanwhile joins them.
 
-  Two S29 tests pin this (`TestSubPCClosedByClient`, and the end of `TestPubOfferGenAndNeg`). S57, which adds
-  `ClosePC` (the `pc.close` path), decides whether Pion's close on `close_notify` stays.
+  **Decided in README S57: Pion's close on `close_notify` stays.** The alternative,
+  `SettingEngine.DisableCloseByDTLS`, was tried: after the client's close, Pion goes on reporting the
+  PeerConnection and its DTLS transport as `connected` and takes every packet written to it without an error, until
+  ICE notices (5 s to `disconnected`, 20 s to `failed`) and the 30 s grace has passed. For that long the DTLS-ready
+  gate would stay open on a dead sub PC, and a share would stay `live` for about 7 s without its publisher. With
+  the close the media facts are right at once: a pub PC's shares are `stalled` when its tracks end, a sub PC's
+  DownTracks stop, and the PC's ICE user name leaves the muxes. `ClosePC` (the `pc.close` path) therefore often
+  finds its PC closed already, since the alert travels on the media path and `pc.close` through the hub; it returns
+  nil either way, and a PC that it closes itself sends no `PCStateEvent`. The same two tests pin this
+  (`TestSubPCClosedByClient`, and the end of `TestPubOfferGenAndNeg`); `TestSubPCRebuild` has the ways out of
+  `closed`.
 - PCStateEvents are sent only for the current PC of each kind, never for one already replaced by a higher `gen`.
 - The SFU never starts an ICE restart or a rebuild because of its own ICE state. Its only unsolicited actions are the
   pub rebuild request (via `PCStateEvent`), the sub ICE restart in `Resync()`, and the codec rebuilds of §8.5
