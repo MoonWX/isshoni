@@ -1,0 +1,3 @@
+LISTEN 0      128    0.0.0.0:22   0.0.0.0:* users:(("sshd",pid=612,fd=3))
+LISTEN 0      511  127.0.0.1:8080 0.0.0.0:* users:(("node",pid=2001,fd=20))
+LISTEN 0      511    0.0.0.0:443  0.0.0.0:* users:(("caddy",pid=900,fd=7))
