@@ -110,9 +110,10 @@ func ParseEnvelope(b []byte) (Envelope, error) {
 //
 // Errors are a *FieldError (the hub answers bad_request with params {field, reason}) or, where the spec prescribes
 // another code, a *Error (RoomJoin: room_not_found; AgentSend: message_too_large). Before unmarshaling, Decode
-// rejects data that is not valid UTF-8, not valid JSON or nested deeper than 32 levels, and arrays longer than the
-// payload's limits (for example subs > 64), so a client->server message cannot make the decoder allocate much more
-// than its own size.
+// rejects data that is not valid UTF-8, not valid JSON or nested deeper than 32 levels, arrays longer than the
+// payload's limits (for example subs > 64), and an object key longer than 1024 bytes (field data, reason invalid;
+// the keys inside the payload of an agent.send are the sender's and may be longer), so a client->server message
+// cannot make the decoder allocate much more than its own size.
 func Decode[T any](e Envelope) (T, error) {
 	var v T
 	err := DecodeInto(e, &v)
@@ -142,6 +143,14 @@ type arrayLimiter interface {
 	arrayLimits() *limitNode
 }
 
+// rawMember is implemented by payloads that keep one member as the bytes of the message, a json.RawMessage that
+// nothing here reads into: the payload of agent.send and agent.recv, which is the sender's business (01 §8.14). The
+// limit on an object key's length (maxKeyLen) does not hold inside that member. A new payload type with a
+// json.RawMessage member needs the method too (TestRawMembers finds a missing one).
+type rawMember interface {
+	rawMember() []byte // the member's JSON name
+}
+
 var jsonNull = []byte("null")
 
 func unmarshalData(data json.RawMessage, v any) error {
@@ -162,11 +171,16 @@ func unmarshalData(data json.RawMessage, v any) error {
 		}
 		return &FieldError{Field: "data", Reason: FieldInvalid}
 	}
-	if !validJSON(data) {
+	var raw []byte
+	if r, ok := v.(rawMember); ok {
+		raw = r.rawMember()
+	}
+	if !validPayload(data, raw) {
 		// encoding/json must not be the one to find a syntax error: its error names the place by a JSON Pointer, and
-		// for that it copies the keys on the way there, up to 14 times the length of a long one. Data that came
-		// through ParseEnvelope always passes (the same scanner has read it), so this costs such data one more look
-		// and nothing else.
+		// for that it copies the keys on the way there, up to 14 times the length of a long one. Nor may it meet a
+		// long key that the payload's type does not know: it looks the key up through a folded copy, which costs up
+		// to 5 times the key's length (maxKeyLen). Data that came through ParseEnvelope is valid JSON (the same
+		// scanner has read it) and, from a real peer, has no such key: for it this is one more look and nothing else.
 		return &FieldError{Field: "data", Reason: FieldInvalid}
 	}
 	if err := json.Unmarshal(data, v); err != nil {

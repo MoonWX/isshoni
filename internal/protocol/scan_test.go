@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"reflect"
 	"strings"
@@ -461,21 +462,40 @@ func TestParseEnvelopeAllocations(t *testing.T) {
 // TestSkipValue: the scanner's value check on its own, against encoding/json's.
 func TestSkipValue(t *testing.T) {
 	for _, in := range jsonValues() {
-		if b := []byte(in); utf8.Valid(b) && validJSON(b) != json.Valid(b) {
-			t.Errorf("validJSON(%q) = %v; json.Valid = %v", in, validJSON(b), json.Valid(b))
+		for _, raw := range [][]byte{nil, []byte("a")} {
+			if b := []byte(in); utf8.Valid(b) && validPayload(b, raw) != json.Valid(b) {
+				t.Errorf("validPayload(%q, %q) = %v; json.Valid = %v", in, raw, validPayload(b, raw), json.Valid(b))
+			}
 		}
 	}
 	// Depth counts the containers around the value too.
 	nested := []byte(strings.Repeat("[", 4) + strings.Repeat("]", 4))
-	if _, err := skipValue(nested, 0, maxDepth-4); err != nil {
+	if _, err := skipValue(nested, 0, maxDepth-4, 0); err != nil {
 		t.Errorf("4 levels inside %d: %v", maxDepth-4, err)
 	}
-	if _, err := skipValue(nested, 0, maxDepth-3); !errors.Is(err, errTooDeep) || !errors.Is(err, ErrBadMessage) {
+	if _, err := skipValue(nested, 0, maxDepth-3, 0); !errors.Is(err, errTooDeep) || !errors.Is(err, ErrBadMessage) {
 		t.Errorf("4 levels inside %d: error %v, want errTooDeep in ErrBadMessage", maxDepth-3, err)
 	}
 	// It stops after the value, wherever that is.
-	if end, err := skipValue([]byte(`[1,{"a":"]"}] ,2`), 0, 1); err != nil || end != 13 {
+	if end, err := skipValue([]byte(`[1,{"a":"]"}] ,2`), 0, 1, 0); err != nil || end != 13 {
 		t.Errorf("skipValue stopped at %d, %v; want 13", end, err)
+	}
+	// A limit on the names holds for every object in the value, for the bytes between the quotes, and for nothing
+	// but names.
+	for _, c := range []struct {
+		in      string
+		maxName int
+		ok      bool
+	}{
+		{`{"abc":1}`, 0, true}, {`{"abc":1}`, 3, true}, {`{"abc":1}`, 2, false},
+		{`{"a":1,"abc":1}`, 2, false}, {`{"a":{"abc":1}}`, 2, false}, {`[1,[{"a":1},{"a":1,"abc":[]}]]`, 2, false},
+		{`{"a":"abcdef","b":["abcdef"]}`, 2, true}, {`"abcdef"`, 2, true}, {`{"":"abc"}`, 1, true},
+		{`{"a` + jsonEsc("0062") + `":1}`, 7, true}, {`{"a` + jsonEsc("0062") + `":1}`, 6, false}, {`{"é":1}`, 2, true}, {`{"é":1}`, 1, false},
+	} {
+		end, err := skipValue([]byte(c.in), 0, 0, c.maxName)
+		if (err == nil) != c.ok || c.ok && end != len(c.in) {
+			t.Errorf("skipValue(%s) with names of at most %d bytes: %d, %v; want ok=%v", c.in, c.maxName, end, err, c.ok)
+		}
 	}
 }
 
@@ -512,17 +532,108 @@ func arrayLimitsOf(v any) *limitNode {
 	return nil
 }
 
-// TestDecodeSyntaxCheck: Decode checks a payload's syntax before encoding/json reads it, and that changes no result.
-// A payload that is valid JSON decodes to what it decoded to before, or fails with the same error. One that is not
-// is refused as before, with the field "data", only without encoding/json's error, which costs many times the
-// length of a long key. (Every payload that the hub decodes has passed ParseEnvelope and is valid JSON.)
+// rawMemberOf returns the JSON name of the member that v, a pointer to a payload, keeps as bytes, or "".
+func rawMemberOf(v any) string {
+	if r, ok := v.(rawMember); ok {
+		return string(r.rawMember())
+	}
+	return ""
+}
+
+// longKey reports whether data, which is valid JSON, has a member name that Decode refuses: one of more than
+// maxKeyLen bytes between its quotes, outside the value of the payload object's member raw ("": no such member). It
+// reads the tokens with encoding/json's Decoder, so it is a reference for the scanner's own count.
+func longKey(t testing.TB, data []byte, raw string) bool {
+	t.Helper()
+	type level struct{ object, name bool } // name: the next token of this object is a member's name
+	var stack []level
+	inRaw := false // inside the value of the payload's member raw
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber() // a number may be too large for a float64
+	for {
+		before := dec.InputOffset()
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			return false
+		}
+		if err != nil {
+			t.Fatalf("the tokens of %q: %v", data, err)
+		}
+		top := len(stack) - 1
+		switch d, isDelim := tok.(json.Delim); {
+		case isDelim && (d == '{' || d == '['):
+			stack = append(stack, level{object: d == '{', name: d == '{'})
+			continue
+		case isDelim:
+			stack = stack[:top]
+		case top >= 0 && stack[top].object && stack[top].name:
+			stack[top].name = false
+			// The name as the message spells it: from its quote to the next quote that no backslash escapes.
+			text := bytes.TrimLeft(data[before:dec.InputOffset()], " \t\r\n,:")
+			n := 1
+			for ; text[n] != '"'; n++ {
+				if text[n] == '\\' {
+					n++
+				}
+			}
+			if n-1 > maxKeyLen && !inRaw {
+				return true
+			}
+			if top == 0 && raw != "" && strings.EqualFold(tok.(string), raw) {
+				inRaw = true
+			}
+			continue
+		}
+		// A value has ended: in an object a name comes next, and back in the payload object the member is over.
+		if top = len(stack) - 1; top >= 0 && stack[top].object {
+			stack[top].name = true
+		}
+		if top == 0 {
+			inRaw = false
+		}
+	}
+}
+
+// TestLongKey holds the tests' reference for the limit on keys to a few cases by hand.
+func TestLongKey(t *testing.T) {
+	at, over := strings.Repeat("k", maxKeyLen), strings.Repeat("k", maxKeyLen+1)
+	for _, c := range []struct {
+		data, raw string
+		want      bool
+	}{
+		{`{"` + at + `":1}`, "", false}, {`{"` + over + `":1}`, "", true}, {` { "a" : [ { "b" : 1 , "` + over + `" : 2 } ] } `, "", true},
+		{`{"a":"` + over + `","b":["` + over + `"]}`, "", false}, {`["` + over + `",{"a":{"` + at + `":"` + over + `"}}]`, "", false},
+		{`{"` + strings.Repeat(jsonEsc("0041"), maxKeyLen/6) + `":1}`, "", false}, {`{"` + strings.Repeat(jsonEsc("0041"), maxKeyLen/6+1) + `":1}`, "", true},
+		{`{"` + strings.Repeat(`\"`, maxKeyLen/2) + `":1}`, "", false}, {`{"` + strings.Repeat(`\"`, maxKeyLen/2) + `k":1}`, "", true},
+		{`{"payload":{"` + over + `":1}}`, "", true}, {`{"payload":{"` + over + `":[{"` + over + `":1}]}}`, "payload", false},
+		{`{"PayLoad":{"` + over + `":1},"p` + jsonEsc("0061") + `yload":[[{"` + over + `":1}]]}`, "payload", false},
+		{`{"payload":{"` + over + `":1},"a":{"` + over + `":1}}`, "payload", true}, {`{"payload":1,"a":{"` + over + `":1}}`, "payload", true},
+		{`{"a":{"payload":{"` + over + `":1}}}`, "payload", true}, {`[{"payload":{"` + over + `":1}}]`, "payload", true},
+		{`{"payload":{"` + over + `":1},"` + over + `":1}`, "payload", true}, {`{"payloads":{"` + over + `":1}}`, "payload", true},
+	} {
+		if got := longKey(t, []byte(c.data), c.raw); got != c.want {
+			t.Errorf("longKey(%.60q..., %q) = %v, want %v", c.data, c.raw, got, c.want)
+		}
+	}
+}
+
+// TestDecodeSyntaxCheck: Decode checks a payload before encoding/json reads it, and that changes no result but the
+// ones it is there to change.
+//   - A payload that is not valid JSON is refused as before, with the field "data", only without encoding/json's
+//     error, which costs many times the length of a long key.
+//   - A payload with a key of more than maxKeyLen bytes is refused the same way. Before, it was decoded, and the key
+//     ignored if the type did not know it, at up to 5 times the key's length. The keys inside the payload of an
+//     agent.send or agent.recv are not limited.
+//   - Every other payload decodes to what it decoded to before, or fails with the same error.
+//
+// (Every payload that the hub decodes has passed ParseEnvelope and is valid JSON.)
 func TestDecodeSyntaxCheck(t *testing.T) {
 	rounds := 200
 	if testing.Short() {
 		rounds = 20
 	}
 	dataInvalid := FieldError{Field: "data", Reason: FieldInvalid}
-	valid, malformed := 0, 0
+	valid, malformed, long := 0, 0, 0
 	check := func(zero any, data []byte) {
 		t.Helper()
 		got, want := reflect.New(reflect.TypeOf(zero)), reflect.New(reflect.TypeOf(zero))
@@ -533,18 +644,23 @@ func TestDecodeSyntaxCheck(t *testing.T) {
 			if err != nil || wantErr != nil || !reflect.DeepEqual(got.Elem().Interface(), zero) {
 				t.Fatalf("%T from no data: %+v, %v", zero, got.Elem().Interface(), err)
 			}
-		case utf8.Valid(data) && !json.Valid(data) && scanJSON(data, arrayLimitsOf(want.Interface())) == nil:
-			malformed++
+		case utf8.Valid(data) && scanJSON(data, arrayLimitsOf(want.Interface())) == nil &&
+			(!json.Valid(data) || longKey(t, data, rawMemberOf(want.Interface()))):
+			if json.Valid(data) {
+				long++
+			} else {
+				malformed++
+			}
 			if !errors.As(err, &fe) || *fe != dataInvalid {
-				t.Fatalf("%T from %q: %v, want data: invalid", zero, data, err)
+				t.Fatalf("%T from %.200q: %v, want data: invalid", zero, data, err)
 			}
 			if !reflect.DeepEqual(got.Elem().Interface(), zero) {
-				t.Fatalf("%T from %q: the refused payload left %+v behind", zero, data, got.Elem().Interface())
+				t.Fatalf("%T from %.200q: the refused payload left %+v behind", zero, data, got.Elem().Interface())
 			}
 		case (err == nil) != (wantErr == nil), errors.As(err, &fe) != errors.As(wantErr, &wantFE), fe != nil && *fe != *wantFE:
-			t.Fatalf("%T from %q: %v; before the syntax check: %v", zero, data, err, wantErr)
+			t.Fatalf("%T from %.200q: %v; before the syntax check: %v", zero, data, err, wantErr)
 		case !reflect.DeepEqual(got.Interface(), want.Interface()):
-			t.Fatalf("%T from %q:\n got %+v\nwant %+v", zero, data, got.Elem().Interface(), want.Elem().Interface())
+			t.Fatalf("%T from %.200q:\n got %+v\nwant %+v", zero, data, got.Elem().Interface(), want.Elem().Interface())
 		default:
 			if json.Valid(data) {
 				valid++
@@ -563,18 +679,197 @@ func TestDecodeSyntaxCheck(t *testing.T) {
 			check(zero, mutateJSON(rng, fx.env.Data))
 		}
 	}
-	// Values of every kind and long keys, as the payload of every type and inside one.
-	long := strings.Repeat("~/", 4000)
+	// Values of every kind and long keys, as the payload of every type and inside one: where the type has a member
+	// of that name, where it has none, and in the member that the relay's types keep as bytes.
+	at, over, long8k := strings.Repeat("k", maxKeyLen), strings.Repeat("k", maxKeyLen+1), strings.Repeat("~/", 4000)
+	values := append(jsonValues(),
+		`{"`+long8k+`":`, `{"`+long8k+`":1}`, `{"`+long8k+`":{"subs":`, `{"`+long8k+`":x}`,
+		`{"`+at+`":1}`, `{"`+over+`":1}`, `{"`+at+`":[{"`+at+`":{}},{"a":1,"`+over+`":null}]}`, `[{"`+over+`":1}]`, `"`+over+`"`,
+		`{"`+strings.Repeat(jsonEsc("0041"), maxKeyLen/6)+`":1}`, `{"`+strings.Repeat(jsonEsc("0041"), maxKeyLen/6+1)+`":1}`,
+	)
 	for _, tg := range decodeTargets() {
 		zero := reflect.Zero(tg.typ).Interface()
-		for _, v := range append(jsonValues(), `{"`+long+`":`, `{"`+long+`":1}`, `{"`+long+`":{"subs":`, `{"`+long+`":x}`) {
+		for _, v := range values {
 			check(zero, []byte(v))
 			check(zero, []byte(`{"u":`+v+`}`))
 			check(zero, []byte(`{"subs":[`+v+`],"roomId":`+v+`,"caps":{"decode":`+v+`}}`))
+			check(zero, []byte(`{"kind":"a.b","payload":`+v+`}`))
+			check(zero, []byte(`{"PAYLOAD":[`+v+`],"u":1,"p`+jsonEsc("0061")+`yload":{"k":`+v+`}}`))
 		}
 	}
-	if valid < 1000 || malformed < 1000 {
-		t.Errorf("%d valid payloads, %d malformed ones; the sample should hold plenty of both kinds", valid, malformed)
+	if valid < 1000 || malformed < 1000 || long < 500 {
+		t.Errorf("%d valid payloads, %d malformed ones, %d with a long key; the sample should hold plenty of each kind", valid, malformed, long)
+	}
+}
+
+// TestDecodeKeyLength spells out the limit on an object key's length with its results, so it does not rest on the
+// reference alone.
+func TestDecodeKeyLength(t *testing.T) {
+	at, over := strings.Repeat("k", maxKeyLen), strings.Repeat("k", maxKeyLen+1)
+	agent := `"toRole":"agent","kind":"a.b"`
+	for _, c := range []struct {
+		name string
+		zero any
+		data string
+		ok   bool
+	}{
+		{"a key at the limit", RoomJoin{}, `{"` + at + `":1,"roomId":"lounge"}`, true},
+		{"a key over the limit", RoomJoin{}, `{"` + over + `":1,"roomId":"lounge"}`, false},
+		{"after the keys that the type knows", RoomJoin{}, `{"roomId":"lounge","` + over + `":1}`, false},
+		{"in an element of a list", SubscribeUpdate{}, `{"subs":[{"shareId":"s_1","` + over + `":1}]}`, false},
+		{"under a key that the type does not know", RoomJoin{}, `{"roomId":"lounge","x":[{"` + over + `":1}]}`, false},
+		{"escapes count as they are written", RoomJoin{}, `{"` + strings.Repeat(jsonEsc("0041"), maxKeyLen/6+1) + `":1,"roomId":"lounge"}`, false},
+		{"the same key, written out", RoomJoin{}, `{"` + strings.Repeat("A", maxKeyLen/6+1) + `":1,"roomId":"lounge"}`, true},
+		{"a long value is no key", RoomJoin{}, `{"roomId":"lounge","x":"` + over + `","y":["` + over + `"]}`, true},
+		{"a payload member means nothing to this type", RoomJoin{}, `{"roomId":"lounge","payload":{"` + over + `":1}}`, false},
+		{"agent.send: keys inside the payload", AgentSend{}, `{` + agent + `,"payload":{"` + over + `":{"` + over + over + `":[{"` + over + `":1}]}}}`, true},
+		{"agent.send: the payload in capitals", AgentSend{}, `{` + agent + `,"PAYLOAD":{"` + over + `":1}}`, true},
+		{"agent.send: the payload with an escape", AgentSend{}, `{` + agent + `,"p` + jsonEsc("0061") + `yload":[{"` + over + `":1}]}`, true},
+		{"agent.send: every payload of several", AgentSend{}, `{"payload":{"` + over + `":1},` + agent + `,"payload":{"` + over + `":2}}`, true},
+		{"agent.send: a key beside the payload", AgentSend{}, `{` + agent + `,"payload":{"a":1},"` + over + `":1}`, false},
+		{"agent.send: a key in another member, after the payload", AgentSend{}, `{"payload":{"` + over + `":1},` + agent + `,"x":{"` + over + `":1}}`, false},
+		{"agent.send: a payload inside another member", AgentSend{}, `{` + agent + `,"payload":{"a":1},"x":{"payload":{"` + over + `":1}}}`, false},
+		{"agent.recv: keys inside the payload", AgentRecv{}, `{"from":"c_1","kind":"a.b","payload":{"` + over + `":1}}`, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			typ := reflect.TypeOf(c.zero)
+			got, want := reflect.New(typ), reflect.New(typ)
+			err := DecodeInto(Envelope{Data: []byte(c.data)}, got.Interface())
+			if !c.ok {
+				var fe *FieldError
+				if !errors.As(err, &fe) || fe.Field != "data" || fe.Reason != FieldInvalid {
+					t.Fatalf("DecodeInto: %v, want data: invalid", err)
+				}
+				if !reflect.DeepEqual(got.Elem().Interface(), c.zero) {
+					t.Errorf("the refused payload left %+v behind", got.Elem().Interface())
+				}
+				return
+			}
+			// Accepted, and decoded as encoding/json alone decodes it.
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := unmarshalDataJSON([]byte(c.data), want.Interface()); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got.Interface(), want.Interface()) || reflect.DeepEqual(got.Elem().Interface(), c.zero) {
+				t.Errorf("got %+v, want %+v", got.Elem().Interface(), want.Elem().Interface())
+			}
+		})
+	}
+
+	// The envelope has no such limit: the frame is no bad_message (which would end the connection), and the request
+	// in it is answered with bad_request.
+	frame := []byte(`{"type":"room.join","id":"7","` + over + `":1,"data":{"roomId":"lounge","` + over + `":1}}`)
+	e, err := parseLikeJSON(t, frame)
+	if err != nil {
+		t.Fatalf("ParseEnvelope: %v", err)
+	}
+	var fe *FieldError
+	if _, err := Decode[RoomJoin](e); !errors.As(err, &fe) || fe.Field != "data" || fe.Reason != FieldInvalid {
+		t.Errorf("Decode: %v, want data: invalid", err)
+	}
+	// The relay hands on a payload with long keys as it came.
+	payload := `{"` + over + `":[{"` + over + `":"x"}]}`
+	e, err = parseLikeJSON(t, []byte(`{"type":"agent.send","id":"8","data":{"toRole":"agent","kind":"a.b","payload":`+payload+`}}`))
+	if err != nil {
+		t.Fatalf("ParseEnvelope: %v", err)
+	}
+	if a, err := Decode[AgentSend](e); err != nil || string(a.Payload) != payload {
+		t.Errorf("Decode: %v, payload %.40q...; want the payload as it came", err, a.Payload)
+	}
+}
+
+// TestRawMembers holds rawMember to the payload types: a type says which member it keeps as bytes, and a type with
+// such a member says so. (A type that named a member which encoding/json does read would lift the limit on the
+// keys in there.)
+func TestRawMembers(t *testing.T) {
+	seen := 0
+	for _, tg := range decodeTargets() {
+		var raws []string
+		for i := range tg.typ.NumField() {
+			if f := tg.typ.Field(i); f.Type == reflect.TypeFor[json.RawMessage]() {
+				name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+				raws = append(raws, name)
+			}
+		}
+		switch name := rawMemberOf(reflect.New(tg.typ).Interface()); {
+		case name == "" && len(raws) > 0:
+			t.Errorf("%v keeps %q as bytes and has no rawMember method: the keys in there are held to %d bytes", tg.typ, raws, maxKeyLen)
+		case name != "" && (len(raws) != 1 || raws[0] != name):
+			t.Errorf("%v: rawMember names %q; its json.RawMessage members are %q", tg.typ, name, raws)
+		case name != "":
+			seen++
+		}
+	}
+	if seen != 2 {
+		t.Errorf("%d payload types have a raw member, want 2 (agent.send, agent.recv)", seen)
+	}
+}
+
+// TestDecodeLongKeyAllocations: keys that a payload's type does not know stay within Decode's allocation bound
+// (01 §19, the bound of FuzzDecode), for every payload that the hub decodes. One long key is refused for the price
+// of the error. A message full of keys at the limit is decoded, with the keys of the lengths that cost
+// encoding/json the most per byte: just over a power of two, where its folded copy has just been grown.
+func TestDecodeLongKeyAllocations(t *testing.T) {
+	fill := func(keyLen, size int) []byte {
+		var b bytes.Buffer
+		b.WriteString(`{"roomId":"lounge"`)
+		for n := 0; b.Len() < size; n++ {
+			fmt.Fprintf(&b, `,"%04d%s":1`, n, strings.Repeat("k", keyLen-4))
+		}
+		b.WriteString(`}`)
+		return b.Bytes()
+	}
+	payloads := map[string][]byte{
+		"one long key":       []byte(`{"` + strings.Repeat("k", 100000) + `":1,"roomId":"lounge"}`),
+		"one key of 250 KiB": []byte(`{"roomId":"lounge","` + strings.Repeat("k", 250<<10) + `":{"a":1}}`),
+	}
+	for _, keyLen := range []int{33, 129, 257, 513, maxKeyLen} {
+		payloads[fmt.Sprintf("keys of %d bytes", keyLen)] = fill(keyLen, 250<<10)
+	}
+	for _, tg := range decodeTargets() {
+		if !tg.serverDecoded {
+			continue
+		}
+		_ = DecodeInto(Envelope{Data: []byte(`{}`)}, reflect.New(tg.typ).Interface()) // encoding/json's cache for the type
+		for name, data := range payloads {
+			var err error
+			limit := 4 * uint64(len(data)) // without FuzzDecode's constant, which is for what does not grow with the input
+			refused := strings.HasPrefix(name, "one ")
+			if refused {
+				limit = uint64(tg.typ.Size()) + 64 // the value to decode into and the error
+			}
+			n := allocatedWithin(limit, func() {
+				err = DecodeInto(Envelope{Type: tg.msgType, Data: data}, reflect.New(tg.typ).Interface())
+			})
+			if n > limit {
+				t.Errorf("%v, %s: allocated %d bytes for %d input bytes (limit %d)", tg.typ, name, n, len(data), limit)
+			}
+			var fe *FieldError
+			if isDataInvalid := errors.As(err, &fe) && fe.Field == "data" && fe.Reason == FieldInvalid; isDataInvalid != refused {
+				t.Errorf("%v, %s: %v; want data: invalid only for a key over the limit", tg.typ, name, err)
+			}
+		}
+	}
+
+	// The keys inside a relay's payload have no limit, and need none: encoding/json keeps the payload as bytes, so
+	// Decode allocates one copy of it, whatever its keys are. (A payload of this size is then refused for its size.)
+	var payload bytes.Buffer
+	payload.WriteString(`{"` + strings.Repeat("k", 100000) + `":{"a":1}`)
+	for n := 0; payload.Len() < 250<<10; n++ {
+		fmt.Fprintf(&payload, `,"%04d%s":[{"%s":%d}]`, n, strings.Repeat("~", 8000), strings.Repeat("K", 2049), n)
+	}
+	payload.WriteString(`}`)
+	data := []byte(`{"toRole":"agent","kind":"a.b","payload":` + payload.String() + `}`)
+	var err error
+	limit := uint64(len(data))*5/4 + 1024
+	if n := allocatedWithin(limit, func() { _, err = Decode[AgentSend](Envelope{Type: MessageTypeAgentSend, Data: data}) }); n > limit {
+		t.Errorf("agent.send with long keys in its payload: allocated %d bytes for %d input bytes (limit %d)", n, len(data), limit)
+	}
+	var pe *Error
+	if !errors.As(err, &pe) || pe.Code != ErrorCodeMessageTooLarge {
+		t.Errorf("agent.send with a payload of %d bytes: %v, want message_too_large", payload.Len(), err)
 	}
 }
 

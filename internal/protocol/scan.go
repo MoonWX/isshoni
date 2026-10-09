@@ -16,6 +16,16 @@ const maxDepth = 32
 
 var errTooDeep = errors.New("protocol: message nested too deeply")
 
+// maxKeyLen bounds the name of an object member in a payload that Decode reads, in bytes as the message spells it
+// (between the quotes, escapes not decoded). The names of this protocol are under 32 bytes.
+//
+// It is there for the names that a payload's type does not know. encoding/json looks such a name up through a
+// case-folded copy of it, in a buffer that it grows step by step and allocates anew at each step. With Go 1.27 that
+// adds up to at most 3.7 times a name within this limit (and 3.8 times one of up to 2048 bytes), but to more than 4
+// times some longer ones, 5.2 times at worst: a message of such names costs more than the 4 times its size that
+// Decode may (01 §19). ParseEnvelope has no such limit and needs none: it copies no name.
+const maxKeyLen = 1024
+
 // limitNode describes the array limits of one payload type as a tree of JSON keys. Keys match the way
 // encoding/json matches them: exactly or case-insensitively (Unicode simple folding, as bytes.EqualFold).
 type limitNode struct {
@@ -172,8 +182,8 @@ type scanFrame struct {
 // scanJSON walks b once and fails when containers nest deeper than maxDepth or when an array named in root has more
 // elements than allowed (a *FieldError with reason too_many). It allocates nothing (escaped keys are unescaped into
 // a stack buffer). It is not a validator: on malformed JSON it returns nil and leaves the syntax error to
-// validJSON, which Decode runs next, before encoding/json reads the payload. The envelope around the payload has a
-// strict scanner of its own (scanEnvelope, below) and is never read by encoding/json.
+// validPayload, which Decode runs next, before encoding/json reads the payload. The envelope around the payload has
+// a strict scanner of its own (scanEnvelope, below) and is never read by encoding/json.
 func scanJSON(b []byte, root *limitNode) error {
 	var stack [maxDepth]scanFrame
 	depth := 0
@@ -338,58 +348,70 @@ func (s *envelopeScan) field(name []byte, escaped bool) *[]byte {
 // envelope's fields in it. It allocates nothing.
 func scanEnvelope(b []byte) (envelopeScan, error) {
 	var s envelopeScan
-	i := skipSpace(b, 0)
-	if i >= len(b) || b[i] != '{' {
-		return s, errEnvelopeSyntax
-	}
-	i = skipSpace(b, i+1)
-	if i < len(b) && b[i] == '}' {
-		i++
-	} else {
-		for {
-			// The member's name.
-			nameEnd, escaped, ok := scanString(b, i)
-			if !ok {
-				return s, errEnvelopeSyntax
-			}
-			field := s.field(b[i+1:nameEnd-1], escaped)
-			start, ok := skipColon(b, nameEnd)
-			if !ok {
-				return s, errEnvelopeSyntax
-			}
-			// Its value.
-			end, err := skipValue(b, start, 1)
-			if err != nil {
-				return s, err
-			}
-			switch {
-			case field == nil: // not a key of the envelope: checked and skipped
-			case field == &s.data:
-				s.data = b[start:end]
-			case b[start] == '"':
-				*field = b[start+1 : end-1]
-			case b[start] != 'n': // null leaves the field as it is
-				return s, errEnvelopeNotString
-			}
-			// A comma and the next member, or the end of the object.
-			i = skipSpace(b, end)
-			if i >= len(b) {
-				return s, errEnvelopeSyntax
-			}
-			if b[i] == '}' {
-				i++
-				break
-			}
-			if b[i] != ',' {
-				return s, errEnvelopeSyntax
-			}
-			i = skipSpace(b, i+1)
+	end, err := scanObject(b, skipSpace(b, 0), func(name []byte, escaped bool, start int) (int, error) {
+		end, err := skipValue(b, start, 1, 0)
+		if err != nil {
+			return 0, err
 		}
+		switch field := s.field(name, escaped); {
+		case field == nil: // not a key of the envelope: checked and skipped
+		case field == &s.data:
+			s.data = b[start:end]
+		case b[start] == '"':
+			*field = b[start+1 : end-1]
+		case b[start] != 'n': // null leaves the field as it is
+			return 0, errEnvelopeNotString
+		}
+		return end, nil
+	})
+	if err != nil {
+		return s, err
 	}
-	if skipSpace(b, i) != len(b) {
+	if skipSpace(b, end) != len(b) {
 		return s, errEnvelopeSyntax // something after the object
 	}
 	return s, nil
+}
+
+// scanObject checks the JSON object that starts at b[i] and returns the index after it. For each member it calls
+// value with the member's name (the contents of a JSON string that scanString accepted; escaped reports a backslash
+// in it) and the index where the member's value starts; value checks that value and returns the index after it.
+// scanObject fails with errEnvelopeSyntax when b[i] does not start an object or the object is malformed, and with
+// value's error. It allocates nothing, and it does not keep value: a closure costs its caller no memory either.
+func scanObject(b []byte, i int, value func(name []byte, escaped bool, start int) (end int, err error)) (int, error) {
+	if i >= len(b) || b[i] != '{' {
+		return 0, errEnvelopeSyntax
+	}
+	i = skipSpace(b, i+1)
+	if i < len(b) && b[i] == '}' {
+		return i + 1, nil
+	}
+	for {
+		nameEnd, escaped, ok := scanString(b, i)
+		if !ok {
+			return 0, errEnvelopeSyntax
+		}
+		start, ok := skipColon(b, nameEnd)
+		if !ok {
+			return 0, errEnvelopeSyntax
+		}
+		end, err := value(b[i+1:nameEnd-1], escaped, start)
+		if err != nil {
+			return 0, err
+		}
+		// A comma and the next member, or the end of the object.
+		i = skipSpace(b, end)
+		if i >= len(b) {
+			return 0, errEnvelopeSyntax
+		}
+		if b[i] == '}' {
+			return i + 1, nil
+		}
+		if b[i] != ',' {
+			return 0, errEnvelopeSyntax
+		}
+		i = skipSpace(b, i+1)
+	}
 }
 
 // envelopeStringBuf holds the longest string that the envelope accepts, a type, while unescapeKey decodes it:
@@ -420,8 +442,9 @@ func validTokenBytes(text []byte) bool {
 
 // skipValue checks the JSON value that starts at b[i], with depth containers open around it, and returns the index
 // after it. It fails when the value is not valid JSON (errEnvelopeSyntax) or nests deeper than maxDepth levels in
-// all (errEnvelopeDepth).
-func skipValue(b []byte, i, depth int) (int, error) {
+// all (errEnvelopeDepth). With maxName > 0 it also fails (errEnvelopeSyntax) when an object in the value has a
+// member name of more than maxName bytes between its quotes.
+func skipValue(b []byte, i, depth, maxName int) (int, error) {
 	var isObject [maxDepth]bool // by depth: the open container is an object, not an array
 	outer := depth
 	for {
@@ -448,7 +471,7 @@ func skipValue(b []byte, i, depth int) (int, error) {
 				break
 			}
 			if c == '{' {
-				if i, ok = skipName(b, i); !ok {
+				if i, ok = skipName(b, i, maxName); !ok {
 					return 0, errEnvelopeSyntax
 				}
 			}
@@ -482,7 +505,7 @@ func skipValue(b []byte, i, depth int) (int, error) {
 			case c == ',':
 				i = skipSpace(b, i+1)
 				if object {
-					if i, ok = skipName(b, i); !ok {
+					if i, ok = skipName(b, i, maxName); !ok {
 						return 0, errEnvelopeSyntax
 					}
 				}
@@ -497,11 +520,49 @@ func skipValue(b []byte, i, depth int) (int, error) {
 	}
 }
 
-// validJSON reports whether b (valid UTF-8) is one JSON value, nested at most maxDepth levels deep, with nothing
-// but whitespace around it: what encoding/json accepts, found out without allocating.
-func validJSON(b []byte) bool {
-	end, err := skipValue(b, skipSpace(b, 0), 0)
+// validPayload is what Decode asks of a payload b (valid UTF-8) before encoding/json reads it, found out without
+// allocating:
+//   - b is one JSON value, nested at most maxDepth levels deep, with nothing but whitespace around it: what
+//     encoding/json accepts;
+//   - no object in it has a member name of more than maxKeyLen bytes.
+//
+// raw, when not nil, names the member of the payload object that the payload's type keeps as the bytes of the
+// message (rawMember). The second rule does not hold inside the value of that member: encoding/json reads no name
+// in there. A key names the member the way encoding/json matches it with the field (keyIs).
+func validPayload(b, raw []byte) bool {
+	i := skipSpace(b, 0)
+	var end int
+	var err error
+	if raw != nil && i < len(b) && b[i] == '{' {
+		end, err = scanObject(b, i, func(name []byte, escaped bool, start int) (int, error) {
+			switch {
+			case len(name) > maxKeyLen:
+				return 0, errEnvelopeSyntax
+			case keyIs(name, escaped, raw):
+				return skipValue(b, start, 1, 0)
+			}
+			return skipValue(b, start, 1, maxKeyLen)
+		})
+	} else {
+		end, err = skipValue(b, i, 0, maxKeyLen)
+	}
 	return err == nil && skipSpace(b, end) == len(b)
+}
+
+// keyIs reports whether key, the contents of a JSON string that scanString accepted (escaped reports a backslash in
+// it), names the member name the way encoding/json matches a key with a struct's field: equal under Unicode case
+// folding (bytes.EqualFold), after unescaping.
+func keyIs(key []byte, escaped bool, name []byte) bool {
+	if escaped {
+		// Unescaped into a buffer on the stack, as in limitNode.child: a key that doesn't fit is longer than a
+		// member's name, even folded.
+		var buf [64]byte
+		var ok bool
+		if key, ok = unescapeKey(key, buf[:]); !ok {
+			return false
+		}
+	}
+	return bytes.EqualFold(key, name)
 }
 
 // skipSpace returns the index of the first byte of b at or after i that is not JSON whitespace.
@@ -513,10 +574,10 @@ func skipSpace(b []byte, i int) int {
 }
 
 // skipName checks an object member's name at b[i] and the colon after it, and returns the index where the member's
-// value starts.
-func skipName(b []byte, i int) (int, bool) {
+// value starts. With maxName > 0, a name of more than maxName bytes between its quotes fails the check.
+func skipName(b []byte, i, maxName int) (int, bool) {
 	end, _, ok := scanString(b, i)
-	if !ok {
+	if !ok || maxName > 0 && end-i-2 > maxName {
 		return 0, false
 	}
 	return skipColon(b, end)

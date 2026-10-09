@@ -40,6 +40,11 @@ func allocatedWithin(limit uint64, fn func()) uint64 {
 // has no such part: it allocates its result, which is a copy of parts of the frame, so its constant only covers how
 // the allocator rounds sizes up. It is small on purpose: with 8 KB there, a frame had to be 2.3 KB long before a
 // decoder that allocated 7.6 times its size was over the bound (F04).
+//
+// Decode's constant is large enough to hide a decoder that is over 4× by a little: a valid payload had to hold one
+// key of about 57 KB that its type does not know before encoding/json's 5.2 times that key showed (F04). So the
+// part that grows with the input has a test of its own, which leaves the fuzzer nothing to grow to:
+// TestDecodeLongKeyAllocations, for the keys that Decode lets through (maxKeyLen).
 const (
 	envelopeAllocSlack = 1 << 10
 	decodeAllocSlack   = 64 << 10
@@ -179,6 +184,15 @@ func FuzzDecode(f *testing.F) {
 	f.Add(targetIndex(targets, RoomJoin{}), []byte(`{"`+strings.Repeat("~", 8000)+`":`))
 	f.Add(targetIndex(targets, SubscribeUpdate{}), []byte(`{"subs":[{"shareId":"s_1","`+strings.Repeat("k/", 4000)+`":`))
 	f.Add(targetIndex(targets, ClientStats{}), []byte(`{"pcs":[],"`+strings.Repeat("k", 8000)+`":x}`))
+	// A valid payload with a long key that its type does not know (F04): encoding/json folds a copy of the key to
+	// look it up, 514768 bytes for this payload of 100024 (limit 465632). Decode refuses a key over maxKeyLen, and
+	// lets through the keys in the one place where encoding/json reads none: the relay's payload.
+	f.Add(targetIndex(targets, RoomJoin{}), []byte(`{"`+strings.Repeat("k", 100000)+`":1,"roomId":"lounge"}`))
+	f.Add(targetIndex(targets, RoomJoin{}), []byte(`{"`+strings.Repeat("k", maxKeyLen)+`":1,"roomId":"lounge"}`))
+	f.Add(targetIndex(targets, RoomJoin{}), []byte(`{"roomId":"lounge","x":[{"`+strings.Repeat(jsonEsc("004b"), maxKeyLen/6+1)+`":1}]}`))
+	f.Add(targetIndex(targets, SubscribeUpdate{}), []byte(`{"subs":[{"shareId":"s_1","`+strings.Repeat("k", 257)+`":1,"`+strings.Repeat("K", 513)+`":2}]}`))
+	f.Add(targetIndex(targets, AgentSend{}), []byte(`{"toRole":"agent","kind":"a.b","payload":{"`+strings.Repeat("k", 8000)+`":[{"`+strings.Repeat("~", 2000)+`":1}]}}`))
+	f.Add(targetIndex(targets, AgentSend{}), []byte(`{"toRole":"agent","kind":"a.b","PAYLOAD":{"`+strings.Repeat("k", 2000)+`":1},"`+strings.Repeat("k", 2000)+`":1}`))
 	f.Fuzz(func(t *testing.T, idx uint8, data []byte) {
 		tg := targets[int(idx)%len(targets)]
 		var v reflect.Value
@@ -201,6 +215,10 @@ func FuzzDecode(f *testing.F) {
 				t.Fatalf("decoding %v: error %v (%T) is neither a *FieldError nor a *Error", tg.typ, err, err)
 			}
 			return
+		}
+		// Decode let no key through that is longer than it allows (the tests' reference reads the tokens).
+		if raw := rawMemberOf(v.Interface()); json.Valid(data) && longKey(t, data, raw) {
+			t.Fatalf("decoding %v accepted a payload with a key of more than %d bytes: %.200q", tg.typ, maxKeyLen, data)
 		}
 		// An agent.send that passed has a payload for the relay to hand on: some JSON value, and not null (01 §8.14).
 		if a, ok := v.Interface().(*AgentSend); ok {
