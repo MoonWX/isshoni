@@ -707,11 +707,13 @@ func TestShareMediaWhileDetached(t *testing.T) {
 // connection that publishes a share (01 §9 rule 10): the MediaPeer reports every pub PC that failed, and the hub
 // passes the request on while the connection has a share that is starting, live or stalled, and drops it when the
 // pub PC has nothing to carry: nothing was shared, the last share stopped or timed out, or the client closed the PC
-// on purpose. Somebody else's share does not count, nor one of the user's other connection.
+// on purpose. Somebody else's share does not count, nor one of the user's other connection. A MediaPeer of a room
+// that the connection has left is not heard at all, whatever the connection shares where it is now.
 func TestPubRestartRequest(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		e := newEnv(t)
 		defer e.close()
+		e.rooms.Add(room1)
 		cookieA, _ := e.user(false)
 		cookieB, _ := e.user(false)
 		a1, wa1 := e.connect(cookieA, signaltest.DefaultHello())
@@ -827,20 +829,45 @@ func TestPubRestartRequest(t *testing.T) {
 		}
 		dropped++
 
-		// A connection that left the room has no pub PC to rebuild, whatever its previous MediaPeer reports.
+		// A previous room's MediaPeer no longer speaks for the connection. Its request is dropped like its other events
+		// (TestRoomSwitch), and here nothing else would drop it: the connection publishes a share in its new room. The
+		// same request from the current MediaPeer goes out.
+		join(t, a1, room1.ID)
+		cur := e.media.Peer(wa1.ConnectionID).Sink()
+		if cur == sinkA1 {
+			t.Fatal("the room switch made no new MediaPeer")
+		}
 		startShare(t, a1, screen("r7"))
 		quiet(t, all...)
-		leave(t, a1)
-		sinkA1.RestartRequest(protocol.PCRestart{PC: pub, Gen: 100, Mode: protocol.RestartModeRebuild,
-			Reason: protocol.RestartReasonFailed})
+		restart := protocol.PCRestart{PC: pub, Gen: 100, Mode: protocol.RestartModeRebuild,
+			Reason: protocol.RestartReasonFailed}
+		sinkA1.RestartRequest(restart)
 		synctest.Wait()
-		expectOpen(t, a1)
+		for _, c := range all {
+			expectOpen(t, c)
+		}
+		cur.RestartRequest(restart)
+		synctest.Wait()
+		env := expectType(t, a1, protocol.MessageTypePCRestart)
+		if got, err := protocol.Decode[protocol.PCRestart](env); err != nil || got != restart {
+			t.Errorf("pc.restart of the current MediaPeer %s (%v), want %+v", env.Data, err, restart)
+		}
+		asked++
+
+		// A connection that left the room has no pub PC to rebuild, whatever its previous MediaPeer reports.
+		leave(t, a1)
+		restart.Gen++
+		cur.RestartRequest(restart)
+		synctest.Wait()
+		for _, c := range all {
+			expectOpen(t, c)
+		}
 
 		if got := e.metric("isshoni_ws_messages_total", "type", "pc.restart", "dir", "out"); got != float64(asked) {
 			t.Errorf("isshoni_ws_messages_total{type=pc.restart,dir=out} = %v, want %d", got, asked)
 		}
-		// Each request that was not passed on left a DEBUG line with the connection; the one of a previous MediaPeer
-		// is dropped like its other events, without one.
+		// Each request that was not passed on left a DEBUG line with the connection; those of a previous MediaPeer are
+		// dropped like its other events, without one.
 		if n := e.logs.count("level=DEBUG", "pub restart request dropped"); n != dropped {
 			t.Errorf("%d lines for dropped requests, want %d:\n%s", n, dropped, e.logs)
 		}
