@@ -170,12 +170,13 @@ func TestSessionsOverREST(t *testing.T) {
 		t.Errorf("refused revocations: calls %+v, notes %v", calls, notes)
 	}
 
-	// Sign out other browsers: 200 {revoked}; this one stays.
+	// Sign out other browsers: 200 {revoked}; this one stays. The number is the browsers the list showed (the
+	// first); the expired row goes with it and is not counted.
 	rec = f.call(http.MethodPost, "/api/v1/me/sessions/revoke-others", "{}", with(second))
-	if got := decodeBody[api.RevokeOthersResponse](t, rec, http.StatusOK); got.Revoked != 2 { // the first, and the expired row
-		t.Errorf("revoked = %d, want 2", got.Revoked)
+	if got := decodeBody[api.RevokeOthersResponse](t, rec, http.StatusOK); got.Revoked != 1 {
+		t.Errorf("revoked = %d, want 1", got.Revoked)
 	}
-	if got, want := rec.Body.String(), `{"revoked":2}`+"\n"; got != want {
+	if got, want := rec.Body.String(), `{"revoked":1}`+"\n"; got != want {
 		t.Errorf("body = %s, want %s", got, want)
 	}
 	f.wantUnauthenticated(first)
@@ -185,7 +186,10 @@ func TestSessionsOverREST(t *testing.T) {
 	}
 	if calls := f.conns.take(); len(calls) != 2 || calls[0].reason != auth.ReasonSessionRevoked || calls[0].sel.ExceptSessionID != "" ||
 		calls[0].sel.SessionID == "" || calls[0].sel.SessionID == store.SessionID(ids["second"]) {
-		t.Errorf("CloseConnections calls = %+v, want one per revoked session", calls)
+		t.Errorf("CloseConnections calls = %+v, want one per deleted row", calls)
+	}
+	if n := f.counter()("SELECT count(*) FROM sessions WHERE user_id = ?", admin.ID); n != 1 {
+		t.Errorf("%d session rows after revoke-others, want this browser's only (the expired row goes too)", n)
 	}
 	if notes := f.signal.takeNotes(); fmt.Sprint(notes) != "[user "+admin.ID+" [devices]]" {
 		t.Errorf("Signal notes after revoke-others = %v", notes)
@@ -355,8 +359,10 @@ func TestPasswordOverREST(t *testing.T) {
 	if rotated.Value == cookie.Value {
 		t.Fatal("the cookie was not rotated")
 	}
-	// The current session stays, under the new cookie only; the others are gone, and so is the linked app.
-	f.wantUnauthenticated(cookie)
+	// The current session stays, under the new cookie. The cookie the request came with is let in for the 60 s of
+	// a rotation (03 §7.4): this browser's other tabs hold it until the new one reaches them. The others are gone
+	// at once, and so is the linked app.
+	f.wantSignedIn(cookie)
 	f.wantUnauthenticated(other)
 	if got := f.sessionID(rotated); got != sid {
 		t.Errorf("the session behind the new cookie is %s, want the same session %s", got, sid)
@@ -375,12 +381,22 @@ func TestPasswordOverREST(t *testing.T) {
 		rows[0].TargetKind != "user" || rows[0].TargetID != admin.ID || len(rows[0].Detail) != 0 {
 		t.Errorf("auth.password_changed rows = %+v", rows)
 	}
+	// The old cookie's 60 s: still in at their end, out a millisecond later. Using it changed nothing.
+	f.clk.advance(60 * time.Second)
+	f.wantSignedIn(cookie)
+	f.clk.advance(time.Millisecond)
+	f.wantUnauthenticated(cookie)
+	f.wantSignedIn(rotated)
+	if calls, notes := f.conns.take(), f.signal.takeNotes(); len(calls) != 0 || len(notes) != 0 {
+		t.Errorf("requests under the old cookie: calls %+v, notes %v", calls, notes)
+	}
 	// The old password is none any more.
 	wantError(t, f.login("Alex", testPassword, addrB), http.StatusUnauthorized, api.CodeInvalidCredentials)
 	decodeBody[api.UserResponse](t, f.login("Alex", newPassword, addrB), http.StatusOK)
 
 	// A session whose daily rotation is due: the chain rotates, then the handler; the response sets one cookie,
-	// the handler's.
+	// the handler's. The cookie the request came with is the one the browser holds, so it is the one with the 60 s,
+	// although the chain's token came between it and the new one.
 	f.clk.advance(25 * time.Hour)
 	rec = f.changePassword(rotated, newPassword, "a third long passphrase")
 	if rec.Code != http.StatusOK {
@@ -388,7 +404,15 @@ func TestPasswordOverREST(t *testing.T) {
 	}
 	latest := f.sessionCookie(rec, thirtyDays) // fails unless there is exactly one
 	f.wantSignedIn(latest)
+	f.wantSignedIn(rotated)
+	f.clk.advance(60 * time.Second)
+	f.wantSignedIn(rotated)
+	f.clk.advance(time.Millisecond)
 	f.wantUnauthenticated(rotated)
+	f.wantSignedIn(latest)
+	if got := f.sessionID(latest); got != sid {
+		t.Errorf("the session behind the latest cookie is %s, want the same session %s", got, sid)
+	}
 
 	// Wrong current passwords are failed password checks (03 §7.3): the sixth from one address is 429.
 	for range 5 {

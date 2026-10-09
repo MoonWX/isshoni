@@ -44,7 +44,9 @@
 //   - selfservice.go (README S58): RevokeSession, RevokeOtherSessions, LogoutEverywhere, ChangePassword, DeleteSelf
 //     and RevokeDevice, each a row of that table with its audit row. Changing the password and deleting the account
 //     ask for the password again (verifyOwnPassword), which counts in the two per-username buckets of failed
-//     password checks like a login; the only active admin can't delete the account (§7.11);
+//     password checks like a login; the only active admin can't delete the account (§7.11). A password change gives
+//     the caller's session a new token as a rotation of §7.4: the token the request arrived with works for 60 s
+//     more;
 //   - alerts.go: admin alerts (§7.11).
 //
 // A call that acts for an account takes a store.Actor and reads that account inside its own transaction (actingAs

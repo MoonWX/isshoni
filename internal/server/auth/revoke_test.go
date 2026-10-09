@@ -147,7 +147,8 @@ type revRow struct {
 
 	// gone are the indexes of Alex's sessions that the event deletes (the table's "Web sessions" column).
 	gone []int
-	// rotated: the caller's session stays under a new token, and its old one is dead at once.
+	// rotated: the caller's session stays under a new token; its old one is the previous token of a rotation
+	// (03 §7.4), which TestChangePassword follows to the end of its 60 s.
 	rotated bool
 	// others is how many session rows Alex has afterwards besides the fixture's three.
 	others int
@@ -400,15 +401,18 @@ func TestRevocationMatrix(t *testing.T) {
 				if got := f.session(f.alex.ID, id) == nil; got != isGone {
 					t.Errorf("s[%d]: row gone = %v, want %v", i, got, isGone)
 				}
-				_, err := f.svc.Authenticate(f.request(http.MethodGet, tok))
+				old, err := f.svc.Authenticate(f.request(http.MethodGet, tok))
 				touchErr := f.svc.Touch(ctx, principalOf(f.s[i].Session, f.s[i].User), netip.MustParseAddr(ipA))
 				switch {
 				case isGone:
 					wantCode(t, err, api.CodeUnauthenticated)
 					wantCode(t, touchErr, api.CodeUnauthenticated)
 				case i == 0 && row.rotated:
-					// The session is the same one under a new token.
-					wantCode(t, err, api.CodeUnauthenticated)
+					// The session is the same one under a new token, and the old token is still let in as that session:
+					// the browser's other tabs hold it until the new cookie reaches them.
+					if err != nil || old.SessionID != id {
+						t.Errorf("the caller's old token right after the rotation: %+v, %v; want the same session", old, err)
+					}
 					p, err := f.svc.Authenticate(f.request(http.MethodGet, f.newToken))
 					if err != nil || p.SessionID != id || touchErr != nil {
 						t.Errorf("the caller's session under its new token: %+v, %v; Touch: %v", p, err, touchErr)

@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -33,10 +34,6 @@ const targetDevice = "device"
 // fieldNewPassword is the JSON name of the new password in POST /api/v1/me/password, the key of its
 // validation_failed answer (CheckPassword names the field "password").
 const fieldNewPassword = "newPassword"
-
-// sessionNoGrace is the prev_valid_until of a rotation whose old token stops working at once: a time that no clock
-// reaches again, so a clock that steps back cannot revive the token either.
-var sessionNoGrace = time.Unix(0, 0)
 
 // errWrongPassword is 403 wrong_password: the re-authentication of a logged-in user failed.
 func errWrongPassword() error { return api.NewError(api.CodeWrongPassword) }
@@ -171,17 +168,22 @@ func (s *Service) RevokeSession(ctx context.Context, p Principal, id store.Sessi
 	return nil
 }
 
-// RevokeOtherSessions deletes every web session of the principal's user except the caller's and returns how many
-// there were (POST /api/v1/me/sessions/revoke-others; 03 §7.7 "Sign out other browsers"). Their push subscriptions
-// go with them; devices and a pending reset link stay. One session.revoked {name} row is written per session.
-// After the commit the user's sessions leave the cache and the connections of exactly the deleted sessions are
-// closed with ReasonSessionRevoked; the caller's stay.
+// RevokeOtherSessions deletes every web session of the principal's user except the caller's
+// (POST /api/v1/me/sessions/revoke-others; 03 §7.7 "Sign out other browsers"). Their push subscriptions go with
+// them; devices and a pending reset link stay. One session.revoked {name} row is written per session. After the
+// commit the user's sessions leave the cache and the connections of exactly the deleted sessions are closed with
+// ReasonSessionRevoked; the caller's stay.
+//
+// It returns how many browsers were signed out: the deleted sessions that were live until then, which are the ones
+// GET /me/sessions lists besides the caller's. A row that had expired already and that the janitor has not pruned
+// yet (03 §4.7) goes like the others, with its audit row, but was no session any more and is not counted.
 func (s *Service) RevokeOtherSessions(ctx context.Context, p Principal, m ReqMeta) (int, error) {
 	if err := webCaller("RevokeOtherSessions", p); err != nil {
 		return 0, err
 	}
 	now := s.now()
 	var rv revoked
+	var live int
 	err := s.db.Write(ctx, func(q *store.Q) error {
 		me, err := loadSelf(q, p, now)
 		if err != nil {
@@ -190,9 +192,13 @@ func (s *Service) RevokeOtherSessions(ctx context.Context, p Principal, m ReqMet
 		if rv, err = revokeOtherBrowsers.apply(q, me.user.ID, me.session.ID); err != nil {
 			return err
 		}
+		live = 0
 		actor := userActor(me.user, m)
 		for _, id := range rv.sessions {
 			sess, _ := sessionNamed(me.sessions, id) // deleted in this Write, so it was in the list read above
+			if sessionLive(sess, now) {
+				live++
+			}
 			err := q.AppendAudit(store.AuditEntry{At: now, Action: auditSessionRevoked, Actor: actor,
 				TargetKind: targetSession, TargetID: string(id), TargetName: sess.Name,
 				Detail: map[string]any{"name": sess.Name}})
@@ -206,7 +212,7 @@ func (s *Service) RevokeOtherSessions(ctx context.Context, p Principal, m ReqMet
 		return 0, serviceErr("revoke other sessions", err)
 	}
 	s.revocationCommitted(rv)
-	return len(rv.sessions), nil
+	return live, nil
 }
 
 // LogoutEverywhere deletes every web session and every device of the principal's user, the caller's session
@@ -252,15 +258,16 @@ func (s *Service) LogoutEverywhere(ctx context.Context, p Principal, m ReqMeta) 
 //  5. one Write, which checks the caller again and that the password is still the one that was verified (a
 //     parallel change or an admin reset in between answers wrong_password): the hash and password_changed_at; every
 //     other web session, every device and a pending reset link are deleted (revokePasswordChanged); the caller's
-//     session gets a new token; auth.password_changed is written.
+//     session gets a new token (rotateForCaller); auth.password_changed is written.
 //
 // After the commit the user's sessions leave the cache and every connection of the user but those of the caller's
 // session is closed with ReasonPasswordChanged.
 //
-// The returned LoginResult is the caller's session under its new token, which httpapi sets as the cookie. The old
-// token stops working at once, without the 60 s grace of the daily rotation: changing the password is how a user
-// shuts out whoever else may hold this cookie. The change counts as a use of the session (last_seen_at, last_ip and
-// idle_expires_at move, and the cookie's Max-Age is a fresh 30 days, or what is left of the 180).
+// The returned LoginResult is the caller's session under its new token, which httpapi sets as the cookie. That is a
+// rotation of 03 §7.4, like the daily one: the token the request arrived with works for 60 s more, so the requests
+// the browser has under way and its other tabs are not signed out before the new cookie reaches them. The change
+// counts as a use of the session (last_seen_at, last_ip and idle_expires_at move, and the cookie's Max-Age is a
+// fresh 30 days, or what is left of the 180).
 func (s *Service) ChangePassword(ctx context.Context, p Principal, current, next string, m ReqMeta) (LoginResult, error) {
 	const op = "change password"
 	if err := webCaller("ChangePassword", p); err != nil {
@@ -306,7 +313,7 @@ func (s *Service) ChangePassword(ctx context.Context, p Principal, current, next
 		if rv, err = revokePasswordChanged.apply(q, user.ID, sess.ID); err != nil {
 			return err
 		}
-		if err := q.RotateSession(sess.ID, s.keys.sessionTokenHash(token), sessionNoGrace, now); err != nil {
+		if err := s.rotateForCaller(q, sess, token, m, now); err != nil {
 			return err
 		}
 		if err := q.TouchSession(sess.ID, ipString(m.IP), now, now.Add(sessionIdleTTL)); err != nil {
@@ -324,6 +331,32 @@ func (s *Service) ChangePassword(ctx context.Context, p Principal, current, next
 	}
 	s.revocationCommitted(rv)
 	return res, nil
+}
+
+// rotateForCaller gives the caller's session a new token inside a Write, as a rotation of 03 §7.4: the token the
+// browser holds becomes the session's previous one and works for sessionPrevGrace more, so the requests it has
+// under way and its other tabs are let in until the new cookie reaches them.
+//
+// The token the browser holds is the one the request arrived with (m.SessionToken). As a rule that is the session's
+// current token, and one rotation does it. It is the previous one, still in its own grace, when a rotation came in
+// between: the chain's daily rotation runs before the handler (03 §7.4), and the cookie it set never reaches the
+// browser, because the handler's replaces it. A session has one previous token, so a plain rotation would give the
+// grace to that token nobody holds and end the browser's own at once. The session is therefore rotated back to the
+// request's token first, which the rotation to the new token then keeps; the token in between stops working at
+// once. (The rotation of a parallel request in the last 60 s looks the same from here and is treated the same:
+// the request's own token is the one the browser is known to have had.) A request that says nothing about its
+// cookie (a caller other than httpapi) gets the plain rotation, and a previous token past its grace is not revived.
+func (s *Service) rotateForCaller(q *store.Q, sess store.Session, token string, m ReqMeta, now time.Time) error {
+	grace := now.Add(sessionPrevGrace)
+	if tokenWellFormed(m.SessionToken, sessionTokenBytes) {
+		held := s.keys.sessionTokenHash(m.SessionToken)
+		if bytes.Equal(held, sess.PrevTokenHash) && !now.After(sess.PrevValidUntil) {
+			if err := q.RotateSession(sess.ID, held, grace, now); err != nil {
+				return err
+			}
+		}
+	}
+	return q.RotateSession(sess.ID, s.keys.sessionTokenHash(token), grace, now)
 }
 
 // DeleteSelf deletes the principal's own account (POST /api/v1/me/delete; 03 §7.7 "Delete user", 03 §7.11). In

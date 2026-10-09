@@ -61,6 +61,10 @@ func (a *API) postLogoutEverywhere(w http.ResponseWriter, r *http.Request) {
 // sessions and every linked device are signed out, and their connections closed. Errors: 403 wrong_password (the
 // current password does not match, or is missing), 422 validation_failed {newPassword: code}, 429 rate_limited
 // (too many wrong passwords, 03 §7.3), 503 server_busy.
+//
+// The new token is a rotation of 03 §7.4: the cookie the request arrived with works for 60 s more. This browser's
+// other tabs hear of the change (devices) before the response with the new cookie is written, and what they fetch
+// under the old cookie in between is still let in.
 func (a *API) postPassword(w http.ResponseWriter, r *http.Request) {
 	p, ok := PrincipalFrom(r.Context())
 	if !ok {
@@ -181,8 +185,9 @@ func (a *API) deleteSession(w http.ResponseWriter, r *http.Request) {
 }
 
 // postRevokeOthers is POST /api/v1/me/sessions/revoke-others (03 §12.3 #16, §12.4.3; 03 §7.7 "Sign out other
-// browsers"): 200 {revoked}, the number of web sessions that were signed out; this one stays. The body ({}) is not
-// read.
+// browsers"): 200 {revoked}, the number of browsers that were signed out: the other sessions that GET /me/sessions
+// listed. An expired row the janitor has not removed yet goes with them and is not counted. This session stays. The
+// body ({}) is not read.
 func (a *API) postRevokeOthers(w http.ResponseWriter, r *http.Request) {
 	p, ok := PrincipalFrom(r.Context())
 	if !ok {

@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -111,7 +112,8 @@ func TestRevokeOtherSessions(t *testing.T) {
 		t.Fatalf("the caller's session afterwards: %v", err)
 	}
 
-	// Two other browsers, one of them expired but not pruned yet: both rows go.
+	// Two other browsers, one of them expired but not pruned yet: both rows go, each with its audit row and its
+	// CloseConnections call. The answer counts the one that was a session until now, which is what the list showed.
 	second := e.login("Alex", ipB)
 	var stale store.Session
 	e.write(func(q *store.Q) error {
@@ -123,8 +125,8 @@ func TestRevokeOtherSessions(t *testing.T) {
 	e.advance(time.Minute)
 	now := e.clk.now()
 	n, err := e.svc.RevokeOtherSessions(ctx, p, meta(ipC))
-	if err != nil || n != 2 {
-		t.Fatalf("RevokeOtherSessions = %d, %v; want 2", n, err)
+	if err != nil || n != 1 {
+		t.Fatalf("RevokeOtherSessions = %d, %v; want 1 (the live session, not the expired row)", n, err)
 	}
 	if got := e.sessions(alex.ID); len(got) != 1 || got[0].ID != mine.Session.ID {
 		t.Errorf("sessions afterwards = %+v, want only the caller's", got)
@@ -147,6 +149,24 @@ func TestRevokeOtherSessions(t *testing.T) {
 	}
 	_, err = e.svc.Authenticate(e.request(http.MethodGet, second.Token))
 	wantCode(t, err, api.CodeUnauthenticated)
+
+	// Only an expired row besides the caller's: it goes like any other, and no browser was signed out.
+	e.write(func(q *store.Q) error {
+		past := e.clk.now().Add(-40 * 24 * time.Hour)
+		stale = store.Session{UserID: alex.ID, TokenHash: []byte("stale-hash-2"), Name: "Firefox on Linux", CreatedAt: past,
+			LastIP: ipC, IdleExpiresAt: past.Add(sessionIdleTTL), ExpiresAt: past.Add(sessionMaxTTL)}
+		return q.CreateSession(&stale)
+	})
+	if n, err := e.svc.RevokeOtherSessions(ctx, p, meta(ipC)); err != nil || n != 0 {
+		t.Fatalf("RevokeOtherSessions with only an expired row = %d, %v; want 0", n, err)
+	}
+	want := []closedConn{{ConnSelector{UserID: alex.ID, SessionID: stale.ID}, ReasonSessionRevoked}}
+	if calls := e.conns.take(); fmt.Sprint(calls) != fmt.Sprint(want) {
+		t.Errorf("CloseConnections calls = %+v, want %+v", calls, want)
+	}
+	if got, rows := e.sessions(alex.ID), e.auditCount(auditSessionRevoked); len(got) != 1 || got[0].ID != mine.Session.ID || rows != 3 {
+		t.Errorf("after the expired row went: sessions %+v, %d session.revoked rows; want the caller's and 3", got, rows)
+	}
 }
 
 func TestLogoutEverywhere(t *testing.T) {
@@ -266,14 +286,30 @@ func TestChangePassword(t *testing.T) {
 		!res.User.PasswordChangedAt.Equal(now) {
 		t.Errorf("LoginResult = %+v", res)
 	}
-	// The old token is dead at once, without the grace of a daily rotation; the new one is the session.
-	_, err = e.svc.Authenticate(e.request(http.MethodGet, mine.Token))
-	wantCode(t, err, api.CodeUnauthenticated)
-	if got, err := e.svc.Authenticate(e.request(http.MethodGet, res.Token)); err != nil || got.SessionID != mine.Session.ID {
-		t.Errorf("the new token: %+v, %v", got, err)
+	// A rotation of 03 §7.4: the new token is the session, and the old one is its previous token for 60 s, so that
+	// the browser's other tabs are not signed out before the new cookie reaches them.
+	if !bytes.Equal(sess.TokenHash, e.svc.keys.sessionTokenHash(res.Token)) ||
+		!bytes.Equal(sess.PrevTokenHash, e.svc.keys.sessionTokenHash(mine.Token)) || !sess.PrevValidUntil.Equal(now.Add(sessionPrevGrace)) {
+		t.Errorf("the caller's session after the change = %+v; want the new hash, and the old one as previous for 60 s", sess)
+	}
+	for name, tok := range map[string]string{"old": mine.Token, "new": res.Token} {
+		if got, err := e.svc.Authenticate(e.request(http.MethodGet, tok)); err != nil || got.SessionID != mine.Session.ID {
+			t.Errorf("the %s token right after the change: %+v, %v; want the caller's session", name, got, err)
+		}
 	}
 	if e.svc.Touch(ctx, p, meta(ipC).IP) != nil {
 		t.Error("the caller's connection would be closed at its next revalidation")
+	}
+	// The old token works until the grace ends, and not a millisecond longer; the new one goes on.
+	e.advance(sessionPrevGrace)
+	if _, err := e.svc.Authenticate(e.request(http.MethodGet, mine.Token)); err != nil {
+		t.Errorf("the old token 60 s after the change: %v", err)
+	}
+	e.advance(time.Millisecond)
+	_, err = e.svc.Authenticate(e.request(http.MethodGet, mine.Token))
+	wantCode(t, err, api.CodeUnauthenticated)
+	if got, err := e.svc.Authenticate(e.request(http.MethodGet, res.Token)); err != nil || got.SessionID != mine.Session.ID {
+		t.Errorf("the new token after the grace: %+v, %v", got, err)
 	}
 	rows := e.audit(auditPasswordChanged)
 	if len(rows) != 1 {
@@ -300,6 +336,81 @@ func TestChangePassword(t *testing.T) {
 		if ae := wantCode(t, err, api.CodeValidationFailed); fmt.Sprint(ae.Fields) != "map[newPassword:same_as_username]" {
 			t.Errorf("ChangePassword to %q: fields %v, want newPassword: same_as_username", next, ae.Fields)
 		}
+	}
+}
+
+// TestChangePasswordAfterARotation: which token keeps the 60 s when the session was rotated just before the
+// change. The chain's daily rotation runs before the handler (03 §7.4), so the request of a password change can
+// arrive with the session's previous token. That is the token the browser holds, and the one that is let in until
+// the new cookie arrives; the chain's token never reaches the browser and stops working at once. In every other
+// case the session's current token becomes the previous one, as in any rotation.
+func TestChangePasswordAfterARotation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// wait is how long after the daily rotation the change arrives.
+		wait time.Duration
+		// cookie picks the token the change's request arrives with ("" for a caller that names none).
+		cookie func(before, chains string) string
+		// keeps: the token from before the rotation is let in after the change; otherwise the chain's token is.
+		keeps bool
+	}{
+		{"the chain rotated in this request", 0, func(before, _ string) string { return before }, true},
+		{"the previous token at the end of its grace", sessionPrevGrace, func(before, _ string) string { return before }, true},
+		{"the previous token after its grace", sessionPrevGrace + time.Millisecond, func(before, _ string) string { return before }, false},
+		{"the browser has the rotated cookie already", 0, func(_, chains string) string { return chains }, false},
+		{"a caller that names no cookie", 0, func(_, _ string) string { return "" }, false},
+		{"a cookie that is no token", 0, func(_, _ string) string { return "nonsense" }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newSvcEnv(t)
+			alex := e.addUser("Alex")
+			mine := e.login("Alex", ipA)
+			e.advance(sessionRotateAfter)
+			cookies, err := e.rotate(mine.Token)
+			if err != nil || len(cookies) != 1 {
+				t.Fatalf("the daily rotation: cookies %v, err %v; want one", cookies, err)
+			}
+			before, chains := mine.Token, cookies[0].Value
+			e.advance(tc.wait)
+
+			now := e.clk.now()
+			m := meta(ipA)
+			m.SessionToken = tc.cookie(before, chains)
+			res, err := e.svc.ChangePassword(context.Background(), principal(mine), testPassword, newPassword, m)
+			if err != nil {
+				t.Fatal(err)
+			}
+			kept, ended := before, chains
+			if !tc.keeps {
+				kept, ended = chains, before
+			}
+			sess := e.session(alex.ID, mine.Session.ID)
+			if sess == nil || !bytes.Equal(sess.TokenHash, e.svc.keys.sessionTokenHash(res.Token)) ||
+				!bytes.Equal(sess.PrevTokenHash, e.svc.keys.sessionTokenHash(kept)) ||
+				!sess.PrevValidUntil.Equal(now.Add(sessionPrevGrace)) || !sess.RotatedAt.Equal(now) {
+				t.Fatalf("the session after the change = %+v; want the new hash, and the kept token's as previous for 60 s", sess)
+			}
+			for name, tok := range map[string]string{"new": res.Token, "kept": kept} {
+				if got, err := e.svc.Authenticate(e.request(http.MethodGet, tok)); err != nil || got.SessionID != mine.Session.ID {
+					t.Errorf("the %s token right after the change: %+v, %v; want the caller's session", name, got, err)
+				}
+			}
+			_, err = e.svc.Authenticate(e.request(http.MethodGet, ended))
+			wantCode(t, err, api.CodeUnauthenticated)
+
+			e.advance(sessionPrevGrace)
+			if _, err := e.svc.Authenticate(e.request(http.MethodGet, kept)); err != nil {
+				t.Errorf("the kept token 60 s after the change: %v", err)
+			}
+			e.advance(time.Millisecond)
+			for _, tok := range []string{kept, ended} {
+				_, err = e.svc.Authenticate(e.request(http.MethodGet, tok))
+				wantCode(t, err, api.CodeUnauthenticated)
+			}
+			if got, err := e.svc.Authenticate(e.request(http.MethodGet, res.Token)); err != nil || got.SessionID != mine.Session.ID {
+				t.Errorf("the new token after the grace: %+v, %v", got, err)
+			}
+		})
 	}
 }
 
