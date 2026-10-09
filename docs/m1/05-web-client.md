@@ -1460,9 +1460,10 @@ pseudo-fullscreen and the keyboard, and nothing else.
   - **Where it is offered: as built, wherever the platform reports it.** `capabilities.pip` is
     `document.pictureInPictureEnabled` and not iOS (§8; an iPad that calls itself a Mac counts as iOS). That is
     the desktop browsers, and it is also **Android Chrome**, which reports PiP too, where the rule above says
-    "desktop only". Whether Android keeps the button is an **open question for the owner** (asked after group 6):
-    the rule above stands as written, the code stays as built until the answer, and the manual matrix row M-AND-1
-    (§19.4) is where it shows. iOS is not part of the question: no PiP there in M1.
+    "desktop only". Whether Android keeps the button is an **open question for the owner** (asked after group 6,
+    still open after group 7): the rule above stands as written, the code stays as built until the answer, and
+    the manual matrix row M-AND-1 (§19.4) is where it shows. iOS is not part of the question: no PiP there in
+    M1.
 - **Wake lock.** `platform.requestWakeLock()` is the browser's side (§8) and answers `null` where the API is
   missing or refuses (battery saver, iOS Low Power Mode); the viewer asks for it only where
   `capabilities.wakeLock` is true, and only decides when to hold one: while the page is visible and a share that
@@ -2338,6 +2339,19 @@ component (`InAppBrowserBanner.tsx`, with `inAppBanner.ts`) and the lines that s
 `GET /api/v1/admin/bandwidth` (one implementation for CLI and UI, 04 §13.4) and shows egress, per-viewer rate and GB
 per session.
 
+**What the Doctor page gets from the server** (04 §13.1, §13.2 as README S60 built them; the page is README
+S91's):
+- `GET /api/v1/admin/doctor` answers **404 `not_found` until the server has its first report**, which is the
+  first 20 s of a new installation; a restarted server has its last report at once. For the page a 404 there
+  means "no report yet", not a failure.
+- `POST` answers 429 `doctor_busy` with `retryAfter` while a run is under way and for 10 s after one: the page
+  keeps the report it has and can try again after that time.
+- A check has five statuses. `ok` also covers a check with nothing to check in this configuration (its code says
+  why, `dns.no_domain` or `tls.off`, say); `skip` means the check could not run; `info` is a fact to read and
+  never a problem. `fixCode` is absent where there is nothing to do, and for `tls` it can be one of the ten
+  certificate codes of 04 §8.7, with the server's own sentence in `params.lastError` when it has one. The
+  catalog needs a text for every code and fix code of 04 §13.2.
+
 **The pages as README S49 built them** (`web/src/admin/`: Users, Approvals, Invites, Rooms, Settings and Audit;
 the Dashboard and Doctor pages are README S91's, and until then their routes show the router's `PageUnavailable`
 inside the layout, whose navigation already lists them).
@@ -2850,6 +2864,74 @@ CI runs Chrome stable headful under `xvfb-run` with a PulseAudio null sink (06's
 `--auto-select-tab-capture-source-by-title=isshoni-e2e-tone`, `--allow-loopback-in-peer-connection`, and
 `--autoplay-policy=no-user-gesture-required` except in the unmute spec.
 
+**The harness as README S61 built it** (`web/playwright.config.ts`, `web/e2e/fixtures.ts`, `stats.ts`,
+`smoke.spec.ts`; the CI job is 06 §8.2). What the paragraphs above leave open:
+
+- **Xvfb needs a window manager: openbox.** Xvfb is a bare X server. Chrome's capture picker also lists the
+  display's windows, which reads properties that only a window manager sets; without one `getDisplayMedia` never
+  answers (an X `BadAtom` error in Chrome's log), so the tone-tab pick hangs. CI starts `openbox` inside the
+  `xvfb-run` session, on a 1920×1080 screen, and it ends with the session. Only CI is headful (`headless: !CI`).
+  A local `task e2e` is headless, and its specs share through the fake-display seam (below); for windows and
+  the real picker, run `ISSHONI_BIN=bin/isshoni npm run e2e -- --headed` in `web/`.
+- **One worker in CI.** There all browser windows share Xvfb's one display, and the picker lists that display's
+  windows: when a window of another worker goes away at that moment, Chrome logs an X `BadWindow` error and
+  `getDisplayMedia` never answers, about one pick in 25 with two workers and none with one. Local runs keep
+  Playwright's default.
+- **One retry in CI, none locally.** A test that passes its second attempt is reported as flaky and leaves the
+  job green, so CI uploads `test-results/` and the report after every run that was not cancelled: the trace, the
+  video and the server log of the failed attempt are how a flake gets found. Timeouts: 60 s per test, 10 s per
+  `expect`, 15 min for the whole run in CI (the job has 20, so a hung run ends as a failure in time for its
+  upload). `forbidOnly` in CI.
+- **Video needs Playwright's own ffmpeg**, so it is recorded in CI only (`retain-on-failure`), where the job runs
+  `npx playwright install ffmpeg`: a machine that already had Chrome doesn't have that build, and `playwright
+  install chrome` is what would bring it along. Locally video is off; the trace (`retain-on-failure` everywhere)
+  shows every step anyway, and a failed test keeps a screenshot.
+- **The PulseAudio null sink stays for now.** It gives Chrome an audio output device. In a container run of the
+  job's steps a captured tab's sound also reached a receiving PeerConnection without any device, so the sink can
+  go once the specs that play audio (`watch`, `focus-audio`, `unmute`; README S66, S72) pass without it.
+- **Service workers are blocked** in every context: a production build registers one, and it would answer
+  navigations from its cache. `pwa.spec` turns them on for itself (`test.use({ serviceWorkers: 'allow' })`).
+- **The auth throttles don't couple the specs.** Every public account request of the harness (the setup, a
+  sign-up, a login) carries an `X-Forwarded-For` header with an address that no earlier request of the worker
+  had, from the documentation ranges of RFC 5737 (`fromNewAddress`). An e2e server trusts the header from a
+  loopback peer (off mode on a loopback listener, 04 §8.5), so each request has a client address of its own, as
+  each friend has. Without it everything would come from 127.0.0.1 and share one `auth-ip` bucket (03 §7.3:
+  20 attempts, then one per 15 s), which the specs that share a worker's server would empty between them. The
+  server-wide `auth-hash` budget is real: on 503 `server_busy` the harness waits as long as `Retry-After` says
+  (at most 5 s) and sends the request again, up to five times. What a page itself sends (a login typed into the
+  form) carries no such header and counts as 127.0.0.1.
+- **The server process** gets this process's environment without any `ISSHONI_*` variable (a config key in the
+  developer's shell, or CI's `ISSHONI_VERSION`, must not reach it), plus `ISSHONI_DATA_DIR` and
+  `ISSHONI_ALLOW_EPHEMERAL_DATA=1` (the data is temporary on purpose, and the tests may themselves run in a
+  container). The fixture owns `public_url`, `data_dir`, `listen.http` and `listen.admin_socket`; an override of
+  one of them is an error. It waits 20 s for `/readyz`; an error of a server that did not start shows the first
+  and the last lines of its log. `stop()` sends SIGTERM and kills after 15 s.
+- **`startServer` returns more than `{url, admin, restart(), stop()}`**: `logPath`; `setupUrl()` (mints
+  `<url>/setup#<token>` with `isshoni setup-url --json`); `createInvite(options?)` as the admin;
+  `createUser(username?)`, an active member through a one-use invite; and `signIn(context, account)`, which logs
+  in over REST with the context's cookie jar. Use one browser context per server: a cookie ignores the port, so
+  the session of a second e2e server would replace the first one's.
+- **More fixtures and helpers.** `asUser(server, account?)` opens one more signed-in browser context for one
+  more person and keeps its video like the default context's. Every context of the harness has the debug flag
+  set, so its pages install `window.__isshoni` (§10.7); `enableDebug` does it for a context a spec made itself.
+  `fakeDisplay(target, value)` sets the fake-display seam and `openToneTab(context, server)` opens the tone tab
+  under the server's origin. `chromeArgs({autoplay: false})` is the flag list without the autoplay flag, for the
+  unmute spec. An automatic fixture attaches, to a failed test, the logs of the servers it could have used, and
+  notes (annotation `e2e server`) a server whose process ended by itself.
+- **`stats.ts`** reads `window.__isshoni`: `debugReady`, `readState`, `readStats`, `waitForState`,
+  `waitForStats`, `waitForRoom`, and `videoOf`, `audioOf` and `pcOf` to pick one share's or one PC's sample. Reads
+  and waits span a navigation: a read whose handle went away under it waits for the next handle.
+- **`smoke.spec`** is the harness's own spec: the worker's server is ready, set up and serves the app of its own
+  build; the admin logs in through the page and lands in the lounge; a second person joins in a context of
+  their own; a page alone on a server of its own reads the state and the stats of an empty room; a server of the
+  test's own waits for the setup and takes overrides, and comes back after a restart with its data at the same
+  URL; and, in a headful run only (CI, or `--headed`; skipped in a headless one), Chrome's flag picks a tab with
+  the tone tab's title by itself. That last test uses stand-in pages served under the server's origin: one with
+  the title `isshoni-e2e-tone`, and one whose button asks as the app does (`displaySurface: 'window'`, with
+  audio); the capture is reported as `browser` with one audio track. `tone.html` itself comes with README S66.
+  On the worker's server, which later specs share, the tests assert only what also holds with other people in
+  the lounge.
+
 **Not `--use-fake-ui-for-media-stream`** (S35's finding, checked again for this write-back with headful Chrome 154
 on macOS and the options of §13.2; an earlier version of this section listed the flag). With the flag Chrome shows
 no picker and answers `getDisplayMedia` at once, and the tone tab is never what it picks, with or without
@@ -2862,8 +2944,9 @@ no picker and answers `getDisplayMedia` at once, and the tone tab is never what 
 So under that flag the real Share button fails. The flag exists for `getUserMedia` prompts, and the app never
 calls `getUserMedia`, so the harness leaves it out. With the auto-select flag alone, the app's own request
 (`displaySurface: 'window'`) captures the tone tab, reported as `displaySurface: 'browser'` with an audio track.
-Both were observed on the Mac only; S61 and S66 confirm the flag list under xvfb, where the tone-tab capture is
-an acceptance item.
+Both were observed on the Mac only. README S61's headful smoke test checks the flag list under Xvfb with a
+stand-in for the tone tab (below: it needs a window manager and one worker there); S66 confirms the capture of
+`tone.html` through the app's own Share button, which is its acceptance item.
 
 **A second pick needs `page.bringToFront()`.** After a real pick of the tone tab, a second `getDisplayMedia` from
 the same sharer page rejects with `InvalidStateError` ("Invalid state"; `capture_failed` in the app), and works
@@ -3056,7 +3139,7 @@ Decided after group 5 (engineering calls the owner delegated; README §6):
   01 §8.7). The M1 UI changes a preset only from the publishing page; the push to the publisher comes with the M2
   desktop handoff.
 
-**Open, for the owner** (raised after group 6; README §6):
+**Open, for the owner** (raised after group 6, still open after group 7; README §6):
 - **Picture-in-picture on Android Chrome** (§12.5). The rule says "desktop only" and hides PiP on iOS. README S56
   built it by capability: the button is there wherever the browser reports PiP and the device is not iOS, which
   includes Android Chrome. The two readings differ only there. Until the owner answers, the rule in §12.5 is not

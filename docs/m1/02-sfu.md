@@ -225,12 +225,26 @@ same rule covers the Go client. The client treats the sub offer with a new `ice-
 - New PC: a 10 s handshake timer (ICE + DTLS to `connected`); expiry closes it and sends
   `PCStateEvent{failed, "handshake_timeout"}`. ICE restarts have no server timer and send no event: the client
   rebuilds after 15 s (01 §10.4).
+
+  **The timer starts with the PC's first answer, not with the PC** (README S57, `Conn.startHandshake`): the moment
+  the client can start ICE and DTLS. For a pub PC that is when `HandleOffer` has taken the first offer of its
+  `gen`, just before it returns the answer. For a sub PC it is when `HandleAnswer` has applied the first answer
+  to an offer of its `gen`; a sub offer that is still waiting for its answer is not timed, however often the 15 s
+  re-send repeats it, because a client that hasn't answered has no ICE to complete. Later answers on the same PC
+  start nothing. The timer stops when the PC is `connected` and when its ICE fails first (the grace below takes
+  over), and with the PC. When it runs out the PC is closed and counted (`Metrics.HandshakeTimeouts`, §13):
+  - **pub**: the PC is gone and its `gen` is over, as after a client's close (below). Its shares stay as they
+    were, `pending` for a first PC, until the hub's 30 s timeout or the next `gen`'s keyframe; the event has the
+    client offer `gen + 1` (§6.4).
+  - **sub**: the PC is in the `closed` state of the table above, with the Conn's subscriptions kept; the
+    client's rebuild request brings the successor.
 - `connected`: sub PC opens the DTLS gate and sends a keyframe request for every video DownTrack. Pub PC (again
   `connected` after a drop, an ICE restart or a rebuild): one keyframe request per video layer of its shares (§9.7).
 - `disconnected`: nothing. The client drives restarts (01/05: ICE `disconnected` for 3 s → restart).
-- `failed`: send `PCStateEvent`, start a 30 s PC grace. With no restart or reset by then, close the PC. For pub, its
-  shares stay `stalled` until the pub PC is connected again and a keyframe arrives (Share diagram above), or the hub's
-  30 s timeout ends them.
+- `failed`: send `PCStateEvent`, start a 30 s PC grace. With no restart or reset by then, close the PC and send
+  `PCStateEvent{closed, "pc_grace_expired"}`. The grace ends without that when the PC is `connecting` again (an
+  ICE restart got in) or is replaced. For pub, its shares are `stalled` at once and stay so until the pub PC is
+  connected again and a keyframe arrives (Share diagram above), or the hub's 30 s timeout ends them.
 - `closed` without a call from signal: Pion closes a PeerConnection when its peer closes its side (the DTLS
   `close_notify` alert), so the SFU sees a current PC go `closed` with no `pc.close` message behind it. A client
   that closes before its own DTLS side is connected sends no alert; the SFU then only sees ICE fail. S29 keeps
@@ -412,16 +426,20 @@ func (s *SFU) Probe(ctx context.Context, user UserID, t ProbeTransport, offerSDP
 func (c *Conn) ID() ConnID
 // HandleOffer applies a pub offer and returns the answer SDP synchronously (gathering is instant with muxes).
 // A higher gen replaces the pub PC (the client rebuilt it); tracks binds every sending m-section to a share.
-// A lower gen, or a lower neg in the current gen, returns sfu.stale_offer (§5.3).
+// A lower gen, or a lower neg in the current gen, returns sfu.stale_offer (§5.3). An 11th new gen within a minute
+// returns sfu.pc_rate_limited, and a PCKind beyond the two sfu.pc_limit ("PC limits" below).
 func (c *Conn) HandleOffer(ctx context.Context, pc PCKind, gen, neg uint32, sdp string, tracks []TrackBinding) (answerSDP string, err error) // PCPub only
 func (c *Conn) HandleAnswer(ctx context.Context, pc PCKind, gen, neg uint32, sdp string) error // PCSub only
 func (c *Conn) AddICECandidate(ctx context.Context, pc PCKind, gen uint32, cand webrtc.ICECandidateInit) error // filtered, §7.3
 // For RestartICE, ResetPC and ClosePC, a gen lower than the current one for that kind is ignored (returns nil,
 // logged at debug).
 func (c *Conn) RestartICE(ctx context.Context, pc PCKind, gen uint32) error // PCSub only (for pub the client re-offers);
-                                                                            // a closed sub PC is rebuilt instead; nil and no
-                                                                            // new offer while one is under way (§5.3)
+                                                                            // a closed sub PC is rebuilt instead, and
+                                                                            // that can be sfu.pc_rate_limited; nil and
+                                                                            // no new offer while one is under way
+                                                                            // (§5.3)
 func (c *Conn) ResetPC(ctx context.Context, pc PCKind, gen uint32) error    // PCSub: close and rebuild with gen + 1 (client asked)
+                                                                            // sfu.pc_rate_limited: the 11th in a minute
 func (c *Conn) ClosePC(ctx context.Context, pc PCKind, gen uint32) error    // the client closed a PC on purpose (pc.close)
 func (c *Conn) StartShare(ctx context.Context, p StartShareParams) (ShareParams, error)
 func (c *Conn) UpdateShare(ctx context.Context, id ShareID, u ShareUpdate) (ShareParams, error)
@@ -476,12 +494,32 @@ subscriptions triggers one debounced renegotiation for the whole batch. Changing
 **Enum values** (S29). `Role`, `ClientKind` and `PCKind` start at 1 (`iota + 1`), so they have no valid zero value: a
 value that the adapter forgot to set is refused instead of meaning `full`, `web` or `pub`. `Join` refuses a `Role`
 or `ClientKind` outside its constants as a contract violation (§6.3), and `HandleOffer`, `HandleAnswer` and
-`AddICECandidate` return `sfu.bad_pc` for a `PCKind` that isn't theirs, the zero value included. `Quality`,
+`AddICECandidate` return `sfu.bad_pc` for a `PCKind` that isn't theirs, the zero value included (for a kind above
+`PCSub`, `HandleOffer` returns `sfu.pc_limit` instead: "PC limits" below). `Quality`,
 `Preset`, `SourceKind` and `ShareState` start at 0, where the zero value is the natural default: `QualityOff`,
 `PresetAuto`, `SourceUnknown`, `SharePending`. The numbers are this package's own and may change: sfuplane maps
 every enum by name (01 §15.4). Each of the seven types has a `String()` with the lower-case name (`full`, `web`,
 `pub`, `high`, `auto`, `window`, `live`, …); for `Role`, `PCKind`, `Quality` and `ShareState` these are the
 `Metrics` label values of §13.
+
+**PC limits** (README S57; the numbers and what counts are §12's).
+- **`sfu.pc_limit`** comes from `HandleOffer` alone, for a `PCKind` above `PCSub`: a Conn has one pub and one sub
+  PC, and such an offer would be for a third. A second PC of one kind can't be asked for at all, because an offer
+  of a higher `gen` replaces the pub PC and the SFU builds every sub PC itself, so that half of the code's meaning
+  has no case. `PCSub` and the zero value stay `sfu.bad_pc` (above).
+- **`sfu.pc_rate_limited`** comes from every request that would make the Conn create one client-caused PC too
+  many, with the time to wait in `RetryAfter`:
+  - as the call's error from `HandleOffer` (a new pub `gen`), from `ResetPC`, and from **`RestartICE`** when the
+    sub PC is closed, since it then rebuilds the PC as `ResetPC` would (§5.3);
+  - as `ErrorEvent{sfu.pc_rate_limited, "pc.sub"}` for the two requests that rebuild a closed sub PC and have no
+    error to put it in: `Resync()`, which returns nothing, and `UpdateSubscriptions`, whose items are applied
+    whether or not the PC that will carry them can be built now. A sub PC that Pion can't create on those two
+    paths is reported the same way, as `ErrorEvent{sfu.internal, "pc.sub"}`.
+
+  A refused request changes nothing: the pub PC of the old `gen` stays, a sub PC that `ResetPC` was to replace
+  stays as it is, and a closed one stays closed with its subscriptions waiting. Nothing builds the refused PC
+  when the minute has passed, so the client asks again; the event is how it knows after a resume or a
+  subscription change.
 
 **`CloseRoom`** (S29) ends every share of the room with `r` (`ShareEnded(r)` each, in `StartedAt` order) and then
 closes every Conn of the room with `Close(r)`; the room is removed with its last Conn. It is the direct way for a
@@ -663,15 +701,15 @@ that has only `Code` set.
 | `sfu.closed` | any Conn method | no | Conn or SFU closed |
 | `sfu.busy` | any Conn method | yes | actor queue full for 5 s |
 | `sfu.role_forbidden` | StartShare, HandleOffer(pub), UpdateSubscriptions | no | role can't do that |
-| `sfu.bad_pc` | HandleOffer, HandleAnswer, RestartICE | no | method not valid for that PC kind (e.g. an offer for `sub`), or the PC doesn't exist. Not returned by `RestartICE`/`ResetPC` when the sub PC was closed: those calls rebuild it (§5.3) |
+| `sfu.bad_pc` | HandleOffer, HandleAnswer, AddICECandidate, RestartICE, ResetPC, ClosePC | no | method not valid for that PC kind (e.g. an offer for `sub`, `RestartICE` or `ResetPC` for `pub`, an unknown kind; for `HandleOffer` a kind above `PCSub` is `sfu.pc_limit` instead), or the PC doesn't exist: a pub offer for a `gen` whose PC has closed, an answer for a closed sub PC's `gen` or without a sub PC, a `RestartICE`, `ResetPC` or `ClosePC{sub}` for a sub `gen` above the current one or without a sub PC. Not returned by `RestartICE`/`ResetPC` when the sub PC was closed: those calls rebuild it (§5.3) |
 | `sfu.bad_sdp` | HandleOffer, HandleAnswer | no | unparsable SDP, data channel in a media PC, >8 m-lines, a pub offer >64 KiB or a sub answer >256 KiB (01 §3.3) |
 | `sfu.no_h264` | HandleOffer | no | the video m-line offers no H.264 packetization-mode=1 (browser without H.264 encoder) |
 | `sfu.bad_rid` | HandleOffer | no | a rid outside {f,q} (M1), or more than 2 |
 | `sfu.unknown_track` | HandleOffer | no | a malformed binding: `tracks` binds one mid twice, a binding of this Conn's share has another kind than its m-section, or one share has a second video or audio m-section. Not for a sending m-section without a binding, or bound to a share that isn't a `pending`/`live`/`stalled` share of this Conn (a share that ended while its offer was in flight): §8.4 answers that m-section `a=inactive` and ignores it (01 §9 rule 4) |
 | `sfu.stale_answer` | HandleAnswer | no | `gen`/`neg` don't match the outstanding offer (sfuplane drops it silently) |
 | `sfu.stale_offer` | HandleOffer | no | pub offer with a `gen` lower than the current one, or a `neg` lower than the last one in the current `gen` (sfuplane sends `stale_negotiation`; the client ignores it) |
-| `sfu.pc_limit` | HandleOffer | no | a third PC or a second PC of the same kind |
-| `sfu.pc_rate_limited` | HandleOffer, ResetPC | yes | more than 10 client-caused PC creations per PC kind in a minute (§12) |
+| `sfu.pc_limit` | HandleOffer | no | a third PC: an offer whose `PCKind` is above `PCSub`. A second PC of the same kind can't be asked for, a new `gen` replaces (§6.1 "PC limits") |
+| `sfu.pc_rate_limited` | HandleOffer, ResetPC, RestartICE (of a closed sub PC); as an `ErrorEvent` with scope `pc.sub` for `Resync()` and `UpdateSubscriptions` | yes | more than 10 client-caused PC creations per PC kind in a minute (§12); nothing changes, and `RetryAfter` says when to ask again (§6.1 "PC limits") |
 | `sfu.share_not_found` | StopShare, UpdateShare, UpdateSubscriptions item | no | unknown or ended share |
 | `sfu.not_owner` | Conn.StopShare, UpdateShare | no | the share belongs to another Conn (the hub always calls the publishing Conn) |
 | `sfu.too_many_shares` | StartShare | no | defense in depth: 4 per participant (the hub enforces 4 per user and the room soft limit first, 01 §8.7) |
@@ -690,13 +728,14 @@ trying again can't help:
   log message names the call.
 - **A method of a later slice** ("interfaces first", README §4): the whole §6.1 API is declared from S29 on, and a
   method whose slice hasn't landed returns an `*Error{sfu.internal}` whose `Unwrap` is `ErrNotImplemented`
-  (`errors.Is(err, sfu.ErrNotImplemented)`); the message names the method and its README slice. After S29 these are
-  `RestartICE`, `ResetPC` and `ClosePC` (S57), `SetDecodeCaps` (S69) and `Probe` (S76). `Resync()` has no error to
-  return and only logs at debug until S57. The sentinel goes away with the last such method.
+  (`errors.Is(err, sfu.ErrNotImplemented)`); the message names the method and its README slice. After S29 these
+  were `RestartICE`, `ResetPC` and `ClosePC` (S57), `SetDecodeCaps` (S69) and `Probe` (S76), and `Resync()`, which
+  has no error to return, only logged at debug. Since S57 two are left: `SetDecodeCaps` and `Probe`. The sentinel
+  goes away with the last such method.
 
 sfuplane needs no special case for either: both are `sfu.internal`, which it maps to 01's `internal` (01 §15.4).
 So until its slice lands, a call that reaches one of these methods is answered `internal` on the wire: a client's
-`pc.close`, `pc.restart` or `caps.update`, for example.
+`caps.update`, for example (and its `pc.close` and `pc.restart` until S57).
 
 01 owns the error envelope (`error{code, retryable, scope}`); `sfuplane` maps these codes to 01's catalog (01 §15.4)
 and uses `Share` and `RetryAfter` when it builds the wire error. A §8.4 violation changes nothing, so a share whose
@@ -789,6 +828,35 @@ connect directly. `SetNAT1To1IPs` and srflx rewrites are never used.
 | `SetDTLSConnectContextMaker` | 10 s timeout | plan guard |
 | `SetSRTPProtectionProfiles` | `SRTP_AEAD_AES_128_GCM`, `SRTP_AES128_CM_HMAC_SHA1_80` | cheaper per-packet encryption |
 | receive MTU | Pion default (1460) | |
+
+**The filter also counts** (README S57; the cap is §12's 64 per PC and `gen`). Pion's ICE agent keeps every remote
+candidate that equals none it already has, pairs it with each local candidate and sends its checks to it, and has
+no cap of its own. So every candidate that reaches Pion goes through one count per PC and `gen`
+(`remoteCandidates` in `conn.go`), wherever it comes from:
+- **What is counted is a candidate as Pion keeps it, not a transport address.** For each candidate it keeps, the
+  filter returns a `candidateKey` with exactly the fields `ice.Candidate.Equal` compares: network type, address
+  (as the client spelled it), port, TCP type, candidate type and related address. Two candidates on one address
+  that differ in type or related address are two of the 64, as they are two to Pion; two with one key are one.
+- **Trickled candidates and those inside a remote description share the count.** A pub offer's and a sub answer's
+  candidates are judged before `SetRemoteDescription` (`limitSDP`): what the filter drops and what is past the cap
+  is taken out of the SDP. They count only once Pion has taken the description, so a description that is refused
+  admits nothing.
+- **A candidate that was admitted costs nothing when it comes again**: the candidates a client repeats in every
+  re-offer, or sends again after an ICE restart, don't use the 64 up. (After an ICE restart Pion has forgotten
+  the ones it had, so an admitted candidate is given to it again.)
+- **Buffered candidates count like applied ones.** One that arrives before its PC has a remote description waits
+  and is applied when the description is set.
+- **The pub PC's candidates are its own.** The client owns the pub `gen`, so it can trickle for a `gen` whose
+  offer the SFU hasn't accepted yet. Those wait in a buffer of their own (`Conn.pubAhead`, for the newest such
+  `gen`, 64 too) and become that `gen`'s when its offer is accepted. A stray candidate for a later `gen` can
+  therefore neither empty the current PC's count nor keep that PC's own trickled candidates out. Candidates for
+  an older `gen`, for a pub `gen` whose PC has closed, and for any sub `gen` but the current, open one are
+  ignored.
+
+Everything this drops is dropped without an error and logged at debug (a trickled candidate with its reason,
+`limit` for the cap; those of a description as a count). The count is for a Conn's two PCs: the filter without
+it (`filterSDP`) is what the probe offers of §7.6 go through (README S76), since a probe PC takes one offer and
+nothing trickled.
 
 ### 7.4 ICE-TCP on 443
 
@@ -1545,13 +1613,13 @@ Guards limit abuse, not people. Every number here is a constant in `config.go`, 
 
 | Guard | Value | On violation |
 |---|---|---|
-| PCs per Conn | 1 pub + 1 sub | `sfu.pc_limit` |
-| PC creations | 10 per minute per Conn and PC kind, counting new-gen `HandleOffer` and `ResetPC` only; internal rebuilds (§8.5) are not counted and never refused | `sfu.pc_rate_limited` (retryable); `Error.RetryAfter` = time until the oldest counted creation leaves the 1-minute window |
-| ICE + DTLS handshake | 10 s to `connected`, new PCs only (not ICE restarts); DTLS context 10 s | close PC, `PCStateEvent{failed, handshake_timeout}` |
-| PC after `failed` | 30 s grace | close; pub shares stay `stalled` (the hub's 30 s timeout ends them) |
+| PCs per Conn | 1 pub + 1 sub | `sfu.pc_limit` for an offer whose `PCKind` is above `PCSub`; a second PC of one kind can't be asked for (§6.1 "PC limits") |
+| PC creations | 10 per minute per Conn and PC kind, counting the PCs a client makes the Conn create (the scope is below); internal rebuilds (§8.5) are not counted and never refused | `sfu.pc_rate_limited` (retryable); `Error.RetryAfter` = time until the oldest counted creation leaves the 1-minute window; the call's error, or an `ErrorEvent` about the sub PC (§6.1 "PC limits") |
+| ICE + DTLS handshake | 10 s to `connected` from the PC's first answer (§5.3), new PCs only (not ICE restarts); DTLS context 10 s | close PC, `PCStateEvent{failed, handshake_timeout}` |
+| PC after `failed` | 30 s grace | close, `PCStateEvent{closed, pc_grace_expired}`; pub shares stay `stalled` (the hub's 30 s timeout ends them) |
 | Shares | 4 per participant (defense in depth; the hub enforces 4 per user and the room soft limit, 01) | `sfu.too_many_shares` |
 | Publish offer | ≤64 KiB, ≤8 m-lines, ≤2 rids from {f,q}, no data channel | §6.3 codes |
-| Remote candidates | 64 per PC and gen in total (buffered or applied); the first 64 are kept | later ones dropped, logged at debug |
+| Remote candidates | 64 per PC and gen in total, trickled or in the PC's remote descriptions, buffered or applied; a candidate is what Pion keeps as one, and one that comes again counts once (§7.3); the first 64 are kept | later ones dropped, logged at debug |
 | Subscriptions | 256 per Conn; 64 items per `UpdateSubscriptions` | `sfu.too_many_subscriptions` |
 | Actor command queue | 64; 5 s wait | `sfu.busy` |
 | Share without media | none here: the hub ends shares `starting` or `stalled` for 30 s (`media_timeout`, 01 §4.4) | – |
@@ -1563,6 +1631,20 @@ Guards limit abuse, not people. Every number here is a constant in `config.go`, 
 
 ICE-TCP first STUN 10 s and ICE-TCP per-IP limits are 04's (netx TCPMux on 443 and 7882); a violation closes the TCP
 connection, not the PC.
+
+**What the PC creation limit counts** (README S57, `Conn.admitPC`; one window of the last 10 per Conn and kind):
+- **pub**: every pub PC the SFU makes for an offer of a new `gen`, whether or not Pion then takes that offer. An
+  offer that the SFU's own checks refuse (§8.4 step 1) makes no PC and counts for nothing, and neither does a
+  re-offer in the current `gen`.
+- **sub**: every sub PC after the Conn's first that a client's request builds: `ResetPC`, and the successor of a
+  closed sub PC whichever request builds it (`ResetPC`, `RestartICE`, `Resync()` or a subscription change,
+  §5.3). Such a PC follows one that the client closed or made the SFU close, at the client's next request, so
+  it is the client's doing on every one of the four paths.
+- **Not counted**: the Conn's first sub PC, which a Conn gets whatever its client does and can get only once, so
+  ten `ResetPC`s within a minute pass; a `ResetPC` on a Conn without subscriptions, which closes the sub PC and
+  builds none; and the SFU's own codec rebuilds (§8.5, README S69).
+- A refused creation is not counted either, and the PC the Conn has is left as it is. The hub's own limits come
+  first (01 §13: 6 pub offers with a new `gen` and 12 `pc.restart` a minute per PC).
 
 Admin soft limits (0 = unlimited, the default; editable in the admin UI and stored by 03; pushed live with
 `SetLimits` by the wiring from `SettingsCache.OnChange`, 04 §6.6). The room share limit and the participant limit
@@ -1909,7 +1991,11 @@ Output: a human summary plus JSON: `{"scenario","params","server":{"cpu":{avg,p9
 
 All Go tests run with `-race`. `TestMain` runs `goleak.VerifyTestMain` (Pion goroutines allowed 2 s to settle after
 `Close`). Timers (allocator, codec policy, share and PC timeouts) use an internal clock interface that tests replace
-through `export_test.go`; integration tests use real time unless noted.
+through `export_test.go`; integration tests use real time unless noted. The PC timers of README S57 (handshake,
+grace, the sub offer re-send, the ICE restart spacing, the window of the PC creation limit and the stalled
+threshold) are not behind a clock: each SFU keeps them as durations (`timings` in `config.go`) that a test shortens
+with `SetTimings` from `export_test.go` before the first `Join`, and `TestHandshakeTimeout` checks the defaults
+against the numbers of §5.3 and §12.
 
 **Unit (M1)**
 - `codec_test`: `ProfileKey` for fmtp variants (case, missing, `640034`); the compatibility matrix table; `bestPT` exact
@@ -1990,6 +2076,13 @@ with `fake.Source`, `sfutest.Viewer`)**
    of unblocking on the same SSRC; the share never leaves `live`. Resume case: the viewer's signaling drops while its
    UDP is black-holed; after 3 s, `Resync()` and then the viewer's `RestartICE` arrive: exactly one ICE-restart offer
    is sent, and media resumes within 3 s of unblocking.
+   As README S57 timed it: the request and the network come back together. After the 5 s the viewer calls
+   `RestartICE` and its UDP is unblocked in the same moment, as for a client whose network has just returned; the
+   3 s run from the unblocking to the first packet of the resumed video, which starts on a keyframe, on the tracks
+   the viewer had. In the resume case the outage lasts until the SFU itself sees the sub PC `disconnected` (Pion's
+   5 s of §7.3, so about 5 s rather than 3) and at least 3 s; then `Resync()`, the viewer's `RestartICE` and the
+   unblocking follow one another at once. `Resync()` starts the restart and the viewer's request finds it under
+   way (§5.3), so the test sees three sub offers in all and none sent into the dead signaling.
 8. `TestPubPCRebuild`: the publisher replaces its pub PC and offers `gen + 1` with the same share ids in `tracks`;
    viewers get no new sub offer; video resumes on a keyframe; the share goes `stalled` → `live`; ShareID unchanged.
 9. `TestSubPCRebuild`: `ResetPC(sub)` → new offer with all subscriptions; media resumes.
@@ -2005,6 +2098,8 @@ with `fake.Source`, `sfutest.Viewer`)**
     it → no negotiation failure, then a retry.
 14. `TestHandshakeTimeout`: a client that never completes ICE → PC closed at 10 s ± 1 s, `PCStateEvent`. An ICE
     restart that never completes gets no server timer and no event.
+    The 10 s are measured from the PC's first answer (§5.3), for a pub and a sub PC, in real time; a sub PC whose
+    offer has no answer yet has no timer running. `TestHandshakeTimeoutShort` runs the timeout with a short timer.
 15. `TestGuards`: a third PC, a fifth share, a bad rid (`h`, or three rids), a malformed track binding (a video
     m-line bound as audio), no H.264, a data channel, a stale pub offer → the §6.3 codes, with nothing applied. A share
     stopped while its re-offer is in flight (the offer still binds it): the answer comes back with that share's
@@ -2197,6 +2292,42 @@ with `no_layer` also for a request for `high` that gets the preview layer. Trans
 own list of spares decides when Pion's `AddTrack` may take one. The server's cap on a subscription is in place
 for slices 10 and 11. The tests are in §17 (`throttle_test.go`, `subscription_test.go`, `simulcast_test.go`,
 `sfutest.WithoutCutFrames`).
+
+**What README S57 built** (slice 9; integration 7, 8, 9, 11, 14 and 15, in `recovery_test.go`, with the unit
+tests of the timers and guards in `guards_test.go`).
+- **The `stalled` state** (§5.3): a live share is stalled when its pub PC has not been connected for 2 s (the
+  ticker), at once when that PC failed, and at once when its last video track ended (the PC closed, or a new
+  `gen` replaced it). It is live again with the first keyframe that arrives while the pub PC is connected;
+  `LiveAt` stays the first time. Each way in and out goes by what the publishing Conn's actor has seen of its pub
+  PC, so they can't flap against each other.
+- **The sub PC's whole negotiation table** (§5.3): the 15 s re-send of an unanswered offer, ICE restarts one at a
+  time, `ResetPC`, and the rebuild from `closed` on `ResetPC`, `RestartICE`, `Resync()` or a subscription change.
+  `RestartICE`, `ResetPC`, `ClosePC` and `Resync()` are implemented, so a client's `pc.restart` and `pc.close` no
+  longer answer `internal` (§6.3). A `ResetPC` on a Conn without subscriptions closes the sub PC and builds none;
+  the next subscription builds the successor.
+- **PC states**: the 10 s handshake timeout from the PC's first answer and the 30 s grace after `failed`, each
+  with its `PCStateEvent` reason (§5.3); Pion's close on the client's `close_notify` stays (§5.3). A PC's
+  connection state is read on the actor when a callback's post is handled, not carried by the callback, because
+  Pion runs each callback in a goroutine of its own and two changes can arrive in either order; each state is
+  reported once.
+- **The guards of §12**: `sfu.pc_limit` and `sfu.pc_rate_limited` with what they count and who returns them
+  (§6.1 "PC limits", §12), and the cap of 64 remote candidates counted as Pion keeps candidates, across trickle
+  and remote descriptions, with the pub PC's candidates its own (§7.3).
+- **`Unbind` ends only the binding of the sender that stopped**, so a late stop of an old sub PC's sender can't
+  unbind a DownTrack that a rebuilt sub PC has bound already (§5.4).
+- A pub offer with new ICE credentials in the current `gen` restarts ICE on the same PC (Pion does it and
+  answers with new credentials of its own): the pub row of §6.5, `TestPubICERestart`.
+- **Test tools**: `sfutest.Viewer.Rebuild`, a `DirectSignaler` that answers like a client (a new `gen` on a new
+  PeerConnection, a repeated offer with the answer it gave) and can be down (`SetDown`), `PublishICERestart`, and
+  `publish.Publisher.OfferICERestart`. A `FaultConn` under a Go client's own UDP mux takes that client's network
+  away.
+- Besides the six integration tests: `TestPCRateLimit`, `TestPCGrace`, `TestPubICERestart`, `TestClosePub`,
+  `TestSubPCResetWithoutSubscriptions`, `TestShareStalled`, `TestSubOfferResend`, `TestSubICERestartRules`,
+  `TestRemoteCandidateCapIsPions`, `TestPubCandidatesOfALaterGen`, and `TestCandidateKey` with `FuzzCandidateKey`,
+  which tie the count's key to `ice.Candidate.Equal`.
+
+Still to come in the paths S57 touched: the last `QualityHintEvent` per share in `Resync()` (README S88, which
+sends the first ones), and the SFU's own codec rebuilds, which the creation limit won't count (README S69).
 
 ## Decisions taken at integration (formerly open questions)
 

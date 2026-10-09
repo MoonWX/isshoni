@@ -336,6 +336,14 @@ Why these settings:
 - **`SystemCallErrorNumber=EPERM`**: a filtered syscall returns an error instead of killing the process.
 - **`ExecReload`**: `systemctl reload isshoni` sends SIGHUP, which re-reads manual TLS files and `log.level`
   (04 §6.5). Everything else needs `systemctl restart isshoni`.
+  - **Until that reload exists, the server ignores SIGHUP, and `systemctl reload isshoni` neither reloads nor
+    stops it** (decided after group 7; README S65 implements the ignoring, README S90 the reload; 04 §6.5). As
+    merged after group 7 `serve` does not handle the signal at all, so it ends the process, and systemd takes
+    an end by SIGHUP for a clean exit that `Restart=on-failure` does not answer: a `reload` would leave the
+    server stopped. The unit keeps the line all the same. Taking it out would make `systemctl reload` an error
+    for now and change a file that the tarball and the packages ship (D3), only to put it back with S90. Nothing
+    is lost meanwhile: manual TLS files are picked up within 60 s without a signal (04 §8.4), and
+    `isshoni admin log-level` changes the level at runtime.
 - **`ProtectClock=yes`** (and `@system-service`) also blocks the read-only `adjtimex` call, so the server-side doctor
   can't read the kernel's clock-sync flag. 04's `clock` check then treats the sync state as unknown and relies on the
   Date-header skew check (04 §13.2). Don't relax `ProtectClock` for this.
@@ -465,11 +473,20 @@ answer Yes; `--yes` accepts):
 | Detected | Offer | Action |
 |---|---|---|
 | `ufw status` is `Status: active` | "Open ports 80, 443 (TCP) and 7882 (TCP+UDP) in ufw? [Y/n]" | `ufw allow isshoni` |
-| `firewall-cmd --state` is `running` | same text, "in firewalld" | `firewall-cmd --permanent --add-service=isshoni && firewall-cmd --reload` |
+| `firewall-cmd --state` is `running` | same text, "in firewalld" | `firewall-cmd --reload`, then `firewall-cmd --permanent --add-service=isshoni && firewall-cmd --reload` (the first reload is needed, below) |
 | Neither, but `iptables -S INPUT` has a `-j REJECT`/`-j DROP` rule and `netfilter-persistent` exists (the Oracle Cloud Ubuntu image pattern) | same text, "in iptables" | Insert before the first REJECT/DROP, for IPv4 and IPv6, then `netfilter-persistent save`. Each rule is tagged `-m comment --comment isshoni` so uninstall finds it: `-p tcp -m multiport --dports 80,443,7882 -j ACCEPT` and `-p udp --dport 7882 -j ACCEPT` |
 | None of these | nothing to open locally | |
 
 - **An inactive ufw or firewalld is never enabled**, because that could lock the admin out of SSH.
+- **firewalld needs a reload before `--add-service`** (README S62's finding, with firewalld 1.1 to 2.4). A
+  running firewalld reads its service files when it starts and when it reloads. `isshoni.xml` was put in place
+  moments ago (`install_fw_profiles`; by the package, for the commands its `postinstall.sh` prints, §5), so the
+  daemon doesn't know a service of that name yet, and `--permanent --add-service=isshoni` is refused. `firewall-cmd
+  --reload` first makes the name known; the second reload applies the permanent change to the running firewall.
+- **Ask systemd before `firewall-cmd`** (the same finding): without a daemon to talk to, firewalld 2.4's
+  `firewall-cmd` waits 10 seconds before it answers, on every Fedora machine where firewalld is installed and
+  not running. So the detection is `systemctl is-active --quiet firewalld.service` first and
+  `firewall-cmd --state` only then; the packaging scripts do the same.
 - **Always printed at the end:** "If your provider has a cloud firewall (AWS, Google Cloud, Azure, Oracle, …), open
   the same ports there: https://moonwx.github.io/isshoni/install/vps". The provider-specific steps were already
   printed before the start by the pre-check's `firewall_hint` (4.8). The browser connection test in the setup
@@ -544,13 +561,40 @@ isshoni 0.1.0 is running.
 3. Remove `/usr/local/bin/isshoni` and `/etc/sysctl.d/60-isshoni.conf`. Running values are left until reboot.
 4. Firewall:
    - ufw: `ufw delete allow isshoni` if present, then remove the profile;
-   - firewalld: `--permanent --remove-service=isshoni`, reload, remove the XML;
+   - firewalld: `--permanent --remove-service=isshoni`, reload, remove the XML. **As written this leaves
+     policies and rich rules behind** (README S62's finding; below): the service must be taken out of every
+     place that names it before the XML goes;
    - iptables: delete the rules tagged `isshoni` and save.
 5. Print: "Kept: /etc/isshoni (config), /var/lib/isshoni (database, certificates, backups) and the isshoni user.
    Remove them with --purge. Before --purge, back up with `sudo isshoni admin backup --out <file>` while isshoni is
    installed and running (run this installer again to bring it back)." It can't offer a backup command for right
    now: at this point the service is stopped and the binary deleted, and an offline backup refuses to run as root
    (04 §12.6).
+
+**firewalld: take the service out of every zone, policy and rich rule before removing its file** (README S62
+found this for the packages, whose `preremove.sh` does it; `--uninstall` has the same step to make, README S78).
+`--remove-service=isshoni` without a zone edits the default zone only. An admin may have added the service to
+another zone or to a policy, or written a rich rule that names it (`rule family="ipv4" source address="…" service
+name="isshoni" accept`), and uninstall as step 4 has it leaves those. Once `isshoni.xml` is gone they name a
+service firewalld can't find, and firewalld then **rejects its whole permanent configuration**: the next reload
+fails, and from its next start on it runs the stock configuration (state `failed`), without any of the admin's
+own rules. So before the XML is removed:
+- for every zone (`--get-zones`) and every policy (`--get-policies`) of the permanent configuration:
+  `--remove-service=isshoni` where `--query-service=isshoni` says it is there, and `--remove-rich-rule=<rule>`
+  for each rule of `--list-rich-rules` that contains `service name="isshoni"`. A removed rich rule is printed in
+  full, so that the admin can add it again: it may hold addresses that are written down nowhere else;
+- through the daemon when it runs (`firewall-cmd --permanent …`, then one `--reload`, which works because the
+  daemon still knows the service at that point and which closes the ports), and on the files with
+  `firewall-offline-cmd` otherwise, whose options are `--remove-service-from-zone` and
+  `--remove-service-from-policy`;
+- a zone or policy that firewalld refuses to change is named in a warning that says to remove the service there
+  by hand, and the uninstall goes on;
+- nothing else in the firewall is touched. ufw needs none of this: `ufw delete allow isshoni` removes the rule,
+  and a rule that is left keeps working without the profile.
+
+The packages skip the step when the admin has a definition of their own in `/etc/firewalld/services/isshoni.xml`,
+which keeps the name valid when the package's file in `/usr/lib` is gone. For install.sh that path is the file
+it removes, so it always scrubs first.
 
 **`--purge`**:
 - Asks for `purge` to be typed; `--yes` skips the question.
@@ -644,6 +688,73 @@ Scripts in `deploy/packaging/`:
 - `preremove.sh`: `systemctl disable --now isshoni` on remove (deb `remove`, rpm `$1 = 0`), not on upgrade.
 - `postremove.sh`: `daemon-reload`. On deb `purge`: remove `/etc/isshoni`, keep `/var/lib/isshoni` and say so. Data is
   deleted only by explicit admin action.
+
+**The scripts as README S62 built them.** Each is one POSIX sh script (`set -eu`) for both package managers: it
+reads dpkg's action word (`install`, `upgrade`, `configure`, `remove`, `purge`, the `abort-*` cases) or rpm's
+count (`$1` = 1 first install, 2 upgrade; on removal 0 removed, 1 upgrade) from its first argument. Every
+`systemctl` step runs only where systemd runs (`/run/systemd/system` exists), so the scripts work in a chroot or
+an image build.
+
+- **`preinstall.sh`**
+  - dpkg's `abort-*` calls (an upgrade being undone) do nothing.
+  - It refuses, exit 1, when `/usr/local/bin/isshoni` **or** `/usr/local/lib/systemd/system/isshoni.service`
+    exists (a symlink counts): systemd looks in `/usr/local` before `/usr` for the program and for the unit
+    alike, so the service would keep running install.sh's copy. The message names the file, gives the uninstall
+    command (`curl -fsSL …/install.sh | sh -s -- --uninstall`) and says what that keeps.
+  - It creates the group and the user with the commands of 4.4, each only when missing. Where `groupadd` or
+    `useradd` is not installed it says which package has them (`passwd` on Debian and Ubuntu, `shadow-utils` on
+    Fedora) and exits 1.
+- **`postinstall.sh`**
+  - `systemctl daemon-reload`.
+  - **The UDP buffer sizes are applied per key and never lowered.** For each of `rmem_max` and `wmem_max` whose
+    running value is below 8388608, it runs `systemd-sysctl --prefix=/net/core/<key> 60-isshoni.conf`, which
+    applies the file as the next boot will (an `/etc/sysctl.d` file of the same name wins). A key that another
+    sysctl.d file set higher is left alone, also when the other key was low; the plain `systemd-sysctl
+    60-isshoni.conf` of the list above would have lowered it until the next boot. Where the values can't be read
+    (most containers) nothing happens, and a failed write is a warning that points at `isshoni doctor`.
+  - **Everything but a first install counts as an upgrade** (dpkg's `abort-*` cases too, since the files of a
+    running service may have changed): `systemctl try-restart isshoni.service`, which restarts only a running
+    service, with a warning when the restart fails.
+  - **A service that is enabled or running** means the admin has started it before, and the script ends there
+    without a word. Running without being enabled counts, so an upgrade of such a server doesn't print the
+    first-install steps.
+  - Otherwise it prints numbered steps:
+    1. only while `/etc/isshoni/isshoni.toml` does not exist: `sudo isshoni config init --path … --domain
+       share.example.com`, or `--tls.mode ip` without a domain; then `sudo chown root:isshoni …`; and the Let's
+       Encrypt Subscriber Agreement notice of 4.10, which a package installation would otherwise never show;
+    2. open ports 80 and 443 (TCP) and 7882 (TCP and UDP), here and in the provider's cloud firewall, with the
+       commands for a firewall that is active on this machine: `sudo ufw allow isshoni`; for firewalld
+       `sudo firewall-cmd --reload` and then `sudo firewall-cmd --permanent --add-service=isshoni && sudo
+       firewall-cmd --reload` (4.9). systemd is asked whether firewalld is active before `firewall-cmd` is;
+    3. `sudo systemctl enable --now isshoni`, then `sudo isshoni setup-url --wait 180s`, and the link to the
+       install guide.
+- **`preremove.sh`** acts only when the package is removed (deb `remove`, rpm `$1 = 0`), never on an upgrade:
+  - `systemctl disable --now isshoni.service`, then `systemctl reset-failed isshoni.service`, so that a unit
+    that had failed (exit 78, say) doesn't stay listed as "not-found failed" with the system "degraded" until the
+    next boot. Without a running systemd it only removes the enablement links;
+  - **it takes the isshoni service out of firewalld** (`clean_firewalld`): every zone and policy of the
+    permanent configuration, and the rich rules that name the service, as 4.11 describes and for its reason. It
+    does nothing when no file under `/etc/firewalld/zones` or `/etc/firewalld/policies` names the service (only
+    a zone or policy that was changed on this machine can), which saves a dozen slow firewalld commands on every
+    other machine, and nothing when the admin has a definition of their own in
+    `/etc/firewalld/services/isshoni.xml`. It prints what it removed, each rich rule in full, and warns about a
+    zone or policy it could not change. ufw is left alone: its rule keeps working without the profile.
+- **`postremove.sh`**
+  - `systemctl daemon-reload`.
+  - deb `purge` removes `/etc/isshoni`, unless `/usr/local/bin/isshoni` exists: a purge can come long after the
+    remove, and if install.sh has installed isshoni in between, that directory is its configuration. The script
+    says that it kept it.
+  - rpm has no purge, so there the configuration stays as well. deb `remove` keeps it until a purge and prints
+    nothing.
+  - After a purge or an rpm removal it says what is left, `/etc/isshoni` and `/var/lib/isshoni` where they
+    exist, and the isshoni user, and prints the one command that deletes them (`sudo rm -rf … && sudo userdel
+    isshoni`). The data directory is never deleted by a script.
+
+Checked with nfpm-built packages under dpkg and rpm in privileged systemd containers of Debian 12 and 13, Ubuntu
+22.04 and 24.04 and Fedora 44 (firewalld 1.1 to 2.4, systemd 249 to 259): install, upgrade, a failed unit,
+remove, reinstall, purge, and removal with the service in zones, a policy and rich rules, with the daemon running
+and stopped. That was by hand (S62 adds no script and no CI change); the packages themselves are built from
+README S73 on (`goreleaser-check`, 8.2).
 
 The package maintainer field is the owner's GitHub noreply address (filled in once; no personal e-mail in the repo).
 
@@ -1102,7 +1213,7 @@ The `changes` job (`dorny/paths-filter`) sets these outputs. On `push` to `main`
 | `protocol` | go or web | `task gen:check` (tygo drift). The golden fixtures (`01`) run inside `test-go` and `web` | 5 | yes |
 | `licenses` | go, web or site | `task licenses` | 10 | yes |
 | `build` | always | downloads `web/dist`, `task notices`, `task build:go` (no Node on this runner); `bin/isshoni version --json` must show the commit and `0.0.0-ci.<run>`; warns above 60 MB. Uploads `bin/isshoni` | 10 | yes |
-| `e2e` | go or web | setup-node and `npm ci` in `web/`; downloads the binary and runs `chmod +x bin/isshoni` (artifacts lose the mode bit); env `ISSHONI_BIN: ${{ github.workspace }}/bin/isshoni`; the runner's preinstalled Google Chrome stable (`npx --prefix web playwright install chrome` only if it is missing); starts a PulseAudio null sink (Chrome needs an output device for tab audio; drop this step if slice S4 shows it isn't needed); `xvfb-run -a npm --prefix web run e2e`. On failure uploads the Playwright trace, video and the per-server JSON logs (`web/test-results/server-*.log`, 14) | 20 | yes |
+| `e2e` | go, web or deploy (below) | setup-node and `npm ci` in `web/`; downloads the binary and runs `chmod +x bin/isshoni` (artifacts lose the mode bit); env `ISSHONI_BIN: ${{ github.workspace }}/bin/isshoni`; the runner's preinstalled Google Chrome stable, plus Playwright's ffmpeg for the videos (`npx --prefix web playwright install ffmpeg`; `… install chrome`, which brings ffmpeg along, only if Chrome is missing); installs `xvfb`, `openbox` and `pulseaudio` and starts a PulseAudio null sink as the default sink (Chrome gets an output device for tab audio; the step can go if the specs that play audio pass without it); `xvfb-run -a --server-args="-screen 0 1920x1080x24" sh -c 'openbox & exec npm --prefix web run e2e'`: Chrome's capture picker needs a window manager under X11. One Playwright worker and one retry (05 §19.3). After every run that was not cancelled, green or red, uploads `web/test-results/` (the Playwright trace and video of a failed attempt, the per-server JSON logs `server-*.log`, 14) and `web/playwright-report/` as `e2e-results`, kept 7 days | 20 | yes |
 | `lint-deploy` | deploy | `task lint:sh lint:actions lint:keys lint:unit lint:pins test:sh` | 10 | yes |
 | `distro` | deploy or release | matrix of the 6 container distros (4.13), scenarios from 11.2; setup-node and `npm ci` in `web/`, because `task release:snapshot` builds the SPA (7.2) | 30 | yes |
 | `docker-smoke` | docker, deploy or release | `task docker:smoke` (11.3), linux/amd64 | 15 | yes |
@@ -1110,6 +1221,30 @@ The `changes` job (`dorny/paths-filter`) sets these outputs. On `push` to `main`
 | `site` | site or deploy | `vitepress build`; setup-go (from `go.mod`), then `go test ./internal/server/ops/doctor -run TestDocsAnchors` (10.4) | 10 | yes |
 | `govulncheck` | go | `.bin/govulncheck ./...`, `continue-on-error: true` (new CVEs mustn't block unrelated PRs; nightly and release gate on it) | 10 | no |
 | `ci-ok` | always (`if: always()`) | fails if any job in `needs` is `failure` or `cancelled`; `skipped` counts as success | 2 | **the only required check** |
+
+**The `e2e` job as README S61 built it.**
+- **It also runs on deploy changes.** The table's "go or web" left out the job's own inputs: the servers' base
+  config `deploy/dev/isshoni.e2e.toml`, the Node pin in `.tool-versions`, and the workflow itself, all of which
+  the `deploy` filter covers. So the job runs when `go`, `web` or `deploy` is true. Like every job it is skipped,
+  which counts as a pass, while one of its inputs doesn't exist yet (`.tool-versions`, `cmd/isshoni`,
+  `web/package.json`, `web/package-lock.json`, `web/playwright.config.ts`, `deploy/dev/isshoni.e2e.toml`); the
+  `changes` job writes each job's decision into the run's summary.
+- **openbox under Xvfb.** Xvfb is a bare X server, and Chrome's capture picker reads window properties that only
+  a window manager sets: without one `getDisplayMedia` never answers. openbox runs inside the `xvfb-run` session
+  and ends with it. The screen is larger than the browser windows.
+- **One worker.** All windows share the one X display, and with two workers about one pick in 25 hung on an X
+  `BadWindow` error (05 §19.3). The config sets it for `CI`; a local run keeps Playwright's default.
+- **ffmpeg for video.** Playwright records the videos of failed tests with its own ffmpeg build, which a
+  preinstalled Chrome doesn't bring; the job installs only that. Locally video is off.
+- **The null sink** is loaded with `pactl load-module module-null-sink` and made the default sink. In a container
+  run of the same steps a captured tab's sound reached a receiving PeerConnection without any device, so the
+  step is kept only until the specs that play audio show whether they need it.
+- **The upload is not only for failures**: with one retry a flaky test leaves the job green, and the trace, the
+  video and the server log of its failed attempt would never be seen otherwise. A run without any failure
+  uploads only the logs and the report, which are small.
+- **Auth throttles.** The job needs no config for them: the harness sends each account request from an address
+  of its own, which the e2e server takes from `X-Forwarded-For` because its peer is loopback (05 §19.3, 04 §8.5).
+- `ci-ok` needs the job.
 
 **`.golangci.yml`** (v2 format):
 - linters: the `standard` set plus `bodyclose`, `errorlint`, `gosec`, `misspell`, `nilerr`, `noctx`,
@@ -1948,7 +2083,8 @@ Anything beyond these, such as a reload, a second tap, a re-join or a second log
   (only `/var/lib/isshoni` and `/run/isshoni` are writable), `PrivateTmp`, `AF_NETLINK` allowed, `UMask=0077`,
   journald captures stdout.
   - stderr is not a TTY under systemd, so 04's `log.format = "auto"` writes JSON lines (04 §10).
-  - `systemctl reload` sends SIGHUP (`ExecReload`, 4.5).
+  - `systemctl reload` sends SIGHUP (`ExecReload`, 4.5). The server reloads on it from README S90 on and ignores
+    it from S65 until then (04 §6.5).
   - Exit 78 stops restarts.
   - `TimeoutStopSec=20`: graceful shutdown must finish in under 15 s.
 - **Container environment:** image `ghcr.io/moonwx/isshoni`; binary `/usr/local/bin/isshoni`; uid 65532; env
@@ -2095,3 +2231,10 @@ M1 timeline:
 - **Design docs on the site**: `docs/PLAN.md` and `docs/m1/` stay on GitHub only (`srcExclude`).
 - **Docker image tag in `compose.yaml` during 0.x**: `:latest`; release notes flag migrations, and the server backs
   up before migrating. The docs show how to pin `:0.<minor>`.
+
+Decided after group 7 (an engineering call the owner delegated; README §6):
+
+- **`systemctl reload isshoni` does nothing until the server can reload.** The unit keeps
+  `ExecReload=/bin/kill -HUP $MAINPID`; the server ignores SIGHUP from README S65 on and reloads manual TLS files
+  and `log.level` on it from README S90 on (4.5; 04 §6.5). Before S65 the signal would stop the server without a
+  restart.

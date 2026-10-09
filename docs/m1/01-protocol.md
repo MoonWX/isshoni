@@ -265,6 +265,20 @@ JSON conventions:
   Zl and Zp rejected (`bad_request`, `params.field: "label"`). Room and user names come from the database (03).
 - Text on the wire is never user-facing English. The only human text is user content (`label`, names).
 
+**Parsing a frame costs at most four times its size** (decided after group 7; README F04 makes the parser meet
+it). `ParseEnvelope` reads every frame a client sends, before anything is known about it, so what it allocates
+must be bounded by what it is given: no more than **4× the frame's bytes**, plus a small constant for what does
+not grow with the input (§19), for **every** input: valid, malformed or hostile. With the read limits of §3.3
+that bounds what one frame can cost the hub. `Decode` has the same bound for the payloads of client messages: it
+refuses data nested deeper than 32 levels, and arrays longer than the field limits of §13, before it unmarshals.
+
+As merged after group 7 the envelope parser does not meet the bound for every input: it hands a frame to
+`encoding/json` after two checks of its own (valid UTF-8, nesting depth), and for some malformed frames that
+call allocates more than the bound allows. The fuzz target finds one within seconds (§19). The decision is
+about which side moves: **the parser changes, the bound stays.** A factor raised until today's parser passes
+would no longer say anything about the protocol, only about one library. The invalid-UTF-8 check is there for
+the same reason: `encoding/json` would replace each bad byte with three.
+
 ## 6. Handshake, versions, features, roles (M1)
 
 ### 6.1 Version negotiation
@@ -1599,20 +1613,29 @@ These rules bind the web client (05), the Go test and load-test clients, the SFU
       a `starting` share that no offer has bound yet stays, under its 30 s start timeout (§8.7).
     - The sub PC closes server-side on `room.leave` or a `room.join` elsewhere; the client closes its local sub PC
       without sending anything. The server ignores `pc.close{pc: sub}` (reserved).
-    - The server never asks to rebuild a pub PC that carries no live share. `room.leave` closes both PCs server-side.
-      - **The server enforces this, in the hub** (decided after group 6; README F03 implements it).
+    - The server never asks to rebuild a pub PC that carries no live share: no share that has not ended, in
+      whatever status. `room.leave` closes both PCs server-side.
+      - **The hub enforces this, not `sfuplane`** (decided after group 6; README F03 implemented it).
         The request in question is `pc.restart{pc: pub, mode: rebuild, reason: failed}`, which is made of the
-        SFU's `PCStateEvent{PCPub, failed}` (§15.4). `sfuplane` passes every such event on as a `RestartRequest`;
-        the hub's `MediaSink` decides on the connection's actor, in order with everything that starts or ends its
-        shares, because the share lifecycle is the hub's. As group 6 merged it, every such event became a request,
-        also for a pub PC whose connection publishes nothing any more: the last share was stopped or timed out, and
-        the PC failed before the client's `pc.close` reached the server, or the client never sent one. That
-        client would build and negotiate a PeerConnection that carries nothing.
-      - The rule: the request goes out only while the failed PC's connection has a share that has not ended,
-        one that is `starting`, `live` or `stalled` (to the SFU: pending, or live with a stalled one included).
-        A `starting` share waits for the new PC's first keyframe and a `stalled` one for its media to come back,
-        each under its 30 s timeout (§4.4), so both need the rebuild. Without such a share nothing is sent. What
-        counts is the moment the actor gets to the request, not the moment the PC failed.
+        SFU's `PCStateEvent{PCPub, failed}` (§15.4). `sfuplane` passes every such event on as a `RestartRequest`
+        and drops none. The one that drops is the connection's `MediaSink` in `internal/server/signal`
+        (`peerSink.RestartRequest` in `room.go`): it decides on the connection's actor, in order with everything
+        that starts or ends the connection's shares, because the share lifecycle is the hub's and the adapter
+        keeps no share list. As group 6 merged it, every such event became a request, also for a pub PC whose
+        connection publishes nothing any more: the last share was stopped or timed out, and the PC failed before
+        the client's `pc.close` reached the server, or the client never sent one. That client would build and
+        negotiate a PeerConnection that carries nothing.
+      - The rule: the request **passes for any share the connection publishes**, whatever its status:
+        `starting`, `live` or `stalled` (to the SFU: pending, or live with a stalled one included). The sink
+        asks only whether the room has a share of this connection (`conn.publishes`); an ended share is no
+        longer in the room. A `starting` share waits for the new PC's first keyframe and a `stalled` one for
+        its media to come back, each under its 30 s timeout (§4.4), so both need the rebuild. Without such a
+        share nothing is sent, and the hub logs the drop at debug. What counts is the moment the actor gets to
+        the request, not the moment the PC failed.
+      - A request from a `MediaPeer` that is no longer the connection's (after a `room.leave` or a join
+        elsewhere) is dropped like every other event of such a peer, whatever the connection publishes in its
+        new room. `TestPubRestartRequest` covers the hub by share status and that branch; `TestPubPCFailed` in
+        `sfuplane` runs it with a real hub, from the SFU's event to the wire.
       - A share that starts later needs no request: its pub offer comes with a `gen` the client chooses, and a
         client whose pub PC has failed offers `gen + 1` (§10.4).
 
@@ -1716,7 +1739,9 @@ client's sub PC has been `disconnected` for 3 s when the socket resumes, so its 
 
 **Server**: it starts exactly three actions on its own:
 1. `pc.restart{pc: pub, gen, mode: rebuild, reason: failed}` when the current pub PC reaches `failed`, or when a new
-   pub PC misses its 10 s handshake (02); only while that connection has a share that has not ended (§9 rule 10);
+   pub PC misses its 10 s handshake (02); only while that connection publishes a share, be it `starting`, `live`
+   or `stalled`: the hub's `MediaSink` drops the request otherwise, and `sfuplane` passes every one on (§9
+   rule 10);
 2. inside `Resync()` (§10.5), an ICE-restart offer for a sub PC that isn't connected;
 3. SFU-internal sub rebuilds for codec recovery (§11.7, 02 §8.5).
 
@@ -2294,10 +2319,11 @@ Files:
 - `snapshot.go`;
 - `signaltest/`: a fake `MediaPlane`, `Authenticator` and `RoomDirectory` for tests (also used by 02 and 04).
 
-**The server before the SFU is wired** (README S54). The first wiring slice did not put `signaltest`'s fake
-`MediaPlane` into `serve`, which would have made a test package part of the binary. `internal/server/wire.go`
-has its own placeholder, `noMedia`, until README S59 passes `sfuplane`'s `Plane` instead. With it signaling is complete
-(connections join rooms, see each other and resume) and everything that needs media is refused:
+**The server before the SFU was wired** (README S54 to S59). The first wiring slice did not put `signaltest`'s
+fake `MediaPlane` into `serve`, which would have made a test package part of the binary. `internal/server/wire.go`
+had its own placeholder, `noMedia`, until README S59 passed `sfuplane`'s `Plane` instead (04 §6.6); the placeholder
+is gone since. With it signaling was complete (connections join rooms, see each other and resume) and everything
+that needs media was refused:
 
 | `MediaPeer` method | `noMedia` |
 |---|---|
@@ -2307,8 +2333,8 @@ has its own placeholder, `noMedia`, until README S59 passes `sfuplane`'s `Plane`
 | `EndShare`, `ClosePC`, `SetCaps`, `Resync`, `Close` | nothing |
 | `Stats` | an empty `ServerStats` (`subs: []`, `layers: []`) |
 
-It keeps no state. `feature_disabled` is the catalog's "hide the feature" (§12.1), which is what a client should do
-with sharing on such a server. No release runs this way: the placeholder exists only between README S54 and S59.
+It kept no state. `feature_disabled` is the catalog's "hide the feature" (§12.1), which is what a client should do
+with sharing on such a server. No release ran this way: the placeholder existed only between README S54 and S59.
 
 **Concurrency model:**
 - Each connection is one actor goroutine. It owns the connection state and handles, in order: parsed client messages
@@ -2325,6 +2351,11 @@ with sharing on such a server. No release runs this way: the placeholder exists 
   - The reader goroutine waits for room in the inbox instead of dropping (a flooding client slows itself down).
   - `Shutdown` reaches the actors through a channel they all select on, not through the inbox, so a detached
     connection can't hold it up for its grace. It is therefore not ordered after calls already queued in an inbox.
+- The connection's `MediaSink` (`peerSink` in `room.go`) sends the peer's notifications for the client on as they
+  are (sub offers, candidates, `subscribe.status`, `quality.hint`, errors), with one exception that the hub
+  decides: a `RestartRequest` goes out only while the connection publishes a share, `starting`, `live` or
+  `stalled`, and is dropped otherwise (§9 rule 10; README F03). `sfuplane` makes the request of every failed pub
+  PC and drops none. Events of a peer that is no longer the connection's are dropped whatever they are.
 
 ```go
 package signal
@@ -2412,7 +2443,7 @@ type ConnSelector struct {
 	UserID          string
 	SessionID       string // "" = any
 	DeviceID        string // "" = any
-	ExceptSessionID string // keep this one ("sign out other browsers", password change)
+	ExceptSessionID string // keep this one (password change; "sign out other browsers" names each session it ends)
 }
 
 // Target selects connections for Notify.
@@ -2510,7 +2541,8 @@ type MediaPeer interface {
 	Close()                 // closes both PCs; the hub has already ended the peer's shares
 }
 
-// MediaSink receives a peer's events. Implementations never block.
+// MediaSink receives a peer's events. Implementations never block, and they copy whatever they keep of a call's
+// arguments before returning, so the caller may reuse its slices, maps and pointers once a call returns.
 type MediaSink interface {
 	Offer(o protocol.PCOffer)                   // sub PC offers
 	ICE(c protocol.PCICE)
@@ -2761,14 +2793,16 @@ Connection.
 | `SubscriptionStateEvent` | `SubscriptionStatus` (reason map below) |
 | `CodecPolicyEvent{Share, Profile}` (one per share this connection publishes) | `QualityHint{shareId, reason: codec, codec: "h264/"+Profile}` with no encodings (a profile switch doesn't change them) |
 | `QualityHintEvent{Share, Reason, MaxBitrate, Encodings}` | `QualityHint{shareId, reason: ev.Reason, maxBitrate, encodings converted 1:1}`; `Reason` is `admin` or `viewers`, and `Encodings` is the full current `f`/`q` list with the cap and pause state applied by the SFU |
-| `PCStateEvent{PCPub, Gen, failed}` | `RestartRequest{pc: pub, gen: ev.Gen, mode: rebuild, reason: failed}` (the SFU emits PCStateEvents only for the current PC of each kind). `sfuplane` passes every such event on. From README F03 on the hub's sink drops the request unless the connection has a share that has not ended (§9 rule 10, decided after group 6) |
+| `PCStateEvent{PCPub, Gen, failed}` | `RestartRequest{pc: pub, gen: ev.Gen, mode: rebuild, reason: failed}` (the SFU emits PCStateEvents only for the current PC of each kind). `sfuplane` passes every such event on and drops none. Since README F03 the hub's sink (the connection's `MediaSink` in `internal/server/signal`) drops the request unless the connection publishes a share, `starting`, `live` or `stalled` (§9 rule 10, decided after group 6) |
 | `PCStateEvent{PCSub, …}` | nothing: the client drives sub restarts (§10.4); the SFU ICE-restarts in `Resync()` and rebuilds sub PCs itself only for codec retries |
 | `ErrorEvent` | `Error` (code map below) with the event's scope: `pc.pub`/`pc.sub` → scope `pc` with that `pc` (an event has no `gen` or `neg`); `share`/`subscription` → that scope with `shareId` = `Error.Share` |
 | `RoomEvents.ShareUpdated` | `ShareMedia` on the publishing connection's sink: `pending→live` or `stalled→live` = `Live`; `→stalled` = `Stalled`; a layer attached or ended, the profile changed, or audio changed while live = `Changed`. `Layers` is built from `ShareInfo.Layers` (every layer whose track is attached, paused ones included), ignoring `LayerInfo.Active` |
 | `RoomEvents.ShareEnded`, `CodecPolicyChanged` | ignored: the hub ends shares itself; per-connection `CodecPolicyEvent`s cover publishers |
 
 The SFU computes the content of every hint; `sfuplane` only converts types and keeps no encoding or share-list state.
-So a failed pub PC is passed on whatever it carried: whether a share still needs it is the hub's to say (§9 rule 10).
+So a failed pub PC is passed on whatever it carried: whether a share still needs it is the hub's to say, and the
+hub's sink is where the request for an idle pub PC is dropped (§9 rule 10; `TestPubPCFailed` runs the adapter with
+a real hub, from the SFU's `PCStateEvent` to the wire).
 On `Resync()` the SFU re-sends one `CodecPolicyEvent` per share and the last `QualityHintEvent` per share, if one was
 sent. The one thing `sfuplane` remembers is the state the SFU last reported for each share (`ShareUpdated` carries
 the share as it is now, not what changed): that tells `Live` from `Changed`, and is forgotten on `ShareEnded`.
@@ -2966,6 +3000,19 @@ Behavior (normative):
 - **Secrets**: `Secret`/`SDP` never appear via `%v`, `%+v`, `%#v` or slog (text and JSON handlers); JSON marshal is
   verbatim.
 - **Fuzzing**: `FuzzParseEnvelope` and `FuzzDecode` (all registry types): no panics, no allocation above 4× the input.
+  - As built (README S03, `fuzz_test.go`): `FuzzParseEnvelope` allows 4× the input plus 8 KiB
+    (`envelopeAllocSlack`: `encoding/json`'s decode state, which does not grow with the input), `FuzzDecode` 4×
+    plus 64 KiB for the payloads of client messages (the slices that the array limits allow), and a looser bound
+    for server-to-client payloads, which only clients decode, from their own server.
+  - **The 4× bound holds for every input, and the parser is what has to meet it** (decided after group 7;
+    README F04; §5). On the tree as merged after group 7, a run of `FuzzParseEnvelope` (with the toolchain of
+    that tree, go1.27.1) fails within seconds: an object whose one member name is about 2 KB long and starts
+    with an escape (`\r`), in JSON that is not even valid (an empty string follows the name where the colon
+    should be): 2,180 bytes in and 18,272 bytes allocated, against the 16,912 that 4× plus the constant allow.
+    The seeds in `testdata/fuzz` don't have such an input, so `go test` and CI pass; the rule that a slice runs
+    its fuzzers before its PR (README §4) is what found it. F04 changes `ParseEnvelope` so that it refuses or
+    reads such input without a decoder that copies it several times, adds the failing input to
+    `testdata/fuzz/FuzzParseEnvelope`, and leaves the 4× and the two constants as they are.
 
 In `internal/server/signal`, with `signaltest` fakes and `httptest`:
 - **Upgrade** (the Origin matrix moved here from 03): bad Origin → 403; Origin that differs only in host case or an
@@ -3043,6 +3090,23 @@ In `internal/server/signal`, with `signaltest` fakes and `httptest`:
 2. **Layers**: `subscribe.update high → low → high` switches on a keyframe, with continuous seq/ts.
 3. **Audio-follows-focus**: with two shares and focus on A, only A's audio DownTrack sends RTP. After one
    `subscribe.update`, only B's does, with no instant where both or neither run (sampled every 20 ms).
+
+   **The tolerance, as README S59 measured it** (`TestAudioFollowsFocus`). "No instant" can't be asserted to the
+   sample from outside the server. A client sees only what arrives: a stream runs from the first packet of a run
+   to 20 ms after its last one, which is the audio that packet carries. The two publishers run free of each
+   other, up to one packet interval apart, so a perfect switch shows an overlap or a gap of up to 20 ms either
+   way, and a busy machine adds its own. The test therefore moves the focus five times, one `subscribe.update`
+   each, and asserts:
+   - **every move within ±250 ms** of overlap (positive) or gap (negative), which no switch that waited for a
+     negotiation or a keyframe could meet;
+   - **the median move within 60 ms**, three samples;
+   - on the 20 ms grid of this case, both streams or neither run in at most 12 samples per move (250 ms), 60 for
+     the five;
+   - each share's audio is one stream in three runs whose sequence numbers go on across its pauses, with no gap
+     and no duplicate, and the five moves cost no renegotiation: one sub offer in all.
+
+   Before the first move the test also checks the rule itself: with the focus on A, the viewer has received no
+   audio of B at all.
 4. **WebSocket killed mid-share** (close the TCP conn): RTP keeps flowing through the outage (no gap > 200 ms), the
    resume succeeds, and there are no extra renegotiations.
 5. **UDP black-holed for 5 s** (a packet filter in the test's UDP mux wrapper): the share goes `stalled`, an ICE
@@ -3258,5 +3322,12 @@ Decided after group 6 (engineering calls the owner delegated; README §6; README
 7. **An `agent.send` with `payload: null` is `bad_request`** (§8.14), like one without a payload. The hub then never
    relays a `null`, which nothing on this wire sends (§5).
 8. **The server asks for no pub PC rebuild that §9 rule 10 forbids**: the hub's `MediaSink` drops the request of a
-   failed pub PC whose connection has no share that has not ended; `sfuplane` still reports every failed pub PC
+   failed pub PC whose connection has no share that has not ended, and passes it for any share the connection
+   publishes (`starting`, `live` or `stalled`); `sfuplane` still reports every failed pub PC and drops none
    (§9 rule 10, §15.4).
+
+Decided after group 7 (an engineering call the owner delegated; README §6; README F04 implements it):
+
+9. **`ParseEnvelope` meets the 4× allocation bound of §19 for every input.** A fuzz run on the merged tree found
+   malformed frames for which the parser, through `encoding/json`, allocates more than the bound allows. The
+   parser changes; the bound, which is what keeps one frame's cost in proportion to its size, stays (§5, §19).

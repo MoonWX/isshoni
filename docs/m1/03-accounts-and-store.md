@@ -1007,8 +1007,8 @@ The throttles are in-memory token buckets (decision 8), in `auth/limiter.go` (al
 | Bucket | Key | Burst | Refill | Consumed by | Checked |
 |---|---|---|---|---|---|
 | `auth-ip` | client IP | 20 | 1 per 15 s | Every attempt at login, register, setup/check+complete, reset/check+complete, invite/check, device/code and device/password *(later: M2)* | First, before any work |
-| `auth-user-ip` | username key (existing or not) + client IP | 5 | 1 per 2 min | Failed password checks | Before hashing, after `auth-ip`. A hard block |
-| `auth-user` | username key (existing or not) | 30 | 1 per 2 min | Failed password checks, from any IP | After `auth-user-ip`. When it is empty, the user's known IPs still pass (below) |
+| `auth-user-ip` | username key (existing or not) + client IP | 5 | 1 per 2 min | Failed password checks: a login's, and the password a logged-in user types again (below) | Before hashing, after `auth-ip`. A hard block |
+| `auth-user` | username key (existing or not) | 30 | 1 per 2 min | Failed password checks, from any IP: a login's, and the password a logged-in user types again (below) | After `auth-user-ip`. When it is empty, the user's known IPs still pass (below) |
 | `register-ip` | client IP | 5 | 1 per 12 min | Every `register` request without an invite, in every mode (only the approval mode lets one through, below). Invite registrations are limited by the invite's own `maxUses` instead (the load test, 02, registers many users from one IP) | Right after `auth-ip`, before the mode check and any other work |
 | `auth-hash` | one for the whole server | 20 | 5 per s | Every public request that reaches the hash: login (the dummy hash too), register, setup/complete, reset/complete, device/password *(later: M2)* | Last: after all of the buckets above, before the semaphore (§7.2) |
 | `lookup` *(later: M2)* | session ID | 10 | 1 per min | Failed user-code lookups | Before lookup |
@@ -1037,6 +1037,25 @@ The throttles are in-memory token buckets (decision 8), in `auth/limiter.go` (al
   store or context error, and a correct password for an account that isn't `active`. An attempt that `auth-user`
   refuses holds no `auth-user-ip` token either; a known IP that goes on while `auth-user` is empty takes none from
   it.
+- **Re-authentication counts in `auth-user-ip` and `auth-user`** (README S58, `verifyOwnPassword`). The password
+  a logged-in user types again, to change the password (`currentPassword` of `POST /me/password`) or to delete
+  the account (`POST /me/delete`), is a password check like a login's and goes through the same two buckets with
+  a login's rules, under the account's username key and the request's IP:
+  - the attempt takes its tokens before the hash, `auth-user-ip` first and then `auth-user`, where the user's
+    known IPs still pass when it is empty; a wrong password keeps both; a correct one gives the `auth-user` token
+    back and refills that address's `auth-user-ip` bucket, as a login does; every other end (a full hash queue,
+    a store or context error) gives both back;
+  - a blocked attempt is 429 `rate_limited` with `retryAfter` and does no hashing. A wrong password is 403
+    `wrong_password`, and so is one that can't be a password at all (empty, over 1024 bytes, refused by PRECIS),
+    which costs neither a token nor a hash;
+  - so a session cookie in the wrong hands is no faster way to guess the password than the login form: five
+    wrong tries from one address block that address for this account, at the login form too, and the other way
+    round.
+
+  `auth-ip` and `auth-hash` are for anonymous requests and don't apply; the hash still waits for a slot of the
+  semaphore (§7.2; a full queue is 503 `server_busy`). A wrong try writes no `auth.login_failed` row: it is no
+  login. The password an admin types again to grant admin or to issue a reset link (§7.10, §7.11) comes with
+  README S64, which has `verifyOwnPassword` to call.
 - **`register-ip` comes before the mode check** (S42; kept, decided after group 5). A `register` request without
   an invite takes its `register-ip` token as its second step, whatever the registration mode is. So in the `invite`
   and `closed` modes, where such a request can never succeed, an address that has spent its five tokens is answered
@@ -1070,9 +1089,6 @@ The throttles are in-memory token buckets (decision 8), in `auth/limiter.go` (al
     used, so it needs no cap on its keys: only a user with a subscription gets as far as taking a token. Memory
     only, like every throttle.
   - It writes no `auth.throttled` row; the audit scopes below are those of the buckets in `auth/limiter.go`.
-  - `auth/limiter.go` still declares a bucket of this name and rate (`ratePushTest`) that nothing calls. Which of
-    the two stays is for a slice that owns `internal/server/auth`; until then the one in `httpapi` is the one that
-    counts.
 - Each map holds at most 100,000 keys. When it is full, full buckets (idle keys) are evicted first, then the least
   recently used ones.
 - The plan's "20 pre-auth WebSocket handshakes per IP per minute" is enforced by 01's hub at the upgrade (01 §3.1;
@@ -1223,6 +1239,68 @@ Revalidate (§7.6).
 
 Pending device codes that the user approved are deleted along with the devices (`DeleteDeviceCodesOf`). 01 maps each
 reason to its `error{code, retryable:false}` message and close code (01 §12.1, §15.4).
+
+**The table as README S58 built it** (`auth/revoke.go`, `auth/selfservice.go`). The rows come in two kinds:
+- **One session**: logout, revoking one session, the session of the cookie that a login, registration or setup
+  arrived with, and the sessions the cap of 50 evicts. Their `Write` deletes that row, and `sessionsRevoked`
+  runs the two steps after the commit, with one `ConnSelector{UserID, SessionID}` per session.
+- **A user's credentials as a whole**: one `revocation` value per row (the reason, whether the caller's session
+  stays, whether the devices and the reset link go). A `Write` calls its `apply`, and `revocationCommitted` runs
+  the steps: the cache forgets the whole user (the session a row kept is read again at its next use), then
+  - a row that takes everything closes `ConnSelector{UserID}`;
+  - a row that takes everything but the caller's session ("Change own password") closes
+    `ConnSelector{UserID, ExceptSessionID}`;
+  - **"Sign out other browsers" names each session it deleted**, one selector each, like the session cap, and
+    does not use `ExceptSessionID`: a selector that excepts one session would also match the connections of the
+    user's devices (M2), which that row keeps.
+
+  The admin rows are declared with the others and run the same two steps when README S64 builds their calls.
+
+Push subscriptions go with their session or device by the foreign key's cascade, which is the "Push
+subscriptions" column for every row. Every self-service call reads its caller again inside its own `Write`
+(`loadSelf`): the account must be `active` and the caller's session must exist and be unexpired, else
+`unauthenticated` and nothing changes. The chain let the request in on a principal that may be 30 s old.
+
+**Change own password** (`ChangePassword`), in order:
+1. the caller (above), in a read;
+2. the new password's rules (`CheckPassword`, with the username) → 422 `validation_failed {newPassword: code}`,
+   so a request that can't succeed costs no hash and no token;
+3. the current password → 403 `wrong_password`, 429 `rate_limited`, 503 `server_busy` (§7.3);
+4. the new hash, outside the transaction;
+5. one `Write`. It checks the caller again, and that the stored hash is still the one that was verified: a
+   parallel change or an admin reset in between answers `wrong_password`. Then the hash and
+   `password_changed_at`, the row's deletions, the caller's new token, and `auth.password_changed`.
+
+The caller's session is **rotated as in §7.4**, not cut over: the new token is the session's current one, and the
+token the request arrived with is its previous one for 60 s. The browser's other tabs and the requests it has
+under way are therefore not answered 401, which would sign the tab out, before the new cookie reaches them; the
+handler notifies `devices` before it writes the response (§12.5), and what the other tabs fetch under the old
+cookie in between is let in. Two details:
+- **Which token keeps the 60 s** (`rotateForCaller`). When the chain's daily rotation ran in the same request
+  (it runs before the handler, §7.4), the token the request arrived with is already the previous one, and the
+  chain's new token never reaches the browser, because the handler's cookie replaces it. A session has one
+  previous token, so a plain rotation would give the grace to that token nobody holds and end the browser's own
+  at once. The session is rotated back to the request's token first, and then to the new one; the token in
+  between stops working at once. A rotation by a parallel request within the last 60 s looks the same and is
+  treated the same. A previous token past its grace is not revived.
+- The change counts as a use of the session: `last_seen_at`, `last_ip` and `idle_expires_at` move, and the
+  cookie's `Max-Age` is the new idle time. The response carries exactly one `Set-Cookie`: the handler removes
+  the one the chain's rotation may have set.
+
+**Delete own account** (`DeleteSelf`): the caller; then the last-admin rule (§7.11) → 409 `last_admin`, before
+the password is looked at, so that answer costs no hash; then the password; then one `Write` that checks all
+three again and deletes the users row. `user.deleted {self: true}` keeps the username as a snapshot, and the
+admins get `admin.users`.
+
+**Revoke one session** may name the caller's own: it is then a logout under the reason `session_revoked`, and
+the handler clears the cookie. An ID that is not one of the caller's sessions (unknown, another user's, gone
+already) is 404 `not_found`. **"Sign out other browsers"** deletes every other session row and writes one
+`session.revoked {name}` row each, but answers with the number that were live until then, which is what
+`GET /me/sessions` listed: an expired row that the janitor has not pruned yet goes with the others, audited and
+not counted. **Revoke device** is a row of M2, but its call and route exist now (`RevokeDevice`,
+`DELETE /me/devices/{id}`): no device exists before M2, so every ID answers 404 `not_found`, and the Devices
+page's Revoke needs nothing new on the day the list has rows. It leaves the device codes the user decided:
+another app may be waiting for its approval.
 
 ### 7.8 Setup token
 
@@ -1543,7 +1621,8 @@ type ConnSelector struct {
 	UserID          store.UserID    // required, never empty (01 closes nothing otherwise)
 	SessionID       store.SessionID // "" = any
 	DeviceID        store.DeviceID  // "" = any
-	ExceptSessionID store.SessionID // keep this one (password change, "sign out other browsers")
+	ExceptSessionID store.SessionID // keep this one (password change: everything else of the user goes;
+	                                // "sign out other browsers" names each session it ends instead, §7.7)
 }
 
 type ConnCloser interface {
@@ -1558,7 +1637,7 @@ const (
 	ReasonPasswordReset   = "password_reset"
 	ReasonAccountDisabled = "account_disabled"
 	ReasonAccountDeleted  = "account_deleted"
-	ReasonDeviceRevoked   = "device_revoked" // later (M2)
+	ReasonDeviceRevoked   = "device_revoked" // RevokeDevice; no device exists before M2
 )
 
 // Implemented by the Web Push service (04).
@@ -1576,10 +1655,11 @@ type AdminAlerter interface {
 type ReqMeta struct {
 	IP        netip.Addr
 	UserAgent string // only turned into a session name
-	// The session cookie the request arrived with, "" for none. The calls that open a session (Login and
-	// CompleteSetup; later Register and CompletePasswordReset) take no request, so the old cookie travels here: they
-	// delete that session in the Write that creates the new one and close its connections (§7.4, §7.7). Never
-	// printed, logged or marshalled.
+	// The session cookie the request arrived with, "" for none. The calls that open a session (Login, CompleteSetup
+	// and Register; later CompletePasswordReset) take no request, so the old cookie travels here: they
+	// delete that session in the Write that creates the new one and close its connections (§7.4, §7.7).
+	// ChangePassword reads it to know which token the browser holds, so that this one keeps the 60 s of the
+	// rotation (§7.7). Never printed, logged or marshalled.
 	SessionToken string `json:"-"`
 }
 
@@ -1793,6 +1873,12 @@ the rules live in the handlers, not in `auth.Service`: rooms have no credentials
   one with a skin tone and a flag of two regional indicators pass; the red heart (U+2764 U+FE0F), the keycaps and
   the profession and family sequences are `invalid`. That is the profile this section names, taken as it is;
   letting those emoji in would be a change to this rule, and is not decided.
+  - **Open, for the owner** (from README S53's write-back; still open after group 7; §19). "Emoji are allowed"
+    above reads as every emoji; the profile lets in only those that need neither U+FE0F nor a zero-width joiner.
+    The two ways to close the gap are to keep the profile and say so in the rule (an admin who types
+    "❤️ Movies" reads `invalid` and picks another emoji), or to let those sequences through in room names,
+    which is a rule of our own next to the profile. Until the owner answers, the rule stands as written above
+    and the code stays as README S53 built it.
 - **The admin rule is checked again inside the transaction of each change** (`stillAdmin`). The chain let the
   request in on a principal that may be up to 30 s old (the session cache, §7.4), and the account can have been
   demoted, disabled or deleted since: the caller's row as stored now must be an active admin, else 403
@@ -2151,8 +2237,8 @@ Common errors are not repeated per row: `bad_request`, `payload_too_large`, `uns
 | 9 | `POST /api/v1/auth/reset/check` | Public | 200 `{username}` | 404 `reset_token_invalid` | M1 |
 | 10 | `POST /api/v1/auth/reset/complete` | Public | 200 `{user}` + cookie | 404 `reset_token_invalid`, 422, 503 | M1 |
 | 11 | `GET /api/v1/me` | User | 200 `Me` (may rotate the cookie) | — | M1 |
-| 12 | `POST /api/v1/me/password` | User | 200 `{}` + rotated cookie | 403 `wrong_password`, 422, 503 | M1 |
-| 13 | `POST /api/v1/me/delete` | User | 204, cookie cleared | 403 `wrong_password`, 409 `last_admin` | M1 |
+| 12 | `POST /api/v1/me/password` | User | 200 `{}` + rotated cookie (the old one works for 60 s more, §7.7) | 422 `validation_failed {newPassword}` first (the new password's rules, before any hash or token); then the current password: 403 `wrong_password` (also for a missing one, which is answered before the throttle), 429 `rate_limited` (too many wrong passwords, §7.3), 503 `server_busy` (the hash queue is full) | M1 |
+| 13 | `POST /api/v1/me/delete` | User | 204, cookie cleared | 409 `last_admin` first (before the password is looked at); then the password: 403 `wrong_password` (also for a missing one), 429 `rate_limited` (§7.3), 503 `server_busy` | M1 |
 | 14 | `GET /api/v1/me/sessions` | User | 200 `{sessions}` | — | M1 |
 | 15 | `DELETE /api/v1/me/sessions/{id}` | User | 204 | 404 `not_found` | M1 |
 | 16 | `POST /api/v1/me/sessions/revoke-others` | User | 200 `{revoked}` | — | M1 |
@@ -2292,9 +2378,12 @@ Secure; SameSite=Lax`. It deletes this session and its push subscriptions. The S
 of `session`.
 
 `POST /api/v1/me/password` `{"currentPassword": "…", "newPassword": "…"}` → `200 {}`. It rotates this session's
-cookie and applies the revocation row in §7.7.
+cookie and applies the revocation row in §7.7: the response sets the cookie to the new token (its only
+`Set-Cookie`), and the cookie the request arrived with works for 60 s more. A rule the new password breaks is
+`validation_failed` with the field `newPassword`; a current password that is wrong or missing is `wrong_password`.
 
-`POST /api/v1/me/delete` `{"password": "…"}` → 204.
+`POST /api/v1/me/delete` `{"password": "…"}` → 204 with the cookie cleared. A wrong or missing password is
+`wrong_password`; the only active admin gets `last_admin` whatever the password (§7.11).
 
 `GET /api/v1/me/sessions` →
 
@@ -2307,6 +2396,18 @@ cookie and applies the revocation row in §7.7.
 ]}
 ```
 
+The session list as README S58 built it (`httpapi/account.go`):
+- **Order**: this request's session first, marked `current`; then the others, the most recently seen first (the
+  store's order).
+- **Only live sessions.** A row past `idle_expires_at` or `expires_at` that the janitor has not pruned yet (§4.7,
+  within the hour) is left out: it is no session any more. Both limits are inclusive, as in the store.
+- If the caller's own session is not among the live rows (it went away between the chain's authentication and
+  this read), the answer is 401 `unauthenticated`, not a list without a current entry.
+- `name` is the browser label of §7.4. The call reads only.
+
+`DELETE /api/v1/me/sessions/{id}` → 204. The SPA signs this browser out through logout, not here; if the ID is
+the caller's own session all the same, it is revoked like any other and the cookie is cleared (§7.7).
+
 `GET /api/v1/me/devices` →
 
 ```json
@@ -2314,7 +2415,17 @@ cookie and applies the revocation row in §7.7.
               "appVersion": "0.2.0", "createdAt": "…", "lastSeenAt": "…", "lastIp": "203.0.113.7"}]}
 ```
 
-`POST /api/v1/me/sessions/revoke-others` `{}` → `200 {"revoked": 2}`.
+`GET /api/v1/me/devices` checks that the caller's session still exists (401 `unauthenticated` otherwise), like
+the push handlers (§12.4.6), and lists the most recently seen device first; the list is empty until M2.
+
+`POST /api/v1/me/sessions/revoke-others` `{}` → `200 {"revoked": 2}`: the number of browsers signed out, which
+is the number of other sessions that `GET /me/sessions` listed. An expired row that was not pruned yet goes with
+them and is not counted (§7.7). The body is not read. `POST /api/v1/auth/logout-everywhere` (`{}`, not read
+either) → 204 with the cookie cleared.
+
+Every change here tells the user's other tabs with `devices` (§12.5): a password change, a revoked session or
+device, `logout-everywhere`, and `revoke-others` when it signed a browser out. Deleting the account tells the
+admins with `admin.users`.
 
 #### 12.4.4 Rooms
 
@@ -3097,3 +3208,10 @@ Decided after group 5 (an engineering call the owner delegated; README §6): **t
 the registration mode.** In the `invite` and `closed` modes a `register` request without an invite takes its
 `register-ip` token first, so an address that has used its tokens up gets 429 `rate_limited` where the mode alone
 would answer 403. It stays as S42 built it; §7.3 has the reasons and §7.9 the full order.
+
+**Open, for the owner** (README §6):
+- **Room names and the emoji that need U+FE0F or a zero-width joiner** (§8). The rule says emoji are allowed;
+  the PRECIS profile it names refuses the variation selector U+FE0F and a joiner between emoji, so the red
+  heart, the keycaps and the profession and family sequences are `invalid` in a room name, while an emoji of one
+  code point, one with a skin tone and a flag pass. Keep the profile as it is, or let those sequences in: not
+  decided. Until the owner answers, the rule in §8 is not changed and the code stays as built.
