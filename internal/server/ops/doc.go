@@ -49,10 +49,11 @@
 //     restore, with the server's shutdown between them: PrepareRestore receives and validates an archive or a
 //     bare database file, saves the current state as backups/pre-restore-<ts>.tar.gz and writes the plan;
 //     CompleteRestore swaps the files once nothing has them open. RecoverRestore completes an interrupted swap at
-//     the next start, and FinishRestore removes the previous files after a start that succeeded. The admin socket
-//     serves the three as GET /v1/backup, POST /v1/restore and POST /v1/rotate-secrets (adminapi.go); the last two
-//     answer 202 and then ask the server for its restart through AdminOptions.Restart. ops may not import store,
-//     so 03's snapshot and its file-level functions arrive as function values (DataDir.Snapshot, doctor.DBFiles).
+//     the next start, or says that only the operator can (ErrRestoreNeedsOperator), and FinishRestore removes the
+//     previous files after a start that succeeded. The admin socket serves the three as GET /v1/backup,
+//     POST /v1/restore and POST /v1/rotate-secrets (adminapi.go); the last two answer 202 and then ask the server
+//     for its restart through AdminOptions.Restart. ops may not import store, so 03's snapshot and its file-level
+//     functions arrive as function values (DataDir.Snapshot, doctor.DBFiles).
 //
 // The later ops slices add dashboard.go and conntest.go.
 //

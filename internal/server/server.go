@@ -106,16 +106,20 @@ var errStopped = errors.New("server: already shut down; build a new Server")
 // NeedsOperator reports whether err, from New, Start or Run, is a refusal to start that a restart can't fix
 // (04 §6.3): an invalid config (a policy key whose value the settings refuse included), a container without a data
 // volume, a data directory or lock file the process can't write, an admin socket directory it can't create, a
-// corrupt or wrongly owned secrets.json, and a database that 03's store can't bring to this binary's schema: one
-// that a newer isshoni wrote, a failed migration, a corrupt file (store.ErrNeedsOperator). cmd/isshoni prints such an
-// error (it carries its own fix line) and exits 78, on which systemd stops restarting. Any other error is a runtime
-// error (exit 1): a busy port, a data directory locked by another isshoni (config.ErrDataDirLocked).
-// config.ReasonOf(err) gives the reason code for the data-directory and secrets refusals.
+// corrupt or wrongly owned secrets.json, a database that 03's store can't bring to this binary's schema: one
+// that a newer isshoni wrote, a failed migration, a corrupt file (store.ErrNeedsOperator), and a restore whose swap
+// only the operator can put right: a restore/plan.json that can't be used, or a file that is both in the data
+// directory and among the ones the restore moved away (ops.ErrRestoreNeedsOperator; the data directory may be half
+// swapped, so nothing opens it). cmd/isshoni prints such an error (it carries its own fix line) and exits 78, on
+// which systemd stops restarting. Any other error is a runtime error (exit 1): a busy port, a data directory locked
+// by another isshoni (config.ErrDataDirLocked). config.ReasonOf(err) gives the reason code for the data-directory
+// and secrets refusals.
 //
 // A certificate that can't be had is neither: the server starts, and is not ready until it has one (04 §6.2, §8.4).
 func NeedsOperator(err error) bool {
 	var ve *config.ValidationError
-	return errors.Is(err, config.ErrNeedsOperator) || errors.Is(err, store.ErrNeedsOperator) || errors.As(err, &ve)
+	return errors.Is(err, config.ErrNeedsOperator) || errors.Is(err, store.ErrNeedsOperator) ||
+		errors.Is(err, ops.ErrRestoreNeedsOperator) || errors.As(err, &ve)
 }
 
 // Addrs are the addresses the server listens on, as bound: a configured port 0 (tests) shows as the port the
@@ -369,7 +373,8 @@ func (s *Server) Start(ctx context.Context) (err error) {
 	}
 	// A restore whose file swap was interrupted (a crash, a kill) is completed now, before anything reads the files
 	// it replaces: secrets.json in step 3, the database in step 4 (04 §12.4 "Crash safety"). An error means the
-	// data directory may be half swapped, and nothing must open it.
+	// data directory may be half swapped, and nothing must open it; one that only the operator can put right is a
+	// refusal (NeedsOperator).
 	if err := ops.RecoverRestore(paths, s.log); err != nil {
 		return err
 	}
@@ -478,13 +483,15 @@ func (s *Server) Start(ctx context.Context) (err error) {
 		s.serveTLS(s.httpSrv, s.mux.TLS())
 		s.serve(s.plainSrv, newLimitListener(s.httpLn, s.cfg.Limits.ConnsPerIP))
 	}
-	s.startBackground()
-	s.state, s.served = stateServing, true
-	// The server runs on what the last restore put in place: the files from before it are no longer needed
-	// (04 §12.4 step 7). Their pre-restore backup stays in backups/.
+	// The server runs on what the last restore put in place, and nothing from here on can fail the start: the
+	// files from before that restore are no longer needed (04 §12.4 step 7). Their pre-restore backup stays in
+	// backups/. This comes before the admin socket takes its first request: the next restore, which a script may
+	// send the moment the socket answers, must find the last one finished, not finishing.
 	if err := ops.FinishRestore(paths, s.log); err != nil {
 		s.log.Warn("could not remove what the last restore kept of the previous state", logx.Err(err))
 	}
+	s.startBackground()
+	s.state, s.served = stateServing, true
 
 	// Step 10: one line that says where the server is and which ports carry media, and how to finish setup while no
 	// admin exists.

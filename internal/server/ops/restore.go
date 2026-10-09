@@ -19,7 +19,10 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/MoonWX/isshoni/internal/logx"
 	"github.com/MoonWX/isshoni/internal/protocol/api"
@@ -43,6 +46,10 @@ import (
 // The plan makes step 2 safe to interrupt: RecoverRestore, which runs at every start before anything reads the
 // data directory, completes a plan that is still "swapping", from whatever point the swap had reached. After the
 // next successful start, FinishRestore removes restore/old-<ts>/ and the plan.
+//
+// One process has the data directory at a time (its lock, 04 §5.1), and inside that process planMu orders the
+// steps that replace or remove the plan: the restore that a server accepts right after its start must not lose
+// its plan to that start's FinishRestore.
 //
 // What is in restore/:
 //
@@ -79,8 +86,19 @@ const (
 	restoreMaxTrailingBytes = 1 << 20
 )
 
-// Variables only so that tests can lower the two limits that are too large to reach, and can stop a swap between
-// two of its steps.
+// Bounds on an entry's name, so that no archive brings a name that the filesystem refuses, or one that the server
+// can't reach afterwards. certmagic's own names are far below both: a few fixed elements and a domain name twice.
+const (
+	// restoreMaxElemBytes bounds one element of a name: what the filesystems that a server runs on take (NAME_MAX).
+	restoreMaxElemBytes = 255
+	// restoreMaxNameBytes bounds a whole name. With the data directory's own path before it, the file's path stays
+	// below what the kernel takes as one path (PATH_MAX, 4096 on Linux): a deeper tree unpacks, since that goes
+	// element by element, and then no backup can read it again.
+	restoreMaxNameBytes = 1024
+)
+
+// Variables only so that tests can lower the two limits that are too large to reach, can stop a swap or a cleanup
+// between two of its steps, and can say how full the disk is.
 var (
 	// restoreMaxBytes is RestoreMaxBytes as PrepareRestore applies it.
 	restoreMaxBytes int64 = RestoreMaxBytes
@@ -88,7 +106,30 @@ var (
 	restoreMaxUnpackedBytes int64 = 16 << 30
 	// renameFile moves one file or directory of a swap.
 	renameFile = os.Rename
+	// removeTree removes restore/old-<ts> when a restore is finished.
+	removeTree = os.RemoveAll
+	// freeBytes is the free space of the filesystem that holds a directory (diskFree).
+	freeBytes = diskFree
 )
+
+// planMu is held by whoever replaces or removes restore/plan.json: CompleteRestore, FinishRestore, and the step
+// of PrepareRestore that ends the last restore and writes the plan of the next. Each of them reads the plan and
+// then acts on what it read, so two of them at once could act on a plan that is no longer there.
+var planMu sync.Mutex
+
+// ErrRestoreNeedsOperator is wrapped by the errors of CompleteRestore and RecoverRestore that no restart can fix: a
+// restore/plan.json that is not one a restore writes, and a swap that finds a file both in the data directory and in
+// restore/old-<ts>/. The data directory may then be half swapped, and only the operator can tell which file belongs
+// where; the error's text says what to do. The server refuses to start on it with exit 78 (server.NeedsOperator,
+// 04 §3.2), so that systemd does not start it again and again. An error that does not wrap it (a file that can't be
+// read or moved) may be gone at the next start.
+var ErrRestoreNeedsOperator = errors.New("ops: a restore needs the operator")
+
+// operatorError is an error that wraps ErrRestoreNeedsOperator and reads as its own message alone.
+type operatorError struct{ msg string }
+
+func (e *operatorError) Error() string { return e.msg }
+func (e *operatorError) Unwrap() error { return ErrRestoreNeedsOperator }
 
 // sqliteMagic starts every SQLite database file; gzipMagic every gzip stream.
 var (
@@ -270,11 +311,7 @@ func (d *DataDir) PrepareRestore(ctx context.Context, body io.Reader, size int64
 	// Step 3: from here on the restore will happen, in this process or at the next start. A restore that was done
 	// but never followed by a successful start (two offline restores in a row) makes room first, so that there is
 	// one plan and one old-<ts> at a time: its old files go, and its pre-restore backup stays.
-	err = FinishRestore(p, d.Logger)
-	if err == nil {
-		err = writePlan(p, &next)
-	}
-	if err != nil {
+	if err := replacePlan(p, &next, d.Logger); err != nil {
 		if info.PreRestoreBackup != "" {
 			_ = os.Remove(filepath.Join(p.DataDir, filepath.FromSlash(info.PreRestoreBackup)))
 		}
@@ -398,7 +435,7 @@ func extractArchive(ctx context.Context, src, dir string) (Manifest, error) {
 	}
 	defer func() { _ = root.Close() }()
 
-	seen := map[string]bool{}
+	seen := entryTree{}
 	entries := 1 // the manifest
 	var unpacked int64
 	for {
@@ -420,17 +457,16 @@ func extractArchive(ctx context.Context, src, dir string) (Manifest, error) {
 			return Manifest{}, err
 		}
 		inCerts := name == backupCerts || strings.HasPrefix(name, backupCerts+"/")
-		switch {
-		case seen[name]:
-			return Manifest{}, invalidBackup("it holds "+quoteName(name)+" twice", nil)
-		case inCerts && !certs, !inCerts && (isDir || !slices.Contains(files, name)), name == backupCerts && !isDir:
+		if (inCerts && !certs) || (!inCerts && (isDir || !slices.Contains(files, name))) || (name == backupCerts && !isDir) {
 			return Manifest{}, invalidBackup("it holds "+quoteName(name)+", which its manifest does not list", nil)
 		}
-		seen[name] = true
+		if err := seen.add(name, isDir); err != nil {
+			return Manifest{}, err
+		}
 		local := filepath.FromSlash(name)
 		if isDir {
 			if err := root.MkdirAll(local, 0o700); err != nil {
-				return Manifest{}, storageError(fmt.Errorf("ops: restore: unpacking %s: %w", name, err))
+				return Manifest{}, unpackError(name, err)
 			}
 			continue
 		}
@@ -449,8 +485,8 @@ func extractArchive(ctx context.Context, src, dir string) (Manifest, error) {
 		case err == nil:
 		case ctx.Err() != nil:
 			return Manifest{}, ctx.Err()
-		case errors.Is(err, errUnpackWrite): // the disk, not the archive
-			return Manifest{}, storageError(fmt.Errorf("ops: restore: unpacking %s: %w", name, err))
+		case errors.Is(err, errUnpackWrite): // the disk, not the archive's content
+			return Manifest{}, unpackError(name, err)
 		default:
 			return Manifest{}, invalidBackup("it is damaged or cut off", err)
 		}
@@ -469,12 +505,12 @@ func extractArchive(ctx context.Context, src, dir string) (Manifest, error) {
 		return Manifest{}, invalidBackup("it has data after the archive's end", nil)
 	}
 	for _, name := range files {
-		if !seen[name] {
+		if !seen.has(name) {
 			return Manifest{}, invalidBackup("it lacks "+quoteName(name)+", which its manifest lists", nil)
 		}
 	}
 	for name := range m.SHA256 {
-		if !seen[name] {
+		if !seen.has(name) {
 			return Manifest{}, invalidBackup("it lacks "+quoteName(name)+", which its manifest has a checksum for", nil)
 		}
 	}
@@ -484,6 +520,58 @@ func extractArchive(ctx context.Context, src, dir string) (Manifest, error) {
 		}
 	}
 	return m, nil
+}
+
+// entryKind is what a name is in the staging directory while an archive is unpacked.
+type entryKind uint8
+
+const (
+	entryFile   entryKind = iota + 1 // a file entry
+	entryDir                         // a directory entry
+	entryParent                      // a directory that no entry has named so far: an entry lies below it
+)
+
+// entryTree is what the entries of an archive have put into the staging directory so far, by name. It refuses the
+// entries that would collide there, which would otherwise fail in the filesystem and pass for a failure of the disk.
+type entryTree map[string]entryKind
+
+// has reports whether an entry had the name.
+func (t entryTree) has(name string) bool { return t[name] == entryFile || t[name] == entryDir }
+
+// add records the entry name, or refuses it (backup_invalid): a name comes once, nothing lies below a file, and a
+// file does not take the place of a directory. A directory may be named after the entries below it.
+func (t entryTree) add(name string, isDir bool) error {
+	switch {
+	case t.has(name):
+		return invalidBackup("it holds "+quoteName(name)+" twice", nil)
+	case t[name] == entryParent && !isDir:
+		return invalidBackup("it holds "+quoteName(name)+" as a file and as a directory", nil)
+	}
+	for dir := path.Dir(name); dir != "."; dir = path.Dir(dir) {
+		if t[dir] == entryFile {
+			return invalidBackup("it holds "+quoteName(name)+" below the file "+quoteName(dir), nil)
+		}
+	}
+	for dir := path.Dir(name); dir != "." && t[dir] == 0; dir = path.Dir(dir) {
+		t[dir] = entryParent
+	}
+	t[name] = entryFile
+	if isDir {
+		t[name] = entryDir
+	}
+	return nil
+}
+
+// unpackError is the error for an entry that could not be created in the staging directory. That directory was
+// empty when the archive's first entry arrived, so a name that is taken there was taken by another entry: on some
+// filesystems two names that differ only in case, or in how they compose an accented letter, are one. Such an
+// archive is refused like any other that is none of ours. Everything else is the disk's, and a full one is
+// insufficient_storage.
+func unpackError(name string, err error) error {
+	if errors.Is(err, fs.ErrExist) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.EISDIR) {
+		return invalidBackup("it holds "+quoteName(name)+", which is the name of another of its entries on this filesystem", err)
+	}
+	return storageError(fmt.Errorf("ops: restore: unpacking %s: %w", name, err))
 }
 
 // manifestContents checks what a manifest says the archive holds and returns the top-level files and whether the
@@ -512,7 +600,9 @@ func manifestContents(m Manifest) (files []string, certs bool, err error) {
 
 // entryName checks one entry's type and name and returns the name without a directory's trailing slash. Only
 // regular files and directories pass (no symlink, hard link or device), and only names that are plain relative
-// paths in their shortest form: no "..", no "//", no leading "/", no backslash.
+// paths in their shortest form: no "..", no "//", no leading "/", no backslash. They are UTF-8 and no longer than a
+// filesystem takes, in each element and as a whole: a name that the disk would refuse is the archive's fault, not
+// the disk's.
 func entryName(hdr *tar.Header) (name string, isDir bool, err error) {
 	switch hdr.Typeflag {
 	case tar.TypeReg:
@@ -533,8 +623,14 @@ func entryName(hdr *tar.Header) (name string, isDir bool, err error) {
 		name = strings.TrimSuffix(name, "/")
 	}
 	if name == "" || name == backupManifest || strings.ContainsAny(name, "\\\x00") || path.IsAbs(name) ||
-		path.Clean(name) != name || !filepath.IsLocal(filepath.FromSlash(name)) {
+		path.Clean(name) != name || !filepath.IsLocal(filepath.FromSlash(name)) || !utf8.ValidString(name) ||
+		len(name) > restoreMaxNameBytes {
 		return "", false, invalidBackup("its entry "+quoteName(hdr.Name)+" has a name that no backup holds", nil)
+	}
+	for elem := range strings.SplitSeq(name, "/") {
+		if len(elem) > restoreMaxElemBytes {
+			return "", false, invalidBackup("its entry "+quoteName(hdr.Name)+" has a name that no backup holds", nil)
+		}
 	}
 	return name, isDir, nil
 }
@@ -646,7 +742,8 @@ func rotatePreRestore(dir string) error {
 	return errors.Join(errs...)
 }
 
-// readPlan reads restore/plan.json; it returns nil without an error when there is none.
+// readPlan reads restore/plan.json; it returns nil without an error when there is none. A file that is there and
+// is no plan of a restore is the operator's to deal with (ErrRestoreNeedsOperator).
 func readPlan(p config.Paths) (*restorePlan, error) {
 	file := filepath.Join(p.Restore, restorePlanName)
 	data, err := os.ReadFile(file) //nolint:gosec // G304: restore/plan.json
@@ -658,8 +755,8 @@ func readPlan(p config.Paths) (*restorePlan, error) {
 	}
 	var plan restorePlan
 	unusable := func(why string) error {
-		return fmt.Errorf("%s is the record of a restore, and it can't be used (%s). Compare the data directory with %s, "+
-			"put the files where they belong, then remove %s", file, why, p.Restore, file)
+		return &operatorError{msg: fmt.Sprintf("%s is the record of a restore, and it can't be used (%s). Compare the "+
+			"data directory with %s, put the files where they belong, then remove %s", file, why, p.Restore, file)}
 	}
 	if err := json.Unmarshal(data, &plan); err != nil {
 		return nil, unusable("it is not valid JSON")
@@ -705,6 +802,19 @@ func writePlan(p config.Paths, plan *restorePlan) error {
 	return syncDir(p.Restore)
 }
 
+// replacePlan is step 3 of a restore (04 §12.4): it ends the restore before this one, if that is done and no start
+// has followed it (finishRestore), and writes plan as the record of the next. Both happen under planMu, so that a
+// FinishRestore that runs beside it removes the done plan before this one is written, or finds this one and leaves
+// it alone.
+func replacePlan(p config.Paths, plan *restorePlan, log *slog.Logger) error {
+	planMu.Lock()
+	defer planMu.Unlock()
+	if err := finishRestore(p, log); err != nil {
+		return err
+	}
+	return writePlan(p, plan)
+}
+
 // CompleteRestore is the second half of a restore (04 §12.4 steps 5 and 6): when restore/plan.json is in the state
 // "swapping", it moves the data directory's current files to restore/old-<ts>/ and the staged ones in, marks the
 // plan "done" and reports true. Without such a plan it does nothing. Nothing may have the data directory's files
@@ -713,7 +823,12 @@ func writePlan(p config.Paths, plan *restorePlan) error {
 // It may be interrupted anywhere and called again: every step looks at what is there. The order keeps a WAL from
 // ever sitting next to a database it does not belong to: the old -wal and -shm leave before the old database,
 // and the new database arrives before a WAL of its own (a raw backup's).
+//
+// An error that wraps ErrRestoreNeedsOperator is one that another call will meet again: the plan can't be used,
+// or a file is both in the data directory and in restore/old-<ts>/.
 func CompleteRestore(p config.Paths, log *slog.Logger) (bool, error) {
+	planMu.Lock()
+	defer planMu.Unlock()
 	plan, err := readPlan(p)
 	if err != nil || plan == nil || plan.State != planSwapping {
 		return false, err
@@ -735,8 +850,9 @@ func CompleteRestore(p config.Paths, log *slog.Logger) (bool, error) {
 		}
 		kept := filepath.Join(old, name)
 		if exists(kept) {
-			return false, fmt.Errorf("ops: restore: both %s and %s exist; a restore moves the first to the second "+
-				"once. Check which one is the data directory's, move the other away, and start again", target, kept)
+			return false, &operatorError{msg: fmt.Sprintf("ops: restore: both %s and %s exist; a restore moves the "+
+				"first to the second once. Check which one is the data directory's, move the other away, and start again",
+				target, kept)}
 		}
 		if err := renameFile(target, kept); err != nil {
 			return false, fmt.Errorf("ops: restore: %w", err)
@@ -777,7 +893,7 @@ func CompleteRestore(p config.Paths, log *slog.Logger) (bool, error) {
 // its plan, and is removed with a log line.
 //
 // Its error means that the data directory may be half swapped and the server must not open it: a plan that can't
-// be read, or a swap that fails again.
+// be read, or a swap that fails again. It wraps ErrRestoreNeedsOperator when only the operator can put that right.
 func RecoverRestore(p config.Paths, log *slog.Logger) error {
 	log = dataLogger(log)
 	if !exists(p.Restore) {
@@ -824,13 +940,23 @@ func RecoverRestore(p config.Paths, log *slog.Logger) error {
 // FinishRestore is the last step of a restore (04 §12.4 step 7), for after the next successful start: when the
 // plan is "done", it removes restore/old-<ts>/, the data directory's files from before the restore, and then the
 // plan. The pre-restore backup in backups/ stays. Without a done plan it does nothing.
+//
+// The server calls it before its admin socket takes requests, and it is safe beside a PrepareRestore all the same
+// (planMu): the plan it removes is the one it read.
 func FinishRestore(p config.Paths, log *slog.Logger) error {
+	planMu.Lock()
+	defer planMu.Unlock()
+	return finishRestore(p, log)
+}
+
+// finishRestore is FinishRestore for a caller that holds planMu.
+func finishRestore(p config.Paths, log *slog.Logger) error {
 	plan, err := readPlan(p)
 	if err != nil || plan == nil || plan.State != planDone {
 		return err
 	}
 	old := filepath.Join(p.Restore, restoreOldPrefix+plan.TS)
-	if err := os.RemoveAll(old); err != nil {
+	if err := removeTree(old); err != nil {
 		return fmt.Errorf("ops: restore: %w", err)
 	}
 	if err := os.Remove(filepath.Join(p.Restore, restorePlanName)); err != nil && !errors.Is(err, fs.ErrNotExist) {

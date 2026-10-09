@@ -221,7 +221,9 @@ func (b *Backup) Close() {
 //
 // With Snapshot set (the running server) a snapshot that fails is the error. Without it (offline), the snapshot of
 // the database file is DB.Backup, and only when that fails are the raw files copied instead, with "raw": true in the
-// manifest (04 §12.3). A part that the data directory does not have is left out of the archive.
+// manifest (04 §12.3). A disk without room for the snapshot is neither: it is the refusal insufficient_storage, with
+// or without a server, and it is seen before the snapshot begins. A part that the data directory does not have is
+// left out of the archive.
 func (d *DataDir) PrepareBackup(ctx context.Context, o BackupOptions) (_ *Backup, err error) {
 	b := &Backup{Manifest: Manifest{
 		Format:         BackupFormat,
@@ -249,7 +251,8 @@ func (d *DataDir) PrepareBackup(ctx context.Context, o BackupOptions) (_ *Backup
 	return b, nil
 }
 
-// stageDatabase adds the database to b: a snapshot, or the raw files of a stopped server whose snapshot failed.
+// stageDatabase adds the database to b: a snapshot, or the raw files of a stopped server whose database can't be
+// read.
 func (d *DataDir) stageDatabase(ctx context.Context, b *Backup) error {
 	online := d.Snapshot != nil
 	if !online {
@@ -259,6 +262,9 @@ func (d *DataDir) stageDatabase(ctx context.Context, b *Backup) error {
 	}
 	if err := os.MkdirAll(d.Paths.Restore, 0o700); err != nil {
 		return storageError(fmt.Errorf("ops: backup: %w", err))
+	}
+	if err := d.snapshotRoom(); err != nil {
+		return storageError(fmt.Errorf("ops: backup: snapshot of the database: %w", err))
 	}
 	tmp := filepath.Join(d.Paths.Restore, "snapshot-"+randomName()+".db")
 	var err error
@@ -277,7 +283,8 @@ func (d *DataDir) stageDatabase(ctx context.Context, b *Backup) error {
 	}
 	if err != nil {
 		_ = os.Remove(tmp)
-		if ctx.Err() != nil || online || d.DB.Backup == nil {
+		// A full disk says nothing about the database: the raw files are for one that can't be read.
+		if ctx.Err() != nil || online || d.DB.Backup == nil || noSpace(err) {
 			return storageError(fmt.Errorf("ops: backup: snapshot of the database: %w", err))
 		}
 		d.log().Warn("the database can't be read as a database; the backup holds its raw files instead",
@@ -292,6 +299,29 @@ func (d *DataDir) stageDatabase(ctx context.Context, b *Backup) error {
 	b.add(entry)
 	b.Manifest.SchemaVersion = d.schemaOf(ctx, tmp)
 	return nil
+}
+
+// snapshotRoom looks ahead at the snapshot of the database, which is a second copy of it on the data directory's
+// disk: without the room for it the error says so (errNoSpace), before a server fills its own disk to find out, and
+// before an offline backup takes the failed snapshot for a database that can't be read. The database's size with
+// its WAL is the most a snapshot takes; it is smaller when the database has pages that it no longer uses. Where the
+// platform can't tell the free space, the snapshot's own error has to do (the wiring marks SQLite's "disk is full").
+func (d *DataDir) snapshotRoom() error {
+	var need uint64
+	for _, file := range []string{d.Paths.DB, d.Paths.DB + "-wal"} {
+		fi, err := os.Stat(file)
+		if err != nil || !fi.Mode().IsRegular() {
+			continue
+		}
+		if size := fi.Size(); size > 0 {
+			need += uint64(size)
+		}
+	}
+	free, ok := freeBytes(d.Paths.Restore)
+	if !ok || need <= free {
+		return nil
+	}
+	return fmt.Errorf("the database has %d bytes and %s has %d free: %w", need, d.Paths.Restore, free, errNoSpace)
 }
 
 // stageRawDatabase adds the database's files as they are (04 §12.3 "raw"). Nothing has them open: the caller is an
@@ -620,11 +650,14 @@ func invalidBackup(why string, err error) *DataError {
 // errNoSpace stands in for the kernel's "no space left on device" where a free-space check sees it coming.
 var errNoSpace = errors.New("not enough free disk space")
 
+// noSpace reports whether err says "the disk is full": the kernel's error, or a free-space check of ours.
+func noSpace(err error) bool { return errors.Is(err, syscall.ENOSPC) || errors.Is(err, errNoSpace) }
+
 // storageError turns an error that says "the disk is full" into the refusal 507 insufficient_storage; any other
 // error is returned as it is.
 func storageError(err error) error {
 	var de *DataError
-	if err == nil || errors.As(err, &de) || (!errors.Is(err, syscall.ENOSPC) && !errors.Is(err, errNoSpace)) {
+	if err == nil || errors.As(err, &de) || !noSpace(err) {
 		return err
 	}
 	return &DataError{

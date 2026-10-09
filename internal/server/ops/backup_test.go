@@ -473,6 +473,87 @@ func TestBackupRawFallback(t *testing.T) {
 	}
 }
 
+// diskWith makes the tests' disk one with free bytes left, wherever backup and restore ask (freeBytes), until the
+// test ends.
+func diskWith(t *testing.T, free uint64) {
+	t.Helper()
+	freeBytes = func(string) (uint64, bool) { return free, true }
+	t.Cleanup(func() { freeBytes = diskFree })
+}
+
+// The snapshot of the database is a second copy of it on the same disk. A disk without the room for it is the
+// refusal insufficient_storage (04 §12.2), seen before the snapshot begins: a running server does not fill its own
+// disk to find out, and an offline backup does not take the failed snapshot for a database that can't be read and
+// fall back to its raw files.
+func TestBackupWithoutRoomForTheSnapshot(t *testing.T) {
+	for _, mode := range []string{"running server", "offline"} {
+		t.Run(mode, func(t *testing.T) {
+			td := newTestData(t, fakeDB{Schema: 7, Note: "alpha"})
+			td.write(t, "isshoni.db-wal", []byte("pages that are not in the database file yet"))
+			need := uint64(len(td.read(t, "isshoni.db")) + len(td.read(t, "isshoni.db-wal")))
+			asked := 0
+			if mode == "running server" {
+				td.Snapshot = func(ctx context.Context, dst string) error { asked++; return copyDB(ctx, td.Paths.DB, dst) }
+			} else {
+				td.DB.Backup = func(ctx context.Context, src, dst string) error { asked++; return copyDB(ctx, src, dst) }
+			}
+			before := td.serverFiles(t)
+
+			diskWith(t, need-1)
+			_, err := td.PrepareBackup(t.Context(), BackupOptions{})
+			var de *DataError
+			if !errors.As(err, &de) || de.Code != api.CodeInsufficientStorage || de.Fix == "" {
+				t.Fatalf("PrepareBackup with %d bytes free for %d: %v, want insufficient_storage with a fix", need-1, need, err)
+			}
+			if want := fmt.Sprintf("the database has %d bytes and %s has %d free", need, td.Paths.Restore, need-1); !strings.Contains(fmt.Sprint(de.Err), want) {
+				t.Errorf("the cause, for the log: %v, want %q in it", de.Err, want)
+			}
+			if asked != 0 {
+				t.Errorf("the snapshot was begun %d times on a disk without room for it", asked)
+			}
+			if strings.Contains(td.logs.String(), "raw files") {
+				t.Errorf("a full disk was taken for a database that can't be read:\n%s", td.logs.String())
+			}
+			if left := tree(t, td.Paths.Restore, nil); len(left) != 0 {
+				t.Errorf("restore/ after the refusal: %v", keys(left))
+			}
+			// A restore, whose first step of its own is this backup, is refused the same way and leaves nothing.
+			wantRefused(t, td, fakeDB{Schema: latestSchema, Note: "restored"}.bytes(), api.CodeInsufficientStorage, "not enough free disk space")
+			if after := td.serverFiles(t); !reflect.DeepEqual(after, before) {
+				t.Errorf("the refusals changed the server's files: %v", keys(after))
+			}
+
+			// With exactly the room, the backup is a snapshot.
+			diskWith(t, need)
+			m, entries := readArchive(t, archiveOf(t, td, BackupOptions{NoCerts: true}))
+			if m.Raw || asked != 1 || !slices.Equal(names(entries), []string{"isshoni.db", "secrets.json"}) {
+				t.Errorf("with room for the snapshot: raw=%v, %d snapshots, entries %v", m.Raw, asked, names(entries))
+			}
+		})
+	}
+
+	// The look ahead is an estimate: the disk can still fill up while the snapshot is written. Offline that is no
+	// reason for a raw backup either.
+	td := newTestData(t, fakeDB{Schema: 7, Note: "alpha"})
+	td.DB.Backup = func(context.Context, string, string) error {
+		return fmt.Errorf("VACUUM INTO: database or disk is full (13) (%w)", syscall.ENOSPC)
+	}
+	var de *DataError
+	if _, err := td.PrepareBackup(t.Context(), BackupOptions{}); !errors.As(err, &de) || de.Code != api.CodeInsufficientStorage {
+		t.Errorf("an offline snapshot on a disk that fills up: %v, want insufficient_storage", err)
+	}
+	if strings.Contains(td.logs.String(), "raw files") {
+		t.Errorf("a full disk was taken for a database that can't be read:\n%s", td.logs.String())
+	}
+	// A platform that can't tell the free space goes on to the snapshot.
+	freeBytes = func(string) (uint64, bool) { return 0, false }
+	t.Cleanup(func() { freeBytes = diskFree })
+	td = newTestData(t, fakeDB{Schema: 7, Note: "alpha"})
+	if m, _ := readArchive(t, archiveOf(t, td, BackupOptions{})); m.Raw || m.SchemaVersion != 7 {
+		t.Errorf("a backup where the free space is unknown: %+v", m)
+	}
+}
+
 // A data directory that lacks a part gives an archive without it, and an empty one an empty backup.
 func TestBackupOfWhatIsThere(t *testing.T) {
 	td := newTestData(t, fakeDB{Schema: 7, Note: "alpha"})

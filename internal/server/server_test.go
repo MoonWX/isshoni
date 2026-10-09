@@ -28,6 +28,7 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/auth"
 	"github.com/MoonWX/isshoni/internal/server/config"
 	"github.com/MoonWX/isshoni/internal/server/httpapi"
+	"github.com/MoonWX/isshoni/internal/server/ops"
 	"github.com/MoonWX/isshoni/internal/server/servertest"
 	"github.com/MoonWX/isshoni/internal/version"
 	"github.com/MoonWX/isshoni/web"
@@ -1238,6 +1239,8 @@ func TestNeedsOperator(t *testing.T) {
 		"operator error":    {&config.OperatorError{Reason: config.ReasonSecretsOwner, Message: "x", Fix: "y"}, true},
 		"wrapped sentinel":  {errors.Join(errors.New("ctx"), config.ErrNeedsOperator), true},
 		"validation error":  {&config.ValidationError{}, true},
+		"restore, at start": {fmt.Errorf("completing the interrupted restore: %w", ops.ErrRestoreNeedsOperator), true},
+		"restore, at stop":  {errors.Join(errors.New("http"), fmt.Errorf("server: shutdown: restore: %w", ops.ErrRestoreNeedsOperator)), true},
 	} {
 		if got := server.NeedsOperator(tc.err); got != tc.want {
 			t.Errorf("NeedsOperator(%s) = %v, want %v", name, got, tc.want)

@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -540,11 +541,112 @@ func TestRestoreCompletedAtStartup(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "plan.json is the record of a restore, and it can't be used") {
 		t.Errorf("Start with an unreadable plan: %v", err)
 	}
+	// No restart makes the plan readable: it is a refusal, on which serve exits 78 (04 §3.2).
+	if !server.NeedsOperator(err) || !errors.Is(err, ops.ErrRestoreNeedsOperator) {
+		t.Errorf("Start with an unreadable plan: %v, want a refusal that needs the operator", err)
+	}
 	if err := os.Remove(filepath.Join(paths.Restore, "plan.json")); err != nil {
 		t.Fatal(err)
 	}
 	// It left nothing open: the data directory starts again once the plan is dealt with.
 	servertest.Start(t, servertest.Options{DataDir: srv.DataDir, Deps: wiredDeps()})
+}
+
+// TestRestoreFinishedBeforeTheSocketAnswers: the start after a restore removes what that restore kept (04 §12.4
+// step 7) before the admin socket takes its first request. `isshoni admin restore` returns as soon as that socket
+// answers again, so the operator's next command, another restore for one, arrives right then. Were the cleanup
+// still under way, it and the new restore would both work on restore/, and the cleanup could take the new
+// restore's plan with it: a restore that was answered 202 and never happened.
+func TestRestoreFinishedBeforeTheSocketAnswers(t *testing.T) {
+	srv := servertest.Start(t, servertest.Options{Deps: wiredDeps()})
+	paths := srv.Cfg.Paths()
+	setUp(t, srv)
+	dir := t.TempDir()
+	snapshot := func(name string) (map[string][][]string, []byte) {
+		t.Helper()
+		file := filepath.Join(dir, name)
+		snapshotDB(t, srv, file)
+		body, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return accountState(t, srv), body
+	}
+	alone, first := snapshot("first.db")
+	register(t, srv, "Sam")
+	withSam, second := snapshot("second.db")
+	register(t, srv, "Robin")
+
+	// A restore, as far as the end of its shutdown: the files are swapped, and those from before wait in
+	// restore/old-<ts>/ for the next start. They get company, so that removing them takes a moment.
+	admin, ctx := adminSocket(t, srv)
+	if _, err := admin.Restore(ctx, bytes.NewReader(first), ops.AdminContentSQLite); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if err := srv.Wait(t); !errors.Is(err, server.ErrRestartRequested) {
+		t.Fatalf("Run after a restore = %v, want ErrRestartRequested", err)
+	}
+	old, _ := filepath.Glob(filepath.Join(paths.Restore, "old-*"))
+	if len(old) != 1 {
+		t.Fatalf("restore/ after the restore's shutdown: %v, want one old-<ts>", dirNames(t, paths.Restore))
+	}
+	if err := os.Mkdir(filepath.Join(old[0], "more"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 2000 {
+		if err := os.WriteFile(filepath.Join(old[0], "more", strconv.Itoa(i)), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A client that is at the socket before the server is: it is answered the moment the socket is served, and
+	// looks at restore/ right then.
+	type look struct {
+		left []string
+		err  error
+	}
+	answered := make(chan look, 1)
+	go func() {
+		for {
+			_, err := admin.Health(ctx)
+			if errors.Is(err, ops.ErrAdminNotRunning) {
+				time.Sleep(time.Millisecond)
+				continue
+			}
+			var left []string
+			entries, _ := os.ReadDir(paths.Restore)
+			for _, e := range entries {
+				left = append(left, e.Name())
+			}
+			answered <- look{left, err}
+			return
+		}
+	}()
+	srv.Restart(t)
+	if got := <-answered; got.err != nil || len(got.left) != 0 {
+		t.Errorf("restore/ when the admin socket first answered: %v (health: %v), want the last restore finished", got.left, got.err)
+	}
+	if got := accountState(t, srv); !reflect.DeepEqual(got, alone) {
+		t.Errorf("the state after the first restore:\n got %v\nwant %v", got, alone)
+	}
+
+	// The next restore, sent at once, is carried out like the first.
+	restoreAndRestart(t, srv, second, ops.AdminContentSQLite)
+	if got := accountState(t, srv); !reflect.DeepEqual(got, withSam) {
+		t.Errorf("the state after the second restore:\n got %v\nwant %v", got, withSam)
+	}
+	if left := dirNames(t, paths.Restore); len(left) != 0 {
+		t.Errorf("restore/ after the second restore: %v, want nothing", left)
+	}
+	logs := srv.Logs()
+	for _, line := range []string{
+		`"msg":"restore: the data directory holds the restored files; the previous ones are kept until the next successful start"`,
+		`"msg":"restore finished: removed the files from before the restore"`,
+	} {
+		if n := strings.Count(logs, line); n != 2 {
+			t.Errorf("the log has %d of %s, want one for each of the two restores", n, line)
+		}
+	}
 }
 
 // A restore whose shutdown is a stop (SIGTERM came first) is swapped in all the same: the plan stands, and the

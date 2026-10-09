@@ -23,6 +23,7 @@ import (
 
 	"github.com/MoonWX/isshoni/internal/server"
 	"github.com/MoonWX/isshoni/internal/server/config"
+	"github.com/MoonWX/isshoni/internal/server/ops"
 )
 
 // serveProc is `isshoni serve` running as its own process: this test binary under the name isshoni, which
@@ -288,6 +289,19 @@ func TestServeExit(t *testing.T) {
 	invalid := &config.ValidationError{Problems: []config.Problem{{
 		Key: "shutdown_timeout", Value: `"0s"`, Severity: config.SeverityError, Message: "is too short", Fix: "use 10s",
 	}}}
+	// A restore that only the operator can put right, as the start returns it: the record of the restore is cut off.
+	paths := (&config.Config{DataDir: t.TempDir()}).Paths()
+	plan := filepath.Join(paths.Restore, "plan.json")
+	if err := os.Mkdir(paths.Restore, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(plan, []byte(`{"ts":"20261014T021500Z","state":"swap`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	halfRestored := ops.RecoverRestore(paths, slog.New(slog.DiscardHandler))
+	if !errors.Is(halfRestored, ops.ErrRestoreNeedsOperator) {
+		t.Fatalf("RecoverRestore with a plan that is cut off: %v", halfRestored)
+	}
 	tests := []struct {
 		name       string
 		err        error
@@ -301,6 +315,10 @@ func TestServeExit(t *testing.T) {
 		{"refusal, wrapped", fmt.Errorf("server: %w", refusal), exitConfig, "isshoni serve: server: /var/lib/isshoni/secrets.json is owned by uid 0, but isshoni runs as uid 998.\n" +
 			"  fix: run: sudo chown isshoni:isshoni /var/lib/isshoni/secrets.json\n"},
 		{"invalid config", invalid, exitConfig, "config error: shutdown_timeout = \"0s\" (default) is too short.\n  fix: use 10s.\n"},
+		{"a restore that needs the operator", halfRestored, exitConfig, "isshoni serve: " + plan + " is the record of a restore, and it can't be used " +
+			"(it is not valid JSON). Compare the data directory with " + paths.Restore + ", put the files where they belong, then remove " + plan + "\n"},
+		{"the same at a stop", fmt.Errorf("server: shutdown: restore: %w", halfRestored), exitConfig,
+			"isshoni serve: server: shutdown: restore: " + halfRestored.Error() + "\n"},
 		{"restart requested", server.ErrRestartRequested, exitRestart, "isshoni serve: the server stopped for a restart (after a restore or rotate-secrets, " +
 			"or because it found the public address it was waiting for): start it again\n"},
 		{"data directory locked", fmt.Errorf("another isshoni process is using /var/lib/isshoni: %w", config.ErrDataDirLocked), exitRuntime,

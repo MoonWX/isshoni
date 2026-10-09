@@ -147,6 +147,19 @@ func TestAdminBackupErrors(t *testing.T) {
 		t.Errorf("the cause is not in the log:\n%s", a.logs.String())
 	}
 
+	// A disk without room for the snapshot is seen before the snapshot is asked for (04 §12.2: 507 for both).
+	a.data.Snapshot = func(context.Context, string) error {
+		t.Error("the snapshot was begun on a disk without room for it")
+		return errors.New("no room")
+	}
+	diskWith(t, 3)
+	_, err = a.client.Backup(t.Context(), true)
+	if ae := adminError(t, err, api.CodeInsufficientStorage); ae.Status != 507 || !strings.Contains(ae.Message, "free disk space") || ae.Fix == "" {
+		t.Errorf("a backup without room for the snapshot: %+v", ae)
+	}
+	if left := tree(t, a.data.Paths.Restore, nil); len(left) != 0 {
+		t.Errorf("restore/ after the refusal: %v", keys(left))
+	}
 }
 
 // onMessage is a log handler that calls do when a record with the message msg passes.
@@ -349,6 +362,22 @@ func TestAdminRestoreRefusals(t *testing.T) {
 	}
 	if left := tree(t, b.data.Paths.Restore, nil); len(left) != 0 || len(b.restarts.asked()) != 0 {
 		t.Errorf("after the refusal: restore/ %v, restarts %v", keys(left), b.restarts.asked())
+	}
+
+	// Nor is it begun on a disk that has room for the body and none for the snapshot of the database in use.
+	c := startDataAdmin(t, fakeDB{Schema: latestSchema, Note: strings.Repeat("larger than the database to restore ", 8)})
+	c.data.Snapshot = func(context.Context, string) error {
+		t.Error("the snapshot was begun on a disk without room for it")
+		return errors.New("no room")
+	}
+	small := fakeDB{Schema: latestSchema}.bytes()
+	diskWith(t, uint64(len(small)))
+	_, err = c.client.Restore(t.Context(), bytes.NewReader(small), AdminContentSQLite)
+	if ae := adminError(t, err, api.CodeInsufficientStorage); ae.Status != 507 || ae.Fix == "" {
+		t.Errorf("a restore without room for the pre-restore backup: %+v", ae)
+	}
+	if left := tree(t, c.data.Paths.Restore, nil); len(left) != 0 || len(c.restarts.asked()) != 0 {
+		t.Errorf("after the refusal: restore/ %v, restarts %v", keys(left), c.restarts.asked())
 	}
 }
 

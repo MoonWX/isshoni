@@ -14,8 +14,8 @@ import (
 )
 
 // `isshoni serve` as its own process (serve_test.go has the harness), for what only a real process shows: the
-// signal it must survive, the re-exec that restarts it in place, and the exit 78 that only an offline restore
-// gets it out of.
+// signal it must survive, the re-exec that restarts it in place, and the exit 78 that only an offline restore or
+// the operator's own hands get it out of.
 
 // waitForLog waits until the server's log holds text n times, and fails when the server ends first.
 func (p *serveProc) waitForLog(t *testing.T, text string, n int) {
@@ -272,6 +272,65 @@ func TestServeNewerSchemaAndOfflineRestore(t *testing.T) {
 	}
 	if m, _ := archiveNames(t, archive); m.SchemaVersion != latest+1 {
 		t.Errorf("the pre-restore backup's schema = %d, want the newer database's %d", m.SchemaVersion, latest+1)
+	}
+	back.stop(t)
+}
+
+// A restore that the next start can't complete by itself is a refusal too (04 §3.2: a data problem that a restart
+// can't fix): with a restore/plan.json that is no plan of a restore, the data directory may be half swapped, and
+// only the operator can tell. serve exits 78 with the one message that says what to do, every time, so that
+// systemd does not start it five times over; once the operator has removed the file, the server starts.
+func TestServeRefusesARestoreItCannotComplete(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("needs signals")
+	}
+	t.Parallel()
+	dataDir, sock := filepath.Join(t.TempDir(), "data"), socketPath(t)
+	flags := []string{"--data-dir", dataDir, "--listen.admin-socket", sock}
+	p := startServe(t, flags...)
+	p.waitReady(t)
+	p.stop(t)
+
+	// What is left of a plan that was damaged: half a JSON document, and the files it was about.
+	restore := filepath.Join(dataDir, "restore")
+	plan := filepath.Join(restore, "plan.json")
+	if err := os.MkdirAll(filepath.Join(restore, "new"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(plan, []byte(`{"ts":"20261014T021500Z","state":"swap`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	staged := filepath.Join(restore, "new", "isshoni.db")
+	if err := os.WriteFile(staged, []byte("the database that was to be restored"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	want := "isshoni serve: " + plan + " is the record of a restore, and it can't be used (it is not valid JSON). " +
+		"Compare the data directory with " + restore + ", put the files where they belong, then remove " + plan + "\n"
+	for range 2 { // it refuses every time: no restart helps
+		refused := startServe(t, flags...)
+		if code := refused.wait(t); code != exitConfig {
+			t.Fatalf("serve with a plan that can't be used: exit %d, want 78\n%s", code, refused.logs())
+		}
+		if logs := refused.logs(); !strings.HasSuffix(logs, want) || strings.Contains(logs, " ready: ") {
+			t.Errorf("the refusal:\n%s\nwant it to end with\n%s", logs, want)
+		}
+	}
+	// It has touched nothing: what the operator has to compare is all there.
+	if data, err := os.ReadFile(staged); err != nil || string(data) != "the database that was to be restored" {
+		t.Errorf("the staged file after the refusals: %q, %v", data, err)
+	}
+
+	// The operator's part, and the server is back. The start removes the staging that no plan claims any more.
+	if err := os.Remove(plan); err != nil {
+		t.Fatal(err)
+	}
+	back := startServe(t, flags...)
+	base := back.waitReady(t)
+	if code, body := httpGet(t, base+"/readyz"); code != 200 || !strings.HasPrefix(body, `{"status":"ready"`) {
+		t.Errorf("GET /readyz once the plan is removed = %d %q", code, body)
+	}
+	if left, _ := os.ReadDir(restore); len(left) != 0 {
+		t.Errorf("restore/ after the start: %v", left)
 	}
 	back.stop(t)
 }

@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -371,7 +372,7 @@ func TestRestoreValidation(t *testing.T) {
 		{"neither an archive nor a database", []byte("PK\x03\x04 a zip file"), invalid, "neither a backup archive"},
 		{"gzip of something else", gzipOf("just text"), invalid, "it is not a tar archive"},
 		{"cut off", whole[:len(whole)/2], invalid, "damaged or cut off"},
-		{"a flipped bit", flipBit(whole), invalid, ""},
+		{"a flipped bit", flipBit(t, whole), invalid, ""},
 		{"megabytes after the tar's end", padded(t, whole, 2<<20), invalid, "data after the archive's end"},
 		{"no manifest first", makeArchive(t, nil, good...), invalid, `its first entry is "isshoni.db", not manifest.json`},
 		{"manifest is not JSON", makeArchive(t, "format: 1", good...), invalid, "its manifest is not valid JSON"},
@@ -403,6 +404,31 @@ func TestRestoreValidation(t *testing.T) {
 		{"a listed file is missing", makeArchive(t, goodManifest, good[1:]...), invalid, `it lacks "isshoni.db"`},
 		{"a hashed file is missing", makeArchive(t, goodManifest, good[:4]...), invalid, `it lacks "certmagic/certificates/site.crt"`},
 		{"too many entries", archive(many), invalid, "more than 10000 entries"},
+
+		// Entries that would collide in the staging directory are the archive's fault, not the disk's.
+		{"an entry below a file", archive(append(slices.Clone(good), tarEntry{name: "certmagic/x", body: "x"}, tarEntry{name: "certmagic/x/y", body: "y"})),
+			invalid, `it holds "certmagic/x/y" below the file "certmagic/x"`},
+		{"an entry far below a file", archive(append(slices.Clone(good), tarEntry{name: "certmagic/x", body: "x"}, tarEntry{name: "certmagic/x/a/b/c", body: "y"})),
+			invalid, `it holds "certmagic/x/a/b/c" below the file "certmagic/x"`},
+		{"a directory below a file", archive(append(slices.Clone(good), tarEntry{name: "certmagic/x", body: "x"}, tarEntry{name: "certmagic/x/d/", kind: tar.TypeDir})),
+			invalid, `it holds "certmagic/x/d" below the file "certmagic/x"`},
+		{"a file where a directory is", archive(append(slices.Clone(good), tarEntry{name: "certmagic/certificates", body: "x"})),
+			invalid, `it holds "certmagic/certificates" twice`},
+		{"a file where an entry's parent directory is", archive([]tarEntry{good[0], good[1], {name: "certmagic/a/b/site.crt", body: "c"}, {name: "certmagic/a/b", body: "x"}}),
+			invalid, `it holds "certmagic/a/b" as a file and as a directory`},
+		{"a directory where a file is", archive(append(slices.Clone(good), tarEntry{name: "certmagic/certificates/site.crt/", kind: tar.TypeDir})),
+			invalid, `it holds "certmagic/certificates/site.crt" twice`},
+		{"a directory twice", archive(append(slices.Clone(good), good[3])), invalid, `it holds "certmagic/certificates" twice`},
+
+		// Names that a filesystem refuses are refused before it is asked.
+		{"a name that is not UTF-8", archive(append(slices.Clone(good), tarEntry{name: "certmagic/\xff\xfe/", kind: tar.TypeDir})), invalid,
+			`its entry "certmagic/\xff\xfe/" has a name that no backup holds`},
+		{"a name longer than a filesystem takes", archive(append(slices.Clone(good), tarEntry{name: "certmagic/" + strings.Repeat("n", 256), body: "x"})), invalid,
+			"has a name that no backup holds"},
+		{"a directory name longer than a filesystem takes", archive(append(slices.Clone(good), tarEntry{name: "certmagic/" + strings.Repeat("n", 256) + "/x/", kind: tar.TypeDir})), invalid,
+			"has a name that no backup holds"},
+		{"a path longer than the kernel takes", archive(append(slices.Clone(good), tarEntry{name: "certmagic/" + strings.Repeat("d/", 600) + "x", body: "x"})), invalid,
+			"has a name that no backup holds"},
 
 		// Types: regular files and directories only.
 		{"symlink", archive(append(slices.Clone(good), tarEntry{name: "certmagic/link", kind: tar.TypeSymlink, link: "/etc/passwd"})), invalid,
@@ -444,6 +470,59 @@ func TestRestoreValidation(t *testing.T) {
 	}
 	// The archive these were made from is itself a good one.
 	restore(t, newTestData(t, fakeDB{Schema: latestSchema, Note: "beta"}), whole)
+	// So is one that names a directory after the entries below it, and one whose names are as long as they may be.
+	late := []tarEntry{good[0], good[1], {name: "certmagic/a/b/site.crt", body: "c"}, {name: "certmagic/a/b/", kind: tar.TypeDir},
+		{name: "certmagic/a/", kind: tar.TypeDir}, {name: "certmagic/", kind: tar.TypeDir}, {name: "certmagic/" + strings.Repeat("n", 255), body: "long"}}
+	td := newTestData(t, fakeDB{Schema: latestSchema, Note: "beta"})
+	restore(t, td, archive(late))
+	if got := tree(t, td.Paths.CertMagic, nil); !reflect.DeepEqual(got, map[string]string{
+		"a": "dir", "a/b": "dir", "a/b/site.crt": "c", strings.Repeat("n", 255): "long",
+	}) {
+		t.Errorf("the certificate storage after a restore with late directory entries: %v", keys(got))
+	}
+}
+
+// caseInsensitive reports whether dir is on a filesystem that takes "A" and "a" for one name.
+func caseInsensitive(t *testing.T, dir string) bool {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "CaseProbe"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Remove(filepath.Join(dir, "CaseProbe")) }()
+	_, err := os.Lstat(filepath.Join(dir, "caseprobe"))
+	return err == nil
+}
+
+// Two names of an archive can be one name on the disk that unpacks it: the default filesystems of macOS and
+// Windows fold case. The second entry then finds its name taken, in a directory that only this archive has written
+// to: that is the archive's fault (backup_invalid), not a failure of the disk. Where the names are two, as on the
+// filesystems a server runs on, the archive is restored.
+func TestRestoreNamesThatAreOneOnDisk(t *testing.T) {
+	good := goodEntries(t)
+	archive := func(extra ...tarEntry) []byte {
+		entries := append(slices.Clone(good), extra...)
+		return makeArchive(t, manifestFor(entries...), entries...)
+	}
+	folds := caseInsensitive(t, t.TempDir())
+	for name, tt := range map[string]struct {
+		body []byte
+		text string
+	}{
+		"two files":                 {archive(tarEntry{name: "certmagic/A", body: "upper"}, tarEntry{name: "certmagic/a", body: "lower"}), `it holds "certmagic/a", which is the name of another of its entries on this filesystem`},
+		"a file, then below it":     {archive(tarEntry{name: "certmagic/A", body: "upper"}, tarEntry{name: "certmagic/a/y", body: "lower"}), `it holds "certmagic/a/y", which is the name of another`},
+		"a file, then a directory":  {archive(tarEntry{name: "certmagic/A", body: "upper"}, tarEntry{name: "certmagic/a/", kind: tar.TypeDir}), `it holds "certmagic/a", which is the name of another`},
+		"a directory, then a file":  {archive(tarEntry{name: "certmagic/CERTIFICATES", body: "upper"}), `it holds "certmagic/CERTIFICATES", which is the name of another`},
+		"a file in a folded parent": {archive(tarEntry{name: "certmagic/Certificates/site.crt", body: "again"}), `it holds "certmagic/Certificates/site.crt", which is the name of another`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			td := newTestData(t, fakeDB{Schema: latestSchema, Note: "beta"}).online()
+			if folds {
+				wantRefused(t, td, tt.body, api.CodeBackupInvalid, tt.text)
+				return
+			}
+			restore(t, td, tt.body)
+		})
+	}
 }
 
 // ustarHeader is one 512-byte tar header, written by hand for the entries that archive/tar refuses to write.
@@ -575,11 +654,34 @@ func padded(t *testing.T, archive []byte, n int) []byte {
 	return buf.Bytes()
 }
 
-// flipBit damages one byte in the middle of the compressed stream.
-func flipBit(archive []byte) []byte {
-	out := bytes.Clone(archive)
-	out[len(out)/2] ^= 0x10
-	return out
+// gunzip unpacks a gzip stream; ok is false when it does not unpack to its end.
+func gunzip(data []byte) (plain []byte, ok bool) {
+	gz, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, false
+	}
+	plain, err = io.ReadAll(gz)
+	return plain, err == nil
+}
+
+// flipBit damages one bit of the compressed stream: the first one from the middle on whose damage reaches the
+// content. Not every bit does. A tar is full of runs of zeros, which the compression writes as "the same bytes as
+// a little earlier", and a bit that only changes how much earlier unpacks to the very same archive.
+func flipBit(t testing.TB, archive []byte) []byte {
+	t.Helper()
+	want, ok := gunzip(archive)
+	if !ok {
+		t.Fatal("flipBit: the archive does not unpack")
+	}
+	for i := len(archive) / 2; i < len(archive); i++ {
+		out := bytes.Clone(archive)
+		out[i] ^= 0x10
+		if got, ok := gunzip(out); !ok || !bytes.Equal(got, want) {
+			return out
+		}
+	}
+	t.Fatal("flipBit: no bit in the second half of the archive changes what it unpacks to")
+	return nil
 }
 
 // The limits on a restore's input: the body's size and what an archive unpacks to.
@@ -642,6 +744,101 @@ func TestRestoreInProgress(t *testing.T) {
 	if d, _ := readFakeDBBytes(entries[0].body); m.SchemaVersion != latestSchema || d.Note != "beta" {
 		t.Errorf("the first pre-restore backup holds %+v", d)
 	}
+}
+
+// A restore that is accepted while the restore before it is being finished keeps its plan. A server finishes a
+// restore when it has started (FinishRestore removes restore/old-<ts>/ and then the plan), and its admin socket may
+// get the next restore at that moment: `isshoni admin restore` returns as soon as the restarted server answers, so
+// a script's next command is right there. The plan that FinishRestore removes must be the one it read, never the
+// one that PrepareRestore has written since: the request was answered 202, and without its plan nothing would be
+// restored.
+func TestRestoreWhileTheLastOneIsFinished(t *testing.T) {
+	second := fakeDB{Schema: latestSchema, Note: "second"}.bytes()
+	// done leaves a data directory as the shutdown of a restore leaves it: the plan is "done", and the files from
+	// before are in restore/old-<ts>/.
+	done := func(t *testing.T) *testData {
+		td := newTestData(t, fakeDB{Schema: latestSchema, Note: "beta"}).online()
+		restore(t, td, fakeDB{Schema: latestSchema, Note: "first"}.bytes())
+		return td
+	}
+	// check is what must hold once both have returned: the accepted restore has its plan, and its swap happens.
+	check := func(t *testing.T, td *testData, finishErr, prepareErr error) {
+		t.Helper()
+		if finishErr != nil || prepareErr != nil {
+			t.Fatalf("FinishRestore: %v; PrepareRestore: %v", finishErr, prepareErr)
+		}
+		const ts = "20260929T101501Z" // the second restore's: one second after the first
+		if plan := planOf(t, td); plan == nil || plan.State != planSwapping || plan.TS != ts {
+			t.Fatalf("the plan after PrepareRestore returned nil: %+v, want the accepted restore's (swapping, %s)\n%s", plan, ts, td.logs.String())
+		}
+		if done, err := CompleteRestore(td.Paths, td.Logger); err != nil || !done {
+			t.Fatalf("CompleteRestore = %v, %v", done, err)
+		}
+		if got := td.read(t, "isshoni.db"); got != string(second) {
+			t.Errorf("the database after the swap is not the second restore's: %q", got)
+		}
+		if left := keys(tree(t, td.Paths.Restore, func(rel string) bool { return strings.Contains(rel, "/") })); !slices.Equal(left, []string{"old-" + ts, "plan.json"}) {
+			t.Errorf("restore/ = %v, want only the second restore's old files and plan", left)
+		}
+	}
+
+	// FinishRestore has read the done plan and is still removing the old files when the next restore arrives.
+	t.Run("in the middle of the cleanup", func(t *testing.T) {
+		td := done(t)
+		removing, goOn := make(chan struct{}), make(chan struct{})
+		var calls atomic.Int32
+		removeTree = func(path string) error {
+			if calls.Add(1) == 1 {
+				close(removing)
+				<-goOn
+			}
+			return os.RemoveAll(path)
+		}
+		defer func() { removeTree = os.RemoveAll }()
+		finished, prepared := make(chan error, 1), make(chan error, 1)
+		go func() { finished <- FinishRestore(td.Paths, td.Logger) }()
+		<-removing
+		go func() {
+			_, err := td.PrepareRestore(t.Context(), bytes.NewReader(second), -1)
+			prepared <- err
+		}()
+		// The restore has to wait for the cleanup. Were it to go ahead, it would be through long before this time is
+		// up, and the cleanup would then remove its plan.
+		var prepareErr error
+		waiting := true
+		select {
+		case prepareErr = <-prepared:
+			waiting = false
+		case <-time.After(300 * time.Millisecond):
+		}
+		close(goOn)
+		finishErr := <-finished
+		if waiting {
+			prepareErr = <-prepared
+		}
+		check(t, td, finishErr, prepareErr)
+		if n := strings.Count(td.logs.String(), "restore finished: removed the files from before the restore"); n != 1 {
+			t.Errorf("the first restore was finished %d times, want once", n)
+		}
+	})
+
+	// The same without a hand in it, many times over: whichever of the two gets there first.
+	t.Run("side by side", func(t *testing.T) {
+		rounds := 10
+		if testing.Short() {
+			rounds = 3
+		}
+		for range rounds {
+			td := done(t)
+			finished, prepared := make(chan error, 1), make(chan error, 1)
+			go func() { finished <- FinishRestore(td.Paths, td.Logger) }()
+			go func() {
+				_, err := td.PrepareRestore(t.Context(), bytes.NewReader(second), -1)
+				prepared <- err
+			}()
+			check(t, td, <-finished, <-prepared)
+		}
+	})
 }
 
 func readFakeDBBytes(s string) (fakeDB, error) {
@@ -873,11 +1070,19 @@ func TestRecoverRestoreStates(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), "plan.json is the record of a restore, and it can't be used") {
 				t.Errorf("%s: RecoverRestore: %v", name, err)
 			}
-			if _, err := CompleteRestore(td.Paths, td.Logger); err == nil {
-				t.Errorf("%s: CompleteRestore went on", name)
+			// No restart makes the file readable: it is the operator's, and the text is the whole message.
+			if !errors.Is(err, ErrRestoreNeedsOperator) || strings.Contains(err.Error(), ErrRestoreNeedsOperator.Error()) ||
+				!strings.HasSuffix(err.Error(), "then remove "+filepath.Join(td.Paths.Restore, "plan.json")) {
+				t.Errorf("%s: RecoverRestore: %v, want an error for the operator that ends with what to do", name, err)
+			}
+			if _, err := CompleteRestore(td.Paths, td.Logger); !errors.Is(err, ErrRestoreNeedsOperator) {
+				t.Errorf("%s: CompleteRestore: %v, want it to stop for the operator", name, err)
 			}
 			if _, err := td.PrepareRestore(t.Context(), bytes.NewReader(fakeDB{Schema: 1}.bytes()), -1); err == nil {
 				t.Errorf("%s: PrepareRestore went on", name)
+			}
+			if err := FinishRestore(td.Paths, td.Logger); !errors.Is(err, ErrRestoreNeedsOperator) {
+				t.Errorf("%s: FinishRestore: %v, want it to stop for the operator", name, err)
 			}
 			if after := tree(t, td.dir, nil); !reflect.DeepEqual(after, before) {
 				t.Errorf("%s: a plan that can't be read led to changes: %v", name, keys(after))
@@ -894,8 +1099,35 @@ func TestRecoverRestoreStates(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "both") {
 			t.Errorf("RecoverRestore: %v, want it to stop rather than overwrite", err)
 		}
+		// The next start would find the same two files: only the operator can say which one counts.
+		if !errors.Is(err, ErrRestoreNeedsOperator) || !strings.HasSuffix(err.Error(), "move the other away, and start again") {
+			t.Errorf("RecoverRestore: %v, want an error for the operator that ends with what to do", err)
+		}
+		if _, err := CompleteRestore(td.Paths, td.Logger); !errors.Is(err, ErrRestoreNeedsOperator) {
+			t.Errorf("CompleteRestore: %v, want the same refusal", err)
+		}
 		if d, _ := readFakeDB(td.Paths.DB); d.Note != "beta" {
 			t.Errorf("the database after the refused swap: %+v", d)
+		}
+	})
+	t.Run("a swap that fails is not the operator's yet", func(t *testing.T) {
+		td := newTestData(t, fakeDB{Schema: latestSchema, Note: "beta"})
+		if _, err := td.PrepareRestore(t.Context(), bytes.NewReader(fakeDB{Schema: latestSchema, Note: "restored"}.bytes()), -1); err != nil {
+			t.Fatal(err)
+		}
+		busy := errors.New("resource busy")
+		renameFile = func(string, string) error { return busy }
+		defer func() { renameFile = os.Rename }()
+		// A file that can't be moved now may move at the next start: a restart is the right answer to that.
+		if err := RecoverRestore(td.Paths, td.Logger); !errors.Is(err, busy) || errors.Is(err, ErrRestoreNeedsOperator) {
+			t.Errorf("RecoverRestore: %v, want the rename's error and no refusal", err)
+		}
+		renameFile = os.Rename
+		if err := RecoverRestore(td.Paths, td.Logger); err != nil {
+			t.Errorf("RecoverRestore at the next start: %v", err)
+		}
+		if d, _ := readFakeDB(td.Paths.DB); d.Note != "restored" {
+			t.Errorf("the database after the recovered swap: %+v", d)
 		}
 	})
 }

@@ -10,8 +10,8 @@
 //     public addresses are detected, the listeners, the admin socket and the media sockets are bound, the components
 //     are built and the servers start. An error that a restart can't fix (a container without a data volume, a data
 //     directory the process can't write, a corrupt or wrongly owned secrets.json, a database from a newer isshoni,
-//     an invalid config) satisfies NeedsOperator: cmd/isshoni prints it and exits 78, so systemd stops retrying
-//     (04 §6.3).
+//     a restore that only the operator can complete, an invalid config) satisfies NeedsOperator: cmd/isshoni
+//     prints it and exits 78, so systemd stops retrying (04 §6.3).
 //   - Run is Start (unless it was called), then waiting for the context to end, and then the graceful shutdown.
 //     Its result tells cmd/isshoni how the server ended: stopped (nil, or ErrShutdownForced: exit 0), to be
 //     restarted (ErrRestartRequested), or failed.
@@ -55,7 +55,8 @@
 //     shutdown runs for ShutdownRestore or ShutdownRestart, and Run returns ErrRestartRequested. A restore's files
 //     are swapped at the end of the shutdown, once the store is closed and still under the data-directory lock;
 //     Start completes a swap that a crash interrupted before it opens anything (ops.RecoverRestore), and removes
-//     the files from before the restore once it has succeeded (ops.FinishRestore). What a rotated key protected is
+//     the files from before the restore once nothing can fail it any more and before the admin socket takes a
+//     request, the next restore's for one (ops.FinishRestore). What a rotated key protected is
 //     purged by the next start's account service (03 §4.6). Reexec (exec_unix.go) is the restart itself:
 //     cmd/isshoni calls it when Run returns ErrRestartRequested, and the process replaces itself with a new run of
 //     the same command line; where a platform has none (exec_other.go), cmd/isshoni exits 75.

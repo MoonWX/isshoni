@@ -212,9 +212,10 @@ func (s *Server) wire(ctx context.Context) error {
 		Logger: s.log,
 	})
 	// Backup, restore and rotate-secrets work on every server, with a site or without: the data directory and the
-	// keys are there either way. The database's snapshot is 03's (*store.DB).BackupTo, and its file-level functions
-	// validate what a restore brings (04 §6.6). Flush joins with the transfer counters (README S85).
-	paths := s.cfg.Paths()
+	// keys are there either way. The database's snapshot is 03's (*store.DB).BackupTo, with a full disk marked as
+	// one (diskFull), and its file-level functions validate what a restore brings (04 §6.6). Flush joins with the
+	// transfer counters (README S85).
+	paths, db := s.cfg.Paths(), s.store
 	s.admin = ops.NewAdminServer(ops.AdminOptions{
 		Health:   s.health,
 		Status:   status,
@@ -224,7 +225,7 @@ func (s *Server) wire(ctx context.Context) error {
 		Data: &ops.DataDir{
 			Paths:    paths,
 			DB:       DBFiles(paths.Backups),
-			Snapshot: s.store.BackupTo,
+			Snapshot: func(ctx context.Context, dst string) error { return diskFull(db.BackupTo(ctx, dst)) },
 			Now:      s.deps.Now,
 			Logger:   s.log,
 		},

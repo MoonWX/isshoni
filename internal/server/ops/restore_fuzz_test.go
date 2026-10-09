@@ -97,6 +97,11 @@ func restoreSeeds(t testing.TB) [][]byte {
 	rawManifest := manifestFor(raw...)
 	rawManifest.Raw = true
 	with := func(extra ...tarEntry) []byte { return makeArchive(t, m, append(slices.Clone(good), extra...)...) }
+	// hashed is with for files that the manifest has checksums for.
+	hashed := func(extra ...tarEntry) []byte {
+		entries := append(slices.Clone(good), extra...)
+		return makeArchive(t, manifestFor(entries...), entries...)
+	}
 	return [][]byte{
 		makeArchive(t, m, good...),
 		makeArchive(t, rawManifest, raw...),
@@ -117,6 +122,16 @@ func restoreSeeds(t testing.TB) [][]byte {
 		with(tarEntry{name: "extra.txt", body: "x"}),
 		with(good[0]),
 		makeArchive(t, m, good[1:]...),
+		// Entries that collide in the staging directory, in the archive or on a filesystem that folds case.
+		hashed(tarEntry{name: "certmagic/x", body: "x"}, tarEntry{name: "certmagic/x/y", body: "y"}),
+		hashed(tarEntry{name: "certmagic/a/b/c", body: "c"}, tarEntry{name: "certmagic/a/b", body: "b"}),
+		hashed(tarEntry{name: "certmagic/A", body: "upper"}, tarEntry{name: "certmagic/a", body: "lower"}),
+		hashed(tarEntry{name: "certmagic/A", body: "upper"}, tarEntry{name: "certmagic/a/y", body: "lower"}),
+		with(tarEntry{name: "certmagic/CERTIFICATES/", kind: tar.TypeDir}),
+		// Names that a filesystem refuses.
+		with(tarEntry{name: "certmagic/\xff\xfe/", kind: tar.TypeDir}),
+		with(tarEntry{name: "certmagic/" + strings.Repeat("n", 300) + "/", kind: tar.TypeDir}),
+		with(tarEntry{name: "certmagic/" + strings.Repeat("d/", 600), kind: tar.TypeDir}),
 	}
 }
 
