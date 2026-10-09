@@ -153,15 +153,17 @@
 //   - rtx.go, and the rest in downtrack.go, layer.go and munger.go: repair and sync (02 §9.4–9.6). A viewer's NACK
 //     is answered from the packet cache of the Layer that sent the sequence number, found through the munger's
 //     epochs: on the RTX stream when the viewer negotiated one for the payload type (video), else as the packet
-//     again (audio), before any new media. A sequence number is retransmitted at most three times and not twice
-//     within max(20 ms, RTT/2); all retransmissions of a DownTrack stay within a quarter of its layer's bitrate or
-//     maximum (at least 200 kbit/s, with a second of that in reserve). The publish side's copies of packets the
-//     cache already has (a browser's redundant RTX) are dropped where they arrive, and a publisher is asked for
-//     a missing packet at most ten times. Padding-only packets are never forwarded and leave no gap. The sender
-//     reports of the layer a DownTrack forwards go on to its viewer with the publisher's NTP time and the RTP time
-//     on the viewer's timeline, every one that arrives and one right after each start of an epoch; a layer switch
-//     keeps that timeline the capture timeline, through both layers' reports, to within a tick. So a share's audio
-//     and video reach a viewer on one clock, the publisher's capture clock;
+//     again (audio), before any new media. A packet is retransmitted at most three times and not twice within
+//     max(20 ms, RTT/2), which is remembered by its sequence number for 5 s: long after the cache has let go of
+//     the packet, and long before the number has its next one. All retransmissions of a DownTrack stay within a
+//     quarter of its layer's bitrate or maximum (at least 200 kbit/s, with a second of that in reserve). The
+//     publish side's copies of packets the cache already has (a browser's redundant RTX) are dropped where they
+//     arrive, and a publisher is asked for a missing packet at most ten times (all ten, also when the first
+//     brought it back: pubNACKTries says what that costs). Padding-only packets are never forwarded and leave no
+//     gap. The sender reports of the layer a DownTrack forwards go on to its viewer with the publisher's NTP time
+//     and the RTP time on the viewer's timeline, every one that arrives and one right after each start of an
+//     epoch; a layer switch keeps that timeline the capture timeline, through both layers' reports, to within a
+//     tick. So a share's audio and video reach a viewer on one clock, the publisher's capture clock;
 //   - events.go, errors.go, types.go, config.go, stats.go, probe.go: the whole interface of 02 §6 and §13;
 //   - api.go: the publish, subscribe and connection-test probe webrtc.APIs on 04's netx.Transport, the
 //     remote-candidate filter (02 §7.3, 01 §17), the selected-pair label and the complete-SDP helper: the SFU never

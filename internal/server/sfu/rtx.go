@@ -42,7 +42,8 @@ type nackState struct {
 	filled   bool
 }
 
-// nackRecord says how often one own sequence number was retransmitted, and when last.
+// nackRecord says how often one own sequence number was retransmitted, and when last. It counts for nackRecordAge
+// from then (live).
 type nackRecord struct {
 	at  int64
 	seq uint16
@@ -106,7 +107,8 @@ func (d *DownTrack) handleNACK(b *binding, pairs []rtcp.NackPair, left *int, now
 //     before the answer to the last one could arrive. So is one that was retransmitted three times: whatever keeps
 //     it from arriving, a fourth copy won't help. (This check comes first: a viewer that goes on asking for what it
 //     already got, as Pion's own NACK generator does for packets that arrive as RTX, is skipped, not counted as a
-//     miss once the cache has let go of the packet.)
+//     miss once the cache has let go of the packet.) What is remembered of a retransmission counts for
+//     nackRecordAge: after that the sequence number is on its way to its next packet, which is repaired like any.
 //  3. The budget: retransmissions may use a quarter of what the layer carries or may carry, at least 200 kbit/s,
 //     with a second of that in reserve. What goes beyond is skipped: a viewer on a link that loses that much needs
 //     a lower layer, not more load (the downlink allocator, README S84).
@@ -142,7 +144,7 @@ func (d *DownTrack) serveNACKs(b *binding, hits []nackHit, now int64) {
 	ns.fill(rate, now)
 	for i := range hits {
 		h := &hits[i]
-		switch rec := ns.record(h.seq); {
+		switch rec := ns.record(h.seq, now); {
 		case rec != nil && (now-rec.at < gap || rec.n >= nackMaxSends):
 			skipped++
 		case h.p == nil:
@@ -201,25 +203,33 @@ func (n *nackState) fill(rate, now int64) {
 	n.bits = min(n.bits, depth)
 }
 
-// record returns what is known of earlier retransmissions of own sequence number seq, or nil when there were none
-// (or the record has made way for another sequence number's). n.mu is held.
-func (n *nackState) record(seq uint16) *nackRecord {
+// live reports whether the record is one of own sequence number seq that still counts at now: the slot holds that
+// number's record, and its last retransmission is less than nackRecordAge ago. An older record is about a packet the
+// cache has long let go of; whatever is asked for under its number now is another packet, 65536 packets later.
+func (r *nackRecord) live(seq uint16, now int64) bool {
+	return r.n > 0 && r.seq == seq && now-r.at < int64(nackRecordAge)
+}
+
+// record returns what is known of earlier retransmissions of own sequence number seq, or nil when there were none,
+// when the record has made way for another sequence number's, and when it has expired (live). n.mu is held.
+func (n *nackState) record(seq uint16, now int64) *nackRecord {
 	if n.records == nil {
 		return nil
 	}
-	if rec := &n.records[seq%nackRecords]; rec.n > 0 && rec.seq == seq {
+	if rec := &n.records[seq%nackRecords]; rec.live(seq, now) {
 		return rec
 	}
 	return nil
 }
 
-// sent notes one more retransmission of own sequence number seq. n.mu is held.
+// sent notes one more retransmission of own sequence number seq: the first of a new record when the slot has none
+// that is live for seq. n.mu is held.
 func (n *nackState) sent(seq uint16, now int64) {
 	if n.records == nil {
 		n.records = new([nackRecords]nackRecord)
 	}
 	rec := &n.records[seq%nackRecords]
-	if rec.n == 0 || rec.seq != seq {
+	if !rec.live(seq, now) {
 		*rec = nackRecord{seq: seq}
 	}
 	rec.n++

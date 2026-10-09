@@ -277,7 +277,12 @@ func (s *pliSource) requests(layer string) []int64 {
 // one the Publisher had pulled when it handled the PLI, at most one comes before the keyframe. Arrival times at the
 // viewer say nothing about that: a reader that was held up for a moment gets frames that left before the PLI
 // stamped after it.
+//
+// That count starts where the Publisher handled the PLI, so it doesn't say how long the Publisher took to get there.
+// The clock does, end to end, with a bound that a loaded machine doesn't reach and a Publisher that sits on its PLIs
+// does: the keyframe arrives within pliToKeyframe of the viewer's sending the PLI.
 func TestLoopbackKeyframeOnPLI(t *testing.T) {
+	const pliToKeyframe = 2 * time.Second
 	layers := []fake.VideoLayer{
 		{RID: "f", Width: 1280, Height: 720, FPS: 30, Bitrate: 2_000_000},
 		{RID: "q", Width: 640, Height: 360, FPS: 15, Bitrate: 300_000},
@@ -330,6 +335,9 @@ func TestLoopbackKeyframeOnPLI(t *testing.T) {
 				key.First.Sub(sent), before)
 			if before > 1 {
 				t.Errorf("%q PLI %d: %d frames before the keyframe, want at most 1", rid, i, before)
+			}
+			if d := key.First.Sub(sent); d > pliToKeyframe {
+				t.Errorf("%q PLI %d: the keyframe arrived %v after the PLI, want within %v", rid, i, d, pliToKeyframe)
 			}
 			time.Sleep(300 * time.Millisecond)
 		}

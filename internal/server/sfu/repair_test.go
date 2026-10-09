@@ -310,9 +310,11 @@ func TestNACKFromCache(t *testing.T) {
 		t.Errorf("answering the sub offer: %v", errs)
 	}
 	// How soon a repeated NACK is answered again goes by the viewer's round-trip time, which the SFU reads from the
-	// sub PC's candidate pair when the viewer's RTCP comes in: on loopback, well under the 20 ms that count anyway.
-	if pc := pcOf(t, viewConn, sfu.PCSub); pc.RTT <= 0 || pc.RTT > 100*time.Millisecond {
-		t.Errorf("the sub PC's round-trip time is %v, want what ICE measured on loopback", pc.RTT)
+	// sub PC's candidate pair when the viewer's RTCP comes in. That it was read is what is checked here, not how
+	// short it is on loopback: the value is one STUN round trip between two agents of this process, which a loaded
+	// machine can stretch a long way.
+	if pc := pcOf(t, viewConn, sfu.PCSub); pc.RTT <= 0 || pc.RTT >= time.Second {
+		t.Errorf("the sub PC's round-trip time is %v, want what ICE measured", pc.RTT)
 	}
 
 	// The other viewer of the layer: nothing lost, nothing asked for, nothing sent twice.

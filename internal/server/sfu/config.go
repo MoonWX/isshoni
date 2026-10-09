@@ -150,6 +150,13 @@ const (
 	// viewer's round-trip time, whichever is longer: a second NACK that soon was sent before the first answer arrived.
 	nackMaxSends = 3
 	nackMinGap   = 20 * time.Millisecond
+	// nackRecordAge is how long a record counts after the retransmission it notes. Own sequence numbers have 16 bits:
+	// the number of a packet that was retransmitted belongs to another packet 65536 packets later (73 s at 900
+	// packets a second), and what is remembered of the first must not keep the second from being repaired. Five
+	// seconds are far less than that, and more than the cache keeps a packet (cacheMaxAge), which they must be: a
+	// packet is gone from the cache before its record expires, so expiry never gets it a fourth sending, and a
+	// viewer that goes on asking for it is still told apart from one that asks for a packet the cache missed.
+	nackRecordAge = 5 * time.Second
 	// The retransmission budget is a token bucket: rtxShare of what the DownTrack's layer carries or may carry, at
 	// least rtxMinRate, with rtxBurst of that rate as its depth. For an 8 Mbit/s full layer that is 2 Mbit/s and
 	// 250 kB, enough to repair the large first frame after an idle screen.

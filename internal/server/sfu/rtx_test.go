@@ -312,12 +312,11 @@ func TestNACKLimits(t *testing.T) {
 	step(time.Millisecond, seq0+1, 1, "again 20 ms after the retransmission")
 	step(20*time.Millisecond, seq0+1, 1, "a third time")
 	step(20*time.Millisecond, seq0+1, 0, "a fourth time")
-	step(time.Hour, seq0+1, 0, "and never again")
+	step(time.Second, seq0+1, 0, "and a second later, with the packet still in the cache")
 	if got, want := r.counts(), (RepairState{NACKs: 7, Served: 3, Skipped: 4}); got != want {
 		t.Errorf("counters = %+v, want %+v", got, want)
 	}
 	// Another sequence number has its own count, and one NACK may ask for both.
-	r.now = monoNow()
 	r.send(deltaPayload, false) // own seq0+6, in the cache now
 	if n := r.nack(seq0+1, seq0+6); n != 1 {
 		t.Errorf("a NACK for a spent and a new sequence number: %d retransmissions, want 1", n)
@@ -335,6 +334,75 @@ func TestNACKLimits(t *testing.T) {
 	r.b.pc.rtt.Store(int64(2 * time.Millisecond))
 	step(19*time.Millisecond, seq, 0, "RTT 2 ms: again after 19 ms")
 	step(time.Millisecond, seq, 1, "RTT 2 ms: again after 20 ms")
+}
+
+// TestNACKRecordAge: what a DownTrack remembers of a retransmission counts for nackRecordAge and no longer. Until
+// then a viewer that goes on asking for a packet it was sent three times is skipped, also when the cache has let go
+// of the packet; after that its NACK is a miss, like any for a packet that old. And the record is long gone when the
+// 16-bit sequence number comes around: the packet that has it 65536 packets later is another packet, and is
+// retransmitted three times like any, whatever was sent under that number before.
+func TestNACKRecordAge(t *testing.T) {
+	r := newRTXRig(t)
+	seq0, _ := r.start(5)
+	spent, once := seq0+1, seq0+2
+	for i := range nackMaxSends {
+		if n := r.nack(spent); n != 1 {
+			t.Fatalf("NACK %d: %d retransmissions, want 1", i+1, n)
+		}
+		r.now += int64(nackMinGap)
+	}
+	if n := r.nack(once); n != 1 {
+		t.Fatalf("%d retransmissions of another sequence number, want 1", n)
+	}
+	// One nanosecond short of nackRecordAge after the third retransmission, and then at it.
+	r.now += int64(nackRecordAge-nackMinGap) - 1
+	if n := r.nack(spent); n != 0 {
+		t.Fatalf("%d retransmissions long after the cache let go of the packet", n)
+	}
+	if got, want := r.counts(), (RepairState{NACKs: 5, Served: 4, Skipped: 1}); got != want {
+		t.Errorf("just before the record expires: counters = %+v, want %+v", got, want)
+	}
+	r.now++
+	if n := r.nack(spent); n != 0 {
+		t.Fatalf("%d retransmissions long after the cache let go of the packet", n)
+	}
+	if got, want := r.counts(), (RepairState{NACKs: 6, Served: 4, Skipped: 1, Missed: 1}); got != want {
+		t.Errorf("once the record has expired: counters = %+v, want %+v", got, want)
+	}
+
+	// 65536 packets later, at 900 packets a second: 73 s. The packets that have the two own sequence numbers now are
+	// told apart from the first by their payloads.
+	r.pace = int64(time.Second) / 900
+	for range 1<<16 - 5 {
+		r.send(deltaPayload, false) // own seq0+6 … seq0+65536, which is seq0 again
+	}
+	again := map[uint16][]byte{spent: {0x41, 0x01}, once: {0x41, 0x02}}
+	r.send(again[spent], false)
+	r.send(again[once], true)
+	for range 3 {
+		r.send(deltaPayload, false)
+	}
+	for round := range nackMaxSends {
+		before := r.w.written()
+		if n := r.nack(spent, once); n != 2 {
+			t.Fatalf("a turn of the sequence number later, NACK %d: %d retransmissions, want 2 (counters %+v)", round+1, n,
+				r.counts())
+		}
+		for i := before; i < before+2; i++ {
+			_, payload := r.w.packet(i)
+			if osn := binary.BigEndian.Uint16(payload); !slices.Equal(payload[2:], again[osn]) {
+				t.Errorf("own seq %d retransmitted with payload %x, want the packet that has that number now, %x", osn,
+					payload[2:], again[osn])
+			}
+		}
+		r.now += int64(nackMinGap)
+	}
+	if n := r.nack(spent, once); n != 0 {
+		t.Errorf("%d retransmissions after three of each packet", n)
+	}
+	if got, want := r.counts(), (RepairState{NACKs: 14, Served: 10, Skipped: 3, Missed: 1}); got != want {
+		t.Errorf("counters = %+v, want %+v", got, want)
+	}
 }
 
 // TestNACKMisses: what the cache no longer has, or never had, is a miss: a sequence number the DownTrack hasn't sent

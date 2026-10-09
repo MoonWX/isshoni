@@ -287,6 +287,15 @@ const (
 	// and well over a thousand times, for more than a minute, on the 30 a second of a still screen. A browser answers
 	// each of those NACKs with the packet again, which the cache then drops as a duplicate (02 §9.1). A packet that
 	// ten requests didn't bring back is of no use to anybody any more: the viewers have asked for a keyframe.
+	//
+	// Ten is a limit, not a cure. All ten requests still go out, whether or not the first brought the packet back,
+	// and a browser answers every one that comes a round trip or more after its last answer: with a round-trip time
+	// of 50 ms or less a sharer sends about ten copies of each packet its uplink lost, at 2% loss some 20% more
+	// uplink, all dropped as duplicates at the cache (TestRTXDuplicates counts them). A lower number is no better: it
+	// takes the repair from publishers far away, whose first retransmission was lost too. What is needed is requests
+	// that stop when the packet arrives: sent by the Layer for the sequence numbers it misses, which the cache's
+	// insert clears (it sees what came back as RTX, since that comes through the track), a round trip apart and at
+	// least 50 ms, in place of this interceptor. No slice of M1 has that yet; it is noted for the integrator.
 	pubNACKTries = 10
 )
 
