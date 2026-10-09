@@ -955,7 +955,7 @@ and for a restore or `rotate-secrets` restart:
 | 4. `SFU.Close()` closes all PeerConnections (concurrently; 02 guarantees it returns within 1 s); then `Transport.Close()` closes the muxes | ≤ 1 s | |
 | 5. `http.Server.Shutdown` on all servers, then `PortMux.Close()` (closes the raw :443 listener and both sub-listeners; the ICE sub-listener may already be closed by `Transport.Close`, which is harmless) | ≤ 5 s | Idle keep-alives close |
 | 6. Stop the TLS manager (`tlsmgr.Manager.Shutdown`, §8.2: no order, renewal or reload writes the certificate storage after it; S44), flush transfer counters, drain the push queue (≤ 2 s), close the admin socket, close the store (WAL checkpoint) | ≤ 2 s | |
-| 7. Exit 0 (or re-exec, §6.5) | total ≤ `shutdown_timeout` (10 s) | |
+| 7. Exit 0 (or re-exec, §6.5) | total ≤ `shutdown_timeout` (10 s); a forced shutdown up to 1 s more for the store's close (below) | |
 
 A step that runs out of its budget closes by force what it still has (a request that won't finish, say), and the
 shutdown goes on: everything is released all the same. The server logs a warning, `Shutdown` returns an error
@@ -966,10 +966,10 @@ the default `shutdown_timeout`, which bounds the whole shutdown whatever the ste
 6 are more exact than the table:
 - **The admin socket closes in step 6, not earlier.** The operator's CLI can ask the server until then: its health
   and ready answers have said "shutting down" since step 1, `status` still answers, and every other request gets
-  503 `server_shutdown` (§12.2). The order inside the step is: the TLS manager, now that nothing handshakes any more; then the server's
-  own background work is cancelled (the janitor, the periodic look at the public addresses, the reads behind hooks
-  without a context); then the admin socket's server; then the runtime log level's timer. Together they have the
-  step's 2 s.
+  503 `server_shutdown` (§12.2). The order inside the step is: the TLS manager, now that nothing handshakes any
+  more; then the server's own background work is cancelled (the janitor, the periodic look at the public addresses,
+  the reads behind hooks without a context); then the admin socket's server; then the runtime log level's timer.
+  Together they have the step's 2 s.
 - **The store's close gets one more second of its own**, outside those 2 s and outside `shutdown_timeout`. The
   close waits for the background goroutines to end and then checkpoints the WAL, which is what makes the `.db`
   file complete by itself. In a shutdown that had the time this is the end of step 6 and takes milliseconds. In

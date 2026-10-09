@@ -1444,17 +1444,17 @@ type AgentSend struct {
 	To      string          `json:"to,omitempty"`     // a connectionId of the same user, or
 	ToRole  Role            `json:"toRole,omitempty"` // all the user's connections with this role (exactly one of To/ToRole)
 	Kind    string          `json:"kind"`             // [a-z.]{1,32}; registry in 04/M2 docs
-	Payload json.RawMessage `json:"payload"`          // any JSON value but null (below), <= 16 KiB; opaque to the server
+	Payload json.RawMessage `json:"payload"`          // any JSON value but null, <= 16 KiB; opaque to the server
 }
 
 type AgentSendResult struct {
-	Delivered int `json:"delivered"` // >= 1: the targets that were handed the message; not an acknowledgment (below)
+	Delivered int `json:"delivered"`
 }
 
 type AgentRecv struct {
-	From    string          `json:"from"`
+	From    string          `json:"from"` // the sender's connectionId
 	Kind    string          `json:"kind"`
-	Payload json.RawMessage `json:"payload"`
+	Payload json.RawMessage `json:"payload"` // the agent.send's payload: never null
 }
 
 // UserConnections (later M2, feature user.connections): all of the user's connections, sent to each of them on change.
@@ -1600,16 +1600,19 @@ These rules bind the web client (05), the Go test and load-test clients, the SFU
     - The sub PC closes server-side on `room.leave` or a `room.join` elsewhere; the client closes its local sub PC
       without sending anything. The server ignores `pc.close{pc: sub}` (reserved).
     - The server never asks to rebuild a pub PC that carries no live share. `room.leave` closes both PCs server-side.
-      - **The server enforces this, and `sfuplane` is where** (decided after group 6; README F03 implements it).
+      - **The server enforces this, in the hub** (decided after group 6; README F03 implements it).
         The request in question is `pc.restart{pc: pub, mode: rebuild, reason: failed}`, which is made of the
-        SFU's `PCStateEvent{PCPub, failed}` (§15.4). As group 6 merged it, every such event became a request, also
-        for a pub PC whose connection publishes nothing any more: the last share was stopped or timed out, and
+        SFU's `PCStateEvent{PCPub, failed}` (§15.4). `sfuplane` passes every such event on as a `RestartRequest`;
+        the hub's `MediaSink` decides on the connection's actor, in order with everything that starts or ends its
+        shares, because the share lifecycle is the hub's. As group 6 merged it, every such event became a request,
+        also for a pub PC whose connection publishes nothing any more: the last share was stopped or timed out, and
         the PC failed before the client's `pc.close` reached the server, or the client never sent one. That
         client would build and negotiate a PeerConnection that carries nothing.
       - The rule: the request goes out only while the failed PC's connection has a share that has not ended,
         one that is `starting`, `live` or `stalled` (to the SFU: pending, or live with a stalled one included).
         A `starting` share waits for the new PC's first keyframe and a `stalled` one for its media to come back,
-        each under its 30 s timeout (§4.4), so both need the rebuild. Without such a share nothing is sent.
+        each under its 30 s timeout (§4.4), so both need the rebuild. Without such a share nothing is sent. What
+        counts is the moment the actor gets to the request, not the moment the PC failed.
       - A share that starts later needs no request: its pub offer comes with a `gen` the client chooses, and a
         client whose pub PC has failed offers `gen + 1` (§10.4).
 
@@ -2511,7 +2514,9 @@ type MediaPeer interface {
 type MediaSink interface {
 	Offer(o protocol.PCOffer)                   // sub PC offers
 	ICE(c protocol.PCICE)
-	RestartRequest(r protocol.PCRestart)        // ask the client to restart/rebuild its pub PC
+	// RestartRequest asks the client to rebuild its pub PC. The peer reports every failed pub PC; the hub passes
+	// the request on only while the connection publishes a share (§9 rule 10).
+	RestartRequest(r protocol.PCRestart)
 	SubscriptionStatus(s []protocol.SubscriptionStatus)
 	QualityHint(h protocol.QualityHint)
 	ShareMedia(shareID string, ev ShareMediaEvent)
@@ -2756,13 +2761,14 @@ Connection.
 | `SubscriptionStateEvent` | `SubscriptionStatus` (reason map below) |
 | `CodecPolicyEvent{Share, Profile}` (one per share this connection publishes) | `QualityHint{shareId, reason: codec, codec: "h264/"+Profile}` with no encodings (a profile switch doesn't change them) |
 | `QualityHintEvent{Share, Reason, MaxBitrate, Encodings}` | `QualityHint{shareId, reason: ev.Reason, maxBitrate, encodings converted 1:1}`; `Reason` is `admin` or `viewers`, and `Encodings` is the full current `f`/`q` list with the cap and pause state applied by the SFU |
-| `PCStateEvent{PCPub, Gen, failed}` | `RestartRequest{pc: pub, gen: ev.Gen, mode: rebuild, reason: failed}` (the SFU emits PCStateEvents only for the current PC of each kind). As README S50 merged it, for every such event; from README F03 on only while the connection has a share that has not ended, the rule of §9 rule 10 (decided after group 6) |
+| `PCStateEvent{PCPub, Gen, failed}` | `RestartRequest{pc: pub, gen: ev.Gen, mode: rebuild, reason: failed}` (the SFU emits PCStateEvents only for the current PC of each kind). `sfuplane` passes every such event on. From README F03 on the hub's sink drops the request unless the connection has a share that has not ended (§9 rule 10, decided after group 6) |
 | `PCStateEvent{PCSub, …}` | nothing: the client drives sub restarts (§10.4); the SFU ICE-restarts in `Resync()` and rebuilds sub PCs itself only for codec retries |
 | `ErrorEvent` | `Error` (code map below) with the event's scope: `pc.pub`/`pc.sub` → scope `pc` with that `pc` (an event has no `gen` or `neg`); `share`/`subscription` → that scope with `shareId` = `Error.Share` |
 | `RoomEvents.ShareUpdated` | `ShareMedia` on the publishing connection's sink: `pending→live` or `stalled→live` = `Live`; `→stalled` = `Stalled`; a layer attached or ended, the profile changed, or audio changed while live = `Changed`. `Layers` is built from `ShareInfo.Layers` (every layer whose track is attached, paused ones included), ignoring `LayerInfo.Active` |
 | `RoomEvents.ShareEnded`, `CodecPolicyChanged` | ignored: the hub ends shares itself; per-connection `CodecPolicyEvent`s cover publishers |
 
 The SFU computes the content of every hint; `sfuplane` only converts types and keeps no encoding or share-list state.
+So a failed pub PC is passed on whatever it carried: whether a share still needs it is the hub's to say (§9 rule 10).
 On `Resync()` the SFU re-sends one `CodecPolicyEvent` per share and the last `QualityHintEvent` per share, if one was
 sent. The one thing `sfuplane` remembers is the state the SFU last reported for each share (`ShareUpdated` carries
 the share as it is now, not what changed): that tells `Live` from `Changed`, and is forgotten on `ShareEnded`.
@@ -3251,6 +3257,6 @@ Decided after group 6 (engineering calls the owner delegated; README §6; README
 
 7. **An `agent.send` with `payload: null` is `bad_request`** (§8.14), like one without a payload. The hub then never
    relays a `null`, which nothing on this wire sends (§5).
-8. **The server asks for no pub PC rebuild that §9 rule 10 forbids, and `sfuplane` is where that is enforced**: a
-   failed pub PC whose connection has no share that has not ended gets no `pc.restart{rebuild}` (§9 rule 10,
-   §15.4).
+8. **The server asks for no pub PC rebuild that §9 rule 10 forbids**: the hub's `MediaSink` drops the request of a
+   failed pub PC whose connection has no share that has not ended; `sfuplane` still reports every failed pub PC
+   (§9 rule 10, §15.4).

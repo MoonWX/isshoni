@@ -574,8 +574,8 @@ The SFU computes the content of every hint; sfuplane only converts types (01 §1
   3. else `no_preview_layer` for a request of `low`, and `no_layer` for a request of `high`.
 
   So `no_layer` does not imply `Forwarded: off`: a request for `high` that gets the preview layer, because the
-  share has no fuller one, is `Forwarded: low` with `no_layer`, and so is one that gets nothing because the share
-  has no video layer yet. 01 maps both reasons to `unavailable`.
+  share has no fuller one, is `Forwarded: low` with `no_layer`; one that gets nothing, because the share has no
+  video layer yet, is `Forwarded: off` with `no_layer`. 01 maps both reasons to `unavailable`.
 - **At once, or paced at 250 ms.** A publisher decides how often what its viewers get changes; it must not decide
   how many events they are sent.
   - What the client asked for itself is reported **at once**, before `UpdateSubscriptions` returns: a pause, and a
