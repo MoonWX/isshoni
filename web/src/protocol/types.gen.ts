@@ -13,7 +13,7 @@ export interface AgentSend {
   to?: string; // a connectionId of the same user, or
   toRole?: Role; // all the user's connections with this role (exactly one of To/ToRole)
   kind: string; // [a-z.]{1,32}; registry in 04/M2 docs
-  payload: unknown; // <= 16 KiB, opaque to the server
+  payload: unknown; // any JSON value but null, <= 16 KiB; opaque to the server
 }
 /**
  * AgentSendResult is the ok payload of agent.send.
@@ -27,7 +27,7 @@ export interface AgentSendResult {
 export interface AgentRecv {
   from: string; // the sender's connectionId
   kind: string;
-  payload: unknown;
+  payload: unknown; // the agent.send's payload: never null
 }
 /**
  * UserConnections (later M2, feature user.connections): all of the user's connections, sent to each of them on change.

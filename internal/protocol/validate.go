@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"bytes"
 	"strconv"
 	"strings"
 	"unicode"
@@ -512,8 +513,12 @@ func (s *ClientStats) Validate() error {
 func (*StatsWatch) Validate() error { return nil }
 
 // Validate checks an agent.send (01 §8.14): exactly one of to (a connection id) and toRole (a known role); kind
-// [a-z.]{1,32}; a payload of 1 byte to 16 KiB. A payload over 16 KiB gets message_too_large, not bad_request (01 §13,
-// P12), so that error is a *Error, not a *FieldError.
+// [a-z.]{1,32}; a payload that is there, of at most 16 KiB. A payload over 16 KiB gets message_too_large, not
+// bad_request (01 §13, P12), so that error is a *Error, not a *FieldError.
+//
+// A payload of null is no payload: it is refused like a missing one (payload: required), so the relay never hands
+// its targets a null (01 §5). That is the one thing the server reads of a payload; a null inside one is the
+// sender's business, like everything else in it.
 func (a *AgentSend) Validate() error {
 	switch {
 	case a.To == "" && a.ToRole == "":
@@ -536,7 +541,7 @@ func (a *AgentSend) Validate() error {
 		return fieldErr("kind", FieldInvalid)
 	}
 	switch {
-	case len(a.Payload) == 0:
+	case len(a.Payload) == 0 || bytes.Equal(bytes.TrimSpace(a.Payload), jsonNull):
 		return fieldErr("payload", FieldRequired)
 	case len(a.Payload) > MaxAgentPayloadBytes:
 		e := NewError(ErrorCodeMessageTooLarge, ErrorScopeRequest)
