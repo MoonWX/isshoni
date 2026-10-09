@@ -62,9 +62,17 @@
 //     exists before M2). auth.Service owns each change, with the revocation row of 03 §7.7 that goes with it; the
 //     handlers set or clear the cookie, as the response's only Set-Cookie, and notify {UserID}: devices, or
 //     {Admins}: admin.users after an account was deleted.
+//   - Admin users and password resets (README S64; 03 §7.10–7.11, §12.4.8; admin_users.go, auth.go):
+//     GET /api/v1/admin/users (every account, with ?status= for one status and online from Signal.OnlineUserIDs),
+//     PATCH /api/v1/admin/users/{id} (rename, role, status), DELETE /api/v1/admin/users/{id},
+//     POST /api/v1/admin/users/{id}/password-reset (201 with the one-time link) and
+//     POST /api/v1/admin/users/{id}/sign-out; and the public side of a reset link, POST /api/v1/auth/reset/check
+//     and POST /api/v1/auth/reset/complete (200 with the session cookie). auth.Service owns the last-admin and self
+//     rules, the password an admin types again, the revocation rows and the admin alerts. The handlers notify
+//     {Admins}: admin.users, and after a request that names a username or a role also call Signal.UserChanged
+//     and notify {UserID}: me.
 //
-// The other endpoints of 03 §12.3 (the admin's user endpoints, the reset links, the audit log), and
-// DashboardAccounts, come with the later account slices.
+// The audit log (03 §12.3 #42) and DashboardAccounts come with the later account slices.
 //
 // Imports (04 §2): config, logx, version, store, auth and internal/protocol(/api); never ops, push, netx, tlsmgr,
 // signal, sfu or sfuplane, which reach this package through small interfaces declared here (RouteObserver, Signal,

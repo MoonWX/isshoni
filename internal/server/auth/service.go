@@ -24,10 +24,11 @@ import (
 // README S30 filled in New (this file; the key-rotation purge is in tokens.go), the sessions and the CSRF wrapper
 // (session.go), login and logout (login.go) and setup (setup.go). README S42 filled in the invites (invite.go),
 // registration and the approval queue (register.go), and added UpdateSettings (settings.go). README S58 filled in
-// self-service (selfservice.go) on the revocation table of 03 §7.7 (revoke.go). The methods still declared below
-// come with the later auth slices (03 §18 slices 10 and 13: admin users and password resets, the janitor). Until
-// then each one with an error result returns notImplemented(method): an error that names the method and wraps
-// *api.Error{internal}, so an HTTP handler that calls it answers 500 internal (api has no not_implemented code).
+// self-service (selfservice.go) on the revocation table of 03 §7.7 (revoke.go). README S64 filled in the admin's
+// user calls (admin.go) and the password resets (reset.go). The methods still declared below come with the later
+// auth slices (03 §18 slice 13: the janitor; slice 15, M2: the device flow). Until then each one with an error
+// result returns notImplemented(method): an error that names the method and wraps *api.Error{internal}, so an HTTP
+// handler that calls it answers 500 internal (api has no not_implemented code).
 //
 // All service errors are *api.Error (03 §12.2) carrying a stable code, so httpapi maps them to statuses in one
 // table: an unexpected failure (the store, a cancelled context) wraps both its cause and *api.Error{internal}
@@ -485,50 +486,19 @@ type InviteInput struct {
 // ---- admin (03 §7.9–7.11; also used by the admin socket with store.CLIActor) ----
 //
 // Approve, Reject and RejectAll (the approval queue, 03 §7.9) are in register.go. UpdateSettings (settings.go) is
-// the settings patch of 03 §9 together with the registration_mode_changed alert of 03 §7.11.
-
-// UpdateUser renames a user or changes its role or status, with the last-admin and self rules.
-func (s *Service) UpdateUser(ctx context.Context, a store.Actor, id store.UserID, ch UserChange) (store.User, error) {
-	return store.User{}, notImplemented("UpdateUser")
-}
-
-// DeleteUser deletes a user, with the last-admin and self rules.
-func (s *Service) DeleteUser(ctx context.Context, a store.Actor, id store.UserID) error {
-	return notImplemented("DeleteUser")
-}
-
-// SignOutUser deletes every session and device of a user and returns how many of each.
-func (s *Service) SignOutUser(ctx context.Context, a store.Actor, id store.UserID) (sessions, devices int, err error) {
-	return 0, 0, notImplemented("SignOutUser")
-}
-
-// IssuePasswordReset returns a /reset#token link for a user (03 §7.10). actorPassword re-authenticates an admin
-// actor; the CLI passes "".
-func (s *Service) IssuePasswordReset(ctx context.Context, a store.Actor, id store.UserID, actorPassword string) (Link, error) {
-	return Link{}, notImplemented("IssuePasswordReset")
-}
-
-// CheckPasswordReset answers POST /api/v1/auth/reset/check with the username the link resets.
-func (s *Service) CheckPasswordReset(ctx context.Context, token string, m ReqMeta) (username string, err error) {
-	return "", notImplemented("CheckPasswordReset")
-}
-
-// CompletePasswordReset sets the new password, revokes the user's sessions and devices and logs the user in.
-func (s *Service) CompletePasswordReset(ctx context.Context, token, password string, m ReqMeta) (LoginResult, error) {
-	return LoginResult{}, notImplemented("CompletePasswordReset")
-}
-
-// UserByUsername looks a user up by any spelling of the username (CLI lookups).
-func (s *Service) UserByUsername(ctx context.Context, username string) (store.User, error) {
-	return store.User{}, notImplemented("UserByUsername")
-}
+// the settings patch of 03 §9 together with the registration_mode_changed alert of 03 §7.11. UpdateUser, DeleteUser,
+// SignOutUser and UserByUsername (03 §7.11) are in admin.go; IssuePasswordReset, CheckPasswordReset and
+// CompletePasswordReset (03 §7.10) are in reset.go.
 
 // UserChange is a patch for UpdateUser: nil fields stay as they are.
 type UserChange struct {
-	Username      *string
-	Role          *store.Role
-	Status        *store.UserStatus // "active" | "disabled" only
-	ActorPassword string            // required when granting admin (not for the CLI)
+	Username *string     // a new name, by the rules of NormalizeUsername
+	Role     *store.Role // "admin" | "user"
+	// Status is "active" or "disabled" only, and never for a pending sign-up, which is approved or rejected.
+	Status *store.UserStatus
+	// ActorPassword is the acting admin's own password, typed again. It is required when the change makes the
+	// user an admin (03 §7.11), not for the CLI, and not looked at otherwise.
+	ActorPassword string
 }
 
 // ---- maintenance (03 §4.7) ----

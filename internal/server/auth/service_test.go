@@ -552,20 +552,7 @@ func TestLaterMethodsSayNotImplemented(t *testing.T) {
 			t.Errorf("%s: %v", method, err)
 		}
 	}
-	_, err := e.svc.UpdateUser(ctx, store.CLIActor, "", UserChange{})
-	check("UpdateUser", err)
-	check("DeleteUser", e.svc.DeleteUser(ctx, store.CLIActor, ""))
-	_, _, err = e.svc.SignOutUser(ctx, store.CLIActor, "")
-	check("SignOutUser", err)
-	_, err = e.svc.IssuePasswordReset(ctx, store.CLIActor, "", "")
-	check("IssuePasswordReset", err)
-	_, err = e.svc.CheckPasswordReset(ctx, "", m)
-	check("CheckPasswordReset", err)
-	_, err = e.svc.CompletePasswordReset(ctx, "", "", m)
-	check("CompletePasswordReset", err)
-	_, err = e.svc.UserByUsername(ctx, "")
-	check("UserByUsername", err)
-	_, err = e.svc.AuthenticateBearerToken(ctx, "")
+	_, err := e.svc.AuthenticateBearerToken(ctx, "")
 	check("AuthenticateBearerToken", err)
 	check("DecideUserCode", e.svc.DecideUserCode(ctx, p, "", false, m))
 

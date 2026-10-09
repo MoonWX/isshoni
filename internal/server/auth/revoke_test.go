@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -62,6 +63,10 @@ type revFixture struct {
 	samSession LoginResult
 	// newToken is the token the event gave the caller's session, for a row that rotates it.
 	newToken string
+	// admin is the admin who acts in an admin's row: Kim, from address C (withAdmin).
+	admin store.Actor
+	// resetToken is the token of the reset link that a row issued.
+	resetToken string
 }
 
 func newRevFixture(t *testing.T, mods ...func(*store.User)) *revFixture {
@@ -119,31 +124,23 @@ func (f *revFixture) withCookie(ip string, i int) ReqMeta {
 	return m
 }
 
-// applyRule runs the two steps that a call of the admin users slice is made of (03 §18 slice 10), for a row whose
-// own call that slice brings: change (what the event does to the account itself, nil for nothing) and the row's
-// rule in one Write, then revocationCommitted.
-func (f *revFixture) applyRule(rule revocation, change func(q *store.Q, now time.Time) error) {
-	f.t.Helper()
-	var rv revoked
-	f.write(func(q *store.Q) error {
-		if change != nil {
-			if err := change(q, f.clk.now()); err != nil {
-				return err
-			}
-		}
-		var err error
-		rv, err = rule.apply(q, f.alex.ID, "")
-		return err
-	})
-	f.svc.revocationCommitted(rv)
+// withAdmin is the prepare of an admin's row: Kim, an admin, who acts from address C. (The fixture has no admin of
+// its own: the setup row needs a server without one.)
+func withAdmin(_ *testing.T, f *revFixture) {
+	f.admin = actorFor(f.addAdmin("Kim"), ipC)
 }
 
 // revRow is one row of the table of 03 §7.7: the event, and what the table says about it.
 type revRow struct {
 	// name is the event as the table names it.
 	name string
+	// prepare, if set, runs first and puts in place what the event needs (an admin who acts, a reset link to
+	// complete). Nothing it does counts as the event: the connections it closes are forgotten.
+	prepare func(t *testing.T, f *revFixture)
 	// run makes the event happen to Alex.
 	run func(t *testing.T, f *revFixture)
+	// after, if set, checks what the row says beyond its columns.
+	after func(t *testing.T, f *revFixture)
 
 	// gone are the indexes of Alex's sessions that the event deletes (the table's "Web sessions" column).
 	gone []int
@@ -176,20 +173,31 @@ func everything(reason string) func(f *revFixture) []closedConn {
 	}
 }
 
+// nothing is the row that closes no connection.
+func nothing(*revFixture) []closedConn { return nil }
+
+// everySessionSees is the after of a row that changes Alex's account and keeps the sessions: the session cache
+// was invalidated, so the next request of each session gets the account as it is now.
+func everySessionSees(what string, ok func(p Principal) bool) func(t *testing.T, f *revFixture) {
+	return func(t *testing.T, f *revFixture) {
+		for i := range f.s {
+			p, err := f.svc.Authenticate(f.request(http.MethodGet, f.s[i].Token))
+			if err != nil || !ok(p) {
+				t.Errorf("s[%d] right after the change: %+v, %v; want %s (03 §7.4: the cache is invalidated)", i, p, err, what)
+			}
+		}
+	}
+}
+
 var all3 = []int{0, 1, 2}
 
 // revMatrix is the table of 03 §7.7, in its order. Not in it:
-//   - "reset completion that arrives with an existing session cookie" (part of the third row): the reset link is
-//     completed by CompletePasswordReset, which comes with the admin users slice; it opens its session like a login
-//     does (openSession);
-//   - "Role change or rename": no session, device or connection goes. The hub is told by httpapi;
 //   - "Revoke device" and "Refresh-token reuse" (M2). TestRevokeDevice covers the path that exists;
 //   - "session key rotated": the startup purge of TestKeyFingerprints, which closes nothing (no connection exists
 //     yet).
 //
-// The four admin rows run through applyRule: their own calls (IssuePasswordReset, SignOutUser, UpdateUser,
-// DeleteUser) come with the admin users slice, and are made of the rule and revocationCommitted that the rows check
-// here.
+// "Role change or rename" is two rows here, one per change. Neither takes a session, a device or a connection: the
+// hub is told by httpapi (Signal.UserChanged), and auth invalidates the session cache.
 var revMatrix = []revRow{
 	{
 		name: "Logout",
@@ -241,6 +249,21 @@ var revMatrix = []revRow{
 				SetupInput{Token: f.setupToken(), Username: "Robin", Password: testPassword}, f.withCookie(ipC, 1))
 			if err != nil {
 				t.Fatal(err)
+			}
+		},
+		gone: []int{1}, device: true, resetLink: true,
+		calls: oneSession(1, ReasonSessionRevoked),
+	},
+	{
+		name: "Reset completion that arrives with an existing session cookie",
+		// The link is for another account, Robin's: a browser that is signed in as Alex opens it.
+		prepare: func(_ *testing.T, f *revFixture) {
+			f.resetToken = f.resetLink(store.CLIActor, f.addUser("Robin").ID, "")
+		},
+		run: func(t *testing.T, f *revFixture) {
+			res, err := f.svc.CompletePasswordReset(context.Background(), f.resetToken, newPassword, f.withCookie(ipC, 1))
+			if err != nil || res.User.Username != "Robin" {
+				t.Fatalf("CompletePasswordReset = %+v, %v", res, err)
 			}
 		},
 		gone: []int{1}, device: true, resetLink: true,
@@ -311,32 +334,44 @@ var revMatrix = []revRow{
 		},
 	},
 	{
-		name: "Admin: password reset",
+		name:    "Admin: password reset",
+		prepare: withAdmin,
 		run: func(_ *testing.T, f *revFixture) {
-			// 03 §7.10: the hash is cleared and the user's reset row is replaced by the new link's.
-			f.applyRule(revokePasswordReset, func(q *store.Q, now time.Time) error {
-				if err := q.SetPasswordHash(f.alex.ID, "", now); err != nil {
-					return err
-				}
-				return q.ReplacePasswordReset(store.PasswordReset{TokenHash: []byte("the-new-link"), UserID: f.alex.ID,
-					ExpiresAt: now.Add(24 * time.Hour)})
-			})
+			f.resetToken = f.resetLink(f.admin, f.alex.ID, "")
 		},
 		gone: all3, resetLink: true,
 		calls: everything(ReasonPasswordReset),
+		// 03 §7.10: the hash is cleared, and the user's reset row is the new link's, not the one before.
+		after: func(t *testing.T, f *revFixture) {
+			hash, _, _, ok := f.resetRow(f.alex.ID)
+			if !ok || !bytes.Equal(hash, f.svc.keys.inviteTokenHash(f.resetToken)) {
+				t.Errorf("Alex's reset link is not the one that was issued (found %v)", ok)
+			}
+			if u := f.userRow(f.alex.ID); u == nil || u.PasswordHash != "" {
+				t.Errorf("Alex's password after the reset was issued: %+v, want none", u)
+			}
+		},
 	},
 	{
-		name: "Admin: sign out everywhere",
-		run:  func(_ *testing.T, f *revFixture) { f.applyRule(revokeSignedOut, nil) },
+		name:    "Admin: sign out everywhere",
+		prepare: withAdmin,
+		run: func(t *testing.T, f *revFixture) {
+			sessions, devices, err := f.svc.SignOutUser(context.Background(), f.admin, f.alex.ID)
+			if err != nil || sessions != len(f.s) || devices != 1 {
+				t.Fatalf("SignOutUser = %d sessions, %d devices, %v; want %d and 1", sessions, devices, err, len(f.s))
+			}
+		},
 		gone: all3, resetLink: true,
 		calls: everything(ReasonSessionRevoked),
 	},
 	{
-		name: "Admin: disable user",
-		run: func(_ *testing.T, f *revFixture) {
-			f.applyRule(revokeAccountDisabled, func(q *store.Q, now time.Time) error {
-				return q.SetStatus(f.alex.ID, store.StatusDisabled, now)
-			})
+		name:    "Admin: disable user",
+		prepare: withAdmin,
+		run: func(t *testing.T, f *revFixture) {
+			u, err := f.svc.UpdateUser(context.Background(), f.admin, f.alex.ID, UserChange{Status: ptr(store.StatusDisabled)})
+			if err != nil || u.Status != store.StatusDisabled {
+				t.Fatalf("UpdateUser = %+v, %v", u, err)
+			}
 		},
 		gone:  all3,
 		calls: everything(ReasonAccountDisabled),
@@ -352,13 +387,42 @@ var revMatrix = []revRow{
 		calls: everything(ReasonAccountDeleted),
 	},
 	{
-		name: "Delete user (admin)",
-		run: func(_ *testing.T, f *revFixture) {
-			f.write(func(q *store.Q) error { return q.DeleteUser(f.alex.ID) })
-			f.svc.revocationCommitted(revokeAccountDeleted.deleted(f.alex.ID))
+		name:    "Delete user (admin)",
+		prepare: withAdmin,
+		run: func(t *testing.T, f *revFixture) {
+			if err := f.svc.DeleteUser(context.Background(), f.admin, f.alex.ID); err != nil {
+				t.Fatal(err)
+			}
 		},
 		gone: all3, deleted: true,
 		calls: everything(ReasonAccountDeleted),
+	},
+	{
+		name:    "Role change",
+		prepare: withAdmin,
+		run: func(t *testing.T, f *revFixture) {
+			u, err := f.svc.UpdateUser(context.Background(), f.admin, f.alex.ID,
+				UserChange{Role: ptr(store.RoleAdmin), ActorPassword: testPassword})
+			if err != nil || u.Role != store.RoleAdmin {
+				t.Fatalf("UpdateUser = %+v, %v", u, err)
+			}
+		},
+		device: true, resetLink: true,
+		calls: nothing,
+		after: everySessionSees("an admin", Principal.IsAdmin),
+	},
+	{
+		name:    "Rename",
+		prepare: withAdmin,
+		run: func(t *testing.T, f *revFixture) {
+			u, err := f.svc.UpdateUser(context.Background(), f.admin, f.alex.ID, UserChange{Username: ptr("Alexandra")})
+			if err != nil || u.Username != "Alexandra" {
+				t.Fatalf("UpdateUser = %+v, %v", u, err)
+			}
+		},
+		device: true, resetLink: true,
+		calls: nothing,
+		after: everySessionSees("the new name", func(p Principal) bool { return p.Username == "Alexandra" }),
 	},
 }
 
@@ -367,6 +431,10 @@ func TestRevocationMatrix(t *testing.T) {
 		t.Run(row.name, func(t *testing.T) {
 			f := newRevFixture(t)
 			ctx := context.Background()
+			if row.prepare != nil {
+				row.prepare(t, f)
+				f.conns.take()
+			}
 
 			// What the service had done by the time it asked for the connections to be closed: the rows must be
 			// gone from the database (the Write committed) and from the session cache.
@@ -464,6 +532,9 @@ func TestRevocationMatrix(t *testing.T) {
 			}
 			if p, err := f.svc.Authenticate(f.request(http.MethodGet, f.samSession.Token)); err != nil || p.UserID != f.sam.ID {
 				t.Errorf("Sam's session afterwards: %+v, %v", p, err)
+			}
+			if row.after != nil {
+				row.after(t, f)
 			}
 		})
 	}
