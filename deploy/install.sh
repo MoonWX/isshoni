@@ -868,9 +868,10 @@ relabel() {
 }
 
 # make_dir DIR creates a system directory that is missing (root, 0755). One that exists keeps its owner and mode:
-# /usr/local/bin and its like are not the installer's to change.
+# /usr/local/bin and its like are not the installer's to change. Root looks whether it exists: an ordinary user
+# can't see into every directory (/etc/firewalld is root's alone on Fedora).
 make_dir() {
-  [ -d "$1" ] || as_root install -d -m 0755 -o root -g root "$1"
+  as_root test -d "$1" || as_root install -d -m 0755 -o root -g root "$1"
 }
 
 # install_binary DIR puts the program from DIR/x in place. It is installed next to its final path and run there
@@ -965,7 +966,7 @@ apply_sysctl() {
 # install_fw_profiles DIR installs the named firewall profiles for the firewalls that are installed, active or
 # not. offer_firewall uses them, and an admin who turns a firewall on later finds them there.
 install_fw_profiles() {
-  if have ufw && [ -d "${UFW_PROFILE%/*}" ]; then
+  if have ufw && as_root test -d "${UFW_PROFILE%/*}"; then
     as_root install -m 0644 -o root -g root "$1/x/deploy/firewall/ufw-isshoni" "$UFW_PROFILE"
   fi
   if have firewall-cmd; then
@@ -976,17 +977,18 @@ install_fw_profiles() {
 }
 
 # payload_complete reports whether everything the installer takes from the release archive is in place, so a run
-# that changes no version can go on without downloading the archive again.
+# that changes no version can go on without downloading the archive again. Root looks for the files, as in
+# make_dir: to an ordinary user a file in a directory that is root's alone would always be missing.
 payload_complete() {
-  [ -f "$UNIT" ] || return 1
+  as_root test -f "$UNIT" || return 1
   if sysctl_low rmem_max || sysctl_low wmem_max; then
-    [ -f "$SYSCTL_FILE" ] || return 1
+    as_root test -f "$SYSCTL_FILE" || return 1
   fi
-  if have ufw && [ -d "${UFW_PROFILE%/*}" ]; then
-    [ -f "$UFW_PROFILE" ] || return 1
+  if have ufw && as_root test -d "${UFW_PROFILE%/*}"; then
+    as_root test -f "$UFW_PROFILE" || return 1
   fi
   if have firewall-cmd; then
-    [ -f "$FIREWALLD_SERVICE" ] || return 1
+    as_root test -f "$FIREWALLD_SERVICE" || return 1
   fi
   return 0
 }
@@ -1057,6 +1059,12 @@ config_init() {
   ci_rc=0
   as_root "$BIN" "$@" || ci_rc=$?
   return "$ci_rc"
+}
+
+# config_exists reports whether there is a config file. Root looks: the file belongs to root and the isshoni
+# group, and an admin may have closed its directory to everybody else.
+config_exists() {
+  as_root test -e "$CONFIG"
 }
 
 # drop_pending_config deletes the config file this run wrote, while it has not passed the pre-check. A file that
@@ -1173,7 +1181,7 @@ write_config() {
 
 # load_config reads from the config file what the steps after it need: the effective TLS mode, the listen
 # addresses and the address friends open. The values come from `isshoni config print`, so the installer never
-# parses TOML.
+# parses TOML. deploy/test/testdata/config-print has samples of that output, which the unit tests read.
 load_config() {
   lc_dump=$(as_root "$BIN" config print --config "$CONFIG" 2>/dev/null) || :
   CFG_TLS_MODE=$(printf '%s\n' "$lc_dump" | sed -n 's/^# effective tls\.mode: \([a-z]*\).*/\1/p' | sed -n 1p)
@@ -1183,8 +1191,12 @@ load_config() {
   CFG_HTTP=$(config_string 'listen\.http')
   CFG_ICE_UDP=$(config_string 'listen\.ice_udp')
   CFG_ICE_TCP=$(config_string 'listen\.ice_tcp')
-  if [ -z "$lc_dump" ]; then
-    # The config can't be read. The server will say why when it starts; check the default ports.
+  if [ -z "$CFG_TLS_MODE" ]; then
+    # `config print` failed, or printed something this script does not find the mode in: then the other values
+    # are not to be trusted either. The server says what is wrong with a config when it starts; the port check
+    # uses the default ports.
+    warn "Could not read the settings in $CONFIG (\"isshoni config print\" did not show them)." \
+      'The installer goes on and checks the default ports: 80, 443 and 7882.'
     CFG_HTTPS=:443
     CFG_HTTP=:80
     CFG_ICE_UDP=:7882
@@ -1558,9 +1570,10 @@ do_purge() {
 }
 
 # cleanup runs when the script ends, however it ends: it deletes a config file that this run wrote and that did
-# not get past the pre-check, and the download directory. When the script ends because a command failed that no
-# code here handles (set -e), it says at which step, and exits with 1: that command's own exit code could be read
-# as one of the installer's.
+# not get past the pre-check, and the download directory. That includes a run that a signal ends: Ctrl-C, a kill,
+# or a terminal that went away (set_traps). When the script ends because a command failed that no code here
+# handles (set -e), it says at which step, and exits with 1: that command's own exit code could be read as one of
+# the installer's.
 cleanup() {
   cl_rc=$?
   drop_pending_config
@@ -1574,6 +1587,15 @@ cleanup() {
     printf '%s\n' 'Fix what it names, then run this installer again: it goes on where it stopped.' >&2
     exit 1
   fi
+}
+
+# set_traps makes the script end through cleanup when a signal ends it, too: Ctrl-C is a cancel (exit 8), a kill
+# and a terminal that went away (HUP, which a dropped SSH session sends) are exit 1. Without a trap of its own, a
+# signal ends dash and busybox sh at once, and the EXIT trap does not run.
+set_traps() {
+  trap cleanup EXIT
+  trap 'PLANNED_EXIT=1; printf "\n%s\n" "Cancelled." >&2; exit 8' INT
+  trap 'PLANNED_EXIT=1; exit 1' TERM HUP
 }
 
 # running_other_version reports whether the running server is another version than the installed program: an
@@ -1650,7 +1672,7 @@ restart_or_repair() {
 do_install() {
   # A machine without a config gets the one question. When no flag answers it and there is no terminal to ask
   # on, say so now, before anything is downloaded or installed.
-  if [ ! -e "$CONFIG" ] && [ -z "$OPT_TLS_MODE" ] && [ "$OPT_YES" = 0 ] && ! have_tty; then
+  if ! config_exists && [ -z "$OPT_TLS_MODE" ] && [ "$OPT_YES" = 0 ] && ! have_tty; then
     die 2 'Non-interactive install: pass --domain NAME or --ip' \
       "Example: curl -fsSL $SITE_URL/install.sh | sh -s -- --domain share.example.com"
   fi
@@ -1703,7 +1725,7 @@ do_install() {
     install_fw_profiles "$TMP/dl"
   fi
 
-  if [ ! -e "$CONFIG" ]; then
+  if ! config_exists; then
     step 'writing the config'
     write_config
   fi
@@ -1740,9 +1762,7 @@ main() {
   setup_colors
   parse_args "$@"
   scrub_env
-  trap cleanup EXIT
-  trap 'PLANNED_EXIT=1; printf "\n%s\n" "Cancelled." >&2; exit 8' INT
-  trap 'PLANNED_EXIT=1; exit 1' TERM
+  set_traps
   step 'checking this system'
   preflight
   case $OPT_ACTION in

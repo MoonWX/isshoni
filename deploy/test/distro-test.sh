@@ -15,10 +15,16 @@
 #     no other way to take a key);
 #   - tools/relserve, which serves all of it over HTTPS like GitHub Releases, with a certificate authority made
 #     for this run that the container is told to trust.
-# Nothing is installed on this machine, and the key, the CA and the release are deleted when the script ends.
+# Nothing is installed on this machine, and the key, the CA, the release and the containers are deleted when the
+# script ends. The container images, isshoni-distro-test:<distro>, stay: they are the build cache of the next run
+# (a few hundred MB each). Remove them with `docker image rm` (or `podman image rm`).
+#
+# The installer and the server would look up this machine's public address (STUN). The scenarios give them one of
+# the documentation range instead (ISSHONI_PUBLIC_IP), so a run does not depend on that lookup and its output,
+# which ends up in CI logs and pull requests, names no real address.
 #
 # Scenarios (the numbers are 06 §11.2's):
-#   C1  a fresh install of the first version with --yes --tls-mode off
+#   C1  a fresh install of the first version with --yes --tls-mode off, and a pre-check that passes
 #   C6  an upgrade from tampered mirrors: checksums changed, signature missing, archive swapped
 #
 # Environment:
@@ -40,6 +46,8 @@ V2=0.0.1-ci.2
 VERSION_PKG=github.com/MoonWX/isshoni/internal/version
 # The name a container reaches this machine by. podman provides it; docker gets it with --add-host.
 HOST_NAME=host.containers.internal
+# The public address the installed server is told it has (RFC 5737's TEST-NET-3).
+PUBLIC_IP=203.0.113.7
 KEEP=${KEEP:-0}
 
 ENGINE=${CONTAINER_ENGINE:-}
@@ -114,6 +122,13 @@ assert_contains() {
   case $3 in
   *"$2"*) ok "$1" ;;
   *) fail "$1" "want it to contain: $2" ;;
+  esac
+}
+
+assert_lacks() {
+  case $3 in
+  *"$2"*) fail "$1" "want it not to contain: $2" ;;
+  *) ok "$1" ;;
   esac
 }
 
@@ -305,6 +320,7 @@ run_installer() {
   RC=0
   # shellcheck disable=SC2016 # the variables are the container shell's
   "$ENGINE" exec -e "ISSHONI_DOWNLOAD_BASE=$BASE_URL$ri_mirror" -e ISSHONI_PUBLIC_URL=http://127.0.0.1:8080 \
+    -e "ISSHONI_PUBLIC_IP=$PUBLIC_IP" \
     "$CONTAINER" sh -c 'url=$1; shift; curl -fsSL -o /root/install.sh "$url" && sh -s -- "$@" </root/install.sh' \
     sh "$BASE_URL/download/v$ri_version/install.sh" "$@" >"$WORK/out" 2>&1 || RC=$?
   OUT=$(cat "$WORK/out")
@@ -323,6 +339,10 @@ scenario_c1() {
 
   run_installer "$V1" '' --yes --tls-mode off
   assert_eq 'C1: exit code' 0 "$RC"
+  assert_contains 'C1: the pre-check ran' 'Checking this server before the first start:' "$OUT"
+  assert_lacks 'C1: the pre-check passed' 'A check failed' "$OUT"
+  assert_contains 'C1: the config has the public address it was given' "public_ip = \"$PUBLIC_IP\"" \
+    "$(value isshoni config print --config /etc/isshoni/isshoni.toml)"
 
   assert_eq 'C1: the service is active' active "$(value systemctl is-active isshoni)"
   assert_eq 'C1: the service is enabled' enabled "$(value systemctl is-enabled isshoni)"
