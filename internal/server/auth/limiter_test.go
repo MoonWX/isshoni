@@ -465,7 +465,6 @@ func TestThrottleRates(t *testing.T) {
 		{"auth-ip", 20, 15 * time.Second, func() verdict { return th.authIP.take(ip) }},
 		{"register-ip", 5, 12 * time.Minute, func() verdict { return th.registerIP.take(ip) }},
 		{"auth-hash", 20, 200 * time.Millisecond, func() verdict { return th.authHash.take(struct{}{}) }},
-		{"push-test", 1, 10 * time.Second, func() verdict { return th.pushTest.take("k3m9p2qxw7ht") }},
 		{"block log line", 1, time.Minute, func() verdict { return th.blockLog.take(ip) }},
 		{"login_failed audit", 600, 6 * time.Second, func() verdict { return th.loginFailedAudit.take(struct{}{}) }},
 		{"global throttled audit", 1, time.Hour, func() verdict { return th.globalThrottledAudit.take(struct{}{}) }},

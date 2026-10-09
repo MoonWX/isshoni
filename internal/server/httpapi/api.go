@@ -151,31 +151,39 @@ func newAPI(d Deps, au authService) *API {
 // routes registers 03's endpoints (03 §12.3; the numbers are the rows of its table). The later slices add theirs
 // here.
 func (a *API) routes() {
-	a.Handle("GET /api/v1/info", Public, http.HandlerFunc(a.getInfo))                             // #1
-	a.Handle("POST /api/v1/auth/login", Public, http.HandlerFunc(a.postLogin))                    // #2
-	a.Handle("POST /api/v1/auth/logout", Public, http.HandlerFunc(a.postLogout))                  // #3
-	a.Handle("POST /api/v1/auth/register", Public, http.HandlerFunc(a.postRegister))              // #5
-	a.Handle("POST /api/v1/auth/invite/check", Public, http.HandlerFunc(a.postInviteCheck))       // #6
-	a.Handle("POST /api/v1/auth/setup/check", Public, http.HandlerFunc(a.postSetupCheck))         // #7
-	a.Handle("POST /api/v1/auth/setup/complete", Public, http.HandlerFunc(a.postSetupComplete))   // #8
-	a.Handle("GET /api/v1/me", User, http.HandlerFunc(a.getMe))                                   // #11
-	a.Handle("GET /api/v1/rooms", User, http.HandlerFunc(a.getRooms))                             // #19
-	a.Handle("GET /api/v1/invites", User, http.HandlerFunc(a.getInvites))                         // #21
-	a.Handle("POST /api/v1/invites", User, http.HandlerFunc(a.postInvite))                        // #22
-	a.Handle("DELETE /api/v1/invites/{id}", User, http.HandlerFunc(a.deleteInvite))               // #23
-	a.Handle("POST /api/v1/push/subscriptions", User, http.HandlerFunc(a.postPushSubscription))   // #24
-	a.Handle("POST /api/v1/push/unsubscribe", User, http.HandlerFunc(a.postPushUnsubscribe))      // #27
-	a.Handle("POST /api/v1/push/test", User, http.HandlerFunc(a.postPushTest))                    // #28
-	a.Handle("GET /api/v1/admin/approvals", Admin, http.HandlerFunc(a.getApprovals))              // #34
-	a.Handle("POST /api/v1/admin/approvals/{id}/approve", Admin, http.HandlerFunc(a.postApprove)) // #35
-	a.Handle("POST /api/v1/admin/approvals/{id}/reject", Admin, http.HandlerFunc(a.postReject))   // #36
-	a.Handle("POST /api/v1/admin/rooms", Admin, http.HandlerFunc(a.postRoom))                     // #37
-	a.Handle("PATCH /api/v1/admin/rooms/{id}", Admin, http.HandlerFunc(a.patchRoom))              // #38
-	a.Handle("DELETE /api/v1/admin/rooms/{id}", Admin, http.HandlerFunc(a.deleteRoom))            // #39
-	a.Handle("GET /api/v1/admin/settings", Admin, http.HandlerFunc(a.getSettings))                // #40
-	a.Handle("PATCH /api/v1/admin/settings", Admin, http.HandlerFunc(a.patchSettings))            // #41
-	a.Handle("GET /api/v1/push/preferences", User, http.HandlerFunc(a.getPushPreferences))        // #50
-	a.Handle("PUT /api/v1/push/preferences", User, http.HandlerFunc(a.putPushPreferences))        // #51
+	a.Handle("GET /api/v1/info", Public, http.HandlerFunc(a.getInfo))                               // #1
+	a.Handle("POST /api/v1/auth/login", Public, http.HandlerFunc(a.postLogin))                      // #2
+	a.Handle("POST /api/v1/auth/logout", Public, http.HandlerFunc(a.postLogout))                    // #3
+	a.Handle("POST /api/v1/auth/logout-everywhere", User, http.HandlerFunc(a.postLogoutEverywhere)) // #4
+	a.Handle("POST /api/v1/auth/register", Public, http.HandlerFunc(a.postRegister))                // #5
+	a.Handle("POST /api/v1/auth/invite/check", Public, http.HandlerFunc(a.postInviteCheck))         // #6
+	a.Handle("POST /api/v1/auth/setup/check", Public, http.HandlerFunc(a.postSetupCheck))           // #7
+	a.Handle("POST /api/v1/auth/setup/complete", Public, http.HandlerFunc(a.postSetupComplete))     // #8
+	a.Handle("GET /api/v1/me", User, http.HandlerFunc(a.getMe))                                     // #11
+	a.Handle("POST /api/v1/me/password", User, http.HandlerFunc(a.postPassword))                    // #12
+	a.Handle("POST /api/v1/me/delete", User, http.HandlerFunc(a.postDeleteSelf))                    // #13
+	a.Handle("GET /api/v1/me/sessions", User, http.HandlerFunc(a.getSessions))                      // #14
+	a.Handle("DELETE /api/v1/me/sessions/{id}", User, http.HandlerFunc(a.deleteSession))            // #15
+	a.Handle("POST /api/v1/me/sessions/revoke-others", User, http.HandlerFunc(a.postRevokeOthers))  // #16
+	a.Handle("GET /api/v1/me/devices", User, http.HandlerFunc(a.getDevices))                        // #17
+	a.Handle("DELETE /api/v1/me/devices/{id}", User, http.HandlerFunc(a.deleteDevice))              // #18
+	a.Handle("GET /api/v1/rooms", User, http.HandlerFunc(a.getRooms))                               // #19
+	a.Handle("GET /api/v1/invites", User, http.HandlerFunc(a.getInvites))                           // #21
+	a.Handle("POST /api/v1/invites", User, http.HandlerFunc(a.postInvite))                          // #22
+	a.Handle("DELETE /api/v1/invites/{id}", User, http.HandlerFunc(a.deleteInvite))                 // #23
+	a.Handle("POST /api/v1/push/subscriptions", User, http.HandlerFunc(a.postPushSubscription))     // #24
+	a.Handle("POST /api/v1/push/unsubscribe", User, http.HandlerFunc(a.postPushUnsubscribe))        // #27
+	a.Handle("POST /api/v1/push/test", User, http.HandlerFunc(a.postPushTest))                      // #28
+	a.Handle("GET /api/v1/admin/approvals", Admin, http.HandlerFunc(a.getApprovals))                // #34
+	a.Handle("POST /api/v1/admin/approvals/{id}/approve", Admin, http.HandlerFunc(a.postApprove))   // #35
+	a.Handle("POST /api/v1/admin/approvals/{id}/reject", Admin, http.HandlerFunc(a.postReject))     // #36
+	a.Handle("POST /api/v1/admin/rooms", Admin, http.HandlerFunc(a.postRoom))                       // #37
+	a.Handle("PATCH /api/v1/admin/rooms/{id}", Admin, http.HandlerFunc(a.patchRoom))                // #38
+	a.Handle("DELETE /api/v1/admin/rooms/{id}", Admin, http.HandlerFunc(a.deleteRoom))              // #39
+	a.Handle("GET /api/v1/admin/settings", Admin, http.HandlerFunc(a.getSettings))                  // #40
+	a.Handle("PATCH /api/v1/admin/settings", Admin, http.HandlerFunc(a.patchSettings))              // #41
+	a.Handle("GET /api/v1/push/preferences", User, http.HandlerFunc(a.getPushPreferences))          // #50
+	a.Handle("PUT /api/v1/push/preferences", User, http.HandlerFunc(a.putPushPreferences))          // #51
 }
 
 // ServeHTTP serves every request under /api/v1/ through the API's chain. After the no-store step it answers every

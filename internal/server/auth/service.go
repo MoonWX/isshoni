@@ -23,11 +23,11 @@ import (
 //
 // README S30 filled in New (this file; the key-rotation purge is in tokens.go), the sessions and the CSRF wrapper
 // (session.go), login and logout (login.go) and setup (setup.go). README S42 filled in the invites (invite.go),
-// registration and the approval queue (register.go), and added UpdateSettings (settings.go). The methods still
-// declared below come with the later auth slices (03 §18 slices 9, 10 and 13: self-service, admin users and password
-// resets, the janitor). Until then each one with an error result returns notImplemented(method): an error that names
-// the method and wraps *api.Error{internal}, so an HTTP handler that calls it answers 500 internal (api has no
-// not_implemented code).
+// registration and the approval queue (register.go), and added UpdateSettings (settings.go). README S58 filled in
+// self-service (selfservice.go) on the revocation table of 03 §7.7 (revoke.go). The methods still declared below
+// come with the later auth slices (03 §18 slices 10 and 13: admin users and password resets, the janitor). Until
+// then each one with an error result returns notImplemented(method): an error that names the method and wraps
+// *api.Error{internal}, so an HTTP handler that calls it answers 500 internal (api has no not_implemented code).
 //
 // All service errors are *api.Error (03 §12.2) carrying a stable code, so httpapi maps them to statuses in one
 // table: an unexpected failure (the store, a cancelled context) wraps both its cause and *api.Error{internal}
@@ -305,7 +305,7 @@ type ConnSelector struct {
 	UserID          store.UserID    // required, never empty (01 closes nothing otherwise)
 	SessionID       store.SessionID // "" = any
 	DeviceID        store.DeviceID  // "" = any
-	ExceptSessionID store.SessionID // keep this one (password change, "sign out other browsers")
+	ExceptSessionID store.SessionID // keep this one (password change: everything else of the user goes)
 }
 
 // ConnCloser closes the WebSocket connections a selector matches, with a Reason* code, and returns how many it
@@ -323,7 +323,7 @@ const (
 	ReasonPasswordReset   = "password_reset"
 	ReasonAccountDisabled = "account_disabled"
 	ReasonAccountDeleted  = "account_deleted"
-	ReasonDeviceRevoked   = "device_revoked" // later (M2)
+	ReasonDeviceRevoked   = "device_revoked" // RevokeDevice; no device exists before M2
 )
 
 // ---- admin alerts (03 §7.11) ----
@@ -445,12 +445,8 @@ type SetupInput struct{ Token, Username, Password, ServerName string }
 
 // ---- login, registration (03 §7.4, §7.9) ----
 //
-// Login and Logout are in login.go, CheckInvite is in invite.go and Register in register.go.
-
-// LogoutEverywhere deletes every session and device of the principal's user.
-func (s *Service) LogoutEverywhere(ctx context.Context, p Principal, m ReqMeta) error {
-	return notImplemented("LogoutEverywhere")
-}
+// Login and Logout are in login.go, LogoutEverywhere is in selfservice.go, CheckInvite is in invite.go and Register
+// in register.go.
 
 // RegisterInput is the body of POST /api/v1/auth/register. An empty InviteToken is a public sign-up, which only the
 // approval mode takes.
@@ -471,32 +467,9 @@ type InviteInfo struct {
 }
 
 // ---- self-service (03 §7.7) ----
-
-// ChangePassword checks the current password, sets the new one, revokes the user's other sessions and devices and
-// rotates this session's token.
-func (s *Service) ChangePassword(ctx context.Context, p Principal, current, next string, m ReqMeta) (LoginResult, error) {
-	return LoginResult{}, notImplemented("ChangePassword")
-}
-
-// DeleteSelf deletes the principal's account after checking its password.
-func (s *Service) DeleteSelf(ctx context.Context, p Principal, password string, m ReqMeta) error {
-	return notImplemented("DeleteSelf")
-}
-
-// RevokeSession deletes one of the principal's own sessions.
-func (s *Service) RevokeSession(ctx context.Context, p Principal, id store.SessionID, m ReqMeta) error {
-	return notImplemented("RevokeSession")
-}
-
-// RevokeOtherSessions deletes every session of the principal's user except the current one and returns how many.
-func (s *Service) RevokeOtherSessions(ctx context.Context, p Principal, m ReqMeta) (int, error) {
-	return 0, notImplemented("RevokeOtherSessions")
-}
-
-// RevokeDevice deletes one of the principal's own devices (none exist before M2).
-func (s *Service) RevokeDevice(ctx context.Context, p Principal, id store.DeviceID, m ReqMeta) error {
-	return notImplemented("RevokeDevice")
-}
+//
+// ChangePassword, DeleteSelf, RevokeSession, RevokeOtherSessions and RevokeDevice are in selfservice.go; the
+// revocation table they apply is in revoke.go.
 
 // ---- invites (03 §7.9) ----
 //

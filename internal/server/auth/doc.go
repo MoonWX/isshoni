@@ -21,7 +21,7 @@
 //     fingerprint check and builds the hasher, the throttles, the CSRF guard and the session cache;
 //   - session.go (README S30): the session cookie, Authenticate (REST) and AuthenticateCookie (/ws), the 30 s session
 //     cache, Touch (the hub's Revalidate), MaybeRotate (the daily token rotation with its 60 s grace), the CSRF
-//     wrapper, and the after-commit steps of a revocation: cache first, then ConnCloser (§7.4–7.7);
+//     wrapper, and the after-commit steps of revoking single sessions: cache first, then ConnCloser (§7.4–7.7);
 //   - login.go (README S30): Login and Logout with the throttles of §7.3 in their order (auth-ip, auth-user-ip,
 //     auth-user with the known-IP rule, auth-hash) and the audit rows of §10. A login takes its tokens of the two
 //     per-username buckets before the hash and gets them back unless the password check failed, so parallel
@@ -37,15 +37,24 @@
 //     approval queue: Approve, Reject and RejectAll;
 //   - settings.go (README S42): UpdateSettings, the settings patch of §9 with the registration_mode_changed admin
 //     alert. It is an addition to §7.13;
+//   - revoke.go (README S58): the revocation table of §7.7. One rule per row that takes a user's credentials as a
+//     whole (which sessions, devices and reset link its Write deletes, and the reason its connections are closed
+//     with), for the user's own actions and for the admin's, and the steps that follow every commit: the session
+//     cache first, then ConnCloser. Also loadSelf, the caller's check that every self-service Write starts with;
+//   - selfservice.go (README S58): RevokeSession, RevokeOtherSessions, LogoutEverywhere, ChangePassword, DeleteSelf
+//     and RevokeDevice, each a row of that table with its audit row. Changing the password and deleting the account
+//     ask for the password again (verifyOwnPassword), which counts in the two per-username buckets of failed
+//     password checks like a login; the only active admin can't delete the account (§7.11);
 //   - alerts.go: admin alerts (§7.11).
 //
 // A call that acts for an account takes a store.Actor and reads that account inside its own transaction (actingAs
 // in service.go): the CLI acts as an admin, a user actor has the role its row has at that moment, and an account
-// that is gone or not active is forbidden.
+// that is gone or not active is forbidden. A self-service call takes the request's Principal and reads the account
+// and the caller's session the same way (loadSelf): without a live session it is unauthenticated.
 //
-// The other Service methods (self-service, admin users, password resets, the janitor) return a not-implemented
-// error wrapping api internal until the later auth slices fill them in (03 §18 slices 9, 10 and 13); the M2
-// device-flow methods come with their api DTOs in 03 slice 15.
+// The other Service methods (admin users, password resets, the janitor) return a not-implemented error wrapping
+// api internal until the later auth slices fill them in (03 §18 slices 10 and 13); the M2 device-flow methods come
+// with their api DTOs in 03 slice 15.
 //
 // Service errors are *api.Error values with the codes of 03 §12.2: the rules' FieldErrors become validation_failed
 // with a code per field, a refused throttle becomes rate_limited or server_busy with retryAfter, and an unexpected
