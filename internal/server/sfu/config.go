@@ -55,10 +55,11 @@ const (
 	maxSharesPerParticipant = 4   // sfu.too_many_shares; the hub enforces 4 per user and the room soft limit first
 	maxSubscriptions        = 256 // per Conn: sfu.too_many_subscriptions
 	maxSubscriptionsPerCall = 64  // items per UpdateSubscriptions: sfu.too_many_subscriptions
-	maxRemoteCandidates     = 64  // per PC and gen, trickled or in an SDP: the first 64 addresses are kept
+	maxRemoteCandidates     = 64  // per PC and gen, trickled or in an SDP: the first 64 are kept (candidateKey)
 	commandQueueLen         = 64  // signal calls waiting for a Conn's actor
 	// maxPCCreations is how many PeerConnections of one kind a client may make a Conn create within pcRateWindow:
-	// pub offers of a new gen, and every sub PC that isn't a codec rebuild of the SFU's own (README S69). One more is
+	// pub offers of a new gen, and every sub PC after the Conn's first that isn't a codec rebuild of the SFU's own
+	// (README S69): ResetPC, and the successor of a closed sub PC, whichever request builds it. One more is
 	// sfu.pc_rate_limited. The hub's own limits come first (01 §13: 6 new pub gens and 12 pc.restart a minute).
 	maxPCCreations = 10
 )

@@ -121,13 +121,17 @@ func (c *Conn) handleOffer(ctx context.Context, kind PCKind, gen, neg uint32, ra
 		return "", newError(CodeBadSDP, "the pub PC takes no more offers: an earlier one failed inside Pion")
 	}
 
-	// Step 1: validate, and drop the candidates the server must not probe (02 §7.3) and those past the 64 addresses of
-	// this PC and gen (02 §12). What the offer's candidates use of the 64 counts only once Pion has taken the offer.
+	// Step 1: validate, and drop the candidates the server must not probe (02 §7.3) and those past the 64 of this PC
+	// and gen (02 §12). What the offer's candidates use of the 64 counts only once Pion has taken the offer. A
+	// re-offer goes on from what the current PC has admitted; a new gen starts with what was trickled ahead of it.
 	offer, err := checkPubOffer(raw, tracks, c.ownsShare)
 	if err != nil {
 		return "", err
 	}
 	budget := c.cands[PCPub].forGen(gen)
+	if gen > c.pubGen {
+		budget = c.pubAhead.forGen(gen)
+	}
 	filtered, dropped, err := c.sfu.apis.filter.limitSDP(raw, budget.admit)
 	if err != nil {
 		return "", err

@@ -167,13 +167,22 @@
 //     subscription's state, a CodecPolicyEvent per share the Conn publishes. It ICE-restarts a sub PC that isn't
 //     connected and rebuilds one that has closed.
 //
-// The guards of 02 §12 that live here: one pub and one sub PC per Conn (an offer for a third is sfu.pc_limit; a
-// second of one kind can't be asked for, a new gen replaces); 10 PeerConnections of a kind that a client makes a
-// Conn create within a minute, pub gens and sub rebuilds alike (sfu.pc_rate_limited with RetryAfter; the SFU's own
-// codec rebuilds, README S69, won't count); 64 remote candidate addresses per PC and gen, trickled or in the PC's
-// remote descriptions, with an address that comes again counted once; 4 shares per participant; 256 subscriptions
-// per Conn and 64 per call; the SDP guards of sdpcheck.go; the command queue; the keyframe throttle; the DownTrack
-// queues.
+// The guards of 02 §12 that live here:
+//   - One pub and one sub PC per Conn: an offer for a third is sfu.pc_limit; a second of one kind can't be asked
+//     for, a new gen replaces.
+//   - 10 PeerConnections of a kind that a client makes a Conn create within a minute: pub offers of a new gen, and
+//     sub PCs after the Conn's first, which are ResetPC's and the successors of a closed sub PC, whichever request
+//     builds them (ResetPC, RestartICE, Resync or a subscription change). One more is sfu.pc_rate_limited with
+//     RetryAfter: the error of HandleOffer, ResetPC and RestartICE, and an ErrorEvent about the sub PC for Resync
+//     and a subscription change, which have no error to put it in. Nothing builds the refused PC later; the
+//     client asks again. The SFU's own codec rebuilds (README S69) won't count.
+//   - 64 remote candidates per PC and gen, trickled or in the PC's remote descriptions. A candidate is what Pion
+//     keeps as one: its transport address, its type and its related address together (candidateKey), since Pion
+//     pairs and checks each of those and has no cap of its own. One that comes again is counted once. The pub PC's
+//     candidates are its own: those a client trickles for a later pub gen wait apart, for that gen's offer, and
+//     count toward that gen's 64.
+//   - 4 shares per participant; 256 subscriptions per Conn and 64 per call; the SDP guards of sdpcheck.go; the
+//     command queue; the keyframe throttle; the DownTrack queues.
 //
 // # What later slices add
 //

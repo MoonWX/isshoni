@@ -393,12 +393,12 @@ func (f candidateFilter) trickled(init webrtc.ICECandidateInit) dropReason {
 	return reason
 }
 
-// judgeTrickled is trickled with the transport address of a candidate it keeps, which is what the cap on remote
-// candidates counts (02 §12, remoteCandidates).
-func (f candidateFilter) judgeTrickled(init webrtc.ICECandidateInit) (candidateAddr, dropReason) {
+// judgeTrickled is trickled with the key of a candidate it keeps, which is what the cap on remote candidates counts
+// (02 §12, remoteCandidates).
+func (f candidateFilter) judgeTrickled(init webrtc.ICECandidateInit) (candidateKey, dropReason) {
 	v := strings.TrimPrefix(init.Candidate, "candidate:")
 	if v == "" {
-		return candidateAddr{}, keepCandidate
+		return candidateKey{}, keepCandidate
 	}
 	return f.judge(v)
 }
@@ -411,24 +411,53 @@ func (f candidateFilter) candidate(value string) dropReason {
 	return reason
 }
 
-// judge is candidate with the transport address of a candidate it keeps: where the server would send its checks.
-func (f candidateFilter) judge(value string) (candidateAddr, dropReason) {
+// candidateKey is what makes a remote candidate one of its own to Pion: everything ice.Candidate.Equal compares.
+// Pion's ICE agent keeps every remote candidate it has no equal of, pairs it with each local candidate and sends
+// its checks to it, and has no cap of its own. So two candidates on one transport address that differ in their type
+// or their related address are two candidates, and the cap on remote candidates (02 §12) counts keys, not addresses.
+//
+// The fields are Pion's, read from the candidate as Pion parsed it, so the SFU and Pion never disagree on whether two
+// candidates are the same: two with one key are equal to Pion. (Pion keeps the address as the client spelled it, so
+// two spellings of one IPv6 address are two candidates, here as there.)
+type candidateKey struct {
+	network ice.NetworkType // udp4, udp6, tcp4 or tcp6
+	address string          // as the candidate spells it, without a zone
+	port    int
+	tcpType ice.TCPType
+	typ     ice.CandidateType
+	// The related address (raddr and rport). A host candidate has none; the other types always have one, empty when
+	// the candidate names none.
+	related bool
+	raddr   string
+	rport   int
+}
+
+// keyOf returns the key of a candidate that Pion parsed.
+func keyOf(c ice.Candidate) candidateKey {
+	k := candidateKey{network: c.NetworkType(), address: c.Address(), port: c.Port(), tcpType: c.TCPType(), typ: c.Type()}
+	if rel := c.RelatedAddress(); rel != nil {
+		k.related, k.raddr, k.rport = true, rel.Address, rel.Port
+	}
+	return k
+}
+
+// judge is candidate with the key of a candidate it keeps.
+func (f candidateFilter) judge(value string) (candidateKey, dropReason) {
 	if strings.ContainsAny(value, "\r\n") {
-		return candidateAddr{}, dropUnparsable
+		return candidateKey{}, dropUnparsable
 	}
 	c, err := ice.UnmarshalCandidate(value)
 	if err != nil {
-		return candidateAddr{}, dropUnparsable
+		return candidateKey{}, dropUnparsable
 	}
 	ip, err := netip.ParseAddr(c.Address())
 	if err != nil {
-		return candidateAddr{}, dropHostname
+		return candidateKey{}, dropHostname
 	}
 	if reason := f.addr(ip); reason != keepCandidate {
-		return candidateAddr{}, reason
+		return candidateKey{}, reason
 	}
-	port := uint16(c.Port()) //nolint:gosec // Pion's parser takes only ports up to 65535
-	return candidateAddr{tcp: c.NetworkType().IsTCP(), addr: netip.AddrPortFrom(ip.Unmap().WithZone(""), port)}, keepCandidate
+	return keyOf(c), keepCandidate
 }
 
 // addr judges a candidate's connection address.
@@ -483,10 +512,10 @@ func (f candidateFilter) filterSDP(raw string) (string, int, error) {
 
 // limitSDP is filterSDP for the remote description of a Conn's PC, whose candidates count toward the PC's cap on
 // remote candidates like trickled ones (02 §12): a candidate that the filter keeps but admit refuses is dropped too.
-// admit gets the transport address of each kept candidate, in the SDP's order, and must give the same answer when
-// it is asked about an address again (remoteCandidates.admit does: an address it admitted stays admitted), because
-// the SDP that comes out is read once more.
-func (f candidateFilter) limitSDP(raw string, admit func(candidateAddr) bool) (string, int, error) {
+// admit gets the key of each kept candidate, in the SDP's order, and must give the same answer when it is asked
+// about a candidate again (remoteCandidates.admit does: a candidate it admitted stays admitted), because the SDP
+// that comes out is read once more.
+func (f candidateFilter) limitSDP(raw string, admit func(candidateKey) bool) (string, int, error) {
 	desc, err := parseSDP(raw)
 	if err != nil {
 		return "", 0, err
@@ -508,14 +537,14 @@ func (f candidateFilter) limitSDP(raw string, admit func(candidateAddr) bool) (s
 
 // dropCandidates removes the candidate attributes the filter drops from desc, at session and media level, and those
 // that admit refuses when there is one, and returns how many it removed.
-func (f candidateFilter) dropCandidates(desc *sdp.SessionDescription, admit func(candidateAddr) bool) int {
+func (f candidateFilter) dropCandidates(desc *sdp.SessionDescription, admit func(candidateKey) bool) int {
 	dropped := 0
 	drop := func(a sdp.Attribute) bool {
 		if !a.IsICECandidate() {
 			return false
 		}
-		addr, reason := f.judge(a.Value)
-		if reason != keepCandidate || (admit != nil && !admit(addr)) {
+		key, reason := f.judge(a.Value)
+		if reason != keepCandidate || (admit != nil && !admit(key)) {
 			dropped++
 			return true
 		}

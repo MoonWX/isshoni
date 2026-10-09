@@ -249,7 +249,8 @@ func (s *Subscription) detach() {
 //
 // On a Conn whose sub PC has closed (02 §5.3), a call that applies an item is the Conn needing a sub PC again: the
 // successor is built with every subscription, the new ones included, and offered at once. If that is one PC too
-// many within a minute (02 §12) the items are applied all the same, and the subscriptions wait for the next request.
+// many within a minute (02 §12) the items are applied all the same, the client gets an ErrorEvent about the sub PC
+// with sfu.pc_rate_limited and the time to wait, and the subscriptions wait for its next request.
 func (c *Conn) UpdateSubscriptions(ctx context.Context, items []SubscriptionUpdate) ([]error, error) {
 	var errs []error
 	err := c.do(ctx, func(context.Context) error {
@@ -291,9 +292,7 @@ func (c *Conn) updateSubscriptions(items []SubscriptionUpdate) ([]error, error) 
 	case s == nil:
 	case s.closed:
 		if applied {
-			if err := c.rebuildClosedSub("a subscription changed", false); err != nil {
-				c.log.Debug("sub PC not rebuilt for a subscription change", "err", err)
-			}
+			c.rebuildClosedSubForEvent("a subscription changed")
 		}
 	case created:
 		c.subChanged()

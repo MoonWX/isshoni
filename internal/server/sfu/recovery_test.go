@@ -115,27 +115,41 @@ func pcOf(t *testing.T, c *sfu.Conn, kind sfu.PCKind) sfu.PCState {
 // waitResumed waits until a video Recorder's stream has started again after its first skip packets: a packet that
 // starts a keyframe, and n whole frames of layer rid from there on. It returns the packets from that keyframe start
 // on, and how many came before it (what was still on its way when the stream broke off).
+//
+// "From there on" is the stream's order, not the order of arrival: a packet that arrives after the keyframe's start
+// with a sequence number before it is no part of the stream that resumed. Those are packets that the outage
+// swallowed, sent again: a publisher whose network is back answers the SFU's NACKs for them, and the SFU forwards a
+// late packet in its own place in the viewer's stream (02 §9.4), where a decoder that starts on the keyframe has no
+// use for it. Whether they come before or after the keyframe is a matter of milliseconds.
 func waitResumed(t *testing.T, ctx context.Context, r *sfutest.Recorder, skip int, rid string, n int,
 ) (resumed []sfutest.Packet, before int) {
 	t.Helper()
-	start := func(pkts []sfutest.Packet) int {
-		return slices.IndexFunc(pkts, func(p sfutest.Packet) bool { return p.KeyStart })
+	since := func(pkts []sfutest.Packet) (resumed []sfutest.Packet, before int) {
+		before = slices.IndexFunc(pkts, func(p sfutest.Packet) bool { return p.KeyStart })
+		if before < 0 {
+			return nil, len(pkts)
+		}
+		first := pkts[before].Seq
+		for _, p := range pkts[before:] {
+			if int16(p.Seq-first) >= 0 {
+				resumed = append(resumed, p)
+			}
+		}
+		return resumed, before
 	}
 	err := r.Wait(ctx, func(r *sfutest.Recorder) bool {
 		pkts := r.Packets()
 		if len(pkts) < skip {
 			return false
 		}
-		i := start(pkts[skip:])
-		return i >= 0 && layerFrames(pkts[skip+i:], rid) >= n
+		resumed, _ := since(pkts[skip:])
+		return len(resumed) > 0 && layerFrames(resumed, rid) >= n
 	})
 	if err != nil {
 		t.Fatalf("the stream didn't start again with a keyframe and %d frames of layer %s: %v (%d packets since)", n, rid,
 			err, len(r.Packets())-skip)
 	}
-	pkts := r.Packets()[skip:]
-	i := start(pkts)
-	return pkts[i:], i
+	return since(r.Packets()[skip:])
 }
 
 // tracksOf counts the Viewer's tracks of a kind in a share's stream: one per PeerConnection that carried it.
@@ -1204,8 +1218,10 @@ func TestGuards(t *testing.T) {
 }
 
 // TestPCRateLimit: the guard on PeerConnection creations (02 §12). A client may make a Conn create 10 PCs of a kind
-// within a minute: pub offers of a new gen, and sub PCs after rebuild requests. One more is sfu.pc_rate_limited,
-// retryable, with the time to wait, and changes nothing. When the oldest has left the window the next one passes.
+// within a minute: pub offers of a new gen, and sub PCs after rebuild requests (the Conn's first sub PC isn't one).
+// One more is sfu.pc_rate_limited, retryable, with the time to wait, and changes nothing: the error of the call, or
+// an ErrorEvent for the requests that have no error to put it in. When the oldest has left the window the next one
+// passes.
 func TestPCRateLimit(t *testing.T) {
 	h := newHarness(t, sfutest.HarnessOptions{})
 	const window = 3 * time.Second
@@ -1250,35 +1266,68 @@ func TestPCRateLimit(t *testing.T) {
 		t.Errorf("the pub PC after a refused gen = %+v, want gen %d kept", st, sfu.MaxPCCreations)
 	}
 
-	// ---- sub: the first PC and nine rebuilds ----
+	// ---- sub: ten rebuilds. The Conn's first sub PC isn't counted: its client can't cause another first one ----
 	viewConn, viewSig := join(t, h, "bob", "c-view", sfu.RoleViewer) // nobody answers: a PC needs no answer to be rebuilt
-	subStarted := time.Now()
 	subscribe(t, viewConn, sfu.SubscriptionUpdate{Share: share, Video: sfu.QualityLow})
 	if _, err := viewSig.WaitOffer(ctx, func(o sfutest.Offer) bool { return o.Gen == 1 }); err != nil {
 		t.Fatal(err)
 	}
-	for gen := uint32(1); gen < sfu.MaxPCCreations; gen++ {
+	const lastGen = sfu.MaxPCCreations + 1
+	subStarted := time.Now()
+	for gen := uint32(1); gen < lastGen; gen++ {
 		if err := viewConn.ResetPC(ctx, sfu.PCSub, gen); err != nil {
 			t.Fatalf("ResetPC of gen %d: %v", gen, err)
 		}
 	}
-	limited("a tenth rebuild", viewConn.ResetPC(ctx, sfu.PCSub, sfu.MaxPCCreations), subStarted)
-	if st := pcOf(t, viewConn, sfu.PCSub); st.Gen != sfu.MaxPCCreations || st.Closed || !st.Offering {
-		t.Errorf("the sub PC after a refused rebuild = %+v, want gen %d as it was", st, sfu.MaxPCCreations)
+	limited("an eleventh rebuild", viewConn.ResetPC(ctx, sfu.PCSub, lastGen), subStarted)
+	if st := pcOf(t, viewConn, sfu.PCSub); st.Gen != lastGen || st.Closed || !st.Offering {
+		t.Errorf("the sub PC after a refused rebuild = %+v, want gen %d as it was", st, lastGen)
 	}
-	// The same for the requests that rebuild a closed PC: the explicit one says so, a subscription change waits.
-	if err := viewConn.ClosePC(ctx, sfu.PCSub, sfu.MaxPCCreations); err != nil {
+	// The same for the requests that rebuild a closed PC. RestartICE returns the error. A subscription change and
+	// Resync have no error to return it in: the client gets an ErrorEvent about its sub PC each time, so that it
+	// knows to ask again, and how long to wait.
+	if err := viewConn.ClosePC(ctx, sfu.PCSub, lastGen); err != nil {
 		t.Fatal(err)
 	}
-	limited("RestartICE of a closed PC", viewConn.RestartICE(ctx, sfu.PCSub, sfu.MaxPCCreations), subStarted)
-	subscribe(t, viewConn, sfu.SubscriptionUpdate{Share: share, Video: sfu.QualityHigh})
-	viewConn.Resync()
-	time.Sleep(4 * 50 * time.Millisecond)
-	if st := pcOf(t, viewConn, sfu.PCSub); st.Gen != sfu.MaxPCCreations || !st.Closed {
-		t.Errorf("the closed sub PC after requests past the limit = %+v, want it still gen %d, closed", st, sfu.MaxPCCreations)
+	limited("RestartICE of a closed PC", viewConn.RestartICE(ctx, sfu.PCSub, lastGen), subStarted)
+	errorEvents := func() (evs []sfu.ErrorEvent) {
+		for _, ev := range viewSig.Events() {
+			if e, ok := ev.(sfu.ErrorEvent); ok {
+				evs = append(evs, e)
+			}
+		}
+		return evs
 	}
-	if n := len(viewSig.Offers()); n != sfu.MaxPCCreations {
-		t.Errorf("%d sub offers, want one per PC: %d", n, sfu.MaxPCCreations)
+	if evs := errorEvents(); len(evs) != 0 {
+		t.Errorf("error events after refusals that the calls returned: %+v", evs)
+	}
+	for i, request := range []struct {
+		what string
+		do   func()
+	}{
+		{"a subscription change", func() { subscribe(t, viewConn, sfu.SubscriptionUpdate{Share: share, Video: sfu.QualityHigh}) }},
+		{"Resync", viewConn.Resync},
+	} {
+		request.do()
+		eventually(t, func() bool { return len(errorEvents()) > i },
+			func() string {
+				return fmt.Sprintf("no error event after %s past the limit: %+v", request.what, viewSig.Events())
+			})
+		evs := errorEvents()
+		if len(evs) != i+1 || evs[i].Scope != sfu.ScopePCSub {
+			t.Fatalf("after %s past the limit the client got %+v, want one more error about its sub PC", request.what, evs)
+		}
+		limited("the error event after "+request.what, evs[i].Err, subStarted)
+	}
+	if subs, err := viewConn.Subscriptions(ctx); err != nil || len(subs) != 1 || subs[0].Video != sfu.QualityHigh {
+		t.Errorf("subscriptions = %+v, %v; want the change applied, though its PC wasn't built", subs, err)
+	}
+	time.Sleep(4 * 50 * time.Millisecond)
+	if st := pcOf(t, viewConn, sfu.PCSub); st.Gen != lastGen || !st.Closed {
+		t.Errorf("the closed sub PC after requests past the limit = %+v, want it still gen %d, closed", st, lastGen)
+	}
+	if n := len(viewSig.Offers()); n != lastGen {
+		t.Errorf("%d sub offers, want one per PC: %d", n, lastGen)
 	}
 
 	// ---- the window moves on ----
@@ -1288,8 +1337,11 @@ func TestPCRateLimit(t *testing.T) {
 	}
 	time.Sleep(time.Until(subStarted.Add(window + 200*time.Millisecond)))
 	subscribe(t, viewConn, sfu.SubscriptionUpdate{Share: share, Video: sfu.QualityLow})
-	if _, err := viewSig.WaitOffer(ctx, func(o sfutest.Offer) bool { return o.Gen == sfu.MaxPCCreations+1 }); err != nil {
+	if _, err := viewSig.WaitOffer(ctx, func(o sfutest.Offer) bool { return o.Gen == lastGen+1 }); err != nil {
 		t.Errorf("the closed sub PC wasn't rebuilt by a subscription change after the window: %v", err)
+	}
+	if evs := errorEvents(); len(evs) != 2 {
+		t.Errorf("error events = %+v, want none for the rebuild after the window", evs)
 	}
 }
 
@@ -1523,15 +1575,28 @@ func TestPubICERestart(t *testing.T) {
 	if st := pcOf(t, pubConn, sfu.PCPub); !st.Exists || st.Gen != 1 || st.Neg != 2 || st.State != "connected" || st.GraceTimer || st.HandshakeTimer {
 		t.Errorf("the pub PC after the ICE restart = %+v, want gen 1, neg 2, connected", st)
 	}
-	tracksAfter, err := pubConn.PubTracks(ctx)
-	if err != nil || len(tracksAfter) != 3 {
-		t.Fatalf("pub tracks after the ICE restart = %+v, %v", tracksAfter, err)
-	}
-	for i, tr := range tracksAfter {
-		if tr.MID != tracksBefore[i].MID || tr.RID != tracksBefore[i].RID || tr.Share != share || tr.Packets <= tracksBefore[i].Packets {
-			t.Errorf("pub track %+v after the ICE restart, was %+v: want the same track, still read", tr, tracksBefore[i])
+	// The share is live again with the first keyframe on `f`: the readers of the other tracks may not have read their
+	// next packet yet, so every track is given a moment to show that it is still read.
+	var (
+		tracksAfter []sfu.PubTrackState
+		tracksErr   error
+	)
+	eventually(t, func() bool {
+		tracksAfter, tracksErr = pubConn.PubTracks(ctx)
+		if tracksErr != nil || len(tracksAfter) != len(tracksBefore) {
+			return false
 		}
-	}
+		for i, tr := range tracksAfter {
+			was := tracksBefore[i]
+			if tr.MID != was.MID || tr.RID != was.RID || tr.Share != share || tr.Packets <= was.Packets {
+				return false
+			}
+		}
+		return true
+	}, func() string {
+		return fmt.Sprintf("pub tracks after the ICE restart = %+v (%v), were %+v: want the same tracks, still read",
+			tracksAfter, tracksErr, tracksBefore)
+	})
 	for _, ev := range pcEvents(pubSig) {
 		if ev.Gen != 1 || ev.Reason != "" || (ev.State != "connected" && ev.State != "disconnected") {
 			t.Errorf("the publisher got %+v", ev)

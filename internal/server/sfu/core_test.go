@@ -956,7 +956,7 @@ func candInit(addr string, port int) webrtc.ICECandidateInit {
 	}
 }
 
-// candState returns the pub candidate buffer of a Conn.
+// candState returns the candidates of a Conn's current PC of a kind.
 func candState(t *testing.T, c *Conn, kind PCKind) (st remoteCandidates) {
 	t.Helper()
 	if err := c.do(testCtx(t), func(context.Context) error {
@@ -969,25 +969,46 @@ func candState(t *testing.T, c *Conn, kind PCKind) (st remoteCandidates) {
 	return st
 }
 
-// sdpWithCandidates returns raw with n more host candidates on 127.0.0.1, ports base, base+1, …, in its first
-// m-section.
-func sdpWithCandidates(t *testing.T, raw string, base, n int) string {
+// aheadState returns the candidates a Conn holds for a pub gen whose offer it hasn't accepted yet.
+func aheadState(t *testing.T, c *Conn) (st remoteCandidates) {
+	t.Helper()
+	if err := c.do(testCtx(t), func(context.Context) error {
+		st = c.pubAhead
+		st.pending = slices.Clone(st.pending)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return st
+}
+
+// sdpWithAttributes returns raw with more candidate attributes in its first m-section.
+func sdpWithAttributes(t *testing.T, raw string, candidates ...string) string {
 	t.Helper()
 	desc, err := parseSDP(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
 	md := desc.MediaDescriptions[0]
-	for i := range n {
-		md.Attributes = append(md.Attributes, sdp.Attribute{
-			Key: "candidate", Value: fmt.Sprintf("%d 1 udp 2130706431 127.0.0.1 %d typ host", 900+i, base+i),
-		})
+	for _, v := range candidates {
+		md.Attributes = append(md.Attributes, sdp.Attribute{Key: "candidate", Value: v})
 	}
 	out, err := desc.Marshal()
 	if err != nil {
 		t.Fatal(err)
 	}
 	return string(out)
+}
+
+// sdpWithCandidates returns raw with n more host candidates on 127.0.0.1, ports base, base+1, …, in its first
+// m-section.
+func sdpWithCandidates(t *testing.T, raw string, base, n int) string {
+	t.Helper()
+	values := make([]string, n)
+	for i := range values {
+		values[i] = fmt.Sprintf("%d 1 udp 2130706431 127.0.0.1 %d typ host", 900+i, base+i)
+	}
+	return sdpWithAttributes(t, raw, values...)
 }
 
 // remoteCandidateCount returns how many remote candidates Pion's ICE agent of pc holds.
@@ -1003,8 +1024,8 @@ func remoteCandidateCount(t *testing.T, pc *webrtc.PeerConnection) int {
 }
 
 // TestAddICECandidate: trickled candidates are filtered (02 §7.3), buffered until their PC has its remote
-// description, capped at 64 addresses per PC and gen together with the candidates of the PC's remote descriptions
-// (02 §12), and ignored for an older gen. An address that was admitted before costs nothing when it comes again.
+// description, capped at 64 per PC and gen together with the candidates of the PC's remote descriptions (02 §12),
+// and ignored for an older gen. A candidate that was admitted before costs nothing when it comes again.
 func TestAddICECandidate(t *testing.T) {
 	s, _ := newTestSFU(t)
 	ctx := testCtx(t)
@@ -1036,8 +1057,8 @@ func TestAddICECandidate(t *testing.T) {
 		t.Errorf("after dropped candidates: %+v, want nothing kept", st)
 	}
 
-	// Candidates that overtake their offer wait for it; the first 64 addresses are kept, and one of them that comes
-	// again neither counts nor waits twice.
+	// Candidates that overtake their offer wait for it, apart from the candidates of a PC the Conn has; the first 64
+	// are kept, and one of them that comes again neither counts nor waits twice.
 	for i := range maxRemoteCandidates + 6 {
 		for range 2 {
 			if err := c.AddICECandidate(ctx, PCPub, 1, candInit("127.0.0.1", 6000+i)); err != nil {
@@ -1045,9 +1066,12 @@ func TestAddICECandidate(t *testing.T) {
 			}
 		}
 	}
-	if st := candState(t, c, PCPub); st.gen != 1 || st.count() != maxRemoteCandidates || len(st.pending) != maxRemoteCandidates {
+	if st := aheadState(t, c); st.gen != 1 || st.count() != maxRemoteCandidates || len(st.pending) != maxRemoteCandidates {
 		t.Errorf("buffered: gen %d, count %d, pending %d; want gen 1 and %d kept", st.gen, st.count(), len(st.pending),
 			maxRemoteCandidates)
+	}
+	if st := candState(t, c, PCPub); st.count() != 0 || len(st.pending) != 0 {
+		t.Errorf("the candidates of a pub PC the Conn doesn't have yet: %+v", st)
 	}
 	// The offer brings its own candidates: the 64 are used up, so they are dropped from it, but one of the 64 that it
 	// repeats stays.
@@ -1062,6 +1086,9 @@ func TestAddICECandidate(t *testing.T) {
 	if st := candState(t, c, PCPub); st.gen != 1 || st.count() != maxRemoteCandidates || len(st.pending) != 0 {
 		t.Errorf("after the offer: %+v, want the buffer flushed and the count kept", st)
 	}
+	if st := aheadState(t, c); st.gen != 0 || st.count() != 0 || len(st.pending) != 0 {
+		t.Errorf("after the offer, the candidates waiting for one: %+v, want none", st)
+	}
 	if n, err := pubRemoteCandidates(t, c); err != nil || n != maxRemoteCandidates {
 		t.Errorf("Pion has %d remote candidates for the pub PC (%v), want the %d trickled ones and none of the offer's %d",
 			n, err, maxRemoteCandidates, own)
@@ -1073,15 +1100,23 @@ func TestAddICECandidate(t *testing.T) {
 		t.Errorf("count = %d after the 65th candidate, want it dropped", st.count())
 	}
 
-	// A candidate of a newer gen starts that gen's buffer; the old gen's candidates are over.
+	// A candidate of a newer gen waits for that gen's offer, and changes nothing for the PC of gen 1: its 64 stay
+	// used up.
 	if err := c.AddICECandidate(ctx, PCPub, 2, candInit("127.0.0.1", 7001)); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.AddICECandidate(ctx, PCPub, 1, candInit("127.0.0.1", 7002)); err != nil {
 		t.Fatal(err)
 	}
-	if st := candState(t, c, PCPub); st.gen != 2 || st.count() != 1 || len(st.pending) != 1 {
+	if st := aheadState(t, c); st.gen != 2 || st.count() != 1 || len(st.pending) != 1 {
 		t.Errorf("after a gen 2 candidate: %+v, want one buffered for gen 2", st)
+	}
+	if st := candState(t, c, PCPub); st.gen != 1 || st.count() != maxRemoteCandidates || len(st.pending) != 0 {
+		t.Errorf("the gen 1 PC's candidates after a gen 2 candidate: %+v, want them as they were", st)
+	}
+	if n, err := pubRemoteCandidates(t, c); err != nil || n != maxRemoteCandidates {
+		t.Errorf("Pion has %d remote candidates for the gen 1 pub PC (%v) after a gen 2 candidate, want %d", n, err,
+			maxRemoteCandidates)
 	}
 
 	// The gen 2 offer: its own candidates count toward gen 2's 64 with the trickled one, and what is past them is
@@ -1097,14 +1132,20 @@ func TestAddICECandidate(t *testing.T) {
 	}
 	_, err := c.HandleOffer(ctx, PCPub, 2, 1, refused.String(), tracks2)
 	wantErr(t, err, CodeBadSDP)
-	if st := candState(t, c, PCPub); st.gen != 2 || st.count() != 1 || len(st.pending) != 1 {
+	if st := aheadState(t, c); st.gen != 2 || st.count() != 1 || len(st.pending) != 1 {
 		t.Errorf("after a refused offer: %+v, want only the trickled candidate counted, and still waiting", st)
+	}
+	if st := candState(t, c, PCPub); st.gen != 1 || st.count() != maxRemoteCandidates {
+		t.Errorf("the gen 1 PC's candidates after a refused gen 2 offer: %+v, want them as they were", st)
 	}
 	if _, err := c.HandleOffer(ctx, PCPub, 2, 1, many, tracks2); err != nil {
 		t.Fatal(err)
 	}
 	if st := candState(t, c, PCPub); st.gen != 2 || st.count() != maxRemoteCandidates || len(st.pending) != 0 {
-		t.Errorf("after the gen 2 offer: %+v, want %d addresses in all", st, maxRemoteCandidates)
+		t.Errorf("after the gen 2 offer: %+v, want %d candidates in all", st, maxRemoteCandidates)
+	}
+	if st := aheadState(t, c); st.gen != 0 || st.count() != 0 || len(st.pending) != 0 {
+		t.Errorf("after the gen 2 offer, the candidates waiting for one: %+v, want none", st)
 	}
 	if n, err := pubRemoteCandidates(t, c); err != nil || n != maxRemoteCandidates {
 		t.Errorf("Pion has %d remote candidates for the gen 2 pub PC (%v), want %d: the trickled one, the offer's own "+
@@ -1114,6 +1155,194 @@ func TestAddICECandidate(t *testing.T) {
 	_, err = c.HandleOffer(ctx, PCPub, 2, 2, many, tracks2)
 	if st := candState(t, c, PCPub); err != nil || st.count() != maxRemoteCandidates {
 		t.Errorf("after a re-offer with the same candidates: %v, count %d", err, st.count())
+	}
+}
+
+// TestRemoteCandidateCapIsPions: the 64 of 02 §12 are candidates as Pion's ICE agent keeps them, not transport
+// addresses. Pion keeps every remote candidate that equals none it has, and candidates on one address that differ
+// in their type or related address are not equal: each is paired and checked, so each costs one of the 64, in a
+// remote description and trickled alike.
+func TestRemoteCandidateCapIsPions(t *testing.T) {
+	s, _ := newTestSFU(t)
+	ctx := testCtx(t)
+	c, _ := join(t, s, "lounge", "alice", "c-a", RoleFull)
+	startShare(t, c, "s_1")
+	_, raw, tracks := pubOfferFrom(t, "s_1")
+	if own := remoteSDPCandidates(t, raw); own == 0 || own >= maxRemoteCandidates {
+		t.Fatalf("the client's offer has %d candidates of its own", own)
+	}
+
+	// 100 candidates in the offer, all on 127.0.0.1:6000, each with a related address of its own.
+	inSDP := make([]string, 100)
+	for i := range inSDP {
+		inSDP[i] = fmt.Sprintf("%d 1 udp 1694498815 127.0.0.1 6000 typ srflx raddr 192.0.2.1 rport %d", 500+i, 20000+i)
+	}
+	if _, err := c.HandleOffer(ctx, PCPub, 1, 1, sdpWithAttributes(t, raw, inSDP...), tracks); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := pubRemoteCandidates(t, c); err != nil || n != maxRemoteCandidates {
+		t.Fatalf("Pion has %d remote candidates after an offer with 100 candidates on one address (%v), want the first %d",
+			n, err, maxRemoteCandidates)
+	}
+	if st := candState(t, c, PCPub); st.count() != maxRemoteCandidates {
+		t.Errorf("%d candidates counted, want %d", st.count(), maxRemoteCandidates)
+	}
+
+	// 100 more, trickled, on the same address again: other types, other related addresses.
+	for i := range 100 {
+		cand := candInit("127.0.0.1", 6000)
+		cand.Candidate = fmt.Sprintf("candidate:%d 1 udp 1 127.0.0.1 6000 typ %s raddr 192.0.2.2 rport %d", 700+i,
+			[]string{"srflx", "prflx", "relay"}[i%3], 30000+i)
+		if err := c.AddICECandidate(ctx, PCPub, 1, cand); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, err := pubRemoteCandidates(t, c); err != nil || n != maxRemoteCandidates {
+		t.Errorf("Pion has %d remote candidates after 100 trickled ones on the same address (%v), want still %d", n, err,
+			maxRemoteCandidates)
+	}
+	// One of the 64 that comes again is taken, trickled or in a re-offer, and costs nothing.
+	again := candInit("127.0.0.1", 6000)
+	again.Candidate = "candidate:" + inSDP[0]
+	if err := c.AddICECandidate(ctx, PCPub, 1, again); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.HandleOffer(ctx, PCPub, 1, 2, sdpWithAttributes(t, raw, inSDP...), tracks); err != nil {
+		t.Fatalf("the re-offer: %v", err)
+	}
+	if n, err := pubRemoteCandidates(t, c); err != nil || n != maxRemoteCandidates {
+		t.Errorf("Pion has %d remote candidates after the same ones came again (%v), want %d", n, err, maxRemoteCandidates)
+	}
+	if st := candState(t, c, PCPub); st.gen != 1 || st.count() != maxRemoteCandidates || len(st.pending) != 0 {
+		t.Errorf("the pub PC's candidates = gen %d, %d counted, %d waiting; want gen 1 and %d", st.gen, st.count(),
+			len(st.pending), maxRemoteCandidates)
+	}
+}
+
+// TestPubCandidatesOfALaterGen: a candidate that names a pub gen above the current one waits for that gen's offer,
+// apart from the candidates of the pub PC the Conn has (01 §9 rule 2: the hub checks no gens, so a client can name
+// any). Whatever gens a client names, the current PC keeps its candidates and its 64, and still takes those trickled
+// for it; the waiting ones go to the PC of their gen, and count toward its 64.
+func TestPubCandidatesOfALaterGen(t *testing.T) {
+	s, _ := newTestSFU(t)
+	ctx := testCtx(t)
+	c, _ := join(t, s, "lounge", "alice", "c-a", RoleFull)
+	startShare(t, c, "s_1")
+	trickle := func(gen uint32, port int) {
+		t.Helper()
+		if err := c.AddICECandidate(ctx, PCPub, gen, candInit("127.0.0.1", port)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inPion := func() int {
+		t.Helper()
+		n, err := pubRemoteCandidates(t, c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	_, raw, tracks := pubOfferFrom(t, "s_1")
+	if _, err := c.HandleOffer(ctx, PCPub, 1, 1, raw, tracks); err != nil {
+		t.Fatal(err)
+	}
+	own := inPion()
+	if st := candState(t, c, PCPub); own == 0 || own != st.count() {
+		t.Fatalf("Pion has %d remote candidates after the first offer, the Conn counted %d", own, st.count())
+	}
+
+	// A stray candidate of gen 5, then one for the PC the Conn has: that one is applied at once.
+	trickle(5, 9000)
+	trickle(1, 6000)
+	if n := inPion(); n != own+1 {
+		t.Errorf("Pion has %d remote candidates, want %d: a gen 1 candidate after one of gen 5 goes to the gen 1 PC", n, own+1)
+	}
+	if st := candState(t, c, PCPub); st.gen != 1 || st.count() != own+1 || len(st.pending) != 0 {
+		t.Errorf("the gen 1 PC's candidates = gen %d, %d counted, %d waiting; want gen 1, %d and 0", st.gen, st.count(),
+			len(st.pending), own+1)
+	}
+	// Gens between the current one and the newest one named are over; the newest keeps its candidates.
+	trickle(3, 9001)
+	trickle(5, 9000)
+	trickle(5, 9002)
+	if st := aheadState(t, c); st.gen != 5 || st.count() != 2 || len(st.pending) != 2 {
+		t.Errorf("waiting for an offer: gen %d, %d counted, %d waiting; want two candidates of gen 5", st.gen, st.count(),
+			len(st.pending))
+	}
+
+	// The current PC's 64 hold, whatever else the client names: each round is a stray candidate of a gen of its own
+	// and a re-offer of gen 1 with 64 candidates Pion hasn't seen.
+	if _, err := c.HandleOffer(ctx, PCPub, 1, 2, sdpWithCandidates(t, raw, 6100, maxRemoteCandidates+10), tracks); err != nil {
+		t.Fatal(err)
+	}
+	if n := inPion(); n != maxRemoteCandidates {
+		t.Fatalf("Pion has %d remote candidates after an offer with more than %d, want %d", n, maxRemoteCandidates,
+			maxRemoteCandidates)
+	}
+	for round := range 3 {
+		trickle(uint32(6+round), 9100+round)
+		neg := uint32(3 + round)
+		if _, err := c.HandleOffer(ctx, PCPub, 1, neg, sdpWithCandidates(t, raw, 7000+100*round, maxRemoteCandidates), tracks); err != nil {
+			t.Fatalf("re-offer neg %d: %v", neg, err)
+		}
+		trickle(1, 7900+round)
+		if n := inPion(); n != maxRemoteCandidates {
+			t.Fatalf("round %d: Pion has %d remote candidates for the gen 1 pub PC, want the first %d and no more", round+1, n,
+				maxRemoteCandidates)
+		}
+		if st := candState(t, c, PCPub); st.gen != 1 || st.count() != maxRemoteCandidates {
+			t.Errorf("round %d: the gen 1 PC's candidates = gen %d, %d counted", round+1, st.gen, st.count())
+		}
+	}
+	if st := aheadState(t, c); st.gen != 8 || st.count() != 1 || len(st.pending) != 1 {
+		t.Errorf("waiting for an offer: gen %d, %d counted, %d waiting; want the one candidate of gen 8", st.gen, st.count(),
+			len(st.pending))
+	}
+
+	// The offer of gen 8 brings a new PC, which takes the candidate that waited for it with the offer's own. One that
+	// waits for a later gen still stays where it is.
+	trickle(8, 9200)
+	_, raw8, tracks8 := pubOfferFrom(t, "s_1")
+	own8 := remoteSDPCandidates(t, raw8)
+	_, err := c.HandleOffer(ctx, PCPub, 7, 1, "v=nonsense", tracks8)
+	wantErr(t, err, CodeBadSDP)
+	if st := aheadState(t, c); st.gen != 8 || st.count() != 2 {
+		t.Errorf("after a refused offer of gen 7: gen %d, %d counted; want the two candidates of gen 8 kept", st.gen, st.count())
+	}
+	if _, err := c.HandleOffer(ctx, PCPub, 8, 1, raw8, tracks8); err != nil {
+		t.Fatal(err)
+	}
+	if st := candState(t, c, PCPub); st.gen != 8 || st.count() < 3 || st.count() > 2+own8 || len(st.pending) != 0 {
+		t.Errorf("the gen 8 PC's candidates = gen %d, %d counted, %d waiting; want the two that waited and the offer's "+
+			"own (%d attributes)", st.gen, st.count(), len(st.pending), own8)
+	}
+	if n, st := inPion(), candState(t, c, PCPub); n != st.count() {
+		t.Errorf("Pion has %d remote candidates for the gen 8 pub PC, the Conn counted %d", n, st.count())
+	}
+	if st := aheadState(t, c); st.gen != 0 || st.count() != 0 || len(st.pending) != 0 {
+		t.Errorf("after the gen 8 offer, the candidates waiting for one: %+v, want none", st)
+	}
+
+	// pc.close ends the wait of the candidates of the gen it names, and of older ones; not of a later gen's.
+	trickle(10, 9300)
+	if err := c.ClosePC(ctx, PCPub, 9); err != nil {
+		t.Fatal(err)
+	}
+	if st := aheadState(t, c); st.gen != 10 || st.count() != 1 {
+		t.Errorf("after ClosePC of gen 9: gen %d, %d counted; want the candidate of gen 10 still waiting", st.gen, st.count())
+	}
+	if st := candState(t, c, PCPub); st.count() != 0 || len(st.pending) != 0 {
+		t.Errorf("the candidates of a pub PC that is closed: %+v, want none", st)
+	}
+	trickle(8, 9301) // its PC has closed
+	if err := c.ClosePC(ctx, PCPub, 10); err != nil {
+		t.Fatal(err)
+	}
+	if st := aheadState(t, c); st.gen != 0 || st.count() != 0 || len(st.pending) != 0 {
+		t.Errorf("after ClosePC of gen 10: %+v, want nothing waiting", st)
+	}
+	if st := candState(t, c, PCPub); st.count() != 0 {
+		t.Errorf("a candidate for a closed pub PC was counted: %+v", st)
 	}
 }
 
@@ -1135,17 +1364,38 @@ func remoteSDPCandidates(t *testing.T, raw string) int {
 	return n
 }
 
-// pubRemoteCandidates returns how many remote candidates Pion holds for the Conn's pub PC.
+// pubRemoteCandidates returns how many remote candidates Pion holds for the Conn's pub PC, once that number has
+// stopped changing: Pion's ICE agent takes each remote candidate in a goroutine of its own, some time after the
+// call that brought it.
 func pubRemoteCandidates(t *testing.T, c *Conn) (n int, err error) {
 	t.Helper()
-	err = c.do(testCtx(t), func(context.Context) error {
-		if c.pub == nil {
-			return errors.New("no pub PC")
+	const settled = 100 * time.Millisecond
+	count := func() (n int, err error) {
+		err = c.do(testCtx(t), func(context.Context) error {
+			if c.pub == nil {
+				return errors.New("no pub PC")
+			}
+			n = remoteCandidateCount(t, c.pub.pc)
+			return nil
+		})
+		return n, err
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	last, since := -1, time.Now()
+	for {
+		if n, err = count(); err != nil {
+			return 0, err
 		}
-		n = remoteCandidateCount(t, c.pub.pc)
-		return nil
-	})
-	return n, err
+		switch {
+		case time.Now().After(deadline):
+			return n, errors.New("the number of remote candidates keeps changing")
+		case n != last:
+			last, since = n, time.Now()
+		case time.Since(since) >= settled:
+			return n, nil
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // TestSubCandidates: candidates the viewer trickles for the sub PC wait for its answer, then go to Pion; those of
@@ -1192,7 +1442,7 @@ func TestSubCandidates(t *testing.T) {
 		t.Fatal(err)
 	}
 	if st := candState(t, viewer, PCSub); st.count() != 6 || len(st.pending) != 0 {
-		t.Errorf("after the answer: %+v, want the waiting candidates applied and the answer's four addresses counted", st)
+		t.Errorf("after the answer: %+v, want the waiting candidates applied and the answer's four candidates counted", st)
 	}
 	if err := viewer.AddICECandidate(ctx, PCSub, 1, candInit("127.0.0.1", 6002)); err != nil {
 		t.Fatal(err)

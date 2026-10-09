@@ -4,7 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"maps"
-	"net/netip"
 	"slices"
 	"strings"
 	"sync"
@@ -55,8 +54,14 @@ type Conn struct {
 	sub    *subPC // nil until the first subscription
 	subGen uint32 // the gen of the newest sub PC; 0 before the first
 	subs   map[ShareID]*Subscription
-	cands  [PCSub + 1]remoteCandidates // by PCKind
-	pcs    [PCSub + 1]pcWindow         // the PeerConnections the client made the Conn create, by PCKind (02 §12)
+	// cands are the remote candidates of the Conn's current PC of each kind, by PCKind: what counts toward that PC's
+	// 64 (02 §12). Nothing but that PC's own gen changes them.
+	cands [PCSub + 1]remoteCandidates
+	// pubAhead holds the candidates the client trickled for a pub gen above pubGen, whose offer hasn't been accepted
+	// yet: the client owns the pub gen, so its candidates can overtake their offer. They are only kept here, apart
+	// from the current pub PC's candidates, and become the new PC's when that gen's offer is accepted.
+	pubAhead remoteCandidates
+	pcs      [PCSub + 1]pcWindow // the PeerConnections the client made the Conn create, by PCKind (02 §12)
 	// writers are the writer goroutines of the Conn's DownTracks. Each ends when its subscription goes
 	// (DownTrack.stop), and at the latest when the Conn closes (stop); teardown waits for all of them.
 	writers sync.WaitGroup
@@ -460,6 +465,7 @@ func (c *Conn) dropPub() {
 		return
 	}
 	c.pub = nil
+	c.cands[PCPub] = remoteCandidates{gen: c.pubGen} // the PC's candidates go with it
 	c.markPubDown()
 	p.close(c.log)
 }
@@ -570,45 +576,40 @@ func (c *Conn) admitPC(kind PCKind) error {
 
 // ---- remote ICE candidates (01 §9 rule 5, 02 §7.3, §12) ----
 
-// candidateAddr is the transport address of a remote candidate: what the server would send its checks to.
-type candidateAddr struct {
-	tcp  bool
-	addr netip.AddrPort
-}
-
-// remoteCandidates are the client's candidates for one PC kind: those of the newest gen seen. The first 64 transport
-// addresses that pass the remote-candidate filter are admitted, whether they are trickled or come in an SDP, and
-// whether Pion has them already or they are still buffered; the others are dropped. A candidate that names an
-// address admitted before costs nothing, so the candidates a client repeats in every re-offer, or after an ICE
-// restart, don't use the 64 up. Trickled candidates are buffered until that gen's PC has its remote description.
+// remoteCandidates are the client's candidates for the PC of one kind and gen. The first 64 that pass the
+// remote-candidate filter are admitted, whether they are trickled or come in an SDP, and whether Pion has them
+// already or they are still buffered; the others are dropped. What counts as one candidate is what Pion keeps as one
+// (candidateKey): Pion has no cap of its own, so every candidate that goes to it is counted here. A candidate that
+// was admitted before costs nothing when it comes again, so the candidates a client repeats in every re-offer, or
+// after an ICE restart, don't use the 64 up. Trickled candidates are buffered until that gen's PC has its remote
+// description.
 type remoteCandidates struct {
 	gen     uint32
-	seen    map[candidateAddr]struct{}
+	seen    map[candidateKey]struct{}
 	pending []webrtc.ICECandidateInit
 }
 
-// count returns how many addresses have been admitted.
+// count returns how many candidates have been admitted.
 func (r *remoteCandidates) count() int { return len(r.seen) }
 
-// admit reports whether a candidate with address a may go to Pion: one of the first 64 addresses, or one admitted
-// before.
-func (r *remoteCandidates) admit(a candidateAddr) bool {
-	ok, _ := r.admitNew(a)
+// admit reports whether the candidate with key k may go to Pion: one of the first 64, or one admitted before.
+func (r *remoteCandidates) admit(k candidateKey) bool {
+	ok, _ := r.admitNew(k)
 	return ok
 }
 
-// admitNew is admit that also says whether the address is new, which costs one of the 64.
-func (r *remoteCandidates) admitNew(a candidateAddr) (ok, fresh bool) {
-	if _, seen := r.seen[a]; seen {
+// admitNew is admit that also says whether the candidate is new, which costs one of the 64.
+func (r *remoteCandidates) admitNew(k candidateKey) (ok, fresh bool) {
+	if _, seen := r.seen[k]; seen {
 		return true, false
 	}
 	if len(r.seen) >= maxRemoteCandidates {
 		return false, false
 	}
 	if r.seen == nil {
-		r.seen = map[candidateAddr]struct{}{}
+		r.seen = map[candidateKey]struct{}{}
 	}
-	r.seen[a] = struct{}{}
+	r.seen[k] = struct{}{}
 	return true, true
 }
 
@@ -625,8 +626,8 @@ func (r *remoteCandidates) forGen(gen uint32) remoteCandidates {
 
 // AddICECandidate adds a candidate the client trickled for the PC of a kind and gen. Candidates the remote-candidate
 // filter drops (02 §7.3), those of an older gen, the end-of-candidates marker and everything past the first 64
-// addresses per PC and gen are ignored without an error. A candidate that arrives before its PC's remote description
-// is buffered.
+// candidates per PC and gen are ignored without an error. A candidate that arrives before its PC's remote
+// description is buffered.
 func (c *Conn) AddICECandidate(ctx context.Context, pc PCKind, gen uint32, cand webrtc.ICECandidateInit) error {
 	return c.do(ctx, func(context.Context) error { return c.addICECandidate(pc, gen, cand) })
 }
@@ -638,33 +639,44 @@ func (c *Conn) addICECandidate(kind PCKind, gen uint32, cand webrtc.ICECandidate
 	if strings.TrimPrefix(cand.Candidate, "candidate:") == "" {
 		return nil // end-of-candidates: the SFU needs no marker
 	}
-	addr, reason := c.sfu.apis.filter.judgeTrickled(cand)
+	key, reason := c.sfu.apis.filter.judgeTrickled(cand)
 	if reason != keepCandidate {
 		c.log.Debug("remote candidate dropped", "pc", kind.String(), "reason", string(reason))
 		return nil
 	}
-	buf := &c.cands[kind]
-	var target *webrtc.PeerConnection
+	var (
+		buf    *remoteCandidates
+		target *webrtc.PeerConnection // nil: the candidate waits for its gen's offer
+	)
 	switch kind {
 	case PCPub:
-		// The client owns the pub gen, so a candidate may name a gen whose offer hasn't arrived yet: it starts that
-		// gen's buffer, and older gens are over.
-		if gen == 0 || gen < c.pubGen || gen < buf.gen || (gen == c.pubGen && c.pub == nil) {
-			return nil // an older gen, or one whose PC has closed
-		}
-		if gen > buf.gen {
-			*buf = remoteCandidates{gen: gen}
-		}
-		if c.pub != nil && c.pub.gen == gen {
-			target = c.pub.pc
+		switch {
+		case gen == 0 || gen < c.pubGen:
+			return nil // an older gen
+		case gen == c.pubGen:
+			if c.pub == nil {
+				return nil // its PC has closed
+			}
+			buf, target = &c.cands[PCPub], c.pub.pc
+		default:
+			// The client owns the pub gen, so a candidate may name a gen whose offer hasn't arrived yet. It waits in
+			// a buffer of its own: whatever gens a client names, the candidates of the pub PC it has stay that PC's,
+			// and count toward its 64. The buffer is the newest such gen's; older ones are over.
+			if gen < c.pubAhead.gen {
+				return nil
+			}
+			if gen > c.pubAhead.gen {
+				c.pubAhead = remoteCandidates{gen: gen}
+			}
+			buf = &c.pubAhead
 		}
 	case PCSub:
 		if c.sub == nil || gen != c.sub.gen || c.sub.closed {
 			return nil
 		}
-		target = c.sub.pc
+		buf, target = &c.cands[PCSub], c.sub.pc
 	}
-	ok, fresh := buf.admitNew(addr)
+	ok, fresh := buf.admitNew(key)
 	if !ok {
 		c.log.Debug("remote candidate dropped", "pc", kind.String(), "reason", "limit")
 		return nil
@@ -681,11 +693,16 @@ func (c *Conn) addICECandidate(kind PCKind, gen uint32, cand webrtc.ICECandidate
 }
 
 // commitCandidates makes budget, the candidates admitted with a remote description that Pion has just taken, the
-// Conn's candidates of that PC, and gives Pion the trickled ones that waited for the description.
+// candidates of pc, the Conn's current PC of the kind, and gives Pion the trickled ones that waited for the
+// description. A pub PC of a new gen takes over what was trickled ahead of its offer: that buffer, and one of a gen
+// the client has passed by, are done with.
 func (c *Conn) commitCandidates(kind PCKind, budget remoteCandidates, pc *webrtc.PeerConnection) {
 	pending := budget.pending
 	budget.pending = nil
 	c.cands[kind] = budget
+	if kind == PCPub && c.pubAhead.gen <= budget.gen {
+		c.pubAhead = remoteCandidates{}
+	}
 	for _, cand := range pending {
 		c.applyCandidate(kind, pc, cand)
 	}
@@ -720,7 +737,7 @@ func (c *Conn) restartICE(kind PCKind, gen uint32) error {
 		return err
 	}
 	if s.closed {
-		return c.rebuildClosedSub("an ICE restart was asked of a closed PC", true)
+		return c.rebuildClosedSub("an ICE restart was asked of a closed PC")
 	}
 	c.restartSubICE(s, "the client asked")
 	return nil
@@ -792,10 +809,12 @@ func (c *Conn) closePC(kind PCKind, gen uint32) error {
 		}
 		if c.pub != nil {
 			c.log.Info("pub PC closed by the client", "gen", c.pub.gen)
-			c.dropPub()
+			c.dropPub() // with its candidates
 		}
 		// The candidates that waited for an offer of a gen that is now closed wait for nothing.
-		c.cands[PCPub] = remoteCandidates{gen: c.pubGen}
+		if c.pubAhead.gen <= gen {
+			c.pubAhead = remoteCandidates{}
+		}
 		return nil
 	case PCSub:
 		s := c.sub
@@ -818,7 +837,9 @@ func (c *Conn) closePC(kind PCKind, gen uint32) error {
 //
 //   - A sub offer that is still outstanding goes out again, with the same gen and neg.
 //   - A sub PC that isn't connected gets an ICE restart, unless one is under way (RestartICE); one that has closed
-//     is rebuilt, if the Conn has subscriptions.
+//     is rebuilt, if the Conn has subscriptions. A rebuild that is one PC too many within a minute (02 §12) is
+//     reported as an ErrorEvent about the sub PC, with sfu.pc_rate_limited and the time to wait: Resync has no
+//     error to return, and the client has to ask again.
 //   - Every subscription's current SubscriptionStateEvent.
 //   - One CodecPolicyEvent per share the Conn publishes, with the room's codec policy: a client re-offers only when
 //     that differs from the profile it last applied (05).
@@ -833,9 +854,7 @@ func (c *Conn) resync() {
 	switch s := c.sub; {
 	case s == nil:
 	case s.closed:
-		if err := c.rebuildClosedSub("the connection resumed", false); err != nil {
-			c.log.Debug("sub PC not rebuilt on resume", "err", err)
-		}
+		c.rebuildClosedSubForEvent("the connection resumed")
 	default:
 		if s.offering {
 			c.sendSubOffer(s)

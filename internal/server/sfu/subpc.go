@@ -2,6 +2,7 @@ package sfu
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"maps"
 	"slices"
@@ -89,13 +90,12 @@ type subOffer struct {
 }
 
 // ensureSubPC returns the Conn's sub PC, creating the first one (gen 1) when a subscription needs it. It may be a
-// closed one: its successor is rebuildSub's.
+// closed one: its successor is rebuildSub's. The first sub PC isn't counted toward the limit on PC creations
+// (02 §12): a Conn gets one, whatever its client does, and the limit is on the rebuilds that follow.
 func (c *Conn) ensureSubPC() (*subPC, error) {
 	if c.sub != nil {
 		return c.sub, nil
 	}
-	// The Conn's first sub PC is one of the PCs its client caused, and never one too many (02 §12).
-	c.pcs[PCSub].admit(monoNow(), c.sfu.timing.pcWindow)
 	return c.newSubPC()
 }
 
@@ -157,19 +157,34 @@ func (c *Conn) rebuildSub(cause string) error {
 // rebuildClosedSub builds the successor of the Conn's closed sub PC when the Conn has subscriptions for it to carry
 // (02 §5.3, the closed row), and does nothing when it has none. Every such PC counts as one the client caused
 // (02 §12): it follows a PC that the client closed or made the SFU close, at the client's next request. One too many
-// in a minute isn't built, and the subscriptions wait for the next request; the error says so (sfu.pc_rate_limited),
-// for the callers that have a client to tell.
-func (c *Conn) rebuildClosedSub(cause string, explicit bool) error {
+// in a minute isn't built, and the subscriptions wait for the next request; the error says so (sfu.pc_rate_limited,
+// with the time to wait). A caller that has no call to return it from tells the client with rebuildClosedSubForEvent.
+func (c *Conn) rebuildClosedSub(cause string) error {
 	if len(c.subs) == 0 {
 		return nil
 	}
 	if err := c.admitPC(PCSub); err != nil {
-		if !explicit {
-			c.log.Debug("closed sub PC not rebuilt yet", "cause", cause)
-		}
 		return err
 	}
 	return c.rebuildSub(cause)
+}
+
+// rebuildClosedSubForEvent is rebuildClosedSub for a request whose call has no error to return it in: Resync, and a
+// subscription change, whose items are applied whether or not the PC that carries them can be built now. A rebuild
+// that fails is reported as an ErrorEvent about the sub PC instead. For one PC too many within a minute that is
+// sfu.pc_rate_limited with its RetryAfter (01's rate_limited): nothing builds the PC when the minute has passed, so
+// the client has to ask again, and this is how it knows. A sub PC that couldn't be made is sfu.internal, retryable
+// the same way. (An offer that fails on the new PC reports itself, in offerSub.)
+func (c *Conn) rebuildClosedSubForEvent(cause string) {
+	err := c.rebuildClosedSub(cause)
+	if err == nil {
+		return
+	}
+	c.log.Debug("closed sub PC not rebuilt", "cause", cause, "err", err)
+	var e *Error
+	if errors.As(err, &e) {
+		c.sig.SendEvent(ErrorEvent{Err: e, Scope: ScopePCSub})
+	}
 }
 
 // addTrack puts dt on the sub PC: on the free transceiver of an ended share when there is one of its kind
