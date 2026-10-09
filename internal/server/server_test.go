@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -41,9 +42,8 @@ const (
 	forwardedFor = "203.0.113.9"
 
 	// checksOK is the "checks" object of /readyz on a ready off-mode server, as loopback clients see it: the
-	// database, the hub, and the certificate, which is the proxy's in off mode (04 §6.2). The media check joins them
-	// with the SFU.
-	checksOK = `"checks":{"db":"ok","signal":"ok","tls":"ok"}`
+	// database, the SFU on its sockets, the hub, and the certificate, which is the proxy's in off mode (04 §6.2).
+	checksOK = `"checks":{"db":"ok","media":"ok","signal":"ok","tls":"ok"}`
 )
 
 // testArgon is a password hash that costs next to nothing (64 KiB, one pass) in place of the real one, which takes a
@@ -265,22 +265,23 @@ func TestHealthEndpoints(t *testing.T) {
 	})
 
 	t.Run("not ready", func(t *testing.T) {
+		// One more check, of a part that is not up yet: the server's own all pass.
 		var mu sync.Mutex
-		mediaUp := false
-		srv.Srv.Health().AddCheck("media", func() (bool, string) {
+		partUp := false
+		srv.Srv.Health().AddCheck("part", func() (bool, string) {
 			mu.Lock()
 			defer mu.Unlock()
-			return mediaUp, "waiting: no UDP socket is bound"
+			return partUp, "waiting: not there yet"
 		})
 		wantJSON(t, "public /readyz", get(t, srv, "/readyz", "X-Forwarded-For", forwardedFor), 503,
 			`{"status":"not_ready"}`+"\n")
 		wantJSON(t, "loopback /readyz", get(t, srv, "/readyz"), 503,
-			`{"status":"not_ready","checks":{"db":"ok","media":"waiting: no UDP socket is bound","signal":"ok","tls":"ok"}}`+"\n")
+			`{"status":"not_ready","checks":{"db":"ok","media":"ok","part":"waiting: not there yet","signal":"ok","tls":"ok"}}`+"\n")
 		// Liveness doesn't depend on the checks.
 		wantJSON(t, "/healthz", get(t, srv, "/healthz"), 200, `{"status":"ok"}`+"\n")
 
 		mu.Lock()
-		mediaUp = true
+		partUp = true
 		mu.Unlock()
 		wantJSON(t, "/readyz", get(t, srv, "/readyz", "X-Forwarded-For", forwardedFor), 200, `{"status":"ready"}`+"\n")
 	})
@@ -1279,10 +1280,13 @@ func TestConfigWarningsAreLogged(t *testing.T) {
 	}
 }
 
-// TestReadyLine: one line says which version serves which site (04 §6.1 step 10).
+// TestReadyLine: one line says which version serves which site, and on which ports media comes in (04 §6.1 step
+// 10).
 func TestReadyLine(t *testing.T) {
 	srv := servertest.Start(t, servertest.Options{})
-	want := "isshoni " + version.Version() + " ready: " + srv.URL + " (tls=off)"
+	addrs := srv.Srv.Addrs()
+	want := fmt.Sprintf("isshoni %s ready: %s (tls=off) media udp/%d ice-tcp %d", version.Version(), srv.URL,
+		addrs.ICEUDP.(*net.UDPAddr).Port, addrs.ICETCP.(*net.TCPAddr).Port)
 	var found bool
 	for _, rec := range logRecords(t, srv.Logs()) {
 		if rec["msg"] == want {
@@ -1430,8 +1434,9 @@ func TestDataDirectory(t *testing.T) {
 	}
 }
 
-// testConfig builds an off-mode config on an ephemeral loopback port from flags alone, for the tests that drive
-// server.New themselves. Later flags win.
+// testConfig builds an off-mode config on ephemeral loopback ports from flags alone, for the tests that drive
+// server.New themselves. Media is on loopback too, as in servertest, and no STUN server is asked for the machine's
+// address. Later flags win.
 func testConfig(t *testing.T, flags ...string) *config.Config {
 	t.Helper()
 	sockDir, err := os.MkdirTemp("", "isshoni")
@@ -1442,6 +1447,10 @@ func testConfig(t *testing.T, flags ...string) *config.Config {
 	args := append([]string{
 		"--tls.mode=off",
 		"--listen.http=127.0.0.1:0",
+		"--listen.ice-udp=127.0.0.1:0",
+		"--listen.ice-tcp=127.0.0.1:0",
+		"--network.include-loopback=true",
+		"--network.stun-servers=",
 		"--listen.admin-socket=" + filepath.Join(sockDir, "admin.sock"),
 		"--data-dir=" + filepath.Join(t.TempDir(), "data"),
 	}, flags...)

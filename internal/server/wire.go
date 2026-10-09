@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/netip"
 	"strconv"
@@ -17,31 +18,33 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/auth"
 	"github.com/MoonWX/isshoni/internal/server/config"
 	"github.com/MoonWX/isshoni/internal/server/httpapi"
+	"github.com/MoonWX/isshoni/internal/server/netx"
 	"github.com/MoonWX/isshoni/internal/server/ops"
+	"github.com/MoonWX/isshoni/internal/server/sfu"
+	"github.com/MoonWX/isshoni/internal/server/sfuplane"
 	"github.com/MoonWX/isshoni/internal/server/signal"
 	"github.com/MoonWX/isshoni/internal/server/store"
 	"github.com/MoonWX/isshoni/internal/version"
 )
 
-// This file is the wiring of 04 §6.6: it builds 03's store, account service and REST API, 01's hub and the admin
-// socket's server on top of what Start has opened, and it holds every adapter between them. Each adapter is a few
-// lines over a small interface of what it calls, so it has a table test with a fake behind it (wire_test.go).
+// This file is the wiring of 04 §6.6: it builds 03's store, account service and REST API, 01's hub, 02's SFU behind
+// 01's sfuplane and the admin socket's server on top of what Start has opened, and it holds every adapter between
+// them. Each adapter is a few lines over a small interface of what it calls, so it has a table test with a fake
+// behind it (wire_test.go).
 //
 // What the later slices of the M1 plan add here:
-//   - README S59: the SFU on netx's Transport (transportOptions, public.go) with 01's sfuplane in place of noMedia,
-//     the readiness check "media", SettingsCache.OnChange → SFU.SetLimits, and the SFU and the Transport in the
-//     shutdown's step 4;
 //   - README S71: push.New before auth.New, the push service as signal.Deps.Push, auth.Options.Alerts and
 //     httpapi.Deps.Push;
-//   - README S80 and S85: ops.Metrics as the router's Observer and the hub's Registerer, and the REST routes of ops
-//     through API.Handle.
+//   - README S80 and S85: ops.Metrics as the router's Observer and the hub's Registerer, a collector over the SFU's
+//     Metrics, the transfer counter on the Transport and the multiplexer, and the REST routes of ops through
+//     API.Handle.
 
 // The adapters and what they adapt: each consumer interface of 04 §6.6 on the left, and on the right the part of
 // 01's hub and 03's service that an adapter calls.
 var (
 	_ signal.Authenticator = (*authenticator)(nil)
 	_ signal.RoomDirectory = roomDirectory{}
-	_ signal.MediaPlane    = noMedia{}
+	_ signal.MediaPlane    = (*sfuplane.Plane)(nil)
 	_ auth.ConnCloser      = (*connCloser)(nil)
 	_ httpapi.Signal       = signalAdapter{}
 	_ httpapi.InfoSource   = buildInfo{}
@@ -189,21 +192,28 @@ const (
 	setupCheckTimeout = 2 * time.Second
 )
 
-// wire is step 8 of the startup sequence (04 §6.1) for 01's and 03's parts: the account service, whose key
-// fingerprint check purges what a rotated key protected before any listener serves (03 §4.6), then the hub and the
-// REST API with the adapters of 04 §6.6 between them, the readiness checks "db" and "signal" (04 §6.2), and the
-// admin socket's server. It opens and starts nothing; Start serves what it builds.
+// wire is step 8 of the startup sequence (04 §6.1) for 01's, 02's and 03's parts: the SFU on the Transport with
+// 01's sfuplane in front of it, the account service, whose key fingerprint check purges what a rotated key
+// protected before any listener serves (03 §4.6), then the hub and the REST API with the adapters of 04 §6.6
+// between them, the readiness checks "db", "media" and "signal" (04 §6.2), and the admin socket's server. It opens
+// and starts nothing; Start serves what it builds.
 //
 // A server without a site (ip mode before a public address is known, 04 §7.4) has no accounts, no API and no hub:
 // each needs the public origin, and the router answers 421 to every request but the health endpoints anyway. Its
-// admin socket still answers health, ready and status, so the operator sees the failing check "public_ip".
+// admin socket still answers health, ready and status, so the operator sees the failing check "public_ip". It has
+// its SFU all the same, on the ports it has bound: nothing joins it, and the check "media" and the status say what
+// the next start will serve media on.
 func (s *Server) wire(ctx context.Context) error {
 	// The wall clock, not Deps.Now: how old an answer is has nothing to do with what time the accounts think it is.
 	s.health.AddCheck("db", newDBCheck(s.run, s.store.Ping, time.Now).ready)
 
+	plane, err := s.wireMedia()
+	if err != nil {
+		return err
+	}
 	var accounts ops.AdminAccounts
 	if s.site.Origin != "" {
-		if err := s.wireAccounts(ctx); err != nil {
+		if err := s.wireAccounts(ctx, plane); err != nil {
 			return err
 		}
 		accounts = &adminAccounts{auth: s.accounts, users: userLister(s.store)}
@@ -221,8 +231,101 @@ func (s *Server) wire(ctx context.Context) error {
 	return nil
 }
 
-// wireAccounts builds the account service, the hub and the REST API for the site.
-func (s *Server) wireAccounts(ctx context.Context) error {
+// wireMedia builds 02's SFU on the Transport that step 6 has bound, and 01's sfuplane as the hub's MediaPlane in
+// front of it (04 §6.6, 01 §15.4). The SFU needs the plane's RoomEvents when it is built and the plane needs the
+// SFU, hence the three steps. The SFU starts with the admin's limit from 03's settings, which already hold the
+// policy pins, and hears of every later change; the readiness check "media" is registered here.
+func (s *Server) wireMedia() (signal.MediaPlane, error) {
+	plane, events := sfuplane.New(slog.New(notImplementedAsDebug{s.log.Handler()}))
+	settings := s.store.Settings()
+	media, err := sfu.New(sfu.Config{
+		Transport:            s.transport,
+		PauseUnwatchedLayers: s.cfg.SFU.PauseUnwatchedLayers,
+		Limits:               sfuLimits(settings.Get()),
+	}, sfu.Deps{Events: events, Logger: s.log})
+	if err != nil {
+		return nil, fmt.Errorf("server: %w", err)
+	}
+	plane.Bind(media)
+	s.media = media
+	s.stopLimits = settings.OnChange(func(_, next store.Settings) { media.SetLimits(sfuLimits(next)) })
+	s.health.AddCheck("media", mediaCheck(s.cfg.Listen.ICEUDP != "", s.transport, media.Ready))
+	return plane, nil
+}
+
+// sfuLimits are the SFU's soft limits of 03's settings (04 §6.6): maxShareBitrateKbps caps every share, and 0
+// means no cap in both places. The hub reads the same setting for its own Policy (policyOf).
+func sfuLimits(s store.Settings) sfu.Limits {
+	return sfu.Limits{MaxShareKbps: s.MaxShareBitrateKbps}
+}
+
+// mediaCheck is the readiness check "media" (04 §6.2): the server has a way in for media, at least one UDP socket,
+// or an ICE-TCP mux when the operator turned UDP off, and the SFU takes connections. udp says whether
+// listen.ice_udp is set.
+func mediaCheck(udp bool, tr *netx.Transport, sfuReady func() error) func() (ok bool, detail string) {
+	return func() (bool, string) {
+		switch {
+		case udp && (tr.UDPMux == nil || len(tr.UDPMux.GetListenAddresses()) == 0):
+			return false, "no UDP socket is bound for media (listen.ice_udp)"
+		case !udp && tr.TCPMux == nil:
+			return false, "UDP is off (listen.ice_udp) and no ICE-TCP listener is up"
+		}
+		if err := sfuReady(); err != nil {
+			return false, "the media server is closed"
+		}
+		return true, ""
+	}
+}
+
+// notImplementedAsDebug is the log handler of 01's sfuplane in this server. The SFU declares its whole API from
+// its first slice on (README "Interfaces first"), and a method that a later slice fills in answers with an error
+// that wraps sfu.ErrNotImplemented. sfuplane logs every SFU error it has no wire code for at error level, as the
+// bug it would otherwise be (01 §15.4), and a client reaches such a method with an everyday message: pc.close and
+// pc.restart until README S57, caps.update until S69. So a record about that error is passed on at debug level: the
+// client still gets its error{internal} with the ref, and a real server's log stays free of an "error" per message
+// for what is only not built yet. It goes away with sfu.ErrNotImplemented.
+type notImplementedAsDebug struct{ next slog.Handler }
+
+// Enabled implements slog.Handler.
+func (h notImplementedAsDebug) Enabled(ctx context.Context, l slog.Level) bool {
+	return h.next.Enabled(ctx, l)
+}
+
+// Handle implements slog.Handler.
+func (h notImplementedAsDebug) Handle(ctx context.Context, r slog.Record) error {
+	if r.Level > slog.LevelDebug && aboutNotImplemented(r) {
+		if !h.next.Enabled(ctx, slog.LevelDebug) {
+			return nil
+		}
+		r = r.Clone()
+		r.Level = slog.LevelDebug
+	}
+	return h.next.Handle(ctx, r)
+}
+
+// WithAttrs implements slog.Handler.
+func (h notImplementedAsDebug) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return notImplementedAsDebug{h.next.WithAttrs(attrs)}
+}
+
+// WithGroup implements slog.Handler.
+func (h notImplementedAsDebug) WithGroup(name string) slog.Handler {
+	return notImplementedAsDebug{h.next.WithGroup(name)}
+}
+
+// aboutNotImplemented reports whether a record carries an error that wraps sfu.ErrNotImplemented.
+func aboutNotImplemented(r slog.Record) bool {
+	found := false
+	r.Attrs(func(a slog.Attr) bool {
+		err, ok := a.Value.Any().(error)
+		found = ok && errors.Is(err, sfu.ErrNotImplemented)
+		return !found
+	})
+	return found
+}
+
+// wireAccounts builds the account service, the hub and the REST API for the site. media is the hub's MediaPlane.
+func (s *Server) wireAccounts(ctx context.Context, media signal.MediaPlane) error {
 	origin := s.site.Origin
 
 	// auth comes before the hub (04 §6.1 step 8), and each needs the other: the hub authenticates through auth, and
@@ -254,7 +357,7 @@ func (s *Server) wireAccounts(ctx context.Context) error {
 	hub, err := signal.New(hubCfg, signal.Deps{
 		Auth:     &authenticator{sessions: accounts, user: userReader(s.store)},
 		Rooms:    roomDirectory{db: s.store},
-		Media:    s.mediaPlane(),
+		Media:    media,
 		Policy:   func() signal.Policy { return policyOf(settings.Get()) },
 		ClientIP: httpapi.ClientIP,
 		Log:      s.log,
@@ -286,10 +389,6 @@ func (s *Server) wireAccounts(ctx context.Context) error {
 	})
 	return nil
 }
-
-// mediaPlane returns the hub's MediaPlane. README S59 builds the SFU here (sfu.New on the Transport, with
-// sfuplane.New's RoomEvents, then Plane.Bind) and returns the plane; until then the server has no media.
-func (s *Server) mediaPlane() signal.MediaPlane { return noMedia{} }
 
 // spaStatus is the router's SPAStatus hook (03 §12.6, 04 §9.5): the web app's /setup answers 404 once setup is
 // done, that is once an admin account exists (auth.SetupAvailable). Every other path is 200.
@@ -717,10 +816,10 @@ func userLister(db *store.DB) func(context.Context) ([]store.UserRow, error) {
 // ---- the admin socket's GET /v1/status ----
 
 // statusSource returns the function behind the admin socket's GET /v1/status (04 §12.2, `isshoni admin status`):
-// what the running process knows about itself. The site, the listeners and the public addresses are fixed once
-// Start has bound everything, so the function keeps its own copies; the certificate, the live counts and the uptime
-// are read at each call. The media parts (the advertised addresses, the socket buffers) come with the SFU (README
-// S59), transfer and the release check with the ops data (README S85).
+// what the running process knows about itself. The site, the listeners, the public addresses and what the ICE
+// Transport advertises are fixed once Start has bound everything, so the function keeps its own copies; the
+// certificate, the live counts and the uptime are read at each call. Transfer and the release check come with the
+// ops data (README S85).
 func (s *Server) statusSource() func(context.Context) (api.ServerStatus, error) {
 	started := s.now()
 	base := api.ServerStatus{
@@ -728,9 +827,13 @@ func (s *Server) statusSource() func(context.Context) (api.ServerStatus, error) 
 		StartedAt:     started,
 		Origin:        s.site.Origin,
 		NAT:           s.public.NAT,
-		Advertised:    []api.AdvertisedAddr{},
+		Advertised:    advertisedAddrs(s.transport.Advertised),
 		Listeners:     s.listeners(),
 		SchemaVersion: s.store.SchemaVersion(),
+	}
+	if s.transport.UDPMux != nil {
+		// The effective buffers of the media sockets, which doctor compares with network.udp_buffer_bytes.
+		base.UDPRcvBufBytes, base.UDPSndBufBytes = s.transport.RcvBuf, s.transport.SndBuf
 	}
 	if s.public.V4.IsValid() {
 		base.PublicIPv4, base.PublicIPv4Method = s.public.V4.String(), string(s.public.V4Method)
@@ -768,7 +871,8 @@ func (s *Server) statusSource() func(context.Context) (api.ServerStatus, error) 
 	}
 }
 
-// listeners lists what the server has bound, by config key (api.ListenerInfo).
+// listeners lists what the server has bound, by config key (api.ListenerInfo). listen.ice_udp has one entry per
+// socket: the Transport binds one on every local address that carries media (04 §7.3).
 func (s *Server) listeners() []api.ListenerInfo {
 	var out []api.ListenerInfo
 	if s.addrs.HTTPS != nil {
@@ -777,78 +881,27 @@ func (s *Server) listeners() []api.ListenerInfo {
 	if s.addrs.HTTP != nil {
 		out = append(out, api.ListenerInfo{Key: "listen.http", Network: "tcp", Addr: s.addrs.HTTP.String()})
 	}
+	if s.transport != nil && s.transport.UDPMux != nil {
+		for _, a := range s.transport.UDPMux.GetListenAddresses() {
+			out = append(out, api.ListenerInfo{Key: "listen.ice_udp", Network: "udp", Addr: a.String()})
+		}
+	}
+	if s.addrs.ICETCP != nil {
+		out = append(out, api.ListenerInfo{Key: "listen.ice_tcp", Network: "tcp", Addr: s.addrs.ICETCP.String()})
+	}
 	if s.adminLn != nil {
 		out = append(out, api.ListenerInfo{Key: "listen.admin_socket", Network: "unix", Addr: s.cfg.Listen.AdminSocket})
 	}
 	return out
 }
 
-// ---- the media plane before the SFU ----
-
-// noMedia is the hub's MediaPlane until the SFU runs in the server (README S59; 04 slice W1 wires the hub with a
-// media plane that is not the real one). Signaling is complete with it: connections join rooms, see each other and
-// resume. What needs media is refused: share.start and the pc.* messages get error{feature_disabled}, and a
-// subscription finds no share. It keeps no state, so nothing grows however long the server runs.
-type noMedia struct{}
-
-// NewPeer implements signal.MediaPlane.
-func (noMedia) NewPeer(signal.PeerParams, signal.MediaSink) (signal.MediaPeer, error) {
-	return noMediaPeer{}, nil
-}
-
-// noMediaPeer is the media side of a connection on a server without media.
-type noMediaPeer struct{}
-
-// errNoMedia is the answer to a request that needs the SFU.
-func errNoMedia() error {
-	e := protocol.NewError(protocol.ErrorCodeFeatureDisabled, protocol.ErrorScopeRequest)
-	return &e
-}
-
-// errNoMediaPC is the answer to a pc.* message: scope pc with the message's pc, gen and neg (01 §15.4).
-func errNoMediaPC(pc protocol.PCKind, gen, neg uint32) error {
-	e := protocol.NewError(protocol.ErrorCodeFeatureDisabled, protocol.ErrorScopePC)
-	e.PC, e.Gen, e.Neg = pc, gen, neg
-	return &e
-}
-
-func (noMediaPeer) CreateShare(string, protocol.ShareStart) (protocol.ShareParams, error) {
-	return protocol.ShareParams{}, errNoMedia()
-}
-
-func (noMediaPeer) UpdateShare(string, protocol.ShareUpdate) (protocol.ShareParams, error) {
-	return protocol.ShareParams{}, errNoMedia()
-}
-
-func (noMediaPeer) EndShare(string, protocol.EndReason) {}
-
-func (noMediaPeer) HandleOffer(o protocol.PCOffer) (protocol.PCAnswer, error) {
-	return protocol.PCAnswer{}, errNoMediaPC(o.PC, o.Gen, o.Neg)
-}
-
-func (noMediaPeer) HandleAnswer(a protocol.PCAnswer) error { return errNoMediaPC(a.PC, a.Gen, a.Neg) }
-
-func (noMediaPeer) AddICE(c protocol.PCICE) error { return errNoMediaPC(c.PC, c.Gen, 0) }
-
-func (noMediaPeer) Restart(r protocol.PCRestart) error { return errNoMediaPC(r.PC, r.Gen, 0) }
-
-func (noMediaPeer) ClosePC(protocol.PCClose) error { return nil }
-
-// Subscribe ignores every share it is asked for: without media no share exists.
-func (noMediaPeer) Subscribe(wants []protocol.SubscriptionWant) ([]string, error) {
-	ignored := make([]string, 0, len(wants))
-	for _, w := range wants {
-		ignored = append(ignored, w.ShareID)
+// advertisedAddrs are the Transport's advertised addresses as the status and the dashboard show them (04 §7.3,
+// §11.4): every address of the server's ICE candidates, after the rewrite rules, with the transport it belongs to.
+// The result is never nil, so it is [] in JSON.
+func advertisedAddrs(adv []netx.AdvertisedAddr) []api.AdvertisedAddr {
+	out := make([]api.AdvertisedAddr, 0, len(adv))
+	for _, a := range adv {
+		out = append(out, api.AdvertisedAddr{Proto: a.Proto, Addr: a.Addr.String(), Via: api.Transport(a.Via)})
 	}
-	return ignored, nil
+	return out
 }
-
-func (noMediaPeer) SetCaps(protocol.Caps) {}
-
-func (noMediaPeer) Resync() {}
-
-func (noMediaPeer) Stats() protocol.ServerStats {
-	return protocol.ServerStats{Subs: []protocol.ServerSubStats{}, Layers: []protocol.ServerLayerStats{}}
-}
-
-func (noMediaPeer) Close() {}

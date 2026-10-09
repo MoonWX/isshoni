@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -25,6 +26,7 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/httpapi"
 	"github.com/MoonWX/isshoni/internal/server/netx"
 	"github.com/MoonWX/isshoni/internal/server/ops"
+	"github.com/MoonWX/isshoni/internal/server/sfu"
 	"github.com/MoonWX/isshoni/internal/server/signal"
 	"github.com/MoonWX/isshoni/internal/server/store"
 	"github.com/MoonWX/isshoni/internal/server/tlsmgr"
@@ -1200,7 +1202,19 @@ func TestStatusSource(t *testing.T) {
 		V6: netip.MustParseAddr("2001:db8::7"), V6Method: netx.MethodInterface,
 		LocalV4: netip.MustParseAddr("10.0.0.5"), NAT: api.NATKindOneToOne,
 	}
+	// The Transport as netx builds it there: one UDP socket on the local address, the ICE-TCP listener on every
+	// address, and candidates that name the public addresses.
+	s.transport = &netx.Transport{
+		UDPMux: fakeUDPMux{&net.UDPAddr{IP: net.IPv4(10, 0, 0, 5), Port: 7882}},
+		Advertised: []netx.AdvertisedAddr{
+			{Proto: "udp", Addr: netip.MustParseAddrPort("203.0.113.7:7882"), Via: netx.ViaUDP},
+			{Proto: "udp", Addr: netip.MustParseAddrPort("[2001:db8::7]:7882"), Via: netx.ViaUDP},
+			{Proto: "tcp", Addr: netip.MustParseAddrPort("203.0.113.7:7882"), Via: netx.ViaTCP7882},
+		},
+		RcvBuf: 8 << 20, SndBuf: 4 << 20,
+	}
 	s.addrs = Addrs{HTTP: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8080}}
+	s.addrs.ICEUDP, s.addrs.ICETCP = iceAddrs(cfg.Listen.ICETCP, s.transport)
 	s.adminLn = listenStandIn(t)
 	if s.tls, err = tlsmgr.New(tlsmgr.Options{Mode: config.TLSOff, Logger: discardLog()}); err != nil {
 		t.Fatal(err)
@@ -1224,12 +1238,20 @@ func TestStatusSource(t *testing.T) {
 		PublicIPv6Method: "interface",
 		LocalIPv4:        "10.0.0.5",
 		NAT:              api.NATKindOneToOne,
-		Advertised:       []api.AdvertisedAddr{},
+		Advertised: []api.AdvertisedAddr{
+			{Proto: "udp", Addr: "203.0.113.7:7882", Via: api.TransportUDP},
+			{Proto: "udp", Addr: "[2001:db8::7]:7882", Via: api.TransportUDP},
+			{Proto: "tcp", Addr: "203.0.113.7:7882", Via: api.TransportTCP7882},
+		},
 		Listeners: []api.ListenerInfo{
 			{Key: "listen.http", Network: "tcp", Addr: "127.0.0.1:8080"},
+			{Key: "listen.ice_udp", Network: "udp", Addr: "10.0.0.5:7882"},
+			{Key: "listen.ice_tcp", Network: "tcp", Addr: ":7882"},
 			{Key: "listen.admin_socket", Network: "unix", Addr: "/run/isshoni/admin.sock"},
 		},
-		SchemaVersion: store.LatestSchemaVersion(),
+		UDPRcvBufBytes: 8 << 20,
+		UDPSndBufBytes: 4 << 20,
+		SchemaVersion:  store.LatestSchemaVersion(),
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("status:\n got %+v\nwant %+v", got, want)
@@ -1240,9 +1262,14 @@ func TestStatusSource(t *testing.T) {
 		t.Errorf("status JSON = %s, %v", b, err)
 	}
 
-	// In a TLS mode the 443 multiplexer comes first; a server that found no public address reports none.
+	// In a TLS mode the 443 multiplexer comes first; a server that found no public address reports none. With UDP
+	// and listen.ice_tcp both off, media has the multiplexer's port alone: no listener of its own, no UDP buffers.
 	s.addrs.HTTPS = &net.TCPAddr{IP: net.IPv4zero, Port: 443}
 	s.public = netx.PublicAddrs{}
+	s.transport = &netx.Transport{Advertised: []netx.AdvertisedAddr{
+		{Proto: "tcp", Addr: netip.MustParseAddrPort("10.0.0.5:443"), Via: netx.ViaTCP443, LAN: true},
+	}}
+	s.addrs.ICEUDP, s.addrs.ICETCP = iceAddrs("", s.transport)
 	got, err = s.statusSource()(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -1253,7 +1280,40 @@ func TestStatusSource(t *testing.T) {
 	if got.PublicIPv4 != "" || got.PublicIPv6 != "" || got.LocalIPv4 != "" || got.PublicIPv4Method != "" {
 		t.Errorf("public addresses of a server that has none = %+v", got)
 	}
+	if got.UDPRcvBufBytes != 0 || got.UDPSndBufBytes != 0 ||
+		!reflect.DeepEqual(got.Advertised, []api.AdvertisedAddr{{Proto: "tcp", Addr: "10.0.0.5:443", Via: api.TransportTCP443}}) {
+		t.Errorf("media of a server on TCP 443 alone = %+v, buffers %d/%d", got.Advertised, got.UDPRcvBufBytes, got.UDPSndBufBytes)
+	}
+
+	// A Transport that advertises nothing still gives a list.
+	if got := advertisedAddrs(nil); got == nil || len(got) != 0 {
+		t.Errorf("advertisedAddrs(nil) = %#v, want an empty list", got)
+	}
 }
+
+// fakeUDPMux is an ice.UDPMux of which only the listen addresses are asked.
+type fakeUDPMux []net.Addr
+
+func (fakeUDPMux) Close() error { return nil }
+
+func (fakeUDPMux) GetConn(string, net.Addr) (net.PacketConn, error) {
+	return nil, errors.New("not asked in this test")
+}
+
+func (fakeUDPMux) RemoveConnByUfrag(string) {}
+
+func (m fakeUDPMux) GetListenAddresses() []net.Addr { return m }
+
+// fakeTCPMux is an ice.TCPMux that is only there.
+type fakeTCPMux struct{}
+
+func (fakeTCPMux) Close() error { return nil }
+
+func (fakeTCPMux) GetConnByUfrag(string, bool, net.IP) (net.PacketConn, error) {
+	return nil, errors.New("not asked in this test")
+}
+
+func (fakeTCPMux) RemoveConnByUfrag(string) {}
 
 // listenStandIn is a listener that only stands for "the admin socket is bound".
 func listenStandIn(t *testing.T) net.Listener {
@@ -1267,57 +1327,132 @@ func listenStandIn(t *testing.T) net.Listener {
 	return ln
 }
 
-// ---- the media plane before the SFU ----
+// ---- the SFU behind the hub ----
 
-func TestNoMedia(t *testing.T) {
-	var plane signal.MediaPlane = noMedia{}
-	peer, err := plane.NewPeer(signal.PeerParams{ConnectionID: "c1", UserID: "u1", RoomID: "lounge"}, nil)
-	if err != nil || peer == nil {
-		t.Fatalf("NewPeer = %v, %v: a connection must be able to join a room", peer, err)
-	}
-
-	wantError := func(what string, err error, scope protocol.ErrorScope, pc protocol.PCKind, gen, neg uint32) {
-		t.Helper()
-		var pe *protocol.Error
-		if !errors.As(err, &pe) {
-			t.Errorf("%s: error %v, want a *protocol.Error (anything else is logged as an internal error)", what, err)
-			return
-		}
-		want := protocol.Error{Code: protocol.ErrorCodeFeatureDisabled, Scope: scope, PC: pc, Gen: gen, Neg: neg}
-		if !reflect.DeepEqual(*pe, want) {
-			t.Errorf("%s: error %+v, want %+v", what, *pe, want)
+func TestSFULimits(t *testing.T) {
+	for kbps, want := range map[int]sfu.Limits{
+		0:    {}, // no cap, in 03's settings as in the SFU
+		4000: {MaxShareKbps: 4000},
+	} {
+		if got := sfuLimits(store.Settings{MaxShareBitrateKbps: kbps, MaxSharesPerRoom: 6}); got != want {
+			t.Errorf("sfuLimits(maxShareBitrateKbps %d) = %+v, want %+v", kbps, got, want)
 		}
 	}
-	_, err = peer.CreateShare("sh1", protocol.ShareStart{})
-	wantError("CreateShare", err, protocol.ErrorScopeRequest, "", 0, 0)
-	_, err = peer.UpdateShare("sh1", protocol.ShareUpdate{})
-	wantError("UpdateShare", err, protocol.ErrorScopeRequest, "", 0, 0)
-	_, err = peer.HandleOffer(protocol.PCOffer{PC: protocol.PCKindPub, Gen: 2, Neg: 3})
-	wantError("HandleOffer", err, protocol.ErrorScopePC, protocol.PCKindPub, 2, 3)
-	wantError("HandleAnswer", peer.HandleAnswer(protocol.PCAnswer{PC: protocol.PCKindSub, Gen: 1, Neg: 4}),
-		protocol.ErrorScopePC, protocol.PCKindSub, 1, 4)
-	wantError("AddICE", peer.AddICE(protocol.PCICE{PC: protocol.PCKindSub, Gen: 5}), protocol.ErrorScopePC, protocol.PCKindSub, 5, 0)
-	wantError("Restart", peer.Restart(protocol.PCRestart{PC: protocol.PCKindSub, Gen: 6}), protocol.ErrorScopePC, protocol.PCKindSub, 6, 0)
-	if err := peer.ClosePC(protocol.PCClose{PC: protocol.PCKindPub, Gen: 1}); err != nil {
-		t.Errorf("ClosePC = %v: there is nothing to close", err)
+}
+
+// TestMediaCheck is the readiness check "media" row by row (04 §6.2): a UDP socket, or an ICE-TCP mux when the
+// operator turned UDP off, and an SFU that takes connections.
+func TestMediaCheck(t *testing.T) {
+	socket := fakeUDPMux{&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 7882}}
+	open := func() error { return nil }
+	closed := func() error { return &sfu.Error{Code: sfu.CodeClosed} }
+	for _, tc := range []struct {
+		name   string
+		udp    bool // listen.ice_udp is set
+		tr     *netx.Transport
+		ready  func() error
+		detail string // "" = ready
+	}{
+		{name: "UDP and TCP", udp: true, tr: &netx.Transport{UDPMux: socket, TCPMux: fakeTCPMux{}}, ready: open},
+		{name: "UDP alone", udp: true, tr: &netx.Transport{UDPMux: socket}, ready: open},
+		{name: "UDP turned off, an ICE-TCP mux", tr: &netx.Transport{TCPMux: fakeTCPMux{}}, ready: open},
+		{name: "UDP wanted, no mux", udp: true, tr: &netx.Transport{TCPMux: fakeTCPMux{}}, ready: open,
+			detail: "no UDP socket is bound for media (listen.ice_udp)"},
+		{name: "UDP wanted, a mux without a socket", udp: true, tr: &netx.Transport{UDPMux: fakeUDPMux{}}, ready: open,
+			detail: "no UDP socket is bound for media (listen.ice_udp)"},
+		{name: "UDP turned off, no ICE-TCP mux", tr: &netx.Transport{}, ready: open,
+			detail: "UDP is off (listen.ice_udp) and no ICE-TCP listener is up"},
+		{name: "the SFU is closed", udp: true, tr: &netx.Transport{UDPMux: socket}, ready: closed,
+			detail: "the media server is closed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, detail := mediaCheck(tc.udp, tc.tr, tc.ready)()
+			if ok != (tc.detail == "") || detail != tc.detail {
+				t.Errorf("media check = %v %q, want %q", ok, detail, tc.detail)
+			}
+		})
+	}
+}
+
+// logRecord is one record as a handler under notImplementedAsDebug got it.
+type logRecord struct {
+	level slog.Level
+	msg   string
+	attrs map[string]string // the record's own and those of With
+}
+
+// recordingHandler keeps the records of the levels it is enabled for.
+type recordingHandler struct {
+	min   slog.Level
+	with  []slog.Attr
+	store *[]logRecord
+}
+
+func (h recordingHandler) Enabled(_ context.Context, l slog.Level) bool { return l >= h.min }
+
+func (h recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	rec := logRecord{level: r.Level, msg: r.Message, attrs: map[string]string{}}
+	for _, a := range h.with {
+		rec.attrs[a.Key] = a.Value.String()
+	}
+	r.Attrs(func(a slog.Attr) bool {
+		rec.attrs[a.Key] = a.Value.String()
+		return true
+	})
+	*h.store = append(*h.store, rec)
+	return nil
+}
+
+func (h recordingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	h.with = append(slices.Clone(h.with), attrs...)
+	return h
+}
+
+func (h recordingHandler) WithGroup(string) slog.Handler { return h }
+
+// TestNotImplementedAsDebug: what sfuplane logs about an SFU method that a later slice fills in reaches the
+// server's log at debug level, whatever level sfuplane gave it; every other record passes as it is.
+func TestNotImplementedAsDebug(t *testing.T) {
+	// The SFU's own error wraps the sentinel the same way (sfu.Error.Unwrap).
+	notYet := fmt.Errorf("sfu.internal: Conn.SetDecodeCaps is not implemented yet (README S69): %w", sfu.ErrNotImplemented)
+	wrapped := fmt.Errorf("sfuplane: %w", notYet)
+	broken := &sfu.Error{Code: sfu.CodeInternal}
+
+	var got []logRecord
+	// The logger as sfuplane builds its own from the one it is given: a component, then the connection's ids.
+	log := slog.New(notImplementedAsDebug{recordingHandler{min: slog.LevelDebug, store: &got}}).
+		With("component", "sfuplane").With("conn_id", "c1")
+	log.Error("internal error", "call", "RestartICE", "ref", "abcd1234", "err", notYet)
+	log.Error("SFU call failed", "call", "SetDecodeCaps", "err", wrapped)
+	log.Warn("SFU call failed", "err", notYet)
+	log.Debug("SFU error", "err", notYet)
+	log.Error("internal error", "call", "HandleOffer", "ref", "efgh5678", "err", broken)
+	log.Error("share with a malformed H.264 profile", "share_id", "s_1")
+	log.Warn("the SFU connection is busy", "err", errors.New("sfu.busy"))
+	log.Info("not an error", "err", "a string that says not implemented")
+
+	want := []logRecord{
+		{slog.LevelDebug, "internal error", map[string]string{"component": "sfuplane", "conn_id": "c1", "call": "RestartICE", "ref": "abcd1234", "err": notYet.Error()}},
+		{slog.LevelDebug, "SFU call failed", map[string]string{"component": "sfuplane", "conn_id": "c1", "call": "SetDecodeCaps", "err": wrapped.Error()}},
+		{slog.LevelDebug, "SFU call failed", map[string]string{"component": "sfuplane", "conn_id": "c1", "err": notYet.Error()}},
+		{slog.LevelDebug, "SFU error", map[string]string{"component": "sfuplane", "conn_id": "c1", "err": notYet.Error()}},
+		{slog.LevelError, "internal error", map[string]string{"component": "sfuplane", "conn_id": "c1", "call": "HandleOffer", "ref": "efgh5678", "err": broken.Error()}},
+		{slog.LevelError, "share with a malformed H.264 profile", map[string]string{"component": "sfuplane", "conn_id": "c1", "share_id": "s_1"}},
+		{slog.LevelWarn, "the SFU connection is busy", map[string]string{"component": "sfuplane", "conn_id": "c1", "err": "sfu.busy"}},
+		{slog.LevelInfo, "not an error", map[string]string{"component": "sfuplane", "conn_id": "c1", "err": "a string that says not implemented"}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("records:\n got %+v\nwant %+v", got, want)
 	}
 
-	// No share exists, so a subscription finds none of what it asks for.
-	ignored, err := peer.Subscribe([]protocol.SubscriptionWant{{ShareID: "sh1"}, {ShareID: "sh2"}})
-	if err != nil || !slices.Equal(ignored, []string{"sh1", "sh2"}) {
-		t.Errorf("Subscribe = %v, %v; want both shares ignored", ignored, err)
+	// A server at log.level = info, the default, hears nothing of what is not built yet, and all of the rest.
+	got = nil
+	log = slog.New(notImplementedAsDebug{recordingHandler{min: slog.LevelInfo, store: &got}}).WithGroup("g")
+	log.Error("internal error", "err", notYet)
+	log.Error("internal error", "err", broken)
+	if len(got) != 1 || got[0].level != slog.LevelError || got[0].attrs["err"] != broken.Error() {
+		t.Errorf("records at info level = %+v, want the one real error", got)
 	}
-	if ignored, err := peer.Subscribe(nil); err != nil || ignored == nil || len(ignored) != 0 {
-		t.Errorf("Subscribe to nothing = %#v, %v; want an empty list", ignored, err)
-	}
-	// The stats go on the wire as they are: their lists are lists.
-	if b, err := json.Marshal(peer.Stats()); err != nil || string(b) != `{"subs":[],"layers":[]}` {
-		t.Errorf("Stats JSON = %s, %v", b, err)
-	}
-	peer.EndShare("sh1", protocol.EndReasonStopped)
-	peer.SetCaps(protocol.Caps{})
-	peer.Resync()
-	peer.Close()
 }
 
 // ---- the readiness check "db" ----
