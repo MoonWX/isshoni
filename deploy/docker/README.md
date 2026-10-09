@@ -20,6 +20,8 @@ files that people download are next door: `deploy/compose.yaml` (bridge network,
   into a new named volume, so the data volume is writable without a `chown`, and the server finds its data directory
   private, as it wants it. The Dockerfile copies each directory on its own: one `COPY --chown` of `rootfs/` onto `/`
   would also hand `/var`, `/var/lib` and `/run` to 65532.
+- **`/usr/local/bin/isshoni`** is `0755`, set by `COPY --chmod` and not taken from the build context: under
+  `cap_drop: ALL` the image's user could not start a binary that a strict umask had left at `0700`.
 - **No `VOLUME`.** An anonymous volume would hide a missing mount. With `ISSHONI_IN_CONTAINER=1` the server refuses
   to start (exit 78) when `/var/lib/isshoni` is not a mount, and says how to mount one.
 - **No config file.** The config comes from `ISSHONI_*` variables; an empty one counts as unset.
@@ -31,6 +33,7 @@ files that people download are next door: `deploy/compose.yaml` (bridge network,
 ```sh
 task docker:smoke              # builds the web app, the notices and the image, then runs every part
 task docker:smoke -- -s host   # flags after -- go to test/docker-smoke.sh; -h lists them
+task docker:smoke -- -i ghcr.io/moonwx/isshoni:latest   # an image Docker already has, instead of building one
 ```
 
 It needs Docker with compose and buildx, curl, openssl and jq, and the host's ports 80, 443 and 7882. Its compose
@@ -39,7 +42,7 @@ project is `isshoni-smoke`, so it never touches an install named `isshoni`. CI r
 
 | Part | What it asserts |
 |---|---|
-| `image` | the `HEALTHCHECK` command, the user, and that the binary has the version it was built with |
+| `image` | the `HEALTHCHECK` command, the user, that the binary starts without capabilities (its mode is 0755 whatever the builder's umask was), and that it has the version it was built with. With `-i IMAGE` the test builds nothing, so `-a` and `-v` are ignored and the image's own version is the one the other parts expect |
 | `novolume` | `docker run IMAGE` exits 78 within 10 s and prints "Mount a volume at /var/lib/isshoni (see compose.yaml)" |
 | `bridge` | `compose.yaml` with manual TLS: healthy within 90 s; `https://smoke.test/api/v1/info` answers with the version; `docker compose exec -T isshoni isshoni setup-url` prints the link; the admin account survives `down` and `up`; `ReadonlyRootfs` and `CapDrop: [ALL]` |
 | `backup` | in `bridge` and `host`, the commands of 06 §6.4 as documented: the archive written under `umask 077` is `0600`, `restore --yes -` succeeds, the server is healthy again within 60 s and the admin is still there |

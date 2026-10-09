@@ -16,11 +16,11 @@
 #             unset, and the container keeps running
 #
 # Usage: docker-smoke.sh [-a ARCH] [-i IMAGE] [-k] [-s PARTS] [-v VERSION]
-#   -a ARCH     build for amd64 or arm64 (default: the architecture of the Docker engine)
+#   -a ARCH     build for amd64 or arm64 (default: the architecture of the Docker engine; ignored with -i)
 #   -i IMAGE    test this image instead of building one (a release image, for example)
 #   -k          keep what the test made (the last deployment, the image, the work directory) for a look around
 #   -s PARTS    skip parts, comma-separated: novolume, bridge, backup, ipv6, host, noenv
-#   -v VERSION  version of the binary to build (default: the version web/dist was built for)
+#   -v VERSION  version of the binary to build (default: the version web/dist was built for; ignored with -i)
 #
 # The test uses the host's ports 80, 443 and 7882 and the compose project "isshoni-smoke"; a project of that name
 # left by an earlier run is removed first. It never touches a project named "isshoni", the name of a real install.
@@ -268,11 +268,15 @@ test_image() {
   got=$(docker image inspect -f '{{.Config.User}}' "$image")
   [ "$got" = 65532:65532 ] || fail "the image's user is '$got', want 65532:65532"
   ok "the image runs as 65532:65532"
-  version=$(docker run --rm "$image" version --short) || fail "'docker run $image version --short' failed"
+  # Without capabilities, as both compose files run it: the image's user can start the binary only when its mode
+  # allows everybody to, whatever the umask of the build was (the --chmod in the Dockerfile).
+  version=$(docker run --rm --cap-drop ALL "$image" version --short) ||
+    fail "'docker run --cap-drop ALL $image version --short' failed: can every user execute /usr/local/bin/isshoni?"
   [ -n "$version" ] || fail "'isshoni version --short' printed nothing"
-  [ -z "$want_version" ] || [ "$version" = "$want_version" ] ||
+  # -v is the version to build. An image given with -i was built elsewhere, so it has a version of its own.
+  [ "$built" = 0 ] || [ -z "$want_version" ] || [ "$version" = "$want_version" ] ||
     fail "the image's binary is version $version, built as $want_version"
-  ok "isshoni version --short prints $version"
+  ok "without capabilities, isshoni version --short prints $version"
 }
 
 test_novolume() {

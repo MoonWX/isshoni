@@ -120,6 +120,9 @@ main() {
     -o "$context/linux/$arch/isshoni" ./cmd/isshoni
   cp -R deploy/docker/rootfs "$context/deploy/docker/rootfs"
   cp LICENSE NOTICE THIRD_PARTY_NOTICES "$context/"
+  # The Dockerfile sets the modes of the binary and of the two directories. These three files keep the mode they
+  # have in the context, and that must not be this shell's umask: everybody may read a license.
+  chmod 0644 "$context/LICENSE" "$context/NOTICE" "$context/THIRD_PARTY_NOTICES"
 
   say "docker-build: docker buildx build --platform linux/$arch -> $image"
   # No attestations: with them the result is an image index, which not every image store can --load.

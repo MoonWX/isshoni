@@ -15,7 +15,10 @@ ARG TARGETPLATFORM
 # /var/lib and /run to nonroot as well. The modes are those of a systemd install (StateDirectory, RuntimeDirectory).
 COPY --chown=65532:65532 --chmod=0700 deploy/docker/rootfs/var/lib/isshoni/ /var/lib/isshoni/
 COPY --chown=65532:65532 --chmod=0750 deploy/docker/rootfs/run/isshoni/ /run/isshoni/
-COPY $TARGETPLATFORM/isshoni /usr/local/bin/isshoni
+# The mode is set here, not taken from the build context: a file built under a strict umask (0700) could not be
+# started by nonroot once the container has no capabilities (cap_drop ALL in both compose files).
+COPY --chmod=0755 $TARGETPLATFORM/isshoni /usr/local/bin/isshoni
+# No --chmod on this line: it would also apply to the directory the COPY creates, and 0644 lets nobody enter it.
 COPY LICENSE NOTICE THIRD_PARTY_NOTICES /usr/share/doc/isshoni/
 # data_dir keeps its default /var/lib/isshoni, and the admin socket /run/isshoni/admin.sock. There is no config file
 # in the image: the config comes from ISSHONI_* variables, and a mounted /etc/isshoni/isshoni.toml is optional.
