@@ -5,6 +5,7 @@ import { fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { HttpResponse } from 'msw';
 import { describe, expect, it, vi } from 'vitest';
 
+import { formatRelativeTime } from '../lib/time';
 import type { AdminUser } from '../protocol/api.gen';
 import { apiError } from '../test/msw';
 import {
@@ -73,11 +74,10 @@ describe('UsersPage', () => {
     expect(sam.getByText('Member')).toBeInTheDocument();
     expect(sam.getByText('Active')).toBeInTheDocument();
     expect(sam.getByText('Invited by admin')).toBeInTheDocument();
-    // Not online: when they were last seen, as a time element.
-    expect(sam.getByRole('cell', { name: /ago$/ }).querySelector('time')).toHaveAttribute(
-      'datetime',
-      '2026-10-02T09:30:00.000Z',
-    );
+    // Not online: when they were last seen, as a time element. The text is relative to today ("6 days ago" one day
+    // is "last week" the next), so it is compared with the formatter's own answer, not with a fixed phrase.
+    const lastSeen = sam.getByText(formatRelativeTime(new Date('2026-10-02T09:30:00.000Z'), 'en'));
+    expect(lastSeen.closest('time')).toHaveAttribute('datetime', '2026-10-02T09:30:00.000Z');
 
     const kim = within(rowOf(/^kim/));
     expect(kim.getByText('Disabled')).toBeInTheDocument();
