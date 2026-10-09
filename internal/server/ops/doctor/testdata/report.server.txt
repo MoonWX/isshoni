@@ -1,0 +1,23 @@
+isshoni doctor · 0.3.0 · server running · 2026-09-29 20:15 UTC
+[ ok ] config        defaults and flags
+[ ok ] data_dir      /var/lib/isshoni (0700, 37.2 GB free)
+[ ok ] secrets       /var/lib/isshoni/secrets.json (0600)
+[ ok ] schema        schema 7
+[ ok ] public_ip     203.0.113.7 (on interface eth0, confirmed by STUN), 2001:db8::7
+[ ok ] dns           no domain: the site is this server's IP address
+[ ok ] tls           ip certificate for 203.0.113.7, valid until 2026-10-05 10:00 UTC, renews 2026-10-02
+[ ok ] clock         synchronized, within 1 second of acme-v02.api.letsencrypt.org
+[warn] udp_buffers   net.core.rmem_max is 212992, isshoni wants 8388608
+       fix: printf 'net.core.rmem_max=8388608\nnet.core.wmem_max=8388608\n' | sudo tee /etc/sysctl.d/60-isshoni.conf && sudo sysctl --system
+       more: https://moonwx.github.io/isshoni/troubleshooting#doctor-udp_buffers
+[info] ports         listening on 443/tcp, 80/tcp, 7882/udp, 7882/tcp (local check only)
+       This only checks this machine. The browser connection test checks from outside.
+[info] firewall_hint Hetzner: Cloud Console → Firewalls → allow TCP 80, 443, 7882 and UDP 7882
+       https://moonwx.github.io/isshoni/install/vps#hetzner
+[ ok ] container     not in a container
+[ ok ] lan_privacy   not a macOS host
+[ ok ] transfer      412.0 GB of 1000 GB out in 2026-09 (41 %)
+[ ok ] release       0.3.0 is the latest release
+[info] nofile        open-file limit 65536
+[info] bandwidth     5 people, 2 sharing: ~41.5 Mbps egress (~44 on the wire), ~39 GB per 2-hour session
+12 ok · 1 warn · 0 fail

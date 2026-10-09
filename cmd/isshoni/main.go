@@ -19,6 +19,7 @@ import (
 
 	"github.com/MoonWX/isshoni/internal/server/config"
 	"github.com/MoonWX/isshoni/internal/server/ops"
+	"github.com/MoonWX/isshoni/internal/server/ops/doctor"
 )
 
 // Process exit codes (04 §3.2).
@@ -64,6 +65,9 @@ type invocation struct {
 	// dialAdmin returns the client for the admin socket at a path. nil means ops.DialAdmin; the tests of a refused
 	// peer pass a client that expects to be refused (ops.AdminClient.AssumeStranger).
 	dialAdmin func(path string) *ops.AdminClient
+	// doctorEnv, when set, changes what an offline doctor run sees before it starts: tests put fakes in place of
+	// the resolver, the STUN client and the other probes, so that no test asks the network.
+	doctorEnv func(*doctor.Env)
 
 	// For a command that reads the config, dispatch loads it before the command runs: cfg is always set then, and
 	// cfgErr holds its errors (the command decides: serve and config exit 78, the offline admin commands only need

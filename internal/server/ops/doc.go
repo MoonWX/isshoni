@@ -26,15 +26,24 @@
 //     Nothing in the server builds these three yet: the wiring does, in the steps their files describe, when it
 //     gets the metrics listener and the dashboard (README S85); until then `serve` only warns that
 //     metrics.enabled has no listener.
+//   - doctor inside the server (README slice S60, 04 §13). The checks themselves are the subpackage ops/doctor,
+//     which `isshoni doctor` also runs by itself while the server is stopped. doctorrun.go has Doctor, which runs
+//     them in the server's process: 20 s after the start and every 24 h, with the last report kept in 03's meta
+//     table for the dashboard (Summary, Alerts); on demand for the admin page (Check and Last, the typed functions
+//     of POST and GET /api/v1/admin/doctor, with 429 doctor_busy for a second run within 10 s); and for the CLI
+//     through the admin socket's POST /v1/doctor (RunFor). Bandwidth and BandwidthFromQuery are the typed
+//     functions of GET /api/v1/admin/bandwidth. The wiring builds the Doctor with a function that returns the
+//     doctor.Env of one run (the config, the server's status, 03's schema version), hands it to AdminOptions, runs
+//     Run, and registers the three REST routes (README S85); until it does, POST /v1/doctor answers that this
+//     server has no doctor.
 //
 // A known limit: only Linux and macOS check peer credentials. The experimental Windows build (06 §3) serves every
 // connection to the admin socket, and file modes don't protect the socket there, so every local user who can open
 // it can administer the server; ListenAdmin logs a warning that says so (peercred_other.go). Checking the peer's
 // process token there, or refusing every connection, is an open decision.
 //
-// The socket's whole surface is declared: /v1/backup, /v1/restore, /v1/rotate-secrets and /v1/doctor answer "not
-// implemented in this build yet" until their slices fill them in (README S60, S65), and the client already has
-// their methods.
+// The socket's whole surface is declared: /v1/backup, /v1/restore and /v1/rotate-secrets answer "not implemented
+// in this build yet" until their slice fills them in (README S65), and the client already has their methods.
 //
 // The later ops slices add dashboard.go, conntest.go and backup.go/restore.go.
 //
