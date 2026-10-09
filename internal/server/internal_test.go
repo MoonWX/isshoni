@@ -296,6 +296,26 @@ func TestWithin(t *testing.T) {
 	})
 }
 
+// TestSFUShutdownBudget: the SFU's part of the shutdown's step 4 outlasts the second that SFU.Close may take by
+// itself (02's closeTimeout; README §4: "SFU.Close returns within 1 s"). An SFU that needs all of it has kept its
+// word: the step waits for it and is not counted as forced, and the Transport, whose budget begins afterwards, is
+// closed after the SFU and not under it.
+func TestSFUShutdownBudget(t *testing.T) {
+	const sfuCloseAtItsSlowest = time.Second
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), sfuShutdownBudget)
+		defer cancel()
+		begin := time.Now()
+		err := within(ctx, func() error {
+			time.Sleep(sfuCloseAtItsSlowest)
+			return nil
+		})
+		if err != nil || time.Since(begin) != sfuCloseAtItsSlowest {
+			t.Errorf("an SFU that closes in its second = %v after %v, want it waited for", err, time.Since(begin))
+		}
+	})
+}
+
 func TestWithBoundPort(t *testing.T) {
 	bound := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 54321}
 	for _, tc := range []struct {

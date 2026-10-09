@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math/big"
@@ -87,8 +88,9 @@ func stunBindingFrame() []byte {
 }
 
 // TestTLSOnePort is the check of 04 §17 for the TLS path: with servertest.Options{TLS: true}, WSS signaling over
-// HTTP/1.1, the web app over HTTP/2 and ICE-TCP share the one port behind the 443 multiplexer. The SFU is wired in
-// later (README S59), so ICE-TCP is a raw STUN frame; /ws is a stub that records how the connection arrived.
+// HTTP/1.1, the web app over HTTP/2 and ICE-TCP share the one port behind the 443 multiplexer. ICE-TCP is a raw
+// STUN frame here, to see where the multiplexer sends it (media over this port: internal/server/itest); /ws is a
+// stub that records how the connection arrived.
 func TestTLSOnePort(t *testing.T) {
 	rec := &wsRecord{}
 	srv := servertest.Start(t, servertest.Options{TLS: true, Deps: server.Deps{SPA: testSPA(), WS: wsStub(t, rec)}})
@@ -162,48 +164,21 @@ func TestTLSOnePort(t *testing.T) {
 	rec.mu.Unlock()
 
 	// ICE-TCP on the same port: a first byte of 0x00 is no TLS record, so the multiplexer routes the connection to
-	// its ICE side, with every byte the client sent. Until the SFU's Transport reads that side (README S59, which
-	// then tests media over 443 instead), the test is its reader. Nothing answers the client: what must not come
-	// back is a TLS alert or the plain-HTTP hint.
+	// its ICE side, which the SFU's Transport reads (its ICE-TCP mux; media over this port is the test of
+	// internal/server/itest). This Binding request names no ICE session, so the mux has no PeerConnection to hand it
+	// to and closes the connection. What must not come back is a TLS alert or the plain-HTTP hint: nothing does.
 	mux := srv.Srv.PortMux()
 	before := mux.Stats()
 	if before.TLS < 2 || before.ICE != 0 {
 		t.Errorf("multiplexer before the ICE connection: %+v, want two or more TLS connections and no ICE one", before)
 	}
 	ice := dialRaw(t, addrs.HTTPS)
-	frame := stunBindingFrame()
-	if _, err := ice.Write(frame); err != nil {
+	if _, err := ice.Write(stunBindingFrame()); err != nil {
 		t.Fatal(err)
 	}
-	type accepted struct {
-		conn net.Conn
-		err  error
-	}
-	got := make(chan accepted, 1)
-	go func() {
-		c, err := mux.ICE().Accept()
-		got <- accepted{c, err}
-	}()
-	select {
-	case a := <-got:
-		if a.err != nil {
-			t.Fatalf("the multiplexer's ICE side: %v", a.err)
-		}
-		defer func() { _ = a.conn.Close() }()
-		_ = a.conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-		read := make([]byte, len(frame))
-		if _, err := io.ReadFull(a.conn, read); err != nil || string(read) != string(frame) {
-			t.Errorf("the ICE side read %x (%v), want the STUN frame %x", read, err, frame)
-		}
-		if a.conn.RemoteAddr().String() != ice.LocalAddr().String() {
-			t.Errorf("the ICE side's connection is from %v, want the client's %v", a.conn.RemoteAddr(), ice.LocalAddr())
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the STUN frame did not reach the multiplexer's ICE side")
-	}
-	_ = ice.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
-	if n, _ := ice.Read(make([]byte, 64)); n != 0 {
-		t.Errorf("the ICE connection got %d bytes back, want none", n)
+	_ = ice.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if n, err := ice.Read(make([]byte, 64)); n != 0 || !errors.Is(err, io.EOF) {
+		t.Errorf("the ICE connection read %d bytes, %v; want the ICE-TCP mux to close it without a byte", n, err)
 	}
 	after := mux.Stats()
 	if after.ICE != 1 || after.TLS != before.TLS || after.PlainHTTP != 0 || after.Garbage != 0 {
@@ -230,8 +205,9 @@ func TestTLSOnePort(t *testing.T) {
 		t.Errorf("plain HTTP on the TLS port = %d %q", hint.StatusCode, hintBody)
 	}
 
-	// The ready line names the site and both listeners.
-	want := "isshoni " + version.Version() + " ready: " + srv.URL + " (tls=manual)"
+	// The ready line names the site, both listeners and the media ports: ICE-TCP is on the HTTPS port too.
+	want := fmt.Sprintf("isshoni %s ready: %s (tls=manual) media udp/%d ice-tcp %s,%d", version.Version(), srv.URL,
+		addrs.ICEUDP.(*net.UDPAddr).Port, port, addrs.ICETCP.(*net.TCPAddr).Port)
 	var found bool
 	for _, rec := range logRecords(t, srv.Logs()) {
 		if rec["msg"] == want {

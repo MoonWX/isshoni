@@ -423,21 +423,34 @@ func TestAdminSocket(t *testing.T) {
 	// The socket shows the readiness checks to whoever reaches it: the operator (04 §11.1).
 	ready, err := admin.Ready(ctx)
 	if err != nil || ready.Status != ops.StatusReady ||
-		!mapsEqual(ready.Checks, map[string]string{"db": "ok", "signal": "ok", "tls": "ok"}) {
+		!mapsEqual(ready.Checks, map[string]string{"db": "ok", "media": "ok", "signal": "ok", "tls": "ok"}) {
 		t.Errorf("ready = %+v, %v", ready, err)
 	}
 	st, err := admin.Status(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The listeners as bound, the media sockets among them, and what the server's ICE candidates name: on the
+	// harness's loopback ports that is the sockets themselves.
+	addrs := srv.Srv.Addrs()
 	wantListeners := []api.ListenerInfo{
-		{Key: "listen.http", Network: "tcp", Addr: srv.Srv.Addrs().HTTP.String()},
+		{Key: "listen.http", Network: "tcp", Addr: addrs.HTTP.String()},
+		{Key: "listen.ice_udp", Network: "udp", Addr: addrs.ICEUDP.String()},
+		{Key: "listen.ice_tcp", Network: "tcp", Addr: addrs.ICETCP.String()},
 		{Key: "listen.admin_socket", Network: "unix", Addr: srv.AdminSocket},
+	}
+	wantAdvertised := []api.AdvertisedAddr{
+		{Proto: "udp", Addr: addrs.ICEUDP.String(), Via: api.TransportUDP},
+		{Proto: "tcp", Addr: addrs.ICETCP.String(), Via: api.TransportTCP7882},
 	}
 	if st.Version != version.Version() || st.Origin != srv.URL || st.TLS.Mode != api.TLSModeOff || !st.TLS.Ready ||
 		st.SchemaVersion != store.LatestSchemaVersion() || !slices.Equal(st.Listeners, wantListeners) ||
+		!slices.Equal(st.Advertised, wantAdvertised) || st.UDPRcvBufBytes <= 0 || st.UDPSndBufBytes <= 0 ||
 		time.Since(st.StartedAt) > time.Minute || st.Rooms != 0 {
-		t.Errorf("status = %+v", st)
+		t.Errorf("status = %+v\nwant the listeners %+v and the advertised addresses %+v", st, wantListeners, wantAdvertised)
+	}
+	if !strings.HasPrefix(addrs.ICEUDP.String(), "127.0.0.1:") || !strings.HasPrefix(addrs.ICETCP.String(), "127.0.0.1:") {
+		t.Errorf("ICE listeners %v and %v, want the harness's loopback ports", addrs.ICEUDP, addrs.ICETCP)
 	}
 
 	// Accounts: nobody yet, then the admin.
@@ -902,5 +915,11 @@ func TestPublicAddressWatch(t *testing.T) {
 	}
 	if warnings != 1 {
 		t.Errorf("the change was reported %d times, want once:\n%s", warnings, logs.String())
+	}
+	// A server that has its site never restarts over an address: it may be serving friends.
+	select {
+	case <-s.RestartAsked():
+		t.Error("a server with a site asked for a restart over a changed address")
+	default:
 	}
 }

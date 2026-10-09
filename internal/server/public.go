@@ -2,9 +2,16 @@ package server
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io/fs"
 	"log/slog"
+	"net"
 	"net/netip"
 	"os"
+	"strconv"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/MoonWX/isshoni/internal/logx"
@@ -14,10 +21,19 @@ import (
 )
 
 // This file is the server's view of its own network: the public addresses (04 §7.4), found at startup and looked at
-// again on a ticker, and the options of the ICE Transport (04 §7.3), which the SFU's wiring binds (README S59).
+// again on a ticker, and the ICE Transport (04 §7.3) that the SFU runs on: its options, its sockets and what the
+// server says about them.
 
 // publicRedetectEvery is how often a running server looks at its public addresses again (04 §7.4).
 const publicRedetectEvery = 10 * time.Minute
+
+// redetectInterval is publicRedetectEvery, or what a test put in its place.
+func (s *Server) redetectInterval() time.Duration {
+	if s.redetectEvery > 0 {
+		return s.redetectEvery
+	}
+	return publicRedetectEvery
+}
 
 // inContainer reports whether the server runs in a container (04 §5.1). Public-address detection and the Transport
 // read it the same way: behind a container bridge the address STUN sees is a 1:1 NAT, not a home router's port
@@ -122,11 +138,27 @@ func watchPublicAddrs(ctx context.Context, interval time.Duration, first netx.Pu
 	}
 }
 
-// publicAddrsChanged is what the running server does about a public address that changed (04 §7.4): it says so and
-// keeps going. The ICE rewrite rules, the site and (in ip mode) the certificate are fixed for the process's life, so
-// only a restart applies the new address.
+// publicAddrsChanged is what the running server does about a public address that changed (04 §7.4). The ICE rewrite
+// rules, the site and (in ip mode) the certificate are fixed for the process's life, so only a restart applies a new
+// address.
+//
+// A server that serves says so and keeps going: the operator restarts it when it suits the people who are watching.
+// The one server that restarts by itself is the one that has nothing to interrupt: it started without the public
+// address that is its site (ip mode, or manual mode without a domain) and has been running without a site, not
+// ready, since (04 §6.2). When a look finds an address that makes a site, it asks Run for a restart, and the next
+// process starts with it. What kept the address away at startup is often gone a minute later (the network was not
+// up yet at boot, STUN did not answer), and nothing else would restart a process that runs.
 func (s *Server) publicAddrsChanged(from, to netx.PublicAddrs) {
 	log := s.log.With(slog.String("component", "netx"))
+	if s.awaitsAddress {
+		if site, err := config.NewSite(&s.cfg, to.V4, to.V6); err == nil {
+			log.Info("public IP address found: isshoni restarts to take it as its site",
+				slog.String("public_ip", site.Hostname))
+			s.publicNow.Store(&to)
+			s.askRestart()
+			return
+		}
+	}
 	for _, c := range []struct {
 		family   string
 		from, to netip.Addr
@@ -144,9 +176,15 @@ func (s *Server) publicAddrsChanged(from, to netx.PublicAddrs) {
 	s.publicNow.Store(&to)
 }
 
+// askRestart makes Run shut the server down for a restart (ShutdownRestart), so that it returns
+// ErrRestartRequested. It only leaves word: the caller is one of the server's own goroutines, which the shutdown
+// waits for.
+func (s *Server) askRestart() {
+	s.restartOnce.Do(func() { close(s.restartAsked) })
+}
+
 // transportOptions fills the options of the ICE Transport (04 §7.3) from the config, the detected public addresses
-// and the environment. README S59 calls netx.NewTransport with them in step 6 of the startup sequence, once the 443
-// multiplexer is bound, and adds the transfer counter of ops (README S55).
+// and the environment, for listenICE. The transfer counter of ops joins them with the ops data (README S85).
 //
 // IPv6 is off when network.ipv6 is false or public_ipv6 is "off": the operator wants no IPv6 media then, whatever
 // the interfaces have. InContainer and CloudProvider are the values the detection got, so that both agree on what a
@@ -165,4 +203,110 @@ func (s *Server) transportOptions() netx.TransportOptions {
 		CloudProvider:     s.cloudProvider(),
 		Logger:            s.log,
 	}
+}
+
+// listenICE binds the ICE Transport (04 §6.1 step 6, §7.3): listen.ice_udp on every local address that carries
+// media, listen.ice_tcp, and the ICE side of the 443 multiplexer when there is one. Its errors are for the
+// operator, like those of the other listeners; they are runtime errors (exit 1), not refusals.
+//
+// A machine without a usable address (netx.ErrNoTransport) has, as a rule, a network that is not up yet: the unit
+// started early at boot, the DHCP lease is still on its way. The interfaces are read once, here, so only another
+// start finds the address, and who makes that start depends on what the server knows of itself:
+//   - With a site, the start fails, and the message says what is missing. systemd and Docker start the server
+//     again by themselves, which helps when the network comes up while they still try (systemd: five times).
+//   - A server that waits for its public address (awaitsAddress) is not ready whatever happens here, and the same
+//     missing network is the usual reason why it found no address (04 §6.2). What it lacks from outside never
+//     stops the start (04 §6.3), so it goes on without media sockets: listenICE returns no Transport and no error,
+//     the server then builds no SFU, its check "media" says why, and the look at the public addresses restarts it
+//     when it finds the address (publicAddrsChanged). Failing instead would hand the wait to the service manager,
+//     and systemd gives up after five failures in a row, which take a quarter of a minute (06's unit).
+//
+// Nothing reads the multiplexer's ICE side on a server without a Transport, so that side is closed: the
+// multiplexer closes a connection that speaks ICE at once instead of keeping it in a queue.
+func (s *Server) listenICE(ctx context.Context) (*netx.Transport, error) {
+	tr, err := netx.NewTransport(ctx, s.transportOptions())
+	if err == nil {
+		return tr, nil
+	}
+	if errors.Is(err, netx.ErrNoTransport) {
+		if !s.awaitsAddress {
+			return nil, fmt.Errorf("no usable network address for media yet (is the network up?). isshoni starts once "+
+				"there is one; systemd and Docker try again by themselves: %w", err)
+		}
+		s.log.Warn("no local network address can carry media yet (is the network up?): isshoni starts without media sockets",
+			slog.String("component", "netx"), logx.Err(err))
+		if s.mux != nil {
+			_ = s.mux.ICE().Close()
+		}
+		return nil, nil
+	}
+	var le *netx.ListenError
+	if !errors.As(err, &le) {
+		return nil, fmt.Errorf("server: %w", err)
+	}
+	key, configured := "listen.ice_udp", s.cfg.Listen.ICEUDP
+	if le.Proto == "tcp" {
+		key, configured = "listen.ice_tcp", s.cfg.Listen.ICETCP
+	}
+	_, port, _ := net.SplitHostPort(le.Addr)
+	switch {
+	case errors.Is(err, syscall.EADDRINUSE):
+		return nil, fmt.Errorf("port %s/%s is in use (another isshoni?). Stop it, or change %s (now %q): %w",
+			port, le.Proto, key, configured, err)
+	case errors.Is(err, fs.ErrPermission):
+		return nil, fmt.Errorf("isshoni may not listen on %s = %q (a port below 1024 needs CAP_NET_BIND_SERVICE, "+
+			"which the systemd unit and the container image grant): %w", key, configured, err)
+	default:
+		return nil, fmt.Errorf("server: listen on %s = %q: %w", key, configured, err)
+	}
+}
+
+// iceAddrs returns the Transport's ICE listeners as bound, for Addrs: the first UDP socket, and the ICE-TCP
+// listener of listen.ice_tcp. The Transport does not name that listener, so its port is the one the Transport
+// advertises for it, and its host the configured one. Either is nil when that listener is off, and both are on a
+// server without a Transport.
+func iceAddrs(configuredTCP string, tr *netx.Transport) (udp, tcp net.Addr) {
+	if tr == nil {
+		return nil, nil
+	}
+	if tr.UDPMux != nil {
+		if addrs := tr.UDPMux.GetListenAddresses(); len(addrs) > 0 {
+			udp = addrs[0]
+		}
+	}
+	for _, adv := range tr.Advertised {
+		if adv.Via != netx.ViaTCP7882 {
+			continue
+		}
+		host, _, _ := net.SplitHostPort(configuredTCP)
+		ip, _ := netip.ParseAddr(host) // the zero Addr for an empty host: every address
+		tcp = net.TCPAddrFromAddrPort(netip.AddrPortFrom(ip, adv.Addr.Port()))
+		break
+	}
+	return udp, tcp
+}
+
+// mediaPorts is the media part of the "ready" line (04 §6.1 step 10): the ports that the server's ICE candidates
+// name, "media udp/7882 ice-tcp 443,7882". A transport that is off shows as "off".
+func mediaPorts(advertised []netx.AdvertisedAddr) string {
+	ports := map[string]string{} // by Via
+	for _, adv := range advertised {
+		if _, seen := ports[adv.Via]; !seen {
+			ports[adv.Via] = strconv.Itoa(int(adv.Addr.Port()))
+		}
+	}
+	udp, ok := ports[netx.ViaUDP]
+	if !ok {
+		udp = "off"
+	}
+	var tcp []string
+	for _, via := range []string{netx.ViaTCP443, netx.ViaTCP7882} {
+		if p, ok := ports[via]; ok {
+			tcp = append(tcp, p)
+		}
+	}
+	if len(tcp) == 0 {
+		tcp = []string{"off"}
+	}
+	return "media udp/" + udp + " ice-tcp " + strings.Join(tcp, ",")
 }

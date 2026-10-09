@@ -21,6 +21,7 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/httpapi"
 	"github.com/MoonWX/isshoni/internal/server/netx"
 	"github.com/MoonWX/isshoni/internal/server/ops"
+	"github.com/MoonWX/isshoni/internal/server/sfu"
 	"github.com/MoonWX/isshoni/internal/server/signal"
 	"github.com/MoonWX/isshoni/internal/server/store"
 	"github.com/MoonWX/isshoni/internal/server/tlsmgr"
@@ -43,8 +44,8 @@ type Deps struct {
 	// at the real cost.
 	Argon auth.ArgonParams
 	// STUN and Resolver are what public-address detection asks (04 §7.4). nil means netx.NewSTUNClient and
-	// net.DefaultResolver. Resolver also answers the TLS manager's look at its own domain (04 §8.7). Off mode needs
-	// no detection for its site; the wiring uses them there for the media addresses (README S59).
+	// net.DefaultResolver. Resolver also answers the TLS manager's look at its own domain (04 §8.7). The detection
+	// runs in every mode: off mode needs none for its site, but its media addresses are the detected ones too.
 	STUN     netx.STUNClient
 	Resolver netx.Resolver
 	// ReleaseHTTP is the HTTP client of the release check (04 §11.5). nil means a client of the server's own.
@@ -74,7 +75,8 @@ const (
 	// ShutdownStop is SIGTERM or SIGINT: the process exits. systemd's restart also sends SIGTERM, so clients are
 	// always told to expect the server back.
 	ShutdownStop ShutdownReason = "stop"
-	// ShutdownRestart is a restart the server asked for itself (rotate-secrets): Run returns ErrRestartRequested.
+	// ShutdownRestart is a restart the server asked for itself (rotate-secrets, and the public address that a server
+	// without one was waiting for, 04 §7.4): Run returns ErrRestartRequested.
 	ShutdownRestart ShutdownReason = "restart"
 	// ShutdownRestore is the restart after a restore: Run returns ErrRestartRequested.
 	ShutdownRestore ShutdownReason = "restore"
@@ -113,7 +115,7 @@ func NeedsOperator(err error) bool {
 }
 
 // Addrs are the addresses the server listens on, as bound: a configured port 0 (tests) shows as the port the
-// kernel picked. Later slices add the ICE ports and the metrics listener.
+// kernel picked. A later slice adds the metrics listener (README S85).
 type Addrs struct {
 	// HTTP is the listener on listen.http: the app itself in off mode; in the other modes the plain-HTTP port,
 	// which answers ACME http-01 challenges and redirects everything else to HTTPS (04 §8.3).
@@ -121,6 +123,15 @@ type Addrs struct {
 	// HTTPS is the 443 multiplexer on listen.https: HTTPS and WSS, and ICE-TCP by the first byte (04 §7.2). nil in
 	// off mode, where a proxy owns that port.
 	HTTPS net.Addr
+	// ICEUDP is the media socket on listen.ice_udp (04 §7.3): a *net.UDPAddr, nil when UDP is off. The server binds
+	// one socket per local address that carries media, all on one port; this is the first of them.
+	ICEUDP net.Addr
+	// ICETCP is the ICE-TCP listener on listen.ice_tcp: a *net.TCPAddr with the host as configured, nil when that
+	// listener is off. ICE-TCP on the HTTPS port needs no address of its own: it is HTTPS's (04 §7.2).
+	//
+	// Both are nil on a server that started without media sockets: one that waits for its public address on a
+	// machine without a local address for media (04 §6.2).
+	ICETCP net.Addr
 }
 
 // lifecycle states of a Server; they only move forward.
@@ -133,13 +144,19 @@ const (
 	stateStopped               // Shutdown finished, or Start failed
 )
 
-// Budgets of the shutdown steps (04 §6.4). Those of steps 3 to 6 add up to the default shutdown_timeout of 10 s,
-// which bounds the whole shutdown whatever the steps would like; only the store's close may go beyond it.
+// Budgets of the shutdown steps (04 §6.4). Those of steps 3 to 6 add up to half a second more than the default
+// shutdown_timeout of 10 s, which bounds the whole shutdown whatever the steps would like: a shutdown in which every
+// step runs out of time has that much less for its last one. Only the store's close may go beyond it.
 const (
-	hubShutdownBudget   = 2 * time.Second // step 3: the hub's server.shutdown and close 1012
-	mediaShutdownBudget = 1 * time.Second // step 4: SFU.Close, then Transport.Close (README S59)
-	httpShutdownBudget  = 5 * time.Second // step 5: http.Server.Shutdown on every server
-	tailShutdownBudget  = 2 * time.Second // step 6: the TLS manager and the admin socket
+	hubShutdownBudget = 2 * time.Second // step 3: the hub's server.shutdown and close 1012
+	// Step 4 has one budget for each of its two parts, so that the second never starts out of time. SFU.Close ends
+	// by itself after the second it gives its PeerConnections (02's closeTimeout, README §4); its budget is that
+	// second and a margin, so the step sees the SFU return and does not run out at the same moment. Transport.Close
+	// then closes sockets, which takes no time to speak of.
+	sfuShutdownBudget       = 1250 * time.Millisecond
+	transportShutdownBudget = 250 * time.Millisecond
+	httpShutdownBudget      = 5 * time.Second // step 5: http.Server.Shutdown on every server
+	tailShutdownBudget      = 2 * time.Second // step 6: the TLS manager and the admin socket
 	// storeCloseBudget is the store's own, at the end of step 6 and outside tailShutdownBudget: what closing it may
 	// take, also when the time above is used up. It is the one thing a shutdown that is out of time still waits for
 	// (see shutdown).
@@ -172,26 +189,35 @@ type Server struct {
 	failErr  error         // set before failed is closed
 
 	// What Start builds, in startup order; Shutdown releases it in reverse (04 §6.4).
-	lock     *config.DataDirLock
-	secrets  *config.SecretStore // the session, invite and resume keys (wire.go); the VAPID pair (README S71)
-	store    *store.DB           // 03's database (wire.go); closed last but the lock
-	public   netx.PublicAddrs    // the detected public addresses; zero in off mode until the SFU needs them (README S59)
-	detected bool                // the detection ran: the running server looks again on a ticker (public.go)
-	mux      *netx.PortMux       // the 443 multiplexer on listen.https; nil in off mode
-	httpLn   net.Listener        // listen.http
-	adminLn  net.Listener        // listen.admin_socket (04 §12.1)
-	tls      *tlsmgr.Manager     // the certificate, in every mode (off: a manager with nothing to do)
-	health   *ops.Health
-	accounts *auth.Service    // 03's account service; nil on a server without a site (wire.go)
-	hub      *signal.Hub      // 01's hub, mounted at GET /ws; nil without a site
-	api      *httpapi.API     // 03's REST API, mounted at /api/v1/; nil without a site
-	logLevel *ops.LogLevel    // the runtime log level; nil without Deps.LogLevel
-	admin    *ops.AdminServer // the admin socket's API, served on adminLn
-	gate     *httpapi.Gate
-	httpSrv  *http.Server   // the main server: on httpLn in off mode, on the multiplexer's TLS side otherwise
-	plainSrv *http.Server   // the port 80 server on httpLn (04 §8.3); nil in off mode
-	pending  pendingConns   // the HTTP connections without a request yet; the shutdown closes them
-	serving  sync.WaitGroup // the Serve goroutines of the HTTP servers; the shutdown's HTTP step waits for them
+	lock    *config.DataDirLock
+	secrets *config.SecretStore // the session, invite and resume keys (wire.go); the VAPID pair (README S71)
+	store   *store.DB           // 03's database (wire.go); closed last but the lock
+	public  netx.PublicAddrs    // the public addresses as detected at startup, in every mode (public.go)
+	mux     *netx.PortMux       // the 443 multiplexer on listen.https; nil in off mode
+	httpLn  net.Listener        // listen.http
+	adminLn net.Listener        // listen.admin_socket (04 §12.1)
+	// transport is the ICE sockets and muxes: listen.ice_udp, listen.ice_tcp, the multiplexer's ICE side. It is nil
+	// on the one server that starts without media: it waits for its public address on a machine that has no local
+	// address for media either (listenICE), and then media is nil too.
+	transport *netx.Transport
+	tls       *tlsmgr.Manager // the certificate, in every mode (off: a manager with nothing to do)
+	health    *ops.Health
+	media     *sfu.SFU         // 02's SFU on transport, behind 01's sfuplane (wire.go); closed before transport
+	accounts  *auth.Service    // 03's account service; nil on a server without a site (wire.go)
+	hub       *signal.Hub      // 01's hub, mounted at GET /ws; nil without a site
+	api       *httpapi.API     // 03's REST API, mounted at /api/v1/; nil without a site
+	logLevel  *ops.LogLevel    // the runtime log level; nil without Deps.LogLevel
+	admin     *ops.AdminServer // the admin socket's API, served on adminLn
+	gate      *httpapi.Gate
+	httpSrv   *http.Server   // the main server: on httpLn in off mode, on the multiplexer's TLS side otherwise
+	plainSrv  *http.Server   // the port 80 server on httpLn (04 §8.3); nil in off mode
+	pending   pendingConns   // the HTTP connections without a request yet; the shutdown closes them
+	serving   sync.WaitGroup // the Serve goroutines of the HTTP servers; the shutdown's HTTP step waits for them
+	// stopLimits ends the settings callback that passes the admin's limits on to the SFU (wire.go).
+	stopLimits func()
+	// awaitsAddress says that the site is the server's public address and the startup found none (04 §6.2): the
+	// server runs without a site, not ready, and restarts itself when a later look finds the address (public.go).
+	awaitsAddress bool
 
 	// run is the life of what the server does on its own: the admin socket's Serve, the janitor, the look at the
 	// public addresses, and the reads behind hooks that have no context (the readiness check "db", the router's
@@ -203,9 +229,17 @@ type Server struct {
 	setupDone atomic.Bool                      // an admin account exists: /setup answers 404 (spaStatus)
 	publicNow atomic.Pointer[netx.PublicAddrs] // the public addresses as last seen, once they differ from public
 
+	// restartAsked is closed when the server wants a restart for a reason of its own: the public address it was
+	// waiting for is there (public.go). Run then shuts down for ShutdownRestart.
+	restartOnce  sync.Once
+	restartAsked chan struct{}
+
 	// hookDraining, set by tests (under life), runs in Shutdown once readiness is off and the gate is closed, while
 	// the listeners still accept: the window in which the hub and the SFU say goodbye (steps 3 and 4).
 	hookDraining func()
+	// hookStep, set by tests (under life), runs in Shutdown right before a component is stopped, with its name:
+	// "signaling", "sfu", "transport", "http", "tls", "admin socket", "store", in the order of 04 §6.4.
+	hookStep func(step string)
 	// hookDetect, set by tests before Start, stands in for the public-address detection (04 §7.4), which reads
 	// the machine's interfaces: a test says what the server finds, at startup and at every later look.
 	hookDetect func() netx.PublicAddrs
@@ -230,13 +264,15 @@ func New(cfg *config.Config, log *slog.Logger, deps Deps) (*Server, error) {
 		return nil, &config.ValidationError{Problems: problems}
 	}
 	return &Server{
-		cfg:      *cfg,
-		warnings: warnings,
-		log:      log,
-		deps:     deps,
-		stopping: make(chan struct{}),
-		done:     make(chan struct{}),
-		failed:   make(chan struct{}),
+		cfg:          *cfg,
+		warnings:     warnings,
+		log:          log,
+		deps:         deps,
+		stopping:     make(chan struct{}),
+		done:         make(chan struct{}),
+		failed:       make(chan struct{}),
+		restartAsked: make(chan struct{}),
+		stopLimits:   func() {},
 	}, nil
 }
 
@@ -341,23 +377,22 @@ func (s *Server) Start(ctx context.Context) (err error) {
 		return err
 	}
 
-	// Step 5: detect the public addresses (04 §7.4; at most 5 s). The TLS modes need them now: ip mode's site and
-	// certificate are the address, manual mode's site is it too when there is no domain, and auto mode compares its
-	// domain's DNS records with it. Off mode takes its site from public_url, or localhost in dev; the media
-	// addresses there come with the SFU (README S59), which detects in off mode too. A server that has detected
-	// looks again every ten minutes while it runs (startBackground starts that ticker only when s.detected is set,
-	// so the off-mode detection sets it as the cases here do).
+	// Step 5: detect the public addresses (04 §7.4; at most 5 s), in every mode. They are what the server's ICE
+	// candidates name (04 §7.5), and the TLS modes need them for more: ip mode's site and certificate are the
+	// address, manual mode's site is it too when there is no domain, and auto mode compares its domain's DNS records
+	// with it. Off mode takes its site from public_url, or localhost in dev. The running server looks again every
+	// ten minutes (startBackground).
 	mode := s.cfg.EffectiveTLSMode()
-	switch {
-	case mode == config.TLSOff:
-	case s.hookDetect != nil:
-		s.public, s.detected = s.hookDetect(), true
-	default:
-		s.public, s.detected = s.detectPublicAddrs(ctx), true
+	if s.hookDetect != nil {
+		s.public = s.hookDetect()
+	} else {
+		s.public = s.detectPublicAddrs(ctx)
 	}
 
-	// Step 6: bind the listeners: the 443 multiplexer (not in off mode), listen.http, then the admin socket. The
-	// ICE transports come with the SFU (README S59: netx.NewTransport with transportOptions).
+	// Step 6: bind the listeners: the 443 multiplexer (not in off mode), listen.http, the admin socket, and then
+	// the ICE Transport: the only code that binds listen.ice_udp and listen.ice_tcp, and the reader of the
+	// multiplexer's ICE side (04 §7.3). A busy port ends the start; so does a machine without an address for media,
+	// except on a server that has to wait for its public address anyway.
 	if mode != config.TLSOff {
 		if s.mux, err = s.listenHTTPS(); err != nil {
 			return err
@@ -376,9 +411,16 @@ func (s *Server) Start(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+	// The site, now that the HTTP ports are bound, and whether the server has to wait for it. The Transport comes
+	// after it: a server that waits for its address may have to start without one (listenICE).
 	if s.site, err = s.newSite(mode); err != nil {
 		return err
 	}
+	s.awaitsAddress = siteIsAddress(&s.cfg, mode) && s.site.Origin == ""
+	if s.transport, err = s.listenICE(ctx); err != nil {
+		return err
+	}
+	s.addrs.ICEUDP, s.addrs.ICETCP = iceAddrs(s.cfg.Listen.ICETCP, s.transport)
 
 	// Step 7: the TLS manager. The certificate arrives in the background (04 §8): the listeners serve before it is
 	// there, and the readiness check "tls" says when it is.
@@ -389,8 +431,8 @@ func (s *Server) Start(ctx context.Context) (err error) {
 		return fmt.Errorf("server: %w", err)
 	}
 
-	// Step 8: build the components and register the readiness checks (04 §6.2): tls and public_ip here, db and
-	// signal with their components in wire; media comes with the SFU (README S59).
+	// Step 8: build the components and register the readiness checks (04 §6.2): tls and public_ip here; db, media
+	// and signal with their components in wire.
 	s.health = ops.NewHealth()
 	s.health.SetClientIP(httpapi.ClientIP)
 	s.health.AddCheck("tls", s.tls.Ready) // off mode: always ready, the proxy has the certificate
@@ -417,10 +459,8 @@ func (s *Server) Start(ctx context.Context) (err error) {
 			slog.String("component", "ops"))
 	}
 
-	// Step 9: start the HTTP servers and the admin socket, then the server's own work. The multiplexer's ICE side,
-	// s.mux.ICE(), has no reader yet: netx.NewTransport takes the multiplexer when the SFU runs in the server (README
-	// S59), and no candidate names port 443 before that. An ICE-TCP connection that arrives all the same waits in
-	// the multiplexer's queue, within its limits, until its client gives up or the server stops.
+	// Step 9: start the HTTP servers and the admin socket, then the server's own work. The multiplexer's ICE side
+	// has had its reader since step 6: the Transport's ICE-TCP mux (without a Transport that side is closed).
 	if mode == config.TLSOff {
 		s.serve(s.httpSrv, s.httpLn)
 	} else {
@@ -430,25 +470,27 @@ func (s *Server) Start(ctx context.Context) (err error) {
 	s.startBackground()
 	s.state, s.served = stateServing, true
 
-	// Step 10: one line that says where the server is, and how to finish setup while no admin exists. The media
-	// ports join the line with the SFU (README S59).
+	// Step 10: one line that says where the server is and which ports carry media, and how to finish setup while no
+	// admin exists.
 	listen := []any{slog.String("listen", s.addrs.HTTP.String())}
 	if mode != config.TLSOff {
 		listen = []any{slog.String("listen", s.addrs.HTTPS.String()), slog.String("listen_http", s.addrs.HTTP.String())}
 	}
-	if s.site.Origin == "" {
+	if s.awaitsAddress {
 		s.log.Warn(fmt.Sprintf("isshoni %s started without a public IP address (tls=%s) and is not ready: set public_ip "+
-			"to this server's public address, or set domain, and restart", version.Version(), s.site.TLSMode), listen...)
+			"to this server's public address, or set domain, and restart. isshoni looks for the address again every %s "+
+			"and restarts itself when it finds one", version.Version(), s.site.TLSMode, s.redetectInterval()), listen...)
 		return nil
 	}
-	s.log.Info(fmt.Sprintf("isshoni %s ready: %s (tls=%s)", version.Version(), s.site.Origin, s.site.TLSMode), listen...)
+	s.log.Info(fmt.Sprintf("isshoni %s ready: %s (tls=%s) %s", version.Version(), s.site.Origin, s.site.TLSMode,
+		mediaPorts(s.transport.Advertised)), listen...)
 	s.setupHint(ctx)
 	return nil
 }
 
 // startBackground starts what the server does on its own while it runs: the admin socket's API (04 §6.1 step 9),
-// 03's janitor, and the look at the public addresses every ten minutes (04 §7.4) when the server found them at
-// startup. The admin socket's goroutine ends with its Shutdown, the others with s.run.
+// 03's janitor, and the look at the public addresses every ten minutes (04 §7.4). The admin socket's goroutine
+// ends with its Shutdown, the others with s.run.
 func (s *Server) startBackground() {
 	admin, ln := s.admin, s.adminLn
 	s.background.Go(func() {
@@ -459,16 +501,10 @@ func (s *Server) startBackground() {
 	if accounts := s.accounts; accounts != nil {
 		s.background.Go(func() { accounts.RunJanitor(s.run) })
 	}
-	if s.detected {
-		every := s.redetectEvery
-		if every <= 0 {
-			every = publicRedetectEvery
-		}
-		first := s.public
-		s.background.Go(func() {
-			watchPublicAddrs(s.run, every, first, s.redetectPublicAddrs, s.publicAddrsChanged)
-		})
-	}
+	every, first := s.redetectInterval(), s.public
+	s.background.Go(func() {
+		watchPublicAddrs(s.run, every, first, s.redetectPublicAddrs, s.publicAddrsChanged)
+	})
 }
 
 // logConfigWarnings writes the config's warnings to the log, one line each with the key and the fix, so they reach
@@ -519,13 +555,16 @@ func (s *Server) fail(err error) {
 }
 
 // Run runs the server: Start (unless the caller already did), then it blocks until ctx is cancelled, a Shutdown
-// from elsewhere begins (a restore or rotate-secrets through the admin socket), or a listener fails. In each case
-// it finishes the graceful shutdown of 04 §6.4, within shutdown_timeout, before it returns. Its result says one
-// thing, so that cmd/isshoni can map it to an exit code:
+// from elsewhere begins (a restore or rotate-secrets through the admin socket), a listener fails, or the server
+// wants a restart of its own: one that started without the public address that is its site restarts when a later
+// look finds the address (04 §6.2, §7.4; public.go). In each case it finishes the graceful shutdown of 04 §6.4,
+// within shutdown_timeout, before it returns. Its result says one thing, so that cmd/isshoni can map it to an exit
+// code:
 //   - nil after a stop (ctx cancelled: SIGTERM or SIGINT in cmd/isshoni);
 //   - an error that wraps ErrShutdownForced after a stop that ran out of time and closed the rest by force. The
 //     server is stopped all the same: exit 0;
-//   - ErrRestartRequested after a shutdown for ShutdownRestart or ShutdownRestore, forced or not;
+//   - ErrRestartRequested after a shutdown for ShutdownRestart or ShutdownRestore, forced or not, which includes
+//     the restart the server wanted itself;
 //   - Start's error when the server could not start (see NeedsOperator);
 //   - the listener's error when one failed, whatever the shutdown after it had to do.
 //
@@ -542,14 +581,19 @@ func (s *Server) Run(ctx context.Context) error {
 			return err
 		}
 	}
+	why := ShutdownStop
 	select {
 	case <-ctx.Done():
 	case <-s.stopping:
 	case <-s.failed:
+	case <-s.restartAsked:
+		if ctx.Err() == nil { // a stop that came at the same moment wins: the operator's word
+			why = ShutdownRestart
+		}
 	}
 	// The run context is gone or about to be; the shutdown gets shutdown_timeout of its own. If a shutdown is
 	// already running or done, this waits for it and returns its result.
-	err := s.Shutdown(context.WithoutCancel(ctx), ShutdownStop)
+	err := s.Shutdown(context.WithoutCancel(ctx), why)
 
 	select {
 	case <-s.failed:
@@ -612,14 +656,17 @@ func (s *Server) Shutdown(ctx context.Context, reason ShutdownReason) error {
 		reason = ShutdownStop
 	}
 	s.state, s.reason = stateStopping, reason
-	draining := s.hookDraining
+	draining, before := s.hookDraining, s.hookStep
+	if before == nil {
+		before = func(string) {}
+	}
 	close(s.stopping)
 	s.life.Unlock()
 
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.ShutdownTimeout.Duration)
 	defer cancel()
 	start := time.Now()
-	err := s.shutdown(ctx, reason, draining)
+	err := s.shutdown(ctx, reason, draining, before)
 	took := slog.Duration("took", time.Since(start))
 	switch {
 	case err == nil:
@@ -639,8 +686,9 @@ func (s *Server) Shutdown(ctx context.Context, reason ShutdownReason) error {
 
 // shutdown is the sequence of 04 §6.4. Each step gets its budget, cut short by ctx; an error doesn't stop the
 // sequence, because the later steps release what the earlier ones depend on. A step whose time runs out closes by
-// force what it still has and returns its context's error (see stepError).
-func (s *Server) shutdown(ctx context.Context, reason ShutdownReason, draining func()) error {
+// force what it still has and returns its context's error (see stepError). before is called with a component's
+// name right before that component is stopped: tests watch the order with it.
+func (s *Server) shutdown(ctx context.Context, reason ShutdownReason, draining func(), before func(step string)) error {
 	// Steps 1 and 2: /readyz and /healthz answer 503 shutting_down, so monitors and load balancers stop sending;
 	// every other request and new /ws upgrade gets 503 server_shutdown with Retry-After: 5.
 	s.health.SetShuttingDown()
@@ -663,13 +711,30 @@ func (s *Server) shutdown(ctx context.Context, reason ShutdownReason, draining f
 	// (01 §11.6). The wire reason is "restart" whatever reason is: SIGTERM can't tell a stop from a restart, and the
 	// clients reconnect either way. A server without a site has no hub.
 	if s.hub != nil {
+		before("signaling")
 		step("signaling", hubShutdownBudget, func(ctx context.Context) error {
 			return s.hub.Shutdown(ctx, protocol.ShutdownReasonRestart)
 		})
 	}
-	// Step 4 (README S59), within mediaShutdownBudget: SFU.Close, then Transport.Close.
+
+	// Step 4: the SFU ends what the hub left (every share, with server_shutdown) and closes its PeerConnections,
+	// all at once; then the Transport closes the ICE sockets and muxes under it, the multiplexer's ICE side
+	// included. The order matters: the SFU never closes a socket, and the Transport must outlive it (02 §6.1), so
+	// each has a budget of its own and the Transport's begins when the SFU has returned. Only an SFU that breaks
+	// its word and is still closing when its budget ends has the Transport closed under what it still holds, which
+	// is what "by force" means here; either call then finishes on its own. A server that started without media
+	// sockets has neither (listenICE).
+	if s.media != nil {
+		before("sfu")
+		step("sfu", sfuShutdownBudget, func(ctx context.Context) error { return within(ctx, s.media.Close) })
+	}
+	if s.transport != nil {
+		before("transport")
+		step("transport", transportShutdownBudget, func(ctx context.Context) error { return within(ctx, s.transport.Close) })
+	}
 
 	// Step 5: the HTTP servers, then the 443 multiplexer.
+	before("http")
 	step("http", httpShutdownBudget, s.shutdownHTTP)
 
 	// Step 6, in tailShutdownBudget altogether: the TLS manager, now that nothing handshakes any more; then the
@@ -683,8 +748,11 @@ func (s *Server) shutdown(ctx context.Context, reason ShutdownReason, draining f
 			errs = append(errs, stepError(tailCtx, name, err))
 		}
 	}
+	before("tls")
 	tail("tls", s.tls.Shutdown)
 	s.stopRun()
+	s.stopLimits() // a settings change no longer reaches the SFU, which is closed
+	before("admin socket")
 	tail("admin socket", s.admin.Shutdown)
 	if s.logLevel != nil {
 		s.logLevel.Close()
@@ -694,6 +762,7 @@ func (s *Server) shutdown(ctx context.Context, reason ShutdownReason, draining f
 	// a shutdown that had the time this is the end of step 6 and takes milliseconds. In one that ran out of time (a
 	// request that had to be cut off) the store still gets storeCloseBudget, on top of what is over: giving up on
 	// the checkpoint too would leave the next start to recover it.
+	before("store")
 	storeCtx, cancelStore := context.WithTimeout(context.WithoutCancel(ctx), storeCloseBudget)
 	defer cancelStore()
 	err := within(storeCtx, func() error {
@@ -780,11 +849,18 @@ func (s *Server) release(ctx context.Context) {
 	if s.hub != nil {
 		_ = s.hub.Shutdown(stopCtx, protocol.ShutdownReasonRestart) // no socket yet: this only ends the hub's context
 	}
+	s.stopLimits()
+	if s.media != nil {
+		_ = s.media.Close() // no connection has joined: there is nothing to wait for
+	}
 	if s.logLevel != nil {
 		s.logLevel.Close()
 	}
 	if s.tls != nil {
 		_ = s.tls.Shutdown(stopCtx)
+	}
+	if s.transport != nil {
+		_ = s.transport.Close() // the ICE sockets, and the multiplexer's ICE side
 	}
 	if s.adminLn != nil {
 		_ = s.adminLn.Close() // removes the socket file
