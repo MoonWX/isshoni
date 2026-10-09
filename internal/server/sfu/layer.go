@@ -37,6 +37,16 @@ func (s Slot) String() string {
 	return "slot?"
 }
 
+// quality returns what a viewer who gets the slot's layer gets (SubscriptionStateEvent.Forwarded): high for the full
+// layer, low for the preview layer. The M5 middle layer counts as low until QualityMedium exists; the audio layer is
+// either forwarded or not, which is QualityHigh or QualityOff.
+func (s Slot) quality() Quality {
+	if s == SlotQ || s == SlotH {
+		return QualityLow
+	}
+	return QualityHigh
+}
+
 // monoBase anchors monoNow.
 var monoBase = time.Now()
 

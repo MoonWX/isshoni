@@ -1008,7 +1008,7 @@ The throttles are in-memory token buckets (decision 8), in `auth/limiter.go`. Ev
 | `auth-ip` | client IP | 20 | 1 per 15 s | Every attempt at login, register, setup/check+complete, reset/check+complete, invite/check, device/code and device/password *(later: M2)* | First, before any work |
 | `auth-user-ip` | username key (existing or not) + client IP | 5 | 1 per 2 min | Failed password checks | Before hashing, after `auth-ip`. A hard block |
 | `auth-user` | username key (existing or not) | 30 | 1 per 2 min | Failed password checks, from any IP | After `auth-user-ip`. When it is empty, the user's known IPs still pass (below) |
-| `register-ip` | client IP | 5 | 1 per 12 min | Sign-up requests without an invite (approval mode). Invite registrations are limited by the invite's own `maxUses` instead (the load test, 02, registers many users from one IP) | Before hashing, after `auth-ip` |
+| `register-ip` | client IP | 5 | 1 per 12 min | Every `register` request without an invite, in every mode (only the approval mode lets one through, below). Invite registrations are limited by the invite's own `maxUses` instead (the load test, 02, registers many users from one IP) | Right after `auth-ip`, before the mode check and any other work |
 | `auth-hash` | one for the whole server | 20 | 5 per s | Every public request that reaches the hash: login (the dummy hash too), register, setup/complete, reset/complete, device/password *(later: M2)* | Last: after all of the buckets above, before the semaphore (§7.2) |
 | `lookup` *(later: M2)* | session ID | 10 | 1 per min | Failed user-code lookups | Before lookup |
 | `push-test` | user ID | 1 | 1 per 10 s | `POST /push/test` | Before sending |
@@ -1036,6 +1036,16 @@ The throttles are in-memory token buckets (decision 8), in `auth/limiter.go`. Ev
   store or context error, and a correct password for an account that isn't `active`. An attempt that `auth-user`
   refuses holds no `auth-user-ip` token either; a known IP that goes on while `auth-user` is empty takes none from
   it.
+- **`register-ip` comes before the mode check** (S42; kept, decided after group 5). A `register` request without
+  an invite takes its `register-ip` token as its second step, whatever the registration mode is. So in the `invite`
+  and `closed` modes, where such a request can never succeed, an address that has spent its five tokens is answered
+  **429 `rate_limited`**, not 403 `invite_required` or `registration_closed`; with a token left it gets the 403.
+  The order stays: a throttle is checked before any other work, here as everywhere in this table, the handler has
+  one order for all three modes, and the limit on sign-up attempts per address holds across a change of the mode,
+  which an admin can make at any time. The cost is small: somebody who keeps posting sign-ups to an invite-only
+  server reads "too many attempts, wait" where the answer would say that an invite is needed. The web client
+  doesn't get there by itself: it links to the sign-up form only in the approval mode (05 §15.1). The first block
+  of an episode writes the `auth.throttled {scope: "ip"}` row like any other (below).
 - **`auth-hash`** caps the total rate of anonymous argon2 hashes, which the per-IP and per-username buckets can't: a
   stranger with many addresses (IPv6 /64s are cheap) could otherwise keep every hash slot busy with random usernames,
   and the SFU would compete for CPU. 5 hashes per second at about 50 ms each use a quarter of one core, about 1/8 of a
@@ -1280,6 +1290,51 @@ A username that is already taken, including by a pending user, gets 409 `usernam
 invite is validated, so usernames can't be enumerated without an invite. In approval mode anyone can probe names, at
 5 per hour per IP. That is accepted, and noted in §11.
 
+**The order as S42 built it** (`auth.Service.Register`). Steps 1 to 4 are the list's. Two refusals that the list
+leaves to the `Write` are answered before the hash as well, so a request that will be refused costs no hash:
+
+| # | Check | Answer |
+|---|---|---|
+| 1 | `auth-ip`, then, only without an invite, `register-ip` (§7.3: before the mode, in every mode) | 429 `rate_limited` |
+| 2 | the mode | 403 `registration_closed` (closed), 403 `invite_required` (invite mode without a token) |
+| 3 | with an invite: its state, read-only | 404 `invite_invalid`; 410 `invite_revoked`, `invite_expired` or `invite_used_up` |
+| 4 | the username and password rules | 422 `validation_failed` with a code per field |
+| 5 | without an invite: 50 sign-ups are pending already | 409 `limit_reached {limit: "pending_signups"}` |
+| 6 | the username is taken, by a pending sign-up too | 409 `username_taken` |
+| 7 | the `auth-hash` budget, then the hash, outside the transaction | 503 `server_busy` |
+| 8 | one `Write`, which checks 2, 3, 5 and 6 again at the moment of the change | the same answers; else 201 or 202 |
+
+Steps 3, 5 and 6 share one read. The field rules of step 4 are evaluated before that read (they are pure) but
+answered after step 3, so a bad invite is reported before a bad password. A token of the wrong shape is
+`invite_invalid` without a lookup. A revoked invite reads `invite_revoked` whatever else holds, and an expired one
+`invite_expired` even when it is used up as well. In the `Write`, a username taken in the meantime rolls the
+invite's use back, and the session of a cookie the request arrived with is deleted as in a login (§7.4). The
+`signup_pending` alert is raised after the commit, whether or not the client is still connected.
+
+**Invites as S42 built them** (`auth/invite.go`):
+- **Who may** is checked first, so a member without the permission learns nothing else: 403 `forbidden` for a
+  member while `membersCanInvite` is off, then 403 `registration_closed` in the closed mode, for admins and the CLI
+  too. Then the fields (422), then one `Write` that checks the permission again with the settings of that moment
+  and applies the limits (the member's 10 first, then the server's 100).
+- **`expiresInHours` and `maxUses`**: left out or `0` means the setting's default; anything else outside 1–720 and
+  1–1000 is `out_of_range`.
+- **The note** is free text for the admin's own use ("for Sam"), at most 64 characters, stored as it is
+  normalized:
+  1. more than 256 bytes of input → `too_long`, before any other work;
+  2. bytes that are not valid UTF-8, or U+FFFD (what a JSON decoder leaves of bad bytes) → `invalid`;
+  3. surrounding white space is dropped; an empty note is fine and stored as empty;
+  4. PRECIS OpaqueString, the profile of free text (§3.3): NFC, and non-ASCII spaces become U+0020. Control
+     characters, a line break among them, are refused → `invalid`;
+  5. more than 64 characters after that → `too_long`.
+
+  A stored note normalizes to itself. The note goes into the `invite.created` audit row with `maxUses` and
+  `expiresAt`.
+- **Revoking is idempotent.** An invite that was revoked before keeps its first revocation, writes no second audit
+  row and answers 204 again. An expired or used-up invite can be revoked too, and then reads as revoked. A member
+  revokes only its own invites, whether or not `membersCanInvite` is still on; anything else is 404 `not_found`.
+- **`invite/check`** takes an `auth-ip` token, answers 403 `registration_closed` in the closed mode before it looks
+  at the token, and uses nothing up.
+
 **Approval queue**:
 - `GET /api/v1/admin/approvals` lists pending users: username, request time and sign-up IP (from the audit row).
 - **Approve**: `status=active`, `approved_by` and `approved_at` are set, and `user.approved` is audited. The user can
@@ -1291,6 +1346,15 @@ invite is validated, so usernames can't be enumerated without an invite. In appr
   `user.signup_rejected {all: true, count}` row with no target and answers 200 `{rejected: n}`. The admin page's
   "Reject all" button (05) is for a flood of fake sign-ups (§11). A real sign-up that arrived a moment before is
   rejected too; its username is free again, so that friend just signs up once more.
+  - **On an empty queue** (S42) it changes nothing: 200 `{rejected: 0}`, no audit row, and no `admin.approvals`
+    notification (§12.5). An audit row "rejected 0 sign-ups" would only be noise, and two admins who press the
+    button at the same moment get one row with the count, not two.
+  - No body, `{}` and `{"all": false}` are not the request: `all` is then looked up as a user ID, which no user
+    has (IDs are 12 characters), and gets 404 `user_not_found`. `null` reads like an absent value, as the body
+    and as `all`'s value. 400 `bad_request` is for a body that is not JSON, for a JSON array, string, number or
+    boolean, and for an `all` of another type than a boolean.
+- **Approve** and **Reject** of a user that doesn't exist, or isn't pending any more (another admin answered
+  first), are 404 `user_not_found`. Approve answers 200 with the user as the admin list shows it; Reject 204.
 - **Expiry**: pending rows expire after 14 days (janitor).
 - Pending users get no session in M1, so there is no "you were approved" push. Their page says "An admin will review
   your request. Try logging in later."
@@ -1586,6 +1650,9 @@ func (s *Service) IssuePasswordReset(ctx context.Context, a store.Actor, id stor
 func (s *Service) CheckPasswordReset(ctx context.Context, token string, m ReqMeta) (username string, err error)
 func (s *Service) CompletePasswordReset(ctx context.Context, token, password string, m ReqMeta) (LoginResult, error)
 func (s *Service) UserByUsername(ctx context.Context, username string) (store.User, error) // CLI lookups
+// UpdateSettings applies an admin's settings patch (PATCH /admin/settings, §9) and raises the
+// registration_mode_changed alert (§7.11). Added by S42; see below.
+func (s *Service) UpdateSettings(ctx context.Context, a store.Actor, patch map[string]json.RawMessage) (SettingsChange, error)
 
 type UserChange struct {
 	Username      *string
@@ -1593,6 +1660,10 @@ type UserChange struct {
 	Status        *store.UserStatus // "active" | "disabled" only
 	ActorPassword string            // required when granting admin (not for the CLI)
 }
+
+// SettingsChange is the outcome of UpdateSettings: the effective settings before and after the patch. They are
+// equal when the patch changed nothing.
+type SettingsChange struct{ Before, After store.Settings }
 
 // ---- maintenance ----
 func (s *Service) RunJanitor(ctx context.Context) // blocks until ctx is done (§4.7)
@@ -1630,6 +1701,28 @@ reaches the client. An `*api.Error` that comes out of a `Write` (for example `se
 return the same kind of error until then: `fmt.Errorf("auth: %s not implemented: %w", method,
 api.NewError(api.CodeInternal))` (README S24). `New` is the exception: it runs before anything serves, and its errors
 (a bad option, the store) are plain errors.
+
+**`UpdateSettings` and `SettingsChange`** (S42) are an addition to this API: its first version had no call for the
+settings, which left `PATCH /admin/settings` with the cache's own `Update` (§9). The handler goes through `auth`
+instead, for three reasons:
+- **The alert needs the actor.** A change of `registrationMode` raises `registration_mode_changed` with the acting
+  admin's name (§7.11). The cache's `OnChange` callbacks don't get the actor, and only `auth` holds the
+  `AdminAlerter`. The alert is raised after the commit, whether or not the client is still connected.
+- **The actor is checked in the `Write` that changes the settings**, like in every other admin call (`a` is an
+  admin or `store.CLIActor`): an admin who was demoted or disabled a moment ago changes nothing and gets 403
+  `forbidden`, before the patch is looked at. The same `Write` holds `SettingsCache.UpdateTx` with its audit row
+  (`settings.changed`; a row that changes `registrationMode` is a security event, §10); the cache swaps and its
+  `OnChange` callbacks run after the commit.
+- **`Before` and `After` are exactly this call's change.** Calls are serialized (one settings update at a time),
+  so two admins who save at once each get their own pair. httpapi reads it to decide what to notify (§12.5):
+  nothing when the two are equal, `admin.settings` otherwise, and `me` for everyone when `MembersCanInvite`
+  differs.
+
+The patch's rules are `UpdateTx`'s (§9): a pinned field is `*api.Error{setting_locked}` with `params.field` (409)
+whatever value is sent, a bad value (`null` too) is `validation_failed` with a code per field (422), unknown names
+are ignored, and a patch that changes nothing writes nothing: no audit row, no alert. No other path changes a
+setting an admin can patch while the server serves (`setup/complete` sets only the server name, before any admin
+exists; config pins its fields before the listeners start), so the pair can't miss a change made elsewhere.
 
 ---
 
@@ -1708,6 +1801,11 @@ func (c *SettingsCache) OnChange(fn func(old, new Settings)) (cancel func())
 Fields:{...}}`, and a pinned field gets 409 `setting_locked`. The new values and the `settings.changed` audit row
 (with `{changes:{field:{from,to}}}`) are written in one `Write`. After the commit, the cache swaps and `OnChange`
 callbacks run.
+
+`PATCH /api/v1/admin/settings` does not call `Update` itself: it goes through `auth.Service.UpdateSettings`
+(§7.13, S42), which runs `UpdateTx` in a `Write` that also checks the acting admin, raises the
+`registration_mode_changed` alert and returns the settings before and after. A body that is not a JSON object
+(`null` included) is 400 `bad_request`; the answer to a patch that changes nothing is 200 with the current settings.
 
 What a patch does in the cases the paragraph above leaves open (S23's choices; `UpdateTx` behaves the same):
 - **`null` is invalid.** A field sent as `null` gets the field code `invalid`, like a value of the wrong type. PATCH
@@ -2428,12 +2526,25 @@ type InfoSource interface {
 | User renamed or role changed | `{UserID: target}`: `me`; `{Admins}`: `admin.users` |
 | User disabled, enabled, deleted, signed out, reset link issued | `{Admins}`: `admin.users` |
 | Sign-up requested, approved or rejected | `{Admins}`: `admin.approvals`, `admin.users` |
-| Invite created, revoked or used by a registration | `{Admins}`: `admin.invites`; `{UserID: creator}`: `admin.invites` when a member created it |
+| Invite created or revoked | `{Admins}`: `admin.invites`; `{UserID: creator}`: `admin.invites` when a member created it |
+| Invite used by a registration | `{Admins}`: `admin.invites` **and `admin.users`**; `{UserID: creator}`: `admin.invites` when a member created it; `{UserID: the new user}`: `devices` (the session row below) |
 | Settings changed | `{Admins}`: `admin.settings` |
 | `membersCanInvite` changed | `{All}`: `me` (members' `permissions.createInvites`) |
 | A session created or revoked; a device linked or revoked (M2) | `{UserID}`: `devices` |
 
 Only REST handlers notify. Janitor expiry and admin-CLI changes are picked up at the SPA's next refetch.
+
+As S42 built these rows (`httpapi/auth.go`, `invites.go`, `admin_users.go`, `admin_settings.go`):
+- **A registration with an invite also notifies `admin.users`.** It uses up an invite and creates a user in one
+  step, so the admins' user list is stale as much as their invite list; the first version of the table named only
+  `admin.invites`. A sign-up without an invite is the row above it (`admin.approvals`, `admin.users`).
+- **The invite's creator is told only when it is a member.** Admins are reached by `{Admins}` already, and members
+  list only their own invites. For a new invite the creator is the caller, so its role is known; for a revocation
+  or a registration the handler reads the invite's creator and its current role after the commit, with a context
+  that doesn't end with the request. An invite from the CLI, or one whose creator was deleted, has nobody else to
+  tell. If that read fails, the member's notification is skipped with a WARN line; the admins' one has gone out.
+- **Nothing is sent for a change that didn't happen**: a settings patch that changed nothing, and "Reject all" on
+  an empty queue (§7.9). Revoking an invite that was revoked before still notifies, since the handler can't tell.
 
 The DTOs in `internal/protocol/api` (tygo → TS; 01's tygo config gains this package) are:
 - `Info`, `AccountRules`;
@@ -2864,3 +2975,8 @@ slice.
 
 Decided at integration: **invites from non-admins** stay behind the setting `membersCanInvite`, default **off**, in
 line with the plan's "an admin plus invite links".
+
+Decided after group 5 (an engineering call the owner delegated; README §6): **the sign-up throttle answers before
+the registration mode.** In the `invite` and `closed` modes a `register` request without an invite takes its
+`register-ip` token first, so an address that has used its tokens up gets 429 `rate_limited` where the mode alone
+would answer 403. It stays as S42 built it; §7.3 has the reasons and §7.9 the full order.

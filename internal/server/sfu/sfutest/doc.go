@@ -7,16 +7,19 @@
 // the fake media's markers (layer, frame, flash, beep), keyframes, gaps, packets recovered by RTX, the final loss
 // after 1 s, and the sender reports. The checks of the S4 spike work on those records (CheckContinuous,
 // CheckStartsOnSPS), plus the marker checks, the GOP bitrate and Viewer.AVOffset (flash against beep, both mapped to
-// NTP through the last sender reports). REMBs are fixed values a test sends with Viewer.SendREMB.
+// NTP through the last sender reports). WithoutPartialTail and WithoutCutFrames leave out the frames that may be
+// short by design: the newest one of a running stream, and the old layer's last one at a layer switch. REMBs are
+// fixed values a test sends with Viewer.SendREMB.
 //
 // FaultConn wraps a UDP socket to lose chosen datagrams or black-hole a peer; tests inject it as the SFU's socket
 // through 04's netx.TransportOptions.PacketConns, or under a Go client through webrtc.NewICEUDPMux.
 //
 // Harness is a real sfu.SFU on a loopback netx.Transport (UDP, and on request the ICE-TCP listener and 04's 443
 // multiplexer, all on ephemeral ports of 127.0.0.1), without a hub: each joined Conn gets a DirectSignaler, which
-// records the Conn's sub offers and events and can answer the offers with a Viewer, and a RoomEventLog records the
-// SFU's RoomEvents with the time of each call. Publish runs a publish.Publisher's side of a pub negotiation, with
-// its tracks bound to a share (Bindings). The SFU's in-process integration tests (02 §17) are written on these.
+// records the Conn's sub offers and events and can answer the offers with a Viewer (WaitAnswered tells when the Conn
+// has an answer), and a RoomEventLog records the SFU's RoomEvents with the time of each call. Publish runs a
+// publish.Publisher's side of a pub negotiation, the first one or a re-offer, with its tracks bound to a share
+// (Bindings). The SFU's in-process integration tests (02 §17) are written on these.
 //
 // Later slices add the rest of the package from 02 §4 and §17 with the first test that needs each part: a FaultConn
 // under the Harness's UDP socket (README S57, S63), REMB from the rembsim model and a FaultConn rate limit (S84).

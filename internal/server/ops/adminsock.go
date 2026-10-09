@@ -285,9 +285,7 @@ type AdminServer struct {
 
 	// The connections that have not sent a request header yet. Shutdown closes them itself: http.Server.Shutdown
 	// would wait up to 5 s for each, longer than the whole step may take (04 §6.4 step 6).
-	connMu  sync.Mutex
-	closing bool
-	fresh   map[net.Conn]struct{}
+	fresh freshConns
 }
 
 // Limits of the admin socket's HTTP server. There is no read or write timeout: backup and restore stream for as
@@ -325,7 +323,7 @@ func NewAdminServer(o AdminOptions) *AdminServer {
 		IdleTimeout:       adminIdleTimeout,
 		MaxHeaderBytes:    adminMaxHeaderBytes,
 		Protocols:         &protocols,
-		ConnState:         s.trackConn,
+		ConnState:         s.fresh.track,
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			if ac, ok := c.(*adminConn); ok && ac.known {
 				return context.WithValue(ctx, peerUIDKey{}, ac.uid)
@@ -354,7 +352,7 @@ func (s *AdminServer) Serve(ln net.Listener) error {
 // request must not wait for Shutdown: it would wait for itself.
 func (s *AdminServer) Shutdown(ctx context.Context) error {
 	s.stopOnce.Do(func() { close(s.stopping) })
-	s.closeFresh()
+	s.fresh.closeAll()
 	err := s.srv.Shutdown(ctx)
 	if err != nil {
 		_ = s.srv.Close()
@@ -364,38 +362,4 @@ func (s *AdminServer) Shutdown(ctx context.Context) error {
 		return fmt.Errorf("ops: closing the admin socket: %w", err)
 	}
 	return nil
-}
-
-// trackConn is the server's ConnState hook: it follows each connection until its first request header is in.
-func (s *AdminServer) trackConn(c net.Conn, state http.ConnState) {
-	s.connMu.Lock()
-	if state != http.StateNew {
-		delete(s.fresh, c)
-		s.connMu.Unlock()
-		return
-	}
-	closing := s.closing
-	if !closing {
-		if s.fresh == nil {
-			s.fresh = make(map[net.Conn]struct{})
-		}
-		s.fresh[c] = struct{}{}
-	}
-	s.connMu.Unlock()
-	if closing {
-		_ = c.Close() // accepted between closeFresh and the moment the listener closed
-	}
-}
-
-// closeFresh closes every connection that has not sent a request yet, and makes trackConn close the ones that are
-// still accepted afterwards.
-func (s *AdminServer) closeFresh() {
-	s.connMu.Lock()
-	s.closing = true
-	conns := s.fresh
-	s.fresh = nil
-	s.connMu.Unlock()
-	for c := range conns {
-		_ = c.Close()
-	}
 }

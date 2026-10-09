@@ -13,7 +13,7 @@ import (
 // minimumFixtures is the fixture set 01 §14.3 requires for M1.
 var minimumFixtures = strings.Fields(`
 	hello.web hello.resume hello.bearer welcome welcome.resumed
-	ping pong room.join ok.room.join room.leave room.state
+	ping pong room.join ok.room.join room.leave room.state room.state.admin
 	room.event.share.started room.event.share.stopped room.event.participant.left
 	share.start ok.share.start share.update share.stop
 	pc.offer.pub pc.answer.pub pc.offer.sub pc.answer.sub pc.ice pc.ice.end
@@ -66,6 +66,60 @@ func TestFixturesRoundTrip(t *testing.T) {
 				t.Errorf("encoded message has null at %s: %s", p, out)
 			}
 		})
+	}
+}
+
+// TestParticipantAdminIsAdditive: ParticipantInfo.admin came after the first fixtures (01 §8.5, §14.1). A room.state
+// from before the field still decodes, to members, and encodes again without the key; room.state.admin.json holds
+// the field; an explicit false is read as absent.
+func TestParticipantAdminIsAdditive(t *testing.T) {
+	load := func(name string) (RoomState, []byte) {
+		t.Helper()
+		raw, err := os.ReadFile(filepath.Join(fixtureDir, name+".json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		env, err := ParseEnvelope(raw)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		st, err := Decode[RoomState](env)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		out, err := Marshal(env.Type, env.ID, env.Re, st)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		return st, out
+	}
+	admins := func(st RoomState) []bool {
+		var out []bool
+		for _, p := range st.Participants {
+			out = append(out, p.Admin)
+		}
+		return out
+	}
+
+	before, out := load("room.state")
+	if got := admins(before); !reflect.DeepEqual(got, []bool{false, false}) {
+		t.Errorf("room.state.json (no admin key): admin = %v, want members only", got)
+	}
+	if strings.Contains(string(out), `"admin"`) {
+		t.Errorf("a member encodes with an admin key: %s", out)
+	}
+
+	with, out := load("room.state.admin")
+	if got := admins(with); !reflect.DeepEqual(got, []bool{true, false}) {
+		t.Errorf("room.state.admin.json: admin = %v, want the first participant only", got)
+	}
+	if n := strings.Count(string(out), `"admin":true`); n != 1 {
+		t.Errorf("room.state.admin.json encodes %d admin keys, want 1: %s", n, out)
+	}
+
+	var p ParticipantInfo
+	if err := json.Unmarshal([]byte(`{"userId":"k3m9p2qxw7ht","name":"Alex","admin":false}`), &p); err != nil || p.Admin {
+		t.Errorf("an explicit false: admin = %v, %v", p.Admin, err)
 	}
 }
 

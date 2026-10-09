@@ -275,7 +275,8 @@ invite, login and room pages show it above their content.
 
 ## 5. Routes
 
-React Router data router; every page except the room is a lazy chunk. `RequireAuth` loads the `['me']` query and
+React Router data router; every page is in a lazy chunk, the room too ("The room is a lazy folder" below).
+`RequireAuth` loads the `['me']` query and
 redirects to `/login?next=<path>` on a 401 `unauthenticated` (§6.2). `RequireAdmin` also needs `me.user.role === "admin"` (else
 NotFound, so admin pages aren't advertised). `RequireInviter` allows admins and users with
 `me.permissions.createInvites`, else NotFound; only `/admin/invites` uses it. `next` is accepted only if it starts with `/` and not `//` (open-redirect guard). No route segment
@@ -283,8 +284,8 @@ contains a dot (04 §9.5 serves dotted paths as files).
 
 | Path | Page | Access | Chunk | Notes |
 |---|---|---|---|---|
-| `/` | RootRedirect | user | main | → `/r/<lastRoomId>` if that room still exists, else `/r/<defaultRoomId>` (from `GET /api/v1/rooms`) |
-| `/r/:roomId` | RoomPage | user | main (eager) | Lounge by default (§11–§13). `?focus=<shareId>` focuses that share (push links, 04 §14.3) |
+| `/` | RootRedirect | user | rooms | → `/r/<lastRoomId>` if that room still exists, else `/r/<defaultRoomId>` (from `GET /api/v1/rooms`) |
+| `/r/:roomId` | RoomPage | user | rooms | Lounge by default (§11–§13). `?focus=<shareId>` focuses that share (push links, 04 §14.3) |
 | `/login` | LoginPage | public | auth | `?next=`; trust-model lines (§6.3); "Forgot your password? Ask an admin for a reset link." (03 §7.10) |
 | `/invite` | InvitePage | public | auth | Token in the fragment: `/invite#<token>` |
 | `/signup` | SignupPage | public | auth | Only when `info.registration === "approval"`; otherwise redirects to `/login` |
@@ -317,7 +318,7 @@ page slice edits it. Each route names one page component and the folder it comes
 
 | Folder | Named exports of `<folder>/index.ts` | Chunk |
 |---|---|---|
-| `rooms/` | `RootRedirect`, `RoomPage` | main (eager) |
+| `rooms/` | `RootRedirect`, `RoomPage`; and `InRoomBar`, which the layout shows above the other pages (§11.1) | `rooms` |
 | `auth/` | `LoginPage`, `InvitePage`, `SignupPage`, `PendingPage`, `ResetPage`, `AboutPage` | `auth` |
 | `setup/` | `SetupPage`, `WelcomePage` | `setup` |
 | `account/` | `AccountPage`, `DevicesPage`, `NotificationsPage` | `account` |
@@ -325,19 +326,72 @@ page slice edits it. Each route names one page component and the folder it comes
 | `download/` | `DownloadPage` | `download` |
 
 - A page folder's entry module is `<folder>/index.ts` (or `index.tsx`), and it exports the folder's pages as **named**
-  exports with exactly these names. The router picks a page by its export name and reads no default export.
-- The router finds the entry modules with `import.meta.glob` (`../auth/index.{ts,tsx}` and so on): the lazy folders
-  as loaders, so each is one chunk fetched on the first visit to one of its routes, and `rooms/` with
-  `{eager: true}`, so the room is in the main chunk.
+  exports with exactly these names. The router picks a page by its export name and reads no default export. The
+  entry module also imports the lazy namespaces that the folder's pages use ("Lazy namespaces" below).
+- The router finds the entry modules with `import.meta.glob` (`../auth/index.{ts,tsx}` and so on), all of them as
+  loaders, so each folder is one chunk fetched on the first visit to one of its routes.
+- **The room is a lazy folder** (W00, group 6). Until group 6 `rooms/` was imported with `{eager: true}` and the
+  room was part of the entry chunk. But the page, the session and the signaling client are about 24 KB gzip, and
+  `/login`, `/invite` and `/setup`, where a friend first arrives, need none of it. Three things go with the move:
+  - **The first page is asked for early.** `preloadRoute(pathname)` of `app/router.tsx` calls the loaders of the
+    folders that the path's routes name, which is exactly what the router will load for that path. `startApp` calls
+    it with the first path just before `GET /api/v1/info` (§4 step 4): the router, which would ask, only exists
+    once `/info` has answered, so without this every first page would wait one more round trip, and the room would
+    be slower than before. The chunk and `/info` now travel together, for every page. Boot skips it while
+    `navigator.onLine` is false: a failed `import()` is not tried again by every browser, and the router's own
+    import of the same chunk would fail with it once the server is back. A folder that can't be loaded is the
+    router's to report (`RouteErrorBoundary`, "Something went wrong" with Reload).
+  - **`InRoomBar` comes with the folder.** `RootLayout` no longer imports `rooms/`: the router gives it the
+    `InRoomBar` export of `rooms/index.ts` as `above`, from the moment the folder is loaded. Before that, no page
+    of this page load has made the room's runtime, and the bar would render nothing anyway (§11.1), so no page
+    fetches the room's code to show an empty bar. Nothing in the entry chunk may import `rooms/`, `viewer/` or
+    `share/` statically; `share/presets.ts`, the content hint that the picker's provider sets
+    (`platform/browser/displayMedia.ts`), is the one file of them there.
+  - **Vitest still has the room up front.** The tests of `rooms/` render the app's routes under a faked clock and
+    look for the room after one tick (`rooms/testing/page.tsx`). A lazy route can't do that: its page is there one
+    render later, and a first `import()` takes real time. So in the `test` mode `router.tsx` loads `rooms/` with
+    its own module (a top-level `await import()` behind `import.meta.env.MODE === 'test'`) and `defaultSources()`
+    gives it as `AppRouteSources.eager`, the same seam the page tests use for their stand-in of the room: such a
+    folder's routes have their `Component` from the start and no `lazy`. A build drops the branch. What a build
+    does is tested with named sources and in the `production` mode (`app/router.test.tsx`) and on the build itself
+    (`app/chunks.node.test.ts`). Once the tests of `rooms/` load the folder themselves and wait for the route,
+    this branch can go.
 - **The room's media chunk** (`rooms/media.ts`; S45, group 5 integration). The room page, its header and the session
-  are in the main chunk; the code that only a joined room needs is one lazy chunk, so the initial JS stays inside
-  §17.3's budget: the stage with its tiles (`RoomStage`, `ViewerLayout`), `ShareButton` with its sheet and warning,
-  `SharePanel`, `TapToStartPill`, `SubscriberPC` and the stats collector. The room page asks for it as it renders
-  (`loadMedia.ts`, `lazyMedia.ts`), and the runtime with the first sub offer (`lazySubscriber.ts`) and the first
-  `room.state` (`connectStats.ts`). A module of `viewer/`, `share/` or `lib/stats` that the main chunk imports itself
-  (`viewer/services.ts`, the stores, `lib/stats/debugHandle.ts`) must not import any of these: `createViewer` gets
-  the `SubscriberPC` class from its caller for that reason. `share/`'s publisher (`BrowserSharing`, `PublisherPC`)
-  is still in the main chunk, through `platform/browser/displayMedia.ts`.
+  are in the `rooms` chunk; the code that only a joined room needs is a second lazy chunk: the stage with its tiles
+  (`RoomStage`, `ViewerLayout`), `ShareButton` with its sheet and warning, `SharePanel`, `TapToStartPill`,
+  `SubscriberPC` and the stats collector. The room page asks for it as it renders (`loadMedia.ts`, `lazyMedia.ts`),
+  and the runtime with the first sub offer (`lazySubscriber.ts`) and the first `room.state` (`connectStats.ts`). A
+  module of `viewer/`, `share/` or `lib/stats` that the `rooms` chunk imports itself (`viewer/services.ts`, the
+  stores, `lib/stats/debugHandle.ts`) must not import any of these: `createViewer` gets the `SubscriberPC` class
+  from its caller for that reason.
+- **The publisher chunk** (W00, group 6). `share/`'s publisher (`BrowserSharing` with its `PublisherPC` and
+  `BrowserShare`) is a lazy chunk too: most friends watch, so most visits never need it. The main chunk keeps only
+  the picker. `platform.sharing` (§8) is `createBrowserSharing()` of `platform/browser/displayMedia.ts`, the same
+  `SharingProvider` as before, whose two calls split the work:
+  - `pick()` opens the picker itself, with nothing awaited before `getDisplayMedia` (the click's transient
+    activation, §13.1), and then asks for the publisher's code without waiting for it, so the chunk arrives while
+    the user chooses what to share;
+  - `start()` waits for the publisher and hands over to it. The publisher is made once and kept: it owns the pub PC,
+    one per signaling client (§13.6). When the chunk can't be fetched, `start()` rejects with `LocalError`
+    `offline` before anything is sent, and the next pick or start fetches it again.
+
+  `BrowserShare` is also a static import of the media chunk (`shareUi.ts` and `SharePanel.tsx` read its error
+  classes), so the room page loads it with the stage; `BrowserSharing` and `PublisherPC` wait for the first pick.
+  Nothing in the main chunk may import one of the three, and neither the `rooms` chunk nor the media chunk may
+  import `BrowserSharing` or `PublisherPC` (through `share/`'s barrel, say): they would load on every visit to a
+  room.
+- **Lazy namespaces** (W00, group 6; §16.5). The texts of a namespace that only lazy folders use are not in the main
+  chunk either. A page folder's entry module imports `i18n/lazy/<ns>.ts` for each such namespace its pages use
+  (`admin/` → `admin`; `account/` and `download/` → `account`; `setup/` → `setup`), which puts the namespace's
+  file in that folder's chunk, or in a small chunk the folders share, and adds it to the catalog when the chunk
+  runs. The router has a page only once its folder's entry module has run, so a lazy route waits for its namespace
+  without any code of its own, and no page shows a bare key.
+- `app/chunks.node.test.ts` builds the app in memory and fails when one of these modules is in the initial chunks
+  again: the page folders' pages, the room's among them, with its session and signaling client (and any other file
+  of `rooms/`, `viewer/`, `share/` or `conntest/`), the media chunk's modules, the publisher, and the lazy
+  namespaces (each of which must also come with the folders that use it). It also fails when the publisher is part
+  of what a room visit loads (the `rooms` chunk, the media chunk and their static imports), and when the entry
+  chunk has more than the one `import()` of the `rooms` chunk, which is how Vitest's branch would show in a build.
 - A folder that doesn't exist yet, or an export that is missing, renders `PageUnavailable` (a missing `AdminLayout`
   renders just its child page). A page slice adds its folder's `index.ts` and exports, and its routes start working
   with no change to `router.tsx`.
@@ -989,6 +1043,10 @@ with W9 (until then it throws). `stats()` resolves with a fresh `StatsSample` (`
 `{connection: {state, resumed, connectionId}, room: {roomId, joinState, rev, participants}, viewer}`, where `viewer`
 is `viewerDebugState` (`focusedShareId`, `audibleShareId`, `audio`, `audioPlaying`, `media`, `subGen`, `shares[]`).
 
+Since the group 6 integration the tiles' freeze watch (§12.6, `viewer/freeze.ts`) reads the same collector:
+`connectStats` calls `attachFreezeWatch(viewer, collector)` when the collector exists and ends it with the runtime.
+It comes with the media chunk (`rooms/media.ts`), like the collector.
+
 ---
 
 ## 11. Room session and presence (`src/rooms/`)
@@ -1134,6 +1192,49 @@ Other rules:
   available yet", and the notifications card (§16.3).
 - The document title shows live state: `● 2 live · Lounge · isshoni`, and `● Sharing · …` while you share.
 
+**The page as README S45 built it** (`rooms/RoomPage.tsx`, `RoomHeader.tsx`, `AccountMenu.tsx`, `PeoplePanel.tsx`,
+`RoomSwitcher.tsx`, `RoomStage.tsx`, `roomTitle.ts`; the group 5 integration wired the viewer, the share panel and
+the stats into it, §5 and §10.7). Where it differs from the list above, or settles what the list leaves open:
+
+- **"Invite friends" is a link, not a card.** The account menu has one entry for invites, shown to admins and to
+  members with `me.permissions.createInvites` (`canInvite(me)`, `app/guards.ts`): **Invite friends**, a link to
+  `/admin/invites`. That page creates an invite and shows its link once (§15.3); a member sees only their own
+  invites there (`RequireInviter`, §5), so the same entry is their "My invites", and there is no second one.
+  Creating the invite right in the menu, with the `InviteLinkCard` of §14.1, arrives with that card: the setup
+  wizard's step 3 builds it (README S87), and the menu can use it from then on.
+- **The account menu's entries**, in order: Account (`/account`), Notifications (`/account/notifications`),
+  Invite friends (as above), Admin (`/admin`, admins only: other users would get NotFound), Install app (only while
+  the browser offers an install prompt, §16.3; read when the menu opens), Test my connection (opens the
+  connection test of §14.2 in a dialog, for a user whose video is poor on a connection that is up), About, and Sign
+  out (the logout flow of §15.1; the page doesn't navigate, the guard does once `['me']` is `null`).
+- **The admin badge shows on every participant who is an admin** (decided after group 5; README F02), as the list
+  above says. S45 could show it on the user's own row only, because `room.state` said who is in the room, not who
+  is an admin (01 §8.5), and the page knew the role of nobody but its own user (`GET /api/v1/me`).
+  `ParticipantInfo` gains the additive field `admin` (01 §8.5), which the hub fills from the user's role, and the
+  panel reads it per row; README F02 does both. A snapshot without the field (an older server) reads as "nobody
+  is an admin". The badge is a label, never a permission: admin actions are REST calls the server checks.
+- **People panel.** A drawer (`Sheet`) opened by the people count. A person who is `reconnecting` is dimmed and
+  says so (§11.1). A person who shares has the "Sharing" badge; a click on them focuses their newest share that
+  has a tile (not one that is still `starting`, 01 §4.4) and closes the panel. The user's own row reads
+  "alex (you)". The page keeps the panel mounted and closes it through `open`, so the browser gives the focus back
+  to the people count (§16.6); closed, it renders no rows.
+- **Share controls.** The header's Share button and the empty state's one are both `share/`'s `ShareButton`
+  (§13.1). There is no separate Stop button in the header: the `SharePanel` under the stage has it (§13.7), and
+  the header shows `viewer/`'s "Tap to unmute" pill (§10.3).
+- **Switching rooms while sharing asks first**: "Stop sharing and switch to {room}?" (§11.1: joining another room
+  ends this page's share). The switcher exists only while `showRoomList` is true, with "Create room" for admins
+  under the same condition.
+- **Document title**: `● Sharing · Lounge · isshoni` while this page shares, `● 2 live · Lounge · isshoni` while
+  others do, `Lounge · isshoni` otherwise.
+- **Lazy chunks.** The stage, the Share button, the share panel and the pill are the room's media chunk (§5), which
+  the page asks for as it renders, with placeholders of the stage's and the button's shape, so the header is there
+  at once. The connection test's panel is a chunk of its own, loaded by hand when its dialog first opens: a load
+  that fails shows a message with a retry inside the dialog, where a failed `React.lazy` would take the page, and
+  the stream on it, to the error screen. The test starts when the user presses its button, not when the dialog
+  opens (the server limits probes per user, 04 §7.7).
+- **Still to come**, each with its slice: the in-app browser banner above the page and the notifications card in
+  the empty state (§16.3, README S77), and `?focus=<shareId>` (§12.2).
+
 ---
 
 ## 12. Viewer (`src/viewer/`)
@@ -1239,6 +1340,12 @@ the next `welcome` re-sends everything. The constants are `SUBSCRIBE_DEBOUNCE_MS
 - Fullscreen: `requestFullscreen()` on the stage container, so overlays stay visible. iPhone:
   `video.webkitEnterFullscreen()` (audio keeps playing from the `<audio>` element). Otherwise a CSS pseudo-fullscreen
   overlay. Toggle with `F`, double-click or double-tap on the stage, or the button.
+  - The app's toasts are outside that container, and a browser draws nothing outside the fullscreen element. So
+    while an element is fullscreen, `app/Toasts.tsx` renders its region into it (a portal into
+    `document.fullscreenElement`, or the prefixed one, followed with `fullscreenchange`), and back in its own place
+    afterwards: "bo started sharing [Watch]" (§12.2) reaches the friend who watches fullscreen. It stays where it is
+    for a fullscreen `<video>` or `<iframe>`, which show no children. A toast that is on screen when fullscreen
+    begins or ends starts its time again.
 - PiP (`requestPictureInPicture` on the stage video): desktop only. It's hidden on iOS in M1 (plan: PiP unreliable).
 - Wake lock: `navigator.wakeLock.request('screen')` while a share is being watched and the page is visible. It's
   released when hidden and re-requested on `visibilitychange → visible`.
@@ -1284,7 +1391,8 @@ The tile list is a roving-tabindex group (one tab stop). Shortcuts are active wh
 - A one-time hint on iOS: "Keep isshoni open while watching. Video pauses when you switch apps." (dismissal stored).
 - No PiP on iOS in M1; fullscreen is the native video player on iPhone.
 - Android Chrome: background audio keeps playing (rule 1 in §12.4). `navigator.mediaSession.metadata` is set to
-  `{title: "bo's window", artist: "<room>"}` so the notification shade shows what's playing.
+  `{title: "bo's window", artist: "<room>"}` so the notification shade shows what's playing. The room page gives
+  the layout the room's name for it (`RoomStage`'s `roomName`, the name the header shows).
 
 ---
 
@@ -1368,12 +1476,61 @@ hand-over to `start`):
   the focus would fall to `<body>`. When what a button's sheet started ends without a share (the sheet, the picker
   or the warning was cancelled, the capture or the start failed), that button takes the focus back, unless the
   focus has gone somewhere else meanwhile.
-- Until the share panel exists (S46), `ShareButton` reports how the flow ended: a failed capture or start as an
+- On a page without a share panel, `ShareButton` reports how the flow ended: a failed capture or start as an
   error toast, and the "no sound is shared" notes of §13.3 (`share/notes.ts`) as an info toast that stays 10 s.
+  While a `SharePanel` is mounted (S46; the room page always has one) the buttons leave both to it: the panel shows
+  a failed start with its error, and the note in its bar, and the button only announces the note once for screen
+  readers.
 - "Already sharing from another tab or device" is `share/elsewhere.ts`: `findShareElsewhere(shares, {userId,
   connectionId})` returns this user's share from another connection, in any status (a `starting` or `stalled` one
   counts too: a second share would not replace it).
-- `BrowserSharing.start` and `PublisherPC` are declared and reject with `NotImplementedError` until S46.
+- S35 declared `BrowserSharing.start` and `PublisherPC` with bodies that rejected with `NotImplementedError`; S46
+  wrote them (below).
+
+How S46 built the second half (`starting` to the end; `share/BrowserSharing.ts`, `BrowserShare.ts`,
+`PublisherPC.ts`, `shareUi.ts`):
+- **Who routes what.** `BrowserSharing` keeps one `PublisherPC` per signaling client (a page has one) and listens
+  on that client itself: `pc.answer`, `pc.ice`, `pc.restart` and errors in scope `pc` about the pub PC go to the
+  `PublisherPC`; `room.state`, `quality.hint` and errors in scope `share` go to the share they name. The room
+  session routes none of this: it starts and stops the `ActiveShare` it got from `start()` and tells it when the
+  server ended it (`serverEnded`, the session's `ShareRecovery` seam, §11.1).
+- **`start()`** checks before anything is sent: no live video track → `LocalError capture_failed`; no H.264
+  encoder → `h264_unavailable` (§13.4 step 8), so the server never makes a share that could not be published. Then
+  `share.start {kind, preset, audio, ref}` (a fresh random `ref`; only the kind of the pick, never a title), the
+  tracks on the pub PC, its offer. A refused `share.start` rejects with the server's error. Once the server has
+  the share, a failure (the tracks can't be added, an error about the share arrives meanwhile, the capture ends:
+  `ShareCancelledError`) sends `share.stop` again before it rejects. On a rejection the source is the caller's to
+  release.
+- **`BrowserShare`** is the `ActiveShare` (§8): `starting` → `live` once a `room.state` lists the share as no longer
+  `starting`; `live` ⇄ `reconnecting` with the pub PC's state; then `ended`. It ends by `stop()` (the Stop button,
+  leaving the room, logout), by the capture ending on its own (the browser's "Stop sharing" bar, the shared window
+  closing), by `serverEnded(reason)`, by an error in scope `share` about it, or when the pub PC gives up. Every end
+  runs in the order of the diagram: `share.stop` first (when the server is to be told), then the transceivers (a
+  re-offer, or `pc.close` when no share is left), then the capture tracks. `stop()` never rejects.
+- **"Stopped from another tab or device" waits 300 ms** (`END_NOTICE_GRACE_MS`). For a share whose offer had no
+  usable H.264 the hub sends `codec_not_supported` (scope `share`) and then ends the share with `stopped` (01 §9
+  rule 7, §15.4). The page does not depend on that order: after a `stopped` or `left` the notice waits that long
+  for an error about the share; if one comes, the share is `failed` with that error and the notice isn't shown.
+- **What the user sees for each end**: `stopped` or `left` → `idle` with the toast (`share.ended.elsewhere`);
+  `media_timeout` → `failed` with a `ShareEndedError` of kind `media_timeout` and [Test my connection]; any other
+  reason, and the `room.state` fallback → `failed` with kind `server`; `room_closed` → nothing here (the session
+  shows the room's end, §6.3); an error in scope `share` → `failed` with that error's text.
+- **A pub PC whose negotiation failed twice within a minute** (01 §9 rule 8) ends the share with
+  `PubNegotiationFailedError` (a `LocalError webrtc_failed`). That is not shown as a failed share that can be
+  started again: `linkShareUi` turns it into the app's Fatal screen "Can't connect media" with Reload (§9). A start
+  that failed once is a plain `webrtc_failed` and stays a failed share in the panel.
+- **`linkShareUi(shareStore, uiStore)`** (`share/shareUi.ts`) ties the share to the app-wide UI, once and for good:
+  `uiStore.sharing` is true while the phase is `starting`, `live`, `reconnecting` or `stopping` (the update pill
+  offers no Reload meanwhile, §16.2), a notice becomes a toast, and the error above becomes the Fatal screen. It
+  is a link and not a component because the share outlives the room page (§11.1): every Share button and panel
+  sets it up when it mounts, and it keeps working on `/account` and `/admin`.
+- **The page's machine follows one share**, the first (`shareStore.publishing`); a second share on the same page
+  would run without it (the M1 UI starts one). `shareStore` gained the publisher's half for this: `publishing`,
+  `advance`, `report` (`preset`, `params`, `withAudio`, `soundOn`, `hint`, `unreachable`) and `finish`, and the
+  fields `soundOn`, `unreachable`, `notice` and `panels` (how many share panels are mounted).
+- **Not here yet** (README S81, the web recovery slice): `BrowserShare.resync` and re-publishing with `replaces`,
+  and the 60 s capture hold of §13.6. Until then the room session stops a share whose server side is gone (a
+  `welcome` that was not resumed).
 
 ### 13.2 `getDisplayMedia` options (plan values, feature-detected)
 
@@ -1464,6 +1621,26 @@ its code on 2026-09-29), and isshoni's desktop app keeps voice apps out. Buttons
 8. No H.264 encoder at all → `errors.local.h264_unavailable` ("This browser can't send H.264 video. Use Chrome or
    Edge."). The server answers the same case with `codec_not_supported` (scope `share`).
 
+As S46 built these steps (`share/encodings.ts`, `codecPrefs.ts`, `PublisherPC.ts`):
+- **Step 8 runs first.** `BrowserSharing.start` asks `canSendH264` before it sends `share.start`, so a browser
+  without an encoder never makes the server create a share. `PublisherPC.addShare` checks again and rejects with
+  the same error.
+- **The source size may be unknown** when the transceiver is made (`getSettings()` has no width before the first
+  frame). The source is then taken to fill the largest pixel budget exactly, so the layers still get their
+  proportions (`f` 1, `q` 3 for 1080p and 360p), and the 2 s size check of step 7 corrects them once the track
+  reports its size.
+- **The single-encoding fallback** of step 2 is one `f` encoding built from the same `ShareParams`
+  (`buildSingleEncoding`).
+- **Codec preferences** list H.264 with `packetization-mode=1` and RTX and nothing else: no VP8, VP9 or AV1, and no
+  RED or FEC entries either. The profile order after the preferred one is step 3's.
+- **Negotiation.** `createOffer`, `setLocalDescription`, `setRemoteDescription` and `setParameters` never
+  interleave: every operation on the PC runs in one promise queue, and each is given up when the PC is closed or
+  replaced meanwhile (an operation on a closed `RTCPeerConnection` may never settle). At most one offer is
+  outstanding; what changes meanwhile is folded into one follow-up offer. `addShare` resolves once the share's
+  m-sections are in an offer that went out, or wait for the outstanding offer's answer. It rejects with
+  `h264_unavailable`, `capture_failed` (no video track) or `webrtc_failed`, with nothing of the share left on the
+  PC.
+
 ### 13.5 Presets
 
 The preset is sent in `share.start`/`share.update`; the server turns it into `ShareParams`. The client adds the parts
@@ -1480,6 +1657,15 @@ that only the browser can set:
 - **Changing the preset while live**: `request('share.update', {shareId, preset})` returns new `ShareParams`; the
   client applies `encodings` and `contentHint` at once and, if `audioBitrate` changed, re-offers the pub PC so the
   answer carries the new Opus `maxaveragebitrate` (01 §8.7).
+  - As S46 built it (`BrowserShare.setPreset`, from the panel's preset picker): after the reply,
+    `PublisherPC.setPreset` sets the track's `contentHint` and the sender's `degradationPreference`, then
+    `applyParams` applies the encodings by `rid`, the audio sender's cap and, when `audioBitrate` changed, the
+    re-offer. When the server refuses the update the share goes on as it was and an error toast says why. The
+    picked preset is saved as the next share's default (`prefsStore`, §6.1).
+  - Only the page that publishes a share changes its preset in M1. A `share.update` sent from another tab or
+    device changes what `room.state` shows, but the publishing page is not told and keeps encoding as before
+    (01 §8.7, decided after group 5: `quality.hint` with reason `preset` is not sent in M1; it comes with the M2
+    desktop handoff). The M1 UI offers no such control, so nothing in the web client depends on it.
 
 ### 13.6 `PublisherPC` and server hints
 
@@ -1526,6 +1712,64 @@ export class PublisherPC {
   with "Sharing stopped: the server was unreachable".
 - `beforeunload` shows the browser's leave prompt while sharing.
 
+**`PublisherPC` as S46 built it.** The methods of the listing exist as written. It has more:
+
+```ts
+export type PublisherSignal = SignalClientLike & Partial<Pick<SignalClient, 'state' | 'welcome' | 'onState'>>;
+export interface PublisherPCDeps {
+  platform: Pick<Platform, 'createPeerConnection'>;
+  signal: PublisherSignal;
+  log: Logger;
+  capabilities?: (kind: 'audio' | 'video') => readonly RTCRtpCodec[];  // default: RTCRtpSender.getCapabilities
+}
+export type PubMediaState = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'unreachable' | 'failed';
+export class PublisherPC {
+  // … the listing above, and:
+  readonly state: PubMediaState;
+  readonly shareIds: string[];                                  // oldest first
+  on(event: 'state', fn: (state: PubMediaState) => void): () => void;
+  setPreset(shareId: string, preset: Preset): Promise<void>;    // contentHint and degradationPreference (§13.5)
+  handleError(e: WireError): void;                              // error notifications in scope pc about the pub PC
+  shareStats(shareId: string): Promise<{ video: RTCStatsReport | null; audio: RTCStatsReport | null }>;
+  targetHeight(shareId: string): number | undefined;            // the full layer's intended height, for the hints
+}
+```
+
+- **`signal` is the client by its structural type, plus what the PC reads when it is there.** In the app the
+  object is 01's `SignalClient`, and the PC uses its `state`, `welcome` (the ICE servers) and `onState`; a
+  `SignalClientLike` without them (tests) is taken as always ready, with no ICE servers.
+- **States.** `idle` (no PC), `connecting` (the first time), `connected`, `reconnecting` (it was connected before),
+  `unreachable` (5 rebuilds didn't connect: the panel says "Can't reach the server's media port" and offers the
+  connection test; rebuilds go on, 30 s apart), `failed` (negotiation failed twice within 60 s; only `close()`
+  leaves it). Connectivity is the worse of `connectionState` and `iceConnectionState`.
+- **Recovery is the pub column of §9's table**: `disconnected` → `signal.probe()` at once and, still disconnected
+  after 3 s, `restartIce()` with a new offer in the same `gen`; an ICE restart not connected after 15 s, a failed
+  PC, or the server's `pc.restart {pub, rebuild}` → rebuild (`gen + 1`, the same tracks and share ids); at most one
+  ICE restart per 5 s and one rebuild per 10 s. A `pc.restart` for an older `gen` is ignored.
+- **Signaling not ready**: changes are only recorded. On `ready` after a resumed `welcome` the outstanding offer
+  goes out again with the same `neg`, unsent candidates follow, and a PC that isn't connected restarts ICE: a
+  disconnected one, and one still connecting although its offer was answered (one whose offer is outstanding
+  waits for that answer; a failed one is rebuilt). After a `welcome` that was not resumed the server has no pub PC
+  and `gen` starts at 1 again (01 §9 rule 2), whether or not a PC exists here at that moment: the local PC is
+  dropped without a message, and the shares stay known, parked, until they are removed or published again (S81).
+  The PC listens to the signaling state for its whole life for this.
+- **Errors in scope `pc`** (`handleError`): one that names the outstanding offer clears it. `sdp_invalid` and
+  `bad_request` → one rebuild, and `failed` the second time within 60 s (01 §9 rule 8), as for an offer or answer
+  that can't be applied locally. `stale_negotiation` is ignored. `rate_limited` → the offer goes out again after
+  `retryAfterMs` (1 s when the server names none). Others are logged.
+- **Candidates.** Local ones are trickled with `pc.ice`; those that can't be sent yet are kept, at most 64 (beyond
+  that the oldest is dropped). Remote ones (the M1 server sends none) wait for the remote description of their
+  `gen`, with the same bound.
+- **`close()`** closes the PC on purpose and forgets the shares. When an offer was made since the last close (the
+  server may have a pub PC), it sends `pc.close {pc: 'pub', gen}`; one that couldn't be sent goes out on the next
+  resumed `ready`. The object stays usable: the next `addShare` makes a new PC with the next `gen`. `removeShare`
+  of the last share does the same as `close()`.
+
+`BrowserShare` adds, on top of `ActiveShare` (§8): `setPreset(preset)`; `setAudioEnabled(on)`, the panel's sound
+switch (off sets `track.enabled = false`, so silence is sent and the audio m-section stays; no renegotiation);
+`stats()`, one sample of the outbound stats every 2 s while live, which feeds the hints of §13.7; and
+`setPaused()`, which rejects with `NotSupportedError` in M1.
+
 ### 13.7 Sharer panel and hints
 
 The `SharePanel` is a bottom bar on desktop: red dot, "You're live · Window · Movie · 3 watching", **Stop**,
@@ -1538,6 +1782,34 @@ and an expander with the preset picker, a **sound on/off** toggle, a level meter
   and its height is below the target size → "Your upload allows about 720p" (height rounded to 360, 480, 540, 720, 900
   or 1080). It clears after 10 s without a bandwidth limit.
 - **CPU hint**: `cpu` for 6 s → "Your computer is struggling to encode. Try the Text preset or share a smaller window."
+
+As S46 built the panel (`share/SharePanel.tsx`, `LevelMeter.tsx`, `levelAudio.ts`, `hints.ts`, `watchers.ts`):
+- **It is a view of `shareStore`'s second half**: nothing while `idle`, `picking` or `confirming`; "Starting…" with
+  Stop; the live bar; "Reconnecting…" while the pub PC recovers, or "Can't reach the server's media port" with
+  [Test my connection] once the PC is `unreachable`; "Stopping…"; and a failed share with its error (and [Test my
+  connection] after a `media_timeout`) until it is dismissed. The room page mounts it once, under the stage, with
+  `share = RoomSession.share`, `onStop = session.stopShare` and `watchers = shareWatchers(room.state, shareId)`.
+- **Stop is disabled while the share is `starting` and the session has no share yet.** `share.start` is still on
+  its way then, the session has nothing to stop, and a click must not look as if it worked while the share goes
+  live anyway. The browser's own "Stop sharing" bar works throughout.
+- **The note of a pick without sound shows in the bar itself** (§13.3: "Live, with the note"), from the start of
+  the share: friends hear nothing, and the sharer has to see that without opening anything. With the expander
+  open, the note is where the sound switch would be. The upload and CPU hints show in the bar too.
+- **The sound switch** exists only for a share that has an audio track. Off sends silence (`track.enabled`), and
+  the level meter stops.
+- **Level meter.** One `AudioContext` per page, made in the Share click (a browser lets it run only after a user
+  gesture, Safari only when it is created or resumed inside one). Nothing is ever connected to its destination:
+  the captured sound is measured, never played back to the sharer. The context runs only while something is
+  metered: the click unlocks it, then it is suspended until the panel's settings open a meter, and again when the
+  last meter closes, so a sharer who never opens the settings has no audio thread left behind.
+- **Hints** are pure (`createHintDetector`), fed by one sample of the full layer's outbound stats every 2 s while
+  the share is live. Both turn on after 3 consecutive limited samples and off after 10 s without that limit; the
+  CPU hint clears the same way as the upload hint. "Below the target size" is an encoded height under 95 % of the
+  height the full layer is meant to send (`PublisherPC.targetHeight`), since encoders round sizes a little. A hint
+  only explains what the sharer sees; nothing is changed because of it.
+- **Watchers**: `shareWatchers` resolves `share.watchers` to names through `room.state.participants`; one whose
+  participant the snapshot doesn't list shows as "Someone". The count the share went live with is not announced;
+  later changes are, once the count has been the same for 5 s.
 
 ### 13.8 Which browsers can share
 
@@ -1811,6 +2083,47 @@ component (`InAppBrowserBanner.tsx`, with `inAppBanner.ts`) and the lines that s
   (`GET /api/v1/me/devices`) are listed in the same page and are empty until M2.
 - `/account/notifications`: see §16.3.
 
+**The pages as README S48 built them** (`web/src/account/`; `AccountPage`, `DevicesPage` and the shared
+`AccountShell`):
+
+- **`AccountShell`, not a layout route.** The router declares the three account pages side by side under
+  `RequireAuth` (§5), so each page wraps its content in `<AccountShell>`: a way back to the room, the page's
+  `<h1>`, the links between the account pages, then the page's sections. `/account/notifications` renders the
+  router's `PageUnavailable` until S77 writes the page; the shell already links to it.
+- **`/account`** shows the username and the role ("Admin" or "Member") with Sign out, then the two forms:
+  - *Change password*: `POST /api/v1/me/password {currentPassword, newPassword}` → 200 with this session's cookie
+    rotated. The note about the other devices is shown up front, above the form. 403 `wrong_password` shows under
+    "Current password", with the field focused and its content selected (`useWrongPassword`: `auth/useSubmit.ts`
+    puts only `validation_failed` and `username_taken` under fields); 422 names the fields; 429 and 503
+    `server_busy` count down. After a change the form starts over empty, a confirmation takes the focus, and
+    `['me','sessions']` and `['me','devices']` are invalidated, since the other sessions are gone.
+  - *Delete account*: a button opens a dialog that asks for the password; each opening is a new dialog with an
+    empty field. `POST /api/v1/me/delete {password}` → 204 with the cookie cleared. 403 `wrong_password` shows
+    under the field, 409 `last_admin` gets its own explanation (the only admin can't leave, and what to do about
+    it). Afterwards a toast says the account is gone.
+- **`/account/devices`**: this browser first, then the most recently seen. Each row has the name the server made
+  from the User-Agent, "Last active 3 minutes ago" with the exact time as a tooltip (a server clock a little ahead
+  reads "now", never "in 20 seconds"), and the last address.
+  - Another browser's row has **Revoke** (`DELETE /api/v1/me/sessions/{id}` → 204). A 404 `not_found` counts as
+    done: it was signed out already (it expired, or another tab revoked it). The row leaves at once and the list
+    is refetched; the focus goes to the section's heading, because the button that had it is gone.
+  - "Sign out other browsers" shows only while the list has another browser.
+  - "Log out everywhere" asks first: it ends this browser's session too (03 §7.7).
+  - Linked devices are a second list on the same page, each with Revoke (`DELETE /api/v1/me/devices/{id}`); it is
+    empty in M1 and says so.
+  - Both lists are about who can act as this user, so a visit always asks the server (`staleTime` 0), and 01's
+    `devices` invalidation refreshes them while the page is open. A list that can't be loaded shows the reason with
+    "Try again", above whatever an earlier answer still shows.
+- **When the server ended the session as part of another request** ("Log out everywhere" and deleting the account
+  both answer 204 with the cookie cleared), the tab still shows the user, its signaling connection may be open, its
+  push subscription exists in the browser and the other tabs don't know. That is the logout flow's own list, so
+  the page runs that flow as it is (`account/sessionEnded.ts`, §15.1): its `POST /api/v1/auth/logout` has nothing
+  left to end and answers 204 all the same. When even that request can't be made, the two steps that need no server
+  still happen: the other tabs are told and this one forgets the user. The page doesn't navigate by itself: the
+  flow ends with `['me']` set to `null`, and the guard goes to `/login`, like after any sign-out. (With a signaling
+  connection the server's `session_revoked` may already have made the guard do that, and two navigations racing
+  would leave the address to chance.)
+
 ### 15.3 Admin pages
 
 | Page | Content | Calls |
@@ -1827,6 +2140,67 @@ component (`InAppBrowserBanner.tsx`, with `inAppBanner.ts`) and the lines that s
 **Bandwidth calculator**: a small form (people, sharing, thumbnails, quality, preset, hours) that calls 04's
 `GET /api/v1/admin/bandwidth` (one implementation for CLI and UI, 04 §13.4) and shows egress, per-viewer rate and GB
 per session.
+
+**The pages as README S49 built them** (`web/src/admin/`: Users, Approvals, Invites, Rooms, Settings and Audit;
+the Dashboard and Doctor pages are README S91's, and until then their routes show the router's `PageUnavailable`
+inside the layout, whose navigation already lists them).
+
+Shared parts:
+- **`AdminLayout`** is the layout route (§5): the way back to the room, the admin navigation with the approvals
+  badge (`me.badges`), and the page. A member who may create invites reaches `/admin/invites` through
+  `RequireInviter` and gets the page **without the navigation**: the other admin pages are NotFound for them, so
+  they aren't advertised.
+- **`adminApi.ts`**: one query per list under the shared query keys, so 01's `invalidate` topics reach them. Lists
+  refetch when the window gets the focus again (§6.2); the audit log doesn't, because it is paged. After its own
+  change a page refreshes its list itself: the server's `invalidate` goes out over the room's WebSocket, which an
+  admin page opened by its address doesn't have.
+- **`ActionDialog` and `useAction`**: one dialog per action that needs a question, a field or the admin's own
+  password, and one submit flow: check the fields, send, then finish or show what the server's code means.
+  - While the request is on its way the dialog can't be left (no Cancel, no ✕, no Esc, no click beside it): the
+    change can't be taken back any more, and its answer belongs to this dialog, a one-time link that must be shown
+    or a "done" that would otherwise close whatever dialog the admin opened next.
+  - The request is sent at once (`networkMode: 'always'`) and never retried, so a browser that reports itself
+    offline can't hold a request back and keep the dialog shut.
+- **Errors** (`formProblem.ts`): `validation_failed` shows each code under its control; `wrong_password` goes under
+  the admin's own password field, `username_taken` and `room_name_taken` under the name that was typed; everything
+  else (`last_admin`, `self_action_forbidden`, …) is one message above the buttons, from `errors.<code>`. After a
+  failed submit the focus moves to the first invalid control (§16.6).
+- **`OneTimeLink`** shows an invite or reset link once, selected and with the focus, with "Copy it now" under it.
+  The link lives in the page's state until the admin is done with it: never in the REST cache, never in storage
+  (§20).
+
+Per page, where the table leaves a choice:
+- **Users.** A pending sign-up has no actions here; it is answered on the Approvals page. Rename, role, disable,
+  enable, reset link, sign out everywhere and delete are in a row menu. Making someone an admin asks for the acting
+  admin's password; a reset link for an admin asks for it too, also when the server is the first to say that the
+  target is an admin: a `wrong_password` answer to a request sent without a password (the row was behind) makes the
+  dialog show and focus the field and refetch the list.
+- **Approvals.** The sign-up's IP is shown (here and in the audit log only). After a decision the focus goes to
+  the same button of the row that moved up (or of the last row; to the heading when the queue is empty), so a
+  queue can be worked through from the keyboard: Enter on Reject, again and again, rejects one after the other
+  and never approves one. A 404 on a decision means another admin answered first; the list is refreshed.
+- **Invites.** A new invite starts with the server's defaults (03 §9). An admin's form reads them from the
+  settings and shows them as values; the default stays among the options after another one was picked, and a
+  default or a value in force that isn't one of the table's choices is added to them. A member can't read the
+  settings: their form says "Server default" and leaves `expiresInHours` and `maxUses` out of the request, so the
+  server's settings apply to members' invites too (the same goes for an admin until the settings have arrived).
+  The note holds at most 64 characters (03 §7.9). The list hides invites that no longer work unless "Show invites
+  that no longer work (N)" is ticked.
+- **Rooms.** The default room can be renamed but has no Delete button; a name holds 1 to 40 characters and the
+  form checks only `required` and `too_long` (the server checks the rest, 03 §8).
+- **Settings.** The page keeps only what the admin changed, so a refetch while the form is open updates every
+  field that wasn't touched. After a save the fields that were sent are the server's values; an edit made while
+  the request ran stays an edit. A 409 `setting_locked` (the config changed after the page loaded) refetches, and
+  the fresh `locked` makes the field read-only. Number fields are text inputs with the numeric keyboard, not
+  `type="number"` (which hides what was typed when it isn't a number and changes on a scroll wheel). The release
+  check's hint says that the request carries the server's isshoni version (04 §11.5). Saving also refreshes
+  `['info']` and the audit log itself, for a tab without a room connection.
+- **Audit.** The action filter offers groups by prefix (`user.` is every account action; 03 §6
+  `AuditQuery.ActionPrefix`). The filters live in the address (`?action=user.&actor=<id>&target=<id>`), so a
+  filtered log can be linked to and Back undoes a filter; a name in a row is a shortcut to its filter. A row's text
+  comes from `admin.audit.action.<action>`; an action this build doesn't know (a newer server) shows as its
+  identifier. "Load more" is gone once the last page is in, and the focus goes to the line that says so. IP
+  addresses show here and on the Approvals page, and nowhere else in the admin pages.
 
 ### 15.4 Download page (placeholder)
 
@@ -2009,25 +2383,66 @@ and, on Android, in the room's one-time card. iOS: the Home Screen sheet above, 
 
 ### 16.5 i18n
 
-- `src/i18n/en.json`, one namespace, nested keys: `common`, `auth`, `setup`, `conntest`, `room`, `viewer`, `share`,
-  `account`, `admin`, `doctor`, `fix`, `errors` (+ `errors.local`), `fieldErrors`, `push`, `a11y`. Plurals use
-  i18next suffixes (`viewer.watching_one`, `viewer.watching_other`). Dates and numbers use `Intl` with
-  `i18n.language`.
+- One i18next namespace (`translation`), nested keys. The first segment of a key is the catalog's own namespace:
+  `common`, `auth`, `setup`, `conntest`, `room`, `viewer`, `share`, `account`, `admin`, `doctor`, `fix`, `errors`
+  (+ `errors.local`), `fieldErrors`, `push`, `a11y`. Plurals use i18next suffixes (`viewer.watching_one`,
+  `viewer.watching_other`). Dates and numbers use `Intl` with `i18n.language`.
+- **Catalog files** (W00, group 6). The catalog is split by who downloads it:
+  - `src/i18n/en.json` is the main bundle's part: every namespace that code of the entry chunk uses, and those
+    that could be lazy but are not yet (below). `initI18n()` gives it to i18next synchronously (boot step 3, §4).
+    `build/sw-plugin.ts` reads its `push` section (§16.2).
+  - `src/i18n/lazy/<ns>.en.json` holds one **lazy namespace**, a namespace that only lazy page folders use, under
+    the key paths the code has: `{"admin": {…}}` and nothing else. M1 has `account`, `admin` and `setup`. Next to
+    it, `lazy/<ns>.ts` imports the file and calls `addMessages()`, which merges it into the catalog with i18next's
+    `addResourceBundle`. A page folder imports that module in its entry module for every lazy namespace its pages
+    use (§5 "Lazy namespaces"): the texts are then in the folder's chunk and in the catalog before the router has
+    any of its pages. No loader, no Suspense, no request of its own: a namespace is as lazy as the code that uses
+    it. Call sites don't change (`t('admin.users.title')`, no `useTranslation('admin')`).
+  - A namespace is lazy only when nothing in the entry chunk uses it, and every folder that uses it has to import
+    its `lazy/<ns>.ts`. Six more namespaces could move and stay in `en.json` for now, because the move needs files
+    that W00 does not touch (about 6 KB gzip of texts together):
+    - `conntest` and `fix`. Only the connection test's lazy panel uses them, but the room page opens that panel
+      past `conntest/index.ts` (`import('../conntest/ConnTestPanel')`, §14.2), so `ConnTestPanel.tsx` itself has
+      to import the two modules, and the connection test's own tests (`links.test.ts`, `fixText.test.ts`,
+      `checkI18nFixTexts.node.test.ts`) read both namespaces from `en.json`.
+    - `room`, `viewer`, `share` and `auth`. With the room in a lazy folder (§5), the entry chunk's code has no
+      literal key of them left, but `rooms/index.ts` would have to import all four (the room's account menu signs
+      out with `auth/useLogout.ts`, and the room page will show the in-app browser banner, §16.3), `auth/index.ts`
+      the fourth, and `auth/formErrors.test.ts` reads its texts from `en.json`.
+  - Vitest renders a page without its folder's entry module, so in the `test` mode `initI18n()` adds every lazy
+    namespace up front (`import.meta.glob`, behind `import.meta.env.MODE === 'test'`; a build drops the branch and
+    with it the files from the entry chunk). `i18n/lazy.test.ts` and `app/lazyNamespaces.test.tsx` run in the
+    `production` mode instead and show that a namespace is absent until its folder is loaded and that a lazy route
+    never renders a bare key.
+  - Each slice adds keys under its own namespaces only, in the file that has the namespace. To make a namespace
+    lazy, move it to `lazy/<ns>.en.json`, add `lazy/<ns>.ts`, and import that from the entry module of every
+    folder that uses it; `check:i18n` then says where it is still missing.
 - `i18next/no-literal-string` fails the lint on JSX text and on user-visible attributes.
-- `scripts/check-i18n.mjs` fails CI when:
-  - a `t('…')` literal key is missing from `en.json`;
+- `scripts/check-i18n.mjs` reads `en.json` and the lazy files as one catalog (a lazy file that holds anything but its
+  own namespace, or a namespace that is in both, is a problem) and fails CI when:
+  - a `t('…')` literal key is missing from the catalog; the message names the file the key belongs in;
   - an `ErrorCode` from `types.gen.ts` (01) or a `Code…` constant from `api.gen.ts` (03) has no `errors.<code>`
     entry. An `errors.<code>` object with sub-keys counts: `limit_reached` has one per `params.limit` (`rooms`,
     `invites`, `member_invites`, `pending_signups`), and the check requires those;
   - a `CloudProvider` constant in `api.gen.ts` (04 §13.3) has no `fix.firewall.<provider>` entry, or a `NATKind`
-    constant there has no `conntest.nat.<nat>` entry. The script reads both constant lists from `api.gen.ts`.
+    constant there has no `conntest.nat.<nat>` entry. The script reads both constant lists from `api.gen.ts`;
+  - a literal key of a lazy namespace could be asked for before the namespace is in the catalog. The script follows
+    the imports from `main.tsx`: those that run before the importer's own code (`import`, `export … from`, an eager
+    `import.meta.glob`) and those that it runs later (`import()`, a lazy `import.meta.glob`, which is how the router
+    loads the page folders). The key's file must not be reachable from the entry without passing a module that
+    depends on `lazy/<ns>.ts` through imports of the first kind. That covers a folder whose entry module forgot the
+    import, a key of a lazy namespace in the main bundle's code, and a file that another chunk loads past its
+    folder's entry module. The tests can't see any of these, because Vitest has every namespace;
+  - a lazy namespace is in the main bundle after all (the entry depends on its `lazy/<ns>.ts` through imports of
+    the first kind), or a lazy file has no `lazy/<ns>.ts`.
 
   Unused keys are warnings.
 
   CI runs `check:i18n` on every PR from the first web slice on, so each rule arrives with the slice that makes it
   checkable (§23): W1 writes the script with the `t('…')` rule; W2 adds the error-code rule and every `errors.<code>`
-  key; W10 adds the `CloudProvider`/`NATKind` rule and its `fix.firewall.*` and `conntest.nat.*` texts; W13 adds the
-  unused-key warnings and a test that a removed key fails the check.
+  key; W10 adds the `CloudProvider`/`NATKind` rule and its `fix.firewall.*` and `conntest.nat.*` texts; W00 adds the
+  lazy files and the two lazy-namespace rules; W13 adds the unused-key warnings and a test that a removed key fails
+  the check.
 - The catalog is the single source for Go-rendered strings later (plan): *later (M2)* the tray embeds it. 04's doctor
   CLI keeps its own English templates of the same codes (04 §13.2).
 
@@ -2112,6 +2527,19 @@ export default defineConfig({
   getDisplayMedia works (plan). Safari and phones need HTTPS: test them against a VPS prerelease (06).
 - **Size budget** (`check:size`, from `build-report.json`): initial JS (entry + static imports) ≤ 200 KB gzip; each lazy
   chunk ≤ 120 KB gzip; CSS ≤ 30 KB gzip.
+- **What stays out of the initial JS** (§5): every page folder, the room's among them, the room's media chunk, the
+  connection test's panel, the share publisher and the catalog's lazy namespaces (§16.5). The budget only
+  measures; `app/chunks.node.test.ts` names the modules, so one of them moving back into the entry chunk fails
+  `npm test` even while the total is still under 200 KB.
+- **Where the initial JS stands.** 158.4 KB in 8 files after W00 (group 6; 194.6 KB in 5 files before). Of the
+  36 KB, the room is 24.1 KB (the page, the session and the signaling client: the `rooms` chunk), the publisher
+  8.5 KB and the lazy namespaces 3.7 KB. React, React Router, i18next, TanStack Query and Zustand are about 125 KB
+  of what is left by themselves, measured in a build of nothing else; the namespaces that could still leave
+  `en.json` (§16.5) are about 6 KB. A first visit to a room downloads the 158.4 KB, the `rooms` folder (27.7 KB in
+  8 files: its chunk and the small chunks it shares with other folders) and then the media chunk (24 KB with its
+  own imports): 186 KB before the stage, where the initial JS was 182.5 KB in 10 files with the room inside. So
+  the room pays about 4 KB and six more requests for the split, in parallel with `/info` (§5), and every other
+  first page (`/login`, `/invite`, `/setup`) downloads 24 KB less.
 
 ---
 
@@ -2411,3 +2839,10 @@ Decided at integration:
   "detect features at runtime"), labeled "works best in Chrome or Edge"; only Chrome and Edge are tested per release.
 - **Pause in the web sharer**: not in M1 (the plan has Pause for the desktop app only); it arrives with 01's
   `share.pause` feature in M2.
+
+Decided after group 5 (engineering calls the owner delegated; README §6):
+- **The people panel shows the admin badge on every participant who is an admin**, not only on the user's own row
+  (§11.2). `room.state` carries it: `ParticipantInfo` gains the additive field `admin` (01 §8.5; README F02).
+- **A preset changed from another tab or device does not reach the page that publishes the share in M1** (§13.5;
+  01 §8.7). The M1 UI changes a preset only from the publishing page; the push to the publisher comes with the M2
+  desktop handoff.

@@ -48,8 +48,8 @@ type wsRecord struct {
 	tls   bool
 }
 
-// wsStub stands in for 01's hub, which the wiring mounts at /ws later (README S54): it accepts the WebSocket and
-// echoes one message.
+// wsStub stands in for 01's hub at /ws (Deps.WS): it accepts the WebSocket and echoes one message, so the test sees
+// the protocol and the frames of the connection itself. TestWiringOverTLS runs the real hub over the same path.
 func wsStub(t *testing.T, rec *wsRecord) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rec.mu.Lock()
@@ -87,8 +87,8 @@ func stunBindingFrame() []byte {
 }
 
 // TestTLSOnePort is the check of 04 §17 for the TLS path: with servertest.Options{TLS: true}, WSS signaling over
-// HTTP/1.1, the web app over HTTP/2 and ICE-TCP share the one port behind the 443 multiplexer. The hub and the SFU
-// are wired in later (README S54, S59), so /ws is a stub and ICE-TCP is a raw STUN frame.
+// HTTP/1.1, the web app over HTTP/2 and ICE-TCP share the one port behind the 443 multiplexer. The SFU is wired in
+// later (README S59), so ICE-TCP is a raw STUN frame; /ws is a stub that records how the connection arrived.
 func TestTLSOnePort(t *testing.T) {
 	rec := &wsRecord{}
 	srv := servertest.Start(t, servertest.Options{TLS: true, Deps: server.Deps{SPA: testSPA(), WS: wsStub(t, rec)}})

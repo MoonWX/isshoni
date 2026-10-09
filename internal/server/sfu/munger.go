@@ -130,6 +130,9 @@ func (m *munger) current() (Slot, bool) {
 	return m.newest().layer.slot, true
 }
 
+// forwards reports whether the current epoch is on Layer l: l is what the viewer gets now.
+func (m *munger) forwards(l *Layer) bool { return m.forwarding && m.newest().layer == l }
+
 // waitingForKeyframe reports whether the munger waits for a keyframe of the target slot before it forwards it: it is
 // active and forwards nothing, or another slot. The DownTrack requests a keyframe when this becomes true. (A new
 // Layer instance or a new profile in the target slot is noticed only when its packets arrive: process then returns

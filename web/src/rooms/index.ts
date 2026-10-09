@@ -1,7 +1,8 @@
 // rooms/: the tab's signaling connection and room session (05 §7, §11), and the room's pages.
 //
 // This is the folder's entry module: app/router.tsx loads the page components RootRedirect and RoomPage from it by
-// name (the main chunk). InRoomBar is for the app's layout: it shows the session on the other pages (05 §11.1).
+// name, as one lazy chunk like every page folder (05 §5). InRoomBar is for the app's layout, which gets it from
+// the router once this folder is loaded: it shows the session on the other pages (05 §11.1).
 //
 // The room's media code (the stage, the Share button, the sub PC controller: rooms/media.ts) is a lazy chunk and
 // is deliberately not exported from here; the page and the runtime load it themselves.

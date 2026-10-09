@@ -85,6 +85,13 @@ func loopbackClientAPI(t *testing.T, nt webrtc.NetworkType, profiles ...dtls.SRT
 	if err := m.RegisterDefaultCodecs(); err != nil {
 		t.Fatal(err)
 	}
+	return loopbackClientAPIWith(t, m, nt, profiles...)
+}
+
+// loopbackClientAPIWith is loopbackClientAPI for a peer with the codecs and header extensions of m.
+func loopbackClientAPIWith(t *testing.T, m *webrtc.MediaEngine, nt webrtc.NetworkType, profiles ...dtls.SRTPProtectionProfile,
+) *webrtc.API {
+	t.Helper()
 	var se webrtc.SettingEngine
 	se.SetNetworkTypes([]webrtc.NetworkType{nt})
 	se.SetIncludeLoopbackCandidate(true)

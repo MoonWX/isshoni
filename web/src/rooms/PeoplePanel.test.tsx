@@ -4,6 +4,8 @@ import { screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 
+import { AppProviders } from '../app/App';
+import type { RoomState } from '../protocol/types.gen';
 import { renderWithApp } from '../test/render';
 import { PeoplePanel, type PeoplePanelProps } from './PeoplePanel';
 import { participant, shareInfo } from './testing/harness';
@@ -12,22 +14,40 @@ const alex = participant('u_alex', 'alex');
 const bo = participant('u_bo', 'bo');
 const cy = participant('u_cy', 'cy');
 
+// The Go side's golden room.state fixtures (01 §14.3), as protocol/registry.test.ts imports them: what the hub
+// encodes is what the panel reads.
+const goldenFiles = import.meta.glob<{ data: RoomState }>('../../../internal/protocol/testdata/v1/room.state*.json', {
+  eager: true,
+  import: 'default',
+});
+
+function golden(name: string): RoomState {
+  const file = Object.entries(goldenFiles).find(([path]) => path.endsWith(`/${name}.json`));
+  if (file === undefined) throw new Error(`no fixture ${name}.json`);
+  return file[1].data;
+}
+
 function renderPanel(props: Partial<PeoplePanelProps> = {}) {
   const onWatch = vi.fn();
   const onClose = vi.fn();
-  renderWithApp(
+  const panel = (more: Partial<PeoplePanelProps> = {}) => (
     <PeoplePanel
       open
       onClose={onClose}
       participants={[alex, bo, cy]}
       shares={[]}
       selfUserId="u_alex"
-      selfIsAdmin={false}
       onWatch={onWatch}
       {...props}
-    />,
+      {...more}
+    />
   );
-  return { onWatch, onClose };
+  const { rerender, services } = renderWithApp(panel());
+  /** The same panel with other props, as after the next room.state. */
+  const update = (more: Partial<PeoplePanelProps>) => {
+    rerender(<AppProviders services={services}>{panel(more)}</AppProviders>);
+  };
+  return { onWatch, onClose, update };
 }
 
 /** A person's row, by their user id. */
@@ -71,14 +91,67 @@ describe('PeoplePanel', () => {
     expect(within(row('u_cy')).queryByText('Sharing')).not.toBeInTheDocument();
   });
 
-  it('shows the admin badge on the own row of an admin, and on nobody else’s', () => {
-    renderPanel({ selfIsAdmin: true });
+  it('shows the admin badge on every admin, the user’s own row or not, and on no member', () => {
+    renderPanel({
+      participants: [participant('u_alex', 'alex', { admin: true }), participant('u_bo', 'bo', { admin: true }), cy],
+    });
     expect(within(row('u_alex')).getByText('Admin')).toBeInTheDocument();
+    expect(within(row('u_bo')).getByText('Admin')).toBeInTheDocument();
+    expect(within(row('u_cy')).queryByText('Admin')).not.toBeInTheDocument();
+    expect(screen.getAllByText('Admin')).toHaveLength(2);
+  });
+
+  it('shows another person’s admin badge to a member', () => {
+    renderPanel({ participants: [alex, participant('u_bo', 'bo', { admin: true })] });
+    expect(within(row('u_bo')).getByText('Admin')).toBeInTheDocument();
+    expect(within(row('u_alex')).queryByText('Admin')).not.toBeInTheDocument();
+  });
+
+  it('shows no admin badge when nobody is an admin: the flag is absent, or false', () => {
+    renderPanel({ participants: [alex, participant('u_bo', 'bo', { admin: false }), cy] });
+    expect(screen.queryByText('Admin')).not.toBeInTheDocument();
+  });
+
+  it('the admin badge follows the role with the next room.state', () => {
+    const { update } = renderPanel();
+    expect(screen.queryByText('Admin')).not.toBeInTheDocument();
+    update({ participants: [alex, participant('u_bo', 'bo', { admin: true }), cy] });
+    expect(within(row('u_bo')).getByText('Admin')).toBeInTheDocument();
+    update({ participants: [alex, bo, cy] });
+    expect(screen.queryByText('Admin')).not.toBeInTheDocument();
+  });
+
+  it('an admin who shares has both badges, and is still a button for their share', async () => {
+    const { onWatch } = renderPanel({
+      participants: [alex, participant('u_bo', 'bo', { admin: true })],
+      shares: [shareInfo('s_bo', 'u_bo', 'c_bo')],
+    });
+    const button = within(row('u_bo')).getByRole('button', { name: /bo/ });
+    expect(within(button).getByText('Admin')).toBeInTheDocument();
+    expect(within(button).getByText('Sharing')).toBeInTheDocument();
+    await userEvent.click(button);
+    expect(onWatch).toHaveBeenCalledExactlyOnceWith('s_bo');
+  });
+
+  it('an admin who is reconnecting keeps the badge', () => {
+    renderPanel({ participants: [alex, participant('u_bo', 'bo', { admin: true, status: 'reconnecting' })] });
+    expect(within(row('u_bo')).getByText('Admin')).toBeInTheDocument();
+    expect(within(row('u_bo')).getByText('Reconnecting…')).toBeInTheDocument();
+  });
+
+  it('reads the flag as the hub encodes it (the golden room.state.admin.json)', () => {
+    const state = golden('room.state.admin');
+    renderPanel({ participants: state.participants, shares: state.shares, selfUserId: 'b8f2n4r6t0vz' });
+    // Alex is the admin of the fixture; Bea, this user, is a member.
+    expect(within(row('k3m9p2qxw7ht')).getByText('Admin')).toBeInTheDocument();
+    expect(row('b8f2n4r6t0vz')).toHaveTextContent('Bea (you)');
     expect(screen.getAllByText('Admin')).toHaveLength(1);
   });
 
-  it('shows no admin badge to a member', () => {
-    renderPanel({ selfIsAdmin: false });
+  it('a room.state from before the flag shows everyone, and no admin badge', () => {
+    const state = golden('room.state');
+    renderPanel({ participants: state.participants, shares: state.shares, selfUserId: 'k3m9p2qxw7ht' });
+    expect(document.querySelectorAll('li[data-user-id]')).toHaveLength(2);
     expect(screen.queryByText('Admin')).not.toBeInTheDocument();
   });
 

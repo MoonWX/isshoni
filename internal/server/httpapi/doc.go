@@ -17,7 +17,8 @@
 // No access log: only 5xx responses log one line (route pattern, status, request ID), and a panic or an internal
 // error logs its cause instead. URLs, queries and bodies are never logged.
 //
-// The API part (api.go, deps.go, info.go, auth.go, me.go, invites.go, admin_users.go, admin_settings.go; 03 §12):
+// The API part (api.go, deps.go, info.go, auth.go, me.go, rooms.go, invites.go, push.go, admin_users.go,
+// admin_rooms.go, admin_settings.go; 03 §12):
 //   - API: 03's REST API, mounted by the router at /api/v1/. Its chain (03 §12.1): body limit (16 KiB for auth and
 //     device endpoints, 64 KiB elsewhere) → no-store on every response → route lookup (JSON 404 not_found, 405
 //     method_not_allowed with Allow; a matched route reports its own pattern to the RouteObserver) → any
@@ -40,6 +41,20 @@
 //     form (all in place of the ID plus the body {"all": true}); GET and PATCH /api/v1/admin/settings. The rules,
 //     limits, audit rows and admin alerts are auth.Service's and the settings cache's; the lists are reads of the
 //     store. After a change the handlers notify the SPAs by the topic table of 03 §12.5.
+//   - Rooms (README S53; 03 §8, §12.4.4): GET /api/v1/rooms for every signed-in user, with showRoomList (more
+//     than one room exists) and each room's live counts from Signal.RoomPresence; POST /api/v1/admin/rooms and
+//     PATCH and DELETE /api/v1/admin/rooms/{id} for admins. The room rules live in this package, not in
+//     auth.Service: names are PRECIS Nickname of 1–40 characters and unique whatever their case, at most 200
+//     rooms, and the default room is renamed but never deleted. Each change is one Write with its audit row
+//     (room.created, room.renamed, room.deleted); after the commit a delete calls Signal.RoomDeleted, and every
+//     change notifies {All}: rooms.
+//   - Push subscriptions and preferences (README S53; 03 §12.4.6): POST /api/v1/push/subscriptions (the body's
+//     shape is checked here, every URL and host rule by Push.ValidateEndpoint; the row is upserted by endpoint,
+//     bound to the caller's web session, and a user keeps the 10 newest), POST /api/v1/push/unsubscribe,
+//     POST /api/v1/push/test (this session's subscriptions through Push.SendTest, one per 10 s per user: the
+//     push-test bucket of 03 §7.3, kept in this package) and GET and PUT /api/v1/push/preferences. With push off
+//     (no Deps.Push, or one without a VAPID key) subscribe and test answer 503 push_unavailable; the caller's
+//     stored data stays reachable. 04's sender reads the same rows through the store.
 //
 // The other endpoints of 03 §12.3, and DashboardAccounts, come with the later account slices.
 //

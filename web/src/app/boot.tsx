@@ -8,6 +8,8 @@
 //  3. i18next with the bundled en.json; <html lang>.
 //  4. GET /api/v1/info, retried after 1, 2 and 4 s: unreachable → Offline (retries on `online` and every 10 s);
 //     setupRequired and the path isn't /setup → NotSetUp; any other failure → Fatal.
+//     Just before the request, the first page's code is asked for (preloadRoute, app/router.tsx): every page is in
+//     a lazy chunk (05 §5), and the router that would load it only exists after this step. The two travel together.
 //  5. The QueryClient (seeded with info: app/info.ts, which pages read through useInfo()) and the router; render.
 //  6. After the first render, production builds only: register the service worker when the browser is idle.
 import { StrictMode, useCallback, useEffect, useRef, useState } from 'react';
@@ -29,7 +31,7 @@ import { createAppServices, type AppServices } from './context';
 import { seedInfo } from './info';
 import { clearMe } from './me';
 import { createQueryClient } from './queryClient';
-import { createAppRoutes } from './router';
+import { createAppRoutes, preloadRoute } from './router';
 import { AppScreenView } from './screens';
 import { listenForLogout } from './session';
 import type { AppScreen } from './uiStore';
@@ -142,6 +144,11 @@ export interface BootOptions {
   createRouter?: (routes: RouteObject[]) => DataRouter;
   /** Default: createAppRoutes(). */
   routes?: () => RouteObject[];
+  /**
+   * Asks for the code of the page at a path, without waiting for it (step 4). Default: preloadRoute, which goes
+   * with the default routes; with a test's own `routes` nothing is asked for.
+   */
+  preload?: (pathname: string) => void;
 }
 
 type Phase = { kind: 'loading' } | InfoResult;
@@ -223,6 +230,11 @@ function BootGate({
   }
 }
 
+/** False only when the browser knows it has no network (navigator.onLine); true doesn't promise the server. */
+function isOnline(): boolean {
+  return typeof navigator === 'undefined' || navigator.onLine;
+}
+
 /** What startApp started: the React root and, past steps 1–2, the services. stop() unmounts and unhooks. */
 export interface StartedApp {
   readonly root: Root;
@@ -277,6 +289,11 @@ export function startApp(container: Element, opts: BootOptions = {}): StartedApp
   const createRouter = opts.createRouter ?? createBrowserRouter;
   const routes = opts.routes ?? createAppRoutes;
   const getRouter = (): DataRouter => (router ??= createRouter(routes()));
+  // The first page's chunk, on its way before /info is asked for (BootGate's effect, after this render). Not while
+  // the browser says it is offline: an import() that fails is not tried again by every browser, and the router's
+  // own import of the same chunk, once the server is back, would fail with it.
+  const preload = opts.preload ?? (opts.routes === undefined ? preloadRoute : undefined);
+  if (isOnline()) preload?.(loc.pathname);
   root.render(
     <StrictMode>
       <I18nextProvider i18n={i18n}>

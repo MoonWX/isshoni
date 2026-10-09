@@ -648,14 +648,18 @@ func TestGETsDoNotChangeTheDB(t *testing.T) {
 		}
 		return v
 	}
-	// Something for the lists to show: an invite, and a pending sign-up.
+	// Something for the lists to show: an invite, a pending sign-up, a second room, a push subscription and
+	// preferences that are not the defaults.
 	f.createInvite(cookie, `{}`)
 	f.write(func(q *store.Q) error {
 		return q.CreateUser(&store.User{Username: "Sam", UsernameKey: "sam", Status: store.StatusPending, CreatedVia: "signup"})
 	})
+	f.newRoom(cookie, "Games")
+	f.subscribed(cookie, pushEndpoint(1))
+	f.putPrefs(cookie, `{"shareStarted":"off","adminAlerts":true}`)
 	before := version()
 	for _, path := range []string{"/api/v1/info", "/api/v1/me", "/api/v1/nope", "/api/v1/invites", "/api/v1/invites?state=all",
-		"/api/v1/admin/approvals", "/api/v1/admin/settings"} {
+		"/api/v1/admin/approvals", "/api/v1/admin/settings", "/api/v1/rooms", "/api/v1/push/preferences"} {
 		for _, method := range []string{http.MethodGet, http.MethodHead} {
 			for _, session := range []reqOpt{with(cookie), with(nil), cookieValue(sessionCookieName, strings.Repeat("A", 43))} {
 				f.call(method, path, "", session)

@@ -1,0 +1,443 @@
+{
+  "admin": {
+    "title": "Admin",
+    "back": "Back to isshoni",
+    "tryAgain": "Try again",
+    "loadFailed": "Couldn't load this. {{reason}}",
+    "never": "Never",
+    "unknown": "Unknown",
+    "yourPassword": "Your password",
+    "nav": {
+      "label": "Admin",
+      "dashboard": "Dashboard",
+      "users": "Users",
+      "approvals": "Approvals",
+      "approvalsWaiting_one": "Approvals, {{count}} waiting",
+      "approvalsWaiting_other": "Approvals, {{count}} waiting",
+      "invites": "Invites",
+      "rooms": "Rooms",
+      "settings": "Settings",
+      "audit": "Audit log",
+      "doctor": "Doctor"
+    },
+    "fieldErrors": {
+      "required": "This can't be empty.",
+      "too_short": "That's too short.",
+      "too_long": "That's too long.",
+      "invalid": "That value can't be used.",
+      "out_of_range": "That number is outside the allowed range.",
+      "not_allowed": "That isn't allowed here.",
+      "reserved": "That name is reserved. Pick another."
+    },
+    "link": {
+      "copy": "Copy link",
+      "copied": "Copied",
+      "copyManually": "Couldn't copy for you. The link is selected: copy it yourself.",
+      "done": "Done"
+    },
+    "users": {
+      "title": "Users",
+      "lead": "Everyone with an account on this server.",
+      "col": {
+        "user": "User",
+        "role": "Role",
+        "status": "Status",
+        "joined": "Joined",
+        "lastSeen": "Last seen"
+      },
+      "you": "You",
+      "online": "Online now",
+      "actionsFor": "Actions for {{username}}",
+      "role": {
+        "admin": "Admin",
+        "user": "Member"
+      },
+      "status": {
+        "active": "Active",
+        "disabled": "Disabled",
+        "pending": "Waiting for approval"
+      },
+      "resetPending": "Has a reset link that wasn't used yet",
+      "review": "Review",
+      "via": {
+        "setup": "Set up the server",
+        "invite": "Invited by {{name}}",
+        "inviteUnknown": "Joined with an invite",
+        "signup": "Asked for an account",
+        "cli": "Created on the server"
+      },
+      "rename": {
+        "action": "Rename",
+        "title": "Rename {{username}}",
+        "submit": "Rename",
+        "done": "{{from}} is now {{to}}."
+      },
+      "makeAdmin": {
+        "action": "Make admin",
+        "title": "Make {{username}} an admin?",
+        "body": "Admins can change every setting, manage every account and read the audit log. Enter your password to confirm.",
+        "submit": "Make admin",
+        "done": "{{username}} is now an admin."
+      },
+      "removeAdmin": {
+        "action": "Remove admin",
+        "title": "Remove {{username}} as admin?",
+        "body": "{{username}} keeps the account, as a member.",
+        "bodySelf": "You keep your account, as a member, and lose these admin pages right away.",
+        "submit": "Remove admin",
+        "done": "{{username}} is no longer an admin."
+      },
+      "disable": {
+        "action": "Disable",
+        "title": "Disable {{username}}?",
+        "body": "{{username}} is signed out everywhere and can't log in until you enable the account again.",
+        "submit": "Disable",
+        "done": "{{username}} is disabled."
+      },
+      "enable": {
+        "action": "Enable",
+        "done": "{{username}} can log in again."
+      },
+      "reset": {
+        "action": "Create reset link",
+        "title": "Create a reset link for {{username}}?",
+        "body": "{{username}}'s password stops working right away and they are signed out everywhere. The link lets them choose a new password.",
+        "bodyAdmin": "{{username}} is an admin, so enter your password to confirm.",
+        "submit": "Create link",
+        "linkTitle": "Reset link for {{username}}",
+        "linkLabel": "Reset link",
+        "linkHint": "Copy it now and send it to {{username}} privately. It is shown only once and works until {{expires}}.",
+        "linkHintNoExpiry": "Copy it now and send it to {{username}} privately. It is shown only once."
+      },
+      "signOut": {
+        "action": "Sign out everywhere",
+        "title": "Sign {{username}} out everywhere?",
+        "body": "Every browser and app where {{username}} is signed in is signed out. They can log in again.",
+        "bodySelf": "That includes this browser.",
+        "submit": "Sign out",
+        "done_one": "{{username}} was signed out in {{count}} place.",
+        "done_other": "{{username}} was signed out in {{count}} places.",
+        "doneNone": "{{username}} wasn't signed in anywhere."
+      },
+      "delete": {
+        "action": "Delete",
+        "title": "Delete {{username}}?",
+        "body": "The account is removed for good and its username becomes free. This can't be undone.",
+        "submit": "Delete account",
+        "done": "{{username}} was deleted."
+      }
+    },
+    "approvals": {
+      "title": "Approvals",
+      "lead": "People who asked for an account. Approve the ones you know.",
+      "col": {
+        "user": "Username",
+        "requested": "Asked",
+        "ip": "IP address"
+      },
+      "approve": "Approve",
+      "approveName": "Approve {{username}}",
+      "approved": "{{username}} can log in now.",
+      "reject": "Reject",
+      "rejectName": "Reject {{username}}",
+      "rejected": "{{username}}'s request was rejected.",
+      "empty": "No sign-ups are waiting.",
+      "emptyOtherMode": "No sign-ups are waiting. People can only ask for an account while registration is set to \"Invite, or ask an admin\". <a>Open Settings</a>",
+      "rejectAll": {
+        "action": "Reject all",
+        "title": "Reject all pending sign-ups?",
+        "body": "Anyone who is real can sign up again.",
+        "submit": "Reject all",
+        "done_one": "Rejected {{count}} sign-up",
+        "done_other": "Rejected {{count}} sign-ups"
+      }
+    },
+    "invites": {
+      "title": "Invites",
+      "lead": "An invite link lets a friend create an account on this server.",
+      "leadMember": "Your invite links. Each lets a friend create an account on this server.",
+      "closed": "Registration is closed, so invite links don't work right now.",
+      "closedAdmin": "Registration is closed, so invite links don't work right now. <a>Open Settings</a>",
+      "create": {
+        "title": "New invite link",
+        "expires": "Expires after",
+        "uses": "Can be used",
+        "note": "Note",
+        "noteHint": "Optional, and only for you: who the link is for.",
+        "submit": "Create link",
+        "serverDefault": "Server default",
+        "hours_one": "{{count}} hour",
+        "hours_other": "{{count}} hours",
+        "days_one": "{{count}} day",
+        "days_other": "{{count}} days",
+        "times_one": "{{count}} time",
+        "times_other": "{{count}} times"
+      },
+      "created": {
+        "title": "Invite link created",
+        "label": "Invite link",
+        "hint": "Copy it now and send it to your friend. It is shown only once: if it gets lost, create a new one."
+      },
+      "showInactive": "Show invites that no longer work ({{count}})",
+      "col": {
+        "invite": "Invite",
+        "createdBy": "Created by",
+        "uses": "Used",
+        "expires": "Expires",
+        "state": "State"
+      },
+      "noNote": "No note",
+      "usesOf": "{{uses}} of {{max}}",
+      "usedBy": "By {{names}}",
+      "state": {
+        "active": "Active",
+        "expired": "Expired",
+        "used_up": "Used up",
+        "revoked": "Revoked"
+      },
+      "revoke": {
+        "action": "Revoke",
+        "name": "Revoke the invite \"{{name}}\"",
+        "title": "Revoke this invite?",
+        "body": "The link stops working right away. Accounts that were created with it stay.",
+        "submit": "Revoke",
+        "done": "The invite was revoked."
+      },
+      "empty": "No invite links yet.",
+      "emptyActive": "No invite link works right now."
+    },
+    "rooms": {
+      "title": "Rooms",
+      "lead": "Friends see a room list once there is more than one room.",
+      "name": "Room name",
+      "nameHint": "Up to {{max}} characters. Emoji are fine.",
+      "create": {
+        "title": "New room",
+        "submit": "Create room",
+        "done": "{{name}} was created."
+      },
+      "col": {
+        "room": "Room",
+        "live": "In it now",
+        "created": "Created"
+      },
+      "default": "Default",
+      "nobody": "Nobody",
+      "live": "{{people}}, {{shares}}",
+      "people_one": "{{count}} person",
+      "people_other": "{{count}} people",
+      "shares_one": "{{count}} share",
+      "shares_other": "{{count}} shares",
+      "rename": {
+        "action": "Rename",
+        "name": "Rename {{name}}",
+        "title": "Rename {{name}}",
+        "submit": "Rename",
+        "done": "{{from}} is now {{to}}."
+      },
+      "delete": {
+        "action": "Delete",
+        "name": "Delete {{name}}",
+        "title": "Delete {{name}}?",
+        "body": "The room is removed for everyone. This can't be undone.",
+        "bodyLive_one": "{{count}} person is in it right now. They move to the default room, and what is shared in this room ends.",
+        "bodyLive_other": "{{count}} people are in it right now. They move to the default room, and what is shared in this room ends.",
+        "submit": "Delete room",
+        "done": "{{name}} was deleted."
+      }
+    },
+    "settings": {
+      "title": "Settings",
+      "lead": "Changes apply right away, without a restart.",
+      "locked": "Set in isshoni.toml.",
+      "lockedKey": "Set in isshoni.toml (<code>{{key}}</code>).",
+      "default": "Default: {{value}}.",
+      "save": "Save changes",
+      "discard": "Discard changes",
+      "unsaved": "You have unsaved changes.",
+      "saved": "Settings saved.",
+      "server": {
+        "title": "Server"
+      },
+      "serverName": {
+        "label": "Server name",
+        "hint": "Friends see it when they log in and on their invite. Leave it empty to use the server's address."
+      },
+      "registration": {
+        "title": "Registration"
+      },
+      "registrationMode": {
+        "legend": "Who can create an account",
+        "invite": {
+          "name": "Invite only",
+          "hint": "Friends join with an invite link."
+        },
+        "approval": {
+          "name": "Invite, or ask an admin",
+          "hint": "Invite links work. Anyone else can ask for an account from the login page, and an admin approves each request."
+        },
+        "closed": {
+          "name": "Closed",
+          "hint": "Nobody can create an account. Invite links stop working until you change this back."
+        }
+      },
+      "invites": {
+        "title": "Invites"
+      },
+      "inviteDefaultTtlHours": {
+        "label": "Invite links expire after (hours)",
+        "hint": "{{min}} to {{max}}. New invite links start with this."
+      },
+      "inviteDefaultMaxUses": {
+        "label": "Uses per invite link",
+        "hint": "{{min}} to {{max}}. New invite links start with this."
+      },
+      "membersCanInvite": {
+        "label": "Members can create invite links",
+        "hint": "Each member sees only their own links and can have 10 that work at a time."
+      },
+      "limits": {
+        "title": "Limits",
+        "lead": "Optional. isshoni sets no limits of its own."
+      },
+      "maxParticipantsPerRoom": {
+        "label": "People per room",
+        "hint": "{{min}} to {{max}}. 0 means no limit."
+      },
+      "maxSharesPerRoom": {
+        "label": "Shares per room",
+        "hint": "{{min}} to {{max}}. 0 means no limit."
+      },
+      "maxShareBitrateKbps": {
+        "label": "Share bitrate cap (kbps)",
+        "hint": "{{min}} to {{max}}, or 0 to let each quality preset decide."
+      },
+      "transfer": {
+        "title": "Transfer alert"
+      },
+      "transferAlertGb": {
+        "label": "Monthly transfer alert (GB)",
+        "hint": "Admins get an alert when what the server sent in a month passes 80% and 100% of this. 0 turns the alert off."
+      },
+      "apps": {
+        "title": "Apps and updates"
+      },
+      "minClientVersion": {
+        "label": "Oldest app version allowed",
+        "hint": "A version such as 0.2.0. Older apps are asked to update. Leave it empty for no minimum."
+      },
+      "updateCheck": {
+        "label": "Check for new isshoni releases",
+        "hint": "Once a day the server asks GitHub for the list of isshoni releases, and the dashboard shows when a newer one is out. The request carries only this server's isshoni version."
+      }
+    },
+    "audit": {
+      "title": "Audit log",
+      "lead": "Logins and admin actions of the last 30 days, newest first.",
+      "filter": {
+        "label": "Filter the log",
+        "action": "Action",
+        "actor": "Done by",
+        "target": "Done to",
+        "anyAction": "Everything",
+        "anyone": "Anyone",
+        "anything": "Anyone or anything",
+        "clear": "Clear filters",
+        "byActor": "Show only what {{name}} did",
+        "byTarget": "Show only what was done to {{name}}",
+        "actions": {
+          "auth": "Logins",
+          "user": "Accounts",
+          "invite": "Invites",
+          "room": "Rooms",
+          "settings": "Settings",
+          "session": "Browser sessions",
+          "setup": "Setup",
+          "secrets": "Server keys"
+        }
+      },
+      "col": {
+        "action": "Action",
+        "when": "When",
+        "actor": "By",
+        "target": "To",
+        "ip": "IP address",
+        "detail": "Details"
+      },
+      "denied": "Denied",
+      "actor": {
+        "cli": "Server command line",
+        "system": "The server",
+        "anonymous": "Not signed in",
+        "anonymousNamed": "{{name}} (not signed in)"
+      },
+      "kind": {
+        "session": "Browser session",
+        "device": "App",
+        "invite": "Invite",
+        "room": "Room",
+        "settings": "Settings",
+        "setup": "Setup"
+      },
+      "loadMore": "Load more",
+      "loadMoreFailed": "Couldn't load more. Try again.",
+      "showing_one": "Showing {{count}} entry.",
+      "showing_other": "Showing {{count}} entries.",
+      "end": "No older entries.",
+      "empty": "Nothing in the log yet.",
+      "emptyFiltered": "Nothing in the log matches these filters.",
+      "action": {
+        "setup": {
+          "token_issued": "Created a setup link",
+          "completed": "Set up the server"
+        },
+        "auth": {
+          "login": "Logged in",
+          "login_failed": "Failed to log in",
+          "throttled": "Slowed down after too many attempts",
+          "logout": "Logged out",
+          "logout_everywhere": "Logged out everywhere",
+          "password_changed": "Changed their password"
+        },
+        "session": {
+          "revoked": "Signed out a browser"
+        },
+        "user": {
+          "registered": "Joined with an invite",
+          "signup_requested": "Asked for an account",
+          "approved": "Approved a sign-up",
+          "signup_rejected": "Rejected a sign-up",
+          "signup_expired": "Sign-up request expired",
+          "renamed": "Renamed an account",
+          "role_changed": "Changed a role",
+          "disabled": "Disabled an account",
+          "enabled": "Enabled an account",
+          "deleted": "Deleted an account",
+          "signed_out": "Signed someone out everywhere",
+          "password_reset_issued": "Created a reset link",
+          "password_reset_completed": "Chose a new password with a reset link"
+        },
+        "invite": {
+          "created": "Created an invite",
+          "revoked": "Revoked an invite"
+        },
+        "room": {
+          "created": "Created a room",
+          "renamed": "Renamed a room",
+          "deleted": "Deleted a room"
+        },
+        "settings": {
+          "changed": "Changed settings"
+        },
+        "secrets": {
+          "rotated": "Rotated the server's keys"
+        },
+        "device": {
+          "linked": "Linked an app",
+          "revoked": "Unlinked an app",
+          "refresh_reused": "Unlinked an app after its sign-in was reused"
+        }
+      }
+    }
+  }
+}

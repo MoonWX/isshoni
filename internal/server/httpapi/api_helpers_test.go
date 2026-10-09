@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -102,14 +103,56 @@ func (f fakeInfo) Protocol() (current, minimum int) { return f.current, f.minimu
 // testVAPIDKey is a VAPID public key in the shape 04 produces (87 base64url characters of an uncompressed point).
 const testVAPIDKey = "BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvMeAtA3LFgDzkrxZJjSgSnfckjBJuBkr3qBUYIHBQFLXYp5Nksh8U"
 
-// fakePush is a Push with a fixed key.
+// fakePush is a Push with a fixed key. It accepts every endpoint and queues every test unless validate or sendErr
+// say otherwise, and records what it was asked.
 type fakePush struct {
 	key string
+	// validate decides ValidateEndpoint; nil accepts every endpoint.
+	validate func(endpoint string) error
+	// sendErr is SendTest's answer.
+	sendErr error
+
+	mu        sync.Mutex
+	validated []string                   // the endpoints ValidateEndpoint saw
+	tests     [][]store.PushSubscription // the subscriptions of each SendTest call
 }
 
-func (f *fakePush) VAPIDPublicKey() string                                   { return f.key }
-func (f *fakePush) ValidateEndpoint(context.Context, string) error           { return nil }
-func (f *fakePush) SendTest(context.Context, []store.PushSubscription) error { return nil }
+func (f *fakePush) VAPIDPublicKey() string { return f.key }
+
+func (f *fakePush) ValidateEndpoint(_ context.Context, endpoint string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.validated = append(f.validated, endpoint)
+	if f.validate != nil {
+		return f.validate(endpoint)
+	}
+	return nil
+}
+
+func (f *fakePush) SendTest(_ context.Context, subs []store.PushSubscription) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tests = append(f.tests, subs)
+	return f.sendErr
+}
+
+// takeValidated returns the endpoints ValidateEndpoint saw so far and clears them.
+func (f *fakePush) takeValidated() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := f.validated
+	f.validated = nil
+	return out
+}
+
+// takeTests returns the subscriptions of the SendTest calls so far and clears them.
+func (f *fakePush) takeTests() [][]store.PushSubscription {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := f.tests
+	f.tests = nil
+	return out
+}
 
 // fakeSignal is a Signal that records its hooks; it shows that the interface can be implemented in full.
 type fakeSignal struct {
@@ -118,6 +161,8 @@ type fakeSignal struct {
 	// notes are the Notify calls again, each with its target: "admins [admin.invites]", "user <id> [devices]",
 	// "all [me]" (takeNotes).
 	notes []string
+	// presence is what RoomPresence returns (setPresence); nil means two participants and one share in the Lounge.
+	presence map[store.RoomID]RoomPresence
 }
 
 func (f *fakeSignal) record(call string) {
@@ -127,7 +172,19 @@ func (f *fakeSignal) record(call string) {
 }
 
 func (f *fakeSignal) RoomPresence() map[store.RoomID]RoomPresence {
-	return map[store.RoomID]RoomPresence{store.DefaultRoomID: {Participants: 2, Shares: 1}}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.presence == nil {
+		return map[store.RoomID]RoomPresence{store.DefaultRoomID: {Participants: 2, Shares: 1}}
+	}
+	return maps.Clone(f.presence)
+}
+
+// setPresence replaces the hub snapshot that RoomPresence returns.
+func (f *fakeSignal) setPresence(p map[store.RoomID]RoomPresence) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.presence = p
 }
 
 func (f *fakeSignal) OnlineUserIDs() map[store.UserID]struct{} {

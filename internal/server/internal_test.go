@@ -15,6 +15,7 @@ import (
 	"slices"
 	"testing"
 	"testing/fstest"
+	"testing/synctest"
 	"time"
 
 	"github.com/MoonWX/isshoni/internal/server/config"
@@ -144,6 +145,9 @@ func TestRouterOptionsFromConfig(t *testing.T) {
 			if o.SPA == nil || o.API == nil || o.WS == nil || o.Logger == nil {
 				t.Errorf("SPA, API, WS or Logger is nil: %+v", o)
 			}
+			if o.SPAStatus == nil {
+				t.Error("SPAStatus is nil: /setup would stay there after setup (03 §12.6)")
+			}
 			if _, err := o.SPA.Open("index.html"); err != nil {
 				t.Errorf("SPA is not Deps.SPA: %v", err)
 			}
@@ -159,8 +163,10 @@ func TestRouterOptionsFromConfig(t *testing.T) {
 		if o.SPA == nil {
 			t.Fatal("SPA is nil without Deps.SPA, want web.Dist()")
 		}
+		// A server that has built neither the API nor the hub (before Start, or one without a site) leaves both nil,
+		// not a nil pointer in an interface: the router then answers JSON 404 there.
 		if o.API != nil || o.WS != nil {
-			t.Error("API or WS is set without the wiring: the router must answer 404 there")
+			t.Error("API or WS is set on a server that has built neither: the router must answer 404 there")
 		}
 	})
 }
@@ -256,6 +262,38 @@ func TestStepError(t *testing.T) {
 	if got, want := stepError(context.Background(), "store", failure).Error(), "server: shutdown: store: disk full"; got != want {
 		t.Errorf("failed step error = %q, want %q", got, want)
 	}
+}
+
+// TestWithin: the shutdown's wait for the store has an end. What finishes in time gives its own result; what does
+// not is given up with the context's error, which stepError counts as "closed by force".
+func TestWithin(t *testing.T) {
+	failure := errors.New("disk full")
+	if err := within(context.Background(), func() error { return nil }); err != nil {
+		t.Errorf("a wait that ends = %v", err)
+	}
+	if err := within(context.Background(), func() error { return failure }); !errors.Is(err, failure) {
+		t.Errorf("a wait that fails = %v, want its error", err)
+	}
+
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), storeCloseBudget)
+		defer cancel()
+		release := make(chan struct{})
+		begin := time.Now()
+		err := within(ctx, func() error {
+			<-release
+			return nil
+		})
+		if !errors.Is(err, context.DeadlineExceeded) || time.Since(begin) != storeCloseBudget {
+			t.Errorf("a wait that hangs = %v after %v, want the deadline's error after %v", err, time.Since(begin), storeCloseBudget)
+		}
+		if !errors.Is(stepError(ctx, "store", err), ErrShutdownForced) {
+			t.Error("giving up on the store does not count as a forced shutdown")
+		}
+		// What was given up finishes on its own.
+		close(release)
+		synctest.Wait()
+	})
 }
 
 func TestWithBoundPort(t *testing.T) {

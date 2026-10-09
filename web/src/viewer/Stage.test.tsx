@@ -1,6 +1,6 @@
 // Stage (05 §12.1, §16.6): the focused share as a region named "Now watching: …", its state, who shares what and
 // how many watch, and a toolbar with the sound controls and the ones later slices add.
-import { act, render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -14,7 +14,7 @@ import {
 import { ViewerContext } from './context';
 import { createViewer, syncRoom, type ViewerServices } from './services';
 import { Stage } from './Stage';
-import { room, SELF, shareInfo, status } from './testing';
+import { installFakeIntersectionObserver, room, SELF, shareInfo, status } from './testing';
 import type { ViewerShare } from './viewerStore';
 
 const track = (kind: 'audio' | 'video') => new FakeMediaStreamTrack(kind) as unknown as MediaStreamTrack;
@@ -141,6 +141,73 @@ describe('Stage', () => {
     expect(viewer.store.getState().visible).toEqual({ s_a: false, s_b: true });
     unmount();
     expect(viewer.store.getState().visible).toEqual({ s_a: false, s_b: false });
+  });
+
+  it('is not shown, for the layer policy, while it is out of view', () => {
+    const io = installFakeIntersectionObserver();
+    const { s_a: share } = shares(shareInfo('s_a', 'u_bea', 1));
+    render(inViewer(<Stage share={share ?? null} />));
+    const stage = screen.getByRole('region', { name: "Now watching: Bea's window" });
+    expect(io.observed()).toEqual([stage]);
+    act(() => {
+      io.show(stage, 0);
+    });
+    expect(viewer.store.getState().visible).toEqual({ s_a: false });
+    act(() => {
+      io.show(stage, 1);
+    });
+    expect(viewer.store.getState().visible).toEqual({ s_a: true });
+  });
+
+  it('says "Waiting for video…" over the last frame when the video stopped arriving (05 §12.6)', () => {
+    const { s_a: share } = shares(shareInfo('s_a', 'u_bea', 1));
+    viewer.registry.set('s_a', 'video', track('video'));
+    render(inViewer(<Stage share={share ?? null} />));
+    const live = screen.getByRole('status');
+    expect(live).toBeEmptyDOMElement();
+    act(() => {
+      viewer.store.getState().setFrozen(['s_a']);
+    });
+    expect(live).toHaveTextContent('Waiting for video…');
+    expect(video().srcObject).not.toBeNull();
+    act(() => {
+      viewer.store.getState().setFrozen([]);
+    });
+    expect(live).toBeEmptyDOMElement();
+  });
+
+  it('toggles fullscreen on a double click outside its controls (05 §12.5)', () => {
+    const { s_a: share } = shares(shareInfo('s_a', 'u_bea', 1));
+    const onToggle = vi.fn();
+    const { rerender } = render(inViewer(<Stage share={share ?? null} onToggleFullscreen={onToggle} />));
+    const stage = screen.getByRole('region', { name: "Now watching: Bea's window" });
+    fireEvent.dblClick(stage);
+    expect(onToggle).toHaveBeenCalledTimes(1);
+    // Two quick presses of Mute are two presses of Mute.
+    fireEvent.dblClick(within(stage).getByRole('button', { name: 'Mute' }));
+    fireEvent.dblClick(within(stage).getByRole('button', { name: /Show who is watching$/ }));
+    expect(onToggle).toHaveBeenCalledTimes(1);
+
+    // A new handler takes over, and none means none.
+    const next = vi.fn();
+    rerender(inViewer(<Stage share={share ?? null} onToggleFullscreen={next} />));
+    fireEvent.dblClick(stage);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(onToggle).toHaveBeenCalledTimes(1);
+    rerender(inViewer(<Stage share={share ?? null} />));
+    fireEvent.dblClick(stage);
+    expect(next).toHaveBeenCalledTimes(1);
+  });
+
+  it('is marked as the stage, with its share, for the controllers that look it up', () => {
+    const { s_a: share } = shares(shareInfo('s_a', 'u_bea', 1));
+    const { rerender } = render(inViewer(<Stage share={share ?? null} />));
+    const stage = document.querySelector('[data-viewer-stage]');
+    expect(stage).toBe(screen.getByRole('region'));
+    expect(stage).toHaveAttribute('data-share-id', 's_a');
+    expect(stage?.querySelector('video')).toBe(video());
+    rerender(inViewer(<Stage share={null} />));
+    expect(document.querySelector('[data-viewer-stage]')).toBe(screen.getByRole('region', { name: 'Stage' }));
   });
 
   it('gives each share its own video element, so no frame of the previous one is left', () => {

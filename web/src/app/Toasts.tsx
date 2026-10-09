@@ -4,8 +4,13 @@
 // live region inserted together with its text is announced unreliably, and a role on the <li> would break the list.
 // A toast leaves after its duration; the timer pauses while the pointer is over it or focus is inside it
 // (WCAG 2.2.1), and ✕ dismisses it at once. Under prefers-reduced-motion they appear without sliding (05 §16.6).
+//
+// While an element of the page is fullscreen (the viewer's layout, 05 §12.5), the browser draws nothing outside
+// it, so the region moves into that element for as long as it is: "bo started sharing [Watch]" is for the very
+// person who watches fullscreen. A toast that is on screen at that moment starts its time again.
 import { CircleAlert, CircleCheck, Info, X } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 
 import { cx } from '../ui/cx';
@@ -88,11 +93,32 @@ function ToastItem({ toast, onDismiss }: { toast: Toast; onDismiss: () => void }
   );
 }
 
+/**
+ * The fullscreen element that can hold the toasts, or null: no element is fullscreen, or it is one that shows no
+ * children of its own (a <video> in the native player, an <iframe>).
+ */
+function fullscreenHost(): Element | null {
+  const doc = document as Document & { webkitFullscreenElement?: Element | null };
+  // Before fullscreenElement was unprefixed, Safari had only the prefixed one.
+  const el = (doc.fullscreenElement as Element | null | undefined) ?? doc.webkitFullscreenElement ?? null;
+  return el === null || el instanceof HTMLMediaElement || el instanceof HTMLIFrameElement ? null : el;
+}
+
+function onFullscreenChange(changed: () => void): () => void {
+  document.addEventListener('fullscreenchange', changed);
+  document.addEventListener('webkitfullscreenchange', changed);
+  return () => {
+    document.removeEventListener('fullscreenchange', changed);
+    document.removeEventListener('webkitfullscreenchange', changed);
+  };
+}
+
 export function Toasts() {
   const { t } = useTranslation();
   const { ui } = useApp();
   const toasts = useUi((s) => s.toasts);
-  return (
+  const host = useSyncExternalStore(onFullscreenChange, fullscreenHost, () => null);
+  const region = (
     <section className={styles.region} aria-label={t('a11y.notifications')}>
       <ol className={styles.list}>
         {toasts.map((toast) => (
@@ -107,4 +133,5 @@ export function Toasts() {
       </ol>
     </section>
   );
+  return host === null ? region : createPortal(region, host);
 }

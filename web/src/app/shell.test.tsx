@@ -165,6 +165,70 @@ describe('Toasts', () => {
     expect(screen.queryByText('hello')).not.toBeInTheDocument();
     expect(screen.getByText('sticky')).toBeInTheDocument();
   });
+
+  describe('while an element is fullscreen (05 §12.5)', () => {
+    /** What the browser reports as the fullscreen element; jsdom has no fullscreen of its own. */
+    let fullscreen: Element | null = null;
+    const enter = (el: Element | null, event = 'fullscreenchange'): void => {
+      act(() => {
+        fullscreen = el;
+        document.dispatchEvent(new Event(event));
+      });
+    };
+    const region = () => screen.getByRole('region', { name: 'Notifications' });
+
+    afterEach(() => {
+      fullscreen = null;
+      Reflect.deleteProperty(document, 'fullscreenElement');
+      Reflect.deleteProperty(document, 'webkitFullscreenElement');
+    });
+
+    it('the region is inside that element, where the browser draws it, and comes back afterwards', () => {
+      Object.defineProperty(document, 'fullscreenElement', { get: () => fullscreen, configurable: true });
+      const { services, container } = renderWithApp(
+        <>
+          <div data-testid="stage" />
+          <Toasts />
+        </>,
+      );
+      const stage = screen.getByTestId('stage');
+      act(() => {
+        services.ui.getState().toast({ kind: 'info', message: 'bo started sharing', durationMs: null });
+      });
+      expect(stage).not.toContainElement(region());
+
+      enter(stage);
+      expect(stage).toContainElement(region());
+      expect(within(region()).getByText('bo started sharing')).toBeInTheDocument();
+      expect(screen.getAllByRole('region', { name: 'Notifications' })).toHaveLength(1);
+
+      enter(null);
+      expect(stage).not.toContainElement(region());
+      expect(container).toContainElement(region());
+      expect(within(region()).getByText('bo started sharing')).toBeInTheDocument();
+    });
+
+    it('also where only the prefixed API exists', () => {
+      Object.defineProperty(document, 'webkitFullscreenElement', { get: () => fullscreen, configurable: true });
+      renderWithApp(
+        <>
+          <div data-testid="stage" />
+          <Toasts />
+        </>,
+      );
+      enter(screen.getByTestId('stage'), 'webkitfullscreenchange');
+      expect(screen.getByTestId('stage')).toContainElement(region());
+    });
+
+    it('stays where it is for a fullscreen video, which shows no children', () => {
+      Object.defineProperty(document, 'fullscreenElement', { get: () => fullscreen, configurable: true });
+      const { container } = renderWithApp(<Toasts />);
+      const video = container.appendChild(document.createElement('video'));
+      enter(video);
+      expect(video).not.toContainElement(region());
+      expect(container).toContainElement(region());
+    });
+  });
 });
 
 describe('Announcer (05 §16.6)', () => {

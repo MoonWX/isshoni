@@ -648,6 +648,12 @@ export interface RoomState {
 export interface ParticipantInfo {
   userId: string;
   name: string;
+  /**
+   * Admin says that the user is an admin (03's role), for the people panel's badge. It follows a role change like
+   * Name follows a rename. Absent means a member, as in welcome.user; a server from before the field never sends
+   * it (additive, 01 §14.1).
+   */
+  admin?: boolean;
   status: ParticipantStatus;
   joinedAt: string;
   connections: ConnectionInfo[];

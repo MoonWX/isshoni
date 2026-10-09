@@ -117,6 +117,7 @@ type authFixture struct {
 	conns  *recConns
 	alerts *recAlerts
 	signal *fakeSignal
+	push   *fakePush
 }
 
 // testAuthOptions are auth.Options for the test origin: fast argon2 parameters and a hash budget that is out of the
@@ -135,7 +136,14 @@ func testAuthOptions(clk *manualClock) auth.Options {
 
 func newAuthFixture(t *testing.T, mods ...func(*auth.Options)) *authFixture {
 	t.Helper()
-	f := &authFixture{t: t, clk: newManualClock(), conns: &recConns{}, alerts: &recAlerts{}, signal: &fakeSignal{}}
+	return newAuthFixtureDeps(t, nil, mods...)
+}
+
+// newAuthFixtureDeps is newAuthFixture with a change to the API's Deps, for example no push service.
+func newAuthFixtureDeps(t *testing.T, deps func(*Deps), mods ...func(*auth.Options)) *authFixture {
+	t.Helper()
+	f := &authFixture{t: t, clk: newManualClock(), conns: &recConns{}, alerts: &recAlerts{}, signal: &fakeSignal{},
+		push: &fakePush{key: testVAPIDKey}}
 	f.dbPath = filepath.Join(t.TempDir(), "isshoni.db")
 	db, err := store.Open(context.Background(), store.Options{
 		Path:       f.dbPath,
@@ -160,16 +168,20 @@ func newAuthFixture(t *testing.T, mods ...func(*auth.Options)) *authFixture {
 	if f.svc, err = auth.New(context.Background(), db, o); err != nil {
 		t.Fatal(err)
 	}
-	f.api = New(Deps{
+	d := Deps{
 		DB:     db,
 		Auth:   f.svc,
 		Signal: f.signal,
-		Push:   &fakePush{key: testVAPIDKey},
+		Push:   f.push,
 		Info:   fakeInfo{version: "1.2.3", current: 3, minimum: 2},
 		Site:   domainSite(),
 		Clock:  f.clk.now,
 		Logger: slog.New(slog.DiscardHandler),
-	})
+	}
+	if deps != nil {
+		deps(&d)
+	}
+	f.api = New(d)
 	f.fixture = newFixture(t, func(o *RouterOptions) { o.API = f.api })
 	return f
 }

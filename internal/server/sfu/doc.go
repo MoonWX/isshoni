@@ -52,6 +52,13 @@
 //     the ShareEnded, and nothing after it). The ticker and SFU.endShare hold it across those calls, which never
 //     block, take Share.mu inside it, and hold no other lock when they take it.
 //   - A Conn's PCs, subscriptions, negotiation state and candidate buffers belong to its actor and have no lock.
+//   - Which layer a DownTrack forwards is chosen with Share.mu and then DownTrack.mu held (02 §10.1): by the
+//     subscriber's actor when the request changes, and by whoever attaches or detaches a layer of the share, before
+//     that returns. So the choice always fits the share's layers, and a DownTrack already wants a new layer when its
+//     track's first packet is read. What follows for the client (a SubscriptionStateEvent) is the subscriber actor's:
+//     it gets a notice, as it does for every change of what a DownTrack's writer forwards. A subscription has at
+//     most one notice in the actor's queue, and the actor reports what the media path changed at most once per
+//     250 ms and subscription, so a publisher whose stream flaps can't flood its viewers' signaling.
 //   - The media path takes no lock per packet but the cache's and, in the writer, the DownTrack's own (uncontended).
 //     A Layer's read loop reads the share's fan-out list and each DownTrack's interest mask as atomics, and hands
 //     packets over with a channel send that never blocks: a full queue drops and counts.
@@ -88,9 +95,19 @@
 //     the stored answer for a repeated neg), incoming tracks bound to shares by the tracks binding until they end,
 //     their read loops, and the stuck state of a PC that Pion left holding an offer it refused (it takes no other
 //     offer of its gen);
-//   - subpc.go, subscription.go: the subscribe PC's offers with gen, neg and tracks, the 50 ms debounce,
-//     HandleAnswer, the DTLS-ready gate, and the closed state: a sub PC the client closed, or one the SFU closed
-//     after a fatal error (an offer it couldn't make, an answer Pion refused); UpdateSubscriptions;
+//   - subpc.go: the subscribe PC's offers with gen, neg and tracks, the 50 ms debounce, HandleAnswer, the DTLS-ready
+//     gate, and the closed state: a sub PC the client closed, or one the SFU closed after a fatal error (an offer it
+//     couldn't make, an answer Pion refused). The m-sections of a share that ended go inactive and are taken over by
+//     the Conn's next subscription (Pion's AddTrack) once the viewer's answer has left them inactive, so a sub PC's
+//     SDP is as large as the most subscriptions its Conn had at once (02 §9.3);
+//   - subscription.go: UpdateSubscriptions and layer selection (02 §10.1). A request for high gets the full layer
+//     f, or the preview layer q while that is all the share has; low gets q and never f; audio flows while Audio is
+//     set and the share has an audio track. The choice is made again whenever a layer of the share comes or goes,
+//     before the new track's first packet is read. The client hears what it gets through SubscriptionStateEvents,
+//     only when the forwarded video, the audio or the reason changes: no_layer and no_preview_layer when the
+//     share's layers can't serve the request, no reason while the viewer only waits for its sub PC or a keyframe.
+//     What its own request changes it hears at once; what the media path changes, at most every 250 ms, the
+//     latest state each time;
 //   - layer.go, downtrack.go, munger.go, packetcache.go: the media path (02 §9). A Layer is one incoming stream of a
 //     share: its packets are copied once, kept in the per-Layer ring of recent packets (02 §9.2) and queued to the
 //     DownTracks that want the layer; it measures its rates and asks its publisher for keyframes, at most one PLI
@@ -99,9 +116,10 @@
 //     failed or closed (S4 finding 1: Pion drops RTP written then, silently); it starts on a packet that carries an
 //     SPS, again after every such interruption, and gives every packet its place in the viewer's stream (the
 //     munger, 02 §9.4) under a fresh header. The viewer gets a keyframe requested for it when its sub PC connects,
-//     when a DownTrack is bound on a connected PC, when its target layer changes, on its own PLI or FIR, and for as
-//     long as packets of the layer it waits for arrive without one (only every 5 s for a viewer whose stream Pion
-//     has taken twice in a row without sending any of it);
+//     when a DownTrack is bound on a connected PC, when its target layer changes (also because the layer it got has
+//     ended: its stream is over then, and goes on with the keyframe of the layer it falls back to), on its own PLI
+//     or FIR, and for as long as packets of the layer it waits for arrive without one (only every 5 s for a viewer
+//     whose stream Pion has taken twice in a row without sending any of it);
 //   - events.go, errors.go, types.go, config.go, stats.go, probe.go: the whole interface of 02 §6 and §13;
 //   - api.go: the publish, subscribe and connection-test probe webrtc.APIs on 04's netx.Transport, the
 //     remote-candidate filter (02 §7.3, 01 §17), the selected-pair label and the complete-SDP helper: the SFU never
@@ -109,20 +127,15 @@
 //   - codec.go, h264.go, sdpcheck.go: profiles, the payload-type table and both MediaEngines (02 §8.1–8.2),
 //     keyframe-start detection and the SPS parser (02 §9.1), pub-offer validation and the answer edits (02 §8.4–8.5).
 //
-// What a subscription forwards is, in this slice, what it names: high is the full layer f, low the preview layer q,
-// off nothing, and audio flows while Audio is set. A layer the publisher doesn't send forwards nothing.
-//
 // # What later slices add
 //
 // The whole API is declared; a method that a later slice implements returns an error that wraps ErrNotImplemented
 // (RestartICE, ResetPC, ClosePC, SetDecodeCaps, Probe), or does nothing yet (Resync). In README order:
-//   - S52: the rest of 02 §10.1's layer selection (high falls back to q, the reasons no_layer and no_preview_layer),
-//     SubscriptionStateEvent, the tests of switching and of audio following focus, and reusing the transceivers of
-//     ended shares (until then every DownTrack gets a new sendonly transceiver, so a sub PC's SDP only grows);
 //   - S57: the stalled state (a share that went live stays live until it ends), RestartICE, ResetPC, ClosePC,
-//     Resync, the 15 s sub offer re-send, the rebuild of a sub PC that closed (subPC.closed, whoever closed it:
-//     until then its subscriptions wait and new ones fail with sfu.internal), the 10 s handshake timer, the 30 s
-//     grace after failed, sfu.pc_limit and sfu.pc_rate_limited;
+//     Resync (which also sends the current SubscriptionStateEvents again), the 15 s sub offer re-send, the rebuild
+//     of a sub PC that closed (subPC.closed, whoever closed it: until then its subscriptions wait and new ones fail
+//     with sfu.internal), the 10 s handshake timer, the 30 s grace after failed, sfu.pc_limit and
+//     sfu.pc_rate_limited;
 //   - S63: NACK/RTX from the cache (the DownTrack's RTX queue), sender reports forwarded to the viewers (a Layer
 //     already keeps its latest one, for the munger), and the tests of padding and of the publisher's redundant RTX;
 //   - S69: the room codec policy with its hysteresis (CodecPolicy is ProfileHigh until then), the codec filter of
@@ -132,4 +145,7 @@
 //     DownTracks count; nothing sums them up yet). S84: the downlink allocator (REMB, receiver reports, queue
 //     drops) and the pacer. S88: the admin cap as REMB and quality hint (SetLimits already caps new ShareParams),
 //     layer pausing.
+//
+// The server's cap on a subscription (02 §10.1: effective = min(requested, cap), with its reason) is in place
+// (Conn.capSubscription); S69 and S84 are its callers.
 package sfu

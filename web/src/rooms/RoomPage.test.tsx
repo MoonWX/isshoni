@@ -156,6 +156,22 @@ describe('RoomPage (05 §11.2)', () => {
     expect(within(panel).getByText('bo')).toBeInTheDocument();
   });
 
+  it('marks the admins in the people panel as room.state names them, for a member too', async () => {
+    setup(); // GET /me: a member
+    await open();
+    sendState({ participants: [alex, participant('u_bo', 'bo', { admin: true })] });
+    fireEvent.click(screen.getByRole('button', { name: /^2 here/ }));
+    const panel = screen.getByRole('dialog', { name: '2 people here' });
+    const person = (name: string) => within(panel).getByText(name).closest('li');
+    expect(person('bo')).toHaveTextContent('Admin');
+    expect(person('alex (you)')).not.toHaveTextContent('Admin');
+
+    // A role change is a new room.state (01 §8.5): the open panel follows it.
+    sendState({ participants: [participant(ME, 'alex', { admin: true }), bo] });
+    expect(person('alex (you)')).toHaveTextContent('Admin');
+    expect(person('bo')).not.toHaveTextContent('Admin');
+  });
+
   it('a click on a person who shares puts their share on the stage, as a pick', async () => {
     setup();
     await open();
@@ -207,6 +223,31 @@ describe('RoomPage (05 §11.2)', () => {
     sendState({ participants: [alex, bo], shares: [shareInfo('s_bo2', 'u_bo', 'c_bo', { status: 'starting' })] });
     expect(document.title).toBe('Lounge · isshoni');
     expect(screen.getByText('Nobody is sharing yet.')).toBeInTheDocument();
+  });
+
+  it('names the room in the system’s "now playing" for the share that is heard (05 §12.8)', async () => {
+    // jsdom has no Media Session API: a stand-in for the two globals the viewer looks for.
+    class Metadata {
+      readonly title: string;
+      readonly artist: string;
+      constructor(init: { title?: string; artist?: string } = {}) {
+        this.title = init.title ?? '';
+        this.artist = init.artist ?? '';
+      }
+    }
+    const mediaSession: { metadata: Metadata | null } = { metadata: null };
+    vi.stubGlobal('MediaMetadata', Metadata);
+    Object.defineProperty(navigator, 'mediaSession', { value: mediaSession, configurable: true });
+    try {
+      setup();
+      await open();
+      expect(mediaSession.metadata).toBeNull();
+      sendState({ participants: [alex, bo], shares: [shareInfo('s_bo', 'u_bo', 'c_bo')] });
+      expect(mediaSession.metadata).toMatchObject({ title: "bo's window", artist: 'Lounge' });
+    } finally {
+      Reflect.deleteProperty(navigator, 'mediaSession');
+      vi.unstubAllGlobals();
+    }
   });
 
   it('gives the title back when the page is left', async () => {

@@ -2,8 +2,9 @@
 // badge while they share, and a person who is reconnecting is dimmed (05 §11.1). A click on a person who shares
 // puts their share on the stage. Other people's OS, app version and devices are not shown (01 §8.5 privacy).
 //
-// The admin badge shows on the user's own row only: room.state says who is in the room, not who is an admin (01
-// §8.5), so the page knows it of nobody but its own user (GET /api/v1/me).
+// The admin badge shows on everyone who is an admin, the user's own row included: room.state says it of each
+// participant (`admin`, 01 §8.5). A role change comes as a new snapshot, so the badge follows it while the panel is
+// open. It is a label only: what an admin may do is the server's to check.
 //
 // The page keeps the panel mounted and closes it with `open`, so that the browser gives the focus back to the
 // people count when it closes (05 §16.6). Closed, it lists nobody: the rows are rendered only while it shows.
@@ -29,8 +30,6 @@ export interface PeoplePanelProps {
   shares: readonly ShareInfo[];
   /** This user's id (welcome.user.id): their row reads "alex (you)". */
   selfUserId: string | null;
-  /** This user is an admin (me.user.role). */
-  selfIsAdmin: boolean;
   /** A person who shares was clicked: focus that share. The panel closes itself. */
   onWatch: (shareId: string) => void;
 }
@@ -48,15 +47,7 @@ function watchableShare(shares: readonly ShareInfo[], userId: string): ShareInfo
     .reduce<ShareInfo | undefined>((newest, s) => (newest && newest.startedAt >= s.startedAt ? newest : s), undefined);
 }
 
-export function PeoplePanel({
-  open,
-  onClose,
-  participants,
-  shares,
-  selfUserId,
-  selfIsAdmin,
-  onWatch,
-}: PeoplePanelProps) {
+export function PeoplePanel({ open, onClose, participants, shares, selfUserId, onWatch }: PeoplePanelProps) {
   const { t } = useTranslation();
   return (
     <Sheet open={open} onClose={onClose} side="end" title={t('room.people.title', { count: participants.length })}>
@@ -75,7 +66,7 @@ export function PeoplePanel({
                 </span>
                 <span className={styles.name}>{self ? t('room.people.you', { name: p.name }) : p.name}</span>
                 {reconnecting && <span className={styles.status}>{t('room.people.reconnecting')}</span>}
-                {self && selfIsAdmin && (
+                {p.admin === true && (
                   <span className={styles.badge}>
                     <ShieldCheck aria-hidden="true" />
                     {t('room.people.admin')}

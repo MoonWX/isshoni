@@ -16,6 +16,7 @@ import (
 
 	"github.com/MoonWX/isshoni/internal/server"
 	"github.com/MoonWX/isshoni/internal/server/config"
+	"github.com/MoonWX/isshoni/internal/server/ops"
 	"github.com/MoonWX/isshoni/internal/server/servertest"
 )
 
@@ -225,6 +226,25 @@ func TestOptions(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "secrets.json")); err != nil {
 		t.Errorf("the server did not use Options.DataDir: %v", err)
+	}
+}
+
+// TestAdminSocket: the admin socket of a test server is live, and `admin log-level` works there without the test
+// passing a level variable: the harness gives the server its own logger's (04 §12, §18).
+func TestAdminSocket(t *testing.T) {
+	srv := servertest.Start(t, servertest.Options{})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	admin := ops.DialAdmin(srv.AdminSocket)
+	if h, err := admin.Ready(ctx); err != nil || h.Status != "ready" {
+		t.Fatalf("ready over the admin socket: %+v, %v", h, err)
+	}
+	// A server without the variable refuses the command (ops.LogLevel is nil then).
+	if err := admin.SetLogLevel(ctx, "info", time.Minute); err != nil {
+		t.Fatalf("log-level info: %v", err)
+	}
+	if logs := srv.Logs(); !strings.Contains(logs, `"log_level":"info"`) {
+		t.Errorf("the server did not log the change of its level:\n%s", logs)
 	}
 }
 

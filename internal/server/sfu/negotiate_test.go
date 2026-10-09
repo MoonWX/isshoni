@@ -429,9 +429,18 @@ func TestPublishAndSubscribe(t *testing.T) {
 	if n := len(viewSig.Offers()); n != 1 {
 		t.Errorf("%d sub offers, want 1", n)
 	}
-	// Neither side heard anything but its own PC's states.
+	// The viewer hears what its subscription gets, once the video and the audio flow: all it asked for.
+	want := sfu.SubscriptionStateEvent{Share: share, Requested: sfu.QualityHigh, Forwarded: sfu.QualityHigh, Audio: true}
+	if _, err := viewSig.WaitEvent(ctx, func(ev sfu.Event) bool { return ev == sfu.Event(want) }); err != nil {
+		t.Errorf("%v: the viewer's events are %+v, want %+v among them", err, viewSig.Events(), want)
+	}
+	// Besides that, neither side heard anything but its own PC's states.
 	for name, sig := range map[string]*sfutest.DirectSignaler{"publisher": pubSig, "viewer": viewSig} {
 		for _, ev := range sig.Events() {
+			if sub, ok := ev.(sfu.SubscriptionStateEvent); ok && name == "viewer" && sub.Share == share &&
+				sub.Requested == sfu.QualityHigh && sub.Reason == "" {
+				continue // on the way there: the audio before the video's keyframe, or the other way round
+			}
 			st, ok := ev.(sfu.PCStateEvent)
 			if !ok || st.Gen != 1 || st.Reason != "" || (name == "publisher") != (st.PC == sfu.PCPub) {
 				t.Errorf("the %s got %+v", name, ev)
@@ -1346,8 +1355,12 @@ func TestSubAnswerRefusedByPion(t *testing.T) {
 	if err != nil || len(subs) != 1 || subs[0].Share != "s_1" {
 		t.Errorf("subscriptions after the sub PC closed = %+v, %v; want the one to s_1 kept for the rebuild", subs, err)
 	}
+	// The viewer heard what its subscription to a share without tracks gets, and that the PC closed; no ErrorEvent,
+	// because HandleAnswer returned the error.
+	noPreview := sfu.SubscriptionStateEvent{Share: "s_1", Requested: sfu.QualityLow, Reason: sfu.SubReasonNoPreviewLayer}
 	for _, ev := range sig.Events() {
-		if st, ok := ev.(sfu.PCStateEvent); !ok || st.PC != sfu.PCSub || st.Gen != 1 || st.State != "closed" {
+		if st, ok := ev.(sfu.PCStateEvent); ev != sfu.Event(noPreview) &&
+			(!ok || st.PC != sfu.PCSub || st.Gen != 1 || st.State != "closed") {
 			t.Errorf("the viewer got %+v, want only the closed state: HandleAnswer returned the error", ev)
 		}
 	}

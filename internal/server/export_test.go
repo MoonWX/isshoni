@@ -2,6 +2,7 @@ package server
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/MoonWX/isshoni/internal/server/netx"
 	"github.com/MoonWX/isshoni/internal/server/ops"
@@ -39,6 +40,26 @@ func (s *Server) SetPublicAddrs(pub netx.PublicAddrs) {
 	defer s.life.Unlock()
 	s.hookDetect = func() netx.PublicAddrs { return pub }
 }
+
+// SetPublicAddrsFunc is SetPublicAddrs with a function, which the running server also calls each time it looks at
+// its public addresses again (04 §7.4). Call it before Start.
+func (s *Server) SetPublicAddrsFunc(fn func() netx.PublicAddrs) {
+	s.life.Lock()
+	defer s.life.Unlock()
+	s.hookDetect = fn
+}
+
+// SetRedetectEvery makes the running server look at its public addresses every d, in place of every ten minutes.
+// Call it before Start.
+func (s *Server) SetRedetectEvery(d time.Duration) {
+	s.life.Lock()
+	defer s.life.Unlock()
+	s.redetectEvery = d
+}
+
+// PublicAddrsNow returns the public addresses as the running server last saw them, once they differ from the ones
+// it started with; nil before.
+func (s *Server) PublicAddrsNow() *netx.PublicAddrs { return s.publicNow.Load() }
 
 // PortMux returns the running server's 443 multiplexer (nil in off mode), for a look at its counters.
 func (s *Server) PortMux() *netx.PortMux {

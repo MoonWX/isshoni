@@ -15,7 +15,7 @@ import {
 } from '../test/fakeMedia';
 import { ViewerContext } from './context';
 import { createViewer, syncRoom, type ViewerServices } from './services';
-import { room, SELF, shareInfo, status } from './testing';
+import { installFakeIntersectionObserver, room, SELF, shareInfo, status } from './testing';
 import { Tile } from './Tile';
 import type { ViewerShare } from './viewerStore';
 
@@ -223,6 +223,64 @@ describe('Tile', () => {
     expect(screen.getByText('You')).toBeInTheDocument();
     expect(video().srcObject).toBe(preview);
     expect(screen.queryByText('Connecting…')).not.toBeInTheDocument();
+  });
+
+  it('says "Waiting for video…" over the last frame when its video stopped arriving (05 §12.6)', () => {
+    const share = synced('s_a', shareInfo('s_a', 'u_bea', 1));
+    viewer.registry.set('s_a', 'video', track('video'));
+    renderTile(<Tile share={share} onPick={vi.fn()} />);
+    expect(mainButton()).not.toHaveAttribute('aria-describedby');
+
+    act(() => {
+      viewer.store.getState().setFrozen(['s_a']);
+    });
+    expect(screen.getByText('Waiting for video…')).toBeInTheDocument();
+    expect(mainButton()).toHaveAccessibleDescription('Waiting for video…');
+    // The picture stays: the last frame under the notice.
+    expect(video().srcObject).not.toBeNull();
+
+    act(() => {
+      viewer.store.getState().setFrozen([]);
+    });
+    expect(screen.queryByText('Waiting for video…')).not.toBeInTheDocument();
+  });
+
+  it('is not shown, for the layer policy, while it is scrolled out of view', () => {
+    const io = installFakeIntersectionObserver();
+    const share = synced('s_a', shareInfo('s_a', 'u_bea', 1));
+    renderTile(<Tile share={share} onPick={vi.fn()} />);
+    const tile = screen.getByRole('listitem');
+    expect(io.observed()).toEqual([tile]);
+    expect(viewer.store.getState().visible).toEqual({ s_a: true });
+    act(() => {
+      io.show(tile, 0);
+    });
+    expect(viewer.store.getState().visible).toEqual({ s_a: false });
+    act(() => {
+      io.show(tile, 0.4);
+    });
+    expect(viewer.store.getState().visible).toEqual({ s_a: true });
+  });
+
+  it('is a tab stop with all its controls by default, and none of them when its list says so (05 §12.7)', () => {
+    const share = synced('s_a', shareInfo('s_a', 'u_bea', 1));
+    const { rerender } = renderTile(<Tile share={share} onPick={vi.fn()} />);
+    const buttons = () => within(screen.getByRole('listitem')).getAllByRole('button');
+    expect(buttons()).toHaveLength(3);
+    expect(buttons().map((b) => b.tabIndex)).toEqual([0, 0, 0]);
+    // What the arrow keys look for.
+    expect(mainButton()).toHaveAttribute('data-tile-main');
+
+    rerender(
+      <ViewerContext.Provider value={viewer}>
+        <ul>
+          <Tile share={share} onPick={vi.fn()} tabStop={false} />
+        </ul>
+      </ViewerContext.Provider>,
+    );
+    expect(buttons().map((b) => b.tabIndex)).toEqual([-1, -1, -1]);
+    // Still the same buttons for a pointer and for a screen reader's cursor.
+    expect(mainButton()).toBeEnabled();
   });
 
   it('puts extra controls next to the button, never inside it', () => {

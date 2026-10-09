@@ -21,6 +21,19 @@ func allocatedBytes(fn func()) uint64 {
 	return after.TotalAlloc - before.TotalAlloc
 }
 
+// allocatedWithin is allocatedBytes for a bound: when fn allocated more than limit, it runs fn once more and returns
+// that second measurement. The first run of an input may also pay for what encoding/json keeps between calls (its
+// pooled buffers, which a fuzz worker that starts with this input has not grown yet, and which a GC empties); that
+// is not the decode's own cost, and it depends on which inputs the process saw before. The second run, right
+// after, measures the decode alone, so a real excess fails both. fn must start from fresh values each time.
+func allocatedWithin(limit uint64, fn func()) uint64 {
+	n := allocatedBytes(fn)
+	if n > limit {
+		n = allocatedBytes(fn)
+	}
+	return n
+}
+
 // Allocation bounds of the fuzz targets (01 §19: "no allocation above 4× the input"). The constant covers what
 // does not grow with the input: encoding/json's decode state and, for Decode, the slices that the array limits
 // allow (about 54 KB for a ClientStats with every list at its limit and every element empty).
@@ -85,8 +98,8 @@ func FuzzParseEnvelope(f *testing.F) {
 	f.Fuzz(func(t *testing.T, b []byte) {
 		var e Envelope
 		var err error
-		n := allocatedBytes(func() { e, err = ParseEnvelope(b) })
-		if limit := 4*uint64(len(b)) + envelopeAllocSlack; n > limit {
+		limit := 4*uint64(len(b)) + envelopeAllocSlack
+		if n := allocatedWithin(limit, func() { e, err = ParseEnvelope(b) }); n > limit {
 			t.Fatalf("ParseEnvelope allocated %d bytes for %d input bytes (limit %d)", n, len(b), limit)
 		}
 		if err != nil {
@@ -148,13 +161,16 @@ func FuzzDecode(f *testing.F) {
 	f.Add(targetIndex(targets, Error{}), []byte(`{"code":"x","params":{"a":[1,[2,{"b":null}]],"c":1e308}}`))
 	f.Fuzz(func(t *testing.T, idx uint8, data []byte) {
 		tg := targets[int(idx)%len(targets)]
-		v := reflect.New(tg.typ)
+		var v reflect.Value
 		var err error
-		n := allocatedBytes(func() { err = DecodeInto(Envelope{Type: tg.msgType, Data: data}, v.Interface()) })
 		limit := 4*uint64(len(data)) + decodeAllocSlack
 		if !tg.serverDecoded {
 			limit = clientDecodeRatio*uint64(len(data)) + decodeAllocSlack
 		}
+		n := allocatedWithin(limit, func() {
+			v = reflect.New(tg.typ) // a new value each time: decoding into a filled one reuses its slices
+			err = DecodeInto(Envelope{Type: tg.msgType, Data: data}, v.Interface())
+		})
 		if n > limit {
 			t.Fatalf("decoding %v allocated %d bytes for %d input bytes (limit %d)", tg.typ, n, len(data), limit)
 		}

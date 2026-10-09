@@ -22,15 +22,15 @@
 // <dialog> gives the focus back to the control that opened it only when it is closed while still in the page
 // (05 §16.6).
 //
-// Still to come, each with its slice: the in-app browser banner above the page and the notifications card in the
-// empty state (05 §16.3); ?focus=<shareId> (05 §12.2).
+// ?focus=<shareId> (05 §12.2) is the viewer's: its layout reads the link and picks the share. Still to come, each
+// with its slice: the in-app browser banner above the page and the notifications card in the empty state
+// (05 §16.3).
 import { DoorClosed, MonitorUp } from 'lucide-react';
 import { Suspense, useCallback, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useParams } from 'react-router';
 
 import { useApp } from '../app/context';
-import { isAdmin } from '../app/guards';
 import { useMeQuery } from '../app/me';
 import { errorMessage } from '../lib/errorText';
 import type { ProtocolError } from '../protocol/errors';
@@ -175,6 +175,7 @@ export function RoomPage() {
               onStartShare={startShare}
               shareElsewhere={shareElsewhere}
               onTestConnection={openTest}
+              roomName={name}
             />
           </Suspense>
         )}
@@ -194,7 +195,6 @@ export function RoomPage() {
         participants={state?.participants ?? []}
         shares={state?.shares ?? []}
         selfUserId={userId}
-        selfIsAdmin={me.data != null && isAdmin(me.data)}
         onWatch={(id) => {
           // A pick, like a click on the tile: it holds until that share ends (05 §12.2).
           viewer.store.getState().focusShare(id);

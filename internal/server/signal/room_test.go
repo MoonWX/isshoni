@@ -127,6 +127,45 @@ func connIDs(p protocol.ParticipantInfo) []string {
 	return ids
 }
 
+// adminIDs returns the user ids of the participants that the state marks as admins, in order.
+func adminIDs(st protocol.RoomState) []string {
+	var ids []string
+	for _, p := range st.Participants {
+		if p.Admin {
+			ids = append(ids, p.UserID)
+		}
+	}
+	return ids
+}
+
+// expectAdmins reads the next message, a room.state of roomID in which exactly the participants want (user ids, in
+// order) are admins. It reads the raw JSON too: an admin has admin: true, and a member has no admin key at all, not
+// false (01 §8.5). It returns the state.
+func expectAdmins(t *testing.T, c *signaltest.Client, roomID string, want ...string) protocol.RoomState {
+	t.Helper()
+	env := expectType(t, c, protocol.MessageTypeRoomState)
+	st, err := protocol.Decode[protocol.RoomState](env)
+	if err != nil || st.RoomID != roomID {
+		t.Fatalf("room.state of %q, %v; want %q", st.RoomID, err, roomID)
+	}
+	var raw struct {
+		Participants []map[string]json.RawMessage `json:"participants"`
+	}
+	if err := json.Unmarshal(env.Data, &raw); err != nil || len(raw.Participants) != len(st.Participants) {
+		t.Fatalf("room.state %s: %v", env.Data, err)
+	}
+	for i, p := range st.Participants {
+		if v, has := raw.Participants[i]["admin"]; has != p.Admin || (has && string(v) != "true") {
+			t.Errorf("participant %s: admin key %q (present: %v), want true for an admin and no key for a member",
+				p.UserID, v, has)
+		}
+	}
+	if got := adminIDs(st); !slices.Equal(got, want) {
+		t.Errorf("admins %v, want %v", got, want)
+	}
+	return st
+}
+
 // room.join and room.leave (01 §8.4): the ok and the room.state that follows at once, the MediaPeer, joining the
 // same room again, and the errors.
 func TestRoomJoinLeave(t *testing.T) {
@@ -144,7 +183,7 @@ func TestRoomJoinLeave(t *testing.T) {
 		p := st.Participants[0]
 		want := protocol.ConnectionInfo{ID: w.ConnectionID, Kind: protocol.ClientKindWeb, Role: protocol.RoleFull,
 			Status: protocol.ConnectionStatusOnline}
-		if p.UserID != a.UserID || p.Name != a.Name || p.Status != protocol.ParticipantStatusPresent ||
+		if p.UserID != a.UserID || p.Name != a.Name || p.Admin || p.Status != protocol.ParticipantStatusPresent ||
 			!p.JoinedAt.Equal(t0) || !slices.Equal(p.Connections, []protocol.ConnectionInfo{want}) {
 			t.Errorf("participant %+v", p)
 		}
@@ -535,15 +574,25 @@ func TestRoomRename(t *testing.T) {
 		expectEvent(t, ca, protocol.RoomEventKindParticipantJoined, b.UserID)
 		expectState(t, ca, "lounge")
 
+		// A new name and a new role in one call: one snapshot with both.
 		e.hub.UpdateUser(a.UserID, "alex", true)
 		settle()
 		for _, c := range []*signaltest.Client{ca, cb} {
-			if st := expectState(t, c, "lounge"); st.Participants[0].Name != "alex" {
+			if st := expectAdmins(t, c, "lounge", a.UserID); st.Participants[0].Name != "alex" {
 				t.Errorf("names %+v", st.Participants)
 			}
 			expectOpen(t, c)
 		}
-		// Only the admin flag: room.state doesn't show it, so nothing is sent.
+		// Only the role: room.state shows it as the participant's admin flag, so that is a snapshot too.
+		e.hub.UpdateUser(a.UserID, "alex", false)
+		settle()
+		for _, c := range []*signaltest.Client{ca, cb} {
+			if st := expectAdmins(t, c, "lounge"); st.Participants[0].Name != "alex" {
+				t.Errorf("names %+v", st.Participants)
+			}
+			expectOpen(t, c)
+		}
+		// Neither: nothing is sent.
 		e.hub.UpdateUser(a.UserID, "alex", false)
 		settle()
 		expectOpen(t, ca)
@@ -557,6 +606,182 @@ func TestRoomRename(t *testing.T) {
 				t.Errorf("names %+v", st.Participants)
 			}
 		}
+	})
+}
+
+// The admin flag of room.state (01 §8.5), which the people panel shows as a badge (05 §11.2): every participant
+// whose user is an admin has it, from the snapshot that follows a room.join on, and a member has no admin key. A
+// role change reaches every connection in the room as one new snapshot and no room.event, whether it comes from
+// UpdateUser (03's REST handlers) or from a Revalidate result (the admin CLI), and also when the user has two
+// connections in the room. A participant that leaves and joins again starts from its connection's current role.
+func TestRoomAdmin(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newEnv(t)
+		defer e.close()
+		cookieA, a := e.user(true)
+		cookieB, b := e.user(false)
+		cookieC, c := e.user(false)
+		ca, _ := e.connect(cookieA, signaltest.DefaultHello())
+		cb1, _ := e.connect(cookieB, signaltest.DefaultHello())
+		cb2, _ := e.connect(cookieB, signaltest.DefaultHello())
+		cc, _ := e.connect(cookieC, signaltest.DefaultHello())
+		clients := []*signaltest.Client{ca, cb1, cb2, cc}
+
+		// From the first snapshot on: the admin's own join state, and the one a member gets when it joins.
+		if st := join(t, ca, "lounge"); !slices.Equal(adminIDs(st), []string{a.UserID}) {
+			t.Errorf("the admin's join state %+v, want the admin flag", st.Participants)
+		}
+		for _, cl := range clients[1:] {
+			time.Sleep(time.Second) // A, B, C by joinedAt
+			if st := join(t, cl, "lounge"); !slices.Equal(adminIDs(st), []string{a.UserID}) {
+				t.Errorf("a member's join state %+v, want A as the only admin", st.Participants)
+			}
+		}
+		settle()
+		for _, cl := range clients {
+			drain(t, cl)
+		}
+
+		// B becomes an admin. Both of B's connections apply it; the room gets one snapshot.
+		e.hub.UpdateUser(b.UserID, b.Name, true)
+		settle()
+		var rev uint64
+		for i, cl := range clients {
+			st := expectAdmins(t, cl, "lounge", a.UserID, b.UserID)
+			if i == 0 {
+				rev = st.Rev
+			}
+			if st.Rev != rev || !slices.Equal(userIDs(st), []string{a.UserID, b.UserID, c.UserID}) {
+				t.Errorf("client %d: rev %d (want %d), participants %v", i, st.Rev, rev, userIDs(st))
+			}
+			expectOpen(t, cl) // no second snapshot, and no room.event
+		}
+
+		// A is an admin no longer: the key goes.
+		e.hub.UpdateUser(a.UserID, a.Name, false)
+		settle()
+		for _, cl := range clients {
+			expectAdmins(t, cl, "lounge", b.UserID)
+			expectOpen(t, cl)
+		}
+
+		// The same roles again change nothing, so nothing is sent.
+		e.hub.UpdateUser(a.UserID, a.Name, false)
+		e.hub.UpdateUser(b.UserID, b.Name, true)
+		settle()
+		for _, cl := range clients {
+			expectOpen(t, cl)
+		}
+
+		// A role change that only the store knows about arrives with the next revalidation.
+		e.auth.SetUser(c.UserID, c.Name, true)
+		time.Sleep(5 * time.Minute)
+		settle()
+		for _, cl := range clients {
+			expectAdmins(t, cl, "lounge", b.UserID, c.UserID)
+			expectOpen(t, cl)
+		}
+
+		// Leaving and joining again makes a new participant, from the connection's role as it is now.
+		leave(t, ca)
+		settle()
+		drain(t, cc) // participant.left about A, and the state without it
+		leave(t, cc)
+		if st := join(t, cc, "lounge"); !slices.Equal(adminIDs(st), []string{b.UserID, c.UserID}) {
+			t.Errorf("C's state after joining again %+v, want B and C as admins", st.Participants)
+		}
+		if st := join(t, ca, "lounge"); !slices.Equal(adminIDs(st), []string{b.UserID, c.UserID}) {
+			t.Errorf("A's state after joining again %+v, want B and C as admins", st.Participants)
+		}
+	})
+}
+
+// A participant with several connections (01 §4.1) can have its name and role from a connection that knew less than
+// the ones that stay. A change that only the store has (the admin CLI) reaches a new connection at its handshake,
+// but the participant it joins was made by an older connection, which goes before its own revalidation; after that
+// no connection's own identity ever changes. So every revalidation of a connection in the room applies that
+// connection's identity to the participant (01 §3.2, §8.5): room.state is right after the next tick, in both
+// directions and for the name too. A revalidation that finds the participant in line sends nothing, and a Revalidate
+// result that is older than an UpdateUser doesn't take the room back.
+func TestRoomAdminAcrossConnections(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newEnv(t)
+		defer e.close()
+		cookieO, _ := e.user(false)
+		cookieA, a := e.user(false)
+		obs, _ := e.connect(cookieO, signaltest.DefaultHello())
+		a1, _ := e.connect(cookieA, signaltest.DefaultHello())
+		join(t, obs, "lounge")
+		join(t, a1, "lounge")
+		// expectUser reads the one room.state that a tick brought to each client, with A as given, and nothing else.
+		expectUser := func(name string, admin bool, clients ...*signaltest.Client) {
+			t.Helper()
+			var admins []string
+			if admin {
+				admins = []string{a.UserID}
+			}
+			for i, cl := range clients {
+				st := expectAdmins(t, cl, "lounge", admins...)
+				if p := participantOf(t, &st, a.UserID); p.Name != name {
+					t.Errorf("client %d: A is %q, want %q", i, p.Name, name)
+				}
+				expectOpen(t, cl)
+			}
+		}
+
+		// A becomes an admin with a new name, in the store only. A's second connection has both from its handshake;
+		// the first one leaves the room before its revalidation.
+		time.Sleep(time.Minute)
+		e.auth.SetUser(a.UserID, "alex", true)
+		a2, w := e.connect(cookieA, signaltest.DefaultHello())
+		if w.User.Name != "alex" || !w.User.Admin {
+			t.Fatalf("the second connection's welcome.user %+v, want alex, an admin", w.User)
+		}
+		join(t, a2, "lounge")
+		settle()
+		drain(t, a1)
+		leave(t, a1)
+		settle()
+		drain(t, obs)
+		drain(t, a2)
+		time.Sleep(5 * time.Minute) // every connection's revalidation tick
+		settle()
+		expectUser("alex", true, obs, a2)
+
+		// The other way, and the older connection closes: A is a member again.
+		e.auth.SetUser(a.UserID, "al", false)
+		a3, _ := e.connect(cookieA, signaltest.DefaultHello())
+		join(t, a3, "lounge")
+		settle()
+		if err := a2.CloseWith(websocket.StatusNormalClosure); err != nil {
+			t.Fatal(err)
+		}
+		settle()
+		drain(t, obs)
+		drain(t, a3)
+		time.Sleep(5 * time.Minute)
+		settle()
+		expectUser("al", false, obs, a3)
+
+		// In line: the next ticks send nothing.
+		time.Sleep(5 * time.Minute)
+		settle()
+		expectOpen(t, obs)
+		expectOpen(t, a3)
+
+		// An UpdateUser while a tick's Revalidate runs: the result, read before the change, equals the identity the
+		// call began with, and the room keeps what UpdateUser gave it.
+		release := e.auth.HoldRevalidate()
+		defer release()
+		time.Sleep(5 * time.Minute)
+		synctest.Wait()
+		e.hub.UpdateUser(a.UserID, "alexa", true)
+		settle()
+		expectUser("alexa", true, obs, a3)
+		release()
+		settle()
+		expectOpen(t, obs)
+		expectOpen(t, a3)
 	})
 }
 

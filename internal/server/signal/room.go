@@ -41,8 +41,13 @@ type room struct {
 
 // participant merges all connections of one user in one room (01 §4.1).
 type participant struct {
-	userID   string
-	name     string // the user's name when the participant was created; then UpdateUser and Revalidate
+	userID string
+	// name and admin are the user's name and role when the participant was created (the identity of its first
+	// connection); then they follow UpdateUser, Revalidate and a resume (room.setUser). A connection that joins later
+	// doesn't change them, though its identity can be the newer one: every revalidation tick of a connection in the
+	// room applies that connection's identity again (conn.applyRevalidation), so they are right after the next one.
+	name     string
+	admin    bool
 	joinedAt time.Time
 	members  []*member // the user's connections in the room, in the order they joined
 }
@@ -204,6 +209,7 @@ func (r *room) stateLocked() protocol.RoomState {
 		pi := protocol.ParticipantInfo{
 			UserID:      p.userID,
 			Name:        p.name,
+			Admin:       p.admin,
 			Status:      p.status(),
 			JoinedAt:    p.joinedAt,
 			Connections: make([]protocol.ConnectionInfo, 0, len(p.members)),
@@ -346,12 +352,14 @@ func (r *room) setName(name string) {
 	r.mu.Unlock()
 }
 
-// rename changes a participant's name (UpdateUser, Revalidate), which room.state shows.
-func (r *room) rename(userID, name string) {
+// setUser changes a participant's name and role (UpdateUser, Revalidate, a resume), which room.state shows as name
+// and admin (01 §8.5). Each of the user's connections in the room applies the change, and every revalidation tick of
+// one applies its identity again; only the first call finds something to change, so the room gets one new snapshot.
+func (r *room) setUser(userID, name string, admin bool) {
 	var o outbox
 	r.mu.Lock()
-	if p := r.participants[userID]; p != nil && p.name != name {
-		p.name = name
+	if p := r.participants[userID]; p != nil && (p.name != name || p.admin != admin) {
+		p.name, p.admin = name, admin
 		r.changedLocked(&o)
 	}
 	r.mu.Unlock()
@@ -413,7 +421,7 @@ func (h *Hub) attach(c *conn, info protocol.RoomInfo, limit int) (*room, *protoc
 	now := time.Now()
 	r.name = info.Name
 	if p == nil {
-		p = &participant{userID: id.UserID, name: id.Name, joinedAt: now}
+		p = &participant{userID: id.UserID, name: id.Name, admin: id.Admin, joinedAt: now}
 		r.participants[id.UserID] = p
 		h.participants++
 		r.eventLocked(&o, protocol.RoomEvent{

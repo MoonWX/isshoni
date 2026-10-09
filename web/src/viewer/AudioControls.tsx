@@ -20,11 +20,13 @@ const hasSound = (share: ViewerShare): boolean => !share.local && share.info.aud
 
 export interface SpeakerButtonProps {
   share: ViewerShare;
+  /** -1 in a tile that is not its list's tab stop (05 §12.7); the L key reaches the button's action there. */
+  tabIndex?: number | undefined;
   className?: string | undefined;
 }
 
 /** A tile's speaker button. Renders nothing for a share without sound and for the own preview. */
-export function SpeakerButton({ share, className }: SpeakerButtonProps) {
+export function SpeakerButton({ share, tabIndex, className }: SpeakerButtonProps) {
   const { t } = useTranslation();
   const { store } = useViewerServices();
   const audible = useViewer((s) => s.audibleShareId === share.id);
@@ -39,6 +41,7 @@ export function SpeakerButton({ share, className }: SpeakerButtonProps) {
       aria-label={label}
       aria-pressed={audible}
       title={label}
+      tabIndex={tabIndex}
       onClick={() => {
         store.getState().toggleAudible(share.id);
       }}
