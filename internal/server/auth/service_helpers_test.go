@@ -43,12 +43,19 @@ type closedConn struct {
 type fakeConns struct {
 	mu    sync.Mutex
 	calls []closedConn
+	// during, if set, runs inside every call, where the hub would be closing connections: a test looks at what
+	// the service had done by then (03 §7.7: the commit and the session cache come first).
+	during func(sel ConnSelector, reason string)
 }
 
 func (f *fakeConns) CloseConnections(sel ConnSelector, reason string) int {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.calls = append(f.calls, closedConn{sel, reason})
+	during := f.during
+	f.mu.Unlock()
+	if during != nil {
+		during(sel, reason)
+	}
 	return 1
 }
 

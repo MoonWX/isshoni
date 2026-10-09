@@ -17,7 +17,7 @@
 // No access log: only 5xx responses log one line (route pattern, status, request ID), and a panic or an internal
 // error logs its cause instead. URLs, queries and bodies are never logged.
 //
-// The API part (api.go, deps.go, info.go, auth.go, me.go, rooms.go, invites.go, push.go, admin_users.go,
+// The API part (api.go, deps.go, info.go, auth.go, me.go, account.go, rooms.go, invites.go, push.go, admin_users.go,
 // admin_rooms.go, admin_settings.go; 03 §12):
 //   - API: 03's REST API, mounted by the router at /api/v1/. Its chain (03 §12.1): body limit (16 KiB for auth and
 //     device endpoints, 64 KiB elsewhere) → no-store on every response → route lookup (JSON 404 not_found, 405
@@ -55,8 +55,16 @@
 //     push-test bucket of 03 §7.3, kept in this package) and GET and PUT /api/v1/push/preferences. With push off
 //     (no Deps.Push, or one without a VAPID key) subscribe and test answer 503 push_unavailable; the caller's
 //     stored data stays reachable. 04's sender reads the same rows through the store.
+//   - Self-service (README S58; 03 §7.7, §12.4.3; account.go): GET /api/v1/me/sessions (this browser first and
+//     marked current) and DELETE /api/v1/me/sessions/{id}, POST /api/v1/me/sessions/revoke-others,
+//     POST /api/v1/auth/logout-everywhere, POST /api/v1/me/password (the session's cookie is replaced by a new
+//     token), POST /api/v1/me/delete, and GET /api/v1/me/devices and DELETE /api/v1/me/devices/{id} (no device
+//     exists before M2). auth.Service owns each change, with the revocation row of 03 §7.7 that goes with it; the
+//     handlers set or clear the cookie, as the response's only Set-Cookie, and notify {UserID}: devices, or
+//     {Admins}: admin.users after an account was deleted.
 //
-// The other endpoints of 03 §12.3, and DashboardAccounts, come with the later account slices.
+// The other endpoints of 03 §12.3 (the admin's user endpoints, the reset links, the audit log), and
+// DashboardAccounts, come with the later account slices.
 //
 // Imports (04 §2): config, logx, version, store, auth and internal/protocol(/api); never ops, push, netx, tlsmgr,
 // signal, sfu or sfuplane, which reach this package through small interfaces declared here (RouteObserver, Signal,

@@ -131,8 +131,8 @@ func newLimiter[K comparable](r rate, maxKeys int, now func() time.Time) *limite
 // window is how far tat may run ahead of now: Burst tokens. It is at least Every and at most maxWindow (validate).
 func (l *limiter[K]) window() time.Duration { return time.Duration(l.rate.Burst) * l.rate.Every }
 
-// take consumes one token for key if there is one. Buckets that count every attempt (auth-ip, register-ip, auth-hash,
-// push-test) only take. The buckets of failed password checks (auth-user-ip, auth-user) take the token before the
+// take consumes one token for key if there is one. Buckets that count every attempt (auth-ip, register-ip,
+// auth-hash) only take. The buckets of failed password checks (auth-user-ip, auth-user) take the token before the
 // password is hashed and give it back with refund when the attempt was not a failure, so attempts that arrive while
 // earlier ones are still hashing see those in the bucket.
 func (l *limiter[K]) take(key K) verdict {
@@ -270,13 +270,13 @@ type userIPKey struct {
 	ip   netip.Prefix
 }
 
-// Throttle rates of 03 §7.3.
+// Throttle rates of 03 §7.3. The table's push-test bucket (one POST /api/v1/push/test per user per 10 s) is not
+// among them: httpapi keeps it next to its only user, the handler (httpapi/push.go, pushTestLimiter).
 var (
 	rateAuthIP     = rate{Burst: 20, Every: 15 * time.Second}
 	rateAuthUserIP = rate{Burst: 5, Every: 2 * time.Minute}
 	rateAuthUser   = rate{Burst: 30, Every: 2 * time.Minute}
 	rateRegisterIP = rate{Burst: 5, Every: 12 * time.Minute}
-	ratePushTest   = rate{Burst: 1, Every: 10 * time.Second}
 	// A blocked attempt logs one warn line per IPKey per minute.
 	rateBlockLog = rate{Burst: 1, Every: time.Minute}
 	// auth.login_failed audit rows: 600 per hour server-wide; beyond that one auth.throttled {scope:"global"} row
@@ -291,13 +291,13 @@ var (
 // decides the order (auth-ip first, auth-hash last).
 type throttles struct {
 	authIP *limiter[netip.Prefix] // every public auth attempt, by IPKey
-	// The two buckets of failed password checks. An attempt takes its tokens before the hash and gets them back when
-	// it was no failure (passwordAttempt in login.go).
+	// The two buckets of failed password checks: a login's, and the password a logged-in user types again
+	// (verifyOwnPassword). An attempt takes its tokens before the hash and gets them back when it was no failure
+	// (passwordAttempt in login.go).
 	authUserIP *limiter[userIPKey]    // by username key and IPKey; a hard block
 	authUser   *limiter[string]       // from any IP, by username key; known IPs pass
 	registerIP *limiter[netip.Prefix] // sign-ups without an invite, by IPKey
 	authHash   *limiter[struct{}]     // every public request that reaches the hash, server-wide
-	pushTest   *limiter[string]       // POST /push/test, by user ID
 
 	blockLog             *limiter[netip.Prefix] // the warn line of a blocked attempt, by IPKey
 	loginFailedAudit     *limiter[struct{}]     // auth.login_failed rows
@@ -316,7 +316,6 @@ func newThrottles(now func() time.Time, hb HashBudget) (*throttles, error) {
 		authUser:             newLimiter[string](rateAuthUser, maxLimiterKeys, now),
 		registerIP:           newLimiter[netip.Prefix](rateRegisterIP, maxLimiterKeys, now),
 		authHash:             newLimiter[struct{}](hashRate, 1, now),
-		pushTest:             newLimiter[string](ratePushTest, maxLimiterKeys, now),
 		blockLog:             newLimiter[netip.Prefix](rateBlockLog, maxLimiterKeys, now),
 		loginFailedAudit:     newLimiter[struct{}](rateLoginFailedAudit, 1, now),
 		globalThrottledAudit: newLimiter[struct{}](rateGlobalThrottled, 1, now),
