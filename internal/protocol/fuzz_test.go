@@ -35,10 +35,13 @@ func allocatedWithin(limit uint64, fn func()) uint64 {
 }
 
 // Allocation bounds of the fuzz targets (01 §19: "no allocation above 4× the input"). The constant covers what
-// does not grow with the input: encoding/json's decode state and, for Decode, the slices that the array limits
-// allow (about 54 KB for a ClientStats with every list at its limit and every element empty).
+// does not grow with the input. For Decode that is encoding/json's decode state and the slices that the array
+// limits allow (about 54 KB for a ClientStats with every list at its limit and every element empty). ParseEnvelope
+// has no such part: it allocates its result, which is a copy of parts of the frame, so its constant only covers how
+// the allocator rounds sizes up. It is small on purpose: with 8 KB there, a frame had to be 2.3 KB long before a
+// decoder that allocated 7.6 times its size was over the bound (F04).
 const (
-	envelopeAllocSlack = 8 << 10
+	envelopeAllocSlack = 1 << 10
 	decodeAllocSlack   = 64 << 10
 	// clientDecodeRatio bounds server->client payloads, which only clients decode (from their own server) and whose
 	// arrays have no count limit: encoding/json allocates up to ~250 bytes per "{}," element there (ShareInfo,
@@ -94,13 +97,22 @@ func FuzzParseEnvelope(f *testing.F) {
 	for _, fx := range loadFixtures(f, fixtureDir) {
 		f.Add(fx.raw)
 	}
-	_, _ = ParseEnvelope([]byte(`{"type":"x","id":"1","data":{}}`)) // warm encoding/json's type cache
+	// Every rule of the envelope scanner and every way to break a frame, with the long keys of F04. The frame of
+	// that finding, 2574 bytes that break off after one long key, is also a seed in testdata/fuzz.
+	for _, frame := range envelopeFrames() {
+		f.Add([]byte(frame))
+	}
 	f.Fuzz(func(t *testing.T, b []byte) {
 		var e Envelope
 		var err error
 		limit := 4*uint64(len(b)) + envelopeAllocSlack
 		if n := allocatedWithin(limit, func() { e, err = ParseEnvelope(b) }); n > limit {
 			t.Fatalf("ParseEnvelope allocated %d bytes for %d input bytes (limit %d)", n, len(b), limit)
+		}
+		// The scanner reads the frame as encoding/json does: the same frames accepted, the same envelope.
+		if want, wantErr := parseEnvelopeJSON(b); (err == nil) != (wantErr == nil) || e.Type != want.Type || e.ID != want.ID ||
+			e.Re != want.Re || !bytes.Equal(e.Data, want.Data) || (e.Data == nil) != (want.Data == nil) {
+			t.Fatalf("ParseEnvelope = %+v (data %q), %v; encoding/json gives %+v (data %q), %v", e, e.Data, err, want, want.Data, wantErr)
 		}
 		if err != nil {
 			if !errors.Is(err, ErrBadMessage) {

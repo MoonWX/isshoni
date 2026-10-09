@@ -67,6 +67,8 @@ const (
 	codePublicIPSymmetric   = "public_ip.symmetric"
 	codePublicIPCGNAT       = "public_ip.cgnat"
 	codePublicIPNone        = "public_ip.none" // params: siteIsAddress, running, error?
+	// skip, without params: network.include_loopback with no STUN server, a development setup that needs no address.
+	codePublicIPLoopback = "public_ip.loopback"
 
 	// The dns codes share: domain, ip?, ipv6?, a?, aaaa?, caa? ("allows" | "none" | "unchecked").
 	codeDNSOK            = "dns.ok"
@@ -617,6 +619,10 @@ var messagesEN = map[string]text{
 			return first + "\nisshoni will start, but it won't be ready"
 		}
 		return first + "\nthe site opens, but nobody can share or watch: media has no address to offer"
+	},
+	codePublicIPLoopback: func(params, api.DoctorEnv) string {
+		return "not checked: network.include_loopback is on and network.stun_servers is empty " +
+			"(a development setup, which needs no public address)"
 	},
 
 	codeDNSOK: func(p params, _ api.DoctorEnv) string {

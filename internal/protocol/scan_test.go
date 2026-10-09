@@ -1,0 +1,493 @@
+package protocol
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math/rand/v2"
+	"reflect"
+	"strings"
+	"testing"
+	"unicode/utf8"
+)
+
+// parseEnvelopeJSON is ParseEnvelope as it was before the envelope scanner: encoding/json reads the frame into the
+// struct. It is the reference that the scanner must agree with, for every input: the same frames accepted, and the
+// same envelope for each of them.
+func parseEnvelopeJSON(b []byte) (Envelope, error) {
+	var e Envelope
+	if !utf8.Valid(b) {
+		return Envelope{}, fmt.Errorf("%w: not valid UTF-8", ErrBadMessage)
+	}
+	if err := scanJSON(b, nil); err != nil {
+		return Envelope{}, fmt.Errorf("%w: %w", ErrBadMessage, err)
+	}
+	if err := json.Unmarshal(b, &e); err != nil {
+		return Envelope{}, fmt.Errorf("%w: %w", ErrBadMessage, err)
+	}
+	switch {
+	case e.Type == "":
+		return Envelope{}, fmt.Errorf("%w: missing type", ErrBadMessage)
+	case len(e.Type) > maxTypeLen:
+		return Envelope{}, fmt.Errorf("%w: type too long", ErrBadMessage)
+	case e.ID != "" && !validToken(e.ID, MaxIDLen):
+		return Envelope{}, fmt.Errorf("%w: invalid id", ErrBadMessage)
+	case e.Re != "" && !validToken(e.Re, MaxIDLen):
+		return Envelope{}, fmt.Errorf("%w: invalid re", ErrBadMessage)
+	}
+	switch {
+	case len(e.Data) == 0:
+	case bytes.Equal(e.Data, jsonNull):
+		e.Data = nil
+	case e.Data[0] != '{':
+		return Envelope{}, fmt.Errorf("%w: data is not an object", ErrBadMessage)
+	}
+	return e, nil
+}
+
+// parseLikeJSON runs ParseEnvelope on b and fails the test unless the result is the reference's: an error for the
+// same frames (one that wraps ErrBadMessage, with a zero Envelope), and otherwise the same fields, byte for byte.
+func parseLikeJSON(t testing.TB, b []byte) (Envelope, error) {
+	t.Helper()
+	got, err := ParseEnvelope(b)
+	want, wantErr := parseEnvelopeJSON(b)
+	switch {
+	case (err == nil) != (wantErr == nil):
+		t.Fatalf("ParseEnvelope(%q) = %+v, %v; encoding/json gives %+v, %v", b, got, err, want, wantErr)
+	case err != nil && !errors.Is(err, ErrBadMessage):
+		t.Fatalf("ParseEnvelope(%q): error %v does not wrap ErrBadMessage", b, err)
+	case err != nil && !reflect.DeepEqual(got, Envelope{}):
+		t.Fatalf("ParseEnvelope(%q) returned %+v with its error", b, got)
+	case got.Type != want.Type || got.ID != want.ID || got.Re != want.Re,
+		!bytes.Equal(got.Data, want.Data) || (got.Data == nil) != (want.Data == nil):
+		t.Fatalf("ParseEnvelope(%q) = %+v (data %q); encoding/json gives %+v (data %q)", b, got, got.Data, want, want.Data)
+	}
+	return got, err
+}
+
+// jsonValues are JSON values and near misses of every kind: what the scanner has to check wherever a frame holds a
+// value that the envelope does not keep.
+func jsonValues() []string {
+	u := jsonEsc
+	return []string{
+		// Numbers.
+		`0`, `-0`, `1`, `-1`, `10`, `1.5`, `1.50`, `0.0`, `-0.0e-0`, `1e5`, `1E5`, `1e+5`, `1e-5`, `1.5e10`, `0e0`, `1E400`,
+		`-1E-400`, `123456789012345678901234567890`, `0.000000000000000000000000000001`,
+		`01`, `00`, `-01`, `-`, `--1`, `+1`, `.5`, `-.5`, `1.`, `0.`, `1.e5`, `0.e1`, `1e`, `1E`, `1e+`, `1e-`, `1ee5`, `1e++5`,
+		`1e5.5`, `1.5.5`, `0x10`, `1_000`, `1a`, `- 1`, `1 .5`, `1 e5`, `NaN`, `Infinity`, `-Infinity`, `1,5`,
+		// Literals.
+		`true`, `false`, `null`,
+		`tru`, `True`, `TRUE`, `nul`, `nulll`, `Null`, `fals`, `falsee`, `t`, `f`, `n`, `truefalse`, `true false`, `nil`,
+		`undefined`,
+		// Strings.
+		`""`, `"a"`, `"a b"`, `"é"`, `"日本"`, `"😀"`, "\"a\x7fb\"", `"{}[],:"`, `"\"\\\/\b\f\n\r\t"`, `"\\"`, `"\\\\"`, `"\""`,
+		`"` + u("0041") + `"`, `"` + u("00e9") + u("abCD") + `"`, `"` + u("d83d") + u("de00") + `"`, `"` + u("d800") + `"`,
+		`"` + u("dc00") + `"`, `"` + u("d800") + `a"`, `"` + u("dc00") + u("d800") + `"`, `"` + u("0000") + `"`,
+		`"`, `"a`, `"a\"`, `"a\`, `"\x"`, `"\'"`, `"\a"`, `"\v"`, `"\0"`, `"\U00000041"`, `"\ "`,
+		`"` + u("12") + `"`, `"` + u("123g") + `"`, `"` + u("") + `"`, `"` + u("00") + `zz"`, `"` + u("d83d") + `\"`, `"` + u("004"),
+		"\"a\tb\"", "\"a\nb\"", "\"a\x00b\"", "\"a\x1fb\"", `'a'`, `"a""b"`, `"a" "b"`,
+		// Arrays.
+		`[]`, `[ ]`, `[1]`, `[1,2]`, `[ 1 , 2 ]`, `[[]]`, `[[],[]]`, `[{}]`, `["a",true,null,-1.5e3,{"a":[]}]`,
+		`[`, `]`, `[1`, `[1,`, `[1,]`, `[,1]`, `[,]`, `[1 2]`, `[1;2]`, `[1,,2]`, `[}`, `[1}`, `[[]`, `[]]`, `["a":1]`, `[1]]`,
+		// Objects.
+		`{}`, `{ }`, `{"a":1}`, `{ "a" : 1 }`, `{"a":1,"b":2}`, `{"a":1,"a":2}`, `{"":1}`, `{"a":{}}`, `{"a":{"b":[1,{"c":null}]}}`,
+		`{"` + u("0061") + `":1}`, `{"a\"b":1}`, `{"type":5,"id":[],"re":{},"data":"x"}`,
+		`{`, `}`, `{"a"`, `{"a":`, `{"a":1`, `{"a":1,`, `{"a":1,}`, `{,}`, `{,"a":1}`, `{"a"}`, `{"a":}`, `{:1}`, `{1:1}`, `{a:1}`,
+		`{'a':1}`, `{"a":1 "b":2}`, `{"a"::1}`, `{"a":1,,"b":2}`, `{"a":1;"b":2}`, `{"a" 1}`, `{"a":1:2}`, `{]`, `{"a":1]`,
+		`{{}}`, `{"a":{}`, `{}}`, `{"a":1}}`, `{null:1}`, `{"a\x":1}`, "{\"a\tb\":1}", `{"a`,
+		// Whitespace and what JSON does not count as whitespace, around a value.
+		" 1 ", "\t\r\n1\n\r\t", "\v1", "1\v", "\f1", "1\f", "\xc2\xa01", "1\xc2\xa0", "\xef\xbb\xbf1", "1\x00", "/**/1", "1//", "1 2",
+		``, ` `,
+	}
+}
+
+// envelopeFrames are frames that exercise each rule by which encoding/json reads an Envelope (scan.go lists
+// them), and each way a frame can be malformed. They are the seeds of FuzzParseEnvelope too.
+func envelopeFrames() []string {
+	u := jsonEsc
+	rep := strings.Repeat
+	frames := []string{
+		// Keys: matched without regard to case, after unescaping; nothing else matches.
+		`{"TYPE":"a"}`, `{"Type":"a"}`, `{"tYpE":"a","ID":"1","Re":"2","DATA":{"k":1}}`, `{"type":"a","iD":"b","rE":"c","dAtA":{}}`,
+		`{"ty` + u("0070") + `e":"a"}`, `{"` + u("0054") + `YPE":"a"}`, `{"` + u("0074") + u("0079") + u("0070") + u("0065") + `":"a"}`,
+		`{"type":"a","` + u("0069") + `d":"1","r` + u("0045") + `":"2","dat` + u("0061") + `":{"k":1}}`,
+		`{"type":"a","` + u("0049") + u("0044") + `":"1"}`, `{"t\ype":"a"}`, `{"type":"a","i\/d":"1"}`,
+		`{"ıd":"1","type":"a"}`, `{"İd":"1","type":"a"}`, `{"type":"a","ⅰd":"1"}`, `{"ｔｙｐｅ":"a"}`, `{"τype":"a"}`,
+		`{"type":"a","ſ":"1","K":"2"}`, `{"type":"a","da_ta":{"k":1}}`, `{"type":"a","da-ta":{"k":1}}`, `{"ty-pe":"a"}`,
+		`{"type ":"a"}`, `{" type":"a"}`, `{"typ":"a"}`, `{"types":"a"}`, `{"":"a"}`, `{"":"a","type":"b"}`, `{"t":"a","type":"b"}`,
+		`{"type` + u("0000") + `":"a"}`, `{"` + u("0000") + `type":"a"}`, `{"type\n":"a"}`, `{"\"type\"":"a"}`, `{"type":"a","id\\":"1"}`,
+		`{"` + u("d83d") + u("de00") + `":"a","type":"b"}`, `{"` + u("d800") + `":"a","type":"b"}`, `{"` + u("d800") + `type":"a"}`,
+		`{"` + rep("type", 20) + `":"a","type":"b"}`, `{"` + rep(u("0074"), 70) + `":"a","type":"b"}`, `{"type` + rep("e", 70) + u("0065") + `":"a"}`,
+		`{"` + rep("x", 70) + `\n":"a","type":"b"}`, `{"` + rep(u("d83d")+u("de00"), 20) + `":"a","type":"b"}`,
+		// Repeated keys: the last value counts.
+		`{"type":"a","type":"b"}`, `{"type":"a","TYPE":"b"}`, `{"TYPE":"b","type":"a"}`, `{"type":"a","type":""}`, `{"type":"","type":"a"}`,
+		`{"type":"` + rep("a", 100) + `","type":"b"}`, `{"type":"b","type":"` + rep("a", 100) + `"}`,
+		`{"type":"a","id":"1","id":"2"}`, `{"type":"a","id":"1","id":""}`, `{"type":"a","id":"bad id","id":"2"}`, `{"type":"a","id":"2","id":"bad id"}`,
+		`{"type":"a","re":"1","Re":"2","RE":"3"}`, `{"type":"a","data":{"a":1},"data":{"b":2}}`, `{"type":"a","data":{"a":1},"data":null}`,
+		`{"type":"a","data":null,"data":{"a":1}}`, `{"type":"a","data":[1],"data":{"a":1}}`, `{"type":"a","data":{"a":1},"data":[1]}`,
+		`{"type":"a","data":"x","Data":null}`, `{"type":"a","data":{},"data":{}}`,
+		// null leaves a string field as it is; any other value that is not a string is an error, wherever it stands.
+		`{"type":null}`, `{"type":"a","type":null}`, `{"type":null,"type":"a"}`, `{"type":"a","id":null}`, `{"type":"a","id":"1","id":null}`,
+		`{"type":"a","re":null,"re":"1","re":null}`, `{"type":"a","id":null,"re":null,"data":null}`,
+		`{"type":5,"type":"a"}`, `{"type":"a","type":5}`, `{"type":"a","id":1}`, `{"type":"a","id":"1","id":1}`, `{"type":"a","id":1,"id":"1"}`,
+		`{"type":"a","re":true}`, `{"type":"a","re":false}`, `{"type":"a","re":[]}`, `{"type":"a","re":{}}`, `{"type":"a","re":1.5}`,
+		`{"type":["a"]}`, `{"type":{"type":"a"}}`, `{"type":true}`, `{"type":"a","id":["1"]}`, `{"type":"a","TYPE":1}`,
+		// String values: escapes are decoded, lengths are those of the decoded text.
+		`{"type":"` + u("0070") + `ing"}`, `{"type":"p` + u("0069") + u("006e") + u("0067") + `","id":"` + u("0031") + `","re":"` + u("005f") + u("002d") + `"}`,
+		`{"type":"a\"b"}`, `{"type":"\"\\\/\b\f\n\r\t"}`, `{"type":"a` + u("0000") + `b"}`, `{"type":"é😀"}`, `{"type":"` + u("00e9") + `"}`,
+		`{"type":"` + u("d83d") + u("de00") + `"}`, `{"type":"` + u("d800") + `"}`, `{"type":"` + u("dc00") + `"}`, `{"type":"` + u("d800") + `a"}`,
+		`{"type":"` + u("d800") + u("0061") + `"}`, `{"type":"` + u("dc00") + u("d800") + `"}`, `{"type":"` + u("d83d") + u("d83d") + u("de00") + `"}`,
+		`{"type":"` + rep("a", 64) + `"}`, `{"type":"` + rep("a", 65) + `"}`, `{"type":"` + rep(u("0061"), 64) + `"}`, `{"type":"` + rep(u("0061"), 65) + `"}`,
+		`{"type":"` + rep("a", 63) + u("0061") + `"}`, `{"type":"` + rep("a", 64) + u("0061") + `"}`, `{"type":"` + u("0061") + rep("a", 64) + `"}`,
+		`{"type":"` + rep("😀", 16) + `"}`, `{"type":"` + rep("😀", 17) + `"}`, `{"type":"a` + rep("😀", 16) + `"}`,
+		`{"type":"` + rep(u("d83d")+u("de00"), 16) + `"}`, `{"type":"` + rep(u("d83d")+u("de00"), 17) + `"}`, `{"type":"aaa` + rep(u("d83d")+u("de00"), 15) + `a"}`,
+		`{"type":"aaa` + rep(u("d83d")+u("de00"), 15) + `aa"}`, `{"type":"` + rep(u("d800"), 21) + `a"}`, `{"type":"` + rep(u("d800"), 21) + `aa"}`,
+		`{"type":"` + rep("é", 32) + `"}`, `{"type":"a` + rep("é", 32) + `"}`, `{"type":"` + rep(u("00e9"), 32) + `"}`, `{"type":"a` + rep(u("00e9"), 32) + `"}`,
+		`{"type":"` + rep("a", 300) + u("0061") + `"}`, `{"type":"` + u("0061") + rep("a", 300) + `"}`, `{"type":"` + rep(u("0061"), 300) + `"}`,
+		`{"type":"a","id":"` + rep("a", 32) + `"}`, `{"type":"a","id":"` + rep("a", 33) + `"}`, `{"type":"a","id":"` + rep(u("0061"), 32) + `"}`,
+		`{"type":"a","id":"` + rep(u("0061"), 33) + `"}`, `{"type":"a","re":"` + rep("a", 31) + u("0061") + `"}`, `{"type":"a","re":"` + rep("a", 32) + u("0061") + `"}`,
+		`{"type":"a","id":"aZ09_-"}`, `{"type":"a","id":"a b"}`, `{"type":"a","id":"a` + u("0020") + `b"}`, `{"type":"a","id":"é"}`, `{"type":"a","id":"` + u("00e9") + `"}`,
+		`{"type":"a","id":"1.2"}`, `{"type":"a","re":"a/b"}`, `{"type":"a","re":"a\/b"}`, `{"type":"a","id":""}`, `{"type":"a","re":""}`, `{"type":""}`,
+		`{"type":"a","id":"` + u("0000") + `"}`, `{"type":"a","id":"` + u("d800") + `"}`, `{"type":"a","id":"` + rep("a", 70) + `"}`, `{"type":"a","id":"` + rep(u("0061"), 70) + `"}`,
+		// data: an object or null, as the bytes of the frame.
+		`{"type":"a","data":{}}`, `{"type":"a","data": { "k" : [ 1 , 2 ] } }`, "{\"type\":\"a\",\"data\":\t{\n\"k\":1\r}\n}", `{"type":"a","data":null}`,
+		`{"type":"a","data":[]}`, `{"type":"a","data":"{}"}`, `{"type":"a","data":0}`, `{"type":"a","data":true}`, `{"type":"a","data":false}`,
+		`{"type":"a","data":nul}`, `{"type":"a","data":nulll}`, `{"type":"a","data":{"type":5,"id":[],"re":{},"data":"x"}}`,
+		`{"type":"a","data":{"k":"` + u("0041") + `","` + u("0042") + `":2}}`, `{"data":{"k":1}}`, `{"data":{"k":1},"type":"a"}`,
+		// The frame: one object, nothing but JSON whitespace around it.
+		`{}`, `{ }`, ` {"type":"a"} `, "\t\r\n{\"type\":\"a\"}\n\r\t", "{\n\t\"type\" : \"a\" ,\r\n\t\"id\" : \"1\"\n}", `{"type":"a"}}`, `{"type":"a"}{}`,
+		`{"type":"a"} x`, `{"type":"a"},`, `{"type":"a"}null`, "{\"type\":\"a\"}\x00", "{\"type\":\"a\"}\f", "{\"type\":\"a\"}\v", "\xef\xbb\xbf{\"type\":\"a\"}",
+		"{\"type\":\"a\"}\xc2\xa0", "{\"type\":\"a\"\v}", "{\"type\"\f:\"a\"}", `{"type":"a"/**/}`, `{"type":"a",}`, `{,"type":"a"}`, `{"type":"a" "id":"1"}`,
+		`{"type":"a";"id":"1"}`, `{"type" "a"}`, `{"type"="a"}`, `{"type":"a","id"}`, `{"type":"a","id":}`, `{"type":"a",,"id":"1"}`, `{'type':"a"}`,
+		`{type:"a"}`, `{"type":'a'}`, `{"type":"a"`, `{"type":"a",`, `{"type":"a","`, `{"type":"a","id`, `{"type":"a","id"`, `{"type":"a","id":`, `{"type":"a","id":"`,
+		`{"type":"a","id":"1`, `{"type":"a","id":"1"`, `{"type`, `{"`, `{`, `}`, `{]`, `[{"type":"a"}]`, `{"type":"a"}]`, `[]`, `"a"`, `"type"`, `1`, `true`, `null`,
+		` null `, `nul`, ``, ` `, "\n", `{"type":"a\`, `{"type":"a\"`, `{"type":"a` + u("00") + `"}`, `{"ty` + u("00") + `pe":"a"}`, "{\"ty\tpe\":\"a\"}",
+		`{"type":"a","x":1}{"type":"b"}`, `{"type":"a"}` + rep(" ", 300), rep(" ", 300) + `{"type":"a"}`, `{{"type":"a"}}`,
+	}
+	// A value of every kind in a key that the envelope ignores.
+	for _, v := range jsonValues() {
+		frames = append(frames, `{"type":"a","u":`+v+`}`)
+	}
+	// Nesting: 32 levels with the envelope's own, in data and in a key that the envelope ignores.
+	for _, n := range []int{1, 30, 31, 32, 64, 1000} {
+		arrays := rep("[", n) + rep("]", n)
+		objects := rep(`{"a":`, n) + `1` + rep("}", n)
+		mixed := rep(`[{"a":`, n/2) + `[]` + rep("}]", n/2)
+		frames = append(frames,
+			`{"type":"a","u":`+arrays+`}`, `{"type":"a","u":`+objects+`}`, `{"type":"a","u":`+mixed+`}`,
+			`{"type":"a","data":{"k":`+arrays+`}}`, `{"type":"a","data":`+objects+`}`,
+			`{"type":"a","u":`+rep("[", n), `{"type":"a","u":`+rep(`{"a":`, n), `{"type":"a","u":`+arrays[:len(arrays)-1]+`}}`,
+			arrays, objects,
+		)
+	}
+	return append(frames, longKeyFrames(2574)...)
+}
+
+// longKeyFrames are frames of n bytes that are mostly one object key, whole and broken off: what F04 was about.
+// encoding/json allocated 3 to 13 times the key for them (a ~ or a / in the key costs it the most: it escapes
+// them for the JSON Pointer of its error).
+func longKeyFrames(n int) []string {
+	var out []string
+	for _, shape := range []struct{ before, after string }{
+		{`{"`, `":`}, // a frame that breaks off after a long key: what FuzzParseEnvelope found (the seed in testdata)
+		{`{"`, `"`}, {`{"`, ``}, {`{"`, `":1`}, {`{"`, `":1,`}, {`{"`, `":x}`}, {`{"`, `"x`}, {`{"`, `":1}`}, {`{"`, `":"a","type":"b"}`},
+		{`{"type":"a","`, `":`}, {`{"type":"a","`, `":1}`}, {`{"type":"a","`, `":{"`}, {`{"type":"a","u":[{"`, `":[`},
+		{`{"type":"a","data":{"`, `":`}, {`{"type":"a","data":{"`, `":1}}`}, {`{"type":"a","data":{"k":{"`, `":{"a":`},
+		{`{"type":"room.join","id":"2","data":{"roomId":"lounge","`, `":`},
+		{`{"type":"a","id":"1","`, `":1,"data":{"k":1}}`},
+	} {
+		for _, fill := range []string{"k", "~", "/", "é", "日", "😀", `\n`, `\\`, jsonEsc("0041"), jsonEsc("d83d") + jsonEsc("de00")} {
+			room := n - len(shape.before) - len(shape.after)
+			key := strings.Repeat(fill, room/len(fill))
+			out = append(out, shape.before+strings.Repeat("k", room-len(key))+key+shape.after)
+		}
+	}
+	return out
+}
+
+// TestParseEnvelopeLikeEncodingJSON: the scanner reads every frame as encoding/json did.
+func TestParseEnvelopeLikeEncodingJSON(t *testing.T) {
+	frames := envelopeFrames()
+	// A value of every kind, also where the envelope keeps one, deeper in the frame, in a frame that breaks off, in
+	// the place of a key, and as the whole frame.
+	for _, v := range jsonValues() {
+		frames = append(frames,
+			`{"u":`+v+`,"type":"a"}`,
+			`{"type":"a","data":{"k":`+v+`}}`,
+			`{"type":"a","data":{"k":[`+v+`,`+v+`],"l":{"m":`+v+`}}}`,
+			`{"type":`+v+`}`,
+			`{"type":"a","id":`+v+`}`,
+			`{"type":"a","data":`+v+`}`,
+			`{"type":"a","u":`+v,
+			`{"type":"a","u":[`+v,
+			`{"type":"a",`+v+`:1}`,
+			v,
+		)
+	}
+	accepted := 0
+	for _, in := range frames {
+		if _, err := parseLikeJSON(t, []byte(in)); err == nil {
+			accepted++
+		}
+	}
+	// The table must not be one-sided: a reference that rejected everything would agree with any scanner.
+	if accepted < len(frames)/10 || accepted > len(frames)*9/10 {
+		t.Errorf("%d of %d frames are accepted; the table should hold plenty of both kinds", accepted, len(frames))
+	}
+}
+
+// TestParseEnvelopeRules spells out the rules of scan.go with their results, so they do not rest on the
+// reference alone.
+func TestParseEnvelopeRules(t *testing.T) {
+	u := jsonEsc
+	type want struct {
+		typ, id, re, data string
+	}
+	for _, c := range []struct {
+		name, in string
+		want     *want // nil: rejected
+	}{
+		{"keys in any case", `{"TYPE":"a","Id":"1","rE":"2","DATA":{"k":1}}`, &want{"a", "1", "2", `{"k":1}`}},
+		{"escaped key", `{"ty` + u("0070") + `e":"a","` + u("0049") + `d":"1"}`, &want{typ: "a", id: "1"}},
+		{"dashes and underscores are not ignored", `{"type":"a","i_d":"1","r-e":"2","da_ta":[]}`, &want{typ: "a"}},
+		{"look-alike letters are other keys", `{"type":"a","ıd":"1","İD":"2"}`, &want{typ: "a"}},
+		{"last type counts", `{"type":"a","Type":"b"}`, &want{typ: "b"}},
+		{"last type counts, also an empty one", `{"type":"a","type":""}`, nil},
+		{"a too long type is fine when it is not the last", `{"type":"` + strings.Repeat("a", 100) + `","type":"b"}`, &want{typ: "b"}},
+		{"an invalid id is fine when it is not the last", `{"type":"a","id":"bad id","id":"2"}`, &want{typ: "a", id: "2"}},
+		{"last data counts", `{"type":"a","data":[1],"data":{"b":2}}`, &want{typ: "a", data: `{"b":2}`}},
+		{"last data counts, also null", `{"type":"a","data":{"a":1},"data":null}`, &want{typ: "a"}},
+		{"last data counts, also an array", `{"type":"a","data":{"a":1},"data":[1]}`, nil},
+		{"null leaves type", `{"type":"a","type":null}`, &want{typ: "a"}},
+		{"null leaves id and re", `{"type":"a","id":"1","re":"2","id":null,"re":null}`, &want{typ: "a", id: "1", re: "2"}},
+		{"null is no type", `{"type":null}`, nil},
+		{"a number is no type, even before a string", `{"type":5,"type":"a"}`, nil},
+		{"an object is no id", `{"type":"a","id":{}}`, nil},
+		{"false is no re", `{"type":"a","re":false}`, nil},
+		{"escapes in values", `{"type":"p` + u("0069") + `ng","id":"` + u("0031") + `","re":"` + u("005F") + `"}`, &want{"ping", "1", "_", ""}},
+		{"a surrogate pair", `{"type":"` + u("d83d") + u("de00") + `"}`, &want{typ: "😀"}},
+		{"half a surrogate pair", `{"type":"` + u("d800") + `"}`, &want{typ: string(utf8.RuneError)}},
+		{"type of 64 bytes, escaped", `{"type":"` + strings.Repeat(u("0061"), 64) + `"}`, &want{typ: strings.Repeat("a", 64)}},
+		{"type of 65 bytes, escaped", `{"type":"` + strings.Repeat(u("0061"), 65) + `"}`, nil},
+		{"type of 64 bytes in 16 runes", `{"type":"` + strings.Repeat(u("d83d")+u("de00"), 16) + `"}`, &want{typ: strings.Repeat("😀", 16)}},
+		{"type of 68 bytes in 17 runes", `{"type":"` + strings.Repeat(u("d83d")+u("de00"), 17) + `"}`, nil},
+		{"id of 32 bytes, escaped", `{"type":"a","id":"` + strings.Repeat(u("0061"), 32) + `"}`, &want{typ: "a", id: strings.Repeat("a", 32)}},
+		{"id of 33 bytes, escaped", `{"type":"a","id":"` + strings.Repeat(u("0061"), 33) + `"}`, nil},
+		{"id with an escaped space", `{"type":"a","id":"1` + u("0020") + `2"}`, nil},
+		{"data keeps its bytes", `{"type":"a","data": { "k" : "` + u("0041") + `" } }`, &want{typ: "a", data: `{ "k" : "` + u("0041") + `" }`}},
+		{"keys inside data are data", `{"type":"a","data":{"type":5,"id":[],"data":"x"}}`, &want{typ: "a", data: `{"type":5,"id":[],"data":"x"}`}},
+		{"number with a leading zero", `{"type":"a","u":01}`, nil},
+		{"control character in a string", "{\"type\":\"a\",\"u\":\"a\tb\"}", nil},
+		{"unknown escape", `{"type":"a","u":"\x"}`, nil},
+		{"single quote escape", `{"type":"a","u":"\'"}`, nil},
+		{"trailing comma", `{"type":"a",}`, nil},
+		{"vertical tab is not whitespace", "{\"type\":\"a\"}\v", nil},
+		{"byte order mark", "\xef\xbb\xbf{\"type\":\"a\"}", nil},
+		{"two objects", `{"type":"a"}{}`, nil},
+		{"a long key the envelope ignores", `{"` + strings.Repeat("~", 3000) + `":{"type":1},"type":"a"}`, &want{typ: "a"}},
+		{"a frame that breaks off after a long key", `{"type":"a","` + strings.Repeat("k", 3000) + `":`, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e, err := parseLikeJSON(t, []byte(c.in))
+			if c.want == nil {
+				if err == nil {
+					t.Fatalf("accepted: %+v", e)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := (want{string(e.Type), e.ID, e.Re, string(e.Data)}); got != *c.want {
+				t.Errorf("got %+v, want %+v", got, *c.want)
+			}
+			if (e.Data == nil) != (c.want.data == "") {
+				t.Errorf("data = %q; absent data must be nil, and only that", e.Data)
+			}
+		})
+	}
+}
+
+// TestParseEnvelopeMutations compares the scanner with encoding/json on the golden fixtures, each broken in many
+// small ways: a deterministic sample of what the fuzzer does, in every run of the tests.
+func TestParseEnvelopeMutations(t *testing.T) {
+	rounds := 400
+	if testing.Short() {
+		rounds = 40
+	}
+	// What a mutation puts in: JSON's own characters, and pieces that make or break its tokens.
+	pieces := []string{
+		`{`, `}`, `[`, `]`, `"`, `:`, `,`, `\`, ` `, "\n", "\t", "\x00", `0`, `1`, `-`, `.`, `e`, `E`, `+`, `a`, `n`, `t`, `f`, `u`, `é`, `😀`,
+		`null`, `true`, `false`, `""`, `{}`, `[]`, `"type":`, `"id":`, `"re":`, `"data":`, `"TYPE":"z",`, `"Data":null,`, `"id":"7",`,
+		`"x":1,`, `,"x":[{}]`, jsonEsc("0041"), jsonEsc("d83d"), jsonEsc("de00"), jsonEsc("00"), `\n`, `\"`, `\/`, `\x`,
+	}
+	rng := rand.New(rand.NewPCG(4, 2026)) //nolint:gosec // G404: the same mutations in every run, not a secret
+	accepted, rejected := 0, 0
+	for _, fx := range loadFixtures(t, fixtureDir) {
+		for range rounds {
+			b := bytes.Clone(fx.raw)
+			for n := 1 + rng.IntN(3); n > 0 && len(b) > 0; n-- {
+				at := rng.IntN(len(b))
+				piece := pieces[rng.IntN(len(pieces))]
+				switch rng.IntN(6) {
+				case 0: // insert
+					b = append(b[:at:at], append([]byte(piece), b[at:]...)...)
+				case 1: // replace one byte
+					b = append(b[:at:at], append([]byte(piece), b[at+1:]...)...)
+				case 2: // delete one byte
+					b = append(b[:at:at], b[at+1:]...)
+				case 3: // break off
+					b = b[:at]
+				case 4: // delete a stretch
+					end := min(len(b), at+1+rng.IntN(12))
+					b = append(b[:at:at], b[end:]...)
+				case 5: // double a stretch
+					end := min(len(b), at+1+rng.IntN(12))
+					b = append(b[:end:end], b[at:]...)
+				}
+			}
+			if !utf8.Valid(b) {
+				continue // cutting through a rune: rejected before the scanner runs
+			}
+			if _, err := parseLikeJSON(t, b); err == nil {
+				accepted++
+			} else {
+				rejected++
+			}
+		}
+	}
+	if accepted < 100 || rejected < 100 {
+		t.Errorf("%d mutations accepted, %d rejected; the sample should hold plenty of both kinds", accepted, rejected)
+	}
+}
+
+// TestEnvelopeScanKnowsEveryField holds the scanner's keys to the Envelope struct: a field added to the struct
+// would otherwise be skipped as an unknown key.
+func TestEnvelopeScanKnowsEveryField(t *testing.T) {
+	typ := reflect.TypeFor[Envelope]()
+	seen := map[*[]byte]string{}
+	var s envelopeScan
+	for i := range typ.NumField() {
+		name, _, _ := strings.Cut(typ.Field(i).Tag.Get("json"), ",")
+		if name == "" || name == "-" {
+			t.Errorf("Envelope.%s has no JSON name", typ.Field(i).Name)
+			continue
+		}
+		for _, key := range []string{name, strings.ToUpper(name)} {
+			dst := s.field([]byte(key), false)
+			if dst == nil {
+				t.Errorf("the scanner skips the key %q of Envelope.%s", key, typ.Field(i).Name)
+			} else if other, ok := seen[dst]; ok && other != name {
+				t.Errorf("the scanner stores %q where it stores %q", key, other)
+			}
+			seen[dst] = name
+		}
+	}
+	if len(seen) != 4 {
+		t.Errorf("the scanner knows %d fields (type, id, re, data); Envelope has %d", len(seen), typ.NumField())
+	}
+	for _, key := range []string{"", "t", "typ", "types", "i", "ids", "r", "rex", "dat", "datas", "payload"} {
+		if s.field([]byte(key), false) != nil {
+			t.Errorf("the scanner takes %q for a key of the envelope", key)
+		}
+	}
+}
+
+// TestParseEnvelopeAllocations: ParseEnvelope allocates its result and nothing else. What the envelope does not
+// keep costs no memory, however long it is, and a rejected frame costs none at all (F04: a frame that broke off
+// after a 2.5 KB key allocated 19 KB in encoding/json).
+func TestParseEnvelopeAllocations(t *testing.T) {
+	long := strings.Repeat("k", 2570)
+	for _, c := range []struct {
+		name, in string
+		ok       bool
+		// One per field of the result that is longer than a byte (the runtime has the 1-byte strings ready).
+		allocs float64
+	}{
+		{"breaks off after a long key", `{"` + long + `":`, false, 0},
+		{"breaks off after a long key in data", `{"type":"room.join","id":"42","data":{"roomId":"lounge","` + long + `":`, false, 0},
+		{"breaks off inside a long key", `{"type":"a","` + long, false, 0},
+		{"long key with slashes, then garbage", `{"type":"a","` + strings.Repeat("/~", 1285) + `":x}`, false, 0},
+		{"long escaped key, no type", `{"` + strings.Repeat(jsonEsc("0041"), 400) + `":1}`, false, 0},
+		{"too deep", `{"type":"a","id":"1","data":{"k":` + strings.Repeat("[", 31) + strings.Repeat("]", 31) + `}}`, false, 0},
+		{"not UTF-8", "{\"type\":\"a\",\"" + long + "\":\"\xff\"}", false, 0},
+		{"not an object", `["` + long + `"]`, false, 0},
+		{"long type", `{"type":"` + long + `"}`, false, 0},
+		{"long escaped type", `{"type":"` + strings.Repeat(jsonEsc("0061"), 400) + `"}`, false, 0},
+		{"invalid id after a type", `{"type":"room.join","id":"` + long + `","data":{"roomId":"lounge"}}`, false, 0},
+		{"invalid re after a type and an id", `{"type":"ok","id":"1","re":"a b","data":{"k":1}}`, false, 0},
+		{"data is an array", `{"type":"room.join","id":"2","data":["` + long + `"]}`, false, 0},
+		{"type is a number", `{"id":"2","data":{"k":"` + long + `"},"type":5}`, false, 0},
+		{"type only", `{"type":"ping"}`, true, 1},
+		{"long key that the envelope ignores", `{"type":"ping","` + long + `":{"a":[1,2,"` + long + `"]}}`, true, 1},
+		{"long keys of every kind", `{"` + strings.Repeat("~/", 1285) + `":1,"type":"ping","` + strings.Repeat(jsonEsc("0041"), 400) + `":2}`, true, 1},
+		{"request", `{"type":"room.join","id":"42","data":{"roomId":"lounge"}}`, true, 3},
+		{"request with a long key in data", `{"type":"room.join","id":"42","data":{"roomId":"lounge","` + long + `":1}}`, true, 3},
+		{"reply with escapes", `{"type":"o` + jsonEsc("006b") + `","re":"4` + jsonEsc("0032") + `","data":null}`, true, 2},
+		{"repeated keys", `{"type":"` + long + `","type":"ok","re":"41","re":"42","data":{"a":"` + long + `"},"data":{}}`, true, 3},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			b := []byte(c.in)
+			e, err := parseLikeJSON(t, b)
+			if (err == nil) != c.ok {
+				t.Fatalf("ParseEnvelope = %+v, %v; want ok=%v", e, err, c.ok)
+			}
+			if got := testing.AllocsPerRun(100, func() { _, _ = ParseEnvelope(b) }); got != c.allocs {
+				t.Errorf("%v allocations, want %v", got, c.allocs)
+			}
+			// And in bytes: the result's own, each field rounded up to the allocator's next size.
+			limit := uint64(len(e.Type)+len(e.ID)+len(e.Re)+len(e.Data))*5/4 + 64
+			if n := allocatedWithin(limit, func() { _, _ = ParseEnvelope(b) }); n > limit {
+				t.Errorf("allocated %d bytes for a result of %d and a frame of %d", n, len(e.Type)+len(e.ID)+len(e.Re)+len(e.Data), len(b))
+			}
+		})
+	}
+}
+
+// TestSkipValue: the scanner's value check on its own, against encoding/json's.
+func TestSkipValue(t *testing.T) {
+	for _, in := range jsonValues() {
+		b := []byte(in)
+		if !utf8.Valid(b) {
+			continue
+		}
+		start := skipSpace(b, 0)
+		end, err := skipValue(b, start, 0)
+		valid := err == nil && skipSpace(b, end) == len(b)
+		if valid != json.Valid(b) {
+			t.Errorf("skipValue(%q) = %d, %v; json.Valid = %v", in, end, err, !valid)
+		}
+	}
+	// Depth counts the containers around the value too.
+	nested := []byte(strings.Repeat("[", 4) + strings.Repeat("]", 4))
+	if _, err := skipValue(nested, 0, maxDepth-4); err != nil {
+		t.Errorf("4 levels inside %d: %v", maxDepth-4, err)
+	}
+	if _, err := skipValue(nested, 0, maxDepth-3); !errors.Is(err, errTooDeep) || !errors.Is(err, ErrBadMessage) {
+		t.Errorf("4 levels inside %d: error %v, want errTooDeep in ErrBadMessage", maxDepth-3, err)
+	}
+	// It stops after the value, wherever that is.
+	if end, err := skipValue([]byte(`[1,{"a":"]"}] ,2`), 0, 1); err != nil || end != 13 {
+		t.Errorf("skipValue stopped at %d, %v; want 13", end, err)
+	}
+}
+
+func BenchmarkParseEnvelope(b *testing.B) {
+	for _, fx := range loadFixtures(b, fixtureDir) {
+		switch fx.name {
+		case "pong", "room.join", "room.state", "stats.client", "pc.offer.sub":
+		default:
+			continue
+		}
+		b.Run(fx.name, func(b *testing.B) {
+			b.SetBytes(int64(len(fx.raw)))
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := ParseEnvelope(fx.raw); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
