@@ -1555,7 +1555,8 @@ after group 7 the interval is 10 minutes everywhere.
   `netx.NewTransport` since README S59: IPv6 is off when `network.ipv6` is false **or** `public_ipv6 = "off"`,
   whatever the interfaces have.
 
-Privacy: STUN contacts Cloudflare and Google at startup and every 10 minutes (one UDP packet each). Setting `public_ip`
+Privacy: STUN contacts Cloudflare and Google at startup and every 10 minutes (one UDP packet each); a server that
+waits for its public address asks every 30 s for as long as it waits (README S65, above). Setting `public_ip`
 limits this to one NAT check at startup; `network.stun_servers = []` stops STUN entirely (set `public_ip` to a literal
 then). The privacy page says so (§16).
 
@@ -2918,7 +2919,11 @@ templates live in `messages_en.go` for the CLI; 05 renders the same codes from i
   `release` offline), the platform can't answer (`skip.unsupported`, with `os`), the server's status or this
   build doesn't carry the fact (`skip.not_reported`), or the run was cut off before the check
   (`skip.interrupted`). `udp_buffers.unknown` is a skip too: Linux without the sysctl files and without a
-  server's sockets to read.
+  server's sockets to read. From README F04 on also `public_ip` on a development server (`public_ip.loopback`,
+  below): no STUN server is asked there, so doctor can't tell which address others would see, and whether the
+  server has a public one stays unknown. That is "could not find out", not "nothing to check", which is why it
+  is `skip` and not `ok`: `tls.off` knows that there is no certificate to look at, and this check knows nothing
+  about the address.
 - **`info`**: a fact the operator should read, never counted as a problem: the state before the first start
   (`data_dir.not_created`, `secrets.not_created`, `schema.no_db`), a certificate order that is under way, a
   clock that neither source could judge, and the checks that are information by nature (`ports`,
@@ -2972,6 +2977,11 @@ one differ, this one is what the code does.
 | `nofile` | – | `nofile.ok` | `nofile.low` | – |
 | `bandwidth` | – | `bandwidth.estimate` | `bandwidth.near_nic` | – |
 
+The table has no column for `skip`. Besides the four `skip.*` codes, a check's own code has that status in two
+cases: `udp_buffers.unknown` (above) and, from README F04 on, `public_ip.loopback` (`public_ip` on a development
+server, below). The second is not in `messages_en.go` as merged after group 7; it joins the list with the
+group 8 write-back, and 05's catalog renders it as `doctor.public_ip.loopback` like every other code.
+
 Fix codes: `config.fix_check`; `data_dir.fix_sudo`, `fix_owner`, `fix_not_dir`, `fix_mount`, `fix_mode`,
 `fix_space`; `secrets.fix_sudo`, `fix_owner`, `fix_restore`, `fix_mode`; `schema.fix_sudo`, `fix_restore` (03's
 message and the restore command), `fix_upgrade` (no backup from before the upgrade), `fix_same_build`,
@@ -3020,16 +3030,28 @@ is where the operator reads why, so the two checks say it in these words:
   find an address (a server behind a NAT that STUN can't see through, STUN switched off), setting `public_ip`
   remains the only fix.
 - **On a development server the check is `skip`, not `fail`** (decided after group 7; README F04 implements it).
-  With `network.include_loopback` set and no STUN server configured (`network.stun_servers = []`), a server has
-  no public address by design: it is a developer's machine or a test, it serves on loopback, and nothing was
-  asked that could have found an address. That is the configuration of `deploy/dev/isshoni.dev.toml` and
-  `isshoni.e2e.toml`. As group 7 merged it, the server's own doctor run, 20 s after every start, reported
-  `public_ip` as `fail` there, so every `task dev` and every e2e server that lived that long logged the WARN
-  line "doctor found problems", and the dashboard would show its `doctor.fail` alert once README S85 wires it,
-  for a state that is not a problem. In exactly that configuration the `fail` of "no public address" becomes a
-  `skip` that says why, and the run counts no failure for it. Everywhere else the check is as above: one of the
-  two alone doesn't change it, since a production server with `include_loopback` left on, or one with STUN
-  switched off, still needs to hear that it has no address.
+  A development server is one with all three of:
+  - `network.include_loopback` set;
+  - no STUN server configured (`network.stun_servers = []`);
+  - a site that is not the server's address: off mode, or a server with a domain (`siteIsAddress` is false).
+
+  Such a server has no public address by design: it is a developer's machine or a test, it serves on loopback,
+  and nothing was asked that could have found an address. And it is ready without one, because the readiness
+  check `public_ip` exists only where the site is the address (§6.2). That is the configuration of
+  `deploy/dev/isshoni.dev.toml` and `isshoni.e2e.toml`, both in off mode. As group 7 merged it, the server's own
+  doctor run, 20 s after every start, reported `public_ip` as `fail` there, so every `task dev` and every e2e
+  server that lived that long logged the WARN line "doctor found problems", and the dashboard would show its
+  `doctor.fail` alert once README S85 wires it, for a state that is not a problem. On such a server the check
+  is `skip`, with the code `public_ip.loopback` and a text that names the two keys, and the run counts no
+  failure for it. Everywhere else the check is as above:
+  - **Where the site is the address** (`ip` mode, and `manual` mode without a domain) the check stays `fail`
+    with `public_ip.none` and its fix, **whatever the two keys say**. That server is not ready until it has an
+    address, and doctor is where its operator reads why (the first bullet of this list). A merged test holds
+    it in exactly that configuration: `testConfig` in `internal/server` sets both keys, and
+    `TestServerWithoutASite` adds ip mode to it and wants the status `fail`, the code `public_ip.none` and a
+    fix from the admin socket's doctor. It passes unchanged with F04.
+  - **One of the two keys alone** doesn't change the check either: a production server with
+    `include_loopback` left on, or one with STUN switched off, still needs to hear that it has no address.
 
 ```
 [fail] public_ip     no public IP address found (no public address on an interface, no STUN answer)
@@ -3519,10 +3541,14 @@ source for the outbound list; 06's `/privacy` page renders this table in full.
 
 | Destination | When | What | Off switch |
 |---|---|---|---|
-| STUN (Cloudflare, Google) | Startup and every 10 min | One UDP Binding request (reveals the server IP) | `network.stun_servers = []` stops STUN entirely (set `public_ip` to a literal then); a literal `public_ip` alone leaves one NAT check at startup |
+| STUN (Cloudflare, Google) | Startup and every 10 min; every 30 s while a server that started without its public address waits for it (§6.2), only while `public_ip` is `auto` | One UDP Binding request (reveals the server IP) | `network.stun_servers = []` stops STUN entirely (set `public_ip` to a literal then); a literal `public_ip` alone leaves one NAT check at startup |
 | Let's Encrypt | Issuance, renewal; one HTTPS GET of the ACME directory for the clock check (doctor, also install.sh's pre-check; `auto`/`ip` modes) | ACME protocol; optional email | `tls.mode=manual` or `off` |
 | GitHub API | Daily | One GET with `User-Agent: isshoni/<ver>` | `updates.release_check=false` |
 | Browser push services (Google, Apple, Mozilla, Microsoft) | On notifications | Encrypted payload (RFC 8291); the service sees timing and size (padded) only | `push.enabled=false`, or users don't subscribe |
+
+The STUN row's 30 s were decided after group 7 and are README S65's to build (§6.2, §7.4); as merged after
+group 7 every server asks every 10 minutes. Such a server sends twenty times as many packets while it waits,
+and it waits only until a look finds its address, which ends the process (§6.2).
 
 OCSP stapling is disabled in certmagic (`OCSP.DisableStapling=true`, §8.2), so the server makes no OCSP requests;
 manual certificates are loaded without certmagic and cause none either. Nothing else leaves the server. Logs contain
@@ -3851,6 +3877,10 @@ Decided after group 7 (engineering calls the owner delegated; README §6):
    find it soon after the network is up. Every other server keeps the 10 minutes. README S65 implements it
    (§6.2, §7.4).
 8. **Doctor's `public_ip` check is `skip`, not `fail`, on a development server**: one with
-   `network.include_loopback` set and no STUN server configured, which is the dev and the e2e config. Such a
-   server has no public address by design, and its own doctor run 20 s after every start should not log a
-   warning or raise the dashboard's alert for it. README F04 implements it (§13.2).
+   `network.include_loopback` set, no STUN server configured and a site that is not its address (off mode, or a
+   domain), which is the dev and the e2e config. Such a server has no public address by design and is ready
+   without one, and its own doctor run 20 s after every start should not log a warning or raise the dashboard's
+   alert for it. Where the site is the address (ip mode, manual mode without a domain) the check stays `fail`
+   with `public_ip.none`, whatever the two keys say: that server is not ready, and doctor is where its operator
+   reads why. It is `skip` and not `ok` because doctor did not find out whether there is an address. README F04
+   implements it (§13.2).

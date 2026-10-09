@@ -265,19 +265,28 @@ JSON conventions:
   Zl and Zp rejected (`bad_request`, `params.field: "label"`). Room and user names come from the database (03).
 - Text on the wire is never user-facing English. The only human text is user content (`label`, names).
 
-**Parsing a frame costs at most four times its size** (decided after group 7; README F04 makes the parser meet
-it). `ParseEnvelope` reads every frame a client sends, before anything is known about it, so what it allocates
-must be bounded by what it is given: no more than **4× the frame's bytes**, plus a small constant for what does
-not grow with the input (§19), for **every** input: valid, malformed or hostile. With the read limits of §3.3
-that bounds what one frame can cost the hub. `Decode` has the same bound for the payloads of client messages: it
-refuses data nested deeper than 32 levels, and arrays longer than the field limits of §13, before it unmarshals.
+**Parsing a frame costs at most four times its size** (decided after group 7; README F04 makes the parser and
+`Decode` meet it). `ParseEnvelope` reads every frame a client sends, before anything is known about it, so what
+it allocates must be bounded by what it is given: no more than **4× the frame's bytes**, plus a small constant
+for what does not grow with the input (§19), for **every** input: valid, malformed or hostile. With the read
+limits of §3.3 that bounds what one frame can cost the hub. `Decode` has the same rule for the payloads of client
+messages, with 4× the payload and a constant of its own (§19): it refuses data nested deeper than 32 levels, and
+arrays longer than the field limits of §13, before it unmarshals.
 
-As merged after group 7 the envelope parser does not meet the bound for every input: it hands a frame to
-`encoding/json` after two checks of its own (valid UTF-8, nesting depth), and for some malformed frames that
-call allocates more than the bound allows. The fuzz target finds one within seconds (§19). The decision is
-about which side moves: **the parser changes, the bound stays.** A factor raised until today's parser passes
-would no longer say anything about the protocol, only about one library. The invalid-UTF-8 check is there for
-the same reason: `encoding/json` would replace each bad byte with three.
+As merged after group 7 neither meets its bound for every input:
+- **The envelope parser** hands a frame to `encoding/json` after two checks of its own (valid UTF-8, nesting
+  depth), and for frames with a long object member name, well-formed ones that the parser accepts among them,
+  that call allocates more than the bound allows: 4.8 to 8.4 times the frame's size in the cases of §19. The
+  fuzz target finds a malformed one within seconds (§19).
+- **Such a frame can't simply be refused.** An unknown member is ignored, however it is named (above), so a
+  well-formed frame with a long member name is accepted today and stays accepted. The parser has to read it
+  within the bound.
+- **`Decode` has the same rule and, as merged, the same gap**, from the same cause: a payload from about 28 KB
+  on whose object has a long member name, which the read limits of §3.3 allow (§19 has the numbers).
+
+The decision is about which side moves: **the parser changes, the bound stays.** A factor raised until today's
+parser passes would no longer say anything about the protocol, only about one library. The invalid-UTF-8 check
+is there for the same reason: `encoding/json` would replace each bad byte with three.
 
 ## 6. Handshake, versions, features, roles (M1)
 
@@ -1613,8 +1622,8 @@ These rules bind the web client (05), the Go test and load-test clients, the SFU
       a `starting` share that no offer has bound yet stays, under its 30 s start timeout (§8.7).
     - The sub PC closes server-side on `room.leave` or a `room.join` elsewhere; the client closes its local sub PC
       without sending anything. The server ignores `pc.close{pc: sub}` (reserved).
-    - The server never asks to rebuild a pub PC that carries no live share: no share that has not ended, in
-      whatever status. `room.leave` closes both PCs server-side.
+    - The server never asks to rebuild a pub PC whose connection publishes no share. A share counts in whatever
+      status it has: `starting`, `live` or `stalled`. `room.leave` closes both PCs server-side.
       - **The hub enforces this, not `sfuplane`** (decided after group 6; README F03 implemented it).
         The request in question is `pc.restart{pc: pub, mode: rebuild, reason: failed}`, which is made of the
         SFU's `PCStateEvent{PCPub, failed}` (§15.4). `sfuplane` passes every such event on as a `RestartRequest`
@@ -3005,14 +3014,37 @@ Behavior (normative):
     plus 64 KiB for the payloads of client messages (the slices that the array limits allow), and a looser bound
     for server-to-client payloads, which only clients decode, from their own server.
   - **The 4× bound holds for every input, and the parser is what has to meet it** (decided after group 7;
-    README F04; §5). On the tree as merged after group 7, a run of `FuzzParseEnvelope` (with the toolchain of
-    that tree, go1.27.1) fails within seconds: an object whose one member name is about 2 KB long and starts
-    with an escape (`\r`), in JSON that is not even valid (an empty string follows the name where the colon
-    should be): 2,180 bytes in and 18,272 bytes allocated, against the 16,912 that 4× plus the constant allow.
-    The seeds in `testdata/fuzz` don't have such an input, so `go test` and CI pass; the rule that a slice runs
-    its fuzzers before its PR (README §4) is what found it. F04 changes `ParseEnvelope` so that it refuses or
-    reads such input without a decoder that copies it several times, adds the failing input to
-    `testdata/fuzz/FuzzParseEnvelope`, and leaves the 4× and the two constants as they are.
+    README F04; §5). On the tree as merged after group 7 it does not hold, for `ParseEnvelope` or for `Decode`.
+    The cause is the same in every case below: a long object member name, in JSON that is valid or not, which
+    `encoding/json` reads at several times its length. Measured with `fuzz_test.go`'s own `allocatedWithin`
+    and constants, on the toolchain of that tree (go1.27.1); "allowed" is 4× the input plus the constant:
+    - **Malformed, `ParseEnvelope`.** `{"\r<2,173 × a>"""`: one member name that starts with an escape, then
+      an empty string where the colon should be. 2,180 bytes in, 18,272 allocated, 16,912 allowed; refused, as
+      it must be. A run of `FuzzParseEnvelope` finds this shape within seconds. The seeds in `testdata/fuzz`
+      don't have such an input, so `go test` and CI pass; the rule that a slice runs its fuzzers before its PR
+      (README §4) is what found it.
+    - **Well-formed and accepted, with an escape.** `{"\r<8,000 × a>":1,"type":"x"}`: 8,019 bytes in, 42,512
+      allocated, 40,268 allowed.
+    - **Well-formed and accepted, no escape needed.** `{"<60,000 × a>":1,"type":"x"}`: 60,017 bytes in, inside
+      the 64 KiB read limit, 285,456 allocated, 248,260 allowed.
+    - **`Decode`.** `{"\r<60,000 × a>":1}` as the data of a `SubscribeUpdate` or a `RoomJoin`: 60,008 bytes
+      in, about 351,000 allocated, 305,568 allowed (4× plus 64 KiB). The member is ignored, as it must be.
+    - **Where it starts.** For `ParseEnvelope`, a name of the envelope's own object: with an escape from about
+      5.4 KB, a plain one from about 9.5 KB. Names inside `data` cost it nothing beyond the copy of `data`.
+      For `Decode`, an escaped name in a payload from about 28 KB on (28,680 bytes: about 187,000 allocated,
+      180,256 allowed), and a plain one only above 64 KiB, which only `pc.offer` and `pc.answer` may be (§3.3;
+      262,080 bytes into a `PCOffer`: 1,186,592 allocated, 1,113,856 allowed). The excess comes in steps, with
+      the sizes at which the library's buffers grow, so not every larger input fails.
+    - **Refusing is not the way out for the well-formed ones.** An unknown member is ignored (§5), so such a
+      frame and such a payload must be accepted as before: the parser has to read them without those copies.
+      Only input that was refused before may be refused, earlier and cheaper.
+    - **A clean fuzz run does not prove it.** `FuzzDecode` is not likely to build a 28 KB payload in 60 s, and
+      the well-formed envelope cases need a name of several KB. So F04 adds deterministic tests next to the fuzz
+      seeds (README F04): a long unknown member name, escaped and plain, in a frame of 64 KiB and of 256 KiB
+      for `ParseEnvelope`, and in a payload of those sizes for `Decode` (256 KiB for `pc.offer` and
+      `pc.answer`), accepted and within the bound.
+    - F04 changes `ParseEnvelope` and `Decode` accordingly, adds the failing inputs to `testdata/fuzz`, and
+      does not loosen the bound: the factor stays 4×, and neither constant grows.
 
 In `internal/server/signal`, with `signaltest` fakes and `httptest`:
 - **Upgrade** (the Origin matrix moved here from 03): bad Origin → 403; Origin that differs only in host case or an
@@ -3322,12 +3354,14 @@ Decided after group 6 (engineering calls the owner delegated; README §6; README
 7. **An `agent.send` with `payload: null` is `bad_request`** (§8.14), like one without a payload. The hub then never
    relays a `null`, which nothing on this wire sends (§5).
 8. **The server asks for no pub PC rebuild that §9 rule 10 forbids**: the hub's `MediaSink` drops the request of a
-   failed pub PC whose connection has no share that has not ended, and passes it for any share the connection
-   publishes (`starting`, `live` or `stalled`); `sfuplane` still reports every failed pub PC and drops none
-   (§9 rule 10, §15.4).
+   failed pub PC whose connection publishes no share, and passes it for any share the connection publishes
+   (`starting`, `live` or `stalled`); `sfuplane` still reports every failed pub PC and drops none (§9 rule 10,
+   §15.4).
 
 Decided after group 7 (an engineering call the owner delegated; README §6; README F04 implements it):
 
-9. **`ParseEnvelope` meets the 4× allocation bound of §19 for every input.** A fuzz run on the merged tree found
-   malformed frames for which the parser, through `encoding/json`, allocates more than the bound allows. The
-   parser changes; the bound, which is what keeps one frame's cost in proportion to its size, stays (§5, §19).
+9. **`ParseEnvelope` meets the 4× allocation bound of §19 for every input.** A fuzz run and measurements on the
+   merged tree found frames, well-formed ones among them, for which the parser, through `encoding/json`,
+   allocates more than the bound allows: those with a long object member name. `Decode` has the same gap for a
+   large payload. The parser changes, and `Decode`'s way to the library with it; the bound, which is what keeps
+   one frame's cost in proportion to its size, stays (§5, §19).
