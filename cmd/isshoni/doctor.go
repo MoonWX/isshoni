@@ -14,7 +14,6 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/config"
 	"github.com/MoonWX/isshoni/internal/server/ops"
 	"github.com/MoonWX/isshoni/internal/server/ops/doctor"
-	"github.com/MoonWX/isshoni/internal/server/store"
 )
 
 type doctorOptions struct {
@@ -181,31 +180,11 @@ func parseOnly(value string) ([]string, error) {
 // errors, which the config check then reports), this machine, and 03's file-level store functions, which read the
 // database without migrating it or creating any file next to it. Everything else is doctor's own default.
 func offlineDoctorEnv(inv *invocation) doctor.Env {
-	backups := inv.cfg.Paths().Backups
 	env := doctor.Env{
 		Config: inv.cfg,
 		UID:    os.Getuid(),
 		Host:   config.Host{Environ: inv.environ},
-		DB: doctor.DBFiles{
-			LatestSchemaVersion: store.LatestSchemaVersion,
-			Inspect: func(ctx context.Context, dbPath string) (doctor.DBInfo, error) {
-				info, err := store.InspectFile(ctx, dbPath, backups)
-				if err != nil {
-					return doctor.DBInfo{}, err
-				}
-				out := doctor.DBInfo{
-					SchemaVersion:  info.SchemaVersion,
-					LastAppVersion: info.LastAppVersion,
-					HistoryOK:      info.HistoryOK,
-					Integrity:      info.Integrity,
-				}
-				if info.TooNew != nil {
-					out.TooNewBackup, out.TooNewMessage = info.TooNew.Backup, info.TooNew.Error()
-				}
-				return out, nil
-			},
-			Backup: store.BackupFile,
-		},
+		DB:     dbFiles(inv.cfg.Paths()),
 	}
 	if inv.doctorEnv != nil {
 		inv.doctorEnv(&env)

@@ -38,8 +38,9 @@ import (
 //   - README S71: push.New before auth.New, the push service as signal.Deps.Push, auth.Options.Alerts and
 //     httpapi.Deps.Push;
 //   - README S80 and S85: ops.Metrics as the router's Observer and the hub's Registerer, a collector over the SFU's
-//     Metrics, the transfer counter on the Transport and the multiplexer, and the REST routes of ops through
-//     API.Handle: the dashboard, and doctor's and the bandwidth estimate's, over the ops.Doctor that wire builds.
+//     Metrics, the transfer counter on the Transport and the multiplexer (with its Flush as ops.DataDir.Flush, so a
+//     backup holds the counters as they are), and the REST routes of ops through API.Handle: the dashboard, and
+//     doctor's and the bandwidth estimate's, over the ops.Doctor that wire builds.
 
 // The adapters and what they adapt: each consumer interface of 04 §6.6 on the left, and on the right the part of
 // 01's hub and 03's service that an adapter calls.
@@ -210,15 +211,41 @@ func (s *Server) wire(ctx context.Context) error {
 		Meta:   metaStore{db: s.store},
 		Logger: s.log,
 	})
+	// Backup, restore and rotate-secrets work on every server, with a site or without: the data directory and the
+	// keys are there either way. The database's snapshot is 03's (*store.DB).BackupTo, and its file-level functions
+	// validate what a restore brings (04 §6.6). Flush joins with the transfer counters (README S85).
+	paths := s.cfg.Paths()
 	s.admin = ops.NewAdminServer(ops.AdminOptions{
 		Health:   s.health,
 		Status:   status,
 		Accounts: accounts,
 		LogLevel: s.logLevel,
 		Doctor:   s.doctor,
-		Logger:   s.log,
+		Data: &ops.DataDir{
+			Paths:    paths,
+			DB:       DBFiles(paths.Backups),
+			Snapshot: s.store.BackupTo,
+			Now:      s.deps.Now,
+			Logger:   s.log,
+		},
+		Secrets: s.secrets,
+		Restart: s.restartFor,
+		Logger:  s.log,
 	})
 	return nil
+}
+
+// restartFor is the admin socket's Restart (ops.AdminOptions): the graceful shutdown after which Run returns
+// ErrRestartRequested and cmd/isshoni re-execs (04 §5.3, §6.5, §12.4). The handler that calls it has written its
+// answer and must not wait for the shutdown, which waits for that very request, so the shutdown runs in a
+// goroutine of its own (04 §6); Run, which watches for a shutdown that begins elsewhere, waits for it to end.
+func (s *Server) restartFor(why ops.RestartReason) {
+	reason := ShutdownRestart
+	if why == ops.RestartAfterRestore {
+		reason = ShutdownRestore
+	}
+	ctx := context.WithoutCancel(s.run) // the shutdown itself ends s.run
+	go func() { _ = s.Shutdown(ctx, reason) }()
 }
 
 // doctorEnv returns what a doctor run inside this server sees (doctor.Env, 04 §13.1): the config as the server

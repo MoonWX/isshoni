@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -35,7 +36,7 @@ type serveProc struct {
 
 	mu     sync.Mutex
 	stderr bytes.Buffer
-	ready  chan string // receives listen once
+	ready  chan string // receives listen at every start of the server: the first, and each restart in place
 }
 
 // startServe starts `isshoni serve` in off mode on an ephemeral loopback port with a fresh data directory, plus
@@ -57,7 +58,7 @@ func startServe(t *testing.T, args ...string) *serveProc {
 		"--listen.ice-udp", "127.0.0.1:0", "--listen.ice-tcp", "127.0.0.1:0", "--network.include-loopback", "--network.stun-servers=",
 		"--data-dir", filepath.Join(t.TempDir(), "data"), "--listen.admin-socket", socketPath(t),
 	}, args...)
-	p := &serveProc{cmd: exec.CommandContext(t.Context(), bin, all...), exited: make(chan struct{}), ready: make(chan string, 1)}
+	p := &serveProc{cmd: exec.CommandContext(t.Context(), bin, all...), exited: make(chan struct{}), ready: make(chan string, 16)}
 	p.cmd.Env = append(os.Environ(),
 		"ISSHONI_CONFIG="+empty,
 		"ISSHONI_ALLOW_EPHEMERAL_DATA=1", // the tests may run in a container, where a temporary data directory is refused
@@ -82,12 +83,12 @@ func startServe(t *testing.T, args ...string) *serveProc {
 	return p
 }
 
-// follow copies the server's log and looks for the line that says where it listens:
-// {"level":"INFO","msg":"isshoni … ready: http://localhost:PORT (tls=off)","listen":"127.0.0.1:PORT"}.
+// follow copies the server's log and looks for the lines that say where it listens:
+// {"level":"INFO","msg":"isshoni … ready: http://localhost:PORT (tls=off)","listen":"127.0.0.1:PORT"}. A server that
+// restarts in place writes one at every start, into the same pipe: the process is the same.
 func (p *serveProc) follow(stderr io.Reader) {
 	sc := bufio.NewScanner(stderr)
 	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
-	found := false
 	for sc.Scan() {
 		line := sc.Bytes()
 		p.mu.Lock()
@@ -95,9 +96,11 @@ func (p *serveProc) follow(stderr io.Reader) {
 		p.stderr.WriteByte('\n')
 		p.mu.Unlock()
 		var rec struct{ Msg, Listen string }
-		if !found && json.Unmarshal(line, &rec) == nil && rec.Listen != "" && strings.Contains(rec.Msg, " ready: ") {
-			found = true
-			p.ready <- rec.Listen
+		if json.Unmarshal(line, &rec) == nil && rec.Listen != "" && strings.Contains(rec.Msg, " ready: ") {
+			select {
+			case p.ready <- rec.Listen:
+			default: // more restarts than any test makes
+			}
 		}
 	}
 }
@@ -108,7 +111,8 @@ func (p *serveProc) logs() string {
 	return p.stderr.String()
 }
 
-// waitReady waits for the "ready" log line and returns the base URL of the server.
+// waitReady waits for the next "ready" log line and returns the base URL of the server: the first call for the
+// server's start, a later one for its next restart in place, which binds a new ephemeral port.
 func (p *serveProc) waitReady(t *testing.T) string {
 	t.Helper()
 	select {
@@ -273,8 +277,8 @@ func TestServeRuntimeErrors(t *testing.T) {
 	}
 }
 
-// The exit mapping of 04 §6: nil and a forced stop → 0, a refusal → 78, a requested restart → 75, anything
-// else → 1.
+// The exit mapping of 04 §6: nil and a forced stop → 0, a refusal → 78, a requested restart → 75 in an invocation
+// that can't re-exec (TestRestartInPlace has the one that can), anything else → 1.
 func TestServeExit(t *testing.T) {
 	refusal := &config.OperatorError{
 		Reason: config.ReasonSecretsOwner, Path: "/var/lib/isshoni/secrets.json",
@@ -310,7 +314,8 @@ func TestServeExit(t *testing.T) {
 		// After SIGINT the context is done; a failure of the server must still exit with its own code, not 130.
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
-		err := serveExit(inv, tt.err)
+		// serve's own context is the one that a stop signal ends; here none came.
+		err := serveExit(t.Context(), inv, slog.New(slog.DiscardHandler), tt.err)
 		if got := exitCodeOf(ctx, err); got != tt.wantCode {
 			t.Errorf("%s: exit %d, want %d", tt.name, got, tt.wantCode)
 		}
@@ -323,6 +328,79 @@ func TestServeExit(t *testing.T) {
 	}
 	if !server.NeedsOperator(refusal) || server.NeedsOperator(server.ErrRestartRequested) {
 		t.Error("NeedsOperator disagrees with the test's cases")
+	}
+}
+
+// What serve does once the server has shut down for a restart (04 §6.5): it re-execs, whatever the restart was
+// for (Run's result is the same after a restore, after rotate-secrets and when the server found the public
+// address it was waiting for). Only when there is no new process does it exit: 0 after a stop, 75 otherwise.
+func TestRestartInPlace(t *testing.T) {
+	const startAgain = "isshoni serve: the server stopped for a restart (after a restore or rotate-secrets, or because it found the " +
+		"public address it was waiting for)"
+	stopped, stop := context.WithCancel(t.Context())
+	stop()
+	tests := []struct {
+		name       string
+		ctx        context.Context
+		reexec     func() error // nil: the invocation has none
+		wantCalls  int
+		wantCode   int
+		wantStderr string
+		wantLog    string
+	}{
+		// In the real program the re-exec does not come back; here it "succeeds" by returning what a failed exec
+		// would, so that the test sees that it was called, once.
+		{"re-exec", t.Context(), func() error { return errors.New("exec format error") }, 1, exitRestart,
+			startAgain + " and could not start itself again (exec format error): start it again\n", "restarting in place"},
+		{"a platform without re-exec", t.Context(), func() error { return server.ErrNoReexec }, 1, exitRestart, startAgain + ": start it again\n", "restarting in place"},
+		{"an invocation that can't", t.Context(), nil, 0, exitRestart, startAgain + ": start it again\n", ""},
+		{"a stop came during the shutdown", stopped, func() error { return errors.New("must not be called") }, 0, exitOK, "",
+			"stopped instead of restarting: a stop signal came during the shutdown"},
+	}
+	cmd := root().sub("serve")
+	for _, tt := range tests {
+		var stderr, logs bytes.Buffer
+		calls := 0
+		inv := &invocation{stderr: &stderr}
+		if tt.reexec != nil {
+			inv.reexec = func() error { calls++; return tt.reexec() }
+		}
+		err := serveExit(tt.ctx, inv, slog.New(slog.NewTextHandler(&logs, nil)), server.ErrRestartRequested)
+		// A restart the server asked for is no interrupt: after a stop it is a clean exit, 0 and not 130.
+		if got := exitCodeOf(tt.ctx, err); got != tt.wantCode || calls != tt.wantCalls {
+			t.Errorf("%s: exit %d after %d re-execs, want %d after %d", tt.name, got, calls, tt.wantCode, tt.wantCalls)
+		}
+		if err != nil {
+			report(inv, cmd, err)
+		}
+		if stderr.String() != tt.wantStderr {
+			t.Errorf("%s: stderr %q\nwant %q", tt.name, stderr.String(), tt.wantStderr)
+		}
+		if got := logs.String(); (tt.wantLog == "") != (got == "") || !strings.Contains(got, tt.wantLog) {
+			t.Errorf("%s: log %q, want %q in it", tt.name, got, tt.wantLog)
+		}
+	}
+}
+
+// logSignals says its line once per signal and stops when told to.
+func TestLogSignals(t *testing.T) {
+	sigs := make(chan os.Signal, 1)
+	said := make(chan struct{}, 8)
+	stop := logSignals(sigs, func() { said <- struct{}{} })
+	for range 3 {
+		sigs <- syscall.SIGHUP
+		select {
+		case <-said:
+		case <-time.After(5 * time.Second):
+			t.Fatal("a signal was not answered")
+		}
+	}
+	stop()
+	sigs <- syscall.SIGHUP // nobody is watching any more
+	select {
+	case <-said:
+		t.Error("a signal after stop was answered")
+	case <-time.After(20 * time.Millisecond):
 	}
 }
 

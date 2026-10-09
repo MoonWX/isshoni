@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"os"
 	"strings"
 	"time"
 
@@ -113,12 +114,23 @@ func (inv *invocation) terminal(w io.Writer) bool {
 	if inv.isTTY != nil {
 		return inv.isTTY(w)
 	}
-	s, ok := w.(interface{ Stat() (fs.FileInfo, error) })
+	return isTerminal(w)
+}
+
+// isTerminal reports whether stream, a file (anything with Stat, such as *os.File), is a terminal: a character
+// device, but not the null device, which is one too. A service manager, cron and `< /dev/null` give a command
+// that for its stdin, and `> /dev/null` for its stdout: nobody reads there, and nobody answers.
+func isTerminal(stream any) bool {
+	f, ok := stream.(interface{ Stat() (fs.FileInfo, error) })
 	if !ok {
 		return false
 	}
-	fi, err := s.Stat()
-	return err == nil && fi.Mode()&fs.ModeCharDevice != 0
+	fi, err := f.Stat()
+	if err != nil || fi.Mode()&fs.ModeCharDevice == 0 {
+		return false
+	}
+	null, err := os.Stat(os.DevNull)
+	return err != nil || !os.SameFile(fi, null)
 }
 
 // color reports whether output to w may carry colors: only on a terminal, and only when NO_COLOR is not set

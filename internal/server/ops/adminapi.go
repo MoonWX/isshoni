@@ -1,6 +1,7 @@
 package ops
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"runtime/debug"
 	"slices"
@@ -19,6 +21,7 @@ import (
 
 	"github.com/MoonWX/isshoni/internal/logx"
 	"github.com/MoonWX/isshoni/internal/protocol/api"
+	"github.com/MoonWX/isshoni/internal/server/config"
 	"github.com/MoonWX/isshoni/internal/server/ops/doctor"
 	"github.com/MoonWX/isshoni/internal/version"
 )
@@ -189,10 +192,9 @@ func (s *AdminServer) routes() http.Handler {
 		{http.MethodPost, "/v1/invites", s.handleInvite, false},
 		{http.MethodPost, "/v1/log-level", s.handleLogLevel, false},
 		{http.MethodPost, "/v1/doctor", s.handleDoctor, false},
-		// A later slice of the M1 plan (README S65) fills these in.
-		{http.MethodGet, "/v1/backup", notImplemented("backup"), false},
-		{http.MethodPost, "/v1/restore", notImplemented("restore"), false},
-		{http.MethodPost, "/v1/rotate-secrets", notImplemented("rotate-secrets"), false},
+		{http.MethodGet, "/v1/backup", s.handleBackup, false},
+		{http.MethodPost, "/v1/restore", s.handleRestore, false},
+		{http.MethodPost, "/v1/rotate-secrets", s.handleRotateSecrets, false},
 	}
 	mux := http.NewServeMux()
 	for _, rt := range routes {
@@ -263,12 +265,6 @@ func internalAnswer(ref string) AdminErrorResponse {
 		Error:   api.Error{Code: api.CodeInternal, RequestID: ref},
 		Message: "the server ran into an internal error (ref " + ref + ")",
 		Fix:     "look for that ref in the server's log (journalctl -u isshoni, or docker compose logs isshoni)",
-	}
-}
-
-func notImplemented(what string) func(http.ResponseWriter, *http.Request) error {
-	return func(http.ResponseWriter, *http.Request) error {
-		return unavailable("%s over the admin socket is not implemented in this build yet", what)
 	}
 }
 
@@ -554,6 +550,211 @@ func (s *AdminServer) handleDoctor(w http.ResponseWriter, r *http.Request) error
 	return nil
 }
 
+// changeState is what the socket's two destructive operations are doing (04 §5.3, §12.4). A restore replaces the
+// database and secrets.json and a rotation rewrites secrets.json, each followed by a restart, so only one runs at
+// a time, and none once a restart has been asked for.
+type changeState uint8
+
+const (
+	changeIdle       changeState = iota
+	changeRunning                // a restore or a rotation is at work
+	changeRestarting             // one of them is done, and the server is about to shut down for its restart
+)
+
+// beginChange reserves the server for a restore or a rotation. While another one runs it answers 409
+// restore_in_progress, and once a restart is on its way 503 server_shutdown, as the socket does from the moment the
+// shutdown itself begins (04 §12.2).
+func (s *AdminServer) beginChange() error {
+	s.changeMu.Lock()
+	defer s.changeMu.Unlock()
+	switch s.change {
+	case changeRunning:
+		return &DataError{
+			Code:    api.CodeRestoreInProgress,
+			Message: "a restore or a rotation of the secrets is running on this server",
+			Fix:     "wait until the server is back, then try again if it is still needed",
+		}
+	case changeRestarting:
+		return api.NewError(api.CodeServerShutdown)
+	}
+	s.change = changeRunning
+	return nil
+}
+
+// endChange ends what beginChange began: with restarting, the server goes down next and takes no further change.
+func (s *AdminServer) endChange(restarting bool) {
+	s.changeMu.Lock()
+	defer s.changeMu.Unlock()
+	s.change = changeIdle
+	if restarting {
+		s.change = changeRestarting
+	}
+}
+
+// answerThenRestart writes the 202 answer of a restore or a rotation and then asks the server for its restart, in
+// that order (04 §5.3): the answer is on its way before the shutdown begins, and the shutdown waits for this
+// request to end before it closes the socket (04 §6.4 step 6).
+func (s *AdminServer) answerThenRestart(w http.ResponseWriter, answer any, why RestartReason) {
+	writeAdminJSON(w, http.StatusAccepted, answer)
+	_ = http.NewResponseController(w).Flush() // an error means the client is gone; the restart happens all the same
+	s.restart(why)
+}
+
+// handleBackup streams a backup archive (GET /v1/backup?certs=1, 04 §12.3). Nearly everything that can go wrong
+// with the data directory happens while the backup is staged, before the answer begins, and is an ordinary error
+// answer. Once a part of the archive is on its way, the status is sent with it, and a failure can only cut the
+// connection: the client then has an answer that broke off, never an archive that looks whole.
+func (s *AdminServer) handleBackup(w http.ResponseWriter, r *http.Request) error {
+	certs := true
+	switch v := r.URL.Query().Get("certs"); v {
+	case "", "1":
+	case "0":
+		certs = false
+	default:
+		return badRequest("certs=%q: want 1 (with the TLS certificates, the default) or 0", v)
+	}
+	if s.data == nil {
+		return unavailable("this server's admin socket has no backup")
+	}
+	if r.Method == http.MethodHead {
+		w.Header().Set("Content-Type", AdminContentArchive)
+		w.WriteHeader(http.StatusOK)
+		return nil
+	}
+	b, err := s.data.PrepareBackup(r.Context(), BackupOptions{NoCerts: !certs})
+	if err != nil {
+		return err
+	}
+	defer b.Close()
+	// Not audited (04 §12.1): one info line with the peer's uid.
+	s.log.LogAttrs(r.Context(), slog.LevelInfo, "backup written through the admin socket",
+		slog.Bool("certs", certs), slog.Int("schema_version", b.Manifest.SchemaVersion), peerUIDAttr(r.Context()))
+	h := w.Header()
+	h.Set("Content-Type", AdminContentArchive)
+	h.Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": b.Filename()}))
+	// The archive's first part waits in a buffer: a small backup, and the start of any, can still fail into an
+	// ordinary error answer, because nothing has left, the status neither.
+	sent := &countingWriter{w: w}
+	out := bufio.NewWriterSize(sent, backupAnswerBuffer)
+	err = b.WriteTo(r.Context(), out)
+	if err == nil {
+		err = out.Flush()
+	}
+	switch {
+	case err == nil:
+		return nil
+	case sent.n == 0:
+		h.Del("Content-Type")
+		h.Del("Content-Disposition")
+		return err
+	}
+	level := slog.LevelError
+	if r.Context().Err() != nil { // the client hung up
+		level = slog.LevelDebug
+	}
+	s.log.LogAttrs(r.Context(), level, "the backup could not be sent to its end", logx.Err(err))
+	panic(http.ErrAbortHandler) // net/http cuts the connection without ending the body
+}
+
+// backupAnswerBuffer is how much of an archive GET /v1/backup holds back before the answer begins.
+const backupAnswerBuffer = 64 << 10
+
+// countingWriter counts what has been written to w.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// handleRestore takes a backup archive or a database file (POST /v1/restore, 04 §12.4): it validates the body,
+// saves the current state as a pre-restore backup, writes the restore's plan, answers 202 and asks for the
+// restart. The files are swapped at the end of the shutdown, when nothing has them open any more.
+func (s *AdminServer) handleRestore(w http.ResponseWriter, r *http.Request) error {
+	if s.data == nil || s.restart == nil {
+		return unavailable("this server's admin socket has no restore")
+	}
+	if err := s.beginChange(); err != nil {
+		return err
+	}
+	info, err := s.data.PrepareRestore(r.Context(), http.MaxBytesReader(w, r.Body, restoreMaxBytes), r.ContentLength)
+	if err != nil {
+		s.endChange(false)
+		return err
+	}
+	s.endChange(true)
+	// Not audited (04 §12.1): the restore replaces the audit log anyway.
+	s.log.LogAttrs(r.Context(), slog.LevelInfo, "restore accepted through the admin socket; restarting to swap the files in",
+		slog.String("kind", string(info.Kind)), slog.Int("schema_version", info.SchemaVersion),
+		slog.String("pre_restore_backup", info.PreRestoreBackup), peerUIDAttr(r.Context()))
+	s.answerThenRestart(w, AdminRestoreResult{Restarting: true, PreRestoreBackup: info.PreRestoreBackup}, RestartAfterRestore)
+	return nil
+}
+
+// handleRotateSecrets replaces the named keys of secrets.json and, with "vapid", the VAPID pair (POST
+// /v1/rotate-secrets, 04 §5.3), answers 202 and asks for the restart. It is a hard cut: the new file is written
+// before the answer, and at the next start every consumer finds that its key differs and purges what the old one
+// protected. The rotation is audited there (03 §4.6), not here.
+func (s *AdminServer) handleRotateSecrets(w http.ResponseWriter, r *http.Request) error {
+	var in AdminRotateRequest
+	if err := decodeAdminJSON(w, r, &in); err != nil {
+		return err
+	}
+	known := config.KeyNames()
+	var names []config.KeyName
+	for _, k := range in.Keys {
+		name := config.KeyName(k)
+		if !slices.Contains(known, name) {
+			return badRequest(`there is no key named %q; the keys are %s, and "vapid": true rotates the push keys`, k, keyList(known))
+		}
+		if !slices.Contains(names, name) {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 && !in.VAPID {
+		return badRequest(`nothing to rotate: name keys (%s) or set "vapid": true`, keyList(known))
+	}
+	if s.secrets == nil || s.restart == nil {
+		return unavailable("this server's admin socket can't rotate secrets")
+	}
+	if err := s.beginChange(); err != nil {
+		return err
+	}
+	res, err := s.secrets.Rotate(r.Context(), names, in.VAPID)
+	if err != nil {
+		s.endChange(false)
+		return err
+	}
+	s.endChange(true)
+	rotated := make([]string, 0, len(res.Rotated)+1)
+	for _, name := range res.Rotated {
+		rotated = append(rotated, string(name))
+	}
+	if res.VAPID {
+		rotated = append(rotated, rotatedVAPID)
+	}
+	s.log.LogAttrs(r.Context(), slog.LevelInfo, "secrets rotated through the admin socket; restarting to apply them",
+		slog.Any("keys", rotated), peerUIDAttr(r.Context()))
+	s.answerThenRestart(w, AdminRotateResult{Rotated: rotated, Restarting: true}, RestartAfterRotation)
+	return nil
+}
+
+// rotatedVAPID is the VAPID pair's name in AdminRotateResult.Rotated, after the keys of config.KeyNames.
+const rotatedVAPID = "vapid"
+
+// keyList prints key names for a message: "session, invite, resume".
+func keyList(names []config.KeyName) string {
+	parts := make([]string, len(names))
+	for i, n := range names {
+		parts[i] = string(n)
+	}
+	return strings.Join(parts, ", ")
+}
+
 // decodeAdminJSON reads a JSON request body into dst. An empty body leaves dst as it is, because every field of
 // the socket's requests is optional (so `curl --unix-socket … -X POST http://isshoni/v1/setup-url` works). Unknown
 // fields are ignored, like everywhere in the API (03 §12.1).
@@ -599,10 +800,17 @@ func writeAdminJSON(w http.ResponseWriter, status int, v any) {
 func (s *AdminServer) writeError(w http.ResponseWriter, r *http.Request, err error) {
 	var out AdminErrorResponse
 	var se *socketError
+	var de *DataError
 	var ae *api.Error
 	switch {
 	case errors.As(err, &se):
 		out = AdminErrorResponse{Error: se.api, Message: se.message, Fix: se.fix}
+	case errors.As(err, &de): // a refusal of a backup or a restore, with its own text
+		out = AdminErrorResponse{Error: api.Error{Code: de.Code}, Message: de.Message, Fix: de.Fix}
+		if de.Err != nil {
+			s.log.LogAttrs(r.Context(), slog.LevelInfo, "an admin socket request was refused",
+				slog.String("route", r.Method+" "+r.Pattern), slog.String("code", de.Code), logx.Err(de.Err))
+		}
 	case errors.As(err, &ae) && ae != nil:
 		out.Error = *ae
 		out.Message, out.Fix = describe(ae, r)
