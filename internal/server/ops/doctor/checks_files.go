@@ -55,17 +55,67 @@ func problemLine(pr config.Problem) string {
 	return strings.TrimSuffix(line, ".")
 }
 
-// serviceUID returns the uid the server runs as, when doctor knows it: its own uid inside the server, and offline
-// the caller's uid, who is taken for the service's user. Offline root outside a container is the exception: the
-// service has a user of its own there (04 §5.1) and root reads everything, so the owner checks are left out.
-func (r *run) serviceUID() (uid int, known bool) {
+// ServiceUser is the name of the user the server runs as on a host that 06's installer set up: install.sh creates
+// it and the systemd unit has User=isshoni (06 §4.5).
+const ServiceUser = "isshoni"
+
+// serviceUser is the user the server runs as, as far as doctor knows.
+type serviceUser struct {
+	uid int
+	// name is ServiceUser when the uid was found by that name, "" when the uid is the one doctor runs as.
+	name string
+	// self reports that doctor runs as this user, so what this process may write is what the server may write.
+	self bool
+}
+
+// service returns the user the server runs as, when doctor knows it (04 §5.1):
+//
+//   - inside the server it is the process's own;
+//   - offline in a container it is the caller: a one-off container of the image runs as the user the service's
+//     container runs as;
+//   - offline on a host that has a user named ServiceUser it is that user, whoever asks. Root, who reads every
+//     file, and an ordinary user, who is someone else, would both be the wrong one to compare owners with: the
+//     next start checks them as the service's user (04 §6.3). A second server that someone starts by hand on
+//     such a host is measured against the wrong user (wrongOwner);
+//   - offline on a host without that user (a development machine, a setup made by hand) the caller is taken for
+//     it, which is right for someone who starts the server by hand too. The texts say that this is a guess. Root
+//     is the exception: the server should not run as root on a host, so there is nobody to compare with and the
+//     owner checks are left out.
+func (r *run) service() (s serviceUser, known bool) {
 	if !unixPerms || r.env.UID < 0 {
-		return 0, false
+		return serviceUser{}, false
 	}
-	if r.offline() && r.env.UID == 0 && !r.inContainer() {
-		return 0, false
+	if !r.offline() || r.inContainer() {
+		return serviceUser{uid: r.env.UID, self: true}, true
 	}
-	return r.env.UID, true
+	if uid, ok := r.env.LookupUser(ServiceUser); ok {
+		return serviceUser{uid: uid, name: ServiceUser, self: uid == r.env.UID}, true
+	}
+	if r.env.UID == 0 {
+		return serviceUser{}, false
+	}
+	return serviceUser{uid: r.env.UID, self: true}, true
+}
+
+// into puts the service's user into the params of a finding about it: uid, and user when the uid was found by
+// the user's name.
+func (s serviceUser) into(p params) {
+	p["uid"] = s.uid
+	if s.name != "" {
+		p["user"] = s.name
+	}
+}
+
+// wrongOwner puts the finding "this path belongs to someone else than the service's user" into p. callerOwns
+// marks a path of the ordinary user who runs doctor, on a host whose service's user was found by name: that is a
+// broken installation, and it is also what a second server looks like that the caller starts by hand on such a
+// host. doctor can't tell the two apart, so the fix says when it does not apply.
+func (r *run) wrongOwner(p params, owner int, s serviceUser) {
+	p["owner"] = owner
+	s.into(p)
+	if s.name != "" && owner == r.env.UID && owner != 0 {
+		p["callerOwns"] = true
+	}
 }
 
 // deniedOffline reports that err is "permission denied" for a caller who could use sudo: the offline mode as an
@@ -126,14 +176,19 @@ func checkDataDir(_ context.Context, r *run) result {
 
 	// The owner and the uid go into the params only where they are the finding: a result that is fine reads the
 	// same on every machine.
-	if service, known := r.serviceUID(); known {
-		if owner, ok := fileOwner(fi); ok && owner != service {
-			p["owner"], p["uid"] = owner, service
+	if service, known := r.service(); known {
+		if owner, ok := fileOwner(fi); ok && owner != service.uid {
+			r.wrongOwner(p, owner, service)
 			return failResult(codeDataDirWrongOwner, p, fixDataDirOwner)
 		}
-		if err := writable(dir); err != nil {
-			p["error"], p["uid"] = err.Error(), service
-			return failResult(codeDataDirNotWritable, p, fixDataDirOwner)
+		// The kernel answers for this process. That says something about the server only when doctor runs as the
+		// service's user: root may write everywhere, and another user's "no" is not the service's.
+		if service.self {
+			if err := writable(dir); err != nil {
+				p["error"] = err.Error()
+				service.into(p)
+				return failResult(codeDataDirNotWritable, p, fixDataDirOwner)
+			}
 		}
 	}
 
@@ -168,9 +223,9 @@ func checkSecrets(_ context.Context, r *run) result {
 		return r.secretsUnreadable(p, err)
 	}
 	p["mode"] = modeText(fi.Mode())
-	if service, known := r.serviceUID(); known {
-		if owner, ok := fileOwner(fi); ok && owner != service {
-			p["owner"], p["uid"] = owner, service
+	if service, known := r.service(); known {
+		if owner, ok := fileOwner(fi); ok && owner != service.uid {
+			r.wrongOwner(p, owner, service)
 			return failResult(codeSecretsWrongOwner, p, fixSecretsOwner)
 		}
 	}

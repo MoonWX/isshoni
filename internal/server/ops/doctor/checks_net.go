@@ -17,6 +17,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/MoonWX/isshoni/internal/protocol/api"
 	"github.com/MoonWX/isshoni/internal/server/config"
@@ -306,10 +308,45 @@ const (
 
 // checkTLS reports the certificate: mode, names, issuer, end date, next renewal, and the last error's code
 // (04 §8.7). Only a running server knows them.
+//
+// A result whose fix code is the server's last error code carries the server's own fix text for it when the Env
+// has one (the lastError param), which then is the fix (04 §13.2): tlsmgr wrote it from the CA's answer and knows
+// more than the code says.
 func checkTLS(ctx context.Context, r *run) result {
 	if r.offline() {
 		return skipResult(codeSkipNeedsServer, nil)
 	}
+	res := r.tlsState(ctx)
+	if text := fixLine(r.env.TLSLastError); text != "" && res.fixCode != "" && res.fixCode == r.live.TLS.LastErrorCode {
+		if res.params == nil {
+			res.params = params{}
+		}
+		res.params["lastError"] = text
+	}
+	return res
+}
+
+// maxFixLine bounds a fix text that doctor did not write itself. tlsmgr cuts the CA's detail to 300 bytes; its
+// longest sentence around a path is well below this.
+const maxFixLine = 1000
+
+// fixLine makes a text from outside doctor fit to be a fix line: one line without control characters (part of it
+// may be the CA's words about what it found at the domain, and the report goes to a terminal), of bounded length,
+// and without the sentence's last period, like doctor's own fixes, which often end in a command to copy.
+func fixLine(s string) string {
+	s = strings.Join(strings.FieldsFunc(s, func(c rune) bool { return unicode.IsSpace(c) || unicode.IsControl(c) }), " ")
+	if len(s) > maxFixLine {
+		cut := maxFixLine
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		s = s[:cut] + "…"
+	}
+	return strings.TrimSuffix(s, ".")
+}
+
+// tlsState is the tls check of a running server.
+func (r *run) tlsState(ctx context.Context) result {
 	st := r.live.TLS
 	mode := config.TLSMode(st.Mode)
 	if mode == "" {

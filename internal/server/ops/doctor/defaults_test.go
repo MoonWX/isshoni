@@ -8,8 +8,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -46,6 +48,24 @@ func TestRunDefaults(t *testing.T) {
 	}
 	if c := rep.Checks[4]; unixPerms && (c.Code != codeNofileOK && c.Code != codeNofileLow) {
 		t.Errorf("nofile on this machine: %+v", c)
+	}
+}
+
+// The default user lookup asks the machine's user database: the user the tests run as has the process's uid, and
+// a name nobody has is no user.
+func TestLookupUserDefault(t *testing.T) {
+	if _, ok := lookupUser("isshoni-doctor-test-no-such-user"); ok {
+		t.Error("a user that does not exist was found")
+	}
+	if !unixPerms {
+		t.Skip("no numeric uids on this platform")
+	}
+	me, err := user.LookupId(strconv.Itoa(os.Getuid()))
+	if err != nil {
+		t.Skipf("the user of the tests is not in the user database: %v", err)
+	}
+	if uid, ok := lookupUser(me.Username); !ok || uid != os.Getuid() {
+		t.Errorf("lookupUser(%q) = %d, %v; want %d", me.Username, uid, ok, os.Getuid())
 	}
 }
 
@@ -158,6 +178,28 @@ func TestTextHelpers(t *testing.T) {
 	}
 	if got := ownerFix(params{"path": "/data"}, sys, true); !strings.Contains(got, "let the user that isshoni runs as read and write /data") {
 		t.Errorf("ownerFix without a uid: %q", got)
+	}
+	// Offline, a service's user that was found by name gets the path, whoever ran doctor.
+	named := params{"uid": 998, "user": "isshoni", "owner": 0, "offline": true, "path": "/var/lib/isshoni"}
+	if got := ownerFix(named, api.DoctorEnv{User: "root"}, true) + "|" + ownerFix(named, api.DoctorEnv{User: "alice", Systemd: true}, false); got != "sudo chown -R isshoni /var/lib/isshoni|sudo chown isshoni /var/lib/isshoni" {
+		t.Errorf("ownerFix for a user found by name: %q", got)
+	}
+	named["callerOwns"] = true
+	if got := ownerFix(named, api.DoctorEnv{User: "alice"}, true); got != "sudo chown -R isshoni /var/lib/isshoni\n(unless you start this isshoni yourself as alice: then leave it as it is)" {
+		t.Errorf("ownerFix for the caller's own path: %q", got)
+	}
+	// Offline, a caller who was only taken for the service's user is told both cases, by name or by number.
+	guess := params{"uid": 1000, "owner": 997, "offline": true, "path": "/srv/isshoni"}
+	const asOwner = "if isshoni runs as the owner (uid 997), run doctor as that user: sudo -u '#997' isshoni doctor\n"
+	if got := ownerFix(guess, api.DoctorEnv{User: "alice"}, true); got != asOwner+"if it runs as alice: sudo chown -R alice /srv/isshoni" {
+		t.Errorf("ownerFix for a guess: %q", got)
+	}
+	if got := ownerFix(guess, api.DoctorEnv{User: "uid 1000"}, false); got != asOwner+"if it runs as uid 1000: sudo chown 1000 /srv/isshoni" {
+		t.Errorf("ownerFix for a guess without a name: %q", got)
+	}
+	// A path that is the caller's own but not writable has no other owner to name.
+	if got := ownerFix(params{"uid": 1000, "offline": true, "path": "/srv/isshoni"}, api.DoctorEnv{User: "alice"}, true); got != "sudo chown -R alice /srv/isshoni" {
+		t.Errorf("ownerFix without an owner: %q", got)
 	}
 	if restart(api.DoctorEnv{}) != "" || restart(api.DoctorEnv{Systemd: true}) != "sudo systemctl restart isshoni" {
 		t.Error("restart names a command where doctor knows none, or the wrong one")

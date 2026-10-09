@@ -35,10 +35,15 @@ import (
 //
 //	doc := ops.NewDoctor(ops.DoctorOptions{Meta: meta, Logger: log, Env: func(ctx context.Context) doctor.Env {
 //		status, _ := statusOf(ctx) // what GET /v1/status answers
-//		return doctor.Env{
+//		env := doctor.Env{
 //			Config: cfg, Live: &status, UID: os.Getuid(), Host: deps.Host, Resolver: deps.Resolver, Now: deps.Now,
 //			DB: doctor.DBFiles{LatestSchemaVersion: store.LatestSchemaVersion},
 //		}
+//		// The fix text of the certificate's last error, which the status leaves out (04 §13.2 tls).
+//		if cert := tlsManager.Status(); cert.LastErrorCode == status.TLS.LastErrorCode {
+//			env.TLSLastError = cert.LastError
+//		}
+//		return env
 //	}})
 //	admin := ops.NewAdminServer(ops.AdminOptions{…, Doctor: doc}) // POST /v1/doctor
 //	go func() { _ = doc.Run(ctx) }()                               // 20 s after the start, then every 24 h
@@ -66,8 +71,9 @@ const (
 // DoctorOptions configures NewDoctor. Only Env is required.
 type DoctorOptions struct {
 	// Env returns what one run sees (doctor.Env): the wiring fills in the config, the server's status as the admin
-	// socket's GET /v1/status reports it (Env.Live, which makes it a run inside the server), 03's
-	// LatestSchemaVersion, the uid and the server's test seams. It is called once per run. Required.
+	// socket's GET /v1/status reports it (Env.Live, which makes it a run inside the server), the fix text of the
+	// certificate's last error (Env.TLSLastError), 03's LatestSchemaVersion, the uid and the server's test seams.
+	// It is called once per run. Required.
 	Env func(ctx context.Context) doctor.Env
 	// Meta keeps the last report across restarts (MetaDoctorLast). nil keeps it in memory only.
 	Meta MetaStore

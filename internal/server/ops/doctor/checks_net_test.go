@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/MoonWX/isshoni/internal/protocol/api"
 	"github.com/MoonWX/isshoni/internal/server/netx"
@@ -622,6 +623,159 @@ func TestCheckTLS(t *testing.T) {
 		if c := w.check("tls"); c.FixCode != code || c.Fix == "" {
 			t.Errorf("%s: fix code %q, fix %q", code, c.FixCode, c.Fix)
 		}
+	}
+}
+
+// The fix of a failing certificate is the server's own text for its last error (tlsmgr.Status.LastError, 04 §8.7),
+// when the wiring passes it on: it names what the code alone does not say (04 §13.2).
+func TestCheckTLSServerFix(t *testing.T) {
+	failing := func(code string, uptime time.Duration, lastError string) *world {
+		w := newWorld(t, "--domain", testDomain)
+		w.live.TLS = api.TLSInfo{Mode: api.TLSModeAuto, Names: []string{testDomain}, LastErrorCode: code, LastErrorAt: testNow.Add(-10 * time.Second)}
+		w.live.UptimeS = int64(uptime / time.Second)
+		w.env.TLSLastError = lastError
+		return w
+	}
+	tests := []struct {
+		name, code, lastError, fix string
+	}{
+		{
+			name: "the CA's own words", code: tlsACMEFailed,
+			lastError: `Error creating new order :: Cannot issue for "watch.example.com": Domain name contains an invalid character`,
+			fix:       `Error creating new order :: Cannot issue for "watch.example.com": Domain name contains an invalid character`,
+		},
+		{
+			name: "the address the domain points to", code: tlsDNSWrong,
+			lastError: "watch.example.com points to 198.51.100.4, but this server is 203.0.113.7.",
+			fix:       "watch.example.com points to 198.51.100.4, but this server is 203.0.113.7",
+		},
+		{
+			name: "the end of the rate limit", code: tlsRateLimited,
+			lastError: "Let's Encrypt rate limit until 2026-10-09 12:30:00 UTC. Restore certmagic/ from a backup if you reinstalled.",
+			fix:       "Let's Encrypt rate limit until 2026-10-09 12:30:00 UTC. Restore certmagic/ from a backup if you reinstalled",
+		},
+		{
+			name: "a code this doctor does not know", code: "tls.something_new",
+			lastError: "Something a later isshoni found out.",
+			fix:       "Something a later isshoni found out",
+		},
+		{
+			// Part of the text may be the CA's words about what it found at the domain, and the report goes to a
+			// terminal.
+			name: "one line without control characters", code: tlsACMEFailed,
+			lastError: "198.51.100.4: Invalid response from http://watch.example.com/x:\n\t\"<html>\x1b[2J\x07oops\"\r\n",
+			fix:       `198.51.100.4: Invalid response from http://watch.example.com/x: "<html> [2J oops"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// A warning from the first failed attempt on, a failure after ten minutes: the same cause.
+			for _, st := range []struct {
+				uptime time.Duration
+				status api.DoctorStatus
+				code   string
+			}{{time.Minute, api.DoctorStatusWarn, codeTLSFailing}, {11 * time.Minute, api.DoctorStatusFail, codeTLSNoCert}} {
+				c := failing(tt.code, st.uptime, tt.lastError).check("tls")
+				want(t, c, st.status, st.code, tt.code)
+				if c.Fix != tt.fix {
+					t.Errorf("after %s, fix:\n got %q\nwant %q", st.uptime, c.Fix, tt.fix)
+				}
+				// The text travels in the params, like every value of a text.
+				if c.Params["lastError"] != tt.fix {
+					t.Errorf("after %s, params.lastError %q", st.uptime, c.Params["lastError"])
+				}
+			}
+		})
+	}
+
+	t.Run("a renewal that fails", func(t *testing.T) {
+		w := newWorld(t, "--tls.mode", "ip")
+		w.live.TLS.LastErrorCode = tlsRateLimited
+		w.env.TLSLastError = "Let's Encrypt rate limit reached. Restore certmagic/ from a backup if you reinstalled."
+		c := w.check("tls")
+		want(t, c, api.DoctorStatusWarn, codeTLSRenewalFailing, tlsRateLimited)
+		if want := "Let's Encrypt rate limit reached. Restore certmagic/ from a backup if you reinstalled"; c.Fix != want {
+			t.Errorf("fix:\n got %q\nwant %q", c.Fix, want)
+		}
+	})
+	t.Run("manual mode names the file", func(t *testing.T) {
+		w := newWorld(t, "--tls.mode", "manual", "--tls.cert-file", "/etc/ssl/c.pem", "--tls.key-file", "/etc/ssl/k.pem", "--domain", testDomain)
+		w.live.TLS = api.TLSInfo{Mode: api.TLSModeManual, Names: []string{testDomain}, LastErrorCode: tlsCertUnreadable}
+		w.env.TLSLastError = "isshoni may not read tls.key_file = /etc/ssl/k.pem. Let the user that isshoni runs as read it, " +
+			"for example: sudo chgrp isshoni /etc/ssl/k.pem && sudo chmod 640 /etc/ssl/k.pem."
+		c := w.check("tls")
+		want(t, c, api.DoctorStatusFail, codeTLSNotLoaded, tlsCertUnreadable)
+		// The command at the end stays copyable: no period after the path.
+		if !strings.HasPrefix(c.Fix, "isshoni may not read tls.key_file = /etc/ssl/k.pem. ") || !strings.HasSuffix(c.Fix, "sudo chmod 640 /etc/ssl/k.pem") {
+			t.Errorf("fix: %q", c.Fix)
+		}
+	})
+	t.Run("without the server's text the code's own text stands in", func(t *testing.T) {
+		c := failing(tlsDNSWrong, time.Minute, "").check("tls")
+		want(t, c, api.DoctorStatusWarn, codeTLSFailing, tlsDNSWrong)
+		if want := "watch.example.com doesn't point to this server (203.0.113.7). Change its A record (see dns)"; c.Fix != want {
+			t.Errorf("fix:\n got %q\nwant %q", c.Fix, want)
+		}
+		if _, ok := c.Params["lastError"]; ok {
+			t.Errorf("params carry an empty lastError: %v", c.Params)
+		}
+		// A text of nothing but white space is none.
+		c = failing(tlsACMEFailed, time.Minute, " \n").check("tls")
+		contains(t, c.Fix, "the server's log (journalctl -u isshoni) has its answer")
+	})
+	t.Run("only for the fix that is the last error's", func(t *testing.T) {
+		manual := []string{"--tls.mode", "manual", "--tls.cert-file", "/etc/ssl/c.pem", "--tls.key-file", "/etc/ssl/k.pem", "--domain", testDomain}
+		const stale = "tls.cert_file and tls.key_file are not a certificate with its private key (…)."
+
+		// A fix that is doctor's own advice, not the server's last error: a manual certificate about to end.
+		w := newWorld(t, manual...)
+		w.live.TLS = api.TLSInfo{Mode: api.TLSModeManual, Names: []string{testDomain}, Ready: true, NotAfter: testNow.Add(3 * 24 * time.Hour)}
+		w.env.TLSLastError = stale
+		c := w.check("tls")
+		want(t, c, api.DoctorStatusWarn, codeTLSExpiresSoon, fixTLSReplace)
+		if c.Fix != "replace the files in tls.cert_file and tls.key_file; isshoni loads new files within a minute" || c.Params["lastError"] != nil {
+			t.Errorf("fix %q, params %v", c.Fix, c.Params)
+		}
+
+		// A manual certificate that ran out while the server's last error is another one.
+		w = newWorld(t, manual...)
+		w.live.TLS = api.TLSInfo{
+			Mode: api.TLSModeManual, Names: []string{testDomain}, NotAfter: testNow.Add(-time.Hour), LastErrorCode: tlsCertInvalid,
+		}
+		w.env.TLSLastError = stale
+		c = w.check("tls")
+		want(t, c, api.DoctorStatusFail, codeTLSExpired, tlsCertExpired)
+		if !strings.HasPrefix(c.Fix, "The certificate in tls.cert_file is expired or not valid yet.") || c.Params["lastError"] != nil {
+			t.Errorf("fix %q, params %v", c.Fix, c.Params)
+		}
+
+		// A certificate that is fine has no fix at all, whatever text is left over.
+		w = newWorld(t, "--tls.mode", "ip")
+		w.env.TLSLastError = stale
+		c = w.check("tls")
+		want(t, c, api.DoctorStatusOK, codeTLSOK, "")
+		if c.Params["lastError"] != nil {
+			t.Errorf("params %v", c.Params)
+		}
+
+		// Offline there is no certificate state to speak of.
+		w.live = nil
+		want(t, w.check("tls"), api.DoctorStatusSkip, codeSkipNeedsServer, "")
+	})
+}
+
+// A fix text from outside doctor is cut at a rune boundary.
+func TestFixLine(t *testing.T) {
+	long := strings.Repeat("é", maxFixLine) // two bytes each
+	got := fixLine(long)
+	if len(got) != maxFixLine+len("…") || !strings.HasSuffix(got, "é…") || !utf8.ValidString(got) {
+		t.Errorf("a long text: %d bytes, ends %q", len(got), got[len(got)-8:])
+	}
+	if got := fixLine("  two\twords.  "); got != "two words" {
+		t.Errorf("fixLine: %q", got)
+	}
+	if got := fixLine(""); got != "" {
+		t.Errorf("fixLine of nothing: %q", got)
 	}
 }
 

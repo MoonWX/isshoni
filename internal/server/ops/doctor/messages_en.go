@@ -37,8 +37,8 @@ const (
 	codeDataDirNotDir           = "data_dir.not_dir"           // params: path
 	codeDataDirNotMounted       = "data_dir.not_mounted"       // in a container, not a volume; params: path, error?
 	codeDataDirEphemeralAllowed = "data_dir.ephemeral_allowed" // the same, allowed by ISSHONI_ALLOW_EPHEMERAL_DATA
-	codeDataDirWrongOwner       = "data_dir.wrong_owner"       // params: path, owner, uid, offline
-	codeDataDirNotWritable      = "data_dir.not_writable"      // params: path, error, uid
+	codeDataDirWrongOwner       = "data_dir.wrong_owner"       // params: path, owner, uid, user?, callerOwns?, offline
+	codeDataDirNotWritable      = "data_dir.not_writable"      // params: path, error, uid, user?
 	codeDataDirModeWide         = "data_dir.mode_wide"         // params: path, mode
 	codeDataDirLowSpace         = "data_dir.low_space"         // params: path, freeBytes
 
@@ -46,7 +46,7 @@ const (
 	codeSecretsNotCreated = "secrets.not_created" // offline, before the first start; params: path
 	codeSecretsMissing    = "secrets.missing"     // the database is there, its keys are not; params: path, offline
 	codeSecretsUnreadable = "secrets.unreadable"  // params: path, error
-	codeSecretsWrongOwner = "secrets.wrong_owner" // params: path, owner, uid
+	codeSecretsWrongOwner = "secrets.wrong_owner" // params: path, owner, uid, user?, callerOwns?, offline
 	codeSecretsCorrupt    = "secrets.corrupt"     // params: path, error
 	codeSecretsModeWide   = "secrets.mode_wide"   // params: path, mode
 
@@ -81,7 +81,8 @@ const (
 	codeDNSLookupFailed  = "dns.lookup_failed"  // the resolver failed; params: error
 	codeDNSUnverified    = "dns.unverified"     // no public address to compare with
 
-	// The tls codes share: mode, names?, name?, domain?, ip?, issuer?, notAfter?, nextRenewal?.
+	// The tls codes share: mode, names?, name?, domain?, ip?, issuer?, notAfter?, nextRenewal?, and lastError? (the
+	// server's own fix text for its last error, when the fix code is that error's code).
 	codeTLSOK             = "tls.ok"
 	codeTLSOff            = "tls.off"             // a proxy has the certificate
 	codeTLSPending        = "tls.pending"         // info: the first order is under way
@@ -201,10 +202,17 @@ func messageEN(code string, p params, e api.DoctorEnv) string {
 	return code
 }
 
-// fixEN returns the English fix of a fix code, or "" when the code has none for these params. A certificate code
-// that this build does not know (the tls check passes the server's code on as it is) gets the text of the general
-// one, which points at the server's log.
+// fixEN returns the English fix of a fix code, or "" when the code has none for these params.
+//
+// The fix of a certificate code (04 §8.7) is the server's own text for its last error when the result carries it
+// (the lastError param, checks_net.go): it names the other address, the end of the rate limit, the CA's words or
+// the file, which the texts here can only describe. They are the fix for a result without it. A certificate code
+// that this build does not know (the tls check passes the server's code on as it is) then gets the text of the
+// general one, which points at the server's log.
 func fixEN(code string, p params, e api.DoctorEnv) string {
+	if strings.HasPrefix(code, "tls.") && p.str("lastError") != "" {
+		return p.str("lastError")
+	}
 	if f, ok := fixesEN[code]; ok {
 		return f(p, e)
 	}
@@ -364,12 +372,33 @@ func restart(e api.DoctorEnv) string {
 	return ""
 }
 
-// owner is the service's user for a chown, by name where the report has one.
+// owner is the service's user for a chown, by name where the report has one: the user param when the check found
+// the service's user by its name, otherwise the user the report's checks ran as.
 func owner(p params, e api.DoctorEnv) string {
+	if name := p.str("user"); name != "" {
+		return name
+	}
 	if inContainer(e) || e.User == "" || strings.HasPrefix(e.User, "uid ") {
 		return strconv.FormatInt(p.int("uid"), 10)
 	}
 	return e.User
+}
+
+// callerAsService reports that the uid of an owner finding is the one doctor itself runs as: an offline run that
+// did not find the service's user by name (checks_files.go). On a host that is a guess at the service's user; in a
+// container it is the image's user.
+func callerAsService(p params) bool { return p.bool("offline") && !p.has("user") }
+
+// wrongOwnerText is the message of the two wrong_owner codes.
+func wrongOwnerText(p params) string {
+	who := fmt.Sprintf("isshoni runs as uid %d", p.int("uid"))
+	switch {
+	case p.has("user"):
+		who = fmt.Sprintf("isshoni runs as the user %s (uid %d)", p.str("user"), p.int("uid"))
+	case callerAsService(p):
+		who = fmt.Sprintf("doctor runs as uid %d", p.int("uid"))
+	}
+	return fmt.Sprintf("%s belongs to uid %d, but %s", p.str("path"), p.int("owner"), who)
 }
 
 // publicIPText is the first line of the public_ip messages: the addresses and how they were found.
@@ -489,13 +518,7 @@ var messagesEN = map[string]text{
 		return p.str("path") + " is not a mounted volume, which ISSHONI_ALLOW_EPHEMERAL_DATA=1 allows: " +
 			"the data is lost when the container is removed"
 	},
-	codeDataDirWrongOwner: func(p params, _ api.DoctorEnv) string {
-		who := "isshoni runs"
-		if p.bool("offline") {
-			who = "doctor runs"
-		}
-		return fmt.Sprintf("%s belongs to uid %d, but %s as uid %d", p.str("path"), p.int("owner"), who, p.int("uid"))
-	},
+	codeDataDirWrongOwner: func(p params, _ api.DoctorEnv) string { return wrongOwnerText(p) },
 	codeDataDirNotWritable: func(p params, _ api.DoctorEnv) string {
 		return p.str("path") + " is not writable for isshoni (" + p.str("error") + ")"
 	},
@@ -520,13 +543,7 @@ var messagesEN = map[string]text{
 	codeSecretsUnreadable: func(p params, _ api.DoctorEnv) string {
 		return "can't read " + p.str("path") + ": " + p.str("error")
 	},
-	codeSecretsWrongOwner: func(p params, _ api.DoctorEnv) string {
-		who := "isshoni runs"
-		if p.bool("offline") {
-			who = "doctor runs"
-		}
-		return fmt.Sprintf("%s belongs to uid %d, but %s as uid %d", p.str("path"), p.int("owner"), who, p.int("uid"))
-	},
+	codeSecretsWrongOwner: func(p params, _ api.DoctorEnv) string { return wrongOwnerText(p) },
 	codeSecretsCorrupt: func(p params, _ api.DoctorEnv) string {
 		return p.str("path") + " can't be used (" + p.str("error") + ")\n" +
 			"isshoni never replaces it, because new keys would sign everyone out"
@@ -1051,7 +1068,8 @@ var fixesEN = map[string]text{
 	},
 
 	// The fix texts of 04 §8.7, from what the server's status says: the certificate's name, the domain and this
-	// server's address. The server's log has the CA's own words for each failed attempt.
+	// server's address. They stand in when the result has no lastError param (fixEN): a report from a server whose
+	// wiring passed no fix text along. The server's log has the CA's own words for each failed attempt.
 	tlsACMEUnreachable: func(p params, _ api.DoctorEnv) string {
 		return "Let's Encrypt couldn't connect to " + p.str("name") + " on port 80 or 443. Open TCP 80 and 443 in your cloud firewall"
 	},
@@ -1169,6 +1187,12 @@ var fixesEN = map[string]text{
 
 // ownerFix gives a data file or directory to the service's user (04 §5.1): by name on a systemd host, by number on
 // a container's host.
+//
+// Where the caller was only taken for the service's user (callerAsService) and someone else owns the path, doctor
+// does not know which of the two the server runs as. Giving the path to the caller would break a server that runs
+// as the owner (its next start exits 78), so the fix names both cases and puts the harmless one first. And where
+// the path is the caller's own on a host with a service user (callerOwns), the fix says that it is not for a
+// server the caller starts by hand.
 func ownerFix(p params, e api.DoctorEnv, recursive bool) string {
 	r := ""
 	if recursive {
@@ -1181,11 +1205,19 @@ func ownerFix(p params, e api.DoctorEnv, recursive bool) string {
 		return fmt.Sprintf("on the container's host, run: sudo chown %s%d:%d <the host path of %s>",
 			r, p.int("uid"), p.int("uid"), p.str("path"))
 	}
-	out := "sudo chown " + r + owner(p, e) + " " + shellQuote(p.str("path"))
-	if p.bool("offline") && p.has("owner") {
-		out += fmt.Sprintf("\n(or run doctor as the owner: sudo -u '#%d' isshoni doctor)", p.int("owner"))
+	to := owner(p, e)
+	chown := "sudo chown " + r + to + " " + shellQuote(p.str("path"))
+	if callerAsService(p) && p.has("owner") {
+		if to != e.User { // a number: the report has no name for the caller
+			to = "uid " + to
+		}
+		return fmt.Sprintf("if isshoni runs as the owner (uid %d), run doctor as that user: sudo -u '#%d' isshoni doctor\n"+
+			"if it runs as %s: %s", p.int("owner"), p.int("owner"), to, chown)
 	}
-	return out
+	if p.bool("callerOwns") && e.User != "" {
+		chown += "\n(unless you start this isshoni yourself as " + e.User + ": then leave it as it is)"
+	}
+	return chown
 }
 
 // logHint names where the server's log is in this environment.

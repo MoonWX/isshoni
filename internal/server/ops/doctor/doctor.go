@@ -24,7 +24,7 @@
 //
 // Imports (04 §2): config, logx, version, netx and internal/protocol/api; never store, tlsmgr, auth or the SFU.
 // What doctor needs from 03's store arrives as function values (DBFiles), and the certificate state as part of
-// the server's status.
+// the server's status, with tlsmgr's fix text for the last error next to it (Env.TLSLastError).
 package doctor
 
 import (
@@ -98,6 +98,17 @@ type Env struct {
 	DiskFree func(dir string) (uint64, error)
 	// NoFile returns the soft limit of open files (RLIMIT_NOFILE). nil means the real one where there is one.
 	NoFile func() (uint64, error)
+	// LookupUser returns the uid of the user with this name, and whether there is one. Offline, the data_dir and
+	// secrets checks find the service's user with it (ServiceUser, which 06's installer creates), so that they
+	// compare owners with the user the server runs as and not with whoever runs doctor. nil means the system's
+	// user database (os/user).
+	LookupUser func(name string) (uid int, ok bool)
+	// TLSLastError is the fix text of the certificate's last error as the server wrote it
+	// (tlsmgr.Status.LastError, 04 §8.7), which api.ServerStatus leaves out. It names what doctor can't know from
+	// the code alone: the address a domain points to, the end of a rate limit, the CA's own words, the file that
+	// can't be read. The wiring fills it from the tlsmgr.Status that Live.TLS was made of; the tls check prints
+	// it as the fix when its fix code is Live.TLS.LastErrorCode. "" means: the code's text in messages_en.go.
+	TLSLastError string
 }
 
 // DBFiles carries 03's file-level store functions, which never migrate or write the source file. doctor and ops
@@ -343,6 +354,9 @@ func newRun(env Env, in api.BandwidthInput) *run {
 	if env.Bind == nil {
 		env.Bind = bind
 	}
+	if env.LookupUser == nil {
+		env.LookupUser = lookupUser
+	}
 	r := &run{env: env, cfg: env.Config, live: env.Live, in: in}
 	if r.in == (api.BandwidthInput{}) {
 		r.in = DefaultBandwidthInput()
@@ -428,6 +442,17 @@ func userName(uid int) string {
 		return u.Username
 	}
 	return "uid " + strconv.Itoa(uid)
+}
+
+// lookupUser asks the system's user database for the uid of a user. A user without a numeric uid (Windows) counts
+// as none.
+func lookupUser(name string) (uid int, ok bool) {
+	u, err := user.Lookup(name)
+	if err != nil {
+		return 0, false
+	}
+	uid, err = strconv.Atoi(u.Uid)
+	return uid, err == nil && uid >= 0
 }
 
 // interfaces lists the network interfaces once per run. A list that can't be read is empty.

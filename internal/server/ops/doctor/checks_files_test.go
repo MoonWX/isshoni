@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -107,25 +108,96 @@ func TestCheckDataDir(t *testing.T) {
 		want(t, w.check("data_dir"), api.DoctorStatusOK, codeDataDirOK, "")
 	})
 	t.Run("another user's", func(t *testing.T) {
+		// Inside the server the service's user is the one the process runs as; no user is looked up by name.
 		w := newWorld(t)
 		w.uid = os.Getuid() + 1000
+		w.env.LookupUser = func(string) (int, bool) {
+			t.Error("a running server looked its user up by name")
+			return 0, false
+		}
 		c := w.check("data_dir")
 		want(t, c, api.DoctorStatusFail, codeDataDirWrongOwner, fixDataDirOwner)
-		contains(t, c.Message, "but isshoni runs as uid")
-		contains(t, c.Fix, "sudo chown -R isshoni "+w.dataDir)
-		// Offline the caller is taken for the service's user, and may also be the wrong one to ask.
-		w.live = nil
-		c = w.check("data_dir")
-		want(t, c, api.DoctorStatusFail, codeDataDirWrongOwner, fixDataDirOwner)
-		contains(t, c.Message, "but doctor runs as uid")
-		contains(t, c.Fix, "or run doctor as the owner: sudo -u '#")
-	})
-	t.Run("offline root is not the service", func(t *testing.T) {
-		if os.Getuid() == 0 {
-			t.Skip("the data directory of this test belongs to root")
+		if want := fmt.Sprintf("%s belongs to uid %d, but isshoni runs as uid %d", w.dataDir, os.Getuid(), w.uid); c.Message != want {
+			t.Errorf("message:\n got %q\nwant %q", c.Message, want)
 		}
+		if want := "sudo chown -R isshoni " + w.dataDir; c.Fix != want {
+			t.Errorf("fix:\n got %q\nwant %q", c.Fix, want)
+		}
+	})
+	t.Run("offline on an installed host", func(t *testing.T) {
+		// The service's user is the one named isshoni, whoever runs doctor: root (`sudo isshoni doctor`, the
+		// command install.sh prints) or an ordinary user. A stopped server whose next start would exit 78 is
+		// explained to both, and the directory is never given to the caller.
+		owner := os.Getuid()
+		for _, caller := range []struct {
+			uid  int
+			name string
+		}{{0, "root"}, {owner + 1000, "alice"}} {
+			w := newWorld(t)
+			w.live, w.uid, w.env.User = nil, caller.uid, caller.name
+			w.env.LookupUser = serviceUserIs(owner + 2000)
+			c := w.check("data_dir")
+			want(t, c, api.DoctorStatusFail, codeDataDirWrongOwner, fixDataDirOwner)
+			if want := fmt.Sprintf("%s belongs to uid %d, but isshoni runs as the user isshoni (uid %d)", w.dataDir, owner, owner+2000); c.Message != want {
+				t.Errorf("as %s, message:\n got %q\nwant %q", caller.name, c.Message, want)
+			}
+			if want := "sudo chown -R isshoni " + w.dataDir; c.Fix != want {
+				t.Errorf("as %s, fix:\n got %q\nwant %q", caller.name, c.Fix, want)
+			}
+			if c.Params["user"] != ServiceUser || c.Params["uid"] != owner+2000 || c.Params["owner"] != owner {
+				t.Errorf("as %s, params %v", caller.name, c.Params)
+			}
+
+			// The directory is the service's: fine, also for a caller who is someone else.
+			w.env.LookupUser = serviceUserIs(owner)
+			c = w.check("data_dir")
+			want(t, c, api.DoctorStatusOK, codeDataDirOK, "")
+			if _, ok := c.Params["user"]; ok {
+				t.Errorf("as %s, a result that is fine names the service's user: %v", caller.name, c.Params)
+			}
+		}
+		// And as the service's user itself (sudo -u isshoni isshoni doctor).
 		w := newWorld(t)
-		w.live, w.uid = nil, 0
+		w.live = nil
+		w.env.LookupUser = serviceUserIs(owner)
+		want(t, w.check("data_dir"), api.DoctorStatusOK, codeDataDirOK, "")
+
+		// A directory of the ordinary user who asks is a broken installation, or a second server that this user
+		// starts by hand. doctor can't tell, so the fix says when it is not one.
+		if owner == 0 {
+			return // root's own directory: root should not be the one who runs the server
+		}
+		w.env.User = "alice"
+		w.env.LookupUser = serviceUserIs(owner + 2000)
+		c := w.check("data_dir")
+		want(t, c, api.DoctorStatusFail, codeDataDirWrongOwner, fixDataDirOwner)
+		if want := "sudo chown -R isshoni " + w.dataDir + "\n(unless you start this isshoni yourself as alice: then leave it as it is)"; c.Fix != want {
+			t.Errorf("the caller's own directory, fix:\n got %q\nwant %q", c.Fix, want)
+		}
+		c = w.check("secrets")
+		want(t, c, api.DoctorStatusFail, codeSecretsWrongOwner, fixSecretsOwner)
+		contains(t, c.Fix, "sudo chown isshoni "+filepath.Join(w.dataDir, "secrets.json")+"\n(unless you start this isshoni yourself as alice: ")
+	})
+	t.Run("offline without a user named isshoni", func(t *testing.T) {
+		// A development machine, or a setup made by hand: the caller is taken for the service's user. That is a
+		// guess, so the fix does not hand the directory to the caller without saying when that is right.
+		w := newWorld(t)
+		w.live, w.uid, w.env.User = nil, os.Getuid()+1000, "alice"
+		c := w.check("data_dir")
+		want(t, c, api.DoctorStatusFail, codeDataDirWrongOwner, fixDataDirOwner)
+		if want := fmt.Sprintf("%s belongs to uid %d, but doctor runs as uid %d", w.dataDir, os.Getuid(), w.uid); c.Message != want {
+			t.Errorf("message:\n got %q\nwant %q", c.Message, want)
+		}
+		wantFix := fmt.Sprintf("if isshoni runs as the owner (uid %d), run doctor as that user: sudo -u '#%d' isshoni doctor\n"+
+			"if it runs as alice: sudo chown -R alice %s", os.Getuid(), os.Getuid(), w.dataDir)
+		if c.Fix != wantFix {
+			t.Errorf("fix:\n got %q\nwant %q", c.Fix, wantFix)
+		}
+		// The caller's own directory is fine.
+		w.uid = os.Getuid()
+		want(t, w.check("data_dir"), api.DoctorStatusOK, codeDataDirOK, "")
+		// Root is not taken for the service's user: there is nobody to compare the owner with.
+		w.uid, w.env.User = 0, "root"
 		want(t, w.check("data_dir"), api.DoctorStatusOK, codeDataDirOK, "")
 	})
 	t.Run("not writable", func(t *testing.T) {
@@ -140,6 +212,18 @@ func TestCheckDataDir(t *testing.T) {
 		c := w.check("data_dir")
 		want(t, c, api.DoctorStatusFail, codeDataDirNotWritable, fixDataDirOwner)
 		contains(t, c.Message, "is not writable for isshoni (permission denied)")
+
+		// Offline as the service's user the answer is the same; as anyone else the kernel is not asked, because
+		// what this process may write says nothing about the service.
+		w.live = nil
+		w.env.LookupUser = serviceUserIs(os.Getuid())
+		c = w.check("data_dir")
+		want(t, c, api.DoctorStatusFail, codeDataDirNotWritable, fixDataDirOwner)
+		if want := "sudo chown -R isshoni " + w.dataDir; c.Fix != want || c.Params["user"] != ServiceUser {
+			t.Errorf("fix %q, params %v; want %q", c.Fix, c.Params, want)
+		}
+		w.uid, w.env.User = os.Getuid()+1000, "alice"
+		want(t, w.check("data_dir"), api.DoctorStatusOK, codeDataDirOK, "")
 	})
 	t.Run("container", func(t *testing.T) {
 		w := newWorld(t)
@@ -161,6 +245,22 @@ func TestCheckDataDir(t *testing.T) {
 		c = w.check("data_dir")
 		want(t, c, api.DoctorStatusFail, codeDataDirNotMounted, fixDataDirMount)
 		contains(t, c.Message, "can't check that")
+
+		// Offline in a container the caller is the image's user, which the service runs as too: no user is looked
+		// up by name, and the fix is for the container's host.
+		w = newWorld(t)
+		w.container("docker", true)
+		w.live, w.uid = nil, os.Getuid()+1000
+		w.env.LookupUser = func(string) (int, bool) {
+			t.Error("a user was looked up by name in a container")
+			return 0, false
+		}
+		c = w.check("data_dir")
+		want(t, c, api.DoctorStatusFail, codeDataDirWrongOwner, fixDataDirOwner)
+		contains(t, c.Message, fmt.Sprintf("but doctor runs as uid %d", w.uid))
+		if want := fmt.Sprintf("on the container's host, run: sudo chown -R %d:%d <the host path of %s>", w.uid, w.uid, w.dataDir); c.Fix != want {
+			t.Errorf("fix:\n got %q\nwant %q", c.Fix, want)
+		}
 	})
 	t.Run("doctor writes nothing", func(t *testing.T) {
 		w := newWorld(t)
@@ -239,10 +339,37 @@ func TestCheckSecrets(t *testing.T) {
 	})
 	t.Run("another user's", func(t *testing.T) {
 		w := newWorld(t)
+		path := filepath.Join(w.dataDir, "secrets.json")
 		w.uid = os.Getuid() + 1000
 		c := w.check("secrets")
 		want(t, c, api.DoctorStatusFail, codeSecretsWrongOwner, fixSecretsOwner)
+		contains(t, c.Message, fmt.Sprintf("but isshoni runs as uid %d", w.uid))
 		contains(t, c.Fix, "sudo chown isshoni ")
+
+		// `sudo isshoni doctor` on a stopped server (04 §6.3): root compares the owner with the service's user, so
+		// a file that makes the next start exit 78 (secrets_owner) is not reported as fine.
+		w.live, w.uid, w.env.User = nil, 0, "root"
+		w.env.LookupUser = serviceUserIs(os.Getuid() + 2000)
+		c = w.check("secrets")
+		want(t, c, api.DoctorStatusFail, codeSecretsWrongOwner, fixSecretsOwner)
+		if want := fmt.Sprintf("%s belongs to uid %d, but isshoni runs as the user isshoni (uid %d)", path, os.Getuid(), os.Getuid()+2000); c.Message != want {
+			t.Errorf("message:\n got %q\nwant %q", c.Message, want)
+		}
+		if want := "sudo chown isshoni " + path; c.Fix != want {
+			t.Errorf("fix:\n got %q\nwant %q", c.Fix, want)
+		}
+		w.env.LookupUser = serviceUserIs(os.Getuid())
+		want(t, w.check("secrets"), api.DoctorStatusOK, codeSecretsOK, "")
+
+		// Without a user named isshoni the caller is taken for the service's user, as a guess; root is not.
+		w.env.LookupUser = noServiceUser
+		want(t, w.check("secrets"), api.DoctorStatusOK, codeSecretsOK, "")
+		w.uid, w.env.User = os.Getuid()+1000, "alice"
+		c = w.check("secrets")
+		want(t, c, api.DoctorStatusFail, codeSecretsWrongOwner, fixSecretsOwner)
+		contains(t, c.Message, fmt.Sprintf("but doctor runs as uid %d", w.uid))
+		contains(t, c.Fix, fmt.Sprintf("if isshoni runs as the owner (uid %d), run doctor as that user: sudo -u '#%d' isshoni doctor\n", os.Getuid(), os.Getuid()),
+			"if it runs as alice: sudo chown alice "+path)
 	})
 	t.Run("unreadable", func(t *testing.T) {
 		if os.Getuid() == 0 {

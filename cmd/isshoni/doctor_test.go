@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -105,6 +106,9 @@ func fakeProbes(env *doctor.Env, root, rmemMax string) {
 	env.CAA = func(context.Context, string) ([]doctor.CAARecord, error) { return nil, nil }
 	env.DiskFree = func(string) (uint64, error) { return 37_200_000_000, nil }
 	env.NoFile = func() (uint64, error) { return 65536, nil }
+	// The faked machine has no user named isshoni, whatever users the machine of the tests has: an offline run
+	// takes the caller for the service's user.
+	env.LookupUser = func(string) (int, bool) { return 0, false }
 }
 
 // fakeMachine is the machine of a fake server: a data directory with its secrets, and what doctor finds there.
@@ -173,6 +177,10 @@ func (m *fakeMachine) serverEnv(context.Context) doctor.Env {
 		DB:     doctor.DBFiles{LatestSchemaVersion: func() int { return live.SchemaVersion }},
 		Now:    func() time.Time { return fakeNow },
 		UID:    os.Getuid(),
+	}
+	if state == "fail" {
+		// The server's own sentence for that error (tlsmgr.Status.LastError), which the wiring passes along.
+		env.TLSLastError = "Let's Encrypt couldn't connect to 203.0.113.7 on port 80 or 443. Open TCP 80 and 443 in your cloud firewall."
 	}
 	fakeProbes(&env, filepath.Join(m.dir, "root"), rmem)
 	return env
@@ -538,6 +546,54 @@ func TestDoctorOfflineSchema(t *testing.T) {
 	}
 	if after := listing(); !slices.Equal(before, after) {
 		t.Errorf("doctor changed the data directory:\n got %v\nwant %v", after, before)
+	}
+}
+
+// `sudo isshoni doctor` while the server is stopped, on a host that the installer set up (04 §6.3, 06 §4.8): the
+// owners of the data directory and of secrets.json are compared with the service's user and not with root, so a
+// file that makes the next start exit 78 fails its check, and the fix gives it to the service's user.
+func TestDoctorOfflineOwners(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no file owners")
+	}
+	dataDir := filepath.Join(t.TempDir(), "data")
+	if err := os.Mkdir(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	secrets := filepath.Join(dataDir, "secrets.json")
+	if _, err := config.OpenSecrets(secrets, nil); err != nil {
+		t.Fatal(err)
+	}
+	environ := []string{"ISSHONI_DATA_DIR=" + dataDir}
+	asRoot := func(serviceUID int) func(*doctor.Env) {
+		return func(env *doctor.Env) {
+			env.UID, env.User = 0, "root"
+			env.LookupUser = func(name string) (int, bool) { return serviceUID, name == doctor.ServiceUser }
+		}
+	}
+
+	// The files belong to the service's user.
+	res := runDoctorCLI(t, false, environ, asRoot(os.Getuid()), "doctor", "--tls.mode", "off", "--only", "data_dir,secrets")
+	if res.code != exitOK || !strings.Contains(res.stdout, "[ ok ] data_dir ") || !strings.Contains(res.stdout, "[ ok ] secrets ") {
+		t.Errorf("the service's own files: exit %d\n%s", res.code, res.stdout)
+	}
+
+	// They belong to someone else: exit 5, and they go to isshoni, not to root.
+	other := os.Getuid() + 1000
+	res = runDoctorCLI(t, false, environ, asRoot(other), "doctor", "--tls.mode", "off", "--only", "data_dir,secrets")
+	for _, want := range []string{
+		"[fail] data_dir      " + dataDir + " belongs to uid " + strconv.Itoa(os.Getuid()) + ", but isshoni runs as the user isshoni (uid " + strconv.Itoa(other) + ")\n" +
+			"       fix: sudo chown -R isshoni " + dataDir + "\n",
+		"[fail] secrets       " + secrets + " belongs to uid " + strconv.Itoa(os.Getuid()) + ", but isshoni runs as the user isshoni (uid " + strconv.Itoa(other) + ")\n" +
+			"       fix: sudo chown isshoni " + secrets + "\n",
+		"\n0 ok · 0 warn · 2 fail\n",
+	} {
+		if !strings.Contains(res.stdout, want) {
+			t.Errorf("no %q in:\n%s", want, res.stdout)
+		}
+	}
+	if res.code != exitDoctorFail || res.stderr != "" || strings.Contains(res.stdout, "chown -R root") {
+		t.Errorf("someone else's files: exit %d, stderr %q\n%s", res.code, res.stderr, res.stdout)
 	}
 }
 

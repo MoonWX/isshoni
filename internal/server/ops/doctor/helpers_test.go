@@ -31,8 +31,8 @@ func TestMain(m *testing.M) {
 }
 
 // Every test here runs doctor against fakes: no test asks a real resolver, STUN server or web server, binds a real
-// service port or reads the machine's /proc. What stays real are a temporary data directory and, for the offline
-// address detection, one unused UDP socket on an ephemeral port.
+// service port, reads the machine's /proc or looks at its users. What stays real are a temporary data directory
+// and, for the offline address detection, one unused UDP socket on an ephemeral port.
 
 // testNow is the clock of the tests.
 var testNow = time.Date(2026, 9, 29, 20, 15, 0, 0, time.UTC)
@@ -281,7 +281,19 @@ func (w *world) build() Env {
 	if env.NoFile == nil {
 		env.NoFile = func() (uint64, error) { return 65536, nil }
 	}
+	if env.LookupUser == nil {
+		env.LookupUser = noServiceUser
+	}
 	return env
+}
+
+// noServiceUser is the user database of a machine without a user named isshoni: the world's default, whatever
+// users the machine of the tests has.
+func noServiceUser(string) (int, bool) { return 0, false }
+
+// serviceUserIs is the user database of a host where the installer made the user isshoni with this uid.
+func serviceUserIs(uid int) func(string) (int, bool) {
+	return func(name string) (int, bool) { return uid, name == ServiceUser }
 }
 
 // check runs one check of the world and returns its result.
