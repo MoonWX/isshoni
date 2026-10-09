@@ -1,10 +1,7 @@
 package httpapi
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"slices"
@@ -207,7 +204,9 @@ func (a *API) deleteUser(w http.ResponseWriter, r *http.Request) {
 // password and signs the user out everywhere, at once. Errors: 404 user_not_found, 409 self_action_forbidden
 // (POST /me/password is the place for the own account), and 403 wrong_password: a reset of another admin needs the
 // acting admin's own password in currentPassword, since the link would hand over that admin account; also 429
-// rate_limited and 503 server_busy. The body may be left out when no password is needed.
+// rate_limited and 503 server_busy. The body may be left out when no password is needed: no body, an empty one and
+// one of white space only send no password (decodeOptionalJSON); a body that is not one JSON object is 400
+// bad_request.
 func (a *API) postPasswordReset(w http.ResponseWriter, r *http.Request) {
 	p, ok := PrincipalFrom(r.Context())
 	if !ok {
@@ -215,11 +214,9 @@ func (a *API) postPasswordReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req api.PasswordResetRequest
-	if r.ContentLength != 0 { // a request without a body sends no password
-		if err := DecodeJSON(w, r, &req, otherBodyLimit); err != nil {
-			WriteError(w, r, err)
-			return
-		}
+	if err := decodeOptionalJSON(r, &req); err != nil {
+		WriteError(w, r, err)
+		return
 	}
 	id := store.UserID(r.PathValue("id"))
 	link, err := a.d.Auth.IssuePasswordReset(r.Context(), a.actorOf(r, p), id, req.CurrentPassword)
@@ -345,22 +342,12 @@ func (a *API) postReject(w http.ResponseWriter, r *http.Request) {
 }
 
 // rejectAllRequested reads the body of a reject request for the ID all and reports whether it is {"all": true}. No
-// body, {} and {"all": false} are not; a body that is not one JSON object is 400 bad_request (03 §12.1). The chain
-// has checked the Content-Type and capped the body (03 §12.1).
+// body, an empty or blank one, {} and {"all": false} are not; a body that is not one JSON object is 400 bad_request
+// (03 §12.1; decodeOptionalJSON).
 func rejectAllRequested(r *http.Request) (bool, error) {
-	if r.Body == nil || r.Body == http.NoBody {
-		return false, nil
-	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		return false, decodeError(err)
-	}
-	if len(bytes.TrimSpace(body)) == 0 {
-		return false, nil
-	}
 	var req api.RejectRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		return false, api.NewError(api.CodeBadRequest)
+	if err := decodeOptionalJSON(r, &req); err != nil {
+		return false, err
 	}
 	return req.All, nil
 }

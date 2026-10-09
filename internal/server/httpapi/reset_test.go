@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -162,6 +163,59 @@ func TestPasswordResetOverREST(t *testing.T) {
 	f.wantSignedIn(cookie) // the admin's own session was never touched
 }
 
+// unknownLength gives a request a body whose length the server is not told: a chunked one, or an HTTP/2 stream
+// without a content-length.
+func unknownLength(body io.ReadCloser) reqOpt {
+	return func(r *http.Request) { r.ContentLength, r.Body = -1, body }
+}
+
+// TestPasswordResetWithoutBodyOverREST: a reset that needs no password needs no body, however the client leaves it
+// out. What counts is that there are no bytes, not a Content-Length of 0: an empty body of unknown length and a
+// blank one send no password either.
+func TestPasswordResetWithoutBodyOverREST(t *testing.T) {
+	f := newAuthFixture(t)
+	_, cookie, sam, _ := f.adminAndMember()
+	streamed := func(body string) []reqOpt {
+		return []reqOpt{unknownLength(io.NopCloser(strings.NewReader(body)))}
+	}
+	issued := map[string]struct {
+		body string
+		opts []reqOpt
+	}{
+		"no body":                           {"", nil},
+		"no body, of unknown length":        {"", []reqOpt{unknownLength(http.NoBody)}},
+		"an empty body of unknown length":   {"", streamed("")},
+		"a space":                           {" ", nil},
+		"white space":                       {" \r\n\t", nil},
+		"white space of unknown length":     {"", streamed("\n")},
+		"an empty object":                   {`{}`, nil},
+		"an empty object of unknown length": {"", streamed(`{}`)},
+	}
+	for name, send := range issued {
+		f.clk.advance(time.Minute)
+		rec := f.issueReset(cookie, sam.ID, send.body, send.opts...)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("%s: status %d, body %s; want 201", name, rec.Code, rec.Body)
+		}
+		link := decodeBody[api.ResetLink](t, rec, http.StatusCreated)
+		token, ok := strings.CutPrefix(link.URL, testOrigin+"/reset#")
+		if !ok || !link.ExpiresAt.Equal(f.clk.now().Add(24*time.Hour)) {
+			t.Fatalf("%s: the link = %+v", name, link)
+		}
+		wantBody(t, f.resetCheck(token, addrB), http.StatusOK, `{"username":"Sam"}`)
+	}
+
+	// A body that is there is held to the rules, whatever its length is said to be, and to the limit.
+	for _, body := range []string{`x`, `{"currentPassword":`, `{} {}`, " "} {
+		wantError(t, f.issueReset(cookie, sam.ID, "", streamed(body)...), http.StatusBadRequest, api.CodeBadRequest)
+	}
+	wantError(t, f.issueReset(cookie, sam.ID, "", streamed(strings.Repeat(" ", otherBodyLimit+1))...),
+		http.StatusRequestEntityTooLarge, api.CodePayloadTooLarge)
+	if rows := f.auditOf("user.password_reset_issued"); len(rows) != len(issued) {
+		t.Errorf("%d user.password_reset_issued rows, want the %d of the links that were issued", len(rows), len(issued))
+	}
+}
+
 // TestResetAnotherAdminOverREST is the rest of 03 §15's passwords case: resetting another admin without
 // currentPassword → 403 wrong_password. With it, the link and the admin_password_reset alert.
 func TestResetAnotherAdminOverREST(t *testing.T) {
@@ -172,7 +226,7 @@ func TestResetAnotherAdminOverREST(t *testing.T) {
 	f.conns.take()
 	f.signal.takeNotes()
 
-	for _, body := range []string{``, `{}`, `{"currentPassword":""}`, `{"currentPassword":"not the password"}`} {
+	for _, body := range []string{``, ` `, `{}`, `{"currentPassword":""}`, `{"currentPassword":"not the password"}`} {
 		wantBody(t, f.issueReset(cookie, sam.ID, body), http.StatusForbidden, `{"error":{"code":"wrong_password"}}`)
 	}
 	f.wantSignedIn(samCookie)

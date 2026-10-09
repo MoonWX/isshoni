@@ -218,6 +218,46 @@ func TestIssuePasswordResetRechecksInWrite(t *testing.T) {
 	}
 }
 
+// TestIssuePasswordResetNeedArisesBeforeWrite: a reset of a member is planned without the acting admin's password.
+// If the member is made an admin before the Write, the link would hand an admin account over: the Write needs the
+// password, which nobody verified, and answers wrong_password. The account keeps its password and its sessions.
+// That goes for a request that carries the right password too: it was never checked (no hash), and the next
+// attempt is planned as the reset of an admin from the start.
+func TestIssuePasswordResetNeedArisesBeforeWrite(t *testing.T) {
+	ctx := context.Background()
+	for _, password := range []string{"", testPassword} {
+		a := newAdminEnv(t)
+		a.changeBeforeWrite(func(q *store.Q, now time.Time) error { return q.SetRole(a.sam.ID, store.RoleAdmin, now) })
+		_, err := a.svc.IssuePasswordReset(ctx, a.asAlex, a.sam.ID, password)
+		if a.hashes.Load() != 0 {
+			t.Fatalf("password %q: %d hashes; the call asked for the password, so the change did not land between "+
+				"its Read and its Write", password, a.hashes.Load())
+		}
+		wantCode(t, err, api.CodeWrongPassword)
+		if u := a.userRow(a.sam.ID); u == nil || u.PasswordHash != a.sam.PasswordHash || u.Role != store.RoleAdmin {
+			t.Errorf("password %q: the account after the refused reset: %+v; want an admin with its password", password, u)
+		}
+		if a.rawCount("password_resets") != 0 || a.auditCount(auditPasswordResetIssued) != 0 || len(a.alerts.take()) != 0 ||
+			len(a.conns.take()) != 0 {
+			t.Errorf("password %q: the refused reset left a link or an audit row, alerted or closed connections", password)
+		}
+		if n := len(a.sessions(a.sam.ID)); n != 1 || a.who(a.samIn).UserID != a.sam.ID {
+			t.Errorf("password %q: the account was signed out: %d sessions", password, n)
+		}
+
+		// Asked again, it is the reset of an admin: it takes the password, and then the link is issued.
+		if password == "" {
+			_, err := a.svc.IssuePasswordReset(ctx, a.asAlex, a.sam.ID, password)
+			wantCode(t, err, api.CodeWrongPassword)
+			continue
+		}
+		a.resetLink(a.asAlex, a.sam.ID, password)
+		if alerts := a.alerts.take(); a.hashes.Load() != 1 || len(alerts) != 1 || alerts[0].Kind != AlertAdminPasswordReset {
+			t.Errorf("the reset again, with the password: %d hashes, alerts %+v", a.hashes.Load(), alerts)
+		}
+	}
+}
+
 func TestCheckPasswordReset(t *testing.T) {
 	a := newAdminEnv(t)
 	ctx := context.Background()

@@ -543,6 +543,57 @@ func TestGrantAdminRechecksInWrite(t *testing.T) {
 	}
 }
 
+// changeBeforeWrite makes the service's clock run change once, the next time it is read. A call of UpdateUser or
+// IssuePasswordReset that asks for no password reads the clock exactly once between its planning Read and its Write
+// (now := s.now()), so that is where the change lands: after the call planned on the accounts as they were, before
+// its Write plans again. changeDuringCheck can't get there: it runs in the hasher, which only a call that already
+// asked for a password reaches.
+func (e *svcEnv) changeBeforeWrite(change func(q *store.Q, now time.Time) error) {
+	var once sync.Once
+	e.svc.now = func() time.Time {
+		once.Do(func() { e.write(func(q *store.Q) error { return change(q, e.clk.now()) }) })
+		return e.clk.now()
+	}
+}
+
+// TestGrantAdminNeedArisesBeforeWrite: a patch with a name and the role admin for an account that is an admin
+// already is planned as a rename, which needs no password. If the account is demoted before the Write, the same
+// patch makes an admin after all: the Write needs the acting admin's password, which nobody verified, and answers
+// wrong_password without writing anything. That goes for a request that carries the right password too: it was
+// never checked (no hash), and the next attempt is planned as a grant from the start.
+func TestGrantAdminNeedArisesBeforeWrite(t *testing.T) {
+	for _, password := range []string{"", testPassword} {
+		a := newAdminEnv(t)
+		kim := a.addAdmin("Kim")
+		a.changeBeforeWrite(func(q *store.Q, now time.Time) error { return q.SetRole(kim.ID, store.RoleUser, now) })
+		ch := UserChange{Username: ptr("Kimberly"), Role: ptr(store.RoleAdmin), ActorPassword: password}
+		_, err := a.update(kim.ID, ch)
+		if a.hashes.Load() != 0 {
+			t.Fatalf("password %q: %d hashes; the call asked for the password, so the change did not land between "+
+				"its Read and its Write", password, a.hashes.Load())
+		}
+		wantCode(t, err, api.CodeWrongPassword)
+		if u := a.userRow(kim.ID); u == nil || u.Username != "Kim" || u.Role != store.RoleUser {
+			t.Errorf("password %q: the account after the refused patch: %+v; want Kim, demoted and not renamed", password, u)
+		}
+		if a.auditCount(auditUserRoleChanged) != 0 || a.auditCount(auditUserRenamed) != 0 || len(a.alerts.take()) != 0 ||
+			len(a.conns.take()) != 0 {
+			t.Errorf("password %q: the refused patch wrote a row, alerted or closed connections", password)
+		}
+
+		// Asked again, the patch is a grant: it takes the password, and then it goes through.
+		if password == "" {
+			_, err := a.update(kim.ID, ch)
+			wantCode(t, err, api.CodeWrongPassword)
+			continue
+		}
+		if got, err := a.update(kim.ID, ch); err != nil || got.Username != "Kimberly" || got.Role != store.RoleAdmin ||
+			a.hashes.Load() != 1 {
+			t.Errorf("the patch again, with the password: %+v, %v, %d hashes", got, err, a.hashes.Load())
+		}
+	}
+}
+
 // TestConfirmedBy: a change that needs the acting admin's password is written only when that password was verified
 // against the hash the account has at the Write. One that was never asked for (the need arose after the first read)
 // is not confirmed.
