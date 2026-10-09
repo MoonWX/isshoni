@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/netip"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/httpapi"
 	"github.com/MoonWX/isshoni/internal/server/netx"
 	"github.com/MoonWX/isshoni/internal/server/ops"
+	"github.com/MoonWX/isshoni/internal/server/ops/doctor"
 	"github.com/MoonWX/isshoni/internal/server/sfu"
 	"github.com/MoonWX/isshoni/internal/server/sfuplane"
 	"github.com/MoonWX/isshoni/internal/server/signal"
@@ -37,7 +39,7 @@ import (
 //     httpapi.Deps.Push;
 //   - README S80 and S85: ops.Metrics as the router's Observer and the hub's Registerer, a collector over the SFU's
 //     Metrics, the transfer counter on the Transport and the multiplexer, and the REST routes of ops through
-//     API.Handle.
+//     API.Handle: the dashboard, and doctor's and the bandwidth estimate's, over the ops.Doctor that wire builds.
 
 // The adapters and what they adapt: each consumer interface of 04 §6.6 on the left, and on the right the part of
 // 01's hub and 03's service that an adapter calls.
@@ -49,6 +51,7 @@ var (
 	_ httpapi.Signal       = signalAdapter{}
 	_ httpapi.InfoSource   = buildInfo{}
 	_ ops.AdminAccounts    = (*adminAccounts)(nil)
+	_ ops.MetaStore        = metaStore{}
 
 	_ sessionService = (*auth.Service)(nil)
 	_ accountService = (*auth.Service)(nil)
@@ -81,38 +84,15 @@ func (s *Server) openStore(ctx context.Context, paths config.Paths) error {
 }
 
 // storeOpenError completes a store.Open error for the operator: 03's message for a newer schema names the backup
-// from before the upgrade, and 04 adds the command that restores it (04 §6.1 step 4, §6.3). Every other error is
-// returned as it is.
+// from before the upgrade, and 04 adds the command that restores it (04 §6.1 step 4, §6.3): the systemd form, or the
+// Docker form in a container. It is doctor's command, so `isshoni doctor` on the stopped server prints the same
+// one. Every other error is returned as it is.
 func storeOpenError(err error, container bool) error {
 	var tooNew *store.SchemaTooNewError
 	if errors.As(err, &tooNew) && tooNew.Backup != "" {
-		return fmt.Errorf("%w\n  fix: %s", err, restoreCommand(tooNew.Backup, container))
+		return fmt.Errorf("%w\n  fix: %s", err, doctor.RestoreCommand(tooNew.Backup, container))
 	}
 	return err
-}
-
-// restoreCommand is the command that restores a database file while the server is stopped (04 §6.3, §12.6): the
-// systemd form, or the Docker form in a container, where the stopped service's container is gone and a one-off
-// container does the restore.
-func restoreCommand(backup string, container bool) string {
-	arg := shellQuote(backup)
-	if container {
-		return "docker compose stop && docker compose run --rm isshoni admin restore --offline " + arg +
-			" && docker compose up -d"
-	}
-	return "sudo -u isshoni isshoni admin restore --offline " + arg + " && sudo systemctl start isshoni"
-}
-
-// shellQuote returns s as one word of a shell command: as it is when it has only plain characters, in single quotes
-// otherwise.
-func shellQuote(s string) string {
-	plain := func(r rune) bool {
-		return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("-_./=:,@%+", r)
-	}
-	if s != "" && strings.IndexFunc(s, func(r rune) bool { return !plain(r) }) < 0 {
-		return s
-	}
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // policyKeys are the policy keys of the config registry (04 §4.3) with their value in a Config. A key of them that
@@ -195,15 +175,15 @@ const (
 // wire is step 8 of the startup sequence (04 §6.1) for 01's, 02's and 03's parts: the SFU on the Transport with
 // 01's sfuplane in front of it, the account service, whose key fingerprint check purges what a rotated key
 // protected before any listener serves (03 §4.6), then the hub and the REST API with the adapters of 04 §6.6
-// between them, the readiness checks "db", "media" and "signal" (04 §6.2), and the admin socket's server. It opens
-// and starts nothing; Start serves what it builds.
+// between them, the readiness checks "db", "media" and "signal" (04 §6.2), doctor (04 §13.1), and the admin
+// socket's server. It opens and starts nothing; Start serves what it builds.
 //
 // A server without a site (ip mode before a public address is known, 04 §7.4) has no accounts, no API and no hub:
 // each needs the public origin, and the router answers 421 to every request but the health endpoints anyway. Its
-// admin socket still answers health, ready and status, so the operator sees the failing check "public_ip". It has
-// its SFU all the same, on the ports it has bound: nothing joins it, and the check "media" and the status say what
-// the next start will serve media on. Only when it found no local address to bind them on either does it have no
-// SFU, and a failing check "media" next to "public_ip" (wireMedia).
+// admin socket still answers health, ready, status and doctor, so the operator sees the failing check "public_ip"
+// and what to do about it. It has its SFU all the same, on the ports it has bound: nothing joins it, and the check
+// "media" and the status say what the next start will serve media on. Only when it found no local address to bind
+// them on either does it have no SFU, and a failing check "media" next to "public_ip" (wireMedia).
 func (s *Server) wire(ctx context.Context) error {
 	// The wall clock, not Deps.Now: how old an answer is has nothing to do with what time the accounts think it is.
 	s.health.AddCheck("db", newDBCheck(s.run, s.store.Ping, time.Now).ready)
@@ -222,14 +202,76 @@ func (s *Server) wire(ctx context.Context) error {
 	if s.deps.LogLevel != nil {
 		s.logLevel = ops.NewLogLevel(s.deps.LogLevel, s.log)
 	}
+	// One status source for `isshoni admin status` and for doctor, which examines the server through it. Doctor's
+	// own runs start with the server's other work (startBackground); its REST routes come with README S85.
+	status := s.statusSource()
+	s.doctor = ops.NewDoctor(ops.DoctorOptions{
+		Env:    s.doctorEnv(status),
+		Meta:   metaStore{db: s.store},
+		Logger: s.log,
+	})
 	s.admin = ops.NewAdminServer(ops.AdminOptions{
 		Health:   s.health,
-		Status:   s.statusSource(),
+		Status:   status,
 		Accounts: accounts,
 		LogLevel: s.logLevel,
+		Doctor:   s.doctor,
 		Logger:   s.log,
 	})
 	return nil
+}
+
+// doctorEnv returns what a doctor run inside this server sees (doctor.Env, 04 §13.1): the config as the server
+// runs it, with the ports it bound, the server's own status, which is what makes it a run inside the server (the
+// checks then report the bound listeners, the certificate and the detected addresses instead of probing for them),
+// the uid of the process, and the server's test seams. status is the admin socket's GET /v1/status.
+//
+// The certificate's last error travels in the status as a code only; its fix text, which names what doctor can't
+// know from the code (the address a domain points to, the end of a rate limit), comes from the TLS manager, and
+// only while it is the text of that same error.
+func (s *Server) doctorEnv(status func(context.Context) (api.ServerStatus, error)) func(context.Context) doctor.Env {
+	cfg, tls, deps := &s.cfg, s.tls, s.deps
+	return func(ctx context.Context) doctor.Env {
+		live, _ := status(ctx) // statusSource has no error to give
+		env := doctor.Env{
+			Config:   cfg,
+			Live:     &live,
+			UID:      os.Getuid(),
+			Host:     deps.Host,
+			Resolver: deps.Resolver,
+			STUN:     deps.STUN,
+			Now:      deps.Now,
+			DB:       doctor.DBFiles{LatestSchemaVersion: store.LatestSchemaVersion},
+		}
+		if cert := tls.Status(); cert.LastErrorCode != "" && cert.LastErrorCode == live.TLS.LastErrorCode {
+			env.TLSLastError = cert.LastError
+		}
+		return env
+	}
+}
+
+// metaStore is 03's meta table as ops keeps its state in it (ops.MetaStore): the last doctor report, so that a
+// restarted server has it at once (04 §13.1). Each call is one short transaction, and a key that is not there reads
+// as "".
+type metaStore struct{ db *store.DB }
+
+// Meta implements ops.MetaStore.
+func (m metaStore) Meta(ctx context.Context, key string) (string, error) {
+	var value string
+	err := m.db.Read(ctx, func(q *store.Q) error {
+		var err error
+		value, err = q.GetMeta(key)
+		return err
+	})
+	if errors.Is(err, store.ErrNotFound) {
+		return "", nil
+	}
+	return value, err
+}
+
+// SetMeta implements ops.MetaStore.
+func (m metaStore) SetMeta(ctx context.Context, key, value string) error {
+	return m.db.Write(ctx, func(q *store.Q) error { return q.SetMeta(key, value) })
 }
 
 // wireMedia builds 02's SFU on the Transport that step 6 has bound, and 01's sfuplane as the hub's MediaPlane in
@@ -292,10 +334,10 @@ func mediaCheck(udp bool, tr *netx.Transport, sfuReady func() error) func() (ok 
 // notImplementedAsDebug is the log handler of 01's sfuplane in this server. The SFU declares its whole API from
 // its first slice on (README "Interfaces first"), and a method that a later slice fills in answers with an error
 // that wraps sfu.ErrNotImplemented. sfuplane logs every SFU error it has no wire code for at error level, as the
-// bug it would otherwise be (01 §15.4), and a client reaches such a method with an everyday message: pc.close and
-// pc.restart until README S57, caps.update until S69. So a record about that error is passed on at debug level: the
-// client still gets its error{internal} with the ref, and a real server's log stays free of an "error" per message
-// for what is only not built yet. It goes away with sfu.ErrNotImplemented.
+// bug it would otherwise be (01 §15.4), and a client reaches such a method with an everyday message: caps.update
+// until README S69 (pc.close and pc.restart were the others, until S57). So a record about that error is passed on
+// at debug level: the client still gets its error{internal} with the ref, and a real server's log stays free of an
+// "error" per message for what is only not built yet. It goes away with sfu.ErrNotImplemented.
 type notImplementedAsDebug struct{ next slog.Handler }
 
 // Enabled implements slog.Handler.

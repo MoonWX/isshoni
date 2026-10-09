@@ -102,7 +102,7 @@ func goldenCases() []goldenCase {
 			Hours: 2,
 		},
 		PerViewerMbps:   BandwidthPerViewer{Sharer: 8.13, Viewer: 8.43},
-		EgressMediaMbps: 41.54, EgressWireMbps: 43.61, IngressMediaMbps: 16.86, TransferPerSessionGB: 39.2,
+		EgressMediaMbps: 41.54, EgressWireMbps: 43.62, IngressMediaMbps: 16.86, TransferPerSessionGB: 39.3,
 	}
 
 	return []goldenCase{

@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -435,7 +437,8 @@ func TestTransportCloseIdempotent(t *testing.T) {
 	}
 }
 
-// TestQuietLogger: the muxes' per-connection warnings become debug lines; errors keep their level.
+// TestQuietLogger: the muxes' per-connection warnings become debug lines, and so does the UDP mux's error about a
+// packet for a connection that has just closed; every other error keeps its level.
 func TestQuietLogger(t *testing.T) {
 	var buf bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -443,6 +446,12 @@ func TestQuietLogger(t *testing.T) {
 	q.Warnf("Error reading first packet from %s: %s", "192.0.2.1:5000", "EOF")
 	q.Warn("Not a STUN message")
 	q.Errorf("Failed to read UDP packet: %v", "boom")
+	// pion/ice's UDPMuxDefault, word for word: the packet of a peer whose connection the server has closed.
+	q.Errorf("Failed to write packet: %v", io.ErrClosedPipe)
+	q.Errorf("Failed to write packet: %v", fmt.Errorf("conn: %w", io.ErrClosedPipe))
+	// The same line for another reason is an error, and so is any other line about a closed pipe.
+	q.Errorf("Failed to write packet: %v", io.ErrShortBuffer)
+	q.Errorf("Failed to read UDP packet: %v", io.ErrClosedPipe)
 	var levels []string
 	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
 		var m map[string]any
@@ -451,7 +460,7 @@ func TestQuietLogger(t *testing.T) {
 		}
 		levels = append(levels, m["level"].(string))
 	}
-	if want := []string{"DEBUG", "DEBUG", "ERROR"}; !slices.Equal(levels, want) {
+	if want := []string{"DEBUG", "DEBUG", "ERROR", "DEBUG", "DEBUG", "ERROR", "ERROR"}; !slices.Equal(levels, want) {
 		t.Errorf("levels = %v, want %v", levels, want)
 	}
 }

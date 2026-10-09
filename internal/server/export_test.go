@@ -42,6 +42,14 @@ func (s *Server) Transport() *netx.Transport {
 	return s.transport
 }
 
+// Doctor returns the running server's doctor: the one behind the admin socket, which also makes the server's own
+// runs.
+func (s *Server) Doctor() *ops.Doctor {
+	s.life.Lock()
+	defer s.life.Unlock()
+	return s.doctor
+}
+
 // RestartAsked is closed once the server wants a restart of its own, which Run then makes.
 func (s *Server) RestartAsked() <-chan struct{} { return s.restartAsked }
 

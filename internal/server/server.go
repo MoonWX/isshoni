@@ -207,6 +207,7 @@ type Server struct {
 	hub       *signal.Hub      // 01's hub, mounted at GET /ws; nil without a site
 	api       *httpapi.API     // 03's REST API, mounted at /api/v1/; nil without a site
 	logLevel  *ops.LogLevel    // the runtime log level; nil without Deps.LogLevel
+	doctor    *ops.Doctor      // doctor inside the server: its own runs, and the admin socket's (wire.go)
 	admin     *ops.AdminServer // the admin socket's API, served on adminLn
 	gate      *httpapi.Gate
 	httpSrv   *http.Server   // the main server: on httpLn in off mode, on the multiplexer's TLS side otherwise
@@ -219,9 +220,9 @@ type Server struct {
 	// server runs without a site, not ready, and restarts itself when a later look finds the address (public.go).
 	awaitsAddress bool
 
-	// run is the life of what the server does on its own: the admin socket's Serve, the janitor, the look at the
-	// public addresses, and the reads behind hooks that have no context (the readiness check "db", the router's
-	// SPAStatus). The shutdown's last step cancels it; background waits for the goroutines.
+	// run is the life of what the server does on its own: the admin socket's Serve, the janitor, doctor's own runs,
+	// the look at the public addresses, and the reads behind hooks that have no context (the readiness check "db",
+	// the router's SPAStatus). The shutdown's last step cancels it; background waits for the goroutines.
 	run        context.Context
 	stopRun    context.CancelFunc
 	background sync.WaitGroup
@@ -489,8 +490,8 @@ func (s *Server) Start(ctx context.Context) (err error) {
 }
 
 // startBackground starts what the server does on its own while it runs: the admin socket's API (04 §6.1 step 9),
-// 03's janitor, and the look at the public addresses every ten minutes (04 §7.4). The admin socket's goroutine
-// ends with its Shutdown, the others with s.run.
+// 03's janitor, doctor's own runs, 20 s from now and then once a day (04 §13.1), and the look at the public
+// addresses every ten minutes (04 §7.4). The admin socket's goroutine ends with its Shutdown, the others with s.run.
 func (s *Server) startBackground() {
 	admin, ln := s.admin, s.adminLn
 	s.background.Go(func() {
@@ -498,6 +499,8 @@ func (s *Server) startBackground() {
 			s.fail(err)
 		}
 	})
+	doc := s.doctor
+	s.background.Go(func() { _ = doc.Run(s.run) }) // nil when the server stops; an error only for a second Run
 	if accounts := s.accounts; accounts != nil {
 		s.background.Go(func() { accounts.RunJanitor(s.run) })
 	}
@@ -739,7 +742,7 @@ func (s *Server) shutdown(ctx context.Context, reason ShutdownReason, draining f
 
 	// Step 6, in tailShutdownBudget altogether: the TLS manager, now that nothing handshakes any more; then the
 	// server's own work and the admin socket, which the operator's CLI could ask until now (its health answers have
-	// said "shutting down" since step 1). README S55 and S71 add here: flush the transfer counters, drain the push
+	// said "shutting down" since step 1). README S85 and S71 add here: flush the transfer counters, drain the push
 	// queue.
 	tailCtx, cancelTail := context.WithTimeout(ctx, tailShutdownBudget)
 	defer cancelTail()
@@ -766,7 +769,7 @@ func (s *Server) shutdown(ctx context.Context, reason ShutdownReason, draining f
 	storeCtx, cancelStore := context.WithTimeout(context.WithoutCancel(ctx), storeCloseBudget)
 	defer cancelStore()
 	err := within(storeCtx, func() error {
-		s.background.Wait() // the admin socket's Serve, the janitor, the look at the public addresses
+		s.background.Wait() // the admin socket's Serve, the janitor, doctor, the look at the public addresses
 		return s.store.Close()
 	})
 	if err != nil {

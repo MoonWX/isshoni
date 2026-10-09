@@ -26,6 +26,7 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/httpapi"
 	"github.com/MoonWX/isshoni/internal/server/netx"
 	"github.com/MoonWX/isshoni/internal/server/ops"
+	"github.com/MoonWX/isshoni/internal/server/ops/doctor"
 	"github.com/MoonWX/isshoni/internal/server/sfu"
 	"github.com/MoonWX/isshoni/internal/server/signal"
 	"github.com/MoonWX/isshoni/internal/server/store"
@@ -1121,20 +1122,76 @@ func TestStoreOpenError(t *testing.T) {
 		t.Errorf("a runtime error: %v (refusal: %v)", got, NeedsOperator(got))
 	}
 
+	// The backup's path is one word of the command, whatever is in it: the operator pastes the line into a shell.
 	for in, want := range map[string]string{
 		backup:                           backup,
 		"/srv/my data/backups/pre-1.db":  `'/srv/my data/backups/pre-1.db'`,
 		"/srv/it's/pre-1.db":             `'/srv/it'\''s/pre-1.db'`,
-		"":                               `''`,
 		"/srv/$(reboot)/backups/pre.db":  `'/srv/$(reboot)/backups/pre.db'`,
 		"C:/isshoni/backups/pre-1-x.db":  "C:/isshoni/backups/pre-1-x.db",
 		"/srv/data;rm/backups/pre-1.db":  `'/srv/data;rm/backups/pre-1.db'`,
 		"/srv/tab\there/backups/pre.db":  "'/srv/tab\there/backups/pre.db'",
 		"/srv/ünï/backups/pre-1-2026.db": `'/srv/ünï/backups/pre-1-2026.db'`,
 	} {
-		if got := shellQuote(in); got != want {
-			t.Errorf("shellQuote(%q) = %s, want %s", in, got, want)
+		got := storeOpenError(&store.SchemaTooNewError{DBVersion: 3, BinaryVersion: 1, LastAppVersion: "0.6.1", Backup: in}, false)
+		if suffix := "\n  fix: sudo -u isshoni isshoni admin restore --offline " + want + " && sudo systemctl start isshoni"; !strings.HasSuffix(got.Error(), suffix) {
+			t.Errorf("the backup %q in the command:\n%s\nwant the end:%s", in, got, suffix)
 		}
+	}
+	// The command is doctor's own, so `isshoni doctor` on the stopped server prints the same one (04 §13.2 schema).
+	if want := tooNew.Error() + "\n  fix: " + doctor.RestoreCommand(backup, true); storeOpenError(tooNew, true).Error() != want {
+		t.Errorf("the server's command differs from doctor's:\n%s\nwant:\n%s", storeOpenError(tooNew, true), want)
+	}
+}
+
+// ---- ops.MetaStore ----
+
+// TestMetaStore: ops keeps its state in 03's meta table through metaStore. A key that was never written reads as
+// "", which is not an error; a written one comes back, and a second write replaces it.
+func TestMetaStore(t *testing.T) {
+	ctx := context.Background()
+	db := openTestStore(t)
+	meta := metaStore{db: db}
+
+	if v, err := meta.Meta(ctx, ops.MetaDoctorLast); v != "" || err != nil {
+		t.Errorf("a key that is not there = %q, %v; want \"\" and no error", v, err)
+	}
+	for _, value := range []string{`{"v":1}`, `{"v":1,"report":{}}`, ""} {
+		if err := meta.SetMeta(ctx, ops.MetaDoctorLast, value); err != nil {
+			t.Fatalf("SetMeta(%q): %v", value, err)
+		}
+		if v, err := meta.Meta(ctx, ops.MetaDoctorLast); v != value || err != nil {
+			t.Errorf("after SetMeta(%q): %q, %v", value, v, err)
+		}
+	}
+	// It is the store's own key: what metaStore wrote is what 03 reads.
+	if err := meta.SetMeta(ctx, ops.MetaDoctorLast, "kept"); err != nil {
+		t.Fatal(err)
+	}
+	var direct string
+	err := db.Read(ctx, func(q *store.Q) error {
+		var err error
+		direct, err = q.GetMeta(ops.MetaDoctorLast)
+		return err
+	})
+	if direct != "kept" || err != nil {
+		t.Errorf("the meta table has %q, %v", direct, err)
+	}
+
+	// Any other failure of the store is passed on: a caller that ended, a closed database.
+	gone, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := meta.Meta(gone, ops.MetaDoctorLast); err == nil {
+		t.Error("Meta with an ended context returned no error")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := meta.Meta(ctx, ops.MetaDoctorLast); err == nil {
+		t.Error("Meta on a closed store returned no error")
+	}
+	if err := meta.SetMeta(ctx, ops.MetaDoctorLast, "late"); err == nil {
+		t.Error("SetMeta on a closed store returned no error")
 	}
 }
 

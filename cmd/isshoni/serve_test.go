@@ -39,7 +39,9 @@ type serveProc struct {
 }
 
 // startServe starts `isshoni serve` in off mode on an ephemeral loopback port with a fresh data directory, plus
-// args, which win. It does not wait for the server to be ready.
+// args, which win. The media sockets get ephemeral loopback ports too and no STUN server is asked: serve binds
+// listen.ice_udp and listen.ice_tcp and detects its public address in every mode, and a test must neither hold the
+// default port 7882 nor send packets to the public STUN servers. It does not wait for the server to be ready.
 func startServe(t *testing.T, args ...string) *serveProc {
 	t.Helper()
 	bin, err := exec.LookPath("isshoni")
@@ -52,6 +54,7 @@ func startServe(t *testing.T, args ...string) *serveProc {
 	}
 	all := append([]string{
 		"serve", "--tls.mode", "off", "--listen.http", "127.0.0.1:0", "--log.format", "json",
+		"--listen.ice-udp", "127.0.0.1:0", "--listen.ice-tcp", "127.0.0.1:0", "--network.include-loopback", "--network.stun-servers=",
 		"--data-dir", filepath.Join(t.TempDir(), "data"), "--listen.admin-socket", socketPath(t),
 	}, args...)
 	p := &serveProc{cmd: exec.CommandContext(t.Context(), bin, all...), exited: make(chan struct{}), ready: make(chan string, 1)}
@@ -294,7 +297,8 @@ func TestServeExit(t *testing.T) {
 		{"refusal, wrapped", fmt.Errorf("server: %w", refusal), exitConfig, "isshoni serve: server: /var/lib/isshoni/secrets.json is owned by uid 0, but isshoni runs as uid 998.\n" +
 			"  fix: run: sudo chown isshoni:isshoni /var/lib/isshoni/secrets.json\n"},
 		{"invalid config", invalid, exitConfig, "config error: shutdown_timeout = \"0s\" (default) is too short.\n  fix: use 10s.\n"},
-		{"restart requested", server.ErrRestartRequested, exitRestart, "isshoni serve: the server stopped for a restart (after a restore or rotate-secrets): start it again\n"},
+		{"restart requested", server.ErrRestartRequested, exitRestart, "isshoni serve: the server stopped for a restart (after a restore or rotate-secrets, " +
+			"or because it found the public address it was waiting for): start it again\n"},
 		{"data directory locked", fmt.Errorf("another isshoni process is using /var/lib/isshoni: %w", config.ErrDataDirLocked), exitRuntime,
 			"isshoni serve: another isshoni process is using /var/lib/isshoni: config: the data directory is locked by another process\n"},
 		{"busy port", errors.New("port 443 is in use"), exitRuntime, "isshoni serve: port 443 is in use\n"},

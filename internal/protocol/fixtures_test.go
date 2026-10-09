@@ -21,7 +21,7 @@ var minimumFixtures = strings.Fields(`
 	pc.restart pc.close subscribe.update ok.subscribe.update subscribe.status
 	quality.hint.codec quality.hint.viewers caps.update stats.client stats.watch
 	stats.server invalidate server.shutdown error.request error.pc error.share.codec
-	error.session agent.send ok.agent.send agent.recv`)
+	error.session error.bad_request agent.send ok.agent.send agent.recv`)
 
 func TestMinimumFixtureSet(t *testing.T) {
 	for _, name := range minimumFixtures {

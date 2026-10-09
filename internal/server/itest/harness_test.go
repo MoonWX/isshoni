@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -26,6 +27,7 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/ops"
 	"github.com/MoonWX/isshoni/internal/server/servertest"
 	"github.com/MoonWX/isshoni/internal/server/sfu/sfutest"
+	"github.com/MoonWX/isshoni/internal/version"
 )
 
 // The harness: one server per test, accounts on it, and clients made of the Go signaling client, the Go publisher
@@ -51,6 +53,9 @@ type world struct {
 // then the setup form. It also takes an invite from the admin socket, which the test's members register with.
 func newWorld(t *testing.T, opts servertest.Options) *world {
 	t.Helper()
+	if opts.Deps.SPA == nil {
+		opts.Deps.SPA = testSPA()
+	}
 	w := &world{t: t, srv: servertest.Start(t, opts)}
 	ctx, cancel := context.WithTimeout(context.Background(), waitTimeout)
 	defer cancel()
@@ -73,6 +78,18 @@ func newWorld(t *testing.T, opts servertest.Options) *world {
 		t.Fatalf("invite link %q, want %s/invite#<token>", invite.URL, w.srv.URL)
 	}
 	return w
+}
+
+// testSPA is the web app of the harness's servers: one page, built for this binary's version. Without it a server
+// serves the web app embedded in the test binary, which is whatever the working tree's web/dist holds: nothing on a
+// fresh clone, and after `task build` or `task e2e` a build stamped with another version than a test binary has,
+// which the server says with a warning at startup. No test here reads a page, and the ones that read the server's
+// log expect no warning of the server's own.
+func testSPA() fstest.MapFS {
+	return fstest.MapFS{
+		"index.html":   &fstest.MapFile{Data: []byte("<!doctype html><title>isshoni</title><div id=root></div>\n")},
+		"version.json": &fstest.MapFile{Data: []byte(`{"version":"` + version.Version() + `"}`)},
+	}
 }
 
 // post sends a JSON request as the web app does, with the site's Origin, and fails the test unless the answer has

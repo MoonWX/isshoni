@@ -342,6 +342,9 @@ Why these settings:
 - **`ConfigurationDirectory` keeps the default mode 0755**: the config file itself is 0640 root:isshoni.
 - **Target score**: `systemd-analyze security isshoni` should report an exposure of 2.5 or less. Slice S5 records the
   real number, and CI fails if a change raises it by more than 0.2.
+  **Recorded: 1.7** (README S62, 2026-10-09), the same on systemd 249, 252, 255, 257 and 259 (Ubuntu 22.04 to
+  Fedora 44), so V6 (§11.2) fails above 1.9. `deploy/systemd/README.md` has the table per distro and the reason
+  for each of the 13 lines the report still marks.
 
 ### 4.6 UDP buffers: `deploy/sysctl/60-isshoni.conf`
 

@@ -101,8 +101,9 @@ func stopOnSignal(ctx context.Context, sigs <-chan os.Signal, again func()) (con
 //   - nil, and a stop that had to close something by force (the server logged the warning): 0;
 //   - a refusal that a restart can't fix (server.NeedsOperator): 78, with the one message that says what to do.
 //     The server returns it without logging it;
-//   - a restart the server asked for after a restore or rotate-secrets: 75, "start it again". README S65 replaces
-//     this by the re-exec of 04 §6.5 where the platform has one;
+//   - a restart the server asked for, after a restore or rotate-secrets or because it found the public address it
+//     had started without (04 §6.2): 75, "start it again", which systemd and Docker do by themselves. README S65
+//     replaces this by the re-exec of 04 §6.5 where the platform has one;
 //   - anything else (a busy port, a data directory another isshoni holds, a listener that failed): 1.
 func serveExit(inv *invocation, err error) error {
 	var ve *config.ValidationError
@@ -115,7 +116,8 @@ func serveExit(inv *invocation, err error) error {
 	case server.NeedsOperator(err):
 		return exitWith(exitConfig, err)
 	case errors.Is(err, server.ErrRestartRequested):
-		return exitWith(exitRestart, errors.New("the server stopped for a restart (after a restore or rotate-secrets): start it again"))
+		return exitWith(exitRestart, errors.New("the server stopped for a restart (after a restore or rotate-secrets, "+
+			"or because it found the public address it was waiting for): start it again"))
 	default:
 		return exitWith(exitRuntime, err)
 	}

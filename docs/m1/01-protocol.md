@@ -2120,7 +2120,7 @@ Forbidden:
   pc.restart.json  pc.close.json  subscribe.update.json  ok.subscribe.update.json  subscribe.status.json
   quality.hint.codec.json  quality.hint.viewers.json  caps.update.json  stats.client.json  stats.watch.json
   stats.server.json  invalidate.json  server.shutdown.json  error.request.json  error.pc.json  error.share.codec.json
-  error.session.json  agent.send.json  ok.agent.send.json  agent.recv.json
+  error.session.json  error.bad_request.json  agent.send.json  ok.agent.send.json  agent.recv.json
   ```
 - **Compat snapshots** are taken before tagging, in the release-prep PR. The release job cannot commit them: `main`
   requires a PR and `ci-ok`, and Actions may not open PRs (06 §8.6).

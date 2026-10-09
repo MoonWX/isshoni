@@ -1044,9 +1044,9 @@ table has them; these are the points the table leaves open, and what is still to
   key can't be forgotten there.
 - **A server without a site** (§6.2) **has no accounts, no API and no hub**: each needs the public origin, and
   the router answers 421 to everything but the health endpoints anyway. Its admin socket still answers `health`,
-  `ready` and `status`, so the operator sees the failing check `public_ip`; the account commands (`setup-url`,
-  `admin users`, `admin invite`) get an error answer, "this server's admin socket has no accounts"
-  (`TestServerWithoutASite`).
+  `ready`, `status` and `doctor`, so the operator sees the failing check `public_ip` and, from doctor, its fix; the
+  account commands (`setup-url`, `admin users`, `admin invite`) get an error answer, "this server's admin socket
+  has no accounts" (`TestServerWithoutASite`).
 - **`auth` before the hub, and each needs the other** (§6.1 step 8): the hub authenticates through `auth`, and
   `auth` closes the hub's connections on a revocation. The `ConnCloser` adapter is made first and bound to the
   hub once that exists; until then it closes nothing, which is right for the one thing that runs in between,
@@ -1079,8 +1079,29 @@ table has them; these are the points the table leaves open, and what is still to
   server has bound everything; the certificate, the live counts and the uptime are read at each call. The
   advertised media addresses come with the SFU (README S59), transfer and the release check with README S85.
 - **The server's own background work** hangs on one context that the shutdown's step 6 cancels (§6.4): the admin
-  socket's `Serve`, 03's janitor (`auth.RunJanitor`), the periodic look at the public addresses (§7.4), and the
-  reads behind hooks that have no context (the `db` check, `SPAStatus`).
+  socket's `Serve`, 03's janitor (`auth.RunJanitor`), doctor's own runs (`ops.Doctor.Run`, below), the periodic
+  look at the public addresses (§7.4), and the reads behind hooks that have no context (the `db` check,
+  `SPAStatus`).
+- **Doctor in the server** (the group 7 integration, after README S60 built `ops.Doctor`; §13.1). `wire` builds
+  one `ops.Doctor` for every server, with or without a site, and it has three parts:
+  - `DoctorOptions.Env` returns, per run, the config as the server runs it (the HTTP ports as bound), the
+    server's status from the same function that answers `GET /v1/status` (`Env.Live`, which makes the run one
+    inside the server), the process's uid, `store.LatestSchemaVersion`, and `Deps.Host`, `Resolver`, `STUN` and
+    `Now`. `Env.TLSLastError` is the TLS manager's `Status.LastError`, taken only while its code is the one in
+    the status, so the text never belongs to another error than the code;
+  - `DoctorOptions.Meta` is `metaStore`, the `ops.MetaStore` over 03's meta table: `GetMeta` and `SetMeta` in
+    one short transaction each, and `store.ErrNotFound` read as `""`. `ops.Transfer` and `ops.ReleaseCheck` take
+    the same adapter when README S85 wires them;
+  - the Doctor is the admin socket's (`AdminOptions.Doctor`, so `isshoni doctor` reaches the running server), and
+    `Doctor.Run` is one of the server's background goroutines: it loads the last report from the meta table at
+    once and runs doctor 20 s after the start and then daily.
+
+  The REST routes (`GET|POST /api/v1/admin/doctor`, `GET /api/v1/admin/bandwidth`) and the dashboard's summary
+  and alert come with README S85, over this same Doctor. Until transfer and the release check are wired, a run
+  inside the server has `transfer` as `skip` (`skip.not_reported`) and `release` as `ok` with
+  `release.not_checked`. `TestDoctorOverTheAdminSocket` and `TestMetaStore` cover it. The restore command that
+  `serve` prints when it refuses a newer schema (§6.1 step 4) is `doctor.RestoreCommand`, the one doctor's
+  `schema` check prints, so there is one copy of it.
 - **Not wired yet**, each with a stand-in that needs no code elsewhere:
 
   | What | Until | Meanwhile |
@@ -2459,8 +2480,10 @@ leaves a case open:
   when a new CLI talks to an old server. A user name that is empty, `.` or `..` never reaches the server: the
   client answers `user_not_found` itself, because the router would redirect such a path.
 - **Endpoints of later slices** are routed from the start: `GET /v1/backup`, `POST /v1/restore` and
-  `POST /v1/rotate-secrets` (README S65) and `POST /v1/doctor` (S60) answer 500 `internal` with "… over the admin
-  socket is not implemented in this build yet" until then.
+  `POST /v1/rotate-secrets` (README S65) answer 500 `internal` with "… over the admin socket is not implemented
+  in this build yet" until then. `POST /v1/doctor` is built (README S60) and wired (the group 7 integration,
+  §6.6): only an `AdminServer` that was given no `Doctor`, which no server of `serve` is, answers "this server's
+  admin socket has no doctor".
 - **`waitReadyS`** is 0 to 3600. A handler that panics is answered 500 `internal` with a `ref` that is also in the
   log, with the stack.
 - **Platforms without the peer-credential check** (anything but Linux and macOS; Windows is compile-only in M1)
@@ -2766,9 +2789,12 @@ The admin UI calls `GET /api/v1/admin/bandwidth?people=5&sharing=2&thumbnails=8&
 ```json
 {"input": {"people": 5, "sharing": 2, "thumbnails": 8, "quality": "1080p60", "preset": "auto", "hours": 2},
  "perViewerMbps": {"sharer": 8.13, "viewer": 8.43},
- "egressMediaMbps": 41.54, "egressWireMbps": 43.61, "ingressMediaMbps": 16.86,
- "transferPerSessionGb": 39.2}
+ "egressMediaMbps": 41.54, "egressWireMbps": 43.62, "ingressMediaMbps": 16.86,
+ "transferPerSessionGb": 39.3}
 ```
+
+Every Mbps value is rounded to two decimals and the gigabytes to one, each from the exact value: 41.54 × 1.05 =
+43.617 is 43.62 on the wire, and 43.617 Mbps for two hours is 39.2553 GB, so 39.3.
 
 ### 13.5 JSON output (`doctor --json`, `POST /api/v1/admin/doctor`)
 
@@ -2790,7 +2816,7 @@ The admin UI calls `GET /api/v1/admin/bandwidth?people=5&sharing=2&thumbnails=8&
      "localOnly": false, "durationMs": 1}
   ],
   "bandwidth": {"input": {"people": 5, "sharing": 2, "thumbnails": 8, "quality": "1080p60", "preset": "auto", "hours": 2},
-                "egressMediaMbps": 41.54, "egressWireMbps": 43.61, "ingressMediaMbps": 16.86, "transferPerSessionGb": 39.2}
+                "egressMediaMbps": 41.54, "egressWireMbps": 43.62, "ingressMediaMbps": 16.86, "transferPerSessionGb": 39.3}
 }
 ```
 
@@ -3296,7 +3322,8 @@ Packages and names (exact):
   check (S60) uses them as `fixCode`.
 - `internal/server/servertest`: `Start(t testing.TB, opts Options) *Server` with fields `URL` (`http://` plus the
   site's host; `Client` dials the listener whatever host the URL names), `WSURL`, `Client` (`*http.Client`, keeps
-  cookies, trusts the test CA when `Options.TLS`), `AdminSocket`, `UDPPort`, `TCPPort` (0 until README S59), `DataDir`,
+  cookies, trusts the test CA when `Options.TLS`), `AdminSocket`, `UDPPort`, `TCPPort` (the bound ICE ports, from
+  `Srv.Addrs().ICEUDP` and `ICETCP`; 0 for a listener the test turned off), `DataDir`,
   `Cfg`, `Srv`; methods `Restart(t)`, `Stop(t)`, `Wait(t) error` (the result of `Run` after a shutdown the test
   began itself) and `Logs()`; `Try(t, opts) (*Server, error)` for a server that is expected to refuse;
   `Options{TLS bool; Roots *x509.CertPool; Flags []string; Config func(*config.Config); Deps server.Deps; DataDir

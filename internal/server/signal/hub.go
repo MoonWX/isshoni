@@ -153,7 +153,7 @@ type ConnSelector struct {
 	UserID          string
 	SessionID       string // "" = any
 	DeviceID        string // "" = any
-	ExceptSessionID string // keep this one ("sign out other browsers", password change)
+	ExceptSessionID string // keep this one (password change; "sign out other browsers" names each session it ends)
 }
 
 func (s ConnSelector) matches(id *Identity) bool {

@@ -35,11 +35,11 @@
 //
 // # What exists so far (README slice S50; 01 slice P8, the adapter)
 //
-// All of 01 §15.4. The peer calls every method of *sfu.Conn as the table says, also those that a later slice of the
-// SFU implements: RestartICE, ResetPC, ClosePC and Resync (README S57) and SetDecodeCaps (S69). Until then the SFU
-// answers them with an sfu.internal that is not retryable, so a client's pc.restart or pc.close gets error{internal}
-// and a caps.update only a log line (02 §6.3); nothing here changes when they land. The integration tests on the
-// hub, this adapter and the SFU together are internal/server/itest's (README S59, S74).
+// All of 01 §15.4. The peer calls every method of *sfu.Conn as the table says, also the one that a later slice of
+// the SFU implements: SetDecodeCaps (README S69). Until then the SFU answers it with an sfu.internal that is not
+// retryable, so a caps.update gets only a log line (02 §6.3); nothing here changes when it lands, as nothing did
+// when RestartICE, ResetPC, ClosePC and Resync did (README S57). The integration tests on the hub, this adapter and
+// the SFU together are internal/server/itest's (README S59, S74).
 //
 // # Concurrency
 //

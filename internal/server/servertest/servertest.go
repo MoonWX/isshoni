@@ -103,8 +103,9 @@ type Server struct {
 	// AdminSocket is listen.admin_socket: a short path, because a unix socket path is limited to 104 bytes on
 	// macOS. The server listens there from Start to shutdown (04 §12); ops.DialAdmin(AdminSocket) reaches it.
 	AdminSocket string
-	// UDPPort and TCPPort are the bound ICE ports (listen.ice_udp, listen.ice_tcp). 0 until the SFU runs in the
-	// server (README S59).
+	// UDPPort and TCPPort are the bound ICE ports (listen.ice_udp, listen.ice_tcp), from Srv.Addrs().ICEUDP and
+	// ICETCP. Either is 0 when the test turned that listener off, and both are on a server that started without
+	// media sockets (04 §6.2). ICE-TCP on the HTTPS port has no port of its own: it is the port of URL.
 	UDPPort, TCPPort int
 	// DataDir is the server's data directory.
 	DataDir string
@@ -249,6 +250,14 @@ func (s *Server) start(t testing.TB, httpAddr, httpsAddr string) error {
 		s.httpsAddr = addrs.HTTPS.String()
 	}
 	s.mu.Unlock()
+
+	s.UDPPort, s.TCPPort = 0, 0 // Restart binds new ones
+	if a, ok := addrs.ICEUDP.(*net.UDPAddr); ok {
+		s.UDPPort = a.Port
+	}
+	if a, ok := addrs.ICETCP.(*net.TCPAddr); ok {
+		s.TCPPort = a.Port
+	}
 
 	site := srv.Site()
 	s.Srv, s.Cfg = srv, cfg

@@ -2596,8 +2596,10 @@ and, on Android, in the room's one-time card. iOS: the Home Screen sheet above, 
     any of its pages. No loader, no Suspense, no request of its own: a namespace is as lazy as the code that uses
     it. Call sites don't change (`t('admin.users.title')`, no `useTranslation('admin')`).
   - A namespace is lazy only when nothing in the entry chunk uses it, and every folder that uses it has to import
-    its `lazy/<ns>.ts`. Six more namespaces could move and stay in `en.json` for now, because the move needs files
-    that W00 does not touch (about 6 KB gzip of texts together):
+    its `lazy/<ns>.ts`. `account`, `admin` and `setup` are the lazy namespaces of M1. Six more could move and stay
+    in `en.json`: the budget of §17.3 is met without them (158.9 KB of 200 KB after group 6), so the plan's clause
+    that `conntest` and `fix` load lazily was dropped (README W00), and the move needs files that W00 does not
+    touch (about 6 KB gzip of texts together):
     - `conntest` and `fix`. Only the connection test's lazy panel uses them, but the room page opens that panel
       past `conntest/index.ts` (`import('../conntest/ConnTestPanel')`, §14.2), so `ConnTestPanel.tsx` itself has
       to import the two modules, and the connection test's own tests (`links.test.ts`, `fixText.test.ts`,
