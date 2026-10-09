@@ -121,6 +121,17 @@ func (inv *invocation) terminal(w io.Writer) bool {
 	return err == nil && fi.Mode()&fs.ModeCharDevice != 0
 }
 
+// color reports whether output to w may carry colors: only on a terminal, and only when NO_COLOR is not set
+// (04 §3.1; https://no-color.org: any value but the empty one switches colors off).
+func (inv *invocation) color(w io.Writer) bool {
+	for _, kv := range inv.environ {
+		if v, ok := strings.CutPrefix(kv, "NO_COLOR="); ok && v != "" {
+			return false
+		}
+	}
+	return inv.terminal(w)
+}
+
 // printJSON writes v as one JSON document on one line, as every --json does (04 §3.1). HTML escaping is off, so a
 // URL prints as it is.
 func printJSON(w io.Writer, v any) error {

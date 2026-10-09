@@ -49,8 +49,8 @@ type Prober interface {
 }
 
 // MetaStore is 03's meta table (03 §5) as ops uses it: one small JSON value per key, for the state that must
-// survive a restart (MetaTransferAlertSent, MetaReleaseCheck). The wiring implements it over (*store.Q).GetMeta and
-// SetMeta, each call one short transaction.
+// survive a restart (MetaTransferAlertSent, MetaReleaseCheck, MetaDoctorLast). The wiring implements it over
+// (*store.Q).GetMeta and SetMeta, each call one short transaction.
 type MetaStore interface {
 	// Meta returns the value of a key. A key that does not exist is "" with a nil error: the adapter turns
 	// store.ErrNotFound into that.
@@ -67,6 +67,9 @@ const (
 	// MetaReleaseCheck holds the last release check as a JSON object: when it ran, the feed's ETag and the releases
 	// it listed (04 §11.5).
 	MetaReleaseCheck = "ops.release_check"
+	// MetaDoctorLast holds the last full doctor report as a JSON object (04 §13.1), so that the dashboard has its
+	// summary right after a restart.
+	MetaDoctorLast = "ops.doctor_last"
 )
 
 // AdminAlert is an alert that ops raises for the admins (03 §7.11). The only one is transfer_threshold (04 §11.3).

@@ -19,6 +19,7 @@ import (
 
 	"github.com/MoonWX/isshoni/internal/logx"
 	"github.com/MoonWX/isshoni/internal/protocol/api"
+	"github.com/MoonWX/isshoni/internal/server/ops/doctor"
 	"github.com/MoonWX/isshoni/internal/version"
 )
 
@@ -121,9 +122,13 @@ type AdminRestoreResult struct {
 	PreRestoreBackup string `json:"preRestoreBackup"` // relative to data_dir: backups/pre-restore-<ts>.tar.gz
 }
 
-// AdminDoctorRequest is the body of POST /v1/doctor: the check ids to run, or none for all of them (04 §13.1).
+// AdminDoctorRequest is the body of POST /v1/doctor (04 §13.1). Both fields are optional.
 type AdminDoctorRequest struct {
+	// Only names the checks to run (doctor.CheckIDs); none means all of them.
 	Only []string `json:"only,omitempty"`
+	// Bandwidth is the session the bandwidth check estimates: the bandwidth flags of `isshoni doctor` (04 §13.4).
+	// Without it the estimate is for doctor.DefaultBandwidthInput.
+	Bandwidth *api.BandwidthInput `json:"bandwidth,omitempty"`
 }
 
 // AdminErrorResponse is the socket's error body (04 §12.1): 03's error with a message and a fix in English, which
@@ -183,11 +188,11 @@ func (s *AdminServer) routes() http.Handler {
 		{http.MethodPost, "/v1/users/{name}/enable", s.handleDisabled(false), false},
 		{http.MethodPost, "/v1/invites", s.handleInvite, false},
 		{http.MethodPost, "/v1/log-level", s.handleLogLevel, false},
-		// Later slices of the M1 plan (README S60, S65) fill these in.
+		{http.MethodPost, "/v1/doctor", s.handleDoctor, false},
+		// A later slice of the M1 plan (README S65) fills these in.
 		{http.MethodGet, "/v1/backup", notImplemented("backup"), false},
 		{http.MethodPost, "/v1/restore", notImplemented("restore"), false},
 		{http.MethodPost, "/v1/rotate-secrets", notImplemented("rotate-secrets"), false},
-		{http.MethodPost, "/v1/doctor", notImplemented("doctor"), false},
 	}
 	mux := http.NewServeMux()
 	for _, rt := range routes {
@@ -499,6 +504,53 @@ func (s *AdminServer) handleLogLevel(w http.ResponseWriter, r *http.Request) err
 		line()
 	}
 	w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+// handleDoctor runs doctor inside the server (04 §13.1) and answers with its report. The request waits while
+// another run is under way.
+func (s *AdminServer) handleDoctor(w http.ResponseWriter, r *http.Request) error {
+	var in AdminDoctorRequest
+	if err := decodeAdminJSON(w, r, &in); err != nil {
+		return err
+	}
+	// A request that asks for something doctor does not have is refused, not answered with a report that leaves
+	// it out without a word.
+	known := doctor.CheckIDs()
+	for _, id := range in.Only {
+		if !slices.Contains(known, id) {
+			return badRequest("doctor has no check %q; its checks are %s", id, strings.Join(known, ", "))
+		}
+	}
+	if in.Bandwidth != nil {
+		if field, _, ok := doctor.BandwidthInputProblem(*in.Bandwidth); !ok {
+			return badRequest("bandwidth.%s is not a value the bandwidth estimate takes", field)
+		}
+	}
+	if s.doctor == nil {
+		return unavailable("this server's admin socket has no doctor")
+	}
+	// A run, or the wait for one, must not hold up a shutdown: it ends when the server stops, like the wait of
+	// setup-url.
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	go func() {
+		select {
+		case <-s.stopping:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	rep, err := s.doctor.RunFor(ctx, in)
+	if err != nil {
+		select {
+		case <-s.stopping:
+			return api.NewError(api.CodeServerShutdown)
+		default:
+			return err
+		}
+	}
+	writeAdminJSON(w, http.StatusOK, rep)
 	return nil
 }
 

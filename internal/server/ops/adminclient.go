@@ -192,11 +192,12 @@ func (c *AdminClient) SetLogLevel(ctx context.Context, level string, d time.Dura
 	return c.call(ctx, http.MethodPost, "/v1/log-level", AdminLogLevelRequest{Level: level, For: d.String()}, nil)
 }
 
-// Doctor asks POST /v1/doctor: the checks run inside the server's process (04 §13.1). only names the checks; nil
-// runs all of them.
-func (c *AdminClient) Doctor(ctx context.Context, only []string) (api.DoctorReport, error) {
+// Doctor asks POST /v1/doctor: the checks run inside the server's process (04 §13.1). req names the checks, or
+// none for all of them, and the session of the bandwidth estimate. The answer comes when the run is done, which
+// can take a quarter of a minute; a run that is under way is waited for.
+func (c *AdminClient) Doctor(ctx context.Context, req AdminDoctorRequest) (api.DoctorReport, error) {
 	var out api.DoctorReport
-	return out, c.call(ctx, http.MethodPost, "/v1/doctor", AdminDoctorRequest{Only: only}, &out)
+	return out, c.call(ctx, http.MethodPost, "/v1/doctor", req, &out)
 }
 
 // RotateSecrets asks POST /v1/rotate-secrets; the server restarts after its answer (04 §5.3).

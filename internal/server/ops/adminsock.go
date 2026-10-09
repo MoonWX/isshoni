@@ -252,8 +252,8 @@ type IssuedLink struct {
 	ExpiresAt time.Time
 }
 
-// AdminOptions configures NewAdminServer. Later slices of the M1 plan add what backup, restore, rotate-secrets and
-// doctor need; until then those endpoints say that this build does not have them.
+// AdminOptions configures NewAdminServer. A later slice of the M1 plan adds what backup, restore and rotate-secrets
+// need; until then those endpoints say that this build does not have them.
 type AdminOptions struct {
 	// Health answers /v1/health and /v1/ready, and tells setup-url when the server is ready. Required.
 	Health *Health
@@ -265,6 +265,9 @@ type AdminOptions struct {
 	Accounts AdminAccounts
 	// LogLevel serves /v1/log-level. nil means that endpoint answers 500.
 	LogLevel *LogLevel
+	// Doctor serves /v1/doctor: the checks of `isshoni doctor`, run inside the server (04 §13.1). nil means that
+	// endpoint answers 500.
+	Doctor *Doctor
 	// Logger is the server's logger. nil means slog.Default().
 	Logger *slog.Logger
 }
@@ -276,6 +279,7 @@ type AdminServer struct {
 	status   func(ctx context.Context) (api.ServerStatus, error)
 	accounts AdminAccounts
 	logLevel *LogLevel
+	doctor   *Doctor
 	log      *slog.Logger
 	started  time.Time
 
@@ -311,6 +315,7 @@ func NewAdminServer(o AdminOptions) *AdminServer {
 		status:   o.Status,
 		accounts: o.Accounts,
 		logLevel: o.LogLevel,
+		doctor:   o.Doctor,
 		log:      log,
 		started:  time.Now(),
 		stopping: make(chan struct{}),

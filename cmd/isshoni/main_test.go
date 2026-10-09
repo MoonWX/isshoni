@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -58,6 +59,7 @@ func TestScripts(t *testing.T) {
 		Cmds: map[string]func(*testscript.TestScript, bool, []string){
 			"exitcode":   cmdExitCode,
 			"fakeserver": cmdFakeServer,
+			"holdport":   cmdHoldPort,
 		},
 		Condition: func(cond string) (bool, error) {
 			switch cond {
@@ -109,6 +111,21 @@ func cmdExitCode(ts *testscript.TestScript, neg bool, args []string) {
 	if got != want {
 		ts.Fatalf("exit code %d, want %d", got, want)
 	}
+}
+
+// cmdHoldPort is the script command "holdport": it listens on a TCP port of the loopback interface until the script
+// ends and puts the port's number into $HELDPORT, so that a script has a port that another program holds.
+func cmdHoldPort(ts *testscript.TestScript, neg bool, args []string) {
+	if neg || len(args) != 0 {
+		ts.Fatalf("usage: holdport")
+	}
+	var lc net.ListenConfig
+	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	ts.Check(err)
+	ts.Defer(func() { _ = ln.Close() })
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	ts.Check(err)
+	ts.Setenv("HELDPORT", port)
 }
 
 // runCLI runs the CLI in-process with an empty config file (never the machine's /etc/isshoni/isshoni.toml).
@@ -226,10 +243,10 @@ var validArgs = map[string][]string{
 	"admin log-level":            {"debug"},
 }
 
-// notImplemented are the leaves that a later slice of the M1 plan fills in (README S60: doctor; S65: backup,
-// restore, rotate-secrets).
+// notImplemented are the leaves that a later slice of the M1 plan fills in (README S65: backup, restore,
+// rotate-secrets).
 var notImplemented = map[string]bool{
-	"doctor": true, "admin backup": true, "admin restore": true, "admin rotate-secrets": true,
+	"admin backup": true, "admin restore": true, "admin rotate-secrets": true,
 }
 
 // clientCommands are the leaves that talk to the running server over its admin socket and work in this build.
@@ -254,10 +271,12 @@ func TestNotImplemented(t *testing.T) {
 	}
 }
 
-// Every leaf is accounted for: a later slice's, a client command, or one that works on its own.
+// Every leaf is accounted for: a later slice's, a client command, or one that works on its own. doctor is of the
+// last kind: it asks a running server, and without one it runs its checks itself (doctor_test.go).
 func TestLeavesAreClassified(t *testing.T) {
 	standalone := map[string]bool{
 		"serve": true, "version": true, "help": true, "config check": true, "config print": true, "config example": true, "config init": true,
+		"doctor": true,
 	}
 	for _, p := range leaves(root(), nil) {
 		name := strings.Join(p, " ")

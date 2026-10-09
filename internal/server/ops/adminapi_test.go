@@ -544,21 +544,16 @@ func TestAdminErrors(t *testing.T) {
 		t.Errorf("GET /v1/setup-url = %d (Allow %q)", code, hdr.Get("Allow"))
 	}
 
-	// The endpoints of later slices are declared and say so.
+	// The endpoints of a later slice are declared and say so.
 	for _, ep := range [][2]string{
-		{http.MethodGet, "/v1/backup?certs=1"}, {http.MethodPost, "/v1/restore"},
-		{http.MethodPost, "/v1/rotate-secrets"}, {http.MethodPost, "/v1/doctor"},
+		{http.MethodGet, "/v1/backup?certs=1"}, {http.MethodPost, "/v1/restore"}, {http.MethodPost, "/v1/rotate-secrets"},
 	} {
 		code, _, body := a.raw(t, ep[0], ep[1], "")
 		if code != 500 || !strings.Contains(body, `"code":"internal"`) || !strings.Contains(body, "not implemented in this build yet") {
 			t.Errorf("%s %s = %d %s, want 500 internal: not implemented", ep[0], ep[1], code, body)
 		}
 	}
-	_, err := a.client.Doctor(t.Context(), []string{"dns"})
-	if ae := adminError(t, err, api.CodeInternal); !strings.Contains(ae.Message, "doctor over the admin socket is not implemented") {
-		t.Errorf("Doctor: %q", ae.Message)
-	}
-	_, err = a.client.RotateSecrets(t.Context(), AdminRotateRequest{Keys: []string{"session"}, VAPID: true})
+	_, err := a.client.RotateSecrets(t.Context(), AdminRotateRequest{Keys: []string{"session"}, VAPID: true})
 	wantCode(t, err, api.CodeInternal)
 	_, err = a.client.Backup(t.Context(), true)
 	wantCode(t, err, api.CodeInternal)
