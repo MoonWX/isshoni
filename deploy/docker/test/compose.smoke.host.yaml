@@ -1,0 +1,20 @@
+# Test override for ../../compose.host.yaml, used by docker-smoke.sh (docs/m1/06-deploy-and-ci.md §11.3). Not for
+# real use.
+#
+# Like compose.smoke.yaml: the locally built image and a throwaway certificate. The data directory is a directory of
+# the test run instead of the host's /var/lib/isshoni (a volume with the same container path replaces the base
+# file's). The directory does not exist before the first start, so Docker creates it owned by root, as it does with
+# /var/lib/isshoni on a real host.
+services:
+  isshoni:
+    image: ${SMOKE_IMAGE:?docker-smoke.sh sets it}
+    pull_policy: never
+    environment:
+      ISSHONI_DOMAIN: smoke.test
+      ISSHONI_PUBLIC_IP: 127.0.0.1
+      ISSHONI_TLS_MODE: manual
+      ISSHONI_TLS_CERT_FILE: /etc/isshoni/tls/cert.pem
+      ISSHONI_TLS_KEY_FILE: /etc/isshoni/tls/key.pem
+    volumes:
+      - ${SMOKE_HOST_DATA:?docker-smoke.sh sets it}:/var/lib/isshoni
+      - ${SMOKE_TLS_DIR:?docker-smoke.sh sets it}:/etc/isshoni/tls:ro
