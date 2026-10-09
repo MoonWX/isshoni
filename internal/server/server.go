@@ -128,6 +128,9 @@ type Addrs struct {
 	ICEUDP net.Addr
 	// ICETCP is the ICE-TCP listener on listen.ice_tcp: a *net.TCPAddr with the host as configured, nil when that
 	// listener is off. ICE-TCP on the HTTPS port needs no address of its own: it is HTTPS's (04 §7.2).
+	//
+	// Both are nil on a server that started without media sockets: one that waits for its public address on a
+	// machine without a local address for media (04 §6.2).
 	ICETCP net.Addr
 }
 
@@ -141,13 +144,19 @@ const (
 	stateStopped               // Shutdown finished, or Start failed
 )
 
-// Budgets of the shutdown steps (04 §6.4). Those of steps 3 to 6 add up to the default shutdown_timeout of 10 s,
-// which bounds the whole shutdown whatever the steps would like; only the store's close may go beyond it.
+// Budgets of the shutdown steps (04 §6.4). Those of steps 3 to 6 add up to half a second more than the default
+// shutdown_timeout of 10 s, which bounds the whole shutdown whatever the steps would like: a shutdown in which every
+// step runs out of time has that much less for its last one. Only the store's close may go beyond it.
 const (
-	hubShutdownBudget   = 2 * time.Second // step 3: the hub's server.shutdown and close 1012
-	mediaShutdownBudget = 1 * time.Second // step 4: SFU.Close, then Transport.Close
-	httpShutdownBudget  = 5 * time.Second // step 5: http.Server.Shutdown on every server
-	tailShutdownBudget  = 2 * time.Second // step 6: the TLS manager and the admin socket
+	hubShutdownBudget = 2 * time.Second // step 3: the hub's server.shutdown and close 1012
+	// Step 4 has one budget for each of its two parts, so that the second never starts out of time. SFU.Close ends
+	// by itself after the second it gives its PeerConnections (02's closeTimeout, README §4); its budget is that
+	// second and a margin, so the step sees the SFU return and does not run out at the same moment. Transport.Close
+	// then closes sockets, which takes no time to speak of.
+	sfuShutdownBudget       = 1250 * time.Millisecond
+	transportShutdownBudget = 250 * time.Millisecond
+	httpShutdownBudget      = 5 * time.Second // step 5: http.Server.Shutdown on every server
+	tailShutdownBudget      = 2 * time.Second // step 6: the TLS manager and the admin socket
 	// storeCloseBudget is the store's own, at the end of step 6 and outside tailShutdownBudget: what closing it may
 	// take, also when the time above is used up. It is the one thing a shutdown that is out of time still waits for
 	// (see shutdown).
@@ -180,15 +189,18 @@ type Server struct {
 	failErr  error         // set before failed is closed
 
 	// What Start builds, in startup order; Shutdown releases it in reverse (04 §6.4).
-	lock      *config.DataDirLock
-	secrets   *config.SecretStore // the session, invite and resume keys (wire.go); the VAPID pair (README S71)
-	store     *store.DB           // 03's database (wire.go); closed last but the lock
-	public    netx.PublicAddrs    // the public addresses as detected at startup, in every mode (public.go)
-	mux       *netx.PortMux       // the 443 multiplexer on listen.https; nil in off mode
-	httpLn    net.Listener        // listen.http
-	adminLn   net.Listener        // listen.admin_socket (04 §12.1)
-	transport *netx.Transport     // the ICE sockets and muxes: listen.ice_udp, listen.ice_tcp, the multiplexer's ICE side
-	tls       *tlsmgr.Manager     // the certificate, in every mode (off: a manager with nothing to do)
+	lock    *config.DataDirLock
+	secrets *config.SecretStore // the session, invite and resume keys (wire.go); the VAPID pair (README S71)
+	store   *store.DB           // 03's database (wire.go); closed last but the lock
+	public  netx.PublicAddrs    // the public addresses as detected at startup, in every mode (public.go)
+	mux     *netx.PortMux       // the 443 multiplexer on listen.https; nil in off mode
+	httpLn  net.Listener        // listen.http
+	adminLn net.Listener        // listen.admin_socket (04 §12.1)
+	// transport is the ICE sockets and muxes: listen.ice_udp, listen.ice_tcp, the multiplexer's ICE side. It is nil
+	// on the one server that starts without media: it waits for its public address on a machine that has no local
+	// address for media either (listenICE), and then media is nil too.
+	transport *netx.Transport
+	tls       *tlsmgr.Manager // the certificate, in every mode (off: a manager with nothing to do)
 	health    *ops.Health
 	media     *sfu.SFU         // 02's SFU on transport, behind 01's sfuplane (wire.go); closed before transport
 	accounts  *auth.Service    // 03's account service; nil on a server without a site (wire.go)
@@ -379,7 +391,8 @@ func (s *Server) Start(ctx context.Context) (err error) {
 
 	// Step 6: bind the listeners: the 443 multiplexer (not in off mode), listen.http, the admin socket, and then
 	// the ICE Transport: the only code that binds listen.ice_udp and listen.ice_tcp, and the reader of the
-	// multiplexer's ICE side (04 §7.3).
+	// multiplexer's ICE side (04 §7.3). A busy port ends the start; so does a machine without an address for media,
+	// except on a server that has to wait for its public address anyway.
 	if mode != config.TLSOff {
 		if s.mux, err = s.listenHTTPS(); err != nil {
 			return err
@@ -398,14 +411,16 @@ func (s *Server) Start(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	if s.transport, err = s.listenICE(ctx); err != nil {
-		return err
-	}
-	s.addrs.ICEUDP, s.addrs.ICETCP = iceAddrs(s.cfg.Listen.ICETCP, s.transport)
+	// The site, now that the HTTP ports are bound, and whether the server has to wait for it. The Transport comes
+	// after it: a server that waits for its address may have to start without one (listenICE).
 	if s.site, err = s.newSite(mode); err != nil {
 		return err
 	}
 	s.awaitsAddress = siteIsAddress(&s.cfg, mode) && s.site.Origin == ""
+	if s.transport, err = s.listenICE(ctx); err != nil {
+		return err
+	}
+	s.addrs.ICEUDP, s.addrs.ICETCP = iceAddrs(s.cfg.Listen.ICETCP, s.transport)
 
 	// Step 7: the TLS manager. The certificate arrives in the background (04 §8): the listeners serve before it is
 	// there, and the readiness check "tls" says when it is.
@@ -445,7 +460,7 @@ func (s *Server) Start(ctx context.Context) (err error) {
 	}
 
 	// Step 9: start the HTTP servers and the admin socket, then the server's own work. The multiplexer's ICE side
-	// has had its reader since step 6: the Transport's ICE-TCP mux.
+	// has had its reader since step 6: the Transport's ICE-TCP mux (without a Transport that side is closed).
 	if mode == config.TLSOff {
 		s.serve(s.httpSrv, s.httpLn)
 	} else {
@@ -702,18 +717,21 @@ func (s *Server) shutdown(ctx context.Context, reason ShutdownReason, draining f
 		})
 	}
 
-	// Step 4, in mediaShutdownBudget altogether: the SFU ends what the hub left (every share, with server_shutdown)
-	// and closes its PeerConnections, all at once; then the Transport closes the ICE sockets and muxes under it,
-	// the multiplexer's ICE side included. The order matters: the SFU never closes a socket, and the Transport
-	// must outlive it (02 §6.1). SFU.Close returns within a second by itself. When the step's time is up before
-	// that, the Transport closes under whatever the SFU still holds, which is what "by force" means here; both
-	// calls finish on their own.
-	step("media", mediaShutdownBudget, func(ctx context.Context) error {
+	// Step 4: the SFU ends what the hub left (every share, with server_shutdown) and closes its PeerConnections,
+	// all at once; then the Transport closes the ICE sockets and muxes under it, the multiplexer's ICE side
+	// included. The order matters: the SFU never closes a socket, and the Transport must outlive it (02 §6.1), so
+	// each has a budget of its own and the Transport's begins when the SFU has returned. Only an SFU that breaks
+	// its word and is still closing when its budget ends has the Transport closed under what it still holds, which
+	// is what "by force" means here; either call then finishes on its own. A server that started without media
+	// sockets has neither (listenICE).
+	if s.media != nil {
 		before("sfu")
-		sfuErr := within(ctx, s.media.Close)
+		step("sfu", sfuShutdownBudget, func(ctx context.Context) error { return within(ctx, s.media.Close) })
+	}
+	if s.transport != nil {
 		before("transport")
-		return errors.Join(sfuErr, within(ctx, s.transport.Close))
-	})
+		step("transport", transportShutdownBudget, func(ctx context.Context) error { return within(ctx, s.transport.Close) })
+	}
 
 	// Step 5: the HTTP servers, then the 443 multiplexer.
 	before("http")

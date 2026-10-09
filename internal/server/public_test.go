@@ -247,6 +247,7 @@ func TestICEAddrs(t *testing.T) {
 		{name: "media on the HTTPS port alone", configured: "",
 			tr: &netx.Transport{Advertised: []netx.AdvertisedAddr{adv(netx.ViaTCP443, "203.0.113.7:443")}}},
 		{name: "a UDP mux without a socket", configured: "", tr: &netx.Transport{UDPMux: fakeUDPMux{}}},
+		{name: "a server that started without media sockets", configured: ":7882"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			udp, tcp := iceAddrs(tc.configured, tc.tr)

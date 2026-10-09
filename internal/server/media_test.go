@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/netip"
@@ -433,6 +434,193 @@ func TestRestartsWhenThePublicAddressAppears(t *testing.T) {
 	case <-next.RestartAsked():
 		t.Error("the restarted server asks for another restart")
 	default:
+	}
+}
+
+// noLocalAddress are the flags of a machine whose network is not up: no interface counts, and loopback, which the
+// tests' servers otherwise run on, carries no media.
+var noLocalAddress = []string{"--network.include-loopback=false", "--network.exclude-interfaces=*"}
+
+// TestStartsBeforeTheNetworkIsUp: what most often keeps the public address from a server at startup is a network
+// that is not up yet (04 §6.2), and such a machine has no local address for the media sockets either. The server
+// that waits for its address starts all the same (04 §6.3: what it lacks from outside never stops the start):
+// without media sockets and without an SFU, not ready, with the checks "public_ip" and "media" saying why. When a
+// look finds the address, it restarts like every server that waited for one.
+func TestStartsBeforeTheNetworkIsUp(t *testing.T) {
+	found := netx.PublicAddrs{V4: netip.MustParseAddr("203.0.113.7"), V4Method: netx.MethodSTUN}
+	for _, tc := range []struct {
+		name  string
+		flags []string
+		cause string // netx's reason, in the warning
+	}{
+		{"UDP", []string{"--listen.ice-udp=:0", "--listen.ice-tcp="}, "no usable local address for ICE UDP"},
+		// The Transport got as far as its ICE-TCP mux on the multiplexer's ICE side before it gave up.
+		{"ICE-TCP on the HTTPS port alone", []string{"--listen.ice-udp=", "--listen.ice-tcp="}, "no usable address for ICE-TCP"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var looks atomic.Int32
+			var appear atomic.Bool
+			flags := slices.Concat(tlsFlags("--tls.mode=ip", closedCA), tc.flags, noLocalAddress)
+			cfg := testConfig(t, flags...)
+			logs := &logCapture{}
+			s, err := server.New(cfg, logs.logger(), testDeps())
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.SetPublicAddrsFunc(func() netx.PublicAddrs {
+				looks.Add(1)
+				if appear.Load() {
+					return found
+				}
+				return netx.PublicAddrs{}
+			})
+			s.SetRedetectEvery(5 * time.Millisecond)
+			if err := s.Start(context.Background()); err != nil {
+				t.Fatalf("Start = %v, want a server that waits for its address", err)
+			}
+			t.Cleanup(func() { // for a test that fails before the restart; after it, the server is stopped already
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				defer cancel()
+				_ = s.Shutdown(ctx, server.ShutdownStop)
+			})
+			ran := make(chan error, 1)
+			go func() { ran <- s.Run(context.Background()) }()
+
+			// No media sockets, no SFU, and both checks say what is missing.
+			const noMedia = "no usable local network address for media; isshoni restarts itself when it finds its public address"
+			ok, checks := s.Health().Ready()
+			if ok || !strings.HasPrefix(checks["public_ip"], "no public IP address found") || checks["media"] != noMedia || checks["db"] != "ok" {
+				t.Errorf("Ready = %v %v", ok, checks)
+			}
+			if addrs := s.Addrs(); addrs.ICEUDP != nil || addrs.ICETCP != nil || addrs.HTTPS == nil || addrs.HTTP == nil {
+				t.Errorf("Addrs = %+v, want the HTTP listeners and no media socket", addrs)
+			}
+			if s.Transport() != nil || s.Media() != nil {
+				t.Errorf("a Transport (%v) or an SFU (%v) on a machine without an address for media", s.Transport(), s.Media())
+			}
+			var warned bool
+			for _, rec := range logRecords(t, logs.String()) {
+				if msg, _ := rec["msg"].(string); strings.HasPrefix(msg, "no local network address can carry media yet") {
+					cause, _ := rec["err"].(string)
+					warned = rec["level"] == "WARN" && rec["component"] == "netx" && strings.Contains(cause, tc.cause)
+				}
+			}
+			if !warned {
+				t.Errorf("no warning about the missing address with the cause %q:\n%s", tc.cause, logs.String())
+			}
+
+			// The operator's view through the admin socket: the same checks, and a status without media.
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			admin := ops.DialAdmin(cfg.Listen.AdminSocket)
+			if ready, err := admin.Ready(ctx); err != nil || ready.Status != ops.StatusNotReady || ready.Checks["media"] != noMedia {
+				t.Errorf("ready = %+v, %v", ready, err)
+			}
+			st, err := admin.Status(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if st.Advertised == nil || len(st.Advertised) != 0 || st.UDPRcvBufBytes != 0 || st.UDPSndBufBytes != 0 {
+				t.Errorf("status = %+v, want nothing advertised and no socket buffers", st)
+			}
+			for _, l := range st.Listeners {
+				if strings.HasPrefix(l.Key, "listen.ice_") {
+					t.Errorf("the status lists the media listener %+v", l)
+				}
+			}
+
+			// Nothing reads ICE-TCP on the HTTPS port: such a connection is closed, not kept waiting. (The server
+			// closes it with the client's bytes unread, so the end may arrive as a reset.)
+			ice := dialRaw(t, s.Addrs().HTTPS)
+			if _, err := ice.Write(stunBindingFrame()); err != nil {
+				t.Fatal(err)
+			}
+			_ = ice.SetReadDeadline(time.Now().Add(10 * time.Second))
+			n, err := ice.Read(make([]byte, 64))
+			if closed := errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET); n != 0 || !closed {
+				t.Errorf("an ICE-TCP connection read %d bytes, %v; want it closed without a byte", n, err)
+			}
+
+			// Looks that find nothing change nothing; the one that finds the address restarts the server.
+			waitFor(t, "a few looks", func() bool { return looks.Load() >= 4 })
+			select {
+			case err := <-ran:
+				t.Fatalf("Run returned %v while no address was found", err)
+			case <-s.RestartAsked():
+				t.Fatal("a restart was asked for while no address was found")
+			default:
+			}
+			appear.Store(true)
+			select {
+			case err := <-ran:
+				if !errors.Is(err, server.ErrRestartRequested) {
+					t.Errorf("Run = %v, want ErrRestartRequested", err)
+				}
+			case <-time.After(20 * time.Second):
+				t.Fatalf("Run did not return after the address appeared:\n%s", logs.String())
+			}
+			// The shutdown of a server without media has nothing to stop there, and nothing to force.
+			if out := logs.String(); !strings.Contains(out, "shutdown complete") || strings.Contains(out, "by force") {
+				t.Errorf("the log does not end with a complete shutdown:\n%s", out)
+			}
+			for _, rec := range logRecords(t, logs.String()) {
+				if rec["level"] == "ERROR" && rec["scope"] == nil { // a scope marks Pion's own lines
+					t.Errorf("the server logged %v", rec)
+				}
+			}
+			if c, err := tryDial(s.Addrs().HTTPS); err == nil {
+				_ = c.Close()
+				t.Error("the HTTPS port still accepts connections")
+			}
+		})
+	}
+}
+
+// TestNoLocalAddressWithASite: a server that knows its site and finds no local address for media does not start:
+// it would be ready for everything but what it is for. That is a runtime error, which the service manager's
+// restart fixes once the network is up, and it says so (04 §6.1 step 6). Only the server that waits for its public
+// address starts without media (TestStartsBeforeTheNetworkIsUp).
+func TestNoLocalAddressWithASite(t *testing.T) {
+	const want = "no usable network address for media yet (is the network up?). isshoni starts once there is one"
+	for _, tc := range []struct {
+		name   string
+		flags  []string
+		public netx.PublicAddrs
+	}{
+		{name: "off mode", flags: []string{"--listen.ice-udp=:0", "--listen.ice-tcp="}},
+		// The next process of a server that waited: it has its address now, and still no way in for media.
+		{name: "ip mode with its address", flags: append(tlsFlags("--tls.mode=ip", closedCA), "--listen.ice-udp=:0", "--listen.ice-tcp="),
+			public: netx.PublicAddrs{V4: netip.MustParseAddr("203.0.113.7"), V4Method: netx.MethodSTUN}},
+		{name: "ip mode with its address, ICE-TCP on the HTTPS port alone",
+			flags:  append(tlsFlags("--tls.mode=ip", closedCA), "--listen.ice-udp=", "--listen.ice-tcp="),
+			public: netx.PublicAddrs{V6: netip.MustParseAddr("2001:db8::7"), V6Method: netx.MethodInterface}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig(t, append(tc.flags, noLocalAddress...)...)
+			s, err := server.New(cfg, discardLog(), testDeps())
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.SetPublicAddrs(tc.public)
+			err = s.Start(context.Background())
+			if err == nil {
+				_ = s.Shutdown(context.Background(), server.ShutdownStop)
+				t.Fatal("Start succeeded without an address for media")
+			}
+			if !strings.HasPrefix(err.Error(), want) || !errors.Is(err, netx.ErrNoTransport) || server.NeedsOperator(err) {
+				t.Errorf("Start = %v\nwant a runtime error that starts with %q", err, want)
+			}
+			// The listeners it had bound before are closed again.
+			for _, a := range []net.Addr{s.Addrs().HTTP, s.Addrs().HTTPS} {
+				if a == nil {
+					continue
+				}
+				if c, err := tryDial(a); err == nil {
+					_ = c.Close()
+					t.Errorf("%v still accepts connections after the failed start", a)
+				}
+			}
+		})
 	}
 }
 

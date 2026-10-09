@@ -33,8 +33,10 @@
 //     minutes. They are what the server's ICE candidates name, and ip mode's site (manual mode's too, without a
 //     domain). A server whose site is its address and that finds none runs without a site, and the check
 //     "public_ip" fails; it is the one server that restarts by itself, when a later look finds the address (Run
-//     returns ErrRestartRequested). Everywhere else an address that changed is logged, and the operator's restart
-//     applies it.
+//     returns ErrRestartRequested). It starts even on a machine whose network is not up yet, which then has no
+//     local address for the media sockets either: without them and without an SFU, and the check "media" fails
+//     too. Everywhere else an address that changed is logged, and the operator's restart applies it; and a
+//     machine without an address for media ends the start with an error that says so.
 //   - Accounts and signaling (wire.go, the wiring of 04 §6.6): 03's store and account service, 03's REST API, and
 //     01's hub, with the adapters between them: the hub authenticates through the session cookie and reads rooms
 //     and policy from the store; a revocation in the account service closes the hub's connections at once; the REST

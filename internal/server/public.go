@@ -207,13 +207,38 @@ func (s *Server) transportOptions() netx.TransportOptions {
 
 // listenICE binds the ICE Transport (04 §6.1 step 6, §7.3): listen.ice_udp on every local address that carries
 // media, listen.ice_tcp, and the ICE side of the 443 multiplexer when there is one. Its errors are for the
-// operator, like those of the other listeners; they are runtime errors (exit 1), not refusals. That goes for a
-// machine without a usable address too (netx.ErrNoTransport): the interfaces are read once, here, so the fix is the
-// restart that systemd and Docker make by themselves, which helps once the network is up.
+// operator, like those of the other listeners; they are runtime errors (exit 1), not refusals.
+//
+// A machine without a usable address (netx.ErrNoTransport) has, as a rule, a network that is not up yet: the unit
+// started early at boot, the DHCP lease is still on its way. The interfaces are read once, here, so only another
+// start finds the address, and who makes that start depends on what the server knows of itself:
+//   - With a site, the start fails, and the message says what is missing. systemd and Docker start the server
+//     again by themselves, which helps when the network comes up while they still try (systemd: five times).
+//   - A server that waits for its public address (awaitsAddress) is not ready whatever happens here, and the same
+//     missing network is the usual reason why it found no address (04 §6.2). What it lacks from outside never
+//     stops the start (04 §6.3), so it goes on without media sockets: listenICE returns no Transport and no error,
+//     the server then builds no SFU, its check "media" says why, and the look at the public addresses restarts it
+//     when it finds the address (publicAddrsChanged). Failing instead would hand the wait to the service manager,
+//     and systemd gives up after five failures in a row, which take a quarter of a minute (06's unit).
+//
+// Nothing reads the multiplexer's ICE side on a server without a Transport, so that side is closed: the
+// multiplexer closes a connection that speaks ICE at once instead of keeping it in a queue.
 func (s *Server) listenICE(ctx context.Context) (*netx.Transport, error) {
 	tr, err := netx.NewTransport(ctx, s.transportOptions())
 	if err == nil {
 		return tr, nil
+	}
+	if errors.Is(err, netx.ErrNoTransport) {
+		if !s.awaitsAddress {
+			return nil, fmt.Errorf("no usable network address for media yet (is the network up?). isshoni starts once "+
+				"there is one; systemd and Docker try again by themselves: %w", err)
+		}
+		s.log.Warn("no local network address can carry media yet (is the network up?): isshoni starts without media sockets",
+			slog.String("component", "netx"), logx.Err(err))
+		if s.mux != nil {
+			_ = s.mux.ICE().Close()
+		}
+		return nil, nil
 	}
 	var le *netx.ListenError
 	if !errors.As(err, &le) {
@@ -238,8 +263,12 @@ func (s *Server) listenICE(ctx context.Context) (*netx.Transport, error) {
 
 // iceAddrs returns the Transport's ICE listeners as bound, for Addrs: the first UDP socket, and the ICE-TCP
 // listener of listen.ice_tcp. The Transport does not name that listener, so its port is the one the Transport
-// advertises for it, and its host the configured one. Either is nil when that listener is off.
+// advertises for it, and its host the configured one. Either is nil when that listener is off, and both are on a
+// server without a Transport.
 func iceAddrs(configuredTCP string, tr *netx.Transport) (udp, tcp net.Addr) {
+	if tr == nil {
+		return nil, nil
+	}
 	if tr.UDPMux != nil {
 		if addrs := tr.UDPMux.GetListenAddresses(); len(addrs) > 0 {
 			udp = addrs[0]

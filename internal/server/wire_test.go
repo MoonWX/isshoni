@@ -1289,6 +1289,25 @@ func TestStatusSource(t *testing.T) {
 	if got := advertisedAddrs(nil); got == nil || len(got) != 0 {
 		t.Errorf("advertisedAddrs(nil) = %#v, want an empty list", got)
 	}
+
+	// A server that started without media sockets (it waits for its public address on a machine without a local
+	// one, listenICE) has no Transport: nothing is advertised, and the lists are still lists.
+	s.transport = nil
+	s.addrs.ICEUDP, s.addrs.ICETCP = iceAddrs(cfg.Listen.ICETCP, s.transport)
+	got, err = s.statusSource()(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Advertised == nil || len(got.Advertised) != 0 || got.UDPRcvBufBytes != 0 || got.UDPSndBufBytes != 0 {
+		t.Errorf("media of a server without a Transport = %#v, buffers %d/%d", got.Advertised, got.UDPRcvBufBytes, got.UDPSndBufBytes)
+	}
+	if len(got.Listeners) != 3 || got.Listeners[0].Key != "listen.https" || got.Listeners[1].Key != "listen.http" ||
+		got.Listeners[2].Key != "listen.admin_socket" {
+		t.Errorf("listeners of a server without a Transport = %+v", got.Listeners)
+	}
+	if b, err := json.Marshal(got); err != nil || strings.Contains(string(b), "null") {
+		t.Errorf("status JSON = %s, %v", b, err)
+	}
 }
 
 // fakeUDPMux is an ice.UDPMux of which only the listen addresses are asked.

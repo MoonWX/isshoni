@@ -202,7 +202,8 @@ const (
 // each needs the public origin, and the router answers 421 to every request but the health endpoints anyway. Its
 // admin socket still answers health, ready and status, so the operator sees the failing check "public_ip". It has
 // its SFU all the same, on the ports it has bound: nothing joins it, and the check "media" and the status say what
-// the next start will serve media on.
+// the next start will serve media on. Only when it found no local address to bind them on either does it have no
+// SFU, and a failing check "media" next to "public_ip" (wireMedia).
 func (s *Server) wire(ctx context.Context) error {
 	// The wall clock, not Deps.Now: how old an answer is has nothing to do with what time the accounts think it is.
 	s.health.AddCheck("db", newDBCheck(s.run, s.store.Ping, time.Now).ready)
@@ -235,7 +236,14 @@ func (s *Server) wire(ctx context.Context) error {
 // front of it (04 §6.6, 01 §15.4). The SFU needs the plane's RoomEvents when it is built and the plane needs the
 // SFU, hence the three steps. The SFU starts with the admin's limit from 03's settings, which already hold the
 // policy pins, and hears of every later change; the readiness check "media" is registered here.
+//
+// A server that started without a Transport (listenICE) gets no SFU and no plane, only the check, which fails. It
+// has no site, so no hub is built that would need the plane.
 func (s *Server) wireMedia() (signal.MediaPlane, error) {
+	if s.transport == nil {
+		s.health.AddCheck("media", func() (bool, string) { return false, noMediaAddress })
+		return nil, nil
+	}
 	plane, events := sfuplane.New(slog.New(notImplementedAsDebug{s.log.Handler()}))
 	settings := s.store.Settings()
 	media, err := sfu.New(sfu.Config{
@@ -258,6 +266,10 @@ func (s *Server) wireMedia() (signal.MediaPlane, error) {
 func sfuLimits(s store.Settings) sfu.Limits {
 	return sfu.Limits{MaxShareKbps: s.MaxShareBitrateKbps}
 }
+
+// noMediaAddress is what the readiness check "media" says on a server that started without media sockets
+// (listenICE): it waits for its public address on a machine that has no local address for media either.
+const noMediaAddress = "no usable local network address for media; isshoni restarts itself when it finds its public address"
 
 // mediaCheck is the readiness check "media" (04 §6.2): the server has a way in for media, at least one UDP socket,
 // or an ICE-TCP mux when the operator turned UDP off, and the SFU takes connections. udp says whether
@@ -827,13 +839,16 @@ func (s *Server) statusSource() func(context.Context) (api.ServerStatus, error) 
 		StartedAt:     started,
 		Origin:        s.site.Origin,
 		NAT:           s.public.NAT,
-		Advertised:    advertisedAddrs(s.transport.Advertised),
+		Advertised:    []api.AdvertisedAddr{}, // a server without media sockets advertises nothing
 		Listeners:     s.listeners(),
 		SchemaVersion: s.store.SchemaVersion(),
 	}
-	if s.transport.UDPMux != nil {
-		// The effective buffers of the media sockets, which doctor compares with network.udp_buffer_bytes.
-		base.UDPRcvBufBytes, base.UDPSndBufBytes = s.transport.RcvBuf, s.transport.SndBuf
+	if tr := s.transport; tr != nil {
+		base.Advertised = advertisedAddrs(tr.Advertised)
+		if tr.UDPMux != nil {
+			// The effective buffers of the media sockets, which doctor compares with network.udp_buffer_bytes.
+			base.UDPRcvBufBytes, base.UDPSndBufBytes = tr.RcvBuf, tr.SndBuf
+		}
 	}
 	if s.public.V4.IsValid() {
 		base.PublicIPv4, base.PublicIPv4Method = s.public.V4.String(), string(s.public.V4Method)

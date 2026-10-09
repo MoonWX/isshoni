@@ -65,15 +65,17 @@ func TestShutdownWithMedia(t *testing.T) {
 	checkVideo(t, "video", video.Packets())
 
 	// The server's own account of it: the shutdown ran to its end, nothing was forced, and nothing along the way
-	// was an error, or worth a warning of the server's own. (Pion's warnings, which carry a scope, are not: a
-	// PeerConnection that closes under a running stream makes some.)
+	// was an error or worth a warning of the server's own. Pion's warnings and errors, which carry a scope, are
+	// not the server's: a PeerConnection that closes under a running stream makes some, and a packet that arrives
+	// for a connection the SFU has just closed is "Failed to write packet" at error level in Pion's UDP mux. Which
+	// of them show up depends on the moment, so the test does not depend on Pion's levels.
 	var complete bool
 	for line := range strings.SplitSeq(strings.TrimSpace(w.srv.Logs()), "\n") {
 		var rec map[string]any
 		if err := json.Unmarshal([]byte(line), &rec); err != nil {
 			t.Fatalf("log line %q: %v", line, err)
 		}
-		if level, pion := rec["level"], rec["scope"] != nil; level == "ERROR" || (level == "WARN" && !pion) {
+		if level := rec["level"]; rec["scope"] == nil && (level == "ERROR" || level == "WARN") {
 			t.Errorf("the server logged %v", rec)
 		}
 		complete = complete || rec["msg"] == "shutdown complete"
