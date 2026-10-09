@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -92,11 +93,29 @@ func TestStart(t *testing.T) {
 	if n := len(srv.AdminSocket); n == 0 || n > 103 {
 		t.Errorf("AdminSocket %q is %d bytes long; a unix socket path holds at most 103", srv.AdminSocket, n)
 	}
-	if srv.UDPPort != 0 || srv.TCPPort != 0 {
-		t.Errorf("UDPPort = %d, TCPPort = %d: no ICE transport runs in this build yet", srv.UDPPort, srv.TCPPort)
+	// The media ports are the ones the server bound: ephemeral, and the ones its Addrs name.
+	addrs := srv.Srv.Addrs()
+	udp, _ := addrs.ICEUDP.(*net.UDPAddr)
+	tcp, _ := addrs.ICETCP.(*net.TCPAddr)
+	if srv.UDPPort == 0 || srv.TCPPort == 0 || udp == nil || tcp == nil || srv.UDPPort != udp.Port || srv.TCPPort != tcp.Port {
+		t.Errorf("UDPPort = %d, TCPPort = %d, Addrs = %v and %v: want the bound ICE ports", srv.UDPPort, srv.TCPPort,
+			addrs.ICEUDP, addrs.ICETCP)
 	}
 	if !strings.Contains(srv.Logs(), " ready: "+srv.URL) {
 		t.Errorf("Logs() has no ready line:\n%s", srv.Logs())
+	}
+}
+
+// TestMediaPortsOfAListenerThatIsOff: a media listener that the test turns off has port 0, the other one keeps its
+// own.
+func TestMediaPortsOfAListenerThatIsOff(t *testing.T) {
+	srv := servertest.Start(t, servertest.Options{Flags: []string{"--listen.ice-tcp="}})
+	if srv.UDPPort == 0 || srv.TCPPort != 0 {
+		t.Errorf("without listen.ice_tcp: UDPPort = %d, TCPPort = %d, want a port and 0", srv.UDPPort, srv.TCPPort)
+	}
+	srv = servertest.Start(t, servertest.Options{Flags: []string{"--listen.ice-udp="}})
+	if srv.UDPPort != 0 || srv.TCPPort == 0 {
+		t.Errorf("without listen.ice_udp: UDPPort = %d, TCPPort = %d, want 0 and a port", srv.UDPPort, srv.TCPPort)
 	}
 }
 

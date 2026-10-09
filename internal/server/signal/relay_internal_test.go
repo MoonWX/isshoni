@@ -50,6 +50,10 @@ func checkRelayEncoding(t *testing.T, frame []byte) bool {
 	if err != nil {
 		return false
 	}
+	// null is no payload (01 §8.14): the protocol's checks stop it, so the relay never hands one on.
+	if bytes.Equal(bytes.TrimSpace(v.Payload), []byte("null")) {
+		t.Fatalf("an agent.send with a null for its payload is valid:\n%s", frame)
+	}
 	out, err := encodeAgentRecv(relayFrom, v.Kind, v.Payload)
 	if err != nil {
 		t.Fatalf("a valid agent.send does not encode: %v\n%s", err, frame)
@@ -112,6 +116,8 @@ func TestRelayEncodeMatchesProtocol(t *testing.T) {
 		{"exclusions.get", `{"escaped":"\u003c\u2028\ud800\"\\","text":"héllo 日本語 🎬"}`},
 		{"x", `"text"`},
 		{"x", `0`},
+		// Not a payload that the relay ever gets (AgentSend.Validate refuses it): this is the encoder alone, whose
+		// placeholder is this very text.
 		{"x", `null`},
 	} {
 		if htmlEscaped([]byte(tc.payload)) {
@@ -194,6 +200,9 @@ func FuzzRelayEncode(f *testing.F) {
 		{"x", "\"\u2028\u2029\""},
 		{"x", `0`},
 		{"x", `null`},
+		{"x", ` null `},
+		{"x", `[null]`},
+		{"x", `{"preset":"game"},"payload":null`},
 		{"x", strings.Repeat("[", 29) + strings.Repeat("]", 29)},
 		{"x", `1},"to":"c_0000000000000000","x":{"y":2`},
 		{"Bad kind", `{}`},

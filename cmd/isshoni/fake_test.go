@@ -203,7 +203,7 @@ func (f *fakeAccounts) CreateInvite(_ context.Context, maxUses, ttlHours int) (o
 	}, nil
 }
 
-// fakeServer is a running admin socket with fake accounts.
+// fakeServer is a running admin socket with fake accounts and a doctor that examines a faked machine.
 type fakeServer struct {
 	path     string
 	health   *ops.Health
@@ -213,6 +213,7 @@ type fakeServer struct {
 	admin    *ops.AdminServer
 	served   chan error
 	tlsReady atomic.Bool // the tls readiness check
+	machine  *fakeMachine
 }
 
 // startFakeServer serves the admin socket at path. With rejectPeers the peer-credential filter turns everyone
@@ -235,14 +236,21 @@ func startFakeServer(path string, rejectPeers bool) (*fakeServer, error) {
 	if rejectPeers {
 		listen.Allow = func(uint32) bool { return false }
 	}
-	ln, err := ops.ListenAdmin(context.Background(), listen)
+	machine, err := newFakeMachine()
 	if err != nil {
 		return nil, err
 	}
+	ln, err := ops.ListenAdmin(context.Background(), listen)
+	if err != nil {
+		machine.remove()
+		return nil, err
+	}
+	f.machine = machine
 	f.logLevel = ops.NewLogLevel(f.level, log)
 	f.admin = ops.NewAdminServer(ops.AdminOptions{
 		Health: f.health, Accounts: f.accounts, LogLevel: f.logLevel, Logger: log,
 		Status: func(context.Context) (api.ServerStatus, error) { return fakeStatus(), nil },
+		Doctor: ops.NewDoctor(ops.DoctorOptions{Env: machine.serverEnv, Logger: log}),
 	})
 	go func() { f.served <- f.admin.Serve(ln) }()
 	return f, nil
@@ -254,6 +262,7 @@ func (f *fakeServer) stop() error {
 	defer cancel()
 	err := f.admin.Shutdown(ctx)
 	f.logLevel.Close()
+	f.machine.remove()
 	return errors.Join(err, <-f.served)
 }
 
@@ -367,6 +376,8 @@ func (sf *scriptFake) close() {
 //	fakeserver set tls ready|pending     the tls readiness check
 //	fakeserver set registration open|closed
 //	fakeserver set shutting-down         the graceful shutdown has begun
+//	fakeserver set doctor ok|warn|fail   what doctor finds on the server's machine: nothing, socket buffer limits
+//	                                     that are too low, or a certificate that could not be had
 //	fakeserver after DUR start|set …     the same, DUR from now, while the script goes on
 //	fakeserver show level|invites|links  print the log level, what invite create sent, or the setup links minted
 //	fakeserver wait level NAME           wait until the log level is NAME
@@ -481,6 +492,8 @@ func (sf *scriptFake) do(args []string, stdout io.Writer) error {
 		srv.accounts.mu.Unlock()
 	case "set shutting-down":
 		srv.health.SetShuttingDown()
+	case "set doctor ok", "set doctor warn", "set doctor fail":
+		srv.machine.set(arg(2))
 	case "show level":
 		_, _ = fmt.Fprintln(stdout, strings.ToLower(srv.level.Level().String()))
 	case "show invites":

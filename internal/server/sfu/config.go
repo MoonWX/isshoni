@@ -55,8 +55,13 @@ const (
 	maxSharesPerParticipant = 4   // sfu.too_many_shares; the hub enforces 4 per user and the room soft limit first
 	maxSubscriptions        = 256 // per Conn: sfu.too_many_subscriptions
 	maxSubscriptionsPerCall = 64  // items per UpdateSubscriptions: sfu.too_many_subscriptions
-	maxRemoteCandidates     = 64  // per PC and gen, buffered or applied: the first 64 are kept
+	maxRemoteCandidates     = 64  // per PC and gen, trickled or in an SDP: the first 64 are kept (candidateKey)
 	commandQueueLen         = 64  // signal calls waiting for a Conn's actor
+	// maxPCCreations is how many PeerConnections of one kind a client may make a Conn create within pcRateWindow:
+	// pub offers of a new gen, and every sub PC after the Conn's first that isn't a codec rebuild of the SFU's own
+	// (README S69): ResetPC, and the successor of a closed sub PC, whichever request builds it. One more is
+	// sfu.pc_rate_limited. The hub's own limits come first (01 §13: 6 new pub gens and 12 pc.restart a minute).
+	maxPCCreations = 10
 )
 
 // Timing (02 §5.3–5.4, §6.1).
@@ -66,6 +71,40 @@ const (
 	subOfferDebounce = 50 * time.Millisecond // changes within it share one sub offer (01 §9 rule 3)
 	closeTimeout     = time.Second           // SFU.Close gives the Conns this long to close their PCs
 )
+
+// PeerConnection recovery (02 §5.3, §12). The SFU keeps each one in a field that tests shorten (timings); none
+// changes once the SFU has a Conn.
+const (
+	// handshakeTimeout is how long a new PeerConnection has to get connected (ICE and DTLS), from the moment the
+	// client can start: the pub PC's first answer, the first answer to a sub PC's offer. One that misses it is closed
+	// and reported failed with ReasonHandshakeTimeout. An ICE restart has no such timer: the client rebuilds after
+	// 15 s (01 §10.4).
+	handshakeTimeout = 10 * time.Second
+	// pcGrace is how long a failed PeerConnection is kept for an ICE restart or a rebuild before it is closed
+	// (ReasonGraceExpired).
+	pcGrace = 30 * time.Second
+	// offerResendInterval: a sub offer without an answer is sent again this often, with the same gen and neg.
+	offerResendInterval = 15 * time.Second
+	// iceRestartSpacing: a sub ICE restart whose offer went out less than this long ago, with ICE neither connected
+	// nor failed since, is still under way, and another request for one starts none (02 §5.3, 01 §10.4).
+	iceRestartSpacing = 5 * time.Second
+	// pcRateWindow is the window of maxPCCreations.
+	pcRateWindow = time.Minute
+	// stalledAfter: a live share whose pub PC hasn't been connected for this long is stalled (02 §5.3, 01 §13).
+	stalledAfter = 2 * time.Second
+)
+
+// timings are the durations above as one SFU uses them.
+type timings struct {
+	handshake, grace, offerResend, iceRestart, pcWindow, stalled time.Duration
+}
+
+func defaultTimings() timings {
+	return timings{
+		handshake: handshakeTimeout, grace: pcGrace, offerResend: offerResendInterval, iceRestart: iceRestartSpacing,
+		pcWindow: pcRateWindow, stalled: stalledAfter,
+	}
+}
 
 // The media path (02 §5.4, §9).
 const (

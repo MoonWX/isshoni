@@ -1227,8 +1227,222 @@ func FuzzFilterSDP(f *testing.F) {
 			if again, n2, err := filter.filterSDP(out); err != nil || n2 != 0 || again != out {
 				t.Fatalf("filtering twice changed the SDP: %d dropped, %v", n2, err)
 			}
+
+			// With a cap on the candidates (02 §12; two here, 64 for a Conn's PC): what comes out is sfu.bad_sdp, or
+			// holds only admitted candidates, at most two that Pion's ICE agent would keep apart (it keeps every remote
+			// candidate that equals none it has), and is left alone when it is limited again.
+			seen := map[candidateKey]bool{}
+			admit := func(k candidateKey) bool {
+				if !seen[k] && len(seen) < 2 {
+					seen[k] = true
+				}
+				return seen[k]
+			}
+			limited, _, err := filter.limitSDP(raw, admit)
+			if err != nil {
+				var e *Error
+				if !errors.As(err, &e) || e.Code != CodeBadSDP {
+					t.Fatalf("error %v is not sfu.bad_sdp", err)
+				}
+				continue
+			}
+			capped := &sdp.SessionDescription{}
+			if err := capped.UnmarshalString(limited); err != nil {
+				t.Fatalf("pion/sdp can't read the limited SDP: %v", err)
+			}
+			var left []ice.Candidate // as Pion's agent would hold them
+			attrs = slices.Clone(capped.Attributes)
+			for _, md := range capped.MediaDescriptions {
+				attrs = append(attrs, md.Attributes...)
+			}
+			for _, a := range attrs {
+				if !a.IsICECandidate() {
+					continue
+				}
+				key, r := filter.judge(a.Value)
+				if r != keepCandidate || !seen[key] {
+					t.Fatalf("a candidate that was dropped (%q) or not admitted is left in the limited SDP", r)
+				}
+				c, err := ice.UnmarshalCandidate(a.Value)
+				if err != nil {
+					t.Fatalf("a kept candidate doesn't parse: %v", err)
+				}
+				if !slices.ContainsFunc(left, c.Equal) {
+					left = append(left, c)
+				}
+			}
+			if len(left) > 2 {
+				t.Fatalf("Pion would hold %d of the candidates that are left, want at most 2", len(left))
+			}
+			if again, n2, err := filter.limitSDP(limited, admit); err != nil || n2 != 0 || again != limited {
+				t.Fatalf("limiting twice changed the SDP: %d dropped, %v", n2, err)
+			}
 		}
 	})
+}
+
+// TestCandidateKey: two candidates have one key exactly when they are equal to Pion (ice.Candidate.Equal), which is
+// when Pion's ICE agent keeps the second one as the first. The cap on remote candidates counts keys (02 §12).
+func TestCandidateKey(t *testing.T) {
+	values := []string{
+		"1 1 udp 2122260223 203.0.113.7 5000 typ host",
+		"9 2 udp 1 203.0.113.7 5000 typ host generation 3 ufrag abcd",                     // the same to Pion
+		"1 1 udp 2122260223 203.0.113.7 5001 typ host",                                    // another port
+		"1 1 udp 2122260223 203.0.113.8 5000 typ host",                                    // another address
+		"1 1 tcp 1518280447 203.0.113.7 5000 typ host tcptype active",                     // another transport
+		"1 1 tcp 1518280447 203.0.113.7 5000 typ host tcptype passive",                    // another TCP type
+		"1 1 udp 1686052607 203.0.113.7 5000 typ srflx raddr 192.168.1.20 rport 54321",    // another type
+		"2 1 udp 1686052607 203.0.113.7 5000 typ srflx raddr 192.168.1.20 rport 54321",    // the same as the one before
+		"1 1 udp 1686052607 203.0.113.7 5000 typ srflx raddr 192.168.1.20 rport 54322",    // another related port
+		"1 1 udp 1686052607 203.0.113.7 5000 typ srflx raddr 192.168.1.21 rport 54321",    // another related address
+		"1 1 udp 1686052607 203.0.113.7 5000 typ srflx",                                   // no related address
+		"1 1 udp 1686052607 203.0.113.7 5000 typ prflx raddr 192.168.1.20 rport 54321",    // the other types with one: prflx
+		"1 1 udp 41885439 203.0.113.7 5000 typ relay raddr 192.168.1.20 rport 54321",      // and relay
+		"1 1 udp 2122260223 2001:db8::7 5000 typ host",                                    // IPv6
+		"1 1 udp 2122260223 2001:db8:0::7 5000 typ host",                                  // the same address, spelled anew
+		"1 1 udp 2122260223 2001:DB8::7 5000 typ host",                                    // and in capitals
+		"1 1 udp 2122260223 2001:db8::7%eth0 5000 typ host",                               // Pion drops the zone
+		"1 1 udp 2122260223 ::ffff:203.0.113.7 5000 typ host",                             // IPv4-mapped
+		"1 1 udp 1686052607 2001:db8::7 5000 typ srflx raddr 2001:db8::1 rport 54321",     // IPv6 with a related address
+		"1 1 udp 1686052607 2001:db8::7 5000 typ srflx raddr 2001:db8:0::1 rport 54321",   // the related address, spelled anew
+		"1 1 udp 1686052607 2001:db8::7 5000 typ srflx raddr 2001:db8::1 rport 54321 x y", // an extension more
+	}
+	filter := candidateFilter{}
+	type parsed struct {
+		value string
+		cand  ice.Candidate
+		key   candidateKey
+	}
+	var all []parsed
+	for _, v := range values {
+		c, err := ice.UnmarshalCandidate(v)
+		if err != nil {
+			t.Fatalf("%q: %v", v, err)
+		}
+		key, reason := filter.judge(v)
+		if reason != keepCandidate {
+			t.Fatalf("%q: dropped as %q", v, reason)
+		}
+		if key != keyOf(c) {
+			t.Errorf("%q: judge returns the key %+v, keyOf %+v", v, key, keyOf(c))
+		}
+		all = append(all, parsed{v, c, key})
+	}
+	same := 0
+	for i, a := range all {
+		for _, b := range all[i+1:] {
+			equal := a.cand.Equal(b.cand)
+			if equal {
+				same++
+			}
+			if (a.key == b.key) != equal {
+				t.Errorf("%q and %q: one key %v, equal to Pion %v", a.value, b.value, a.key == b.key, equal)
+			}
+		}
+	}
+	if same < 2 {
+		t.Errorf("only %d pairs of the candidates are equal to Pion: the table tests nothing of the keys that match", same)
+	}
+	// A trickled candidate has the key of the same candidate in an SDP.
+	trickled, reason := filter.judgeTrickled(webrtc.ICECandidateInit{Candidate: "candidate:" + values[6]})
+	if reason != keepCandidate || trickled != all[6].key {
+		t.Errorf("the trickled candidate has the key %+v (%q), want %+v", trickled, reason, all[6].key)
+	}
+}
+
+// FuzzCandidateKey: whatever two candidates a client sends, if the filter keeps both they have one key exactly when
+// they are equal to Pion. So the cap on remote candidates never counts fewer candidates than Pion's ICE agent keeps,
+// and never charges twice for one that Pion keeps once.
+func FuzzCandidateKey(f *testing.F) {
+	for _, pair := range [][2]string{
+		{"1 1 udp 2122260223 203.0.113.7 5000 typ host", "9 2 udp 1 203.0.113.7 5000 typ host generation 3"},
+		{"1 1 udp 2122260223 203.0.113.7 5000 typ host", "1 1 udp 1686052607 203.0.113.7 5000 typ srflx raddr 10.0.0.1 rport 1"},
+		{"1 1 udp 1 203.0.113.7 5000 typ srflx raddr 10.0.0.1 rport 1", "1 1 udp 1 203.0.113.7 5000 typ srflx raddr 10.0.0.1 rport 2"},
+		{"1 1 udp 1 203.0.113.7 5000 typ relay raddr 10.0.0.1 rport 1", "1 1 udp 1 203.0.113.7 5000 typ prflx raddr 10.0.0.1 rport 1"},
+		{"1 1 tcp 1 203.0.113.7 9 typ host tcptype passive", "1 1 tcp 1 203.0.113.7 9 typ host tcptype so"},
+		{"1 1 udp 1 2001:db8::7 5000 typ host", "1 1 UDP 1 2001:DB8:0::7%eth0 5000 typ host"},
+		{"1 1 udp 1 ::ffff:203.0.113.7 5000 typ host", "candidate:1 1 udp 1 203.0.113.7 5000 typ host"},
+	} {
+		f.Add(pair[0], pair[1])
+	}
+	f.Fuzz(func(t *testing.T, a, b string) {
+		filter := candidateFilter{loopback: true, private: true}
+		keyA, reasonA := filter.judge(a)
+		keyB, reasonB := filter.judge(b)
+		if reasonA != keepCandidate || reasonB != keepCandidate {
+			return
+		}
+		candA, err := ice.UnmarshalCandidate(a)
+		if err != nil {
+			t.Fatalf("kept, but Pion can't parse it: %v", err)
+		}
+		candB, err := ice.UnmarshalCandidate(b)
+		if err != nil {
+			t.Fatalf("kept, but Pion can't parse it: %v", err)
+		}
+		if equal := candA.Equal(candB); (keyA == keyB) != equal || equal != candB.Equal(candA) {
+			t.Fatalf("one key %v, equal to Pion %v (and the other way round %v):\n%+v\n%+v", keyA == keyB, equal,
+				candB.Equal(candA), keyA, keyB)
+		}
+	})
+}
+
+// TestLimitSDP: the candidates of a remote description count toward the cap on remote candidates like trickled ones
+// (02 §12). Past the cap they are dropped from the SDP; a candidate that was admitted before stays, however often it
+// comes. A candidate is what Pion keeps as one: another type or related address on an address that was admitted is
+// another candidate.
+func TestLimitSDP(t *testing.T) {
+	const head = "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n"
+	section := func(mid string, ports ...int) string {
+		s := "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:" + mid + "\r\n"
+		for i, port := range ports {
+			s += fmt.Sprintf("a=candidate:%d 1 udp 2122260223 203.0.113.7 %d typ host\r\n", i, port)
+		}
+		return s
+	}
+	filter := candidateFilter{}
+	var budget remoteCandidates
+	for port := range maxRemoteCandidates - 2 { // the trickled ones so far
+		key, reason := filter.judge(fmt.Sprintf("1 1 udp 2122260223 198.51.100.1 %d typ host", 1000+port))
+		if reason != keepCandidate || !budget.admit(key) {
+			t.Fatalf("trickled candidate %d: dropped as %q, or not admitted", port, reason)
+		}
+	}
+	// Two places are left. The first m-section repeats port 5000 and brings a loopback candidate, which the filter
+	// drops before it can count; the second m-section's port 5000 is the candidate already admitted. The last one is
+	// on that port too, but a candidate of its own to Pion: it is past the cap like any other.
+	const reflexive = "a=candidate:8 1 udp 1686052607 203.0.113.7 5000 typ srflx raddr 198.51.100.9 rport 9\r\n"
+	raw := head + section("0", 5000, 5000, 5001, 5002) + "a=candidate:9 1 udp 1 127.0.0.1 1 typ host\r\n" +
+		section("1", 5000, 5003) + reflexive
+	out, dropped, err := filter.limitSDP(raw, budget.admit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := head + section("0", 5000, 5000, 5001) + section("1", 5000)
+	if dropped != 4 || budget.count() != maxRemoteCandidates {
+		t.Errorf("dropped %d candidates with %d admitted, want 4 and %d", dropped, budget.count(), maxRemoteCandidates)
+	}
+	wantDesc, err := parseSDP(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBytes, err := wantDesc.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != string(wantBytes) {
+		t.Errorf("limited SDP:\n%s\nwant:\n%s", out, wantBytes)
+	}
+	// The same description again (a re-offer): its candidates are known, and nothing more is dropped than before.
+	again, dropped, err := filter.limitSDP(raw, budget.admit)
+	if err != nil || dropped != 4 || again != out {
+		t.Errorf("the same SDP again: %d dropped, %v, the same result %v", dropped, err, again == out)
+	}
+	// Without a cap it is filterSDP.
+	plain, dropped, err := filter.limitSDP(raw, nil)
+	if viaFilter, n, _ := filter.filterSDP(raw); err != nil || dropped != 1 || plain != viaFilter || n != 1 {
+		t.Errorf("without a cap: %d dropped, %v; filterSDP dropped %d, the same result %v", dropped, err, n, plain == viaFilter)
+	}
 }
 
 // TestCandidateFilterTrickled: a trickled candidate is read the way Pion's AddICECandidate reads it.

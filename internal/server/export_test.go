@@ -6,6 +6,7 @@ import (
 
 	"github.com/MoonWX/isshoni/internal/server/netx"
 	"github.com/MoonWX/isshoni/internal/server/ops"
+	"github.com/MoonWX/isshoni/internal/server/sfu"
 	"github.com/MoonWX/isshoni/internal/server/tlsmgr"
 )
 
@@ -18,6 +19,39 @@ func (s *Server) SetDrainingHook(fn func()) {
 	defer s.life.Unlock()
 	s.hookDraining = fn
 }
+
+// SetShutdownStepHook makes Shutdown call fn right before it stops each component, with the component's name:
+// "signaling", "sfu", "transport", "http", "tls", "admin socket", "store" (04 §6.4).
+func (s *Server) SetShutdownStepHook(fn func(step string)) {
+	s.life.Lock()
+	defer s.life.Unlock()
+	s.hookStep = fn
+}
+
+// Media returns the running server's SFU.
+func (s *Server) Media() *sfu.SFU {
+	s.life.Lock()
+	defer s.life.Unlock()
+	return s.media
+}
+
+// Transport returns the running server's ICE Transport.
+func (s *Server) Transport() *netx.Transport {
+	s.life.Lock()
+	defer s.life.Unlock()
+	return s.transport
+}
+
+// Doctor returns the running server's doctor: the one behind the admin socket, which also makes the server's own
+// runs.
+func (s *Server) Doctor() *ops.Doctor {
+	s.life.Lock()
+	defer s.life.Unlock()
+	return s.doctor
+}
+
+// RestartAsked is closed once the server wants a restart of its own, which Run then makes.
+func (s *Server) RestartAsked() <-chan struct{} { return s.restartAsked }
 
 // Health returns the running server's health, so a test can add a failing check.
 func (s *Server) Health() *ops.Health {

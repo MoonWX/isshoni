@@ -525,15 +525,17 @@ func TestRelayRoles(t *testing.T) {
 	})
 }
 
-// An agent.send that is not valid gets bad_request with the field (01 §8.14, §12.1), and nothing is relayed.
+// An agent.send that is not valid gets bad_request with the field (01 §8.14, §12.1), and nothing is relayed. A
+// payload of null is no payload: it is refused like a missing one, to a role or to a connection, so a target never
+// gets an agent.recv with a null for its payload (01 §5).
 func TestRelayBadRequest(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		e := newEnv(t)
 		defer e.close()
 		cookie, _ := e.user(false)
-		page, _ := e.relayConn(cookie, protocol.RoleFull)
+		page, pageID := e.relayConn(cookie, protocol.RoleFull)
 		agent, agentID := e.relayConn(cookie, protocol.RoleAgent)
-		for _, tc := range []struct{ data, field, reason string }{
+		cases := []struct{ data, field, reason string }{
 			{`{"kind":"share.request","payload":{}}`, "to", "required"},
 			{`{"to":"` + agentID + `","toRole":"agent","kind":"share.request","payload":{}}`, "toRole", "invalid"},
 			{`{"toRole":"robot","kind":"share.request","payload":{}}`, "toRole", "invalid"},
@@ -542,24 +544,54 @@ func TestRelayBadRequest(t *testing.T) {
 			{`{"toRole":"agent","kind":"Share.Request","payload":{}}`, "kind", "invalid"},
 			{`{"toRole":"agent","kind":"` + strings.Repeat("a", 33) + `","payload":{}}`, "kind", "too_long"},
 			{`{"toRole":"agent","kind":"share.request"}`, "payload", "required"},
-		} {
+			{`{"to":"` + agentID + `","kind":"share.request"}`, "payload", "required"},
+			{`{"toRole":"agent","kind":"share.request","payload":null}`, "payload", "required"},
+			{`{"to":"` + agentID + `","kind":"share.request","payload":null}`, "payload", "required"},
+			{`{"toRole":"agent","kind":"share.request","payload" :` + "\n\t" + `null }`, "payload", "required"},
+			// The last of two keys is the message's (encoding/json), so this one has no payload either.
+			{`{"toRole":"agent","kind":"share.request","payload":{"preset":"game"},"payload":null}`, "payload", "required"},
+		}
+		for _, tc := range cases {
 			id := page.NextID()
 			if err := page.SendRaw([]byte(`{"type":"agent.send","id":"` + id + `","data":` + tc.data + `}`)); err != nil {
 				t.Fatal(err)
 			}
 			pe, re := expectError(t, page, protocol.ErrorCodeBadRequest, protocol.ErrorScopeRequest)
-			if re != id || pe.Params["field"] != tc.field || pe.Params["reason"] != tc.reason {
-				t.Errorf("%s: re %q (want %q), params %v; want field %s, reason %s", tc.data, re, id, pe.Params,
-					tc.field, tc.reason)
+			if re != id || pe.Params["field"] != tc.field || pe.Params["reason"] != tc.reason || pe.Retryable {
+				t.Errorf("%s: re %q (want %q), retryable %v, params %v; want field %s, reason %s", tc.data, re, id,
+					pe.Retryable, pe.Params, tc.field, tc.reason)
 			}
+			time.Sleep(time.Second) // a refused message costs a token, too: stay under the 10 per second
+		}
+		nothingFor(t, page, agent)
+		// Nothing went to a target, and none of them counted as a relayed message.
+		if got := e.metric("isshoni_ws_messages_total", "type", "agent.recv", "dir", "out"); got > 0 {
+			t.Errorf("isshoni_ws_messages_total{type=agent.recv,dir=out} = %v, want none", got)
+		}
+		if n := e.logs.count("msg=relay"); n != 0 {
+			t.Errorf("%d relay log lines, want none:\n%s", n, e.logs)
+		}
+		if got := e.metric("isshoni_ws_errors_total", "code", string(protocol.ErrorCodeBadRequest)); got != float64(len(cases)) {
+			t.Errorf("errors sent (bad_request) %v, want %d", got, len(cases))
+		}
+
+		// The relay still works for this connection, and a null inside a payload is the sender's business: it goes
+		// through like the rest of it.
+		const inside = `{"preset":null,"list":[null]}`
+		if n := relayed(t, page, protocol.AgentSend{ToRole: protocol.RoleAgent, Kind: "share.request",
+			Payload: json.RawMessage(inside)}); n != 1 {
+			t.Errorf("delivered %d, want 1", n)
+		}
+		if p := expectRecv(t, agent, pageID, "share.request"); string(p) != inside {
+			t.Errorf("payload %s, want %s", p, inside)
 		}
 		nothingFor(t, page, agent)
 	})
 }
 
-// The payload is opaque to the hub (01 §8.14): any JSON value goes through as it came in, whatever is in it, but
-// for the white space between its tokens, and it is never logged (01 §17). The characters that encoding/json escapes
-// for HTML are not escaped: a target is sent no more bytes than the sender sent.
+// The payload is opaque to the hub (01 §8.14): any JSON value but null (TestRelayBadRequest) goes through as it came
+// in, whatever is in it, but for the white space between its tokens, and it is never logged (01 §17). The characters
+// that encoding/json escapes for HTML are not escaped: a target is sent no more bytes than the sender sent.
 func TestRelayPayloadOpaque(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		e := newEnv(t)

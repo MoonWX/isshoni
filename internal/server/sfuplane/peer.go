@@ -314,6 +314,10 @@ func (p *peer) SendEvent(ev sfu.Event) {
 	case sfu.PCStateEvent:
 		// The client drives every other recovery itself (01 §10.4): a failed pub PC, or one that missed its handshake,
 		// is the one state the server acts on, by asking for a new pub PC. Sub PC states send nothing.
+		//
+		// Every failed pub PC is passed on, whatever it carried. The server asks only for a pub PC that a share needs
+		// (01 §9 rule 10), and which shares a connection has is the hub's to say, not the adapter's: its sink drops
+		// the request of a connection that publishes none (TestPubPCFailed).
 		if ev.PC == sfu.PCPub && ev.State == webrtc.PeerConnectionStateFailed.String() {
 			p.sink.RestartRequest(protocol.PCRestart{
 				PC: protocol.PCKindPub, Gen: ev.Gen,

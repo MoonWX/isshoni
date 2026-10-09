@@ -251,9 +251,12 @@ func (s *SFU) Snapshot() Snapshot {
 }
 
 // Metrics returns the counters and gauges of 02 §13 with every label value present. Only the Conn and share gauges
-// count so far; README S79 fills in the rest from what the Layers and DownTracks count.
+// and the handshake timeouts count so far; README S79 fills in the rest from what the Layers and DownTracks count.
 func (s *SFU) Metrics() Metrics {
 	m := newMetrics()
+	for _, kind := range []PCKind{PCPub, PCSub} {
+		m.HandshakeTimeouts[kind.String()] = s.handshakeTimeouts[kind].Load()
+	}
 	s.mu.Lock()
 	for _, c := range s.conns {
 		m.Conns[c.role.String()]++

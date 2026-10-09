@@ -342,6 +342,9 @@ Why these settings:
 - **`ConfigurationDirectory` keeps the default mode 0755**: the config file itself is 0640 root:isshoni.
 - **Target score**: `systemd-analyze security isshoni` should report an exposure of 2.5 or less. Slice S5 records the
   real number, and CI fails if a change raises it by more than 0.2.
+  **Recorded: 1.7** (README S62, 2026-10-09), the same on systemd 249, 252, 255, 257 and 259 (Ubuntu 22.04 to
+  Fedora 44), so V6 (§11.2) fails above 1.9. `deploy/systemd/README.md` has the table per distro and the reason
+  for each of the 13 lines the report still marks.
 
 ### 4.6 UDP buffers: `deploy/sysctl/60-isshoni.conf`
 
@@ -895,7 +898,7 @@ actionlint 1.<latest>
 
 - `<latest>` means: pin the exact latest patch when slice S1 lands. Versions are bumped by hand, monthly, in one PR;
   Dependabot can't read `.tool-versions`.
-- `go.mod` has `go 1.26.0` and `toolchain go1.27.1`, the `.tool-versions` patch (the plan: language version 1.26,
+- `go.mod` has `go 1.26.0` and `toolchain go1.27.2`, the `.tool-versions` patch (the plan: language version 1.26,
   newest toolchain). The go line carries a patch because `golang.org/x/text`, `golang.org/x/crypto` and
   `modernc.org/sqlite` require `go 1.26.0`, so `go get` and `go mod tidy` write it that way; the language version is
   still 1.26. `tools/go.mod` has the same two lines. CI reads the version from `go.mod`, not from `.tool-versions`,

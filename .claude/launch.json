@@ -2,6 +2,15 @@
   "version": "0.0.1",
   "configurations": [
     {
+      "name": "isshoni-dev",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": [
+        "-c",
+        "CGO_ENABLED=0 exec .bin/task dev"
+      ],
+      "port": 5173
+    },
+    {
       "name": "s4-sfu",
       "runtimeExecutable": "go",
       "runtimeArgs": [

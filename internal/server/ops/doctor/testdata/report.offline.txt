@@ -1,0 +1,21 @@
+server not running · 2026-09-29 20:15 UTC
+[ ok ] config        defaults and flags
+[ ok ] data_dir      /var/lib/isshoni (0700, 37.2 GB free)
+[ ok ] secrets       /var/lib/isshoni/secrets.json (0600)
+[info] schema        no database yet at /var/lib/isshoni/isshoni.db; isshoni creates it at its first start
+[ ok ] public_ip     203.0.113.7 (on interface eth0, confirmed by STUN), 2001:db8::7
+[ ok ] dns           no domain: the site is this server's IP address
+[skip] tls           not checked: isshoni is not running
+[ ok ] clock         synchronized, within 1 second of acme-v02.api.letsencrypt.org
+[ ok ] udp_buffers   net.core.rmem_max is 8388608, net.core.wmem_max is 8388608
+[info] ports         443/tcp, 80/tcp, 7882/udp and 7882/tcp are free (local check only)
+       This only checks this machine. The browser connection test checks from outside.
+[info] firewall_hint Hetzner: Cloud Console → Firewalls → allow TCP 80, 443, 7882 and UDP 7882
+       https://moonwx.github.io/isshoni/install/vps#hetzner
+[ ok ] container     not in a container
+[ ok ] lan_privacy   not a macOS host
+[skip] transfer      not checked: isshoni is not running
+[skip] release       not checked: isshoni is not running
+[info] nofile        open-file limit 65536 (this shell's; the service gets its own from its unit or container)
+[info] bandwidth     5 people, 2 sharing: ~41.5 Mbps egress (~44 on the wire), ~39 GB per 2-hour session
+9 ok · 0 warn · 0 fail · 3 skipped

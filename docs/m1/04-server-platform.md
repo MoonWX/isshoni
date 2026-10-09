@@ -164,7 +164,7 @@ Conventions:
 | 4 | Server not reachable on the admin socket: not running or wrong path, or permission denied, which prints its own message: "Permission denied on /run/isshoni/admin.sock: run it with sudo (sudo isshoni …)" (§12.1) |
 | 5 | `doctor`: at least one `fail` (with `--strict`, also any `warn`) |
 | 7 | Refused: precondition not met (an admin already exists: `setup_unavailable`, backup is newer than this binary, `--offline` while the server runs or holds the data-directory lock, running as the wrong user, `config init` target exists) |
-| 75 | `serve` on a platform without re-exec (Windows): "restart required" after a restore |
+| 75 | `serve` on a platform without re-exec (Windows): "restart required" after a restore. Until README S65 re-execs, on every platform and for every restart the server asks for itself (§6.5): after a restore or `rotate-secrets`, and when a server that started without a public address has found one (§6.2). systemd and Docker restart a process that exits 75 |
 | 130 | Interrupted (SIGINT) |
 
 **Exception, `healthcheck`**: exits only **0** (healthy) or **1** (unhealthy, unreachable, or any error), because
@@ -833,13 +833,30 @@ goroutine and does not wait for it: its own request would hold up the HTTP step.
 
 | Check | Owner | Ready when |
 |---|---|---|
-| `db` | 03 | `db.Ping` succeeds |
+| `db` | 03 | `db.Ping` succeeds (a `SELECT 1` on the writer and on a reader) within 1 s; the answer is kept for 1 s (below) |
 | `tls` | tlsmgr | A valid certificate for the site name is loaded (`off`: always) |
 | `media` | netx + 02 | ≥ 1 UDP socket bound (or UDP disabled and a TCP mux up) and `SFU.Ready()` |
 | `signal` | 01 | `Hub.Ready()` |
 | `public_ip` | netx | only where the site is the server's address (`ip` mode, and `manual` mode without a `domain`): a public address is known |
 
 Liveness is false after shutdown began. Endpoints: §11.1.
+
+**The checks as the wiring registers them** (README S54). `tls` and `public_ip` are registered by `Start` (S44),
+`db` and `signal` by `wire` with their components, and `media` comes with the SFU (README S59). A server without
+a site (below) has no hub, so it has no `signal` check; its `db` check is there all the same. `signal` says
+"signaling is shutting down" once `Hub.Ready()` is false.
+
+**The `db` check keeps its answer for 1 s** (README S54; `dbCheck` in `wire.go`). `/readyz` is public, and a ping
+takes the store's one writer connection, so a check that pinged for every request would let anyone keep the writer
+busy. However many requests ask, the database sees at most one ping per second:
+- A ping runs under a 1 s timeout, on a context that ends with the server, never with the request that asked.
+- Callers that arrive while a ping runs wait for its answer and share it.
+- The second counts **from the answer**, not from the question. A ping that used up its whole timeout would
+  otherwise leave an answer that is stale the moment it arrives, and every caller that had waited for it would
+  send a ping of its own, one after the other (`TestDBCheckBehindASlowPing`: eight callers, one ping).
+- The clock is the wall clock, not `Deps.Now`: how old an answer is has nothing to do with what time the accounts
+  think it is. A failed ping reads "the database does not answer: …" in the checks, and is asked again a second
+  later.
 
 **A server whose site is its address and that finds none starts, and is not ready** (as README S44 built it;
 kept, decided after group 5). The site is the public address in ip mode and in manual mode without a `domain`
@@ -869,15 +886,32 @@ the ICE rewrite rules are made once, at startup (§7.4's rationale for "restart 
 restart with an address to find: `public_ip` set to the address (the fix every message names), `domain` set, or
 simply `sudo systemctl restart isshoni` once the network is up.
 
-**Nothing restarts such a server by itself.** systemd's `Restart=on-failure` and Docker's restart policy act on a
+**Nothing outside restarts such a server.** systemd's `Restart=on-failure` and Docker's restart policy act on a
 process that ended, not on one that runs and is not ready, and Docker's `HEALTHCHECK` is liveness, which passes.
-So a cause that was gone a minute after boot still leaves the server not ready until the operator restarts it.
-What staying up gives is a server that says why, in every place of the table above. The periodic detection of
-§7.4 does not change this. It is not wired yet after S44, whose `Start` detects once and only in the TLS modes;
-it comes with the wiring (README S54). From then on it looks again every 10 minutes and reports an address that
-shows up the way it reports any change: a warning in the log that says to restart isshoni to apply it (the
-dashboard's `public_ip.changed` alert is the same event, but nobody can open the dashboard of a server without a
-site).
+What staying up gives is a server that says why, in every place of the table above.
+
+**So it restarts itself, once it finds an address** (decided after group 6; README S59 implements it). As groups
+5 and 6 left it, a cause that was gone a minute after boot still left the server not ready until a person
+restarted it: the periodic detection of §7.4, wired by README S54, looks again every 10 minutes, but it reported
+an address that showed up the way it reports any change, with a warning that says to restart isshoni. On a
+server whose only problem is that it started too early, that message asks a person to do what the server can do.
+- **The rule.** An ip-mode server that started not ready **because no public address was found** asks for its own
+  restart as soon as the periodic detection finds one: a full graceful shutdown (§6.4), after which `Run` returns
+  `ErrRestartRequested`, the result of a restart after a restore (§6.5). `cmd/isshoni` exits 75 until README S65
+  re-execs. Either way a new process starts, detects the address at startup, takes its site and orders its
+  certificate: systemd's `Restart=on-failure` and Docker's restart policy restart a process that exited 75, and
+  the re-exec restarts in place. The server recovers without a person, at the detection's next look.
+- **Only that state.** In every other state a changed address is still only logged, "Public IPv4 address changed
+  from A to B; restart isshoni to apply" (§7.4): a server that has a site and friends connected is not restarted
+  under them because an address moved, and the operator decides when. A server that is not ready has nobody to
+  disconnect.
+- **No loop.** The restart happens only when an address was found, never because one is missing. A new process
+  that again finds none at startup starts not ready as before and waits for the next look.
+- What the operator sees is the table above until then, and afterwards a log line that says why the server
+  restarts, followed by the ordinary start. Setting `public_ip` or `domain` and restarting by hand stays the fix
+  that every message names: it does not depend on the detection.
+- The decision names ip mode. Manual mode without a `domain` is the other state without a site; whether it
+  restarts the same way is README S59's to settle when it builds this, and its PR says which.
 
 ### 6.3 Refusing to start
 
@@ -904,8 +938,9 @@ Reasons (codes, used in logs and doctor): `schema_newer`, `migration_failed`, `d
 **Not refusals** (S44): what the server lacks from outside never stops the start. A certificate that can't be had
 yet, in any mode, and a public address that the detection didn't find leave a running server that is not ready
 (§6.2, §8.2), where the admin socket and doctor can say why. The certificate then arrives by itself once its
-cause is gone (certmagic retries, manual files are polled); the address takes the restart of §6.2. Exit 78 is for
-what only the operator can change on this machine.
+cause is gone (certmagic retries, manual files are polled); the address takes a restart, which an ip-mode server
+asks for itself once its periodic detection finds one (§6.2, decided after group 6). Exit 78 is for what only the
+operator can change on this machine.
 
 ### 6.4 Graceful shutdown: what clients see
 
@@ -920,11 +955,33 @@ and for a restore or `rotate-secrets` restart:
 | 4. `SFU.Close()` closes all PeerConnections (concurrently; 02 guarantees it returns within 1 s); then `Transport.Close()` closes the muxes | ≤ 1 s | |
 | 5. `http.Server.Shutdown` on all servers, then `PortMux.Close()` (closes the raw :443 listener and both sub-listeners; the ICE sub-listener may already be closed by `Transport.Close`, which is harmless) | ≤ 5 s | Idle keep-alives close |
 | 6. Stop the TLS manager (`tlsmgr.Manager.Shutdown`, §8.2: no order, renewal or reload writes the certificate storage after it; S44), flush transfer counters, drain the push queue (≤ 2 s), close the admin socket, close the store (WAL checkpoint) | ≤ 2 s | |
-| 7. Exit 0 (or re-exec, §6.5) | total ≤ `shutdown_timeout` (10 s) | |
+| 7. Exit 0 (or re-exec, §6.5) | total ≤ `shutdown_timeout` (10 s); a forced shutdown up to 1 s more for the store's close (below) | |
 
 A step that runs out of its budget closes by force what it still has (a request that won't finish, say), and the
 shutdown goes on: everything is released all the same. The server logs a warning, `Shutdown` returns an error
 wrapping `ErrShutdownForced`, and after a stop the process still exits 0.
+
+**Step 6 as the wiring built it** (README S54; `Server.shutdown`). The budgets of steps 3 to 6 are 2 + 1 + 5 + 2 s,
+the default `shutdown_timeout`, which bounds the whole shutdown whatever the steps would like. Two things in step
+6 are more exact than the table:
+- **The admin socket closes in step 6, not earlier.** The operator's CLI can ask the server until then: its health
+  and ready answers have said "shutting down" since step 1, `status` still answers, and every other request gets
+  503 `server_shutdown` (§12.2). The order inside the step is: the TLS manager, now that nothing handshakes any
+  more; then the server's own background work is cancelled (the janitor, the periodic look at the public addresses,
+  the reads behind hooks without a context); then the admin socket's server; then the runtime log level's timer.
+  Together they have the step's 2 s.
+- **The store's close gets one more second of its own**, outside those 2 s and outside `shutdown_timeout`. The
+  close waits for the background goroutines to end and then checkpoints the WAL, which is what makes the `.db`
+  file complete by itself. In a shutdown that had the time this is the end of step 6 and takes milliseconds. In
+  one that ran out of time (a request that had to be cut off) it is the one thing still waited for, for at most
+  that second: giving up on the checkpoint too would leave the next start to recover it. So a forced shutdown can
+  take `shutdown_timeout` + 1 s; systemd's `TimeoutStopSec=20` and compose's `stop_grace_period: 20s` leave room.
+  If the close hangs all the same (a disk that does not answer), the shutdown returns after that second and lets
+  it finish on its own; the step is then named in the `ErrShutdownForced` error.
+- Last of all the data-directory lock is released, so that the process that follows (a re-exec, the next start)
+  can take it.
+- A server without a site has no hub: step 3 is skipped. Step 4 is empty until the SFU is wired (README S59), and
+  "flush transfer counters" and "drain the push queue" join step 6 with README S85 and S71.
 
 A second SIGTERM/SIGINT exits immediately with code 1. 06 sets systemd `TimeoutStopSec=20` and compose
 `stop_grace_period: 20s`.
@@ -938,6 +995,10 @@ A second SIGTERM/SIGINT exits immediately with code 1. 06 sets systemd `TimeoutS
 - Restart after a restore or `rotate-secrets`: `Run` returns `ErrRestartRequested` after a full graceful shutdown;
   `cmd/isshoni` then calls `syscall.Exec(os.Args[0], os.Args, os.Environ())`. The PID stays the same, so systemd and
   Docker (PID 1) see no exit. On Windows (compile-only in M1) it exits 75 instead.
+- The same path serves the one restart the server decides on by itself (decided after group 6): an ip-mode server
+  that started without a public address and has found one (§6.2). Until the re-exec exists (README S65) every
+  such restart is exit 75, which systemd's `Restart=on-failure` and Docker's `restart: unless-stopped` answer with
+  a new process (06 §4.5, §6.2).
 
 ### 6.6 Wiring (`internal/server/wire.go`)
 
@@ -968,6 +1029,91 @@ The only place (with `cmd/isshoni` and `servertest`, §2) that imports 01's `sig
 | REST routes of `ops` and `push` | 03's `API.Handle` | each typed `ops`/`push` function is wrapped with `httpapi.DecodeJSON`/`WriteJSON`/`WriteError` and registered through `API.Handle` with the principal from `httpapi.PrincipalFrom` (§2): `POST /api/v1/conntest` (User), `GET /api/v1/admin/dashboard`, `GET\|POST /api/v1/admin/doctor`, `GET /api/v1/admin/bandwidth` (Admin) |
 | Admin socket handlers | 03's `auth.Service`, `store.DB` | 03 §12.6 table |
 | Metrics | `ops.Metrics.Registerer()` to 01; a `prometheus.Collector` over `SFU.Metrics()` | §11.2 |
+
+**What README S54 wired** (wiring v1: the store, the account service, the REST API, the hub and the admin socket;
+`wire.go`, with the server's view of its own network in `public.go`). The rows above that it built are as the
+table has them; these are the points the table leaves open, and what is still to come.
+
+- **Two steps of §6.1.** `openStore` is step 4: `store.Open`, then `pinPolicy`. `wire` is step 8: it builds
+  everything else and opens nothing; `Start` serves what it built.
+- **Policy pins.** A policy key pins its setting only when the operator set it (`cfg.IsSet`: flag, env or file);
+  a key that is not set stays the admin's to change. The settings are the only validation of those values: one
+  that `SettingsCache.Pin` refuses comes back as a `*config.ValidationError` with a `Problem` per key (its
+  source, 03's field code in the message, the key's help as the fix), on which `serve` exits 78 like on any
+  config error. The list of policy keys in `wire.go` is checked against the registry by a test, so a new policy
+  key can't be forgotten there.
+- **A server without a site** (§6.2) **has no accounts, no API and no hub**: each needs the public origin, and
+  the router answers 421 to everything but the health endpoints anyway. Its admin socket still answers `health`,
+  `ready`, `status` and `doctor`, so the operator sees the failing check `public_ip` and, from doctor, its fix; the
+  account commands (`setup-url`, `admin users`, `admin invite`) get an error answer, "this server's admin socket
+  has no accounts" (`TestServerWithoutASite`).
+- **`auth` before the hub, and each needs the other** (§6.1 step 8): the hub authenticates through `auth`, and
+  `auth` closes the hub's connections on a revocation. The `ConnCloser` adapter is made first and bound to the
+  hub once that exists; until then it closes nothing, which is right for the one thing that runs in between,
+  `auth.New`'s startup purge.
+- **One public origin.** `auth.Options.Origins` is `{Primary: Site.Origin, Public: [Site.Origin]}`: it builds the
+  setup, invite and reset links and is the only origin the REST CSRF check trusts. The hub's `PublicOrigin` is
+  the same one, with `AllowedOrigins = Site.ExtraOrigins` (none in M1).
+- **One client address.** `httpapi.ClientIP` goes to `auth.Options.ClientIP`, to `signal.Deps.ClientIP` and to
+  `Health.SetClientIP`, so trusted proxies count the same everywhere.
+- **The hub's config** is `signal.DefaultConfig()` with `PublicOrigin`, `ServerVersion`, `ResumeKey` = the
+  `resume` key of `secrets.json` (resume tokens die with a rotated key, §5.2) and `Limits.PreAuthPerIPPerMinute` =
+  `limits.ws_handshakes_per_ip_per_minute`.
+- **`Revalidate`** does more than the row says: after `Touch` it reads the user again, and a user who was deleted
+  since, or is not `active`, is `signal.ErrInvalid` too. Its result carries the user's current name and role, which
+  is how a rename or a role change made on the CLI reaches open connections (03 §7.7). A store error there is
+  transient like any other.
+- **`httpapi.Signal`.** `RoomPresence` counts the participants and shares of each room in `Hub.Snapshot()`.
+  `OnlineUserIDs` is every user with a connection in a room, a reconnecting one included: the snapshot is made of
+  rooms, and a web client is in one for as long as its tab is open.
+- **`ops.AdminAccounts`** (the admin socket's account commands, 03 §12.6) is an adapter over `auth.Service` that
+  acts as `store.CLIActor`, so every call follows the rules of the admin pages (the last-admin rule, the invite
+  limits) and is audited as `cli`. Errors are 03's `*api.Error` values, passed on unchanged. `invite create`
+  passes 0 for a value the operator left out, so 03's invite settings apply. A role change reaches the user's
+  open connections at the hub's next `Revalidate`; disabling closes them through `ConnCloser`.
+- **`/setup` answers 404 once an admin exists** (`RouterOptions.SPAStatus`, 03 §12.6): the hook asks
+  `auth.SetupAvailable` under a 2 s timeout, and keeps the answer "done" for good, since an admin account never
+  goes away again while the server runs (the last-admin rule). When the look fails the page is served, and its
+  own API calls say what is wrong.
+- **`GET /v1/status`** on the admin socket: the site, the listeners and the public addresses are copied when the
+  server has bound everything; the certificate, the live counts and the uptime are read at each call. The
+  advertised media addresses come with the SFU (README S59), transfer and the release check with README S85.
+- **The server's own background work** hangs on one context that the shutdown's step 6 cancels (§6.4): the admin
+  socket's `Serve`, 03's janitor (`auth.RunJanitor`), doctor's own runs (`ops.Doctor.Run`, below), the periodic
+  look at the public addresses (§7.4), and the reads behind hooks that have no context (the `db` check,
+  `SPAStatus`).
+- **Doctor in the server** (the group 7 integration, after README S60 built `ops.Doctor`; §13.1). `wire` builds
+  one `ops.Doctor` for every server, with or without a site, and it has three parts:
+  - `DoctorOptions.Env` returns, per run, the config as the server runs it (the HTTP ports as bound), the
+    server's status from the same function that answers `GET /v1/status` (`Env.Live`, which makes the run one
+    inside the server), the process's uid, `store.LatestSchemaVersion`, and `Deps.Host`, `Resolver`, `STUN` and
+    `Now`. `Env.TLSLastError` is the TLS manager's `Status.LastError`, taken only while its code is the one in
+    the status, so the text never belongs to another error than the code;
+  - `DoctorOptions.Meta` is `metaStore`, the `ops.MetaStore` over 03's meta table: `GetMeta` and `SetMeta` in
+    one short transaction each, and `store.ErrNotFound` read as `""`. `ops.Transfer` and `ops.ReleaseCheck` take
+    the same adapter when README S85 wires them;
+  - the Doctor is the admin socket's (`AdminOptions.Doctor`, so `isshoni doctor` reaches the running server), and
+    `Doctor.Run` is one of the server's background goroutines: it loads the last report from the meta table at
+    once and runs doctor 20 s after the start and then daily.
+
+  The REST routes (`GET|POST /api/v1/admin/doctor`, `GET /api/v1/admin/bandwidth`) and the dashboard's summary
+  and alert come with README S85, over this same Doctor. Until transfer and the release check are wired, a run
+  inside the server has `transfer` as `skip` (`skip.not_reported`) and `release` as `ok` with
+  `release.not_checked`. `TestDoctorOverTheAdminSocket` and `TestMetaStore` cover it. The restore command that
+  `serve` prints when it refuses a newer schema (§6.1 step 4) is `doctor.RestoreCommand`, the one doctor's
+  `schema` check prints, so there is one copy of it.
+- **Not wired yet**, each with a stand-in that needs no code elsewhere:
+
+  | What | Until | Meanwhile |
+  |---|---|---|
+  | The SFU: `sfu.Config`, `sfuplane`, the Transport, the `media` check, `SetLimits` on a settings change | README S59 | the hub's `MediaPlane` is the placeholder `noMedia` (01 §15.2): rooms and presence work, `share.start` and `pc.*` get `feature_disabled`; the multiplexer's ICE side has no reader |
+  | Push: `signal.Deps.Push`, `auth.Options.Alerts`, `httpapi.Deps.Push` | README S71 | the push endpoints answer `push_unavailable` and `/info` has no `push` object, as with `push.enabled = false`; admin alerts are only logged |
+  | `ops.Metrics` as the router's observer and the hub's registerer; the REST routes of `ops` | README S80, S85 | `signal.Deps.Metrics` is nil; with `metrics.enabled` the server logs a warning that nothing listens on `metrics.listen` |
+  | Transfer accounting and the release check in `serve` (built in README S55, §11.3, §11.5) | README S85 | nothing counts or checks |
+
+- The tests are `wire_test.go` (each adapter against a fake, and the ones over 03 once more against the real
+  service), `wiring_test.go` (in `servertest`: log in over REST, `/ws` joins Lounge, a logout closes that
+  session's socket with `session_revoked`) and `wiring_store_test.go`.
 
 ## 7. Networking (`internal/server/netx`)
 
@@ -1218,9 +1364,34 @@ addresses rarely change.
 no address then either, with the NAT kind `cgnat_likely`; S44, kept after group 5): `DetectPublicAddrs` returns
 what it found, and an error next to it when a step failed; neither stops the start. In ip mode, and in manual mode
 without a domain, the server then starts without a site and is not ready; §6.2 lists what the operator sees and
-why it is not an exit 78. Once the periodic detection is wired (README S54; §6.2), it goes on for such a server
-as for any other. An address it finds later is a change like "A to B": logged, and applied only by a restart.
-The server does not take it by itself, and nothing restarts it (§6.2).
+why it is not an exit 78. The periodic detection (below) goes on for such a server as for any other. An address
+it finds later can't be taken by the running process, so it takes a restart, and **an ip-mode server that started
+this way asks for that restart itself** when the detection finds an address (decided after group 6; README S59
+implements it; §6.2). That is the one case in which the detection does more than log.
+
+**The periodic detection as README S54 wired it** (`internal/server/public.go`).
+- **Which servers look again.** One that detected at startup: every TLS mode. In off mode `Start` detects nothing
+  until the SFU needs the media addresses (README S59), and nothing looks again until then.
+- **Every 10 minutes**, on the server's background context, until the shutdown's step 6 (§6.4).
+- **No STUN after a literal.** While `public_ip` is `auto` (or unset), the later looks ask the STUN servers as the
+  first one did. With `public_ip` set to a literal, of either family, or to `off`, they only read the machine's
+  interfaces and send nothing: the address can't change, and the operator who set it gets the one NAT check at
+  startup and no packets to third parties afterwards (the Privacy paragraph below).
+- **What counts as a change.** A look that fails changes nothing, and neither does one that finds no address
+  where there was one: the network is down for a moment, or a STUN server didn't answer, and the server keeps
+  what it has. A new address where there was none counts, and so does a different one. IPv4 and IPv6 are compared
+  apart.
+- **What a change does.** One WARN line per family from `netx`, "Public IPv4 address changed from 203.0.113.7 to
+  203.0.113.99; restart isshoni to apply" (`from` is `none` when there was no address), and the server keeps
+  serving with what it started with: the ICE rewrite rules, the site and, in ip mode, the certificate are fixed
+  for the process's life. The addresses as last seen are kept for whatever reports them later (the dashboard's
+  `public_ip.changed` alert, §11.4). The same change is reported once: the next look compares with what was seen
+  last.
+- The detection gets the same `CloudProvider` and `InContainer` as the Transport (`DetectOptions` has both fields,
+  filled from `netx.DetectCloudProvider` and the container detection of §5.1), so both agree on whether an address
+  that STUN sees and no interface holds is a 1:1 NAT or a home router's port forwarding (§7.5).
+- `transportOptions` in the same file fills `netx.TransportOptions` for README S59: IPv6 is off when
+  `network.ipv6` is false **or** `public_ipv6 = "off"`, whatever the interfaces have.
 
 Privacy: STUN contacts Cloudflare and Google at startup and every 10 minutes (one UDP packet each). Setting `public_ip`
 limits this to one NAT check at startup; `network.stun_servers = []` stops STUN entirely (set `public_ip` to a literal
@@ -1922,6 +2093,51 @@ registers an adapter over 02's `SFU.Metrics()` for the `isshoni_sfu_*` names (02
 counted); it adds no labels of its own. Its table test covers every 02 §13 name, including
 `isshoni_sfu_ingress_duplicates_total` (from `IngressDuplicates`). No per-user labels.
 
+**As README S55 built it** (`ops/metrics.go`; the wiring builds and serves it with README S85).
+
+```go
+package ops
+
+type MetricsOptions struct {
+	Health       *Health                    // required: isshoni_ready, and /healthz and /readyz on this listener
+	Transfer     *netx.TransferCounter      // nil counts nothing
+	PortMux      func() netx.PortMuxStats   // (*netx.PortMux).Stats; nil = no multiplexer (tls.mode = off)
+	CertNotAfter func() time.Time           // tlsmgr.Status().NotAfter; nil or a zero time = no certificate
+	PProf        bool                       // metrics.pprof
+	Logger       *slog.Logger
+}
+
+func NewMetrics(o MetricsOptions) *Metrics           // builds the registry; starts nothing
+func (m *Metrics) Registerer() prometheus.Registerer // for the components that own series
+func (m *Metrics) Gatherer() prometheus.Gatherer     // the read side, for tests and tools
+func (m *Metrics) ObserveRoute(pattern string, status int, bytes int64) // httpapi.RouteObserver (§9.2)
+func (m *Metrics) Handler() http.Handler             // what the listener serves
+func (m *Metrics) Serve(ln net.Listener) error       // on metrics.listen, until Shutdown
+func (m *Metrics) Shutdown(ctx context.Context) error // §6.4 step 5
+```
+
+- **The server always has a `Metrics`**, whether or not `metrics.enabled`: only the listener depends on the key.
+- **Which series `Metrics` owns**: the table's rows but `isshoni_push_sent_total`, which `push` registers through
+  `Registerer()` (its `Options.Metrics`, §14), plus the Go runtime and process collectors. The others come through
+  `Registerer()` as the paragraph above says. A name registered twice is the second caller's error.
+- **The values are read at every scrape**, from where they live (`Health`, `netx`, `tlsmgr`), so nothing has to
+  be kept in step. A source that is left out has its series at zero, so the set of series does not depend on the
+  configuration: without a multiplexer every `isshoni_portmux_conns_total{result}` is 0, and all six transfer
+  series (two directions, three paths) are always there.
+- **`isshoni_tls_cert_not_after_seconds` is absent while there is no certificate**, the one exception: an expiry
+  of 0 would look like a certificate that ran out in 1970.
+- **`isshoni_ready`** is 1 while every readiness check passes, 0 otherwise and during a shutdown.
+- **`isshoni_http_responses_total{route, class}`**: `route` is the route's `ServeMux` pattern, never the URL, so
+  the label has as many values as the server has routes. `class` is `2xx` to `5xx`, and **`1xx` for a WebSocket
+  upgrade** (101), which the table's list leaves out. The response's bytes are not counted here: web bytes are
+  counted at the socket (`isshoni_transfer_bytes_total{path="web"}`, §11.3).
+- **The listener** serves `GET /metrics`, `/healthz` and `/readyz` (as on the main listener; a client on this
+  machine also gets the checks, §11.1), `/debug/pprof/` only with `metrics.pprof`, and 404 for everything else. It
+  speaks HTTP/1.1 only and has no authentication, which is why it belongs on loopback (config warns otherwise).
+  At most 4 scrapes are answered at once; one more gets 503. A collector that fails during a scrape costs its own
+  series and a WARN line, not the scrape. There is no write timeout, because a CPU profile runs as long as its
+  request asks; on shutdown, requests in flight may finish until the step's context ends.
+
 ### 11.3 Transfer accounting and alerts
 
 - Bytes are counted at the socket layer: UDP mux sockets (`media_udp`), ICE-TCP connections (`media_tcp`), HTTPS and
@@ -1946,6 +2162,68 @@ type TransferCounter struct{ /* atomics */ }
 func (c *TransferCounter) Add(p Path, egress bool, n int)
 func (c *TransferCounter) Totals() map[Path]struct{ Egress, Ingress uint64 }
 ```
+
+**As README S55 built it** (`ops/transfer.go`; the wiring runs it with README S85).
+
+```go
+package ops
+
+type TransferStore interface { // 03's transfer_months; the wiring adapts AddTransfer and TransferMonth
+	AddTransfer(ctx context.Context, month string, egress, ingress int64, now time.Time) error
+	TransferMonth(ctx context.Context, month string) (egress, ingress int64, err error)
+}
+type MetaStore interface { // 03's meta table: "" and a nil error for a key that does not exist
+	Meta(ctx context.Context, key string) (string, error)
+	SetMeta(ctx context.Context, key, value string) error
+}
+type AdminAlerter interface{ AdminAlert(ctx context.Context, a AdminAlert) } // push.Service.AdminAlert; must not block
+
+type TransferOptions struct {
+	Counter *netx.TransferCounter // required
+	Store   TransferStore         // required
+	Meta    MetaStore             // nil: the alerted threshold is remembered in memory only
+	Policy  Policy                // nil: no limit, no alerts
+	Alerter AdminAlerter          // nil: the alert is only logged; the dashboard shows it either way
+	Now     func() time.Time
+	Logger  *slog.Logger
+}
+
+func NewTransfer(o TransferOptions) *Transfer
+func (t *Transfer) Run(ctx context.Context) error   // until ctx ends; then the last flush (≤ 2 s) and nil
+func (t *Transfer) Flush(ctx context.Context) error // now, for a caller that needs the store up to date (a backup)
+func (t *Transfer) Info() api.TransferInfo          // the dashboard's "transfer" object
+func (t *Transfer) Alerts() []api.Alert             // transfer.80 or transfer.100, or none
+```
+
+- **When it flushes.** Every 60 s, at shutdown, and **at the first instant of each month (UTC)**: that flush
+  stores everything counted until then in the month that ends, so a month's row holds the bytes counted before
+  it ended and the new month starts at zero. A crash loses at most 60 s of counts. `Run`'s context ends in step 6
+  of the shutdown, after the sockets have closed and before the store does (§6.4).
+- **While the store fails, the bytes stay counted** and the next flush tries again (a WARN line each time). A
+  flush at a month's end that the store refuses is remembered with the counter's reading at that moment, and
+  every later flush stores what is owed to that month before anything else, in order, so the bytes never move
+  into the new month. Several months can be owed. `Info` leaves the owed bytes out of the new month's total.
+- **`Info`**: the month's totals including the bytes not flushed yet, `alertGb`, the projection and the current
+  rate. The rate is the average over the last 5 s (the counter is sampled every second). The projection is `mtd ×
+  the month's length / the time elapsed`, with the elapsed time as a fraction of days, so it does not jump at
+  midnight; it is 0, "no projection", during the month's first three days. Before the month's row was read from
+  the store, the totals are only the bytes counted since the server started.
+- **The push alert, once per threshold and month.** After every flush the month's egress is compared with 80 % and
+  100 % of `Policy.TransferAlertGB()` (0: no alerts). A threshold that was not alerted this month yet raises the
+  admin alert `transfer_threshold` with the threshold as its target (`"80"` or `"100"`) and the actor `system`,
+  and a WARN line. A month that jumps past both gets the 100 % alert only. The threshold is written to the `meta`
+  key `ops.transfer_alert_sent` **before** the alert goes out, so a store that fails delays an alert but never
+  repeats one; while that key can't be read, no alert goes out, because it might be a repeat.
+- **The `meta` value** is the JSON string `"2026-09:80"`: the month and the highest threshold alerted in it.
+  `"2026-09:0"` is a month whose alerts were forgotten because the limit was raised: when the month is found below
+  a threshold it was alerted for, the limit went up (a month's egress only grows), so that threshold alerts again
+  when the month gets there. 80 % of a new limit is not alerted when the month is past it already at the first
+  check after the change. Nothing is forgotten while the month's row is unread and the totals only look low.
+- **The dashboard alert follows the numbers**, not the memory: `Alerts()` is `transfer.100` once the month's
+  egress has reached the limit, `transfer.80` from 80 % of it, none below or without a limit, so it goes away when
+  an admin raises the limit. Its `params` are `{month, alertGb}`.
+- **Severities** (`api.AlertSeverity`: `info`, `warn`, `error`): `transfer.80` is `warn`, `transfer.100` is
+  `error`. §11.5 has the release alerts.
 
 ### 11.4 Admin dashboard API
 
@@ -2030,6 +2308,9 @@ type Policy interface {
 - Admins see who watches what; this matches the plan's "no hidden viewers" rule.
 - Alert codes: `transfer.80`, `transfer.100`, `release.update`, `release.security_update`, `public_ip.changed`,
   `tls.renewal_failing`, `doctor.fail`, `dashboard.source_failed`.
+- Alert severities are `info`, `warn` and `error` (`api.AlertSeverity`). The four alerts that README S55 built
+  have theirs: `transfer.80` `warn`, `transfer.100` `error` (§11.3), `release.update` `info`,
+  `release.security_update` `warn` (§11.5). The other four get theirs with the dashboard (README S85).
 
 ### 11.5 Release check
 
@@ -2045,6 +2326,81 @@ type Policy interface {
   release template adds it) sets `security: true`.
 - The result is kept in memory and in 03's `meta` key `ops.release_check` (JSON), so the dashboard shows it after a
   restart. Failures log at debug and retry at the next tick.
+
+**As README S55 built it** (`ops/release.go`; the wiring runs it with README S85).
+
+```go
+package ops
+
+const DefaultReleasesURL = "https://api.github.com/repos/MoonWX/isshoni/releases" // updates.release_url's default
+const SecurityMarker = "<!-- isshoni:security -->"
+
+type ReleaseCheckOptions struct {
+	Policy  Policy       // required: asked before every request, and by Update and Alerts
+	URL     string       // updates.release_url (hidden; tests); "" = DefaultReleasesURL. per_page=20 is added
+	Version string       // "" = version.Version()
+	Meta    MetaStore    // nil: the result is kept in memory only
+	HTTP    *http.Client // server.Deps.ReleaseHTTP; nil = a client of the check's own
+	Now     func() time.Time
+	Logger  *slog.Logger
+}
+
+func NewReleaseCheck(o ReleaseCheckOptions) (*ReleaseCheck, error) // an error only for a URL that is no http(s) URL
+func (r *ReleaseCheck) Run(ctx context.Context) error // loads the last result, then checks on the schedule
+func (r *ReleaseCheck) Update() *api.UpdateInfo       // the dashboard's "update"; nil while there is nothing to show
+func (r *ReleaseCheck) Alerts() []api.Alert           // release.update or release.security_update, or none
+```
+
+- **What goes out is fixed**, because it is on the privacy page (§16): one `GET` with the four headers above and
+  nothing else of ours. No cookie (the client's jar is removed, also from a client the test passes), no token, no
+  identifier, no body, no `Referer`.
+  - **`User-Agent` is exactly `isshoni/<version>`**, the running version without a leading `v`, with no OS,
+    architecture or Go version after it.
+  - Next to them go the headers of any HTTP client, which name nothing of ours: `Host`, `Accept-Encoding: gzip`
+    and, from the check's own client, `Connection: close`: one request a day needs no connection kept alive.
+  - `If-None-Match` is sent when the last answer had an ETag that can go back (visible ASCII, at most 200 bytes).
+    A 304 keeps the list of the last check and only moves `checkedAt`.
+- **The redirect rule.** A redirect is followed **only to the same host over the same scheme**, at most 3 times:
+  that is how GitHub answers for a repository that was renamed. One that points anywhere else ends the check with
+  an error, so the request never goes to a host this section doesn't name.
+- **The limits.** 10 s for the whole check. The 1 MiB limit counts the answer **on the wire**, compressed as
+  GitHub sends it: the check sets `Accept-Encoding: gzip` itself (what `net/http` sends anyway) and reads the body
+  through its own reader, with a second limit of 16 MiB for what it expands to. GitHub describes every asset of
+  every release in about 2 kB, so a page of 20 releases with 22 assets each (06 §3) is about 1 MB of JSON, and
+  less than a tenth of that on the wire. A content encoding that was not asked for is refused. The list is decoded
+  one release at a time and read to its end, and a body over a limit is refused however much of it parsed.
+- **Which releases count.** Drafts are left out, and so is a release whose tag is not SemVer (`nightly`); `v0.3.1`
+  and `0.3.1` are both read. Versions compare with `golang.org/x/mod/semver`; the newest 20 are kept, each version
+  once. A release is a prerelease when GitHub flags it or its version has a prerelease part; prereleases count
+  only when the running version is one itself. A running version that is not SemVer (a dev build) can't be
+  compared, so nothing is newer. `security` is true when **any** release newer than the running one carries the
+  marker, not only the latest.
+- **The `meta` value `ops.release_check`** holds the releases, not a verdict, because what they mean depends on
+  the running version, and that changes with an upgrade while the value stays in the database:
+
+  ```json
+  {"v": 1, "checkedAt": "2026-10-08T09:12:00.000Z", "etag": "W/\"3f2a…\"",
+   "releases": [{"version": "0.4.0-rc.1", "url": "https://github.com/MoonWX/isshoni/releases/tag/v0.4.0-rc.1",
+                 "prerelease": true},
+                {"version": "0.3.1", "url": "https://github.com/MoonWX/isshoni/releases/tag/v0.3.1", "security": true},
+                {"version": "0.3.0", "url": "https://github.com/MoonWX/isshoni/releases/tag/v0.3.0"}]}
+  ```
+
+  `v` is the format's version; a value with another `v`, without `checkedAt`, or that isn't JSON is no result, and
+  the first check fetches the list again. `releases` is newest first; `version` is canonical SemVer without the
+  `v`; `url` is kept only when it is an https URL of at most 512 bytes; `etag`, `prerelease` and `security` are
+  left out when empty or false. Every part is checked again when it is read back, as if it came from the feed: a
+  restored backup or an older build may have written it. So a restarted or upgraded server shows the right
+  result before its first check.
+- **`Update()`** is `{latest, url, security, checkedAt}`: the latest release that counts, which may be the running
+  one or older. It is nil before the first check, when the feed listed no release, and while `updateCheck` is off.
+- **Alerts and their severities.** `release.update` (`info`) when a release is newer than the running version,
+  `release.security_update` (`warn`) when one of the newer ones is a security release; `params` is `{version}`,
+  the latest. A newer version is also named once in the log (INFO, or WARN for a security release), for the
+  operator who reads the journal and never opens the dashboard.
+- **The switch.** `Policy.ReleaseCheck()` is asked before every request, so an admin's switch needs no restart,
+  and with it off nothing is sent at all; `Update` and `Alerts` then show nothing either, also not an earlier
+  result.
 
 ---
 
@@ -2124,8 +2480,10 @@ leaves a case open:
   when a new CLI talks to an old server. A user name that is empty, `.` or `..` never reaches the server: the
   client answers `user_not_found` itself, because the router would redirect such a path.
 - **Endpoints of later slices** are routed from the start: `GET /v1/backup`, `POST /v1/restore` and
-  `POST /v1/rotate-secrets` (README S65) and `POST /v1/doctor` (S60) answer 500 `internal` with "… over the admin
-  socket is not implemented in this build yet" until then.
+  `POST /v1/rotate-secrets` (README S65) answer 500 `internal` with "… over the admin socket is not implemented
+  in this build yet" until then. `POST /v1/doctor` is built (README S60) and wired (the group 7 integration,
+  §6.6): only an `AdminServer` that was given no `Doctor`, which no server of `serve` is, answers "this server's
+  admin socket has no doctor".
 - **`waitReadyS`** is 0 to 3600. A handler that panics is answered 500 `internal` with a `ref` that is also in the
   log, with the stack.
 - **Platforms without the peer-credential check** (anything but Linux and macOS; Windows is compile-only in M1)
@@ -2341,6 +2699,10 @@ is where the operator reads why, so the two checks say it in these words:
 - `tls` in `ip` mode is `fail` with "No certificate: there is no public IP address to get one for" and points at
   `public_ip`'s fix. It carries no `fixCode` of §8.7 (no ACME request was made, so there is no ACME error) and
   does not wait 10 minutes to turn from `warn` to `fail`: nothing is under way.
+- These texts stay as they are with the self-restart decided after group 6 (§6.2): an ip-mode server whose
+  network came up late now restarts itself at its next look, within 10 minutes, and "restarting is enough" is
+  still true and faster. When no look will ever find an address (a server behind a NAT that STUN can't see
+  through, STUN switched off), setting `public_ip` remains the only fix.
 
 ```
 [fail] public_ip     no public IP address found (no public address on an interface, no STUN answer)
@@ -2427,9 +2789,12 @@ The admin UI calls `GET /api/v1/admin/bandwidth?people=5&sharing=2&thumbnails=8&
 ```json
 {"input": {"people": 5, "sharing": 2, "thumbnails": 8, "quality": "1080p60", "preset": "auto", "hours": 2},
  "perViewerMbps": {"sharer": 8.13, "viewer": 8.43},
- "egressMediaMbps": 41.54, "egressWireMbps": 43.61, "ingressMediaMbps": 16.86,
- "transferPerSessionGb": 39.2}
+ "egressMediaMbps": 41.54, "egressWireMbps": 43.62, "ingressMediaMbps": 16.86,
+ "transferPerSessionGb": 39.3}
 ```
+
+Every Mbps value is rounded to two decimals and the gigabytes to one, each from the exact value: 41.54 × 1.05 =
+43.617 is 43.62 on the wire, and 43.617 Mbps for two hours is 39.2553 GB, so 39.3.
 
 ### 13.5 JSON output (`doctor --json`, `POST /api/v1/admin/doctor`)
 
@@ -2451,7 +2816,7 @@ The admin UI calls `GET /api/v1/admin/bandwidth?people=5&sharing=2&thumbnails=8&
      "localOnly": false, "durationMs": 1}
   ],
   "bandwidth": {"input": {"people": 5, "sharing": 2, "thumbnails": 8, "quality": "1080p60", "preset": "auto", "hours": 2},
-                "egressMediaMbps": 41.54, "egressWireMbps": 43.61, "ingressMediaMbps": 16.86, "transferPerSessionGb": 39.2}
+                "egressMediaMbps": 41.54, "egressWireMbps": 43.62, "ingressMediaMbps": 16.86, "transferPerSessionGb": 39.3}
 }
 ```
 
@@ -2957,7 +3322,8 @@ Packages and names (exact):
   check (S60) uses them as `fixCode`.
 - `internal/server/servertest`: `Start(t testing.TB, opts Options) *Server` with fields `URL` (`http://` plus the
   site's host; `Client` dials the listener whatever host the URL names), `WSURL`, `Client` (`*http.Client`, keeps
-  cookies, trusts the test CA when `Options.TLS`), `AdminSocket`, `UDPPort`, `TCPPort` (0 until README S59), `DataDir`,
+  cookies, trusts the test CA when `Options.TLS`), `AdminSocket`, `UDPPort`, `TCPPort` (the bound ICE ports, from
+  `Srv.Addrs().ICEUDP` and `ICETCP`; 0 for a listener the test turned off), `DataDir`,
   `Cfg`, `Srv`; methods `Restart(t)`, `Stop(t)`, `Wait(t) error` (the result of `Run` after a shutdown the test
   began itself) and `Logs()`; `Try(t, opts) (*Server, error)` for a server that is expected to refuse;
   `Options{TLS bool; Roots *x509.CertPool; Flags []string; Config func(*config.Config); Deps server.Deps; DataDir
@@ -3125,3 +3491,14 @@ Decided after group 5 (an engineering call the owner delegated; README §6):
    S54) is only logged, and the operator restarts isshoni (§6.2). systemd does not restart a running server, and
    Docker's `HEALTHCHECK` passes meanwhile because it checks liveness. The same holds for manual mode without a
    domain. A `public_ip` literal that is not a public address stays a config error (exit 78, §4.5).
+
+Decided after group 6 (an engineering call the owner delegated; README §6):
+
+5. **An ip-mode server that started not ready because no public address was found restarts itself when its
+   periodic detection finds one.** This amends decision 4's "it does not recover by itself": the running process
+   still can't take a site, but it can ask for its own restart, and a new process can (§6.2, §6.5, §7.4). `Run`
+   returns `ErrRestartRequested` after a graceful shutdown; that is exit 75 until the re-exec of README S65, and
+   systemd and Docker restart a process that exits 75. The server then recovers without a person, at the next
+   10-minute look. In every other state a changed public address is only logged with "restart isshoni to apply":
+   a server that has a site, and maybe friends connected, is not restarted because an address moved. README S59
+   implements it.

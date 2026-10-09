@@ -554,9 +554,10 @@ func (r *room) liveLocked() LiveRoom {
 
 // peerSink is the MediaSink of one MediaPeer (01 §15.2). Its methods never block: they post the event to the
 // connection's actor, which drops the events of a peer that is no longer the connection's (after a room.leave or a
-// join elsewhere). The server→client notifications go out as they are: sub offers, candidates, pub restart
-// requests, subscribe.status, quality.hint and errors. ShareMedia drives the share lifecycle (share.go), and an
-// error with scope share is acted on as well: codec_not_supported ends its share.
+// join elsewhere). The server→client notifications go out as they are: sub offers, candidates, subscribe.status,
+// quality.hint and errors. A pub restart request goes out only while the connection publishes a share
+// (RestartRequest). ShareMedia drives the share lifecycle (share.go), and an error with scope share is acted on as
+// well: codec_not_supported ends its share.
 //
 // A notification is encoded before it is posted, on the caller's goroutine, so the actor never reads the slices,
 // maps or pointers of the caller's value (PCOffer.Tracks, QualityHint.Encodings, PCICE.Candidate, Error.Params),
@@ -575,8 +576,33 @@ func (s *peerSink) Offer(o protocol.PCOffer) { s.forward(protocol.MessageTypePCO
 // ICE implements MediaSink: pc.ice.
 func (s *peerSink) ICE(c protocol.PCICE) { s.forward(protocol.MessageTypePCICE, c) }
 
-// RestartRequest implements MediaSink: pc.restart, asking the client to restart or rebuild its pub PC.
-func (s *peerSink) RestartRequest(r protocol.PCRestart) { s.forward(protocol.MessageTypePCRestart, r) }
+// RestartRequest implements MediaSink: pc.restart, asking the client for a new pub PC after its current one failed
+// or missed its handshake (01 §10.4).
+//
+// The server never asks to rebuild a pub PC that has nothing to carry (01 §9 rule 10): the request goes out only
+// while the connection publishes a share, in whatever status. A starting share waits for the new PC's first
+// keyframe and a stalled one for its media to come back, each under its 30 s timeout; a pub PC whose last share has
+// ended (stopped, or timed out a moment before its PC failed) would be rebuilt to send nothing. The hub decides
+// this, not the SFU or its adapter: the share lifecycle is the hub's (share.go), and on the connection's actor the
+// request is in order with everything that starts or ends the connection's shares. What counts is the moment the
+// actor gets to the request, not the moment the PC failed.
+func (s *peerSink) RestartRequest(r protocol.PCRestart) {
+	c := s.c
+	b, ok := s.encode(protocol.MessageTypePCRestart, r)
+	if !ok {
+		return
+	}
+	c.post(func() {
+		switch {
+		case !c.currentPeer(s.seq):
+		case !c.publishes():
+			c.h.log.Debug("pub restart request dropped: the connection publishes no share",
+				slog.String("conn_id", c.id), slog.Uint64("gen", uint64(r.Gen)))
+		default:
+			c.sendEncoded(protocol.MessageTypePCRestart, b)
+		}
+	})
+}
 
 // SubscriptionStatus implements MediaSink: subscribe.status.
 func (s *peerSink) SubscriptionStatus(st []protocol.SubscriptionStatus) {
@@ -621,10 +647,8 @@ func (s *peerSink) forward(t protocol.MessageType, data any) { s.post(t, data, n
 // current one, then calls sent (nil: nothing) when the message was queued.
 func (s *peerSink) post(t protocol.MessageType, data any, sent func()) {
 	c := s.c
-	b, err := protocol.Marshal(t, "", "", data)
-	if err != nil {
-		c.h.log.Error("encode message", slog.String("conn_id", c.id), slog.String("type", string(t)),
-			slog.Any("err", err))
+	b, ok := s.encode(t, data)
+	if !ok {
 		return
 	}
 	c.post(func() {
@@ -632,4 +656,16 @@ func (s *peerSink) post(t protocol.MessageType, data any, sent func()) {
 			sent()
 		}
 	})
+}
+
+// encode encodes a notification of type t on the caller's goroutine, for the actor to send. It reports false, with
+// a log line, for a payload that does not encode.
+func (s *peerSink) encode(t protocol.MessageType, data any) ([]byte, bool) {
+	b, err := protocol.Marshal(t, "", "", data)
+	if err != nil {
+		s.c.h.log.Error("encode message", slog.String("conn_id", s.c.id), slog.String("type", string(t)),
+			slog.Any("err", err))
+		return nil, false
+	}
+	return b, true
 }

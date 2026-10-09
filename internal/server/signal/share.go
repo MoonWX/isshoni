@@ -495,6 +495,23 @@ func (c *conn) endOwn(reason protocol.EndReason, pick func(*share) bool) int {
 	return len(ended)
 }
 
+// publishes reports whether the connection publishes a share in its room: one that is starting, live or stalled,
+// since a share that ended has left the room. Only the connection's actor calls it.
+func (c *conn) publishes() bool {
+	r := c.room
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, s := range r.shares {
+		if s.info.ConnectionID == c.id {
+			return true
+		}
+	}
+	return false
+}
+
 // armShareTimer sets the connection's share timer to the earliest deadline of the shares it publishes, or stops it
 // when none of them has one. It runs after every change of those shares or their deadlines.
 func (c *conn) armShareTimer() {

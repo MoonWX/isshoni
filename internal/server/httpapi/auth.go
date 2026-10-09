@@ -12,7 +12,8 @@ import (
 
 // The auth endpoints of 03 §12.3 that exist so far: login (#2), logout (#3), setup/check (#7) and setup/complete
 // (#8) (README S30), and register (#5) and invite/check (#6) (README S42). All are Public: the chain's CSRF step
-// still applies, and the throttles are auth's (03 §7.3). The reset links come with the admin users slice.
+// still applies, and the throttles are auth's (03 §7.3). logout-everywhere (#4) is a User route and sits with the
+// rest of self-service in account.go. The reset links come with the admin users slice.
 
 // apiUser is the public identity shape {id, username, role} of a user (03 §12.4.2).
 func apiUser(u store.User) api.User {

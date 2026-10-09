@@ -367,8 +367,8 @@ func (s *Service) MaybeRotate(w http.ResponseWriter, p Principal) {
 
 // sessionsRevoked runs the after-commit steps of 03 §7.7 for sessions whose rows were just deleted: the session
 // cache is invalidated first, and only then are their live connections closed with reason. No code path deletes a
-// session row without this call, except the janitor's prune of expired sessions and the startup purge after a
-// session-key change.
+// session row without this call or revocationCommitted (revoke.go: the rows that take a user's credentials as a
+// whole), except the janitor's prune of expired sessions and the startup purge after a session-key change.
 func (s *Service) sessionsRevoked(user store.UserID, ids []store.SessionID, reason string) {
 	for _, id := range ids {
 		s.sessions.invalidateSession(id)

@@ -407,10 +407,35 @@ func TestValidateAgentSend(t *testing.T) {
 		{"kind with a digit", with(base, "kind", `"share2"`), "kind:invalid"},
 		{"kind 33", with(base, "kind", jsonString(strings.Repeat("k", 33))), "kind:too_long"},
 		{"payload missing", with(base, "payload", "-"), "payload:required"},
-		{"payload null is opaque", with(base, "payload", "null"), ""},
+		// null is no payload (01 §5: nothing the hub sends has a null of its own). It is the one value refused.
+		{"payload null", with(base, "payload", "null"), "payload:required"},
+		{"payload null, spaced", `{"toRole":"agent","kind":"share.request","payload" : ` + "\n\tnull }", "payload:required"},
+		{"payload empty object", with(base, "payload", `{}`), ""},
 		{"payload array is opaque", with(base, "payload", `[1,2,3]`), ""},
+		{"payload with a null inside is opaque", with(base, "payload", `{"preset":null,"list":[null]}`), ""},
+		{"payload [null] is opaque", with(base, "payload", `[null]`), ""},
+		{"payload \"null\" is a string", with(base, "payload", `"null"`), ""},
+		{"payload false", with(base, "payload", `false`), ""},
+		{"payload 0", with(base, "payload", `0`), ""},
+		{"payload empty string", with(base, "payload", `""`), ""},
 		{"payload 16 KiB", with(base, "payload", jsonString(strings.Repeat("p", MaxAgentPayloadBytes-2))), ""},
 	})
+	// A null that never went through the decoder, as a Go caller may build it, is refused all the same; a payload
+	// that was left out encodes as {} (TestNilRelayPayloadEncodesAsObject) and passes.
+	for _, raw := range []string{"null", " null", "null\n", "\t null \r\n"} {
+		a := AgentSend{ToRole: RoleAgent, Kind: "share.request", Payload: json.RawMessage(raw)}
+		var fe *FieldError
+		if err := a.Validate(); !errors.As(err, &fe) || fe.Field != "payload" || fe.Reason != FieldRequired {
+			t.Errorf("payload %q: got %v, want payload:required", raw, err)
+		}
+	}
+	built, err := json.Marshal(AgentSend{ToRole: RoleAgent, Kind: "share.request"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode[AgentSend](Envelope{Type: MessageTypeAgentSend, Data: built}); err != nil {
+		t.Errorf("an agent.send built without a payload (%s): %v", built, err)
+	}
 	// A payload over 16 KiB is message_too_large, not bad_request (01 §13, P12): a *Error, like room_not_found.
 	for _, n := range []int{MaxAgentPayloadBytes - 1, 17 << 10} {
 		data := with(base, "payload", jsonString(strings.Repeat("p", n)))

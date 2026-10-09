@@ -80,7 +80,7 @@ internal/server/auth/
 internal/server/httpapi/
   api.go          API, Deps, Access, Handle, the /api/v1 middleware chain (04's router, helpers and global chain
                   live in the same package: router.go, middleware.go, errors.go, json.go, spa.go, headers.go)
-  info.go  auth.go  me.go  rooms.go  invites.go  push.go (subscriptions and preferences)
+  info.go  auth.go  me.go  rooms.go  invites.go  push.go (subscriptions, preferences, the push-test bucket of §7.3)
   admin_users.go  admin_rooms.go  admin_settings.go  admin_audit.go  accounts.go (dashboard accounts part)
   device.go       later (M2)
 ```
@@ -999,7 +999,8 @@ This is the first open question in §19. `/api/v1/info` serves the limits, so ch
 
 ### 7.3 Throttles
 
-The throttles are in-memory token buckets (decision 8), in `auth/limiter.go`. Every per-IP key is `auth.IPKey`
+The throttles are in-memory token buckets (decision 8), in `auth/limiter.go` (all but `push-test`, which is in
+`httpapi`: below). Every per-IP key is `auth.IPKey`
 (§7.13): an IPv4 address as its /32, an IPv6 address as its /64. It is exported so that 04's wiring test pins
 `netx.IPKey` to the same result (04 §7.2, §17).
 
@@ -1011,7 +1012,7 @@ The throttles are in-memory token buckets (decision 8), in `auth/limiter.go`. Ev
 | `register-ip` | client IP | 5 | 1 per 12 min | Every `register` request without an invite, in every mode (only the approval mode lets one through, below). Invite registrations are limited by the invite's own `maxUses` instead (the load test, 02, registers many users from one IP) | Right after `auth-ip`, before the mode check and any other work |
 | `auth-hash` | one for the whole server | 20 | 5 per s | Every public request that reaches the hash: login (the dummy hash too), register, setup/complete, reset/complete, device/password *(later: M2)* | Last: after all of the buckets above, before the semaphore (§7.2) |
 | `lookup` *(later: M2)* | session ID | 10 | 1 per min | Failed user-code lookups | Before lookup |
-| `push-test` | user ID | 1 | 1 per 10 s | `POST /push/test` | Before sending |
+| `push-test` | user ID | 1 | 1 per 10 s | `POST /push/test` | After the 503 for push that is off and the 404 for a session without a subscription, before sending (below) |
 
 - A blocked attempt gets 429 `rate_limited` with `retryAfter` and a `Retry-After` header. It does no hashing, and no
   DB access other than the known-IP read below.
@@ -1054,6 +1055,24 @@ The throttles are in-memory token buckets (decision 8), in `auth/limiter.go`. Ev
   does no hashing. The trade-off: under such an attack, new logins, sign-ups and resets wait. Existing sessions,
   WebSockets and media are unaffected, because nothing on those paths hashes. Password checks by a logged-in user
   (changing the password, deleting the account, granting admin) don't use this bucket.
+- **`push-test` lives in `httpapi`** (README S53; `httpapi/push.go`, `pushTestLimiter`). Its handler is its only
+  user and `auth.Service` has no call for it, so the slice that wrote the handler kept the bucket next to it.
+  - **Order** in `POST /push/test`: push off → 503 `push_unavailable`; this session has no subscription → 404
+    `not_found`; only then the bucket → 429 `rate_limited` with `retryAfter` and `Retry-After`; then
+    `Push.SendTest`. So a request that could not send anything costs no token, and somebody without a
+    subscription never reads "wait 10 s".
+  - **The token goes back when nothing was sent**: when `SendTest` returns an error (503 `server_busy` because
+    04's queue took nothing, 503 `server_shutdown`), the handler refunds the token it took. A token that was taken
+    again since (the first had come back meanwhile) is left alone.
+  - **Shape.** With a burst of 1 a bucket is one timestamp: a user has a token unless one was taken less than 10 s
+    ago. A clock that was set back counts as "back": an early test is harmless, a user locked out for the size of
+    the step is not. The map holds only the users who tested within the last two windows and is swept as it is
+    used, so it needs no cap on its keys: only a user with a subscription gets as far as taking a token. Memory
+    only, like every throttle.
+  - It writes no `auth.throttled` row; the audit scopes below are those of the buckets in `auth/limiter.go`.
+  - `auth/limiter.go` still declares a bucket of this name and rate (`ratePushTest`) that nothing calls. Which of
+    the two stays is for a slice that owns `internal/server/auth`; until then the one in `httpapi` is the one that
+    counts.
 - Each map holds at most 100,000 keys. When it is full, full buckets (idle keys) are evicted first, then the least
   recently used ones.
 - The plan's "20 pre-auth WebSocket handshakes per IP per minute" is enforced by 01's hub at the upgrade (01 §3.1;
@@ -1756,6 +1775,45 @@ exists; config pins its fields before the listeners start), so the pair can't mi
 - **Live counts** in room lists come from `Signal.RoomPresence()` (01). They are never stored.
 - Later: per-room locks (plan: Later), room order, invites into a specific room, and an i18n default name.
 
+**As README S53 built it** (`httpapi/rooms.go` for the list, `httpapi/admin_rooms.go` for the three admin routes;
+the rules live in the handlers, not in `auth.Service`: rooms have no credentials and no CLI command).
+
+- **The name rules, in order** (`normalizeRoomName`; the first that fails gives the field code of 422
+  `validation_failed {name: …}`):
+  1. valid UTF-8 without U+FFFD, else `invalid` (`encoding/json` turns bad bytes of a body into U+FFFD, and the
+     profile below works on valid UTF-8 only; the `serverName` setting has the same rule);
+  2. nothing, or only spaces, is `too_short`;
+  3. `precis.Nickname.String`: non-ASCII spaces become U+0020, leading and trailing spaces go, inner runs collapse
+     to one, NFKC. Control characters (a line break among them) and the other runes the profile refuses are
+     `invalid`. The result must map to itself again, so a stored name normalizes unchanged, else `invalid`;
+  4. at most 40 characters of that normalized form, else `too_long`;
+  5. `name_key = precis.Nickname.CompareKey(name)`.
+- **Not every emoji passes rule 3.** The profile disallows the variation selector U+FE0F and lets the zero-width
+  joiner U+200D through only after a virama, so not between emoji. An emoji of one code point ("🎬 Movie night"),
+  one with a skin tone and a flag of two regional indicators pass; the red heart (U+2764 U+FE0F), the keycaps and
+  the profession and family sequences are `invalid`. That is the profile this section names, taken as it is;
+  letting those emoji in would be a change to this rule, and is not decided.
+- **The admin rule is checked again inside the transaction of each change** (`stillAdmin`). The chain let the
+  request in on a principal that may be up to 30 s old (the session cache, §7.4), and the account can have been
+  demoted, disabled or deleted since: the caller's row as stored now must be an active admin, else 403
+  `forbidden`. `auth.Service` applies the same rule to its admin calls. Reading the row in the write also keeps
+  `rooms.created_by` from failing its foreign key for an account deleted a moment ago.
+- **Each change is one write with its audit row** (§10): `room.created {name}`, `room.renamed {from, to}`,
+  `room.deleted {name}`. The hub hears of it after the commit.
+- **`GET /rooms`**: the default room first, then the others in the order they were created, each with its live
+  counts from one `RoomPresence()` call. A room nobody is in has no entry there, which reads as zero and zero.
+- **Create**: the cap counts every room, the default one included, so the 201st is 409. A name that differs from
+  an existing one at most in case is 409 `room_name_taken` (the store's unique `name_key`). The answer is the new
+  room with its (zero) live counts.
+- **Rename is a JSON merge** (§12.1): a body without `name`, or with `null` for it, changes nothing and answers
+  200 with the room as it is, and so does the name the room already has. Neither writes an audit row or notifies
+  anyone. A change of case only is a rename. The name is validated first (422); then the room is looked up, and an
+  unknown id is 404 `room_not_found`, also for a body that would change nothing.
+- **Delete**: 404 `room_not_found` also for a room that was deleted before (it is not idempotent), 409
+  `room_is_default` for the default room. After the commit `RoomDeleted(id)` first, then the `rooms`
+  notification.
+- With `Deps.Signal` nil (tests) the endpoints work, with zero live counts and no-op hooks.
+
 ---
 
 ## 9. Settings
@@ -2104,9 +2162,9 @@ Common errors are not repeated per row: `bad_request`, `payload_too_large`, `uns
 | 21 | `GET /api/v1/invites` | User | 200 `{invites}` (admin: all; member: own) | 403 `forbidden` (member without permission) | M1 |
 | 22 | `POST /api/v1/invites` | Admin, or User if `membersCanInvite` | 201 `{invite, url}` | 403 `forbidden`/`registration_closed`, 409 `limit_reached`, 422 | M1 |
 | 23 | `DELETE /api/v1/invites/{id}` | Admin, or the creator | 204 | 404 `not_found` | M1 |
-| 24 | `POST /api/v1/push/subscriptions` | User | 201 `{id}` (new) · 200 `{id}` (existing) | 422 `push_endpoint_rejected`, 503 `push_unavailable` | M1 |
+| 24 | `POST /api/v1/push/subscriptions` | User | 201 `{id}` (new) · 200 `{id}` (the endpoint was known: rebound to the caller and this session) | 503 `push_unavailable` (checked first), 422 `push_endpoint_rejected` with `params.reason`, 401 `unauthenticated` when the session ended after the request was let in (§12.4.6) | M1 |
 | 27 | `POST /api/v1/push/unsubscribe` | User | 204 (idempotent, by endpoint) | — | M1 |
-| 28 | `POST /api/v1/push/test` | User | 202 (this session's subscriptions) | 404 `not_found` (none), 429 (1 per 10 s), 503 `push_unavailable`, 503 `server_busy` (04's queue is full; `Push.SendTest`'s error, 04 §14.2) | M1 |
+| 28 | `POST /api/v1/push/test` | User | 202 (this session's subscriptions) | In this order: 503 `push_unavailable`; 404 `not_found` (this session has no subscription; costs no token); 429 `rate_limited` (1 per 10 s per user, §7.3); 503 `server_busy` (04's queue is full) or `server_shutdown`, `Push.SendTest`'s error (04 §14.2), after which the token goes back | M1 |
 | 29 | `GET /api/v1/admin/users` | Admin | 200 `{users}` (`?status=active\|pending\|disabled`) | — | M1 |
 | 30 | `PATCH /api/v1/admin/users/{id}` | Admin | 200 `{user}` | 404 `user_not_found`, 409 `username_taken`/`last_admin`/`self_action_forbidden`, 403 `wrong_password`, 422 | M1 |
 | 31 | `DELETE /api/v1/admin/users/{id}` | Admin | 204 | 404, 409 `last_admin`/`self_action_forbidden` | M1 |
@@ -2116,7 +2174,7 @@ Common errors are not repeated per row: `bad_request`, `payload_too_large`, `uns
 | 35 | `POST /api/v1/admin/approvals/{id}/approve` | Admin | 200 `{user}` | 404 `user_not_found` (not pending) | M1 |
 | 36 | `POST /api/v1/admin/approvals/{id}/reject` | Admin | 204 · with `{id}` = `all` and `{"all": true}`: 200 `{rejected}` (§7.9) | 404 (also `all` without that body) | M1 |
 | 37 | `POST /api/v1/admin/rooms` | Admin | 201 `{room}` | 409 `room_name_taken`/`limit_reached`, 422 | M1 |
-| 38 | `PATCH /api/v1/admin/rooms/{id}` | Admin | 200 `{room}` | 404 `room_not_found`, 409 `room_name_taken`, 422 | M1 |
+| 38 | `PATCH /api/v1/admin/rooms/{id}` | Admin | 200 `{room}`; also for a body without `name` or with the name the room has, which changes nothing (§8) | 422 (the name, checked first), 404 `room_not_found`, 409 `room_name_taken` | M1 |
 | 39 | `DELETE /api/v1/admin/rooms/{id}` | Admin | 204 | 404, 409 `room_is_default` | M1 |
 | 40 | `GET /api/v1/admin/settings` | Admin | 200 `{settings, defaults, locked}` | — | M1 |
 | 41 | `PATCH /api/v1/admin/settings` | Admin | 200 `{settings, defaults, locked}` | 409 `setting_locked`, 422 | M1 |
@@ -2129,7 +2187,7 @@ Common errors are not repeated per row: `bad_request`, `payload_too_large`, `uns
 | 48 | `POST /api/v1/device/password` | Public | 200 token pair | as #2 | M2 |
 | 49 | `POST /api/v1/device/revoke` | User (bearer only) | 204 | — | M2 |
 | 50 | `GET /api/v1/push/preferences` | User | 200 `PushPreferences` | — | M1 |
-| 51 | `PUT /api/v1/push/preferences` | User | 200 `PushPreferences` | 422 | M1 |
+| 51 | `PUT /api/v1/push/preferences` | User | 200 `PushPreferences` (as stored) | 422 `validation_failed`: both fields are needed (`required` for one left out or `null`), `shareStarted` is `all` or `off` (`invalid`); 401 `unauthenticated` when the session ended after the request was let in | M1 |
 
 ### 12.4 Requests and responses
 
@@ -2340,6 +2398,44 @@ endpoint. The SPA re-subscribes when the key differs from its subscription's `ap
   `shareStarted` is `all` or `off`; `adminAlerts` matters for admins only. 04's sender reads them through
   `PushFilter.Pref`.
 
+**As README S53 built it** (`httpapi/push.go`; the storage side is here, sending is 04's).
+
+- **When push is off.** "Off" is one rule, the one by which `GET /info` omits its `push` object (§12.4.1):
+  `Deps.Push` is nil (`push.enabled = false`), or it has no VAPID key. Subscribe and test then answer 503
+  `push_unavailable`, before they read the body. Unsubscribe and both preference calls keep working: they only
+  touch the caller's own stored data, and a browser can always take its subscription back.
+- **The keys** (`pushKey`). `p256dh` and `auth` are base64url, without padding as browsers write it, or with it;
+  a line break is refused like any other character outside the alphabet. `p256dh` must decode to exactly **65
+  bytes whose first is `0x04`**, the browser's P-256 public key as an uncompressed point (RFC 8291), and `auth` to
+  exactly 16 bytes. Anything else is `bad_keys`. The row stores both in the canonical form, base64url without
+  padding, which is what 04's sender reads.
+- **The order holds whatever else is wrong**: an endpoint over 2048 bytes is `too_long` even with bad keys. An
+  empty endpoint passes the handler's two checks and is refused by `ValidateEndpoint` (`not_https`).
+  `ValidateEndpoint` looks the host up in DNS, so it runs before the write, never inside it.
+- **Storage** (`UpsertPushSubscription`, `TrimPushSubscriptions`). A known endpoint is rebound to the caller and
+  this session, also when another user had it: one browser, one subscription, and it belongs to whoever is
+  signed in there now. It gets the new keys, the name and a failure count of zero; `last_success_at` is kept for
+  the same user and cleared for another. Every post sets the row's `created_at`, so "the oldest is evicted" means
+  the browsers that have not posted for the longest time, not the ones that subscribed first. The name is
+  `auth.DescribeUserAgent` ("Chrome on Windows"): one of a fixed set of labels, never text from the header.
+- **The session is checked again inside the write** (`callerLive`), for subscribe and for `PUT` preferences: the
+  chain let the request in on a principal that may be up to 30 s old (§7.4), and a logout, a revocation or the
+  account's deletion may have removed the session since. Then the answer is 401 `unauthenticated` and nothing is
+  stored, instead of a failed foreign key and a 500. Every way an account stops being active deletes its sessions
+  (§7.7), so the session stands for the account too. Reading and unsubscribing need no such check.
+- **Unsubscribe** deletes the caller's subscription with that endpoint and nothing else: an endpoint the caller
+  has no subscription for, somebody else's among them, answers 204 too and deletes nothing. An empty endpoint, or
+  one longer than 2048 bytes, is 204 without a look at the database: no stored endpoint is either.
+- **Test.** The body is not read. The order is: push off (503), no subscription in this session (404
+  `not_found`; a caller without a web session has none), the `push-test` bucket (429), `SendTest`. §7.3 has the
+  bucket: it lives in this package, the 404 costs no token, and a `SendTest` error gives the token back.
+- **Preferences.** `GET` reads only; a user who never changed them has the defaults, `all` and `true`. `PUT`
+  replaces both choices, so **both fields are needed**: one that is left out, or `null`, is 422
+  `validation_failed` with the field code `required`, rather than a choice the user never made; a `shareStarted`
+  other than `all` and `off` is `invalid`. `adminAlerts` is stored for every user. The answer is the stored
+  pair.
+- None of these calls notifies a topic (§12.5).
+
 #### 12.4.7 Device flow (later: M2)
 
 ```json
@@ -2458,7 +2554,8 @@ type Deps struct {
 	DB       *store.DB
 	Auth     *auth.Service
 	Signal   Signal                         // wiring adapter over 01's hub; nil-safe (tests): no presence, no-op hooks
-	Push     Push                           // wiring adapter over 04's push service; nil → push_unavailable
+	Push     Push                           // wiring adapter over 04's push service; nil, or one without a VAPID
+	                                        // key → push_unavailable, and no push object in /info (§12.4.6)
 	Info     InfoSource                     // 04
 	Site     Site                           // 04's RouterOptions.Site: /info's publicUrl and server.name fallback
 	ClientIP func(*http.Request) netip.Addr // 04's httpapi.ClientIP
@@ -2508,7 +2605,9 @@ type NotifyTarget struct {
 type Push interface {
 	VAPIDPublicKey() string                                     // base64url, uncompressed P-256
 	ValidateEndpoint(ctx context.Context, endpoint string) error // nil or *api.Error{push_endpoint_rejected}
-	SendTest(ctx context.Context, subs []store.PushSubscription) error
+	SendTest(ctx context.Context, subs []store.PushSubscription) error // only queues; nil or an *api.Error
+	                                                                   // (server_busy, server_shutdown), which
+	                                                                   // the handler sends as it is
 }
 
 // Implemented by 04.
@@ -2546,14 +2645,32 @@ As S42 built these rows (`httpapi/auth.go`, `invites.go`, `admin_users.go`, `adm
 - **Nothing is sent for a change that didn't happen**: a settings patch that changed nothing, and "Reject all" on
   an empty queue (§7.9). Revoking an invite that was revoked before still notifies, since the handler can't tell.
 
+As README S53 built the rooms row and the push endpoints (`httpapi/admin_rooms.go`, `rooms.go`, `push.go`):
+- **Rooms.** A create, a rename that changed the name and a delete each notify `{All}: rooms` after the commit; a
+  `PATCH` that changed nothing (no `name`, or the name the room has, §8) notifies nobody. A delete calls
+  `RoomDeleted(id)` first and then notifies. A rename has no other hook: the hub reads a room's name when it uses
+  it.
+- **Push.** Subscribing, unsubscribing, the test and the preferences notify no topic. `Deps.Push` is used by two
+  handlers only, subscribe (`ValidateEndpoint`) and test (`SendTest`), and "off" is `Deps.Push == nil` or an empty
+  `VAPIDPublicKey()`, the rule `/info` goes by (§12.4.6).
+- **`Deps.Signal == nil`** is replaced by a stand-in with no presence and no-op hooks, so every handler calls
+  `Signal` without a nil check; `Deps.Info == nil` reads `internal/version` and `internal/protocol` itself.
+- **Two rules of the chain are checked again inside the transaction of a change**, because the chain's principal
+  may be up to 30 s old: the room handlers check that the caller is still an active admin (403, §8), and the push
+  handlers that write check that the caller's session still exists (401, §12.4.6).
+- The `push-test` bucket is a field of `API` (`pushTestLimiter`, §7.3), built with `Deps.Clock`.
+
 The DTOs in `internal/protocol/api` (tygo → TS; 01's tygo config gains this package) are:
 - `Info`, `AccountRules`;
 - `User`, `Me`, `SessionInfo`, `DeviceInfo`;
 - `LoginRequest`, `RegisterRequest`, `RegisterResponse`, `TokenRequest` (the `{token}` bodies), `InviteInfo`;
 - `SetupCompleteRequest`, `ResetCompleteRequest`, `ChangePasswordRequest`, `DeleteSelfRequest`;
-- `Room`, `RoomPresence` (the `live` object in room lists), `Rooms`;
+- `Room`, `RoomPresence` (the `live` object in room lists), `Rooms`, `CreateRoomRequest`, `PatchRoomRequest`
+  (`name` is a pointer: absent means "leave it"), `RoomResponse` (`{room}`);
 - `Invite`, `CreateInviteRequest`, `CreateInviteResponse`;
-- `PushSubscribeRequest`, `PushPreferences`;
+- `PushSubscribeRequest` with `PushKeys`, `PushSubscribeResponse` (`{id}`), `PushUnsubscribeRequest`,
+  `PushPreferences` with `ShareStartedPref` (`all`, `off`), `PushRejectReason` (the `params.reason` values of
+  `push_endpoint_rejected`);
 - `AdminUser`, `PatchUserRequest`, `PendingUser`, `RejectRequest` (`{all}`), `RejectAllResponse`, `ResetLink`;
 - `SettingsResponse` (with `Settings` mirrored from store), `AuditEntry`, `AuditPage`, `DashboardAccounts`;
 - `Error`, `ErrorResponse`, the `Code*` constants and `StatusOf`;

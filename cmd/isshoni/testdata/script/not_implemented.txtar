@@ -1,9 +1,6 @@
-# Commands whose behavior later slices add say so and exit 1 (a runtime error, not a usage error).
-exitcode 1 isshoni doctor
-! stdout .
-stderr '^isshoni doctor: not implemented in this build yet$'
-
+# Commands whose behavior a later slice adds say so and exit 1 (a runtime error, not a usage error).
 exitcode 1 isshoni admin backup --out -
+! stdout .
 stderr '^isshoni admin backup: not implemented in this build yet$'
 
 exitcode 1 isshoni admin restore --yes backup.tar.gz
@@ -13,5 +10,5 @@ exitcode 1 isshoni admin rotate-secrets --yes
 stderr '^isshoni admin rotate-secrets: not implemented in this build yet$'
 
 # Commands that read the config accept the config flags.
-exitcode 1 isshoni doctor --listen.admin-socket /tmp/isshoni-test.sock --json
-stderr '^isshoni doctor: not implemented in this build yet$'
+exitcode 1 isshoni admin backup --listen.admin-socket nowhere.sock --no-certs
+stderr '^isshoni admin backup: not implemented in this build yet$'

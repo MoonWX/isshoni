@@ -173,10 +173,16 @@ web/
    │                         RoomHeader.tsx · PeoplePanel.tsx · RoomSwitcher.tsx · InRoomBar.tsx · RoomStage.tsx ·
    │                         media.ts (the room's lazy media chunk, §5) · loadMedia.ts · lazyMedia.ts ·
    │                         lazySubscriber.ts
-   ├─ viewer/                SubscriberPC.ts · mediaRegistry.ts · viewerStore.ts · services.ts (createViewer, syncRoom,
-   │                         attachViewer) · context.ts · shareView.ts · watchToast.ts · layerPolicy.ts ·
-   │                         autoFocus.ts · audioOut.ts · ViewerLayout.tsx · Stage.tsx · Tile.tsx · ShareVideo.tsx ·
-   │                         TapToStart.tsx · WatchersPopover.tsx · fullscreen.ts · keyboard.ts · useVisibility.ts
+   ├─ viewer/                index.ts (what the rest of the app uses) · SubscriberPC.ts · mediaRegistry.ts ·
+   │                         viewerStore.ts · services.ts (createViewer, syncRoom, attachViewer) · context.ts ·
+   │                         shareView.ts · watchToast.ts · layerPolicy.ts · subscriptions.ts (the store → the
+   │                         policy → SubscriptionSync) · autoFocus.ts · audioOut.ts · videoPlayback.ts · stats.ts ·
+   │                         ViewerLayout.tsx · Stage.tsx · Tile.tsx · ShareVideo.tsx · AudioControls.tsx ·
+   │                         TapToStart.tsx · WatchersPopover.tsx · useVisibility.ts · and W8's (README S56, §12.4–
+   │                         §12.8): page.ts (the page's visibility) · fullscreen.ts · pip.ts · wakeLock.ts ·
+   │                         mediaSession.ts · useControls.ts (their React hooks) · StageControls.tsx ·
+   │                         keyboard.ts · ShortcutsDialog.tsx · focusParam.ts · FocusFromUrl.tsx · freeze.ts ·
+   │                         IosHint.tsx
    ├─ share/                 BrowserSharing.ts (SharingProvider) · PublisherPC.ts · presets.ts · encodings.ts ·
    │                         codecPrefs.ts · shareStore.ts · ShareButton.tsx · ShareSheet.tsx · ScreenAudioWarning.tsx ·
    │                         notes.ts · elsewhere.ts · SharePanel.tsx · LevelMeter.tsx · hints.ts
@@ -195,7 +201,8 @@ web/
    │                         time.ts · clipboard.ts · ua.ts
    ├─ ui/                    Button · Dialog (native <dialog>) · Sheet · Popover · Field · Stepper · Spinner ·
    │                         VisuallyHidden · tokens.css · global.css
-   ├─ i18n/                  index.ts · en.json
+   ├─ i18n/                  index.ts · en.json · lazy/ (<ns>.en.json and <ns>.ts for account, admin and setup: the
+   │                         texts that load with the page folders that use them, §16.5; README W00)
    ├─ sw/                    sw.ts · routes.ts (pure fetch strategy) · push.ts (payload → notification)
    ├─ test/                  setup.ts · FakeWebSocket · FakeRTCPeerConnection · fake media element · MSW handlers
    └─ types/                 dom-extras.d.ts · globals.d.ts
@@ -203,7 +210,10 @@ web/
 
 Components have a sibling `*.module.css` file (`Tile.tsx` + `Tile.module.css`); the tree above leaves them out. It
 also leaves out the entry module of each page folder: `rooms`, `auth`, `setup`, `account`, `admin` and `download`
-each have an `index.ts` that exports the folder's pages by name, which is how `router.tsx` finds them (§5).
+each have an `index.ts` that exports the folder's pages by name, which is how `router.tsx` finds them (§5). Tests
+are left out too: each sits next to what it tests (`keyboard.ts` + `keyboard.test.ts`), a test that needs Node
+instead of a DOM is `*.node.test.ts` (`app/chunks.node.test.ts`, which builds the app), and a folder's test
+helpers are in its `testing/` folder (`viewer/testing/`, `rooms/testing/`, `protocol/testing/`).
 
 Three placements differ from what the names suggest (group 4):
 - `SubscriptionSync` is `rooms/subscriptionSync.ts`, not a viewer file: the session owns it (§11.1) and the viewer
@@ -216,6 +226,18 @@ Three placements differ from what the names suggest (group 4):
   `auth/useLogout.ts`, `auth/session.ts`, `auth/useMe.ts`, `auth/fragmentToken.ts` and the form pieces that
   `setup/SetupPage` and the account pages share. Another page folder follows the same rule: the room page takes
   the in-app browser banner from `auth/InAppBrowserBanner.tsx` (§16.3).
+
+Two more since group 6 (W00, S56):
+- `rooms/` is a lazy page folder like the others (§5), and the one whose `index.ts` exports more than pages: next
+  to `RootRedirect` and `RoomPage` it has `InRoomBar`, which the router hands to the app's layout once the folder
+  is loaded, and the folder's own API (the connection, the session, the hooks). All of it is in the `rooms` chunk;
+  nothing in the entry chunk imports `rooms/`, `viewer/` or `share/` statically, and the room's media code
+  (`rooms/media.ts`) is deliberately not exported from it.
+- `viewer/` has one module per browser feature of §12.5–§12.8, each without React (`fullscreen.ts`, `pip.ts`,
+  `wakeLock.ts`, `mediaSession.ts`, `page.ts`, `keyboard.ts`, `focusParam.ts`, `freeze.ts`), and `useControls.ts`
+  with the hooks that `ViewerLayout` runs them through. The screen wake lock is in two files on purpose:
+  `platform/browser/wakeLock.ts` asks the browser (the API is behind the platform adapter, §8), and
+  `viewer/wakeLock.ts` decides when.
 
 **Layering rule.** React components never touch `WebSocket` or `RTCPeerConnection`. Controllers (`RoomSession`,
 `SubscriberPC`, `PublisherPC`, `runConnTest`) and 01's `SignalClient` never import React. They talk through Zustand
@@ -410,7 +432,7 @@ page slice edits it. Each route names one page component and the folder it comes
 |---|---|---|---|
 | `connectionStore` | `rooms/connection.ts` | `state` (01's `SignalState`), `welcome` (server version, limits, features, user, default room), `resumed`, `staleBuild`, `downSince`, `stopReason`, `shutdown`, `retryAt`, `rateLimited` (§7, §7.1) | `createConnection`, through the store's actions: `signalChanged(state, info)` from `SignalClient.onState`, `welcomed(w)` for every welcome, `serverRestarting()` for a REST 503 `server_shutdown` |
 | `roomStore` | `rooms/roomStore.ts` | `roomId` (the desired room), `joinState` (`idle`, `joining`, `joined`, `failed`), `joinError`, `room` (id and name, from the join's `ok`), `state` (the last `room.state`: participants, shares, `rev`), own `connectionId` and `userId`, `redirect` (the room the server sent the user to, §6.3) | RoomSession; the room page calls `clearRedirect()` |
-| `viewerStore` | `viewer/viewerStore.ts` | `shares` (the tiled ones, each with `own` and `local`, §12.2), `focusedShareId`, `focusMode` (auto, manual), `audibleShareId`, `pendingFocusParam`, `ended` (for re-published shares), `audio` (locked, playing, blocked, muted), `volume`, `fullscreen`, `pipShareId`, `visible` per share, `pageHiddenSince`, `status` per share (from `subscribe.status`), `media` (the sub PC's state, §10.1) | viewer components, `syncRoom` with every `room.state`, SubscriberPC |
+| `viewerStore` | `viewer/viewerStore.ts` | `shares` (the tiled ones, each with `own` and `local`, §12.2), `focusedShareId`, `focusMode` (auto, manual), `audibleShareId`, `pendingFocusParam`, `ended` (for re-published shares), `audio` (locked, playing, blocked, muted), `volume`, `fullscreen`, `pipShareId`, `visible` per share, `pageHiddenSince`, `status` per share (from `subscribe.status`), `media` (the sub PC's state, §10.1), and since README S56 `inRoom` (a `room.state` stands behind the shares: the `?focus=` wait starts with it, §12.2) and `frozen` (the shares whose picture stands still, §12.6) | viewer components, `syncRoom` with every `room.state`, SubscriberPC |
 | `shareStore` | `share/shareStore.ts` | local share state machine (`phase`, §13.1), `preset`, `withAudio`, `picked` classification, latest `params` (`ShareParams`), `hint`, `error`, `hostId` | its own actions (`pick`, `confirm`, `cancel`, `dismiss`, `attach`), called by the Share buttons; the publisher (S46) for `starting` and after |
 | `uiStore` | `app/` | toasts, announcer queue, install availability, `updateReady` | many |
 | `prefsStore` | `app/prefs.ts` | persisted per device: `volume`, `lastRoomId`, `preset`, dismissed hints, `debug` | settings UI |
@@ -1265,6 +1287,24 @@ you share.
   (owner question, §24). The unmute tap doesn't count as a manual choice.
 - `?focus=<shareId>` (push notification links, 04 §14.3) acts as a manual focus once the share is `live`; it waits up to
   5 s for the share to appear, then is dropped from the URL.
+  - **The 5 s count from the room's first `room.state`, not from the link** (README S56, `viewer/focusParam.ts`).
+    A push link often opens the app cold: the room page shows the layout while it still connects and joins, and
+    until the first snapshot nobody knows which shares the room has, so a clock started at the mount could drop
+    the link before the share was ever looked for. `viewerStore.inRoom` says that a snapshot stands behind the
+    store's shares (`syncRoom` sets it in the same update as the shares, `reset()` clears it); the clock runs only
+    while it is true. Out of a room the id just stays pending, and the parameter stays in the URL.
+  - A link that names another room makes the session switch rooms, which empties the store and with it the
+    pending id: it is asked for again, and the new room's first snapshot starts a fresh 5 s.
+  - One case is still timed from the link: a page that was in the room already and is reconnecting, as a phone
+    does when a notification's tap brings its tab back. The store keeps the snapshot of before (for re-published
+    shares, below), so the 5 s start at once, and a share that began while the page was away is picked only if
+    the fresh `room.state` comes in time. After that it is a new share like any other: auto-focus shows it when
+    it is the newest, and a pick the user holds stays.
+  - The wait ends early when the share gets the stage, and when the user picks something else or another
+    `?focus=` arrives: what the user chose last wins. An empty `?focus=` is dropped at once.
+  - `FocusFromUrl.tsx` reads the parameter from the router's location (so a link that arrives while the page is
+    open is followed too) and drops it with a **replace**, picked or not: the Back button doesn't bring it back,
+    and a reload or a shared link doesn't pick again. `ViewerLayout` renders it only inside a router.
 - **Re-published shares** (01 §10.6): when a new share's `replaces` names the focused or audible share and both have
   the same `userId`, focus, tile position and audio move to the new share.
 - The own share is never auto-focused and is never subscribed. Clicking it enlarges the local preview.
@@ -1335,6 +1375,40 @@ timer, a `welcome`), except the request-scope actions of §6.3 (`rate_limited` o
 `internal` once, `not_in_room` with one rejoin per send run). A request that the connection lost is not an error:
 the next `welcome` re-sends everything. The constants are `SUBSCRIBE_DEBOUNCE_MS` and `SUBSCRIBE_OFF_DELAY_MS`.
 
+**The inputs as README S56 measures them.** The rules were written out with S47, which fed them the focus and the
+audio and left the rest at their defaults; S56 adds what the page really shows. `subscriptions.ts` turns
+`viewerStore` into `LayerInputs` and hands the policy's result to `session.subscriptions`, once when it is attached
+and after every change of something the policy reads.
+
+- **`visible`** (`useVisibility.ts`). `useVisibility(shareId)` is the ref of the element that shows a share's
+  video, a tile's `<li>` or the stage's `<section>`. An `IntersectionObserver` with a threshold of 0.1
+  (`VISIBLE_RATIO`) watches it, which also sees what the strip's own scrolling clips.
+  - An element counts as shown **from the moment it is mounted**, until the observer says that it is out of
+    view. The browser measures a frame later, and a stage that changes its share must not look empty to the policy
+    meanwhile; a tile that mounts out of view is corrected within that frame, well inside the 150 ms that
+    changes are batched for.
+  - The marks are counted per share: the stage and a tile can show the same share for a moment, and the share
+    is not shown only when the last of them is gone.
+  - Without `IntersectionObserver` (an old browser, a test DOM) nothing ever says otherwise: an element is shown
+    while it is in the document.
+  - The phone's "Shares" sheet renders its tiles only while it is open, so tiles that nobody sees don't count.
+- **`focused`** is the stage's share only while the stage shows it. Away from the room page nothing is mounted,
+  so the focused share is one more share that nobody sees: every video goes off and the audible share keeps
+  playing (§11.1).
+- **`pageHiddenForMs`** (`page.ts`). `createViewer` follows `visibilitychange` for the life of the viewer, so it
+  also works while the room page is not mounted. `hidden` stores the time in `viewerStore.pageHiddenSince`; the
+  first one counts, and a page that is made in the background starts hidden. `subscriptions.ts` sets a timer for
+  the moment the 10 s are over (`PAGE_HIDDEN_OFF_MS`) and applies the policy again then. `visible` clears the time,
+  so video is asked for again at once, and plays every tile's video and the `<audio>` element again (§12.8).
+  While the page is hidden the browser reports no intersections, so the marks stay as they were.
+- **`fullscreen`** and **`pip`** are `viewerStore.fullscreen` and `viewerStore.pipShareId`, which `fullscreen.ts`
+  and `pip.ts` keep in step with the browser (§12.5).
+- **`remoteShares`** are the tiled shares that are not `local` (§12.2).
+
+`viewer/layers.test.tsx` runs the layout, a fake observer and the real `SubscriptionSync` together: focused
+`high`, thumbnails `low`, a tile out of view `off` after a second, a hidden tab `off` after 10 s, the PiP share
+kept, thumbnails `off` under a fullscreen stage.
+
 ### 12.5 Fullscreen, PiP, wake lock
 
 - Fullscreen: `requestFullscreen()` on the stage container, so overlays stay visible. iPhone:
@@ -1349,6 +1423,56 @@ the next `welcome` re-sends everything. The constants are `SUBSCRIBE_DEBOUNCE_MS
 - PiP (`requestPictureInPicture` on the stage video): desktop only. It's hidden on iOS in M1 (plan: PiP unreliable).
 - Wake lock: `navigator.wakeLock.request('screen')` while a share is being watched and the page is visible. It's
   released when hidden and re-requested on `visibilitychange → visible`.
+
+**As README S56 built them** (`fullscreen.ts`, `pip.ts`, `wakeLock.ts`, the hooks in `useControls.ts`, the buttons
+in `StageControls.tsx`). Each follows what the platform says it can do (`PlatformCapabilities`, §8: `fullscreen`,
+`pip`, `wakeLock`), read from the app's context, never a guess from the user agent. Until the platform has
+answered, nothing that needs a capability is offered; a layout outside the app's providers has the
+pseudo-fullscreen and the keyboard, and nothing else.
+
+- **Fullscreen, by `capabilities.fullscreen`:**
+
+  | Mode | How |
+  |---|---|
+  | `element` | `requestFullscreen()` (or the prefixed call) on **the viewer's layout**, the stage's container, which renders only the stage while fullscreen. So everything that lies on the stage stays: its state, the bar with its controls, TapToStart, the watchers, the banner, the shortcuts dialog, and the toasts (above) |
+  | `video-only` | iPhone: `video.webkitEnterFullscreen()` on the stage's video, the native player with only the picture; the sound keeps coming from the page's `<audio>` element |
+  | `none` | the CSS pseudo-fullscreen: the layout covers the page |
+
+  - A way that doesn't work when it is asked for (the browser rejects the request, the stage has no video yet)
+    falls back to the pseudo-fullscreen, so `F` always does something.
+  - `viewerStore.fullscreen` is what the app reads. The store follows the browser (`fullscreenchange`, the
+    iPhone's `webkitbeginfullscreen` and `webkitendfullscreen`), so Esc and the native player's own "Done" are
+    seen; and the browser follows the store: when the page leaves its room, or the layout goes, the fullscreen
+    ends. Only the fullscreen this controller asked for is ever ended.
+  - iOS pauses the video when its native player closes: the tiles' videos are played again at that event and once
+    more 400 ms later, because the pause can come after the event.
+  - Nothing on the stage is nothing to fill the screen with: `F` does nothing then, and a fullscreen whose stage
+    empties ends by itself (a phone has no Esc to leave it with).
+  - The double tap is counted by the viewer (two taps within 300 ms and 40 px, outside the stage's controls): the
+    stage sets `touch-action: manipulation` so that a double tap doesn't zoom the page, and with it not every
+    browser sends `dblclick` for touch.
+- **PiP** puts the stage's `<video>` in the browser's floating window. `viewerStore.pipShareId` is what the layer
+  policy reads (rule 2). The store follows the browser (`enterpictureinpicture`, `leavepictureinpicture`: the
+  window's own close button), and the window closes when the stage moves to another share (it shows one
+  `<video>` element, and that one goes), when the share ends, and when the page leaves its room.
+  - The button is there where `capabilities.pip` is true **and** the stage shows a received share: a floating
+    window of one's own capture shows nothing new.
+  - **Where it is offered: as built, wherever the platform reports it.** `capabilities.pip` is
+    `document.pictureInPictureEnabled` and not iOS (§8; an iPad that calls itself a Mac counts as iOS). That is
+    the desktop browsers, and it is also **Android Chrome**, which reports PiP too, where the rule above says
+    "desktop only". Whether Android keeps the button is an **open question for the owner** (asked after group 6):
+    the rule above stands as written, the code stays as built until the answer, and the manual matrix row M-AND-1
+    (§19.4) is where it shows. iOS is not part of the question: no PiP there in M1.
+- **Wake lock.** `platform.requestWakeLock()` is the browser's side (§8) and answers `null` where the API is
+  missing or refuses (battery saver, iOS Low Power Mode); the viewer asks for it only where
+  `capabilities.wakeLock` is true, and only decides when to hold one: while the page is visible and a share that
+  it **receives** is on the stage or in a tile that is in view (`isWatching`; one's own preview doesn't keep the
+  screen on). The browser drops the lock by itself when the page is hidden; coming back requests a new one. A
+  request that was refused is not repeated until then.
+- **The stage's toolbar**, after the sound: PiP (above), the shortcuts button (only on a device that can hover:
+  shortcuts need a keyboard, and a touch toolbar has little room), and fullscreen, which is always there because
+  every device has at least the pseudo-fullscreen. The buttons say what a press does ("Fullscreen", "Exit
+  fullscreen"), so they need no pressed state.
 
 ### 12.6 Tile states
 
@@ -1367,6 +1491,18 @@ Each tile shows the owner's name, the localized kind (`share.label.<kind>`: "Scr
 `WatchersPopover` with the names ("Watching: bo, cy, you"). The plan's "no hidden viewers" applies to everyone, admins
 included.
 
+**The frozen state as README S56 built it** (`freeze.ts`; the other states need no stats). A detector takes the
+stats collector's samples (every 2 s, §10.7) and writes `viewerStore.frozen`, which the tiles and the stage read.
+`rooms/connectStats.ts` attaches it to the collector (§10.7); without that call no tile is ever frozen.
+- **Which shares are measured.** One that the layer policy asks video for (§12.4), that is `live` (a stalled
+  share has its own notice) and that the server forwards (`subscribe.status` says neither `off` nor `waiting`:
+  those have their own overlays), and only while the page is visible, since a hidden tab may stop decoding on its
+  own. A share that falls out of this set starts its clock again when video is due.
+- **Only what the stats can see.** A share whose stream is not in the sample with a frame count is never called
+  frozen: an overlay over a picture that plays would be worse than a missing notice.
+- **3 s** (`FREEZE_AFTER_MS`) without a new decoded frame, measured from the first sample that had the count. With
+  samples every 2 s the overlay shows at the second sample without a new frame.
+
 ### 12.7 Keyboard
 
 The tile list is a roving-tabindex group (one tab stop). Shortcuts are active when focus isn't in a text field:
@@ -1383,6 +1519,47 @@ The tile list is a roving-tabindex group (one tab stop). Shortcuts are active wh
 | ? | shortcuts dialog |
 | Shift+D | debug overlay |
 
+**As README S56 built it** (`keyboard.ts`: the map and its rules, without React; `ViewerLayout` gives it the
+handlers and listens on the document while it is mounted; `ShortcutsDialog.tsx`).
+
+- **The keys, more exactly.**
+  - Arrow keys move between tiles and stop at both ends; **Home** and **End** go to the first and the last.
+  - Enter and Space are not in the map: a tile is a `<button>`, and they activate the focused button as in every
+    browser.
+  - `1`–`9` count the shares newest first, the one on the stage included.
+  - `F` does nothing while the stage is empty (§12.5).
+  - `M` mutes and unmutes; while the browser still wants a gesture for the sound, it is the tap of TapToStart
+    (§10.3). It does nothing while nothing is audible and the sound isn't muted.
+  - `L` does what the speaker button of the keyboard-focused tile does: it moves the sound to that tile, and
+    pressed on the tile that is heard it gives the sound back to the share on the stage. It does nothing on a
+    tile of a share this page publishes or of a share without audio.
+  - `Esc` leaves the pseudo-fullscreen; a real fullscreen ends with the browser's own Esc, and a native
+    `<dialog>` closes itself.
+  - `?` opens the shortcuts dialog, and so does the keyboard button on the stage (§12.5). The dialog lists the
+    rows of the table.
+  - `Shift+D` switches `prefsStore.debug`. The overlay that reads it comes with W13 (README S93); outside the
+    app's providers there is no such preference, and the dialog leaves the row out.
+- **A key that did nothing goes on to the browser.** A handled key is `preventDefault`ed (no page scroll for an
+  arrow key); an action that found nothing to do (no such share, not in fullscreen) is not.
+- **Rules that keep the shortcuts out of the way:**
+  - never with Ctrl, Alt or Cmd held (Ctrl+F, Cmd+L and Alt+← are the browser's), and never during an IME
+    composition; a key that is held down acts once, except the arrow keys;
+  - never while the focus is in a text field (an input that takes text, a textarea, a select, editable content),
+    and never on a key press that something else handled already (`defaultPrevented`: the watchers popover
+    closes on its own Escape);
+  - while a modal `<dialog>` is open, or the focus is inside a popover, only the arrow keys work, and only among
+    the tiles of a list the focus is in (the phone's "Shares" sheet): the dialog has the keyboard;
+  - the arrow keys are left to a control that uses them itself (the volume slider, a select, a menu);
+  - letters are matched without Shift, so Caps Lock doesn't matter and Shift+F stays free. On a layout without
+    Latin letters (Cyrillic, Greek) the key's position counts instead (`KeyboardEvent.code`). `?` and the digits
+    are matched as characters, whatever keys the layout needs for them (AZERTY types digits with Shift);
+  - a `keydown` without a string `key` is no shortcut: Chrome's autofill and password-manager extensions dispatch
+    a plain `Event` of that name on the field they fill.
+- **The roving tab stop** is the tile that had the keyboard focus last, whichever of its controls had it (the eye
+  and the speaker button count), else the first tile. A pick made from a focused tile moves the focus to the tile
+  of the share that left the stage, so Enter swaps the two back; after a click or a tap the list stays where the
+  user scrolled it, and only the keyboard's focus is scrolled into view.
+
 ### 12.8 Mobile and iOS limits
 
 - iOS: foreground only. WebRTC is suspended in the background and when the screen locks. On return
@@ -1393,6 +1570,26 @@ The tile list is a roving-tabindex group (one tab stop). Shortcuts are active wh
 - Android Chrome: background audio keeps playing (rule 1 in §12.4). `navigator.mediaSession.metadata` is set to
   `{title: "bo's window", artist: "<room>"}` so the notification shade shows what's playing. The room page gives
   the layout the room's name for it (`RoomStage`'s `roomName`, the name the header shows).
+
+**As README S56 built them** (`page.ts`, `IosHint.tsx`, `mediaSession.ts`, the layout's CSS).
+
+- **Coming back** (`page.ts`, attached by `createViewer`). On `visibilitychange → visible` after the page was
+  hidden, every tile's video is played again and so is the `<audio>` element. If the browser refuses that one, its
+  state is `blocked` and TapToStart asks for the tap (§10.3). On a desktop nothing was paused, and both calls do
+  nothing. The same handler clears the hidden time, so video is subscribed again at once (§12.4).
+- **The iOS hint** (`IosHint.tsx`) shows only on iOS (`platform.client.os`, which only ever chooses help text, §8),
+  only while the page shows someone's share, and until "Got it": the dismissal is `prefsStore.dismissed` under
+  `viewer.iosForeground`, kept on the device, so it never comes back. It gives way to the "can't reach the media
+  port" banner (one notice at a time) and is not shown over a fullscreen stage.
+- **The media session** names what is **heard**, not what is watched: the metadata is set while a share is
+  audible (its title as the tiles show it, the room's name as the artist; the app's name where there is no room
+  name) and cleared when nothing is. A share that is only watched puts nothing in the notification shade. No
+  action handlers are set: a live share can't be paused or skipped, and the page's own mute stays the only
+  control. Without the Media Session API, or without `MediaMetadata`, nothing happens.
+- **No PiP on iOS** is `capabilities.pip` (§8); for Android see the open question in §12.5.
+- **Phone landscape** is `(orientation: landscape) and (max-height: 500px)`: the others move into the "Shares (N)"
+  sheet (§12.1). A stage that reaches the screen's edges, in fullscreen and on a phone held sideways, keeps its
+  bar clear of the notch and the home indicator with the safe-area insets.
 
 ---
 
@@ -2399,8 +2596,10 @@ and, on Android, in the room's one-time card. iOS: the Home Screen sheet above, 
     any of its pages. No loader, no Suspense, no request of its own: a namespace is as lazy as the code that uses
     it. Call sites don't change (`t('admin.users.title')`, no `useTranslation('admin')`).
   - A namespace is lazy only when nothing in the entry chunk uses it, and every folder that uses it has to import
-    its `lazy/<ns>.ts`. Six more namespaces could move and stay in `en.json` for now, because the move needs files
-    that W00 does not touch (about 6 KB gzip of texts together):
+    its `lazy/<ns>.ts`. `account`, `admin` and `setup` are the lazy namespaces of M1. Six more could move and stay
+    in `en.json`: the budget of §17.3 is met without them (158.9 KB of 200 KB after group 6), so the plan's clause
+    that `conntest` and `fix` load lazily was dropped (README W00), and the move needs files that W00 does not
+    touch (about 6 KB gzip of texts together):
     - `conntest` and `fix`. Only the connection test's lazy panel uses them, but the room page opens that panel
       past `conntest/index.ts` (`import('../conntest/ConnTestPanel')`, §14.2), so `ConnTestPanel.tsx` itself has
       to import the two modules, and the connection test's own tests (`links.test.ts`, `fixText.test.ts`,
@@ -2549,7 +2748,7 @@ export default defineConfig({
 |---|---|
 | "Reconnecting…" shown after / "Can't reach the server" after | 2 s / 30 s |
 | Subscription sync | up: 150 ms debounce; down to off (not visible): 1 s; page hidden → off: 10 s |
-| Tile "frozen" | 3 s without decoded frames |
+| Tile "frozen" | 3 s without decoded frames (shown at the second 2 s sample without a new one, §12.6) |
 | Firefox: caps poll / give-up hint | 5 s / 3 min (the server's rebuild retries run 20 s × 9, 02 §8.5) |
 | Upload/CPU hint | 3 samples (6 s) on, 10 s off |
 | Stats sampling / ring buffer / `stats` notification | 2 s (1 s with overlay) / 150 samples / 10 s |
@@ -2558,7 +2757,7 @@ export default defineConfig({
 | Connection test: connect / pings | 8 s / 5 × 200 ms |
 | SW navigation timeout | 4 s |
 | Admin dashboard poll | 2 s while visible |
-| `?focus=` wait | 5 s |
+| `?focus=` wait | 5 s, from the room's first `room.state` (§12.2) |
 | One-time cards | push card after 3 min watching, 30 days after dismissal; iOS install sheet every 14 days at most |
 
 ---
@@ -2578,6 +2777,11 @@ export default defineConfig({
 | `share/encodings.ts` | `ShareParams.encodings` (wire order `f`, `q`) → complete `sendEncodings` in ascending order (`q`, `f`), every field set (`rid`, `active`, `maxBitrate`, `maxFramerate`, `scaleResolutionDownBy`); `scaleResolutionDownBy` from 1080p, 1440p, 2160p and 3440×1440 sources; later `setParameters` edits match by rid, never index (a reversed `getParameters()` order still updates the right layer); a hint's `active` flags applied per rid |
 | `share/hints.ts` | upload hint after 3 limited samples, rounding, clears after 10 s |
 | `viewer/layerPolicy.ts` | each rule in §12.4, including PiP while hidden, fullscreen, the 10 s hidden rule |
+| `viewer/useVisibility.ts`, `page.ts`, and `layers.test.tsx` (the layout, a fake `IntersectionObserver` and the real `SubscriptionSync`; README S56) | a share is shown from the mount, then while at least 10 % of its element is in view; the stage stays shown through a change of its share; the page's hidden time (the first `hidden` counts, a page that starts in the background), and every video and the audio played again on return, with TapToStart when the audio is refused; end to end: focused `high` and thumbnails `low`, a tile out of view `off` after 1 s and nothing sent when it is back sooner, a hidden tab `off` after 10 s with the sound kept, the PiP share kept `high`, thumbnails `off` under a fullscreen stage |
+| `viewer/fullscreen.ts`, `pip.ts`, `wakeLock.ts` (README S56) | fullscreen in its three modes (§12.5), Safari's prefixed calls, the fallback to the pseudo-fullscreen (a rejection, the error event, a call that throws, a video that can't), Esc and the native player's "Done" seen, the videos played again after the native player, never ending a fullscreen that isn't its own, `onDoublePress` (a double click, two taps within 300 ms and 40 px, no swipe or pinch, not on a control); PiP only where the platform reports it (not on iOS, an iPad that calls itself a Mac included), the window's own close seen, closed when the stage's video changes; the wake lock requested and released with `isWatching`, asked again after the page was hidden, a late answer released, a refusal not repeated |
+| `viewer/keyboard.ts`, and `shortcuts.test.tsx` (through the layout; README S56) | every row of §12.7 and its row in the dialog; the rules (modifiers, IME, a held key, letters without Shift, digits and `?` as characters, the key's position on a non-Latin layout, a `keydown` without a `key`); `isTextField`, `shortcutAllowed` (text fields, dialogs, popovers, controls that use the arrows, the "Shares" sheet); `moveIndex`, `moveTileFocus`; the roving tab stop, and the focus that follows a pick to the tile of the share that left the stage; `M` as the tap that starts the sound |
+| `viewer/focusParam.ts`, `FocusFromUrl.tsx` (README S56) | a live share is picked at once; one that isn't live yet is waited for; the 5 s start with the room's first snapshot, also for a room with no share, and the next room gets the whole 5 s; a pick by the user or a newer request ends the wait; the parameter is dropped with a replace, picked or not, and the URL's other parameters stay; an empty one is dropped at once; a link that arrives while the page is open is followed; nothing is read outside a router |
+| `viewer/freeze.ts`, `mediaSession.ts`, `IosHint.tsx` (README S56) | frozen after 3 s without a decoded frame (two samples at the collector's pace), thawed by the first new frame, never for a share the sample doesn't measure, and only the shares of §12.6; the media session names the audible share and the room, follows the sound and clears; the iOS hint shows on iOS while a share is watched, goes for good with "Got it", and waits behind fullscreen and the media banner |
 | `viewer/autoFocus.ts` | newest share auto-focused; manual holds; resumes after the manual share ends; `replaces` carries focus and audio only for the same user; `?focus=`; own share never focused |
 | `viewer/audioOut.ts` (fake media element) | locked → blocked on `NotAllowedError` → playing after tap; swap keeps playing |
 | `viewer/SubscriberPC.ts`, `share/PublisherPC.ts` (fake RTCPeerConnection) | `gen`/`neg` rules of §9: stale gen dropped, repeated neg resends the stored answer, one outstanding offer with folding, candidate buffering (64), `probe()` on `disconnected`, recovery timers (3 s, 15 s, spacing 5 s/10 s, 5 rebuilds → UI state), no sub `pc.restart` after a resumed welcome; a sub offer with a new `ice-ufrag` cancels the 3 s timer (no `pc.restart {mode:'ice'}` follows) and starts the 15 s rebuild timer from that offer, also when the client had already sent its own request |
@@ -2588,6 +2792,11 @@ export default defineConfig({
 | `sw/routes.ts`, `sw/push.ts` | strategy per URL class; payload → notification options for every known type; same-origin guard on click URLs; generic fallback |
 | `lib/ua.ts` | `inAppBrowser()` matches each known token (`FBAN`, `FBAV`, `Instagram`, `Line/`, `MicroMessenger`) and returns `null` for plain Safari, Chrome, iOS Chrome (`CriOS`), Firefox and Edge UAs |
 | `app/boot.tsx` (`stashFragmentToken`), `auth/fragmentToken.ts` | boot step 0 stores the token for `/setup`, `/invite` and `/reset` and removes the fragment via `replaceState` before the first fetch (`/info` included); other paths and empty fragments are left alone; `fragmentToken.ts` reads the stored token and clears it |
+| `app/boot.tsx`, the first page's code (`boot.test.tsx`; README W00, §5) | the first page's folder is asked for just before `GET /api/v1/info`: once, however often `/info` has to be retried; not while the browser says it is offline (a failed `import()` may not be tried again); not on NeedsHttps, which leads to no page; with the default routes it is the router's `preloadRoute`, and a test's own routes preload nothing |
+| `app/router.tsx`, the room as a lazy folder (`router.test.tsx`; README W00, §5) | the route table has a loader for every folder of the build, `rooms/` among them; in the `production` mode the default routes load `rooms/` on demand and no folder is there up front, and in Vitest they have the real `rooms/` from the start; `rooms/` is loaded on the first visit to a room and not for another page; the layout shows `InRoomBar` of `rooms/` above the pages once the folder is loaded and nothing before, and a `rooms/` without that export leaves the layout as it is; a `rooms/` that fails to load shows the route error screen like any folder; `preloadRoute` asks for exactly what the router then loads for a path, skips a folder that is there already or that the build doesn't have, and takes a failed load instead of throwing it |
+| the production build (`app/chunks.node.test.ts`: the app built in memory by the real Vite, in Node; README W00, §5, §17.3) | the app shell, the layout and the main catalog are in the initial chunks; nothing of `rooms/`, `viewer/`, `share/` or `conntest/` is, except what the picker needs (`share/presets.ts`); the router loads the room by `import()`, in one place, and the branch that Vitest has is not in a build; the room's folder comes with one import (the page, the redirect, the bar and the session); the publisher is loaded by `import()` from the provider in the main chunk, and is not part of what a room visit loads; a page folder gets only the lazy namespaces it uses |
+| `platform/browser/displayMedia.ts`, the lazy publisher (`platform/browser/displayMedia.test.ts`; README W00, §5) | making the provider loads nothing; `pick()` opens the picker first, in the same turn, then asks for the publisher and doesn't wait for it; `start()` hands over to the publisher the pick loaded (one for every share), waits for one that is still loading, and loads it itself when no pick did; when the chunk can't be loaded the pick still resolves, `start()` rejects with `offline`, and the next start loads again |
+| the lazy namespaces (`i18n/lazy.test.ts`, `app/lazyNamespaces.test.tsx`, `i18n/check-i18n-lazy.node.test.ts`; README W00, §16.5) | the catalog starts with the main bundle's namespaces only and gets a lazy one when its page folder's chunk runs; a lazy route never shows a bare key; in test mode every namespace is there from the start; `check:i18n` reads the main file and the lazy files as one catalog, names the file a missing key belongs in, and fails when a folder uses a lazy namespace that its entry module doesn't load, when the main bundle uses one, and when a lazy namespace is in the main file too |
 | i18n | every generated error code maps to an existing `en.json` key (also enforced by `check:i18n`) |
 
 01 owns the `SignalClient`, `codecs.ts` and registry tests (01 §19).
@@ -2846,3 +3055,10 @@ Decided after group 5 (engineering calls the owner delegated; README §6):
 - **A preset changed from another tab or device does not reach the page that publishes the share in M1** (§13.5;
   01 §8.7). The M1 UI changes a preset only from the publishing page; the push to the publisher comes with the M2
   desktop handoff.
+
+**Open, for the owner** (raised after group 6; README §6):
+- **Picture-in-picture on Android Chrome** (§12.5). The rule says "desktop only" and hides PiP on iOS. README S56
+  built it by capability: the button is there wherever the browser reports PiP and the device is not iOS, which
+  includes Android Chrome. The two readings differ only there. Until the owner answers, the rule in §12.5 is not
+  changed and the code stays as built; "keep it" needs one sentence in §12.5, "hide it" one more condition in the
+  platform's `pip` capability (§8).

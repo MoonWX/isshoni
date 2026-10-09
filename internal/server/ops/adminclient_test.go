@@ -380,7 +380,7 @@ func TestAdminClientStreams(t *testing.T) {
 	if err != nil || !rot.Restarting || len(rot.Rotated) != 4 {
 		t.Errorf("RotateSecrets = %+v, %v", rot, err)
 	}
-	rep, err := c.Doctor(t.Context(), nil)
+	rep, err := c.Doctor(t.Context(), AdminDoctorRequest{})
 	if err != nil || len(rep.Checks) != 1 || rep.Checks[0].ID != "dns" {
 		t.Errorf("Doctor = %+v, %v", rep, err)
 	}

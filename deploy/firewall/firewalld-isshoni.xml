@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>isshoni</short>
+  <description>isshoni screen sharing server (HTTPS, ACME, WebRTC media)</description>
+  <port protocol="tcp" port="80"/>
+  <port protocol="tcp" port="443"/>
+  <port protocol="tcp" port="7882"/>
+  <port protocol="udp" port="7882"/>
+</service>

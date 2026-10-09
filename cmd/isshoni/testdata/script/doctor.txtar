@@ -1,0 +1,171 @@
+# doctor runs the checks of 04 §13: inside a running server through its admin socket, or on this machine when no
+# server runs. "fakeserver" serves a real admin socket inside the test (fake_test.go); its doctor examines a faked
+# machine, a VPS at 203.0.113.7, so nothing here asks the network.
+
+# --list-checks prints the check ids of 04 §13.2 in table order, with --json as an array. The project site has one
+# troubleshooting section per id.
+exec isshoni doctor --list-checks
+cmp stdout ids.txt
+! stderr .
+exec isshoni doctor --list-checks --json
+stdout '^\["config","data_dir","secrets","schema","public_ip","dns","tls","clock","udp_buffers","ports","firewall_hint","container","lan_privacy","transfer","release","nofile","bandwidth"\]$'
+! stderr .
+
+# A usage error exits 2 before anything runs.
+exitcode 2 isshoni doctor --only nope
+! stdout .
+stderr '^isshoni doctor: --only: no check "nope"; --list-checks prints the ids$'
+exitcode 2 isshoni doctor --only dnss
+stderr '^isshoni doctor: --only: no check "dnss" \(did you mean "dns"\?\); --list-checks prints the ids$'
+exitcode 2 isshoni doctor --people 0
+stderr '^isshoni doctor: --people 0: want 1 to 1000$'
+exitcode 2 isshoni doctor --quality 720p30
+stderr '^isshoni doctor: --quality "720p30": want 1080p60, 1440p60 or 2160p60$'
+
+# A running server runs the checks in its own process, and the CLI prints its report: exit 0 without failures.
+fakeserver start
+exec isshoni doctor
+stdout '^isshoni doctor · 0\.3\.0 · server running · 2026-09-29 13:12 UTC$'
+stdout '^\[ ok \] config        '
+stdout '^\[ ok \] tls           ip certificate for 203\.0\.113\.7, valid until 2026-10-06 00:00 UTC$'
+stdout '^\[info\] ports         listening on 443/tcp, 80/tcp, 7882/udp, 7882/tcp \(local check only\)$'
+stdout '^       This only checks this machine\. The browser connection test checks from outside\.$'
+stdout '^\[info\] firewall_hint Hetzner: Cloud Console → Firewalls → allow TCP 80, 443, 7882 and UDP 7882$'
+stdout '^       https://moonwx\.github\.io/isshoni/install/vps#hetzner$'
+stdout '^\[info\] bandwidth     5 people, 2 sharing: ~41\.5 Mbps egress \(~44 on the wire\), ~39 GB per 2-hour session$'
+stdout '^12 ok · 0 warn · 0 fail$'
+! stderr .
+
+# --json is the one document of 04 §13.5.
+exec isshoni doctor --json
+stdout '^\{"schema":1,"version":"0\.3\.0","mode":"cli-with-server","summary":\{"ok":12,"warn":0,"fail":0,"skip":0,"info":5\},"env":\{"os":"linux",'
+stdout '"provider":"hetzner","user":"isshoni"\},"checks":\[\{"id":"config","status":"ok","code":"config\.ok",'
+stdout '"bandwidth":\{"input":\{"people":5,"sharing":2,"thumbnails":8,"quality":"1080p60","preset":"auto","hours":2\},'
+stdout '"ranAt":"2026-09-29T13:12:00\.000Z"\}$'
+! stderr .
+
+# --only names the checks, and the bandwidth flags the session of the estimate; both go to the server.
+exec isshoni doctor --only bandwidth,dns --people 10 --sharing 10
+stdout '^\[ ok \] dns           no domain: the site is this server''s IP address$'
+stdout '^\[info\] bandwidth     10 people, 10 sharing: ~105\.3 Mbps egress \(~111 on the wire\), ~99 GB per 2-hour session$'
+stdout '^1 ok · 0 warn · 0 fail$'
+! stdout 'tls|config'
+
+# A warning still exits 0; with --strict it exits 5.
+fakeserver set doctor warn
+exec isshoni doctor
+stdout '^\[warn\] udp_buffers   net\.core\.rmem_max is 212992, isshoni wants 8388608$'
+stdout '^       fix: printf ''net\.core\.rmem_max=8388608\\nnet\.core\.wmem_max=8388608\\n'' \| sudo tee /etc/sysctl\.d/60-isshoni\.conf && sudo sysctl --system$'
+stdout '^       more: https://moonwx\.github\.io/isshoni/troubleshooting#doctor-udp_buffers$'
+stdout '^11 ok · 1 warn · 0 fail$'
+exitcode 5 isshoni doctor --strict
+stdout '^11 ok · 1 warn · 0 fail$'
+! stderr .
+
+# A failure exits 5, with the cause the server knows and where to read more.
+fakeserver set doctor fail
+exitcode 5 isshoni doctor
+stdout '^\[fail\] tls           still no ip certificate for 203\.0\.113\.7, 192 minutes after the start$'
+stdout '^       fix: Let''s Encrypt couldn''t connect to 203\.0\.113\.7 on port 80 or 443\. Open TCP 80 and 443 in your cloud firewall$'
+stdout '^       more: https://moonwx\.github\.io/isshoni/troubleshooting#doctor-tls$'
+stdout '^11 ok · 0 warn · 1 fail$'
+! stderr .
+exitcode 5 isshoni doctor --json --only tls
+stdout '"summary":\{"ok":0,"warn":0,"fail":1,"skip":0,"info":0\}'
+stdout '"status":"fail","code":"tls\.no_cert"'
+stdout '"fixCode":"tls\.acme_unreachable"'
+! stderr .
+# A failure outside --only does not count.
+exec isshoni doctor --only dns,clock
+stdout '^2 ok · 0 warn · 0 fail$'
+fakeserver stop
+
+# A user the socket refuses gets the sudo message and exit 4, and no check runs.
+[peercred] fakeserver start -reject-peers
+[peercred] exitcode 4 isshoni doctor --only dns
+[peercred] ! stdout .
+[peercred] stderr '^Permission denied on .*admin\.sock: run it with sudo \(sudo isshoni doctor --only dns\)$'
+[peercred] fakeserver stop
+
+# Without a server doctor checks this machine itself; what only a running server knows is skipped. The checks
+# named here look at files only.
+env ISSHONI_DATA_DIR=$WORK/data
+env ISSHONI_TLS_MODE=off
+exec isshoni doctor --only config,data_dir,secrets,schema,tls,transfer,release,lan_privacy
+stdout '^isshoni doctor · .* · server not running · [0-9-]+ [0-9:]+ UTC$'
+stdout '^\[ ok \] config        .*\.empty\.toml$'
+stdout '^\[info\] data_dir      .*data does not exist yet; isshoni creates it at its first start$'
+stdout '^\[info\] secrets       .*secrets\.json does not exist yet; isshoni creates it at its first start$'
+stdout '^\[info\] schema        no database yet at .*isshoni\.db; isshoni creates it at its first start$'
+stdout '^\[skip\] tls           not checked: isshoni is not running$'
+stdout '^\[skip\] transfer      not checked: isshoni is not running$'
+stdout '^\[skip\] release       not checked: isshoni is not running$'
+stdout ' ok · 0 warn · 0 fail · 3 skipped$'
+! stderr .
+exec isshoni doctor --only tls --json
+stdout '"mode":"cli-offline"'
+stdout '"id":"tls","status":"skip","code":"skip\.needs_server"'
+! stderr .
+
+# Offline doctor creates nothing (04 §13.1): the data directory still does not exist.
+! exists $WORK/data
+
+# ports, offline: every port is bound and released at once. A port the config turns off is a warning (exit 0, with
+# --strict 5), a port that another program holds is a failure (exit 5).
+env ISSHONI_LISTEN_HTTP=127.0.0.1:0
+env ISSHONI_LISTEN_ICE_UDP=127.0.0.1:0
+env ISSHONI_LISTEN_ICE_TCP=127.0.0.1:0
+exec isshoni doctor --only ports
+stdout '^\[info\] ports         0/tcp, 0/udp and 0/tcp are free \(local check only\)$'
+stdout '^       This only checks this machine\. The browser connection test checks from outside\.$'
+! stdout 'more:'
+exec isshoni doctor --only ports --listen.ice-tcp=
+stdout '^\[warn\] ports         0/tcp and 0/udp are free; turned off: 7882/tcp \(listen\.ice_tcp is empty\) \(local check only\)$'
+stdout '^       more: https://moonwx\.github\.io/isshoni/troubleshooting#doctor-ports$'
+exitcode 5 isshoni doctor --only ports --listen.ice-tcp= --strict
+holdport
+exitcode 5 isshoni doctor --only ports --listen.http 127.0.0.1:$HELDPORT
+stdout '^\[fail\] ports         [0-9]+/tcp is in use by another program \(local check only\)$'
+stdout '^       fix: stop the other program \(another web server\?\), or run isshoni behind it with tls\.mode = "off"$'
+stdout '^       more: https://moonwx\.github\.io/isshoni/troubleshooting#doctor-ports$'
+stdout '^0 ok · 0 warn · 1 fail$'
+! stderr .
+exitcode 5 isshoni doctor --only ports --listen.http 127.0.0.1:$HELDPORT --json
+stdout '"status":"fail","code":"ports\.in_use"'
+stdout '"localOnly":true'
+! stderr .
+
+# A config with errors is a failed check, not exit 78: doctor is where the operator reads why serve refuses.
+exitcode 5 isshoni doctor --only config --tls.mode manual
+stdout '^\[fail\] config        1 error: tls\.mode = "manual" \(flag --tls\.mode\) needs tls\.cert_file and tls\.key_file$'
+stdout '^       more: https://moonwx\.github\.io/isshoni/troubleshooting#doctor-config$'
+
+# A caller who may not enter the socket's directory (/run/isshoni is 0750) is refused too. doctor does not take
+# that for "no server" and run its checks offline.
+[root] stop 'file modes do not keep root out'
+[windows] stop 'no file modes'
+fakeserver start
+chmod 000 $SOCKDIR
+exitcode 4 isshoni doctor
+! stdout .
+stderr '^Permission denied on .*admin\.sock: run it with sudo \(sudo isshoni doctor\)$'
+chmod 700 $SOCKDIR
+
+-- ids.txt --
+config
+data_dir
+secrets
+schema
+public_ip
+dns
+tls
+clock
+udp_buffers
+ports
+firewall_hint
+container
+lan_privacy
+transfer
+release
+nofile
+bandwidth

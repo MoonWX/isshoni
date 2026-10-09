@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -474,8 +475,22 @@ func (t *Transport) Close() error {
 
 // quietLogger is the pion logger of the muxes. Their per-connection and per-packet warnings ("Error reading first
 // packet from <addr>", "Failed to handle decode ICE from <addr>") come from port scanners and stray packets and
-// carry the remote address, so they are debug lines here; errors keep their level.
+// carry the remote address, so they are debug lines here. Errors keep their level, but for one: the UDP mux says
+// "Failed to write packet: io: read/write on closed pipe" for every packet that arrives for a connection that has
+// just closed, which is what a peer does that has not heard of the close yet (a PeerConnection the SFU closed, a
+// viewer that left). That is no error of the server's, so it is a debug line as well; a packet that fails for any
+// other reason stays an error.
 type quietLogger struct{ logging.LeveledLogger }
 
 func (q quietLogger) Warn(msg string)                  { q.Debug(msg) }
 func (q quietLogger) Warnf(format string, args ...any) { q.Debugf(format, args...) }
+
+func (q quietLogger) Errorf(format string, args ...any) {
+	if strings.HasPrefix(format, "Failed to write packet") && len(args) == 1 {
+		if err, ok := args[0].(error); ok && errors.Is(err, io.ErrClosedPipe) {
+			q.Debugf(format, args...)
+			return
+		}
+	}
+	q.LeveledLogger.Errorf(format, args...)
+}

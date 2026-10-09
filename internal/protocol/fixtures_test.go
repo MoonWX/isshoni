@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,7 +21,7 @@ var minimumFixtures = strings.Fields(`
 	pc.restart pc.close subscribe.update ok.subscribe.update subscribe.status
 	quality.hint.codec quality.hint.viewers caps.update stats.client stats.watch
 	stats.server invalidate server.shutdown error.request error.pc error.share.codec
-	error.session agent.send ok.agent.send agent.recv`)
+	error.session error.bad_request agent.send ok.agent.send agent.recv`)
 
 func TestMinimumFixtureSet(t *testing.T) {
 	for _, name := range minimumFixtures {
@@ -120,6 +121,44 @@ func TestParticipantAdminIsAdditive(t *testing.T) {
 	var p ParticipantInfo
 	if err := json.Unmarshal([]byte(`{"userId":"k3m9p2qxw7ht","name":"Alex","admin":false}`), &p); err != nil || p.Admin {
 		t.Errorf("an explicit false: admin = %v, %v", p.Admin, err)
+	}
+}
+
+// TestAgentSendWithoutPayload: an agent.send whose payload is missing or null is answered with bad_request for the
+// field payload (01 §8.14), and error.bad_request.json is that answer as the hub builds it: the FieldError of Decode
+// as an error with scope request, in reply to the request's id. agent.send.json is the request, with its payload
+// taken out or made null.
+func TestAgentSendWithoutPayload(t *testing.T) {
+	var send, want *fixture
+	for _, f := range loadFixtures(t, fixtureDir) {
+		switch f.name {
+		case "agent.send":
+			send = &f
+		case "error.bad_request":
+			want = &f
+		}
+	}
+	if send == nil || want == nil {
+		t.Fatal("no agent.send.json or no error.bad_request.json")
+	}
+	if _, err := Decode[AgentSend](send.env); err != nil {
+		t.Fatalf("agent.send.json as it is: %v", err)
+	}
+	for _, payload := range []string{"-", "null"} {
+		env := send.env
+		env.Data = json.RawMessage(with(string(send.env.Data), "payload", payload))
+		_, err := Decode[AgentSend](env)
+		var fe *FieldError
+		if !errors.As(err, &fe) {
+			t.Fatalf("payload %s: got %v, want a *FieldError", payload, err)
+		}
+		out, err := Marshal(MessageTypeError, "", env.ID, fe.BadRequest(ErrorScopeRequest))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w, got := envelopeTree(t, want.raw), envelopeTree(t, out); !reflect.DeepEqual(w, got) {
+			t.Errorf("payload %s: answered with %s, want error.bad_request.json: %s", payload, out, mustJSON(t, w))
+		}
 	}
 }
 

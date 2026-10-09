@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,6 +24,12 @@ type SFU struct {
 	// subEventEvery is the least time between two SubscriptionStateEvents about one subscription that the media path
 	// caused: subEventInterval (250 ms), shorter in tests. It is set before the first Join and never changes.
 	subEventEvery time.Duration
+	// timing holds the durations of PeerConnection recovery (config.go): the handshake timeout, the grace after
+	// failed, the offer re-send, the ICE restart spacing, the PC creation window and the stalled threshold. Tests
+	// shorten them; they are set before the first Join and never change.
+	timing timings
+	// handshakeTimeouts counts the new PeerConnections that weren't connected in time, by PCKind (Metrics).
+	handshakeTimeouts [PCSub + 1]atomic.Uint64
 
 	// The ticker (02 §5.4): one goroutine, started by the first Join and stopped by Close. kick wakes it at once for a
 	// share's state change, tickStop ends it and tickDone says that it has ended.
@@ -68,6 +75,7 @@ func New(cfg Config, deps Deps) (*SFU, error) {
 		pauseUnwatched: cfg.PauseUnwatchedLayers,
 		commandWait:    commandWait,
 		subEventEvery:  subEventInterval,
+		timing:         defaultTimings(),
 		kick:           make(chan struct{}, 1),
 		tickStop:       make(chan struct{}),
 		tickDone:       make(chan struct{}),
@@ -160,8 +168,9 @@ func (s *SFU) Close() error {
 // ---- the ticker (02 §5.4) ----
 
 // runTicker is the SFU's ticker goroutine. Every 250 ms, and at once when a share changes state (kick), it makes the
-// ShareUpdated calls that are due; once a second it turns the layers' counters into rates and sizes their packet
-// caches. Later slices add the rest of 02 §5.4's ticker work (README S57, S69, S84, S88).
+// ShareUpdated calls that are due; once a second it turns the layers' counters into rates, sizes their packet
+// caches, and makes the shares stalled whose pub PC has been away for 2 s. Later slices add the rest of 02 §5.4's
+// ticker work (README S69, S84, S88).
 func (s *SFU) runTicker() {
 	defer close(s.tickDone)
 	tick := time.NewTicker(tickInterval)
@@ -204,19 +213,29 @@ func (s *SFU) reportShares(now int64) {
 	}
 }
 
-// everySecond is the ticker's once-a-second work on the media path: each layer's rates and cache size (02 §9.1).
+// everySecond is the ticker's once-a-second work on the media path: each layer's rates and cache size (02 §9.1), and
+// the stalled check of 02 §5.3: a live share whose pub PC hasn't been connected for 2 s is stalled. The other ways
+// into stalled don't wait for the ticker (Share.detach, Conn.stallShares).
 func (s *SFU) everySecond(now int64) {
 	for _, sh := range s.liveShares() {
 		for _, l := range sh.attached() {
 			l.tick(now)
 		}
+		if sh.conn.pubAway(now) >= s.timing.stalled {
+			sh.stall("the pub PC is not connected")
+		}
 	}
 }
 
-// shareLive runs when a share's first keyframe has made it live (the layer's read loop calls it): the ticker reports
-// the state change at once.
-func (s *SFU) shareLive(sh *Share) {
-	s.log.Info("share live", "share_id", string(sh.id), "room_id", string(sh.room.id), "conn_id", string(sh.conn.id))
+// shareStateChanged runs when a share's media state has changed (02 §5.3): pending or stalled → live with a keyframe
+// (the layer's read loop calls it), live → stalled when its media stopped (the ticker, or the publishing Conn's
+// actor). The ticker reports the change at once.
+func (s *SFU) shareStateChanged(sh *Share, state ShareState, cause string) {
+	attrs := []any{"share_id", string(sh.id), "room_id", string(sh.room.id), "conn_id", string(sh.conn.id)}
+	if cause != "" {
+		attrs = append(attrs, "cause", cause)
+	}
+	s.log.Info("share "+state.String(), attrs...)
 	select {
 	case s.kick <- struct{}{}:
 	default: // a kick is already waiting, and the ticker looks at every share when it takes it

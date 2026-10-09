@@ -1,0 +1,277 @@
+{
+  "schema": 1,
+  "version": "0.3.0",
+  "mode": "server",
+  "summary": {
+    "ok": 12,
+    "warn": 1,
+    "fail": 0,
+    "skip": 0,
+    "info": 4
+  },
+  "env": {
+    "os": "linux",
+    "arch": "amd64",
+    "kernel": "6.8.0-45-generic",
+    "container": "none",
+    "systemd": true,
+    "provider": "hetzner",
+    "user": "isshoni"
+  },
+  "checks": [
+    {
+      "id": "config",
+      "status": "ok",
+      "code": "config.ok",
+      "params": {
+        "file": "",
+        "fileRead": false
+      },
+      "message": "defaults and flags",
+      "localOnly": false,
+      "durationMs": 0
+    },
+    {
+      "id": "data_dir",
+      "status": "ok",
+      "code": "data_dir.ok",
+      "params": {
+        "freeBytes": 37200000000,
+        "mode": "0700",
+        "offline": false,
+        "path": "/var/lib/isshoni"
+      },
+      "message": "/var/lib/isshoni (0700, 37.2 GB free)",
+      "localOnly": false,
+      "durationMs": 0
+    },
+    {
+      "id": "secrets",
+      "status": "ok",
+      "code": "secrets.ok",
+      "params": {
+        "mode": "0600",
+        "offline": false,
+        "path": "/var/lib/isshoni/secrets.json"
+      },
+      "message": "/var/lib/isshoni/secrets.json (0600)",
+      "localOnly": false,
+      "durationMs": 0
+    },
+    {
+      "id": "schema",
+      "status": "ok",
+      "code": "schema.ok",
+      "params": {
+        "binary": 7,
+        "version": 7
+      },
+      "message": "schema 7",
+      "localOnly": false,
+      "durationMs": 0
+    },
+    {
+      "id": "public_ip",
+      "status": "ok",
+      "code": "public_ip.ok",
+      "params": {
+        "iface": "eth0",
+        "ipv4": "203.0.113.7",
+        "ipv4Method": "interface",
+        "ipv6": "2001:db8::7",
+        "ipv6Method": "interface",
+        "local": "203.0.113.7",
+        "nat": "none"
+      },
+      "message": "203.0.113.7 (on interface eth0, confirmed by STUN), 2001:db8::7",
+      "localOnly": false,
+      "durationMs": 0
+    },
+    {
+      "id": "dns",
+      "status": "ok",
+      "code": "dns.no_domain",
+      "message": "no domain: the site is this server's IP address",
+      "localOnly": false,
+      "durationMs": 0
+    },
+    {
+      "id": "tls",
+      "status": "ok",
+      "code": "tls.ok",
+      "params": {
+        "ip": "203.0.113.7",
+        "issuer": "Let's Encrypt",
+        "mode": "ip",
+        "name": "203.0.113.7",
+        "names": [
+          "203.0.113.7"
+        ],
+        "nextRenewal": "2026-10-02T02:00:00.000Z",
+        "notAfter": "2026-10-05T10:00:00.000Z"
+      },
+      "message": "ip certificate for 203.0.113.7, valid until 2026-10-05 10:00 UTC, renews 2026-10-02",
+      "localOnly": false,
+      "durationMs": 0
+    },
+    {
+      "id": "clock",
+      "status": "ok",
+      "code": "clock.ok",
+      "params": {
+        "host": "acme-v02.api.letsencrypt.org",
+        "skewS": 0,
+        "sync": "yes"
+      },
+      "message": "synchronized, within 1 second of acme-v02.api.letsencrypt.org",
+      "localOnly": false,
+      "durationMs": 0
+    },
+    {
+      "id": "udp_buffers",
+      "status": "warn",
+      "code": "udp_buffers.low",
+      "params": {
+        "rcvBuf": 212992,
+        "rmemMax": 212992,
+        "sndBuf": 212992,
+        "want": 8388608,
+        "wmemMax": 212992
+      },
+      "message": "net.core.rmem_max is 212992, isshoni wants 8388608",
+      "fixCode": "udp_buffers.fix_sysctl",
+      "fix": "printf 'net.core.rmem_max=8388608\\nnet.core.wmem_max=8388608\\n' | sudo tee /etc/sysctl.d/60-isshoni.conf \u0026\u0026 sudo sysctl --system",
+      "localOnly": false,
+      "durationMs": 0
+    },
+    {
+      "id": "ports",
+      "status": "info",
+      "code": "ports.listening",
+      "params": {
+        "listening": [
+          "443/tcp",
+          "80/tcp",
+          "7882/udp",
+          "7882/tcp"
+        ]
+      },
+      "message": "listening on 443/tcp, 80/tcp, 7882/udp, 7882/tcp (local check only)\nThis only checks this machine. The browser connection test checks from outside.",
+      "localOnly": true,
+      "durationMs": 0
+    },
+    {
+      "id": "firewall_hint",
+      "status": "info",
+      "code": "firewall_hint.open_ports",
+      "params": {
+        "provider": "hetzner",
+        "tcpPorts": [
+          "80",
+          "443",
+          "7882"
+        ],
+        "udpPorts": [
+          "7882"
+        ]
+      },
+      "message": "Hetzner: Cloud Console → Firewalls → allow TCP 80, 443, 7882 and UDP 7882",
+      "localOnly": false,
+      "durationMs": 0
+    },
+    {
+      "id": "container",
+      "status": "ok",
+      "code": "container.none",
+      "message": "not in a container",
+      "localOnly": false,
+      "durationMs": 0
+    },
+    {
+      "id": "lan_privacy",
+      "status": "ok",
+      "code": "lan_privacy.not_macos",
+      "message": "not a macOS host",
+      "localOnly": false,
+      "durationMs": 0
+    },
+    {
+      "id": "transfer",
+      "status": "ok",
+      "code": "transfer.ok",
+      "params": {
+        "alertGb": 1000,
+        "egressBytes": 412000000000,
+        "ingressBytes": 98000000000,
+        "month": "2026-09",
+        "pct": 41
+      },
+      "message": "412.0 GB of 1000 GB out in 2026-09 (41 %)",
+      "localOnly": false,
+      "durationMs": 0
+    },
+    {
+      "id": "release",
+      "status": "ok",
+      "code": "release.ok",
+      "params": {
+        "latest": "0.3.0",
+        "url": "https://github.com/MoonWX/isshoni/releases/tag/v0.3.0",
+        "version": "0.3.0"
+      },
+      "message": "0.3.0 is the latest release",
+      "localOnly": false,
+      "durationMs": 0
+    },
+    {
+      "id": "nofile",
+      "status": "info",
+      "code": "nofile.ok",
+      "params": {
+        "limit": 65536,
+        "offline": false,
+        "want": 8192
+      },
+      "message": "open-file limit 65536",
+      "localOnly": false,
+      "durationMs": 0
+    },
+    {
+      "id": "bandwidth",
+      "status": "info",
+      "code": "bandwidth.estimate",
+      "params": {
+        "egressMediaMbps": 41.54,
+        "egressWireMbps": 43.62,
+        "hours": 2,
+        "iface": "eth0",
+        "nicMbps": 1000,
+        "people": 5,
+        "sharing": 2,
+        "transferPerSessionGb": 39.3
+      },
+      "message": "5 people, 2 sharing: ~41.5 Mbps egress (~44 on the wire), ~39 GB per 2-hour session",
+      "localOnly": false,
+      "durationMs": 0
+    }
+  ],
+  "bandwidth": {
+    "input": {
+      "people": 5,
+      "sharing": 2,
+      "thumbnails": 8,
+      "quality": "1080p60",
+      "preset": "auto",
+      "hours": 2
+    },
+    "perViewerMbps": {
+      "sharer": 8.13,
+      "viewer": 8.43
+    },
+    "egressMediaMbps": 41.54,
+    "egressWireMbps": 43.62,
+    "ingressMediaMbps": 16.86,
+    "transferPerSessionGb": 39.3
+  },
+  "ranAt": "2026-09-29T20:15:00.000Z"
+}

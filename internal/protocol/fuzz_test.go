@@ -157,6 +157,9 @@ func FuzzDecode(f *testing.F) {
 	f.Add(targetIndex(targets, Hello{}), []byte(`{"feat`+jsonEsc("0075")+`res":[`+strings.Repeat(`"x",`, 40)+`"x"]}`))
 	f.Add(targetIndex(targets, RoomState{}), []byte(`{"shares":`+dense(200)+`,"participants":[{"connections":`+dense(50)+`}]}`))
 	f.Add(targetIndex(targets, AgentSend{}), []byte(`{"to":"c_1","kind":"a.b","payload":`+strings.Repeat("[", 30)+strings.Repeat("]", 30)+`}`))
+	f.Add(targetIndex(targets, AgentSend{}), []byte(`{"toRole":"agent","kind":"a.b","payload":null}`))
+	f.Add(targetIndex(targets, AgentSend{}), []byte(`{"toRole":"agent","kind":"a.b","payload":{"a":null},"payload": null }`))
+	f.Add(targetIndex(targets, AgentSend{}), []byte(`{"toRole":"agent","kind":"a.b","payload":null,"payload":[null]}`))
 	f.Add(targetIndex(targets, ShareStart{}), []byte(`{"kind":"tab","label":"`+jsonEsc("202e")+` `+jsonEsc("0041")+` ","preset":"game","ref":"r"}`))
 	f.Add(targetIndex(targets, Error{}), []byte(`{"code":"x","params":{"a":[1,[2,{"b":null}]],"c":1e308}}`))
 	f.Fuzz(func(t *testing.T, idx uint8, data []byte) {
@@ -181,6 +184,12 @@ func FuzzDecode(f *testing.F) {
 				t.Fatalf("decoding %v: error %v (%T) is neither a *FieldError nor a *Error", tg.typ, err, err)
 			}
 			return
+		}
+		// An agent.send that passed has a payload for the relay to hand on: some JSON value, and not null (01 §8.14).
+		if a, ok := v.Interface().(*AgentSend); ok {
+			if !json.Valid(a.Payload) || bytes.Equal(bytes.TrimSpace(a.Payload), []byte("null")) {
+				t.Fatalf("accepted an agent.send with the payload %q", a.Payload)
+			}
 		}
 		// A decoded payload encodes, and its encoding is canonical: decoding and encoding it again gives the same
 		// bytes (and passes validation again).

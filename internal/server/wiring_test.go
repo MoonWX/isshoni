@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -29,6 +30,7 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/config"
 	"github.com/MoonWX/isshoni/internal/server/netx"
 	"github.com/MoonWX/isshoni/internal/server/ops"
+	"github.com/MoonWX/isshoni/internal/server/ops/doctor"
 	"github.com/MoonWX/isshoni/internal/server/servertest"
 	"github.com/MoonWX/isshoni/internal/server/signal/signaltest"
 	"github.com/MoonWX/isshoni/internal/server/store"
@@ -423,21 +425,34 @@ func TestAdminSocket(t *testing.T) {
 	// The socket shows the readiness checks to whoever reaches it: the operator (04 §11.1).
 	ready, err := admin.Ready(ctx)
 	if err != nil || ready.Status != ops.StatusReady ||
-		!mapsEqual(ready.Checks, map[string]string{"db": "ok", "signal": "ok", "tls": "ok"}) {
+		!mapsEqual(ready.Checks, map[string]string{"db": "ok", "media": "ok", "signal": "ok", "tls": "ok"}) {
 		t.Errorf("ready = %+v, %v", ready, err)
 	}
 	st, err := admin.Status(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The listeners as bound, the media sockets among them, and what the server's ICE candidates name: on the
+	// harness's loopback ports that is the sockets themselves.
+	addrs := srv.Srv.Addrs()
 	wantListeners := []api.ListenerInfo{
-		{Key: "listen.http", Network: "tcp", Addr: srv.Srv.Addrs().HTTP.String()},
+		{Key: "listen.http", Network: "tcp", Addr: addrs.HTTP.String()},
+		{Key: "listen.ice_udp", Network: "udp", Addr: addrs.ICEUDP.String()},
+		{Key: "listen.ice_tcp", Network: "tcp", Addr: addrs.ICETCP.String()},
 		{Key: "listen.admin_socket", Network: "unix", Addr: srv.AdminSocket},
+	}
+	wantAdvertised := []api.AdvertisedAddr{
+		{Proto: "udp", Addr: addrs.ICEUDP.String(), Via: api.TransportUDP},
+		{Proto: "tcp", Addr: addrs.ICETCP.String(), Via: api.TransportTCP7882},
 	}
 	if st.Version != version.Version() || st.Origin != srv.URL || st.TLS.Mode != api.TLSModeOff || !st.TLS.Ready ||
 		st.SchemaVersion != store.LatestSchemaVersion() || !slices.Equal(st.Listeners, wantListeners) ||
+		!slices.Equal(st.Advertised, wantAdvertised) || st.UDPRcvBufBytes <= 0 || st.UDPSndBufBytes <= 0 ||
 		time.Since(st.StartedAt) > time.Minute || st.Rooms != 0 {
-		t.Errorf("status = %+v", st)
+		t.Errorf("status = %+v\nwant the listeners %+v and the advertised addresses %+v", st, wantListeners, wantAdvertised)
+	}
+	if !strings.HasPrefix(addrs.ICEUDP.String(), "127.0.0.1:") || !strings.HasPrefix(addrs.ICETCP.String(), "127.0.0.1:") {
+		t.Errorf("ICE listeners %v and %v, want the harness's loopback ports", addrs.ICEUDP, addrs.ICETCP)
 	}
 
 	// Accounts: nobody yet, then the admin.
@@ -483,6 +498,94 @@ func TestAdminSocket(t *testing.T) {
 	srv.Restart(t)
 	if users, err := admin.Users(ctx); err != nil || len(users.Users) != 2 {
 		t.Errorf("users after a restart = %+v, %v", users, err)
+	}
+}
+
+// TestDoctorOverTheAdminSocket: `isshoni doctor` on a machine with a running server asks that server (04 §13.1). The
+// checks then run in the server's process and report what it has bound and opened, instead of probing for it. A run
+// of every check is the server's last report, kept in 03's meta table, so the server that follows has it from its
+// start; that server reads it when it begins its own runs (20 s after the start, then once a day).
+func TestDoctorOverTheAdminSocket(t *testing.T) {
+	srv := servertest.Start(t, servertest.Options{Deps: wiredDeps()})
+	admin, ctx := adminSocket(t, srv)
+
+	var ae *api.Error
+	if _, err := srv.Srv.Doctor().Last(ctx); !errors.As(err, &ae) || ae.Code != api.CodeNotFound {
+		t.Errorf("the last report of a new server: %v, want not_found", err)
+	}
+	rep, err := admin.Doctor(ctx, ops.AdminDoctorRequest{})
+	if err != nil {
+		t.Fatalf("doctor: %v", err)
+	}
+	if rep.Mode != api.DoctorModeCLIWithServer || rep.Schema != api.DoctorReportSchema || rep.Version != version.Version() {
+		t.Errorf("report: mode %q, schema %d, version %q", rep.Mode, rep.Schema, rep.Version)
+	}
+	var ids []string
+	checks := map[string]api.DoctorCheck{}
+	for _, c := range rep.Checks {
+		ids = append(ids, c.ID)
+		checks[c.ID] = c
+	}
+	if !slices.Equal(ids, doctor.CheckIDs()) {
+		t.Errorf("checks %v, want every check of 04 §13.2 in order: %v", ids, doctor.CheckIDs())
+	}
+
+	// What the checks can only know from the running server: its config and data directory, the schema of its open
+	// database, its certificate mode, and the ports it bound, which an offline run would try to bind itself.
+	if c := checks["data_dir"]; c.Status != api.DoctorStatusOK || c.Params["path"] != srv.DataDir || c.Params["offline"] != false {
+		t.Errorf("data_dir = %+v, want ok for %s, not offline", c, srv.DataDir)
+	}
+	if c := checks["schema"]; c.Status != api.DoctorStatusOK || c.Code != "schema.ok" || c.Params["version"] != float64(store.LatestSchemaVersion()) {
+		t.Errorf("schema = %+v, want schema.ok at version %d", c, store.LatestSchemaVersion())
+	}
+	if c := checks["tls"]; c.Status != api.DoctorStatusOK || c.Code != "tls.off" {
+		t.Errorf("tls = %+v, want tls.off", c)
+	}
+	addrs := srv.Srv.Addrs()
+	ports := checks["ports"]
+	listening, _ := ports.Params["listening"].([]any)
+	for _, want := range []string{
+		strconv.Itoa(addrs.HTTP.(*net.TCPAddr).Port) + "/tcp",
+		strconv.Itoa(srv.UDPPort) + "/udp",
+		strconv.Itoa(srv.TCPPort) + "/tcp",
+	} {
+		if ports.Code != "ports.listening" || !slices.Contains(listening, any(want)) {
+			t.Errorf("ports = %+v, want ports.listening with %s", ports, want)
+		}
+	}
+	for _, c := range rep.Checks {
+		if c.Status == api.DoctorStatusFail {
+			t.Logf("doctor fails %s on this machine: %s", c.ID, c.Message) // the machine's own state, not the wiring's
+		}
+	}
+
+	// The run of every check is the last report, as the server made it; a run of some checks leaves it alone.
+	last, err := srv.Srv.Doctor().Last(ctx)
+	if err != nil || last.Mode != api.DoctorModeServer || len(last.Checks) != len(rep.Checks) {
+		t.Errorf("the last report: mode %q with %d checks, %v; want the full run", last.Mode, len(last.Checks), err)
+	}
+	some, err := admin.Doctor(ctx, ops.AdminDoctorRequest{Only: []string{"schema", "ports"}})
+	if err != nil || len(some.Checks) != 2 || some.Checks[0].ID != "schema" || some.Checks[1].ID != "ports" {
+		t.Errorf("doctor --only schema,ports = %+v, %v", some.Checks, err)
+	}
+	if again, err := srv.Srv.Doctor().Last(ctx); err != nil || len(again.Checks) != len(rep.Checks) {
+		t.Errorf("the last report after a run of two checks has %d checks, %v", len(again.Checks), err)
+	}
+	if _, err := admin.Doctor(ctx, ops.AdminDoctorRequest{Only: []string{"no_such_check"}}); err == nil {
+		t.Error("doctor --only no_such_check was answered with a report")
+	}
+
+	// The next server has the report at once: its doctor reads the meta table when its own runs begin.
+	srv.Restart(t)
+	var loaded api.DoctorReport
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if loaded, err = srv.Srv.Doctor().Last(ctx); err == nil || time.Now().After(deadline) {
+			break
+		}
+	}
+	if err != nil || loaded.RanAt.Sub(rep.RanAt).Abs() > time.Second || len(loaded.Checks) != len(rep.Checks) {
+		t.Errorf("the last report after a restart: ran at %v with %d checks, %v; want the one of %v", loaded.RanAt,
+			len(loaded.Checks), err, rep.RanAt)
 	}
 }
 
@@ -838,6 +941,12 @@ func TestServerWithoutASite(t *testing.T) {
 	if _, err := admin.SetupURL(ctx, 0); !errors.As(err, &ae) || ae.API.Code != api.CodeInternal {
 		t.Errorf("setup-url without a site: %v, want an error answer", err)
 	}
+	// Doctor answers there too, and names what is missing with its fix (04 §13.2 public_ip).
+	rep, err := admin.Doctor(ctx, ops.AdminDoctorRequest{Only: []string{"public_ip"}})
+	if err != nil || len(rep.Checks) != 1 || rep.Checks[0].Status != api.DoctorStatusFail ||
+		rep.Checks[0].Code != "public_ip.none" || rep.Checks[0].Fix == "" {
+		t.Errorf("doctor --only public_ip without a site = %+v, %v; want the failing public_ip.none with a fix", rep.Checks, err)
+	}
 	if _, err := os.Stat(cfg.Paths().DB); err != nil {
 		t.Errorf("the database: %v", err)
 	}
@@ -902,5 +1011,11 @@ func TestPublicAddressWatch(t *testing.T) {
 	}
 	if warnings != 1 {
 		t.Errorf("the change was reported %d times, want once:\n%s", warnings, logs.String())
+	}
+	// A server that has its site never restarts over an address: it may be serving friends.
+	select {
+	case <-s.RestartAsked():
+		t.Error("a server with a site asked for a restart over a changed address")
+	default:
 	}
 }

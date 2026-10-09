@@ -29,7 +29,7 @@ import (
 // with a Pion publisher and a Pion viewer on loopback. They check what the tables with the fake Conn can't: that
 // the real API takes what the adapter passes, and that the real errors and events come out as 01 §15.4 says.
 //
-// They assert only what holds for every slice of the SFU: a method that a later slice implements (README S57, S69)
+// They assert only what holds for every slice of the SFU: a method that a later slice implements (README S69)
 // may return an error today and nil tomorrow, and the SFU may send more events than it does now.
 
 // loopbackOnly is a netx.InterfaceLister with only 127.0.0.1, so the Transport doesn't depend on the host.
@@ -518,10 +518,11 @@ func TestRealSFU(t *testing.T) {
 	}
 
 	// Nothing so far is the adapter's or the SFU's bug, so nothing was logged as one. (A method of a later slice is
-	// logged as an internal error until its slice lands: those lines name their call.)
+	// logged as an internal error until its slice lands: that line names its call. README S57 has built RestartICE,
+	// ResetPC and ClosePC, so a line about one of them is a failure now.)
 	for _, l := range atLeast(rp.logs.take(), slog.LevelWarn) {
 		switch l.Attrs["call"] {
-		case "RestartICE", "ResetPC", "ClosePC", "SetDecodeCaps":
+		case "SetDecodeCaps":
 		default:
 			t.Errorf("logged %+v", l)
 		}

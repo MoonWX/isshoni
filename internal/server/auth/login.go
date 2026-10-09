@@ -166,6 +166,8 @@ func (s *Service) takeHashBudget(ctx context.Context, m ReqMeta) error {
 //   - a completed login gives the auth-user token back and refills this address's auth-user-ip bucket (loggedIn);
 //   - every other end gives both back (release): an empty hash budget, a full hash queue, a store or context error,
 //     and a correct password for an account that is not active. None of them is a failed password check.
+//
+// The password a logged-in user types again (verifyOwnPassword in selfservice.go) holds its place the same way.
 type passwordAttempt struct {
 	t      *throttles
 	userIP userIPKey
@@ -487,11 +489,8 @@ func (s *Service) Login(ctx context.Context, username, password string, m ReqMet
 // After the commit the session leaves the cache and its WebSocket connections are closed with ReasonLoggedOut. It is
 // idempotent: a session that is already gone is no error. (M2: a bearer principal's device.)
 func (s *Service) Logout(ctx context.Context, p Principal, m ReqMeta) error {
-	if p.Method != MethodSession {
-		return notImplemented("Logout for a device")
-	}
-	if p.UserID == "" || p.SessionID == "" {
-		return errUnauthenticated()
+	if err := webCaller("Logout", p); err != nil {
+		return err
 	}
 	now := s.now()
 	err := s.db.Write(ctx, func(q *store.Q) error {

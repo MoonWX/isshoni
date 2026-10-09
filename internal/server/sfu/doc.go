@@ -41,8 +41,9 @@
 //	DownTrack RTCP    1 per DownTrack  the viewer's PLI and FIR for the track, until its sender stops
 //	                                   (DownTrack.readRTCP); owned by the sub PC
 //	Ticker            1 per SFU        every 250 ms, and at once for a state change: the ShareUpdated calls that are
-//	                                   due; every second: each layer's rates and cache size. Started by the first
-//	                                   Join, stopped by Close. README S57, S69, S84 and S88 add to it
+//	                                   due; every second: each layer's rates and cache size, and the stalled check
+//	                                   (a live share whose pub PC has been away for 2 s). Started by the first
+//	                                   Join, stopped by Close. README S69, S84 and S88 add to it
 //	Probe             1 per probe PC   README S76
 //
 // Rules:
@@ -67,11 +68,20 @@
 //     never block. Keyframe requests are throttled per layer by a compare-and-swap, so callers need no lock.
 //   - Bind and Unbind of a DownTrack are called by Pion with the sender's lock held. They read the negotiation and
 //     store the result, taking DownTrack.mu for a moment; that lock is never held across a Pion call, so the two
-//     are only ever taken in this order.
+//     are only ever taken in this order. Unbind ends the binding of the sender that stopped and no other: a sub PC
+//     that Pion closes by itself stops its senders late, when a rebuilt sub PC may have bound the DownTrack already.
 //   - Pion callbacks (OnTrack, OnConnectionStateChange) only append to the Conn's internal event queue. They never
 //     block, so a Pion call made by the actor can't deadlock on its own callback. Pion runs each callback in a
 //     goroutine of its own, so their order means nothing: a state callback carries no state, and the actor reads
-//     the PC's state when it handles the post (onPCState).
+//     the PC's state when it handles the post (onPCState), and once more when a track arrives.
+//   - A Conn's timers (the handshake timeout and the grace of each PC, the re-send of a sub offer, the debounce) only
+//     post to its event queue too; the actor drops the post of a timer that was stopped or set again meanwhile
+//     (actorTimer). They stop when their PC closes.
+//   - A share's media state is decided where its facts are: pending → live and stalled → live by the read loop of
+//     the layer whose keyframe arrives, live → stalled by the ticker (2 s without a connected pub PC), by the
+//     publishing Conn's actor (the pub PC failed) or by whoever detaches the share's last video layer. What they
+//     know of the pub PC is what its Conn's actor has seen (Conn.pubUp, an atomic), so the ways into stalled and out
+//     of it go by the same view and can't flap against each other.
 //   - A pubTrack reader whose RTP read fails posts the track's end to the actor, which detaches the track and takes
 //     it out of pubPC.tracks (pubTrackEnded). The table holds only tracks that are still read, so an offer never
 //     binds an ended track to a share.
@@ -88,18 +98,28 @@
 //
 //   - sfu.go, room.go, participant.go, share.go: the object model; New, Close, Ready, Join, the room reads,
 //     StopShare, CloseRoom, SetLimits; StartShare, UpdateShare and the encodings per preset (02 §8.6); the ticker;
-//     a share's media state (pending until its first keyframe, then live) and its ShareUpdated calls: a state
-//     change at once, a layer, profile or audio change while live at most every 250 ms (02 §5.3, §6.2);
-//   - conn.go: the Conn actor with its two queues, Close and Done, PC state events, the remote-candidate buffer;
+//     a share's media state and its ShareUpdated calls: a state change at once, a layer, profile or audio change
+//     while live at most every 250 ms (02 §5.3, §6.2). A share is pending until its first keyframe, then live. It
+//     is stalled when its pub PC hasn't been connected for 2 s, at once when that PC failed, and at once when its
+//     last video track ended (the pub PC closed, or a new gen replaced it); it is live again with the first keyframe
+//     that arrives while its pub PC is connected. The SFU never ends a share: the hub's timeouts do;
+//   - conn.go: the Conn actor with its two queues, Close and Done; the PC states of 02 §5.3 with their events and
+//     timers (below); the remote candidates; RestartICE, ResetPC, ClosePC and Resync;
 //   - pubpc.go: the publish PC: HandleOffer (gen and neg, validation, the answer with its Opus and a=inactive edits,
 //     the stored answer for a repeated neg), incoming tracks bound to shares by the tracks binding until they end,
 //     their read loops, and the stuck state of a PC that Pion left holding an offer it refused (it takes no other
-//     offer of its gen);
-//   - subpc.go: the subscribe PC's offers with gen, neg and tracks, the 50 ms debounce, HandleAnswer, the DTLS-ready
-//     gate, and the closed state: a sub PC the client closed, or one the SFU closed after a fatal error (an offer it
-//     couldn't make, an answer Pion refused). The m-sections of a share that ended go inactive and are taken over by
-//     the Conn's next subscription (Pion's AddTrack) once the viewer's answer has left them inactive, so a sub PC's
-//     SDP is as large as the most subscriptions its Conn had at once (02 §9.3);
+//     offer of its gen). An offer of a higher gen replaces the PC and leaves its shares, stalled until the new
+//     tracks bring a keyframe; an offer with new ICE credentials restarts ICE on the same PC;
+//   - subpc.go: the subscribe PC's negotiation, the whole table of 02 §5.3: offers with gen, neg and tracks, the
+//     50 ms debounce, HandleAnswer, the 15 s re-send of an offer without an answer, ICE restarts (one at a time: a
+//     request while one is queued, unanswered or less than 5 s old with ICE neither connected nor failed since
+//     starts none), the DTLS-ready gate, and the closed state: a sub PC that its client closed, or that the SFU
+//     closed after a fatal error (an offer it couldn't make, an answer Pion refused), a missed handshake or 30 s of
+//     failed. A closed sub PC is replaced by one of the next gen, with every subscription in its first offer, when
+//     the Conn needs a sub PC again: on ResetPC (which does the same to a PC that isn't closed), RestartICE, Resync
+//     or a subscription change. The m-sections of a share that ended go inactive and are taken over by the Conn's
+//     next subscription (Pion's AddTrack) once the viewer's answer has left them inactive, so a sub PC's SDP is as
+//     large as the most subscriptions its Conn had at once (02 §9.3);
 //   - subscription.go: UpdateSubscriptions and layer selection (02 §10.1). A request for high gets the full layer
 //     f, or the preview layer q while that is all the share has; low gets q and never f; audio flows while Audio is
 //     set and the share has an audio track. The choice is made again whenever a layer of the share comes or goes,
@@ -127,15 +147,47 @@
 //   - codec.go, h264.go, sdpcheck.go: profiles, the payload-type table and both MediaEngines (02 §8.1–8.2),
 //     keyframe-start detection and the SPS parser (02 §9.1), pub-offer validation and the answer edits (02 §8.4–8.5).
 //
+// # PeerConnection states, recovery and guards (02 §5.3, §6.5, §12)
+//
+// The client drives the recovery of both of its PCs (01 §10.4); the SFU reports each state of a Conn's current PC
+// once (PCStateEvent) and cleans up:
+//   - A new PC has 10 s from its first answer to get connected. One that misses that is closed and reported failed
+//     with PCReasonHandshakeTimeout, which for a pub PC has the client offer the next gen. An ICE restart has no
+//     timer and no event.
+//   - A failed PC is kept for 30 s, for an ICE restart or a rebuild, then closed and reported closed with
+//     PCReasonGraceExpired. A pub PC's shares are stalled meanwhile and afterwards.
+//   - A PC whose client closes its side is closed by Pion (the DTLS close_notify), and the SFU keeps it that way
+//     (02 §5.3). The other choice, SettingEngine.DisableCloseByDTLS, leaves a PC that Pion goes on reporting as
+//     connected, taking every packet written to it without an error, until ICE gives up 20 s later and the grace
+//     after failed 30 s after that: the gate would stay open on a dead PC, and a share would stay live without its
+//     publisher. A closed pub PC is gone, and only a higher gen brings a new one; a closed sub PC waits for the
+//     Conn's next request (above). ClosePC (01's pc.close) closes either kind without a report, and finds a PC that
+//     the client's close_notify closed first as it wants it.
+//   - Resync, after a WebSocket resume, sends again what signal may have dropped: the outstanding sub offer, each
+//     subscription's state, a CodecPolicyEvent per share the Conn publishes. It ICE-restarts a sub PC that isn't
+//     connected and rebuilds one that has closed.
+//
+// The guards of 02 §12 that live here:
+//   - One pub and one sub PC per Conn: an offer for a third is sfu.pc_limit; a second of one kind can't be asked
+//     for, a new gen replaces.
+//   - 10 PeerConnections of a kind that a client makes a Conn create within a minute: pub offers of a new gen, and
+//     sub PCs after the Conn's first, which are ResetPC's and the successors of a closed sub PC, whichever request
+//     builds them (ResetPC, RestartICE, Resync or a subscription change). One more is sfu.pc_rate_limited with
+//     RetryAfter: the error of HandleOffer, ResetPC and RestartICE, and an ErrorEvent about the sub PC for Resync
+//     and a subscription change, which have no error to put it in. Nothing builds the refused PC later; the
+//     client asks again. The SFU's own codec rebuilds (README S69) won't count.
+//   - 64 remote candidates per PC and gen, trickled or in the PC's remote descriptions. A candidate is what Pion
+//     keeps as one: its transport address, its type and its related address together (candidateKey), since Pion
+//     pairs and checks each of those and has no cap of its own. One that comes again is counted once. The pub PC's
+//     candidates are its own: those a client trickles for a later pub gen wait apart, for that gen's offer, and
+//     count toward that gen's 64.
+//   - 4 shares per participant; 256 subscriptions per Conn and 64 per call; the SDP guards of sdpcheck.go; the
+//     command queue; the keyframe throttle; the DownTrack queues.
+//
 // # What later slices add
 //
 // The whole API is declared; a method that a later slice implements returns an error that wraps ErrNotImplemented
-// (RestartICE, ResetPC, ClosePC, SetDecodeCaps, Probe), or does nothing yet (Resync). In README order:
-//   - S57: the stalled state (a share that went live stays live until it ends), RestartICE, ResetPC, ClosePC,
-//     Resync (which also sends the current SubscriptionStateEvents again), the 15 s sub offer re-send, the rebuild
-//     of a sub PC that closed (subPC.closed, whoever closed it: until then its subscriptions wait and new ones fail
-//     with sfu.internal), the 10 s handshake timer, the 30 s grace after failed, sfu.pc_limit and
-//     sfu.pc_rate_limited;
+// (SetDecodeCaps, Probe). In README order:
 //   - S63: NACK/RTX from the cache (the DownTrack's RTX queue), sender reports forwarded to the viewers (a Layer
 //     already keeps its latest one, for the munger), and the tests of padding and of the publisher's redundant RTX;
 //   - S69: the room codec policy with its hysteresis (CodecPolicy is ProfileHigh until then), the codec filter of
@@ -144,7 +196,7 @@
 //   - S76: Probe. S79: the transports, RTTs and counters of Snapshot, ConnStats and Metrics (the Layers and
 //     DownTracks count; nothing sums them up yet). S84: the downlink allocator (REMB, receiver reports, queue
 //     drops) and the pacer. S88: the admin cap as REMB and quality hint (SetLimits already caps new ShareParams),
-//     layer pausing.
+//     layer pausing, and the last QualityHintEvent per share in Resync.
 //
 // The server's cap on a subscription (02 §10.1: effective = min(requested, cap), with its reason) is in place
 // (Conn.capSubscription); S69 and S84 are its callers.

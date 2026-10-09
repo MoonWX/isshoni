@@ -552,15 +552,7 @@ func TestLaterMethodsSayNotImplemented(t *testing.T) {
 			t.Errorf("%s: %v", method, err)
 		}
 	}
-	check("LogoutEverywhere", e.svc.LogoutEverywhere(ctx, p, m))
-	_, err := e.svc.ChangePassword(ctx, p, "", "", m)
-	check("ChangePassword", err)
-	check("DeleteSelf", e.svc.DeleteSelf(ctx, p, "", m))
-	check("RevokeSession", e.svc.RevokeSession(ctx, p, "", m))
-	_, err = e.svc.RevokeOtherSessions(ctx, p, m)
-	check("RevokeOtherSessions", err)
-	check("RevokeDevice", e.svc.RevokeDevice(ctx, p, "", m))
-	_, err = e.svc.UpdateUser(ctx, store.CLIActor, "", UserChange{})
+	_, err := e.svc.UpdateUser(ctx, store.CLIActor, "", UserChange{})
 	check("UpdateUser", err)
 	check("DeleteUser", e.svc.DeleteUser(ctx, store.CLIActor, ""))
 	_, _, err = e.svc.SignOutUser(ctx, store.CLIActor, "")

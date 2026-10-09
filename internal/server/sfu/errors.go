@@ -68,6 +68,14 @@ func errBusy() *Error {
 	return e
 }
 
+// errPCRateLimited is the error of a call that would make the Conn create one PeerConnection of a kind too many
+// within a minute (02 §12); retryAfter is when the oldest counted one leaves that minute.
+func errPCRateLimited(kind PCKind, retryAfter time.Duration) *Error {
+	e := newError(CodePCRateLimited, "too many "+kind.String()+" PeerConnections within a minute")
+	e.RetryAfter = retryAfter
+	return e
+}
+
 // newError returns an *Error for code with the retryable flag of 02 §6.3 and a log message.
 func newError(code, msg string) *Error {
 	return &Error{Code: code, Retryable: retryableCode(code), msg: msg}
