@@ -21,25 +21,30 @@ warn() {
 }
 
 # apply_sysctl applies /usr/lib/sysctl.d/60-isshoni.conf now, as the next boot will (an /etc/sysctl.d file of the
-# same name wins, as at boot). Like install.sh (06 §4.6) it does so only while a running value is below the file's:
-# a larger value from another sysctl.d file would otherwise be lowered until the next boot. Where the values can't
-# be read or written (most containers), nothing happens.
+# same name wins, as at boot). Like install.sh (06 §4.6) it never lowers a value: each of the two keys is written
+# only while its running value is below the file's, because another sysctl.d file may have set a larger one, which
+# would otherwise shrink until the next boot. Where the values can't be read or written (most containers), nothing
+# happens.
 apply_sysctl() {
-  low=0
+  sysctl_bin=
+  for bin in /usr/lib/systemd/systemd-sysctl /lib/systemd/systemd-sysctl; do
+    if [ -x "$bin" ]; then
+      sysctl_bin=$bin
+      break
+    fi
+  done
+  [ -n "$sysctl_bin" ] || return 0
+  failed=0
   for key in rmem_max wmem_max; do
     cur=$(cat "/proc/sys/net/core/$key" 2>/dev/null) || cur=
     case $cur in
-    '' | *[!0-9]*) ;;
-    *) [ "$cur" -ge "$BUFFER_BYTES" ] || low=1 ;;
+    '' | *[!0-9]*) continue ;;
     esac
+    [ "$cur" -lt "$BUFFER_BYTES" ] || continue
+    "$sysctl_bin" --prefix="/net/core/$key" 60-isshoni.conf || failed=1
   done
-  [ "$low" = 1 ] || return 0
-  for bin in /usr/lib/systemd/systemd-sysctl /lib/systemd/systemd-sysctl; do
-    [ -x "$bin" ] || continue
-    "$bin" 60-isshoni.conf ||
-      warn 'could not apply 60-isshoni.conf (UDP buffer sizes); "isshoni doctor" shows the sizes in use'
-    return 0
-  done
+  [ "$failed" = 0 ] ||
+    warn 'could not apply 60-isshoni.conf (UDP buffer sizes); "isshoni doctor" shows the sizes in use'
 }
 
 # Everything but a first install counts as an upgrade, dpkg's abort-* cases too: the files of a running service may
@@ -60,8 +65,9 @@ if [ -d /run/systemd/system ]; then
   fi
 fi
 
-# Enabled means the admin has started it before (the last step below): there is nothing left to say.
-if systemctl is-enabled --quiet isshoni.service 2>/dev/null; then
+# Enabled or running means the admin has started it before (the last step below): there is nothing left to say.
+if systemctl is-enabled --quiet isshoni.service 2>/dev/null ||
+  systemctl is-active --quiet isshoni.service 2>/dev/null; then
   exit 0
 fi
 
@@ -73,7 +79,9 @@ if [ ! -e "$CONFIG" ]; then
     "   or, without a domain, for this server's public IP address:" \
     "     sudo isshoni config init --path $CONFIG --tls.mode ip" \
     '   Then let the service read it:' \
-    "     sudo chown root:isshoni $CONFIG"
+    "     sudo chown root:isshoni $CONFIG" \
+    "   isshoni gets its certificate from Let's Encrypt. Using it means you accept the Let's Encrypt" \
+    '   Subscriber Agreement: https://letsencrypt.org/repository/'
   step=$((step + 1))
 fi
 say "$step. Open ports 80 and 443 (TCP) and 7882 (TCP and UDP), here and in your provider's cloud firewall."
@@ -82,7 +90,9 @@ say "$step. Open ports 80 and 443 (TCP) and 7882 (TCP and UDP), here and in your
 if LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active'; then
   say '     sudo ufw allow isshoni'
 fi
-if [ "$(firewall-cmd --state 2>/dev/null)" = running ]; then
+# systemd is asked first: without a daemon to talk to, firewalld 2.4's firewall-cmd waits 10 seconds.
+if systemctl is-active --quiet firewalld.service 2>/dev/null &&
+  [ "$(firewall-cmd --state 2>/dev/null)" = running ]; then
   # A running firewalld knows a new service file only after a reload.
   say '     sudo firewall-cmd --reload' \
     '     sudo firewall-cmd --permanent --add-service=isshoni && sudo firewall-cmd --reload'
