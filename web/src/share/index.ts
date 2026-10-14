@@ -26,9 +26,12 @@
 //   reconnect needs it published again (resync and republish: share.start {replaces}, 01 §10.6).
 // - recovery.ts: the 60 s capture hold, and share.start retried with the same ref across a resumed drop.
 // - uiStore.sharing ("no Reload in the update pill while sharing", 05 §16.2), the toast of a share that was stopped
-//   from another tab, and the app's "Can't connect media" screen when the pub PC's negotiation failed twice within
-//   a minute (05 §9) follow the share state through linkShareUi, which every Share button and panel sets up when
-//   it mounts. It keeps working after the room page is left.
+//   from another tab, the app's "Can't connect media" screen when the pub PC's negotiation failed twice within
+//   a minute (05 §9), and "You're live" and "Sharing stopped" for screen readers (05 §16.6) follow the share state
+//   through linkShareUi, which every Share button and panel sets up when it mounts. It keeps working after the room
+//   page is left.
+// - stats.ts: the page's pub PC as a source of lib/stats' collector (05 §10.7), which PublisherPC lists while it has
+//   a PC: `sources: () => [...viewerStatsSources(viewer), ...shareStatsSources()]`.
 export {
   BrowserShare,
   END_NOTICE_GRACE_MS,
@@ -60,6 +63,7 @@ export { ScreenAudioWarning, type ScreenAudioWarningProps } from './ScreenAudioW
 export { ShareButton, ShareUnavailableNote, type ShareButtonProps } from './ShareButton';
 export { SharePanel, type SharePanelProps } from './SharePanel';
 export { ShareSheet, type ShareElsewhere, type ShareSheetProps } from './ShareSheet';
+export { addShareStatsPublisher, shareStatsSources, type ShareStatsPublisher } from './stats';
 export {
   createShareStore,
   isSharingPhase,

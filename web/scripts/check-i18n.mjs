@@ -25,7 +25,22 @@
 //    check until en.json has its text. A src tree that has neither union in api.gen.ts nor either message family in
 //    its catalog (test fixtures) skips the rule with a note. Anything in between is a problem: a union missing next
 //    to the other one, or next to a catalog that has these texts (a renamed Go type must not turn the rule off).
-// 4. (S93) Unused keys are warnings.
+// 4. (S93) Unused keys are warnings: a message of the catalog that no code asks for is reported with its file, line
+//    and column, and the check still passes. Code asks for a message (unusedMessages):
+//    - by a literal key, as rule 1 reads them, or by the base of a plural form (viewer.watching for
+//      viewer.watching_one);
+//    - by a string that is the key, anywhere in the scanned code (`{ label: 'room.menu.leave' }` → t(item.label));
+//    - by a key built at run time, through the part that is written out: the head of a template literal
+//      (t(`doctor.part.firewall.${provider}`), `errors.${code}`) or a string that ends in a dot
+//      ('viewer.title.' + kind) covers every key it begins. A template head names a namespace and a dot at least;
+//      a string needs a part below the namespace too, because a lone 'room.' is more often something else (the
+//      audit log's action groups) and would cover the whole namespace. A template head that is a namespace alone
+//      (`doctor.${check.code}`) does cover all of it, and the run says so in a note: rule 4 can't check there;
+//    - by rules 2 and 3: every errors.<code>, fix.firewall.<provider> and conntest.nat.<nat> they require;
+//    - as a whole namespace that code outside the t() calls reads (READ_WHOLE: the service worker's `push` texts,
+//      05 §16.2), or through $t(…) nesting in another message.
+//    A message that only tests use is unused. The warnings never fail the check: a key may wait for the code of a
+//    later slice, and keys built at run time are only followed as far as their written part.
 // 5. (W00) A lazy namespace is in the catalog before a key of it is asked for, and it is not in the main bundle.
 //    src/i18n/lazy/<ns>.ts adds the namespace when a module that imports it runs, so every page folder that uses
 //    the namespace imports that module in its entry module (admin/index.ts). The check follows the imports from
@@ -42,7 +57,8 @@
 // Paths default to this package's src/ and src/i18n/en.json, so it runs the same from the repo root and from web/.
 // --catalog names the main file. The lazy namespaces are always the ones under <src>/i18n/lazy/, in the language of
 // the main file's name (en.json: <ns>.en.json).
-// Exit 0 when clean, 1 with one line per problem, 2 on bad usage.
+// Exit 0 when clean, 1 with one line per problem, 2 on bad usage. Warnings (rule 4) go to stderr as
+// `<file>:<line>:<column>: warning: …` lines and leave the exit code alone.
 import { access, readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -252,11 +268,12 @@ function importsAt(node) {
 }
 
 /**
- * The literal message keys a file uses, the places that set an i18n `keyPrefix` (keyPrefixSite), and the modules
- * the file imports (importsAt).
+ * The literal message keys a file uses, the places that set an i18n `keyPrefix` (keyPrefixSite), the modules the
+ * file imports (importsAt), and for rule 4 every string the code writes out: the text of each string literal and the
+ * head of each template literal (`doctor.part.firewall.` of `doctor.part.firewall.${provider}`), wherever they are.
  * @param {string} file shown in problems
  * @param {string} text the source
- * @returns {{ keys: KeyUse[], prefixes: Problem[], imports: ImportUse[] }}
+ * @returns {{ keys: KeyUse[], prefixes: Problem[], imports: ImportUse[], strings: string[], heads: string[] }}
  */
 export function scanSource(file, text) {
   const kind = file.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
@@ -267,6 +284,10 @@ export function scanSource(file, text) {
   const prefixes = [];
   /** @type {ImportUse[]} */
   const imports = [];
+  /** @type {Set<string>} */
+  const strings = new Set();
+  /** @type {Set<string>} */
+  const heads = new Set();
   /** @param {ts.Node} node */
   const at = (node) => {
     const { line, character } = sf.getLineAndCharacterOfPosition(node.getStart(sf));
@@ -288,11 +309,16 @@ export function scanSource(file, text) {
     if (prefix) {
       prefixes.push({ ...at(prefix), message: 'keyPrefix hides message keys from check:i18n; write each key in full' });
     }
+    if (ts.isStringLiteralLike(node)) {
+      strings.add(node.text);
+    } else if (ts.isTemplateExpression(node)) {
+      heads.add(node.head.text);
+    }
     imports.push(...importsAt(node));
     ts.forEachChild(node, visit);
   };
   visit(sf);
-  return { keys, prefixes, imports };
+  return { keys, prefixes, imports, strings: [...strings], heads: [...heads] };
 }
 
 /**
@@ -342,10 +368,12 @@ async function sourceFiles(dir) {
  * Scans every source file under a src dir (isScanned).
  * @param {string} srcDir
  * @returns {Promise<{ uses: (KeyUse & { module: string })[], prefixes: Problem[],
- *   imports: Map<string, ImportUse[]>, shown: (module: string) => string }>}
+ *   imports: Map<string, ImportUse[]>, shown: (module: string) => string, strings: Set<string>,
+ *   heads: Set<string> }>}
  *   uses: every literal key, with the file it is in as a path relative to the src dir with forward slashes
  *   (`module`); prefixes: the keyPrefix problems; imports: what each file imports, by that path, with an entry for
- *   every scanned file; shown: such a path as problems name the file
+ *   every scanned file; shown: such a path as problems name the file; strings and heads: the string literals and
+ *   template heads of every scanned file (scanSource), for rule 4
  */
 export async function scanTree(srcDir) {
   /** @param {string} module */
@@ -356,13 +384,59 @@ export async function scanTree(srcDir) {
   const prefixes = [];
   /** @type {Map<string, ImportUse[]>} */
   const imports = new Map();
+  /** @type {Set<string>} */
+  const strings = new Set();
+  /** @type {Set<string>} */
+  const heads = new Set();
   for (const module of await sourceFiles(srcDir)) {
     const scan = scanSource(shown(module), await readFile(path.join(srcDir, module), 'utf8'));
     prefixes.push(...scan.prefixes);
     imports.set(module, scan.imports);
     for (const use of scan.keys) uses.push({ ...use, module });
+    for (const s of scan.strings) strings.add(s);
+    for (const h of scan.heads) heads.add(h);
   }
-  return { uses, prefixes, imports, shown };
+  return { uses, prefixes, imports, shown, strings, heads };
+}
+
+/**
+ * @typedef {{ file: string, line: number, column: number }} Position
+ *   A place in a file, 1-based.
+ */
+
+/**
+ * Where each message of a catalog file is: its dotted key → the line and column of the message's name. Objects are
+ * followed, so a lazy file's keys start with its namespace, as in the catalog.
+ * @param {string} file shown in warnings
+ * @param {string} text the file's JSON
+ * @returns {Map<string, Position>}
+ */
+export function messagePositions(file, text) {
+  const sf = ts.parseJsonText(file, text);
+  /** @type {Map<string, Position>} */
+  const out = new Map();
+  /**
+   * @param {ts.Node} node
+   * @param {string} prefix
+   */
+  const walk = (node, prefix) => {
+    if (!ts.isObjectLiteralExpression(node)) return;
+    for (const prop of node.properties) {
+      if (!ts.isPropertyAssignment(prop)) continue;
+      const name = prop.name;
+      if (!ts.isStringLiteral(name) && !ts.isIdentifier(name) && !ts.isNumericLiteral(name)) continue;
+      const key = prefix === '' ? name.text : `${prefix}.${name.text}`;
+      if (ts.isObjectLiteralExpression(prop.initializer)) {
+        walk(prop.initializer, key);
+      } else {
+        const { line, character } = sf.getLineAndCharacterOfPosition(name.getStart(sf));
+        out.set(key, { file, line: line + 1, column: character + 1 });
+      }
+    }
+  };
+  const root = sf.statements[0]?.expression;
+  if (root) walk(root, '');
+  return out;
 }
 
 /**
@@ -371,14 +445,17 @@ export async function scanTree(srcDir) {
  * its own namespace, `{"<ns>": {…}}`, or when the main file has that namespace too; such a file is left out.
  * @param {{ srcDir: string, catalogPath: string }} opts
  * @returns {Promise<{ catalog: Catalog, lazy: LazyNamespace[], fileOf: (key: string) => string,
- *   problems: Problem[] }>} fileOf: the file a key belongs in, as problems show it
+ *   positionOf: (key: string) => Position, problems: Problem[] }>} fileOf: the file a key belongs in, as problems
+ *   show it; positionOf: where a message of the catalog is (line 1, column 1 of its file for any other key)
  */
 export async function readCatalog({ srcDir, catalogPath }) {
   /** @param {string} p */
   const shown = (p) => path.relative(process.cwd(), p) || p;
+  const mainText = await readFile(catalogPath, 'utf8');
   /** @type {Catalog} */
-  const catalog = JSON.parse(await readFile(catalogPath, 'utf8'));
+  const catalog = JSON.parse(mainText);
   const mainName = shown(catalogPath);
+  const positions = messagePositions(mainName, mainText);
   const suffix = `.${path.basename(catalogPath, '.json')}.json`;
   const lazyDir = path.join(srcDir, 'i18n', 'lazy');
   const names = (await exists(lazyDir)) ? await readdir(lazyDir) : [];
@@ -389,8 +466,9 @@ export async function readCatalog({ srcDir, catalogPath }) {
   for (const fileName of names.filter((n) => n.endsWith(suffix)).sort()) {
     const name = fileName.slice(0, -suffix.length);
     const file = shown(path.join(lazyDir, fileName));
+    const text = await readFile(path.join(lazyDir, fileName), 'utf8');
     /** @type {unknown} */
-    const content = JSON.parse(await readFile(path.join(lazyDir, fileName), 'utf8'));
+    const content = JSON.parse(text);
     /** @param {string} message */
     const problem = (message) => problems.push({ file, line: 1, column: 1, message });
     const keys = typeof content === 'object' && content !== null && !Array.isArray(content) ? Object.keys(content) : [];
@@ -401,11 +479,14 @@ export async function readCatalog({ srcDir, catalogPath }) {
     } else {
       catalog[name] = /** @type {Catalog} */ (content)[name] ?? {};
       lazy.push({ name, file });
+      for (const [key, at] of messagePositions(file, text)) positions.set(key, at);
     }
   }
   /** @param {string} key */
   const fileOf = (key) => lazy.find((ns) => key === ns.name || key.startsWith(`${ns.name}.`))?.file ?? mainName;
-  return { catalog, lazy, fileOf, problems };
+  /** @param {string} key */
+  const positionOf = (key) => positions.get(key) ?? { file: fileOf(key), line: 1, column: 1 };
+  return { catalog, lazy, fileOf, positionOf, problems };
 }
 
 /** The app's entry module, relative to the src dir (index.html loads it). */
@@ -721,14 +802,15 @@ const fileFor = (catalogName, key) => (typeof catalogName === 'function' ? catal
 /**
  * Rule 2: every ErrorCode (protocol/types.gen.ts) and api Code (protocol/api.gen.ts) has an errors.<code> entry.
  * @param {{ srcDir: string, catalog: Catalog, catalogName: CatalogName }} opts
- * @returns {Promise<{ problems: Problem[], codes: number | null }>} codes: the distinct codes checked, or null when
- *   the src tree has neither generated file (the rule is skipped)
+ * @returns {Promise<{ problems: Problem[], codes: number | null, required: string[] }>} codes: the distinct codes
+ *   checked, or null when the src tree has neither generated file (the rule is skipped); required: the entries the
+ *   codes ask for (errors.<code>, or errors.<code>.<subKey> for SUB_KEYED), which rule 4 counts as used
  */
 export async function checkErrorCodes({ srcDir, catalog, catalogName }) {
   const typesPath = path.join(srcDir, 'protocol', 'types.gen.ts');
   const apiPath = path.join(srcDir, 'protocol', 'api.gen.ts');
   const [hasTypes, hasApi] = await Promise.all([exists(typesPath), exists(apiPath)]);
-  if (!hasTypes && !hasApi) return { problems: [], codes: null };
+  if (!hasTypes && !hasApi) return { problems: [], codes: null, required: [] };
   /** @type {Problem[]} */
   const problems = [];
   /** @param {string} p */
@@ -763,11 +845,14 @@ export async function checkErrorCodes({ srcDir, catalog, catalogName }) {
 
   /** @type {Set<string>} */
   const seen = new Set();
+  /** @type {string[]} */
+  const required = [];
   for (const c of [...(wire.get('ErrorCode') ?? []), ...(rest.get('Code') ?? [])]) {
     if (seen.has(c.value)) continue; // a code shared by 01 and 03 (bad_request, internal, …) needs one entry
     seen.add(c.value);
     const subType = Object.hasOwn(SUB_KEYED, c.value) ? SUB_KEYED[c.value] : undefined;
     const subKeys = subType === undefined ? undefined : (rest.get(subType) ?? []).map((s) => s.value);
+    required.push(...(subKeys === undefined ? [`errors.${c.value}`] : subKeys.map((s) => `errors.${c.value}.${s}`)));
     const why = errorEntryProblem(catalog, c.value, subKeys);
     if (why) {
       problems.push({
@@ -778,7 +863,7 @@ export async function checkErrorCodes({ srcDir, catalog, catalogName }) {
       });
     }
   }
-  return { problems, codes: seen.size };
+  return { problems, codes: seen.size, required };
 }
 
 /**
@@ -795,22 +880,25 @@ export const CONSTANT_KEYED = Object.freeze([
  * Rule 3: every CloudProvider constant has a fix.firewall.<provider> message and every NATKind constant a
  * conntest.nat.<nat> message (a string, or plural forms: these keys are shown as they are).
  * @param {{ srcDir: string, catalog: Catalog, catalogName: CatalogName }} opts
- * @returns {Promise<{ problems: Problem[], counts: Record<string, number> | null }>} counts: the constants checked
- *   per union type name, or null when the rule was skipped: no protocol/api.gen.ts (rule 2 reports a lone missing
- *   file), or one that declares none of the unions while the catalog has none of the families either
+ * @returns {Promise<{ problems: Problem[], counts: Record<string, number> | null, required: string[] }>} counts:
+ *   the constants checked per union type name, or null when the rule was skipped: no protocol/api.gen.ts (rule 2
+ *   reports a lone missing file), or one that declares none of the unions while the catalog has none of the
+ *   families either; required: the keys the constants ask for, which rule 4 counts as used
  */
 export async function checkConstantKeys({ srcDir, catalog, catalogName }) {
   const apiPath = path.join(srcDir, 'protocol', 'api.gen.ts');
-  if (!(await exists(apiPath))) return { problems: [], counts: null };
+  if (!(await exists(apiPath))) return { problems: [], counts: null, required: [] };
   const shown = path.relative(process.cwd(), apiPath) || apiPath;
   const text = await readFile(apiPath, 'utf8');
   const unions = CONSTANT_KEYED.map((family) => ({ family, res: unionConstants(shown, text, family.typeName) }));
   const inCatalog = CONSTANT_KEYED.some((family) => lookup(catalog, family.prefix) !== undefined);
-  if (unions.every((u) => u.res === undefined) && !inCatalog) return { problems: [], counts: null };
+  if (unions.every((u) => u.res === undefined) && !inCatalog) return { problems: [], counts: null, required: [] };
   /** @type {Problem[]} */
   const problems = [];
   /** @type {Record<string, number>} */
   const counts = {};
+  /** @type {string[]} */
+  const required = [];
   for (const { family, res } of unions) {
     if (!res) {
       problems.push({ file: shown, line: 1, column: 1, message: `no \`export type ${family.typeName}\` union found` });
@@ -820,6 +908,7 @@ export async function checkConstantKeys({ srcDir, catalog, catalogName }) {
     counts[family.typeName] = res.constants.length;
     for (const c of res.constants) {
       const key = `${family.prefix}.${c.value}`;
+      required.push(key);
       const why = keyProblem(catalog, key);
       if (why) {
         const file = fileFor(catalogName, key);
@@ -835,20 +924,110 @@ export async function checkConstantKeys({ srcDir, catalog, catalogName }) {
       }
     }
   }
-  return { problems, counts };
+  return { problems, counts, required };
+}
+
+/**
+ * Rule 4: namespaces that code reads as a whole, not by key: the service worker's `push` texts, which
+ * build/sw-plugin.ts hands to it as one object (05 §16.2), and which src/sw/push.ts picks by the push's type.
+ * @type {readonly string[]}
+ */
+export const READ_WHOLE = Object.freeze(['push']);
+
+/** Rule 4: a template head of a key that is built at run time: a namespace, a dot, then key characters. */
+const KEY_HEAD = /^[A-Za-z][\w-]*\.[\w.-]*$/;
+
+/** Rule 4: a string that is the head of such a key: a namespace and a part below it at least ('viewer.title.'). */
+const STRING_HEAD = /^[A-Za-z][\w-]*\.[\w-]+\.[\w.-]*$/;
+
+/** i18next's plural and ordinal suffixes at the end of a key: viewer.watching_one → viewer.watching. */
+const PLURAL_FORM = /^(.+?)(?:_ordinal)?_(?:zero|one|two|few|many|other)$/;
+
+/**
+ * Every message of a catalog: its dotted key and its text.
+ * @param {Catalog} catalog
+ * @param {string} [prefix]
+ * @returns {[string, string][]}
+ */
+function messagesOf(catalog, prefix = '') {
+  return Object.entries(catalog).flatMap(([name, value]) => {
+    const key = prefix === '' ? name : `${prefix}.${name}`;
+    return typeof value === 'string' ? [[key, value]] : messagesOf(value, key);
+  });
+}
+
+/**
+ * Rule 4: the messages of the catalog that no code asks for (see the rule at the top of the file), sorted.
+ * @param {{ catalog: Catalog, keys: Iterable<string>, strings?: Iterable<string>, heads?: Iterable<string>,
+ *   required?: Iterable<string> }} opts
+ *   keys: the literal keys of rule 1; strings and heads: every string literal and template head of the scanned
+ *   code (scanTree); required: the keys that rules 2 and 3 ask for, each with what is below it
+ * @returns {string[]}
+ */
+export function unusedMessages({ catalog, keys, strings = [], heads = [], required = [] }) {
+  /** @type {Set<string>} keys asked for as they are */
+  const exact = new Set(keys);
+  /** @type {Set<string>} heads of keys built at run time: each covers every key it begins */
+  const begins = new Set(READ_WHOLE.map((ns) => `${ns}.`));
+  for (const s of strings) {
+    exact.add(s);
+    if (s.endsWith('.') && STRING_HEAD.test(s)) begins.add(s);
+  }
+  for (const h of heads) {
+    if (KEY_HEAD.test(h)) begins.add(h);
+  }
+  for (const r of required) {
+    exact.add(r);
+    begins.add(`${r}.`);
+  }
+  const messages = messagesOf(catalog);
+  // $t(key) in a message asks for that key too (i18next's nesting).
+  for (const [, text] of messages) {
+    for (const m of text.matchAll(/\$t\(\s*([\w.-]+)/g)) if (m[1] !== undefined) exact.add(m[1]);
+  }
+  const starts = [...begins];
+  /** @param {string} key */
+  const asked = (key) => exact.has(key) || starts.some((h) => key.startsWith(h));
+  return messages
+    .map(([key]) => key)
+    .filter((key) => {
+      if (asked(key)) return false;
+      const base = PLURAL_FORM.exec(key)?.[1];
+      return base === undefined || !asked(base);
+    })
+    .sort();
+}
+
+/**
+ * Rule 4: the namespaces of the catalog that a template head names alone (`doctor.${check.code}` → doctor): such a
+ * head covers every message of the namespace, so the rule can't find an unused one there. The namespaces that code
+ * reads whole (READ_WHOLE) are not among them. Sorted.
+ * @param {{ catalog: Catalog, heads: Iterable<string> }} opts heads: every template head of the scanned code
+ * @returns {string[]}
+ */
+export function namespacesBuiltWhole({ catalog, heads }) {
+  /** @type {Set<string>} */
+  const found = new Set();
+  for (const h of heads) {
+    const ns = /^([A-Za-z][\w-]*)\.$/.exec(h)?.[1];
+    if (ns !== undefined && !READ_WHOLE.includes(ns) && typeof catalog[ns] === 'object') found.add(ns);
+  }
+  return [...found].sort();
 }
 
 /**
  * Runs every rule.
  * @param {{ srcDir: string, catalogPath: string }} opts catalogPath: the main catalog file (readCatalog)
- * @returns {Promise<{ problems: Problem[], keysUsed: number, files: number, errorCodes: number | null,
- *   constantKeys: Record<string, number> | null, lazyNamespaces: string[] }>}
- *   errorCodes: the distinct error codes rule 2 checked, or null when it was skipped; constantKeys: the constants
- *   rule 3 checked per union type name (CloudProvider, NATKind), or null when it was skipped; lazyNamespaces: the
- *   lazy namespaces rule 5 checked
+ * @returns {Promise<{ problems: Problem[], warnings: Problem[], builtWhole: string[], keysUsed: number,
+ *   files: number, errorCodes: number | null, constantKeys: Record<string, number> | null,
+ *   lazyNamespaces: string[] }>}
+ *   warnings: rule 4's unused messages, at their place in the catalog files; builtWhole: the namespaces in which
+ *   rule 4 can't find unused messages (namespacesBuiltWhole); errorCodes: the distinct error codes rule 2 checked,
+ *   or null when it was skipped; constantKeys: the constants rule 3 checked per union type name (CloudProvider,
+ *   NATKind), or null when it was skipped; lazyNamespaces: the lazy namespaces rule 5 checked
  */
 export async function checkI18n({ srcDir, catalogPath }) {
-  const { catalog, lazy, fileOf, problems } = await readCatalog({ srcDir, catalogPath });
+  const { catalog, lazy, fileOf, positionOf, problems } = await readCatalog({ srcDir, catalogPath });
   const tree = await scanTree(srcDir);
   problems.push(...tree.prefixes);
   for (const use of tree.uses) {
@@ -867,8 +1046,21 @@ export async function checkI18n({ srcDir, catalogPath }) {
   const constantKeys = await checkConstantKeys({ srcDir, catalog, catalogName: fileOf });
   problems.push(...constantKeys.problems);
   problems.push(...checkLazyNamespaces({ lazy, imports: tree.imports, uses: tree.uses, shown: tree.shown }));
+  const unused = unusedMessages({
+    catalog,
+    keys: tree.uses.map((use) => use.key),
+    strings: tree.strings,
+    heads: tree.heads,
+    required: [...errorCodes.required, ...constantKeys.required],
+  });
+  // In the order of the files, as an editor goes through them.
+  const warnings = unused
+    .map((key) => ({ ...positionOf(key), message: `message "${key}" is not used: no code asks for it` }))
+    .sort((a, b) => a.file.localeCompare(b.file) || a.line - b.line || a.column - b.column);
   return {
     problems,
+    warnings,
+    builtWhole: namespacesBuiltWhole({ catalog, heads: tree.heads }),
     keysUsed: tree.uses.length,
     files: tree.imports.size,
     errorCodes: errorCodes.codes,
@@ -889,10 +1081,11 @@ async function main() {
   }
   const srcDir = path.resolve(values.src ?? path.join(WEB_ROOT, 'src'));
   const catalogPath = path.resolve(values.catalog ?? path.join(WEB_ROOT, 'src', 'i18n', 'en.json'));
-  const { problems, keysUsed, files, errorCodes, constantKeys, lazyNamespaces } = await checkI18n({
-    srcDir,
-    catalogPath,
-  });
+  const { problems, warnings, builtWhole, keysUsed, files, errorCodes, constantKeys, lazyNamespaces } = await checkI18n(
+    { srcDir, catalogPath },
+  );
+  for (const w of warnings) console.error(`${w.file}:${w.line}:${w.column}: warning: ${w.message}`);
+  if (warnings.length > 0) console.error(`check:i18n: ${warnings.length} unused message(s): warnings, not problems`);
   for (const p of problems) console.error(`${p.file}:${p.line}:${p.column}: ${p.message}`);
   if (problems.length > 0) {
     console.error(`check:i18n: ${problems.length} problem(s)`);
@@ -900,6 +1093,14 @@ async function main() {
   }
   if (lazyNamespaces.length > 0) {
     console.log(`check:i18n: lazy namespaces, each loaded before its keys are used: ${lazyNamespaces.join(', ')}`);
+  }
+  if (builtWhole.length > 0) {
+    // Rule 4's blind spots, so that its silence there isn't taken for a clean catalog.
+    const names = builtWhole.map((ns) => `${ns}.*`).join(', ');
+    const example = `\`${builtWhole[0] ?? ''}.\${…}\``;
+    console.log(
+      `check:i18n: note: unused messages are not checked in ${names}: code builds their keys from the namespace alone (${example})`,
+    );
   }
   let summary = `check:i18n: ok (${keysUsed} message keys in ${files} files)`;
   if (errorCodes === null) {
