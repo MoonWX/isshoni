@@ -247,6 +247,10 @@ share.start ok                first video keyframe (SFU)
 
 JSON conventions:
 - Keys are camelCase. Unknown keys are **ignored** by both sides; never use `DisallowUnknownFields` outside tests.
+  The one limit (decided after group 8, below): inside a payload, an object key may be at most **1024 bytes** long
+  as the message spells it, or `Decode` refuses the payload with `bad_request` (`field: "data"`, `reason:
+  "invalid"`). The keys inside the `payload` of `agent.send` and `agent.recv`, which is the sender's (§8.14), and
+  the envelope's own keys have no such limit. The names of this protocol are under 32 bytes.
 - IDs are strings, never numbers.
 - Units live in the name: bit rates in bits/s, named `…Bitrate` (integers); durations in ms, named `…Ms`; timestamps are
   RFC 3339 UTC strings with exactly three fractional digits and a `Z` suffix (`2026-10-12T19:04:05.123Z`, like
@@ -273,20 +277,68 @@ limits of §3.3 that bounds what one frame can cost the hub. `Decode` has the sa
 messages, with 4× the payload and a constant of its own (§19): it refuses data nested deeper than 32 levels, and
 arrays longer than the field limits of §13, before it unmarshals.
 
-As merged after group 7 neither meets its bound for every input:
-- **The envelope parser** hands a frame to `encoding/json` after two checks of its own (valid UTF-8, nesting
+As merged after group 7 neither met its bound for every input:
+- **The envelope parser** handed a frame to `encoding/json` after two checks of its own (valid UTF-8, nesting
   depth), and for frames with a long object member name, well-formed ones that the parser accepts among them,
-  that call allocates more than the bound allows: 4.8 to 8.4 times the frame's size in the cases of §19. The
-  fuzz target finds a malformed one within seconds (§19).
+  that call allocated more than the bound allows: 4.8 to 8.4 times the frame's size in the cases of §19. The
+  fuzz target found a malformed one within seconds (§19).
 - **Such a frame can't simply be refused.** An unknown member is ignored, however it is named (above), so a
-  well-formed frame with a long member name is accepted today and stays accepted. The parser has to read it
-  within the bound.
-- **`Decode` has the same rule and, as merged, the same gap**, from the same cause: a payload from about 28 KB
-  on whose object has a long member name, which the read limits of §3.3 allow (§19 has the numbers).
+  well-formed frame with a long member name was accepted and stays accepted. The parser has to read it within
+  the bound.
+- **`Decode` had the same rule and the same gap**, from the same cause: a payload from about 28 KB on whose object
+  has a long member name, which the read limits of §3.3 allow (§19 has the numbers).
 
 The decision is about which side moves: **the parser changes, the bound stays.** A factor raised until today's
 parser passes would no longer say anything about the protocol, only about one library. The invalid-UTF-8 check
 is there for the same reason: `encoding/json` would replace each bad byte with three.
+
+**As README F04 built it** (`envelope.go`, `scan.go`):
+- **`ParseEnvelope` has a scanner of its own and never calls `encoding/json`.** After the UTF-8 check,
+  `scanEnvelope` reads the frame once as a strict JSON reader (RFC 8259: one value, an object, nothing but JSON
+  whitespace around it, nesting at most 32 levels with the envelope's own) and keeps nothing but positions in it:
+  a key or a value that the envelope does not keep is checked and skipped and costs no memory, however long it
+  is and wherever the frame breaks off. It reads what `encoding/json` reads into an `Envelope`, with the same
+  result: a key names a field when it equals the field's name under Unicode case folding after unescaping
+  (`TYPE` and `ty\u0070e` are `type`), the last of repeated keys counts, `type`, `id` and `re` take a string
+  (`null` leaves the field as it is, any other value is an error), and `data` takes any value as the bytes of the
+  frame, of which `ParseEnvelope` accepts an object or `null`. The strings are decoded into buffers on the stack
+  and every check comes before the first allocation, so `ParseEnvelope` allocates only its result, which is never
+  larger than the frame (the three strings and a copy of `data`), and a frame it rejects costs no memory at all.
+  The old parser stays in the tests as the reference (§19).
+- **Its errors are fixed values that wrap `ErrBadMessage`**, built once (so a rejection allocates nothing), one
+  per reason: not valid UTF-8; not a JSON object (also malformed JSON and anything after the object); nested
+  too deeply; `type`, `id` or `re` not a string; missing `type`; `type` too long; invalid `id`; invalid `re`;
+  `data` not an object. The hub answers each with `bad_message` and close 4400, as before.
+- **`Decode` checks a payload's syntax before `encoding/json` reads it** (`validPayload`, the envelope scanner's
+  value check): data that is not valid JSON is refused as before, `field: "data"`, `reason: "invalid"`, but
+  without `encoding/json`'s error, which copied the keys on the way to the error's place (its JSON Pointer), up to
+  14 times the length of a long one. No result changes for valid JSON. Data that came through `ParseEnvelope` is
+  valid JSON already, so for the hub and the Go client this is one more look at the bytes (about 0.6 ns per byte).
+  The order of `Decode`'s checks is: valid UTF-8, the nesting depth and the array limits of §13 (`scanJSON`), the
+  syntax and the key length (`validPayload`), then `encoding/json`, then the type's `Validate`.
+- **`Decode` refuses an object key longer than 1024 bytes** (`maxKeyLen`), counted as the message spells it
+  (between the quotes, escapes not decoded), with the same `field: "data"`, `reason: "invalid"`, wherever the key
+  is in the payload, in an element of a list or under a key the type doesn't know. A valid payload with one long
+  key that its type doesn't know was still over the bound: `encoding/json` looks such a key up through a
+  case-folded copy that it grows step by step, which costs up to 5.2 times the key (a `RoomJoin` of 100,024 bytes
+  with one key of 100,000 allocated 514,768 bytes, limit 465,632), and within 1024 bytes at most 3.7 times. The
+  limit is in `Decode` only: `ParseEnvelope` copies no name and needs none, so a frame with such a key is no
+  `bad_message`, the connection stays, and the request in it is answered `bad_request`.
+- **The exemption: the payload of `agent.send` and `agent.recv`.** That member is the sender's business (§8.14) and
+  a `json.RawMessage`: `encoding/json` keeps it as bytes and reads no key in it, so `Decode` allocates one copy of
+  it whatever its keys are, and the keys in there are not limited. A payload type says which member it keeps as
+  bytes with an unexported `rawMember` method (`AgentSend` and `AgentRecv` name `payload`); a key names that member
+  the way `encoding/json` matches it (`PAYLOAD` and `p\u0061yload` too). A new payload type with a
+  `json.RawMessage` member needs the method too, or its keys are held to the limit (`TestRawMembers` finds one
+  that lacks it). The key length limit holds everywhere else in such a payload, including a `payload` key nested
+  in another member.
+
+**Decided after group 8** (an engineering call the owner delegated; README §6): **the syntax check in `Decode` and
+the 1024-byte limit on an object key, with the exemption of the `agent.send` and `agent.recv` payload, stay.**
+Without them a known input breaks the 4× allocation bound of §19: a payload that breaks off after a long key
+(8 to 14 times its size in `encoding/json`'s error), and a valid payload with one long key that its type doesn't
+know (up to 5.2 times). The key limit is the one change to what the server accepts that F04 made: such a payload
+was decoded before, with the key ignored; no client of this protocol sends one (§13, §19).
 
 ## 6. Handshake, versions, features, roles (M1)
 
@@ -2097,7 +2149,7 @@ made while `stopped`).
 | Room soft limits | participants, shares: 0 = none (03 settings `maxParticipantsPerRoom`, `maxSharesPerRoom`, read through `Deps.Policy`) | §8.7 |
 | Global message rate | 20/s refill, burst 100; 512 KiB/s refill, burst 1 MiB | server |
 | Per type | `room.join` 10/min · `share.start` 10/min · `pc.restart` 12/min per PC · pub offers with a new `gen` 6/min · `caps.update` 12/min · `stats` 1 per 5 s (excess dropped silently) · `agent.send` 10/s | server |
-| Field sizes | `id`/`ref` ≤ 32; `label` ≤ 40 code points; room/user ids ≤ 64; `subs` ≤ 64; `tracks` ≤ 8 (pub offers); pub offer SDP ≤ 64 KiB and ≤ 8 m-lines (02 §12); sub answer ≤ 256 KiB; candidate ≤ 512 B; buffered candidates ≤ 64 per PC per gen (later ones dropped); `agent.send.payload` ≤ 16 KiB (above it `message_too_large`, not `bad_request`); `stats` ≤ 16 KiB; `features`, `caps.decode` ≤ 32 entries | `protocol` validation |
+| Field sizes | `id`/`ref` ≤ 32; `label` ≤ 40 code points; room/user ids ≤ 64; `subs` ≤ 64; `tracks` ≤ 8 (pub offers); pub offer SDP ≤ 64 KiB and ≤ 8 m-lines (02 §12); sub answer ≤ 256 KiB; candidate ≤ 512 B; buffered candidates ≤ 64 per PC per gen (later ones dropped); `agent.send.payload` ≤ 16 KiB (above it `message_too_large`, not `bad_request`); `stats` ≤ 16 KiB; `features`, `caps.decode` ≤ 32 entries; an object key inside a payload ≤ 1024 bytes as spelled, except inside the `payload` of `agent.send`/`agent.recv` (decided after group 8, §5; above it `bad_request` `data`/`invalid`); nesting ≤ 32 levels with the envelope | `protocol` validation |
 
 The per-type limits are token buckets per connection that start full: `n` per minute or per second is a burst of
 `n` that refills evenly, so the 11th `agent.send` in one instant is refused with `retryAfterMs: 100`, and a steady
@@ -2112,6 +2164,13 @@ Why 256 KiB for SDP: a Chrome sub answer is about 2.7 KB per video m-section whe
 plus RTX, and about 0.6 KB per audio m-section. That is about 3.3 KB per watched share, so 64 KiB would stop a viewer at
 about 19 shares, which is a numeric limit on people in disguise. The pre-auth limit, the guard that matters, stays
 64 KiB. 02 should also keep sub offers lean: only the profiles in use, and reused inactive transceivers.
+
+Why 1024 bytes for an object key (README F04; decided after group 8, §5): the names of this protocol are under 32
+bytes, and a key that a payload's type doesn't know costs `encoding/json` a folded copy of it (with Go 1.27: at most
+3.7 times its length within 1024 bytes, 3.8 times up to 2048, and more than 4 times for some longer keys, 5.2 at
+worst), which would break the 4× bound of §19. A newer peer's
+unknown keys stay far below the limit and are ignored as before (§5). The limit is checked by `Decode`, before
+`encoding/json` reads the payload; the envelope's keys and the relay's `payload` have none (§5).
 
 ## 14. Versioning and compatibility (M1 setup, used from the first release on)
 
@@ -2222,7 +2281,10 @@ Forbidden:
 
 Files:
 - `doc.go`: versions;
-- `envelope.go`: `Envelope`, `MessageType` consts, encode/decode;
+- `envelope.go`: `Envelope`, `MessageType` consts, `ParseEnvelope`, `Decode`/`DecodeInto`, `Marshal`;
+- `scan.go`: the envelope scanner of `ParseEnvelope` and `Decode`'s checks before `encoding/json` (the nesting
+  depth, the array limits, the syntax and the key length; README F04, §5);
+- `encode.go`: the `MarshalJSON` methods that keep arrays non-null and timestamps in the wire form (§5);
 - `hello.go`, `room.go`, `share.go`, `pc.go`, `subscribe.go`, `quality.go`, `stats.go`, `notify.go`, `agent.go`,
   `errors.go`: the types above;
 - `codec.go`: `CodecKey` helpers;
@@ -2237,13 +2299,25 @@ No dependency on Pion or any server package: `internal/client` and the TS genera
 // MessageTypeError = "error", MessageTypePing, MessageTypePong, MessageTypeRoomJoin = "room.join", ... one per §7 row.
 type MessageType string
 
-// ParseEnvelope parses one frame. Errors (-> bad_message): not a JSON object, missing/empty type,
-// id/re longer than 32 bytes or with characters outside [A-Za-z0-9_-].
+// ParseEnvelope parses one frame with a scanner of its own (scan.go; no encoding/json), reading it as
+// encoding/json reads it into an Envelope. Errors are fixed values that wrap ErrBadMessage (-> bad_message):
+// not valid UTF-8, not a JSON object, nested deeper than 32 levels, missing or empty type (or one over 64 bytes),
+// a type/id/re that is not a string, id/re longer than 32 bytes or with characters outside [A-Za-z0-9_-], data
+// neither an object nor null. It allocates only its result; a rejected frame allocates nothing.
 func ParseEnvelope(b []byte) (Envelope, error)
 
+// ErrBadMessage is wrapped by every ParseEnvelope error.
+var ErrBadMessage = errors.New("protocol: bad message")
+
 // Decode unmarshals e.Data into T (unknown fields ignored; absent data decodes as the zero value)
-// and runs T's Validate method if it has one.
+// and runs T's Validate method if it has one. Before encoding/json reads the data it refuses, as
+// *FieldError{data, invalid}, data that is not valid UTF-8, not valid JSON, nested deeper than 32 levels, or
+// with an object key over 1024 bytes (not inside agent.send's and agent.recv's payload), and arrays over the
+// limits of §13 as *FieldError{<path>, too_many}.
 func Decode[T any](e Envelope) (T, error)
+
+// DecodeInto is Decode for a caller-supplied pointer (the Go client's Request, a Registry-driven dispatcher).
+func DecodeInto(e Envelope, v any) error
 
 // Marshal encodes one message; data may be nil. Slices in data must be non-nil (tests enforce).
 func Marshal(t MessageType, id, re string, data any) ([]byte, error)
@@ -3012,7 +3086,8 @@ Behavior (normative):
   - As built (README S03, `fuzz_test.go`): `FuzzParseEnvelope` allows 4× the input plus 8 KiB
     (`envelopeAllocSlack`: `encoding/json`'s decode state, which does not grow with the input), `FuzzDecode` 4×
     plus 64 KiB for the payloads of client messages (the slices that the array limits allow), and a looser bound
-    for server-to-client payloads, which only clients decode, from their own server.
+    for server-to-client payloads, which only clients decode, from their own server. README F04 lowered
+    `envelopeAllocSlack` to 1 KiB (below).
   - **The 4× bound holds for every input, and the parser is what has to meet it** (decided after group 7;
     README F04; §5). On the tree as merged after group 7 it does not hold, for `ParseEnvelope` or for `Decode`.
     The cause is the same in every case below: a long object member name, in JSON that is valid or not, which
@@ -3037,7 +3112,8 @@ Behavior (normative):
       the sizes at which the library's buffers grow, so not every larger input fails.
     - **Refusing is not the way out for the well-formed ones.** An unknown member is ignored (§5), so such a
       frame and such a payload must be accepted as before: the parser has to read them without those copies.
-      Only input that was refused before may be refused, earlier and cheaper.
+      Only input that was refused before may be refused, earlier and cheaper. (Amended after group 8 for
+      `Decode`: a key of more than 1024 bytes inside a payload is refused, below and §5. The frame stays accepted.)
     - **A clean fuzz run does not prove it.** `FuzzDecode` is not likely to build a 28 KB payload in 60 s, and
       the well-formed envelope cases need a name of several KB. So F04 adds deterministic tests next to the fuzz
       seeds (README F04): a long unknown member name, escaped and plain, in a frame of 64 KiB and of 256 KiB
@@ -3045,6 +3121,47 @@ Behavior (normative):
       `pc.answer`), accepted and within the bound.
     - F04 changes `ParseEnvelope` and `Decode` accordingly, adds the failing inputs to `testdata/fuzz`, and
       does not loosen the bound: the factor stays 4×, and neither constant grows.
+  - **As README F04 built it** (`scan.go`, `scan_test.go`, `fuzz_test.go`; §5 has the parser and `Decode`'s
+    checks). The bound holds, and is not loosened: the factor stays 4×, `envelopeAllocSlack` went **down** from
+    8 KiB to 1 KiB (`ParseEnvelope` no longer has a decode state, only the allocator's rounding of its result),
+    and `decodeAllocSlack` stays 64 KiB. The tests, deterministic next to the fuzz targets:
+    - **The scanner reads every frame as `encoding/json` did.** The former `ParseEnvelope` stays in the tests as
+      the reference (`parseEnvelopeJSON`), and `parseLikeJSON` wants the same frames accepted and the same
+      envelope, byte for byte, with every error wrapping `ErrBadMessage` and a zero `Envelope`:
+      `TestParseEnvelopeLikeEncodingJSON` (about 2,600 frames: every rule of the scanner, values of every kind
+      and near misses in every place, nesting at 1 to 1000 levels, and frames of 2,574 bytes that are mostly one
+      long key, whole or broken off, of every character kind), `TestParseEnvelopeMutations` (thousands of
+      mutations of the fixtures), and `FuzzParseEnvelope`, which compares the two on every input it makes.
+      `TestParseEnvelopeRules` spells the rules out with their results, and `TestEnvelopeScanKnowsEveryField`
+      holds the scanner's field names to the struct's tags.
+    - **`ParseEnvelope` allocates its result and nothing else** (`TestParseEnvelopeAllocations`): an exact
+      allocation count per frame (one per field of the result longer than a byte; 0 for every rejected frame,
+      a long key, a too deep nesting, invalid UTF-8 and an invalid id among them) and at most 5/4 of the result's
+      bytes plus 64, whatever the frame holds beside it. A long unknown key, escaped or plain, in the envelope or
+      in `data`, costs nothing, so the cost doesn't depend on the frame's size, which is why these frames are a few
+      KB and not the 64 KiB and 256 KiB the acceptance named.
+    - **`Decode`**: `TestDecodeSyntaxCheck` compares `Decode` with the former path (`encoding/json` alone) on
+      every payload type, over values of every kind and thousands of mutations of the fixtures, with a reference
+      for the key rule that reads `encoding/json`'s tokens (`longKey`, itself held to cases by hand in
+      `TestLongKey`): malformed and long-key payloads are refused as `data`/`invalid` and leave nothing behind,
+      everything else decodes as before. `TestSkipValue` holds the syntax check to `json.Valid`.
+      `TestDecodeKeyLength` spells the key rule out (at the limit, over it, in a list, under an unknown key,
+      escapes counted as written, the relay's payload in capitals and with an escape, a key beside it, a
+      `payload` nested elsewhere), and that the frame of such a request is no `bad_message`.
+      `TestRawMembers` holds `rawMember` to the types with a `json.RawMessage` member (exactly `agent.send` and
+      `agent.recv`).
+    - **`Decode`'s bound without its constant** (`TestDecodeLongKeyAllocations`): for every payload type the hub
+      decodes, 250 KiB of keys at the lengths that cost `encoding/json` the most per byte (33, 129, 257, 513 and
+      1024 bytes, just over its buffer steps) decode within 4× the input with **no** constant, which would hide
+      a decoder over 4× by a little; one key of 100,000 bytes or 250 KiB is refused for the price of the error;
+      and an `agent.send` with 250 KiB of long keys in its payload allocates one copy of it (then refused as
+      `message_too_large` for its size). `TestDecodeMalformedAllocations`: a payload that breaks off after a long
+      key costs its error and nothing else.
+    - **Seeds**: the frame that `FuzzParseEnvelope` found on the group 7 tree (2,574 bytes that break off after
+      one long key) is in `testdata/fuzz/FuzzParseEnvelope`, and every frame of the table above is a seed;
+      `FuzzDecode` has the payloads of the findings (one that breaks off after a key of 8,000 `~`, the `RoomJoin`
+      with a key of 100,000) and more, and checks that no payload it accepts holds a key over the limit.
+      `FuzzUnescapeKey` holds the scanner's unescaping to `encoding/json`'s.
 
 In `internal/server/signal`, with `signaltest` fakes and `httptest`:
 - **Upgrade** (the Origin matrix moved here from 03): bad Origin → 403; Origin that differs only in host case or an
@@ -3365,3 +3482,12 @@ Decided after group 7 (an engineering call the owner delegated; README §6; READ
    allocates more than the bound allows: those with a long object member name. `Decode` has the same gap for a
    large payload. The parser changes, and `Decode`'s way to the library with it; the bound, which is what keeps
    one frame's cost in proportion to its size, stays (§5, §19).
+
+Decided after group 8 (an engineering call the owner delegated; README §6; README F04 built it):
+
+10. **`Decode`'s syntax check and the 1024-byte limit on an object key stay**, with the exemption of the `payload`
+    of `agent.send` and `agent.recv`. F04 built both to meet decision 9's bound: without the syntax check a
+    payload that breaks off after a long key costs `encoding/json`'s error 8 to 14 times its size, and without the
+    key limit a valid payload with one long key that its type doesn't know costs up to 5.2 times. A payload with
+    such a key is `bad_request` (`data`/`invalid`) where it was decoded with the key ignored; the envelope's keys,
+    which `ParseEnvelope` reads without copying, have no limit (§5, §13, §19).

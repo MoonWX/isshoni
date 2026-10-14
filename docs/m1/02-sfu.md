@@ -80,12 +80,13 @@ internal/server/sfu/
   doc.go          overview, lock order, goroutine table and its rules (copy of §5.4)
   sfu.go          SFU, New, Close, Ready, Join, room reads, StopShare, CloseRoom, ticker
   config.go       Config, Limits, defaults, validation
-  api.go          the webrtc.API instances: pub, sub, probe (MediaEngines, interceptors, SettingEngine on top of
-                  04's netx.Transport.Apply), remote-candidate filter
+  api.go          the webrtc.API instances: pub (one per pub PC, §8.1), sub, probe (MediaEngines, interceptors,
+                  SettingEngine on top of 04's netx.Transport.Apply), remote-candidate filter
   room.go         Room: participants, shares, codec policy
   participant.go  Participant
   conn.go         Conn actor: command queue, internal event queue, Resync, Close
   pubpc.go        publish PC: offer handling, validation, answer filtering, OnTrack → Layer
+  pubnack.go      the pub PC's NACK filter: no NACK to the publisher for what a Layer has cached (§8.1, §9.5)
   subpc.go        subscribe PC: negotiation state machine, ICE restart, rebuild, DTLS gate
   subscription.go Subscription {video, audio DownTrack}, UpdateSubscriptions
   share.go        Share: lifecycle, layers, fan-out lists, keyframe requests, ShareInfo
@@ -936,11 +937,32 @@ offerer's PTs, so browsers' own PT numbers are fine on the publish side.
 | Video feedback | `goog-remb`, `ccm fir`, `nack`, `nack pli`, `transport-cc` | `goog-remb`, `ccm fir`, `nack`, `nack pli` (no transport-cc in v1) |
 | Audio feedback | `nack`, `transport-cc` | `nack` |
 | Header extensions | `sdes:mid`, `rtp-stream-id`, `repaired-rtp-stream-id` (video); `transport-wide-cc` (video, audio) | `abs-send-time` (video) only; REMB needs it without transport-cc |
-| Interceptors | `nack.NewGeneratorInterceptor(GeneratorSize(2048), GeneratorInterval(50 ms))`, `report.NewReceiverInterceptor(ReceiverInterval(1 s))`, `twcc.NewSenderInterceptor()` | **none**: no NACK responder (the shared cache serves NACKs), no SR generator (SRs are forwarded), no stats interceptor |
+| Interceptors, in this order | the PC's own NACK filter (`pubnack.go`, below), `nack.NewGeneratorInterceptor(GeneratorSize(2048), GeneratorInterval(50 ms), GeneratorMaxNacksPerPacket(10))`, `report.NewReceiverInterceptor(ReceiverInterval(1 s))`, `twcc.NewSenderInterceptor()` | **none**: no NACK responder (the shared cache serves NACKs), no SR generator (SRs are forwarded), no stats interceptor |
 | Not registered | NACK responder, report sender, stats interceptor (the SFU counts itself) | |
 
 The pub registry is built by hand, not with `RegisterDefaultInterceptors`. S4's sub API used `ConfigureNack` and
 `ConfigureRTCPReports`; M1 drops both.
+
+**The publish side as README S63 built it** (`codec.go` `pubInterceptors`, `api.go` `pubAPI`, `pubnack.go`):
+- **The chain is `[NACK filter, NACK generator, receiver reports, twcc]`.** Pion hands each interceptor the RTCP
+  writer of those registered before it, so the generator writes its NACKs through the filter. The filter takes
+  out of each NACK the sequence numbers whose packets the cache of the track's Layer already holds, however they
+  came, and drops a NACK with nothing left (§9.5). Every other RTCP packet, the SFU's own PLIs included, passes
+  unchanged, and so does a NACK about an SSRC the filter doesn't know yet. `TestInterceptors` holds the order,
+  `TestPubNACKFilter` the filter.
+- **The generator asks for one packet at most 10 times** (`pubNACKTries`; `GeneratorMaxNacksPerPacket(10)`, every
+  50 ms, so for half a second). The filter ends the requests for a packet that came back; the cap bounds those for
+  one that never comes. Without it Pion's generator asks for as long as its window of 2048 holds the sequence
+  number: some 45 times at 900 packets a second, over a thousand times on a still screen. Ten requests that
+  brought nothing back are of no use any more (the viewers have asked for a keyframe), and fewer would cost the
+  repair from publishers far away whose first retransmission was lost too.
+- **One `webrtc.API` per pub PC.** The filter has to know the PC's tracks (by SSRC, a copy-on-write table that the
+  Conn's actor keeps), and Pion builds a PC's interceptors from its API's registry while it creates the PC and
+  names them only by a PC id made of the time, which two PCs created at once can share. So each pub PC gets an API
+  of its own (`apis.pubAPI`): the pub MediaEngine, a registry with that PC's filter, and the one pub
+  `SettingEngine` that `New` builds (§7.3), shared by all of them. `New` builds one such API without a filter, so
+  that a pub engine that can't be built fails `New` and not every offer. The sub API and the probe APIs stay one
+  per SFU (§7.6).
 
 ### 8.2 Profile keys and compatibility
 
@@ -1109,8 +1131,9 @@ type packet struct { // immutable after insert; shared by the cache and every Do
   the RTX packets without payload. Forwarding the copies would cost egress for every viewer and raise each viewer's
   received count in its RRs, which hides real loss from the allocator (§10.2).
 - **RTCP loop**: simulcast video uses `recv.ReadSimulcastRTCP(rid)`, audio and single-layer video use
-  `recv.ReadRTCP()` (S4 finding 2). This also keeps the pub interceptors (NACK generator, RR, TWCC) running. A
-  `*rtcp.SenderReport` for this SSRC updates `lastSR` and enqueues an SR item to DownTracks forwarding this layer.
+  `recv.ReadRTCP()` (S4 finding 2). This also keeps the pub interceptors (NACK filter and generator, RR, TWCC,
+  §8.1) running. A `*rtcp.SenderReport` for this SSRC updates `lastSR` and enqueues an SR item to DownTracks
+  forwarding this layer (`Layer.srNotice`, §9.3).
 - **Keyframe start** (`h264.go`, kept from S4): the first NAL is an SPS (type 7), or a STAP-A (type 24) holds one. The
   STAP-A walk is bounds-checked and fuzzed.
 - **SPS parser**: profile_idc, constraint flags, level and size (with cropping), for `LayerInfo` and the dashboard.
@@ -1253,13 +1276,20 @@ type binding struct {
   For a padding marker: `m.skipPadding(p)`. For an SR item: §9.6.
 - **RTCP reader** (`sender.ReadRTCP()`): Pion delivers a compound packet to every SSRC it names, so each DownTrack
   filters by its own SSRC.
-  - `PictureLossIndication`, `FullIntraRequest` → `share.requestKeyframe(current slot)`.
-  - `TransportLayerNack` → §9.5.
+  - `PictureLossIndication`, `FullIntraRequest` → `share.requestKeyframe(current slot)` (video DownTracks only).
+  - `TransportLayerNack` → §9.5, for audio as for video. One compound packet may have at most 256 of its sequence
+    numbers looked at, across all its NACKs (§9.5).
   - `ReceiverEstimatedMaximumBitrate` → `allocator.onREMB(bitrate, now)`. The same REMB reaches several DownTracks;
     the allocator keeps the latest and compares each new value with it (§10.2), so a repeated copy changes nothing.
   - `ReceiverReport` blocks for our SSRC → `fractionLost` → DownTrack loss EWMA and `allocator.onLoss`.
-- **RTT** for the sub PC comes from the nominated ICE candidate pair (`pc.GetStats()`, sampled every 5 s). RR-based RTT
-  is meaningless here because the forwarded SRs carry the publisher's NTP clock (§9.6).
+- **RTT** for the sub PC comes from the selected ICE candidate pair, sampled every 5 s. RR-based RTT is meaningless
+  here because the forwarded SRs carry the publisher's NTP clock (§9.6). As README S63 built it (`subPC.sampleRTT`,
+  `rtt` and `rttAt` atomics on the `subPC`): the RTCP readers of the PC's DownTracks take the sample when the
+  viewer's RTCP arrives, before they act on it, whichever reader comes first after the 5 s (a compare-and-swap on
+  `rttAt`; the first RTCP of a new sub PC takes one at once). It asks the sender's DTLS transport for its ICE
+  transport's `GetSelectedCandidatePairStats` (`CurrentRoundTripTime`), only while the gate is open and DTLS is
+  connected: Pion logs an error when a closed ICE agent is asked. A reader may wait for Pion's ICE agent a moment,
+  a writer may not, which is why the readers do it. The NACK limits of §9.5 read the value, 0 while it is unknown.
 
 **What README S41 built** (the media path with one layer; `layer.go`, `downtrack.go`, and the ticker in `sfu.go`).
 The writer runs steps 1, 2, 3 and 5 of the loop above; a subscription forwards what it names (`high` is `f`, `low`
@@ -1305,16 +1335,37 @@ S52 has added them since: §10.1, §6.2). Beyond the text above it settled five 
   - the **latest sender report per layer** (`Layer.lastSR`, from the track's RTCP reader), which the munger's
     SR-aligned timestamp rule (§9.4) reads at a layer switch.
 
-  Still slice 8's: the RTX queue and NACK handling (§9.5), forwarding translated SRs to the viewers (§9.6: the
-  layer keeps the report, nothing sends it on yet), and its integration tests (4, 5, 6 and 19), which include the
-  ones for padding and for the publisher's redundant RTX.
+  Left then for slice 8, and built by README S63 since: the RTX queue and NACK handling (§9.5), forwarding
+  translated SRs to the viewers (§9.6), and integration 4, 5, 6 and 19 (§17), which include the ones for padding
+  and for the publisher's redundant RTX.
 
-`DownTrack` as built differs from the struct above in what later slices add: there is no `rtxQueue` (slice 8) and
-no pacer (slice 11). It has `pc atomic.Pointer[subPC]` (set by the actor before Pion can call `Bind`, so the binding
-gets its gate), `forwarding atomic.Bool` (the writer forwards a layer now: `ShareInfo.Viewers`; written only with
-`DownTrack.mu` held, so a writer can't leave a paused viewer listed) and `stats` with packets, bytes, queue drops,
-packets without a payload type, unsent packets, write errors, epochs started and the viewer's keyframe requests.
-The RTCP reader handles PLI and FIR only; NACK is slice 8's, REMB and receiver reports slice 11's.
+**What README S63 added to the DownTrack** (slice 8; `rtx.go`, `downtrack.go`, `layer.go`):
+- **The second queue**, `rtxQueue chan rtxItem` (256), which the writer drains before it takes anything off
+  `queue`: a viewer that waits for a repair can't show anything newer, so a retransmission that queued behind new
+  media would add its delay to every frame after it. A full queue drops (counted, `rtxDrops`); the viewer asks
+  again. An item carries the cached packet, the binding the NACK came through, and the own sequence number and
+  timestamp it went out with; the payload stays the cache's.
+- **`nack nackState`**, the RTCP reader's: the ring of what was retransmitted when, made with the first
+  retransmission (most DownTracks never see a NACK), and the budget (§9.5). Its lock is a leaf.
+- **Sender reports through the queue.** A Layer that gets a sender report queues one notice to its DownTracks
+  (`Layer.srNotice`, a `packet` with `report` set, one for all of them, so a report allocates nothing however many
+  viewers it reaches), and the writer sends the report on when it reaches the notice, in its place among the
+  layer's packets (§9.6). A notice that finds the queue full is not counted as a drop: the next report comes in a
+  second. The binding keeps the sub PC's PeerConnection to send reports on (`binding.rtcp`).
+- **The writer's own counts** (`rtpWriteState`): packets and octets sent on the media SSRC since the binding
+  began, which the sender reports carry (plain retransmissions count, RTX ones don't), and the RTX stream's own
+  sequence number, random at the start (RFC 3550).
+- **Counters** (`dtStats`, for README S79): `srs` (reports forwarded), and for repair `nackReceived`, `nackServed`,
+  `nackMissed`, `rtxSkipped`, `rtxDrops`, `rtxPackets` and `rtxBytes` (§9.5 says what each counts). `packets`
+  and `bytes` count forwarded media only, retransmissions not included.
+
+`DownTrack` as built differs from the struct above in what later slices add: there is no pacer (slice 11). It has
+`pc atomic.Pointer[subPC]` (set by the actor before Pion can call `Bind`, so the binding gets its gate),
+`forwarding atomic.Bool` (the writer forwards a layer now: `ShareInfo.Viewers`; written only with `DownTrack.mu`
+held, so a writer can't leave a paused viewer listed) and `stats` with packets, bytes, queue drops, packets
+without a payload type, unsent packets, write errors, epochs started and the viewer's keyframe requests, and the
+counters above. The RTCP reader handles PLI and FIR (video) and NACK (both kinds); REMB and receiver reports are
+slice 11's.
 
 Since slice 7 (README S52) the request and the cap are the **Subscription's**, not the DownTrack's: `reqVideo`,
 `reqAudio`, `capQ` and `capReason` belong to the subscriber's actor and need no lock. The DownTrack has one field
@@ -1362,8 +1413,23 @@ Rules:
      advanced in media time.
   2. *SR-aligned*: both the old and new layer have an SR less than 10 s old. Capture time of the keyframe:
      `t = ntp_n + int32(p.ts − rtp_n)/clock`. Old-timeline ts at `t`: `rtp_o + (t − ntp_o)·clock`. Then
-     `outTS = that + tsOff_old` and `tsOff = outTS − p.ts`. Accepted if `0 < int32(outTS − lastTS) ≤ (elapsed + 1 s)·clock`.
+     `outTS = that + tsOff_old` and `tsOff = outTS − p.ts`. With `step = int32(outTS − lastTS)`: accepted if
+     `0 < step ≤ (elapsed + 1 s)·clock`; **`outTS = lastTS + 1` if `−clock < step ≤ 0`** (README S63, below);
+     otherwise, and after a pause of more than 8 hours (the wall clock's cap), rule 3 decides.
   3. *Wall clock* (the S4 rule): `outTS = lastTS + max(1, elapsed·clock)`.
+
+  **The `lastTS + 1` rule** (README S63, `munger.srAligned`). A result at or less than a second behind `lastTS` is
+  the common case of a switch, not a fault: a sharer's layers are encoded from the same captured frames, so the new
+  layer's keyframe has the capture time of a frame of the old layer, and when that frame was forwarded first the
+  keyframe belongs exactly where `lastTS` is. Two frames can't share a timestamp, so it gets the next tick, and the
+  viewer's timeline stays the capture timeline to within one tick (11 µs at 90 kHz): no timestamp error while the
+  reports are fresh (§9.6). The S12 rule sent such a switch to the wall clock, which put the keyframe, and
+  everything the new layer sent after it, later by however long the keyframe took to arrive after that frame.
+  Integration 5 asks for 5 ms; with this rule S63 measured flash to beep within 12 µs through ten switches, and
+  the test also wants the forwarded reports' RTP time to advance with their NTP time within 200 µs, report to
+  report, a tick at a switch included. A result a second or more behind means the two layers' clocks can't be
+  trusted to be one, and the wall clock decides as before. The timestamp still only moves forward: the monotonic
+  guard holds for every rule.
 - **In-epoch packets**: `S = U + seqOff`, `T = ts + tsOff`. `lastS` and `lastTS` only move forward (int16/int32
   comparisons), so reordered packets keep their mapped seq.
 - **Late packets** from before the current epoch's `startU`: look back through earlier epochs of the **same Layer**
@@ -1393,22 +1459,66 @@ Rules:
 
 ### 9.5 NACK and RTX (video and audio)
 
-For each lost own seq `S` in a `TransportLayerNack` (each NACK item names up to 17 seqs):
-1. `e, ok := m.lookup(S, now)`, then `U = S − e.seqOff` and `p := e.layer.cache.get(U, now)`. A miss is counted
-   (`nack_missed`) and skipped.
-2. Skip it if `S` was retransmitted in the last `max(20 ms, rtt/2)`, or 3 times already (ring of 1024 records keyed
-   by `S`).
-3. Retransmission budget: a token bucket whose rate is 25% of max(the DownTrack's forwarded bitrate, the current
-   layer's `MaxBitrate` after the admin cap, §8.6; audio: `AudioBitrate`), at least 200 kbps, and whose depth is 1 s at
-   that rate. For an 8 Mbps `f` that is 2 Mbps with a 250 KB depth, enough to repair the large first frame after an
-   idle screen, when the forwarded rate is still low. Over budget, skip and count.
-4. Build the packet: `ts = p.ts + e.tsOff`, marker from `p`. With RTX negotiated for the viewer PT: SSRC = `rtxSSRC`,
-   PT = RTX PT, the DownTrack's own RTX seq counter, payload = `S` (2 bytes, big endian) + `p.payload`. Without RTX
-   (always the case for audio): the original SSRC, PT and `S`.
-5. Put it on `rtxQueue`, which the writer sends before new media. RTX payloads come from a `sync.Pool`.
+For each lost own seq `S` in a `TransportLayerNack` (each NACK item names up to 17 seqs), in this order (README S63
+built it so, `rtx.go` `handleNACK` and `serveNACKs`; the DownTrack's RTCP reader runs steps 1–6, its writer 7):
+1. **At most 256 per compound packet** (`nackBatch`, the size of the RTX queue). One compound packet from a viewer
+   may name thousands of sequence numbers; only the first 256, across all its NACKs, are looked at. More couldn't
+   be sent anyway, and looking them up costs time under the DownTrack's lock, which a viewer must not be able to
+   spend at will. The rest count as skipped, and the viewer asks again for what it still misses
+   (`TestNACKBatch`).
+2. **Look it up**: `e, ok := m.lookup(S, now)` (§9.4), then `U = S − e.seqOff` and `p := e.layer.cache.get(U, now)`.
+3. **Asked too soon or too often**: skip it (counted as skipped) if `S` was retransmitted in the last
+   `max(20 ms, rtt/2)` (`rtt` of §9.3, 0 while unknown), or 3 times already. The records are a ring of 1024 keyed
+   by `S`, made with the DownTrack's first retransmission, and a record counts for 5 s after the retransmission it
+   notes (`nackRecordAge`): own sequence numbers have 16 bits, and the number of a packet retransmitted three times
+   belongs to another packet 65536 packets later (73 s at 900 packets a second), which must be repaired like any.
+   Five seconds are more than the cache keeps a packet (1.5 s), so expiry never gets a packet a fourth sending
+   (`TestNACKLimits`, `TestNACKRecordAge`). This check comes **before** the miss: a viewer that goes on asking for
+   what it already got (Pion's own NACK generator does, for packets that arrived as RTX) is skipped, not counted
+   as a miss once the cache has let go of the packet.
+4. **A miss**: no epoch sent `S` (not sent yet, too old, or the lookup stopped at an epoch older than 2 s), or the
+   cache no longer has the packet. Counted (`nackMissed`) and skipped; the viewer asks for a keyframe when it
+   needs one.
+5. **Retransmission budget**: a token bucket in bits whose rate is 25% of max(the forwarded layer's measured
+   bitrate, what that layer may carry at most), at least 200 kbps, and whose depth is 1 s at that rate. The layer
+   is the one of the DownTrack's newest epoch; a DownTrack forwards all of a layer or nothing, so the layer's own
+   rate stands for "the DownTrack's forwarded bitrate". The maximum is the full layer's `MaxBitrate` after the
+   admin cap (§8.6), the preview layer's 300 kbps, or for audio the preset's Opus bitrate (`AudioBitrate`); each is
+   an atomic or a constant (`SFU.fullMaxBps`, set by `New` and `SetLimits`; `Share.audioBps`, set with the
+   preset), so the NACK path takes no lock beyond its own three (`TestRTXRate`). For an 8 Mbps `f` that is 2 Mbps
+   with a 250 KB depth, enough to repair the large first frame after an idle screen, when the measured rate is
+   still low. The bucket starts full with the first NACK; a lower rate than last time also lowers the depth. A
+   retransmission costs its payload; over budget, it is skipped and counted (`TestRTXBudget`).
+6. **Queue it** on `rtxQueue` (256), which the writer sends before new media (§9.3). A full queue drops it
+   (`rtxDrops`); the viewer asks again.
+7. **The writer builds and sends it** (`retransmit`): `ts = p.ts + e.tsOff`, marker from `p`, abs-send-time of
+   this sending when negotiated. With RTX negotiated for the viewer PT: SSRC = `rtxSSRC`, PT = RTX PT, the
+   DownTrack's own RTX seq counter, payload = `S` (2 bytes, big endian) + `p.payload`, built in a buffer from a
+   `sync.Pool`. Without RTX (always the case for audio): the original SSRC, PT and `S`. A retransmission asked for
+   on another binding than the one the DownTrack has now (the sub PC was rebuilt meanwhile), or that the viewer can
+   no longer get or decode (the gate closed, no PT for the profile), is skipped (counted).
 
-The publish side needs nothing extra: Pion's NACK generator asks the publisher, and the recovered packet reaches the
-cache and every forwarding DownTrack as a late packet.
+The locks are taken one after the other, never inside each other: `DownTrack.mu` for the epochs (step 2), each
+cache's own for the packet, and the NACK state's (a leaf) for the records and the budget (steps 3–5).
+
+**What is counted** (`dtStats`, §9.3; README S79 exports them): every sequence number a NACK names is received
+(`nackReceived`), and then either served (`nackServed`, when the write succeeded), missed (`nackMissed`, step 4),
+skipped (`rtxSkipped`: beyond the 256 of step 1, asked too soon or too often, over budget, or dropped by the
+writer in step 7), or dropped by the full RTX queue (`rtxDrops`). A write that fails or that Pion takes without
+sending counts as `writeErrors` or `unsent`, like a forwarded packet. `rtxPackets` and `rtxBytes` count the
+retransmissions written (with the 2 bytes of RTX's original sequence number); a plain retransmission also counts
+in the packets and octets of the next sender report, since it is on the media SSRC, and an RTX one doesn't.
+
+**The publish side needs more than Pion's generator** (README S63). Pion's NACK generator asks the publisher, and
+the recovered packet reaches the cache and every forwarding DownTrack as a late packet (§9.1). But the generator
+never learns of a packet that came back on the RTX stream: Pion's receiver reads that stream through an
+interceptor chain of its own and hands the packets to the track past the generator. Left to itself it asked for
+such a packet again at every tick, and a browser sends a copy for every request that comes a round trip or more
+after its last one: some ten copies of each packet the publisher's link lost, all dropped as duplicates at the
+cache. So each pub PC has the NACK filter of §8.1 in front of the generator, which stops the requests for a packet
+as soon as its Layer's cache has it, and the generator asks for one packet at most 10 times, which bounds the
+requests for a packet that never comes. In integration 19 the publisher now resends 20 packets for 20 lost ones
+(200 before the filter).
 
 ### 9.6 Sender reports and A/V sync
 
@@ -1913,15 +2023,43 @@ mid/rid extensions itself (Pion's built-in tracks don't for simulcast senders, a
 packetizes with `pion/rtp/codecs` (`H264Payloader`, MTU 1200; Opus as is), computes `rtp_ts = base + (capture −
 t0) × clock`, and sends its own SRs every 1 s per SSRC (NTP = wall clock at capture, RTP = that frame's timestamp,
 exactly the plan's native path). It answers PLI with `Source.RequestKeyframe` and registers the TWCC header-extension
-interceptor, so the SFU's feedback generator does real work. No rate control in M1. A test option, `RedundantRTX`,
-negotiates RTX and resends already-delivered packets on the RTX stream with the `repaired-rtp-stream-id` extension,
-like Chrome's padding and probes (§17 test 19).
+interceptor, so the SFU's feedback generator does real work. No rate control in M1. Two test options send what
+browsers send and fake media alone doesn't (README S63, `repair.go` and `track.go`):
+- **`RedundantRTX`** (§17 test 19) makes the Publisher repair like a browser. It negotiates RTX for the video
+  (PT 97, `apt=96`) and registers **no** NACK responder: the tracks answer NACKs themselves, from a ring of the
+  last 1024 packets each sent, because the RTX stream has one sequence of numbers, which the second copies below
+  must share with the repairs. Video goes out on the RTX stream (RFC 4588: RTX SSRC and PT, the stream's next
+  sequence number, the original's timestamp and marker, the original sequence number in front of the payload),
+  with `repaired-rtp-stream-id` naming the layer when the video is simulcast; audio is the packet again. After its
+  first 15 frames (a receiver can place a simulcast layer's RTX stream only once that layer's media has arrived)
+  a video track also sends a second copy of each frame's last packet on the RTX stream right after the frame, the
+  way Chrome fills its padding and probes with payloads it already delivered. A receiver must drop those copies.
+- **`Padding`** (§17 test 6): after every `Padding`-th frame of each video layer the Publisher sends two
+  padding-only packets (200 bytes of padding, no payload, the frame's timestamp) on the layer's media stream, as
+  a browser without RTX pads and probes. They take sequence numbers and carry nothing, so a receiver that forwards
+  the stream must close the gaps they would leave. 0 sends none; a negative value is `ErrInvalidOptions`.
+- `TrackStats` counts them apart: `Padding`, `Redundant` (second copies) and `Retransmitted` (NACK answers, with
+  `RedundantRTX` only; without it Pion's responder answers and nothing counts there). `Packets` and `Octets` are
+  the media stream's alone. `ErrNotImplemented` is gone with the last option that returned it.
 
-`sfutest.Viewer`: a Pion subscriber (NACK generator, RR, and REMB either from the `rembsim` model driven by a scripted
+`sfutest.Viewer`: a Pion subscriber (NACKs, RR, and REMB either from the `rembsim` model driven by a scripted
 link capacity (§17) or fixed values injected by the test) that records per track: seq, ts, arrival, marker contents
 (layer, frame, flash), gaps, recovered-by-RTX, final loss after 1 s, keyframes, SRs. It offers the S4 checks
 (`CheckContinuous`, `CheckStartsOnSPS`) plus `AVOffset()` (flash vs beep, both mapped to NTP through the last
 forwarded SRs).
+
+**The Viewer's NACKs are its own** (README S63), not Pion's generator, which never sees what Pion's receiver
+recovered from an RTX stream and would ask for it again every interval for as long as its window holds the
+sequence number: no browser does that, and an SFU that answers NACKs would send every repaired packet several
+times. Each track's Recorder knows which sequence numbers are missing, and a loop per track sends NACKs for them,
+timed about as a browser's: once a number has been missing for `NACKAfter` (10 ms; a packet that is only out of
+order needs none), again every `NACKEvery` (100 ms) while it stays missing, at most `NACKTries` (10) times, never
+once it counts as lost (`FinalLossAfter`), and never again once it arrives, on the track or through RTX. A NACK
+packet names at most 256 sequence numbers; more go into the next one. `ViewerOptions.NoNACK` asks for nothing.
+The Recorder also keeps a hash of each payload, so a test can compare what arrived with what the publisher sent,
+and the NACKs it sent. `HarnessOptions.FaultyUDP` puts the Harness's SFU socket behind a `FaultConn`
+(`Harness.Wire`), whose filter gets the client's address with every datagram, so a test can lose chosen packets
+between the SFU and one client (integration 4).
 
 ### 15.2 `cmd/isshoni-loadtest`
 
@@ -2032,6 +2170,13 @@ against the numbers of §5.3 and §12.
   `TestSubSpareNotFreeYet`, `TestSubSpareNotInactive`).
 - `rtx_test`: RTX packet layout (OSN, SSRC, PT); per-seq limits; budget rate and depth (after 10 s of an idle
   8 Mbps `f`, NACKs for 30 packets of one large frame are all served).
+  As README S63 wrote it (`rtx_test.go`, on a DownTrack without a sub PC, `newRTXRig`): `TestRTXLayout`,
+  `TestRTXAudio` (the packet again, counted by the next sender report), `TestNACKLimits`, `TestNACKRecordAge`
+  (the 5 s of a record, to the nanosecond, and the packet that has the number 65536 packets later),
+  `TestNACKMisses`, `TestNACKAcrossEpochs` (a switch and a padding gap), `TestRTXBudget`, `TestRTXRate` (the three
+  maxima after `SetLimits` and a preset change), `TestNACKBatch` (the 256), `TestRTXQueue` (the 256, a rebuilt
+  binding, a closed gate, no PT), `TestWriterSendsRTXFirst`, `TestSenderReportForwarding` (§9.6), and
+  `TestPubNACKFilter` (§8.1; `TestInterceptors` in `codec_test` holds the filter's place in the chain).
 - `allocator_test` (fake clock): scripted REMB and RR sequences → state changes, backoff doubling up to 120 s and
   reset, events once per change, allocation order (audio, thumbnails, newest high); a REMB below a target the viewer
   isn't receiving yet never downgrades; a REMB after a gap of more than 5 s is a baseline, not a decrease. Then the
@@ -2069,6 +2214,14 @@ with `fake.Source`, `sfutest.Viewer`)**
    the pause.
 4. `TestNACKFromCache`: `FaultConn` drops chosen outgoing packets to one viewer. The viewer's NACKs are served from
    the cache (video as RTX, audio plain), with payload bytes equal to the originals; the cache's miss counter stays 0.
+   As README S63 wrote it (`repair_test.go`): the SFU's socket is the Harness's `FaultConn`
+   (`HarnessOptions.FaultyUDP`), and the viewer that loses packets has a socket of its own, so the filter tells it
+   from the second viewer of the same share by its address. For about 5 s it loses single video packets and runs
+   of three, and single audio packets (at least 10 of each kind). Every gap closes (video through the RTX stream only, audio through the
+   packet itself), nothing is lost for good, each frame and audio packet is the publisher's by a hash of its
+   payload, nothing arrives twice on the media stream, the DownTrack's repair counters show no miss and no queue
+   drop, and the sub PC's round-trip time has been read (its value on loopback is not checked: a loaded machine
+   stretches one STUN round trip a long way). The second viewer sees no gap and sends no NACK.
 5. `TestSRTranslationAndAVOffset`: |flash − beep| ≤ 5 ms after 10 layer switches and 5 audio off/on cycles; forwarded
    SR RTP equals upstream RTP + offset.
 6. `TestPaddingNoGaps`: the publisher injects padding-only packets; the viewer sees no seq gaps and sends no NACKs.
@@ -2120,6 +2273,16 @@ with `fake.Source`, `sfutest.Viewer`)**
     already delivered on its RTX stream, as Chrome does for padding and probes; each viewer receives every seq exactly
     once and sends no extra NACKs; `isshoni_sfu_ingress_duplicates_total` counts the copies. A packet dropped on the
     publish side and then recovered by RTX still reaches every viewer once.
+    As README S63 wrote it (`repair_test.go`; the metric is README S79's, so the test reads the same count from
+    `SFU.Ingress`, `LayerState.Duplicates`): two viewers, one on `f` and one on `q`, get every sequence number once
+    in whole frames while the publisher sends a second copy of each frame's last packet on its RTX stream (at
+    least 60 on `f`, 30 on `q`), and the SFU counts every copy. Then the publisher's own socket (a `FaultConn`
+    under its UDP mux) loses at least 20 packets that no second copy covers. Only the SFU's NACKs bring them
+    back, on the same RTX stream, and the requests for each stop when it is back, because the pub PC's NACK filter
+    takes out what the cache holds (§8.1, §9.5): the test wants at most three resends per lost packet on average,
+    room for a loaded machine (on loopback it is one each: 20 resends for 20 lost packets, 200 before the filter).
+    Every gap closes for both viewers, and what the SFU forwards arrives once; a copy on the viewer's RTX stream can
+    only be the answer to that viewer's own NACK.
 
 **The frame checks and a layer switch** (README S52, `sfutest/checks.go`). An SFU switches on the first packet of
 the new layer's keyframe (§9.4), and the two layers are read by different goroutines, so that packet can reach a
@@ -2131,6 +2294,25 @@ forwarded, and a decoder drops what it got of it. That is correct, and the check
   out exactly the frames that a switch cut short: a frame whose last packet (the marker bit) didn't arrive, right
   before a frame of another layer. A frame that is short for any other reason still fails. `WithoutPartialTail`
   does the same for the one frame the recording itself may have cut at its end.
+
+**The checks and repair** (README S63, and the group 8 integration's commit "tests that hold on a loaded Linux
+machine"). With repair a packet can arrive after newer ones: a retransmission that a NACK brought back, or a
+packet the network or a loaded machine delayed. A decoder's jitter buffer puts such a packet back in its place,
+and the checks do the same:
+- **The checks of the stream read packets in sequence-number order**, the order the SFU sent them in:
+  `CheckContinuous` sorts them itself (the S4 check always did), and `CheckStartsOnSPS`, `CheckVideoMarkers` and
+  `CheckAudioMarkers` read them through `sfutest.InSeqOrder`, which keeps a second copy of a number right behind
+  the first. (S63 added `InSeqOrder` for the tests with repair; the three checks took arrival order until the
+  integration found them failing on a loaded Linux machine, where a repaired packet arrived after the next frame
+  had begun.)
+- `Frames`, `WithoutPartialTail` and `WithoutCutFrames` still take packets in arrival order, which is the stream's
+  order as long as nothing was lost or reordered; a test with repairs puts the packets in order with `InSeqOrder`
+  before it calls them.
+
+The media integration tests of 01 (`internal/server/itest`) sign up their accounts through REST like the web app.
+On a fast machine they come faster than the auth-hash budget of 03 §7.3 refills (a burst of 20), and the server
+answers 503 `server_busy` with a `Retry-After`. The harness retries such a sign-up after the `Retry-After`, as it
+already did for a 429 (`world.post`), within the test's deadline; any other status still fails the test at once.
 
 Integration 2, 3, 10 and 17 are `simulcast_test.go`, with two more of README S52's next to them:
 `TestSimulcastFromTheFirstPacket` (§10.1: viewers who were subscribed before a simulcast publisher sent anything
@@ -2328,6 +2510,14 @@ tests of the timers and guards in `guards_test.go`).
 
 Still to come in the paths S57 touched: the last `QualityHintEvent` per share in `Resync()` (README S88, which
 sends the first ones), and the SFU's own codec rebuilds, which the creation limit won't count (README S69).
+
+**What README S63 built** (slice 8; integration 4, 5, 6 and 19 in `repair_test.go`, the unit tests in
+`rtx_test.go`). Repair is §9.5 in the order of its steps, with the cap of 256 sequence numbers per compound
+packet, the 5 s life of a NACK record and the counters; the DownTrack's second queue, its RTCP reader for NACKs
+and the RTT from the candidate pair are §9.3. Sync is §9.6, with the `lastTS + 1` rule of §9.4 for a switch to a
+keyframe whose capture time was forwarded already. The publish side got the NACK filter and the cap of 10 requests
+per packet, with one `webrtc.API` per pub PC (§8.1). The test tools are §15.1 (`RedundantRTX`, `Padding`, the
+Viewer's own NACKs, `HarnessOptions.FaultyUDP`) and §17 (`InSeqOrder`).
 
 ## Decisions taken at integration (formerly open questions)
 

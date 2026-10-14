@@ -1277,6 +1277,17 @@ Tiles are `object-fit: contain`. Safe areas use `env(safe-area-inset-*)` with `v
 at least 44×44 px. With no remote share, the stage shows the empty state (§11.2), or "You're live · 3 watching" while
 you share.
 
+**In a low window the stage gives way** (README S66, found by `watch.spec`; `ViewerLayout.module.css`,
+`RoomPage.module.css`, `SharePanel.module.css`). The room page keeps the window's height (`flex: none` in the app's
+root column), so a playing share never makes the document taller than the window. Below 1024 px the stage may
+shrink (`flex: 0 1 auto`), and the picture keeps its shape inside it: in a window too low for a 16:9 stage, the
+strip and the sharer's bar together, the stage is lower than 16:9, where the row above says "16:9", and it never
+gets lower than its controls' row (a touch target and its padding), so Mute and Fullscreen stay whole. The sharer's
+bar (§13.7) takes at most 45 % of the window's height, and its settings are the part that scrolls, so the status
+and Stop stay in view. Measured by S66 with both people sharing and the settings open: at 900×520 and 700×520 the
+stage is 77 px with its controls inside it, at 683×600 121 px, at 360×640 130 px; the strip ends above the bar,
+and nothing scrolls.
+
 ### 12.2 Focus
 
 - **Auto-focus** (plan: "the most recent share is focused automatically"): while `focusMode === 'auto'`, the stage shows
@@ -1461,9 +1472,9 @@ pseudo-fullscreen and the keyboard, and nothing else.
     `document.pictureInPictureEnabled` and not iOS (§8; an iPad that calls itself a Mac counts as iOS). That is
     the desktop browsers, and it is also **Android Chrome**, which reports PiP too, where the rule above says
     "desktop only". Whether Android keeps the button is an **open question for the owner** (asked after group 6,
-    still open after group 7): the rule above stands as written, the code stays as built until the answer, and
-    the manual matrix row M-AND-1 (§19.4) is where it shows. iOS is not part of the question: no PiP there in
-    M1.
+    still open after groups 7 and 8): the rule above stands as written, the code stays as built until the
+    answer, and the manual matrix row M-AND-1 (§19.4) is where it shows. iOS is not part of the question: no PiP
+    there in M1.
 - **Wake lock.** `platform.requestWakeLock()` is the browser's side (§8) and answers `null` where the API is
   missing or refuses (battery saver, iOS Low Power Mode); the viewer asks for it only where
   `capabilities.wakeLock` is true, and only decides when to hold one: while the page is visible and a share that
@@ -2351,6 +2362,13 @@ S91's):
   never a problem. `fixCode` is absent where there is nothing to do, and for `tls` it can be one of the ten
   certificate codes of 04 §8.7, with the server's own sentence in `params.lastError` when it has one. The
   catalog needs a text for every code and fix code of 04 §13.2.
+- **For README S91, from README F04** (no Doctor page exists yet, so the catalog has no `doctor.*` entries): two
+  codes of a check's own have the status `skip`, and the catalog needs them like the rest:
+  `doctor.udp_buffers.unknown` and `doctor.public_ip.loopback`, the latter the `public_ip` check on a development
+  server (`network.include_loopback` set, no STUN server, a site that is not the server's address; 04 §13.2). It
+  has no params and no fix code; the CLI's text is "not checked: network.include_loopback is on and
+  network.stun_servers is empty (a development setup, which needs no public address)". A page on a `task dev` or
+  e2e server shows it, so `admin.spec`'s "doctor page renders results" meets it.
 
 **The pages as README S49 built them** (`web/src/admin/`: Users, Approvals, Invites, Rooms, Settings and Audit;
 the Dashboard and Doctor pages are README S91's, and until then their routes show the router's `PageUnavailable`
@@ -2971,6 +2989,36 @@ real picker. The host must be exactly `localhost` or `127.0.0.1` (`[::1]` and na
 30 fps with a moving bar and a frame counter; it stops drawing and closes its `AudioContext` when its tracks are
 stopped.
 
+**The specs as README S66 built them** (`invite`, `rooms`, `warning` and `watch.spec.ts`, `tone.html`), where the
+text above leaves something open:
+- **`context.setOffline(true)` does not close a WebSocket.** Chrome's offline emulation holds back the frames of a
+  socket that is already open and leaves its TCP connection alone, so the server notices nothing until its 45 s
+  idle timeout (01 §3.4), and the person never goes to "Reconnecting…" on the others' pages. `rooms.spec` cuts the
+  network with a SOCKS5 proxy on a free loopback port instead, which the person's browser context uses
+  (`proxy: socks5://…`) and which the test closes: every connection through it ends without a goodbye, and no new
+  one gets through until the test lets them again. A later spec that cuts the network has to take this into
+  account: `reconnect.spec` (README S81) uses `setOffline` in its case (b) of the table below, which asks only for
+  the page's own banner, not for the server to see the cut.
+- **`--mute-audio`.** Playwright starts a headless Chrome with `--mute-audio` (one of its own defaults for headless
+  Chromium; `chromeArgs` doesn't add it, and the headful CI run has no such flag). Muting the output changes
+  nothing the specs read: the sound checks read the receiving PeerConnection's `audioLevel` and
+  `totalAudioEnergy` (§10.7), which measure what arrived, and the headless runs share the fake display, whose tone
+  is a WebAudio track.
+- **The tone tab** draws its canvas at 30 fps, every second animation frame of a 60 Hz display, not at the
+  display's rate: on a CI machine the sharer encodes both layers in software next to everything else, and half the
+  frames leave it room for that. The canvas fills the tab, so what is captured is the tab's size, not the canvas's
+  1280×720: S66 measured the tone tab's capture at 1280×658, which still gives the high layer a frame height
+  above the 540 that `watch.spec` asks for. The tone is the fake display's (1 kHz at a quarter of full scale), and
+  `window.__tone` tells the specs that the tab draws and sounds. `fixtures.ts` serves it through `context.route`,
+  so the server's Content-Security-Policy does not apply to its inline script.
+- **The high layer gets 40 s.** A sharer whose machine is busy starts with the low layer alone and adds the high
+  one when its bandwidth estimate allows it: within a second on an idle machine, 10 to 17 s after the start in a
+  container held to two CPUs. `watch.spec` waits up to 40 s (`HIGH_LAYER_TIMEOUT_MS`) for `room.state` to list both
+  layers, and 20 s for everything else of a share's start.
+- **A server per test** for `rooms`, `warning` and `watch`, which count what a whole room shows; `invite.spec`
+  uses the worker's server and asserts only what holds with other people in the lounge. Every Share click brings
+  its page to the front first (above), and the tests named "headful:" are skipped in a headless run.
+
 The tone tab has no flash/beep sync marker, and no browser spec measures the A/V offset. The plan's 45 ms target is
 checked by S63's Go integration test (02 int. 5, flash-to-beep offset ≤ 5 ms through the SFU) and by the exit
 session's survey ("nobody reports audio out of sync", 06 §12.3). M1 builds no browser flash/beep harness.
@@ -2980,13 +3028,14 @@ Stats are read through `window.__isshoni.stats()` (§10.7).
 | Spec | Asserts |
 |---|---|
 | `setup.spec` | own server with `setUp: false`: wizard: admin created; connection test shows UDP ✓, TCP 7882 ✓, TCP 443 row hidden (`transport_disabled` in off mode); invite link and QR present; `setupWizardDone` set. A second own server with `{'listen.ice_udp': ''}`: the UDP row shows ✗ with `conntest.udpDisabled` |
-| `invite.spec` | a second context opens the invite link, signs up, lands in Lounge; the fragment is gone from the URL; both appear in the people panel |
-| `watch.spec` | sharer (tone tab) live; `room.state` lists layers `high` and `low`; the viewer's focused tile has `framesDecoded > 0` and `frameHeight ≥ 540`; audio `audioLevel > 0.05` and `totalAudioEnergy` rising; the sharer sees the viewer's name |
+| `invite.spec` | a second context opens the invite link, signs up, lands in Lounge; the fragment is gone from the URL; both appear in the people panel. As README S66 built it (on the worker's server): the token is in no request URL and in none of the tab's storage either, and a used-up link says so |
+| `rooms.spec` (README S66; a server per test, since it counts a room's people) | two people see each other within 1 s of the second one's `room.join`; closing a tab takes its person out at once (the page closes with 1000, the hub skips the grace), unless the person has another tab in the room; a person whose network is cut stays as "Reconnecting…" for the 30 s grace, is gone after it, and is back by themselves when the network is (the cut is a SOCKS5 proxy that the test closes, not `setOffline`: below); the room switcher appears only with a second room, and switching asks first while sharing and takes the person and the share out of the room they leave |
+| `watch.spec` | sharer (tone tab) live; `room.state` lists layers `high` and `low`; the viewer's focused tile has `framesDecoded > 0` and `frameHeight ≥ 540`; audio `audioLevel > 0.05` and `totalAudioEnergy` rising; the sharer sees the viewer's name. As README S66 built it (a server per test): the high layer may take up to 40 s (below); the stage and its Mute and Fullscreen buttons fit the window; a reload watches again and is counted once; Stop, a closed sharer tab and (headful only) a closed shared tab each end the share at once; the same page shares again and a latecomer watches it; in a low window (900×600, 700×520, 683×600) the stage gives way and the tiles stay above the sharer's bar, also with the share's settings open (§12.1, §13.7) |
 | `focus-audio.spec` | 2 sharers + viewer: audio bytes flow only for the focused share; clicking the other tile flips it within 2 s; the speaker button moves audio without moving focus; the newest share is auto-focused |
 | `layers.spec` | thumbnail `frameHeight ≤ 360`; a tile scrolled out of view stops receiving video bytes within 3 s; fullscreen turns thumbnails off |
 | `unmute.spec` | without the autoplay flag, "Tap to unmute" appears; after a click, the audio element plays and `audioLevel > 0.05` |
 | `reconnect.spec` | (a) `__isshoni.dropSocket()`: resumed with the same `connectionId`, `framesDecoded` keeps rising, no new sub offer; (b) `context.setOffline(true)` for 5 s: the banner appears after 2 s, then clears; (c) own server, `restart()` (same data dir and ports): the viewer decodes the re-published share within 15 s, focused, with audio |
-| `warning.spec` | fake display `monitor+audio` shows the warning; "Share without sound" publishes without an audio track; "Pick something else" reopens the picker |
+| `warning.spec` | fake display `monitor+audio` shows the warning; "Share without sound" publishes without an audio track; "Pick something else" reopens the picker. As README S66 built it (a server per test): nothing is shared before the answer; "Share with sound anyway" publishes both tracks, and the friend gets both; what is picked behind "Pick something else" is shared (the tone tab through the real picker when headful, another fake display when headless) |
 | `a11y.spec` | axe (`wcag2a`, `wcag2aa`, `wcag21aa`) on login, invite, reset, setup, the room with a share, admin users: no serious or critical violations; the tile list is keyboard-reachable; `F` toggles fullscreen |
 | `pwa.spec` | the manifest parses; the service worker activates; offline navigation shows the Offline screen from the cached shell |
 | `version.spec` | `page.routeWebSocket` rewrites `serverVersion` in `welcome`: the page reloads once, then shows VersionMismatch; a routed `protocol_unsupported` error shows it at once |
@@ -3139,7 +3188,7 @@ Decided after group 5 (engineering calls the owner delegated; README §6):
   01 §8.7). The M1 UI changes a preset only from the publishing page; the push to the publisher comes with the M2
   desktop handoff.
 
-**Open, for the owner** (raised after group 6, still open after group 7; README §6):
+**Open, for the owner** (raised after group 6, still open after groups 7 and 8; README §6):
 - **Picture-in-picture on Android Chrome** (§12.5). The rule says "desktop only" and hides PiP on iOS. README S56
   built it by capability: the button is there wherever the browser reports PiP and the device is not iOS, which
   includes Android Chrome. The two readings differ only there. Until the owner answers, the rule in §12.5 is not

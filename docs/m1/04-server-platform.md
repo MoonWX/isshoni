@@ -119,19 +119,19 @@ governed by the license gate (06).
 
 | Command | What it does | Talks to |
 |---|---|---|
-| `isshoni serve [config flags]` | Runs the server until SIGTERM or SIGINT, then shuts down gracefully (§6.4). SIGHUP is ignored until the reload of §6.5 exists (decided after group 7: README S65 ignores it, README S90 reloads), so `systemctl reload isshoni` neither reloads nor stops the server. Docker `CMD ["serve"]` | – |
+| `isshoni serve [config flags]` | Runs the server until SIGTERM or SIGINT, then shuts down gracefully (§6.4). After a restore, `rotate-secrets`, or the public address that a server waited for, it restarts in place with the same PID (the re-exec of §6.5). SIGHUP is ignored until the reload of §6.5 exists (decided after group 7: README S65 ignores it, README S90 reloads). As S65 built it, `serve` takes the signal, logs one INFO line, `reload is not supported yet; restart to apply changes`, and goes on, so `systemctl reload isshoni` neither reloads nor stops the server. Docker `CMD ["serve"]` | – |
 | `isshoni setup-url [--qr\|--no-qr] [--wait DUR] [--json]` | Mints a one-time setup link and prints it (plus a QR code on a TTY). `--wait` is for Docker and manual use; install.sh waits with `healthcheck --ready` and then calls `setup-url` once | admin socket |
 | `isshoni doctor [--json] [--strict] [--only ID,…] [--list-checks] [--bandwidth-flags…]` | Diagnostics (§13). Works with or without a running server. `--only` runs the named checks (install.sh uses `dns,public_ip,clock` before the first start); `--list-checks --json` prints a JSON array of the check ids (06's anchor test, §13.1) | admin socket if up |
 | `isshoni healthcheck [--ready] [--wait DUR]` | Liveness (default) or readiness. Docker `HEALTHCHECK` (liveness); install.sh uses `--ready` | admin socket |
 | `isshoni admin status [--json]` | Version, uptime, TLS, rooms, connections | admin socket |
-| `isshoni admin backup [--out PATH\|-] [--no-certs] [--offline]` | Writes a backup archive (§12.3) | admin socket |
-| `isshoni admin restore PATH\|- [--yes] [--offline]` | Restores a backup archive, or only the database from a pre-migration `backups/pre-*.db` file, and restarts the server (§12.4) | admin socket |
+| `isshoni admin backup [--out PATH\|-] [--no-certs] [--offline]` | Writes a backup archive (§12.3); never overwrites a file (exit 7) | admin socket |
+| `isshoni admin restore PATH\|- [--yes] [--offline]` | Restores a backup archive, or only the database from a pre-migration `backups/pre-*.db` file, and restarts the server; waits up to 60 s for it to answer again (§12.4) | admin socket |
 | `isshoni admin users list [--json]` | Lists accounts | admin socket |
 | `isshoni admin users reset-password NAME` | Prints a one-time password-reset link | admin socket |
 | `isshoni admin users set-role NAME admin\|user` | Changes a role (03's roles) | admin socket |
 | `isshoni admin users disable\|enable NAME` | Blocks or unblocks sign-in (disable revokes sessions and devices) | admin socket |
 | `isshoni admin invite create [--uses N] [--ttl DUR]` | Prints an invite link. Flags left out are not sent; defaults: the server's invite settings (03 §9). `--ttl` is whole hours from `1h` to `720h` | admin socket |
-| `isshoni admin rotate-secrets [--yes]` | Rotates all generated secrets (session, invite, resume and VAPID keys) and restarts the server (§5.3) | admin socket |
+| `isshoni admin rotate-secrets [--yes]` | Rotates all generated secrets (session, invite, resume and VAPID keys) and restarts the server; waits up to 60 s for it to answer again (§5.3) | admin socket |
 | `isshoni admin log-level LEVEL [--for DUR]` | Changes the log level at runtime (default `--for 30m`, then back) | admin socket |
 | `isshoni config check` | Loads and validates config; prints problems | – |
 | `isshoni config print [--json]` | Effective config with the source of every value | – |
@@ -157,14 +157,14 @@ Conventions:
 
 | Code | Meaning |
 |---|---|
-| 0 | Success (doctor: no `fail` results) |
-| 1 | Runtime error: cannot bind a port, another isshoni process holds the data-directory lock (§5.1), a `store.Open` error that does not wrap `store.ErrNeedsOperator`, backup failed, unexpected server error |
+| 0 | Success (doctor: no `fail` results). `serve`: also a stop that came while the server shut down for a restart, which then does not happen (§6.5) |
+| 1 | Runtime error: cannot bind a port, another isshoni process holds the data-directory lock (§5.1), a `store.Open` error that does not wrap `store.ErrNeedsOperator`, backup failed, unexpected server error, a second SIGTERM/SIGINT during the graceful shutdown (§6.4), a destructive command answered with anything but `y` or `yes` (§3.1) |
 | 2 | Usage error: unknown command or flag, missing argument, a destructive command without a TTY and without `--yes` (§3.1) |
-| 78 | `EX_CONFIG`: a configuration or data problem that a restart can't fix: invalid config (all problems are printed, §4.5, including a policy value that 03's `SettingsCache.Pin` rejects), `config init`/`config example`: the given values are invalid, any `store.Open` error for which `errors.Is(err, store.ErrNeedsOperator)` (newer schema, history mismatch, failed migration, corrupt DB, …; 03's message is printed), a corrupt `secrets.json`, wrong owner of data files (§5.2), or a container without a data volume (§6.3). systemd's `RestartPreventExitStatus=78` (06) stops the restart loop |
+| 78 | `EX_CONFIG`: a configuration or data problem that a restart can't fix: invalid config (all problems are printed, §4.5, including a policy value that 03's `SettingsCache.Pin` rejects), `config init`/`config example`: the given values are invalid, any `store.Open` error for which `errors.Is(err, store.ErrNeedsOperator)` (newer schema, history mismatch, failed migration, corrupt DB, …; 03's message is printed), a restore whose file swap only the operator can put right (`ops.ErrRestoreNeedsOperator`, §12.4), a corrupt `secrets.json`, wrong owner of data files (§5.2), or a container without a data volume (§6.3). systemd's `RestartPreventExitStatus=78` (06) stops the restart loop |
 | 4 | Server not reachable on the admin socket: not running or wrong path, or permission denied, which prints its own message: "Permission denied on /run/isshoni/admin.sock: run it with sudo (sudo isshoni …)" (§12.1) |
 | 5 | `doctor`: at least one `fail` (with `--strict`, also any `warn`) |
-| 7 | Refused: precondition not met (an admin already exists: `setup_unavailable`, backup is newer than this binary, `--offline` while the server runs or holds the data-directory lock, running as the wrong user, `config init` target exists) |
-| 75 | `serve` on a platform without re-exec (Windows): "restart required" after a restore. Until README S65 re-execs, on every platform and for every restart the server asks for itself (§6.5): after a restore or `rotate-secrets`, and when a server that started without a public address has found one (§6.2). systemd and Docker restart a process that exits 75 |
+| 7 | Refused: precondition not met (an admin already exists: `setup_unavailable`, backup is newer than this binary, `--offline` while the server runs or holds the data-directory lock, running as the wrong user, `config init` target exists, `admin backup --out` names a file that exists) |
+| 75 | `serve` could not restart in place: "restart required", on a platform without re-exec (Windows) or when the exec failed, for every restart the server asks for itself (§6.5): after a restore or `rotate-secrets`, and when a server that started without a public address has found one (§6.2). systemd and Docker restart a process that exits 75. From README S65 on, every other platform re-execs and does not exit (before S65 every such restart was exit 75) |
 | 130 | Interrupted (SIGINT) |
 
 **Exception, `healthcheck`**: exits only **0** (healthy) or **1** (unhealthy, unreachable, or any error), because
@@ -945,8 +945,9 @@ an address that showed up the way it reports any change, with a warning that say
 server whose only problem is that it started too early, that message asks a person to do what the server can do.
 - **The rule.** An ip-mode server that started not ready **because no public address was found** asks for its own
   restart as soon as the periodic detection finds one: a full graceful shutdown (§6.4), after which `Run` returns
-  `ErrRestartRequested`, the result of a restart after a restore (§6.5). `cmd/isshoni` exits 75 until README S65
-  re-execs. Either way a new process starts, detects the address at startup, takes its site and orders its
+  `ErrRestartRequested`, the result of a restart after a restore (§6.5). `cmd/isshoni` exited 75 until README S65
+  built the re-exec, and now restarts in place (75 only where it can't, §6.5). Either way a new process starts,
+  detects the address at startup, takes its site and orders its
   certificate: systemd's `Restart=on-failure` and Docker's restart policy restart a process that exited 75, and
   the re-exec restarts in place. The server recovers without a person, at the detection's next look.
 - **Only that state.** In every other state a changed address is still only logged, "Public IPv4 address changed
@@ -1087,6 +1088,9 @@ step 6 are more exact than the table:
   take `shutdown_timeout` + 1 s; systemd's `TimeoutStopSec=20` and compose's `stop_grace_period: 20s` leave room.
   If the close hangs all the same (a disk that does not answer), the shutdown returns after that second and lets
   it finish on its own; the step is then named in the `ErrShutdownForced` error.
+- **A restore's files are swapped right after the store's close** (README S65, §12.4), whatever the shutdown is
+  for, when the admin socket accepted a restore and the store closed in time; otherwise the next start completes
+  the swap.
 - Last of all the data-directory lock is released, so that the process that follows (a re-exec, the next start)
   can take it.
 - A server without a site has no hub: step 3 is skipped. "Flush transfer counters" and "drain the push queue"
@@ -1109,15 +1113,46 @@ A second SIGTERM/SIGINT exits immediately with code 1. 06 sets systemd `TimeoutS
   lost meanwhile: manual TLS files are picked up by the 60 s poll (§8.4), the log level changes at runtime with
   `isshoni admin log-level` (§12.2), and every other change needs a restart anyway. S90 replaces the ignoring
   with the reload of the first bullet. The unit keeps `ExecReload` throughout (06 §4.5).
+- **As README S65 built the ignoring** (`cmd/isshoni/serve.go`): `serve` takes SIGHUP (`signal.Notify`) before
+  the server starts, so a reload during a slow start is harmless too, and answers each one with the INFO line
+  `reload is not supported yet; restart to apply changes`, nothing more. Across a re-exec (below) the signal is
+  ignored outright (`signal.Ignore` right before the exec; an ignored signal stays ignored across `exec`, a handled
+  one goes back to its default, which would end the process), until the new process's `serve` takes it again.
+  `TestServeIgnoresSIGHUP` runs `serve` as a real process.
 - No `sd_notify` in M1: 06's unit uses `Type=exec`, and install.sh polls `isshoni healthcheck --ready`. *Later*:
   `Type=notify` with `READY=1`/`STATUS=` if the unit ever needs it.
 - Restart after a restore or `rotate-secrets`: `Run` returns `ErrRestartRequested` after a full graceful shutdown;
-  `cmd/isshoni` then calls `syscall.Exec(os.Args[0], os.Args, os.Environ())`. The PID stays the same, so systemd and
-  Docker (PID 1) see no exit. On Windows (compile-only in M1) it exits 75 instead.
+  `cmd/isshoni` then re-execs: the same command line, arguments and environment (`server.Reexec`). The PID stays
+  the same, so systemd and Docker (PID 1) see no exit. On Windows (compile-only in M1) it exits 75 instead.
 - The same path serves the one restart the server decides on by itself (decided after group 6): an ip-mode server
-  that started without a public address and has found one (§6.2). Until the re-exec exists (README S65) every
-  such restart is exit 75, which systemd's `Restart=on-failure` and Docker's `restart: unless-stopped` answer with
-  a new process (06 §4.5, §6.2).
+  that started without a public address and has found one (§6.2). Before the re-exec existed (README S65) every
+  such restart was exit 75, which systemd's `Restart=on-failure` and Docker's `restart: unless-stopped` answer with
+  a new process (06 §4.5, §6.2); now it is the re-exec too.
+
+**The re-exec as README S65 built it** (`internal/server/exec_unix.go`, `exec_other.go`; `cmd/isshoni/serve.go`
+`restartInPlace`):
+- **The program is the one `os.Executable` names, not `os.Args[0]`.** Under 06's unit argv[0] is the bare word
+  `isshoni` (`ExecStart=isshoni serve …` has no path on purpose, 06 §4.5), which names a file only by way of a
+  search path, and `syscall.Exec` searches none. `os.Executable` gives the path of the running binary. After an
+  upgrade that replaced the binary on disk, that path holds the new version, and the restart runs it, as a
+  restart by systemd would. Where the path is gone altogether, Linux still has the running
+  program as `/proc/self/exe`, which is the fallback. `os.Args` and `os.Environ()` are passed on unchanged: nothing
+  in the exec comes from a request.
+- **A stop is never lost on the way.** Before the exec, `serve` gives SIGTERM and SIGINT back to their default
+  (`signal.Stop`, which hands a signal already under way to `serve`'s channel, and `signal.Reset`) and looks once
+  more whether one came. A stop that came during the shutdown for the restart, or before that last look, wins:
+  `serve` logs `stopped instead of restarting` and exits 0, and nothing starts. One that comes after it ends the
+  process with the signal's default action, during the exec or in the new process before that takes the signals
+  itself, as the operator asked; without this, the new process would start (a migration, a certificate order)
+  while systemd waited for the old one to stop and then killed it.
+- **Exit 75 only where there is no new process**: on a platform without re-exec (`exec_other.go` returns
+  `ErrNoReexec`) and when the exec itself failed (the process is still the old one, its server shut down). The
+  message says why the server stopped ("after a restore or rotate-secrets, or because it found the public address
+  it was waiting for") and to start it again; systemd and Docker do.
+- Tests: the re-exec in a process of its own (`TestReexec`), `serve` as a real process started under the bare
+  name `isshoni` for SIGHUP and for the restarts in place after `rotate-secrets` and after a restore
+  (`TestServeIgnoresSIGHUP`, `TestServeRestartsInPlace`), and `restartInPlace` for every way out, a stop during
+  the shutdown included (`TestRestartInPlace`).
 
 ### 6.6 Wiring (`internal/server/wire.go`)
 
@@ -2613,9 +2648,9 @@ func (r *ReleaseCheck) Alerts() []api.Alert           // release.update or relea
 | `POST /v1/users/{name}/role` | `{"role":"admin"}` | 204 | 404, 409 `last_admin` |
 | `POST /v1/users/{name}/disable` · `/enable` | – | 204 | 404, 409 `last_admin` |
 | `POST /v1/invites` | `{"uses":10,"ttl":"168h"}`; both optional (omitted → 0 → the setting's default); `ttl` in whole hours `1h`–`720h` | `{"url":"https://…/invite#…","expiresAt":"…"}` | 403 `registration_closed`, 422 `validation_failed` |
-| `GET /v1/backup?certs=1` | – | `application/gzip` stream, `Content-Disposition: attachment; filename="isshoni-backup-…tar.gz"` | 500 |
-| `POST /v1/restore` | `application/gzip` archive or `application/vnd.sqlite3` DB body (≤ 2 GiB) | 202 `{"restarting":true,"preRestoreBackup":"backups/pre-restore-20260929T101500Z.tar.gz"}` | 400 `backup_invalid`, 409 `backup_newer`, 409 `restore_in_progress`, 507 `insufficient_storage` |
-| `POST /v1/rotate-secrets` | `{"keys":["session","invite","resume"],"vapid":true}` (the CLI always sends all four) | 202 `{"rotated":[…],"restarting":true}` (the server restarts, §5.3) | 400 |
+| `GET /v1/backup?certs=1` | – (`certs=1`, the default, includes the certificates; `certs=0` leaves them out) | `application/gzip` stream, `Content-Disposition: attachment; filename="isshoni-backup-…tar.gz"` | 400 `bad_request` (another `certs` value), 507 `insufficient_storage` (no room for the database snapshot), 500; a failure after the stream began cuts the connection (S65, below) |
+| `POST /v1/restore` | `application/gzip` archive or `application/vnd.sqlite3` DB body (≤ 2 GiB); the server goes by the body's first bytes, not by the `Content-Type` | 202 `{"restarting":true,"preRestoreBackup":"backups/pre-restore-20260929T101500Z.tar.gz"}` (`preRestoreBackup` is `""` when the data directory had nothing to save) | 400 `backup_invalid`, 409 `backup_newer`, 409 `restore_in_progress` (also while a rotation runs), 413 `payload_too_large` (over 2 GiB), 503 `server_shutdown` (a restart is on its way), 507 `insufficient_storage` |
+| `POST /v1/rotate-secrets` | `{"keys":["session","invite","resume"],"vapid":true}` (the CLI always sends all four) | 202 `{"rotated":["session","invite","resume","vapid"],"restarting":true}` (the server restarts, §5.3) | 400 `bad_request` (a key name that `config.KeyNames` doesn't have, or nothing to rotate), 409 `restore_in_progress` (a restore or another rotation runs), 503 `server_shutdown` |
 | `POST /v1/doctor` | `{"only": ["dns"], "bandwidth": {"people": 8, "sharing": 3, "thumbnails": 8, "quality": "1080p60", "preset": "auto", "hours": 2}}`; both optional (`ops.AdminDoctorRequest`, §13.1) | `api.DoctorReport` (server-side checks, `mode: "cli-with-server"`). The answer comes when the run is done; a run that is under way is waited for, never answered `doctor_busy` (§13.1) | 400 `bad_request` (a check id doctor doesn't have, or a `bandwidth` value outside its range), 503 `server_shutdown` (the server stops while the request runs or waits) |
 | `POST /v1/log-level` | `{"level":"debug","for":"30m"}` | 204 | 400 |
 
@@ -2642,15 +2677,39 @@ leaves a case open:
   isshoni binary may be different versions: restart the server after an upgrade", which is what the operator has
   when a new CLI talks to an old server. A user name that is empty, `.` or `..` never reaches the server: the
   client answers `user_not_found` itself, because the router would redirect such a path.
-- **Endpoints of later slices** are routed from the start: `GET /v1/backup`, `POST /v1/restore` and
-  `POST /v1/rotate-secrets` (README S65) answer 500 `internal` with "… over the admin socket is not implemented
-  in this build yet" until then. `POST /v1/doctor` is built (README S60) and wired (the group 7 integration,
-  §6.6): only an `AdminServer` that was given no `Doctor`, which no server of `serve` is, answers "this server's
-  admin socket has no doctor".
+- **Endpoints of later slices** were routed from the start: `GET /v1/backup`, `POST /v1/restore` and
+  `POST /v1/rotate-secrets` answered 500 `internal` with "… over the admin socket is not implemented in this build
+  yet" until README S65 built them (below). `POST /v1/doctor` is built (README S60) and wired (the group 7
+  integration, §6.6): only an `AdminServer` that was given no `Doctor`, which no server of `serve` is, answers
+  "this server's admin socket has no doctor".
 - **`waitReadyS`** is 0 to 3600. A handler that panics is answered 500 `internal` with a `ref` that is also in the
   log, with the stack.
 - **Platforms without the peer-credential check** (anything but Linux and macOS; Windows is compile-only in M1)
   serve every connection and say so in the log at startup.
+
+**Backup, restore and rotation on the socket as README S65 built them** (`ops/adminapi.go`; the data directory's
+side is `ops/backup.go` and `restore.go`, §12.3, §12.4):
+- **`GET /v1/backup` stages before it answers.** The database snapshot, `secrets.json` and the certificates are
+  read and hashed first (`DataDir.PrepareBackup`), so what can go wrong with the data directory is an ordinary
+  error answer; the first 64 KiB of the archive are held back as well, so a small backup, and the start of any,
+  still fails into one. Once a part of the archive has left, the status has left with it, and a failure can only
+  cut the connection: the client then has an answer that broke off, never an archive that looks whole, and the
+  CLI says so. `HEAD` answers the headers alone. Each backup logs one INFO line with the peer's uid (§12.1).
+- **A restore and a rotation run one at a time, and none once a restart is on its way.** While one of them is at
+  work, the other and a second of the same kind get 409 `restore_in_progress`; once one has answered, every
+  further one gets 503 `server_shutdown`, as the socket answers from the moment the shutdown itself begins. A
+  restore whose staged files still wait for a restart (a plan in the state `swapping`) is `restore_in_progress`
+  too, also to the offline command.
+- **The 202 goes out before the restart is asked for**, and is flushed: the shutdown then waits for that request
+  to end before it closes the socket (§6.4 step 6), so the CLI has its answer and starts waiting for the server to
+  come back (§12.4).
+- **`rotate-secrets` takes key names from `config.KeyNames()`** (`session`, `invite`, `resume`): an unknown name
+  is 400 `bad_request` with the list, a name given twice counts once, and a request that names no key and has no
+  `vapid: true` is 400 too. `rotated` lists the keys, then `vapid` when the pair was rotated. The new
+  `secrets.json` is written before the answer (§5.3); the rotation is audited at the next start (03 §4.6).
+- **`POST /v1/restore`** takes at most 2 GiB (`ops.RestoreMaxBytes`): a `Content-Length` above it, or a body that
+  goes past it, is 413 `payload_too_large`. The server reads what the body is from its first bytes (`ops.KindOf`:
+  gzip, or the SQLite header; anything else is `backup_invalid`); the CLI's `Content-Type` is informational.
 
 User, invite and setup operations call 03's service layer (§19); this doc only defines the socket surface. Timestamps
 in these bodies (`expiresAt`, `createdAt`, `lastSeenAt`) have 03 §3.3's fixed form, `2026-09-30T10:00:00.000Z`, the
@@ -2690,6 +2749,27 @@ isshoni-backup-0.3.0-20260929T101500Z.tar.gz
   works on it. Only when `BackupFile` fails (for example on a corrupt DB) does it copy the raw files (`isshoni.db`,
   `-wal`, `-shm`) and set `"raw": true` in the manifest.
 
+**As README S65 built it** (`ops/backup.go`, `cmd/isshoni/backup.go`), where the text above leaves a choice:
+- **The manifest is the archive's first entry**, so a reader knows what follows before it reads it, and the
+  archive is staged first (`DataDir.PrepareBackup`) to have every size and hash for it: the database snapshot is
+  a temporary file in `restore/` (`snapshot-*.db`), and `secrets.json` and the certificate files, which are small,
+  are read into memory, so the bytes in the archive are the ones that were hashed even when a renewal rewrites a
+  certificate meanwhile. `Backup.WriteTo` then streams the `.tar.gz`.
+- **`createdAt` has the wire form of 03 §3.3** (`api.WireTime`, cut to the second: `"2026-09-29T10:15:00.000Z"`),
+  `sha256` has every file of the archive by its name, the files below `certmagic/` included, and `contents` lists
+  what the archive holds in its order: an archive of a data directory that lacked a part lacks it too. `format` is
+  1 (`ops.BackupFormat`); a restore refuses a newer format as `backup_newer`. The file name is
+  `isshoni-backup-<version>-<UTC time as 20060102T150405Z>.tar.gz`, with any character of the version outside
+  `[A-Za-z0-9.+_-]` replaced by `_`.
+- **No room for the snapshot** is the refusal 507 `insufficient_storage`, seen before the snapshot begins, with or
+  without a server.
+- **The CLI never overwrites a file**: `--out` (or the default name) is created with `O_EXCL` and mode `0600`; a
+  file that exists is exit 7 (a pipe or a device the operator named is written to as it is). A backup that could
+  not be written to its end removes its file again. Afterwards the CLI prints the file and its size and the
+  "Keep it private" line; with `--out -` only the line, on stderr. An offline backup of a data directory with no
+  database, no `secrets.json` and no certificates is an error ("nothing to back up"), and a raw one says that the
+  database was copied as it was.
+
 ### 12.4 Restore
 
 Two inputs are accepted:
@@ -2726,6 +2806,48 @@ otherwise `--yes` is required (§3.1). With `-` stdin carries the archive, so `-
 `docker compose exec -T` also gives no TTY. Without `--yes` it refuses and prints the exact command with `--yes` for
 its environment (06 §6.4 documents the Docker form above, and `task docker:smoke` runs it).
 
+**As README S65 built it** (`ops/restore.go`; `internal/server/server.go`; `cmd/isshoni/backup.go`), where it
+differs from the steps above or settles what they leave open:
+- **Two halves with the shutdown between them.** `DataDir.PrepareRestore` is steps 1 to 3, while the server still
+  runs; then the handler answers 202 and asks for the restart (§12.2). **The swap (step 5) happens at the end of
+  the shutdown**, once the store is closed (its WAL checkpointed into the database file) and the TLS manager writes
+  no more, still under the data-directory lock, and whatever the shutdown is for: a server that is only stopped
+  then starts on the restored state next time (`ops.CompleteRestore`). Then `Run` returns `ErrRestartRequested`
+  and `serve` re-execs (§6.5). A swap that fails there, or that is skipped because the store did not close in
+  time, is completed by the next start.
+- **Startup** completes a plan that is still `swapping` right after it takes the data-directory lock, before
+  anything reads the files (`ops.RecoverRestore`; also the first thing an offline command does), and removes what
+  a restore or a backup left in `restore/` without a plan (the body, the unpacked files, a snapshot) with a log
+  line. **Step 7** (`ops.FinishRestore`) runs once the server serves and before the admin socket takes its first
+  request, so a restore that a script sends the moment the socket answers finds the last one finished.
+- **The plan** is `restore/plan.json` `{"ts", "state": "swapping"|"done", "install": [...], "evict": [...]}`:
+  `install` are the staged files in the order they are moved in (the database before a raw backup's WAL), `evict`
+  the old database's `-wal` and `-shm` when nothing replaces them, which are only moved away (the staged `-shm` is
+  never installed: SQLite builds a new one). The swap moves out first, then in, so a WAL never sits next to a
+  database it doesn't belong to; every step looks at what is there, so it can be interrupted anywhere and run
+  again. There is one plan and one `restore/old-<ts>/` at a time: a restore that was done but never followed by a
+  successful start (two offline restores in a row) has its old files removed by the next one, and its
+  pre-restore backup stays.
+- **A swap only the operator can put right** (a plan that is not one a restore writes, or a file that is both in
+  the data directory and in `restore/old-<ts>/`) is `ops.ErrRestoreNeedsOperator`: the data directory may be half
+  swapped, nothing opens it, and the start exits 78 with the text that says what to check (§3.2, §6.3).
+- **Validation, beyond step 1**: the manifest must be the first entry, of a format this build reads, at most
+  8 MiB; the entries are regular files and directories only (no links, devices or sparse files), named by the
+  manifest's `contents`, plain relative UTF-8 names in their shortest form, at most 255 bytes per element and
+  1024 in all, and they unpack to at most 16 GiB; at most 1 MiB may follow the tar's end in the gzip stream. An
+  archive's `secrets.json` must be one the server can load (`config.InspectSecrets`). A database that is no
+  isshoni database at all is `backup_invalid` like a failed integrity check. The body's size is checked against
+  the free space before it is received (507 `insufficient_storage`; a full disk while unpacking is that too, not
+  `backup_invalid`).
+- **The pre-restore backup** (step 2) is written with the backup code of §12.3; when the data directory has
+  nothing to back up there is none, and the answer's `preRestoreBackup` is `""`.
+- **The CLI** reads the first bytes itself to say what the file is (`ops.KindOf`): for an archive it shows the
+  manifest's line ("a backup of isshoni 0.3.0 from 2026-09-29 10:15 UTC (database schema 7), with database,
+  secrets and certificates") before it asks. After the 202 it waits up to 60 s for a server whose `startedAt` in
+  `/v1/status` is not the one it talked to, and whose `/v1/health` is ok, then prints the version it found and
+  where the pre-restore backup is. A server that does not come back in time is reported with the restore in
+  place and the server as the thing to look at.
+
 ### 12.5 Setup URL, users, invites
 
 - `setup-url` works only while no admin exists (03's `setup_unavailable` otherwise; the CLI exits 7 with the fix "use
@@ -2760,6 +2882,26 @@ server can't start at all (for example invalid config):
   followed by the exact command for its environment (systemd or Docker, §6.1 step 4), and offline doctor's `schema`
   fix uses the same formatter. An offline restore doesn't re-exec anything; the operator starts the service
   afterwards.
+
+**As README S65 built them** (`cmd/isshoni/backup.go` `offlineData`, `asServiceUser`), in this order:
+1. **The admin socket must not answer** ("the server is running; drop --offline", exit 7). Only something that
+   answered counts: a dial that reached nothing for another reason (a socket path too long for a socket address,
+   which is a config error, exactly when the offline commands are needed) is noted on stderr and left to the lock
+   (`ops.ErrAdminDial` marks such dials).
+2. **Not as root outside a container** (exit 7).
+3. **The data-directory lock**, without waiting (exit 7 when another process holds it). A user who can't reach the
+   data directory or open its lock file is neither root nor the service user and gets the same refusal as root:
+   exit 7 with the command as typed in the form that runs it as the service user, `sudo -u isshoni isshoni admin
+   …` (or `docker compose run --rm isshoni admin …` in Docker), never the server's own `data_dir_not_writable`
+   fix that would chown the directory to the caller.
+4. **A restore that was interrupted is completed** (`ops.RecoverRestore`), as the server would at its start, so the
+   command sees a data directory in one piece.
+
+The config may have errors (that is one reason a server does not start): the commands need only `data_dir` and the
+socket's path from it. An offline restore runs both halves of §12.4 at once (`PrepareRestore`, then
+`CompleteRestore`), prints where the restored files are and the command that starts the service
+(`sudo systemctl start isshoni`, or `docker compose up -d`), and leaves `restore/old-<ts>/` for the next successful
+start to remove. Their log lines go to stderr as plain lines (`isshoni: <message> (key=value …)`).
 
 ---
 
@@ -2978,9 +3120,9 @@ one differ, this one is what the code does.
 | `bandwidth` | – | `bandwidth.estimate` | `bandwidth.near_nic` | – |
 
 The table has no column for `skip`. Besides the four `skip.*` codes, a check's own code has that status in two
-cases: `udp_buffers.unknown` (above) and, from README F04 on, `public_ip.loopback` (`public_ip` on a development
-server, below). The second is not in `messages_en.go` as merged after group 7; it joins the list with the
-group 8 write-back, and 05's catalog renders it as `doctor.public_ip.loopback` like every other code.
+cases: `udp_buffers.unknown` (above) and `public_ip.loopback` (README F04: `public_ip` on a development server,
+below), which carries no params and no fix code. 05's catalog renders it as `doctor.public_ip.loopback` like every
+other code (the Doctor page is README S91's, 05 §15.3).
 
 Fix codes: `config.fix_check`; `data_dir.fix_sudo`, `fix_owner`, `fix_not_dir`, `fix_mount`, `fix_mode`,
 `fix_space`; `secrets.fix_sudo`, `fix_owner`, `fix_restore`, `fix_mode`; `schema.fix_sudo`, `fix_restore` (03's
@@ -3025,8 +3167,8 @@ is where the operator reads why, so the two checks say it in these words:
   `public_ip`'s fix. It carries no `fixCode` of §8.7 (no ACME request was made, so there is no ACME error) and
   does not wait 10 minutes to turn from `warn` to `fail`: nothing is under way.
 - These texts stay as they are with the self-restart decided after group 6 (§6.2): an ip-mode server whose
-  network came up late now restarts itself at its next look, within 10 minutes (within 30 s once README S65 has
-  built the shorter interval, §6.2), and "restarting is enough" is still true and faster. When no look will ever
+  network came up late now restarts itself at its next look, within 30 s (README S65 built the shorter interval,
+  §6.2; 10 minutes before it), and "restarting is enough" is still true and faster. When no look will ever
   find an address (a server behind a NAT that STUN can't see through, STUN switched off), setting `public_ip`
   remains the only fix.
 - **On a development server the check is `skip`, not `fail`** (decided after group 7; README F04 implements it).
@@ -3052,6 +3194,25 @@ is where the operator reads why, so the two checks say it in these words:
     fix from the admin socket's doctor. It passes unchanged with F04.
   - **One of the two keys alone** doesn't change the check either: a production server with
     `include_loopback` left on, or one with STUN switched off, still needs to hear that it has no address.
+
+  **As README F04 built it** (`ops/doctor/checks_net.go` `loopbackSetup`, `checkPublicIP`; `messages_en.go`):
+  - The rule is `network.include_loopback && len(network.stun_servers) == 0 && !siteIsAddress()`, where
+    `siteIsAddress` is ip mode, or manual mode without a domain (`public_ip.none`'s param of the same name says
+    the same). On such a server the check is `skip` with the code `public_ip.loopback`, no params and no fix code.
+  - **It looks for no address at all**: no interface, no STUN server, so the result is the same on every
+    developer's machine, whatever addresses it has. A machine with a public address on an interface, and a config
+    with `public_ip` set, get the same `skip`: on a development server that address says nothing about the setup.
+  - The text: "not checked: network.include_loopback is on and network.stun_servers is empty (a development setup,
+    which needs no public address)". The summary counts it as a skip, never as a problem, so the server's own run
+    20 s after its start logs no "doctor found problems" for it, and the `doctor.fail` alert of README S85 has
+    nothing to raise.
+  - `doctor.go`'s list of statuses says it: `skip` is a check that could not run, "or it has nothing to judge:
+    public_ip in a development setup on the loopback interface".
+  - Tests: `TestPublicIPLoopbackSetup` (the loopback setup skipped on a laptop with a private address and on a
+    machine with public ones, offline and with a running server; checked in ip mode and in manual mode without a
+    domain, and with each key alone; a skipped check asks nobody and has no params and no fix) and
+    `TestPublicIPDevConfigs` (`deploy/dev/isshoni.dev.toml` and `isshoni.e2e.toml` give a report without a
+    `public_ip` failure). `TestServerWithoutASite` in `internal/server` passes unchanged.
 
 ```
 [fail] public_ip     no public IP address found (no public address on an interface, no STUN answer)

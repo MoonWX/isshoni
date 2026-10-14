@@ -195,6 +195,40 @@ stopped:
 After exit 5 the unit is already enabled, so a re-run takes the repair branch. That branch also ends with the ready
 wait and `setup-url` (4.10), so once the admin has fixed the cause, the re-run prints the setup link.
 
+**As README S67 built the flow** (`deploy/install.sh`: `main`, `do_install`, `first_start`, `restart_or_repair`),
+where it settles what the diagram leaves open:
+- **No question without a terminal, said first.** On a machine without a config, with neither `--domain`, `--ip`,
+  `--tls-mode` nor `--yes`, and no terminal to ask on, the script exits 2 ("Non-interactive install: pass
+  --domain NAME or --ip") before it downloads or installs anything.
+- **What is fetched.** The archive is downloaded and verified for another version, for `--reinstall`, **and when a
+  file that comes from it is missing** (`payload_complete`: the unit; the sysctl file while a buffer limit is
+  below 8 MiB; the ufw profile where ufw and its profile directory are there; the firewalld service file where
+  `firewall-cmd` is). So a same-version run on a machine where a file went missing repairs it. The program is
+  replaced only for another version or `--reinstall`; the unit, the sysctl file and the firewall profiles are
+  installed from the archive whenever it was fetched, the unit only when it differs from the installed one. The
+  user and the directories are ensured on every run.
+- **`--no-start` on a started server** installs and leaves the running server as it is, and prints the command
+  that restarts it (`sudo systemctl daemon-reload && sudo systemctl restart isshoni`).
+- **Restart or not** (`STARTED`): the server is restarted when this run replaced the program or the unit, or when
+  the running server reports another version than the installed program (an earlier run replaced the program and
+  did not get to the restart); the port check runs before that restart. Otherwise it is only started when it is not
+  running (with the port check first). The headline is "Upgraded IV → TV", "Downgraded IV → TV" with
+  `--allow-downgrade`, or "isshoni TV is running." for a repair and a first start (4.10).
+- **How a run ends when it is stopped**: Ctrl-C is "Cancelled." with exit 8; a kill (TERM) or a hangup (HUP, a
+  dropped SSH session) is exit 1 with "Stopped by a signal while <step>"; a command that fails where no code of the
+  script handles it is exit 1 with "The installer stopped at an unexpected error while <step>", never that
+  command's own exit code, which could be read as one of the installer's. Every way out removes the download
+  directory and a config that this run wrote and that did not get past the pre-check (4.8); the message always
+  ends with "run this installer again: it goes on where it stopped".
+- **`--uninstall` and `--purge`** are parsed and answer exit 1 "not implemented in this version of the installer
+  yet", with the command that stops isshoni, until README S78 builds them (4.11).
+- **The copy in the repository installs nothing yet**: its key block is empty until the release key exists (the
+  owner creates it before README S73, §9.4) and is in `deploy/keys/allowed_signers` and in the block, which must
+  equal each other (§4.3). Without a key the script says so before it downloads (exit 3: "a development copy").
+  The tests put a key of their own between the markers (§11).
+- The script sets `LC_ALL=C` (it reads what `ufw` and `ss` print) and adds the `sbin` directories to `PATH` (root's
+  tools, which an ordinary user's `PATH` may lack).
+
 ### 4.3 Download and verification (fail closed)
 
 **Version resolution.**
@@ -338,12 +372,17 @@ Why these settings:
   (04 §6.5). Everything else needs `systemctl restart isshoni`.
   - **Until that reload exists, the server ignores SIGHUP, and `systemctl reload isshoni` neither reloads nor
     stops it** (decided after group 7; README S65 implements the ignoring, README S90 the reload; 04 §6.5). As
-    merged after group 7 `serve` does not handle the signal at all, so it ends the process, and systemd takes
-    an end by SIGHUP for a clean exit that `Restart=on-failure` does not answer: a `reload` would leave the
+    merged after group 7 `serve` did not handle the signal at all, so it ended the process, and systemd takes
+    an end by SIGHUP for a clean exit that `Restart=on-failure` does not answer: a `reload` would have left the
     server stopped. The unit keeps the line all the same. Taking it out would make `systemctl reload` an error
     for now and change a file that the tarball and the packages ship (D3), only to put it back with S90. Nothing
     is lost meanwhile: manual TLS files are picked up within 60 s without a signal (04 §8.4), and
     `isshoni admin log-level` changes the level at runtime.
+  - **From README S65 on, `systemctl reload isshoni` is harmless until S90**: `serve` takes the signal from before
+    the server starts, logs `reload is not supported yet; restart to apply changes` at INFO for each one, and goes
+    on serving; across a restart in place (a restore, `rotate-secrets`) the signal is ignored until the new
+    process takes it again (04 §6.5). The journal line is what an operator who tried a reload sees; `systemctl
+    restart isshoni` applies a changed config.
 - **`ProtectClock=yes`** (and `@system-service`) also blocks the read-only `adjtimex` call, so the server-side doctor
   can't read the kernel's clock-sync flag. 04's `clock` check then treats the sync state as unknown and relies on the
   Date-header skew check (04 §13.2). Don't relax `ProtectClock` for this.
@@ -366,6 +405,14 @@ net.core.wmem_max = 8388608
 - install.sh writes this file only when the current `/proc/sys/net/core/rmem_max` or `wmem_max` is below 8 MiB. It
   never lowers a value the admin set higher.
 - It then runs `sysctl -p /etc/sysctl.d/60-isshoni.conf`. In a container that fails, and the script only warns.
+- **As README S67 built it** (`apply_sysctl`): the installed file holds **only the keys whose running value is
+  below 8 MiB**; a key that is high enough is left out of it, so the file can't lower that value at the next boot
+  either, and when both are high enough no file is written. A value that can't be read counts as low. `sysctl -p`
+  exits 0 even when the kernel refuses a value (in a container, say), so the script reads both values back
+  afterwards and warns when one is still low: "Could not apply /etc/sysctl.d/60-isshoni.conf (larger UDP buffers
+  for video). In a container that is expected. "sudo isshoni doctor" shows the sizes in use." The file comes from
+  the release archive, so it is (re)written whenever a run fetched the archive, and a same-version run fetches it
+  when the file is missing while a value is low (4.2).
 - Packages ship the file in `/usr/lib/sysctl.d/`, where any `/etc/sysctl.d/` file overrides it.
 - The server asks for 8 MiB per media socket, and doctor reports the effective size (`02`/`04`).
 
@@ -487,9 +534,18 @@ answer Yes; `--yes` accepts):
   `firewall-cmd` waits 10 seconds before it answers, on every Fedora machine where firewalld is installed and
   not running. So the detection is `systemctl is-active --quiet firewalld.service` first and
   `firewall-cmd --state` only then; the packaging scripts do the same.
-- **Who builds the two in install.sh.** Both were written back here after group 7, while README S67 was already
-  building this offer from the text before them. README S78's acceptance has both, with the tests of §11.1 and
-  scenario V3 (§11.2), so install.sh has them at the latest when that slice merges.
+- **Who builds the two in install.sh: README S67 did.** Both were written back here after group 7, while S67 was
+  already building this offer, and S67 merged with both (`offer_firewall`): `systemctl is-active --quiet
+  firewalld` comes before `firewall-cmd --state`, and the offer runs `firewall-cmd --reload`, `--permanent
+  --add-service=isshoni` and `--reload` again, in that order; a "no" prints the same three commands for later.
+  What README S78 still adds is their tests: the unit tests of §11.1 with stubbed `systemctl` and `firewall-cmd`,
+  and scenario V3 (§11.2) on a real firewalld.
+- **The rest of the offer as S67 built it**: a "no" leaves the firewall as it is and prints how to open the ports
+  later; Ctrl-C or the end of input at the question is exit 8 ("Nothing was started"); a command of the firewall
+  that fails is a warning with the command to run by hand, not an error. The iptables row also counts a `DROP`
+  policy of the INPUT chain as blocking (the rules are then appended), opens ip6tables only where it blocks too,
+  and leaves a chain alone that has the `isshoni` rules already. Without `ss` the port check is skipped with a
+  warning (package `iproute2`).
 - **Always printed at the end:** "If your provider has a cloud firewall (AWS, Google Cloud, Azure, Oracle, …), open
   the same ports there: https://moonwx.github.io/isshoni/install/vps". The provider-specific steps were already
   printed before the start by the pre-check's `firewall_hint` (4.8). The browser connection test in the setup
@@ -555,6 +611,29 @@ isshoni 0.1.0 is running.
 - prerelease identifiers compare numerically when both are digits, lexically otherwise.
 
 `sort -V` gets `0.2.0` vs `0.2.0-rc.1` wrong, so it is not used.
+
+**As README S67 built it** (`start_or_restart`, `wait_ready`, `not_ready`, `print_setup`), where it differs from
+the text above or settles what it leaves open:
+- **Restart.** An upgrade, a downgrade and `--reinstall` restart the server only when the program or the unit
+  changed, or when the running server is another version than the installed program (4.2); such a restart, and
+  the start of a server that is not running on a repair, come after `systemctl reset-failed isshoni` and after the
+  port check (4.9). A first start whose `enable --now` fails ends with exit 1 only when the unit did not even get
+  enabled; a start that fails otherwise is noticed by the wait.
+- **Wait.** The wait also ends as soon as systemd has given up on the unit (`systemctl is-failed`), not only at
+  its timeout. Its line every 10 s is "Waiting for the HTTPS certificate… (20 s)" in `auto` and `ip` mode and
+  "Waiting for isshoni to be ready… (20 s)" otherwise, and the Let's Encrypt hint after 30 s is printed in `auto`
+  and `ip` mode only.
+- **On timeout** the output also names the provider-firewall page next to troubleshooting. After an upgrade, the
+  way back names the newest `backups/pre-*.db` that the server wrote **during this run** (found with privilege,
+  `find … -newer` a file the run made at its start): a backup of an earlier upgrade is older than this run, and
+  restoring it would lose what was written since. Without one only the `--version <old> --allow-downgrade` step
+  is printed.
+- **The setup link after an upgrade too.** Every path that ends well prints its headline ("isshoni TV is
+  running.", "Upgraded IV → TV" or "Downgraded IV → TV", 4.2) and then runs `setup-url`: the link while no admin
+  exists, else "Setup is already done. Open <origin>/", with the origin from the running server's
+  `isshoni admin status --json`, or from the config when no server answers. Any other exit of `setup-url` is the
+  timeout's diagnostics and exit 5 (the server answered the readiness check a moment before and is gone). The
+  link goes from the server to stdout and nowhere else: never into a file or a log.
 
 ### 4.11 Uninstall and purge
 
@@ -766,15 +845,17 @@ The package maintainer field is the owner's GitHub noreply address (filled in on
 ### 6.1 Image: `deploy/docker/Dockerfile`
 
 ```dockerfile
-# syntax=docker/dockerfile:1
-# Built by goreleaser dockers_v2 (release) and deploy/test/docker-build.sh (CI). No RUN steps: nothing is emulated
-# for arm64, and the image holds only the static binary.
+# syntax=docker/dockerfile:1@sha256:<pinned digest> (pinned by README S73, below; as S68 merged it: dockerfile:1)
+# Built by goreleaser dockers_v2 (release) and deploy/docker/test/docker-build.sh (CI, task docker:smoke). No RUN
+# steps: nothing is emulated for arm64, and the image holds only the static binary.
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:<pinned digest, updated by Dependabot>
 ARG TARGETPLATFORM
 # rootfs/ contains var/lib/isshoni/.keep and run/isshoni/.keep: both directories owned by nonroot, so a new named
-# volume is writable (Docker copies the ownership into an empty volume) and the admin socket has a home.
-COPY --chown=65532:65532 deploy/docker/rootfs/ /
-COPY $TARGETPLATFORM/isshoni /usr/local/bin/isshoni
+# volume is writable (Docker copies the ownership and the mode into an empty volume) and the admin socket has a
+# home. One COPY per directory: one COPY of rootfs/ onto / would hand /var, /var/lib and /run to nonroot as well.
+COPY --chown=65532:65532 --chmod=0700 deploy/docker/rootfs/var/lib/isshoni/ /var/lib/isshoni/
+COPY --chown=65532:65532 --chmod=0750 deploy/docker/rootfs/run/isshoni/ /run/isshoni/
+COPY --chmod=0755 $TARGETPLATFORM/isshoni /usr/local/bin/isshoni
 COPY LICENSE NOTICE THIRD_PARTY_NOTICES /usr/share/doc/isshoni/
 # data_dir keeps 04's default /var/lib/isshoni; the admin socket keeps /run/isshoni/admin.sock.
 ENV ISSHONI_IN_CONTAINER=1
@@ -797,6 +878,26 @@ CMD ["serve"]
   optional and read-only when mounted.
 - **Start period.** 120 s covers ACME on first start.
 - Multi-arch: `linux/amd64` and `linux/arm64`, with `org.opencontainers.image.*` labels (section 9.2).
+
+**As README S68 built it** (`deploy/docker/Dockerfile`, `rootfs/`, `test/docker-build.sh`; `deploy/docker/README.md`
+says the same for the repository's readers):
+- **Two COPYs of the directories, each with `--chown` and `--chmod`**: `/var/lib/isshoni` `0700` and `/run/isshoni`
+  `0750`, both `65532:65532`, the modes of a systemd install (`StateDirectory`, `RuntimeDirectory`). Docker copies
+  the owner and the mode into a new named volume, so the data volume is writable without a `chown`, and the server
+  finds its data directory private, as it wants it. One `COPY --chown` of `rootfs/` onto `/`, the first version of
+  the block above, would also have given `/var`, `/var/lib` and `/run` to 65532.
+- **The binary's mode is set by `COPY --chmod=0755`**, not taken from the build context: under `cap_drop: [ALL]`
+  the image's user could not start a binary that a strict umask on the builder had left at `0700`. The notices'
+  `COPY` has no `--chmod`: it would also apply to the directory the `COPY` creates, and `0644` would let nobody
+  into it.
+- **The `FROM` digest** is the multi-arch index of the `:nonroot` tag, and Dependabot's `docker` ecosystem for
+  `/deploy/docker` updates it (§8.1).
+- **The `# syntax=` line is pinned by digest too** (decided after group 8; README §6; README S73 implements it).
+  BuildKit fetches the Dockerfile frontend that this line names from Docker Hub before it reads the rest of the
+  file, so `docker/dockerfile:1` is a floating tag that every build, the release's included, pulls as it is at
+  that moment: the one input of the image that no digest fixed. Like the `FROM` line it becomes
+  `docker/dockerfile:1@sha256:<digest>`, so no build pulls a frontend nobody chose (§9.2); S73 also says how that
+  digest is kept current. As S68 merged it the line is still `# syntax=docker/dockerfile:1`.
 
 ### 6.2 `deploy/compose.yaml` (bridge networking, the default)
 
@@ -909,6 +1010,11 @@ services:
   per-IP limits (login, registration, invite check, WebSocket handshakes; 03, 01), and one stranger can lock them all
   out. When the domain has an AAAA record, use `compose.host.yaml` (6.3). `task docker:smoke` checks this behaviour
   (11.3).
+  - **Docker Desktop** (macOS, Windows; README S68's finding): the engine runs in a virtual machine, and a
+    published port is forwarded from that machine's own address, `192.168.65.1` by default on Docker Desktop for
+    Mac. That is what the server sees for a client on `[::1]` there, where a Linux engine shows the bridge
+    gateway: the finding is the same, the server does not see the client's address. `task docker:smoke` accepts
+    either, the forwarding address only where the engine is not local, and fails on `::1` itself.
 - **Operations:**
   - setup link: `docker compose exec isshoni isshoni setup-url`;
   - doctor: `docker compose exec isshoni isshoni doctor`;
@@ -1178,7 +1284,7 @@ task dev:setup-url        # in a second terminal: open the printed link, create 
 | `.github/workflows/nightly.yml` | `schedule: '17 3 * * *'`, `workflow_dispatch` | slow and flaky-prone checks (8.5) |
 | `.github/workflows/release.yml` | `push` tags `v*`, `workflow_dispatch` (dry run) | section 9 |
 | `.github/workflows/site.yml` | `push` to `main` (paths `docs/**`), `workflow_dispatch`, `workflow_call` | section 10 |
-| `.github/dependabot.yml` | weekly | `gomod` (`/`, `/tools`), `npm` (`/web`, `/docs`), `github-actions`, and `docker` (`/deploy/docker`) once S68 adds the Dockerfile (Dependabot's update job fails on a directory without one); minor and patch updates grouped per ecosystem; `target-branch: m1/server-web` for every ecosystem while M1 lands there (README §4), switched to `main` after M1. The tools pinned in `.tool-versions` (Task, golangci-lint, shfmt) are ignored in `/tools` and bumped by hand. In `npm`, major updates of `eslint`, `@eslint/js` and `typescript` are ignored until eslint-plugin-jsx-a11y and typescript-eslint allow them (05 §2); the file names the blocking peer ranges |
+| `.github/dependabot.yml` | weekly | `gomod` (`/`, `/tools`), `npm` (`/web`, `/docs`), `github-actions`, and `docker` (`/deploy/docker`), added back by README S68 with the Dockerfile (Dependabot's update job fails on a directory without one); minor and patch updates grouped per ecosystem; `target-branch: m1/server-web` for every ecosystem while M1 lands there (README §4), switched to `main` after M1. The tools pinned in `.tool-versions` (Task, golangci-lint, shfmt) are ignored in `/tools` and bumped by hand. In `npm`, major updates of `eslint`, `@eslint/js` and `typescript` are ignored until eslint-plugin-jsx-a11y and typescript-eslint allow them (05 §2); the file names the blocking peer ranges |
 
 **Rules for every workflow:**
 - Top-level `permissions: contents: read`; jobs raise permissions individually.
@@ -1536,6 +1642,12 @@ changelog:
 - **Images are signed in the workflow** (`cosign sign --yes ghcr.io/moonwx/isshoni@<digest>`), not with goreleaser's
   `docker_signs`. It is simpler and doesn't depend on how dockers_v2 names its artifacts.
 - The release workflow checks that no `TODO` is left in the release notes before publishing (9.3 `publish`).
+- **The Dockerfile's frontend is pinned by digest** (decided after group 8; README §6; README S73 implements it,
+  §6.1). `dockers_v2` builds with BuildKit, which pulls the frontend that the Dockerfile's `# syntax=` line names
+  before anything else. With `docker/dockerfile:1` that is whatever the tag points at on the day of the release, and
+  a release image would then depend on a Docker Hub tag that no digest fixes, unlike its base image. The line
+  carries the frontend's digest (`docker/dockerfile:1@sha256:…`), so the release build, CI's
+  `docker-build.sh` and `task docker:smoke` all use the frontend that was chosen.
 
 ### 9.3 `release.yml`
 
@@ -1861,6 +1973,44 @@ page is written):
 - Once a real release exists, "N−1" also means the latest real release, installed with its own script and the
   production key.
 
+**As README S67 built the setup** (`deploy/test/distro-test.sh`, `deploy/test/distro/Containerfile`,
+`tools/relserve`; `task deploy:test`, with `DISTRO=<name>` for one), with scenarios C1 and C6 (README S78 adds the
+rest):
+- **The test release is built from the working tree, not by `task release:snapshot`**, which needs goreleaser
+  (README S73): two versions, `0.0.1-ci.1` and `0.0.1-ci.2`, built for the container's CPU with the version
+  stamped through `-ldflags` and packed like a release archive (§3), each with a `checksums.txt` signed by a key
+  pair made for the run, and a copy of `install.sh` per version, stamped with it as a release would and with that
+  key between the markers. The binary carries the web app only when `web/dist` was built before; the scenarios
+  don't open it.
+- **`tools/relserve`** serves the release root over HTTPS the way GitHub Releases does (`/download/v<ver>/<file>`,
+  and `/latest` → 302 to the newest tag), with a certificate authority made at its start whose key is never
+  written; it writes the CA certificate for the container and its bound address to files. The container reaches
+  it as `host.containers.internal` (podman provides the name; docker gets it with `--add-host`) and trusts the CA
+  through `update-ca-certificates` or `update-ca-trust`.
+- **The containers**: one image per distro (`isshoni-distro-test:<distro>`, from `deploy/test/distro/Containerfile`)
+  with systemd as PID 1, D-Bus, curl, `ss`, procps and python3 (the tests' JSON reads), and **without** the
+  OpenSSH client, which the installer has to install itself. The six distros of §4.13 run one after the other;
+  the images stay as the next run's build cache, everything else (key, CA, release, containers) is deleted at the
+  end. `CONTAINER_ENGINE` picks podman or docker (podman when installed), `KEEP=1` leaves the container for a look
+  after a failure.
+- **The installer runs as an admin runs it**: fetched with curl and piped into `sh` without a terminal, with
+  `ISSHONI_DOWNLOAD_BASE` pointing at relserve, `ISSHONI_PUBLIC_URL=http://127.0.0.1:8080`, and
+  `ISSHONI_PUBLIC_IP=203.0.113.7` (RFC 5737), which keeps the real address of the machine out of the output that
+  ends up in CI logs.
+- **C1 as built** asserts, besides the row below: that the pre-check ran and checked DNS (`[ ok ] dns`: off mode
+  decides it without the network) and the public address, **not that the pre-check passed**: doctor's NAT check
+  still asks the STUN servers when `public_ip` is set, so its `public_ip` result depends on the network of the
+  machine that runs the containers (behind Docker Desktop it fails, as a symmetric NAT). Also: the config has the
+  given `public_ip`; the service is enabled; the program is `root:root 755`, the unit
+  (`/usr/local/lib/systemd/system/`) `root:root 644`, `/etc/isshoni` `root:root 755`; the installer printed
+  "isshoni 0.0.1-ci.1 is running.", a `/setup#` link and its firewall line; and no `ISSHONI_*` variable reached the
+  service's environment.
+- **C6 as built** is an upgrade to ci.2 with `--yes` from three mirrors that each have one thing wrong
+  (`checksums.txt` with one character of the archive's sum changed, no `.sig`, the archive of ci.1 in ci.2's
+  place). Each run exits 3 with its reason and "Nothing was installed or changed."; the program, the config and
+  the running version are unchanged, no `.isshoni.new` is left, and the service was not restarted
+  (`ActiveEnterTimestamp`).
+
 **Container scenarios** (each asserts the exit code and the listed state):
 
 | # | Scenario | Asserts |
@@ -1890,13 +2040,13 @@ page is written):
 | V5 | ACME with Pebble plus `pebble-challtestsrv` on the runner. The VM uses `ISSHONI_TLS_ACME_CA` and `ISSHONI_TLS_ACME_CA_ROOT` (04's keys `tls.acme_ca`, `tls.acme_ca_root`), and challtestsrv resolves `isshoni.test` to the VM | `--domain isshoni.test --yes` is ready within 60 s; the certificate issuer is Pebble. IP mode (`--ip`) the same, if the pinned Pebble supports IP identifiers; otherwise IP mode stays on the manual release checklist |
 | V6 | `systemd-analyze security isshoni` | score ≤ the recorded value + 0.2 |
 
-### 11.3 Docker smoke: `deploy/test/docker-smoke.sh`
+### 11.3 Docker smoke: `deploy/docker/test/docker-smoke.sh`
 
 1. Build the image with `docker buildx build --platform linux/<arch> --load -f deploy/docker/Dockerfile` from a
    context laid out like goreleaser's (`linux/<arch>/isshoni` plus the extra files).
 2. Make a test certificate with openssl (a throwaway CA). Manual TLS mode proves 443 binds without depending on ACME.
-3. **Bridge:** `docker compose -f deploy/compose.yaml -f deploy/test/compose.smoke.yaml up -d`. The override sets the
-   local image, `ISSHONI_TLS_MODE=manual`, the certificate mount and `ISSHONI_PUBLIC_IP=127.0.0.1`. Asserts:
+3. **Bridge:** `docker compose -f deploy/compose.yaml -f deploy/docker/test/compose.smoke.yaml up -d`. The override
+   sets the local image, `ISSHONI_TLS_MODE=manual`, the certificate mount and `ISSHONI_PUBLIC_IP=127.0.0.1`. Asserts:
    - health is `healthy` within 90 s;
    - `curl --cacert ca.pem --resolve smoke.test:443:127.0.0.1 https://smoke.test/api/v1/info` → 200 with the
      version;
@@ -1922,6 +2072,30 @@ page is written):
      `default`, not `env`, and the derived TLS mode `ip` (04 §4.2 empty-means-unset rule). No certificate is
      expected: the runner can't pass ACME.
 7. **Healthcheck:** `docker inspect` shows a HEALTHCHECK whose command is `/usr/local/bin/isshoni healthcheck`.
+
+**As README S68 built it** (`deploy/docker/test/`; `deploy/docker/README.md` has the table of parts):
+- **The files are in `deploy/docker/test/`**, next to the image, not in `deploy/test/` (install.sh's):
+  `docker-smoke.sh`, `docker-build.sh` (builds the image from the working tree without goreleaser, from a build
+  context laid out like goreleaser's: `linux/<arch>/isshoni`, `deploy/docker/rootfs/`, `LICENSE`, `NOTICE`, `THIRD_PARTY_NOTICES`), and
+  one compose override per part: `compose.smoke.yaml` (bridge), `compose.smoke.host.yaml` (host) and
+  `compose.smoke.noenv.yaml` (no `.env`). Each override sets the local image (`SMOKE_IMAGE`, `pull_policy: never`)
+  and what its part needs; `docker-smoke.sh` exports the `SMOKE_*` variables.
+- **The compose project is `isshoni-smoke`** (`docker compose -p`), so the test never touches a real install,
+  whose project is `isshoni`; a project of that name left by an earlier run is removed first. Step 3's network is
+  therefore `isshoni-smoke_default`, not `isshoni_default`.
+- **The part without `.env` (step 6) points the ACME directory at a closed port** of the container's own loopback
+  (`ISSHONI_TLS_ACME_CA: https://127.0.0.1:9/directory`): ip mode would otherwise ask Let's Encrypt for a
+  certificate at every test run. No certificate is expected there.
+- **Parts and flags**: `image` (the HEALTHCHECK, the user, that the binary starts without capabilities, the
+  version), `novolume`, `bridge`, `backup` (in bridge and in host), `ipv6`, `host` and `noenv`; `-s` skips parts,
+  `-i IMAGE` tests an image that exists (a release image) and builds nothing, `-a` picks the architecture, `-k`
+  keeps what the test made. `task docker:smoke` builds the web app and the notices first; flags after `--` go to the
+  script.
+- **On Docker Desktop** (macOS, Windows) the engine runs in a virtual machine: the IPv6 client is seen with the
+  machine's forwarding address (6.4), and the host network of `compose.host.yaml` is the machine's, so the host
+  part checks only what it can see from outside (healthy, confined, `setup-url` through `exec`, the data surviving
+  `down` and `up`) and skips the HTTPS checks, the owner of port 443, the admin account and the backup, with a note.
+  CI runs every part on Linux.
 
 ## 12. M1 exit test run book
 
@@ -2247,3 +2421,9 @@ Decided after group 7 (an engineering call the owner delegated; README §6):
   `ExecReload=/bin/kill -HUP $MAINPID`; the server ignores SIGHUP from README S65 on and reloads manual TLS files
   and `log.level` on it from README S90 on (4.5; 04 §6.5). Before S65 the signal would stop the server without a
   restart.
+
+Decided after group 8 (an engineering call the owner delegated; README §6):
+
+- **The Dockerfile's `# syntax=` line is pinned by digest, like its `FROM` line**, so no build, release builds
+  included, pulls a floating Dockerfile frontend from Docker Hub (6.1, 9.2). README S73 implements it; as README S68
+  merged the Dockerfile, the line is `# syntax=docker/dockerfile:1`.
