@@ -107,6 +107,7 @@ export function createRoomRuntime(services: AppServices, opts: RoomRuntimeOption
     viewer,
     room: stores.room,
     connection: stores.connection,
+    signal,
     storage: platform.storage.session,
     log: log.child('stats'),
   });
