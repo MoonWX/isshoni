@@ -44,7 +44,8 @@
 // it gave before. SetDown stands in for a WebSocket that is down: what the Conn sends meanwhile is lost, and the
 // test calls Conn.Resync when it is back. Publish runs a publish.Publisher's side of a pub negotiation, the first
 // one or a re-offer, with its tracks bound to a share (Bindings); PublishICERestart, the re-offer that restarts ICE.
-// The SFU's in-process integration tests (02 §17) are written on these.
+// ApplyHint does with a quality hint's encodings what a browser sharer does: it turns the Publisher's layers off and
+// on (02 §11, layer pausing). The SFU's in-process integration tests (02 §17) are written on these.
 //
 // ProbeClient is the browser's side of the connection test (02 §7.6, 05 §14.2): a PeerConnection with one data
 // channel whose offer, sent without candidates as a browser sends it, goes to sfu.SFU.Probe (or 04's

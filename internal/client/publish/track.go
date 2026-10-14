@@ -2,6 +2,7 @@ package publish
 
 import (
 	"math/bits"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -41,10 +42,13 @@ type track struct {
 	// profile is the H.264 profile key the video goes out in: Options.Profile until Bind chooses, then what the
 	// negotiation chose. next is the one it switches to with its next keyframe (switchTo), "" while it stays.
 	profile, next string
-	sent          bool
-	lastTS        uint32
-	lastNTP       uint64
-	stats         TrackStats
+	// inactive: SetActive turned the video layer off, and it sends nothing. resuming: it was turned on again and
+	// sends nothing until its next keyframe (admit).
+	inactive, resuming bool
+	sent               bool
+	lastTS             uint32
+	lastNTP            uint64
+	stats              TrackStats
 }
 
 // binding is what Bind learned from the negotiation.
@@ -274,12 +278,40 @@ func (t *track) pad(b *binding, ts uint32) (written uint64) {
 	return written
 }
 
+// admit reports whether a Source packet of the track goes out (Publisher.SetActive): not while the video layer is
+// off, and after it was turned on again not before its first keyframe, as an encoder that starts a layer again
+// starts it with one. A packet that doesn't go out is counted in TrackStats.Paused. Only the send loop calls it.
+func (t *track) admit(pkt fake.Packet) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	switch {
+	case t.inactive, t.resuming && !pkt.Keyframe:
+		t.stats.Paused++
+		return false
+	}
+	t.resuming = false
+	return true
+}
+
+// setActive turns the video layer on or off, and reports whether it was off and is on now.
+func (t *track) setActive(active bool) (resumed bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	resumed = active && t.inactive
+	t.inactive = !active
+	if resumed {
+		t.resuming = true
+	}
+	return resumed
+}
+
 // senderReport returns the SR for the last frame sent: NTP = wall clock at its capture, RTP = its timestamp, and the
-// packet and octet counts (RFC 3550 §6.4.1). ok is false before the first packet or while unbound.
+// packet and octet counts (RFC 3550 §6.4.1). ok is false before the first packet, while unbound, and while the video
+// layer is off (Publisher.SetActive): an encoding that sends nothing reports nothing.
 func (t *track) senderReport() (*rtcp.SenderReport, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if !t.sent || t.b == nil {
+	if !t.sent || t.b == nil || t.inactive {
 		return nil, false
 	}
 	return &rtcp.SenderReport{
@@ -316,11 +348,9 @@ func (t *track) onRTCP(pkt rtcp.Packet) (layer string, keyframe bool) {
 			t.stats.NACKs++
 		}
 	case *rtcp.ReceiverEstimatedMaximumBitrate:
-		for _, s := range pkt.SSRCs {
-			if s == ssrc {
-				t.stats.LastREMB = uint64(pkt.Bitrate)
-				break
-			}
+		if slices.Contains(pkt.SSRCs, ssrc) {
+			t.stats.REMBs++
+			t.stats.LastREMB = uint64(pkt.Bitrate)
 		}
 	}
 	return "", false

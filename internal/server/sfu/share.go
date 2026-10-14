@@ -55,6 +55,14 @@ type Share struct {
 	// The fan-out lists: the DownTracks of every subscription to this share, by kind. They are copied on write (under
 	// mu), so the media path reads them without a lock (02 §5.4).
 	video, audio atomic.Pointer[[]*DownTrack]
+
+	// paused holds the slot bits of the layers the sharer was told to pause (02 §11): up.paused, for the goroutines
+	// other than the publishing Conn's actor. A keyframe request for a paused layer does nothing
+	// (Layer.requestKeyframe), and a viewer's new request for high has the actor look at once (askedForHigh).
+	paused atomic.Uint32
+	// up is the share's uplink control (02 §11, uplink.go). It belongs to the publishing Conn's actor, like the rest of
+	// what that Conn publishes; addShare sets it there.
+	up shareUplink
 }
 
 // Encodings per preset (02 §8.6).
@@ -70,33 +78,40 @@ const (
 	audioBitrateMovie = 256_000
 )
 
-// shareParams returns what a sharer encodes for a preset (02 §8.6): the full layer f, then the preview layer q, both
-// active. The admin cap (Limits.MaxShareKbps) lowers f's bitrate and never touches q. profile is the room's codec
+// shareParams returns what a sharer encodes for a preset (02 §8.6): the encodings for the share's cap in bit/s
+// (0 for none) and the layers paused now (slot bits), the audio bitrate of the preset, and profile, the room's codec
 // policy.
-func shareParams(preset Preset, limits Limits, profile ProfileKey) ShareParams {
+func shareParams(preset Preset, capBps int, paused uint32, profile ProfileKey) ShareParams {
+	return ShareParams{
+		Profile:      profile,
+		Encodings:    presetEncodings(preset, capBps, paused),
+		AudioBitrate: presetAudioBitrate(preset),
+	}
+}
+
+// presetEncodings returns the encodings of a preset (02 §8.6): the full layer f, then the preview layer q. The cap
+// (capBps, 0 for none) lowers f's bitrate and never touches q; each layer whose slot bit is in paused is inactive
+// (02 §11), the others active. StartShare, UpdateShare and the quality hints all build their lists here.
+func presetEncodings(preset Preset, capBps int, paused uint32) []EncodingParams {
 	full := EncodingParams{
-		RID: ridFull, Active: true, MaxBitrate: fullLayerMax(limits), MaxFramerate: fullFramerate,
+		RID: ridFull, Active: paused&(1<<SlotF) == 0, MaxBitrate: fullLayerMax(capBps), MaxFramerate: fullFramerate,
 		MaxPixels: fullMaxPixels,
 	}
 	if preset == PresetText {
 		full.MaxFramerate = textFramerate
 	}
 	preview := EncodingParams{
-		RID: ridPreview, Active: true, MaxBitrate: previewMaxBitrate, MaxFramerate: previewFramerate,
-		MaxPixels: previewMaxPixels,
+		RID: ridPreview, Active: paused&(1<<SlotQ) == 0, MaxBitrate: previewMaxBitrate,
+		MaxFramerate: previewFramerate, MaxPixels: previewMaxPixels,
 	}
-	return ShareParams{
-		Profile:      profile,
-		Encodings:    []EncodingParams{full, preview},
-		AudioBitrate: presetAudioBitrate(preset),
-	}
+	return []EncodingParams{full, preview}
 }
 
-// fullLayerMax is the full layer's MaxBitrate under the admin's cap (02 §8.6): fullMaxBitrate, or Limits.MaxShareKbps
+// fullLayerMax is the full layer's MaxBitrate under a share's cap in bit/s (02 §8.6): fullMaxBitrate, or the cap
 // when that is set and lower.
-func fullLayerMax(limits Limits) int {
-	if limit := limits.MaxShareKbps; limit > 0 && limit < fullMaxBitrate/1000 {
-		return limit * 1000
+func fullLayerMax(capBps int) int {
+	if capBps > 0 && capBps < fullMaxBitrate {
+		return capBps
 	}
 	return fullMaxBitrate
 }
@@ -557,12 +572,14 @@ func (c *Conn) startShare(p StartShareParams) (ShareParams, error) {
 	}
 	c.log.Info("share started", "share_id", string(sh.id), "preset", p.Preset.String(), "source", p.Source.String(),
 		"audio", p.Audio)
-	return shareParams(p.Preset, c.sfu.currentLimits(), c.room.codecPolicy()), nil
+	return shareParams(p.Preset, sh.up.capBps, 0, c.room.codecPolicy()), nil
 }
 
 // UpdateShare changes a share this Conn publishes and returns its new ShareParams: the encodings apply at once, the
-// audio bitrate with the next publish offer's answer. It returns sfu.share_not_found for an unknown or ended share
-// and sfu.not_owner for another Conn's.
+// audio bitrate with the next publish offer's answer. The encodings are the share's as they stand: under the admin's
+// cap as it is now, and with the layers paused that the sharer was told to pause (02 §11), so a sharer that applies
+// them pauses or resumes nothing. It returns sfu.share_not_found for an unknown or ended share and sfu.not_owner for
+// another Conn's.
 func (c *Conn) UpdateShare(ctx context.Context, id ShareID, u ShareUpdate) (ShareParams, error) {
 	var params ShareParams
 	err := c.do(ctx, func(context.Context) error {
@@ -589,11 +606,21 @@ func (c *Conn) updateShare(id ShareID, u ShareUpdate) (ShareParams, error) {
 			return ShareParams{}, newError(CodeShareNotFound, "the share ended")
 		}
 	}
-	info, ok := sh.info()
+	preset, ok := sh.currentPreset()
 	if !ok {
 		return ShareParams{}, newError(CodeShareNotFound, "the share ended")
 	}
-	return shareParams(info.Preset, c.sfu.currentLimits(), c.room.codecPolicy()), nil
+	// The sharer applies the cap it gets here: the uplink control has nothing more to tell it about the cap (a hint
+	// with the reason admin follows only a change after this one).
+	sh.up.capBps = c.sfu.currentLimits().shareCap()
+	return shareParams(preset, sh.up.capBps, sh.up.paused, c.room.codecPolicy()), nil
+}
+
+// currentPreset returns the share's preset, and false once the share has ended.
+func (s *Share) currentPreset() (Preset, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.preset, !s.ended
 }
 
 // StopShare ends a share this Conn publishes with the hub's reason: RoomEvents.ShareEnded fires, the subscribers'

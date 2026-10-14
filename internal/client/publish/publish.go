@@ -125,7 +125,11 @@ type TrackStats struct {
 	WriteErrors       int
 	PLIs, FIRs, NACKs int    // received for this SSRC
 	SRs               int    // sender reports written
+	REMBs             int    // REMBs received that name this SSRC
 	LastREMB          uint64 // bps of the last REMB naming this SSRC; 0 before the first
+	// Paused counts the Source packets of a video layer that SetActive kept from going out: while the layer was off,
+	// and after it was turned on again until its first keyframe.
+	Paused uint64
 	// Padding counts the padding-only packets written (Options.Padding). Redundant counts the second copies sent on
 	// the RTX stream, and Retransmitted the packets sent again for a NACK (both Options.RedundantRTX; without it
 	// Pion's NACK responder answers, and nothing counts here).
@@ -511,6 +515,25 @@ func (p *Publisher) SetProfile(profile string) error {
 	return nil
 }
 
+// SetActive turns a video layer of the Publisher off or on again, as a browser sharer does with the active flag of
+// a quality hint's encodings (01 §8.10; the SFU pauses a full layer that nobody watches, 02 §11). An inactive layer
+// sends nothing: its Source packets are dropped (TrackStats.Paused) and it writes no sender reports, while its RTCP
+// is still read. A layer turned on again starts with a keyframe, which the Source is asked for, as an encoder starts
+// an encoding it turns back on. Turning a layer to the state it has changes nothing. It returns an error that wraps
+// ErrInvalidOptions for a layer the Publisher doesn't send.
+func (p *Publisher) SetActive(layer string, active bool) error {
+	for _, t := range p.video {
+		if t.layer != layer {
+			continue
+		}
+		if t.setActive(active) {
+			p.src.RequestKeyframe(layer)
+		}
+		return nil
+	}
+	return fmt.Errorf("%w: no video layer %q", ErrInvalidOptions, layer)
+}
+
 // followAnswer notes an answer's choice of profile, the first H.264 codec of the video m-section with a profile the
 // Publisher can send, for the send loop to switch to (applyProfile). An answer without one changes nothing.
 func (p *Publisher) followAnswer(answer string) {
@@ -718,11 +741,14 @@ func (p *Publisher) waitConnected(ctx context.Context) error {
 	}
 }
 
-// send writes one Source packet on its track.
+// send writes one Source packet on its track, unless SetActive keeps it back.
 func (p *Publisher) send(pkt fake.Packet) {
 	t := p.trackFor(pkt)
 	if t == nil {
 		p.dropped.Add(1)
+		return
+	}
+	if !t.admit(pkt) {
 		return
 	}
 	if !p.anchored {
