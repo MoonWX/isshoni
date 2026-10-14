@@ -2,18 +2,20 @@
 // as one lazy chunk on the first visit to /account, /account/devices or /account/notifications, and picks each page
 // by its export name. Only pages are exported here.
 //
-// NotificationsPage (Web Push on this device, 05 §16.3) joins these two when it exists; until then
-// /account/notifications renders the router's PageUnavailable. The pages' shared frame, AccountShell.tsx, already
-// links to it.
+// The folder also holds Web Push's parts for the room page (05 §16.3), which rooms/ imports from their own files,
+// never through this one: RoomPushSlots.tsx (part of the room's chunk) loads RoomPush.tsx, the room's notifications
+// card and Home Screen sheet, as a chunk of its own. pushState.ts is the push state that the room and the
+// notifications page share.
 //
-// For that page: useInAppBanner().showing (auth/inAppBanner.ts) is true in an in-app browser until the banner is
-// dismissed, on every page, including one that renders no banner. If NotificationsPage hides its `needs-install` card
-// on that flag, it must also render <InAppBrowserBanner /> (import it from '../auth/InAppBrowserBanner'); otherwise a
-// friend in a chat app's browser gets neither the Home Screen steps nor a banner to dismiss.
+// useInAppBanner().showing (auth/inAppBanner.ts) is true in an in-app browser until the banner is dismissed, on
+// every page, including one that renders no banner. NotificationsPage hides its `needs-install` steps on that flag,
+// so it renders <InAppBrowserBanner /> itself; otherwise a friend in a chat app's browser would get neither the Home
+// Screen steps nor a banner to dismiss.
 //
 // The pages' texts, the `account` namespace, come with this chunk and not with the main bundle (05 §16.5): the
-// import below adds them to the catalog before the router has any of the pages.
+// import below adds them to the catalog before the router has any of the pages. RoomPush.tsx imports it too.
 import '../i18n/lazy/account';
 
 export { AccountPage } from './AccountPage';
 export { DevicesPage } from './DevicesPage';
+export { NotificationsPage } from './NotificationsPage';

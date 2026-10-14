@@ -11,10 +11,14 @@ import { mockDevices, mockSessions, sessionFixture } from './testing/harness';
 
 describe('account/index.ts', () => {
   it('exports the pages by the names the router asks for', async () => {
-    expect(Object.keys(folder).sort()).toEqual(['AccountPage', 'DevicesPage']);
+    expect(Object.keys(folder).sort()).toEqual(['AccountPage', 'DevicesPage', 'NotificationsPage']);
     const load = defaultSources().lazy.account;
     expect(load).toBeTypeOf('function');
-    expect(await load?.()).toMatchObject({ AccountPage: folder.AccountPage, DevicesPage: folder.DevicesPage });
+    expect(await load?.()).toMatchObject({
+      AccountPage: folder.AccountPage,
+      DevicesPage: folder.DevicesPage,
+      NotificationsPage: folder.NotificationsPage,
+    });
   });
 
   it('/account is the account page for a signed-in user', async () => {
@@ -40,11 +44,10 @@ describe('account/index.ts', () => {
     expect(router.state.location.pathname + router.state.location.search).toBe('/login?next=%2Faccount');
   });
 
-  it('/account/notifications is the router stand-in until the notifications page exists', async () => {
-    // AccountShell already links there (05 §16.3 "Account → Notifications"). When NotificationsPage is exported
-    // from index.ts this test goes with the stand-in.
+  it('/account/notifications is the notifications page (05 §16.3 "Account → Notifications")', async () => {
     server.use(signedIn());
     renderRoute({ path: '/account/notifications' });
-    expect(await screen.findByRole('heading', { name: 'Not in this build yet' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { level: 1, name: 'Notifications' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Not in this build yet' })).not.toBeInTheDocument();
   });
 });

@@ -18,6 +18,20 @@
   min-height: 0;
 }
 
+/*
+ * The in-app browser banner (05 §16.3), above the page in a chat app's built-in browser. That browser has its own
+ * toolbar at the top, so there is no safe area to keep clear above the banner. Elsewhere the banner renders
+ * nothing, and its slot takes no room.
+ */
+.inAppBanner {
+  flex: none;
+  margin: var(--space-2) calc(var(--space-2) + var(--safe-right)) 0 calc(var(--space-2) + var(--safe-left));
+}
+
+.inAppBanner:empty {
+  display: none;
+}
+
 .main {
   display: flex;
   flex: 1;

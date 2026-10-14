@@ -2,10 +2,11 @@
 // state. It is part of the room's media chunk (rooms/media.ts): the room page renders it through lazyMedia.ts.
 //
 // Empty state (05 §11.2): "Nobody is sharing yet." plus [Share your screen] where the platform can share, or the
-// note for phones. The notifications card of 05 §16.3 joins it with the Web Push flow.
+// note for phones, and account/'s one-time notifications card (05 §16.3: after 3 minutes of watching).
 import type { ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 
+import { RoomNotificationsCard } from '../account/RoomPushSlots';
 import { useApp } from '../app/context';
 import { ShareButton, ShareUnavailableNote } from '../share/ShareButton';
 import type { ShareElsewhere } from '../share/ShareSheet';
@@ -67,6 +68,7 @@ function EmptyRoom({ onStartShare, shareElsewhere }: Pick<RoomStageProps, 'onSta
           <ShareUnavailableNote />
         </div>
       )}
+      <RoomNotificationsCard />
     </>
   );
 }
