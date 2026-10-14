@@ -129,11 +129,12 @@ func checkOriginals(t *testing.T, what string, pkts []sfutest.Packet, want map[i
 // each sequence number of each stream once: the video packets (a viewer's H.264 payload types are the even ones
 // from 96 to 104) whose sequence number modulo 80 is 7, or 40, 41 or 42, and the audio packets (payload type 111)
 // where it is 3 modulo 10. That is 5 % of the video: the loss its receiver reports show (they count a packet that
-// came back on the RTX stream as lost, as Chrome's do) stays under the 10 % at which the downlink allocator takes
-// a viewer to the preview layer (02 §10.2); this test is about the repair, not about that. Retransmissions on the RTX stream (the odd payload types) always pass. It also returns a
-// function that ends the loss, and one that reports how many packets of each kind were lost, and how many went out
-// on the RTX stream. The filter stays in place after the loss has ended, so that it counts the retransmissions that
-// still answer the last NACKs: a slow machine sends some of them only then.
+// came back on the RTX stream as lost, as Chrome's do) stays under the 10 % at which the downlink allocator takes a
+// viewer to the preview layer (02 §10.2); this test is about the repair, not about that. Retransmissions on the RTX
+// stream (the odd payload types) always pass. It also returns a function that ends the loss, and one that reports
+// how many packets of each kind were lost, and how many went out on the RTX stream. The filter stays in place after
+// the loss has ended, so that it counts the retransmissions that still answer the last NACKs: a slow machine sends
+// some of them only then.
 func mediaLoss(viewer net.Addr) (drop func(sfutest.Direction, net.Addr, []byte) bool, stop func(),
 	counts func() (video, audio, rtx int)) {
 	var (

@@ -78,6 +78,31 @@ func TestAllocatorREMB(t *testing.T) {
 	if a.remb != 100_000 {
 		t.Errorf("latest REMB %d after a REMB of 0, want 100000", a.remb)
 	}
+
+	// So is one above 100 Gbit/s, on its way from the viewer's RTCP: the largest Pion parses (a mantissa of 2^18 - 1,
+	// an exponent of 63) doesn't fit an int64, and must leave the latest REMB as it was on every architecture. Had it
+	// replaced it, the next REMB of 6 Mbit/s would fall, below the 8 Mbit/s forwarded: an overuse.
+	s, _ := newTicklessSFU(t)
+	viewer, _ := join(t, s, "lounge", "bob", "c-b", RoleViewer)
+	d, _ := testDownTrack(t, viewer, testShare(t, s, "s_1"), webrtc.RTPCodecTypeVideo)
+	va := &viewer.alloc
+	va.forwarded.Store(8_000_000)
+	viewerREMB := func(bps float32) {
+		t.Helper()
+		d.handleRTCP([]rtcp.Packet{&rtcp.ReceiverEstimatedMaximumBitrate{Bitrate: bps, SSRCs: []uint32{0x7000}}})
+		va.mu.Lock()
+		latest, fall, overuse := va.remb, va.fall, va.overuse
+		va.mu.Unlock()
+		if latest != 6_000_000 || fall != 0 || overuse != 0 {
+			t.Fatalf("after a REMB of %g: latest %d, fall %d, overuse %d; want 6000000 and no fall", bps, latest, fall,
+				overuse)
+		}
+	}
+	viewerREMB(6_000_000)
+	viewerREMB(float32(math.Ldexp(1<<18-1, 63)))
+	viewerREMB(float32(math.Inf(1)))
+	viewerREMB(float32(math.NaN()))
+	viewerREMB(6_000_000)
 }
 
 // TestAllocatorStates scripts the state machine of 02 §10.2 through every row of its table, with the budget each
@@ -529,6 +554,65 @@ func TestAllocatorReports(t *testing.T) {
 	now += time.Second.Nanoseconds()
 	da.noteReport(rtcp.ReceptionReport{SSRC: 0x7001, LastSequenceNumber: 110, TotalLost: 50}, now)
 	check("audio", "")
+}
+
+// TestAllocatorReportFlood: a viewer that sends receiver reports as fast as it likes costs the allocator no more
+// than one that sends five a second. A report less than 200 ms after the last one that counted is folded into the
+// next, which covers its interval and the gaps in it: of 10 000 reports in a second, 5 are kept, and they still add
+// up to what was sent and lost. And the allocator keeps at most maxLossReports reports, the newest.
+func TestAllocatorReportFlood(t *testing.T) {
+	s, _ := newTicklessSFU(t)
+	viewer, _ := join(t, s, "lounge", "bob", "c-b", RoleViewer)
+	d, _ := testDownTrack(t, viewer, testShare(t, s, "s_1"), webrtc.RTPCodecTypeVideo)
+	a := &viewer.alloc
+	var w rtpWriteState
+	// Report i comes 100 µs after the one before, with one more packet sent, and one in 20 lost on the way. Halfway
+	// through the writer passes over 10 sequence numbers (an upstream gap), which the viewer counts as lost too.
+	const reports, gap = 10_000, 10
+	seq := func(i int) uint32 {
+		if i >= reports/2 {
+			return uint32(1000 + i + gap)
+		}
+		return uint32(1000 + i)
+	}
+	for i := 0; i <= reports; i++ { // and one more, exactly a second after the first
+		d.noteSeq(&w, uint16(seq(i)))
+		lost := uint32(i / 20)
+		if i >= reports/2 {
+			lost += gap
+		}
+		at := t0 + int64(i)*int64(100*time.Microsecond)
+		d.noteReport(rtcp.ReceptionReport{SSRC: 0x7000, LastSequenceNumber: seq(i), TotalLost: lost}, at)
+	}
+	a.mu.Lock()
+	kept := slices.Clone(a.losses)
+	a.mu.Unlock()
+	var expected, lost int64
+	for _, l := range kept {
+		expected += l.expected
+		lost += l.lost
+	}
+	if len(kept) > 5 || expected != reports || lost != reports/20 {
+		t.Fatalf("after %d reports in a second: %d kept, %d packets expected and %d lost; want at most 5, %d and %d",
+			reports+1, len(kept), expected, lost, reports, reports/20)
+	}
+	if from := kept[0].from; from != t0 {
+		t.Errorf("the first report kept covers the time from %v on, want from the first report", time.Duration(from-t0))
+	}
+
+	// The allocator's own bound: past maxLossReports the oldest go, and what is older than 3 s goes first.
+	var b allocator
+	for i := range 2 * maxLossReports {
+		b.onLoss(int64(100+i), 0, t0, t0+int64(i))
+	}
+	if n, oldest := len(b.losses), b.losses[0].expected; n != maxLossReports || oldest != 100+maxLossReports {
+		t.Fatalf("after %d reports: %d kept, the oldest of %d packets; want %d, the newest", 2*maxLossReports, n,
+			oldest, maxLossReports)
+	}
+	b.onLoss(1, 0, t0, t0+int64(recoverWindow)+2*maxLossReports)
+	if len(b.losses) != 1 {
+		t.Errorf("a report more than 3 s after the others: %d kept, want 1", len(b.losses))
+	}
 }
 
 // TestAllocatorEvents runs the allocator on a viewer Conn with real DownTracks (02 §10.2, §6.2): the client hears each

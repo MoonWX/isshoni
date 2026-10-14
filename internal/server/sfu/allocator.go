@@ -28,8 +28,10 @@ import (
 //   - the loss its receiver reports give for its video DownTracks (onLoss, DownTrack.noteReport), as the link lost it:
 //     the sequence numbers the SFU itself never sent (an upstream gap, a packet the queue dropped) are taken out
 //     (seqGaps), and a report that comes long after the one before covers an outage of the viewer's network rather
-//     than congestion, and only starts the count again. A report says something about a decision of the allocator
-//     only when all of the time it covers came after the decision;
+//     than congestion, and only starts the count again. One that comes right after the one before (reportMinGap)
+//     is folded into the next, so a viewer that reports at any rate costs no more than one that reports five
+//     times a second. A report says something about a decision of the allocator only when all of the time it
+//     covers came after the decision;
 //   - what the queues of its DownTracks dropped (drops; at these rates the writer is starved of CPU);
 //   - the rate the SFU forwards to it now: its DownTracks' bitrates, 2 s moving averages (the actor's step);
 //   - the measured bitrate of each layer, 2 s moving averages (02 §9.1), for what fits the budget.
@@ -68,6 +70,10 @@ const (
 	// and the latest REMB is known only for rembFresh.
 	rembFallPct = 3
 	rembFresh   = 5 * time.Second
+	// maxREMB (100 Gbit/s): a REMB above it is ignored, like one of 0. No real estimate comes near it, and what Pion
+	// parses goes up to 2^18 × 2^63, past an int64: converting such a float32 gives MaxInt64 on arm64 and MinInt64 on
+	// amd64, and the products of onREMB and step would overflow.
+	maxREMB = 100_000_000_000
 	// Loss is averaged over lossWindow. At lossCongestedPct % or more it is congestion; during a trial upgrade,
 	// lossProbePct % fails the trial; and the backoff ends only while it stays under lossRecoveredPct % over
 	// recoverWindow. A verdict needs lossMinPackets packets: one lost of three is no 33 % of anything.
@@ -81,6 +87,12 @@ const (
 	// of the viewer's network: its RTCP didn't reach the SFU either, which downlink congestion doesn't do (the
 	// reports travel the other way). Such a report only starts the count again. Browsers send one about every second.
 	reportGap = 2 * time.Second
+	// reportMinGap: a receiver report of a stream that comes less than reportMinGap after the last one that counted
+	// is folded into the next one, which then covers both intervals and the gaps in them. The viewer chooses how
+	// often it reports, and each report that counts is kept for recoverWindow: this keeps that to about 15 a stream.
+	// maxLossReports bounds the reports kept, of all of the Conn's streams; past it the oldest go.
+	reportMinGap   = 200 * time.Millisecond
+	maxLossReports = 1024
 	// More than dropsCongested queue drops a second is congestion.
 	dropsCongested = 50
 	// The budget, on congestion: budgetREMBPct % of an overuse REMB; on loss or drops, budgetForwardedPct % of the
@@ -125,7 +137,8 @@ type allocator struct {
 	// fall is the lowest REMB that fell since the actor's last step, 0 for none; overuse the lowest of those that
 	// was also below the forwarded rate (an overuse REMB).
 	fall, overuse int64
-	// losses are what the receiver reports said, the last recoverWindow of them.
+	// losses are what the receiver reports said, the last recoverWindow of them (at most maxLossReports), oldest
+	// first.
 	losses []reportLoss
 
 	// The actor's.
@@ -187,14 +200,22 @@ func (a *allocator) onREMB(bps, now int64) (fell bool) {
 // onLoss takes what one receiver report says of a video stream, which covers the time from from (the stream's last
 // report) to now: of expected packets the SFU sent in it, the viewer lost lost. It reports whether that is enough
 // loss to fail a trial, which needs the actor's look before its next tick.
+//
+// The reports come in the order of the clock (near enough: each RTCP reader reads it before it takes the lock), so
+// the ones older than recoverWindow are at the front, and go from there; so does the oldest past maxLossReports.
+// (One a little out of order stays a little longer; lossSince counts by time, not by place.)
 func (a *allocator) onLoss(expected, lost, from, now int64) bool {
 	if expected <= 0 {
 		return false
 	}
 	lost = min(max(lost, 0), expected)
 	a.mu.Lock()
-	a.losses = slices.DeleteFunc(a.losses, func(s reportLoss) bool { return now-s.at > int64(recoverWindow) })
-	a.losses = append(a.losses, reportLoss{from: from, at: now, expected: expected, lost: lost})
+	old := 0
+	for old < len(a.losses) && now-a.losses[old].at > int64(recoverWindow) {
+		old++
+	}
+	old = max(old, len(a.losses)+1-maxLossReports)
+	a.losses = append(a.losses[old:], reportLoss{from: from, at: now, expected: expected, lost: lost})
 	a.mu.Unlock()
 	return lost*100 >= expected*lossProbePct
 }
@@ -511,9 +532,9 @@ type rrState struct {
 }
 
 // noteREMB hands one REMB of the viewer to its Conn's allocator. It reports whether the REMB fell, so that the
-// allocator decides before its next tick.
+// allocator decides before its next tick. A REMB of nothing, or of more than maxREMB, is ignored.
 func (d *DownTrack) noteREMB(bps float32, now int64) bool {
-	if d.alloc == nil {
+	if d.alloc == nil || !(bps > 0 && bps <= maxREMB) {
 		return false
 	}
 	return d.alloc.onREMB(int64(bps), now)
@@ -522,18 +543,23 @@ func (d *DownTrack) noteREMB(bps float32, now int64) bool {
 // noteReport hands what a receiver report about the video DownTrack's stream adds to the last one to its Conn's
 // allocator, as loss on the link: of the sequence numbers the report covers, those the SFU never sent (seqGaps) were
 // not the link's to lose, and are taken out of both counts. The first report of a stream, and one that comes more than
-// reportGap after the last (an outage, not congestion), only start the count. It reports whether the allocator should
-// decide before its next tick.
+// reportGap after the last (an outage, not congestion), only start the count. One that comes less than reportMinGap
+// after the last is folded into the next: it changes nothing, so the next covers its interval and its gaps too. It
+// reports whether the allocator should decide before its next tick.
 func (d *DownTrack) noteReport(r rtcp.ReceptionReport, now int64) bool {
 	a := d.alloc
 	if a == nil || d.kind != webrtc.RTPCodecTypeVideo {
 		return false
 	}
-	skipped := d.gaps.take(uint16(r.LastSequenceNumber))
 	a.mu.Lock()
 	prev := d.rr
+	if prev.ok && prev.ssrc == r.SSRC && now-prev.at < int64(reportMinGap) {
+		a.mu.Unlock()
+		return false
+	}
 	d.rr = rrState{ok: true, ssrc: r.SSRC, highest: r.LastSequenceNumber, lost: r.TotalLost, at: now}
 	a.mu.Unlock()
+	skipped := d.gaps.take(uint16(r.LastSequenceNumber)) // a leaf of its own, never inside the allocator's lock
 	if !prev.ok || prev.ssrc != r.SSRC || now-prev.at > int64(reportGap) {
 		return false
 	}

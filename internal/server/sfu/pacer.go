@@ -15,7 +15,7 @@ import (
 // change arrives at up to the cap, often starting with a frame of 150–400 KB. A rate from the measured average alone
 // would be 2 Mbit/s at that moment, and add about a second of video latency (and of A/V drift, since audio isn't
 // paced) at every motion onset. For an 8 Mbit/s full layer the rate is 20 Mbit/s: a 150 KB keyframe leaves over
-// about 60 ms, 50 KB of it (the bucket) at once.
+// about 40 ms, its first 50 KB (the bucket) at once, or over 60 ms when a burst just before has emptied the bucket.
 //
 // What goes through it (decided in README S84, the open question of S63): every video packet the writer sends, media
 // and retransmissions alike, in the writer's order, which sends retransmissions first. A repair takes its tokens
