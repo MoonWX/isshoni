@@ -2001,9 +2001,13 @@ alone. Registry logins are a plain `docker login` with the job's token, not a th
   1. `gh release download "$TAG" --dir rel` (the draft is visible to `GITHUB_TOKEN`);
   2. `(cd rel && sha256sum --strict -c checksums.txt)`, so every asset matches what is about to be signed and a
      malformed line fails, and **nothing is in the draft that the signature would not cover**: the job fails on an
-     asset, hidden ones included (`shopt -s dotglob`), that `checksums.txt` does not list (`checksums.txt` itself,
-     its `.sig` and its `.sigstore.json` excepted; a `.sig` is there when the job runs again after it uploaded
-     one). It is `publish`'s check without the signature, so a draft that `publish` would refuse is never signed;
+     asset, hidden ones included (`shopt -s dotglob nullglob`), that `checksums.txt` does not list (`checksums.txt`
+     itself, its `.sig` and its `.sigstore.json` excepted; a `.sig` is there when the job runs again after it
+     uploaded one). It is `publish`'s check without the signature, so a draft that `publish` would refuse is never
+     signed. It stays inline in `sign` and `sign-dry`, and `deploy/test/check-draft-test.sh` fails if either
+     loses `--strict`, sets `dotglob nullglob` only after its `for f in rel/*` loop or not at all, drops that loop
+     or its `exit 1`, gets an `if:` or `continue-on-error:` from the check to the signature, or checks after it
+     signs (README F15; reviews F09-R3, F15-R2);
   3. fails when the environment has no secret `RELEASE_SSH_SIGNING_KEY`; removes an earlier `checksums.txt.sig`
      first (without a terminal, `ssh-keygen -Y sign` keeps an existing signature file and still exits 0); writes
      the key under `umask 077` into `$RUNNER_TEMP` and deletes it when the step ends;
@@ -2058,20 +2062,49 @@ alone. Registry logins are a plain `docker login` with the job's token, not a th
   `sign-dry` is skipped, so a plain condition would skip `publish` after a green `verify`, and the run would end
   green with the release still a draft and the floating tags not moved (actions/runner#491; the dry run can't show
   it, because it skips `publish` by design).
-- Permissions: `contents: write`, `packages: write`. Checks out `deploy/keys` (sparse).
+- Permissions: `contents: write`, `packages: write`. Checks out `deploy/keys` and `deploy/release` (sparse).
 - Fails if the draft body still contains `TODO` ("edit them on GitHub, then re-run this job").
 - **Checks the draft once more, right before it goes public** (README F09, review R4): `gh release download` into
-  a new `rel/`, then fails unless all three pass, in this order: `ssh-keygen -Y verify -f
+  a new `rel/`, then `sh deploy/release/check-draft.sh rel deploy/keys/allowed_signers` (README F15, review
+  F09-R1), which fails unless all three checks pass, in this order: `ssh-keygen -Y verify -f
   deploy/keys/allowed_signers -I isshoni-release -n isshoni-checksums -s rel/checksums.txt.sig <
   rel/checksums.txt`; `(cd rel && sha256sum --strict -c checksums.txt)`; and the asset check of `sign`: every
   file of the draft, hidden ones included, is listed in `checksums.txt`, except `checksums.txt`, its `.sig` and
-  its `.sigstore.json`. The step reads nothing but `rel/` and `deploy/keys/allowed_signers`; F09 ran it on
-  fixture directories (a draft as signed passes, and so does one without the cosign bundle; an added asset, an
-  added hidden asset, a changed `install.sh`, a changed `install.sh` with `checksums.txt` to match, a signature of
-  another key, no signature, a missing asset and an empty `allowed_signers` each fail), and `sign`'s and
-  `sign-dry`'s check too (an added asset, a hidden one, a changed `install.sh` and a malformed line each fail).
-  Those were one-off runs of the steps taken out of the workflow: the checks are inline, and no test in the
-  repository runs them again.
+  its `.sigstore.json`. The signature comes first, so `sha256sum` reads only names that the key signed.
+- **`deploy/release/check-draft.sh DIR ALLOWED_SIGNERS`** as README F15 built it: POSIX sh, run with the runner's
+  `sh` (dash). It reads nothing but the two paths and changes nothing; exit 0 with a line that says `ok`, 1 when a
+  check fails (or the draft has no `checksums.txt` or `.sig`, or `ALLOWED_SIGNERS` is missing or empty), 2 for
+  usage. Hidden files count without `dotglob`: it walks both `DIR/*` and `DIR/.*`, skips `.`, `..` and a pattern
+  that matched nothing, and names every unlisted file, a directory too, not only the first. A file is listed when
+  a line of `checksums.txt` is `<hex>  NAME` or `<hex> *NAME` for its whole name (taken from the environment, since
+  `awk -v` would turn a backslash into an escape), so a name that starts, ends or extends a listed one is not
+  listed. In GitHub Actions (`GITHUB_ACTIONS=true`) each error is an `::error::` annotation, with control
+  characters shown as `?`, so that an asset's name can't start a workflow command of its own, and `%` as `%25`
+  (as `@actions/core` escapes it: the runner decodes `%25`, `%0D` and `%0A` in a message, so a name with `%0A` in
+  it would show as two lines); the step adds one annotation that names the tag.
+- **Its test**, `deploy/test/check-draft-test.sh`, which `task test:sh` runs under dash and `bash --posix` (the
+  script under the same shell; not busybox, whose own `sha256sum` has no `--strict`). It makes an ephemeral release
+  key and another key with `ssh-keygen`, an `allowed_signers` for the first, and a draft as `sign` leaves it (the
+  asset names of §3, `checksums.txt`, its cosign bundle and `.sig`); each case copies that draft, changes one thing
+  and asserts the exit code and the error of the check meant to catch it. Passing: the draft as signed, from
+  another directory and with relative paths as `publish` gives them; without the cosign bundle; with a hidden asset
+  that the signed `checksums.txt` lists; with a `<hex> *NAME` line. Failing at the asset list: an added asset, an
+  added hidden file, a name that extends, starts or ends a listed one, two added assets (both named), a directory,
+  a missing `checksums.txt` line signed again, a hidden copy of `checksums.txt`. At the checksums: a changed
+  `install.sh`, a missing asset, a malformed line signed again. At the signature: a changed `install.sh` with
+  `checksums.txt` to match (unsigned, and signed by another key), a signature of another key, of the right key in
+  the namespace `file`, a broken one, none, no `checksums.txt`, a missing line not signed again, a bad signature
+  together with an added asset (only the signature is reported), and an `allowed_signers` that is empty, missing,
+  for another principal or for another namespace. Then usage (exit 2, `-h`); the annotations with a name that
+  holds a line break and one that holds `%0A` (shown as `%250A`; outside Actions as it is); and `release.yml`
+  itself (review F15-R1, R2), with the lines it looks for matched whole: `publish` runs the script as `if ! sh
+  deploy/release/check-draft.sh rel deploy/keys/allowed_signers; then` with `exit 1` as the only exit before that
+  `if`'s `fi`, after the last `gh release download` and before the first `--draft=false`, with no `if:` or
+  `continue-on-error:` from that download to `--draft=false`; it checks out `deploy/release` and keeps no inline
+  copy of the check. `sign`'s and `sign-dry`'s inline checks run, in this order and before `ssh-keygen -Y sign`,
+  `(cd rel && sha256sum --strict -c checksums.txt)`, `shopt -s dotglob nullglob`, and the `for f in rel/*` loop
+  whose unlisted branch ends in `exit 1`, with no `if:` or `continue-on-error:` from the check's step to the
+  signature. No key is committed: the keys live in the test's temporary directory.
 - A final release: `gh release edit "$TAG" --draft=false --latest`. A prerelease: `--draft=false --prerelease
   --latest=false`, so GitHub's "latest" stays where it is (goreleaser sets none, `make_latest: false`, 9.2).
 - Unless it is a prerelease: `docker buildx imagetools create -t ghcr.io/moonwx/isshoni:<tag> …

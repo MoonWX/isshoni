@@ -752,11 +752,13 @@ jobs:
       FLOATING_TAGS: ${{ needs.version.outputs.floating-tags }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Check out deploy/keys
+      - name: Check out deploy/keys and deploy/release
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          sparse-checkout: deploy/keys
+          sparse-checkout: |
+            deploy/keys
+            deploy/release
 
       - name: The release notes have no TODO left
         run: |
@@ -772,32 +774,15 @@ jobs:
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir rel
 
       - name: The draft is what sign signed (signature, checksums, no other asset)
-        # Reads only rel/ and deploy/keys/allowed_signers in the working directory.
+        # deploy/release/check-draft.sh (06 §9.3), in this order: checksums.txt is signed by a key of
+        # deploy/keys/allowed_signers, as install.sh will check it (06 §4.3); every asset it lists is there, with
+        # that SHA-256 (--strict); and the draft has no asset that it does not list, hidden ones included, which no
+        # signature would cover (its own signature and cosign bundle excepted). The script reads only rel/ and
+        # deploy/keys/allowed_signers, and annotates each error; deploy/test/check-draft-test.sh tests it on
+        # fixture drafts (`task test:sh`, README F15).
         run: |
-          # checksums.txt is signed by a key of deploy/keys/allowed_signers, as install.sh will check it (06 §4.3).
-          if ! ssh-keygen -Y verify -f deploy/keys/allowed_signers -I isshoni-release -n isshoni-checksums \
-            -s rel/checksums.txt.sig < rel/checksums.txt; then
-            echo "::error::checksums.txt of the draft $TAG has no valid signature of a key in deploy/keys/allowed_signers"
-            exit 1
-          fi
-          # Every asset it lists is there, with that SHA-256.
-          if ! (cd rel && sha256sum --strict -c checksums.txt); then
-            echo "::error::an asset of the draft $TAG is missing or does not match checksums.txt"
-            exit 1
-          fi
-          # And the draft has no asset that it does not list, which no signature would cover. Its own signature and
-          # cosign bundle are the exceptions.
-          shopt -s dotglob nullglob
-          unlisted=0
-          for f in rel/*; do
-            name=${f#rel/}
-            case $name in checksums.txt | checksums.txt.sig | checksums.txt.sigstore.json) continue ;; esac
-            if ! awk -v f="$name" '$2 == f { found = 1 } END { exit !found }' rel/checksums.txt; then
-              echo "::error::the draft $TAG has $name, which checksums.txt does not list"
-              unlisted=1
-            fi
-          done
-          if [ "$unlisted" != 0 ]; then
+          if ! sh deploy/release/check-draft.sh rel deploy/keys/allowed_signers; then
+            echo "::error::the draft $TAG is not the release that sign signed, so it stays a draft (the errors above say why)"
             exit 1
           fi
           echo "The draft $TAG is the release that sign signed"

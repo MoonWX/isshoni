@@ -240,7 +240,8 @@ tasks:
   test:sh:
     desc: >-
       Run the install.sh unit tests under dash, bash --posix and busybox sh (outside CI, a missing shell is skipped),
-      and check that deploy/test/vm/vm-test.sh still finds what it takes from distro-test.sh (`vm-test.sh -h`)
+      check that deploy/test/vm/vm-test.sh still finds what it takes from distro-test.sh (`vm-test.sh -h`), and run
+      the tests of release.yml's draft check (deploy/test/check-draft-test.sh) under dash and bash --posix
     cmds:
       - cmd: "echo 'test:sh: skipped, deploy/test/install_unit.sh does not exist yet'"
         silent: true
@@ -265,6 +266,13 @@ tasks:
             if [ -f deploy/test/vm/vm-test.sh ]; then
               echo "test:sh: $shell deploy/test/vm/vm-test.sh -h"
               $shell deploy/test/vm/vm-test.sh -h > /dev/null
+            fi
+            # release.yml's publish runs deploy/release/check-draft.sh with the runner's sh (dash); its test runs it
+            # under the same shell as itself (06 §9.3). Not under busybox: busybox's own sha256sum, which a busybox
+            # shell may run in place of the system's, has no --strict.
+            if [ "$cmd" != busybox ] && [ -f deploy/test/check-draft-test.sh ]; then
+              echo "test:sh: $shell deploy/test/check-draft-test.sh"
+              CHECK_DRAFT_SHELL=$shell $shell deploy/test/check-draft-test.sh
             fi
           done
         silent: true
