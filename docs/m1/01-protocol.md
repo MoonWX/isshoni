@@ -2052,10 +2052,10 @@ Dan's fresh Firefox                     Hub                                    S
  │ subscribe.update{s_a high on} ─────────►│ peer.Subscribe ───────────────────────►│ viewer can't decode:
  │                                        │                                        │ adds audio only
  │◄ pc.offer{sub,1,1, tracks: 0→s_a audio}  (answer, ICE) → Dan hears s_a
- │◄ subscribe.status{s_a video off, requestedVideo high, reason codec}  (the first one with reason codec
- │    also shows the toast; there is no separate error)
+ │◄ subscribe.status{s_a video off, requestedVideo high, reason codec}  (no toast and no separate error: the
+ │    tile says it, 05 §10.6 as README S86 built it)
  UI tile: "Your browser is still getting its video decoder, retrying…" (audio plays)
- client: every 5 s re-read capabilities (the only client-side retry)
+ client: re-read capabilities at once, then every 5 s (the only client-side retry; caps.update ≤ 1 per 5 s)
  server (02 §8.5): if caps list H.264 but the answer still rejects video (Firefox lists H.264 before it can use it),
    rebuild the sub PC every 20 s, at most 9 times (3 min); same status each time
  …OpenH264 installed → caps now include h264/42e0, h264/4200
@@ -2066,7 +2066,8 @@ Dan's fresh Firefox                     Hub                                    S
  │◄ pc.offer{sub, gen 2, neg 1, tracks: video+audio}   (server rebuilt Dan's sub PC: a fresh PC is sure to
  │   see the new decoder)
  │ pc.answer{sub,2,1} → video decodes; subscribe.status{s_a video high} (reason cleared)
- after 3 min without success: tile shows "Reload the page" (a reload gives fresh caps and a fresh PC)
+ after 3 min without success: tile and a room banner say "Reload the page" (a reload gives fresh caps and a
+   fresh PC); a short gap in the wait (< 30 s) doesn't restart the 3 min
 ```
 
 Policy details belong to 02:

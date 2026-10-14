@@ -473,6 +473,7 @@ Rules (E = error, W = warning):
 | `admin_socket` ≤ 104 bytes; `data_dir` not empty | E |
 | Durations > 0; `udp_buffer_bytes` between 1 MiB and 64 MiB | E |
 | `push.subject` starts with `mailto:` or `https:` (only the prefix is checked here; with push on, `server.New` also refuses a bare `mailto:` or `https:` as a config error, §14.1) | E |
+| `updates.release_url` (hidden; tests) is empty or an absolute `http` or `https` URL without credentials (checked by `server.New` with `ops.CheckReleasesURL`, the release check's own rule, §11.5; README S85). The value in the message has its user info replaced by `xxxxx` (`ops.RedactURL`): `serve` prints it on stderr, into the journal, and passwords are never logged | E (at serve startup, exit 78) |
 | `clients.min_version` is SemVer | E |
 | Policy key value accepted by 03's `SettingsCache.Pin` (ranges of 03 §9) | E (at serve startup; reported like other config errors, exit 78) |
 | `metrics.listen` not loopback | W |
@@ -782,8 +783,9 @@ type Addrs struct {
 	                // that carries media, all on one port); nil when UDP is off
 	ICETCP net.Addr // listen.ice_tcp (S59): a *net.TCPAddr with the host as configured; nil when that listener is
 	                // off. ICE-TCP on the HTTPS port has no address of its own: it is HTTPS's (§7.2)
-} // ICEUDP and ICETCP are both nil on a server that started without media sockets (§6.2). A later slice adds the
-  // metrics listener (README S85)
+	Metrics net.Addr // metrics.listen (README S85, §11.2): /metrics, /healthz, /readyz and, with metrics.pprof,
+	                 // /debug/pprof/; nil unless metrics.enabled
+} // ICEUDP and ICETCP are both nil on a server that started without media sockets (§6.2)
 
 type ShutdownReason string // "stop" | "restart" | "restore"
 
@@ -832,8 +834,14 @@ goroutine and does not wait for it: its own request would hold up the HTTP step.
    - **The order** is the 443 multiplexer (not in off mode), `listen.http`, the admin socket; then the site is
      made from the bound HTTP ports and the detected addresses, which says whether the server has to wait for
      its address (§6.2); and last the Transport: `listen.ice_udp` on every local address that carries media,
-     `listen.ice_tcp`, and the reader of the multiplexer's ICE side, which had none before. The metrics listener
-     is still README S85's: with `metrics.enabled` the server warns that nothing listens on `metrics.listen`.
+     `listen.ice_tcp`, and the reader of the multiplexer's ICE side, which had none before. README S85 put the
+     metrics listener between `listen.http` and the admin socket (with `metrics.enabled` only), and since then
+     the multiplexer, `listen.http` and the Transport count every byte they move on the server's transfer
+     counter (§11.3). A `metrics.listen` that can't be bound is a runtime error (exit 1) that names the key and
+     its value like the others: "port 9469 is in use (another isshoni, or another exporter?). Stop it, or change
+     metrics.listen (now "127.0.0.1:9469")", or for a port the process may not bind, the advice to use
+     `127.0.0.1:9469`. The listener serves from step 9 on, and closes with the HTTP servers in step 5 of the
+     shutdown (§6.4).
    - **A media port that can't be bound** is a runtime error (exit 1) that names the key and its value: "port
      7882/udp is in use (another isshoni?). Stop it, or change listen.ice_udp (now ":7882")", the same for
      `7882/tcp` with `listen.ice_tcp`, and for a port the process may not bind "isshoni may not listen on
@@ -859,8 +867,9 @@ goroutine and does not wait for it: its own request would hold up the HTTP step.
     each only when it is up; a transport that is off shows as `off`: `media udp/off ice-tcp 443` for a TLS-mode
     server with both 7882 listeners turned off, `media udp/7882 ice-tcp 7882` in off mode, `media udp/7882
     ice-tcp off` in off mode without `listen.ice_tcp`. The line has the attributes `listen` (the main listener:
-    `listen.https`, or `listen.http` in off mode) and, in a TLS mode, `listen_http` (the plain port). A server
-    that waits for its public address logs the WARN line of §6.2 instead, and no setup hint: it has no accounts.
+    `listen.https`, or `listen.http` in off mode), in a TLS mode `listen_http` (the plain port), and with
+    `metrics.enabled` `listen_metrics` (the metrics listener as bound, README S85). A server that waits for its
+    public address logs the WARN line of §6.2 instead, and no setup hint: it has no accounts.
 
 ### 6.2 Liveness and readiness
 
@@ -1050,7 +1059,7 @@ and for a restore or `rotate-secrets` restart:
 | 2. New `/ws` upgrades and API calls → 503 `server_shutdown` (`Retry-After: 5`) | 0 | |
 | 3. `Hub.Shutdown(ctx, reason)` (01): every connection gets `server.shutdown{reason, reconnectInMs}` and `error{code: "server_shutdown", retryable: true, scope: "connection"}`, then WebSocket close **1012 (Service Restart)**. The wire reason is `restart` for SIGTERM, restore and rotation (SIGTERM can't tell stop from restart) | ≤ 2 s | The SPA shows "Server restarting… reconnecting" and reconnects after `reconnectInMs`; after the restart it rejoins and re-publishes (01 §10.5–§10.6) |
 | 4. `SFU.Close()` closes all PeerConnections (concurrently; 02 guarantees it returns within 1 s); then `Transport.Close()` closes the muxes | ≤ 1 s for the SFU; two budgets of their own as built, 1.25 s and then 0.25 s (below) | |
-| 5. `http.Server.Shutdown` on all servers, then `PortMux.Close()` (closes the raw :443 listener and both sub-listeners; the ICE sub-listener may already be closed by `Transport.Close`, which is harmless) | ≤ 5 s | Idle keep-alives close |
+| 5. `http.Server.Shutdown` on all servers (the metrics listener's too, `ops.Metrics.Shutdown`, README S85), then `PortMux.Close()` (closes the raw :443 listener and both sub-listeners; the ICE sub-listener may already be closed by `Transport.Close`, which is harmless) | ≤ 5 s | Idle keep-alives close |
 | 6. Stop the TLS manager (`tlsmgr.Manager.Shutdown`, §8.2: no order, renewal or reload writes the certificate storage after it; S44), flush transfer counters, wait for the push queue's drain (≤ 2 s; it began right after step 5, README S71), close the admin socket, close the store (WAL checkpoint) | ≤ 2 s | |
 | 7. Exit 0 (or re-exec, §6.5) | total ≤ `shutdown_timeout` (10 s); a forced shutdown up to 1 s more for the store's close (below) | |
 
@@ -1080,10 +1089,17 @@ step 6 are more exact than the table:
 - **The admin socket closes in step 6, not earlier.** The operator's CLI can ask the server until then: its health
   and ready answers have said "shutting down" since step 1, `status` still answers, and every other request gets
   503 `server_shutdown` (§12.2). The order inside the step is: the TLS manager, now that nothing handshakes any
-  more; then the server's own background work is cancelled (the janitor, the periodic look at the public addresses,
+  more; then the last flush of the transfer counters (the step `transfer`, README S85, below); then the server's
+  own background work is cancelled (the janitor, the periodic look at the public addresses, the release check,
   the reads behind hooks without a context); then the wait for the push service's drain (the step `push`, README
   S71, below); then the admin socket's server; then the runtime log level's timer. Together they have the step's
   2 s.
+- **The transfer counters' last flush is a step of its own, `transfer`** (README S85; `TestShutdownOrder` names
+  the steps `signaling`, `sfu`, `transport`, `http`, `tls`, `transfer`, `push`, `admin socket`, `store`). It comes
+  after the TLS manager, when every socket that counts has closed (the multiplexer and `listen.http` in step 5, the
+  Transport in step 4): the shutdown ends `ops.Transfer.Run`'s context of its own, and `Run` stores what was
+  counted since its last flush (with 2 s of its own for that, §11.3) and returns. The step waits for it within
+  what is left of step 6's 2 s; a store too slow for that makes `transfer` forced, like `push` below.
 - **The push service drains from the end of step 5, and step 6 waits for it after the TLS manager** (README S71;
   `TestShutdownOrder`). Once the HTTP servers are down nothing can queue a notification any more: the hub stopped
   in step 3, the REST API in step 5, and the admin socket has answered only `health`, `ready` and `status` since
@@ -1108,8 +1124,9 @@ step 6 are more exact than the table:
   the swap.
 - Last of all the data-directory lock is released, so that the process that follows (a re-exec, the next start)
   can take it.
-- A server without a site has no hub: step 3 is skipped. "Flush transfer counters" joins step 6 with README S85
-  ("wait for the push queue's drain" joined with S71, above). Step 6 also ends the settings callback that passes
+- A server without a site has no hub: step 3 is skipped. "Flush transfer counters" joined step 6 with README S85
+  and "wait for the push queue's drain" with S71 (above); the transfer accounting runs on every server, with or
+  without a site, so every shutdown has the `transfer` step. Step 6 also ends the settings callback that passes
   the admin's limit on to the SFU, which is closed by then.
 
 A second SIGTERM/SIGINT exits immediately with code 1. 06 sets systemd `TimeoutStopSec=20` and compose
@@ -1193,7 +1210,7 @@ The only place (with `cmd/isshoni` and `servertest`, §2) that imports 01's `sig
 | `ops.LiveSource`, `ops.AccountsSource`, `ops.Prober` | hub + SFU, 03's `API.DashboardAccounts`, `SFU.Probe` | §11.4, §7.7 |
 | Offline DB functions of `ops` (backup, restore) and `ops/doctor` (`schema`) | 03's `store.LatestSchemaVersion`, `store.InspectFile`, `store.BackupFile` | passed as function values (§2); `cmd/isshoni` does the same for offline commands (§12.3, §12.4, §13.1) |
 | `push.Store` | 03's store | §14.7; `store.ErrNotFound` becomes nil in `RecordResult` and `Delete`, and `""` with a nil error in `Meta` |
-| `push.Options` | built by the wiring | `Subject` = `push.DeriveSubject(push.subject, tls.acme_email, Site.Origin)`; `VAPID` = `SecretStore.VAPID`; `OwnAddrs` = the detected `PublicAddrs.V4` and `V6`; `Store` = the `push.Store` row; `Sender` = `Deps.PushSender`; `Now` = `Deps.Now` (the store's clock, for `last_success_at`, the prune and the TTLs); `Resolver` = `Deps.Resolver`; `Metrics` = `ops.Metrics.Registerer()` (README S85; nil until then) (§14.1, §14.3, §14.5) |
+| `push.Options` | built by the wiring | `Subject` = `push.DeriveSubject(push.subject, tls.acme_email, Site.Origin)`; `VAPID` = `SecretStore.VAPID`; `OwnAddrs` = the detected `PublicAddrs.V4` and `V6`; `Store` = the `push.Store` row; `Sender` = `Deps.PushSender`; `Now` = `Deps.Now` (the store's clock, for `last_success_at`, the prune and the TTLs); `Resolver` = `Deps.Resolver`; `Metrics` = `ops.Metrics.Registerer()` (README S85) (§14.1, §14.3, §14.5) |
 | `push.enabled=false` | – | the wiring passes `httpapi.Deps.Push = nil` and `auth.Options.Alerts = nil`, and does not build or start `push.Service`: it never calls `push.New`, which refuses `Options.Enabled == false` with `push.ErrDisabled` (§14.3); 03 then answers `push_unavailable` and omits `push` from `/info` |
 | REST routes of `ops` and `push` | 03's `API.Handle` | each typed `ops`/`push` function is wrapped with `httpapi.DecodeJSON`/`WriteJSON`/`WriteError` and registered through `API.Handle` with the principal from `httpapi.PrincipalFrom` (§2): `POST /api/v1/conntest` (User), `GET /api/v1/admin/dashboard`, `GET\|POST /api/v1/admin/doctor`, `GET /api/v1/admin/bandwidth` (Admin) |
 | Admin socket handlers | 03's `auth.Service`, `store.DB` | 03 §12.6 table |
@@ -1247,7 +1264,8 @@ table has them; these are the points the table leaves open, and what is still to
 - **`GET /v1/status`** on the admin socket: the site, the listeners and the public addresses are copied when the
   server has bound everything; the certificate, the live counts and the uptime are read at each call. The
   advertised media addresses, the `listen.ice_*` listeners and the media sockets' buffers are there since the
-  SFU is (README S59, below); transfer and the release check come with README S85.
+  SFU is (README S59, below); the month's transfer, the release check's result and the `metrics.listen` listener
+  since README S85 (below).
 - **The server's own background work** hangs on one context that the shutdown's step 6 cancels (§6.4): the admin
   socket's `Serve`, 03's janitor (`auth.RunJanitor`), doctor's own runs (`ops.Doctor.Run`, below), the periodic
   look at the public addresses (§7.4), and the reads behind hooks that have no context (the `db` check,
@@ -1261,27 +1279,24 @@ table has them; these are the points the table leaves open, and what is still to
     the status, so the text never belongs to another error than the code;
   - `DoctorOptions.Meta` is `metaStore`, the `ops.MetaStore` over 03's meta table: `GetMeta` and `SetMeta` in
     one short transaction each, and `store.ErrNotFound` read as `""`. `ops.Transfer` and `ops.ReleaseCheck` take
-    the same adapter when README S85 wires them;
+    the same adapter since README S85 wired them;
   - the Doctor is the admin socket's (`AdminOptions.Doctor`, so `isshoni doctor` reaches the running server), and
     `Doctor.Run` is one of the server's background goroutines: it loads the last report from the meta table at
     once and runs doctor 20 s after the start and then daily.
 
-  The REST routes (`GET|POST /api/v1/admin/doctor`, `GET /api/v1/admin/bandwidth`) and the dashboard's summary
-  and alert come with README S85, over this same Doctor. Until transfer and the release check are wired, a run
-  inside the server has `transfer` as `skip` (`skip.not_reported`) and `release` as `ok` with
-  `release.not_checked`. `TestDoctorOverTheAdminSocket` and `TestMetaStore` cover it. The restore command that
-  `serve` prints when it refuses a newer schema (§6.1 step 4) is `doctor.RestoreCommand`, the one doctor's
-  `schema` check prints, so there is one copy of it.
-- **Not wired yet**, each with a stand-in that needs no code elsewhere (the SFU's row left this table with
-  README S59, and the push row, `signal.Deps.Push`, `auth.Options.Alerts` and `httpapi.Deps.Push`, with README S71;
-  both below):
-
-  | What | Until | Meanwhile |
-  |---|---|---|
-  | `push.Options.Metrics` (`isshoni_push_sent_total`, §11.2) | README S85 | the push service counts its results for nobody |
-  | `ops.Metrics` as the router's observer and the hub's registerer; the REST routes of `ops` other than `POST /api/v1/conntest` (README S80 wired that one, `wireConnTest`) | README S85 | `signal.Deps.Metrics` is nil; with `metrics.enabled` the server logs a warning that nothing listens on `metrics.listen` |
-  | Transfer accounting and the release check in `serve` (built in README S55, §11.3, §11.5) | README S85 | nothing counts or checks |
-
+  The REST routes (`GET|POST /api/v1/admin/doctor`, `GET /api/v1/admin/bandwidth`) and the dashboard's summary and alert
+  came with README S85, over this same Doctor. Until then transfer and the release check weren't wired, and a run inside
+  the server had `transfer` as `skip` (`skip.not_reported`) and `release` as `ok` with `release.not_checked`; since S85
+  both read what the status reports. `TestDoctorOverTheAdminSocket` and `TestMetaStore` cover it. The restore command
+  that `serve` prints when it refuses a newer schema (§6.1 step 4) is `doctor.RestoreCommand`, the one doctor's `schema`
+  check prints, so there is one copy of it.
+- **Not wired yet**: nothing since README S85. The table that stood here listed what waited for a later slice,
+  each with a stand-in that needed no code elsewhere: the SFU's row left it with README S59; the push rows
+  (`signal.Deps.Push`, `auth.Options.Alerts`, `httpapi.Deps.Push`) with README S71; and the last three,
+  `push.Options.Metrics`, `ops.Metrics` as the router's observer and the hub's registerer with the REST routes of
+  `ops` other than `POST /api/v1/conntest` (README S80 wired that one, `wireConnTest`), and the transfer accounting
+  and the release check in `serve`, with README S85 (below). Until S85 `metrics.enabled` only gave a warning that
+  nothing listened on `metrics.listen`.
 - The tests are `wire_test.go` (each adapter against a fake, and the ones over 03 once more against the real
   service), `wiring_test.go` (in `servertest`: log in over REST, `/ws` joins Lounge, a logout closes that
   session's socket with `session_revoked`) and `wiring_store_test.go`.
@@ -1316,7 +1331,7 @@ the tests in `media_test.go` and in `internal/server/itest`).
   `internal/client/signal` on `/ws` with its cookie, `publish.Publisher` with `fake.Source` as the pub PC and an
   `sfutest.Viewer` as the sub PC, against `servertest`. Cases 1–3 and 9 of 01 §19 are there, the ICE-TCP checks
   of §17 (`TestICETCPVia443`, and `TestICETCPVia7882` for off mode), and `TestShutdownWithMedia`, with a
-  goroutine leak check for the package. The metric assertion of the ICE-TCP test comes with README S85.
+  goroutine leak check for the package. README S85 added the metric assertion of the ICE-TCP test (§17).
 
 **What README S71 wired** (wiring v3: Web Push in `serve`; `wirePush` and the adapters in `wire.go`, the shutdown
 step in `server.go`, the tests in `push_test.go`, `wire_test.go` and `servertest/push.go`).
@@ -1350,6 +1365,54 @@ step in `server.go`, the tests in `push_test.go`, `wire_test.go` and `servertest
   table test per adapter (`TestPushNotifier`, `TestPushAPI`, `TestPushStore`, `TestPushPrefNamesMatchStore`). The
   rotation tests (`TestRotateSecrets`, `TestRotateExactlyTheNamedKeys`) see the VAPID purge and the new key in
   `GET /info`, and `TestShutdownOrder` the `push` step.
+
+**What README S85 wired** (wiring v4: the ops data; `newMetrics`, `wireOps`, `wireOpsRoutes` and the adapters at the
+end of `wire.go`, the listeners in `server.go` and `http.go`, the tests in `ops_test.go`, `opswire_test.go`,
+`itest/metrics_test.go` and `itest/tcp_test.go`).
+- **The rows `httpapi.RouteObserver`, `ops.Policy`, `ops.LiveSource` with `ops.AccountsSource`, the REST routes of
+  `ops` and Metrics** are as the table has them, and `push.Options.Metrics` and the hub's `Deps.Metrics` are
+  `ops.Metrics.Registerer()`. **`ops.Metrics` is built first, on every server** (`newMetrics`), `metrics.enabled`
+  or not, because the SFU, the push service and the hub register their series on it as they are built; only the
+  listener depends on the key (`Addrs.Metrics`, §6.1 step 6). It reads readiness, the transfer counter, the
+  multiplexer's outcomes and the certificate's expiry at every scrape (§11.2).
+- **`sfuCollector`** is the adapter over `SFU.Metrics()` (§11.2), registered when the SFU is built. It builds every
+  series with `prometheus.NewConstMetric` and sends an invalid metric for one that can't be built (a label value
+  that is not UTF-8), so a bad value costs that series and a WARN line, never a panic in the registry's gathering
+  goroutines, which would end the server (`TestSFUCollector`, `TestSFUCollectorBadLabel`).
+- **One transfer counter** (`netx.TransferCounter`, made by `New`) on the 443 multiplexer (TLS as `web`, ICE-TCP as
+  `media_tcp`), on `listen.http` and on the Transport (§11.3). `listen.http` counts through a counting listener in
+  `internal/server` (`countWeb`), because netx has no such wrapper for plain HTTP; in off mode that is the app
+  itself, in the TLS modes the ACME challenges and redirects of port 80.
+- **`wireOps`** builds `ops.Transfer` and `ops.ReleaseCheck` on every server, with a site or without: the bytes on
+  the wire are counted and the releases looked at either way. Both read the policy through `opsPolicy` at every
+  tick, keep their state through `metaStore`, and use `Deps.Now` as their clock (nil: `time.Now`). The transfer
+  alert goes to the admins through `opsAlerter`, an adapter over `push.Service.AdminAlert`; a server without push
+  only logs it, and the dashboard shows it either way. `Transfer.Flush` is the admin socket's `DataDir.Flush`, so
+  a backup holds this month's bytes as they are. Both run with the server's background work; the shutdown ends the
+  transfer accounting in a step of its own (§6.4).
+- **`updates.release_url` is checked before the start** (`releaseURLProblem`, with `ops.CheckReleasesURL`): a value
+  that the release check would refuse is a config error with the value's user info redacted (`ops.RedactURL`), so
+  `serve` exits 78 like on any config error (§4.5), not with a start failure in step 8.
+- **`wireOpsRoutes`** (only on a server with a site, which has the REST API) builds `ops.Dashboard` and registers
+  `GET /api/v1/admin/dashboard`, `GET|POST /api/v1/admin/doctor` and `GET /api/v1/admin/bandwidth` for admins (403
+  `forbidden` for a member, 401 without a session; `TestOpsRoutesForAdminsOnly`), each a typed function of `ops` wrapped
+  by `opsRoute` (its answer through `WriteJSON`, its error through `WriteError`). **`POST /api/v1/admin/doctor` raises
+  its own read deadline to 3 minutes** before it runs (`doctorRouteDeadline`): a run takes up to 2 minutes (§13.1), and
+  the router's 30 s read deadline (§9.3) would end the request's context under it.
+- **The dashboard's sources** (§11.4): the status is the admin socket's (`statusSource`, which since S85 also has
+  the month's transfer and the release check's result, so doctor's two checks read them); `liveSource` joins 01's
+  `Hub.Snapshot()` and 02's `SFU.Snapshot()` on the connection id, and takes each room's current name from 03's
+  store under a budget of its own (250 ms of the source's second; a slow or failed read keeps the hub's names,
+  which lag a rename, rather than losing the whole section); `accountsSource` is 03's `API.DashboardAccounts`; the
+  public addresses are the last periodic look's (§7.4); `minClientVersion` is read at every snapshot.
+- **Tests**: `TestOpsRoutesForAdminsOnly`, `TestDashboardInServer`, `TestDashboardRoutesNeedASite`,
+  `TestMetricsEndpoint`, `TestMetricsOff`, `TestPushMetricsNeedPush`, `TestMetricsPortInUse`, `TestTransferAccounting`
+  (`ops_test.go`); `TestLiveSource`, `TestOpsAdapters`, `TestReleaseURLProblem` and the collector's two
+  (`opswire_test.go`); `TestMetricsSeries` in `itest` (after a session with everything the exit test measures, 06 §12.3,
+  the endpoint has each of its series), and the metric and dashboard assertions of `TestICETCPVia443` and
+  `TestICETCPVia7882` (§17). The integration fixed `cmd/isshoni`'s `TestServeLogger`, which asserted the warning that
+  S85 removed and bound the default 9469: it checks the warning about `listen.https` in off mode now, and
+  `listen_metrics` in the ready line, on port 0.
 
 ## 7. Networking (`internal/server/netx`)
 
@@ -1786,7 +1849,7 @@ text above leaves a choice:
 | ICE-TCP connections per IP | 64 across 443 and 7882 |
 | ICE source addresses per ufrag (review R3) | 64 distinct remote transport addresses (protocol, IP, port) per local ICE ufrag, across UDP and ICE-TCP, every UDP socket and both TCP ports. Pion makes a peer-reflexive candidate for every new source of a valid Binding request and has no cap of its own (02 §12). Only STUN with a USERNAME counts: netx reads its ufrag as Pion's muxes route it, at every UDP socket below the UDP mux and at the first RFC 4571 frame of each ICE-TCP connection (before Pion's TCP mux takes it). From the 65th address on such STUN is dropped (no Binding response, no prflx candidate, no address-map entry) and the ICE-TCP connection closed. A ufrag counts from the first `GetConn`/`GetConnByUfrag` of the Transport's muxes (gathering) until `RemoveConnByUfrag` (close, ICE restart, failed), and a removed ufrag is never counted again: a restart or close cancels Pion's gathering without waiting, so the old ufrag can still reach the muxes after its removal (Pion closes that connection at once and its agent rejects the ufrag's STUN). This relies on Pion never reusing a ufrag (random per agent and restart; the server never sets ICE credentials); netx remembers the last 1024 removed ufrags. STUN for a ufrag the muxes don't serve goes to Pion as before (the UDP mux drops it, the TCP mux holds the connection 30 s at most, within the per-IP limit). Sources are counted before Pion checks MESSAGE-INTEGRITY (netx doesn't know the password): someone who sees a PC's ufrag on the path and spoofs UDP sources can use up its 64 slots; sources already admitted keep working and an ICE restart (new ufrag) starts over. Logged at debug once per ufrag, without the ufrag or address |
 | HTTP servers | `ReadHeaderTimeout` 10 s, `IdleTimeout` 120 s, `MaxHeaderBytes` 16 KiB, no server `ReadTimeout`/`WriteTimeout` (WebSocket) |
-| Main server request read deadline | 30 s per request via `http.ResponseController`, except `/ws` (§9.3) |
+| Main server request read deadline | 30 s per request via `http.ResponseController`, except `/ws` (none after the upgrade) and `POST /api/v1/admin/doctor` (3 min, README S85) (§9.3) |
 | Port 80 server | `ReadHeaderTimeout` 5 s, `IdleTimeout` 30 s |
 | JSON request bodies | 64 KiB default (`httpapi.DecodeJSON`) |
 | UDP socket buffers | 8 MiB requested |
@@ -2163,7 +2226,10 @@ func (g *Gate) ShuttingDown() bool // a nil *Gate is serving
    as it likes. The router's `/ws` mount clears the deadline (`SetReadDeadline(time.Time{})`) before it hands the
    request to 01's hub, so 01 needs nothing. Every `ResponseWriter` wrapper in the chain implements
    `Unwrap() http.ResponseWriter` so the controller reaches the connection. Main server only; the admin socket streams
-   large backup and restore bodies and sets no deadline.
+   large backup and restore bodies and sets no deadline. **One route raises it** (README S85, §6.6):
+   `POST /api/v1/admin/doctor` sets its read deadline to 3 minutes before it runs, because a doctor run takes up
+   to 2 minutes (§13.1), and a read deadline that passes ends the request's context: net/http's background read of
+   the connection fails then.
 4. **Transfer/metrics**: response bytes and status class per route pattern, reported to `RouterOptions.Observer`.
 5. **Gate**: shutting down → 503 `server_shutdown` (`Retry-After: 5`). Exempt: `/healthz`, `/readyz`.
 6. **Host check**: `Host` must equal `Site.Host` (or, when `Site.Dev`, any `localhost`/`127.0.0.1`/`[::1]` host so the
@@ -2391,7 +2457,7 @@ registers an adapter over 02's `SFU.Metrics()` for the `isshoni_sfu_*` names (02
 counted); it adds no labels of its own. Its table test covers every 02 §13 name, including
 `isshoni_sfu_ingress_duplicates_total` (from `IngressDuplicates`). No per-user labels.
 
-**As README S55 built it** (`ops/metrics.go`; the wiring builds and serves it with README S85).
+**As README S55 built it** (`ops/metrics.go`; README S85's wiring builds it on every server and serves it, §6.6).
 
 ```go
 package ops
@@ -2435,6 +2501,10 @@ func (m *Metrics) Shutdown(ctx context.Context) error // §6.4 step 5
   At most 4 scrapes are answered at once; one more gets 503. A collector that fails during a scrape costs its own
   series and a WARN line, not the scrape. There is no write timeout, because a CPU profile runs as long as its
   request asks; on shutdown, requests in flight may finish until the step's context ends.
+- **The SFU's adapter as README S85 built it** (`sfuCollector` in `wire.go`): one `SFU.Metrics()` per scrape, every
+  series built with `prometheus.NewConstMetric`, and a series that can't be built (a label value that is not
+  UTF-8) sent as an invalid metric. `MustNewConstMetric` would panic there, in a goroutine of the registry's that
+  has no recover, and end the server; an invalid metric is the failing collector of the bullet above.
 
 ### 11.3 Transfer accounting and alerts
 
@@ -2461,7 +2531,13 @@ func (c *TransferCounter) Add(p Path, egress bool, n int)
 func (c *TransferCounter) Totals() map[Path]struct{ Egress, Ingress uint64 }
 ```
 
-**As README S55 built it** (`ops/transfer.go`; the wiring runs it with README S85).
+**As README S55 built it** (`ops/transfer.go`; README S85's wiring runs it on every server, §6.6).
+
+- **Where the bytes are counted, as README S85 wired it**: the 443 multiplexer counts its TLS connections as `web`
+  and its ICE-TCP ones as `media_tcp`; the Transport counts its UDP sockets as `media_udp` and the connections of
+  `listen.ice_tcp` as `media_tcp`; and **`listen.http`'s bytes are `web` too**, the app in off mode and port 80's
+  challenges and redirects in the TLS modes, through a counting listener in `internal/server` (`countWeb`), since
+  netx has no wrapper for plain HTTP. The metrics listener's own bytes are not counted.
 
 ```go
 package ops
@@ -2608,7 +2684,51 @@ type Policy interface {
   `tls.renewal_failing`, `doctor.fail`, `dashboard.source_failed`.
 - Alert severities are `info`, `warn` and `error` (`api.AlertSeverity`). The four alerts that README S55 built
   have theirs: `transfer.80` `warn`, `transfer.100` `error` (§11.3), `release.update` `info`,
-  `release.security_update` `warn` (§11.5). The other four get theirs with the dashboard (README S85).
+  `release.security_update` `warn` (§11.5). README S85 gave the other four theirs (below).
+
+**As README S85 built it** (`ops/dashboard.go`, `Dashboard.Snapshot`; the sources in `wire.go`, §6.6; the golden
+file `ops/testdata/dashboard.json`), where the text above leaves a choice:
+- **The alerts, their severities and `params`**, in this order in `alerts`:
+
+  | Code | Severity | `params` | When |
+  |---|---|---|---|
+  | `dashboard.source_failed` | `warn` | `{source}` | one per source that failed in this snapshot (below) |
+  | `transfer.80`, `transfer.100` | `warn`, `error` | `{month, alertGb}` | §11.3 |
+  | `release.update`, `release.security_update` | `info`, `warn` | `{version}` | §11.5 |
+  | `public_ip.changed` | `warn` | `{family, from?, to}`: `family` is `ipv4` or `ipv6`; `from` is left out when the server started without an address of that family | one per family whose public address, as the last periodic look found it (§7.4), is not the one the server started with and still uses in its candidates and its site |
+  | `tls.renewal_failing` | `warn` while the certificate is valid and served; `error` once it has expired or is no longer served | `{code, notAfter}`: the certificate error code of §8.7 (for 05's text and fix) and the certificate's expiry | auto and ip modes only, on a server that has had a certificate and whose last attempt at a new one failed: doctor's rule for its code `tls.renewal_failing` (§13.2). A first order that fails is no renewal: the TLS object shows it (`ready` false, `lastErrorCode`) |
+  | `doctor.fail` | `error` | `{fail, checks}`: the number of failing checks and their ids | while the last full report has failures (README S60, §13.1) |
+
+- **The sources, and `params.source`.** Each part of the document comes from one source, whose name is a wire
+  value that 05 renders and that is never renamed: `server` (the status: the server object but its process and
+  its update), `process`, `rooms` (the rooms, and the clients counted from them), `media`, `transfer`, `update`
+  (`server.update` and the release alerts), `doctor` and `accounts`. A source **fails** when it returns an error
+  (the status, the accounts), panics (a bug, which costs its section and not the response), or has not returned
+  when its 1 s ends. That second is only the source's context: nothing cuts off a source that doesn't watch it,
+  and snapshots take turns, so one that hung would hold up every dashboard request. Every source therefore answers
+  promptly by itself: all but the store reads (the rooms' names, the accounts) read memory, and those honour their
+  context. A failed source leaves its section empty (an empty list, zero totals, an absent object), adds its
+  `dashboard.source_failed`, and is logged once (WARN) until it works again. The response never fails for a
+  source; its only error is the caller's own context, for a client that went away.
+- **The snapshot** is built by one caller at a time and served again for 1 s, so the sources are asked at most
+  once a second however many pages poll. `generatedAt` and the cache use the dashboard's clock, which the wiring
+  leaves at the wall clock.
+- **`clients[]`** counts the connections of the rooms by `kind` and `version`, sorted by kind and then version. A
+  client is `outdated` when its version is below the setting `minClientVersion` **or below the server's own
+  version**: a web client older than the server it talks to is a tab that was not reloaded since an upgrade. A
+  version that is not SemVer is never outdated, and none is while the server's own version isn't SemVer (a dev
+  build).
+- **`rooms[]`**: every room of the hub with someone in it, in the hub's order, with its **current name from the
+  store** (the hub's lags a rename), read under 250 ms of the source's second; a slow or failed read keeps the
+  hub's names in a whole section. A share the SFU doesn't have (yet, or any more) is not listed, while its
+  watchers still count in `participants[].watching`. **`codec` is `""` while the SFU doesn't know the share's
+  profile**, not `"h264/"`.
+- **`server.process`**: CPU seconds and resident memory from Prometheus's process collector (the one the metrics
+  endpoint has too, so both agree; 0 where the platform has none), the CPUs and goroutines from the runtime.
+- Tests: `TestDashboardGolden`, `TestDashboardSourceFailed` (an error, a panic and a source past its second each cost
+  their section and add the alert), `TestDashboardCache`, `TestDashboardWithoutSources`, `TestClientCounts`,
+  `TestPublicIPAlerts`, `TestTLSAlerts` and `TestProcessReader` (`ops/dashboard_test.go`); in the server
+  `TestDashboardInServer` and `TestLiveSource` (§6.6).
 
 ### 11.5 Release check
 
@@ -2625,7 +2745,9 @@ type Policy interface {
 - The result is kept in memory and in 03's `meta` key `ops.release_check` (JSON), so the dashboard shows it after a
   restart. Failures log at debug and retry at the next tick.
 
-**As README S55 built it** (`ops/release.go`; the wiring runs it with README S85).
+**As README S55 built it** (`ops/release.go`; README S85's wiring runs it on every server, §6.6, with `Deps.Now`
+as its clock and the URL checked before the start: an `updates.release_url` it would refuse is a config error,
+§4.5).
 
 ```go
 package ops
@@ -2883,7 +3005,9 @@ isshoni-backup-0.3.0-20260929T101500Z.tar.gz
     written ("… is a pipe or a device of another user (uid N) …"). Links are followed, so `--out /dev/fd/3` and
     `--out /dev/null` work. The type and the owner are checked with `stat` before the open, so that another
     user's FIFO is never opened, and again with `fstat` on the opened file, the one that would get the archive;
-  - where the system has no Unix owners (Windows, a development platform only), an existing `--out` is exit 7;
+  - where the system has no Unix owners (Windows, a development platform only), an existing `--out` is exit 7 (the
+    owner lookup, `fileOwner`, is in `backup_unix.go`, built for Unix like config's `sys_unix.go`; the one in
+    `backup_other.go` knows no owner, so `GOOS=windows go vet` still passes);
   - `--out -` is unchanged: stdout is no file at a path, and nothing about it is checked but the terminal.
     A pipe that a shell made for a `sudo` command belongs to the user who ran `sudo`, not to root, so
     `sudo isshoni admin backup --out /dev/stdout | …` is refused; `--out -` is the form for stdout.
@@ -3097,7 +3221,8 @@ integration, §6.6). One `Doctor` serves three callers, and **one run is under w
   parameter that is left out has the default session's value, and one that is no number or out of range is 400
   `bad_request` with `params.field`. The ranges are `doctor.BandwidthInputProblem`'s: `people` 1 to 1000,
   `sharing` 0 to `people`, `thumbnails` 0 to 100, a known `quality` and `preset`, `hours` above 0 up to 8784.
-  The REST routes themselves come with README S85 (§6.6).
+  README S85 registered the REST routes (§6.6), for admins only; `POST /api/v1/admin/doctor` raises its own read
+  deadline to 3 minutes, since a run may take 2 (§9.3).
 
 ```go
 package doctor
@@ -3886,6 +4011,7 @@ no tokens, SDP, push endpoints or usernames.
 | `netx` transport | Counting `PacketConn` keeps `AddrPortReaderWriter`; byte counts match; port 0 reuse; interface filter globs; buffer read-back and the one warn line when it is below target; 7882/tcp per-IP ICE limit shared with 443 (65th connection across both closed, also from different addresses in one /64); `Advertised` holds post-rewrite addresses with `Via` `udp`/`tcp443`/`tcp7882`, and equals the candidates of a real pion offer; with `include_loopback` and `ipv6`, `::1` is advertised for UDP only (no `tcp` entry, no `tcp6` type from it alone, `IPFilter` drops it; §7.6); a setter called after `Apply` wins |
 | `netx` public IP | Fake STUN (pion/stun) + fake interfaces: each row of §7.4's table; timeouts; literal config skips STUN for the result |
 | `netx` rewrite | Rules/filters for each row of §7.5 (direct, 1:1 NAT, Docker bridge, home LAN Append, IPv6 literal) |
+| `netx` source guard (README F06, §7.3, §7.8; `srcguard_test.go`) | The counts (`TestSourceGuardCounts`: 64 distinct sources per known ufrag, a source admitted once costs nothing again, a UDP and a TCP source on one address and port are two, ufrags count apart, an unknown ufrag passes, a forgotten ufrag's count is gone for good, an ICE restart's new ufrag starts at zero); removed ufrags never known again (`TestSourceGuardRemovedUfrags`); `TestCanonicalSource`; the parsing (`TestStunUfrag`, `TestAdmitUDP`: only STUN with a USERNAME is judged; `TestFirstFrameGate`: the first frame and what follows byte for byte however Pion reads it, unless it names a ufrag past its limit or is too long); the acceptance through a real Pion agent, 1000 sources over UDP on two sockets (`TestSourceGuardUDPAgent`) and over ICE-TCP on 7882, 443 and both (`TestSourceGuardTCPAgent`): 64 responses and 64 peer-reflexive candidates, nothing for the rest; `TestSourceGuardRemoveConnByUfrag`, `TestSourceGuardNormalClient` (a client with host and server-reflexive candidates in both families is refused nothing) and `TestSourceGuardRestartWhileGathering`. **Fuzz targets** (README F14, `srcguard_fuzz_test.go`, seeds in `testdata/fuzz`): `FuzzStunUfrag` (for any packet, `stunUfrag` returns the ufrag Pion's UDP mux routes it by, or nothing when the mux doesn't route it by ufrag, without changing the packet and within its allocation bound, and `admitUDP` counts the source exactly then) and `FuzzFirstFrameGate` (whatever a connection sends and however it arrives, the gate takes no more than the first frame and allocates within its bound, refuses a frame over `maxFirstFrame` or one Pion would route to a known ufrag with no slot left for the address, fails a stream that ends inside the first frame, and otherwise hands the reader every byte and has counted the address). The allocation bound is linear: 48 bytes per input byte for `stunUfrag`, which decodes the message as Pion's muxes do, plus a constant; two seeds with 14593 and 16381 attributes, all empty but a USERNAME, pin its worst case (43.3 bytes per byte measured) in every `go test`. **`TestPionRoutesLikeReference`** sends every seed through a real Pion UDP mux and TCP mux and checks that each reaches its ufrag's connection exactly when the targets' reference (`pionUfrag`, `pionTCPTakes`, a copy of pion/ice v4.4.7's routing) says so, so a pion/ice update that changes the routing fails here first |
 | `tlsmgr` | Manual: load, reload on file change and SIGHUP, bad new pair keeps the old, key mismatch, expiry warning; `HTTPHandler`: ACME path passthrough, 503 while not ready, 308 to config host (ignores request Host), off-mode passthrough; ACME problem → hint code table |
 | `httpapi` | Middleware order; read deadline: a request body trickled past it (shortened in tests) is cut, and `/ws` has no deadline after the upgrade; security headers per response type (`/sw.js` carries the HTML CSP, with `connect-src` including `'self'`; other non-HTML files carry `default-src 'none'`); HSTS only with domain+TLS; host check incl. dev localhost; trusted-proxy XFF (right-most untrusted) and ignoring XFF in non-off modes; error envelope; `DecodeJSON` limits; SPA table of §9.5 (asset 404, dotted path 404, deep link → index 200, `/setup` → 404 via hook, ETag/304, `.br` negotiation, MIME types without `/etc/mime.types`) |
 | `logx` | `Secret` redacted in text and JSON handlers, every fmt verb except `%p` and `%w` (fmt prints both raw; vet rejects only `%w`), `json.Marshal`; `ReplaceAttr` key list; pion bridge drops SDP-like lines and rate-limits; format auto-detection |
@@ -3909,6 +4035,9 @@ no tokens, SDP, push endpoints or usernames.
   (no 443 multiplexer there, §8.5). README S85 adds the metric assertion to this test:
   `isshoni_sfu_selected_transport{transport="tcp443"}` counts both PCs. S7's `servertest` check (README S44) runs
   before that wiring, so it uses a stub `/ws` handler and a raw RFC 4571 STUN frame on the 443 port, not media.
+  As README S85 added it (`wantTransport`, with `metrics.enabled` on a port of its own): the metric counts both
+  PCs, and the admin dashboard has them as `tcp443` in its totals (`media.peerConnections`) and on each
+  connection; `TestICETCPVia7882` asserts the same with `tcp7882`.
 - **Connection test over TLS**: `servertest.Options{TLS: true}`; `POST /api/v1/conntest` with `tcp443` returns an
   answer that connects through the 443 multiplexer (README S80, `TestConnTestOverTLS`; §7.7 lists the others). The
   browser e2e harness runs in off mode only, so this Go test is the only `tcp443` probe check (05 §19.3).
@@ -3994,7 +4123,10 @@ Packages and names (exact):
   `WriteError(w, r, err)`, `DecodeJSON(w, r, dst, maxBytes)`, `Gate`; the global middleware order of §9.3.
 - `internal/server/ops`: `Health` (`AddCheck`, …), `Metrics` (`Registerer()`, `ObserveRoute`), `LiveSource`,
   `AccountsSource`, `Policy`, `Prober`, the typed dashboard, doctor, bandwidth and conntest functions (§2), admin
-  socket API (§12.2) and client (`ops.DialAdmin(path) *AdminClient`).
+  socket API (§12.2) and client (`ops.DialAdmin(path) *AdminClient`). Since README S85 also `Dashboard`
+  (`NewDashboard`, `DashboardOptions`, `Snapshot`), its source interfaces `TransferSource`, `UpdateSource` and
+  `DoctorSource`, the `DashboardSource*` names of `params.source` (§11.4), and `CheckReleasesURL` and `RedactURL`
+  (§4.5, §11.5).
 - `internal/server/ops/doctor`: `Run`, `Bandwidth`, `RenderText`, `CheckIDs`, `Env`, `DBFiles`, `DBInfo`.
 - `internal/server/push`: `New(ctx, opts)`, `Options` (with `Resolver`, `OwnAddrs`, `Metrics`), `ErrDisabled`,
   `DeriveSubject`, `Service` (`ShareStarted`, `AdminAlert`, `VAPIDPublicKey`,
@@ -4005,7 +4137,8 @@ Packages and names (exact):
   on: the 443 multiplexer, nil in off mode; and from S59 on the bound ICE listeners, **`ICEUDP`**, a
   `*net.UDPAddr` for `listen.ice_udp`, the first of its sockets, and **`ICETCP`**, a `*net.TCPAddr` for
   `listen.ice_tcp`: each nil when its listener is off, both nil on a server that started without media sockets,
-  §6.2; ICE-TCP on the HTTPS port has no address of its own), `ShutdownReason`, `ErrRestartRequested`,
+  §6.2; ICE-TCP on the HTTPS port has no address of its own; from S85 on **`Metrics`**, the metrics listener, nil
+  unless `metrics.enabled`), `ShutdownReason`, `ErrRestartRequested`,
   `ErrShutdownForced`, `NeedsOperator`, `Deps`, and the wiring table of §6.6.
 - `internal/server/tlsmgr` (S44; §8.2): `Options` (with `PublicIPv6`, `Site`, `HTTPAddr`, `HTTPSAddr`, `Resolver`),
   `New`, `Manager` (`Start`, `Shutdown`, `TLSConfig`, `HTTPHandler`, `Reload`, `Status`, `Ready`), `Status`, and the
@@ -4237,7 +4370,9 @@ Decided after group 10 (an engineering call the owner delegated; README §6 (1))
    endpoints that never answer could hold the four shared push workers, fixed by the `push.test` lane, a test
    attempted once, one subscription per web session and 2 s dial and TLS-handshake timeouts (§14.2–§14.5, 03 §12.4.6;
    README F08); R5, `admin backup` without `--out` could write into a FIFO that another user placed at the default
-   name, which README F09 fixes in group 12 (§12.3).
+   name, which README F09 fixed in group 12 (§12.3): without `--out` whatever is at the default name is exit 7, and
+   an explicit `--out` FIFO or character device is written to only when its owner is the command's effective user
+   or root.
 
 Decided after group 11 (engineering calls the owner delegated; README §6 (2), (6)):
 
@@ -4247,3 +4382,20 @@ Decided after group 11 (engineering calls the owner delegated; README §6 (2), (
 11. **The connection test answers a missing or unknown transport with 422 `validation_failed`**, 03's rule for a
     bad body field, and maps 02's `sfu.bad_sdp` to 400 `bad_sdp` and `sfu.closed` to 503 `not_ready`; only the
     requests that get past the transport checks count toward its limit (§7.7, README S80).
+
+Decided after group 12 (engineering calls the owner delegated; README §6 (4), (5)):
+
+12. **The dashboard's four alerts of its own and its sources, as README S85 built them** (§11.4).
+    `dashboard.source_failed` is `warn` with `{source}`, the source names being wire values for 05 (`server`,
+    `process`, `rooms`, `media`, `transfer`, `update`, `doctor`, `accounts`); `public_ip.changed` is `warn` with
+    `{family, from?, to}`, one per family; `tls.renewal_failing` is `{code, notAfter}`, `warn` while the certificate
+    is served and `error` once it has expired or is not served, in auto and ip modes only; `doctor.fail` is `error`
+    with `{fail, checks}`. A source fails on an error, a panic or a second that ran out, and that second is
+    cooperative. `clients[].outdated` is also true below the server's own version, and `codec` is `""` while the
+    SFU doesn't know the profile.
+13. **Three choices of the ops wiring** (README S85). An `updates.release_url` that the release check would refuse
+    is a config error, exit 78, with its credentials redacted, not a start failure (§4.5); the transfer counters'
+    last flush is a shutdown step of its own, `transfer`, right after `tls` and inside step 6's 2 s (§6.4); and
+    `listen.http`'s bytes count as `web`, through a counting listener in `internal/server` (§11.3). With them, the
+    ready line names the metrics listener (`listen_metrics`, §6.1), and `POST /api/v1/admin/doctor` raises its read
+    deadline to 3 minutes for a run that may take 2 (§9.3).
