@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,6 +11,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
 
 	"github.com/MoonWX/isshoni/internal/server/store"
 )
@@ -45,37 +49,109 @@ func (p *serveProc) stop(t *testing.T) {
 	}
 }
 
-// SIGHUP does not stop serve. The reload it stands for (04 §6.5) is not built yet, and a process that does not
-// handle the signal dies of it, which systemd would count as a clean stop after `systemctl reload isshoni`. serve
-// says that a reload is not supported, once per signal, and goes on serving.
-func TestServeIgnoresSIGHUP(t *testing.T) {
+// reloadedLine is the start of the log line of a reload that applied log.level (server.Reload).
+const reloadedLine = `"level":"INFO","msg":"reloaded (SIGHUP)"`
+
+// openSocket opens an anonymous WebSocket on the server at base and closes it again. The hub logs the close at
+// debug level ("websocket closed"), which makes it a probe of the level the process logs at.
+func openSocket(t *testing.T, base string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	origin := strings.Replace(base, "127.0.0.1", "localhost", 1) // the dev site's origin
+	c, res, err := websocket.Dial(ctx, strings.Replace(base, "http://", "ws://", 1)+"/ws",
+		&websocket.DialOptions{HTTPHeader: http.Header{"Origin": {origin}}})
+	if res != nil && res.Body != nil { // nil after a successful Dial
+		_ = res.Body.Close()
+	}
+	if err != nil {
+		t.Fatalf("WebSocket to %s: %v", base, err)
+	}
+	_ = c.Close(websocket.StatusNormalClosure, "")
+}
+
+// SIGHUP reloads (04 §6.5): serve loads the config again, from its flags and its environment and the file as it is
+// now, and the server applies log.level and reads manual TLS files again (server's TestReloadManualCertificate);
+// every other change waits for a restart, and the log names those keys. A file with errors changes nothing, and
+// says so. The server never stops for the signal: a process that does not handle it dies of it, which systemd
+// would count as a clean stop after `systemctl reload isshoni`.
+func TestServeReloadsOnSIGHUP(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("needs signals")
 	}
 	t.Parallel()
-	p := startServe(t)
+	file := filepath.Join(t.TempDir(), "isshoni.toml")
+	write := func(text string) {
+		t.Helper()
+		if err := os.WriteFile(file, []byte(text), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("[log]\nlevel = \"info\"\n")
+	p := startServe(t, "--config", file)
 	base := p.waitReady(t)
-	const line = `"level":"INFO","msg":"reload is not supported yet; restart to apply changes"`
-	for n := 1; n <= 3; n++ {
+	hup := func() {
+		t.Helper()
 		if err := p.cmd.Process.Signal(syscall.SIGHUP); err != nil {
 			t.Fatal(err)
 		}
-		p.waitForLog(t, line, n)
-		if code, body := httpGet(t, base+"/healthz"); code != 200 || body != `{"status":"ok"}`+"\n" {
-			t.Errorf("GET /healthz after %d SIGHUPs = %d %q, want 200 ok", n, code, body)
-		}
+	}
+	const closed = `"msg":"websocket closed"`
+
+	// At info, the probe's debug line stays out of the log.
+	openSocket(t, base)
+	time.Sleep(200 * time.Millisecond)
+	if strings.Contains(p.logs(), closed) {
+		t.Fatalf("a debug line at log.level = info:\n%s", p.logs())
+	}
+
+	// The file says debug now, and takes a longer shutdown_timeout, which a reload does not apply.
+	write("shutdown_timeout = \"15s\"\n[log]\nlevel = \"debug\"\n")
+	hup()
+	p.waitForLog(t, reloadedLine, 1)
+	logs := p.logs()
+	if !strings.Contains(logs, `"msg":"reloaded (SIGHUP)","certificate":"not read: the certificate is not from files (tls.mode is not manual)","log_level":"debug"`) {
+		t.Errorf("the reload's line:\n%s", logs)
+	}
+	if !strings.Contains(logs, `"level":"WARN","msg":"the config has changes that a reload does not apply; restart isshoni to apply them","keys":["shutdown_timeout"]`) {
+		t.Errorf("no warning that names shutdown_timeout:\n%s", logs)
+	}
+	openSocket(t, base)
+	p.waitForLog(t, closed, 1)
+
+	// A file with an error is what a restart would refuse: nothing changes, and the log says why.
+	write("[log]\nlevel = \"loud\"\n")
+	hup()
+	p.waitForLog(t, `"msg":"reloaded (SIGHUP) without the log level"`, 1)
+	if logs := p.logs(); !strings.Contains(logs, `"msg":"reload: the config has errors: log.level is not reloaded`) ||
+		!strings.Contains(logs, `"key":"log.level"`) {
+		t.Errorf("the reload of a file with an error:\n%s", logs)
+	}
+	openSocket(t, base)
+	p.waitForLog(t, closed, 2) // still debug
+
+	// Back to info, and a few signals in a row: the server serves on.
+	write("[log]\nlevel = \"info\"\n")
+	for n := 2; n <= 4; n++ {
+		hup()
+		p.waitForLog(t, reloadedLine, n)
+	}
+	if code, body := httpGet(t, base+"/healthz"); code != 200 || body != `{"status":"ok"}`+"\n" {
+		t.Errorf("GET /healthz after the SIGHUPs = %d %q, want 200 ok", code, body)
 	}
 	if code, body := httpGet(t, base+"/readyz"); code != 200 || !strings.HasPrefix(body, `{"status":"ready"`) {
 		t.Errorf("GET /readyz after the SIGHUPs = %d %q, want 200 ready", code, body)
+	}
+	openSocket(t, base)
+	time.Sleep(200 * time.Millisecond)
+	if n := strings.Count(p.logs(), closed); n != 2 {
+		t.Errorf("%d debug lines of the probe, want 2: the level is info again\n%s", n, p.logs())
 	}
 	if logs := p.logs(); strings.Contains(logs, `"msg":"shutting down"`) {
 		t.Errorf("SIGHUP began a shutdown:\n%s", logs)
 	}
 	// It still stops when it is told to.
 	p.stop(t)
-	if n := strings.Count(p.logs(), line); n != 3 {
-		t.Errorf("%d lines about the reload for 3 SIGHUPs:\n%s", n, p.logs())
-	}
 }
 
 // A server that shuts down for a restart starts again in place (04 §6.5): the process re-execs itself, so the PID
@@ -179,11 +255,13 @@ func TestServeRestartsInPlace(t *testing.T) {
 		t.Errorf("%d restarts in place, want 3 (two rotations and a restore)\n%s", n, p.logs())
 	}
 
-	// A reload is still only answered: the process that the re-exec made watches SIGHUP like the first.
+	// The process that the re-exec made reloads on SIGHUP like the first: the signal was ignored across the exec,
+	// and the new serve takes it again.
 	if err := p.cmd.Process.Signal(syscall.SIGHUP); err != nil {
 		t.Fatal(err)
 	}
-	p.waitForLog(t, reloadNotSupported, 1)
+	p.waitForLog(t, reloadedLine, 1)
+	running("after a SIGHUP to the restarted server")
 	// The offline commands refuse while it runs: its admin socket answers, and it holds the data directory, which
 	// a command that looks at another socket finds out by the lock.
 	for _, args := range [][]string{

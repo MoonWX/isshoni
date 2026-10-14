@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -24,8 +25,9 @@ func serveCmd() *command {
 		help: "Runs the server in the foreground until it receives SIGTERM or SIGINT, then shuts down gracefully " +
 			"(clients see \"Server restarting…\" and reconnect on their own). systemd and Docker start it this way. " +
 			"A configuration or data problem that a restart can't fix exits 78. After a restore or rotate-secrets " +
-			"the server restarts in place, with the same process ID. A reload (SIGHUP) is not supported yet: restart " +
-			"the server to apply a changed configuration.",
+			"the server restarts in place, with the same process ID. SIGHUP (systemctl reload isshoni) reads the " +
+			"manual TLS certificate files and log.level again; every other change takes a restart, and the log " +
+			"names the keys that wait for one.",
 		config:          true,
 		listConfigFlags: true,
 		setup: func(*flag.FlagSet) runFunc {
@@ -33,9 +35,6 @@ func serveCmd() *command {
 		},
 	}
 }
-
-// reloadNotSupported is what serve logs for a SIGHUP.
-const reloadNotSupported = "reload is not supported yet; restart to apply changes"
 
 // runServe runs the server until SIGTERM or SIGINT (04 §6.1–§6.5). Step 1 of the startup sequence is here: a config
 // with errors exits 78 with every problem printed, and the logger is built (04 §10); server.New and Run do the
@@ -45,28 +44,30 @@ func runServe(ctx context.Context, inv *invocation, _ []string) error {
 	if err := configInvalid(inv); err != nil {
 		return err
 	}
-	// The level is a variable: `isshoni admin log-level` changes it at runtime through the admin socket. The server
-	// gets the variable as Deps.LogLevel and hands it to ops.NewLogLevel.
+	// The level is a variable: `isshoni admin log-level` changes it at runtime through the admin socket, and a
+	// reload sets the configured one. The server gets the variable as Deps.LogLevel and hands it to ops.NewLogLevel.
 	level := new(slog.LevelVar)
 	if l, ok := ops.ParseLogLevel(inv.cfg.Log.Level); ok { // validated by config; anything else stays at info
 		level.Set(l)
 	}
 	log := logx.New(logx.Options{Level: level, Format: inv.cfg.Log.Format, Out: inv.stderr})
+	// What the libraries write to the standard log package (certmagic does) goes into the same log.
+	defer routeStdLog(log)()
 
-	// SIGHUP is the reload of 04 §6.5 (06's unit: ExecReload=/bin/kill -HUP $MAINPID), which comes with the server
-	// hardening (README S90). Until then the signal must not do what it does to a process that doesn't handle it:
-	// end the server, which systemd would count as a clean stop. serve takes it, says so, and goes on. It is
-	// watched from here on, before the server starts, so a reload during a slow start is harmless too.
+	// SIGHUP is the reload of 04 §6.5 (06's unit: ExecReload=/bin/kill -HUP $MAINPID). The signal must never do
+	// what it does to a process that doesn't handle it: end the server, which systemd would count as a clean stop.
+	// It is taken from here on, before the server is built, and a reload that comes during a slow start waits for
+	// the start (server.Reload).
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	defer signal.Stop(hup)
-	defer logSignals(hup, func() { log.Info(reloadNotSupported) })()
 
 	srv, err := server.New(inv.cfg, log, server.Deps{LogLevel: level})
 	if err != nil {
 		// No stop signal is taken yet: SIGTERM still ends the process by itself, so there is nothing to release.
 		return serveExit(ctx, inv, log, err, nil)
 	}
+	defer onSignals(hup, func() { reload(ctx, inv, log, srv) })()
 
 	// SIGTERM joins SIGINT (main's context): systemd and Docker stop the server with it. The first signal starts
 	// the graceful shutdown; a second one exits at once with code 1 (04 §6.4).
@@ -92,16 +93,16 @@ func runServe(ctx context.Context, inv *invocation, _ []string) error {
 	return serveExit(ctx, inv, log, srv.Run(ctx), release)
 }
 
-// logSignals calls say for every signal on sigs until the returned function is called, which waits for the
-// watching goroutine. serve uses it for SIGHUP.
-func logSignals(sigs <-chan os.Signal, say func()) (stop func()) {
+// onSignals calls fn for every signal on sigs, one call after the other, until the returned function is called,
+// which waits for the watching goroutine (and a call of fn that is under way). serve uses it for SIGHUP.
+func onSignals(sigs <-chan os.Signal, fn func()) (stop func()) {
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Go(func() {
 		for {
 			select {
 			case <-sigs:
-				say()
+				fn()
 			case <-done:
 				return
 			}
@@ -111,6 +112,25 @@ func logSignals(sigs <-chan os.Signal, say func()) (stop func()) {
 		close(done)
 		wg.Wait()
 	}
+}
+
+// reload is serve's answer to SIGHUP (04 §6.5): it loads the config again, from serve's own flags and the
+// environment it started with and the file as it is now, so that a flag or an ISSHONI_* variable still wins over
+// the file (04 §4.1), and hands it to the server, which reads the manual TLS files again, applies log.level and
+// logs the keys that changed and take a restart. A config that can't be loaded at all is reported, and only the
+// certificate files are read again.
+func reload(ctx context.Context, inv *invocation, log *slog.Logger, srv *server.Server) {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	cfg, err := config.Load(fs, inv.configArgs, inv.environ)
+	var ve *config.ValidationError
+	if err != nil && !errors.As(err, &ve) {
+		// The same arguments parsed at the start: this is no usage error of the operator's.
+		log.Error("reload: the config could not be loaded again", logx.Err(err))
+		cfg = nil
+	}
+	// The server logs what it did; an error is the TLS manager's, which has logged it with the fix.
+	_ = srv.Reload(ctx, cfg)
 }
 
 // stopOnSignal returns a context that ends with the first signal on sigs (or with ctx), and calls again for a

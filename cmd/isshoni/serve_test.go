@@ -433,11 +433,11 @@ func TestRestartInPlace(t *testing.T) {
 	}
 }
 
-// logSignals says its line once per signal and stops when told to.
-func TestLogSignals(t *testing.T) {
+// onSignals calls its function once per signal and stops when told to.
+func TestOnSignals(t *testing.T) {
 	sigs := make(chan os.Signal, 1)
 	said := make(chan struct{}, 8)
-	stop := logSignals(sigs, func() { said <- struct{}{} })
+	stop := onSignals(sigs, func() { said <- struct{}{} })
 	for range 3 {
 		sigs <- syscall.SIGHUP
 		select {
