@@ -70,6 +70,51 @@ func TestKeyframeThrottle(t *testing.T) {
 	}
 }
 
+// TestKeyframeWaitsForPubPC: while the publishing Conn's actor has its pub PC as away (Conn.pubUp), a keyframe
+// request writes nothing and leaves the throttle alone (02 §9.7), so the request that the pub PC's connect makes
+// goes out at once. This is the order of a viewer and a sharer who both lost their network: the viewer's sub PC
+// connects first and asks for the layer it watches, the sharer's pub PC connects about 30 ms later and asks for
+// every layer, and only that request can bring the keyframe.
+func TestKeyframeWaitsForPubPC(t *testing.T) {
+	s, _ := newTicklessSFU(t)
+	sh := testShare(t, s, "s_1")
+	f, pub := testLayer(t, sh, SlotF, 0xf00)
+	sh.keyframe(f, ProfileHigh) // live
+	if !f.requestKeyframe(t0) || len(pub.plis()) != 1 {
+		t.Fatal("no PLI while the pub PC was connected")
+	}
+	sent := f.lastPLI.Load()
+
+	sh.conn.pubUp.Store(false) // the pub PC is away
+	away := t0 + int64(pliInterval)
+	for i := range 3 {
+		if f.requestKeyframe(away + int64(i)*int64(pliInterval)) {
+			t.Error("a PLI written while the pub PC was away")
+		}
+	}
+	sh.requestKeyframe(SlotF) // as a DownTrack or the sub PC's connect asks
+	if n := len(pub.plis()); n != 1 {
+		t.Errorf("%d PLIs after requests made while the pub PC was away, want the one before", n)
+	}
+	if got := f.lastPLI.Load(); got != sent {
+		t.Errorf("lastPLI = %d after requests made while the pub PC was away, want %d: they must not start the 500 ms",
+			got, sent)
+	}
+	if n, th := f.stats.pliSent.Load(), f.stats.pliThrottled.Load(); n != 1 || th != 0 {
+		t.Errorf("%d PLIs counted sent and %d throttled, want 1 and 0: a request while the pub PC is away is neither",
+			n, th)
+	}
+
+	// The pub PC connects 30 ms after the last request: its own request goes out.
+	sh.conn.pubUp.Store(true)
+	if back := away + 2*int64(pliInterval) + int64(30*time.Millisecond); !f.requestKeyframe(back) {
+		t.Fatal("the pub PC's connect asked for a keyframe and was throttled by requests made while it was away")
+	}
+	if plis := pub.plis(); len(plis) != 2 || plis[1].MediaSSRC != 0xf00 {
+		t.Errorf("PLIs = %+v, want a second one for f", plis)
+	}
+}
+
 // TestKeyframeThrottlePerLayer: the throttle is each layer's own. Twenty viewers who switch to the preview layer in
 // the same moment, and whose DownTracks then all wait for its keyframe and ask again with every packet (02 §9.7),
 // cost the publisher one PLI for that layer per 500 ms; and a request for the full layer right after goes out all the

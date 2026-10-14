@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"math"
 	"net"
 	"net/netip"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -897,6 +899,106 @@ func TestNewAPIsNeedsTransport(t *testing.T) {
 	if _, err := newAPIs(nil, nil); err == nil {
 		t.Fatal("newAPIs without a Transport must fail")
 	}
+}
+
+// TestICEMaxBindingRequests: the SFU's ICE agents check a candidate pair for as long as their failed timeout, one
+// binding request per round of Pion's checks (200 ms), instead of Pion's 7 (02 §7.3): 75 on the pub and sub PCs, 40
+// on the probe PCs. The test reads it from the SettingEngine of every API and from the agent of a sub PC itself,
+// and checks Pion's pace, which the number is derived from. With 7, a sub PC gave up each pair of an ICE restart
+// 1.5 s after the viewer's answer, so a restart asked for while the viewer's network was away never connected
+// (itest TestUDPBlackHoleViewer).
+func TestICEMaxBindingRequests(t *testing.T) {
+	for _, tc := range []struct {
+		failed time.Duration
+		want   uint16
+	}{
+		{iceFailedTimeout, 75},
+		{probeFailedTimeout, 40},
+		{20 * time.Second, 100},
+		{3*time.Second + 150*time.Millisecond, 15}, // whole rounds only
+		{time.Second, pionMaxBindingRequests},      // never fewer than Pion's own
+		{0, pionMaxBindingRequests},
+		{24 * time.Hour, math.MaxUint16},
+	} {
+		if got := maxBindingRequests(tc.failed); got != tc.want {
+			t.Errorf("maxBindingRequests(%v) = %d, want %d", tc.failed, got, tc.want)
+		}
+	}
+
+	// What every API's SettingEngine holds (Pion keeps it unexported).
+	a := newTestAPIs(t, loopbackTransport(t, true))
+	engines := map[string]reflect.Value{
+		"the pub SettingEngine": reflect.ValueOf(a.pubSettings),
+		"a pub PC's API":        pionField(t, reflect.ValueOf(pubAPI(t, a)), "settingEngine"),
+		"the sub API":           pionField(t, reflect.ValueOf(a.sub), "settingEngine"),
+	}
+	if len(a.probe) != 2 {
+		t.Fatalf("probe APIs %v, want udp and tcp7882", slices.Sorted(maps.Keys(a.probe)))
+	}
+	for pt, api := range a.probe {
+		engines["the "+string(pt)+" probe API"] = pionField(t, reflect.ValueOf(api), "settingEngine")
+	}
+	for name, se := range engines {
+		want := maxBindingRequests(iceFailedTimeout)
+		if strings.Contains(name, "probe") {
+			want = maxBindingRequests(probeFailedTimeout)
+		}
+		n := pionField(t, se, "iceMaxBindingRequests")
+		if n.IsNil() {
+			t.Errorf("%s leaves the binding requests at Pion's %d, want %d", name, pionMaxBindingRequests, want)
+		} else if got := n.Elem().Uint(); got != uint64(want) {
+			t.Errorf("%s allows %d binding requests per pair, want %d", name, got, want)
+		}
+	}
+
+	// What the ICE agent of a sub PC uses: the SettingEngine's number, at Pion's pace. A Pion whose agent checks at
+	// another pace needs the number derived again.
+	pc := newTestPC(t, a.sub)
+	addSendonly(t, pc, h264Track(t, "s_sub"), opusTrack(t, "a-s_sub"))
+	offer, err := pc.CreateOffer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completeDescription(t, pc, offer)
+	agent := pionField(t, reflect.ValueOf(pc), "iceGatherer", "agent")
+	if got := pionField(t, agent, "maxBindingRequests").Uint(); got != uint64(maxBindingRequests(iceFailedTimeout)) {
+		t.Errorf("a sub PC's ICE agent sends %d binding requests per pair, want %d", got, maxBindingRequests(iceFailedTimeout))
+	}
+	if got := time.Duration(pionField(t, agent, "checkInterval").Int()); got != iceCheckInterval {
+		t.Errorf("a sub PC's ICE agent checks every %v, want Pion's %v that the binding requests are counted in", got,
+			iceCheckInterval)
+	}
+	// Pion's own limit, the floor.
+	plain, err := ice.NewAgentWithOptions(ice.WithMulticastDNSMode(ice.MulticastDNSModeDisabled))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pionField(t, reflect.ValueOf(plain), "maxBindingRequests").Uint(); got != pionMaxBindingRequests {
+		t.Errorf("Pion's ICE agent sends %d binding requests per pair by default, want %d", got, pionMaxBindingRequests)
+	}
+	if err := plain.Close(); err != nil {
+		t.Errorf("close the agent: %v", err)
+	}
+}
+
+// pionField follows the named fields from v, through pointers, into a Pion struct's unexported state, and fails the
+// test when one is gone: a Pion that renamed it needs the test that reads it changed.
+func pionField(t *testing.T, v reflect.Value, names ...string) reflect.Value {
+	t.Helper()
+	for _, name := range names {
+		for v.Kind() == reflect.Pointer {
+			if v.IsNil() {
+				t.Fatalf("Pion's %s is nil", v.Type())
+			}
+			v = v.Elem()
+		}
+		f := v.FieldByName(name)
+		if !f.IsValid() {
+			t.Fatalf("Pion's %s has no field %s any more", v.Type(), name)
+		}
+		v = f
+	}
+	return v
 }
 
 // TestCandidateFilterAddrs is the remote-candidate filter table of 02 §7.3 (01 §17), for the three server setups
