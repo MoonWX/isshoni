@@ -878,6 +878,127 @@ func TestTransferStoreFailure(t *testing.T) {
 	})
 }
 
+// stoppingStore is a fakeTransferStore whose first call of one method returns only when its context ends, with the
+// context's error, as a real store's call does when the server stops in the middle of it (README F20).
+type stoppingStore struct {
+	*fakeTransferStore
+	method  string      // "AddTransfer", "TransferMonth", "Meta" or "SetMeta"
+	entered atomic.Bool // the call came
+}
+
+// hold waits for the end of ctx when method is the store's method and this is its first call.
+func (s *stoppingStore) hold(ctx context.Context, method string) (held bool, err error) {
+	if method != s.method || !s.entered.CompareAndSwap(false, true) {
+		return false, nil
+	}
+	<-ctx.Done()
+	return true, ctx.Err()
+}
+
+func (s *stoppingStore) AddTransfer(ctx context.Context, month string, egress, ingress int64, now time.Time) error {
+	if held, err := s.hold(ctx, "AddTransfer"); held {
+		return err
+	}
+	return s.fakeTransferStore.AddTransfer(ctx, month, egress, ingress, now)
+}
+
+func (s *stoppingStore) TransferMonth(ctx context.Context, month string) (int64, int64, error) {
+	if held, err := s.hold(ctx, "TransferMonth"); held {
+		return 0, 0, err
+	}
+	return s.fakeTransferStore.TransferMonth(ctx, month)
+}
+
+func (s *stoppingStore) Meta(ctx context.Context, key string) (string, error) {
+	if held, err := s.hold(ctx, "Meta"); held {
+		return "", err
+	}
+	return s.fakeTransferStore.Meta(ctx, key)
+}
+
+func (s *stoppingStore) SetMeta(ctx context.Context, key, value string) error {
+	if held, err := s.hold(ctx, "SetMeta"); held {
+		return err
+	}
+	return s.fakeTransferStore.SetMeta(ctx, key, value)
+}
+
+// TestTransferStopInFirstTick: a server that stops right after it starts stops in the middle of Run's first tick, and
+// the store calls under way fail with context.Canceled. That is a normal stop: no WARN line (the S90 log canary's
+// short-lived servers logged "transfer accounting: the store failed … context canceled"), and the last flush still
+// stores the bytes. A store call that times out while the server runs is still a failure and still warns.
+func TestTransferStopInFirstTick(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string // the store call under way when the server stops
+		egress int    // counted before Run starts
+		limit  int    // transferAlertGb
+		hang   bool   // the call hangs past its timeout while the server runs, and the server stops after that
+	}{
+		{name: "adding the bytes", method: "AddTransfer", egress: 1234},
+		{name: "reading the month's row", method: "TransferMonth"},
+		{name: "reading the alert memory", method: "Meta", egress: 1234, limit: 1},
+		{name: "remembering an alert", method: "SetMeta", egress: 9 * gb / 10, limit: 1},
+		{name: "a store that hangs while the server runs", method: "AddTransfer", egress: 1234, hang: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				store := &stoppingStore{fakeTransferStore: newFakeTransferStore(), method: tt.method}
+				policy := new(fakePolicy)
+				policy.alertGB.Store(int64(tt.limit))
+				alerter := new(fakeAlerter)
+				log, logs := testLogger()
+				counter := new(netx.TransferCounter)
+				counter.Add(netx.PathMediaUDP, true, tt.egress)
+				tr := NewTransfer(TransferOptions{
+					Counter: counter, Store: store, Meta: store, Policy: policy, Alerter: alerter,
+					Now: clockAt(time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)), Logger: log,
+				})
+				ctx, cancel := context.WithCancel(t.Context())
+				done := make(chan error, 1)
+				go func() { done <- tr.Run(ctx) }()
+				synctest.Wait()
+				if !store.entered.Load() {
+					t.Fatalf("the first tick made no %s call", tt.method)
+				}
+				if tt.hang {
+					time.Sleep(transferStoreTimeout)
+					synctest.Wait()
+				}
+				cancel()
+				if err := <-done; err != nil {
+					t.Errorf("Run returned %v, want nil", err)
+				}
+
+				var warnings []string
+				for line := range strings.Lines(logs.String()) {
+					if strings.Contains(line, `"level":"WARN"`) {
+						warnings = append(warnings, line)
+					}
+				}
+				switch {
+				case tt.hang:
+					if len(warnings) != 1 || !strings.Contains(warnings[0], "transfer accounting: the store failed") ||
+						!strings.Contains(warnings[0], "deadline exceeded") {
+						t.Errorf("a store call that timed out while the server ran: warnings %q, want the store's failure",
+							warnings)
+					}
+				case len(warnings) > 0:
+					t.Errorf("the stop logged warnings:\n%s", strings.Join(warnings, ""))
+				}
+				// The last flush stored what the stop cut short.
+				if got := store.month("2026-09"); got.egress != int64(tt.egress) {
+					t.Errorf("store after the stop = %+v, want the %d bytes counted", got, tt.egress)
+				}
+				if got := alerter.targets(); len(got) != 0 {
+					t.Errorf("alerts %v, want none: the alert check did not finish", got)
+				}
+			})
+		})
+	}
+}
+
 // The current rate is the average over the last five seconds, in bits per second.
 func TestTransferRate(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {

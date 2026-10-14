@@ -237,16 +237,36 @@ func nextFlush(now time.Time) (at time.Time, closing string) {
 func monthKey(t time.Time) string { return t.UTC().Format(monthLayout) }
 
 // tick is one round of Run: flush, then the alert check. closing is nextFlush's.
+//
+// A server that stops while a tick is under way (one that stops right after it starts does so in the first tick,
+// which reads the month's row) ends ctx in the middle of the store calls, and they fail with context.Canceled. That
+// is a normal stop, not a store that fails: no WARN, and no alert check on a context that has ended. Run's last
+// flush follows on a context of its own and stores what this tick could not, and it logs if the store fails then.
 func (t *Transfer) tick(ctx context.Context, closing string) {
 	if ctx.Err() != nil {
 		return // the server is stopping: Run's last flush follows
 	}
 	now := t.now()
-	if err := t.flush(ctx, now, closing, transferStoreTimeout); err != nil {
+	err := t.flush(ctx, now, closing, transferStoreTimeout)
+	if stopping(ctx) {
+		if err != nil {
+			t.log.LogAttrs(ctx, slog.LevelDebug, "transfer flush cut short by the stop; the last flush follows",
+				logx.Err(err))
+		}
+		return
+	}
+	if err != nil {
 		t.log.LogAttrs(ctx, slog.LevelWarn, "transfer accounting: the store failed; the bytes stay counted and "+
 			"the next flush tries again", logx.Err(err))
 	}
 	t.checkAlerts(ctx, now)
+}
+
+// stopping reports whether ctx, Run's context or one made from it, was cancelled: the server is stopping (04 §6.4
+// step 6 ends Run's context). A store call that fails then was cut short by the stop, which is no failure of the
+// store. A store call's own timeout (context.DeadlineExceeded) is one.
+func stopping(ctx context.Context) bool {
+	return errors.Is(ctx.Err(), context.Canceled)
 }
 
 // finalFlush stores what is left when the server stops. ctx has ended, so it runs on a context of its own.
@@ -545,8 +565,10 @@ func (t *Transfer) checkAlerts(ctx context.Context, now time.Time) {
 func (t *Transfer) rememberSent(ctx context.Context, month string, level int) bool {
 	if t.meta != nil {
 		if err := t.meta.SetMeta(ctx, MetaTransferAlertSent, encodeAlertSent(month, level)); err != nil {
-			t.log.LogAttrs(ctx, slog.LevelWarn, "transfer alert: could not remember the threshold; trying again at "+
-				"the next flush", logx.Err(err))
+			if !stopping(ctx) { // a stop that cuts the write short is no failure (tick)
+				t.log.LogAttrs(ctx, slog.LevelWarn, "transfer alert: could not remember the threshold; trying "+
+					"again at the next flush", logx.Err(err))
+			}
 			return false
 		}
 	}
@@ -570,8 +592,10 @@ func (t *Transfer) loadSent(ctx context.Context) bool {
 	if t.meta != nil {
 		value, err := t.meta.Meta(ctx, MetaTransferAlertSent)
 		if err != nil {
-			t.log.LogAttrs(ctx, slog.LevelWarn, "transfer alert: could not read which threshold was alerted; "+
-				"trying again at the next flush", logx.Err(err))
+			if !stopping(ctx) { // a stop that cuts the read short is no failure (tick)
+				t.log.LogAttrs(ctx, slog.LevelWarn, "transfer alert: could not read which threshold was alerted; "+
+					"trying again at the next flush", logx.Err(err))
+			}
 			return false
 		}
 		month, level = decodeAlertSent(value)
