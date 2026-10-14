@@ -148,8 +148,9 @@ func newAPI(d Deps, au authService) *API {
 	return a
 }
 
-// routes registers 03's endpoints (03 §12.3; the numbers are the rows of its table). The later slices add theirs
-// here.
+// routes registers 03's endpoints (03 §12.3; the numbers are the rows of its table): every M1 row but #43, the
+// dashboard, which 04's wiring registers through Handle with DashboardAccounts inside (03 §12.6). The device flow
+// (#44–#49) comes with M2.
 func (a *API) routes() {
 	a.Handle("GET /api/v1/info", Public, http.HandlerFunc(a.getInfo))                                      // #1
 	a.Handle("POST /api/v1/auth/login", Public, http.HandlerFunc(a.postLogin))                             // #2
@@ -189,6 +190,7 @@ func (a *API) routes() {
 	a.Handle("DELETE /api/v1/admin/rooms/{id}", Admin, http.HandlerFunc(a.deleteRoom))                     // #39
 	a.Handle("GET /api/v1/admin/settings", Admin, http.HandlerFunc(a.getSettings))                         // #40
 	a.Handle("PATCH /api/v1/admin/settings", Admin, http.HandlerFunc(a.patchSettings))                     // #41
+	a.Handle("GET /api/v1/admin/audit", Admin, http.HandlerFunc(a.getAudit))                               // #42
 	a.Handle("GET /api/v1/push/preferences", User, http.HandlerFunc(a.getPushPreferences))                 // #50
 	a.Handle("PUT /api/v1/push/preferences", User, http.HandlerFunc(a.putPushPreferences))                 // #51
 }
@@ -222,13 +224,6 @@ func (a *API) Handle(pattern string, access Access, h http.Handler) {
 		h = a.authenticate(access, h)
 	}
 	a.mux.Handle(pattern, rejectAuthorization(a.auth.CSRF(h)))
-}
-
-// DashboardAccounts builds the "accounts" object of 04's admin dashboard (03 §12.4.8). It comes with the audit and
-// dashboard slice (03 §18 slice 13); until then it returns an error that wraps *api.Error{internal}.
-func (a *API) DashboardAccounts(ctx context.Context) (api.DashboardAccounts, error) {
-	return api.DashboardAccounts{}, fmt.Errorf("httpapi: DashboardAccounts not implemented: %w",
-		api.NewError(api.CodeInternal))
 }
 
 type principalKey struct{}

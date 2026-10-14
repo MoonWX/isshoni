@@ -728,14 +728,6 @@ func TestNew(t *testing.T) {
 	}
 }
 
-func TestDashboardAccountsNotImplemented(t *testing.T) {
-	f := newAPIFixture(t, nil)
-	_, err := f.api.DashboardAccounts(context.Background())
-	if !api.IsCode(err, api.CodeInternal) || !strings.Contains(err.Error(), "DashboardAccounts") {
-		t.Fatalf("DashboardAccounts error = %v; want one that names the method and wraps internal", err)
-	}
-}
-
 func TestNopSignal(t *testing.T) {
 	var s Signal = nopSignal{}
 	if len(s.RoomPresence()) != 0 || len(s.OnlineUserIDs()) != 0 {
