@@ -76,6 +76,16 @@ func newTestAPIs(t *testing.T, tr *netx.Transport) *apis {
 	return a
 }
 
+// pubAPI returns the API of a pub PC of a, with a NACK filter of its own that knows no tracks.
+func pubAPI(t *testing.T, a *apis) *webrtc.API {
+	t.Helper()
+	api, err := a.pubAPI(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return api
+}
+
 // loopbackClientAPI is the far side: a plain Pion peer on loopback with Pion's default codecs that uses only network
 // type nt (for TCP it dials the server's passive candidates: active ICE-TCP). profiles, if any, replace Pion's SRTP
 // protection profiles.
@@ -286,7 +296,7 @@ func TestPubAnswerCandidates(t *testing.T) {
 	}
 	offerSDP := completeDescription(t, client, offer)
 
-	pc := newTestPC(t, a.pub)
+	pc := newTestPC(t, pubAPI(t, a))
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: offerSDP}); err != nil {
 		t.Fatal(err)
 	}
@@ -455,7 +465,7 @@ func negotiate(t *testing.T, server, client *webrtc.PeerConnection, serverOffers
 func connectToClient(t *testing.T, a *apis, serverOffers bool, clientAPI *webrtc.API, filter candidateFilter,
 ) *webrtc.ICECandidatePair {
 	t.Helper()
-	serverAPI := a.pub
+	serverAPI := pubAPI(t, a)
 	if serverOffers {
 		serverAPI = a.sub
 	}
@@ -642,7 +652,7 @@ func TestCandidatesWithTCP443(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pub := newTestPC(t, a.pub)
+	pub := newTestPC(t, pubAPI(t, a))
 	remote := webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: completeDescription(t, client, offer)}
 	if err := pub.SetRemoteDescription(remote); err != nil {
 		t.Fatal(err)
@@ -1165,7 +1175,7 @@ func TestFilterSDPOnPionDescriptions(t *testing.T) {
 	if strings.Contains(filtered, "a=candidate:") {
 		t.Errorf("a loopback candidate is left:\n%s", filtered)
 	}
-	pc := newTestPC(t, a.pub)
+	pc := newTestPC(t, pubAPI(t, a))
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: filtered}); err != nil {
 		t.Fatalf("Pion refuses the filtered offer: %v", err)
 	}

@@ -90,10 +90,14 @@ func TestShutdownWithMedia(t *testing.T) {
 // log must not count them:
 //   - with the stock Linux sysctls (a CI runner) the kernel grants smaller UDP buffers than
 //     network.udp_buffer_bytes asks for, and netx says which sysctls to raise;
-//   - inside a container (the tests in Docker) the harness turns the data-volume check off, and config says so.
+//   - inside a container (the tests in Docker) the harness turns the data-volume check off, and config says so;
+//   - on a loaded machine (a CI runner, -race in a container) a database write can take longer than the store's
+//     warning threshold, and the store says so: that is the machine's load, not the shutdown.
 func hostWarning(rec map[string]any) bool {
 	msg, _ := rec["msg"].(string)
 	switch rec["component"] {
+	case "store":
+		return msg == "slow write transaction"
 	case "netx":
 		return strings.HasPrefix(msg, "UDP socket buffers are smaller than network.udp_buffer_bytes")
 	case "config":

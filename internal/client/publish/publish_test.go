@@ -48,7 +48,9 @@ func TestNewOptions(t *testing.T) {
 		{"audio only", Options{Source: src, Layers: []string{}, Audio: true}, nil},
 		{"no source", Options{}, ErrInvalidOptions},
 		{"nothing to send", Options{Source: src, Layers: []string{}}, ErrInvalidOptions},
-		{"redundant RTX", Options{Source: src, RedundantRTX: true}, ErrNotImplemented},
+		{"redundant RTX", Options{Source: src, RedundantRTX: true}, nil},
+		{"padding", Options{Source: src, Padding: 3}, nil},
+		{"negative padding", Options{Source: src, Padding: -1}, ErrInvalidOptions},
 		{"repeated layer", Options{Source: src, Layers: []string{"f", "f"}}, ErrInvalidOptions},
 		{"empty layer", Options{Source: src, Layers: []string{""}}, ErrInvalidOptions},
 		{"profile with level", Options{Source: src, Profile: "64001f"}, ErrInvalidOptions},
@@ -149,6 +151,44 @@ func TestOffer(t *testing.T) {
 	}
 	if tracks[0].MID != tracks[1].MID || tracks[0].SSRC == tracks[1].SSRC {
 		t.Errorf("simulcast encodings %+v and %+v", tracks[0], tracks[1])
+	}
+}
+
+// TestOfferRedundantRTX: with RedundantRTX the video is offered with an RTX payload type for its one H.264 profile,
+// an RTX stream next to each media stream (Pion lists the SSRCs of simulcast encodings too) and the
+// repaired-rtp-stream-id extension. Without the option the offer has neither payload type nor stream.
+func TestOfferRedundantRTX(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	for _, tc := range []struct {
+		name string
+		o    Options
+		rtx  bool
+	}{
+		{"simulcast", Options{RedundantRTX: true}, true},
+		{"one layer", Options{RedundantRTX: true, Layers: []string{"f"}}, true},
+		{"without the option", Options{Layers: []string{"f"}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.o.Source, tc.o.Settings = newSource(t), loopbackSettings()
+			p, err := New(tc.o)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer p.Close()
+			offer, err := p.Offer(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for sub, want := range map[string]bool{
+				"a=rtpmap:97 rtx/90000\r\n": tc.rtx, "a=fmtp:97 apt=96\r\n": tc.rtx, "a=ssrc-group:FID ": tc.rtx,
+				sdp.SDESRepairRTPStreamIDURI: true, "a=rtpmap:96 H264/90000\r\n": true,
+			} {
+				if got := strings.Contains(offer.SDP, sub); got != want {
+					t.Errorf("the offer contains %q: %v, want %v\n%s", sub, got, want, offer.SDP)
+				}
+			}
+		})
 	}
 }
 

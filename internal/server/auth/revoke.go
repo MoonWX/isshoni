@@ -15,15 +15,15 @@ import (
 // after a session-key change (no connection exists yet).
 //
 // The rows come in two kinds:
-//   - one session: logout, revoking one session, the session of the cookie a login, registration or setup arrived
-//     with, and the sessions the cap of 50 evicts. Their Write deletes that row, and sessionsRevoked (session.go)
-//     runs the steps after the commit;
+//   - one session: logout, revoking one session, the session of the cookie a login, registration, setup or reset
+//     completion arrived with, and the sessions the cap of 50 evicts. Their Write deletes that row, and
+//     sessionsRevoked (session.go) runs the steps after the commit;
 //   - a user's credentials as a whole: the revocation values below. A Write calls apply, and revocationCommitted
 //     runs the steps after the commit.
 //
 // The M2 rows (revoking one device, a replayed refresh token) come with the device flow; RevokeDevice
 // (selfservice.go) already takes one device away. A role change or a rename closes nothing: the hub is told through
-// httpapi's Signal.UserChanged, and auth only invalidates the session cache.
+// httpapi's Signal.UserChanged, and auth only invalidates the session cache (UpdateUser in admin.go).
 
 // revocation is one row of the table of 03 §7.7 for an event that revokes a user's credentials as a whole.
 //
@@ -42,8 +42,9 @@ type revocation struct {
 }
 
 // The rows of 03 §7.7 that revoke a user's credentials as a whole. The first three and revokeAccountDeleted are
-// the user's own actions (selfservice.go). The admin actions come with the admin users slice (03 §18 slice 10):
-// its calls run the same two steps with these rows, which is why the whole table is here.
+// the user's own actions (selfservice.go). The others are an admin's: IssuePasswordReset (reset.go), and
+// SignOutUser, UpdateUser when it disables and DeleteUser (admin.go). All of them run the same two steps, apply
+// in the Write and revocationCommitted after it.
 var (
 	// "Sign out other browsers": every web session but the caller's. Devices and the reset link stay.
 	revokeOtherBrowsers = revocation{reason: ReasonSessionRevoked, keepCurrent: true}

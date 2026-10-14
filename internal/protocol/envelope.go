@@ -64,37 +64,43 @@ const maxTypeLen = 64
 
 // ParseEnvelope parses one frame. Errors wrap ErrBadMessage (-> bad_message): not valid UTF-8 (JSON and WebSocket
 // text frames must be), not a JSON object, nested deeper than 32 levels, missing or empty type (or one longer than
-// 64 bytes), id/re longer than 32 bytes or with characters outside [A-Za-z0-9_-], or data that is neither an object
-// nor null. A data of null is treated as absent.
+// 64 bytes), a type, id or re that is not a string, id/re longer than 32 bytes or with characters outside
+// [A-Za-z0-9_-], or data that is neither an object nor null. A data of null is treated as absent.
+//
+// It reads a frame as encoding/json reads it into an Envelope (keys match without regard to case, the last of
+// repeated keys counts, unknown keys are ignored: scan.go has the rules), but with a scanner of its own that
+// allocates nothing. ParseEnvelope allocates only its result, which is never larger than the frame: the three
+// strings and a copy of data. A frame it rejects costs no memory at all, whatever it holds.
 func ParseEnvelope(b []byte) (Envelope, error) {
-	var e Envelope
 	if !utf8.Valid(b) {
-		// Checked first: encoding/json would replace each invalid byte with a 3-byte U+FFFD, which lets a message
-		// allocate several times its size.
-		return Envelope{}, fmt.Errorf("%w: not valid UTF-8", ErrBadMessage)
+		// Checked first: the scanner reads bytes, and what it hands on (the strings here, data to Decode and to
+		// the relay) must be text. encoding/json would accept such a frame and put U+FFFD for each invalid byte.
+		return Envelope{}, errEnvelopeUTF8
 	}
-	if err := scanJSON(b, nil); err != nil {
-		return Envelope{}, fmt.Errorf("%w: %w", ErrBadMessage, err)
+	s, err := scanEnvelope(b)
+	if err != nil {
+		return Envelope{}, err
 	}
-	if err := json.Unmarshal(b, &e); err != nil {
-		return Envelope{}, fmt.Errorf("%w: %w", ErrBadMessage, err)
-	}
+	// The strings are decoded on the stack and every check comes before the first allocation.
+	var typBuf, idBuf, reBuf envelopeStringBuf
+	typ, typOK := envelopeString(s.typ, &typBuf, maxTypeLen)
+	id, idOK := envelopeString(s.id, &idBuf, MaxIDLen)
+	re, reOK := envelopeString(s.re, &reBuf, MaxIDLen)
 	switch {
-	case e.Type == "":
-		return Envelope{}, fmt.Errorf("%w: missing type", ErrBadMessage)
-	case len(e.Type) > maxTypeLen:
-		return Envelope{}, fmt.Errorf("%w: type too long", ErrBadMessage)
-	case e.ID != "" && !validToken(e.ID, MaxIDLen):
-		return Envelope{}, fmt.Errorf("%w: invalid id", ErrBadMessage)
-	case e.Re != "" && !validToken(e.Re, MaxIDLen):
-		return Envelope{}, fmt.Errorf("%w: invalid re", ErrBadMessage)
+	case !typOK:
+		return Envelope{}, errEnvelopeTypeLen
+	case len(typ) == 0:
+		return Envelope{}, errEnvelopeNoType
+	case !idOK || len(id) > 0 && !validTokenBytes(id):
+		return Envelope{}, errEnvelopeID
+	case !reOK || len(re) > 0 && !validTokenBytes(re):
+		return Envelope{}, errEnvelopeRe
+	case s.data != nil && s.data[0] != '{' && !bytes.Equal(s.data, jsonNull):
+		return Envelope{}, errEnvelopeData
 	}
-	switch {
-	case len(e.Data) == 0:
-	case bytes.Equal(e.Data, jsonNull):
-		e.Data = nil
-	case e.Data[0] != '{':
-		return Envelope{}, fmt.Errorf("%w: data is not an object", ErrBadMessage)
+	e := Envelope{Type: MessageType(typ), ID: string(id), Re: string(re)}
+	if s.data != nil && s.data[0] == '{' {
+		e.Data = bytes.Clone(s.data) // the envelope owns its data: the caller may reuse the frame's buffer
 	}
 	return e, nil
 }
@@ -104,8 +110,10 @@ func ParseEnvelope(b []byte) (Envelope, error) {
 //
 // Errors are a *FieldError (the hub answers bad_request with params {field, reason}) or, where the spec prescribes
 // another code, a *Error (RoomJoin: room_not_found; AgentSend: message_too_large). Before unmarshaling, Decode
-// rejects data that is not valid UTF-8 or nested deeper than 32 levels, and arrays longer than the payload's limits
-// (for example subs > 64), so a client->server message cannot make the decoder allocate much more than its own size.
+// rejects data that is not valid UTF-8, not valid JSON or nested deeper than 32 levels, arrays longer than the
+// payload's limits (for example subs > 64), and an object key longer than 1024 bytes (field data, reason invalid;
+// the keys inside the payload of an agent.send are the sender's and may be longer), so a client->server message
+// cannot make the decoder allocate much more than its own size.
 func Decode[T any](e Envelope) (T, error) {
 	var v T
 	err := DecodeInto(e, &v)
@@ -135,6 +143,14 @@ type arrayLimiter interface {
 	arrayLimits() *limitNode
 }
 
+// rawMember is implemented by payloads that keep one member as the bytes of the message, a json.RawMessage that
+// nothing here reads into: the payload of agent.send and agent.recv, which is the sender's business (01 §8.14). The
+// limit on an object key's length (maxKeyLen) does not hold inside that member. A new payload type with a
+// json.RawMessage member needs the method too (TestRawMembers finds a missing one).
+type rawMember interface {
+	rawMember() []byte // the member's JSON name
+}
+
 var jsonNull = []byte("null")
 
 func unmarshalData(data json.RawMessage, v any) error {
@@ -153,6 +169,18 @@ func unmarshalData(data json.RawMessage, v any) error {
 		if errors.As(err, &fe) {
 			return fe
 		}
+		return &FieldError{Field: "data", Reason: FieldInvalid}
+	}
+	var raw []byte
+	if r, ok := v.(rawMember); ok {
+		raw = r.rawMember()
+	}
+	if !validPayload(data, raw) {
+		// encoding/json must not be the one to find a syntax error: its error names the place by a JSON Pointer, and
+		// for that it copies the keys on the way there, up to 14 times the length of a long one. Nor may it meet a
+		// long key that the payload's type does not know: it looks the key up through a folded copy, which costs up
+		// to 5 times the key's length (maxKeyLen). Data that came through ParseEnvelope is valid JSON (the same
+		// scanner has read it) and, from a real peer, has no such key: for it this is one more look and nothing else.
 		return &FieldError{Field: "data", Reason: FieldInvalid}
 	}
 	if err := json.Unmarshal(data, v); err != nil {

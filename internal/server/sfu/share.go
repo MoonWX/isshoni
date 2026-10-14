@@ -48,6 +48,10 @@ type Share struct {
 	// it without a lock.
 	awaitsKeyframe atomic.Bool
 
+	// audioBps is the Opus bitrate of the share's preset (presetAudioBitrate), set with the preset. The pub answer
+	// and the NACK path read it without a lock (audioTarget, maxBitrate).
+	audioBps atomic.Int64
+
 	// The fan-out lists: the DownTracks of every subscription to this share, by kind. They are copied on write (under
 	// mu), so the media path reads them without a lock (02 §5.4).
 	video, audio atomic.Pointer[[]*DownTrack]
@@ -71,13 +75,11 @@ const (
 // policy.
 func shareParams(preset Preset, limits Limits, profile ProfileKey) ShareParams {
 	full := EncodingParams{
-		RID: ridFull, Active: true, MaxBitrate: fullMaxBitrate, MaxFramerate: fullFramerate, MaxPixels: fullMaxPixels,
+		RID: ridFull, Active: true, MaxBitrate: fullLayerMax(limits), MaxFramerate: fullFramerate,
+		MaxPixels: fullMaxPixels,
 	}
 	if preset == PresetText {
 		full.MaxFramerate = textFramerate
-	}
-	if limit := limits.MaxShareKbps; limit > 0 && limit < fullMaxBitrate/1000 {
-		full.MaxBitrate = limit * 1000
 	}
 	preview := EncodingParams{
 		RID: ridPreview, Active: true, MaxBitrate: previewMaxBitrate, MaxFramerate: previewFramerate,
@@ -88,6 +90,15 @@ func shareParams(preset Preset, limits Limits, profile ProfileKey) ShareParams {
 		Encodings:    []EncodingParams{full, preview},
 		AudioBitrate: presetAudioBitrate(preset),
 	}
+}
+
+// fullLayerMax is the full layer's MaxBitrate under the admin's cap (02 §8.6): fullMaxBitrate, or Limits.MaxShareKbps
+// when that is set and lower.
+func fullLayerMax(limits Limits) int {
+	if limit := limits.MaxShareKbps; limit > 0 && limit < fullMaxBitrate/1000 {
+		return limit * 1000
+	}
+	return fullMaxBitrate
 }
 
 // presetAudioBitrate is the Opus target of a preset, which the pub answer carries as maxaveragebitrate (02 §8.4).
@@ -159,9 +170,22 @@ func (s *Share) currentProfile() ProfileKey {
 
 // audioTarget returns the Opus bitrate the share's preset asks for now.
 func (s *Share) audioTarget() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return presetAudioBitrate(s.preset)
+	return int(s.audioBps.Load())
+}
+
+// maxBitrate returns what a layer of the share in slot is meant to carry at most, in bit/s (02 §8.6): for video the
+// encoding's MaxBitrate after the admin cap (the middle layer of M5 counts as the full one), for audio the preset's
+// Opus bitrate. The retransmission budget of the layer's DownTracks follows it (02 §9.5). A viewer's NACK path asks
+// for it with every NACK, so it takes no lock and makes nothing: each number is an atomic or a constant.
+func (s *Share) maxBitrate(slot Slot) int64 {
+	switch slot {
+	case SlotAudio:
+		return s.audioBps.Load()
+	case SlotQ:
+		return previewMaxBitrate
+	default:
+		return s.conn.sfu.fullMaxBps.Load()
+	}
 }
 
 // setPreset changes the preset; false when the share has ended.
@@ -172,6 +196,7 @@ func (s *Share) setPreset(p Preset) bool {
 		return false
 	}
 	s.preset = p
+	s.audioBps.Store(int64(presetAudioBitrate(p)))
 	return true
 }
 

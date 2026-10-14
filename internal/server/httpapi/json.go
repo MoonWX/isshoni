@@ -95,6 +95,33 @@ func DecodeJSON(w http.ResponseWriter, r *http.Request, dst any, maxBytes int64)
 	return nil
 }
 
+// jsonSpace is the white space a JSON text may have around its value (RFC 8259 §2).
+const jsonSpace = " \t\r\n"
+
+// decodeOptionalJSON decodes the body of an /api/v1 request that may come without one into dst. No body, an empty
+// one and one of nothing but white space leave dst as it is. Any other body is held to DecodeJSON's rule: exactly
+// one JSON value, followed by nothing but white space → otherwise bad_request.
+//
+// What counts is the bytes, never Content-Length: an empty body of unknown length (chunked, or an HTTP/2 stream that
+// ends with an empty DATA frame) is no body either. The chain has checked the Content-Type, with or without a body,
+// and capped the reader (03 §12.1), so a body over the limit is payload_too_large here.
+func decodeOptionalJSON(r *http.Request, dst any) error {
+	if r.Body == nil || r.Body == http.NoBody {
+		return nil
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return decodeError(err)
+	}
+	if len(bytes.Trim(body, jsonSpace)) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(body, dst); err != nil { // one value: Unmarshal refuses anything after it
+		return decodeError(err)
+	}
+	return nil
+}
+
 // maxBytesReader is http.MaxBytesReader on the innermost ResponseWriter. net/http tells its own writer that the
 // limit was hit (so it sends Connection: close and closes after the reply) through a type assertion on the writer it
 // is given, which doesn't follow Unwrap; the router's wrappers would hide it. 03's body-limit step should use it too.

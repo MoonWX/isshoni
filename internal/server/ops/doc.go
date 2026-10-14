@@ -42,10 +42,20 @@
 // it can administer the server; ListenAdmin logs a warning that says so (peercred_other.go). Checking the peer's
 // process token there, or refusing every connection, is an open decision.
 //
-// The socket's whole surface is declared: /v1/backup, /v1/restore and /v1/rotate-secrets answer "not implemented
-// in this build yet" until their slice fills them in (README S65), and the client already has their methods.
+//   - Backup, restore and rotation (README slice S65, 04 §5.3, §12.3, §12.4, §12.6). backup.go has DataDir, the data
+//     directory as both the running server and the offline commands of a stopped one act on it, and the archive
+//     format: PrepareBackup stages a consistent snapshot of the database, secrets.json and the certificate
+//     storage, and Backup.WriteTo streams the .tar.gz with its manifest first. restore.go has the two halves of a
+//     restore, with the server's shutdown between them: PrepareRestore receives and validates an archive or a
+//     bare database file, saves the current state as backups/pre-restore-<ts>.tar.gz and writes the plan;
+//     CompleteRestore swaps the files once nothing has them open. RecoverRestore completes an interrupted swap at
+//     the next start, or says that only the operator can (ErrRestoreNeedsOperator), and FinishRestore removes the
+//     previous files after a start that succeeded. The admin socket serves the three as GET /v1/backup,
+//     POST /v1/restore and POST /v1/rotate-secrets (adminapi.go); the last two answer 202 and then ask the server
+//     for its restart through AdminOptions.Restart. ops may not import store, so 03's snapshot and its file-level
+//     functions arrive as function values (DataDir.Snapshot, doctor.DBFiles).
 //
-// The later ops slices add dashboard.go, conntest.go and backup.go/restore.go.
+// The later ops slices add dashboard.go and conntest.go.
 //
 // Imports (04 §2): config, logx, version, netx and internal/protocol(/api), plus ops/doctor; never httpapi, store,
 // auth, signal, sfu or sfuplane. The wiring (internal/server) adapts those to the small interfaces declared here,

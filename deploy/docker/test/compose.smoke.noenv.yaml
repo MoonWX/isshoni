@@ -1,0 +1,13 @@
+# Test override for ../../compose.yaml without a .env file, used by docker-smoke.sh (docs/m1/06-deploy-and-ci.md
+# §11.3 step 6). Not for real use.
+#
+# It sets the locally built image and nothing that the .env file of a real install would set: ISSHONI_DOMAIN and
+# ISSHONI_PUBLIC_IP reach the container as the empty strings of compose.yaml, so the server runs in ip mode. The
+# ACME directory points at a closed port on the container's own loopback, so that a test run never asks Let's Encrypt
+# for a certificate; no certificate is expected in this test.
+services:
+  isshoni:
+    image: ${SMOKE_IMAGE:?docker-smoke.sh sets it}
+    pull_policy: never
+    environment:
+      ISSHONI_TLS_ACME_CA: https://127.0.0.1:9/directory

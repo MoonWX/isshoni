@@ -35,10 +35,18 @@ func allocatedWithin(limit uint64, fn func()) uint64 {
 }
 
 // Allocation bounds of the fuzz targets (01 §19: "no allocation above 4× the input"). The constant covers what
-// does not grow with the input: encoding/json's decode state and, for Decode, the slices that the array limits
-// allow (about 54 KB for a ClientStats with every list at its limit and every element empty).
+// does not grow with the input. For Decode that is encoding/json's decode state and the slices that the array
+// limits allow (about 54 KB for a ClientStats with every list at its limit and every element empty). ParseEnvelope
+// has no such part: it allocates its result, which is a copy of parts of the frame, so its constant only covers how
+// the allocator rounds sizes up. It is small on purpose: with 8 KB there, a frame had to be 2.3 KB long before a
+// decoder that allocated 7.6 times its size was over the bound (F04).
+//
+// Decode's constant is large enough to hide a decoder that is over 4× by a little: a valid payload had to hold one
+// key of about 57 KB that its type does not know before encoding/json's 5.2 times that key showed (F04). So the
+// part that grows with the input has a test of its own, which leaves the fuzzer nothing to grow to:
+// TestDecodeLongKeyAllocations, for the keys that Decode lets through (maxKeyLen).
 const (
-	envelopeAllocSlack = 8 << 10
+	envelopeAllocSlack = 1 << 10
 	decodeAllocSlack   = 64 << 10
 	// clientDecodeRatio bounds server->client payloads, which only clients decode (from their own server) and whose
 	// arrays have no count limit: encoding/json allocates up to ~250 bytes per "{}," element there (ShareInfo,
@@ -94,13 +102,22 @@ func FuzzParseEnvelope(f *testing.F) {
 	for _, fx := range loadFixtures(f, fixtureDir) {
 		f.Add(fx.raw)
 	}
-	_, _ = ParseEnvelope([]byte(`{"type":"x","id":"1","data":{}}`)) // warm encoding/json's type cache
+	// Every rule of the envelope scanner and every way to break a frame, with the long keys of F04. The frame of
+	// that finding, 2574 bytes that break off after one long key, is also a seed in testdata/fuzz.
+	for _, frame := range envelopeFrames() {
+		f.Add([]byte(frame))
+	}
 	f.Fuzz(func(t *testing.T, b []byte) {
 		var e Envelope
 		var err error
 		limit := 4*uint64(len(b)) + envelopeAllocSlack
 		if n := allocatedWithin(limit, func() { e, err = ParseEnvelope(b) }); n > limit {
 			t.Fatalf("ParseEnvelope allocated %d bytes for %d input bytes (limit %d)", n, len(b), limit)
+		}
+		// The scanner reads the frame as encoding/json does: the same frames accepted, the same envelope.
+		if want, wantErr := parseEnvelopeJSON(b); (err == nil) != (wantErr == nil) || e.Type != want.Type || e.ID != want.ID ||
+			e.Re != want.Re || !bytes.Equal(e.Data, want.Data) || (e.Data == nil) != (want.Data == nil) {
+			t.Fatalf("ParseEnvelope = %+v (data %q), %v; encoding/json gives %+v (data %q), %v", e, e.Data, err, want, want.Data, wantErr)
 		}
 		if err != nil {
 			if !errors.Is(err, ErrBadMessage) {
@@ -162,6 +179,20 @@ func FuzzDecode(f *testing.F) {
 	f.Add(targetIndex(targets, AgentSend{}), []byte(`{"toRole":"agent","kind":"a.b","payload":null,"payload":[null]}`))
 	f.Add(targetIndex(targets, ShareStart{}), []byte(`{"kind":"tab","label":"`+jsonEsc("202e")+` `+jsonEsc("0041")+` ","preset":"game","ref":"r"}`))
 	f.Add(targetIndex(targets, Error{}), []byte(`{"code":"x","params":{"a":[1,[2,{"b":null}]],"c":1e308}}`))
+	// Payloads that break off after a long key (F04): encoding/json's syntax error allocated 8 to 14 times their
+	// size, so Decode finds the error first.
+	f.Add(targetIndex(targets, RoomJoin{}), []byte(`{"`+strings.Repeat("~", 8000)+`":`))
+	f.Add(targetIndex(targets, SubscribeUpdate{}), []byte(`{"subs":[{"shareId":"s_1","`+strings.Repeat("k/", 4000)+`":`))
+	f.Add(targetIndex(targets, ClientStats{}), []byte(`{"pcs":[],"`+strings.Repeat("k", 8000)+`":x}`))
+	// A valid payload with a long key that its type does not know (F04): encoding/json folds a copy of the key to
+	// look it up, 514768 bytes for this payload of 100024 (limit 465632). Decode refuses a key over maxKeyLen, and
+	// lets through the keys in the one place where encoding/json reads none: the relay's payload.
+	f.Add(targetIndex(targets, RoomJoin{}), []byte(`{"`+strings.Repeat("k", 100000)+`":1,"roomId":"lounge"}`))
+	f.Add(targetIndex(targets, RoomJoin{}), []byte(`{"`+strings.Repeat("k", maxKeyLen)+`":1,"roomId":"lounge"}`))
+	f.Add(targetIndex(targets, RoomJoin{}), []byte(`{"roomId":"lounge","x":[{"`+strings.Repeat(jsonEsc("004b"), maxKeyLen/6+1)+`":1}]}`))
+	f.Add(targetIndex(targets, SubscribeUpdate{}), []byte(`{"subs":[{"shareId":"s_1","`+strings.Repeat("k", 257)+`":1,"`+strings.Repeat("K", 513)+`":2}]}`))
+	f.Add(targetIndex(targets, AgentSend{}), []byte(`{"toRole":"agent","kind":"a.b","payload":{"`+strings.Repeat("k", 8000)+`":[{"`+strings.Repeat("~", 2000)+`":1}]}}`))
+	f.Add(targetIndex(targets, AgentSend{}), []byte(`{"toRole":"agent","kind":"a.b","PAYLOAD":{"`+strings.Repeat("k", 2000)+`":1},"`+strings.Repeat("k", 2000)+`":1}`))
 	f.Fuzz(func(t *testing.T, idx uint8, data []byte) {
 		tg := targets[int(idx)%len(targets)]
 		var v reflect.Value
@@ -184,6 +215,10 @@ func FuzzDecode(f *testing.F) {
 				t.Fatalf("decoding %v: error %v (%T) is neither a *FieldError nor a *Error", tg.typ, err, err)
 			}
 			return
+		}
+		// Decode let no key through that is longer than it allows (the tests' reference reads the tokens).
+		if raw := rawMemberOf(v.Interface()); json.Valid(data) && longKey(t, data, raw) {
+			t.Fatalf("decoding %v accepted a payload with a key of more than %d bytes: %.200q", tg.typ, maxKeyLen, data)
 		}
 		// An agent.send that passed has a payload for the relay to hand on: some JSON value, and not null (01 §8.14).
 		if a, ok := v.Interface().(*AgentSend); ok {

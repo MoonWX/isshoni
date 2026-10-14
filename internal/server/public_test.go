@@ -186,7 +186,7 @@ func TestRestartWhenTheAddressAppears(t *testing.T) {
 					watchPublicAddrs(ctx, s.redetectInterval(), s.public, detect, s.publicAddrsChanged)
 				}()
 				for i := range tc.looks {
-					time.Sleep(publicRedetectEvery) // the fake clock: ten minutes to each look
+					time.Sleep(s.redetectInterval()) // the fake clock: one interval to each look
 					synctest.Wait()
 					if n := int(looks.Load()); n != i+1 {
 						t.Fatalf("%d looks after %d intervals", n, i+1)
@@ -213,6 +213,99 @@ func TestRestartWhenTheAddressAppears(t *testing.T) {
 				s.askRestart() // asking twice is fine
 			}
 		})
+	}
+}
+
+// TestRedetectPace runs the server's own look at its public addresses (watchPublic, what startBackground starts) on
+// a fake clock, with a fake detector: a server that started without the public address that is its site, and is
+// not ready, looks every 30 s, so that it is back within the minute once the network is (04 §6.2, §7.4). Every
+// other server looks every ten minutes.
+func TestRedetectPace(t *testing.T) {
+	found := netx.PublicAddrs{V4: netip.MustParseAddr("203.0.113.7"), V4Method: netx.MethodSTUN}
+	ipMode := []string{"--tls.mode=ip", "--listen.https=127.0.0.1:8443"}
+	manual := []string{"--tls.mode=manual", "--tls.cert-file=c.pem", "--tls.key-file=k.pem", "--listen.https=127.0.0.1:8443"}
+
+	for _, tc := range []struct {
+		name    string
+		flags   []string
+		first   netx.PublicAddrs // what the startup found
+		waiting bool
+		every   time.Duration
+	}{
+		{"ip mode, waiting for its address", ipMode, netx.PublicAddrs{}, true, 30 * time.Second},
+		{"manual mode without a domain, waiting for its address", manual, netx.PublicAddrs{}, true, 30 * time.Second},
+		{"ip mode with its address", ipMode, found, false, 10 * time.Minute},
+		{"manual mode with a domain, no address", append([]string{"--domain=watch.example.com"}, manual...), netx.PublicAddrs{}, false, 10 * time.Minute},
+		{"off mode, no address", nil, netx.PublicAddrs{}, false, 10 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := loadFlags(t, tc.flags...)
+			s, err := New(cfg, discardLog(), Deps{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// What Start decides once the listeners are bound (as in TestRestartWhenTheAddressAppears).
+			mode := cfg.EffectiveTLSMode()
+			s.public = tc.first
+			if s.site, err = s.newSite(mode); err != nil {
+				t.Fatal(err)
+			}
+			s.awaitsAddress = siteIsAddress(&s.cfg, mode) && s.site.Origin == ""
+			if s.awaitsAddress != tc.waiting || s.redetectInterval() != tc.every {
+				t.Fatalf("awaitsAddress = %v, interval %v; want %v, %v", s.awaitsAddress, s.redetectInterval(), tc.waiting, tc.every)
+			}
+			// The detection finds what the startup found: nothing changes, and the server keeps looking.
+			var looks atomic.Int32
+			s.hookDetect = func() netx.PublicAddrs {
+				looks.Add(1)
+				return tc.first
+			}
+
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					s.watchPublic(ctx)
+				}()
+				// No look before the first interval is over, and then one per interval, exactly.
+				time.Sleep(tc.every - time.Millisecond)
+				synctest.Wait()
+				if n := looks.Load(); n != 0 {
+					t.Fatalf("%d looks in the first %v", n, tc.every-time.Millisecond)
+				}
+				time.Sleep(time.Millisecond)
+				for want := int32(1); want <= 5; want++ {
+					synctest.Wait()
+					if n := looks.Load(); n != want {
+						t.Fatalf("%d looks after %v, want %d", n, time.Duration(want)*tc.every, want)
+					}
+					time.Sleep(tc.every)
+				}
+				cancel()
+				<-done
+			})
+
+			// On the wall clock of the server's first ten minutes, that is twenty looks where it was one.
+			if got, want := int(publicRedetectEvery/s.redetectInterval()), map[bool]int{true: 20, false: 1}[tc.waiting]; got != want {
+				t.Errorf("looks per ten minutes = %d, want %d", got, want)
+			}
+			select {
+			case <-s.restartAsked:
+				t.Error("a look that found nothing new asked for a restart")
+			default:
+			}
+		})
+	}
+
+	// A test's own interval wins over both.
+	s, err := New(loadFlags(t, ipMode...), discardLog(), Deps{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.awaitsAddress, s.redetectEvery = true, 5*time.Millisecond
+	if got := s.redetectInterval(); got != 5*time.Millisecond {
+		t.Errorf("redetectInterval with a test's interval = %v", got)
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 
 	"github.com/MoonWX/isshoni/internal/logx"
 	"github.com/MoonWX/isshoni/internal/protocol/api"
+	"github.com/MoonWX/isshoni/internal/server/config"
 )
 
 // The admin socket (04 §12.1): HTTP/1.1 over a unix socket at listen.admin_socket, for the operator's CLI on the
@@ -252,8 +253,25 @@ type IssuedLink struct {
 	ExpiresAt time.Time
 }
 
-// AdminOptions configures NewAdminServer. A later slice of the M1 plan adds what backup, restore and rotate-secrets
-// need; until then those endpoints say that this build does not have them.
+// SecretRotator is secrets.json as POST /v1/rotate-secrets changes it (04 §5.3): *config.SecretStore. Rotate
+// writes the new file; the keys take effect with the restart that the handler then asks for.
+type SecretRotator interface {
+	Rotate(ctx context.Context, names []config.KeyName, vapid bool) (config.RotateResult, error)
+}
+
+// RestartReason says why the admin socket asks the server to restart itself.
+type RestartReason string
+
+const (
+	// RestartAfterRestore follows an accepted restore: the shutdown ends with the swap of the data directory's
+	// files (CompleteRestore), and the next start reads the restored state (04 §12.4).
+	RestartAfterRestore RestartReason = "restore"
+	// RestartAfterRotation follows rotate-secrets: the next start reads the new keys and purges what the old ones
+	// protected (04 §5.3).
+	RestartAfterRotation RestartReason = "rotation"
+)
+
+// AdminOptions configures NewAdminServer.
 type AdminOptions struct {
 	// Health answers /v1/health and /v1/ready, and tells setup-url when the server is ready. Required.
 	Health *Health
@@ -268,6 +286,17 @@ type AdminOptions struct {
 	// Doctor serves /v1/doctor: the checks of `isshoni doctor`, run inside the server (04 §13.1). nil means that
 	// endpoint answers 500.
 	Doctor *Doctor
+	// Data serves /v1/backup and /v1/restore: the data directory, with 03's snapshot of the running database
+	// (04 §12.3, §12.4). nil means those endpoints answer 500.
+	Data *DataDir
+	// Secrets serves /v1/rotate-secrets (04 §5.3). nil means that endpoint answers 500.
+	Secrets SecretRotator
+	// Restart asks the server for a graceful shutdown that ends in a restart: the wiring passes a function that
+	// starts Server.Shutdown in a goroutine of its own (04 §6). The restore and rotate-secrets handlers call it
+	// after their answer is written, and it must not wait for the shutdown: the request that calls it is one of
+	// the things the shutdown waits for. nil means that both endpoints answer 500: a server that can't restart
+	// must not swap its files or its keys.
+	Restart func(RestartReason)
 	// Logger is the server's logger. nil means slog.Default().
 	Logger *slog.Logger
 }
@@ -280,8 +309,16 @@ type AdminServer struct {
 	accounts AdminAccounts
 	logLevel *LogLevel
 	doctor   *Doctor
+	data     *DataDir
+	secrets  SecretRotator
+	restart  func(RestartReason)
 	log      *slog.Logger
 	started  time.Time
+
+	// change is what restore and rotate-secrets do one at a time: each replaces files that the other, and the
+	// restart that follows, rely on (beginChange).
+	changeMu sync.Mutex
+	change   changeState
 
 	srv      *http.Server
 	stopOnce sync.Once
@@ -316,6 +353,9 @@ func NewAdminServer(o AdminOptions) *AdminServer {
 		accounts: o.Accounts,
 		logLevel: o.LogLevel,
 		doctor:   o.Doctor,
+		data:     o.Data,
+		secrets:  o.Secrets,
+		restart:  o.Restart,
 		log:      log,
 		started:  time.Now(),
 		stopping: make(chan struct{}),

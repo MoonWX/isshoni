@@ -147,7 +147,7 @@ func TestLogin(t *testing.T) {
 			t.Errorf("Login(%q): %v", name, err)
 		}
 	}
-	if err := e.tryLogin("Alex", strings.ReplaceAll(testPassword, " ", " "), ipA); err != nil {
+	if err := e.tryLogin("Alex", strings.ReplaceAll(testPassword, " ", "\u00a0"), ipA); err != nil {
 		t.Errorf("a password typed with non-breaking spaces: %v", err)
 	}
 	// Every login issues a new token and a new session.

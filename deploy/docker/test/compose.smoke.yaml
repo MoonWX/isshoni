@@ -1,0 +1,16 @@
+# Test override for ../../compose.yaml, used by docker-smoke.sh (docs/m1/06-deploy-and-ci.md §11.3). Not for real use.
+#
+# It swaps in the locally built image and a throwaway certificate: manual TLS mode shows that the container binds
+# 443 and serves HTTPS without asking an ACME server for anything. docker-smoke.sh exports the SMOKE_* variables.
+services:
+  isshoni:
+    image: ${SMOKE_IMAGE:?docker-smoke.sh sets it}
+    pull_policy: never
+    environment:
+      ISSHONI_DOMAIN: smoke.test
+      ISSHONI_PUBLIC_IP: 127.0.0.1
+      ISSHONI_TLS_MODE: manual
+      ISSHONI_TLS_CERT_FILE: /etc/isshoni/tls/cert.pem
+      ISSHONI_TLS_KEY_FILE: /etc/isshoni/tls/key.pem
+    volumes:
+      - ${SMOKE_TLS_DIR:?docker-smoke.sh sets it}:/etc/isshoni/tls:ro

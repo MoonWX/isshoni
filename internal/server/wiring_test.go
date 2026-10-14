@@ -532,8 +532,11 @@ func TestDoctorOverTheAdminSocket(t *testing.T) {
 
 	// What the checks can only know from the running server: its config and data directory, the schema of its open
 	// database, its certificate mode, and the ports it bound, which an offline run would try to bind itself.
-	if c := checks["data_dir"]; c.Status != api.DoctorStatusOK || c.Params["path"] != srv.DataDir || c.Params["offline"] != false {
-		t.Errorf("data_dir = %+v, want ok for %s, not offline", c, srv.DataDir)
+	// servertest turns the container data-volume check off, so inside a container (the tests in Docker) the check
+	// says that instead of ok.
+	if c := checks["data_dir"]; (c.Status != api.DoctorStatusOK && c.Code != "data_dir.ephemeral_allowed") ||
+		c.Params["path"] != srv.DataDir || c.Params["offline"] != false {
+		t.Errorf("data_dir = %+v, want ok (or ephemeral_allowed in a container) for %s, not offline", c, srv.DataDir)
 	}
 	if c := checks["schema"]; c.Status != api.DoctorStatusOK || c.Code != "schema.ok" || c.Params["version"] != float64(store.LatestSchemaVersion()) {
 		t.Errorf("schema = %+v, want schema.ok at version %d", c, store.LatestSchemaVersion())

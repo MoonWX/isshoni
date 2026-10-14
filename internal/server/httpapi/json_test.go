@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -282,6 +283,73 @@ func TestDecodeJSON(t *testing.T) {
 	}
 }
 
+// TestDecodeOptionalJSON: a body that may be left out is judged by its bytes. None, an empty one of any declared
+// length and a blank one decode nothing; any other is held to DecodeJSON's rule.
+func TestDecodeOptionalJSON(t *testing.T) {
+	const ct = "application/json"
+	unknownLength := func(body io.ReadCloser) func(*http.Request) {
+		return func(r *http.Request) { r.ContentLength, r.Body = -1, body }
+	}
+	was := loginReq{Username: "kept"}
+	for _, tt := range []struct {
+		name     string
+		body     string
+		mod      func(*http.Request)
+		want     loginReq
+		wantCode string // "" = success
+	}{
+		{"no body", ``, func(r *http.Request) { r.Body = nil }, was, ""},
+		{"http.NoBody", ``, func(r *http.Request) { r.Body = http.NoBody }, was, ""},
+		{"http.NoBody of unknown length", ``, unknownLength(http.NoBody), was, ""},
+		{"empty, of unknown length", ``, unknownLength(io.NopCloser(strings.NewReader(""))), was, ""},
+		{"empty", ``, nil, was, ""},
+		{"one space", ` `, nil, was, ""},
+		{"JSON white space", " \t\r\n", nil, was, ""},
+		{"blank, of unknown length", ``, unknownLength(io.NopCloser(strings.NewReader("\n"))), was, ""},
+		{"null", `null`, nil, was, ""},
+		{"an empty object", `{}`, nil, was, ""},
+		{"an object", ` {"username":"alex","password":"pw"}` + "\n", nil, loginReq{"alex", "pw"}, ""},
+		{"unknown fields are ignored", `{"password":"pw","extra":[1,2]}`, nil, loginReq{"kept", "pw"}, ""},
+		{"other white space is not blank", "\u00a0", nil, was, api.CodeBadRequest},
+		{"malformed", `{"username":`, nil, was, api.CodeBadRequest},
+		{"wrong type", `{"username":42}`, nil, was, api.CodeBadRequest},
+		{"array instead of object", `[]`, nil, was, api.CodeBadRequest},
+		{"trailing object", `{} {}`, nil, was, api.CodeBadRequest},
+		{"trailing garbage", `{"username":"a"} x`, nil, was, api.CodeBadRequest},
+		{"over the chain's limit", `{"username":"` + strings.Repeat("a", 100) + `"}`, func(r *http.Request) {
+			r.Body = http.MaxBytesReader(httptest.NewRecorder(), r.Body, 64)
+		}, was, api.CodePayloadTooLarge},
+		{"blank, over the chain's limit", strings.Repeat(" ", 100), func(r *http.Request) {
+			r.Body = http.MaxBytesReader(httptest.NewRecorder(), r.Body, 64)
+		}, was, api.CodePayloadTooLarge},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := jsonReq(tt.body, ct)
+			if tt.mod != nil {
+				tt.mod(req)
+			}
+			dst := was
+			err := decodeOptionalJSON(req, &dst)
+			if tt.wantCode != "" {
+				if !api.IsCode(err, tt.wantCode) {
+					t.Fatalf("err = %v, want %s", err, tt.wantCode)
+				}
+				return
+			}
+			if err != nil || dst != tt.want {
+				t.Fatalf("decoded %+v, %v; want %+v", dst, err, tt.want)
+			}
+		})
+	}
+
+	// A dst that isn't a pointer is a programming error: not an *api.Error, so WriteError answers 500.
+	err := decodeOptionalJSON(jsonReq(`{}`, ct), loginReq{})
+	var ae *api.Error
+	if err == nil || errors.As(err, &ae) {
+		t.Fatalf("non-pointer dst: err = %v", err)
+	}
+}
+
 // TestDecodeJSONLimitClosesConnection runs a real server: a body cut by the limit while reading gets 413, and
 // net/http closes the connection after it instead of draining the rest, also through the router's wrapped writers.
 func TestDecodeJSONLimitClosesConnection(t *testing.T) {
@@ -333,6 +401,35 @@ func FuzzDecodeJSON(f *testing.F) {
 		err := DecodeJSON(httptest.NewRecorder(), jsonReq(body, "application/json"), &dst, 256)
 		if err != nil && !api.IsCode(err, api.CodeBadRequest) && !api.IsCode(err, api.CodePayloadTooLarge) {
 			t.Fatalf("DecodeJSON(%q) = %v", body, err)
+		}
+	})
+}
+
+// FuzzDecodeOptionalJSON checks that a blank body decodes nothing and that any other gets DecodeJSON's verdict and
+// value.
+func FuzzDecodeOptionalJSON(f *testing.F) {
+	for _, s := range []string{
+		``, ` `, "\r\n\t", "\u00a0", `{}`, ` {"a":1} `, `{"a":1} {"b":2}`, `[`, `null`, `"x"`, "{}\x00",
+	} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, body string) {
+		var got, want map[string]any
+		err := decodeOptionalJSON(jsonReq(body, "application/json"), &got)
+		if strings.Trim(body, jsonSpace) == "" {
+			if err != nil || got != nil {
+				t.Fatalf("decodeOptionalJSON(%q) = %v, %v; want nothing decoded", body, got, err)
+			}
+			return
+		}
+		wantErr := DecodeJSON(httptest.NewRecorder(), jsonReq(body, "application/json"), &want, int64(len(body)))
+		switch {
+		case wantErr != nil:
+			if !api.IsCode(err, api.CodeBadRequest) || !api.IsCode(wantErr, api.CodeBadRequest) {
+				t.Fatalf("decodeOptionalJSON(%q) = %v, DecodeJSON = %v; want bad_request from both", body, err, wantErr)
+			}
+		case err != nil || !reflect.DeepEqual(got, want):
+			t.Fatalf("decodeOptionalJSON(%q) = %v, %v; DecodeJSON = %v", body, got, err, want)
 		}
 	})
 }

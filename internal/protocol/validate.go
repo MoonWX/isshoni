@@ -208,6 +208,12 @@ func (*PCOffer) arrayLimits() *limitNode         { return pcOfferLimits }
 func (*SubscribeUpdate) arrayLimits() *limitNode { return subscribeLimits }
 func (*ClientStats) arrayLimits() *limitNode     { return clientStatsLimits }
 
+// The relay's payload is a json.RawMessage: its keys are not held to maxKeyLen (rawMember).
+var agentPayloadName = []byte("payload")
+
+func (*AgentSend) rawMember() []byte { return agentPayloadName }
+func (*AgentRecv) rawMember() []byte { return agentPayloadName }
+
 // Validate checks a hello (01 §8.2 step 2): client.kind matches [a-z]{1,16} (unknown kinds are accepted), role is
 // known, features <= 32 entries, caps.decode and caps.encode <= 32 well-formed keys. The diagnostic strings are
 // bounded: client.os [a-z]{0,16} (unknown values accepted), client.browser [a-z]{0,16}, client.version <= 64

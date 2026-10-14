@@ -94,8 +94,9 @@ func testSPA() fstest.MapFS {
 
 // post sends a JSON request as the web app does, with the site's Origin, and fails the test unless the answer has
 // the wanted status. forwardedFor, when set, is the client address that the test passes on as the operator's
-// proxy in front of an off-mode server would (04 §8.5). A 429 is retried after its Retry-After: the accounts of a
-// large test come faster than the server lets strangers sign up.
+// proxy in front of an off-mode server would (04 §8.5). A 429, and a 503 with a Retry-After (the server-wide
+// auth-hash budget of 03 §7.3, a burst of 20), is retried after its Retry-After: the accounts of a large test come
+// faster than the server lets strangers sign up, and on a fast machine faster than the budget refills.
 func (w *world) post(hc *http.Client, forwardedFor, path string, body any, want int) {
 	w.t.Helper()
 	payload, err := json.Marshal(body)
@@ -127,7 +128,8 @@ func (w *world) post(hc *http.Client, forwardedFor, path string, body any, want 
 			return
 		}
 		wait, _ := strconv.Atoi(res.Header.Get("Retry-After"))
-		if res.StatusCode != http.StatusTooManyRequests || wait <= 0 || time.Now().Add(time.Duration(wait)*time.Second).After(deadline) {
+		retry := res.StatusCode == http.StatusTooManyRequests || res.StatusCode == http.StatusServiceUnavailable
+		if !retry || wait <= 0 || time.Now().Add(time.Duration(wait)*time.Second).After(deadline) {
 			w.t.Fatalf("POST %s = %d %s, want %d", path, res.StatusCode, answer, want)
 		}
 		time.Sleep(time.Duration(wait) * time.Second)

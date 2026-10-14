@@ -65,7 +65,10 @@ Usage: isshoni admin restore [flags] [config flags] PATH|-
 
 Restores a backup archive (.tar.gz), or only the database from a pre-migration backups/pre-*.db
 file, and restarts the server. It asks for confirmation on a terminal; otherwise --yes is required.
-With - the archive comes from stdin, so --yes is always required.
+With - the archive comes from stdin, so --yes is always required. The state from before the restore
+is kept as backups/pre-restore-<time>.tar.gz in the data directory. With --offline, for a server
+that can't start, run it as the service user while the server is stopped, and start the server
+afterwards.
 
 Flags:
   --offline      restore into the data directory directly while the server is stopped

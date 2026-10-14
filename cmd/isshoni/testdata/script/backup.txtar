@@ -1,0 +1,103 @@
+# backup, restore and rotate-secrets against a real admin socket with the fake server behind it (fake_test.go),
+# which has a data directory of its own and "restarts" after a restore or a rotation. restart_test.go runs the
+# same commands against the real server, and backup_test.go has the offline forms.
+
+fakedb pre-6.db 6 0.2.9
+fakedb newer.db 8 0.5.0
+
+# No server: exit 4, before anything is asked or written.
+exitcode 4 isshoni admin backup --out b.tar.gz
+stderr '^isshoni is not running \(no server on .*admin\.sock\)$'
+! exists b.tar.gz
+exitcode 4 isshoni admin rotate-secrets --yes
+exitcode 4 isshoni admin restore --yes pre-6.db
+
+fakeserver start
+
+# backup: a new file for the archive, which a second backup does not overwrite (exit 7).
+exec isshoni admin backup --out b.tar.gz
+stdout '^Wrote b\.tar\.gz \([0-9.]+ k?B\)\.$'
+stdout '^This file contains your server''s keys\. Keep it private\.$'
+! stderr .
+exists b.tar.gz
+exitcode 7 isshoni admin backup --out b.tar.gz
+! stdout .
+stderr '^isshoni admin backup: b\.tar\.gz exists, and a backup never overwrites a file: remove it, or name another --out$'
+
+# --out -: the archive on stdout and the note on stderr, as in
+# (umask 077; docker compose exec -T isshoni isshoni admin backup --out - > isshoni-backup.tar.gz).
+exec isshoni admin backup --out -
+stderr '^This file contains your server''s keys\. Keep it private\.$'
+cp stdout piped.tar.gz
+
+# The destructive commands need --yes where there is no terminal to ask on (exit 2), and print the command to
+# run. Its form is the environment's: the Docker one in a container.
+exitcode 2 isshoni admin rotate-secrets
+! stdout .
+stderr '^isshoni admin rotate-secrets: it needs a confirmation, and there is no terminal to ask on\. Add --yes:$'
+stderr 'isshoni admin rotate-secrets --yes$'
+exitcode 2 isshoni admin restore b.tar.gz
+stderr 'isshoni admin restore --yes b\.tar\.gz$'
+env ISSHONI_IN_CONTAINER=1
+exitcode 2 isshoni admin restore -
+stderr '^  docker compose exec -T isshoni isshoni admin restore --yes - < backup\.tar\.gz$'
+exitcode 2 isshoni admin rotate-secrets
+stderr '^  docker compose exec -T isshoni isshoni admin rotate-secrets --yes$'
+# There a backup needs --out too (exit 2): the error has the one form that gets the archive to the host.
+exitcode 2 isshoni admin backup
+! stdout .
+stderr '^isshoni admin backup: --out is required in a container'
+stderr '^  \(umask 077; docker compose exec -T isshoni isshoni admin backup --out - > isshoni-backup\.tar\.gz\)$'
+env ISSHONI_IN_CONTAINER=
+fakeserver show restarts
+stdout '^0$'
+
+# restore from stdin, the Docker form (docker compose exec -T isshoni isshoni admin restore --yes - <
+# backup.tar.gz): the server takes the archive and restarts, and the command waits until it is back.
+stdin piped.tar.gz
+exec isshoni admin restore --yes -
+stdout '^Restored\. The server is back \(isshoni 0\.3\.0\)\.$'
+stdout '^The state from before the restore is in the data directory: backups/pre-restore-[0-9]+T[0-9]+Z\.tar\.gz$'
+stderr '^The server accepted the backup and is restarting…$'
+fakeserver show restarts
+stdout '^1$'
+# Until it is back, the server takes no second one (the fake stays that way): exit 1, a retry later works.
+exitcode 1 isshoni admin rotate-secrets --yes
+stderr '^isshoni admin rotate-secrets: the server is shutting down$'
+
+# A database file, such as the pre-migration backups/pre-<schema>-<time>.db, replaces the database alone.
+fakeserver stop
+fakeserver start
+exec isshoni admin restore --yes pre-6.db
+stdout '^Restored\. The server is back'
+fakeserver show database
+stdout '^\{"schema":6,"app":"0\.2\.9"\}$'
+
+# A backup from a newer isshoni is refused (exit 7), and a file that is no backup is an error (exit 1).
+fakeserver stop
+fakeserver start
+exitcode 7 isshoni admin restore --yes newer.db
+! stdout .
+stderr '^isshoni admin restore: This backup is from isshoni 0\.5\.0; install 0\.5\.0 or newer first$'
+exitcode 1 isshoni admin restore --yes notes.txt
+stderr '^isshoni admin restore: this is not a backup that isshoni can restore: it is neither a backup archive \(\.tar\.gz\) nor an SQLite database file$'
+exitcode 1 isshoni admin restore --yes missing.tar.gz
+stderr '^isshoni admin restore: the backup can''t be read: '
+fakeserver show restarts
+stdout '^0$'
+
+# rotate-secrets: all four, and the wait for the server.
+exec isshoni admin rotate-secrets --yes
+stdout '^Rotated: session, invite, resume, vapid\. The server is back \(isshoni 0\.3\.0\); everyone has to sign in again\.$'
+stderr '^The server has new keys and is restarting…$'
+fakeserver show restarts
+stdout '^1$'
+
+# Flags go before the argument, and restore takes exactly one.
+exitcode 2 isshoni admin restore b.tar.gz --yes
+stderr '^isshoni admin restore: flag --yes after an argument: flags go before arguments$'
+exitcode 2 isshoni admin restore --yes
+stderr '^isshoni admin restore: missing argument PATH\|-$'
+
+-- notes.txt --
+Not a backup.

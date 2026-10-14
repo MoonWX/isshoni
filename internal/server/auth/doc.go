@@ -47,6 +47,18 @@
 //     password checks like a login; the only active admin can't delete the account (§7.11). A password change gives
 //     the caller's session a new token as a rotation of §7.4: the token the request arrived with works for 60 s
 //     more;
+//   - admin.go (README S64): UpdateUser (rename, role, status), DeleteUser, SignOutUser and UserByUsername (§7.11).
+//     At least one active admin always exists (last_admin); an admin can't disable or delete the own account
+//     through them (self_action_forbidden); making someone an admin asks for the acting admin's own password
+//     (wrong_password), which the CLI is exempt from. A rename, a role change and a status change invalidate the
+//     session cache; disabling, deleting and signing out are rows of the revocation table; a role change raises
+//     the admin_granted or admin_revoked alert;
+//   - reset.go (README S64): the admin-issued password reset of §7.10. IssuePasswordReset clears the password,
+//     takes every session and device of the user away and returns a one-time /reset#token link (24 h); a reset of
+//     another admin asks for the acting admin's password and raises the admin_password_reset alert, and nobody
+//     resets the own account this way. CheckPasswordReset and CompletePasswordReset are the public side: the
+//     token is checked before the password rules and the hash, and the completion sets the password and opens a
+//     session in one Write;
 //   - alerts.go: admin alerts (§7.11).
 //
 // A call that acts for an account takes a store.Actor and reads that account inside its own transaction (actingAs
@@ -54,9 +66,9 @@
 // that is gone or not active is forbidden. A self-service call takes the request's Principal and reads the account
 // and the caller's session the same way (loadSelf): without a live session it is unauthenticated.
 //
-// The other Service methods (admin users, password resets, the janitor) return a not-implemented error wrapping
-// api internal until the later auth slices fill them in (03 §18 slices 10 and 13); the M2 device-flow methods come
-// with their api DTOs in 03 slice 15.
+// The janitor (RunJanitor) prunes nothing until its slice fills it in (03 §18 slice 13). The two M2 methods declared
+// so far (AuthenticateBearerToken, DecideUserCode) return a not-implemented error wrapping api internal; the other
+// device-flow methods come with their api DTOs in 03 slice 15.
 //
 // Service errors are *api.Error values with the codes of 03 §12.2: the rules' FieldErrors become validation_failed
 // with a code per field, a refused throttle becomes rate_limited or server_busy with retryAfter, and an unexpected

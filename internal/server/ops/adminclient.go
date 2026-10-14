@@ -36,6 +36,12 @@ var (
 	// the socket's owner are never refused (callerMayBeRefused). The CLI exits 4 with the sudo message; doctor runs
 	// nothing.
 	ErrAdminPermission = errors.New("ops: permission denied on the admin socket")
+	// ErrAdminDial: the dial failed for a reason that is neither of the two above, so no connection was made and
+	// nothing answered: for example EINVAL for a path longer than the platform's limit on a socket address, or
+	// the call's context ending during the dial. It is not an *AdminUnreachableError: the CLI prints it as it is
+	// (exit 1). The offline commands, which only need to know whether a server answers, ask the data-directory
+	// lock instead (04 §12.6).
+	ErrAdminDial = errors.New("ops: connecting to the admin socket")
 )
 
 // AdminUnreachableError is the error of an AdminClient call that reached no server.
@@ -96,9 +102,10 @@ const (
 // opens a connection of its own, so an error always says what happened to that call. Its context bounds the call;
 // there is no other timeout.
 //
-// Errors: an *AdminUnreachableError when no server answers (ErrAdminNotRunning or ErrAdminPermission), an
-// *AdminError when the server answers with an error, and anything else for a failed exchange (a timeout, an answer
-// that is not the socket's).
+// Errors: an *AdminUnreachableError when no server answers (ErrAdminNotRunning or ErrAdminPermission), an error
+// that wraps ErrAdminDial for any other dial that failed, an *AdminError when the server answers with an error,
+// and anything else for an exchange that failed after the connection was made (a timeout, an answer that is not
+// the socket's).
 type AdminClient struct {
 	path string
 	// stranger makes every hang-up before the first answer a refusal (AssumeStranger).
@@ -428,9 +435,9 @@ func (c *AdminClient) dialError(ctx context.Context, err error) error {
 	case errors.Is(err, fs.ErrPermission):
 		return &AdminUnreachableError{Path: c.path, Kind: ErrAdminPermission, Err: err}
 	case ctx.Err() != nil:
-		return fmt.Errorf("ops: connecting to the admin socket %s: %w", c.path, ctx.Err())
+		return fmt.Errorf("%w %s: %w", ErrAdminDial, c.path, ctx.Err())
 	default:
-		return fmt.Errorf("ops: connecting to the admin socket %s: %w", c.path, err)
+		return fmt.Errorf("%w %s: %w", ErrAdminDial, c.path, err)
 	}
 }
 

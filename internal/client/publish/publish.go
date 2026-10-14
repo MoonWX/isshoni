@@ -50,10 +50,17 @@ type Options struct {
 	Audio   bool
 	// StreamID is the msid stream id of the tracks (default DefaultStreamID). The SFU maps tracks by mid.
 	StreamID string
-	// RedundantRTX (02 §17 test 19) negotiates RTX and resends already-delivered packets on the RTX stream with the
-	// repaired-rtp-stream-id extension, like Chrome's padding and probes. Not implemented yet (README S63): New
-	// returns ErrNotImplemented.
+	// RedundantRTX is a test option (02 §17 test 19) that makes the Publisher repair like a browser. It negotiates
+	// RTX for the video and answers NACKs itself: video on the RTX stream (RFC 4588), with the
+	// repaired-rtp-stream-id extension when the video is simulcast, audio as the packet again. And it sends, on the
+	// RTX stream, a second copy of the last packet of every video frame right after the frame, the way Chrome fills
+	// its padding and bandwidth probes with payloads it already delivered. A receiver must drop those copies.
 	RedundantRTX bool
+	// Padding is a test option (02 §17 test 6): after every Padding-th frame of each video layer the Publisher
+	// sends two padding-only packets on the layer's media stream, as a browser without RTX pads and probes. They
+	// take sequence numbers and carry no payload, so a receiver that forwards the stream must close the gaps they
+	// would leave. 0 sends none.
+	Padding int
 	// Logger gets the Publisher's own logs (default slog.Default()). Pion logs through Settings.LoggerFactory.
 	Logger *slog.Logger
 }
@@ -68,6 +75,7 @@ const (
 	SRInterval = time.Second
 
 	videoPT        = 96
+	rtxPT          = 97 // RedundantRTX: the video's RTX payload type
 	opusPT         = 111
 	h264FmtpPrefix = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id="
 	opusFmtp       = "minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1"
@@ -77,8 +85,6 @@ const (
 )
 
 var (
-	// ErrNotImplemented is returned by New for an option that a later slice adds.
-	ErrNotImplemented = errors.New("publish: not implemented yet")
 	// ErrInvalidOptions is wrapped by New's errors about Options.
 	ErrInvalidOptions = errors.New("publish: invalid options")
 	// ErrClosed is returned by Start after Close.
@@ -97,12 +103,16 @@ type TrackInfo struct {
 // TrackStats are one track's counters.
 type TrackStats struct {
 	TrackInfo
-	Packets, Octets   uint64 // RTP packets and payload bytes written
+	Packets, Octets   uint64 // RTP packets and payload bytes written; padding and repairs are counted apart
 	Frames, Keyframes int    // access units (audio: packets) and keyframes written
 	WriteErrors       int
 	PLIs, FIRs, NACKs int    // received for this SSRC
 	SRs               int    // sender reports written
 	LastREMB          uint64 // bps of the last REMB naming this SSRC; 0 before the first
+	// Padding counts the padding-only packets written (Options.Padding). Redundant counts the second copies sent on
+	// the RTX stream, and Retransmitted the packets sent again for a NACK (both Options.RedundantRTX; without it
+	// Pion's NACK responder answers, and nothing counts here).
+	Padding, Redundant, Retransmitted uint64
 }
 
 // Stats are a Publisher's counters.
@@ -142,8 +152,8 @@ func New(o Options) (*Publisher, error) {
 	if o.Source == nil {
 		return nil, fmt.Errorf("%w: no Source", ErrInvalidOptions)
 	}
-	if o.RedundantRTX {
-		return nil, fmt.Errorf("%w: RedundantRTX (README S63)", ErrNotImplemented)
+	if o.Padding < 0 {
+		return nil, fmt.Errorf("%w: Padding %d is negative", ErrInvalidOptions, o.Padding)
 	}
 	layers := o.Layers
 	if layers == nil {
@@ -173,7 +183,7 @@ func New(o Options) (*Publisher, error) {
 		log = slog.Default()
 	}
 
-	api, err := newAPI(o.Settings, profile)
+	api, err := newAPI(o.Settings, profile, o.RedundantRTX)
 	if err != nil {
 		return nil, err
 	}
@@ -189,13 +199,23 @@ func New(o Options) (*Publisher, error) {
 		_ = pc.Close()
 		return nil, err
 	}
+	for _, t := range p.tracks() {
+		if o.RedundantRTX {
+			t.repair = newRepair()
+		}
+		if t.kind == webrtc.RTPCodecTypeVideo {
+			t.padEvery = o.Padding
+		}
+	}
 	return p, nil
 }
 
 // newAPI builds a browser-like publishing API: the one H.264 profile the Source sends and Opus, simulcast and
 // transport-wide-cc header extensions, a NACK responder and the TWCC header-extension interceptor. No sender-report
-// interceptor: the Publisher writes its own SRs.
-func newAPI(se webrtc.SettingEngine, profile string) (*webrtc.API, error) {
+// interceptor: the Publisher writes its own SRs. With rtx (Options.RedundantRTX) the video has an RTX payload type
+// and there is no NACK responder: the tracks answer NACKs themselves (repair.go), because the RTX stream has one
+// sequence of numbers, which the second copies they send on it must share with the repairs.
+func newAPI(se webrtc.SettingEngine, profile string, rtx bool) (*webrtc.API, error) {
 	m := &webrtc.MediaEngine{}
 	videoFB := []webrtc.RTCPFeedback{
 		{Type: webrtc.TypeRTCPFBGoogREMB}, {Type: webrtc.TypeRTCPFBCCM, Parameter: "fir"},
@@ -226,6 +246,17 @@ func newAPI(se webrtc.SettingEngine, profile string) (*webrtc.API, error) {
 			return nil, fmt.Errorf("publish: register %s: %w", c.params.MimeType, err)
 		}
 	}
+	if rtx {
+		err := m.RegisterCodec(webrtc.RTPCodecParameters{
+			RTPCodecCapability: webrtc.RTPCodecCapability{
+				MimeType: webrtc.MimeTypeRTX, ClockRate: videoClock, SDPFmtpLine: "apt=" + strconv.Itoa(videoPT),
+			},
+			PayloadType: rtxPT,
+		}, webrtc.RTPCodecTypeVideo)
+		if err != nil {
+			return nil, fmt.Errorf("publish: register RTX: %w", err)
+		}
+	}
 	for _, e := range []struct {
 		uri  string
 		kind webrtc.RTPCodecType
@@ -238,16 +269,18 @@ func newAPI(se webrtc.SettingEngine, profile string) (*webrtc.API, error) {
 			return nil, fmt.Errorf("publish: register header extension %s: %w", e.uri, err)
 		}
 	}
-	responder, err := nack.NewResponderInterceptor()
-	if err != nil {
-		return nil, fmt.Errorf("publish: nack responder: %w", err)
+	ir := &interceptor.Registry{}
+	if !rtx {
+		responder, err := nack.NewResponderInterceptor()
+		if err != nil {
+			return nil, fmt.Errorf("publish: nack responder: %w", err)
+		}
+		ir.Add(responder)
 	}
 	tcc, err := twcc.NewHeaderExtensionInterceptor()
 	if err != nil {
 		return nil, fmt.Errorf("publish: twcc header extension: %w", err)
 	}
-	ir := &interceptor.Registry{}
-	ir.Add(responder)
 	ir.Add(tcc)
 	return webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(ir),
 		webrtc.WithSettingEngine(se)), nil
@@ -577,7 +610,7 @@ func (p *Publisher) srLoop(ctx context.Context) {
 }
 
 // rtcpLoop reads one track's RTCP until the sender stops. Reading also runs the interceptors' RTCP handling (the
-// NACK responder).
+// NACK responder); with Options.RedundantRTX the track answers the NACKs here.
 func (p *Publisher) rtcpLoop(t *track, read func([]byte) (int, error)) {
 	defer p.wg.Done()
 	buf := make([]byte, 1500)
@@ -593,6 +626,9 @@ func (p *Publisher) rtcpLoop(t *track, read func([]byte) (int, error)) {
 		for _, pkt := range pkts {
 			if layer, key := t.onRTCP(pkt); key {
 				p.src.RequestKeyframe(layer)
+			}
+			if nack, ok := pkt.(*rtcp.TransportLayerNack); ok {
+				t.answerNACK(nack)
 			}
 		}
 	}

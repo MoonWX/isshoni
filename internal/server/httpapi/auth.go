@@ -10,10 +10,10 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/store"
 )
 
-// The auth endpoints of 03 §12.3 that exist so far: login (#2), logout (#3), setup/check (#7) and setup/complete
-// (#8) (README S30), and register (#5) and invite/check (#6) (README S42). All are Public: the chain's CSRF step
-// still applies, and the throttles are auth's (03 §7.3). logout-everywhere (#4) is a User route and sits with the
-// rest of self-service in account.go. The reset links come with the admin users slice.
+// The auth endpoints of 03 §12.3: login (#2), logout (#3), setup/check (#7) and setup/complete (#8) (README S30),
+// register (#5) and invite/check (#6) (README S42), and reset/check (#9) and reset/complete (#10) (README S64). All
+// are Public: the chain's CSRF step still applies, and the throttles are auth's (03 §7.3). logout-everywhere (#4)
+// is a User route and sits with the rest of self-service in account.go.
 
 // apiUser is the public identity shape {id, username, role} of a user (03 §12.4.2).
 func apiUser(u store.User) api.User {
@@ -105,6 +105,48 @@ func (a *API) postSetupComplete(w http.ResponseWriter, r *http.Request) {
 	a.d.Auth.SetSessionCookie(w, res.Token, res.Session.IdleExpiresAt)
 	a.sessionChanged(res.User.ID)
 	WriteJSON(w, http.StatusCreated, api.UserResponse{User: apiUser(res.User)})
+}
+
+// postResetCheck is POST /api/v1/auth/reset/check (03 §12.3 #9, §7.10): {token} → 200 {username}, the account the
+// link resets, so the page says whose password it is before the form is filled in. Errors: 404 reset_token_invalid
+// (unknown, used, replaced or expired), 403 account_pending or account_disabled (a live link of an account that
+// can't use it yet), 429 rate_limited.
+func (a *API) postResetCheck(w http.ResponseWriter, r *http.Request) {
+	var req api.TokenRequest
+	if err := DecodeJSON(w, r, &req, authBodyLimit); err != nil {
+		WriteError(w, r, err)
+		return
+	}
+	username, err := a.d.Auth.CheckPasswordReset(r.Context(), req.Token, a.d.Auth.RequestMeta(r))
+	if err != nil {
+		WriteError(w, r, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, api.ResetCheckResponse{Username: username})
+}
+
+// postResetComplete is POST /api/v1/auth/reset/complete (03 §12.3 #10, §7.10): {token, password} → 200 {user} with
+// the session cookie: the password is set, the link is used up, and its holder is logged in. Errors: 404
+// reset_token_invalid (checked first, before the password and the hash), 403 account_pending or account_disabled,
+// 422 validation_failed {password: code}, 429 rate_limited, 503 server_busy. A request that arrives with a session
+// cookie loses that old session (03 §7.4).
+//
+// The user's tabs hear of the new session, and the admins' user lists of the reset that is no longer pending.
+func (a *API) postResetComplete(w http.ResponseWriter, r *http.Request) {
+	var req api.ResetCompleteRequest
+	if err := DecodeJSON(w, r, &req, authBodyLimit); err != nil {
+		WriteError(w, r, err)
+		return
+	}
+	res, err := a.d.Auth.CompletePasswordReset(r.Context(), req.Token, req.Password, a.d.Auth.RequestMeta(r))
+	if err != nil {
+		WriteError(w, r, err)
+		return
+	}
+	a.d.Auth.SetSessionCookie(w, res.Token, res.Session.IdleExpiresAt)
+	a.sessionChanged(res.User.ID)
+	a.usersChanged()
+	WriteJSON(w, http.StatusOK, api.UserResponse{User: apiUser(res.User)})
 }
 
 // postInviteCheck is POST /api/v1/auth/invite/check (03 §12.3 #6, §12.4.2): {token} → 200 InviteInfo, what the

@@ -29,6 +29,12 @@ type track struct {
 	tsBase         uint32
 	pay            codecs.H264Payloader
 	midExt, ridExt []byte
+	frames         int // frames written (video)
+
+	// The test options, set by New before the track is bound: padEvery is Options.Padding (video), and repair is
+	// there with Options.RedundantRTX (repair.go).
+	padEvery int
+	repair   *repair
 
 	mu      sync.Mutex // guards the fields below
 	b       *binding
@@ -44,6 +50,11 @@ type binding struct {
 	ssrc         uint32
 	pt           uint8
 	midID, ridID uint8 // header extension IDs; 0 when not negotiated
+	// The RTX stream of the track's payload type: its SSRC and payload type, 0 when RTX isn't negotiated for it, and
+	// the ID of the repaired-rtp-stream-id header extension, which names the rid an RTX packet repairs.
+	rtxSSRC uint32
+	rtxPT   uint8
+	rridID  uint8
 }
 
 func newTrack(kind webrtc.RTPCodecType, id, stream, rid, layer, profile string) *track {
@@ -76,7 +87,12 @@ func (t *track) Bind(ctx webrtc.TrackLocalContext) (webrtc.RTPCodecParameters, e
 				b.midID = uint8(e.ID)
 			case sdp.SDESRTPStreamIDURI:
 				b.ridID = uint8(e.ID)
+			case sdp.SDESRepairRTPStreamIDURI:
+				b.rridID = uint8(e.ID)
 			}
+		}
+		if pt, ok := rtxFor(c.PayloadType, ctx.CodecParameters()); ok && ctx.SSRCRetransmission() != 0 {
+			b.rtxSSRC, b.rtxPT = uint32(ctx.SSRCRetransmission()), pt
 		}
 		t.mu.Lock()
 		t.b = b
@@ -135,28 +151,38 @@ func (t *track) write(pkt fake.Packet, ticks uint32, ntp uint64) bool {
 	if t.kind == webrtc.RTPCodecTypeVideo {
 		payloads = t.pay.Payload(PayloadMTU, pkt.Data)
 	}
+	video := t.kind == webrtc.RTPCodecTypeVideo
 	var octets uint64
 	errs := 0
 	for i, payload := range payloads {
 		hdr := rtp.Header{
 			Version:        2,
-			Marker:         t.kind == webrtc.RTPCodecTypeVideo && i == len(payloads)-1,
+			Marker:         video && i == len(payloads)-1,
 			PayloadType:    b.pt,
 			SequenceNumber: t.seq,
 			Timestamp:      ts,
 			SSRC:           b.ssrc,
 		}
 		t.seq++
-		if b.midID != 0 && t.midExt != nil {
-			_ = hdr.SetExtension(b.midID, t.midExt)
-		}
-		if b.ridID != 0 && t.ridExt != nil {
-			_ = hdr.SetExtension(b.ridID, t.ridExt)
+		t.identify(&hdr, b)
+		if t.repair != nil {
+			t.repair.keep(hdr.SequenceNumber, ts, hdr.Marker, payload)
 		}
 		if _, err := b.w.WriteRTP(&hdr, payload); err != nil {
 			errs++
 		}
 		octets += uint64(len(payload))
+	}
+	var padding, redundant uint64
+	if video && len(payloads) > 0 {
+		t.frames++
+		// The second copy of the frame's last packet, on the RTX stream (Options.RedundantRTX).
+		if t.repair != nil && b.rtxSSRC != 0 && t.frames > redundantAfter && t.resend(b, t.seq-1) {
+			redundant = 1
+		}
+		if t.padEvery > 0 && t.frames%t.padEvery == 0 {
+			padding = t.pad(b, ts)
+		}
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -164,11 +190,42 @@ func (t *track) write(pkt fake.Packet, ticks uint32, ntp uint64) bool {
 	t.stats.Packets += uint64(len(payloads))
 	t.stats.Octets += octets
 	t.stats.WriteErrors += errs
+	t.stats.Padding += padding
+	t.stats.Redundant += redundant
 	t.stats.Frames++
 	if pkt.Keyframe {
 		t.stats.Keyframes++
 	}
 	return true
+}
+
+// identify adds the mid and rid header extensions to a packet of the track's media stream, when they are
+// negotiated. Only the send loop calls it.
+func (t *track) identify(hdr *rtp.Header, b *binding) {
+	if b.midID != 0 && t.midExt != nil {
+		_ = hdr.SetExtension(b.midID, t.midExt)
+	}
+	if b.ridID != 0 && t.ridExt != nil {
+		_ = hdr.SetExtension(b.ridID, t.ridExt)
+	}
+}
+
+// pad writes padPackets padding-only packets after a frame with timestamp ts (Options.Padding): the next sequence
+// numbers of the media stream, the frame's timestamp, no payload, padSize bytes of padding. It returns how many were
+// written. Only the send loop calls it.
+func (t *track) pad(b *binding, ts uint32) (written uint64) {
+	for range padPackets {
+		hdr := rtp.Header{
+			Version: 2, Padding: true, PaddingSize: padSize, PayloadType: b.pt, SequenceNumber: t.seq, Timestamp: ts,
+			SSRC: b.ssrc,
+		}
+		t.seq++
+		t.identify(&hdr, b)
+		if _, err := b.w.WriteRTP(&hdr, nil); err == nil {
+			written++
+		}
+	}
+	return written
 }
 
 // senderReport returns the SR for the last frame sent: NTP = wall clock at its capture, RTP = its timestamp, and the

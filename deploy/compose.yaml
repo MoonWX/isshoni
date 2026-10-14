@@ -1,0 +1,32 @@
+# isshoni. Start: docker compose up -d   Then: docker compose exec isshoni isshoni setup-url
+# Put ISSHONI_DOMAIN=share.example.com in a .env file next to this file, or leave it empty for an IP certificate.
+# isshoni gets its certificate from Let's Encrypt. Using it means you accept the Let's Encrypt Subscriber Agreement: https://letsencrypt.org/repository/
+# Docs: https://moonwx.github.io/isshoni/install/docker
+name: isshoni
+services:
+  isshoni:
+    image: ghcr.io/moonwx/isshoni:latest
+    restart: unless-stopped
+    ports:
+      - "80:80/tcp"       # ACME HTTP-01, redirect to HTTPS
+      - "443:443/tcp"     # HTTPS, signaling, ICE-TCP fallback
+      - "7882:7882/udp"   # media
+      - "7882:7882/tcp"   # ICE-TCP
+    environment:
+      ISSHONI_DOMAIN: ${ISSHONI_DOMAIN:-}        # empty: certificate for the public IP
+      ISSHONI_PUBLIC_IP: ${ISSHONI_PUBLIC_IP:-}  # empty: detected with STUN (required behind Docker's NAT)
+    volumes:
+      - data:/var/lib/isshoni                    # mandatory: users, rooms, certificates
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run/isshoni:uid=65532,gid=65532,mode=0750   # admin socket (healthcheck, setup-url, backup)
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+volumes:
+  data:

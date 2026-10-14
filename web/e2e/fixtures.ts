@@ -242,7 +242,7 @@ export async function openToneTab(context: BrowserContext, server: Pick<E2EServe
   try {
     body = await fsp.readFile(file, 'utf8');
   } catch (err) {
-    throw new Error('web/e2e/tone.html does not exist yet: it comes with the first spec that shares (README S66)', {
+    throw new Error('cannot read web/e2e/tone.html, the tone tab that the sharing specs capture', {
       cause: err,
     });
   }

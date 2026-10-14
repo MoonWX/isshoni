@@ -163,6 +163,11 @@ type fakeSignal struct {
 	notes []string
 	// presence is what RoomPresence returns (setPresence); nil means two participants and one share in the Lounge.
 	presence map[store.RoomID]RoomPresence
+	// online is what OnlineUserIDs returns (setOnline); nil means the fake auth service's member alone.
+	online map[store.UserID]struct{}
+	// changes are the UserChanged calls, each with what the hub was told: "<id> <username> admin=<bool>"
+	// (takeChanges).
+	changes []string
 }
 
 func (f *fakeSignal) record(call string) {
@@ -188,13 +193,41 @@ func (f *fakeSignal) setPresence(p map[store.RoomID]RoomPresence) {
 }
 
 func (f *fakeSignal) OnlineUserIDs() map[store.UserID]struct{} {
-	return map[store.UserID]struct{}{userPrincipal.UserID: {}}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.online == nil {
+		return map[store.UserID]struct{}{userPrincipal.UserID: {}}
+	}
+	return maps.Clone(f.online)
+}
+
+// setOnline replaces the users that OnlineUserIDs reports.
+func (f *fakeSignal) setOnline(ids ...string) {
+	online := map[store.UserID]struct{}{}
+	for _, id := range ids {
+		online[store.UserID(id)] = struct{}{}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.online = online
 }
 
 func (f *fakeSignal) RoomDeleted(id store.RoomID) { f.record("room_deleted " + string(id)) }
 
-func (f *fakeSignal) UserChanged(id store.UserID, _ string, _ bool) {
+func (f *fakeSignal) UserChanged(id store.UserID, username string, admin bool) {
 	f.record("user_changed " + string(id))
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.changes = append(f.changes, fmt.Sprintf("%s %s admin=%t", id, username, admin))
+}
+
+// takeChanges returns the UserChanged calls recorded so far and clears them.
+func (f *fakeSignal) takeChanges() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := f.changes
+	f.changes = nil
+	return out
 }
 
 func (f *fakeSignal) Notify(t NotifyTarget, topics ...protocol.Topic) {

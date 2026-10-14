@@ -119,7 +119,7 @@ governed by the license gate (06).
 
 | Command | What it does | Talks to |
 |---|---|---|
-| `isshoni serve [config flags]` | Runs the server. Docker `CMD ["serve"]` | – |
+| `isshoni serve [config flags]` | Runs the server until SIGTERM or SIGINT, then shuts down gracefully (§6.4). SIGHUP is ignored until the reload of §6.5 exists (decided after group 7: README S65 ignores it, README S90 reloads), so `systemctl reload isshoni` neither reloads nor stops the server. Docker `CMD ["serve"]` | – |
 | `isshoni setup-url [--qr\|--no-qr] [--wait DUR] [--json]` | Mints a one-time setup link and prints it (plus a QR code on a TTY). `--wait` is for Docker and manual use; install.sh waits with `healthcheck --ready` and then calls `setup-url` once | admin socket |
 | `isshoni doctor [--json] [--strict] [--only ID,…] [--list-checks] [--bandwidth-flags…]` | Diagnostics (§13). Works with or without a running server. `--only` runs the named checks (install.sh uses `dns,public_ip,clock` before the first start); `--list-checks --json` prints a JSON array of the check ids (06's anchor test, §13.1) | admin socket if up |
 | `isshoni healthcheck [--ready] [--wait DUR]` | Liveness (default) or readiness. Docker `HEALTHCHECK` (liveness); install.sh uses `--ready` | admin socket |
@@ -254,7 +254,7 @@ flag  >  env  >  file  >  [policy keys only: admin UI setting in the DB]  >  bui
   path is fine (Docker runs on env only). A missing file at an explicit path is error 78.
 - The file is read-only to the service (install.sh: `root:isshoni 0640`, 06). The server never writes it.
 - Changes need a restart (`systemctl restart isshoni`); clients reconnect on their own (§6.4). `SIGHUP` reloads only
-  manual TLS files and `log.level` (§6.5).
+  manual TLS files and `log.level` (§6.5), from README S90 on; until then `serve` ignores the signal (§6.5).
 - Relative paths (dev only) are resolved against the working directory at startup.
 
 ### 4.2 Naming rule (mechanical, one registry)
@@ -773,9 +773,14 @@ func (s *Server) Site() config.Site
 func (s *Server) Addrs() Addrs // as bound: a configured port 0 shows as the port the kernel picked
 
 type Addrs struct {
-	HTTP  net.Addr // listen.http: the app in off mode; else the plain port (ACME http-01, redirect; §8.3)
-	HTTPS net.Addr // listen.https: the 443 multiplexer (S44); nil in off mode
-} // later slices add the ICE ports and the metrics listener
+	HTTP   net.Addr // listen.http: the app in off mode; else the plain port (ACME http-01, redirect; §8.3)
+	HTTPS  net.Addr // listen.https: the 443 multiplexer (S44); nil in off mode
+	ICEUDP net.Addr // listen.ice_udp (S59): a *net.UDPAddr, the first of the media sockets (one per local address
+	                // that carries media, all on one port); nil when UDP is off
+	ICETCP net.Addr // listen.ice_tcp (S59): a *net.TCPAddr with the host as configured; nil when that listener is
+	                // off. ICE-TCP on the HTTPS port has no address of its own: it is HTTPS's (§7.2)
+} // ICEUDP and ICETCP are both nil on a server that started without media sockets (§6.2). A later slice adds the
+  // metrics listener (README S85)
 
 type ShutdownReason string // "stop" | "restart" | "restore"
 
@@ -812,11 +817,29 @@ goroutine and does not wait for it: its own request would hold up the HTTP step.
    Offline doctor's `schema` fix uses the same formatter (§13.2). Then pin the policy settings that the config sets
    (§4.6); a value that `Pin` rejects → exit 78.
 5. Detect public addresses (§7.4; ≤ 5 s). A detection that finds nothing is no error: the server goes on, and
-   where its site is the address it starts without a site and is not ready (§6.2).
+   where its site is the address it starts without a site and is not ready (§6.2). The detection runs in every
+   mode, off mode too (README S59): off mode's site is the proxy's, but the addresses in its ICE candidates are
+   the detected ones.
 6. Bind listeners: 443 `PortMux`, 80, metrics, admin socket; then `netx.NewTransport` binds 7882/udp (per local IP)
    and 7882/tcp. `NewTransport` is the only code that binds 7882. A busy port → exit 1 with the owner if known
    ("port 443 is in use (another web server?). Stop it, or run isshoni behind it with `tls.mode = "off"`"; "port
    7882/udp is in use (another isshoni?). Stop it, or change `listen.ice_udp`").
+
+   As README S59 built the step (`Server.Start`, `listenICE` in `public.go`):
+   - **The order** is the 443 multiplexer (not in off mode), `listen.http`, the admin socket; then the site is
+     made from the bound HTTP ports and the detected addresses, which says whether the server has to wait for
+     its address (§6.2); and last the Transport: `listen.ice_udp` on every local address that carries media,
+     `listen.ice_tcp`, and the reader of the multiplexer's ICE side, which had none before. The metrics listener
+     is still README S85's: with `metrics.enabled` the server warns that nothing listens on `metrics.listen`.
+   - **A media port that can't be bound** is a runtime error (exit 1) that names the key and its value: "port
+     7882/udp is in use (another isshoni?). Stop it, or change listen.ice_udp (now ":7882")", the same for
+     `7882/tcp` with `listen.ice_tcp`, and for a port the process may not bind "isshoni may not listen on
+     listen.ice_udp = ":80" (a port below 1024 needs CAP_NET_BIND_SERVICE, which the systemd unit and the
+     container image grant)".
+   - **A machine without a local address for media** (`netx.ErrNoTransport`: as a rule the network is not up
+     yet) ends the start too, with "no usable network address for media yet (is the network up?). isshoni starts
+     once there is one; systemd and Docker try again by themselves", unless the server has to wait for its
+     public address anyway: that one starts without media sockets (§6.2, §6.3).
 7. Start the TLS manager (certificate is obtained asynchronously).
 8. Build the components and adapters of §6.6 on top of the existing Transport, in this order: `push.New` (VAPID
    fingerprint check and purge; not built with `push.enabled=false`), then `auth.New` (session and invite fingerprint
@@ -826,6 +849,15 @@ goroutine and does not wait for it: its own request would hold up the HTTP step.
 10. Log one line: `isshoni 0.3.0 ready: https://203.0.113.7 (tls=ip) media udp/7882 ice-tcp 443,7882`. If no admin
     exists: "Finish setup: run `sudo isshoni setup-url` (Docker: `docker compose exec isshoni isshoni setup-url`)". The
     setup token itself is **never** logged.
+
+    The ready line as README S59 built it (`mediaPorts` in `public.go`): the media part names the ports that the
+    server's ICE candidates carry, read from `Transport.Advertised`, not from the config, so a port 0 shows as
+    the port the kernel picked. `ice-tcp` lists the 443 multiplexer's port first and then `listen.ice_tcp`'s,
+    each only when it is up; a transport that is off shows as `off`: `media udp/off ice-tcp 443` for a TLS-mode
+    server with both 7882 listeners turned off, `media udp/7882 ice-tcp 7882` in off mode, `media udp/7882
+    ice-tcp off` in off mode without `listen.ice_tcp`. The line has the attributes `listen` (the main listener:
+    `listen.https`, or `listen.http` in off mode) and, in a TLS mode, `listen_http` (the plain port). A server
+    that waits for its public address logs the WARN line of §6.2 instead, and no setup hint: it has no accounts.
 
 ### 6.2 Liveness and readiness
 
@@ -841,10 +873,25 @@ goroutine and does not wait for it: its own request would hold up the HTTP step.
 
 Liveness is false after shutdown began. Endpoints: §11.1.
 
-**The checks as the wiring registers them** (README S54). `tls` and `public_ip` are registered by `Start` (S44),
-`db` and `signal` by `wire` with their components, and `media` comes with the SFU (README S59). A server without
-a site (below) has no hub, so it has no `signal` check; its `db` check is there all the same. `signal` says
-"signaling is shutting down" once `Hub.Ready()` is false.
+**The checks as the wiring registers them** (README S54, S59). `tls` and `public_ip` are registered by `Start`
+(S44), `db` and `signal` by `wire` with their components, and `media` by `wireMedia` with the SFU (README S59).
+A server without a site (below) has no hub, so it has no `signal` check; its `db` and `media` checks are there
+all the same. `signal` says "signaling is shutting down" once `Hub.Ready()` is false.
+
+**The `media` check as README S59 built it** (`mediaCheck` in `wire.go`, `TestMediaCheck`). It is ready when the
+server has a way in for media and the SFU takes connections, and otherwise says which of the two is missing:
+
+| State | The check says |
+|---|---|
+| `listen.ice_udp` is set and no UDP socket is bound | "no UDP socket is bound for media (listen.ice_udp)" |
+| `listen.ice_udp` is `""` and no ICE-TCP mux is up (neither the 443 multiplexer's ICE side nor `listen.ice_tcp`) | "UDP is off (listen.ice_udp) and no ICE-TCP listener is up" |
+| `SFU.Ready()` returns an error (the SFU is closed) | "the media server is closed" |
+| The server started without media sockets (below) | "no usable local network address for media; isshoni restarts itself when it finds its public address" |
+
+A TLS-mode server with both 7882 listeners turned off is ready on the 443 multiplexer's ICE side alone
+(`TestMediaOnThe443Port`); the same config in off mode has no way in for media and is a config error (§4.5). A
+server without a site has its SFU all the same, on the ports it bound: nothing can join it, and the check and
+the status say what the next start will serve media on.
 
 **The `db` check keeps its answer for 1 s** (README S54; `dbCheck` in `wire.go`). `/readyz` is public, and a ping
 takes the store's one writer connection, so a check that pinged for every request would let anyone keep the writer
@@ -874,7 +921,7 @@ What the operator sees on such a server:
 
 | Where | What |
 |---|---|
-| The log | WARN `public address detection failed` from `netx` when the detection itself failed, then its INFO line `public addresses` with neither a `public_ipv4` nor a `public_ipv6` attribute (`nat=unknown`, or `nat=cgnat_likely` when the default route's interface has a carrier-NAT address and no STUN server answered); in ip mode WARN from `tls`: `tls.mode "ip" has no public IP address to get a certificate for; set public_ip and restart`; and in place of the "ready" line of §6.1 step 10, WARN `isshoni 0.3.0 started without a public IP address (tls=ip) and is not ready: set public_ip to this server's public address, or set domain, and restart` |
+| The log | WARN `public address detection failed` from `netx` when the detection itself failed, then its INFO line `public addresses` with neither a `public_ipv4` nor a `public_ipv6` attribute (`nat=unknown`, or `nat=cgnat_likely` when the default route's interface has a carrier-NAT address and no STUN server answered); in ip mode WARN from `tls`: `tls.mode "ip" has no public IP address to get a certificate for; set public_ip and restart`; and in place of the "ready" line of §6.1 step 10, WARN `isshoni 0.3.0 started without a public IP address (tls=ip) and is not ready: set public_ip to this server's public address, or set domain, and restart. isshoni looks for the address again every 10m0s and restarts itself when it finds one` (the interval is the detection's: 30 s on such a server once README S65 has built the decision below) |
 | Readiness | `public_ip`: "no public IP address found; set public_ip and restart". In ip mode also `tls`: "no public IP address to get a certificate for" (there is no name to order a certificate for, so no ACME request is made). Liveness is true: the process is healthy, and Docker's `HEALTHCHECK` passes |
 | `isshoni healthcheck --ready`, the admin socket's `/v1/ready` | not ready (exit 1), with the two checks. install.sh's wait for readiness ends at its timeout and prints the journal's last lines and doctor's output (06 §4.10) |
 | Port 80 | **503** with `Retry-After: 30` and the waiting page (§8.3) for every request outside `/.well-known/acme-challenge/`: there is no origin to redirect to |
@@ -890,7 +937,8 @@ simply `sudo systemctl restart isshoni` once the network is up.
 process that ended, not on one that runs and is not ready, and Docker's `HEALTHCHECK` is liveness, which passes.
 What staying up gives is a server that says why, in every place of the table above.
 
-**So it restarts itself, once it finds an address** (decided after group 6; README S59 implements it). As groups
+**So it restarts itself, once it finds an address** (decided after group 6; README S59 implemented it:
+`publicAddrsChanged` and `askRestart` in `public.go`, `TestRestartsWhenThePublicAddressAppears`). As groups
 5 and 6 left it, a cause that was gone a minute after boot still left the server not ready until a person
 restarted it: the periodic detection of §7.4, wired by README S54, looks again every 10 minutes, but it reported
 an address that showed up the way it reports any change, with a warning that says to restart isshoni. On a
@@ -910,8 +958,44 @@ server whose only problem is that it started too early, that message asks a pers
 - What the operator sees is the table above until then, and afterwards a log line that says why the server
   restarts, followed by the ordinary start. Setting `public_ip` or `domain` and restarting by hand stays the fix
   that every message names: it does not depend on the detection.
-- The decision names ip mode. Manual mode without a `domain` is the other state without a site; whether it
-  restarts the same way is README S59's to settle when it builds this, and its PR says which.
+- The decision names ip mode. Manual mode without a `domain` is the other state without a site, and README S59
+  settled it the same way: the rule is for every server whose site is its address and that found none
+  (`siteIsAddress` with an empty origin, the field `awaitsAddress`), so such a manual-mode server restarts too.
+- **As built.** A look counts when the addresses it found make a site (`config.NewSite` succeeds with them).
+  The server then logs INFO `public IP address found: isshoni restarts to take it as its site` with the
+  `public_ip` attribute and leaves word for `Run`, which shuts down for the reason `restart` and returns
+  `ErrRestartRequested`. A stop that arrives in the same moment wins: the operator's word. `cmd/isshoni`'s exit
+  75 message names this restart next to the one after a restore.
+
+**It looks every 30 s while it waits** (decided after group 7; README S65 implements it). The periodic detection
+looks every 10 minutes, which is right for its first purpose, noticing that a VPS's address changed, and wrong
+for this one: a server that started a few seconds before its network would be not ready for up to ten minutes,
+with install.sh's wait for readiness (180 s at most, 06 §4.10) long over. So a server that **waits for its
+public address** looks again every **30 s**; every other server keeps the 10 minutes (§7.4). The shorter
+interval lasts only as long as the wait, since the look that finds the address ends the process. While
+`public_ip` is `auto` each look sends one STUN packet per server, as every look does (§7.4). As merged after
+group 7 the interval is still 10 minutes for every server (`publicRedetectEvery`), and the WARN line of the
+table above names whatever interval the server uses.
+
+**Such a server also starts before the network is up, without media sockets** (README S59's review;
+`listenICE` in `public.go`, `TestStartsBeforeTheNetworkIsUp`). What most often keeps the public address away at
+boot is a network that isn't up yet, and such a machine has no local address for the media sockets either:
+`netx.NewTransport` returns `ErrNoTransport`. The two servers differ in who makes the next start:
+- **A server that waits for its address** goes on. It is not ready whatever happens to the sockets, and what a
+  server lacks from outside never stops the start (§6.3). It logs WARN `no local network address can carry media
+  yet (is the network up?): isshoni starts without media sockets` from `netx` with the cause, binds no
+  `listen.ice_udp` and no `listen.ice_tcp`, builds no SFU, and closes the 443 multiplexer's ICE side, so a
+  connection that speaks ICE there is closed at once instead of waiting in a queue that nobody reads. The checks
+  `public_ip` and `media` both fail and say why (the last row of the `media` table above), `Addrs().ICEUDP` and
+  `ICETCP` are nil, the status advertises nothing and lists no `listen.ice_*` listener, and the shutdown has no
+  step 4. The look that finds the address restarts it like every server that waited, and the next start binds
+  the sockets. Failing instead would hand the wait to the service manager, and systemd gives up after five
+  failures in a row, which with 06's unit take a quarter of a minute.
+- **A server that knows its site** (off mode, a domain, a literal or detected address) does not start without a
+  way in for media: it would be ready for everything but what it is for. The start ends with the runtime error
+  of §6.1 step 6 (exit 1), which systemd's and Docker's restarts answer, and which is over once the network is
+  up (`TestNoLocalAddressWithASite`). That includes the next process of a server that waited, when it has its
+  address by then and still no local address for media.
 
 ### 6.3 Refusing to start
 
@@ -938,9 +1022,18 @@ Reasons (codes, used in logs and doctor): `schema_newer`, `migration_failed`, `d
 **Not refusals** (S44): what the server lacks from outside never stops the start. A certificate that can't be had
 yet, in any mode, and a public address that the detection didn't find leave a running server that is not ready
 (§6.2, §8.2), where the admin socket and doctor can say why. The certificate then arrives by itself once its
-cause is gone (certmagic retries, manual files are polled); the address takes a restart, which an ip-mode server
-asks for itself once its periodic detection finds one (§6.2, decided after group 6). Exit 78 is for what only the
-operator can change on this machine.
+cause is gone (certmagic retries, manual files are polled); the address takes a restart, which a server that
+waits for its address asks for itself once its periodic detection finds one (§6.2, decided after group 6). Exit
+78 is for what only the operator can change on this machine.
+
+**The media sockets** (README S59) follow the same line, with one difference. A server that waits for its public
+address starts **without media sockets** when the machine has no local address that can carry media, and its
+`media` check says so (§6.2): the missing network is what it is waiting for anyway. Every other server ends the
+start there with a **runtime error, exit 1**, not a refusal: "no usable network address for media yet (is the
+network up?). isshoni starts once there is one; systemd and Docker try again by themselves". A busy media port
+and a port the process may not bind are runtime errors too (§6.1 step 6). None of them is exit 78, because a
+restart can fix each one. What the config itself rules out stays a config error with exit 78: no media
+transport at all (`listen.ice_udp` and `listen.ice_tcp` both `""` without a 443 multiplexer, §4.5).
 
 ### 6.4 Graceful shutdown: what clients see
 
@@ -952,7 +1045,7 @@ and for a restore or `rotate-secrets` restart:
 | 1. `readyz` → 503 `shutting_down` | 0 | Load balancers/monitors stop sending |
 | 2. New `/ws` upgrades and API calls → 503 `server_shutdown` (`Retry-After: 5`) | 0 | |
 | 3. `Hub.Shutdown(ctx, reason)` (01): every connection gets `server.shutdown{reason, reconnectInMs}` and `error{code: "server_shutdown", retryable: true, scope: "connection"}`, then WebSocket close **1012 (Service Restart)**. The wire reason is `restart` for SIGTERM, restore and rotation (SIGTERM can't tell stop from restart) | ≤ 2 s | The SPA shows "Server restarting… reconnecting" and reconnects after `reconnectInMs`; after the restart it rejoins and re-publishes (01 §10.5–§10.6) |
-| 4. `SFU.Close()` closes all PeerConnections (concurrently; 02 guarantees it returns within 1 s); then `Transport.Close()` closes the muxes | ≤ 1 s | |
+| 4. `SFU.Close()` closes all PeerConnections (concurrently; 02 guarantees it returns within 1 s); then `Transport.Close()` closes the muxes | ≤ 1 s for the SFU; two budgets of their own as built, 1.25 s and then 0.25 s (below) | |
 | 5. `http.Server.Shutdown` on all servers, then `PortMux.Close()` (closes the raw :443 listener and both sub-listeners; the ICE sub-listener may already be closed by `Transport.Close`, which is harmless) | ≤ 5 s | Idle keep-alives close |
 | 6. Stop the TLS manager (`tlsmgr.Manager.Shutdown`, §8.2: no order, renewal or reload writes the certificate storage after it; S44), flush transfer counters, drain the push queue (≤ 2 s), close the admin socket, close the store (WAL checkpoint) | ≤ 2 s | |
 | 7. Exit 0 (or re-exec, §6.5) | total ≤ `shutdown_timeout` (10 s); a forced shutdown up to 1 s more for the store's close (below) | |
@@ -961,9 +1054,25 @@ A step that runs out of its budget closes by force what it still has (a request 
 shutdown goes on: everything is released all the same. The server logs a warning, `Shutdown` returns an error
 wrapping `ErrShutdownForced`, and after a stop the process still exits 0.
 
-**Step 6 as the wiring built it** (README S54; `Server.shutdown`). The budgets of steps 3 to 6 are 2 + 1 + 5 + 2 s,
-the default `shutdown_timeout`, which bounds the whole shutdown whatever the steps would like. Two things in step
-6 are more exact than the table:
+**Step 4 has two budgets** (README S59's review; `sfuShutdownBudget`, `transportShutdownBudget`,
+`TestSFUShutdownBudget`, `TestShutdownOrder`). The order inside the step matters: the SFU never closes a socket,
+and the Transport must outlive it (02 §6.1). With one budget of 1 s for both, an SFU that keeps its word and
+returns after exactly the second it gives its PeerConnections would run out of the step's time in the same
+moment, be counted as forced, and have the Transport closed under it instead of after it. So each part has its
+own budget, and the second begins when the first has returned:
+- **the SFU: 1.25 s**, the second that `SFU.Close` may take (02's `closeTimeout`, README §4) and a margin, so the
+  step sees the SFU return;
+- **the Transport: 0.25 s**, which begins after it. Closing sockets takes no time to speak of.
+
+Only an SFU that breaks its word and is still closing when its budget ends has the Transport closed under what
+it still holds, which is what "by force" means for this step; either call then finishes on its own. A shutdown
+with a share being watched needs neither budget (`TestShutdownWithMedia` in `itest`: well under 3 s, nothing
+forced, no warning of the server's own). A server that started without media sockets has neither part (§6.2).
+
+**Step 6 as the wiring built it** (README S54; `Server.shutdown`). The budgets of steps 3 to 6 are 2 + 1.5 + 5 +
+2 s, half a second more than the default `shutdown_timeout`, which bounds the whole shutdown whatever the steps
+would like: a shutdown in which every step runs out of time has that much less for its last one. Two things in
+step 6 are more exact than the table:
 - **The admin socket closes in step 6, not earlier.** The operator's CLI can ask the server until then: its health
   and ready answers have said "shutting down" since step 1, `status` still answers, and every other request gets
   503 `server_shutdown` (§12.2). The order inside the step is: the TLS manager, now that nothing handshakes any
@@ -980,8 +1089,9 @@ the default `shutdown_timeout`, which bounds the whole shutdown whatever the ste
   it finish on its own; the step is then named in the `ErrShutdownForced` error.
 - Last of all the data-directory lock is released, so that the process that follows (a re-exec, the next start)
   can take it.
-- A server without a site has no hub: step 3 is skipped. Step 4 is empty until the SFU is wired (README S59), and
-  "flush transfer counters" and "drain the push queue" join step 6 with README S85 and S71.
+- A server without a site has no hub: step 3 is skipped. "Flush transfer counters" and "drain the push queue"
+  join step 6 with README S85 and S71. Step 6 also ends the settings callback that passes the admin's limit on
+  to the SFU, which is closed by then.
 
 A second SIGTERM/SIGINT exits immediately with code 1. 06 sets systemd `TimeoutStopSec=20` and compose
 `stop_grace_period: 20s`.
@@ -990,6 +1100,15 @@ A second SIGTERM/SIGINT exits immediately with code 1. 06 sets systemd `TimeoutS
 
 - `SIGHUP`: reload manual TLS files and `log.level` from the config file; everything else needs a restart.
   06: `ExecReload=/bin/kill -HUP $MAINPID`.
+- **Until the reload exists, `serve` ignores `SIGHUP`** (decided after group 7; README S65 implements the
+  ignoring, README S90 the reload). As merged after group 7, `serve` handles SIGTERM and SIGINT and nothing
+  else, so a SIGHUP has Go's default effect: the process dies of the signal, at once and without the shutdown of
+  §6.4. systemd counts a death by SIGHUP as a clean exit, which `Restart=on-failure` does not answer, so
+  `systemctl reload isshoni` (06's `ExecReload`) would stop the server and leave it stopped. From S65 on `serve`
+  ignores the signal, so `systemctl reload isshoni` then **neither reloads nor stops** the server. Nothing is
+  lost meanwhile: manual TLS files are picked up by the 60 s poll (§8.4), the log level changes at runtime with
+  `isshoni admin log-level` (§12.2), and every other change needs a restart anyway. S90 replaces the ignoring
+  with the reload of the first bullet. The unit keeps `ExecReload` throughout (06 §4.5).
 - No `sd_notify` in M1: 06's unit uses `Type=exec`, and install.sh polls `isshoni healthcheck --ready`. *Later*:
   `Type=notify` with `READY=1`/`STATUS=` if the unit ever needs it.
 - Restart after a restore or `rotate-secrets`: `Run` returns `ErrRestartRequested` after a full graceful shutdown;
@@ -1077,7 +1196,8 @@ table has them; these are the points the table leaves open, and what is still to
   own API calls say what is wrong.
 - **`GET /v1/status`** on the admin socket: the site, the listeners and the public addresses are copied when the
   server has bound everything; the certificate, the live counts and the uptime are read at each call. The
-  advertised media addresses come with the SFU (README S59), transfer and the release check with README S85.
+  advertised media addresses, the `listen.ice_*` listeners and the media sockets' buffers are there since the
+  SFU is (README S59, below); transfer and the release check come with README S85.
 - **The server's own background work** hangs on one context that the shutdown's step 6 cancels (§6.4): the admin
   socket's `Serve`, 03's janitor (`auth.RunJanitor`), doctor's own runs (`ops.Doctor.Run`, below), the periodic
   look at the public addresses (§7.4), and the reads behind hooks that have no context (the `db` check,
@@ -1102,11 +1222,11 @@ table has them; these are the points the table leaves open, and what is still to
   `release.not_checked`. `TestDoctorOverTheAdminSocket` and `TestMetaStore` cover it. The restore command that
   `serve` prints when it refuses a newer schema (§6.1 step 4) is `doctor.RestoreCommand`, the one doctor's
   `schema` check prints, so there is one copy of it.
-- **Not wired yet**, each with a stand-in that needs no code elsewhere:
+- **Not wired yet**, each with a stand-in that needs no code elsewhere (the SFU's row left this table with
+  README S59, below):
 
   | What | Until | Meanwhile |
   |---|---|---|
-  | The SFU: `sfu.Config`, `sfuplane`, the Transport, the `media` check, `SetLimits` on a settings change | README S59 | the hub's `MediaPlane` is the placeholder `noMedia` (01 §15.2): rooms and presence work, `share.start` and `pc.*` get `feature_disabled`; the multiplexer's ICE side has no reader |
   | Push: `signal.Deps.Push`, `auth.Options.Alerts`, `httpapi.Deps.Push` | README S71 | the push endpoints answer `push_unavailable` and `/info` has no `push` object, as with `push.enabled = false`; admin alerts are only logged |
   | `ops.Metrics` as the router's observer and the hub's registerer; the REST routes of `ops` | README S80, S85 | `signal.Deps.Metrics` is nil; with `metrics.enabled` the server logs a warning that nothing listens on `metrics.listen` |
   | Transfer accounting and the release check in `serve` (built in README S55, §11.3, §11.5) | README S85 | nothing counts or checks |
@@ -1114,6 +1234,36 @@ table has them; these are the points the table leaves open, and what is still to
 - The tests are `wire_test.go` (each adapter against a fake, and the ones over 03 once more against the real
   service), `wiring_test.go` (in `servertest`: log in over REST, `/ws` joins Lounge, a logout closes that
   session's socket with `session_revoked`) and `wiring_store_test.go`.
+
+**What README S59 wired** (wiring v2: the SFU in `serve`; `wireMedia` in `wire.go`, the Transport in `public.go`,
+the tests in `media_test.go` and in `internal/server/itest`).
+- **The rows `sfu.Config`, `sfu.Deps.Events` with `signal.Deps.Media`, and "02's live limits"** are as the table
+  has them. `wireMedia` runs first in `wire`: `sfuplane.New`, then `sfu.New` on the Transport that step 6 bound
+  with the plane's `RoomEvents` and the limit from the settings (which already hold the policy pins), then
+  `Plane.Bind(sfu)`. The plane is the hub's `MediaPlane` in place of `noMedia`, so `share.start`, the `pc.*`
+  messages and `subscribe.update` reach the SFU. `SettingsCache.OnChange` passes every later
+  `maxShareBitrateKbps` on with `SFU.SetLimits` (`TestLimitsReachTheSFU`).
+- **The SFU is built on every server that has a Transport**, with or without a site. Only the server that
+  started without media sockets has none (§6.2), and it has no hub that would need the plane.
+- **The public addresses are detected in every mode** (§6.1 step 5), and the Transport gets them with the same
+  `InContainer` and `CloudProvider` as the detection (§7.4).
+- **`Addrs` has the ICE listeners** (`ICEUDP`, `ICETCP`; §6), `GET /v1/status` on the admin socket has what the
+  Transport advertises, one `listen.ice_udp` entry per socket, `listen.ice_tcp`, and the effective UDP buffers,
+  and the ready line names the media ports (§6.1 step 10).
+- **Shutdown step 4** closes the SFU and then the Transport, each within its own budget (§6.4).
+- **An SFU method that a later slice implements is quiet in the log.** The SFU declares its whole API from its
+  first slice on, and a method that isn't built yet answers with an error that wraps `sfu.ErrNotImplemented`
+  (02 §6.3). `sfuplane` logs every SFU error it has no wire code for at error level, as the bug it would
+  otherwise be (01 §15.4), and a client reaches such a method with an everyday message: `caps.update` until
+  README S69. The wiring therefore gives `sfuplane` a log handler (`notImplementedAsDebug`) that passes a record
+  about that error on at debug level. The client still gets its `error{internal}` with the ref. The handler goes
+  away with `sfu.ErrNotImplemented` (`TestUnbuiltSFUMethodsAreQuiet`).
+- **A changed public address** is logged, and restarts only the server that waited for one (§6.2, §7.4).
+- **`internal/server/itest`** is new: Go clients made of an account registered over REST with an invite,
+  `internal/client/signal` on `/ws` with its cookie, `publish.Publisher` with `fake.Source` as the pub PC and an
+  `sfutest.Viewer` as the sub PC, against `servertest`. Cases 1–3 and 9 of 01 §19 are there, the ICE-TCP checks
+  of §17 (`TestICETCPVia443`, and `TestICETCPVia7882` for off mode), and `TestShutdownWithMedia`, with a
+  goroutine leak check for the package. The metric assertion of the ICE-TCP test comes with README S85.
 
 ## 7. Networking (`internal/server/netx`)
 
@@ -1358,21 +1508,32 @@ IPv4 algorithm:
 Tailscale interfaces (`tailscale*`, `utun*` with 100.64/10) are ignored for the CGNAT rule. Detection runs once at
 startup and then every 10 minutes; a change is logged as a warning and shown on the dashboard ("Public IP changed from
 A to B; restart isshoni to apply"). Rationale: rewrite rules are fixed per `webrtc.API`; a hot swap is *later*. VPS
-addresses rarely change.
+addresses rarely change. A server that waits for its public address looks every 30 s instead (decided after
+group 7, README S65; below and §6.2).
 
 **"Nothing found" at startup** (the table's last row, and its `cgnat_likely` row when no STUN server answered:
 no address then either, with the NAT kind `cgnat_likely`; S44, kept after group 5): `DetectPublicAddrs` returns
 what it found, and an error next to it when a step failed; neither stops the start. In ip mode, and in manual mode
 without a domain, the server then starts without a site and is not ready; §6.2 lists what the operator sees and
 why it is not an exit 78. The periodic detection (below) goes on for such a server as for any other. An address
-it finds later can't be taken by the running process, so it takes a restart, and **an ip-mode server that started
+it finds later can't be taken by the running process, so it takes a restart, and **a server that started
 this way asks for that restart itself** when the detection finds an address (decided after group 6; README S59
-implements it; §6.2). That is the one case in which the detection does more than log.
+implemented it for ip mode and for manual mode without a domain alike; §6.2). That is the one case in which the
+detection does more than log.
+
+**While a server waits for its address, the detection looks every 30 s** (decided after group 7; README S65
+implements it). Ten minutes suit a server that serves: its address rarely changes, and a change is only logged.
+They don't suit the server that is not ready until a look succeeds, where the usual cause is gone within a
+minute of boot. So the interval is 30 s for exactly the server of §6.2 that started without the public address
+that is its site, for as long as it waits, and 10 minutes for every other. Nothing else about the looks changes:
+the same detection, with STUN while `public_ip` is `auto`, and the same rule for what counts as found. As merged
+after group 7 the interval is 10 minutes everywhere.
 
 **The periodic detection as README S54 wired it** (`internal/server/public.go`).
-- **Which servers look again.** One that detected at startup: every TLS mode. In off mode `Start` detects nothing
-  until the SFU needs the media addresses (README S59), and nothing looks again until then.
-- **Every 10 minutes**, on the server's background context, until the shutdown's step 6 (§6.4).
+- **Which servers look again.** Every server: since README S59 `Start` detects in every mode, off mode too,
+  because the SFU's candidates name the detected addresses, and every server that detected looks again.
+- **Every 10 minutes**, on the server's background context, until the shutdown's step 6 (§6.4); every 30 s on a
+  server that waits for its address, from README S65 on (above).
 - **No STUN after a literal.** While `public_ip` is `auto` (or unset), the later looks ask the STUN servers as the
   first one did. With `public_ip` set to a literal, of either family, or to `off`, they only read the machine's
   interfaces and send nothing: the address can't change, and the operator who set it gets the one NAT check at
@@ -1390,10 +1551,12 @@ implements it; §6.2). That is the one case in which the detection does more tha
 - The detection gets the same `CloudProvider` and `InContainer` as the Transport (`DetectOptions` has both fields,
   filled from `netx.DetectCloudProvider` and the container detection of §5.1), so both agree on whether an address
   that STUN sees and no interface holds is a 1:1 NAT or a home router's port forwarding (§7.5).
-- `transportOptions` in the same file fills `netx.TransportOptions` for README S59: IPv6 is off when
-  `network.ipv6` is false **or** `public_ipv6 = "off"`, whatever the interfaces have.
+- `transportOptions` in the same file fills `netx.TransportOptions`, which `listenICE` hands to
+  `netx.NewTransport` since README S59: IPv6 is off when `network.ipv6` is false **or** `public_ipv6 = "off"`,
+  whatever the interfaces have.
 
-Privacy: STUN contacts Cloudflare and Google at startup and every 10 minutes (one UDP packet each). Setting `public_ip`
+Privacy: STUN contacts Cloudflare and Google at startup and every 10 minutes (one UDP packet each); a server that
+waits for its public address asks every 30 s for as long as it waits (README S65, above). Setting `public_ip`
 limits this to one NAT check at startup; `network.stun_servers = []` stops STUN entirely (set `public_ip` to a literal
 then). The privacy page says so (§16).
 
@@ -2453,7 +2616,7 @@ func (r *ReleaseCheck) Alerts() []api.Alert           // release.update or relea
 | `GET /v1/backup?certs=1` | – | `application/gzip` stream, `Content-Disposition: attachment; filename="isshoni-backup-…tar.gz"` | 500 |
 | `POST /v1/restore` | `application/gzip` archive or `application/vnd.sqlite3` DB body (≤ 2 GiB) | 202 `{"restarting":true,"preRestoreBackup":"backups/pre-restore-20260929T101500Z.tar.gz"}` | 400 `backup_invalid`, 409 `backup_newer`, 409 `restore_in_progress`, 507 `insufficient_storage` |
 | `POST /v1/rotate-secrets` | `{"keys":["session","invite","resume"],"vapid":true}` (the CLI always sends all four) | 202 `{"rotated":[…],"restarting":true}` (the server restarts, §5.3) | 400 |
-| `POST /v1/doctor` | `{"only": ["dns"]}` (optional) | `api.DoctorReport` (server-side checks) | – |
+| `POST /v1/doctor` | `{"only": ["dns"], "bandwidth": {"people": 8, "sharing": 3, "thumbnails": 8, "quality": "1080p60", "preset": "auto", "hours": 2}}`; both optional (`ops.AdminDoctorRequest`, §13.1) | `api.DoctorReport` (server-side checks, `mode: "cli-with-server"`). The answer comes when the run is done; a run that is under way is waited for, never answered `doctor_busy` (§13.1) | 400 `bad_request` (a check id doctor doesn't have, or a `bandwidth` value outside its range), 503 `server_shutdown` (the server stops while the request runs or waits) |
 | `POST /v1/log-level` | `{"level":"debug","for":"30m"}` | 204 | 400 |
 
 **The socket as README S43 built it** (`ops/adminsock.go`, `adminapi.go`, `adminclient.go`), where the table
@@ -2622,6 +2785,54 @@ server can't start at all (for example invalid config):
   `ops.doctor_last`) for the dashboard. `POST /api/v1/admin/doctor` runs it on demand (one run at a time globally,
   at most one per 10 s: `429 doctor_busy`).
 
+**Doctor in the server as README S60 built it** (`ops.Doctor` in `ops/doctorrun.go`; wired by the group 7
+integration, §6.6). One `Doctor` serves three callers, and **one run is under way at a time, whoever asks**:
+
+| Caller | Function | When another run is under way |
+|---|---|---|
+| The server itself, 20 s after its start and then every 24 h | `Doctor.Run(ctx)` | waits its turn |
+| The admin page: `POST /api/v1/admin/doctor` | `Doctor.Check(ctx)` | **429 `doctor_busy`** with `retryAfter`, and the same for 10 s after the end of the last run, with the seconds that are left, rounded up: the page shows the report it has and tries again |
+| `isshoni doctor`: the admin socket's `POST /v1/doctor` (§12.2) | `Doctor.RunFor(ctx, req)` | **waits its turn** and then runs; it never answers `doctor_busy`, and the 10 s gap doesn't apply to it. An operator at a terminal has no page that retries. The CLI gives the call 90 s; a server that stops meanwhile answers 503 `server_shutdown` |
+
+- **`GET /api/v1/admin/doctor` is `Doctor.Last`: the last full report, and 404 `not_found` before the first
+  one.** That is the first 20 s of a new installation only: `Run` loads the report of the meta key before
+  anything else, so a restarted server has its last report at once. `Summary()` (the dashboard's `doctor`
+  object) is nil for as long, and `Alerts()` is the dashboard's `doctor.fail` alert while the last full report
+  has failures, with `params` `{fail, checks}`: their number and the ids of the failing checks (§11.4).
+- **Which runs are kept.** A run of every check with the default bandwidth session: the server's own, the
+  page's, and the socket's when its request names no checks and no session. A run of some checks, or with
+  another session, answers its caller and replaces nothing: a run of three checks must not be what the dashboard
+  summarizes. A run that was cut off (its caller went away, the server stops) is not kept either, and its caller
+  gets the context's error, not half a report.
+- **A kept run** is written to `ops.doctor_last` as `{"v": 1, "report": {…}}` (a value of another version, another
+  report schema or without `ranAt` is read as none) and logged in one line: INFO `doctor ran` with the counts
+  `ok`, `warn` and `fail`, or, with a failure, WARN ``doctor found problems; `isshoni doctor` shows them with
+  their fixes`` with the ids in `failed`. An operator who reads the journal and never opens the dashboard sees
+  them too.
+- A run has 2 minutes in all (each probe has a timeout of its own), and sends at most one request to the outside,
+  the clock check's GET of the ACME directory (§16); the page's 10 s gap also bounds what a page that keeps
+  asking can make the server send.
+- **The socket's request** is `ops.AdminDoctorRequest`:
+
+  ```go
+  type AdminDoctorRequest struct {
+      Only      []string            `json:"only,omitempty"`      // doctor.CheckIDs; none means all
+      Bandwidth *api.BandwidthInput `json:"bandwidth,omitempty"` // the session of the bandwidth flags (§13.4)
+  }
+  ```
+
+  `bandwidth` is how `isshoni doctor --people 8 --sharing 3` reaches a run inside the server; the CLI sends it
+  only when the flags differ from the default session. The handler refuses an id that doctor doesn't have, and a
+  session the calculator doesn't take, with 400 `bad_request`, instead of a report that leaves something out
+  without a word. The CLI checks both first: an unknown `--only` id and a bandwidth flag out of range are usage
+  errors (exit 2), the first with a "did you mean" when an id is close. The report's `mode` is `server` for a
+  run in the server; the socket's handler changes it to `cli-with-server` for the report it hands to the CLI.
+- The typed functions `Bandwidth(in)` and `BandwidthFromQuery(q)` are `GET /api/v1/admin/bandwidth` (§13.4): a
+  parameter that is left out has the default session's value, and one that is no number or out of range is 400
+  `bad_request` with `params.field`. The ranges are `doctor.BandwidthInputProblem`'s: `people` 1 to 1000,
+  `sharing` 0 to `people`, `thumbnails` 0 to 100, a known `quality` and `preset`, `hours` above 0 up to 8784.
+  The REST routes themselves come with README S85 (§6.6).
+
 ```go
 package doctor
 
@@ -2636,7 +2847,24 @@ type Env struct { // all fakeable
 	DB        DBFiles                // offline `schema` check
 	Now       func() time.Time
 	GOOS      string
-	UID       int
+	UID       int                    // the uid the checks run as; the caller sets it (os.Getuid()), 0 is root
+
+	// Added by README S60 while it built the checks. Each has a real default, so a caller sets none of them.
+	User       string                // the report's env.user; "" = looked up from UID
+	Host       config.Host           // container runtime, mount table (§5.1); zero = the running process
+	Interfaces netx.InterfaceLister  // nil = netx.SystemInterfaces()
+	Bind       func(ctx context.Context, network, addr string) error // the offline ports check: bind and release
+	CAA        func(ctx context.Context, name string) ([]CAARecord, error) // dns in auto mode; nil = a lookup
+	                                 // through the resolvers of /etc/resolv.conf (caa.go)
+	DiskFree   func(dir string) (uint64, error) // nil = statfs on Linux and macOS, "unknown" elsewhere
+	NoFile     func() (uint64, error)           // the soft RLIMIT_NOFILE
+	LookupUser func(name string) (uid int, ok bool) // offline: the service's user (ServiceUser = "isshoni"), so
+	                                 // data_dir and secrets compare owners with the user the server runs as, not
+	                                 // with whoever runs doctor; nil = os/user
+	TLSLastError string              // the server's own fix text for its certificate's last error
+	                                 // (tlsmgr.Status.LastError, §8.7), which api.ServerStatus leaves out. The
+	                                 // wiring fills it; the tls check prints it as the fix when its fix code is
+	                                 // Live.TLS.LastErrorCode (the lastError param). "" = the code's own text
 }
 
 // DBFiles carries 03's file-level store functions, which never migrate or write the source file. doctor and ops
@@ -2653,18 +2881,56 @@ type DBInfo struct { // store.FileInfo, copied field by field
 	HistoryOK      bool
 	Integrity      error  // PRAGMA integrity_check
 	TooNewBackup   string // SchemaTooNewError.Backup, for the restore command of §6.1 step 4
+	TooNewMessage  string // SchemaTooNewError.Error() when the file's schema is newer than this binary: 03's one
+	                      // message for the operator, which the schema check prints as it is (S60); "" otherwise
 }
 
 func Run(ctx context.Context, env Env, in api.BandwidthInput, only []string) api.DoctorReport // only: nil = all
 func RenderText(w io.Writer, r api.DoctorReport, color bool)
 func Bandwidth(in api.BandwidthInput) api.BandwidthEstimate
 func CheckIDs() []string // the §13.2 ids, for --list-checks
+
+// Also exported (S60):
+func DefaultBandwidthInput() api.BandwidthInput // the M1 exit scenario of §13.4: 5 people, 2 sharing, 1080p60, 2 h
+func BandwidthInputProblem(in api.BandwidthInput) (field, code string, ok bool) // the ranges; Bandwidth clamps
+func RestoreCommand(backup string, container bool) string // the one copy of §6.1 step 4's command
+const ServiceUser = "isshoni"                             // the user 06's installer creates
+type CAARecord struct{ /* … */ }
 ```
+
+`Run` never fails: a check that can't find out says so in its result, and when `ctx` ends, the checks that have
+not run yet are `skip` with `skip.interrupted`. An `in` that is the zero value means `DefaultBandwidthInput()`.
+An id in `only` that is not one of `CheckIDs` is ignored there; the CLI and the admin socket refuse such a request
+before they get that far. Everything the checks ask of the machine or the network goes through `Env`, so the
+tests answer with fakes and make no network call.
 
 ### 13.2 Checks
 
 Status values: `ok`, `warn`, `fail`, `skip`, `info`. Messages are templates keyed by `code` with `params` (English
 templates live in `messages_en.go` for the CLI; 05 renders the same codes from its catalog).
+
+**What each status means** (README S60; the package comment of `doctor.go`):
+- **`ok`**: checked and fine, **or nothing to check in this configuration**. A check that doesn't apply is `ok`
+  with a code that says why, not `skip`: `dns` without a domain or behind a proxy, `tls` in off mode,
+  `udp_buffers` with UDP turned off, `container` outside a container, `lan_privacy` off macOS, `transfer`
+  without a limit, `release` before the server's first look or with the check switched off. The operator reads
+  "nothing to do here", and the summary's `skip` count stays a count of what doctor could not find out.
+- **`skip`**: the check **could not run**: it needs a running server (`skip.needs_server`: `tls`, `transfer` and
+  `release` offline), the platform can't answer (`skip.unsupported`, with `os`), the server's status or this
+  build doesn't carry the fact (`skip.not_reported`), or the run was cut off before the check
+  (`skip.interrupted`). `udp_buffers.unknown` is a skip too: Linux without the sysctl files and without a
+  server's sockets to read. From README F04 on also `public_ip` on a development server (`public_ip.loopback`,
+  below): no STUN server is asked there, so doctor can't tell which address others would see, and whether the
+  server has a public one stays unknown. That is "could not find out", not "nothing to check", which is why it
+  is `skip` and not `ok`: `tls.off` knows that there is no certificate to look at, and this check knows nothing
+  about the address.
+- **`info`**: a fact the operator should read, never counted as a problem: the state before the first start
+  (`data_dir.not_created`, `secrets.not_created`, `schema.no_db`), a certificate order that is under way, a
+  clock that neither source could judge, and the checks that are information by nature (`ports`,
+  `firewall_hint`, `nofile`, `bandwidth`). `ports` is `info` at best and never `ok`, because it only looks at
+  this machine.
+- **`warn`** and **`fail`** carry a `fixCode` where there is something to do; exit 5 follows `fail`, and `warn`
+  with `--strict` (§3.2).
 
 | ID | Checks | warn | fail |
 |---|---|---|---|
@@ -2686,6 +2952,65 @@ templates live in `messages_en.go` for the CLI; 05 renders the same codes from i
 | `nofile` | `info`: open-file limit | < 8192 | – |
 | `bandwidth` | `info`: calculator output (§13.4) and NIC speed from `/sys/class/net/<if>/speed` | estimate > 80 % of NIC speed | – |
 
+**The result codes as README S60 built them** (`messages_en.go`; a code is never renamed or reused once
+released, and 05 renders `doctor.<code>` and `doctor.fix.<fixCode>` from its catalog). The part before the dot is
+the check's id, except for the four `skip.*` codes above, which any check may use. Where the table above and this
+one differ, this one is what the code does.
+
+| Check | `ok` | `info` | `warn` | `fail` |
+|---|---|---|---|---|
+| `config` | `config.ok` | – | `config.warnings` | `config.invalid` |
+| `data_dir` | `data_dir.ok` | `data_dir.not_created` (offline, before the first start) | `data_dir.mode_wide`, `data_dir.low_space`, `data_dir.ephemeral_allowed` (a container without a volume, allowed by `ISSHONI_ALLOW_EPHEMERAL_DATA`) | `data_dir.missing` (a running server whose directory is gone), `data_dir.unreadable`, `data_dir.not_dir`, `data_dir.not_mounted`, `data_dir.wrong_owner`, `data_dir.not_writable` |
+| `secrets` | `secrets.ok` | `secrets.not_created` (offline, with no database either) | `secrets.mode_wide` | `secrets.missing` (the database is there, its keys are not), `secrets.unreadable`, `secrets.wrong_owner`, `secrets.corrupt` |
+| `schema` | `schema.ok`, `schema.older` (offline: the next start migrates it) | `schema.no_db` (offline, before the first start) | – | `schema.newer`, `schema.history_mismatch`, `schema.corrupt`, `schema.unreadable` |
+| `public_ip` | `public_ip.ok` | `public_ip.no_ipv6`, `public_ip.ephemeral` (with the fix `public_ip.fix_static_ip`, the one `info` that has one) | `public_ip.port_forward`, `public_ip.ipv6_only` (no public IPv4) | `public_ip.none`, `public_ip.symmetric`, `public_ip.cgnat` |
+| `dns` | `dns.ok`, `dns.no_domain` (the site is the address), `dns.proxy` (off mode) | – | `dns.also_elsewhere`, `dns.aaaa_wrong`, `dns.no_a` (only an AAAA record, though the server has an IPv4 address), `dns.lookup_failed` (the resolver failed), `dns.unverified` (no public address to compare with) | `dns.missing`, `dns.wrong`, `dns.caa_forbids` |
+| `tls` | `tls.ok`, `tls.off` | `tls.pending` (the first order is under way, nothing has failed) | `tls.failing`, `tls.renewal_failing`, `tls.reload_failed` (manual: new files were refused, the old pair serves), `tls.expires_soon` | `tls.no_cert`, `tls.no_public_ip`, `tls.expired`, `tls.not_loaded` (manual: the files can't be read or don't match) |
+| `clock` | `clock.ok` | `clock.unknown` | `clock.unsynced`, `clock.skew` (30 s to 5 min) | `clock.skew` (above 5 min), `clock.cert_time` (the CA's own certificate looks expired or not yet valid from here: the clock is further off than a `Date` header could show) |
+| `udp_buffers` | `udp_buffers.ok`, `udp_buffers.udp_off` | – | `udp_buffers.low` | – |
+| `ports` | – | `ports.listening`, `ports.free` (offline) | `ports.disabled`, `ports.not_listening` (a configured port that the running server doesn't listen on) | `ports.in_use` (offline) |
+| `firewall_hint` | – | `firewall_hint.open_ports` | – | – |
+| `container` | `container.none` | `container.detected` | – | – |
+| `lan_privacy` | `lan_privacy.not_macos` | `lan_privacy.macos` | – | – |
+| `transfer` | `transfer.ok`, `transfer.no_limit` | – | `transfer.high` (80 % of the limit and more), `transfer.over` (the limit and more; still a warning, it never blocks) | – |
+| `release` | `release.ok`, `release.not_checked` | – | `release.update`, `release.security_update` | – |
+| `nofile` | – | `nofile.ok` | `nofile.low` | – |
+| `bandwidth` | – | `bandwidth.estimate` | `bandwidth.near_nic` | – |
+
+The table has no column for `skip`. Besides the four `skip.*` codes, a check's own code has that status in two
+cases: `udp_buffers.unknown` (above) and, from README F04 on, `public_ip.loopback` (`public_ip` on a development
+server, below). The second is not in `messages_en.go` as merged after group 7; it joins the list with the
+group 8 write-back, and 05's catalog renders it as `doctor.public_ip.loopback` like every other code.
+
+Fix codes: `config.fix_check`; `data_dir.fix_sudo`, `fix_owner`, `fix_not_dir`, `fix_mount`, `fix_mode`,
+`fix_space`; `secrets.fix_sudo`, `fix_owner`, `fix_restore`, `fix_mode`; `schema.fix_sudo`, `fix_restore` (03's
+message and the restore command), `fix_upgrade` (no backup from before the upgrade), `fix_same_build`,
+`fix_restore_backup` (a damaged file); `public_ip.fix_set`, `fix_nat`, `fix_forward`, `fix_static_ip`;
+`dns.fix_add_record`, `fix_point_here`, `fix_aaaa`, `fix_caa`; `tls.fix_replace`, and for every other `tls`
+result the server's `lastErrorCode`, one of the ten codes of §8.7; `clock.fix_ntp`; `udp_buffers.fix_sysctl`,
+`fix_sysctl_reload` (isshoni's sysctl file is there and only has to be loaded), `fix_restart` (the limits are
+high enough now, the sockets were opened under lower ones); `ports.fix_free`; `transfer.fix_review`;
+`release.fix_upgrade`; `nofile.fix_limit`; `bandwidth.fix_link`.
+
+More that the table above leaves open:
+- **Offline, `data_dir` and `secrets` judge the owner by the service's user**, not by whoever runs doctor
+  (`Env.LookupUser`, `ServiceUser`). On a host with a user `isshoni`, `sudo isshoni doctor` on a stopped server
+  reports a data directory or a `secrets.json` of another owner, which would make the next start exit 78, and the
+  fix gives the path to `isshoni`, never to the caller. Whether the directory is writable is probed only when
+  doctor runs as that user: root may write everywhere, and another user's "no" is not the service's. Without
+  such a user the caller is taken for the service's, and the fix names both cases. A path the caller may not
+  read gets the `fix_sudo` fix.
+- **`tls`'s fix is the server's own sentence** when the wiring passes it (`Env.TLSLastError`) and the result's
+  fix code is the status's `lastErrorCode`: the other address a domain points to, the end of a rate limit, the
+  CA's detail, the file that can't be read. It travels as the param `lastError`, cut to one line of at most
+  1000 bytes without control characters; the per-code texts are the fallback.
+- **`ports` offline** tries to bind each configured port and releases it at once. A port it may not bind as this
+  user (a privileged port, which the service gets from its unit) is listed as `unchecked` in the params, with
+  `uncheckedDenied`, and decides nothing.
+- **`clock`** is `ok` when the skew is known and small or the kernel says the clock is synchronized, and `info`
+  (`clock.unknown`) when neither source could say.
+- **`schema` with a running server** only reports the version: the server migrated its database at startup.
+
 **When no public address was found** (decided after group 5; the server then runs and is not ready, §6.2). Doctor
 is where the operator reads why, so the two checks say it in these words:
 
@@ -2700,9 +3025,33 @@ is where the operator reads why, so the two checks say it in these words:
   `public_ip`'s fix. It carries no `fixCode` of §8.7 (no ACME request was made, so there is no ACME error) and
   does not wait 10 minutes to turn from `warn` to `fail`: nothing is under way.
 - These texts stay as they are with the self-restart decided after group 6 (§6.2): an ip-mode server whose
-  network came up late now restarts itself at its next look, within 10 minutes, and "restarting is enough" is
-  still true and faster. When no look will ever find an address (a server behind a NAT that STUN can't see
-  through, STUN switched off), setting `public_ip` remains the only fix.
+  network came up late now restarts itself at its next look, within 10 minutes (within 30 s once README S65 has
+  built the shorter interval, §6.2), and "restarting is enough" is still true and faster. When no look will ever
+  find an address (a server behind a NAT that STUN can't see through, STUN switched off), setting `public_ip`
+  remains the only fix.
+- **On a development server the check is `skip`, not `fail`** (decided after group 7; README F04 implements it).
+  A development server is one with all three of:
+  - `network.include_loopback` set;
+  - no STUN server configured (`network.stun_servers = []`);
+  - a site that is not the server's address: off mode, or a server with a domain (`siteIsAddress` is false).
+
+  Such a server has no public address by design: it is a developer's machine or a test, it serves on loopback,
+  and nothing was asked that could have found an address. And it is ready without one, because the readiness
+  check `public_ip` exists only where the site is the address (§6.2). That is the configuration of
+  `deploy/dev/isshoni.dev.toml` and `isshoni.e2e.toml`, both in off mode. As group 7 merged it, the server's own
+  doctor run, 20 s after every start, reported `public_ip` as `fail` there, so every `task dev` and every e2e
+  server that lived that long logged the WARN line "doctor found problems", and the dashboard would show its
+  `doctor.fail` alert once README S85 wires it, for a state that is not a problem. On such a server the check
+  is `skip`, with the code `public_ip.loopback` and a text that names the two keys, and the run counts no
+  failure for it. Everywhere else the check is as above:
+  - **Where the site is the address** (`ip` mode, and `manual` mode without a domain) the check stays `fail`
+    with `public_ip.none` and its fix, **whatever the two keys say**. That server is not ready until it has an
+    address, and doctor is where its operator reads why (the first bullet of this list). A merged test holds
+    it in exactly that configuration: `testConfig` in `internal/server` sets both keys, and
+    `TestServerWithoutASite` adds ip mode to it and wants the status `fail`, the code `public_ip.none` and a
+    fix from the admin socket's doctor. It passes unchanged with F04.
+  - **One of the two keys alone** doesn't change the check either: a production server with
+    `include_loopback` left on, or one with STUN switched off, still needs to hear that it has no address.
 
 ```
 [fail] public_ip     no public IP address found (no public address on an interface, no STUN answer)
@@ -2816,9 +3165,16 @@ Every Mbps value is rounded to two decimals and the gigabytes to one, each from 
      "localOnly": false, "durationMs": 1}
   ],
   "bandwidth": {"input": {"people": 5, "sharing": 2, "thumbnails": 8, "quality": "1080p60", "preset": "auto", "hours": 2},
+                "perViewerMbps": {"sharer": 8.13, "viewer": 8.43},
                 "egressMediaMbps": 41.54, "egressWireMbps": 43.62, "ingressMediaMbps": 16.86, "transferPerSessionGb": 39.3}
 }
 ```
+
+As built (S60): `bandwidth` is the same `api.BandwidthEstimate` as §13.4's, `perViewerMbps` included, and is
+there whenever the `bandwidth` check ran (a run with `--only` that leaves the check out has none). A check
+without params has no `params` key, and `fixCode` and `fix` are left out where there is none. `localOnly` is true
+for `ports` alone. `version` is the running server's when the checks ran in it. `summary` counts every status,
+`skip` and `info` too; the dashboard's `doctor` object carries `ok`, `warn` and `fail` (§11.4).
 
 `mode`: `server` | `cli-with-server` | `cli-offline`. `env.container`: `none` | `docker` | `podman` | `other`. Types
 (`internal/protocol/api/doctor.go`): `DoctorReport`, `DoctorCheck`, `DoctorStatus`, `DoctorEnv`, `BandwidthInput`,
@@ -3185,10 +3541,14 @@ source for the outbound list; 06's `/privacy` page renders this table in full.
 
 | Destination | When | What | Off switch |
 |---|---|---|---|
-| STUN (Cloudflare, Google) | Startup and every 10 min | One UDP Binding request (reveals the server IP) | `network.stun_servers = []` stops STUN entirely (set `public_ip` to a literal then); a literal `public_ip` alone leaves one NAT check at startup |
+| STUN (Cloudflare, Google) | Startup and every 10 min; every 30 s while a server that started without its public address waits for it (§6.2), only while `public_ip` is `auto` | One UDP Binding request (reveals the server IP) | `network.stun_servers = []` stops STUN entirely (set `public_ip` to a literal then); a literal `public_ip` alone leaves one NAT check at startup |
 | Let's Encrypt | Issuance, renewal; one HTTPS GET of the ACME directory for the clock check (doctor, also install.sh's pre-check; `auto`/`ip` modes) | ACME protocol; optional email | `tls.mode=manual` or `off` |
 | GitHub API | Daily | One GET with `User-Agent: isshoni/<ver>` | `updates.release_check=false` |
 | Browser push services (Google, Apple, Mozilla, Microsoft) | On notifications | Encrypted payload (RFC 8291); the service sees timing and size (padded) only | `push.enabled=false`, or users don't subscribe |
+
+The STUN row's 30 s were decided after group 7 and are README S65's to build (§6.2, §7.4); as merged after
+group 7 every server asks every 10 minutes. Such a server sends twenty times as many packets while it waits,
+and it waits only until a look finds its address, which ends the process (§6.2).
 
 OCSP stapling is disabled in certmagic (`OCSP.DisableStapling=true`, §8.2), so the server makes no OCSP requests;
 manual certificates are loaded without certmagic and cause none either. Nothing else leaves the server. Logs contain
@@ -3224,7 +3584,7 @@ no tokens, SDP, push endpoints or usernames.
   headers.
 - **TLS path through the 443 mux**: `servertest.Options{TLS: true}` (a private test CA, manual mode) → WSS signaling
   over HTTP/1.1 and SPA over h2 on the same port.
-- **ICE-TCP via 443** (in `internal/server/itest`, README S59, once the hub and the SFU are wired into `serve`):
+- **ICE-TCP via 443** (in `internal/server/itest`, README S59: `TestICETCPVia443` and `TestICETCPVia7882`):
   `servertest.Options{TLS: true}` with `listen.ice_udp = ""` and `listen.ice_tcp = ""`; a Go publisher restricted to
   `tcp4` shares, an `sfutest.Viewer` decodes its media, and WSS signaling runs on the same port; both Go clients'
   selected candidate pairs are TCP with the TLS listener's port as the remote port. The same via 7882/tcp in off mode
@@ -3310,9 +3670,12 @@ Packages and names (exact):
   `ValidateEndpoint`, `SendTest`, `Run`), `ShareStarted`, `AdminAlert`, `Store`, `RecipientFilter`
   (`PrefShareStarted`, `PrefAdminAlerts`), `Sender`, `SendOptions`, `SendResult`, `ErrUndeliverable`,
   `ErrBlockedAddress`, `Subscription`.
-- `internal/server`: `Server`, `New`, `Start`, `Run`, `Shutdown`, `Site`, `Addrs` (`HTTP`, and `HTTPS` from S44
-  on: the 443 multiplexer, nil in off mode), `ShutdownReason`, `ErrRestartRequested`, `ErrShutdownForced`,
-  `NeedsOperator`, `Deps`, and the wiring table of §6.6.
+- `internal/server`: `Server`, `New`, `Start`, `Run`, `Shutdown`, `Site`, `Addrs` (`HTTP`; `HTTPS` from S44
+  on: the 443 multiplexer, nil in off mode; and from S59 on the bound ICE listeners, **`ICEUDP`**, a
+  `*net.UDPAddr` for `listen.ice_udp`, the first of its sockets, and **`ICETCP`**, a `*net.TCPAddr` for
+  `listen.ice_tcp`: each nil when its listener is off, both nil on a server that started without media sockets,
+  §6.2; ICE-TCP on the HTTPS port has no address of its own), `ShutdownReason`, `ErrRestartRequested`,
+  `ErrShutdownForced`, `NeedsOperator`, `Deps`, and the wiring table of §6.6.
 - `internal/server/tlsmgr` (S44; §8.2): `Options` (with `PublicIPv6`, `Site`, `HTTPAddr`, `HTTPSAddr`, `Resolver`),
   `New`, `Manager` (`Start`, `Shutdown`, `TLSConfig`, `HTTPHandler`, `Reload`, `Status`, `Ready`), `Status`, and the
   ten `Code…` constants of `Status.LastErrorCode`: the seven ACME hints of §8.7 (`tls.acme_unreachable`,
@@ -3361,9 +3724,9 @@ Packages and names (exact):
   4 unreachable, 7 `setup_unavailable`; doctor 0/5), the output of the link commands (§3.3: off a terminal the bare
   link is the first line of stdout and everything else is on stderr), env names (§4.2, including the
   empty-means-unset rule and the reserved names; §4.3 env-only switches), the data-directory lock `isshoni.lock`
-  (§5.1), `SIGHUP` reload, re-exec after restore and rotation, no `sd_notify` (unit `Type=exec`), Docker needs
-  `/run/isshoni` writable by uid 65532 (tmpfs with a read-only root) and a data volume at `/var/lib/isshoni`, the
-  release-note marker `<!-- isshoni:security -->`.
+  (§5.1), `SIGHUP` reload (from README S90 on; ignored from S65 until then, §6.5), re-exec after restore and
+  rotation, no `sd_notify` (unit `Type=exec`), Docker needs `/run/isshoni` writable by uid 65532 (tmpfs with a
+  read-only root) and a data volume at `/var/lib/isshoni`, the release-note marker `<!-- isshoni:security -->`.
 
 ---
 
@@ -3501,4 +3864,23 @@ Decided after group 6 (an engineering call the owner delegated; README §6):
    systemd and Docker restart a process that exits 75. The server then recovers without a person, at the next
    10-minute look. In every other state a changed public address is only logged with "restart isshoni to apply":
    a server that has a site, and maybe friends connected, is not restarted because an address moved. README S59
-   implements it.
+   implemented it, for manual mode without a domain as well.
+
+Decided after group 7 (engineering calls the owner delegated; README §6):
+
+6. **`serve` ignores SIGHUP until the reload exists.** The reload of §6.5 is README S90's. Until then a SIGHUP
+   would end the process, and systemd would not start it again, because it counts an end by SIGHUP as a clean
+   exit. From README S65 on the signal is ignored, so `systemctl reload isshoni` neither reloads nor stops the
+   server (§3.1, §6.5; 06 §4.5).
+7. **A server that waits for its public address looks for it every 30 s, not every 10 minutes.** This amends
+   decision 5's "at the next 10-minute look": the server that restarts itself when it finds its address should
+   find it soon after the network is up. Every other server keeps the 10 minutes. README S65 implements it
+   (§6.2, §7.4).
+8. **Doctor's `public_ip` check is `skip`, not `fail`, on a development server**: one with
+   `network.include_loopback` set, no STUN server configured and a site that is not its address (off mode, or a
+   domain), which is the dev and the e2e config. Such a server has no public address by design and is ready
+   without one, and its own doctor run 20 s after every start should not log a warning or raise the dashboard's
+   alert for it. Where the site is the address (ip mode, manual mode without a domain) the check stays `fail`
+   with `public_ip.none`, whatever the two keys say: that server is not ready, and doctor is where its operator
+   reads why. It is `skip` and not `ok` because doctor did not find out whether there is an address. README F04
+   implements it (§13.2).

@@ -544,25 +544,20 @@ func TestAdminErrors(t *testing.T) {
 		t.Errorf("GET /v1/setup-url = %d (Allow %q)", code, hdr.Get("Allow"))
 	}
 
-	// The endpoints of a later slice are declared and say so.
-	for _, ep := range [][2]string{
-		{http.MethodGet, "/v1/backup?certs=1"}, {http.MethodPost, "/v1/restore"}, {http.MethodPost, "/v1/rotate-secrets"},
+	// The endpoints of backup, restore and rotate-secrets take their own methods only (adminbackup_test.go has the
+	// rest of them).
+	for _, ep := range [][3]string{
+		{http.MethodPost, "/v1/backup", "GET, HEAD"}, {http.MethodGet, "/v1/restore", "POST"}, {http.MethodGet, "/v1/rotate-secrets", "POST"},
 	} {
-		code, _, body := a.raw(t, ep[0], ep[1], "")
-		if code != 500 || !strings.Contains(body, `"code":"internal"`) || !strings.Contains(body, "not implemented in this build yet") {
-			t.Errorf("%s %s = %d %s, want 500 internal: not implemented", ep[0], ep[1], code, body)
+		code, hdr, body := a.raw(t, ep[0], ep[1], "")
+		if code != 405 || hdr.Get("Allow") != ep[2] || !strings.Contains(body, `"code":"method_not_allowed"`) {
+			t.Errorf("%s %s = %d (Allow %q) %s", ep[0], ep[1], code, hdr.Get("Allow"), body)
 		}
 	}
-	_, err := a.client.RotateSecrets(t.Context(), AdminRotateRequest{Keys: []string{"session"}, VAPID: true})
-	wantCode(t, err, api.CodeInternal)
-	_, err = a.client.Backup(t.Context(), true)
-	wantCode(t, err, api.CodeInternal)
-	_, err = a.client.Restore(t.Context(), strings.NewReader("not an archive"), AdminContentArchive)
-	wantCode(t, err, api.CodeInternal)
 
 	// An error that is not 03's: 500 internal with a ref that is in the log, and nothing of the error on the wire.
 	a.accounts.with(func(f *fakeAccounts) { f.fail = errors.New("database is locked: /var/lib/isshoni/isshoni.db") })
-	_, err = a.client.Users(t.Context())
+	_, err := a.client.Users(t.Context())
 	ae := adminError(t, err, api.CodeInternal)
 	ref := ae.API.RequestID
 	if len(ref) != 8 || !strings.Contains(ae.Message, "ref "+ref) || strings.Contains(ae.Message, "database is locked") {

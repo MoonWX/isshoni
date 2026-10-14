@@ -30,6 +30,11 @@ type subPC struct {
 	// has failed or closed, without an error. A rebuilt sub PC is a new subPC with its own gate, so a stale "ready"
 	// can never leak.
 	ready atomic.Bool
+	// rtt is the round-trip time of the PC's selected candidate pair in ns, 0 while unknown; rttAt the monoNow at
+	// which it was last read. The RTCP readers of the PC's DownTracks keep it (sampleRTT), every rttEvery; the NACK
+	// handling reads it (02 §9.5). RTT from receiver reports would mean nothing here: the sender reports the viewer
+	// gets carry the publisher's clock (02 §9.6).
+	rtt, rttAt atomic.Int64
 	// readers are the RTCP readers of the PC's DownTracks, one per sender; each ends when its sender stops, all of
 	// them when the PC closes.
 	readers sync.WaitGroup
@@ -109,6 +114,7 @@ func (c *Conn) newSubPC() (*subPC, error) {
 	}
 	c.subGen++
 	s := &subPC{gen: c.subGen, pc: pc}
+	s.rttAt.Store(-int64(rttEvery)) // the first RTCP from the viewer reads the round-trip time
 	gen := s.gen
 	pc.OnConnectionStateChange(func(webrtc.PeerConnectionState) {
 		// Only "something changed": Pion runs each callback in a goroutine of its own, so their order means nothing.
@@ -204,7 +210,7 @@ func (s *subPC) addTrack(dt *DownTrack, log *slog.Logger) error {
 		sender = tr.Sender()
 	}
 	dt.transceiver, dt.sender = tr, sender
-	s.readers.Go(func() { dt.readRTCP(sender) })
+	s.readers.Go(func() { dt.readRTCP(s, sender) })
 	return nil
 }
 

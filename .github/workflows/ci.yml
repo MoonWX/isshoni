@@ -8,9 +8,9 @@
 # yet (web/ before the web client lands, for example) is skipped too. The run summary of the
 # changes job says why each job runs or not.
 #
-# Jobs for parts that land later (docker-smoke, distro, goreleaser-check and site of 06 §8.2)
-# come with those parts: each adds a `decide` line to the changes job and, when it gates the
-# merge, its id to ci-ok's needs.
+# Jobs for parts that land later (distro, goreleaser-check and site of 06 §8.2) come with
+# those parts: each adds a `decide` line to the changes job and, when it gates the merge, its
+# id to ci-ok's needs.
 #
 # Rules for every workflow (06 §8.1): a read-only token by default, with jobs raising their
 # own permissions; third-party actions pinned by full commit SHA with a version comment;
@@ -66,6 +66,7 @@ jobs:
       run-e2e: ${{ steps.plan.outputs.run-e2e }}
       run-lint-deploy: ${{ steps.plan.outputs.run-lint-deploy }}
       run-acme: ${{ steps.plan.outputs.run-acme }}
+      run-docker-smoke: ${{ steps.plan.outputs.run-docker-smoke }}
       run-govulncheck: ${{ steps.plan.outputs.run-govulncheck }}
       # Task's pin from .tool-versions (06 §7.1). Go comes from go.mod, Node from .tool-versions.
       task-version: ${{ steps.plan.outputs.task-version }}
@@ -143,6 +144,8 @@ jobs:
           if [ "$go" = true ] || [ "$deploy" = true ]; then go_or_deploy=true; fi
           go_web_or_deploy=$go_or_web
           if [ "$deploy" = true ]; then go_web_or_deploy=true; fi
+          docker_deploy_or_release=$deploy
+          if [ "$docker" = true ] || [ "$release" = true ]; then docker_deploy_or_release=true; fi
           {
             echo "go=$go"
             echo "web=$web"
@@ -200,6 +203,14 @@ jobs:
           # The job's own inputs count too: Pebble's config (the go filter's tlsmgr/testdata
           # pattern) and this workflow, which pins the two images (the deploy filter).
           decide acme "$go_or_deploy" go.mod internal/server/tlsmgr/testdata/pebble-config.json
+          # 06 §8.2 runs the Docker smoke test on docker, deploy or release changes: the image
+          # and the compose files, the Taskfile and this workflow, and what a release builds
+          # next to the image. A pull request that changes only the server does not run it;
+          # the push to main does.
+          decide docker-smoke "$docker_deploy_or_release" Taskfile.yml .tool-versions go.mod \
+            cmd/isshoni tools/go.mod tools/notices web/package.json web/package-lock.json \
+            deploy/docker/Dockerfile deploy/docker/test/docker-smoke.sh \
+            deploy/compose.yaml deploy/compose.host.yaml
           decide govulncheck "$go" Taskfile.yml .tool-versions tools/go.mod
 
           task_version=''
@@ -826,6 +837,67 @@ jobs:
           docker logs pebble || true
           docker logs challtestsrv || true
 
+  docker-smoke:
+    # The Docker smoke test of 06 §11.3, on linux/amd64. `task docker:smoke` builds the web
+    # app, THIRD_PARTY_NOTICES and the server binary for one version, and from them the image
+    # with deploy/docker/Dockerfile, as goreleaser does at a release. Then
+    # deploy/docker/test/docker-smoke.sh starts the image the way the docs do: compose.yaml
+    # (bridge network) and compose.host.yaml (host network) with a throwaway certificate, a
+    # start without a data volume (exit 78) and one without a .env file. On a failure the
+    # script prints the container's last log lines.
+    #
+    # The runner is the Docker host: the test uses its ports 80, 443 and 7882, and reads the
+    # owner of port 443 with `sudo ss`. Node is set up because the task builds the web app
+    # itself, so the job waits for no artifact of the web job.
+    needs: changes
+    if: needs.changes.outputs.run-docker-smoke == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # one cache per job below: setup-go's key is shared by every job
+
+      - name: Cache Go modules and builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum', '.tool-versions') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+
+      - name: Set up Node (version from .tool-versions)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Set up Task
+        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: ${{ needs.changes.outputs.task-version }}
+
+      - name: npm ci
+        run: npm ci --prefix web --no-audit --no-fund
+
+      - name: Show the Docker versions
+        run: |
+          docker version
+          docker compose version
+          docker buildx version
+
+      - name: task docker:smoke
+        run: task docker:smoke
+
   govulncheck:
     needs: changes
     if: needs.changes.outputs.run-govulncheck == 'true'
@@ -878,7 +950,7 @@ jobs:
     # The only required check (06 §8.6). It fails when a gating job failed or was cancelled;
     # a skipped job counts as a pass. always(), so it also reports when a job it needs failed.
     if: always()
-    needs: [changes, lint-go, test-go, web, protocol, licenses, build, e2e, lint-deploy, acme]
+    needs: [changes, lint-go, test-go, web, protocol, licenses, build, e2e, lint-deploy, acme, docker-smoke]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     permissions: {}

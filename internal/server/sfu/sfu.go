@@ -30,6 +30,10 @@ type SFU struct {
 	timing timings
 	// handshakeTimeouts counts the new PeerConnections that weren't connected in time, by PCKind (Metrics).
 	handshakeTimeouts [PCSub + 1]atomic.Uint64
+	// fullMaxBps is the full layer's MaxBitrate under the admin's cap, in bit/s (fullLayerMax of limits): New and
+	// SetLimits set it with limits. The NACK path reads it for the retransmission budget (Share.maxBitrate), once
+	// per NACK, so it is an atomic and not a field under mu.
+	fullMaxBps atomic.Int64
 
 	// The ticker (02 §5.4): one goroutine, started by the first Join and stopped by Close. kick wakes it at once for a
 	// share's state change, tickStop ends it and tickDone says that it has ended.
@@ -68,7 +72,7 @@ func New(cfg Config, deps Deps) (*SFU, error) {
 	if events == nil {
 		events = noRoomEvents{}
 	}
-	return &SFU{
+	s := &SFU{
 		log:            log,
 		events:         events,
 		apis:           a,
@@ -84,7 +88,9 @@ func New(cfg Config, deps Deps) (*SFU, error) {
 		conns:          map[ConnID]*Conn{},
 		shares:         map[ShareID]*Share{},
 		actors:         map[*Conn]struct{}{},
-	}, nil
+	}
+	s.fullMaxBps.Store(int64(fullLayerMax(cfg.Limits)))
+	return s, nil
 }
 
 // Ready returns nil once the APIs are built, which is as soon as New has returned, and sfu.closed after Close. 04's
@@ -367,6 +373,7 @@ func (s *SFU) addShare(c *Conn, p StartShareParams) (*Share, error) {
 		preset: p.Preset, state: SharePending,
 	}
 	sh.awaitsKeyframe.Store(true)
+	sh.audioBps.Store(int64(presetAudioBitrate(p.Preset)))
 	s.shares[sh.id] = sh
 	c.room.shares[sh.id] = sh
 	c.part.shares[sh.id] = sh
@@ -495,8 +502,8 @@ func (s *SFU) CloseRoom(room RoomID, r EndReason) {
 }
 
 // SetLimits replaces the admin's soft limits; the wiring calls it when 03's settings change. New ShareParams follow
-// the new cap at once. Telling running shares (REMB on the pub PC and a quality hint, 02 §11) is README S88's. An
-// invalid value is logged and ignored.
+// the new cap at once, and so do the retransmission budgets of the full layers' viewers (02 §9.5). Telling running
+// shares (REMB on the pub PC and a quality hint, 02 §11) is README S88's. An invalid value is logged and ignored.
 func (s *SFU) SetLimits(l Limits) {
 	if err := l.validate(); err != nil {
 		s.log.Warn("limits ignored", "err", err)
@@ -504,6 +511,7 @@ func (s *SFU) SetLimits(l Limits) {
 	}
 	s.mu.Lock()
 	s.limits = l
+	s.fullMaxBps.Store(int64(fullLayerMax(l)))
 	s.mu.Unlock()
 }
 

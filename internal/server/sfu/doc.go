@@ -35,10 +35,14 @@
 //	                  track            attached to: parse, one copy, cache insert, fan-out to the DownTracks that
 //	                                   want the layer (Layer.handleRTP)
 //	Layer RTCP reader 1 per incoming   reads the track's RTCP, per rid for simulcast, which also runs the publish
-//	                  track            side's interceptors; keeps the layer's latest sender report
-//	DownTrack writer  1 per DownTrack  takes packets off the DownTrack's queue: gate, munge, fresh header, write
-//	                                   (DownTrack.run); owned by the subscriber's Conn
-//	DownTrack RTCP    1 per DownTrack  the viewer's PLI and FIR for the track, until its sender stops
+//	                  track            side's interceptors; keeps the layer's latest sender report and tells the
+//	                                   DownTracks that want the layer of it
+//	DownTrack writer  1 per DownTrack  sends the retransmissions its viewer asked for, before anything else; takes
+//	                                   packets off the DownTrack's queue: gate, munge, fresh header, write; sends
+//	                                   the forwarded layer's sender reports on (DownTrack.run); owned by the
+//	                                   subscriber's Conn
+//	DownTrack RTCP    1 per DownTrack  the viewer's NACKs (looked up in the packet caches and queued for the
+//	                                   writer), PLI and FIR for the track, until its sender stops
 //	                                   (DownTrack.readRTCP); owned by the sub PC
 //	Ticker            1 per SFU        every 250 ms, and at once for a state change: the ShareUpdated calls that are
 //	                                   due; every second: each layer's rates and cache size, and the stalled check
@@ -63,6 +67,17 @@
 //   - The media path takes no lock per packet but the cache's and, in the writer, the DownTrack's own (uncontended).
 //     A Layer's read loop reads the share's fan-out list and each DownTrack's interest mask as atomics, and hands
 //     packets over with a channel send that never blocks: a full queue drops and counts.
+//   - A viewer's NACK is handled on its DownTrack's RTCP reader with three locks, one after the other and never
+//     one inside another: the DownTrack's (which epoch sent that sequence number), the cache's of that epoch's
+//     Layer (is the packet still there), and the DownTrack's NACK state (was it retransmitted just now, or too
+//     often; is there budget). No other lock: the budget's rate is read from atomics (the layer's measured bitrate,
+//     SFU.fullMaxBps for the admin's cap, Share.audioBps), so a NACK never waits for SFU.mu or Share.mu and the
+//     signaling calls that hold them. What is to be sent goes to the writer through the RTX queue, with a send that
+//     never blocks. One compound packet has at most 256 sequence numbers looked at, so a viewer can't keep those
+//     locks busy at will.
+//   - The NACKs a pub PC sends its publisher go through the PC's NACK filter, on the goroutine of Pion's NACK
+//     generator, which holds none of its locks then. The filter reads the PC's track table, an atomic pointer that
+//     the Conn's actor replaces when a track comes or goes, and takes each cache's lock for one lookup at a time.
 //   - WriteRTP and WriteRTCP are media calls, not signaling calls: the media goroutines make them, and so may any
 //     actor, also for another Conn's pub PC (a keyframe request). Pion allows them from any goroutine and they
 //     never block. Keyframe requests are throttled per layer by a compare-and-swap, so callers need no lock.
@@ -140,10 +155,27 @@
 //     ended: its stream is over then, and goes on with the keyframe of the layer it falls back to), on its own PLI
 //     or FIR, and for as long as packets of the layer it waits for arrive without one (only every 5 s for a viewer
 //     whose stream Pion has taken twice in a row without sending any of it);
+//   - rtx.go, and the rest in downtrack.go, layer.go and munger.go: repair and sync (02 §9.4–9.6). A viewer's NACK
+//     is answered from the packet cache of the Layer that sent the sequence number, found through the munger's
+//     epochs: on the RTX stream when the viewer negotiated one for the payload type (video), else as the packet
+//     again (audio), before any new media. A packet is retransmitted at most three times and not twice within
+//     max(20 ms, RTT/2), which is remembered by its sequence number for 5 s: long after the cache has let go of
+//     the packet, and long before the number has its next one. All retransmissions of a DownTrack stay within a
+//     quarter of its layer's bitrate or maximum (at least 200 kbit/s, with a second of that in reserve). The
+//     publish side's copies of packets the cache already has (a browser's redundant RTX) are dropped where they
+//     arrive. A publisher is asked for a missing packet until it is in the Layer's cache, by whichever way it came,
+//     and at most ten times: Pion's NACK generator writes its NACKs through the pub PC's NACK filter (pubnack.go),
+//     which takes out what the cache holds. Padding-only packets are never forwarded and leave no gap. The sender
+//     reports of the layer a DownTrack forwards go on to its viewer with the publisher's NTP time and the RTP time
+//     on the viewer's timeline, every one that arrives and one right after each start of an epoch; a layer switch
+//     keeps that timeline the capture timeline, through both layers' reports, to within a tick. So a share's audio
+//     and video reach a viewer on one clock, the publisher's capture clock;
 //   - events.go, errors.go, types.go, config.go, stats.go, probe.go: the whole interface of 02 §6 and §13;
-//   - api.go: the publish, subscribe and connection-test probe webrtc.APIs on 04's netx.Transport, the
-//     remote-candidate filter (02 §7.3, 01 §17), the selected-pair label and the complete-SDP helper: the SFU never
-//     trickles (02 §7.1–7.3, §7.6);
+//   - pubnack.go: the NACK filter of each pub PC, which keeps Pion's NACK generator from asking a publisher for
+//     packets that the Layer's cache already holds (02 §9.5);
+//   - api.go: the publish, subscribe and connection-test probe webrtc.APIs on 04's netx.Transport (an API of its
+//     own for each pub PC, whose NACK filter knows the PC's tracks), the remote-candidate filter (02 §7.3, 01 §17),
+//     the selected-pair label and the complete-SDP helper: the SFU never trickles (02 §7.1–7.3, §7.6);
 //   - codec.go, h264.go, sdpcheck.go: profiles, the payload-type table and both MediaEngines (02 §8.1–8.2),
 //     keyframe-start detection and the SPS parser (02 §9.1), pub-offer validation and the answer edits (02 §8.4–8.5).
 //
@@ -188,14 +220,13 @@
 //
 // The whole API is declared; a method that a later slice implements returns an error that wraps ErrNotImplemented
 // (SetDecodeCaps, Probe). In README order:
-//   - S63: NACK/RTX from the cache (the DownTrack's RTX queue), sender reports forwarded to the viewers (a Layer
-//     already keeps its latest one, for the munger), and the tests of padding and of the publisher's redundant RTX;
 //   - S69: the room codec policy with its hysteresis (CodecPolicy is ProfileHigh until then), the codec filter of
 //     the pub answer, SetDecodeCaps, viewers without H.264, and the codec_mismatch state of a DownTrack whose
 //     viewer has no payload type for the stream's profile (it forwards nothing until then, silently);
 //   - S76: Probe. S79: the transports, RTTs and counters of Snapshot, ConnStats and Metrics (the Layers and
-//     DownTracks count; nothing sums them up yet). S84: the downlink allocator (REMB, receiver reports, queue
-//     drops) and the pacer. S88: the admin cap as REMB and quality hint (SetLimits already caps new ShareParams),
+//     DownTracks count, the repair counters of 02 §13 included; nothing sums them up yet. A sub PC's round-trip
+//     time is read already, for the NACK handling: subPC.rtt). S84: the downlink allocator (REMB, receiver
+//     reports, queue drops) and the pacer. S88: the admin cap as REMB and quality hint (SetLimits already caps new ShareParams),
 //     layer pausing, and the last QualityHintEvent per share in Resync.
 //
 // The server's cap on a subscription (02 §10.1: effective = min(requested, cap), with its reason) is in place
