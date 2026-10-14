@@ -198,9 +198,10 @@ func (c *Conn) PC(ctx context.Context, kind PCKind) (PCState, error) {
 
 // Timings are the durations of PeerConnection recovery that a test may shorten (config.go): the handshake timeout
 // (10 s), the grace after failed (30 s), the sub offer re-send (15 s), the ICE restart spacing (5 s), the window of
-// the PC creation limit (1 min) and the stalled threshold (2 s).
+// the PC creation limit (1 min), the stalled threshold (2 s) and the time between two codec rebuilds for a viewer
+// whose answers refuse H.264 (20 s).
 type Timings struct {
-	Handshake, Grace, OfferResend, ICERestart, PCWindow, Stalled time.Duration
+	Handshake, Grace, OfferResend, ICERestart, PCWindow, Stalled, CodecRetry time.Duration
 }
 
 // SetTimings replaces the durations of t that aren't zero. Call it before the SFU's first Join.
@@ -211,6 +212,7 @@ func (s *SFU) SetTimings(t Timings) {
 	}{
 		{&s.timing.handshake, t.Handshake}, {&s.timing.grace, t.Grace}, {&s.timing.offerResend, t.OfferResend},
 		{&s.timing.iceRestart, t.ICERestart}, {&s.timing.pcWindow, t.PCWindow}, {&s.timing.stalled, t.Stalled},
+		{&s.timing.codecRetry, t.CodecRetry},
 	} {
 		if d.from != 0 {
 			*d.to = d.from
@@ -223,12 +225,59 @@ func DefaultTimings() Timings {
 	d := defaultTimings()
 	return Timings{
 		Handshake: d.handshake, Grace: d.grace, OfferResend: d.offerResend, ICERestart: d.iceRestart,
-		PCWindow: d.pcWindow, Stalled: d.stalled,
+		PCWindow: d.pcWindow, Stalled: d.stalled, CodecRetry: d.codecRetry,
 	}
 }
 
 // MaxPCCreations is the number of PeerConnections of one kind a client may make a Conn create within a minute.
 const MaxPCCreations = maxPCCreations
+
+// CodecRetries is how many codec rebuilds the SFU makes for a viewer whose answers refuse H.264 (02 §8.5), and
+// CodecPolicyHold how long a room's codec policy stays cb after the last viewer that needed it (02 §8.3).
+const (
+	CodecRetries    = codecRetries
+	CodecPolicyHold = codecPolicyHold
+)
+
+// AdvanceCodecClock moves the clock of the SFU's codec policies on by d: the fake clock of 02 §17, with which a test
+// sees a policy's hold pass without waiting for it. The ticker looks at the policies once a second;
+// CheckCodecPolicies looks at once.
+func (s *SFU) AdvanceCodecClock(d time.Duration) { s.clockSkew.Add(int64(d)) }
+
+// CheckCodecPolicies brings every room's codec policy up to date now, as the ticker does once a second.
+func (s *SFU) CheckCodecPolicies() {
+	s.mu.Lock()
+	rooms := make([]*Room, 0, len(s.rooms))
+	for _, r := range s.rooms {
+		rooms = append(rooms, r)
+	}
+	s.mu.Unlock()
+	for _, r := range rooms {
+		s.updateCodecPolicy(r)
+	}
+}
+
+// DecoderState describes what a Conn knows of its viewer's H.264 decoders (02 §8.5).
+type DecoderState struct {
+	H264     bool // the viewer's caps list some H.264
+	Refused  bool // an answer of the viewer refused H.264: its video waits for a codec rebuild
+	Rebuilds int  // codec rebuilds since the caps last changed or the viewer last took H.264
+	Failed   bool // all of them done, and refused still: decoder_failed
+	Retry    bool // the next codec rebuild is set
+}
+
+// Decoders returns the Conn's DecoderState.
+func (c *Conn) Decoders(ctx context.Context) (DecoderState, error) {
+	var st DecoderState
+	err := c.do(ctx, func(context.Context) error {
+		st = DecoderState{
+			H264: c.decodesH264(), Refused: c.codec.refused, Rebuilds: c.codec.retries, Failed: c.codec.failed,
+			Retry: c.codec.retry.pending(),
+		}
+		return nil
+	})
+	return st, err
+}
 
 // SetMediaICETimeouts replaces the ICE timeouts of the pub and sub PCs of every SFU built from now on, and returns
 // the function that puts the real ones back (02 §7.3: 5 s to disconnected, 15 s more to failed). A test that needs a

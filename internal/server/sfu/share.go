@@ -376,15 +376,21 @@ func (s *Share) requestKeyframe(slot Slot) {
 // goes by, so the two can't disagree and flap. A keyframe that overtakes the actor's look at a PC that has just
 // reconnected isn't lost: the actor asks every layer of the PC for a keyframe when it sees the PC connected, and
 // until one makes the share live, each further packet asks again (Layer.handleRTP).
+//
+// A new profile (the first keyframe, or the sharer's switch after a codec policy change, 02 §8.3) is news for every
+// video subscriber: whether it has a payload type for the profile decides codec_mismatch, which its Conn's actor
+// works out when it looks at the subscription (Subscription.changed).
 func (s *Share) keyframe(l *Layer, profile ProfileKey) (wentLive bool) {
 	s.mu.Lock()
 	if s.ended || s.layers[l.slot] != l {
 		s.mu.Unlock()
 		return false
 	}
+	var viewers []*DownTrack
 	if s.profile != profile {
 		s.profile = profile
 		s.changedLocked()
+		viewers = s.downTracks(webrtc.RTPCodecTypeVideo)
 	}
 	switch {
 	case s.state == SharePending:
@@ -401,6 +407,9 @@ func (s *Share) keyframe(l *Layer, profile ProfileKey) (wentLive bool) {
 	s.mu.Unlock()
 	if wentLive {
 		s.conn.sfu.shareStateChanged(s, ShareLive, "")
+	}
+	for _, dt := range viewers {
+		dt.sub.changed()
 	}
 	return wentLive
 }

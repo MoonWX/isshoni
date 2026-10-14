@@ -246,6 +246,27 @@ func filterByPolicy(codecs []webrtc.RTPCodecParameters, policy ProfileKey) []web
 	return out
 }
 
+// inOfferOrder returns the codecs of list that an offer's m-section lists, in the order of its formats: a sharer's
+// re-offer may reorder its codecs (a codec hint puts the hinted profile first, 01 §8.10), and the answer follows
+// that order. Codecs are matched by payload type, which a peer keeps for the whole session (JSEP). A codec of list
+// that the m-section doesn't list is left out, and so is a format of the m-section that has no codec in list.
+func inOfferOrder(list []webrtc.RTPCodecParameters, md *sdp.MediaDescription) []webrtc.RTPCodecParameters {
+	out := make([]webrtc.RTPCodecParameters, 0, len(list))
+	for _, f := range sdpCodecs(md) {
+		pt, err := strconv.ParseUint(f.pt, 10, 8)
+		if err != nil {
+			continue
+		}
+		for _, c := range list {
+			if uint64(c.PayloadType) == pt {
+				out = append(out, c)
+				break
+			}
+		}
+	}
+	return out
+}
+
 // ---- MediaEngines and interceptors (02 §8.1) ----
 
 // h264Codec is one row of the static payload-type table. Both MediaEngines register the same PTs; Pion matches remote

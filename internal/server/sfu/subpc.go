@@ -18,10 +18,8 @@ import (
 // glare. Its negotiation is the state machine of 02 §5.3. It is idle or offering, with changes made while an offer
 // is outstanding folded into one follow-up offer; an offer without an answer goes out again every 15 s; an ICE
 // restart is one more reason for an offer, with new ICE credentials; and it is closed for good once its
-// PeerConnection is, until the Conn builds its successor with the next gen (rebuildSub). Everything but ready belongs
-// to the Conn's actor.
-//
-// README S69 adds the codec rebuilds.
+// PeerConnection is, until the Conn builds its successor with the next gen (rebuildSub). The SFU also rebuilds it on
+// its own for the viewer's decoders (codecstate.go). Everything but ready belongs to the Conn's actor.
 type subPC struct {
 	gen uint32
 	pc  *webrtc.PeerConnection
@@ -63,6 +61,10 @@ type subPC struct {
 	// restartAt is the monoNow at which the last ICE-restart offer went out, and 0 once ICE has connected or failed
 	// since, or before the first: within 5 s of it a restart is still under way (requestICERestart).
 	restartAt int64
+	// refusedVideo: an answer refused H.264 on a video m-section with a DownTrack (Conn.codecAnswered). Pion settles
+	// a PC's video codecs with the first answer that has video, so this PC can't carry video any more: only a rebuild
+	// can (02 §8.5).
+	refusedVideo bool
 
 	// spares are the transceivers whose DownTrack has left (its share ended): their m-sections stay in the SDP for
 	// good, and the next DownTrack of the kind takes one over instead of adding a new one, so the SDP doesn't grow
@@ -126,10 +128,11 @@ func (c *Conn) newSubPC() (*subPC, error) {
 }
 
 // rebuildSub replaces the Conn's sub PC with one of the next gen that carries every subscription, and offers it at
-// once as neg 1 (02 §5.3): what ResetPC does, and the way out of the closed state. The old PC is closed first, which
-// unbinds its DownTracks; nothing more is reported about it, because it is no longer the Conn's sub PC when its
-// closed state arrives. The DownTracks keep their place in their viewer's streams: each goes on, with a new SSRC,
-// when the new PC is connected and the keyframe it asks for then has come.
+// once as neg 1 (02 §5.3): what ResetPC does, the way out of the closed state, and the SFU's own codec rebuild
+// (codecRebuild, 02 §8.5). A video DownTrack goes on it only for a viewer that decodes H.264. The old PC is closed
+// first, which unbinds its DownTracks; nothing more is reported about it, because it is no longer the Conn's sub PC
+// when its closed state arrives. The DownTracks keep their place in their viewer's streams: each goes on, with a new
+// SSRC, when the new PC is connected and the keyframe it asks for then has come.
 //
 // If the new PeerConnection can't be made, the Conn keeps the old one, closed, and the next request tries again.
 func (c *Conn) rebuildSub(cause string) error {
@@ -146,9 +149,13 @@ func (c *Conn) rebuildSub(cause string) error {
 	if err != nil {
 		return err
 	}
+	c.codec.stale = false
 	c.log.Info("sub PC rebuilt", "gen", s.gen, "cause", cause, "subscriptions", len(c.subs))
 	for _, id := range slices.Sorted(maps.Keys(c.subs)) {
 		for _, dt := range c.subs[id].tracks() {
+			if !c.carries(dt) {
+				continue // a viewer without H.264 gets no video (02 §8.5)
+			}
 			if err := s.addTrack(dt, c.log); err != nil {
 				c.log.Warn("DownTrack not added to the rebuilt sub PC", "share_id", string(id), "err", err)
 				c.subFatal(s)
@@ -539,9 +546,14 @@ func (c *Conn) handleAnswer(kind PCKind, gen, neg uint32, raw string) error {
 	case gen != s.gen || !s.offering || neg != s.neg:
 		return newError(CodeStaleAnswer, "the answer doesn't match the outstanding sub offer")
 	}
-	// The video m-lines without H.264 that this returns are README S69's: their DownTracks bind as unsupported.
-	if _, err := checkSubAnswer(raw); err != nil {
+	// Video m-lines without H.264 (02 §8.5) are no reason to refuse the answer: their DownTracks bind as unsupported,
+	// the audio flows, and codecAnswered starts the guard's codec rebuilds.
+	noH264, err := checkSubAnswer(raw)
+	if err != nil {
 		return err
+	}
+	if len(noH264) > 0 {
+		c.log.Debug("sub answer has video m-lines without H.264", "gen", gen, "neg", neg, "count", len(noH264))
 	}
 	budget := c.cands[PCSub].forGen(gen)
 	filtered, dropped, err := c.sfu.apis.filter.limitSDP(raw, budget.admit)
@@ -569,6 +581,8 @@ func (c *Conn) handleAnswer(kind PCKind, gen, neg uint32, raw string) error {
 		c.startHandshake(PCSub, gen, s.pc, &s.pcState)
 	}
 	s.sparesAnswered(neg, filtered)
+	// Pion has bound the DownTracks new in this answer: what they can send decides the viewer's codec state.
+	c.codecAnswered(s)
 	if s.dirty || s.restartQueued {
 		c.offerSub(s)
 	}

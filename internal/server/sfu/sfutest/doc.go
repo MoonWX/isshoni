@@ -11,7 +11,13 @@
 // leave out the frames that may be short by design: the newest one of a running stream, and the old layer's last one
 // at a layer switch; InSeqOrder puts a stream with repairs in the order a decoder gets it in. REMBs are fixed values
 // a test sends with Viewer.SendREMB. Viewer.Rebuild gives it a new PeerConnection, as a client does for a sub PC of
-// a new gen; an offer with new ICE credentials restarts ICE on the one it has.
+// a new gen; an offer with new ICE credentials restarts ICE on the one it has. ViewerOptions.H264 and NoH264 make
+// it a Firefox, with Constrained Baseline and Baseline only or before its decoder download, and Viewer.SetH264
+// installs a decoder for its next PeerConnections, as a browser that fetched OpenH264 uses it on a new
+// PeerConnection (02 §8.5).
+//
+// ProfileSource is a publish.ProfileSource of fake.Sources, one per profile, on one timeline: what a sharer's
+// encoder does when the room's codec policy changes the profile (02 §8.3).
 //
 // The Viewer's NACKs are its own, from what its Recorders miss, timed about as a browser's (NACKAfter, NACKEvery,
 // NACKTries), and they stop when the packet arrives, on the track or through RTX. Pion's NACK generator doesn't: it
