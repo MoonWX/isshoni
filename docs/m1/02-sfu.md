@@ -2395,7 +2395,8 @@ choice:
   only. Handshake timeouts are warnings (they were info before S79), and so are sub offers sent again (they were
   debug).
 - **Pion's own lines** reach the log through 04's bridge (04 §10: Pion's levels kept, its debug and info lines only
-  while debug is on, 20 lines a minute per scope, no SDP-like line), under `component=sfu` with the scope, and the
+  while debug is on, 20 lines a minute per scope, no SDP-like line, and since README F20 every ICE password in a
+  line's text redacted), under `component=sfu` with the scope, and the
   SFU's logger factory (`pionlog.go`) changes two things on top: Pion's info lines are debug lines (they repeat,
   without ids, what the SFU says itself), and so are its warnings and errors that hold an IP address (a check from a
   stray address names it). Pion's other warnings and errors keep their level. The group 11 integration made netx's
