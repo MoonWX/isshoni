@@ -214,16 +214,34 @@ check_backup_restore() {
   check_admin_exists "after the restore"
 }
 
+# has_ipv6_loopback reports whether this computer has the IPv6 loopback address ::1 (Linux, then BSD and macOS).
+has_ipv6_loopback() {
+  if [ -r /proc/net/if_inet6 ]; then
+    grep -q '^00000000000000000000000000000001 ' /proc/net/if_inet6
+  else
+    ifconfig lo0 2>/dev/null | grep -q 'inet6 ::1 '
+  fi
+}
+
 # check_ipv6_client checks what 06 §6.4 warns about: in bridge mode Docker's proxy forwards a client on the IPv6
 # loopback from the compose network's gateway, so the server never sees the client's own address. When a Docker
-# update changes that, this fails and 06 §6.4 needs an update.
+# update changes that, this fails and 06 §6.4 needs an update. It is skipped only when this computer has no IPv6
+# loopback, or when port 443 does not answer on [::1] and the engine runs in a virtual machine or on another host,
+# whose port forwarding is not Docker's proxy.
 check_ipv6_client() {
   if skipping ipv6; then
     skip "the client address over IPv6: -s ipv6"
     return 0
   fi
+  if ! has_ipv6_loopback; then
+    skip "the client address over IPv6: this computer has no IPv6 loopback (::1)"
+    return 0
+  fi
   if ! api '[::1]' -o /dev/null "$SITE/api/v1/info" 2>"$work/ipv6.err"; then
-    skip "the client address over IPv6: port 443 does not answer on [::1] ($(tr '\n' ' ' <"$work/ipv6.err"))"
+    why=$(tr '\n' ' ' <"$work/ipv6.err")
+    [ "$engine_local" = 0 ] ||
+      fail "port 443 does not answer on [::1]: Docker no longer forwards IPv6 clients as 06 §6.4 says; update 06 §6.4 ($why)"
+    skip "the client address over IPv6: port 443 does not answer on [::1], and the Docker engine runs in a virtual machine or on another host ($why)"
     return 0
   fi
   printf '{"username":"smokeadmin","password":"%s"}' "$(cat "$work/password")" >"$work/login.json"
@@ -316,14 +334,14 @@ make_certificate() {
   tls=$work/tls
   mkdir -p "$tls"
   {
-    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 \
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 30 \
       -subj '/CN=isshoni smoke test CA' -keyout "$tls/ca.key" -out "$tls/ca.pem" \
       -addext 'basicConstraints=critical,CA:TRUE' -addext 'keyUsage=critical,keyCertSign'
     openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
       -subj '/CN=smoke.test' -keyout "$tls/key.pem" -out "$tls/cert.csr"
     printf 'subjectAltName=DNS:smoke.test\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\n' >"$tls/cert.ext"
     openssl x509 -req -in "$tls/cert.csr" -CA "$tls/ca.pem" -CAkey "$tls/ca.key" -CAcreateserial \
-      -days 2 -extfile "$tls/cert.ext" -out "$tls/cert.pem"
+      -days 30 -extfile "$tls/cert.ext" -out "$tls/cert.pem"
   } >"$work/openssl.log" 2>&1 || {
     sed 's/^/    /' "$work/openssl.log" >&2
     fail "openssl could not make the test certificate"
