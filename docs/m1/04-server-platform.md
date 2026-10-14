@@ -2849,7 +2849,9 @@ isshoni-backup-0.3.0-20260929T101500Z.tar.gz
 
   The tests (`cmd/isshoni/backup_unix_test.go`) put FIFOs with a waiting reader at the default names of the
   seconds around a backup and check exit 7 and an empty pipe; the owner of an explicit `--out` FIFO comes from an
-  injectable check (`backupOutOwner`), since a file of another user takes root to make.
+  injectable check (`backupOutOwner`), since a file of another user takes root to make. The real check runs on
+  `/dev/null`, root's, and that case is skipped where `/dev/null` shows another owner: in a user namespace that
+  doesn't map the host's root, as in a rootless container, it shows the overflow uid, and exit 7 is then right.
 
 ### 12.4 Restore
 

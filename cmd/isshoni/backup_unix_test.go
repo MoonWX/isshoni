@@ -219,7 +219,15 @@ func TestBackupNamedFIFO(t *testing.T) {
 	})
 
 	t.Run("a character device of root's", func(t *testing.T) {
-		// The real owner check: /dev/null belongs to root.
+		// The real owner check: /dev/null belongs to root, except in a user namespace that doesn't map the host's
+		// root (a rootless container), where it shows the overflow uid and the refusal is right.
+		fi, err := os.Stat(os.DevNull)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if uid, ok := fileOwner(fi); !ok || uid != 0 {
+			t.Skipf("%s belongs to uid %d here, not to root", os.DevNull, uid)
+		}
 		code, stdout, stderr := runCLIEnv(t, env, "admin", "backup", "--out", os.DevNull)
 		if code != exitOK || stderr != "" || stdout != "Wrote "+os.DevNull+".\n"+keepPrivate+"\n" {
 			t.Errorf("admin backup --out %s: exit %d, stdout %q, stderr %q", os.DevNull, code, stdout, stderr)

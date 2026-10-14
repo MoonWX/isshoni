@@ -394,10 +394,13 @@ jobs:
         run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir rel
 
       - name: Every asset matches checksums.txt
+        # publish's checksum and asset check, which publish runs once more right before the draft goes public: a draft
+        # that would fail there is never signed. --strict fails on a malformed line too.
         run: |
-          (cd rel && sha256sum -c checksums.txt)
-          # And nothing is in the draft that the signature would not cover. checksums.txt.sig is there when this
-          # job runs again after it uploaded one; the next step replaces it.
+          (cd rel && sha256sum --strict -c checksums.txt)
+          # And nothing is in the draft that the signature would not cover, hidden files included. checksums.txt.sig
+          # is there when this job runs again after it uploaded one; the next step replaces it.
+          shopt -s dotglob nullglob
           for f in rel/*; do
             name=${f#rel/}
             case $name in checksums.txt | checksums.txt.sig | checksums.txt.sigstore.json) continue ;; esac
@@ -435,11 +438,13 @@ jobs:
 
       - name: Upload the signed files for verify
         # verify installs exactly these, the draft as checked above with its signature, and so needs no token that
-        # can read a draft (contents: write) next to the third-party code it runs (review R4).
+        # can read a draft (contents: write) next to the third-party code it runs (review R4). Hidden files too: the
+        # check above lets one through only when checksums.txt lists it.
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-signed
           path: rel
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
 
@@ -460,7 +465,8 @@ jobs:
 
       - name: Every asset matches checksums.txt
         run: |
-          (cd rel && sha256sum -c checksums.txt)
+          (cd rel && sha256sum --strict -c checksums.txt)
+          shopt -s dotglob nullglob
           for f in rel/*; do
             name=${f#rel/}
             case $name in checksums.txt | checksums.txt.sigstore.json) continue ;; esac
@@ -486,6 +492,7 @@ jobs:
         with:
           name: release-signed
           path: rel
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 3
 
@@ -622,6 +629,39 @@ jobs:
           fi
           addr=$(cat "$RUNNER_TEMP/addr")
           echo "BASE_URL=https://host.containers.internal:${addr##*:}" >> "$GITHUB_ENV"
+
+      - name: A systemd user session for rootless podman
+        # systemd in the container comes up only in a cgroup of its own that it may write to, which rootless podman
+        # gets from the runner user's systemd (its systemd cgroup manager, through the user's D-Bus). A job runs under
+        # the runner's service, not in a login session; without one, podman falls back to cgroupfs and systemd in the
+        # container fails on its first cgroup. Lingering starts the user's systemd without a login (06 §4.13). sudo
+        # runs loginctl only, on the runner; the container gets nothing from it.
+        run: |
+          user=$(id -un)
+          run=/run/user/$(id -u)
+          if [ ! -S "$run/bus" ]; then
+            sudo loginctl enable-linger "$user"
+            for _ in $(seq 1 100); do
+              [ -S "$run/bus" ] && break
+              sleep 0.1
+            done
+          fi
+          export XDG_RUNTIME_DIR=$run DBUS_SESSION_BUS_ADDRESS=unix:path=$run/bus
+          {
+            echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+            echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
+          } >> "$GITHUB_ENV"
+          # A podman that ran before the session existed keeps its first setup until it is migrated.
+          podman system migrate
+          manager=$(podman info --format '{{.Host.CgroupManager}}')
+          linger=$(loginctl show-user "$user" --property=Linger --value 2>/dev/null) || linger=no
+          echo "$user: linger $linger, podman's cgroup manager $manager"
+          if [ "$manager" != systemd ]; then
+            loginctl user-status "$user" --no-pager 2>&1 | head -n 20 || :
+            echo "::error::rootless podman reaches no systemd user session at $run/bus (cgroup manager" \
+              "$manager), so systemd can't come up in its container"
+            exit 1
+          fi
 
       - name: Start a ${{ matrix.distro }} systemd container (rootless podman)
         env:
