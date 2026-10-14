@@ -1798,6 +1798,24 @@ PC recovers first.
 client's sub PC has been `disconnected` for 3 s when the socket resumes, so its request sent on `ready` and
 `Resync()` both ask, and one offer serves both.
 
+**A sub ICE restart asked for during the outage** (README §6 "Decided after group 10" (3)). The client's 3 s timer
+usually runs out while its network is still down, so the server's ICE-restart offer arrives (on the WebSocket, which
+may well be up) before the client's UDP is back. The SFU is the controlling ICE agent of a sub PC, so that restart
+connects only if the SFU keeps checking its candidate pairs until the network returns. From README F10 on it checks
+them for the length of Pion's failed timeout (02 §7.3). Before F10 it kept Pion's default and gave up on each pair
+after 7 unanswered checks, about 1.5 s, so such a viewer came back only through the 15 s rebuild (README S74 found
+it; §11.5 B, §19 case 5).
+
+**A sub PC that the server closed counts as `disconnected` for a Go client** (README S74). Pion closes a
+PeerConnection whose peer closes its side with a DTLS `close_notify` (02 §5.3, §7.3), and it does so on both ends. The
+SFU closes the old sub PC when it replaces it on its own for a codec rebuild (02 §8.5), so a Go client on Pion's
+defaults (the itest harness of §19, whose viewer is a `sfutest.Viewer`) sees its sub PC go `closed` while the new PC's
+offer (the next `gen`) is on its way. A browser's PeerConnection never closes by itself; its ICE only stops hearing
+the server. The Go client therefore treats a sub PC closed under it like ICE `disconnected`: it asks for nothing
+unless the new offer fails to come, and then the 3 s and 15 s rows above apply, whose `pc.restart` gets a closed sub
+PC rebuilt (02 §6.4). Treated as `failed`, it would send a `pc.restart{sub, rebuild}` for the old `gen` before the new
+offer arrives, which case 7 of §19 forbids (the client never sends `pc.restart` in that flow).
+
 **Server**: it starts exactly three actions on its own:
 1. `pc.restart{pc: pub, gen, mode: rebuild, reason: failed}` when the current pub PC reaches `failed`, or when a new
    pub PC misses its 10 s handshake (02); only while that connection publishes a share, be it `starting`, `live`
@@ -1973,6 +1991,24 @@ t+3 s    client (offerer, pub): ICE restart offer → pc.answer
 t=5 s    UDP back → ICE checks succeed (or TCP 443 pairs win if UDP stays blocked)
 t≈5.5 s  connected → keyframe requests → s_a live; subscriptions resume on keyframes
 ```
+
+**As README S74 measured it** (case 5 of §19; decided after group 10, README §6 (2) and (3)):
+- **The share is `stalled` later than drawn.** The SFU decides it, not the browser (02 §5.3): the pub PC must have
+  been not connected for 2 s, and the SFU sees that only after Pion's 5 s without a packet (02 §7.3) or once the
+  client's ICE restart arrives (the browser notices after about 2 s, then waits 3 s). Its once-a-second ticker adds
+  up to a second. So the share is stalled about 7 s into the outage, and an outage of exactly 5 s ends before that:
+  the share stays `live` in `room.state` and its viewers see the last frame until the media is back. Case 5
+  therefore keeps the UDP away until the share is stalled (about 7.4 s).
+- **The sub half needs README F10.** The `pc.restart{sub, ice}` at t+3 s goes out while the viewer's UDP is still
+  gone, and the SFU's ICE-restart offer with it. The SFU is the controlling agent of a sub PC, and with Pion's
+  default it gives up on each candidate pair after 7 unanswered checks (about 1.5 s) and never checks it again, so
+  that restart doesn't connect when the network is back (§10.4). README F10 makes the SFU's sub PCs keep checking
+  for the length of the failed timeout, and makes a keyframe request wait while the share's pub PC is away, so that
+  the request of the pub PC's own reconnect is not swallowed by the 500 ms throttle (02 §9.7). Until README F10, a
+  viewer whose own outage outlasts its detection time plus 3 s comes back only through the 15 s rebuild (§10.4),
+  and the itest case for this half, `TestUDPBlackHoleViewer`, is skipped. The pub half, the sharer's own ICE
+  restart, connects as drawn: the client is the pub PC's controlling agent, and a browser keeps checking its pairs
+  through such an outage (the Go test client is set to keep checking for 25 s: case 5 of §19).
 
 **C. Wi-Fi → LTE** (both break): A and B together. Socket and ICE fail, the client resumes the socket first (skip-wait
 on `online`), then the resumed-`welcome` rows of §10.4 run: the client ICE-restarts its pub PC, and the server's
@@ -2225,6 +2261,13 @@ Forbidden:
   - Tests decode every compat fixture with the current code. They assert that decoding succeeds, and that
     re-encoding keeps every key present in the fixture with an equal value. That enforces "additive only"
     mechanically.
+  - **What counts as a snapshot** (README S75, `compat_test.go`): every entry of `testdata/compat/` must be a
+    directory named after a final release, `X.Y.Z` without leading zeros, and not a link (a link to `testdata/v1`
+    would follow every change and freeze nothing); inside it, every entry must be a regular `*.json` file. Anything
+    else fails the test, hidden files such as `.DS_Store` aside. release.yml's check refuses a snapshot with links
+    in it too, and `task release:compat` refuses a `VERSION` older than the two snapshots it would keep and runs
+    only while `compat/` holds nothing but such directories (06 §7.2, §9.3). Until the first release-prep PR
+    commits a snapshot, `TestCompatFixtures` skips.
 
 ### 14.4 TypeScript generation and drift check
 
@@ -3261,13 +3304,56 @@ In `internal/server/signal`, with `signaltest` fakes and `httptest`:
 5. **UDP black-holed for 5 s** (a packet filter in the test's UDP mux wrapper): the share goes `stalled`, an ICE
    restart happens, and media resumes within 3 s after unblocking; the viewer's subscription stays; the share id is
    unchanged.
+
+   **As README S74 built it** (`TestUDPBlackHole`; decided after group 10, README §6 (2)):
+   - **Only the sharer's UDP is cut**, by a `sfutest.FaultConn` under the sharer's own UDP mux
+     (`faultySettings`); its WebSocket stays up. The viewer's network is fine, so it keeps its subscription, its
+     sub PC and its tracks: it is offered nothing new and sends no `pc.restart`. Cutting the viewer's UDP too is
+     §11.5 B's sub half, which needs README F10 (below).
+   - **The outage lasts 5 s and on until the share is `stalled`**, about 7.4 s (7.38 to 7.46 s measured): with
+     02's timers no share can be stalled within 5 s (§11.5 B), and a check of `stalled` is the point of the case.
+     It follows S57's `TestSubICERestart`, whose outage also runs until a condition on the SFU's side.
+   - **The sharer's Pion is set closer to a browser's**: ICE `disconnected` after 2 s, with 500 ms keepalives, and
+     checks of a pair for 25 s (`SetICEMaxBindingRequests(125)`). With Pion's default of 7 checks its own ICE
+     restart, made during the outage, would not connect when the network is back either.
+   - **Asserted**: the share went `live stalled live` in the viewer's `room.state`; one ICE restart of the pub PC
+     (pub offers `1/1 1/2`, new ICE credentials, the same tracks) and no `pc.restart` either way; video, from a
+     keyframe, and audio back within 3 s of the network, the pub PC on a UDP pair again; one share id; the
+     viewer's requested layer unchanged in every `subscribe.status` and one track per kind.
+   - **The continuity checks wait `sfutest.FinalLossAfter` (plus 200 ms) first**, so that what a loaded machine
+     lost on the way has had its NACK/RTX repair: they then see the stream as a jitter buffer would. Under load
+     the SFU logged Pion's "mux: endpoint buffer is full, dropping packet" right after the reconnect, and a check
+     made at once failed.
+   - **`TestUDPBlackHoleViewer`** runs the same case with the viewer's UDP cut too: exactly one
+     `pc.restart{sub, gen 1, ice, disconnected}`, sub offers `1/1 1/2` with a new `ice-ufrag`, no rebuild, the
+     viewer's video (from a keyframe) and audio back within 3 s on the tracks it had, and a UDP pair again. It is
+     skipped until README F10 makes the SFU's sub PCs keep checking their pairs through such an outage and keeps
+     keyframe requests back while the pub PC is away (§10.4, §11.5 B; 02 §7.3, §9.7).
 6. **Server restart** (stop hub and SFU, start new ones on the same ports): the publisher re-publishes with
    `replaces`, the subscriber refocuses on the new share id, and media flows within 5 s of the new server being up.
+
+   **As README S74 built it** (`TestServerRestart`): the new server takes the same ICE ports and data; both
+   clients were told `server.shutdown{restart}`, get a `welcome` that did not resume and a new connection id; the
+   sharer publishes once more (pub offers `1/1 1/1`, one per server, the second for the new share id) and the
+   viewer gets the new share's video within 5 s of the new server being up, on the full layer, with its focus and
+   audio moved to it (`desired` is the new share in focus with audio); one sub offer per server; nobody sends
+   `pc.restart`. **The `replaces` check**: only the sharer must have received `room.event share.started` with
+   `replaces`, because it joins before it publishes again. The viewer is in the room for that event only if it
+   rejoined first, which the random `reconnectInMs` of `server.shutdown` decides, so its `ShareInfo.replaces` is
+   checked instead (the new share replaces the old id, with the sharer's user and new connection), and a
+   `share.started` it did get must carry the right `replaces`.
 7. **Codec-blocked viewer**: a subscriber with `caps.decode = ["opus"]` gets audio and `subscribe.status{codec}`.
    After `caps.update` with `h264/42e0`: the publisher gets `quality.hint{codec: h264/42e0}`, the viewer's sub PC is
    rebuilt (gen 2), and video decodes. The client never sends `pc.restart` in this flow.
 8. **Pub PC rebuild**: the publisher's pub PC is closed abruptly, then `gen 2` is offered with the same share id.
    Viewers get video again without renegotiation.
+
+   **As README S74 built it** (`TestPubPCRebuild`): one viewer on `f` (focus) and one on `q` (thumbnail); the pub
+   PC is closed under the client, with no `pc.close`; the client offers `1/1 2/1`, the second binding the video and
+   the audio of the same share; the share goes `live stalled live` under its id with no room event; each viewer
+   gets video again on the track it had, starting with a keyframe (a viewer of `f` may get `q` until `f`'s first
+   frame, 02 §10.1), with no new sub offer. **The continuity checks wait `sfutest.FinalLossAfter` (plus 200 ms)**,
+   as in case 5: then both videos and the audio have no gap in their sequence numbers through the rebuild.
 9. **10 × 10** (from S4): all 100 video subscriptions get the right layer, and audio flows only on focused shares.
 
 **TypeScript (Vitest)**, `signal-client.test.ts` with a fake WebSocket:
@@ -3491,3 +3577,15 @@ Decided after group 8 (an engineering call the owner delegated; README §6; READ
     key limit a valid payload with one long key that its type doesn't know costs up to 5.2 times. A payload with
     such a key is `bad_request` (`data`/`invalid`) where it was decoded with the key ignored; the envelope's keys,
     which `ParseEnvelope` reads without copying, have no limit (§5, §13, §19).
+
+Decided after group 10 (engineering calls the owner delegated; README §6):
+
+11. **Case 5 of §19 cuts only the sharer's UDP, and its outage lasts until the share is `stalled`** (about 7.4 s),
+    not exactly 5 s. With 02's timers a 5 s outage can't make a share `stalled`: the SFU sees its pub PC not
+    connected only after Pion's 5 s without a packet or once the client's ICE restart arrives, and marks the share
+    stalled 2 s later (§11.5 B). README S74 built it that way; the viewer's half, with the viewer's UDP cut too, is
+    `TestUDPBlackHoleViewer`, which README F10 enables (§19).
+12. **The SFU's sub PCs keep checking candidate pairs for the length of the failed timeout**, so a sub ICE restart
+    asked for during a viewer's outage connects once the network is back, and a viewer recovers within seconds
+    instead of through the 15 s rebuild (§10.4, §11.5 B; 02 §7.3). README F10 builds it, together with keyframe
+    requests that wait while the share's pub PC is away (02 §9.7).

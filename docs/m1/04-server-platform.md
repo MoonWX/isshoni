@@ -1520,7 +1520,10 @@ Construction details:
   `exclude_interfaces` globs), bind `ListenUDP("udp", ip:7882)` per address (the same as
   `ice.NewMultiUDPMuxFromPort`), set SO_RCVBUF/SO_SNDBUF to `udp_buffer_bytes`, wrap each in a byte-counting
   `PacketConn`, then `ice.NewUDPMuxDefault` per socket and `ice.NewMultiUDPMuxDefault(muxes...)`. We build it
-  ourselves only to count bytes and read back buffer sizes. The counting wrapper implements
+  ourselves to count bytes, to read back buffer sizes, and for the ICE source guard of §7.8 (README F06, from the M1
+  security review): the counting wrapper also drops, below the mux, STUN from a source address past a ufrag's 64, and
+  each socket's `ice.UDPMuxDefault` is wrapped (`guardedUDPMux`) so that the guard hears which ufrags the mux serves
+  (`GetConn`, `GetConnByUfrag`) and which Pion removes (`RemoveConnByUfrag`). The counting wrapper implements
   `ice.AddrPortReaderWriter` (`ReadFromAddrPort`/`WriteToAddrPort`) so pion keeps its allocation-free path. Port `0`
   (tests): bind the first address, reuse its port for the others. If `RcvBuf` or `SndBuf` read back below
   `udp_buffer_bytes`, `NewTransport` logs one warn line (`component=netx`) naming the sysctl fix; doctor's
@@ -1531,7 +1534,11 @@ Construction details:
   advertises every local address (then filtered and rewritten). The 7882 listener is wrapped like the 443 ICE route:
   a per-IP limit of `MaxICEConnsPerIP` (64) ICE connections per `IPKey` (IPv4 address or IPv6 /64, §7.2), counted
   together with 443 (excess closed and counted as `Limited`), a byte counter (path `media_tcp`), and the same `ice.TCPMuxParams` (`FirstStunBindTimeout` 10 s,
-  `AliveDurationForConnFromStun` 30 s, `ReadBufferSize` 64, `WriteBufferSize` 4 MiB).
+  `AliveDurationForConnFromStun` 30 s, `ReadBufferSize` 64, `WriteBufferSize` 4 MiB). For the source guard of
+  §7.8 (README F06) both listeners hand each accepted connection to Pion through a first-frame gate, which reads
+  the first RFC 4571 frame and closes the connection when its STUN comes from a source past its ufrag's 64; each
+  `ice.TCPMuxDefault` is wrapped (`guardedTCPMux`) like the UDP ones. The guard is one per `Transport`, shared by
+  every UDP socket and both TCP ports.
 - **Advertised**: `Advertised` holds every advertised address with its final address:port after the rewrite rules
   (§7.5). 02 uses it to label selected candidate pairs (`Via`); the same value set `udp` | `tcp443` | `tcp7882` is used
   everywhere (dashboard, metrics). It lists exactly what pion gathers, no more: a test compares it with the
@@ -2821,6 +2828,14 @@ isshoni-backup-0.3.0-20260929T101500Z.tar.gz
   "Keep it private" line; with `--out -` only the line, on stderr. An offline backup of a data directory with no
   database, no `secrets.json` and no certificates is an error ("nothing to back up"), and a raw one says that the
   database was copied as it was.
+- **Review R5** (the M1 security review; README §6 "Decided after group 10" (1)). As built, the default name takes
+  the pipe-or-device path too: when `O_EXCL` finds something at the default name that is neither a regular file
+  nor a directory, the CLI opens it for writing (following links) and streams the archive into it. Another local
+  user can place FIFOs at the predictable names of the next seconds in a world-writable directory, and an operator
+  who runs `sudo isshoni admin backup` there hands that user the database, `secrets.json` and the TLS keys. The
+  rule above ("a pipe or a device the operator named") is meant: README F09 (group 12) makes any existing file at
+  the default name exit 7, and writes to an explicit `--out` that exists only when it is a FIFO or a character
+  device owned by the caller's euid or by root (a link stays allowed: `--out /dev/fd/N` is one).
 
 ### 12.4 Restore
 
@@ -3440,7 +3455,9 @@ there is no separate config endpoint. This service implements what those handler
   With no subscriptions it does nothing and returns nil (03's handler answers 404 for that case itself). It returns
   `*api.Error{server_busy, retryAfter: 5}` when the queue took none of them, and
   `*api.Error{server_shutdown, retryAfter: 5}` once `Run`'s context has ended; both are 503 through
-  `httpapi.WriteError` (03 §12.3 #28). The per-recipient bucket of §14.4 does not apply to it.
+  `httpapi.WriteError` (03 §12.3 #28). The per-recipient bucket of §14.4 does not apply to it. Since README F08 the
+  queue is the `push.test` lane's own, with one worker that serves nothing else, and each test is attempted once
+  (§14.4, §14.5); 03 passes one subscription, since a web session keeps one (03 §12.4.6).
 
 05 posts its subscription on every app start when permission is granted, and re-subscribes when the key in `/info`
 differs from the subscription's `applicationServerKey`.
@@ -3451,7 +3468,7 @@ differs from the subscription's `applicationServerKey`.
 |---|---|---|---|---|
 | `share.started` | A share goes `starting → live`, without `replaces` (01's hub calls `ShareStarted`, through the wiring) | Active users whose `shareStarted` preference is `all`, except the sharer and except `PresentUserIDs` (participants in that room, who already see it) | 600 s | `high` |
 | `admin.alert` | 03's `AdminAlerter` (§7.11 there: `admin_granted`, `admin_revoked`, `admin_password_reset`, `registration_mode_changed`, `signup_pending`, `secrets_rotated`) and this doc's transfer alerts (`transfer_threshold`, §11.3) | Active admins whose `adminAlerts` preference is on | 86400 s | `normal` |
-| `push.test` | `SendTest` (03's `POST /api/v1/push/test`) | The caller's current-session subscriptions | 60 s | `high` |
+| `push.test` | `SendTest` (03's `POST /api/v1/push/test`) | The caller's current-session subscription (one per web session since README F08, 03 §12.4.6); on the `push.test` lane, attempted once (§14.4, §14.5) | 60 s | `high` |
 
 - Recipients come from 03's store: `ListPushSubscriptions(PushFilter{ExcludeUserIDs, AdminsOnly, Pref, SessionID})`
   (03 §6), which applies the preferences and returns active users only. Per-room muting is *later*.
@@ -3498,8 +3515,9 @@ type Options struct { // only Enabled, VAPID, Subject and Store are required
 	Subject      string                  // the VAPID sub claim: a mailto: or https: URL (DeriveSubject, §14.1)
 	Store        Store
 	Sender       Sender           // nil: the real one, webpush-go with the guarded client (§14.5)
-	Workers      int              // 0: 4
-	QueueLen     int              // 0: 1024
+	Workers      int              // the workers of share.started and admin.alert; 0: 4 (push.test has one of its own,
+	                              // README F08)
+	QueueLen     int              // the length of each queue (events, jobs, push.test jobs); 0: 1024
 	Now          func() time.Time // nil: time.Now
 	Logger       *slog.Logger     // nil: discard; the service adds component=push
 	Resolver     netx.Resolver    // resolves an endpoint's host in ValidateEndpoint; nil: net.DefaultResolver
@@ -3521,8 +3539,9 @@ type Service struct{ /* … */ }
 func New(ctx context.Context, opts Options) (*Service, error) // checks vapid_key_fp and purges before returning (§5.2);
                                                           // starts no goroutine
 func DeriveSubject(pushSubject, acmeEmail, origin string) string // §14.1
-func (s *Service) Run(ctx context.Context) error          // workers, dispatcher and the daily prune; blocks until ctx
-                                                          // ends, drains for ≤ 2 s, returns nil; callable once
+func (s *Service) Run(ctx context.Context) error          // workers, the push.test lane's worker, dispatcher and the
+                                                          // daily prune; blocks until ctx ends, drains for ≤ 2 s,
+                                                          // returns nil; callable once
 func (s *Service) ShareStarted(ev ShareStarted)           // non-blocking; drops when the queue is full
 func (s *Service) AdminAlert(a AdminAlert)                // non-blocking
 func (s *Service) VAPIDPublicKey() string                 // 03's httpapi.Push
@@ -4151,3 +4170,14 @@ Decided after group 7 (engineering calls the owner delegated; README §6):
    with `public_ip.none`, whatever the two keys say: that server is not ready, and doctor is where its operator
    reads why. It is `skip` and not `ok` because doctor did not find out whether there is an address. README F04
    implements it (§13.2).
+
+Decided after group 10 (an engineering call the owner delegated; README §6 (1)):
+
+9. **The M1 security review's findings in this doc get fix slices.** The review was read-only, of `main` at f7053dc
+   before the first release candidate, over seven attack surfaces, with every finding checked by three independent
+   reviewers. Its parts here: R3, a member's PC could grow Pion's peer-reflexive candidates without bound, fixed by
+   the ICE source guard of 64 addresses per ufrag (§7.3, §7.8; README F06); R6, one member's `push.test` calls to
+   endpoints that never answer could hold the four shared push workers, fixed by the `push.test` lane, a test
+   attempted once, one subscription per web session and 2 s dial and TLS-handshake timeouts (§14.2–§14.5, 03 §12.4.6;
+   README F08); R5, `admin backup` without `--out` could write into a FIFO that another user placed at the default
+   name, which README F09 fixes in group 12 (§12.3).

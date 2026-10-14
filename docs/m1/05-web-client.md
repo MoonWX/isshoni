@@ -776,7 +776,8 @@ export interface SharingProvider {
 export interface NotificationsProvider {
   support(): Promise<PushSupport>;
   status(): Promise<'on' | 'off'>;
-  enable(): Promise<void>;                      // from a user gesture; throws ApiError or a local error
+  enable(): Promise<void>;                      // from a user gesture; resolves without a subscription when the
+                                                // permission isn't granted; throws ApiError or PushSetupError (§16.3)
   disable(): Promise<void>;
   test(): Promise<void>;
 }
@@ -1258,8 +1259,22 @@ the stats into it, §5 and §10.7). Where it differs from the list above, or set
   that fails shows a message with a retry inside the dialog, where a failed `React.lazy` would take the page, and
   the stream on it, to the error screen. The test starts when the user presses its button, not when the dialog
   opens (the server limits probes per user, 04 §7.7).
-- **Still to come**, each with its slice: the in-app browser banner above the page and the notifications card in
-  the empty state (§16.3, README S77), and `?focus=<shareId>` (§12.2).
+- **Web Push on the page, as README S77 mounted it** (`rooms/RoomPage.tsx`, `RoomStage.tsx`; the pieces are
+  `auth/`'s and `account/`'s, §16.3):
+  - **The in-app browser banner** sits above the page, in a slot of its own (`RoomPage.module.css`
+    `.inAppBanner`) that takes no room when the banner renders nothing, as in every real browser.
+  - **`RoomPushPrompts`** is mounted with the page: it reads the push state on every mount (which is also the
+    start-up re-post of the subscription), counts the time the page is watched, lets a notification click navigate
+    inside the app, and shows the iOS Home Screen sheet.
+  - **The notifications card is the empty state's** (`RoomNotificationsCard` in `EmptyRoom`): after 3 minutes of
+    watching it shows in "Nobody is sharing yet." and only there, not while a share is on the stage; it is there
+    again when the stage is empty again.
+  - **Both come from a chunk of their own** (`account/RoomPushSlots.tsx` loads `account/RoomPush.tsx`, with the
+    `account` namespace, when they first render), so the room's chunk doesn't carry them. Until it is there, and if
+    it can't be loaded, both render nothing: a push prompt is never worth the room's error screen, and the next
+    mount tries again. The room's test harness preloads it with the room's other lazy chunks
+    (`rooms/testing/page.tsx`).
+- `?focus=<shareId>` is the viewer's: its layout reads the link and picks the share (§12.2, README S56).
 
 ---
 
@@ -1384,9 +1399,10 @@ with a list that re-snaps the way a browser does.
 - `autoFocus.test.ts` holds the rules and the settle step, the two cases of the review included: a speaker-button
   choice that survives its share's audio going away and coming back, and a re-published share whose first live has
   no audio yet, which gets the sound when its audio comes.
-- **Open, for the owner** (README §6 "Decided after group 9"): when the focused share has no sound, nothing from
-  the stage is heard. The alternative is to keep the previous share's sound playing until a share with sound is
-  focused. Until the owner answers, the rule above stands and the code stays as README S72 built it (§24).
+- **Open, for the owner** (README §6 "Decided after group 9"; still open after group 10): when the focused share has
+  no sound, nothing from the stage is heard. The alternative is to keep the previous share's sound playing until a
+  share with sound is focused. Until the owner answers, the rule above stands and the code stays as README S72 built
+  it (§24).
 
 ### 12.4 Layer policy
 
@@ -1520,7 +1536,7 @@ pseudo-fullscreen and the keyboard, and nothing else.
     `document.pictureInPictureEnabled` and not iOS (§8; an iPad that calls itself a Mac counts as iOS). That is
     the desktop browsers, and it is also **Android Chrome**, which reports PiP too, where the rule above says
     "desktop only". Whether Android keeps the button is an **open question for the owner** (asked after group 6,
-    still open after groups 7, 8 and 9): the rule above stands as written, the code stays as built until the
+    still open after groups 7, 8, 9 and 10): the rule above stands as written, the code stays as built until the
     answer, and the manual matrix row M-AND-1 (§19.4) is where it shows. iOS is not part of the question: no PiP
     there in M1.
 - **Wake lock.** `platform.requestWakeLock()` is the browser's side (§8) and answers `null` where the API is
@@ -2346,8 +2362,9 @@ component (`InAppBrowserBanner.tsx`, with `inAppBanner.ts`) and the lines that s
 
 - **`AccountShell`, not a layout route.** The router declares the three account pages side by side under
   `RequireAuth` (§5), so each page wraps its content in `<AccountShell>`: a way back to the room, the page's
-  `<h1>`, the links between the account pages, then the page's sections. `/account/notifications` renders the
-  router's `PageUnavailable` until S77 writes the page; the shell already links to it.
+  `<h1>`, the links between the account pages, then the page's sections. `/account/notifications` rendered the
+  router's `PageUnavailable` until README S77 wrote the page (`NotificationsPage`, §16.3); the shell linked to it
+  from the start.
 - **`/account`** shows the username and the role ("Admin" or "Member") with Sign out, then the two forms:
   - *Change password*: `POST /api/v1/me/password {currentPassword, newPassword}` → 200 with this session's cookie
     rotated. The note about the other devices is shown up front, above the form. 403 `wrong_password` shows under
@@ -2651,6 +2668,74 @@ Home Screen app. Never an automatic permission prompt.
 **Install prompts**: Chrome/Edge/Android: keep the `beforeinstallprompt` event; show "Install app" in the account menu
 and, on Android, in the room's one-time card. iOS: the Home Screen sheet above, at most every 14 days.
 
+**As README S77 built it** (`platform/browser/push.ts`, which replaced S27's stub; `sw/push.ts`; in `account/`:
+`NotificationsPage.tsx`, `RoomPush.tsx`, `RoomPushSlots.tsx`, `pushState.ts`, `useNotificationOpen.ts`,
+`PushHelp.tsx`), where the text above leaves a choice:
+- **`support()` asks the device first, then the server.** `needs-install` is iOS or iPadOS in a browser tab;
+  `unsupported` is a build or browser without a service worker (the worker is registered in production builds
+  only, §16.2, so a development build can't push), the Push API or the Notification API. Only then does it read
+  `GET /api/v1/info` itself, because `platform/` can't see the query cache and the Platform interface is fixed: a
+  server without push is `unsupported`, on iOS too (the Home Screen app wouldn't help). The answer is kept for
+  5 minutes (`INFO_MAX_AGE_MS`), and `support()` waits for it at most 3 s (`INFO_WAIT_MS`): a server that couldn't
+  be asked, or hasn't answered by then, counts as one with push. So `support()` never rejects and never holds up
+  `BrowserPlatform.capabilities()`, which waits for it, and on which the stage's controls wait (fullscreen, PiP,
+  the wake lock). `enable()` then fails with the real reason.
+- **The start-up re-post is every `status()`.** Each `status()` that finds the permission granted and a
+  subscription in the worker posts that subscription again, after re-subscribing when its key isn't the one in
+  `/info` (the key from `support()`'s answer of a moment ago: one `GET /api/v1/info` for a room's start). There is
+  no once-per-page latch: a login after a logout, after a session revoked elsewhere ("Sign out other browsers", a
+  password change), after idle expiry or by another user happens inside the same page, and the new session needs
+  the post as much as the first one did (03 §12.4.6 "keeps the binding current after re-logins"; the 401 rule of
+  `pushsubscriptionchange` above). The room page and the notifications page read the push state on every mount,
+  and both are under `RequireAuth`, after `GET /api/v1/me`, so logged-out pages never call the push endpoints. An
+  app start that lands on another page posts at the next visit to one of the two. A failed post is logged and
+  tried again at the next `status()`; a 401 (signed out meanwhile) waits for the next sign-in.
+- **`enable()`** calls `Notification.requestPermission()` first, in the click's own turn (Safari asks only within
+  the user activation). A permission that isn't granted is no error: `enable()` resolves, `status()` stays `off`,
+  `support()` says `denied` when the user blocked it, and the UI reads both again and shows the blocked text. Then
+  a fresh `/info` (not the kept answer), the active worker (waited for at most 10 s), the subscription (one made
+  with the same key is reused, one with another key is dropped first: a browser has one per worker) and the post;
+  a subscription the server refused is taken back, so the browser and the server agree. What fails on the device
+  throws `PushSetupError` with a reason for the log (`unsupported`, `no_worker`, `bad_key`, `subscribe_failed`),
+  and the UI shows one text for all of them (`account.push.setupFailed`); a server or network failure is an
+  `ApiError` or `NetworkError` with the usual texts (§6.3).
+- **`disable()`** tells the server first, then drops the browser's subscription; after a 401 it drops it too (the
+  server deleted it with the session), after any other failure it keeps it. **`test()`** answers a 404 (the server
+  has no subscription of this session: it went with an older session) by posting the subscription and trying once
+  more; the 404 comes before the rate limit (03 §7.3), so the second try isn't refused for being the second.
+- **A click on a notification** (the worker's `{type: 'open', url}` message, §16.2) is handled by the provider.
+  `onNotificationOpen(fn)` registers how a page navigates (the latest registration wins, and the one before it
+  comes back when it leaves): the room page, through its push prompts, and the notifications page register the
+  router's navigate (`useNotificationOpen`), so "Alex started sharing" opens `/r/lounge?focus=…` without reloading
+  the app. Without a registration the page goes to the URL with a full navigation. The URL is checked again: this
+  origin only, and no path that starts with `//`. A registration at boot in `app/`, which would cover every page,
+  is not built.
+- **The room's card** shows after 3 minutes of *visible* time on the room page within one visit (`useVisibleFor`:
+  a hidden tab or a phone in a pocket doesn't count, and a new mount starts over), only in the stage's empty state
+  (§11.2), where the browser and the server can push and it is off. It is named by its question, not
+  "Notifications", which is the name of the toasts' region. Turn on asks from the click; once on, the card is
+  dismissed like Not now; a block shows the blocked text in the card. On Android it also offers "Install app" while
+  the browser holds an install prompt, and that alone where push is on or can't be.
+- **iOS**: in a Safari tab (`needs-install`) the Home Screen sheet shows on the room page at once, then at most
+  every 14 days. In the Home Screen app, where push works, the app's first launch offers notifications once, in a
+  sheet ("Turn on notifications?"); its "Not now" also keeps the room's card away for 30 days. While the in-app
+  banner shows, both sheets and the card stay hidden.
+- **Dismissals** are `prefsStore`'s `dismissed` entries, per device: `push.card` (30 days), `push.homeScreen`
+  (14 days) and `push.appLaunch` (for good).
+- **One push state per page** (`pushState.ts`): one store per platform holds `support()`, `status()` and whether
+  an action runs, so the room's card, the sheets and the notifications page never disagree.
+- **The notifications page** (`/account/notifications`) has the switch with "Send a test notification" while it is
+  on, the help for every other support state (the Home Screen steps, how to allow notifications again after a
+  block, why this browser or server can't), "Install app" while the browser offers it, and the two preferences
+  while the server has push. In a chat app's browser the in-app banner shows there too, before the Home Screen
+  steps.
+- **Lazy**: the room's parts are a chunk of their own with the `account` namespace (`RoomPushSlots.tsx`, §11.2);
+  a chunk that can't be loaded renders nothing.
+- **Texts**: the worker's are `en.json`'s `push` namespace (`push.shareStarted`, `push.adminAlert.<kind>` for every
+  kind, M2's `refresh_token_reused` included, `push.test`, `push.generic`, and the actor names `push.actor.*`). No
+  body starts with the actor, whose CLI name ("the server's command line") is lower case. The page's and the
+  card's are `account.notifications.*` and `account.push.*` in `lazy/account.en.json`.
+
 ### 16.4 Version mismatch
 
 | Trigger | Web behaviour |
@@ -2892,6 +2977,30 @@ invites show the link once; locked settings are read-only; with an Instagram UA 
 banner and its Copy link includes `#<token>` (S48, which also tests it on the login page and its dismissal), and in
 the room (iOS UA) the banner shows and the Home Screen sheet stays hidden until the banner is dismissed (S77).
 
+**Web Push, as README S77 tested it** (`account/RoomPush.test.tsx`, `NotificationsPage.test.tsx`,
+`pushState.test.ts`, and the provider's own tests in `account/browserPush.test.ts`, the folder of the slice that
+wrote it, as S35's `platform/browser` tests live in `share/`):
+- the room page: the banner above the room in a chat app's browser (naming Safari on an iPhone) and nothing in a
+  real one; the Home Screen sheet at once in an iOS Safari tab and again after 14 days, never on a desktop browser,
+  and hidden until the banner is dismissed; the first launch of the iOS Home Screen app offering notifications
+  once, its "Not now" also keeping the card away; the card in the empty state after 3 minutes of watching, counting
+  only visible time, not while a share is on the stage, Turn on asking from the click, the blocked text, Not now
+  for 30 days, waiting for the banner, and "Install app" on Android (alone where push is on, with Turn on where it
+  is off); `status()` asked on every mount of the page (a sign-in in the same page re-posts); a notification click
+  followed inside the app to the room and the share of its link;
+- the notifications page: the switch on and off with the test notification, its own failures only, the wait after
+  a 429, a permission changed in the browser's settings seen on the next visit, the help after a block, the Home
+  Screen steps on iOS and behind the banner in a chat app, Install app, and the preferences (a member's choice
+  saved with both fields, admin alerts for admins, a failed save put back, a failed load offered again, none while
+  the server has no push);
+- the provider: every support state, the 3 s wait for `/info` and its 5 minutes, the re-post at every `status()`
+  (with the key of `support()`'s answer, a new key, a key the browser doesn't report, push off on the server, a
+  failed post or `/info` tried again, a 401 and the post after the next sign-in, the endpoint a
+  `pushsubscriptionchange` made), `enable()` (the permission in the click's turn, a fresh key, reuse and
+  replacement, a refused subscription taken back, `push_unavailable`, `subscribe_failed`, `no_worker`, `bad_key`),
+  `disable()` and `test()` (the 404 retry), notification clicks with the handlers' order and the full-navigation
+  fallback, and the same-origin check.
+
 ### 19.3 End-to-end (Playwright, Google Chrome)
 
 **Harness** (06 §7.2–§7.3, §8.2): `task e2e` builds the binary and runs `npm run e2e` with `ISSHONI_BIN` (06 passes an
@@ -3121,7 +3230,7 @@ Stats are read through `window.__isshoni.stats()` (§10.7).
 | `reconnect.spec` | (a) `__isshoni.dropSocket()`: resumed with the same `connectionId`, `framesDecoded` keeps rising, no new sub offer; (b) `context.setOffline(true)` for 5 s: the banner appears after 2 s, then clears; (c) own server, `restart()` (same data dir and ports): the viewer decodes the re-published share within 15 s, focused, with audio |
 | `warning.spec` | fake display `monitor+audio` shows the warning; "Share without sound" publishes without an audio track; "Pick something else" reopens the picker. As README S66 built it (a server per test): nothing is shared before the answer; "Share with sound anyway" publishes both tracks, and the friend gets both; what is picked behind "Pick something else" is shared (the tone tab through the real picker when headful, another fake display when headless) |
 | `a11y.spec` | axe (`wcag2a`, `wcag2aa`, `wcag21aa`) on login, invite, reset, setup, the room with a share, admin users: no serious or critical violations; the tile list is keyboard-reachable; `F` toggles fullscreen |
-| `pwa.spec` | the manifest parses; the service worker activates; offline navigation shows the Offline screen from the cached shell |
+| `pwa.spec` | the manifest parses; the service worker activates; offline navigation shows the Offline screen from the cached shell. As README S77 wrote it: the manifest has what an install needs (Chrome's own parser reads it too); the worker activates, controls the page and precaches the shell; an offline navigation, and a navigation after the server has stopped (every byte from the worker's cache), both show the Offline screen; the notifications page against the real server (push on by default): the switch where Chrome can push, the preferences saved and there after a reload, and a block set through Chrome's DevTools protocol (`Browser.setPermission`, which Playwright lacks) showing the help instead of the switch. The spec turns service workers on for itself (`test.use({serviceWorkers: 'allow'})`), and each test that registers one has a server of its own, because the port makes the origin. Real pushes are the manual rows M-IOS-2 and M-AND-1 (§19.4) |
 | `version.spec` | `page.routeWebSocket` rewrites `serverVersion` in `welcome`: the page reloads once, then shows VersionMismatch; a routed `protocol_unsupported` error shows it at once |
 | `admin.spec` | own server (approval mode is server-wide): create and revoke an invite; approve a pending sign-up in approval mode; doctor page renders results |
 | `tcp-only.spec` (04 S14, README S90) | own server with `{'listen.ice_udp': ''}` (no UDP media stands in for a network that blocks UDP): the viewer's focused tile has `framesDecoded` rising, and its selected candidate pair is TCP |
@@ -3148,6 +3257,13 @@ tests). The M1 exit check is the human session of 06 §12.
 | M-LAN | Firefox on macOS against a LAN server | the Local Network fix text appears (S4 finding 6) |
 | M-WIFI | phone viewer switching Wi-Fi → LTE | playback recovers without a reload (01 §11.5 C) |
 | M-BW | Chrome viewer on a throttled downlink (macOS Network Link Conditioner, or `tc` on Linux), watching a share with motion | the focused tile drops to `low` with reason `bandwidth` ("Lower quality (your connection)"); after the throttle is lifted it returns to `high` within about 2 minutes, with no reload (02 §10.2, trial upgrades) |
+
+**The push rows (M-IOS-2, M-AND-1), as README S77's review found**: `share.started` goes only to users who are not in
+the share's room (04 §14.3), and the room session lives on while the app shows another page (§11.1: only Leave,
+switching rooms, logout or closing the tab leave the room). So the phone that is to receive "Alex started sharing"
+leaves the room with **Leave** (or is closed) before Alex starts: opening Account keeps it in the room, and an app put
+in the background keeps its participant alive, plus the 30 s grace after its socket drops (01 §4). Otherwise no push
+arrives, and push would look broken.
 
 ---
 
@@ -3273,14 +3389,14 @@ Decided after group 5 (engineering calls the owner delegated; README §6):
   desktop handoff.
 
 **Open, for the owner** (README §6):
-- **Picture-in-picture on Android Chrome** (§12.5; raised after group 6, still open after groups 7, 8 and 9). The
-  rule says "desktop only" and hides PiP on iOS. README S56 built it by capability: the button is there wherever
-  the browser reports PiP and the device is not iOS, which includes Android Chrome. The two readings differ only
-  there. Until the owner answers, the rule in §12.5 is not changed and the code stays as built; "keep it" needs one
-  sentence in §12.5, "hide it" one more condition in the platform's `pip` capability (§8).
-- **The sound when the focused share has none** (§12.3; raised after group 9, from README S72). Focus on a share
-  without sound, automatic or picked, leaves nothing from the stage heard ("audio follows focus" taken
-  literally). The alternative is to keep the previous share's sound playing until a share with sound is focused.
-  It is not blocking: before S72 such a page was silent too. Until the owner answers, the rule in §12.3 is not
-  changed and the code stays as S72 built it; keeping the previous sound would be a change to the settle step of
-  §12.3 (`settleSound`), which today gives the sound to the stage's share or to nothing.
+- **Picture-in-picture on Android Chrome** (§12.5; raised after group 6, still open after groups 7, 8, 9 and 10). The
+  rule says "desktop only" and hides PiP on iOS. README S56 built it by capability: the button is there wherever the
+  browser reports PiP and the device is not iOS, which includes Android Chrome. The two readings differ only there.
+  Until the owner answers, the rule in §12.5 is not changed and the code stays as built; "keep it" needs one sentence
+  in §12.5, "hide it" one more condition in the platform's `pip` capability (§8).
+- **The sound when the focused share has none** (§12.3; raised after group 9, from README S72; still open after group
+  10). Focus on a share without sound, automatic or picked, leaves nothing from the stage heard ("audio follows focus"
+  taken literally). The alternative is to keep the previous share's sound playing until a share with sound is focused.
+  It is not blocking: before S72 such a page was silent too. Until the owner answers, the rule in §12.3 is not changed
+  and the code stays as S72 built it; keeping the previous sound would be a change to the settle step of §12.3
+  (`settleSound`), which today gives the sound to the stage's share or to nothing.
