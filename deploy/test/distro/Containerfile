@@ -7,16 +7,20 @@
 # iproute2 (ss, for the installer's port check), procps and python3 (the tests' own helpers). The OpenSSH client
 # is left out on purpose: the installer has to install it itself to verify the release signature. So are the
 # package lists, as in a fresh image.
+#
+# EXTRA adds packages of the distro: scenario V3 builds the image once more with its firewall (firewalld on Fedora,
+# ufw on Ubuntu), as isshoni-distro-test:<distro>-firewall.
 ARG BASE=debian:12
 FROM ${BASE}
+ARG EXTRA=
 
 RUN if command -v apt-get >/dev/null 2>&1; then \
       apt-get update \
       && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        systemd systemd-sysv dbus curl ca-certificates iproute2 procps python3 \
+        systemd systemd-sysv dbus curl ca-certificates iproute2 procps python3 ${EXTRA} \
       && rm -rf /var/lib/apt/lists/*; \
     else \
-      dnf install -y systemd dbus-broker curl ca-certificates iproute procps-ng python3 \
+      dnf install -y systemd dbus-broker curl ca-certificates iproute procps-ng python3 ${EXTRA} \
       && dnf clean all; \
     fi
 
