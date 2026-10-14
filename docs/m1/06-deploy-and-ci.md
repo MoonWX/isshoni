@@ -795,8 +795,9 @@ If isshoni was installed from a package, both refuse and print `apt remove issho
 **Containers** (`deploy/test/distro/`):
 - `Containerfile` takes `ARG BASE` and installs `systemd`, `dbus`, `curl`, `ca-certificates`, `iproute2`, `procps`
   and `python3`. It deliberately does **not** install openssh-client, which exercises the auto-install path.
-- Started with `podman run -d --systemd=always` on CI, or `docker run -d --privileged --cgroupns=private --tmpfs /run
-  --tmpfs /run/lock` locally (Docker Desktop works on macOS). `CONTAINER_ENGINE` selects which.
+- Started with `podman run -d --systemd=always --cap-add=SYS_ADMIN --cap-add=SYS_PTRACE` (the F16 bullet below), or
+  `docker run -d --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock` (Docker Desktop works on macOS; CI
+  uses Docker, the S78 bullet below). `CONTAINER_ENGINE` selects which.
 - **As README S78 built it, CI uses Docker too**: the `distro` job sets `CONTAINER_ENGINE=docker`, with the same
   `--privileged`, `--cgroupns=private` and host-gateway setup that release.yml's `verify` job used until README
   F09, because the runner's podman is rootless and its containers reach the runner's `relserve` another way (the
@@ -850,18 +851,24 @@ If isshoni was installed from a package, both refuse and print `apt remove issho
   nothing on the machine; under rootful podman they are the machine's, still less than the Docker path's
   `--privileged`. **What the script leaves to the caller**: rootless podman needs the caller's systemd user
   session, as `verify` sets it up (the bullet above): a login, or lingering with `XDG_RUNTIME_DIR` and
-  `DBUS_SESSION_BUS_ADDRESS` pointing at it, so that `podman info --format '{{.Host.CgroupManager}}'` says
-  `systemd`. Without it podman falls back to cgroupfs, and the run fails: at its wait for systemd, which doesn't
-  come up in the container, or already at `podman build` (the bullet above). The network is podman's default: on
-  Linux, where `relserve` listens on every address, slirp4netns under podman 4.9 and pasta under podman 5.8 both
-  give the container a `host.containers.internal` that reaches it. F16 checked it rootless, as a user with
-  lingering and no login, in privileged Docker containers that stood in for a Linux machine. With podman 4.9.3
-  (Ubuntu 24.04, slirp4netns) the parts `main`, `c7`, `c13` and `c11` passed on debian-12 and ubuntu-24.04 (246
-  checks), and `v3` on ubuntu-24.04 (ufw, 8); with podman 5.8.7 (Fedora 44, pasta) the same four parts passed on
-  debian-12 and fedora-44 (246). Without the capabilities, C1 failed as above (podman 4.9.3); with `SYS_ADMIN`
-  alone, C4 failed with exit 7, and C5 after it (both versions); with no user session (podman 5.8.7 on cgroupfs)
-  the run stopped at the wait for systemd. Podman on macOS (`podman machine`) was not tried. CI still doesn't take this
-  path (the S78 bullet above).
+  `DBUS_SESSION_BUS_ADDRESS` pointing at it, so that podman uses the systemd cgroup manager. Without it podman falls
+  back to cgroupfs, with a warning: `podman build` then fails when it has to build the image
+  (`sd-bus call: Permission denied`, the bullet above), and in a container from an image built before, systemd doesn't
+  come up. The script checks for the latter as `verify` does: before each container it asks `podman info`, and when that
+  says rootless and `cgroupfs` it stops and names the cause and the session it needs, instead of waiting a minute for
+  systemd. The network is podman's default: on Linux, where `relserve` listens on every address, slirp4netns (the
+  rootless default up to podman 4.9, checked with 4.9.3) and pasta from podman 5.3 on (its `--map-guest-addr`, checked
+  with 5.8.7) both give the container a `host.containers.internal` that reaches it. Pasta under podman 5.0 to 5.2 gives
+  the name no address that reaches `relserve`, as under 4.9 (the bullet above), and the run stops at "the container does
+  not reach relserve"; there, set `default_rootless_network_cmd = "slirp4netns"` in the `[network]` table of
+  `containers.conf`. F16 checked it rootless, as a user with lingering and no login, in privileged Docker containers
+  that stood in for a Linux machine. With podman 4.9.3 (Ubuntu 24.04, slirp4netns) the parts `main`, `c7`, `c13` and
+  `c11` passed on debian-12 and ubuntu-24.04 (246 checks), and `v3` on ubuntu-24.04 (ufw, 8); with podman 5.8.7 (Fedora
+  44, pasta) the same four parts passed on debian-12 and fedora-44 (246). Without the capabilities, C1 failed as above
+  (podman 4.9.3); with `SYS_ADMIN` alone, C4 failed with exit 7, and C5 after it (both versions). Without a user session
+  (podman 5.8.7 on cgroupfs), `podman build` failed on an empty image store, and with the image built before, the run
+  stopped at the check, before it started a container. Podman on macOS (`podman machine`) was not tried. CI still
+  doesn't take this path (the S78 bullet above).
 - `tools/relserve` serves a locally built, test-signed release over HTTPS (section 11.2).
 
 **VMs** (`deploy/test/vm/`):

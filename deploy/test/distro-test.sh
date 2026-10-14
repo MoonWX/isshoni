@@ -431,10 +431,17 @@ start_container() {
     # Docker path's --privileged.
     # Rootless podman also needs a systemd user session of the user who runs this script, through which it uses the
     # systemd cgroup manager: a login, or lingering (`loginctl enable-linger`) with XDG_RUNTIME_DIR and
-    # DBUS_SESSION_BUS_ADDRESS pointing at it, as verify sets up. Without one podman falls back to cgroupfs, and
-    # systemd in the container does not come up; `podman info --format '{{.Host.CgroupManager}}'` must say systemd.
-    # The network is podman's default for the user: slirp4netns under rootless podman 4.9 and pasta under 5.8 both
-    # give the container a host.containers.internal that reaches relserve.
+    # DBUS_SESSION_BUS_ADDRESS pointing at it, as verify sets up. Without one podman falls back to cgroupfs: a
+    # `podman build` that has to build the image fails ("sd-bus call: Permission denied"), and systemd does not come
+    # up in a container from an image built before, so the script stops here.
+    # The network is podman's default for the user. slirp4netns (the rootless default up to podman 4.9) and pasta
+    # from podman 5.3 on (host.containers.internal through pasta's --map-guest-addr) both reach relserve. Pasta under
+    # podman 5.0 to 5.2 does not; there, set default_rootless_network_cmd = "slirp4netns" in containers.conf.
+    sc_info=$("$ENGINE" info --format '{{.Host.Security.Rootless}} {{.Host.CgroupManager}}' 2>/dev/null) || :
+    if [ "$sc_info" = 'true cgroupfs' ]; then
+      die 'rootless podman uses the cgroupfs cgroup manager, under which systemd cannot come up in a container' \
+        'run this from a login session, or enable lingering (loginctl enable-linger) and point XDG_RUNTIME_DIR at /run/user/<uid> and DBUS_SESSION_BUS_ADDRESS at unix:path=/run/user/<uid>/bus (06 §4.13)'
+    fi
     case $1 in
     *-v3) sc_caps=--privileged ;;
     *) sc_caps='--cap-add=SYS_ADMIN --cap-add=SYS_PTRACE' ;;
