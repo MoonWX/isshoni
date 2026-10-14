@@ -336,6 +336,13 @@ store). When only the upkeep fails, `Prune` returns the error together with the 
 | `device_tokens` *(later: M2)* | `expires_at < now`. Spent refresh tokens are kept until their own expiry, for reuse detection |
 | `audit_log` | `at < now − 30 d` |
 
+As README S70 built it (`auth/janitor.go`): each run prunes at the service's clock and logs one line with its
+counts (debug), and nothing else follows it: no connection is closed and the session cache is left alone (an
+expired session is no credential wherever it is looked at, and the hub finds a live connection's at its next
+`Revalidate`, §7.6, §7.7), and no SPA is notified (an expired sign-up leaves the approval queue at the admins' next
+refetch). A run that fails is logged at warn with the counts it committed, and the next one comes an hour later as
+usual; a run that the context ends is not logged, and `RunJanitor` returns.
+
 ---
 
 ## 5. Schema: migration `0001_init.sql` (schema version 1)
@@ -1903,7 +1910,7 @@ the rules live in the handlers, not in `auth.Service`: rooms have no credentials
   one with a skin tone and a flag of two regional indicators pass; the red heart (U+2764 U+FE0F), the keycaps and
   the profession and family sequences are `invalid`. That is the profile this section names, taken as it is;
   letting those emoji in would be a change to this rule, and is not decided.
-  - **Open, for the owner** (from README S53's write-back; still open after groups 7 and 8; §19). "Emoji are
+  - **Open, for the owner** (from README S53's write-back; still open after groups 7, 8 and 9; §19). "Emoji are
     allowed" above reads as every emoji; the profile lets in only those that need neither U+FE0F nor a zero-width
     joiner.
     The two ways to close the gap are to keep the profile and say so in the rule (an admin who types
@@ -2065,11 +2072,28 @@ soft limit.
 | `settings.changed` | admin/cli | settings | `{changes:{field:{from,to}}}` | ✓ if `registrationMode` changed |
 | `secrets.rotated` | system | — | `{keys:[...]}` | ✓ |
 | `device.linked` *(later: M2)* | user | device | `{clientKind, os, via}` | |
-| `device.revoked` *(later: M2)* | user/admin | device | `{}` | |
+| `device.revoked` *(the user's own in M1, README S58; admin later: M2)* | user/admin | device | `{}` | |
 | `device.refresh_reused` *(later: M2)* | system | device | `{}` | ✓ |
 
 What is never stored in `detail`: tokens, password material, User-Agent strings, the usernames tried for unknown
 accounts (a typo there is often the password), and SDP.
+
+**As README S70 checked the table against the code** (`httpapi/audit_coverage_test.go`):
+- **`device.revoked` already has an M1 writer.** `DELETE /api/v1/me/devices/{id}` (README S58, §7.7) writes it for
+  any device row of the caller (actor user, target device). No M1 path links a device, so the coverage test
+  inserts one row as M2's linking would and revokes it over REST. `device.linked` and `device.refresh_reused` have
+  no writer before the device flow (03 slice 15).
+- **M1 has no CLI path for `user.renamed` or `settings.changed`.** The table names `admin/cli` as their actor, but
+  M1's admin socket has no rename or settings command (§12.6), so only the admin pages write them, with a user
+  actor. The CLI is the actor of `setup.token_issued`, `user.role_changed`, `user.disabled`, `user.enabled`,
+  `user.password_reset_issued` and `invite.created`.
+- **Two actions have a variant without a target**: `auth.login_failed` for an unknown username, and
+  `user.signup_rejected` for reject all (detail `{all: true, count}`).
+- **The tests**: `TestAuditCoverage` produces every action that M1 writes by a real request (or the CLI path, the
+  janitor or a key rotation) and finds it in `GET /api/v1/admin/audit` with the actor and target kinds of the
+  table and, for a request, the IP that `ClientIP` gave, both target variants included. `TestAuditActionsInSource`
+  keeps the test's table in step with the code: every action that `auth`, `httpapi` or `store` names is in a row here
+  (32 actions), and an action marked later has no writer in `auth` or `httpapi` yet.
 
 ---
 
@@ -2686,6 +2710,23 @@ A `null` value is 422 `validation_failed` (field code `invalid`), and a field li
 
 `nextBefore` is null on the last page.
 
+As README S70 built it (`httpapi/admin_audit.go`):
+- **The query.** Every parameter is optional and may appear once. `before` is an entry `id` and must be a positive
+  integer; without it the page starts at the newest row. `limit` must be an integer from 1 to 200 (default 50); a
+  value out of range is refused, not clamped. `action` is a prefix of the action (`user.` is every account action,
+  `auth.login_failed` that action alone), `actor` the acting user's ID and `target` the target's ID; each is at most
+  64 bytes, an empty one is no filter, and the filters combine. Any other parameter is ignored. A parameter given
+  twice, a bad `before` or `limit` and a filter over 64 bytes are 400 `bad_request`.
+- **The page** holds the matching rows below `before`, newest first, read in one snapshot. `nextBefore` is the `id`
+  of the page's last entry when older rows match, and null otherwise: a full page with nothing after it is the last
+  page too (the server reads one row more to know). Since new rows get higher ids, a client that pages with
+  `nextBefore` sees every row once even while new rows arrive.
+- **An entry** has the actor always, the target only when the action has one, the IP only when the row has one
+  (none for the CLI and the server's own jobs), and the detail, `{}` when empty. The names are the snapshots taken
+  when the row was written (§10).
+- `FuzzParseAuditQuery` holds the query rules; `TestAuditLogOverREST`, `TestAuditLogPaging`, `TestAuditLogBadQuery`
+  and `TestAuditRowsPrunedAfter30Days` the endpoint.
+
 `GET /api/v1/admin/dashboard` is 04's endpoint (04 §11.4). This doc supplies its `accounts` object through
 `(*API).DashboardAccounts(ctx)` (§12.5), which 04's wiring calls:
 
@@ -2701,6 +2742,20 @@ A `null` value is 422 `validation_failed` (field code `invalid`), and a field li
 ```
 
 `securityEvents` holds up to 20 security-flagged audit rows from the last 7 days.
+
+The counts as README S70 built them (`httpapi/accounts.go`, read in one snapshot at the API's clock):
+- `users.active`, `pending` and `disabled` count the accounts by status. **`users.admins` counts active admins
+  only**, the ones the last-admin rule counts (§7.11); a disabled admin is in `disabled` alone.
+- `invites.active` counts the invites that still work: not revoked, not expired, not used up.
+- **`sessions.active` counts the web sessions that are not past their idle or their absolute expiry.** A row that
+  the janitor has not pruned yet is no session any more (§4.7, §12.4.3), so it doesn't count.
+- **`devices.linked` counts the device rows** (0 until M2's linking writes any).
+- `registrationMode` is the setting in force.
+- `securityEvents`: the newest 20 rows of §10's Sec column at or after 7 days ago (a row exactly 7 days old is in),
+  `settings.changed` only when it changed `registrationMode`, newest first, each in the form of `GET /admin/audit`.
+- It reads only. A store error (or the context's end) is returned wrapped; 04's dashboard then leaves the part out
+  and raises its `dashboard.source_failed` alert (04 §11.4). `TestDashboardAccountsGolden` holds the shape in
+  `httpapi/testdata/dashboard_accounts.json` (regenerated with `-update` when the audit flows change).
 
 ### 12.5 httpapi Go API (for the integrator and the other docs)
 
@@ -3042,7 +3097,11 @@ SPA removes the fragment right after reading it (05).
 - **Settings**: a bad value → 422 with `fields`; a pinned field → 409; `OnChange` fires; a registration-mode change
   raises an alert and a security event.
 - **Audit**: every action in §10 that M1 can trigger is produced by at least one test, with the IP from `ClientIP`.
-  Pagination with `before` is stable. Rows older than 30 d are pruned.
+  Pagination with `before` is stable. Rows older than 30 d are pruned. As README S70 wrote it: `TestAuditCoverage`
+  and `TestAuditActionsInSource` (§10), the endpoint's tests and `FuzzParseAuditQuery` (§12.4.8), the dashboard's
+  `TestDashboardAccountsGolden`, `…SecurityEvents` and `…StoreError` (§12.4.8), and the janitor's schedule under a
+  fake clock in `auth/janitor_test.go` (§4.7: `TestJanitorScheduleUnderFakeClock`, `…KeepsGoingAfterAFailedRun`,
+  `…StopsWithItsContext`).
 - **Cross-cutting**:
   - every `/api/v1` response, including 4xx and 5xx, has `Cache-Control: no-store`;
   - error bodies match the `api.Error` golden JSON;
@@ -3275,7 +3334,7 @@ the registration mode.** In the `invite` and `closed` modes a `register` request
 `register-ip` token first, so an address that has used its tokens up gets 429 `rate_limited` where the mode alone
 would answer 403. It stays as S42 built it; §7.3 has the reasons and §7.9 the full order.
 
-**Open, for the owner** (README §6; still open after group 8):
+**Open, for the owner** (README §6; still open after groups 8 and 9):
 - **Room names and the emoji that need U+FE0F or a zero-width joiner** (§8). The rule says emoji are allowed;
   the PRECIS profile it names refuses the variation selector U+FE0F and a joiner between emoji, so the red
   heart, the keycaps and the profession and family sequences are `invalid` in a room name, while an emoji of one

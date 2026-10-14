@@ -472,7 +472,7 @@ Rules (E = error, W = warning):
 | `trusted_proxies` entries are CIDRs; `stun_servers` are `host:port` | E |
 | `admin_socket` ≤ 104 bytes; `data_dir` not empty | E |
 | Durations > 0; `udp_buffer_bytes` between 1 MiB and 64 MiB | E |
-| `push.subject` starts with `mailto:` or `https:` (only the prefix is checked; `push.New` also refuses a bare `mailto:` or `https:`, §14.1) | E |
+| `push.subject` starts with `mailto:` or `https:` (only the prefix is checked here; with push on, `server.New` also refuses a bare `mailto:` or `https:` as a config error, §14.1) | E |
 | `clients.min_version` is SemVer | E |
 | Policy key value accepted by 03's `SettingsCache.Pin` (ranges of 03 §9) | E (at serve startup; reported like other config errors, exit 78) |
 | `metrics.listen` not loopback | W |
@@ -748,8 +748,9 @@ package server
 type Deps struct { // test seams; zero values = real implementations
 	Now        func() time.Time
 	STUN       netx.STUNClient
-	Resolver   netx.Resolver
-	PushSender push.Sender // joins the struct with the push wiring (README S71)
+	Resolver   netx.Resolver // also push's look at an endpoint's host (§14.5), tlsmgr's at its domain (§8.7)
+	PushSender push.Sender   // push.Options.Sender (§14.5); nil = webpush-go behind the SSRF guard. Tests pass
+	                         // servertest.PushService as both PushSender and Resolver (README S71, §18)
 	ReleaseHTTP *http.Client
 	Host       config.Host  // the machine as the data-directory checks see it (§5.1); zero = the running process
 	SPA        fs.FS        // the built web app; nil = web.Dist()
@@ -1050,7 +1051,7 @@ and for a restore or `rotate-secrets` restart:
 | 3. `Hub.Shutdown(ctx, reason)` (01): every connection gets `server.shutdown{reason, reconnectInMs}` and `error{code: "server_shutdown", retryable: true, scope: "connection"}`, then WebSocket close **1012 (Service Restart)**. The wire reason is `restart` for SIGTERM, restore and rotation (SIGTERM can't tell stop from restart) | ≤ 2 s | The SPA shows "Server restarting… reconnecting" and reconnects after `reconnectInMs`; after the restart it rejoins and re-publishes (01 §10.5–§10.6) |
 | 4. `SFU.Close()` closes all PeerConnections (concurrently; 02 guarantees it returns within 1 s); then `Transport.Close()` closes the muxes | ≤ 1 s for the SFU; two budgets of their own as built, 1.25 s and then 0.25 s (below) | |
 | 5. `http.Server.Shutdown` on all servers, then `PortMux.Close()` (closes the raw :443 listener and both sub-listeners; the ICE sub-listener may already be closed by `Transport.Close`, which is harmless) | ≤ 5 s | Idle keep-alives close |
-| 6. Stop the TLS manager (`tlsmgr.Manager.Shutdown`, §8.2: no order, renewal or reload writes the certificate storage after it; S44), flush transfer counters, drain the push queue (≤ 2 s), close the admin socket, close the store (WAL checkpoint) | ≤ 2 s | |
+| 6. Stop the TLS manager (`tlsmgr.Manager.Shutdown`, §8.2: no order, renewal or reload writes the certificate storage after it; S44), flush transfer counters, wait for the push queue's drain (≤ 2 s; it began right after step 5, README S71), close the admin socket, close the store (WAL checkpoint) | ≤ 2 s | |
 | 7. Exit 0 (or re-exec, §6.5) | total ≤ `shutdown_timeout` (10 s); a forced shutdown up to 1 s more for the store's close (below) | |
 
 A step that runs out of its budget closes by force what it still has (a request that won't finish, say), and the
@@ -1080,8 +1081,20 @@ step 6 are more exact than the table:
   and ready answers have said "shutting down" since step 1, `status` still answers, and every other request gets
   503 `server_shutdown` (§12.2). The order inside the step is: the TLS manager, now that nothing handshakes any
   more; then the server's own background work is cancelled (the janitor, the periodic look at the public addresses,
-  the reads behind hooks without a context); then the admin socket's server; then the runtime log level's timer.
-  Together they have the step's 2 s.
+  the reads behind hooks without a context); then the wait for the push service's drain (the step `push`, README
+  S71, below); then the admin socket's server; then the runtime log level's timer. Together they have the step's
+  2 s.
+- **The push service drains from the end of step 5, and step 6 waits for it after the TLS manager** (README S71;
+  `TestShutdownOrder`). Once the HTTP servers are down nothing can queue a notification any more: the hub stopped
+  in step 3, the REST API in step 5, and the admin socket has answered only `health`, `ready` and `status` since
+  step 1. So right after step 5 the shutdown ends the push service's `Run`, which stops taking work and sends what
+  is still queued for at most 2 s, dropping what is left then (§14.5). That drain runs alongside the TLS manager's
+  shutdown, and the step named `push`, between `tls` and `admin socket`, waits for what is left of it within the
+  same 2 s of step 6. A drain that uses its whole 2 s (a slow push service at shutdown) therefore uses up the step:
+  `push`, and the admin socket's close after it, are then reported as forced, which is no failure (the exit code
+  is unchanged, and nothing is lost that the drain would have kept). The push service writes its results to the
+  store, whose close waits for the background goroutines anyway. A server without push (no site, or
+  `push.enabled = false`) has no `push` step (`TestPushDisabled`).
 - **The store's close gets one more second of its own**, outside those 2 s and outside `shutdown_timeout`. The
   close waits for the background goroutines to end and then checkpoints the WAL, which is what makes the `.db`
   file complete by itself. In a shutdown that had the time this is the end of step 6 and takes milliseconds. In
@@ -1095,9 +1108,9 @@ step 6 are more exact than the table:
   the swap.
 - Last of all the data-directory lock is released, so that the process that follows (a re-exec, the next start)
   can take it.
-- A server without a site has no hub: step 3 is skipped. "Flush transfer counters" and "drain the push queue"
-  join step 6 with README S85 and S71. Step 6 also ends the settings callback that passes the admin's limit on
-  to the SFU, which is closed by then.
+- A server without a site has no hub: step 3 is skipped. "Flush transfer counters" joins step 6 with README S85
+  ("wait for the push queue's drain" joined with S71, above). Step 6 also ends the settings callback that passes
+  the admin's limit on to the SFU, which is closed by then.
 
 A second SIGTERM/SIGINT exits immediately with code 1. 06 sets systemd `TimeoutStopSec=20` and compose
 `stop_grace_period: 20s`.
@@ -1180,7 +1193,7 @@ The only place (with `cmd/isshoni` and `servertest`, §2) that imports 01's `sig
 | `ops.LiveSource`, `ops.AccountsSource`, `ops.Prober` | hub + SFU, 03's `API.DashboardAccounts`, `SFU.Probe` | §11.4, §7.7 |
 | Offline DB functions of `ops` (backup, restore) and `ops/doctor` (`schema`) | 03's `store.LatestSchemaVersion`, `store.InspectFile`, `store.BackupFile` | passed as function values (§2); `cmd/isshoni` does the same for offline commands (§12.3, §12.4, §13.1) |
 | `push.Store` | 03's store | §14.7; `store.ErrNotFound` becomes nil in `RecordResult` and `Delete`, and `""` with a nil error in `Meta` |
-| `push.Options` | built by the wiring | `Subject` = `push.DeriveSubject(push.subject, tls.acme_email, Site.Origin)`; `VAPID` = `SecretStore.VAPID`; `OwnAddrs` = the detected `PublicAddrs.V4` and `V6`; `Metrics` = `ops.Metrics.Registerer()` (§14.1, §14.3) |
+| `push.Options` | built by the wiring | `Subject` = `push.DeriveSubject(push.subject, tls.acme_email, Site.Origin)`; `VAPID` = `SecretStore.VAPID`; `OwnAddrs` = the detected `PublicAddrs.V4` and `V6`; `Store` = the `push.Store` row; `Sender` = `Deps.PushSender`; `Now` = `Deps.Now` (the store's clock, for `last_success_at`, the prune and the TTLs); `Resolver` = `Deps.Resolver`; `Metrics` = `ops.Metrics.Registerer()` (README S85; nil until then) (§14.1, §14.3, §14.5) |
 | `push.enabled=false` | – | the wiring passes `httpapi.Deps.Push = nil` and `auth.Options.Alerts = nil`, and does not build or start `push.Service`: it never calls `push.New`, which refuses `Options.Enabled == false` with `push.ErrDisabled` (§14.3); 03 then answers `push_unavailable` and omits `push` from `/info` |
 | REST routes of `ops` and `push` | 03's `API.Handle` | each typed `ops`/`push` function is wrapped with `httpapi.DecodeJSON`/`WriteJSON`/`WriteError` and registered through `API.Handle` with the principal from `httpapi.PrincipalFrom` (§2): `POST /api/v1/conntest` (User), `GET /api/v1/admin/dashboard`, `GET\|POST /api/v1/admin/doctor`, `GET /api/v1/admin/bandwidth` (Admin) |
 | Admin socket handlers | 03's `auth.Service`, `store.DB` | 03 §12.6 table |
@@ -1260,11 +1273,12 @@ table has them; these are the points the table leaves open, and what is still to
   `serve` prints when it refuses a newer schema (§6.1 step 4) is `doctor.RestoreCommand`, the one doctor's
   `schema` check prints, so there is one copy of it.
 - **Not wired yet**, each with a stand-in that needs no code elsewhere (the SFU's row left this table with
-  README S59, below):
+  README S59, and the push row, `signal.Deps.Push`, `auth.Options.Alerts` and `httpapi.Deps.Push`, with README S71;
+  both below):
 
   | What | Until | Meanwhile |
   |---|---|---|
-  | Push: `signal.Deps.Push`, `auth.Options.Alerts`, `httpapi.Deps.Push` | README S71 | the push endpoints answer `push_unavailable` and `/info` has no `push` object, as with `push.enabled = false`; admin alerts are only logged |
+  | `push.Options.Metrics` (`isshoni_push_sent_total`, §11.2) | README S85 | the push service counts its results for nobody |
   | `ops.Metrics` as the router's observer and the hub's registerer; the REST routes of `ops` | README S80, S85 | `signal.Deps.Metrics` is nil; with `metrics.enabled` the server logs a warning that nothing listens on `metrics.listen` |
   | Transfer accounting and the release check in `serve` (built in README S55, §11.3, §11.5) | README S85 | nothing counts or checks |
 
@@ -1294,13 +1308,47 @@ the tests in `media_test.go` and in `internal/server/itest`).
   otherwise be (01 §15.4), and a client reaches such a method with an everyday message: `caps.update` until
   README S69. The wiring therefore gives `sfuplane` a log handler (`notImplementedAsDebug`) that passes a record
   about that error on at debug level. The client still gets its `error{internal}` with the ref. The handler goes
-  away with `sfu.ErrNotImplemented` (`TestUnbuiltSFUMethodsAreQuiet`).
+  away with `sfu.ErrNotImplemented` (`TestUnbuiltSFUMethodsAreQuiet`). Since README S69 every `Conn` method is
+  built, and only `SFU.Probe` still returns the error, until README S76; no client message reaches it (02 §6.3).
 - **A changed public address** is logged, and restarts only the server that waited for one (§6.2, §7.4).
 - **`internal/server/itest`** is new: Go clients made of an account registered over REST with an invite,
   `internal/client/signal` on `/ws` with its cookie, `publish.Publisher` with `fake.Source` as the pub PC and an
   `sfutest.Viewer` as the sub PC, against `servertest`. Cases 1–3 and 9 of 01 §19 are there, the ICE-TCP checks
   of §17 (`TestICETCPVia443`, and `TestICETCPVia7882` for off mode), and `TestShutdownWithMedia`, with a
   goroutine leak check for the package. The metric assertion of the ICE-TCP test comes with README S85.
+
+**What README S71 wired** (wiring v3: Web Push in `serve`; `wirePush` and the adapters in `wire.go`, the shutdown
+step in `server.go`, the tests in `push_test.go`, `wire_test.go` and `servertest/push.go`).
+- **The rows `signal.PushNotifier`, `auth.AdminAlerter`, `httpapi.Push`, `push.Store` and `push.Options`** are as
+  the table has them, but for `push.Options.Metrics` (still in "Not wired yet"). `wireAccounts` builds the push
+  service first (§6.1 step 8): `push.New` compares the VAPID key with the fingerprint in 03's meta table and,
+  after a rotation, deletes every subscription before anything else reads them (§5.2), and `auth`, whose own
+  purges and changes raise admin alerts, sends them through it. `startBackground` runs it (`push.Service.Run`: the
+  workers, the dispatcher and the daily prune) next to the janitor. The triggers and the test notification only
+  queue: they never block, and the work outlives the caller's context. `push.Store` reads `store.ErrNotFound` as
+  success in `RecordResult` and `Delete` (the row is gone either way).
+- **`push.Options.Now` is `Deps.Now`**, so push uses the store's clock for `last_success_at`, the prune and the
+  TTLs, and **`Options.Resolver` is `Deps.Resolver`**, the one that also answers public-address detection and the
+  TLS manager. `Options.Sender` is `Deps.PushSender` (§6).
+- **With `push.enabled = false` there is no service**: `push.New` is never called, the hub gets no `PushNotifier`
+  and notifies nobody, `auth` gets no alerter and only logs its alerts, the push endpoints answer
+  `push_unavailable`, `GET /info` has no `push` object, and the shutdown has no `push` step (`TestPushDisabled`).
+- **Push is built only on a server with a site**: its subject needs `Site.Origin` (§14.1), and none of its three
+  consumers exists without one. A server without a site (§6.2) therefore runs no VAPID purge until it starts with
+  a site.
+- **A bare `push.subject` is a config error** (§14.1): `server.New` refuses `mailto:` or `https:` with nothing after
+  it as a `*config.ValidationError`, with config's fix text, before `Start` opens anything, so `serve` exits 78
+  (`TestPushSubjectOnlyAPrefix`, `TestPushSubjectProblem`). With `push.enabled = false` nothing reads the subject.
+- **Shutdown**: the push service stops taking work right after step 5, and step 6 waits for its drain after the
+  TLS manager, inside the same 2 s (§6.4).
+- **Tests**: `servertest.PushService` stands in for the browsers' push services (§17, §18), and the server tests'
+  `wiredDeps()` pass it as the sender, so a subscription that a test writes directly never reaches a real push
+  service. `TestShareStartedPush` is the slice's acceptance: a share that goes live reaches the push service for
+  the users who are not in the room, and only for them, on each of their browsers; `TestSignupPendingPush`,
+  `TestPushEndpoints`, `TestPushDisabled` and `TestPushSubjectOnlyAPrefix` go with it, and `wire_test.go` has a
+  table test per adapter (`TestPushNotifier`, `TestPushAPI`, `TestPushStore`, `TestPushPrefNamesMatchStore`). The
+  rotation tests (`TestRotateSecrets`, `TestRotateExactlyTheNamedKeys`) see the VAPID purge and the new key in
+  `GET /info`, and `TestShutdownOrder` the `push` step.
 
 ## 7. Networking (`internal/server/netx`)
 
@@ -3359,12 +3407,17 @@ for `ports` alone. `version` is the running server's when the checks ran in it. 
   `https:` URL (RFC 8292 §2.1), so **an `http://` origin** (off mode without a proxy that says https, a development
   server) **is given as `https://`** with the same host: the claim only names a contact, and nothing connects to it.
   `New` refuses any other subject: it must start with `mailto:` or `https:` and have something after the prefix.
-  `config` checks only the prefix (§4.5), so a bare `mailto:` or `https:` in `push.subject` passes config validation
-  and is refused by `New` at startup (§6.1 step 8; with `push.enabled = false` `New` isn't called, §6.6). The
-  derived forms always pass: `mailto:` with a non-empty address, or the origin that `config.NewSite` built, which
-  has a host. Making the config rule as strict as `New`'s, and correcting the comment on `validSubject` (it says
-  the two rules are the same), is a code follow-up for a slice that may touch `internal/server/config` and
-  `internal/server/push`.
+  `config` checks only the prefix (§4.5), so a bare `mailto:` or `https:` in `push.subject` passes config validation.
+  **The server refuses it as a config error** (README S71; `pushSubjectProblem` in `wire.go`): with push on,
+  `server.New` adds it to config's own problems, a `*config.ValidationError` with the key, its source and config's
+  fix text, before `Start` opens anything, so `serve` exits 78 like on any other config error (§3.2, §6.3) and
+  systemd does not restart it. Left to `push.New` in §6.1 step 8 it would have been a runtime error (exit 1, and a
+  restart loop), and on an ip-mode server that waits for its address it would have come only at the re-exec once
+  the address is found. With `push.enabled = false` nothing reads the subject, and the server starts
+  (`TestPushSubjectOnlyAPrefix`). The derived forms always pass: `mailto:` with a non-empty address, or the origin
+  that `config.NewSite` built, which has a host. Making the config rule itself as strict as `New`'s, and correcting
+  the comment on `validSubject` (it says the two rules are the same), is still a code follow-up for a slice that
+  may touch `internal/server/config` and `internal/server/push`.
 - The key pair comes from `Options.VAPID()` (`SecretStore.VAPID`), read once in `New`, which checks that it is a
   pair: a 65-byte uncompressed P-256 point that belongs to the 32-byte private scalar (`crypto/ecdh`), else `New`
   fails. `VAPIDPublicKey()` returns the point in base64url without padding.
@@ -3769,6 +3822,19 @@ no tokens, SDP, push endpoints or usernames.
   backup; sessions from the backup still work.
 - **rotate-secrets**: the server restarts (tests call `Run` again instead of `exec`); web sessions, device codes and
   invites invalid; push rows gone (session cascade and VAPID purge) before the first request is served.
+- **Web Push** (README S71, `push_test.go`, with `servertest.PushService` as the server's `PushSender` and
+  `Resolver`, §18): a share that goes live reaches the push service for the users who are not in the room, and
+  only for them: not the sharer, not a user who is in the room, not one who switched the notification off, and the
+  one who gets it on each of their browsers (`TestShareStartedPush`, the slice's acceptance); a sign-up in the
+  approval mode reaches the admins as `admin.alert` `signup_pending`, and no member (`TestSignupPendingPush`);
+  `GET /info` publishes the VAPID key of `secrets.json`, a subscription passes the push service's endpoint checks,
+  the test notification goes to that browser alone, an endpoint the guard refuses is 422
+  `push_endpoint_rejected`, and a subscription the push service answers 410 for is deleted
+  (`TestPushEndpoints`); with `push.enabled = false` REST answers `push_unavailable`, `/info` has no `push`
+  object, admin alerts are only logged, nobody is notified and the shutdown has no `push` step
+  (`TestPushDisabled`); a bare `push.subject` is refused with exit 78, and passes with push off
+  (`TestPushSubjectOnlyAPrefix`). The rotation tests see the VAPID purge in the log and the new key in `/info`, and
+  `TestShutdownOrder` the `push` step after `tls` (§6.4).
 - **Wiring** (§6.6): every adapter has a table test; a unit test asserts that the registry's policy defaults equal
   03's `SettingsCache.Defaults()`; a unit test asserts that `netx.IPKey` and 03's limiter key (exported by `auth` for
   this test) give the same key for the `IPKey` table of the netx tests; in-process (off mode),
@@ -3872,6 +3938,18 @@ Packages and names (exact):
     what `Client` trusts in a TLS mode, the test CA plus `Options.Roots`, and nil in off mode; a test that dials the
     HTTPS port by itself (`Srv.Addrs().HTTPS`) verifies the server with it.
   - No harness config has STUN servers, so no test asks the public ones for the machine's address.
+  - **Web Push is on** in a harness server, as `push.enabled` is by default, with the real sender, which sends
+    nothing until a browser has subscribed. **`PushService`** (README S71; `NewPushService()`) is a fake of the
+    browsers' push services that a test passes as both `Deps.PushSender` and `Deps.Resolver`: as a `push.Sender`
+    it records every message (`PushMessage`: the endpoint, the subscription, user and session ids, the decoded
+    `api.PushPayload` next to the raw bytes, and the `SendOptions`) instead of encrypting and delivering it, and
+    answers 201 unless `SetStatus(endpoint, status)` says otherwise; as a `netx.Resolver` it resolves
+    **`PushHost`** (the constant `"push.isshoni.test"`, which never resolves in DNS) to a public address, so the
+    server's subscribe-time SSRF guard takes the endpoint, and every other name as the system does. A browser
+    subscribes with `Subscription(name)` (its `Endpoint(name)` and a fresh key pair), and a test reads
+    `Messages()` or waits with `Wait(ctx, cond)`. The real sender reaches only public addresses on port 443, so a
+    test server can't send to a push service on a loopback port; the encryption and the VAPID token are `push`'s
+    own tests'.
 - `internal/protocol/api` (TS via tygo, next to 03's DTOs): `OpsDashboard` and its parts (`ServerInfo`,
   `ProcessInfo`, `TLSInfo`, `AdvertisedAddr`, `UpdateInfo`, `TransferInfo`, `MediaTotals`, `RoomLive`,
   `ParticipantLive`, `ConnectionLive`, `ShareLive`, `LayerLive`, `ViewerCounts`, `ClientVersionCount`,
