@@ -333,7 +333,7 @@ func TestServeExit(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
 		// serve's own context is the one that a stop signal ends; here none came.
-		err := serveExit(t.Context(), inv, slog.New(slog.DiscardHandler), tt.err)
+		err := serveExit(t.Context(), inv, slog.New(slog.DiscardHandler), tt.err, nil)
 		if got := exitCodeOf(ctx, err); got != tt.wantCode {
 			t.Errorf("%s: exit %d, want %d", tt.name, got, tt.wantCode)
 		}
@@ -351,42 +351,69 @@ func TestServeExit(t *testing.T) {
 
 // What serve does once the server has shut down for a restart (04 §6.5): it re-execs, whatever the restart was
 // for (Run's result is the same after a restore, after rotate-secrets and when the server found the public
-// address it was waiting for). Only when there is no new process does it exit: 0 after a stop, 75 otherwise.
+// address it was waiting for). Before the re-exec it gives the stop signals back to their default (release), and
+// looks once more for a stop. Only when there is no new process does it exit: 0 after a stop, 75 otherwise.
 func TestRestartInPlace(t *testing.T) {
 	const startAgain = "isshoni serve: the server stopped for a restart (after a restore or rotate-secrets, or because it found the " +
 		"public address it was waiting for)"
+	const stoppedLog = "stopped instead of restarting: a stop signal came during the shutdown"
 	stopped, stop := context.WithCancel(t.Context())
 	stop()
+	// A SIGTERM that comes after the first look, on the way to the exec: serve's real watcher, and the signal in
+	// its channel when the signals are released, where signal.Stop leaves one that was under way. Whether the
+	// watcher took it (the context is done) or not (it waits in the channel), it is a stop.
+	sigs := make(chan os.Signal, 2)
+	late, stopLate := stopOnSignal(t.Context(), sigs, func() { t.Error("one signal counted as two") })
+	defer stopLate()
+	lateSignal := func() bool {
+		sigs <- syscall.SIGTERM
+		return stopLate()
+	}
+	none := func() bool { return false }
 	tests := []struct {
-		name       string
-		ctx        context.Context
-		reexec     func() error // nil: the invocation has none
-		wantCalls  int
-		wantCode   int
-		wantStderr string
-		wantLog    string
+		name         string
+		ctx          context.Context
+		reexec       func() error // nil: the invocation has none
+		release      func() bool  // nil: serve has not taken the signals
+		wantReleases int
+		wantCalls    int
+		wantCode     int
+		wantStderr   string
+		wantLog      string
 	}{
 		// In the real program the re-exec does not come back; here it "succeeds" by returning what a failed exec
 		// would, so that the test sees that it was called, once.
-		{"re-exec", t.Context(), func() error { return errors.New("exec format error") }, 1, exitRestart,
+		{"re-exec", t.Context(), func() error { return errors.New("exec format error") }, none, 1, 1, exitRestart,
 			startAgain + " and could not start itself again (exec format error): start it again\n", "restarting in place"},
-		{"a platform without re-exec", t.Context(), func() error { return server.ErrNoReexec }, 1, exitRestart, startAgain + ": start it again\n", "restarting in place"},
-		{"an invocation that can't", t.Context(), nil, 0, exitRestart, startAgain + ": start it again\n", ""},
-		{"a stop came during the shutdown", stopped, func() error { return errors.New("must not be called") }, 0, exitOK, "",
-			"stopped instead of restarting: a stop signal came during the shutdown"},
+		{"re-exec before serve took the signals", t.Context(), func() error { return errors.New("exec format error") }, nil, 0, 1, exitRestart,
+			startAgain + " and could not start itself again (exec format error): start it again\n", "restarting in place"},
+		{"a platform without re-exec", t.Context(), func() error { return server.ErrNoReexec }, none, 1, 1, exitRestart,
+			startAgain + ": start it again\n", "restarting in place"},
+		{"an invocation that can't", t.Context(), nil, none, 0, 0, exitRestart, startAgain + ": start it again\n", ""},
+		{"a stop came during the shutdown", stopped, func() error { return errors.New("must not be called") }, none, 0, 0, exitOK, "", stoppedLog},
+		{"a stop came after the first look", late, func() error { return errors.New("must not be called") }, lateSignal, 1, 0, exitOK, "", stoppedLog},
 	}
 	cmd := root().sub("serve")
 	for _, tt := range tests {
 		var stderr, logs bytes.Buffer
-		calls := 0
+		var order []string
 		inv := &invocation{stderr: &stderr}
 		if tt.reexec != nil {
-			inv.reexec = func() error { calls++; return tt.reexec() }
+			inv.reexec = func() error { order = append(order, "reexec"); return tt.reexec() }
 		}
-		err := serveExit(tt.ctx, inv, slog.New(slog.NewTextHandler(&logs, nil)), server.ErrRestartRequested)
+		var release func() bool
+		if tt.release != nil {
+			release = func() bool { order = append(order, "release"); return tt.release() }
+		}
+		err := serveExit(tt.ctx, inv, slog.New(slog.NewTextHandler(&logs, nil)), server.ErrRestartRequested, release)
 		// A restart the server asked for is no interrupt: after a stop it is a clean exit, 0 and not 130.
-		if got := exitCodeOf(tt.ctx, err); got != tt.wantCode || calls != tt.wantCalls {
-			t.Errorf("%s: exit %d after %d re-execs, want %d after %d", tt.name, got, calls, tt.wantCode, tt.wantCalls)
+		releases, calls := strings.Count(strings.Join(order, " "), "release"), strings.Count(strings.Join(order, " "), "reexec")
+		if got := exitCodeOf(tt.ctx, err); got != tt.wantCode || calls != tt.wantCalls || releases != tt.wantReleases {
+			t.Errorf("%s: exit %d after %d releases and %d re-execs, want %d after %d and %d", tt.name, got, releases, calls,
+				tt.wantCode, tt.wantReleases, tt.wantCalls)
+		}
+		if releases == 1 && calls == 1 && order[0] != "release" {
+			t.Errorf("%s: %v, want the signals released before the re-exec", tt.name, order)
 		}
 		if err != nil {
 			report(inv, cmd, err)
@@ -470,10 +497,14 @@ func TestStopOnSignal(t *testing.T) {
 		case <-time.After(50 * time.Millisecond):
 		}
 	})
+	// stop reports whether a stop came, and is the same when it is called again.
 	t.Run("stop without a signal", func(t *testing.T) {
 		sigs := make(chan os.Signal, 2)
 		ctx, stop := stopOnSignal(t.Context(), sigs, func() { t.Error("second-signal call without signals") })
-		stop()
+		first := stop()
+		if again := stop(); first || again {
+			t.Errorf("stop without a signal reports a stop: %v, then %v", first, again)
+		}
 		<-ctx.Done()
 		sigs <- syscall.SIGTERM // nobody is watching any more
 	})
@@ -482,6 +513,28 @@ func TestStopOnSignal(t *testing.T) {
 		ctx, stop := stopOnSignal(t.Context(), sigs, func() { t.Error("second-signal call after one signal") })
 		sigs <- syscall.SIGTERM
 		<-ctx.Done()
-		stop()
+		first := stop()
+		if again := stop(); !first || !again {
+			t.Errorf("stop after a signal reports %v, then %v; want a stop both times", first, again)
+		}
+	})
+	t.Run("stop with a signal just sent", func(t *testing.T) {
+		// The watcher may have taken it or not when it is told to end: a stop either way.
+		for range 100 {
+			sigs := make(chan os.Signal, 2)
+			_, stop := stopOnSignal(t.Context(), sigs, func() { t.Error("second-signal call after one signal") })
+			sigs <- syscall.SIGTERM
+			if !stop() {
+				t.Fatal("a signal sent right before stop was missed")
+			}
+		}
+	})
+	t.Run("stop after the parent context ended", func(t *testing.T) {
+		parent, cancel := context.WithCancel(t.Context())
+		_, stop := stopOnSignal(parent, make(chan os.Signal, 2), func() { t.Error("second-signal call without signals") })
+		cancel()
+		if !stop() {
+			t.Error("stop after SIGINT through main's context reports none")
+		}
 	})
 }

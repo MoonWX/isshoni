@@ -64,7 +64,8 @@ func runServe(ctx context.Context, inv *invocation, _ []string) error {
 
 	srv, err := server.New(inv.cfg, log, server.Deps{LogLevel: level})
 	if err != nil {
-		return serveExit(ctx, inv, log, err)
+		// No stop signal is taken yet: SIGTERM still ends the process by itself, so there is nothing to release.
+		return serveExit(ctx, inv, log, err, nil)
 	}
 
 	// SIGTERM joins SIGINT (main's context): systemd and Docker stop the server with it. The first signal starts
@@ -78,7 +79,17 @@ func runServe(ctx context.Context, inv *invocation, _ []string) error {
 	})
 	defer stop()
 
-	return serveExit(ctx, inv, log, srv.Run(ctx))
+	// Before a re-exec the stop signals go back to their default, so that one that comes on the way to the exec
+	// ends the process, as the operator asked, instead of a context that nobody reads any more (restartInPlace).
+	// signal.Stop hands a signal that is already under way to sigs, and stop waits for the watcher to have seen it.
+	// SIGINT is main's too: the Reset takes it from main's context as well. One that arrives in the moment between
+	// the two calls is caught by main's context alone, and may be missed; a terminal's operator presses Ctrl-C again.
+	release := func() bool {
+		signal.Stop(sigs)
+		signal.Reset(os.Interrupt)
+		return stop()
+	}
+	return serveExit(ctx, inv, log, srv.Run(ctx), release)
 }
 
 // logSignals calls say for every signal on sigs until the returned function is called, which waits for the
@@ -103,12 +114,14 @@ func logSignals(sigs <-chan os.Signal, say func()) (stop func()) {
 }
 
 // stopOnSignal returns a context that ends with the first signal on sigs (or with ctx), and calls again for a
-// second signal: the operator does not want to wait for the graceful shutdown. stop ends the watching and waits
-// for its goroutine.
+// second signal: the operator does not want to wait for the graceful shutdown. stop ends the watching, waits for
+// its goroutine, ends the context, and reports whether a stop came: the context had ended, or a signal still waits
+// in sigs (the goroutine was told to end before it took it). Calling stop again changes nothing and reports the
+// same.
 //
 // SIGINT arrives twice, here and through main's context, which ends ctx by itself; the watcher still takes its
 // copy from sigs first, so that the first Ctrl-C never counts as the second.
-func stopOnSignal(ctx context.Context, sigs <-chan os.Signal, again func()) (context.Context, func()) {
+func stopOnSignal(ctx context.Context, sigs <-chan os.Signal, again func()) (context.Context, func() (stopped bool)) {
 	ctx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	var wg sync.WaitGroup
@@ -125,10 +138,18 @@ func stopOnSignal(ctx context.Context, sigs <-chan os.Signal, again func()) (con
 		case <-done:
 		}
 	})
-	return ctx, func() {
-		close(done)
-		wg.Wait()
-		cancel()
+	var (
+		once    sync.Once
+		stopped bool
+	)
+	return ctx, func() bool {
+		once.Do(func() {
+			close(done)
+			wg.Wait()
+			stopped = ctx.Err() != nil || len(sigs) > 0
+			cancel()
+		})
+		return stopped
 	}
 }
 
@@ -141,8 +162,9 @@ func stopOnSignal(ctx context.Context, sigs <-chan os.Signal, again func()) (con
 //     there is none;
 //   - anything else (a busy port, a data directory another isshoni holds, a listener that failed): 1.
 //
-// ctx is the one that SIGTERM and SIGINT end.
-func serveExit(ctx context.Context, inv *invocation, log *slog.Logger, err error) error {
+// ctx is the one that SIGTERM and SIGINT end, and release gives those signals back to their default (nil when
+// serve has not taken them); restartInPlace has the details.
+func serveExit(ctx context.Context, inv *invocation, log *slog.Logger, err error, release func() (stopped bool)) error {
 	var ve *config.ValidationError
 	switch {
 	case err == nil, errors.Is(err, server.ErrShutdownForced):
@@ -153,7 +175,7 @@ func serveExit(ctx context.Context, inv *invocation, log *slog.Logger, err error
 	case server.NeedsOperator(err):
 		return exitWith(exitConfig, err)
 	case errors.Is(err, server.ErrRestartRequested):
-		return restartInPlace(ctx, inv, log)
+		return restartInPlace(ctx, inv, log, release)
 	default:
 		return exitWith(exitRuntime, err)
 	}
@@ -164,20 +186,30 @@ func serveExit(ctx context.Context, inv *invocation, log *slog.Logger, err error
 // and Docker see no exit, and the new process finds what the restart was for: the restored files, the rotated
 // keys, or the public address that the old one had started without.
 //
+// A stop signal must not get lost on the way: serve's handling of it ends with the exec, and the new process takes
+// a while to start (a migration, a certificate order), during which systemd would wait for it in vain and then
+// kill it. So before the exec, release gives SIGTERM and SIGINT back to their default, which ends the process,
+// and reports whether one came before; the new process keeps the default until it takes them itself.
+//
 // It returns only when there is no new process:
-//   - the operator's stop came while the server was already shutting down for the restart: the server is stopped,
-//     which is what a stop asks for, so serve exits 0 and nothing starts;
+//   - the operator's stop came while the server was shutting down for the restart, or before the signals were
+//     released: the server is stopped, which is what a stop asks for, so serve exits 0 and nothing starts;
 //   - the platform has no re-exec (Windows), or the exec failed: exit 75, "restart required". systemd
 //     (Restart=on-failure) and Docker (restart: unless-stopped) start a new process on it.
-func restartInPlace(ctx context.Context, inv *invocation, log *slog.Logger) error {
+func restartInPlace(ctx context.Context, inv *invocation, log *slog.Logger, release func() (stopped bool)) error {
 	const startAgain = "the server stopped for a restart (after a restore or rotate-secrets, or because it found the " +
 		"public address it was waiting for)"
+	const stopped = "stopped instead of restarting: a stop signal came during the shutdown"
 	if ctx.Err() != nil {
-		log.Info("stopped instead of restarting: a stop signal came during the shutdown")
+		log.Info(stopped)
 		return nil //nolint:nilerr // the stop is what was asked for, not a failure
 	}
 	if inv.reexec == nil {
 		return exitWith(exitRestart, errors.New(startAgain+": start it again"))
+	}
+	if release != nil && release() { // the last look for a stop: one that comes later ends the process
+		log.Info(stopped)
+		return nil
 	}
 	log.Info("restarting in place")
 	err := inv.reexec() // comes back only when it failed

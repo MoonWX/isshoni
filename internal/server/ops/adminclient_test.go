@@ -106,6 +106,20 @@ func TestAdminClientUnreachable(t *testing.T) {
 			t.Errorf("error text %q, want %q", err.Error(), want)
 		}
 	})
+	// Any other failed dial reached nothing either, but it is neither of the two: ErrAdminDial, with the dial's own
+	// error. A path longer than a socket address can hold (104 bytes on macOS, 108 on Linux) can't be dialled.
+	t.Run("a path too long for a socket address", func(t *testing.T) {
+		path := filepath.Join(filepath.Dir(socketPath(t)), strings.Repeat("s", 200))
+		_, err := DialAdmin(path).Health(t.Context())
+		var ue *AdminUnreachableError
+		if !errors.Is(err, ErrAdminDial) || errors.Is(err, ErrAdminNotRunning) || errors.Is(err, ErrAdminPermission) || errors.As(err, &ue) {
+			t.Fatalf("Health on a path of %d bytes: %v, want ErrAdminDial", len(path), err)
+		}
+		var opErr *net.OpError
+		if !errors.As(err, &opErr) || !strings.HasPrefix(err.Error(), "ops: connecting to the admin socket "+path+": ") {
+			t.Errorf("error %q, want the dial's own error after the path", err.Error())
+		}
+	})
 	t.Run("a socket the caller can't write", func(t *testing.T) {
 		if runtime.GOOS == "windows" || os.Geteuid() == 0 {
 			t.Skip("needs a user that file modes apply to")
@@ -243,7 +257,8 @@ func TestAdminClientTimeout(t *testing.T) {
 	defer cancel()
 	start := time.Now()
 	_, err := c.Health(ctx)
-	if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrAdminPermission) || errors.Is(err, ErrAdminNotRunning) {
+	if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrAdminPermission) || errors.Is(err, ErrAdminNotRunning) ||
+		errors.Is(err, ErrAdminDial) { // the connection was made: something listens
 		t.Fatalf("Health with a silent server: %v, want the deadline error", err)
 	}
 	if !strings.Contains(err.Error(), "no answer from the server on the admin socket "+c.Path()) {
@@ -253,8 +268,8 @@ func TestAdminClientTimeout(t *testing.T) {
 		t.Errorf("the call took %v", time.Since(start))
 	}
 	// A context that is done before the call fails the dial.
-	if _, err := c.Health(ctx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("Health with a dead context: %v", err)
+	if _, err := c.Health(ctx); !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, ErrAdminDial) {
+		t.Errorf("Health with a dead context: %v, want a failed dial", err)
 	}
 }
 

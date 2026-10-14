@@ -678,6 +678,100 @@ func TestOfflineRefusals(t *testing.T) {
 	if code != exitOK || !strings.HasPrefix(stdout, "\x1f\x8b") {
 		t.Errorf("backup --offline as root in a container: exit %d, stderr %q", code, stderr)
 	}
+
+	// A socket path that can't be dialled at all (longer than a socket address holds) reached no server: the lock
+	// decides, and the data directory of this stopped server is free. Such a path in the config is a config error,
+	// which is when the offline commands are needed most (04 §12.6).
+	long := filepath.Join(filepath.Dir(socketPath(t)), strings.Repeat("s", 140))
+	for _, socket := range [][]string{{"--socket", long}, {"--listen.admin-socket", long}} {
+		code, stdout, stderr := runCLI(t, args("backup", append([]string{"--data-dir", dir}, socket...))...)
+		if code != exitOK || !strings.HasPrefix(stdout, "\x1f\x8b") || !strings.Contains(stderr, "Nothing answers on "+long+" (") {
+			t.Errorf("backup --offline %s <%d bytes>: exit %d, stderr %q", socket[0], len(long), code, stderr)
+		}
+	}
+
+	t.Run("neither root nor the service user", offlineAsAnotherUser)
+}
+
+// An offline command run by a user who is neither root nor the service user, and who can't open the server's
+// files, is told to run it as the service user, as root is. The server's own refusal would print its fix, a chown
+// of the data directory to that user, after which the server could not start any more.
+func offlineAsAnotherUser(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("needs a user that file modes apply to")
+	}
+	dir, flags := realDataDir(t)
+	p := (&config.Config{DataDir: dir}).Paths()
+	file := writeTemp(t, "pre.db", nil)
+	_ = os.Remove(file)
+	if err := store.BackupFile(context.Background(), p.DB, file); err != nil {
+		t.Fatal(err)
+	}
+	commands := map[string][]string{
+		"backup":  append(append([]string{"admin", "backup"}, flags...), "--offline", "--out", "-"),
+		"restore": append(append([]string{"admin", "restore"}, flags...), "--offline", "--yes", file),
+	}
+	refused := func(t *testing.T, what string) {
+		t.Helper()
+		for name, a := range commands {
+			code, stdout, stderr := runCLI(t, a...)
+			want := "isshoni admin " + name + ": run as the service user, so that the files stay the server's:\n  sudo -u isshoni isshoni " + strings.Join(a, " ") + "\n"
+			if code != exitRefused || stdout != "" || stderr != want || strings.Contains(stderr, "chown") {
+				t.Errorf("%s --offline %s: exit %d, stdout %q\nstderr %q\n  want %q", name, what, code, stdout, stderr, want)
+			}
+		}
+	}
+
+	// The lock file of the service user, which nobody else may open (the server makes it 0600).
+	lock, err := config.LockDataDir(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(p.Lock, 0); err != nil {
+		t.Fatal(err)
+	}
+	refused(t, "with a lock file it can't open")
+	if err := os.Chmod(p.Lock, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// A directory on the way to the data directory that it may not enter: not "there is no data directory".
+	parent := filepath.Dir(dir)
+	if err := os.Chmod(parent, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(parent, 0o700) }) //nolint:gosec // G302: a directory needs its x bit
+	refused(t, "behind a directory it can't enter")
+	if err := os.Chmod(parent, 0o700); err != nil { //nolint:gosec // G302: a directory needs its x bit
+		t.Fatal(err)
+	}
+
+	// In a container the form is the Docker one; from stdin it says where the archive goes.
+	a := append(append([]string{"admin", "restore"}, flags...), "--offline", "--yes", "-")
+	if err := os.Chmod(p.Lock, 0); err != nil {
+		t.Fatal(err)
+	}
+	db, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, _, stderr := runCLIWith(t, cliRun{environ: []string{"ISSHONI_IN_CONTAINER=1"}, stdin: string(db)}, a...)
+	want := "isshoni admin restore: run as the service user, so that the files stay the server's:\n  docker compose run --rm -T isshoni " +
+		strings.Join(a, " ") + " < backup.tar.gz\n"
+	if code != exitRefused || stderr != want {
+		t.Errorf("restore --offline - in a container: exit %d\nstderr %q\n  want %q", code, stderr, want)
+	}
+	if err := os.Chmod(p.Lock, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Nothing was changed: the service user's own run still works.
+	if code, stdout, stderr := runCLI(t, commands["backup"]...); code != exitOK || !strings.HasPrefix(stdout, "\x1f\x8b") {
+		t.Errorf("backup --offline once the files are open again: exit %d, stderr %q", code, stderr)
+	}
 }
 
 // An offline command first completes a restore that was interrupted, as the server would at its start, and says

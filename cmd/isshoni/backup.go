@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net"
 	"os"
 	"slices"
 	"strings"
@@ -112,7 +113,7 @@ func runAdminBackup(ctx context.Context, inv *invocation, o backupOptions, _ []s
 // backupOffline is `admin backup --offline` (04 §12.3, §12.6): the snapshot is 03's store.BackupFile on the stopped
 // server's database, which a newer schema does not stop; only when that fails are the raw files copied.
 func backupOffline(ctx context.Context, inv *invocation, o backupOptions) error {
-	data, release, err := offlineData(ctx, inv, o.clientOptions)
+	data, release, err := offlineData(ctx, inv, o.clientOptions, false)
 	if err != nil {
 		return err
 	}
@@ -247,7 +248,7 @@ func runAdminRestore(ctx context.Context, inv *invocation, o restoreOptions, arg
 	const saved = "The current state is saved first, as backups/pre-restore-<time>.tar.gz in the data directory."
 	if o.offline {
 		ask.what = append(what, saved)
-		data, release, err := offlineData(ctx, inv, o.clientOptions)
+		data, release, err := offlineData(ctx, inv, o.clientOptions, fromStdin)
 		if err != nil {
 			return err
 		}
@@ -504,21 +505,28 @@ func confirm(inv *invocation, c confirmation) error {
 // container is stopped (04 §12.6).
 func yesCommand(inv *invocation, c confirmation) string {
 	args := slices.Insert(slices.Clone(inv.args), min(c.words, len(inv.args)), "--yes")
+	return commandLine(inv, args, c.offline, c.stdinIsData)
+}
+
+// commandLine is args, a command line of the CLI without the program name, in the form that runs it in this
+// environment: with sudo, or as the service user when it is an offline command (yesCommand has examples), with
+// the archive on stdin when stdinIsData.
+func commandLine(inv *invocation, args []string, offline, stdinIsData bool) string {
 	line := strings.Join(quoteArgs(args), " ")
 	var prefix string
 	switch container := inv.inContainer(); {
-	case container && c.offline && c.stdinIsData:
+	case container && offline && stdinIsData:
 		prefix = "docker compose run --rm -T isshoni "
-	case container && c.offline:
+	case container && offline:
 		prefix = "docker compose run --rm isshoni "
 	case container:
 		prefix = "docker compose exec -T isshoni isshoni "
-	case c.offline:
+	case offline:
 		prefix = "sudo -u isshoni isshoni "
 	default:
 		prefix = "sudo isshoni "
 	}
-	if c.stdinIsData {
+	if stdinIsData {
 		line += " < backup.tar.gz"
 	}
 	return prefix + line
@@ -540,19 +548,22 @@ func dataFailure(err error) error {
 }
 
 // offlineData prepares an offline command (04 §12.6) and returns the data directory to act on, with a function
-// that releases it. In this order:
+// that releases it. stdinIsData says that the command reads its archive from stdin (restore -), for the command
+// lines it prints. In this order:
 //
 //  1. the admin socket must not answer: "the server is running; drop --offline" (exit 7). This check is first
-//     because its message is the friendliest;
+//     because its message is the friendliest. Only something that answered counts: a dial that reached nothing,
+//     whatever the reason (a socket path too long to dial, in a config with errors for one), is left to the lock;
 //  2. not as root outside a container (exit 7): root would create files that the service user can't open;
 //  3. the data-directory lock, without waiting (exit 7 when another process holds it, which also sees a server in
-//     another container on the same volume);
+//     another container on the same volume). A user who can't reach the data directory or open its lock is
+//     neither root nor the service user, and gets the same refusal as root (exit 7);
 //  4. a restore that was interrupted is completed, as the server would at its start, so that the command sees a
 //     data directory in one piece.
 //
 // The config may have errors: that is one reason a server does not start, and the commands need only data_dir
 // and the socket's path from it.
-func offlineData(ctx context.Context, inv *invocation, o clientOptions) (*ops.DataDir, func(), error) {
+func offlineData(ctx context.Context, inv *invocation, o clientOptions, stdinIsData bool) (*ops.DataDir, func(), error) {
 	const running = "the server is running; drop --offline"
 	c := o.admin(inv)
 	callCtx, cancel := context.WithTimeout(ctx, healthCallTimeout)
@@ -564,7 +575,15 @@ func offlineData(ctx context.Context, inv *invocation, o clientOptions) (*ops.Da
 	case errors.Is(err, ops.ErrAdminNotRunning):
 	case errors.Is(err, ops.ErrAdminPermission):
 		return nil, nil, adminFailure(inv, o, c, err)
-	default: // an answer, also one that is no health document, or a socket on which something listens and is silent
+	case errors.Is(err, ops.ErrAdminDial):
+		// No connection, so no server on this path; one may still run elsewhere, which the lock below shows.
+		reason := err
+		if opErr := (*net.OpError)(nil); errors.As(err, &opErr) {
+			reason = opErr.Err // the path is in the line already
+		}
+		_, _ = fmt.Fprintf(inv.stderr, "Nothing answers on %s (%v); the data-directory lock shows whether a server is running.\n",
+			c.Path(), reason)
+	default: // something answered: a health document, an error, an answer that is none, or a silence after the connect
 		return nil, nil, exitWith(exitRefused, errors.New(running))
 	}
 	if inv.cfgErr != nil {
@@ -572,10 +591,13 @@ func offlineData(ctx context.Context, inv *invocation, o clientOptions) (*ops.Da
 	}
 	paths := inv.cfg.Paths()
 	if inv.euid() == 0 && !inv.inContainer() {
-		return nil, nil, exitWith(exitRefused, errors.New("run as the service user, so that the files stay the "+
-			"server's:\n  sudo -u isshoni isshoni "+strings.Join(quoteArgs(inv.args), " ")))
+		return nil, nil, asServiceUser(inv, stdinIsData)
 	}
-	if fi, err := os.Stat(paths.DataDir); err != nil || !fi.IsDir() {
+	fi, err := os.Stat(paths.DataDir)
+	switch {
+	case errors.Is(err, fs.ErrPermission): // a directory on the way that this user may not enter
+		return nil, nil, asServiceUser(inv, stdinIsData)
+	case err != nil || !fi.IsDir():
 		return nil, nil, fmt.Errorf("there is no data directory at %s (data_dir). Pass the server's --config or "+
 			"--data-dir, or start the server once so that it creates one", paths.DataDir)
 	}
@@ -583,6 +605,10 @@ func offlineData(ctx context.Context, inv *invocation, o clientOptions) (*ops.Da
 	switch {
 	case errors.Is(err, config.ErrDataDirLocked):
 		return nil, nil, exitWith(exitRefused, fmt.Errorf("%s (another isshoni process is using %s)", running, paths.DataDir))
+	case errors.Is(err, fs.ErrPermission), config.ReasonOf(err) == config.ReasonDataDirNotWritable:
+		// Never the server's own refusal: its fix gives the data directory to the user who runs the command, after
+		// which the server can't start.
+		return nil, nil, asServiceUser(inv, stdinIsData)
 	case err != nil:
 		return nil, nil, err
 	}
@@ -593,6 +619,14 @@ func offlineData(ctx context.Context, inv *invocation, o clientOptions) (*ops.Da
 	}
 	data := &ops.DataDir{Paths: paths, DB: dbFiles(paths), Logger: log}
 	return data, func() { _ = lock.Close() }, nil
+}
+
+// asServiceUser is the refusal of an offline command that does not run as the service user (04 §12.6): as root
+// outside a container it would create files that the server can't open, and any other user can't open the
+// server's. It prints the command as typed, in the form that runs it as the service user.
+func asServiceUser(inv *invocation, stdinIsData bool) error {
+	return exitWith(exitRefused, errors.New("run as the service user, so that the files stay the server's:\n  "+
+		commandLine(inv, inv.args, true, stdinIsData)))
 }
 
 // dbFiles are 03's file-level store functions for the offline commands and offline doctor (04 §6.6).
