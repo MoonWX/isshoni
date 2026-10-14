@@ -371,8 +371,9 @@ Rules:
   one call.
 - `Signaler` and `RoomEvents` implementations must not block and must not call into the SFU synchronously.
 - **A share's uplink control belongs to the publishing Conn's actor** (README S88, §11): its policy, the cap and
-  pause state its sharer was told, and the pub PC's REMB state. The ticker, `SetLimits` and a viewer's request for
-  `high` only post to that actor (a look is queued at most once at a time, `Conn.upQueued`). What other goroutines
+  pause state its sharer was told, and the pub PC's REMB state. The ticker and `SetLimits` only post to that actor,
+  a look of all its shares queued at most once at a time (`Conn.upQueued`, `wakeUplink`); a viewer's new request for
+  `high` posts a look of that one share (`Share.askedForHigh`), which writes no REMB. What other goroutines
   need of it are atomics: `Share.paused` (a keyframe request for a paused layer does nothing, §9.7) and
   `Share.resumedAt`, which the actor stores before it clears a bit of `Share.paused`, so a downlink allocator never
   sees a resumed layer as neither paused nor resumed (§10.2). The viewers' requests reach the policy as each
@@ -818,7 +819,7 @@ version for SFU implementers:
 
 | Case | Client (05) | Signal (01) | SFU |
 |---|---|---|---|
-| WebSocket drops, media fine | reconnect with jittered backoff, `hello{resumeToken}` | same session → `Conn.Resync()` | re-sends an outstanding sub offer (same `gen`/`neg`), current `SubscriptionStateEvent`s, one `CodecPolicyEvent` per own share, the last `QualityHintEvent` per share (if one was sent); ICE-restarts a sub PC that isn't connected, or builds a new one if it was closed |
+| WebSocket drops, media fine | reconnect with jittered backoff, `hello{resumeToken}` | same session → `Conn.Resync()` | re-sends an outstanding sub offer (same `gen`/`neg`), current `SubscriptionStateEvent`s, one `CodecPolicyEvent` per own share, the last `QualityHintEvent` per share (if one was sent), rebuilt from the current cap, pause state and preset (§6.2); ICE-restarts a sub PC that isn't connected, or builds a new one if it was closed |
 | WebSocket gone for 30 s | – | `Conn.StopShare(id, disconnected)` per share, then `Conn.Close` | removes its shares and DownTracks, closes PCs |
 | ICE `disconnected` ≥3 s on sub | `pc.restart{pc: sub, gen, mode: ice}` | `Conn.RestartICE(PCSub, gen)` | ICE-restart offer, same `gen`, next `neg` (after a pending answer if one is outstanding). Nothing new if an ICE restart for this `gen` is queued or was offered less than 5 s ago with no `connected` or `failed` since, e.g. from `Resync()` on the same resume (§5.3); the client counts that offer (new `ice-ufrag`) as its restart. No server timer: the client rebuilds if it isn't connected 15 s after that offer (01 §10.4) |
 | ICE `disconnected` ≥3 s on pub | re-offer with fresh ICE credentials, same `gen` | `Conn.HandleOffer(PCPub, gen, neg+1, …)` | normal answer. Pion restarts ICE; SSRCs stay |

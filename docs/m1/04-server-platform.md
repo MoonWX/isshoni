@@ -2290,10 +2290,11 @@ httpapi's transfer step logs WARN `http request failed` for every 5xx whose caus
 logger in `internal/server` moves that line to debug for two kinds of 503 that clients ask for again and again:
 `GET /readyz` and `GET /healthz` while the server is not ready or is shutting down (a monitor or a load balancer
 polls them, and the reason is logged once by whoever owns it: the TLS manager, the public-address detection, the
-shutdown), and every 503 `server_shutdown` of the gate (step 5) while it is shutting down (browsers that retry). Every
-other 5xx keeps its warning (`server_busy`, `push_unavailable`, an error of a handler). The rule keys on httpapi's
-message and its `route` and `status` attributes as they are, which `TestExpected503sAreQuiet` pins; httpapi itself
-did not change.
+shutdown), and every 503 logged while the shutdown gate is shutting down (step 5's `server_shutdown` for browsers
+that retry, and any other 503 then, a handler's `server_busy` too). Every other 5xx keeps its warning (`server_busy`
+or `push_unavailable` outside a shutdown, an error of a handler). The rule keys on httpapi's message, its `route`
+and `status` attributes as they are, and the gate's state (`Gate.ShuttingDown`), which `TestExpected503sAreQuiet`
+pins; httpapi itself did not change.
 
 ### 9.4 Error envelope
 

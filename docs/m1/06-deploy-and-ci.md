@@ -2733,10 +2733,19 @@ can watch.
 4. On the day, before T+0 (the T−5 row): with E's firewall rules in place, the admin dashboard must show E's
    connection as `tcp443`. If it doesn't, fix E's rules before starting.
 5. **Doctor in Docker** (README S90's last acceptance item, made manual after group 13, README §6 "Decided after
-   group 13"): on a Linux host with a real public address (the VPS before `install.sh`, or another one), the rc's
-   image with `deploy/compose.yaml` (bridge) and then with `deploy/compose.host.yaml` (host): `docker compose exec
-   isshoni isshoni doctor` reports ok in both. Record both outputs; then `docker compose down -v`, so that the ports
-   are free again. Docker Desktop on a Mac can't give this result (its user-space NAT makes `public_ip` symmetric),
+   group 13"), run earlier than T−1 and never on the installed VPS: there the systemd isshoni holds 80, 443 and 7882,
+   and `compose.host.yaml` would mount its data directory, `/var/lib/isshoni`, as root. So during Setup, on the VPS
+   before `install.sh`, or on another Linux host with a real public address, in a directory with `deploy/`'s two
+   compose files and a `.env`: both files' `image:` set to the rc's `ghcr.io/moonwx/isshoni:0.1.0-rc.N` (a
+   prerelease never moves `:latest`, 3), `ISSHONI_DOMAIN` naming that host (or empty, for an IP certificate), and
+   the host's UDP buffers raised (6.4). In this order:
+   - bridge: `docker compose up -d`, `docker compose exec isshoni isshoni doctor`, record the output, then
+     `docker compose down -v`, which frees the ports and deletes the volume (the host setup doesn't use it);
+   - host: `docker compose -f compose.host.yaml up -d`, `docker compose -f compose.host.yaml exec isshoni isshoni
+     doctor`, record the output, then `docker compose -f compose.host.yaml down` and `sudo rm -rf /var/lib/isshoni`,
+     the directory it created on the host as root, which `install.sh` would otherwise take over.
+
+   Both report ok. Docker Desktop on a Mac can't give this result (its user-space NAT makes `public_ip` symmetric),
    nor can CI's docker-smoke with its test overrides (04 §13.2, §17).
 
 ### 12.2 Timeline

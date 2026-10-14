@@ -3227,7 +3227,7 @@ export default defineConfig({
 | `platform/browser/displayMedia.ts`, the lazy publisher (`platform/browser/displayMedia.test.ts`; README W00, §5) | making the provider loads nothing; `pick()` opens the picker first, in the same turn, then asks for the publisher and doesn't wait for it; `start()` hands over to the publisher the pick loaded (one for every share), waits for one that is still loading, and loads it itself when no pick did; when the chunk can't be loaded the pick still resolves, `start()` rejects with `offline`, and the next start loads again |
 | the lazy namespaces (`i18n/lazy.test.ts`, `app/lazyNamespaces.test.tsx`, `i18n/check-i18n-lazy.node.test.ts`; README W00, §16.5) | the catalog starts with the main bundle's namespaces only and gets a lazy one when its page folder's chunk runs; a lazy route never shows a bare key; in test mode every namespace is there from the start; `check:i18n` reads the main file and the lazy files as one catalog, names the file a missing key belongs in, and fails when a folder uses a lazy namespace that its entry module doesn't load, when the main bundle uses one, and when a lazy namespace is in the main file too |
 | i18n | every generated error code maps to an existing `en.json` key (also enforced by `check:i18n`) |
-| `admin/doctorText.ts`, `dashboardText.ts`, and `doctorCatalog.node.test.ts` (README S91, §15.3) | doctor's golden report renders from the catalog with no key or placeholder left and reads like the CLI's text; the variant the params pick (contexts, plurals), owners named as the CLI names them, every provider's firewall text, the server's English for an unknown code or fix code; fixes with the environment's commands, quoted paths, both owner cases, the server's own certificate sentence, a certificate code's fix without a report and without a command that depends on how the server runs; the links of a check; the catalog against the CLI's codes both ways and a name for every check id |
+| `admin/doctorText.ts` and `doctorCatalog.node.test.ts` (README S91, §15.3; `dashboardText.ts` is tested through `DashboardPage.test.tsx`, §19.2) | doctor's golden report renders from the catalog with no key or placeholder left and reads like the CLI's text; the variant the params pick (contexts, plurals), owners named as the CLI names them, every provider's firewall text, the server's English for an unknown code or fix code; fixes with the environment's commands, quoted paths, both owner cases, the server's own certificate sentence, a certificate code's fix without a report and without a command that depends on how the server runs; the links of a check; the catalog against the CLI's codes both ways and a name for every check id |
 
 01 owns the `SignalClient`, `codecs.ts` and registry tests (01 §19).
 
@@ -3242,9 +3242,10 @@ banner and its Copy link includes `#<token>` (S48, which also tests it on the lo
 the room (iOS UA) the banner shows and the Home Screen sheet stays hidden until the banner is dismissed (S77); the
 room's "Invite friends" dialog creates one invite per opening and shows it in the invite card, with Try again only
 where a retry can help (`rooms/InviteDialog.test.tsx`, README F17, §11.2); the admin Dashboard and Doctor pages
-(`admin/DashboardPage.test.tsx`, `admin/DoctorPage.test.tsx`, README S91, §15.3: the snapshot's parts, the alerts,
-the certificate's last error, failed sources shown as not available, the polling while visible; no report yet, a
-run, a busy server, the checks with their fixes and links, the bandwidth calculator).
+(`admin/DashboardPage.test.tsx`, which also covers `dashboardText.ts`, and `admin/DoctorPage.test.tsx`, README S91,
+§15.3: the snapshot's parts, the alerts, the certificate's last error, failed sources shown as not available, the
+polling while visible; no report yet, a run, a busy server, the checks with their fixes and links, the bandwidth
+calculator).
 
 **Web Push, as README S77 tested it** (`account/RoomPush.test.tsx`, `NotificationsPage.test.tsx`,
 `pushState.test.ts`, and the provider's own tests in `account/browserPush.test.ts`, the folder of the slice that
