@@ -13,9 +13,23 @@ import { errors, type Page } from '@playwright/test';
 
 import type { DebugHandle } from '../src/lib/stats/debugHandle';
 import type { AudioInSample, PCSample, StatsSample, VideoInSample } from '../src/lib/stats/summarize';
-import type { PCKind, ShareKind, ShareStatus, SubscriptionStatus, VideoLayer } from '../src/protocol/types.gen';
+import type {
+  CodecKey,
+  PCKind,
+  ShareKind,
+  ShareStatus,
+  SubscriptionStatus,
+  VideoLayer,
+} from '../src/protocol/types.gen';
 
 export type { AudioInSample, PCSample, StatsSample, VideoInSample };
+
+/**
+ * What the page says about the codec wait (05 §10.6; viewer/codecWait.ts CodecNotice): `waiting` for a decoder
+ * ("Retrying…" on the tile), `stuck` or `stuckFirefox` after 3 minutes without one ("Reload the page"), `missing`
+ * for a browser other than Firefox without any H.264 decoder (the room's banner).
+ */
+export type CodecWaitNotice = 'waiting' | 'stuck' | 'stuckFirefox' | 'missing';
 
 /**
  * What state() returns (rooms/connectStats.ts debugState, viewer/stats.ts viewerDebugState). Those modules can't
@@ -57,6 +71,8 @@ export interface DebugState {
     readonly media: 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'unreachable' | 'failed';
     /** The generation of the sub PC; 0 while there is none. */
     readonly subGen: number;
+    /** The codec wait the page shows; null while no subscription waits for a decoder. */
+    readonly codecWait: CodecWaitNotice | null;
     /** The tiles. */
     readonly shares: readonly DebugShare[];
   };
@@ -73,6 +89,8 @@ export interface DebugShare {
   readonly status: ShareStatus;
   /** The layers whose tracks reached the server, e.g. ["high", "low"]. */
   readonly layers: readonly VideoLayer[];
+  /** The H.264 profile the share is published in now, from room.state (e.g. "h264/42e0"); null before it is known. */
+  readonly codec: CodecKey | null;
   /** How many people watch it. */
   readonly watchers: number;
   /** Its tile is on screen. */

@@ -7,7 +7,8 @@
 //   the stage and the sound of the ones they replace (01 §10.6).
 // - When the session has no snapshot anymore, the user is out of that room (leave(), a room switch, a room the
 //   server closed or refused): the viewer goes back to its empty state, and forgets the shares it remembered.
-// - subscribe.status reaches viewerStore.status (attachViewer).
+// - subscribe.status reaches viewerStore.status (attachViewer), and while a subscription waits for a decoder the
+//   codec wait sends caps.update through the same signal (05 §10.6), which is why it is given with `notify`.
 // - What the viewer shows and plays is what the session asks the server for (attachSubscriptions, 05 §12.3–§12.4):
 //   the viewer's desired set goes to session.subscriptions, which sends one subscribe.update per change. Away from
 //   the room page no tile is shown, so every video goes off while the audible share keeps playing (05 §11.1).
@@ -24,7 +25,8 @@ import type { RoomStore, RoomStoreState } from './roomStore';
 
 export interface ConnectViewerDeps {
   viewer: ViewerServices;
-  signal: Pick<SignalClient, 'on'>;
+  /** `on` brings subscribe.status; `notify` sends the codec wait's caps.update (attachViewer, 05 §10.6). */
+  signal: Pick<SignalClient, 'on' | 'notify'>;
   session: Pick<RoomSession, 'onRoomEvent' | 'subscriptions'>;
   room: RoomStore;
   ui: UiStore;

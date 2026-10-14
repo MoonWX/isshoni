@@ -1,0 +1,20 @@
+/* "Invite friends": what the link is for, then the link's card, the line while it is made, or why it isn't. */
+
+.content {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.lead {
+  color: var(--color-text-muted);
+}
+
+/* About as tall as the card's first row, so the dialog grows less when the card arrives. */
+.creating {
+  display: flex;
+  gap: var(--space-3);
+  align-items: center;
+  min-height: var(--tap-target);
+  color: var(--color-text-muted);
+}

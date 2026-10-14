@@ -8,17 +8,18 @@ import { useStore } from 'zustand';
 import { createStore } from 'zustand/vanilla';
 
 import type { PwaProvider } from '../platform/types';
+import type { CreateInviteResponse } from '../protocol/api.gen';
 import { queryKeys } from '../protocol/queryKeys';
-import { apiPath, meFixture, roomsFixture, server } from '../test/msw';
+import { apiPath, infoFixture, meFixture, roomsFixture, server } from '../test/msw';
 import { createTestPlatform } from '../test/platform';
 import { createTestServices, renderRoute } from '../test/render';
 import { RoomHeader, type RoomHeaderProps } from './RoomHeader';
 import { stubNativeDialog, twoRooms } from './testing/page';
 
-function renderHeader(props: Partial<RoomHeaderProps> = {}, pwa: PwaProvider | null = null) {
+function renderHeader(props: Partial<RoomHeaderProps> = {}, pwa: PwaProvider | null = null, info = infoFixture()) {
   const onOpenPeople = vi.fn();
   const onOpenRooms = vi.fn();
-  const services = createTestServices({ platform: createTestPlatform({ pwa }) });
+  const services = createTestServices({ platform: createTestPlatform({ pwa }), info });
   // The header's props are in a store, so that a test can render it again with other ones (setProps), as the page
   // does on every room.state.
   const current = createStore<RoomHeaderProps>(() => ({
@@ -49,6 +50,25 @@ function renderHeader(props: Partial<RoomHeaderProps> = {}, pwa: PwaProvider | n
     });
   };
   return { ...result, onOpenPeople, onOpenRooms, setProps };
+}
+
+const INVITE_LINK = 'http://localhost:3000/invite#EXAMPLEinviteTOKEN0123456789abcd';
+
+function inviteFixture(): CreateInviteResponse {
+  return {
+    url: INVITE_LINK,
+    invite: {
+      id: 'h6j8k0m2n4p6',
+      note: '',
+      createdBy: { id: 'k3m9p2qxw7ht', username: 'alex' },
+      createdAt: '2026-10-01T12:00:00.000Z',
+      expiresAt: '2026-10-08T12:00:00.000Z',
+      maxUses: 10,
+      uses: 0,
+      state: 'active',
+      redeemedBy: [],
+    },
+  };
 }
 
 const openSwitcher = () => userEvent.click(screen.getByRole('button', { name: 'Switch room' }));
@@ -226,17 +246,96 @@ describe('the account menu', () => {
     expect(screen.getByRole('button', { name: 'Sign out' })).toBeEnabled();
   });
 
-  it('gives members who may invite "Invite friends"', async () => {
+  it('gives members who may invite "Invite friends", and "My invites", a link to their invites', async () => {
     renderHeader({ me: meFixture({ createInvites: true }) });
     await openMenu();
-    expect(links()).toMatchObject({ 'Invite friends': '/admin/invites' });
+    expect(screen.getByRole('button', { name: 'Invite friends' })).toHaveAttribute('aria-haspopup', 'dialog');
+    expect(links()).toMatchObject({ 'My invites': '/admin/invites' });
     expect(links()).not.toHaveProperty('Admin');
+    expect(links()).not.toHaveProperty('Invite friends');
   });
 
-  it('gives admins "Admin" and "Invite friends"', async () => {
+  it('gives admins "Admin" and "Invite friends"; their invites are under Admin', async () => {
     renderHeader({ me: meFixture({ admin: true }) });
     await openMenu();
-    expect(links()).toMatchObject({ Admin: '/admin', 'Invite friends': '/admin/invites' });
+    expect(screen.getByRole('button', { name: 'Invite friends' })).toBeInTheDocument();
+    expect(links()).toMatchObject({ Admin: '/admin' });
+    expect(links()).not.toHaveProperty('My invites');
+  });
+
+  // 03 §7.9: while registration is closed, creating an invite is refused to everyone, admins too.
+  it('offers no "Invite friends" to an admin while registration is closed', async () => {
+    renderHeader({ me: meFixture({ admin: true }) }, null, infoFixture({ registration: 'closed' }));
+    await openMenu();
+    expect(screen.queryByRole('button', { name: 'Invite friends' })).not.toBeInTheDocument();
+    expect(links()).toMatchObject({ Admin: '/admin' });
+  });
+
+  it('offers no "Invite friends" to a member while registration is closed, but still "My invites"', async () => {
+    renderHeader({ me: meFixture({ createInvites: true }) }, null, infoFixture({ registration: 'closed' }));
+    await openMenu();
+    expect(screen.queryByRole('button', { name: 'Invite friends' })).not.toBeInTheDocument();
+    // They still see and revoke their invites there.
+    expect(links()).toMatchObject({ 'My invites': '/admin/invites' });
+  });
+
+  it('"Invite friends" closes the menu and opens the invite card with a new invite; closing it returns the focus to the menu’s button', async () => {
+    const bodies: unknown[] = [];
+    // The server answers once the test looked at the focus: the link takes it when it arrives.
+    let answer: () => void = () => undefined;
+    const answered = new Promise<void>((resolve) => {
+      answer = resolve;
+    });
+    server.use(
+      http.post(apiPath('/api/v1/invites'), async ({ request }) => {
+        bodies.push(await request.json());
+        await answered;
+        return HttpResponse.json(inviteFixture(), { status: 201 });
+      }),
+    );
+    const dialogs = stubNativeDialog();
+    try {
+      renderHeader({ me: meFixture({ createInvites: true }) });
+      await openMenu();
+      await userEvent.click(screen.getByRole('button', { name: 'Invite friends' }));
+      expect(screen.queryByRole('dialog', { name: 'Account menu' })).not.toBeInTheDocument();
+      // The entry went with the menu: the dialog gives the focus back to the menu's button, which stays.
+      expect(screen.getByRole('button', { name: /^Account menu/ })).toHaveFocus();
+
+      const invite = screen.getByRole('dialog', { name: 'Invite friends' });
+      expect(within(invite).getByText('Making an invite link…')).toBeInTheDocument();
+      answer();
+      expect(await within(invite).findByRole('textbox', { name: 'Invite link' })).toHaveValue(INVITE_LINK);
+      expect(bodies).toEqual([{}]);
+
+      await userEvent.click(within(invite).getByRole('button', { name: 'Done' }));
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      expect(dialogs.closes).toEqual([{ title: 'Invite friends', inPage: true }]);
+    } finally {
+      dialogs.restore();
+    }
+  });
+
+  it('keeps a link it made on screen when the permission goes meanwhile', async () => {
+    server.use(http.post(apiPath('/api/v1/invites'), () => HttpResponse.json(inviteFixture(), { status: 201 })));
+    const dialogs = stubNativeDialog();
+    try {
+      const { setProps } = renderHeader({ me: meFixture({ createInvites: true }) });
+      await openMenu();
+      await userEvent.click(screen.getByRole('button', { name: 'Invite friends' }));
+      const invite = screen.getByRole('dialog', { name: 'Invite friends' });
+      expect(await within(invite).findByRole('textbox', { name: 'Invite link' })).toHaveValue(INVITE_LINK);
+
+      // An admin turned membersCanInvite off: ['me'] says so now (03 §10).
+      setProps({ me: meFixture() });
+      expect(within(invite).getByRole('textbox', { name: 'Invite link' })).toHaveValue(INVITE_LINK);
+      await userEvent.click(within(invite).getByRole('button', { name: 'Done' }));
+      expect(dialogs.closes).toEqual([{ title: 'Invite friends', inPage: true }]);
+      await openMenu();
+      expect(screen.queryByRole('button', { name: 'Invite friends' })).not.toBeInTheDocument();
+    } finally {
+      dialogs.restore();
+    }
   });
 
   it('closes when a link is followed', async () => {
