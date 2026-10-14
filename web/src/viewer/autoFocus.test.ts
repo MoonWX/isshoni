@@ -15,9 +15,9 @@ import {
   type FocusState,
 } from './autoFocus';
 
-/** A share that started `minute` minutes into the hour. */
-function share(id: string, minute: number, userId = `u_${id}`, own = false): FocusShare {
-  return { id, userId, startedAt: `2026-10-12T19:${String(minute).padStart(2, '0')}:00.000Z`, own };
+/** A share that started `minute` minutes into the hour; with sound unless `audio` is false. */
+function share(id: string, minute: number, userId = `u_${id}`, own = false, audio = true): FocusShare {
+  return { id, userId, startedAt: `2026-10-12T19:${String(minute).padStart(2, '0')}:00.000Z`, own, audio };
 }
 
 function run(events: FocusEvent[], from: FocusState = initialFocusState()): FocusState {
@@ -30,6 +30,8 @@ const ended = (...shareIds: string[]): FocusEvent => ({ type: 'shareEnded', shar
 const replaced = (s: FocusShare, replaces: string): FocusEvent => ({ type: 'shareReplaced', share: s, replaces });
 const pick = (shareId: string): FocusEvent => ({ type: 'userFocus', shareId });
 const ids = (s: FocusState): string[] => s.shares.map((x) => x.id);
+/** The speaker button of another tile (viewerStore.setAudible): heard without being focused. */
+const listenTo = (s: FocusState, shareId: string): FocusState => ({ ...s, audibleShareId: shareId, soundDue: null });
 
 const A = share('a', 1);
 const B = share('b', 2);
@@ -43,6 +45,7 @@ describe('auto-focus', () => {
       focusedShareId: null,
       focusMode: 'auto',
       audibleShareId: null,
+      soundDue: null,
       pendingFocusParam: null,
       ended: [],
     });
@@ -165,9 +168,6 @@ describe('a pick (owner decision: a new share only gets a toast)', () => {
 });
 
 describe('audio follows focus (05 §12.3)', () => {
-  /** The speaker button of another tile: heard without being focused. */
-  const listenTo = (s: FocusState, shareId: string): FocusState => ({ ...s, audibleShareId: shareId });
-
   it('keeps the share the user listens to when the focus moves by itself', () => {
     let s = listenTo(run([live(A), live(B)]), 'a');
     s = run([live(C)], s);
@@ -189,6 +189,192 @@ describe('audio follows focus (05 §12.3)', () => {
   it('goes silent when the one listened to ends and the stage shows the own preview', () => {
     const s = listenTo(run([live(A), live(MINE), pick('mine')]), 'a');
     expect(run([ended('a')], s)).toMatchObject({ focusedShareId: 'mine', audibleShareId: null });
+  });
+});
+
+describe('a share without sound is never the one heard (README S72)', () => {
+  /** Bo shares a window without its sound. */
+  const QUIET = share('quiet', 5, 'u_bo', false, false);
+
+  it('takes the stage by itself, and then nothing is heard', () => {
+    let s = run([live(A)]);
+    expect(s).toMatchObject({ focusedShareId: 'a', audibleShareId: 'a' });
+    s = run([live(QUIET)], s);
+    expect(s).toMatchObject({ focusedShareId: 'quiet', audibleShareId: null, focusMode: 'auto' });
+    // Its sound follows the focus again to the next share that has one.
+    expect(run([live(share('c', 6))], s)).toMatchObject({ focusedShareId: 'c', audibleShareId: 'c' });
+    expect(run([ended('quiet')], s)).toMatchObject({ focusedShareId: 'a', audibleShareId: 'a', focusMode: 'auto' });
+  });
+
+  it('is silent when it is the only share', () => {
+    expect(run([live(QUIET)])).toMatchObject({ focusedShareId: 'quiet', audibleShareId: null });
+  });
+
+  it('gives no sound to a pick of it: the sound goes with the focus', () => {
+    const s = run([live(QUIET), live(C), pick('quiet')]);
+    expect(s).toMatchObject({ focusedShareId: 'quiet', focusMode: 'manual', audibleShareId: null });
+    expect(run([pick('c')], s)).toMatchObject({ focusedShareId: 'c', audibleShareId: 'c' });
+    // A pick of it again, where nothing changes but the sound of a speaker button, still takes that sound away.
+    expect(run([pick('quiet')], listenTo(s, 'c'))).toMatchObject({ focusedShareId: 'quiet', audibleShareId: null });
+  });
+
+  it('keeps a sound chosen with a speaker button while the focus moves to it by itself', () => {
+    const s = run([live(QUIET)], listenTo(run([live(A), live(B)]), 'a'));
+    expect(s).toMatchObject({ focusedShareId: 'quiet', audibleShareId: 'a' });
+  });
+
+  it('leaves nothing heard when the share listened to ends while it has the stage', () => {
+    const s = listenTo(run([live(A), live(QUIET)]), 'a');
+    expect(run([ended('a')], s)).toMatchObject({ focusedShareId: 'quiet', audibleShareId: null });
+  });
+
+  it('is heard once its audio track arrives, when it has the stage and nothing else is heard', () => {
+    // Live before its audio track arrived (ShareInfo.audio says, once live, whether one did), and after.
+    const early = share('b', 5, 'u_bo', false, false);
+    const B5 = share('b', 5, 'u_bo');
+    let s = run([live(A), live(early)]);
+    expect(s).toMatchObject({ focusedShareId: 'b', audibleShareId: null });
+    s = run([live(B5)], s);
+    expect(s).toMatchObject({ focusedShareId: 'b', audibleShareId: 'b' });
+    expect(ids(s)).toEqual(['b', 'a']);
+    // Not over a sound the user chose, and not when it isn't on the stage.
+    expect(run([live(B5)], listenTo(run([live(A), live(early)]), 'a'))).toMatchObject({ audibleShareId: 'a' });
+    expect(run([live(B5)], run([live(A), live(early), pick('a')]))).toMatchObject({
+      focusedShareId: 'a',
+      audibleShareId: 'a',
+    });
+  });
+
+  it('gives the sound back to the stage when the share heard loses its own', () => {
+    const s = listenTo(run([live(A), live(C)]), 'a');
+    const silentA = { ...A, audio: false };
+    expect(run([live(silentA)], s)).toMatchObject({ focusedShareId: 'c', audibleShareId: 'c' });
+    // On the stage itself: nothing is heard then.
+    expect(run([live({ ...C, audio: false })], run([live(A), live(C)]))).toMatchObject({
+      focusedShareId: 'c',
+      audibleShareId: null,
+    });
+  });
+
+  it('takes no sound from the share it replaces, and gives it to the stage meanwhile', () => {
+    const quietA2 = share('a2', 30, A.userId, false, false);
+    // The replaced share was on the stage: the stage moves, and nothing is heard.
+    expect(run([replaced(quietA2, 'a')], run([live(A), live(B), pick('a')]))).toMatchObject({
+      focusedShareId: 'a2',
+      audibleShareId: null,
+      soundDue: 'a2',
+    });
+    // It was heard through its speaker button: the sound goes back to the stage.
+    expect(run([replaced(quietA2, 'a')], listenTo(run([live(A), live(B)]), 'a'))).toMatchObject({
+      focusedShareId: 'b',
+      audibleShareId: 'b',
+      soundDue: 'a2',
+    });
+    // It had ended: the re-publish gets the stage back, and nothing is heard, as when the old tile was still there.
+    expect(run([replaced(quietA2, 'a')], run([live(A), live(B), pick('a'), ended('a')]))).toMatchObject({
+      focusedShareId: 'a2',
+      focusMode: 'manual',
+      audibleShareId: null,
+      soundDue: 'a2',
+    });
+  });
+});
+
+// ShareInfo.audio is what the server receives now (01 §8.5), not a promise: a share that has sound shows up without
+// it for a while, at its first live when the first video keyframe beats the first audio packet, and while its
+// sharer's PC is rebuilt. The share the sound belongs to is owed it (soundDue) and gets it when its audio arrives,
+// unless the sound went elsewhere in between: then it is heard as if it had had sound all along.
+describe('a share whose sound comes late or goes for a while', () => {
+  const quiet = (s: FocusShare): FocusShare => ({ ...s, audio: false });
+
+  it('gives the sound back to a share chosen with its speaker button once it has sound again', () => {
+    let s = listenTo(run([live(A), live(B)]), 'a');
+    s = run([live(quiet(A))], s);
+    // Meanwhile the stage is heard.
+    expect(s).toMatchObject({ focusedShareId: 'b', audibleShareId: 'b', soundDue: 'a' });
+    s = run([live(A)], s);
+    expect(s).toMatchObject({ focusedShareId: 'b', audibleShareId: 'a', soundDue: null });
+  });
+
+  it('gives the sound to the share on the stage once it has sound again', () => {
+    let s = run([live(A), live(B)]);
+    s = run([live(quiet(B))], s);
+    expect(s).toMatchObject({ focusedShareId: 'b', audibleShareId: null, soundDue: 'b' });
+    s = run([live(B)], s);
+    expect(s).toMatchObject({ focusedShareId: 'b', audibleShareId: 'b', soundDue: null });
+  });
+
+  it('gives the sound to a re-publish of the share heard once its sound arrives (01 §10.6)', () => {
+    const a2 = share('a2', 30, A.userId);
+    // The replaced share had ended (a server restart), and the re-publish is live before its audio track arrived.
+    let s = run([live(A), live(B), pick('a'), ended('a')]);
+    expect(s).toMatchObject({ focusedShareId: 'b', audibleShareId: 'b' });
+    s = run([replaced(quiet(a2), 'a')], s);
+    expect(s).toMatchObject({ focusedShareId: 'a2', focusMode: 'manual', audibleShareId: null, soundDue: 'a2' });
+    s = run([live(a2)], s);
+    expect(s).toMatchObject({ focusedShareId: 'a2', focusMode: 'manual', audibleShareId: 'a2', soundDue: null });
+    // The same when the replaced share still had its tile, and when it was heard through its speaker button.
+    s = run([replaced(quiet(a2), 'a'), ended('a'), live(a2)], run([live(A), live(B), pick('a')]));
+    expect(s).toMatchObject({ focusedShareId: 'a2', audibleShareId: 'a2', soundDue: null });
+    s = run([ended('a'), replaced(quiet(a2), 'a')], listenTo(run([live(A), live(B)]), 'a'));
+    expect(s).toMatchObject({ focusedShareId: 'b', audibleShareId: 'b', soundDue: 'a2' });
+    expect(run([live(a2)], s)).toMatchObject({ focusedShareId: 'b', audibleShareId: 'a2', soundDue: null });
+  });
+
+  it('lets a pick made meanwhile win', () => {
+    const s = run([live(quiet(A))], listenTo(run([live(A), live(B), live(C)]), 'a'));
+    expect(s).toMatchObject({ focusedShareId: 'c', audibleShareId: 'c', soundDue: 'a' });
+    // A pick of the stage itself, which changes nothing that is heard now, is still a choice.
+    let after = run([pick('c'), live(A)], s);
+    expect(after).toMatchObject({ focusedShareId: 'c', audibleShareId: 'c', soundDue: null });
+    after = run([pick('b'), live(A)], s);
+    expect(after).toMatchObject({ focusedShareId: 'b', audibleShareId: 'b', soundDue: null });
+  });
+
+  it('lets a speaker button pressed meanwhile win', () => {
+    const s = run([live(quiet(A))], listenTo(run([live(A), live(B), live(C)]), 'a'));
+    expect(run([live(A)], listenTo(s, 'b'))).toMatchObject({
+      focusedShareId: 'c',
+      audibleShareId: 'b',
+      soundDue: null,
+    });
+  });
+
+  it('lets a focus change that the sound follows win', () => {
+    // The stage's share goes quiet, then a newer share takes the stage and the sound by itself.
+    let s = run([live(A), live(quiet(A)), live(B)]);
+    expect(s).toMatchObject({ focusedShareId: 'b', audibleShareId: 'b', soundDue: null });
+    s = run([live(A)], s);
+    expect(s).toMatchObject({ focusedShareId: 'b', audibleShareId: 'b' });
+  });
+
+  it('forgets the share owed the sound when it ends', () => {
+    let s = run([live(quiet(A))], listenTo(run([live(A), live(B)]), 'a'));
+    s = run([ended('a')], s);
+    expect(s).toMatchObject({ focusedShareId: 'b', audibleShareId: 'b', soundDue: null });
+    // Its re-publish gets the sound back, as one of a share that was heard (it was, for the user).
+    const a2 = share('a2', 30, A.userId);
+    expect(run([replaced(a2, 'a')], s)).toMatchObject({ focusedShareId: 'b', audibleShareId: 'a2', soundDue: null });
+    // On the stage: the next share takes it, with its sound.
+    s = run([live(A), live(B), live(quiet(B)), ended('b')]);
+    expect(s).toMatchObject({ focusedShareId: 'a', audibleShareId: 'a', soundDue: null });
+  });
+
+  it("keeps the sound owed to the stage's share when the user enlarges their own preview", () => {
+    const s = run([live(A), live(MINE), live(quiet(MINE))]);
+    expect(s).toMatchObject({ focusedShareId: 'a', audibleShareId: 'a', soundDue: null });
+    // The stage's share is quiet and owed the sound: a pick of the own share keeps that.
+    const t = run([live(quiet(A)), pick('mine')], s);
+    expect(t).toMatchObject({ focusedShareId: 'mine', audibleShareId: null, soundDue: 'a' });
+    expect(run([live(A)], t)).toMatchObject({ focusedShareId: 'mine', audibleShareId: 'a', soundDue: null });
+  });
+
+  it('changes nothing for a share that always had sound', () => {
+    const s = run([live(A), live(B), pick('a'), live({ ...A, startedAt: A.startedAt })]);
+    expect(s).toMatchObject({ focusedShareId: 'a', audibleShareId: 'a', soundDue: null });
+    // An event that changes nothing returns the same state, also while a share is owed the sound.
+    const due = run([live(quiet(B))], run([live(A), live(B)]));
+    expect(run([pick('zz'), ended('zz'), live(due.shares[0] as FocusShare)], due)).toBe(due);
   });
 });
 
