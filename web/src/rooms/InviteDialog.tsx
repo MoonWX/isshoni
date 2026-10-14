@@ -50,7 +50,8 @@ export interface InviteDialogProps {
 
 /**
  * The card's "once" text for a member: their way to /admin/invites is the menu's "My invites". An admin's is
- * Admin → Invites, the card's own text.
+ * Admin → Invites, the card's own text. check:i18n doesn't see a key passed as a prop (InviteLinkCardProps.onceKey):
+ * InviteDialog.test asserts the member's full text instead.
  */
 const MEMBER_ONCE_KEY = 'room.invite.once';
 

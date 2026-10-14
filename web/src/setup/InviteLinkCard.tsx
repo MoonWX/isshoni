@@ -41,6 +41,8 @@ export interface InviteLinkCardProps {
    * The message key of the text that says the link can't be shown again and where to find the invite and make
    * another: a <Trans> message whose `<a>…</a>` becomes the link to /admin/invites. Its text names that page as the
    * user's menu does. Default `setup.inviteCard.once`, "under Admin → Invites", for an admin (the wizard).
+   * check:i18n reads only literal keys (t('…'), i18nKey="…"), so it doesn't check a key given here: the caller's
+   * test asserts the card's text, which shows the bare key when the catalog lacks it.
    */
   onceKey?: string;
   className?: string;
