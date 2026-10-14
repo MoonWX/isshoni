@@ -135,6 +135,13 @@ export const RateLimitMinWaitMs = 30_000;
 export const ReconnectCloseCode = 4000;
 
 /**
+ * The close code of dropSocket() (05 §10.7). Like every client code but 1000 and 1001 it keeps the server's grace
+ * (01 §4.2), so the server sees a network drop; and neither side uses it otherwise, so the server's log and its close
+ * count tell such a drop apart from the client's own reconnects (4000) and from a failed network (1006).
+ */
+export const DropSocketCloseCode = 3000;
+
+/**
  * The backoff delay for attempt n (n = 0 for the first retry after a drop, 01 §10.2):
  * min(10 s, 0.5 s × 2ⁿ) × U(0.8, 1.2), clamped to [0.5 s, 10 s]. random follows Math.random: [0, 1).
  */
@@ -312,6 +319,19 @@ export class SignalClient {
   /** Skips the current backoff wait (05's Retry button), except a rate-limit wait (01 §10.2). Backoff only. */
   retryNow(): void {
     this.#skipWait();
+  }
+
+  /**
+   * Drops the socket as a network failure would: 05 §10.7's window.__isshoni.dropSocket(), for the reconnect test.
+   * It closes with DropSocketCloseCode (3000), which keeps the server's grace, and goes on as after any drop: pending
+   * requests reject with connection_lost, backoff, and the next hello carries the resume token, so the connection
+   * comes back with the same id (resumed: true). A socket still connecting or handshaking is dropped the same way.
+   * No-op without a socket (backoff, stopped).
+   */
+  dropSocket(): void {
+    if (this.#ws !== undefined) {
+      this.#end({}, DropSocketCloseCode);
+    }
   }
 
   /**
@@ -562,9 +582,9 @@ export class SignalClient {
 
   /**
    * The socket is done: pick backoff or stopped (01 §10.1; the server's error decides, the close code is the fallback,
-   * §12.2), drop the socket and fail the pending requests.
+   * §12.2), close the socket with closeWith (when it is still open) and fail the pending requests.
    */
-  #end(cause: EndCause): void {
+  #end(cause: EndCause, closeWith: number = ReconnectCloseCode): void {
     if (cause.error === undefined && cause.closeCode === CloseCodeMessageTooBig) {
       // 01 §12.2: backoff, log. This client sent a message over the server's read limit: a bug worth seeing.
       report('SignalClient: the server closed with 1009 (a message over its read limit)', undefined);
@@ -584,7 +604,7 @@ export class SignalClient {
         this.#rateLimitWaitMs = Math.max(RateLimitMinWaitMs, error.retryAfterMs ?? 0);
       }
     }
-    this.#dropSocket(ReconnectCloseCode);
+    this.#closeSocket(closeWith);
     const info: SignalStateInfo = error !== undefined ? { error } : {};
     if (stop) {
       this.#removePageListeners();
@@ -627,7 +647,7 @@ export class SignalClient {
     if (this.#state === 'stopped') {
       return;
     }
-    this.#dropSocket(CloseCodeNormal);
+    this.#closeSocket(CloseCodeNormal);
     this.#backoffTimer.clear();
     this.#resumeToken = undefined;
     this.#state = 'stopped';
@@ -635,7 +655,7 @@ export class SignalClient {
   }
 
   /** Detaches and closes the current socket, stops its timers and rejects the pending requests. */
-  #dropSocket(closeCode: number): void {
+  #closeSocket(closeCode: number): void {
     const ws = this.#ws;
     this.#ws = undefined;
     this.#helloId = undefined;

@@ -1,10 +1,12 @@
 // The stats' side of the room runtime (05 §10.7): the collector samples the viewer's sub PC while the session is in
-// a room, and window.__isshoni exists in a tab with the debug flag, with a fresh sample per tile and the page's
-// state. The viewer's freeze watch reads the same samples (05 §12.6). The runtime's own media is used (no fakes for
-// the sub PC), so this also checks that the viewer knows the session's sub PC.
+// a room, and window.__isshoni exists in a tab with the debug flag, with a fresh sample per tile, the page's state,
+// and a dropSocket() that drops the runtime's signaling socket. The viewer's freeze watch reads the same samples
+// (05 §12.6). The runtime's own media is used (no fakes for the sub PC), so this also checks that the viewer knows
+// the session's sub PC.
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { DEBUG_FLAG_KEY } from '../lib/stats/debugHandle';
+import { BackoffMaxMs, DropSocketCloseCode } from '../protocol/signal-client';
 import { FakeSignalServer } from '../protocol/testing';
 import type { PCOffer } from '../protocol/types.gen';
 import { buildSdp, FakeRTCPeerConnection } from '../test/FakeRTCPeerConnection';
@@ -139,9 +141,29 @@ describe('window.__isshoni (05 §10.7)', () => {
     expect(sample?.shares['s_bo']?.video).toMatchObject({ frameWidth: 1920, frameHeight: 1080, framesDecoded: 600 });
   });
 
-  it('dropSocket() is not there yet', async () => {
+  it('dropSocket() drops the signaling socket with 3000, and the connection resumes with the same id', async () => {
     await start(true);
-    expect(() => window.__isshoni?.dropSocket()).toThrow(/S81/);
+    const connectionId = runtime.stores.room.getState().connectionId;
+    expect(connectionId).not.toBeNull();
+    // The server still has the connection in the lounge when it resumes it.
+    server.welcomeDefaults = { roomId: 'lounge' };
+
+    window.__isshoni?.dropSocket();
+    expect(server.sockets[0]?.clientClose?.code).toBe(DropSocketCloseCode);
+    expect(runtime.signal.state).toBe('backoff');
+
+    await tick(BackoffMaxMs);
+    expect(runtime.signal.state).toBe('ready');
+    expect(server.sockets).toHaveLength(2);
+    expect(server.welcomes[1]).toMatchObject({ resumed: true, connectionId });
+    expect((window.__isshoni?.state() as RoomDebugState).connection).toEqual({
+      state: 'ready',
+      resumed: true,
+      connectionId,
+    });
+    // Resumed into its room: no second room.join.
+    expect(hub.joins).toEqual(['lounge']);
+    expect(runtime.stores.room.getState().joinState).toBe('joined');
   });
 });
 

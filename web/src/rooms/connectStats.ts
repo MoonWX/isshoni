@@ -11,13 +11,15 @@
 //   collector exists until the runtime goes: it is what puts "Waiting for video…" on a tile whose picture stands
 //   still. It comes with the same chunk.
 // - The handle exists only in a tab with sessionStorage['isshoni.debug'] === '1' (lib/stats/debugHandle.ts). Its
-//   state() has ids and states and no names: nothing the page doesn't show. dropSocket() needs a public hook on 01's
-//   SignalClient, which it doesn't have yet, so the handle's dropSocket() still throws; reconnect.spec drops the
-//   socket with the harness's cut link instead (e2e/fixtures.ts), which is how a network drops it.
+//   state() has ids and states and no names: nothing the page doesn't show. Its dropSocket() is the tab's
+//   SignalClient.dropSocket(): the socket closes with 3000, which the server treats as a network drop, and the
+//   client resumes the connection as after any drop. (reconnect.spec drops the socket with the harness's cut link,
+//   e2e/fixtures.ts, which is how a network drops it.)
 import type { Logger } from '../lib/log';
 import type { StatsCollector } from '../lib/stats/collector';
 import { installDebugHandle } from '../lib/stats/debugHandle';
 import type { KeyValueStore } from '../platform/types';
+import type { SignalClient } from '../protocol/signal-client';
 import type { ViewerServices } from '../viewer/services';
 import { viewerDebugState, viewerStatsSources } from '../viewer/stats';
 import type { ConnectionStore } from './connection';
@@ -28,6 +30,8 @@ export interface ConnectStatsDeps {
   viewer: ViewerServices;
   room: RoomStore;
   connection: ConnectionStore;
+  /** The tab's SignalClient: the debug handle's dropSocket() drops its socket. */
+  signal: Pick<SignalClient, 'dropSocket'>;
   /** platform.storage.session: holds the debug flag. */
   storage: Pick<KeyValueStore, 'get'>;
   log: Logger;
@@ -105,6 +109,9 @@ export function connectStats(deps: ConnectStatsDeps): () => void {
     storage: deps.storage,
     stats: () => get().then((c) => c.snapshot()),
     state: () => debugState(deps),
+    dropSocket: () => {
+      deps.signal.dropSocket();
+    },
     ...(deps.target ? { target: deps.target } : {}),
   });
 

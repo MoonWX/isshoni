@@ -3,10 +3,9 @@
 // see in the debug overlay (05 §20):
 // - stats():      a fresh stats sample, per tile (lib/stats/summarize.ts); no IP addresses;
 // - state():      what the page shows: the viewer's focus and audio, the room, the connection;
-// - dropSocket(): closes the signaling socket with code 3000, which the server treats as a network drop (the
-//                 reconnect test).
+// - dropSocket(): closes the signaling socket with code 3000, which the server treats as a network drop, and the
+//                 client resumes the connection as after any drop (SignalClient.dropSocket; the reconnect test).
 // The handle is frozen and the property can't be assigned: tests read it, nothing else writes it.
-import { NotImplementedError } from '../errors';
 import type { StatsSample } from './summarize';
 
 /** The per-tab flag (platform.storage.session, 05 §6.1). */
@@ -17,7 +16,7 @@ export interface DebugHandle {
   stats(): Promise<StatsSample>;
   /** A JSON-safe snapshot of the page's state. */
   state(): unknown;
-  /** Drops the signaling socket as a network failure would. */
+  /** Drops the signaling socket as a network failure would; the connection then resumes. */
   dropSocket(): void;
 }
 
@@ -36,8 +35,9 @@ export interface DebugHandleDeps {
   /** What state() returns; the caller gathers it from its stores. */
   state: () => unknown;
   /**
-   * Closes the signaling socket with code 3000. Without it dropSocket() throws NotImplementedError: the reconnect
-   * test's slice (S81) passes the SignalClient's hook.
+   * The tab's SignalClient.dropSocket: closes the signaling socket with code 3000, and the client resumes. The room's
+   * wiring (rooms/connectStats.ts) always passes it; without it (a test of the stats alone) the handle's dropSocket()
+   * throws, so a test can't pass by dropping nothing.
    */
   dropSocket?: () => void;
   /** Where the handle goes; default window. */
@@ -60,7 +60,7 @@ export function installDebugHandle(deps: DebugHandleDeps): () => void {
     stats: () => deps.stats(),
     state: () => deps.state(),
     dropSocket: () => {
-      if (!deps.dropSocket) throw new NotImplementedError('__isshoni.dropSocket', 'S81');
+      if (!deps.dropSocket) throw new Error('window.__isshoni.dropSocket(): this page has no signaling client');
       deps.dropSocket();
     },
   });

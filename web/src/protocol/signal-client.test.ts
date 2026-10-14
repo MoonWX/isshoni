@@ -1,7 +1,7 @@
 // SignalClient and ProtocolError (01 §10.1–§10.3, §12, §16; the TypeScript cases of §19) against the fake server
 // of ./testing, with Vitest's fake timers: handshake, backoff and its reset rule, skip-wait, ping and probe, resume,
-// requests, the close-code and error → state mapping, unknown codes, stale builds, server.shutdown, the order of
-// state events when a listener changes the state, and page events.
+// dropSocket() (05 §10.7), requests, the close-code and error → state mapping, unknown codes, stale builds,
+// server.shutdown, the order of state events when a listener changes the state, and page events.
 import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
 
 import type * as api from './api.gen';
@@ -17,6 +17,7 @@ import {
   backoffDelay,
   BackoffMaxMs,
   BackoffMinMs,
+  DropSocketCloseCode,
   isDevVersion,
   isStaleBuild,
   RateLimitMinWaitMs,
@@ -498,6 +499,78 @@ describe('resume', () => {
     await tick();
     expect(server.hellos[1]?.resumeToken).toBeUndefined();
     expect(lastInfo()).toMatchObject({ resumed: false });
+  });
+});
+
+describe('dropSocket() (05 §10.7)', () => {
+  it('closes with 3000 and resumes the same connection, as after a network drop', async () => {
+    const c = await readyClient();
+    const first = server.welcomes[0];
+    const r = track(c.request('room.join', { roomId: 'lounge' }));
+    c.dropSocket();
+    expect(DropSocketCloseCode).toBe(3000);
+    expect(socketAt(0).clientClose?.code).toBe(DropSocketCloseCode);
+    expect(c.state).toBe('backoff');
+    expect(lastInfo().error).toBeUndefined();
+    await tick();
+    expect(r.error).toMatchObject({ code: LocalErrorCodeConnectionLost, local: true });
+
+    await tick(BackoffMaxMs);
+    expect(c.state).toBe('ready');
+    expect(server.sockets).toHaveLength(2);
+    expect(server.hellos[1]?.resumeToken).toBe(first?.resumeToken);
+    expect(server.welcomes[1]).toMatchObject({ resumed: true, connectionId: first?.connectionId });
+    expect(c.welcome?.connectionId).toBe(first?.connectionId);
+    expect(lastInfo()).toMatchObject({ resumed: true });
+    // One drop, one backoff: the dropped socket's own close event changes nothing.
+    expect(states()).toEqual(['connecting', 'handshaking', 'ready', 'backoff', 'connecting', 'handshaking', 'ready']);
+    // The request was not sent again (request() never retries).
+    expect(server.messages('room.join')).toHaveLength(1);
+  });
+
+  it('backs off like after any drop, and online skips the wait', async () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.5); // no jitter
+    const c = await readyClient();
+    c.dropSocket();
+    expect(lastInfo()).toEqual({ delayMs: BackoffMinMs, rateLimited: false });
+    window.dispatchEvent(new Event('online'));
+    await tick();
+    expect(c.state).toBe('ready');
+    expect(server.welcomes[1]?.resumed).toBe(true);
+  });
+
+  it('drops a socket that is still handshaking like a failed attempt', async () => {
+    server.autoWelcome = false;
+    const c = makeClient();
+    c.start();
+    await tick();
+    expect(c.state).toBe('handshaking');
+    c.dropSocket();
+    expect(c.state).toBe('backoff');
+    expect(socketAt(0).clientClose?.code).toBe(DropSocketCloseCode);
+    server.autoWelcome = true;
+    await tick(BackoffMaxMs);
+    expect(c.state).toBe('ready');
+    expect(server.sockets).toHaveLength(2);
+  });
+
+  it('is a no-op without a socket: stopped, or in backoff', async () => {
+    const c = makeClient();
+    c.dropSocket();
+    expect(c.state).toBe('stopped');
+    expect(server.sockets).toHaveLength(0);
+    expect(log).toEqual([]);
+
+    c.start();
+    await tick();
+    server.drop();
+    await tick();
+    expect(c.state).toBe('backoff');
+    const seen = log.length;
+    c.dropSocket();
+    expect(c.state).toBe('backoff');
+    expect(log).toHaveLength(seen);
+    expect(server.sockets).toHaveLength(1);
   });
 });
 
