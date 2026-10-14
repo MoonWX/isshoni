@@ -1,0 +1,188 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+#
+# The release build (docs/m1/06-deploy-and-ci.md §9.2, "06" below): goreleaser OSS v2, the version that
+# .tool-versions pins, built into .bin/ from tools/goreleaser/go.mod by `task release:goreleaser`.
+#
+# The asset names are an interface (06 §3): install.sh, the site and the docs build URLs from them, and
+# `task release:assets` checks them after every run (CI job goreleaser-check, release.yml's build job).
+#
+#   task release:snapshot                    the local dry run: the web app, then a snapshot without signing,
+#                                            SBOMs or publishing, then the asset check
+#   .bin/goreleaser check                    the config alone
+#
+# A snapshot is versioned by ISSHONI_SNAPSHOT_VERSION, which `task release:snapshot` sets (and builds the web app
+# for). A bare `goreleaser release --snapshot` falls back to <next patch>-dev.<commit>, and the before hook then
+# stops at its web/dist check, because no web app was built for that version.
+version: 2
+project_name: isshoni
+
+before:
+  hooks:
+    # No npm here: the privileged release job runs no third-party JavaScript. The hook checks that web/dist (built
+    # by release.yml's unprivileged web job, or by `task release:snapshot`) is for this version, then writes
+    # THIRD_PARTY_NOTICES and the stamped dist-extra/install.sh (06 §7.2).
+    - task release:prepare VERSION={{ .Version }}
+
+snapshot:
+  version_template: >-
+    {{ if index .Env "ISSHONI_SNAPSHOT_VERSION" }}{{ .Env.ISSHONI_SNAPSHOT_VERSION }}{{ else }}{{ incpatch .Version }}-dev.{{ .ShortCommit }}{{ end }}
+
+builds:
+  - id: isshoni
+    main: ./cmd/isshoni
+    binary: isshoni
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    # The flags of `task build:go` (06 §7.2): the same three values, the commit date in UTC.
+    ldflags:
+      - -s -w
+      - -X github.com/MoonWX/isshoni/internal/version.version={{ .Version }}
+      - -X github.com/MoonWX/isshoni/internal/version.commit={{ .FullCommit }}
+      - -X github.com/MoonWX/isshoni/internal/version.date={{ .CommitDate }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: server
+    ids: [isshoni]
+    name_template: "isshoni_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    # Owned by root and dated by the commit, wherever the archive is built. install.sh unpacks with
+    # --no-same-owner and installs each file with its own owner and mode (06 §4.4).
+    builds_info:
+      owner: root
+      group: root
+      mode: 0755
+      mtime: "{{ .CommitDate }}"
+    # At the root of the archive, with their repository paths: install.sh takes deploy/... from there (06 §3).
+    files:
+      - &archived { src: LICENSE, info: { owner: root, group: root, mtime: "{{ .CommitDate }}" } }
+      - { <<: *archived, src: NOTICE }
+      # Written by the before hook (`task notices`); gitignored, never committed (06 §8.4).
+      - { <<: *archived, src: THIRD_PARTY_NOTICES }
+      # A pattern, not the plain name: the repository has no README.md yet, and goreleaser fails on a plain name that
+      # matches nothing. The archive takes it as soon as it exists, and `task release:assets` then requires it.
+      - { <<: *archived, src: "README.m[d]" }
+      - { <<: *archived, src: deploy/systemd/isshoni.service }
+      - { <<: *archived, src: deploy/sysctl/60-isshoni.conf }
+      - { <<: *archived, src: deploy/firewall/ufw-isshoni }
+      - { <<: *archived, src: deploy/firewall/firewalld-isshoni.xml }
+
+nfpms:
+  - id: packages
+    ids: [isshoni]
+    package_name: isshoni
+    file_name_template: "{{ .ConventionalFileName }}"
+    formats: [deb, rpm]
+    homepage: https://moonwx.github.io/isshoni/
+    # The owner's GitHub noreply address (06 §5): no personal e-mail address in the repository.
+    maintainer: "MoonWX <19631498+MoonWX@users.noreply.github.com>"
+    description: Self-hosted screen and system-audio sharing for friend groups.
+    license: Apache-2.0
+    section: net
+    bindir: /usr/bin
+    mtime: "{{ .CommitDate }}"
+    # The files of 06 §5.
+    contents:
+      - { src: deploy/systemd/isshoni.service, dst: /usr/lib/systemd/system/isshoni.service }
+      - { src: deploy/sysctl/60-isshoni.conf, dst: /usr/lib/sysctl.d/60-isshoni.conf }
+      - { src: deploy/firewall/ufw-isshoni, dst: /etc/ufw/applications.d/isshoni, type: config }
+      - { src: deploy/firewall/firewalld-isshoni.xml, dst: /usr/lib/firewalld/services/isshoni.xml }
+      - { dst: /etc/isshoni, type: dir, file_info: { mode: 0755 } }
+      - { src: THIRD_PARTY_NOTICES, dst: /usr/share/doc/isshoni/THIRD_PARTY_NOTICES }
+      - { src: NOTICE, dst: /usr/share/doc/isshoni/NOTICE }
+      - { src: LICENSE, dst: /usr/share/doc/isshoni/LICENSE }
+    # The maintainer scripts of README S62 (06 §5). Firewalld: the packages never reload it on install or upgrade.
+    # A reload drops every runtime-only rule the admin has, so postinstall.sh prints `firewall-cmd --reload` before
+    # `--add-service=isshoni` instead, for the admin to run; preremove.sh reloads only after it took the service out
+    # of a zone or policy, which closes the ports it opened.
+    scripts:
+      preinstall: deploy/packaging/preinstall.sh
+      postinstall: deploy/packaging/postinstall.sh
+      preremove: deploy/packaging/preremove.sh
+      postremove: deploy/packaging/postremove.sh
+    # preinstall.sh creates the isshoni user with groupadd and useradd, before the package's files are unpacked:
+    # dpkg runs a preinst only after its Pre-Depends are configured; rpm orders a Requires before the package.
+    deb:
+      predepends: [passwd]
+    rpm:
+      # rpm records the build machine's host name; a fixed one keeps it out of the package.
+      buildhost: isshoni
+    overrides:
+      rpm:
+        dependencies: [shadow-utils]
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+  extra_files:
+    - glob: dist-extra/install.sh
+    - glob: deploy/compose.yaml
+    - glob: deploy/compose.host.yaml
+
+sboms:
+  - id: archives
+    artifacts: archive # syft → <archive>.sbom.json (SPDX JSON)
+
+signs:
+  - id: cosign-checksums # keyless (GitHub OIDC); the ssh signature comes from release.yml's protected sign job
+    cmd: cosign
+    artifacts: checksum
+    signature: "${artifact}.sigstore.json"
+    args: [sign-blob, "--bundle=${signature}", "${artifact}", "--yes"]
+
+# Built and pushed in one step at a release (`ghcr.io/moonwx/isshoni:<v>` only; the floating tags move after the
+# owner's approval, in release.yml's publish job). In a snapshot goreleaser builds one image per platform, tagged
+# <v>-amd64 and <v>-arm64, loads them into the local Docker and pushes nothing. The build context holds
+# linux/<arch>/isshoni and the extra files at their repository paths, as deploy/docker/Dockerfile expects (and as
+# deploy/docker/test/docker-build.sh lays it out for CI).
+dockers_v2:
+  - id: server
+    ids: [isshoni]
+    dockerfile: deploy/docker/Dockerfile
+    images: [ghcr.io/moonwx/isshoni]
+    tags: ["{{ .Version }}"]
+    platforms: [linux/amd64, linux/arm64]
+    extra_files: [deploy/docker/rootfs, LICENSE, NOTICE, THIRD_PARTY_NOTICES]
+    sbom: true
+    labels:
+      org.opencontainers.image.title: isshoni
+      org.opencontainers.image.description: Self-hosted screen and system-audio sharing
+      org.opencontainers.image.source: https://github.com/MoonWX/isshoni
+      org.opencontainers.image.licenses: Apache-2.0
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.created: "{{ .CommitDate }}"
+
+release:
+  github: { owner: MoonWX, name: isshoni }
+  # A draft until the owner approved, the sign job signed and the verify job installed it (06 §9.3). The publish
+  # job decides GitHub's "latest": only a final release takes it, never a prerelease.
+  draft: true
+  replace_existing_draft: true
+  prerelease: auto
+  make_latest: false
+  extra_files:
+    - glob: dist-extra/install.sh
+    - glob: deploy/compose.yaml
+    - glob: deploy/compose.host.yaml
+  # The owner edits the TODOs on the draft; release.yml's publish job refuses a body that still has one.
+  header: |
+    ## isshoni {{ .Version }}
+    **Upgrade:** run the installer again, or `docker compose pull && docker compose up -d`.
+    **Database migration:** TODO yes/no   **Protocol:** v1 (TODO bump?)   **Security fixes:** TODO
+    <!-- TODO: keep the next line only for a security release; 04's release check reads it -->
+    <!-- isshoni:security -->
+    Verify downloads: https://moonwx.github.io/isshoni/security#verify
+  footer: |
+    Release signing keys: https://moonwx.github.io/isshoni/security#keys
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude: ["^docs:", "^test:", "^ci:", "^chore\\(deps\\)"]

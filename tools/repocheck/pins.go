@@ -21,7 +21,18 @@ var pinnedTools = []struct {
 	{name: "shfmt", module: "mvdan.cc/sh/v3"},
 }
 
-// checkPins compares .tool-versions with go.mod and tools/go.mod. It reports every difference at once.
+// goreleaser is built into .bin/ from a module of its own, tools/goreleaser/go.mod (`task release:goreleaser`): its
+// go directive is newer than the repository's, and its dependency graph would raise versions the other tools share.
+// That module's toolchain line and its goreleaser version follow .tool-versions like the others.
+const (
+	goreleaserPin    = "goreleaser"
+	goreleaserModule = "github.com/goreleaser/goreleaser/v2"
+)
+
+var goreleaserModFile = filepath.Join("tools", "goreleaser", "go.mod")
+
+// checkPins compares .tool-versions with go.mod, tools/go.mod and tools/goreleaser/go.mod. It reports every
+// difference at once.
 func checkPins(root string) error {
 	pins, err := readToolVersions(filepath.Join(root, ".tool-versions"))
 	if err != nil {
@@ -35,6 +46,10 @@ func checkPins(root string) error {
 	if err != nil {
 		return err
 	}
+	goreleaserMod, err := readModFile(root, goreleaserModFile)
+	if err != nil {
+		return err
+	}
 
 	var problems []string
 	if goPin, ok := pins["golang"]; !ok {
@@ -44,7 +59,7 @@ func checkPins(root string) error {
 		for _, m := range []struct {
 			name string
 			file *modfile.File
-		}{{"go.mod", mainMod}, {"tools/go.mod", toolsMod}} {
+		}{{"go.mod", mainMod}, {"tools/go.mod", toolsMod}, {"tools/goreleaser/go.mod", goreleaserMod}} {
 			switch got := toolchain(m.file); got {
 			case want:
 			case "":
@@ -68,8 +83,19 @@ func checkPins(root string) error {
 			problems = append(problems, fmt.Sprintf("tools/go.mod has %s %s but .tool-versions pins %s %s", t.module, got, t.name, pin))
 		}
 	}
+	if pin, ok := pins[goreleaserPin]; !ok {
+		problems = append(problems, ".tool-versions has no goreleaser line")
+	} else {
+		switch got := requiredVersion(goreleaserMod, goreleaserModule); got {
+		case "v" + pin:
+		case "":
+			problems = append(problems, fmt.Sprintf("tools/goreleaser/go.mod does not require %s (.tool-versions: goreleaser %s)", goreleaserModule, pin))
+		default:
+			problems = append(problems, fmt.Sprintf("tools/goreleaser/go.mod has %s %s but .tool-versions pins goreleaser %s", goreleaserModule, got, pin))
+		}
+	}
 	if len(problems) > 0 {
-		return fmt.Errorf("the pins differ:\n  - %s\nChange .tool-versions, go.mod and tools/go.mod together", strings.Join(problems, "\n  - "))
+		return fmt.Errorf("the pins differ:\n  - %s\nChange .tool-versions, go.mod, tools/go.mod and tools/goreleaser/go.mod together", strings.Join(problems, "\n  - "))
 	}
 	return nil
 }

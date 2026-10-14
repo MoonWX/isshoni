@@ -8,9 +8,9 @@
 # yet (web/ before the web client lands, for example) is skipped too. The run summary of the
 # changes job says why each job runs or not.
 #
-# Jobs for parts that land later (distro, goreleaser-check and site of 06 §8.2) come with
-# those parts: each adds a `decide` line to the changes job and, when it gates the merge, its
-# id to ci-ok's needs.
+# Jobs for parts that land later (distro and site of 06 §8.2) come with those parts: each
+# adds a `decide` line to the changes job and, when it gates the merge, its id to ci-ok's
+# needs.
 #
 # Rules for every workflow (06 §8.1): a read-only token by default, with jobs raising their
 # own permissions; third-party actions pinned by full commit SHA with a version comment;
@@ -67,6 +67,7 @@ jobs:
       run-lint-deploy: ${{ steps.plan.outputs.run-lint-deploy }}
       run-acme: ${{ steps.plan.outputs.run-acme }}
       run-docker-smoke: ${{ steps.plan.outputs.run-docker-smoke }}
+      run-goreleaser-check: ${{ steps.plan.outputs.run-goreleaser-check }}
       run-govulncheck: ${{ steps.plan.outputs.run-govulncheck }}
       # Task's pin from .tool-versions (06 §7.1). Go comes from go.mod, Node from .tool-versions.
       task-version: ${{ steps.plan.outputs.task-version }}
@@ -107,6 +108,7 @@ jobs:
               - '.goreleaser.yaml'
               - '.github/workflows/release.yml'
               - 'deploy/packaging/**'
+              - 'tools/goreleaser/**'
             site:
               - 'docs/**'
               - 'web/src/conntest/codes.json'
@@ -146,6 +148,8 @@ jobs:
           if [ "$deploy" = true ]; then go_web_or_deploy=true; fi
           docker_deploy_or_release=$deploy
           if [ "$docker" = true ] || [ "$release" = true ]; then docker_deploy_or_release=true; fi
+          deploy_or_release=$deploy
+          if [ "$release" = true ]; then deploy_or_release=true; fi
           {
             echo "go=$go"
             echo "web=$web"
@@ -211,6 +215,12 @@ jobs:
             cmd/isshoni tools/go.mod tools/notices web/package.json web/package-lock.json \
             deploy/docker/Dockerfile deploy/docker/test/docker-smoke.sh \
             deploy/compose.yaml deploy/compose.host.yaml
+          # 06 §8.2 runs goreleaser-check on release changes. Its other inputs are deploy changes:
+          # the files the archives and packages ship, install.sh (the before hook stamps it), the
+          # release tasks in Taskfile.yml and this workflow.
+          decide goreleaser-check "$deploy_or_release" Taskfile.yml .tool-versions go.mod .goreleaser.yaml \
+            tools/goreleaser/go.mod cmd/isshoni tools/notices web/package.json web/package-lock.json \
+            deploy/install.sh deploy/docker/Dockerfile
           decide govulncheck "$go" Taskfile.yml .tool-versions tools/go.mod
 
           task_version=''
@@ -898,6 +908,80 @@ jobs:
       - name: task docker:smoke
         run: task docker:smoke
 
+  goreleaser-check:
+    # The release build of .goreleaser.yaml as a snapshot (06 §8.2, §9.2). `task release:snapshot`
+    # builds the pinned goreleaser (tools/goreleaser) and the web app for the snapshot's version,
+    # runs `goreleaser check`, then `goreleaser release --snapshot` without signing, SBOMs or
+    # publishing: the two images are built and loaded here, never pushed. Then `task
+    # release:assets` asserts the asset list of 06 §3: the names, checksums.txt, the archives'
+    # contents, the packages' files and dependencies, and the version that this runner's binary
+    # reports. The task's last step starts this runner's image and checks its version too.
+    #
+    # The snapshot carries this run's CI version (0.0.0-ci.<run>), not a dev version.
+    needs: changes
+    if: needs.changes.outputs.run-goreleaser-check == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      ISSHONI_SNAPSHOT_VERSION: 0.0.0-ci.${{ github.run_number }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # one cache per job below: setup-go's key is shared by every job
+
+      - name: Cache Go modules and builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum', '.tool-versions') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+
+      # The pinned goreleaser and Task's checksum of its module: on a hit `task release:goreleaser`
+      # is up to date, and goreleaser's large module graph is neither downloaded nor compiled. No
+      # restore-keys: a binary of another version would only be rebuilt.
+      - name: Cache the pinned goreleaser
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .bin/goreleaser
+            .task/checksum/release-goreleaser
+          key: goreleaser-bin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/goreleaser/go.mod', 'tools/goreleaser/go.sum') }}
+
+      - name: Set up Node (version from .tool-versions)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Set up Task
+        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: ${{ needs.changes.outputs.task-version }}
+
+      - name: npm ci
+        run: npm ci --prefix web --no-audit --no-fund
+
+      - name: Install rpm (release:assets lists the rpm packages and their dependencies with it)
+        run: |
+          if ! command -v rpm > /dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends rpm
+          fi
+          rpm --version
+
+      - name: task release:snapshot
+        run: task release:snapshot
+
   govulncheck:
     needs: changes
     if: needs.changes.outputs.run-govulncheck == 'true'
@@ -950,7 +1034,8 @@ jobs:
     # The only required check (06 §8.6). It fails when a gating job failed or was cancelled;
     # a skipped job counts as a pass. always(), so it also reports when a job it needs failed.
     if: always()
-    needs: [changes, lint-go, test-go, web, protocol, licenses, build, e2e, lint-deploy, acme, docker-smoke]
+    needs:
+      [changes, lint-go, test-go, web, protocol, licenses, build, e2e, lint-deploy, acme, docker-smoke, goreleaser-check]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     permissions: {}
