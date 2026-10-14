@@ -2165,7 +2165,10 @@ choice:
   `TestSnapshotGolden` (`testdata/golden/snapshot.json`, with exact rates from a hand-fed media path and the test's
   clock), `TestTotalsOutliveTheirObjects` (every total wired by hand driven to a value of its own, and kept after
   the share ends), `TestDownTrackTick`, `TestPionLogs`, `TestHoldsAddress` and `TestDowngradeReasons`;
-  integrations 12 and 13 read `codec_mismatch`, `decoder_unavailable` and `decoder_failed` from `Metrics`.
+  integrations 4 and 19 also read the repair and duplicate totals from `Metrics` (`NACKReceived`, `NACKServed` and
+  the egress `rtx` packets at least what the DownTracks counted, with some egress `rtx` bytes; `IngressDuplicates`
+  at least what the layers counted), and integrations 12 and 13 read `codec_mismatch`, `decoder_unavailable` and
+  `decoder_failed`.
 
 ## 14. Code reuse and attribution
 
@@ -2487,7 +2490,8 @@ with `fake.Source`, `sfutest.Viewer`)**
    payload, nothing arrives twice on the media stream, the DownTrack's repair counters show no miss and no queue
    drop, and the sub PC's round-trip time has been read: the test wants a value above 0 and under a second, no
    tighter (a loaded machine stretches one STUN round trip on loopback a long way). The second viewer sees no gap
-   and sends no NACK.
+   and sends no NACK. Since README S79 the SFU's `Metrics` must show at least the NACKs and retransmissions that the
+   DownTracks counted (`NACKReceived`, `NACKServed`, egress `rtx` packets), and some egress `rtx` bytes.
 5. `TestSRTranslationAndAVOffset`: |flash − beep| ≤ 5 ms after 10 layer switches and 5 audio off/on cycles; forwarded
    SR RTP equals upstream RTP + offset.
 6. `TestPaddingNoGaps`: the publisher injects padding-only packets; the viewer sees no seq gaps and sends no NACKs.
@@ -2561,16 +2565,17 @@ with `fake.Source`, `sfutest.Viewer`)**
     already delivered on its RTX stream, as Chrome does for padding and probes; each viewer receives every seq exactly
     once and sends no extra NACKs; `isshoni_sfu_ingress_duplicates_total` counts the copies. A packet dropped on the
     publish side and then recovered by RTX still reaches every viewer once.
-    As README S63 wrote it (`repair_test.go`; the metric is README S79's, so the test reads the same count from
-    `SFU.Ingress`, `LayerState.Duplicates`): two viewers, one on `f` and one on `q`, get every sequence number once
-    in whole frames while the publisher sends a second copy of each frame's last packet on its RTX stream (at
-    least 60 on `f`, 30 on `q`), and the SFU counts every copy. Then the publisher's own socket (a `FaultConn`
-    under its UDP mux) loses at least 20 packets that no second copy covers. Only the SFU's NACKs bring them
-    back, on the same RTX stream, and the requests for each stop when it is back, because the pub PC's NACK filter
-    takes out what the cache holds (§8.1, §9.5): the test wants at most three resends per lost packet on average,
-    room for a loaded machine (on loopback it is one each: 20 resends for 20 lost packets, 200 before the filter).
-    Every gap closes for both viewers, and what the SFU forwards arrives once; a copy on the viewer's RTX stream can
-    only be the answer to that viewer's own NACK.
+    As README S63 wrote it (`repair_test.go`; the metric came with README S79, so the test reads the same count from
+    `SFU.Ingress`, `LayerState.Duplicates`, and since README S79 also checks that `Metrics.IngressDuplicates` is at
+    least the layers' sum after the loss): two viewers, one on `f` and one on `q`, get every sequence number once in
+    whole frames while the publisher sends a second copy of each frame's last packet on its RTX stream (at least 60
+    on `f`, 30 on `q`), and the SFU counts every copy. Then the publisher's own socket (a `FaultConn` under its UDP
+    mux) loses at least 20 packets that no second copy covers. Only the SFU's NACKs bring them back, on the same RTX
+    stream, and the requests for each stop when it is back, because the pub PC's NACK filter takes out what the
+    cache holds (§8.1, §9.5): the test wants at most three resends per lost packet on average, room for a loaded
+    machine (on loopback it is one each: 20 resends for 20 lost packets, 200 before the filter). Every gap closes
+    for both viewers, and what the SFU forwards arrives once; a copy on the viewer's RTX stream can only be the
+    answer to that viewer's own NACK.
 
 **The frame checks and a layer switch** (README S52, `sfutest/checks.go`). An SFU switches on the first packet of
 the new layer's keyframe (§9.4), and the two layers are read by different goroutines, so that packet can reach a
@@ -2838,14 +2843,15 @@ Still to come in the paths S69 touched: the codec downgrade counters of §13 (`i
 reason, README S79). README S79 built them since: integrations 12 and 13 read them from `Metrics`.
 
 **What README S79 built** (slice 12; `stats.go`, `counters.go`, `pionlog.go`, with `observability_test.go` and
-`stats_test.go`). `Conn.Stats`, `SFU.Snapshot` and `SFU.Metrics` report everything of §13 but what slice 11 adds (the
-downlink estimate and the `bandwidth` downgrades) and `server_limit`, which is later. §13 "What README S79 settled"
-has the rules it chose: totals per SFU that Layers and DownTracks count into, so counters never go back; transport and
-RTT only while a PC is connected, the pub PC's RTT read too; every label in `Snapshot`'s totals; what counts as a
-layer switch and as a downgrade; the log levels, with Pion's info lines and its lines that hold an address at debug.
-It also reads the viewer's receiver reports for `DownTrackStats.LossPct` (§9.3) and gives each DownTrack its bitrate
-on the ticker. The SFU's count of handshake timeouts moved into its totals. Its one handover outside the package,
-netx's Pion info lines at info when the log level is debug, the group 11 integration fixed (04 §7.3).
+`stats_test.go`, and `Metrics` checks added to `repair_test.go` and `firefox_test.go`). `Conn.Stats`, `SFU.Snapshot`
+and `SFU.Metrics` report everything of §13 but what slice 11 adds (the downlink estimate and the `bandwidth`
+downgrades) and `server_limit`, which is later. §13 "What README S79 settled" has the rules it chose: totals per SFU
+that Layers and DownTracks count into, so counters never go back; transport and RTT only while a PC is connected, the
+pub PC's RTT read too; every label in `Snapshot`'s totals; what counts as a layer switch and as a downgrade; the log
+levels, with Pion's info lines and its lines that hold an address at debug. It also reads the viewer's receiver
+reports for `DownTrackStats.LossPct` (§9.3) and gives each DownTrack its bitrate on the ticker. The SFU's count of
+handshake timeouts moved into its totals. Its one handover outside the package, netx's Pion info lines at info when
+the log level is debug, the group 11 integration fixed (04 §7.3).
 
 ## Decisions taken at integration (formerly open questions)
 

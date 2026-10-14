@@ -1306,7 +1306,7 @@ vars:
 | `release:goreleaser` (README S73) | `go -C tools/goreleaser build -o ../../.bin/ github.com/goreleaser/goreleaser/v2` with `CGO_ENABLED=0` | the pinned goreleaser (7.1); rebuilt only when `tools/goreleaser/go.mod` or `go.sum` changed (Task `sources`/`generates`) |
 | `release:snapshot` | `build:web`, then `goreleaser release --snapshot --clean --skip=sign,sbom`; both get `ISSHONI_SNAPSHOT_VERSION` (default `0.0.0-dev.<12-char commit>`), as `VERSION` for `build:web` and as env for goreleaser. As README S73 built it: first `release:goreleaser` and `goreleaser check`; `CLI_ARGS` go on to goreleaser (`task release:snapshot -- --skip=docker` leaves out the images); then `release:assets` for that version, and the image for this machine's CPU must start and report it. The images are built (9.2: one per platform, `<v>-amd64` and `<v>-arm64`, loaded locally, never pushed) and removed again when the task ends, passed or not; `KEEP_IMAGES=true` keeps them | local dry run; `goreleaser-check` and the distro tests use it too |
 | `release:assets` (README S73) | checks `dist/` after a goreleaser run against §3 for `VERSION=<v>`: the asset names (each one GitHub keeps as it is), `checksums.txt` (exactly the summed files, each once, with the right hash), the stamped `dist-extra/install.sh`, every archive's files, this machine's binary's version, and each package's files, version (`~` before a prerelease), architecture and dependencies (rpm's with `rpm` where it is installed). `FULL=true` (a release) also wants the SBOMs, the cosign bundle and `README.md` | run by `release:snapshot`, CI's `goreleaser-check` and release.yml's `build` (`FULL=true`) |
-| `release:keys` (README S73) | writes `deploy/keys/allowed_signers` into install.sh's key block, then `lint:keys`, and prints each key's fingerprint. It refuses, before it writes anything, a missing or empty file, a private key, a line that is not `isshoni-release namespaces="isshoni-checksums" ssh-ed25519 …`, a single quote anywhere and a missing final newline | the owner's step 2 of `deploy/keys/README.md` (9.4) |
+| `release:keys` (README S73) | checks `deploy/keys/allowed_signers` and prints each key's fingerprint, writes the file into install.sh's key block, then runs `lint:keys`. It refuses, before it writes anything, a missing or empty file, a private key, a line that is not `isshoni-release namespaces="isshoni-checksums" ssh-ed25519 …`, a key that `ssh-keygen` does not read, a single quote anywhere and a missing final newline. From README F11 on, lint:keys' README.md check runs after the write, so the first run ends with an error until the root `README.md` lists the printed fingerprints (deploy/keys/README.md step 2, 10.3) | the owner's step 2 of `deploy/keys/README.md` (9.4) |
 | `release:compat` | `task release:compat VERSION=<v>` (`<v>` is the tag without `v`, e.g. `0.2.0`): copies `internal/protocol/testdata/v1` to `internal/protocol/testdata/compat/<v>/`, then deletes all but the two newest final-release snapshots (SemVer order). Fails unless `VERSION` is a final `X.Y.Z`: prereleases (`-rc.N`) get no snapshot, and a forgotten `VERSION=` leaves the dev version, which fails too. It also refuses, changing nothing, a `VERSION` older than the two snapshots it would keep, a missing `testdata/v1`, and a `compat/` that holds anything but `X.Y.Z` snapshot directories (hidden files aside; a link counts as anything) | 01 §14.3. Run in the release-prep PR (9.1 "Before tagging"); release.yml checks the result (9.3). Plain `sh` and `cp`, no Go or Node. S01 writes it as a stub; S75 (01 P13) owns the body |
 | `deploy:test` | distro container tests; `DISTRO=debian-12` selects one | needs podman or Docker |
 | `docker:smoke` | section 6 smoke test (bridge with a backup → restore round trip and the IPv6 client-IP check, host, no-volume, no `.env`; 11.3) | |
@@ -1407,7 +1407,7 @@ task dev:setup-url        # in a second terminal: open the printed link, create 
 - `concurrency: ${{ github.workflow }}-${{ github.ref }}` with cancel-in-progress for PRs. One exception,
   `site.yml` (README S82), whose header says why: called from `release.yml`, `github.workflow` and `github.ref` are
   the caller's, so the group would be `release.yml`'s own, a deadlock that GitHub cancels. Its deploys are one at a
-  time through the `deploy` job's own group, `pages`, which never cancels (10.5).
+  time through the `deploy` job's own group, `pages`, which never cancels one under way (10.5).
 - `timeout-minutes` on every job.
 - **No local `gh` is needed for anything.** Secrets, environments, rulesets and Pages are set once in the GitHub web
   UI (8.6), and everything else is YAML in the repo.
@@ -1624,7 +1624,8 @@ same holds for git and PulseAudio on runners. The "no GPL" rule covers code in t
   root-relative links resolve as on Pages, and runs lychee over it; it says so and does nothing while
   `docs/package.json` doesn't exist.
 - **No caches**: like `release.yml`, the nightly builds from the module proxy and npm, and leaves `ci.yml`'s cache
-  space alone; the jobs' timeouts allow for cold builds. Its own `concurrency` group never cancels a run.
+  space alone; the jobs' timeouts allow for cold builds. Its own `concurrency` group never cancels a run under
+  way; a newer run takes the place of one that is still waiting.
 
 ### 8.6 One-time GitHub setup (owner, in the web UI)
 
@@ -2288,7 +2289,9 @@ page is written):
   re-check of the served installer and keys (10.3). Its outputs say whether Pages is on, whether a release exists,
   and the version and the installer's SHA-256.
 - **`deploy` runs only once Pages is on**, and only from `main` or a `v*` tag, which the `github-pages`
-  environment allows (8.6 step 5). Its `concurrency` group `pages` never cancels: a newer deploy waits.
+  environment allows (8.6 step 5). Its concurrency group `pages` never cancels a deploy that is under way
+  (`cancel-in-progress: false`). GitHub keeps at most one deploy waiting, and a newer one takes the waiting one's
+  place, so that run's deploy ends cancelled while the newest run serves the latest site.
 - **`check`** (a job of its own, with an explicit condition: a job-level `success()` would skip it with `deploy`)
   runs once a release exists, on `main` or a `v*` tag. It fails when `deploy` didn't succeed (Pages still off, or
   a failed deploy: the stable install URL would serve nothing or an old script) and says how to fix it; else it
