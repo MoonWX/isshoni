@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -21,7 +22,9 @@ import (
 
 	"github.com/MoonWX/isshoni/internal/logx"
 	"github.com/MoonWX/isshoni/internal/protocol/api"
+	"github.com/MoonWX/isshoni/internal/server/config"
 	"github.com/MoonWX/isshoni/internal/server/ops"
+	"github.com/MoonWX/isshoni/internal/server/ops/doctor"
 )
 
 // The client commands are tested against a real admin socket, served by ops.AdminServer inside the test process,
@@ -203,7 +206,40 @@ func (f *fakeAccounts) CreateInvite(_ context.Context, maxUses, ttlHours int) (o
 	}, nil
 }
 
-// fakeServer is a running admin socket with fake accounts and a doctor that examines a faked machine.
+// fakeSchema is the database schema of the fake server's build.
+const fakeSchema = 7
+
+// fakeDatabase is a database file for the fake server's backup and restore, which run without 03's store as ops
+// does (04 §2): SQLite's header, and then as JSON what 03's InspectFile would find in the file. app is the isshoni
+// that last used it.
+func fakeDatabase(schema int, app string) []byte {
+	return fmt.Appendf([]byte("SQLite format 3\x00"), `{"schema":%d,"app":%q}`, schema, app)
+}
+
+// fakeDBFiles are 03's file-level functions over fakeDatabase files.
+func fakeDBFiles() doctor.DBFiles {
+	return doctor.DBFiles{
+		LatestSchemaVersion: func() int { return fakeSchema },
+		Inspect: func(_ context.Context, path string) (doctor.DBInfo, error) {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return doctor.DBInfo{}, err
+			}
+			var d struct {
+				Schema int
+				App    string
+			}
+			doc, ok := strings.CutPrefix(string(data), "SQLite format 3\x00")
+			if !ok || json.Unmarshal([]byte(doc), &d) != nil {
+				return doctor.DBInfo{}, errors.New("file is not a database")
+			}
+			return doctor.DBInfo{SchemaVersion: d.Schema, LastAppVersion: d.App, HistoryOK: true}, nil
+		},
+	}
+}
+
+// fakeServer is a running admin socket with fake accounts, a doctor that examines a faked machine, and a data
+// directory of its own for backup, restore and rotate-secrets.
 type fakeServer struct {
 	path     string
 	health   *ops.Health
@@ -214,6 +250,64 @@ type fakeServer struct {
 	served   chan error
 	tlsReady atomic.Bool // the tls readiness check
 	machine  *fakeMachine
+
+	// data is the fake's data directory: a fakeDatabase, a real secrets.json and a certificate.
+	data *ops.DataDir
+	// A restore or a rotation "restarts" the fake: after restartDelay the restore's files are swapped in and the
+	// server's start time moves on, which is how the CLI tells the restarted server from the one before
+	// (waitRestarted). With stuck set it never does, like a server that does not come back.
+	started  atomic.Int64 // seconds added to fakeStatus's StartedAt
+	restarts atomic.Int32
+	stuck    atomic.Bool
+	stopping chan struct{}
+	pending  sync.WaitGroup
+}
+
+// restartDelay is how long the fake's "restart" takes.
+const restartDelay = 50 * time.Millisecond
+
+// newFakeData makes the fake's data directory below dir.
+func newFakeData(dir string) (*ops.DataDir, error) {
+	p := (&config.Config{DataDir: dir}).Paths()
+	cert := filepath.Join(p.CertMagic, "certificates", "site.crt")
+	if err := os.MkdirAll(filepath.Dir(cert), 0o700); err != nil {
+		return nil, err
+	}
+	if err := errors.Join(
+		os.WriteFile(p.DB, fakeDatabase(fakeSchema, "0.3.0"), 0o600),
+		os.WriteFile(cert, []byte("the fake's certificate"), 0o600),
+	); err != nil {
+		return nil, err
+	}
+	if _, err := config.OpenSecrets(p.Secrets, nil); err != nil {
+		return nil, err
+	}
+	return &ops.DataDir{
+		Paths: p, DB: fakeDBFiles(), Logger: slog.New(slog.DiscardHandler),
+		Snapshot: func(_ context.Context, dst string) error {
+			data, err := os.ReadFile(p.DB)
+			if err != nil {
+				return err
+			}
+			return os.WriteFile(dst, data, 0o600) //nolint:gosec // G703: a path below the fake's own data directory
+		},
+	}, nil
+}
+
+// restart is the fake's ops.AdminOptions.Restart.
+func (f *fakeServer) restart(ops.RestartReason) {
+	f.restarts.Add(1)
+	if f.stuck.Load() {
+		return
+	}
+	f.pending.Go(func() {
+		select {
+		case <-time.After(restartDelay):
+			_, _ = ops.CompleteRestore(f.data.Paths, f.data.Logger)
+			f.started.Add(3600)
+		case <-f.stopping:
+		}
+	})
 }
 
 // startFakeServer serves the admin socket at path. With rejectPeers the peer-credential filter turns everyone
@@ -225,6 +319,7 @@ func startFakeServer(path string, rejectPeers bool) (*fakeServer, error) {
 		accounts: &fakeAccounts{},
 		level:    new(slog.LevelVar),
 		served:   make(chan error, 1),
+		stopping: make(chan struct{}),
 	}
 	f.tlsReady.Store(true)
 	f.health.AddCheck("db", func() (bool, string) { return true, "" })
@@ -240,17 +335,32 @@ func startFakeServer(path string, rejectPeers bool) (*fakeServer, error) {
 	if err != nil {
 		return nil, err
 	}
+	data, err := newFakeData(filepath.Join(machine.dir, "served"))
+	if err != nil {
+		machine.remove()
+		return nil, err
+	}
+	secrets, err := config.OpenSecrets(data.Paths.Secrets, nil)
+	if err != nil {
+		machine.remove()
+		return nil, err
+	}
 	ln, err := ops.ListenAdmin(context.Background(), listen)
 	if err != nil {
 		machine.remove()
 		return nil, err
 	}
-	f.machine = machine
+	f.machine, f.data = machine, data
 	f.logLevel = ops.NewLogLevel(f.level, log)
 	f.admin = ops.NewAdminServer(ops.AdminOptions{
 		Health: f.health, Accounts: f.accounts, LogLevel: f.logLevel, Logger: log,
-		Status: func(context.Context) (api.ServerStatus, error) { return fakeStatus(), nil },
+		Status: func(context.Context) (api.ServerStatus, error) {
+			st := fakeStatus()
+			st.StartedAt = st.StartedAt.Add(time.Duration(f.started.Load()) * time.Second)
+			return st, nil
+		},
 		Doctor: ops.NewDoctor(ops.DoctorOptions{Env: machine.serverEnv, Logger: log}),
+		Data:   data, Secrets: secrets, Restart: f.restart,
 	})
 	go func() { f.served <- f.admin.Serve(ln) }()
 	return f, nil
@@ -261,6 +371,8 @@ func (f *fakeServer) stop() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	err := f.admin.Shutdown(ctx)
+	close(f.stopping)
+	f.pending.Wait()
 	f.logLevel.Close()
 	f.machine.remove()
 	return errors.Join(err, <-f.served)
@@ -378,6 +490,8 @@ func (sf *scriptFake) close() {
 //	fakeserver set shutting-down         the graceful shutdown has begun
 //	fakeserver set doctor ok|warn|fail   what doctor finds on the server's machine: nothing, socket buffer limits
 //	                                     that are too low, or a certificate that could not be had
+//	fakeserver set restart ok|stuck      whether the server comes back after a restore or rotate-secrets
+//	fakeserver show restarts|database    print how often the server was asked to restart, or what its database is
 //	fakeserver after DUR start|set …     the same, DUR from now, while the script goes on
 //	fakeserver show level|invites|links  print the log level, what invite create sent, or the setup links minted
 //	fakeserver wait level NAME           wait until the log level is NAME
@@ -494,6 +608,16 @@ func (sf *scriptFake) do(args []string, stdout io.Writer) error {
 		srv.health.SetShuttingDown()
 	case "set doctor ok", "set doctor warn", "set doctor fail":
 		srv.machine.set(arg(2))
+	case "set restart ok", "set restart stuck":
+		srv.stuck.Store(arg(2) == "stuck")
+	case "show restarts":
+		_, _ = fmt.Fprintln(stdout, srv.restarts.Load())
+	case "show database":
+		data, err := os.ReadFile(srv.data.Paths.DB)
+		if err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintln(stdout, strings.TrimPrefix(string(data), "SQLite format 3\x00"))
 	case "show level":
 		_, _ = fmt.Fprintln(stdout, strings.ToLower(srv.level.Level().String()))
 	case "show invites":

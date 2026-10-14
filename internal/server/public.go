@@ -24,15 +24,34 @@ import (
 // again on a ticker, and the ICE Transport (04 §7.3) that the SFU runs on: its options, its sockets and what the
 // server says about them.
 
-// publicRedetectEvery is how often a running server looks at its public addresses again (04 §7.4).
-const publicRedetectEvery = 10 * time.Minute
+// How often a running server looks at its public addresses again (04 §7.4).
+const (
+	// publicRedetectEvery is the pace of a server that has its site: an address that changed is only reported.
+	publicRedetectEvery = 10 * time.Minute
+	// publicRedetectWaiting is the pace of a server that started without the public address that is its site and
+	// is not ready (04 §6.2). It has nobody to serve until it finds the address, and what kept the address away
+	// (the network at boot, a STUN server) is often gone within the minute, so it looks every 30 s and restarts
+	// itself as soon as a look succeeds (publicAddrsChanged). The next process then looks at the usual pace.
+	publicRedetectWaiting = 30 * time.Second
+)
 
-// redetectInterval is publicRedetectEvery, or what a test put in its place.
+// redetectInterval is how often this server looks again: publicRedetectWaiting while it waits for its address,
+// publicRedetectEvery otherwise, or what a test put in their place. It is settled once Start knows whether the
+// server has its site.
 func (s *Server) redetectInterval() time.Duration {
-	if s.redetectEvery > 0 {
+	switch {
+	case s.redetectEvery > 0:
 		return s.redetectEvery
+	case s.awaitsAddress:
+		return publicRedetectWaiting
+	default:
+		return publicRedetectEvery
 	}
-	return publicRedetectEvery
+}
+
+// watchPublic is the server's look at its public addresses, at its pace, until ctx ends (startBackground).
+func (s *Server) watchPublic(ctx context.Context) {
+	watchPublicAddrs(ctx, s.redetectInterval(), s.public, s.redetectPublicAddrs, s.publicAddrsChanged)
 }
 
 // inContainer reports whether the server runs in a container (04 §5.1). Public-address detection and the Transport

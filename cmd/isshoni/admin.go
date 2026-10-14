@@ -14,8 +14,7 @@ import (
 )
 
 // The admin commands talk to the running server over its admin socket (04 §12). backup and restore also work
-// offline, on the data directory of a stopped server (04 §12.6). backup, restore and rotate-secrets come with a
-// later slice of the M1 plan (README S65).
+// offline, on the data directory of a stopped server (04 §12.6); they and rotate-secrets are in backup.go.
 
 func adminCmd() *command {
 	return &command{
@@ -194,10 +193,6 @@ func adminBackupCmd() *command {
 	}
 }
 
-func runAdminBackup(context.Context, *invocation, backupOptions, []string) error {
-	return errNotImplemented
-}
-
 type restoreOptions struct {
 	clientOptions
 	yes, offline bool
@@ -210,7 +205,9 @@ func adminRestoreCmd() *command {
 		summary: "Restore a backup archive or a pre-migration database, then restart the server",
 		help: "Restores a backup archive (.tar.gz), or only the database from a pre-migration backups/pre-*.db file, " +
 			"and restarts the server. It asks for confirmation on a terminal; otherwise --yes is required. With - " +
-			"the archive comes from stdin, so --yes is always required.",
+			"the archive comes from stdin, so --yes is always required. The state from before the restore is kept " +
+			"as backups/pre-restore-<time>.tar.gz in the data directory. With --offline, for a server that can't " +
+			"start, run it as the service user while the server is stopped, and start the server afterwards.",
 		minArgs: 1,
 		maxArgs: 1,
 		config:  true,
@@ -220,10 +217,6 @@ func adminRestoreCmd() *command {
 			o.register(fs)
 		}, runAdminRestore),
 	}
-}
-
-func runAdminRestore(context.Context, *invocation, restoreOptions, []string) error {
-	return errNotImplemented
 }
 
 func adminUsersCmd() *command {
@@ -433,10 +426,6 @@ func adminRotateSecretsCmd() *command {
 			o.register(fs)
 		}, runRotateSecrets),
 	}
-}
-
-func runRotateSecrets(context.Context, *invocation, confirmOptions, []string) error {
-	return errNotImplemented
 }
 
 type logLevelOptions struct {

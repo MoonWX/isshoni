@@ -2,9 +2,10 @@
 // config and version.
 //
 // Exit codes (04 §3.2): 0 success, 1 runtime error, 2 usage error, 4 server not reachable on the admin socket,
-// 5 doctor found a failure, 7 refused (a precondition is not met), 75 restart required on a platform without re-exec,
-// 78 a configuration or data problem that a restart can't fix (EX_CONFIG: systemd stops retrying), 130 interrupted.
-// healthcheck exits only 0 or 1, because Docker's HEALTHCHECK reserves 2.
+// 5 doctor found a failure, 7 refused (a precondition is not met), 75 restart required where the server could not
+// re-exec itself (Windows, or an exec that failed), 78 a configuration or data problem that a restart can't fix
+// (EX_CONFIG: systemd stops retrying), 130 interrupted. healthcheck exits only 0 or 1, because Docker's HEALTHCHECK
+// reserves 2.
 package main
 
 import (
@@ -30,20 +31,27 @@ const (
 	exitUnreachable = 4  // no server on the admin socket, or permission denied on it
 	exitDoctorFail  = 5  // doctor: at least one fail (with --strict, also a warn)
 	exitRefused     = 7  // precondition not met: setup_unavailable, backup newer than this binary, …
-	exitRestart     = 75 // serve on a platform without re-exec (Windows): restart required after a restore
+	exitRestart     = 75 // serve could not re-exec itself (Windows, or the exec failed): restart required
 	exitConfig      = 78 // EX_CONFIG: invalid config, schema newer than the binary, corrupt secrets, no data volume
 	exitInterrupted = 130
 )
 
 func main() {
-	os.Exit(runMain(&invocation{stdout: os.Stdout, stderr: os.Stderr, environ: os.Environ()}))
+	os.Exit(runMain(processInvocation()))
+}
+
+// processInvocation is the invocation of the real process: its streams and environment, and the re-exec with
+// which serve restarts itself in place (04 §6.5).
+func processInvocation() *invocation {
+	return &invocation{stdin: os.Stdin, stdout: os.Stdout, stderr: os.Stderr, environ: os.Environ(), reexec: reexecServe}
 }
 
 // runMain runs the process's command line with inv and returns the exit code. The test scripts start the CLI
 // through it too, with an invocation of their own.
 func runMain(inv *invocation) int {
 	// SIGINT cancels ctx. Once it has, the default handling is back, so a second Ctrl-C ends the process at once.
-	// serve adds its own handling of SIGTERM and of the second signal (04 §6.4); SIGHUP comes with README S90.
+	// serve adds its own handling of SIGTERM and of the second signal (04 §6.4), and of SIGHUP, which it only
+	// answers with a log line until the reload of 04 §6.5 exists (README S90).
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	context.AfterFunc(ctx, stop)
 	code := run(ctx, inv, os.Args[1:])
@@ -53,9 +61,25 @@ func runMain(inv *invocation) int {
 
 // invocation carries the process's streams and environment to the commands, so tests can run them in-process.
 type invocation struct {
+	stdin   io.Reader // nil reads as empty: a restore from "-" takes its archive here, a confirmation its answer
 	stdout  io.Writer
 	stderr  io.Writer
 	environ []string // os.Environ form; config commands read the ISSHONI_* names (04 §4.2)
+
+	// stdinTTY says whether stdin is a terminal, where a destructive command asks before it acts (04 §3.1). nil
+	// means: look at the file.
+	stdinTTY func() bool
+	// reexec replaces the process by a new run of itself when the server asked for a restart (04 §6.5); it returns
+	// only when that failed. nil means that this invocation can't: a test that runs serve inside its own process
+	// must not replace it, and serve then exits 75.
+	reexec func() error
+	// geteuid is the effective uid, which the offline commands refuse when it is root's (04 §12.6). nil means
+	// os.Geteuid.
+	geteuid func() int
+	// hostRoot is where the files that mark a container are looked for (/.dockerenv, /run/.containerenv; 04 §5.1),
+	// for the commands that print a command line in the environment's form. "" means the real root; tests point it
+	// at an empty directory, so that their result does not depend on where they run.
+	hostRoot string
 
 	// args is the command line as typed, without the program name; run sets it. The "run it with sudo" message
 	// repeats it (04 §12.1).
@@ -126,9 +150,6 @@ type clientOptions struct {
 func (o *clientOptions) register(fs *flag.FlagSet) {
 	fs.StringVar(&o.socket, "socket", "", "admin socket `PATH` (default: listen.admin_socket from the config, /run/isshoni/admin.sock)")
 }
-
-// errNotImplemented is returned by commands whose behavior later slices of the M1 plan add (docs/m1/README.md).
-var errNotImplemented = errors.New("not implemented in this build yet")
 
 // root returns the command tree.
 func root() *command {

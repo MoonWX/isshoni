@@ -86,8 +86,12 @@ const (
 func (r ShutdownReason) restarts() bool { return r == ShutdownRestart || r == ShutdownRestore }
 
 // ErrRestartRequested is returned by Run after a full graceful shutdown for ShutdownRestart or ShutdownRestore.
-// cmd/isshoni then re-execs the binary; the PID stays the same, so systemd and Docker see no exit (04 §6.5).
+// cmd/isshoni then re-execs the binary (Reexec); the PID stays the same, so systemd and Docker see no exit
+// (04 §6.5).
 var ErrRestartRequested = errors.New("server: restart requested")
+
+// ErrNoReexec is Reexec's error on a platform that can't replace a running process by a new run of itself.
+var ErrNoReexec = errors.New("server: this platform has no re-exec")
 
 // ErrShutdownForced marks the error of a shutdown in which a step ran out of time and closed by force what it
 // still had: a request that would not finish, say. The server is stopped and everything is released all the same.
@@ -102,16 +106,20 @@ var errStopped = errors.New("server: already shut down; build a new Server")
 // NeedsOperator reports whether err, from New, Start or Run, is a refusal to start that a restart can't fix
 // (04 §6.3): an invalid config (a policy key whose value the settings refuse included), a container without a data
 // volume, a data directory or lock file the process can't write, an admin socket directory it can't create, a
-// corrupt or wrongly owned secrets.json, and a database that 03's store can't bring to this binary's schema: one
-// that a newer isshoni wrote, a failed migration, a corrupt file (store.ErrNeedsOperator). cmd/isshoni prints such an
-// error (it carries its own fix line) and exits 78, on which systemd stops restarting. Any other error is a runtime
-// error (exit 1): a busy port, a data directory locked by another isshoni (config.ErrDataDirLocked).
-// config.ReasonOf(err) gives the reason code for the data-directory and secrets refusals.
+// corrupt or wrongly owned secrets.json, a database that 03's store can't bring to this binary's schema: one
+// that a newer isshoni wrote, a failed migration, a corrupt file (store.ErrNeedsOperator), and a restore whose swap
+// only the operator can put right: a restore/plan.json that can't be used, or a file that is both in the data
+// directory and among the ones the restore moved away (ops.ErrRestoreNeedsOperator; the data directory may be half
+// swapped, so nothing opens it). cmd/isshoni prints such an error (it carries its own fix line) and exits 78, on
+// which systemd stops restarting. Any other error is a runtime error (exit 1): a busy port, a data directory locked
+// by another isshoni (config.ErrDataDirLocked). config.ReasonOf(err) gives the reason code for the data-directory
+// and secrets refusals.
 //
 // A certificate that can't be had is neither: the server starts, and is not ready until it has one (04 §6.2, §8.4).
 func NeedsOperator(err error) bool {
 	var ve *config.ValidationError
-	return errors.Is(err, config.ErrNeedsOperator) || errors.Is(err, store.ErrNeedsOperator) || errors.As(err, &ve)
+	return errors.Is(err, config.ErrNeedsOperator) || errors.Is(err, store.ErrNeedsOperator) ||
+		errors.Is(err, ops.ErrRestoreNeedsOperator) || errors.As(err, &ve)
 }
 
 // Addrs are the addresses the server listens on, as bound: a configured port 0 (tests) shows as the port the
@@ -363,6 +371,13 @@ func (s *Server) Start(ctx context.Context) (err error) {
 	if s.lock, err = config.LockDataDir(ctx, paths); err != nil {
 		return err
 	}
+	// A restore whose file swap was interrupted (a crash, a kill) is completed now, before anything reads the files
+	// it replaces: secrets.json in step 3, the database in step 4 (04 §12.4 "Crash safety"). An error means the
+	// data directory may be half swapped, and nothing must open it; one that only the operator can put right is a
+	// refusal (NeedsOperator).
+	if err := ops.RecoverRestore(paths, s.log); err != nil {
+		return err
+	}
 	if !s.deps.InProcess {
 		config.ApplyMemoryLimit(s.deps.Host, s.log)
 	}
@@ -382,7 +397,7 @@ func (s *Server) Start(ctx context.Context) (err error) {
 	// candidates name (04 §7.5), and the TLS modes need them for more: ip mode's site and certificate are the
 	// address, manual mode's site is it too when there is no domain, and auto mode compares its domain's DNS records
 	// with it. Off mode takes its site from public_url, or localhost in dev. The running server looks again every
-	// ten minutes (startBackground).
+	// ten minutes, and every 30 s while it waits for the address that is its site (startBackground).
 	mode := s.cfg.EffectiveTLSMode()
 	if s.hookDetect != nil {
 		s.public = s.hookDetect()
@@ -468,6 +483,13 @@ func (s *Server) Start(ctx context.Context) (err error) {
 		s.serveTLS(s.httpSrv, s.mux.TLS())
 		s.serve(s.plainSrv, newLimitListener(s.httpLn, s.cfg.Limits.ConnsPerIP))
 	}
+	// The server runs on what the last restore put in place, and nothing from here on can fail the start: the
+	// files from before that restore are no longer needed (04 §12.4 step 7). Their pre-restore backup stays in
+	// backups/. This comes before the admin socket takes its first request: the next restore, which a script may
+	// send the moment the socket answers, must find the last one finished, not finishing.
+	if err := ops.FinishRestore(paths, s.log); err != nil {
+		s.log.Warn("could not remove what the last restore kept of the previous state", logx.Err(err))
+	}
 	s.startBackground()
 	s.state, s.served = stateServing, true
 
@@ -491,7 +513,8 @@ func (s *Server) Start(ctx context.Context) (err error) {
 
 // startBackground starts what the server does on its own while it runs: the admin socket's API (04 §6.1 step 9),
 // 03's janitor, doctor's own runs, 20 s from now and then once a day (04 §13.1), and the look at the public
-// addresses every ten minutes (04 §7.4). The admin socket's goroutine ends with its Shutdown, the others with s.run.
+// addresses every ten minutes, or every 30 s while the server waits for the address that is its site (04 §7.4).
+// The admin socket's goroutine ends with its Shutdown, the others with s.run.
 func (s *Server) startBackground() {
 	admin, ln := s.admin, s.adminLn
 	s.background.Go(func() {
@@ -504,10 +527,7 @@ func (s *Server) startBackground() {
 	if accounts := s.accounts; accounts != nil {
 		s.background.Go(func() { accounts.RunJanitor(s.run) })
 	}
-	every, first := s.redetectInterval(), s.public
-	s.background.Go(func() {
-		watchPublicAddrs(s.run, every, first, s.redetectPublicAddrs, s.publicAddrsChanged)
-	})
+	s.background.Go(func() { s.watchPublic(s.run) })
 }
 
 // logConfigWarnings writes the config's warnings to the log, one line each with the key and the fix, so they reach
@@ -774,6 +794,13 @@ func (s *Server) shutdown(ctx context.Context, reason ShutdownReason, draining f
 	})
 	if err != nil {
 		errs = append(errs, stepError(storeCtx, "store", err))
+	} else if _, err := ops.CompleteRestore(s.cfg.Paths(), s.log); err != nil {
+		// A restore that the admin socket accepted has left its plan (04 §12.4 step 5): now that the store is closed,
+		// the WAL is in the database file and the TLS manager writes no more, the files are swapped, still under the
+		// data-directory lock. Whatever the shutdown is for: the plan stands, and a server that is only stopped
+		// starts on the restored state next time. A swap that fails here, or that is skipped because the store did
+		// not close in time, is completed by the next start (ops.RecoverRestore).
+		errs = append(errs, fmt.Errorf("server: shutdown: restore: %w", err))
 	}
 
 	// Last: the data-directory lock, so that the process that follows (a re-exec, the next start) can take it.

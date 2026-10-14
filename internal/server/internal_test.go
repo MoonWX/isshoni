@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,6 +14,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
+	"syscall"
 	"testing"
 	"testing/fstest"
 	"testing/synctest"
@@ -370,5 +373,63 @@ func TestShutdownReasonRestarts(t *testing.T) {
 		if got := reason.restarts(); got != want {
 			t.Errorf("%q.restarts() = %v, want %v", reason, got, want)
 		}
+	}
+}
+
+// codedError has a result code, as the SQLite driver's error has.
+type codedError int
+
+func (e codedError) Error() string { return fmt.Sprintf("sqlite: result code %d", int(e)) }
+func (e codedError) Code() int     { return int(e) }
+
+// TestDiskFull: a snapshot that fails because SQLite ran out of disk reads as a full disk (syscall.ENOSPC), which
+// is what ops answers with 507 insufficient_storage and never takes for a database that can't be read. The driver's
+// own error is made here by a database that may not grow.
+func TestDiskFull(t *testing.T) {
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "small.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	db.SetMaxOpenConns(1) // the page limit is the connection's
+	ctx := t.Context()
+	for _, stmt := range []string{`PRAGMA max_page_count = 8`, `CREATE TABLE t (x BLOB)`} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	_, full := db.ExecContext(ctx, `INSERT INTO t VALUES (zeroblob(1 << 20))`)
+	if full == nil || !strings.Contains(full.Error(), "full") {
+		t.Fatalf("a megabyte into a database of 8 pages: %v, want SQLite's \"database or disk is full\"", full)
+	}
+	_, syntax := db.ExecContext(ctx, `SELEKT 1`)
+	if syntax == nil {
+		t.Fatal("SELEKT 1 worked")
+	}
+
+	for name, err := range map[string]error{
+		"the driver's SQLITE_FULL, as the store wraps it": fmt.Errorf("store: VACUUM INTO /data/restore/snapshot-1.db: %w", full),
+		"SQLITE_FULL":                     codedError(13),
+		"an extended code of SQLITE_FULL": codedError(13 | 2<<8),
+	} {
+		got := diskFull(err)
+		if !errors.Is(got, syscall.ENOSPC) || !errors.Is(got, err) || !strings.HasPrefix(got.Error(), err.Error()) {
+			t.Errorf("%s: diskFull = %v, want the error, marked as a full disk", name, got)
+		}
+	}
+	already := fmt.Errorf("write: %w", syscall.ENOSPC)
+	for name, err := range map[string]error{
+		"another error of the driver":   fmt.Errorf("store: VACUUM INTO x: %w", syntax),
+		"SQLITE_IOERR":                  codedError(10),
+		"an extended code of another":   codedError(1 | 13<<8),
+		"an error without a code":       errors.New("database is locked"),
+		"an error that is ENOSPC as is": already,
+	} {
+		if got := diskFull(err); got != err || (err != already && errors.Is(got, syscall.ENOSPC)) { //nolint:errorlint // the same error value, untouched
+			t.Errorf("%s: diskFull = %v, want the error as it is", name, got)
+		}
+	}
+	if diskFull(nil) != nil {
+		t.Error("diskFull(nil) != nil")
 	}
 }

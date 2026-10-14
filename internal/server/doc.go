@@ -10,8 +10,8 @@
 //     public addresses are detected, the listeners, the admin socket and the media sockets are bound, the components
 //     are built and the servers start. An error that a restart can't fix (a container without a data volume, a data
 //     directory the process can't write, a corrupt or wrongly owned secrets.json, a database from a newer isshoni,
-//     an invalid config) satisfies NeedsOperator: cmd/isshoni prints it and exits 78, so systemd stops retrying
-//     (04 §6.3).
+//     a restore that only the operator can complete, an invalid config) satisfies NeedsOperator: cmd/isshoni
+//     prints it and exits 78, so systemd stops retrying (04 §6.3).
 //   - Run is Start (unless it was called), then waiting for the context to end, and then the graceful shutdown.
 //     Its result tells cmd/isshoni how the server ended: stopped (nil, or ErrShutdownForced: exit 0), to be
 //     restarted (ErrRestartRequested), or failed.
@@ -33,7 +33,9 @@
 //     minutes. They are what the server's ICE candidates name, and ip mode's site (manual mode's too, without a
 //     domain). A server whose site is its address and that finds none runs without a site, and the check
 //     "public_ip" fails; it is the one server that restarts by itself, when a later look finds the address (Run
-//     returns ErrRestartRequested). It starts even on a machine whose network is not up yet, which then has no
+//     returns ErrRestartRequested), and until then it looks every 30 s, not every ten minutes: it has nobody to
+//     serve, and what kept the address away is often gone within the minute. It starts even on a machine whose
+//     network is not up yet, which then has no
 //     local address for the media sockets either: without them and without an SFU, and the check "media" fails
 //     too. Everywhere else an address that changed is logged, and the operator's restart applies it; and a
 //     machine without an address for media ends the start with an error that says so.
@@ -47,9 +49,20 @@
 //     the admin's bitrate limit follows 03's settings live. The readiness check "media" is theirs.
 //   - The admin socket of 04 §12 on listen.admin_socket, for the operator's CLI (setup-url, healthcheck, admin …),
 //     with its accounts part over 03's service.
+//   - Backup, restore and secret rotation (README S65; 04 §5.3, §12.3, §12.4). The admin socket serves them over
+//     ops.DataDir, with 03's snapshot of the running database and its file-level functions (DBFiles), and over
+//     secrets.json. A restore and a rotation answer and then ask for the server's restart (restartFor): the
+//     shutdown runs for ShutdownRestore or ShutdownRestart, and Run returns ErrRestartRequested. A restore's files
+//     are swapped at the end of the shutdown, once the store is closed and still under the data-directory lock;
+//     Start completes a swap that a crash interrupted before it opens anything (ops.RecoverRestore), and removes
+//     the files from before the restore once nothing can fail it any more and before the admin socket takes a
+//     request, the next restore's for one (ops.FinishRestore). What a rotated key protected is
+//     purged by the next start's account service (03 §4.6). Reexec (exec_unix.go) is the restart itself:
+//     cmd/isshoni calls it when Run returns ErrRestartRequested, and the process replaces itself with a new run of
+//     the same command line; where a platform has none (exec_other.go), cmd/isshoni exits 75.
 //
-// The later slices of the M1 plan extend Start and Shutdown at the marked steps: restore and secret rotation with
-// the re-exec (S65), push (S71), the ops data, metrics and their REST routes (S80, S85) and the SIGHUP reload (S90).
+// The later slices of the M1 plan extend Start and Shutdown at the marked steps: push (S71), the ops data, metrics
+// and their REST routes (S80, S85) and the SIGHUP reload (S90), which serve only answers with a log line so far.
 //
 // Of the packages of 04 §2, only this one, cmd/isshoni and servertest import signal, sfu and sfuplane, or combine
 // store and auth with ops and push.

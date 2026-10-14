@@ -1,0 +1,41 @@
+# On a terminal a destructive command says what it is about to do and asks `Continue? [y/N]` (04 §3.1). Anything
+# but y or yes is a no: exit 1, and nothing was changed. backup.txtar has the refusal without a terminal.
+[!linux] [!darwin] skip 'needs a pseudo-terminal for stdin'
+
+fakedb pre-6.db 6 0.2.9
+fakeserver start
+
+ttyin -stdin no.txt
+exitcode 1 isshoni admin rotate-secrets
+! stdout .
+stderr '^This replaces the session, invite, resume and push \(VAPID\) keys and restarts the server\.$'
+stderr 'Continue\? \[y/N\] isshoni admin rotate-secrets: cancelled; nothing was changed$'
+fakeserver show restarts
+stdout '^0$'
+
+ttyin -stdin no.txt
+exitcode 1 isshoni admin restore pre-6.db
+stderr '^pre-6\.db is a database file: only the database is replaced; secrets\.json and the certificates stay\.$'
+stderr 'Continue\? \[y/N\] isshoni admin restore: cancelled; nothing was changed$'
+fakeserver show restarts
+stdout '^0$'
+
+# Without a server nobody is asked: the answer is "not running".
+fakeserver stop
+ttyin -stdin yes.txt
+exitcode 4 isshoni admin rotate-secrets
+! stderr 'Continue'
+stderr '^isshoni is not running'
+
+fakeserver start
+ttyin -stdin yes.txt
+exec isshoni admin rotate-secrets
+stdout '^Rotated: session, invite, resume, vapid\.'
+stderr 'Continue\? \[y/N\] The server has new keys and is restarting…$'
+fakeserver show restarts
+stdout '^1$'
+
+-- no.txt --
+n
+-- yes.txt --
+y
