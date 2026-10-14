@@ -277,7 +277,8 @@ func TestSnapshotGolden(t *testing.T) {
 
 // TestTotalsOutliveTheirObjects: the counters of Metrics never go back (02 §13): what a Layer and a DownTrack counted
 // stays counted after the share has ended and they are gone, while the gauges drop to zero. It also checks the
-// counters the golden test leaves at zero: queue drops, the repair path, and layer switches, which count a change of
+// counters the golden test leaves at zero, each with its own total: the drops of all three queues, every outcome of
+// the repair path (served, missed, skipped, dropped), a throttled PLI, and layer switches, which count a change of
 // layer, not a resume in the same one.
 func TestTotalsOutliveTheirObjects(t *testing.T) {
 	s, _ := newTicklessSFU(t)
@@ -312,34 +313,73 @@ func TestTotalsOutliveTheirObjects(t *testing.T) {
 		t.Errorf("the DownTrack started %d epochs, want 4 (f, q, f, f)", d.stats.switches.Load())
 	}
 
-	// A NACK for the last packet bob got: served from the cache, as RTX is not negotiated, as the packet again.
-	last := w.packets // the writer's count of what left on the media SSRC
-	if last == 0 {
+	// The repair path (02 §9.5), one outcome of a NACK at a time. bob's RTT is 1 s, so a sequence number that was
+	// retransmitted less than 500 ms ago is asked for too soon, however slowly the test runs.
+	if w.packets == 0 { // the writer's count of what left on the media SSRC
 		t.Fatal("bob got nothing")
+	}
+	d.binding.Load().pc.rtt.Store(int64(time.Second))
+	nack := func(seq uint16, lost rtcp.PacketBitmap) {
+		d.handleRTCP([]rtcp.Packet{&rtcp.TransportLayerNack{
+			MediaSSRC: 0x7000, Nacks: []rtcp.NackPair{{PacketID: seq, LostPackets: lost}},
+		}})
 	}
 	d.mu.Lock()
 	lastSeq := d.m.lastS
 	d.mu.Unlock()
-	d.handleRTCP([]rtcp.Packet{&rtcp.TransportLayerNack{MediaSSRC: 0x7000, Nacks: []rtcp.NackPair{{PacketID: lastSeq}}}})
+	// A NACK for the last packet bob got: served from the cache, as RTX is not negotiated, as the packet again.
+	nack(lastSeq, 0)
 	select {
 	case it := <-d.rtxQueue:
 		d.retransmit(w, it)
 	default:
 		t.Fatal("the NACK queued no retransmission")
 	}
-	// A writer that has stopped: its queue fills, and three more packets are dropped.
+	// The same NACK again at once: skipped, the retransmission can't have arrived yet.
+	nack(lastSeq, 0)
+	// A NACK for the two sequence numbers after it, which bob was never sent: both missed.
+	nack(lastSeq+1, 1)
+	if n := len(d.rtxQueue); n != 0 {
+		t.Fatalf("the NACKs asked too soon and for packets never sent queued %d retransmissions", n)
+	}
+	// A writer that has stopped: its RTX queue is full, and the retransmission of the packet before the last is
+	// dropped.
+	for range rtxQueueLen {
+		d.rtxQueue <- rtxItem{}
+	}
+	nack(lastSeq-1, 0)
+	for len(d.rtxQueue) > 0 {
+		<-d.rtxQueue
+	}
+	// And its media queues fill: three more packets of video, and of the audio bob didn't ask for, are dropped.
+	if n := len(sub.audio.queue); n != 0 {
+		t.Fatalf("bob's audio DownTrack has %d packets queued, want none: he didn't ask for audio", n)
+	}
 	for i := range videoQueueLen + 3 {
 		d.enqueue(&packet{layer: rig.f, seq: uint16(i), payload: []byte{0x41}})
 	}
+	for i := range audioQueueLen + 3 {
+		sub.audio.enqueue(&packet{layer: rig.a, seq: uint16(i), payload: []byte{0xf8}})
+	}
+	// Two keyframe requests for f within 500 ms, long after the last: a PLI, and a request that is throttled.
+	before := s.Metrics()
+	if at := now + 10*oneSecond; !rig.f.requestKeyframe(at) || rig.f.requestKeyframe(at+int64(pliInterval)-1) {
+		t.Error("two keyframe requests 500 ms apart less 1 ns, long after the last: want a PLI, then none")
+	}
 
 	m := s.Metrics()
-	if m.NACKReceived != 1 || m.NACKServed != 1 || m.NACKMissed != 0 || m.RTXSkipped != 0 || m.EgressPackets["rtx"] != 1 ||
-		m.QueueDrops["video"] != 3 || m.QueueDrops["rtx"] != 0 {
-		t.Errorf("Metrics after a NACK and a full queue = %+v", m)
+	if m.NACKReceived != 5 || m.NACKServed != 1 || m.NACKMissed != 2 || m.RTXSkipped != 1 || m.EgressPackets["rtx"] != 1 ||
+		fmt.Sprint(m.QueueDrops) != "map[audio:3 rtx:1 video:3]" {
+		t.Errorf("Metrics after the NACKs and full queues = %+v; want 5 sequence numbers NACKed, 1 served, 2 missed and "+
+			"1 skipped, and 3 video, 3 audio and 1 RTX queue drops", m)
+	}
+	if m.PLISent != before.PLISent+1 || m.PLIThrottled != before.PLIThrottled+1 {
+		t.Errorf("PLIs sent %d → %d, throttled %d → %d; want one more of each", before.PLISent, m.PLISent,
+			before.PLIThrottled, m.PLIThrottled)
 	}
 	if st := bob.Stats(); len(st.Subscriptions) != 1 || st.Subscriptions[0].Video.NACKsServed != 1 ||
-		st.Subscriptions[0].Video.Drops != 3 {
-		t.Errorf("bob's Stats = %+v, want 1 NACK served and 3 drops", st)
+		st.Subscriptions[0].Video.Drops != 4 || st.Subscriptions[0].Audio.Drops != 3 {
+		t.Errorf("bob's Stats = %+v, want 1 NACK served, 4 video drops (one of them RTX) and 3 audio drops", st)
 	}
 
 	// The share ends: its Layers and DownTracks are gone, what they counted isn't.
@@ -353,8 +393,12 @@ func TestTotalsOutliveTheirObjects(t *testing.T) {
 		"EgressPackets":     {after.EgressPackets, m.EgressPackets},
 		"EgressBytes":       {after.EgressBytes, m.EgressBytes},
 		"QueueDrops":        {after.QueueDrops, m.QueueDrops},
+		"NACKReceived":      {after.NACKReceived, m.NACKReceived},
 		"NACKServed":        {after.NACKServed, m.NACKServed},
+		"NACKMissed":        {after.NACKMissed, m.NACKMissed},
+		"RTXSkipped":        {after.RTXSkipped, m.RTXSkipped},
 		"PLISent":           {after.PLISent, m.PLISent},
+		"PLIThrottled":      {after.PLIThrottled, m.PLIThrottled},
 		"KeyframesReceived": {after.KeyframesReceived, m.KeyframesReceived},
 		"LayerSwitches":     {after.LayerSwitches, m.LayerSwitches},
 	} {

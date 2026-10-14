@@ -264,14 +264,19 @@ func addressIn(s string) string {
 }
 
 // TestLogsHoldNoSDPOrAddresses is the log capture test of 02 §13 (README S79): a session with every kind of SFU line
-// at info, on the ICE-TCP transports too and with a connection-test probe, read back as JSON. Every line of
-// component=sfu at info and above, Pion's included, holds no SDP, no candidate and no IP address in its message or
-// any attribute; Pion's info lines are debug lines (pionlog.go). The SFU's own info lines say what 02 §13 lists, with
-// the transport of each connected PC.
+// at info, on the ICE-TCP transports too and with a connection-test probe, read back as JSON. Every line at info and
+// above, Pion's included, holds no SDP, no candidate and no IP address in its message or any attribute; Pion's info
+// lines are debug lines (pionlog.go). The SFU's own info lines say what 02 §13 lists, with the transport of each
+// connected PC.
 //
 // The session runs twice. Logged at debug, Pion produces all of its lines, and none of its info lines is left at
 // info. Logged at info, which is how a server runs, Pion's warnings are all there: at debug, logx's limit of 20 lines
 // a minute per Pion scope (04 §10) is spent on Pion's chatter, and it suppresses the warnings that come later.
+//
+// The lines of other components are the Transport's (netx, 04 §7.3), its Pion ICE scope's among them. Logged at info
+// they hold no address either. Logged at debug, netx passes the info lines of that Pion scope on at info, and those
+// hold addresses ("Listening TCP on <ip>:<port>"): netx's logger is to send them to debug as pionlog.go does, and
+// until it does, the debug run lists those lines instead of failing on them.
 func TestLogsHoldNoSDPOrAddresses(t *testing.T) {
 	for _, level := range []slog.Level{slog.LevelDebug, slog.LevelInfo} {
 		t.Run(level.String(), func(t *testing.T) {
@@ -345,9 +350,9 @@ func logSession(t *testing.T, level slog.Level) string {
 // checkLogs checks the log of logSession at level.
 func checkLogs(t *testing.T, level slog.Level, text string) {
 	var (
-		sfuInfo, pionDebug   int
-		pionAbove, netxAddrs []string
-		msgs                 []string
+		sfuInfo, pionDebug    int
+		pionAbove, otherAddrs []string
+		msgs                  []string
 	)
 	sc := bufio.NewScanner(strings.NewReader(text))
 	sc.Buffer(make([]byte, 1<<20), 1<<20)
@@ -361,19 +366,9 @@ func checkLogs(t *testing.T, level slog.Level, text string) {
 		if !above && lv != slog.LevelDebug.String() {
 			t.Errorf("a log line at %q: %s", lv, sc.Text())
 		}
-		if rec.str("component") != "sfu" {
-			// The Transport's lines are netx's (04 §7.3). What they hold is listed for the record.
-			if above {
-				for _, s := range rec.strings() {
-					if a := addressIn(s); a != "" {
-						netxAddrs = append(netxAddrs, fmt.Sprintf("%s %s %q", rec.str("component"), lv, rec.str("msg")))
-						break
-					}
-				}
-			}
-			continue
-		}
+		other := rec.str("component") != "sfu"
 		switch {
+		case other:
 		case pion && lv == slog.LevelDebug.String():
 			pionDebug++
 		case pion && lv == slog.LevelInfo.String():
@@ -387,19 +382,27 @@ func checkLogs(t *testing.T, level slog.Level, text string) {
 		if !above {
 			continue
 		}
+		listed := false
 		for _, s := range rec.strings() {
 			if sdpRE.MatchString(s) {
 				t.Errorf("a log line at %s holds SDP or a candidate (%q): %s", lv, sdpRE.FindString(s), sc.Text())
 			}
-			if a := addressIn(s); a != "" {
+			switch a := addressIn(s); {
+			case a == "":
+			case other && level == slog.LevelDebug: // netx's, see TestLogsHoldNoSDPOrAddresses
+				if !listed {
+					otherAddrs = append(otherAddrs, fmt.Sprintf("%s %s %q", rec.str("component"), lv, rec.str("msg")))
+					listed = true
+				}
+			default:
 				t.Errorf("a log line at %s holds the address %s: %s", lv, a, sc.Text())
 			}
 		}
 	}
 	t.Logf("component=sfu: %d info lines of the SFU's own, %d Pion lines at debug, %d at warn or error: %v", sfuInfo,
 		pionDebug, len(pionAbove), pionAbove)
-	if len(netxAddrs) > 0 {
-		t.Logf("lines of other components at info and above with an address (not the SFU's): %v", netxAddrs)
+	if len(otherAddrs) > 0 {
+		t.Logf("lines of other components at info and above with an address, for netx to log at debug: %v", otherAddrs)
 	}
 	if level == slog.LevelDebug && pionDebug == 0 {
 		t.Error("no Pion line at debug: the capture saw nothing of Pion's")

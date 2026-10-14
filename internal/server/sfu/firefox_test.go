@@ -254,6 +254,7 @@ func TestCodecPolicy(t *testing.T) {
 	waitSubState(t, ffSig, sfu.SubscriptionStateEvent{
 		Share: share, Requested: sfu.QualityHigh, Forwarded: sfu.QualityOff, Audio: true, Reason: sfu.SubReasonCodecMismatch,
 	})
+	wantDowngraded(t, h, sfu.SubReasonCodecMismatch)
 	if subs, err := ffConn.Subscriptions(ctx); err != nil || len(subs) != 1 || subs[0].VideoSent != 0 ||
 		!samePTs(subs[0].VideoPTs, map[sfu.ProfileKey]uint8{"42e0": 96, "4200": 98}) {
 		t.Fatalf("the Firefox viewer's subscription = %+v, %v; want CB payload types and nothing sent", subs, err)
@@ -429,6 +430,7 @@ func TestDecoderUnavailable(t *testing.T) {
 			Share: share, Requested: sfu.QualityHigh, Forwarded: sfu.QualityOff, Audio: true,
 			Reason: sfu.SubReasonDecoderUnavailable,
 		})
+		wantDowngraded(t, h, sfu.SubReasonDecoderUnavailable)
 		heard := streamTrack(t, v, share, audio)
 		if err := heard.Wait(ctx, func(r *sfutest.Recorder) bool { return r.Stats().Packets >= 50 }); err != nil {
 			t.Fatalf("the audio of a viewer without H.264: %v", err)
@@ -491,6 +493,7 @@ func TestDecoderUnavailable(t *testing.T) {
 		}, func() string {
 			return fmt.Sprintf("the client's events %+v, want decoder_unavailable", subEvents(sig, share))
 		})
+		wantDowngraded(t, h, sfu.SubReasonDecoderUnavailable)
 
 		// Nine codec rebuilds, one per interval, each answered with the video refused again; then decoder_failed.
 		st := waitDecoders(t, c, func(st sfu.DecoderState) bool { return st.Failed })
@@ -509,6 +512,7 @@ func TestDecoderUnavailable(t *testing.T) {
 			Share: share, Requested: sfu.QualityHigh, Forwarded: sfu.QualityOff, Audio: true,
 			Reason: sfu.SubReasonDecoderFailed,
 		})
+		wantDowngraded(t, h, sfu.SubReasonDecoderFailed)
 		heard := streamTrack(t, v, share, audio)
 		if err := heard.Wait(ctx, func(r *sfutest.Recorder) bool { return r.Stats().Packets >= 25 }); err != nil {
 			t.Fatalf("the audio of a viewer whose answers refuse the video: %v", err)
@@ -682,5 +686,14 @@ func TestDecoderCapsOfClosedSubPC(t *testing.T) {
 		if e, ok := ev.(sfu.ErrorEvent); ok {
 			t.Errorf("the viewer got %+v", e)
 		}
+	}
+}
+
+// wantDowngraded checks that the SFU counted, in isshoni_sfu_downgrades_total (02 §13), the reason a viewer has just
+// heard: the Conn counts it before it tells the client, so it is there once the client has it.
+func wantDowngraded(t *testing.T, h *sfutest.Harness, reason sfu.SubReason) {
+	t.Helper()
+	if n := h.SFU.Metrics().Downgrades[string(reason)]; n == 0 {
+		t.Errorf("Metrics.Downgrades[%s] = 0 after a viewer heard it", reason)
 	}
 }
