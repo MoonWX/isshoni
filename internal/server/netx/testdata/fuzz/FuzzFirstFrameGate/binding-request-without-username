@@ -1,0 +1,5 @@
+go test fuzz v1
+[]byte("\x00\x1c\x00\x01\x00\b!\x12\xa4Bisshoni-fuzz\x80(\x00\x04w˽\b\x00\x0ethe next frame")
+byte('\x03')
+byte('ÿ')
+byte('ÿ')
