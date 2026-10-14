@@ -1,11 +1,16 @@
 /*
  * The room page fills the viewport, and nothing on it scrolls the document: the header keeps its height, and the
  * stage and the tiles share what is left (viewer/ViewerLayout fills the box it is given and scrolls its own list).
+ *
+ * `flex: none`, so that the height below is the page's height. The app's root is a column that is as tall as its
+ * content (only its min-height is the viewport's). As a flexible item of it (`flex: 1`), the page took its
+ * height from its content instead, and a playing video's content is its picture: a 16:9 share on the stage made
+ * the page taller than a 16:9 window, and the stage's controls ended up below the fold (README S66).
  */
 
 .page {
   display: flex;
-  flex: 1;
+  flex: none;
   flex-direction: column;
   min-width: 0;
   height: 100vh;

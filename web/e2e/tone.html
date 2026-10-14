@@ -1,0 +1,105 @@
+<!doctype html>
+<!--
+  The tone tab of the e2e tests (docs/m1/05-web-client.md §19.3): what a sharer shares when it clicks the real
+  Share button. Chrome's tab picker selects this tab by its title (the flag
+  auto-select-tab-capture-source-by-title of fixtures.ts, chromeArgs), so the title must stay TONE_TAB_TITLE.
+
+  - Picture: a canvas that fills the tab, redrawn 30 times a second: a bar that crosses it every two seconds and
+    a frame counter. A tab capture only delivers frames while the tab changes, so the picture never stands still.
+    Not at the display's 60 Hz: on a CI machine the sharer encodes both layers in software, next to everything
+    else, and half the frames leave it room for that.
+  - Sound: a 1 kHz sine at a quarter of full scale, the same tone as the app's fake display
+    (src/platform/browser/fakeDisplay.ts): a receiver's audioLevel is then far above the 0.05 the specs ask for.
+
+  fixtures.ts serves this file through context.route (openToneTab), so the server's Content-Security-Policy is
+  not on it and the inline script runs. The specs read window.__tone to know that the tab draws and sounds.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>isshoni-e2e-tone</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background: #101014;
+      }
+      canvas {
+        display: block;
+        width: 100vw;
+        height: 100vh;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas width="1280" height="720"></canvas>
+    <script>
+      'use strict';
+      const WIDTH = 1280;
+      const HEIGHT = 720;
+      /** A little under a thirtieth of a second: every second animation frame of a 60 Hz display draws. */
+      const FRAME_MS = 30;
+      const TONE_HZ = 1000;
+      const TONE_GAIN = 0.25;
+
+      /** What the specs read: how many frames were drawn, and the AudioContext's state ("running" when it sounds). */
+      const tone = { frames: 0, audio: 'suspended' };
+      window.__tone = tone;
+
+      const g = document.querySelector('canvas').getContext('2d');
+      const started = performance.now();
+      let drawnAt = 0;
+
+      function draw() {
+        const now = performance.now();
+        drawnAt = now;
+        tone.frames += 1;
+        const phase = ((now - started) % 2000) / 2000;
+        g.fillStyle = '#101014';
+        g.fillRect(0, 0, WIDTH, HEIGHT);
+        g.fillStyle = '#8e88ff';
+        g.fillRect(phase * WIDTH, 0, 80, HEIGHT);
+        g.fillStyle = '#ffffff';
+        g.font = '48px monospace';
+        g.fillText('isshoni e2e tone', 48, 96);
+        g.fillText('frame ' + tone.frames, 48, 168);
+        g.fillText('audio ' + tone.audio, 48, 240);
+      }
+
+      function onFrame() {
+        if (performance.now() - drawnAt >= FRAME_MS) draw();
+        requestAnimationFrame(onFrame);
+      }
+      requestAnimationFrame(onFrame);
+      // A tab in the background gets no animation frames. Its timers still run (once a second), so the picture
+      // keeps changing there too.
+      setInterval(() => {
+        if (performance.now() - drawnAt > 200) draw();
+      }, 100);
+
+      const audio = new AudioContext();
+      const oscillator = audio.createOscillator();
+      oscillator.frequency.value = TONE_HZ;
+      const gain = audio.createGain();
+      gain.gain.value = TONE_GAIN;
+      oscillator.connect(gain).connect(audio.destination);
+      oscillator.start();
+      const sync = () => {
+        tone.audio = audio.state;
+      };
+      audio.addEventListener('statechange', sync);
+      sync();
+      // With Chrome's autoplay flag (chromeArgs) the context runs from the start. Without it (the spec of "Tap to
+      // unmute" turns the flag off for its whole browser), a click or a key press in this tab starts the tone.
+      const resume = () => {
+        void audio.resume().then(sync, sync);
+      };
+      resume();
+      addEventListener('pointerdown', resume);
+      addEventListener('keydown', resume);
+    </script>
+  </body>
+</html>
