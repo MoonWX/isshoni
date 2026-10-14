@@ -1,12 +1,13 @@
 // Stats (05 §10.7): the collector that samples the page's PCs, the summary of a getStats() report, and the debug
 // handle the e2e tests read.
 //
-// Wiring, for whoever owns the room session (05 §11.1):
-//   const stats = createStatsCollector({ sources: () => [...viewerStatsSources(viewer), ...pubSources], log });
+// Wiring, for whoever owns the room session (05 §11.1; rooms/connectStats.ts does it):
+//   const sources = () => [...viewerStatsSources(viewer), ...shareStatsSources()];
+//   const stats = createStatsCollector({ sources, log });
 //   stats.start() when the session joins its room, stats.stop() when it leaves;
 //   installDebugHandle({ storage: platform.storage.session, stats: () => stats.snapshot(), state, dropSocket });
-// The `stats` notification (01 §8.11) is toClientStats(stats.latest()) every STATS_REPORT_INTERVAL_MS; it and the
-// debug overlay arrive with the hardening slice (05 W13).
+// The `stats` notification (01 §8.11) is toClientStats(stats.latest()) every STATS_REPORT_INTERVAL_MS. It and the
+// debug overlay's feed are viewer/statsLink.ts's (attachViewerStats), which reads the same collector.
 export {
   createStatsCollector,
   STATS_FAST_INTERVAL_MS,

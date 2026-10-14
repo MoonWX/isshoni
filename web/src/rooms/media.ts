@@ -1,9 +1,9 @@
 // The room's media code, as one lazy chunk (05 §17.3: initial JS ≤ 200 KB): the stage with its tiles, the Share
 // button with its sheet and warning, the share panel, the header's "Tap to unmute" pill, the sub PC controller,
-// the stats collector and the tiles' freeze watch that reads its samples. The room page itself, with its header,
-// is in the room folder's chunk (05 §5); it asks for this chunk as soon as it renders, while the connection is
-// still being made, so the stage is there before the first room.state. Only loadMedia.ts imports this file, with
-// import().
+// the stats collector and what reads its samples (viewer/statsLink.ts: the tiles' freeze watch, the `stats`
+// reports, the debug overlay's feed). The room page itself, with its header, is in the room folder's chunk (05 §5);
+// it asks for this chunk as soon as it renders, while the connection is still being made, so the stage is there
+// before the first room.state. Only loadMedia.ts imports this file, with import().
 //
 // What later slices add to the viewer and the sharer UI is imported here or below RoomStage, and stays out of the
 // room folder's chunk the same way. A module of viewer/, share/ or lib/stats that the room's chunk imports by
@@ -11,7 +11,7 @@
 export { createStatsCollector } from '../lib/stats/collector';
 export { ShareButton } from '../share/ShareButton';
 export { SharePanel } from '../share/SharePanel';
-export { attachFreezeWatch } from '../viewer/freeze';
+export { attachViewerStats } from '../viewer/statsLink';
 export { SubscriberPC } from '../viewer/SubscriberPC';
 export { TapToStartPill } from '../viewer/TapToStart';
 export { RoomStage } from './RoomStage';

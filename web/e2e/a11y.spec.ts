@@ -1,7 +1,8 @@
 // a11y.spec (05 §19.3, §16.6): axe (WCAG 2.0 A and AA, 2.1 AA) on the pages a friend meets, against a real server,
 // finds no serious or critical violation, in the light and the dark colour scheme (05 §16.6: AA in both): the login,
 // invite, reset and setup pages, the room with a share (and its debug overlay, "Stats for nerds"), and the admin's
-// user list. In the room the tile list is reachable with the keyboard and F switches the stage's fullscreen.
+// user list. In the room the tile list is reachable with the keyboard and F switches the stage's fullscreen, and the
+// overlay shows the friend's tile as the page receives it and as the server forwards it, with no IP address.
 //
 // What axe can't judge (a screen reader's reading order, the live regions' timing) is the manual matrix's and the
 // component tests' (05 §19.2, §19.4).
@@ -15,6 +16,8 @@ import { readState, waitForRoom, waitForState } from './stats.ts';
 const TAGS = ['wcag2a', 'wcag2aa', 'wcag21aa'];
 /** A share that started may take this long to reach the server and a viewer: two PeerConnections. */
 const MEDIA_TIMEOUT_MS = 20_000;
+/** IPv4 and IPv6 addresses, which the debug overlay never shows (05 §10.7). */
+const IP = /\b\d{1,3}(?:\.\d{1,3}){3}\b|\b[0-9a-f]{1,4}(?::[0-9a-f]{0,4}){2,7}\b/i;
 
 // Two pages that encode and decode in the room test: room for a CI machine that runs them in software.
 test.describe.configure({ timeout: 120_000 });
@@ -172,10 +175,20 @@ test('the room with a share: axe, the tile list by keyboard, F for fullscreen, t
   await page.keyboard.press('f');
   await expect.poll(async () => (await readState(page)).viewer.fullscreen).toBe(false);
 
-  // The debug overlay (Shift+D, 05 §10.7) over the room, with its own heading and close button.
+  // The debug overlay (Shift+D, 05 §10.7) over the room, with its own heading and close button. It shows both of the
+  // page's PCs, the friend's tile as the page receives it and as the server forwards it (stats.watch), and what the
+  // page sends; nowhere an IP address.
   await page.keyboard.press('Shift+D');
   const overlay = page.getByRole('complementary', { name: 'Stats for nerds' });
   await expect(overlay).toBeVisible();
+  const friendShare = (await readState(page)).viewer.shares.find((s) => !s.local)?.id;
+  if (friendShare === undefined) throw new Error('the friend’s share is not on the page');
+  const tile = overlay.locator(`[data-debug-share="${friendShare}"]`);
+  await expect(tile.locator('dt')).toContainText([/^Video$/, /^Server video$/], { timeout: MEDIA_TIMEOUT_MS });
+  const pcs = overlay.getByRole('region', { name: 'Connections' }).locator('dt');
+  await expect(pcs).toContainText([/^sub PC/, /^pub PC/]);
+  await expect(overlay.getByRole('region', { name: 'Sending' })).toBeVisible();
+  expect(await overlay.innerText(), 'the overlay shows no IP address').not.toMatch(IP);
   await expectAccessible(page, 'the debug overlay', '[data-debug-overlay]');
   await overlay.getByRole('button', { name: 'Close the stats' }).click();
   await expect(overlay).toHaveCount(0);

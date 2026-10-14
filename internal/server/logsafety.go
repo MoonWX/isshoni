@@ -8,12 +8,13 @@ import (
 )
 
 // The server's last safety net for its log (README S90; 04 §10). logx replaces the attributes whose names say they
-// hold a secret, and its Pion bridge drops the lines that hold SDP or a candidate; what neither can see is a
-// credential inside the text of a library's message. The log canary (TestLogCanary) found one: Pion's ICE agent
-// writes the remote ICE password at debug level when it starts ("Started agent: isControlling? false, remoteUfrag:
-// \"…\", remotePwd: \"…\"", pion/ice v4.4.7 agent.go), through the SFU's and netx's Pion loggers. The password is
-// SDP's a=ice-pwd, which 04 §10 says is never logged, and it authenticates the PeerConnection's connectivity
-// checks.
+// hold a secret, and its Pion bridge drops the lines that hold SDP or a candidate. The log canary (TestLogCanary)
+// found a credential inside the text of a library's message: Pion's ICE agent writes the remote ICE password at
+// debug level when it starts ("Started agent: isControlling? false, remoteUfrag: \"…\", remotePwd: \"…\"", pion/ice
+// v4.4.7 agent.go), through the SFU's and netx's Pion loggers. The password is SDP's a=ice-pwd, which 04 §10 says is
+// never logged, and it authenticates the PeerConnection's connectivity checks. Since README F20 the Pion bridge
+// redacts such passwords itself (logx's redactCredentials); this handler stays as a second layer, for any message
+// that reaches the server's logger some other way.
 //
 // New wraps the logger it is given in safeHandler, so that every part the server builds logs through it.
 
