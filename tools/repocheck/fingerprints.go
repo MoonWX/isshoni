@@ -50,7 +50,7 @@ func (k signerKey) String() string {
 //   - a line of the section that still says a key is "not created yet".
 //
 // Only what a reader sees counts: HTML comments are left out, and the section ends at the next heading of level 1 or
-// 2 outside a fenced code block.
+// 2 outside a fenced code block (markdownSection).
 func checkReadmeFingerprints(root, signers string) error {
 	keys, err := parseAllowedSigners(signers)
 	if err != nil {
@@ -198,26 +198,81 @@ type docLine struct {
 	text string // the line without the parts in HTML comments
 }
 
+// The kinds of block that a line of a Markdown document leaves open, as far as setext headings need them: an
+// underline (a line of = or -) makes a heading of the paragraph right before it only.
+type blockKind int
+
+const (
+	noBlock    blockKind = iota // after a blank line, a heading, a fence, a thematic break or indented code
+	paragraph                   // text, which an underline makes a setext heading
+	otherBlock                  // a table, a list item, a block quote or HTML, with its lazy continuation lines
+)
+
+var (
+	setextUnderlineRE = regexp.MustCompile(`^ {0,3}(=+|-+)[ \t]*$`)
+	thematicBreakRE   = regexp.MustCompile(`^ {0,3}((\*[ \t]*){3,}|(-[ \t]*){3,}|(_[ \t]*){3,})$`)
+	listItemRE        = regexp.MustCompile(`^ {0,3}([-+*]|[0-9]{1,9}[.)])([ \t]|$)`)
+	blockQuoteRE      = regexp.MustCompile(`^ {0,3}>`)
+	htmlTagRE         = regexp.MustCompile(`^ {0,3}</?[A-Za-z]`)
+)
+
 // markdownSection returns the lines of the first level-2 section of doc (LF line ends) whose heading text equals
-// title, ignoring case: the lines after the heading, up to the next ATX heading of level 1 or 2. Headings in fenced
-// code blocks and in HTML comments do not count, and the parts of lines in HTML comments are left out.
+// title, ignoring case: the lines after the heading, up to the next heading of level 1 or 2. Both heading forms
+// count: ATX ("## Title") and setext (a paragraph underlined with = or -, which is then no line of the section).
+// Headings in fenced code blocks and in HTML comments do not, and the parts of lines in HTML comments are left out.
+//
+// It follows CommonMark as far as a README needs. Where it simplifies, it errs toward not taking an underline for a
+// heading's: a line with a | in it is taken for a table row, one that starts with an HTML tag for an HTML block, and
+// neither for a paragraph line.
 func markdownSection(doc, title string) (lines []docLine, found bool) {
 	var (
 		fence     string // the fence that opened the code block the scan is in, or ""
 		inComment bool
 		inSection bool
+		block     blockKind // what the line before left open
+		para      []docLine // the lines of the open paragraph
 	)
 	for i, text := range strings.Split(doc, "\n") {
+		line := docLine{n: i + 1, text: text}
 		if fence != "" {
 			if run, after := fenceRun(text); run != "" && run[0] == fence[0] && len(run) >= len(fence) &&
 				strings.TrimSpace(after) == "" {
 				fence = ""
 			}
 		} else {
-			text, inComment = stripHTMLComments(text, inComment)
-			if run, _ := fenceRun(text); run != "" {
-				fence = run
-			} else if level, heading := atxHeading(text); level == 1 || level == 2 {
+			line.text, inComment = stripHTMLComments(text, inComment)
+			level, heading := atxHeading(line.text)
+			opening, setext := openingFence(line.text), false
+			prev := block
+			block = noBlock
+			switch {
+			case prev == paragraph && setextUnderlineRE.MatchString(line.text):
+				level, heading, setext = 2, paragraphText(para), true
+				if strings.TrimLeft(line.text, " ")[0] == '=' {
+					level = 1
+				}
+			case level > 0:
+			case opening != "":
+				fence = opening
+			case strings.TrimSpace(line.text) == "" || thematicBreakRE.MatchString(line.text):
+			case blockQuoteRE.MatchString(line.text) || listItemRE.MatchString(line.text) ||
+				htmlTagRE.MatchString(line.text) || strings.Contains(line.text, "|"):
+				block = otherBlock
+			case prev != noBlock: // a continuation line of the paragraph, or a lazy one of the other block
+				block = prev
+			case !isIndentedCode(line.text):
+				block = paragraph
+			}
+			switch {
+			case block == paragraph:
+				para = append(para, line)
+			case setext && inSection:
+				lines = lines[:len(lines)-len(para)] // the paragraph is the heading's text
+				fallthrough
+			default:
+				para = nil
+			}
+			if level == 1 || level == 2 {
 				if inSection {
 					return lines, true
 				}
@@ -228,10 +283,36 @@ func markdownSection(doc, title string) (lines []docLine, found bool) {
 			}
 		}
 		if inSection {
-			lines = append(lines, docLine{n: i + 1, text: text})
+			lines = append(lines, line)
 		}
 	}
 	return lines, found
+}
+
+// paragraphText returns the text of a paragraph's lines as one line.
+func paragraphText(para []docLine) string {
+	texts := make([]string, len(para))
+	for i, l := range para {
+		texts[i] = strings.TrimSpace(l.text)
+	}
+	return strings.Join(texts, " ")
+}
+
+// isIndentedCode reports whether line, outside a paragraph, is a line of an indented code block: it starts with four
+// columns of blanks.
+func isIndentedCode(line string) bool {
+	t := strings.TrimLeft(line, " ")
+	return len(line)-len(t) >= 4 || strings.HasPrefix(t, "\t")
+}
+
+// openingFence returns the fence that opens a fenced code block on line, or "" when the line opens none. The info
+// string after a backtick fence has no backtick (CommonMark 4.5): a line such as "```x``` y" starts with inline code.
+func openingFence(line string) string {
+	run, after := fenceRun(line)
+	if run != "" && run[0] == '`' && strings.Contains(after, "`") {
+		return ""
+	}
+	return run
 }
 
 // stripHTMLComments removes the parts of line that are in HTML comments. inComment says whether the line starts in

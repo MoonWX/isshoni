@@ -32,8 +32,9 @@ var (
 // checkKeys checks the copies of the release keys against deploy/keys/allowed_signers, their source of truth
 // (06 §10.3), and reports the problems of both checks at once:
 //   - the block embedded in deploy/install.sh must equal the file byte for byte;
-//   - once the file holds keys (it is neither empty nor blank), the "Release signing keys" section of README.md must
-//     list the fingerprint of each of them and no other one (checkReadmeFingerprints).
+//   - once the file is non-empty, it must hold at least one key, and the "Release signing keys" section of README.md
+//     must list the fingerprint of each of them and no other one (checkReadmeFingerprints). A file of blank or
+//     comment lines only fails: release.yml's `[ -s … ]` guard takes it for one with keys.
 //
 // While deploy/keys/allowed_signers does not exist yet, it returns a note and no error. While deploy/install.sh does
 // not, it notes that the block was not checked.
@@ -72,7 +73,9 @@ func checkKeys(root string) (note string, err error) {
 	} else {
 		note = "skipped the key block: " + filepath.ToSlash(installScript) + " does not exist yet"
 	}
-	if strings.TrimSpace(signers) != "" {
+	// An empty file has no key whose fingerprint README.md could list (the block check still wants a final newline).
+	// Any other file holds keys, or checkReadmeFingerprints reports that it holds none.
+	if signers != "" {
 		readmeErr = checkReadmeFingerprints(root, signers)
 	}
 	return note, errors.Join(blockErr, readmeErr)

@@ -152,6 +152,26 @@ func TestCheckKeysReadme(t *testing.T) {
 			wantErr: []string{"it does not list " + releaseKey.fingerprint},
 		},
 		{
+			// "```ssh-keygen -lf```" is inline code, no fence that would hide the "## Privacy" heading (CommonMark 4.5).
+			name: "a fingerprint only after inline code and the next heading",
+			files: withFile(keyTree(goodScript, signers), "README.md",
+				strings.Replace(readmeWith(releaseKey.fingerprint, "TBD"), "## Privacy\n",
+					"```ssh-keygen -lf``` prints them.\n\n## Privacy\n\n"+backupKey.fingerprint+"\n", 1)),
+			wantErr: []string{"it does not list " + backupKey.fingerprint},
+		},
+		{
+			name: "a fingerprint only after the next heading, a setext one",
+			files: withFile(keyTree(goodScript, signers), "README.md",
+				strings.Replace(readmeWith(releaseKey.fingerprint, "TBD"), "## Privacy\n",
+					"Privacy\n-------\n\n"+backupKey.fingerprint+"\n", 1)),
+			wantErr: []string{"it does not list " + backupKey.fingerprint},
+		},
+		{
+			name: "the section under a setext heading",
+			files: withFile(keyTree(goodScript, signers), "README.md",
+				strings.Replace(goodReadme, "## Release signing keys\n", "Release signing keys\n--------------------\n", 1)),
+		},
+		{
 			name: "README.md without the section",
 			files: withFile(keyTree(goodScript, signers), "README.md",
 				strings.Replace(goodReadme, "## Release signing keys", "## Signing", 1)),
@@ -169,8 +189,23 @@ func TestCheckKeysReadme(t *testing.T) {
 			wantErr: []string{`there is no README.md, whose "## Release signing keys" section must list`},
 		},
 		{
-			name:  "a blank key file: README.md is not checked",
-			files: withFile(keyTree(scriptWith("\n"), "\n"), "README.md", notCreatedReadme),
+			// release.yml's `[ -s allowed_signers ]` guard takes a file of blank lines for one with keys.
+			name:    "a blank key file",
+			files:   withFile(keyTree(scriptWith("\n"), "\n"), "README.md", notCreatedReadme),
+			wantErr: []string{"deploy/keys/allowed_signers has no key, only blank and comment lines"},
+		},
+		{
+			name: "an empty key file: README.md is not checked",
+			files: map[string]string{
+				"deploy/keys/allowed_signers": "",
+				"README.md":                   notCreatedReadme,
+			},
+			wantNote: "skipped the key block: deploy/install.sh does not exist yet",
+		},
+		{
+			name:    "an empty key file: the block check wants a final newline",
+			files:   withFile(keyTree(scriptWith(""), ""), "README.md", notCreatedReadme),
+			wantErr: []string{"deploy/keys/allowed_signers must end with a newline"},
 		},
 		{
 			name:    "a key file with comments only",
@@ -346,6 +381,45 @@ func TestMarkdownSection(t *testing.T) {
 			name: "the code block in a comment is no code block",
 			doc:  "## Keys\n<!-- ```\n-->\n## Next\n",
 			want: []string{"2:", "3:"},
+		},
+		{
+			// A backtick fence's info string has no backtick (CommonMark 4.5); a tilde fence's may have one.
+			name: "inline code at the start of a line is no fence",
+			doc:  "## Keys\n```x``` y\na\n~~~ `z`\n## Next\n~~~\nb\n## Next\nc\n",
+			want: []string{"2:```x``` y", "3:a", "4:~~~ `z`", "5:## Next", "6:~~~", "7:b"},
+		},
+		{
+			name: "up to a setext heading, without the paragraph it underlines",
+			doc:  "## Keys\na\n\nNext\nsection\n  ----  \nb\n",
+			want: []string{"2:a", "3:"},
+		},
+		{
+			name: "up to a level-1 setext heading",
+			doc:  "## Keys\na\n\n   Next\n=\nb\n",
+			want: []string{"2:a", "3:"},
+		},
+		{
+			// With no blank line between them, a and Next are one paragraph, the heading's text.
+			name: "a section whose only paragraph is the next heading's text",
+			doc:  "## Keys\na\nNext\n----\nb\n",
+			want: []string{},
+		},
+		{
+			name: "the section under a setext heading",
+			doc:  "Keys\n===\nb\n\nKeys\n---\na\n## Next\n",
+			want: []string{"7:a"},
+		},
+		{
+			name: "no setext heading after a table row, a list item, a block quote, HTML, a break, a blank or indented code",
+			doc: "## Keys\n| a |\n---\n- b\n---\n> c\nlazy\n---\n<p>d</p>\n---\n***\n---\n\n---\n" +
+				"    code\n---\n\t~~~\n---\ne\n## Next\n",
+			want: []string{"2:| a |", "3:---", "4:- b", "5:---", "6:> c", "7:lazy", "8:---", "9:<p>d</p>", "10:---",
+				"11:***", "12:---", "13:", "14:---", "15:    code", "16:---", "17:\t~~~", "18:---", "19:e"},
+		},
+		{
+			name: "an underline in a code block makes no heading",
+			doc:  "## Keys\n```\na\n---\n```\nb",
+			want: []string{"2:```", "3:a", "4:---", "5:```", "6:b"},
 		},
 	}
 	for _, tt := range tests {
