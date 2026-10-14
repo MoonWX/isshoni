@@ -554,6 +554,18 @@ describe('dropSocket() (05 §10.7)', () => {
     expect(server.sockets).toHaveLength(2);
   });
 
+  it('drops a socket that is still connecting', async () => {
+    const c = makeClient();
+    c.start();
+    expect(c.state).toBe('connecting');
+    c.dropSocket();
+    expect(c.state).toBe('backoff');
+    expect(socketAt(0).clientClose?.code).toBe(DropSocketCloseCode);
+    await tick(BackoffMaxMs);
+    expect(c.state).toBe('ready');
+    expect(server.sockets).toHaveLength(2);
+  });
+
   it('is a no-op without a socket: stopped, or in backoff', async () => {
     const c = makeClient();
     c.dropSocket();
