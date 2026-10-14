@@ -123,6 +123,7 @@ func (c *Conn) newSubPC() (*subPC, error) {
 		c.post(func() { c.onPCState(PCSub, gen, pc) })
 	})
 	c.sub = s
+	c.views[PCSub].Store(&pcView{kind: PCSub, gen: gen, pc: pc, rtt: &s.rtt})
 	c.cands[PCSub] = remoteCandidates{gen: gen}
 	return s, nil
 }
@@ -515,7 +516,7 @@ func (c *Conn) sendSubOffer(s *subPC) {
 	c.sig.SendOffer(PCSub, s.gen, s.offer.neg, s.offer.sdp, s.offer.tracks)
 	c.after(&s.resend, c.sfu.timing.offerResend, func() {
 		if c.sub == s && s.offering && !s.closed {
-			c.log.Debug("sub offer sent again: no answer yet", "gen", s.gen, "neg", s.offer.neg)
+			c.log.Warn("sub offer sent again: no answer yet", "gen", s.gen, "neg", s.offer.neg) // 02 §13
 			c.sendSubOffer(s)
 		}
 	})
