@@ -238,7 +238,9 @@ tasks:
         if: '[ -f web/scripts/licenses.test.mjs ]'
 
   test:sh:
-    desc: Run the install.sh unit tests under dash, bash --posix and busybox sh (outside CI, a missing shell is skipped)
+    desc: >-
+      Run the install.sh unit tests under dash, bash --posix and busybox sh (outside CI, a missing shell is skipped),
+      and check that deploy/test/vm/vm-test.sh still finds what it takes from distro-test.sh (`vm-test.sh -h`)
     cmds:
       - cmd: "echo 'test:sh: skipped, deploy/test/install_unit.sh does not exist yet'"
         silent: true
@@ -258,6 +260,12 @@ tasks:
             fi
             echo "test:sh: $shell deploy/test/install_unit.sh"
             $shell deploy/test/install_unit.sh
+            # The VM harness sources distro-test.sh and checks first that every name it takes is still there: a
+            # rename there fails here, not only in the nightly (06 §4.13). It needs no VM, Linux or network.
+            if [ -f deploy/test/vm/vm-test.sh ]; then
+              echo "test:sh: $shell deploy/test/vm/vm-test.sh -h"
+              $shell deploy/test/vm/vm-test.sh -h > /dev/null
+            fi
           done
         silent: true
         if: '[ -f deploy/test/install_unit.sh ]'

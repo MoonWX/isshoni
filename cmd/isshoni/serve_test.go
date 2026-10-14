@@ -210,7 +210,10 @@ func TestServeLogger(t *testing.T) {
 		t.Skip("needs signals")
 	}
 	t.Parallel()
-	p := startServe(t, "--log.level", "debug", "--log.format", "text", "--metrics.enabled")
+	// listen.https is ignored in off mode, which is a config warning. The metrics listener gets a free port, as the
+	// default 127.0.0.1:9469 may be taken.
+	p := startServe(t, "--log.level", "debug", "--log.format", "text", "--listen.https", "127.0.0.1:0",
+		"--metrics.enabled", "--metrics.listen", "127.0.0.1:0")
 	// The text format has no "listen" JSON field to find: wait for the line itself.
 	deadline := time.Now().Add(30 * time.Second)
 	for !strings.Contains(p.logs(), " ready: http://localhost:") {
@@ -234,8 +237,11 @@ func TestServeLogger(t *testing.T) {
 	if !strings.Contains(logs, "level=INFO msg=\"isshoni ") || strings.Contains(logs, `{"time"`) {
 		t.Errorf("log.format = text gave:\n%s", logs)
 	}
-	if !strings.Contains(logs, "level=WARN") || !strings.Contains(logs, "metrics.enabled") {
-		t.Errorf("the warning about metrics.enabled is not in the log:\n%s", logs)
+	if !strings.Contains(logs, "level=WARN") || !strings.Contains(logs, "listen.https") {
+		t.Errorf("the warning about listen.https is not in the log:\n%s", logs)
+	}
+	if !strings.Contains(logs, "listen_metrics=127.0.0.1:") {
+		t.Errorf("the ready line does not name the metrics listener:\n%s", logs)
 	}
 }
 

@@ -1103,9 +1103,10 @@ jobs:
     # each: deploy/test/distro-test.sh with the releases of distro-release, served by
     # tools/relserve on this runner. Per distro: C1-C6 and C8-C10 and C12 in one systemd
     # container, C7 and C13 in one each, C11 in the distro's plain image, and V3 with a running
-    # firewall on Fedora (firewalld) and Ubuntu 24.04 (ufw). Docker, as release.yml's verify
-    # job: the runner's podman is rootless, and its containers reach the runner's relserve
-    # another way.
+    # firewall on Fedora (firewalld) and Ubuntu 24.04 (ufw). Docker, privileged, unlike
+    # release.yml's verify job: that job runs the runner's rootless podman with
+    # --cap-add SYS_ADMIN, a systemd user session and relserve as host.containers.internal
+    # (06 §4.13), which distro-test.sh's podman path doesn't set up.
     needs: [changes, distro-release]
     if: needs.changes.outputs.run-distro == 'true'
     runs-on: ubuntu-24.04

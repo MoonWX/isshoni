@@ -849,6 +849,19 @@ If isshoni was installed from a package, both refuse and print `apt remove issho
   same script runs by hand in UTM/Tart on the Mac.
 - This is the only place that tests SELinux, real sysctl writes, enabled ufw/firewalld, the Oracle-style iptables
   path and ACME (Pebble).
+- **As README F13 built it**: `sh deploy/test/vm/vm-test.sh [-r DIR] [-o PARTS] [DISTRO...]` is the nightly's
+  `distro-vm` job (8.5) and the run by hand before a release. It sources `deploy/test/distro-test.sh` with
+  `DISTRO_TEST_LIB=1`, a guard that skips the library's main (the library refuses that variable when it runs as
+  itself), and runs its scenario functions over SSH through `vm_engine`, which stands in for the container
+  engine's `exec`. At its start it checks that the library still has every function and variable it takes or
+  replaces (`die`, `assert_eq`, `ROOT`, `ENGINE`, `in_container`'s `"$ENGINE" exec` call among them), so
+  `vm-test.sh -h` is a check that needs no VM, no Linux and no network. The parts are `main`, `c7`, `c13`, `v3`
+  (fedora-44, ubuntu-24.04), `v4` (ubuntu-24.04) and `v5`, each in a fresh VM; a part is skipped with a note on a
+  distro it doesn't apply to, an image is fetched only where a part runs, and a run in which no part applies
+  fails. The script starts Pebble and challtestsrv for V5 itself (their digests match `ci.yml`'s `acme` job and
+  are bumped together). `deploy/test/vm/cloud-image.sh DISTRO FILE` downloads a distro's cloud image and checks
+  its checksum; `vm-test.sh` calls it when `VM_DIR/images/<distro>.qcow2` is missing. Without KVM, `VM_ACCEL=tcg`
+  emulates the VMs, for example in a Linux container or a UTM/Tart VM on a Mac, many times slower.
 
 ## 5. deb and rpm packages
 
@@ -1635,14 +1648,11 @@ same holds for git and PulseAudio on runners. The "no GPL" rule covers code in t
   firewalld), `v4` (Ubuntu 24.04) and `v5` on every distro; C11 has no VM form and stays in `ci.yml`. Without
   `/dev/kvm` each job is skipped with a warning naming 4.13 and 9.1. The scenario step has a timeout of its own
   (75 of the job's 90 minutes), so a hang still leaves time to show Pebble's logs and upload the VMs' consoles.
-- **The VM harness is inline in the `distro-vm` job's step**, not a script in `deploy/test/vm/` (4.13): S83 could
-  change only `nightly.yml`. The step sources `deploy/test/distro-test.sh` without its last line (`main "$@"`,
-  which it checks first and fails loudly without) and runs the library's container scenarios in the VMs through
-  an executor over SSH (`vm_engine` in place of the container engine), relying on the library's function and
-  variable names. So a rename there breaks only the nightly, and the harness can't be run by hand before a release
-  without being taken out of the YAML (taken out, `VM_ACCEL=tcg` runs it without KVM, much slower). README F13
-  moves it to `deploy/test/vm/`, with a guard in `distro-test.sh` that skips its main when sourced, and `lint:sh`
-  over the new scripts (README §6 "Decided after group 11" (5)).
+- **The VM harness is `deploy/test/vm/vm-test.sh`** (4.13), which the `distro-vm` job's scenario step runs with
+  `-r` (the `vm-release` job's releases) and `-o` (the matrix row's parts). S83 first wrote it inline in that step,
+  sourcing `distro-test.sh` without its last line, because it could change only `nightly.yml` (README §6 "Decided
+  after group 11" (5)); README F13 moved it into the script, behind `distro-test.sh`'s sourced guard, and
+  `lint:sh` covers it. Pebble and challtestsrv start inside the script, not in a step of their own.
 - **`goreleaser-full` does not sign**: `goreleaser release --snapshot --clean --skip=sign` with the images and the
   SBOMs, not the plain command of the table. cosign's keyless signature would need `id-token: write` in a job that
   also runs npm, which `release.yml` keeps apart (9.3), and every night would add an entry to the public
@@ -2084,11 +2094,14 @@ all pass; and `build`'s buildx driver image is pinned by digest too. Turning on 
 releases, which the one-time setup of 8.6 doesn't include, is the owner's to consider: they would also stop a write
 token from changing the assets of a release that is already out.
 
-**`site`** (README S82; not there yet)
-- `uses: ./.github/workflows/site.yml`, after `publish`.
+**`site`** (README S82)
+- `uses: ./.github/workflows/site.yml`, after `publish`, with `contents: read`, `pages: write` and `id-token: write`;
+  it deploys from the tag's ref, which the `github-pages` environment allows (8.6 step 5).
 - A `release` event created with `GITHUB_TOKEN` doesn't trigger other workflows, so the site deploy is called directly.
 - **It needs `if: ${{ !cancelled() && needs.publish.result == 'success' }}`**, not a plain condition, for the reason
   given at `publish`: `sign-dry`, skipped on a tag, is upstream of it too. The workflow's header comment says so.
+- With Pages still off it fails once the release is out (`site.yml`'s `check` job, 10.5), since the stable install
+  URL would serve nothing: turn Pages on, then run Site from `main`.
 
 **Dry run** (`workflow_dispatch`, input `dry_run: true`, the default of a manual run):
 - `web` builds the SPA as `0.0.0-dryrun.<run>`; `build` runs `goreleaser release --snapshot --clean --skip=publish`
@@ -2956,8 +2969,8 @@ Decided after group 11 (engineering calls the owner delegated; README §6 (3), (
   without Pages stays green with the site built and checked and a warning, so `main` doesn't go red over a setting
   of the owner's (8.6 step 5); once a release exists, a run on `main` or a release tag that didn't deploy fails, so
   a release can't end green while its stable install URL serves nothing.
-- **The nightly departs from this doc twice, the first time until README F13** (8.5): its VM harness is inline in
-  `nightly.yml`, not a script in `deploy/test/vm/` (4.13), because S83 could change only that file; and
-  `goreleaser-full` doesn't sign (`--skip=sign`), because cosign's keyless signature would need an OIDC token in a
-  job that runs npm and a public transparency-log entry every night, while `release.yml`'s dry run covers the
-  signing.
+- **The nightly departed from this doc twice; the first, until README F13** (8.5): its VM harness was inline in
+  `nightly.yml`, not a script in `deploy/test/vm/` (4.13), because S83 could change only that file. F13 moved it
+  to `deploy/test/vm/vm-test.sh`. The second stays: `goreleaser-full` doesn't sign (`--skip=sign`), because
+  cosign's keyless signature would need an OIDC token in a job that runs npm and a public transparency-log entry
+  every night, while `release.yml`'s dry run covers the signing.

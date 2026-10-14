@@ -241,7 +241,8 @@ describe('a page opened with a token in the fragment', () => {
 
       await user.click(screen.getByRole('button', { name: submit }));
       await waitFor(() => {
-        expect(window.location.pathname).toBe('/');
+        // Setup goes on to the wizard's step 2 (README S87); the other forms go home.
+        expect(window.location.pathname).toBe(kind === 'setup' ? '/admin/welcome' : '/');
       });
       const completed = seen.find((r) => r.url === signIn);
       expect(JSON.parse(completed?.body ?? 'null')).toMatchObject({ [tokenField]: TOKEN });
