@@ -34,7 +34,8 @@
 // - the codec wait's banner (CodecBanner.tsx, 05 §10.6): "Reload the page" after 3 minutes without a video
 //   decoder, or "This browser can't play isshoni video";
 // - the debug overlay, "Stats for nerds" (DebugOverlay.tsx, 05 §10.7): Shift+D or `?debug=1`, per tile, with the
-//   server's view; only inside the app, whose preferences say whether it is on;
+//   server's view; only inside the app, whose preferences say whether it is on. `?debug=1` shows it on this page
+//   only and leaves the preference alone; Shift+D switches what is on screen, and hiding it ends the URL's part too;
 // - "Now listening to bo" for screen readers when the sound moves to a share that was already there (05 §16.6).
 import { Layers } from 'lucide-react';
 import {
@@ -59,7 +60,7 @@ import { cx } from '../ui/cx';
 import { Sheet } from '../ui/Sheet';
 import { CodecBanner } from './CodecBanner';
 import { ViewerContext } from './context';
-import { DebugOverlay } from './DebugOverlay';
+import { DebugOverlay, debugInUrl } from './DebugOverlay';
 import { FocusFromUrl } from './FocusFromUrl';
 import { IosHint } from './IosHint';
 import { attachShortcuts, moveTileFocus, TILE_LIST, TILE_MAIN, type ShortcutAction } from './keyboard';
@@ -188,6 +189,8 @@ export function ViewerLayout({
   const [helpOpen, setHelpOpen] = useState(false);
   /** The tile the Tab key stops at (05 §12.7): the one that had the keyboard focus last. */
   const [rovingId, setRovingId] = useState<string | null>(null);
+  /** `?debug=1` asked for the debug overlay, and it hasn't been hidden since (05 §10.7). */
+  const [debugFromUrl, setDebugFromUrl] = useState(() => debugInUrl(globalThis.location.search));
 
   const fullscreen = useFullscreen(viewer, root, caps?.fullscreen ?? 'none');
   const toggleFullscreen = useCallback(() => {
@@ -275,8 +278,10 @@ export function ViewerLayout({
         return true;
       case 'debug': {
         if (app === null) return false;
+        // What is on screen switches, and the device keeps it; hiding also ends what ?debug=1 asked for.
         const prefs = app.prefs.getState();
-        prefs.setDebug(!prefs.debug);
+        prefs.setDebug(!(prefs.debug || debugFromUrl));
+        setDebugFromUrl(false);
         return true;
       }
     }
@@ -405,7 +410,16 @@ export function ViewerLayout({
           }}
           without={app === null ? ['debug'] : []}
         />
-        {app !== null && <DebugOverlay viewer={viewer} prefs={app.prefs} />}
+        {app !== null && (
+          <DebugOverlay
+            viewer={viewer}
+            prefs={app.prefs}
+            fromUrl={debugFromUrl}
+            onClose={() => {
+              setDebugFromUrl(false);
+            }}
+          />
+        )}
       </div>
     </ViewerContext.Provider>
   );

@@ -250,7 +250,8 @@ describe('attachViewerStats: the debug overlay (05 §10.7)', () => {
     // A new one (the server restarted) has none.
     server.restart();
     server.drop();
-    await tick(1_000);
+    // The second drop in a row waits 0.8–1.2 s (01 §10.2).
+    await tick(1_500);
     expect(server.welcomes.at(-1)?.resumed).toBe(false);
     expect(watches()).toEqual([true, true]);
 

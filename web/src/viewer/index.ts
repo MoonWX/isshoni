@@ -57,9 +57,10 @@
 // by whoever owns the collector: the tiles' freeze watch (05 §12.6, freeze.ts; until it runs no tile ever says
 // "Waiting for video…"), the `stats` notification every 10 s (01 §8.11), and the debug overlay's feed.
 //
-// The debug overlay, "Stats for nerds" (DebugOverlay.tsx; Shift+D, prefsStore.debug, or `?debug=1`): the layout
-// shows it over the stage, per tile, with the page's PCs and what it sends; while it is open the collector samples
-// every second and stats.watch brings the server's view (viewer.debug, debugStats.ts). It shows no IP address.
+// The debug overlay, "Stats for nerds" (DebugOverlay.tsx; Shift+D, prefsStore.debug, or `?debug=1` for one page):
+// the layout shows it over the stage, per tile, with the page's PCs and what it sends; while it is open the
+// collector samples every second and stats.watch brings the server's view (viewer.debug, debugStats.ts). It shows
+// no IP address.
 //
 // For screen readers (05 §16.6) the layout says "Now listening to bo" when the sound moves to a share that was
 // already there (listening.ts); share/ says "You're live" and "Sharing stopped".

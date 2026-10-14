@@ -10,7 +10,14 @@ import { promisify } from 'node:util';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { checkI18n, messagePositions, READ_WHOLE, scanSource, unusedMessages } from '../../scripts/check-i18n.mjs';
+import {
+  checkI18n,
+  messagePositions,
+  namespacesBuiltWhole,
+  READ_WHOLE,
+  scanSource,
+  unusedMessages,
+} from '../../scripts/check-i18n.mjs';
 
 const SCRIPT = fileURLToPath(new URL('../../scripts/check-i18n.mjs', import.meta.url));
 const WEB_SRC = fileURLToPath(new URL('..', import.meta.url));
@@ -92,6 +99,29 @@ describe('unusedMessages', () => {
     ]);
   });
 
+  it('takes a string for a head only below a namespace: a lone namespace and a dot is more often something else', () => {
+    const catalog = { room: { title: 'Room', gone: 'Gone', menu: { leave: 'Leave', stay: 'Stay' } } };
+    // The audit log's action groups ('room.' for room.create …) are no message keys.
+    expect(unused(catalog, "const GROUPS = ['room.', 'auth.']; t('room.title');")).toEqual([
+      'room.gone',
+      'room.menu.leave',
+      'room.menu.stay',
+    ]);
+    expect(unused(catalog, "t('room.title'); t('room.menu.' + item);")).toEqual(['room.gone']);
+  });
+
+  it('names the namespaces that a template head covers whole, where it can’t tell what is unused', () => {
+    const catalog = { doctor: { a: 'A' }, errors: { x: 'X' }, push: { p: 'P' }, room: { title: 'Room' }, n: 'N' };
+    const heads = (code: string): string[] => namespacesBuiltWhole({ catalog, heads: scanSource('a.ts', code).heads });
+    expect(heads('t(`errors.${c}`); t(`doctor.${c}`); t(`doctor.${d}.x`); t(`room.menu.${m}`);')).toEqual([
+      'doctor',
+      'errors',
+    ]);
+    // Not a namespace of the catalog, a message rather than a namespace, one read whole, and a string are none.
+    expect(heads("t(`isshoni.${k}`); t(`n.${k}`); t(`push.${k}`); t('room.' + k);")).toEqual([]);
+    expect(unused(catalog, 't(`doctor.${c}`);')).toEqual(['errors.x', 'n', 'room.title']);
+  });
+
   it('counts what rules 2 and 3 require, with what is below it, the namespaces read whole, and $t() nesting', () => {
     expect(READ_WHOLE).toEqual(['push']);
     const catalog = {
@@ -167,6 +197,20 @@ describe('check-i18n.mjs with unused messages', () => {
     expect(out.stderr).toMatch(/check:i18n: 3 unused message\(s\): warnings, not problems\n/);
     // The summary is the last line, as before rule 4.
     expect(out.stdout).toMatch(/check:i18n: ok \(2 message keys in 3 files\)\n$/);
+  });
+
+  it('notes the namespaces that a template head covers whole', async () => {
+    await write('main.tsx', "import('./admin/index');\nexport const A = (c: string) => t(`room.${c}`);\n");
+    const result = await checkI18n({ srcDir, catalogPath });
+    expect(result.builtWhole).toEqual(['room']);
+    expect(result.warnings.map((w) => w.message)).not.toContain('message "room.old" is not used: no code asks for it');
+
+    const out = await cli(['--src', srcDir, '--catalog', catalogPath]);
+    expect(out.code).toBe(0);
+    expect(out.stdout).toContain(
+      'check:i18n: note: unused messages are not checked in room.*: code builds their keys from the namespace alone (`room.${…}`)\n',
+    );
+    expect(out.stdout).toMatch(/check:i18n: ok \(1 message keys in 3 files\)\n$/);
   });
 
   it('fails when a message that the code asks for is gone; the warnings stay warnings', async () => {

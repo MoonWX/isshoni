@@ -242,15 +242,37 @@ describe('the overlay in the layout', () => {
     expect(services.prefs.getState().debug).toBe(false);
   });
 
-  it('?debug=1 turns it on', () => {
+  it('?debug=1 shows it on this page only: the preference stays off, and Shift+D or the close button hide it', async () => {
+    const user = userEvent.setup();
+    const gone = (): void => {
+      expect(screen.queryByRole('complementary', { name: 'Stats for nerds' })).not.toBeInTheDocument();
+    };
     const before = globalThis.location.href;
     globalThis.history.replaceState(null, '', '/r/lounge?debug=1');
     try {
       syncRoom(viewer, room(BEA), SELF);
       const services = createTestServices();
-      renderWithApp(layout(), { services });
-      expect(services.prefs.getState().debug).toBe(true);
+      const first = renderWithApp(layout(), { services });
       expect(overlay()).toBeInTheDocument();
+      expect(viewer.debug.getState().open).toBe(true);
+      expect(services.prefs.getState().debug).toBe(false);
+      // Shift+D hides what is on screen, with one press.
+      await user.keyboard('{Shift>}D{/Shift}');
+      gone();
+      expect(services.prefs.getState().debug).toBe(false);
+      // And shows it again, kept by the device as before.
+      await user.keyboard('{Shift>}D{/Shift}');
+      expect(overlay()).toBeInTheDocument();
+      expect(services.prefs.getState().debug).toBe(true);
+      first.unmount();
+
+      // The close button, on a page that has only the URL's overlay.
+      services.prefs.getState().setDebug(false);
+      renderWithApp(layout(), { services });
+      await user.click(within(overlay()).getByRole('button', { name: 'Close the stats' }));
+      gone();
+      expect(services.prefs.getState().debug).toBe(false);
+      expect(viewer.debug.getState().open).toBe(false);
     } finally {
       globalThis.history.replaceState(null, '', before);
     }

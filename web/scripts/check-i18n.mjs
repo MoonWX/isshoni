@@ -32,7 +32,10 @@
 //    - by a string that is the key, anywhere in the scanned code (`{ label: 'room.menu.leave' }` → t(item.label));
 //    - by a key built at run time, through the part that is written out: the head of a template literal
 //      (t(`doctor.part.firewall.${provider}`), `errors.${code}`) or a string that ends in a dot
-//      ('viewer.title.' + kind) covers every key it begins. Such a head names a namespace and a dot at least;
+//      ('viewer.title.' + kind) covers every key it begins. A template head names a namespace and a dot at least;
+//      a string needs a part below the namespace too, because a lone 'room.' is more often something else (the
+//      audit log's action groups) and would cover the whole namespace. A template head that is a namespace alone
+//      (`doctor.${check.code}`) does cover all of it, and the run says so in a note: rule 4 can't check there;
 //    - by rules 2 and 3: every errors.<code>, fix.firewall.<provider> and conntest.nat.<nat> they require;
 //    - as a whole namespace that code outside the t() calls reads (READ_WHOLE: the service worker's `push` texts,
 //      05 §16.2), or through $t(…) nesting in another message.
@@ -931,8 +934,11 @@ export async function checkConstantKeys({ srcDir, catalog, catalogName }) {
  */
 export const READ_WHOLE = Object.freeze(['push']);
 
-/** Rule 4: a written-out head of a key that is built at run time: a namespace, a dot, then key characters. */
+/** Rule 4: a template head of a key that is built at run time: a namespace, a dot, then key characters. */
 const KEY_HEAD = /^[A-Za-z][\w-]*\.[\w.-]*$/;
+
+/** Rule 4: a string that is the head of such a key: a namespace and a part below it at least ('viewer.title.'). */
+const STRING_HEAD = /^[A-Za-z][\w-]*\.[\w-]+\.[\w.-]*$/;
 
 /** i18next's plural and ordinal suffixes at the end of a key: viewer.watching_one → viewer.watching. */
 const PLURAL_FORM = /^(.+?)(?:_ordinal)?_(?:zero|one|two|few|many|other)$/;
@@ -965,7 +971,7 @@ export function unusedMessages({ catalog, keys, strings = [], heads = [], requir
   const begins = new Set(READ_WHOLE.map((ns) => `${ns}.`));
   for (const s of strings) {
     exact.add(s);
-    if (s.endsWith('.') && KEY_HEAD.test(s)) begins.add(s);
+    if (s.endsWith('.') && STRING_HEAD.test(s)) begins.add(s);
   }
   for (const h of heads) {
     if (KEY_HEAD.test(h)) begins.add(h);
@@ -993,13 +999,32 @@ export function unusedMessages({ catalog, keys, strings = [], heads = [], requir
 }
 
 /**
+ * Rule 4: the namespaces of the catalog that a template head names alone (`doctor.${check.code}` → doctor): such a
+ * head covers every message of the namespace, so the rule can't find an unused one there. The namespaces that code
+ * reads whole (READ_WHOLE) are not among them. Sorted.
+ * @param {{ catalog: Catalog, heads: Iterable<string> }} opts heads: every template head of the scanned code
+ * @returns {string[]}
+ */
+export function namespacesBuiltWhole({ catalog, heads }) {
+  /** @type {Set<string>} */
+  const found = new Set();
+  for (const h of heads) {
+    const ns = /^([A-Za-z][\w-]*)\.$/.exec(h)?.[1];
+    if (ns !== undefined && !READ_WHOLE.includes(ns) && typeof catalog[ns] === 'object') found.add(ns);
+  }
+  return [...found].sort();
+}
+
+/**
  * Runs every rule.
  * @param {{ srcDir: string, catalogPath: string }} opts catalogPath: the main catalog file (readCatalog)
- * @returns {Promise<{ problems: Problem[], warnings: Problem[], keysUsed: number, files: number,
- *   errorCodes: number | null, constantKeys: Record<string, number> | null, lazyNamespaces: string[] }>}
- *   warnings: rule 4's unused messages, at their place in the catalog files; errorCodes: the distinct error codes
- *   rule 2 checked, or null when it was skipped; constantKeys: the constants rule 3 checked per union type name
- *   (CloudProvider, NATKind), or null when it was skipped; lazyNamespaces: the lazy namespaces rule 5 checked
+ * @returns {Promise<{ problems: Problem[], warnings: Problem[], builtWhole: string[], keysUsed: number,
+ *   files: number, errorCodes: number | null, constantKeys: Record<string, number> | null,
+ *   lazyNamespaces: string[] }>}
+ *   warnings: rule 4's unused messages, at their place in the catalog files; builtWhole: the namespaces in which
+ *   rule 4 can't find unused messages (namespacesBuiltWhole); errorCodes: the distinct error codes rule 2 checked,
+ *   or null when it was skipped; constantKeys: the constants rule 3 checked per union type name (CloudProvider,
+ *   NATKind), or null when it was skipped; lazyNamespaces: the lazy namespaces rule 5 checked
  */
 export async function checkI18n({ srcDir, catalogPath }) {
   const { catalog, lazy, fileOf, positionOf, problems } = await readCatalog({ srcDir, catalogPath });
@@ -1035,6 +1060,7 @@ export async function checkI18n({ srcDir, catalogPath }) {
   return {
     problems,
     warnings,
+    builtWhole: namespacesBuiltWhole({ catalog, heads: tree.heads }),
     keysUsed: tree.uses.length,
     files: tree.imports.size,
     errorCodes: errorCodes.codes,
@@ -1055,10 +1081,9 @@ async function main() {
   }
   const srcDir = path.resolve(values.src ?? path.join(WEB_ROOT, 'src'));
   const catalogPath = path.resolve(values.catalog ?? path.join(WEB_ROOT, 'src', 'i18n', 'en.json'));
-  const { problems, warnings, keysUsed, files, errorCodes, constantKeys, lazyNamespaces } = await checkI18n({
-    srcDir,
-    catalogPath,
-  });
+  const { problems, warnings, builtWhole, keysUsed, files, errorCodes, constantKeys, lazyNamespaces } = await checkI18n(
+    { srcDir, catalogPath },
+  );
   for (const w of warnings) console.error(`${w.file}:${w.line}:${w.column}: warning: ${w.message}`);
   if (warnings.length > 0) console.error(`check:i18n: ${warnings.length} unused message(s): warnings, not problems`);
   for (const p of problems) console.error(`${p.file}:${p.line}:${p.column}: ${p.message}`);
@@ -1068,6 +1093,14 @@ async function main() {
   }
   if (lazyNamespaces.length > 0) {
     console.log(`check:i18n: lazy namespaces, each loaded before its keys are used: ${lazyNamespaces.join(', ')}`);
+  }
+  if (builtWhole.length > 0) {
+    // Rule 4's blind spots, so that its silence there isn't taken for a clean catalog.
+    const names = builtWhole.map((ns) => `${ns}.*`).join(', ');
+    const example = `\`${builtWhole[0] ?? ''}.\${…}\``;
+    console.log(
+      `check:i18n: note: unused messages are not checked in ${names}: code builds their keys from the namespace alone (${example})`,
+    );
   }
   let summary = `check:i18n: ok (${keysUsed} message keys in ${files} files)`;
   if (errorCodes === null) {

@@ -1,7 +1,9 @@
 // The debug overlay, "Stats for nerds" (05 §10.7): what this page's stats collector measures, per tile, and the
-// server's view of this connection (01's stats.watch). Shift+D switches it (prefsStore.debug, kept on the device),
-// and so does `?debug=1` in the URL, which turns it on. ViewerLayout mounts it inside the layout, so it shows over a
-// fullscreen stage too.
+// server's view of this connection (01's stats.watch). Shift+D switches it (prefsStore.debug, kept on the device).
+// `?debug=1` in the URL shows it on that page only: prefsStore.debug stays as it was, so a link with the parameter
+// doesn't leave the overlay, its sampling every second and the server's stats.watch on for every later visit from
+// the device. ViewerLayout mounts it inside the layout, so it shows over a fullscreen stage too, and holds the URL's
+// part (debugInUrl), which hiding the overlay ends.
 //
 // It is a view of viewer.debug (debugStats.ts): while it is mounted it says it is open, and attachViewerStats
 // (statsLink.ts), run by the owner of the collector, makes the collector sample every second and fills in the
@@ -40,30 +42,37 @@ import type { ViewerServices } from './services';
 import { shareTitle } from './shareView';
 import type { ViewerShare } from './viewerStore';
 
-/** The URL parameter that turns the overlay on (05 §10.7). */
+/** The URL parameter that shows the overlay on the page that has it (05 §10.7). */
 export const DEBUG_PARAM = 'debug';
+
+/** Whether a URL's query (location.search) asks for the overlay: `?debug=1`. */
+export function debugInUrl(search: string): boolean {
+  return new URLSearchParams(search).get(DEBUG_PARAM) === '1';
+}
 
 export interface DebugOverlayProps {
   /** The viewer: its tiles, and the overlay's state (viewer.debug). */
   viewer: Pick<ViewerServices, 'store' | 'debug'>;
   /** The device's preferences: `debug` says whether the overlay is on. */
   prefs: PrefsStore;
+  /** The page's URL asked for the overlay (debugInUrl): it shows whatever prefsStore.debug says. */
+  fromUrl?: boolean | undefined;
+  /** Its close button was used, after prefsStore.debug went off: the owner of fromUrl ends it. */
+  onClose?: (() => void) | undefined;
   className?: string | undefined;
 }
 
-/** The overlay while prefsStore.debug is on; `?debug=1` turns that on when the layout mounts. */
-export function DebugOverlay({ viewer, prefs, className }: DebugOverlayProps) {
+/** The overlay while prefsStore.debug is on, or while the page's URL asks for it (fromUrl). */
+export function DebugOverlay({ viewer, prefs, fromUrl = false, onClose, className }: DebugOverlayProps) {
   const on = useStore(prefs, (s) => s.debug);
-  useEffect(() => {
-    if (new URLSearchParams(globalThis.location.search).get(DEBUG_PARAM) === '1') prefs.getState().setDebug(true);
-  }, [prefs]);
-  if (!on) return null;
+  if (!on && !fromUrl) return null;
   return (
     <DebugPanel
       viewer={viewer}
       className={className}
       onClose={() => {
         prefs.getState().setDebug(false);
+        onClose?.();
       }}
     />
   );
