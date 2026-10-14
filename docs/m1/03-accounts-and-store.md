@@ -1481,6 +1481,36 @@ invite's use back, and the session of a cookie the request arrived with is delet
 - **Login while the hash is NULL** answers `invalid_credentials`, with no enumeration. The login page always shows
   "Forgot your password? Ask an admin for a reset link."
 
+**As README S64 built it** (`auth/reset.go`; `httpapi/admin_users.go` and `auth.go`):
+- **Issue** (`IssuePasswordReset`), in order: the actor (an active admin or the CLI, 403 `forbidden`), the target
+  (404 `user_not_found`) and the self rule (409 `self_action_forbidden`), all read first and costing no hash; then,
+  for an admin target, the acting admin's own password (403 `wrong_password`, also for none; 429 `rate_limited`
+  from the `auth-user-ip` and `auth-user` buckets, as for `/me/password`, §7.3; 503 `server_busy` when the hash
+  queue is full); then the one `Write` above, which checks the first three again on the rows as they are then and
+  that the password verified is still the actor's (the target can have become an admin in between: then a request
+  that sent no password gets `wrong_password` and nothing is written). Its deletions are the revocation row
+  "Admin: password reset" of §7.7. The link is a `/reset#<token>` whose keyed hash alone is stored, 24 h, one per
+  user (a new one replaces the old), and the answer is the only place it is ever shown (201). The body of the request may be left out when no password is
+  needed: no body, an empty one and one of JSON white space only send no password; anything else must be one JSON
+  object (400 `bad_request`).
+- **A link can be issued for an account of any status, but only an active account can use it.** Check and
+  complete answer 403 `account_pending` for a pending account and `account_disabled` for a disabled one, as a login
+  answers a correct password. Disabling an account deletes its link (§7.7), so this is a link issued while the
+  account was not active; it works once the account is approved or enabled, while it lasts.
+- **Check** (`CheckPasswordReset`) takes a token of the `auth-ip` bucket (429) and answers `{username}`, so the
+  page can say whose password it is, or that the link is dead, before the form is filled in. A token of the wrong
+  shape is refused without a lookup; an unknown, used, replaced or expired one is 404 `reset_token_invalid`.
+- **Complete** (`CompletePasswordReset`), in order: the `auth-ip` bucket (429); the link, read-only (404, 403 as
+  above), so a request without a live link costs no hash and learns nothing about the password rules; the password
+  rules with the account's username (422 `validation_failed {password: code}`); the auth-hash budget and the hash,
+  outside the transaction (503 `server_busy`); one `Write` that checks the link again (of two requests with one
+  link, the second finds it gone, and a rename in between checks "not the username" again), sets the hash and
+  `password_changed_at`, deletes the link, sets the last login, opens a session and audits. A request that
+  arrived with a session cookie loses that old session, as a login does (§7.4, §7.7). The account has no other
+  session to end: issuing the link deleted them all.
+- After the completion the user's tabs hear of the new session (`devices`) and the admins' user lists that no
+  reset is pending any more (`admin.users`, §12.5).
+
 ### 7.11 Roles, the last-admin rule and admin alerts
 
 - There are two roles, `admin` and `user`. Only admins reach `/api/v1/admin/*`; everyone else gets 403 `forbidden`.
@@ -1873,8 +1903,9 @@ the rules live in the handlers, not in `auth.Service`: rooms have no credentials
   one with a skin tone and a flag of two regional indicators pass; the red heart (U+2764 U+FE0F), the keycaps and
   the profession and family sequences are `invalid`. That is the profile this section names, taken as it is;
   letting those emoji in would be a change to this rule, and is not decided.
-  - **Open, for the owner** (from README S53's write-back; still open after group 7; §19). "Emoji are allowed"
-    above reads as every emoji; the profile lets in only those that need neither U+FE0F nor a zero-width joiner.
+  - **Open, for the owner** (from README S53's write-back; still open after groups 7 and 8; §19). "Emoji are
+    allowed" above reads as every emoji; the profile lets in only those that need neither U+FE0F nor a zero-width
+    joiner.
     The two ways to close the gap are to keep the profile and say so in the rule (an admin who types
     "❤️ Movies" reads `invalid` and picks another emoji), or to let those sequences through in room names,
     which is a rule of our own next to the profile. Until the owner answers, the rule stands as written above
@@ -2173,8 +2204,8 @@ type ErrorResponse struct {
 | `wrong_password` | 403 | Re-authentication failed (`currentPassword`) |
 | `forbidden` | 403 | Not allowed for this role |
 | `csrf_failed` | 403 | Cross-origin unsafe request |
-| `account_pending` | 403 | Correct password, but the sign-up awaits approval |
-| `account_disabled` | 403 | Correct password, but the account is disabled |
+| `account_pending` | 403 | Correct password, or a live reset link (§7.10), but the sign-up awaits approval |
+| `account_disabled` | 403 | Correct password, or a live reset link (§7.10), but the account is disabled |
 | `registration_closed` | 403 | Mode `closed` |
 | `invite_required` | 403 | Mode `invite` and no invite token |
 | `not_found` | 404 | Generic |
@@ -2234,8 +2265,8 @@ Common errors are not repeated per row: `bad_request`, `payload_too_large`, `uns
 | 6 | `POST /api/v1/auth/invite/check` | Public | 200 `InviteInfo` | 403 `registration_closed`, 404 `invite_invalid`, 410 `invite_*` | M1 |
 | 7 | `POST /api/v1/auth/setup/check` | Public | 204 | 404 `setup_unavailable`/`setup_token_invalid` | M1 |
 | 8 | `POST /api/v1/auth/setup/complete` | Public | 201 `{user}` + cookie | 404 `setup_unavailable`/`setup_token_invalid` (checked first, before the fields and the hash, §7.8), 409 `username_taken`, 422, 503 | M1 |
-| 9 | `POST /api/v1/auth/reset/check` | Public | 200 `{username}` | 404 `reset_token_invalid` | M1 |
-| 10 | `POST /api/v1/auth/reset/complete` | Public | 200 `{user}` + cookie | 404 `reset_token_invalid`, 422, 503 | M1 |
+| 9 | `POST /api/v1/auth/reset/check` | Public | 200 `{username}` | 404 `reset_token_invalid`, 403 `account_pending`/`account_disabled` (a live link of an account that is not active, §7.10) | M1 |
+| 10 | `POST /api/v1/auth/reset/complete` | Public | 200 `{user}` + cookie | 404 `reset_token_invalid` and 403 `account_pending`/`account_disabled` (the link, checked first, before the password rules and the hash, §7.10), 422, 503 | M1 |
 | 11 | `GET /api/v1/me` | User | 200 `Me` (may rotate the cookie) | — | M1 |
 | 12 | `POST /api/v1/me/password` | User | 200 `{}` + rotated cookie (the old one works for 60 s more, §7.7) | 422 `validation_failed {newPassword}` first (the new password's rules, before any hash or token); then the current password: 403 `wrong_password` (also for a missing one, which is answered before the throttle), 429 `rate_limited` (too many wrong passwords, §7.3), 503 `server_busy` (the hash queue is full) | M1 |
 | 13 | `POST /api/v1/me/delete` | User | 204, cookie cleared | 409 `last_admin` first (before the password is looked at); then the password: 403 `wrong_password` (also for a missing one), 429 `rate_limited` (§7.3), 503 `server_busy` | M1 |
@@ -2605,6 +2636,29 @@ pending users go through the approval endpoints (otherwise 422 with `fields.stat
 
 `POST /api/v1/admin/users/{id}/sign-out` `{}` → `200 {"sessions": 2, "devices": 0}`.
 
+As README S64 built these (`httpapi/admin_users.go`, `auth/admin.go`, `auth/reset.go`):
+- **`GET /admin/users`** lists every account by name, pending sign-ups included. `?status=` narrows it to
+  `active`, `pending` or `disabled`; any other value, or the parameter twice, is 400 `bad_request`.
+- **`PATCH /admin/users/{id}`** is a JSON merge (§12.1): only the fields present change, and a field given the
+  value it has changes nothing; a request that changes nothing writes nothing and answers 200 with the account.
+  The 422 field codes: the username rules of §7.1 for `username`, `invalid` for a `role` other than `admin` or
+  `user`, `not_allowed` for a `status` other than `active` or `disabled` and for any `status` of a pending sign-up.
+  The errors come in the order of `UpdateUser` (§7.11): the actor (403), the values (422), the target (404), a
+  status for a pending sign-up (422), disabling oneself, the last admin and a taken name (409), all before the
+  password, so none of them costs a hash; then `currentPassword` when the role becomes `admin` (403
+  `wrong_password`, also for none; 429; 503). Enabling a disabled admin needs no password (§7.11 asks for it when
+  the role is granted). The `user` in the answer is read after the commit, with its sessions,
+  devices and inviter; should that read fail, or the account have another status by then (another admin's change
+  in between), it is built from the account alone: the change went through, and a 500 would say it did not.
+- **`DELETE /admin/users/{id}`** → 204: 404 `user_not_found`, 409 `self_action_forbidden` (`POST /me/delete` is
+  the place for the own account) and `last_admin`.
+- **`POST …/password-reset`**: the body may be left out when no password is needed; no body, an empty one and one
+  of JSON white space only send none, and anything else must be one JSON object (400 `bad_request`). §7.10 has
+  the rules and their order.
+- **`POST …/sign-out`** (the body is not read) ends every web session and device of the user and closes every
+  connection; the password stays. An admin may sign the own account out this way: the request's session is then
+  one of those, and the answer clears its cookie.
+
 `GET /api/v1/admin/approvals` →
 `{"pending": [{"id": "…", "username": "sam_k", "requestedAt": "…", "ip": "198.51.100.23"}]}`.
 
@@ -2733,8 +2787,9 @@ type InfoSource interface {
 | Change | `Notify` target and topics |
 |---|---|
 | Room created, renamed or deleted | `{All}`: `rooms` |
-| User renamed or role changed | `{UserID: target}`: `me`; `{Admins}`: `admin.users` |
-| User disabled, enabled, deleted, signed out, reset link issued | `{Admins}`: `admin.users` |
+| User renamed or role changed (a `PATCH` with `username` or `role`) | `Signal.UserChanged` with the account's current name and role; `{UserID: target}`: `me`; `{Admins}`: `admin.users` |
+| User disabled or enabled (a `PATCH` with `status` and neither of the two above), deleted, signed out, reset link issued | `{Admins}`: `admin.users` |
+| Reset link completed | `{Admins}`: `admin.users` (no reset pending any more); `{UserID}`: `devices` (the new session) |
 | Sign-up requested, approved or rejected | `{Admins}`: `admin.approvals`, `admin.users` |
 | Invite created or revoked | `{Admins}`: `admin.invites`; `{UserID: creator}`: `admin.invites` when a member created it |
 | Invite used by a registration | `{Admins}`: `admin.invites` **and `admin.users`**; `{UserID: creator}`: `admin.invites` when a member created it; `{UserID: the new user}`: `devices` (the session row below) |
@@ -2770,6 +2825,17 @@ As README S53 built the rooms row and the push endpoints (`httpapi/admin_rooms.g
   may be up to 30 s old: the room handlers check that the caller is still an active admin (403, §8), and the push
   handlers that write check that the caller's session still exists (401, §12.4.6).
 - The `push-test` bucket is a field of `API` (`pushTestLimiter`, §7.3), built with `Deps.Clock`.
+
+As README S64 built the user rows (`httpapi/admin_users.go`, `auth.go`):
+- **A `PATCH /admin/users/{id}` notifies by the fields present in the request**, not by what changed: the handler
+  can't tell a request that changed nothing from one that did, so it notifies for both. With `username` or `role`
+  present it calls `Signal.UserChanged` and notifies the user's `me` and the admins' `admin.users`, with the name
+  and role the account has after the commit, read back for the answer; with only `status` present, `admin.users`;
+  with none of the three (`{}`, or `currentPassword` alone), nothing. Disabling closes the user's connections
+  through auth's `ConnCloser` (§7.7), not through a topic.
+- **Completing a reset link notifies `admin.users`**, because the admins' lists show `resetPending`, and the
+  user's `devices`, like every new session. Issuing a link, deleting a user and "sign out everywhere" notify
+  `admin.users` after every success.
 
 The DTOs in `internal/protocol/api` (tygo → TS; 01's tygo config gains this package) are:
 - `Info`, `AccountRules`;
@@ -3209,7 +3275,7 @@ the registration mode.** In the `invite` and `closed` modes a `register` request
 `register-ip` token first, so an address that has used its tokens up gets 429 `rate_limited` where the mode alone
 would answer 403. It stays as S42 built it; §7.3 has the reasons and §7.9 the full order.
 
-**Open, for the owner** (README §6):
+**Open, for the owner** (README §6; still open after group 8):
 - **Room names and the emoji that need U+FE0F or a zero-width joiner** (§8). The rule says emoji are allowed;
   the PRECIS profile it names refuses the variation selector U+FE0F and a joiner between emoji, so the red
   heart, the keycaps and the profession and family sequences are `invalid` in a room name, while an emoji of one
