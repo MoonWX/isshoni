@@ -170,53 +170,111 @@ var caps = protocol.Caps{
 	DisplayCapture: true,
 }
 
-// client is one connection of a member in the default room: the Go signaling client, with a goroutine that
-// receives its notifications for as long as it lives, and the PeerConnections the test gives it.
+// client is one connection of a member in the default room: the Go signaling client, with the goroutines that
+// receive its notifications and its state changes for as long as it lives, and the PeerConnections the test gives
+// it. Like the web client, it recovers by itself (client_test.go): it resumes, answers every sub offer as 01 §9
+// says, restarts and rebuilds its PeerConnections (01 §10.4), and after a welcome that does not resume it joins
+// its room again, publishes its share again with replaces and moves its subscriptions to the new shares
+// (01 §10.5, §10.6). It publishes at most one share, on a pub PeerConnection of its own.
 type client struct {
-	t    *testing.T
-	name string
-	sig  *signal.Client
-	// UserID and ConnectionID are the welcome's.
-	userID, connectionID string
+	t     *testing.T
+	name  string
+	sig   *signal.Client
+	sock  *sockets // the TCP connections of the client's WebSocket upgrades
+	quit  chan struct{}
+	work  chan func()    // the client's own actions, run one after the other by its worker (client_test.go)
+	alive sync.WaitGroup // the goroutines that receive sig.Events and sig.States, and the worker
+	// userID is the welcome's; the user is the same on every connection.
+	userID string
 
-	pumped sync.WaitGroup // the goroutine that receives sig.Events
+	// subMu makes the sub PeerConnection's owner one at a time, as a browser's page is: answering an offer, the sub
+	// PC's recovery (subDriver) and the discarding of a new connection's old PeerConnections.
+	subMu sync.Mutex
 
-	mu      sync.Mutex // guards the fields below
-	room    protocol.RoomState
-	events  []protocol.RoomEvent
-	status  map[string][]protocol.SubscriptionStatus // by share, in the order they came
-	answers []protocol.PCAnswer                      // to this client's pub offers
-	offers  []protocol.PCOffer                       // the server's sub offers
-	errs    []protocol.Error                         // error notifications
-	goodbye []protocol.ServerShutdown                // server.shutdown notices
-	failed  []error                                  // what the pump ran into
-	viewer  *sfutest.Viewer                          // answers the sub offers; nil until watch
+	mu           sync.Mutex // guards the fields below
+	connectionID string     // the last welcome's
+	roomID       string     // the room the client is in: the one it joins again after a welcome that did not resume
+	ready        bool       // signaling is ready (01 §10.1): the client acts on its PeerConnections only then
+	epoch        int        // the welcomes that did not resume since the first: a new connection after a restart
+	room         protocol.RoomState
+	rooms        []protocol.RoomState // every room.state, in order
+	events       []protocol.RoomEvent
+	status       map[string][]protocol.SubscriptionStatus // by share, in the order they came
+	answers      []protocol.PCAnswer                      // to this client's pub offers
+	offers       []protocol.PCOffer                       // the server's sub offers
+	hints        []protocol.QualityHint                   // quality.hint notifications
+	asked        []protocol.PCRestart                     // the server's pc.restart requests
+	sent         []protocol.PCRestart                     // the client's pc.restart requests
+	pubOffers    []protocol.PCOffer                       // the client's pub offers
+	errs         []protocol.Error                         // error notifications
+	goodbye      []protocol.ServerShutdown                // server.shutdown notices
+	states       []signal.StateChange                     // the signaling client's states after its first welcome
+	failed       []error                                  // what the pump, the worker and the drivers ran into
+	viewer       *sfutest.Viewer                          // answers the sub offers; nil until watch
+	sub          subPC                                    // the sub PeerConnection as the client knows it
+	wants        []protocol.SubscriptionWant              // the desired subscriptions, one per share, merged (01 §8.9)
+	owners       map[string]string                        // the user of every share the client has seen in room.state
+	shares       []*share                                 // what the client publishes
+}
+
+// subPC is what a client knows of its sub PeerConnection (01 §9, §10.4): the gen and neg of the last offer it
+// answered, that offer's ICE user name and its answer, and the timers of its recovery.
+type subPC struct {
+	gen, neg uint32
+	ufrag    string
+	answer   string
+	// down is when the PC's ICE was first seen disconnected, zero while it isn't; restartAt is when an offer with a
+	// new ICE user name came (an ICE restart, whoever asked for it), zero once ICE is connected again; askedAt and
+	// rebuiltAt are the client's last pc.restart requests for an ICE restart and a rebuild.
+	down, restartAt, askedAt, rebuiltAt time.Time
+}
+
+// connOptions configure a connection beyond its member and role.
+type connOptions struct {
+	// caps are the hello's capabilities; nil means the harness's caps.
+	caps *protocol.Caps
 }
 
 // connect opens a signaling connection for m with the given role and joins the default room. The client is closed
 // when the test ends, before the server stops.
 func (w *world) connect(m *member, role protocol.Role) *client {
 	w.t.Helper()
+	return w.connectWith(m, role, connOptions{})
+}
+
+// connectWith is connect with options.
+func (w *world) connectWith(m *member, role protocol.Role, o connOptions) *client {
+	w.t.Helper()
+	hello := caps
+	if o.caps != nil {
+		hello = *o.caps
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), waitTimeout)
 	defer cancel()
+	sock := &sockets{}
 	sig, err := signal.Dial(ctx, signal.Options{
-		URL:        w.srv.WSURL,
-		HTTPClient: m.http, // its jar has the session cookie, and its transport reaches the test server
+		URL: w.srv.WSURL,
+		// Its jar has the member's session cookie, and its transport reaches the test server. The sockets it dials
+		// are recorded, so a test can cut one.
+		HTTPClient: &http.Client{Jar: m.http.Jar, Transport: sock.transport(w.t, w.srv.Client.Transport)},
 		Client:     protocol.ClientInfo{Kind: protocol.ClientKindTool, Version: "0.1.0", OS: protocol.ClientOSLinux},
 		Role:       role,
-		Caps:       caps,
+		Caps:       hello,
 	})
 	if err != nil {
 		w.t.Fatalf("%s: dial %s: %v", m.name, w.srv.WSURL, err)
 	}
 	welcome := sig.Welcome()
 	c := &client{
-		t: w.t, name: m.name, sig: sig, userID: welcome.User.ID, connectionID: welcome.ConnectionID,
-		status: map[string][]protocol.SubscriptionStatus{},
+		t: w.t, name: m.name, sig: sig, sock: sock, quit: make(chan struct{}), work: make(chan func(), 64),
+		userID: welcome.User.ID, connectionID: welcome.ConnectionID, ready: true,
+		status: map[string][]protocol.SubscriptionStatus{}, owners: map[string]string{},
 	}
 	// A signaling client whose Events nobody receives stops reading its socket (01 §15.3): the pump runs until Close
-	// has closed the channel.
-	c.pumped.Go(c.pump)
+	// has closed the channel. The state watcher and the worker are the client's recovery (client_test.go).
+	c.alive.Go(c.pump)
+	c.alive.Go(c.watchStates)
+	c.alive.Go(c.worker)
 	w.t.Cleanup(c.close)
 	if welcome.Resumed || welcome.User.Name != m.name {
 		w.t.Fatalf("%s: welcome = %+v", m.name, welcome)
@@ -226,25 +284,38 @@ func (w *world) connect(m *member, role protocol.Role) *client {
 	if joined.Room.ID != welcome.DefaultRoomID {
 		w.t.Fatalf("%s: joined %+v, want the default room %s", m.name, joined.Room, welcome.DefaultRoomID)
 	}
+	c.mu.Lock()
+	c.roomID = joined.Room.ID
+	c.mu.Unlock()
 	return c
 }
 
-// close ends the connection with a normal close, so the server ends it at once, and waits for the pump.
+// close ends the connection with a normal close, so the server ends it at once, and waits for the client's
+// goroutines.
 func (c *client) close() {
 	if err := c.sig.Close(); err != nil {
 		c.t.Logf("%s: closing the signaling client: %v", c.name, err)
 	}
-	c.pumped.Wait()
+	close(c.quit)
+	c.alive.Wait()
+}
+
+// connID returns the connection id of the last welcome: a new one after a welcome that did not resume.
+func (c *client) connID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.connectionID
 }
 
 // pump receives the client's notifications in order until the client has stopped. It keeps what the tests look at
 // and answers the server's sub offers with the client's Viewer, as a browser's sub PeerConnection would (01 §9).
+// What takes a request of its own (moving a subscription to a share that replaces another) or a negotiation (a
+// codec hint, a request to rebuild the pub PC) goes to the worker or to the share's driver: a pump that waited for
+// a reply would hold up the notifications behind it.
 func (c *client) pump() {
 	for env := range c.sig.Events() {
 		if err := c.handle(env); err != nil {
-			c.mu.Lock()
-			c.failed = append(c.failed, fmt.Errorf("%s: %w", env.Type, err))
-			c.mu.Unlock()
+			c.fail(fmt.Errorf("%s: %w", env.Type, err))
 		}
 	}
 }
@@ -256,9 +327,7 @@ func (c *client) handle(env protocol.Envelope) error {
 		if err != nil {
 			return err
 		}
-		c.mu.Lock()
-		c.room = st
-		c.mu.Unlock()
+		c.roomStateArrived(st)
 	case protocol.MessageTypeRoomEvent:
 		ev, err := protocol.Decode[protocol.RoomEvent](env)
 		if err != nil {
@@ -291,6 +360,31 @@ func (c *client) handle(env protocol.Envelope) error {
 			return err
 		}
 		return c.answerSubOffer(o)
+	case protocol.MessageTypePCRestart:
+		r, err := protocol.Decode[protocol.PCRestart](env)
+		if err != nil {
+			return err
+		}
+		c.mu.Lock()
+		c.asked = append(c.asked, r)
+		c.mu.Unlock()
+		if r.PC != protocol.PCKindPub || r.Mode != protocol.RestartModeRebuild {
+			return fmt.Errorf("the server asked for %+v: it asks only to rebuild the pub PC (01 §10.4)", r)
+		}
+		for _, sh := range c.published() {
+			sh.post(func() { sh.rebuildAsked(r.Gen) })
+		}
+	case protocol.MessageTypeQualityHint:
+		h, err := protocol.Decode[protocol.QualityHint](env)
+		if err != nil {
+			return err
+		}
+		c.mu.Lock()
+		c.hints = append(c.hints, h)
+		c.mu.Unlock()
+		for _, sh := range c.published() {
+			sh.post(func() { sh.hinted(h) })
+		}
 	case protocol.MessageTypeError:
 		e, err := protocol.Decode[protocol.Error](env)
 		if err != nil {
@@ -304,19 +398,27 @@ func (c *client) handle(env protocol.Envelope) error {
 		if err != nil {
 			return err
 		}
+		// The server is going away and will close the PeerConnections too: like the web client, this one ignores what
+		// happens to them until it is ready again (01 §11.6).
 		c.mu.Lock()
 		c.goodbye = append(c.goodbye, bye)
+		c.ready = false
 		c.mu.Unlock()
 	}
 	return nil
 }
 
-// answerSubOffer applies a sub offer on the Viewer and sends its answer with the offer's gen and neg. The Viewer's
-// answer carries its candidates, so the client sends no pc.ice.
+// answerSubOffer answers a sub offer on the Viewer as 01 §9 says, and sends the answer with the offer's gen and neg.
+// An offer of a new gen gets a new PeerConnection (Viewer.Rebuild); the repeat of the offer last answered (a resume
+// sends it again) gets the answer that was sent; an older one is dropped. An offer of the same gen with a new ICE
+// user name is an ICE restart, whoever asked for it: it stops the 3 s timer of the sub PC's recovery and starts its
+// 15 s one (01 §10.4). The Viewer's answer carries its candidates, so the client sends no pc.ice.
 func (c *client) answerSubOffer(o protocol.PCOffer) error {
+	c.subMu.Lock()
+	defer c.subMu.Unlock()
 	c.mu.Lock()
 	c.offers = append(c.offers, o)
-	viewer := c.viewer
+	viewer, cur := c.viewer, c.sub
 	c.mu.Unlock()
 	if o.PC != protocol.PCKindSub {
 		return fmt.Errorf("an offer for the %s PC: the server offers on sub only", o.PC)
@@ -324,34 +426,114 @@ func (c *client) answerSubOffer(o protocol.PCOffer) error {
 	if viewer == nil {
 		return errors.New("a sub offer, and the client has no Viewer")
 	}
+	switch {
+	case o.Gen < cur.gen, o.Gen == cur.gen && o.Neg < cur.neg:
+		return nil // stale (01 §9 rules 2 and 3)
+	case o.Gen == cur.gen && o.Neg == cur.neg:
+		return c.send(protocol.MessageTypePCAnswer, protocol.PCAnswer{PC: o.PC, Gen: o.Gen, Neg: o.Neg, SDP: protocol.SDP(cur.answer)})
+	case o.Gen > cur.gen && cur.gen != 0:
+		if err := viewer.Rebuild(); err != nil {
+			return err
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), waitTimeout)
 	defer cancel()
 	answer, err := viewer.Answer(ctx, webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: o.SDP.Reveal()})
 	if err != nil {
 		return err
 	}
-	return c.sig.Send(protocol.MessageTypePCAnswer, protocol.PCAnswer{PC: o.PC, Gen: o.Gen, Neg: o.Neg, SDP: protocol.SDP(answer.SDP)})
+	ufrag := iceUfrag(o.SDP.Reveal())
+	c.mu.Lock()
+	next := subPC{gen: o.Gen, neg: o.Neg, ufrag: ufrag, answer: answer.SDP, askedAt: cur.askedAt, rebuiltAt: cur.rebuiltAt}
+	if o.Gen == cur.gen {
+		next.down, next.restartAt = cur.down, cur.restartAt
+		if ufrag != cur.ufrag {
+			next.down, next.restartAt = time.Time{}, time.Now()
+		}
+	}
+	c.sub = next
+	c.mu.Unlock()
+	return c.send(protocol.MessageTypePCAnswer, protocol.PCAnswer{PC: o.PC, Gen: o.Gen, Neg: o.Neg, SDP: protocol.SDP(answer.SDP)})
 }
 
-// request sends a request and decodes its reply into result; any error fails the test.
+// iceUfrag returns the first ICE user name of a description, "" when it has none.
+func iceUfrag(sdp string) string {
+	for line := range strings.SplitSeq(sdp, "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(line), "a=ice-ufrag:"); ok {
+			return v
+		}
+	}
+	return ""
+}
+
+// send sends a notification and keeps the pc.restart requests and the pub offers among them.
+func (c *client) send(typ protocol.MessageType, data any) error {
+	if err := c.sig.Send(typ, data); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch m := data.(type) {
+	case protocol.PCRestart:
+		c.sent = append(c.sent, m)
+	case protocol.PCOffer:
+		c.pubOffers = append(c.pubOffers, m)
+	}
+	return nil
+}
+
+// request sends a request and decodes its reply into result; any error fails the test. It is for the test's own
+// goroutine; the client's own actions use do.
 func (c *client) request(typ protocol.MessageType, data, result any) {
 	c.t.Helper()
+	if err := c.do(typ, data, result); err != nil {
+		c.t.Fatalf("%s: %v", c.name, err)
+	}
+}
+
+// do sends a request and decodes its reply into result.
+func (c *client) do(typ protocol.MessageType, data, result any) error {
 	ctx, cancel := context.WithTimeout(context.Background(), waitTimeout)
 	defer cancel()
 	if err := c.sig.Request(ctx, typ, data, result); err != nil {
-		c.t.Fatalf("%s: %s: %v", c.name, typ, err)
+		return fmt.Errorf("%s: %w", typ, err)
 	}
+	return nil
+}
+
+// fail keeps what went wrong on one of the client's own goroutines, for check.
+func (c *client) fail(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.failed = append(c.failed, fmt.Errorf("%s: %w", c.name, err))
+}
+
+// viewerOptions configure a client's Viewer beyond its Pion settings.
+type viewerOptions struct {
+	// keep bounds the packets each of its Recorders keeps (0: the Viewer's default).
+	keep int
+	// noH264 makes the Viewer a fresh Firefox, without an H.264 decoder (sfutest.ViewerOptions.NoH264).
+	noH264 bool
 }
 
 // watch gives the client its sub PeerConnection: a Viewer with the given Pion settings, which answers the
 // server's sub offers from now on. keep bounds the packets each of its Recorders keeps (0: the Viewer's default).
 func (c *client) watch(se webrtc.SettingEngine, keep int) *sfutest.Viewer {
 	c.t.Helper()
-	v, err := sfutest.NewViewer(sfutest.ViewerOptions{Settings: se, KeepPackets: keep})
+	return c.watchWith(se, viewerOptions{keep: keep})
+}
+
+// watchWith is watch with options. The sub PC's recovery (subDriver) runs until the Viewer closes.
+func (c *client) watchWith(se webrtc.SettingEngine, o viewerOptions) *sfutest.Viewer {
+	c.t.Helper()
+	v, err := sfutest.NewViewer(sfutest.ViewerOptions{Settings: se, KeepPackets: o.keep, NoH264: o.noH264})
 	if err != nil {
 		c.t.Fatal(err)
 	}
+	stop, stopped := make(chan struct{}), make(chan struct{})
 	c.t.Cleanup(func() {
+		close(stop)
+		<-stopped
 		if err := v.Close(); err != nil {
 			c.t.Errorf("%s: Viewer.Close: %v", c.name, err)
 		}
@@ -359,18 +541,40 @@ func (c *client) watch(se webrtc.SettingEngine, keep int) *sfutest.Viewer {
 	c.mu.Lock()
 	c.viewer = v
 	c.mu.Unlock()
+	go func() {
+		defer close(stopped)
+		c.subDriver(stop)
+	}()
 	return v
 }
 
-// subscribe sends the client's subscriptions in one subscribe.update, which the SFU applies in one step. A share
-// the server no longer knows fails the test.
+// subscribe sends the client's subscriptions in one subscribe.update, which the SFU applies in one step, and merges
+// them into the client's desired set (01 §8.9), which it sends again after a resume. A share the server no longer
+// knows fails the test.
 func (c *client) subscribe(wants ...protocol.SubscriptionWant) {
 	c.t.Helper()
+	c.mu.Lock()
+	c.wants = mergeWants(c.wants, wants...)
+	c.mu.Unlock()
 	var res protocol.SubscribeResult
 	c.request(protocol.MessageTypeSubscribeUpdate, protocol.SubscribeUpdate{Subs: wants}, &res)
 	if len(res.Ignored) != 0 {
 		c.t.Fatalf("%s: subscribe.update ignored %v", c.name, res.Ignored)
 	}
+}
+
+// mergeWants merges subscriptions into a desired set, one entry per share, as the server merges a
+// subscribe.update into a connection's wants.
+func mergeWants(set []protocol.SubscriptionWant, wants ...protocol.SubscriptionWant) []protocol.SubscriptionWant {
+	set = slices.Clone(set)
+	for _, w := range wants {
+		if i := slices.IndexFunc(set, func(s protocol.SubscriptionWant) bool { return s.ShareID == w.ShareID }); i >= 0 {
+			set[i] = w
+		} else {
+			set = append(set, w)
+		}
+	}
+	return set
 }
 
 // want is one subscription: the full layer with audio for the share in focus, the preview without audio for a
@@ -387,6 +591,13 @@ func (c *client) roomState() protocol.RoomState {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.room
+}
+
+// roomStates returns every room.state so far, in order.
+func (c *client) roomStates() []protocol.RoomState {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.rooms)
 }
 
 // shareIn returns a share of the newest room.state.
@@ -444,8 +655,8 @@ func (c *client) waitStatus(w protocol.SubscriptionWant) {
 	})
 }
 
-// check fails the test when the client was sent an error notification, or its pump could not handle a message:
-// nothing in these tests is supposed to go wrong on the way.
+// check fails the test when the client was sent an error notification, or one of its goroutines ran into
+// something: nothing in these tests is supposed to go wrong on the way.
 func (c *client) check() {
 	c.t.Helper()
 	c.mu.Lock()
@@ -454,18 +665,11 @@ func (c *client) check() {
 		c.t.Errorf("%s was sent error %s (scope %s, share %q, pc %q)", c.name, e.Code, e.Scope, e.ShareID, e.PC)
 	}
 	for _, err := range c.failed {
-		c.t.Errorf("%s: %v", c.name, err)
+		c.t.Errorf("%v", err)
 	}
 }
 
 // ---- publishing ----
-
-// share is one share of a client: the hub's id and parameters, and the Publisher that sends its media.
-type share struct {
-	id     string
-	params protocol.ShareParams
-	pub    *publish.Publisher
-}
 
 // fakeLayers are small fake video layers, light enough for a 10×10 test on any CI machine: the full layer "f" and
 // the preview "q".
@@ -476,89 +680,98 @@ func fakeLayers() []fake.VideoLayer {
 	}
 }
 
+// fakeSource makes the fake media of a share: f and q with audio, in an H.264 profile ("" is fake's default, High),
+// with a GOP far longer than a test, so that every keyframe after a layer's first is one that somebody asked for.
+func fakeSource(seed uint64, profile string) (*fake.Source, error) {
+	return fake.New(fake.Config{Profile: profile, Layers: fakeLayers(), GOP: time.Minute, Audio: true, Seed: seed})
+}
+
+// shareOptions configure a share beyond its seed and the Pion settings of its publisher.
+type shareOptions struct {
+	// profileSource makes the media a sfutest.ProfileSource that starts in High and can switch to Constrained
+	// Baseline, and the Publisher offers both, High first, as Chrome does: a sharer whose room's codec policy can
+	// change (02 §8.3).
+	profileSource bool
+}
+
 // publish starts a share and publishes fake media on it, the way a browser does (01 §11.2): share.start, a pub
-// offer whose tracks name the share, the server's answer, then media. The video is simulcast f and q with audio;
-// its GOP is far longer than a test, so every keyframe after a layer's first is one that somebody asked for. se
-// are the Pion settings of the pub PeerConnection.
+// offer whose tracks name the share, the server's answer, then media. The video is simulcast f and q with audio.
+// se are the Pion settings of the pub PeerConnection. The share's driver (client_test.go) recovers its pub PC
+// until the test ends.
 func (c *client) publish(seed uint64, se webrtc.SettingEngine) *share {
 	c.t.Helper()
-	sh := &share{}
-	c.request(protocol.MessageTypeShareStart, protocol.ShareStart{
-		Kind: protocol.ShareKindScreen, Preset: protocol.PresetAuto, Audio: true, Ref: "r" + strconv.FormatUint(seed, 10),
-	}, &sh.params)
-	sh.id = sh.params.ShareID
-	if sh.id == "" || sh.params.Codec != protocol.CodecH264High || len(sh.params.Encodings) != 2 || sh.params.AudioBitrate <= 0 {
-		c.t.Fatalf("%s: share.start = %+v, want an id, High profile, two encodings and an audio bitrate", c.name, sh.params)
-	}
+	return c.publishWith(seed, se, shareOptions{})
+}
 
-	src, err := fake.New(fake.Config{Layers: fakeLayers(), GOP: time.Minute, Audio: true, Seed: seed})
-	if err != nil {
-		c.t.Fatal(err)
+// publishWith is publish with options.
+func (c *client) publishWith(seed uint64, se webrtc.SettingEngine, o shareOptions) *share {
+	c.t.Helper()
+	if len(c.published()) != 0 {
+		c.t.Fatalf("%s publishes a share already: a client of this harness has one pub PC, for one share", c.name)
 	}
-	c.t.Cleanup(func() { _ = src.Close() })
-	sh.pub, err = publish.New(publish.Options{Source: src, Settings: se, Audio: true})
-	if err != nil {
-		c.t.Fatal(err)
+	sh := &share{
+		c: c, seed: seed, settings: se, quit: make(chan struct{}), cmds: make(chan func(), 64),
+		start: protocol.ShareStart{Kind: protocol.ShareKindScreen, Preset: protocol.PresetAuto, Audio: true},
 	}
-	// The Publisher sends until the test ends: its context has no deadline of its own.
-	ctx, cancel := context.WithCancel(context.Background())
-	c.t.Cleanup(func() {
-		cancel()
-		if err := sh.pub.Close(); err != nil {
-			c.t.Errorf("%s: Publisher.Close: %v", c.name, err)
-		}
-	})
+	params, err := sh.startShare("")
+	if err != nil {
+		c.t.Fatalf("%s: %v", c.name, err)
+	}
+	if params.ShareID == "" || params.Codec != protocol.CodecH264High || len(params.Encodings) != 2 || params.AudioBitrate <= 0 {
+		c.t.Fatalf("%s: share.start = %+v, want an id, High profile, two encodings and an audio bitrate", c.name, params)
+	}
+	sh.id, sh.applied = params.ShareID, params.Codec
+	sh.ids = []string{params.ShareID}
 
-	offerCtx, cancelOffer := context.WithTimeout(ctx, waitTimeout)
-	defer cancelOffer()
-	offer, err := sh.pub.Offer(offerCtx)
+	if o.profileSource {
+		sh.profiles = []string{"42e0"}
+		sh.src, err = sfutest.NewProfileSource(publish.DefaultProfile, func(p string) (*fake.Source, error) {
+			return fakeSource(seed, p)
+		})
+	} else {
+		sh.src, err = fakeSource(seed, "")
+	}
 	if err != nil {
-		c.t.Fatalf("%s: pub offer: %v", c.name, err)
-	}
-	// One TrackRef per m-section: the simulcast encodings share the video's mid.
-	var tracks []protocol.TrackRef
-	for _, tr := range sh.pub.Tracks() {
-		ref := protocol.TrackRef{MID: tr.MID, ShareID: sh.id, Kind: protocol.TrackKindVideo}
-		if tr.Kind == webrtc.RTPCodecTypeAudio {
-			ref.Kind = protocol.TrackKindAudio
-		}
-		if !slices.Contains(tracks, ref) {
-			tracks = append(tracks, ref)
-		}
-	}
-	if err := c.sig.Send(protocol.MessageTypePCOffer, protocol.PCOffer{
-		PC: protocol.PCKindPub, Gen: 1, Neg: 1, SDP: protocol.SDP(offer.SDP), Tracks: tracks,
-	}); err != nil {
-		c.t.Fatalf("%s: send the pub offer: %v", c.name, err)
-	}
-	var answer protocol.PCAnswer
-	eventually(c.t, func() bool {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		for _, a := range c.answers {
-			if a.PC == protocol.PCKindPub && a.Gen == 1 && a.Neg == 1 {
-				answer = a
-				return true
-			}
-		}
-		return false
-	}, func() string {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		return fmt.Sprintf("%s: no answer to the pub offer; errors so far: %+v", c.name, c.errs)
-	})
-	if err := sh.pub.SetAnswer(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answer.SDP.Reveal()}); err != nil {
-		c.t.Fatalf("%s: the Publisher refused the answer: %v", c.name, err)
-	}
-	if err := sh.pub.Start(ctx); err != nil {
 		c.t.Fatal(err)
 	}
+	c.t.Cleanup(func() { _ = sh.src.Close() })
+	// The Publishers send until the test ends: their context has no deadline of its own.
+	sh.ctx, sh.cancel = context.WithCancel(context.Background())
+	pub, err := sh.newPublisher()
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	sh.pub, sh.gen, sh.neg = pub, 1, 1
+	c.t.Cleanup(sh.stop)
+	if err := sh.negotiate(pub, 1, 1, false); err != nil {
+		c.t.Fatalf("%s: %v", c.name, err)
+	}
+	if err := pub.Start(sh.ctx); err != nil {
+		c.t.Fatal(err)
+	}
+	c.mu.Lock()
+	c.shares = append(c.shares, sh)
+	c.mu.Unlock()
+	sh.driven.Go(sh.drive)
 	return sh
+}
+
+// published returns the shares the client publishes.
+func (c *client) published() []*share {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.shares)
 }
 
 // waitLive waits until the client's room.state shows the share live with both layers, its codec and its audio:
 // the SFU has both simulcast layers and has seen the first keyframe.
 func (c *client) waitLive(shareID string) protocol.ShareInfo {
+	c.t.Helper()
+	return c.waitLiveIn(shareID, protocol.CodecH264High)
+}
+
+// waitLiveIn is waitLive for a share in another H.264 profile.
+func (c *client) waitLiveIn(shareID string, codec protocol.CodecKey) protocol.ShareInfo {
 	c.t.Helper()
 	both := []protocol.VideoLayer{protocol.VideoLayerHigh, protocol.VideoLayerLow}
 	var info protocol.ShareInfo
@@ -566,9 +779,9 @@ func (c *client) waitLive(shareID string) protocol.ShareInfo {
 		var ok bool
 		info, ok = c.shareIn(shareID)
 		return ok && info.Status == protocol.ShareStatusLive && slices.Equal(info.Layers, both) &&
-			info.Codec == protocol.CodecH264High && info.Audio
+			info.Codec == codec && info.Audio
 	}, func() string {
-		return fmt.Sprintf("%s: share %s in room.state is %+v, want it live", c.name, shareID, info)
+		return fmt.Sprintf("%s: share %s in room.state is %+v, want it live in %s", c.name, shareID, info, codec)
 	})
 	return info
 }
@@ -699,6 +912,13 @@ func ticks(from, to uint32) int64 {
 // between the last frame of one layer and the first of the next, the RTP timestamp advances by their capture time
 // difference (02 §9.4). The tolerance is what the SFU's wall-clock rule may add on a busy machine; a wrong offset
 // is off by a random 32-bit number.
+//
+// The new layer's first frame can have been captured before the old layer's last one (README S74: TestLayers once
+// failed with "the capture time by -100ms" on a loaded machine). The SFU switches when the new layer's keyframe is
+// read, and each layer has a read loop of its own: when the new layer's loop is late, the old layer's frames
+// captured after the keyframe are forwarded first. A timestamp never goes back, so the SFU puts such a keyframe one
+// tick after the last frame (02 §9.4, the lastTS + 1 rule, for a step of up to a second back), and the step to
+// expect is then that tick. The test assumed that the keyframe always comes after the frames captured before it.
 func checkSwitchTimestamps(t *testing.T, pkts []sfutest.Packet) {
 	t.Helper()
 	const tolerance = 50 * time.Millisecond
@@ -709,10 +929,14 @@ func checkSwitchTimestamps(t *testing.T, pkts []sfutest.Packet) {
 			continue
 		}
 		got := time.Duration(ticks(a.TS, b.TS)) * time.Second / 90000
-		wantStep := time.Duration(b.Mark.CaptureNS - a.Mark.CaptureNS)
+		capture := time.Duration(b.Mark.CaptureNS - a.Mark.CaptureNS)
+		wantStep := capture
+		if capture < 0 && capture > -time.Second {
+			wantStep = 0
+		}
 		if d := got - wantStep; d < -tolerance || d > tolerance {
 			t.Errorf("switch %s → %s at seq %d: the timestamp advances by %v, the capture time by %v", a.Mark.RID,
-				b.Mark.RID, b.FirstSeq, got, wantStep)
+				b.Mark.RID, b.FirstSeq, got, capture)
 		}
 	}
 }

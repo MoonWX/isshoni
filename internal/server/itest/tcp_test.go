@@ -53,7 +53,7 @@ func watchOverTCP(t *testing.T, w *world, port int) {
 	}
 
 	// Both clients reach the server over TCP, on the one port.
-	for name, pc := range map[string]*webrtc.PeerConnection{"the publisher": sh.pub.PC(), "the viewer": viewer.PC()} {
+	for name, pc := range map[string]*webrtc.PeerConnection{"the publisher": sh.publisher().PC(), "the viewer": viewer.PC()} {
 		pair := selectedPair(t, name, pc)
 		if pair.Local.Protocol != webrtc.ICEProtocolTCP || pair.Remote.Protocol != webrtc.ICEProtocolTCP {
 			t.Errorf("%s selected a %s/%s pair, want TCP", name, pair.Local.Protocol, pair.Remote.Protocol)
