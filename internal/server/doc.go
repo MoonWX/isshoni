@@ -22,7 +22,7 @@
 //     socket, the store, and last the data-directory lock. It finishes within shutdown_timeout (10 s); what is
 //     still open then is closed by force, and its error says so with ErrShutdownForced.
 //
-// What runs in the server (README slices S31, S44, S54, S59 and S71; 04 slices S4, S7, W1, W2 and S12b):
+// What runs in the server (README slices S31, S44, S54, S59, S71 and S80; 04 slices S4, S7, W1, W2, S12b and S13):
 //   - The HTTP side of every TLS mode of 04 §8.1. httpapi's router serves the embedded web app with its fallback,
 //     GET /healthz and GET /readyz from ops.Health, 03's REST API at /api/v1/ and 01's hub at GET /ws.
 //     In off mode the router is on plain HTTP on listen.http, behind the operator's HTTPS proxy, or on localhost for
@@ -48,6 +48,10 @@
 //     carries media, listen.ice_tcp, and the ICE side of the 443 multiplexer), and 02's SFU on it. 01's sfuplane is
 //     the hub's MediaPlane in front of the SFU, so share.start, the pc.* messages and subscribe.update reach it;
 //     the admin's bitrate limit follows 03's settings live. The readiness check "media" is theirs.
+//   - The connection test (README S80; 04 §7.7, wire.go): POST /api/v1/conntest on the REST API for every signed-in
+//     user, ops.ConnTest over the SFU's probe PCs. A transport without a listener (tcp443 in off mode, udp or
+//     tcp7882 when the operator turned it off) is 409 transport_disabled; the answer's server object is the public
+//     IPv4 address, NAT kind, provider, container and media ports that Start found.
 //   - Web Push (04 §14; wire.go): 04's push service on 03's tables, built before the account service so that its
 //     VAPID fingerprint check purges the subscriptions of a rotated key first. A share that goes live reaches it
 //     from the hub (the users who are not in the room get "started sharing"), 03's admin alerts reach it from the
@@ -68,8 +72,8 @@
 //     restart itself: cmd/isshoni calls it when Run returns ErrRestartRequested, and the process replaces itself
 //     with a new run of the same command line; where a platform has none (exec_other.go), cmd/isshoni exits 75.
 //
-// The later slices of the M1 plan extend Start and Shutdown at the marked steps: the ops data, metrics and their REST
-// routes (S80, S85) and the SIGHUP reload (S90), which serve only answers with a log line so far.
+// The later slices of the M1 plan extend Start and Shutdown at the marked steps: the ops data, metrics and the other
+// REST routes of ops (S85) and the SIGHUP reload (S90), which serve only answers with a log line so far.
 //
 // Of the packages of 04 §2, only this one, cmd/isshoni and servertest import signal, sfu and sfuplane, or combine
 // store and auth with ops and push.

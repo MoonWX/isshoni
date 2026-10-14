@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"net"
 	"net/http"
 	"net/netip"
 	"os"
@@ -35,11 +37,11 @@ import (
 // test with a fake behind it (wire_test.go).
 //
 // What the later slices of the M1 plan add here:
-//   - README S80 and S85: ops.Metrics as the router's Observer, the hub's Registerer and push's Metrics, a collector
-//     over the SFU's Metrics, the transfer counter on the Transport and the multiplexer (with its Flush as
-//     ops.DataDir.Flush, so a backup holds the counters as they are), the transfer alerts through push's AdminAlert,
-//     and the REST routes of ops through API.Handle: the dashboard, and doctor's and the bandwidth estimate's, over
-//     the ops.Doctor that wire builds.
+//   - README S85: ops.Metrics as the router's Observer, the hub's Registerer and push's Metrics, a collector over the
+//     SFU's Metrics, the transfer counter on the Transport and the multiplexer (with its Flush as ops.DataDir.Flush,
+//     so a backup holds the counters as they are), the transfer alerts through push's AdminAlert, and the other REST
+//     routes of ops through API.Handle: the dashboard, and doctor's and the bandwidth estimate's, over the ops.Doctor
+//     that wire builds. The first REST route of ops, POST /api/v1/conntest, came with README S80 (wireConnTest).
 
 // The adapters and what they adapt: each consumer interface of 04 §6.6 on the left, and on the right the part of
 // 01's hub, 03's service and 04's push service that an adapter calls.
@@ -55,6 +57,7 @@ var (
 	_ httpapi.InfoSource   = buildInfo{}
 	_ ops.AdminAccounts    = (*adminAccounts)(nil)
 	_ ops.MetaStore        = metaStore{}
+	_ ops.Prober           = prober{}
 	_ push.Store           = pushStore{}
 
 	_ sessionService = (*auth.Service)(nil)
@@ -62,6 +65,7 @@ var (
 	_ hubCloser      = (*signal.Hub)(nil)
 	_ hubControl     = (*signal.Hub)(nil)
 	_ pushService    = (*push.Service)(nil)
+	_ probeSFU       = (*sfu.SFU)(nil)
 )
 
 // ---- step 4: the store and the policy pins ----
@@ -365,8 +369,8 @@ func mediaCheck(udp bool, tr *netx.Transport, sfuReady func() error) func() (ok 
 	}
 }
 
-// wireAccounts builds the push service, the account service, the hub and the REST API for the site. media is the
-// hub's MediaPlane.
+// wireAccounts builds the push service, the account service, the hub and the REST API for the site, with the
+// connection test's route on the API (wireConnTest). media is the hub's MediaPlane.
 func (s *Server) wireAccounts(ctx context.Context, media signal.MediaPlane) error {
 	origin := s.site.Origin
 
@@ -441,6 +445,7 @@ func (s *Server) wireAccounts(ctx context.Context, media signal.MediaPlane) erro
 		Clock:    s.deps.Now,
 		Logger:   s.log,
 	})
+	s.wireConnTest()
 	s.health.AddCheck("signal", func() (bool, string) {
 		if hub.Ready() {
 			return true, ""
@@ -1068,6 +1073,143 @@ func userLister(db *store.DB) func(context.Context) ([]store.UserRow, error) {
 		})
 		return rows, err
 	}
+}
+
+// ---- the connection test: ops.ConnTest on 02's probe PCs (README S80) ----
+
+// wireConnTest registers POST /api/v1/conntest on the REST API (04 §6.6, §7.7), for every signed-in user (User; any
+// signed-in user may test their connection, and only the SPA keeps the fix text to admins). The route is
+// ops.ConnTest.Probe over the SFU's probe PCs (prober), and its server object is what Start found: the public IPv4
+// address that the ICE candidates name, the NAT kind, the provider and container that the detection and the
+// Transport got, and the ports of the transports that have a listener (connTestPorts). Each is fixed for the life
+// of the process, like the candidates themselves: a public address that changes later takes a restart (04 §7.4).
+//
+// The limiter's clock is the wall clock, not Deps.Now: how long ago a user tested has nothing to do with what time
+// the accounts think it is.
+func (s *Server) wireConnTest() {
+	var pr ops.Prober // a server without an SFU has no site and no API, so nil only stands for "not ready"
+	if s.media != nil {
+		pr = prober{sfu: s.media}
+	}
+	ct := ops.NewConnTest(ops.ConnTestOptions{
+		Prober:     pr,
+		Ports:      connTestPorts(s.transport, s.addrs),
+		PublicIPv4: s.public.V4,
+		Provider:   s.cloudProvider(),
+		Container:  api.ContainerKind(s.deps.Host.Container()),
+		NAT:        s.public.NAT,
+		Logger:     s.log,
+	})
+	s.api.Handle("POST /api/v1/conntest", httpapi.User, connTestHandler(ct))
+}
+
+// connTestHandler wraps the typed function into the route (04 §2): the request body through httpapi.DecodeJSON
+// (03's 64 KiB, which holds any browser's offer), the principal of 03's chain, and the answer or the *api.Error
+// through WriteJSON and WriteError.
+func connTestHandler(ct *ops.ConnTest) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p, ok := httpapi.PrincipalFrom(r.Context())
+		if !ok {
+			httpapi.WriteError(w, r, errors.New("server: POST /api/v1/conntest without a principal"))
+			return
+		}
+		var req api.ConnTestRequest
+		if err := httpapi.DecodeJSON(w, r, &req, 0); err != nil {
+			httpapi.WriteError(w, r, err)
+			return
+		}
+		res, err := ct.Probe(r.Context(), string(p.UserID), req)
+		if err != nil {
+			httpapi.WriteError(w, r, err)
+			return
+		}
+		httpapi.WriteJSON(w, http.StatusOK, res)
+	})
+}
+
+// connTestPorts are the ports of the transports that have a listener (ops.ConnTestPorts): the UDP sockets of
+// listen.ice_udp, the 443 multiplexer's ICE side on listen.https (none in off mode), and listen.ice_tcp, each as
+// bound, and 0 for a transport whose mux the Transport doesn't have. A server without a Transport has none.
+func connTestPorts(tr *netx.Transport, addrs Addrs) ops.ConnTestPorts {
+	var p ops.ConnTestPorts
+	if tr == nil {
+		return p
+	}
+	if tr.UDPMux != nil {
+		p.UDP = portOf(addrs.ICEUDP)
+	}
+	if tr.TCPMux443 != nil {
+		p.TCP443 = portOf(addrs.HTTPS)
+	}
+	if tr.TCPMux7882 != nil {
+		p.TCP7882 = portOf(addrs.ICETCP)
+	}
+	return p
+}
+
+// portOf returns the port of a bound address, or 0 for none.
+func portOf(a net.Addr) int {
+	switch a := a.(type) {
+	case *net.UDPAddr:
+		return a.Port
+	case *net.TCPAddr:
+		return a.Port
+	case nil:
+		return 0
+	}
+	if ap, err := netip.ParseAddrPort(a.String()); err == nil {
+		return int(ap.Port())
+	}
+	return 0
+}
+
+// probeSFU is the part of 02's SFU that prober calls.
+type probeSFU interface {
+	Probe(ctx context.Context, user sfu.UserID, t sfu.ProbeTransport, offerSDP string) (string, <-chan sfu.ProbeResult, error)
+}
+
+// prober is ops.Prober over 02's SFU.Probe (04 §6.6, §7.7): the user and the transport become sfu.UserID and
+// sfu.ProbeTransport, the result channel is dropped (the SFU never blocks on it), and the SFU's errors become the
+// endpoint's answers (probeError).
+type prober struct{ sfu probeSFU }
+
+// Probe implements ops.Prober.
+func (p prober) Probe(ctx context.Context, userID, transport, offerSDP string) (string, error) {
+	answer, _, err := p.sfu.Probe(ctx, sfu.UserID(userID), sfu.ProbeTransport(transport), offerSDP)
+	if err != nil {
+		return "", probeError(transport, err)
+	}
+	return answer, nil
+}
+
+// probeError maps an error of SFU.Probe to the answer of POST /api/v1/conntest (04 §7.7, 02 §6.3):
+//   - sfu.probe_limit (20 probes run on the server) is 429 rate_limited, with the SFU's wait as retryAfter in whole
+//     seconds, at least 1;
+//   - sfu.transport_disabled (the transport has no mux) is 409 transport_disabled with params.transport, as
+//     ops.ConnTest answers for a transport without a listener;
+//   - sfu.bad_sdp (an offer that is not exactly one data channel, larger than 64 KiB, or one Pion refuses) is 400
+//     bad_sdp;
+//   - sfu.closed is 503 not_ready: the SFU is closed (the server is stopping), or the same user's next probe of the
+//     transport replaced this one before it was answered.
+//
+// Anything else (sfu.internal: Pion failed, or a contract violation) stays an error of the server's, wrapped for
+// the log line of the 500 internal that WriteError makes of it.
+func probeError(transport string, err error) error {
+	var se *sfu.Error
+	if errors.As(err, &se) {
+		switch se.Code {
+		case sfu.CodeProbeLimit:
+			wait := max(int(math.Ceil(se.RetryAfter.Seconds())), 1)
+			return &api.Error{Code: api.CodeRateLimited, RetryAfter: wait}
+		case sfu.CodeTransportDisabled:
+			return ops.TransportDisabled(api.Transport(transport))
+		case sfu.CodeBadSDP:
+			return api.NewError(api.CodeBadSDP)
+		case sfu.CodeClosed:
+			return api.NewError(api.CodeNotReady)
+		}
+	}
+	return fmt.Errorf("server: connection-test probe on %s: %w", transport, err)
 }
 
 // ---- the admin socket's GET /v1/status ----
