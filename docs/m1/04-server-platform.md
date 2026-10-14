@@ -1336,7 +1336,7 @@ the tests in `media_test.go` and in `internal/server/itest`).
 **What README S71 wired** (wiring v3: Web Push in `serve`; `wirePush` and the adapters in `wire.go`, the shutdown
 step in `server.go`, the tests in `push_test.go`, `wire_test.go` and `servertest/push.go`).
 - **The rows `signal.PushNotifier`, `auth.AdminAlerter`, `httpapi.Push`, `push.Store` and `push.Options`** are as
-  the table has them, but for `push.Options.Metrics` (still in "Not wired yet"). `wireAccounts` builds the push
+  the table has them, but for `push.Options.Metrics`, which README S85 wired (below). `wireAccounts` builds the push
   service first (§6.1 step 8): `push.New` compares the VAPID key with the fingerprint in 03's meta table and,
   after a rotation, deletes every subscription before anything else reads them (§5.2), and `auth`, whose own
   purges and changes raise admin alerts, sends them through it. `startBackground` runs it (`push.Service.Run`: the

@@ -1662,7 +1662,10 @@ same holds for git and PulseAudio on runners. The "no GPL" rule covers code in t
   `-r` (the `vm-release` job's releases) and `-o` (the matrix row's parts). S83 first wrote it inline in that step,
   sourcing `distro-test.sh` without its last line, because it could change only `nightly.yml` (README §6 "Decided
   after group 11" (5)); README F13 moved it into the script, behind `distro-test.sh`'s sourced guard, and
-  `lint:sh` covers it. Pebble and challtestsrv start inside the script, not in a step of their own.
+  `lint:sh` covers it. Pebble and challtestsrv start inside the script, not in a step of their own. The job's first
+  real run is the first nightly after `m1/server-web` reaches `main`: F13 never ran the VMs of debian-13,
+  ubuntu-22.04 and ubuntu-26.04 by hand, nor any VM on x86_64 with KVM, the only way the job runs (README §6 "Owner
+  actions").
 - **`goreleaser-full` does not sign**: `goreleaser release --snapshot --clean --skip=sign` with the images and the
   SBOMs, not the plain command of the table. cosign's keyless signature would need `id-token: write` in a job that
   also runs npm, which `release.yml` keeps apart (9.3), and every night would add an entry to the public

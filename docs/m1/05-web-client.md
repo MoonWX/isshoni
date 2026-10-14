@@ -1309,11 +1309,13 @@ the stats into it, §5 and §10.7). Where it differs from the list above, or set
   right in the menu, with the `InviteLinkCard` of §14.1, arrives with that card: the setup wizard's step 3 builds it
   (README S87), and the menu can use it from then on. **As group 12 left it** the card exists
   (`web/src/setup/InviteLinkCard.tsx`) and the menu still links to `/admin/invites`; README F17 (group 13) wires it:
-  "Invite friends", for the users `canInvite(me)` allows (03's rule: admins, and members while `membersCanInvite` is
-  on), opens a dialog that sends `POST /api/v1/invites {}` and shows the card with the answer, the link held only in the
-  dialog's state (§20). The card's texts are in the lazy `setup` namespace and the card doesn't load them itself, so
-  `rooms/index.ts` has to `import '../i18n/lazy/setup'` (check:i18n says so when it is missing, §16.5), which puts that
-  namespace into the room's chunk, so `check:size` has to pass with it.
+  "Invite friends", for the users `canInvite(me)` allows (`me.permissions.createInvites`: admins, and members while
+  `membersCanInvite` is on), opens a dialog that sends `POST /api/v1/invites {}` and shows the card with the answer,
+  the link held only in the dialog's state (§20); a refusal shows its text in the dialog with Try again, as the
+  wizard's step 3 does (§14.1): while registration is closed the POST is 403 `registration_closed` for admins too
+  (03 §7.9), which `canInvite(me)` doesn't know. The card's texts are in the lazy `setup` namespace and the card
+  doesn't load them itself, so `rooms/index.ts` has to `import '../i18n/lazy/setup'` (check:i18n says so when it is
+  missing, §16.5), which puts that namespace into the room's chunk, so `check:size` has to pass with it.
 - **The account menu's entries**, in order: Account (`/account`), Notifications (`/account/notifications`),
   Invite friends (as above), Admin (`/admin`, admins only: other users would get NotFound), Install app (only while
   the browser offers an install prompt, §16.3; read when the menu opens), Test my connection (opens the
