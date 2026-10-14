@@ -246,8 +246,8 @@ func TestRejectAllOverREST(t *testing.T) {
 	}
 	// The body alone is not enough either: with an ID, only that sign-up is judged.
 	wantError(t, f.decide(cookie, "nobody000000", "reject", `{"all":true}`), http.StatusNotFound, api.CodeUserNotFound)
-	// A body that is not one JSON object → 400.
-	for _, body := range []string{`{"all":`, `[]`, `{"all":"yes"}`, `{"all":true} x`} {
+	// A body that is not one JSON object → 400. Only JSON's own white space makes a blank body.
+	for _, body := range []string{`{"all":`, `[]`, `{"all":"yes"}`, `{"all":true} x`, "\u00a0"} {
 		wantError(t, f.decide(cookie, "all", "reject", body), http.StatusBadRequest, api.CodeBadRequest)
 	}
 	if got := f.pending(cookie); len(got) != 3 {

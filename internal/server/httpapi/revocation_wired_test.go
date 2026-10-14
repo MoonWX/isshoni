@@ -141,15 +141,22 @@ func nextOf(t *testing.T, c *signaltest.Client, types ...protocol.MessageType) p
 // scope session, not retryable}, then close 4401.
 func wantRevoked(t *testing.T, what string, c *signaltest.Client) {
 	t.Helper()
+	wantEnded(t, what, c, protocol.ErrorCodeSessionRevoked, protocol.CloseCodeUnauthenticated)
+}
+
+// wantEnded checks that the server ended the socket with an error of the session scope that is not retryable and
+// has this code, and then closed it with this close code.
+func wantEnded(t *testing.T, what string, c *signaltest.Client, want protocol.ErrorCode, closed protocol.CloseCode) {
+	t.Helper()
 	pe, err := protocol.Decode[protocol.Error](nextOf(t, c, protocol.MessageTypeError))
-	if err != nil || pe.Code != protocol.ErrorCodeSessionRevoked || pe.Scope != protocol.ErrorScopeSession || pe.Retryable {
-		t.Fatalf("%s: the socket got %+v, %v; want session_revoked", what, pe, err)
+	if err != nil || pe.Code != want || pe.Scope != protocol.ErrorScopeSession || pe.Retryable {
+		t.Fatalf("%s: the socket got %+v, %v; want %s", what, pe, err, want)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), wiredTimeout)
 	defer cancel()
 	code, err := c.CloseStatus(ctx)
-	if err != nil || code != websocket.StatusCode(protocol.CloseCodeUnauthenticated) {
-		t.Errorf("%s: close code %d, %v; want %d", what, code, err, protocol.CloseCodeUnauthenticated)
+	if err != nil || code != websocket.StatusCode(closed) {
+		t.Errorf("%s: close code %d, %v; want %d", what, code, err, closed)
 	}
 }
 
