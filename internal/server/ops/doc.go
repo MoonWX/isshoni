@@ -23,10 +23,8 @@
 //     else. Transfer and ReleaseCheck each give the dashboard, `admin status` and doctor their part (Info, Update)
 //     and their alerts (Alerts). sources.go declares what they need from the rest of the server: Policy (the
 //     settings, read on every tick), MetaStore, AdminAlerter, the connection test's Prober (conntest.go, below),
-//     and for the slice to come the dashboard's LiveSource and AccountsSource.
-//     Nothing in the server builds these three yet: the wiring does, in the steps their files describe, when it
-//     gets the metrics listener and the dashboard (README S85); until then `serve` only warns that
-//     metrics.enabled has no listener.
+//     and the dashboard's LiveSource and AccountsSource. The wiring builds all three on every server since
+//     README S85, and serves Metrics on metrics.listen with metrics.enabled.
 //   - doctor inside the server (README slice S60, 04 §13). The checks themselves are the subpackage ops/doctor,
 //     which `isshoni doctor` also runs by itself while the server is stopped. doctorrun.go has Doctor, which runs
 //     them in the server's process: 20 s after the start and every 24 h, with the last report kept in 03's meta
@@ -35,8 +33,7 @@
 //     through the admin socket's POST /v1/doctor (RunFor). Bandwidth and BandwidthFromQuery are the typed
 //     functions of GET /api/v1/admin/bandwidth. The wiring builds the Doctor with a function that returns the
 //     doctor.Env of one run (the config, the server's status, 03's schema version), hands it to AdminOptions, runs
-//     Run, and registers the three REST routes (README S85); until it does, POST /v1/doctor answers that this
-//     server has no doctor.
+//     Run, and registers the three REST routes for admins (README S85).
 //
 // A known limit: only Linux and macOS check peer credentials. The experimental Windows build (06 §3) serves every
 // connection to the admin socket, and file modes don't protect the socket there, so every local user who can open
@@ -63,7 +60,14 @@
 //     (api.ConnTestServerInfo: the public IPv4 address, provider, container, ports and NAT kind) by which 05 picks
 //     its fix text. The wiring builds it from what Start found and registers the route for every signed-in user.
 //
-// The later ops slices add dashboard.go.
+//   - The admin dashboard (README slice S85, 04 §11.4). dashboard.go has Dashboard, whose Snapshot is the typed
+//     function of GET /api/v1/admin/dashboard: the server's status, the process, the release check's update, the
+//     month's transfer, the live rooms and media totals (LiveSource), the clients counted from the rooms,
+//     doctor's summary and 03's accounts (AccountsSource), with the alerts of every part. A snapshot is served
+//     again for 1 s. A source that fails (an error, a panic, no answer within its second) leaves its section empty
+//     and adds the alert dashboard.source_failed naming it; the response never fails for it. The dashboard adds
+//     two alerts of its own: public_ip.changed, from the addresses the server's last look found, and
+//     tls.renewal_failing, from the certificate's state in the status.
 //
 // Imports (04 §2): config, logx, version, netx and internal/protocol(/api), plus ops/doctor; never httpapi, store,
 // auth, signal, sfu or sfuplane. The wiring (internal/server) adapts those to the small interfaces declared here,

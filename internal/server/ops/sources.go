@@ -24,7 +24,8 @@ type Policy interface {
 }
 
 // LiveSource is the live state of the dashboard (04 §11.4): the wiring adapts 01's Hub.Snapshot() and 02's
-// SFU.Snapshot(). The dashboard that reads it comes with README slice S85.
+// SFU.Snapshot(). Neither can fail; the dashboard counts a source that panics, or does not return within its
+// second (ctx), as failed (dashboard.go).
 type LiveSource interface {
 	// Rooms returns the rooms that have participants, with their connections, shares, layers and viewers.
 	Rooms(ctx context.Context) []api.RoomLive
@@ -33,7 +34,7 @@ type LiveSource interface {
 }
 
 // AccountsSource is the accounts part of the dashboard (04 §11.4): 03's API.DashboardAccounts, which the dashboard
-// calls with a 1 s timeout. The dashboard that reads it comes with README slice S85.
+// calls with a 1 s timeout.
 type AccountsSource interface {
 	Accounts(ctx context.Context) (api.DashboardAccounts, error)
 }

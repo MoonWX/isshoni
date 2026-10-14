@@ -21,9 +21,9 @@ func (s *Server) SetDrainingHook(fn func()) {
 }
 
 // SetShutdownStepHook makes Shutdown call fn right before it stops each component, with the component's name:
-// "signaling", "sfu", "transport", "http", "tls", "push", "admin socket", "store" (04 §6.4). "push" is the wait for
-// the push service's drain, which began right after "http" was done. A server without a component has no step for
-// it.
+// "signaling", "sfu", "transport", "http", "tls", "transfer", "push", "admin socket", "store" (04 §6.4).
+// "transfer" is the last flush of the transfer counters; "push" is the wait for the push service's drain, which
+// began right after "http" was done. A server without a component has no step for it.
 func (s *Server) SetShutdownStepHook(fn func(step string)) {
 	s.life.Lock()
 	defer s.life.Unlock()
@@ -139,3 +139,21 @@ func (s *Server) PendingConns() int {
 	defer s.pending.mu.Unlock()
 	return len(s.pending.conns)
 }
+
+// Metrics returns the running server's Prometheus registry, which exists whether or not metrics.enabled.
+func (s *Server) Metrics() *ops.Metrics {
+	s.life.Lock()
+	defer s.life.Unlock()
+	return s.metrics
+}
+
+// TransferAccounting returns the running server's transfer accounting.
+func (s *Server) TransferAccounting() *ops.Transfer {
+	s.life.Lock()
+	defer s.life.Unlock()
+	return s.transfer
+}
+
+// SetPublicAddrsSeen makes the running server's dashboard see these public addresses as the last look's, as a
+// changed address does (publicAddrsChanged, 04 §7.4).
+func (s *Server) SetPublicAddrsSeen(pub netx.PublicAddrs) { s.publicNow.Store(&pub) }

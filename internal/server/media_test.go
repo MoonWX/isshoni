@@ -116,8 +116,10 @@ func TestShutdownOrder(t *testing.T) {
 		{step: "transport", socket: true, push: true},            // the SFU is closed; its sockets outlived it
 		{step: "http", push: true},                               // media is gone before the HTTP servers stop
 		// The hub and the REST API are down: the push service has stopped taking work, and drains alongside the TLS
-		// manager's shutdown; the "push" step waits for what is left of that drain.
+		// manager's shutdown and the last flush of the transfer counters; the "push" step waits for what is left of
+		// that drain.
 		{step: "tls"},
+		{step: "transfer"},
 		{step: "push"},
 		{step: "admin socket"},
 		{step: "store"},

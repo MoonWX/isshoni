@@ -203,7 +203,8 @@ func (s *Server) askRestart() {
 }
 
 // transportOptions fills the options of the ICE Transport (04 §7.3) from the config, the detected public addresses
-// and the environment, for listenICE. The transfer counter of ops joins them with the ops data (README S85).
+// and the environment, for listenICE. Its sockets count their bytes on the server's transfer counter (04 §11.3):
+// the UDP sockets as media_udp, the ICE-TCP connections on listen.ice_tcp as media_tcp.
 //
 // IPv6 is off when network.ipv6 is false or public_ipv6 is "off": the operator wants no IPv6 media then, whatever
 // the interfaces have. InContainer and CloudProvider are the values the detection got, so that both agree on what a
@@ -220,6 +221,7 @@ func (s *Server) transportOptions() netx.TransportOptions {
 		Public:            s.public,
 		InContainer:       s.inContainer(),
 		CloudProvider:     s.cloudProvider(),
+		Counter:           s.counter,
 		Logger:            s.log,
 	}
 }

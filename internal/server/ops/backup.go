@@ -144,8 +144,7 @@ type DataDir struct {
 	// file, and a copy of the raw files when that fails.
 	Snapshot func(ctx context.Context, dst string) error
 	// Flush, when set, runs before a snapshot of the running database, so that what the server still holds in
-	// memory is in it: ops.Transfer.Flush once the transfer counters are wired (04 §11.3; README S85). Its error is
-	// logged and the backup goes on.
+	// memory is in it: the wiring passes ops.Transfer.Flush (04 §11.3). Its error is logged and the backup goes on.
 	Flush func(ctx context.Context) error
 	// Now is the clock for the timestamps in manifests and file names. nil means time.Now.
 	Now func() time.Time

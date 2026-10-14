@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/MoonWX/isshoni/internal/logx"
 	"github.com/MoonWX/isshoni/internal/protocol"
@@ -32,16 +35,21 @@ import (
 )
 
 // This file is the wiring of 04 §6.6: it builds 03's store, account service and REST API, 01's hub, 02's SFU behind
-// 01's sfuplane, 04's Web Push service and the admin socket's server on top of what Start has opened, and it holds
-// every adapter between them. Each adapter is a few lines over a small interface of what it calls, so it has a table
-// test with a fake behind it (wire_test.go).
+// 01's sfuplane, 04's Web Push service, the ops data (the metrics registry, the transfer accounting, the release
+// check, doctor and the dashboard) and the admin socket's server on top of what Start has opened, and it holds every
+// adapter between them. Each adapter is a few lines over a small interface of what it calls, so it has a table test
+// with a fake behind it (wire_test.go).
 //
-// What the later slices of the M1 plan add here:
-//   - README S85: ops.Metrics as the router's Observer, the hub's Registerer and push's Metrics, a collector over the
-//     SFU's Metrics, the transfer counter on the Transport and the multiplexer (with its Flush as ops.DataDir.Flush,
-//     so a backup holds the counters as they are), the transfer alerts through push's AdminAlert, and the other REST
-//     routes of ops through API.Handle: the dashboard, and doctor's and the bandwidth estimate's, over the ops.Doctor
-//     that wire builds. The first REST route of ops, POST /api/v1/conntest, came with README S80 (wireConnTest).
+// The ops data as README S85 wired it (wireOps and the adapters at the end of this file):
+//   - ops.Metrics is built first, on every server: the router's Observer, the hub's Registerer, push's Metrics, and
+//     the registry of sfuCollector, the collector over the SFU's Metrics. Start serves it on metrics.listen with
+//     metrics.enabled.
+//   - The transfer counter counts on the 443 multiplexer, listen.http and the ICE Transport; ops.Transfer stores it
+//     per month, alerts the admins through push's AdminAlert, and is ops.DataDir.Flush, so a backup holds the
+//     counters as they are. ops.ReleaseCheck runs on every server too. Both give the admin socket's status, and so
+//     doctor, their part.
+//   - The REST routes of ops go through API.Handle: the dashboard, doctor's and the bandwidth estimate's for admins
+//     (wireOpsRoutes), and POST /api/v1/conntest, which came with README S80 (wireConnTest), for every user.
 
 // The adapters and what they adapt: each consumer interface of 04 §6.6 on the left, and on the right the part of
 // 01's hub, 03's service and 04's push service that an adapter calls.
@@ -58,7 +66,14 @@ var (
 	_ ops.AdminAccounts    = (*adminAccounts)(nil)
 	_ ops.MetaStore        = metaStore{}
 	_ ops.Prober           = prober{}
+	_ ops.TransferStore    = transferStore{}
+	_ ops.Policy           = opsPolicy{}
+	_ ops.AdminAlerter     = opsAlerter{}
+	_ ops.LiveSource       = liveSource{}
+	_ ops.AccountsSource   = accountsSource{}
 	_ push.Store           = pushStore{}
+
+	_ prometheus.Collector = sfuCollector{}
 
 	_ sessionService = (*auth.Service)(nil)
 	_ accountService = (*auth.Service)(nil)
@@ -66,6 +81,10 @@ var (
 	_ hubControl     = (*signal.Hub)(nil)
 	_ pushService    = (*push.Service)(nil)
 	_ probeSFU       = (*sfu.SFU)(nil)
+	_ sfuSnapshotter = (*sfu.SFU)(nil)
+	_ sfuMetrics     = (*sfu.SFU)(nil)
+	_ hubSnapshot    = (*signal.Hub)(nil)
+	_ dashboardAPI   = (*httpapi.API)(nil)
 )
 
 // ---- step 4: the store and the policy pins ----
@@ -181,12 +200,14 @@ const (
 	setupCheckTimeout = 2 * time.Second
 )
 
-// wire is step 8 of the startup sequence (04 §6.1) for 01's, 02's, 03's and 04's parts: the SFU on the Transport
-// with 01's sfuplane in front of it, the push service and then the account service, whose key fingerprint checks
-// purge what a rotated key protected before any listener serves (04 §5.2, 03 §4.6), then the hub and the REST API
-// with the adapters of 04 §6.6 between them, the readiness checks "db", "media" and "signal" (04 §6.2), doctor
-// (04 §13.1), and the admin socket's server. It opens and starts nothing; Start serves what it builds, and runs the
-// push service with the server's other work (startBackground).
+// wire is step 8 of the startup sequence (04 §6.1) for 01's, 02's, 03's and 04's parts: the metrics registry, the
+// SFU on the Transport with 01's sfuplane in front of it, the push service and then the account service, whose key
+// fingerprint checks purge what a rotated key protected before any listener serves (04 §5.2, 03 §4.6), then the hub
+// and the REST API with the adapters of 04 §6.6 between them, the readiness checks "db", "media" and "signal"
+// (04 §6.2), the transfer accounting and the release check (04 §11.3, §11.5), doctor (04 §13.1), the dashboard and
+// the REST routes of ops, and the admin socket's server. It opens and starts nothing; Start serves what it builds,
+// and runs the push service, the transfer accounting and the release check with the server's other work
+// (startBackground).
 //
 // A server without a site (ip mode before a public address is known, 04 §7.4) has no accounts, no API, no hub and
 // no push service: each needs the public origin, and the router answers 421 to every request but the health
@@ -199,6 +220,8 @@ func (s *Server) wire(ctx context.Context) error {
 	// The wall clock, not Deps.Now: how old an answer is has nothing to do with what time the accounts think it is.
 	s.health.AddCheck("db", newDBCheck(s.run, s.store.Ping, time.Now).ready)
 
+	// The metrics registry comes first: the SFU, the push service and the hub register their series on it.
+	s.metrics = s.newMetrics()
 	plane, err := s.wireMedia()
 	if err != nil {
 		return err
@@ -213,18 +236,24 @@ func (s *Server) wire(ctx context.Context) error {
 	if s.deps.LogLevel != nil {
 		s.logLevel = ops.NewLogLevel(s.deps.LogLevel, s.log)
 	}
-	// One status source for `isshoni admin status` and for doctor, which examines the server through it. Doctor's
-	// own runs start with the server's other work (startBackground); its REST routes come with README S85.
+	if err := s.wireOps(); err != nil {
+		return err
+	}
+	// One status source for `isshoni admin status`, for doctor, which examines the server through it, and for the
+	// dashboard. Doctor's own runs start with the server's other work (startBackground).
 	status := s.statusSource()
 	s.doctor = ops.NewDoctor(ops.DoctorOptions{
 		Env:    s.doctorEnv(status),
 		Meta:   metaStore{db: s.store},
 		Logger: s.log,
 	})
+	if s.api != nil {
+		s.wireOpsRoutes(status)
+	}
 	// Backup, restore and rotate-secrets work on every server, with a site or without: the data directory and the
 	// keys are there either way. The database's snapshot is 03's (*store.DB).BackupTo, with a full disk marked as
-	// one (diskFull), and its file-level functions validate what a restore brings (04 §6.6). Flush joins with the
-	// transfer counters (README S85).
+	// one (diskFull), and its file-level functions validate what a restore brings (04 §6.6). The transfer counters
+	// are flushed before the snapshot, so that the backup holds this month's bytes as they are (04 §11.3).
 	paths, db := s.cfg.Paths(), s.store
 	s.admin = ops.NewAdminServer(ops.AdminOptions{
 		Health:   s.health,
@@ -236,6 +265,7 @@ func (s *Server) wire(ctx context.Context) error {
 			Paths:    paths,
 			DB:       DBFiles(paths.Backups),
 			Snapshot: func(ctx context.Context, dst string) error { return diskFull(db.BackupTo(ctx, dst)) },
+			Flush:    s.transfer.Flush,
 			Now:      s.deps.Now,
 			Logger:   s.log,
 		},
@@ -336,6 +366,10 @@ func (s *Server) wireMedia() (signal.MediaPlane, error) {
 	}
 	plane.Bind(media)
 	s.media = media
+	// isshoni_sfu_* (04 §11.2, 02 §13): read from the SFU at every scrape. A failed start closes the SFU (release).
+	if err := s.metrics.Registerer().Register(sfuCollector{sfu: media}); err != nil {
+		return nil, fmt.Errorf("server: register the SFU's metrics: %w", err)
+	}
 	s.stopLimits = settings.OnChange(func(_, next store.Settings) { media.SetLimits(sfuLimits(next)) })
 	s.health.AddCheck("media", mediaCheck(s.cfg.Listen.ICEUDP != "", s.transport, media.Ready))
 	return plane, nil
@@ -426,7 +460,7 @@ func (s *Server) wireAccounts(ctx context.Context, media signal.MediaPlane) erro
 		Push:     notifier,
 		ClientIP: httpapi.ClientIP,
 		Log:      s.log,
-		// Metrics is ops.Metrics.Registerer() (README S85).
+		Metrics:  s.metrics.Registerer(), // isshoni_ws_*, isshoni_rooms, …, isshoni_client_* (01 §18)
 	})
 	if err != nil {
 		return fmt.Errorf("server: %w", err)
@@ -466,8 +500,8 @@ func (s *Server) wireAccounts(ctx context.Context, media signal.MediaPlane) erro
 // bare "mailto:" or "https:" (04 §4.5, §14.1), never gets here: New refuses it as a config error
 // (pushSubjectProblem), on which serve exits 78 as on any other.
 //
-// ops.Metrics.Registerer() becomes Options.Metrics with the metrics endpoint (README S85); until then the service
-// counts its results for nobody.
+// The service counts its results in isshoni_push_sent_total{result} on the server's registry (Options.Metrics,
+// 04 §11.2).
 func (s *Server) wirePush(ctx context.Context) (*push.Service, error) {
 	if !s.cfg.Push.Enabled {
 		return nil, nil
@@ -482,6 +516,7 @@ func (s *Server) wirePush(ctx context.Context) (*push.Service, error) {
 		Logger:   s.log,
 		Resolver: s.deps.Resolver,
 		OwnAddrs: []netip.Addr{s.public.V4, s.public.V6}, // a zero address, one that was not found, is ignored
+		Metrics:  s.metrics.Registerer(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("server: %w", err)
@@ -1223,8 +1258,8 @@ func probeError(ctx context.Context, transport string, err error) error {
 // statusSource returns the function behind the admin socket's GET /v1/status (04 §12.2, `isshoni admin status`):
 // what the running process knows about itself. The site, the listeners, the public addresses and what the ICE
 // Transport advertises are fixed once Start has bound everything, so the function keeps its own copies; the
-// certificate, the live counts and the uptime are read at each call. Transfer and the release check come with the
-// ops data (README S85).
+// certificate, the live counts, the uptime, the month's transfer and the release check's result are read at each
+// call: doctor's transfer and release checks see them there (04 §13.2).
 func (s *Server) statusSource() func(context.Context) (api.ServerStatus, error) {
 	started := s.now()
 	base := api.ServerStatus{
@@ -1252,10 +1287,17 @@ func (s *Server) statusSource() func(context.Context) (api.ServerStatus, error) 
 	if s.public.LocalV4.IsValid() {
 		base.LocalIPv4 = s.public.LocalV4.String()
 	}
-	tls, hub, now := s.tls, s.hub, s.now
+	tls, hub, now, transfer, releases := s.tls, s.hub, s.now, s.transfer, s.releases
 	return func(context.Context) (api.ServerStatus, error) {
 		st := base
 		st.UptimeS = int64(now().Sub(started) / time.Second)
+		if transfer != nil {
+			info := transfer.Info()
+			st.Transfer = &info
+		}
+		if releases != nil {
+			st.Update = releases.Update()
+		}
 		cert := tls.Status()
 		st.TLS = api.TLSInfo{
 			Mode:          api.TLSMode(cert.Mode),
@@ -1297,6 +1339,9 @@ func (s *Server) listeners() []api.ListenerInfo {
 	if s.addrs.ICETCP != nil {
 		out = append(out, api.ListenerInfo{Key: "listen.ice_tcp", Network: "tcp", Addr: s.addrs.ICETCP.String()})
 	}
+	if s.addrs.Metrics != nil {
+		out = append(out, api.ListenerInfo{Key: "metrics.listen", Network: "tcp", Addr: s.addrs.Metrics.String()})
+	}
 	if s.adminLn != nil {
 		out = append(out, api.ListenerInfo{Key: "listen.admin_socket", Network: "unix", Addr: s.cfg.Listen.AdminSocket})
 	}
@@ -1312,4 +1357,478 @@ func advertisedAddrs(adv []netx.AdvertisedAddr) []api.AdvertisedAddr {
 		out = append(out, api.AdvertisedAddr{Proto: a.Proto, Addr: a.Addr.String(), Via: api.Transport(a.Via)})
 	}
 	return out
+}
+
+// ---- the ops data: metrics, transfer, release check, dashboard and the ops routes (README S85) ----
+
+// newMetrics builds the server's Prometheus registry (04 §11.2) on every server, metrics.enabled or not: only the
+// listener depends on the key. Its own series read the server's state at every scrape: readiness, the transfer
+// counter, the 443 multiplexer's outcomes (none in off mode) and the certificate's expiry.
+func (s *Server) newMetrics() *ops.Metrics {
+	var muxStats func() netx.PortMuxStats
+	if s.mux != nil {
+		muxStats = s.mux.Stats
+	}
+	tls := s.tls
+	return ops.NewMetrics(ops.MetricsOptions{
+		Health:       s.health,
+		Transfer:     s.counter,
+		PortMux:      muxStats,
+		CertNotAfter: func() time.Time { return tls.Status().NotAfter },
+		PProf:        s.cfg.Metrics.PProf,
+		Logger:       s.log,
+	})
+}
+
+// wireOps builds the transfer accounting and the release check (04 §11.3, §11.5) on every server, with a site or
+// without: the bytes on the wire are counted and the releases looked at either way. Both read the policy through
+// 03's settings at every tick (opsPolicy), keep their state in 03's meta table (metaStore) and use the server's
+// clock. A threshold alert goes to the admins through the push service (opsAlerter); a server without one (no
+// site, or push.enabled = false) only logs it, and the dashboard shows it either way. The release check's URL was
+// checked by New (releaseURLProblem).
+func (s *Server) wireOps() error {
+	policy := opsPolicy{settings: s.store.Settings()}
+	meta := metaStore{db: s.store}
+	var alerter ops.AdminAlerter
+	if s.push != nil {
+		alerter = opsAlerter{svc: s.push}
+	}
+	s.transfer = ops.NewTransfer(ops.TransferOptions{
+		Counter: s.counter,
+		Store:   transferStore{db: s.store},
+		Meta:    meta,
+		Policy:  policy,
+		Alerter: alerter,
+		Now:     s.deps.Now,
+		Logger:  s.log,
+	})
+	release, err := ops.NewReleaseCheck(ops.ReleaseCheckOptions{
+		Policy: policy,
+		URL:    s.cfg.Updates.ReleaseURL,
+		Meta:   meta,
+		HTTP:   s.deps.ReleaseHTTP,
+		Now:    s.deps.Now,
+		Logger: s.log,
+	})
+	if err != nil {
+		return fmt.Errorf("server: %w", err)
+	}
+	s.releases = release
+	return nil
+}
+
+// releaseURLProblem returns the config error of an updates.release_url that the release check would refuse (not an
+// http or https URL, or one with credentials; 04 §11.5). config keeps the hidden key as it is given; New refuses it
+// with config's own problems, before Start opens anything, so serve exits 78.
+func releaseURLProblem(cfg *config.Config) (config.Problem, bool) {
+	const key = "updates.release_url"
+	if ops.CheckReleasesURL(cfg.Updates.ReleaseURL) == nil {
+		return config.Problem{}, false
+	}
+	return config.Problem{
+		Key:      key,
+		Value:    strconv.Quote(cfg.Updates.ReleaseURL),
+		Source:   cfg.Source(key),
+		Severity: config.SeverityError,
+		Message:  "is not an http or https URL without credentials",
+		Fix:      "leave it out: it is for tests, and its default is the project's releases on GitHub",
+	}, true
+}
+
+// doctorRouteDeadline is the read deadline of POST /api/v1/admin/doctor: a doctor run takes up to two minutes
+// (ops.Doctor), past the router's 30 s, which would cancel the request's context (04 §9.3).
+const doctorRouteDeadline = 3 * time.Minute
+
+// wireOpsRoutes builds the dashboard and registers the admin routes of ops on the REST API (04 §6.6, §11.4, §13.1,
+// §13.4), each for admins only (403 forbidden for every other user, 03's access check):
+//
+//	GET  /api/v1/admin/dashboard   ops.Dashboard.Snapshot
+//	GET  /api/v1/admin/doctor      ops.Doctor.Last (404 not_found before the first report)
+//	POST /api/v1/admin/doctor      ops.Doctor.Check (429 doctor_busy while a run is under way and for 10 s after)
+//	GET  /api/v1/admin/bandwidth   ops.BandwidthFromQuery
+//
+// The dashboard's sources are the status (the admin socket's), the hub and the SFU (liveSource, with the rooms'
+// current names from 03's store), 03's DashboardAccounts, the transfer accounting, the release check, doctor, the
+// public addresses as the server's last look found them, and the setting minClientVersion.
+func (s *Server) wireOpsRoutes(status func(context.Context) (api.ServerStatus, error)) {
+	settings := s.store.Settings()
+	live := liveSource{hub: s.hub, names: roomNames(s.store)}
+	if s.media != nil {
+		live.media = s.media
+	}
+	s.dashboard = ops.NewDashboard(ops.DashboardOptions{
+		Status:           status,
+		Live:             live,
+		Accounts:         accountsSource{api: s.api},
+		Transfer:         s.transfer,
+		Release:          s.releases,
+		Doctor:           s.doctor,
+		PublicAddrs:      s.publicAddrsSeen,
+		MinClientVersion: func() string { return settings.Get().MinClientVersion },
+		Logger:           s.log,
+	})
+	dash, doc := s.dashboard, s.doctor
+	s.api.Handle("GET /api/v1/admin/dashboard", httpapi.Admin, opsRoute(func(r *http.Request) (api.OpsDashboard, error) {
+		return dash.Snapshot(r.Context())
+	}))
+	s.api.Handle("GET /api/v1/admin/doctor", httpapi.Admin, opsRoute(func(r *http.Request) (api.DoctorReport, error) {
+		return doc.Last(r.Context())
+	}))
+	run := opsRoute(func(r *http.Request) (api.DoctorReport, error) { return doc.Check(r.Context()) })
+	s.api.Handle("POST /api/v1/admin/doctor", httpapi.Admin, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(doctorRouteDeadline))
+		if err != nil && !errors.Is(err, http.ErrNotSupported) {
+			s.log.LogAttrs(r.Context(), slog.LevelDebug, "doctor: extend the read deadline", logx.Err(err))
+		}
+		run.ServeHTTP(w, r)
+	}))
+	s.api.Handle("GET /api/v1/admin/bandwidth", httpapi.Admin, opsRoute(func(r *http.Request) (api.BandwidthEstimate, error) {
+		return ops.BandwidthFromQuery(r.URL.Query())
+	}))
+}
+
+// opsRoute wraps a typed function of ops into a route (04 §2, §6.6): its answer through httpapi.WriteJSON with 200,
+// its error through WriteError, which answers an *api.Error as 03's table says and anything else as 500 internal.
+// None of these routes takes a body: the doctor run's POST has nothing to say.
+func opsRoute[T any](fn func(r *http.Request) (T, error)) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		res, err := fn(r)
+		if err != nil {
+			httpapi.WriteError(w, r, err)
+			return
+		}
+		httpapi.WriteJSON(w, http.StatusOK, res)
+	})
+}
+
+// publicAddrsSeen is the dashboard's PublicAddrs: the public addresses as the last periodic look found them, once
+// they differ from the ones the server started with (publicAddrsChanged, 04 §7.4).
+func (s *Server) publicAddrsSeen() (netx.PublicAddrs, bool) {
+	if p := s.publicNow.Load(); p != nil {
+		return *p, true
+	}
+	return netx.PublicAddrs{}, false
+}
+
+// transferStore implements ops.TransferStore over 03's table transfer_months (04 §11.3): each call one short
+// transaction.
+type transferStore struct{ db *store.DB }
+
+// AddTransfer implements ops.TransferStore.
+func (t transferStore) AddTransfer(ctx context.Context, month string, egress, ingress int64, now time.Time) error {
+	return t.db.Write(ctx, func(q *store.Q) error { return q.AddTransfer(month, egress, ingress, now) })
+}
+
+// TransferMonth implements ops.TransferStore: a month without a row is zero.
+func (t transferStore) TransferMonth(ctx context.Context, month string) (egress, ingress int64, err error) {
+	err = t.db.Read(ctx, func(q *store.Q) error {
+		var err error
+		egress, ingress, err = q.TransferMonth(month)
+		return err
+	})
+	return egress, ingress, err
+}
+
+// opsPolicy implements ops.Policy over 03's settings (04 §6.6): transferAlertGb and updateCheck, read at every
+// call, so an admin's change applies at the next tick.
+type opsPolicy struct{ settings *store.SettingsCache }
+
+// TransferAlertGB implements ops.Policy.
+func (p opsPolicy) TransferAlertGB() int { return p.settings.Get().TransferAlertGB }
+
+// ReleaseCheck implements ops.Policy.
+func (p opsPolicy) ReleaseCheck() bool { return p.settings.Get().UpdateCheck }
+
+// opsAlerter implements ops.AdminAlerter over the push service (04 §6.6, §11.3): the transfer threshold goes out as
+// admin.alert like 03's alerts. It only queues, as ops asks.
+type opsAlerter struct{ svc pushService }
+
+// AdminAlert implements ops.AdminAlerter.
+func (a opsAlerter) AdminAlert(_ context.Context, al ops.AdminAlert) {
+	a.svc.AdminAlert(push.AdminAlert{Kind: string(al.Kind), Actor: al.Actor, Target: al.Target, At: al.At})
+}
+
+// accountsSource implements ops.AccountsSource with 03's API.DashboardAccounts (03 §12.4.8).
+type accountsSource struct{ api dashboardAPI }
+
+// dashboardAPI is the part of *httpapi.API that the dashboard reads.
+type dashboardAPI interface {
+	DashboardAccounts(ctx context.Context) (api.DashboardAccounts, error)
+}
+
+// Accounts implements ops.AccountsSource.
+func (a accountsSource) Accounts(ctx context.Context) (api.DashboardAccounts, error) {
+	return a.api.DashboardAccounts(ctx)
+}
+
+// hubSnapshot is the part of *signal.Hub that the dashboard reads.
+type hubSnapshot interface{ Snapshot() signal.LiveSnapshot }
+
+// sfuSnapshotter is the part of 02's SFU that the dashboard reads.
+type sfuSnapshotter interface{ Snapshot() sfu.Snapshot }
+
+// liveSource implements ops.LiveSource over 01's hub and 02's SFU (04 §11.4): the hub knows who is in which room
+// with which connections and who wants to watch what; the SFU knows the shares as media (layers, rates, viewers by
+// forwarded quality) and each connection's selected transport and RTT, joined on the connection id. A room's name is
+// the store's current one, which the hub's lags after a rename (signal.LiveRoom).
+type liveSource struct {
+	hub   hubSnapshot
+	media sfuSnapshotter                                       // nil on a server without media sockets
+	names func(ctx context.Context) (map[string]string, error) // the rooms' names by id; nil: the hub's
+}
+
+// Rooms implements ops.LiveSource: every room of the hub with someone in it, in the hub's order. A room's shares
+// are the SFU's for that room, one to one; a share the SFU does not have (yet, or any more) is not listed, and the
+// hub's watchers of it still count in participants[].watching, which is what the users see in room.state.
+func (l liveSource) Rooms(ctx context.Context) []api.RoomLive {
+	hub := l.hub.Snapshot()
+	var media sfu.Snapshot
+	if l.media != nil {
+		media = l.media.Snapshot()
+	}
+	sfuRooms := make(map[string]sfu.RoomSnapshot, len(media.Rooms))
+	conns := map[string]sfu.ConnSummary{}
+	for _, r := range media.Rooms {
+		sfuRooms[string(r.Room)] = r
+		for _, c := range r.Conns {
+			conns[string(c.Conn)] = c
+		}
+	}
+	var names map[string]string
+	if l.names != nil && len(hub.Rooms) > 0 {
+		names, _ = l.names(ctx) // a failed read keeps the hub's names, which at most lag a rename
+	}
+
+	out := make([]api.RoomLive, 0, len(hub.Rooms))
+	for _, r := range hub.Rooms {
+		room := api.RoomLive{
+			ID:           r.ID,
+			Name:         r.Name,
+			Participants: make([]api.ParticipantLive, 0, len(r.Participants)),
+			Shares:       []api.ShareLive{},
+		}
+		if name, ok := names[r.ID]; ok {
+			room.Name = name
+		}
+		watching := map[string][]string{} // share ids by user, from the hub's desired subscriptions
+		for _, sh := range r.Shares {
+			for _, w := range sh.Info.Watchers {
+				watching[w.UserID] = append(watching[w.UserID], sh.Info.ID)
+			}
+		}
+		for _, p := range r.Participants {
+			part := api.ParticipantLive{
+				UserID:      p.UserID,
+				Username:    p.Name,
+				Connections: make([]api.ConnectionLive, 0, len(p.Connections)),
+				Watching:    watching[p.UserID],
+			}
+			if part.Watching == nil {
+				part.Watching = []string{}
+			}
+			for _, c := range p.Connections {
+				conn := api.ConnectionLive{
+					ID:          c.ID,
+					Kind:        string(c.Kind),
+					Role:        string(c.Role),
+					Version:     c.Version,
+					OS:          string(c.OS),
+					ConnectedAt: c.Since,
+				}
+				if sum, ok := conns[c.ID]; ok {
+					conn.Transport = api.Transport(sum.Transport)
+					conn.RTTMs = int(sum.RTT / time.Millisecond)
+				}
+				part.Connections = append(part.Connections, conn)
+			}
+			room.Participants = append(room.Participants, part)
+		}
+		for _, sh := range sfuRooms[r.ID].Shares {
+			room.Shares = append(room.Shares, shareLive(sh))
+		}
+		out = append(out, room)
+	}
+	return out
+}
+
+// shareLive is the dashboard's view of one share of the SFU (04 §11.4): the codec is "h264/" and the profile ("" until
+// the SFU knows it), the kind is the source, the owner is the share's user, and the layers, the viewers and the
+// rates are the SFU's. The label is never shown.
+func shareLive(sh sfu.ShareSnapshot) api.ShareLive {
+	info := sh.Info
+	out := api.ShareLive{
+		ShareID:     string(info.ID),
+		OwnerUserID: string(info.User),
+		Kind:        info.Source.String(),
+		StartedAt:   info.StartedAt,
+		Layers:      make([]api.LayerLive, 0, len(info.Layers)),
+		Viewers:     api.ViewerCounts{High: sh.Viewers.High, Low: sh.Viewers.Low, Audio: sh.Viewers.Audio},
+		IngressBps:  sh.IngressBps,
+		EgressBps:   sh.EgressBps,
+	}
+	if info.Profile != "" {
+		out.Codec = "h264/" + string(info.Profile)
+	}
+	for _, l := range info.Layers {
+		out.Layers = append(out.Layers, api.LayerLive{
+			RID: l.RID, Width: l.Width, Height: l.Height, FPS: l.FPS, Bitrate: int64(l.Bitrate), LossPct: l.LossPct,
+		})
+	}
+	return out
+}
+
+// Media implements ops.LiveSource with the SFU's totals: the RTP rates, the DownTracks, and the connected
+// PeerConnections by selected transport (probe PCs are not counted, 02 §13). A server without media has zeros.
+func (l liveSource) Media(context.Context) api.MediaTotals {
+	if l.media == nil {
+		return api.MediaTotals{}
+	}
+	t := l.media.Snapshot().Totals
+	return api.MediaTotals{
+		IngressBps: t.IngressBps,
+		EgressBps:  t.EgressBps,
+		DownTracks: t.DownTracks,
+		PeerConnections: api.TransportCounts{
+			UDP:     t.PCsByTransport[string(api.TransportUDP)],
+			TCP443:  t.PCsByTransport[string(api.TransportTCP443)],
+			TCP7882: t.PCsByTransport[string(api.TransportTCP7882)],
+		},
+	}
+}
+
+// roomNames reads the names of every room from 03's store.
+func roomNames(db *store.DB) func(context.Context) (map[string]string, error) {
+	return func(ctx context.Context) (map[string]string, error) {
+		var rooms []store.Room
+		err := db.Read(ctx, func(q *store.Q) error {
+			var err error
+			rooms, err = q.ListRooms()
+			return err
+		})
+		if err != nil {
+			return nil, err
+		}
+		out := make(map[string]string, len(rooms))
+		for _, r := range rooms {
+			out[string(r.ID)] = r.Name
+		}
+		return out, nil
+	}
+}
+
+// sfuMetrics is the part of 02's SFU that the metrics read.
+type sfuMetrics interface{ Metrics() sfu.Metrics }
+
+// sfuCollector is the adapter of 04 §11.2 over 02's SFU.Metrics(): at every scrape it reads the SFU's counters and
+// gauges once and emits the isshoni_sfu_* series of 02 §13 with exactly the label values the SFU gives (every one
+// of 02's values is there, zero or not), and no label of its own. Probe PCs are not counted: the SFU leaves them out.
+type sfuCollector struct{ sfu sfuMetrics }
+
+// The isshoni_sfu_* series (02 §13). Their names and labels are the metric contract: never renamed.
+var (
+	sfuConnsDesc = prometheus.NewDesc("isshoni_sfu_conns",
+		"SFU connections, by role.", []string{"role"}, nil)
+	sfuPCsDesc = prometheus.NewDesc("isshoni_sfu_peerconnections",
+		"PeerConnections, by kind and state (probe PCs not counted).", []string{"kind", "state"}, nil)
+	sfuSelectedTransportDesc = prometheus.NewDesc("isshoni_sfu_selected_transport",
+		"Connected PeerConnections, by the transport of their selected candidate pair.", []string{"transport"}, nil)
+	sfuSharesDesc = prometheus.NewDesc("isshoni_sfu_shares",
+		"Shares in the SFU, by media state.", []string{"state"}, nil)
+	sfuDownTracksDesc = prometheus.NewDesc("isshoni_sfu_downtracks",
+		"DownTracks, by kind and forwarded quality.", []string{"kind", "forwarding"}, nil)
+	sfuIngressBytesDesc = prometheus.NewDesc("isshoni_sfu_ingress_bytes_total",
+		"RTP bytes received from publishers, by kind.", []string{"kind"}, nil)
+	sfuIngressPacketsDesc = prometheus.NewDesc("isshoni_sfu_ingress_packets_total",
+		"RTP packets received from publishers, by kind.", []string{"kind"}, nil)
+	sfuIngressDuplicatesDesc = prometheus.NewDesc("isshoni_sfu_ingress_duplicates_total",
+		"Incoming RTP packets already in the cache, dropped without fan-out.", nil, nil)
+	sfuEgressBytesDesc = prometheus.NewDesc("isshoni_sfu_egress_bytes_total",
+		"RTP bytes sent to viewers, by kind.", []string{"kind"}, nil)
+	sfuEgressPacketsDesc = prometheus.NewDesc("isshoni_sfu_egress_packets_total",
+		"RTP packets sent to viewers, by kind.", []string{"kind"}, nil)
+	sfuNACKReceivedDesc = prometheus.NewDesc("isshoni_sfu_nack_received_total",
+		"Packets that viewers asked to be sent again (NACK).", nil, nil)
+	sfuNACKServedDesc = prometheus.NewDesc("isshoni_sfu_nack_served_total",
+		"NACKed packets sent again from the cache.", nil, nil)
+	sfuNACKMissedDesc = prometheus.NewDesc("isshoni_sfu_nack_missed_total",
+		"NACKed packets that were no longer in the cache.", nil, nil)
+	sfuRTXSkippedDesc = prometheus.NewDesc("isshoni_sfu_rtx_skipped_total",
+		"Retransmissions skipped.", nil, nil)
+	sfuPLISentDesc = prometheus.NewDesc("isshoni_sfu_pli_sent_total",
+		"Keyframe requests (PLI) sent to publishers.", nil, nil)
+	sfuPLIThrottledDesc = prometheus.NewDesc("isshoni_sfu_pli_throttled_total",
+		"Keyframe requests held back by the throttle.", nil, nil)
+	sfuKeyframesDesc = prometheus.NewDesc("isshoni_sfu_keyframes_received_total",
+		"Keyframes received from publishers.", nil, nil)
+	sfuLayerSwitchesDesc = prometheus.NewDesc("isshoni_sfu_layer_switches_total",
+		"Simulcast layer switches of DownTracks.", nil, nil)
+	sfuDowngradesDesc = prometheus.NewDesc("isshoni_sfu_downgrades_total",
+		"Subscriptions forwarded below what was asked, by reason.", []string{"reason"}, nil)
+	sfuQueueDropsDesc = prometheus.NewDesc("isshoni_sfu_queue_drops_total",
+		"Packets dropped by the DownTrack queues, by kind.", []string{"kind"}, nil)
+	sfuHandshakeTimeoutsDesc = prometheus.NewDesc("isshoni_sfu_handshake_timeouts_total",
+		"PeerConnections whose handshake timed out, by kind.", []string{"kind"}, nil)
+	sfuPacketCacheDesc = prometheus.NewDesc("isshoni_sfu_packet_cache_bytes",
+		"Bytes held by the packet caches.", nil, nil)
+)
+
+// Describe implements prometheus.Collector.
+func (sfuCollector) Describe(ch chan<- *prometheus.Desc) {
+	for _, d := range []*prometheus.Desc{
+		sfuConnsDesc, sfuPCsDesc, sfuSelectedTransportDesc, sfuSharesDesc, sfuDownTracksDesc,
+		sfuIngressBytesDesc, sfuIngressPacketsDesc, sfuIngressDuplicatesDesc, sfuEgressBytesDesc, sfuEgressPacketsDesc,
+		sfuNACKReceivedDesc, sfuNACKServedDesc, sfuNACKMissedDesc, sfuRTXSkippedDesc,
+		sfuPLISentDesc, sfuPLIThrottledDesc, sfuKeyframesDesc, sfuLayerSwitchesDesc,
+		sfuDowngradesDesc, sfuQueueDropsDesc, sfuHandshakeTimeoutsDesc, sfuPacketCacheDesc,
+	} {
+		ch <- d
+	}
+}
+
+// Collect implements prometheus.Collector: one SFU.Metrics() per scrape.
+func (c sfuCollector) Collect(ch chan<- prometheus.Metric) {
+	m := c.sfu.Metrics()
+	gauges := func(d *prometheus.Desc, values map[string]int64) {
+		for label, v := range values {
+			ch <- prometheus.MustNewConstMetric(d, prometheus.GaugeValue, float64(v), label)
+		}
+	}
+	gauges2 := func(d *prometheus.Desc, values map[string]map[string]int64) {
+		for outer, inner := range values {
+			for label, v := range inner {
+				ch <- prometheus.MustNewConstMetric(d, prometheus.GaugeValue, float64(v), outer, label)
+			}
+		}
+	}
+	counters := func(d *prometheus.Desc, values map[string]uint64) {
+		for label, v := range values {
+			ch <- prometheus.MustNewConstMetric(d, prometheus.CounterValue, float64(v), label)
+		}
+	}
+	counter := func(d *prometheus.Desc, v uint64) {
+		ch <- prometheus.MustNewConstMetric(d, prometheus.CounterValue, float64(v))
+	}
+
+	gauges(sfuConnsDesc, m.Conns)
+	gauges2(sfuPCsDesc, m.PeerConnections)
+	gauges(sfuSelectedTransportDesc, m.SelectedTransport)
+	gauges(sfuSharesDesc, m.Shares)
+	gauges2(sfuDownTracksDesc, m.DownTracks)
+	counters(sfuIngressBytesDesc, m.IngressBytes)
+	counters(sfuIngressPacketsDesc, m.IngressPackets)
+	counter(sfuIngressDuplicatesDesc, m.IngressDuplicates)
+	counters(sfuEgressBytesDesc, m.EgressBytes)
+	counters(sfuEgressPacketsDesc, m.EgressPackets)
+	counter(sfuNACKReceivedDesc, m.NACKReceived)
+	counter(sfuNACKServedDesc, m.NACKServed)
+	counter(sfuNACKMissedDesc, m.NACKMissed)
+	counter(sfuRTXSkippedDesc, m.RTXSkipped)
+	counter(sfuPLISentDesc, m.PLISent)
+	counter(sfuPLIThrottledDesc, m.PLIThrottled)
+	counter(sfuKeyframesDesc, m.KeyframesReceived)
+	counter(sfuLayerSwitchesDesc, m.LayerSwitches)
+	counters(sfuDowngradesDesc, m.Downgrades)
+	counters(sfuQueueDropsDesc, m.QueueDrops)
+	counters(sfuHandshakeTimeoutsDesc, m.HandshakeTimeouts)
+	ch <- prometheus.MustNewConstMetric(sfuPacketCacheDesc, prometheus.GaugeValue, float64(m.PacketCacheBytes))
 }
