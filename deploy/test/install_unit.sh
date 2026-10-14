@@ -144,6 +144,12 @@ test_parse_args_flags() {
   assert_eq 'parse_args: --purge' "action=purge mode= domain= version= $DEFAULTS" "$(parsed --purge)"
   assert_eq 'parse_args: --purge --uninstall is a purge' "action=purge mode= domain= version= $DEFAULTS" \
     "$(parsed --purge --uninstall)"
+  assert_eq 'parse_args: --uninstall --no-firewall' \
+    'action=uninstall mode= domain= version= yes=0 nofw=1 fw=0 nostart=0 downgrade=0 reinstall=0' \
+    "$(parsed --uninstall --no-firewall)"
+  assert_eq 'parse_args: --purge with ISSHONI_NO_FIREWALL=1' \
+    'action=purge mode= domain= version= yes=1 nofw=1 fw=0 nostart=0 downgrade=0 reinstall=0' \
+    "$(ISSHONI_NO_FIREWALL=1 && parsed --purge --yes)"
   assert_eq 'parse_args: every flag at once' \
     'action=install mode=auto domain=share.example.com version=0.3.0 yes=1 nofw=1 fw=0 nostart=1 downgrade=1 reinstall=1' \
     "$(parsed --domain share.example.com --version v0.3.0 -y --no-firewall --no-start --allow-downgrade --reinstall)"
@@ -1436,12 +1442,15 @@ ip6tables() {
 
 # The stand-in for firewall-cmd and firewall-offline-cmd (one program, two names). It keeps firewalld's
 # permanent configuration in $FW_STATE: zones and policies (their names), <zone|policy>-NAME.services and .rich
-# (one service or rich rule per line), refuse (the zone-NAME or policy-NAME that refuse every change) and state
-# ("running" or not). Like firewalld, it knows the isshoni service only after a --reload that saw isshoni.xml, and
-# refuses --add-service=isshoni before.
+# (one service or rich rule per line), refuse (the zone-NAME or policy-NAME that refuse every change), state
+# ("running" or not) and get-fails (when it is there, --get-zones and --get-policies fail). Like firewalld, it
+# knows the isshoni service only after a --reload that saw isshoni.xml, and refuses --add-service=isshoni before.
+# Like firewalld, it also writes a zone or a policy that it changed to its file below /etc/firewalld (the
+# directory of $FW_XML's services/), after a copy of the old file to NAME.xml.old.
 # shellcheck disable=SC2016 # a program of its own: the variables are its own
 FW_STUB='#!/bin/sh
 s=$FW_STATE
+etc=${FW_XML%/services/*}
 xml=absent
 [ ! -e "$FW_XML" ] || xml=present
 printf "%s %s [xml %s]\n" "${0##*/}" "$*" "$xml" >>"$s/calls"
@@ -1462,6 +1471,21 @@ drop() {
   grep -vxF -- "$2" "$1" >"$1.new" 2>/dev/null || :
   mv "$1.new" "$1"
 }
+save() {
+  case $target in
+  zone-*) kind=zone file=$etc/zones/${target#zone-}.xml ;;
+  policy-*) kind=policy file=$etc/policies/${target#policy-}.xml ;;
+  *) return 0 ;;
+  esac
+  mkdir -p "${file%/*}"
+  [ ! -e "$file" ] || cp "$file" "$file.old"
+  {
+    printf "<%s>\n" "$kind"
+    sed "s/.*/  <service name=\"&\"\/>/" "$s/$target.services" 2>/dev/null || :
+    sed "s/.*/  <rule>&<\/rule>/" "$s/$target.rich" 2>/dev/null || :
+    printf "</%s>\n" "$kind"
+  } >"$file"
+}
 for arg in "$@"; do
   case $arg in
   --permanent | --zone=* | --policy=*) ;;
@@ -1477,8 +1501,10 @@ for arg in "$@"; do
     [ "$xml" = absent ] || : >"$s/known"
     exit 0
     ;;
-  --get-zones) exec cat "$s/zones" ;;
-  --get-policies) exec cat "$s/policies" ;;
+  --get-zones | --get-policies)
+    [ ! -e "$s/get-fails" ] || exit 1
+    exec cat "$s/${arg#--get-}"
+    ;;
   --query-service=*) exec grep -qxF -- "${arg#*=}" "$s/$target.services" ;;
   --add-service=*)
     if [ ! -e "$s/known" ]; then
@@ -1486,11 +1512,13 @@ for arg in "$@"; do
       exit 101
     fi
     printf "%s\n" "${arg#*=}" >>"$s/$target.services"
+    save
     exit 0
     ;;
   --remove-service=* | --remove-service-from-zone=* | --remove-service-from-policy=*)
     refuse
     drop "$s/$target.services" "${arg#*=}"
+    save
     exit 0
     ;;
   --list-rich-rules)
@@ -1500,6 +1528,7 @@ for arg in "$@"; do
   --remove-rich-rule=*)
     refuse
     drop "$s/$target.rich" "${arg#*=}"
+    save
     exit 0
     ;;
   *)
@@ -1605,9 +1634,10 @@ fw_has() {
   printf '%s\n' "$@" >>"$fh_file"
 }
 
-# fw_calls prints the recorded calls of the programs whose names match the pattern PROG (one per line).
+# fw_calls PATTERN prints the recorded calls (one per line) that start with a match of the extended regular
+# expression PATTERN, a program's name or a whole call, followed by a space or the end of the line.
 fw_calls() {
-  grep -E "^($1) " "$FW_STATE/calls" 2>/dev/null || :
+  grep -E "^($1)( |\$)" "$FW_STATE/calls" 2>/dev/null || :
 }
 
 # line_of PATTERN prints the number of the first recorded call that has PATTERN in it, or 0.
@@ -1828,6 +1858,12 @@ systemctl reset-failed isshoni.service' "$(fw_calls systemctl | grep -v firewall
   assert_eq 'uninstall: firewalld, nor is a policy without the service' '' \
     "$(fw_calls 'firewall-cmd' | grep -- '--policy=allow-host-ipv6')"
   assert_eq 'uninstall: firewalld, isshoni.xml is gone' none "$(gone "$FIREWALLD_SERVICE")"
+  assert_eq 'uninstall: firewalld, no file of a zone or a policy names the service' '' \
+    "$(grep -l 'name="isshoni"' "$FIREWALLD_DIR"/zones/*.xml "$FIREWALLD_DIR"/policies/*.xml)"
+  # firewalld keeps a copy of the file it rewrote, which it does not load: the copy still names the service, and
+  # isshoni.xml went all the same.
+  assert_eq "uninstall: firewalld, the .xml.old copies don't count" "$FIREWALLD_DIR/zones/public.xml.old" \
+    "$(grep -l 'name="isshoni"' "$FIREWALLD_DIR/zones/public.xml.old")"
 
   # iptables: the rules tagged isshoni, and nothing else; then they are saved.
   assert_eq 'uninstall: iptables, the rules tagged isshoni are deleted' \
@@ -1857,8 +1893,9 @@ test_uninstall_firewalld_cases() {
   printf 'zone-internal\n' >"$FW_STATE/refuse"
   run do_uninstall
   assert_eq "uninstall: a zone refuses, the uninstall goes on ($OUT)" 0 "$RC"
-  assert_contains 'uninstall: a zone refuses, the warning names it' \
-    "Could not take the isshoni service out of firewalld's zone internal." "$OUT"
+  assert_contains 'uninstall: a zone refuses, the warning names it and its file' \
+    "Could not take the isshoni service out of firewalld here: zone internal, $FIREWALLD_DIR/zones/internal.xml." \
+    "$OUT"
   assert_contains 'uninstall: a zone refuses, the warning says what to do' 'Remove it there by hand' "$OUT"
   assert_contains 'uninstall: a zone refuses, the others are cleaned' \
     'removed the isshoni service from firewalld (zone public, zone trusted, policy lan-to-host)' "$OUT"
@@ -1895,10 +1932,61 @@ test_uninstall_firewalld_cases() {
   HAVE_NOT='cosign gh ufw netfilter-persistent firewall-offline-cmd'
   run do_uninstall
   assert_eq "uninstall: no way to firewalld's files ($OUT)" 0 "$RC"
-  assert_contains "uninstall: no way to firewalld's files, the warning" 'firewall-offline-cmd is not installed' "$OUT"
+  assert_contains "uninstall: no way to firewalld's files, the warning" \
+    'Could not take the isshoni service out of firewalld here: ' "$OUT"
+  for nw_file in zones/public.xml zones/internal.xml zones/trusted.xml policies/lan-to-host.xml; do
+    assert_contains "uninstall: no way to firewalld's files, the warning names $nw_file" "$FIREWALLD_DIR/$nw_file" "$OUT"
+  done
+  assert_contains "uninstall: no way to firewalld's files, the warning says why" \
+    'firewalld is not running, and firewall-offline-cmd is not installed.' "$OUT"
   assert_eq "uninstall: no way to firewalld's files, isshoni.xml stays" " /etc/firewalld/services/isshoni.xml" \
     "$(gone "$FIREWALLD_SERVICE")"
   HAVE_NOT='cosign gh ufw netfilter-persistent'
+
+  # The files have the final word. A zone file that names the service, edited by hand (or by a configuration
+  # tool) and not reloaded yet, is one that the running firewalld does not know about: it cleans the zones it
+  # knows, and isshoni.xml stays, because at its next reload or start firewalld would load internal.xml.
+  fake_install
+  fw_world 'public internal' ''
+  fw_has zone-public.services ssh isshoni
+  printf '<zone><service name="isshoni"/></zone>\n' >"$FIREWALLD_DIR/zones/public.xml"
+  printf '<zone>\n  <service name="isshoni"/>\n</zone>\n' >"$FIREWALLD_DIR/zones/internal.xml"
+  run do_uninstall
+  assert_eq "uninstall: a hand edit firewalld has not read ($OUT)" 0 "$RC"
+  assert_contains 'uninstall: a hand edit, the zone firewalld knows is cleaned' \
+    'Firewall: removed the isshoni service from firewalld (zone public).' "$OUT"
+  assert_contains 'uninstall: a hand edit, the warning names the file' \
+    "Could not take the isshoni service out of firewalld here: $FIREWALLD_DIR/zones/internal.xml." "$OUT"
+  assert_contains 'uninstall: a hand edit, the warning says what to do' "Remove it there by hand, then delete $FIREWALLD_SERVICE." "$OUT"
+  assert_eq 'uninstall: a hand edit, isshoni.xml stays' " /etc/firewalld/services/isshoni.xml" "$(gone "$FIREWALLD_SERVICE")"
+  assert_eq 'uninstall: a hand edit, the rest is removed' none "$(gone "$BIN" "$UNIT")"
+
+  # firewalld lists no zones and no policies (the commands fail): nothing is changed, and the files keep
+  # isshoni.xml.
+  fake_install
+  firewalld_with_isshoni
+  : >"$FW_STATE/get-fails"
+  run do_uninstall
+  assert_eq "uninstall: firewalld lists nothing ($OUT)" 0 "$RC"
+  assert_contains 'uninstall: firewalld lists nothing, the warning names a file' \
+    "$FIREWALLD_DIR/zones/public.xml" "$OUT"
+  assert_eq 'uninstall: firewalld lists nothing, isshoni.xml stays' " /etc/firewalld/services/isshoni.xml" \
+    "$(gone "$FIREWALLD_SERVICE")"
+
+  # Every way to write the attribute that firewalld reads counts; a word in a log prefix or a description does
+  # not, and neither does a file that is not .xml.
+  fake_install
+  fw_world 'public' ''
+  printf "<zone><service name = 'isshoni' /></zone>\n" >"$FIREWALLD_DIR/zones/public.xml"
+  run remove_firewalld
+  assert_contains "uninstall: name = 'isshoni' counts ($OUT)" "$FIREWALLD_DIR/zones/public.xml" "$OUT"
+  printf '<zone><description>isshoni was here</description><rule><log prefix="isshoni"/></rule></zone>\n' \
+    >"$FIREWALLD_DIR/zones/public.xml"
+  printf '<zone><service name="isshoni"/></zone>\n' >"$FIREWALLD_DIR/zones/public.xml.old"
+  printf '<zone><service name="isshoni-dev"/></zone>\n' >"$FIREWALLD_DIR/zones/dmz.xml"
+  run remove_firewalld
+  assert_eq "uninstall: a mention that names no service ($OUT)" 0 "$RC"
+  assert_eq 'uninstall: a mention that names no service, isshoni.xml is gone' none "$(gone "$FIREWALLD_SERVICE")"
 
   # No zone or policy file names the service (the admin said no to the offer): firewalld is not asked, and the
   # file goes.
@@ -1908,7 +1996,7 @@ test_uninstall_firewalld_cases() {
   run do_uninstall
   assert_eq "uninstall: firewalld without the service ($OUT)" 0 "$RC"
   assert_eq 'uninstall: firewalld without the service, firewalld is not asked' '' \
-    "$(fw_calls 'firewall-cmd|firewall-offline-cmd|systemctl is-active --quiet firewalld')"
+    "$(fw_calls 'firewall-cmd|firewall-offline-cmd|systemctl is-active --quiet firewalld.service')"
   assert_eq 'uninstall: firewalld without the service, isshoni.xml is gone' none "$(gone "$FIREWALLD_SERVICE")"
 
   # A ufw that refuses keeps its profile, which it needs to delete the rule later.
@@ -1921,6 +2009,47 @@ test_uninstall_firewalld_cases() {
   assert_contains 'uninstall: ufw refuses, the warning' 'Delete the rule yourself (sudo ufw delete allow isshoni)' "$OUT"
   assert_eq 'uninstall: ufw refuses, the profile stays' " /etc/ufw/applications.d/isshoni" "$(gone "$UFW_PROFILE")"
   HAVE_NOT='cosign gh'
+
+  # --no-firewall (here from ISSHONI_NO_FIREWALL=1) leaves every firewall as it is, with isshoni's profiles,
+  # which their rules may still name, and says so.
+  fake_install
+  firewalld_with_isshoni
+  : >"$FW_STATE/ufw-rule"
+  IPTABLES_RULES='-P INPUT ACCEPT
+-A INPUT -p udp -m udp --dport 7882 -m comment --comment isshoni -j ACCEPT'
+  HAVE_NOT='cosign gh'
+  ISSHONI_NO_FIREWALL=1
+  parse_args --uninstall
+  unset ISSHONI_NO_FIREWALL
+  run do_uninstall
+  assert_eq "uninstall --no-firewall ($OUT)" 0 "$RC"
+  assert_contains 'uninstall --no-firewall: says so' 'Firewall: not touched (--no-firewall).' "$OUT"
+  assert_contains 'uninstall --no-firewall: says how to remove them later' \
+    'To remove them, run --uninstall again without --no-firewall' "$OUT"
+  assert_eq 'uninstall --no-firewall: no firewall is asked or changed' '' \
+    "$(fw_calls 'ufw|firewall-cmd|firewall-offline-cmd|netfilter-persistent|systemctl is-active --quiet firewalld.service')"
+  assert_eq 'uninstall --no-firewall: no iptables rule is deleted' no "$([ -e "$WORK/iptables-calls" ] && echo yes || echo no)"
+  assert_eq 'uninstall --no-firewall: the ufw rule and the profiles stay' \
+    " /etc/ufw/applications.d/isshoni /etc/firewalld/services/isshoni.xml" "$(gone "$UFW_PROFILE" "$FIREWALLD_SERVICE")"
+  assert_eq 'uninstall --no-firewall: the ufw rule stays' yes "$([ -e "$FW_STATE/ufw-rule" ] && echo yes || echo no)"
+  assert_eq 'uninstall --no-firewall: firewalld keeps the service' isshoni "$(grep -x isshoni "$FW_STATE/zone-public.services")"
+  assert_eq 'uninstall --no-firewall: the program, the unit and the sysctl file are gone' none \
+    "$(gone "$BIN" "$UNIT" "$SYSCTL_FILE")"
+
+  # The same for --purge.
+  fake_install
+  firewalld_with_isshoni
+  parse_args --purge --yes --no-firewall
+  run do_purge
+  assert_eq "purge --no-firewall ($OUT)" 0 "$RC"
+  assert_contains 'purge --no-firewall: says so' 'Firewall: not touched (--no-firewall).' "$OUT"
+  assert_eq 'purge --no-firewall: no firewall is asked or changed' '' \
+    "$(fw_calls 'ufw|firewall-cmd|firewall-offline-cmd|netfilter-persistent|systemctl is-active --quiet firewalld.service')"
+  assert_eq 'purge --no-firewall: the profiles stay' \
+    " /etc/ufw/applications.d/isshoni /etc/firewalld/services/isshoni.xml" "$(gone "$UFW_PROFILE" "$FIREWALLD_SERVICE")"
+  assert_eq 'purge --no-firewall: the rest is gone' none "$(gone "$BIN" "$CONFIG_DIR" "$DATA_DIR" "$R/users/passwd-isshoni")"
+  parse_args
+  HAVE_NOT='cosign gh ufw netfilter-persistent'
 
   # A service that does not stop: nothing is removed.
   fake_install

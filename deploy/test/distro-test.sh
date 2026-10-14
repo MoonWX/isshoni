@@ -31,7 +31,8 @@
 #   c11        the distro's plain image, without systemd (exit 4)
 #   v3         fedora-44 and ubuntu-24.04 only, a container with a running firewall: the firewall offer opens the
 #              ports, and --uninstall takes them out again. On Fedora the service is first put into a second zone,
-#              a policy and a rich rule, and firewalld must still load its configuration after the uninstall
+#              a policy and a rich rule, and written by hand into a third zone's file that firewalld has not read;
+#              that file keeps isshoni.xml, and firewalld must still load its configuration after the uninstall
 #              (06 §4.9, §4.11). 06 §11.2 also has V3 in the nightly's virtual machines (README S83).
 # Default: all of them.
 #
@@ -779,8 +780,10 @@ scenario_c11() {
 
 # V3 with firewalld (Fedora): the offer opens the ports in firewalld, right after isshoni.xml was put in place,
 # which takes the reload before --add-service. The admin then puts the service into a second zone and a policy and
-# names it in a rich rule; --uninstall takes it out of all of them, and firewalld loads its configuration after
-# that, at a reload and at a restart.
+# names it in a rich rule, and also writes it into a third zone's file by hand, without a reload. --uninstall takes
+# it out of all that the running firewalld knows; the file it does not know about keeps isshoni.xml, with a
+# warning that names it. After the admin has done what the warning says, firewalld loads its configuration, at a
+# reload and at a restart.
 scenario_v3_firewalld() {
   say '' 'V3: firewalld running'
   v3_tries=0
@@ -803,6 +806,9 @@ scenario_v3_firewalld() {
       firewall-cmd --permanent --policy=isshonitest --add-egress-zone=HOST &&
       firewall-cmd --permanent --policy=isshonitest --add-service=isshoni &&
       firewall-cmd --reload' >/dev/null || fail 'V3 firewalld: the admin puts the service into a zone, a policy and a rich rule'
+  # shellcheck disable=SC2016 # the variables are the container shell's
+  in_container sh -c 'sed "s|</zone>|  <service name=\"isshoni\"/>\n</zone>|" /usr/lib/firewalld/zones/work.xml >"$1"' \
+    sh /etc/firewalld/zones/work.xml || fail 'V3 firewalld: the admin writes the service into the zone work by hand'
 
   run_installer "$V1" '' --uninstall
   assert_eq 'V3 firewalld uninstall: exit code' 0 "$RC"
@@ -813,7 +819,12 @@ scenario_v3_firewalld() {
   for v3_label in 'zone public' 'zone internal' 'zone trusted' 'policy isshonitest'; do
     assert_contains "V3 firewalld uninstall: out of the $v3_label" "$v3_label" "$v3_where"
   done
-  assert_eq 'V3 firewalld uninstall: isshoni.xml is gone' no "$(yes_no test -e /etc/firewalld/services/isshoni.xml)"
+  assert_contains 'V3 firewalld uninstall: the hand-written zone file is named' \
+    'Could not take the isshoni service out of firewalld here: /etc/firewalld/zones/work.xml.' "$OUT"
+  assert_eq 'V3 firewalld uninstall: so isshoni.xml stays' yes "$(yes_no test -e /etc/firewalld/services/isshoni.xml)"
+  assert_eq 'V3 firewalld uninstall: firewall-cmd --reload succeeds with the file' 0 "$(exit_of firewall-cmd --reload)"
+  in_container sh -c 'firewall-cmd --permanent --zone=work --remove-service=isshoni &&
+    rm /etc/firewalld/services/isshoni.xml' >/dev/null || fail 'V3 firewalld: the admin does what the warning says'
   assert_eq 'V3 firewalld uninstall: no zone or policy names the service' '' \
     "$(in_container sh -c 'grep -l isshoni /etc/firewalld/zones/*.xml /etc/firewalld/policies/*.xml 2>/dev/null || :')"
   assert_eq 'V3 firewalld uninstall: firewall-cmd --reload succeeds' 0 "$(exit_of firewall-cmd --reload)"

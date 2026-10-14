@@ -75,9 +75,10 @@ PLANNED_EXIT=0   # 1 when the script ends with one of its own exit codes, not at
 REMOVED=0        # what an uninstall removed, counted
 FW_ONLINE=''     # an uninstall's way to firewalld: 1 the daemon, 0 its files (firewall-offline-cmd)
 FW_REMOVED=''    # the zones and policies an uninstall took the isshoni service out of
-FW_FAILED=''     # the ones firewalld refused to change
+FW_FAILED=''     # the ones firewalld refused to change, and the files of firewalld that still name the service
 OPT_ACTION=install
 OPT_YES=0
+OPT_NO_FIREWALL=0
 CFG_TLS_MODE=''
 # Colors, for stdout (C_) and stderr (E_): empty unless setup_colors turns them on.
 C_BOLD=''
@@ -1690,13 +1691,16 @@ EOF
 # other zones or a policy, or written a rich rule that names it. So before isshoni.xml goes, the service leaves
 # every zone and policy that has it, with every rich rule that names it: through the daemon when it runs, and then
 # one reload, which closes the ports (it works because the daemon still knows the service), or on the files with
-# firewall-offline-cmd. Nothing else in the firewall is touched. When firewalld refuses to change a zone or a
-# policy, a warning names it and the file stays, so that firewalld goes on loading its configuration until the
-# admin has taken the service out there by hand; the uninstall goes on.
+# firewall-offline-cmd. Nothing else in the firewall is touched. The files that firewalld loads have the final
+# word: when one of them still names the service afterwards (a zone or a policy that firewalld refused to change,
+# a hand edit that the daemon has not read yet, a zone that it did not list), a warning names it and the file
+# stays, so that firewalld goes on loading its configuration until the admin has taken the service out there by
+# hand; the uninstall goes on.
 remove_firewalld() {
   exists "$FIREWALLD_SERVICE" || return 0
   FW_REMOVED=''
   FW_FAILED=''
+  rf_why=''
   # Only a zone or a policy that was changed on this machine can name the service, and firewalld keeps those in
   # files of their names below /etc/firewalld. Looking at the files first saves a dozen slow firewalld commands.
   if as_root grep -rqs isshoni "$FIREWALLD_DIR/zones" "$FIREWALLD_DIR/policies"; then
@@ -1711,7 +1715,7 @@ remove_firewalld() {
       rf_policy_rm=--remove-service-from-policy
     else
       FW_ONLINE=''
-      FW_FAILED='zones and policies (firewalld is not running, and firewall-offline-cmd is not installed)'
+      rf_why='firewalld is not running, and firewall-offline-cmd is not installed.'
     fi
     if [ -n "$FW_ONLINE" ]; then
       for rf_zone in $(fw_perm --get-zones 2>/dev/null); do
@@ -1731,8 +1735,20 @@ remove_firewalld() {
       REMOVED=$((REMOVED + 1))
     fi
   fi
+  # firewalld loads these files at its next reload or start, and it writes every change above to them at once
+  # (firewall-cmd --permanent and firewall-offline-cmd alike). So the service file stays while one of them still
+  # names the service, whatever firewalld said above. It loads the .xml files only (zones/ may also have a
+  # directory per zone), not the .xml.old copies that it keeps of the files it rewrote.
+  rf_left=$(as_root find "$FIREWALLD_DIR/zones" "$FIREWALLD_DIR/policies" -name '*.xml' \
+    -exec grep -lsE "name[[:space:]]*=[[:space:]]*[\"']isshoni[\"']" {} + 2>/dev/null) || :
+  while IFS= read -r rf_file; do
+    [ -n "$rf_file" ] || continue
+    FW_FAILED="${FW_FAILED:+$FW_FAILED, }$rf_file"
+  done <<EOF
+$rf_left
+EOF
   if [ -n "$FW_FAILED" ]; then
-    warn "Could not take the isshoni service out of firewalld's $FW_FAILED." \
+    warn "Could not take the isshoni service out of firewalld here: $FW_FAILED." ${rf_why:+"$rf_why"} \
       "Remove it there by hand, then delete $FIREWALLD_SERVICE. The file stays until then: firewalld can't load" \
       'its configuration while a zone or a policy names a service that it has no file for.'
     return 0
@@ -1778,11 +1794,18 @@ EOF
 
 # uninstall_steps removes isshoni and keeps its configuration, its data and its user: the service, the unit, the
 # program, the sysctl file and the firewall rules and profiles (06 §4.11 steps 1 to 4). REMOVED counts what it
-# removed.
+# removed. --no-firewall (never touch the firewall, 06 §4.1) holds here too: the firewall is left as it is, with
+# the profiles, which its rules may still name.
 uninstall_steps() {
   REMOVED=0
   stop_service
   remove_program
+  if [ "$OPT_NO_FIREWALL" = 1 ]; then
+    say "Firewall: not touched (--no-firewall). isshoni's ufw rule and profile, its firewalld service and its" \
+      'iptables rules stay, where there are any. To remove them, run --uninstall again without --no-firewall' \
+      '(and without ISSHONI_NO_FIREWALL).'
+    return 0
+  fi
   step 'removing the firewall rules'
   remove_ufw
   remove_firewalld
