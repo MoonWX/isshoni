@@ -214,9 +214,8 @@ test('a quality.hint{codec} makes the sharer re-offer, and the viewers keep deco
   const shareId = await share(alex);
 
   // Everybody decodes High: the room's policy is `high`, and the share goes out in it (02 §8.3). A Chrome that
-  // can't encode High (a software encoder only) puts its next profile first, Constrained Baseline (05 §13.4).
-  const params = received(alexWire, 'ok').find((d) => d['shareId'] === shareId);
-  expect(params?.['codec'], "share.start's ShareParams.codec").toBe('h264/6400');
+  // can't encode High (a software encoder only, as on CI's Linux runners) puts its next profile first, Constrained
+  // Baseline (05 §13.4), and the share starts in that one.
   const encodesHigh = await alex.evaluate(
     () =>
       RTCRtpSender.getCapabilities('video')?.codecs.some(
@@ -224,6 +223,8 @@ test('a quality.hint{codec} makes the sharer re-offer, and the viewers keep deco
       ) ?? false,
   );
   const startProfile = encodesHigh ? '6400' : '42e0';
+  const params = received(alexWire, 'ok').find((d) => d['shareId'] === shareId);
+  expect(params?.['codec'], "share.start's ShareParams.codec").toBe(`h264/${startProfile}`);
   if (!encodesHigh) {
     test.info().annotations.push({ type: 'note', description: "the sharer's Chrome can't encode High here" });
   }
