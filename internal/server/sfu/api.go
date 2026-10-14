@@ -27,7 +27,7 @@ import (
 
 // ProbeTransport names one ICE transport of the connection test (02 §7.6). The values are netx's Via labels, the
 // same set used everywhere (dashboard, metrics, the selected-pair label). probe.go has ProbeResult and SFU.Probe,
-// which README S76 implements on the probe APIs built here.
+// which run on the probe APIs built here.
 type ProbeTransport string
 
 // The three probe transports. Each is unavailable when its mux is nil: udp with listen.ice_udp = "", tcp443 in
@@ -360,7 +360,7 @@ var (
 // candidateFilter is the remote-candidate filter of 02 §7.3. With full ICE the server sends connectivity checks to
 // every remote candidate a client signals, so without it a client could make the server probe its own loopback or
 // internal networks (01 §17). It applies to everything a client signals: trickled candidates (trickled, in
-// Conn.AddICECandidate) and the candidates of its SDP (filterSDP, before SetRemoteDescription: a browser's pub offer,
+// Conn.AddICECandidate) and the candidates of its SDP (limitSDP, before SetRemoteDescription: a browser's pub offer,
 // sub answer or re-offer can carry the candidates it has gathered, and so can a connection-test probe offer, SFU.Probe
 // of 02 §7.6, which any signed-in user may send). It never applies to peer-reflexive candidates: those are the
 // source addresses of checks that already reached the server, and the server learns every client address it needs
@@ -420,7 +420,7 @@ func (f candidateFilter) judgeTrickled(init webrtc.ICECandidateInit) (candidateK
 
 // candidate judges one candidate string as ice.UnmarshalCandidate reads it (the value of a candidate attribute, or a
 // trickled candidate as trickled passes it). A value with a CR or LF in it is dropped as unparsable: no valid
-// candidate has one, and pion/sdp wouldn't read it back unchanged after filterSDP re-marshals the SDP.
+// candidate has one, and pion/sdp wouldn't read it back unchanged after limitSDP re-marshals the SDP.
 func (f candidateFilter) candidate(value string) dropReason {
 	_, reason := f.judge(value)
 	return reason
@@ -510,26 +510,21 @@ func (f candidateFilter) addr(a netip.Addr) dropReason {
 	return keepCandidate
 }
 
-// filterSDP returns a remote description (a pub offer, a sub answer or a probe offer: SFU.Probe, 02 §7.6) without
-// the candidate attributes the filter drops, at session or media level, and how many it dropped.
+// limitSDP returns a remote description (a pub offer, a sub answer or a probe offer: SFU.Probe, 02 §7.6) without the
+// candidate attributes the filter drops, at session or media level, and how many it dropped. Its candidates count
+// toward the PC's cap on remote candidates like trickled ones (02 §12): a candidate that the filter keeps but admit
+// refuses is dropped too. admit gets the key of each kept candidate, in the SDP's order, and must give the same
+// answer when it is asked about a candidate again (remoteCandidates.admit does: a candidate it admitted stays
+// admitted), because the SDP that comes out is read once more. A nil admit applies the filter alone.
 //
 // It reads the SDP with pion/sdp, the parser of Pion's SetRemoteDescription, and judges each candidate attribute by
 // its value, exactly the string Pion's parser reads (webrtc's extractICEDetails → ice.UnmarshalCandidate), so every
 // attribute Pion takes for a candidate is judged however the lines are broken (pion/sdp also ends a line at a lone
 // CR in places, and skips CRs before a line's type). An SDP without a dropped candidate comes back unchanged. Otherwise
 // it is re-marshaled, and since pion/sdp doesn't always read back what it wrote for a malformed line (it cuts one more
-// character off a line for each CR inside it), the result is read again the same way: a candidate the filter drops
-// in it makes the SDP sfu.bad_sdp, as does an SDP pion/sdp can't parse (SetRemoteDescription would refuse it too).
-// Browser and Pion descriptions never hit either case.
-func (f candidateFilter) filterSDP(raw string) (string, int, error) {
-	return f.limitSDP(raw, nil)
-}
-
-// limitSDP is filterSDP for the remote description of a Conn's PC, whose candidates count toward the PC's cap on
-// remote candidates like trickled ones (02 §12): a candidate that the filter keeps but admit refuses is dropped too.
-// admit gets the key of each kept candidate, in the SDP's order, and must give the same answer when it is asked
-// about a candidate again (remoteCandidates.admit does: a candidate it admitted stays admitted), because the SDP
-// that comes out is read once more.
+// character off a line for each CR inside it), the result is read again the same way: a candidate dropped in it
+// makes the SDP sfu.bad_sdp, as does an SDP pion/sdp can't parse (SetRemoteDescription would refuse it too). Browser
+// and Pion descriptions never hit either case.
 func (f candidateFilter) limitSDP(raw string, admit func(candidateKey) bool) (string, int, error) {
 	desc, err := parseSDP(raw)
 	if err != nil {

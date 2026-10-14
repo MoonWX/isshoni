@@ -195,7 +195,7 @@ func errOf(t *testing.T, err error, code string) *Error {
 	if !errors.As(err, &e) || e.Code != code {
 		t.Fatalf("error = %v, want %s", err, code)
 	}
-	if e.Retryable != retryableCode(code) && !errors.Is(err, ErrNotImplemented) && code != CodeInternal {
+	if e.Retryable != retryableCode(code) && code != CodeInternal {
 		t.Errorf("%s: Retryable = %v, want the flag of 02 §6.3", code, e.Retryable)
 	}
 	return e
@@ -544,7 +544,9 @@ func (w *syncBuffer) String() string {
 }
 
 // TestCloseAbandonsSlowConns: SFU.Close returns within about 1 s even when a Conn can't close in time, says so in a
-// warning, and the Conn still finishes on its own. The logs carry component=sfu and the ids, never more.
+// warning, and the Conn still finishes on its own. A connection-test probe that is still closing then is stopped and
+// counted in a warning too, although the Conn used the time up. The logs carry component=sfu and the ids, never
+// more.
 func TestCloseAbandonsSlowConns(t *testing.T) {
 	tr := loopbackTransport(t, false)
 	logs := &syncBuffer{}
@@ -565,6 +567,11 @@ func TestCloseAbandonsSlowConns(t *testing.T) {
 		})
 	}()
 	<-entered
+	// A probe without a goroutine: nothing closes its done.
+	stuck := s.newProbe("carol", ProbeUDP)
+	if _, err := s.addProbe(stuck); err != nil {
+		t.Fatal(err)
+	}
 
 	start := time.Now()
 	if err := s.Close(); err != nil {
@@ -572,6 +579,9 @@ func TestCloseAbandonsSlowConns(t *testing.T) {
 	}
 	if d := time.Since(start); d < closeTimeout || d > closeTimeout+time.Second {
 		t.Errorf("Close took %v with a stuck Conn, want about %v", d, closeTimeout)
+	}
+	if !stuck.stopped() {
+		t.Error("SFU.Close did not stop the probe")
 	}
 	waitDone(t, quick)
 	select {
@@ -594,6 +604,8 @@ func TestCloseAbandonsSlowConns(t *testing.T) {
 		`msg="connection joined"`, "conn_id=c-slow", "room_id=lounge", "user_id=bob", "role=full",
 		`msg="share started"`, `msg="share ended"`, "share_id=s_1", "reason=server_shutdown",
 		`msg="connection left"`,
+		`level=WARN msg="connections were still closing their PeerConnections when the SFU closed" component=sfu count=1`,
+		`level=WARN msg="connection test probes were still closing their PeerConnections when the SFU closed" component=sfu count=1`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the logs lack %q:\n%s", want, out)
@@ -681,29 +693,20 @@ func TestUpdateShareAndLimits(t *testing.T) {
 	}
 }
 
-// TestNotImplemented: the methods that later slices fill in exist and say so (README §4 "Interfaces first").
+// TestNotImplemented: every method that a later slice filled in (README §4 "Interfaces first") exists now, the last
+// one README S76's Probe, so none says "not implemented" any more: no error of the package wraps ErrNotImplemented.
 func TestNotImplemented(t *testing.T) {
 	s, _ := newTestSFU(t)
 	ctx := testCtx(t)
 	c, _ := join(t, s, "lounge", "alice", "c-a", RoleFull)
 	_, _, probeErr := s.Probe(ctx, "alice", ProbeUDP, "v=0\r\n")
-	for name, err := range map[string]error{
-		"SFU.Probe": probeErr,
-	} {
-		if !errors.Is(err, ErrNotImplemented) {
-			t.Errorf("%s = %v, want an error that wraps ErrNotImplemented", name, err)
-			continue
-		}
-		if e := errOf(t, err, CodeInternal); e.Retryable {
-			t.Errorf("%s: a missing method is retryable", name)
-		}
-	}
-	// The methods of README S57 and S69 exist now: none of them says "not implemented" any more.
+	wantErr(t, probeErr, CodeBadSDP)
 	for name, err := range map[string]error{
 		"Conn.RestartICE":    c.RestartICE(ctx, PCSub, 1),
 		"Conn.ResetPC":       c.ResetPC(ctx, PCSub, 1),
 		"Conn.ClosePC":       c.ClosePC(ctx, PCPub, 1),
 		"Conn.SetDecodeCaps": c.SetDecodeCaps(ctx, DecodeCaps{H264: []ProfileKey{ProfileHigh}}),
+		"SFU.Probe":          probeErr,
 	} {
 		if errors.Is(err, ErrNotImplemented) {
 			t.Errorf("%s = %v", name, err)
