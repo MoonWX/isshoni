@@ -1018,6 +1018,7 @@ The throttles are in-memory token buckets (decision 8), in `auth/limiter.go` (al
 | `auth-user` | username key (existing or not) | 30 | 1 per 2 min | Failed password checks, from any IP: a login's, and the password a logged-in user types again (below) | After `auth-user-ip`. When it is empty, the user's known IPs still pass (below) |
 | `register-ip` | client IP | 5 | 1 per 12 min | Every `register` request without an invite, in every mode (only the approval mode lets one through, below). Invite registrations are limited by the invite's own `maxUses` instead (the load test, 02, registers many users from one IP) | Right after `auth-ip`, before the mode check and any other work |
 | `auth-hash` | one for the whole server | 20 | 5 per s | Every public request that reaches the hash: login (the dummy hash too), register, setup/complete, reset/complete, device/password *(later: M2)* | Last: after all of the buckets above, before the semaphore (§7.2) |
+| `password-change` | user ID | 3 | 1 per 10 min | `POST /me/password` whose `currentPassword` was right (README F08): the token is taken before the first hash and kept once that password is verified, whatever comes after. Every other end gives it back: a wrong `currentPassword` (`auth-user-ip` and `auth-user` count it, as before), another bucket's 429, a full hash queue, a store or context error | After the new password's rules and the shape of `currentPassword` (a missing one is 403 first), before `auth-user-ip`. Empty: 429 and no hash, whatever the password |
 | `lookup` *(later: M2)* | session ID | 10 | 1 per min | Failed user-code lookups | Before lookup |
 | `push-test` | user ID | 1 | 1 per 10 s | `POST /push/test` | After the 503 for push that is off and the 404 for a session without a subscription, before sending (below) |
 
@@ -1062,7 +1063,30 @@ The throttles are in-memory token buckets (decision 8), in `auth/limiter.go` (al
   `auth-ip` and `auth-hash` are for anonymous requests and don't apply; the hash still waits for a slot of the
   semaphore (§7.2; a full queue is 503 `server_busy`). A wrong try writes no `auth.login_failed` row: it is no
   login. The password an admin types again to grant admin or to issue a reset link (§7.10, §7.11) comes with
-  README S64, which has `verifyOwnPassword` to call.
+  README S64, which has `verifyOwnPassword` to call. A password change also takes a `password-change` token
+  first (below).
+- **`password-change`** (README F08, from the M1 security review). A right `currentPassword` gives `auth-user-ip`
+  and `auth-user` their tokens back, and the change then hashes the new password with no token at all, so without
+  this bucket a member could loop `POST /me/password` with the own password (or two passwords in turn, so
+  refusing a new password equal to the current one would not help), keep every slot of the semaphore busy and,
+  with 32 waiters queued, have every anonymous login, sign-up and reset answered 503 `server_busy`: the outcome
+  `auth-hash` exists to prevent. Rules (`auth/selfservice.go`, `reauthenticate`):
+  - **Order**: the new password's rules (422), a missing or impossible `currentPassword` (403, no token), then
+    `password-change`, then `auth-user-ip` and `auth-user`, then the hash. An empty bucket is 429 `rate_limited`
+    with `retryAfter` and `Retry-After`, without a hash, whatever the password.
+  - **Kept** once the current password is verified: that change runs at most two hashes (the check and the new
+    hash), so a user's changes with the right password run at most 6 hashes at once and 2 per 10 minutes after
+    that. Requests sent in parallel each take their token before they hash: of 20 in flight together with the
+    right password, 17 are 429 at once; the 3 that hash verify it, one changes it, and the other two find it
+    changed in their `Write` (403 `wrong_password`) and keep their tokens too. A request that reads the account
+    only after such a change checks a password that is no longer the account's: a wrong one (next bullet).
+  - **Given back** by every other end. A wrong `currentPassword` costs one hash and is a failed password check:
+    `auth-user-ip` and `auth-user` count it as before, as they count `POST /me/delete`'s, so the rule "five wrong
+    tries from one address block that address" stays as it was and this bucket would add nothing there. The
+    other ends ran no hash: another bucket's 429, a full hash queue, a store or context error.
+  - Per user, from any session and address. It writes no `auth.throttled` row (§10 has no scope for it); the
+    first refusal of an episode logs one `warn` line with `user_id`. `POST /me/delete` and the admin's own
+    password (§7.10, §7.11) take no token: deleting the account happens once, and admins are trusted.
 - **`register-ip` comes before the mode check** (S42; kept, decided after group 5). A `register` request without
   an invite takes its `register-ip` token as its second step, whatever the registration mode is. So in the `invite`
   and `closed` modes, where such a request can never succeed, an address that has spent its five tokens is answered
@@ -1080,7 +1104,8 @@ The throttles are in-memory token buckets (decision 8), in `auth/limiter.go` (al
   empty, the request gets 503 `server_busy` with `Retry-After` (the seconds until the next token, at least 1) and
   does no hashing. The trade-off: under such an attack, new logins, sign-ups and resets wait. Existing sessions,
   WebSockets and media are unaffected, because nothing on those paths hashes. Password checks by a logged-in user
-  (changing the password, deleting the account, granting admin) don't use this bucket.
+  (changing the password, deleting the account, granting admin) don't use this bucket; a password change has
+  `password-change` instead.
 - **`push-test` lives in `httpapi`** (README S53; `httpapi/push.go`, `pushTestLimiter`). Its handler is its only
   user and `auth.Service` has no call for it, so the slice that wrote the handler kept the bucket next to it.
   - **Order** in `POST /push/test`: push off → 503 `push_unavailable`; this session has no subscription → 404
@@ -2584,6 +2609,13 @@ endpoint. The SPA re-subscribes when the key differs from its subscription's `ap
   the same user and cleared for another. Every post sets the row's `created_at`, so "the oldest is evicted" means
   the browsers that have not posted for the longest time, not the ones that subscribed first. The name is
   `auth.DescribeUserAgent` ("Chrome on Windows"): one of a fixed set of labels, never text from the header.
+  **One subscription per web session** (README F08, from the M1 security review): the same `Write` deletes the
+  session's other rows (`DeleteSessionPushSubscriptionsExcept`), so the session keeps the endpoint it posted
+  last, and `POST /push/test`, which sends to this session's subscriptions, reaches one endpoint. Before, one
+  session could hold all 10 of the user's subscriptions, which contradicted "one browser, one subscription" and
+  let one test reach 10 endpoints that never answer. A browser holds one `PushSubscription` per service worker,
+  so the SPA never posts two at once; a new one (after `rotate-secrets`, 04 §5.2) replaces the old. The cap of 10
+  per user still holds across the user's sessions, and is applied after this rule.
 - **The session is checked again inside the write** (`callerLive`), for subscribe and for `PUT` preferences: the
   chain let the request in on a principal that may be up to 30 s old (§7.4), and a logout, a revocation or the
   account's deletion may have removed the session since. Then the answer is 401 `unauthenticated` and nothing is

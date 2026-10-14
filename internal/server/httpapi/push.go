@@ -107,8 +107,10 @@ func callerLive(q *store.Q, p auth.Principal) error {
 // (not_https). ValidateEndpoint looks the host up in DNS, so it runs before the Write, never inside it.
 //
 // Storage: the row is upserted by endpoint. A known endpoint is rebound to the caller and this session, with the
-// new keys and a fresh failure count; the name is the browser label of the User-Agent ("Chrome on Windows"). A user
-// keeps at most 10 subscriptions: the ones that were posted longest ago go.
+// new keys and a fresh failure count; the name is the browser label of the User-Agent ("Chrome on Windows"). A web
+// session keeps one subscription, the one it posted last: the session's other rows are deleted in the same Write
+// (README F08), so POST /push/test, which sends to this session's subscriptions, reaches one endpoint. A user keeps
+// at most 10 subscriptions across the sessions: the ones that were posted longest ago go.
 func (a *API) postPushSubscription(w http.ResponseWriter, r *http.Request) {
 	p, ok := PrincipalFrom(r.Context())
 	if !ok {
@@ -157,6 +159,9 @@ func (a *API) postPushSubscription(w http.ResponseWriter, r *http.Request) {
 		if created, err = q.UpsertPushSubscription(&sub); err != nil {
 			return err
 		}
+		if _, err := q.DeleteSessionPushSubscriptionsExcept(p.SessionID, sub.ID); err != nil {
+			return err
+		}
 		return q.TrimPushSubscriptions(p.UserID, maxPushSubscriptions)
 	})
 	if err != nil {
@@ -200,8 +205,9 @@ func (a *API) postPushUnsubscribe(w http.ResponseWriter, r *http.Request) {
 }
 
 // postPushTest is POST /api/v1/push/test (03 §12.3 #28, §12.4.6): 202 with no body. It sends a push.test
-// notification to this session's subscriptions, that is, to this browser, through Push.SendTest, which only queues
-// (04 §14.2). The body ({}) is not read. In order:
+// notification to this session's subscriptions (one, since a subscribe deletes the session's others), that is, to
+// this browser, through Push.SendTest, which only queues (04 §14.2), on a lane of its own: a test never waits for,
+// or holds up, the workers of share.started and admin.alert (04 §14.5). The body ({}) is not read. In order:
 //
 //  1. push off → 503 push_unavailable;
 //  2. this session has no subscription → 404 not_found;

@@ -66,6 +66,11 @@ const (
 	sendTimeout     = 10 * time.Second // one request, from dial to the end of the body
 	maxResponseBody = 4 << 10          // read at most this much of a response body
 	maxRetryAfter   = 60 * time.Second // a longer Retry-After is not waited for (the Service gives up instead)
+	// dialTimeout and tlsHandshakeTimeout bound the connection to a push service (README F08): an endpoint whose
+	// address drops every packet holds a worker for 2 s per attempt, not 5. The push services answer from nearby
+	// data centres in milliseconds, and a SYN lost once (sent again after 1 s) still fits.
+	dialTimeout         = 2 * time.Second
+	tlsHandshakeTimeout = 2 * time.Second
 )
 
 // webPushSender is the real Sender: RFC 8291 encryption and the RFC 8292 VAPID header by webpush-go, sent through
@@ -83,7 +88,7 @@ type webPushSender struct {
 
 // newWebPushSender builds the real Sender. roots is nil outside tests (the system's root certificates).
 func newWebPushSender(keys config.VAPIDKeys, subject string, g *guard, roots *x509.CertPool) *webPushSender {
-	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second, Control: g.control}
+	dialer := &net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second, Control: g.control}
 	w := &webPushSender{
 		publicKey:  keys.Public,
 		privateKey: keys.Private,
@@ -99,7 +104,7 @@ func newWebPushSender(keys config.VAPIDKeys, subject string, g *guard, roots *x5
 		},
 		TLSClientConfig:        &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots},
 		ForceAttemptHTTP2:      true,
-		TLSHandshakeTimeout:    5 * time.Second,
+		TLSHandshakeTimeout:    tlsHandshakeTimeout,
 		ResponseHeaderTimeout:  sendTimeout,
 		MaxResponseHeaderBytes: 16 << 10,
 		MaxIdleConns:           16,

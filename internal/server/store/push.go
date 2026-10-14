@@ -212,6 +212,18 @@ func (q *Q) RecordPushResult(id PushSubID, ok bool, now time.Time) error {
 		string(id))
 }
 
+// DeleteSessionPushSubscriptionsExcept deletes every subscription of web session s but keep, and returns how many
+// went. A web session holds one subscription, the endpoint its browser posted last (03 §12.4.6, README F08): POST
+// /api/v1/push/subscriptions calls it in the Write of its upsert, so that a member can't pile up endpoints in one
+// session for POST /push/test to send to. A device's subscriptions (later: M2) are not touched.
+func (q *Q) DeleteSessionPushSubscriptionsExcept(s SessionID, keep PushSubID) (int, error) {
+	if s == "" {
+		return 0, errors.New("store: DeleteSessionPushSubscriptionsExcept: no session")
+	}
+	return q.execCount("delete the session's other push subscriptions",
+		`DELETE FROM push_subscriptions WHERE session_id = ? AND id != ?`, string(s), string(keep))
+}
+
 // TrimPushSubscriptions keeps the user's keep newest subscriptions by CreatedAt, which every re-subscribe moves
 // forward (UpsertPushSubscription), and deletes the older ones.
 func (q *Q) TrimPushSubscriptions(u UserID, keep int) error {
