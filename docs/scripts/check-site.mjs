@@ -96,7 +96,10 @@ function attributes(tag) {
 
 /** @param {string} file @param {string} html */
 function checkHTML(file, html) {
-  const noComments = html.replace(/<!--[\s\S]*?-->/g, '');
+  // Each comment becomes a space rather than nothing, so that the text around a removed comment can't join into a
+  // new "<!--" (CodeQL js/incomplete-multi-character-sanitization). A leftover "<!--" would only make this check
+  // scan more of the page, never less.
+  const noComments = html.replace(/<!--[\s\S]*?-->/g, ' ');
   for (const m of noComments.matchAll(/<([a-zA-Z][a-zA-Z0-9-]*)(\s[^>]*)?>/g)) {
     const tag = m[1].toLowerCase();
     if (tag === 'a' || tag === 'area') continue;
