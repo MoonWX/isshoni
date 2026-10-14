@@ -125,9 +125,10 @@ func WithoutCutFrames(pkts []Packet) []Packet {
 }
 
 // InSeqOrder returns the packets in the order of their sequence numbers, as a jitter buffer hands them to a decoder.
-// The checks of frames (Frames, CheckVideoMarkers, WithoutPartialTail) take packets in arrival order, which is the
-// stream's order as long as nothing was lost; a stream with repairs, whose retransmissions arrive after newer frames
-// began, is put in order with this first. A second copy of a sequence number stays right behind the first.
+// Frames, WithoutPartialTail and WithoutCutFrames take packets in arrival order, which is the stream's order as long
+// as nothing was lost or reordered; a stream with repairs, whose retransmissions arrive after newer frames began, is
+// put in order with this first. The checks of the stream (CheckContinuous, CheckStartsOnSPS, CheckVideoMarkers,
+// CheckAudioMarkers) do it themselves. A second copy of a sequence number stays right behind the first.
 func InSeqOrder(pkts []Packet) []Packet {
 	if len(pkts) == 0 {
 		return nil
@@ -187,9 +188,11 @@ func CheckContinuous(pkts []Packet) error {
 }
 
 // CheckStartsOnSPS checks that the video stream starts on an SPS and that every layer switch (a change of the
-// marker's layer between two frames) starts on one (S4, 02 §9.4).
+// marker's layer between two frames) starts on one (S4, 02 §9.4). Like the other checks of the stream it reads the
+// packets in sequence-number order (InSeqOrder), the order the SFU sent them in: a packet the network delayed or
+// the viewer's NACK repaired arrives after newer ones, and a decoder's jitter buffer puts it back.
 func CheckStartsOnSPS(pkts []Packet) error {
-	frames := Frames(pkts)
+	frames := Frames(InSeqOrder(pkts))
 	if len(frames) == 0 {
 		return errors.New("no frames")
 	}
@@ -208,8 +211,9 @@ func CheckStartsOnSPS(pkts []Packet) error {
 // CheckVideoMarkers checks that every frame of fake video arrived intact: one marker per frame, whose keyframe flag
 // matches an SPS at the frame's start, the RTP marker bit exactly on its last packet, and, within each run of one
 // layer, consecutive frame indices and timestamps that follow the capture times at 90 kHz (±1 tick of rounding).
+// The packets are read in sequence-number order (see CheckStartsOnSPS).
 func CheckVideoMarkers(pkts []Packet) error {
-	frames := Frames(pkts)
+	frames := Frames(InSeqOrder(pkts))
 	if len(frames) == 0 {
 		return errors.New("no frames")
 	}
@@ -235,11 +239,13 @@ func CheckVideoMarkers(pkts []Packet) error {
 }
 
 // CheckAudioMarkers checks that every packet of fake audio carries its marker, with consecutive packet indices and
-// timestamps that follow the capture times at 48 kHz (±1 tick).
+// timestamps that follow the capture times at 48 kHz (±1 tick). The packets are read in sequence-number order (see
+// CheckStartsOnSPS).
 func CheckAudioMarkers(pkts []Packet) error {
 	if len(pkts) == 0 {
 		return errors.New("no packets")
 	}
+	pkts = InSeqOrder(pkts)
 	var prev *Packet
 	for i := range pkts {
 		p := &pkts[i]
