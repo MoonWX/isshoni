@@ -10,9 +10,11 @@
 //   but <a> and <area>, which only navigate when clicked, is a path on this site or a data: URL; so is every url()
 //   and @import of a style attribute or <style> block, and a <meta http-equiv="refresh"> target.
 // - CSS: every url() and @import, comments left out, is a path on this site or a data: URL.
-// - JS: no string names a host that serves fonts, scripts, analytics or search (the list below). The theme carries
-//   one such fallback, a social link's icon from api.iconify.design for an icon given by name whose CSS is missing;
-//   it is accepted only while no page has such an icon (the config gives its icon as inline SVG).
+// - JS, in .js and .mjs files and in every inline <script> of a page (where a `head` entry of the config would put an
+//   analytics or tag-manager loader): no string names a host that serves fonts, scripts, analytics or search (the
+//   list below). The theme carries one such fallback, a social link's icon from api.iconify.design for an icon given
+//   by name whose CSS is missing; it is accepted only while no page has such an icon (the config gives its icon as
+//   inline SVG).
 // - The site's own config, inlined in every page: local search, and no Algolia settings.
 //
 // Exit 0 when the site passes, 1 with every finding listed, 2 on bad usage. A browser's network panel is the final
@@ -151,13 +153,22 @@ async function main() {
     process.exit(2);
   }
 
+  /** @type {Map<string, string>} */
+  const pages = new Map();
   let socialIconsByName = false;
   let config = null;
   for (const file of html) {
     const text = await readFile(file, 'utf8');
-    checkHTML(file, text);
+    pages.set(file, text);
     if (/class="vpi-social-/.test(text)) socialIconsByName = true;
     config ??= siteData(text);
+  }
+  for (const [file, text] of pages) {
+    checkHTML(file, text);
+    // Inline scripts (a <script src> is an attribute that checkHTML checks).
+    for (const m of text.matchAll(/<script\b(?![^>]*\ssrc\s*=)[^>]*>([\s\S]*?)<\/script>/gi)) {
+      checkJS(file, m[1], socialIconsByName);
+    }
   }
   for (const file of files.filter((f) => f.endsWith('.css'))) {
     for (const url of cssURLs(await readFile(file, 'utf8'))) {
@@ -169,7 +180,9 @@ async function main() {
   }
 
   if (!config) {
-    findings.push('no page carries the site config (__VP_SITE_DATA__): this check needs updating for the VitePress in use');
+    findings.push(
+      'no page carries the site config (__VP_SITE_DATA__): this check needs updating for the VitePress in use',
+    );
   } else {
     const theme = config.themeConfig ?? {};
     if (theme.search?.provider !== 'local') {

@@ -679,9 +679,10 @@ jobs:
   site:
     # The project site with the new release's install.sh (06 §9.3, §10.3), deployed from a tag ref: the github-pages
     # environment allows main and tags v* (06 §8.6 step 5). A prerelease is never GitHub's "latest", so the site
-    # keeps serving the latest final release then. The result check is explicit for the reason given at publish:
-    # sign-dry, skipped on a tag, is upstream of this job too. Its jobs have their own timeouts (a job that calls a
-    # workflow takes none).
+    # keeps serving the latest final release then. With Pages still off, this job fails (site.yml's check job) once
+    # the release is out, since the stable install URL serves nothing: turn Pages on, then run Site from main. The
+    # result check is explicit for the reason given at publish: sign-dry, skipped on a tag, is upstream of this job
+    # too. Its jobs have their own timeouts (a job that calls a workflow takes none).
     needs: [publish]
     if: ${{ !cancelled() && needs.publish.result == 'success' }}
     permissions:

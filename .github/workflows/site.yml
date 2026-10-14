@@ -11,18 +11,28 @@
 #   says "not released yet". Then vitepress build, the check that the site loads nothing from other origins
 #   (docs/scripts/check-site.mjs), and the Pages artifact.
 # - deploy publishes the artifact (environment github-pages). It runs only once the owner has turned Pages on
-#   (06 §8.6 step 5: Settings → Pages → Source "GitHub Actions"); until then build says so in a warning, and the run
-#   stays green with the site built and checked but not deployed.
+#   (06 §8.6 step 5: Settings → Pages → Source "GitHub Actions"). Until the first release, a run without Pages stays
+#   green with the site built and checked but not deployed, and build says so in a warning.
 # - check fetches the served /install.sh and compares its SHA-256 with the latest release's install.sh: the asset the
-#   site must serve. Skipped while no release exists. Pages sends Cache-Control: max-age=600, so it asks past caches
-#   and waits up to 10 minutes for the new site.
+#   site must serve. Skipped while no release exists. Once one exists, a run on main or a release tag that did not
+#   deploy (Pages still off, or the deploy failed) fails here: the stable install URL would serve nothing or an old
+#   script. Pages sends Cache-Control: max-age=600, so it asks past caches and waits up to 10 minutes for the new
+#   site. It then asks GitHub again which release is the latest: a release published while this run built (whose own
+#   run may have deployed before this one) fails it, and a new run from main serves the new one. A new run, not a
+#   re-run of failed jobs: check would compare with the old build's outputs again.
 #
 # A release made with GITHUB_TOKEN triggers no other workflow, so release.yml calls this one after it publishes
-# (its site job, 06 §9.3).
+# (its site job, 06 §9.3). Called from a final release's tag, build makes sure that GitHub's latest release is that
+# tag.
 #
 # Rules for every workflow (06 §8.1): a read-only token by default, with jobs raising their own permissions;
 # third-party actions pinned by full commit SHA with a version comment; checkout without persisted credentials;
-# timeout-minutes on every job. Like release.yml, this workflow uses no caches.
+# timeout-minutes on every job. Like release.yml, this workflow uses no caches. GH_TOKEN goes only to the steps that
+# call gh, never to npm or the build, which run third-party code.
+#
+# No top-level concurrency, unlike 06 §8.1's rule: called from release.yml, github.workflow and github.ref are the
+# caller's, so the group would be release.yml's own, a deadlock that GitHub cancels. Deploys are serialized by the
+# deploy job's "pages" group instead.
 
 name: Site
 
@@ -57,8 +67,6 @@ jobs:
       released: ${{ steps.release.outputs.released }}
       version: ${{ steps.release.outputs.version }}
       install-sh-sha256: ${{ steps.release.outputs.install-sh-sha256 }}
-    env:
-      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Check out main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -76,6 +84,8 @@ jobs:
 
       - name: Is GitHub Pages on?
         id: pages
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           # GET /repos/{repo}/pages answers 404 while Pages is off.
           if out=$(gh api "repos/$GITHUB_REPOSITORY/pages" --jq .build_type 2>&1); then
@@ -85,7 +95,7 @@ jobs:
             fi
             enabled=true
           elif grep -q 'HTTP 404' <<< "$out"; then
-            echo "::warning::GitHub Pages is not turned on yet (06 §8.6 step 5: Settings → Pages → Source \"GitHub Actions\"). The site is built and checked, not deployed."
+            echo "::warning::GitHub Pages is not turned on yet (06 §8.6 step 5: Settings → Pages → Source \"GitHub Actions\"). The site is built and checked, not deployed; once a release exists, the check job fails until Pages is on."
             enabled=false
           else
             printf '%s\n' "$out"
@@ -96,6 +106,8 @@ jobs:
 
       - name: The latest release's installer, verified (06 §10.3)
         id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           fail() {
             echo "::error::$*"
@@ -113,6 +125,11 @@ jobs:
           fi
           re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.[1-9][0-9]*)?$'
           [[ $tag =~ $re ]] || fail "the latest release's tag \"$tag\" is not vX.Y.Z"
+          # Called by release.yml for a final release, which publish made the latest: a stale answer would serve the
+          # previous installer, and the check below would compare the site with that same stale value.
+          if [[ $GITHUB_REF =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]] && [ "$tag" != "$GITHUB_REF_NAME" ]; then
+            fail "GitHub's latest release is $tag, not $GITHUB_REF_NAME, the tag this run is for"
+          fi
           version=${tag#v}
           rel=$RUNNER_TEMP/release
           gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$rel" \
@@ -138,6 +155,7 @@ jobs:
           grep -qx "ISSHONI_INSTALLER_VERSION=\"$version\"" "$rel/install.sh" ||
             fail "the install.sh of $tag is not stamped with $version"
           sha=$(sha256sum "$rel/install.sh" | cut -d' ' -f1)
+          keys_sha=$(sha256sum "$keys" | cut -d' ' -f1)
 
           # The fingerprints of every key, as ssh-keygen -l prints them (the README and /security list them).
           fingerprints=()
@@ -161,6 +179,7 @@ jobs:
             echo "released=true"
             echo "version=$version"
             echo "install-sh-sha256=$sha"
+            echo "keys-sha256=$keys_sha"
           } >> "$GITHUB_OUTPUT"
           echo "The site serves the install.sh of $tag, SHA-256 $sha." >> "$GITHUB_STEP_SUMMARY"
 
@@ -171,13 +190,15 @@ jobs:
         run: node docs/scripts/check-site.mjs
 
       - name: The built site carries the verified installer and keys
-        # The build ran third-party code (every npm package) after the verification above.
+        # The build ran third-party code (every npm package) after the verification above, and could have changed
+        # any file of the workspace: the SHA-256s come from the verifying step's outputs, not from files.
         if: steps.release.outputs.released == 'true'
         env:
           SHA: ${{ steps.release.outputs.install-sh-sha256 }}
+          KEYS_SHA: ${{ steps.release.outputs.keys-sha256 }}
         run: |
           echo "$SHA  docs/.vitepress/dist/install.sh" | sha256sum -c
-          cmp deploy/keys/allowed_signers docs/.vitepress/dist/keys/allowed_signers
+          echo "$KEYS_SHA  docs/.vitepress/dist/keys/allowed_signers" | sha256sum -c
 
       - name: Upload the Pages artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
@@ -210,23 +231,39 @@ jobs:
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
 
   check:
-    # The served install.sh is the latest release's (06 §10.5, README S82).
+    # The served install.sh is the latest release's (06 §10.5, README S82). Once a release exists, a run that deploys
+    # (main or a release tag) must have deployed: with deploy skipped (Pages off) or failed the stable install URL
+    # does not serve the release's installer, and this job fails. The result checks are explicit because a job-level
+    # success() would skip this job with deploy. Before the first release nothing is checked, so main stays green
+    # while Pages is off.
     needs: [build, deploy]
-    if: needs.build.outputs.released == 'true'
+    if: >-
+      ${{ !cancelled() && needs.build.result == 'success' && needs.build.outputs.released == 'true' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    permissions: {}
+    permissions:
+      contents: read # the latest release, asked again
     env:
       PAGE_URL: ${{ needs.deploy.outputs.page-url }}
       VERSION: ${{ needs.build.outputs.version }}
       WANT: ${{ needs.build.outputs.install-sh-sha256 }}
     steps:
+      - name: The site was deployed
+        if: needs.deploy.result != 'success'
+        env:
+          DEPLOY: ${{ needs.deploy.result }}
+          PAGES: ${{ needs.build.outputs.pages }}
+        run: |
+          echo "::error::v$VERSION is released but the site was not deployed (deploy: $DEPLOY, Pages on: $PAGES), so the stable install URL does not serve its install.sh. Turn on Pages if it is off (06 §8.6 step 5), then run Site from main (Actions → Site → Run workflow)."
+          exit 1
+
       - name: The served install.sh has the SHA-256 of the release's
         run: |
           url=${PAGE_URL%/}/install.sh
           # A query string of its own per attempt gets past the caches of Pages' CDN (max-age=600).
           for i in $(seq 1 30); do
-            if curl -fsSL --retry 2 -o "$RUNNER_TEMP/install.sh" "$url?check=$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT.$i"; then
+            if curl -fsSL --retry 2 --max-time 30 -o "$RUNNER_TEMP/install.sh" "$url?check=$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT.$i"; then
               got=$(sha256sum "$RUNNER_TEMP/install.sh" | cut -d' ' -f1)
               if [ "$got" = "$WANT" ]; then
                 echo "$url is the install.sh of v$VERSION (SHA-256 $got)" | tee -a "$GITHUB_STEP_SUMMARY"
@@ -240,3 +277,17 @@ jobs:
           done
           echo "::error::$url is not the install.sh of v$VERSION (SHA-256 $WANT) after 10 minutes"
           exit 1
+
+      - name: v${{ needs.build.outputs.version }} is still the latest release
+        # A run that built just before a release was published (a docs push, say) can deploy after the release's own
+        # run, since deploys queue in the pages group, and serve the previous installer; the step above passes then,
+        # as it compares with what this run's build saw.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+          if [ "$latest" != "v$VERSION" ]; then
+            echo "::error::the latest release is now $latest, not v$VERSION: a newer release was published while this run built; run Site from main again (Actions → Site → Run workflow)"
+            exit 1
+          fi
+          echo "v$VERSION is still the latest release" | tee -a "$GITHUB_STEP_SUMMARY"

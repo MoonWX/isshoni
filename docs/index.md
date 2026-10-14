@@ -30,6 +30,8 @@ app, the accounts and a WebRTC SFU, so each share goes up to your server once, h
 on a small VPS; friends open an invite link and watch in their browser, on a computer or a phone. It is open source
 under the Apache License 2.0, with no telemetry.
 
+![A room in isshoni: sora's game window on the stage, mika's chess window next to it, both shared at the same time](/screenshot.webp)
+
 <ReleaseNotice />
 
 ## Install in 2 minutes
