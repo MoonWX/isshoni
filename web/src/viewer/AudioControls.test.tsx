@@ -234,6 +234,35 @@ describe('the stage’s sound controls (05 §10.3, §12.3)', () => {
     expect(within(toolbar()).queryByRole('slider')).not.toBeInTheDocument();
   });
 
+  it('has no sound controls for a share without sound on the stage while nothing is heard (README S72)', async () => {
+    const quiet = shareInfo('s_quiet', 'u_cy', 2, { audio: false });
+    render(<ViewerLayout viewer={viewer} />);
+    act(() => {
+      syncRoom(viewer, room(BEA, quiet), SELF);
+      viewer.registry.set('s_bea', 'video', track('video'));
+      viewer.registry.set('s_bea', 'audio', track('audio'));
+      viewer.registry.set('s_quiet', 'video', track('video'));
+    });
+    await settle();
+    expect(stage()).toHaveAccessibleName("Now watching: Cy's window");
+    expect(state()).toMatchObject({ focusedShareId: 's_quiet', audibleShareId: null });
+    expect(heard()).toEqual([]);
+    // Nothing to mute, nothing to bring here, no volume; the layout's own controls are still there.
+    expect(within(toolbar()).queryByRole('button', { name: /Mute|Unmute|Listen/ })).not.toBeInTheDocument();
+    expect(within(toolbar()).queryByRole('slider')).not.toBeInTheDocument();
+    expect(within(toolbar()).getByRole('button', { name: 'Fullscreen' })).toBeInTheDocument();
+    // The M key does nothing either: nothing is heard.
+    fireEvent.keyDown(document.body, { key: 'm', code: 'KeyM' });
+    expect(state().audio).not.toBe('muted');
+
+    // Bea's speaker button: her sound plays with Cy's window on the stage, and the stage's Mute is for it.
+    fireEvent.click(screen.getByRole('button', { name: 'Listen to Bea' }));
+    await settle();
+    expect(state()).toMatchObject({ focusedShareId: 's_quiet', audibleShareId: 's_bea' });
+    expect(within(toolbar()).getByRole('button', { name: 'Mute' })).toBeInTheDocument();
+    expect(within(toolbar()).queryByRole('button', { name: /^Listen here/ })).not.toBeInTheDocument();
+  });
+
   it('keeps mute on the stage while the preview is enlarged and another share is heard', () => {
     const mine = shareInfo('s_mine', 'u_alex', 3, { connectionId: 'c_me' });
     render(<ViewerLayout viewer={viewer} />);

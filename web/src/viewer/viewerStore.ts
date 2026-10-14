@@ -123,11 +123,15 @@ export interface ViewerActions {
   dispatch(event: FocusEvent<ViewerShare>): void;
   /** The user picked a tile: focus it and hold it (focusMode 'manual') until that share ends. */
   focusShare(shareId: string): void;
-  /** The speaker button (05 §12.3): hear this share without moving the focus; null for silence. */
+  /**
+   * The speaker button (05 §12.3): hear this share without moving the focus; null for silence. A share without sound
+   * or this page's own preview is refused.
+   */
   setAudible(shareId: string | null): void;
   /**
    * A press on a tile's speaker button: hear that share; pressed while it is the one heard, the sound goes back to
-   * the share on the stage (silence when that is a share of this user, which focus never makes audible).
+   * the share on the stage (silence when that is a share of this user, which focus never makes audible, or a share
+   * without sound).
    */
   toggleAudible(shareId: string): void;
   setAudio(audio: AudioUnlockState): void;
@@ -270,6 +274,7 @@ function roomEvents(
       startedAt: info.startedAt,
       own: info.userId === self.userId,
       local: info.connectionId === self.connectionId,
+      audio: info.audio,
       info,
       ownerName,
       watchers,
@@ -333,8 +338,8 @@ export function createViewerStore(opts: ViewerStoreOptions = {}): ViewerStore {
       },
       setAudible(shareId) {
         const s = get();
-        // Only a share with a tile that this page receives can be heard: never the own preview.
-        if (shareId !== null && !s.shares.some((share) => share.id === shareId && !share.local)) return;
+        // Only a share with a tile that this page receives, and that has sound, can be heard: never the own preview.
+        if (shareId !== null && !s.shares.some((share) => share.id === shareId && !share.local && share.audio)) return;
         // The user chose what to hear: a share that comes back later doesn't take the sound from that choice.
         const ended = withoutRememberedSound(s.ended);
         if (s.audibleShareId === shareId && ended === s.ended) return;
@@ -347,7 +352,7 @@ export function createViewerStore(opts: ViewerStoreOptions = {}): ViewerStore {
           return;
         }
         const focused = s.shares.find((share) => share.id === s.focusedShareId);
-        s.setAudible(focused && !focused.own && focused.id !== shareId ? focused.id : null);
+        s.setAudible(focused && !focused.own && focused.audio && focused.id !== shareId ? focused.id : null);
       },
       setAudio(audio) {
         if (get().audio !== audio) set({ audio });

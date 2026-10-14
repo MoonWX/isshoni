@@ -318,14 +318,24 @@ describe('the shortcuts', () => {
     const user = userEvent.setup();
     syncRoom(viewer, room(BEA, CY, DEE), SELF);
     render(layout());
+    // Dee's screen, on the stage, has no sound: nothing is heard (README S72).
+    expect(state()).toMatchObject({ focusedShareId: 's_dee', focusMode: 'auto', audibleShareId: null });
     tile(BEA_TILE).focus();
     await user.keyboard('l');
     expect(state()).toMatchObject({ focusedShareId: 's_dee', focusMode: 'auto', audibleShareId: 's_bea' });
     expect(screen.getByRole('button', { name: 'Listen to Bea' })).toHaveAttribute('aria-pressed', 'true');
-    // Pressed again, like the speaker button: the sound goes back to the stage's share.
+    // Pressed again, like the speaker button: the sound goes back to the stage's share, which has none.
     await user.keyboard('l');
-    expect(state().audibleShareId).toBe('s_dee');
+    expect(state().audibleShareId).toBeNull();
     expect(screen.getByRole('button', { name: 'Listen to Bea' })).toHaveAttribute('aria-pressed', 'false');
+    // On a stage that has sound, it goes back to that one.
+    watch(BEA, CY);
+    expect(state()).toMatchObject({ focusedShareId: 's_cy', audibleShareId: 's_cy' });
+    tile(BEA_TILE).focus();
+    await user.keyboard('l');
+    expect(state().audibleShareId).toBe('s_bea');
+    await user.keyboard('l');
+    expect(state().audibleShareId).toBe('s_cy');
   });
 
   it('L does nothing without a focused tile, and on a tile without sound', async () => {
