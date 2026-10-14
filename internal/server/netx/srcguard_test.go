@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -48,7 +49,7 @@ func frameOf(b []byte) []byte {
 
 // TestSourceGuardCounts: a known ufrag admits 64 distinct sources, a source it has admitted costs nothing again,
 // a UDP and a TCP source on one address and port are two, ufrags count apart, a ufrag the guard doesn't know
-// passes, and forget starts the count over.
+// passes, forget drops a ufrag's count for good, and a new ufrag (an ICE restart's) counts from zero.
 func TestSourceGuardCounts(t *testing.T) {
 	g := newSourceGuard(maxSourcesPerUfrag, nil)
 	ufragA, ufragB := []byte("ufragA"), []byte("ufragB")
@@ -95,20 +96,63 @@ func TestSourceGuardCounts(t *testing.T) {
 	if g.known() != 1 || g.sources("ufragA") != 0 {
 		t.Fatalf("after forget: %d known, %d sources", g.known(), g.sources("ufragA"))
 	}
-	g.open("ufragA")
+	g.open("ufragA") // a gathering that the ICE restart cancelled, late
+	if g.known() != 1 {
+		t.Fatal("a removed ufrag became known again")
+	}
+	if !g.admit(ufragA, testSource(2000, false)) {
+		t.Error("STUN for a removed ufrag must pass like any the guard doesn't know")
+	}
+
+	ufragC := []byte("ufragC") // the restart's new ufrag
+	g.open(string(ufragC))
 	for i := range maxSourcesPerUfrag {
-		if !g.admit(ufragA, testSource(1000+i, false)) {
-			t.Fatalf("after forget, source %d refused", i+1)
+		if !g.admit(ufragC, testSource(i, false)) {
+			t.Fatalf("new ufrag: source %d refused", i+1)
 		}
 	}
-	if g.admit(ufragA, testSource(2000, false)) {
-		t.Error("after forget, the 65th source was admitted")
+	if g.admit(ufragC, testSource(maxSourcesPerUfrag, false)) {
+		t.Error("new ufrag: the 65th source was admitted")
 	}
-	g.forget("ufragA")
+	g.forget("ufragC")
 	g.forget("ufragB")
 	g.forget("ufragB")
 	if g.known() != 0 {
 		t.Errorf("%d ufrags left", g.known())
+	}
+}
+
+// TestSourceGuardRemovedUfrags: a removed ufrag never becomes known again, whether it was known or not (pion removes
+// a ufrag from every mux, and removes one it never gathered for while creating an agent); the guard remembers the
+// last maxRemovedUfrags of them, and a ufrag removed again keeps its one place.
+func TestSourceGuardRemovedUfrags(t *testing.T) {
+	g := newSourceGuard(maxSourcesPerUfrag, nil)
+	name := func(i int) string { return "ufrag" + strconv.Itoa(i) }
+	g.open(name(0))
+	for i := range maxRemovedUfrags {
+		g.forget(name(i))
+		g.forget(name(i)) // the next mux
+	}
+	g.forget(name(0)) // again, much later
+	for i := range maxRemovedUfrags {
+		g.open(name(i))
+	}
+	if g.known() != 0 {
+		t.Fatalf("%d removed ufrags became known again", g.known())
+	}
+	if len(g.removed) != maxRemovedUfrags || len(g.removedRing) != maxRemovedUfrags {
+		t.Fatalf("the guard remembers %d (%d) removed ufrags, want %d", len(g.removed), len(g.removedRing),
+			maxRemovedUfrags)
+	}
+
+	g.forget("one more") // the oldest, ufrag0, makes room
+	g.open(name(0))
+	g.open(name(1))
+	if _, ok := g.ufrags[name(0)]; !ok || g.known() != 1 {
+		t.Errorf("after one more removal: ufrag0 known %v, %d known; want only ufrag0", ok, g.known())
+	}
+	if len(g.removed) != maxRemovedUfrags {
+		t.Errorf("the guard remembers %d removed ufrags, want %d", len(g.removed), maxRemovedUfrags)
 	}
 }
 
@@ -569,8 +613,8 @@ func TestSourceGuardUDPAgent(t *testing.T) {
 }
 
 // TestSourceGuardRemoveConnByUfrag: through the Transport's own muxes (no agent), a ufrag's connection receives the
-// STUN of its first 64 sources only; after RemoveConnByUfrag and a new GetConn the count starts over. Both muxes
-// tell the guard which ufrags they serve.
+// STUN of its first 64 sources only; RemoveConnByUfrag drops the ufrag's count for good (a late GetConn for it doesn't
+// bring it back), and a new ufrag counts from zero. Both muxes tell the guard which ufrags they serve.
 func TestSourceGuardRemoveConnByUfrag(t *testing.T) {
 	tr := newTestTransport(t, TransportOptions{UDPAddr: "127.0.0.1:0", TCPAddr: "127.0.0.1:0", IncludeLoopback: true})
 	local := tr.UDPMux.GetListenAddresses()[0]
@@ -586,14 +630,14 @@ func TestSourceGuardRemoveConnByUfrag(t *testing.T) {
 		t.Fatalf("GetConnByUfrag: the guard knows %d ufrags", tr.guard.known())
 	}
 
-	// receive sends one request from each of srcs and returns the sources the ufrag's connection got them from.
-	receive := func(pc net.PacketConn) map[netip.AddrPort]bool {
+	// receive sends one request for ufrag from each of srcs and returns the sources pc got them from.
+	receive := func(pc net.PacketConn, ufrag string) map[netip.AddrPort]bool {
 		t.Helper()
 		for _, s := range srcs {
-			udpSend(t, s, dst, bindingRequest(t, "udpufrag", "unused"))
+			udpSend(t, s, dst, bindingRequest(t, ufrag, "unused"))
 		}
 		// srcs[0] again as the last: the socket's one reader routes in order, so it arrives after all the others.
-		last := bindingRequest(t, "udpufrag", "unused")
+		last := bindingRequest(t, ufrag, "unused")
 		udpSend(t, srcs[0], dst, last)
 		got := map[netip.AddrPort]bool{}
 		buf := make([]byte, 1500)
@@ -610,14 +654,12 @@ func TestSourceGuardRemoveConnByUfrag(t *testing.T) {
 		}
 	}
 
-	// The connections stay open until the end: closing one makes the mux remove its ufrag later, from a goroutine
-	// of its own, which could hit the next connection of the same ufrag. (Pion never reuses a ufrag.)
 	pc, err := tr.UDPMux.GetConn("udpufrag", local)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = pc.Close() }()
-	got := receive(pc)
+	got := receive(pc, "udpufrag")
 	if len(got) != maxSourcesPerUfrag || got[udpAddrPortOf(srcs[maxSourcesPerUfrag])] {
 		t.Fatalf("the connection got STUN from %d sources (the 65th: %v), want the first %d",
 			len(got), got[udpAddrPortOf(srcs[maxSourcesPerUfrag])], maxSourcesPerUfrag)
@@ -627,25 +669,42 @@ func TestSourceGuardRemoveConnByUfrag(t *testing.T) {
 	if tr.guard.known() != 1 || tr.guard.sources("udpufrag") != 0 {
 		t.Fatalf("after RemoveConnByUfrag: %d known, %d sources", tr.guard.known(), tr.guard.sources("udpufrag"))
 	}
-	// The 65 sources again, in reverse order: the count started over, so the old 65th is admitted now.
+	// A gathering that an ICE restart cancelled may still ask both muxes for the removed ufrag (pion closes those
+	// connections at once): the guard doesn't take it back.
+	stale, err := tr.UDPMux.GetConn("udpufrag", local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = stale.Close()
+	tr.TCPMux.RemoveConnByUfrag("tcpufrag")
+	staleTCP, err := tr.TCPMux.GetConnByUfrag("tcpufrag", false, net.IPv4(127, 0, 0, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = staleTCP.Close()
+	if tr.guard.known() != 0 {
+		t.Fatalf("a late GetConn for a removed ufrag: the guard knows %d ufrags", tr.guard.known())
+	}
+
+	// The restart's new ufrag counts from zero: the 65 sources again, in reverse order, so the old 65th is
+	// admitted now.
 	for i, j := 0, len(srcs)-1; i < j; i, j = i+1, j-1 {
 		srcs[i], srcs[j] = srcs[j], srcs[i]
 	}
-	pc2, err := tr.UDPMux.GetConn("udpufrag", local)
+	pc2, err := tr.UDPMux.GetConn("udpufrag2", local)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = pc2.Close() }()
-	got = receive(pc2)
+	got = receive(pc2, "udpufrag2")
 	if len(got) != maxSourcesPerUfrag || !got[udpAddrPortOf(srcs[0])] {
-		t.Errorf("after RemoveConnByUfrag the connection got STUN from %d sources (the old 65th: %v)",
-			len(got), got[udpAddrPortOf(srcs[0])])
+		t.Errorf("the new ufrag's connection got STUN from %d sources (the old 65th: %v), want %d with it",
+			len(got), got[udpAddrPortOf(srcs[0])], maxSourcesPerUfrag)
 	}
 
-	tr.TCPMux.RemoveConnByUfrag("tcpufrag")
-	tr.UDPMux.RemoveConnByUfrag("udpufrag")
+	tr.UDPMux.RemoveConnByUfrag("udpufrag2")
 	if tr.guard.known() != 0 {
-		t.Errorf("the guard knows %d ufrags after both were removed", tr.guard.known())
+		t.Errorf("the guard knows %d ufrags after all were removed", tr.guard.known())
 	}
 }
 
@@ -831,4 +890,41 @@ func TestSourceGuardNormalClient(t *testing.T) {
 		t.Errorf("the guard refused %d packets of a normal client", n)
 	}
 	eventually(t, "the guard forgets the closed PC's ufrag", func() bool { return tr.guard.known() == 0 })
+}
+
+// TestSourceGuardRestartWhileGathering: an ICE restart right after GatherCandidates cancels a gathering that may
+// still ask the muxes for the old ufrag after pion removed it (pion doesn't wait for the cancelled goroutine). The
+// guard must not take that ufrag back: when every agent has closed, it knows none.
+func TestSourceGuardRestartWhileGathering(t *testing.T) {
+	tr := newTestTransport(t, TransportOptions{
+		UDPAddr: "127.0.0.1:0", TCPAddr: "127.0.0.1:0", IncludeLoopback: true,
+		Interfaces: &fakeIfaces{ifs: []Interface{loIface()}},
+	})
+	for range 50 {
+		a, err := ice.NewAgentWithOptions(
+			ice.WithUDPMux(tr.UDPMux), ice.WithTCPMux(tr.TCPMux),
+			ice.WithNetworkTypes([]ice.NetworkType{ice.NetworkTypeUDP4, ice.NetworkTypeTCP4}),
+			ice.WithCandidateTypes([]ice.CandidateType{ice.CandidateTypeHost}),
+			ice.WithMulticastDNSMode(ice.MulticastDNSModeDisabled),
+			ice.WithIncludeLoopback(), ice.WithIPFilter(tr.IPFilter), ice.WithInterfaceFilter(tr.InterfaceFilter),
+			ice.WithDisableActiveTCP(),
+			ice.WithLoggerFactory(logx.NewPionLoggerFactory(slog.New(slog.DiscardHandler))),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := a.OnCandidate(func(ice.Candidate) {}); err != nil {
+			t.Fatal(err)
+		}
+		if err := a.GatherCandidates(); err != nil {
+			t.Fatal(err)
+		}
+		if err := a.Restart("", ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := a.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	eventually(t, "the guard knows no ufrag of the closed agents", func() bool { return tr.guard.known() == 0 })
 }

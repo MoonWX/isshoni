@@ -28,6 +28,10 @@ import (
 // (04 §7.8, 02 §12): UDP and ICE-TCP, every local socket and both TCP ports counted together.
 const maxSourcesPerUfrag = 64
 
+// maxRemovedUfrags is the number of removed ufrags the guard remembers, so that none of them becomes known again
+// (sourceGuard.forget).
+const maxRemovedUfrags = 1024
+
 // maxFirstFrame is the largest first ICE-TCP frame the guard reads ahead to find the frame's ufrag. Pion reads the
 // first frame into 512 bytes and closes the connection when it is longer, so a first frame this long is never one
 // Pion would take; the guard closes it itself.
@@ -52,20 +56,36 @@ var (
 // A ufrag is known from the moment one of the Transport's muxes hands out a connection for it (GetConn and
 // GetConnByUfrag, while Pion gathers, before any SDP with the ufrag leaves the server) until RemoveConnByUfrag (the
 // PC closes, restarts ICE with a new ufrag, or fails). Its addresses are never released before that, as Pion keeps
-// its peer-reflexive candidates until then; an address counted once costs nothing when it comes again.
+// its peer-reflexive candidates until then; an address counted once costs nothing when it comes again. A removed
+// ufrag never becomes known again: an ICE restart or a close cancels the agent's gathering without waiting for it,
+// so the cancelled gathering may still ask the muxes for the old ufrag after Pion removed it, and Pion then closes
+// that connection itself, through the inner mux, which the guard never hears of. This relies on Pion never reusing
+// a ufrag: it makes a random one for every agent and ICE restart, and the server never sets ICE credentials (with
+// fixed ones Pion would remove the ufrag while creating the agent, and the guard would never count it). The guard
+// remembers the last maxRemovedUfrags removed ufrags, far more than are removed while a cancelled gathering runs.
 //
 // What the guard doesn't count passes: a packet that isn't STUN or has no USERNAME (the UDP mux routes it only by its
 // address map, which holds the addresses the agent has sent to: signaled candidates, which 02 caps, and sources the
-// guard admitted), and STUN for a ufrag the guard doesn't know (no mux has a connection for it: the UDP mux drops it,
-// the TCP mux holds it 30 s at most, within the per-IP ICE-TCP limit).
+// guard admitted), and STUN for a ufrag the guard doesn't know. Either no mux has a connection for it (the UDP mux
+// drops it, the TCP mux holds it 30 s at most, within the per-IP ICE-TCP limit), or the ufrag was removed and only a
+// cancelled gathering's connection has it for a moment: Pion closes that at once, and the agent rejects STUN for a
+// ufrag that is no longer its own.
+//
+// Sources are counted before Pion checks MESSAGE-INTEGRITY (netx doesn't know the password): someone who sees a PC's
+// ufrag on the path and spoofs UDP sources can use up its 64 slots; sources already admitted keep working and an ICE
+// restart (new ufrag) starts over. Counting a source only once Pion answers it wouldn't close this (a spoofer
+// resending holds the slots all the same) and would loosen the bound, so the guard doesn't.
 type sourceGuard struct {
 	max int
 	log *slog.Logger
 
 	refused atomic.Uint64 // STUN packets and ICE-TCP connections dropped at the limit
 
-	mu     sync.Mutex
-	ufrags map[string]*ufragSources
+	mu          sync.Mutex
+	ufrags      map[string]*ufragSources
+	removed     map[string]struct{} // the last maxRemovedUfrags removed ufrags, never known again
+	removedRing []string            // removed's ufrags, oldest at removedNext once it holds maxRemovedUfrags
+	removedNext int
 }
 
 // ufragSources is one known ufrag's admitted addresses.
@@ -84,23 +104,42 @@ func newSourceGuard(maxPerUfrag int, log *slog.Logger) *sourceGuard {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &sourceGuard{max: maxPerUfrag, log: log, ufrags: map[string]*ufragSources{}}
+	return &sourceGuard{
+		max: maxPerUfrag, log: log,
+		ufrags: map[string]*ufragSources{}, removed: map[string]struct{}{},
+	}
 }
 
-// open makes ufrag known with no addresses, unless it is known already.
+// open makes ufrag known with no addresses, unless it is known already or was removed.
 func (g *sourceGuard) open(ufrag string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if _, ok := g.removed[ufrag]; ok {
+		return
+	}
 	if _, ok := g.ufrags[ufrag]; !ok {
 		g.ufrags[ufrag] = &ufragSources{addrs: map[iceSource]struct{}{}}
 	}
 }
 
-// forget drops ufrag and its addresses; a later open starts its count over.
+// forget drops ufrag and its addresses, and remembers it as removed, so that no later open makes it known again
+// (a gathering that an ICE restart or a close cancelled). Pion removes a ufrag from every mux, and may remove one it
+// never gathered for, so ufrag need not be known.
 func (g *sourceGuard) forget(ufrag string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	delete(g.ufrags, ufrag)
+	if _, ok := g.removed[ufrag]; ok {
+		return
+	}
+	if len(g.removedRing) < maxRemovedUfrags {
+		g.removedRing = append(g.removedRing, ufrag)
+	} else {
+		delete(g.removed, g.removedRing[g.removedNext])
+		g.removedRing[g.removedNext] = ufrag
+		g.removedNext = (g.removedNext + 1) % maxRemovedUfrags
+	}
+	g.removed[ufrag] = struct{}{}
 }
 
 // admit reports whether STUN for ufrag from src may reach Pion, and counts src when it is new to ufrag.
@@ -206,7 +245,7 @@ type guardedUDPMux struct {
 
 var _ ice.UDPMux = (*guardedUDPMux)(nil)
 
-// GetConn makes ufrag known to the guard before the mux can route anything to it.
+// GetConn makes ufrag known to the guard before the mux can route anything to it (unless it was removed already).
 func (m *guardedUDPMux) GetConn(ufrag string, addr net.Addr) (net.PacketConn, error) {
 	m.guard.open(ufrag)
 	return m.UDPMuxDefault.GetConn(ufrag, addr)
@@ -227,7 +266,8 @@ type guardedTCPMux struct {
 
 var _ ice.TCPMux = (*guardedTCPMux)(nil)
 
-// GetConnByUfrag makes ufrag known to the guard before the mux can route a connection to it.
+// GetConnByUfrag makes ufrag known to the guard before the mux can route a connection to it (unless it was removed
+// already).
 func (m *guardedTCPMux) GetConnByUfrag(ufrag string, isIPv6 bool, local net.IP) (net.PacketConn, error) {
 	m.guard.open(ufrag)
 	return m.TCPMuxDefault.GetConnByUfrag(ufrag, isIPv6, local)
