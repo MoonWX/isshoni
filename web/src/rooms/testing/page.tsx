@@ -6,6 +6,7 @@ import { act, render, type RenderResult } from '@testing-library/react';
 import { createMemoryRouter, Outlet, RouterProvider, type DataRouter, type RouteObject } from 'react-router';
 import { vi, type MockInstance } from 'vitest';
 
+import { loadRoomPush } from '../../account/RoomPushSlots';
 import { AppProviders } from '../../app/App';
 import type { AppServices } from '../../app/context';
 import type { Platform } from '../../platform/types';
@@ -118,14 +119,15 @@ export async function advance(ms = 0): Promise<void> {
 }
 
 /**
- * Loads the room page's lazy chunks: the media chunk (the stage, the Share button, the sub PC) and the connection
- * test's panel. Call it in beforeAll, with PRELOAD_TIMEOUT_MS: a first load reads and transforms files, which
+ * Loads the room page's lazy chunks: the media chunk (the stage, the Share button, the sub PC), the connection
+ * test's panel and the push prompts (account/RoomPushSlots.tsx). Call it in beforeAll, with PRELOAD_TIMEOUT_MS: a first load reads and transforms files, which
  * takes real time that no fake timer advances, and on a busy machine more than a hook's default timeout. Once
  * loaded, the page's own import() calls resolve at once.
  */
 export async function preloadLazyChunks(): Promise<void> {
   await loadRoomMedia();
   await import('../../conntest/ConnTestPanel');
+  await loadRoomPush();
 }
 
 export const PRELOAD_TIMEOUT_MS = 60_000;

@@ -478,6 +478,52 @@
     "generic": {
       "title": "isshoni",
       "body": "Something new on your server. Tap to open isshoni."
+    },
+    "shareStarted": {
+      "title": "{{user}} started sharing",
+      "body": "in {{room}} · Tap to watch"
+    },
+    "adminAlert": {
+      "signup_pending": {
+        "title": "New sign-up request",
+        "body": "{{target}} asked for an account. Tap to review it."
+      },
+      "admin_granted": {
+        "title": "{{target}} is now an admin",
+        "body": "Made an admin by {{actor}}."
+      },
+      "admin_revoked": {
+        "title": "{{target}} is no longer an admin",
+        "body": "Changed by {{actor}}."
+      },
+      "admin_password_reset": {
+        "title": "Password reset for an admin",
+        "body": "{{actor}} made a reset link for {{target}}."
+      },
+      "registration_mode_changed": {
+        "title": "Sign-up rules changed",
+        "body": "{{actor}} changed who can create an account."
+      },
+      "secrets_rotated": {
+        "title": "Server keys changed",
+        "body": "The server's secret keys changed when it started. Tap to see the audit log."
+      },
+      "transfer_threshold": {
+        "title": "{{target}}% of this month's transfer",
+        "body": "The server has sent {{target}}% of the monthly transfer you set an alert for. Tap for details."
+      },
+      "refresh_token_reused": {
+        "title": "A linked device was signed out",
+        "body": "One of its sign-in tokens was used twice, so isshoni signed it out. Tap to review."
+      }
+    },
+    "actor": {
+      "cli": "the server's command line",
+      "system": "isshoni"
+    },
+    "test": {
+      "title": "Notifications work",
+      "body": "This is the test you asked for. isshoni tells you here when friends start sharing."
     }
   },
   "conntest": {

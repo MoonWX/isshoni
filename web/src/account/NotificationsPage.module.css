@@ -1,0 +1,62 @@
+/* "Checking…" and "Loading…": a small spinner with its line. */
+.checking {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  color: var(--color-text-muted);
+}
+
+/* The switch, and each choice: the control with its label and help beside it. */
+.toggle,
+.check {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--space-3);
+  align-items: start;
+}
+
+.toggle input,
+.check input {
+  width: 1.125rem;
+  height: 1.125rem;
+  /* Lines the control up with the first line of its label. */
+  margin: 0.1875rem 0 0;
+  accent-color: var(--color-accent);
+}
+
+.toggleText {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.toggleText label {
+  font-weight: var(--weight-medium);
+}
+
+.hint {
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+  text-wrap: pretty;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
+.install {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  align-items: flex-start;
+  padding-top: var(--space-3);
+  border-top: var(--border-width) solid var(--color-border);
+}
+
+.prefs {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}

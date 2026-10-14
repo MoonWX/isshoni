@@ -22,16 +22,20 @@
 // <dialog> gives the focus back to the control that opened it only when it is closed while still in the page
 // (05 §16.6).
 //
-// ?focus=<shareId> (05 §12.2) is the viewer's: its layout reads the link and picks the share. Still to come, each
-// with its slice: the in-app browser banner above the page and the notifications card in the empty state
-// (05 §16.3).
+// ?focus=<shareId> (05 §12.2) is the viewer's: its layout reads the link and picks the share.
+//
+// Web Push (05 §16.3, README S77): the in-app browser banner above the page (auth/InAppBrowserBanner.tsx, nothing
+// in a real browser) and account/'s push prompts (RoomPushSlots.tsx: the push state, the iOS Home Screen sheet,
+// notification clicks; the notifications card is the stage's, in the empty state).
 import { DoorClosed, MonitorUp } from 'lucide-react';
 import { Suspense, useCallback, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useParams } from 'react-router';
 
+import { RoomPushPrompts } from '../account/RoomPushSlots';
 import { useApp } from '../app/context';
 import { useMeQuery } from '../app/me';
+import { InAppBrowserBanner } from '../auth/InAppBrowserBanner';
 import { errorMessage } from '../lib/errorText';
 import type { ProtocolError } from '../protocol/errors';
 import { MessageTypeShareStop } from '../protocol/types.gen';
@@ -123,6 +127,10 @@ export function RoomPage() {
 
   return (
     <div className={styles.page}>
+      <div className={styles.inAppBanner}>
+        <InAppBrowserBanner />
+      </div>
+      <RoomPushPrompts />
       <ConnectionBanner onTestConnection={openTest} />
       <RoomHeader
         roomId={roomId ?? ''}

@@ -62,6 +62,71 @@
         "empty": "Nothing is linked yet. Apps you sign in to with this account, like the isshoni desktop app when it arrives, show up here."
       }
     },
+    "notifications": {
+      "title": "Notifications",
+      "device": {
+        "heading": "This device",
+        "lead": "Get a notification when friends start sharing, even while isshoni is closed.",
+        "toggle": "Notifications on this device",
+        "on": "On: this device gets isshoni's notifications.",
+        "off": "Off: this device gets no notifications.",
+        "checking": "Checking what this browser can do…",
+        "test": "Send a test notification",
+        "testSent": "Test sent. It should arrive within a few seconds.",
+        "disabled": "Notifications are off for this device."
+      },
+      "install": {
+        "lead": "Install isshoni to open it like an app, from your home screen or dock.",
+        "action": "Install app"
+      },
+      "prefs": {
+        "heading": "What to tell me about",
+        "lead": "These choices apply to every device where your notifications are on.",
+        "shareStarted": "When someone starts sharing",
+        "shareStartedHint": "Not while you're in that room already: then you see it.",
+        "adminAlerts": "Admin alerts",
+        "adminAlertsHint": "Sign-up requests, new admins, password resets and other changes to the server.",
+        "loading": "Loading your choices…",
+        "loadFailed": "Couldn't load your choices. {{reason}}",
+        "saveFailed": "Couldn't save that. {{reason}}",
+        "retry": "Try again"
+      }
+    },
+    "push": {
+      "enabled": "Notifications are on for this device.",
+      "setupFailed": "This browser couldn't turn on notifications. Check that they aren't turned off in its settings, then try again.",
+      "denied": "Notifications are blocked for isshoni in this browser. To get them, allow notifications for this site in the browser's site settings, then reload the page.",
+      "unsupported": {
+        "browser": "This browser can't show isshoni notifications. Chrome, Edge, Firefox and Safari can.",
+        "ios": "This version of iOS can't show isshoni notifications. Update to iOS 16.4 or later.",
+        "server": "Notifications are turned off on this server."
+      },
+      "card": {
+        "title": "Get a notification when friends start sharing?",
+        "installTitle": "Install isshoni on this phone?",
+        "installBody": "It opens like an app, from your home screen.",
+        "turnOn": "Turn on",
+        "notNow": "Not now",
+        "install": "Install app"
+      },
+      "homeScreen": {
+        "title": "Add isshoni to your Home Screen",
+        "lead": "Add isshoni to your Home Screen to get notifications (iOS 16.4 or later).",
+        "stepsLabel": "How to add it",
+        "step1": "Tap Share in Safari.",
+        "step2": "Choose Add to Home Screen.",
+        "step3": "Open isshoni from your Home Screen.",
+        "login": "You'll log in once more inside the app: Home Screen apps keep their own sign-in.",
+        "chatApp": "Opened this from a chat app? Use its ⋯ menu → Open in Safari first.",
+        "done": "Got it"
+      },
+      "appLaunch": {
+        "title": "Turn on notifications?",
+        "body": "isshoni can tell you when friends start sharing, even while the app is closed.",
+        "turnOn": "Turn on",
+        "notNow": "Not now"
+      }
+    },
     "download": {
       "title": "Desktop app",
       "coming": "The isshoni desktop app is coming (Windows first). It keeps Discord and other voice apps out of what friends hear.",

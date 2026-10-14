@@ -1,0 +1,53 @@
+/*
+ * The notifications card, in the room's empty state on the stage's black (viewer/Stage centres it, with the text
+ * centred). The card has the page's colours and reads left to right. It stays compact: on a phone in portrait the
+ * stage is only 16:9 of the screen's width, and it clips what doesn't fit.
+ */
+.card {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+  width: 100%;
+  max-width: 26rem;
+  padding: var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--color-text);
+  text-align: start;
+  background-color: var(--color-surface);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.icon {
+  flex: none;
+  width: 1.125rem;
+  height: 1.125rem;
+  /* Lines the icon up with the first line of text. */
+  margin-top: 0.125rem;
+  color: var(--color-accent);
+}
+
+.body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+  text-wrap: pretty;
+}
+
+.title {
+  font-weight: var(--weight-medium);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.sheetBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}

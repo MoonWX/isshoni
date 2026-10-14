@@ -38,7 +38,7 @@ export function AccountShell({ title, children }: AccountShellProps) {
           <NavLink to="/account/devices" className={tabClass}>
             {t('account.nav.devices')}
           </NavLink>
-          {/* Web Push on this device (05 §16.3). Until that page is built the router shows its PageUnavailable. */}
+          {/* Web Push on this device and the user's choices (05 §16.3). */}
           <NavLink to="/account/notifications" className={tabClass}>
             {t('account.nav.notifications')}
           </NavLink>
