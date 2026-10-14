@@ -1,0 +1,1323 @@
+# Nightly: the slow and flaky-prone checks that do not gate a pull request (docs/m1/06-deploy-and-ci.md §8.5,
+# "06" below).
+#
+#   distro-vm          the install.sh scenarios in a VM of each of the six distros of 06 §4.13, including the
+#                      VM-only ones of 06 §11.2: V1 (C1-C10 on a real kernel and systemd, and the sysctl values),
+#                      V2 (SELinux on Fedora), V3 (a running ufw or firewalld), V4 (iptables with
+#                      netfilter-persistent, the Oracle Cloud pattern), V5 (ACME with Pebble) and V6 (the exposure
+#                      score of systemd-analyze security). QEMU with KVM; without /dev/kvm the job is skipped with
+#                      a warning, and the scenarios are run by hand before a release (06 §4.13, §9.1).
+#   docker-multiarch   `task docker:smoke` (06 §11.3) on ubuntu-24.04 and on the native arm64 runner
+#   go-cross-os        `go test -race ./...` on macOS and Windows, whose server builds are shipped (experimental)
+#   govulncheck        fails on a reachable vulnerability; npm audit of the web app's shipped packages
+#   goreleaser-full    `goreleaser release --snapshot --clean` with the images and the SBOMs, then the asset
+#                      list of 06 §3: catches drift of the dockers_v2 and nfpm config
+#   site-links         lychee over the built project site, external links included
+#
+# GitHub e-mails the owner when a scheduled run fails. It also disables a scheduled workflow after 60 days without
+# activity in the repository; CONTRIBUTING.md says how to turn it on again.
+#
+# Locally: the jobs run tasks and scripts of the repository, and their steps run as they are elsewhere. distro-vm
+# needs Linux with QEMU and KVM; without KVM, VM_ACCEL=tcg runs the same steps emulated (in a privileged Linux
+# container on an arm64 Mac, say), much slower. docker-multiarch is `task docker:smoke` on the machine's own
+# architecture.
+#
+# Rules for every workflow (06 §8.1): a read-only token, and no job here needs more; third-party actions pinned by
+# full commit SHA with a version comment; checkout without persisted credentials; timeout-minutes on every job. No
+# caches: like a release, the nightly builds from the module proxy and npm alone, and leaves the repository's cache
+# space to ci.yml.
+
+name: Nightly
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One run at a time; a scheduled run is never cancelled by a manual one.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  vm-release:
+    # The two test releases of the install.sh scenarios (06 §11.2), as ci.yml's distro-release job builds them:
+    # `task release:snapshot` without the images as 0.0.1-ci.1 and 0.0.1-ci.2. Unsigned: each distro-vm job signs
+    # them with a key of its own.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Set up Node (version from .tool-versions)
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .tool-versions
+
+      - name: Read Task's pin from .tool-versions
+        id: pins
+        run: |
+          task=$(awk '$1 == "task" { sub(/^v/, "", $2); print $2; exit }' .tool-versions)
+          if [ -z "$task" ]; then
+            echo "::error file=.tool-versions::.tool-versions needs a task pin, a line 'task <version>' (06 §7.1)"
+            exit 1
+          fi
+          echo "task=$task" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Task
+        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: ${{ steps.pins.outputs.task }}
+
+      - name: npm ci
+        run: npm ci --prefix web --no-audit --no-fund
+
+      - name: Install rpm (release:snapshot's asset check lists the rpm packages with it)
+        run: |
+          if ! command -v rpm > /dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends rpm
+          fi
+
+      - name: Build the releases 0.0.1-ci.1 and 0.0.1-ci.2
+        run: sh deploy/test/distro-test.sh -b "$RUNNER_TEMP/distro-releases"
+
+      - name: Upload the releases
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vm-releases
+          path: ${{ runner.temp }}/distro-releases
+          if-no-files-found: error
+          retention-days: 1
+
+  distro-vm:
+    # One VM after the other, each booted fresh from the distro's official cloud image with a cloud-init seed, and
+    # reached over SSH. The scenarios are deploy/test/distro-test.sh's, run in the VM instead of a container (see
+    # the step "The scenarios"), plus the VM-only ones of 06 §11.2. Parts, each in a VM of its own:
+    #   main  C12, C1, then V1's sysctl values, C2, C3, C6, C4, C5, C8, C9, C10, then V6 and, on Fedora, V2
+    #   c7    C7, a port taken by another program          c13  C13, a server that does not start
+    #   v3    V3: the firewall offer with ufw (Ubuntu 24.04) or firewalld (Fedora) running, and SSH still reachable
+    #   v4    V4: iptables with netfilter-persistent and a REJECT rule; the rules survive a reboot (Ubuntu 24.04)
+    #   v5    V5: --domain isshoni.test against Pebble on this runner, ready within 60 s, a certificate from Pebble
+    # C11 (no systemd) has no VM form: it stays in ci.yml's distro job.
+    needs: vm-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: debian-12
+            parts: main c7 c13 v5
+          - distro: debian-13
+            parts: main c7 c13 v5
+          - distro: ubuntu-22.04
+            parts: main c7 c13 v5
+          - distro: ubuntu-24.04
+            parts: main c7 c13 v3 v4 v5
+          - distro: ubuntu-26.04
+            parts: main c7 c13 v5
+          - distro: fedora-44
+            parts: main c7 c13 v3 v5
+    env:
+      DISTRO: ${{ matrix.distro }}
+      PARTS: ${{ matrix.parts }}
+    steps:
+      - name: /dev/kvm
+        id: kvm
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "::warning title=distro-vm skipped on $DISTRO::this runner has no /dev/kvm, so the VM scenarios of 06 §11.2 did not run. Run them by hand before a release (06 §4.13, §9.1)."
+            echo "### distro-vm $DISTRO: skipped, the runner has no /dev/kvm" >> "$GITHUB_STEP_SUMMARY"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The runner's user may use KVM once a udev rule opens the device (GitHub's documented way).
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-isshoni-kvm.rules > /dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          for _ in $(seq 1 20); do
+            if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+              ls -l /dev/kvm
+              echo "ok=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          ls -l /dev/kvm
+          echo "::error::/dev/kvm exists, but the udev rule did not make it usable"
+          exit 1
+
+      - name: Check out
+        if: steps.kvm.outputs.ok == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod; for tools/relserve)
+        if: steps.kvm.outputs.ok == 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Download the releases
+        if: steps.kvm.outputs.ok == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vm-releases
+          path: ${{ runner.temp }}/distro-releases
+
+      - name: Install QEMU and cloud-image-utils
+        if: steps.kvm.outputs.ok == 'true'
+        run: |
+          case $(uname -m) in
+          x86_64) qemu='qemu-system-x86' ;;
+          aarch64) qemu='qemu-system-arm qemu-efi-aarch64' ;;
+          *)
+            echo "::error::no VMs on $(uname -m)"
+            exit 1
+            ;;
+          esac
+          sudo apt-get update -qq
+          # shellcheck disable=SC2086 # one or two package names
+          sudo apt-get install -y -qq --no-install-recommends $qemu qemu-utils cloud-image-utils
+          "qemu-system-$(uname -m)" --version | sed -n 1p
+
+      - name: Download the ${{ matrix.distro }} cloud image
+        if: steps.kvm.outputs.ok == 'true'
+        env:
+          VM_DIR: ${{ runner.temp }}/vm
+        run: |
+          # The distro's own cloud image, checked against the checksum file next to it (HTTPS). Debian's and
+          # Ubuntu's are the current build of the release, Fedora's the release's image.
+          mkdir -p "$VM_DIR"
+          case $(uname -m) in
+          x86_64) deb_arch=amd64 rpm_arch=x86_64 ;;
+          aarch64) deb_arch=arm64 rpm_arch=aarch64 ;;
+          esac
+          case $DISTRO in
+          debian-12 | debian-13)
+            v=${DISTRO#debian-}
+            code=bookworm
+            [ "$v" = 12 ] || code=trixie
+            base=https://cloud.debian.org/images/cloud/$code/latest
+            sums_url=$base/SHA512SUMS algo=sha512
+            image=debian-$v-genericcloud-$deb_arch.qcow2
+            ;;
+          ubuntu-*)
+            v=${DISTRO#ubuntu-}
+            base=https://cloud-images.ubuntu.com/releases/$v/release
+            sums_url=$base/SHA256SUMS algo=sha256
+            image=ubuntu-$v-server-cloudimg-$deb_arch.img
+            ;;
+          fedora-*)
+            v=${DISTRO#fedora-}
+            listing=https://dl.fedoraproject.org/pub/fedora/linux/releases/$v/Cloud/$rpm_arch/images
+            sums=$(curl -fsSL --retry 3 "$listing/" | grep -o "Fedora-Cloud-$v-[0-9.]*-$rpm_arch-CHECKSUM" | sed -n 1p)
+            if [ -z "$sums" ]; then
+              echo "::error::no CHECKSUM file in $listing/"
+              exit 1
+            fi
+            sums_url=$listing/$sums algo=sha256
+            # Any mirror: the checksum from the Fedora project's own server decides.
+            base=https://download.fedoraproject.org/pub/fedora/linux/releases/$v/Cloud/$rpm_arch/images
+            image=''
+            ;;
+          *)
+            echo "::error::no cloud image for $DISTRO"
+            exit 1
+            ;;
+          esac
+          for attempt in 1 2; do
+            curl -fsSL --retry 3 -o "$VM_DIR/SUMS" "$sums_url"
+            if [ -z "$image" ]; then
+              # "SHA256 (Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2) = <hex>"
+              image=$(awk -v v="$v" -v a="$rpm_arch" '
+                $1 == "SHA256" && $2 ~ "^\\(Fedora-Cloud-Base-Generic-" v "-[0-9.]+\\." a "\\.qcow2\\)$" {
+                  gsub(/[()]/, "", $2); print $2; exit
+                }' "$VM_DIR/SUMS")
+            fi
+            want=$(awk -v f="$image" '
+              ($2 == f || $2 == "*" f) && $1 ~ /^[0-9a-f]+$/ { print $1; exit }
+              $1 == "SHA256" && $2 == "(" f ")" { print $4; exit }' "$VM_DIR/SUMS")
+            if [ -z "$image" ] || [ -z "$want" ]; then
+              echo "::error::$sums_url lists no checksum for the image (${image:-not found})"
+              exit 1
+            fi
+            echo "Downloading $base/$image"
+            curl -fsSL --retry 3 -o "$VM_DIR/base.qcow2" "$base/$image"
+            if echo "$want  $VM_DIR/base.qcow2" | "${algo}sum" -c --quiet -; then
+              break
+            fi
+            # A "latest" directory can change between the two downloads; the second attempt reads both again.
+            if [ "$attempt" = 2 ]; then
+              echo "::error::$image does not match its $algo checksum in $sums_url"
+              exit 1
+            fi
+          done
+          qemu-img info "$VM_DIR/base.qcow2" | sed -n '1,3p'
+          echo "Cloud image of $DISTRO: $image ($algo $want)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Start Pebble and pebble-challtestsrv (V5)
+        # As ci.yml's acme job starts them: on the runner's network, with Pebble's validation ports 5002
+        # (http-01) and 5001 (tls-alpn-01) of internal/server/tlsmgr/testdata/pebble-config.json, and
+        # challtestsrv as Pebble's DNS, which resolves every name to 127.0.0.1. The V5 VM's ports 80 and 443 are
+        # forwarded there, so Pebble validates isshoni.test against the server in the VM.
+        if: steps.kvm.outputs.ok == 'true' && contains(matrix.parts, 'v5')
+        env:
+          # Pebble v2.10.1, both images by the digest of their multi-arch index (as in ci.yml's acme job).
+          PEBBLE_IMAGE: ghcr.io/letsencrypt/pebble@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199
+          CHALLTESTSRV_IMAGE: ghcr.io/letsencrypt/pebble-challtestsrv@sha256:12ce21884def456bcf9786542113949e1f19dc7738d2c70e156c2d0c38a1405b
+        run: |
+          docker run -d --name isshoni-nightly-challtestsrv --network host "$CHALLTESTSRV_IMAGE" \
+            -defaultIPv4 127.0.0.1 -defaultIPv6 "" -http01 "" -https01 "" -tlsalpn01 "" -doh ""
+          docker run -d --name isshoni-nightly-pebble --network host \
+            -e PEBBLE_VA_NOSLEEP=1 -e PEBBLE_WFE_NONCEREJECT=0 \
+            -v "$PWD/internal/server/tlsmgr/testdata/pebble-config.json:/test/config/isshoni.json:ro" \
+            "$PEBBLE_IMAGE" -config /test/config/isshoni.json -dnsserver 127.0.0.1:8053
+          # The CA of Pebble's own HTTPS endpoints. Its certificate names "pebble", which the VM resolves to the
+          # runner.
+          docker cp isshoni-nightly-pebble:/test/certs/pebble.minica.pem "$RUNNER_TEMP/pebble.minica.pem"
+          for _ in $(seq 1 60); do
+            if curl -fsS --cacert "$RUNNER_TEMP/pebble.minica.pem" -o /dev/null https://127.0.0.1:14000/dir; then
+              echo "Pebble is up"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "::error::Pebble did not answer on https://127.0.0.1:14000/dir within 30 s"
+          exit 1
+
+      - name: The scenarios in ${{ matrix.distro }} VMs
+        if: steps.kvm.outputs.ok == 'true'
+        shell: sh
+        env:
+          VM_DIR: ${{ runner.temp }}/vm
+          RELEASES: ${{ runner.temp }}/distro-releases
+          PEBBLE_MINICA: ${{ runner.temp }}/pebble.minica.pem
+        run: |
+          # deploy/test/distro-test.sh holds the scenarios, the test releases' signing and relserve; its last line
+          # runs its main, which starts containers. This step sources the rest and runs the same scenarios in VMs:
+          # vm_engine stands in for the container engine (`exec`, over SSH), and the VM-only scenarios of 06 §11.2
+          # are below. POSIX sh, like the library; every function's variables carry a prefix of its own.
+          lib=$VM_DIR/distro-lib.sh
+          # shellcheck disable=SC2016 # the line as it is in the file
+          if [ "$(tail -n 1 deploy/test/distro-test.sh)" != 'main "$@"' ]; then
+            echo '::error file=deploy/test/distro-test.sh::its last line is no longer `main "$@"`, which the distro-vm job of nightly.yml leaves out to source the rest'
+            exit 1
+          fi
+          sed '$d' deploy/test/distro-test.sh >"$lib"
+          # shellcheck source=/dev/null
+          . "$lib"
+          # The library takes these from $0 and the machine; here they are the checkout and the VMs.
+          # shellcheck disable=SC2034 # the library's functions read them
+          ROOT=$PWD ENGINE=vm_engine
+
+          VM_ACCEL=${VM_ACCEL:-kvm}
+          VM_BOOT_TIMEOUT=${VM_BOOT_TIMEOUT:-300}
+          case $(uname -m) in
+          x86_64) VM_QEMU="qemu-system-x86_64 -machine q35,accel=$VM_ACCEL" ;;
+          aarch64) VM_QEMU="qemu-system-aarch64 -machine virt,accel=$VM_ACCEL -bios /usr/share/qemu-efi-aarch64/QEMU_EFI.fd" ;;
+          esac
+          if [ "$VM_ACCEL" = kvm ]; then
+            VM_QEMU="$VM_QEMU -cpu host"
+          elif [ "$(uname -m)" = aarch64 ]; then
+            # A plain Armv8.2 core: TCG emulates "max" with pointer authentication and SVE at a fraction of the speed.
+            VM_QEMU="$VM_QEMU -cpu neoverse-n1"
+          else
+            VM_QEMU="$VM_QEMU -cpu max"
+          fi
+          VM_SSH_PORT=2200 # each VM gets the next port for its SSH
+          VM_ENV=''        # NAME=VALUE words that vm_engine adds to every command (V5's ACME server)
+          # V6: the exposure that 06 §4.5 recorded (1.7, deploy/systemd/README.md) plus 0.2.
+          VM_EXPOSURE_MAX=1.9
+
+          # sh_quote WORD prints WORD in single quotes, for the VM's shell to read back as the same word.
+          sh_quote() {
+            sq_q="'" sq_rest=$1 sq_out=''
+            while :; do
+              case $sq_rest in
+              *"$sq_q"*)
+                sq_out=$sq_out${sq_rest%%"$sq_q"*}$sq_q\\$sq_q$sq_q
+                sq_rest=${sq_rest#*"$sq_q"}
+                ;;
+              *) break ;;
+              esac
+            done
+            printf '%s%s%s%s' "$sq_q" "$sq_out" "$sq_rest" "$sq_q"
+          }
+
+          # vm_ssh VM COMMAND runs a command line in the VM's shell as root, through the VM's SSH master
+          # connection when it has one. stdin goes to the command.
+          vm_ssh() {
+            vh_dir=$VM_DIR/$1
+            shift
+            ssh -F "$VM_DIR/ssh_config" -p "$(cat "$vh_dir/port")" -o "ControlPath=$vh_dir/ssh.ctl" \
+              root@127.0.0.1 "$@"
+          }
+
+          # vm_ssh_new VM COMMAND is vm_ssh over a connection of its own, as a new client sees the VM.
+          vm_ssh_new() {
+            vn_dir=$VM_DIR/$1
+            shift
+            ssh -F "$VM_DIR/ssh_config" -p "$(cat "$vn_dir/port")" -o ControlPath=none root@127.0.0.1 "$@"
+          }
+
+          # vm_master VM start|exit opens the SSH connection that the VM's commands share, or closes it.
+          vm_master() {
+            vm_m_dir=$VM_DIR/$1
+            if [ "$2" = start ]; then
+              ssh -F "$VM_DIR/ssh_config" -p "$(cat "$vm_m_dir/port")" -o "ControlPath=$vm_m_dir/ssh.ctl" \
+                -o ControlMaster=yes -o ControlPersist=yes -f -N root@127.0.0.1 </dev/null >/dev/null 2>&1
+            else
+              ssh -F "$VM_DIR/ssh_config" -o "ControlPath=$vm_m_dir/ssh.ctl" -O exit root@127.0.0.1 \
+                </dev/null >/dev/null 2>&1 || :
+            fi
+          }
+
+          # vm_engine exec [-d] [-i] [-u USER] [-e NAME=VALUE]... VM COMMAND [ARG...] is the library's container
+          # engine: it runs COMMAND in the VM the way `docker exec` runs it in a container. As root, or as USER;
+          # without a terminal; stdin only with -i; in the background with -d.
+          vm_engine() {
+            if [ "${1-}" != exec ]; then
+              printf 'vm_engine: "%s" has no VM form (only exec)\n' "${1-}" >&2
+              return 125
+            fi
+            shift
+            ve_detach=0 ve_stdin=0 ve_user=root ve_env=$VM_ENV
+            while [ $# -gt 0 ]; do
+              case $1 in
+              -d) ve_detach=1 ;;
+              -i) ve_stdin=1 ;;
+              -u)
+                ve_user=$2
+                shift
+                ;;
+              -e)
+                ve_env="$ve_env $(sh_quote "$2")"
+                shift
+                ;;
+              -*)
+                printf 'vm_engine: exec %s has no VM form\n' "$1" >&2
+                return 125
+                ;;
+              *) break ;;
+              esac
+              shift
+            done
+            ve_vm=$1
+            shift
+            ve_cmd=''
+            for ve_arg in "$@"; do
+              ve_cmd="$ve_cmd $(sh_quote "$ve_arg")"
+            done
+            [ -z "$ve_env" ] || ve_cmd=" env$ve_env$ve_cmd"
+            [ "$ve_user" = root ] || ve_cmd=" runuser -u $(sh_quote "$ve_user") --$ve_cmd"
+            if [ "$ve_detach" = 1 ]; then
+              vm_ssh "$ve_vm" "setsid$ve_cmd </dev/null >/dev/null 2>&1 &" </dev/null
+            elif [ "$ve_stdin" = 1 ]; then
+              vm_ssh "$ve_vm" "exec$ve_cmd"
+            else
+              vm_ssh "$ve_vm" "exec$ve_cmd" </dev/null
+            fi
+          }
+
+          # vm_put FILE PATH copies a file of this runner into the VM, mode 0644.
+          vm_put() {
+            vm_ssh "$CONTAINER" "mkdir -p $(sh_quote "${2%/*}") && cat >$(sh_quote "$2") && chmod 0644 $(sh_quote "$2")" <"$1" ||
+              die "could not copy $1 to $2 in the VM"
+          }
+
+          # vm_setup makes what every VM shares: the SSH key and client config, and the cloud-init seed, which lets
+          # root in with that key.
+          vm_setup() {
+            rm -f "$VM_DIR/id_ed25519" "$VM_DIR/id_ed25519.pub"
+            ssh-keygen -q -t ed25519 -N '' -C isshoni-distro-vm -f "$VM_DIR/id_ed25519"
+            cat >"$VM_DIR/ssh_config" <<EOF
+          Host *
+            User root
+            IdentityFile $VM_DIR/id_ed25519
+            IdentitiesOnly yes
+            BatchMode yes
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+            LogLevel ERROR
+            ConnectTimeout 10
+            ServerAliveInterval 15
+            ServerAliveCountMax 4
+            ControlMaster no
+          EOF
+            # No unattended upgrades or package-cache timers while the tests run: they hold the package manager's
+            # lock and restart services.
+            cat >"$VM_DIR/user-data" <<EOF
+          #cloud-config
+          disable_root: false
+          ssh_pwauth: false
+          ssh_authorized_keys:
+            - $(cat "$VM_DIR/id_ed25519.pub")
+          bootcmd:
+            - [sh, -c, 'systemctl stop apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service dnf-makecache.timer 2>/dev/null || true']
+          EOF
+            printf 'instance-id: isshoni-distro-vm\nlocal-hostname: isshoni-vm\n' >"$VM_DIR/meta-data"
+            cloud-localds "$VM_DIR/seed.img" "$VM_DIR/user-data" "$VM_DIR/meta-data"
+          }
+
+          # vm_ready VM waits until the VM answers on SSH, has finished cloud-init and booting, and resolves this
+          # runner's names: relserve's (HOST_NAME) and Pebble's. QEMU's user network reaches the runner at
+          # 10.0.2.2.
+          vm_ready() {
+            vr_dir=$VM_DIR/$1
+            vr_start=$(date +%s)
+            until vm_ssh_new "$1" true </dev/null >/dev/null 2>&1; do
+              vr_pid=$(cat "$vr_dir/qemu.pid" 2>/dev/null) || vr_pid=''
+              if [ -z "$vr_pid" ] || ! kill -0 "$vr_pid" 2>/dev/null; then
+                tail -n 40 "$vr_dir/console.log" >&2 || :
+                die "the VM $1 stopped while it booted (its console is above)"
+              fi
+              if [ $(($(date +%s) - vr_start)) -gt "$VM_BOOT_TIMEOUT" ]; then
+                tail -n 40 "$vr_dir/console.log" >&2 || :
+                die "the VM $1 did not answer on SSH within $VM_BOOT_TIMEOUT s (its console is above)"
+              fi
+              sleep 3
+            done
+            vm_master "$1" start
+            vm_ssh "$1" 'cloud-init status --wait >/dev/null 2>&1; timeout 300 systemctl is-system-running --wait' \
+              </dev/null >"$vr_dir/state" 2>&1 || :
+            say "  the VM $1 is up after $(($(date +%s) - vr_start)) s (systemd: $(cat "$vr_dir/state"))"
+            vm_ssh "$1" "grep -q '^10.0.2.2 $HOST_NAME ' /etc/hosts || echo '10.0.2.2 $HOST_NAME pebble' >>/etc/hosts" \
+              </dev/null
+          }
+
+          # vm_packages PACKAGE... installs packages of the distro in the VM.
+          vm_packages() {
+            if in_container sh -c 'command -v apt-get' >/dev/null 2>&1; then
+              # shellcheck disable=SC2016 # the VM's shell expands it
+              in_container sh -c 'export DEBIAN_FRONTEND=noninteractive
+                apt-get -o DPkg::Lock::Timeout=300 update -qq &&
+                  apt-get -o DPkg::Lock::Timeout=300 install -y -qq --no-install-recommends "$@"' sh "$@" >/dev/null ||
+                die "could not install $* in the VM"
+            else
+              in_container dnf install -y -q "$@" >/dev/null || die "could not install $* in the VM"
+            fi
+          }
+
+          # vm_start VM [HOSTFWD...] boots a new VM from the cloud image, makes it the one the scenarios run in
+          # (CONTAINER), and gets it to where start_container gets a container: the programs the scenarios use,
+          # relserve's CA trusted, the release reachable. HOSTFWD forwards a port of this runner into the VM
+          # (QEMU's tcp:ADDR:PORT-:PORT).
+          vm_start() {
+            vs_name=$1
+            shift
+            vs_dir=$VM_DIR/$vs_name
+            rm -rf "$vs_dir"
+            mkdir -p "$vs_dir"
+            VM_SSH_PORT=$((VM_SSH_PORT + 1))
+            echo "$VM_SSH_PORT" >"$vs_dir/port"
+            vs_fwd=hostfwd=tcp:127.0.0.1:$VM_SSH_PORT-:22
+            for vs_extra in "$@"; do
+              vs_fwd=$vs_fwd,hostfwd=$vs_extra
+            done
+            say '' "==== $DISTRO VM $vs_name ($(uname -m), $VM_ACCEL)"
+            qemu-img create -q -f qcow2 -F qcow2 -b "$VM_DIR/base.qcow2" "$vs_dir/disk.qcow2" 16G
+            # shellcheck disable=SC2086 # VM_QEMU is the program and its machine flags
+            $VM_QEMU -name "isshoni-$vs_name" -smp 2 -m 2048 \
+              -drive "if=virtio,format=qcow2,file=$vs_dir/disk.qcow2" \
+              -drive "if=virtio,format=raw,readonly=on,file=$VM_DIR/seed.img" \
+              -netdev "user,id=net0,$vs_fwd" -device virtio-net-pci,netdev=net0,romfile= \
+              -device virtio-rng-pci -display none -monitor none -serial "file:$vs_dir/console.log" \
+              -pidfile "$vs_dir/qemu.pid" -daemonize
+            CONTAINER=$vs_name
+            vm_ready "$vs_name"
+            # What the container images have (deploy/test/distro/Containerfile) and a cloud image may lack.
+            # shellcheck disable=SC2016 # the VM's shell expands it
+            vs_missing=$(in_container sh -c 'for t in curl python3 ss ps pgrep; do command -v "$t" >/dev/null || echo "$t"; done')
+            if [ -n "$vs_missing" ]; then
+              vs_apt=no
+              if in_container sh -c 'command -v apt-get' >/dev/null 2>&1; then
+                vs_apt=yes
+              fi
+              vs_packages=''
+              for vs_tool in $vs_missing; do
+                case $vs_tool:$vs_apt in
+                ss:yes) vs_packages="$vs_packages iproute2" ;;
+                ss:no) vs_packages="$vs_packages iproute" ;;
+                ps:yes | pgrep:yes) vs_packages="$vs_packages procps" ;;
+                ps:no | pgrep:no) vs_packages="$vs_packages procps-ng" ;;
+                *) vs_packages="$vs_packages $vs_tool" ;;
+                esac
+              done
+              say "  installing what the scenarios use:$vs_packages"
+              # shellcheck disable=SC2086 # package names
+              vm_packages $vs_packages
+            fi
+            if in_container sh -c 'command -v update-ca-certificates' >/dev/null 2>&1; then
+              vm_put "$WORK/ca.pem" /usr/local/share/ca-certificates/relserve.crt
+              in_container update-ca-certificates >/dev/null 2>&1 || die 'update-ca-certificates failed in the VM'
+            else
+              vm_put "$WORK/ca.pem" /etc/pki/ca-trust/source/anchors/relserve.crt
+              in_container update-ca-trust >/dev/null 2>&1 || die 'update-ca-trust failed in the VM'
+            fi
+            in_container curl -fsS -o /dev/null "$BASE_URL/tag/v$V1" ||
+              die "the VM does not reach relserve at $BASE_URL" "$(cat "$WORK/relserve.log")"
+          }
+
+          # vm_reboot reboots the VM the scenarios run in, and waits until it is back.
+          vm_reboot() {
+            vb_boot=$(value cat /proc/sys/kernel/random/boot_id)
+            in_container systemctl reboot >/dev/null 2>&1 || :
+            vm_master "$CONTAINER" exit
+            vb_start=$(date +%s)
+            while :; do
+              vb_now=$(vm_ssh_new "$CONTAINER" cat /proc/sys/kernel/random/boot_id </dev/null 2>/dev/null) || vb_now=''
+              if [ -n "$vb_now" ] && [ "$vb_now" != "$vb_boot" ]; then
+                break
+              fi
+              [ $(($(date +%s) - vb_start)) -le "$VM_BOOT_TIMEOUT" ] || die "the VM $CONTAINER did not come back from its reboot"
+              sleep 3
+            done
+            vm_ready "$CONTAINER"
+          }
+
+          # vm_stop stops the VM the scenarios ran in and deletes its disk; its console log stays.
+          vm_stop() {
+            vm_kill "$CONTAINER"
+            rm -f "$VM_DIR/$CONTAINER/disk.qcow2"
+            CONTAINER=''
+          }
+
+          # vm_kill VM closes the VM's SSH master and stops its QEMU.
+          vm_kill() {
+            vk_pidfile=$VM_DIR/$1/qemu.pid
+            vm_master "$1" exit
+            [ -f "$vk_pidfile" ] || return 0
+            vk_pid=$(cat "$vk_pidfile")
+            kill "$vk_pid" 2>/dev/null || :
+            vk_tries=0
+            while kill -0 "$vk_pid" 2>/dev/null && [ "$vk_tries" -lt 50 ]; do
+              vk_tries=$((vk_tries + 1))
+              sleep 0.2
+            done
+            kill -9 "$vk_pid" 2>/dev/null || :
+            rm -f "$vk_pidfile"
+          }
+
+          vm_cleanup() {
+            for vc_dir in "$VM_DIR"/*/; do
+              [ ! -f "$vc_dir/qemu.pid" ] || vm_kill "$(basename "$vc_dir")"
+            done
+            cleanup
+          }
+
+          # vm_assert_ssh LABEL asserts that a new SSH connection to the VM still gets in (V3, V4).
+          vm_assert_ssh() {
+            if vm_ssh_new "$CONTAINER" true </dev/null >/dev/null 2>&1; then
+              ok "$1: SSH is still reachable (a new connection)"
+            else
+              fail "$1: SSH is still reachable (a new connection)" 'a new SSH connection to the VM failed'
+            fi
+          }
+
+          # In a VM the OpenSSH client is part of the system (the SSH server needs it), so the installer finds
+          # ssh-keygen instead of installing it: C1's two checks of that apply to containers only.
+          assert_eq() {
+            case $1 in
+            'C1 before: the container has no ssh-keygen' | 'C1: openssh-client was installed by the installer')
+              printf '  skip %s (containers only: a VM has the OpenSSH client)\n' "$1"
+              return 0
+              ;;
+            esac
+            if [ "$2" = "$3" ]; then
+              ok "$1"
+            else
+              fail "$1" "want: $2" "got:  $3"
+            fi
+          }
+
+          # V1, what only a real kernel shows: the UDP buffer sizes of 60-isshoni.conf are in effect.
+          scenario_vm_v1() {
+            say '' 'V1: the sysctl values of 60-isshoni.conf are in effect'
+            assert_eq 'V1: /etc/sysctl.d/60-isshoni.conf is installed' yes "$(yes_no test -s /etc/sysctl.d/60-isshoni.conf)"
+            assert_eq 'V1: net.core.rmem_max' 8388608 "$(value sysctl -n net.core.rmem_max)"
+            assert_eq 'V1: net.core.wmem_max' 8388608 "$(value sysctl -n net.core.wmem_max)"
+          }
+
+          # V2 (Fedora): SELinux enforcing, the program labeled bin_t, and no AVC denial that names isshoni since
+          # the VM booted, after the whole main part.
+          scenario_vm_v2() {
+            say '' 'V2: SELinux enforcing'
+            assert_eq 'V2: SELinux is enforcing' Enforcing "$(value getenforce)"
+            assert_eq 'V2: auditd records the denials' active "$(value systemctl is-active auditd)"
+            assert_eq 'V2: ausearch is installed' yes "$(yes_no sh -c 'command -v ausearch')"
+            assert_eq 'V2: the service is active' active "$(value systemctl is-active isshoni)"
+            assert_contains 'V2: ls -Z shows the program as bin_t' ':bin_t:' "$(value ls -Z /usr/local/bin/isshoni)"
+            assert_eq 'V2: ausearch -m avc -ts boot names no isshoni denial' '' \
+              "$(in_container sh -c 'ausearch -m avc -ts boot 2>/dev/null | grep -i isshoni || :')"
+          }
+
+          # V6: the exposure that systemd-analyze security reports is at most the recorded value + 0.2.
+          scenario_vm_v6() {
+            say '' "V6: systemd-analyze security isshoni (at most $VM_EXPOSURE_MAX)"
+            v6n_level=$(value systemd-analyze security --no-pager isshoni |
+              sed -n 's/.*Overall exposure level for isshoni\.service: \([0-9][0-9.]*\).*/\1/p')
+            if [ -z "$v6n_level" ]; then
+              fail 'V6: the exposure level' 'systemd-analyze security printed no exposure level for isshoni.service'
+            elif awk -v l="$v6n_level" -v m="$VM_EXPOSURE_MAX" 'BEGIN { exit !(l <= m) }'; then
+              ok "V6: the exposure level is $v6n_level"
+            else
+              fail 'V6: the exposure level' "want: at most $VM_EXPOSURE_MAX (06 §4.5)" "got:  $v6n_level"
+            fi
+          }
+
+          vm_part_main() {
+            vm_start main
+            case $DISTRO in
+            fedora-*)
+              # V2 reads the denials from auditd's log, so auditd has to run before isshoni does.
+              if [ "$(yes_no sh -c 'command -v ausearch')" = no ]; then
+                vm_packages audit
+              fi
+              in_container systemctl start auditd >/dev/null 2>&1 || :
+              ;;
+            esac
+            # The main part of distro-test.sh, in its order, with the VM's checks between.
+            scenario_c12
+            scenario_c1
+            scenario_vm_v1
+            scenario_c2
+            scenario_c3
+            scenario_c6
+            scenario_c4
+            scenario_c5
+            scenario_c8
+            scenario_c9
+            scenario_c10
+            scenario_vm_v6
+            case $DISTRO in
+            fedora-*) scenario_vm_v2 ;;
+            esac
+            vm_stop
+          }
+
+          # V3: the library's scenario with the firewall running, as an admin has it: ufw lets SSH in before it is
+          # turned on; firewalld's default zone does. Afterwards a new SSH connection must still get in.
+          vm_part_v3() {
+            v3n_fw=$(firewall_of "$DISTRO") || die "V3 runs on fedora-44 and ubuntu-24.04, not on $DISTRO"
+            vm_start v3
+            case $v3n_fw in
+            ufw)
+              if [ "$(yes_no sh -c 'command -v ufw')" = no ]; then
+                vm_packages ufw
+              fi
+              in_container ufw allow 22/tcp >/dev/null || die 'ufw did not take the rule for SSH'
+              ;;
+            firewalld)
+              if [ "$(yes_no sh -c 'command -v firewall-cmd')" = no ]; then
+                vm_packages firewalld
+              fi
+              in_container systemctl enable --now firewalld >/dev/null 2>&1 || die 'firewalld did not start'
+              ;;
+            esac
+            "scenario_v3_$v3n_fw"
+            vm_assert_ssh "V3 $v3n_fw"
+            vm_stop
+          }
+
+          # v4_order prints how many INPUT rules carry the comment isshoni, and how many of them come before the
+          # first REJECT rule: "2 2" when the firewall offer did its job.
+          v4_order() {
+            value iptables -S INPUT | awk '
+              /--comment isshoni/ { n++; if (!rejected) before++ }
+              / -j REJECT/ { rejected = 1 }
+              END { printf "%d %d", n, before }'
+          }
+
+          # V4: Oracle Cloud's Ubuntu images: no ufw, iptables-persistent, and an INPUT chain that rejects
+          # everything it does not allow. The offer inserts isshoni's rules before the REJECT and saves them; they
+          # survive a reboot; --uninstall removes them, and SSH still gets in.
+          vm_part_v4() {
+            vm_start v4
+            say '' 'V4: iptables with netfilter-persistent and a REJECT rule (the Oracle Cloud pattern)'
+            in_container sh -c 'printf "%s\n" \
+              "iptables-persistent iptables-persistent/autosave_v4 boolean false" \
+              "iptables-persistent iptables-persistent/autosave_v6 boolean false" | debconf-set-selections'
+            vm_packages iptables-persistent
+            cat >"$VM_DIR/rules.v4" <<'EOF'
+          *filter
+          :INPUT ACCEPT [0:0]
+          :FORWARD ACCEPT [0:0]
+          :OUTPUT ACCEPT [0:0]
+          -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+          -A INPUT -p icmp -j ACCEPT
+          -A INPUT -i lo -j ACCEPT
+          -A INPUT -p udp --sport 123 -j ACCEPT
+          -A INPUT -p tcp -m state --state NEW -m tcp --dport 22 -j ACCEPT
+          -A INPUT -j REJECT --reject-with icmp-host-prohibited
+          -A FORWARD -j REJECT --reject-with icmp-host-prohibited
+          COMMIT
+          EOF
+            vm_put "$VM_DIR/rules.v4" /etc/iptables/rules.v4
+            in_container netfilter-persistent reload >/dev/null 2>&1 || die 'netfilter-persistent did not load the rules'
+            assert_contains 'V4 before: the INPUT chain rejects' '-A INPUT -j REJECT' "$(value iptables -S INPUT)"
+
+            run_installer "$V1" '' --yes --tls-mode off
+            assert_eq 'V4 install: exit code' 0 "$RC"
+            assert_contains 'V4 install: the offer' \
+              'Firewall: opened ports 80, 443 (TCP) and 7882 (TCP+UDP) in iptables, and saved the rules.' "$OUT"
+            assert_eq 'V4 install: two isshoni rules, both before the REJECT' '2 2' "$(v4_order)"
+            assert_eq 'V4 install: saved in rules.v4' 2 \
+              "$(in_container sh -c 'grep -c -- "--comment isshoni" /etc/iptables/rules.v4 || :')"
+
+            vm_reboot
+            assert_eq 'V4 after a reboot: the rules are back, before the REJECT' '2 2' "$(v4_order)"
+            if wait_ready; then
+              ok 'V4 after a reboot: the server is ready'
+            else
+              fail 'V4 after a reboot: the server is ready' 'it was not ready within 60 s'
+            fi
+
+            run_installer "$V1" '' --uninstall
+            assert_eq 'V4 uninstall: exit code' 0 "$RC"
+            assert_contains 'V4 uninstall: the rules are removed' \
+              "Firewall: removed isshoni's iptables rules, and saved the rules." "$OUT"
+            assert_eq 'V4 uninstall: no isshoni rule is left' '0 0' "$(v4_order)"
+            assert_contains 'V4 uninstall: the REJECT stays' '-A INPUT -j REJECT' "$(value iptables -S INPUT)"
+            assert_eq 'V4 uninstall: rules.v4 has no isshoni rule' 0 \
+              "$(in_container sh -c 'grep -c -- "--comment isshoni" /etc/iptables/rules.v4 || :')"
+            vm_assert_ssh 'V4 uninstall'
+            vm_stop
+          }
+
+          # V5: --domain isshoni.test against Pebble on this runner. challtestsrv resolves the name to 127.0.0.1,
+          # where QEMU forwards Pebble's validation ports to the VM's 80 and 443. The VM finds Pebble's directory at
+          # https://pebble:14000/dir (vm_ready). IP mode (--ip) is not run: ip mode takes only a public address, and
+          # a VM on a runner has none that Pebble could validate, so it stays on the release checklist (06 §11.2).
+          vm_part_v5() {
+            [ -s "$PEBBLE_MINICA" ] || die "V5 needs Pebble: $PEBBLE_MINICA is missing"
+            vm_start v5 tcp:127.0.0.1:5002-:80 tcp:127.0.0.1:5001-:443
+            say '' 'V5: ACME with Pebble: --domain isshoni.test --yes'
+            vm_put "$PEBBLE_MINICA" /usr/local/share/isshoni-test/pebble.minica.pem
+            VM_ENV=" $(sh_quote ISSHONI_TLS_ACME_CA=https://pebble:14000/dir)"
+            VM_ENV="$VM_ENV $(sh_quote ISSHONI_TLS_ACME_CA_ROOT=/usr/local/share/isshoni-test/pebble.minica.pem)"
+            run_installer "$V1" '' --domain isshoni.test --yes
+            VM_ENV=''
+            assert_eq 'V5: exit code' 0 "$RC"
+            assert_eq 'V5: the server is ready' 0 "$(exit_of isshoni healthcheck --ready)"
+            # The installer returns once the server is ready, so the time since the start is an upper bound.
+            v5n_since=$(awk -v s="$(value systemctl show -p ActiveEnterTimestampMonotonic --value isshoni)" \
+              -v u="$(value cut -d' ' -f1 /proc/uptime)" \
+              'BEGIN { if (s !~ /^[0-9]+$/ || s == 0 || u !~ /^[0-9.]+$/) print "unknown"; else printf "%d", u - s / 1000000 }')
+            case $v5n_since in
+            unknown) fail 'V5: ready within 60 s of the start' 'could not read the start time of the service' ;;
+            *)
+              if [ "$v5n_since" -le 60 ]; then
+                ok "V5: ready within 60 s of the start ($v5n_since s)"
+              else
+                fail 'V5: ready within 60 s of the start' "it took up to $v5n_since s"
+              fi
+              ;;
+            esac
+            v5n_cert=$(openssl s_client -connect 127.0.0.1:5001 -servername isshoni.test </dev/null 2>/dev/null |
+              openssl x509 -noout -issuer -ext subjectAltName 2>/dev/null) || v5n_cert='(failed)'
+            assert_contains 'V5: the certificate is issued by Pebble' 'Pebble' "$v5n_cert"
+            assert_contains 'V5: the certificate is for isshoni.test' 'DNS:isshoni.test' "$v5n_cert"
+            # And the chain leads to the root Pebble issues from (its management interface hands it out).
+            curl -fsS --cacert "$PEBBLE_MINICA" -o "$VM_DIR/pebble-root.pem" https://127.0.0.1:15000/roots/0 ||
+              die 'Pebble did not hand out its root'
+            vm_put "$VM_DIR/pebble-root.pem" /usr/local/share/isshoni-test/pebble-root.pem
+            assert_eq 'V5: GET https://isshoni.test/api/v1/info, trusting only the root Pebble issues from' "$V1" "$(json_of \
+              'curl -fsS --cacert /usr/local/share/isshoni-test/pebble-root.pem --resolve isshoni.test:443:127.0.0.1 https://isshoni.test/api/v1/info' \
+              'd["server"]["version"]')"
+            say '  note: IP mode is not run here (no public address to validate); it stays on the release checklist'
+            vm_stop
+          }
+
+          for part in $PARTS; do
+            case $part in
+            main | c7 | c13 | v3 | v4 | v5) ;;
+            *) die "unknown part \"$part\"" 'known: main c7 c13 v3 v4 v5' ;;
+            esac
+          done
+          for tool in qemu-img cloud-localds ssh ssh-keygen openssl go curl awk; do
+            command -v "$tool" >/dev/null 2>&1 || die "\"$tool\" is needed and not installed"
+          done
+          [ -s "$VM_DIR/base.qcow2" ] || die "there is no cloud image at $VM_DIR/base.qcow2"
+
+          # As the library's main prepares a run: the signing key, the signed releases, relserve.
+          WORK=$(mktemp -d)
+          trap vm_cleanup EXIT
+          trap 'exit 1' INT TERM
+          mkdir -p "$WORK/root"
+          ssh-keygen -q -t ed25519 -N '' -C isshoni-distro-test -f "$WORK/key" >/dev/null
+          prepare_releases "$RELEASES"
+          start_relserve
+          vm_setup
+
+          for part in $PARTS; do
+            case $part in
+            main) vm_part_main ;;
+            c7)
+              vm_start c7
+              scenario_c7
+              vm_stop
+              ;;
+            c13)
+              vm_start c13
+              scenario_c13
+              vm_stop
+              ;;
+            v3) vm_part_v3 ;;
+            v4) vm_part_v4 ;;
+            v5) vm_part_v5 ;;
+            esac
+          done
+
+          say '' "distro-vm $DISTRO: $PASSED passed, $FAILED failed"
+          echo "### distro-vm $DISTRO: $PASSED passed, $FAILED failed (parts: $PARTS)" >>"$GITHUB_STEP_SUMMARY"
+          [ "$FAILED" -eq 0 ]
+
+      - name: Show the logs of Pebble and pebble-challtestsrv
+        if: failure() && steps.kvm.outputs.ok == 'true' && contains(matrix.parts, 'v5')
+        run: |
+          docker logs isshoni-nightly-pebble || true
+          docker logs isshoni-nightly-challtestsrv || true
+
+      - name: Upload the VMs' console logs
+        if: failure() && steps.kvm.outputs.ok == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: distro-vm-${{ matrix.distro }}-consoles
+          path: ${{ runner.temp }}/vm/*/console.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  docker-multiarch:
+    # The Docker smoke test of 06 §11.3 (`task docker:smoke`) on both architectures of the image, each on a
+    # native runner: the image is built from the working tree for the runner's own CPU, then every part runs, the
+    # host-network ones included. ci.yml's docker-smoke job runs only linux/amd64.
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Set up Node (version from .tool-versions)
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .tool-versions
+
+      - name: Read Task's pin from .tool-versions
+        id: pins
+        run: |
+          task=$(awk '$1 == "task" { sub(/^v/, "", $2); print $2; exit }' .tool-versions)
+          if [ -z "$task" ]; then
+            echo "::error file=.tool-versions::.tool-versions needs a task pin, a line 'task <version>' (06 §7.1)"
+            exit 1
+          fi
+          echo "task=$task" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Task
+        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: ${{ steps.pins.outputs.task }}
+
+      - name: npm ci
+        run: npm ci --prefix web --no-audit --no-fund
+
+      - name: Show the Docker versions
+        run: |
+          docker version
+          docker compose version
+          docker buildx version
+
+      - name: task docker:smoke (${{ runner.arch }})
+        run: task docker:smoke
+
+  go-cross-os:
+    # The Go tests on the two other systems the server is built for (06 §3: experimental macOS and Windows
+    # archives). The race detector needs cgo, so a C compiler: Xcode's on macOS, MinGW-w64's gcc on Windows.
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2025]
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: gcc for cgo (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          if command -v gcc > /dev/null; then
+            gcc --version | sed -n 1p
+            exit 0
+          fi
+          # The runner images keep MinGW-w64 in one of these places; Chocolatey is the fallback.
+          for dir in /c/mingw64/bin /c/msys64/ucrt64/bin /c/msys64/mingw64/bin; do
+            if [ -x "$dir/gcc.exe" ]; then
+              cygpath -w "$dir" >> "$GITHUB_PATH"
+              "$dir/gcc.exe" --version | sed -n 1p
+              exit 0
+            fi
+          done
+          echo "::notice::no gcc on this runner image; installing MinGW-w64 with Chocolatey"
+          choco install mingw --no-progress -y
+          cygpath -w /c/ProgramData/mingw64/mingw64/bin >> "$GITHUB_PATH"
+
+      - name: go env
+        run: |
+          go version
+          go env GOOS GOARCH CGO_ENABLED CC
+
+      - name: go test -race (internal/server/ops and cmd/isshoni, the backup, restore and re-exec code)
+        run: go test -race -count=1 -timeout 30m ./internal/server/ops/ ./cmd/isshoni/
+
+      - name: go test -race (every other package)
+        run: |
+          pkgs=$(go list ./... | grep -v -x \
+            -e github.com/MoonWX/isshoni/internal/server/ops \
+            -e github.com/MoonWX/isshoni/cmd/isshoni)
+          # shellcheck disable=SC2086 # one word per package
+          go test -race -count=1 -timeout 30m $pkgs
+
+  govulncheck:
+    # Gating here, as in release.yml (ci.yml's job only warns: a new CVE must not block unrelated pull requests).
+    # govulncheck fails on a vulnerability that the code reaches; npm audit on a high or critical one in a package
+    # the web app ships (devDependencies left out).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Set up Node (version from .tool-versions)
+        id: node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .tool-versions
+
+      - name: Read Task's pin from .tool-versions
+        id: pins
+        run: |
+          task=$(awk '$1 == "task" { sub(/^v/, "", $2); print $2; exit }' .tool-versions)
+          if [ -z "$task" ]; then
+            echo "::error file=.tool-versions::.tool-versions needs a task pin, a line 'task <version>' (06 §7.1)"
+            exit 1
+          fi
+          echo "task=$task" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Task
+        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: ${{ steps.pins.outputs.task }}
+
+      - name: The pinned govulncheck (task tools:govulncheck)
+        run: task tools:govulncheck
+
+      - name: govulncheck ./...
+        run: .bin/govulncheck ./...
+
+      - name: npm audit --omit=dev --audit-level=high (web)
+        # Also when govulncheck failed, so that one run reports both.
+        if: ${{ !cancelled() && steps.node.outcome == 'success' }}
+        working-directory: web
+        run: npm audit --omit=dev --audit-level=high
+
+  goreleaser-full:
+    # The whole release build as a snapshot (06 §9.2): the archives, the deb and rpm packages, both images
+    # (built and loaded here, never pushed) and the SBOMs, which ci.yml's goreleaser-check leaves out. Then the
+    # asset list of 06 §3 (task release:assets FULL=true), the SBOMs' contents and both images.
+    #
+    # Not signed (--skip=sign): cosign's keyless signature needs the job's OIDC token, which this job does not
+    # get, because it also runs npm (release.yml keeps the two apart, 06 §9.3), and a nightly snapshot needs no
+    # signature in the public transparency log. The asset check therefore expects everything of a release except
+    # the cosign bundle of checksums.txt. release.yml's dry run covers the signing.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      ISSHONI_SNAPSHOT_VERSION: 0.0.0-nightly.${{ github.run_number }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Set up Node (version from .tool-versions)
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .tool-versions
+
+      - name: Read Task's pin from .tool-versions
+        id: pins
+        run: |
+          task=$(awk '$1 == "task" { sub(/^v/, "", $2); print $2; exit }' .tool-versions)
+          if [ -z "$task" ]; then
+            echo "::error file=.tool-versions::.tool-versions needs a task pin, a line 'task <version>' (06 §7.1)"
+            exit 1
+          fi
+          echo "task=$task" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Task
+        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: ${{ steps.pins.outputs.task }}
+
+      - name: Set up syft (goreleaser's SBOMs; the version release.yml uses)
+        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          syft-version: v1.54.1
+
+      - name: Set up Docker Buildx (dockers_v2 builds both platforms with an SBOM attestation)
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: npm ci
+        run: npm ci --prefix web --no-audit --no-fund
+
+      - name: Install rpm (release:assets lists the rpm packages and their dependencies with it)
+        run: |
+          if ! command -v rpm > /dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends rpm
+          fi
+          rpm --version
+
+      - name: The pinned goreleaser (task release:goreleaser)
+        run: |
+          task release:goreleaser
+          .bin/goreleaser --version
+
+      - name: The web app for ${{ env.ISSHONI_SNAPSHOT_VERSION }}
+        run: task build:web VERSION="$ISSHONI_SNAPSHOT_VERSION"
+
+      - name: goreleaser check
+        run: .bin/goreleaser check
+
+      - name: goreleaser release --snapshot --clean --skip=sign
+        # The before hook runs `task release:prepare` (THIRD_PARTY_NOTICES, the stamped install.sh).
+        run: PATH="$PWD/.bin:$PATH" .bin/goreleaser release --snapshot --clean --skip=sign
+
+      - name: task release:assets FULL=true (the assets of 06 §3, without the cosign bundle)
+        run: |
+          status=0
+          task release:assets VERSION="$ISSHONI_SNAPSHOT_VERSION" FULL=true 2> "$RUNNER_TEMP/assets.err" || status=$?
+          cat "$RUNNER_TEMP/assets.err" >&2
+          # The one difference from a release: this run does not sign (see the job's comment).
+          expected='release:assets: dist/ lacks checksums.txt.sigstore.json'
+          if [ "$status" -ne 0 ]; then
+            others=$(grep '^release:assets: ' "$RUNNER_TEMP/assets.err" | grep -vxF "$expected" || true)
+            if [ -n "$others" ] || ! grep -qxF "$expected" "$RUNNER_TEMP/assets.err"; then
+              echo "::error::dist/ does not have the release assets of 06 §3 (see above)"
+              exit 1
+            fi
+          fi
+          echo "dist/ has the assets of a release, except checksums.txt.sigstore.json, which only a signed run makes"
+
+      - name: The SBOMs describe the archives
+        run: |
+          status=0
+          for archive in dist/*.tar.gz dist/*.zip; do
+            sbom=$archive.sbom.json
+            # SPDX JSON (syft), with the Go modules of the binary in the archive: pion/webrtc is one of them.
+            if jq -e '(.spdxVersion | startswith("SPDX-")) and ([.packages[].name] | any(test("pion/webrtc")))' \
+              "$sbom" > /dev/null; then
+              echo "$sbom: $(jq -r '.spdxVersion' "$sbom"), $(jq '.packages | length' "$sbom") packages"
+            else
+              echo "::error::$sbom is not an SPDX document that lists the binary's Go modules"
+              status=1
+            fi
+          done
+          exit "$status"
+
+      - name: Both images are loaded, and the runner's starts with the version
+        run: |
+          v=$ISSHONI_SNAPSHOT_VERSION
+          for arch in amd64 arm64; do
+            image=ghcr.io/moonwx/isshoni:$v-$arch
+            got=$(docker image inspect -f '{{.Os}}/{{.Architecture}}' "$image") || {
+              echo "::error::goreleaser did not load the image $image"
+              exit 1
+            }
+            if [ "$got" != "linux/$arch" ]; then
+              echo "::error::$image is for $got, not linux/$arch"
+              exit 1
+            fi
+            echo "$image: $got"
+          done
+          native=$(docker version -f '{{.Server.Arch}}')
+          got=$(docker run --rm --name "isshoni-nightly-image-$$" "ghcr.io/moonwx/isshoni:$v-$native" version --short)
+          if [ "$got" != "$v" ]; then
+            echo "::error::the $native image reports version ${got:-(none)}, not $v"
+            exit 1
+          fi
+          echo "the $native image starts and reports version $got"
+
+      - name: Remove the snapshot's images
+        if: always()
+        run: |
+          for arch in amd64 arm64; do
+            docker image rm "ghcr.io/moonwx/isshoni:$ISSHONI_SNAPSHOT_VERSION-$arch" > /dev/null 2>&1 || true
+          done
+
+  site-links:
+    # lychee over the project site as `task site:build` builds it (06 §10), external links included. The site is
+    # laid out under its base path (/isshoni/, 06 §10.1), so that its root-relative links resolve as on GitHub
+    # Pages. Until the site exists (README S82) the job only says so.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Is there a site?
+        id: site
+        run: |
+          if [ -f docs/package.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice title=site-links skipped::docs/package.json does not exist yet (the project site, README S82), so there is no site to check"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Node (version from .tool-versions)
+        if: steps.site.outputs.present == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .tool-versions
+
+      - name: Read Task's pin from .tool-versions
+        if: steps.site.outputs.present == 'true'
+        id: pins
+        run: |
+          task=$(awk '$1 == "task" { sub(/^v/, "", $2); print $2; exit }' .tool-versions)
+          if [ -z "$task" ]; then
+            echo "::error file=.tool-versions::.tool-versions needs a task pin, a line 'task <version>' (06 §7.1)"
+            exit 1
+          fi
+          echo "task=$task" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Task
+        if: steps.site.outputs.present == 'true'
+        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: ${{ steps.pins.outputs.task }}
+
+      - name: npm ci (docs)
+        if: steps.site.outputs.present == 'true'
+        run: npm ci --prefix docs --no-audit --no-fund
+
+      - name: task site:build
+        if: steps.site.outputs.present == 'true'
+        run: task site:build
+
+      - name: Lay out the site as GitHub Pages serves it
+        if: steps.site.outputs.present == 'true'
+        id: layout
+        run: |
+          root=$RUNNER_TEMP/site
+          rm -rf "$root"
+          mkdir -p "$root"
+          cp -R docs/.vitepress/dist "$root/isshoni"
+          # The action runs `eval lychee … ARGS`, so each value is in single quotes here. The input comes first, so
+          # that no option takes it for a value of its own.
+          args="'$root/isshoni/**/*.html' --no-progress --root-dir '$root'"
+          args="$args --fallback-extensions html --index-files index.html"
+          # 429 is a site's rate limit, not a broken link.
+          args="$args --max-retries 3 --retry-wait-time 10 --timeout 30 --max-concurrency 8 --accept '200..=299,429'"
+          exclude() {
+            args="$args --exclude '$1'"
+          }
+          # The docs' examples: loopback and private addresses, documentation names and addresses.
+          args="$args --exclude-all-private"
+          exclude '^https?://([^/]*\.)?example\.(com|net|org)([:/]|$)'
+          exclude '^https?://[^/]*\.test([:/]|$)'
+          exclude '^https?://(192\.0\.2|198\.51\.100|203\.0\.113)\.'
+          exclude '^https?://\[2001:db8:'
+          # site.yml adds what it takes from the latest release, and the release keys (06 §10.3). Here they are
+          # fetched the same way when there is a release; before the first one, links to them can't work yet and
+          # are left out.
+          latest=$(curl -sS -o /dev/null -w '%{redirect_url}' "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/latest" || true)
+          case $latest in
+          */releases/tag/v*)
+            echo "The latest release is ${latest##*/}"
+            for file in install.sh compose.yaml compose.host.yaml checksums.txt checksums.txt.sig checksums.txt.sigstore.json; do
+              curl -fsSL --retry 3 -o "$root/isshoni/$file" \
+                "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/latest/download/$file" || rm -f "$root/isshoni/$file"
+            done
+            ;;
+          *)
+            echo "::notice::there is no release yet, so links to release assets are not checked"
+            exclude '/releases/(latest/)?download/'
+            exclude '/isshoni/(install\.sh|compose(\.host)?\.yaml|checksums\.txt(\.sig|\.sigstore\.json)?)$'
+            ;;
+          esac
+          if [ -f deploy/keys/allowed_signers ]; then
+            mkdir -p "$root/isshoni/keys"
+            cp deploy/keys/allowed_signers "$root/isshoni/keys/allowed_signers"
+          fi
+          echo "lychee $args"
+          echo "args=$args" >> "$GITHUB_OUTPUT"
+
+      - name: lychee
+        if: steps.site.outputs.present == 'true'
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          lycheeVersion: v0.24.2
+          args: ${{ steps.layout.outputs.args }}
+          output: ${{ runner.temp }}/lychee.md
+          fail: true

@@ -66,6 +66,11 @@ note and succeeds.
 Run `task lint test`, plus `task e2e` when you changed the server or the web app. CI runs the same tasks; its only
 required check is `ci-ok`. Open pull requests against `main`.
 
+The slow checks (installer VMs, both Docker architectures, macOS and Windows tests, a full release snapshot, the
+site's links) run every night at 03:17 UTC, or from Actions → Nightly → Run workflow
+(`.github/workflows/nightly.yml`). GitHub disables a scheduled workflow after 60 days without activity in the
+repository; when the nightly has stopped, turn it on again with Actions → Nightly → Enable workflow.
+
 ## Rules
 
 **The protocol.** The Go types in `internal/protocol` and `internal/protocol/api` are the source of truth for
