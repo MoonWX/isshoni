@@ -543,9 +543,11 @@ tasks:
   release:snapshot:
     desc: >-
       Local release dry run - the web app, then goreleaser --snapshot without signing, SBOMs or publishing, then
-      release:assets. `task release:snapshot -- --skip=docker` leaves out the two images (they need Docker)
+      release:assets and the image's version, then removes the two images (KEEP_IMAGES=true keeps them).
+      `task release:snapshot -- --skip=docker` leaves out the images (they need Docker)
     vars:
       SNAPSHOT_VERSION: '{{.ISSHONI_SNAPSHOT_VERSION | default (print "0.0.0-dev." .COMMIT)}}'
+      KEEP_IMAGES: '{{.KEEP_IMAGES | default "false"}}'
     env:
       ISSHONI_SNAPSHOT_VERSION: '{{.SNAPSHOT_VERSION}}'
     cmds:
@@ -559,9 +561,21 @@ tasks:
         if: '[ -f .goreleaser.yaml ]'
       - cmd: .bin/goreleaser{{exeExt}} check
         if: '[ -f .goreleaser.yaml ]'
-      # The before hook runs `task release:prepare`: with .bin/ first in PATH, it finds the pinned Task there too.
       # A snapshot builds each image for one platform, tags it <version>-<arch>, loads it into the local Docker and
-      # pushes nothing.
+      # pushes nothing. Both images go again when the task ends, whether it passed or not: every commit has its own
+      # version and would leave two more behind. KEEP_IMAGES=true keeps them (for docker:smoke, say).
+      - defer: |
+          command -v docker >/dev/null 2>&1 || exit 0
+          for image in ghcr.io/moonwx/isshoni:{{.SNAPSHOT_VERSION}}-amd64 ghcr.io/moonwx/isshoni:{{.SNAPSHOT_VERSION}}-arm64; do
+            docker image inspect "$image" >/dev/null 2>&1 || continue
+            if [ '{{.KEEP_IMAGES}}' = true ]; then
+              echo "release:snapshot: KEEP_IMAGES=true: keeping $image"
+            elif docker image rm "$image" >/dev/null; then
+              echo "release:snapshot: removed the snapshot image $image (KEEP_IMAGES=true keeps it)"
+            fi
+          done
+        silent: true
+      # The before hook runs `task release:prepare`: with .bin/ first in PATH, it finds the pinned Task there too.
       - cmd: PATH="$PWD/.bin:$PATH" .bin/goreleaser{{exeExt}} release --snapshot --clean --skip=sign,sbom {{.CLI_ARGS}}
         if: '[ -f .goreleaser.yaml ]'
       - task: release:assets
@@ -581,7 +595,6 @@ tasks:
             exit 1
           fi
           echo "release:snapshot: the image $image starts and reports version $got"
-          echo "release:snapshot: remove the snapshot images with: docker image rm ghcr.io/moonwx/isshoni:{{.SNAPSHOT_VERSION}}-amd64 ghcr.io/moonwx/isshoni:{{.SNAPSHOT_VERSION}}-arm64"
         silent: true
         if: '[ -f .goreleaser.yaml ] && command -v docker >/dev/null 2>&1'
 
@@ -596,8 +609,9 @@ tasks:
           set -eu
           v='{{.VERSION}}'
           full='{{.FULL}}'
-          # deb and rpm versions put "~" before a prerelease, so that it sorts before the release (nfpm's
-          # ConventionalFileName): 0.1.0-rc.1 is isshoni_0.1.0~rc.1_amd64.deb.
+          # The packages' own version puts "~" before a prerelease, so that it sorts before the release: 0.1.0-rc.1
+          # is the deb and rpm version 0.1.0~rc.1. Their file names have "-" there (.goreleaser.yaml): GitHub
+          # renames an asset with a "~" in its name.
           pv=$(printf '%s' "$v" | sed 's/-/~/')
           tmp=$(mktemp -d)
           trap 'rm -rf "$tmp"' EXIT
@@ -641,8 +655,8 @@ tasks:
           for target in windows_amd64 windows_arm64; do
             echo "isshoni_${v}_$target.zip" >>"$tmp/archives"
           done
-          printf '%s\n' "isshoni_${pv}_amd64.deb" "isshoni_${pv}_arm64.deb" \
-            "isshoni-$pv-1.x86_64.rpm" "isshoni-$pv-1.aarch64.rpm" >"$tmp/packages"
+          printf '%s\n' "isshoni_${v}_amd64.deb" "isshoni_${v}_arm64.deb" \
+            "isshoni-$v-1.x86_64.rpm" "isshoni-$v-1.aarch64.rpm" >"$tmp/packages"
           sed 's/$/.sbom.json/' "$tmp/archives" >"$tmp/sboms"
           # checksums.txt: every archive, package, install.sh and compose file, and in a full release the SBOMs.
           cat "$tmp/archives" "$tmp/packages" >"$tmp/summed"
@@ -692,15 +706,33 @@ tasks:
             done <dist/checksums.txt
           fi
 
-          # The archives: the binary, the license files and the files install.sh installs (06 §3), at the root.
-          # README.md is shipped as soon as the repository has one (.goreleaser.yaml).
+          # Every name is one that GitHub keeps as it is. It renames a release asset whose name has any other
+          # character ("~" becomes ".") or starts or ends with ".", and the draft would then no longer match
+          # checksums.txt: release.yml's sign job would fail on it, after the owner's approval.
+          cat "$tmp/dist.want" "$tmp/dist.got" "$tmp/summed" >"$tmp/names"
+          [ ! -f "$tmp/summed.got" ] || cat "$tmp/summed.got" >>"$tmp/names"
+          LC_ALL=C grep -Evx '[A-Za-z0-9_-]([A-Za-z0-9._-]*[A-Za-z0-9_-])?' "$tmp/names" >"$tmp/names.bad" || :
+          LC_ALL=C sort -u "$tmp/names.bad" | while IFS= read -r name; do
+            printf 'release:assets: %s is not a name GitHub keeps for a release asset: use only A-Z a-z 0-9 . _ -\n' \
+              "$name" >&2
+          done
+          [ ! -s "$tmp/names.bad" ] || status=1
+
+          # The archives: the binary, the license files, README.md and the files install.sh installs (06 §3), at
+          # the root. A snapshot builds without README.md while the repository has none (.goreleaser.yaml); a
+          # release (FULL=true) never does.
           printf '%s\n' LICENSE NOTICE THIRD_PARTY_NOTICES deploy/systemd/isshoni.service \
             deploy/sysctl/60-isshoni.conf deploy/firewall/ufw-isshoni deploy/firewall/firewalld-isshoni.xml \
             >"$tmp/content"
-          if [ -f README.md ]; then
+          if [ -f README.md ] || [ "$full" = true ]; then
             echo README.md >>"$tmp/content"
-          else
-            echo 'release:assets: note: the repository has no README.md yet, so the archives have none (06 §3 lists it)'
+          fi
+          if [ ! -f README.md ]; then
+            if [ "$full" = true ]; then
+              problem 'the repository has no README.md, and every archive of a release has one (06 §3)'
+            else
+              echo 'release:assets: note: the repository has no README.md yet, so the archives have none (06 §3 lists it; a release fails without it)'
+            fi
           fi
           while read -r archive; do
             [ -f "dist/$archive" ] || continue
@@ -739,7 +771,7 @@ tasks:
           # (Each listing goes to a file first: Task's shell has pipefail on, and grep -q ending a pipe early
           # would fail the command that writes into it.)
           for arch in amd64 arm64; do
-            deb=dist/isshoni_${pv}_$arch.deb
+            deb=dist/isshoni_${v}_$arch.deb
             [ -f "$deb" ] || continue
             ar p "$deb" data.tar.gz | tar -tzf - | sed 's|^\./||' >"$tmp/deb.list"
             # data.tar.gz lists the parent directories as well; of those only /etc/isshoni is the package's own.
@@ -765,7 +797,7 @@ tasks:
             esac
           fi
           for arch in x86_64 aarch64; do
-            rpm=dist/isshoni-$pv-1.$arch.rpm
+            rpm=dist/isshoni-$v-1.$arch.rpm
             [ -f "$rpm" ] || continue
             if ! rpm_list "$rpm" >"$tmp/rpm.list"; then
               problem "can't list ${rpm#dist/}: install rpm (or bsdtar, from libarchive)"
@@ -776,10 +808,12 @@ tasks:
             if command -v rpm >/dev/null 2>&1; then
               rpm -qpR "$rpm" >"$tmp/rpm.requires" 2>/dev/null || :
               grep -qx shadow-utils "$tmp/rpm.requires" || problem "${rpm#dist/} does not require shadow-utils"
+              got=$(rpm -qp --queryformat '%{VERSION} %{ARCH}' "$rpm" 2>/dev/null) || got=''
+              [ "$got" = "$pv $arch" ] || problem "${rpm#dist/}: version and architecture are \"$got\", not \"$pv $arch\""
             fi
           done
           if ! command -v rpm >/dev/null 2>&1; then
-            echo "release:assets: note: rpm is not installed here, so the rpm packages' Requires were not checked"
+            echo "release:assets: note: rpm is not installed here, so the rpm packages' Requires and version were not checked"
           fi
 
           if [ "$status" = 0 ]; then
@@ -805,6 +839,11 @@ tasks:
           if grep -q 'PRIVATE KEY' "$keys"; then
             die "$keys holds a PRIVATE key. Do not commit it: delete the file, and use the .pub files' contents"
           fi
+          # What lint:keys rejects is checked before install.sh is written, so that a failed run leaves it as it was.
+          if grep -q "'" "$keys"; then
+            die "$keys contains a single quote (comments count too), which install.sh's key block cannot hold"
+          fi
+          [ -z "$(tail -c 1 "$keys")" ] || die "$keys must end with a newline"
           tmp=$(mktemp -d)
           trap 'rm -rf "$tmp"' EXIT
           # Each line: the principal install.sh asks for, the namespace it verifies, an ed25519 key (06 §4.3, §9.4).

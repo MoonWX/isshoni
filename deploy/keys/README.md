@@ -29,6 +29,10 @@ lives in exactly two places: the `release` environment's secret, and the owner's
 Done once, in this order, before `v0.1.0-rc.1`. Nobody but the owner does these steps, and no agent creates keys or
 changes GitHub settings.
 
+The repository needs a `README.md` at its root first, with a "Release signing keys" section for the fingerprints of
+step 2: every release archive carries it (06 §3), and release.yml (its dry run too) refuses to build without it.
+Until it lands, only the snapshots of CI's `goreleaser-check` job and of `task release:snapshot` build without it.
+
 1. **Generate the two keys** on the Mac, outside the repository (06 §9.4):
    ```sh
    ssh-keygen -t ed25519 -N '' -C isshoni-release-1 -f isshoni-release-1
@@ -47,8 +51,9 @@ changes GitHub settings.
    git commit -m "Release signing keys"
    ```
    The change is data only: the key file and the block in `install.sh`. Keep the two fingerprints that
-   `task release:keys` prints (`ssh-keygen -lf <key>.pub` prints the same): they go into `README.md` and onto the
-   site's `/security` page (06 §10.3), and you compare them in step 4. Merge once `ci-ok` is green.
+   `task release:keys` prints (`ssh-keygen -lf <key>.pub` prints the same): they go into the "Release signing keys"
+   section of the root `README.md` (06 §9.4) and onto the site's `/security` page (06 §10.3), and you compare them
+   in step 5. Merge once `ci-ok` is green.
 3. **Create the environment `release`** (Settings → Environments → New environment; 06 §8.6 step 4):
    - required reviewers: you, with "Prevent self-review" **off** (you approve your own releases);
    - deployment branches and tags: "Selected branches and tags", with one rule for **tags** `v*` (no branches);

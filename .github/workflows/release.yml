@@ -13,7 +13,9 @@
 #   the attestations.
 # - publish publishes the draft. Only a final release becomes GitHub's "latest" and moves the floating image tags
 #   (:0.<minor> and :latest in 0.x); a prerelease (-rc.N) moves neither.
-# The site job (`uses: ./.github/workflows/site.yml`, after publish) comes with the project site, README S82.
+# The site job (`uses: ./.github/workflows/site.yml`, after publish) comes with the project site, README S82. It
+# needs `if: ${{ !cancelled() && needs.publish.result == 'success' }}`, not a plain condition: sign-dry is skipped
+# on a tag, and a job-level success() counts every job upstream (see publish).
 #
 # Dry run (Actions → Release → Run workflow, dry_run on): the same jobs as 0.0.0-dryrun.<run>, with goreleaser's
 # snapshot (built and signed with cosign, never published), a sign-dry job that signs with a key made in the job, and
@@ -241,6 +243,15 @@ jobs:
           fi
           task lint:keys
 
+      - name: The repository has the README.md that every archive carries
+        # 06 §3; release:assets FULL=true checks the archives for it after goreleaser. This fails before a draft
+        # or an image exists. .goreleaser.yaml takes it by a pattern, which would let it go missing quietly.
+        run: |
+          if [ ! -f README.md ]; then
+            echo "::error::there is no README.md, and every release archive has one (06 §3; deploy/keys/README.md)"
+            exit 1
+          fi
+
       - name: The protocol compat snapshot is committed (final releases)
         # 01 §14.3 and 06 §9.1: the release-prep PR runs task release:compat. A prerelease and a dry run skip it.
         if: env.DRY_RUN == 'false' && env.PRERELEASE == 'false'
@@ -355,10 +366,11 @@ jobs:
       - name: Every asset matches checksums.txt
         run: |
           (cd rel && sha256sum -c checksums.txt)
-          # And nothing is in the draft that the signature would not cover.
+          # And nothing is in the draft that the signature would not cover. checksums.txt.sig is there when this
+          # job runs again after it uploaded one; the next step replaces it.
           for f in rel/*; do
             name=${f#rel/}
-            case $name in checksums.txt | checksums.txt.sigstore.json) continue ;; esac
+            case $name in checksums.txt | checksums.txt.sig | checksums.txt.sigstore.json) continue ;; esac
             if ! awk -v f="$name" '$2 == f { found = 1 } END { exit !found }' rel/checksums.txt; then
               echo "::error::the draft has $name, which checksums.txt does not list"
               exit 1
@@ -373,6 +385,9 @@ jobs:
             echo "::error::the release environment has no secret RELEASE_SSH_SIGNING_KEY (deploy/keys/README.md)"
             exit 1
           fi
+          # A signature from an earlier run of this job goes first: without a terminal, ssh-keygen -Y sign keeps an
+          # existing checksums.txt.sig ("Overwrite (y/n)?" reads no answer) and still exits 0.
+          rm -f rel/checksums.txt.sig
           key=$RUNNER_TEMP/k
           trap 'rm -f "$key"' EXIT
           umask 077
@@ -598,7 +613,10 @@ jobs:
 
   publish:
     # 06 §9.3: refuses notes with a TODO; only a final release becomes "latest" and moves the floating image tags.
-    if: needs.version.outputs.dry-run == 'false'
+    # The result check is explicit: a job-level `if` without a status function means success(), and success() looks
+    # at every job upstream, not only at `needs`. On a tag sign-dry is skipped, so a plain condition would skip
+    # publish after a green verify, and the run would end green with the release still a draft (actions/runner#491).
+    if: ${{ !cancelled() && needs.verify.result == 'success' && needs.version.outputs.dry-run == 'false' }}
     needs: [version, verify]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
