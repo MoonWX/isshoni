@@ -8,7 +8,7 @@ import { useStore } from 'zustand';
 import { createStore } from 'zustand/vanilla';
 
 import type { PwaProvider } from '../platform/types';
-import type { CreateInviteResponse } from '../protocol/api.gen';
+import type { CreateInviteResponse, Info } from '../protocol/api.gen';
 import { queryKeys } from '../protocol/queryKeys';
 import { apiPath, infoFixture, meFixture, roomsFixture, server } from '../test/msw';
 import { createTestPlatform } from '../test/platform';
@@ -277,6 +277,55 @@ describe('the account menu', () => {
     expect(screen.queryByRole('button', { name: 'Invite friends' })).not.toBeInTheDocument();
     // They still see and revoke their invites there.
     expect(links()).toMatchObject({ 'My invites': '/admin/invites' });
+  });
+
+  // A member gets no admin.settings invalidation (01 §8.12), and the room page stays open for hours: the menu reads
+  // /info again when it opens, once the one it has is older than staleTime.
+  it("reads the registration mode again when a member's menu opens, once it is 30 s old", async () => {
+    let registration: Info['registration'] = 'invite';
+    let reads = 0;
+    server.use(
+      http.get(apiPath('/api/v1/info'), () => {
+        reads += 1;
+        return HttpResponse.json(infoFixture({ registration }));
+      }),
+    );
+    const later = (ms: number): void => {
+      vi.setSystemTime(Date.now() + ms);
+    };
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      renderHeader({ me: meFixture({ createInvites: true }) });
+      await openMenu();
+      expect(screen.getByRole('button', { name: 'Invite friends' })).toBeInTheDocument();
+      await userEvent.keyboard('{Escape}');
+
+      // An admin closes registration. Within staleTime the menu keeps what boot read.
+      registration = 'closed';
+      later(29_000);
+      await openMenu();
+      expect(screen.getByRole('button', { name: 'Invite friends' })).toBeInTheDocument();
+      await userEvent.keyboard('{Escape}');
+      expect(reads).toBe(0);
+
+      later(2_000);
+      await openMenu();
+      await waitFor(() => {
+        expect(screen.queryByRole('button', { name: 'Invite friends' })).not.toBeInTheDocument();
+      });
+      expect(reads).toBe(1);
+      expect(links()).toMatchObject({ 'My invites': '/admin/invites' });
+      await userEvent.keyboard('{Escape}');
+
+      // And opens it again: the entry comes back without a reload.
+      registration = 'invite';
+      later(31_000);
+      await openMenu();
+      expect(await screen.findByRole('button', { name: 'Invite friends' })).toBeInTheDocument();
+      expect(reads).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('"Invite friends" closes the menu and opens the invite card with a new invite; closing it returns the focus to the menu’s button', async () => {

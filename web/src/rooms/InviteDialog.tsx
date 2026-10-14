@@ -7,6 +7,9 @@
 // - The link lives in this dialog's state for one opening (05 §20): never in the REST cache, never in storage.
 //   Closing the dialog drops it: the server keeps only the token's hash, so the next opening makes a new invite.
 //   An invite already created stays on the server; the user sees and revokes theirs under /admin/invites.
+// - A failure says why there is no link. "Try again" follows it, except after a refusal no retry ends (403
+//   registration_closed or forbidden): that one marks ['info'] or ['me'] stale instead, so the menu, which read an
+//   older state, stops offering the entry.
 // - The card's texts are in the lazy `setup` namespace, which rooms/index.ts imports for this dialog (05 §16.5).
 //
 // The menu keeps this dialog mounted and closes it with `open`, so that the browser gives the focus back to the
@@ -18,11 +21,16 @@ import { useTranslation } from 'react-i18next';
 import { useApp } from '../app/context';
 import { Notice } from '../auth/Notice';
 import { errorMessage } from '../lib/errorText';
-import type { CreateInviteRequest, CreateInviteResponse } from '../protocol/api.gen';
+import {
+  CodeForbidden,
+  CodeRegistrationClosed,
+  type CreateInviteRequest,
+  type CreateInviteResponse,
+} from '../protocol/api.gen';
 import { applyInvalidate } from '../protocol/invalidate';
 import { queryKeys } from '../protocol/queryKeys';
-import { api } from '../protocol/rest';
-import { TopicAdminInvites } from '../protocol/types.gen';
+import { ApiError, api } from '../protocol/rest';
+import { TopicAdminInvites, TopicMe } from '../protocol/types.gen';
 import { InviteLinkCard } from '../setup/InviteLinkCard';
 import { Button } from '../ui/Button';
 import { Dialog } from '../ui/Dialog';
@@ -52,6 +60,14 @@ export function InviteDialog({ open, onClose }: InviteDialogProps) {
   );
 }
 
+/**
+ * The server refuses this user any invite (03 §7.9): the permission went, or the mode is closed. Trying again can't
+ * change that, unlike a network error or a full allowance (limit_reached: revoking an invite makes room).
+ */
+function isRefused(err: unknown): boolean {
+  return err instanceof ApiError && (err.code === CodeForbidden || err.code === CodeRegistrationClosed);
+}
+
 /** One opening of the dialog: creates the invite when it mounts, and shows its link, or why there is none. */
 function NewInvite() {
   const { t } = useTranslation();
@@ -69,6 +85,14 @@ function NewInvite() {
       // Every field left out: the server's invite defaults (03 §12.4.5).
       const body: CreateInviteRequest = {};
       return api<CreateInviteResponse>('POST', '/api/v1/invites', body);
+    },
+    // A refusal says the state that offered the entry was out of date: the mode was closed meanwhile (a member gets
+    // no `admin.settings` invalidation, 01 §8.12), or the permission went. The menu reads the fresh one when it
+    // opens next.
+    onError: (err) => {
+      if (!(err instanceof ApiError)) return;
+      if (err.code === CodeRegistrationClosed) void queryClient.invalidateQueries({ queryKey: queryKeys.info });
+      else if (err.code === CodeForbidden) void applyInvalidate(queryClient, { topics: [TopicMe] });
     },
     onSuccess: (res) => {
       setCreated(res);
@@ -106,15 +130,18 @@ function NewInvite() {
         </div>
       ) : create.isError ? (
         <Notice
+          // Another try makes no invite while the server refuses this user one: Done is the way on.
           action={
-            <Button
-              size="sm"
-              onClick={() => {
-                createInvite();
-              }}
-            >
-              {t('room.invite.retry')}
-            </Button>
+            isRefused(create.error) ? undefined : (
+              <Button
+                size="sm"
+                onClick={() => {
+                  createInvite();
+                }}
+              >
+                {t('room.invite.retry')}
+              </Button>
+            )
           }
         >
           {t('room.invite.failed', { message: errorMessage(create.error, t) })}

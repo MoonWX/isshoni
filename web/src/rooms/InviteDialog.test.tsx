@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AppProviders } from '../app/App';
 import type { CreateInviteResponse } from '../protocol/api.gen';
 import { queryKeys } from '../protocol/queryKeys';
-import { apiError, apiPath, server } from '../test/msw';
+import { apiError, apiPath, meFixture, server } from '../test/msw';
 import { createTestServices, renderRoute } from '../test/render';
 import { InviteDialog } from './InviteDialog';
 import { stubNativeDialog } from './testing/page';
@@ -159,29 +159,68 @@ describe('InviteDialog', () => {
     expect([input.selectionStart, input.selectionEnd]).toEqual([0, linkOf(1).length]);
   });
 
-  it.each([
-    [
-      'the member has as many invites as allowed',
-      apiError(409, { code: 'limit_reached', params: { limit: 'member_invites' } }),
-      "Couldn't make an invite link. You have as many active invites as you're allowed. Revoke some first.",
-    ],
-    [
-      'registration was closed meanwhile',
-      apiError(403, { code: 'registration_closed' }),
-      "Couldn't make an invite link. This server isn't taking new accounts.",
-    ],
-  ])('says why there is no link when %s, and "Try again" makes one', async (_name, failure, text) => {
-    const created = invites(failure, null);
+  it('says why there is no link when the member has as many invites as allowed, and "Try again" makes one', async () => {
+    const created = invites(apiError(409, { code: 'limit_reached', params: { limit: 'member_invites' } }), null);
     renderOpener();
     await open();
-    expect(await within(dialog()).findByRole('alert')).toHaveTextContent(text);
+    expect(await within(dialog()).findByRole('alert')).toHaveTextContent(
+      "Couldn't make an invite link. You have as many active invites as you're allowed. Revoke some first.",
+    );
     expect(within(dialog()).queryByRole('textbox')).not.toBeInTheDocument();
 
+    // Revoking one under My invites makes room: another try can work.
     await userEvent.click(within(dialog()).getByRole('button', { name: 'Try again' }));
     expect(await within(dialog()).findByRole('textbox', { name: 'Invite link' })).toHaveValue(linkOf(2));
     expect(within(dialog()).queryByRole('alert')).not.toBeInTheDocument();
     expect(created).toEqual([{}, {}]);
   });
+
+  it('says why there is no link when the server fails, and "Try again" makes one', async () => {
+    const created = invites(apiError(500, { code: 'internal' }), null);
+    renderOpener();
+    await open();
+    expect(await within(dialog()).findByRole('alert')).toHaveTextContent(/^Couldn't make an invite link\./);
+    await userEvent.click(within(dialog()).getByRole('button', { name: 'Try again' }));
+    expect(await within(dialog()).findByRole('textbox', { name: 'Invite link' })).toHaveValue(linkOf(2));
+    expect(created).toEqual([{}, {}]);
+  });
+
+  // 03 §7.9: no retry changes these. The menu offered the entry from a state that was out of date (a member gets
+  // no admin.settings invalidation): the dialog marks it stale, so the menu reads it again when it opens next.
+  it.each([
+    [
+      'registration was closed meanwhile',
+      "['info']",
+      apiError(403, { code: 'registration_closed' }),
+      "Couldn't make an invite link. This server isn't taking new accounts.",
+      queryKeys.info,
+    ],
+    [
+      'the permission went meanwhile',
+      "['me']",
+      apiError(403, { code: 'forbidden' }),
+      "Couldn't make an invite link. You're not allowed to do that.",
+      queryKeys.me,
+    ],
+  ])(
+    'says why there is no link when %s, offers only Done, and marks %s stale',
+    async (_name, _key, failure, text, key) => {
+      const created = invites(failure, null);
+      const { services } = renderOpener();
+      // ['me'] as the guard around the room has it (['info'] is seeded already).
+      if (key === queryKeys.me) services.queryClient.setQueryData(queryKeys.me, meFixture({ createInvites: true }));
+      expect(services.queryClient.getQueryState(key)?.isInvalidated).toBe(false);
+      await open();
+      expect(await within(dialog()).findByRole('alert')).toHaveTextContent(text);
+      expect(within(dialog()).queryByRole('textbox')).not.toBeInTheDocument();
+      expect(within(dialog()).queryByRole('button', { name: 'Try again' })).not.toBeInTheDocument();
+      expect(within(dialog()).getByRole('button', { name: 'Done' })).toBeInTheDocument();
+      await waitFor(() => {
+        expect(services.queryClient.getQueryState(key)?.isInvalidated).toBe(true);
+      });
+      expect(created).toEqual([{}]);
+    },
+  );
 
   it('closes with Done and with ✕, and the next opening makes a new invite: the old link is not kept', async () => {
     const onClose = vi.fn();
