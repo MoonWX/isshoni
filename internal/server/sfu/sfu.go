@@ -25,8 +25,9 @@ type SFU struct {
 	// caused: subEventInterval (250 ms), shorter in tests. It is set before the first Join and never changes.
 	subEventEvery time.Duration
 	// timing holds the durations of PeerConnection recovery (config.go): the handshake timeout, the grace after
-	// failed, the offer re-send, the ICE restart spacing, the PC creation window and the stalled threshold. Tests
-	// shorten them; they are set before the first Join and never change.
+	// failed, the offer re-send, the ICE restart spacing, the PC creation window and the stalled threshold; and the
+	// life of a connection-test probe. Tests shorten them; they are set before the first Join or Probe and never
+	// change.
 	timing timings
 	// handshakeTimeouts counts the new PeerConnections that weren't connected in time, by PCKind (Metrics).
 	handshakeTimeouts [PCSub + 1]atomic.Uint64
@@ -54,6 +55,11 @@ type SFU struct {
 	// actors are the Conns whose actor goroutine still runs: the joined ones, and closed ones until their PCs are
 	// closed. Close waits for them.
 	actors map[*Conn]struct{}
+	// probes are the connection-test probes that hold a slot of the 20 (02 §7.6), one per user and transport: a
+	// user's new probe of a transport takes the old one's slot. probing are the probes whose goroutine still runs,
+	// replaced ones included; Close stops them and waits for them (probe.go).
+	probes  map[probeKey]*probe
+	probing map[*probe]struct{}
 }
 
 // New checks cfg and builds the SFU's APIs on cfg.Transport, whose sockets 04 has already bound. It starts no
@@ -91,6 +97,8 @@ func New(cfg Config, deps Deps) (*SFU, error) {
 		conns:          map[ConnID]*Conn{},
 		shares:         map[ShareID]*Share{},
 		actors:         map[*Conn]struct{}{},
+		probes:         map[probeKey]*probe{},
+		probing:        map[*probe]struct{}{},
 	}
 	s.fullMaxBps.Store(int64(fullLayerMax(cfg.Limits)))
 	return s, nil
@@ -107,9 +115,10 @@ func (s *SFU) Ready() error {
 	return nil
 }
 
-// Close ends every share with server_shutdown, closes every Conn, their PeerConnections concurrently, and stops the
-// ticker. It returns within 1 s: Conns still closing their PCs then are abandoned (they finish on their own) and
-// counted in a warning. It is safe to call twice and never closes the Transport, which is 04's.
+// Close ends every share with server_shutdown, closes every Conn, their PeerConnections and the connection-test
+// probes concurrently, and stops the ticker. It returns within 1 s: Conns and probes still closing their PCs then
+// are abandoned (they finish on their own) and counted in a warning. It is safe to call twice and never closes the
+// Transport, which is 04's.
 func (s *SFU) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -139,6 +148,7 @@ func (s *SFU) Close() error {
 	for _, c := range conns {
 		c.Close(EndReasonServerShutdown)
 	}
+	probes := s.stopProbes()
 	close(s.tickStop)
 
 	deadline := time.NewTimer(closeTimeout)
@@ -166,6 +176,25 @@ func (s *SFU) Close() error {
 			}
 			if left > 0 {
 				s.log.Warn("connections were still closing their PeerConnections when the SFU closed",
+					"count", left, "timeout", closeTimeout)
+			}
+			return nil
+		}
+	}
+	for i, p := range probes {
+		select {
+		case <-p.done:
+		case <-deadline.C:
+			left := 0
+			for _, rest := range probes[i:] {
+				select {
+				case <-rest.done:
+				default:
+					left++
+				}
+			}
+			if left > 0 {
+				s.log.Warn("connection test probes were still closing their PeerConnections when the SFU closed",
 					"count", left, "timeout", closeTimeout)
 			}
 			return nil

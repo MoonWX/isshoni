@@ -14,8 +14,8 @@ import (
 
 // The whole signal ↔ sfu interface of 02 §6 (the list in 02 §18), pinned at compile time: every function with the
 // signature the spec gives, every type with its fields. 01's sfuplane and 04's wiring are written against exactly
-// this, so a change here is a change to the spec first. The methods that later slices fill in are part of it; what
-// they return until then is TestNotImplemented's.
+// this, so a change here is a change to the spec first. The methods that later slices filled in were part of it from
+// the start (TestNotImplemented checks that none of them is still missing).
 var (
 	// Construction (04's wiring).
 	_ func(sfu.Config, sfu.Deps) (*sfu.SFU, error) = sfu.New

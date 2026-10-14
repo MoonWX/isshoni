@@ -49,7 +49,12 @@
 //	                                   (a live share whose pub PC has been away for 2 s), and each room's codec
 //	                                   policy (its way back to high after the hold). Started by the first Join,
 //	                                   stopped by Close. README S84 and S88 add to it
-//	Probe             1 per probe PC   README S76
+//	Probe             1 per probe PC   the connection-test probe's life (probe.run): waits for its PC to connect,
+//	                                   reports the result 1 s later, and ends the probe after 20 s, when the PC
+//	                                   fails or closes, when its data channel closes, or when it is stopped (a
+//	                                   newer probe of the user and transport, Close); then it closes the PC.
+//	                                   Pion's callbacks only wake it; the echo runs on Pion's read loop of the
+//	                                   channel and only queues the message
 //
 // Rules:
 //   - Lock order: SFU.mu → Room.mu → Share.mu → DownTrack.mu. Each is held briefly and never across a Pion call, a
@@ -174,7 +179,14 @@
 //     on the viewer's timeline, every one that arrives and one right after each start of an epoch; a layer switch
 //     keeps that timeline the capture timeline, through both layers' reports, to within a tick. So a share's audio
 //     and video reach a viewer on one clock, the publisher's capture clock;
-//   - events.go, errors.go, types.go, config.go, stats.go, probe.go: the whole interface of 02 §6 and §13;
+//   - events.go, errors.go, types.go, config.go, stats.go: the whole interface of 02 §6 and §13;
+//   - probe.go: the connection-test probe (02 §7.6). Probe answers a browser's data-channel offer on the probe API of
+//     one transport (api.go), so the answer holds only that transport's candidates, and the probe PC echoes every
+//     data-channel message unchanged. A user has one probe per transport (a new one closes the old one), the server
+//     20 (sfu.probe_limit, RetryAfter until the oldest one's 20 s are over), and a transport without its mux is
+//     sfu.transport_disabled. The result channel gets one value: connected, with the server side of the selected
+//     pair and its round-trip time 1 s later, or why the probe ended without (timeout, closed). Probe PCs are counted
+//     in no Snapshot or Metrics value (02 §13). Close stops them and waits for them as it does for the Conns;
 //   - pubnack.go: the NACK filter of each pub PC, which keeps Pion's NACK generator from asking a publisher for
 //     packets that the Layer's cache already holds (02 §9.5);
 //   - api.go: the publish, subscribe and connection-test probe webrtc.APIs on 04's netx.Transport (an API of its
@@ -233,16 +245,21 @@
 //     count toward that gen's 64.
 //   - 4 shares per participant; 256 subscriptions per Conn and 64 per call; the SDP guards of sdpcheck.go; the
 //     command queue; the keyframe throttle; the DownTrack queues.
+//   - Connection-test probes (probe.go): one per user and transport, 20 per server, 20 s each; a probe offer of at
+//     most 64 KiB with one data channel and no media; one data channel per probe PC (a further one is closed at
+//     once); and no echo while 1 MiB of echoes waits to go out, so a client that doesn't read can't make the server
+//     hold its echoes.
 //
 // # What later slices add
 //
-// The whole API is declared; a method that a later slice implements returns an error that wraps ErrNotImplemented
-// (Probe). In README order:
-//   - S76: Probe. S79: the transports, RTTs and counters of Snapshot, ConnStats and Metrics (the Layers and
-//     DownTracks count, the repair counters of 02 §13 included; nothing sums them up yet. A sub PC's round-trip
-//     time is read already, for the NACK handling: subPC.rtt). S84: the downlink allocator (REMB, receiver
-//     reports, queue drops) and the pacer. S88: the admin cap as REMB and quality hint (SetLimits already caps new ShareParams),
-//     layer pausing, and the last QualityHintEvent per share in Resync.
+// The whole API of 02 §6 is implemented (README S76 did the last method, Probe), so no error wraps ErrNotImplemented
+// any more. What later slices add, in README order:
+//   - S79: the transports, RTTs and counters of Snapshot, ConnStats and Metrics (the Layers and DownTracks count,
+//     the repair counters of 02 §13 included; nothing sums them up yet. A sub PC's round-trip time is read already,
+//     for the NACK handling: subPC.rtt).
+//   - S84: the downlink allocator (REMB, receiver reports, queue drops) and the pacer.
+//   - S88: the admin cap as REMB and quality hint (SetLimits already caps new ShareParams), layer pausing, and the
+//     last QualityHintEvent per share in Resync.
 //
 // The server's cap on a subscription (02 §10.1: effective = min(requested, cap), with its reason) is in place
 // (Conn.capSubscription) for the allocator of S84; the viewer's decoders have a cap of their own

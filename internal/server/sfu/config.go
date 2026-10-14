@@ -108,15 +108,16 @@ const (
 	codecRetries       = 9
 )
 
-// timings are the durations above as one SFU uses them.
+// timings are the durations above as one SFU uses them, and the life of a connection-test probe (probeLifetime,
+// probe.go).
 type timings struct {
-	handshake, grace, offerResend, iceRestart, pcWindow, stalled, codecRetry time.Duration
+	handshake, grace, offerResend, iceRestart, pcWindow, stalled, codecRetry, probeLife time.Duration
 }
 
 func defaultTimings() timings {
 	return timings{
 		handshake: handshakeTimeout, grace: pcGrace, offerResend: offerResendInterval, iceRestart: iceRestartSpacing,
-		pcWindow: pcRateWindow, stalled: stalledAfter, codecRetry: codecRetryInterval,
+		pcWindow: pcRateWindow, stalled: stalledAfter, codecRetry: codecRetryInterval, probeLife: probeLifetime,
 	}
 }
 

@@ -27,7 +27,7 @@ import (
 
 // ProbeTransport names one ICE transport of the connection test (02 §7.6). The values are netx's Via labels, the
 // same set used everywhere (dashboard, metrics, the selected-pair label). probe.go has ProbeResult and SFU.Probe,
-// which README S76 implements on the probe APIs built here.
+// which run on the probe APIs built here.
 type ProbeTransport string
 
 // The three probe transports. Each is unavailable when its mux is nil: udp with listen.ice_udp = "", tcp443 in

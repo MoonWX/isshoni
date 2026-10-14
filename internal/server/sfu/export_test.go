@@ -199,12 +199,12 @@ func (c *Conn) PC(ctx context.Context, kind PCKind) (PCState, error) {
 // Timings are the durations of PeerConnection recovery that a test may shorten (config.go): the handshake timeout
 // (10 s), the grace after failed (30 s), the sub offer re-send (15 s), the ICE restart spacing (5 s), the window of
 // the PC creation limit (1 min), the stalled threshold (2 s) and the time between two codec rebuilds for a viewer
-// whose answers refuse H.264 (20 s).
+// whose answers refuse H.264 (20 s); and the life of a connection-test probe (20 s).
 type Timings struct {
-	Handshake, Grace, OfferResend, ICERestart, PCWindow, Stalled, CodecRetry time.Duration
+	Handshake, Grace, OfferResend, ICERestart, PCWindow, Stalled, CodecRetry, ProbeLife time.Duration
 }
 
-// SetTimings replaces the durations of t that aren't zero. Call it before the SFU's first Join.
+// SetTimings replaces the durations of t that aren't zero. Call it before the SFU's first Join or Probe.
 func (s *SFU) SetTimings(t Timings) {
 	for _, d := range []struct {
 		to   *time.Duration
@@ -212,7 +212,7 @@ func (s *SFU) SetTimings(t Timings) {
 	}{
 		{&s.timing.handshake, t.Handshake}, {&s.timing.grace, t.Grace}, {&s.timing.offerResend, t.OfferResend},
 		{&s.timing.iceRestart, t.ICERestart}, {&s.timing.pcWindow, t.PCWindow}, {&s.timing.stalled, t.Stalled},
-		{&s.timing.codecRetry, t.CodecRetry},
+		{&s.timing.codecRetry, t.CodecRetry}, {&s.timing.probeLife, t.ProbeLife},
 	} {
 		if d.from != 0 {
 			*d.to = d.from
@@ -225,8 +225,26 @@ func DefaultTimings() Timings {
 	d := defaultTimings()
 	return Timings{
 		Handshake: d.handshake, Grace: d.grace, OfferResend: d.offerResend, ICERestart: d.iceRestart,
-		PCWindow: d.pcWindow, Stalled: d.stalled, CodecRetry: d.codecRetry,
+		PCWindow: d.pcWindow, Stalled: d.stalled, CodecRetry: d.codecRetry, ProbeLife: d.probeLife,
 	}
+}
+
+// MaxProbes is how many connection-test probes one server runs at once (02 §7.6).
+const MaxProbes = maxProbes
+
+// Probes returns how many connection-test probes hold a slot, and how many probe goroutines still run (the replaced
+// ones that are still closing included).
+func (s *SFU) Probes() (slots, running int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.probes), len(s.probing)
+}
+
+// HasProbe reports whether a probe of the user and transport holds a slot.
+func (s *SFU) HasProbe(user UserID, t ProbeTransport) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.probes[probeKey{user: user, t: t}] != nil
 }
 
 // MaxPCCreations is the number of PeerConnections of one kind a client may make a Conn create within a minute.

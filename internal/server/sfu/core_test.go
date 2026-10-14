@@ -195,7 +195,7 @@ func errOf(t *testing.T, err error, code string) *Error {
 	if !errors.As(err, &e) || e.Code != code {
 		t.Fatalf("error = %v, want %s", err, code)
 	}
-	if e.Retryable != retryableCode(code) && !errors.Is(err, ErrNotImplemented) && code != CodeInternal {
+	if e.Retryable != retryableCode(code) && code != CodeInternal {
 		t.Errorf("%s: Retryable = %v, want the flag of 02 §6.3", code, e.Retryable)
 	}
 	return e
@@ -681,29 +681,20 @@ func TestUpdateShareAndLimits(t *testing.T) {
 	}
 }
 
-// TestNotImplemented: the methods that later slices fill in exist and say so (README §4 "Interfaces first").
+// TestNotImplemented: every method that a later slice filled in (README §4 "Interfaces first") exists now, the last
+// one README S76's Probe, so none says "not implemented" any more: no error of the package wraps ErrNotImplemented.
 func TestNotImplemented(t *testing.T) {
 	s, _ := newTestSFU(t)
 	ctx := testCtx(t)
 	c, _ := join(t, s, "lounge", "alice", "c-a", RoleFull)
 	_, _, probeErr := s.Probe(ctx, "alice", ProbeUDP, "v=0\r\n")
-	for name, err := range map[string]error{
-		"SFU.Probe": probeErr,
-	} {
-		if !errors.Is(err, ErrNotImplemented) {
-			t.Errorf("%s = %v, want an error that wraps ErrNotImplemented", name, err)
-			continue
-		}
-		if e := errOf(t, err, CodeInternal); e.Retryable {
-			t.Errorf("%s: a missing method is retryable", name)
-		}
-	}
-	// The methods of README S57 and S69 exist now: none of them says "not implemented" any more.
+	wantErr(t, probeErr, CodeBadSDP)
 	for name, err := range map[string]error{
 		"Conn.RestartICE":    c.RestartICE(ctx, PCSub, 1),
 		"Conn.ResetPC":       c.ResetPC(ctx, PCSub, 1),
 		"Conn.ClosePC":       c.ClosePC(ctx, PCPub, 1),
 		"Conn.SetDecodeCaps": c.SetDecodeCaps(ctx, DecodeCaps{H264: []ProfileKey{ProfileHigh}}),
+		"SFU.Probe":          probeErr,
 	} {
 		if errors.Is(err, ErrNotImplemented) {
 			t.Errorf("%s = %v", name, err)
