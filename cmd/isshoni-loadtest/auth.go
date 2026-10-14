@@ -218,23 +218,38 @@ func (lt *loadTest) revokeInvite(ctx context.Context) error {
 	return err
 }
 
+// accountPrefix is what the names of the run's accounts start with: lt-<run>-.
+func (lt *loadTest) accountPrefix() string { return "lt-" + lt.runID + "-" }
+
 // register signs up the account lt-<run>-<n> with the run's invite. The answer carries its session cookie.
+//
+// A sign-up whose answer never came (a dropped connection, a timeout, a proxy's 5xx) may have made the account all
+// the same: register then looks for it in the admin's list and, when it is there, returns it with the error, so
+// that the teardown deletes it. An interrupt leaves that to the teardown's own look (deleteStrays).
 func (lt *loadTest) register(ctx context.Context, n int) (*account, error) {
 	if err := lt.pace.wait(ctx); err != nil {
 		return nil, err
 	}
 	a := &account{
-		name:     fmt.Sprintf("lt-%s-%d", lt.runID, n),
+		name:     lt.accountPrefix() + strconv.Itoa(n),
 		password: logx.Secret(randomPassword()),
-		rest:     newRESTClient(lt.origin, lt.transport),
+		rest:     newRESTClient(lt.origin, lt.rt),
 	}
 	var res api.RegisterResponse
 	err := a.rest.callRetrying(ctx, lt.log, http.MethodPost, "/api/v1/auth/register",
 		api.RegisterRequest{InviteToken: lt.inviteToken.Reveal(), Username: a.name, Password: a.password.Reveal()},
 		&res, http.StatusCreated)
+	var he *httpError
 	switch {
 	case ctx.Err() != nil:
 		return nil, ctx.Err()
+	case err != nil && (!errors.As(err, &he) || he.status >= http.StatusInternalServerError):
+		if id, ok := lt.findUser(ctx, a.name); ok {
+			a.id = id
+			lt.log.Warn("the server made an account whose sign-up answer never came", "account", a.name)
+			return a, setupErrorf("signing up %s: %w", a.name, err)
+		}
+		return nil, setupErrorf("signing up %s: %w", a.name, err)
 	case err != nil:
 		return nil, setupErrorf("signing up %s: %w", a.name, err)
 	case res.User == nil || res.User.ID == "":
@@ -242,6 +257,28 @@ func (lt *loadTest) register(ctx context.Context, n int) (*account, error) {
 	}
 	a.id = res.User.ID
 	return a, nil
+}
+
+// listUsers reads GET /api/v1/admin/users (03 §12.4.8): every account of the server.
+func (lt *loadTest) listUsers(ctx context.Context) ([]api.AdminUser, error) {
+	var res api.AdminUsersResponse
+	err := lt.admin.call(ctx, http.MethodGet, "/api/v1/admin/users", nil, &res, http.StatusOK)
+	return res.Users, err
+}
+
+// findUser returns the id of the account called name, when the admin's list has it.
+func (lt *loadTest) findUser(ctx context.Context, name string) (string, bool) {
+	users, err := lt.listUsers(ctx)
+	if err != nil {
+		lt.log.Warn("looking for an account", "account", name, "err", err)
+		return "", false
+	}
+	for _, u := range users {
+		if strings.EqualFold(u.Username, name) {
+			return u.ID, true
+		}
+	}
+	return "", false
 }
 
 // deleteUser deletes one account of the run (03 §12.4.8). One that is gone already counts as deleted.

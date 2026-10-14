@@ -102,7 +102,8 @@ type loadTest struct {
 	loopback bool // the server is on this machine: the clients use loopback ICE candidates
 	runID    string
 
-	transport *http.Transport // shared by every REST client
+	transport *http.Transport   // shared by every REST client
+	rt        http.RoundTripper // what the REST clients send through: transport, or a test's wrapper of it
 	admin     *restClient
 	adminID   string
 	pace      pacer
@@ -136,9 +137,10 @@ func newLoadTest(cfg *config, log *slog.Logger) *loadTest {
 	lt := &loadTest{
 		cfg: cfg, log: log, pionLog: logx.NewPionLoggerFactory(pionLogger(log, cfg.verbose)),
 		origin: origin, wsURL: wsScheme + "://" + cfg.server.Host + "/ws", loopback: isLoopback(cfg.server.Hostname()),
-		runID: newRunID(), transport: transport, pace: pacer{every: cfg.loginInterval}, problemSeen: map[string]bool{},
+		runID: newRunID(), transport: transport, rt: transport, pace: pacer{every: cfg.loginInterval},
+		problemSeen: map[string]bool{},
 	}
-	lt.admin = newRESTClient(origin, transport)
+	lt.admin = newRESTClient(origin, lt.rt)
 	lt.stopMedia = func() {}
 	lt.meter = newMeter(lt)
 	return lt
@@ -202,6 +204,15 @@ func (lt *loadTest) problem(text string) {
 // *setupError, errInterrupted, or a failure that ended the run early (also listed in the report's failures).
 func (lt *loadTest) run(ctx context.Context) (*report, error) {
 	rep := newReport(lt.cfg)
+	// Say at once what an interrupt still does: the teardown takes a while, and main lets a second signal end it.
+	notice := context.AfterFunc(ctx, func() {
+		if lt.cfg.keepUsers {
+			lt.log.Warn("interrupted: closing the clients (Ctrl-C again to quit at once)")
+			return
+		}
+		lt.log.Warn("interrupted: deleting the accounts (Ctrl-C again to quit and leave them)")
+	})
+	defer notice()
 	err := lt.runScenario(ctx, rep)
 	lt.teardown(rep)
 	switch {
@@ -247,12 +258,13 @@ func (lt *loadTest) runScenario(ctx context.Context, rep *report) error {
 	}
 	for n := 1; n <= cfg.publishers+cfg.subscribers; n++ {
 		a, err := lt.register(ctx, n)
+		if a != nil { // also with an error: an account the server made though its answer never came
+			lt.accounts = append(lt.accounts, a)
+		}
 		if err != nil {
 			return err
 		}
-		lt.accounts = append(lt.accounts, a)
 	}
-	rep.Users.Created = len(lt.accounts)
 	lt.log.Info("accounts registered", "count", len(lt.accounts), "run", lt.runID)
 
 	if err := lt.connectAll(ctx); err != nil {
@@ -606,8 +618,9 @@ func (lt *loadTest) stepUp(ctx context.Context, rep *report) {
 // teardownTimeout bounds the teardown, which runs after an interrupt too.
 const teardownTimeout = 60 * time.Second
 
-// teardown closes every client, deletes the run's accounts (unless -keep-users), revokes the invite and logs the
-// admin out. What fails here is a failure of the run: accounts may be left over.
+// teardown closes every client, deletes the run's accounts (unless -keep-users), revokes the invite, deletes the
+// accounts of the run that the server made although their sign-up's answer never came, and logs the admin out. What
+// fails here is a failure of the run: accounts may be left over.
 func (lt *loadTest) teardown(rep *report) {
 	ctx, cancel := context.WithTimeout(context.Background(), teardownTimeout)
 	defer cancel()
@@ -621,9 +634,11 @@ func (lt *loadTest) teardown(rep *report) {
 	if len(clients) > 0 {
 		lt.log.Info("clients closed", "count", len(clients))
 	}
-	rep.Users.Kept = lt.cfg.keepUsers
+	rep.Users.Created, rep.Users.Kept = len(lt.accounts), lt.cfg.keepUsers
+	known := map[string]bool{}
 	if !lt.cfg.keepUsers {
 		for _, a := range lt.accounts {
+			known[a.id] = true
 			if err := lt.deleteUser(ctx, a); err != nil {
 				rep.Failures = append(rep.Failures, fmt.Sprintf("teardown: deleting %s: %v", a.name, err))
 				continue
@@ -638,11 +653,40 @@ func (lt *loadTest) teardown(rep *report) {
 		if err := lt.revokeInvite(ctx); err != nil {
 			rep.Failures = append(rep.Failures, fmt.Sprintf("teardown: revoking the invite: %v", err))
 		}
+		if !lt.cfg.keepUsers {
+			lt.deleteStrays(ctx, rep, known)
+		}
 	}
 	if lt.adminID != "" {
 		if err := lt.logout(ctx); err != nil {
 			lt.log.Warn("logging the admin out", "err", err)
 		}
+	}
+}
+
+// deleteStrays deletes the accounts of the run that it does not know: the server made them, but the answer to their
+// sign-up never came (an interrupt that cancelled the request, a timeout, a dropped connection). They are the
+// accounts lt-<run>-<n> of the admin's list besides known (ids). It runs once the invite is revoked: a sign-up the
+// server was still working on has then either made its account already or fails.
+func (lt *loadTest) deleteStrays(ctx context.Context, rep *report, known map[string]bool) {
+	users, err := lt.listUsers(ctx)
+	if err != nil {
+		rep.Failures = append(rep.Failures, fmt.Sprintf("teardown: listing the accounts to find any left over: %v", err))
+		return
+	}
+	prefix := lt.accountPrefix()
+	for _, u := range users {
+		if known[u.ID] || !strings.HasPrefix(strings.ToLower(u.Username), prefix) {
+			continue
+		}
+		a := &account{name: u.Username, id: u.ID}
+		rep.Users.Created++
+		lt.log.Warn("deleting an account whose sign-up answer never came", "account", a.name)
+		if err := lt.deleteUser(ctx, a); err != nil {
+			rep.Failures = append(rep.Failures, fmt.Sprintf("teardown: deleting %s: %v", a.name, err))
+			continue
+		}
+		rep.Users.Deleted++
 	}
 }
 

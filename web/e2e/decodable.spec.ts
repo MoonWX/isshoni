@@ -5,9 +5,10 @@
 // the stage, and the browser's decoder turns it into pictures: framesDecoded > 0, at the full layer's 640×360. The
 // tool then ends its run with exit 0 and a report that passes, and deletes the account it made.
 //
-// The tool: ISSHONI_LOADTEST_BIN names a built binary (a relative path counts from the repository root). Without it
-// this spec builds ./cmd/isshoni-loadtest with the Go toolchain on the PATH (go.mod's toolchain line picks the
-// version), once per worker, into a temporary directory; `task e2e` builds only bin/isshoni.
+// The tool: LOADTEST_BIN names a built binary (a relative path counts from the repository root). Without it this
+// spec builds ./cmd/isshoni-loadtest with the Go toolchain on the PATH (go.mod's toolchain line picks the version),
+// once per worker, into a temporary directory; `task e2e` builds only bin/isshoni. The name has no ISSHONI_ prefix:
+// that is for the server's config keys and the names 04 §4.2 reserves.
 import { execFile, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
@@ -22,7 +23,7 @@ import { videoOf, waitForRoom, waitForState, waitForStats } from './stats.ts';
 const execFileAsync = promisify(execFile);
 
 /** The environment variable that names a built isshoni-loadtest. */
-const LOADTEST_ENV = 'ISSHONI_LOADTEST_BIN';
+const LOADTEST_ENV = 'LOADTEST_BIN';
 /** The tool reads the admin's password from here (02 §15.2, 04 §4.2). */
 const PASSWORD_ENV = 'ISSHONI_LOADTEST_PASSWORD';
 /** A cold build downloads the toolchain and the modules first. */
@@ -50,7 +51,7 @@ interface ToolRun {
 }
 
 /**
- * The tool's binary: ISSHONI_LOADTEST_BIN, or a fresh build. A worker fixture, so that a cold build happens once
+ * The tool's binary: LOADTEST_BIN, or a fresh build. A worker fixture, so that a cold build happens once
  * per worker and under a timeout of its own.
  */
 const test = base.extend<object, { loadtest: string }>({
@@ -145,6 +146,9 @@ test('Chrome decodes the Go publisher’s decodable video', async ({ startServer
     admin.password,
     logPath,
   );
+  // A failed browser check is the test's error; the tool's exit code then joins it as a soft error rather than
+  // replacing it, since the tool often fails for the same reason.
+  let failure: unknown;
   try {
     // The tool's share goes live, and the friend's stage takes it.
     const share = await waitForState(
@@ -175,11 +179,16 @@ test('Chrome decodes the Go publisher’s decodable video', async ({ startServer
       (s) => (videoOf(s, share.id)?.framesDecoded ?? 0) > (videoOf(full, share.id)?.framesDecoded ?? 0) + 30 && s,
       { timeout: MEDIA_TIMEOUT_MS, message: 'more decoded frames: the P_Skip frames decode too' },
     );
+  } catch (err) {
+    failure = err;
+    throw err;
   } finally {
     // The tool's run ends by itself; its log belongs to the report either way.
     const finished = await run;
     await testInfo.attach('loadtest.log', { path: logPath, contentType: 'text/plain' });
-    expect(finished.code, `isshoni-loadtest exited with ${String(finished.code)}:\n${finished.output}`).toBe(0);
+    const exited = `isshoni-loadtest exited with ${String(finished.code)}:\n${finished.output}`;
+    if (failure === undefined) expect(finished.code, exited).toBe(0);
+    else expect.soft(finished.code, exited).toBe(0);
   }
 
   // Its report passes, and the one account it made is gone.

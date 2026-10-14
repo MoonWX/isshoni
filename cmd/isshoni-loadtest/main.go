@@ -22,15 +22,16 @@
 //
 // What is measured (measure.go) after the warm-up: the server's CPU, memory per DownTrack and media egress from
 // GET /api/v1/admin/dashboard every 5 s; the loss before and after NACK/RTX on every subscriber track; the keyframe
-// requests that reach each publisher layer; the time from a subscribe.update to the first packet of the new layer;
-// and the offset of the fake media's flash frames from their beeps at the viewers. The result (report.go) is a
+// requests that reach each publisher layer; the time from a subscribe.update to the first packet of the new layer,
+// and whether the track's sequence numbers and timestamps run on across that switch; and the offset of the fake
+// media's flash frames from their beeps at the viewers. The result (report.go) is a
 // human summary on stdout and, with -json, the JSON report in a file ("-" puts it on stdout and the summary on
 // stderr). Progress goes to stderr.
 //
 // Exit codes: 0 the run passed; 1 it failed (a check, a client that lost its connection, media that never came, a
 // teardown that left accounts behind); 2 a setup error (a usage error, a server that can't be reached, a refused
 // login, an account or a share the server would not create); 130 interrupted (SIGINT or SIGTERM: the accounts are
-// deleted all the same).
+// deleted all the same; a second signal quits at once and leaves them).
 //
 // This is test tooling: the release builds only cmd/isshoni (06), so no release artifact contains it.
 package main
@@ -46,6 +47,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -87,6 +89,9 @@ type env struct {
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// The first signal ends the run, whose teardown still deletes the accounts. From then on a signal has its default
+	// action again: a second Ctrl-C quits at once and leaves them.
+	context.AfterFunc(ctx, stop)
 	code := run(ctx, os.Args[1:], processEnv())
 	stop()
 	os.Exit(code)
@@ -325,7 +330,25 @@ func parseFlags(args []string, stderr io.Writer) (*config, error) {
 	if cfg.layers, err = parseLayers(*full, *preview, set["full"], set["preview"], cfg.decodable); err != nil {
 		return nil, err
 	}
+	// The fake media checks what the flags alone don't, such as a layer above H.264 level 6.2: here, before any
+	// account exists, rather than at the first share. New starts nothing.
+	src, err := fake.New(cfg.fakeConfig(0))
+	if err != nil {
+		return nil, fmt.Errorf("-full %s -preview %s -gop %v: %w", *full, *preview, cfg.gop, err)
+	}
+	_ = src.Close()
 	return cfg, nil
+}
+
+// fakeConfig is the fake media of a publisher: seed makes each share's synthetic video its own.
+func (cfg *config) fakeConfig(seed uint64) fake.Config {
+	mode := fake.Synthetic
+	if cfg.decodable {
+		mode = fake.Decodable
+	}
+	return fake.Config{
+		Mode: mode, Profile: cfg.profile, Layers: slices.Clone(cfg.layers), GOP: cfg.gop, Audio: true, Seed: seed,
+	}
 }
 
 // usage prints the synopsis, the flags and the exit codes.
@@ -340,7 +363,8 @@ Flags:
 `)
 	fs.PrintDefaults()
 	fmt.Fprint(w, `
-Exit codes: 0 pass, 1 fail, 2 setup error (usage, server unreachable, login or accounts refused), 130 interrupted.
+Exit codes: 0 pass, 1 fail, 2 setup error (usage, server unreachable, login or accounts refused), 130 interrupted
+(the accounts are deleted all the same; Ctrl-C again quits at once and leaves them).
 `)
 }
 

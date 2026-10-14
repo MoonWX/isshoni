@@ -344,13 +344,7 @@ func (c *client) publish(ctx, media context.Context, seed uint64) error {
 		return fmt.Errorf("%s: %w", c.acct.name, err)
 	}
 	cfg := c.lt.cfg
-	mode := fake.Synthetic
-	if cfg.decodable {
-		mode = fake.Decodable
-	}
-	src, err := fake.New(fake.Config{
-		Mode: mode, Profile: cfg.profile, Layers: slices.Clone(cfg.layers), GOP: cfg.gop, Audio: true, Seed: seed,
-	})
+	src, err := fake.New(cfg.fakeConfig(seed))
 	if err != nil {
 		return fmt.Errorf("%s: the fake media: %w", c.acct.name, err)
 	}

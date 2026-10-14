@@ -115,6 +115,12 @@ type switchReport struct {
 	Max             float64 `json:"max"`
 	WithoutKeyframe int     `json:"withoutKeyframe"` // switches that did not start on a keyframe with its SPS
 	LostStart       int     `json:"lostStart"`       // switches whose start was lost (counted as loss)
+	// Verified counts the switches checked again once the repairs had had their chance (all but those the run's end
+	// cut short); SeqGaps those of them with a sequence number missing in front of the new layer; TSBack the switches
+	// whose new layer's timestamp did not move forward. Both must be 0: seq and ts continuous per track (02 §15.2).
+	Verified int `json:"verified"`
+	SeqGaps  int `json:"seqGaps"`
+	TSBack   int `json:"tsBack"`
 }
 
 // avReport is |flash − beep| of the fake media at the viewers, through the SFU's sender reports.

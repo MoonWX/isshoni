@@ -2,6 +2,7 @@ package main
 
 import (
 	"math"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -223,22 +224,34 @@ func (b *trackBuilder) frame(rid string, key bool) {
 	b.seq++
 }
 
+// switchTrack builds a track of 7 q frames and then 2 f frames, the first a keyframe at 70 ms, with the sequence
+// numbers wrapping on the way; between the last q frame and the f keyframe, between runs first.
+func switchTrack(t0 time.Time, between func(b *trackBuilder)) *trackBuilder {
+	b := &trackBuilder{t0: t0, seq: 65530}
+	b.frame("q", true)
+	for range 6 {
+		b.frame("q", false)
+	}
+	if between != nil {
+		between(b)
+	}
+	b.frame("f", true)
+	b.frame("f", false)
+	return b
+}
+
 func TestFindSwitch(t *testing.T) {
 	t.Parallel()
 	t0 := time.Unix(1000, 0)
-	b := &trackBuilder{t0: t0, seq: 65530} // the sequence numbers wrap on the way
-	b.frame("q", true)
-	for range 5 {
-		b.frame("q", false)
-	}
+	b := switchTrack(t0, nil)
 	sentAt := t0.Add(35 * time.Millisecond) // after frame 3
-	b.frame("q", false)
-	b.frame("f", true) // frame 7, at 70 ms
-	b.frame("f", false)
 
 	s, state := findSwitch(b.pkts, "f", sentAt)
-	if state != switchFound || s.latency != 35*time.Millisecond || !s.keyframe || s.lostStart {
-		t.Errorf("findSwitch = %+v, %v; want found after 35 ms, on a keyframe", s, state)
+	if state != switchFound || s.latency != 35*time.Millisecond || !s.keyframe || s.lostStart || s.seqGap || s.tsBack {
+		t.Errorf("findSwitch = %+v, %v; want found after 35 ms, on a keyframe, continuous", s, state)
+	}
+	if want := b.pkts[len(b.pkts)-3].Seq; s.start != want || s.seq != want+1 {
+		t.Errorf("findSwitch = %+v: the frame starts at seq %d (its SPS), its slice at %d", s, want, want+1)
 	}
 	if _, state := findSwitch(b.pkts[:len(b.pkts)-3], "f", sentAt); state != switchPending {
 		t.Errorf("before the first f packet: %v, want pending", state)
@@ -255,7 +268,7 @@ func TestFindSwitch(t *testing.T) {
 			lost = append(lost, p)
 		}
 	}
-	if s, state := findSwitch(lost, "f", sentAt); state != switchFound || s.keyframe || !s.lostStart {
+	if s, state := findSwitch(lost, "f", sentAt); state != switchFound || s.keyframe || !s.lostStart || s.seqGap {
 		t.Errorf("without its SPS packet: %+v, %v; want found, lost start", s, state)
 	}
 	// A switch onto a delta frame.
@@ -263,9 +276,77 @@ func TestFindSwitch(t *testing.T) {
 	d.frame("q", true)
 	d.frame("q", false)
 	d.frame("f", false)
-	if s, state := findSwitch(d.pkts, "f", t0); state != switchFound || s.keyframe || s.lostStart {
+	if s, state := findSwitch(d.pkts, "f", t0); state != switchFound || s.keyframe || s.lostStart || s.seqGap {
 		t.Errorf("onto a delta frame: %+v, %v; want found, not a keyframe", s, state)
 	}
+}
+
+// TestCheckSwitch: the second look at a switch, once repairs have had their chance, finds what the first one could
+// not tell: a gap in the sequence numbers at the layer change, an SPS packet that a repair brought late, and a
+// timestamp that does not move forward.
+func TestCheckSwitch(t *testing.T) {
+	t.Parallel()
+	t0 := time.Unix(1000, 0)
+	sentAt := t0.Add(35 * time.Millisecond)
+	find := func(t *testing.T, pkts []sfutest.Packet) switchSample {
+		t.Helper()
+		s, state := findSwitch(pkts, "f", sentAt)
+		if state != switchFound {
+			t.Fatalf("findSwitch: %v, want found", state)
+		}
+		return s
+	}
+
+	t.Run("seq gap at the layer change", func(t *testing.T) {
+		t.Parallel()
+		b := switchTrack(t0, func(b *trackBuilder) { b.seq++ }) // the munger skipped a number
+		s := find(t, b.pkts)
+		if !checkSwitch(b.pkts, &s) || !s.keyframe || s.lostStart || !s.seqGap || s.tsBack {
+			t.Errorf("checkSwitch = %+v; want a keyframe with a seq gap in front", s)
+		}
+	})
+
+	t.Run("SPS repaired after the slice", func(t *testing.T) {
+		t.Parallel()
+		b := switchTrack(t0, nil)
+		// The f keyframe's SPS packet is lost on the way and comes again through RTX after the delta frame.
+		i := len(b.pkts) - 3
+		sps := b.pkts[i]
+		sps.RTX, sps.Arrival = true, b.pkts[len(b.pkts)-1].Arrival.Add(30*time.Millisecond)
+		pkts := append(slices.Delete(slices.Clone(b.pkts), i, i+1), sps)
+		early := find(t, pkts[:len(pkts)-1])
+		if early.keyframe || !early.lostStart {
+			t.Errorf("first look, before the repair: %+v; want a lost start", early)
+		}
+		s := early
+		if !checkSwitch(pkts, &s) || !s.keyframe || s.lostStart || s.seqGap || s.tsBack {
+			t.Errorf("checkSwitch after the repair = %+v; want a keyframe on its SPS, continuous", s)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		back uint32
+	}{{"timestamp of the frame before", 3000}, {"timestamp before the frame before", 6000}} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			b := switchTrack(t0, func(b *trackBuilder) { b.ts -= tc.back })
+			s := find(t, b.pkts)
+			if !checkSwitch(b.pkts, &s) || !s.keyframe || s.seqGap || !s.tsBack {
+				t.Errorf("checkSwitch = %+v; want a keyframe whose timestamp goes back", s)
+			}
+		})
+	}
+
+	t.Run("frame no longer kept", func(t *testing.T) {
+		t.Parallel()
+		b := switchTrack(t0, nil)
+		s := find(t, b.pkts)
+		before := s
+		if checkSwitch(b.pkts[:5], &s) || s != before {
+			t.Errorf("checkSwitch without the frame = %+v; want false, the sample as it was", s)
+		}
+	})
 }
 
 func TestTimestampsForward(t *testing.T) {

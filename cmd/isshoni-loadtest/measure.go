@@ -25,8 +25,10 @@ import (
 //   - Client data: each subscriber track's loss before NACK/RTX (gaps) and after (still missing after 1 s), from
 //     sfutest's Recorders; the keyframe requests (PLI, FIR) that reach each publisher layer, from the Publishers'
 //     counters every second; per focus move, the time from the subscribe.update to the first packet of the new
-//     layer, which must start a keyframe on its SPS; and the offset of every flash frame from its beep at the
-//     viewers, both mapped to NTP through the sender reports the SFU forwarded.
+//     layer, which must start a keyframe on its SPS and, once repairs have had their chance, follow the packet in
+//     front of it with the next sequence number and a later timestamp (seq continuous per track); and the offset of
+//     every flash frame from its beep at the viewers, both mapped to NTP through the sender reports the SFU
+//     forwarded.
 
 // The kinds of a track.
 const (
@@ -45,6 +47,11 @@ const pliWindow = 10 * time.Second
 
 // switchPoll is how often a switch measurement looks at the Recorder.
 const switchPoll = 20 * time.Millisecond
+
+// switchSettle is how long a switch measurement waits after the new layer's first packet before it checks the
+// switch's start: the Viewer asks for a missing packet again until it has been missing for FinalLossAfter, and the
+// last retransmission may still be on its way then. What is missing after it stays missing.
+const switchSettle = sfutest.FinalLossAfter + 200*time.Millisecond
 
 // dashSample is one reading of the dashboard.
 type dashSample struct {
@@ -79,9 +86,19 @@ type pubSample struct {
 
 // switchSample is one measured layer switch.
 type switchSample struct {
-	latency   time.Duration
-	keyframe  bool // the new layer starts on a keyframe with its SPS in front
-	lostStart bool // the SPS in front was lost, so the start could not be checked
+	latency time.Duration
+	// The new layer's first frame: its timestamp, the packet with its marker (its slice's start), and its first
+	// packet as checkSwitch found it (the SPS in front of the slice, or the slice).
+	ts         uint32
+	seq, start uint16
+	keyMarked  bool // the marker says the frame is a keyframe
+	keyframe   bool // the new layer starts on a keyframe with its SPS in front
+	lostStart  bool // the SPS in front never arrived, so the start could not be checked (the loss check counts it)
+	// verified: the switch was checked again once repairs had had their chance (switchSettle), so seqGap is final.
+	// A switch that the run's end cut short keeps what its first look found.
+	verified bool
+	seqGap   bool // the sequence number in front of the new layer's first packet never arrived (verified only)
+	tsBack   bool // the new layer's first frame does not come after the packet in front of it (02 §9.4)
 }
 
 // avKey identifies one flash frame at one subscriber.
@@ -270,19 +287,34 @@ func (m *meter) finish(ctx context.Context) {
 // measureSwitch waits until a subscriber's video of a share has switched to layer rid after a subscribe.update sent
 // at sentAt, and keeps the switch when it began after the warm-up. A track that was on that layer already (the SFU
 // had moved it for bandwidth) has nothing to switch. No switch by deadline is a problem of the run.
+//
+// A kept switch is checked once more after switchSettle, when every repair the Viewer asked for has come or never
+// will: the new layer starts on its SPS, and the track's sequence numbers and timestamps run on across the switch
+// (02 §15.2 "seq continuous per track", §9.4).
 func (m *meter) measureSwitch(ctx context.Context, c *client, shareID, rid string, sentAt, deadline time.Time) {
 	for {
 		if r := c.recorder(shareID, videoKind); r != nil {
 			s, state := findSwitch(r.Packets(), rid, sentAt)
 			switch state {
 			case switchFound:
-				if m.inWindow(sentAt) {
-					m.mu.Lock()
-					m.switches = append(m.switches, s)
-					m.mu.Unlock()
-					if !s.keyframe && !s.lostStart {
-						c.problem("the switch of %s to layer %s did not start on a keyframe with its SPS", shareID, rid)
-					}
+				if !m.inWindow(sentAt) {
+					return
+				}
+				if sleep(ctx, switchSettle) == nil {
+					s.verified = checkSwitch(r.Packets(), &s)
+				}
+				m.mu.Lock()
+				m.switches = append(m.switches, s)
+				m.mu.Unlock()
+				if !s.keyframe && !s.lostStart {
+					c.problem("the switch of %s to layer %s did not start on a keyframe with its SPS", shareID, rid)
+				}
+				if s.verified && s.seqGap {
+					c.log.Warn("a sequence number is missing in front of a switch", "share_id", shareID, "layer", rid,
+						"missing_seq", s.start-1, "first_seq", s.start)
+				}
+				if s.tsBack {
+					c.log.Warn("the timestamp goes back at a switch", "share_id", shareID, "layer", rid, "seq", s.seq, "ts", s.ts)
 				}
 				return
 			case switchNotNeeded:
@@ -311,9 +343,7 @@ const (
 )
 
 // findSwitch finds the first frame of layer rid in a track's packets (in arrival order) that arrived at or after
-// sentAt, and checks how it starts: a keyframe (its marker says so) whose SPS came right in front of its slice (02
-// §9.4). When the packet in front of that frame never arrived, the start can't be checked: that is loss, which the
-// loss check counts.
+// sentAt, and takes a first look at how it starts (checkSwitch).
 func findSwitch(pkts []sfutest.Packet, rid string, sentAt time.Time) (switchSample, switchState) {
 	i := sort.Search(len(pkts), func(i int) bool { return !pkts[i].Arrival.Before(sentAt) })
 	for k := i - 1; k >= 0; k-- {
@@ -335,24 +365,39 @@ func findSwitch(pkts []sfutest.Packet, rid string, sentAt time.Time) (switchSamp
 		return switchSample{}, switchPending
 	}
 	p := pkts[first]
-	s := switchSample{latency: p.Arrival.Sub(sentAt)}
-	if !p.Mark.Keyframe {
-		return s, switchFound
-	}
-	ordered := sfutest.InSeqOrder(pkts)
-	have := make(map[uint16]bool, len(ordered))
-	for _, q := range ordered {
-		have[q.Seq] = true
-	}
-	for _, f := range sfutest.Frames(ordered) {
-		if f.TS != p.TS {
-			continue
-		}
-		s.keyframe = f.KeyStart
-		s.lostStart = !f.KeyStart && !have[f.FirstSeq-1]
-		break
-	}
+	s := switchSample{latency: p.Arrival.Sub(sentAt), ts: p.TS, seq: p.Seq, keyMarked: p.Mark.Keyframe}
+	checkSwitch(pkts, &s)
 	return s, switchFound
+}
+
+// checkSwitch checks how the new layer's first frame of a switch starts, in a track's packets: on a keyframe (its
+// marker says so) whose SPS came right in front of its slice (02 §9.4, the STAP-A of publish.Publisher), right
+// behind the packet before it (the sequence numbers run on), and after it (its timestamp is later: two frames never
+// share one). When the packet in front of a keyframe's slice never arrived, the start can't be told from a gap:
+// that is loss, which the loss check counts. It returns false, and leaves s as it was, when the frame's marked packet
+// is no longer among the packets.
+func checkSwitch(pkts []sfutest.Packet, s *switchSample) bool {
+	bySeq := make(map[uint16]sfutest.Packet, len(pkts))
+	for _, p := range pkts {
+		if !p.Dup {
+			bySeq[p.Seq] = p
+		}
+	}
+	if p, ok := bySeq[s.seq]; !ok || p.TS != s.ts {
+		return false
+	}
+	start := s.seq
+	if p, ok := bySeq[start-1]; ok && p.TS == s.ts && p.KeyStart {
+		start--
+	}
+	first := bySeq[start]
+	prev, havePrev := bySeq[start-1]
+	s.start = start
+	s.keyframe = s.keyMarked && first.KeyStart
+	s.lostStart = s.keyMarked && !first.KeyStart && !havePrev
+	s.seqGap = !havePrev && !s.lostStart
+	s.tsBack = havePrev && int32(s.ts-prev.TS) <= 0 //nolint:gosec // G115: RTP timestamps wrap; the difference is read as signed
+	return true
 }
 
 // hasLayer reports whether a track has a whole frame's start of layer rid.
@@ -756,6 +801,15 @@ func (m *meter) report(rep *report) {
 			case !s.keyframe:
 				rep.SwitchMs.WithoutKeyframe++
 			}
+			if s.verified {
+				rep.SwitchMs.Verified++
+				if s.seqGap {
+					rep.SwitchMs.SeqGaps++
+				}
+			}
+			if s.tsBack {
+				rep.SwitchMs.TSBack++
+			}
 		}
 		rep.SwitchMs.Count = len(lat)
 		if len(lat) > 0 {
@@ -766,6 +820,10 @@ func (m *meter) report(rep *report) {
 			lim.switchP95 > 0, rep.SwitchMs.P95 < ms(lim.switchP95), fmt.Sprintf("p95 < %v", lim.switchP95))
 		checks.add("switch starts", len(lat) > 0, fmt.Sprintf("%d without a keyframe and its SPS", rep.SwitchMs.WithoutKeyframe),
 			lim.switchP95 > 0, rep.SwitchMs.WithoutKeyframe == 0, "every switch on an SPS")
+		checks.add("continuity", rep.SwitchMs.Verified > 0 || rep.SwitchMs.TSBack > 0,
+			fmt.Sprintf("%d seq gaps and %d timestamps back at %d switches checked after repairs", rep.SwitchMs.SeqGaps,
+				rep.SwitchMs.TSBack, rep.SwitchMs.Verified),
+			lim.switchP95 > 0, rep.SwitchMs.SeqGaps == 0 && rep.SwitchMs.TSBack == 0, "seq and ts continuous at every switch")
 		for _, c := range continuity {
 			rep.Failures = append(rep.Failures, "continuity: "+c)
 		}

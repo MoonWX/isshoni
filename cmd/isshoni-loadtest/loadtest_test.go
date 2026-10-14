@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -196,7 +197,8 @@ func TestSmoke(t *testing.T) {
 }
 
 // TestFocusRotation runs a short focus scenario in which the subscribers move their focus every 3 s: every switch
-// is measured and starts on a keyframe, and the run passes the focus criteria. CPU and memory are not checked
+// is measured, starts on a keyframe and keeps the track's seq and timestamps continuous, and the run passes the
+// focus criteria. CPU and memory are not checked
 // against an in-process server, and the PLI and egress limits allow for the quick rotation.
 func TestFocusRotation(t *testing.T) {
 	t.Parallel()
@@ -232,8 +234,14 @@ func TestFocusRotation(t *testing.T) {
 	if rep.SwitchMs.Count < 8 || rep.SwitchMs.WithoutKeyframe != 0 {
 		t.Errorf("switches = %+v, want at least 8, each on a keyframe", rep.SwitchMs)
 	}
-	if c := checkOf(t, rep, "switch latency"); !c.Checked || !c.Pass {
-		t.Errorf("check switch latency = %+v", c)
+	// Each switch is checked again after its repairs, but for the last ones, which the run's end cuts short.
+	if s := rep.SwitchMs; s.Verified < s.Count/2 || s.SeqGaps != 0 || s.TSBack != 0 {
+		t.Errorf("switches = %+v, want most verified, without a seq gap or a timestamp going back", s)
+	}
+	for _, name := range []string{"switch latency", "switch starts", "continuity"} {
+		if c := checkOf(t, rep, name); !c.Checked || !c.Pass {
+			t.Errorf("check %s = %+v, want checked and passed", name, c)
+		}
 	}
 	if rep.Users.Created != 5 || rep.Users.Deleted != 5 {
 		t.Errorf("users = %+v, want 5 created and deleted", rep.Users)
@@ -323,6 +331,83 @@ func TestInterrupted(t *testing.T) {
 	}
 }
 
+// lostAnswer is a transport that loses the answer to the nth sign-up after the server has made the account, as a
+// dropped connection or an interrupt that cancels the request at that moment does; then it calls lost.
+type lostAnswer struct {
+	base http.RoundTripper
+	n    int
+	lost func()
+
+	mu      sync.Mutex
+	signups int
+}
+
+func (l *lostAnswer) RoundTrip(req *http.Request) (*http.Response, error) {
+	res, err := l.base.RoundTrip(req)
+	if err != nil || req.Method != http.MethodPost || req.URL.Path != "/api/v1/auth/register" {
+		return res, err
+	}
+	l.mu.Lock()
+	l.signups++
+	nth := l.signups == l.n
+	l.mu.Unlock()
+	if !nth || res.StatusCode != http.StatusCreated {
+		return res, nil
+	}
+	_ = res.Body.Close()
+	l.lost()
+	return nil, errors.New("the connection dropped before the answer")
+}
+
+// TestLostSignUpAnswer: an account whose sign-up answer never came is deleted all the same, both when the run looks
+// for it at once (a dropped connection: a setup error) and when the teardown finds it (an interrupt).
+func TestLostSignUpAnswer(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		interrupt bool
+		n         int // the sign-up whose answer is lost
+	}{
+		{name: "dropped connection", n: 2},
+		{name: "interrupt", interrupt: true, n: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			srv := startServer(t)
+			var stderr syncBuffer
+			cfg, err := parseFlags([]string{"-server", srv.URL, "-admin", adminName, "-scenario", "smoke", "-login-interval", "0s"},
+				&stderr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.password = logx.Secret(adminPassword)
+			ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
+			defer cancel()
+			lt := newLoadTest(cfg, logx.New(logx.Options{Out: &stderr, Format: "text"}))
+			lt.rt = &lostAnswer{base: lt.rt, n: tc.n, lost: func() {
+				if tc.interrupt {
+					cancel()
+				}
+			}}
+			lt.admin = newRESTClient(lt.origin, lt.rt)
+			rep, err := lt.run(ctx)
+			var se *setupError
+			switch {
+			case tc.interrupt && !errors.Is(err, errInterrupted):
+				t.Errorf("run: %v, want interrupted", err)
+			case !tc.interrupt && !errors.As(err, &se):
+				t.Errorf("run: %v, want a setup error", err)
+			}
+			if rep.Pass || rep.Users != (usersReport{Created: tc.n, Deleted: tc.n}) {
+				t.Errorf("report: pass %v, users %+v, want %d created and deleted\n%s", rep.Pass, rep.Users, tc.n, stderr.String())
+			}
+			if names := usersOf(t, srv); len(names) != 1 || names[0] != adminName {
+				t.Errorf("the server's accounts after the run: %q, want only %s", names, adminName)
+			}
+		})
+	}
+}
+
 // TestUnreachableServer: a server that doesn't answer is a setup error, exit 2, and nothing is left to tear down.
 func TestUnreachableServer(t *testing.T) {
 	t.Parallel()
@@ -379,6 +464,7 @@ func TestUsage(t *testing.T) {
 		{"warm-up too long", []string{"-server", "http://x", "-admin", "a", "-duration", "10s", "-warmup", "10s"}, "-warmup 10s"},
 		{"bad layer", []string{"-server", "http://x", "-admin", "a", "-full", "1920x1080"}, "-full"},
 		{"no bitrate", []string{"-server", "http://x", "-admin", "a", "-preview", "640x360@15"}, "needs a bitrate"},
+		{"layer above level 6.2", []string{"-server", "http://x", "-admin", "a", "-full", "8192x8192@30:8M"}, "level 6.2"},
 		{"decodable high", []string{"-server", "http://x", "-admin", "a", "-decodable", "-profile", "6400"}, "always 42e0"},
 		{"all-high without subscribers", []string{"-server", "http://x", "-admin", "a", "-scenario", "all-high", "-subscribers", "0"}, "needs subscribers"},
 		{"unknown flag", []string{"-nope"}, "flag provided but not defined"},
