@@ -17,7 +17,8 @@ import (
 // bookkeeping of what was retransmitted when; the payloads are the cache's.
 //
 // The publish side needs nothing of this: Pion's NACK generator asks the publisher, and what the publisher sends
-// again reaches the cache, and every DownTrack that forwards the layer, as a late packet (02 §9.1).
+// again reaches the cache, and every DownTrack that forwards the layer, as a late packet (02 §9.1). The pub PC's
+// NACK filter (pubnack.go) stops the requests for a packet once the cache has it.
 
 // rtxItem is one retransmission on its way from the DownTrack's RTCP reader, which decided on it, to the DownTrack's
 // writer.
@@ -114,7 +115,8 @@ func (d *DownTrack) handleNACK(b *binding, pairs []rtcp.NackPair, left *int, now
 //     a lower layer, not more load (the downlink allocator, README S84).
 //
 // The locks are taken one after the other, never inside each other: the DownTrack's for the epochs, each cache's own
-// for the packet, and the NACK state's for the records and the budget.
+// for the packet, and the NACK state's for the records and the budget. No other lock is taken: the budget's rate
+// comes from atomics (rtxRate), and the RTT from one.
 func (d *DownTrack) serveNACKs(b *binding, hits []nackHit, now int64) {
 	var newest *Layer
 	d.mu.Lock()
@@ -182,10 +184,11 @@ func rtxCost(p *packet) int64 { return int64(len(p.payload)) * 8 }
 // the DownTrack's newest epoch, nil before the first. The layer's own measured bitrate stands for "the DownTrack's
 // forwarded bitrate": a DownTrack forwards all of a layer or nothing. The maximum counts because screen video idles
 // far below it and then starts with a frame of hundreds of packets, when the measured rate is still the idle one.
+// Both are atomics (Share.maxBitrate): rtxRate runs for every NACK and takes no lock.
 func (d *DownTrack) rtxRate(l *Layer) int64 {
 	var bps int64
 	if l != nil {
-		bps = max(l.stats.bitrate.Load(), int64(d.share.maxBitrate(l.slot)))
+		bps = max(l.stats.bitrate.Load(), d.share.maxBitrate(l.slot))
 	}
 	return max(bps/rtxShare, rtxMinRate)
 }

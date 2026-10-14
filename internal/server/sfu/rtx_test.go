@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
@@ -598,6 +599,123 @@ func TestRTXRate(t *testing.T) {
 		if got := r.d.rtxRate(c.layer); got != c.want {
 			t.Errorf("%s: %d bit/s, want %d", c.name, got, c.want)
 		}
+	}
+	// The maxima the rate follows are the share's, as SetLimits and UpdateShare leave them: the full layer's under
+	// the cap, the preview layer's, and the Opus bitrate of the preset.
+	r.s.SetLimits(Limits{MaxShareKbps: 2500})
+	if !r.sh.setPreset(PresetMovie) {
+		t.Fatal("the share took no preset")
+	}
+	for _, c := range []struct {
+		slot Slot
+		want int64
+	}{{SlotF, 2_500_000}, {SlotH, 2_500_000}, {SlotQ, previewMaxBitrate}, {SlotAudio, audioBitrateMovie}} {
+		if got := r.sh.maxBitrate(c.slot); got != c.want {
+			t.Errorf("the most layer %s may carry: %d bit/s, want %d", c.slot, got, c.want)
+		}
+	}
+}
+
+// TestPubNACKFilter: the NACKs that Pion's generator sends a publisher go through the pub PC's NACK filter, which
+// takes out what the cache of the track's Layer holds by then (02 §9.5, pubnack.go): the generator never learns of a
+// packet that came back through RTX, and would ask for it nine more times. A NACK left with nothing is not sent.
+// Other RTCP, NACKs about an SSRC the filter has no track of, and a track that feeds no Layer, pass unchanged.
+func TestPubNACKFilter(t *testing.T) {
+	r := newRTXRig(t)
+	r.start(0)
+	// Upstream 500 to 504 arrive, 505 to 507 are lost, 508 and 509 arrive.
+	for range 4 {
+		r.send(deltaPayload, false)
+	}
+	r.seq += 3
+	r.send(deltaPayload, false)
+	r.send(deltaPayload, false)
+	track := &pubTrack{ssrc: r.f.ssrc, kind: webrtc.RTPCodecTypeVideo}
+	track.layer.Store(r.f)
+	f := &nackFilter{}
+	f.add(track)
+
+	var written [][]rtcp.Packet
+	w := f.BindRTCPWriter(interceptor.RTCPWriterFunc(func(pkts []rtcp.Packet, _ interceptor.Attributes) (int, error) {
+		written = append(written, pkts)
+		return len(pkts), nil
+	}))
+	nackOf := func(ssrc uint32, seqs ...uint16) *rtcp.TransportLayerNack {
+		return &rtcp.TransportLayerNack{SenderSSRC: 0x5e, MediaSSRC: ssrc, Nacks: rtcp.NackPairsFromSequenceNumbers(seqs)}
+	}
+	asked := func(p rtcp.Packet) (ssrc uint32, seqs []uint16) {
+		nack, ok := p.(*rtcp.TransportLayerNack)
+		if !ok {
+			return 0, nil
+		}
+		for _, pair := range nack.Nacks {
+			seqs = append(seqs, pair.PacketList()...)
+		}
+		return nack.MediaSSRC, seqs
+	}
+	write := func(pkts ...rtcp.Packet) []rtcp.Packet {
+		t.Helper()
+		before := len(written)
+		if _, err := w.Write(pkts, nil); err != nil {
+			t.Fatal(err)
+		}
+		if len(written) == before {
+			return nil
+		}
+		return written[len(written)-1]
+	}
+
+	// What arrived is taken out; the sender SSRC stays.
+	out := write(nackOf(r.f.ssrc, 503, 505, 506, 507, 509))
+	if len(out) != 1 {
+		t.Fatalf("%d packets written, want one NACK", len(out))
+	}
+	if ssrc, seqs := asked(out[0]); ssrc != r.f.ssrc || !slices.Equal(seqs, []uint16{505, 506, 507}) ||
+		out[0].(*rtcp.TransportLayerNack).SenderSSRC != 0x5e {
+		t.Errorf("the NACK asks for %v of %#x, want 505 to 507 of %#x", seqs, ssrc, r.f.ssrc)
+	}
+	// A NACK for nothing but what arrived is not sent at all.
+	if out := write(nackOf(r.f.ssrc, 500, 504, 508)); out != nil {
+		t.Errorf("a NACK for packets in the cache went out: %v", out)
+	}
+	// 506 comes back on the RTX stream, late: the requests for it stop, those for the others go on.
+	r.f.handleRTP(rtpPkt(506, 90000+3000*6, false, deltaPayload), ProfileHigh, r.now)
+	pli := &rtcp.PictureLossIndication{MediaSSRC: r.f.ssrc}
+	rr := &rtcp.ReceiverReport{SSRC: 0x5e}
+	out = write(rr, nackOf(r.f.ssrc, 505, 506, 507), nackOf(r.f.ssrc, 506), pli)
+	if len(out) != 3 || out[0] != rr || out[2] != pli {
+		t.Fatalf("written %v, want the receiver report, one NACK and the PLI, in that order", out)
+	}
+	if _, seqs := asked(out[1]); !slices.Equal(seqs, []uint16{505, 507}) {
+		t.Errorf("after 506 came back the NACK asks for %v, want 505 and 507", seqs)
+	}
+	// Unchanged: a batch without NACKs, a NACK of an SSRC the PC has no track of, and one of a track that feeds no
+	// Layer (its m-section carries no share).
+	for _, batch := range [][]rtcp.Packet{
+		{pli, rr},
+		{nackOf(0x9999, 500, 501)},
+	} {
+		if out := write(batch...); !slices.Equal(out, batch) {
+			t.Errorf("written %v, want %v as it was", out, batch)
+		}
+	}
+	track.layer.Store(nil)
+	if _, seqs := asked(write(nackOf(r.f.ssrc, 500, 505))[0]); !slices.Equal(seqs, []uint16{500, 505}) {
+		t.Errorf("a track without a Layer: the NACK asks for %v, want 500 and 505", seqs)
+	}
+	track.layer.Store(r.f)
+
+	// The table follows the PC's tracks: a track that ended leaves it, unless a newer one has its SSRC by then.
+	newer := &pubTrack{ssrc: r.f.ssrc, kind: webrtc.RTPCodecTypeVideo}
+	newer.layer.Store(r.f)
+	f.add(newer)
+	f.remove(track)
+	if _, seqs := asked(write(nackOf(r.f.ssrc, 500, 505))[0]); !slices.Equal(seqs, []uint16{505}) {
+		t.Errorf("after an older track of the SSRC ended the NACK asks for %v, want 505", seqs)
+	}
+	f.remove(newer)
+	if _, seqs := asked(write(nackOf(r.f.ssrc, 500, 505))[0]); !slices.Equal(seqs, []uint16{500, 505}) {
+		t.Errorf("after the track ended the NACK asks for %v, want 500 and 505", seqs)
 	}
 }
 

@@ -129,12 +129,16 @@ func checkOriginals(t *testing.T, what string, pkts []sfutest.Packet, want map[i
 // each sequence number of each stream once: the video packets (a viewer's H.264 payload types are the even ones
 // from 96 to 104) whose sequence number modulo 40 is 7, or 20, 21 or 22, and the audio packets (payload type 111)
 // where it is 3 modulo 10. Retransmissions on the RTX stream (the odd payload types) always pass. It also returns a
-// function that reports how many packets of each kind were lost, and how many went out on the RTX stream.
-func mediaLoss(viewer net.Addr) (drop func(sfutest.Direction, net.Addr, []byte) bool, counts func() (video, audio, rtx int)) {
+// function that ends the loss, and one that reports how many packets of each kind were lost, and how many went out
+// on the RTX stream. The filter stays in place after the loss has ended, so that it counts the retransmissions that
+// still answer the last NACKs: a slow machine sends some of them only then.
+func mediaLoss(viewer net.Addr) (drop func(sfutest.Direction, net.Addr, []byte) bool, stop func(),
+	counts func() (video, audio, rtx int)) {
 	var (
 		mu                sync.Mutex
 		lost              = map[[2]uint32]bool{}
 		video, audio, rtx int
+		stopped           bool
 	)
 	to := viewer.String()
 	drop = func(dir sfutest.Direction, peer net.Addr, b []byte) bool {
@@ -148,6 +152,8 @@ func mediaLoss(viewer net.Addr) (drop func(sfutest.Direction, net.Addr, []byte) 
 		switch {
 		case pt >= 97 && pt <= 105 && pt%2 == 1:
 			rtx++
+			return false
+		case stopped:
 			return false
 		case isVideo && (seq%40 == 7 || (seq%40 >= 20 && seq%40 <= 22)):
 		case pt == 111 && seq%10 == 3:
@@ -166,7 +172,12 @@ func mediaLoss(viewer net.Addr) (drop func(sfutest.Direction, net.Addr, []byte) 
 		}
 		return true
 	}
-	return drop, func() (int, int, int) {
+	stop = func() {
+		mu.Lock()
+		defer mu.Unlock()
+		stopped = true
+	}
+	return drop, stop, func() (int, int, int) {
 		mu.Lock()
 		defer mu.Unlock()
 		return video, audio, rtx
@@ -229,7 +240,7 @@ func TestNACKFromCache(t *testing.T) {
 	// Both streams of the first viewer have begun (a receiver doesn't miss what came before the first packet it
 	// got): from here on the SFU's socket loses media on its way to that viewer, for five seconds, about 30 video and
 	// 25 audio packets.
-	drop, lostSoFar := mediaLoss(viewerSocket.LocalAddr())
+	drop, stopLoss, lostSoFar := mediaLoss(viewerSocket.LocalAddr())
 	h.Wire.SetDrop(drop)
 	if err := video.Wait(ctx, func(r *sfutest.Recorder) bool { return len(sfutest.Frames(r.Packets())) >= 150 }); err != nil {
 		t.Fatalf("%v (answer errors %v)", err, viewSig.Errs())
@@ -237,7 +248,7 @@ func TestNACKFromCache(t *testing.T) {
 	if err := audio.Wait(ctx, func(r *sfutest.Recorder) bool { return r.Stats().Packets >= 250 }); err != nil {
 		t.Fatal(err)
 	}
-	h.Wire.SetDrop(nil)
+	stopLoss()
 	lostVideo, lostAudio, _ := lostSoFar()
 	// The last repairs arrive, and a second later the Recorders would count what is still missing as lost.
 	time.Sleep(sfutest.FinalLossAfter + 300*time.Millisecond)
@@ -630,7 +641,8 @@ func TestPaddingNoGaps(t *testing.T) {
 // TestRTXDuplicates is integration 19 of 02 §17. The publisher resends packets it already delivered on its RTX
 // stream, as Chrome does for padding and probes. The SFU drops and counts those copies (02 §9.1): each viewer gets
 // every sequence number once and has nothing to ask for. Then the publisher's link loses packets that no second copy
-// covers: the SFU's NACKs get them resent on the same RTX stream, and those reach every viewer, once.
+// covers: the SFU's NACKs get them resent on the same RTX stream, each once, since the requests stop when the
+// packet is back (the pub PC's NACK filter), and those reach every viewer, once.
 func TestRTXDuplicates(t *testing.T) {
 	h := newHarness(t, sfutest.HarnessOptions{})
 	ctx := testCtx(t)
@@ -732,13 +744,15 @@ func TestRTXDuplicates(t *testing.T) {
 	dropped := lostSoFar()
 	time.Sleep(sfutest.FinalLossAfter + 300*time.Millisecond)
 
-	// Only a NACK brings such a packet back, so each was asked for; and none more than ten times, although Pion's
-	// NACK generator never learns that a packet came back on the RTX stream and would ask for it for as long as its
-	// window holds the sequence number. This publisher resends on every NACK, as a browser nearly does.
+	// Only a NACK brings such a packet back, so each was asked for; and the requests for it stopped once it was
+	// back, although Pion's NACK generator never learns that a packet came back on the RTX stream: the pub PC's NACK
+	// filter takes out what the cache holds. This publisher resends on every NACK, as a browser nearly does, so
+	// without the filter it would have sent each lost packet ten times (pubNACKTries); on loopback it sends each
+	// once, and the bound leaves room for a loaded machine whose readers are late by a tick or two.
 	resent := int(layerStats(t, pub, "f").Retransmitted + layerStats(t, pub, "q").Retransmitted)
-	if st := layerStats(t, pub, "f"); st.NACKs == 0 || resent < dropped || resent > 10*dropped {
-		t.Errorf("the publisher got %d NACKs on f and resent %d packets for %d lost ones; want each asked for, at most "+
-			"10 times", st.NACKs, resent, dropped)
+	if st := layerStats(t, pub, "f"); st.NACKs == 0 || resent < dropped || resent > 3*dropped {
+		t.Errorf("the publisher got %d NACKs on f and resent %d packets for %d lost ones; want each asked for until "+
+			"it came back: at most 3 times on average", st.NACKs, resent, dropped)
 	}
 	for name, c := range viewers {
 		st := c.video.Stats()

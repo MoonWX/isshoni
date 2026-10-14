@@ -70,9 +70,14 @@
 //   - A viewer's NACK is handled on its DownTrack's RTCP reader with three locks, one after the other and never
 //     one inside another: the DownTrack's (which epoch sent that sequence number), the cache's of that epoch's
 //     Layer (is the packet still there), and the DownTrack's NACK state (was it retransmitted just now, or too
-//     often; is there budget). What is to be sent goes to the writer through the RTX queue, with a send that never
-//     blocks. One compound packet has at most 256 sequence numbers looked at, so a viewer can't keep those locks
-//     busy at will.
+//     often; is there budget). No other lock: the budget's rate is read from atomics (the layer's measured bitrate,
+//     SFU.fullMaxBps for the admin's cap, Share.audioBps), so a NACK never waits for SFU.mu or Share.mu and the
+//     signaling calls that hold them. What is to be sent goes to the writer through the RTX queue, with a send that
+//     never blocks. One compound packet has at most 256 sequence numbers looked at, so a viewer can't keep those
+//     locks busy at will.
+//   - The NACKs a pub PC sends its publisher go through the PC's NACK filter, on the goroutine of Pion's NACK
+//     generator, which holds none of its locks then. The filter reads the PC's track table, an atomic pointer that
+//     the Conn's actor replaces when a track comes or goes, and takes each cache's lock for one lookup at a time.
 //   - WriteRTP and WriteRTCP are media calls, not signaling calls: the media goroutines make them, and so may any
 //     actor, also for another Conn's pub PC (a keyframe request). Pion allows them from any goroutine and they
 //     never block. Keyframe requests are throttled per layer by a compare-and-swap, so callers need no lock.
@@ -158,16 +163,19 @@
 //     the packet, and long before the number has its next one. All retransmissions of a DownTrack stay within a
 //     quarter of its layer's bitrate or maximum (at least 200 kbit/s, with a second of that in reserve). The
 //     publish side's copies of packets the cache already has (a browser's redundant RTX) are dropped where they
-//     arrive, and a publisher is asked for a missing packet at most ten times (all ten, also when the first
-//     brought it back: pubNACKTries says what that costs). Padding-only packets are never forwarded and leave no
-//     gap. The sender reports of the layer a DownTrack forwards go on to its viewer with the publisher's NTP time
-//     and the RTP time on the viewer's timeline, every one that arrives and one right after each start of an
-//     epoch; a layer switch keeps that timeline the capture timeline, through both layers' reports, to within a
-//     tick. So a share's audio and video reach a viewer on one clock, the publisher's capture clock;
+//     arrive. A publisher is asked for a missing packet until it is in the Layer's cache, by whichever way it came,
+//     and at most ten times: Pion's NACK generator writes its NACKs through the pub PC's NACK filter (pubnack.go),
+//     which takes out what the cache holds. Padding-only packets are never forwarded and leave no gap. The sender
+//     reports of the layer a DownTrack forwards go on to its viewer with the publisher's NTP time and the RTP time
+//     on the viewer's timeline, every one that arrives and one right after each start of an epoch; a layer switch
+//     keeps that timeline the capture timeline, through both layers' reports, to within a tick. So a share's audio
+//     and video reach a viewer on one clock, the publisher's capture clock;
 //   - events.go, errors.go, types.go, config.go, stats.go, probe.go: the whole interface of 02 §6 and §13;
-//   - api.go: the publish, subscribe and connection-test probe webrtc.APIs on 04's netx.Transport, the
-//     remote-candidate filter (02 §7.3, 01 §17), the selected-pair label and the complete-SDP helper: the SFU never
-//     trickles (02 §7.1–7.3, §7.6);
+//   - pubnack.go: the NACK filter of each pub PC, which keeps Pion's NACK generator from asking a publisher for
+//     packets that the Layer's cache already holds (02 §9.5);
+//   - api.go: the publish, subscribe and connection-test probe webrtc.APIs on 04's netx.Transport (an API of its
+//     own for each pub PC, whose NACK filter knows the PC's tracks), the remote-candidate filter (02 §7.3, 01 §17),
+//     the selected-pair label and the complete-SDP helper: the SFU never trickles (02 §7.1–7.3, §7.6);
 //   - codec.go, h264.go, sdpcheck.go: profiles, the payload-type table and both MediaEngines (02 §8.1–8.2),
 //     keyframe-start detection and the SPS parser (02 §9.1), pub-offer validation and the answer edits (02 §8.4–8.5).
 //

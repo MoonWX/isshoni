@@ -549,7 +549,7 @@ func pubAnswer(t *testing.T) string {
 // pionPubAnswer answers an offer with a new PC of the pub engine: what Pion makes of an offer.
 func pionPubAnswer(t *testing.T, offer string) (webrtc.SessionDescription, error) {
 	t.Helper()
-	m, ir, err := newPubEngine()
+	m, ir, err := testPubEngine()
 	if err != nil {
 		t.Fatal(err)
 	}

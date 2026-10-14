@@ -280,22 +280,14 @@ const (
 	pubNACKSize     = 2048
 	pubNACKInterval = 50 * time.Millisecond
 	pubRRInterval   = time.Second
-	// pubNACKTries is how often the SFU asks a publisher for one missing packet: every pubNACKInterval, so for half a
-	// second. Pion's NACK generator never learns that a packet came back on the RTX stream (Pion's receiver hands
-	// those to the track past the generator), so without a limit it goes on asking for every packet a browser
-	// repaired until the sequence number leaves its window of pubNACKSize packets: 45 times at 900 packets a second,
-	// and well over a thousand times, for more than a minute, on the 30 a second of a still screen. A browser answers
-	// each of those NACKs with the packet again, which the cache then drops as a duplicate (02 §9.1). A packet that
-	// ten requests didn't bring back is of no use to anybody any more: the viewers have asked for a keyframe.
-	//
-	// Ten is a limit, not a cure. All ten requests still go out, whether or not the first brought the packet back,
-	// and a browser answers every one that comes a round trip or more after its last answer: with a round-trip time
-	// of 50 ms or less a sharer sends about ten copies of each packet its uplink lost, at 2% loss some 20% more
-	// uplink, all dropped as duplicates at the cache (TestRTXDuplicates counts them). A lower number is no better: it
-	// takes the repair from publishers far away, whose first retransmission was lost too. What is needed is requests
-	// that stop when the packet arrives: sent by the Layer for the sequence numbers it misses, which the cache's
-	// insert clears (it sees what came back as RTX, since that comes through the track), a round trip apart and at
-	// least 50 ms, in place of this interceptor. No slice of M1 has that yet; it is noted for the integrator.
+	// pubNACKTries is how often the SFU asks a publisher for one missing packet at most: every pubNACKInterval, so
+	// for half a second. The requests for a packet stop as soon as it is in the Layer's cache, by whichever way it
+	// came (the pub PC's NACK filter, pubnack.go); this bounds those for a packet that doesn't come. Pion's NACK
+	// generator would otherwise go on asking for as long as its window of pubNACKSize packets holds the sequence
+	// number: 45 times at 900 packets a second, and well over a thousand times, for more than a minute, on the 30 a
+	// second of a still screen. A packet that ten requests didn't bring back is of no use to anybody any more: the
+	// viewers have asked for a keyframe. A lower number is no better: it takes the repair from publishers far away,
+	// whose first retransmission was lost too.
 	pubNACKTries = 10
 )
 
@@ -329,24 +321,32 @@ var (
 	subEngineSpec = engineSpec{subVideoFB, subAudioFB, opusFmtpSub, subVideoHdrExt, nil}
 )
 
-// newPubEngine builds the publish side's MediaEngine (browser or native → SFU) and its interceptors: a NACK
-// generator, receiver reports and transport-wide CC feedback. No NACK responder, sender reports or stats
-// interceptor: the SFU never sends media on a pub PC and counts packets itself. Built by hand rather than with
-// webrtc.RegisterDefaultInterceptors, so nothing else slips in.
-func newPubEngine() (*webrtc.MediaEngine, *interceptor.Registry, error) {
+// newPubEngine builds the publish side's MediaEngine (browser or native → SFU) and the interceptor registry of one
+// pub PC, whose NACK filter is f (pubInterceptors). Each pub PC gets its own (apis.pubAPI): f knows the tracks of one
+// PC.
+func newPubEngine(f *nackFilter) (*webrtc.MediaEngine, *interceptor.Registry, error) {
 	m, err := newMediaEngine(pubEngineSpec)
 	if err != nil {
 		return nil, nil, err
 	}
-	factories, err := pubInterceptors()
+	ir, err := pubRegistry(f)
 	if err != nil {
 		return nil, nil, err
 	}
-	ir := &interceptor.Registry{}
-	for _, f := range factories {
-		ir.Add(f)
-	}
 	return m, ir, nil
+}
+
+// pubRegistry returns the interceptor registry of one pub PC (pubInterceptors).
+func pubRegistry(f *nackFilter) (*interceptor.Registry, error) {
+	factories, err := pubInterceptors(f)
+	if err != nil {
+		return nil, err
+	}
+	ir := &interceptor.Registry{}
+	for _, factory := range factories {
+		ir.Add(factory)
+	}
+	return ir, nil
 }
 
 // newSubEngine builds the subscribe side's MediaEngine (SFU → viewer) and its interceptor registry, which stays
@@ -360,8 +360,16 @@ func newSubEngine() (*webrtc.MediaEngine, *interceptor.Registry, error) {
 	return m, &interceptor.Registry{}, nil
 }
 
-// pubInterceptors returns the publish side's interceptor factories in registration order.
-func pubInterceptors() ([]interceptor.Factory, error) {
+// pubInterceptors returns the interceptor factories of one pub PC in registration order: the PC's NACK filter f
+// (pubnack.go), then a NACK generator, receiver reports and transport-wide CC feedback (02 §8.1). The filter comes
+// first because Pion's chain hands each interceptor the RTCP writer of those registered before it: so the generator
+// writes its NACKs through the filter. A nil f is a filter that knows no tracks and lets every NACK through. No NACK
+// responder, sender reports or stats interceptor: the SFU never sends media on a pub PC and counts packets itself.
+// Built by hand rather than with webrtc.RegisterDefaultInterceptors, so nothing else slips in.
+func pubInterceptors(f *nackFilter) ([]interceptor.Factory, error) {
+	if f == nil {
+		f = &nackFilter{}
+	}
 	gen, err := nack.NewGeneratorInterceptor(nack.GeneratorSize(pubNACKSize), nack.GeneratorInterval(pubNACKInterval),
 		nack.GeneratorMaxNacksPerPacket(pubNACKTries))
 	if err != nil {
@@ -375,7 +383,7 @@ func pubInterceptors() ([]interceptor.Factory, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sfu: twcc feedback: %w", err)
 	}
-	return []interceptor.Factory{gen, rr, tcc}, nil
+	return []interceptor.Factory{f, gen, rr, tcc}, nil
 }
 
 // newMediaEngine registers the static PT table of 02 §8.1 with one side's feedback, Opus fmtp and header extensions.

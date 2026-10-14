@@ -36,6 +36,9 @@ type pubPC struct {
 	// tracks are the incoming tracks that are still being read: one whose read failed (the PC closed, or Pion stopped
 	// its receiver because an offer made its m-section inactive) has left the table (pubTrackEnded).
 	tracks map[trackKey]*pubTrack
+	// nacks is the PC's NACK filter (pubnack.go), the first of its interceptors: it has the tracks of the table
+	// above by their SSRC, and keeps Pion's NACK generator from asking for what their Layers have cached.
+	nacks *nackFilter
 	// readers are the tracks' read goroutines; each ends with its track, all of them when the PC closes.
 	readers sync.WaitGroup
 }
@@ -52,6 +55,7 @@ type trackKey struct{ mid, rid string }
 type pubTrack struct {
 	key   trackKey
 	kind  webrtc.RTPCodecType
+	ssrc  uint32 // of the track's media stream
 	track *webrtc.TrackRemote
 	recv  *webrtc.RTPReceiver
 
@@ -242,13 +246,20 @@ func (c *Conn) ownsShare(id ShareID) bool {
 	return sh != nil && sh.conn == c
 }
 
-// newPubPC creates the pub PC of a gen. Its Pion callbacks only post to the actor (02 §5.4).
+// newPubPC creates the pub PC of a gen, on an API of its own with the PC's NACK filter (apis.pubAPI). Its Pion
+// callbacks only post to the actor (02 §5.4).
 func (c *Conn) newPubPC(gen uint32) (*pubPC, error) {
-	pc, err := c.sfu.apis.pub.NewPeerConnection(webrtc.Configuration{})
+	nacks := &nackFilter{}
+	api, err := c.sfu.apis.pubAPI(nacks)
 	if err != nil {
 		return nil, err
 	}
-	p := &pubPC{gen: gen, pc: pc, rtcpSSRC: rand.Uint32() | 1, tracks: map[trackKey]*pubTrack{}} //nolint:gosec // not a secret
+	pc, err := api.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		return nil, err
+	}
+	p := &pubPC{gen: gen, pc: pc, tracks: map[trackKey]*pubTrack{}, nacks: nacks}
+	p.rtcpSSRC = rand.Uint32() | 1 //nolint:gosec // not a secret
 	pc.OnTrack(func(track *webrtc.TrackRemote, recv *webrtc.RTPReceiver) {
 		// Pion hands the track over once: if the Conn is closing and drops the post, the PC is closing too.
 		c.post(func() { c.onPubTrack(p, track, recv) })
@@ -295,9 +306,12 @@ func (c *Conn) onPubTrack(p *pubPC, track *webrtc.TrackRemote, recv *webrtc.RTPR
 			break
 		}
 	}
-	t := &pubTrack{key: trackKey{mid, track.RID()}, kind: track.Kind(), track: track, recv: recv}
+	t := &pubTrack{
+		key: trackKey{mid, track.RID()}, kind: track.Kind(), ssrc: uint32(track.SSRC()), track: track, recv: recv,
+	}
 	old := p.tracks[t.key]
 	p.tracks[t.key] = t
+	p.nacks.add(t)
 	c.log.Debug("pub track", "gen", p.gen, "kind", t.kind.String(), "rid", t.key.rid)
 	c.bindTrack(p, t)
 	if old != nil {
@@ -327,6 +341,7 @@ func (c *Conn) onPubTrack(p *pubPC, track *webrtc.TrackRemote, recv *webrtc.RTPR
 // there is nothing left to do.
 func (c *Conn) pubTrackEnded(p *pubPC, t *pubTrack) {
 	t.detach()
+	p.nacks.remove(t)
 	if p.tracks[t.key] == t { // not when a newer track of the same m-section and rid has taken its place
 		delete(p.tracks, t.key)
 		c.log.Debug("pub track ended", "gen", p.gen, "kind", t.kind.String(), "rid", t.key.rid)
