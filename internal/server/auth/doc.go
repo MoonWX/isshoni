@@ -59,16 +59,18 @@
 //     resets the own account this way. CheckPasswordReset and CompletePasswordReset are the public side: the
 //     token is checked before the password rules and the hash, and the completion sets the password and opens a
 //     session in one Write;
-//   - alerts.go: admin alerts (§7.11).
+//   - alerts.go: admin alerts (§7.11);
+//   - janitor.go (README S70): RunJanitor, below.
 //
 // A call that acts for an account takes a store.Actor and reads that account inside its own transaction (actingAs
 // in service.go): the CLI acts as an admin, a user actor has the role its row has at that moment, and an account
 // that is gone or not active is forbidden. A self-service call takes the request's Principal and reads the account
 // and the caller's session the same way (loadSelf): without a live session it is unauthenticated.
 //
-// The janitor (RunJanitor) prunes nothing until its slice fills it in (03 §18 slice 13). The two M2 methods declared
-// so far (AuthenticateBearerToken, DecideUserCode) return a not-implemented error wrapping api internal; the other
-// device-flow methods come with their api DTOs in 03 slice 15.
+// The janitor (README S70; janitor.go): RunJanitor prunes the expired rows of §4.7 through store.DB.Prune at startup
+// and then every hour, until its context ends. The two M2 methods declared so far (AuthenticateBearerToken,
+// DecideUserCode) return a not-implemented error wrapping api internal; the other device-flow methods come with
+// their api DTOs in 03 slice 15.
 //
 // Service errors are *api.Error values with the codes of 03 §12.2: the rules' FieldErrors become validation_failed
 // with a code per field, a refused throttle becomes rate_limited or server_busy with retryAfter, and an unexpected

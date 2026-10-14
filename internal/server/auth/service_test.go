@@ -555,14 +555,4 @@ func TestLaterMethodsSayNotImplemented(t *testing.T) {
 	_, err := e.svc.AuthenticateBearerToken(ctx, "")
 	check("AuthenticateBearerToken", err)
 	check("DecideUserCode", e.svc.DecideUserCode(ctx, p, "", false, m))
-
-	// RunJanitor blocks until its context ends.
-	jctx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	go func() {
-		e.svc.RunJanitor(jctx)
-		close(done)
-	}()
-	cancel()
-	<-done
 }
