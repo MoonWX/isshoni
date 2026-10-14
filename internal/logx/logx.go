@@ -4,7 +4,7 @@
 //   - Secret and SecretBytes redact themselves in logs, fmt output and JSON.
 //   - A safety net replaces the values of attributes with sensitive keys (password, token, sdp, …).
 //   - NewPionLoggerFactory and NewZapBridge route Pion's and certmagic's logs into the same logger, with Pion's
-//     rate-limited and stripped of SDP.
+//     rate-limited, stripped of SDP and with ICE passwords redacted.
 //
 // Attribute names used across the server: component (tls, netx, push, sfu, signal, store, …), user_id, room_id,
 // share_id, conn_id, remote_ip (security events only), route and err (see Err). Usernames, share labels, SDP, ICE
