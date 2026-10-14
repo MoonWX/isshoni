@@ -53,9 +53,11 @@ Dev notes:
 | `task e2e` | Playwright end-to-end tests against the built binary (run `task setup:e2e` once first) |
 | `task clean` | remove build output, `.dev/` and the pinned tools in `.bin/` except `task` (`task tools` builds them again) |
 
-Tasks run through Task's built-in POSIX shell, so they work on macOS, Linux and Windows. `lint:unit`, `test:sh`,
-`deploy:test` and `docker:smoke` need Linux (or containers). A task whose inputs do not exist yet prints a note and
-succeeds.
+Tasks run through Task's built-in POSIX shell, so they work on macOS, Linux and Windows. `lint:unit` needs Linux.
+`test:sh` skips a shell that is not installed (macOS has no busybox; CI runs all three). `deploy:test` and
+`docker:smoke` need Docker; with Docker Desktop on macOS, `docker:smoke` skips the host-network checks it can't
+reach from outside the virtual machine (`deploy/docker/README.md`). A task whose inputs do not exist yet prints a
+note and succeeds.
 
 ## Before you push
 
