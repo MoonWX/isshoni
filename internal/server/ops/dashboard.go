@@ -33,10 +33,16 @@ import (
 //	api.Handle("GET /api/v1/admin/dashboard", httpapi.Admin, …) // d.Snapshot(r.Context())
 //
 // Every part comes from a source: the server's status, the live rooms and the media totals, the accounts, the
-// transfer, the release check, doctor and the process. A source that fails (an error, a panic, or no answer in
-// its time) leaves its section empty (an empty list, zero totals, or an absent object) and adds the alert
-// dashboard.source_failed with params.source naming it; the response never fails for it. The only error of
-// Snapshot is the caller's context: a client that went away gets no half-built document.
+// transfer, the release check, doctor and the process. A source that fails (an error, a panic, or a second that
+// ran out before it returned) leaves its section empty (an empty list, zero totals, or an absent object) and adds
+// the alert dashboard.source_failed with params.source naming it; the response never fails for it. The only error
+// of Snapshot is the caller's context: a client that went away gets no half-built document.
+//
+// A source's second is cooperative: it reaches the source through its context, and nothing cuts off a source that
+// takes no context or does not watch it. Snapshots take turns, so such a source that hung would hold up every
+// dashboard request behind it. Every source must therefore answer promptly by itself: the status, the process,
+// the hub's and the SFU's snapshots, the transfer, the release check and doctor read memory, and the store reads
+// (the rooms' names, the accounts) honor their context.
 
 // TransferSource is the transfer part of the dashboard: *Transfer (04 §11.3).
 type TransferSource interface {
@@ -79,8 +85,8 @@ const (
 	// dashboardCacheFor is how long a snapshot is served again (04 §11.4): however many admin pages poll, the
 	// sources are asked at most once a second.
 	dashboardCacheFor = time.Second
-	// dashboardSourceTimeout bounds each source: the accounts' store read (04 §11.4: 1 s), and the others, which
-	// read memory and never wait.
+	// dashboardSourceTimeout is each source's second, through its context: the accounts' store read (04 §11.4:
+	// 1 s), and the others, which read memory and never wait. A source that returns after it is counted as failed.
 	dashboardSourceTimeout = time.Second
 )
 
@@ -322,7 +328,8 @@ func (d *Dashboard) build(ctx context.Context, now time.Time) api.OpsDashboard {
 
 // callSource runs one source under its own timeout, and turns what makes it fail into an error: the error it
 // returns, a panic (a bug, which costs the section and not the response), or a context that ended before it
-// returned, which makes what it gave a part of the section at best.
+// returned, which makes what it gave a part of the section at best. The timeout is only the source's context:
+// callSource waits for fn to return however long it takes (the dashboard's comment at the top of this file).
 func callSource(ctx context.Context, source string, fn func(context.Context) error) (err error) {
 	ctx, cancel := context.WithTimeout(ctx, dashboardSourceTimeout)
 	defer cancel()

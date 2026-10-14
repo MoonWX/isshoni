@@ -64,10 +64,12 @@
 //     function of GET /api/v1/admin/dashboard: the server's status, the process, the release check's update, the
 //     month's transfer, the live rooms and media totals (LiveSource), the clients counted from the rooms,
 //     doctor's summary and 03's accounts (AccountsSource), with the alerts of every part. A snapshot is served
-//     again for 1 s. A source that fails (an error, a panic, no answer within its second) leaves its section empty
-//     and adds the alert dashboard.source_failed naming it; the response never fails for it. The dashboard adds
-//     two alerts of its own: public_ip.changed, from the addresses the server's last look found, and
-//     tls.renewal_failing, from the certificate's state in the status.
+//     again for 1 s. A source that fails (an error, a panic, or one that honors its context and has not returned
+//     when its 1 s ends) leaves its section empty and adds the alert dashboard.source_failed naming it; the
+//     response never fails for it. The second is cooperative: a source must answer promptly by itself, since
+//     nothing cuts off one that does not watch its context. The dashboard adds two alerts of its own:
+//     public_ip.changed, from the addresses the server's last look found, and tls.renewal_failing, from the
+//     certificate's state in the status.
 //
 // Imports (04 §2): config, logx, version, netx and internal/protocol(/api), plus ops/doctor; never httpapi, store,
 // auth, signal, sfu or sfuplane. The wiring (internal/server) adapts those to the small interfaces declared here,

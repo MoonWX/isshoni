@@ -205,16 +205,43 @@ func releasesURL(raw string) (string, error) {
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return "", fmt.Errorf("ops: release check: updates.release_url: %w", err)
+		// Not url.Parse's error, whose text holds the whole value, credentials and all.
+		return "", fmt.Errorf("ops: release check: updates.release_url is not a URL: %q", RedactURL(raw))
 	}
 	if (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil {
-		return "", fmt.Errorf("ops: release check: updates.release_url must be an http(s) URL without credentials, got %q", raw)
+		return "", fmt.Errorf("ops: release check: updates.release_url must be an http(s) URL without credentials, got %q",
+			RedactURL(raw))
 	}
 	q := u.Query()
 	q.Set("per_page", strconv.Itoa(releasePerPage))
 	u.RawQuery = q.Encode()
 	u.Fragment = ""
 	return u.String(), nil
+}
+
+// RedactURL returns raw for an error or a log line with whatever may be a credential replaced by "xxxxx" (README §4
+// "Logging": passwords are never logged): the whole user info of a URL that has one, since a user name alone can be
+// a token, and in a value that does not parse as a URL with an authority ("user:secret@host" parses as the scheme
+// user), everything between its "://" (or its start) and its last "@". Any other value is returned as it is.
+func RedactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err == nil && u.Opaque == "" {
+		if u.User == nil {
+			return raw
+		}
+		r := *u
+		r.User = url.User("xxxxx")
+		return r.String()
+	}
+	at := strings.LastIndex(raw, "@")
+	if at < 0 {
+		return raw
+	}
+	start := 0
+	if i := strings.Index(raw, "://"); i >= 0 && i < at {
+		start = i + len("://")
+	}
+	return raw[:start] + "xxxxx" + raw[at:]
 }
 
 // sameHostRedirect is the client's redirect policy: follow a redirect only to the host and scheme of the first

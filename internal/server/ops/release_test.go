@@ -1252,6 +1252,28 @@ func TestCleanETag(t *testing.T) {
 	}
 }
 
+// TestRedactURL: what may be a credential in a value of updates.release_url is replaced before the value goes into
+// an error: the user info of a URL, whole, and in a value without an authority, what stands before its last "@".
+func TestRedactURL(t *testing.T) {
+	for raw, want := range map[string]string{
+		"":                                    "",
+		"https://example.org/releases":        "https://example.org/releases",
+		"https://example.org/a@b?x=%41":       "https://example.org/a@b?x=%41", // an "@" in the path is no credential
+		"ftp://example.org/releases":          "ftp://example.org/releases",
+		"https://user:s3cr3t@example.org/r":   "https://xxxxx@example.org/r",
+		"https://s3cr3t@example.org/r":        "https://xxxxx@example.org/r",
+		"https://user:s3cr3t@exa mple.org/r":  "https://xxxxx@exa mple.org/r",  // does not parse
+		"https://u:s3cr3t@example.org:x/r":    "https://xxxxx@example.org:x/r", // a bad port: does not parse
+		"user:s3cr3t@example.org":             "xxxxx@example.org",             // the scheme user and an opaque rest
+		"https://example.org/%zz":             "https://example.org/%zz",       // does not parse, and has no "@"
+		"https://u:s3cr3t@example.org/p#frag": "https://xxxxx@example.org/p#frag",
+	} {
+		if got := RedactURL(raw); got != want {
+			t.Errorf("RedactURL(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
 func TestNewReleaseCheck(t *testing.T) {
 	policy := new(fakePolicy)
 
@@ -1280,9 +1302,15 @@ func TestNewReleaseCheck(t *testing.T) {
 	for _, bad := range []string{
 		"api.github.com/repos/MoonWX/isshoni/releases", "ftp://example.org/releases", "file:///etc/passwd",
 		"https://", "/releases", "https://token@example.org/releases", "https://user:pw@example.org/releases", "ht!tp://x",
+		"https://user:s3cr3t@exa mple.org/releases", "https://s3cr3t@example.org/releases",
 	} {
-		if r, err := NewReleaseCheck(ReleaseCheckOptions{Policy: policy, URL: bad}); err == nil {
+		r, err := NewReleaseCheck(ReleaseCheckOptions{Policy: policy, URL: bad})
+		if err == nil {
 			t.Errorf("NewReleaseCheck(URL %q) succeeded with %s", bad, r.url)
+			continue
+		}
+		if strings.Contains(err.Error(), "s3cr3t") {
+			t.Errorf("NewReleaseCheck(URL %q): the error shows the credentials: %v", bad, err)
 		}
 	}
 

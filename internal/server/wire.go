@@ -1419,7 +1419,8 @@ func (s *Server) wireOps() error {
 
 // releaseURLProblem returns the config error of an updates.release_url that the release check would refuse (not an
 // http or https URL, or one with credentials; 04 §11.5). config keeps the hidden key as it is given; New refuses it
-// with config's own problems, before Start opens anything, so serve exits 78.
+// with config's own problems, before Start opens anything, so serve exits 78. serve prints the problem on stderr,
+// into the journal: its value has the credentials redacted (ops.RedactURL).
 func releaseURLProblem(cfg *config.Config) (config.Problem, bool) {
 	const key = "updates.release_url"
 	if ops.CheckReleasesURL(cfg.Updates.ReleaseURL) == nil {
@@ -1427,7 +1428,7 @@ func releaseURLProblem(cfg *config.Config) (config.Problem, bool) {
 	}
 	return config.Problem{
 		Key:      key,
-		Value:    strconv.Quote(cfg.Updates.ReleaseURL),
+		Value:    strconv.Quote(ops.RedactURL(cfg.Updates.ReleaseURL)),
 		Source:   cfg.Source(key),
 		Severity: config.SeverityError,
 		Message:  "is not an http or https URL without credentials",
@@ -1567,6 +1568,11 @@ type hubSnapshot interface{ Snapshot() signal.LiveSnapshot }
 // sfuSnapshotter is the part of 02's SFU that the dashboard reads.
 type sfuSnapshotter interface{ Snapshot() sfu.Snapshot }
 
+// roomNamesTimeout bounds liveSource's read of the rooms' names from the store: a quarter of the second that the
+// dashboard gives the rooms source (ops), so that a store that is slow to answer leaves the hub's names in a
+// complete section instead of a section dropped as failed.
+const roomNamesTimeout = 250 * time.Millisecond
+
 // liveSource implements ops.LiveSource over 01's hub and 02's SFU (04 §11.4): the hub knows who is in which room
 // with which connections and who wants to watch what; the SFU knows the shares as media (layers, rates, viewers by
 // forwarded quality) and each connection's selected transport and RTT, joined on the connection id. A room's name is
@@ -1596,7 +1602,11 @@ func (l liveSource) Rooms(ctx context.Context) []api.RoomLive {
 	}
 	var names map[string]string
 	if l.names != nil && len(hub.Rooms) > 0 {
-		names, _ = l.names(ctx) // a failed read keeps the hub's names, which at most lag a rename
+		// A failed or slow read keeps the hub's names, which at most lag a rename. Its own budget, well inside the
+		// source's second, makes a slow store cost the names and not the whole section.
+		nctx, cancel := context.WithTimeout(ctx, roomNamesTimeout)
+		names, _ = l.names(nctx)
+		cancel()
 	}
 
 	out := make([]api.RoomLive, 0, len(hub.Rooms))
@@ -1785,28 +1795,37 @@ func (sfuCollector) Describe(ch chan<- *prometheus.Desc) {
 	}
 }
 
-// Collect implements prometheus.Collector: one SFU.Metrics() per scrape.
+// Collect implements prometheus.Collector: one SFU.Metrics() per scrape. A series that can't be built (a label
+// value that is not UTF-8) is an invalid metric, never a panic: the registry gathers in goroutines of its own, where
+// a panic would end the server, and an invalid metric costs only its own series and a WARN line (04 §11.2).
 func (c sfuCollector) Collect(ch chan<- prometheus.Metric) {
 	m := c.sfu.Metrics()
+	emit := func(d *prometheus.Desc, t prometheus.ValueType, v float64, labels ...string) {
+		metric, err := prometheus.NewConstMetric(d, t, v, labels...)
+		if err != nil {
+			metric = prometheus.NewInvalidMetric(d, err)
+		}
+		ch <- metric
+	}
 	gauges := func(d *prometheus.Desc, values map[string]int64) {
 		for label, v := range values {
-			ch <- prometheus.MustNewConstMetric(d, prometheus.GaugeValue, float64(v), label)
+			emit(d, prometheus.GaugeValue, float64(v), label)
 		}
 	}
 	gauges2 := func(d *prometheus.Desc, values map[string]map[string]int64) {
 		for outer, inner := range values {
 			for label, v := range inner {
-				ch <- prometheus.MustNewConstMetric(d, prometheus.GaugeValue, float64(v), outer, label)
+				emit(d, prometheus.GaugeValue, float64(v), outer, label)
 			}
 		}
 	}
 	counters := func(d *prometheus.Desc, values map[string]uint64) {
 		for label, v := range values {
-			ch <- prometheus.MustNewConstMetric(d, prometheus.CounterValue, float64(v), label)
+			emit(d, prometheus.CounterValue, float64(v), label)
 		}
 	}
 	counter := func(d *prometheus.Desc, v uint64) {
-		ch <- prometheus.MustNewConstMetric(d, prometheus.CounterValue, float64(v))
+		emit(d, prometheus.CounterValue, float64(v))
 	}
 
 	gauges(sfuConnsDesc, m.Conns)
@@ -1830,5 +1849,5 @@ func (c sfuCollector) Collect(ch chan<- prometheus.Metric) {
 	counters(sfuDowngradesDesc, m.Downgrades)
 	counters(sfuQueueDropsDesc, m.QueueDrops)
 	counters(sfuHandshakeTimeoutsDesc, m.HandshakeTimeouts)
-	ch <- prometheus.MustNewConstMetric(sfuPacketCacheDesc, prometheus.GaugeValue, float64(m.PacketCacheBytes))
+	emit(sfuPacketCacheDesc, prometheus.GaugeValue, float64(m.PacketCacheBytes))
 }

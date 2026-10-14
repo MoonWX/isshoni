@@ -24,8 +24,9 @@ type Policy interface {
 }
 
 // LiveSource is the live state of the dashboard (04 §11.4): the wiring adapts 01's Hub.Snapshot() and 02's
-// SFU.Snapshot(). Neither can fail; the dashboard counts a source that panics, or does not return within its
-// second (ctx), as failed (dashboard.go).
+// SFU.Snapshot(). Neither can fail; the dashboard counts a source that panics, or that has not returned when the
+// second of its ctx ends, as failed (dashboard.go). That second is only ctx: a method that does not watch it is not
+// cut off, so both must return promptly by themselves.
 type LiveSource interface {
 	// Rooms returns the rooms that have participants, with their connections, shares, layers and viewers.
 	Rooms(ctx context.Context) []api.RoomLive

@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -239,6 +240,30 @@ func TestSFUCollector(t *testing.T) {
 	}
 }
 
+// TestSFUCollectorBadLabel: a series that can't be built (a label value that is not UTF-8) costs only that series,
+// as an error of the scrape, and never panics in the registry's goroutine, where a panic would end the server
+// (04 §11.2).
+func TestSFUCollectorBadLabel(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(sfuCollector{sfu: fakeSFUMetrics{m: sfu.Metrics{
+		Conns:            map[string]int64{"full": 2, "\xff": 1},
+		PacketCacheBytes: 4096,
+	}}})
+	families, err := reg.Gather()
+	if err == nil || !strings.Contains(err.Error(), "isshoni_sfu_conns") {
+		t.Errorf("gather = %v, want the error of the bad isshoni_sfu_conns series", err)
+	}
+	got := map[string]float64{}
+	for _, f := range families {
+		for _, m := range f.GetMetric() {
+			got[f.GetName()] += m.GetGauge().GetValue() + m.GetCounter().GetValue()
+		}
+	}
+	if got["isshoni_sfu_conns"] != 2 || got["isshoni_sfu_packet_cache_bytes"] != 4096 {
+		t.Errorf("the other series = %v, want isshoni_sfu_conns{role=full} 2 and the packet cache's 4096", got)
+	}
+}
+
 type countingSFU struct {
 	fakeSFUMetrics
 	calls int
@@ -383,6 +408,42 @@ func TestLiveSource(t *testing.T) {
 	if got := (liveSource{hub: &fakeHub{}, names: live.names}).Rooms(context.Background()); got == nil || len(got) != 0 {
 		t.Errorf("rooms of an empty hub = %#v, want an empty list", got)
 	}
+
+	// A store that is slow to answer costs the names, not the section: the read has a budget of its own, well
+	// inside the rooms source's second, so the dashboard shows the rooms with the hub's names, counts their
+	// clients, and raises no dashboard.source_failed.
+	synctest.Test(t, func(t *testing.T) {
+		slow := liveSource{hub: hub, media: media, names: func(ctx context.Context) (map[string]string, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}}
+		d := ops.NewDashboard(ops.DashboardOptions{
+			Status:  func(context.Context) (api.ServerStatus, error) { return api.ServerStatus{Version: "0.3.0"}, nil },
+			Live:    slow,
+			Process: func() api.ProcessInfo { return api.ProcessInfo{} },
+			Logger:  discardLog(),
+		})
+		start := time.Now()
+		snap, err := d.Snapshot(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if waited := time.Since(start); waited != roomNamesTimeout {
+			t.Errorf("the snapshot waited %v for the names, want %v", waited, roomNamesTimeout)
+		}
+		if len(snap.Rooms) != 2 || snap.Rooms[0].Name != "Lounge" || snap.Rooms[1].Name != "Movies" ||
+			len(snap.Rooms[0].Participants) != 2 || len(snap.Rooms[0].Shares) != 1 {
+			t.Errorf("rooms behind a slow store = %+v, want both rooms whole with the hub's names", snap.Rooms)
+		}
+		if len(snap.Clients) == 0 {
+			t.Error("no clients counted from the rooms behind a slow store")
+		}
+		for _, a := range snap.Alerts {
+			if a.Code == api.AlertCodeDashboardSourceFailed {
+				t.Errorf("a slow read of the names failed a source: %+v", a)
+			}
+		}
+	})
 }
 
 // TestOpsAdapters: the ops adapters over 03's store and settings and over the push service.
@@ -437,27 +498,37 @@ func TestOpsAdapters(t *testing.T) {
 }
 
 // TestReleaseURLProblem: an updates.release_url that the release check would refuse is a config error (exit 78),
-// and the default and an http(s) URL are none.
+// and the default and an http(s) URL are none. The problem, which serve prints into the journal, never shows the
+// credentials it refuses (README §4 "Logging"), whether the value parses as a URL or not.
 func TestReleaseURLProblem(t *testing.T) {
 	for _, tc := range []struct {
-		url string
-		bad bool
+		url, value string // value: the problem's, when bad
+		bad        bool
 	}{
-		{"", false},
-		{"https://api.github.com/repos/MoonWX/isshoni/releases", false},
-		{"http://127.0.0.1:8080/releases", false},
-		{"ftp://example.com/releases", true},
-		{"https://user:secret@example.com/releases", true},
-		{"/releases", true},
+		{"", "", false},
+		{"https://api.github.com/repos/MoonWX/isshoni/releases", "", false},
+		{"http://127.0.0.1:8080/releases", "", false},
+		{"ftp://example.com/releases", `"ftp://example.com/releases"`, true},
+		{"https://user:secret@example.com/releases", `"https://xxxxx@example.com/releases"`, true},
+		{"https://secret@example.com/releases", `"https://xxxxx@example.com/releases"`, true}, // a token as the user
+		{"https://user:secret@exa mple.com/releases", `"https://xxxxx@exa mple.com/releases"`, true},
+		{"user:secret@example.com", `"xxxxx@example.com"`, true}, // the scheme user, and an opaque rest
+		{"/releases", `"/releases"`, true},
 	} {
 		cfg := loadFlags(t, "--updates.release-url="+tc.url)
 		p, bad := releaseURLProblem(cfg)
-		if bad != tc.bad || (bad && (p.Key != "updates.release_url" || p.Severity != "error")) {
-			t.Errorf("%q: problem %+v, %t; want bad %t", tc.url, p, bad, tc.bad)
+		if bad != tc.bad || (bad && (p.Key != "updates.release_url" || p.Severity != "error" || p.Value != tc.value)) {
+			t.Errorf("%q: problem %+v, %t; want bad %t with the value %s", tc.url, p, bad, tc.bad, tc.value)
+		}
+		if strings.Contains(p.Value, "secret") {
+			t.Errorf("%q: the problem shows the credentials: %s", tc.url, p.Value)
 		}
 		_, err := New(cfg, discardLog(), Deps{})
 		if NeedsOperator(err) != tc.bad {
 			t.Errorf("%q: New = %v, want a refusal %t", tc.url, err, tc.bad)
+		}
+		if err != nil && strings.Contains(err.Error(), "secret") {
+			t.Errorf("%q: New's error shows the credentials: %v", tc.url, err)
 		}
 	}
 }
