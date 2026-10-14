@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -33,8 +34,11 @@ type auditAction struct {
 	// actors are the actor kinds of §10's Actor column that the merged tree writes, each of which TestAuditCoverage
 	// produces: user (an admin or the user), anonymous, cli (the admin socket's commands, store.CLIActor) or system.
 	actors []store.ActorKind
-	target string // the target kind; "" = the action has none (§10's Target column)
-	sec    bool   // a security event (§10's Sec column); settings.changed only when registrationMode changed
+	// targets are the target kinds of §10's Target column, "" for a row without a target, each of which
+	// TestAuditCoverage produces for the actions M1 writes. Two actions have a variant without one: a failed login
+	// names the account only if it exists, and reject all has none.
+	targets []string
+	sec     bool // a security event (§10's Sec column); settings.changed only when registrationMode changed
 	// later is why M1 has no code that writes the action (§10 marks it later); "" for the actions M1 writes.
 	later string
 }
@@ -50,43 +54,43 @@ var (
 
 // auditActions is the table of 03 §10, in its order.
 var auditActions = []auditAction{
-	{action: "setup.token_issued", actors: byCLI},
-	{action: "setup.completed", actors: byUser, target: "user", sec: true},
-	{action: "auth.login", actors: byUser, target: "session"},
-	{action: "auth.login_failed", actors: byAnonymous, target: "user"},
-	{action: "auth.throttled", actors: byAnonymous, sec: true},
-	{action: "auth.logout", actors: byUser, target: "session"},
-	{action: "auth.logout_everywhere", actors: byUser, target: "user"},
-	{action: "auth.password_changed", actors: byUser, target: "user"},
-	{action: "session.revoked", actors: byUser, target: "session"},
-	{action: "user.registered", actors: byUser, target: "user"},
-	{action: "user.signup_requested", actors: byAnonymous, target: "user"},
-	{action: "user.approved", actors: byUser, target: "user"},
-	{action: "user.signup_rejected", actors: byUser, target: "user"},
-	{action: "user.signup_expired", actors: bySystem, target: "user"},
+	{action: "setup.token_issued", actors: byCLI, targets: []string{""}},
+	{action: "setup.completed", actors: byUser, targets: []string{"user"}, sec: true},
+	{action: "auth.login", actors: byUser, targets: []string{"session"}},
+	{action: "auth.login_failed", actors: byAnonymous, targets: []string{"user", ""}},
+	{action: "auth.throttled", actors: byAnonymous, targets: []string{""}, sec: true},
+	{action: "auth.logout", actors: byUser, targets: []string{"session"}},
+	{action: "auth.logout_everywhere", actors: byUser, targets: []string{"user"}},
+	{action: "auth.password_changed", actors: byUser, targets: []string{"user"}},
+	{action: "session.revoked", actors: byUser, targets: []string{"session"}},
+	{action: "user.registered", actors: byUser, targets: []string{"user"}},
+	{action: "user.signup_requested", actors: byAnonymous, targets: []string{"user"}},
+	{action: "user.approved", actors: byUser, targets: []string{"user"}},
+	{action: "user.signup_rejected", actors: byUser, targets: []string{"user", ""}},
+	{action: "user.signup_expired", actors: bySystem, targets: []string{"user"}},
 	// §10 also names the CLI as the actor of a rename and a settings change; M1's admin socket has neither command
 	// (03 §12.6), so only the admin pages write them.
-	{action: "user.renamed", actors: byUser, target: "user"},
-	{action: "user.role_changed", actors: byUserOrCLI, target: "user", sec: true},
-	{action: "user.disabled", actors: byUserOrCLI, target: "user", sec: true},
-	{action: "user.enabled", actors: byUserOrCLI, target: "user"},
-	{action: "user.deleted", actors: byUser, target: "user", sec: true},
-	{action: "user.signed_out", actors: byUser, target: "user"},
-	{action: "user.password_reset_issued", actors: byUserOrCLI, target: "user", sec: true},
-	{action: "user.password_reset_completed", actors: byUser, target: "user"},
-	{action: "invite.created", actors: byUserOrCLI, target: "invite"},
-	{action: "invite.revoked", actors: byUser, target: "invite"},
-	{action: "room.created", actors: byUser, target: "room"},
-	{action: "room.renamed", actors: byUser, target: "room"},
-	{action: "room.deleted", actors: byUser, target: "room"},
-	{action: "settings.changed", actors: byUser, target: "settings", sec: true},
-	{action: "secrets.rotated", actors: bySystem, sec: true},
-	{action: "device.linked", target: "device",
+	{action: "user.renamed", actors: byUser, targets: []string{"user"}},
+	{action: "user.role_changed", actors: byUserOrCLI, targets: []string{"user"}, sec: true},
+	{action: "user.disabled", actors: byUserOrCLI, targets: []string{"user"}, sec: true},
+	{action: "user.enabled", actors: byUserOrCLI, targets: []string{"user"}},
+	{action: "user.deleted", actors: byUser, targets: []string{"user"}, sec: true},
+	{action: "user.signed_out", actors: byUser, targets: []string{"user"}},
+	{action: "user.password_reset_issued", actors: byUserOrCLI, targets: []string{"user"}, sec: true},
+	{action: "user.password_reset_completed", actors: byUser, targets: []string{"user"}},
+	{action: "invite.created", actors: byUserOrCLI, targets: []string{"invite"}},
+	{action: "invite.revoked", actors: byUser, targets: []string{"invite"}},
+	{action: "room.created", actors: byUser, targets: []string{"room"}},
+	{action: "room.renamed", actors: byUser, targets: []string{"room"}},
+	{action: "room.deleted", actors: byUser, targets: []string{"room"}},
+	{action: "settings.changed", actors: byUser, targets: []string{"settings"}, sec: true},
+	{action: "secrets.rotated", actors: bySystem, targets: []string{""}, sec: true},
+	{action: "device.linked", targets: []string{"device"},
 		later: "M2: no M1 code links a device; the device flow is 03 slice 15"},
 	// §10 marks it later, but S58's DELETE /api/v1/me/devices/{id} writes it for any device row. No M1 path links
 	// a device, so TestAuditCoverage inserts one row, as M2's linking would, and revokes it over REST.
-	{action: "device.revoked", actors: byUser, target: "device"},
-	{action: "device.refresh_reused", target: "device", sec: true,
+	{action: "device.revoked", actors: byUser, targets: []string{"device"}},
+	{action: "device.refresh_reused", targets: []string{"device"}, sec: true,
 		later: "M2: no refresh tokens exist before the device flow (03 slice 15)"},
 }
 
@@ -131,6 +135,23 @@ func proxied(a netip.Addr) netip.Addr {
 
 // proxiedText is the IP a row must show for a request from the IPv4 address ip.
 func proxiedText(ip string) string { return proxied(netip.MustParseAddr(ip)).String() }
+
+// targetKind is the target kind of an audit entry, "" when it has none.
+func targetKind(e api.AuditEntry) string {
+	if e.Target == nil {
+		return ""
+	}
+	return e.Target.Kind
+}
+
+// rowShape tells apart the variants of one action: the entry's target kind ("none" without a target) and its detail.
+func rowShape(e api.AuditEntry) string {
+	kind := targetKind(e)
+	if kind == "" {
+		kind = "none"
+	}
+	return kind + " " + fmt.Sprint(e.Detail)
+}
 
 // runJanitor runs the service's janitor until done reports true (its first run, at startup, is due at once), then
 // stops it.
@@ -194,9 +215,13 @@ func TestAuditCoverage(t *testing.T) {
 		action string
 		actor  store.ActorKind // ActorCLI or ActorSystem; "" for a request's row (a user or anonymous)
 		ip     string
+		shape  string // the row's rowShape, for an action with variants; "" = not checked
 	}
 	var wants []want
 	expect := func(action, from string) { wants = append(wants, want{action: action, ip: proxiedText(from)}) }
+	expectShaped := func(action, from, shape string) {
+		wants = append(wants, want{action: action, ip: proxiedText(from), shape: shape})
+	}
 	expectBy := func(action string, actor store.ActorKind) { wants = append(wants, want{action: action, actor: actor}) }
 	ok := func(rec *httptest.ResponseRecorder, status int) {
 		t.Helper()
@@ -218,8 +243,11 @@ func TestAuditCoverage(t *testing.T) {
 	// Logins.
 	decodeBody[api.UserResponse](t, f.login("Alex", testPassword, ip(2)), http.StatusOK)
 	expect("auth.login", ip(2))
+	// A failed login names the account only if it exists, and never the name tried for an unknown one (03 §10).
 	wantError(t, f.login("Alex", "not the password", ip(3)), http.StatusUnauthorized, api.CodeInvalidCredentials)
-	expect("auth.login_failed", ip(3))
+	expectShaped("auth.login_failed", ip(3), "user map[reason:wrong_password]")
+	wantError(t, f.login("Nobody", "not the password", ip(34)), http.StatusUnauthorized, api.CodeInvalidCredentials)
+	expectShaped("auth.login_failed", ip(34), "none map[reason:unknown_user]")
 
 	// Invites and a registration; a second invite is revoked.
 	newInvite := func(addr string) api.CreateInviteResponse {
@@ -262,7 +290,7 @@ func TestAuditCoverage(t *testing.T) {
 	expect("user.approved", ip(12))
 	wantNoContent(t, f.call(http.MethodPost, "/api/v1/admin/approvals/"+pendingID["Lee"]+"/reject", `{}`,
 		with(admin), from(ip(13))))
-	expect("user.signup_rejected", ip(13))
+	expectShaped("user.signup_rejected", ip(13), "user map[]")
 
 	// The admin's user changes.
 	ok(f.patchUser(admin, sam.ID, `{"username":"Samuel"}`, from(ip(14))), http.StatusOK)
@@ -328,12 +356,21 @@ func TestAuditCoverage(t *testing.T) {
 		t.Fatal(err)
 	}
 	expectBy("user.password_reset_issued", store.ActorCLI)
-	if _, _, err := f.svc.CreateInvite(ctx, cli, auth.InviteInput{MaxUses: 1, ExpiresInHours: 24}); err != nil {
+	_, cliInvite, err := f.svc.CreateInvite(ctx, cli, auth.InviteInput{MaxUses: 1, ExpiresInHours: 24})
+	if err != nil {
 		t.Fatal(err)
 	}
 	expectBy("invite.created", store.ActorCLI)
+
+	// The admin deletes Sam's account; Ivy joins with the CLI's invite and deletes her own (03 §7.7).
 	wantNoContent(t, f.call(http.MethodDelete, "/api/v1/admin/users/"+sam.ID, "", with(admin), from(ip(29))))
-	expect("user.deleted", ip(29))
+	expectShaped("user.deleted", ip(29), "user map[self:false]")
+	cliToken, _ := strings.CutPrefix(cliInvite.URL, testOrigin+"/invite#")
+	_, ivy := f.join(cliToken, "Ivy", ip(35))
+	expect("user.registered", ip(35))
+	wantNoContent(t, f.call(http.MethodPost, "/api/v1/me/delete", jsonBody(t, api.DeleteSelfRequest{
+		Password: testPassword}), with(ivy), from(ip(36))))
+	expectShaped("user.deleted", ip(36), "user map[self:true]")
 
 	// Rooms.
 	room := decodeBody[api.RoomResponse](t, f.call(http.MethodPost, "/api/v1/admin/rooms", `{"name":"Games"}`,
@@ -383,9 +420,19 @@ func TestAuditCoverage(t *testing.T) {
 	expectBy("secrets.rotated", store.ActorSystem)
 	wantSecurity("after the rotation, two weeks on") // the rotation alone: the others are older than 7 days
 
-	// Read the whole log over REST, 7 rows a page, and compare it with the store's.
+	// The admin signs in again and finds one new sign-up (the approval mode is still on, and Max's has expired):
+	// reject all (03 §7.9), whose row names no user (03 §10).
 	reader := f.sessionCookie(f.login("Alex", testPassword, ip(33)), thirtyDays)
 	expect("auth.login", ip(33))
+	f.signup("Noa", ip(37))
+	expect("user.signup_requested", ip(37))
+	if res := decodeBody[api.RejectAllResponse](t, f.call(http.MethodPost, "/api/v1/admin/approvals/all/reject",
+		`{"all":true}`, with(reader), from(ip(38))), http.StatusOK); res.Rejected != 1 {
+		t.Fatalf("reject all rejected %d sign-ups, want Noa's alone", res.Rejected)
+	}
+	expectShaped("user.signup_rejected", ip(38), "none map[all:true count:1]")
+
+	// Read the whole log over REST, 7 rows a page, and compare it with the store's.
 	entries := f.auditPages(reader, 7)
 	stored := f.audit()
 	if len(entries) != len(stored) || len(stored) >= 200 {
@@ -406,13 +453,14 @@ func TestAuditCoverage(t *testing.T) {
 			continue
 		}
 		rows[e.Action] = append(rows[e.Action], e)
-		target := ""
-		if e.Target != nil {
-			target = e.Target.Kind
+		if target := targetKind(e); !slices.Contains(a.actors, store.ActorKind(e.Actor.Kind)) ||
+			!slices.Contains(a.targets, target) {
+			t.Errorf("row %d %s: actor %q, target %q; want one of %q and one of %q (03 §10)", e.ID, e.Action,
+				e.Actor.Kind, target, a.actors, a.targets)
 		}
-		if !slices.Contains(a.actors, store.ActorKind(e.Actor.Kind)) || target != a.target {
-			t.Errorf("row %d %s: actor %q, target %q; want one of %q and %q (03 §10)", e.ID, e.Action, e.Actor.Kind,
-				target, a.actors, a.target)
+		// The name tried for an unknown account is never stored (03 §10).
+		if e.Action == "auth.login_failed" && strings.Contains(fmt.Sprint(e), "Nobody") {
+			t.Errorf("row %d %s holds the name tried for an unknown account: %+v", e.ID, e.Action, e)
 		}
 		fromRequest := e.Actor.Kind == string(store.ActorUser) || e.Actor.Kind == string(store.ActorAnonymous)
 		if fromRequest != (e.IP != "") || e.IP != "" && !strings.HasPrefix(e.IP, "2001:db8:") {
@@ -422,9 +470,10 @@ func TestAuditCoverage(t *testing.T) {
 	}
 	for _, w := range wants {
 		if !slices.ContainsFunc(rows[w.action], func(e api.AuditEntry) bool {
-			return e.IP == w.ip && (w.actor == "" || e.Actor.Kind == string(w.actor))
+			return e.IP == w.ip && (w.actor == "" || e.Actor.Kind == string(w.actor)) &&
+				(w.shape == "" || rowShape(e) == w.shape)
 		}) {
-			t.Errorf("no %s row with the IP %q (actor %q)", w.action, w.ip, w.actor)
+			t.Errorf("no %s row with the IP %q (actor %q, shape %q)", w.action, w.ip, w.actor, w.shape)
 		}
 	}
 	for _, a := range auditActions {
@@ -440,6 +489,13 @@ func TestAuditCoverage(t *testing.T) {
 		for _, kind := range a.actors {
 			if !slices.ContainsFunc(rows[a.action], func(e api.AuditEntry) bool { return e.Actor.Kind == string(kind) }) {
 				t.Errorf("03 §10 %s: no row by %s, which the merged tree writes", a.action, kind)
+			}
+		}
+		for _, kind := range a.targets {
+			if a.later == "" && !slices.ContainsFunc(rows[a.action], func(e api.AuditEntry) bool {
+				return targetKind(e) == kind
+			}) {
+				t.Errorf("03 §10 %s: no row with the target %q, which the merged tree writes", a.action, kind)
 			}
 		}
 	}
