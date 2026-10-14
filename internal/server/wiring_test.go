@@ -45,8 +45,11 @@ const (
 	adminPassword = "correct horse battery"
 )
 
-// wiredDeps are the Deps of a server whose accounts a test uses: a small web app and the tests' hash cost.
-func wiredDeps() server.Deps { return server.Deps{SPA: testSPA(), Argon: testArgon} }
+// wiredDeps are the Deps of a server whose accounts a test uses: a small web app, the tests' hash cost, and a fake
+// push service, so that a notification for a subscription that a test wrote never leaves the machine.
+func wiredDeps() server.Deps {
+	return server.Deps{SPA: testSPA(), Argon: testArgon, PushSender: servertest.NewPushService()}
+}
 
 // call sends a request as the web app does: with the site's Origin, and a JSON body (nil for none) under
 // Content-Type: application/json, which every unsafe method needs (03 §7.5).
@@ -206,8 +209,12 @@ func TestSetupLoginJoinLogout(t *testing.T) {
 		t.Fatalf("GET /info = %d %q", res.status, res.body)
 	}
 	if !info.SetupRequired || info.Server.PublicURL != srv.URL || info.Server.Version != version.Version() ||
-		info.Protocol != (api.InfoProtocol{Current: protocol.Version, Min: protocol.MinVersion}) || info.Push != nil {
+		info.Protocol != (api.InfoProtocol{Current: protocol.Version, Min: protocol.MinVersion}) {
 		t.Errorf("/info of a new server = %+v", info)
+	}
+	// Push is on by default (push.enabled), with the VAPID key of secrets.json.
+	if info.Push == nil || info.Push.VAPIDPublicKey != secretIDs(t, srv)["vapid"] || !slices.Contains(info.Features, "push") {
+		t.Errorf("/info of a new server has push %+v and the features %v", info.Push, info.Features)
 	}
 	if res := get(t, srv, "/setup"); res.status != 200 || res.body != indexHTML {
 		t.Errorf("GET /setup before setup = %d", res.status)
@@ -543,6 +550,11 @@ func TestDoctorOverTheAdminSocket(t *testing.T) {
 	}
 	if c := checks["tls"]; c.Status != api.DoctorStatusOK || c.Code != "tls.off" {
 		t.Errorf("tls = %+v, want tls.off", c)
+	}
+	// servertest is a development server (README §6 "Decided after group 7" (3); 04 §13.2): network.include_loopback,
+	// no STUN server, and an off-mode site, which is not the server's address. It has no public address by design.
+	if c := checks["public_ip"]; c.Status != api.DoctorStatusSkip || c.Code != "public_ip.loopback" {
+		t.Errorf("public_ip = %+v, want skip with public_ip.loopback", c)
 	}
 	addrs := srv.Srv.Addrs()
 	ports := checks["ports"]

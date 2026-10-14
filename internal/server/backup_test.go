@@ -102,8 +102,9 @@ func count(t *testing.T, srv *servertest.Server, table string) int {
 	return len(query(t, srv, true, "SELECT 1 FROM "+table))
 }
 
-// seedPush gives the admin's session a push subscription and the server a pending device code: rows that only
-// exist in M1 when something writes them directly (the push endpoints come with README S71, devices with M2).
+// seedPush gives the admin's session a push subscription and the server a pending device code, written directly:
+// device codes come with M2, and the rows are what a backup and a rotation have to deal with, not what a browser
+// would send (push_test.go subscribes through the REST API).
 func seedPush(t *testing.T, srv *servertest.Server) {
 	t.Helper()
 	session := query(t, srv, true, `SELECT s.id, s.user_id FROM sessions s JOIN users u ON u.id = s.user_id WHERE u.username = ?`, adminName)
@@ -726,9 +727,45 @@ func rotateAndRestart(t *testing.T, srv *servertest.Server, in ops.AdminRotateRe
 	return res
 }
 
+// vapidPurges returns what the push service's VAPID fingerprint check deleted at each start that found a rotated key
+// (04 §5.2), from the server's log so far: one count per such start, across restarts.
+func vapidPurges(t *testing.T, srv *servertest.Server) []int {
+	t.Helper()
+	var out []int
+	for line := range strings.Lines(srv.Logs()) {
+		if !strings.Contains(line, `"msg":"the VAPID key changed: deleted every push subscription`) {
+			continue
+		}
+		var rec struct {
+			Component string `json:"component"`
+			Count     int    `json:"count"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil || rec.Component != "push" {
+			t.Fatalf("the purge's log line %q: %+v, %v", line, rec, err)
+		}
+		out = append(out, rec.Count)
+	}
+	return out
+}
+
+// infoVAPID is the VAPID public key that GET /api/v1/info publishes, "" when it has no push object.
+func infoVAPID(t *testing.T, srv *servertest.Server) string {
+	t.Helper()
+	res := call(t, srv, http.MethodGet, "/api/v1/info", nil)
+	var info api.Info
+	if res.status != http.StatusOK || json.Unmarshal([]byte(res.body), &info) != nil {
+		t.Fatalf("GET /info = %d %s", res.status, res.body)
+	}
+	if info.Push == nil {
+		return ""
+	}
+	return info.Push.VAPIDPublicKey
+}
+
 // TestRotateSecrets is the rotation of 04 §17 as `isshoni admin rotate-secrets` asks for it, all four: the server
 // restarts, and before the next one serves its first request the web sessions, the device codes and the invites
-// are gone, and with the sessions the push subscriptions.
+// are gone, and the push subscriptions twice over: the push service, built first, deletes them all because the
+// VAPID key changed (04 §5.2), and the session rotation would have taken them with the sessions anyway.
 func TestRotateSecrets(t *testing.T) {
 	srv := servertest.Start(t, servertest.Options{Deps: wiredDeps()})
 	setUp(t, srv)
@@ -742,6 +779,14 @@ func TestRotateSecrets(t *testing.T) {
 		t.Fatalf("rows before the rotation (sessions, device codes, invites, push): %v", n)
 	}
 	before := secretIDs(t, srv)
+	if got := infoVAPID(t, srv); got != before["vapid"] || got == "" {
+		t.Fatalf("GET /info publishes the VAPID key %q, secrets.json has %q", got, before["vapid"])
+	}
+	fingerprint := query(t, srv, true, `SELECT value FROM meta WHERE key = 'vapid_key_fp'`)
+	if len(fingerprint) != 1 || len(vapidPurges(t, srv)) != 0 {
+		t.Fatalf("the first start: VAPID fingerprint %v, purges %v; want a fingerprint and no purge", fingerprint,
+			vapidPurges(t, srv))
+	}
 	ws := dialWS(t, srv)
 	joinLounge(t, ws, signaltest.DefaultHello())
 
@@ -764,6 +809,17 @@ func TestRotateSecrets(t *testing.T) {
 	// The purge is done when the server is ready: these are the first looks at it.
 	if n := [4]int{count(t, srv, "sessions"), count(t, srv, "device_codes"), count(t, srv, "invites"), count(t, srv, "push_subscriptions")}; n != [4]int{} {
 		t.Errorf("rows after the rotation (sessions, device codes, invites, push): %v, want none", n)
+	}
+	// The push service came first, so it found the subscription and deleted it for the new VAPID key; it keeps that
+	// key's fingerprint, and the browsers subscribe again with the key that GET /info now publishes.
+	if got := vapidPurges(t, srv); !slices.Equal(got, []int{1}) {
+		t.Errorf("the VAPID purges in the log: %v, want one of 1 subscription", got)
+	}
+	if got := query(t, srv, true, `SELECT value FROM meta WHERE key = 'vapid_key_fp'`); len(got) != 1 || reflect.DeepEqual(got, fingerprint) {
+		t.Errorf("the VAPID fingerprint %v after the rotation, %v before; want a new one", got, fingerprint)
+	}
+	if got := infoVAPID(t, srv); got != after["vapid"] {
+		t.Errorf("GET /info publishes the VAPID key %q after the rotation, want the new %q", got, after["vapid"])
 	}
 	if got := whoAmI(t, srv.Client, srv); got != api.CodeUnauthenticated {
 		t.Errorf("the admin's session after the rotation: %s", got)
@@ -797,7 +853,7 @@ func TestRotateSecrets(t *testing.T) {
 
 // TestRotateExactlyTheNamedKeys: a rotation invalidates exactly the tokens of the keys it names (04 §5.2). The
 // invite key takes the links and leaves the sessions; the session key takes the sessions and leaves the links;
-// the resume key takes only the resume tokens.
+// the resume key takes only the resume tokens; the VAPID pair takes the push subscriptions and leaves the sessions.
 func TestRotateExactlyTheNamedKeys(t *testing.T) {
 	srv := servertest.Start(t, servertest.Options{Deps: wiredDeps()})
 	setUp(t, srv)
@@ -831,12 +887,25 @@ func TestRotateExactlyTheNamedKeys(t *testing.T) {
 		t.Error("the rotation of the resume key took an invite, a session or a push subscription")
 	}
 
-	// vapid alone: until the push service is wired (README S71) nothing reads that key, and nothing else goes.
+	// vapid alone: the push subscriptions go, made for a key that is no more (04 §5.2), and nothing else does.
 	vapid := secretIDs(t, srv)["vapid"]
+	if len(vapidPurges(t, srv)) != 0 {
+		t.Errorf("VAPID purges before the VAPID pair was rotated: %v", vapidPurges(t, srv))
+	}
 	rotateAndRestart(t, srv, ops.AdminRotateRequest{VAPID: true})
 	if secretIDs(t, srv)["vapid"] == vapid || !inviteWorks(invite) || whoAmI(t, srv.Client, srv) != adminName {
 		t.Error("the rotation of the VAPID pair: the pair did not change, or an invite or a session went with it")
 	}
+	if n := [2]int{count(t, srv, "sessions"), count(t, srv, "push_subscriptions")}; n != [2]int{1, 0} {
+		t.Errorf("sessions and push subscriptions after the rotation of the VAPID pair: %v, want the session alone", n)
+	}
+	if got := vapidPurges(t, srv); !slices.Equal(got, []int{1}) {
+		t.Errorf("the VAPID purges in the log: %v, want one of 1 subscription", got)
+	}
+	// A subscription for the new key, which the session rotation below takes with the session (seedPush's device code
+	// is still there: only the session key takes those).
+	query(t, srv, false, `DELETE FROM device_codes`)
+	seedPush(t, srv)
 
 	// session: the session and its push subscription go, the invite stays.
 	rotateAndRestart(t, srv, ops.AdminRotateRequest{Keys: []string{"session"}})
@@ -845,6 +914,9 @@ func TestRotateExactlyTheNamedKeys(t *testing.T) {
 	}
 	if n := [2]int{count(t, srv, "sessions"), count(t, srv, "push_subscriptions")}; n != [2]int{} {
 		t.Errorf("sessions and push subscriptions after the rotation of the session key: %v", n)
+	}
+	if got := vapidPurges(t, srv); !slices.Equal(got, []int{1}) {
+		t.Errorf("the VAPID purges in the log at the end: %v, want only the one of the VAPID rotation", got)
 	}
 	if !inviteWorks(invite) {
 		t.Error("the invite went with the session key")
