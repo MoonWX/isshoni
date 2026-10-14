@@ -37,11 +37,46 @@ type publicState struct {
 	local              netip.Addr // the IPv4 of the default route's interface
 	nat                api.NATKind
 	err                string // why the offline detection failed, if it did
+	// unreachable are the addresses the detection gave that no other machine can reach (onlyThisMachine): a
+	// public_ip or public_ipv6 literal such as 127.0.0.1. They are no public addresses, so v4 and v6 leave them
+	// out, and every check judges the server as one without them (README F21).
+	unreachable []netip.Addr
+}
+
+// onlyThisMachine reports an address that no other machine can reach: a loopback address (127.0.0.0/8, ::1) or
+// the unspecified one (0.0.0.0, ::). config accepts such a public_ip literal outside ip mode (04 §4.5), and the
+// server advertises it as it is given (the smoke test's ISSHONI_PUBLIC_IP=127.0.0.1, 06 §11.3), but no friend can
+// connect to it.
+func onlyThisMachine(a netip.Addr) bool {
+	a = a.Unmap()
+	return a.IsLoopback() || a.IsUnspecified()
+}
+
+// addrStrings returns the addresses as text, for a param.
+func addrStrings(addrs []netip.Addr) []string {
+	out := make([]string, len(addrs))
+	for i, a := range addrs {
+		out[i] = a.String()
+	}
+	return out
+}
+
+// dropUnreachable moves the addresses that only this machine can reach out of v4 and v6.
+func (st *publicState) dropUnreachable() {
+	if st.v4.IsValid() && onlyThisMachine(st.v4) {
+		st.unreachable = append(st.unreachable, st.v4)
+		st.v4, st.v4Method = netip.Addr{}, ""
+	}
+	if st.v6.IsValid() && onlyThisMachine(st.v6) {
+		st.unreachable = append(st.unreachable, st.v6)
+		st.v6, st.v6Method = netip.Addr{}, ""
+	}
 }
 
 // publicAddrs returns the public addresses, found once per run. With a running server they are the ones the server
 // started with: its site, its certificate's name and its ICE candidates are built on them, so those are the
-// addresses to judge, and no STUN server is asked again.
+// addresses to judge, and no STUN server is asked again. An address that only this machine can reach is never one
+// of them (onlyThisMachine).
 func (r *run) publicAddrs(ctx context.Context) publicState {
 	r.publicOnce.Do(func() {
 		st := publicState{nat: api.NATKindUnknown}
@@ -56,6 +91,7 @@ func (r *run) publicAddrs(ctx context.Context) publicState {
 			if r.live.NAT != "" {
 				st.nat = r.live.NAT
 			}
+			st.dropUnreachable()
 			r.public = st
 			return
 		}
@@ -75,6 +111,7 @@ func (r *run) publicAddrs(ctx context.Context) publicState {
 		if err != nil {
 			st.err = err.Error()
 		}
+		st.dropUnreachable()
 		r.public = st
 	})
 	return r.public
@@ -102,6 +139,17 @@ func (r *run) loopbackSetup() bool {
 // would differ from one developer's machine to the next). The exception is a site that is the server's address (ip
 // mode, manual mode without a domain): without the address that server is not ready, whatever the setup, so the
 // check runs and fails as everywhere else.
+//
+// Two rules of README F21 (04 §13.2):
+//   - An address that only this machine can reach (a public_ip literal such as 127.0.0.1) is no public address:
+//     the check judges the server as one without it, and names it in the param unreachable.
+//   - In a container on a bridge network, symmetric NAT is no failure. Friends reach the server on the ports the
+//     container runtime publishes on the host, and the server advertises its public address with those port
+//     numbers (04 §7.5); every media flow starts with the browser's packet to such a port, and the server's answers
+//     go back through the same mapping, whatever the bridge's NAT does with connections that start inside the
+//     container (Docker Desktop's and rootless Docker's user-space NAT gives each of them another port). So STUN's
+//     reading of that NAT says nothing about whether friends can connect; the check judges the address as it would
+//     behind a container's 1:1 NAT, with the param dockerBridge.
 func checkPublicIP(ctx context.Context, r *run) result {
 	if r.loopbackSetup() && !r.siteIsAddress() {
 		return skipResult(codePublicIPLoopback, nil)
@@ -120,17 +168,26 @@ func checkPublicIP(ctx context.Context, r *run) result {
 	if pub.local.IsValid() {
 		p["local"] = pub.local.String()
 	}
+	if len(pub.unreachable) > 0 {
+		p["unreachable"] = addrStrings(pub.unreachable)
+	}
+	symmetric := pub.nat == api.NATKindSymmetric
+	if symmetric && pub.v4.IsValid() && r.inContainer() && r.containerNetwork(ctx) == networkBridge {
+		p["dockerBridge"] = true
+		symmetric = false
+	}
 	provider := r.host.Provider
 	switch {
 	case !pub.v4.IsValid() && !pub.v6.IsValid():
 		// No address at all (04 §6.2, §13.2): the server runs and is not ready where its site is its address, and
-		// media has no address to advertise in any mode.
+		// media has no address to advertise in any mode. With an address that only this machine can reach the
+		// server is ready, and nobody else can use it.
 		p["siteIsAddress"], p["running"] = r.siteIsAddress(), !r.offline()
 		if pub.err != "" {
 			p["error"] = pub.err
 		}
 		return failResult(codePublicIPNone, p, fixPublicIPSet)
-	case pub.nat == api.NATKindSymmetric:
+	case symmetric:
 		return failResult(codePublicIPSymmetric, p, fixPublicIPNAT)
 	case pub.nat == api.NATKindCGNATLikely:
 		return failResult(codePublicIPCGNAT, p, fixPublicIPNAT)

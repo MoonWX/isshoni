@@ -58,7 +58,10 @@ const (
 	codeSchemaCorrupt         = "schema.corrupt"          // params: path, error
 	codeSchemaUnreadable      = "schema.unreadable"       // params: path, error
 
-	// The public_ip codes share: ipv4?, ipv4Method?, iface?, ipv6?, ipv6Method?, local?, nat.
+	// The public_ip codes share: ipv4?, ipv4Method?, iface?, ipv6?, ipv6Method?, local?, nat, and from README F21
+	// unreachable? (the addresses that only this machine can reach, which are none of ipv4 and ipv6: a public_ip
+	// literal 127.0.0.1) and dockerBridge? (true: a container on a bridge network whose symmetric NAT the check let
+	// pass, 04 §13.2).
 	codePublicIPOK          = "public_ip.ok"
 	codePublicIPNoIPv6      = "public_ip.no_ipv6"      // info: an IPv4 address only
 	codePublicIPv6Only      = "public_ip.ipv6_only"    // no public IPv4
@@ -439,6 +442,25 @@ func publicIPText(p params) string {
 	return strings.Join(parts, ", ")
 }
 
+// unreachableText names the addresses that only this machine can reach (the param unreachable, README F21), or "".
+func unreachableText(p params) string {
+	addrs := p.list("unreachable")
+	if len(addrs) == 0 {
+		return ""
+	}
+	return and(addrs) + " can only be reached from this machine"
+}
+
+// bridgeNATNote is the line that public_ip adds where it let a container's symmetric NAT pass (the param
+// dockerBridge, README F21), or "".
+func bridgeNATNote(p params) string {
+	if !p.bool("dockerBridge") {
+		return ""
+	}
+	return "\nthe container's bridge network gives each outgoing connection its own port (symmetric NAT), which " +
+		"doesn't matter here: friends reach the published ports"
+}
+
 // tlsSubject is "ip certificate for 203.0.113.7", "certificate for watch.example.com".
 func tlsSubject(p params) string {
 	kind := "certificate"
@@ -581,20 +603,27 @@ var messagesEN = map[string]text{
 		return "can't read " + p.str("path") + ": " + p.str("error")
 	},
 
-	codePublicIPOK: func(p params, _ api.DoctorEnv) string { return publicIPText(p) },
+	codePublicIPOK: func(p params, _ api.DoctorEnv) string { return publicIPText(p) + bridgeNATNote(p) },
 	codePublicIPNoIPv6: func(p params, e api.DoctorEnv) string {
-		if inContainer(e) {
-			return publicIPText(p) + "; IPv6 media off (Docker bridge)"
+		switch {
+		case p.has("unreachable"):
+			return publicIPText(p) + "; no public IPv6 address (" + unreachableText(p) + ")" + bridgeNATNote(p)
+		case inContainer(e):
+			return publicIPText(p) + "; IPv6 media off (Docker bridge)" + bridgeNATNote(p)
 		}
-		return publicIPText(p) + "; no public IPv6 address"
+		return publicIPText(p) + "; no public IPv6 address" + bridgeNATNote(p)
 	},
 	codePublicIPv6Only: func(p params, _ api.DoctorEnv) string {
+		if p.has("unreachable") {
+			return publicIPText(p) + "; no public IPv4 address (" + unreachableText(p) + "), " +
+				"so friends without IPv6 can't connect"
+		}
 		return publicIPText(p) + "; no public IPv4 address, so friends without IPv6 can't connect"
 	},
 	codePublicIPEphemeral: func(p params, _ api.DoctorEnv) string {
 		return publicIPText(p) + "\n" +
 			"The default public IPv4 changes on stop/start; in IP mode that moves the server's address and breaks " +
-			"every link, installed app and push subscription"
+			"every link, installed app and push subscription" + bridgeNATNote(p)
 	},
 	codePublicIPPortForward: func(p params, _ api.DoctorEnv) string {
 		if p.has("local") {
@@ -611,6 +640,14 @@ var messagesEN = map[string]text{
 			"friends can't connect from outside"
 	},
 	codePublicIPNone: func(p params, _ api.DoctorEnv) string {
+		if p.has("unreachable") {
+			// The server has the address it was given and is ready; only this machine can use it (README F21).
+			first := "no public IP address: " + unreachableText(p)
+			if p.bool("siteIsAddress") {
+				return first + "\nthe site is at that address too, so only this machine can open it"
+			}
+			return first + "\nthe site opens, but friends can't share or watch: media has no public address to offer"
+		}
 		first := "no public IP address found (no public address on an interface, no STUN answer)"
 		switch {
 		case p.bool("siteIsAddress") && p.bool("running"):
@@ -1019,7 +1056,20 @@ var fixesEN = map[string]text{
 		return "restore a backup: sudo -u isshoni isshoni admin restore --offline <backup>"
 	},
 
-	fixPublicIPSet: func(_ params, e api.DoctorEnv) string {
+	fixPublicIPSet: func(p params, e api.DoctorEnv) string {
+		if p.has("unreachable") {
+			// The address was given, so the network coming up late is no cause, and a domain alone doesn't replace
+			// it (README F21).
+			if inContainer(e) {
+				return "set ISSHONI_PUBLIC_IP in .env to this server's public address, or leave it empty to detect it, " +
+					"then run docker compose up -d"
+			}
+			out := "set public_ip to this server's public address, or to auto to detect it, then restart isshoni"
+			if cmd := restart(e); cmd != "" {
+				return out + ": " + cmd
+			}
+			return out
+		}
 		if inContainer(e) {
 			return "set ISSHONI_PUBLIC_IP in .env to this server's public address, or set a domain, then run docker compose up -d\n" +
 				"(if the network wasn't up yet when isshoni started: docker compose restart)"
