@@ -29,6 +29,38 @@
       "title": "This server is already set up",
       "body": "An admin account exists. Log in with it, or ask the admin for an invite.",
       "logIn": "Log in"
+    },
+    "welcome": {
+      "conntest": {
+        "title": "Test the connection",
+        "lead": "Video reaches friends over the server's media ports. This checks each of them from where you are now.",
+        "continue": "Continue"
+      },
+      "invite": {
+        "title": "Invite your friends",
+        "lead": "Send this link to the friends you want to watch with. Each of them makes an account with it.",
+        "creating": "Making an invite link…",
+        "failed": "Couldn't make an invite link. {{message}}",
+        "retry": "Try again",
+        "doneFailed": "Couldn't finish the setup. {{message}}",
+        "done": "Done, go to the Lounge"
+      }
+    },
+    "inviteCard": {
+      "label": "Invite link",
+      "copy": "Copy",
+      "copied": "Copied",
+      "copiedSpoken": "Invite link copied",
+      "copyManually": "Couldn't copy for you. The link is selected: copy it yourself.",
+      "share": "Share…",
+      "shareTitle": "Join me on {{server}}",
+      "shareText": "Watch screens together with me on {{server}}.",
+      "shareFailed": "Couldn't open sharing. The link is selected: copy it instead.",
+      "qr": "QR code of the invite link",
+      "qrHint": "Scan it with a phone's camera.",
+      "expiry_one": "Works for {{count}} person, until {{date}}.",
+      "expiry_other": "Works for up to {{count}} people, until {{date}}.",
+      "once": "Copy it now: for safety it can't be shown again. You can always make a new one under <a>Admin → Invites</a>."
     }
   }
 }

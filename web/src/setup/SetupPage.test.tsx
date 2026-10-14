@@ -1,9 +1,10 @@
 // /setup#<token>, step 1 of the wizard (05 §14.1, 03 §7.8) against MSW: the token, setup/check (#7), the
-// create-admin form, setup/complete (#8) with every error code, and where the page goes afterwards.
+// create-admin form, setup/complete (#8) with every error code, and where the page goes afterwards: step 2 on
+// /admin/welcome, whose connection test is a double here (WelcomePage.test.tsx has the rest of the wizard).
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { fragmentTokenKey } from '../app/boot';
 import {
@@ -15,7 +16,6 @@ import {
   onPost,
   PASSWORD_CODES,
   renderPage,
-  ROOM_HEADING,
   typeInto,
   USERNAME_CODES,
   type ErrorRow,
@@ -24,6 +24,15 @@ import {
 import { queryKeys } from '../protocol/queryKeys';
 import { apiError, apiPath, infoFixture, meFixture, server } from '../test/msw';
 import { AFTER_SETUP_PATH } from './SetupPage';
+
+// Step 2 starts the connection test as soon as it shows: here it finds every transport working.
+vi.mock(import('../conntest/runConnTest'), async (importOriginal) => {
+  const { resultFixture } = await import('../conntest/testing');
+  return { ...(await importOriginal()), runConnTest: vi.fn(() => Promise.resolve(resultFixture())) };
+});
+
+/** The heading of the wizard's step 2, where the page goes once the admin exists. */
+const STEP_2 = 'Test the connection';
 
 const TOKEN = 'EXAMPLEsetupTOKEN0123456789abcdef';
 const HEADING = 'Create the admin account';
@@ -59,7 +68,7 @@ async function submitAdmin({ username = 'Alex', password = 'correct horse batter
 }
 
 describe('SetupPage', () => {
-  it('reads the stashed token, checks it, creates the admin and goes to "/"', async () => {
+  it('reads the stashed token, checks it, creates the admin and goes to the connection test', async () => {
     const session = mockSession();
     const checked = checkWorks();
     const completed = completeWorks(session);
@@ -81,10 +90,13 @@ describe('SetupPage', () => {
     );
     await submitAdmin({ serverName: "  Alex's server " });
 
-    expect(await screen.findByRole('heading', { name: ROOM_HEADING })).toBeInTheDocument();
-    // Until the wizard's steps 2–3 exist (S87: /admin/welcome?step=2).
-    expect(AFTER_SETUP_PATH).toBe('/');
-    expect(router.state.location.pathname + router.state.location.search).toBe('/');
+    expect(await screen.findByRole('heading', { name: STEP_2 })).toBeInTheDocument();
+    expect(AFTER_SETUP_PATH).toBe('/admin/welcome?step=2');
+    expect(router.state.location.pathname + router.state.location.search).toBe('/admin/welcome?step=2');
+    // The new admin is past step 1: the stepper shows it done.
+    const steps = within(screen.getByRole('list', { name: 'Setup' })).getAllByRole('listitem');
+    expect(steps[0]).toHaveTextContent('Step 1 of 3, done: Create the admin');
+    expect(steps[1]).toHaveAttribute('aria-current', 'step');
     expect(completed).toEqual([
       { token: TOKEN, username: 'Alex', password: 'correct horse battery', serverName: "Alex's server" },
     ]);
@@ -106,7 +118,7 @@ describe('SetupPage', () => {
     const completed = completeWorks(session);
     renderSetup();
     await submitAdmin();
-    expect(await screen.findByRole('heading', { name: ROOM_HEADING })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: STEP_2 })).toBeInTheDocument();
     expect(completed).toEqual([{ token: TOKEN, username: 'Alex', password: 'correct horse battery' }]);
   });
 
