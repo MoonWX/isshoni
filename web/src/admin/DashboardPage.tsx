@@ -1,10 +1,11 @@
 import { useQuery } from '@tanstack/react-query';
 import type { TFunction } from 'i18next';
 import { CircleAlert, CircleCheck, ExternalLink, Info, TriangleAlert } from 'lucide-react';
-import type { ReactNode } from 'react';
+import { Fragment, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Link } from 'react-router';
 
+import { CommandBlock } from '../app/screens/ScreenFrame';
 import { errorMessage } from '../lib/errorText';
 import { parseWireTime } from '../lib/time';
 import {
@@ -35,8 +36,18 @@ import { dashboardQueryOptions, settingsQueryOptions } from './adminApi';
 import { AdminPage, Empty, Loaded, Section, Tag } from './AdminPage';
 import { actionLabel, actorLabel, refName } from './auditText';
 import styles from './DashboardPage.module.css';
-import { alertText } from './dashboardText';
+import {
+  alertText,
+  certificateFixOf,
+  clientKindName,
+  failedSources,
+  type FailedSources,
+  natName,
+  osName,
+  tlsModeName,
+} from './dashboardText';
 import { DataTable, Lines, Note, Row } from './DataTable';
+import type { FixStep } from './doctorText';
 import { Format } from './format';
 import { usePageVisible } from './usePageVisible';
 import { When } from './When';
@@ -48,8 +59,9 @@ import { When } from './When';
  * the server's version, certificate and addresses, the client versions, doctor's last summary, and the accounts.
  * Until the setup wizard is done (settings.setupWizardDone) a checklist card leads to its steps (05 §14.1).
  *
- * A section whose source failed is empty in the snapshot, and an alert dashboard.source_failed says which; the
- * page shows what it has. A poll that fails keeps the last snapshot on screen and says it is not current.
+ * A section whose source failed is empty in the snapshot, and an alert dashboard.source_failed says which: the
+ * page shows that part as not available, not its zero values. A poll that fails keeps the last snapshot on screen
+ * and says it is not current.
  */
 export function DashboardPage() {
   const { t } = useTranslation();
@@ -135,21 +147,39 @@ function SetupChecklist() {
 }
 
 function Dashboard({ data }: { data: OpsDashboard }) {
+  const failed = failedSources(data);
   return (
     <>
       {data.alerts.length > 0 && <Alerts data={data} />}
-      <Overview data={data} />
-      <LiveRooms rooms={data.rooms} />
+      <Overview data={data} failed={failed} />
+      <LiveRooms rooms={data.rooms} failed={failed} />
       <div className={styles.columns}>
-        <ServerCard data={data} />
+        <ServerCard data={data} failed={failed} />
         <div className={styles.stack}>
-          <DoctorCard data={data} />
-          <ClientsCard data={data} />
+          <DoctorCard data={data} failed={failed} />
+          <ClientsCard data={data} failed={failed} />
         </div>
       </div>
       {data.accounts && <AccountsCard accounts={data.accounts} />}
     </>
   );
+}
+
+/** What a part whose source failed shows instead of its zero values. */
+function Unavailable() {
+  const { t } = useTranslation();
+  return <span className={styles.unavailable}>{t('admin.dashboard.unavailable')}</span>;
+}
+
+/** A fix from doctor's catalog: each step's sentence, and its command to copy when it has one. */
+function FixSteps({ steps, className }: { steps: readonly FixStep[]; className?: string }) {
+  return steps.map((s, i) => (
+    // Steps are positional: the same code gives the same steps in the same order.
+    <Fragment key={i}>
+      <p className={className}>{s.text}</p>
+      {s.command !== undefined && <CommandBlock>{s.command}</CommandBlock>}
+    </Fragment>
+  ));
 }
 
 // ---- alerts ----
@@ -184,7 +214,7 @@ function Alerts({ data }: { data: OpsDashboard }) {
                   <VisuallyHidden>{severityName(alert, t)}: </VisuallyHidden>
                   {text}
                 </p>
-                {fix !== '' && <p className={styles.alertFix}>{fix}</p>}
+                <FixSteps steps={fix} className={styles.alertFix} />
                 {alert.code === AlertCodeDoctorFail && (
                   <Link to="/admin/doctor">{t('admin.dashboard.openDoctor')}</Link>
                 )}
@@ -215,7 +245,7 @@ function Stat({ label, value, detail }: { label: string; value: ReactNode; detai
   );
 }
 
-function Overview({ data }: { data: OpsDashboard }) {
+function Overview({ data, failed }: { data: OpsDashboard; failed: FailedSources }) {
   const { t, i18n } = useTranslation();
   const f = new Format(i18n.language);
   const people = new Set(data.rooms.flatMap((r) => r.participants.map((p) => p.userId))).size;
@@ -223,44 +253,56 @@ function Overview({ data }: { data: OpsDashboard }) {
   const shares = data.rooms.reduce((n, r) => n + r.shares.length, 0);
   const { transfer, media } = data;
   const pcs = media.peerConnections;
+  const roomsOK = !failed.rooms;
+  const transferOK = !failed.transfer;
   return (
     <section aria-label={t('admin.dashboard.overview')}>
       <dl className={styles.stats}>
         <Stat
           label={t('admin.dashboard.stat.sending')}
-          value={f.bitrate(transfer.egressBps)}
-          detail={t('admin.dashboard.stat.receiving', { rate: f.bitrate(transfer.ingressBps) })}
+          value={transferOK ? f.bitrate(transfer.egressBps) : <Unavailable />}
+          detail={
+            transferOK ? t('admin.dashboard.stat.receiving', { rate: f.bitrate(transfer.ingressBps) }) : undefined
+          }
         />
         <Stat
           label={t('admin.dashboard.stat.people')}
-          value={f.number(people)}
-          detail={t('admin.dashboard.stat.connections', { count: connections })}
+          value={roomsOK ? f.number(people) : <Unavailable />}
+          detail={roomsOK ? t('admin.dashboard.stat.connections', { count: connections }) : undefined}
         />
         <Stat
           label={t('admin.dashboard.stat.shares')}
-          value={f.number(shares)}
-          detail={t('admin.dashboard.stat.media', {
-            udp: pcs.udp,
-            tcp443: pcs.tcp443,
-            tcp7882: pcs.tcp7882,
-          })}
-        />
-        <Stat
-          label={t('admin.dashboard.stat.month', { month: f.month(transfer.month) })}
-          value={f.size(transfer.egressBytes)}
+          value={roomsOK ? f.number(shares) : <Unavailable />}
           detail={
-            <Lines>
-              {transfer.projectedEgressBytes !== undefined && (
-                <span>{t('admin.dashboard.stat.projected', { size: f.size(transfer.projectedEgressBytes) })}</span>
-              )}
-              <span>
-                {transfer.alertGb > 0
-                  ? t('admin.dashboard.stat.alertAt', { size: f.gigabytes(transfer.alertGb) })
-                  : t('admin.dashboard.stat.noAlert')}
-              </span>
-            </Lines>
+            failed.media
+              ? undefined
+              : t('admin.dashboard.stat.media', {
+                  udp: pcs.udp,
+                  tcp443: pcs.tcp443,
+                  tcp7882: pcs.tcp7882,
+                })
           }
         />
+        {transferOK ? (
+          <Stat
+            label={t('admin.dashboard.stat.month', { month: f.month(transfer.month) })}
+            value={f.size(transfer.egressBytes)}
+            detail={
+              <Lines>
+                {transfer.projectedEgressBytes !== undefined && (
+                  <span>{t('admin.dashboard.stat.projected', { size: f.size(transfer.projectedEgressBytes) })}</span>
+                )}
+                <span>
+                  {transfer.alertGb > 0
+                    ? t('admin.dashboard.stat.alertAt', { size: f.gigabytes(transfer.alertGb) })
+                    : t('admin.dashboard.stat.noAlert')}
+                </span>
+              </Lines>
+            }
+          />
+        ) : (
+          <Stat label={t('admin.dashboard.stat.monthUnknown')} value={<Unavailable />} />
+        )}
       </dl>
     </section>
   );
@@ -284,9 +326,15 @@ function transportName(transport: string | undefined, t: TFunction): string {
   }
 }
 
-/** "web 0.3.0 on iOS": what a connection is. */
+/** "Web 0.3.0 on iOS": what a connection is. */
 function connectionText(c: ConnectionLive, t: TFunction): string {
-  return t('admin.dashboard.connection', { kind: c.kind, version: c.version, os: c.os });
+  return t('admin.dashboard.connection', { kind: clientKindName(c.kind, t), version: c.version, os: osName(c.os, t) });
+}
+
+/** "over UDP, 38 ms", or "no media yet" for a connection without a selected pair (and so without an RTT). */
+function connectionPath(c: ConnectionLive, t: TFunction): string {
+  if (c.transport === undefined || (c.transport as string) === '') return t('admin.dashboard.transport.none');
+  return t('admin.dashboard.rooms.via', { transport: transportName(c.transport, t), rtt: c.rttMs });
 }
 
 function shareTitle(share: ShareLive, owner: string, t: TFunction): string {
@@ -302,12 +350,16 @@ function shareTitle(share: ShareLive, owner: string, t: TFunction): string {
   }
 }
 
-function LiveRooms({ rooms }: { rooms: readonly RoomLive[] }) {
+function LiveRooms({ rooms, failed }: { rooms: readonly RoomLive[]; failed: FailedSources }) {
   const { t } = useTranslation();
   const live = rooms.filter((r) => r.participants.length > 0 || r.shares.length > 0);
   return (
     <Section title={t('admin.dashboard.rooms.title')}>
-      {live.length === 0 ? (
+      {failed.rooms ? (
+        <p>
+          <Unavailable />
+        </p>
+      ) : live.length === 0 ? (
         <Empty>{t('admin.dashboard.rooms.empty')}</Empty>
       ) : (
         <div className={styles.rooms}>
@@ -352,13 +404,7 @@ function LiveRoom({ room }: { room: RoomLive }) {
                   {p.connections.map((c) => (
                     <span key={c.id}>
                       {connectionText(c, t)}
-                      <Note>
-                        {' '}
-                        {t('admin.dashboard.rooms.via', {
-                          transport: transportName(c.transport, t),
-                          rtt: c.rttMs,
-                        })}
-                      </Note>
+                      <Note> {connectionPath(c, t)}</Note>
                     </span>
                   ))}
                 </Lines>,
@@ -437,87 +483,35 @@ function Fact({ term, children }: { term: string; children: ReactNode }) {
   );
 }
 
-function ServerCard({ data }: { data: OpsDashboard }) {
+function ServerCard({ data, failed }: { data: OpsDashboard; failed: FailedSources }) {
   const { t, i18n } = useTranslation();
   const f = new Format(i18n.language);
   const { server } = data;
-  const { tls } = server;
+  // Without the server's status the snapshot has only the version (its own) and the parts of other sources: the
+  // rest would be zero values (a start in year 1, a certificate of no mode, no address).
+  const statusOK = !failed.server;
   return (
     <Section title={t('admin.dashboard.server.title')}>
       <dl className={styles.facts}>
         <Fact term={t('admin.dashboard.server.version')}>{server.version}</Fact>
-        <Fact term={t('admin.dashboard.server.started')}>
-          <When at={server.startedAt} mode="relative" fallback={t('admin.unknown')} />
-        </Fact>
-        <Fact term={t('admin.dashboard.server.origin')}>
-          {server.origin === '' ? t('admin.unknown') : server.origin}
-        </Fact>
-        <Fact term={t('admin.dashboard.server.tls')}>
-          {tls.mode === TLSModeOff ? (
-            t('admin.dashboard.server.tlsOff')
-          ) : (
+        {statusOK && <ServerStatusFacts data={data} />}
+        {!failed.process && (
+          <Fact term={t('admin.dashboard.server.process')}>
             <Lines>
-              <span>
-                {tls.names.length > 0
-                  ? t('admin.dashboard.server.tlsFor', { mode: tls.mode, names: f.list(tls.names) })
-                  : tls.mode}{' '}
-                {tls.ready ? (
-                  <Tag tone="success">{t('admin.dashboard.server.tlsReady')}</Tag>
-                ) : (
-                  <Tag tone="warning">{t('admin.dashboard.server.tlsNotReady')}</Tag>
-                )}
-              </span>
-              {tls.notAfter !== undefined && (
-                <Note>
-                  {tls.nextRenewal !== undefined
-                    ? t('admin.dashboard.server.tlsValidRenews', {
-                        notAfter: f.date(tls.notAfter),
-                        nextRenewal: f.date(tls.nextRenewal),
-                      })
-                    : t('admin.dashboard.server.tlsValid', { notAfter: f.date(tls.notAfter) })}
-                </Note>
+              {/* A platform without the process's numbers (macOS) reports 0. */}
+              {server.process.rssBytes > 0 && (
+                <span>{t('admin.dashboard.server.memory', { size: f.size(server.process.rssBytes) })}</span>
               )}
-              {tls.lastErrorCode !== undefined && tls.lastErrorCode !== '' && (
-                <Note>{t('admin.dashboard.server.tlsLastError', { code: tls.lastErrorCode })}</Note>
-              )}
+              <Note>
+                {t('admin.dashboard.server.cpu', {
+                  seconds: f.number(server.process.cpuSeconds, 1),
+                  cpus: server.process.numCpu,
+                  goroutines: server.process.goroutines,
+                })}
+              </Note>
             </Lines>
-          )}
-        </Fact>
-        <Fact term={t('admin.dashboard.server.publicIp')}>
-          <Lines>
-            <span>{server.publicIpv4 === '' ? t('admin.dashboard.server.noIpv4') : server.publicIpv4}</span>
-            {server.publicIpv6 !== '' && <span>{server.publicIpv6}</span>}
-            <Note>{t('admin.dashboard.server.nat', { nat: server.nat })}</Note>
-          </Lines>
-        </Fact>
-        <Fact term={t('admin.dashboard.server.media')}>
-          {server.advertised.length === 0 ? (
-            t('admin.dashboard.server.noMedia')
-          ) : (
-            <Lines>
-              {server.advertised.map((a) => (
-                <span key={`${a.proto} ${a.addr} ${a.via}`}>
-                  {a.addr} <Note>{transportName(a.via, t)}</Note>
-                </span>
-              ))}
-            </Lines>
-          )}
-        </Fact>
-        <Fact term={t('admin.dashboard.server.process')}>
-          <Lines>
-            {/* A platform without the process's numbers (macOS) reports 0. */}
-            {server.process.rssBytes > 0 && (
-              <span>{t('admin.dashboard.server.memory', { size: f.size(server.process.rssBytes) })}</span>
-            )}
-            <Note>
-              {t('admin.dashboard.server.cpu', {
-                seconds: f.number(server.process.cpuSeconds, 1),
-                cpus: server.process.numCpu,
-                goroutines: server.process.goroutines,
-              })}
-            </Note>
-          </Lines>
-        </Fact>
+          </Fact>
+        )}
         {server.update && (
           <Fact term={t('admin.dashboard.server.update')}>
             <Lines>
@@ -532,16 +526,113 @@ function ServerCard({ data }: { data: OpsDashboard }) {
           </Fact>
         )}
       </dl>
+      {!statusOK && (
+        <p>
+          <Unavailable />
+        </p>
+      )}
     </Section>
   );
 }
 
-function DoctorCard({ data }: { data: OpsDashboard }) {
+/** The facts of the server's status: its start, address, certificate, public addresses and media addresses. */
+function ServerStatusFacts({ data }: { data: OpsDashboard }) {
+  const { t } = useTranslation();
+  const { server } = data;
+  return (
+    <>
+      <Fact term={t('admin.dashboard.server.started')}>
+        <When at={server.startedAt} mode="relative" fallback={t('admin.unknown')} />
+      </Fact>
+      <Fact term={t('admin.dashboard.server.origin')}>{server.origin === '' ? t('admin.unknown') : server.origin}</Fact>
+      <Fact term={t('admin.dashboard.server.tls')}>
+        <Certificate data={data} />
+      </Fact>
+      <Fact term={t('admin.dashboard.server.publicIp')}>
+        <Lines>
+          <span>{server.publicIpv4 === '' ? t('admin.dashboard.server.noIpv4') : server.publicIpv4}</span>
+          {server.publicIpv6 !== '' && <span>{server.publicIpv6}</span>}
+          <Note>{t('admin.dashboard.server.nat', { nat: natName(server.nat, t) })}</Note>
+        </Lines>
+      </Fact>
+      <Fact term={t('admin.dashboard.server.media')}>
+        {server.advertised.length === 0 ? (
+          t('admin.dashboard.server.noMedia')
+        ) : (
+          <Lines>
+            {server.advertised.map((a) => (
+              <span key={`${a.proto} ${a.addr} ${a.via}`}>
+                {a.addr} <Note>{transportName(a.via, t)}</Note>
+              </span>
+            ))}
+          </Lines>
+        )}
+      </Fact>
+    </>
+  );
+}
+
+/**
+ * The certificate: its kind and names, whether it is served, its dates, and its last error with doctor's fix for
+ * it (04 §8.7, §18). A manual certificate that can't be read, or a first order that failed, raises no alert: this
+ * is where the admin reads what went wrong.
+ */
+function Certificate({ data }: { data: OpsDashboard }) {
+  const { t, i18n } = useTranslation();
+  const f = new Format(i18n.language);
+  const { tls } = data.server;
+  if (tls.mode === TLSModeOff) return t('admin.dashboard.server.tlsOff');
+  const kind = tlsModeName(tls.mode, t);
+  const code = tls.lastErrorCode ?? '';
+  return (
+    <div className={styles.certificate}>
+      <span>
+        {tls.names.length > 0 ? t('admin.dashboard.server.tlsFor', { mode: kind, names: f.list(tls.names) }) : kind}{' '}
+        {tls.ready ? (
+          <Tag tone="success">{t('admin.dashboard.server.tlsReady')}</Tag>
+        ) : (
+          <Tag tone="warning">{t('admin.dashboard.server.tlsNotReady')}</Tag>
+        )}
+      </span>
+      {tls.notAfter !== undefined && (
+        <Note>
+          {tls.nextRenewal !== undefined
+            ? t('admin.dashboard.server.tlsValidRenews', {
+                notAfter: f.date(tls.notAfter),
+                nextRenewal: f.date(tls.nextRenewal),
+              })
+            : t('admin.dashboard.server.tlsValid', { notAfter: f.date(tls.notAfter) })}
+        </Note>
+      )}
+      {code !== '' && <CertificateError data={data} code={code} />}
+    </div>
+  );
+}
+
+function CertificateError({ data, code }: { data: OpsDashboard; code: string }) {
+  const { t, i18n } = useTranslation();
+  const steps = certificateFixOf(code, data, t, i18n.language);
+  return (
+    <div className={styles.certificateError}>
+      <Note>
+        {t('admin.dashboard.server.tlsLastError')} <When at={data.server.tls.lastErrorAt} mode="relative" />
+      </Note>
+      {/* A code this build can't read (no certificate code at all) is still precise. */}
+      {steps.length > 0 ? <FixSteps steps={steps} /> : <p>{code}</p>}
+    </div>
+  );
+}
+
+function DoctorCard({ data, failed }: { data: OpsDashboard; failed: FailedSources }) {
   const { t } = useTranslation();
   const d = data.doctor;
   return (
     <Section title={t('admin.dashboard.doctor.title')}>
-      {d ? (
+      {failed.doctor ? (
+        <p>
+          <Unavailable />
+        </p>
+      ) : d ? (
         <>
           <p>
             {t('admin.dashboard.doctor.ran')} <When at={d.ranAt} mode="relative" />
@@ -564,11 +655,16 @@ function DoctorCard({ data }: { data: OpsDashboard }) {
   );
 }
 
-function ClientsCard({ data }: { data: OpsDashboard }) {
+function ClientsCard({ data, failed }: { data: OpsDashboard; failed: FailedSources }) {
   const { t } = useTranslation();
   return (
     <Section title={t('admin.dashboard.clients.title')}>
-      {data.clients.length === 0 ? (
+      {/* The clients are counted from the rooms. */}
+      {failed.rooms ? (
+        <p>
+          <Unavailable />
+        </p>
+      ) : data.clients.length === 0 ? (
         <p className={styles.muted}>{t('admin.dashboard.clients.empty')}</p>
       ) : (
         <DataTable
@@ -583,7 +679,7 @@ function ClientsCard({ data }: { data: OpsDashboard }) {
             <Row
               key={`${c.kind} ${c.version}`}
               cells={[
-                c.kind,
+                clientKindName(c.kind, t),
                 <>
                   {c.version} {c.outdated && <Tag tone="warning">{t('admin.dashboard.clients.outdated')}</Tag>}
                 </>,

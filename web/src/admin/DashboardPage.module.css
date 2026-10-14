@@ -20,6 +20,13 @@
   color: var(--color-text-muted);
 }
 
+/* A part whose source failed: a note, not a value, also where a value would be large (a stat). */
+.unavailable {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-normal);
+  color: var(--color-text-muted);
+}
+
 /* ---- setup checklist ---- */
 
 .checklist {
@@ -258,6 +265,24 @@
 .fact dd {
   min-width: 0;
   overflow-wrap: anywhere;
+}
+
+.certificate {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  align-items: flex-start;
+}
+
+.certificateError {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  align-self: stretch;
+  padding-inline-start: var(--space-3);
+  margin-top: var(--space-1);
+  text-wrap: pretty;
+  border-inline-start: 3px solid var(--color-warning);
 }
 
 .counts {

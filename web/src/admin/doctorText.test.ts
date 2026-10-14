@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { i18n } from '../i18n';
 import type { DoctorCheck, DoctorEnv, DoctorReport } from '../protocol/api.gen';
 import {
+  certificateFix,
   checkFix,
   checkLinks,
   checkMessage,
@@ -302,6 +303,45 @@ describe('checkFix', () => {
       {
         text: "The certificate authority refused or could not be reached. The server's log has its answer:",
         command: 'journalctl -u isshoni',
+      },
+    ]);
+  });
+
+  it('gives a certificate code’s fix without a report, with no command that depends on how the server runs', () => {
+    const cert = (code: string, params: Record<string, unknown> = { mode: 'auto', names: ['watch.example.com'] }) =>
+      certificateFix(code, params, t, LANG);
+    // The log's command is the env's: without one the sentence ends where the command would have come.
+    expect(cert('tls.rate_limited')).toEqual([
+      {
+        text: "Let's Encrypt's rate limit was reached. If you reinstalled, restore certmagic/ from a backup. The server's log says until when.",
+      },
+    ]);
+    expect(cert('tls.acme_failed')).toEqual([
+      { text: "The certificate authority refused or could not be reached. The server's log has its answer." },
+    ]);
+    expect(cert('tls.brand_new')).toEqual(cert('tls.acme_failed'));
+    // A command that is the same everywhere stays.
+    expect(cert('tls.cert_unreadable', { mode: 'manual', names: [] })).toEqual([
+      {
+        text: "isshoni can't read tls.cert_file or tls.key_file. Check the paths, and let the user that isshoni runs as read both, for example:",
+        command: 'sudo chgrp isshoni <file> && sudo chmod 640 <file>',
+      },
+    ]);
+    // The address only where it is known.
+    expect(cert('tls.dns_missing')).toEqual([
+      { text: "watch.example.com doesn't resolve. Add an A record pointing to this server." },
+    ]);
+    expect(cert('tls.dns_missing', { mode: 'auto', names: ['watch.example.com'], ip: '203.0.113.7' })).toEqual([
+      { text: "watch.example.com doesn't resolve. Add an A record pointing to 203.0.113.7." },
+    ]);
+    // Not a certificate code: nothing to say.
+    expect(cert('public_ip.fix_set')).toEqual([]);
+    expect(cert('')).toEqual([]);
+    // checkFix, with a report, still names the command.
+    expect(fix({ id: 'tls', code: 'tls.renewal_failing', fixCode: 'tls.rate_limited' }, DOCKER)).toEqual([
+      {
+        text: "Let's Encrypt's rate limit was reached. If you reinstalled, restore certmagic/ from a backup. The server's log says until when:",
+        command: 'docker compose logs isshoni',
       },
     ]);
   });

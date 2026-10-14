@@ -4,7 +4,7 @@ import { screen, within } from '@testing-library/react';
 import { HttpResponse } from 'msw';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { Alert, OpsDashboard } from '../protocol/api.gen';
+import type { Alert, OpsDashboard, ServerInfo, TLSInfo } from '../protocol/api.gen';
 import { apiError, meFixture } from '../test/msw';
 import { DASHBOARD_POLL_MS } from './adminApi';
 import {
@@ -15,6 +15,7 @@ import {
   renderAdmin,
   serve,
   settingsResponse,
+  without,
 } from './testing/harness';
 
 /** Serves the dashboard (a fresh generatedAt on every request) and the settings. */
@@ -34,6 +35,39 @@ async function openDashboard(snapshot?: () => OpsDashboard, setupWizardDone = tr
   await screen.findByRole('heading', { level: 1, name: 'Dashboard' });
   await screen.findByText('Sending now');
   return { gets, ...page };
+}
+
+/** The fixture with some of the server object's fields replaced. */
+function withServer(server: Partial<ServerInfo>, overrides: Partial<OpsDashboard> = {}): () => OpsDashboard {
+  return () => {
+    const d = opsDashboard(overrides);
+    return { ...d, server: { ...d.server, ...server } };
+  };
+}
+
+/** The texts of the alerts, as the page shows them (the first paragraph of each). */
+function alertTexts(): (string | undefined)[] {
+  const items = within(screen.getByRole('region', { name: 'Alerts' })).getAllByRole('listitem');
+  return items.map((li) => li.querySelector('p')?.textContent ?? undefined);
+}
+
+/** The ten certificate codes of 04 §8.7: none of them is text an admin reads. */
+const CERTIFICATE_CODE =
+  /tls\.(acme_unreachable|dns_missing|dns_wrong|rate_limited|ip_rejected|caa_forbids|acme_failed|cert_unreadable|cert_invalid|cert_expired)/;
+
+/** What the server sends for a section whose source failed (Go's zero values, 04 §11.4). */
+const ZERO_SERVER: Partial<ServerInfo> = {
+  startedAt: '0001-01-01T00:00:00.000Z',
+  origin: '',
+  tls: { mode: '' as ServerInfo['tls']['mode'], names: [], ready: false },
+  publicIpv4: '',
+  publicIpv6: '',
+  nat: '' as ServerInfo['nat'],
+  advertised: [],
+};
+
+function sourceFailed(...sources: string[]): Alert[] {
+  return sources.map((source) => ({ code: 'dashboard.source_failed', severity: 'warn', params: { source } }));
 }
 
 let visibility: DocumentVisibilityState = 'visible';
@@ -95,7 +129,7 @@ describe('DashboardPage', () => {
 
     const people = within(lounge).getByRole('table', { name: 'People in Lounge' });
     const sam = within(people).getByRole('row', { name: /^sam/ });
-    expect(sam).toHaveTextContent('web 0.3.0 on ios');
+    expect(sam).toHaveTextContent('Web 0.3.0 on iOS');
     expect(sam).toHaveTextContent('over TCP 443, 61 ms');
     expect(sam).toHaveTextContent('1 share');
     expect(within(people).getByRole('row', { name: /^alex/ })).toHaveTextContent('Nothing');
@@ -114,9 +148,10 @@ describe('DashboardPage', () => {
     const server = screen.getByRole('region', { name: 'Server' });
     expect(server).toHaveTextContent('Version0.3.0');
     expect(server).toHaveTextContent('Addresshttps://203.0.113.7');
-    expect(server).toHaveTextContent('ip for 203.0.113.7');
+    expect(server).toHaveTextContent("Let's Encrypt IP certificate for 203.0.113.7");
     expect(within(server).getByText('Ready')).toBeInTheDocument();
     expect(server).toHaveTextContent('Valid until Oct 5, 2026, renews on Oct 2, 2026');
+    expect(server).toHaveTextContent('NAT: none');
     expect(server).toHaveTextContent('203.0.113.7:7882 UDP');
     expect(server).toHaveTextContent('187 MB of memory');
 
@@ -127,7 +162,7 @@ describe('DashboardPage', () => {
     expect(within(doctor).getByRole('link', { name: 'Open Doctor' })).toHaveAttribute('href', '/admin/doctor');
 
     const clients = screen.getByRole('region', { name: 'App versions' });
-    expect(within(clients).getByRole('row', { name: /^web/ })).toHaveTextContent('web0.3.0 2');
+    expect(within(clients).getByRole('row', { name: /^Web/ })).toHaveTextContent('Web0.3.0 2');
   });
 
   it('says that doctor hasn’t run yet, and shows an outdated app', async () => {
@@ -223,6 +258,237 @@ describe('DashboardPage', () => {
       'href',
       '/admin/doctor',
     );
+  });
+
+  it('says what went wrong with a manual certificate, in doctor’s words, not as a code', async () => {
+    await openDashboard(
+      withServer({
+        tls: {
+          mode: 'manual',
+          names: ['watch.example.com'],
+          ready: false,
+          lastErrorCode: 'tls.cert_unreadable',
+          lastErrorAt: '2026-09-29T20:10:00.000Z',
+        },
+      }),
+    );
+    const server = screen.getByRole('region', { name: 'Server' });
+    expect(server).toHaveTextContent('Your own certificate for watch.example.com');
+    expect(within(server).getByText('Not ready')).toBeInTheDocument();
+    expect(server).toHaveTextContent(
+      "isshoni can't read tls.cert_file or tls.key_file. Check the paths, and let the user that isshoni runs as " +
+        'read both, for example:',
+    );
+    expect(within(server).getByText('sudo chgrp isshoni <file> && sudo chmod 640 <file>')).toBeInTheDocument();
+    expect(
+      within(server)
+        .getByText(/^Last error/)
+        .querySelector('time'),
+    ).toHaveAttribute('datetime', '2026-09-29T20:10:00.000Z');
+    expect(server).not.toHaveTextContent(CERTIFICATE_CODE);
+    // A manual certificate raises no alert: the card is where the admin reads it.
+    expect(screen.queryByRole('region', { name: 'Alerts' })).not.toBeInTheDocument();
+  });
+
+  it('says why a first certificate order failed, with the address when there is one', async () => {
+    const tls: TLSInfo = { mode: 'auto', names: ['watch.example.com'], ready: false, lastErrorCode: 'tls.dns_wrong' };
+    const { unmount } = await openDashboard(withServer({ tls }));
+    let server = screen.getByRole('region', { name: 'Server' });
+    expect(server).toHaveTextContent("Let's Encrypt certificate for watch.example.com");
+    expect(server).toHaveTextContent(
+      "watch.example.com doesn't point to this server (203.0.113.7). Change its A record (see the DNS check).",
+    );
+    expect(server).not.toHaveTextContent(/Valid until/);
+    expect(server).not.toHaveTextContent(CERTIFICATE_CODE);
+    unmount();
+
+    await openDashboard(withServer({ tls, publicIpv4: '' }));
+    server = screen.getByRole('region', { name: 'Server' });
+    expect(server).toHaveTextContent(
+      "watch.example.com doesn't point to this server. Change its A record (see the DNS check).",
+    );
+    expect(server).not.toHaveTextContent(CERTIFICATE_CODE);
+  });
+
+  it('shows a code that is no certificate code as it is', async () => {
+    await openDashboard(
+      withServer({
+        tls: { mode: 'auto', names: ['watch.example.com'], ready: false, lastErrorCode: 'acme.brand_new' },
+      }),
+    );
+    expect(screen.getByRole('region', { name: 'Server' })).toHaveTextContent('acme.brand_new');
+  });
+
+  it('tells an expired certificate from one the server no longer serves', async () => {
+    const renewal = (severity: Alert['severity'], notAfter: string, code = 'tls.acme_unreachable'): Alert => ({
+      code: 'tls.renewal_failing',
+      severity,
+      params: { code, notAfter },
+    });
+    // The snapshots are made on 2026-09-29.
+    await openDashboard(() =>
+      opsDashboard({
+        alerts: [
+          renewal('warn', '2026-10-05T10:00:00.000Z'),
+          renewal('error', '2026-10-05T10:00:00.000Z'),
+          renewal('error', '2026-09-28T10:00:00.000Z'),
+        ],
+      }),
+    );
+    expect(alertTexts()).toEqual([
+      expect.stringMatching(/^Warning: The certificate can't be renewed\. It is valid until Oct 5, 2026, /),
+      expect.stringMatching(
+        /^Problem: The certificate can't be renewed, and the server isn't using it any more\. It would be valid until Oct 5, 2026, /,
+      ),
+      expect.stringMatching(
+        /^Problem: The certificate can't be renewed, and it is no longer valid since Sep 28, 2026, /,
+      ),
+    ]);
+  });
+
+  it('gives the whole fix of a failing renewal, without an address it doesn’t have', async () => {
+    const alerts: Alert[] = [
+      {
+        code: 'tls.renewal_failing',
+        severity: 'warn',
+        params: { code: 'tls.rate_limited', notAfter: '2026-10-05T10:00:00.000Z' },
+      },
+      {
+        code: 'tls.renewal_failing',
+        severity: 'warn',
+        params: { code: 'tls.dns_missing', notAfter: '2026-10-05T10:00:00.000Z' },
+      },
+    ];
+    await openDashboard(
+      withServer(
+        { tls: { mode: 'auto', names: ['watch.example.com'], ready: true, notAfter: '2026-10-05T10:00:00.000Z' } },
+        { alerts },
+      ),
+    );
+    const items = within(screen.getByRole('region', { name: 'Alerts' })).getAllByRole('listitem');
+    // The command that reads the log depends on how the server runs, which the dashboard doesn't know: the
+    // sentence doesn't announce one.
+    expect(items[0]).toHaveTextContent(
+      "Let's Encrypt's rate limit was reached. If you reinstalled, restore certmagic/ from a backup. The server's " +
+        'log says until when.',
+    );
+    expect(items[0]).not.toHaveTextContent(/until when:/);
+    expect(within(items[0] as HTMLElement).queryByRole('button', { name: /copy/i })).not.toBeInTheDocument();
+    expect(items[1]).toHaveTextContent("watch.example.com doesn't resolve. Add an A record pointing to 203.0.113.7.");
+  });
+
+  it('says "this server" in a renewal’s fix when the server has no public IPv4 address', async () => {
+    const alerts: Alert[] = [
+      {
+        code: 'tls.renewal_failing',
+        severity: 'warn',
+        params: { code: 'tls.dns_missing', notAfter: '2026-10-05T10:00:00.000Z' },
+      },
+    ];
+    await openDashboard(
+      withServer(
+        {
+          tls: { mode: 'auto', names: ['watch.example.com'], ready: true, notAfter: '2026-10-05T10:00:00.000Z' },
+          publicIpv4: '',
+        },
+        { alerts },
+      ),
+    );
+    const item = within(screen.getByRole('region', { name: 'Alerts' })).getByRole('listitem');
+    expect(item).toHaveTextContent("watch.example.com doesn't resolve. Add an A record pointing to this server.");
+    expect(item).not.toHaveTextContent(/pointing to \./);
+  });
+
+  it('shows the server’s status as not available when its source failed, not its zero values', async () => {
+    await openDashboard(withServer(ZERO_SERVER, { alerts: sourceFailed('server') }));
+    const server = screen.getByRole('region', { name: 'Server' });
+    expect(server).toHaveTextContent('Version0.3.0');
+    expect(server).toHaveTextContent('187 MB of memory');
+    expect(server).toHaveTextContent('Not available right now');
+    for (const zero of [
+      'Started',
+      'years ago',
+      'Certificate',
+      'Not ready',
+      'No public IPv4 address',
+      'NAT',
+      'None advertised',
+    ]) {
+      expect(server).not.toHaveTextContent(zero);
+    }
+  });
+
+  it('shows the transfer as not available when its source failed', async () => {
+    const transfer = { month: '', egressBytes: 0, ingressBytes: 0, alertGb: 0, egressBps: 0, ingressBps: 0 };
+    await openDashboard(() => opsDashboard({ transfer, alerts: sourceFailed('transfer') }));
+    const stats = screen.getByRole('region', { name: 'Right now' });
+    expect(within(stats).getByText('Sending now').nextElementSibling).toHaveTextContent('Not available right now');
+    expect(within(stats).getByText('Sent this month').nextElementSibling).toHaveTextContent('Not available right now');
+    for (const zero of ['0 MB', '0 kb/s', 'Receiving', 'Sent in ', 'No transfer alert set']) {
+      expect(stats).not.toHaveTextContent(zero);
+    }
+    // The other stats are there.
+    expect(within(stats).getByText('People online').nextElementSibling).toHaveTextContent('2');
+  });
+
+  it('shows the rooms, the media, the process and doctor as not available when their sources failed', async () => {
+    const d = opsDashboard();
+    await openDashboard(() => ({
+      ...d,
+      server: { ...d.server, process: { cpuSeconds: 0, rssBytes: 0, numCpu: 0, goroutines: 0 } },
+      media: { ingressBps: 0, egressBps: 0, downTracks: 0, peerConnections: { udp: 0, tcp443: 0, tcp7882: 0 } },
+      rooms: [],
+      clients: [],
+      doctor: undefined,
+      alerts: sourceFailed('process', 'rooms', 'media', 'doctor'),
+    }));
+    const stats = screen.getByRole('region', { name: 'Right now' });
+    expect(within(stats).getByText('People online').nextElementSibling).toHaveTextContent('Not available right now');
+    expect(within(stats).getByText('Live shares').nextElementSibling).toHaveTextContent('Not available right now');
+    expect(stats).not.toHaveTextContent(/connections|Media:/);
+    expect(within(stats).getByText('Sending now').nextElementSibling).toHaveTextContent('41.5 Mb/s');
+
+    const rooms = screen.getByRole('region', { name: 'Live rooms' });
+    expect(rooms).toHaveTextContent('Not available right now');
+    expect(rooms).not.toHaveTextContent('Nobody is in a room right now.');
+    const clients = screen.getByRole('region', { name: 'App versions' });
+    expect(clients).toHaveTextContent('Not available right now');
+    expect(clients).not.toHaveTextContent('Nobody is connected.');
+    const doctor = screen.getByRole('region', { name: 'Doctor' });
+    expect(doctor).toHaveTextContent('Not available right now');
+    expect(doctor).not.toHaveTextContent("Doctor hasn't run yet.");
+    expect(within(doctor).getByRole('link', { name: 'Open Doctor' })).toBeInTheDocument();
+    const server = screen.getByRole('region', { name: 'Server' });
+    expect(server).not.toHaveTextContent(/Process|CPU seconds/);
+    expect(server).toHaveTextContent('Addresshttps://203.0.113.7');
+  });
+
+  it('names the NAT, the apps and their systems, and a connection without media yet', async () => {
+    const d = opsDashboard();
+    const [lounge] = d.rooms;
+    if (lounge === undefined) throw new Error('no lounge');
+    const [alex, sam] = lounge.participants;
+    if (alex === undefined || sam === undefined) throw new Error('no alex or sam');
+    const waiting = { ...alex, connections: alex.connections.map((c) => ({ ...without(c, 'transport'), rttMs: 0 })) };
+    await openDashboard(() => ({
+      ...d,
+      server: { ...d.server, nat: 'cgnat_likely' },
+      rooms: [{ ...lounge, participants: [waiting, sam] }],
+      clients: [
+        { kind: 'web', version: '0.3.0', count: 1, outdated: false },
+        { kind: 'robot', version: '1.0.0', count: 1, outdated: false },
+      ],
+    }));
+    expect(screen.getByRole('region', { name: 'Server' })).toHaveTextContent(
+      'NAT: carrier-grade NAT likely, no public address',
+    );
+    const row = within(screen.getByRole('table', { name: 'People in Lounge' })).getByRole('row', { name: /^alex/ });
+    expect(row).toHaveTextContent('Web 0.3.0 on macOS no media yet');
+    expect(row).not.toHaveTextContent(/ms|over/);
+    const clients = screen.getByRole('region', { name: 'App versions' });
+    expect(within(clients).getByRole('row', { name: /^Web/ })).toBeInTheDocument();
+    // A kind this build doesn't know shows as it is.
+    expect(within(clients).getByRole('row', { name: /^robot/ })).toBeInTheDocument();
   });
 
   it('shows the setup checklist until the wizard is done', async () => {

@@ -162,6 +162,11 @@ interface Msg {
 interface Ctx {
   readonly p: Reader;
   readonly e: DoctorEnv;
+  /**
+   * False where no report says how the server runs (certificateFix, the dashboard's): `e` is NO_ENV then, and a
+   * step whose command depends on it has none.
+   */
+  readonly envKnown: boolean;
   readonly f: Format;
   readonly t: TFunction;
 }
@@ -524,7 +529,7 @@ export function checkMessage(check: DoctorCheck, env: DoctorEnv, t: TFunction, l
   const p = new Reader(check.params ?? {});
   const rule = Object.hasOwn(MESSAGES, check.code) ? MESSAGES[check.code] : undefined;
   if (rule === undefined) return t(key, p.values(f));
-  const msg = rule({ p, e: env, f, t });
+  const msg = rule({ p, e: env, envKnown: true, f, t });
   return msg === null ? check.message : render(t, key, msg);
 }
 
@@ -592,7 +597,12 @@ const tlsWithIP: FixRule = ({ p, t }, key) => {
 
 const tlsNamed: FixRule = ({ p, t }, key) => [step(t, key, { values: { name: certName(p) } })];
 
-const tlsLog: FixRule = ({ e, t }, key) => [step(t, key, {}, logCommand(e))];
+/**
+ * The server's log has the answer. Without a report's env there is no command to name, and the sentence (the
+ * code's noCommand variant) doesn't introduce one.
+ */
+const tlsLog: FixRule = ({ e, envKnown, t }, key) =>
+  envKnown ? [step(t, key, {}, logCommand(e))] : [step(t, key, { context: 'noCommand' })];
 
 const TLS_FIXES: Readonly<Record<string, FixRule>> = {
   'tls.acme_unreachable': tlsNamed,
@@ -766,7 +776,33 @@ export function checkFix(check: DoctorCheck, env: DoctorEnv, t: TFunction, lang:
   const f = new Format(lang);
   const p = new Reader(check.params ?? {});
   if (rule === undefined) return [{ text: t(key, p.values(f)) }];
-  return [...rule({ p, e: env, f, t }, key)];
+  return [...rule({ p, e: env, envKnown: true, f, t }, key)];
+}
+
+/** The env of certificateFix, which has no report: no rule that reads it runs with it. */
+const NO_ENV: DoctorEnv = {
+  os: '',
+  arch: '',
+  kernel: '',
+  container: ContainerKindNone,
+  systemd: false,
+  provider: CloudProviderUnknown,
+  user: '',
+};
+
+/**
+ * The fix of a certificate code of 04 §8.7 where no doctor report says how the server runs: the dashboard's, for
+ * TLSInfo.lastErrorCode and the alert tls.renewal_failing. The steps are those of checkFix for the code, with
+ * params like the tls check's ({mode, names, ip}, ip only when the address is known), except that a step whose
+ * command depends on how the server runs (the server's log) has no command and a sentence that doesn't introduce
+ * one. A certificate code this build doesn't know reads as tls.acme_failed's; any other code has no steps.
+ */
+export function certificateFix(code: string, params: Params, t: TFunction, lang: string): FixStep[] {
+  if (!code.startsWith('tls.')) return [];
+  const rule = fixRule(code);
+  if (rule === undefined) return [];
+  const ctx: Ctx = { p: new Reader(params), e: NO_ENV, envKnown: false, f: new Format(lang), t };
+  return [...rule(ctx, `doctor.fix.${code}`)];
 }
 
 // ---- links ----

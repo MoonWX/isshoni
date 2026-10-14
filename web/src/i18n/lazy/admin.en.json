@@ -40,6 +40,7 @@
       "lead": "What the server is doing right now. The numbers update every 2 seconds while this page is open.",
       "updated": "Updated",
       "stale": "Couldn't update: these numbers may be old. {{reason}}",
+      "unavailable": "Not available right now",
       "overview": "Right now",
       "alerts": "Alerts",
       "severity": {
@@ -56,6 +57,7 @@
         "publicIpNew": "The server has a public {{family}} address now, {{to}}. isshoni uses it after a restart.",
         "tlsRenewalFailing": "The certificate can't be renewed. It is valid until {{notAfter}}.",
         "tlsRenewalExpired": "The certificate can't be renewed, and it is no longer valid since {{notAfter}}.",
+        "tlsRenewalNotServed": "The certificate can't be renewed, and the server isn't using it any more. It would be valid until {{notAfter}}.",
         "doctorFail_one": "Doctor found a problem: {{checks}}.",
         "doctorFail_other": "Doctor found {{count}} problems: {{checks}}.",
         "sourceFailed": "Couldn't read {{source}}: that part of the dashboard is empty."
@@ -96,6 +98,7 @@
         "shares": "Live shares",
         "media": "Media: UDP {{udp}}, TCP 443 {{tcp443}}, TCP 7882 {{tcp7882}}",
         "month": "Sent in {{month}}",
+        "monthUnknown": "Sent this month",
         "projected": "On course for {{size}} this month",
         "alertAt": "Alert at {{size}}",
         "noAlert": "No transfer alert set"
@@ -105,6 +108,34 @@
         "tcp443": "TCP 443",
         "tcp7882": "TCP 7882",
         "none": "no media yet"
+      },
+      "tlsMode": {
+        "auto": "Let's Encrypt certificate",
+        "ip": "Let's Encrypt IP certificate",
+        "manual": "Your own certificate"
+      },
+      "natKind": {
+        "none": "none",
+        "one_to_one": "1:1, a cloud network or a container",
+        "port_forward": "a router forwards the ports",
+        "symmetric": "symmetric, friends probably can't connect",
+        "cgnat_likely": "carrier-grade NAT likely, no public address",
+        "unknown": "unknown"
+      },
+      "clientKind": {
+        "web": "Web",
+        "desktop": "Desktop",
+        "mobile": "Mobile",
+        "tool": "Tool"
+      },
+      "os": {
+        "windows": "Windows",
+        "macos": "macOS",
+        "linux": "Linux",
+        "ios": "iOS",
+        "android": "Android",
+        "chromeos": "ChromeOS",
+        "other": "another system"
       },
       "connection": "{{kind}} {{version}} on {{os}}",
       "rooms": {
@@ -157,7 +188,7 @@
         "tlsNotReady": "Not ready",
         "tlsValid": "Valid until {{notAfter}}",
         "tlsValidRenews": "Valid until {{notAfter}}, renews on {{nextRenewal}}",
-        "tlsLastError": "Last error: {{code}}",
+        "tlsLastError": "Last error",
         "publicIp": "Public address",
         "noIpv4": "No public IPv4 address",
         "nat": "NAT: {{nat}}",
