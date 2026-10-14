@@ -9,8 +9,10 @@
 // those records (CheckContinuous, CheckStartsOnSPS), plus the marker checks, the GOP bitrate and Viewer.AVOffset
 // (flash against beep, both mapped to NTP through the last sender reports). WithoutPartialTail and WithoutCutFrames
 // leave out the frames that may be short by design: the newest one of a running stream, and the old layer's last one
-// at a layer switch; InSeqOrder puts a stream with repairs in the order a decoder gets it in. REMBs are fixed values
-// a test sends with Viewer.SendREMB. Viewer.Rebuild gives it a new PeerConnection, as a client does for a sub PC of
+// at a layer switch; InSeqOrder puts a stream with repairs in the order a decoder gets it in. Its REMBs are what
+// Chrome's receive-side estimator would send on the Link in front of it (ViewerOptions.REMB: rembsim's model of the
+// link, Viewer.REMBs), or fixed values a test sends with Viewer.SendREMB. Viewer.Rebuild gives it a new
+// PeerConnection, as a client does for a sub PC of
 // a new gen; an offer with new ICE credentials restarts ICE on the one it has. ViewerOptions.H264 and NoH264 make
 // it a Firefox, with Constrained Baseline and Baseline only or before its decoder download, and Viewer.SetH264
 // installs a decoder for its next PeerConnections, as a browser that fetched OpenH264 uses it on a new
@@ -27,7 +29,12 @@
 // FaultConn wraps a UDP socket to lose chosen datagrams or black-hole a peer. It goes under the Harness's SFU
 // (HarnessOptions.FaultyUDP, through 04's netx.TransportOptions.PacketConns), where its filter tells the clients
 // apart by their addresses, or under a Go client through webrtc.NewICEUDPMux, which is how the recovery tests take a
-// client's network away.
+// client's network away. On the SFU's socket a Link in front of a client's address (FaultConn.SetLink) is the
+// bottleneck of that client's downlink, with a capacity the test scripts: the RTP beyond it is lost, everything else
+// passes and takes its share (integration 16, 02 §17).
+//
+// rembsim (a package of its own, without the SFU or Pion) is a small copy of Chrome's receive-side estimator, which
+// the SFU's allocator tests drive in fake time and a Viewer on a Link (ViewerOptions.REMB).
 //
 // Harness is a real sfu.SFU on a loopback netx.Transport (UDP, and on request the ICE-TCP listener and 04's 443
 // multiplexer, all on ephemeral ports of 127.0.0.1), without a hub: each joined Conn gets a DirectSignaler, which
@@ -43,7 +50,4 @@
 // channel whose offer, sent without candidates as a browser sends it, goes to sfu.SFU.Probe (or 04's
 // POST /api/v1/conntest); it takes the answer, waits for the PC and the channel (WaitOpen), and sends and receives
 // the messages that the probe PC echoes. Done tells when the probe is over for it. Integration 18 is written on it.
-//
-// Later slices add the rest of the package from 02 §4 and §17 with the first test that needs each part: REMB from
-// the rembsim model and a FaultConn rate limit (README S84).
 package sfutest

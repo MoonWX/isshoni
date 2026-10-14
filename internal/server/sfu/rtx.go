@@ -113,7 +113,7 @@ func (d *DownTrack) handleNACK(b *binding, pairs []rtcp.NackPair, left *int, now
 //     nackRecordAge: after that the sequence number is on its way to its next packet, which is repaired like any.
 //  3. The budget: retransmissions may use a quarter of what the layer carries or may carry, at least 200 kbit/s,
 //     with a second of that in reserve. What goes beyond is skipped: a viewer on a link that loses that much needs
-//     a lower layer, not more load (the downlink allocator, README S84).
+//     a lower layer, not more load (the downlink allocator, 02 §10.2, sees the loss in its receiver reports).
 //
 // The locks are taken one after the other, never inside each other: the DownTrack's for the epochs, each cache's own
 // for the packet, and the NACK state's for the records and the budget. No other lock is taken: the budget's rate
@@ -171,6 +171,9 @@ func (d *DownTrack) serveNACKs(b *binding, hits []nackHit, now int64) {
 		case d.rtxQueue <- rtxItem{p: h.p, b: b, seq: h.seq, ts: h.p.ts + h.tsOff}:
 		default:
 			d.stats.rtxDrops.Add(1)
+			if d.alloc != nil {
+				d.alloc.drops.Add(1) // a queue drop like any (02 §10.2): the writer is behind
+			}
 		}
 	}
 	d.stats.nackMissed.Add(missed)
@@ -249,6 +252,10 @@ func (n *nackState) sent(seq uint16, now int64) {
 // A retransmission that was asked for on another binding than the DownTrack has now (the sub PC was rebuilt
 // meanwhile), or that the viewer can no longer get or decode (the gate closed, the payload type is gone), is
 // dropped and counted as skipped. The writer calls it.
+//
+// A video retransmission goes through the DownTrack's pacer like new media (02 §9.8, README S84): the writer serves
+// the RTX queue first, so it takes its tokens before new media does, and a large frame asked for again leaves spread
+// like the frame itself. Audio is never paced.
 func (d *DownTrack) retransmit(w *rtpWriteState, it rtxItem) {
 	b := d.binding.Load()
 	w.bind(b)
@@ -269,6 +276,13 @@ func (d *DownTrack) retransmit(w *rtpWriteState, it rtxItem) {
 		payload = buf[:2+copy(buf[2:], payload)]
 		w.hdr.PayloadType, w.hdr.SSRC, w.hdr.SequenceNumber = rtxPT, b.rtxSSRC, w.rtxSeq
 		w.rtxSeq++
+	}
+	if !d.pace(w, it.p.layer, len(payload)) {
+		if buf != nil {
+			rtxPool.Put(buf)
+		}
+		d.stats.rtxSkipped.Add(1) // the writer is stopping
+		return
 	}
 	if b.absSendTimeID != 0 {
 		putAbsSendTime(&w.absSendTime, time.Now())

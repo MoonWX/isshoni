@@ -187,8 +187,9 @@ func TestMetricsAfterLayerSwitches(t *testing.T) {
 		sub.Layer != "f" || sub.Profile == "" || !sub.AudioRequested || !sub.AudioForwarded {
 		t.Errorf("the viewer's subscription = %+v, want high on f with audio", sub)
 	}
+	// The Viewer sends no REMB here, and nothing was capped: the downlink allocator has no estimate.
 	if len(vs.Shares) != 0 || vs.DownlinkEstimate != 0 {
-		t.Errorf("the viewer's Stats = %+v, want no own share and no downlink estimate before README S84", vs)
+		t.Errorf("the viewer's Stats = %+v, want no own share and no downlink estimate without a REMB", vs)
 	}
 	var ps sfu.ConnStats
 	eventually(t, func() bool {

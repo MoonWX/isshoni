@@ -305,3 +305,28 @@ func SetMediaICETimeouts(disconnected, failed, keepalive time.Duration) (restore
 	mediaICETimeouts = iceTimeouts{disconnected: disconnected, failed: failed, keepalive: keepalive}
 	return func() { mediaICETimeouts = old }
 }
+
+// DownlinkState describes a Conn's downlink allocator (02 §10.2).
+type DownlinkState struct {
+	State   string        // "normal", "limited" or "probing"
+	Budget  int64         // bit/s; what the high requests are fitted into while limited
+	Backoff time.Duration // before the next trial upgrade
+	Cause   string        // why it capped last: "remb", "loss" or "drops"
+}
+
+// Downlink returns the state of the Conn's downlink allocator.
+func (c *Conn) Downlink(ctx context.Context) (DownlinkState, error) {
+	var st DownlinkState
+	err := c.do(ctx, func(context.Context) error {
+		a := &c.alloc
+		st = DownlinkState{State: a.state.String(), Budget: a.budget, Backoff: a.backoff, Cause: a.cause}
+		return nil
+	})
+	return st, err
+}
+
+// The downlink allocator's first backoff and the length of a trial upgrade (02 §10.2).
+const (
+	BackoffStart = backoffStart
+	ProbeTime    = probeTime
+)
