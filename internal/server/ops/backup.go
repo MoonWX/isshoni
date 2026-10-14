@@ -685,28 +685,25 @@ func readSmallFile(path string, limit int64) ([]byte, error) {
 	return data, nil
 }
 
-// copyContext is io.Copy that gives up when ctx ends: a backup of a large database can be interrupted.
+// copyContext is io.Copy that gives up when ctx ends: a backup of a large database can be interrupted. ctx is
+// checked before every read. The copy is io.CopyBuffer's rather than a loop of dst.Write calls of its own: CodeQL
+// resolves such a call on an io.Writer to every Write method in the program, an HTTP response's among them, and
+// then sees the restore's upload, which goes to a file, reach a response (go/reflected-xss).
 func copyContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
-	buf := make([]byte, 256<<10)
-	var total int64
-	for {
-		if err := ctx.Err(); err != nil {
-			return total, err
-		}
-		n, err := src.Read(buf)
-		if n > 0 {
-			if _, werr := dst.Write(buf[:n]); werr != nil {
-				return total, werr
-			}
-			total += int64(n)
-		}
-		if errors.Is(err, io.EOF) {
-			return total, nil
-		}
-		if err != nil {
-			return total, err
-		}
+	return io.CopyBuffer(dst, ctxReader{ctx: ctx, r: src}, make([]byte, 256<<10))
+}
+
+// ctxReader is a reader that fails with ctx's error once ctx has ended.
+type ctxReader struct {
+	ctx context.Context //nolint:containedctx // the reader lives for one copyContext call
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
 	}
+	return c.r.Read(p)
 }
 
 // syncDir makes the directory's entries durable: a new file or a rename survives a crash only then.

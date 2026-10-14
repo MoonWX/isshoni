@@ -630,6 +630,58 @@ func TestBackupFileName(t *testing.T) {
 	}
 }
 
+// TestCopyContext: copyContext copies everything to the end, stops with ctx's error once ctx has ended (checked
+// before every read), and returns a write error as it is.
+func TestCopyContext(t *testing.T) {
+	data := bytes.Repeat([]byte("isshoni "), 100<<10) // 800 KiB: more than one 256 KiB buffer
+	var out bytes.Buffer
+	if n, err := copyContext(context.Background(), &out, bytes.NewReader(data)); err != nil || n != int64(len(data)) || !bytes.Equal(out.Bytes(), data) {
+		t.Errorf("copyContext = %d, %v; copied %d of %d bytes", n, err, out.Len(), len(data))
+	}
+
+	ended, cancel := context.WithCancel(context.Background())
+	cancel()
+	out.Reset()
+	if n, err := copyContext(ended, &out, bytes.NewReader(data)); !errors.Is(err, context.Canceled) || n != 0 || out.Len() != 0 {
+		t.Errorf("copyContext with an ended ctx = %d, %v; copied %d bytes", n, err, out.Len())
+	}
+
+	// ctx ends while the copy runs: the next read stops it. The destination has no ReadFrom (a bytes.Buffer's would
+	// take the whole input in its first read), so the copy reads 256 KiB at a time, as into a tar.Writer or a hash.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out.Reset()
+	r := &cancelAfterRead{r: bytes.NewReader(data), cancel: cancel}
+	if n, err := copyContext(ctx, writerOnly{&out}, r); !errors.Is(err, context.Canceled) || n != 256<<10 {
+		t.Errorf("copyContext cancelled after the first read = %d, %v; want the first 256 KiB and Canceled", n, err)
+	}
+
+	failed := errors.New("no space left on device")
+	if _, err := copyContext(context.Background(), failingWriter{failed}, bytes.NewReader(data)); !errors.Is(err, failed) {
+		t.Errorf("copyContext into a failing writer = %v, want %v", err, failed)
+	}
+}
+
+// cancelAfterRead cancels its context after its first read.
+type cancelAfterRead struct {
+	r      io.Reader
+	cancel context.CancelFunc
+}
+
+func (c *cancelAfterRead) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.cancel()
+	return n, err
+}
+
+// writerOnly hides every method of its writer but Write.
+type writerOnly struct{ io.Writer }
+
+// failingWriter fails every write with err.
+type failingWriter struct{ err error }
+
+func (f failingWriter) Write([]byte) (int, error) { return 0, f.err }
+
 func TestDataError(t *testing.T) {
 	cause := errors.New("gzip: invalid header")
 	err := fmt.Errorf("wrapped: %w", invalidBackup("it is not a gzip file", cause))
