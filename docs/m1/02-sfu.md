@@ -824,7 +824,7 @@ on: in the usual VPS case the public address is on an interface and no rule appl
 the local address is replaced by the public one; on a home server the public one is appended, so LAN clients still
 connect directly. `SetNAT1To1IPs` and srflx rewrites are never used.
 
-### 7.3 SettingEngine (shared by the pub and sub APIs; the probe APIs differ only in network types and muxes)
+### 7.3 SettingEngine (shared by the pub and sub APIs; the probe APIs differ in network types, muxes, ICE timeouts and checks per pair)
 
 | Setting | Value | Why |
 |---|---|---|
@@ -833,7 +833,7 @@ connect directly. `SetNAT1To1IPs` and srflx rewrites are never used.
 | `SetLite(false)` | full ICE | S4 tested full ICE; no reason to change |
 | Remote-candidate filter (in `AddICECandidate`, and on the candidates inside every remote SDP: pub offers, sub answers and probe offers, before `SetRemoteDescription`) | drop loopback and the server's own advertised addresses unless `Transport.IncludeLoopback` (04's `network.include_loopback`); drop unparsable candidates, host names (mDNS or not), link-local, multicast, broadcast, unspecified (`0.0.0.0/8`, `::`) and IPv4-compatible IPv6 (`::/96`) addresses always; drop RFC 1918, CGNAT, ULA and site-local (`fec0::/10`) addresses unless any `Transport.Advertised[].LAN` is true (the server itself advertises a private address, 04's LAN/Append case). IPv4-mapped and NAT64 (`64:ff9b::/96`) addresses are judged by the IPv4 address inside. Pion's `SetRemoteIPFilter` is not used: Pion also applies it to prflx candidates, which the server must keep learning | 01 §17: a client must not make the server probe internal networks. Client addresses are learned as prflx from incoming checks anyway |
 | `SetICETimeouts(5 s, 15 s, 2 s)` | disconnected, failed, keepalive | the client drives restarts after 3 s; the server only cleans up |
-| `SetICEMaxBindingRequests` | the failed timeout ÷ Pion's 200 ms check interval, at least Pion's 7: 75 (40 on the probe APIs, 8 s) | a pair is checked for as long as the client waits for an ICE restart; Pion's 7 give it up after about 1.5 s. Below |
+| `SetICEMaxBindingRequests` | 75 on the pub and sub APIs: the failed timeout ÷ Pion's 200 ms check interval, at least Pion's 7. Pion's 7 on the probe APIs, which only ever answer a browser's checks | a pair is checked for as long as the client waits for an ICE restart; Pion's 7 give it up after about 1.5 s. A probe gains nothing from more, and its offer's candidates would get more checks. Below |
 | `SetPrflxAcceptanceMinWait(300 ms)`, `SetSrflxAcceptanceMinWait(0)`, `SetHostAcceptanceMinWait(0)` | | when controlling (sub PC), browser pairs are prflx. Pion's default 1 s wait delays the first frame. 300 ms lets a UDP pair win over TCP |
 | `SetDTLSConnectContextMaker` | 10 s timeout | plan guard |
 | `SetSRTPProtectionProfiles` | `SRTP_AEAD_AES_128_GCM`, `SRTP_AES128_CM_HMAC_SHA1_80` | cheaper per-packet encryption |
@@ -847,17 +847,26 @@ every sub PC (it offers, and browsers are full ICE agents). With Pion's 7, a vie
 it sent `pc.restart{sub, ice}` (01 §11.5 B: 3 s after its ICE noticed) had each pair of that restart given up about
 1.5 s after its answer, and got its media back only through the rebuild 15 s after the restart's offer (01 §10.4).
 `maxBindingRequests` (`api.go`) gives a pair the checks of the failed timeout instead: 15 s, as long as the client
-waits for the restart before it rebuilds. It is set in `settingEngine`, so every API gets it, not only the sub API:
+waits for the restart before it rebuilds. It is set in `settingEngine`, so the pub API gets it as well as the sub
+API; `probeAPI` sets Pion's 7 back:
 - A controlled agent doesn't need it, and that is what the SFU is on a pub or probe PC, which the client offers. It
-  answers each of the client's checks with a check of its own whatever its pair's state, and that check's answer
-  revives a pair it had given up: itest `TestUDPBlackHole` recovered a sharer's pub PC that way with Pion's 7, from
-  an ICE restart that the sharer offered about 2 s before its network came back. There the setting only lets the
-  SFU's own checks of a silent pair go on longer, at the same pace and on the same pairs (at most 64 remote
-  candidates per PC, below), and they end when the agent fails at the latest.
-- The role is the negotiation's, not the API's: Pion controls a pub or probe PC whose offer says `a=ice-lite`
-  (RFC 8445 §6.1.1), and switches roles after a 487 role conflict. One setting for every PC keeps those right too,
+  answers each of the client's checks with a triggered check of its own on any pair that hasn't succeeded, a
+  given-up one included (Pion skips it only on a pair that has succeeded, once the agent has selected a pair), and
+  that check's answer revives the pair: itest `TestUDPBlackHole` recovered a sharer's pub PC that way with Pion's 7,
+  from an ICE restart that the sharer offered about 2 s before its network came back. On a pub PC the setting only
+  lets the SFU's own checks of a silent pair go on longer, at the same pace and on the same pairs (at most 64 remote
+  candidates per PC and `gen`, below), and they end when the agent fails at the latest: each pair of a candidate
+  that the client names gets up to 76 checks over 15 s, where Pion's 7 sent 8.
+- The role is the negotiation's, not the API's: Pion controls a pub PC whose offer says `a=ice-lite`
+  (RFC 8445 §6.1.1), and switches roles after a 487 role conflict. One setting for both keeps those right too,
   and the pub and sub APIs keep one `SettingEngine`, as this section's heading says; the prflx wait above is a
   setting of the same kind, which only matters when the SFU controls.
+- The probe APIs keep Pion's 7. A browser's probe offer has no candidates (§7.6): the SFU learns the browser's
+  address as prflx from its checks and, as the controlled agent, answers each with a triggered check, so a probe
+  gains nothing from more. Only a hand-made `a=ice-lite` probe offer would make the SFU control a probe PC. What more
+  would cost: a probe offer's candidates are the client's (up to 64, at addresses of its choosing; README S76), and
+  any signed-in user may post 12 probe offers a minute (04 §7.7). With the 40 that the probe's 8 s would give, each
+  of those candidates would get 41 checks instead of 8, about five times the STUN that S76 bounded.
 
 **The filter also counts** (README S57; the cap is §12's 64 per PC and `gen`). Pion's ICE agent keeps every remote
 candidate that equals none it already has, pairs it with each local candidate and sends its checks to it, and has

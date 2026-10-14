@@ -901,9 +901,10 @@ func TestNewAPIsNeedsTransport(t *testing.T) {
 	}
 }
 
-// TestICEMaxBindingRequests: the SFU's ICE agents check a candidate pair for as long as their failed timeout, one
-// binding request per round of Pion's checks (200 ms), instead of Pion's 7 (02 §7.3): 75 on the pub and sub PCs, 40
-// on the probe PCs. The test reads it from the SettingEngine of every API and from the agent of a sub PC itself,
+// TestICEMaxBindingRequests: the SFU's pub and sub PCs check a candidate pair for as long as their failed timeout,
+// one binding request per round of Pion's checks (200 ms), instead of Pion's 7 (02 §7.3): 75. The probe PCs keep
+// Pion's 7, which is all a browser's probe needs, so a probe offer's candidates get no more checks. The test reads
+// the number from the SettingEngine of every API and from the agents of a sub PC and of each probe PC themselves,
 // and checks Pion's pace, which the number is derived from. With 7, a sub PC gave up each pair of an ICE restart
 // 1.5 s after the viewer's answer, so a restart asked for while the viewer's network was away never connected
 // (itest TestUDPBlackHoleViewer).
@@ -913,7 +914,7 @@ func TestICEMaxBindingRequests(t *testing.T) {
 		want   uint16
 	}{
 		{iceFailedTimeout, 75},
-		{probeFailedTimeout, 40},
+		{8 * time.Second, 40},
 		{20 * time.Second, 100},
 		{3*time.Second + 150*time.Millisecond, 15}, // whole rounds only
 		{time.Second, pionMaxBindingRequests},      // never fewer than Pion's own
@@ -939,20 +940,32 @@ func TestICEMaxBindingRequests(t *testing.T) {
 		engines["the "+string(pt)+" probe API"] = pionField(t, reflect.ValueOf(api), "settingEngine")
 	}
 	for name, se := range engines {
-		want := maxBindingRequests(iceFailedTimeout)
+		want := uint64(maxBindingRequests(iceFailedTimeout))
 		if strings.Contains(name, "probe") {
-			want = maxBindingRequests(probeFailedTimeout)
+			want = pionMaxBindingRequests
 		}
-		n := pionField(t, se, "iceMaxBindingRequests")
-		if n.IsNil() {
-			t.Errorf("%s leaves the binding requests at Pion's %d, want %d", name, pionMaxBindingRequests, want)
-		} else if got := n.Elem().Uint(); got != uint64(want) {
+		got := uint64(pionMaxBindingRequests) // not set: Pion's own
+		if n := pionField(t, se, "iceMaxBindingRequests"); !n.IsNil() {
+			got = n.Elem().Uint()
+		}
+		if got != want {
 			t.Errorf("%s allows %d binding requests per pair, want %d", name, got, want)
 		}
 	}
 
-	// What the ICE agent of a sub PC uses: the SettingEngine's number, at Pion's pace. A Pion whose agent checks at
-	// another pace needs the number derived again.
+	// What the ICE agents use: the SettingEngine's number, at Pion's pace. A Pion whose agent checks at another pace
+	// needs the number derived again.
+	checkAgent := func(name string, pc *webrtc.PeerConnection, want uint64) {
+		t.Helper()
+		agent := pionField(t, reflect.ValueOf(pc), "iceGatherer", "agent")
+		if got := pionField(t, agent, "maxBindingRequests").Uint(); got != want {
+			t.Errorf("%s ICE agent sends %d binding requests per pair, want %d", name, got, want)
+		}
+		if got := time.Duration(pionField(t, agent, "checkInterval").Int()); got != iceCheckInterval {
+			t.Errorf("%s ICE agent checks every %v, want Pion's %v that the binding requests are counted in", name,
+				got, iceCheckInterval)
+		}
+	}
 	pc := newTestPC(t, a.sub)
 	addSendonly(t, pc, h264Track(t, "s_sub"), opusTrack(t, "a-s_sub"))
 	offer, err := pc.CreateOffer(nil)
@@ -960,13 +973,18 @@ func TestICEMaxBindingRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 	completeDescription(t, pc, offer)
-	agent := pionField(t, reflect.ValueOf(pc), "iceGatherer", "agent")
-	if got := pionField(t, agent, "maxBindingRequests").Uint(); got != uint64(maxBindingRequests(iceFailedTimeout)) {
-		t.Errorf("a sub PC's ICE agent sends %d binding requests per pair, want %d", got, maxBindingRequests(iceFailedTimeout))
-	}
-	if got := time.Duration(pionField(t, agent, "checkInterval").Int()); got != iceCheckInterval {
-		t.Errorf("a sub PC's ICE agent checks every %v, want Pion's %v that the binding requests are counted in", got,
-			iceCheckInterval)
+	checkAgent("a sub PC's", pc, uint64(maxBindingRequests(iceFailedTimeout)))
+	for pt, api := range a.probe {
+		pc := newTestPC(t, api)
+		if _, err := pc.CreateDataChannel("probe", nil); err != nil {
+			t.Fatal(err)
+		}
+		offer, err := pc.CreateOffer(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		completeDescription(t, pc, offer)
+		checkAgent("a "+string(pt)+" probe PC's", pc, pionMaxBindingRequests)
 	}
 	// Pion's own limit, the floor.
 	plain, err := ice.NewAgentWithOptions(ice.WithMulticastDNSMode(ice.MulticastDNSModeDisabled))

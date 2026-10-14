@@ -160,11 +160,12 @@ func (a *apis) pubAPI(f *nackFilter) (*webrtc.API, error) {
 // candidate pair gets, the candidate acceptance waits, the DTLS handshake timeout and the SRTP profiles. The receive
 // MTU stays Pion's default (1460).
 //
-// The checks are set here, so for every API, though only a controlling agent needs them: on every sub PC (the SFU
-// offers to a full ICE agent), and on a pub or probe PC whose client is ICE-lite or after a role conflict (Pion's
-// role follows the negotiation, not the API). A controlled agent answers each of the client's checks with one of its
-// own whatever its pair's state, and that one's answer revives a pair it had given up, so there the setting only
-// lets its own checks of a silent pair go on longer, at the same pace.
+// The checks are set here, so for the pub and sub APIs (probeAPI sets Pion's own back), though only a controlling
+// agent needs them: on every sub PC (the SFU offers to a full ICE agent), and on a pub PC whose client is ICE-lite or
+// after a role conflict (Pion's role follows the negotiation, not the API). A controlled agent answers each of the
+// client's checks with a triggered check of its own on any pair that hasn't succeeded, a given-up one included
+// (Pion skips it only on a pair that has succeeded, once the agent has selected a pair), and that check's answer
+// revives the pair, so there the setting only lets its own checks of a silent pair go on longer, at the same pace.
 func settingEngine(tr *netx.Transport, lf logging.LoggerFactory, t iceTimeouts) (webrtc.SettingEngine, error) {
 	se := webrtc.SettingEngine{LoggerFactory: lf}
 	if err := tr.Apply(&se); err != nil {
@@ -187,8 +188,8 @@ func settingEngine(tr *netx.Transport, lf logging.LoggerFactory, t iceTimeouts) 
 }
 
 // maxBindingRequests is how many binding requests the SFU's ICE agent sends on one candidate pair before it gives
-// the pair up (02 §7.3): as many as Pion's check interval fits in the failed timeout, so 75 for the media PCs'
-// 15 s and 40 for a probe's 8 s, and never fewer than Pion's own 7.
+// the pair up (02 §7.3): as many as Pion's check interval fits in the failed timeout, so 75 for the pub and sub PCs'
+// 15 s, and never fewer than Pion's own 7. The probe PCs keep Pion's 7 (probeAPI).
 //
 // Pion's 7 last about 1.5 s, and a controlling agent never checks a pair again once it has given it up: it answers
 // the client's checks, but nominates only a pair that its own check got through. An ICE restart that a viewer asks
@@ -205,6 +206,12 @@ func maxBindingRequests(failed time.Duration) uint16 {
 // (probeNetworkTypes), and only that transport's mux: for tcp443 and tcp7882 SetICETCPMux with that listener's mux
 // alone. 04 guarantees that Apply only calls setters, so the later call wins. The MediaEngine is empty; SCTP is on
 // (Pion's default).
+//
+// The checks per candidate pair go back to Pion's 7 (02 §7.3), by the same rule. A browser's probe offer has no
+// candidates: the probe PC learns the browser's address from its checks and, as the controlled agent, answers each
+// with a triggered check of its own, so a probe gains nothing from more. They would cost: the candidates of a probe
+// offer are the client's (up to 64, at addresses of its choosing), and with the 40 that the probe's 8 s would give,
+// each of them would get 41 checks instead of 8.
 //
 // Unlike 02 §7.6, which leaves the UDP mux in place for a TCP probe, the other protocol's mux is removed: Pion (ice
 // v4.4) gathers a host candidate on every address of a UDP mux whatever the network types, so a TCP probe would
@@ -240,6 +247,7 @@ func probeAPI(tr *netx.Transport, lf logging.LoggerFactory, pt ProbeTransport) (
 	if err != nil {
 		return nil, err
 	}
+	se.SetICEMaxBindingRequests(pionMaxBindingRequests)
 	se.SetNetworkTypes(types)
 	switch {
 	case !udp:
