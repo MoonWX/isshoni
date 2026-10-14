@@ -7,8 +7,9 @@
 # DISTRO is one of the supported distros (06 §4.13; debian-12, debian-13, ubuntu-22.04, ubuntu-24.04, ubuntu-26.04,
 # fedora-44 today), named as distro-test.sh names them: Debian 12 or 13, any Ubuntu release, any Fedora release, so
 # that a Fedora bump needs no change here. The image is for this machine's CPU (x86_64 or aarch64). Debian's and
-# Ubuntu's are the current build of the release, Fedora's is the release's image. FILE gets the image (qcow2) once its checksum matches, and not before. vm-test.sh calls this
-# when its VM directory has no image for the distro yet; the nightly's distro-vm job calls it in a step of its own.
+# Ubuntu's are the current build of the release, Fedora's is the release's image.
+# FILE gets the image (qcow2) once its checksum matches, and not before. vm-test.sh calls this when its VM
+# directory has no image for the distro yet; the nightly's distro-vm job calls it in a step of its own.
 #
 # Everything goes over HTTPS. The checksum comes from the distro's own server (for Fedora the project's, and the
 # image itself from any mirror). A "latest" directory can change between the two downloads, so a mismatch is tried

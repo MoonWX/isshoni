@@ -22,9 +22,10 @@
 #   v4    V4 (ubuntu-24.04): iptables with netfilter-persistent and a REJECT rule, IPv4 and IPv6; the rules
 #         survive a reboot
 #   v5    V5: --domain isshoni.test against Pebble on this machine, ready within 60 s, a certificate from Pebble
-# C11 (no systemd) has no VM form: it stays in distro-test.sh's container runs. Before anything else the script
-# checks that distro-test.sh still has every function and variable it takes from it, so `vm-test.sh -h` is a check
-# of that which needs no VM.
+# C11 (no systemd) has no VM form: it stays in distro-test.sh's container runs. A part is skipped with a note on a
+# distro it does not apply to, and its image is fetched only when a part runs there; a run in which no part applies
+# fails. Before anything else the script checks that distro-test.sh still has every function and variable it takes
+# from it or replaces, so `vm-test.sh -h` is a check of that which needs no VM, no Linux and no network.
 #
 # Where it runs: Linux on x86_64 or aarch64, with QEMU (qemu-system-x86, or qemu-system-arm and qemu-efi-aarch64;
 # qemu-utils), cloud-image-utils, OpenSSH, OpenSSL, curl, Go, and for v5 Docker (Pebble and pebble-challtestsrv run
@@ -49,19 +50,54 @@ set -eu
 VT_ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/../../.." && pwd)
 VT_ENGINE=${CONTAINER_ENGINE:-docker}
 
+# vt_lib_fail WHAT stops the script before anything has started: distro-test.sh, WHAT. Until the checks below have
+# passed, die is the library's or missing.
+vt_lib_fail() {
+  printf 'vm-test: deploy/test/distro-test.sh %s\n' "$1" >&2
+  [ "${GITHUB_ACTIONS-}" != true ] || printf '::error::vm-test: deploy/test/distro-test.sh %s\n' "$1"
+  exit 1
+}
+
 # The library. Without its guard its main would run here, with this script's arguments, and test containers in
 # place of VMs. It sets ROOT from $0, which is this script here, and ENGINE from the machine: both are set again
-# below.
+# below. The variables this script takes from it are unset first, so that only the library can set them (KEEP is
+# the caller's, as it is there).
 # shellcheck disable=SC2016 # the text of the guard
-if ! grep -q '"${DISTRO_TEST_LIB-}" != 1' "$VT_ROOT/deploy/test/distro-test.sh"; then
-  printf 'vm-test: %s\n' 'deploy/test/distro-test.sh no longer skips its main when DISTRO_TEST_LIB=1' >&2
-  exit 1
-fi
+grep -q '"${DISTRO_TEST_LIB-}" != 1' "$VT_ROOT/deploy/test/distro-test.sh" ||
+  vt_lib_fail 'no longer skips its main when DISTRO_TEST_LIB=1'
+unset ROOT ENGINE DISTROS V1 HOST_NAME WORK CONTAINER BASE_URL RC OUT PASSED FAILED
 DISTRO_TEST_LIB=1
 # shellcheck source=deploy/test/distro-test.sh
 . "$VT_ROOT/deploy/test/distro-test.sh"
+
+# What this script takes from distro-test.sh, and what it replaces there: the functions die and assert_eq, the
+# variables ROOT and ENGINE, and in_container's call of "$ENGINE" exec "$CONTAINER", which vm_engine answers. A name
+# that is renamed or removed there fails here, before a release is built or a VM booted. A function counts only when
+# the shell has it as a function: `command -v` prints a path for a program of the same name (macOS has a `say`).
+for vt_name in die assert_eq say usage ok fail assert_contains assert_lacks base_image firewall_of in_container \
+  value yes_no exit_of json_of wait_ready cleanup build_releases prepare_releases start_relserve run_installer \
+  scenario_c1 scenario_c2 scenario_c3 scenario_c4 scenario_c5 scenario_c6 scenario_c7 scenario_c8 scenario_c9 \
+  scenario_c10 scenario_c12 scenario_c13 scenario_v3_firewalld scenario_v3_ufw; do
+  case $(command -v "$vt_name" 2>/dev/null || echo /) in
+  */*) vt_lib_fail "has no function $vt_name, which deploy/test/vm/vm-test.sh uses or replaces" ;;
+  esac
+done
+for vt_name in ROOT ENGINE DISTROS V1 HOST_NAME KEEP WORK CONTAINER BASE_URL RC OUT PASSED FAILED; do
+  eval "[ \"\${$vt_name+set}\" = set ]" ||
+    vt_lib_fail "does not set $vt_name, which deploy/test/vm/vm-test.sh uses or replaces"
+done
+# in_container's call, with a stand-in for the engine that only records it.
+vt_probe() {
+  VT_PROBED="$*"
+}
+VT_PROBED='' ENGINE=vt_probe CONTAINER=vt-probe
+in_container true >/dev/null 2>&1 || :
+[ "$VT_PROBED" = 'exec vt-probe true' ] ||
+  vt_lib_fail "no longer runs in_container's command as \"\$ENGINE\" exec \"\$CONTAINER\", which vm_engine answers"
+
 ROOT=$VT_ROOT
 ENGINE=vm_engine
+CONTAINER=''
 
 die() {
   printf 'vm-test: %s\n' "$@" >&2
@@ -69,25 +105,12 @@ die() {
   exit 1
 }
 
-# What this script takes from distro-test.sh. A name that is renamed or removed there fails here, before a release
-# is built or a VM booted.
-for vt_name in say usage ok fail assert_contains assert_lacks base_image firewall_of in_container value yes_no \
-  exit_of json_of wait_ready cleanup build_releases prepare_releases start_relserve run_installer scenario_c1 \
-  scenario_c2 scenario_c3 scenario_c4 scenario_c5 scenario_c6 scenario_c7 scenario_c8 scenario_c9 scenario_c10 \
-  scenario_c12 scenario_c13 scenario_v3_firewalld scenario_v3_ufw; do
-  command -v "$vt_name" >/dev/null 2>&1 ||
-    die "deploy/test/distro-test.sh has no function $vt_name, which deploy/test/vm/vm-test.sh uses"
-done
-for vt_name in DISTROS V1 V2 HOST_NAME KEEP WORK CONTAINER BASE_URL RUN_AS RC OUT PASSED FAILED; do
-  eval "[ \"\${$vt_name+set}\" = set ]" ||
-    die "deploy/test/distro-test.sh does not set $vt_name, which deploy/test/vm/vm-test.sh uses"
-done
-
 VM_DIR=${VM_DIR:-$ROOT/.dev/vm}
 VM_BOOT_TIMEOUT=${VM_BOOT_TIMEOUT:-300}
 VM_ACCEL=${VM_ACCEL:-kvm}
 VM_PARTS_ALL='main c7 c13 v3 v4 v5'
 VM_SSH_PORT=2200 # each VM gets the next port for its SSH
+VM_STARTED=''    # the VMs this run started, for the cleanup (VM_DIR may hold an earlier run's)
 VM_ENV=''        # NAME=VALUE words that vm_engine adds to every command (V5's ACME server)
 VM_PEBBLE=0      # 1 once this run has started Pebble
 PEBBLE_MINICA='' # the CA of Pebble's own HTTPS endpoints, once Pebble runs
@@ -302,6 +325,7 @@ vm_start() {
     vs_fwd=$vs_fwd,hostfwd=$vs_extra
   done
   say '' "==== VM $vs_name ($(uname -m), $VM_ACCEL)"
+  VM_STARTED="$VM_STARTED $vs_name"
   qemu-img create -q -f qcow2 -F qcow2 -b "$VM_IMAGE" "$vs_dir/disk.qcow2" 16G
   # shellcheck disable=SC2086 # VM_QEMU is the program and its machine flags
   $VM_QEMU -name "isshoni-$vs_name" -smp 2 -m 2048 \
@@ -369,7 +393,7 @@ vm_stop() {
   CONTAINER=''
 }
 
-# vm_kill VM closes the VM's SSH master and stops its QEMU.
+# vm_kill VM closes the VM's SSH master and stops its QEMU: SIGTERM, and SIGKILL if it still runs 10 s later.
 vm_kill() {
   vk_pidfile=$VM_DIR/$1/qemu.pid
   vm_master "$1" exit
@@ -377,20 +401,25 @@ vm_kill() {
   vk_pid=$(cat "$vk_pidfile")
   kill "$vk_pid" 2>/dev/null || :
   vk_tries=0
-  while kill -0 "$vk_pid" 2>/dev/null && [ "$vk_tries" -lt 50 ]; do
+  while kill -0 "$vk_pid" 2>/dev/null; do
+    if [ "$vk_tries" -ge 50 ]; then
+      kill -9 "$vk_pid" 2>/dev/null || :
+      break
+    fi
     vk_tries=$((vk_tries + 1))
     sleep 0.2
   done
-  kill -9 "$vk_pid" 2>/dev/null || :
   rm -f "$vk_pidfile"
 }
 
-# vm_cleanup, the EXIT trap, stops what is left of the run: the VMs, Pebble, and then what distro-test.sh's
-# cleanup removes (relserve and the work directory).
+# vm_cleanup, the EXIT trap, stops what is left of the run: the VMs it started (not an earlier run's, whose
+# pidfiles may name other processes by now) and their disks (KEEP=1 keeps them), Pebble, and then what
+# distro-test.sh's cleanup removes (relserve and the work directory).
 vm_cleanup() {
   vc_status=$?
-  for vc_dir in "$VM_DIR"/*/; do
-    [ ! -f "$vc_dir/qemu.pid" ] || vm_kill "$(basename "$vc_dir")"
+  for vc_name in $VM_STARTED; do
+    vm_kill "$vc_name"
+    [ "$KEEP" = 1 ] || rm -f "$VM_DIR/$vc_name/disk.qcow2"
   done
   pebble_stop "$vc_status"
   cleanup
@@ -777,6 +806,18 @@ vm_main() {
   for vm_distro in "$@"; do
     base_image "$vm_distro" >/dev/null || die "unknown distro \"$vm_distro\"" "known: $DISTROS"
   done
+  # A run in which no part applies would end green with nothing tested: a mistake of -o or of the distros (a
+  # matrix row of the nightly), found before anything is built or fetched.
+  vm_any=''
+  for vm_distro in "$@"; do
+    for vm_part in $PARTS; do
+      if vm_applies "$vm_part" "$vm_distro"; then
+        vm_any=1
+      fi
+    done
+  done
+  [ -n "$vm_any" ] || die "none of the parts ($PARTS) runs on $*" \
+    'v3 runs on fedora-44 and ubuntu-24.04, v4 on ubuntu-24.04, the others on every distro'
 
   case $(uname -s)/$(uname -m) in
   Linux/x86_64) VM_QEMU="qemu-system-x86_64 -machine q35,accel=$VM_ACCEL" ;;
@@ -833,20 +874,26 @@ vm_main() {
   vm_setup
   case " $PARTS " in *' v5 '*) pebble_start ;; esac
 
+  # A distro's image is fetched only when one of the parts runs there.
   vm_summary=''
   for DISTRO in "$@"; do
-    vm_image "$DISTRO"
-    vm_passed=$PASSED vm_failed=$FAILED vm_ran=''
+    vm_todo=''
     for vm_part in $PARTS; do
-      if ! vm_applies "$vm_part" "$DISTRO"; then
+      if vm_applies "$vm_part" "$DISTRO"; then
+        vm_todo="$vm_todo $vm_part"
+      else
         say '' "vm-test: $vm_part does not run on $DISTRO"
-        continue
+        [ "${GITHUB_ACTIONS-}" != true ] || printf '::warning::vm-test: %s does not run on %s\n' "$vm_part" "$DISTRO"
       fi
+    done
+    [ -n "$vm_todo" ] || continue
+    vm_image "$DISTRO"
+    vm_passed=$PASSED vm_failed=$FAILED
+    for vm_part in $vm_todo; do
       "vm_part_$vm_part"
-      vm_ran="$vm_ran $vm_part"
     done
     vm_summary="$vm_summary
-distro-vm $DISTRO: $((PASSED - vm_passed)) passed, $((FAILED - vm_failed)) failed (parts:$vm_ran)"
+distro-vm $DISTRO: $((PASSED - vm_passed)) passed, $((FAILED - vm_failed)) failed (parts:$vm_todo)"
   done
 
   say '' "vm-test: $PASSED passed, $FAILED failed$vm_summary"

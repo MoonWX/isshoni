@@ -972,7 +972,16 @@ main() {
 }
 
 # deploy/test/vm/vm-test.sh sources this file for its helpers, the test releases, relserve and the scenarios, and
-# sets DISTRO_TEST_LIB=1 first: then main does not run, and nothing above it has started anything.
+# sets DISTRO_TEST_LIB=1 first: then main does not run, and nothing above it has started anything. Run as itself
+# ($0 is this file), the script refuses the variable, which an export left in the environment would otherwise turn
+# into a run that tests nothing and passes.
 if [ "${DISTRO_TEST_LIB-}" != 1 ]; then
   main "$@"
+else
+  case ${0##*/} in
+  distro-test.sh)
+    die 'DISTRO_TEST_LIB=1 is only for sourcing this file, as deploy/test/vm/vm-test.sh does' \
+      'unset it to run the scenarios'
+    ;;
+  esac
 fi
