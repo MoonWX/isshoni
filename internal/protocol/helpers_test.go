@@ -121,27 +121,44 @@ func decodeLenient(e Envelope, zero any) (reflect.Value, error) {
 	return v.Elem(), nil
 }
 
-// jsonTree decodes b into a generic tree. Envelopes without data get data: {} ("absent means {}").
+// jsonTree decodes b into a generic tree, with numbers as json.Number.
 func jsonTree(t testing.TB, b []byte) any {
 	t.Helper()
-	var v any
-	dec := json.NewDecoder(bytes.NewReader(b))
-	dec.UseNumber()
-	if err := dec.Decode(&v); err != nil {
+	v, err := parseJSONTree(b)
+	if err != nil {
 		t.Fatalf("invalid JSON: %v\n%s", err, b)
 	}
 	return v
 }
 
+// envelopeTree is jsonTree for an envelope. Envelopes without data get data: {} ("absent means {}").
 func envelopeTree(t testing.TB, b []byte) any {
 	t.Helper()
-	v := jsonTree(t, b)
+	v, err := parseEnvelopeTree(b)
+	if err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, b)
+	}
+	return v
+}
+
+func parseJSONTree(b []byte) (any, error) {
+	var v any
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
+func parseEnvelopeTree(b []byte) (any, error) {
+	v, err := parseJSONTree(b)
 	if m, ok := v.(map[string]any); ok {
 		if _, has := m["data"]; !has {
 			m["data"] = map[string]any{}
 		}
 	}
-	return v
+	return v, err
 }
 
 // findNull returns the path of the first null in a JSON tree, or "".

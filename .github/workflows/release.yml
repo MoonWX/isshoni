@@ -6,7 +6,9 @@
 #
 # - web is unprivileged and the only job that runs npm (every npm package is third-party code, bumped weekly).
 # - build runs goreleaser (.goreleaser.yaml) with write permissions and no Node: the draft release, the image
-#   ghcr.io/moonwx/isshoni:<v>, SBOMs, the cosign bundle of checksums.txt and the provenance attestations.
+#   ghcr.io/moonwx/isshoni:<v>, SBOMs, the cosign bundle of checksums.txt and the provenance attestations. For a
+#   final release it first checks the protocol compat snapshot (01 §14.3): internal/protocol/testdata/compat/<v>/,
+#   committed by the release-prep PR (`task release:compat VERSION=<v>`, 06 §9.1), must be a copy of testdata/v1.
 # - sign is the only job that sees the release signing key (06 §9.4), and runs nothing but checkout, gh and
 #   ssh-keygen. Its signature, checksums.txt.sig, is what install.sh checks before it installs anything.
 # - verify installs the draft with its own install.sh in systemd containers, and checks the cosign signatures and
@@ -188,6 +190,32 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: The protocol compat snapshot is committed and current (final releases)
+        # 01 §14.3, 06 §9.1: the release-prep PR runs task release:compat VERSION=<v> and commits
+        # internal/protocol/testdata/compat/<v>/, a copy of testdata/v1 that the compat test decodes from then on.
+        # This runs first, so a missing or stale snapshot stops the release before goreleaser makes a draft or pushes
+        # an image. A prerelease (-rc.N) and a dry run take no snapshot.
+        if: env.DRY_RUN == 'false' && env.PRERELEASE == 'false'
+        run: |
+          fixtures=internal/protocol/testdata/v1
+          snapshot=internal/protocol/testdata/compat/$VERSION
+          if [ ! -d "$snapshot" ]; then
+            echo "::error::there is no protocol compat snapshot $snapshot: run task release:compat VERSION=$VERSION in a release-prep PR (06 §9.1)"
+            exit 1
+          fi
+          # A link to the fixtures would always match them, and freeze nothing.
+          links=$(find "$snapshot" -type l)
+          if [ -n "$links" ]; then
+            printf '%s\n' "$links"
+            echo "::error::$snapshot holds symbolic links (above), not copies: run task release:compat VERSION=$VERSION in a release-prep PR (06 §9.1)"
+            exit 1
+          fi
+          if ! diff -r "$fixtures" "$snapshot"; then
+            echo "::error::$snapshot is not a copy of $fixtures (diff above): run task release:compat VERSION=$VERSION in a release-prep PR (06 §9.1)"
+            exit 1
+          fi
+          echo "$snapshot is a copy of $fixtures"
+
       - name: Download web/dist
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -249,16 +277,6 @@ jobs:
         run: |
           if [ ! -f README.md ]; then
             echo "::error::there is no README.md, and every release archive has one (06 §3; deploy/keys/README.md)"
-            exit 1
-          fi
-
-      - name: The protocol compat snapshot is committed (final releases)
-        # 01 §14.3 and 06 §9.1: the release-prep PR runs task release:compat. A prerelease and a dry run skip it.
-        if: env.DRY_RUN == 'false' && env.PRERELEASE == 'false'
-        run: |
-          snapshot=internal/protocol/testdata/compat/$VERSION
-          if [ ! -d "$snapshot" ] || ! diff -r internal/protocol/testdata/v1 "$snapshot"; then
-            echo "::error::run task release:compat VERSION=$VERSION in a release-prep PR (06 §9.1)"
             exit 1
           fi
 
