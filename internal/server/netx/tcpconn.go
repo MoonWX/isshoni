@@ -89,7 +89,8 @@ const (
 // iceListener wraps an ICE-TCP listener for ice.TCPMuxDefault. On 7882/tcp it allows at most limiter.max open
 // connections per IPKey (the excess is closed at once and counted in limiter.refused), and every accepted connection
 // counts its bytes on PathMediaTCP. With a nil limiter and a nil counter (PortMux's 443 ICE sub-listener, which PortMux
-// already limits and counts) it only tracks the connections for Close.
+// already limits and counts) it only tracks the connections for Close. With a guard (both ports in a Transport), each
+// connection goes to pion through a firstFrameGate, which applies the ICE source guard to its first frame.
 //
 // Accept never returns a transient error: pion's TCPMuxDefault stops accepting for good on the first error, so
 // transient errors are retried here and only a closed listener ends Accept.
@@ -101,6 +102,7 @@ type iceListener struct {
 	net.Listener
 	limiter *connLimiter // nil: no limit
 	counter *TransferCounter
+	guard   *sourceGuard // nil: connections go to pion as they are
 	log     *slog.Logger
 
 	mu        sync.Mutex
@@ -109,9 +111,11 @@ type iceListener struct {
 	closed    chan struct{}
 }
 
-func newICEListener(ln net.Listener, limiter *connLimiter, counter *TransferCounter, log *slog.Logger) *iceListener {
+func newICEListener(ln net.Listener, limiter *connLimiter, counter *TransferCounter, guard *sourceGuard,
+	log *slog.Logger,
+) *iceListener {
 	return &iceListener{
-		Listener: ln, limiter: limiter, counter: counter, log: log,
+		Listener: ln, limiter: limiter, counter: counter, guard: guard, log: log,
 		live: map[*countingConn]struct{}{}, closed: make(chan struct{}),
 	}
 }
@@ -176,10 +180,14 @@ func (l *iceListener) Accept() (net.Conn, error) {
 			}
 			key = k
 		}
-		if cc := l.track(c, key); cc != nil {
-			return cc, nil
+		cc := l.track(c, key)
+		if cc == nil {
+			return nil, net.ErrClosed
 		}
-		return nil, net.ErrClosed
+		if l.guard != nil {
+			return newFirstFrameGate(cc, l.guard), nil
+		}
+		return cc, nil
 	}
 }
 
