@@ -7,6 +7,8 @@
 // - The link lives in this dialog's state for one opening (05 §20): never in the REST cache, never in storage.
 //   Closing the dialog drops it: the server keeps only the token's hash, so the next opening makes a new invite.
 //   An invite already created stays on the server; the user sees and revokes theirs under /admin/invites.
+// - The card says where that page is in the user's menu: Admin → Invites for an admin (the card's own text, as in the
+//   wizard), My invites for a member (room.invite.once), whose menu has no Admin (05 §11.2).
 // - A failure says why there is no link. "Try again" follows it, except after a refusal no retry ends (403
 //   registration_closed or forbidden): that one marks ['info'] or ['me'] stale instead, so the menu, which read an
 //   older state, stops offering the entry.
@@ -19,6 +21,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { useApp } from '../app/context';
+import { isAdmin } from '../app/guards';
 import { Notice } from '../auth/Notice';
 import { errorMessage } from '../lib/errorText';
 import {
@@ -26,6 +29,7 @@ import {
   CodeRegistrationClosed,
   type CreateInviteRequest,
   type CreateInviteResponse,
+  type Me,
 } from '../protocol/api.gen';
 import { applyInvalidate } from '../protocol/invalidate';
 import { queryKeys } from '../protocol/queryKeys';
@@ -38,11 +42,19 @@ import { Spinner } from '../ui/Spinner';
 import styles from './InviteDialog.module.css';
 
 export interface InviteDialogProps {
+  /** GET /api/v1/me, as the account menu has it: says which way to the user's invites the card names. */
+  me: Me;
   open: boolean;
   onClose: () => void;
 }
 
-export function InviteDialog({ open, onClose }: InviteDialogProps) {
+/**
+ * The card's "once" text for a member: their way to /admin/invites is the menu's "My invites". An admin's is
+ * Admin → Invites, the card's own text.
+ */
+const MEMBER_ONCE_KEY = 'room.invite.once';
+
+export function InviteDialog({ me, open, onClose }: InviteDialogProps) {
   const { t } = useTranslation();
   return (
     <Dialog
@@ -55,7 +67,7 @@ export function InviteDialog({ open, onClose }: InviteDialogProps) {
         </Button>
       }
     >
-      {open && <NewInvite />}
+      {open && <NewInvite onceKey={isAdmin(me) ? undefined : MEMBER_ONCE_KEY} />}
     </Dialog>
   );
 }
@@ -68,8 +80,11 @@ function isRefused(err: unknown): boolean {
   return err instanceof ApiError && (err.code === CodeForbidden || err.code === CodeRegistrationClosed);
 }
 
-/** One opening of the dialog: creates the invite when it mounts, and shows its link, or why there is none. */
-function NewInvite() {
+/**
+ * One opening of the dialog: creates the invite when it mounts, and shows its link, or why there is none. onceKey
+ * goes to the card (InviteLinkCardProps.onceKey).
+ */
+function NewInvite({ onceKey }: { onceKey: string | undefined }) {
   const { t } = useTranslation();
   const { queryClient } = useApp();
   /** The new invite and its link, for this opening only. */
@@ -126,7 +141,7 @@ function NewInvite() {
       <p className={styles.lead}>{t('room.invite.lead')}</p>
       {created !== null ? (
         <div ref={card}>
-          <InviteLinkCard created={created} />
+          <InviteLinkCard created={created} onceKey={onceKey} />
         </div>
       ) : create.isError ? (
         <Notice

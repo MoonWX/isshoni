@@ -122,6 +122,7 @@ export function AccountMenu({ me, onTestConnection }: AccountMenuProps) {
         also after the permission went while it was open (a link it made stays on screen until then).
       */}
       <InviteDialog
+        me={me}
         open={inviting}
         onClose={() => {
           setInviting(false);

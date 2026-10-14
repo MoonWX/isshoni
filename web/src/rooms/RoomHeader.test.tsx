@@ -356,6 +356,8 @@ describe('the account menu', () => {
       answer();
       expect(await within(invite).findByRole('textbox', { name: 'Invite link' })).toHaveValue(INVITE_LINK);
       expect(bodies).toEqual([{}]);
+      // The menu tells the card who reads it: a member finds the invite under My invites, as their menu has it.
+      expect(within(invite).getByRole('link', { name: 'My invites' })).toHaveAttribute('href', '/admin/invites');
 
       await userEvent.click(within(invite).getByRole('button', { name: 'Done' }));
       expect(screen.queryByRole('dialog')).not.toBeInTheDocument();

@@ -358,7 +358,8 @@
       "creating": "Making an invite link…",
       "failed": "Couldn't make an invite link. {{message}}",
       "retry": "Try again",
-      "done": "Done"
+      "done": "Done",
+      "once": "Copy it now: for safety it can't be shown again. You'll find the invite under <a>My invites</a> in your account menu, where you can always make a new one."
     },
     "empty": {
       "title": "Nobody is sharing yet.",

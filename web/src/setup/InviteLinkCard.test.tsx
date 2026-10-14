@@ -1,5 +1,5 @@
 // InviteLinkCard (05 §14.1): the link once, with Copy, the QR code, Share… where the browser has it, the expiry and
-// the uses, and where to make another link.
+// the uses, and where to make another link: under Admin → Invites, or where the caller's own text says (onceKey).
 import { act, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -31,11 +31,14 @@ function created(overrides: Partial<CreateInviteResponse['invite']> = {}): Creat
   };
 }
 
-function renderCard(response: CreateInviteResponse = created()) {
+function renderCard(response: CreateInviteResponse = created(), onceKey?: string) {
   const services = createTestServices({
     info: infoFixture({ server: { name: 'Movie night', version: '0.1.0', publicUrl: '' } }),
   });
-  return renderRoute({ routes: [{ path: '/', element: <InviteLinkCard created={response} /> }], services });
+  return renderRoute({
+    routes: [{ path: '/', element: <InviteLinkCard created={response} onceKey={onceKey} /> }],
+    services,
+  });
 }
 
 function stubNavigator(name: 'clipboard' | 'share', value: unknown): void {
@@ -59,7 +62,29 @@ describe('InviteLinkCard', () => {
     const date = formatDateTime(new Date(EXPIRES), 'en');
     expect(screen.getByText(`Works for up to 10 people, until ${date}.`)).toBeInTheDocument();
     expect(screen.getByText(/Copy it now: for safety it can't be shown again/)).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: 'Admin → Invites' })).toHaveAttribute('href', '/admin/invites');
+  });
+
+  // The wizard's step 3 gives no onceKey: the admin's menu has Admin, and Invites under it.
+  it('says where to make another link: under Admin → Invites by default', () => {
+    renderCard();
+    const link = screen.getByRole('link', { name: 'Admin → Invites' });
+    expect(link).toHaveAttribute('href', '/admin/invites');
+    expect(link.closest('p')).toHaveTextContent(
+      "Copy it now: for safety it can't be shown again. You can always make a new one under Admin → Invites.",
+    );
+  });
+
+  // The room's invite dialog for a member: their menu has no Admin, but My invites, a link to the same page.
+  it("says the caller's text when given onceKey, its link still to /admin/invites", () => {
+    renderCard(created(), 'room.invite.once');
+    const link = screen.getByRole('link', { name: 'My invites' });
+    expect(link).toHaveAttribute('href', '/admin/invites');
+    expect(link.closest('p')).toHaveTextContent(
+      "Copy it now: for safety it can't be shown again. You'll find the invite under My invites in your account " +
+        'menu, where you can always make a new one.',
+    );
+    expect(screen.queryByText(/Admin → Invites/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'Admin → Invites' })).not.toBeInTheDocument();
   });
 
   it('says "1 person" for a one-use invite', () => {
