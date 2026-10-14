@@ -599,6 +599,335 @@
       "docker_ports": "Publishing ports from Docker"
     }
   },
+  "doctor": {
+    "skip": {
+      "needs_server": "Not checked: isshoni is not running.",
+      "interrupted": "Not checked: doctor was interrupted.",
+      "unsupported": "Not checked: not available on {{os}}.",
+      "not_reported": "Not checked: the server does not report it."
+    },
+    "config": {
+      "ok": "Loaded from {{file}}.",
+      "ok_noFile": "No config file at {{file}}: defaults, environment and flags.",
+      "ok_defaults": "Defaults and flags.",
+      "warnings": "{{count}} warnings: {{first}}",
+      "warnings_one": "1 warning: {{first}}",
+      "invalid": "{{count}} errors: {{first}}",
+      "invalid_one": "1 error: {{first}}"
+    },
+    "data_dir": {
+      "ok": "{{path}} (mode {{mode}}).",
+      "ok_free": "{{path}} (mode {{mode}}, {{free}} free).",
+      "not_created": "{{path}} does not exist yet. isshoni creates it at its first start.",
+      "missing": "{{path}} is gone while isshoni runs on it.",
+      "unreadable": "Can't look at {{path}}: {{error}}",
+      "not_dir": "{{path}} is not a directory.",
+      "not_mounted": "{{path}} is not a mounted volume: your data would be lost when the container is removed.",
+      "not_mounted_error": "Can't check that {{path}} is a mounted volume: {{error}}",
+      "ephemeral_allowed": "{{path}} is not a mounted volume, which ISSHONI_ALLOW_EPHEMERAL_DATA=1 allows: the data is lost when the container is removed.",
+      "wrong_owner": "{{path}} belongs to uid {{owner}}, but isshoni runs as uid {{uid}}.",
+      "wrong_owner_user": "{{path}} belongs to uid {{owner}}, but isshoni runs as the user {{user}} (uid {{uid}}).",
+      "wrong_owner_caller": "{{path}} belongs to uid {{owner}}, but doctor runs as uid {{uid}}.",
+      "not_writable": "{{path}} is not writable for isshoni ({{error}}).",
+      "mode_wide": "{{path}} has mode {{mode}}, so other users can look into it. isshoni makes it 0700 at its next start.",
+      "low_space": "{{path}} has only {{free}} free."
+    },
+    "secrets": {
+      "ok": "{{path}} (mode {{mode}}).",
+      "not_created": "{{path}} does not exist yet. isshoni creates it at its first start.",
+      "missing": "{{path}} is gone: the next start would make new keys and sign everyone out.",
+      "missing_offline": "{{path}} is missing next to a database: the next start would make new keys and sign everyone out.",
+      "unreadable": "Can't read {{path}}: {{error}}",
+      "wrong_owner": "{{path}} belongs to uid {{owner}}, but isshoni runs as uid {{uid}}.",
+      "wrong_owner_user": "{{path}} belongs to uid {{owner}}, but isshoni runs as the user {{user}} (uid {{uid}}).",
+      "wrong_owner_caller": "{{path}} belongs to uid {{owner}}, but doctor runs as uid {{uid}}.",
+      "corrupt": "{{path}} can't be used ({{error}}). isshoni never replaces it, because new keys would sign everyone out.",
+      "mode_wide": "{{path}} has mode {{mode}}. isshoni makes it 0600 at its next start."
+    },
+    "schema": {
+      "ok": "Schema {{version}}.",
+      "ok_path": "Schema {{version}} ({{path}}).",
+      "no_db": "No database yet at {{path}}. isshoni creates it at its first start.",
+      "older": "Schema {{version}}. This isshoni brings it to {{binary}} at its next start, after a backup.",
+      "newer": "Database schema {{version}} is newer than this isshoni build supports ({{binary}}): isshoni refuses to start.",
+      "history_mismatch": "The migration history in {{path}} is not this isshoni build's: isshoni refuses to start.",
+      "corrupt": "{{path}} failed its integrity check ({{error}}): isshoni refuses to start.",
+      "unreadable": "Can't read {{path}}: {{error}}"
+    },
+    "public_ip": {
+      "ok": "{{addresses}}.",
+      "no_ipv6": "{{addresses}}. No public IPv6 address.",
+      "no_ipv6_container": "{{addresses}}. IPv6 media is off (Docker bridge).",
+      "ipv6_only": "{{addresses}}. No public IPv4 address, so friends without IPv6 can't connect.",
+      "ephemeral": "{{addresses}}. The default public IPv4 changes on stop/start; in IP mode that moves the server's address and breaks every link, installed app and push subscription.",
+      "port_forward": "{{addresses}}. This machine is behind a router.",
+      "port_forward_local": "{{addresses}}. This machine is {{local}} behind a router.",
+      "symmetric": "{{addresses}}. The NAT in front gives every connection another port (symmetric NAT), so friends probably can't connect.",
+      "cgnat": "This machine's address {{local}} is carrier-grade NAT (100.64.0.0/10): friends can't connect from outside.",
+      "none": "No public IP address found: no public address on a network interface, and no STUN answer. The site opens, but nobody can share or watch: media has no address to offer.",
+      "none_running": "No public IP address found: no public address on a network interface, and no STUN answer. isshoni is running but not ready, and nobody can open it.",
+      "none_offline": "No public IP address found: no public address on a network interface, and no STUN answer. isshoni will start, but it won't be ready.",
+      "loopback": "Not checked: network.include_loopback is on and network.stun_servers is empty (a development setup, which needs no public address)."
+    },
+    "dns": {
+      "ok": "{{domain}} points to {{addresses}}, this server.",
+      "ok_caa": "{{domain}} points to {{addresses}}, this server. CAA allows letsencrypt.org.",
+      "no_domain": "No domain: the site is this server's IP address.",
+      "proxy": "tls.mode is off: DNS points at the proxy in front, which doctor can't check.",
+      "missing": "{{domain}} doesn't resolve.",
+      "wrong": "{{domain}} points to {{others}}, but this server is {{here}}.",
+      "also_elsewhere": "{{domain}} points to this server and also to {{others}}: visitors and Let's Encrypt reach either one.",
+      "no_a": "{{domain}} has an AAAA record only: friends without IPv6 can't open it.",
+      "aaaa_wrong": "{{domain}} has the AAAA record {{others}}, which is not this server: browsers that prefer IPv6 end up elsewhere.",
+      "caa_forbids": "A CAA record on {{caaName}} doesn't allow letsencrypt.org.",
+      "lookup_failed": "Could not look up {{domain}}: {{error}}",
+      "unverified": "{{domain}} points to {{addresses}}, but this server's public address is unknown (see the public IP check)."
+    },
+    "tls": {
+      "ok": "The {{subject}} is in place.",
+      "ok_valid": "The {{subject}} is valid until {{notAfter}}.",
+      "ok_renews": "The {{subject}} is valid until {{notAfter}} and renews on {{nextRenewal}}.",
+      "off": "Off: the proxy in front has the certificate.",
+      "pending": "Getting the {{subject}}. This usually takes less than a minute.",
+      "failing": "No certificate yet: the last attempt to get the {{subject}} failed. isshoni keeps trying.",
+      "no_cert": "Still no {{subject}}, {{uptime}} after the start.",
+      "no_public_ip": "No certificate: there is no public IP address to get one for (see the public IP check).",
+      "renewal_failing": "The renewal of the {{subject}} is failing.",
+      "renewal_failing_valid": "The {{subject}} is valid until {{notAfter}}, but its renewal is failing.",
+      "reload_failed": "The new files in tls.cert_file and tls.key_file were refused. The {{subject}} loaded before keeps serving.",
+      "expires_soon": "The {{subject}} ends on {{date}}, in {{days}}.",
+      "expired": "The {{subject}} is expired or not valid yet.",
+      "expired_date": "The {{subject}} expired on {{date}}.",
+      "not_loaded": "No certificate: tls.cert_file and tls.key_file could not be loaded."
+    },
+    "clock": {
+      "ok": "The clock is right.",
+      "ok_synced": "Synchronized.",
+      "ok_skew": "Within {{skew}} of {{host}}.",
+      "ok_syncedSkew": "Synchronized, within {{skew}} of {{host}}.",
+      "unknown": "Can't tell: the kernel's sync state is not readable here.",
+      "unknown_error": "Can't tell: the kernel's sync state is not readable here, and {{host}} did not answer ({{error}}).",
+      "unsynced": "The clock is not synchronized: no time service is keeping it right.",
+      "skew": "The clock is {{skew}} (compared with {{host}}).",
+      "cert_time": "The clock ({{now}}) looks far off: the certificate of {{host}} is not valid at that time."
+    },
+    "udp_buffers": {
+      "ok": "The media sockets have {{rcvBuf}} bytes to receive and {{sndBuf}} to send.",
+      "ok_sysctl": "net.core.rmem_max is {{rmemMax}}, net.core.wmem_max is {{wmemMax}}.",
+      "ok_both": "net.core.rmem_max is {{rmemMax}}, the media sockets have {{rcvBuf}}.",
+      "low": "The media sockets send from {{value}} bytes, isshoni wants {{want}}.",
+      "low_rmem": "net.core.rmem_max is {{value}}, isshoni wants {{want}}.",
+      "low_wmem": "net.core.wmem_max is {{value}}, isshoni wants {{want}}.",
+      "low_rcv": "The media sockets receive into {{value}} bytes, isshoni wants {{want}}.",
+      "udp_off": "UDP media is turned off (listen.ice_udp is empty).",
+      "unknown": "Not checked: net.core.rmem_max can't be read here, and isshoni is not running."
+    },
+    "ports": {
+      "listening": "Listening on {{ports}}.",
+      "free": "{{free}}.",
+      "free_unchecked": "{{free}}; {{unchecked}}.",
+      "disabled": "{{first}}. Turned off: {{disabled}}.",
+      "not_listening": "Not listening on {{missing}}.",
+      "not_listening_listening": "Not listening on {{missing}}; listening on {{listening}}.",
+      "in_use": "{{ports}} are in use by another program.",
+      "in_use_one": "{{ports}} is in use by another program."
+    },
+    "firewall_hint": {
+      "open_ports": "{{where}}: allow {{ports}}.",
+      "open_ports_oracle": "{{where}}: allow {{ports}}. Oracle's images also block these ports with their own iptables rules: open them on the server too.",
+      "open_ports_unknown": "Open {{ports}} in your provider's firewall or security group, and in this machine's own firewall if it has one."
+    },
+    "container": {
+      "none": "Not in a container.",
+      "detected": "{{kind}}: ports published from a bridge network must keep their numbers (443:443, 7882:7882/udp).",
+      "detected_bridge": "{{kind}}, bridge network: publish {{ports}} under the same numbers (443:443, 7882:7882/udp), because isshoni tells browsers the container's ports.",
+      "detected_host": "{{kind}}, host network: isshoni uses the host's ports directly."
+    },
+    "lan_privacy": {
+      "macos": "macOS: a browser on a Mac needs the Local Network permission (System Settings → Privacy & Security) to reach this server over the LAN. localhost is not affected.",
+      "not_macos": "Not a macOS host."
+    },
+    "transfer": {
+      "ok": "{{egress}} of {{limit}} sent in {{month}} ({{percent}}).",
+      "no_limit": "{{egress}} sent in {{month}}. No alert limit is set.",
+      "high": "{{egress}} of {{limit}} sent in {{month}} ({{percent}}).",
+      "high_projected": "{{egress}} of {{limit}} sent in {{month}} ({{percent}}). At this rate the month ends at {{projected}}.",
+      "over": "{{egress}} of {{limit}} sent in {{month}} ({{percent}}).",
+      "over_projected": "{{egress}} of {{limit}} sent in {{month}} ({{percent}}). At this rate the month ends at {{projected}}."
+    },
+    "release": {
+      "ok": "{{version}} is the latest release.",
+      "not_checked": "{{version}}. No release check yet (it runs once a day, unless it is switched off).",
+      "update": "isshoni {{latest}} is available (this is {{version}}).",
+      "security_update": "isshoni {{latest}} is available and fixes a security problem (this is {{version}})."
+    },
+    "nofile": {
+      "ok": "Open-file limit {{limit}}.",
+      "ok_offline": "Open-file limit {{limit}} (this shell's; the service gets its own from its unit or container).",
+      "low": "Open-file limit {{limit}}, isshoni wants {{want}}.",
+      "low_offline": "Open-file limit {{limit}} (this shell's; the service gets its own from its unit or container), isshoni wants {{want}}."
+    },
+    "bandwidth": {
+      "estimate": "{{people}} people, {{sharing}} sharing: about {{egress}} Mbps egress ({{wire}} on the wire), about {{gb}} GB per {{hours}}-hour session.",
+      "near_nic": "{{people}} people, {{sharing}} sharing: about {{egress}} Mbps egress ({{wire}} on the wire), about {{gb}} GB per {{hours}}-hour session. That is more than 80% of {{iface}}'s {{nicMbps}} Mbps."
+    },
+    "fix": {
+      "config": {
+        "fix_check": "This lists every problem with its fix:",
+        "fix_check_first": "{{firstFix}}"
+      },
+      "data_dir": {
+        "fix_sudo": "Run doctor as root:",
+        "fix_owner": "Give it to the user that isshoni runs as:",
+        "fix_owner_unknown": "Let the user that isshoni runs as read and write {{path}}.",
+        "fix_owner_container": "On the container's host, give the host path of {{path}} to uid {{uid}}:",
+        "fix_owner_ifOwner": "If isshoni runs as the owner (uid {{owner}}), run doctor as that user:",
+        "fix_owner_ifOther": "If it runs as {{who}}:",
+        "fix_owner_callerOwns": "Unless you start this isshoni yourself as {{user}}: then leave it as it is.",
+        "fix_not_dir": "Move that file away, or set data_dir to a directory.",
+        "fix_mount": "Mount a volume at {{path}} (see compose.yaml), for example with -v isshoni-data:{{path}}.",
+        "fix_mode": "Make it private to isshoni:",
+        "fix_space": "Free some space, or move data_dir to a larger disk."
+      },
+      "secrets": {
+        "fix_sudo": "Run doctor as root:",
+        "fix_owner": "Give it to the user that isshoni runs as:",
+        "fix_owner_unknown": "Let the user that isshoni runs as read and write {{path}}.",
+        "fix_owner_container": "On the container's host, give the host path of {{path}} to uid {{uid}}:",
+        "fix_owner_ifOwner": "If isshoni runs as the owner (uid {{owner}}), run doctor as that user:",
+        "fix_owner_ifOther": "If it runs as {{who}}:",
+        "fix_owner_callerOwns": "Unless you start this isshoni yourself as {{user}}: then leave it as it is.",
+        "fix_restore": "Restore it from a backup:",
+        "fix_mode": "Make it private to isshoni:"
+      },
+      "schema": {
+        "fix_sudo": "Run doctor as root:",
+        "fix_restore": "Or restore the database from before the upgrade, {{backup}}. Changes made after that backup are lost:",
+        "fix_upgrade": "Install the isshoni version that used this database last, or a newer one. No backup from before the upgrade was found.",
+        "fix_upgrade_version": "Install isshoni {{version}}, which used this database last, or a newer one. No backup from before the upgrade was found.",
+        "fix_same_build": "Install the isshoni version that used this database last, or restore a backup:",
+        "fix_same_build_version": "Install isshoni {{version}}, which used this database last, or restore a backup:",
+        "fix_restore_backup": "Restore a backup:"
+      },
+      "public_ip": {
+        "fix_set": "Set public_ip to this server's public address, or set domain, then restart isshoni.",
+        "fix_set_container": "Set ISSHONI_PUBLIC_IP in .env to this server's public address, or set a domain, then run:",
+        "fix_nat": "Run isshoni where it has a public IPv4 address of its own, for example on a small VPS, or ask your internet provider for a public address.",
+        "fix_forward": "On your router, forward {{ports}} to this machine.",
+        "fix_forward_local": "On your router, forward {{ports}} to {{local}}.",
+        "fix_static_ip": "Attach an Elastic IP (AWS) to this instance, or use a domain.",
+        "fix_static_ip_gcp": "Reserve a static external IP (GCP) for this instance, or use a domain."
+      },
+      "dns": {
+        "fix_add_record": "Add an A record for {{domain}} pointing to this server.",
+        "fix_add_record_ip": "Add an A record for {{domain}} pointing to {{ip}}.",
+        "fix_point_here": "Point {{domain}} to this server.",
+        "fix_point_here_ip": "Point the A record of {{domain}} to {{ip}} only, then run doctor again (a changed record can take a while to show).",
+        "fix_point_here_ipv6": "Point the AAAA record of {{domain}} to {{ipv6}}.",
+        "fix_aaaa": "Remove the AAAA record of {{domain}}: this server has no public IPv6 address.",
+        "fix_aaaa_ipv6": "Point the AAAA record of {{domain}} to {{ipv6}}, or remove it.",
+        "fix_caa": "Add the CAA record 0 issue \"letsencrypt.org\" to {{caaName}}, or remove its CAA records."
+      },
+      "tls": {
+        "acme_unreachable": "Let's Encrypt couldn't connect to {{name}} on port 80 or 443. Open TCP 80 and 443 in your cloud firewall.",
+        "dns_missing": "{{name}} doesn't resolve. Add an A record pointing to this server.",
+        "dns_missing_ip": "{{name}} doesn't resolve. Add an A record pointing to {{ip}}.",
+        "dns_wrong": "{{name}} doesn't point to this server. Change its A record (see the DNS check).",
+        "dns_wrong_ip": "{{name}} doesn't point to this server ({{ip}}). Change its A record (see the DNS check).",
+        "rate_limited": "Let's Encrypt's rate limit was reached. If you reinstalled, restore certmagic/ from a backup. The server's log says until when:",
+        "ip_rejected": "Let's Encrypt refused {{name}} (not a public address?).",
+        "caa_forbids": "A CAA record on {{name}} doesn't allow letsencrypt.org.",
+        "acme_failed": "The certificate authority refused or could not be reached. The server's log has its answer:",
+        "cert_unreadable": "isshoni can't read tls.cert_file or tls.key_file. Check the paths, and let the user that isshoni runs as read both, for example:",
+        "cert_invalid": "tls.cert_file and tls.key_file are not a certificate with its private key. Put the full chain in tls.cert_file and the matching key in tls.key_file, both as PEM.",
+        "cert_expired": "The certificate in tls.cert_file is expired or not valid yet. Replace it and its key; isshoni loads new files within a minute.",
+        "fix_replace": "Replace the files in tls.cert_file and tls.key_file; isshoni loads new files within a minute."
+      },
+      "clock": {
+        "fix_ntp": "Turn on time synchronization:",
+        "fix_ntp_container": "On the Docker host, turn on time synchronization:"
+      },
+      "udp_buffers": {
+        "fix_sysctl": "Raise the limits:",
+        "fix_sysctl_container": "On the Docker host, raise the limits:",
+        "fix_sysctl_reload": "Load isshoni's sysctl file:",
+        "fix_restart": "Restart isshoni so that its sockets get the larger buffers:",
+        "fix_restart_plain": "Restart isshoni so that its sockets get the larger buffers."
+      },
+      "ports": {
+        "fix_free": "Stop the other program (another isshoni?), or change {{keys}}.",
+        "fix_free_web": "Stop the other program (another web server?), or run isshoni behind it with tls.mode = \"off\"."
+      },
+      "transfer": {
+        "fix_review": "Compare it with your provider's allowance. The alert limit is under Settings, Transfer alert (limits.transfer_alert_gb), and lower share bitrates use less."
+      },
+      "release": {
+        "fix_upgrade": "Run the installer again to upgrade.",
+        "fix_upgrade_container": "Upgrade the container:"
+      },
+      "nofile": {
+        "fix_limit": "Raise LimitNOFILE in isshoni's systemd unit (sudo systemctl edit isshoni), then restart it.",
+        "fix_limit_container": "Raise the container's limit, for example in compose.yaml: ulimits: {nofile: 65536}."
+      },
+      "bandwidth": {
+        "fix_link": "Plan for a faster uplink, fewer people at once, or a lower limit on share bitrates (limits.max_bitrate_kbps)."
+      }
+    },
+    "part": {
+      "noAddress": "No public address",
+      "ip": {
+        "config": "{{ip}} (set in the config)",
+        "interface": "{{ip}} (on a network interface)",
+        "interfaceNamed": "{{ip}} (on interface {{iface}})",
+        "interfaceConfirmed": "{{ip}} (on a network interface, confirmed by STUN)",
+        "interfaceNamedConfirmed": "{{ip}} (on interface {{iface}}, confirmed by STUN)",
+        "stun": "{{ip}} (seen by STUN)",
+        "stunNat": "{{ip}} (seen by STUN, 1:1 NAT from {{local}})"
+      },
+      "cert": {
+        "auto": "certificate",
+        "ip": "IP certificate",
+        "manual": "manual certificate",
+        "for": "{{kind}} for {{names}}"
+      },
+      "ahead": "{{duration}} ahead",
+      "behind": "{{duration}} behind",
+      "tcpPorts": "TCP {{ports}}",
+      "udpPorts": "UDP {{ports}}",
+      "listeningOn": "Listening on {{ports}}",
+      "portsFree": "{{ports}} are free",
+      "portsFree_one": "{{ports}} is free",
+      "noPortChecked": "No port could be checked",
+      "unchecked": "not checked: {{ports}}",
+      "uncheckedDenied": "not checked without root: {{ports}}",
+      "portOff": "{{port}} ({{key}} is empty)",
+      "firewall": {
+        "aws": "AWS: in the EC2 console, under Security Groups, the inbound rules of this instance's group",
+        "gcp": "Google Cloud: under VPC network, Firewall, a rule for incoming traffic",
+        "azure": "Azure: the inbound security rules of this VM's network security group",
+        "oracle": "Oracle Cloud: the ingress rules of the subnet's security list",
+        "hetzner": "Hetzner: in the Cloud Console, under Firewalls",
+        "digitalocean": "DigitalOcean: under Networking, Firewalls, the firewall of this Droplet",
+        "vultr": "Vultr: under Firewall, the group linked to this instance",
+        "linode": "Akamai (Linode): in Cloud Manager, under Firewalls, the firewall of this Linode",
+        "scaleway": "Scaleway: the inbound rules of this instance's security group",
+        "ovh": "OVHcloud: the inbound rules of this instance's security group",
+        "alibaba": "Alibaba Cloud: the inbound rules of this instance's security group",
+        "tencent": "Tencent Cloud: the inbound rules of this instance's security group"
+      },
+      "proxyPorts": "TCP 80 and 443 belong to the proxy in front: open them for it.",
+      "dockerBridge": "Docker publishes ports past ufw: a published port is open even when ufw denies it.",
+      "container": {
+        "docker": "Docker",
+        "podman": "Podman",
+        "other": "A container"
+      },
+      "notUpYet": "If the network wasn't up yet when isshoni started, a restart is enough:",
+      "notUpYetPlain": "If the network wasn't up yet when isshoni started, restarting isshoni is enough.",
+      "schemaNewer": "The database was last used by a newer isshoni. Install that version or a newer one.",
+      "schemaNewer_version": "The database was last used by isshoni {{version}}. Install isshoni {{version}} or newer."
+    }
+  },
   "fix": {
     "firewall": {
       "aws": "In the AWS console, add inbound rules to this instance's security group: UDP {{udpPort}}, TCP 443 and {{tcpPort}}, and TCP 80 for certificates.",

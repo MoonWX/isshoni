@@ -45,14 +45,20 @@ export interface SectionProps {
   title: string;
   /** A line under the heading (translated). */
   lead?: ReactNode;
+  /**
+   * Whether the card is a region named by its heading (the default). False for a card around a component that is a
+   * region of its own with the same name (the connection test), so the page has no two landmarks of one name.
+   */
+  region?: boolean;
   children: ReactNode;
 }
 
 /** A titled card: a form ("New invite"), a group of settings. */
-export function Section({ title, lead, children }: SectionProps) {
+export function Section({ title, lead, region = true, children }: SectionProps) {
   const headingId = useId();
+  const Card = region ? 'section' : 'div';
   return (
-    <section className={styles.section} aria-labelledby={headingId}>
+    <Card className={styles.section} {...(region ? { 'aria-labelledby': headingId } : {})}>
       <header className={styles.sectionHeader}>
         <h2 id={headingId} className={styles.sectionTitle}>
           {title}
@@ -60,7 +66,7 @@ export function Section({ title, lead, children }: SectionProps) {
         {lead !== undefined && <p className={styles.lead}>{lead}</p>}
       </header>
       {children}
-    </section>
+    </Card>
   );
 }
 

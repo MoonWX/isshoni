@@ -1,0 +1,151 @@
+.runRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3) var(--space-4);
+  align-items: center;
+}
+
+.running {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}
+
+.none {
+  color: var(--color-text-muted);
+}
+
+.ran {
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}
+
+.version {
+  white-space: nowrap;
+}
+
+.summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.checks {
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  list-style: none;
+  border-top: var(--border-width) solid var(--color-border);
+}
+
+.check {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+  padding: var(--space-4) 0;
+  border-bottom: var(--border-width) solid var(--color-border);
+}
+
+.icon {
+  display: flex;
+  flex: none;
+  padding-top: 0.125rem;
+  color: var(--color-text-muted);
+}
+
+.icon svg {
+  width: 1.25rem;
+  height: 1.25rem;
+}
+
+.ok .icon {
+  color: var(--color-success);
+}
+
+.warn .icon {
+  color: var(--color-warning);
+}
+
+.fail .icon {
+  color: var(--color-danger);
+}
+
+.info .icon {
+  color: var(--color-link);
+}
+
+.body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+.name {
+  font-weight: var(--weight-medium);
+}
+
+.message {
+  display: flex;
+  flex-direction: column;
+  overflow-wrap: anywhere;
+  text-wrap: pretty;
+}
+
+.note {
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}
+
+.fix {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  font-size: var(--text-sm);
+  background-color: var(--color-surface-2);
+  border-radius: var(--radius-md);
+}
+
+.fixLabel {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.step {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+  font-size: var(--text-sm);
+}
+
+.links a {
+  display: inline-flex;
+  gap: var(--space-1);
+  align-items: center;
+}
+
+.links svg {
+  width: 0.875rem;
+  height: 0.875rem;
+}
