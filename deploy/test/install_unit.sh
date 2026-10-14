@@ -686,6 +686,7 @@ ss() {
   esac
 }
 
+# shellcheck disable=SC2030 # the ports_needed cases set the CFG_ values in subshells of their own, on purpose
 test_check_ports() {
   CFG_TLS_MODE=auto
 
@@ -1118,6 +1119,119 @@ test_precheck() {
 }
 
 # ---------------------------------------------------------------------------------------------------------------
+# What the installer reads from isshoni: the settings of the config, and the status of the running server
+
+# Recorded output of isshoni, run as root in a Debian container (record it again when that output changes):
+#   testdata/config-print/MODE.txt   `isshoni config print --config /etc/isshoni/isshoni.toml` for the config that
+#                                    `isshoni config init` writes with the installer's flags: auto is --domain
+#                                    share.example.com, ip is --tls.mode ip, off is --tls.mode off --public-url
+#                                    https://share.example.com --listen.http 127.0.0.1:8080;
+#   testdata/admin-status.json       `isshoni admin status --json` of the server of distro-test.sh's C1 (off mode,
+#                                    ISSHONI_PUBLIC_IP=203.0.113.7), its container address replaced with 10.0.0.2.
+PRINTED=$HERE/testdata/config-print
+STATUS_JSON=$HERE/testdata/admin-status.json
+
+# with_isshoni PRINT STATUS CMD ARGS... runs CMD in a subshell whose as_root answers the two isshoni commands that
+# the installer reads: `config print` of the config with the file PRINT, and `admin status --json` with the file
+# STATUS. An empty name makes that command fail, as it does when the config can't be read or no server answers.
+with_isshoni() {
+  (
+    BIN=/usr/local/bin/isshoni
+    CONFIG=/etc/isshoni/isshoni.toml
+    wi_print=$1
+    wi_status=$2
+    shift 2
+    # shellcheck disable=SC2329 # the functions of install.sh call it
+    as_root() {
+      case "$*" in
+      "$BIN config print --config $CONFIG") [ -n "$wi_print" ] && cat "$wi_print" ;;
+      "$BIN admin status --json") [ -n "$wi_status" ] && cat "$wi_status" ;;
+      *)
+        printf 'as_root was called with: %s\n' "$*" >&2
+        return 1
+        ;;
+      esac
+    }
+    "$@"
+  )
+}
+
+# loaded prints the settings that load_config read.
+loaded() {
+  load_config
+  # shellcheck disable=SC2031 # load_config sets them in this shell
+  printf 'mode=%s domain=%s url=%s https=%s http=%s udp=%s tcp=%s' "$CFG_TLS_MODE" "$CFG_DOMAIN" \
+    "$CFG_PUBLIC_URL" "$CFG_HTTPS" "$CFG_HTTP" "$CFG_ICE_UDP" "$CFG_ICE_TCP"
+}
+
+# origin_shown prints the address that the end of a run names, after load_config.
+origin_shown() {
+  load_config 2>/dev/null
+  site_origin
+}
+
+test_load_config() {
+  # Every key line of the recorded output is `key = value  # source`; listen.http must not pick up listen.https,
+  # which comes first.
+  assert_eq 'load_config: auto' \
+    'mode=auto domain=share.example.com url= https=:443 http=:80 udp=:7882 tcp=:7882' \
+    "$(with_isshoni "$PRINTED/auto.txt" '' loaded 2>&1)"
+  assert_eq 'load_config: ip' 'mode=ip domain= url= https=:443 http=:80 udp=:7882 tcp=:7882' \
+    "$(with_isshoni "$PRINTED/ip.txt" '' loaded 2>&1)"
+  assert_eq 'load_config: off' \
+    'mode=off domain= url=https://share.example.com https=:443 http=127.0.0.1:8080 udp=:7882 tcp=:7882' \
+    "$(with_isshoni "$PRINTED/off.txt" '' loaded 2>&1)"
+
+  # `config print` fails and prints nothing: the default ports, and a warning.
+  run with_isshoni '' '' loaded
+  assert_eq 'load_config: nothing printed' 0 "$RC"
+  assert_contains 'load_config: nothing printed, the default ports' \
+    'mode= domain= url= https=:443 http=:80 udp=:7882 tcp=:7882' "$OUT"
+  assert_contains 'load_config: nothing printed, the warning' \
+    'Warning: Could not read the settings in /etc/isshoni/isshoni.toml ("isshoni config print" did not show them).' \
+    "$OUT"
+  assert_contains 'load_config: nothing printed, what happens' \
+    'The installer goes on and checks the default ports: 80, 443 and 7882.' "$OUT"
+
+  # Output without the mode line (another version of isshoni, say): none of its values are taken.
+  printf '%s\n' '# config file: /etc/isshoni/isshoni.toml' 'domain = "share.example.com"' \
+    'listen.https = ":8443"' 'listen.ice_udp = ":9000"' >"$WORK/printed-other"
+  run with_isshoni "$WORK/printed-other" '' loaded
+  assert_contains 'load_config: no mode line, the default ports' 'https=:443 http=:80 udp=:7882 tcp=:7882' "$OUT"
+  assert_contains 'load_config: no mode line, the warning' 'Could not read the settings' "$OUT"
+}
+
+test_status_field() {
+  assert_eq 'status_field: version' 0.0.1-ci.1 "$(with_isshoni '' "$STATUS_JSON" status_field version)"
+  assert_eq 'status_field: origin' http://127.0.0.1:8080 "$(with_isshoni '' "$STATUS_JSON" status_field origin)"
+  assert_eq 'status_field: a number is no string field' '' "$(with_isshoni '' "$STATUS_JSON" status_field rooms)"
+  assert_eq 'status_field: no server' '' "$(with_isshoni '' '' status_field version)"
+
+  assert_eq 'running_other_version: the same version' no "$(
+    TV=0.0.1-ci.1
+    with_isshoni '' "$STATUS_JSON" running_other_version && printf yes || printf no
+  )"
+  assert_eq 'running_other_version: another version' yes "$(
+    TV=0.0.1-ci.2
+    with_isshoni '' "$STATUS_JSON" running_other_version && printf yes || printf no
+  )"
+  assert_eq 'running_other_version: no server' no "$(
+    TV=0.0.1-ci.2
+    with_isshoni '' '' running_other_version && printf yes || printf no
+  )"
+
+  # The address that a run names when setup is done: the server's own, or else the config's.
+  assert_eq 'site_origin: from the server' http://127.0.0.1:8080 \
+    "$(with_isshoni "$PRINTED/off.txt" "$STATUS_JSON" origin_shown)"
+  assert_eq 'site_origin: no server, off mode' https://share.example.com \
+    "$(with_isshoni "$PRINTED/off.txt" '' origin_shown)"
+  assert_eq 'site_origin: no server, auto mode' https://share.example.com \
+    "$(with_isshoni "$PRINTED/auto.txt" '' origin_shown)"
+  assert_eq 'site_origin: no server, ip mode' "https://<this server's address>" \
+    "$(with_isshoni "$PRINTED/ip.txt" '' origin_shown)"
+}
+
+# ---------------------------------------------------------------------------------------------------------------
 # How the script ends
 
 # The three ways a run ends, each with the installer's exit trap in place.
@@ -1169,6 +1283,58 @@ What to do next.' "$OUT"
     assert_eq "exit: the download directory is removed ($how)" no "$([ -e "$WORK/download-dir" ] && printf yes || printf no)"
   done
   TMP=''
+}
+
+# end_by_signal SIG sets the traps of main and sends this shell SIG, while there are a download directory and a
+# config that has not passed the pre-check: a Ctrl-C (INT), a kill (TERM), or a dropped SSH session (HUP).
+end_by_signal() {
+  set_traps
+  step 'downloading the release'
+  TMP=$WORK/signal-dir
+  mkdir -p "$TMP/dl"
+  CONFIG=$WORK/pending.toml
+  : >"$CONFIG"
+  CONFIG_PENDING=1
+  # $$ is the test script's PID in a subshell too. The parent of a program that a subshell execs is the subshell.
+  ebs_pid=$(exec sh -c 'printf "%s\n" "$PPID"')
+  kill -s "$1" "$ebs_pid"
+  sleep 1
+}
+
+# signal_ignored SIG reports whether SIG was ignored when this script started, as nohup does with HUP and a
+# non-interactive shell with INT for a command it starts in the background: then no shell started from here can
+# trap SIG. The shell that looks traps the signal it sends itself, so that nothing dies of it here (bash would take
+# a child that INT ended for a Ctrl-C of its own).
+signal_ignored() {
+  # shellcheck disable=SC2016 # the variables are that shell's
+  [ "$(sh -c 'trap "printf trapped" "$1"; kill -s "$1" "$$"' sh "$1")" != trapped ]
+}
+
+test_signals() {
+  for sig in INT TERM HUP; do
+    if signal_ignored "$sig"; then
+      printf 'note: SIG%s was ignored when this script started, so its case is skipped\n' "$sig"
+      continue
+    fi
+    run end_by_signal "$sig"
+    case $sig in
+    INT)
+      assert_eq 'signal INT: exit 8 (cancelled)' 8 "$RC"
+      assert_eq 'signal INT: the message' '
+Cancelled.' "$OUT"
+      ;;
+    *)
+      assert_eq "signal $sig: exit 1" 1 "$RC"
+      assert_eq "signal $sig: the message names the step" '
+Error: Stopped by a signal while downloading the release.
+Run this installer again: it goes on where it stopped.' "$OUT"
+      ;;
+    esac
+    assert_eq "signal $sig: the download directory is removed" no \
+      "$([ -e "$WORK/signal-dir" ] && printf yes || printf no)"
+    assert_eq "signal $sig: the config of this run is removed" no \
+      "$([ -e "$WORK/pending.toml" ] && printf yes || printf no)"
+  done
 }
 
 test_backup_lookup() {
@@ -1309,7 +1475,10 @@ test_confirm
 test_config_init
 test_question
 test_precheck
+test_load_config
+test_status_field
 test_exit_codes
+test_signals
 test_backup_lookup
 test_iptables
 

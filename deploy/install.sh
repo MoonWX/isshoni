@@ -1590,12 +1590,23 @@ cleanup() {
 }
 
 # set_traps makes the script end through cleanup when a signal ends it, too: Ctrl-C is a cancel (exit 8), a kill
-# and a terminal that went away (HUP, which a dropped SSH session sends) are exit 1. Without a trap of its own, a
-# signal ends dash and busybox sh at once, and the EXIT trap does not run.
+# and a terminal that went away (HUP, which a dropped SSH session sends) are exit 1 (stopped_by_signal). Without a
+# trap of its own, a signal ends dash and busybox sh at once, and the EXIT trap does not run.
 set_traps() {
   trap cleanup EXIT
   trap 'PLANNED_EXIT=1; printf "\n%s\n" "Cancelled." >&2; exit 8' INT
-  trap 'PLANNED_EXIT=1; exit 1' TERM HUP
+  trap stopped_by_signal TERM HUP
+}
+
+# stopped_by_signal ends a run that a kill or a hangup stopped with exit 1, an unexpected error, whose message says
+# at which step (06 §4.1). The message may have nowhere to go, the terminal of a dropped SSH session or a pipe whose
+# reader is gone: neither a failed write nor a SIGPIPE may keep cleanup from running.
+stopped_by_signal() {
+  PLANNED_EXIT=1
+  trap '' PIPE
+  printf '\n%sError:%s Stopped by a signal while %s.\n%s\n' "$E_RED" "$E_RESET" "$STEP" \
+    'Run this installer again: it goes on where it stopped.' >&2 || :
+  exit 1
 }
 
 # running_other_version reports whether the running server is another version than the installed program: an

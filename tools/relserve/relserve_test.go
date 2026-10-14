@@ -17,7 +17,15 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"go.uber.org/goleak"
 )
+
+// TestMain fails the tests when a goroutine outlives them: the server that run starts, its connections, or a
+// test's own run.
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m)
+}
 
 const (
 	testV1      = "0.0.1-ci.1"

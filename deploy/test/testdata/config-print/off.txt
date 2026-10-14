@@ -1,0 +1,45 @@
+# config file: /etc/isshoni/isshoni.toml
+# effective tls.mode: off
+domain = ""                                                     # default
+public_ip = "auto"                                              # default
+public_ipv6 = "auto"                                            # default
+public_url = "https://share.example.com"                        # file /etc/isshoni/isshoni.toml:20
+data_dir = "/var/lib/isshoni"                                   # default
+shutdown_timeout = "10s"                                        # default
+listen.https = ":443"                                           # default
+listen.http = "127.0.0.1:8080"                                  # file /etc/isshoni/isshoni.toml:36
+listen.ice_udp = ":7882"                                        # default
+listen.ice_tcp = ":7882"                                        # default
+listen.admin_socket = "/run/isshoni/admin.sock"                 # default
+tls.mode = "off"                                                # file /etc/isshoni/isshoni.toml:52
+tls.acme_email = ""                                             # default
+tls.acme_ca = "https://acme-v02.api.letsencrypt.org/directory"  # default
+tls.acme_staging = false                                        # default
+tls.acme_ca_root = ""                                           # default
+tls.cert_file = ""                                              # default
+tls.key_file = ""                                               # default
+tls.hsts = true                                                 # default
+network.stun_servers = ["stun.cloudflare.com:3478", "stun.l.google.com:19302"]  # default
+network.ipv6 = true                                             # default
+network.exclude_interfaces = ["docker*", "br-*", "veth*", "virbr*", "cni*", "flannel*", "cali*", "kube-*"]  # default
+network.include_loopback = false                                # default
+network.udp_buffer_bytes = 8388608                              # default
+network.trusted_proxies = ["127.0.0.0/8", "::1/128"]            # file /etc/isshoni/isshoni.toml:101
+# registration.mode: not set (admin UI value applies; default "invite")
+# clients.min_version: not set (admin UI value applies; default "")
+# limits.max_participants_per_room: not set (admin UI value applies; default 0)
+# limits.max_shares_per_room: not set (admin UI value applies; default 0)
+# limits.max_bitrate_kbps: not set (admin UI value applies; default 0)
+# limits.transfer_alert_gb: not set (admin UI value applies; default 0)
+limits.ws_handshakes_per_ip_per_minute = 20                     # default
+limits.conns_per_ip = 256                                       # default
+# updates.release_check: not set (admin UI value applies; default true)
+updates.release_url = "https://api.github.com/repos/MoonWX/isshoni/releases"  # default
+sfu.pause_unwatched_layers = true                               # default
+push.enabled = true                                             # default
+push.subject = ""                                               # default
+metrics.enabled = false                                         # default
+metrics.listen = "127.0.0.1:9469"                               # default
+metrics.pprof = false                                           # default
+log.level = "info"                                              # default
+log.format = "auto"                                             # default
