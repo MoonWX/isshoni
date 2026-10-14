@@ -1545,6 +1545,13 @@ Construction details:
   candidates of a real offer. The one kept address that gets no TCP entry is the IPv6 loopback `::1` (§7.6).
 - Interfaces are enumerated once at startup (06: systemd `After=network-online.target`). Hot-plugged interfaces need a
   restart.
+- **Pion's lines from the muxes** (`quietLogger`, over the bridge of §10, `component=netx`, scope `ice`) carry
+  addresses and are no business of an operator's at info: its warnings ("Error reading first packet from <addr>",
+  from port scanners and stray packets) and, since the group 11 integration, its info lines ("Listening TCP on
+  <ip>:<port>", "Added connection: tcp remote <addr> to local <addr>") are debug lines, and so is the UDP mux's
+  "Failed to write packet" for a packet that arrives for a connection that has just closed (`io.ErrClosedPipe`).
+  Other errors keep their level. The SFU's Pion logger does the same for its info lines (02 §13), so that at info
+  and above no line names an address (README §6 "Decided after group 11" (2)); `TestQuietLogger` covers it.
 
 ### 7.4 Public IP detection and NAT classification
 
@@ -1698,7 +1705,8 @@ Request:  {"transport": "udp" | "tcp443" | "tcp7882", "offer": "<SDP with one da
 Response: 200 {"answer": "<SDP>", "expiresInS": 20,
                "server": {"publicIp": "203.0.113.7", "provider": "hetzner", "container": "none",
                           "udpPort": 7882, "tcpPorts": [443, 7882], "nat": "none"}}
-Errors:   400 bad_sdp · 409 transport_disabled (params.transport) · 429 rate_limited · 503 not_ready
+Errors:   400 bad_sdp · 409 transport_disabled (params.transport) · 422 validation_failed (fields.transport)
+          · 429 rate_limited · 503 not_ready
 ```
 
 - 409 `transport_disabled` (with `params.transport`) is returned when that transport has no listener: `tcp443` in off
@@ -1712,7 +1720,8 @@ package ops
 
 type Prober interface {
 	// The wiring adapts 02's SFU.Probe: it converts userID/transport to sfu.UserID/sfu.ProbeTransport, discards
-	// the result channel, and maps sfu.probe_limit to 429 rate_limited and sfu.transport_disabled to 409.
+	// the result channel, and maps sfu.probe_limit to 429 rate_limited and sfu.transport_disabled to 409
+	// (README S80 also: sfu.bad_sdp to 400 bad_sdp and sfu.closed to 503 not_ready; below).
 	Probe(ctx context.Context, userID string, transport string, offerSDP string) (answerSDP string, err error)
 }
 ```
@@ -1732,6 +1741,36 @@ Types (`internal/protocol/api/conntest.go`): `ConnTestRequest`, `ConnTestRespons
 `type CloudProvider string` with one constant per §13.3 id and `type NATKind string` with the §7.4 values, so
 `task gen` puts them in `api.gen.ts` for 05's check and 06's anchor test. `ConnTestServerInfo.Provider` and `.NAT` use
 these types, and `netx` and `doctor` use them instead of their own.
+
+**As README S80 built it** (`ops/conntest.go`; the route and the `Prober` in `wire.go`, `wireConnTest`), where the
+text above leaves a choice:
+- **The checks, in order**: a missing transport is 422 `validation_failed` with `fields.transport` `required`, one
+  that is not `udp`, `tcp443` or `tcp7882` the same with `invalid` (03's rule for a bad body field; the SPA never
+  sends either, and the SFU is never asked about a transport it doesn't know); a transport without a listener is
+  409 `transport_disabled`; then the user's limit; then the SFU (none: 503 `not_ready`). README §6 "Decided after
+  group 11" (6).
+- **What the limit counts**: the requests that pass the first two checks, the ones the SFU answers included,
+  `bad_sdp` too. A request for an unknown transport or one without a listener costs nothing. The window is a
+  sliding minute per user: the 13th request within it is 429 with `retryAfter` (whole seconds, at least 1) until
+  the oldest leaves it. Memory only, like every throttle; a user who stopped testing leaves the map within two
+  minutes.
+- **The `Prober`'s errors**, mapped in `wire.go` (`probeError`): `sfu.probe_limit` is 429 with the SFU's wait as
+  `retryAfter`; `sfu.transport_disabled` is 409 with `params.transport`, built by `ops.TransportDisabled`, which
+  `ConnTest` uses too, so both say the same; `sfu.bad_sdp` is 400 `bad_sdp`; `sfu.closed` is 503 `not_ready` (the
+  SFU is closed, or the same user's next probe of the transport replaced this one before it was answered). Any
+  other error, `sfu.internal` among them, is a 500 `internal` that `WriteError` logs. When the request has ended by
+  then (the browser left while the SFU waited for ICE gathering), its context error is joined in, so the 500 of a
+  client that went away is logged at debug, not as a server error: `sfu.Error` carries no cause (02 §6.3).
+- **Which transports have a listener** is `ops.ConnTestPorts` (0 for none), filled from the Transport's muxes and
+  the bound addresses. The answer's `server` object is built once at start: `udpPort` 0 without UDP, `tcpPorts` in
+  the order 443, 7882 (`[]`, not null, without either), `publicIp` only for a known IPv4 address, and `unknown`,
+  `none` and `unknown` for a provider, container and NAT kind that weren't found.
+- **Tests**: `ops/conntest_test.go` with a fake `Prober` (the answers, the server object, validation, each
+  transport without a listener, the limit and how it forgets, the `Prober`'s errors passed on); `wire_test.go`'s
+  `TestProber` (the mapping, a request that ended among it) and `TestConnTestPorts`; and in `internal/server`
+  against `servertest`, `TestConnTest` (off mode: `udp` and `tcp7882` answered with only their candidates and
+  connected, `tcp443` 409, an unknown transport 422, a second probe of a user and transport replacing the first, no
+  test without a session), `TestConnTestOverTLS` (the `tcp443` probe of §17) and `TestConnTestWithoutUDP`.
 
 ### 7.8 Limits and timeouts (summary)
 
@@ -2278,7 +2317,9 @@ Rules:
   their type.
 - **No SDP**: our code never logs signaling payloads. The pion bridge maps pion levels to slog (trace/debug → debug),
   defaults to warn, rate-limits each scope to 20 lines per minute ("N messages suppressed"), and drops any message
-  containing `a=` lines or `candidate:`.
+  containing `a=` lines or `candidate:`. Its two users go further: the SFU's and netx's Pion loggers log Pion's
+  info lines at debug, the SFU also Pion's warnings and errors that hold an address, and netx its muxes' warnings
+  (02 §13, §7.3 here).
 - **No access logs.** Security events (rate-limit hits, login failures) may carry `remote_ip`; 03's audit log in the DB
   holds the durable record (30-day pruning).
 - **Attribute names**: `component` (e.g. `tls`, `netx`, `push`, `sfu`, `signal`, `store`), `user_id`, `room_id`,
@@ -3869,8 +3910,8 @@ no tokens, SDP, push endpoints or usernames.
   `isshoni_sfu_selected_transport{transport="tcp443"}` counts both PCs. S7's `servertest` check (README S44) runs
   before that wiring, so it uses a stub `/ws` handler and a raw RFC 4571 STUN frame on the 443 port, not media.
 - **Connection test over TLS**: `servertest.Options{TLS: true}`; `POST /api/v1/conntest` with `tcp443` returns an
-  answer that connects through the 443 multiplexer (README S80). The browser e2e harness runs in off mode only, so
-  this Go test is the only `tcp443` probe check (05 §19.3).
+  answer that connects through the 443 multiplexer (README S80, `TestConnTestOverTLS`; §7.7 lists the others). The
+  browser e2e harness runs in off mode only, so this Go test is the only `tcp443` probe check (05 §19.3).
 - **Graceful shutdown**: connected clients receive `server.shutdown`, `error{server_shutdown}` and close code 1012
   within 2 s; REST gets 503 `server_shutdown`; `Run` returns within `shutdown_timeout`; goleak clean.
 - **Refusing to start**: seed a DB with a newer schema → `serve` exits 78 and prints 03's message with the backup
@@ -4197,3 +4238,12 @@ Decided after group 10 (an engineering call the owner delegated; README §6 (1))
    attempted once, one subscription per web session and 2 s dial and TLS-handshake timeouts (§14.2–§14.5, 03 §12.4.6;
    README F08); R5, `admin backup` without `--out` could write into a FIFO that another user placed at the default
    name, which README F09 fixes in group 12 (§12.3).
+
+Decided after group 11 (engineering calls the owner delegated; README §6 (2), (6)):
+
+10. **Pion's info lines from netx's muxes are debug lines**, like its warnings there and like the SFU's Pion info
+    lines (§7.3, §10; 02 §13). Logged at debug, they had named the listen addresses and each client's address at
+    info.
+11. **The connection test answers a missing or unknown transport with 422 `validation_failed`**, 03's rule for a
+    bad body field, and maps 02's `sfu.bad_sdp` to 400 `bad_sdp` and `sfu.closed` to 503 `not_ready`; only the
+    requests that get past the transport checks count toward its limit (§7.7, README S80).

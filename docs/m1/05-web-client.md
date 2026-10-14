@@ -1058,14 +1058,17 @@ background (about a minute), and that Firefox decodes only Constrained Baseline 
   the last connection-test result.
 
 `window.__isshoni` (read-only `stats()` and `state()`, plus `dropSocket()` for the reconnect test, which closes the
-socket with code 3000 so the server treats it as a network drop) exists only when
-`sessionStorage['isshoni.debug'] === '1'`, which e2e sets with `addInitScript`. It exposes nothing the user can't see
-in the debug overlay.
+socket with a code that keeps the server's grace, so the server treats it as a network drop, 01 §4.2) exists only
+when `sessionStorage['isshoni.debug'] === '1'`, which e2e sets with `addInitScript`. It exposes nothing the user
+can't see in the debug overlay.
 
 As wired so far (`rooms/connectStats.ts`, group 5 integration): the collector starts with the first `room.state` of a
 room and stops when the session has no room anymore, which also drops its samples. Its only source is the sub PC
-(`viewer/stats.ts`); the pub PC's source, the `stats` notification and the overlay come with W13, and `dropSocket()`
-with W9 (until then it throws). `stats()` resolves with a fresh `StatsSample` (`pcs`, `shares[shareId].video|audio`,
+(`viewer/stats.ts`); the pub PC's source, the `stats` notification and the overlay come with W13. `dropSocket()`
+still throws `NotImplementedError` after W9 (README S81): it needs a public hook on 01's `SignalClient`
+(`web/src/protocol/signal-client.ts`), which README F12 adds and passes in from `connectStats.ts`. `reconnect.spec`
+doesn't use it: it drops the socket with the harness's `link`, which ends the socket's TCP connection the way a
+network does (§19.3). `stats()` resolves with a fresh `StatsSample` (`pcs`, `shares[shareId].video|audio`,
 `outbound`), and `state()` returns ids and states, no names:
 `{connection: {state, resumed, connectionId}, room: {roomId, joinState, rev, participants}, viewer}`, where `viewer`
 is `viewerDebugState` (`focusedShareId`, `audibleShareId`, `audio`, `audioPlaying`, `media`, `subGen`, `shares[]`).
@@ -1148,6 +1151,39 @@ export type RoomEventTap = (e: RoomEvent) => boolean | undefined;   // true: the
   were built side by side in group 4, so until the room page plugs viewer/ and share/ in (§11.2),
   `rooms/seams.test.ts` checks at compile time that `SubscriberPC`, `createWatchToast`, `syncRoom`, `attachViewer`
   and share/'s `StartShare` fit them.
+
+**`ShareRecovery` as README S81 built it** (`share/BrowserShare.ts`, `BrowserSharing.ts`, `PublisherPC.ts`,
+`recovery.ts`; `rooms/RoomSession.ts`). `BrowserShare` implements all three methods. Where the text above leaves
+a choice, or the work sits elsewhere than it says:
+- **`resync(ctx)` with `ctx.kept` does nothing**: the pub PC re-sends its pending offer and restarts ICE by itself
+  on the resumed `ready` (§13.6), and a lost `share.start` is retried where it was sent (next bullet). Without
+  `kept`, the share is published again: `PublisherPC.forgetServer(welcome)` drops the local pub PC without a
+  message (once per `welcome`, also after a resumed one that needed a `room.join`), then `share.start {replaces:
+  its id, ref: new}` and its tracks on a new pub PC of `gen` 1. It resolves once that offer is out, or once the
+  share has given up; it never rejects.
+- **The same-`ref` retry of a `share.start` lost with the socket** (01 §10.5) is not in `resync`. A first start is
+  retried inside `BrowserSharing.start` (`requestShareStart`, `recovery.ts`), since no `ActiveShare` exists yet:
+  when the next `welcome` resumes the connection in the same room within the capture hold, the request goes again
+  with the same data, `ref` included, and the start goes on from its answer; a connection that wasn't kept (or no
+  `ready` within the hold) rejects it with `connection_lost`. The capture ending ends that wait at once
+  (`ShareCancelledError`): the browser's "Stop sharing" bar is the user's way out, since the panel has no share to
+  stop yet (§13.7). A re-publish whose answer was lost keeps its `ref`, and `republish()` uses it again: the
+  session's check after a resumed `welcome` always calls `republish()` then, and a retry in `resync(kept)` too would
+  send a second `share.start {replaces}`.
+- **`republish()`** publishes the share again under a new id (`share.start {replaces}`) on a **new pub PC of the
+  next `gen`**, which the server takes in place of the one it kept, like a rebuild (01 §9 rule 2), with the
+  connection's other shares on it; not with new transceivers on the kept PC (README §6 "Decided after group 11"
+  (4), §13.6). One re-publish runs at a time, and it never rejects: a refusal ends the share with that error.
+- **The reconcile after a resumed `welcome` spares the re-publish's copy.** A server share of this connection whose
+  `replaces` is the local share's id, while the local share is missing from the snapshot and has `republish`, is
+  the server's copy of a re-publish whose answer the socket took: `republish()` asks again with the same `ref` and
+  gets it (01 §8.7), so the session doesn't `share.stop` it. A copy that the re-publish didn't claim (the capture
+  had ended, the server refused) is stopped once the re-publish has settled.
+- **Snapshots without the old id while the share is published again** are not "the server ended it" (§13.1's
+  fallback): the session counts the new id from the first snapshot that lists it, after a `welcome` that didn't
+  keep the media and while `republish()` runs.
+- The share gets a new id each time: it emits `state` (§8), and the page's preview and watchers follow it; it is
+  `reconnecting` meanwhile and `live` again once the pub PC is connected and the server lists the share.
 
 **`SubscriptionSync` lives in `rooms/`** (`rooms/subscriptionSync.ts`, exported from `rooms/index.ts`), one per
 session as `session.subscriptions`. Its API is `set(wants)` (the complete desired set from the viewer's
@@ -1399,10 +1435,10 @@ with a list that re-snaps the way a browser does.
 - `autoFocus.test.ts` holds the rules and the settle step, the two cases of the review included: a speaker-button
   choice that survives its share's audio going away and coming back, and a re-published share whose first live has
   no audio yet, which gets the sound when its audio comes.
-- **Open, for the owner** (README §6 "Decided after group 9"; still open after group 10): when the focused share has
-  no sound, nothing from the stage is heard. The alternative is to keep the previous share's sound playing until a
-  share with sound is focused. Until the owner answers, the rule above stands and the code stays as README S72 built
-  it (§24).
+- **Open, for the owner** (README §6 "Decided after group 9"; still open after groups 10 and 11): when the focused
+  share has no sound, nothing from the stage is heard. The alternative is to keep the previous share's sound playing
+  until a share with sound is focused. Until the owner answers, the rule above stands and the code stays as README
+  S72 built it (§24).
 
 ### 12.4 Layer policy
 
@@ -1536,9 +1572,9 @@ pseudo-fullscreen and the keyboard, and nothing else.
     `document.pictureInPictureEnabled` and not iOS (§8; an iPad that calls itself a Mac counts as iOS). That is
     the desktop browsers, and it is also **Android Chrome**, which reports PiP too, where the rule above says
     "desktop only". Whether Android keeps the button is an **open question for the owner** (asked after group 6,
-    still open after groups 7, 8, 9 and 10): the rule above stands as written, the code stays as built until the
-    answer, and the manual matrix row M-AND-1 (§19.4) is where it shows. iOS is not part of the question: no PiP
-    there in M1.
+    still open after groups 7, 8, 9, 10 and 11): the rule above stands as written, the code stays as built until
+    the answer, and the manual matrix row M-AND-1 (§19.4) is where it shows. iOS is not part of the question: no
+    PiP there in M1.
 - **Wake lock.** `platform.requestWakeLock()` is the browser's side (§8) and answers `null` where the API is
   missing or refuses (battery saver, iOS Low Power Mode); the viewer asks for it only where
   `capabilities.wakeLock` is true, and only decides when to hold one: while the page is visible and a share that
@@ -1802,9 +1838,17 @@ How S46 built the second half (`starting` to the end; `share/BrowserSharing.ts`,
   would run without it (the M1 UI starts one). `shareStore` gained the publisher's half for this: `publishing`,
   `advance`, `report` (`preset`, `params`, `withAudio`, `soundOn`, `hint`, `unreachable`) and `finish`, and the
   fields `soundOn`, `unreachable`, `notice` and `panels` (how many share panels are mounted).
-- **Not here yet** (README S81, the web recovery slice): `BrowserShare.resync` and re-publishing with `replaces`,
-  and the 60 s capture hold of §13.6. Until then the room session stops a share whose server side is gone (a
-  `welcome` that was not resumed).
+- **Following a reconnect** came with README S81, the web recovery slice: `BrowserShare.resync` and `republish`,
+  the same-`ref` retry of a lost `share.start`, and the room session's part are §11.1 ("`ShareRecovery` as README
+  S81 built it"); the pub PC's part is §13.6.
+- **The capture hold** (README S81, 01 §10.6): while signaling isn't `ready`, a share keeps its capture for 60 s
+  (`CAPTURE_HOLD_MS`); every `ready` ends the wait and the next drop starts a new one. When the time is up the share
+  ends without telling the server (nothing can be sent; a resumed connection's reconcile stops the server's copy, and
+  a new one never had it) and goes to `failed` with a `ShareEndedError` of kind `unreachable`: "Sharing stopped: the
+  server was unreachable" (`share.ended.unreachable`) and [Test my connection] (§13.7). A `share.start` waits for a
+  resumed connection at most as long (§11.1).
+- **A capture that ended while the server was away** is not published again: the share ends as if the browser's
+  "Stop sharing" had been pressed, with nothing to tell the server.
 
 ### 13.2 `getDisplayMedia` options (plan values, feature-detected)
 
@@ -2027,6 +2071,17 @@ export class PublisherPC {
   and `gen` starts at 1 again (01 §9 rule 2), whether or not a PC exists here at that moment: the local PC is
   dropped without a message, and the shares stay known, parked, until they are removed or published again (S81).
   The PC listens to the signaling state for its whole life for this.
+- **Publishing a share again** (README S81; 01 §10.6). Two methods beyond the listing: `republish(oldId, params)`
+  moves a share to the id that `share.start {replaces}` gave it, with the same tracks and preset, always on a new PC:
+  `gen + 1` when there is one, which carries every share again like a rebuild (the others under the ids they have) and
+  replaces the server's PC on the higher `gen`, or `gen` 1 after a `welcome` that left the server without a pub PC.
+  Never with new transceivers on the current PC: stopping the old ones rejects the first m-section, the BUNDLE group's
+  tag, and Chrome then moves the group to a new transport (new ICE credentials in the re-offer), which the SFU's PC
+  doesn't follow; in `reconnect.spec` (d) it went back to `connecting` and failed 20 s later (README §6 "Decided after
+  group 11" (4)). It rejects with `LocalError webrtc_failed`, with nothing of the share left on the PC.
+  `forgetServer(welcome)` drops the local PC without a message and resets `gen` to 1, as a `welcome` that was not
+  resumed does, once per `welcome`: a share's `resync` calls it whenever the server didn't keep the media, which
+  matters after a resumed `welcome` that still needed a `room.join` (a new MediaPeer, 01 §8.4).
 - **Errors in scope `pc`** (`handleError`): one that names the outstanding offer clears it. `sdp_invalid` and
   `bad_request` → one rebuild, and `failed` the second time within 60 s (01 §9 rule 8), as for an offer or answer
   that can't be applied locally. `stale_negotiation` is ignored. `rate_limited` → the offer goes out again after
@@ -2059,13 +2114,17 @@ and an expander with the preset picker, a **sound on/off** toggle, a level meter
 
 As S46 built the panel (`share/SharePanel.tsx`, `LevelMeter.tsx`, `levelAudio.ts`, `hints.ts`, `watchers.ts`):
 - **It is a view of `shareStore`'s second half**: nothing while `idle`, `picking` or `confirming`; "Starting…" with
-  Stop; the live bar; "Reconnecting…" while the pub PC recovers, or "Can't reach the server's media port" with
-  [Test my connection] once the PC is `unreachable`; "Stopping…"; and a failed share with its error (and [Test my
-  connection] after a `media_timeout`) until it is dismissed. The room page mounts it once, under the stage, with
-  `share = RoomSession.share`, `onStop = session.stopShare` and `watchers = shareWatchers(room.state, shareId)`.
+  Stop; the live bar; "Reconnecting…" while the pub PC recovers, or "Can't reach the server's media port" with [Test
+  my connection] once the PC is `unreachable`; "Stopping…"; and a failed share with its error (and [Test my
+  connection] after a `media_timeout`, and since README S81 also after the capture hold's end, "Sharing stopped: the
+  server was unreachable", §13.1: both are ends the network may explain) until it is dismissed. The room page mounts
+  it once, under the stage, with `share = RoomSession.share`, `onStop = session.stopShare` and `watchers =
+  shareWatchers(room.state, shareId)`.
 - **Stop is disabled while the share is `starting` and the session has no share yet.** `share.start` is still on
   its way then, the session has nothing to stop, and a click must not look as if it worked while the share goes
-  live anyway. The browser's own "Stop sharing" bar works throughout.
+  live anyway. The browser's own "Stop sharing" bar works throughout; since README S81 it also ends at once a
+  start whose `share.start` waits for a resumed connection, which can last up to the 60 s of the capture hold
+  (§11.1).
 - **The note of a pick without sound shows in the bar itself** (§13.3: "Live, with the note"), from the start of
   the share: friends hear nothing, and the sharer has to see that without opening anything. With the expander
   open, the note is where the sound switch would be. The upload and CPU hints show in the bar too.
@@ -3032,9 +3091,10 @@ reconfigured or restarted:
   specs.
 
 A spec that needs a server that isn't set up, a different config, a restart, or a change to server-wide settings
-calls `startServer` for its own: `setup.spec`, `reconnect.spec` (c), `tcp-only.spec` and `admin.spec` (see the
-table below). This is the rule for new specs too. The harness needs no TLS: the `tcp443` probe ("TCP 443 ✓") is
-covered in Go (04 §17, a `servertest` case with TLS).
+calls `startServer` for its own: `setup.spec`, `reconnect.spec` (every case: (c) restarts its server, and the others
+count what a room's pages do), `tcp-only.spec` and `admin.spec` (see the table below). This is the rule for new specs
+too. The harness needs no TLS: the `tcp443` probe ("TCP 443 ✓") is covered in Go (04 §17, a `servertest` case with
+TLS).
 
 CI runs Chrome stable headful under `xvfb-run` with a PulseAudio null sink (06's `e2e` job). Chrome flags:
 `--auto-select-tab-capture-source-by-title=isshoni-e2e-tone`, `--allow-loopback-in-peer-connection`, and
@@ -3158,8 +3218,10 @@ text above leaves something open:
   network with a SOCKS5 proxy on a free loopback port instead, which the person's browser context uses
   (`proxy: socks5://…`) and which the test closes: every connection through it ends without a goodbye, and no new
   one gets through until the test lets them again. A later spec that cuts the network has to take this into
-  account: `reconnect.spec` (README S81) uses `setOffline` in its case (b) of the table below, which asks only for
-  the page's own banner, not for the server to see the cut.
+  account. README S81 moved the proxy into `e2e/fixtures.ts` as the test-scoped `link` fixture (`link.proxy` for
+  `browser.newContext({proxy: {server: …}})`, `cut()`, `restore()`), which `rooms.spec` and `reconnect.spec` share;
+  only TCP goes through it, so a cut leaves the context's WebRTC media on UDP alone. `reconnect.spec` cuts with it
+  in its case (b) too, not with `setOffline`: the banner of §7.1 needs the page's socket to close.
 - **`--mute-audio`.** Playwright starts a headless Chrome with `--mute-audio` (one of its own defaults for headless
   Chromium; `chromeArgs` doesn't add it, and the headful CI run has no such flag). Muting the output changes
   nothing the specs read: the sound checks read the receiving PeerConnection's `audioLevel` and
@@ -3222,12 +3284,12 @@ Stats are read through `window.__isshoni.stats()` (§10.7).
 |---|---|
 | `setup.spec` | own server with `setUp: false`: wizard: admin created; connection test shows UDP ✓, TCP 7882 ✓, TCP 443 row hidden (`transport_disabled` in off mode); invite link and QR present; `setupWizardDone` set. A second own server with `{'listen.ice_udp': ''}`: the UDP row shows ✗ with `conntest.udpDisabled` |
 | `invite.spec` | a second context opens the invite link, signs up, lands in Lounge; the fragment is gone from the URL; both appear in the people panel. As README S66 built it (on the worker's server): the token is in no request URL and in none of the tab's storage either, and a used-up link says so |
-| `rooms.spec` (README S66; a server per test, since it counts a room's people) | two people see each other within 1 s of the second one's `room.join`; closing a tab takes its person out at once (the page closes with 1000, the hub skips the grace), unless the person has another tab in the room; a person whose network is cut stays as "Reconnecting…" for the 30 s grace, is gone after it, and is back by themselves when the network is (the cut is a SOCKS5 proxy that the test closes, not `setOffline`: below); the room switcher appears only with a second room, and switching asks first while sharing and takes the person and the share out of the room they leave |
+| `rooms.spec` (README S66; a server per test, since it counts a room's people) | two people see each other within 1 s of the second one's `room.join`; closing a tab takes its person out at once (the page closes with 1000, the hub skips the grace), unless the person has another tab in the room; a person whose network is cut stays as "Reconnecting…" for the 30 s grace, is gone after it, and is back by themselves when the network is (the cut is a SOCKS5 proxy that the test closes, not `setOffline`: below); the room switcher appears only with a second room, and switching asks first while sharing and takes the person and the share out of the room they leave. Since README S81 the proxy is the shared `link` fixture |
 | `watch.spec` | sharer (tone tab) live; `room.state` lists layers `high` and `low`; the viewer's focused tile has `framesDecoded > 0` and `frameHeight ≥ 540`; audio `audioLevel > 0.05` and `totalAudioEnergy` rising; the sharer sees the viewer's name. As README S66 built it (a server per test): the high layer may take up to 40 s (below); the stage and its Mute and Fullscreen buttons fit the window; a reload watches again and is counted once; Stop, a closed sharer tab and (headful only) a closed shared tab each end the share at once; the same page shares again and a latecomer watches it; in a low window (900×600, 700×520, 683×600) the stage gives way and the tiles stay above the sharer's bar, also with the share's settings open (§12.1, §13.7) |
 | `focus-audio.spec` | 2 sharers + viewer: audio bytes flow only for the focused share; clicking the other tile flips it within 2 s; the speaker button moves audio without moving focus; the newest share is auto-focused. As README S72 built it (fake display, a server per test): a share without sound takes the stage and nothing is heard; after a pick a new share is a toast with Watch, also in a real fullscreen stage |
 | `layers.spec` | thumbnail `frameHeight ≤ 360`; a tile scrolled out of view stops receiving video bytes within 3 s; fullscreen turns thumbnails off. As README S72 built it (fake display, a server per test): a tile scrolled into view receives video again; a tile whose video stops says "Waiting for video…" and plays again when it comes back (§12.6) |
 | `unmute.spec` | without the autoplay flag, "Tap to unmute" appears; after a click, the audio element plays and `audioLevel > 0.05`. As README S72 built it (fake display, Chrome's default autoplay policy stated, a CDP reader and a trace without DOM snapshots: above): a later change of what is heard needs no tap; the M key and the header's pill are the tap too |
-| `reconnect.spec` | (a) `__isshoni.dropSocket()`: resumed with the same `connectionId`, `framesDecoded` keeps rising, no new sub offer; (b) `context.setOffline(true)` for 5 s: the banner appears after 2 s, then clears; (c) own server, `restart()` (same data dir and ports): the viewer decodes the re-published share within 15 s, focused, with audio |
+| `reconnect.spec` | (a) `__isshoni.dropSocket()`: resumed with the same `connectionId`, `framesDecoded` keeps rising, no new sub offer; (b) `context.setOffline(true)` for 5 s: the banner appears after 2 s, then clears; (c) own server, `restart()` (same data dir and ports): the viewer decodes the re-published share within 15 s, focused, with audio. As README S81 built it (fake display, a server per test, the `link` fixture, above): (a) cuts the viewer's link and restores it at once, which ends the socket's TCP connection without a close frame (`dropSocket()` still throws, §10.7): resumed with the same `connectionId`, the same sub `gen`, the video still decoding and no sub offer from the server's `Resync()`; (b) cuts the link for 5 s: "Reconnecting…" shows 2 s after the cut and not before, goes once the page is back, and the connection is resumed; (c) also checks that the friend's pick is kept (`focusMode` manual) and that the sharer was never asked to pick again; (d) the server ends a share while its sharer's link is cut (another tab of the same person stops it), the link comes back within the grace: the sharer publishes it again with `replaces` on a new pub PC of the next `gen`, whose first offer the SFU answers with nothing failing, and the friend decodes the new share |
 | `warning.spec` | fake display `monitor+audio` shows the warning; "Share without sound" publishes without an audio track; "Pick something else" reopens the picker. As README S66 built it (a server per test): nothing is shared before the answer; "Share with sound anyway" publishes both tracks, and the friend gets both; what is picked behind "Pick something else" is shared (the tone tab through the real picker when headful, another fake display when headless) |
 | `a11y.spec` | axe (`wcag2a`, `wcag2aa`, `wcag21aa`) on login, invite, reset, setup, the room with a share, admin users: no serious or critical violations; the tile list is keyboard-reachable; `F` toggles fullscreen |
 | `pwa.spec` | the manifest parses; the service worker activates; offline navigation shows the Offline screen from the cached shell. As README S77 wrote it: the manifest has what an install needs (Chrome's own parser reads it too); the worker activates, controls the page and precaches the shell; an offline navigation, and a navigation after the server has stopped (every byte from the worker's cache), both show the Offline screen; the notifications page against the real server (push on by default): the switch where Chrome can push, the preferences saved and there after a reload, and a block set through Chrome's DevTools protocol (`Browser.setPermission`, which Playwright lacks) showing the help instead of the switch. The spec turns service workers on for itself (`test.use({serviceWorkers: 'allow'})`), and each test that registers one has a server of its own, because the port makes the origin. Real pushes are the manual rows M-IOS-2 and M-AND-1 (§19.4) |
@@ -3388,15 +3450,21 @@ Decided after group 5 (engineering calls the owner delegated; README §6):
   01 §8.7). The M1 UI changes a preset only from the publishing page; the push to the publisher comes with the M2
   desktop handoff.
 
+Decided after group 11 (an engineering call the owner delegated; README §6 (4)):
+- **A share published again on a kept connection goes onto a new pub PC** of the next `gen`, which the server takes
+  in place of the one it kept, not onto new transceivers of the kept PC (§11.1, §13.6). Chrome's re-offer that
+  stops the old transceivers moves the BUNDLE group to a new transport, which the SFU's PC doesn't follow
+  (`reconnect.spec` (d), README S81).
+
 **Open, for the owner** (README §6):
-- **Picture-in-picture on Android Chrome** (§12.5; raised after group 6, still open after groups 7, 8, 9 and 10). The
-  rule says "desktop only" and hides PiP on iOS. README S56 built it by capability: the button is there wherever the
-  browser reports PiP and the device is not iOS, which includes Android Chrome. The two readings differ only there.
-  Until the owner answers, the rule in §12.5 is not changed and the code stays as built; "keep it" needs one sentence
-  in §12.5, "hide it" one more condition in the platform's `pip` capability (§8).
-- **The sound when the focused share has none** (§12.3; raised after group 9, from README S72; still open after group
-  10). Focus on a share without sound, automatic or picked, leaves nothing from the stage heard ("audio follows focus"
-  taken literally). The alternative is to keep the previous share's sound playing until a share with sound is focused.
-  It is not blocking: before S72 such a page was silent too. Until the owner answers, the rule in §12.3 is not changed
-  and the code stays as S72 built it; keeping the previous sound would be a change to the settle step of §12.3
-  (`settleSound`), which today gives the sound to the stage's share or to nothing.
+- **Picture-in-picture on Android Chrome** (§12.5; raised after group 6, still open after groups 7, 8, 9, 10 and 11).
+  The rule says "desktop only" and hides PiP on iOS. README S56 built it by capability: the button is there wherever
+  the browser reports PiP and the device is not iOS, which includes Android Chrome. The two readings differ only
+  there. Until the owner answers, the rule in §12.5 is not changed and the code stays as built; "keep it" needs one
+  sentence in §12.5, "hide it" one more condition in the platform's `pip` capability (§8).
+- **The sound when the focused share has none** (§12.3; raised after group 9, from README S72; still open after groups
+  10 and 11). Focus on a share without sound, automatic or picked, leaves nothing from the stage heard ("audio follows
+  focus" taken literally). The alternative is to keep the previous share's sound playing until a share with sound is
+  focused. It is not blocking: before S72 such a page was silent too. Until the owner answers, the rule in §12.3 is
+  not changed and the code stays as S72 built it; keeping the previous sound would be a change to the settle step of
+  §12.3 (`settleSound`), which today gives the sound to the stage's share or to nothing.

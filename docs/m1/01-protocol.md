@@ -3375,7 +3375,9 @@ generated arrays; this imports the Go fixtures with `import.meta.glob`, so one f
 - **Watch**: the sharer tab (canvas + tone source, S4 finding 7) and the viewer tab assert `framesDecoded > 0` and
   audio energy.
 - **Reconnect**: `context.setOffline(true)` for 5 s on the viewer, then back online. It asserts "Reconnecting…"
-  appeared, playback continues, and the same `connectionId` is in the debug overlay (`resumed`).
+  appeared, playback continues, and the same `connectionId` is in the debug overlay (`resumed`). As README S81
+  built it (05 §19.3): Chrome's offline emulation leaves an open WebSocket alone, so the viewer's network is cut
+  with the harness's SOCKS link instead, which carries only TCP and ends the socket without a close frame.
 - **Restart**: restart the server process during a share; the viewer shows the replaced share within 15 s, focused,
   with audio.
 - **Focus**: two sharers; clicking the second tile moves audio; axe checks pass.
