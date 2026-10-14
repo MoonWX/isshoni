@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.27.1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 # The isshoni server image (docs/m1/06-deploy-and-ci.md §6.1). Built by goreleaser's dockers_v2 at a release and by
 # deploy/docker/test/docker-build.sh in CI and for `task docker:smoke`. The build context holds the prebuilt static
 # binary as linux/<arch>/isshoni, deploy/docker/rootfs/, LICENSE, NOTICE and THIRD_PARTY_NOTICES.

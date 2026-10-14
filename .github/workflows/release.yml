@@ -1,0 +1,658 @@
+# The release pipeline (docs/m1/06-deploy-and-ci.md §9.3, "06" below).
+#
+#   tag v* ──► version ──► web ──► build ──► sign ──► verify ──► publish
+#                                            │ environment "release": runs only after the owner approves
+#                                  a draft release exists; nothing is public but the exact image tag :<v>
+#
+# - web is unprivileged and the only job that runs npm (every npm package is third-party code, bumped weekly).
+# - build runs goreleaser (.goreleaser.yaml) with write permissions and no Node: the draft release, the image
+#   ghcr.io/moonwx/isshoni:<v>, SBOMs, the cosign bundle of checksums.txt and the provenance attestations.
+# - sign is the only job that sees the release signing key (06 §9.4), and runs nothing but checkout, gh and
+#   ssh-keygen. Its signature, checksums.txt.sig, is what install.sh checks before it installs anything.
+# - verify installs the draft with its own install.sh in systemd containers, and checks the cosign signatures and
+#   the attestations.
+# - publish publishes the draft. Only a final release becomes GitHub's "latest" and moves the floating image tags
+#   (:0.<minor> and :latest in 0.x); a prerelease (-rc.N) moves neither.
+# The site job (`uses: ./.github/workflows/site.yml`, after publish) comes with the project site, README S82. It
+# needs `if: ${{ !cancelled() && needs.publish.result == 'success' }}`, not a plain condition: sign-dry is skipped
+# on a tag, and a job-level success() counts every job upstream (see publish).
+#
+# Dry run (Actions → Release → Run workflow, dry_run on): the same jobs as 0.0.0-dryrun.<run>, with goreleaser's
+# snapshot (built and signed with cosign, never published), a sign-dry job that signs with a key made in the job, and
+# verify against those files with an install.sh that carries that key. Nothing needs approval, nothing is public.
+#
+# Rules for every workflow (06 §8.1): a read-only token by default, with jobs raising their own permissions;
+# third-party actions pinned by full commit SHA with a version comment; checkout without persisted credentials;
+# timeout-minutes on every job. This workflow uses no caches: a release builds from the module proxy and npm alone.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: >-
+          Dry run: build everything as 0.0.0-dryrun.<run>, sign with a throwaway key, install it, publish nothing.
+          A release itself starts from a pushed v* tag.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  # One run per tag; a release is never cancelled half-way by another run.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  IMAGE: ghcr.io/moonwx/isshoni
+
+jobs:
+  version:
+    # The version is computed once (06 §9.3): the tag without "v", or 0.0.0-dryrun.<run>.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      dry-run: ${{ steps.version.outputs.dry-run }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      floating-tags: ${{ steps.version.outputs.floating-tags }}
+      task-version: ${{ steps.version.outputs.task-version }}
+    steps:
+      - name: Check out .tool-versions
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .tool-versions
+          sparse-checkout-cone-mode: false
+
+      - name: Compute the version
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          floating=''
+          if [ "$EVENT" = workflow_dispatch ]; then
+            if [ "$DRY_RUN" != true ]; then
+              echo "::error::A release starts from a pushed v* tag (06 §9.1); a manual run is the dry run only"
+              exit 1
+            fi
+            version=0.0.0-dryrun.$RUN_NUMBER dry=true prerelease=true
+          else
+            if [ "$REF_TYPE" != tag ]; then
+              echo "::error::release.yml runs for v* tags and as a dry run, not for $REF_TYPE $REF_NAME"
+              exit 1
+            fi
+            # Versions are vX.Y.Z, prereleases vX.Y.Z-rc.N (06 §9.1).
+            re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.[1-9][0-9]*)?$'
+            if ! [[ $REF_NAME =~ $re ]]; then
+              echo "::error::$REF_NAME is not a release tag: vX.Y.Z, or vX.Y.Z-rc.N for a prerelease (06 §9.1)"
+              exit 1
+            fi
+            major=${BASH_REMATCH[1]} minor=${BASH_REMATCH[2]}
+            version=${REF_NAME#v} dry=false prerelease=false
+            if [ -n "${BASH_REMATCH[4]}" ]; then
+              prerelease=true
+            elif [ "$major" = 0 ]; then
+              # 0.x: no :0, a 0.x minor may break things (06 §3).
+              floating="0.$minor latest"
+            else
+              floating="$major.$minor $major latest"
+            fi
+          fi
+          task_version=$(awk '$1 == "task" { sub(/^v/, "", $2); print $2; exit }' .tool-versions)
+          if [ -z "$task_version" ]; then
+            echo "::error file=.tool-versions::.tool-versions needs a task pin, a line 'task <version>' (06 §7.1)"
+            exit 1
+          fi
+          {
+            echo "version=$version"
+            echo "tag=v$version"
+            echo "dry-run=$dry"
+            echo "prerelease=$prerelease"
+            echo "floating-tags=$floating"
+            echo "task-version=$task_version"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### isshoni $version"
+            echo
+            echo "Dry run: $dry. Prerelease: $prerelease. Floating image tags after publish: ${floating:-none}."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  web:
+    # Unprivileged, and the only job that runs npm (06 §9.3): the build half of ci.yml's web job, for this version.
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node (version from .tool-versions)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .tool-versions
+
+      - name: npm ci
+        run: npm ci --prefix web --no-audit --no-fund
+
+      - name: npm run build (writes web/dist/version.json and licenses.txt)
+        env:
+          ISSHONI_VERSION: ${{ needs.version.outputs.version }}
+        run: npm --prefix web run build
+
+      - name: Upload web/dist
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: web-dist
+          path: web/dist
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    # goreleaser and the pinned Go tools only: no Node, no npm on this runner (06 §9.3).
+    needs: [version, web]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write # the draft release
+      packages: write # the image :<v>
+      id-token: write # cosign keyless signing, attestations
+      attestations: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      DRY_RUN: ${{ needs.version.outputs.dry-run }}
+      PRERELEASE: ${{ needs.version.outputs.prerelease }}
+    steps:
+      - name: Check out (with history and tags, for goreleaser's changelog)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download web/dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: web-dist
+          path: web/dist
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Set up Task
+        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: ${{ needs.version.outputs.task-version }}
+
+      - name: Set up cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+
+      - name: Set up syft (goreleaser's SBOMs)
+        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          syft-version: v1.54.1
+
+      - name: Set up Docker Buildx (dockers_v2 builds both platforms and an SBOM attestation)
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build the pinned goreleaser into .bin/
+        run: |
+          task release:goreleaser
+          .bin/goreleaser --version
+
+      - name: Install rpm (release:assets lists the rpm packages and their dependencies with it)
+        run: |
+          if ! command -v rpm > /dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends rpm
+          fi
+          rpm --version
+
+      - name: The installer carries the release keys
+        # The key block of install.sh is how users verify the release (06 §4.3). Without
+        # deploy/keys/allowed_signers it is empty, and the released installer would refuse to install anything
+        # (deploy/keys/README.md).
+        if: env.DRY_RUN == 'false'
+        run: |
+          if [ ! -s deploy/keys/allowed_signers ]; then
+            echo "::error file=deploy/keys/allowed_signers::there are no release keys yet: see deploy/keys/README.md"
+            exit 1
+          fi
+          task lint:keys
+
+      - name: The repository has the README.md that every archive carries
+        # 06 §3; release:assets FULL=true checks the archives for it after goreleaser. This fails before a draft
+        # or an image exists. .goreleaser.yaml takes it by a pattern, which would let it go missing quietly.
+        run: |
+          if [ ! -f README.md ]; then
+            echo "::error::there is no README.md, and every release archive has one (06 §3; deploy/keys/README.md)"
+            exit 1
+          fi
+
+      - name: The protocol compat snapshot is committed (final releases)
+        # 01 §14.3 and 06 §9.1: the release-prep PR runs task release:compat. A prerelease and a dry run skip it.
+        if: env.DRY_RUN == 'false' && env.PRERELEASE == 'false'
+        run: |
+          snapshot=internal/protocol/testdata/compat/$VERSION
+          if [ ! -d "$snapshot" ] || ! diff -r internal/protocol/testdata/v1 "$snapshot"; then
+            echo "::error::run task release:compat VERSION=$VERSION in a release-prep PR (06 §9.1)"
+            exit 1
+          fi
+
+      - name: Log in to ghcr.io
+        if: env.DRY_RUN == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: printf '%s\n' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: goreleaser release (the draft and the image :${{ needs.version.outputs.version }})
+        if: env.DRY_RUN == 'false'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: .bin/goreleaser release --clean
+
+      - name: goreleaser release --snapshot (dry run, nothing is published)
+        if: env.DRY_RUN == 'true'
+        env:
+          ISSHONI_SNAPSHOT_VERSION: ${{ needs.version.outputs.version }}
+        run: .bin/goreleaser release --snapshot --clean --skip=publish
+
+      - name: task release:assets (the asset list of 06 §3)
+        run: task release:assets VERSION="$VERSION" FULL=true
+
+      - name: Attest the archives, packages, checksums and installer
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.deb
+            dist/*.rpm
+            dist/checksums.txt
+            dist-extra/install.sh
+
+      - name: Find the image digest
+        id: image
+        if: env.DRY_RUN == 'false'
+        run: |
+          digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
+          if [[ ! $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::no digest for $IMAGE:$VERSION (got: $digest)"
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "$IMAGE:$VERSION is $IMAGE@$digest" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Sign the image (cosign keyless)
+        # By digest: the floating tags that publish adds later copy the index, so the signature covers them too.
+        if: env.DRY_RUN == 'false'
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: cosign sign --yes "$IMAGE@$DIGEST"
+
+      - name: Attest the image
+        if: env.DRY_RUN == 'false'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/moonwx/isshoni
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+
+      - name: Collect the dry run's release files
+        # A dry run has no draft to download from: sign-dry and verify take these files instead.
+        if: env.DRY_RUN == 'true'
+        run: |
+          mkdir release-assets
+          cp dist/*.tar.gz dist/*.zip dist/*.deb dist/*.rpm dist/*.sbom.json \
+            dist/checksums.txt dist/checksums.txt.sigstore.json \
+            dist-extra/install.sh deploy/compose.yaml deploy/compose.host.yaml release-assets/
+          ls -l release-assets
+
+      - name: Upload the dry run's release files
+        if: env.DRY_RUN == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets
+          path: release-assets
+          if-no-files-found: error
+          retention-days: 3
+
+  sign:
+    # The only job with the release signing key (06 §9.3, §9.4). It runs once the owner approves the environment,
+    # and uses no third-party action but checkout.
+    if: needs.version.outputs.dry-run == 'false'
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: write # read the draft, upload the signature
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out deploy/keys
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: deploy/keys
+
+      - name: Download the draft's assets
+        run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir rel
+
+      - name: Every asset matches checksums.txt
+        run: |
+          (cd rel && sha256sum -c checksums.txt)
+          # And nothing is in the draft that the signature would not cover. checksums.txt.sig is there when this
+          # job runs again after it uploaded one; the next step replaces it.
+          for f in rel/*; do
+            name=${f#rel/}
+            case $name in checksums.txt | checksums.txt.sig | checksums.txt.sigstore.json) continue ;; esac
+            if ! awk -v f="$name" '$2 == f { found = 1 } END { exit !found }' rel/checksums.txt; then
+              echo "::error::the draft has $name, which checksums.txt does not list"
+              exit 1
+            fi
+          done
+
+      - name: Sign checksums.txt
+        env:
+          RELEASE_SSH_SIGNING_KEY: ${{ secrets.RELEASE_SSH_SIGNING_KEY }}
+        run: |
+          if [ -z "$RELEASE_SSH_SIGNING_KEY" ]; then
+            echo "::error::the release environment has no secret RELEASE_SSH_SIGNING_KEY (deploy/keys/README.md)"
+            exit 1
+          fi
+          # A signature from an earlier run of this job goes first: without a terminal, ssh-keygen -Y sign keeps an
+          # existing checksums.txt.sig ("Overwrite (y/n)?" reads no answer) and still exits 0.
+          rm -f rel/checksums.txt.sig
+          key=$RUNNER_TEMP/k
+          trap 'rm -f "$key"' EXIT
+          umask 077
+          printf '%s\n' "$RELEASE_SSH_SIGNING_KEY" > "$key"
+          ssh-keygen -Y sign -f "$key" -n isshoni-checksums rel/checksums.txt
+          ssh-keygen -l -f "$key"
+
+      - name: Verify the signature with deploy/keys/allowed_signers (catches a wrong key in the secret)
+        run: |
+          ssh-keygen -Y verify -f deploy/keys/allowed_signers -I isshoni-release -n isshoni-checksums \
+            -s rel/checksums.txt.sig < rel/checksums.txt
+
+      - name: Upload checksums.txt.sig to the draft
+        run: gh release upload "$TAG" rel/checksums.txt.sig --repo "$GITHUB_REPOSITORY" --clobber
+
+  sign-dry:
+    # The dry run's sign: the same commands with a key made here, and no environment.
+    if: needs.version.outputs.dry-run == 'true'
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Download the dry run's release files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: rel
+
+      - name: Every asset matches checksums.txt
+        run: |
+          (cd rel && sha256sum -c checksums.txt)
+          for f in rel/*; do
+            name=${f#rel/}
+            case $name in checksums.txt | checksums.txt.sigstore.json) continue ;; esac
+            if ! awk -v f="$name" '$2 == f { found = 1 } END { exit !found }' rel/checksums.txt; then
+              echo "::error::the release has $name, which checksums.txt does not list"
+              exit 1
+            fi
+          done
+
+      - name: Sign checksums.txt with a throwaway key and verify it
+        run: |
+          mkdir signed
+          ssh-keygen -q -t ed25519 -N '' -C isshoni-release-dryrun -f "$RUNNER_TEMP/k"
+          printf 'isshoni-release namespaces="isshoni-checksums" %s\n' "$(cat "$RUNNER_TEMP/k.pub")" \
+            > signed/allowed_signers
+          ssh-keygen -Y sign -f "$RUNNER_TEMP/k" -n isshoni-checksums rel/checksums.txt
+          rm -f "$RUNNER_TEMP/k"
+          ssh-keygen -Y verify -f signed/allowed_signers -I isshoni-release -n isshoni-checksums \
+            -s rel/checksums.txt.sig < rel/checksums.txt
+          mv rel/checksums.txt.sig signed/
+
+      - name: Upload the signature and its allowed_signers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-signature-dryrun
+          path: signed
+          if-no-files-found: error
+          retention-days: 3
+
+  verify:
+    # The release as a user gets it (06 §9.3): its own install.sh, from a mirror of the draft served by
+    # tools/relserve over HTTPS, in a systemd container, as scenario C1 of 06 §11.2 does. In a dry run the
+    # installer carries sign-dry's key, the one thing that differs from the files of a release.
+    needs: [version, build, sign, sign-dry]
+    if: >-
+      !cancelled() && needs.build.result == 'success' &&
+      (needs.sign.result == 'success' || needs.sign-dry.result == 'success')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write # read the draft
+      packages: read # the image is private until the owner makes the package public (06 §8.6)
+      attestations: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: debian-12
+            base: debian:12
+          - distro: ubuntu-24.04
+            base: ubuntu:24.04
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TAG: ${{ needs.version.outputs.tag }}
+      DRY_RUN: ${{ needs.version.outputs.dry-run }}
+      GH_TOKEN: ${{ github.token }}
+      CONTAINER: isshoni-release-verify
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod; for tools/relserve)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Set up cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+
+      - name: Download the draft's assets
+        if: env.DRY_RUN == 'false'
+        run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "mirror/download/$TAG"
+
+      - name: Download the dry run's release files
+        if: env.DRY_RUN == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: mirror/download/${{ needs.version.outputs.tag }}
+
+      - name: Download the dry run's signature
+        if: env.DRY_RUN == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-signature-dryrun
+          path: ${{ runner.temp }}/signed
+
+      - name: Put the dry run's key into its installer
+        # The released install.sh has the production keys between its key markers and no other way to take one
+        # (06 §4.3). A dry run's installer gets sign-dry's key there instead, as the distro tests do.
+        if: env.DRY_RUN == 'true'
+        run: |
+          dir=mirror/download/$TAG
+          cp "$RUNNER_TEMP/signed/checksums.txt.sig" "$dir/"
+          awk -v q="'" -v keys="$(cat "$RUNNER_TEMP/signed/allowed_signers")" '
+            /^# BEGIN ALLOWED SIGNERS/ { print; print "ALLOWED_SIGNERS=" q keys q; skip = 1; next }
+            /^# END ALLOWED SIGNERS/ { skip = 0 }
+            !skip { print }' "$dir/install.sh" > "$RUNNER_TEMP/install.sh"
+          mv "$RUNNER_TEMP/install.sh" "$dir/install.sh"
+          grep -q '^ALLOWED_SIGNERS=.isshoni-release namespaces="isshoni-checksums" ssh-ed25519 ' "$dir/install.sh"
+
+      - name: The installer is the release's, stamped with ${{ needs.version.outputs.version }}
+        run: grep -qx "ISSHONI_INSTALLER_VERSION=\"$VERSION\"" "mirror/download/$TAG/install.sh"
+
+      - name: cosign verify-blob on checksums.txt (the identity install.sh checks, 06 §4.3)
+        run: |
+          cosign verify-blob --bundle "mirror/download/$TAG/checksums.txt.sigstore.json" \
+            --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@$GITHUB_REF" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "mirror/download/$TAG/checksums.txt"
+
+      - name: cosign verify on the image
+        if: env.DRY_RUN == 'false'
+        run: |
+          printf '%s\n' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          cosign verify "$IMAGE:$VERSION" \
+            --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@$GITHUB_REF" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+
+      - name: gh attestation verify on the linux/amd64 archive
+        run: gh attestation verify "mirror/download/$TAG/isshoni_${VERSION}_linux_amd64.tar.gz" --repo "$GITHUB_REPOSITORY"
+
+      - name: Serve the mirror with tools/relserve
+        run: |
+          go -C tools build -o "$RUNNER_TEMP/relserve" ./relserve
+          # On every address: the container comes in through Docker's bridge.
+          "$RUNNER_TEMP/relserve" -dir mirror -latest "$VERSION" -ca-out "$RUNNER_TEMP/ca.pem" -addr 0.0.0.0:0 \
+            -ready-file "$RUNNER_TEMP/addr" > "$RUNNER_TEMP/relserve.log" 2>&1 &
+          for _ in $(seq 1 100); do
+            [ -s "$RUNNER_TEMP/addr" ] && break
+            sleep 0.1
+          done
+          if [ ! -s "$RUNNER_TEMP/addr" ]; then
+            cat "$RUNNER_TEMP/relserve.log"
+            echo "::error::relserve did not start"
+            exit 1
+          fi
+          addr=$(cat "$RUNNER_TEMP/addr")
+          echo "BASE_URL=https://host.docker.internal:${addr##*:}" >> "$GITHUB_ENV"
+
+      - name: Start a ${{ matrix.distro }} systemd container
+        env:
+          BASE: ${{ matrix.base }}
+          DISTRO: ${{ matrix.distro }}
+        run: |
+          docker build -q -t "isshoni-release-verify:$DISTRO" --build-arg "BASE=$BASE" \
+            -f deploy/test/distro/Containerfile deploy/test/distro
+          docker run -d --name "$CONTAINER" --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock \
+            --add-host=host.docker.internal:host-gateway "isshoni-release-verify:$DISTRO"
+          for _ in $(seq 1 120); do
+            state=$(docker exec "$CONTAINER" systemctl is-system-running 2>/dev/null) || :
+            case $state in running | degraded) break ;; esac
+            sleep 0.5
+          done
+          echo "systemd: ${state:-not up}"
+          docker cp "$RUNNER_TEMP/ca.pem" "$CONTAINER:/usr/local/share/ca-certificates/relserve.crt"
+          docker exec "$CONTAINER" update-ca-certificates
+          docker exec "$CONTAINER" curl -fsS -o /dev/null "$BASE_URL/tag/$TAG"
+
+      - name: Install with the release's install.sh (--yes --tls-mode off)
+        run: |
+          # As an admin would: fetched with curl and run without a terminal. A public address of the
+          # documentation range keeps the runner's own out of the log (06 §11.2).
+          # shellcheck disable=SC2016 # the variables are the container shell's
+          docker exec -e "ISSHONI_DOWNLOAD_BASE=$BASE_URL" -e ISSHONI_PUBLIC_URL=http://127.0.0.1:8080 \
+            -e ISSHONI_PUBLIC_IP=203.0.113.7 "$CONTAINER" \
+            sh -c 'curl -fsSL -o /root/install.sh "$1" && sh /root/install.sh --yes --tls-mode off' \
+            sh "$BASE_URL/download/$TAG/install.sh"
+
+      - name: The installed server reports ${{ needs.version.outputs.version }}
+        run: |
+          docker exec "$CONTAINER" systemctl is-active isshoni
+          installed=$(docker exec "$CONTAINER" isshoni version --short)
+          served=$(docker exec "$CONTAINER" curl -fsS http://127.0.0.1:8080/api/v1/info | jq -r .server.version)
+          echo "isshoni version --short: $installed; GET /api/v1/info: $served"
+          if [ "$installed" != "$VERSION" ] || [ "$served" != "$VERSION" ]; then
+            echo "::error::the installed server is not $VERSION"
+            exit 1
+          fi
+
+      - name: Show the service log and relserve's
+        if: failure()
+        run: |
+          docker exec "$CONTAINER" journalctl -u isshoni --no-pager -n 100 || :
+          cat "$RUNNER_TEMP/relserve.log" || :
+
+  publish:
+    # 06 §9.3: refuses notes with a TODO; only a final release becomes "latest" and moves the floating image tags.
+    # The result check is explicit: a job-level `if` without a status function means success(), and success() looks
+    # at every job upstream, not only at `needs`. On a tag sign-dry is skipped, so a plain condition would skip
+    # publish after a green verify, and the run would end green with the release still a draft (actions/runner#491).
+    if: ${{ !cancelled() && needs.verify.result == 'success' && needs.version.outputs.dry-run == 'false' }}
+    needs: [version, verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      packages: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TAG: ${{ needs.version.outputs.tag }}
+      PRERELEASE: ${{ needs.version.outputs.prerelease }}
+      FLOATING_TAGS: ${{ needs.version.outputs.floating-tags }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: The release notes have no TODO left
+        run: |
+          body=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body)
+          if grep -n TODO <<< "$body"; then
+            echo "::error::the notes of the draft $TAG still have a TODO: edit them on GitHub, then re-run this job"
+            exit 1
+          fi
+
+      - name: Publish the release
+        run: |
+          if [ "$PRERELEASE" = true ]; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --latest=false
+          else
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          fi
+
+      - name: Move the floating image tags
+        # Copying the index keeps the digest, so build's cosign signature stays valid (06 §9.3).
+        if: env.PRERELEASE == 'false'
+        run: |
+          printf '%s\n' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          args=()
+          for t in $FLOATING_TAGS; do
+            args+=(-t "$IMAGE:$t")
+          done
+          docker buildx imagetools create "${args[@]}" "$IMAGE:$VERSION"
