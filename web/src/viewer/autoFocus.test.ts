@@ -192,7 +192,7 @@ describe('audio follows focus (05 §12.3)', () => {
   });
 });
 
-describe('a share without sound is never the one heard (README S72)', () => {
+describe('a share without sound is never the one heard (05 §12.3)', () => {
   /** Bo shares a window without its sound. */
   const QUIET = share('quiet', 5, 'u_bo', false, false);
 

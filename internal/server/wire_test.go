@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1452,87 +1451,6 @@ func TestMediaCheck(t *testing.T) {
 				t.Errorf("media check = %v %q, want %q", ok, detail, tc.detail)
 			}
 		})
-	}
-}
-
-// logRecord is one record as a handler under notImplementedAsDebug got it.
-type logRecord struct {
-	level slog.Level
-	msg   string
-	attrs map[string]string // the record's own and those of With
-}
-
-// recordingHandler keeps the records of the levels it is enabled for.
-type recordingHandler struct {
-	min   slog.Level
-	with  []slog.Attr
-	store *[]logRecord
-}
-
-func (h recordingHandler) Enabled(_ context.Context, l slog.Level) bool { return l >= h.min }
-
-func (h recordingHandler) Handle(_ context.Context, r slog.Record) error {
-	rec := logRecord{level: r.Level, msg: r.Message, attrs: map[string]string{}}
-	for _, a := range h.with {
-		rec.attrs[a.Key] = a.Value.String()
-	}
-	r.Attrs(func(a slog.Attr) bool {
-		rec.attrs[a.Key] = a.Value.String()
-		return true
-	})
-	*h.store = append(*h.store, rec)
-	return nil
-}
-
-func (h recordingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	h.with = append(slices.Clone(h.with), attrs...)
-	return h
-}
-
-func (h recordingHandler) WithGroup(string) slog.Handler { return h }
-
-// TestNotImplementedAsDebug: what sfuplane logs about an SFU method that a later slice fills in reaches the
-// server's log at debug level, whatever level sfuplane gave it; every other record passes as it is.
-func TestNotImplementedAsDebug(t *testing.T) {
-	// The SFU's own error wraps the sentinel the same way (sfu.Error.Unwrap).
-	notYet := fmt.Errorf("sfu.internal: Conn.SetDecodeCaps is not implemented yet (README S69): %w", sfu.ErrNotImplemented)
-	wrapped := fmt.Errorf("sfuplane: %w", notYet)
-	broken := &sfu.Error{Code: sfu.CodeInternal}
-
-	var got []logRecord
-	// The logger as sfuplane builds its own from the one it is given: a component, then the connection's ids.
-	log := slog.New(notImplementedAsDebug{recordingHandler{min: slog.LevelDebug, store: &got}}).
-		With("component", "sfuplane").With("conn_id", "c1")
-	log.Error("internal error", "call", "RestartICE", "ref", "abcd1234", "err", notYet)
-	log.Error("SFU call failed", "call", "SetDecodeCaps", "err", wrapped)
-	log.Warn("SFU call failed", "err", notYet)
-	log.Debug("SFU error", "err", notYet)
-	log.Error("internal error", "call", "HandleOffer", "ref", "efgh5678", "err", broken)
-	log.Error("share with a malformed H.264 profile", "share_id", "s_1")
-	log.Warn("the SFU connection is busy", "err", errors.New("sfu.busy"))
-	log.Info("not an error", "err", "a string that says not implemented")
-
-	want := []logRecord{
-		{slog.LevelDebug, "internal error", map[string]string{"component": "sfuplane", "conn_id": "c1", "call": "RestartICE", "ref": "abcd1234", "err": notYet.Error()}},
-		{slog.LevelDebug, "SFU call failed", map[string]string{"component": "sfuplane", "conn_id": "c1", "call": "SetDecodeCaps", "err": wrapped.Error()}},
-		{slog.LevelDebug, "SFU call failed", map[string]string{"component": "sfuplane", "conn_id": "c1", "err": notYet.Error()}},
-		{slog.LevelDebug, "SFU error", map[string]string{"component": "sfuplane", "conn_id": "c1", "err": notYet.Error()}},
-		{slog.LevelError, "internal error", map[string]string{"component": "sfuplane", "conn_id": "c1", "call": "HandleOffer", "ref": "efgh5678", "err": broken.Error()}},
-		{slog.LevelError, "share with a malformed H.264 profile", map[string]string{"component": "sfuplane", "conn_id": "c1", "share_id": "s_1"}},
-		{slog.LevelWarn, "the SFU connection is busy", map[string]string{"component": "sfuplane", "conn_id": "c1", "err": "sfu.busy"}},
-		{slog.LevelInfo, "not an error", map[string]string{"component": "sfuplane", "conn_id": "c1", "err": "a string that says not implemented"}},
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("records:\n got %+v\nwant %+v", got, want)
-	}
-
-	// A server at log.level = info, the default, hears nothing of what is not built yet, and all of the rest.
-	got = nil
-	log = slog.New(notImplementedAsDebug{recordingHandler{min: slog.LevelInfo, store: &got}}).WithGroup("g")
-	log.Error("internal error", "err", notYet)
-	log.Error("internal error", "err", broken)
-	if len(got) != 1 || got[0].level != slog.LevelError || got[0].attrs["err"] != broken.Error() {
-		t.Errorf("records at info level = %+v, want the one real error", got)
 	}
 }
 

@@ -29,8 +29,8 @@ import (
 // with a Pion publisher and a Pion viewer on loopback. They check what the tables with the fake Conn can't: that
 // the real API takes what the adapter passes, and that the real errors and events come out as 01 §15.4 says.
 //
-// They assert only what holds for every slice of the SFU: every Conn method is built since README S69 (only
-// SFU.Probe waits for README S76), but the SFU may send more events than it does now.
+// They assert only what holds for every slice of the SFU: its whole API is built since README S76 (every Conn
+// method since S69, SFU.Probe last), but the SFU may send more events than it does now.
 
 // loopbackOnly is a netx.InterfaceLister with only 127.0.0.1, so the Transport doesn't depend on the host.
 type loopbackOnly struct{}

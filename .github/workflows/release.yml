@@ -272,8 +272,8 @@ jobs:
           task lint:keys
 
       - name: The repository has the README.md that every archive carries
-        # 06 §3; release:assets FULL=true checks the archives for it after goreleaser. This fails before a draft
-        # or an image exists. .goreleaser.yaml takes it by a pattern, which would let it go missing quietly.
+        # 06 §3; release:assets FULL=true checks the archives for it after goreleaser. goreleaser, which names it
+        # plainly (.goreleaser.yaml), would fail without it too; this step says why, before the ghcr.io login.
         run: |
           if [ ! -f README.md ]; then
             echo "::error::there is no README.md, and every release archive has one (06 §3; deploy/keys/README.md)"

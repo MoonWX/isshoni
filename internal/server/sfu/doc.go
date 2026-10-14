@@ -252,8 +252,8 @@
 //
 // # What later slices add
 //
-// The whole API of 02 §6 is implemented (README S76 did the last method, Probe), so no error wraps ErrNotImplemented
-// any more. What later slices add, in README order:
+// The whole API of 02 §6 is implemented (README S76 did the last method, Probe), and the sentinel ErrNotImplemented
+// that the unbuilt methods wrapped is gone. What later slices add, in README order:
 //   - S79: the transports, RTTs and counters of Snapshot, ConnStats and Metrics (the Layers and DownTracks count,
 //     the repair counters of 02 §13 included; nothing sums them up yet. A sub PC's round-trip time is read already,
 //     for the NACK handling: subPC.rtt).

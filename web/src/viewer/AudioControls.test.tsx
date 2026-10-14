@@ -234,7 +234,7 @@ describe('the stage’s sound controls (05 §10.3, §12.3)', () => {
     expect(within(toolbar()).queryByRole('slider')).not.toBeInTheDocument();
   });
 
-  it('has no sound controls for a share without sound on the stage while nothing is heard (README S72)', async () => {
+  it('has no sound controls for a share without sound on the stage while nothing is heard (05 §12.3)', async () => {
     const quiet = shareInfo('s_quiet', 'u_cy', 2, { audio: false });
     render(<ViewerLayout viewer={viewer} />);
     act(() => {

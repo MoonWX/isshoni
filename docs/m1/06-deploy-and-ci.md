@@ -1261,7 +1261,7 @@ vars:
 | `release:snapshot` | `build:web`, then `goreleaser release --snapshot --clean --skip=sign,sbom`; both get `ISSHONI_SNAPSHOT_VERSION` (default `0.0.0-dev.<12-char commit>`), as `VERSION` for `build:web` and as env for goreleaser. As README S73 built it: first `release:goreleaser` and `goreleaser check`; `CLI_ARGS` go on to goreleaser (`task release:snapshot -- --skip=docker` leaves out the images); then `release:assets` for that version, and the image for this machine's CPU must start and report it. The images are built (9.2: one per platform, `<v>-amd64` and `<v>-arm64`, loaded locally, never pushed) and removed again when the task ends, passed or not; `KEEP_IMAGES=true` keeps them | local dry run; `goreleaser-check` and the distro tests use it too |
 | `release:assets` (README S73) | checks `dist/` after a goreleaser run against §3 for `VERSION=<v>`: the asset names (each one GitHub keeps as it is), `checksums.txt` (exactly the summed files, each once, with the right hash), the stamped `dist-extra/install.sh`, every archive's files, this machine's binary's version, and each package's files, version (`~` before a prerelease), architecture and dependencies (rpm's with `rpm` where it is installed). `FULL=true` (a release) also wants the SBOMs, the cosign bundle and `README.md` | run by `release:snapshot`, CI's `goreleaser-check` and release.yml's `build` (`FULL=true`) |
 | `release:keys` (README S73) | writes `deploy/keys/allowed_signers` into install.sh's key block, then `lint:keys`, and prints each key's fingerprint. It refuses, before it writes anything, a missing or empty file, a private key, a line that is not `isshoni-release namespaces="isshoni-checksums" ssh-ed25519 …`, a single quote anywhere and a missing final newline | the owner's step 2 of `deploy/keys/README.md` (9.4) |
-| `release:compat` | `task release:compat VERSION=<v>` (`<v>` is the tag without `v`, e.g. `0.2.0`): copies `internal/protocol/testdata/v1` to `internal/protocol/testdata/compat/<v>/`, then deletes all but the two newest final-release snapshots (SemVer order). Fails unless `VERSION` is a final `X.Y.Z`: prereleases (`-rc.N`) get no snapshot, and a forgotten `VERSION=` leaves the dev version, which fails too | 01 §14.3. Run in the release-prep PR (9.1 "Before tagging"); release.yml checks the result (9.3). Plain `sh` and `cp`, no Go or Node. S01 writes it as a stub; S75 (01 P13) owns the body |
+| `release:compat` | `task release:compat VERSION=<v>` (`<v>` is the tag without `v`, e.g. `0.2.0`): copies `internal/protocol/testdata/v1` to `internal/protocol/testdata/compat/<v>/`, then deletes all but the two newest final-release snapshots (SemVer order). Fails unless `VERSION` is a final `X.Y.Z`: prereleases (`-rc.N`) get no snapshot, and a forgotten `VERSION=` leaves the dev version, which fails too. It also refuses, changing nothing, a `VERSION` older than the two snapshots it would keep, a missing `testdata/v1`, and a `compat/` that holds anything but `X.Y.Z` snapshot directories (hidden files aside; a link counts as anything) | 01 §14.3. Run in the release-prep PR (9.1 "Before tagging"); release.yml checks the result (9.3). Plain `sh` and `cp`, no Go or Node. S01 writes it as a stub; S75 (01 P13) owns the body |
 | `deploy:test` | distro container tests; `DISTRO=debian-12` selects one | needs podman or Docker |
 | `docker:smoke` | section 6 smoke test (bridge with a backup → restore round trip and the IPv6 client-IP check, host, no-volume, no `.env`; 11.3) | |
 | `site:dev` / `site:build` | `npx --prefix docs vitepress dev\|build docs` | |
@@ -1795,31 +1795,35 @@ alone. Registry logins are a plain `docker login` with the job's token, not a th
 **`build`**
 - `needs: [version, web]`. Permissions: `contents: write`, `packages: write`, `id-token: write`, `attestations: write`.
 - **No Node on this runner**: no setup-node, no npm, no npm cache. Only goreleaser and pinned Go tools run.
-- Steps, in this order. Every check of the repository's inputs (steps 3–5) comes before goreleaser, so a failed one
-  leaves no draft and no image. The asset check of step 7 reads goreleaser's output, so it comes after it, as do
-  the attestations and the image's signature: a failure there leaves the draft and the image `:<v>`, which a re-run
-  for the same tag replaces (the draft by `replace_existing_draft`, 9.2; the image by the same tag pushed again):
-  1. checkout with `fetch-depth: 0`; download the `web-dist` artifact into `web/dist/`;
-  2. setup-go (from `go.mod`), Task (the pin), cosign v3, syft, buildx; `task release:goreleaser` (7.1); rpm, for
+- Steps, in this order. Every check of the repository's inputs (steps 2, 5 and 6) comes before goreleaser, so a
+  failed one leaves no draft and no image. The asset check of step 8 reads goreleaser's output, so it comes after
+  it, as do the attestations and the image's signature: a failure there leaves the draft and the image `:<v>`, which
+  a re-run for the same tag replaces (the draft by `replace_existing_draft`, 9.2; the image by the same tag pushed
+  again):
+  1. checkout with `fetch-depth: 0`;
+  2. **compat snapshot check** (final releases only; skipped for `-rc.N` and in a dry run), right after checkout,
+     before the download, the tool setup and goreleaser: fails with "run task release:compat VERSION=<v> in a
+     release-prep PR (9.1)" unless `internal/protocol/testdata/compat/<v>/` exists, holds no symbolic link (a link
+     to the fixtures would always match them and freeze nothing), and `diff -r internal/protocol/testdata/v1
+     internal/protocol/testdata/compat/<v>` finds no difference (01 §14.3); a missing, a linked and a different
+     snapshot each have their own error. S73 built it; README S75 owns `release:compat` and moved this check to the
+     front, where it fails fastest;
+  3. download the `web-dist` artifact into `web/dist/`;
+  4. setup-go (from `go.mod`), Task (the pin), cosign v3, syft, buildx; `task release:goreleaser` (7.1); rpm, for
      `release:assets`;
-  3. **the installer carries the release keys** (not in a dry run): fails while `deploy/keys/allowed_signers` is
+  5. **the installer carries the release keys** (not in a dry run): fails while `deploy/keys/allowed_signers` is
      missing or empty, else runs `task lint:keys`. A released install.sh with an empty key block would refuse to
      install anything (9.4, `deploy/keys/README.md`);
-  4. **the repository has the root `README.md`** that every archive carries (§3), in a dry run too;
-  5. **compat snapshot check** (final releases only; skipped for `-rc.N` and in a dry run): fails with "run task
-     release:compat VERSION=<v> in a release-prep PR (9.1)" unless `internal/protocol/testdata/compat/<v>/` exists
-     and `diff -r internal/protocol/testdata/v1 internal/protocol/testdata/compat/<v>` finds no difference (01
-     §14.3). S73 built it; README S75 owns `release:compat` and keeps this check where a failure stops the release
-     before a draft exists;
-  6. `docker login ghcr.io`, then `goreleaser release --clean`, which creates the **draft** release and pushes
+  6. **the repository has the root `README.md`** that every archive carries (§3), in a dry run too;
+  7. `docker login ghcr.io`, then `goreleaser release --clean`, which creates the **draft** release and pushes
      `ghcr.io/moonwx/isshoni:<v>`. Its before hook (`task release:prepare`, 7.2) runs no npm: it fails unless
      `web/dist/version.json` is `<v>`, then writes `THIRD_PARTY_NOTICES` (Go only, 8.4) and stamps `install.sh`. A
      dry run runs `goreleaser release --snapshot --clean --skip=publish` with `ISSHONI_SNAPSHOT_VERSION` instead;
-  7. `task release:assets VERSION=<v> FULL=true` (7.2): the asset list of §3, with the SBOMs, the cosign bundle and
+  8. `task release:assets VERSION=<v> FULL=true` (7.2): the asset list of §3, with the SBOMs, the cosign bundle and
      `README.md` in every archive;
-  8. `actions/attest-build-provenance` for `dist/*.tar.gz dist/*.zip dist/*.deb dist/*.rpm dist/checksums.txt
+  9. `actions/attest-build-provenance` for `dist/*.tar.gz dist/*.zip dist/*.deb dist/*.rpm dist/checksums.txt
      dist-extra/install.sh` (a dry run attests its files too);
-  9. not in a dry run: the image digest via `docker buildx imagetools inspect ghcr.io/moonwx/isshoni:<v> --format
+  10. not in a dry run: the image digest via `docker buildx imagetools inspect ghcr.io/moonwx/isshoni:<v> --format
      '{{json .Manifest}}'`, then `cosign sign --yes ghcr.io/moonwx/isshoni@<digest>` and `attest-build-provenance`
      with that `subject-digest` and `push-to-registry: true`. A dry run instead uploads its release files (the
      archives, packages, SBOMs, `checksums.txt` and its cosign bundle, `install.sh` and the compose files) as the

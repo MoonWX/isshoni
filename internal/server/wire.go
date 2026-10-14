@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"net/netip"
 	"os"
@@ -321,7 +320,7 @@ func (s *Server) wireMedia() (signal.MediaPlane, error) {
 		s.health.AddCheck("media", func() (bool, string) { return false, noMediaAddress })
 		return nil, nil
 	}
-	plane, events := sfuplane.New(slog.New(notImplementedAsDebug{s.log.Handler()}))
+	plane, events := sfuplane.New(s.log)
 	settings := s.store.Settings()
 	media, err := sfu.New(sfu.Config{
 		Transport:            s.transport,
@@ -364,54 +363,6 @@ func mediaCheck(udp bool, tr *netx.Transport, sfuReady func() error) func() (ok 
 		}
 		return true, ""
 	}
-}
-
-// notImplementedAsDebug is the log handler of 01's sfuplane in this server. The SFU declares its whole API from
-// its first slice on (README "Interfaces first"), and a method that a later slice fills in answers with an error
-// that wraps sfu.ErrNotImplemented. sfuplane logs every SFU error it has no wire code for at error level, as the
-// bug it would otherwise be (01 §15.4), and a client reached such a method with an everyday message: caps.update
-// until README S69, pc.close and pc.restart until S57. So a record about that error is passed on at debug level: the
-// client still gets its error{internal} with the ref, and a real server's log stays free of an "error" per message
-// for what is only not built yet. Since S69 every Conn method is built and only SFU.Probe (README S76) still returns
-// the error; this handler goes away with sfu.ErrNotImplemented.
-type notImplementedAsDebug struct{ next slog.Handler }
-
-// Enabled implements slog.Handler.
-func (h notImplementedAsDebug) Enabled(ctx context.Context, l slog.Level) bool {
-	return h.next.Enabled(ctx, l)
-}
-
-// Handle implements slog.Handler.
-func (h notImplementedAsDebug) Handle(ctx context.Context, r slog.Record) error {
-	if r.Level > slog.LevelDebug && aboutNotImplemented(r) {
-		if !h.next.Enabled(ctx, slog.LevelDebug) {
-			return nil
-		}
-		r = r.Clone()
-		r.Level = slog.LevelDebug
-	}
-	return h.next.Handle(ctx, r)
-}
-
-// WithAttrs implements slog.Handler.
-func (h notImplementedAsDebug) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return notImplementedAsDebug{h.next.WithAttrs(attrs)}
-}
-
-// WithGroup implements slog.Handler.
-func (h notImplementedAsDebug) WithGroup(name string) slog.Handler {
-	return notImplementedAsDebug{h.next.WithGroup(name)}
-}
-
-// aboutNotImplemented reports whether a record carries an error that wraps sfu.ErrNotImplemented.
-func aboutNotImplemented(r slog.Record) bool {
-	found := false
-	r.Attrs(func(a slog.Attr) bool {
-		err, ok := a.Value.Any().(error)
-		found = ok && errors.Is(err, sfu.ErrNotImplemented)
-		return !found
-	})
-	return found
 }
 
 // wireAccounts builds the push service, the account service, the hub and the REST API for the site. media is the

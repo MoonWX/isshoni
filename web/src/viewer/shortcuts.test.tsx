@@ -318,7 +318,7 @@ describe('the shortcuts', () => {
     const user = userEvent.setup();
     syncRoom(viewer, room(BEA, CY, DEE), SELF);
     render(layout());
-    // Dee's screen, on the stage, has no sound: nothing is heard (README S72).
+    // Dee's screen, on the stage, has no sound: nothing is heard (05 §12.3).
     expect(state()).toMatchObject({ focusedShareId: 's_dee', focusMode: 'auto', audibleShareId: null });
     tile(BEA_TILE).focus();
     await user.keyboard('l');

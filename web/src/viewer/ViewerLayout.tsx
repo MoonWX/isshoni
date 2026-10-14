@@ -12,7 +12,7 @@
 // the strip keeps its room.
 //
 // The list is newest first, so the share that leaves the stage for a newer one comes in at its start. A list that
-// was at its start stays there (README S72): the browser would re-snap the strip to the tile it was snapped to
+// was at its start stays there (05 §12.1): the browser would re-snap the strip to the tile it was snapped to
 // before, and the share the friend just watched would be out of view, with its video turned off (05 §12.4). A list
 // the user scrolled keeps the tile they scrolled to.
 //
@@ -95,7 +95,7 @@ function atStart(el: Element): boolean {
 }
 
 /**
- * Keeps the list of tiles at its start while the tiles change, when it was there (README S72). Returns the ref for
+ * Keeps the list of tiles at its start while the tiles change, when it was there (05 §12.1). Returns the ref for
  * the list; `order` is the tiles' ids in order.
  */
 function useListStart(order: string): (el: HTMLUListElement | null) => (() => void) | undefined {

@@ -1,9 +1,6 @@
 package sfu
 
-import (
-	"errors"
-	"time"
-)
+import "time"
 
 // Error codes (02 §6.3). They are stable and never sent on the wire: 01's sfuplane maps each one to a protocol
 // ErrorCode. A code is never renamed or reused.
@@ -41,12 +38,6 @@ type Error struct {
 
 	msg string // for logs only; never sent, never holds SDP, candidates or other client data
 }
-
-// ErrNotImplemented was wrapped by the error of an API method that a later slice of the plan filled in (README §4
-// "Interfaces first"). Every method of 02 §6 is implemented now (README S76 did the last one, Probe), so no error of
-// this package wraps it any more, and *Error has no Unwrap. It stays only because internal/server's wire.go still
-// names it, and goes away with that use.
-var ErrNotImplemented = errors.New("sfu: not implemented yet")
 
 // errClosed is the error of every Conn method after Close, and of Join after SFU.Close.
 func errClosed(what string) *Error { return newError(CodeClosed, what+" is closed") }

@@ -719,21 +719,10 @@ tasks:
           [ ! -s "$tmp/names.bad" ] || status=1
 
           # The archives: the binary, the license files, README.md and the files install.sh installs (06 §3), at
-          # the root. A snapshot builds without README.md while the repository has none (.goreleaser.yaml); a
-          # release (FULL=true) never does.
-          printf '%s\n' LICENSE NOTICE THIRD_PARTY_NOTICES deploy/systemd/isshoni.service \
+          # the root. .goreleaser.yaml names README.md plainly, so goreleaser fails without it, snapshots too.
+          printf '%s\n' LICENSE NOTICE THIRD_PARTY_NOTICES README.md deploy/systemd/isshoni.service \
             deploy/sysctl/60-isshoni.conf deploy/firewall/ufw-isshoni deploy/firewall/firewalld-isshoni.xml \
             >"$tmp/content"
-          if [ -f README.md ] || [ "$full" = true ]; then
-            echo README.md >>"$tmp/content"
-          fi
-          if [ ! -f README.md ]; then
-            if [ "$full" = true ]; then
-              problem 'the repository has no README.md, and every archive of a release has one (06 §3)'
-            else
-              echo 'release:assets: note: the repository has no README.md yet, so the archives have none (06 §3 lists it; a release fails without it)'
-            fi
-          fi
           while read -r archive; do
             [ -f "dist/$archive" ] || continue
             cp "$tmp/content" "$tmp/content.want"

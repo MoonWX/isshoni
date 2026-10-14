@@ -47,13 +47,14 @@ release.yml (its dry run too) refuse to build without it.
      printf 'isshoni-release namespaces="isshoni-checksums" %s\n' "$(cat "/path/to/$k.pub")"
    done > deploy/keys/allowed_signers
    task release:keys        # copies the file into deploy/install.sh, runs lint:keys, prints the fingerprints
-   git add deploy/keys/allowed_signers deploy/install.sh
+   # now replace the two "not created yet" cells of README.md's "Release signing keys" table with them
+   git add deploy/keys/allowed_signers deploy/install.sh README.md
    git commit -m "Release signing keys"
    ```
-   The change is data only: the key file and the block in `install.sh`. Keep the two fingerprints that
-   `task release:keys` prints (`ssh-keygen -lf <key>.pub` prints the same): they go into the "Release signing keys"
-   section of the root `README.md` (06 §9.4) and onto the site's `/security` page (06 §10.3), and you compare them
-   in step 5. Merge once `ci-ok` is green.
+   The change is data only: the key file, the block in `install.sh` and the two fingerprints that
+   `task release:keys` prints (`ssh-keygen -lf <key>.pub` prints the same) in the "Release signing keys" section of
+   the root `README.md` (06 §9.4). Keep the fingerprints: they also go onto the site's `/security` page (06 §10.3),
+   and you compare them in step 5. Merge once `ci-ok` is green.
 3. **Create the environment `release`** (Settings → Environments → New environment; 06 §8.6 step 4):
    - required reviewers: you, with "Prevent self-review" **off** (you approve your own releases);
    - deployment branches and tags: "Selected branches and tags", with one rule for **tags** `v*` (no branches);

@@ -1302,14 +1302,15 @@ the tests in `media_test.go` and in `internal/server/itest`).
   Transport advertises, one `listen.ice_udp` entry per socket, `listen.ice_tcp`, and the effective UDP buffers,
   and the ready line names the media ports (§6.1 step 10).
 - **Shutdown step 4** closes the SFU and then the Transport, each within its own budget (§6.4).
-- **An SFU method that a later slice implements is quiet in the log.** The SFU declares its whole API from its
-  first slice on, and a method that isn't built yet answers with an error that wraps `sfu.ErrNotImplemented`
+- **An SFU method that a later slice implemented was quiet in the log.** The SFU declared its whole API from its
+  first slice on, and a method that wasn't built yet answered with an error that wrapped `sfu.ErrNotImplemented`
   (02 §6.3). `sfuplane` logs every SFU error it has no wire code for at error level, as the bug it would
-  otherwise be (01 §15.4), and a client reaches such a method with an everyday message: `caps.update` until
-  README S69. The wiring therefore gives `sfuplane` a log handler (`notImplementedAsDebug`) that passes a record
-  about that error on at debug level. The client still gets its `error{internal}` with the ref. The handler goes
-  away with `sfu.ErrNotImplemented` (`TestUnbuiltSFUMethodsAreQuiet`). Since README S69 every `Conn` method is
-  built, and only `SFU.Probe` still returns the error, until README S76; no client message reaches it (02 §6.3).
+  otherwise be (01 §15.4), and a client reached such a method with an everyday message: `caps.update` until
+  README S69. The wiring therefore gave `sfuplane` a log handler (`notImplementedAsDebug`) that passed a record
+  about that error on at debug level. Since README S76 built `SFU.Probe`, the last such method, nothing returns
+  the error: the group 10 integration took out the handler and the sentinel, and the wiring hands `sfuplane` the
+  server's logger as it is. `TestEverydaySFUMessagesAreQuiet` (formerly `TestUnbuiltSFUMethodsAreQuiet`) still
+  checks that the everyday messages leave no warning or error in the log.
 - **A changed public address** is logged, and restarts only the server that waited for one (§6.2, §7.4).
 - **`internal/server/itest`** is new: Go clients made of an account registered over REST with an invite,
   `internal/client/signal` on `/ws` with its cookie, `publish.Publisher` with `fake.Source` as the pub PC and an

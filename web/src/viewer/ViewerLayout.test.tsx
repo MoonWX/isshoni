@@ -213,7 +213,7 @@ describe('ViewerLayout: picking a tile (05 §12.2, owner decision)', () => {
   });
 });
 
-describe('ViewerLayout: the list stays at its start (README S72)', () => {
+describe('ViewerLayout: the list stays at its start (05 §12.1)', () => {
   const DEE = shareInfo('s_dee', 'u_dee', 4);
 
   /**

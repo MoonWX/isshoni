@@ -689,19 +689,14 @@ type Error struct {
 	RetryAfter time.Duration // set for pc_rate_limited (§12), busy (1 s) and probe_limit (until the oldest running
 	                         // probe's 20 s lifetime ends)
 	msg        string        // logs only, never sent
-	cause      error         // what Unwrap returns: ErrNotImplemented, or nil
 }
 func (e *Error) Error() string          // the code, and ": " + msg when there is one
-func (e *Error) Unwrap() error          // ErrNotImplemented for a method that a later slice fills in, else nil
 func (e *Error) Is(target error) bool   // errors.Is(err, &sfu.Error{Code: sfu.CodeBadSDP}) matches by Code alone
 
 // One constant per code of the table below: CodeClosed = "sfu.closed", CodeBusy, CodeRoleForbidden, CodeBadPC,
 // CodeBadSDP, CodeNoH264, CodeBadRID, CodeUnknownTrack, CodeStaleAnswer, CodeStaleOffer, CodePCLimit,
 // CodePCRateLimited, CodeShareNotFound, CodeNotOwner, CodeTooManyShares, CodeTooManySubscriptions, CodeProbeLimit,
 // CodeTransportDisabled, CodeInternal.
-
-// ErrNotImplemented is wrapped by the error of an API method that a later slice of README §5 fills in.
-var ErrNotImplemented = errors.New("sfu: not implemented yet")
 ```
 
 Every exported method that can fail returns an `*Error` (`New` returns plain errors: a nil `Config.Transport`, a
@@ -728,22 +723,23 @@ that has only `Code` set.
 | `sfu.too_many_subscriptions` | UpdateSubscriptions | no | guard: 256 per Conn, 64 items per call |
 | `sfu.probe_limit` | Probe | yes | 20 probes per server already running (a user's new probe of the same transport replaces the old one, §7.6) |
 | `sfu.transport_disabled` | Probe | no | the requested transport has no mux: `udp` with `listen.ice_udp` = "", `tcp443` in `tls.mode=off`, `tcp7882` with `listen.ice_tcp` = "" (04 answers 409 `transport_disabled`) |
-| `sfu.internal` | any | yes; no for the two cases below | unexpected Pion error (logged with details). Also, with `Retryable` false: a call that breaks the API's contract, and a method that isn't implemented yet |
+| `sfu.internal` | any | yes; no for the case below | unexpected Pion error (logged with details). Also, with `Retryable` false: a call that breaks the API's contract (and, until README S76, a method that wasn't implemented yet) |
 
-**`sfu.internal` that is not retryable** (S29). Two kinds of error use the code with `Retryable: false`, because
-trying again can't help:
+**`sfu.internal` that is not retryable** (S29). Two kinds of error used the code with `Retryable: false`, because
+trying again can't help; since README S76 only the first is left:
 - **A contract violation**: the caller, not the client, got it wrong. `Join` with an empty `Room`, `Participant`,
   `User` or `Conn`, a `Role` or `ClientKind` outside its constants, a nil `Signaler`, a `Conn` id that is already
   joined, or a `Participant` that belongs to another `User`; `StartShare` with an empty share id, an id of a share
   that exists, or an unknown preset; `UpdateShare` with an unknown preset; an `UpdateSubscriptions` item with an
   unknown quality (a per-item error). These are bugs in the hub or sfuplane, so they get no code of their own: the
   log message names the call.
-- **A method of a later slice** ("interfaces first", README §4): the whole §6.1 API is declared from S29 on, and a
-  method whose slice hasn't landed returns an `*Error{sfu.internal}` whose `Unwrap` is `ErrNotImplemented`
-  (`errors.Is(err, sfu.ErrNotImplemented)`); the message names the method and its README slice. After S29 these
-  were `RestartICE`, `ResetPC` and `ClosePC` (S57), `SetDecodeCaps` (S69) and `Probe` (S76), and `Resync()`, which
-  has no error to return, only logged at debug. Since S69 one is left: `Probe`, until README S76. Every `Conn`
-  method is built. The sentinel goes away with the last such method.
+- **A method of a later slice** ("interfaces first", README §4), until README S76: the whole §6.1 API was declared
+  from S29 on, and a method whose slice hadn't landed returned an `*Error{sfu.internal}` whose `Unwrap` was the
+  sentinel `ErrNotImplemented`; the message named the method and its README slice. After S29 these were
+  `RestartICE`, `ResetPC` and `ClosePC` (S57), `SetDecodeCaps` (S69) and `Probe` (S76), and `Resync()`, which has
+  no error to return, only logged at debug. S76 built `Probe`, the last of them, and took out `Error.Unwrap` and its
+  `cause` field; the group 10 integration took out the sentinel with the wiring's log handler that had passed these
+  errors on at debug level (04 §6.6).
 
 sfuplane needs no special case for either: both are `sfu.internal`, which it maps to 01's `internal` (01 §15.4).
 So until its slice landed, a call that reached one of these methods was answered `internal` on the wire: a
@@ -2473,8 +2469,8 @@ milestone gate before the M1 exit test). `-scenario smoke` runs as a Go test in 
   `ShareUpdate`, `SubscriptionUpdate`, `DecodeCaps`, `ProfileKey`, `Role`, `ClientKind`, `PCKind`, `Quality`,
   `Preset`, `SourceKind`, `ShareState`, `EndReason`, `SubReason`, `ShareInfo`, `LayerInfo`, `Signaler`,
   `RoomEvents`, `Event` and its types (`SubscriptionStateEvent`, `CodecPolicyEvent`, `QualityHintEvent`,
-  `PCStateEvent`, `ErrorEvent`), `Error` (with `Share` and `RetryAfter`; `Unwrap` and `Is`) and the `sfu.*` codes
-  (`Code…` constants), `ErrNotImplemented` (§6.3), `ConnStats` and its types (`PCStats`, `OwnShareStats`,
+  `PCStateEvent`, `ErrorEvent`), `Error` (with `Share` and `RetryAfter`; `Is`) and the `sfu.*` codes
+  (`Code…` constants), `ConnStats` and its types (`PCStats`, `OwnShareStats`,
   `SubscriptionStats`, `DownTrackStats`),
   `Snapshot` and its types (`RoomSnapshot`, `ShareSnapshot`, `ViewerCounts`, `ConnSummary`, `SnapshotTotals`),
   `Metrics` and its label values (§13), `ProbeTransport`, `ProbeResult`. Later: `RoomLimits`, `SetRoomLimits`.

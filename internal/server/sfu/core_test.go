@@ -694,7 +694,7 @@ func TestUpdateShareAndLimits(t *testing.T) {
 }
 
 // TestNotImplemented: every method that a later slice filled in (README §4 "Interfaces first") exists now, the last
-// one README S76's Probe, so none says "not implemented" any more: no error of the package wraps ErrNotImplemented.
+// one README S76's Probe, so none says "not implemented" any more (the sentinel ErrNotImplemented went with it).
 func TestNotImplemented(t *testing.T) {
 	s, _ := newTestSFU(t)
 	ctx := testCtx(t)
@@ -708,7 +708,7 @@ func TestNotImplemented(t *testing.T) {
 		"Conn.SetDecodeCaps": c.SetDecodeCaps(ctx, DecodeCaps{H264: []ProfileKey{ProfileHigh}}),
 		"SFU.Probe":          probeErr,
 	} {
-		if errors.Is(err, ErrNotImplemented) {
+		if err != nil && strings.Contains(err.Error(), "not implemented") {
 			t.Errorf("%s = %v", name, err)
 		}
 	}

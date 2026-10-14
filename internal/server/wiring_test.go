@@ -311,8 +311,17 @@ func TestSetupLoginJoinLogout(t *testing.T) {
 	if _, err := c.Hello(helloCtx, signaltest.DefaultHello()); !errors.As(err, &pe) || pe.Code != protocol.ErrorCodeUnauthenticated {
 		t.Errorf("hello without a session: %v, want unauthenticated", err)
 	}
-	if st, err := admin.Status(ctx); err != nil || st.Rooms != 0 || st.Participants != 0 {
-		t.Errorf("status after logout = %+v, %v; want nobody", st, err)
+	// The revoked connection leaves Lounge once the server's side of its socket has closed too, which on a busy
+	// machine can come a moment after the client read the close frame (there is no grace after a revocation).
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		st, err := admin.Status(ctx)
+		if err == nil && st.Rooms == 0 && st.Participants == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("status 5 s after logout = %+v, %v; want nobody", st, err)
+			break
+		}
 	}
 
 	// The server name of the setup form is a setting like any other: /info shows it.
