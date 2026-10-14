@@ -39,6 +39,11 @@
 // one or a re-offer, with its tracks bound to a share (Bindings); PublishICERestart, the re-offer that restarts ICE.
 // The SFU's in-process integration tests (02 §17) are written on these.
 //
+// ProbeClient is the browser's side of the connection test (02 §7.6, 05 §14.2): a PeerConnection with one data
+// channel whose offer, sent without candidates as a browser sends it, goes to sfu.SFU.Probe (or 04's
+// POST /api/v1/conntest); it takes the answer, waits for the PC and the channel (WaitOpen), and sends and receives
+// the messages that the probe PC echoes. Done tells when the probe is over for it. Integration 18 is written on it.
+//
 // Later slices add the rest of the package from 02 §4 and §17 with the first test that needs each part: REMB from
 // the rembsim model and a FaultConn rate limit (README S84).
 package sfutest

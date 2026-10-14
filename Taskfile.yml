@@ -719,21 +719,10 @@ tasks:
           [ ! -s "$tmp/names.bad" ] || status=1
 
           # The archives: the binary, the license files, README.md and the files install.sh installs (06 §3), at
-          # the root. A snapshot builds without README.md while the repository has none (.goreleaser.yaml); a
-          # release (FULL=true) never does.
-          printf '%s\n' LICENSE NOTICE THIRD_PARTY_NOTICES deploy/systemd/isshoni.service \
+          # the root. .goreleaser.yaml names README.md plainly, so goreleaser fails without it, snapshots too.
+          printf '%s\n' LICENSE NOTICE THIRD_PARTY_NOTICES README.md deploy/systemd/isshoni.service \
             deploy/sysctl/60-isshoni.conf deploy/firewall/ufw-isshoni deploy/firewall/firewalld-isshoni.xml \
             >"$tmp/content"
-          if [ -f README.md ] || [ "$full" = true ]; then
-            echo README.md >>"$tmp/content"
-          fi
-          if [ ! -f README.md ]; then
-            if [ "$full" = true ]; then
-              problem 'the repository has no README.md, and every archive of a release has one (06 §3)'
-            else
-              echo 'release:assets: note: the repository has no README.md yet, so the archives have none (06 §3 lists it; a release fails without it)'
-            fi
-          fi
           while read -r archive; do
             [ -f "dist/$archive" ] || continue
             cp "$tmp/content" "$tmp/content.want"
@@ -877,27 +866,84 @@ tasks:
       - task: lint:keys
 
   release:compat:
-    desc: Snapshot the protocol fixtures for the final release VERSION=X.Y.Z (run in the release-prep PR)
+    desc: >-
+      Snapshot the protocol fixtures for the final release VERSION=X.Y.Z into internal/protocol/testdata/compat/ and
+      keep the two newest snapshots (run it in the release-prep PR and commit the result)
+    # 01 §14.3, 06 §9.1: the compat test (internal/protocol/compat_test.go) decodes every snapshot with the current
+    # code from then on, and release.yml refuses a final release whose snapshot is missing or differs from
+    # testdata/v1. Plain sh, cp and rm: no Go, no Node, no sort (versions are compared in the shell).
     cmds:
       - cmd: |
-          case '{{.VERSION}}' in
-            *[!0-9.]* | .* | *. | *..* | *.*.*.*) ok=no ;;
-            *.*.*) ok=yes ;;
-            *) ok=no ;;
-          esac
-          if [ "$ok" = no ]; then
-            echo 'release:compat: VERSION={{.VERSION}} is not a final X.Y.Z release: run task release:compat VERSION=X.Y.Z' >&2
+          set -eu
+          die() {
+            printf 'release:compat: %s\n' "$@" >&2
             exit 1
+          }
+          src=internal/protocol/testdata/v1
+          compat=internal/protocol/testdata/compat
+          v='{{.VERSION}}'
+          # A final release X.Y.Z without leading zeros, as release.yml takes a tag (06 §9.1). A prerelease (-rc.N)
+          # gets no snapshot, and a forgotten VERSION= leaves the dev version (0.0.0-dev+<commit>), which fails too.
+          is_release() {
+            case $1 in
+            '' | *[!0-9.]* | .* | *. | *..* | *.*.*.* | 0[0-9]* | *.0[0-9]*) return 1 ;;
+            *.*.*) return 0 ;;
+            *) return 1 ;;
+            esac
+          }
+          is_release "$v" || die "VERSION=$v is not a final X.Y.Z release: run task release:compat VERSION=X.Y.Z" \
+            '(a prerelease -rc.N gets no snapshot: docs/m1/06-deploy-and-ci.md §9.1)'
+          [ -d "$src" ] || die "there is no $src to take a snapshot of"
+          # newer A B: release A comes after release B in SemVer order (numbers, so 0.0.10 comes after 0.0.9). The
+          # returns are explicit: in Task's shell a bare `return` returns 0, even right after a failing command.
+          newer() {
+            a=$1 b=$2
+            for _part in 1 2 3; do
+              x=${a%%.*} y=${b%%.*}
+              if [ "$x" -gt "$y" ]; then
+                return 0
+              elif [ "$x" -lt "$y" ]; then
+                return 1
+              fi
+              a=${a#*.} b=${b#*.}
+            done
+            return 1
+          }
+          # The two newest releases among the snapshots there and this one. Every entry of compat/ must be a
+          # snapshot directory, as the compat test requires; hidden files (.DS_Store) don't match the pattern.
+          first=$v second=
+          for d in "$compat"/*; do
+            [ -e "$d" ] || [ -L "$d" ] || continue
+            name=${d##*/}
+            [ "$name" != "$v" ] || continue
+            if [ -L "$d" ] || [ ! -d "$d" ] || ! is_release "$name"; then
+              die "$d is not a snapshot (a directory named after a final release X.Y.Z): remove it, then run this again"
+            fi
+            if newer "$name" "$first"; then
+              second=$first first=$name
+            elif [ -z "$second" ] || newer "$name" "$second"; then
+              second=$name
+            fi
+          done
+          # Only the two newest stay: a snapshot for an older release would be deleted as soon as it was made.
+          if [ "$v" != "$first" ] && [ "$v" != "$second" ]; then
+            die "$v is older than the snapshots $second and $first: only the two newest releases keep a snapshot," \
+              'so this one would be deleted at once (docs/m1/06-deploy-and-ci.md §7.2)'
           fi
+          # A fresh copy: a snapshot taken again (testdata/v1 changed after the first run) drops what is gone.
+          rm -rf "${compat:?}/$v"
+          mkdir -p "$compat/$v"
+          cp -R "$src/." "$compat/$v/"
+          echo "release:compat: copied $src to $compat/$v"
+          for d in "$compat"/*; do
+            [ -e "$d" ] || [ -L "$d" ] || continue
+            case ${d##*/} in "$first" | "$second") continue ;; esac
+            rm -rf "$d"
+            echo "release:compat: removed $d (only the two newest releases keep a snapshot)"
+          done
+          echo "release:compat: the snapshots are now ${second:+$second and }$first. Commit $compat/ in the" \
+            'release-prep PR and merge it before you tag (docs/m1/06-deploy-and-ci.md §9.1)'
         silent: true
-      - cmd: "echo 'release:compat: skipped, internal/protocol/testdata/v1 does not exist yet'"
-        silent: true
-        if: '[ ! -d internal/protocol/testdata/v1 ]'
-      - cmd: |
-          echo 'release:compat: not implemented yet: copy internal/protocol/testdata/v1 to internal/protocol/testdata/compat/{{.VERSION}}/ and keep the two newest (docs/m1/01-protocol.md §14.3)' >&2
-          exit 1
-        silent: true
-        if: '[ -d internal/protocol/testdata/v1 ]'
 
   # ---------------------------------------------------------------------------------------------------------------
   # Deployment tests

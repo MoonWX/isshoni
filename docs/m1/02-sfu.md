@@ -99,6 +99,7 @@ internal/server/sfu/
   allocator.go    per-subscriber downlink controller
   uplink.go       UplinkPolicy (M1: admin cap and layer pausing; M2: native estimator)
   codec.go        ProfileKey, compatibility matrix, PT table, codec policy helpers
+  codecstate.go   SetDecodeCaps, viewers without H.264: caps-driven video, codec rebuilds, the guard (§8.5)
   h264.go         SPS detection (keyframe start), SPS parser (size), NAL helpers
   sdpcheck.go     publish-offer validation, subscribe-answer checks, Opus fmtp edit (pion/sdp)
   probe.go        connection-test probe PCs
@@ -106,7 +107,7 @@ internal/server/sfu/
   errors.go       Error and codes
   stats.go        ShareInfo, ConnStats, Snapshot, Metrics
   *_test.go
-internal/server/sfu/sfutest/   Harness, DirectSignaler, Viewer (+Recorder, checks), FaultConn
+internal/server/sfu/sfutest/   Harness, DirectSignaler, Viewer (+Recorder, checks), FaultConn, ProfileSource
 internal/server/sfu/sfutest/rembsim/  REMB model copying libwebrtc's AIMD estimator (no imports of sfu or Pion;
                                       used by allocator_test and sfutest.Viewer, §17)
 internal/media/fake/           Source, synthetic and decodable H.264, Opus asset, testdata/
@@ -297,14 +298,24 @@ already ended every share with its own reason.
 
 Rules:
 - Lock order: `SFU.mu` → `Room.mu` → `Share.mu` → `DownTrack.mu`. Each is held briefly and never across a Pion call,
-  a `Signaler`/`RoomEvents` call or a blocking channel send.
-- **One exception: `Share.notify`** (README S41). It is a mutex per share that is outside the order above and is
-  the one lock held across a `RoomEvents` call. It only puts a share's reports in order: the ticker holds it while
-  it makes the share's `ShareUpdated` calls, and `SFU.endShare` holds it while it ends the share, reports the state
-  changes the ticker hadn't reported yet and then `ShareEnded`. So every `ShareUpdated` comes before the
-  `ShareEnded`, and nothing is reported about a share after its end (§6.2). It is safe because `RoomEvents` calls
-  never block (the last rule below), `Share.mu` is the only lock taken inside it, and whoever takes it holds no
-  other lock.
+  a `Signaler`/`RoomEvents` call or a blocking channel send. `Room.mu` also guards each Conn's decode caps, which
+  the room's policy reads (README S69).
+- **Two exceptions: `Share.notify` and `Room.policyMu`.** Each is a mutex outside the order above, and they are
+  the only locks held across a `RoomEvents` call.
+  - **`Share.notify`** (README S41), one per share, only puts a share's reports in order: the ticker holds it while
+    it makes the share's `ShareUpdated` calls, and `SFU.endShare` holds it while it ends the share, reports the
+    state changes the ticker hadn't reported yet and then `ShareEnded`. So every `ShareUpdated` comes before the
+    `ShareEnded`, and nothing is reported about a share after its end (§6.2). It is safe because `RoomEvents` calls
+    never block (the last rule below), `Share.mu` is the only lock taken inside it, and whoever takes it holds no
+    other lock.
+  - **`Room.policyMu`** (README S69), one per room, only puts the room's codec policy changes and their reports in
+    order (§8.3). `SFU.updateCodecPolicy` holds it while it works out the policy (under `Room.mu`, taken inside
+    it), makes the change's `CodecPolicyChanged` call and posts one `CodecPolicyEvent` per share to the internal
+    event queue of the Conn that publishes it. So one evaluation runs at a time, and its reports are out before the
+    next one starts: every publisher hears of the changes in the order they happened. Its callers are `Join`, a
+    Conn's close, `SetDecodeCaps` and the ticker, none of which holds a lock then. It is safe for the reasons
+    `Share.notify` is: the `RoomEvents` call and the posts never block, `Room.mu` is the only lock taken inside it,
+    and whoever takes it holds no other lock.
 - **The layer choice is made under `Share.mu`, then `DownTrack.mu`** (README S52; the order above). Which layer a
   DownTrack forwards (§10.1) is chosen with both held:
   - by the subscriber's actor when the request or the server's cap changes (`DownTrack.setWant`);
@@ -531,7 +542,7 @@ connections, each of which ends its shares with its own reason and closes its pe
 **`StartShare` and `UpdateShare`** exist from S29 on with the numbers of §8.6 (they are not stubs until slice 7):
 - `StartShare` creates the share `pending` under the hub's id and returns `ShareParams` for its preset: `f` then `q`,
   both `Active`, `f.MaxBitrate` under the admin cap, `AudioBitrate` by preset, and `Profile` = the room's codec
-  policy (`6400` for every room until slice 10 adds the policy). Errors: `sfu.role_forbidden`,
+  policy (`6400` for every room until slice 10, README S69, added the policy). Errors: `sfu.role_forbidden`,
   `sfu.too_many_shares`, and the contract violations of §6.3 (an empty or reused share id, an unknown preset).
 - `UpdateShare(id, ShareUpdate{Preset})` stores the new preset and returns the share's new `ShareParams`; a nil
   `Preset` changes nothing and returns the current ones. The encodings apply at once (the client sets them); the
@@ -678,19 +689,14 @@ type Error struct {
 	RetryAfter time.Duration // set for pc_rate_limited (§12), busy (1 s) and probe_limit (until the oldest running
 	                         // probe's 20 s lifetime ends)
 	msg        string        // logs only, never sent
-	cause      error         // what Unwrap returns: ErrNotImplemented, or nil
 }
 func (e *Error) Error() string          // the code, and ": " + msg when there is one
-func (e *Error) Unwrap() error          // ErrNotImplemented for a method that a later slice fills in, else nil
 func (e *Error) Is(target error) bool   // errors.Is(err, &sfu.Error{Code: sfu.CodeBadSDP}) matches by Code alone
 
 // One constant per code of the table below: CodeClosed = "sfu.closed", CodeBusy, CodeRoleForbidden, CodeBadPC,
 // CodeBadSDP, CodeNoH264, CodeBadRID, CodeUnknownTrack, CodeStaleAnswer, CodeStaleOffer, CodePCLimit,
 // CodePCRateLimited, CodeShareNotFound, CodeNotOwner, CodeTooManyShares, CodeTooManySubscriptions, CodeProbeLimit,
 // CodeTransportDisabled, CodeInternal.
-
-// ErrNotImplemented is wrapped by the error of an API method that a later slice of README §5 fills in.
-var ErrNotImplemented = errors.New("sfu: not implemented yet")
 ```
 
 Every exported method that can fail returns an `*Error` (`New` returns plain errors: a nil `Config.Transport`, a
@@ -717,26 +723,28 @@ that has only `Code` set.
 | `sfu.too_many_subscriptions` | UpdateSubscriptions | no | guard: 256 per Conn, 64 items per call |
 | `sfu.probe_limit` | Probe | yes | 20 probes per server already running (a user's new probe of the same transport replaces the old one, §7.6) |
 | `sfu.transport_disabled` | Probe | no | the requested transport has no mux: `udp` with `listen.ice_udp` = "", `tcp443` in `tls.mode=off`, `tcp7882` with `listen.ice_tcp` = "" (04 answers 409 `transport_disabled`) |
-| `sfu.internal` | any | yes; no for the two cases below | unexpected Pion error (logged with details). Also, with `Retryable` false: a call that breaks the API's contract, and a method that isn't implemented yet |
+| `sfu.internal` | any | yes; no for the case below | unexpected Pion error (logged with details). Also, with `Retryable` false: a call that breaks the API's contract (and, until README S76, a method that wasn't implemented yet) |
 
-**`sfu.internal` that is not retryable** (S29). Two kinds of error use the code with `Retryable: false`, because
-trying again can't help:
+**`sfu.internal` that is not retryable** (S29). Two kinds of error used the code with `Retryable: false`, because
+trying again can't help; since README S76 only the first is left:
 - **A contract violation**: the caller, not the client, got it wrong. `Join` with an empty `Room`, `Participant`,
   `User` or `Conn`, a `Role` or `ClientKind` outside its constants, a nil `Signaler`, a `Conn` id that is already
   joined, or a `Participant` that belongs to another `User`; `StartShare` with an empty share id, an id of a share
   that exists, or an unknown preset; `UpdateShare` with an unknown preset; an `UpdateSubscriptions` item with an
   unknown quality (a per-item error). These are bugs in the hub or sfuplane, so they get no code of their own: the
   log message names the call.
-- **A method of a later slice** ("interfaces first", README §4): the whole §6.1 API is declared from S29 on, and a
-  method whose slice hasn't landed returns an `*Error{sfu.internal}` whose `Unwrap` is `ErrNotImplemented`
-  (`errors.Is(err, sfu.ErrNotImplemented)`); the message names the method and its README slice. After S29 these
-  were `RestartICE`, `ResetPC` and `ClosePC` (S57), `SetDecodeCaps` (S69) and `Probe` (S76), and `Resync()`, which
-  has no error to return, only logged at debug. Since S57 two are left: `SetDecodeCaps` and `Probe`. The sentinel
-  goes away with the last such method.
+- **A method of a later slice** ("interfaces first", README §4), until README S76: the whole §6.1 API was declared
+  from S29 on, and a method whose slice hadn't landed returned an `*Error{sfu.internal}` whose `Unwrap` was the
+  sentinel `ErrNotImplemented`; the message named the method and its README slice. After S29 these were
+  `RestartICE`, `ResetPC` and `ClosePC` (S57), `SetDecodeCaps` (S69) and `Probe` (S76), and `Resync()`, which has
+  no error to return, only logged at debug. S76 built `Probe`, the last of them, and took out `Error.Unwrap` and its
+  `cause` field; the group 10 integration took out the sentinel with the wiring's log handler that had passed these
+  errors on at debug level (04 §6.6).
 
 sfuplane needs no special case for either: both are `sfu.internal`, which it maps to 01's `internal` (01 §15.4).
-So until its slice lands, a call that reaches one of these methods is answered `internal` on the wire: a client's
-`caps.update`, for example (and its `pc.close` and `pc.restart` until S57).
+So until its slice landed, a call that reached one of these methods was answered `internal` on the wire: a
+client's `pc.close` and `pc.restart` until S57, and its `caps.update` until S69. No signaling message reaches
+`Probe`: its one caller is 04's connection-test endpoint, which README S80 wires after S76.
 
 01 owns the error envelope (`error{code, retryable, scope}`); `sfuplane` maps these codes to 01's catalog (01 §15.4)
 and uses `Share` and `RetryAfter` when it builds the wire error. A §8.4 violation changes nothing, so a share whose
@@ -1022,10 +1030,24 @@ compatible one in the order `6400, 640c, 4d00, 42e0, 4200`.
    answer.
 2. Create the pub PC if needed, or replace it when `gen` is higher than the current one (PC guards, §12). Store the
    mid → share binding for `OnTrack`. Then `SetRemoteDescription(offer)` and flush buffered candidates.
-3. **Filter codecs** on each video transceiver: `SetCodecPreferences` keeps, in the offerer's order, only the profiles
-   the room policy allows. `high` allows all five; `cb` allows `42e0` and `4200`. Plus their RTX. The browser then
-   has to encode an allowed profile. (Slice 10 verifies that Pion honours transceiver preferences in answers. If it
-   doesn't, the fallback is to strip the other PTs from the offer before step 2.)
+3. **Filter codecs** on the transceiver of each video m-line that carries a share: `SetCodecPreferences` keeps, in
+   the order of the offer being answered, only the profiles the room policy allows. `high` allows all five; `cb`
+   allows `42e0` and `4200`. Plus their RTX. The browser then has to encode an allowed profile. Pion honours a
+   transceiver's preferences in its answers (README S69 verified it: integration 12 and `TestPubAnswerCodecFilter`),
+   so the fallback of stripping the other PTs from the offer is not needed. As S69 built it (`Conn.filterCodecs`):
+   - **The filter is set on every offer**, a re-offer in the same `gen` included. Pion takes a transceiver's codecs
+     from the remote description only when it creates the transceiver, and from then on answers with the
+     preferences last set on it, so a filter set while the policy was `cb` would otherwise still hold once it is
+     `high` again.
+   - **It chooses from the first offer's list.** For the same reason the codecs Pion matched in the offer that
+     created an m-line's transceiver are kept by mid (`pubPC.offered`) and are what every later filter chooses
+     from, put in the current offer's order by payload type (`inOfferOrder`); a codec the current offer doesn't
+     list is left out. So a sharer that re-offers with the hinted profile first gets it first in the answer
+     (01 §8.10).
+   - **An offer with no profile the policy allows** (a native sharer that can encode only High while the room is
+     `cb`) is answered with every profile it has, as without a policy, and that is logged at info. A viewer that
+     can't decode the stream then hears `codec_mismatch` (§8.3), which is better than a share without video for
+     everybody. An offer in which Pion matched no profile at all is not filtered.
 4. `CreateAnswer`, `SetLocalDescription(answer)`, wait for gathering (≤2 s).
 5. **Edit the copy sent to the client** (not the local description; these attributes only tell the remote side what
    to do, so Pion's local description can keep its own):
@@ -1048,17 +1070,51 @@ compatible one in the order `6400, 640c, 4d00, 42e0, 4200`.
 - **Recovery**: `SetDecodeCaps` going from no H.264 to some rebuilds the sub PC (close, new PC, all DownTracks, offer).
   A new Firefox PC picks up the newly installed OpenH264. Renegotiating the old PC may not, so it isn't relied on. It
   costs one audio gap of about 1 s, once per profile.
-- **Server guard** (caps wrong or stale): before `SetRemoteDescription(answer)`, `sdpcheck` finds video m-lines whose
-  answer contains no H.264. `DownTrack.Bind` never fails while at least one codec of its kind is negotiated: it returns
-  the first negotiated codec and marks itself `unsupported`, so the whole negotiation doesn't fail the way it did in
-  S4. The subscription then reports `decoder_unavailable`, and the SFU retries with a sub PC rebuild every 20 s, at
-  most 9 times (3 min, matching 05's "Reload the page" hint). After that the reason is `decoder_failed` until the next
-  `SetDecodeCaps`. If Pion calls `Bind` with an empty codec list for a rejected m-line and refuses a zero codec, the
-  fallback is to `RemoveTrack` those video senders before SRD and re-offer. The fake-Firefox integration test pins
-  this down.
+- **Server guard** (caps wrong or stale): an answer that refuses H.264 on a video m-line with a DownTrack doesn't fail
+  the negotiation the way it did in S4, because `DownTrack.Bind` never fails. With video codecs but no usable H.264
+  it returns the first negotiated one; for an m-line the viewer rejected (port 0), which Pion binds with an empty
+  codec list, it returns a zero codec, which Pion accepts. Either binding is marked `unsupported`, and nothing is
+  written through it. The subscription then reports `decoder_unavailable`, and the SFU retries with a sub PC rebuild
+  every 20 s, at most 9 times (3 min, matching 05's "Reload the page" hint). After that the reason is
+  `decoder_failed` until the next `SetDecodeCaps` that changes the caps. The fake-Firefox integration test pins this
+  down (integration 13).
 - **One retry loop, on the server** (plan: "the SFU must retry a subscription that failed on the codec"). Clients only
   poll their capabilities and send `caps.update`; they never send `pc.restart` for codecs (01 §11.7). On the wire all
   three internal reasons are `reason: codec` (01 §15.4).
+
+**As README S69 built it** (`codecstate.go`; `DownTrack.Bind` in `downtrack.go`; `checkSubAnswer` in
+`sdpcheck.go`).
+- **What Bind could bind drives the guard.** Pion fixes a sub PC's video codecs with the first answer that has
+  video in it, so a PC that took an answer refusing H.264 can carry no video any more, whatever later answers on it
+  say, and the bindings are the truth of what the SFU can send. After Pion has taken an answer (`Bind` runs inside
+  that `SetRemoteDescription`), a video DownTrack bound as unsupported on that sub PC marks the PC as one that
+  refused video and starts the guard (`Conn.codecAnswered`). The guard ends when an answer of a sub PC that never
+  refused binds video with H.264. `checkSubAnswer` still runs before `SetRemoteDescription` and finds the video
+  m-lines without H.264 (by position, rejected ones included), but its result is only logged at debug.
+- **No fallback is needed.** Pion binds a rejected m-line with an empty codec list and accepts the zero codec that
+  `Bind` returns, so the design's fallback (remove those video senders before the answer is applied, and re-offer)
+  was not built.
+- **When `SetDecodeCaps` rebuilds.** The caps are compared as sets: the same profiles again, in whatever order, are
+  a no-op, so a `caps.update` about something other than decoding starts no rebuild and leaves the guard as it is.
+  Caps that change reset the guard (no retries made, not failed) and rebuild the sub PC when the viewer has H.264 now
+  and either had none before or some subscription's video is held by the codec: by the decoders (`decoder_unavailable`,
+  `decoder_failed`) or by a stream in a profile its sub PC negotiated no payload type for (`codec_mismatch`). That is
+  01 §8.10's "retries codec-blocked subscriptions". Caps that lose H.264 rebuild nothing: the decoders' cap stops the
+  video (§10.1), and new video DownTracks stay off the sub PC.
+- **A sub PC without subscriptions is not rebuilt**, since there is nothing to offer: it is marked stale, and the
+  Conn's next subscription rebuilds it instead of renegotiating it (an SFU rebuild, not counted, §12). A codec retry
+  that comes due on a Conn without subscriptions does nothing.
+- **A closed sub PC is never rebuilt for the codec**, neither by `SetDecodeCaps` nor by a retry. It stays closed until
+  the client's next request (§5.3), and that request's successor counts toward the PC creation limit (§12) and
+  carries the video as the caps stand then. Otherwise a client could close its sub PC and toggle its caps for PCs
+  that nobody counts (`TestDecoderCapsOfClosedSubPC`).
+- **A codec rebuild that fails** reaches the client as an `ErrorEvent` with scope `pc.sub`, like any rebuild that no
+  call returns.
+- **After `decoder_failed`, only a caps change or a reload starts the retries again** (a known M1 limit, README §6
+  "Decided after group 9" (4); 06 §9.5). Equal caps start nothing, and a client sends `caps.update` only when its
+  capabilities change. So a Firefox whose first `hello` already listed H.264 (Firefox can list it before it can
+  use it) and whose OpenH264 download takes longer than the 3 min of retries stays `decoder_failed` until a reload,
+  which gives fresh caps and a fresh PC. 05's "Reload the page" hint appears at the same 3 min (05 §10.6).
 
 ### 8.6 Encodings per preset (`ShareParams`, M1)
 
@@ -1323,7 +1379,8 @@ S52 has added them since: §10.1, §6.2). Beyond the text above it settled five 
   nobody is asked for a keyframe the viewer couldn't decode. If the layer forwarded now has moved to that profile,
   what the viewer was getting is over (`munger.unforwardable`): a flip back to the old profile then waits for a
   keyframe instead of going on across a gap that a NACK would fill with the other profile's packets. Reporting it
-  (`codec_mismatch`) and fixing it through the room's codec policy is slice 10 (README S69).
+  (`codec_mismatch`, `DownTrack.mismatched`, §10.1) and fixing it through the room's codec policy are slice 10's
+  (README S69 built both).
 - **Done here, ahead of slice 8** (README S63, "repair and sync"), because the one-layer path needs it or gets it
   for nothing:
   - the **duplicate and too-late drop** at the cache insert (§9.1, §9.2), with both counters: a packet that isn't
@@ -1592,8 +1649,9 @@ requests for a packet that never comes. In integration 19 the publisher now rese
 | `off` | none | – |
 | audio `true` | the audio Layer | `Audio: false` in the state event |
 
-- Effective video quality = `min(requested, cap)`. The cap comes from the allocator (`bandwidth`), from server
-  limits (`server_limit`) or from codec state (`codec_mismatch`, `decoder_unavailable`).
+- Effective video quality = `min(requested, cap)`. The cap comes from the allocator (`bandwidth`) or from server
+  limits (`server_limit`); the viewer's decoders have a cap of their own (`decoder_unavailable`, `decoder_failed`),
+  and `codec_mismatch` is a reason without a cap (README S69, below).
 - Audio follows focus: the audio DownTrack is active only while its subscription has `Audio: true`. The client sends
   that for the focused share (05). The SFU doesn't force a single audio stream; a speaker button on another tile just
   sends another update.
@@ -1619,8 +1677,19 @@ requests for a packet that never comes. In integration 19 the publisher now rese
   - *A track that Pion delivers again with another SSRC* attaches its Layer before the old one is taken off, so
     its viewers wait for the new track's keyframe and don't fall back.
 - **The cap exists and nothing sets it yet.** `Conn.capSubscription(sub, q, reason)` stores the cap and its reason
-  on the subscription, applies `min(requested, cap)` and reports at once; its callers are the codec state (slice
-  10) and the allocator (slice 11). `server_limit` is later.
+  on the subscription, applies `min(requested, cap)` and reports at once; its caller is the allocator (slice 11,
+  README S84). `server_limit` is later.
+- **The decoders' cap is `Subscription.codec`, not `capSubscription`** (README S69, §8.5). It is
+  `decoder_unavailable` or `decoder_failed` while the viewer can't decode H.264, and then the subscription gets no
+  video, whatever the other cap says; it is empty otherwise. The Conn's actor sets it for every subscription
+  whenever the decoder state or the bindings may have changed (`Conn.refreshCodec`: after `SetDecodeCaps` and after
+  each applied answer) and reports at once. Kept apart from `capQ` and `capReason`, it can't conflict with the
+  allocator's cap; when both hold, the decoders' reason is the one reported.
+- **`codec_mismatch` is a derived reason, not a cap** (§8.3). A stream in a profile the viewer's sub PC negotiated
+  no payload type for (`DownTrack.mismatched`) leaves the DownTrack waiting, so it starts on the first keyframe it
+  can take, and the reason says `codec_mismatch` while the video forwarded is less than the request and no cap
+  explains it. The reasons go in this order: the decoders' cap, the allocator's cap, `codec_mismatch`, then what
+  the share's layers lack.
 - **Reasons**: the two of the table's last column, with one reading the table doesn't spell out. `no_layer` is
   the reason whenever a request for `high` is not served in full: with nothing forwarded, and also while the
   preview layer is forwarded in its place (`Forwarded: low`). A viewer who only waits (for its sub PC, or for the
@@ -2061,6 +2130,27 @@ and the NACKs it sent. `HarnessOptions.FaultyUDP` puts the Harness's SFU socket 
 (`Harness.Wire`), whose filter gets the client's address with every datagram, so a test can lose chosen packets
 between the SFU and one client (integration 4).
 
+**H.264 profiles and decoders in the test tools** (README S69, for §8.3–8.5 and integration 12 and 13):
+- **`publish.Options.Profile`** (default `6400`) **and `Options.Profiles`** (at most 4 more): the Publisher offers
+  every profile it can send, `Profile` first, each on a payload type of its own with its RTX right after it, and
+  sends the first one the answer lists, as a browser does, so the room's codec policy chooses. On a codec hint the
+  caller does what a browser sharer does (01 §8.10): `Publisher.SetProfile` puts the hinted profile first, and the
+  next offer's answer has the Publisher switch. The switch is made in the send loop, between two packets
+  (`applyProfile`), each layer from its next keyframe, which the Publisher asks the Source for; a switch made when
+  the answer arrived raced with a keyframe the Source had made in the old profile already. A Source that is a
+  `publish.ProfileSource` (one that can encode another profile; in M2 the native engine re-initializes its encoder)
+  is switched first; any other Source keeps its SPS, and only the payload type changes.
+- **`sfutest.ProfileSource`** is a `publish.ProfileSource` made of `fake.Source`s, one per profile, on one timeline:
+  a switch makes a new Source in the new profile, whose capture times go on from the moment of the switch and
+  which starts with a keyframe of every layer.
+- **`sfutest.ViewerOptions.H264`** lists the profile-level-ids a Viewer decodes (by default the five of §8.1), and
+  `NoH264` registers no H.264 at all, like a fresh Firefox before its decoder download. `Viewer.SetH264` changes
+  them for the PeerConnections the Viewer builds from then on (`Rebuild`), while its current one keeps what it
+  negotiated: a browser uses a downloaded decoder on a new PeerConnection and may not on the one it has.
+- **`export_test.go`** has `AdvanceCodecClock`, `CheckCodecPolicies`, `Timings.CodecRetry`, `CodecRetries`,
+  `CodecPolicyHold` and `Conn.Decoders` (the guard's state: H.264 in the caps, refused, rebuilds, failed, a retry
+  set), §17.
+
 ### 15.2 `cmd/isshoni-loadtest`
 
 ```
@@ -2133,7 +2223,11 @@ through `export_test.go`; integration tests use real time unless noted. The PC t
 grace, the sub offer re-send, the ICE restart spacing, the window of the PC creation limit and the stalled
 threshold) are not behind a clock: each SFU keeps them as durations (`timings` in `config.go`) that a test shortens
 with `SetTimings` from `export_test.go` before the first `Join`, and `TestHandshakeTimeout` checks the defaults
-against the numbers of §5.3 and §12.
+against the numbers of §5.3 and §12. README S69 kept both patterns for the codecs: the room codec policy's hold of
+§8.3 reads a clock (`monoNow` plus a skew) that a test moves on with `AdvanceCodecClock`, and `CheckCodecPolicies`
+looks at every room's policy at once instead of waiting for the ticker; the 20 s between two codec rebuilds of §8.5
+is a duration like S57's (`Timings.CodecRetry` through `SetTimings`), not a clock. `TestDecoderUnavailable` checks
+the defaults (20 s, `CodecRetries` = 9, `CodecPolicyHold` = 60 s).
 
 **Unit (M1)**
 - `codec_test`: `ProfileKey` for fmtp variants (case, missing, `640034`); the compatibility matrix table; `bestPT` exact
@@ -2195,8 +2289,18 @@ against the numbers of §5.3 and §12.
 - `sdpcheck_test`: each validation code; a sending m-section without a binding, or bound to a share that isn't this
   Conn's, carries no share and is no error (and skips the per-share checks, the kind check included); the Opus edit
   per m-line (stereo and `maxaveragebitrate`) and `a=inactive` on the m-lines without a share; the answer check for
-  m-lines without H.264.
+  m-lines without H.264. README S69 added `TestPubAnswerCodecFilter` (step 3 of §8.4 on Chrome's offer, through a
+  Conn: the answer's video holds the policy's profiles with their RTX in the order of the offer it answers; a
+  re-offer with the hinted profile first gets it first; back at `high` a re-offer gets every profile again, although
+  the transceiver's preferences were filtered before; an offer without an allowed profile is answered with what it
+  has) and `TestInOfferOrder` (codecs in the offer's order by payload type, what either side lacks left out), and
+  `FuzzSDPCheck` runs `inOfferOrder` on every m-section it parses (each codec of the list at most once, and nothing
+  that isn't in the list).
 - `policy_test` (fake clock): high → cb at once; cb → high after 60 s; conns without H.264 ignored.
+  As README S69 wrote it: `TestCodecPolicyNext` drives the hysteresis by hand, and `TestRoomCodecPolicy` runs it
+  through an SFU (the viewer set, in which Conns without H.264 and Conns that don't subscribe are no viewers; the
+  reports of a change to the hub and, per share, to the publishing Conn; `ShareParams.Profile`; the hold on the
+  fake clock; `SetDecodeCaps` and `Resync`).
 - `api_test`: with a loopback `netx.Transport` (04) that has a fake 443 ICE listener, a sub offer contains UDP 7882,
   passive TCP 443 and 7882 candidates and no trickle; the probe APIs each advertise only their transport; the
   remote-candidate filter drops loopback, link-local, private (unless the server's own address is private) and
@@ -2250,6 +2354,23 @@ with `fake.Source`, `sfutest.Viewer`)**
 13. `TestDecoderUnavailable`: a viewer MediaEngine without H.264 (fresh Firefox) → audio only, `decoder_unavailable`;
     `SetDecodeCaps` with CB → sub PC rebuilt → video flows. The guard path: caps claim H.264 but the answer rejects
     it → no negotiation failure, then a retry.
+    As README S69 wrote 12 and 13 (`firefox_test.go`, with `sfutest.Viewer`'s `H264`, `NoH264` and `SetH264`, and
+    `sfutest.ProfileSource`, §15.1):
+    - `TestCodecPolicy`: a sharer sends High to a Chrome viewer; a viewer that decodes only CB joins, and the policy
+      is `cb` at once; the sharer gets `CodecPolicyEvent{42e0}`, the new viewer hears `codec_mismatch` while the
+      share is still High, the sharer re-offers with `42e0` first and the answer holds only `42e0` and `4200`; both
+      viewers then get the video on their CB payload type, the Chrome viewer without a gap in its stream. When the
+      CB viewer has left, the policy is `high` again 60 s later on the fake clock, and so is the sharer.
+    - `TestDecoderUnavailable`, with the 20 s shortened to 300 ms (`SetTimings`), in three parts. Caps-driven: no
+      video m-section and `decoder_unavailable` while the caps list no H.264, the audio flows, and caps that gain it
+      rebuild the sub PC once (`gen` 2) with the video. The guard: caps that list H.264 with a MediaEngine that has
+      none; the answer is applied without an error, 9 rebuilds follow one per interval, then `decoder_failed` and no
+      more rebuilds; the same caps again change nothing; the SFU's rebuilds don't count toward the PC creation limit
+      (a `ResetPC` after them still gets a PC, which doesn't restart the guard); caps that change after the
+      decoder download rebuild at once and the video comes. A decoder between shares: a viewer that gains H.264
+      while it watches nothing gets no rebuild then, and its next subscription gets a new sub PC with video.
+    - `TestDecoderCapsOfClosedSubPC`: caps that gain and lose H.264 21 times on a closed sub PC build no PC; the
+      client's next request (`Resync()`) builds the successor, which carries the video.
 14. `TestHandshakeTimeout`: a client that never completes ICE → PC closed at 10 s ± 1 s, `PCStateEvent`. An ICE
     restart that never completes gets no server timer and no event.
     The 10 s are measured from the PC's first answer (§5.3), for a pub and a sub PC, in real time; a sub PC whose
@@ -2348,8 +2469,8 @@ milestone gate before the M1 exit test). `-scenario smoke` runs as a Go test in 
   `ShareUpdate`, `SubscriptionUpdate`, `DecodeCaps`, `ProfileKey`, `Role`, `ClientKind`, `PCKind`, `Quality`,
   `Preset`, `SourceKind`, `ShareState`, `EndReason`, `SubReason`, `ShareInfo`, `LayerInfo`, `Signaler`,
   `RoomEvents`, `Event` and its types (`SubscriptionStateEvent`, `CodecPolicyEvent`, `QualityHintEvent`,
-  `PCStateEvent`, `ErrorEvent`), `Error` (with `Share` and `RetryAfter`; `Unwrap` and `Is`) and the `sfu.*` codes
-  (`Code…` constants), `ErrNotImplemented` (§6.3), `ConnStats` and its types (`PCStats`, `OwnShareStats`,
+  `PCStateEvent`, `ErrorEvent`), `Error` (with `Share` and `RetryAfter`; `Is`) and the `sfu.*` codes
+  (`Code…` constants), `ConnStats` and its types (`PCStats`, `OwnShareStats`,
   `SubscriptionStats`, `DownTrackStats`),
   `Snapshot` and its types (`RoomSnapshot`, `ShareSnapshot`, `ViewerCounts`, `ConnSummary`, `SnapshotTotals`),
   `Metrics` and its label values (§13), `ProbeTransport`, `ProbeResult`. Later: `RoomLimits`, `SetRoomLimits`.
@@ -2510,7 +2631,8 @@ tests of the timers and guards in `guards_test.go`).
   which tie the count's key to `ice.Candidate.Equal`.
 
 Still to come in the paths S57 touched: the last `QualityHintEvent` per share in `Resync()` (README S88, which
-sends the first ones), and the SFU's own codec rebuilds, which the creation limit won't count (README S69).
+sends the first ones), and the SFU's own codec rebuilds, which the creation limit won't count (README S69 built
+them, §8.5).
 
 **What README S63 built** (slice 8; integration 4, 5, 6 and 19 in `repair_test.go`, the unit tests in
 `rtx_test.go`). Repair is §9.5 in the order of its steps, with the cap of 256 sequence numbers per compound
@@ -2519,6 +2641,33 @@ and the RTT from the candidate pair are §9.3. Sync is §9.6, with the `lastTS +
 keyframe whose capture time was forwarded already. The publish side got the NACK filter and the cap of 10 requests
 per packet, with one `webrtc.API` per pub PC (§8.1). The test tools are §15.1 (`RedundantRTX`, `Padding`, the
 Viewer's own NACKs, `HarnessOptions.FaultyUDP`) and §17 (`InSeqOrder`).
+
+**What README S69 built** (slice 10; integration 12 and 13 in `firefox_test.go`, `policy_test.go`, and the codec
+filter's tests in `sdpcheck_test.go`).
+- **The room codec policy** of §8.3 in `room.go`: high while every viewer (a Conn that subscribes, with H.264 in
+  its caps) can receive High, cb at once otherwise, and high again only after 60 s without a viewer that needs cb.
+  It is worked out again where the viewer set changes (`Join`, a Conn's close, `SetDecodeCaps`) and by the ticker
+  once a second for the way back. A change goes to the hub (`CodecPolicyChanged`) and, as a `CodecPolicyEvent`, to
+  the Conn that publishes each share, in the order of the changes under `Room.policyMu` (§5.4); new shares get it
+  in `ShareParams.Profile`, and `Resync()` sends it again per own share (§6.5).
+- **The pub answer's codec filter** (§8.4 step 3, `Conn.filterCodecs`): set on every offer, chosen from the codecs
+  of the offer that made the transceiver (`pubPC.offered`) in the current offer's order, and an offer without an
+  allowed profile answered with what it has. Pion honours the transceiver's preferences, so the design's fallback
+  wasn't needed.
+- **Viewers without H.264** (§8.5, `codecstate.go`): `SetDecodeCaps`, the caps-driven video, the codec rebuilds
+  with their rules (equal caps a no-op, a rebuild also when the codec holds a subscription, a stale empty sub PC
+  rebuilt by the next subscription, a closed sub PC never rebuilt for the codec), and the guard driven by what
+  `Bind` could bind, with its 20 s × 9 retries and `decoder_failed`. None of these rebuilds counts toward the PC
+  creation limit (§12). `SetDecodeCaps` is implemented, so a client's `caps.update` no longer answers `internal`
+  (§6.3); `Probe` is the one method left, until README S76.
+- **The decoders' cap** is `Subscription.codec`, apart from the allocator's cap, and `codec_mismatch` is a derived
+  reason (§10.1).
+- **Test tools**: `publish.Options.Profiles`, `Publisher.SetProfile` and `publish.ProfileSource`;
+  `sfutest.ProfileSource`; `sfutest.ViewerOptions.H264`, `NoH264` and `Viewer.SetH264`; the codec clock and
+  `Timings.CodecRetry` in `export_test.go` (§15.1, §17).
+
+Still to come in the paths S69 touched: the codec downgrade counters of §13 (`isshoni_sfu_downgrades_total` by
+reason, README S79).
 
 ## Decisions taken at integration (formerly open questions)
 

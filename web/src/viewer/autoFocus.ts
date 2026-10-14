@@ -20,7 +20,7 @@
 // (S47) sets audibleShareId without moving the focus; that choice stays until the user focuses a tile, or its share
 // ends. An automatic focus change moves the audio only when the audio was following the focus.
 //
-// A share without sound (ShareInfo.audio false) is never the audible one (README S72). That flag is what the server
+// A share without sound (ShareInfo.audio false) is never the audible one (05 §12.3). That flag is what the server
 // receives now (01 §8.5), not a promise: it is false for a share made without sound, but for a while also for one
 // that has it, at its first live when the first video keyframe beats the first audio packet, and while its sharer's
 // PC is rebuilt. So the rules above give the sound as if every share had one, and settleSound then decides what is

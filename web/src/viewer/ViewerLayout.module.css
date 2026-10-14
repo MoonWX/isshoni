@@ -65,7 +65,7 @@
 /*
  * A horizontal strip; each tile is min(44vw, 220px) wide. The padding keeps the tiles' focus rings unclipped. A
  * browser re-snaps the strip to the tile it was snapped to when tiles come in before it; ViewerLayout keeps a strip
- * that was at its start there (README S72).
+ * that was at its start there (05 §12.1).
  */
 .others {
   display: flex;

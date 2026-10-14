@@ -8,9 +8,8 @@
 # yet (web/ before the web client lands, for example) is skipped too. The run summary of the
 # changes job says why each job runs or not.
 #
-# Jobs for parts that land later (distro and site of 06 §8.2) come with those parts: each
-# adds a `decide` line to the changes job and, when it gates the merge, its id to ci-ok's
-# needs.
+# Jobs for parts that land later (site of 06 §8.2) come with those parts: each adds a
+# `decide` line to the changes job and, when it gates the merge, its id to ci-ok's needs.
 #
 # Rules for every workflow (06 §8.1): a read-only token by default, with jobs raising their
 # own permissions; third-party actions pinned by full commit SHA with a version comment;
@@ -68,6 +67,7 @@ jobs:
       run-acme: ${{ steps.plan.outputs.run-acme }}
       run-docker-smoke: ${{ steps.plan.outputs.run-docker-smoke }}
       run-goreleaser-check: ${{ steps.plan.outputs.run-goreleaser-check }}
+      run-distro: ${{ steps.plan.outputs.run-distro }}
       run-govulncheck: ${{ steps.plan.outputs.run-govulncheck }}
       # Task's pin from .tool-versions (06 §7.1). Go comes from go.mod, Node from .tool-versions.
       task-version: ${{ steps.plan.outputs.task-version }}
@@ -116,6 +116,11 @@ jobs:
               - '!docs/m1/**'
             tools:
               - 'tools/**'
+            # Inputs of the distro job that neither deploy nor release covers: tools/relserve, which
+            # only that job runs, and tools/notices, whose output is in the archives it installs.
+            distro_tools:
+              - 'tools/relserve/**'
+              - 'tools/notices/**'
 
       - name: Decide which jobs run
         id: plan
@@ -128,15 +133,16 @@ jobs:
           FILTER_RELEASE: ${{ steps.filter.outputs.release }}
           FILTER_SITE: ${{ steps.filter.outputs.site }}
           FILTER_TOOLS: ${{ steps.filter.outputs.tools }}
+          FILTER_DISTRO_TOOLS: ${{ steps.filter.outputs.distro_tools }}
         run: |
           # A pull request runs what its paths touch; a push to main and a merge-queue group
           # run everything.
           if [ "$EVENT" = pull_request ]; then
             go=${FILTER_GO:-false} web=${FILTER_WEB:-false} deploy=${FILTER_DEPLOY:-false}
             docker=${FILTER_DOCKER:-false} release=${FILTER_RELEASE:-false} site=${FILTER_SITE:-false}
-            tools=${FILTER_TOOLS:-false}
+            tools=${FILTER_TOOLS:-false} distro_tools=${FILTER_DISTRO_TOOLS:-false}
           else
-            go=true web=true deploy=true docker=true release=true site=true tools=true
+            go=true web=true deploy=true docker=true release=true site=true tools=true distro_tools=true
           fi
           go_or_web=false
           if [ "$go" = true ] || [ "$web" = true ]; then go_or_web=true; fi
@@ -150,6 +156,8 @@ jobs:
           if [ "$docker" = true ] || [ "$release" = true ]; then docker_deploy_or_release=true; fi
           deploy_or_release=$deploy
           if [ "$release" = true ]; then deploy_or_release=true; fi
+          distro_when=$deploy_or_release
+          if [ "$distro_tools" = true ]; then distro_when=true; fi
           {
             echo "go=$go"
             echo "web=$web"
@@ -162,7 +170,7 @@ jobs:
           {
             echo "### CI plan ($EVENT)"
             echo
-            echo "Filters: go=$go, web=$web, deploy=$deploy, docker=$docker, release=$release, site=$site, tools=$tools"
+            echo "Filters: go=$go, web=$web, deploy=$deploy, docker=$docker, release=$release, site=$site, tools=$tools, distro_tools=$distro_tools"
             echo
             echo "| Job | Decision |"
             echo "|---|---|"
@@ -221,6 +229,13 @@ jobs:
           decide goreleaser-check "$deploy_or_release" Taskfile.yml .tool-versions go.mod .goreleaser.yaml \
             tools/goreleaser/go.mod cmd/isshoni tools/notices web/package.json web/package-lock.json \
             deploy/install.sh deploy/docker/Dockerfile
+          # 06 §8.2 runs the distro scenarios on deploy or release changes. They install the
+          # releases that task release:snapshot builds, served by tools/relserve, so a change to
+          # relserve or to tools/notices (its output is in the archives) runs them too, as a
+          # job's own inputs do for e2e (06 §8.2).
+          decide distro "$distro_when" Taskfile.yml .tool-versions go.mod .goreleaser.yaml \
+            tools/goreleaser/go.mod cmd/isshoni tools/notices tools/relserve web/package.json \
+            web/package-lock.json deploy/install.sh deploy/test/distro-test.sh deploy/test/distro/Containerfile
           decide govulncheck "$go" Taskfile.yml .tool-versions tools/go.mod
 
           task_version=''
@@ -344,7 +359,7 @@ jobs:
         run: task test:go
 
       - name: Upload coverage
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-go
           path: |
@@ -370,7 +385,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Node (version from .tool-versions)
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .tool-versions
           cache: npm
@@ -398,7 +413,7 @@ jobs:
         run: npm run check:size
 
       - name: Upload web/dist
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: web-dist
           path: web/dist
@@ -478,7 +493,7 @@ jobs:
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
 
       - name: Set up Node (version from .tool-versions)
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .tool-versions
           cache: npm
@@ -546,7 +561,7 @@ jobs:
           version: ${{ needs.changes.outputs.task-version }}
 
       - name: Download web/dist
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: web-dist
           path: web/dist
@@ -599,7 +614,7 @@ jobs:
 
       - name: Upload bin/isshoni
         # The e2e job downloads it (artifacts drop the mode bit: chmod +x after download).
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: isshoni-linux-amd64
           path: bin/isshoni
@@ -626,7 +641,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Node (version from .tool-versions)
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .tool-versions
           cache: npm
@@ -636,7 +651,7 @@ jobs:
         run: npm ci --prefix web --no-audit --no-fund
 
       - name: Download bin/isshoni
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: isshoni-linux-amd64
           path: bin
@@ -690,7 +705,7 @@ jobs:
         # server log of its failed attempt are how the flake gets found. A run without any
         # failure uploads only the logs and the report, which are small.
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-results
           path: |
@@ -885,7 +900,7 @@ jobs:
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
 
       - name: Set up Node (version from .tool-versions)
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .tool-versions
           cache: npm
@@ -957,7 +972,7 @@ jobs:
           key: goreleaser-bin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/goreleaser/go.mod', 'tools/goreleaser/go.sum') }}
 
       - name: Set up Node (version from .tool-versions)
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .tool-versions
           cache: npm
@@ -981,6 +996,128 @@ jobs:
 
       - name: task release:snapshot
         run: task release:snapshot
+
+  distro-release:
+    # The two test releases of the install.sh scenarios (06 §11.2), built once for the distro
+    # matrix below: `task release:snapshot` (goreleaser, without the images) as 0.0.1-ci.1 and
+    # 0.0.1-ci.2, each with the web app built for its version first. deploy/test/distro-test.sh
+    # -b keeps what the installer downloads: the linux archives, checksums.txt and the stamped
+    # install.sh. Unsigned: every distro job signs them with a key of its own.
+    needs: changes
+    if: needs.changes.outputs.run-distro == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # one cache per job below: setup-go's key is shared by every job
+
+      - name: Cache Go modules and builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum', '.tool-versions') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+
+      # The cache of goreleaser-check, by the same key (see there).
+      - name: Cache the pinned goreleaser
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .bin/goreleaser
+            .task/checksum/release-goreleaser
+          key: goreleaser-bin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/goreleaser/go.mod', 'tools/goreleaser/go.sum') }}
+
+      - name: Set up Node (version from .tool-versions)
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Set up Task
+        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: ${{ needs.changes.outputs.task-version }}
+
+      - name: npm ci
+        run: npm ci --prefix web --no-audit --no-fund
+
+      - name: Install rpm (release:snapshot's asset check lists the rpm packages with it)
+        run: |
+          if ! command -v rpm > /dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends rpm
+          fi
+
+      - name: Build the releases 0.0.1-ci.1 and 0.0.1-ci.2
+        run: sh deploy/test/distro-test.sh -b "$RUNNER_TEMP/distro-releases"
+
+      - name: Upload the releases
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: distro-releases
+          path: ${{ runner.temp }}/distro-releases
+          if-no-files-found: error
+          retention-days: 1
+
+  distro:
+    # The install.sh scenarios of 06 §11.2 on the six container distros of 06 §4.13, one job
+    # each: deploy/test/distro-test.sh with the releases of distro-release, served by
+    # tools/relserve on this runner. Per distro: C1-C6 and C8-C10 and C12 in one systemd
+    # container, C7 and C13 in one each, C11 in the distro's plain image, and V3 with a running
+    # firewall on Fedora (firewalld) and Ubuntu 24.04 (ufw). Docker, as release.yml's verify
+    # job: the runner's podman is rootless, and its containers reach the runner's relserve
+    # another way.
+    needs: [changes, distro-release]
+    if: needs.changes.outputs.run-distro == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [debian-12, debian-13, ubuntu-22.04, ubuntu-24.04, ubuntu-26.04, fedora-44]
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod; for tools/relserve)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # one cache per job below: setup-go's key is shared by every job
+
+      - name: Cache Go modules and builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum', '.tool-versions') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+
+      - name: Download the releases
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: distro-releases
+          path: ${{ runner.temp }}/distro-releases
+
+      - name: The scenarios on ${{ matrix.distro }}
+        env:
+          CONTAINER_ENGINE: docker
+          DISTRO: ${{ matrix.distro }}
+        run: sh deploy/test/distro-test.sh -r "$RUNNER_TEMP/distro-releases" "$DISTRO"
 
   govulncheck:
     needs: changes
@@ -1035,7 +1172,22 @@ jobs:
     # a skipped job counts as a pass. always(), so it also reports when a job it needs failed.
     if: always()
     needs:
-      [changes, lint-go, test-go, web, protocol, licenses, build, e2e, lint-deploy, acme, docker-smoke, goreleaser-check]
+      [
+        changes,
+        lint-go,
+        test-go,
+        web,
+        protocol,
+        licenses,
+        build,
+        e2e,
+        lint-deploy,
+        acme,
+        docker-smoke,
+        goreleaser-check,
+        distro-release,
+        distro,
+      ]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     permissions: {}

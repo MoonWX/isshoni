@@ -1,0 +1,52 @@
+.help {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  text-wrap: pretty;
+}
+
+/* Share → Add to Home Screen → open it: each step with the icon Safari shows for it. */
+.steps {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: 0;
+  margin: 0;
+  list-style: none;
+  counter-reset: step;
+}
+
+.steps li {
+  display: grid;
+  grid-template-columns: 1.5rem minmax(0, 1fr);
+  gap: var(--space-3);
+  align-items: start;
+  counter-increment: step;
+}
+
+.steps svg {
+  width: 1.25rem;
+  height: 1.25rem;
+  margin-top: 0.0625rem;
+  color: var(--color-accent);
+}
+
+/* The last step has no Safari icon: its number instead. */
+.number::before {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.25rem;
+  height: 1.25rem;
+  font-size: var(--text-xs);
+  font-weight: var(--weight-bold);
+  color: var(--color-on-accent);
+  content: counter(step);
+  background-color: var(--color-accent);
+  border-radius: var(--radius-full);
+}
+
+.muted {
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}

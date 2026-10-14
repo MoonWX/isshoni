@@ -267,7 +267,7 @@ describe('viewerStore.syncRoom', () => {
     });
   });
 
-  it('never makes a share without sound the one heard (README S72)', () => {
+  it('never makes a share without sound the one heard (05 §12.3)', () => {
     const store = createViewerStore();
     const withSound = shareInfo('s_a', 'u_bea', 1);
     const quiet = shareInfo('s_q', 'u_cy', 2, { audio: false });

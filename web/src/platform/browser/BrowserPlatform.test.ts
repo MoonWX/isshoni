@@ -4,9 +4,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { UAData } from '../../lib/ua';
 import { apiPath, server } from '../../test/msw';
 import { installFakeRTC } from '../../test/FakeRTCPeerConnection';
-import { NotImplementedError } from '../../lib/errors';
 import { BrowserPlatform, canShareHere } from './BrowserPlatform';
 import type { DeviceEnv } from './device';
+import { PushSetupError } from './push';
 import { detectPlatform } from '../detect';
 
 const UA = {
@@ -163,7 +163,7 @@ describe('BrowserPlatform basics', () => {
     }
   });
 
-  it('reports capabilities; push and install come from the stub providers (S77, S38)', async () => {
+  it('reports capabilities; push and install come from their providers (S77, S38)', async () => {
     const caps = await new BrowserPlatform({ env: env(UA.chromeMac) }).capabilities();
     expect(caps).toEqual({
       caps: { decode: [] },
@@ -186,7 +186,9 @@ describe('BrowserPlatform basics', () => {
     await Promise.resolve();
     expect(onUpdateReady).not.toHaveBeenCalled();
     off?.();
-    await expect(p.notifications.enable()).rejects.toBeInstanceOf(NotImplementedError);
+    // No service worker in a test build, and no Notification API in jsdom: push can't be turned on (S77).
+    await expect(p.notifications.support()).resolves.toBe('unsupported');
+    await expect(p.notifications.enable()).rejects.toBeInstanceOf(PushSetupError);
   });
 
   it('offers reload as its version action', () => {

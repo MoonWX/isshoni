@@ -418,7 +418,7 @@ func firstState(pc *webrtc.PeerConnection, states ...webrtc.PeerConnectionState)
 }
 
 // negotiate runs one offer/answer between the server PC and the client with complete SDP both ways. The server's
-// remote description goes through filter first, as a Conn does (filterSDP before SetRemoteDescription).
+// remote description goes through filter first, as a Conn does (limitSDP before SetRemoteDescription).
 func negotiate(t *testing.T, server, client *webrtc.PeerConnection, serverOffers bool, filter candidateFilter) {
 	t.Helper()
 	offerer, answerer := client, server
@@ -1059,6 +1059,11 @@ func TestNewCandidateFilter(t *testing.T) {
 	}
 }
 
+// filterSDP is limitSDP without a cap: what the remote-candidate filter alone takes out of an SDP.
+func (f candidateFilter) filterSDP(raw string) (string, int, error) {
+	return f.limitSDP(raw, nil)
+}
+
 // TestFilterSDP: a client's SDP loses exactly the candidates the filter drops, at session and media level, read as
 // Pion's SDP parser reads them.
 func TestFilterSDP(t *testing.T) {
@@ -1448,10 +1453,9 @@ func TestLimitSDP(t *testing.T) {
 	if err != nil || dropped != 4 || again != out {
 		t.Errorf("the same SDP again: %d dropped, %v, the same result %v", dropped, err, again == out)
 	}
-	// Without a cap it is filterSDP.
-	plain, dropped, err := filter.limitSDP(raw, nil)
-	if viaFilter, n, _ := filter.filterSDP(raw); err != nil || dropped != 1 || plain != viaFilter || n != 1 {
-		t.Errorf("without a cap: %d dropped, %v; filterSDP dropped %d, the same result %v", dropped, err, n, plain == viaFilter)
+	// Without a cap only the filter drops: the loopback candidate.
+	if _, dropped, err := filter.limitSDP(raw, nil); err != nil || dropped != 1 {
+		t.Errorf("without a cap: %d dropped, %v, want 1", dropped, err)
 	}
 }
 

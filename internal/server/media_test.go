@@ -677,11 +677,11 @@ func TestLimitsReachTheSFU(t *testing.T) {
 	}
 }
 
-// TestUnbuiltSFUMethodsAreQuiet: the messages that reach an SFU method a later slice of the plan implements are
-// answered, and none of them puts a warning or an error into the server's log (wire.go: notImplementedAsDebug).
-// Every client sends pc.close when its last share stops, and Firefox sends caps.update while it gets its decoder.
-// The test holds whichever of these methods are built: it asks only that the log stays quiet.
-func TestUnbuiltSFUMethodsAreQuiet(t *testing.T) {
+// TestEverydaySFUMessagesAreQuiet: the everyday messages that reach the SFU methods later slices of the plan built
+// (README S57, S69) are answered, and none of them puts a warning or an error into the server's log. Every client
+// sends pc.close when its last share stops, and Firefox sends caps.update while it gets its decoder. The test asks
+// only that the log stays quiet, not what each method answered.
+func TestEverydaySFUMessagesAreQuiet(t *testing.T) {
 	srv := servertest.Start(t, servertest.Options{Deps: wiredDeps()})
 	setUp(t, srv)
 	c := dialWS(t, srv)
@@ -707,8 +707,8 @@ func TestUnbuiltSFUMethodsAreQuiet(t *testing.T) {
 	// done, whatever each of them answered.
 	startShare(t, c, "r2")
 
-	// Nothing is an error, and the adapter between the hub and the SFU, which is where the answers of an unbuilt
-	// method arrive, has no warning either. (Pion's own lines, which carry a scope, are not the server's.)
+	// Nothing is an error, and the adapter between the hub and the SFU, which is where the SFU's answers arrive,
+	// has no warning either. (Pion's own lines, which carry a scope, are not the server's.)
 	for _, rec := range logRecords(t, srv.Logs()) {
 		if rec["scope"] != nil {
 			continue

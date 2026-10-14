@@ -23,18 +23,19 @@ func TestJoinAndWatch(t *testing.T) {
 	w := newWorld(t, servertest.Options{})
 	alice := w.connect(w.member("alice"), protocol.RoleFull)
 	sh := alice.publish(1, sfutest.LoopbackSettings())
+	pub := sh.publisher()
 	alice.waitLive(sh.id)
 	// The share has been live for a while when the viewer comes: the stream's own first keyframe is long past, and
 	// the next one is a minute away unless someone asks.
-	eventually(t, func() bool { return layerStats(t, sh.pub, "f").Frames >= 30 },
-		func() string { return fmt.Sprintf("the publisher's stats are %+v", sh.pub.Stats()) })
-	before := layerStats(t, sh.pub, "f")
+	eventually(t, func() bool { return layerStats(t, pub, "f").Frames >= 30 },
+		func() string { return fmt.Sprintf("the publisher's stats are %+v", pub.Stats()) })
+	before := layerStats(t, pub, "f")
 
 	bob := w.connect(w.member("bob"), protocol.RoleViewer)
 	viewer := bob.watch(sfutest.LoopbackSettings(), 0)
 	// A new connection learns of the share from the room.state that follows its join.
 	info := bob.waitLive(sh.id)
-	if info.UserID != alice.userID || info.ConnectionID != alice.connectionID || info.Kind != protocol.ShareKindScreen ||
+	if info.UserID != alice.userID || info.ConnectionID != alice.connID() || info.Kind != protocol.ShareKindScreen ||
 		info.Preset != protocol.PresetAuto || len(info.Watchers) != 0 {
 		t.Errorf("the share in the viewer's room.state = %+v, want alice's screen share without watchers", info)
 	}
@@ -62,11 +63,11 @@ func TestJoinAndWatch(t *testing.T) {
 		}
 	}
 	// The keyframe the viewer started on is one the SFU asked the publisher for: it did not wait for the GOP to end.
-	if after := layerStats(t, sh.pub, "f"); after.PLIs+after.FIRs <= before.PLIs+before.FIRs || after.Keyframes <= before.Keyframes {
+	if after := layerStats(t, pub, "f"); after.PLIs+after.FIRs <= before.PLIs+before.FIRs || after.Keyframes <= before.Keyframes {
 		t.Errorf("the publisher's full layer: %d keyframe requests and %d keyframes before the viewer, %d and %d after; want one more of each",
 			before.PLIs+before.FIRs, before.Keyframes, after.PLIs+after.FIRs, after.Keyframes)
 	}
-	if st := layerStats(t, sh.pub, "q"); st.PLIs+st.FIRs != 0 {
+	if st := layerStats(t, pub, "q"); st.PLIs+st.FIRs != 0 {
 		t.Errorf("the preview layer got %d keyframe requests, and nobody watches it", st.PLIs+st.FIRs)
 	}
 
@@ -146,6 +147,7 @@ func TestLayers(t *testing.T) {
 	w := newWorld(t, servertest.Options{})
 	alice := w.connect(w.member("alice"), protocol.RoleFull)
 	sh := alice.publish(2, sfutest.LoopbackSettings())
+	pub := sh.publisher()
 	alice.waitLive(sh.id)
 	bob := w.connect(w.member("bob"), protocol.RoleViewer)
 	viewer := bob.watch(sfutest.LoopbackSettings(), 0)
@@ -159,10 +161,10 @@ func TestLayers(t *testing.T) {
 	// A second and a half: by then the publisher has sent a sender report for each layer, which a switch aligns
 	// the timestamps with.
 	waitFrames(t, video, 0, "f", 45)
-	eventually(t, func() bool { return layerStats(t, sh.pub, "f").SRs >= 1 && layerStats(t, sh.pub, "q").SRs >= 1 },
-		func() string { return fmt.Sprintf("the publisher's stats are %+v", sh.pub.Stats()) })
+	eventually(t, func() bool { return layerStats(t, pub, "f").SRs >= 1 && layerStats(t, pub, "q").SRs >= 1 },
+		func() string { return fmt.Sprintf("the publisher's stats are %+v", pub.Stats()) })
 	bob.waitStatus(high)
-	if st := layerStats(t, sh.pub, "q"); st.PLIs+st.FIRs != 0 || st.Keyframes != 1 {
+	if st := layerStats(t, pub, "q"); st.PLIs+st.FIRs != 0 || st.Keyframes != 1 {
 		t.Errorf("the preview layer before anybody asked for it: %d keyframe requests, %d keyframes", st.PLIs+st.FIRs, st.Keyframes)
 	}
 
@@ -172,19 +174,19 @@ func TestLayers(t *testing.T) {
 	waitFrames(t, video, mark, "q", 8)
 	bob.waitStatus(low)
 	toLow := switchTime(t, video.Packets()[mark:], "q", asked)
-	if st := layerStats(t, sh.pub, "q"); st.PLIs+st.FIRs < 1 || st.Keyframes < 2 {
+	if st := layerStats(t, pub, "q"); st.PLIs+st.FIRs < 1 || st.Keyframes < 2 {
 		t.Errorf("the preview layer after the switch: %d keyframe requests, %d keyframes; want the request and its keyframe",
 			st.PLIs+st.FIRs, st.Keyframes)
 	}
 
 	// ---- low → high ----
-	keysBefore := layerStats(t, sh.pub, "f").Keyframes
+	keysBefore := layerStats(t, pub, "f").Keyframes
 	mark, asked = len(video.Packets()), time.Now()
 	bob.subscribe(high)
 	waitFrames(t, video, mark, "f", 15)
 	bob.waitStatus(high)
 	toHigh := switchTime(t, video.Packets()[mark:], "f", asked)
-	if keys := layerStats(t, sh.pub, "f").Keyframes; keys <= keysBefore {
+	if keys := layerStats(t, pub, "f").Keyframes; keys <= keysBefore {
 		t.Errorf("the full layer made no keyframe for the switch back (%d before, %d after)", keysBefore, keys)
 	}
 	t.Logf("high → low took %v, low → high %v (S4: 42–106 ms)", toLow.Round(time.Millisecond), toHigh.Round(time.Millisecond))

@@ -10,10 +10,16 @@
 //   - Pion PeerConnections on loopback: internal/client/publish with internal/media/fake as the pub PC, and an
 //     sfutest.Viewer as the sub PC, which answers the server's sub offers and records what arrives.
 //
+// A client recovers by itself, as the web client does (client_test.go): it resumes after a socket drops, restarts
+// ICE and rebuilds its PeerConnections when 01 §10.4 says so, follows codec hints, and after a server restart joins
+// its room again, publishes its share again with replaces and moves its subscriptions to the new shares (01 §10.5,
+// §10.6). A test can cut a client's WebSocket under it, and take a client's UDP away (sfutest.FaultConn under its
+// ICE UDP mux).
+//
 // What the tests assert is what a client can observe: the messages on its socket and the RTP on its
 // PeerConnections. The SFU's own tests (internal/server/sfu) look inside the SFU for the same cases without a hub;
 // these go through every layer between a browser and it.
 //
-// Cases 1–3 and 9 of 01 §19 and the ICE-TCP checks of 04 §17 are here (README S59). The recovery cases 4–8 come
-// with README S74, and the metric assertion of the ICE-TCP test with README S85.
+// Cases 1–3 and 9 of 01 §19 and the ICE-TCP checks of 04 §17 are here (README S59), and the recovery cases 4–8
+// (README S74, recovery_test.go). The metric assertion of the ICE-TCP test comes with README S85.
 package itest

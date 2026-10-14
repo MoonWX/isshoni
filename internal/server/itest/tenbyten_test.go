@@ -145,7 +145,7 @@ func TestTenByTen(t *testing.T) {
 	var requests int
 	for i, sh := range shares {
 		for _, layer := range []string{"f", "q"} {
-			st := layerStats(t, sh.pub, layer)
+			st := layerStats(t, sh.publisher(), layer)
 			requests += st.PLIs + st.FIRs
 			if st.PLIs+st.FIRs < 1 {
 				t.Errorf("sharer %d, layer %s: no keyframe request, and viewers started on it", i, layer)

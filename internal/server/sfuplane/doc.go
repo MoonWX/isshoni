@@ -30,8 +30,7 @@
 // nothing waits for an answer: sfu.stale_answer, and sfu.closed on the notification paths. An SFU error with no wire
 // code of its own (sfu.internal, sfu.busy, a code this package doesn't know) becomes internal with a new 8-character
 // params.ref, and the same ref is logged with the SFU's error, so a user's report leads to the log line. Its
-// retryable flag is the SFU's: a call that broke the SFU's contract, or reached a method that isn't implemented yet,
-// can't succeed on a second try.
+// retryable flag is the SFU's: a call that broke the SFU's contract can't succeed on a second try.
 //
 // # What exists so far (README slice S50; 01 slice P8, the adapter)
 //

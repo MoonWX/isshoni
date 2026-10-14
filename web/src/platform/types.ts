@@ -2,8 +2,8 @@
 // implementation; the desktop app (M2/M3) bundles this same SPA with a DesktopPlatform. Outside platform/, nothing
 // reads cookies or location.origin, builds /api URLs by hand, or constructs RTCPeerConnection or WebSocket URLs.
 //
-// Wire types come from 01's types.gen.ts. The interfaces are declared in full ("interfaces first", README §4); the
-// browser's push provider is a stub until its slice lands (S77).
+// Wire types come from 01's types.gen.ts. The interfaces are declared in full ("interfaces first", README §4), and
+// BrowserPlatform implements every one of them since the push provider landed (S77).
 import type { ClientNotifications, ClientRequests, ServerEnvelope, ServerMessages } from '../protocol/registry.gen';
 import type {
   Caps,

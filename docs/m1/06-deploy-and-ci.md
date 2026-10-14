@@ -81,16 +81,40 @@ URLs from them. `<v>` is the version without the leading `v` (e.g. `0.1.0`).
 |---|---|
 | `isshoni_<v>_linux_amd64.tar.gz`, `…_linux_arm64.tar.gz` | `isshoni`, `LICENSE`, `NOTICE`, `THIRD_PARTY_NOTICES`, `README.md`, `deploy/systemd/isshoni.service`, `deploy/sysctl/60-isshoni.conf`, `deploy/firewall/ufw-isshoni`, `deploy/firewall/firewalld-isshoni.xml` |
 | `isshoni_<v>_darwin_{amd64,arm64}.tar.gz`, `isshoni_<v>_windows_{amd64,arm64}.zip` | same layout. **Experimental, untested server builds** for LAN/dev use; no installer. Release notes say so |
-| `isshoni_<v>_{amd64,arm64}.deb`, `isshoni-<v>-1.{x86_64,aarch64}.rpm` | packages (section 5); file names from nfpm's `ConventionalFileName` |
+| `isshoni_<v>_{amd64,arm64}.deb`, `isshoni-<v>-1.{x86_64,aarch64}.rpm` | packages (section 5); file names from nfpm's `ConventionalFileName` with `-` where the package version has `~` (README S73, below), so `<v>` is the release's version here too: `isshoni_0.1.0-rc.1_amd64.deb` |
 | `install.sh` | the installer, stamped with `<v>` |
 | `compose.yaml`, `compose.host.yaml` | Docker Compose files (section 6) |
-| `checksums.txt` | SHA-256 of every archive, package, `install.sh` and compose file (`<hex>  <name>` per line) |
+| `checksums.txt` | SHA-256 of every archive, package, `install.sh`, compose file and SBOM (`<hex>  <name>` per line) |
 | `checksums.txt.sig` | `ssh-keygen -Y sign` signature, namespace `isshoni-checksums` |
 | `checksums.txt.sigstore.json` | cosign v3 keyless bundle for `checksums.txt` |
 | `*.sbom.json` | SPDX JSON SBOM per archive (syft) |
 
 Also: images `ghcr.io/moonwx/isshoni:<v>` (multi-arch amd64+arm64), signed with cosign keyless, with a buildx SBOM
 attestation, and GitHub build-provenance attestations for every archive, package and image digest.
+
+**The assets as README S73 built them** (`.goreleaser.yaml`, 9.2; `task release:assets`, 7.2, checks every name
+and archive after each goreleaser run: CI's `goreleaser-check`, `task release:snapshot` and release.yml's `build`):
+- **Package file names have `-` where the package's version has `~`** (README §6 "Decided after group 9" (1)).
+  nfpm gives a prerelease the package version `0.1.0~rc.1`, which dpkg and rpm order before `0.1.0`, and its
+  conventional file names carry that `~`. GitHub renames a release asset whose name has a character other than
+  `A-Z a-z 0-9 . _ -` (`~` becomes `.`), or that starts or ends with `.`, so the draft would hold
+  `isshoni_0.1.0.rc.1_amd64.deb` while `checksums.txt` lists the `~` name, and the `sign` job's `sha256sum -c` would
+  fail after the owner's approval (9.3). So the file name template replaces `~` with `-`
+  (`{{ replace .ConventionalFileName "~" "-" }}`), and the package's own version keeps the `~` (the deb control's
+  `Version: 0.1.0~rc.1`, the rpm's `%{VERSION}`), so a package manager still orders the rc before the release.
+  `release:assets` checks both, and that every asset name is one GitHub keeps.
+- **`checksums.txt` lists the SBOMs too**: goreleaser sums every file it uploads, the `*.sbom.json` included, and
+  the `extra_files` (`install.sh`, both compose files) by their base names. A snapshot built without SBOMs (`task
+  release:snapshot`) has none to list. `checksums.txt.sigstore.json` (goreleaser's cosign step) and
+  `checksums.txt.sig` (the `sign` job) are not in it, and the `sign` job refuses a draft that holds any other asset
+  that `checksums.txt` does not list.
+- **Every archive ships the root `README.md`**, which also carries the release-key fingerprints (9.4, 10.3).
+  README S73 took it by the pattern `README.m[d]` while the repository had none, so that CI's snapshots built
+  meanwhile; release.yml's `build` job refuses a release without it, before a draft or an image exists. README F05
+  adds the root `README.md` and makes the archive entry the plain `src: README.md`, so that goreleaser itself fails
+  without it.
+- **The archives' entries are owned by root and dated by the commit**, wherever the archive is built; install.sh
+  unpacks with `--no-same-owner` and installs each file with its own owner and mode (4.4).
 
 **Docker tags.**
 - `0.x`: `:<v>` (e.g. `0.1.0`), `:0.<minor>` and `:latest`. There is no `:0`, because a 0.x minor may break things.
@@ -534,6 +558,11 @@ answer Yes; `--yes` accepts):
   `firewall-cmd` waits 10 seconds before it answers, on every Fedora machine where firewalld is installed and
   not running. So the detection is `systemctl is-active --quiet firewalld.service` first and
   `firewall-cmd --state` only then; the packaging scripts do the same.
+- **Only this offer reloads firewalld; the deb and rpm packages never do on install or upgrade** (README §6
+  "Decided after group 9" (2); §5). A reload drops every runtime-only rule the admin has, and the offer asks first
+  (or runs with `--yes`, which the admin typed). A package's `postinstall.sh` is not asked: it prints `firewall-cmd
+  --reload` before `--add-service=isshoni` for the admin to run (§5), and its `preremove.sh` reloads only after it
+  took the service out of a zone or policy, which closes the ports the service opened (4.11).
 - **Who builds the two in install.sh: README S67 did.** Both were written back here after group 7, while S67 was
   already building this offer, and S67 merged with both (`offer_firewall`): `systemctl is-active --quiet
   firewalld` comes before `firewall-cmd --state`, and the offer runs `firewall-cmd --reload`, `--permanent
@@ -840,12 +869,27 @@ README S73 on (`goreleaser-check`, 8.2).
 
 The package maintainer field is the owner's GitHub noreply address (filled in once; no personal e-mail in the repo).
 
+**The packages as README S73 built them** (`nfpms` in `.goreleaser.yaml`, 9.2; `task release:assets` checks the
+files, the versions and the dependencies of each):
+- **They never reload firewalld on install or upgrade** (README §6 "Decided after group 9" (2); 4.9): only
+  install.sh's firewall offer does. `postinstall.sh` puts nothing into firewalld and prints `firewall-cmd --reload`
+  before `--add-service=isshoni` for the admin; `preremove.sh` reloads only after it took the service out of a
+  zone or policy.
+- **The tools `preinstall.sh` needs come first**: the deb has `Pre-Depends: passwd` (dpkg runs a `preinst` only after
+  its Pre-Depends are configured), the rpm `Requires: shadow-utils` (rpm orders a Requires before the package).
+- **Nothing of the build machine is in a package**: the files are dated by the commit (`mtime`), and the rpm's build
+  host is the fixed name `isshoni` (rpm would record the machine's host name).
+- **File names** use `-` where the package version has `~` (§3).
+- The maintainer is the owner's GitHub noreply address, which the owner confirms before the first release.
+
 ## 6. Docker
 
 ### 6.1 Image: `deploy/docker/Dockerfile`
 
 ```dockerfile
-# syntax=docker/dockerfile:1@sha256:<pinned digest>
+# syntax=docker/dockerfile:<exact version>@sha256:<pinned digest>
+# Dependabot does not keep the line above current (its docker ecosystem reads only FROM lines): bump its version and
+# digest by hand with the monthly bump of the tool pins (§6.1, §7.1).
 # Built by goreleaser dockers_v2 (release) and deploy/docker/test/docker-build.sh (CI, task docker:smoke). No RUN
 # steps: nothing is emulated for arm64, and the image holds only the static binary.
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:<pinned digest, updated by Dependabot>
@@ -897,11 +941,15 @@ says the same for the repository's readers):
   file, so `docker/dockerfile:1` is a floating tag that every build, the release's included, pulls as it is at
   that moment: the one input of the image that no digest fixed. Like the `FROM` line it becomes
   `docker/dockerfile:1@sha256:<digest>`, so no build pulls a frontend nobody chose (§9.2). S73 also says, in a
-  comment just below the line, how that digest is kept current: by Dependabot's `docker` ecosystem if S73 confirms
-  that it updates the directive, otherwise by hand with the monthly bump of the tool pins (§7.1). The comment can't
-  go above the line: BuildKit looks for parser directives only at the top of the file, before any comment, empty
-  line or instruction, and would read the line as a plain comment. As S68 merged it the line is still
-  `# syntax=docker/dockerfile:1`; the block above shows it as S73 pins it.
+  comment just below the line, how that digest is kept current. The comment can't go above the line: BuildKit
+  looks for parser directives only at the top of the file, before any comment, empty line or instruction, and
+  would read the line as a plain comment.
+- **As README S73 pinned it** (with the group 9 integration's comment below it): the line names the frontend's
+  exact version and its digest, `docker/dockerfile:1.27.1@sha256:…` (the version that `:1` pointed at then), not
+  `:1@sha256:…`, so that a bump says what it moves to. **Dependabot does not update it**: its `docker` ecosystem
+  reads only `FROM` lines, so the version and the digest are **bumped by hand with the monthly bump of the tool
+  pins** (§7.1; README §6 "Decided after group 9" (3)), and the comment says so. `.github/dependabot.yml`'s "not
+  covered here" comment names the line too.
 
 ### 6.2 `deploy/compose.yaml` (bridge networking, the default)
 
@@ -1121,7 +1169,9 @@ actionlint 1.<latest>
 ```
 
 - `<latest>` means: pin the exact latest patch when slice S1 lands. Versions are bumped by hand, monthly, in one PR;
-  Dependabot can't read `.tool-versions`.
+  Dependabot can't read `.tool-versions`. The same PR bumps the two pins that follow them and that Dependabot doesn't
+  read either (README §6 "Decided after group 9" (3)): `tools/goreleaser/go.mod` with the goreleaser line (below),
+  and the version and digest of the Dockerfile's `# syntax=` line (§6.1).
 - `go.mod` has `go 1.26.0` and `toolchain go1.27.2`, the `.tool-versions` patch (the plan: language version 1.26,
   newest toolchain). The go line carries a patch because `golang.org/x/text`, `golang.org/x/crypto` and
   `modernc.org/sqlite` require `go 1.26.0`, so `go get` and `go mod tidy` write it that way; the language version is
@@ -1137,6 +1187,17 @@ actionlint 1.<latest>
   `go.yaml.in/yaml/v4` release candidate that golangci-lint's gosec needs);
 - our own small programs: `tools/repocheck` (behind `task lint:pins` and `lint:keys`), `tools/notices` (section 8.4),
   `tools/relserve` (section 11.2) and `tools/exittest` (section 12).
+
+**`tools/goreleaser/go.mod`** (README S73) is a module of its own, `github.com/MoonWX/isshoni/tools/goreleaser`, with
+one `tool` directive, `github.com/goreleaser/goreleaser/v2` at the `.tool-versions` version. goreleaser is not in
+`tools/go.mod` because it needs a newer `go` directive than the repository's 1.26 (2.18 requires `go 1.27.1`), and
+its large dependency graph (cloud SDKs, sigstore, …) would raise versions that golangci-lint, Task and the other
+tools share. `task release:goreleaser` builds it into `.bin/` (§7.2), and the release tasks, CI's `goreleaser-check`
+and release.yml's `build` job run it from there, each building it first: the `.bin/goreleaser` they run is always
+the pinned one, whatever mise or a package manager installed (`CONTRIBUTING.md` says so).
+`task lint:pins` (`tools/repocheck`) checks the module's toolchain line and its goreleaser version against
+`.tool-versions`, like the other modules. Dependabot's `gomod` directories leave it out: it is bumped by hand with
+`.tool-versions`.
 
 `task tools` builds the pinned tools into `.bin/`, using the repo toolchain:
 `go -C tools build -o ../.bin/ github.com/gzuidhof/tygo …`. They run from the repo root (tygo and go-licenses load the
@@ -1196,12 +1257,15 @@ vars:
 | `licenses` | go-licenses check (3 GOOS) and `node web/scripts/licenses.mjs check` for `web/` and `docs/` | section 8.3 |
 | `notices` | `go -C tools run ./notices …` → `THIRD_PARTY_NOTICES` | section 8.4 |
 | `release:prepare` | **no npm**: fails with "web/dist was built for X, not VERSION: run task build:web VERSION=…" unless `web/dist/version.json`'s `version` equals `VERSION` (read with `sed`, no Node); then `notices`, stamp `dist-extra/install.sh` (`VERSION=`) | goreleaser's before hook (`task release:prepare VERSION={{ .Version }}`, 9.2). The SPA comes from outside: the unprivileged `web` job in `release.yml` (9.3), or `release:snapshot` below. So the privileged release job runs no third-party JavaScript |
-| `release:snapshot` | `build:web`, then `goreleaser release --snapshot --clean --skip=sign,sbom`; both get `ISSHONI_SNAPSHOT_VERSION` (default `0.0.0-dev.<12-char commit>`), as `VERSION` for `build:web` and as env for goreleaser | local dry run; `goreleaser-check` and the distro tests use it too |
-| `release:compat` | `task release:compat VERSION=<v>` (`<v>` is the tag without `v`, e.g. `0.2.0`): copies `internal/protocol/testdata/v1` to `internal/protocol/testdata/compat/<v>/`, then deletes all but the two newest final-release snapshots (SemVer order). Fails unless `VERSION` is a final `X.Y.Z`: prereleases (`-rc.N`) get no snapshot, and a forgotten `VERSION=` leaves the dev version, which fails too | 01 §14.3. Run in the release-prep PR (9.1 "Before tagging"); release.yml checks the result (9.3). Plain `sh` and `cp`, no Go or Node. S01 writes it as a stub; S75 (01 P13) owns the body |
+| `release:goreleaser` (README S73) | `go -C tools/goreleaser build -o ../../.bin/ github.com/goreleaser/goreleaser/v2` with `CGO_ENABLED=0` | the pinned goreleaser (7.1); rebuilt only when `tools/goreleaser/go.mod` or `go.sum` changed (Task `sources`/`generates`) |
+| `release:snapshot` | `build:web`, then `goreleaser release --snapshot --clean --skip=sign,sbom`; both get `ISSHONI_SNAPSHOT_VERSION` (default `0.0.0-dev.<12-char commit>`), as `VERSION` for `build:web` and as env for goreleaser. As README S73 built it: first `release:goreleaser` and `goreleaser check`; `CLI_ARGS` go on to goreleaser (`task release:snapshot -- --skip=docker` leaves out the images); then `release:assets` for that version, and the image for this machine's CPU must start and report it. The images are built (9.2: one per platform, `<v>-amd64` and `<v>-arm64`, loaded locally, never pushed) and removed again when the task ends, passed or not; `KEEP_IMAGES=true` keeps them | local dry run; `goreleaser-check` and the distro tests use it too |
+| `release:assets` (README S73) | checks `dist/` after a goreleaser run against §3 for `VERSION=<v>`: the asset names (each one GitHub keeps as it is), `checksums.txt` (exactly the summed files, each once, with the right hash), the stamped `dist-extra/install.sh`, every archive's files, this machine's binary's version, and each package's files, version (`~` before a prerelease), architecture and dependencies (rpm's with `rpm` where it is installed). `FULL=true` (a release) also wants the SBOMs, the cosign bundle and `README.md` | run by `release:snapshot`, CI's `goreleaser-check` and release.yml's `build` (`FULL=true`) |
+| `release:keys` (README S73) | writes `deploy/keys/allowed_signers` into install.sh's key block, then `lint:keys`, and prints each key's fingerprint. It refuses, before it writes anything, a missing or empty file, a private key, a line that is not `isshoni-release namespaces="isshoni-checksums" ssh-ed25519 …`, a single quote anywhere and a missing final newline | the owner's step 2 of `deploy/keys/README.md` (9.4) |
+| `release:compat` | `task release:compat VERSION=<v>` (`<v>` is the tag without `v`, e.g. `0.2.0`): copies `internal/protocol/testdata/v1` to `internal/protocol/testdata/compat/<v>/`, then deletes all but the two newest final-release snapshots (SemVer order). Fails unless `VERSION` is a final `X.Y.Z`: prereleases (`-rc.N`) get no snapshot, and a forgotten `VERSION=` leaves the dev version, which fails too. It also refuses, changing nothing, a `VERSION` older than the two snapshots it would keep, a missing `testdata/v1`, and a `compat/` that holds anything but `X.Y.Z` snapshot directories (hidden files aside; a link counts as anything) | 01 §14.3. Run in the release-prep PR (9.1 "Before tagging"); release.yml checks the result (9.3). Plain `sh` and `cp`, no Go or Node. S01 writes it as a stub; S75 (01 P13) owns the body |
 | `deploy:test` | distro container tests; `DISTRO=debian-12` selects one | needs podman or Docker |
 | `docker:smoke` | section 6 smoke test (bridge with a backup → restore round trip and the IPv6 client-IP check, host, no-volume, no `.env`; 11.3) | |
 | `site:dev` / `site:build` | `npx --prefix docs vitepress dev\|build docs` | |
-| `clean` | remove `bin/`, `.bin/`, `dist/`, `dist-extra/`, `web/dist/*` (keeps `.gitkeep`), `.dev/` | |
+| `clean` | remove `bin/`, `.bin/`, `dist/`, `dist-extra/`, `web/dist/*` (keeps `.gitkeep`), `.dev/` | as built, `.bin/task` stays (it is often the Task running the command), and the other pinned tools go, `.bin/goreleaser` included |
 
 `.gitignore` gains: `.bin/`, `dist-extra/`, `.dev/`, `web/dist/*`, `!web/dist/.gitkeep`, `THIRD_PARTY_NOTICES`,
 `web/build-report.json`, `web/playwright-report/`, `web/test-results/`,
@@ -1314,7 +1378,8 @@ The `changes` job (`dorny/paths-filter`) sets these outputs. On `push` to `main`
 - `web`: `web/**`
 - `deploy`: `deploy/**`, `.github/workflows/**`, `Taskfile.yml`, `.tool-versions`
 - `docker`: `deploy/docker/**`, `deploy/compose*.yaml`
-- `release`: `.goreleaser.yaml`, `.github/workflows/release.yml`, `deploy/packaging/**`
+- `release`: `.goreleaser.yaml`, `.github/workflows/release.yml`, `deploy/packaging/**`, `tools/goreleaser/**`
+  (README S73)
 - `site`: `docs/**` except `docs/PLAN.md` and `docs/m1/**`, plus `web/src/conntest/codes.json` (the anchor test,
   10.4)
 
@@ -1330,7 +1395,7 @@ The `changes` job (`dorny/paths-filter`) sets these outputs. On `push` to `main`
 | `lint-deploy` | deploy | `task lint:sh lint:actions lint:keys lint:unit lint:pins test:sh` | 10 | yes |
 | `distro` | deploy or release | matrix of the 6 container distros (4.13), scenarios from 11.2; setup-node and `npm ci` in `web/`, because `task release:snapshot` builds the SPA (7.2) | 30 | yes |
 | `docker-smoke` | docker, deploy or release | `task docker:smoke` (11.3), linux/amd64 | 15 | yes |
-| `goreleaser-check` | release | setup-node and `npm ci` in `web/`; `goreleaser check`; `task release:snapshot` (builds the SPA first, 7.2); asserts the asset list of section 3 (names and archive contents) | 20 | yes |
+| `goreleaser-check` | release or deploy (below) | setup-node and `npm ci` in `web/`; `goreleaser check`; `task release:snapshot` (builds the SPA first, 7.2); asserts the asset list of section 3 (names and archive contents) | 20 | yes |
 | `site` | site or deploy | `vitepress build`; setup-go (from `go.mod`), then `go test ./internal/server/ops/doctor -run TestDocsAnchors` (10.4) | 10 | yes |
 | `govulncheck` | go | `.bin/govulncheck ./...`, `continue-on-error: true` (new CVEs mustn't block unrelated PRs; nightly and release gate on it) | 10 | no |
 | `ci-ok` | always (`if: always()`) | fails if any job in `needs` is `failure` or `cancelled`; `skipped` counts as success | 2 | **the only required check** |
@@ -1358,6 +1423,23 @@ The `changes` job (`dorny/paths-filter`) sets these outputs. On `push` to `main`
 - **Auth throttles.** The job needs no config for them: the harness sends each account request from an address
   of its own, which the e2e server takes from `X-Forwarded-For` because its peer is loopback (05 §19.3, 04 §8.5).
 - `ci-ok` needs the job.
+
+**The `goreleaser-check` job as README S73 built it.**
+- **It also runs on deploy changes**, not on release changes alone, as the `e2e` job does (README S61): its other
+  inputs are deploy files, which the `deploy` filter covers: the files the archives and packages ship, install.sh
+  (the before hook stamps it), the Dockerfile, the release tasks in `Taskfile.yml`, `.tool-versions` and the
+  workflow itself. The `release` filter also has `tools/goreleaser/**`. Like every job it is skipped, which counts
+  as a pass, while one of its inputs doesn't exist yet.
+- **One step does it all**: `task release:snapshot` (7.2) builds the pinned goreleaser, the SPA for the snapshot's
+  version, runs `goreleaser check`, the snapshot without signing, SBOMs or publishing, `task release:assets`, and
+  starts the runner's image to read its version. The snapshot carries the run's CI version
+  (`ISSHONI_SNAPSHOT_VERSION=0.0.0-ci.<run>`), not a dev one. The two images are built and loaded on the runner,
+  never pushed.
+- **rpm is installed** on the runner when missing, so `release:assets` reads the rpm packages' dependencies and
+  version too.
+- **Caches**: the Go modules and builds per job, and the pinned goreleaser binary with Task's checksum of its
+  module (keyed by `tools/goreleaser/go.mod` and `go.sum`, no restore keys), so a hit neither downloads nor compiles
+  goreleaser's module graph. release.yml uses no caches (9.3).
 
 **`.golangci.yml`** (v2 format):
 - linters: the `standard` set plus `bodyclose`, `errorlint`, `gosec`, `misspell`, `nilerr`, `noctx`,
@@ -1498,6 +1580,8 @@ owner.
 
 ### 9.2 `.goreleaser.yaml` (goreleaser OSS v2, ≥ 2.12)
 
+As README S73 built it (the comments here are shorter than the file's; the owner's address stays out of this page):
+
 ```yaml
 version: 2
 project_name: isshoni
@@ -1535,21 +1619,22 @@ archives:
     format_overrides:
       - goos: windows
         formats: [zip]
-    files:
-      - LICENSE
-      - NOTICE
-      - THIRD_PARTY_NOTICES
-      - README.md
-      - deploy/systemd/isshoni.service
-      - deploy/sysctl/60-isshoni.conf
-      - deploy/firewall/ufw-isshoni
-      - deploy/firewall/firewalld-isshoni.xml
+    builds_info: { owner: root, group: root, mode: 0755, mtime: "{{ .CommitDate }}" }
+    files: # at the archive's root, with their repository paths (§3); owned by root, dated by the commit
+      - &archived { src: LICENSE, info: { owner: root, group: root, mtime: "{{ .CommitDate }}" } }
+      - { <<: *archived, src: NOTICE }
+      - { <<: *archived, src: THIRD_PARTY_NOTICES }
+      - { <<: *archived, src: README.md }   # README F05; S73 had "README.m[d]" while there was none (§3)
+      - { <<: *archived, src: deploy/systemd/isshoni.service }
+      - { <<: *archived, src: deploy/sysctl/60-isshoni.conf }
+      - { <<: *archived, src: deploy/firewall/ufw-isshoni }
+      - { <<: *archived, src: deploy/firewall/firewalld-isshoni.xml }
 
 nfpms:
   - id: packages
     ids: [isshoni]
     package_name: isshoni
-    file_name_template: "{{ .ConventionalFileName }}"
+    file_name_template: '{{ replace .ConventionalFileName "~" "-" }}'   # §3: GitHub renames a "~"
     formats: [deb, rpm]
     homepage: https://moonwx.github.io/isshoni/
     maintainer: "<owner's GitHub noreply address>"
@@ -1557,6 +1642,7 @@ nfpms:
     license: Apache-2.0
     section: net
     bindir: /usr/bin
+    mtime: "{{ .CommitDate }}"
     contents: # as in section 5
       - { src: deploy/systemd/isshoni.service, dst: /usr/lib/systemd/system/isshoni.service }
       - { src: deploy/sysctl/60-isshoni.conf, dst: /usr/lib/sysctl.d/60-isshoni.conf }
@@ -1571,6 +1657,10 @@ nfpms:
       postinstall: deploy/packaging/postinstall.sh
       preremove: deploy/packaging/preremove.sh
       postremove: deploy/packaging/postremove.sh
+    deb: { predepends: [passwd] }          # preinstall.sh's groupadd and useradd (§5)
+    rpm: { buildhost: isshoni }            # not the build machine's host name
+    overrides:
+      rpm: { dependencies: [shadow-utils] }
 
 checksum:
   name_template: checksums.txt
@@ -1614,6 +1704,7 @@ release:
   draft: true
   replace_existing_draft: true
   prerelease: auto
+  make_latest: false                # the publish job alone decides GitHub's "latest" (9.3)
   extra_files:
     - glob: dist-extra/install.sh
     - glob: deploy/compose.yaml
@@ -1622,6 +1713,7 @@ release:
     ## isshoni {{ .Version }}
     **Upgrade:** run the installer again, or `docker compose pull && docker compose up -d`.
     **Database migration:** TODO yes/no   **Protocol:** v1 (TODO bump?)   **Security fixes:** TODO
+    **macOS and Windows archives** are experimental, untested server builds for LAN/dev use, with no installer; Linux (install.sh, deb, rpm, Docker) is the supported path.
     <!-- TODO: keep the next line only for a security release; 04's release check reads it -->
     <!-- isshoni:security -->
     Verify downloads: https://moonwx.github.io/isshoni/security#verify
@@ -1638,11 +1730,23 @@ changelog:
 - **Snapshots go through `task release:snapshot`** (7.2), which builds the SPA with `ISSHONI_SNAPSHOT_VERSION` first.
   A bare `goreleaser release --snapshot` without it takes the `incpatch` fallback, and the before hook then stops at
   the `version.json` check, because no SPA was built for that version.
-- **Verify in slice S9** (these could not be checked from docs alone):
-  - that `dockers_v2.extra_files` keeps repo-relative paths in the build context. The Dockerfile relies on
-    `deploy/docker/rootfs/`; if paths are flattened, change the `COPY` source;
-  - the exact `snapshot` behavior of `dockers_v2`. Images are built only in the publish phase, so PR CI builds the
-    image with plain `docker buildx build` and the same Dockerfile (11.3).
+- **What slice S9 had to verify, as README S73 found it** (goreleaser 2.18):
+  - **`dockers_v2.extra_files` keep their repository paths** in the build context, next to the binary at
+    `linux/<arch>/isshoni`: the Dockerfile's `COPY deploy/docker/rootfs/…` and `$TARGETPLATFORM/isshoni` work as
+    written, the way `deploy/docker/test/docker-build.sh` lays the context out for CI.
+  - **`dockers_v2` builds images in a snapshot too**, unlike the design's assumption that images come only with
+    publishing: one image per platform, tagged `<v>-amd64` and `<v>-arm64`, loaded into the local Docker and never
+    pushed. `task release:snapshot` therefore checks that this machine's image starts and reports the version, and
+    removes both images when it ends (7.2); `-- --skip=docker` leaves them out. PR CI's Docker smoke test still
+    builds with `docker buildx build` and the same Dockerfile (11.3). At a release goreleaser builds and pushes the
+    one multi-arch `:<v>`.
+- **The release notes' header says that the macOS and Windows archives are experimental**, untested server builds
+  for LAN/dev use with no installer, as §3 requires of every release: the line is fixed in the header, not a TODO
+  that the owner has to remember.
+- **`make_latest: false`**: goreleaser never marks a release "latest"; the `publish` job does it, for a final
+  release only (9.3).
+- **Nothing of the build machine is in the output**: archives and packages are dated by the commit and owned by
+  root, and the rpm's build host is fixed (§5).
 - **Images are signed in the workflow** (`cosign sign --yes ghcr.io/moonwx/isshoni@<digest>`), not with goreleaser's
   `docker_signs`. It is simpler and doesn't depend on how dockers_v2 names its artifacts.
 - The release workflow checks that no `TODO` is left in the release notes before publishing (9.3 `publish`).
@@ -1650,18 +1754,32 @@ changelog:
   §6.1). `dockers_v2` builds with BuildKit, which pulls the frontend that the Dockerfile's `# syntax=` line names
   before anything else. With `docker/dockerfile:1` that is whatever the tag points at on the day of the release, and
   a release image would then depend on a Docker Hub tag that no digest fixes, unlike its base image. The line
-  carries the frontend's digest (`docker/dockerfile:1@sha256:…`), so the release build, CI's
-  `docker-build.sh` and `task docker:smoke` all use the frontend that was chosen.
+  carries the frontend's exact version and digest (`docker/dockerfile:1.27.1@sha256:…`), so the release build, CI's
+  `docker-build.sh` and `task docker:smoke` all use the frontend that was chosen. Dependabot does not update it: it
+  is bumped by hand with the tool pins (§6.1, §7.1).
 
 ### 9.3 `release.yml`
 
 ```
-tag v* ──► web ──► build ──► sign (Environment "release": owner approves) ──► verify ──► publish ──► site
-                             draft release exists; nothing public except the exact image tag
+tag v* ──► version ──► web ──► build ──► sign ──► verify ──► publish ──► site
+                                         │ Environment "release": runs only after the owner approves
+                               a draft release exists; nothing is public but the exact image tag :<v>
+dry run:   version ──► web ──► build ──► sign-dry ──► verify
 ```
 
-The workflow computes the version once: the tag without `v`, or `0.0.0-dryrun.<run>` in a dry run. `web` and
+As README S73 built it; the workflow's header comment says the same in short. Every job has a timeout, the token is
+read-only unless a job raises its own permissions, third-party actions are pinned by commit SHA, checkout never
+persists credentials, and **nothing in the workflow uses a cache**: a release builds from the module proxy and npm
+alone. Registry logins are a plain `docker login` with the job's token, not a third-party action. One run per tag
+(`concurrency`), never cancelled half-way by another run.
+
+**`version`** computes the version once: the tag without `v`, or `0.0.0-dryrun.<run>` in a dry run. `web` and
 `build` both use it.
+- **A release starts from a pushed tag.** A manual run with `dry_run` off fails; a run for anything but a tag fails.
+- **The tag must be `vX.Y.Z` or `vX.Y.Z-rc.N`** (9.1); anything else fails before a job builds.
+- Its outputs: `version`, `tag`, `dry-run`, `prerelease` (an `-rc.N` tag, and every dry run), the floating image tags
+  that `publish` moves (`0.<minor> latest` in 0.x, `<major>.<minor> <major> latest` from 1.0, none for a
+  prerelease), and Task's pin from `.tool-versions`.
 
 **`web`** (unprivileged; the only job that runs npm)
 - Permissions: `contents: read` only, no secrets, checkout with `persist-credentials: false`.
@@ -1675,68 +1793,118 @@ The workflow computes the version once: the tag without `v`, or `0.0.0-dryrun.<r
 - Timeout 10 min.
 
 **`build`**
-- `needs: web`. Permissions: `contents: write`, `packages: write`, `id-token: write`, `attestations: write`.
+- `needs: [version, web]`. Permissions: `contents: write`, `packages: write`, `id-token: write`, `attestations: write`.
 - **No Node on this runner**: no setup-node, no npm, no npm cache. Only goreleaser and pinned Go tools run.
-- Steps:
+- Steps, in this order. Every check of the repository's inputs (steps 2, 5 and 6) comes before goreleaser, so a
+  failed one leaves no draft and no image. The asset check of step 8 reads goreleaser's output, so it comes after
+  it, as do the attestations and the image's signature: a failure there leaves the draft and the image `:<v>`, which
+  a re-run for the same tag replaces (the draft by `replace_existing_draft`, 9.2; the image by the same tag pushed
+  again):
   1. checkout with `fetch-depth: 0`;
-  2. download the `web-dist` artifact into `web/dist/`;
-  3. setup-go (from `go.mod`), Task, syft, cosign v3, buildx, ghcr login with `GITHUB_TOKEN`;
-  4. **compat snapshot check** (non-prerelease tags only; skipped for `-rc.N` and in a dry run): fails with "run task
-     release:compat VERSION=<v> in a release-prep PR (9.1)" unless `internal/protocol/testdata/compat/<v>/` exists
-     and `diff -r internal/protocol/testdata/v1 internal/protocol/testdata/compat/<v>` finds no difference (01
-     §14.3). It runs before goreleaser, so a missing or stale snapshot creates no draft and pushes no image;
-  5. `goreleaser release --clean`, which creates the **draft** release and pushes `ghcr.io/moonwx/isshoni:<v>`. Its
-     before hook (`task release:prepare`, 7.2) runs no npm: it fails unless `web/dist/version.json` is `<v>`, then
-     writes `THIRD_PARTY_NOTICES` (Go only, 8.4) and stamps `install.sh`;
-  6. `actions/attest-build-provenance` for `dist/*.tar.gz dist/*.zip dist/*.deb dist/*.rpm dist/checksums.txt
-     dist-extra/install.sh`;
-  7. image digest via `docker buildx imagetools inspect ghcr.io/moonwx/isshoni:<v> --format '{{json .Manifest}}'`,
-     then `cosign sign --yes ghcr.io/moonwx/isshoni@<digest>` and `attest-build-provenance` with that
-     `subject-digest` and `push-to-registry: true`.
+  2. **compat snapshot check** (final releases only; skipped for `-rc.N` and in a dry run), right after checkout,
+     before the download, the tool setup and goreleaser: fails with "run task release:compat VERSION=<v> in a
+     release-prep PR (9.1)" unless `internal/protocol/testdata/compat/<v>/` exists, holds no symbolic link (a link
+     to the fixtures would always match them and freeze nothing), and `diff -r internal/protocol/testdata/v1
+     internal/protocol/testdata/compat/<v>` finds no difference (01 §14.3); a missing, a linked and a different
+     snapshot each have their own error. S73 built it; README S75 owns `release:compat` and moved this check to the
+     front, where it fails fastest;
+  3. download the `web-dist` artifact into `web/dist/`;
+  4. setup-go (from `go.mod`), Task (the pin), cosign v3, syft, buildx; `task release:goreleaser` (7.1); rpm, for
+     `release:assets`;
+  5. **the installer carries the release keys** (not in a dry run): fails while `deploy/keys/allowed_signers` is
+     missing or empty, else runs `task lint:keys`. A released install.sh with an empty key block would refuse to
+     install anything (9.4, `deploy/keys/README.md`);
+  6. **the repository has the root `README.md`** that every archive carries (§3), in a dry run too;
+  7. `docker login ghcr.io`, then `goreleaser release --clean`, which creates the **draft** release and pushes
+     `ghcr.io/moonwx/isshoni:<v>`. Its before hook (`task release:prepare`, 7.2) runs no npm: it fails unless
+     `web/dist/version.json` is `<v>`, then writes `THIRD_PARTY_NOTICES` (Go only, 8.4) and stamps `install.sh`. A
+     dry run runs `goreleaser release --snapshot --clean --skip=publish` with `ISSHONI_SNAPSHOT_VERSION` instead;
+  8. `task release:assets VERSION=<v> FULL=true` (7.2): the asset list of §3, with the SBOMs, the cosign bundle and
+     `README.md` in every archive;
+  9. `actions/attest-build-provenance` for `dist/*.tar.gz dist/*.zip dist/*.deb dist/*.rpm dist/checksums.txt
+     dist-extra/install.sh` (a dry run attests its files too);
+  10. not in a dry run: the image digest via `docker buildx imagetools inspect ghcr.io/moonwx/isshoni:<v> --format
+     '{{json .Manifest}}'`, then `cosign sign --yes ghcr.io/moonwx/isshoni@<digest>` and `attest-build-provenance`
+     with that `subject-digest` and `push-to-registry: true`. A dry run instead uploads its release files (the
+     archives, packages, SBOMs, `checksums.txt` and its cosign bundle, `install.sh` and the compose files) as the
+     artifact `release-assets`, kept 3 days, for `sign-dry` and `verify`.
 - Timeout 45 min.
 
 **`sign`**
-- `environment: release`; permissions `contents: write`. Runs only after the owner approves.
+- Not in a dry run; `needs: [version, build]`; `environment: release`; permissions `contents: write`. Runs only after
+  the owner approves.
 - Steps, with no third-party actions except checkout (sparse: `deploy/keys`):
   1. `gh release download "$TAG" --dir rel` (the draft is visible to `GITHUB_TOKEN`);
-  2. `(cd rel && sha256sum -c checksums.txt)`, so every asset matches what is about to be signed;
-  3. `umask 077; printf '%s\n' "$RELEASE_SSH_SIGNING_KEY" > "$RUNNER_TEMP/k"`;
-  4. `ssh-keygen -Y sign -f "$RUNNER_TEMP/k" -n isshoni-checksums rel/checksums.txt`, then `rm -f "$RUNNER_TEMP/k"`;
+  2. `(cd rel && sha256sum -c checksums.txt)`, so every asset matches what is about to be signed, and **nothing is in
+     the draft that the signature would not cover**: the job fails on an asset that `checksums.txt` does not list
+     (`checksums.txt` itself, its `.sig` and its `.sigstore.json` excepted; a `.sig` is there when the job runs
+     again after it uploaded one);
+  3. fails when the environment has no secret `RELEASE_SSH_SIGNING_KEY`; removes an earlier `checksums.txt.sig`
+     first (without a terminal, `ssh-keygen -Y sign` keeps an existing signature file and still exits 0); writes
+     the key under `umask 077` into `$RUNNER_TEMP` and deletes it when the step ends;
+  4. `ssh-keygen -Y sign -f "$RUNNER_TEMP/k" -n isshoni-checksums rel/checksums.txt`, and prints the key's
+     fingerprint, which the owner compares with the one in `README.md` (`deploy/keys/README.md` step 5);
   5. `ssh-keygen -Y verify -f deploy/keys/allowed_signers -I isshoni-release -n isshoni-checksums -s
      rel/checksums.txt.sig < rel/checksums.txt`, which catches a wrong key in the secret;
-  6. `gh release upload "$TAG" rel/checksums.txt.sig`.
+  6. `gh release upload "$TAG" rel/checksums.txt.sig --clobber`, so a re-run of the job replaces its signature.
 - Timeout 10 min.
 
 **`verify`**
-- Matrix: `debian-12`, `ubuntu-24.04`.
-- Downloads the draft's assets into `mirror/v<v>/` and serves them with `tools/relserve` (HTTPS, test CA).
-- In a systemd container, runs the **released, stamped `install.sh` with the production key** and
-  `ISSHONI_DOWNLOAD_BASE`, `ISSHONI_PUBLIC_URL=http://127.0.0.1:8080` and `--tls-mode off --yes` (as C1 does), then
-  asserts `/api/v1/info` reports `server.version` = `<v>`.
-- Also:
-  - `cosign verify-blob` on the checksums bundle (identity from 4.3);
-  - `cosign verify ghcr.io/moonwx/isshoni:<v>` with the same identity and issuer;
-  - `gh attestation verify` on one archive (`GH_TOKEN` is available in CI).
+- `needs: [version, build, sign, sign-dry]` with `if: !cancelled() && needs.build.result == 'success' &&
+  (needs.sign.result == 'success' || needs.sign-dry.result == 'success')`: one of the two sign jobs is always
+  skipped, and a plain condition would skip this job too (`publish`, below). Permissions `contents: write` (to read
+  the draft), `packages: read` (the image is private until the owner makes the package public, 8.6),
+  `attestations: read`.
+- Matrix: `debian-12`, `ubuntu-24.04`, `fail-fast: false`.
+- Downloads the draft's assets into `mirror/download/<tag>/` (a dry run: the `release-assets` artifact, and
+  sign-dry's signature, whose key goes into that installer's key block in place of the production keys) and serves
+  them with `tools/relserve` (HTTPS with a test CA, on every address, so the container reaches it as
+  `host.docker.internal`).
+- Checks that the installer is stamped with `<v>`; `cosign verify-blob` on the checksums bundle with the identity
+  of 4.3 (`https://github.com/<repo>/.github/workflows/release.yml@<ref>`, the Actions OIDC issuer); `cosign verify
+  ghcr.io/moonwx/isshoni:<v>` with the same identity and issuer (not in a dry run); `gh attestation verify` on the
+  `linux_amd64` archive.
+- In a systemd container (`deploy/test/distro/Containerfile`, as C1 of 11.2), fetches the **released, stamped
+  `install.sh` with the production key** with `curl` and runs it without a terminal: `--yes --tls-mode off` with
+  `ISSHONI_DOWNLOAD_BASE`, `ISSHONI_PUBLIC_URL=http://127.0.0.1:8080` and a documentation-range
+  `ISSHONI_PUBLIC_IP`, so the runner's own address stays out of the log. Then the service is active, and both
+  `isshoni version --short` and `/api/v1/info`'s `server.version` are `<v>`; on a failure the job prints the
+  service's journal and relserve's log.
 - Timeout 20 min.
 
 **`publish`**
+- `needs: [version, verify]`, with **`if: ${{ !cancelled() && needs.verify.result == 'success' &&
+  needs.version.outputs.dry-run == 'false' }}`**. The explicit result check is needed: a job-level `if` without a
+  status function means `success() && …`, and `success()` looks at every job upstream, not only at `needs`. On a tag
+  `sign-dry` is skipped, so a plain condition would skip `publish` after a green `verify`, and the run would end
+  green with the release still a draft and the floating tags not moved (actions/runner#491; the dry run can't show
+  it, because it skips `publish` by design).
 - Permissions: `contents: write`, `packages: write`.
-- Fails if the draft body still contains `TODO`.
-- `gh release edit "$TAG" --draft=false`, plus `--latest` unless it is a prerelease.
-- Unless it is a prerelease:
-  `docker buildx imagetools create -t ghcr.io/moonwx/isshoni:0.<minor> -t ghcr.io/moonwx/isshoni:latest
-  ghcr.io/moonwx/isshoni:<v>`. Copying the index keeps the digest, so the cosign signature stays valid.
+- Fails if the draft body still contains `TODO` ("edit them on GitHub, then re-run this job").
+- A final release: `gh release edit "$TAG" --draft=false --latest`. A prerelease: `--draft=false --prerelease
+  --latest=false`, so GitHub's "latest" stays where it is (goreleaser sets none, `make_latest: false`, 9.2).
+- Unless it is a prerelease: `docker buildx imagetools create -t ghcr.io/moonwx/isshoni:<tag> …
+  ghcr.io/moonwx/isshoni:<v>` for each floating tag of the `version` job (`0.<minor>` and `latest` in 0.x).
+  Copying the index keeps the digest, so the cosign signature stays valid.
+- Timeout 10 min.
 
-**`site`**
-- `uses: ./.github/workflows/site.yml`.
+**`site`** (README S82; not there yet)
+- `uses: ./.github/workflows/site.yml`, after `publish`.
 - A `release` event created with `GITHUB_TOKEN` doesn't trigger other workflows, so the site deploy is called directly.
+- **It needs `if: ${{ !cancelled() && needs.publish.result == 'success' }}`**, not a plain condition, for the reason
+  given at `publish`: `sign-dry`, skipped on a tag, is upstream of it too. The workflow's header comment says so.
 
-**Dry run** (`workflow_dispatch`, input `dry_run: true`):
+**Dry run** (`workflow_dispatch`, input `dry_run: true`, the default of a manual run):
 - `web` builds the SPA as `0.0.0-dryrun.<run>`; `build` runs `goreleaser release --snapshot --clean --skip=publish`
-  with `ISSHONI_SNAPSHOT_VERSION=0.0.0-dryrun.<run>`.
-- A `sign-dry` job (**no environment**) signs with an ephemeral key made in the job and verifies with it.
-- `verify` runs against those files with a test-stamped `install.sh`.
-- This proves the pipeline before the first real tag.
+  with `ISSHONI_SNAPSHOT_VERSION=0.0.0-dryrun.<run>`, checks the assets with `FULL=true`, attests them, and uploads
+  them as an artifact. It skips the release-key check, the compat check, the registry login and everything about
+  the image.
+- goreleaser's snapshot still **signs `checksums.txt` with cosign keyless** (it doesn't skip signs), so every dry run
+  leaves public entries in Sigstore's Rekor transparency log, as its attestations do.
+- A `sign-dry` job (**no environment**, no permissions) makes the same checks and signs with an ephemeral key made
+  in the job, verifies with it, and uploads the signature and its `allowed_signers`.
+- `verify` runs against those files with an `install.sh` that carries that key.
+- Nothing needs approval, and nothing is published. This proves the pipeline before the first real tag.
 
 ### 9.4 Signing keys
 
@@ -1756,7 +1924,10 @@ ssh-keygen -t ed25519 -C isshoni-release-backup-1 -f isshoni-release-backup-1
 ```
 - Then the two public keys go into `deploy/keys/allowed_signers` by PR (the format is in 4.3).
 - The private `isshoni-release-1` goes into the environment secret, and the local copy is deleted.
-- The fingerprints (`ssh-keygen -lf`) are published in `README.md` and on `/security`.
+- The fingerprints (`ssh-keygen -lf`, or what `task release:keys` prints, 7.2) are published in the "Release
+  signing keys" section of the root `README.md` (README F05 writes the section, without a fingerprint until the
+  keys exist) and on `/security`. `deploy/keys/README.md` is the owner's checklist for these steps, before the
+  first release candidate.
 
 **Rotation (or a leak):**
 1. Add the new key line to `allowed_signers`, and mark the old one `valid-before="YYYYMMDD"` (OpenSSH ≥ 8.8;
@@ -1781,7 +1952,9 @@ After a leak, the backup key signs until a new key exists, and a security adviso
   - no desktop apps yet (M2 Windows, M3 macOS, M4 Linux);
   - a whole-screen share from the browser includes voice apps (the SPA warns);
   - iOS: foreground only, tap to unmute;
-  - a fresh Firefox may need about a minute to fetch OpenH264 before the first join (S4);
+  - a fresh Firefox may need about a minute to fetch OpenH264 before the first join (S4); one whose first join
+    already listed H.264 and whose download takes longer than the server's 3 minutes of retries needs a reload
+    (README §6 "Decided after group 9" (4); 02 §8.5);
   - DRM video shows black.
 - **Not in M1:** update-manifest signing, installers, SignPath (apply after the first Windows release, M2), Homebrew
   tap (M3), signed apt/rpm repositories (Later).
@@ -2430,5 +2603,22 @@ Decided after group 7 (an engineering call the owner delegated; README §6):
 Decided after group 8 (an engineering call the owner delegated; README §6):
 
 - **The Dockerfile's `# syntax=` line is pinned by digest, like its `FROM` line**, so no build, release builds
-  included, pulls a floating Dockerfile frontend from Docker Hub (6.1, 9.2). README S73 implements it; as README S68
-  merged the Dockerfile, the line is `# syntax=docker/dockerfile:1`.
+  included, pulls a floating Dockerfile frontend from Docker Hub (6.1, 9.2). README S73 implemented it: the line is
+  `# syntax=docker/dockerfile:1.27.1@sha256:…`, and the comment below it says how it is kept current (group 9's
+  decision 3, below).
+
+Decided after group 9 (engineering calls the owner delegated; README §6):
+
+- **Release package file names use `-` where the package's version has `~`** (3, 9.2). GitHub renames a release
+  asset with a `~` in its name (to `.`), and the draft would then no longer match `checksums.txt`, so the first rc
+  would stop in the `sign` job after the owner's approval. The package's own version keeps the `~`
+  (`0.1.0~rc.1`), so dpkg and rpm order a prerelease before its release.
+- **The deb and rpm packages never reload firewalld on install**; only install.sh's firewall offer does (4.9, 5). A
+  reload drops the admin's runtime-only rules, and the packages ask nobody: their `postinstall.sh` prints the reload
+  before `--add-service` for the admin, and `preremove.sh` reloads only after it took the service out.
+- **The Dockerfile's `# syntax=` digest and the goreleaser pin are bumped by hand** with the monthly bump of the
+  tool pins (6.1, 7.1). Dependabot reads neither: its `docker` ecosystem reads only `FROM` lines, and goreleaser is
+  built from `tools/goreleaser/go.mod`, which stays out of its `gomod` directories and follows `.tool-versions`.
+- **A known M1 limit for the release notes**: after `decoder_failed`, a viewer's codec retries start again only on
+  a caps change or a reload, so a Firefox whose OpenH264 download outlasts the 3 minutes of retries needs a reload
+  (9.5; 02 §8.5).
