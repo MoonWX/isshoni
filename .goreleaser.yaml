@@ -64,11 +64,9 @@ archives:
       - { <<: *archived, src: NOTICE }
       # Written by the before hook (`task notices`); gitignored, never committed (06 §8.4).
       - { <<: *archived, src: THIRD_PARTY_NOTICES }
-      # A pattern, not the plain name, only while the repository has no README.md: goreleaser fails on a plain name
-      # that matches nothing, and the snapshots of CI's goreleaser-check job must build until then. A release does
-      # not: `task release:assets FULL=true` (release.yml's build job) requires README.md in every archive. When
-      # README.md lands, this line becomes `src: README.md`, so that goreleaser itself fails without it.
-      - { <<: *archived, src: "README.m[d]" }
+      # The plain name, not a pattern: goreleaser fails on a plain name that matches nothing, so a snapshot or a
+      # release without README.md stops here (06 §3). `task release:assets` checks that every archive has it.
+      - { <<: *archived, src: README.md }
       - { <<: *archived, src: deploy/systemd/isshoni.service }
       - { <<: *archived, src: deploy/sysctl/60-isshoni.conf }
       - { <<: *archived, src: deploy/firewall/ufw-isshoni }

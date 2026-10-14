@@ -29,9 +29,9 @@ lives in exactly two places: the `release` environment's secret, and the owner's
 Done once, in this order, before `v0.1.0-rc.1`. Nobody but the owner does these steps, and no agent creates keys or
 changes GitHub settings.
 
-The repository needs a `README.md` at its root first, with a "Release signing keys" section for the fingerprints of
-step 2: every release archive carries it (06 §3), and release.yml (its dry run too) refuses to build without it.
-Until it lands, only the snapshots of CI's `goreleaser-check` job and of `task release:snapshot` build without it.
+The root `README.md` has a "Release signing keys" section, whose table says "not created yet" for both keys until
+step 2 puts their fingerprints there. Every release archive carries `README.md` (06 §3), and goreleaser and
+release.yml (its dry run too) refuse to build without it.
 
 1. **Generate the two keys** on the Mac, outside the repository (06 §9.4):
    ```sh
