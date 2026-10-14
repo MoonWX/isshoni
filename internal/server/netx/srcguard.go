@@ -208,22 +208,70 @@ func (g *sourceGuard) known() int {
 	return len(g.ufrags)
 }
 
+// The sizes of the STUN wire format that stunUfrag reads (RFC 8489 §5 and §14).
+const (
+	stunHeaderSize     = 20 // type, length, magic cookie, transaction ID
+	stunAttrHeaderSize = 4  // type, length
+)
+
 // stunUfrag returns the local ufrag that a STUN message is for: the part of its USERNAME before the first colon,
 // exactly as Pion's muxes route it ("<receiver ufrag>:<sender ufrag>"). ok is false when the message doesn't decode
 // or has no USERNAME; Pion then routes it by its source address only, or drops it. The ufrag aliases b.
+//
+// Pion's muxes find the USERNAME with stun.Message.Decode, which keeps a RawAttribute for every attribute in a slice
+// that grows with the message: up to 43 bytes allocated per input byte for a message of empty attributes, about
+// 190 KB for one 8 KiB packet. The guard reads every STUN packet of every UDP socket and the first frame of every
+// ICE-TCP connection, so stunUfrag walks the attribute list in place instead and allocates nothing. It takes and
+// refuses exactly what Decode followed by Message.Get does (pion/stun v4.0.1, which pion/ice's muxes use). The tests
+// hold the two together (FuzzStunUfragDecode, and TestStunUfragWalk for the rules below), so they fail when an
+// update of pion/stun changes these rules:
+//   - a message is a 20-byte header with the magic cookie and then at least the header's length in bytes; bytes
+//     after that length are not the message's;
+//   - every attribute's header and its value, padded to a multiple of 4, lie inside that length, the last one too;
+//     otherwise the message doesn't decode, even when a good USERNAME comes before the broken attribute;
+//   - the USERNAME is the first one Decode keeps. Decode drops the attributes after MESSAGE-INTEGRITY, or after
+//     MESSAGE-INTEGRITY-SHA256, except those two and FINGERPRINT; so a USERNAME after either one is dropped, and one
+//     after FINGERPRINT alone is kept.
 func stunUfrag(b []byte) (ufrag []byte, ok bool) {
-	m := stun.Message{Raw: b}
-	if err := m.Decode(); err != nil {
+	if !stun.IsMessage(b) { // the header and the magic cookie
 		return nil, false
 	}
-	u, err := m.Get(stun.AttrUsername)
-	if err != nil {
+	size := int(binary.BigEndian.Uint16(b[2:4]))
+	if len(b) < stunHeaderSize+size {
 		return nil, false
 	}
-	if i := bytes.IndexByte(u, ':'); i >= 0 {
-		u = u[:i]
+	var username []byte
+	found, integrity := false, false
+	for attrs := b[stunHeaderSize : stunHeaderSize+size]; len(attrs) > 0; {
+		if len(attrs) < stunAttrHeaderSize {
+			return nil, false
+		}
+		typ := stun.AttrType(binary.BigEndian.Uint16(attrs[0:2]))
+		n := int(binary.BigEndian.Uint16(attrs[2:4]))
+		padded := (n + 3) &^ 3
+		attrs = attrs[stunAttrHeaderSize:]
+		if len(attrs) < padded {
+			return nil, false
+		}
+		switch typ {
+		case stun.AttrUsername:
+			if !found && !integrity {
+				username, found = attrs[:n], true
+			}
+		case stun.AttrMessageIntegrity, stun.AttrMessageIntegritySHA256:
+			// Decode drops one of these only when it has kept one before, so from the first on it drops every
+			// USERNAME.
+			integrity = true
+		}
+		attrs = attrs[padded:]
 	}
-	return u, true
+	if !found {
+		return nil, false
+	}
+	if i := bytes.IndexByte(username, ':'); i >= 0 {
+		username = username[:i]
+	}
+	return username, true
 }
 
 // canonicalSource is the form of a source address that Pion keys its remote candidates by: IPv4-mapped addresses as
