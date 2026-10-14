@@ -6,7 +6,8 @@
 #
 # It installs the isshoni server on a Linux machine with systemd, asks one question (the domain name), starts the
 # service and prints the link that creates the admin account. Run it again to upgrade, to repair an installation,
-# or to finish one that stopped half way. `--help` lists the options and the exit codes.
+# or to finish one that stopped half way; `--uninstall` and `--purge` remove it again. `--help` lists the options
+# and the exit codes.
 #
 # The script is thin on purpose. The program, the systemd unit, the sysctl file and the firewall profiles all come
 # from the release archive, and nothing from it is used before the archive passed verification: the release's
@@ -40,9 +41,12 @@ UNIT=$UNIT_DIR/isshoni.service
 CONFIG_DIR=/etc/isshoni
 CONFIG=$CONFIG_DIR/isshoni.toml
 DATA_DIR=/var/lib/isshoni
+RUN_DIR=/run/isshoni
+DROPIN_DIR=/etc/systemd/system/isshoni.service.d # the admin's `systemctl edit isshoni`
 SYSCTL_FILE=/etc/sysctl.d/60-isshoni.conf
 UFW_PROFILE=/etc/ufw/applications.d/isshoni
-FIREWALLD_SERVICE=/etc/firewalld/services/isshoni.xml
+FIREWALLD_DIR=/etc/firewalld # zones/ and policies/ there hold what was changed on this machine
+FIREWALLD_SERVICE=$FIREWALLD_DIR/services/isshoni.xml
 PACKAGE_BIN=/usr/bin/isshoni    # where the deb and rpm packages put the program
 SYSTEMD_DIR=/run/systemd/system # there when systemd is the init system
 BUFFER_BYTES=8388608            # both values of deploy/sysctl/60-isshoni.conf
@@ -68,8 +72,13 @@ CONFIG_PENDING=0 # 1 while a config this run wrote has not passed the pre-check:
 ANSWER=''        # the answer to the last question
 STEP='starting'  # what the installer is doing, for the message when a command fails unexpectedly
 PLANNED_EXIT=0   # 1 when the script ends with one of its own exit codes, not at a command that failed
+REMOVED=0        # what an uninstall removed, counted
+FW_ONLINE=''     # an uninstall's way to firewalld: 1 the daemon, 0 its files (firewall-offline-cmd)
+FW_REMOVED=''    # the zones and policies an uninstall took the isshoni service out of
+FW_FAILED=''     # the ones firewalld refused to change, and the files of firewalld that still name the service
 OPT_ACTION=install
 OPT_YES=0
+OPT_NO_FIREWALL=0
 CFG_TLS_MODE=''
 # Colors, for stdout (C_) and stderr (E_): empty unless setup_colors turns them on.
 C_BOLD=''
@@ -1322,13 +1331,13 @@ offer_firewall() {
     1) say 'Firewall: ufw not changed. To open the ports later: sudo ufw allow isshoni' ;;
     *) die 8 'Cancelled.' 'Nothing was started. Run this installer again to go on.' ;;
     esac
-  elif systemctl is-active --quiet firewalld 2>/dev/null &&
-    [ "$(as_root firewall-cmd --state 2>/dev/null)" = running ]; then
-    # systemd is asked first: without a daemon to talk to, firewall-cmd waits for seconds.
+  elif firewalld_running; then
     confirm "$of_ask in firewalld?" y || of_rc=$?
     case $of_rc in
     0)
-      # A running firewalld learns of the new service file only through a reload.
+      # A running firewalld reads its service files when it starts and when it reloads, so it does not know the
+      # isshoni.xml that install_fw_profiles put in place moments ago, and refuses --add-service=isshoni until a
+      # reload. The second reload applies the permanent change to the running firewall.
       if as_root firewall-cmd --reload >/dev/null &&
         as_root firewall-cmd --permanent --add-service=isshoni >/dev/null &&
         as_root firewall-cmd --reload >/dev/null; then
@@ -1360,6 +1369,14 @@ offer_firewall() {
   fi
   say 'If your provider has a cloud firewall (AWS, Google Cloud, Azure, Oracle, ...), open the same ports there:' \
     "  $SITE_URL/install/vps"
+}
+
+# firewalld_running reports whether firewalld runs. systemd is asked first: without a daemon to talk to,
+# firewalld 2.4's firewall-cmd waits 10 seconds before it answers, on every machine where firewalld is installed
+# and not running (Fedora's). The packaging scripts ask in the same order.
+firewalld_running() {
+  systemctl is-active --quiet firewalld.service 2>/dev/null &&
+    [ "$(as_root firewall-cmd --state 2>/dev/null)" = running ]
 }
 
 # iptables_blocks CMD reports whether the INPUT chain of iptables or ip6tables rejects or drops traffic: by a
@@ -1556,18 +1573,321 @@ print_setup() {
 }
 
 # ---------------------------------------------------------------------------------------------------------------
-# Actions
+# Uninstall and purge (06 §4.11)
 
-# do_uninstall and do_purge are --uninstall and --purge (06 §4.11). They are not written yet.
+# exists PATH reports whether something is at PATH, a dangling link included. Root looks, as in make_dir.
+exists() {
+  as_root test -e "$1" || as_root test -L "$1"
+}
+
+# remove_path PATH WHAT deletes a file that the installer put there, and says so. One that is gone already is fine:
+# an uninstall finishes what an earlier one left.
+remove_path() {
+  exists "$1" || return 0
+  as_root rm -f "$1" || die 1 "Could not remove $1." 'Check the file system, then run this installer again.'
+  say "Removed $2 ($1)."
+  REMOVED=$((REMOVED + 1))
+}
+
+# stop_service stops and disables the service, then removes its unit (06 §4.11 steps 1 and 2). The admin's own
+# drop-ins (`systemctl edit isshoni`) stay.
+stop_service() {
+  step 'stopping isshoni'
+  if systemctl is-active --quiet isshoni 2>/dev/null; then
+    say 'Stopping isshoni'
+  fi
+  as_root systemctl disable --now isshoni.service >/dev/null 2>&1 || :
+  if systemctl is-active --quiet isshoni 2>/dev/null; then
+    die 1 'Could not stop isshoni, so nothing was removed.' \
+      'See "systemctl status isshoni", stop it, then run this installer again.'
+  fi
+  step 'removing the systemd unit'
+  remove_path "$UNIT" 'the systemd unit'
+  as_root systemctl daemon-reload >/dev/null 2>&1 || :
+  # A unit that had failed (it exited 78, say) would stay listed as "not-found failed", and the system "degraded",
+  # until the next boot.
+  as_root systemctl reset-failed isshoni.service >/dev/null 2>&1 || :
+}
+
+# remove_program removes the program and the sysctl file (06 §4.11 step 3). The larger UDP buffers stay in effect
+# until the next boot.
+remove_program() {
+  step 'removing the program'
+  remove_path "$BIN" 'the program'
+  remove_path "${BIN%/*}/.isshoni.new" 'an unfinished copy of the program'
+  step 'removing the UDP buffer settings'
+  remove_path "$SYSCTL_FILE" 'the UDP buffer settings, which stay in effect until the next boot'
+}
+
+# remove_ufw deletes the rule that the firewall offer added (`ufw allow isshoni`), then the profile. ufw needs the
+# profile to delete the rule, so a rule ufw does not delete keeps its profile. A rule of the admin's that names the
+# profile in another way keeps working without it.
+remove_ufw() {
+  exists "$UFW_PROFILE" || return 0
+  if have ufw; then
+    ru_rc=0
+    ru_out=$(as_root ufw delete allow isshoni 2>&1) || ru_rc=$?
+    if [ "$ru_rc" -ne 0 ]; then
+      warn "ufw did not delete the isshoni rule, so its profile $UFW_PROFILE stays:" "$ru_out" \
+        'Delete the rule yourself (sudo ufw delete allow isshoni), then the profile.'
+      return 0
+    fi
+    case $ru_out in
+    *'Rule deleted'*)
+      say 'Firewall: removed the isshoni rule from ufw.'
+      REMOVED=$((REMOVED + 1))
+      ;;
+    esac
+  fi
+  remove_path "$UFW_PROFILE" "ufw's isshoni profile"
+}
+
+# fw_perm runs a firewalld command on the permanent configuration: through the daemon when it runs (FW_ONLINE is
+# 1), on the files with firewall-offline-cmd otherwise.
+fw_perm() {
+  if [ "$FW_ONLINE" = 1 ]; then
+    as_root firewall-cmd --permanent "$@"
+  else
+    as_root firewall-offline-cmd "$@"
+  fi
+}
+
+# fw_scrub LABEL SELECT REMOVE takes the isshoni service, and the rich rules that name it, out of one zone or policy
+# of firewalld's permanent configuration. SELECT is the option that names the zone or policy (--zone=public),
+# REMOVE the option that removes a service there. LABEL ("zone public") goes into FW_REMOVED, or into FW_FAILED
+# when firewalld refuses a change. A removed rich rule is printed in full: it may hold addresses that are written
+# down nowhere else, and the admin may want to add it again.
+fw_scrub() {
+  fs_found=0
+  fs_ok=1
+  if fw_perm "$2" --query-service=isshoni >/dev/null 2>&1; then
+    fs_found=1
+    fw_perm "$2" "$3=isshoni" >/dev/null 2>&1 || fs_ok=0
+  fi
+  fs_rules=$(fw_perm "$2" --list-rich-rules 2>/dev/null | grep -F 'service name="isshoni"') || fs_rules=''
+  while IFS= read -r fs_rule; do
+    [ -n "$fs_rule" ] || continue
+    fs_found=1
+    if fw_perm "$2" --remove-rich-rule="$fs_rule" >/dev/null 2>&1; then
+      say "Firewall: removed this rule from firewalld's $1: $fs_rule"
+    else
+      fs_ok=0
+    fi
+  done <<EOF
+$fs_rules
+EOF
+  [ "$fs_found" = 1 ] || return 0
+  if [ "$fs_ok" = 1 ]; then
+    FW_REMOVED="${FW_REMOVED:+$FW_REMOVED, }$1"
+  else
+    FW_FAILED="${FW_FAILED:+$FW_FAILED, }$1"
+  fi
+}
+
+# remove_firewalld takes the isshoni service out of firewalld, then removes its file (06 §4.11). firewalld rejects
+# its whole permanent configuration when a zone or a policy names a service it can't find: the next reload fails,
+# and from its next start on it runs the stock configuration (state "failed"), without any of the admin's own
+# rules. `--remove-service=isshoni` alone edits the default zone only, and an admin may have put the service into
+# other zones or a policy, or written a rich rule that names it. So before isshoni.xml goes, the service leaves
+# every zone and policy that has it, with every rich rule that names it: through the daemon when it runs, and then
+# one reload, which closes the ports (it works because the daemon still knows the service), or on the files with
+# firewall-offline-cmd. Nothing else in the firewall is touched. The files that firewalld loads have the final
+# word: when one of them still names the service afterwards (a zone or a policy that firewalld refused to change,
+# a hand edit that the daemon has not read yet, a zone that it did not list), a warning names it and the file
+# stays, so that firewalld goes on loading its configuration until the admin has taken the service out there by
+# hand; the uninstall goes on.
+remove_firewalld() {
+  exists "$FIREWALLD_SERVICE" || return 0
+  FW_REMOVED=''
+  FW_FAILED=''
+  rf_why=''
+  # Only a zone or a policy that was changed on this machine can name the service, and firewalld keeps those in
+  # files of their names below /etc/firewalld. Looking at the files first saves a dozen slow firewalld commands.
+  if as_root grep -rqs isshoni "$FIREWALLD_DIR/zones" "$FIREWALLD_DIR/policies"; then
+    if firewalld_running; then
+      FW_ONLINE=1
+      rf_zone_rm=--remove-service
+      rf_policy_rm=--remove-service
+    elif have firewall-offline-cmd; then
+      FW_ONLINE=0
+      # This tool's --remove-service is another option, which takes neither --zone nor --policy.
+      rf_zone_rm=--remove-service-from-zone
+      rf_policy_rm=--remove-service-from-policy
+    else
+      FW_ONLINE=''
+      rf_why='firewalld is not running, and firewall-offline-cmd is not installed.'
+    fi
+    if [ -n "$FW_ONLINE" ]; then
+      for rf_zone in $(fw_perm --get-zones 2>/dev/null); do
+        as_root grep -rqs isshoni "$FIREWALLD_DIR/zones/$rf_zone.xml" "$FIREWALLD_DIR/zones/$rf_zone" || continue
+        fw_scrub "zone $rf_zone" "--zone=$rf_zone" "$rf_zone_rm"
+      done
+      for rf_policy in $(fw_perm --get-policies 2>/dev/null); do
+        as_root grep -qs isshoni "$FIREWALLD_DIR/policies/$rf_policy.xml" || continue
+        fw_scrub "policy $rf_policy" "--policy=$rf_policy" "$rf_policy_rm"
+      done
+    fi
+    if [ -n "$FW_REMOVED" ]; then
+      if [ "$FW_ONLINE" = 1 ] && ! as_root firewall-cmd --reload >/dev/null 2>&1; then
+        warn 'firewalld did not reload, so the ports stay open until it does.' 'Reload it: sudo firewall-cmd --reload'
+      fi
+      say "Firewall: removed the isshoni service from firewalld ($FW_REMOVED)."
+      REMOVED=$((REMOVED + 1))
+    fi
+  fi
+  # firewalld loads these files at its next reload or start, and it writes every change above to them at once
+  # (firewall-cmd --permanent and firewall-offline-cmd alike). So the service file stays while one of them still
+  # names the service, whatever firewalld said above. It loads the .xml files only (zones/ may also have a
+  # directory per zone), not the .xml.old copies that it keeps of the files it rewrote.
+  rf_left=$(as_root find "$FIREWALLD_DIR/zones" "$FIREWALLD_DIR/policies" -name '*.xml' \
+    -exec grep -lsE "name[[:space:]]*=[[:space:]]*[\"']isshoni[\"']" {} + 2>/dev/null) || :
+  while IFS= read -r rf_file; do
+    [ -n "$rf_file" ] || continue
+    FW_FAILED="${FW_FAILED:+$FW_FAILED, }$rf_file"
+  done <<EOF
+$rf_left
+EOF
+  if [ -n "$FW_FAILED" ]; then
+    warn "Could not take the isshoni service out of firewalld here: $FW_FAILED." ${rf_why:+"$rf_why"} \
+      "Remove it there by hand, then delete $FIREWALLD_SERVICE. The file stays until then: firewalld can't load" \
+      'its configuration while a zone or a policy names a service that it has no file for.'
+    return 0
+  fi
+  remove_path "$FIREWALLD_SERVICE" "firewalld's isshoni service"
+}
+
+# remove_iptables deletes the rules tagged "isshoni" from the INPUT chains of iptables and ip6tables (the firewall
+# offer added them), and saves the rules where netfilter-persistent keeps them.
+remove_iptables() {
+  ri_deleted=0
+  for ri_cmd in iptables ip6tables; do
+    have "$ri_cmd" || continue
+    ri_rules=$(as_root "$ri_cmd" -S INPUT 2>/dev/null) || continue
+    ri_ours=$(printf '%s\n' "$ri_rules" | grep -E -- '^-A INPUT .*--comment isshoni( |$)') || ri_ours=''
+    while IFS= read -r ri_rule; do
+      [ -n "$ri_rule" ] || continue
+      set -f
+      # shellcheck disable=SC2086 # the words of the rule as iptables -S printed it, with -A turned into -D
+      if as_root "$ri_cmd" -D ${ri_rule#-A } 2>/dev/null; then
+        ri_deleted=$((ri_deleted + 1))
+      else
+        warn "$ri_cmd did not delete the rule: $ri_rule" "Delete it yourself: sudo $ri_cmd -D ${ri_rule#-A }"
+      fi
+      set +f
+    done <<EOF
+$ri_ours
+EOF
+  done
+  [ "$ri_deleted" -gt 0 ] || return 0
+  REMOVED=$((REMOVED + 1))
+  if have netfilter-persistent; then
+    if as_root netfilter-persistent save >/dev/null 2>&1; then
+      say "Firewall: removed isshoni's iptables rules, and saved the rules."
+    else
+      warn "Removed isshoni's iptables rules, but netfilter-persistent did not save the rules." \
+        'Save them yourself: sudo netfilter-persistent save'
+    fi
+  else
+    say "Firewall: removed isshoni's iptables rules."
+  fi
+}
+
+# uninstall_steps removes isshoni and keeps its configuration, its data and its user: the service, the unit, the
+# program, the sysctl file and the firewall rules and profiles (06 §4.11 steps 1 to 4). REMOVED counts what it
+# removed. --no-firewall (never touch the firewall, 06 §4.1) holds here too: the firewall is left as it is, with
+# the profiles, which its rules may still name.
+uninstall_steps() {
+  REMOVED=0
+  stop_service
+  remove_program
+  if [ "$OPT_NO_FIREWALL" = 1 ]; then
+    say "Firewall: not touched (--no-firewall). isshoni's ufw rule and profile, its firewalld service and its" \
+      'iptables rules stay, where there are any. To remove them, run --uninstall again without --no-firewall' \
+      '(and without ISSHONI_NO_FIREWALL).'
+    return 0
+  fi
+  step 'removing the firewall rules'
+  remove_ufw
+  remove_firewalld
+  remove_iptables
+}
+
+# say_dropins mentions the admin's own drop-ins, which an uninstall leaves where they are.
+say_dropins() {
+  exists "$DROPIN_DIR" || return 0
+  say "Your own changes to the service (systemctl edit isshoni) are still in $DROPIN_DIR."
+}
+
+# do_uninstall is --uninstall: it removes isshoni and keeps its configuration, its data and its user, so that
+# running the installer again brings it back as it was (06 §4.11). It ends with exit 0 also when there was nothing
+# left to remove.
 do_uninstall() {
-  die 1 '--uninstall is not implemented in this version of the installer yet.' \
-    'To stop isshoni now: sudo systemctl disable --now isshoni'
+  uninstall_steps
+  if [ "$REMOVED" = 0 ]; then
+    say '' 'isshoni is not installed here: there was nothing to remove.'
+  else
+    say '' 'isshoni is uninstalled.'
+  fi
+  if exists "$CONFIG_DIR" || exists "$DATA_DIR" || getent passwd isshoni >/dev/null 2>&1; then
+    # It can offer no backup command for now: the service is stopped and the program gone, and an offline backup
+    # refuses to run as root.
+    say '' "Kept: $CONFIG_DIR (config), $DATA_DIR (database, certificates, backups) and the isshoni user." \
+      'Remove them with --purge. Before --purge, back up with "sudo isshoni admin backup --out <file>" while' \
+      'isshoni is installed and running (run this installer again to bring it back).'
+  fi
+  say_dropins
 }
 
-do_purge() {
-  die 1 '--purge is not implemented in this version of the installer yet.' \
-    'To stop isshoni now: sudo systemctl disable --now isshoni'
+# confirm_purge asks for "purge" to be typed, before anything is changed; --yes skips the question. It comes while
+# the server still runs, so the backup command it shows works. Any other answer is exit 8 with nothing changed.
+confirm_purge() {
+  [ "$OPT_YES" = 0 ] || return 0
+  have_tty || die 2 '--purge deletes the configuration, the data and the isshoni user, and there is no terminal to confirm on.' \
+    'Run it in a terminal, or pass --yes as well.'
+  printf '%s\n' '' \
+    "This removes isshoni and deletes its configuration ($CONFIG_DIR), its data ($DATA_DIR: the database, the" \
+    'certificates and the backups) and the isshoni user. It makes no backup. To keep one, press Enter now and' \
+    'back up first, while isshoni runs:' \
+    '  sudo isshoni admin backup --out <file>' '' >&2
+  if ! ask 'Type purge to delete everything:'; then
+    die 8 'Cancelled.' 'Nothing was changed.'
+  fi
+  [ "$ANSWER" = purge ] || die 8 'Cancelled.' 'Nothing was changed.'
 }
+
+# do_purge is --purge: --uninstall, then it deletes the configuration, the data and the isshoni user (06 §4.11). It
+# makes no backup.
+do_purge() {
+  confirm_purge
+  uninstall_steps
+  step 'deleting the configuration and the data'
+  for dp_dir in "$CONFIG_DIR" "$DATA_DIR" "$RUN_DIR"; do
+    exists "$dp_dir" || continue
+    as_root rm -rf "$dp_dir" || die 1 "Could not delete $dp_dir." 'Check the file system, then run this installer again.'
+    say "Deleted $dp_dir."
+  done
+  step 'deleting the isshoni user'
+  if getent passwd isshoni >/dev/null 2>&1; then
+    if quietly as_root userdel isshoni; then
+      say 'Deleted the isshoni user.'
+    else
+      warn 'Could not delete the isshoni user (see above).' 'Delete it yourself: sudo userdel isshoni'
+    fi
+  fi
+  # userdel deletes the group too where the system makes a group per user; elsewhere it stays.
+  if getent group isshoni >/dev/null 2>&1; then
+    if quietly as_root groupdel isshoni; then
+      say 'Deleted the isshoni group.'
+    else
+      warn 'Could not delete the isshoni group (see above).' 'Delete it yourself: sudo groupdel isshoni'
+    fi
+  fi
+  say '' 'isshoni is purged: its program, configuration, data and user are gone.'
+  say_dropins
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+# Actions
 
 # cleanup runs when the script ends, however it ends: it deletes a config file that this run wrote and that did
 # not get past the pre-check, and the download directory. That includes a run that a signal ends: Ctrl-C, a kill,
