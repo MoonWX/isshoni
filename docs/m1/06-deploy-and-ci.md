@@ -804,7 +804,8 @@ If isshoni was installed from a package, both refuse and print `apt remove issho
 - **Review R4** (the M1 security review; README §6 "Decided after group 10" (1)): release.yml's `verify` job runs
   such a privileged container, built from Docker Hub bases that no digest pins (`debian:12`, `ubuntu:24.04`),
   while it holds a `contents: write` token. README F09 (group 12) moves `verify` to rootless
-  `podman run -d --systemd=always` with the bases pinned by digest and a read-only token (9.3).
+  `podman run -d --systemd=always` with the bases pinned by digest and a read-only token, and makes `relserve`
+  reachable from that container, which reaches the runner another way than a Docker one (the bullet above; 9.3).
 - `tools/relserve` serves a locally built, test-signed release over HTTPS (section 11.2).
 
 **VMs** (`deploy/test/vm/`):
@@ -1640,12 +1641,13 @@ owner.
      `build` job fails before goreleaser runs (9.3).
   5. **The root `README.md`, for every tag, the rc's too** (README F05's review): every release archive carries it
      (3), so what it says ships inside the release. Bring up to date, in a PR into `main` merged before the tag
-     (for a final release, step 4's PR can carry it): the pre-release banner at the top and the "Status" section
-     ("No release yet" must not ship inside `v0.1.0-rc.1`), "What v0.1.0 will ship" and the Install intro ("Not
-     available yet"), as the comment in its Status section lists. Its "Release signing keys" table must list the
-     fingerprints of `deploy/keys/allowed_signers` (9.4), which `deploy/keys/README.md` step 2 fills in with the
-     keys; from README F11 on, `repocheck keys` (`task lint:keys`, and release.yml) fails while a key's fingerprint
-     is missing there or a row still says the key is not created (10.3).
+     (for a final release, step 4's PR carries it, and the tag goes on that merge commit; for an rc, tag the merge
+     commit of this PR): the pre-release banner at the top and the "Status" section ("No release yet" must not ship
+     inside `v0.1.0-rc.1`), "What v0.1.0 will ship" and the Install intro ("Not available yet"), as the comment in
+     its Status section lists. Its "Release signing keys" table must list the fingerprints of
+     `deploy/keys/allowed_signers` (9.4), which `deploy/keys/README.md` step 2 fills in with the keys; from README
+     F11 on, `repocheck keys` (`task lint:keys`, and release.yml) fails while a key's fingerprint is missing there, a
+     fingerprint there is no key's, or a row still says the key is not created (10.3).
 - **Tag and push** with plain git: `git tag -a v0.1.0 -m v0.1.0 && git push origin v0.1.0`. `gh` is not needed.
 - **Approve.** The owner edits the draft notes on GitHub, then approves the `release` environment (works from the
   GitHub mobile app).
@@ -1968,9 +1970,11 @@ no write token near third-party code. README F09 (group 12) fixes it: `sign` upl
 artifact, `verify` takes them from there with `contents: read` (plus `packages: read` and `attestations: read`) and
 no job-level `GH_TOKEN`, starts the distro container rootless (`podman run -d --systemd=always`) from bases pinned
 by digest, and `publish` downloads the draft right before `--draft=false` and fails unless the signature, the
-checksums and the asset list all pass. The same Docker Hub exposure in `build`'s buildx driver image can be pinned
-by digest in the same slice. Turning on GitHub's immutable releases, which the one-time setup of 8.6 doesn't
-include, is the owner's to consider.
+checksums and the asset list all pass. A rootless podman container reaches the runner's `relserve` another way than
+today's Docker one, as README S78 found (4.13), so F09 also makes `relserve` reachable from it (for example as
+`host.containers.internal`; `verify` already starts `relserve` on every address), and the release dry run shows it.
+The same Docker Hub exposure in `build`'s buildx driver image can be pinned by digest in the same slice. Turning on
+GitHub's immutable releases, which the one-time setup of 8.6 doesn't include, is the owner's to consider.
 
 **`site`** (README S82; not there yet)
 - `uses: ./.github/workflows/site.yml`, after `publish`.
@@ -2116,9 +2120,10 @@ after the first Windows release):
   - `deploy/keys/allowed_signers` (source of truth);
   - the block embedded in install.sh (checked by `lint:keys`);
   - the fingerprints on `/security` and in `README.md` (from `release.json` and the file). `README.md`'s are
-    checked by `repocheck keys` (`lint:keys`, and release.yml) from README F11 on: once `allowed_signers` exists,
-    its "Release signing keys" section must list the SHA256 fingerprint of every key in it and no row may still
-    say the key is not created. Until F11 nothing checks them (README F05's review);
+    checked by `repocheck keys` (`lint:keys`, and release.yml) from README F11 on: once `allowed_signers` exists and
+    is not empty, `README.md`'s "Release signing keys" section must list the SHA256 fingerprint of every key in it
+    and no other one, and no row may still say the key is not created (a file of blank and comment lines only
+    fails, as one without a key). Until F11 nothing checks them (README F05's review);
   - the release notes footer.
 - **Manual verification** (on `/install/` and `/security#verify`):
 

@@ -705,7 +705,7 @@ that has only `Code` set.
 
 | Code | Returned by | Retryable | Meaning |
 |---|---|---|---|
-| `sfu.closed` | any Conn method; Probe | no | Conn or SFU closed. `Probe` checks `Ready()` first, so after `Close` it is `sfu.closed` even for a disabled transport or a bad offer; it is also the answer for a probe that the same user's next probe of the transport replaced before the call returned |
+| `sfu.closed` | any Conn method; Probe | no | Conn or SFU closed. `Probe` checks `Ready()` before the transport, the offer and the slot (only a contract violation comes first, §7.6), so after `Close` it is `sfu.closed` even for a disabled transport or a bad offer; it is also the answer for a probe that the same user's next probe of the transport replaced before the call returned |
 | `sfu.busy` | any Conn method | yes | actor queue full for 5 s |
 | `sfu.role_forbidden` | StartShare, HandleOffer(pub), UpdateSubscriptions | no | role can't do that |
 | `sfu.bad_pc` | HandleOffer, HandleAnswer, AddICECandidate, RestartICE, ResetPC, ClosePC | no | method not valid for that PC kind (e.g. an offer for `sub`, `RestartICE` or `ResetPC` for `pub`, an unknown kind; for `HandleOffer` a kind above `PCSub` is `sfu.pc_limit` instead), or the PC doesn't exist: a pub offer for a `gen` whose PC has closed, an answer for a closed sub PC's `gen` or without a sub PC, a `RestartICE`, `ResetPC` or `ClosePC{sub}` for a sub `gen` above the current one or without a sub PC. Not returned by `RestartICE`/`ResetPC` when the sub PC was closed: those calls rebuild it (§5.3) |

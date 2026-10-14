@@ -2008,7 +2008,7 @@ t≈5.5 s  connected → keyframe requests → s_a live; subscriptions resume on
   viewer whose own outage outlasts its detection time plus 3 s comes back only through the 15 s rebuild (§10.4),
   and the itest case for this half, `TestUDPBlackHoleViewer`, is skipped. The pub half, the sharer's own ICE
   restart, connects as drawn: the client is the pub PC's controlling agent, and a browser keeps checking its pairs
-  through such an outage (the Go test client is set to, 25 s: case 5 of §19).
+  through such an outage (the Go test client is set to keep checking for 25 s: case 5 of §19).
 
 **C. Wi-Fi → LTE** (both break): A and B together. Socket and ICE fail, the client resumes the socket first (skip-wait
 on `online`), then the resumed-`welcome` rows of §10.4 run: the client ICE-restarts its pub PC, and the server's

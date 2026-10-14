@@ -895,7 +895,7 @@ func (q *Q) DeleteRoom(id RoomID) error                              // ErrDefau
 // push subscriptions
 // UpsertPushSubscription: on endpoint conflict it rebinds the row to s.UserID/s.SessionID and replaces the keys.
 func (q *Q) UpsertPushSubscription(s *PushSubscription) (created bool, err error)
-// DeleteSessionPushSubscriptionsExcept (README F08): deletes every subscription of web session s but keep and
+// DeleteSessionPushSubscriptionsExcept (README F08): deletes every subscription of web session s except keep, and
 // returns how many went; the subscribe handler calls it in the Write of its upsert (one per session, §12.4.6). An
 // empty s is an error; a device's subscriptions (later: M2) are not touched.
 func (q *Q) DeleteSessionPushSubscriptionsExcept(s SessionID, keep PushSubID) (int, error)
@@ -3345,7 +3345,7 @@ would answer 403. It stays as S42 built it; §7.3 has the reasons and §7.9 the 
 Decided after group 10 (an engineering call the owner delegated; README §6 (1)): **the M1 security review's two
 findings in this doc are fixed by README F08.** The review (read-only, of `main` at f7053dc, before the first
 release candidate) found two gaps where the code followed this spec: a member could loop `POST /me/password` with
-the own password and keep every hash slot busy, because a right password gives `auth-user-ip` and `auth-user`
+their own password and keep every hash slot busy, because a right password gives `auth-user-ip` and `auth-user`
 their tokens back (R2: the `password-change` bucket of §7.3); and one session could hold all 10 of the user's push
 subscriptions, so one `POST /push/test` reached 10 endpoints (R6, with 04's half in 04 §14.4–§14.5: one
 subscription per web session, §12.4.6, `DeleteSessionPushSubscriptionsExcept` in §6).
