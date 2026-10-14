@@ -313,25 +313,18 @@ func TestUDPBlackHole(t *testing.T) { udpBlackHole(t, false) }
 // PC (the same gen, the next neg, new ICE credentials). When the network is back that restart connects: the
 // viewer's media is back within 3 s, starting with a keyframe, on the tracks it had, and nothing is rebuilt.
 //
-// It is skipped until the SFU (internal/server/sfu) does two things it doesn't do yet:
-//   - Go on checking a sub PC's candidate pairs through such an outage. The SFU's ICE agent controls a sub PC, and
-//     with Pion's default it gives up on each pair after 7 unanswered checks, about 1.5 s, and never checks it
-//     again: the restart asked for during the outage does not connect when the network is back, and the viewer
-//     recovers only with the rebuild 15 s after the restart's offer (01 §10.4). SetICEMaxBindingRequests with the
-//     failed timeout's worth of checks (one per 200 ms) in the SettingEngine of 02 §7.3 keeps it checking. The
-//     SFU's own TestSubICERestart (02 §17 integration 7) times its request with the network's return for the same
-//     reason.
-//   - Get the viewer a keyframe when its sub PC connects again before the sharer's pub PC does. The sub PC's
-//     keyframe request for the full layer is made while the pub PC is still away and brings no keyframe, and the
-//     500 ms throttle of 02 §9.7 then swallows the request that the pub PC's own connect makes for that layer. The
-//     share goes live on the preview layer's keyframe, and the viewer gets the full layer's frames without one: a
-//     browser would ask for one itself, the Viewer doesn't. A Layer that asks for nothing while the publishing
-//     Conn has its pub PC away, as its read loop already does, would leave the request to the connect.
-func TestUDPBlackHoleViewer(t *testing.T) {
-	t.Skip("needs two SFU changes: sub PC ICE checks that go on through an outage, and keyframe requests that " +
-		"wait for the pub PC to be connected again")
-	udpBlackHole(t, true)
-}
+// Two things in the SFU make that work (02 §7.3, §9.7):
+//   - Its ICE agent goes on checking a sub PC's candidate pairs through the outage. It controls a sub PC, and with
+//     Pion's default it gave each pair up after 7 unanswered checks, about 1.5 s, and never checked it again: the
+//     restart asked for during the outage didn't connect when the network was back, and the viewer recovered only
+//     through the rebuild 15 s after the restart's offer (01 §10.4). It now checks a pair for the failed timeout.
+//   - The viewer gets a keyframe when its sub PC connects again before the sharer's pub PC does. The sub PC's
+//     keyframe request for the full layer is made while the pub PC is still away. It used to start the 500 ms
+//     throttle all the same, which then swallowed the request that the pub PC's own connect makes for that layer:
+//     the share went live on the preview layer's keyframe, and the viewer got the full layer's frames without one
+//     (a browser would ask for one itself, the Viewer doesn't). A request made while the pub PC is away now does
+//     nothing.
+func TestUDPBlackHoleViewer(t *testing.T) { udpBlackHole(t, true) }
 
 // udpBlackHole runs case 5: the sharer's UDP goes away, and the viewer's with it when viewerToo.
 func udpBlackHole(t *testing.T, viewerToo bool) {

@@ -304,8 +304,14 @@ func (l *Layer) handleSR(sr *rtcp.SenderReport, now int64) {
 // check is a compare-and-swap on lastPLI, so concurrent callers produce one PLI; the others are counted as
 // throttled. It reports whether a PLI was written. It takes no lock and never blocks: DownTrack writers and RTCP
 // readers, the layer's own read loop and any Conn's actor call it.
+//
+// While the publishing Conn's actor has its pub PC as away (Conn.pubUp), a request does nothing, not even start
+// the 500 ms: no PLI could get through, and the pub PC's connect asks for every layer it carries (Conn.onPCState).
+// Spent here, the throttle would swallow that request when it came within 500 ms. It did when a viewer's sub PC
+// connected just before the publisher's pub PC after both had lost their network: the viewer's DownTrack went on
+// with the layer's delta frames and never got a keyframe (02 §9.7).
 func (l *Layer) requestKeyframe(now int64) bool {
-	if l.kind != webrtc.RTPCodecTypeVideo {
+	if l.kind != webrtc.RTPCodecTypeVideo || !l.share.conn.pubUp.Load() {
 		return false
 	}
 	last := l.lastPLI.Load()
