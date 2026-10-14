@@ -406,10 +406,12 @@ func TestUserStatusOverREST(t *testing.T) {
 	}
 
 	// Disable → 200; the account's sessions and devices are gone, its connections closed with account_disabled.
+	// The answer is the row of the user list, read under the status the change left: the inviter is only there.
 	f.clk.advance(time.Minute)
 	f.wantSignedIn(samCookie) // in the session cache, as a request a moment ago leaves it
 	got := f.patched(cookie, sam.ID, `{"status":"disabled"}`)
-	if got.Status != api.UserStatusDisabled || got.Sessions != 0 || got.Devices != 0 || got.Role != api.RoleUser {
+	if got.Status != api.UserStatusDisabled || got.Sessions != 0 || got.Devices != 0 || got.Role != api.RoleUser ||
+		got.InvitedBy == nil || got.InvitedBy.Username != "Alex" {
 		t.Errorf("the disabled account = %+v", got)
 	}
 	wantCalls := []closedConn{{auth.ConnSelector{UserID: samID}, auth.ReasonAccountDisabled}}
@@ -431,7 +433,7 @@ func TestUserStatusOverREST(t *testing.T) {
 
 	// Enable → 200; the password works again.
 	got = f.patched(cookie, sam.ID, `{"status":"active"}`)
-	if got.Status != api.UserStatusActive {
+	if got.Status != api.UserStatusActive || got.InvitedBy == nil || got.InvitedBy.Username != "Alex" {
 		t.Errorf("the enabled account = %+v", got)
 	}
 	if notes := f.signal.takeNotes(); fmt.Sprint(notes) != "[admins [admin.users]]" {

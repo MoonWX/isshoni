@@ -181,7 +181,9 @@ func planUserChange(q *store.Q, a store.Actor, id store.UserID, ch UserChange) (
 //     user_not_found, 409 self_action_forbidden, last_admin or username_taken. All of them cost no hash;
 //  2. granting admin: an acting admin types the own password again (ch.ActorPassword, verifyOwnPassword) → 403
 //     wrong_password, also for none; 429 rate_limited; 503 server_busy. A stolen admin cookie alone can't mint a
-//     second admin. The CLI is exempt: the admin socket has checked its peer (04 §12.1);
+//     second admin. The CLI is exempt: the admin socket has checked its peer (04 §12.1). Enabling a disabled
+//     admin takes no password, though it brings an admin back: 03 §7.11 asks for one only when the role is
+//     granted, and the SPA's Enable action sends none;
 //  3. one Write, which plans again on the rows as they are then and checks that the password is still the one
 //     that was verified:
 //     - a rename → user.renamed {from, to};

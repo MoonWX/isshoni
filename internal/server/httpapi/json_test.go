@@ -310,7 +310,7 @@ func TestDecodeOptionalJSON(t *testing.T) {
 		{"an empty object", `{}`, nil, was, ""},
 		{"an object", ` {"username":"alex","password":"pw"}` + "\n", nil, loginReq{"alex", "pw"}, ""},
 		{"unknown fields are ignored", `{"password":"pw","extra":[1,2]}`, nil, loginReq{"kept", "pw"}, ""},
-		{"other white space is not blank", " ", nil, was, api.CodeBadRequest},
+		{"other white space is not blank", "\u00a0", nil, was, api.CodeBadRequest},
 		{"malformed", `{"username":`, nil, was, api.CodeBadRequest},
 		{"wrong type", `{"username":42}`, nil, was, api.CodeBadRequest},
 		{"array instead of object", `[]`, nil, was, api.CodeBadRequest},
@@ -408,7 +408,9 @@ func FuzzDecodeJSON(f *testing.F) {
 // FuzzDecodeOptionalJSON checks that a blank body decodes nothing and that any other gets DecodeJSON's verdict and
 // value.
 func FuzzDecodeOptionalJSON(f *testing.F) {
-	for _, s := range []string{``, ` `, "\r\n\t", " ", `{}`, ` {"a":1} `, `{"a":1} {"b":2}`, `[`, `null`, `"x"`, "{}\x00"} {
+	for _, s := range []string{
+		``, ` `, "\r\n\t", "\u00a0", `{}`, ` {"a":1} `, `{"a":1} {"b":2}`, `[`, `null`, `"x"`, "{}\x00",
+	} {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, body string) {

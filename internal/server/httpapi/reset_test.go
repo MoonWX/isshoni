@@ -206,7 +206,7 @@ func TestPasswordResetWithoutBodyOverREST(t *testing.T) {
 	}
 
 	// A body that is there is held to the rules, whatever its length is said to be, and to the limit.
-	for _, body := range []string{`x`, `{"currentPassword":`, `{} {}`, " "} {
+	for _, body := range []string{`x`, `{"currentPassword":`, `{} {}`, "\u00a0"} {
 		wantError(t, f.issueReset(cookie, sam.ID, "", streamed(body)...), http.StatusBadRequest, api.CodeBadRequest)
 	}
 	wantError(t, f.issueReset(cookie, sam.ID, "", streamed(strings.Repeat(" ", otherBodyLimit+1))...),

@@ -62,16 +62,16 @@ func (a *API) usersChanged() {
 }
 
 // adminUser is an account a handler just changed, as the user list shows it: with its sessions, devices and
-// inviter, read after the commit, and whether it is online. Should that read fail, or the account be gone again,
-// the answer is built from the account alone: the change went through, and a 500 would say that it did not.
+// inviter, read after the commit, and whether it is online. The read lists only the accounts with the status the
+// change left, not the whole table. Should it fail, or the account be gone again or have another status by then
+// (another admin's change in between), the answer is built from the account alone: the change went through, and a
+// 500 would say that it did not. The admins' SPAs refetch the list on the admin.users topic either way.
 func (a *API) adminUser(r *http.Request, user store.User) api.AdminUser {
 	row := store.UserRow{User: user, ResetPending: user.PasswordHash == ""}
 	err := a.d.DB.Read(r.Context(), func(q *store.Q) error {
-		rows, err := q.ListUsers("")
-		for i := range rows {
-			if rows[i].ID == user.ID {
-				row = rows[i]
-			}
+		rows, err := q.ListUsers(user.Status)
+		if i := slices.IndexFunc(rows, func(u store.UserRow) bool { return u.ID == user.ID }); i >= 0 {
+			row = rows[i]
 		}
 		return err
 	})
