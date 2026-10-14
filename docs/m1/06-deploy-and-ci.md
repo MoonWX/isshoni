@@ -392,19 +392,19 @@ Why these settings:
 - **`SystemCallErrorNumber=EPERM`**: a filtered syscall returns an error instead of killing the process.
 - **`ExecReload`**: `systemctl reload isshoni` sends SIGHUP, which re-reads manual TLS files and `log.level`
   (04 §6.5). Everything else needs `systemctl restart isshoni`.
-  - **Until that reload exists, the server ignores SIGHUP, and `systemctl reload isshoni` neither reloads nor
-    stops it** (decided after group 7; README S65 implements the ignoring, README S90 the reload; 04 §6.5). As
-    merged after group 7 `serve` did not handle the signal at all, so it ended the process, and systemd takes
-    an end by SIGHUP for a clean exit that `Restart=on-failure` does not answer: a `reload` would have left the
-    server stopped. The unit keeps the line all the same. Taking it out would make `systemctl reload` an error
-    for now and change a file that the tarball and the packages ship (D3), only to put it back with S90. Nothing
-    is lost meanwhile: manual TLS files are picked up within 60 s without a signal (04 §8.4), and
-    `isshoni admin log-level` changes the level at runtime.
-  - **From README S65 on, `systemctl reload isshoni` is harmless until S90**: `serve` takes the signal from before
-    the server starts, logs `reload is not supported yet; restart to apply changes` at INFO for each one, and goes
-    on serving; across a restart in place (a restore, `rotate-secrets`) the signal is ignored until the new
-    process takes it again (04 §6.5). The journal line is what an operator who tried a reload sees; `systemctl
-    restart isshoni` applies a changed config.
+  - **The reload as README S90 built it** (group 13; 04 §6.5): `serve` loads the config again from its own flags,
+    the unit's environment and the file as it is now, reads the manual TLS files again and applies `log.level`.
+    Every other key that changed is named in one WARN line in the journal ("the config has changes that a reload
+    does not apply; restart isshoni to apply them", with the attribute `keys`), and a config with errors changes
+    nothing and says that a restart would refuse it (exit 78). The server never stops for the signal; across a
+    restart in place (a restore, `rotate-secrets`) the signal is ignored until the new process takes it again.
+    `docker compose kill -s HUP isshoni` does the same in a container.
+  - **Before S90 the server ignored SIGHUP** (decided after group 7; README S65 built the ignoring). As merged
+    after group 7 `serve` did not handle the signal at all, so it ended the process, and systemd takes an end by
+    SIGHUP for a clean exit that `Restart=on-failure` does not answer: a `reload` would have left the server
+    stopped. From S65 to S90 `serve` took the signal, logged `reload is not supported yet; restart to apply
+    changes` at INFO and went on serving. The unit kept the line throughout, so no file that the tarball and the
+    packages ship (D3) had to change for the reload.
 - **`ProtectClock=yes`** (and `@system-service`) also blocks the read-only `adjtimex` call, so the server-side doctor
   can't read the kernel's clock-sync flag. 04's `clock` check then treats the sync state as unknown and relies on the
   Date-header skew check (04 §13.2). Don't relax `ProtectClock` for this.
@@ -2732,6 +2732,12 @@ can watch.
    minutes. Pass: CPU under 40% of 2 vCPU, loss under 0.5%, RSS flat.
 4. On the day, before T+0 (the T−5 row): with E's firewall rules in place, the admin dashboard must show E's
    connection as `tcp443`. If it doesn't, fix E's rules before starting.
+5. **Doctor in Docker** (README S90's last acceptance item, made manual after group 13, README §6 "Decided after
+   group 13"): on a Linux host with a real public address (the VPS before `install.sh`, or another one), the rc's
+   image with `deploy/compose.yaml` (bridge) and then with `deploy/compose.host.yaml` (host): `docker compose exec
+   isshoni isshoni doctor` reports ok in both. Record both outputs; then `docker compose down -v`, so that the ports
+   are free again. Docker Desktop on a Mac can't give this result (its user-space NAT makes `public_ip` symmetric),
+   nor can CI's docker-smoke with its test overrides (04 §13.2, §17).
 
 ### 12.2 Timeline
 
@@ -2853,8 +2859,9 @@ Anything beyond these, such as a reload, a second tap, a re-join or a second log
   (only `/var/lib/isshoni` and `/run/isshoni` are writable), `PrivateTmp`, `AF_NETLINK` allowed, `UMask=0077`,
   journald captures stdout.
   - stderr is not a TTY under systemd, so 04's `log.format = "auto"` writes JSON lines (04 §10).
-  - `systemctl reload` sends SIGHUP (`ExecReload`, 4.5). The server reloads on it from README S90 on and ignores
-    it from S65 until then (04 §6.5).
+  - `systemctl reload` sends SIGHUP (`ExecReload`, 4.5): the server reads manual TLS files and `log.level` again
+    and names every other changed key for a restart (README S90; it ignored the signal from S65 until then, 04
+    §6.5).
   - Exit 78 stops restarts.
   - `TimeoutStopSec=20`: graceful shutdown must finish in under 15 s.
 - **Container environment:** image `ghcr.io/moonwx/isshoni`; binary `/usr/local/bin/isshoni`; uid 65532; env
@@ -2992,6 +2999,10 @@ M1 timeline:
 | S11 | Nightly and VMs (2 d) | `nightly.yml`: VM matrix V1–V6 (Pebble), multi-arch smoke, cross-OS Go tests, govulncheck, full goreleaser snapshot, link check | One green nightly with all rows (or KVM rows marked skipped with the reason, and run by hand in UTM/Tart once) | S7, S8, S9 |
 | S12 | Exit test (1 d prep + the session) | `tools/exittest` (collect, summarize), the run book as a checklist, the session, the results file | All pass criteria in 12.3 met on an rc; `v0.1.0` tagged from that commit (or a fixed one after a re-run) | everything |
 
+README S94 is this slice, split after group 13 (README §6 "Decided after group 13"): its code, `tools/exittest` and
+the run book in `docs/m1/exit-test/`, is built in group 14; the session itself, 05 §19.4's device matrix and the
+`v0.1.0` tag stay with the owner, after README S92's load gate on a VPS.
+
 ## 17. Decisions taken at integration (formerly open questions)
 
 - **Project site address**: `https://moonwx.github.io/isshoni/` for M1 (free, in line with the owner's
@@ -3007,7 +3018,7 @@ Decided after group 7 (an engineering call the owner delegated; README §6):
 - **`systemctl reload isshoni` does nothing until the server can reload.** The unit keeps
   `ExecReload=/bin/kill -HUP $MAINPID`; the server ignores SIGHUP from README S65 on and reloads manual TLS files
   and `log.level` on it from README S90 on (4.5; 04 §6.5). Before S65 the signal would stop the server without a
-  restart.
+  restart. README S90 merged in group 13, so the reload is there now.
 
 Decided after group 8 (an engineering call the owner delegated; README §6):
 
@@ -3071,3 +3082,20 @@ Decided after group 12 (an engineering call the owner delegated; README §6 (8))
   F15 (group 13) turned into `deploy/release/check-draft.sh` with a committed test under `task test:sh` (9.3); and
   `distro-test.sh`'s podman path lacked `--cap-add SYS_ADMIN`, which README F16 (group 13) added with `SYS_PTRACE`,
   leaving the user session to the caller and stopping with its cause when there is none (4.13). The image digests that F09 and F13 pin are bumped by hand with the tool pins (7.1).
+
+Decided after group 13 (engineering calls the owner delegated; README §6 "Decided after group 13"):
+
+- **"doctor reports ok in the Docker bridge and host setups" is a manual check on a Linux host with a real
+  address, run with the exit test** (12.1 pre-flight 5; README S90's last acceptance item). Docker Desktop can't
+  produce an all-ok report (its user-space NAT makes `public_ip` symmetric, its fake-IP DNS answers for a test
+  domain, its VM's clock and UDP buffers warn), and neither can 11.3's smoke overrides on a Linux runner (the test
+  domain resolves nowhere). A later slice that owns `deploy/docker/test` and 04's doctor may run
+  `isshoni doctor --json` in the `docker-smoke` job and assert per code, after reviewing two `public_ip` rules
+  (04 §13.2).
+- **README S94 (this doc's S12) is split** (16): `tools/exittest` and the run book in `docs/m1/exit-test/` are
+  built in group 14; the session, 05 §19.4's device matrix and the `v0.1.0` tag stay with the owner, after README
+  S92's load gate on a VPS.
+- **The e2e job gets `isshoni-loadtest` from the `build` job** (8.2; the group 13 integration, README S89-R2):
+  `CGO_ENABLED=0 go build -trimpath`, uploaded as its own artifact and passed to the specs as `LOADTEST_BIN`, so
+  `decodable.spec` doesn't build the tool with an unpinned Go inside the 15 minutes that the whole Playwright run has in
+  CI (05 §19.3). The tool is no release artifact.
