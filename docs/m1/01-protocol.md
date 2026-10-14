@@ -1999,16 +1999,17 @@ t≈5.5 s  connected → keyframe requests → s_a live; subscriptions resume on
   up to a second. So the share is stalled about 7 s into the outage, and an outage of exactly 5 s ends before that:
   the share stays `live` in `room.state` and its viewers see the last frame until the media is back. Case 5
   therefore keeps the UDP away until the share is stalled (about 7.4 s).
-- **The sub half needs README F10.** The `pc.restart{sub, ice}` at t+3 s goes out while the viewer's UDP is still
+- **The sub half is README F10's.** The `pc.restart{sub, ice}` at t+3 s goes out while the viewer's UDP is still
   gone, and the SFU's ICE-restart offer with it. The SFU is the controlling agent of a sub PC, and with Pion's
-  default it gives up on each candidate pair after 7 unanswered checks (about 1.5 s) and never checks it again, so
-  that restart doesn't connect when the network is back (§10.4). README F10 makes the SFU's sub PCs keep checking
+  default it gave up on each candidate pair after 7 unanswered checks (about 1.5 s) and never checked it again, so
+  that restart didn't connect when the network was back (§10.4). README F10 makes the SFU's sub PCs keep checking
   for the length of the failed timeout, and makes a keyframe request wait while the share's pub PC is away, so that
-  the request of the pub PC's own reconnect is not swallowed by the 500 ms throttle (02 §9.7). Until README F10, a
-  viewer whose own outage outlasts its detection time plus 3 s comes back only through the 15 s rebuild (§10.4),
-  and the itest case for this half, `TestUDPBlackHoleViewer`, is skipped. The pub half, the sharer's own ICE
-  restart, connects as drawn: the client is the pub PC's controlling agent, and a browser keeps checking its pairs
-  through such an outage (the Go test client is set to keep checking for 25 s: case 5 of §19).
+  the request of the pub PC's own reconnect is not swallowed by the 500 ms throttle (02 §9.7). Before README F10, a
+  viewer whose own outage outlasted its detection time plus 3 s came back only through the 15 s rebuild (§10.4).
+  The itest case for this half, `TestUDPBlackHoleViewer`, runs since F10: the viewer's video was back 86 to 919 ms
+  after its network (§19 case 5). The pub half, the sharer's own ICE restart, connects as drawn: the client is the
+  pub PC's controlling agent, and a browser keeps checking its pairs through such an outage (the Go test client is
+  set to keep checking for 25 s: case 5 of §19).
 
 **C. Wi-Fi → LTE** (both break): A and B together. Socket and ICE fail, the client resumes the socket first (skip-wait
 on `online`), then the resumed-`welcome` rows of §10.4 run: the client ICE-restarts its pub PC, and the server's
@@ -3309,7 +3310,7 @@ In `internal/server/signal`, with `signaltest` fakes and `httptest`:
    - **Only the sharer's UDP is cut**, by a `sfutest.FaultConn` under the sharer's own UDP mux
      (`faultySettings`); its WebSocket stays up. The viewer's network is fine, so it keeps its subscription, its
      sub PC and its tracks: it is offered nothing new and sends no `pc.restart`. Cutting the viewer's UDP too is
-     §11.5 B's sub half, which needs README F10 (below).
+     §11.5 B's sub half, which README F10 built (below).
    - **The outage lasts 5 s and on until the share is `stalled`**, about 7.4 s (7.38 to 7.46 s measured): with
      02's timers no share can be stalled within 5 s (§11.5 B), and a check of `stalled` is the point of the case.
      It follows S57's `TestSubICERestart`, whose outage also runs until a condition on the SFU's side.
@@ -3326,9 +3327,10 @@ In `internal/server/signal`, with `signaltest` fakes and `httptest`:
      made at once failed.
    - **`TestUDPBlackHoleViewer`** runs the same case with the viewer's UDP cut too: exactly one
      `pc.restart{sub, gen 1, ice, disconnected}`, sub offers `1/1 1/2` with a new `ice-ufrag`, no rebuild, the
-     viewer's video (from a keyframe) and audio back within 3 s on the tracks it had, and a UDP pair again. It is
-     skipped until README F10 makes the SFU's sub PCs keep checking their pairs through such an outage and keeps
-     keyframe requests back while the pub PC is away (§10.4, §11.5 B; 02 §7.3, §9.7).
+     viewer's video (from a keyframe) and audio back within 3 s on the tracks it had, and a UDP pair again. It
+     runs since README F10 made the SFU's sub PCs keep checking their pairs through such an outage and keeps
+     keyframe requests back while the pub PC is away (§10.4, §11.5 B; 02 §7.3, §9.7); S74 had committed it
+     skipped.
 6. **Server restart** (stop hub and SFU, start new ones on the same ports): the publisher re-publishes with
    `replaces`, the subscriber refocuses on the new share id, and media flows within 5 s of the new server being up.
 

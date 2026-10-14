@@ -122,6 +122,11 @@ jobs:
             # filter would also run docker-smoke and the six distros on every README edit.
             readme:
               - 'README.md'
+            # tools/repocheck, behind lint:keys and lint:pins (06 §7.2). lint-deploy runs both on
+            # the tree, so a change to the checker, or to README.md (whose "Release signing keys"
+            # section lint:keys checks, README F11), runs it as deploy changes do.
+            repocheck:
+              - 'tools/repocheck/**'
             # Inputs of the distro job that neither deploy nor release covers: tools/relserve, which
             # only that job runs, and tools/notices, whose output is in the archives it installs.
             distro_tools:
@@ -141,6 +146,7 @@ jobs:
           FILTER_TOOLS: ${{ steps.filter.outputs.tools }}
           FILTER_DISTRO_TOOLS: ${{ steps.filter.outputs.distro_tools }}
           FILTER_README: ${{ steps.filter.outputs.readme }}
+          FILTER_REPOCHECK: ${{ steps.filter.outputs.repocheck }}
         run: |
           # A pull request runs what its paths touch; a push to main and a merge-queue group
           # run everything.
@@ -148,10 +154,10 @@ jobs:
             go=${FILTER_GO:-false} web=${FILTER_WEB:-false} deploy=${FILTER_DEPLOY:-false}
             docker=${FILTER_DOCKER:-false} release=${FILTER_RELEASE:-false} site=${FILTER_SITE:-false}
             tools=${FILTER_TOOLS:-false} distro_tools=${FILTER_DISTRO_TOOLS:-false}
-            readme=${FILTER_README:-false}
+            readme=${FILTER_README:-false} repocheck=${FILTER_REPOCHECK:-false}
           else
             go=true web=true deploy=true docker=true release=true site=true tools=true distro_tools=true
-            readme=true
+            readme=true repocheck=true
           fi
           go_or_web=false
           if [ "$go" = true ] || [ "$web" = true ]; then go_or_web=true; fi
@@ -171,6 +177,8 @@ jobs:
           if [ "$readme" = true ]; then goreleaser_when=true; fi
           site_or_deploy=$site
           if [ "$deploy" = true ]; then site_or_deploy=true; fi
+          lint_deploy_when=$deploy
+          if [ "$readme" = true ] || [ "$repocheck" = true ]; then lint_deploy_when=true; fi
           {
             echo "go=$go"
             echo "web=$web"
@@ -183,7 +191,7 @@ jobs:
           {
             echo "### CI plan ($EVENT)"
             echo
-            echo "Filters: go=$go, web=$web, deploy=$deploy, docker=$docker, release=$release, site=$site, tools=$tools, distro_tools=$distro_tools, readme=$readme"
+            echo "Filters: go=$go, web=$web, deploy=$deploy, docker=$docker, release=$release, site=$site, tools=$tools, distro_tools=$distro_tools, readme=$readme, repocheck=$repocheck"
             echo
             echo "| Job | Decision |"
             echo "|---|---|"
@@ -224,7 +232,9 @@ jobs:
           # workflow, which the deploy filter covers.
           decide e2e "$go_web_or_deploy" .tool-versions cmd/isshoni web/package.json web/package-lock.json \
             web/playwright.config.ts deploy/dev/isshoni.e2e.toml
-          decide lint-deploy "$deploy" Taskfile.yml .tool-versions
+          # lint:keys checks README.md against deploy/keys/allowed_signers (README F11), and
+          # lint:keys and lint:pins are tools/repocheck: their changes run the job too.
+          decide lint-deploy "$lint_deploy_when" Taskfile.yml .tool-versions
           # The job's own inputs count too: Pebble's config (the go filter's tlsmgr/testdata
           # pattern) and this workflow, which pins the two images (the deploy filter).
           decide acme "$go_or_deploy" go.mod internal/server/tlsmgr/testdata/pebble-config.json

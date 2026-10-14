@@ -488,9 +488,13 @@ func (t *Transport) Close() error {
 // "Failed to write packet: io: read/write on closed pipe" for every packet that arrives for a connection that has
 // just closed, which is what a peer does that has not heard of the close yet (a PeerConnection the SFU closed, a
 // viewer that left). That is no error of the server's, so it is a debug line as well; a packet that fails for any
-// other reason stays an error.
+// other reason stays an error. Their info lines ("Listening TCP on <ip>:<port>", "Added connection: tcp remote
+// <addr> to local <addr>", "Error accepting connection" at close) name addresses too and say nothing the server
+// needs at info, so they are debug lines as well, as the SFU's Pion info lines are (02 §13).
 type quietLogger struct{ logging.LeveledLogger }
 
+func (q quietLogger) Info(msg string)                  { q.Debug(msg) }
+func (q quietLogger) Infof(format string, args ...any) { q.Debugf(format, args...) }
 func (q quietLogger) Warn(msg string)                  { q.Debug(msg) }
 func (q quietLogger) Warnf(format string, args ...any) { q.Debugf(format, args...) }
 

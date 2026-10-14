@@ -105,7 +105,8 @@
 //     the layer whose keyframe arrives, live → stalled by the ticker (2 s without a connected pub PC), by the
 //     publishing Conn's actor (the pub PC failed) or by whoever detaches the share's last video layer. What they
 //     know of the pub PC is what its Conn's actor has seen (Conn.pubUp, an atomic), so the ways into stalled and out
-//     of it go by the same view and can't flap against each other.
+//     of it go by the same view and can't flap against each other. Layer.requestKeyframe goes by that view too: a
+//     request made while the pub PC is away does nothing, not even start the 500 ms throttle (02 §9.7).
 //   - A pubTrack reader whose RTP read fails posts the track's end to the actor, which detaches the track and takes
 //     it out of pubPC.tracks (pubTrackEnded). The table holds only tracks that are still read, so an offer never
 //     binds an ended track to a share.

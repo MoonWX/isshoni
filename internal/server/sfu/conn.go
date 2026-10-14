@@ -45,9 +45,10 @@ type Conn struct {
 	events eventQueue
 
 	// pubUp and pubDownAt are what the actor has seen of the Conn's pub PC, for the goroutines that decide the media
-	// state of its shares (02 §5.3): the layers' read loops and the ticker. pubUp is true while the current pub PC is
-	// connected. pubDownAt is the monoNow at which it last stopped being so, 0 before any pub PC was connected. Only
-	// the actor writes them (markPubDown, onPCState).
+	// state of its shares (02 §5.3): the layers' read loops and the ticker. Layer.requestKeyframe, on any goroutine,
+	// reads pubUp too: no keyframe request while the pub PC is away (02 §9.7). pubUp is true while the current pub
+	// PC is connected. pubDownAt is the monoNow at which it last stopped being so, 0 before any pub PC was
+	// connected. Only the actor writes them (markPubDown, onPCState).
 	pubUp     atomic.Bool
 	pubDownAt atomic.Int64
 

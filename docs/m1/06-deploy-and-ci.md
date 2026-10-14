@@ -1294,7 +1294,7 @@ vars:
 | `lint:web` | `npm --prefix web run lint && npm --prefix web run typecheck` | |
 | `lint:sh` | `shellcheck --shell=sh` and `shfmt -p -i 2 -d` over `deploy/**/*.sh` | |
 | `lint:actions` | `actionlint` | |
-| `lint:keys` | embedded block in `install.sh` = `deploy/keys/allowed_signers` | |
+| `lint:keys` | embedded block in `install.sh` = `deploy/keys/allowed_signers`; from README F11 on, once that file is not empty, the root `README.md`'s "Release signing keys" section lists the fingerprint of each of its keys and no other one, and no row there says a key is not created (10.3) | |
 | `lint:unit` | `systemd-analyze verify deploy/systemd/isshoni.service` (Linux only; skipped elsewhere) | |
 | `build:web` | `npm --prefix web run build` with env `ISSHONI_VERSION={{.VERSION}}` → `web/dist/` (plus `web/dist/licenses.txt` and `version.json`) | Task `sources`/`generates` make it a no-op when nothing changed. A `status:` check next to them (a one-line `node -p` read of `web/dist/version.json`) makes it out of date whenever that file's `version` ≠ `{{.VERSION}}` |
 | `build:go` | `CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/MoonWX/isshoni/internal/version.version={{.VERSION}} -X github.com/MoonWX/isshoni/internal/version.commit=$(git rev-parse HEAD) -X github.com/MoonWX/isshoni/internal/version.date=$(git log -1 --format=%cI)" -o bin/isshoni ./cmd/isshoni` (04 §15) | Go only, no Node needed (CI's `build` job). Fails if `web/dist/index.html` is missing. The flags are identical in content to 9.2 (commit date, as goreleaser's `{{ .CommitDate }}` and `mod_timestamp`) |
@@ -1431,6 +1431,10 @@ The `changes` job (`dorny/paths-filter`) sets these outputs. On `push` to `main`
 - `tools`: `tools/**`
 - `distro_tools`: `tools/relserve/**`, `tools/notices/**`: the inputs of the distro jobs that neither `deploy` nor
   `release` covers (README S78, below)
+- `readme`: the root `README.md`, which every release archive carries (3): it runs `goreleaser-check`, so a pull
+  request that deletes it fails there (README S82), and `lint-deploy`, whose `lint:keys` checks its "Release
+  signing keys" section (README F11)
+- `repocheck`: `tools/repocheck/**`, the checker behind `lint:keys` and `lint:pins`: it runs `lint-deploy`
 
 | Job | Runs when | Steps and assertions | Timeout | Gates merge |
 |---|---|---|---|---|
@@ -1441,11 +1445,11 @@ The `changes` job (`dorny/paths-filter`) sets these outputs. On `push` to `main`
 | `licenses` | go, web or site | `task licenses` | 10 | yes |
 | `build` | always | downloads `web/dist`, `task notices`, `task build:go` (no Node on this runner); `bin/isshoni version --json` must show the commit and `0.0.0-ci.<run>`; warns above 60 MB. Uploads `bin/isshoni` | 10 | yes |
 | `e2e` | go, web or deploy (below) | setup-node and `npm ci` in `web/`; downloads the binary and runs `chmod +x bin/isshoni` (artifacts lose the mode bit); env `ISSHONI_BIN: ${{ github.workspace }}/bin/isshoni`; the runner's preinstalled Google Chrome stable, plus Playwright's ffmpeg for the videos (`npx --prefix web playwright install ffmpeg`; `… install chrome`, which brings ffmpeg along, only if Chrome is missing); installs `xvfb`, `openbox` and `pulseaudio` and starts a PulseAudio null sink as the default sink (Chrome gets an output device for tab audio; the step can go if the specs that play audio pass without it); `xvfb-run -a --server-args="-screen 0 1920x1080x24" sh -c 'openbox & exec npm --prefix web run e2e'`: Chrome's capture picker needs a window manager under X11. One Playwright worker and one retry (05 §19.3). After every run that was not cancelled, green or red, uploads `web/test-results/` (the Playwright trace and video of a failed attempt, the per-server JSON logs `server-*.log`, 14) and `web/playwright-report/` as `e2e-results`, kept 7 days | 20 | yes |
-| `lint-deploy` | deploy | `task lint:sh lint:actions lint:keys lint:unit lint:pins test:sh` | 10 | yes |
+| `lint-deploy` | deploy, readme or repocheck | `task lint:sh lint:actions lint:keys lint:unit lint:pins test:sh` | 10 | yes |
 | `distro-release` | deploy or release, or `tools/relserve` or `tools/notices` (below) | builds the two test releases once for the matrix (README S78): setup-node and `npm ci` in `web/`, because `task release:snapshot` builds the SPA (7.2); rpm on the runner; `sh deploy/test/distro-test.sh -b`; uploads them as the artifact `distro-releases`, kept 1 day | 20 | yes |
 | `distro` | as `distro-release` | matrix of the 6 container distros (4.13), scenarios from 11.2, on the releases of `distro-release` (`distro-test.sh -r`), with `CONTAINER_ENGINE=docker` | 30 | yes |
 | `docker-smoke` | docker, deploy or release | `task docker:smoke` (11.3), linux/amd64 | 15 | yes |
-| `goreleaser-check` | release or deploy (below) | setup-node and `npm ci` in `web/`; `goreleaser check`; `task release:snapshot` (builds the SPA first, 7.2); asserts the asset list of section 3 (names and archive contents) | 20 | yes |
+| `goreleaser-check` | release, deploy or readme (below) | setup-node and `npm ci` in `web/`; `goreleaser check`; `task release:snapshot` (builds the SPA first, 7.2); asserts the asset list of section 3 (names and archive contents) | 20 | yes |
 | `site` | site or deploy | `vitepress build`; setup-go (from `go.mod`), then `go test ./internal/server/ops/doctor -run TestDocsAnchors` (10.4) | 10 | yes |
 | `govulncheck` | go | `.bin/govulncheck ./...`, `continue-on-error: true` (new CVEs mustn't block unrelated PRs; nightly and release gate on it) | 10 | no |
 | `ci-ok` | always (`if: always()`) | fails if any job in `needs` is `failure` or `cancelled`; `skipped` counts as success | 2 | **the only required check** |

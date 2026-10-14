@@ -2782,7 +2782,8 @@ Decided after group 10 (engineering calls the owner delegated; README §6):
    With Pion's default the SFU, the controlling agent of a sub PC, gave up on each pair after 7 unanswered checks,
    about 1.5 s, and such a viewer came back only through the 15 s rebuild. README F10 builds it, together with
    keyframe requests that wait while the share's pub PC is away, so that the request of the pub PC's own reconnect
-   is not swallowed by the 500 ms throttle (§9.7).
+   is not swallowed by the 500 ms throttle (§9.7). The setting is in the shared `SettingEngine`, so the pub PCs get
+   it too; the probe APIs keep Pion's 7 (§7.3).
 4. **The M1 security review's two findings in this doc** (§12): R3, peer-reflexive sources, is bounded below Pion
    in 04's netx, 64 per local ICE ufrag (README F06); R1, pub-PC tracks under SSRC churn, has a fix that waits for
    the owner (README F07).

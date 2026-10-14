@@ -1279,7 +1279,7 @@ table has them; these are the points the table leaves open, and what is still to
   | What | Until | Meanwhile |
   |---|---|---|
   | `push.Options.Metrics` (`isshoni_push_sent_total`, §11.2) | README S85 | the push service counts its results for nobody |
-  | `ops.Metrics` as the router's observer and the hub's registerer; the REST routes of `ops` | README S80, S85 | `signal.Deps.Metrics` is nil; with `metrics.enabled` the server logs a warning that nothing listens on `metrics.listen` |
+  | `ops.Metrics` as the router's observer and the hub's registerer; the REST routes of `ops` other than `POST /api/v1/conntest` (README S80 wired that one, `wireConnTest`) | README S85 | `signal.Deps.Metrics` is nil; with `metrics.enabled` the server logs a warning that nothing listens on `metrics.listen` |
   | Transfer accounting and the release check in `serve` (built in README S55, §11.3, §11.5) | README S85 | nothing counts or checks |
 
 - The tests are `wire_test.go` (each adapter against a fake, and the ones over 03 once more against the real
