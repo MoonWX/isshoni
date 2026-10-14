@@ -11,133 +11,20 @@
 // Every test has a server of its own (startServer): these tests count the people of a room, and on the worker's
 // server the people of other specs would be counted with them.
 //
-// The cut network is a SOCKS proxy between one browser context and the server, which the test closes: the server's
-// end of the WebSocket goes away without a close frame, and no new connection gets through. Chrome's own offline
-// emulation (context.setOffline) is no cut for a socket that is already open: it holds the frames back and leaves
-// the TCP connection alone, so the server would notice nothing until its 45 s idle timeout.
-import net from 'node:net';
-
+// The cut network is the harness's `link` (fixtures.ts), a SOCKS proxy between one browser context and the server,
+// which the test closes: the server's end of the WebSocket goes away without a close frame, and no new connection
+// gets through. Chrome's own offline emulation (context.setOffline) is no cut for a socket that is already open: it
+// holds the frames back and leaves the TCP connection alone, so the server would notice nothing until its 45 s idle
+// timeout.
 import type { Locator, Page } from '@playwright/test';
 
-import { enableDebug, expect, fakeDisplay, test as base } from './fixtures.ts';
+import { enableDebug, expect, fakeDisplay, test } from './fixtures.ts';
 import { readState, waitForRoom, waitForState } from './stats.ts';
 
 /** 01 §13: how long a connection without a socket keeps its place. */
 const GRACE_MS = 30_000;
 /** "At once": what needs no grace period and no timeout shows within this, on a busy CI machine too. */
 const AT_ONCE_MS = 3_000;
-
-// ---- The link that can be cut ----
-
-interface Link {
-  /** `socks5://127.0.0.1:<port>`: the proxy of the browser context whose network the test cuts. */
-  readonly proxy: string;
-  /** Closes every connection through the link, without a goodbye, and refuses new ones. */
-  cut(): void;
-  /** Lets new connections through again. */
-  restore(): void;
-  close(): Promise<void>;
-}
-
-/**
- * A SOCKS5 proxy on a free loopback port: no authentication, CONNECT only, to an IPv4 address or a host name
- * (RFC 1928). It is all a browser context needs to reach the e2e server through it.
- */
-async function startLink(): Promise<Link> {
-  const sockets = new Set<net.Socket>();
-  let down = false;
-  const track = (socket: net.Socket): void => {
-    sockets.add(socket);
-    socket.on('close', () => sockets.delete(socket));
-    // A reset from either end is what cut() is for.
-    socket.on('error', () => undefined);
-  };
-
-  const listener = net.createServer((client) => {
-    track(client);
-    if (down) {
-      client.destroy();
-      return;
-    }
-    let buffered = Buffer.alloc(0);
-    let greeted = false;
-    const onData = (chunk: Buffer): void => {
-      buffered = Buffer.concat([buffered, chunk]);
-      if (!greeted) {
-        // VER, NMETHODS, METHODS…: answered with "no authentication".
-        const methods = buffered[1];
-        if (methods === undefined || buffered.length < 2 + methods) return;
-        buffered = buffered.subarray(2 + methods);
-        client.write(Buffer.from([5, 0]));
-        greeted = true;
-      }
-      // VER, CMD, RSV, ATYP, the address, the port.
-      const type = buffered[3];
-      if (type === undefined) return;
-      let host: string;
-      let portAt: number;
-      if (type === 1) {
-        if (buffered.length < 10) return;
-        host = [...buffered.subarray(4, 8)].join('.');
-        portAt = 8;
-      } else if (type === 3) {
-        const length = buffered[4];
-        if (length === undefined || buffered.length < 7 + length) return;
-        host = buffered.subarray(5, 5 + length).toString('latin1');
-        portAt = 5 + length;
-      } else {
-        client.destroy();
-        return;
-      }
-      const port = buffered.readUInt16BE(portAt);
-      const early = buffered.subarray(portAt + 2);
-      client.off('data', onData);
-
-      const upstream = net.connect({ host, port });
-      track(upstream);
-      upstream.once('connect', () => {
-        client.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
-        if (early.length > 0) upstream.write(early);
-        client.pipe(upstream);
-        upstream.pipe(client);
-      });
-      upstream.once('close', () => client.destroy());
-      client.once('close', () => upstream.destroy());
-    };
-    client.on('data', onData);
-  });
-  await new Promise<void>((resolve) => listener.listen(0, '127.0.0.1', resolve));
-
-  const closeAll = (): void => {
-    for (const socket of sockets) socket.destroy();
-  };
-  return {
-    proxy: `socks5://127.0.0.1:${String((listener.address() as net.AddressInfo).port)}`,
-    cut() {
-      down = true;
-      closeAll();
-    },
-    restore() {
-      down = false;
-    },
-    close: () =>
-      new Promise<void>((resolve) => {
-        closeAll();
-        listener.close(() => {
-          resolve();
-        });
-      }),
-  };
-}
-
-const test = base.extend<{ link: Link }>({
-  // eslint-disable-next-line no-empty-pattern -- Playwright reads the fixture names from this pattern
-  link: async ({}, use) => {
-    const link = await startLink();
-    await use(link);
-    await link.close();
-  },
-});
 
 // ---- The page ----
 

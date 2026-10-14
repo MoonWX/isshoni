@@ -132,6 +132,10 @@ describe('shareErrorMessage', () => {
     expect(shareErrorMessage(new ShareEndedError('server'))).toBe('Sharing stopped by the server');
   });
 
+  it('and of a share that the capture hold ended (01 §10.6)', () => {
+    expect(shareErrorMessage(new ShareEndedError('unreachable'))).toBe('Sharing stopped: the server was unreachable');
+  });
+
   it('and the error’s own text otherwise', () => {
     expect(shareErrorMessage(new LocalError('h264_unavailable'))).toBe(
       "This browser can't send H.264 video. Use Chrome or Edge.",

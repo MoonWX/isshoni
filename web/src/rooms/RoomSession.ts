@@ -95,8 +95,8 @@ export interface ShareResyncContext {
 /**
  * What a local share can add to ActiveShare (05 §8) so that it survives a reconnect: the three transitions that only
  * the session can start, because only it sees every welcome, room.event and room.state. share/'s in-page ActiveShare
- * implements them (serverEnded with the publisher, resync and republish with the web recovery slice). Each is
- * optional; without one the session falls back to ending the share, which is always correct, just less kind.
+ * (BrowserShare) implements all three. Each is optional; without one the session falls back to ending the share,
+ * which is always correct, just less kind.
  */
 export interface ShareRecovery {
   /**
@@ -686,12 +686,28 @@ export class RoomSession {
       this.#reconcilePending = false;
       const own = this.#stores.room.getState().connectionId;
       const localId = share?.shareId;
-      // A server share of this connection that the page no longer has (its share.stop was lost with the socket).
+      // A local share the server no longer has (it timed out while the socket was down): it is published again.
+      const again = share !== null && !listed && share.state !== 'ended';
+      const claims = again && typeof share.republish === 'function';
+      const copies: string[] = [];
       for (const x of s.shares) {
-        if (x.connectionId === own && x.id !== localId) this.#stopStray(x.id);
+        if (x.connectionId !== own || x.id === localId) continue;
+        if (claims && x.replaces === localId) {
+          // The server's copy of a re-publish of the local share whose answer the socket took: republish() asks
+          // again with the same ref and gets it (01 §8.7, §10.5). Stopping it now would make the retry a third share.
+          copies.push(x.id);
+          continue;
+        }
+        // A server share of this connection that the page no longer has (its share.stop was lost with the socket).
+        this.#stopStray(x.id);
       }
-      // A local share the server no longer has (it timed out while the socket was down): publish it again.
-      if (share !== null && !listed && share.state !== 'ended') void this.#republish(share);
+      if (again) {
+        void this.#republish(share).then(() => {
+          // A copy that the re-publish didn't claim (the capture had ended, the server refused) is a stray after all.
+          if (this.#disposed || this.#desired !== s.roomId || this.#signal.state !== 'ready') return;
+          for (const id of copies) if (share.shareId !== id) this.#stopStray(id);
+        });
+      }
       return;
     }
 
@@ -829,6 +845,9 @@ export class RoomSession {
   async #resyncShare(ctx: ShareResyncContext): Promise<void> {
     const share = this.#share;
     if (share === null || share.state === 'ended') return;
+    // The server lost the share: no snapshot lists its id again, which is no end of the share. Its re-publish gets
+    // a new one, which counts from the first snapshot that lists it.
+    if (!ctx.kept) this.#shareSeenId = null;
     if (typeof share.resync === 'function') {
       try {
         await share.resync(ctx);
@@ -852,6 +871,9 @@ export class RoomSession {
       await this.#stop(share);
       return;
     }
+    // Snapshots without the old id keep coming while the share is published again; they are not "the server ended
+    // it" (05 §13.1's fallback). The new id counts from the first snapshot that lists it.
+    if (this.#shareSeenId === share.shareId) this.#shareSeenId = null;
     try {
       await share.republish();
     } catch (err) {

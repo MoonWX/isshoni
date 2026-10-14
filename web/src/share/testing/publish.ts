@@ -1,7 +1,7 @@
 // Test support for the publishing half of the sharer: ShareParams as the server sends them, the server's answer to
 // a pub offer, and the hub's side of a share (share.start, share.update, share.stop, room.state).
 import { FakeSignalServer } from '../../protocol/testing';
-import type { PCAnswer, PCOffer, RoomState, ShareInfo, ShareParams } from '../../protocol/types.gen';
+import type { PCAnswer, PCOffer, RoomState, ShareInfo, ShareParams, ShareStart } from '../../protocol/types.gen';
 import { buildSdp, FakeRTCPeerConnection, parseSdpSections } from '../../test/FakeRTCPeerConnection';
 
 /** share.start's answer for the Auto preset (02 §8.6), in wire order: high first. */
@@ -62,23 +62,43 @@ export function shareInfo(id: string, overrides: Partial<ShareInfo> = {}): Share
 /**
  * The hub's side of sharing on a fake signaling server: share.start answers with ShareParams (ids s_1, s_2, …),
  * share.update with the same params and the new preset's audio bitrate (Movie: 256 kbit/s), share.stop with ok.
+ *
+ * Like the hub (01 §8.7), a share.start with a ref that a share of the same connection still has gets that share's
+ * params again: nothing is made twice. share.stop ends the share (its ref makes a new share then), and so does a
+ * new connection (a restarted server, an expired grace).
  */
 export class FakeShareHub {
   readonly #server: FakeSignalServer;
   #made = 0;
   #rev = 1;
+  /** The shares made, by connection id and ref. */
+  readonly #byRef = new Map<string, ShareParams>();
   /** What the next share.start answers; default: shareParams('s_<n>'). */
   nextParams: Partial<ShareParams> = {};
+  /**
+   * Called with each share.start before the hub handles it, on the socket it came on: a test drops the socket here
+   * to lose the answer of a share the hub makes.
+   */
+  onStart: ((data: ShareStart) => void) | null = null;
 
   constructor(server: FakeSignalServer) {
     this.#server = server;
-    server.handle('share.start', () => ({
-      ok: shareParams(`s_${String(++this.#made)}`, this.nextParams),
-    }));
+    server.handle('share.start', (data) => {
+      this.onStart?.(data);
+      const key = `${this.#connectionId()} ${data.ref}`;
+      const made = this.#byRef.get(key);
+      if (made !== undefined) return { ok: made };
+      const params = shareParams(`s_${String(++this.#made)}`, this.nextParams);
+      this.#byRef.set(key, params);
+      return { ok: params };
+    });
     server.handle('share.update', (data) => ({
       ok: shareParams(data.shareId, { ...this.nextParams, audioBitrate: data.preset === 'movie' ? 256_000 : 128_000 }),
     }));
-    server.handle('share.stop', () => ({ ok: {} }));
+    server.handle('share.stop', (data) => {
+      for (const [key, params] of this.#byRef) if (params.shareId === data.shareId) this.#byRef.delete(key);
+      return { ok: {} };
+    });
   }
 
   /** The data of the client's requests of one type, oldest first. */
@@ -89,6 +109,11 @@ export class FakeShareHub {
   /** Sends a room.state of roomId with these shares. */
   roomState(roomId: string, shares: ShareInfo[], overrides: Partial<RoomState> = {}): void {
     this.#server.send('room.state', { roomId, rev: this.#rev++, participants: [], shares, ...overrides });
+  }
+
+  /** The connection the newest welcome named: the one a request on the newest socket comes from. */
+  #connectionId(): string {
+    return this.#server.welcomes.at(-1)?.connectionId ?? '';
   }
 
   /** Answers the newest pub offer like the SFU. */

@@ -15,10 +15,23 @@
 // - an error notification in scope `share` about it (codec_not_supported) → failed, with that error;
 // - a pub PC whose negotiation failed twice within a minute (01 §9 rule 8) → failed with PubNegotiationFailedError,
 //   which the app turns into its "Can't connect media" screen with Reload (05 §9; shareUi.ts does, it has the
-//   uiStore).
+//   uiStore);
+// - 60 s without a ready connection (the capture hold, 01 §10.6) → failed, "Sharing stopped: the server was
+//   unreachable". Until then the capture stays, so that the share can be published again without a new pick.
 //
-// Not here yet (the web recovery slice): following a reconnect (resync, re-publishing with `replaces`) and the 60 s
-// capture hold. Without them the room session stops a share whose server side is gone.
+// Across a reconnect (01 §10.5, §10.6; the room session's ShareRecovery seam, 05 §11.1):
+// - a resumed welcome that kept the connection in the room: the pub PC re-sends its offer and restarts ICE by
+//   itself (PublisherPC), so resync() has nothing to do;
+// - a welcome after which the server has neither the share nor a pub PC (not resumed: a restarted server, a grace
+//   period that ran out; or resumed, but with a room.join that gave the connection a new MediaPeer): resync()
+//   publishes the share again, share.start {replaces: its id, ref: new} and its tracks on a new pub PC of gen 1;
+// - the first room.state after a resumed welcome doesn't list the share (it ended while the socket was down):
+//   republish() publishes it again the same way, on a new pub PC of the next gen that replaces the one the server
+//   kept (PublisherPC.republish says why not on that one).
+// The share gets a new id then: it reports it as a `state` event (05 §8), and viewers move their focus, tile and
+// sound to it (01 §10.6). It is `reconnecting` meanwhile, `live` again once the pub PC is connected and the server
+// lists it. A share.start of a re-publish whose answer the socket took goes again with the same ref when the
+// connection is kept (the server answers with the share it made, 01 §8.7), and with a new one otherwise.
 import { createEmitter } from '../lib/emitter';
 import { LocalError } from '../lib/errors';
 import type { Logger } from '../lib/log';
@@ -29,14 +42,14 @@ import type {
   PickedSource,
   ShareHint,
   ShareStatsSample,
-  SignalClientLike,
 } from '../platform/types';
-import { isProtocolError, LocalErrorCodeConnectionLost } from '../protocol/errors';
+import type { SignalState } from '../protocol/signal-client';
 import {
   EndReasonLeft,
   EndReasonMediaTimeout,
   EndReasonRoomClosed,
   EndReasonStopped,
+  MessageTypeShareStart,
   MessageTypeShareStop,
   MessageTypeShareUpdate,
   RIDHigh,
@@ -48,8 +61,10 @@ import {
   type ShareKind,
   type ShareParams,
 } from '../protocol/types.gen';
+import type { ShareRecovery, ShareResyncContext } from '../rooms/RoomSession';
 import { createHintDetector, hintSample, sameHint } from './hints';
-import type { PublisherPC, PubMediaState } from './PublisherPC';
+import type { PublisherPC, PublisherSignal, PubMediaState } from './PublisherPC';
+import { CAPTURE_HOLD_MS, isConnectionLost, newRef } from './recovery';
 import type { ShareOutcome, ShareStore } from './shareStore';
 
 /** The sender's stats are sampled this often for the hints (05 §18). */
@@ -61,16 +76,26 @@ export const STATS_SAMPLE_MS = 2_000;
  */
 export const END_NOTICE_GRACE_MS = 300;
 
-/** Why the server ended a share that nobody stopped (05 §13.1); the share panel has a text for each kind. */
+/**
+ * Why a share ended that nobody stopped: the server ended it (05 §13.1), or the server was out of reach for longer
+ * than the capture hold (01 §10.6). The share panel has a text for each kind.
+ */
 export class ShareEndedError extends Error {
   override readonly name = 'ShareEndedError';
-  /** `media_timeout`: no video reached the server. `server`: any other reason, or none (room.state lost it). */
-  readonly kind: 'media_timeout' | 'server';
+  /**
+   * `media_timeout`: no video reached the server. `server`: any other reason, or none (room.state lost it).
+   * `unreachable`: no ready connection for CAPTURE_HOLD_MS.
+   */
+  readonly kind: 'media_timeout' | 'server' | 'unreachable';
   /** The reason on the wire, when there was one. */
   readonly reason: string | undefined;
 
-  constructor(kind: 'media_timeout' | 'server', reason?: string) {
-    super(`the server ended the share (${reason ?? 'no reason'})`);
+  constructor(kind: 'media_timeout' | 'server' | 'unreachable', reason?: string) {
+    super(
+      kind === 'unreachable'
+        ? 'the server was unreachable for too long'
+        : `the server ended the share (${reason ?? 'no reason'})`,
+    );
     this.kind = kind;
     this.reason = reason;
   }
@@ -98,7 +123,11 @@ type ShareEvents = {
 };
 
 export interface BrowserShareDeps {
-  signal: SignalClientLike;
+  /**
+   * ShareContext.signal: 01's SignalClient in the app. The capture hold follows its state; a bare SignalClientLike
+   * (tests) counts as always ready.
+   */
+  signal: PublisherSignal;
   publisher: PublisherPC;
   /**
    * The page's share state machine, which this share reports to; null for a share the page's machine doesn't follow
@@ -137,10 +166,10 @@ function limitOf(v: unknown): 'none' | 'bandwidth' | 'cpu' | 'other' | undefined
   return v === 'none' || v === 'bandwidth' || v === 'cpu' || v === 'other' ? v : undefined;
 }
 
-export class BrowserShare implements ActiveShare {
+export class BrowserShare implements ActiveShare, ShareRecovery {
   readonly kind: ShareKind;
 
-  readonly #signal: SignalClientLike;
+  readonly #signal: PublisherSignal;
   readonly #publisher: PublisherPC;
   readonly #store: ShareStore | null;
   readonly #log: Logger;
@@ -154,7 +183,8 @@ export class BrowserShare implements ActiveShare {
   /** Per stream of the stats: the bytes sent and the time of the previous sample, for the bitrate. */
   readonly #sent = new Map<string, { bytes: number; at: number }>();
 
-  readonly #shareId: string;
+  /** The id the server knows the share by: share.start's, then each re-publish's (01 §10.6). */
+  #shareId: string;
   #params: ShareParams | null;
   #preset: Preset;
   #state: LocalShareState = 'starting';
@@ -166,6 +196,12 @@ export class BrowserShare implements ActiveShare {
   #serverError: unknown;
   /** Ends the wait for a late error (see END_NOTICE_GRACE_MS). */
   #wake: (() => void) | null = null;
+  /** The capture hold: runs while signaling isn't ready (01 §10.6). */
+  #holdTimer: ReturnType<typeof setTimeout> | undefined;
+  /** The re-publish under way, if any: there is one at a time. */
+  #republishing: Promise<void> | null = null;
+  /** The ref of a re-publish's share.start whose answer was lost with the socket (01 §10.5: retried as it was). */
+  #lostRef: string | null = null;
 
   constructor(deps: BrowserShareDeps) {
     this.kind = deps.src.kind;
@@ -182,7 +218,7 @@ export class BrowserShare implements ActiveShare {
     this.#preview = deps.src.preview;
   }
 
-  /** The share's id on the server. (It changes on a re-publish with `replaces`, 01 §10.6: the recovery slice.) */
+  /** The share's id on the server. It changes on a re-publish with `replaces` (01 §10.6), with a `state` event. */
   get shareId(): string {
     return this.#shareId;
   }
@@ -254,21 +290,40 @@ export class BrowserShare implements ActiveShare {
       clearInterval(timer);
     });
 
+    // The capture hold (01 §10.6): the clock runs while signaling isn't ready.
+    const offSignal = this.#signal.onState?.((state) => {
+      this.#followSignal(state);
+    });
+    this.#offs.push(() => {
+      offSignal?.();
+      clearTimeout(this.#holdTimer);
+      this.#holdTimer = undefined;
+    });
+    if (this.#signal.state !== undefined) this.#followSignal(this.#signal.state);
+
     // "Stop sharing" may have been pressed while the share was being set up; no event comes for that any more.
     if (videoTracks.some((t) => t.readyState === 'ended')) browserStopped();
   }
 
   // ---- What BrowserSharing routes here ----
 
-  /** A room.state of the share's room: `starting` → `live` once the server lists the share as live (05 §13.1). */
+  /**
+   * A room.state of the share's room: `starting` → `live` once the server lists the share as live (05 §13.1), and a
+   * re-published share that is `reconnecting` on a pub PC that stayed connected → `live` the same way.
+   */
   roomState(s: RoomState): void {
-    if (this.#ending !== null || this.#state !== 'starting' || s.roomId !== this.#roomId) return;
+    if (this.#ending !== null || s.roomId !== this.#roomId) return;
+    if (this.#state !== 'starting' && this.#state !== 'reconnecting') return;
     const info = s.shares.find((x) => x.id === this.#shareId);
     // live, stalled (it was live before), or a status this build doesn't know (01: treat it as live).
     if (info === undefined || info.status === ShareStatusStarting) return;
-    this.#setState('live');
     const pub = this.#publisher.state;
-    if (pub === 'reconnecting' || pub === 'unreachable') this.#setState('reconnecting');
+    if (this.#state === 'starting') {
+      this.#setState('live');
+      if (pub === 'reconnecting' || pub === 'unreachable') this.#setState('reconnecting');
+    } else if (pub === 'connected' && this.#republishing === null) {
+      this.#setState('live');
+    }
   }
 
   /**
@@ -392,6 +447,34 @@ export class BrowserShare implements ActiveShare {
     }
   }
 
+  /**
+   * After a welcome, once the session is in the share's room again (01 §10.5). ctx.kept: the server still has the
+   * share's pub PC, which re-sends its offer and restarts ICE by itself (PublisherPC); a share the server lost
+   * meanwhile comes back through republish(). Not kept: the server has neither the share nor a pub PC, so the share
+   * is published again (01 §10.6): share.start {replaces: its id, ref: new}, then its tracks on a new pub PC of
+   * gen 1. It resolves once that offer is out, or once the share has given up: it never rejects.
+   */
+  resync(ctx: ShareResyncContext): Promise<void> {
+    if (this.#ending !== null || ctx.kept) return Promise.resolve();
+    // A re-publish of the connection before is still settling: this one follows it, on what it left.
+    const previous = this.#republishing;
+    if (previous !== null) return previous.then(() => this.resync(ctx));
+    // A share.start that was cut off on the connection before means nothing to this one.
+    this.#lostRef = null;
+    this.#publisher.forgetServer(ctx.welcome);
+    return this.#publishAgain();
+  }
+
+  /**
+   * The first room.state after a resumed welcome doesn't list the share: it ended while the socket was down. The
+   * share is published again (01 §10.5): share.start {replaces: its id}, with the ref of an attempt whose answer was
+   * lost if there was one, then its tracks under the new id on a new pub PC (gen + 1). Never rejects.
+   */
+  republish(): Promise<void> {
+    if (this.#ending !== null) return Promise.resolve();
+    return this.#publishAgain();
+  }
+
   // ---- Internals ----
 
   /** Whether the share is ending or has ended. */
@@ -431,6 +514,90 @@ export class BrowserShare implements ActiveShare {
     }
   }
 
+  /**
+   * The capture hold (01 §10.6): a share whose connection isn't ready keeps its capture for CAPTURE_HOLD_MS, then
+   * ends with "Sharing stopped: the server was unreachable". Every `ready` ends the wait, and the next drop starts a
+   * new one.
+   */
+  #followSignal(state: SignalState): void {
+    if (this.#ending !== null) return;
+    if (state === 'ready') {
+      clearTimeout(this.#holdTimer);
+      this.#holdTimer = undefined;
+      return;
+    }
+    this.#holdTimer ??= setTimeout(() => {
+      this.#holdTimer = undefined;
+      this.#log.info('no connection to the server for the whole capture hold: stopping the share');
+      // Nothing can be sent: a resumed connection stops the server's share then (the session's reconcile), and a
+      // new one never had it.
+      void this.#end('server-unreachable', false, { error: new ShareEndedError('unreachable') });
+    }, CAPTURE_HOLD_MS);
+  }
+
+  /** Publishes the share again under a new id (01 §10.6): one re-publish at a time, which never rejects. */
+  #publishAgain(): Promise<void> {
+    this.#republishing ??= this.#runPublishAgain().finally(() => {
+      this.#republishing = null;
+    });
+    return this.#republishing;
+  }
+
+  async #runPublishAgain(): Promise<void> {
+    const oldId = this.#shareId;
+    const stream = this.#src.preview;
+    if (!stream.getVideoTracks().some((t) => t.readyState !== 'ended')) {
+      // The capture ended while the server was away: there is nothing to publish, and nothing to tell the server.
+      this.#log.info('the capture ended while the server was away: the share is not published again');
+      await this.#end('browser-stopped', false, {});
+      return;
+    }
+    if (this.#state === 'live') this.#setState('reconnecting');
+    const ref = this.#lostRef ?? newRef();
+    let params: ShareParams;
+    try {
+      params = await this.#signal.request(MessageTypeShareStart, {
+        kind: this.kind,
+        preset: this.#preset,
+        audio: stream.getAudioTracks().some((t) => t.readyState !== 'ended'),
+        ref,
+        replaces: oldId,
+      });
+    } catch (err) {
+      if (this.#over()) return;
+      if (isConnectionLost(err)) {
+        // The server may have made the share: the next welcome that keeps the connection asks again with this ref.
+        this.#lostRef = ref;
+        this.#log.info('the re-publish lost its connection: it goes again after the next welcome');
+        return;
+      }
+      this.#log.warn('the share could not be published again', { err });
+      await this.#end('error', false, { error: err });
+      return;
+    }
+    this.#lostRef = null;
+    if (this.#over()) {
+      // Stopped meanwhile (the Stop button, the capture): the server has the new share now, so it is stopped there.
+      this.#signal.request(MessageTypeShareStop, { shareId: params.shareId }).catch((err: unknown) => {
+        if (!isConnectionLost(err)) this.#log.warn('share.stop of the re-published share failed', { err });
+      });
+      return;
+    }
+    this.#log.info('the share is published again', { codec: params.codec });
+    this.#shareId = params.shareId;
+    this.#params = params;
+    this.#store?.getState().report({ params });
+    // A new id is a change of the share (05 §8: watch 'state'): the page's preview and watchers follow it.
+    this.#emitter.emit('state', this.#state);
+    try {
+      await this.#publisher.republish(oldId, params);
+    } catch (err) {
+      if (this.#over()) return;
+      this.#log.warn('the re-published share could not be put on the pub PC', { err });
+      await this.#end('error', true, { error: err });
+    }
+  }
+
   #end(reason: LocalEndReason, tellServer: boolean, outcome: ShareOutcome, lateError = false): Promise<void> {
     if (this.#ending === null) {
       let done!: () => void;
@@ -459,8 +626,7 @@ export class BrowserShare implements ActiveShare {
           () => undefined,
           (err: unknown) => {
             // Without a connection the server ends the share itself, or the session stops it after the resume.
-            const lost = isProtocolError(err) && err.local && err.code === LocalErrorCodeConnectionLost;
-            if (!lost) this.#log.warn('share.stop failed', { err });
+            if (!isConnectionLost(err)) this.#log.warn('share.stop failed', { err });
           },
         )
       : Promise.resolve();

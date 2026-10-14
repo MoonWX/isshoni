@@ -5,11 +5,12 @@
 import { describe, expectTypeOf, it } from 'vitest';
 
 import type { SignalClient } from '../protocol/signal-client';
+import type { BrowserShare } from '../share/BrowserShare';
 import type { StartShare } from '../share/shareStore';
 import type { attachViewer, syncRoom } from '../viewer/services';
 import type { SubscriberDeps as SubscriberPCDeps, SubscriberPC } from '../viewer/SubscriberPC';
 import type { createWatchToast } from '../viewer/watchToast';
-import type { RoomEventTap, RoomSession, SessionMedia, SubscriberDeps } from './RoomSession';
+import type { RoomEventTap, RoomSession, SessionMedia, ShareRecovery, SubscriberDeps } from './RoomSession';
 import type { RoomStoreState } from './roomStore';
 
 describe('seams of the room session', () => {
@@ -23,6 +24,10 @@ describe('seams of the room session', () => {
 
   it("the session's startShare is a ShareButton's onStart (05 §11.1, §13.1)", () => {
     expectTypeOf<RoomSession['startShare']>().toExtend<StartShare>();
+  });
+
+  it("share/'s BrowserShare takes the whole ShareRecovery seam: it follows reconnects (01 §10.5, §10.6)", () => {
+    expectTypeOf<BrowserShare>().toExtend<Required<ShareRecovery>>();
   });
 
   it("viewer/'s watch toast is a room.event tap of the session (05 §12.2)", () => {

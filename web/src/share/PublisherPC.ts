@@ -32,8 +32,15 @@
 //   one, and one that is still connecting although its offer was answered. (One whose offer is outstanding waits for
 //   the answer to the offer that just went out again; a failed one is rebuilt.) After a welcome that was not resumed
 //   the server has no pub PC and gen starts at 1 again, whether a PC exists here at that moment or not: the local PC
-//   is dropped without a message, and the shares stay known here, parked, until they are removed or published again
-//   (the recovery slice).
+//   is dropped without a message, and the shares stay known here, parked, until they are removed or published again.
+//   forgetServer() does the same for a resumed welcome after which the server has no pub PC either (a room.join gave
+//   the connection a new MediaPeer: the room session knows, and the share's resync says so).
+// - Publishing a share again (01 §10.6): republish() moves a share to the id that share.start {replaces} gave it,
+//   always on a new PC: gen + 1 when there is one, which carries every share again like a rebuild, or gen 1 after one
+//   of the welcomes above. Not with new transceivers on the current PC: stopping the old ones rejects the first
+//   m-section, the BUNDLE group's tag, and Chrome then moves the group to a new transport (new ICE credentials in
+//   the re-offer), which the SFU's PC doesn't follow: in reconnect.spec (d) it went back to `connecting` and failed
+//   20 s later.
 // - sdp_invalid or bad_request about this PC, or an offer or answer that can't be applied here: one rebuild; a second
 //   failure within 60 s ends it: state 'failed' (01 §9 rule 8), and whoever owns the shares ends them.
 // - close() closes the PC on purpose and says so: pc.close {pc: 'pub', gen} (01 §9 rule 10).
@@ -68,6 +75,7 @@ import {
   type Preset,
   type ShareParams,
   type TrackRef,
+  type Welcome,
 } from '../protocol/types.gen';
 import { audioCodecPreferences, videoCodecPreferences } from './codecPrefs';
 import { applyEncodings, buildSendEncodings, buildSingleEncoding, needsRescale, sourceSize } from './encodings';
@@ -270,6 +278,8 @@ export class PublisherPC {
   #announced = false;
   /** A pc.close that couldn't be sent; it goes out on the next resumed `ready`. */
   #unsentClose: PCClose | null = null;
+  /** The welcome after which the server last had no pub PC of this connection (forgetServer: once per welcome). */
+  #forgotten: Welcome | undefined;
   #remoteCandidates: BufferedCandidate[] = [];
   /** Local candidates that couldn't be sent yet. */
   #localCandidates: PCICE[] = [];
@@ -442,6 +452,70 @@ export class PublisherPC {
   }
 
   // later (M2): setPaused(shareId: string, paused: boolean): Promise<void>;
+
+  /**
+   * Publishes a share again under the id that share.start {replaces} gave it (01 §10.6): the same tracks and preset,
+   * the new shareId and its ShareParams, on a new PC (see the header for why never on the current one). With a
+   * current PC (the server kept the connection's media and lost only the share) the new PC replaces it like a
+   * rebuild: gen + 1, every share attached again, the others under the ids they have, and its first offer; the
+   * server replaces its PC on the higher gen (01 §9 rule 2). Without one (after a welcome that was not resumed, or
+   * forgetServer()) it is the connection's first: gen 1. The share keeps its place among the shares.
+   *
+   * It resolves like addShare, and rejects with LocalError `webrtc_failed` with nothing of the share left on the PC:
+   * also for a share this PC doesn't know (it was removed meanwhile).
+   */
+  republish(oldId: string, params: ShareParams): Promise<void> {
+    return this.#enqueue(async () => {
+      const old = this.#shares.get(oldId);
+      if (old === undefined) {
+        throw new LocalError('webrtc_failed', { cause: new Error(`PublisherPC: share ${oldId} is not published`) });
+      }
+      if (this.#fatal) throw new LocalError('webrtc_failed');
+      const share: PublishedShare = {
+        ...old,
+        shareId: params.shareId,
+        params,
+        codec: params.codec,
+        videoTx: null,
+        audioTx: null,
+      };
+      const order = [...this.#shares.entries()];
+      // The shares on the current PC go onto the new one with it. Parked ones (a welcome that was not resumed) wait
+      // for their own re-publish: the new connection doesn't know their ids.
+      const carried = new Set(order.filter(([id, s]) => id !== oldId && s.videoTx !== null).map(([, s]) => s));
+      this.#shares.clear();
+      for (const [id, s] of order) {
+        if (id === oldId) this.#shares.set(share.shareId, share);
+        else this.#shares.set(id, s);
+      }
+      // The old PC goes, with the old share's transceivers; the server drops its side on the new PC's higher gen.
+      this.#teardownPc();
+      const pc = this.#createPc();
+      this.#log.info('publishing a share again on a new pub PC', { gen: this.#gen });
+      try {
+        for (const s of this.#shares.values()) if (s === share || carried.has(s)) await this.#attach(pc, s);
+        await this.#negotiate(pc);
+      } catch (err) {
+        await this.#dropFailedShare(pc, share);
+        throw err instanceof LocalError ? err : new LocalError('webrtc_failed', { cause: err });
+      }
+    });
+  }
+
+  /**
+   * The server has no pub PC of this connection anymore, and gen starts at 1 again (01 §9 rule 2, §10.5): the PC
+   * does this by itself after a welcome that was not resumed; a share's resync calls it after a resumed welcome that
+   * still needed a room.join, which gave the connection a new MediaPeer (01 §8.4). The local PC is dropped without a
+   * message, and the shares stay known, parked, until they are removed or published again (republish).
+   *
+   * Once per welcome: every share of the connection calls it, and a PC that the first one's re-publish made since
+   * belongs to the new connection.
+   */
+  forgetServer(welcome: Welcome): void {
+    if (this.#forgotten === welcome) return;
+    this.#forgotten = welcome;
+    this.#dropServerPc();
+  }
 
   /**
    * Takes a pc.answer {pc: 'pub'}. Only the answer to the outstanding offer is applied; any other gen or neg is
@@ -702,6 +776,18 @@ export class PublisherPC {
     this.#fatal = false;
     if (this.#sizeTimer !== undefined) clearInterval(this.#sizeTimer);
     this.#sizeTimer = undefined;
+  }
+
+  /** The server has no pub PC of this connection: drop the local one without a message; the next PC has gen 1. */
+  #dropServerPc(): void {
+    this.#unsentClose = null;
+    this.#announced = false;
+    if (this.#pc) this.#log.info('the server has no pub PC of this connection anymore: dropping it');
+    this.#teardownPc();
+    this.#resetRecovery();
+    this.#gen = 1;
+    this.#made = false;
+    this.#updateState();
   }
 
   // ---- A share's transceivers ----
@@ -1041,14 +1127,10 @@ export class PublisherPC {
     if (state !== 'ready') return;
     if (info.resumed === false) {
       // A new connection: the server has neither the shares nor a pub PC, and gen starts at 1 again (01 §9 rule 2).
-      this.#unsentClose = null;
-      this.#announced = false;
-      if (this.#pc) this.#log.info('the connection was not resumed: dropping the pub PC');
-      this.#teardownPc();
-      this.#resetRecovery();
-      this.#gen = 1;
-      this.#made = false;
-      this.#updateState();
+      // The share's resync, which follows, finds this welcome forgotten already.
+      const welcome = this.#signal.welcome;
+      if (welcome !== undefined) this.forgetServer(welcome);
+      else this.#dropServerPc();
       return;
     }
     if (this.#unsentClose !== null && this.#signal.notify(MessageTypePCClose, this.#unsentClose)) {

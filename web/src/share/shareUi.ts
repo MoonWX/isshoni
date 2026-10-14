@@ -52,12 +52,19 @@ export function linkShareUi(store: ShareStore, ui: UiStore): void {
 }
 
 /**
- * The message for the error of a failed share (shareStore.error): the texts of a share the server ended (05 §13.1),
- * else the error's own (errors.<code>, errors.local.<code>).
+ * The message for the error of a failed share (shareStore.error): the texts of a share the server ended (05 §13.1)
+ * or that the capture hold ended (01 §10.6), else the error's own (errors.<code>, errors.local.<code>).
  */
 export function shareErrorMessage(err: unknown, t: TFunction = i18n.t): string {
   if (err instanceof ShareEndedError) {
-    return err.kind === 'media_timeout' ? t('share.ended.mediaTimeout') : t('share.ended.generic');
+    switch (err.kind) {
+      case 'media_timeout':
+        return t('share.ended.mediaTimeout');
+      case 'unreachable':
+        return t('share.ended.unreachable');
+      case 'server':
+        return t('share.ended.generic');
+    }
   }
   return errorMessage(err, t);
 }
