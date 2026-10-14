@@ -971,4 +971,8 @@ main() {
   [ "$FAILED" -eq 0 ]
 }
 
-main "$@"
+# deploy/test/vm/vm-test.sh sources this file for its helpers, the test releases, relserve and the scenarios, and
+# sets DISTRO_TEST_LIB=1 first: then main does not run, and nothing above it has started anything.
+if [ "${DISTRO_TEST_LIB-}" != 1 ]; then
+  main "$@"
+fi
