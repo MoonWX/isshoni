@@ -622,3 +622,65 @@ func TestDecoderUnavailable(t *testing.T) {
 		checkVideo(t, "video on the new sub PC", seen.Packets())
 	})
 }
+
+// TestDecoderCapsOfClosedSubPC: caps that gain H.264 don't rebuild a sub PC that is closed (02 §5.3: it stays closed
+// until the client's next request). Its successor is one the client caused, which counts toward the limit on PC
+// creations (02 §12), so a client can't get uncounted PCs by closing its sub PC and toggling its caps. The request
+// that builds the successor (Resync here) gets one with the video, as the caps stand then.
+func TestDecoderCapsOfClosedSubPC(t *testing.T) {
+	h := newHarness(t, sfutest.HarnessOptions{})
+	ctx := testCtx(t)
+	video, audio := webrtc.RTPCodecTypeVideo, webrtc.RTPCodecTypeAudio
+	const share = sfu.ShareID("s_closed")
+	pubConn, _ := join(t, h, "alice", "c-pub", sfu.RoleFull)
+	startShare(t, pubConn, share, sfu.PresetAuto)
+
+	// A fresh Firefox, which nobody answers for: a PC needs no answer to be closed or rebuilt.
+	c, sig := joinDecoding(t, h, "dan", "c-fresh", sfu.RoleViewer)
+	subscribe(t, c, sfu.SubscriptionUpdate{Share: share, Video: sfu.QualityHigh, Audio: true})
+	first, err := sig.WaitOffer(ctx, func(o sfutest.Offer) bool { return o.Gen == 1 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Tracks) != 1 || first.Tracks[0].Kind != audio {
+		t.Fatalf("the offer to a viewer without H.264 carries %+v, want its audio alone", first.Tracks)
+	}
+	if err := c.ClosePC(ctx, sfu.PCSub, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	// The caps gain H.264 and lose it again, more often than the limit allows PCs in a minute: no PC is built.
+	h264 := sfu.DecodeCaps{H264: []sfu.ProfileKey{sfu.ProfileConstrainedBaseline}}
+	for i := range 2*sfu.MaxPCCreations + 1 {
+		caps := h264
+		if i%2 == 1 {
+			caps = sfu.DecodeCaps{}
+		}
+		if err := c.SetDecodeCaps(ctx, caps); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(300 * time.Millisecond) // six debounce periods
+	if n := len(sig.Offers()); n != 1 {
+		t.Errorf("%d sub offers after caps changes on a closed sub PC, want only the first", n)
+	}
+	if st := pcOf(t, c, sfu.PCSub); st.Gen != 1 || !st.Closed {
+		t.Errorf("the sub PC after caps changes = %+v, want gen 1, closed, until the client asks", st)
+	}
+
+	// The client's next request builds the successor, with the video the caps allow now.
+	c.Resync()
+	next, err := sig.WaitOffer(ctx, func(o sfutest.Offer) bool { return o.Gen == 2 })
+	if err != nil {
+		t.Fatalf("no successor of the closed sub PC after Resync: %v (offers %+v)", err, sig.Offers())
+	}
+	wantTracks := []sfu.TrackBinding{{MID: "0", Share: share, Kind: video}, {MID: "1", Share: share, Kind: audio}}
+	if next.Neg != 1 || !slices.Equal(next.Tracks, wantTracks) {
+		t.Errorf("the successor's offer: neg %d, tracks %+v; want neg 1 and %+v", next.Neg, next.Tracks, wantTracks)
+	}
+	for _, ev := range sig.Events() {
+		if e, ok := ev.(sfu.ErrorEvent); ok {
+			t.Errorf("the viewer got %+v", e)
+		}
+	}
+}

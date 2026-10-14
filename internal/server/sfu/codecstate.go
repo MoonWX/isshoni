@@ -52,7 +52,9 @@ type decoderState struct {
 //   - a viewer that gains H.264, or whose video is held by the codec now (no decoder, a refused answer,
 //     decoder_failed, or a stream in a profile its sub PC negotiated no payload type for), gets a new sub PC with
 //     every DownTrack at once. It is the SFU's own rebuild, which the limit on PC creations doesn't count. A Conn
-//     without subscriptions keeps its sub PC until the next subscription, which then rebuilds it;
+//     without subscriptions keeps its sub PC until the next subscription, which then rebuilds it. A sub PC that is
+//     closed stays closed until the client's next request (02 §5.3), whose successor counts toward the limit
+//     (02 §12) and carries the video;
 //   - the guard's retries start again: decoder_failed holds only until the next SetDecodeCaps.
 //
 // The same profiles again, in whatever order, change nothing: a caps.update about something else than decoding
@@ -194,16 +196,18 @@ func (c *Conn) codecRetryDue() {
 	c.codecRebuild("the viewer refused H.264")
 }
 
-// codecRebuild gives the Conn a new sub PC for the viewer's decoders (rebuildSub, from any state but the closed one
-// without subscriptions): the SFU's own rebuild, which isn't counted toward the PC creation limit (02 §12). Without
-// subscriptions there is nothing to offer; a sub PC that is open is then rebuilt by the next subscription (stale).
-// A failure reaches the client as an ErrorEvent about the sub PC, like any rebuild that no call returns.
+// codecRebuild gives the Conn's open sub PC a successor for the viewer's decoders (rebuildSub): the SFU's own
+// rebuild, which isn't counted toward the PC creation limit (02 §12). A closed sub PC stays closed until the client's
+// next request (02 §5.3): its successor is one the client caused, which rebuildClosedSub counts, and it carries the
+// video as the caps stand then (carries). Without subscriptions there is nothing to offer; the open sub PC is then
+// rebuilt by the next subscription (stale). A failure reaches the client as an ErrorEvent about the sub PC, like any
+// rebuild that no call returns.
 func (c *Conn) codecRebuild(cause string) {
 	switch {
-	case c.sub == nil:
+	case c.sub == nil, c.sub.closed:
 		return
 	case len(c.subs) == 0:
-		c.codec.stale = !c.sub.closed
+		c.codec.stale = true
 		return
 	}
 	if err := c.rebuildSub(cause); err != nil {

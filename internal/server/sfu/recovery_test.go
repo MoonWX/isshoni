@@ -472,11 +472,20 @@ func TestPubPCRebuild(t *testing.T) {
 			sfu.SubscriptionStateEvent{Share: share, Requested: sfu.QualityLow, Forwarded: sfu.QualityLow}},
 	} {
 		resumed, old := waitResumed(t, ctx, v.rec, v.mark, v.rid, 15)
-		for _, f := range sfutest.Frames(sfutest.WithoutPartialTail(resumed)) {
-			if !f.HasMark || f.Mark.RID != v.rid {
-				t.Errorf("%s got a frame of layer %q after the rebuild, want %s", v.name, f.Mark.RID, v.rid)
+		// The new PC's layers attach in the order their first packets arrive, which a loaded machine may spread
+		// apart: a viewer of f gets q for as long as that is all the share has (02 §10.1), and f from its first
+		// frame on, never q again.
+		frames := sfutest.Frames(sfutest.WithoutPartialTail(resumed))
+		first := slices.IndexFunc(frames, func(f sfutest.Frame) bool { return f.HasMark && f.Mark.RID == v.rid })
+		for i, f := range frames {
+			if !f.HasMark || (f.Mark.RID != v.rid && (i > first || f.Mark.RID != "q")) {
+				t.Errorf("%s got a frame of layer %q after the rebuild (frame %d, the first of %s is %d), want %s",
+					v.name, f.Mark.RID, i, v.rid, first, v.rid)
 				break
 			}
+		}
+		if first > 0 {
+			t.Logf("%s: %d frames of q before f, while q was all the new PC had", v.name, first)
 		}
 		// One stream through the rebuild: the new PC's packets follow the old one's without a gap in the viewer's
 		// sequence numbers, and the timestamps go on.

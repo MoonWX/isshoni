@@ -57,6 +57,9 @@
 //   - Share.notify is outside that order: it only puts a share's RoomEvents calls in order (every ShareUpdated before
 //     the ShareEnded, and nothing after it). The ticker and SFU.endShare hold it across those calls, which never
 //     block, take Share.mu inside it, and hold no other lock when they take it.
+//   - Room.policyMu is outside that order too: it only puts a room's codec policy changes and their reports in
+//     order. SFU.updateCodecPolicy holds it across CodecPolicyChanged and the posts of the CodecPolicyEvents (which
+//     never block), takes Room.mu inside it, and holds no other lock when it takes it.
 //   - A Conn's PCs, subscriptions, negotiation state and candidate buffers belong to its actor and have no lock.
 //   - Which layer a DownTrack forwards is chosen with Share.mu and then DownTrack.mu held (02 §10.1): by the
 //     subscriber's actor when the request changes, and by whoever attaches or detaches a layer of the share, before
@@ -211,7 +214,8 @@
 //     subscription's state, a CodecPolicyEvent per share the Conn publishes. It ICE-restarts a sub PC that isn't
 //     connected and rebuilds one that has closed.
 //   - The SFU's only rebuilds of its own are for a viewer's decoders (codecstate.go, 02 §8.5): when its caps gain
-//     H.264, and the guard's retries.
+//     H.264, and the guard's retries. Neither touches a closed sub PC, which waits for the client's request all the
+//     same, so its successor is always counted (below).
 //
 // The guards of 02 §12 that live here:
 //   - One pub and one sub PC per Conn: an offer for a third is sfu.pc_limit; a second of one kind can't be asked
