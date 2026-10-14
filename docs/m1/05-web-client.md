@@ -1015,6 +1015,10 @@ background (about a minute), and that Firefox decodes only Constrained Baseline 
   changes, it sends `caps.update {caps}`; the server rebuilds the sub PC (`gen + 1`), and video starts.
 - The client sends no `pc.restart` for codecs. For a Firefox that lists H.264 before it can use it, the server
   rebuilds the sub PC itself every 20 s, at most 9 times (02 §8.5); the client just answers the new offers.
+- **A known M1 limit** (README §6 "Decided after group 9" (4); 02 §8.5): after those 9 rebuilds the server reports
+  `decoder_failed`, and only a caps change or a reload starts its retries again. A Firefox that listed H.264 in its
+  first `hello` already and whose download outlasts the 3 minutes sends no `caps.update` when the download ends
+  (its H.264 list doesn't change), so it needs the reload that the 3-minute hint below asks for.
 - After 3 minutes: "Firefox hasn't got its video decoder yet. Reload the page. If that doesn't help, open Settings →
   Extensions & Themes → Plugins and check that 'OpenH264 Video Codec provided by Cisco Systems, Inc.' is enabled, or
   use Chrome or Edge."
@@ -1288,6 +1292,16 @@ and Stop stay in view. Measured by S66 with both people sharing and the settings
 stage is 77 px with its controls inside it, at 683×600 121 px, at 360×640 130 px; the strip ends above the bar,
 and nothing scrolls.
 
+**A list of tiles at its start stays at its start** (README S72, found by `layers.spec`; `useListStart` in
+`ViewerLayout.tsx`). The list is newest first, so the share that leaves the stage for a newer one comes in at the
+list's start. A browser re-snaps a scroll-snapped strip to the tile it was snapped to, which is one tile further on
+now: the share the friend just watched would be out of view, and the layer policy would turn its video off (§12.4
+rule 6). So a list that was at its start when the user last scrolled it (and a list that was just mounted) is put
+back at its start after its tiles changed, before the browser paints; a list the user scrolled keeps the tile they
+scrolled to. It holds for the strip (`scrollLeft`; in a right-to-left list it counts down from 0, so its absolute
+value is read), the right column (`scrollTop`) and the phone's sheet. `ViewerLayout.test.tsx` checks both cases
+with a list that re-snaps the way a browser does.
+
 ### 12.2 Focus
 
 - **Auto-focus** (plan: "the most recent share is focused automatically"): while `focusMode === 'auto'`, the stage shows
@@ -1341,6 +1355,37 @@ and nothing scrolls.
   focus; the stage then shows a muted-speaker indicator. Exactly one share is audible at a time.
 - Each change is **one** `subscribe.update` with all affected shares, so the server stops the old audio and starts the
   new one in the same step (01 §8.9).
+
+**A share without sound never takes the sound** (README S72; `autoFocus.ts`, `viewerStore.ts`, `AudioControls.tsx`).
+- `FocusState.audibleShareId` is never a share whose `ShareInfo.audio` is false. Focus on such a share, automatic or
+  picked, leaves nothing heard: "audio follows focus" taken literally. The stage then offers no Mute and no volume,
+  the M key does nothing (§12.7), and no audio is asked for (§12.4 rule 1). The tile of a share without sound has
+  no speaker button, and `setAudible` refuses it. The rule for one's own share is unchanged: a pick of it moves the
+  stage and leaves the sound where it was (§12.2). Before S72 the audible id pointed at the silent share, so the
+  page was silent already; the fix keeps that, and removes the wrong id and the Mute button that muted nothing.
+- **`ShareInfo.audio` is the current state, not a promise** (01 §8.5): the server sets it from whether the share's
+  audio layer is attached now. It is false for a share made without sound, but for a while also for one that has
+  sound: at its first live, when the first video keyframe beats the first audio packet, and while its sharer's pub
+  PC is rebuilt. Treated as final, it would lose the sound such a share is owed for good. So the reducer has two
+  steps:
+  1. **The rules** (this section's and §12.2's) give the sound as if every share had one, starting from the share
+     the sound belongs to: the one owed it, while there is one.
+  2. **The settle step** (`settleSound`) turns that into what is heard: the share the rules chose, when it has
+     sound. One without sound is **owed** it (`FocusState.soundDue`), and meanwhile the stage's share is heard when
+     it is someone else's and has sound, else nothing: nothing when the owed share is on the stage, the stage's
+     sound when it is another tile (one that went quiet after its speaker button chose it). The owed share is heard
+     the moment its audio arrives (the next `room.state` with `audio: true`), unless the rules gave the sound
+     elsewhere in between: a pick, the speaker button (`setAudible` clears `soundDue`, and also the sound
+     remembered for a re-publish, §12.2), a focus change that the sound follows, or its end.
+- The speaker button pressed on the tile that is heard gives the sound back to the stage (`toggleAudible`). A
+  stage without sound now is then owed it, as when the focus moved to it: nothing is heard until its audio
+  arrives.
+- `autoFocus.test.ts` holds the rules and the settle step, the two cases of the review included: a speaker-button
+  choice that survives its share's audio going away and coming back, and a re-published share whose first live has
+  no audio yet, which gets the sound when its audio comes.
+- **Open, for the owner** (README §6 "Decided after group 9"): when the focused share has no sound, nothing from
+  the stage is heard. The alternative is to keep the previous share's sound playing until a share with sound is
+  focused. Until the owner answers, the rule above stands and the code stays as README S72 built it (§24).
 
 ### 12.4 Layer policy
 
@@ -1403,6 +1448,8 @@ and after every change of something the policy reads.
   - Without `IntersectionObserver` (an old browser, a test DOM) nothing ever says otherwise: an element is shown
     while it is in the document.
   - The phone's "Shares" sheet renders its tiles only while it is open, so tiles that nobody sees don't count.
+  - A tile that comes in at the start of a list that was at its start is in view: the list stays at its start
+    (§12.1, README S72), so the share that left the stage for a newer one goes on at `low` instead of `off`.
 - **`focused`** is the stage's share only while the stage shows it. Away from the room page nothing is mounted,
   so the focused share is one more share that nobody sees: every video goes off and the audible share keeps
   playing (§11.1).
@@ -1472,7 +1519,7 @@ pseudo-fullscreen and the keyboard, and nothing else.
     `document.pictureInPictureEnabled` and not iOS (§8; an iPad that calls itself a Mac counts as iOS). That is
     the desktop browsers, and it is also **Android Chrome**, which reports PiP too, where the rule above says
     "desktop only". Whether Android keeps the button is an **open question for the owner** (asked after group 6,
-    still open after groups 7 and 8): the rule above stands as written, the code stays as built until the
+    still open after groups 7, 8 and 9): the rule above stands as written, the code stays as built until the
     answer, and the manual matrix row M-AND-1 (§19.4) is where it shows. iOS is not part of the question: no PiP
     there in M1.
 - **Wake lock.** `platform.requestWakeLock()` is the browser's side (§8) and answers `null` where the API is
@@ -1570,7 +1617,8 @@ handlers and listens on the document while it is mounted; `ShortcutsDialog.tsx`)
 - **The roving tab stop** is the tile that had the keyboard focus last, whichever of its controls had it (the eye
   and the speaker button count), else the first tile. A pick made from a focused tile moves the focus to the tile
   of the share that left the stage, so Enter swaps the two back; after a click or a tap the list stays where the
-  user scrolled it, and only the keyboard's focus is scrolled into view.
+  user scrolled it, and only the keyboard's focus is scrolled into view. A list at its start stays at its start
+  when a tile comes in at its front (§12.1, README S72).
 
 ### 12.8 Mobile and iOS limits
 
@@ -2880,7 +2928,8 @@ covered in Go (04 §17, a `servertest` case with TLS).
 
 CI runs Chrome stable headful under `xvfb-run` with a PulseAudio null sink (06's `e2e` job). Chrome flags:
 `--auto-select-tab-capture-source-by-title=isshoni-e2e-tone`, `--allow-loopback-in-peer-connection`, and
-`--autoplay-policy=no-user-gesture-required` except in the unmute spec.
+`--autoplay-policy=no-user-gesture-required` except in the unmute spec, which sets
+`--autoplay-policy=document-user-activation-required` instead (README S72, below).
 
 **The harness as README S61 built it** (`web/playwright.config.ts`, `web/e2e/fixtures.ts`, `stats.ts`,
 `smoke.spec.ts`; the CI job is 06 §8.2). What the paragraphs above leave open:
@@ -2976,7 +3025,9 @@ real picker) brings the page to the front before the second click.
 **Capture source**: `e2e/tone.html` (served through `context.route`, title `isshoni-e2e-tone`) draws an animated canvas
 with a frame counter and plays a 1 kHz WebAudio tone. The sharer opens it in its own context and clicks the real
 **Share** button; Chrome auto-selects that tab (plan CI item). S4 finding 7 (headless Chrome can't auto-accept a
-picker) is why CI runs headful. For local headless runs, and for whole-screen cases, the fake-display seam is used:
+picker) is why CI runs headful. `focus-audio`, `unmute` and `layers.spec` share through the fake display in CI too
+(README S72, below): the tone tab is for the specs of the real picker (`watch`, and `warning` when headful).
+For local headless runs, and for whole-screen cases, the fake-display seam is used:
 when `sessionStorage['isshoni.e2e.fakeDisplay']` is set **and** the host is `localhost` or `127.0.0.1`,
 `displayMedia.ts` skips `getDisplayMedia` and returns a canvas + WebAudio stream, reporting `displaySurface` from the
 value (`browser`, `window`, `monitor`, `monitor+audio`; `1` means `browser` with audio) to `classify.ts`.
@@ -3020,6 +3071,37 @@ text above leaves something open:
   uses the worker's server and asserts only what holds with other people in the lounge. Every Share click brings
   its page to the front first (above), and the tests named "headful:" are skipped in a headless run.
 
+**The specs as README S72 built them** (`focus-audio`, `unmute` and `layers.spec.ts`; a server per test, since
+each says what a whole room shows), where the text above leaves something open:
+- **They share through the fake display, in CI too**, not the tone tab: they are about what a viewer does with
+  several shares, and the real picker's tab capture is `watch.spec`'s. That also keeps them clear of the picker's
+  flakiness under Xvfb and of Chrome's flag picking one tab per pick for two to four sharers.
+- **Every script that Playwright runs in a page gives it a user activation**: `page.evaluate`, the queries behind
+  a locator (`isVisible` included), and the DOM snapshots of a trace, which Playwright takes around every action.
+  The activation is sticky, so a page that a spec has read in any of these ways may play sound, and a spec of the
+  autoplay rule passes without testing it. Signing in over REST, `page.goto`, `bringToFront` and
+  `setViewportSize` give none.
+- **`unmute.spec`** therefore runs with `chromeArgs({autoplay: false})` plus
+  `--autoplay-policy=document-user-activation-required`, which is Chrome's default said out loud: a headful Chrome
+  has it anyway, and a headless one would play sound without a gesture. Its trace keeps screenshots and sources but
+  no DOM snapshots (`retain-on-failure`, `snapshots: false`), and until the sound has been refused it reads the
+  viewer's page only through a CDP session of its own (`QuietReader`), whose `Runtime.evaluate` is no gesture, not
+  through `stats.ts`. It checks the tap, then that a later change of what is heard needs none, and that the M key
+  and the header's pill are the tap too.
+- **`focus-audio.spec`** has four tests: the newest share takes the stage by itself and only its sound reaches the
+  viewer (the other share's audio bytes stand still); a click on the other tile moves the stage and the sound
+  within 2 s, and a speaker button moves the sound alone, with the stage's "Listen here" bringing it back; a share
+  without sound takes the stage and then nothing is heard and the stage has no Mute (§12.3), while another share's
+  speaker button still brings its sound; after a pick a new share is a toast with Watch, also inside a real
+  fullscreen stage (a browser draws nothing outside the fullscreen element).
+- **`layers.spec`**: the scroll test needs four sharers and a 320×640 viewport (a tile is 44vw wide, so a fully
+  hidden tile needs at least three tiles in the strip besides the stage), and each sharer puts its own preview on
+  its stage to save decoding on CI. It also checks the frozen tile of §12.6 ("Waiting for video…" and back): an
+  init script on the sharer's page records its `RTCPeerConnection`s, and the test stops the video with
+  `sender.replaceTrack(null)` while the share stays live, a test-only instrument of the spec.
+- Real element fullscreen (`focus-audio` test 4 and `layers` test 1 assert `:fullscreen`) passes in a local
+  headless run; under Xvfb and openbox the CI job is the first to run it.
+
 The tone tab has no flash/beep sync marker, and no browser spec measures the A/V offset. The plan's 45 ms target is
 checked by S63's Go integration test (02 int. 5, flash-to-beep offset ≤ 5 ms through the SFU) and by the exit
 session's survey ("nobody reports audio out of sync", 06 §12.3). M1 builds no browser flash/beep harness.
@@ -3032,9 +3114,9 @@ Stats are read through `window.__isshoni.stats()` (§10.7).
 | `invite.spec` | a second context opens the invite link, signs up, lands in Lounge; the fragment is gone from the URL; both appear in the people panel. As README S66 built it (on the worker's server): the token is in no request URL and in none of the tab's storage either, and a used-up link says so |
 | `rooms.spec` (README S66; a server per test, since it counts a room's people) | two people see each other within 1 s of the second one's `room.join`; closing a tab takes its person out at once (the page closes with 1000, the hub skips the grace), unless the person has another tab in the room; a person whose network is cut stays as "Reconnecting…" for the 30 s grace, is gone after it, and is back by themselves when the network is (the cut is a SOCKS5 proxy that the test closes, not `setOffline`: below); the room switcher appears only with a second room, and switching asks first while sharing and takes the person and the share out of the room they leave |
 | `watch.spec` | sharer (tone tab) live; `room.state` lists layers `high` and `low`; the viewer's focused tile has `framesDecoded > 0` and `frameHeight ≥ 540`; audio `audioLevel > 0.05` and `totalAudioEnergy` rising; the sharer sees the viewer's name. As README S66 built it (a server per test): the high layer may take up to 40 s (below); the stage and its Mute and Fullscreen buttons fit the window; a reload watches again and is counted once; Stop, a closed sharer tab and (headful only) a closed shared tab each end the share at once; the same page shares again and a latecomer watches it; in a low window (900×600, 700×520, 683×600) the stage gives way and the tiles stay above the sharer's bar, also with the share's settings open (§12.1, §13.7) |
-| `focus-audio.spec` | 2 sharers + viewer: audio bytes flow only for the focused share; clicking the other tile flips it within 2 s; the speaker button moves audio without moving focus; the newest share is auto-focused |
-| `layers.spec` | thumbnail `frameHeight ≤ 360`; a tile scrolled out of view stops receiving video bytes within 3 s; fullscreen turns thumbnails off |
-| `unmute.spec` | without the autoplay flag, "Tap to unmute" appears; after a click, the audio element plays and `audioLevel > 0.05` |
+| `focus-audio.spec` | 2 sharers + viewer: audio bytes flow only for the focused share; clicking the other tile flips it within 2 s; the speaker button moves audio without moving focus; the newest share is auto-focused. As README S72 built it (fake display, a server per test): a share without sound takes the stage and nothing is heard; after a pick a new share is a toast with Watch, also in a real fullscreen stage |
+| `layers.spec` | thumbnail `frameHeight ≤ 360`; a tile scrolled out of view stops receiving video bytes within 3 s; fullscreen turns thumbnails off. As README S72 built it (fake display, a server per test): a tile scrolled into view receives video again; a tile whose video stops says "Waiting for video…" and plays again when it comes back (§12.6) |
+| `unmute.spec` | without the autoplay flag, "Tap to unmute" appears; after a click, the audio element plays and `audioLevel > 0.05`. As README S72 built it (fake display, Chrome's default autoplay policy stated, a CDP reader and a trace without DOM snapshots: above): a later change of what is heard needs no tap; the M key and the header's pill are the tap too |
 | `reconnect.spec` | (a) `__isshoni.dropSocket()`: resumed with the same `connectionId`, `framesDecoded` keeps rising, no new sub offer; (b) `context.setOffline(true)` for 5 s: the banner appears after 2 s, then clears; (c) own server, `restart()` (same data dir and ports): the viewer decodes the re-published share within 15 s, focused, with audio |
 | `warning.spec` | fake display `monitor+audio` shows the warning; "Share without sound" publishes without an audio track; "Pick something else" reopens the picker. As README S66 built it (a server per test): nothing is shared before the answer; "Share with sound anyway" publishes both tracks, and the friend gets both; what is picked behind "Pick something else" is shared (the tone tab through the real picker when headful, another fake display when headless) |
 | `a11y.spec` | axe (`wcag2a`, `wcag2aa`, `wcag21aa`) on login, invite, reset, setup, the room with a share, admin users: no serious or critical violations; the tile list is keyboard-reachable; `F` toggles fullscreen |
@@ -3189,9 +3271,15 @@ Decided after group 5 (engineering calls the owner delegated; README §6):
   01 §8.7). The M1 UI changes a preset only from the publishing page; the push to the publisher comes with the M2
   desktop handoff.
 
-**Open, for the owner** (raised after group 6, still open after groups 7 and 8; README §6):
-- **Picture-in-picture on Android Chrome** (§12.5). The rule says "desktop only" and hides PiP on iOS. README S56
-  built it by capability: the button is there wherever the browser reports PiP and the device is not iOS, which
-  includes Android Chrome. The two readings differ only there. Until the owner answers, the rule in §12.5 is not
-  changed and the code stays as built; "keep it" needs one sentence in §12.5, "hide it" one more condition in the
-  platform's `pip` capability (§8).
+**Open, for the owner** (README §6):
+- **Picture-in-picture on Android Chrome** (§12.5; raised after group 6, still open after groups 7, 8 and 9). The
+  rule says "desktop only" and hides PiP on iOS. README S56 built it by capability: the button is there wherever
+  the browser reports PiP and the device is not iOS, which includes Android Chrome. The two readings differ only
+  there. Until the owner answers, the rule in §12.5 is not changed and the code stays as built; "keep it" needs one
+  sentence in §12.5, "hide it" one more condition in the platform's `pip` capability (§8).
+- **The sound when the focused share has none** (§12.3; raised after group 9, from README S72). Focus on a share
+  without sound, automatic or picked, leaves nothing from the stage heard ("audio follows focus" taken
+  literally). The alternative is to keep the previous share's sound playing until a share with sound is focused.
+  It is not blocking: before S72 such a page was silent too. Until the owner answers, the rule in §12.3 is not
+  changed and the code stays as S72 built it; keeping the previous sound would be a change to the settle step of
+  §12.3 (`settleSound`), which today gives the sound to the stage's share or to nothing.
