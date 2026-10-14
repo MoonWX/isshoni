@@ -3,6 +3,7 @@ package server_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/cookiejar"
@@ -31,15 +32,21 @@ import (
 // invite and reset tokens, passwords, session cookies, resume tokens, the keys of secrets.json, a push
 // subscription's keys), SDP (its attribute lines, an ICE password), an ICE candidate, a push endpoint beyond its
 // host, a username or a share label, at any level; and a client's address, IP or ICE transport address, in any
-// line at info or above.
+// line at info or above, except as the remote_ip of a security event at warn (01 §17, 03 §7.3: a refused WebSocket
+// Origin, throttled pre-auth upgrades, a throttled auth attempt), of which the flow makes one.
 //
-// What the canary allows: Pion's own warnings and errors (they carry the attribute scope), which a PeerConnection
-// that closes under a running stream makes, at the shutdown and when a probe ends. Which of them appear depends on
-// the moment, so the canary does not count them; it holds them to the same rules as every other line, and S79's
-// and netx's Pion loggers have moved every line of Pion's that names an address to debug. The machine's own
-// warnings (hostWarning) are allowed too. Client addresses at debug level are allowed: debug is for the operator
-// who is looking for a problem, for a while (`isshoni admin log-level debug --for 30m`), and Pion's ICE lines name
-// the pairs it checks.
+// What the canary allows: Pion's own warnings (they carry the attribute scope), which the SFU keeps at warn when they
+// name no address (sfu/pionlog.go). Two of them come with every PeerConnection in a normal evening, at log.level = info
+// as well: "Failed to ping without candidate pairs. Connection is not possible yet." (scope ice) at its start, when its
+// ICE agent begins the checks before it has a candidate pair (the server learns a client's address from the client's
+// checks), and "Failed to accept RTP stream is already closed" with its RTCP twin (scope pc) when it closes: every
+// share, every viewer and every probe. "Incoming unhandled RTCP ssrc(…), OnTrack will not be fired" (scope pc) comes
+// now and then besides. How many appear depends on the moment and on logx's limit per scope (20 lines a minute, which
+// Pion's debug lines use up at this test's level), so the canary does not count them; it holds them to the same rules
+// as every other line, and S79's and netx's Pion loggers have moved every line of Pion's that names an address to
+// debug. The machine's own warnings (hostWarning) are allowed too. Client addresses at debug level are allowed: debug
+// is for the operator who is looking for a problem, for a while (`isshoni admin log-level debug --for 30m`), and Pion's
+// ICE lines name the pairs it checks.
 
 // The canary's people and what they type. The names are unusual on purpose: a common word could be in the log for
 // another reason.
@@ -87,6 +94,15 @@ func (c *canary) sdp(what, sdp string) {
 }
 
 var icePwd = regexp.MustCompile(`a=ice-pwd:(\S+)`)
+
+// securityEvents are the messages of the security events, logged at warn with the client's IP as remote_ip:
+// signal's refused upgrades (01 §17) and auth's blocked attempts (03 §7.3).
+var securityEvents = map[string]bool{
+	"websocket origin refused":                         true,
+	"websocket origin refused for a cookie connection": true,
+	"websocket pre-auth upgrades throttled":            true,
+	"auth attempt throttled":                           true,
+}
 
 // sdpMarkers are what SDP and ICE candidates look like inside a JSON log line.
 var sdpMarkers = []string{"a=ice-ufrag", "a=ice-pwd", "a=fingerprint", "a=candidate", "a=rtpmap", "a=mid:", "a=ssrc",
@@ -433,9 +449,23 @@ func TestLogCanary(t *testing.T) {
 	if _, err := sock.Doctor(ctx, ops.AdminDoctorRequest{}); err != nil {
 		t.Fatal(err)
 	}
+	// A security event: the member's browser on another site's page opens the WebSocket, and the Origin check
+	// refuses it (01 §17). Its line carries the member's IP as remote_ip, and nothing else of the member's.
+	dctx, cancelDial := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelDial()
+	_, err = signaltest.Dial(dctx, member, srv.WSURL, signaltest.DialOptions{Header: http.Header{"Origin": {"https://evil.example"}}})
+	var refused *signaltest.RefusedError
+	if !errors.As(err, &refused) || refused.Status != http.StatusForbidden {
+		t.Fatalf("a WebSocket from another site's page: %v, want 403", err)
+	}
+
 	want("logout", callAs(t, member, srv, http.MethodPost, "/api/v1/auth/logout", nil), ok)
 	waitPushes(t, pushes, 1)
 	srv.Stop(t)
+	if recs := records(t, srv, "websocket origin refused"); len(recs) != 1 || recs[0]["level"] != "WARN" ||
+		recs[0]["remote_ip"] != canaryMemberIP {
+		t.Errorf("the refused Origin's line = %v, want one warning with remote_ip %s", recs, canaryMemberIP)
+	}
 
 	// The keys of secrets.json.
 	data, err := os.ReadFile(srv.Cfg.Paths().Secrets)
@@ -484,8 +514,18 @@ func (c *canary) search(t *testing.T, logs string) {
 			}
 		}
 		if level := rec["level"]; level != "DEBUG" {
+			// A security event at warn carries the client's IP as remote_ip, and nowhere else.
+			rest := line
+			if msg, _ := rec["msg"].(string); level == "WARN" && securityEvents[msg] {
+				delete(rec, "remote_ip")
+				b, err := json.Marshal(rec)
+				if err != nil {
+					t.Fatal(err)
+				}
+				rest = string(b)
+			}
 			for value, what := range c.clientAddr {
-				if strings.Contains(line, value) {
+				if strings.Contains(rest, value) {
 					why = append(why, what+" at "+fmt.Sprint(level))
 				}
 			}

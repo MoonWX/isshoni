@@ -455,6 +455,32 @@ func TestOnSignals(t *testing.T) {
 	}
 }
 
+// onSignals' stop waits for a call that is under way, but not for one that hangs (a reload whose read of the
+// certificate files does not end): the process exits after its shutdown all the same.
+func TestOnSignalsStopDoesNotWaitForAHungCall(t *testing.T) {
+	sigs := make(chan os.Signal, 1)
+	started, release := make(chan struct{}), make(chan struct{})
+	returned := make(chan struct{})
+	stop := onSignals(sigs, func() {
+		defer close(returned)
+		close(started)
+		<-release
+	})
+	sigs <- syscall.SIGHUP
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the signal was not answered")
+	}
+	begin := time.Now()
+	stop()
+	if took := time.Since(begin); took < onSignalsWait || took > onSignalsWait+2*time.Second {
+		t.Errorf("stop returned after %v with a call that hangs, want about %v", took, onSignalsWait)
+	}
+	close(release) // the call ends after all, and so does the watcher (leakCheck)
+	<-returned
+}
+
 // The first signal ends the context; the second one calls for the immediate exit; stop ends the watching.
 func TestStopOnSignal(t *testing.T) {
 	t.Run("two signals", func(t *testing.T) {

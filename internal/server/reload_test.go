@@ -91,9 +91,11 @@ func TestReloadLogLevel(t *testing.T) {
 		t.Errorf("the line about the keys that take a restart = %v", recs)
 	}
 
-	// A config with errors is what a restart would refuse: the level stays, and the log says why.
+	// A config with errors is what a restart would refuse: the level stays, and the log says why. It names no key
+	// for a restart: the keys it could not use hold their defaults, and a restart would not start anyway.
 	bad := reloaded(srv, "debug")
 	bad.Log.Format = "xml"
+	bad.ShutdownTimeout = config.Duration{Duration: 15 * time.Second}
 	if err := srv.Srv.Reload(ctx, bad); err != nil {
 		t.Fatal(err)
 	}
@@ -106,6 +108,9 @@ func TestReloadLogLevel(t *testing.T) {
 	}
 	if !strings.Contains(srv.Logs(), `"key":"log.format"`) {
 		t.Errorf("the config's error is not in the log:\n%s", srv.Logs())
+	}
+	if got := records(t, srv, "the config has changes that a reload does not apply; restart isshoni to apply them"); len(got) != 1 {
+		t.Errorf("a config with errors named keys for a restart: %v", got)
 	}
 	// A config that could not be loaded at all: no level either.
 	if err := srv.Srv.Reload(ctx, nil); err != nil {

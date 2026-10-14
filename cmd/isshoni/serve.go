@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/MoonWX/isshoni/internal/logx"
 	"github.com/MoonWX/isshoni/internal/server"
@@ -93,12 +94,18 @@ func runServe(ctx context.Context, inv *invocation, _ []string) error {
 	return serveExit(ctx, inv, log, srv.Run(ctx), release)
 }
 
+// onSignalsWait bounds how long onSignals' stop waits for a call of fn that is under way.
+const onSignalsWait = time.Second
+
 // onSignals calls fn for every signal on sigs, one call after the other, until the returned function is called,
-// which waits for the watching goroutine (and a call of fn that is under way). serve uses it for SIGHUP.
+// which ends the watching and waits for the watching goroutine: for a call of fn that is under way too, but at most
+// onSignalsWait. serve uses it for SIGHUP, and calls stop once the server has shut down: a reload normally ends in
+// milliseconds, and one that hangs in its read of the certificate files (a mount that stopped answering;
+// server.Reload reads them without holding up the shutdown) must not keep the process from exiting.
 func onSignals(sigs <-chan os.Signal, fn func()) (stop func()) {
-	done := make(chan struct{})
-	var wg sync.WaitGroup
-	wg.Go(func() {
+	done, ended := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(ended)
 		for {
 			select {
 			case <-sigs:
@@ -107,10 +114,13 @@ func onSignals(sigs <-chan os.Signal, fn func()) (stop func()) {
 				return
 			}
 		}
-	})
+	}()
 	return func() {
 		close(done)
-		wg.Wait()
+		select {
+		case <-ended:
+		case <-time.After(onSignalsWait):
+		}
 	}
 }
 

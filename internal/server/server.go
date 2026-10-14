@@ -191,6 +191,9 @@ type Server struct {
 	warnings []config.Problem
 	log      *slog.Logger
 	deps     Deps
+	// reloads makes the reloads one at a time (Reload). It is not life: a reload reads the certificate files
+	// without life held, so that a shutdown never waits for that read.
+	reloads sync.Mutex
 
 	// life guards the lifecycle state and what Start fills in for the accessors. Start holds it for the whole
 	// startup, so a Shutdown that arrives meanwhile waits for the startup to finish.

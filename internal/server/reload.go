@@ -25,45 +25,60 @@ const reloadKey = "log.level"
 //
 // cfg is the config as cmd/isshoni loaded it again, from the same flags and environment and the file as it is now,
 // so the precedence of 04 §4.1 holds: a log.level set by a flag or ISSHONI_LOG_LEVEL wins over the file. A cfg with
-// errors changes no level (it is the config that a restart would refuse, with exit 78, and the log says so with
-// every problem); a nil cfg is a config that could not be loaded at all. The certificate files are read again in
+// errors changes nothing and names no key for a restart (it is the config that a restart would refuse, with exit
+// 78, and the log says so with every problem; the keys it could not use hold their defaults, which are no change of
+// the operator's); a nil cfg is a config that could not be loaded at all. The certificate files are read again in
 // both cases: they are no part of the config.
 //
 // A reload that comes during the startup waits for it; one that comes once the shutdown has begun does nothing.
 // Before Start it only sets the level, which the start then takes as the configured one. Reload logs what it did,
 // and returns the TLS manager's error when the new certificate files were rejected (the old pair keeps serving,
 // and the manager has logged why and how to fix it).
+//
+// The certificate files are read without life held: a read that hangs (a mount that stopped answering) must not
+// hold up the shutdown, which begins by taking life. The TLS manager has a lock of its own for its loads, and a
+// manual load only swaps the pair it holds in memory, so a load that overlaps the manager's shutdown does no harm.
+// A shutdown that begins during the read leaves the level as it is. Reloads run one at a time (reloads), so each
+// applies its level after its own read.
 func (s *Server) Reload(ctx context.Context, cfg *config.Config) error {
+	s.reloads.Lock()
+	defer s.reloads.Unlock()
 	s.life.Lock()
-	defer s.life.Unlock()
-	switch s.state {
-	case stateStopping, stateStopped:
+	if s.stoppingLocked() {
+		s.life.Unlock()
 		s.log.Info("reload ignored: the server is shutting down")
 		return nil
 	}
-
-	level, levelOK := s.reloadLevel(ctx, cfg)
-	if cfg != nil {
+	level, apply, valid := s.reloadLevel(ctx, cfg)
+	if valid {
 		if changed := s.restartKeys(cfg); len(changed) > 0 {
 			s.log.LogAttrs(ctx, slog.LevelWarn, "the config has changes that a reload does not apply; restart isshoni to "+
 				"apply them", slog.Any("keys", changed))
 		}
 	}
+	tlsm, manual := s.tls, s.cfg.EffectiveTLSMode() == config.TLSManual
+	s.life.Unlock()
 
 	var tlsErr error
 	certificate := "not read: the certificate is not from files (tls.mode is not manual)"
 	switch {
-	case s.tls == nil: // before Start: the start reads the files
+	case tlsm == nil: // before Start: the start reads the files
 		certificate = "not read: the server has not started"
-	case s.cfg.EffectiveTLSMode() == config.TLSManual:
+	case manual:
 		certificate = "read again"
-		if tlsErr = s.tls.Reload(); tlsErr != nil { // logged by the TLS manager, with the fix
+		if tlsErr = tlsm.Reload(); tlsErr != nil { // logged by the TLS manager, with the fix
 			certificate = "rejected: the files can't be used (the line before says why)"
 		}
 	}
-
 	attrs := []slog.Attr{slog.String("certificate", certificate)}
-	if !levelOK {
+
+	s.life.Lock()
+	defer s.life.Unlock()
+	if s.stoppingLocked() { // the shutdown began while the files were read: the level stays as it is
+		s.log.LogAttrs(ctx, slog.LevelInfo, "reload ignored: the server is shutting down", attrs...)
+		return tlsErr
+	}
+	if !apply {
 		s.log.LogAttrs(ctx, slog.LevelInfo, "reloaded (SIGHUP) without the log level", attrs...)
 		return tlsErr
 	}
@@ -82,16 +97,18 @@ func (s *Server) Reload(ctx context.Context, cfg *config.Config) error {
 	return tlsErr
 }
 
-// reloadLevel returns the log level of a reloaded config, and false when there is none to apply: no level variable
-// (Deps.LogLevel is nil), no config, or a config with errors, which are logged here.
-func (s *Server) reloadLevel(ctx context.Context, cfg *config.Config) (slog.Level, bool) {
-	if s.deps.LogLevel == nil {
-		s.log.LogAttrs(ctx, slog.LevelWarn, "reload: the log level of this process is fixed; log.level is not reloaded")
-		return 0, false
-	}
+// stoppingLocked reports whether the shutdown has begun. Called with life held.
+func (s *Server) stoppingLocked() bool {
+	return s.state == stateStopping || s.state == stateStopped
+}
+
+// reloadLevel returns the log level of a reloaded config and whether to apply it, and whether the config is one the
+// server could start with: no config, or a config with errors (which are logged here), is not. There is no level to
+// apply in those cases, nor when the level of this process is fixed (Deps.LogLevel is nil).
+func (s *Server) reloadLevel(ctx context.Context, cfg *config.Config) (level slog.Level, apply, valid bool) {
 	if cfg == nil {
 		s.log.LogAttrs(ctx, slog.LevelWarn, "reload: the config could not be read again; log.level is not reloaded")
-		return 0, false
+		return 0, false, false
 	}
 	all, warnings := configProblems(cfg)
 	if len(all) > len(warnings) {
@@ -101,7 +118,10 @@ func (s *Server) reloadLevel(ctx context.Context, cfg *config.Config) (slog.Leve
 				continue
 			}
 			line, _, _ := strings.Cut(p.String(), "\n")
-			attrs := []slog.Attr{slog.String("key", p.Key)}
+			var attrs []slog.Attr
+			if p.Key != "" { // a problem of the file as a whole has no key
+				attrs = append(attrs, slog.String("key", p.Key))
+			}
 			if p.Fix != "" {
 				attrs = append(attrs, slog.String("fix", p.Fix))
 			}
@@ -109,14 +129,18 @@ func (s *Server) reloadLevel(ctx context.Context, cfg *config.Config) (slog.Leve
 		}
 		s.log.LogAttrs(ctx, slog.LevelWarn, "reload: the config has errors: log.level is not reloaded, and isshoni "+
 			"would refuse to start with this config (exit 78) until they are fixed", slog.Int("errors", len(all)-len(warnings)))
-		return 0, false
+		return 0, false, false
+	}
+	if s.deps.LogLevel == nil {
+		s.log.LogAttrs(ctx, slog.LevelWarn, "reload: the log level of this process is fixed; log.level is not reloaded")
+		return 0, false, true
 	}
 	level, ok := ops.ParseLogLevel(cfg.Log.Level)
 	if !ok { // config validates log.level; this would be a bug there
 		s.log.LogAttrs(ctx, slog.LevelError, "reload: log.level is not a level", slog.String("log_level", cfg.Log.Level))
-		return 0, false
+		return 0, false, true
 	}
-	return level, true
+	return level, true, true
 }
 
 // setBaseLevel makes level the configured log level: through the runtime level of the admin socket once the server

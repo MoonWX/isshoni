@@ -73,8 +73,9 @@ func openSocket(t *testing.T, base string) {
 // SIGHUP reloads (04 §6.5): serve loads the config again, from its flags and its environment and the file as it is
 // now, and the server applies log.level and reads manual TLS files again (server's TestReloadManualCertificate);
 // every other change waits for a restart, and the log names those keys. A file with errors changes nothing, and
-// says so. The server never stops for the signal: a process that does not handle it dies of it, which systemd
-// would count as a clean stop after `systemctl reload isshoni`.
+// says so; it names no key for a restart either (the keys it could not use hold their defaults, which a restart
+// would not apply: it would refuse to start). The server never stops for the signal: a process that does not
+// handle it dies of it, which systemd would count as a clean stop after `systemctl reload isshoni`.
 func TestServeReloadsOnSIGHUP(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("needs signals")
@@ -87,7 +88,7 @@ func TestServeReloadsOnSIGHUP(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	write("[log]\nlevel = \"info\"\n")
+	write("shutdown_timeout = \"12s\"\n[log]\nlevel = \"info\"\n")
 	p := startServe(t, "--config", file)
 	base := p.waitReady(t)
 	hup := func() {
@@ -97,6 +98,7 @@ func TestServeReloadsOnSIGHUP(t *testing.T) {
 		}
 	}
 	const closed = `"msg":"websocket closed"`
+	const restartKeys = `"msg":"the config has changes that a reload does not apply; restart isshoni to apply them"`
 
 	// At info, the probe's debug line stays out of the log.
 	openSocket(t, base)
@@ -119,7 +121,8 @@ func TestServeReloadsOnSIGHUP(t *testing.T) {
 	openSocket(t, base)
 	p.waitForLog(t, closed, 1)
 
-	// A file with an error is what a restart would refuse: nothing changes, and the log says why.
+	// A file with an error is what a restart would refuse: nothing changes, and the log says why. It no longer sets
+	// shutdown_timeout, which is no key to restart for: the restart would not start.
 	write("[log]\nlevel = \"loud\"\n")
 	hup()
 	p.waitForLog(t, `"msg":"reloaded (SIGHUP) without the log level"`, 1)
@@ -130,11 +133,27 @@ func TestServeReloadsOnSIGHUP(t *testing.T) {
 	openSocket(t, base)
 	p.waitForLog(t, closed, 2) // still debug
 
+	// A file that is no TOML: every key holds its default, shutdown_timeout too, and the problem is the file's,
+	// with no key.
+	write("shutdown_timeout = \"12s\"\n[log\nlevel = \"info\"\n")
+	hup()
+	p.waitForLog(t, `"msg":"reloaded (SIGHUP) without the log level"`, 2)
+	if logs := p.logs(); !strings.Contains(logs, `is not valid TOML`) || strings.Contains(logs, `"key":""`) {
+		t.Errorf("the reload of a file that is no TOML:\n%s", logs)
+	}
+	if n := strings.Count(p.logs(), restartKeys); n != 1 {
+		t.Errorf("%d lines that name keys for a restart, want 1 (a config with errors names none):\n%s", n, p.logs())
+	}
+
 	// Back to info, and a few signals in a row: the server serves on.
-	write("[log]\nlevel = \"info\"\n")
-	for n := 2; n <= 4; n++ {
+	write("shutdown_timeout = \"12s\"\n[log]\nlevel = \"info\"\n")
+	seen := strings.Count(p.logs(), reloadedLine) // the lines without the level start the same way
+	for n := 1; n <= 3; n++ {
 		hup()
-		p.waitForLog(t, reloadedLine, n)
+		p.waitForLog(t, reloadedLine, seen+n)
+	}
+	if n := strings.Count(p.logs(), restartKeys); n != 1 {
+		t.Errorf("%d lines that name keys for a restart, want 1:\n%s", n, p.logs())
 	}
 	if code, body := httpGet(t, base+"/healthz"); code != 200 || body != `{"status":"ok"}`+"\n" {
 		t.Errorf("GET /healthz after the SIGHUPs = %d %q, want 200 ok", code, body)
