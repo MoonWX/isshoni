@@ -1795,8 +1795,10 @@ alone. Registry logins are a plain `docker login` with the job's token, not a th
 **`build`**
 - `needs: [version, web]`. Permissions: `contents: write`, `packages: write`, `id-token: write`, `attestations: write`.
 - **No Node on this runner**: no setup-node, no npm, no npm cache. Only goreleaser and pinned Go tools run.
-- Steps, in this order; every check that can fail comes before goreleaser, so a failed one leaves no draft and no
-  image:
+- Steps, in this order. Every check of the repository's inputs (steps 3–5) comes before goreleaser, so a failed one
+  leaves no draft and no image. The asset check of step 7 reads goreleaser's output, so it comes after it, as do
+  the attestations and the image's signature: a failure there leaves the draft and the image `:<v>`, which a re-run
+  for the same tag replaces (the draft by `replace_existing_draft`, 9.2; the image by the same tag pushed again):
   1. checkout with `fetch-depth: 0`; download the `web-dist` artifact into `web/dist/`;
   2. setup-go (from `go.mod`), Task (the pin), cosign v3, syft, buildx; `task release:goreleaser` (7.1); rpm, for
      `release:assets`;

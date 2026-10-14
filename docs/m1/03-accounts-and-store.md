@@ -2072,7 +2072,7 @@ soft limit.
 | `settings.changed` | admin/cli | settings | `{changes:{field:{from,to}}}` | ✓ if `registrationMode` changed |
 | `secrets.rotated` | system | — | `{keys:[...]}` | ✓ |
 | `device.linked` *(later: M2)* | user | device | `{clientKind, os, via}` | |
-| `device.revoked` *(the user's own in M1, README S70; admin later: M2)* | user/admin | device | `{}` | |
+| `device.revoked` *(the user's own in M1, README S58; admin later: M2)* | user/admin | device | `{}` | |
 | `device.refresh_reused` *(later: M2)* | system | device | `{}` | ✓ |
 
 What is never stored in `detail`: tokens, password material, User-Agent strings, the usernames tried for unknown
@@ -2092,8 +2092,8 @@ accounts (a typo there is often the password), and SDP.
 - **The tests**: `TestAuditCoverage` produces every action that M1 writes by a real request (or the CLI path, the
   janitor or a key rotation) and finds it in `GET /api/v1/admin/audit` with the actor and target kinds of the
   table and, for a request, the IP that `ClientIP` gave, both target variants included. `TestAuditActionsInSource`
-  keeps the test's table in step with the code: every action that `auth`, `httpapi` or `store` names is a row here
-  (32 rows), and an action marked later has no writer in `auth` or `httpapi` yet.
+  keeps the test's table in step with the code: every action that `auth`, `httpapi` or `store` names is in a row here
+  (32 actions), and an action marked later has no writer in `auth` or `httpapi` yet.
 
 ---
 

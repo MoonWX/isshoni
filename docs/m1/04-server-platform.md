@@ -1336,8 +1336,8 @@ step in `server.go`, the tests in `push_test.go`, `wire_test.go` and `servertest
 - **Push is built only on a server with a site**: its subject needs `Site.Origin` (§14.1), and none of its three
   consumers exists without one. A server without a site (§6.2) therefore runs no VAPID purge until it starts with
   a site.
-- **A bare `push.subject` is a config error** (§14.1): `New` refuses `mailto:` or `https:` with nothing after it as
-  a `*config.ValidationError`, with config's fix text, before `Start` opens anything, so `serve` exits 78
+- **A bare `push.subject` is a config error** (§14.1): `server.New` refuses `mailto:` or `https:` with nothing after
+  it as a `*config.ValidationError`, with config's fix text, before `Start` opens anything, so `serve` exits 78
   (`TestPushSubjectOnlyAPrefix`, `TestPushSubjectProblem`). With `push.enabled = false` nothing reads the subject.
 - **Shutdown**: the push service stops taking work right after step 5, and step 6 waits for its drain after the
   TLS manager, inside the same 2 s (§6.4).

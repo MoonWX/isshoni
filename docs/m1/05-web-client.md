@@ -1350,9 +1350,10 @@ with a list that re-snaps the way a browser does.
 
 ### 12.3 Audio follows focus
 
-- `audibleShareId` defaults to the focused share. Focusing moves the audio.
-- Every other tile has a **speaker button** ("Listen to bo"). It moves the audio to that tile without moving video
-  focus; the stage then shows a muted-speaker indicator. Exactly one share is audible at a time.
+- `audibleShareId` defaults to the focused share when that share has sound (below). Focusing moves the audio.
+- Every other tile of a share with sound has a **speaker button** ("Listen to bo"). It moves the audio to that tile
+  without moving video focus; the stage then shows a muted-speaker indicator. At most one share is audible at a
+  time: none while the share the sound belongs to has none (below).
 - Each change is **one** `subscribe.update` with all affected shares, so the server stops the old audio and starts the
   new one in the same step (01 §8.9).
 
