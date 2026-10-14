@@ -305,24 +305,54 @@ func TestSocketKilled(t *testing.T) {
 // which comes 3 s after the client's own ICE has noticed the silence (01 §10.4, after 2 s here, faultySettings),
 // and it says the share is stalled 2 s after that, with its once-a-second ticker (02 §5.3). So the outage lasts
 // about 7 to 8 s.
+func TestUDPBlackHole(t *testing.T) { udpBlackHole(t, false) }
+
+// TestUDPBlackHoleViewer is case 5 with the viewer's UDP gone too, for the same outage: 01 §11.5 B, where the sub
+// PC loses its UDP as well. The viewer's ICE notices the silence, and 3 s later, while its network is still gone, it
+// asks for an ICE restart: pc.restart{sub, ice, disconnected}, which the SFU answers with an offer on the same sub
+// PC (the same gen, the next neg, new ICE credentials). When the network is back that restart connects: the
+// viewer's media is back within 3 s, starting with a keyframe, on the tracks it had, and nothing is rebuilt.
 //
-// The viewer's network stays: a viewer whose UDP is gone too asks for its sub ICE restart while it is still gone
-// (pc.restart{sub, ice} 3 s after its ICE noticed), and the SFU's ICE agent, which controls a sub PC, gives up on
-// each candidate pair after 7 unanswered checks, about 1.5 s, and never checks it again. That restart does not
-// connect when the network is back, and the viewer recovers with the 15 s rebuild of 01 §10.4 instead. The SFU's own
-// TestSubICERestart (02 §17 integration 7) times the request with the network's return for the same reason.
-func TestUDPBlackHole(t *testing.T) {
+// It is skipped until the SFU (internal/server/sfu) does two things it doesn't do yet:
+//   - Go on checking a sub PC's candidate pairs through such an outage. The SFU's ICE agent controls a sub PC, and
+//     with Pion's default it gives up on each pair after 7 unanswered checks, about 1.5 s, and never checks it
+//     again: the restart asked for during the outage does not connect when the network is back, and the viewer
+//     recovers only with the rebuild 15 s after the restart's offer (01 §10.4). SetICEMaxBindingRequests with the
+//     failed timeout's worth of checks (one per 200 ms) in the SettingEngine of 02 §7.3 keeps it checking. The
+//     SFU's own TestSubICERestart (02 §17 integration 7) times its request with the network's return for the same
+//     reason.
+//   - Get the viewer a keyframe when its sub PC connects again before the sharer's pub PC does. The sub PC's
+//     keyframe request for the full layer is made while the pub PC is still away and brings no keyframe, and the
+//     500 ms throttle of 02 §9.7 then swallows the request that the pub PC's own connect makes for that layer. The
+//     share goes live on the preview layer's keyframe, and the viewer gets the full layer's frames without one: a
+//     browser would ask for one itself, the Viewer doesn't. A Layer that asks for nothing while the publishing
+//     Conn has its pub PC away, as its read loop already does, would leave the request to the connect.
+func TestUDPBlackHoleViewer(t *testing.T) {
+	t.Skip("needs two SFU changes: sub PC ICE checks that go on through an outage, and keyframe requests that " +
+		"wait for the pub PC to be connected again")
+	udpBlackHole(t, true)
+}
+
+// udpBlackHole runs case 5: the sharer's UDP goes away, and the viewer's with it when viewerToo.
+func udpBlackHole(t *testing.T, viewerToo bool) {
 	const (
 		outage = 5 * time.Second
 		within = 3 * time.Second
 	)
 	w := newWorld(t, servertest.Options{})
 	alice := w.connect(w.member("alice"), protocol.RoleFull)
-	pubNet, wire := faultySettings(t)
+	pubNet, pubWire := faultySettings(t)
 	sh := alice.publish(51, pubNet)
 	alice.waitLive(sh.id)
 	bob := w.connect(w.member("bob"), protocol.RoleViewer)
-	viewer := bob.watch(sfutest.LoopbackSettings(), 0)
+	wires := []*sfutest.FaultConn{pubWire}
+	subNet := sfutest.LoopbackSettings()
+	if viewerToo {
+		var subWire *sfutest.FaultConn
+		subNet, subWire = faultySettings(t)
+		wires = append(wires, subWire)
+	}
+	viewer := bob.watch(subNet, 0)
 	bob.waitLive(sh.id)
 	bob.subscribe(want(sh.id, true))
 	video, audio := track(t, viewer, sh.id, webrtc.RTPCodecTypeVideo), track(t, viewer, sh.id, webrtc.RTPCodecTypeAudio)
@@ -332,8 +362,10 @@ func TestUDPBlackHole(t *testing.T) {
 	roomMark := len(bob.roomStates()) - 1
 	statusMark := len(bob.statuses(sh.id))
 
-	// ---- the sharer's UDP is gone ----
-	blackHole(wire, true)
+	// ---- the UDP is gone ----
+	for _, wire := range wires {
+		blackHole(wire, true)
+	}
 	gone := time.Now()
 	eventually(t, func() bool {
 		s, _ := bob.shareIn(sh.id)
@@ -343,9 +375,11 @@ func TestUDPBlackHole(t *testing.T) {
 		return fmt.Sprintf("%v into the outage the share is %s, want stalled", time.Since(gone), s.Status)
 	})
 	videoMark, audioMark := len(video.Packets()), len(audio.Packets())
-	blackHole(wire, false)
+	for _, wire := range wires {
+		blackHole(wire, false)
+	}
 	back := time.Now()
-	t.Logf("the sharer's UDP was gone for %v", back.Sub(gone).Round(time.Millisecond))
+	t.Logf("the UDP was gone for %v", back.Sub(gone).Round(time.Millisecond))
 
 	// ---- the media is back within 3 s ----
 	resumed, stragglers := waitResumed(t, video, videoMark, "f", 15)
@@ -384,7 +418,7 @@ func TestUDPBlackHole(t *testing.T) {
 		t.Errorf("the share went %q in the viewer's room.state since the outage, want live, stalled, live again", runs)
 	}
 
-	// ---- one ICE restart, and nothing more ----
+	// ---- one ICE restart of each PC that lost its UDP, and nothing more ----
 	if did := sh.actions(); !slices.Equal(did, []string{"ice restart"}) {
 		t.Errorf("the sharer's pub PC: %v, want one ICE restart", did)
 	}
@@ -399,9 +433,31 @@ func TestUDPBlackHole(t *testing.T) {
 	if pair := selectedPair(t, "the sharer", sh.publisher().PC()); pair.Local.Protocol != webrtc.ICEProtocolUDP {
 		t.Errorf("the sharer's PC is on a %s pair after the ICE restart, want UDP again", pair.Local.Protocol)
 	}
-	for _, c := range []*client{alice, bob} {
-		if r, a := c.sentRestarts(), c.askedRestarts(); len(r) != 0 || len(a) != 0 {
-			t.Errorf("%s sent pc.restart %+v and was asked for %+v: no PC failed", c.name, r, a)
+	if r, a := alice.sentRestarts(), alice.askedRestarts(); len(r) != 0 || len(a) != 0 {
+		t.Errorf("the sharer sent pc.restart %+v and was asked for %+v: no PC failed", r, a)
+	}
+	subOffers := bob.subOffers()
+	if !viewerToo {
+		if len(subOffers) != 1 {
+			t.Errorf("the viewer got the sub offers %s, want its first alone", offerList(subOffers))
+		}
+		if r, a := bob.sentRestarts(), bob.askedRestarts(); len(r) != 0 || len(a) != 0 {
+			t.Errorf("the viewer sent pc.restart %+v and was asked for %+v: its network was fine", r, a)
+		}
+	} else {
+		// The viewer asked for an ICE restart once, and the SFU's offer of it was the restart: no rebuild.
+		ice := protocol.PCRestart{PC: protocol.PCKindSub, Gen: 1, Mode: protocol.RestartModeICE, Reason: protocol.RestartReasonDisconnected}
+		if r, a := bob.sentRestarts(), bob.askedRestarts(); !slices.Equal(r, []protocol.PCRestart{ice}) || len(a) != 0 {
+			t.Errorf("the viewer sent pc.restart %+v and was asked for %+v, want %+v alone", r, a, ice)
+		}
+		if offerList(subOffers) != "1/1 1/2" {
+			t.Fatalf("the viewer got the sub offers %s, want its first and the ICE restart's, 1/1 1/2", offerList(subOffers))
+		}
+		if a, b := iceUfrag(subOffers[0].SDP.Reveal()), iceUfrag(subOffers[1].SDP.Reveal()); a == b {
+			t.Errorf("the second sub offer has the ICE user name %q of the first, want new ICE credentials", b)
+		}
+		if pair := selectedPair(t, "the viewer", viewer.PC()); pair.Local.Protocol != webrtc.ICEProtocolUDP {
+			t.Errorf("the viewer's PC is on a %s pair after the ICE restart, want UDP again", pair.Local.Protocol)
 		}
 	}
 
@@ -414,9 +470,6 @@ func TestUDPBlackHole(t *testing.T) {
 		if st.RequestedVideo != protocol.VideoLayerHigh {
 			t.Errorf("subscribe.status %+v during the outage: the subscription changed", st)
 		}
-	}
-	if offers := bob.subOffers(); len(offers) != 1 {
-		t.Errorf("the viewer got the sub offers %s, want its first alone", offerList(offers))
 	}
 	for _, kind := range []webrtc.RTPCodecType{webrtc.RTPCodecTypeVideo, webrtc.RTPCodecTypeAudio} {
 		if n := tracksOf(viewer, sh.id, kind); n != 1 {
@@ -460,9 +513,15 @@ func TestServerRestart(t *testing.T) {
 		t.Fatalf("the new server's ICE ports are %d/udp and %d/tcp, want %d and %d as before", w.srv.UDPPort, w.srv.TCPPort, udp, tcp)
 	}
 	for _, c := range []*client{alice, bob} {
-		c.mu.Lock()
-		bye := slices.Clone(c.goodbye)
-		c.mu.Unlock()
+		// The client's socket read the server.shutdown before the old server was gone; its pump keeps it a moment
+		// later, which on a loaded machine can be after the new server is up.
+		var bye []protocol.ServerShutdown
+		eventually(t, func() bool {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			bye = slices.Clone(c.goodbye)
+			return len(bye) >= 1
+		}, func() string { return c.name + ": no server.shutdown" })
 		if len(bye) != 1 || bye[0].Reason != protocol.ShutdownReasonRestart {
 			t.Fatalf("%s: server.shutdown = %+v, want one that announces a restart", c.name, bye)
 		}

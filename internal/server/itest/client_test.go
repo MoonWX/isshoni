@@ -368,6 +368,7 @@ func (c *client) watchSub() {
 		sub.down = time.Time{}
 	}
 	var ask *protocol.PCRestart
+	before := sub // the timers as they were, should the request not go out
 	if ready {
 		broken := ice == webrtc.ICEConnectionStateFailed ||
 			(!sub.restartAt.IsZero() && now.Sub(sub.restartAt) >= restartWait)
@@ -394,8 +395,14 @@ func (c *client) watchSub() {
 		if !lost(err) {
 			c.fail(fmt.Errorf("pc.restart %+v: %w", *ask, err))
 		}
+		// Not sent: as if never asked, it asks again once ready. Only the timer of what it asked for goes back: the
+		// spacing of the other kind of request still counts from the last one that was sent.
 		c.mu.Lock()
-		c.sub.askedAt, c.sub.rebuiltAt = time.Time{}, time.Time{} // not sent: asks again once ready
+		if ask.Mode == protocol.RestartModeRebuild {
+			c.sub.rebuiltAt = before.rebuiltAt
+		} else {
+			c.sub.askedAt = before.askedAt
+		}
 		c.mu.Unlock()
 	}
 }
