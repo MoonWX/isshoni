@@ -1,0 +1,14 @@
+<!--
+  isshoni's mark (two screens, one in front of the other), the project site's icon and logo: a copy of the web app's
+  web/public/icons/icon.svg. Original artwork of this project, Apache-2.0 like the rest.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <title>isshoni</title>
+  <rect width="512" height="512" rx="112" fill="#101014"/>
+  <g transform="translate(78.4 59.9) scale(7.4)">
+    <rect x="3" y="9" width="28" height="20" rx="4" fill="none" stroke="#a4a4b1" stroke-width="3"/>
+    <rect x="15.5" y="17.5" width="31" height="23" rx="5.5" fill="#101014"/>
+    <rect x="17" y="19" width="28" height="20" rx="4" fill="#8e88ff"/>
+    <path d="M27 44H35" fill="none" stroke="#8e88ff" stroke-width="3" stroke-linecap="round"/>
+  </g>
+</svg>
