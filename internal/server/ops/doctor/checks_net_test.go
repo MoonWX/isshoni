@@ -5,8 +5,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"flag"
 	"net"
 	"net/url"
+	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
@@ -15,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/MoonWX/isshoni/internal/protocol/api"
+	"github.com/MoonWX/isshoni/internal/server/config"
 	"github.com/MoonWX/isshoni/internal/server/netx"
 )
 
@@ -259,6 +262,159 @@ func TestNoPublicAddress(t *testing.T) {
 			t.Errorf("fix:\n got %q\nwant %q", got, wantFix)
 		}
 	})
+}
+
+// A development setup on the loopback interface (network.include_loopback, and no STUN server to ask: deploy/dev's
+// configs) needs no public address, so public_ip is skipped there and says why, whatever addresses the machine has.
+// Where the site is the server's address, the check runs as everywhere: without the address that server is not
+// ready. One of the two keys alone is no such setup.
+func TestPublicIPLoopbackSetup(t *testing.T) {
+	const stunServer = "stun.example.net:3478"
+	var (
+		loopback = []string{"--network.include-loopback=true", "--network.stun-servers", ""}
+		off      = []string{"--tls.mode", "off"}
+		ip       = []string{"--tls.mode", "ip"}
+		manual   = []string{"--tls.mode", "manual", "--tls.cert-file", "/etc/ssl/c.pem", "--tls.key-file", "/etc/ssl/k.pem"}
+		domain   = []string{"--domain", testDomain}
+	)
+	// The machines: a laptop with a private address, and one whose interface has public addresses.
+	private := &fakeIfaces{ifs: []netx.Interface{iface("lo", "127.0.0.1"), iface("en0", "192.168.1.20")}, route: "192.168.1.20"}
+	public := &fakeIfaces{ifs: []netx.Interface{iface("lo", "127.0.0.1"), iface("eth0", testIP, testIPv6)}, route: testIP}
+	v6Only := &fakeIfaces{ifs: []netx.Interface{iface("lo", "127.0.0.1"), iface("en0", "192.168.1.20", testIPv6)}, route: "192.168.1.20"}
+	const (
+		skipText = "not checked: network.include_loopback is on and network.stun_servers is empty " +
+			"(a development setup, which needs no public address)"
+		noneText = "no public IP address found (no public address on an interface, no STUN answer)"
+	)
+
+	tests := []struct {
+		name    string
+		args    [][]string
+		running bool // a running server (which found the addresses of ifaces at its start), or doctor on its own
+		ifaces  *fakeIfaces
+		status  api.DoctorStatus
+		code    string
+		fix     string
+		message string // the whole message, or for a failure a part of it
+	}{
+		// The loopback setup: skipped.
+		{"off mode, running", [][]string{off, loopback}, true, private, api.DoctorStatusSkip, codePublicIPLoopback, "", skipText},
+		{"off mode, offline", [][]string{off, loopback}, false, private, api.DoctorStatusSkip, codePublicIPLoopback, "", skipText},
+		{"off mode, a public address on an interface", [][]string{off, loopback}, false, public, api.DoctorStatusSkip, codePublicIPLoopback, "", skipText},
+		{"off mode, a public IPv6 address only", [][]string{off, loopback}, true, v6Only, api.DoctorStatusSkip, codePublicIPLoopback, "", skipText},
+		{"off mode, public_ip set", [][]string{off, loopback, {"--public-ip", testIP}}, false, private, api.DoctorStatusSkip, codePublicIPLoopback, "", skipText},
+		{"auto mode with a domain", [][]string{domain, loopback}, true, private, api.DoctorStatusSkip, codePublicIPLoopback, "", skipText},
+		{"manual mode with a domain", [][]string{manual, domain, loopback}, false, private, api.DoctorStatusSkip, codePublicIPLoopback, "", skipText},
+
+		// The loopback setup where the site is the server's address: checked.
+		{"ip mode without an address, running", [][]string{ip, loopback}, true, private, api.DoctorStatusFail, codePublicIPNone, fixPublicIPSet,
+			noneText + "\nisshoni is running but not ready, and nobody can open it"},
+		{"ip mode without an address, offline", [][]string{ip, loopback}, false, private, api.DoctorStatusFail, codePublicIPNone, fixPublicIPSet,
+			noneText + "\nisshoni will start, but it won't be ready"},
+		{"manual mode without a domain, no address", [][]string{manual, loopback}, true, private, api.DoctorStatusFail, codePublicIPNone, fixPublicIPSet,
+			noneText + "\nisshoni is running but not ready, and nobody can open it"},
+		{"ip mode with public_ip set", [][]string{ip, loopback, {"--public-ip", testIP, "--network.ipv6=false"}}, false, private,
+			api.DoctorStatusOK, codePublicIPOK, "", testIP + " (set in the config)"},
+		{"ip mode with an address on an interface", [][]string{ip, loopback}, true, public,
+			api.DoctorStatusOK, codePublicIPOK, "", testIP + " (on interface eth0), " + testIPv6},
+
+		// One of the two keys alone: checked.
+		{"include_loopback with a STUN server, off mode", [][]string{off, {"--network.include-loopback=true", "--network.stun-servers", stunServer}}, false, private,
+			api.DoctorStatusFail, codePublicIPNone, fixPublicIPSet, noneText + "\nthe site opens, but nobody can share or watch"},
+		{"no STUN server without include_loopback, off mode", [][]string{off, {"--network.stun-servers", ""}}, true, private,
+			api.DoctorStatusFail, codePublicIPNone, fixPublicIPSet, noneText + "\nthe site opens, but nobody can share or watch"},
+		{"neither, off mode", [][]string{off, {"--network.stun-servers", stunServer}}, false, private,
+			api.DoctorStatusFail, codePublicIPNone, fixPublicIPSet, noneText + "\nthe site opens, but nobody can share or watch"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := newWorld(t, slices.Concat(tt.args...)...)
+			w.files = withoutDMI(w)
+			w.env.Interfaces = tt.ifaces
+			stun := &fakeSTUN{} // no STUN server answers
+			w.env.STUN = stun
+			if tt.running {
+				// What the server found at its start: the public addresses of its interfaces, and no NAT kind,
+				// which only a STUN answer tells.
+				*w.live = api.ServerStatus{Version: "0.3.0", UptimeS: 30, NAT: api.NATKindUnknown, LocalIPv4: tt.ifaces.route}
+				for _, a := range tt.ifaces.ifs[1].Addrs {
+					switch {
+					case a.Addr.IsPrivate():
+					case a.Addr.Is4():
+						w.live.PublicIPv4, w.live.PublicIPv4Method = a.Addr.String(), "interface"
+					default:
+						w.live.PublicIPv6, w.live.PublicIPv6Method = a.Addr.String(), "interface"
+					}
+				}
+			} else {
+				w.live = nil
+			}
+
+			rep := Run(t.Context(), w.build(), api.BandwidthInput{}, []string{"public_ip"})
+			c := rep.Checks[0]
+			want(t, c, tt.status, tt.code, tt.fix)
+			if tt.status == api.DoctorStatusFail {
+				contains(t, c.Message, tt.message)
+			} else if c.Message != tt.message {
+				t.Errorf("message:\n got %q\nwant %q", c.Message, tt.message)
+			}
+			if tt.status != api.DoctorStatusSkip {
+				return
+			}
+			// A skipped check asks nobody, carries no params and no fix, and counts as skipped: the report of a
+			// development server has no failure and no warning from it.
+			if stun.calls != 0 {
+				t.Errorf("the skipped check sent %d STUN queries", stun.calls)
+			}
+			if c.Params != nil || c.Fix != "" {
+				t.Errorf("params %v, fix %q; want none", c.Params, c.Fix)
+			}
+			if rep.Summary != (api.DoctorCounts{Skip: 1}) {
+				t.Errorf("summary %+v, want one skipped check", rep.Summary)
+			}
+			var b strings.Builder
+			RenderText(&b, rep, false)
+			_, lines, _ := strings.Cut(b.String(), "\n")
+			if wantText := "[skip] public_ip     " + skipText + "\n0 ok · 0 warn · 0 fail · 1 skipped\n"; lines != wantText {
+				t.Errorf("text output:\n%s\nwant:\n%s", lines, wantText)
+			}
+		})
+	}
+
+	// The preconditions of the table: the flags above give the configs they are meant to.
+	cfg := loadConfig(t, slices.Concat(off, loopback)...)
+	if !cfg.Network.IncludeLoopback || len(cfg.Network.STUNServers) != 0 {
+		t.Errorf("the loopback flags give include_loopback %v, stun_servers %q", cfg.Network.IncludeLoopback, cfg.Network.STUNServers)
+	}
+	if cfg := loadConfig(t, off...); cfg.Network.IncludeLoopback || len(cfg.Network.STUNServers) == 0 {
+		t.Errorf("the defaults are include_loopback %v, stun_servers %q", cfg.Network.IncludeLoopback, cfg.Network.STUNServers)
+	}
+}
+
+// The development configs of this repository (06 §7.3) are loopback setups: the servers of `task dev` and of the
+// e2e tests, which find no public address and need none, get a report without a public_ip failure.
+func TestPublicIPDevConfigs(t *testing.T) {
+	for _, name := range []string{"isshoni.dev.toml", "isshoni.e2e.toml"} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join("..", "..", "..", "..", "deploy", "dev", name)
+			args := []string{"--config", path, "--data-dir", t.TempDir()}
+			cfg, err := config.Load(flag.NewFlagSet("test", flag.ContinueOnError), args, []string{})
+			if err != nil {
+				t.Fatalf("load %s: %v", name, err)
+			}
+			for _, running := range []bool{true, false} {
+				w := newWorld(t)
+				w.env.Config = cfg
+				w.env.Interfaces = &fakeIfaces{ifs: []netx.Interface{iface("lo", "127.0.0.1")}}
+				if running {
+					*w.live = api.ServerStatus{Version: "0.3.0", UptimeS: 30, NAT: api.NATKindUnknown}
+				} else {
+					w.live = nil
+				}
+				want(t, w.check("public_ip"), api.DoctorStatusSkip, codePublicIPLoopback, "")
+			}
+		})
+	}
 }
 
 // ip mode on AWS and GCP gets the note about the address that changes on stop/start, with the provider's install

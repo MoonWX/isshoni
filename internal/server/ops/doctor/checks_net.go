@@ -87,8 +87,25 @@ func (r *run) siteIsAddress() bool {
 	return mode == config.TLSIP || (mode == config.TLSManual && r.cfg.Domain == "")
 }
 
+// loopbackSetup reports a development setup that looks for no public address: network.include_loopback puts the
+// loopback addresses among the media candidates, for a browser on the server's own machine, and with
+// network.stun_servers empty no STUN server is asked for the address that others would see (deploy/dev's configs
+// for `task dev` and the e2e servers).
+func (r *run) loopbackSetup() bool {
+	return r.cfg.Network.IncludeLoopback && len(r.cfg.Network.STUNServers) == 0
+}
+
 // checkPublicIP reports the public addresses, how they were found and what kind of NAT is in front (04 §7.4).
+//
+// In a loopback setup it is skipped, with the two keys as the reason: such a server needs no public address, so a
+// missing one is no failure, and one that the machine happens to have says nothing about the setup (the report
+// would differ from one developer's machine to the next). The exception is a site that is the server's address (ip
+// mode, manual mode without a domain): without the address that server is not ready, whatever the setup, so the
+// check runs and fails as everywhere else.
 func checkPublicIP(ctx context.Context, r *run) result {
+	if r.loopbackSetup() && !r.siteIsAddress() {
+		return skipResult(codePublicIPLoopback, nil)
+	}
 	pub := r.publicAddrs(ctx)
 	p := params{"nat": string(pub.nat)}
 	if pub.v4.IsValid() {

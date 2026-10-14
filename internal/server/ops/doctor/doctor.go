@@ -17,7 +17,8 @@
 //
 // Statuses: ok (checked, fine, or nothing to check in this configuration), info (a fact the operator should read;
 // never counted as a problem), warn, fail, and skip (the check could not run: it needs a running server, the
-// platform can't answer, or the run was interrupted).
+// platform can't answer, or the run was interrupted; or it has nothing to judge: public_ip in a development setup
+// on the loopback interface).
 //
 // Everything the checks ask of the machine or the network goes through Env, so tests answer with fakes and make
 // no network call. bandwidth.go has the calculator of 04 §13.4, render.go the CLI's text output.
