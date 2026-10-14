@@ -131,7 +131,8 @@ func TestAdminCapREMB(t *testing.T) {
 // TestLayerPausing: nobody asks for high for 10 s, and the sharer is told to pause the full layer, as a browser
 // would apply it (sfutest.ApplyHint); the share stays live with both layers listed. A WebSocket resume brings the
 // hint again. When a viewer asks for high, the layer resumes at once, with a PLI, and the viewer's stream goes on in
-// the full layer from its keyframe. Back on the preview layer, 10 s later the full layer is paused again.
+// the full layer from its keyframe. Back on the preview layer, the full layer is paused again 10 s after the first
+// look that finds the request for high gone.
 func TestLayerPausing(t *testing.T) {
 	h := newHarness(t, sfutest.HarnessOptions{PauseUnwatchedLayers: true})
 	const share = sfu.ShareID("s_pause")
@@ -201,9 +202,13 @@ func TestLayerPausing(t *testing.T) {
 		switchTime(t, video.Packets()[mark:], "f", asked))
 	checkVideo(t, "video", video.Packets())
 
-	// Back to low: ten seconds later f is paused again.
+	// Back to low: ten seconds after the first look that finds no request for high, f is paused again. The test
+	// makes that look itself, so the ten seconds it moves the clock on come after it.
 	subscribe(t, viewConn, sfu.SubscriptionUpdate{Share: share, Video: sfu.QualityLow, Audio: true})
 	waitFrames(t, video, len(video.Packets()), "q", 3)
+	if err := pubConn.CheckUplink(testCtx(t)); err != nil {
+		t.Fatal(err)
+	}
 	h.SFU.AdvanceUplinkClock(sfu.PauseAfter)
 	wantHint(t, nthHint(t, sig, 4), share, sfu.HintReasonViewers, 0, false, true)
 }

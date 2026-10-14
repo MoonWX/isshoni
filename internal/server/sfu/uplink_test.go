@@ -38,8 +38,9 @@ func (r *recSignaler) waitHints(t *testing.T, n int) []QualityHintEvent {
 }
 
 // TestM1UplinkPolicy is the policy of 02 §11 on a fake clock: the admin's cap always, and with layer pausing the full
-// layer off once nobody has asked for high for 10 s (not a nanosecond before), on again with the first request, and
-// never off while the share has no preview layer.
+// layer off once nobody has asked for high for 10 s (not a nanosecond before), counted from the share's start or from
+// the first look that finds the request for high gone, on again with the first request, and never off while the share
+// has no preview layer.
 func TestM1UplinkPolicy(t *testing.T) {
 	s, _ := newTicklessSFU(t)
 	var clock int64
@@ -76,13 +77,27 @@ func TestM1UplinkPolicy(t *testing.T) {
 	tick(p, both, UplinkDecision{}) // no change
 	tick(p, focused, UplinkDecision{Active: on})
 	tick(p, focused, UplinkDecision{})
-	// The 10 s count from the last look that found a request for high.
+	// The 10 s count from the first look that finds no request for high, not from the last one that found one: the
+	// request may have ended just after that look, so 10 s after it are not 10 s without a request.
+	advance(pauseAfter)
+	tick(p, both, UplinkDecision{})
 	advance(pauseAfter - 1)
 	tick(p, both, UplinkDecision{})
 	advance(1)
 	s.SetLimits(Limits{MaxShareKbps: 3000})
 	tick(p, both, UplinkDecision{MaxBitrate: 3_000_000, Active: off})
 	s.SetLimits(Limits{})
+	// A request for high within the 10 s starts them again, at the first look that finds it gone.
+	tick(p, focused, UplinkDecision{Active: on})
+	tick(p, both, UplinkDecision{})
+	advance(pauseAfter / 2)
+	tick(p, focused, UplinkDecision{})
+	advance(pauseAfter / 2)
+	tick(p, both, UplinkDecision{}) // the count starts again here
+	advance(pauseAfter - 1)
+	tick(p, both, UplinkDecision{})
+	advance(1)
+	tick(p, both, UplinkDecision{Active: off})
 
 	// A share without its preview layer keeps its full layer: it is all the share's viewers could get.
 	p = newM1Uplink(s, now)
@@ -98,7 +113,9 @@ func TestM1UplinkPolicy(t *testing.T) {
 // TestUplinkHints: a share's sharer hears where its uplink stands only when that changes (02 §11): f paused 10 s
 // after the share started without a request for high, with the reason viewers and the full encodings; resumed at once,
 // without waiting for the ticker, when a viewer asks for high, and asked for a keyframe then; a cap change with the
-// reason admin; both in one hint, with the reason viewers, when they change together. A paused layer's keyframe
+// reason admin; both in one hint, with the reason viewers, when they change together. The 10 s without a request for
+// high count from the first look that finds it gone, so a request that ended 0.9 s after a look is not paused 9.1 s
+// later. A paused layer's keyframe
 // requests do nothing, so that the one after the resume finds the throttle unspent. A viewer that the downlink
 // allocator holds at the preview layer still counts as asking for high. UpdateShare and Resync tell the sharer the
 // same state.
@@ -211,10 +228,20 @@ func TestUplinkHints(t *testing.T) {
 	if got := pubSig.waitHints(t, 4); !reflect.DeepEqual(got[3], hint(HintReasonAdmin, 2_500_000, 0)) {
 		t.Errorf("the hint after the cap changed = %+v", got[3])
 	}
-	// Back to low, 10 s pass, and the cap changes in the same look: one hint, with the reason viewers.
-	request(QualityLow)
+	// A look finds the request for high, which ends 0.9 s later. The next look, 10 s after the one that found it and
+	// 9.1 s after it ended, pauses nothing: it is the first that finds the request gone, and the 10 s count from it.
 	look()
-	s.AdvanceUplinkClock(pauseAfter)
+	s.AdvanceUplinkClock(900 * time.Millisecond)
+	request(QualityLow)
+	s.AdvanceUplinkClock(9100 * time.Millisecond)
+	look()
+	s.AdvanceUplinkClock(pauseAfter - time.Second)
+	look()
+	if n := len(pubSig.hints()); n != 4 {
+		t.Fatalf("%d hints less than 10 s after the first look that found no request for high, want 4", n)
+	}
+	// 10 s after that look, the cap changes in the same look that pauses f: one hint, with the reason viewers.
+	s.AdvanceUplinkClock(time.Second)
 	s.SetLimits(Limits{MaxShareKbps: 3000})
 	settle(pub)
 	look()
@@ -237,6 +264,123 @@ func TestUplinkHints(t *testing.T) {
 	settle(pub)
 	if n := len(pubSig.hints()); n != 5 {
 		t.Errorf("%d hints after the share ended, want 5", n)
+	}
+}
+
+// TestUplinkUpdateShare: UpdateShare's params don't count as told to the sharer, since the hub also runs another of
+// the user's connections' share.update on the sharer's Conn and replies to that connection (01 §8.7). An UpdateShare
+// that runs between a new cap and the look that SetLimits posts returns the new cap, and the look still tells the
+// sharer, with the reason admin.
+func TestUplinkUpdateShare(t *testing.T) {
+	s, _ := newTicklessSFU(t)
+	ctx := testCtx(t)
+	pub, pubSig := join(t, s, "lounge", "alice", "c-pub", RoleFull)
+	startShare(t, pub, "s_1")
+	var params ShareParams
+	err := pub.do(ctx, func(context.Context) error { // the look comes after this, on the same actor
+		s.SetLimits(Limits{MaxShareKbps: 2000})
+		var err error
+		params, err = pub.updateShare("s_1", ShareUpdate{})
+		return err
+	})
+	if err != nil || params.Encodings[0].MaxBitrate != 2_000_000 {
+		t.Fatalf("UpdateShare under the new cap = %+v, %v", params, err)
+	}
+	settle(pub)
+	want := QualityHintEvent{
+		Share: "s_1", Reason: HintReasonAdmin, MaxBitrate: 2_000_000, Encodings: presetEncodings(PresetAuto, 2_000_000, 0),
+	}
+	if got := pubSig.hints(); len(got) != 1 || !reflect.DeepEqual(got[0], want) {
+		t.Errorf("hints after an UpdateShare under the new cap = %+v, want %+v", got, want)
+	}
+}
+
+// TestAllocatorPausedLayer: a request for high, made while the viewer's downlink allocator is limited, for a share
+// whose full layer is paused. The layer measures 0 bps, but weighs its maximum (02 §10.2, §11), so the request is
+// capped with the reason bandwidth when 8 Mbit/s don't fit the budget, rather than served at a layer measured at
+// 0 bps. It counts as a request for high all the same, so the layer resumes. For 2 s after the resume the layer
+// weighs its maximum still, while its 2 s moving average catches up, then its measured rate again.
+func TestAllocatorPausedLayer(t *testing.T) {
+	s, _ := newTicklessSFU(t)
+	s.pauseUnwatched = true
+	ctx := testCtx(t)
+	pub, pubSig := join(t, s, "lounge", "alice", "c-pub", RoleFull)
+	startShare(t, pub, "s_1")
+	sh := s.lookupShare("s_1")
+	f, _ := testLayer(t, sh, SlotF, 0xf00)
+	q, _ := testLayer(t, sh, SlotQ, 0xa00)
+	q.stats.bitrate.Store(300_000)
+	viewer, _ := join(t, s, "lounge", "bob", "c-view", RoleViewer)
+	request := func(want Quality) {
+		t.Helper()
+		errs, err := viewer.UpdateSubscriptions(ctx, []SubscriptionUpdate{{Share: "s_1", Video: want}})
+		if err != nil || errs[0] != nil {
+			t.Fatalf("UpdateSubscriptions(%v) = %v, %v", want, errs, err)
+		}
+	}
+	// refocus has the viewer's request go to low and back to high: a new request for high, which the limited
+	// allocator weighs, and returns its cap reason.
+	refocus := func() SubReason {
+		t.Helper()
+		request(QualityLow)
+		request(QualityHigh)
+		var reason SubReason
+		if err := viewer.do(ctx, func(context.Context) error {
+			reason = viewer.subs["s_1"].capReason
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return reason
+	}
+	weighs := func(want int64) {
+		t.Helper()
+		if got := sh.allocRate(f); got != want {
+			t.Errorf("the full layer weighs %d bit/s, want %d", got, want)
+		}
+	}
+
+	request(QualityLow)
+	s.AdvanceUplinkClock(pauseAfter)
+	if err := pub.CheckUplink(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if sh.paused.Load() != 1<<SlotF {
+		t.Fatalf("Share.paused = %#b, want f", sh.paused.Load())
+	}
+	weighs(fullMaxBitrate)
+	if err := viewer.do(ctx, func(context.Context) error {
+		viewer.alloc.state, viewer.alloc.budget = allocLimited, 1_000_000
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The paused layer doesn't fit 1 Mbit/s, and the request resumes it.
+	if reason := refocus(); reason != SubReasonBandwidth {
+		t.Errorf("a request for high for a paused layer: the cap reason is %q, want %q", reason, SubReasonBandwidth)
+	}
+	if got := pubSig.waitHints(t, 2); !got[1].Encodings[0].Active || sh.paused.Load() != 0 {
+		t.Fatalf("the hint after the request for high = %+v, Share.paused %#b: f must resume", got[1], sh.paused.Load())
+	}
+	// Just resumed, f measures 400 kbit/s while its average catches up: it weighs 8 Mbit/s still.
+	f.stats.bitrate.Store(400_000)
+	weighs(fullMaxBitrate)
+	if reason := refocus(); reason != SubReasonBandwidth {
+		t.Errorf("a request for high right after the resume: the cap reason is %q, want %q", reason, SubReasonBandwidth)
+	}
+	// 2 s after the resume its measured rate counts, and 400 kbit/s fit; 8 Mbit/s measured don't.
+	s.AdvanceUplinkClock(rateWindow)
+	weighs(400_000)
+	if reason := refocus(); reason != SubReasonNone {
+		t.Errorf("a request for high for a layer that fits: the cap reason is %q", reason)
+	}
+	f.stats.bitrate.Store(8_000_000)
+	if reason := refocus(); reason != SubReasonBandwidth {
+		t.Errorf("a request for high for a layer measured at 8 Mbit/s: the cap reason is %q", reason)
+	}
+	if n := len(pubSig.hints()); n != 2 {
+		t.Errorf("%d hints, want 2: f stays on while the viewer asks for high", n)
 	}
 }
 
@@ -402,7 +546,7 @@ func TestUplinkREMB(t *testing.T) {
 
 // TestLayerJitter is the interarrival jitter of RFC 3550 §6.4.1 that a layer measures for its uplink policy: 0 for
 // packets that arrive as they were sent; |D| for a delay that alternates by D; packets that come late or after a
-// pause of more than 10 s change nothing.
+// pause of more than 10 s change nothing; a frame of many packets is one sample.
 func TestLayerJitter(t *testing.T) {
 	s, _ := newTicklessSFU(t)
 	sh := testShare(t, s, "s_1")
@@ -462,5 +606,23 @@ func TestLayerJitter(t *testing.T) {
 	st := sh.uplinkStats(ClientWeb)
 	if len(st.Layers) != 1 || st.Layers[0].RID != "f" || st.Layers[0].Jitter != video.jitterNow() {
 		t.Errorf("uplink stats = %+v", st)
+	}
+
+	// Frames of 10 packets 0.1 ms apart, each frame 2 ms late or early in turn, on a new layer: only the first packet
+	// of a frame is a sample, against the last packet of the frame before, so the jitter is the frames' 2 ms. A sample
+	// per packet would make it about a tenth of that.
+	frames, _ := testLayer(t, testShare(t, s, "s_2"), SlotF, 0xf2)
+	for i := range 300 {
+		late := time.Duration(i%2) * 2 * time.Millisecond
+		for k := range 10 {
+			if k > 0 {
+				seq++
+			}
+			send(frames, late+time.Duration(k)*100*time.Microsecond)
+		}
+		step(3000, time.Second/30)
+	}
+	if j := frames.jitterNow(); j < 1900*time.Microsecond || j > 2100*time.Microsecond {
+		t.Errorf("jitter of frames of 10 packets = %v, want 2 ms", j)
 	}
 }

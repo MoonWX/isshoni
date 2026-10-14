@@ -59,14 +59,18 @@ const (
 
 // m1Uplink is the M1 policy of 02 §11, one per share and the same for every publisher. The cap is the admin's
 // (Limits.MaxShareKbps). With sfu.pause_unwatched_layers on, the full layer is paused once nobody has asked for high
-// for 10 s, counted from the share's start, and resumes as soon as somebody does. Nothing else is ever paused: the
+// for 10 s, and resumes as soon as somebody does. The 10 s count from the share's start, or from the first look that
+// found no request for high after one that found some: the last request ended between those two looks, a second
+// apart at most, so the layer is paused 10 to 11 s after it ended, never before. Nothing else is ever paused: the
 // preview layer is what every thumbnail shows, and the full layer of a share that has no preview layer is the only
 // video it has.
 type m1Uplink struct {
 	sfu *SFU
 	now func() int64 // the clock: SFU.uplinkNow
-	// wantedAt is the time at which a viewer last asked for high, or the share started.
+	// wantedAt is when the 10 s began: the share's start, or the first look that found no request for high after
+	// one that found some (watched). While watched, it is the last look that found one.
 	wantedAt int64
+	watched  bool
 	paused   bool
 }
 
@@ -76,14 +80,18 @@ func (p *m1Uplink) Tick(s ShareUplinkStats) UplinkDecision {
 		return d
 	}
 	now := p.now()
-	switch {
-	case s.HighRequests > 0:
-		p.wantedAt = now
+	if s.HighRequests > 0 {
+		p.wantedAt, p.watched = now, true
 		if p.paused {
 			p.paused = false
 			d.Active = map[string]bool{ridFull: true}
 		}
-	case !p.paused && now-p.wantedAt >= int64(pauseAfter) && slices.ContainsFunc(s.Layers, isPreview):
+		return d
+	}
+	if p.watched {
+		p.wantedAt, p.watched = now, false // the request for high ended since the last look
+	}
+	if !p.paused && now-p.wantedAt >= int64(pauseAfter) && slices.ContainsFunc(s.Layers, isPreview) {
 		p.paused = true
 		d.Active = map[string]bool{ridFull: false}
 	}
@@ -98,9 +106,9 @@ func (s *SFU) uplinkNow() int64 { return monoNow() + s.uplinkSkew.Load() }
 // shareUplink is a share's uplink control as the publishing Conn's actor keeps it (02 §11).
 type shareUplink struct {
 	policy UplinkPolicy
-	// capBps is the cap the sharer was told last, in bit/s (0 for none): by the ShareParams of StartShare or
-	// UpdateShare, or by a hint. paused holds the slot bits of the layers it was told to pause (Share.paused is the
-	// copy for other goroutines).
+	// capBps is the cap the sharer was told last, in bit/s (0 for none): by the ShareParams of StartShare, or by a
+	// hint. UpdateShare's don't count, as they may go to another of the user's connections (01 §8.7). paused holds the
+	// slot bits of the layers it was told to pause (Share.paused is the copy for other goroutines).
 	capBps int
 	paused uint32
 	// reason is the reason of the last hint, "" before the first: Resync tells the sharer again what the hints told
@@ -126,8 +134,9 @@ func (u *shareUplink) hint(id ShareID, preset Preset) QualityHintEvent {
 	}
 }
 
-// uplinkStats returns what the share's uplink policy decides by. It reads atomics only: the viewers' requests as
-// their actors published them (Subscription.requested), and the layers' rates of the ticker's last second.
+// uplinkStats returns what the share's uplink policy decides by. It reads the viewers' requests as their actors
+// published them (Subscription.requested), the layers' rates of the ticker's last second and their jitter (atomics),
+// and the share's layer set under Share.mu, a leaf.
 func (s *Share) uplinkStats(client ClientKind) ShareUplinkStats {
 	st := ShareUplinkStats{Client: client}
 	viewers := s.downTracks(webrtc.RTPCodecTypeVideo)
@@ -154,6 +163,28 @@ func (s *Share) uplinkStats(client ClientKind) ShareUplinkStats {
 		st.Layers = append(st.Layers, ls)
 	}
 	return st
+}
+
+// allocRate returns the rate in bit/s at which the downlink allocators weigh the share's layer l (02 §10.2): its
+// measured rate, unless that says nothing about what the layer brings a viewer who gets it. A video layer the sharer
+// was told to pause measures 0 within seconds, and one it was told to resume less than rateWindow ago measures less
+// than it sends while its 2 s moving average catches up: such a layer weighs at least its maximum
+// (Share.maxBitrate). So a request for high made while the viewer's allocator is limited is capped unless the full
+// layer's maximum fits, rather than served at a layer measured at 0 bps; the request still counts for the uplink
+// policy (ShareUplinkStats.HighRequests), so the layer resumes, and the next trial upgrade tests a layer that flows
+// (02 §11). It reads atomics only.
+func (s *Share) allocRate(l *Layer) int64 {
+	rate := l.stats.bitrate.Load()
+	if l.slot >= SlotAudio {
+		return rate
+	}
+	if s.paused.Load()&(1<<l.slot) != 0 {
+		return max(rate, s.maxBitrate(l.slot))
+	}
+	if at := s.resumedAt[l.slot].Load(); at != 0 && s.conn.sfu.uplinkNow()-at < int64(rateWindow) {
+		return max(rate, s.maxBitrate(l.slot))
+	}
+	return rate
 }
 
 // askedForHigh runs on a viewer's actor when its request for the share has become high (UpdateSubscriptions), after
@@ -207,8 +238,9 @@ func (c *Conn) ownShares() []*Share {
 // cap or its pause state did, with the reason viewers when the pause state did (that wins over a cap that changed
 // with it), else admin. Each hint carries both, whole. A layer that resumes gets a keyframe request once the hint is
 // out, for the viewers who wait for it: a sharer that sends the layer again starts it with a keyframe of its own
-// accord, and one that never stopped it (a client that applies no encodings) is asked here. It runs on the actor; a
-// share that has ended gets nothing.
+// accord, and one that never stopped it (a client that applies no encodings) is asked here. The time of the resume
+// goes to Share.resumedAt, for the downlink allocators (allocRate). It runs on the actor; a share that has ended gets
+// nothing.
 func (c *Conn) lookAtUplink(sh *Share) {
 	up := &sh.up
 	if sh.conn != c || up.policy == nil {
@@ -240,6 +272,15 @@ func (c *Conn) lookAtUplink(sh *Share) {
 	up.paused, up.capBps, up.reason = paused, capBps, HintReasonAdmin
 	if pausing {
 		up.reason = HintReasonViewers
+	}
+	if resumed != 0 {
+		// Before the paused bits go, so the downlink allocator never sees a resumed layer as neither (allocRate).
+		at := max(c.sfu.uplinkNow(), 1)
+		for slot := range SlotAudio {
+			if resumed&(1<<slot) != 0 {
+				sh.resumedAt[slot].Store(at)
+			}
+		}
 	}
 	sh.paused.Store(paused)
 	c.log.Debug("quality hint", "share_id", string(sh.id), "reason", up.reason, "max_bitrate", capBps,

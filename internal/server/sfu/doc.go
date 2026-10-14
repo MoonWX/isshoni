@@ -102,10 +102,11 @@
 //     wait. Audio is never paced.
 //   - A share's uplink control (02 §11: its policy, the cap and pause state its sharer was told) belongs to the
 //     publishing Conn's actor, like everything else the Conn publishes: the ticker, SetLimits and a viewer's request
-//     for high only post to that actor. What other goroutines need of it is an atomic, Share.paused: a keyframe
-//     request for a paused layer does nothing. The viewers' requests reach the policy as each subscriber's actor
-//     published them (Subscription.shown), and a request for high has that actor post a look after it published it,
-//     so the look sees it.
+//     for high only post to that actor. What other goroutines need of it are atomics: Share.paused (a keyframe
+//     request for a paused layer does nothing) and Share.resumedAt, which the actor stores before it clears a bit
+//     of Share.paused (the downlink allocators weigh a paused or just resumed layer at its maximum, allocRate). The
+//     viewers' requests reach the policy as each subscriber's actor published them (Subscription.shown), and a request
+//     for high has that actor post a look after it published it, so the look sees it.
 //   - WriteRTP and WriteRTCP are media calls, not signaling calls: the media goroutines make them, and so may any
 //     actor, also for another Conn's pub PC (a keyframe request). Pion allows them from any goroutine and they
 //     never block. Keyframe requests are throttled per layer by a compare-and-swap, so callers need no lock.
@@ -206,7 +207,8 @@
 //     the viewer's network starts the count again), or more than 50 queue drops a second. It fills a budget cheapest
 //     first (audio, thumbnails, then the newest high requests), and after a backoff of 10 s, doubling up to 120 s
 //     with each trial that fails, lifts the caps for a 6 s trial upgrade: REMB can't grant an upgrade, so one is
-//     tried. A new high request while capped is served at the full layer only if that layer's measured rate fits.
+//     tried. A new high request while capped is served at the full layer only if that layer's measured rate fits
+//     (its maximum while the layer is paused for its sharer, and for 2 s after it resumed: 02 §11).
 //     ConnStats.DownlinkEstimate is its budget while it caps, else the viewer's latest REMB. Each video DownTrack
 //     paces what it sends through a token bucket of max(2.5 × the layer's maximum, 3 × its measured rate, 2 Mbit/s)
 //     holding 20 ms of that: a keyframe after a still screen leaves over tens of milliseconds, not in one burst per
@@ -215,13 +217,15 @@
 //     asks once a second, when the admin's cap changes, and at once when a viewer asks for high, so a paused layer
 //     resumes without waiting. M1's policy is the admin's cap (Limits.MaxShareKbps) for every publisher, and with
 //     sfu.pause_unwatched_layers the full layer paused once no viewer has asked for high for 10 s, counted from the
-//     share's start; a viewer held at the preview layer by its downlink allocator still asks for high, and a share
-//     without a preview layer is never paused. The sharer hears of a change of its cap or pause state through a
-//     QualityHintEvent with the full encodings (the reason viewers when the pause state changed, else admin), and a
-//     layer that resumes is asked for a keyframe right after the hint; UpdateShare's encodings and Resync say the same.
-//     While every share of a pub PC has a cap, the PC gets a REMB of their sum every second, naming their video
-//     layers, and three REMBs of no limit once the cap is gone. Layers measure their interarrival jitter for the
-//     policy (RFC 3550);
+//     share's start or from the first look that found the last request for high gone; a viewer held at the preview
+//     layer by its downlink allocator still asks for high, and a share without a preview layer is never paused.
+//     While a layer is paused, and for 2 s after it resumed, the downlink allocators weigh it at its maximum, not at
+//     its measured rate, which is 0 or catching up (Share.allocRate). The sharer hears of a change of its cap or
+//     pause state through a QualityHintEvent with the full encodings (the reason viewers when the pause state
+//     changed, else admin), and a layer that resumes is asked for a keyframe right after the hint; UpdateShare's
+//     encodings and Resync say the same. While every share of a pub PC has a cap, the PC gets a REMB of their sum
+//     every second, naming their video layers, and three REMBs of no limit once the cap is gone. Layers measure
+//     their interarrival jitter for the policy (RFC 3550), one sample per frame;
 //   - events.go, errors.go, types.go, config.go, stats.go: the whole interface of 02 §6 and §13;
 //   - stats.go, counters.go, pionlog.go: observability (02 §13). Conn.Stats, SFU.Snapshot and SFU.Metrics never ask
 //     an actor and never wait: they read what the Layers and DownTracks measure (their rates are the ticker's, once

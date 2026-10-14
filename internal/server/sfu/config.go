@@ -155,7 +155,7 @@ const (
 	// A layer's rates are 2 s moving averages, and a layer without a packet for 2 s isn't active (02 §9.1).
 	rateWindow  = 2 * time.Second
 	activeAfter = 2 * time.Second
-	// jitterGap: a packet that arrives this long after the last one a layer's jitter estimate sampled starts the
+	// jitterGap: a packet that arrives this long after the last one a layer's jitter estimate took starts the
 	// estimate again from there, as the first packet does (Layer.sampleJitter). A layer that its sharer paused for an
 	// hour has no interarrival time to speak of, and the arithmetic in clock ticks stays far from overflowing.
 	jitterGap = 10 * time.Second

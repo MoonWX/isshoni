@@ -96,7 +96,7 @@ type Layer struct {
 	highSeq    uint16 // the highest sequence number seen (int16 order)
 	tsStarted  bool
 	highTS     uint32 // the highest timestamp of a cached packet (int32 order): a newer one is a new frame
-	// The last packet the jitter estimate sampled (sampleJitter): its arrival (monoNow, 0 before the first) and its
+	// The last packet the jitter estimate took (sampleJitter): its arrival (monoNow, 0 before the first) and its
 	// timestamp.
 	jitterAt int64
 	jitterTS uint32
@@ -275,12 +275,16 @@ func (l *Layer) span(seq uint16) (newest bool) {
 }
 
 // sampleJitter feeds the stream's interarrival jitter estimate (RFC 3550 §6.4.1) one packet: its RTP timestamp and
-// its arrival. The RTP loop calls it for the packets that are the newest of the stream when they arrive, as libwebrtc
-// does: a late or repaired one would count its own delay as jitter. Only the track's reader calls it.
+// its arrival. The RTP loop calls it for the packets that are the newest of the stream when they arrive, and only a
+// packet with a new timestamp (the first of a video frame) is a sample, against the last packet before it, as
+// libwebrtc does (receive_statistics_impl.cc): a late or repaired packet would count its own delay as jitter, and
+// the packets of one frame, which leave together, would count how close together they arrive, so many samples near
+// 0 would hide the frames' jitter. Each newest packet still moves the reference on, so a frame is measured from the
+// last packet of the one before. Only the track's reader calls it.
 func (l *Layer) sampleJitter(ts uint32, now int64) {
 	last, lastTS := l.jitterAt, l.jitterTS
 	l.jitterAt, l.jitterTS = now, ts
-	if last == 0 || now-last > int64(jitterGap) || now < last {
+	if last == 0 || now-last > int64(jitterGap) || now < last || ts == lastTS {
 		return
 	}
 	clock := int64(videoClockRate)

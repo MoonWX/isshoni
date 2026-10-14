@@ -34,7 +34,8 @@ import (
 //     covers came after the decision;
 //   - what the queues of its DownTracks dropped (drops; at these rates the writer is starved of CPU);
 //   - the rate the SFU forwards to it now: its DownTracks' bitrates, 2 s moving averages (the actor's step);
-//   - the measured bitrate of each layer, 2 s moving averages (02 §9.1), for what fits the budget.
+//   - the measured bitrate of each layer, 2 s moving averages (02 §9.1), for what fits the budget. A layer that its
+//     sharer was told to pause, or to resume less than 2 s ago, weighs its maximum instead (Share.allocRate, 02 §11).
 //
 // The decisions are its Conn's actor's (Conn.adapt): once a second, when the ticker wakes it, and at once when a
 // REMB falls or a report shows loss. The caps it sets are the subscriptions' server cap (Conn.capSubscription, 02
@@ -336,7 +337,8 @@ func (a *allocator) step(now, forwarded int64, drops uint64) allocDecision {
 	return d
 }
 
-// allocItem is one subscription as the allocation weighs it (all rates in bit/s, measured: 2 s moving averages).
+// allocItem is one subscription as the allocation weighs it (all rates in bit/s, measured: 2 s moving averages, or a
+// paused or just resumed layer's maximum, Share.allocRate).
 type allocItem struct {
 	high  bool   // the client asks for the video at high
 	order uint64 // when it asked for high (Subscription.highAt): the newest is served first
@@ -468,14 +470,14 @@ func (c *Conn) requestChanged(sub *Subscription, wasHigh bool) {
 	}
 }
 
-// allocItem returns the subscription as the allocation weighs it, from the layers its share has now and their
-// measured rates. A subscription whose viewer can't decode the video (Subscription.codec) gets none and weighs only
-// its audio.
+// allocItem returns the subscription as the allocation weighs it, from the layers its share has now and their measured
+// rates (a layer paused for its sharer, or resumed less than 2 s ago, at its maximum: Share.allocRate, 02 §11). A
+// subscription whose viewer can't decode the video (Subscription.codec) gets none and weighs only its audio.
 func (s *Subscription) allocItem() allocItem {
 	layers := s.share.layerSet()
 	rate := func(slot Slot) int64 {
 		if l := layers[slot]; l != nil {
-			return l.stats.bitrate.Load()
+			return s.share.allocRate(l)
 		}
 		return 0
 	}

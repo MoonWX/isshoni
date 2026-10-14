@@ -60,6 +60,11 @@ type Share struct {
 	// other than the publishing Conn's actor. A keyframe request for a paused layer does nothing
 	// (Layer.requestKeyframe), and a viewer's new request for high has the actor look at once (askedForHigh).
 	paused atomic.Uint32
+	// resumedAt holds, per video slot, when the sharer was last told to resume the layer, on the uplink policies'
+	// clock (SFU.uplinkNow), 0 for never: the publishing Conn's actor stores it before it clears the slot's bit in
+	// paused. For rateWindow after it the layer's measured rate lags what the sharer sends, and the downlink
+	// allocators weigh the layer at its maximum (allocRate).
+	resumedAt [SlotAudio]atomic.Int64
 	// up is the share's uplink control (02 §11, uplink.go). It belongs to the publishing Conn's actor, like the rest of
 	// what that Conn publishes; addShare sets it there.
 	up shareUplink
@@ -578,8 +583,10 @@ func (c *Conn) startShare(p StartShareParams) (ShareParams, error) {
 // UpdateShare changes a share this Conn publishes and returns its new ShareParams: the encodings apply at once, the
 // audio bitrate with the next publish offer's answer. The encodings are the share's as they stand: under the admin's
 // cap as it is now, and with the layers paused that the sharer was told to pause (02 §11), so a sharer that applies
-// them pauses or resumes nothing. It returns sfu.share_not_found for an unknown or ended share and sfu.not_owner for
-// another Conn's.
+// them pauses or resumes nothing. The params may reach another of the user's connections, not the sharer (01 §8.7), so
+// the uplink control doesn't count them as told: when the cap differs from what its last hint or StartShare said, its
+// next look sends a hint all the same. It returns sfu.share_not_found for an unknown or ended share and sfu.not_owner
+// for another Conn's.
 func (c *Conn) UpdateShare(ctx context.Context, id ShareID, u ShareUpdate) (ShareParams, error) {
 	var params ShareParams
 	err := c.do(ctx, func(context.Context) error {
@@ -610,10 +617,12 @@ func (c *Conn) updateShare(id ShareID, u ShareUpdate) (ShareParams, error) {
 	if !ok {
 		return ShareParams{}, newError(CodeShareNotFound, "the share ended")
 	}
-	// The sharer applies the cap it gets here: the uplink control has nothing more to tell it about the cap (a hint
-	// with the reason admin follows only a change after this one).
-	sh.up.capBps = c.sfu.currentLimits().shareCap()
-	return shareParams(preset, sh.up.capBps, sh.up.paused, c.room.codecPolicy()), nil
+	// The cap is the admin's as it is now, which the uplink control may not have told the sharer yet. The uplink
+	// control doesn't take these params as told (shareUplink.capBps): the hub runs another connection's share.update
+	// here too and replies to that connection (01 §8.7), so the sharer may never see them. Its next look sends the
+	// hint of a new cap all the same, which repeats what these params said when the sharer got them: harmless, as
+	// setParameters with the same encodings changes nothing.
+	return shareParams(preset, c.sfu.currentLimits().shareCap(), sh.up.paused, c.room.codecPolicy()), nil
 }
 
 // currentPreset returns the share's preset, and false once the share has ended.
