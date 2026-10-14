@@ -20,6 +20,7 @@ tool (
 
 require (
 	github.com/google/licensecheck v0.3.1
+	go.uber.org/goleak v1.3.0
 	golang.org/x/mod v0.41.0
 )
 

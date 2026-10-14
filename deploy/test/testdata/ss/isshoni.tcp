@@ -1,0 +1,5 @@
+LISTEN 0      128    0.0.0.0:22   0.0.0.0:* users:(("sshd",pid=612,fd=3))
+LISTEN 0      4096         *:443        *:* users:(("isshoni",pid=1423,fd=8))
+LISTEN 0      4096         *:80         *:* users:(("isshoni",pid=1423,fd=9))
+LISTEN 0      4096         *:7882       *:* users:(("isshoni",pid=1423,fd=12))
+LISTEN 0      128       [::]:22      [::]:* users:(("sshd",pid=612,fd=4))

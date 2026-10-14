@@ -238,13 +238,24 @@ tasks:
         if: '[ -f web/scripts/licenses.test.mjs ]'
 
   test:sh:
-    desc: Run the install.sh unit tests under dash, bash --posix and busybox sh
+    desc: Run the install.sh unit tests under dash, bash --posix and busybox sh (outside CI, a missing shell is skipped)
     cmds:
       - cmd: "echo 'test:sh: skipped, deploy/test/install_unit.sh does not exist yet'"
         silent: true
         if: '[ ! -f deploy/test/install_unit.sh ]'
+      # A shell that is not installed (macOS has no busybox, Fedora no dash) is skipped with a note. In CI, where
+      # the lint-deploy job installs busybox, a missing shell fails the task.
       - cmd: |
           for shell in dash 'bash --posix' 'busybox sh'; do
+            cmd=${shell%% *}
+            if ! command -v "$cmd" >/dev/null 2>&1; then
+              if [ -n "${CI:-}" ]; then
+                echo "test:sh: $cmd is not installed" >&2
+                exit 1
+              fi
+              echo "test:sh: skipped $shell (not installed here; CI runs it)"
+              continue
+            fi
             echo "test:sh: $shell deploy/test/install_unit.sh"
             $shell deploy/test/install_unit.sh
           done

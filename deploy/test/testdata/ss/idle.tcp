@@ -1,0 +1,2 @@
+LISTEN 0      128    0.0.0.0:22   0.0.0.0:* users:(("sshd",pid=612,fd=3))
+LISTEN 0      128       [::]:22      [::]:* users:(("sshd",pid=612,fd=4))
