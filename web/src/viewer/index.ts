@@ -4,7 +4,8 @@
 //   const viewer = createViewer({ volume: prefs.volume, onVolume: prefs.setVolume });  // once per page
 //   new RoomSession({ …, media: { createSubscriber } });                   // 05 §10.1, with
 //     createSubscriber = (deps) => viewer.createSubscriber({ ...deps, ui }, SubscriberPC)
-//   const detach = attachViewer(signal, viewer);                           // subscribe.status → viewerStore.status
+//   const detach = attachViewer(signal, viewer);                           // subscribe.status → viewerStore.status,
+//                                                                          // and the codec wait (caps.update)
 //   const unsync = attachSubscriptions(viewer, session.subscriptions);     // the desired set → subscribe.update
 //   syncRoom(viewer, roomState, { userId, connectionId });                 // on every room.state; null after leaving
 //   const tap = createWatchToast({ viewer, ui, selfUserId });              // room.event → "bo started sharing [Watch]"
@@ -36,6 +37,12 @@
 //   (IosHint.tsx).
 // - When the page comes back (05 §12.8): iOS suspended it, and every video and the audio element are played
 //   again; a refusal shows TapToStart.
+// - The codec wait (05 §10.6, codecWait.ts, through attachViewer): while the server holds a share's video back
+//   because this browser can't decode it (subscribe.status reason `codec`, a fresh Firefox fetching OpenH264), the
+//   tile plays the sound and says why; the capabilities are read every 5 s, and caps.update goes out when the H.264
+//   decoders changed, which is the page's only part in codec recovery (never pc.restart). After 3 minutes the
+//   layout asks for a reload (CodecBanner.tsx); a browser other than Firefox without any H.264 decoder is told it
+//   can't play isshoni video.
 //
 // Re-published shares (`replaces`, 01 §10.6): the store remembers the shares that ended, with what they had, so a
 // share that comes back under a new id gets the stage, the pick and the sound back, also after a server restart,
@@ -51,8 +58,8 @@
 // The layout takes the platform and the preferences from the app's context. The one thing the room page can add is
 // `roomName`, the "artist" of the media notification; without it the app's name stands in.
 //
-// Arriving with later slices, inside this folder: the Firefox codec wait (S86). The debug overlay that Shift+D
-// switches (prefsStore.debug) is the hardening slice's (05 W13).
+// Arriving with later slices, inside this folder: the debug overlay that Shift+D switches (prefsStore.debug) is
+// the hardening slice's (05 W13).
 export { SpeakerButton, StageSound, type SpeakerButtonProps, type StageSoundProps } from './AudioControls';
 export { canSetVolume, createAudioOut, type AudioOut, type AudioOutDeps } from './audioOut';
 export {
@@ -64,6 +71,18 @@ export {
   type FocusShare,
   type FocusState,
 } from './autoFocus';
+export { CodecBanner, type CodecBannerProps } from './CodecBanner';
+export {
+  attachCodecWait,
+  CAPS_POLL_MS,
+  CAPS_UPDATE_SPACING_MS,
+  CODEC_STUCK_MS,
+  CODEC_WAIT_GAP_MS,
+  codecNotice,
+  type CodecNotice,
+  type CodecWaitOptions,
+  type CodecWaitSignal,
+} from './codecWait';
 export { ViewerContext, useShareMedia, useViewer, useViewerServices } from './context';
 export { FocusFromUrl, type FocusFromUrlProps } from './FocusFromUrl';
 export { FOCUS_PARAM, FOCUS_PARAM_WAIT_MS, followFocusParam } from './focusParam';
@@ -108,6 +127,7 @@ export {
   type SubscriberClass,
   type ViewerOptions,
   type ViewerServices,
+  type ViewerSignal,
 } from './services';
 export { ShareVideo, type ShareVideoProps } from './ShareVideo';
 export { ShortcutsDialog, type ShortcutsDialogProps } from './ShortcutsDialog';
@@ -128,6 +148,7 @@ export { WatchersPopover, type WatchersPopoverProps } from './WatchersPopover';
 export {
   createViewerStore,
   type AudioUnlockState,
+  type CodecWait,
   type RoomSnapshot,
   type SubMediaState,
   type ViewerActions,

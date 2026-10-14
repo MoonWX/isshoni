@@ -10,6 +10,7 @@ import { useTranslation } from 'react-i18next';
 
 import { Spinner } from '../ui/Spinner';
 import { SpeakerButton } from './AudioControls';
+import { codecNotice } from './codecWait';
 import { useShareMedia, useViewer } from './context';
 import { ShareVideo } from './ShareVideo';
 import { badgeText, overlayText, shareTitle, shareView, shareWhat, sharerName, watchingText } from './shareView';
@@ -38,6 +39,7 @@ export function Tile({ share, preview, onPick, actions, tabStop = true }: TilePr
   const media = useShareMedia(share.id);
   const status = useViewer((s) => s.status[share.id]);
   const frozen = useViewer((s) => s.frozen[share.id] === true);
+  const codec = useViewer((s) => codecNotice(s.codecWait));
   const stateId = useId();
   // The tile is shown while it is in view: the layer policy gives it the low layer only then (05 §12.4).
   const shown = useVisibility(share.id);
@@ -51,7 +53,7 @@ export function Tile({ share, preview, onPick, actions, tabStop = true }: TilePr
   if (share.local) label = t('viewer.tile.preview', { watching });
   else if (share.own) label = t('viewer.tile.watchOwn', { watching });
   else label = t('viewer.tile.watch', { title: shareTitle(t, share), watching });
-  const state = view.overlay ? overlayText(t, view.overlay) : view.badge ? badgeText(t, view.badge) : null;
+  const state = view.overlay ? overlayText(t, view.overlay, codec) : view.badge ? badgeText(t, view.badge) : null;
 
   return (
     <li ref={shown} className={styles.tile} data-share-id={share.id}>
@@ -70,7 +72,7 @@ export function Tile({ share, preview, onPick, actions, tabStop = true }: TilePr
         {view.overlay && (
           <span className={styles.overlay} id={stateId}>
             {(view.overlay === 'connecting' || view.overlay === 'frozen') && <Spinner size="md" label={null} />}
-            <span className={styles.overlayText}>{overlayText(t, view.overlay)}</span>
+            <span className={styles.overlayText}>{overlayText(t, view.overlay, codec)}</span>
           </span>
         )}
         {!view.overlay && view.badge && (

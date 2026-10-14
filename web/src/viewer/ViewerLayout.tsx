@@ -30,7 +30,9 @@
 // - the keyboard: the tiles are one tab stop that the arrow keys move, and the shortcuts of keyboard.ts, with
 //   their dialog on "?";
 // - `?focus=<shareId>` from the URL (FocusFromUrl.tsx), inside a router;
-// - what plays, for the system's media notification (mediaSession.ts), and the one-time hint on iOS (IosHint.tsx).
+// - what plays, for the system's media notification (mediaSession.ts), and the one-time hint on iOS (IosHint.tsx);
+// - the codec wait's banner (CodecBanner.tsx, 05 §10.6): "Reload the page" after 3 minutes without a video
+//   decoder, or "This browser can't play isshoni video".
 import { Layers } from 'lucide-react';
 import {
   useCallback,
@@ -52,6 +54,7 @@ import { AppContext } from '../app/context';
 import { Button } from '../ui/Button';
 import { cx } from '../ui/cx';
 import { Sheet } from '../ui/Sheet';
+import { CodecBanner } from './CodecBanner';
 import { ViewerContext } from './context';
 import { FocusFromUrl } from './FocusFromUrl';
 import { IosHint } from './IosHint';
@@ -326,6 +329,8 @@ export function ViewerLayout({
             {onTestConnection && <Button onClick={onTestConnection}>{t('viewer.media.test')}</Button>}
           </div>
         )}
+        {/* The codec wait's (05 §10.6), when waiting doesn't help; the media banner goes first, in the same place. */}
+        {media !== 'unreachable' && <CodecBanner store={viewer.store} className={styles.banner} />}
         {/* One notice at a time: the banner says what is wrong now, the hint can wait. */}
         {!isFullscreen && media !== 'unreachable' && <IosHint className={styles.hint} />}
         <div className={styles.main}>

@@ -12,6 +12,7 @@ import { useTranslation } from 'react-i18next';
 import { cx } from '../ui/cx';
 import { Spinner } from '../ui/Spinner';
 import { StageSound, useStageSound } from './AudioControls';
+import { codecNotice } from './codecWait';
 import { useShareMedia, useViewer } from './context';
 import { onDoublePress } from './fullscreen';
 import { ShareVideo } from './ShareVideo';
@@ -76,6 +77,7 @@ function FocusedStage({
   const media = useShareMedia(share.id);
   const status = useViewer((s) => s.status[share.id]);
   const frozen = useViewer((s) => s.frozen[share.id] === true);
+  const codec = useViewer((s) => codecNotice(s.codecWait));
   const sound = useStageSound(share);
   // The stage shows this share: the layer policy gives it the high layer only while it does (05 §12.4).
   const shown = useVisibility(share.id);
@@ -120,7 +122,7 @@ function FocusedStage({
         {view.overlay && (
           <div className={styles.overlay}>
             {waiting && <Spinner size="lg" label={null} />}
-            <p className={styles.overlayText}>{overlayText(t, view.overlay)}</p>
+            <p className={styles.overlayText}>{overlayText(t, view.overlay, codec)}</p>
           </div>
         )}
         {!view.overlay && view.badge && <p className={styles.badge}>{badgeText(t, view.badge)}</p>}
