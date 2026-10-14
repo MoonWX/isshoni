@@ -15,6 +15,7 @@ import (
 
 	"github.com/MoonWX/isshoni/internal/server/config"
 	"github.com/MoonWX/isshoni/internal/server/httpapi"
+	"github.com/MoonWX/isshoni/internal/server/netx"
 	"github.com/MoonWX/isshoni/web"
 )
 
@@ -112,11 +113,15 @@ func (s *Server) routerOptions() httpapi.RouterOptions {
 		DisableHSTS:    !s.cfg.TLS.HSTS,
 		SPA:            spa,
 		SPAStatus:      s.spaStatus, // /setup is gone once setup is done (03 §12.6)
-		// Observer is ops.Metrics, which comes with the ops routes (README S85).
-		Gate:   s.gate,
-		API:    s.deps.API,
-		WS:     s.deps.WS,
-		Logger: s.log,
+		Gate:           s.gate,
+		API:            s.deps.API,
+		WS:             s.deps.WS,
+		Logger:         s.log,
+	}
+	// isshoni_http_responses_total{route,class} (04 §9.2, §11.2). A server that has not built its metrics yet (a
+	// test of the options alone) leaves the observer out, not a nil pointer in the interface.
+	if s.metrics != nil {
+		opts.Observer = s.metrics
 	}
 	// 03's API and 01's hub, unless a test put its own handler there. A server without a site has neither (wire.go):
 	// the fields stay nil then, and the router answers JSON 404.
@@ -171,6 +176,75 @@ func listenHTTP(ctx context.Context, addr string, mode config.TLSMode) (net.List
 	default:
 		return nil, fmt.Errorf("server: listen on listen.http = %q: %w", addr, err)
 	}
+}
+
+// listenMetrics binds the metrics listener on metrics.listen (04 §6.1 step 6, §11.2). Its errors are for the
+// operator, like those of the other listeners: runtime errors (exit 1) that name the key and its value.
+func listenMetrics(ctx context.Context, addr string) (net.Listener, error) {
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", addr)
+	if err == nil {
+		return ln, nil
+	}
+	_, port, _ := net.SplitHostPort(addr)
+	switch {
+	case errors.Is(err, syscall.EADDRINUSE):
+		return nil, fmt.Errorf("port %s is in use (another isshoni, or another exporter?). Stop it, or change "+
+			"metrics.listen (now %q): %w", port, addr, err)
+	case errors.Is(err, fs.ErrPermission):
+		return nil, fmt.Errorf("isshoni may not listen on metrics.listen = %q (a port below 1024 needs "+
+			`CAP_NET_BIND_SERVICE); use "127.0.0.1:9469": %w`, addr, err)
+	default:
+		return nil, fmt.Errorf("server: listen on metrics.listen = %q: %w", addr, err)
+	}
+}
+
+// countWeb makes ln count the bytes of every connection it accepts as web transfer (04 §11.3): listen.http, which
+// serves the app in off mode and ACME challenges and redirects in the other modes. The 443 multiplexer counts its
+// own connections, and the ICE Transport its sockets. A nil counter counts nothing.
+func countWeb(ln net.Listener, counter *netx.TransferCounter) net.Listener {
+	return &countingListener{Listener: ln, counter: counter}
+}
+
+// countingListener is countWeb's listener.
+type countingListener struct {
+	net.Listener
+	counter *netx.TransferCounter
+}
+
+func (l *countingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &countingConn{Conn: c, counter: l.counter}, nil
+}
+
+// countingConn counts what it reads as web ingress and what it writes as web egress.
+type countingConn struct {
+	net.Conn
+	counter *netx.TransferCounter
+}
+
+func (c *countingConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	c.counter.Add(netx.PathWeb, false, n)
+	return n, err
+}
+
+func (c *countingConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	c.counter.Add(netx.PathWeb, true, n)
+	return n, err
+}
+
+// CloseWrite passes a half close on to a TCP connection, as net/http asks of a connection it is done writing to
+// (it then lets the client read the answer before it closes). A connection without one does nothing.
+func (c *countingConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
 }
 
 // withBoundPort returns a listen address with the bound port in place of a configured port 0 (tests let the kernel

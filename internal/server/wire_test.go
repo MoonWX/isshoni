@@ -1513,6 +1513,33 @@ func TestStatusSource(t *testing.T) {
 	if b, err := json.Marshal(got); err != nil || strings.Contains(string(b), "null") {
 		t.Errorf("status JSON = %s, %v", b, err)
 	}
+
+	// With the ops data (README S85): the metrics listener before the admin socket, the month's transfer as it is
+	// counted, and no update before the release check's first look.
+	counter := &netx.TransferCounter{}
+	counter.Add(netx.PathWeb, true, 4000)
+	counter.Add(netx.PathMediaUDP, false, 1000)
+	s.transfer = ops.NewTransfer(ops.TransferOptions{Counter: counter, Store: transferStore{db: s.store},
+		Now: func() time.Time { return clock }, Logger: discardLog()})
+	if s.releases, err = ops.NewReleaseCheck(ops.ReleaseCheckOptions{Policy: opsPolicy{settings: s.store.Settings()},
+		Logger: discardLog()}); err != nil {
+		t.Fatal(err)
+	}
+	s.addrs.Metrics = &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9469}
+	got, err = s.statusSource()(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr := got.Transfer; tr == nil || tr.Month != "2026-10" || tr.EgressBytes != 4000 || tr.IngressBytes != 1000 ||
+		tr.ProjectedEgressBytes <= tr.EgressBytes {
+		t.Errorf("transfer = %+v, want October with 4000 bytes out, 1000 in, and a projection past day 3", tr)
+	}
+	if got.Update != nil {
+		t.Errorf("update before the first release check = %+v", got.Update)
+	}
+	if len(got.Listeners) != 4 || got.Listeners[2] != (api.ListenerInfo{Key: "metrics.listen", Network: "tcp", Addr: "127.0.0.1:9469"}) {
+		t.Errorf("listeners with the metrics listener = %+v", got.Listeners)
+	}
 }
 
 // fakeUDPMux is an ice.UDPMux of which only the listen addresses are asked.

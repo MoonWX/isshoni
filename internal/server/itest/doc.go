@@ -21,5 +21,7 @@
 // these go through every layer between a browser and it.
 //
 // Cases 1–3 and 9 of 01 §19 and the ICE-TCP checks of 04 §17 are here (README S59), and the recovery cases 4–8
-// (README S74, recovery_test.go). The metric assertion of the ICE-TCP test comes with README S85.
+// (README S74, recovery_test.go). README S85 added what the metrics endpoint says about them: the ICE-TCP-via-443
+// test counts both PeerConnections in isshoni_sfu_selected_transport{transport="tcp443"}, and metrics_test.go
+// reads the series of 06 §12.3 (the exit test's) from a session with media, client stats and a resume.
 package itest

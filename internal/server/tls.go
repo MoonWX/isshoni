@@ -64,6 +64,7 @@ func (s *Server) listenHTTPS() (*netx.PortMux, error) {
 		Addr:          addr,
 		MaxConnsPerIP: s.cfg.Limits.ConnsPerIP,
 		PublicHost:    publicHost,
+		Counter:       s.counter, // TLS as web, ICE-TCP as media_tcp (04 §11.3)
 		Logger:        s.log,
 	})
 	switch {
