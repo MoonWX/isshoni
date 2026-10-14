@@ -4,7 +4,8 @@
 //   is hidden (page.ts: no video after 10 s, and everything plays again when an iPhone comes back, 05 §12.8);
 // - syncRoom() gives them each room.state (RoomSession calls it, so focus and audio stay right while the room page
 //   is not mounted, 05 §11.1);
-// - attachViewer() gives the store the server's subscribe.status messages;
+// - attachViewer() gives the store the server's subscribe.status messages, and runs the codec wait with them
+//   (codecWait.ts, 05 §10.6: the caps poll and caps.update while the server holds video back for the codec);
 // - attachSubscriptions() (subscriptions.ts) gives the session's SubscriptionSync the desired set;
 // - viewer.createSubscriber() makes the session's sub PC (05 §10.1, §11.1): it is SessionMedia.createSubscriber.
 //   The session routes pc.offer and pc.ice {pc: 'sub'} to the PC's handleOffer and handleIce, and calls close()
@@ -17,6 +18,7 @@ import type { Logger } from '../lib/log';
 import type { SignalClient } from '../protocol/signal-client';
 import { MessageTypeSubscribeStatus } from '../protocol/types.gen';
 import { createAudioOut, type AudioOut } from './audioOut';
+import { attachCodecWait, type CodecWaitOptions } from './codecWait';
 import { createMediaRegistry, type MediaRegistry } from './mediaRegistry';
 import { attachPage } from './page';
 import type { SubscriberDeps, SubscriberPC } from './SubscriberPC';
@@ -147,11 +149,33 @@ export function syncRoom(
 }
 
 /**
- * Listens to subscribe.status (01 §8.9) for the viewer: what the server forwards per share goes to
- * viewerStore.status, which the tiles show (05 §10.4). Returns the function that stops it.
+ * What attachViewer needs from signaling: 01's SignalClient, by its structural type. `on` brings subscribe.status;
+ * `notify`, when the object has it (the app's SignalClient does), sends the codec wait's caps.update.
  */
-export function attachViewer(signal: Pick<SignalClient, 'on'>, viewer: Pick<ViewerServices, 'store'>): () => void {
-  return signal.on(MessageTypeSubscribeStatus, (status) => {
+export type ViewerSignal = Pick<SignalClient, 'on'> & Partial<Pick<SignalClient, 'notify'>>;
+
+function canSend(signal: ViewerSignal): signal is ViewerSignal & Pick<SignalClient, 'notify'> {
+  return typeof signal.notify === 'function';
+}
+
+/**
+ * Listens to subscribe.status (01 §8.9) for the viewer: what the server forwards per share goes to
+ * viewerStore.status, which the tiles show (05 §10.4). With a signal that can send (`notify`), it also runs the
+ * codec wait (codecWait.ts, 05 §10.6): while some subscription has the reason `codec`, the capabilities are read
+ * every 5 s and caps.update goes out when the H.264 decoders changed; nothing else is ever sent for codecs.
+ * `codec` is for tests. Returns the function that stops both.
+ */
+export function attachViewer(
+  signal: ViewerSignal,
+  viewer: Pick<ViewerServices, 'store'>,
+  codec: CodecWaitOptions = {},
+): () => void {
+  const offStatus = signal.on(MessageTypeSubscribeStatus, (status) => {
     viewer.store.getState().applyStatus(status.subs);
   });
+  const offCodec = canSend(signal) ? attachCodecWait(signal, viewer.store, codec) : null;
+  return () => {
+    offStatus();
+    offCodec?.();
+  };
 }

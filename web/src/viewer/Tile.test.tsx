@@ -195,6 +195,14 @@ describe('Tile', () => {
     expect(screen.getByText("The sharer isn't sending this quality right now")).toBeInTheDocument();
     report('codec');
     expect(screen.getByText(/still getting its video decoder/)).toBeInTheDocument();
+    act(() => {
+      viewer.store.getState().setCodecWait({ since: 0, stuck: true, noDecoder: false, firefox: true });
+    });
+    expect(screen.getByText('No video decoder yet. Reload the page.')).toBeInTheDocument();
+    expect(mainButton()).toHaveAccessibleDescription('No video decoder yet. Reload the page.');
+    act(() => {
+      viewer.store.getState().setCodecWait(null);
+    });
     report('something-new');
     expect(screen.getByText('Lower quality')).toBeInTheDocument();
     report();

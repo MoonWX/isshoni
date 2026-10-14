@@ -108,6 +108,8 @@
       "connecting": "Connecting…",
       "stalled": "Connection unstable",
       "codec": "Your browser is still getting its video decoder (Firefox does this once, about a minute). Retrying…",
+      "codecStuck": "No video decoder yet. Reload the page.",
+      "codecMissing": "This browser can't play this video. You still hear it.",
       "bandwidth": "Lower quality (your connection)",
       "unavailable": "The sharer isn't sending this quality right now",
       "reduced": "Lower quality",
@@ -116,6 +118,11 @@
     "media": {
       "unreachable": "Can't reach the server's media port. isshoni keeps trying.",
       "test": "Test my connection"
+    },
+    "codec": {
+      "stuckFirefox": "Firefox hasn't got its video decoder yet. Reload the page. If that doesn't help, open Settings → Extensions & Themes → Plugins and check that 'OpenH264 Video Codec provided by Cisco Systems, Inc.' is enabled, or use Chrome or Edge.",
+      "stuck": "Your browser still can't play the video. Reload the page. If that doesn't help, use Chrome or Edge.",
+      "missing": "This browser can't play isshoni video. Use Chrome, Edge, Safari or Firefox."
     },
     "toast": {
       "started": "{{name}} started sharing",

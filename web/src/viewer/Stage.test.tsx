@@ -92,6 +92,16 @@ describe('Stage', () => {
       viewer.store.getState().applyStatus([status('s_a', { video: 'off', reason: 'codec' })]);
     });
     expect(live).toHaveTextContent(/still getting its video decoder/);
+    // The page's codec wait (05 §10.6): after 3 minutes, and in a browser that has no decoder to wait for.
+    const wait = { since: 0, stuck: false, noDecoder: false, firefox: true };
+    act(() => {
+      viewer.store.getState().setCodecWait({ ...wait, stuck: true });
+    });
+    expect(live).toHaveTextContent('No video decoder yet. Reload the page.');
+    act(() => {
+      viewer.store.getState().setCodecWait({ ...wait, noDecoder: true, firefox: false });
+    });
+    expect(live).toHaveTextContent("This browser can't play this video. You still hear it.");
   });
 
   it('says "Connection unstable" over a stalled share', () => {

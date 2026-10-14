@@ -28,9 +28,29 @@ describe('viewerStore: defaults', () => {
       status: {},
       frozen: {},
       media: 'idle',
+      codecWait: null,
     });
     expect(createViewerStore({ volume: 0.4 }).getState().volume).toBe(0.4);
     expect(createViewerStore({ volume: 7 }).getState().volume).toBe(1);
+  });
+});
+
+describe('viewerStore.setCodecWait', () => {
+  it('stores the codec wait, and tells nobody about an equal one', () => {
+    const store = createViewerStore();
+    const listener = vi.fn();
+    store.subscribe(listener);
+    const wait = { since: 5, stuck: false, noDecoder: true, firefox: true };
+    store.getState().setCodecWait(wait);
+    expect(store.getState().codecWait).toBe(wait);
+    store.getState().setCodecWait({ ...wait });
+    expect(listener).toHaveBeenCalledOnce();
+    store.getState().setCodecWait({ ...wait, stuck: true });
+    expect(store.getState().codecWait?.stuck).toBe(true);
+    store.getState().setCodecWait(null);
+    store.getState().setCodecWait(null);
+    expect(store.getState().codecWait).toBeNull();
+    expect(listener).toHaveBeenCalledTimes(3);
   });
 });
 

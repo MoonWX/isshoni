@@ -148,6 +148,12 @@ describe('shareView (05 §10.4, §12.6)', () => {
     expect(overlayText(t, 'stalled')).toBe('Connection unstable');
     expect(overlayText(t, 'codec')).toContain('video decoder');
     expect(overlayText(t, 'frozen')).toBe('Waiting for video…');
+    // The codec overlay follows the page's codec wait (05 §10.6, codecWait.ts).
+    expect(overlayText(t, 'codec', 'waiting')).toBe(overlayText(t, 'codec'));
+    expect(overlayText(t, 'codec', 'stuck')).toBe('No video decoder yet. Reload the page.');
+    expect(overlayText(t, 'codec', 'stuckFirefox')).toBe('No video decoder yet. Reload the page.');
+    expect(overlayText(t, 'codec', 'missing')).toBe("This browser can't play this video. You still hear it.");
+    expect(overlayText(t, 'connecting', 'missing')).toBe('Connecting…');
     expect(badgeText(t, 'bandwidth')).toBe('Lower quality (your connection)');
     expect(badgeText(t, 'unavailable')).toBe("The sharer isn't sending this quality right now");
     expect(badgeText(t, 'reduced')).toBe('Lower quality');

@@ -8,8 +8,9 @@
 // and volume (05 §10.3, written by audioOut.ts) and whether a tile's video was refused (videoPlayback.ts);
 // fullscreen and PiP (05 §12.5: fullscreen.ts, pip.ts), which tiles are in view (useVisibility.ts) and since when
 // the page is hidden (page.ts), all of which the layer policy reads (05 §12.4); what the server forwards per share
-// (subscribe.status, 05 §10.4); the tiles whose video stopped arriving (freeze.ts, 05 §12.6); and the state of the
-// sub PC (05 §9).
+// (subscribe.status, 05 §10.4); the tiles whose video stopped arriving (freeze.ts, 05 §12.6); the state of the
+// sub PC (05 §9); and the codec wait, while the server holds video back because this browser can't decode it yet
+// (codecWait.ts, 05 §10.6).
 import { createStore, type StoreApi } from 'zustand/vanilla';
 
 import {
@@ -81,6 +82,21 @@ export type AudioUnlockState = 'locked' | 'playing' | 'blocked' | 'muted';
  */
 export type SubMediaState = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'unreachable' | 'failed';
 
+/**
+ * The codec wait of 05 §10.6 (codecWait.ts): some subscription has the reason `codec`, so its tile plays the audio
+ * and says why there is no video. codecNotice() (codecWait.ts) turns it into what the page says.
+ */
+export interface CodecWait {
+  /** Date.now() when the wait began. A short gap doesn't start it again (CODEC_WAIT_GAP_MS). */
+  readonly since: number;
+  /** It has lasted CODEC_STUCK_MS (3 min): the page asks for a reload. */
+  readonly stuck: boolean;
+  /** The browser listed no H.264 decoder at all when its capabilities were last read. */
+  readonly noDecoder: boolean;
+  /** The browser is Firefox, which fetches its decoder by itself (OpenH264): its own texts. */
+  readonly firefox: boolean;
+}
+
 export interface ViewerData extends FocusState<ViewerShare> {
   /**
    * The last syncRoom had a room.state: `shares` are that room's, also when it has none. False before the room's
@@ -109,6 +125,8 @@ export interface ViewerData extends FocusState<ViewerShare> {
    */
   readonly frozen: Readonly<Record<string, true>>;
   readonly media: SubMediaState;
+  /** The codec wait (05 §10.6); null while no subscription has the reason `codec`. */
+  readonly codecWait: CodecWait | null;
 }
 
 export interface ViewerActions {
@@ -147,13 +165,16 @@ export interface ViewerActions {
   /** The complete set of frozen shares (05 §12.6); shares without a tile are left out. */
   setFrozen(shareIds: readonly string[]): void;
   setMedia(media: SubMediaState): void;
+  /** codecWait.ts: the codec wait as it is now; null when it is over. */
+  setCodecWait(wait: CodecWait | null): void;
   /**
    * Back to the state of a page that is in no room: no shares, auto-focus, nothing per share, no fullscreen or PiP,
    * no memory of ended shares, `inRoom` false. (fullscreen.ts and pip.ts follow: they leave the browser's
    * fullscreen and close its PiP window when the store says so.) Call it when the user leaves the room, not for a
    * reconnect: after a welcome that was not resumed the room's snapshots keep going to syncRoom, so that
    * re-published shares take over (01 §10.6). What belongs to the page stays: the volume, the audio unlock and the
-   * refused videos, the sub PC's state (SubscriberPC.close() resets that one) and the page's visibility.
+   * refused videos, the sub PC's state (SubscriberPC.close() resets that one), the page's visibility, and the codec
+   * wait, which ends by itself once no status is left (codecWait.ts).
    */
   reset(): void;
 }
@@ -184,6 +205,7 @@ function initialData(volume: number): ViewerData {
     status: {},
     frozen: {},
     media: 'idle',
+    codecWait: null,
   };
 }
 
@@ -402,6 +424,21 @@ export function createViewerStore(opts: ViewerStoreOptions = {}): ViewerStore {
       },
       setMedia(media) {
         if (get().media !== media) set({ media });
+      },
+      setCodecWait(codecWait) {
+        const before = get().codecWait;
+        if (before === codecWait) return;
+        if (
+          before !== null &&
+          codecWait !== null &&
+          before.since === codecWait.since &&
+          before.stuck === codecWait.stuck &&
+          before.noDecoder === codecWait.noDecoder &&
+          before.firefox === codecWait.firefox
+        ) {
+          return;
+        }
+        set({ codecWait });
       },
       reset() {
         set({

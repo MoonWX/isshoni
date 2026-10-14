@@ -6,6 +6,7 @@
 //                        state: () => ({ viewer: viewerDebugState(viewer) }) });
 import type { StatsSource } from '../lib/stats';
 import { PCKindSub } from '../protocol/types.gen';
+import { codecNotice } from './codecWait';
 import type { ViewerServices } from './services';
 
 /**
@@ -59,6 +60,8 @@ export function viewerDebugState(viewer: Pick<ViewerServices, 'store' | 'audio' 
     pageHidden: s.pageHiddenSince !== null,
     media: s.media,
     subGen: viewer.subscriber?.gen ?? 0,
+    /** What the page says about the codec wait (05 §10.6, codecWait.ts); null while there is none. */
+    codecWait: codecNotice(s.codecWait),
     shares: s.shares.map((share) => ({
       id: share.id,
       userId: share.userId,
@@ -67,6 +70,8 @@ export function viewerDebugState(viewer: Pick<ViewerServices, 'store' | 'audio' 
       kind: share.info.kind,
       status: share.info.status,
       layers: [...share.info.layers],
+      /** The H.264 profile the share is published in now (room.state); null before the server knows it. */
+      codec: share.info.codec ?? null,
       watchers: share.info.watchers.length,
       visible: s.visible[share.id] === true,
       frozen: s.frozen[share.id] === true,
