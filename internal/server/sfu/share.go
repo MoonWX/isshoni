@@ -203,8 +203,9 @@ func (s *Share) setPreset(p Preset) bool {
 // attach makes l the share's Layer for its slot and returns the Layer it replaces, if any (a track whose SSRC
 // changed). ok is false when the share has ended: nothing attaches to an ended share. The share's DownTracks choose
 // their layer again before attach returns (retargetLocked), so a caller that attaches a track before it starts to
-// read it loses none of its packets for any viewer.
+// read it loses none of its packets for any viewer. From here on the Layer counts into the SFU's totals (02 §13).
 func (s *Share) attach(l *Layer) (replaced *Layer, ok bool) {
+	l.countInto(&s.conn.sfu.counters)
 	s.mu.Lock()
 	if s.ended {
 		s.mu.Unlock()

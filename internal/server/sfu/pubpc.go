@@ -46,6 +46,10 @@ type pubPC struct {
 	nacks *nackFilter
 	// readers are the tracks' read goroutines; each ends with its track, all of them when the PC closes.
 	readers sync.WaitGroup
+	// rtt is the round-trip time of the PC's selected candidate pair in ns, 0 while unknown; rttAt the monoNow at
+	// which it was last read. The tracks' RTCP readers keep it (samplePairRTT), every rttEvery, as a sub PC's
+	// DownTracks do theirs; the reports of 02 §13 read it, for a Conn whose sub PC has none.
+	rtt, rttAt atomic.Int64
 }
 
 // trackKey names one incoming RTP stream of a pub PC: an m-section and, for simulcast, a rid.
@@ -179,6 +183,7 @@ func (c *Conn) handleOffer(ctx context.Context, kind PCKind, gen, neg uint32, ra
 			c.dropPub()
 		}
 		c.pub, c.pubGen = p, gen
+		c.views[PCPub].Store(&pcView{kind: PCPub, gen: gen, pc: p.pc, rtt: &p.rtt})
 		// The client can start ICE and DTLS as soon as it has the answer.
 		c.startHandshake(PCPub, gen, p.pc, &p.pcState)
 	}
@@ -317,6 +322,8 @@ func (c *Conn) newPubPC(gen uint32) (*pubPC, error) {
 		gen: gen, pc: pc, tracks: map[trackKey]*pubTrack{}, nacks: nacks, offered: map[string][]webrtc.RTPCodecParameters{},
 	}
 	p.rtcpSSRC = rand.Uint32() | 1 //nolint:gosec // not a secret
+	// The first RTCP from the publisher reads the round-trip time.
+	p.rttAt.Store(-int64(rttEvery))
 	pc.OnTrack(func(track *webrtc.TrackRemote, recv *webrtc.RTPReceiver) {
 		// Pion hands the track over once: if the Conn is closing and drops the post, the PC is closing too.
 		c.post(func() { c.onPubTrack(p, track, recv) })
@@ -387,7 +394,7 @@ func (c *Conn) onPubTrack(p *pubPC, track *webrtc.TrackRemote, recv *webrtc.RTPR
 	}()
 	go func() {
 		defer p.readers.Done()
-		t.readRTCP()
+		t.readRTCP(p)
 	}()
 }
 
@@ -513,8 +520,9 @@ func (t *pubTrack) readRTP() {
 
 // readRTCP is the Layer RTCP loop of 02 §9.1: it reads the RTCP of the track's stream until it ends, per rid for
 // simulcast (S4 finding 2), and hands the publisher's sender reports to the Layer. Reading is also what keeps the
-// publish side's interceptors (NACK generator, receiver reports, TWCC) running.
-func (t *pubTrack) readRTCP() {
+// publish side's interceptors (NACK generator, receiver reports, TWCC) running. Now and then it reads the round-trip
+// time of p, the track's pub PC, for the reports of 02 §13 (samplePairRTT).
+func (t *pubTrack) readRTCP(p *pubPC) {
 	buf := make([]byte, rtpReadBuffer)
 	for {
 		var (
@@ -529,6 +537,8 @@ func (t *pubTrack) readRTCP() {
 		if err != nil {
 			return
 		}
+		now := monoNow()
+		samplePairRTT(&p.rtt, &p.rttAt, t.recv.Transport, now)
 		l := t.layer.Load()
 		if l == nil {
 			continue
@@ -537,7 +547,6 @@ func (t *pubTrack) readRTCP() {
 		if err != nil {
 			continue
 		}
-		now := monoNow()
 		for _, pkt := range pkts {
 			if sr, ok := pkt.(*rtcp.SenderReport); ok {
 				l.handleSR(sr, now)

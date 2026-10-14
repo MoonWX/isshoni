@@ -29,8 +29,9 @@ type SFU struct {
 	// life of a connection-test probe. Tests shorten them; they are set before the first Join or Probe and never
 	// change.
 	timing timings
-	// handshakeTimeouts counts the new PeerConnections that weren't connected in time, by PCKind (Metrics).
-	handshakeTimeouts [PCSub + 1]atomic.Uint64
+	// counters are the totals of 02 §13 that Metrics reports: what the Layers and DownTracks count, also after they
+	// are gone, and the downgrades and handshake timeouts (counters.go).
+	counters counters
 	// clockSkew is added to monoNow for the codec policy's clock (codecNow): 0 but in tests, which move that clock on
 	// to see the policy's 60 s hysteresis pass (02 §17: policy_test and integration 12 use a fake clock).
 	clockSkew atomic.Int64
@@ -247,15 +248,17 @@ func (s *SFU) reportShares(now int64) {
 	}
 }
 
-// everySecond is the ticker's once-a-second work: each layer's rates and cache size (02 §9.1); the stalled check of
-// 02 §5.3, a live share whose pub PC hasn't been connected for 2 s is stalled (the other ways into stalled don't wait
-// for the ticker: Share.detach, Conn.stallShares); and each room's codec policy, whose way back to high waits for
-// its hold to pass (02 §8.3). Every other policy change happens where the viewer set changes.
+// everySecond is the ticker's once-a-second work: each layer's rates and cache size (02 §9.1), and each DownTrack's
+// bitrate (02 §13); the stalled check of 02 §5.3, a live share whose pub PC hasn't been connected for 2 s is stalled
+// (the other ways into stalled don't wait for the ticker: Share.detach, Conn.stallShares); and each room's codec
+// policy, whose way back to high waits for its hold to pass (02 §8.3). Every other policy change happens where the
+// viewer set changes.
 func (s *SFU) everySecond(now int64) {
 	for _, sh := range s.liveShares() {
 		for _, l := range sh.attached() {
 			l.tick(now)
 		}
+		sh.tickEgress(now)
 		if sh.conn.pubAway(now) >= s.timing.stalled {
 			sh.stall("the pub PC is not connected")
 		}

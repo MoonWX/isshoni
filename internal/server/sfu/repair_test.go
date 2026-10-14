@@ -317,6 +317,14 @@ func TestNACKFromCache(t *testing.T) {
 				st.repair.Served, st.lost)
 		}
 	}
+	// The same repair in the SFU's metrics (02 §13), which count what every DownTrack did, read since: each served
+	// sequence number is one retransmission, egress of kind rtx.
+	m := h.SFU.Metrics()
+	nacks, served := sub.VideoRepair.NACKs+sub.AudioRepair.NACKs, sub.VideoRepair.Served+sub.AudioRepair.Served
+	if m.NACKReceived < nacks || m.NACKServed < served || m.EgressPackets["rtx"] < served || m.EgressBytes["rtx"] == 0 {
+		t.Errorf("Metrics: %d NACKed, %d served, %d rtx packets of %d bytes; the DownTracks counted %d and %d",
+			m.NACKReceived, m.NACKServed, m.EgressPackets["rtx"], m.EgressBytes["rtx"], nacks, served)
+	}
 	if errs := viewSig.Errs(); len(errs) != 0 {
 		t.Errorf("answering the sub offer: %v", errs)
 	}
@@ -776,6 +784,10 @@ func TestRTXDuplicates(t *testing.T) {
 	if after["f"].Duplicates <= ingress["f"].Duplicates {
 		t.Errorf("the SFU counts %d duplicates on f after the loss, %d before; want the copies still counted",
 			after["f"].Duplicates, ingress["f"].Duplicates)
+	}
+	// isshoni_sfu_ingress_duplicates_total (02 §13): every copy that the layers counted, read since.
+	if m, layers := h.SFU.Metrics(), after["f"].Duplicates+after["q"].Duplicates; m.IngressDuplicates < layers {
+		t.Errorf("Metrics.IngressDuplicates = %d, the layers counted %d", m.IngressDuplicates, layers)
 	}
 	t.Logf("second copies sent: f %d, q %d; duplicates dropped by the SFU: %+v; lost on the publisher's link: %d; "+
 		"publisher f: %+v", redundant("f"), redundant("q"), after, dropped, layerStats(t, pub, "f"))

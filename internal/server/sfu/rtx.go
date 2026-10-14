@@ -3,6 +3,7 @@ package sfu
 import (
 	"encoding/binary"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/rtcp"
@@ -307,21 +308,31 @@ func (b *binding) payloadType(p *packet) (uint8, bool) {
 // first after the interval does it. It asks Pion's ICE agent and may wait for it a moment, which a reader may and a
 // writer may not. A PC that isn't connected has no pair to ask about.
 func (s *subPC) sampleRTT(sender *webrtc.RTPSender, now int64) {
-	last := s.rttAt.Load()
-	if now-last < int64(rttEvery) || !s.ready.Load() || !s.rttAt.CompareAndSwap(last, now) {
+	if s.ready.Load() {
+		samplePairRTT(&s.rtt, &s.rttAt, sender.Transport, now)
+	}
+}
+
+// samplePairRTT reads the round-trip time of a PeerConnection's selected candidate pair into rtt (ns), unless the last
+// read, at is, is less than rttEvery ago; dtls gives the PC's DTLS transport, which a sender or a receiver of the PC
+// knows. The RTCP readers of both kinds of PC call it (subPC.sampleRTT, pubTrack.readRTCP): the NACK handling and the
+// reports of 02 §13 read the result.
+func samplePairRTT(rtt, at *atomic.Int64, dtls func() *webrtc.DTLSTransport, now int64) {
+	last := at.Load()
+	if now-last < int64(rttEvery) || !at.CompareAndSwap(last, now) {
 		return
 	}
-	// Only while DTLS is up: a PC that the viewer has just closed still counts as ready until the actor has seen it,
+	// Only while DTLS is up: a PC that its client has just closed may still count as up until the actor has seen it,
 	// and Pion logs an error when a closed ICE agent is asked for its statistics.
-	dtls := sender.Transport()
-	if dtls == nil || dtls.State() != webrtc.DTLSTransportStateConnected {
+	tr := dtls()
+	if tr == nil || tr.State() != webrtc.DTLSTransportStateConnected {
 		return
 	}
-	ice := dtls.ICETransport()
+	ice := tr.ICETransport()
 	if ice == nil {
 		return
 	}
 	if pair, ok := ice.GetSelectedCandidatePairStats(); ok && pair.CurrentRoundTripTime > 0 {
-		s.rtt.Store(int64(pair.CurrentRoundTripTime * float64(time.Second)))
+		rtt.Store(int64(pair.CurrentRoundTripTime * float64(time.Second)))
 	}
 }

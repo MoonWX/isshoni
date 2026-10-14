@@ -1,6 +1,7 @@
 package sfu
 
 import (
+	"math"
 	"math/rand/v2"
 	"strings"
 	"sync"
@@ -33,7 +34,9 @@ import (
 // viewer with their RTP time moved to the viewer's timeline, which is what keeps a share's audio and video in sync
 // across layer switches and pauses (sendSR).
 //
-// Later slices add the rest of 02 §9.3: the pacer, REMB and receiver reports (README S84).
+// What it counts, its bitrate and the loss its viewer reports are what Conn.Stats, Snapshot and Metrics show of it
+// (02 §13, stats.go). Later slices add the rest of 02 §9.3: the pacer, REMB and the downlink allocator's use of the
+// receiver reports (README S84).
 type DownTrack struct {
 	share *Share
 	sub   *Subscription
@@ -78,13 +81,18 @@ type DownTrack struct {
 	// without a lock.
 	forwarding atomic.Bool
 	stats      dtStats
+	// totals are the SFU's (counters.go), which the tallies of stats count into, and the layer switches; nil for a
+	// DownTrack that a unit test builds without a Conn.
+	totals *counters
 }
 
-// dtStats are a DownTrack's counters. The writer and the RTCP reader count; README S79 reads them.
+// dtStats are a DownTrack's counters and rates (02 §13). The writer and the RTCP reader count; the ticker turns the
+// bytes into the bitrate once a second (DownTrack.tick); Conn.Stats, Snapshot and Metrics read them. The tallies also
+// count into the SFU's totals, which outlive the DownTrack (countInto).
 type dtStats struct {
-	packets     atomic.Uint64 // RTP packets written, retransmissions not included
-	bytes       atomic.Uint64 // their payload bytes
-	drops       atomic.Uint64 // packets a full queue dropped
+	packets     tally         // RTP packets written, retransmissions not included
+	bytes       tally         // their payload bytes
+	drops       tally         // packets a full queue dropped
 	noCodec     atomic.Uint64 // packets in a profile the viewer negotiated no payload type for
 	unsent      atomic.Uint64 // packets Pion took without sending them (WriteRTP returned 0 and no error)
 	writeErrors atomic.Uint64
@@ -94,13 +102,24 @@ type dtStats struct {
 
 	// Repair (02 §9.5, §13). Every sequence number a NACK names is received, and then served, missed, skipped or
 	// dropped by the full RTX queue.
-	nackReceived atomic.Uint64 // sequence numbers the viewer's NACKs asked for
-	nackServed   atomic.Uint64 // of those, retransmitted
-	nackMissed   atomic.Uint64 // not in a cache any more, or never sent
-	rtxSkipped   atomic.Uint64 // not retransmitted: asked for again too soon or too often, over budget, or too many at once
-	rtxPackets   atomic.Uint64 // retransmissions written, as RTX or plain (egress kind "rtx")
-	rtxBytes     atomic.Uint64 // their payload bytes, with the two of RTX's original sequence number
-	rtxDrops     atomic.Uint64 // retransmissions the full RTX queue dropped
+	nackReceived tally // sequence numbers the viewer's NACKs asked for
+	nackServed   tally // of those, retransmitted
+	nackMissed   tally // not in a cache any more, or never sent
+	rtxSkipped   tally // not retransmitted: asked for again too soon or too often, over budget, or too many at once
+	rtxPackets   tally // retransmissions written, as RTX or plain (egress kind "rtx")
+	rtxBytes     tally // their payload bytes, with the two of RTX's original sequence number
+	rtxDrops     tally // retransmissions the full RTX queue dropped
+
+	// lossPct is the fraction the viewer's last receiver report about the track says it lost, in percent
+	// (math.Float64bits); 0 before the first one.
+	lossPct atomic.Uint64
+	// bitrate is what the DownTrack sends its viewer, media and retransmissions, in bit/s of payload: a 2 s moving
+	// average that the ticker updates once a second (tick).
+	bitrate atomic.Int64
+	// The ticker's own state: only SFU.everySecond touches it.
+	ticks     int    // ticks seen, up to 2: the first is the baseline
+	tickAt    int64  // monoNow of the last tick
+	tickBytes uint64 // bytes + rtxBytes at the last tick
 }
 
 // binding is one negotiated attachment of a DownTrack to a sub PC's sender (02 §9.3).
@@ -140,6 +159,9 @@ func newDownTrack(sub *Subscription, kind webrtc.RTPCodecType) *DownTrack {
 		d.queue, d.m = make(chan *packet, audioQueueLen), newMunger(audioClockRate)
 	} else {
 		d.queue, d.m = make(chan *packet, videoQueueLen), newMunger(videoClockRate)
+	}
+	if sub.conn != nil {
+		d.countInto(&sub.conn.sfu.counters)
 	}
 	return d
 }
@@ -560,6 +582,10 @@ func (d *DownTrack) forward(w *rtpWriteState, p *packet) (changed bool) {
 	}
 
 	d.mu.Lock()
+	var last *Layer // the Layer of the stream so far: its newest epoch's
+	if d.m.n > 0 {
+		last = d.m.newest().layer
+	}
 	seq, ts, v := d.m.process(p, now)
 	if v == verdictNewEpoch {
 		d.interest.Store(d.interestLocked()) // a switch is done: the old layer's packets are no longer wanted
@@ -581,6 +607,12 @@ func (d *DownTrack) forward(w *rtpWriteState, p *packet) (changed bool) {
 		return changed
 	case verdictNewEpoch:
 		d.stats.switches.Add(1)
+		if last != nil && last.slot != p.layer.slot && d.totals != nil {
+			// A layer switch (isshoni_sfu_layer_switches_total): the viewer's stream goes on in another layer than
+			// it was in, at once or after a pause. A resume in the same layer, or a publisher's new track for it,
+			// is none.
+			d.totals.layerSwitches.Add(1)
+		}
 	case verdictForward:
 	}
 
@@ -705,8 +737,9 @@ func (d *DownTrack) readRTCP(pc *subPC, sender *webrtc.RTPSender) {
 // handleRTCP acts on one compound packet from the viewer. Pion delivers a compound packet to every SSRC it names,
 // so each DownTrack looks only at what names its own SSRC. A NACK is answered from the packet cache (02 §9.5,
 // handleNACK), for audio as for video. A PLI or FIR about a video track becomes a keyframe request to the publisher
-// for the layer forwarded now (a FIR is translated to a PLI upstream, 02 §9.7). REMB and receiver reports are README
-// S84's.
+// for the layer forwarded now (a FIR is translated to a PLI upstream, 02 §9.7). A receiver report about the track
+// gives its loss (DownTrackStats.LossPct, 02 §13). REMB, and what the downlink allocator makes of the receiver reports,
+// are README S84's.
 func (d *DownTrack) handleRTCP(pkts []rtcp.Packet) {
 	b := d.binding.Load()
 	if b == nil {
@@ -716,6 +749,12 @@ func (d *DownTrack) handleRTCP(pkts []rtcp.Packet) {
 	left := nackBatch
 	for _, pkt := range pkts {
 		switch pkt := pkt.(type) {
+		case *rtcp.ReceiverReport:
+			for _, r := range pkt.Reports {
+				if r.SSRC == b.ssrc {
+					d.stats.lossPct.Store(math.Float64bits(100 * float64(r.FractionLost) / 256))
+				}
+			}
 		case *rtcp.TransportLayerNack:
 			if pkt.MediaSSRC == b.ssrc {
 				d.handleNACK(b, pkt.Nacks, &left, monoNow())

@@ -97,7 +97,8 @@ type apis struct {
 
 // newAPIs builds the subscribe and probe APIs, and the SettingEngine of the publish APIs, on tr (02 §7.1): each
 // SettingEngine gets tr.Apply first and then the settings of 02 §7.3. log carries component=sfu; one Pion logger
-// factory on it serves every API, so the per-scope line limit of logx holds for the whole SFU.
+// factory on it serves every API, so the per-scope line limit of logx holds for the whole SFU. It is logx's with
+// Pion's info lines, and its warnings that hold an address, at debug (pionlog.go, 02 §13).
 func newAPIs(tr *netx.Transport, log *slog.Logger) (*apis, error) {
 	if tr == nil {
 		return nil, errors.New("sfu: no ICE transport (Config.Transport is nil)")
@@ -105,7 +106,7 @@ func newAPIs(tr *netx.Transport, log *slog.Logger) (*apis, error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	lf := logx.NewPionLoggerFactory(log)
+	lf := pionLogs{logx.NewPionLoggerFactory(log)}
 	a := &apis{
 		probe:      map[ProbeTransport]*webrtc.API{},
 		filter:     newCandidateFilter(tr),
