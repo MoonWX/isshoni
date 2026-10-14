@@ -2456,17 +2456,21 @@ Rules:
   SFU's and netx's Pion loggers. That is SDP's `a=ice-pwd`, which is never logged. **The Pion bridge redacts before
   it writes**, at every level and through every method, in each line its limiter lets through
   (`redactCredentials`, `logx/pion.go`):
-  - a **named password**: a name that ends in `pwd`, `password`, `passwd` or `credential` (any case, after any
-    letters, digits and `_`: `remotePwd`, `localPwd`, `icePwd`, the `pwd` of `ice-pwd`, a struct's `Password` field
-    as `%+v` prints it, a JSON key, a TURN server's `Credential`), then `:` or `=`; its value becomes `[redacted]`
-    inside the quotes it had (`"…"` with Go's escapes, `'…'` or `` `…` ``), and a value without them (an escaped
-    JSON quote counts as none) up to the next space, comma, semicolon, `&` or closing bracket;
+  - a **named password**: a name that ends in `pwd`, `password`, `passwd` or `credential`, or their plural (any
+    case, after any letters, digits and `_`: `remotePwd`, `localPwd`, `icePwd`, the `pwd` of `ice-pwd`, a struct's
+    `Password` field as `%+v` prints it, a JSON key, a TURN server's `Credential`), then `:` or `=`; its value
+    becomes `[redacted]` inside the quotes it had (`"…"` with Go's escapes, `'…'` or `` `…` ``), and a value without
+    them (an escaped JSON quote counts as none) up to the next space, comma, semicolon, `&` or closing bracket;
   - the password of a **ufrag:password pair**: in a run of ICE characters (letters, digits, `+` and `/`) and colons,
     a part of at least 22 characters that follows a part of at least 4 (RFC 8445's lengths for a password and a
     ufrag) becomes `[redacted]`. A ufrag is no secret (every connectivity check carries it in the clear) and stays.
     The parts of addresses with ports, fingerprints and times are shorter. The rule is a heuristic that leans
-    toward redacting: a URL whose host has no dot and 20 or more characters looks like a pair after its scheme and
-    is redacted as well.
+    toward redacting: a URL whose scheme has 4 or more letters (`http`, `https`, `stun`, `turn`) looks like a pair
+    when what follows the scheme's colon (the `//`, the host and the path, up to the next colon or the first dot,
+    `-`, `_`, `?` or other character that is not an ICE character) has 22 or more characters, and that whole part
+    is redacted: `http://localhost/api/v1/rooms/abc` becomes `http:[redacted]`, and a `turn:` URL with a long
+    dotless host loses the host. A port and the path after it make such a part too
+    (`http://localhost:8080/api/v1/rooms/abcdefgh` becomes `http://localhost:[redacted]`).
 
   `server.New` still wraps the logger it is given in README S90's handler, which replaces the value of `remotePwd`,
   `localPwd`, `ice-pwd` (or `icePwd`) or a bare `pwd` (any case, quoted or not, after `:` or `=`) by `"[redacted]"` in
@@ -4229,10 +4233,10 @@ no tokens, SDP, push endpoints or usernames.
 - TCP-only viewer (`tcp-only.spec`): its own server (05's `startServer` fixture) with `listen.ice_udp = ""`; Chrome
   viewer plays (`framesDecoded > 0`) and the selected candidate pair is TCP. As README S90 wrote it: in off mode
   there is no 443 multiplexer, so the TCP is `listen.ice_tcp` (7882 in production); the friend's stage keeps
-  decoding, its sub PC is `connected` with transport `tcp`, and the sharer's pub PC, which the page's debug stats
-  don't list (05 §10.7), is checked in the server's log: the SFU's `PeerConnection state` lines for both PCs say
-  `connected` with transport `tcp7882`, and none connected over UDP. A headful Chrome shares the tone tab, a
-  headless one the fake display (05 §19.3).
+  decoding, its sub PC is `connected` with transport `tcp`, and the sharer's pub PC is checked in the server's log
+  (README S90 wrote it before README S93 added the pub PC to the page's stats, 05 §10.7): the SFU's
+  `PeerConnection state` lines for both PCs say `connected` with transport `tcp7882`, and none connected over UDP.
+  A headful Chrome shares the tone tab, a headless one the fake display (05 §19.3).
 - Connection test: wizard step 2 reports UDP ✓ and TCP 7882 ✓ on localhost with the TCP 443 row hidden (the harness
   runs in off mode, so `tcp443` answers `transport_disabled`; the TLS case is the Go test above); with
   `listen.ice_udp = ""` the UDP row shows ✗ with the "UDP turned off" text.
@@ -4586,10 +4590,11 @@ Decided after group 14 (engineering calls the owner delegated; README §6 "Decid
 
 18. **logx's Pion bridge redacts ICE passwords itself, and its limiter's lines have the level of the lines they
     stand for** (README F20; §10, §17). The bridge redacts a named password and the password of a ufrag:password
-    pair in every line it writes, at every level; the pair rule leans toward redacting (a URL with a long dotless
-    host loses its host). `internal/server/logsafety.go`'s net stays as a second layer. The "further messages
-    suppressed" notice comes at the dropped line's level, and again within the same minute for a dropped line of a
-    higher level; the count comes at the highest dropped level. The limiter keeps one budget per scope across
-    levels, so at `log.level = debug` Pion's debug lines can crowd out a warning; the notice then says so at warn.
+    pair in every line it writes, at every level; the pair rule leans toward redacting (a URL with a dotless host
+    and path of 22 or more characters after a scheme of 4 or more letters loses both, §10).
+    `internal/server/logsafety.go`'s net stays as a second layer. The "further messages suppressed" notice comes
+    at the dropped line's level, and again within the same minute for a dropped line of a higher level; the count
+    comes at the highest dropped level. The limiter keeps one budget per scope across levels, so at
+    `log.level = debug` Pion's debug lines can crowd out a warning; the notice then says so at warn.
 19. **A transfer tick that the stop cuts short is a normal stop** (README F20; §11.3): a debug line, no alert
     check and no warning from the alert memory for a cancelled context; a store call's own timeout still warns.

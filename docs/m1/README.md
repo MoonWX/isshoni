@@ -966,10 +966,12 @@ discusses it. The numbering of "Decided after group 13" above stays as S00L set 
 
 1. **logx's Pion bridge redacts ICE passwords itself, and its limiter's lines have the level of the lines they
    stand for** (README F20; 04 §10, §17 and its decision 18; 02 §13). In every line it writes, at every level, the
-   bridge replaces a named password (a name ending in `pwd`, `password`, `passwd` or `credential`, then `:` or
-   `=`) and, in a ufrag:password pair, a part of 22 or more ICE characters after one of 4 or more. The pair rule
-   leans toward redacting: a URL whose dotless host has 20 or more characters loses it. README S90's net in
-   `internal/server/logsafety.go` stays as a second layer (the integration rewrote its header comment). The
+   bridge replaces a named password (a name ending in `pwd`, `password`, `passwd` or `credential`, or their
+   plural, then `:` or `=`) and, in a ufrag:password pair, a part of 22 or more ICE characters after one of 4 or
+   more. The pair rule leans toward redacting: after a scheme of 4 or more letters, a URL's `//`, host and path,
+   up to the next colon or the first dot or other character that is not an ICE character, are one part, redacted
+   when it has 22 or more characters (`http://localhost/api/v1/rooms/abc` becomes `http:[redacted]`). README S90's
+   net in `internal/server/logsafety.go` stays as a second layer (the integration rewrote its header comment). The
    "further messages suppressed" notice comes at the level of the line that was dropped, and once more in the same
    minute for a dropped line of a higher level; "N messages suppressed" comes at the highest dropped level. A
    design point stays as it is: the limiter has one budget per scope across levels, so at `log.level = debug`
@@ -1048,7 +1050,10 @@ discusses it. The numbering of "Decided after group 13" above stays as S00L set 
     symmetric; a literal loopback `public_ip` taken for a public address). The manual check on a Linux host with a
     real address stays in the exit test's pre-flight (06 §12.1 item 5). Still not scheduled: `sign` and `sign-dry`
     calling `check-draft.sh` without the signature check (F15's note); `task e2e` building `isshoni-loadtest` and
-    passing `LOADTEST_BIN` (S89's option).
+    passing `LOADTEST_BIN` (S89's option). Two stale comments wait for the next slice that edits their file:
+    `web/e2e/tcp-only.spec.ts` still says the page's stats have only the viewer's PCs (S93 added the pub PC), and
+    `redactCredentials` in `internal/logx/pion.go` describes the pair rule's URL case by a dotless host of at
+    least 20 characters, where 04 §10 has what the code does (review S00M-R1, R2).
 12. **Still waiting for the owner: README F07** (R1 of the security review, point 1 of "Decided after group 10"),
     unchanged and not in group 15; **README S92**, the load gate, which needs the owner's OK for its two machines;
     and **README S94-day**, the exit test, the device matrix and `v0.1.0`, after S92 ("Owner actions").

@@ -2873,10 +2873,11 @@ its results template `results-template.md`):
     `check` when the recording doesn't cover the session.
   - **Recovery** stays `manual`. For the server restart the summary gives the outage as a range: at most from the
     old process's last scrape with everyone (the most participants of its last 5 minutes) to the new one's first,
-    at least from the first to the last sign of the outage in between (a scrape with fewer participants, a failed
-    scrape, a `down` row), since participants are scraped every 30 s. The new PID's own row is no sign: it comes up
-    to a sample late. It is `check` when even the shorter end is over 30 s, or when the participants never came
-    back (review S94-F2).
+    at least from the first sign of the outage, or the new PID's `restart` row when that comes first (the old
+    process had stopped by then), to the last sign in between (a scrape with fewer participants, a failed scrape, a
+    `down` row), since participants are scraped every 30 s. The new PID's row is no sign that the outage went on:
+    it comes up to a sample late. It is `check` when even the shorter end is over 30 s, or when the participants
+    never came back (review S94-F2).
   - **Viewing quality** is `FAIL` only when the viewers' freeze time is at least 3 % of the video tracks' watch
     time, every device together (the phones' limit, the larger one); otherwise `manual`, because the split per
     device comes from the dashboard and the notes. The watch time is the forwarding video DownTracks times time,
