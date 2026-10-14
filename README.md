@@ -19,10 +19,12 @@ Discord keeps high-quality screen sharing behind Nitro. isshoni is a self-hostab
 
 ## Status
 
+<!-- Before each release tag (the rc's too): bring this section, the banner above, "What v0.1.0 will ship" and the
+Install intro up to date, and fill in the fingerprints under "Release signing keys" (deploy/keys/README.md step 2). -->
 - **No release yet.** M1, "Watch together" (the server and the web client), is being built. It runs from source for
   development: see [CONTRIBUTING.md](CONTRIBUTING.md).
-- **v0.1.0 ends M1.** Release candidates come first. v0.1.0 follows once five friends have shared and watched for two
-  hours on a small VPS with no manual fixes, with an iPhone and an Android phone among the viewers.
+- **v0.1.0 ends M1.** Release candidates come first. v0.1.0 follows once five friends have finished a two-hour session
+  on a small VPS with no manual fixes, with an iPhone and an Android phone among the viewers.
 - **The desktop apps are later milestones**: Windows (M2), macOS (M3) and a Linux share agent (M4). Native iOS and
   Android apps are pending; phones watch in the browser. [docs/PLAN.md](docs/PLAN.md) has the whole roadmap.
 
@@ -78,8 +80,8 @@ isshoni gets its certificate from Let's Encrypt. Using it means you accept the L
 ## Release signing keys
 
 Every release's `checksums.txt` is signed with `ssh-keygen -Y sign`. `install.sh` checks that signature against the
-public keys built into it before it installs anything, and stops if the check fails. The public keys are in
-[`deploy/keys/`](deploy/keys/README.md); their fingerprints appear here before the first release:
+public keys built into it before it installs anything, and stops if the check fails. The public keys will be in
+[`deploy/keys/allowed_signers`](deploy/keys/README.md), and their fingerprints here, before the first release:
 
 | Key | Use | Fingerprint |
 |---|---|---|
