@@ -9,20 +9,24 @@
 #   ghcr.io/moonwx/isshoni:<v>, SBOMs, the cosign bundle of checksums.txt and the provenance attestations. For a
 #   final release it first checks the protocol compat snapshot (01 §14.3): internal/protocol/testdata/compat/<v>/,
 #   committed by the release-prep PR (`task release:compat VERSION=<v>`, 06 §9.1), must be a copy of testdata/v1.
-# - sign is the only job that sees the release signing key (06 §9.4), and runs nothing but checkout, gh and
-#   ssh-keygen. Its signature, checksums.txt.sig, is what install.sh checks before it installs anything.
-# - verify installs the draft with its own install.sh in systemd containers, and checks the cosign signatures and
-#   the attestations.
-# - publish publishes the draft. Only a final release becomes GitHub's "latest" and moves the floating image tags
-#   (:0.<minor> and :latest in 0.x); a prerelease (-rc.N) moves neither.
+# - sign is the only job that sees the release signing key (06 §9.4), and runs nothing but checkout, gh,
+#   ssh-keygen and upload-artifact. Its signature, checksums.txt.sig, is what install.sh checks before it installs
+#   anything; the files it signed, with the signature, go to verify as the artifact release-signed.
+# - verify installs those files with their own install.sh in rootless systemd containers (podman), and checks the
+#   cosign signatures and the attestations. It holds no write token: the container runs third-party code as its
+#   root, from Docker Hub bases pinned by digest (06 §4.13; README §6 "Decided after group 10" (1), review R4).
+# - publish downloads the draft once more and publishes it only if the signature, every checksum and the asset list
+#   still hold. Only a final release becomes GitHub's "latest" and moves the floating image tags (:0.<minor> and
+#   :latest in 0.x); a prerelease (-rc.N) moves neither.
 # - site calls .github/workflows/site.yml after publish, which rebuilds the project site from main with the new
 #   release's install.sh (06 §10.3): a release made with GITHUB_TOKEN triggers no other workflow. It needs
 #   `if: ${{ !cancelled() && needs.publish.result == 'success' }}`, not a plain condition: sign-dry is skipped on a
 #   tag, and a job-level success() counts every job upstream (see publish).
 #
 # Dry run (Actions → Release → Run workflow, dry_run on): the same jobs as 0.0.0-dryrun.<run>, with goreleaser's
-# snapshot (built and signed with cosign, never published), a sign-dry job that signs with a key made in the job, and
-# verify against those files with an install.sh that carries that key. Nothing needs approval, nothing is public.
+# snapshot (built and signed with cosign, never published), a sign-dry job that signs with a key made in the job and
+# uploads release-signed as sign does, and verify against those files with an install.sh that carries that key.
+# Nothing needs approval, nothing is public.
 #
 # Rules for every workflow (06 §8.1): a read-only token by default, with jobs raising their own permissions;
 # third-party actions pinned by full commit SHA with a version comment; checkout without persisted credentials;
@@ -246,6 +250,13 @@ jobs:
 
       - name: Set up Docker Buildx (dockers_v2 builds both platforms and an SBOM attestation)
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          # The builder runs BuildKit as a privileged container in this job, which holds the write token: its image
+          # is pinned by the digest of its multi-arch index, the release that buildx-stable-1 (the action's default)
+          # named when it was pinned (review R4). Dependabot does not read it; bump it by hand with the monthly bump
+          # of the tool pins (06 §7.1): `docker buildx imagetools inspect moby/buildkit:buildx-stable-1` prints the
+          # digest, and the release tag with the same digest goes in front of it.
+          driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
       - name: Build the pinned goreleaser into .bin/
         run: |
@@ -361,7 +372,7 @@ jobs:
 
   sign:
     # The only job with the release signing key (06 §9.3, §9.4). It runs once the owner approves the environment,
-    # and uses no third-party action but checkout.
+    # and uses no actions but GitHub's checkout and upload-artifact.
     if: needs.version.outputs.dry-run == 'false'
     needs: [version, build]
     runs-on: ubuntu-24.04
@@ -422,8 +433,19 @@ jobs:
       - name: Upload checksums.txt.sig to the draft
         run: gh release upload "$TAG" rel/checksums.txt.sig --repo "$GITHUB_REPOSITORY" --clobber
 
+      - name: Upload the signed files for verify
+        # verify installs exactly these, the draft as checked above with its signature, and so needs no token that
+        # can read a draft (contents: write) next to the third-party code it runs (review R4).
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-signed
+          path: rel
+          if-no-files-found: error
+          retention-days: 7
+
   sign-dry:
-    # The dry run's sign: the same commands with a key made here, and no environment.
+    # The dry run's sign: the same commands with a key made here, and no environment. It uploads the signed files as
+    # sign does, and the key's allowed_signers for the dry run's installer.
     if: needs.version.outputs.dry-run == 'true'
     needs: [version, build]
     runs-on: ubuntu-24.04
@@ -450,28 +472,41 @@ jobs:
 
       - name: Sign checksums.txt with a throwaway key and verify it
         run: |
-          mkdir signed
+          mkdir keys
           ssh-keygen -q -t ed25519 -N '' -C isshoni-release-dryrun -f "$RUNNER_TEMP/k"
           printf 'isshoni-release namespaces="isshoni-checksums" %s\n' "$(cat "$RUNNER_TEMP/k.pub")" \
-            > signed/allowed_signers
+            > keys/allowed_signers
           ssh-keygen -Y sign -f "$RUNNER_TEMP/k" -n isshoni-checksums rel/checksums.txt
           rm -f "$RUNNER_TEMP/k"
-          ssh-keygen -Y verify -f signed/allowed_signers -I isshoni-release -n isshoni-checksums \
+          ssh-keygen -Y verify -f keys/allowed_signers -I isshoni-release -n isshoni-checksums \
             -s rel/checksums.txt.sig < rel/checksums.txt
-          mv rel/checksums.txt.sig signed/
 
-      - name: Upload the signature and its allowed_signers
+      - name: Upload the signed files for verify
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: release-signature-dryrun
-          path: signed
+          name: release-signed
+          path: rel
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Upload the throwaway key's allowed_signers
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-keys-dryrun
+          path: keys
           if-no-files-found: error
           retention-days: 3
 
   verify:
-    # The release as a user gets it (06 §9.3): its own install.sh, from a mirror of the draft served by
+    # The release as a user gets it (06 §9.3): its own install.sh, from a mirror of the signed files served by
     # tools/relserve over HTTPS, in a systemd container, as scenario C1 of 06 §11.2 does. In a dry run the
     # installer carries sign-dry's key, the one thing that differs from the files of a release.
+    #
+    # The container runs third-party code as its root: the distro's packages and whatever its base image holds.
+    # So this job has no write token (review R4): it takes the files from sign's artifact, not from the draft, which
+    # only a token with contents: write can read; GH_TOKEN, read-only, is set only for the two steps that ask
+    # GitHub, and both run before the container starts. The container is rootless podman with systemd (06 §4.13),
+    # not a privileged one, and its bases are pinned by digest.
     needs: [version, build, sign, sign-dry]
     if: >-
       !cancelled() && needs.build.result == 'success' &&
@@ -479,22 +514,25 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
-      contents: write # read the draft
+      contents: read
       packages: read # the image is private until the owner makes the package public (06 §8.6)
       attestations: read
     strategy:
       fail-fast: false
       matrix:
+        # The bases of deploy/test/distro/Containerfile by the digest of their multi-arch index; the comment names
+        # the tag that the digest was taken from. A floating tag would let whoever controls it run code here.
+        # Dependabot does not read a workflow's matrix: bump both by hand with the monthly bump of the tool pins
+        # (06 §7.1), each to the digest that `docker buildx imagetools inspect docker.io/library/<tag>` prints.
         include:
           - distro: debian-12
-            base: debian:12
+            base: docker.io/library/debian@sha256:2c037a04925515fdd6ea85ea14a682d0e79931f5e9f5d07b6dbfc6ba12f9e858 # debian:12
           - distro: ubuntu-24.04
-            base: ubuntu:24.04
+            base: docker.io/library/ubuntu@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55 # ubuntu:24.04
     env:
       VERSION: ${{ needs.version.outputs.version }}
       TAG: ${{ needs.version.outputs.tag }}
       DRY_RUN: ${{ needs.version.outputs.dry-run }}
-      GH_TOKEN: ${{ github.token }}
       CONTAINER: isshoni-release-verify
     steps:
       - name: Check out
@@ -513,23 +551,18 @@ jobs:
         with:
           cosign-release: v3.1.3
 
-      - name: Download the draft's assets
-        if: env.DRY_RUN == 'false'
-        run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "mirror/download/$TAG"
-
-      - name: Download the dry run's release files
-        if: env.DRY_RUN == 'true'
+      - name: Download the signed release files (sign's, or sign-dry's in a dry run)
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: release-assets
+          name: release-signed
           path: mirror/download/${{ needs.version.outputs.tag }}
 
-      - name: Download the dry run's signature
+      - name: Download the dry run's allowed_signers
         if: env.DRY_RUN == 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: release-signature-dryrun
-          path: ${{ runner.temp }}/signed
+          name: release-keys-dryrun
+          path: ${{ runner.temp }}/keys
 
       - name: Put the dry run's key into its installer
         # The released install.sh has the production keys between its key markers and no other way to take one
@@ -537,8 +570,7 @@ jobs:
         if: env.DRY_RUN == 'true'
         run: |
           dir=mirror/download/$TAG
-          cp "$RUNNER_TEMP/signed/checksums.txt.sig" "$dir/"
-          awk -v q="'" -v keys="$(cat "$RUNNER_TEMP/signed/allowed_signers")" '
+          awk -v q="'" -v keys="$(cat "$RUNNER_TEMP/keys/allowed_signers")" '
             /^# BEGIN ALLOWED SIGNERS/ { print; print "ALLOWED_SIGNERS=" q keys q; skip = 1; next }
             /^# END ALLOWED SIGNERS/ { skip = 0 }
             !skip { print }' "$dir/install.sh" > "$RUNNER_TEMP/install.sh"
@@ -557,19 +589,26 @@ jobs:
 
       - name: cosign verify on the image
         if: env.DRY_RUN == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          trap 'docker logout ghcr.io > /dev/null' EXIT
           printf '%s\n' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           cosign verify "$IMAGE:$VERSION" \
             --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@$GITHUB_REF" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
 
       - name: gh attestation verify on the linux/amd64 archive
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: gh attestation verify "mirror/download/$TAG/isshoni_${VERSION}_linux_amd64.tar.gz" --repo "$GITHUB_REPOSITORY"
 
       - name: Serve the mirror with tools/relserve
         run: |
           go -C tools build -o "$RUNNER_TEMP/relserve" ./relserve
-          # On every address: the container comes in through Docker's bridge.
+          # On every address: the rootless container comes in through slirp4netns, which connects from the runner
+          # to the runner's own address, the one podman names host.containers.internal (06 §4.13). Its loopback
+          # address is not reachable from there.
           "$RUNNER_TEMP/relserve" -dir mirror -latest "$VERSION" -ca-out "$RUNNER_TEMP/ca.pem" -addr 0.0.0.0:0 \
             -ready-file "$RUNNER_TEMP/addr" > "$RUNNER_TEMP/relserve.log" 2>&1 &
           for _ in $(seq 1 100); do
@@ -582,42 +621,64 @@ jobs:
             exit 1
           fi
           addr=$(cat "$RUNNER_TEMP/addr")
-          echo "BASE_URL=https://host.docker.internal:${addr##*:}" >> "$GITHUB_ENV"
+          echo "BASE_URL=https://host.containers.internal:${addr##*:}" >> "$GITHUB_ENV"
 
-      - name: Start a ${{ matrix.distro }} systemd container
+      - name: Start a ${{ matrix.distro }} systemd container (rootless podman)
         env:
           BASE: ${{ matrix.base }}
           DISTRO: ${{ matrix.distro }}
         run: |
-          docker build -q -t "isshoni-release-verify:$DISTRO" --build-arg "BASE=$BASE" \
+          podman --version
+          podman build -q -t "isshoni-release-verify:$DISTRO" --build-arg "BASE=$BASE" \
             -f deploy/test/distro/Containerfile deploy/test/distro
-          docker run -d --name "$CONTAINER" --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock \
-            --add-host=host.docker.internal:host-gateway "isshoni-release-verify:$DISTRO"
+          # Rootless and without --privileged: systemd as PID 1 comes from --systemd=always (06 §4.13).
+          # CAP_SYS_ADMIN is the container's, in its own user namespace, and nothing on the runner: systemd needs it
+          # to build the unit's sandbox (ProtectSystem= and the rest are mount namespaces). Without it systemd skips
+          # the sandbox, the StateDirectory= bind mount with it, and the server, which sees a container, refuses a
+          # data_dir that is not a mounted volume (04 §5.1). The network is named although slirp4netns is the
+          # default of the runner's podman (4.9) for a rootless container: with pasta, the default from podman 5
+          # on, podman 4.9 gives host.containers.internal no address that reaches the runner.
+          podman run -d --systemd=always --cap-add SYS_ADMIN --network slirp4netns --name "$CONTAINER" \
+            "isshoni-release-verify:$DISTRO"
           for _ in $(seq 1 120); do
-            state=$(docker exec "$CONTAINER" systemctl is-system-running 2>/dev/null) || :
+            state=$(podman exec "$CONTAINER" systemctl is-system-running 2>/dev/null) || :
             case $state in running | degraded) break ;; esac
             sleep 0.5
           done
           echo "systemd: ${state:-not up}"
-          docker cp "$RUNNER_TEMP/ca.pem" "$CONTAINER:/usr/local/share/ca-certificates/relserve.crt"
-          docker exec "$CONTAINER" update-ca-certificates
-          docker exec "$CONTAINER" curl -fsS -o /dev/null "$BASE_URL/tag/$TAG"
+          case $state in
+          running | degraded) ;;
+          *)
+            podman logs "$CONTAINER" 2>&1 | tail -n 30 || :
+            podman info --format 'cgroup manager {{.Host.CgroupManager}}, cgroups {{.Host.CgroupsVersion}}' || :
+            echo "::error::systemd did not come up in the $DISTRO container"
+            exit 1
+            ;;
+          esac
+          podman cp "$RUNNER_TEMP/ca.pem" "$CONTAINER:/usr/local/share/ca-certificates/relserve.crt"
+          podman exec "$CONTAINER" update-ca-certificates
+          if ! podman exec "$CONTAINER" curl -fsS -o /dev/null "$BASE_URL/tag/$TAG"; then
+            cat "$RUNNER_TEMP/relserve.log"
+            echo "::error::the container does not reach relserve at $BASE_URL"
+            exit 1
+          fi
+          echo "The container reaches relserve at $BASE_URL"
 
       - name: Install with the release's install.sh (--yes --tls-mode off)
         run: |
           # As an admin would: fetched with curl and run without a terminal. A public address of the
           # documentation range keeps the runner's own out of the log (06 §11.2).
           # shellcheck disable=SC2016 # the variables are the container shell's
-          docker exec -e "ISSHONI_DOWNLOAD_BASE=$BASE_URL" -e ISSHONI_PUBLIC_URL=http://127.0.0.1:8080 \
+          podman exec -e "ISSHONI_DOWNLOAD_BASE=$BASE_URL" -e ISSHONI_PUBLIC_URL=http://127.0.0.1:8080 \
             -e ISSHONI_PUBLIC_IP=203.0.113.7 "$CONTAINER" \
             sh -c 'curl -fsSL -o /root/install.sh "$1" && sh /root/install.sh --yes --tls-mode off' \
             sh "$BASE_URL/download/$TAG/install.sh"
 
       - name: The installed server reports ${{ needs.version.outputs.version }}
         run: |
-          docker exec "$CONTAINER" systemctl is-active isshoni
-          installed=$(docker exec "$CONTAINER" isshoni version --short)
-          served=$(docker exec "$CONTAINER" curl -fsS http://127.0.0.1:8080/api/v1/info | jq -r .server.version)
+          podman exec "$CONTAINER" systemctl is-active isshoni
+          installed=$(podman exec "$CONTAINER" isshoni version --short)
+          served=$(podman exec "$CONTAINER" curl -fsS http://127.0.0.1:8080/api/v1/info | jq -r .server.version)
           echo "isshoni version --short: $installed; GET /api/v1/info: $served"
           if [ "$installed" != "$VERSION" ] || [ "$served" != "$VERSION" ]; then
             echo "::error::the installed server is not $VERSION"
@@ -627,11 +688,13 @@ jobs:
       - name: Show the service log and relserve's
         if: failure()
         run: |
-          docker exec "$CONTAINER" journalctl -u isshoni --no-pager -n 100 || :
+          podman exec "$CONTAINER" journalctl -u isshoni --no-pager -n 100 || :
           cat "$RUNNER_TEMP/relserve.log" || :
 
   publish:
-    # 06 §9.3: refuses notes with a TODO; only a final release becomes "latest" and moves the floating image tags.
+    # 06 §9.3: refuses notes with a TODO, and a draft that is no longer what sign signed: it downloads the draft
+    # once more right before it goes public, since anything with a write token could have changed it after sign
+    # (review R4). Only a final release becomes "latest" and moves the floating image tags.
     # The result check is explicit: a job-level `if` without a status function means success(), and success() looks
     # at every job upstream, not only at `needs`. On a tag sign-dry is skipped, so a plain condition would skip
     # publish after a green verify, and the run would end green with the release still a draft (actions/runner#491).
@@ -649,6 +712,12 @@ jobs:
       FLOATING_TAGS: ${{ needs.version.outputs.floating-tags }}
       GH_TOKEN: ${{ github.token }}
     steps:
+      - name: Check out deploy/keys
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: deploy/keys
+
       - name: The release notes have no TODO left
         run: |
           body=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body)
@@ -656,6 +725,42 @@ jobs:
             echo "::error::the notes of the draft $TAG still have a TODO: edit them on GitHub, then re-run this job"
             exit 1
           fi
+
+      - name: Download the draft once more
+        run: |
+          rm -rf rel
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir rel
+
+      - name: The draft is what sign signed (signature, checksums, no other asset)
+        # Reads only rel/ and deploy/keys/allowed_signers in the working directory.
+        run: |
+          # checksums.txt is signed by a key of deploy/keys/allowed_signers, as install.sh will check it (06 §4.3).
+          if ! ssh-keygen -Y verify -f deploy/keys/allowed_signers -I isshoni-release -n isshoni-checksums \
+            -s rel/checksums.txt.sig < rel/checksums.txt; then
+            echo "::error::checksums.txt of the draft $TAG has no valid signature of a key in deploy/keys/allowed_signers"
+            exit 1
+          fi
+          # Every asset it lists is there, with that SHA-256.
+          if ! (cd rel && sha256sum --strict -c checksums.txt); then
+            echo "::error::an asset of the draft $TAG is missing or does not match checksums.txt"
+            exit 1
+          fi
+          # And the draft has no asset that it does not list, which no signature would cover. Its own signature and
+          # cosign bundle are the exceptions.
+          shopt -s dotglob nullglob
+          unlisted=0
+          for f in rel/*; do
+            name=${f#rel/}
+            case $name in checksums.txt | checksums.txt.sig | checksums.txt.sigstore.json) continue ;; esac
+            if ! awk -v f="$name" '$2 == f { found = 1 } END { exit !found }' rel/checksums.txt; then
+              echo "::error::the draft $TAG has $name, which checksums.txt does not list"
+              unlisted=1
+            fi
+          done
+          if [ "$unlisted" != 0 ]; then
+            exit 1
+          fi
+          echo "The draft $TAG is the release that sign signed"
 
       - name: Publish the release
         run: |

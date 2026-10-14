@@ -2823,19 +2823,33 @@ isshoni-backup-0.3.0-20260929T101500Z.tar.gz
 - **No room for the snapshot** is the refusal 507 `insufficient_storage`, seen before the snapshot begins, with or
   without a server.
 - **The CLI never overwrites a file**: `--out` (or the default name) is created with `O_EXCL` and mode `0600`; a
-  file that exists is exit 7 (a pipe or a device the operator named is written to as it is). A backup that could
-  not be written to its end removes its file again. Afterwards the CLI prints the file and its size and the
-  "Keep it private" line; with `--out -` only the line, on stderr. An offline backup of a data directory with no
-  database, no `secrets.json` and no certificates is an error ("nothing to back up"), and a raw one says that the
-  database was copied as it was.
-- **Review R5** (the M1 security review; README §6 "Decided after group 10" (1)). As built, the default name takes
-  the pipe-or-device path too: when `O_EXCL` finds something at the default name that is neither a regular file
-  nor a directory, the CLI opens it for writing (following links) and streams the archive into it. Another local
-  user can place FIFOs at the predictable names of the next seconds in a world-writable directory, and an operator
-  who runs `sudo isshoni admin backup` there hands that user the database, `secrets.json` and the TLS keys. The
-  rule above ("a pipe or a device the operator named") is meant: README F09 (group 12) makes any existing file at
-  the default name exit 7, and writes to an explicit `--out` that exists only when it is a FIFO or a character
-  device owned by the caller's euid or by root (a link stays allowed: `--out /dev/fd/N` is one).
+  file that exists is exit 7. Only an `--out` that the operator named may exist, and only as a FIFO or a character
+  device that belongs to the command's effective user or to root: that is written to as it is (without the size
+  in the "Wrote" line). **Without `--out`, whatever is at the default name is exit 7**, a FIFO or a link included:
+  the name is predictable (review R5, below). A backup that could not be written to its end removes its file
+  again. Afterwards the CLI prints the file and its size and the "Keep it private" line; with `--out -` only the
+  line, on stderr. An offline backup of a data directory with no database, no `secrets.json` and no certificates is
+  an error ("nothing to back up"), and a raw one says that the database was copied as it was.
+- **Review R5** (the M1 security review; README §6 "Decided after group 10" (1)), as README F09 fixed it. Until
+  F09 the default name took the pipe-or-device path too: when `O_EXCL` found something at the default name that
+  was neither a regular file nor a directory, the CLI opened it for writing and streamed the archive into it.
+  Another local user could place FIFOs at the predictable names of the next seconds in a world-writable directory,
+  and an operator who ran `sudo isshoni admin backup` there handed that user the database, `secrets.json` and the
+  TLS keys. Now (`openBackupOut` in `cmd/isshoni/backup.go`):
+  - the default name never takes it: anything there is exit 7, and nothing is opened;
+  - an `--out` that exists is written to only when it is a FIFO or a character device whose owner is the
+    command's effective uid or root (uid 0); anything else, another user's pipe included, is exit 7 with nothing
+    written ("… is a pipe or a device of another user (uid N) …"). Links are followed, so `--out /dev/fd/3` and
+    `--out /dev/null` work. The type and the owner are checked with `stat` before the open, so that another
+    user's FIFO is never opened, and again with `fstat` on the opened file, the one that would get the archive;
+  - where the system has no Unix owners (Windows, a development platform only), an existing `--out` is exit 7;
+  - `--out -` is unchanged: stdout is no file at a path, and nothing about it is checked but the terminal.
+    A pipe that a shell made for a `sudo` command belongs to the user who ran `sudo`, not to root, so
+    `sudo isshoni admin backup --out /dev/stdout | …` is refused; `--out -` is the form for stdout.
+
+  The tests (`cmd/isshoni/backup_unix_test.go`) put FIFOs with a waiting reader at the default names of the
+  seconds around a backup and check exit 7 and an empty pipe; the owner of an explicit `--out` FIFO comes from an
+  injectable check (`backupOutOwner`), since a file of another user takes root to make.
 
 ### 12.4 Restore
 

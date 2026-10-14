@@ -134,8 +134,9 @@ func backupOffline(ctx context.Context, inv *invocation, o backupOptions) error 
 }
 
 // writeBackup writes an archive where --out says: to stdout for "-", else to a new file with mode 0600, out or
-// name in the working directory. A file that exists is never overwritten (exit 7); a file that could not be
-// written to its end is removed again. Afterwards it says where the archive is, and that it holds the keys.
+// name in the working directory (openBackupOut). A file that exists is never overwritten (exit 7); a file that
+// could not be written to its end is removed again. Afterwards it says where the archive is, and that it holds
+// the keys.
 func writeBackup(inv *invocation, out, name string, write func(io.Writer) error) error {
 	if out == "-" {
 		if err := write(inv.stdout); err != nil {
@@ -144,20 +145,13 @@ func writeBackup(inv *invocation, out, name string, write func(io.Writer) error)
 		_, _ = fmt.Fprintln(inv.stderr, keepPrivate)
 		return nil
 	}
-	if out == "" {
+	named := out != ""
+	if !named {
 		out = name
 	}
-	f, err := os.OpenFile(out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // G304: the operator's --out
-	created := err == nil
-	if errors.Is(err, fs.ErrExist) {
-		fi, statErr := os.Stat(out)
-		if statErr != nil || fi.Mode().IsRegular() || fi.IsDir() {
-			return exitWith(exitRefused, fmt.Errorf("%s exists, and a backup never overwrites a file: remove it, or name another --out", out))
-		}
-		f, err = os.OpenFile(out, os.O_WRONLY, 0) //nolint:gosec // G304: a pipe or a device that the operator named
-	}
+	f, created, err := openBackupOut(inv, out, named)
 	if err != nil {
-		return fmt.Errorf("the backup can't be written: %w", err)
+		return err
 	}
 	err = write(f)
 	if err == nil && created {
@@ -178,6 +172,76 @@ func writeBackup(inv *invocation, out, name string, write func(io.Writer) error)
 	}
 	_, err = fmt.Fprintf(inv.stdout, "Wrote %s%s.\n%s\n", out, size, keepPrivate)
 	return err
+}
+
+// backupOutOwner returns the uid that owns an existing --out, and false where the system can't tell (fileOwner).
+// It is a variable only so that a test can give a pipe of its own another owner: making a file that belongs to
+// another user takes root.
+var backupOutOwner = fileOwner
+
+// openBackupOut opens where a backup goes (04 §12.3): a new file, created with O_EXCL and mode 0600 (created is
+// true). Something that exists already is never overwritten (exit 7), and only a path that the operator named
+// with --out (named) may exist at all: a pipe (FIFO) or a character device that belongs to the command's effective
+// user or to root is then written into as it is (created is false). At the default name nothing that exists is
+// ever opened: the name is predictable, and another local user could have put a FIFO at the name of the next
+// seconds in a world-writable directory and read the keys from it (README §6 "Decided after group 10" (1), review
+// R5). Links are followed, since --out /dev/fd/3 is one, and what a link leads to is checked twice: before the open,
+// so that the pipe of another user is never opened, and on the open file, which is the one that gets the archive.
+func openBackupOut(inv *invocation, out string, named bool) (f *os.File, created bool, err error) {
+	f, err = os.OpenFile(out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // G304: the operator's --out
+	switch {
+	case err == nil:
+		return f, true, nil
+	case !errors.Is(err, fs.ErrExist):
+		return nil, false, fmt.Errorf("the backup can't be written: %w", err)
+	case !named:
+		return nil, false, outExists(out)
+	}
+	fi, err := os.Stat(out)
+	if err != nil {
+		return nil, false, outExists(out) // a link that leads nowhere, or that this user may not follow
+	}
+	if err := writableOut(inv, out, fi); err != nil {
+		return nil, false, err
+	}
+	// A FIFO without a reader holds the open until one comes, as a shell's redirect does.
+	f, err = os.OpenFile(out, os.O_WRONLY, 0) //nolint:gosec // G304: a pipe or a device that the operator named
+	if err != nil {
+		return nil, false, fmt.Errorf("the backup can't be written: %w", err)
+	}
+	if fi, err = f.Stat(); err != nil {
+		err = fmt.Errorf("the backup can't be written: %w", err)
+	} else {
+		err = writableOut(inv, out, fi)
+	}
+	if err != nil {
+		_ = f.Close()
+		return nil, false, err
+	}
+	return f, false, nil
+}
+
+// writableOut says whether a backup may write into fi, which exists at out, the operator's --out: only a FIFO or
+// a character device, and only one that the command's effective user or root owns (exit 7 otherwise).
+func writableOut(inv *invocation, out string, fi fs.FileInfo) error {
+	if fi.Mode()&(fs.ModeNamedPipe|fs.ModeCharDevice) == 0 {
+		return outExists(out)
+	}
+	uid, ok := backupOutOwner(fi)
+	switch {
+	case !ok:
+		return exitWith(exitRefused, fmt.Errorf("%s exists, and a backup writes into a pipe or a device only when it "+
+			"belongs to you or to root, which this system can't tell: name a new file with --out, or use --out -", out))
+	case uid != inv.euid() && uid != 0:
+		return exitWith(exitRefused, fmt.Errorf("%s is a pipe or a device of another user (uid %d), and a backup "+
+			"writes only into one of yours or root's: remove it, or name another --out (for stdout, --out -)", out, uid))
+	}
+	return nil
+}
+
+// outExists is the refusal of an --out (or of the default name) that exists already.
+func outExists(out string) error {
+	return exitWith(exitRefused, fmt.Errorf("%s exists, and a backup never overwrites a file: remove it, or name another --out", out))
 }
 
 // byteSize prints a file size for people: 512 B, 3.4 MB.

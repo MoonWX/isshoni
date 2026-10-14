@@ -798,14 +798,37 @@ If isshoni was installed from a package, both refuse and print `apt remove issho
 - Started with `podman run -d --systemd=always` on CI, or `docker run -d --privileged --cgroupns=private --tmpfs /run
   --tmpfs /run/lock` locally (Docker Desktop works on macOS). `CONTAINER_ENGINE` selects which.
 - **As README S78 built it, CI uses Docker too**: the `distro` job sets `CONTAINER_ENGINE=docker`, with the same
-  `--privileged`, `--cgroupns=private` and host-gateway setup that release.yml's `verify` job already used,
-  because the runner's podman is rootless and its containers reach the runner's `relserve` another way. The
-  script still takes podman, and picks it when it is installed, but that path is not tested on CI.
-- **Review R4** (the M1 security review; README §6 "Decided after group 10" (1)): release.yml's `verify` job runs
-  such a privileged container, built from Docker Hub bases that no digest pins (`debian:12`, `ubuntu:24.04`),
-  while it holds a `contents: write` token. README F09 (group 12) moves `verify` to rootless
-  `podman run -d --systemd=always` with the bases pinned by digest and a read-only token, and makes `relserve`
-  reachable from that container, which reaches the runner another way than a Docker one (the bullet above; 9.3).
+  `--privileged`, `--cgroupns=private` and host-gateway setup that release.yml's `verify` job used until README
+  F09, because the runner's podman is rootless and its containers reach the runner's `relserve` another way (the
+  next bullet). The script still takes podman, and picks it when it is installed, but that path is not tested on
+  CI.
+- **Review R4** (the M1 security review; README §6 "Decided after group 10" (1)), as README F09 fixed it.
+  release.yml's `verify` job ran such a privileged container, built from Docker Hub bases that no digest pinned
+  (`debian:12`, `ubuntu:24.04`), while it held a `contents: write` token. Now (9.3) it holds a read-only token,
+  builds the image with `podman build` from bases pinned by the digest of their multi-arch index
+  (`docker.io/library/debian@sha256:…`, the tag in a comment; Dependabot doesn't read a workflow's matrix, so they
+  are bumped by hand with the monthly tool pins of 7.1), and starts it rootless, with no `--privileged`:
+  `podman run -d --systemd=always --cap-add SYS_ADMIN --network slirp4netns`. **`CAP_SYS_ADMIN`** is the
+  container's, in its own user namespace, and gives nothing on the runner; systemd needs it for the unit's sandbox
+  (`ProtectSystem=` and the rest are mount namespaces). Without it systemd skips the sandbox ("namespace setup is
+  prohibited (container manager?)"), and with it the `StateDirectory=` bind mount, so the server, which sees a
+  Podman container (`/run/.containerenv`), refuses `/var/lib/isshoni` as not a mounted volume (exit 78, 04 §5.1).
+  A privileged Docker container never met this. `distro-test.sh`'s podman path has no `--cap-add` yet, so its C1
+  would meet the same refusal; CI doesn't take that path (the bullet above). **How a rootless container reaches
+  `relserve`**: through
+  slirp4netns, which connects from the runner to the runner's own address, the one podman puts into the
+  container's `/etc/hosts` as `host.containers.internal` (a name in relserve's certificate). So `relserve` listens
+  on every address, and the installer's base is `https://host.containers.internal:<port>`. The runner's loopback
+  address is not reachable that way (with `allow_host_loopback=true` too, podman 4.9 maps the name to the runner's
+  address), and with pasta, the default network from podman 5 on, podman 4.9 gives the name no address that
+  reaches the runner; so the network is named, although slirp4netns is the default of the runner's podman 4.9.
+  F09 checked this with Ubuntu 24.04's podman 4.9.3, rootless in a container with a cgroup delegated to its user:
+  the default and the named slirp4netns reach a server on every address of the host as `host.containers.internal`,
+  pasta and the loopback address don't, and the image built from a digest boots systemd with `--systemd=always`.
+  There, `verify`'s steps as release.yml has them (taken out of the file and run in order, in a dry run's mode,
+  against a local snapshot) passed on both bases: systemd up, `relserve` reached, the installer's run, the service
+  active and `<v>` reported. The release dry run on the runner is what shows it there; its log says where the
+  container reached `relserve`.
 - `tools/relserve` serves a locally built, test-signed release over HTTPS (section 11.2).
 
 **VMs** (`deploy/test/vm/`):
@@ -1905,13 +1928,17 @@ alone. Registry logins are a plain `docker login` with the job's token, not a th
      '{{json .Manifest}}'`, then `cosign sign --yes ghcr.io/moonwx/isshoni@<digest>` and `attest-build-provenance`
      with that `subject-digest` and `push-to-registry: true`. A dry run instead uploads its release files (the
      archives, packages, SBOMs, `checksums.txt` and its cosign bundle, `install.sh` and the compose files) as the
-     artifact `release-assets`, kept 3 days, for `sign-dry` and `verify`.
+     artifact `release-assets`, kept 3 days, for `sign-dry`, which hands them on to `verify` signed.
+- `docker/setup-buildx-action` runs BuildKit as a privileged container in this job, which holds the write
+  permissions: its `driver-opts` pin the image by the digest of its multi-arch index
+  (`moby/buildkit:v0.33.1@sha256:…`, the release that the action's default `buildx-stable-1` named), bumped by hand
+  with the monthly tool pins of 7.1 (README F09; review R4).
 - Timeout 45 min.
 
 **`sign`**
 - Not in a dry run; `needs: [version, build]`; `environment: release`; permissions `contents: write`. Runs only after
   the owner approves.
-- Steps, with no third-party actions except checkout (sparse: `deploy/keys`):
+- Steps, with no actions but GitHub's checkout (sparse: `deploy/keys`) and upload-artifact:
   1. `gh release download "$TAG" --dir rel` (the draft is visible to `GITHUB_TOKEN`);
   2. `(cd rel && sha256sum -c checksums.txt)`, so every asset matches what is about to be signed, and **nothing is in
      the draft that the signature would not cover**: the job fails on an asset that `checksums.txt` does not list
@@ -1924,30 +1951,40 @@ alone. Registry logins are a plain `docker login` with the job's token, not a th
      fingerprint, which the owner compares with the one in `README.md` (`deploy/keys/README.md` step 5);
   5. `ssh-keygen -Y verify -f deploy/keys/allowed_signers -I isshoni-release -n isshoni-checksums -s
      rel/checksums.txt.sig < rel/checksums.txt`, which catches a wrong key in the secret;
-  6. `gh release upload "$TAG" rel/checksums.txt.sig --clobber`, so a re-run of the job replaces its signature.
+  6. `gh release upload "$TAG" rel/checksums.txt.sig --clobber`, so a re-run of the job replaces its signature;
+  7. uploads `rel/`, the files it checked with their new signature, as the artifact `release-signed`, kept 7 days:
+     `verify` installs these, so that it needs no token that can read the draft (README F09).
 - Timeout 10 min.
 
 **`verify`**
 - `needs: [version, build, sign, sign-dry]` with `if: !cancelled() && needs.build.result == 'success' &&
   (needs.sign.result == 'success' || needs.sign-dry.result == 'success')`: one of the two sign jobs is always
-  skipped, and a plain condition would skip this job too (`publish`, below). Permissions `contents: write` (to read
-  the draft), `packages: read` (the image is private until the owner makes the package public, 8.6),
-  `attestations: read`.
-- Matrix: `debian-12`, `ubuntu-24.04`, `fail-fast: false`.
-- Downloads the draft's assets into `mirror/download/<tag>/` (a dry run: the `release-assets` artifact, and
-  sign-dry's signature, whose key goes into that installer's key block in place of the production keys) and serves
-  them with `tools/relserve` (HTTPS with a test CA, on every address, so the container reaches it as
-  `host.docker.internal`).
+  skipped, and a plain condition would skip this job too (`publish`, below). Permissions `contents: read`,
+  `packages: read` (the image is private until the owner makes the package public, 8.6), `attestations: read`.
+  **No write token** (README F09, review R4 below): the container runs third-party code as its root. `GH_TOKEN` is
+  set only on the two steps that ask GitHub (`cosign verify` on the image, after a `docker login` that the step
+  undoes, and `gh attestation verify`), which run before the container starts.
+- Matrix: `debian-12`, `ubuntu-24.04`, `fail-fast: false`; each with its base by the digest of its multi-arch index
+  (`docker.io/library/debian@sha256:…  # debian:12`), bumped by hand with the monthly tool pins (7.1): Dependabot
+  doesn't read a workflow's matrix.
+- Downloads the signed files, sign's artifact `release-signed` (a dry run: sign-dry's, and its `release-keys-dryrun`,
+  whose key goes into that installer's key block in place of the production keys), into `mirror/download/<tag>/`,
+  and serves them with `tools/relserve` (HTTPS with a test CA, on every address, so that the rootless container
+  reaches it as `host.containers.internal`, 4.13).
 - Checks that the installer is stamped with `<v>`; `cosign verify-blob` on the checksums bundle with the identity
   of 4.3 (`https://github.com/<repo>/.github/workflows/release.yml@<ref>`, the Actions OIDC issuer); `cosign verify
   ghcr.io/moonwx/isshoni:<v>` with the same identity and issuer (not in a dry run); `gh attestation verify` on the
   `linux_amd64` archive.
-- In a systemd container (`deploy/test/distro/Containerfile`, as C1 of 11.2), fetches the **released, stamped
-  `install.sh` with the production key** with `curl` and runs it without a terminal: `--yes --tls-mode off` with
-  `ISSHONI_DOWNLOAD_BASE`, `ISSHONI_PUBLIC_URL=http://127.0.0.1:8080` and a documentation-range
-  `ISSHONI_PUBLIC_IP`, so the runner's own address stays out of the log. Then the service is active, and both
-  `isshoni version --short` and `/api/v1/info`'s `server.version` are `<v>`; on a failure the job prints the
-  service's journal and relserve's log.
+- In a systemd container (`deploy/test/distro/Containerfile`, as C1 of 11.2), built with `podman build` and started
+  rootless with `podman run -d --systemd=always --cap-add SYS_ADMIN --network slirp4netns` (no `--privileged`; 4.13
+  says why the capability, which is the container's own, and the network are named), fetches the **released,
+  stamped `install.sh` with the production key** with `curl` and runs
+  it without a terminal: `--yes --tls-mode off` with `ISSHONI_DOWNLOAD_BASE`,
+  `ISSHONI_PUBLIC_URL=http://127.0.0.1:8080` and a documentation-range `ISSHONI_PUBLIC_IP`, so the runner's own
+  address stays out of the log. Then the service is active, and both `isshoni version --short` and
+  `/api/v1/info`'s `server.version` are `<v>`. A container whose systemd doesn't come up, or that doesn't reach
+  `relserve`, fails its step with the container's log (and podman's cgroup setup) or relserve's; a later failure
+  prints the service's journal and relserve's log.
 - Timeout 20 min.
 
 **`publish`**
@@ -1957,8 +1994,16 @@ alone. Registry logins are a plain `docker login` with the job's token, not a th
   `sign-dry` is skipped, so a plain condition would skip `publish` after a green `verify`, and the run would end
   green with the release still a draft and the floating tags not moved (actions/runner#491; the dry run can't show
   it, because it skips `publish` by design).
-- Permissions: `contents: write`, `packages: write`.
+- Permissions: `contents: write`, `packages: write`. Checks out `deploy/keys` (sparse).
 - Fails if the draft body still contains `TODO` ("edit them on GitHub, then re-run this job").
+- **Checks the draft once more, right before it goes public** (README F09, review R4): `gh release download` into
+  a new `rel/`, then fails unless all three pass, in this order: `ssh-keygen -Y verify -f
+  deploy/keys/allowed_signers -I isshoni-release -n isshoni-checksums -s rel/checksums.txt.sig <
+  rel/checksums.txt`; `(cd rel && sha256sum --strict -c checksums.txt)`; and the asset check of `sign`: every
+  file of the draft, hidden ones included, is listed in `checksums.txt`, except `checksums.txt`, its `.sig` and
+  its `.sigstore.json`. The step reads nothing but `rel/` and `deploy/keys/allowed_signers`; F09 ran it on
+  fixture directories (a draft as signed passes; an added asset, a changed `install.sh`, a changed `install.sh`
+  with `checksums.txt` to match, a signature of another key, no signature and a missing asset each fail).
 - A final release: `gh release edit "$TAG" --draft=false --latest`. A prerelease: `--draft=false --prerelease
   --latest=false`, so GitHub's "latest" stays where it is (goreleaser sets none, `make_latest: false`, 9.2).
 - Unless it is a prerelease: `docker buildx imagetools create -t ghcr.io/moonwx/isshoni:<tag> …
@@ -1966,19 +2011,19 @@ alone. Registry logins are a plain `docker login` with the job's token, not a th
   Copying the index keeps the digest, so the cosign signature stays valid.
 - Timeout 10 min.
 
-**Review R4** (the M1 security review; README §6 "Decided after group 10" (1)). As built, `verify` holds a
-`contents: write` token in its job environment while it runs a privileged container from Docker Hub bases that no
-digest pins (4.13), and `publish` takes the draft as it is: no new download, no `ssh-keygen -Y verify`, no
-`sha256sum -c`, no check for assets that `checksums.txt` doesn't list. That goes against this section's rule of
-no write token near third-party code. README F09 (group 12) fixes it: `sign` uploads its verified files as an
-artifact, `verify` takes them from there with `contents: read` (plus `packages: read` and `attestations: read`) and
-no job-level `GH_TOKEN`, starts the distro container rootless (`podman run -d --systemd=always`) from bases pinned
-by digest, and `publish` downloads the draft right before `--draft=false` and fails unless the signature, the
-checksums and the asset list all pass. A rootless podman container reaches the runner's `relserve` another way than
-today's Docker one, as README S78 found (4.13), so F09 also makes `relserve` reachable from it (for example as
-`host.containers.internal`; `verify` already starts `relserve` on every address), and the release dry run shows it.
-The same Docker Hub exposure in `build`'s buildx driver image can be pinned by digest in the same slice. Turning on
-GitHub's immutable releases, which the one-time setup of 8.6 doesn't include, is the owner's to consider.
+**Review R4** (the M1 security review; README §6 "Decided after group 10" (1)), as README F09 fixed it. Until F09
+`verify` held a `contents: write` token in its job environment while it ran a privileged container from Docker Hub
+bases that no digest pinned (4.13), and `publish` took the draft as it was: no new download, no `ssh-keygen -Y
+verify`, no `sha256sum -c`, no check for assets that `checksums.txt` doesn't list. That went against this
+section's rule of no write token near third-party code. Now, as the job descriptions above say: `sign` (and
+`sign-dry`) uploads the files it checked, with the signature, as the artifact `release-signed`; `verify` takes them
+from there in both modes with `contents: read` (plus `packages: read` and `attestations: read`) and `GH_TOKEN` on
+two steps only, and starts the distro container rootless (`podman run -d --systemd=always --cap-add SYS_ADMIN
+--network slirp4netns`) from bases pinned by digest, reaching `relserve` as `host.containers.internal` (4.13);
+`publish` downloads the draft right before `--draft=false` and fails unless the signature, the checksums and the
+asset list all pass; and `build`'s buildx driver image is pinned by digest too. Turning on GitHub's immutable
+releases, which the one-time setup of 8.6 doesn't include, is the owner's to consider: they would also stop a write
+token from changing the assets of a release that is already out.
 
 **`site`** (README S82; not there yet)
 - `uses: ./.github/workflows/site.yml`, after `publish`.
@@ -1994,7 +2039,8 @@ GitHub's immutable releases, which the one-time setup of 8.6 doesn't include, is
 - goreleaser's snapshot still **signs `checksums.txt` with cosign keyless** (it doesn't skip signs), so every dry run
   leaves public entries in Sigstore's Rekor transparency log, as its attestations do.
 - A `sign-dry` job (**no environment**, no permissions) makes the same checks and signs with an ephemeral key made
-  in the job, verifies with it, and uploads the signature and its `allowed_signers`.
+  in the job, verifies with it, and uploads the signed files as `release-signed`, as `sign` does, and the key's
+  `allowed_signers` as `release-keys-dryrun`.
 - `verify` runs against those files with an `install.sh` that carries that key.
 - Nothing needs approval, and nothing is published. This proves the pipeline before the first real tag.
 
