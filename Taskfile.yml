@@ -956,4 +956,5 @@ tasks:
       - rm -rf bin dist dist-extra .dev .task
       - >-
         rm -rf {{.GOLANGCI_LINT}} {{.TYGO}} {{.GO_LICENSES}} .bin/govulncheck{{exeExt}} {{.SHFMT}}
+        .bin/goreleaser{{exeExt}}
       - rm -rf web/dist/*

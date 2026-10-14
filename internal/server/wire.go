@@ -369,10 +369,11 @@ func mediaCheck(udp bool, tr *netx.Transport, sfuReady func() error) func() (ok 
 // notImplementedAsDebug is the log handler of 01's sfuplane in this server. The SFU declares its whole API from
 // its first slice on (README "Interfaces first"), and a method that a later slice fills in answers with an error
 // that wraps sfu.ErrNotImplemented. sfuplane logs every SFU error it has no wire code for at error level, as the
-// bug it would otherwise be (01 §15.4), and a client reaches such a method with an everyday message: caps.update
-// until README S69 (pc.close and pc.restart were the others, until S57). So a record about that error is passed on
-// at debug level: the client still gets its error{internal} with the ref, and a real server's log stays free of an
-// "error" per message for what is only not built yet. It goes away with sfu.ErrNotImplemented.
+// bug it would otherwise be (01 §15.4), and a client reached such a method with an everyday message: caps.update
+// until README S69, pc.close and pc.restart until S57. So a record about that error is passed on at debug level: the
+// client still gets its error{internal} with the ref, and a real server's log stays free of an "error" per message
+// for what is only not built yet. Since S69 every Conn method is built and only SFU.Probe (README S76) still returns
+// the error; this handler goes away with sfu.ErrNotImplemented.
 type notImplementedAsDebug struct{ next slog.Handler }
 
 // Enabled implements slog.Handler.

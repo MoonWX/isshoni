@@ -10,8 +10,9 @@
 # merged into main.
 #
 # Not covered here: the tools pinned in .tool-versions, including the Task, golangci-lint and
-# shfmt modules in tools/go.mod (bumped by hand, monthly: 06 §7.1), and spikes/, which is
-# throwaway.
+# shfmt modules in tools/go.mod and goreleaser's own module, tools/goreleaser/go.mod (bumped by
+# hand, monthly: 06 §7.1); the Dockerfile's `# syntax=` line, which the docker ecosystem does
+# not read (bumped by hand with those pins); and spikes/, which is throwaway.
 
 version: 2
 updates:

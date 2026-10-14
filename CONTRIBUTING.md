@@ -23,8 +23,10 @@ go -C tools build -o ../.bin/ github.com/go-task/task/v3/cmd/task
 ```
 
 `task setup` builds the other pinned Go tools into `.bin/` too (golangci-lint, tygo, go-licenses, govulncheck,
-shfmt), and the tasks run them from there. ShellCheck, actionlint and goreleaser then come from your package manager,
-at the versions in `.tool-versions`; only `task lint:sh`, `task lint:actions` and `task release:snapshot` need them.
+shfmt), and the tasks run them from there. ShellCheck and actionlint then come from your package manager, at the
+versions in `.tool-versions`; only `task lint:sh` and `task lint:actions` need them. goreleaser is built into `.bin/`
+from its own module, `tools/goreleaser/go.mod`, by `task release:goreleaser`, which `task release:snapshot` runs
+itself.
 
 Dev notes:
 - The dev server runs in `tls.mode = "off"` with `deploy/dev/isshoni.dev.toml`; its data lives in `.dev/`
