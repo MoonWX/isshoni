@@ -32,7 +32,10 @@
 // - `?focus=<shareId>` from the URL (FocusFromUrl.tsx), inside a router;
 // - what plays, for the system's media notification (mediaSession.ts), and the one-time hint on iOS (IosHint.tsx);
 // - the codec wait's banner (CodecBanner.tsx, 05 §10.6): "Reload the page" after 3 minutes without a video
-//   decoder, or "This browser can't play isshoni video".
+//   decoder, or "This browser can't play isshoni video";
+// - the debug overlay, "Stats for nerds" (DebugOverlay.tsx, 05 §10.7): Shift+D or `?debug=1`, per tile, with the
+//   server's view; only inside the app, whose preferences say whether it is on;
+// - "Now listening to bo" for screen readers when the sound moves to a share that was already there (05 §16.6).
 import { Layers } from 'lucide-react';
 import {
   useCallback,
@@ -56,9 +59,11 @@ import { cx } from '../ui/cx';
 import { Sheet } from '../ui/Sheet';
 import { CodecBanner } from './CodecBanner';
 import { ViewerContext } from './context';
+import { DebugOverlay } from './DebugOverlay';
 import { FocusFromUrl } from './FocusFromUrl';
 import { IosHint } from './IosHint';
 import { attachShortcuts, moveTileFocus, TILE_LIST, TILE_MAIN, type ShortcutAction } from './keyboard';
+import { attachListeningAnnouncer } from './listening';
 import type { ViewerServices } from './services';
 import { ShortcutsDialog } from './ShortcutsDialog';
 import { Stage } from './Stage';
@@ -278,6 +283,15 @@ export function ViewerLayout({
   });
   useEffect(() => attachShortcuts({ run: (action) => runShortcut(action) }), []);
 
+  // "Now listening to bo" (05 §16.6), through the app's live regions.
+  const ui = app?.ui ?? null;
+  useEffect(() => {
+    if (ui === null) return undefined;
+    return attachListeningAnnouncer(viewer.store, (text) => {
+      ui.getState().announce(text);
+    });
+  }, [ui, viewer.store]);
+
   // The roving tab stop follows the keyboard focus, whichever of a tile's controls has it.
   useEffect(() => {
     if (root === null) return undefined;
@@ -391,6 +405,7 @@ export function ViewerLayout({
           }}
           without={app === null ? ['debug'] : []}
         />
+        {app !== null && <DebugOverlay viewer={viewer} prefs={app.prefs} />}
       </div>
     </ViewerContext.Provider>
   );

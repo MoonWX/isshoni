@@ -96,6 +96,45 @@ describe('linkShareUi', () => {
     expect(toasts()).toHaveLength(2);
   });
 
+  it('says "You’re live" and "Sharing stopped" in the assertive live region (05 §16.6)', () => {
+    const store = createShareStore();
+    const ui = createUiStore();
+    linkShareUi(store, ui);
+    const said: string[] = [];
+    ui.subscribe((s, prev) => {
+      const a = s.announcements.assertive;
+      if (a !== null && a !== prev.announcements.assertive) said.push(a.text);
+    });
+    const publish = (id: string): void => {
+      store.getState().publishing({ picked: WINDOW, preset: 'auto', withAudio: true, params: shareParams(id) });
+    };
+
+    publish('s_1');
+    expect(said).toEqual([]);
+    store.getState().advance('live');
+    expect(said).toEqual(["You're live"]);
+    // Live again after a reconnect: nothing new to say.
+    store.getState().advance('reconnecting');
+    store.getState().advance('live');
+    store.getState().advance('stopping');
+    store.getState().finish();
+    expect(said).toEqual(["You're live", 'Sharing stopped']);
+
+    // A start that never went live, a failed share (its panel says why) and one stopped elsewhere (a toast): no
+    // "Sharing stopped".
+    publish('s_2');
+    store.getState().finish();
+    publish('s_3');
+    store.getState().advance('live');
+    store.getState().finish({ error: new LocalError('webrtc_failed') });
+    store.getState().dismiss();
+    publish('s_4');
+    store.getState().advance('live');
+    store.getState().finish({ notice: 'elsewhere' });
+    expect(said).toEqual(["You're live", 'Sharing stopped', "You're live", "You're live"]);
+    expect(ui.getState().announcements.polite?.text).toBe('Sharing was stopped from another tab or device');
+  });
+
   it('only a share that ended because the pub PC gave up becomes the "Can’t connect media" screen', () => {
     const store = createShareStore();
     const ui = createUiStore();

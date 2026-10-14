@@ -9,7 +9,8 @@
 //   const unsync = attachSubscriptions(viewer, session.subscriptions);     // the desired set → subscribe.update
 //   syncRoom(viewer, roomState, { userId, connectionId });                 // on every room.state; null after leaving
 //   const tap = createWatchToast({ viewer, ui, selfUserId });              // room.event → "bo started sharing [Watch]"
-//   const unfreeze = attachFreezeWatch(viewer, statsCollector);            // lib/stats' samples → viewerStore.frozen
+//   const unstats = attachViewerStats({ viewer, collector, signal });      // lib/stats' samples → the freeze watch,
+//                                                                          // `stats` every 10 s, the debug overlay
 //   <ViewerLayout viewer={viewer} localPreviews={…} empty={…} onTestConnection={…} roomName={…} />
 //   <TapToStartPill viewer={viewer} />                                     // in the room's header (05 §10.3)
 // The sub PC (05 §10.1): the session makes one through createSubscriber when the server's first sub offer arrives,
@@ -50,16 +51,21 @@
 // welcome, resumed or not, and calls viewer.store.getState().reset() only when the user leaves the room. The
 // speaker button goes through the store's setAudible, which drops the remembered sound.
 //
-// Stats (05 §10.7): viewerStatsSources(viewer) is the sub PC for lib/stats' collector, and viewerDebugState(viewer)
-// the viewer's part of window.__isshoni.state(); see lib/stats/index.ts for the wiring. The collector's samples are
-// also what tells a frozen tile (05 §12.6): attachFreezeWatch(viewer, collector), by whoever owns the collector.
-// Until that is called no tile ever says "Waiting for video…".
+// Stats (05 §10.7): viewerStatsSources(viewer) is the sub PC for lib/stats' collector (share/stats.ts has the pub
+// PC), and viewerDebugState(viewer) the viewer's part of window.__isshoni.state(); see lib/stats/index.ts for the
+// wiring. What else reads the collector's samples is attachViewerStats({ viewer, collector, signal }) (statsLink.ts),
+// by whoever owns the collector: the tiles' freeze watch (05 §12.6, freeze.ts; until it runs no tile ever says
+// "Waiting for video…"), the `stats` notification every 10 s (01 §8.11), and the debug overlay's feed.
+//
+// The debug overlay, "Stats for nerds" (DebugOverlay.tsx; Shift+D, prefsStore.debug, or `?debug=1`): the layout
+// shows it over the stage, per tile, with the page's PCs and what it sends; while it is open the collector samples
+// every second and stats.watch brings the server's view (viewer.debug, debugStats.ts). It shows no IP address.
+//
+// For screen readers (05 §16.6) the layout says "Now listening to bo" when the sound moves to a share that was
+// already there (listening.ts); share/ says "You're live" and "Sharing stopped".
 //
 // The layout takes the platform and the preferences from the app's context. The one thing the room page can add is
 // `roomName`, the "artist" of the media notification; without it the app's name stands in.
-//
-// Arriving with later slices, inside this folder: the debug overlay that Shift+D switches (prefsStore.debug) is
-// the hardening slice's (05 W13).
 export { SpeakerButton, StageSound, type SpeakerButtonProps, type StageSoundProps } from './AudioControls';
 export { canSetVolume, createAudioOut, type AudioOut, type AudioOutDeps } from './audioOut';
 export {
@@ -84,6 +90,8 @@ export {
   type CodecWaitSignal,
 } from './codecWait';
 export { ViewerContext, useShareMedia, useViewer, useViewerServices } from './context';
+export { DEBUG_PARAM, DebugOverlay, DebugPanel, type DebugOverlayProps, type DebugPanelProps } from './DebugOverlay';
+export { createDebugStats, type DebugStatsState, type DebugStatsStore } from './debugStats';
 export { FocusFromUrl, type FocusFromUrlProps } from './FocusFromUrl';
 export { FOCUS_PARAM, FOCUS_PARAM_WAIT_MS, followFocusParam } from './focusParam';
 export { attachFreezeWatch, createFreezeDetector, FREEZE_AFTER_MS, freezeWatched, type FreezeDetector } from './freeze';
@@ -116,6 +124,7 @@ export {
   type ShortcutsDeps,
 } from './keyboard';
 export { desiredSubscriptions, PAGE_HIDDEN_OFF_MS, type LayerInputs } from './layerPolicy';
+export { attachListeningAnnouncer } from './listening';
 export { attachMediaSession, type MediaSessionDeps } from './mediaSession';
 export { createMediaRegistry, NO_MEDIA, type MediaRegistry, type ShareMedia } from './mediaRegistry';
 export { attachPage, type PageDeps } from './page';
@@ -134,6 +143,7 @@ export { ShortcutsDialog, type ShortcutsDialogProps } from './ShortcutsDialog';
 export { Stage, type StageProps } from './Stage';
 export { StageControls, type StageControlsProps } from './StageControls';
 export { viewerDebugState, viewerStatsSources, type ViewerDebugState } from './stats';
+export { attachViewerStats, type StatsLinkSignal, type ViewerStatsDeps } from './statsLink';
 export { SubscriberPC, type SubscriberDeps, type SubscriberSignal } from './SubscriberPC';
 export { attachSubscriptions, layerInputs, viewerWants, type SubscriptionSink } from './subscriptions';
 export { TapToStart, TapToStartPill, type TapToStartPillProps, type TapToStartProps } from './TapToStart';

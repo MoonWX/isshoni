@@ -2,8 +2,9 @@
 //
 // linkShareUi keeps uiStore.sharing equal to "this page shares a screen right now", so the UpdatePill offers no
 // Reload meanwhile (05 §16.2: a reload would end the share), shows the toast of a share that the server ended
-// without a failure ("Sharing was stopped from another tab or device", 05 §13.1), and puts up the app's "Can't
-// connect media" screen when the pub PC's negotiation failed twice within a minute (05 §9, 01 §9 rule 8).
+// without a failure ("Sharing was stopped from another tab or device", 05 §13.1), puts up the app's "Can't
+// connect media" screen when the pub PC's negotiation failed twice within a minute (05 §9, 01 §9 rule 8), and says
+// "You're live" and "Sharing stopped" in the Announcer's assertive live region (05 §16.6).
 //
 // Why a link and not a component: the share outlives the room page (the session is app-level, 05 §11.1), so all of
 // it has to work on /account and /admin too, where nothing of share/ is mounted. A share can only start from a Share
@@ -23,6 +24,10 @@ const linked = new WeakMap<ShareStore, WeakSet<UiStore>>();
  * reconnecting and stopping count as sharing), a notice of the store becomes a toast, and a share that failed with
  * PubNegotiationFailedError becomes the Fatal screen "Can't connect media", whose Reload is the way on. Linking the
  * same pair again does nothing.
+ *
+ * For screen readers (05 §16.6), assertively: "You're live" when a share goes from starting to live (not when it is
+ * live again after a reconnect), and "Sharing stopped" when a share that was live is over without a word of its
+ * own. A notice is a toast, which is announced anyway, and a failed share's panel says why with role="alert".
  */
 export function linkShareUi(store: ShareStore, ui: UiStore): void {
   let uis = linked.get(store);
@@ -38,8 +43,21 @@ export function linkShareUi(store: ShareStore, ui: UiStore): void {
     if (ui.getState().sharing !== sharing) ui.getState().setSharing(sharing);
   };
   sync();
+  /** The share under way went live: its end is announced. */
+  let wentLive = store.getState().phase === 'live';
   store.subscribe((state, before) => {
     sync();
+    if (state.phase !== before.phase) {
+      if (state.phase === 'live' && before.phase === 'starting') {
+        wentLive = true;
+        ui.getState().announce(i18n.t('share.announce.live'), 'assertive');
+      } else if (state.phase === 'idle' || state.phase === 'failed') {
+        if (wentLive && state.phase === 'idle' && state.notice === before.notice) {
+          ui.getState().announce(i18n.t('share.announce.stopped'), 'assertive');
+        }
+        wentLive = false;
+      }
+    }
     if (state.notice !== null && state.notice !== before.notice) {
       // One kind so far; a switch when there are more.
       ui.getState().toast({ kind: 'info', message: i18n.t('share.ended.elsewhere') });

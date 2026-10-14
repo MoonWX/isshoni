@@ -47,6 +47,8 @@
 import { createEmitter } from '../lib/emitter';
 import { LocalError } from '../lib/errors';
 import type { Logger } from '../lib/log';
+import type { StatsSource } from '../lib/stats/collector';
+import type { StatsTrackRef } from '../lib/stats/summarize';
 import type { Platform, SignalClientLike } from '../platform/types';
 import type { SignalClient, SignalState, SignalStateInfo } from '../protocol/signal-client';
 import {
@@ -80,6 +82,7 @@ import {
 import { audioCodecPreferences, videoCodecPreferences } from './codecPrefs';
 import { applyEncodings, buildSendEncodings, buildSingleEncoding, needsRescale, sourceSize } from './encodings';
 import { applyVideoContentHint, presetHints } from './presets';
+import { addShareStatsPublisher } from './stats';
 
 /** ICE `disconnected` for this long → ICE restart (01 §10.4). */
 export const DISCONNECTED_GRACE_MS = 3_000;
@@ -261,7 +264,7 @@ export class PublisherPC {
   readonly #shares = new Map<string, PublishedShare>();
 
   #pc: RTCPeerConnection | null = null;
-  /** Removes the listeners of #pc. */
+  /** Removes the listeners of #pc, and #pc from the page's stats sources (stats.ts). */
   #offPc: (() => void) | null = null;
   /** Rejects when #pc is closed or replaced, so a step in flight on it ends (see #step). */
   #gone: { promise: Promise<never>; reject: (err: PcGoneError) => void } | null = null;
@@ -631,6 +634,34 @@ export class PublisherPC {
   }
 
   /**
+   * The pub PC as a source of the page's stats collector (lib/stats, 05 §10.7; share/stats.ts lists it), while there
+   * is one; null otherwise. Its reports stop with the PC: a PC that was replaced reports nothing. A sent stream
+   * belongs to the share whose transceiver has its mid, or whose capture track has its id.
+   */
+  statsSource(): StatsSource | null {
+    const pc = this.#pc;
+    if (pc === null) return null;
+    return {
+      pc: PCKindPub,
+      gen: this.#gen,
+      state: pc.connectionState,
+      getStats: () => (this.#pc === pc ? pc.getStats() : Promise.resolve(null)),
+      shareOf: (track) => this.#shareOfStream(track),
+    };
+  }
+
+  /** The share a sent stream of the stats belongs to (statsSource). */
+  #shareOfStream(track: StatsTrackRef): string | undefined {
+    for (const share of this.#shares.values()) {
+      const tx = track.kind === TrackKindVideo ? share.videoTx : share.audioTx;
+      const sent = track.kind === TrackKindVideo ? share.video : share.audio;
+      if (track.mid !== undefined && tx?.mid === track.mid) return share.shareId;
+      if (track.mid === undefined && track.trackId !== undefined && sent?.id === track.trackId) return share.shareId;
+    }
+    return undefined;
+  }
+
+  /**
    * The height a share's full layer is meant to encode: the source's height over that layer's
    * scaleResolutionDownBy. undefined while the source size or the sender is unknown.
    */
@@ -713,10 +744,13 @@ export class PublisherPC {
     pc.addEventListener('icecandidate', onCandidate);
     pc.addEventListener('connectionstatechange', onState);
     pc.addEventListener('iceconnectionstatechange', onState);
+    // The stats collector samples the PC while it exists (05 §10.7).
+    const offStats = addShareStatsPublisher(this);
     this.#offPc = () => {
       pc.removeEventListener('icecandidate', onCandidate);
       pc.removeEventListener('connectionstatechange', onState);
       pc.removeEventListener('iceconnectionstatechange', onState);
+      offStats();
     };
     let reject!: (err: PcGoneError) => void;
     const promise = new Promise<never>((_, rej) => {

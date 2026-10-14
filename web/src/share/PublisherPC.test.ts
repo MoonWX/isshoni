@@ -33,6 +33,8 @@ import {
   type PubMediaState,
   type PublisherPCDeps,
 } from './PublisherPC';
+import { summarize } from '../lib/stats/summarize';
+import { shareStatsSources } from './stats';
 import { captureStream } from './testing/fakeCapture';
 import { answerFor, lastPc, pubOffers, shareParams } from './testing/publish';
 
@@ -598,6 +600,54 @@ describe('PublisherPC: changes while live (05 §13.4 step 7, §13.6)', () => {
     expect(stats.video).toBe(report);
     expect(stats.audio).toBeInstanceOf(Map);
     expect(await pub.shareStats('s_x')).toEqual({ video: null, audio: null });
+  });
+});
+
+describe('PublisherPC: a source of the stats collector (05 §10.7)', () => {
+  it('is listed in shareStatsSources while it has a PC, with its gen, state and report', async () => {
+    expect(pub.statsSource()).toBeNull();
+    expect(shareStatsSources()).toEqual([]);
+
+    const stream = await publish('s_a');
+    connect();
+    const sources = shareStatsSources();
+    expect(sources).toHaveLength(1);
+    const source = sources[0];
+    if (!source) throw new Error('no source');
+    expect(source).toMatchObject({ pc: 'pub', gen: 1, state: 'connected' });
+
+    const [videoTx, audioTx] = lastPc().transceivers;
+    const videoMid = videoTx?.mid ?? '';
+    const audioMid = audioTx?.mid ?? '';
+    expect(videoMid).not.toBe('');
+    lastPc().stats = new Map<string, Record<string, unknown>>([
+      ['o-f', { type: 'outbound-rtp', kind: 'video', mid: videoMid, rid: 'f', bytesSent: 1000, frameHeight: 1080 }],
+      ['o-a', { type: 'outbound-rtp', kind: 'audio', mid: audioMid, bytesSent: 100 }],
+      ['o-x', { type: 'outbound-rtp', kind: 'video', mid: '99', bytesSent: 5 }],
+    ]);
+    const sample = summarize([{ ...source, report: await source.getStats() }], 1_000).sample;
+    // Each stream of the share, by its mid; a stream of no share is left out.
+    expect(sample.outbound.map((o) => [o.shareId, o.kind, o.rid])).toEqual([
+      ['s_a', 'video', 'f'],
+      ['s_a', 'audio', undefined],
+    ]);
+    // Without a mid, by the capture track's id.
+    const video = stream.getVideoTracks()[0];
+    expect(source.shareOf({ kind: 'video', trackId: video?.id ?? '' })).toBe('s_a');
+    expect(source.shareOf({ kind: 'audio', trackId: video?.id ?? '' })).toBeUndefined();
+    expect(source.shareOf({ kind: 'video', mid: audioMid })).toBeUndefined();
+  });
+
+  it('takes the next gen after a rebuild, and is off the list once closed; an old source reports nothing', async () => {
+    await publish('s_a');
+    const first = pub.statsSource();
+    await pub.rebuild();
+    expect(shareStatsSources().map((s) => s.gen)).toEqual([2]);
+    expect(await first?.getStats()).toBeNull();
+
+    pub.close();
+    expect(shareStatsSources()).toEqual([]);
+    expect(pub.statsSource()).toBeNull();
   });
 });
 

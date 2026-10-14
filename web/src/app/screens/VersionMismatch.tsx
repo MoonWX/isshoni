@@ -17,8 +17,11 @@ export interface VersionMismatchProps {
 }
 
 /**
- * This page and the server don't speak a common protocol version (05 §16.4). S93 (05 W13) wires the triggers; the
- * connection wiring shows it for `stopped` with protocol_unsupported.
+ * This page and the server don't speak a common protocol version (05 §16.4). The connection wiring
+ * (rooms/connection.ts) shows it for `stopped` with protocol_unsupported or client_outdated, at once and without a
+ * reload of its own; a second time for the same server version means that the Reload didn't help (`stillStale`).
+ * A welcome from a server of another version is not this screen: the page reloads once, or the update pill waits
+ * while it shares. e2e/version.spec.ts checks both through a routed signaling socket.
  */
 export function VersionMismatch({
   serverVersion,
