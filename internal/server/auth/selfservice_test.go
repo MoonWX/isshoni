@@ -1045,6 +1045,46 @@ func TestChangePasswordBucketInParallel(t *testing.T) {
 	}
 }
 
+// TestChangePasswordBucketStaggered: the 20 requests of TestChangePasswordBucketInParallel, one after the other (03
+// §7.3, README F08). The first changes the password and keeps its token. The other 19 carry the password that was
+// right when they were sent, which is wrong now: each gives its change token back and costs auth-user-ip a token,
+// so after five of them that bucket refuses the rest. That is 2 + 5 hashes, not 2 × the burst: the bound of 6 is for
+// requests in flight together, and a request that reads the account after a change is a wrong guess. A change to
+// what a wrong current password gives back shows up here.
+func TestChangePasswordBucketStaggered(t *testing.T) {
+	e := newSvcEnv(t)
+	ctx := context.Background()
+	alex := e.addUser("Alex")
+	p := principal(e.login("Alex", ipA))
+	e.hashes.Store(0)
+	codes := map[string]int{}
+	for i := range 20 {
+		_, err := e.svc.ChangePassword(ctx, p, testPassword, fmt.Sprintf("parallel passphrase %d", i), meta(ipA))
+		var ae *api.Error
+		switch {
+		case err == nil:
+			codes["ok"]++
+		case errors.As(err, &ae):
+			codes[ae.Code]++
+		default:
+			t.Fatalf("change %d: %v", i+1, err)
+		}
+	}
+	want := map[string]int{"ok": 1, api.CodeWrongPassword: 5, api.CodeRateLimited: 14}
+	if fmt.Sprint(codes) != fmt.Sprint(want) {
+		t.Errorf("answers %v, want %v", codes, want)
+	}
+	if n := e.hashes.Load(); n != 7 {
+		t.Errorf("%d hashes, want 7: 2 for the change and auth-user-ip's burst of 5 wrong checks after it", n)
+	}
+	if spent := e.changesSpent(alex.ID); spent != 1 {
+		t.Errorf("%d change tokens spent, want 1: only the request whose current password was right keeps one", spent)
+	}
+	if n := e.auditCount(auditPasswordChanged); n != 1 {
+		t.Errorf("%d auth.password_changed rows, want 1", n)
+	}
+}
+
 // TestChangePasswordBucketRefunds: what the password-change bucket keeps (README F08). A token is kept by a change
 // whose current password was right, whatever comes after (here a password changed elsewhere in between). Every
 // other end gives it back: a wrong current password, which costs auth-user-ip and auth-user as before; another

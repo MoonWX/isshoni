@@ -410,10 +410,17 @@ func TestRetries(t *testing.T) {
 	}
 }
 
-// A message that waits for its retry does not hold a worker: the next message goes out at once.
+// A message that waits for its retry does not hold a worker: the next message on the same (only) worker goes out at
+// once. The next message is an admin alert, not a test: tests have a lane of their own (README F08).
 func TestRetryDoesNotBlockTheWorker(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		f := newFixture(t, func(o *Options) { o.Workers = 1 }, sub("b1", "bob"))
+		f := newFixture(t, func(o *Options) { o.Workers = 1 })
+		f.store.recipients = func(flt RecipientFilter) []Subscription {
+			if flt.AdminsOnly {
+				return []Subscription{sub("m1", "me")}
+			}
+			return []Subscription{sub("b1", "bob")}
+		}
 		f.sender.respond = func(_ int, c sendCall) (SendResult, error) {
 			if c.Sub.ID == "b1" {
 				return SendResult{Status: 503}, nil
@@ -424,9 +431,7 @@ func TestRetryDoesNotBlockTheWorker(t *testing.T) {
 		start := time.Now()
 		f.ShareStarted(share("lounge", "alex"))
 		synctest.Wait()
-		if err := f.SendTest(context.Background(), []Subscription{sub("m1", "me")}); err != nil {
-			t.Fatal(err)
-		}
+		f.AdminAlert(AdminAlert{Kind: "signup_pending", Actor: "system"})
 		synctest.Wait()
 		calls := f.sender.sent()
 		if len(calls) != 2 || calls[1].Sub.ID != "m1" || !calls[1].At.Equal(start) {
@@ -763,17 +768,19 @@ func TestShutdownDrainsTheQueue(t *testing.T) {
 	})
 }
 
+// Both kinds of worker hang here: the shared one (share.started) and the push.test lane's (README F08).
 func TestShutdownGivesUpAfterTwoSeconds(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		f := newFixture(t, func(o *Options) { o.Workers = 1 })
+		f := newFixture(t, func(o *Options) { o.Workers = 1 }, sub("b1", "bob"))
 		f.sender.hang = true // a push service that never answers
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)
 		go func() { done <- f.Run(ctx) }()
+		f.ShareStarted(share("lounge", "alex"))
 		if err := f.SendTest(context.Background(), []Subscription{sub("m1", "me"), sub("m2", "me")}); err != nil {
 			t.Fatal(err)
 		}
-		synctest.Wait() // m1 is being sent, m2 waits for the only worker
+		synctest.Wait() // b1 and m1 are being sent, m2 waits for the test lane's worker
 		start := time.Now()
 		cancel()
 		if err := <-done; err != nil {
@@ -782,12 +789,12 @@ func TestShutdownGivesUpAfterTwoSeconds(t *testing.T) {
 		if d := time.Since(start); d != drainTimeout {
 			t.Errorf("Run returned %v after its context ended, want %v", d, drainTimeout)
 		}
-		// Neither message is the subscription's failure: nothing is recorded, both count as dropped.
+		// No message is the subscription's failure: nothing is recorded, all three count as dropped.
 		if got := f.store.snapshot(); len(got.results) != 0 || len(got.deleted) != 0 {
 			t.Errorf("recorded %+v, deleted %v; want nothing", got.results, got.deleted)
 		}
-		if f.sent(resultDropped) != 2 || f.sent(resultError) != 0 {
-			t.Errorf("dropped=%d error=%d, want 2 and 0", f.sent(resultDropped), f.sent(resultError))
+		if f.sent(resultDropped) != 3 || f.sent(resultError) != 0 {
+			t.Errorf("dropped=%d error=%d, want 3 and 0", f.sent(resultDropped), f.sent(resultError))
 		}
 	})
 }

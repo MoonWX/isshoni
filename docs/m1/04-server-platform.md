@@ -3514,9 +3514,13 @@ are ignored (`SendTest`: `server_shutdown`) once `Run`'s context has ended. `pus
   public address that drops packets passes `ValidateEndpoint`) could post a test every 10 s and keep all 4
   workers busy, delaying everyone's `share.started` and `admin.alert` by about a minute. Now such a member holds
   the test lane's worker and nothing else, and reaches one endpoint per test: 03 keeps one subscription per web
-  session (03 §12.4.6). What such endpoints still cost the 4 workers is the notifications their user receives,
-  which the per-recipient bucket above limits (an event per 10 minutes after the first 3), at up to 3 attempts
-  each.
+  session (03 §12.4.6). What remains is the notifications such a member receives. With 10 subscriptions across
+  10 sessions whose endpoints complete the TLS handshake and then never answer (10 s per attempt), and a second
+  account that starts shares in 3 rooms, the per-recipient burst of 3 events is 30 jobs of up to 10 s each on the
+  4 workers (their retries come back later, behind the others). In a test with a fake sender, that delayed another
+  user's `share.started` by about 70 s, about as long as the delay this lane removed. After that, those
+  subscriptions get one event per 10 minutes. A per-user cap on the jobs in flight on the 4 workers would bound
+  this; it is not in M1's plan yet.
 - `Topic` header per (room, sharer): `s` + first 22 chars of base64url(SHA-256(roomID + "/" + userID)) (≤ 32
   URL-safe chars), so a phone that was offline receives only the latest notification per sharer.
 - `admin.alert`: 03 already coalesces `signup_pending` (one per 10 min); transfer alerts fire once per threshold per
@@ -3597,7 +3601,10 @@ Queue: 1024 jobs, 4 workers; a full queue drops the job (`dropped`). `push.test`
 under the lock that the shutdown takes, so the lane's worker drains every test that was queued and none is queued
 after the shutdown began (`server_shutdown`); a full lane is `server_busy` as before. A test is attempted once, so
 one test holds the worker for at most the 10 s timeout, and a test that waited past its 60 s TTL is dropped
-unsent.
+unsent. The lane is shared by every user: a member whose endpoint completes the TLS handshake and then never
+answers holds its worker 10 s per test, which at the `push-test` bucket's one test per 10 s (03 §7.3) is all of
+its time, so other members' tests wait; with two such members they can pass their TTL and be dropped (`expired`)
+after the 202.
 
 How S32 reads the table (every status has a row, and the `isshoni_push_sent_total` result is named):
 - **ok**: every 2xx, not only 200, 201 and 202.
