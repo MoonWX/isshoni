@@ -13,7 +13,6 @@ import (
 
 	"github.com/pion/ice/v4"
 	"github.com/pion/interceptor"
-	"github.com/pion/interceptor/pkg/nack"
 	"github.com/pion/interceptor/pkg/report"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
@@ -34,6 +33,8 @@ type ViewerOptions struct {
 	NoH264 bool
 	// NoRTX registers no RTX codecs, so repairs come as plain retransmissions.
 	NoRTX bool
+	// NoNACK makes the viewer ask for nothing again: what is lost stays lost.
+	NoNACK bool
 	// KeepPackets bounds the packets each Recorder keeps (the newest are kept; the counters cover all). 0 means
 	// DefaultKeepPackets; negative keeps none.
 	KeepPackets int
@@ -53,14 +54,33 @@ const (
 	opusPT         = 111
 )
 
+// A Viewer's NACKs, timed about as a browser's: a sequence number is asked for once it has been missing for
+// NACKAfter (a packet that is only out of order needs no NACK), again every NACKEvery while it stays missing, at
+// most NACKTries times, and no longer once it counts as lost (FinalLossAfter).
+const (
+	NACKAfter = 10 * time.Millisecond
+	NACKEvery = 100 * time.Millisecond
+	NACKTries = 10
+	nackTick  = 10 * time.Millisecond
+	// nackSeqs is the most sequence numbers one NACK packet names: more go into the next packet.
+	nackSeqs = 256
+)
+
 // Viewer is a Pion subscriber that records what it receives. NewViewer creates its PeerConnection; tracks are
 // recorded from the first packet on, until Close. Rebuild replaces the PeerConnection with a new one, as a client
 // does for a sub offer of a new gen (01 §9 rule 2); the Recorders of the old one stay, and stop growing.
+//
+// It asks for what it misses, as a browser does: each track's Recorder knows which sequence numbers are missing, and
+// the Viewer sends NACKs for them until they arrive, on the track's own stream or through RTX. (Pion's NACK
+// generator is not used: it never learns of a packet that Pion's receiver recovered from the RTX stream, so it asks
+// for it again every 100 ms for as long as the sequence number stays in its window. No browser does that, and an
+// SFU that answers NACKs would send every repaired packet several times.)
 type Viewer struct {
-	api  *webrtc.API
-	cfg  webrtc.Configuration
-	log  *slog.Logger
-	keep int
+	api    *webrtc.API
+	cfg    webrtc.Configuration
+	log    *slog.Logger
+	keep   int
+	noNACK bool
 
 	mu       sync.Mutex // guards the fields below
 	pc       *webrtc.PeerConnection
@@ -76,29 +96,24 @@ type rtcpKey struct {
 	rid  string
 }
 
-// NewViewer builds the Viewer's API (a browser-like MediaEngine, a NACK generator and receiver reports every 1 s)
-// and its PeerConnection.
+// NewViewer builds the Viewer's API (a browser-like MediaEngine and receiver reports every 1 s; the NACKs are the
+// Viewer's own) and its PeerConnection.
 func NewViewer(o ViewerOptions) (*Viewer, error) {
 	m, err := viewerEngine(o)
 	if err != nil {
 		return nil, err
-	}
-	gen, err := nack.NewGeneratorInterceptor(nack.GeneratorSize(2048))
-	if err != nil {
-		return nil, fmt.Errorf("sfutest: nack generator: %w", err)
 	}
 	rr, err := report.NewReceiverInterceptor(report.ReceiverInterval(time.Second))
 	if err != nil {
 		return nil, fmt.Errorf("sfutest: receiver reports: %w", err)
 	}
 	ir := &interceptor.Registry{}
-	ir.Add(gen)
 	ir.Add(rr)
 	v := &Viewer{
 		api: webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(ir),
 			webrtc.WithSettingEngine(o.Settings)),
 		cfg: webrtc.Configuration{ICEServers: o.ICEServers},
-		log: o.Logger, keep: o.KeepPackets, rtcpRead: map[rtcpKey]bool{},
+		log: o.Logger, keep: o.KeepPackets, noNACK: o.NoNACK, rtcpRead: map[rtcpKey]bool{},
 	}
 	if v.log == nil {
 		v.log = slog.Default()
@@ -253,8 +268,8 @@ func (v *Viewer) Answer(ctx context.Context, offer webrtc.SessionDescription) (w
 	return *pc.LocalDescription(), nil
 }
 
-// onTrack starts recording a new track of pc: an RTP reader for the track and, once per receiver and rid, an RTCP
-// reader.
+// onTrack starts recording a new track of pc: an RTP reader for the track with the loop that sends its NACKs, and,
+// once per receiver and rid, an RTCP reader.
 func (v *Viewer) onTrack(pc *webrtc.PeerConnection, tr *webrtc.TrackRemote, recv *webrtc.RTPReceiver) {
 	mid := ""
 	for _, t := range pc.GetTransceivers() {
@@ -272,8 +287,13 @@ func (v *Viewer) onTrack(pc *webrtc.PeerConnection, tr *webrtc.TrackRemote, recv
 		return
 	}
 	v.recs = append(v.recs, rec)
+	ended := make(chan struct{})
 	v.wg.Add(1)
-	go v.readRTP(rec, tr)
+	go v.readRTP(rec, tr, ended)
+	if !v.noNACK {
+		v.wg.Add(1)
+		go v.sendNACKs(pc, rec, ended)
+	}
 	if !v.rtcpRead[key] {
 		v.rtcpRead[key] = true
 		v.wg.Add(1)
@@ -282,9 +302,11 @@ func (v *Viewer) onTrack(pc *webrtc.PeerConnection, tr *webrtc.TrackRemote, recv
 	v.mu.Unlock()
 }
 
-// readRTP records the track's packets until it ends. Packets that Pion unwrapped from RTX carry its RTX attributes.
-func (v *Viewer) readRTP(rec *Recorder, tr *webrtc.TrackRemote) {
+// readRTP records the track's packets until it ends, and then closes ended. Packets that Pion unwrapped from RTX
+// carry its RTX attributes.
+func (v *Viewer) readRTP(rec *Recorder, tr *webrtc.TrackRemote, ended chan<- struct{}) {
 	defer v.wg.Done()
+	defer close(ended)
 	buf := make([]byte, 1500)
 	for {
 		n, attrs, err := tr.Read(buf)
@@ -297,6 +319,29 @@ func (v *Viewer) readRTP(rec *Recorder, tr *webrtc.TrackRemote) {
 		}
 		rtx := attrs != nil && attrs.Get(webrtc.AttributeRtxSsrc) != nil
 		rec.record(&pkt, time.Now(), rtx)
+	}
+}
+
+// sendNACKs asks the sender again for what a track misses, until the track ends: every nackTick it sends one NACK
+// for the sequence numbers that are due (Recorder.nacks), in packets of at most nackSeqs.
+func (v *Viewer) sendNACKs(pc *webrtc.PeerConnection, rec *Recorder, ended <-chan struct{}) {
+	defer v.wg.Done()
+	tick := time.NewTicker(nackTick)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ended:
+			return
+		case <-tick.C:
+		}
+		for seqs := rec.nacks(time.Now()); len(seqs) > 0; {
+			n := min(len(seqs), nackSeqs)
+			nack := &rtcp.TransportLayerNack{MediaSSRC: rec.ssrc, Nacks: rtcp.NackPairsFromSequenceNumbers(seqs[:n])}
+			if err := pc.WriteRTCP([]rtcp.Packet{nack}); err != nil {
+				break // the PeerConnection is closing: the track ends next
+			}
+			seqs = seqs[n:]
+		}
 	}
 }
 

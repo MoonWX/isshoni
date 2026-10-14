@@ -350,6 +350,9 @@ func newTestPC(t *testing.T, api *webrtc.API) *webrtc.PeerConnection {
 }
 
 // engineOffer returns an offer with one video and one audio transceiver from an engine.
+// testPubEngine is newPubEngine with a NACK filter that knows no tracks: the pub engine of a test PC.
+func testPubEngine() (*webrtc.MediaEngine, *interceptor.Registry, error) { return newPubEngine(nil) }
+
 func engineOffer(t *testing.T, build func() (*webrtc.MediaEngine, *interceptor.Registry, error),
 	dir webrtc.RTPTransceiverDirection) string {
 	t.Helper()
@@ -499,7 +502,7 @@ func checkAttr(t *testing.T, md *sdp.MediaDescription, key, prefix string, want 
 }
 
 func TestPubEngineGolden(t *testing.T) {
-	offer := engineOffer(t, newPubEngine, webrtc.RTPTransceiverDirectionRecvonly)
+	offer := engineOffer(t, testPubEngine, webrtc.RTPTransceiverDirectionRecvonly)
 	checkSpec81(t, offer, pubWant)
 	golden(t, "pub-engine-offer.sdp", sdpFragments(t, offer))
 }
@@ -517,7 +520,7 @@ func TestSubEngineGolden(t *testing.T) {
 // captured from headless Chrome on macOS: video with rids f and q and High first, plus Opus) with the pub engine.
 // Pion keeps the offerer's PTs, matches H.264 profiles by fmtp, and keeps only the extensions and feedback of §8.1.
 func TestPubEngineAnswersChromeOffer(t *testing.T) {
-	m, ir, err := newPubEngine()
+	m, ir, err := testPubEngine()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -577,7 +580,8 @@ func TestPubEngineAnswersChromeOffer(t *testing.T) {
 }
 
 func TestInterceptors(t *testing.T) {
-	factories, err := pubInterceptors()
+	filter := &nackFilter{}
+	factories, err := pubInterceptors(filter)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -585,7 +589,12 @@ func TestInterceptors(t *testing.T) {
 	for _, f := range factories {
 		got = append(got, reflect.TypeOf(f).String())
 	}
+	// The PC's NACK filter comes first: the generator writes its NACKs through what was registered before it.
+	if factories[0] != filter {
+		t.Error("the first pub interceptor is not the PC's own NACK filter")
+	}
 	want := []string{
+		reflect.TypeFor[*nackFilter]().String(),
 		reflect.TypeFor[*nack.GeneratorInterceptorFactory]().String(),
 		reflect.TypeFor[*report.ReceiverInterceptorFactory]().String(),
 		reflect.TypeFor[*twcc.SenderInterceptorFactory]().String(),

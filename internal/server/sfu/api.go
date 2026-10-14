@@ -73,10 +73,13 @@ var (
 
 // apis are the webrtc.APIs of one SFU, built once in New on 04's netx.Transport and shared by every PeerConnection.
 // They hold no sockets: the Transport owns them, and the wiring closes it after SFU.Close. A MediaEngine is copied
-// into each PeerConnection and an interceptor registry builds new interceptors for each, so sharing is safe.
+// into each PeerConnection and an interceptor registry builds new interceptors for each, so sharing is safe. The
+// publish side is the exception: each pub PC gets an API of its own (pubAPI), since its first interceptor, the NACK
+// filter, has to know the PC's tracks.
 type apis struct {
-	pub *webrtc.API // publish PCs (the client offers): pub MediaEngine and interceptors (02 §8.1)
-	sub *webrtc.API // subscribe PCs (the SFU offers): sub MediaEngine, no interceptors
+	// pubSettings is the SettingEngine of every pub PC's API (pubAPI): the publish PCs, which the client offers.
+	pubSettings webrtc.SettingEngine
+	sub         *webrtc.API // subscribe PCs (the SFU offers): sub MediaEngine, no interceptors
 	// probe holds one API per transport whose mux isn't nil (02 §7.6): an empty MediaEngine, SCTP on, only that
 	// transport's candidates.
 	probe      map[ProbeTransport]*webrtc.API
@@ -85,9 +88,9 @@ type apis struct {
 	log        *slog.Logger
 }
 
-// newAPIs builds the publish, subscribe and probe APIs on tr (02 §7.1): each SettingEngine gets tr.Apply first and
-// then the settings of 02 §7.3. log carries component=sfu; one Pion logger factory on it serves every API, so the
-// per-scope line limit of logx holds for the whole SFU.
+// newAPIs builds the subscribe and probe APIs, and the SettingEngine of the publish APIs, on tr (02 §7.1): each
+// SettingEngine gets tr.Apply first and then the settings of 02 §7.3. log carries component=sfu; one Pion logger
+// factory on it serves every API, so the per-scope line limit of logx holds for the whole SFU.
 func newAPIs(tr *netx.Transport, log *slog.Logger) (*apis, error) {
 	if tr == nil {
 		return nil, errors.New("sfu: no ICE transport (Config.Transport is nil)")
@@ -107,12 +110,10 @@ func newAPIs(tr *netx.Transport, log *slog.Logger) (*apis, error) {
 	if err != nil {
 		return nil, err
 	}
-	pubME, pubIR, err := newPubEngine()
-	if err != nil {
+	a.pubSettings = se
+	if _, err := a.pubAPI(nil); err != nil { // so that a pub engine that can't be built fails New, not every offer
 		return nil, err
 	}
-	a.pub = webrtc.NewAPI(webrtc.WithMediaEngine(pubME), webrtc.WithInterceptorRegistry(pubIR),
-		webrtc.WithSettingEngine(se))
 	subME, subIR, err := newSubEngine()
 	if err != nil {
 		return nil, err
@@ -130,6 +131,20 @@ func newAPIs(tr *netx.Transport, log *slog.Logger) (*apis, error) {
 		}
 	}
 	return a, nil
+}
+
+// pubAPI returns the API of one new pub PC (02 §8.1): the publish MediaEngine and SettingEngine, and an interceptor
+// registry of the PC's own whose first interceptor is the PC's NACK filter f (pubnack.go). The filter looks up the
+// PC's tracks, and only a registry per PC can give it them: Pion builds a PC's interceptors from its API's registry
+// while it creates the PC, and names them only by the PC's id, which is made of the time and so can be the same for
+// two PCs created at once. nil is a filter without tracks.
+func (a *apis) pubAPI(f *nackFilter) (*webrtc.API, error) {
+	m, ir, err := newPubEngine(f)
+	if err != nil {
+		return nil, err
+	}
+	return webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(ir),
+		webrtc.WithSettingEngine(a.pubSettings)), nil
 }
 
 // settingEngine returns the SettingEngine of 02 §7.3. 04's Transport.Apply comes first: the UDP and TCP muxes,

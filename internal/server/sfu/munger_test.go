@@ -645,9 +645,9 @@ func TestMungerSRAlignedFallbacks(t *testing.T) {
 			sr.ntp -= 3 << 32
 			q.lastSR.Store(&sr)
 		}},
-		{"equal to the last timestamp", func(_, q *Layer, _ int64) {
+		{"a second behind the last timestamp", func(_, q *Layer, _ int64) {
 			sr := *q.lastSR.Load()
-			sr.rtp += 3000 // puts the keyframe on f's last frame (1_087_000 on f's timeline)
+			sr.rtp += 93000 // puts the keyframe at 997_000 on f's timeline, 90000 ticks before f's last frame
 			q.lastSR.Store(&sr)
 		}},
 		{"further ahead than the elapsed time plus 1 s", func(_, q *Layer, _ int64) {
@@ -681,6 +681,47 @@ func TestMungerSRAlignedFallbacks(t *testing.T) {
 			t.Fatalf("ts %d after a pause longer than maxWallJumpNs, want %d", ts, last+maxWallJump)
 		}
 	})
+}
+
+// TestMungerSRAlignedNotAhead: a sharer's layers are encoded from the same captured frames, so the keyframe a switch
+// waits for often has the capture time of a frame of the old layer that was forwarded already (or, when its reader
+// was slow, of an earlier one). The sender reports then put it at or behind the last timestamp, where no packet may
+// go: it gets the next tick, which keeps the viewer's timeline the capture timeline, instead of the wall-clock time
+// that the keyframe happened to take.
+func TestMungerSRAlignedNotAhead(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		shift uint32 // added to the RTP time of q's SR: moves q's keyframe back on f's timeline
+	}{
+		{"on the last frame", 3000}, // 1_087_000 on f's timeline: f's last frame
+		{"one frame behind", 6000},  // 1_084_000
+		{"just under a second behind", 92999},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m, _, q, now := srSwitch(t)
+			sr := *q.lastSR.Load()
+			sr.rtp += c.shift
+			q.lastSR.Store(&sr)
+			lastS, lastTS := m.lastS, m.lastTS
+			seq, ts, v := m.process(vp(q, 7000, 5_045_000, true), now)
+			if v != verdictNewEpoch || seq != lastS+1 || ts != lastTS+1 {
+				t.Fatalf("seq %d ts %d verdict %d, want seq %d and ts %d, one tick after the last", seq, ts, v, lastS+1,
+					lastTS+1)
+			}
+			// The epoch goes on from there, a frame is a frame later, and the layer's SR is on the same timeline: at
+			// most one tick from where the capture clock has it.
+			if _, ts, v := m.process(vp(q, 7001, 5_051_000, false), now+tick); v != verdictForward || ts != lastTS+1+6000 {
+				t.Fatalf("the next frame: ts %d verdict %d, want %d", ts, v, lastTS+1+6000)
+			}
+			aligned := 140000 - c.shift // where the SRs alone put the keyframe
+			if rtp, ok := m.translateSR(q, &sr); !ok || rtp != sr.rtp+(lastTS+1-5_045_000) {
+				t.Fatalf("translateSR: %d %v", rtp, ok)
+			}
+			if c.shift == 3000 && lastTS+1-aligned != 1 {
+				t.Fatalf("the keyframe is %d ticks from its capture time, want 1", lastTS+1-aligned)
+			}
+		})
+	}
 }
 
 func TestMungerResumeSameLayerKeepsTSOffset(t *testing.T) {

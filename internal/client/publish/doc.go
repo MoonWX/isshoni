@@ -18,4 +18,10 @@
 //     receive rids, which the SFU refuses like any rid listed twice (sendOnlySimulcast).
 //
 // There is no rate control in M1: REMB from the SFU is only recorded in Stats.
+//
+// Two options exist for the SFU's tests (02 §17), to send what browsers send and fake media alone doesn't.
+// Options.RedundantRTX negotiates RTX for the video and makes the Publisher answer NACKs itself, on the RTX stream,
+// on which it also sends second copies of packets it already delivered: Chrome's padding and probes (repair.go).
+// Options.Padding sends padding-only packets on the video's media streams, which take sequence numbers and carry
+// nothing: a browser's padding without RTX.
 package publish

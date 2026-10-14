@@ -303,11 +303,12 @@ func (m *munger) startEpoch(p *packet, now int64) {
 //  1. the same Layer instance as the previous epoch (a resume, audio after off, a profile change): keep its tsOff,
 //     because upstream timestamps already advanced in media time;
 //  2. SR-aligned: the capture time of p through the new layer's SR, mapped onto the old layer's timeline through the
-//     old layer's SR, both less than 10 s old;
+//     old layer's SR, both less than 10 s old; one tick after lastTS when that isn't ahead of it (srAligned);
 //  3. wall clock (the S4 rule): lastTS plus the time since lastTS moved, at least 1 tick.
 //
-// The first two must move the timestamp forward (the monotonic guard); SR alignment may also not jump further than
-// the time since lastTS moved plus 1 s. Otherwise the wall clock decides.
+// The timestamp always moves forward (the monotonic guard): a resume on the same Layer that wouldn't falls back to
+// the wall clock, and so does SR alignment that would jump further than the time since lastTS moved plus 1 s, or
+// back by 1 s or more.
 func (m *munger) nextTS(p *packet, now int64) uint32 {
 	prev := m.newest()
 	elapsed := max(now-m.lastAt, 0)
@@ -323,7 +324,15 @@ func (m *munger) nextTS(p *packet, now int64) uint32 {
 
 // srAligned maps the capture time of p onto the previous epoch's timeline through both layers' sender reports:
 // t = ntp_new + (p.ts − rtp_new)/clock, then rtp_old + (t − ntp_old)·clock + tsOff_old. It fails when either SR is
-// missing or more than 10 s old, or when the result isn't in (lastTS, lastTS + (elapsed + 1 s)·clock].
+// missing or more than 10 s old, or when the result is more than 1 s behind lastTS or more than the elapsed time plus
+// 1 s ahead of it: then the two layers' clocks can't be trusted to be one.
+//
+// A result at or up to 1 s behind lastTS is the common case of a switch, not a fault: a sharer's layers are encoded
+// from the same captured frames, so the new layer's keyframe has the capture time of a frame of the old layer, and
+// when that frame was forwarded first, the keyframe belongs exactly where lastTS is. Two frames can't share a
+// timestamp, so it gets the next tick: the viewer's timeline then stays the capture timeline to within 11 µs
+// (02 §9.6: no timestamp error while the reports are fresh). The wall clock would put it later by however long the
+// keyframe took to arrive after that frame, and with it everything the new layer sends.
 func (m *munger) srAligned(prev *epoch, p *packet, now, elapsed int64) (uint32, bool) {
 	old, cur := prev.layer.lastSR.Load(), p.layer.lastSR.Load()
 	if old == nil || cur == nil || now-old.arrival > int64(srMaxAge) || now-cur.arrival > int64(srMaxAge) {
@@ -336,8 +345,11 @@ func (m *munger) srAligned(prev *epoch, p *packet, now, elapsed int64) (uint32, 
 	}
 	ts := old.rtp + (p.ts - cur.rtp) + uint32(int64(ticks)) + prev.tsOff
 	step := int64(int32(ts - m.lastTS))
-	if step <= 0 || elapsed > maxWallJumpNs || step > (elapsed+nsPerSecond)*int64(m.clock)/nsPerSecond {
+	switch {
+	case elapsed > maxWallJumpNs, step > (elapsed+nsPerSecond)*int64(m.clock)/nsPerSecond, step <= -int64(m.clock):
 		return 0, false
+	case step <= 0:
+		return m.lastTS + 1, true
 	}
 	return ts, true
 }

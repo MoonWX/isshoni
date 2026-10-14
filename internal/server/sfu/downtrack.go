@@ -2,6 +2,7 @@ package sfu
 
 import (
 	"errors"
+	"math/rand/v2"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,8 +29,12 @@ import (
 // chosen then. Whenever what the viewer gets changes, the subscriber's Conn hears of it (Subscription.changed) and
 // tells the client (SubscriptionStateEvent).
 //
-// Later slices add the rest of 02 §9.3: the RTX queue, NACKs and forwarded sender reports (README S63), the pacer,
-// REMB and receiver reports (S84).
+// Repair and sync (02 §9.5, §9.6): what the viewer's NACKs ask for comes from the Layers' packet caches, through a
+// second queue that the writer serves first (rtx.go); and the sender reports of the layer forwarded now go on to the
+// viewer with their RTP time moved to the viewer's timeline, which is what keeps a share's audio and video in sync
+// across layer switches and pauses (sendSR).
+//
+// Later slices add the rest of 02 §9.3: the pacer, REMB and receiver reports (README S84).
 type DownTrack struct {
 	share *Share
 	sub   *Subscription
@@ -47,7 +52,13 @@ type DownTrack struct {
 	// to it is done, the layer forwarded now. It is 0 while the DownTrack is paused. Layer read loops test it per
 	// packet, without a lock.
 	interest atomic.Uint32
-	queue    chan *packet  // video 1024, audio 256; a full queue drops (counted)
+	// queue holds what the Layers hand over, in their order: packets, padding markers and sender report notices
+	// (packet). Video 1024, audio 256; a full queue drops (counted).
+	queue chan *packet
+	// rtxQueue holds the retransmissions the viewer's NACKs asked for (02 §9.5); the writer sends them before new
+	// media. 256; a full queue drops (counted), and the viewer asks again.
+	rtxQueue chan rtxItem
+	nack     nackState     // the RTCP reader's: what was retransmitted when, and the budget
 	done     chan struct{} // closed by stop: the writer ends
 	stopOnce sync.Once
 
@@ -70,9 +81,9 @@ type DownTrack struct {
 	stats      dtStats
 }
 
-// dtStats are a DownTrack's counters. The writer counts; README S79 reads them.
+// dtStats are a DownTrack's counters. The writer and the RTCP reader count; README S79 reads them.
 type dtStats struct {
-	packets     atomic.Uint64 // RTP packets written
+	packets     atomic.Uint64 // RTP packets written, retransmissions not included
 	bytes       atomic.Uint64 // their payload bytes
 	drops       atomic.Uint64 // packets a full queue dropped
 	noCodec     atomic.Uint64 // packets in a profile the viewer negotiated no payload type for
@@ -80,15 +91,28 @@ type dtStats struct {
 	writeErrors atomic.Uint64
 	switches    atomic.Uint64 // epochs started: the first keyframe, layer switches, resumes
 	keyRequests atomic.Uint64 // PLIs and FIRs from the viewer
+	srs         atomic.Uint64 // sender reports forwarded to the viewer
+
+	// Repair (02 §9.5, §13). Every sequence number a NACK names is received, and then served, missed, skipped or
+	// dropped by the full RTX queue.
+	nackReceived atomic.Uint64 // sequence numbers the viewer's NACKs asked for
+	nackServed   atomic.Uint64 // of those, retransmitted
+	nackMissed   atomic.Uint64 // not in a cache any more, or never sent
+	rtxSkipped   atomic.Uint64 // not retransmitted: asked for again too soon or too often, over budget, or too many at once
+	rtxPackets   atomic.Uint64 // retransmissions written, as RTX or plain (egress kind "rtx")
+	rtxBytes     atomic.Uint64 // their payload bytes, with the two of RTX's original sequence number
+	rtxDrops     atomic.Uint64 // retransmissions the full RTX queue dropped
 }
 
 // binding is one negotiated attachment of a DownTrack to a sub PC's sender (02 §9.3).
 type binding struct {
 	// id is the id of the sender's TrackLocalContext, one per sender: Unbind ends the binding only when Pion ends
 	// that sender, not when the stop of an older sender (of the sub PC before a rebuild) arrives late.
-	id            string
-	pc            *subPC // the generation: its ready flag is the DTLS gate
-	writer        webrtc.TrackLocalWriter
+	id     string
+	pc     *subPC // the generation: its ready flag is the DTLS gate
+	writer webrtc.TrackLocalWriter
+	// rtcp sends the track's sender reports (02 §9.6): the sub PC's PeerConnection. nil when there is none to send on.
+	rtcp          rtcpWriter
 	ssrc, rtxSSRC uint32
 	// ptFor maps a stream's H.264 profile to the viewer's payload type for it (bestPT); a profile the viewer can't
 	// decode has no entry. Audio has one entry, under "", for Opus.
@@ -113,7 +137,9 @@ const (
 // newDownTrack returns a paused DownTrack. It starts no goroutine: the Conn starts the writer (run) when the
 // subscription is made, and the sub PC the RTCP reader when the DownTrack gets its sender.
 func newDownTrack(sub *Subscription, kind webrtc.RTPCodecType) *DownTrack {
-	d := &DownTrack{share: sub.share, sub: sub, kind: kind, done: make(chan struct{})}
+	d := &DownTrack{
+		share: sub.share, sub: sub, kind: kind, done: make(chan struct{}), rtxQueue: make(chan rtxItem, rtxQueueLen),
+	}
 	if kind == webrtc.RTPCodecTypeAudio {
 		d.queue, d.m = make(chan *packet, audioQueueLen), newMunger(audioClockRate)
 	} else {
@@ -155,6 +181,9 @@ func (d *DownTrack) Bind(ctx webrtc.TrackLocalContext) (webrtc.RTPCodecParameter
 		rtxSSRC:  uint32(ctx.SSRCRetransmission()),
 		ptFor:    map[ProfileKey]uint8{},
 		rtxPTFor: map[uint8]uint8{},
+	}
+	if b.pc != nil && b.pc.pc != nil {
+		b.rtcp = b.pc.pc
 	}
 	for _, ext := range ctx.HeaderExtensions() {
 		if ext.URI == sdp.ABSSendTimeURI {
@@ -353,26 +382,42 @@ func (d *DownTrack) noteLocked() bool {
 
 // ---- the writer (02 §9.3) ----
 
-// enqueue hands a packet (or a padding marker) of an interesting layer to the writer. It never blocks: a full queue
-// drops the packet and counts it, so a writer that falls behind costs only its own viewer. Layer read loops call it.
+// enqueue hands a packet, a padding marker or a sender report notice of an interesting layer to the writer. It never
+// blocks: a full queue drops the packet and counts it, so a writer that falls behind costs only its own viewer. (A
+// notice that finds no room is not a packet lost: the next report comes in a second.) Layer read loops call it.
 func (d *DownTrack) enqueue(p *packet) {
 	select {
 	case d.queue <- p:
 	default:
-		d.stats.drops.Add(1)
+		if !p.report {
+			d.stats.drops.Add(1)
+		}
 	}
 }
 
-// run is the writer goroutine: it forwards what the Layers queue until stop, or until the Conn that owns the
-// subscription closes (connClosed), whichever comes first. That Conn starts it and waits for it (Conn.writers).
+// run is the writer goroutine: it sends the retransmissions the viewer asked for and forwards what the Layers queue,
+// until stop, or until the Conn that owns the subscription closes (connClosed), whichever comes first. That Conn
+// starts it and waits for it (Conn.writers).
+//
+// Retransmissions come first (02 §9.3): a viewer that waits for one can't show anything newer, so a repair that
+// queued behind new media would only add its delay to every frame after it.
 func (d *DownTrack) run(connClosed <-chan struct{}) {
-	var w rtpWriteState
+	// Not a secret: RFC 3550 asks for a random first sequence number, and the RTX stream is a stream of its own.
+	w := rtpWriteState{rtxSeq: uint16(rand.Uint32())} //nolint:gosec // see above
 	for {
+		select {
+		case it := <-d.rtxQueue:
+			d.retransmit(&w, it)
+			continue
+		default:
+		}
 		select {
 		case <-d.done:
 			return
 		case <-connClosed:
 			return
+		case it := <-d.rtxQueue:
+			d.retransmit(&w, it)
 		case p := <-d.queue:
 			d.write(&w, p)
 		}
@@ -402,6 +447,26 @@ type rtpWriteState struct {
 	// limit.
 	unsentStarts int
 	askedAt      int64
+	// packets and octets are what has left through binding on the track's media SSRC: the counts of the sender
+	// reports the viewer gets (02 §9.6).
+	packets, octets uint32
+
+	// rtxSeq is the next sequence number of the DownTrack's RTX stream (02 §9.5).
+	rtxSeq uint16
+}
+
+// bind makes b the binding the writer's state is about: with another one than before, the stream's start and its
+// counts begin again.
+func (w *rtpWriteState) bind(b *binding) {
+	if b != w.binding {
+		w.binding, w.sent, w.unsentStarts, w.packets, w.octets = b, false, 0, 0, 0
+	}
+}
+
+// count notes a packet with n payload bytes that left on the media SSRC.
+func (w *rtpWriteState) count(n int) {
+	w.packets++
+	w.octets += uint32(n)
 }
 
 // write forwards one queued packet, the steps of 02 §9.3:
@@ -416,9 +481,12 @@ type rtpWriteState struct {
 //     SSRC, the publisher's marker bit and nothing else of the publisher's header (no CSRCs, no padding, none of its
 //     extensions, whose ids are the pub PC's); abs-send-time when the viewer negotiated it;
 //  4. pacing is README S84's;
-//  5. the write, which never blocks (02 §5.4). A packet that Pion takes without sending it is unsent's.
+//  5. the write, which never blocks (02 §5.4). A packet that Pion takes without sending it is unsent's. The first
+//     packet of an epoch is followed by the layer's latest sender report (sendSR), so the viewer knows the new
+//     layer's place in time at once: after a switch, and when audio is turned on.
 //
-// A padding marker only moves the munger (skipPadding).
+// A padding marker only moves the munger (skipPadding), and a sender report notice sends the layer's report on
+// (sendSR).
 //
 // When the packet changed what the viewer gets (its stream began or ended, or went on in another layer), the
 // subscriber's Conn hears of it, after the write: a start that Pion took without sending has by then been taken back,
@@ -432,9 +500,7 @@ func (d *DownTrack) write(w *rtpWriteState, p *packet) {
 // forward is write without the notice: it reports whether what the viewer gets changed.
 func (d *DownTrack) forward(w *rtpWriteState, p *packet) (changed bool) {
 	b := d.binding.Load()
-	if b != w.binding {
-		w.binding, w.sent, w.unsentStarts = b, false, 0
-	}
+	w.bind(b)
 	if !b.sendable() {
 		// The viewer gets nothing now, and missed what it was getting: the stream it had is over.
 		w.sent, w.unsentStarts = false, 0
@@ -446,6 +512,10 @@ func (d *DownTrack) forward(w *rtpWriteState, p *packet) (changed bool) {
 		return changed
 	}
 	now := monoNow()
+	if p.report {
+		d.sendSR(w, b, p.layer, now)
+		return false
+	}
 	if p.padding {
 		d.mu.Lock()
 		d.m.skipPadding(p, now)
@@ -511,10 +581,42 @@ func (d *DownTrack) forward(w *rtpWriteState, p *packet) (changed bool) {
 		}
 	default:
 		w.sent, w.unsentStarts = true, 0
+		w.count(len(p.payload))
 		d.stats.packets.Add(1)
 		d.stats.bytes.Add(uint64(len(p.payload)))
+		if v == verdictNewEpoch {
+			d.sendSR(w, b, p.layer, now)
+		}
 	}
 	return changed
+}
+
+// sendSR sends the viewer the latest sender report of layer l, as a report about the DownTrack's own stream
+// (02 §9.6): the publisher's NTP time as it is, its RTP time moved by the current epoch's timestamp offset, and the
+// DownTrack's own counts. A browser reads from it which wall-clock instant an RTP timestamp of the track stands for,
+// and plays the audio and the video of a share, which have the same msid stream, by that. So the SFU adds no error
+// of its own while the publisher's reports are fresh: both tracks stay on the publisher's capture clock, through
+// layer switches, pauses and publisher rebuilds.
+//
+// Nothing is sent unless the DownTrack forwards l now (another layer's timeline isn't the viewer's), for a report
+// older than 10 s, or without a PeerConnection to send on. The writer calls it: for every report that arrives while
+// it forwards the layer (the Layer's notice), and right after the first packet of a new epoch.
+func (d *DownTrack) sendSR(w *rtpWriteState, b *binding, l *Layer, now int64) {
+	sr := l.lastSR.Load()
+	if sr == nil || now-sr.arrival > int64(srMaxAge) || b.rtcp == nil {
+		return
+	}
+	d.mu.Lock()
+	ts, ok := d.m.translateSR(l, sr)
+	d.mu.Unlock()
+	if !ok {
+		return
+	}
+	report := &rtcp.SenderReport{SSRC: b.ssrc, NTPTime: sr.ntp, RTPTime: ts, PacketCount: w.packets, OctetCount: w.octets}
+	if err := b.rtcp.WriteRTCP([]rtcp.Packet{report}); err != nil {
+		return // the PC is closing: Unbind follows
+	}
+	d.stats.srs.Add(1)
 }
 
 // unsent handles a packet that Pion took without sending it and without an error. Pion does that in two situations
@@ -560,8 +662,10 @@ func putAbsSendTime(b *[3]byte, t time.Time) {
 // ---- the viewer's RTCP (02 §9.3) ----
 
 // readRTCP reads the viewer's RTCP for this track from sender until the sender stops (the track left the PC, or the
-// PC closed). The sub PC that made the sender starts it and waits for it (subPC.readers).
-func (d *DownTrack) readRTCP(sender *webrtc.RTPSender) {
+// PC closed). The sub PC that made the sender, pc, starts it and waits for it (subPC.readers). A PC that is heard
+// from has its round-trip time read now and then (subPC.sampleRTT), before what the viewer sent is acted on: the
+// handling of a NACK goes by it.
+func (d *DownTrack) readRTCP(pc *subPC, sender *webrtc.RTPSender) {
 	buf := make([]byte, rtpReadBuffer)
 	for {
 		n, _, err := sender.Read(buf)
@@ -572,22 +676,29 @@ func (d *DownTrack) readRTCP(sender *webrtc.RTPSender) {
 		if err != nil {
 			continue
 		}
+		pc.sampleRTT(sender, monoNow())
 		d.handleRTCP(pkts)
 	}
 }
 
 // handleRTCP acts on one compound packet from the viewer. Pion delivers a compound packet to every SSRC it names,
-// so each DownTrack looks only at what names its own SSRC. A PLI or FIR becomes a keyframe request to the publisher
-// for the layer forwarded now (a FIR is translated to a PLI upstream, 02 §9.7). NACKs are README S63's; REMB and
-// receiver reports S84's.
+// so each DownTrack looks only at what names its own SSRC. A NACK is answered from the packet cache (02 §9.5,
+// handleNACK), for audio as for video. A PLI or FIR about a video track becomes a keyframe request to the publisher
+// for the layer forwarded now (a FIR is translated to a PLI upstream, 02 §9.7). REMB and receiver reports are README
+// S84's.
 func (d *DownTrack) handleRTCP(pkts []rtcp.Packet) {
 	b := d.binding.Load()
-	if b == nil || d.kind != webrtc.RTPCodecTypeVideo {
+	if b == nil {
 		return
 	}
 	wanted := false
+	left := nackBatch
 	for _, pkt := range pkts {
 		switch pkt := pkt.(type) {
+		case *rtcp.TransportLayerNack:
+			if pkt.MediaSSRC == b.ssrc {
+				d.handleNACK(b, pkt.Nacks, &left, monoNow())
+			}
 		case *rtcp.PictureLossIndication:
 			wanted = wanted || pkt.MediaSSRC == b.ssrc
 		case *rtcp.FullIntraRequest:
@@ -596,7 +707,7 @@ func (d *DownTrack) handleRTCP(pkts []rtcp.Packet) {
 			}
 		}
 	}
-	if !wanted {
+	if !wanted || d.kind != webrtc.RTPCodecTypeVideo {
 		return
 	}
 	d.stats.keyRequests.Add(1)

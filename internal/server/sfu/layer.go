@@ -72,6 +72,9 @@ type Layer struct {
 	slot   Slot
 	cache  *packetCache
 	lastSR atomic.Pointer[srInfo] // the latest sender report for this layer's SSRC; nil until the first one
+	// srNotice is what the Layer queues to its DownTracks when lastSR changes: one item for all of them and for every
+	// report, so a sender report costs no allocation however many viewers it reaches.
+	srNotice *packet
 
 	share *Share
 	rid   string // "f" | "q" for video (a track without a rid is "f"), "" for audio
@@ -136,6 +139,7 @@ type lossSample struct{ expected, received uint64 }
 // newLayer returns a Layer for a slot with an empty packet cache sized for its kind.
 func newLayer(slot Slot, kind webrtc.RTPCodecType) *Layer {
 	l := &Layer{slot: slot, cache: newPacketCache(kind), kind: kind}
+	l.srNotice = &packet{layer: l, report: true}
 	l.lastPLI.Store(-int64(pliInterval)) // the first request is never throttled
 	return l
 }
@@ -164,6 +168,10 @@ type srInfo struct {
 
 // packet is one incoming RTP packet (02 §9.1). It is immutable after the Layer's RTP loop builds it, and shared by the
 // packet cache and every DownTrack queue.
+//
+// It is also the item of a DownTrack's queue (02 §9.3), which holds two more things in the order the Layer saw them:
+// a padding marker (padding: a packet without payload, of which only the sequence number matters) and the notice
+// that the Layer got a sender report (report: Layer.srNotice, which has nothing but its layer).
 type packet struct {
 	layer    *Layer
 	seq      uint16
@@ -173,6 +181,7 @@ type packet struct {
 	profile  ProfileKey // video: from the PT via the pub PC's negotiated codecs; "" for audio
 	keyStart bool       // video: carries an SPS (isKeyframeStart); audio: always true
 	padding  bool       // no payload (probe padding): never cached, used only to close sequence gaps
+	report   bool       // no packet at all: the layer has a new sender report (lastSR) for its viewers
 	payload  []byte     // exact-size copy, header extensions removed
 	arrival  int64      // monotonic ns
 }
@@ -278,13 +287,17 @@ func (l *Layer) fanOut(p *packet) {
 	}
 }
 
-// handleSR keeps a sender report of the Layer's SSRC (02 §9.1): the munger aligns timestamps through it when a
-// DownTrack switches layers (02 §9.4). Forwarding it to the viewers is README S63's (02 §9.6).
+// handleSR keeps a sender report of the Layer's SSRC (02 §9.1) and tells the DownTracks that want the layer. The
+// munger aligns timestamps through the report when a DownTrack switches layers (02 §9.4), and each DownTrack that
+// forwards the layer sends its viewer the report on the viewer's own timeline (02 §9.6, DownTrack.sendSR): that is
+// what a browser lip-syncs a share's audio and video with. The notice goes through the DownTracks' queues, so a
+// writer sees it in its place among the layer's packets. Only the track's RTCP reader calls it.
 func (l *Layer) handleSR(sr *rtcp.SenderReport, now int64) {
 	if sr.SSRC != l.ssrc {
 		return
 	}
 	l.lastSR.Store(&srInfo{ntp: sr.NTPTime, rtp: sr.RTPTime, arrival: now})
+	l.fanOut(l.srNotice)
 }
 
 // requestKeyframe sends the publisher a PLI for this layer, unless one went out less than 500 ms ago (02 §9.7). The
