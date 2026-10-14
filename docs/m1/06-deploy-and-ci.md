@@ -31,7 +31,7 @@ Where this doc needs something from them, section 15 lists it precisely.
 | D5 | Docker binary lives at `/usr/local/bin/isshoni`, not `/isshoni` as the plan says | `docker compose exec isshoni isshoni setup-url` resolves the command through `PATH`; distroless has no `/` on `PATH` |
 | D6 | The image contains `/var/lib/isshoni` owned by uid 65532 (the same path as systemd installs), and the server **refuses to start** (exit 78) in a container when it is not a mount (04 §5.1) | A named volume then works with no `chown`, nobody loses their users when the container is recreated, and every doc and command uses one data path |
 | D7 | CI has **one required check, `ci-ok`**. Path-filtered jobs run inside the same workflow | GitHub blocks merges on required checks from workflows that were skipped by path filters |
-| D8 | install.sh tests: systemd **containers** on PRs (fast), **KVM VMs** nightly and before a release (SELinux, real firewalls, Pebble ACME) | Containers can't test SELinux labels, sysctls or firewalls; VMs are too slow for every PR |
+| D8 | install.sh tests: systemd **containers** on PRs (fast), **KVM VMs** nightly and before a release (SELinux, real firewalls, Pebble ACME) | Containers can't test SELinux labels, sysctls or firewalls; VMs are too slow for every PR. (Firewalls they can, in a privileged systemd container: README S78 runs scenario V3 there too, on every PR that touches deploy, 11.2) |
 | D9 | Binaries are pinned in `.tool-versions` (mise or asdf). Go tools are pinned in a separate `tools/go.mod` | One pin file, as in the plan; the main `go.mod` stays free of tool dependencies |
 | D10 | License policy: an **allowlist** for everything shipped, a **GPL/AGPL denylist** for dev-only npm packages. `THIRD_PARTY_NOTICES` is generated from the exact module set of `cmd/isshoni` | Shipped code must be provably permissive; dev tools only must not be GPL/AGPL |
 | D11 | Site: VitePress in `docs/` (excluding `PLAN.md` and `m1/`), on GitHub Pages at `https://moonwx.github.io/isshoni/` | Free, no domain to buy; a custom domain can be added later and GitHub redirects the old URLs |
@@ -244,8 +244,6 @@ where it settles what the diagram leaves open:
   command's own exit code, which could be read as one of the installer's. Every way out removes the download
   directory and a config that this run wrote and that did not get past the pre-check (4.8); the message always
   ends with "run this installer again: it goes on where it stopped".
-- **`--uninstall` and `--purge`** are parsed and answer exit 1 "not implemented in this version of the installer
-  yet", with the command that stops isshoni, until README S78 builds them (4.11).
 - **The copy in the repository installs nothing yet**: its key block is empty until the release key exists (the
   owner creates it before README S73, §9.4) and is in `deploy/keys/allowed_signers` and in the block, which must
   equal each other (§4.3). Without a key the script says so before it downloads (exit 3: "a development copy").
@@ -707,6 +705,45 @@ The packages skip the step when the admin has a definition of their own in `/etc
 which keeps the name valid when the package's file in `/usr/lib` is gone. For install.sh that path is the file
 it removes, so it always scrubs first.
 
+**As README S78 built it** (`deploy/install.sh`: `uninstall_steps`, `stop_service`, `remove_program`,
+`remove_ufw`, `remove_firewalld`, `remove_iptables`, `do_uninstall`, `do_purge`), where the steps above leave a
+choice:
+- **A stop that fails removes nothing.** After `systemctl disable --now isshoni`, a service that is still active
+  ends the run with exit 1, "Could not stop isshoni, so nothing was removed.", and points at
+  `systemctl status isshoni`. Then the unit file goes, with `daemon-reload` and `reset-failed` (a unit that had
+  failed would stay listed as "not-found failed", and the system "degraded", until the next boot). A
+  `.isshoni.new` left by an unfinished install goes with the program.
+- **The admin's own drop-ins stay** (`/etc/systemd/system/isshoni.service.d/`, from `systemctl edit isshoni`):
+  they are the admin's, and the uninstall and the purge say where they are.
+- **`--no-firewall` holds here too** (and `ISSHONI_NO_FIREWALL=1`, 4.1: "never touch the firewall"): the firewall
+  is left as it is, with ufw's profile and firewalld's service file, which its rules may still name, and the
+  output says how to remove them (`--uninstall` again without it).
+- **ufw**: `ufw delete allow isshoni`, then the profile. ufw needs the profile to delete the rule, so a rule ufw
+  does not delete keeps its profile, with a warning.
+- **firewalld, a file prefilter.** Only a zone or a policy that was changed on this machine can name the service,
+  and firewalld keeps those as files of their names below `/etc/firewalld/zones` and `policies`. So the scrub
+  above runs only when one of those files mentions `isshoni`, and then only on the zones and policies whose files
+  do: about a dozen slow `firewall-cmd` calls fewer than asking every one (the packages' `preremove.sh` does the
+  same).
+- **The files have the final word, and `isshoni.xml` stays while one of them names the service.** Whatever
+  firewalld answered, the `*.xml` files of `zones/` and `policies/` are what it loads at its next reload or start
+  (not the `.xml.old` copies it keeps of files it rewrote). When one of them still names the service (`name` =
+  `isshoni` in any quoting and spacing; a word in a log prefix or a description doesn't count),
+  `/etc/firewalld/services/isshoni.xml` is kept, with a warning that names the file and says to take the service
+  out there by hand and then delete the service file. That covers a zone or policy that firewalld refused to
+  change, a hand edit or a `firewall-offline-cmd` change that the running daemon has not read yet, `--get-zones`
+  or `--get-policies` failing, and firewalld stopped without `firewall-offline-cmd` (then nothing is changed, and
+  the warning says why). Removing the file then would leave firewalld unable to load its permanent
+  configuration, which is what this section prevents; "the uninstall goes on" holds: everything else is removed
+  and the run ends with exit 0. README S78's review reproduced the hand-edit case against a real firewalld.
+- **iptables**: the rules tagged `isshoni` are deleted from `INPUT` of iptables and ip6tables (a warning with the
+  command for a rule that won't go), then saved with `netfilter-persistent save` where it is installed.
+- **Nothing left to remove** is exit 0 too ("isshoni is not installed here: there was nothing to remove."); the
+  "Kept:" lines show only when the config, the data or the user is there.
+- **`--purge`** asks before anything changes; without a terminal and without `--yes` it exits 2. It deletes
+  `/etc/isshoni`, `/var/lib/isshoni` and `/run/isshoni`, then the user, and the group where `userdel` left it,
+  each with a warning and the command when it fails.
+
 **`--purge`**:
 - Asks for `purge` to be typed; `--yes` skips the question.
 - Runs uninstall, then `rm -rf /etc/isshoni /var/lib/isshoni /run/isshoni`, then `userdel isshoni` and
@@ -760,6 +797,14 @@ If isshoni was installed from a package, both refuse and print `apt remove issho
   and `python3`. It deliberately does **not** install openssh-client, which exercises the auto-install path.
 - Started with `podman run -d --systemd=always` on CI, or `docker run -d --privileged --cgroupns=private --tmpfs /run
   --tmpfs /run/lock` locally (Docker Desktop works on macOS). `CONTAINER_ENGINE` selects which.
+- **As README S78 built it, CI uses Docker too**: the `distro` job sets `CONTAINER_ENGINE=docker`, with the same
+  `--privileged`, `--cgroupns=private` and host-gateway setup that release.yml's `verify` job already used,
+  because the runner's podman is rootless and its containers reach the runner's `relserve` another way. The
+  script still takes podman, and picks it when it is installed, but that path is not tested on CI.
+- **Review R4** (the M1 security review; README §6 "Decided after group 10" (1)): release.yml's `verify` job runs
+  such a privileged container, built from Docker Hub bases that no digest pins (`debian:12`, `ubuntu:24.04`),
+  while it holds a `contents: write` token. README F09 (group 12) moves `verify` to rootless
+  `podman run -d --systemd=always` with the bases pinned by digest and a read-only token (9.3).
 - `tools/relserve` serves a locally built, test-signed release over HTTPS (section 11.2).
 
 **VMs** (`deploy/test/vm/`):
@@ -1382,6 +1427,9 @@ The `changes` job (`dorny/paths-filter`) sets these outputs. On `push` to `main`
   (README S73)
 - `site`: `docs/**` except `docs/PLAN.md` and `docs/m1/**`, plus `web/src/conntest/codes.json` (the anchor test,
   10.4)
+- `tools`: `tools/**`
+- `distro_tools`: `tools/relserve/**`, `tools/notices/**`: the inputs of the distro jobs that neither `deploy` nor
+  `release` covers (README S78, below)
 
 | Job | Runs when | Steps and assertions | Timeout | Gates merge |
 |---|---|---|---|---|
@@ -1393,7 +1441,8 @@ The `changes` job (`dorny/paths-filter`) sets these outputs. On `push` to `main`
 | `build` | always | downloads `web/dist`, `task notices`, `task build:go` (no Node on this runner); `bin/isshoni version --json` must show the commit and `0.0.0-ci.<run>`; warns above 60 MB. Uploads `bin/isshoni` | 10 | yes |
 | `e2e` | go, web or deploy (below) | setup-node and `npm ci` in `web/`; downloads the binary and runs `chmod +x bin/isshoni` (artifacts lose the mode bit); env `ISSHONI_BIN: ${{ github.workspace }}/bin/isshoni`; the runner's preinstalled Google Chrome stable, plus Playwright's ffmpeg for the videos (`npx --prefix web playwright install ffmpeg`; `… install chrome`, which brings ffmpeg along, only if Chrome is missing); installs `xvfb`, `openbox` and `pulseaudio` and starts a PulseAudio null sink as the default sink (Chrome gets an output device for tab audio; the step can go if the specs that play audio pass without it); `xvfb-run -a --server-args="-screen 0 1920x1080x24" sh -c 'openbox & exec npm --prefix web run e2e'`: Chrome's capture picker needs a window manager under X11. One Playwright worker and one retry (05 §19.3). After every run that was not cancelled, green or red, uploads `web/test-results/` (the Playwright trace and video of a failed attempt, the per-server JSON logs `server-*.log`, 14) and `web/playwright-report/` as `e2e-results`, kept 7 days | 20 | yes |
 | `lint-deploy` | deploy | `task lint:sh lint:actions lint:keys lint:unit lint:pins test:sh` | 10 | yes |
-| `distro` | deploy or release | matrix of the 6 container distros (4.13), scenarios from 11.2; setup-node and `npm ci` in `web/`, because `task release:snapshot` builds the SPA (7.2) | 30 | yes |
+| `distro-release` | deploy or release, or `tools/relserve` or `tools/notices` (below) | builds the two test releases once for the matrix (README S78): setup-node and `npm ci` in `web/`, because `task release:snapshot` builds the SPA (7.2); rpm on the runner; `sh deploy/test/distro-test.sh -b`; uploads them as the artifact `distro-releases`, kept 1 day | 20 | yes |
+| `distro` | as `distro-release` | matrix of the 6 container distros (4.13), scenarios from 11.2, on the releases of `distro-release` (`distro-test.sh -r`), with `CONTAINER_ENGINE=docker` | 30 | yes |
 | `docker-smoke` | docker, deploy or release | `task docker:smoke` (11.3), linux/amd64 | 15 | yes |
 | `goreleaser-check` | release or deploy (below) | setup-node and `npm ci` in `web/`; `goreleaser check`; `task release:snapshot` (builds the SPA first, 7.2); asserts the asset list of section 3 (names and archive contents) | 20 | yes |
 | `site` | site or deploy | `vitepress build`; setup-go (from `go.mod`), then `go test ./internal/server/ops/doctor -run TestDocsAnchors` (10.4) | 10 | yes |
@@ -1423,6 +1472,21 @@ The `changes` job (`dorny/paths-filter`) sets these outputs. On `push` to `main`
 - **Auth throttles.** The job needs no config for them: the harness sends each account request from an address
   of its own, which the e2e server takes from `X-Forwarded-For` because its peer is loopback (05 §19.3, 04 §8.5).
 - `ci-ok` needs the job.
+
+**The `distro-release` and `distro` jobs as README S78 built them.**
+- **The releases are built once.** The design had each of the six matrix jobs run setup-node, `npm ci` and the
+  snapshot build. `distro-release` builds the two test releases (`0.0.1-ci.1` and `0.0.1-ci.2`, 11.2) and passes
+  what the installer downloads (the linux archives, `checksums.txt` and the stamped `install.sh`, unsigned) to the
+  matrix as an artifact; each `distro` job needs only Go (for `tools/relserve`), signs the releases with a key of
+  its own and runs one distro. That saves about five snapshot builds per run. `ci-ok` needs both jobs, so a
+  failed `distro-release` can't leave `distro` skipped and green.
+- **Docker on the runner**, not podman (4.13): `CONTAINER_ENGINE=docker`.
+- **Its own inputs count**, as for `e2e` (README S61): `tools/relserve`, which only this job runs, and
+  `tools/notices`, whose output is inside the archives it installs, are in neither the `deploy` nor the `release`
+  filter, so the `changes` job has a filter for them (`distro_tools`) that runs both jobs too. Like every job they
+  are skipped, which counts as a pass, while one of their inputs doesn't exist yet.
+- **Per distro** (11.2): C1–C6, C8–C10 and C12 in one systemd container, C7 and C13 in one each, C11 in the
+  distro's plain image, and V3 with a running firewall on `fedora-44` (firewalld) and `ubuntu-24.04` (ufw).
 
 **The `goreleaser-check` job as README S73 built it.**
 - **It also runs on deploy changes**, not on release changes alone, as the `e2e` job does (README S61): its other
@@ -1574,6 +1638,14 @@ owner.
      and merge it once `ci-ok` is green. Tag that merge commit. The release job can't commit the snapshot itself:
      `main` requires a PR and `ci-ok`, and Actions may not open PRs (8.6). Without the merged snapshot, release.yml's
      `build` job fails before goreleaser runs (9.3).
+  5. **The root `README.md`, for every tag, the rc's too** (README F05's review): every release archive carries it
+     (3), so what it says ships inside the release. Bring up to date, in a PR into `main` merged before the tag
+     (for a final release, step 4's PR can carry it): the pre-release banner at the top and the "Status" section
+     ("No release yet" must not ship inside `v0.1.0-rc.1`), "What v0.1.0 will ship" and the Install intro ("Not
+     available yet"), as the comment in its Status section lists. Its "Release signing keys" table must list the
+     fingerprints of `deploy/keys/allowed_signers` (9.4), which `deploy/keys/README.md` step 2 fills in with the
+     keys; from README F11 on, `repocheck keys` (`task lint:keys`, and release.yml) fails while a key's fingerprint
+     is missing there or a row still says the key is not created (10.3).
 - **Tag and push** with plain git: `git tag -a v0.1.0 -m v0.1.0 && git push origin v0.1.0`. `gh` is not needed.
 - **Approve.** The owner edits the draft notes on GitHub, then approves the `release` environment (works from the
   GitHub mobile app).
@@ -1888,6 +1960,18 @@ alone. Registry logins are a plain `docker login` with the job's token, not a th
   Copying the index keeps the digest, so the cosign signature stays valid.
 - Timeout 10 min.
 
+**Review R4** (the M1 security review; README §6 "Decided after group 10" (1)). As built, `verify` holds a
+`contents: write` token in its job environment while it runs a privileged container from Docker Hub bases that no
+digest pins (4.13), and `publish` takes the draft as it is: no new download, no `ssh-keygen -Y verify`, no
+`sha256sum -c`, no check for assets that `checksums.txt` doesn't list. That goes against this section's rule of
+no write token near third-party code. README F09 (group 12) fixes it: `sign` uploads its verified files as an
+artifact, `verify` takes them from there with `contents: read` (plus `packages: read` and `attestations: read`) and
+no job-level `GH_TOKEN`, starts the distro container rootless (`podman run -d --systemd=always`) from bases pinned
+by digest, and `publish` downloads the draft right before `--draft=false` and fails unless the signature, the
+checksums and the asset list all pass. The same Docker Hub exposure in `build`'s buildx driver image can be pinned
+by digest in the same slice. Turning on GitHub's immutable releases, which the one-time setup of 8.6 doesn't
+include, is the owner's to consider.
+
 **`site`** (README S82; not there yet)
 - `uses: ./.github/workflows/site.yml`, after `publish`.
 - A `release` event created with `GITHUB_TOKEN` doesn't trigger other workflows, so the site deploy is called directly.
@@ -2031,7 +2115,10 @@ after the first Windows release):
 - **The key is pinned in four places, cross-checked:**
   - `deploy/keys/allowed_signers` (source of truth);
   - the block embedded in install.sh (checked by `lint:keys`);
-  - the fingerprints on `/security` and in `README.md` (from `release.json` and the file);
+  - the fingerprints on `/security` and in `README.md` (from `release.json` and the file). `README.md`'s are
+    checked by `repocheck keys` (`lint:keys`, and release.yml) from README F11 on: once `allowed_signers` exists,
+    its "Release signing keys" section must list the SHA256 fingerprint of every key in it and no row may still
+    say the key is not created. Until F11 nothing checks them (README F05's review);
   - the release notes footer.
 - **Manual verification** (on `/install/` and `/security#verify`):
 
@@ -2135,7 +2222,14 @@ page is written):
     `--reload` before `--permanent --add-service=isshoni` and once more after it (4.9);
   - `--uninstall` with the service in the default zone, in a second zone and in a policy, and with a rich rule
     that names it: each of them is removed, and the rule printed in full, before `isshoni.xml` goes; a zone that
-    refuses the change is named in a warning, and the uninstall goes on (4.11).
+    refuses the change is named in a warning, and the uninstall goes on (4.11). As README S78 wrote them, the
+    firewalld stand-in writes the files of the zones and policies it changed, as firewalld does, and the tests
+    also cover: zones whose files don't mention the service are not asked; `isshoni.xml` stays, with the file
+    named in the warning, when a zone refuses, when firewalld is stopped and `firewall-offline-cmd` is missing,
+    when a zone file was edited by hand and not reloaded, and when firewalld lists no zones; with firewalld
+    stopped, `firewall-offline-cmd` and its own options do the work and nothing reloads; the `.xml.old` copies and
+    a mention that names no service don't count; a second run finds nothing to remove; and `--no-firewall`
+    leaves the firewall alone.
 - **Key block:** it is identical to `deploy/keys/allowed_signers`.
 
 ### 11.2 Distro scenarios: `deploy/test/distro-test.sh`
@@ -2153,12 +2247,15 @@ page is written):
 **As README S67 built the setup** (`deploy/test/distro-test.sh`, `deploy/test/distro/Containerfile`,
 `tools/relserve`; `task deploy:test`, with `DISTRO=<name>` for one), with scenarios C1 and C6 (README S78 adds the
 rest):
-- **The test release is built from the working tree, not by `task release:snapshot`**, which needs goreleaser
-  (README S73): two versions, `0.0.1-ci.1` and `0.0.1-ci.2`, built for the container's CPU with the version
-  stamped through `-ldflags` and packed like a release archive (§3), each with a `checksums.txt` signed by a key
-  pair made for the run, and a copy of `install.sh` per version, stamped with it as a release would and with that
-  key between the markers. The binary carries the web app only when `web/dist` was built before; the scenarios
-  don't open it.
+- **The test release is a snapshot release** (README S78; S67 built it from the working tree, before goreleaser
+  existed): `task release:snapshot` with `ISSHONI_SNAPSHOT_VERSION` set to `0.0.1-ci.1` and then `0.0.1-ci.2`,
+  without the images (`--skip=docker`), which builds the web app for each version first. The scenarios take from
+  each snapshot what a release serves the installer: the two linux archives, `checksums.txt` and `install.sh`,
+  stamped with the version by goreleaser's before hook. The run then signs each `checksums.txt` with a key pair
+  made for it, puts that key between `install.sh`'s key markers, and updates `install.sh`'s line in
+  `checksums.txt`. A snapshot needs `web/node_modules` (`task setup`) and replaces `dist/`, `dist-extra/` and
+  `web/dist` of the working tree, as `task release:snapshot` always does. With warm caches a snapshot takes about
+  16 s per version; the first one on a cold machine also builds goreleaser.
 - **`tools/relserve`** serves the release root over HTTPS the way GitHub Releases does (`/download/v<ver>/<file>`,
   and `/latest` → 302 to the newest tag), with a certificate authority made at its start whose key is never
   written; it writes the CA certificate for the container and its bound address to files. The container reaches
@@ -2188,6 +2285,30 @@ rest):
   the running version are unchanged, no `.isshoni.new` is left, and the service was not restarted
   (`ActiveEnterTimestamp`).
 
+**As README S78 built the rest** (`deploy/test/distro-test.sh`, `deploy/test/distro/`; `task deploy:test`):
+- **Flags**: `distro-test.sh [-r DIR] [-o PARTS] [DISTRO...]`, or `-b DIR` to build the two test releases into
+  DIR and stop; `-r DIR` takes them from such a DIR instead of building them. CI's `distro-release` job runs `-b`
+  once, and each `distro` job `-r` with its distro (8.2). Without a DISTRO all six run, one after the other.
+- **Parts** (`-o`, default all): `main`, one container with, in this order, C12 (non-root without sudo, checked
+  to have installed nothing), C1, C2, C3, **C6 before C4** (the tampered mirrors need ci.1 installed and ci.2 not
+  yet), C4, C5, C8, C9 and C10; `c7` and `c13`, a container each; `c11`, the distro's plain image without systemd;
+  `v3` (below).
+- **V3 also runs in containers**, on every PR that touches deploy, not only in the nightly's virtual machines
+  (D8 assumed containers couldn't test firewalls; S62 found that privileged systemd containers run a real
+  firewalld and ufw): on `fedora-44` (firewalld) and `ubuntu-24.04` (ufw), in a container from an image with the
+  firewall (`<image>:<distro>-firewall`). The firewall offer opens the ports, and `--uninstall` takes them out
+  again. On Fedora the service is first put into a second zone, a policy and a rich rule, and written by hand into
+  a third zone's file that firewalld has not read: that file keeps `isshoni.xml` (4.11), and after the uninstall
+  firewalld must still load its configuration (`firewall-cmd --reload` succeeds, `--state` is `running`). README
+  S83 runs V3 in the nightly's VMs; reusing these scenario functions there needs an executor over SSH.
+- **Names**: `IMAGE_NAME` names the images and prefixes the containers (default `isshoni-distro-test`), so a
+  run can keep away from another run's images and containers; the images stay as the next run's build cache,
+  everything else is deleted at the end. `CONTAINER_ENGINE` picks podman or docker (podman when installed; CI
+  sets docker, 4.13), `KEEP=1` leaves the containers and the work directory for a look after a failure.
+- **Counts**: a distro runs 123 checks (131 on ubuntu-24.04 and 141 on fedora-44, with V3); the group 10
+  integration ran all six locally in Docker. The GitHub path (the `distro-release` job, Docker on the runner) is
+  checked only by CI, on the pull request.
+
 **Container scenarios** (each asserts the exit code and the listed state):
 
 | # | Scenario | Asserts |
@@ -2206,7 +2327,7 @@ rest):
 | C12 | Non-root without sudo | exit 4 |
 | C13 | Re-run after exit 5 (third container): a test drop-in `/etc/systemd/system/isshoni.service.d/zz-test.conf` with `ExecStartPre=/bin/false` makes every start fail; fresh install with C1's flags; then the drop-in is removed with `systemctl daemon-reload` (the admin's fix) and the installer run again | first run: exit 5 after the wait; the last output line is "Fix the problem above, then run this installer again."; the unit is enabled. Re-run: exit 0; no question; the unit is active; the output has a `/setup#` link |
 
-**VM-only scenarios** (nightly):
+**VM scenarios** (nightly; V3 also runs in containers since README S78, above):
 
 | # | Scenario | Asserts |
 |---|---|---|
@@ -2622,3 +2743,12 @@ Decided after group 9 (engineering calls the owner delegated; README §6):
 - **A known M1 limit for the release notes**: after `decoder_failed`, a viewer's codec retries start again only on
   a caps change or a reload, so a Firefox whose OpenH264 download outlasts the 3 minutes of retries needs a reload
   (9.5; 02 §8.5).
+
+Decided after group 10 (an engineering call the owner delegated; README §6 (1)):
+
+- **The M1 security review's finding in the release pipeline (R4) is fixed** by README F09 in group 12, where no other
+  slice touches `release.yml` or `cmd/isshoni` (README S82 has the first in group 11, S90 the second in group 13):
+  `verify` drops its write token and its privileged container from unpinned bases, and `publish` checks the draft
+  again before it publishes it (4.13, 9.3). F09 also fixes R5, which is 04's: `admin backup` without `--out` never
+  writes into a file that already exists at the default name (04 §12.3). The review was read-only, of `main` at
+  f7053dc, before the first release candidate; README §6 has its other findings and their slices.
