@@ -3508,6 +3508,15 @@ are ignored (`SendTest`: `server_shutdown`) once `Run`'s context has ended. `pus
 - **`push.test` is exempt from the bucket** (S32): 03 limits the endpoint itself (1 per 10 s per user, 03 §7.3
   `push-test`), and a test that silently sends nothing would look like broken notifications. A test doesn't take a
   token either, so it never uses up the budget of real notifications.
+- **`push.test` has a lane of its own** (README F08, from the M1 security review): its own queue and one worker,
+  and each test is attempted once (§14.5). Before, tests shared the 4 workers and the retries of everything
+  else: a member with 10 subscriptions on one session whose endpoints never answer (a name that resolves to a
+  public address that drops packets passes `ValidateEndpoint`) could post a test every 10 s and keep all 4
+  workers busy, delaying everyone's `share.started` and `admin.alert` by about a minute. Now such a member holds
+  the test lane's worker and nothing else, and reaches one endpoint per test: 03 keeps one subscription per web
+  session (03 §12.4.6). What such endpoints still cost the 4 workers is the notifications their user receives,
+  which the per-recipient bucket above limits (an event per 10 minutes after the first 3), at up to 3 attempts
+  each.
 - `Topic` header per (room, sharer): `s` + first 22 chars of base64url(SHA-256(roomID + "/" + userID)) (≤ 32
   URL-safe chars), so a phone that was offline receives only the latest notification per sharer.
 - `admin.alert`: 03 already coalesces `signup_pending` (one per 10 min); transfer alerts fire once per threshold per
@@ -3562,7 +3571,9 @@ At send time (the real guard, because DNS can change):
   ranges, IPv4-mapped/NAT64 forms of those, and the server's own public addresses. Checking in `Control` also defeats
   DNS rebinding between check and connect.
 - `Proxy: nil` (environment proxies ignored), `CheckRedirect` returns `http.ErrUseLastResponse` (no redirects),
-  timeout 10 s, response body read ≤ 4 KiB.
+  timeout 10 s, response body read ≤ 4 KiB. The dial and the TLS handshake have 2 s each (README F08; 5 s
+  before): an endpoint whose address drops every packet holds a worker for 2 s per attempt. Push services answer
+  from nearby data centres, and a SYN lost once (sent again after 1 s) still fits.
 - `webpush.Options{HTTPClient: guarded, Subscriber: subject, VAPIDPublicKey, VAPIDPrivateKey, TTL, Urgency, Topic}`.
 - S32's guard also refuses, in `Control`, any port other than 443, and before each send it runs the stored endpoint
   through the URL rules above again, so a row written in any other way never reaches the client. Both refusals
@@ -3579,9 +3590,14 @@ Results:
 | 404, 410 | delete the subscription (gone) |
 | 401, 403 | delete (the subscription belongs to another VAPID key, e.g. after rotation) |
 | 400, 413 | log a warning (our bug), `failures++` |
-| 429, 5xx, network error | retry at 5 s and 30 s (or `Retry-After` ≤ 60 s) while still within the TTL, then `failures++` |
+| 429, 5xx, network error | retry at 5 s and 30 s (or `Retry-After` ≤ 60 s) while still within the TTL, then `failures++`; a `push.test` is not retried: `failures++` at once |
 
-Queue: 1024 jobs, 4 workers; a full queue drops the job (`dropped`).
+Queue: 1024 jobs, 4 workers; a full queue drops the job (`dropped`). `push.test` has a lane of its own (README F08,
+§14.4): a queue of 1024 (`Options.QueueLen`) and one worker that serves nothing else. `SendTest` queues there,
+under the lock that the shutdown takes, so the lane's worker drains every test that was queued and none is queued
+after the shutdown began (`server_shutdown`); a full lane is `server_busy` as before. A test is attempted once, so
+one test holds the worker for at most the 10 s timeout, and a test that waited past its 60 s TTL is dropped
+unsent.
 
 How S32 reads the table (every status has a row, and the `isshoni_push_sent_total` result is named):
 - **ok**: every 2xx, not only 200, 201 and 202.
@@ -3590,8 +3606,9 @@ How S32 reads the table (every status has a row, and the `isshoni_push_sent_tota
   followed, and any 4xx that has no row of its own), and a send that fails with `ErrUndeliverable` (the
   subscription's keys don't decode, its endpoint breaks the URL rules, or the guard refused the address). One
   warning, `failures++`.
-- **transient**: 408, 429, every 5xx, and no answer at all (a network error, a timeout). At most two retries, 5 s
-  after the first attempt and 30 s after the second; a `Retry-After` of at most 60 s replaces that wait. There is no
+- **transient**: 408, 429, every 5xx, and no answer at all (a network error, a timeout). A `push.test` is not
+  retried (README F08): it is an **error** at once. Every other message gets at most two retries, 5 s after the
+  first attempt and 30 s after the second; a `Retry-After` of at most 60 s replaces that wait. There is no
   retry when the push service asks for more than 60 s, or when the wait would end at or after the end of the
   message's TTL (which runs from the moment the dispatcher takes the event): the message is then an **error**
   (`failures++`) at once, as it is after the third attempt. A retry asks the push service to keep the message only

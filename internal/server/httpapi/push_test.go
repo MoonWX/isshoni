@@ -121,7 +121,8 @@ func wantPushRejected(t *testing.T, rec *httptest.ResponseRecorder, reason api.P
 
 // TestPushSubscribeOverREST is 03 §15's push case: an endpoint over 2048 bytes → 422 too_long; bad keys → 422
 // bad_keys; a fake ValidateEndpoint rejection → 422 with its reason; a valid subscription → 201, and the same
-// endpoint again → 200; the 11th subscription evicts the oldest; logout deletes the session's subscriptions.
+// endpoint again → 200; another endpoint from the same session replaces the first (README F08); the 11th
+// subscription across a user's sessions evicts the oldest; logout deletes the session's subscriptions.
 func TestPushSubscribeOverREST(t *testing.T) {
 	f := newAuthFixture(t)
 	admin, cookie, sam, samCookie := f.adminAndMember()
@@ -202,13 +203,14 @@ func TestPushSubscribeOverREST(t *testing.T) {
 		Endpoint: pushEndpoint(0), P256dh: keys.P256dh, Auth: keys.Auth, Name: "Chrome on Windows"}) {
 		t.Errorf("stored subscription = %+v", rows[0])
 	}
-	// An endpoint of exactly 2048 bytes fits.
+	// An endpoint of exactly 2048 bytes fits. (Posted from Sam's browser: from this one it would replace endpoint 0,
+	// the session's only subscription, below.)
 	fits := long[:pushEndpointMaxBytes]
-	decodeBody[api.PushSubscribeResponse](t, f.subscribe(cookie, fits, keys), http.StatusCreated)
+	decodeBody[api.PushSubscribeResponse](t, f.subscribe(samCookie, fits, keys), http.StatusCreated)
 	if got := f.push.takeValidated(); len(got) != 2 || got[0] != pushEndpoint(0) || got[1] != fits {
 		t.Errorf("ValidateEndpoint saw %d endpoints, want the two that were stored", len(got))
 	}
-	if rec := f.unsubscribe(cookie, fits); rec.Code != http.StatusNoContent {
+	if rec := f.unsubscribe(samCookie, fits); rec.Code != http.StatusNoContent {
 		t.Fatalf("unsubscribe = %d %s", rec.Code, rec.Body)
 	}
 
@@ -244,10 +246,34 @@ func TestPushSubscribeOverREST(t *testing.T) {
 		t.Errorf("after another account posted the endpoint: Alex has %d, Sam %d; want 0 and 1", len(f.subsOf(admin.ID)), len(f.subsOf(sam.ID)))
 	}
 
-	// Each user keeps at most 10: the 11th evicts the one that was posted longest ago.
+	// A web session keeps one subscription, the one it posted last (README F08): a second endpoint from this session
+	// replaces the first in the same request, so a test from this browser reaches one endpoint. Sam's row stays.
+	f.clk.advance(time.Minute)
+	first := f.subscribed(cookie, pushEndpoint(1))
+	f.clk.advance(time.Minute)
+	second := f.subscribed(cookie, pushEndpoint(2))
+	if rows = f.subsOf(admin.ID); len(rows) != 1 || string(rows[0].ID) != second || rows[0].Endpoint != pushEndpoint(2) ||
+		rows[0].SessionID != session || first == second {
+		t.Errorf("after two endpoints from one session Alex has %+v, want only the newer", rows)
+	}
+	// Posting the session's endpoint again (an app start) keeps it, and keeps it the only one.
+	f.clk.advance(time.Minute)
+	if got := decodeBody[api.PushSubscribeResponse](t, f.subscribe(cookie, pushEndpoint(2), newPushKeys(t)), http.StatusOK).ID; got != second {
+		t.Errorf("the session's endpoint again: id %q, want %q", got, second)
+	}
+	if n := count("SELECT count(*) FROM push_subscriptions WHERE session_id = ?", string(session)); n != 1 {
+		t.Errorf("%d subscriptions of one session, want 1", n)
+	}
+
+	// Each user keeps at most 10 across the sessions: the 11th evicts the one that was posted longest ago. Ten
+	// browsers post endpoints 1 to 10, the first of them endpoint 1 in place of its endpoint 2.
+	browsers := []*http.Cookie{cookie, cookieB}
+	for i := range maxPushSubscriptions - 1 {
+		browsers = append(browsers, f.sessionCookie(f.login("Alex", testPassword, clientIP(i)), thirtyDays))
+	}
 	for i := 1; i <= maxPushSubscriptions; i++ {
 		f.clk.advance(time.Minute)
-		f.subscribed(cookie, pushEndpoint(i))
+		f.subscribed(browsers[i-1], pushEndpoint(i))
 	}
 	if rows = f.subsOf(admin.ID); len(rows) != maxPushSubscriptions || rows[0].Endpoint != pushEndpoint(1) {
 		t.Fatalf("Alex has %d subscriptions, the oldest %q", len(rows), rows[0].Endpoint)
@@ -256,12 +282,16 @@ func TestPushSubscribeOverREST(t *testing.T) {
 	f.clk.advance(time.Minute)
 	decodeBody[api.PushSubscribeResponse](t, f.subscribe(cookie, pushEndpoint(1), newPushKeys(t)), http.StatusOK)
 	f.clk.advance(time.Minute)
-	f.subscribed(cookieB, pushEndpoint(11))
+	eleventh := browsers[maxPushSubscriptions]
+	f.subscribed(eleventh, pushEndpoint(11))
 	got := endpointsOf(f.subsOf(admin.ID))
 	want := []string{pushEndpoint(3), pushEndpoint(4), pushEndpoint(5), pushEndpoint(6), pushEndpoint(7), pushEndpoint(8),
 		pushEndpoint(9), pushEndpoint(10), pushEndpoint(1), pushEndpoint(11)}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Errorf("after the 11th subscription Alex has %q, want %q", got, want)
+	}
+	if n := count("SELECT count(*) FROM push_subscriptions WHERE session_id = ?", string(sessionB)); n != 0 {
+		t.Errorf("%d subscriptions of session B, whose endpoint 2 was the oldest; want 0", n)
 	}
 	// The cap is per user: Sam's subscription is untouched.
 	if rows = f.subsOf(sam.ID); len(rows) != 1 || rows[0].Endpoint != pushEndpoint(0) {
@@ -269,13 +299,14 @@ func TestPushSubscribeOverREST(t *testing.T) {
 	}
 
 	// Logout deletes the session's subscriptions, and only those (03 §7.7).
-	if rec := f.call(http.MethodPost, "/api/v1/auth/logout", `{}`, with(cookieB)); rec.Code != http.StatusNoContent {
+	lastSession := f.sessionID(eleventh)
+	if rec := f.call(http.MethodPost, "/api/v1/auth/logout", `{}`, with(eleventh)); rec.Code != http.StatusNoContent {
 		t.Fatalf("logout = %d %s", rec.Code, rec.Body)
 	}
 	if got := endpointsOf(f.subsOf(admin.ID)); len(got) != 9 || strings.Contains(fmt.Sprint(got), pushEndpoint(11)) {
-		t.Errorf("after the logout of session B Alex has %q, want the 9 of the first session", got)
+		t.Errorf("after the logout of the 11th session Alex has %q, want the 9 of the other sessions", got)
 	}
-	if n := count("SELECT count(*) FROM push_subscriptions WHERE session_id = ?", string(sessionB)); n != 0 {
+	if n := count("SELECT count(*) FROM push_subscriptions WHERE session_id = ?", string(lastSession)); n != 0 {
 		t.Errorf("%d subscriptions of the session that logged out", n)
 	}
 	// Nothing about push is audited or announced (03 §10, §12.5), and no endpoint is in the audit log.
@@ -289,8 +320,9 @@ func TestPushSubscribeOverREST(t *testing.T) {
 func TestPushUnsubscribeOverREST(t *testing.T) {
 	f := newAuthFixture(t)
 	admin, cookie, sam, samCookie := f.adminAndMember()
+	cookieB := f.sessionCookie(f.login("Alex", testPassword, addrB), thirtyDays) // a session holds one subscription
 	f.subscribed(cookie, pushEndpoint(1))
-	f.subscribed(cookie, pushEndpoint(2))
+	f.subscribed(cookieB, pushEndpoint(2))
 	f.subscribed(samCookie, pushEndpoint(3))
 
 	// Somebody else's endpoint: 204, and their subscription stays.
@@ -338,8 +370,9 @@ func TestPushTestOverREST(t *testing.T) {
 		}
 	}
 
-	// Two subscriptions in this session, one in another session of the same user, one of another user.
-	idA1 := f.subscribed(cookie, pushEndpoint(1))
+	// Two endpoints posted from this session, which keeps the newer (README F08); one in another session of the same
+	// user, one of another user.
+	f.subscribed(cookie, pushEndpoint(1))
 	f.clk.advance(time.Second)
 	idA2 := f.subscribed(cookie, pushEndpoint(2))
 	cookieB := f.sessionCookie(f.login("Alex", testPassword, addrB), thirtyDays)
@@ -355,10 +388,10 @@ func TestPushTestOverREST(t *testing.T) {
 		t.Fatalf("POST /push/test = %d %q (Content-Type %q), want 202 without a body", rec.Code, rec.Body, rec.Header().Get("Content-Type"))
 	}
 	tests := f.push.takeTests()
-	if len(tests) != 1 || len(tests[0]) != 2 || tests[0][0].ID != store.PushSubID(idA1) || tests[0][1].ID != store.PushSubID(idA2) ||
-		tests[0][0].Endpoint != pushEndpoint(1) || tests[0][0].UserID != store.UserID(admin.ID) || tests[0][0].SessionID != f.sessionID(cookie) ||
+	if len(tests) != 1 || len(tests[0]) != 1 || tests[0][0].ID != store.PushSubID(idA2) ||
+		tests[0][0].Endpoint != pushEndpoint(2) || tests[0][0].UserID != store.UserID(admin.ID) || tests[0][0].SessionID != f.sessionID(cookie) ||
 		len(tests[0][0].P256dh) != 87 || len(tests[0][0].Auth) != 22 {
-		t.Errorf("SendTest got %+v, want the two subscriptions of this session", tests)
+		t.Errorf("SendTest got %+v, want the one subscription of this session", tests)
 	}
 
 	// A second test within 10 s → 429 with Retry-After, from any session of that user. Nothing is sent.

@@ -340,14 +340,15 @@ func TestRetries(t *testing.T) {
 			want: []attempt{{0, 600 * sec}, {5 * sec, 595 * sec}, {35 * sec, 565 * sec}}, recorded: false},
 		{name: "410 after a retry deletes", answers: []SendResult{{Status: 503}, {Status: 410}},
 			want: []attempt{{0, 600 * sec}, {5 * sec, 595 * sec}}},
-		{name: "test: both retries fit in 60 s", test: true, answers: []SendResult{{Status: 503}, {Status: 503}, {Status: 503}},
-			want: []attempt{{0, 60 * sec}, {5 * sec, 55 * sec}, {35 * sec, 25 * sec}}, recorded: false},
-		{name: "test: a retry past the TTL is not made", test: true,
-			answers: []SendResult{{Status: 503, RetryAfter: 50 * sec}, {Status: 503, RetryAfter: 50 * sec}},
-			want:    []attempt{{0, 60 * sec}, {50 * sec, 10 * sec}}, recorded: false},
-		{name: "test: a wait as long as the TTL is not made", test: true,
-			answers: []SendResult{{Status: 429, RetryAfter: 60 * sec}},
-			want:    []attempt{{0, 60 * sec}}, recorded: false},
+		// A push.test is attempted once (README F08): no retry, whatever the answer or its Retry-After.
+		{name: "test: 503 is not retried", test: true, answers: []SendResult{{Status: 503}},
+			want: []attempt{{0, 60 * sec}}, recorded: false},
+		{name: "test: Retry-After is not waited for", test: true, answers: []SendResult{{Status: 503, RetryAfter: 5 * sec}},
+			want: []attempt{{0, 60 * sec}}, recorded: false},
+		{name: "test: 429 is not retried", test: true, answers: []SendResult{{Status: 429, RetryAfter: 60 * sec}},
+			want: []attempt{{0, 60 * sec}}, recorded: false},
+		{name: "test: a network error is not retried", test: true, err: netErr,
+			want: []attempt{{0, 60 * sec}}, recorded: false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -430,6 +431,120 @@ func TestRetryDoesNotBlockTheWorker(t *testing.T) {
 		calls := f.sender.sent()
 		if len(calls) != 2 || calls[1].Sub.ID != "m1" || !calls[1].At.Equal(start) {
 			t.Errorf("calls %+v, want b1 and then m1 without waiting", attempts(start, calls))
+		}
+	})
+}
+
+// retryWait keeps every retry inside the message's TTL (04 §14.5). The push.test rows of TestRetries showed it
+// while a test was retried; a test is attempted once now (README F08), and the rule still holds for any message
+// whose time runs short, such as a share.started that waited in the queue.
+func TestRetryWaitTTL(t *testing.T) {
+	now := time.Now()
+	sec := time.Second
+	for _, tc := range []struct {
+		name    string
+		left    time.Duration // until the message's deadline
+		attempt int
+		res     SendResult
+		wait    time.Duration
+		ok      bool
+	}{
+		{"the first retry fits", 6 * sec, 0, SendResult{Status: 503}, 5 * sec, true},
+		{"the first retry would end at the deadline", 5 * sec, 0, SendResult{Status: 503}, 0, false},
+		{"the second retry fits", 31 * sec, 1, SendResult{Status: 503}, 30 * sec, true},
+		{"the second retry would pass the TTL", 25 * sec, 1, SendResult{Status: 503}, 0, false},
+		{"a Retry-After inside the TTL", 60 * sec, 0, SendResult{Status: 429, RetryAfter: 50 * sec}, 50 * sec, true},
+		{"a Retry-After past the TTL", 10 * sec, 0, SendResult{Status: 503, RetryAfter: 50 * sec}, 0, false},
+		{"a Retry-After as long as the TTL", 60 * sec, 0, SendResult{Status: 429, RetryAfter: 60 * sec}, 0, false},
+		{"no third retry", time.Hour, 2, SendResult{Status: 503}, 0, false},
+		{"a Retry-After over 60 s", time.Hour, 0, SendResult{Status: 503, RetryAfter: 61 * sec}, 0, false},
+	} {
+		j := job{kind: api.PushTypeShareStarted, deadline: now.Add(tc.left), attempt: tc.attempt}
+		if wait, ok := retryWait(j, tc.res, now); wait != tc.wait || ok != tc.ok {
+			t.Errorf("%s: retryWait = %v, %v; want %v, %v", tc.name, wait, ok, tc.wait, tc.ok)
+		}
+	}
+}
+
+// TestTestsHaveTheirOwnLane is README F08 (review R6): a member who tests subscriptions whose push service never
+// answers holds the push.test lane's one worker and nothing else. Mallory calls SendTest every 10 s for 2 minutes,
+// each time with 10 such subscriptions (the worst case from before F08; a session holds one now), and every send to
+// them blocks until its 10 s timeout. Meanwhile a share.started or an admin.alert for another user every 3 s goes
+// out within a second of its trigger (at once, here), and each of Mallory's tests is attempted once.
+func TestTestsHaveTheirOwnLane(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newFixture(t, nil)
+		f.sender.hangIf = func(s Subscription) bool { return s.UserID == "mallory" }
+		// Every event has a recipient of its own, so that the per-recipient buckets drop nothing. The dispatcher
+		// handles the events in order, so the n-th event's recipient is bn.
+		n := 0
+		f.store.recipients = func(RecipientFilter) []Subscription {
+			n++
+			return []Subscription{sub(fmt.Sprint("b", n), fmt.Sprint("user", n))}
+		}
+		f.start(t)
+		triggered := map[string]time.Time{} // the recipient's subscription ID → when its event was triggered
+		tests := 0
+		for second := 0; second <= 120; second++ {
+			if second%10 == 0 {
+				subs := make([]Subscription, 10)
+				for i := range subs {
+					subs[i] = sub(fmt.Sprintf("m%d-%d", second, i), "mallory")
+				}
+				if err := f.SendTest(context.Background(), subs); err != nil {
+					t.Fatalf("Mallory's test at %d s: %v", second, err)
+				}
+				tests += len(subs)
+			}
+			if second%3 == 0 {
+				event := len(triggered) + 1
+				triggered[fmt.Sprint("b", event)] = time.Now()
+				if event%2 == 0 {
+					f.AdminAlert(AdminAlert{Kind: "signup_pending", Actor: "system"})
+				} else {
+					f.ShareStarted(share("lounge", fmt.Sprint("sharer", event)))
+				}
+			}
+			time.Sleep(time.Second)
+		}
+		synctest.Wait()
+
+		attemptsOf := map[string]int{}
+		var mallory []time.Time
+		others := 0
+		for _, c := range f.sender.sent() {
+			attemptsOf[c.Sub.ID]++
+			if c.Sub.UserID == "mallory" {
+				mallory = append(mallory, c.At)
+				continue
+			}
+			at, ok := triggered[c.Sub.ID]
+			if !ok {
+				t.Errorf("a send to %s, for which no event was triggered", c.Sub.ID)
+				continue
+			}
+			others++
+			if d := c.At.Sub(at); d < 0 || d > time.Second {
+				t.Errorf("%s (%s) went out %v after its event, want within 1 s", c.Sub.ID, c.Payload[:40], d)
+			}
+		}
+		if others != len(triggered) {
+			t.Errorf("%d of the %d events were sent", others, len(triggered))
+		}
+		for id, n := range attemptsOf {
+			if n != 1 {
+				t.Errorf("%s was attempted %d times, want once", id, n)
+			}
+		}
+		// The lane's one worker: Mallory's sends follow each other, each holding it for its 10 s timeout, and the
+		// tests that waited longer than their 60 s TTL are dropped without a send.
+		for i := 1; i < len(mallory); i++ {
+			if d := mallory[i].Sub(mallory[i-1]); d < sendTimeout {
+				t.Errorf("Mallory's sends %d and %d were %v apart: more than one worker sent tests", i, i+1, d)
+			}
+		}
+		if len(mallory) == 0 || len(mallory) >= tests || f.sent(resultDropped) == 0 {
+			t.Errorf("%d of Mallory's %d tests were sent, %d dropped", len(mallory), tests, f.sent(resultDropped))
 		}
 	})
 }
@@ -595,6 +710,13 @@ func TestDefaults(t *testing.T) {
 	f := newFixture(t, nil)
 	if f.workers != 4 || cap(f.jobs) != 1024 || cap(f.events) != 1024 {
 		t.Errorf("workers %d, queues %d and %d; want 4, 1024, 1024", f.workers, cap(f.jobs), cap(f.events))
+	}
+	// The push.test lane (README F08): a queue of its own and one worker.
+	if cap(f.tests) != 1024 || testWorkers != 1 {
+		t.Errorf("the push.test lane: queue %d, %d workers; want 1024 and 1", cap(f.tests), testWorkers)
+	}
+	if dialTimeout != 2*time.Second || tlsHandshakeTimeout != 2*time.Second {
+		t.Errorf("dial %v, TLS handshake %v; want 2 s each", dialTimeout, tlsHandshakeTimeout)
 	}
 	if f.VAPIDPublicKey() != f.keys.Public {
 		t.Errorf("VAPIDPublicKey = %q, want %q", f.VAPIDPublicKey(), f.keys.Public)
@@ -1140,13 +1262,16 @@ func TestExpiredJobIsDropped(t *testing.T) {
 func TestRetryQueueFullAndAfterShutdown(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := newFixture(t, func(o *Options) { o.QueueLen = 1 })
-		retry := job{kind: api.PushTypeTest, sub: sub("m1", "me"), deadline: time.Now().Add(time.Hour), attempt: 1}
+		retry := job{kind: api.PushTypeShareStarted, sub: sub("m1", "me"), deadline: time.Now().Add(time.Hour), attempt: 1}
 		if !f.retryLater(retry, 5*time.Second) {
 			t.Fatal("retryLater refused before shutdown")
 		}
-		// The queue fills up while the retry waits.
-		if err := f.SendTest(context.Background(), []Subscription{sub("m2", "me")}); err != nil {
-			t.Fatal(err)
+		// The queue fills up while the retry waits. (A test would not fill it: tests have a queue of their own.)
+		if err := f.SendTest(context.Background(), []Subscription{sub("m2", "me")}); err != nil || len(f.jobs) != 0 {
+			t.Fatalf("SendTest = %v, %d jobs in the shared queue; want nil and none", err, len(f.jobs))
+		}
+		if !f.enqueue(job{kind: api.PushTypeAdminAlert, sub: sub("m3", "me"), deadline: time.Now().Add(time.Hour)}) {
+			t.Fatal("the queue took nothing")
 		}
 		time.Sleep(5 * time.Second)
 		synctest.Wait()

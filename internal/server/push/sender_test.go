@@ -527,6 +527,9 @@ func TestSenderClientSettings(t *testing.T) {
 	if wp.client.Timeout != 10*time.Second {
 		t.Errorf("timeout %v, want 10 s", wp.client.Timeout)
 	}
+	if wp.transport.TLSHandshakeTimeout != 2*time.Second {
+		t.Errorf("TLS handshake timeout %v, want 2 s (README F08)", wp.transport.TLSHandshakeTimeout)
+	}
 	if err := wp.client.CheckRedirect(nil, nil); !errors.Is(err, http.ErrUseLastResponse) {
 		t.Errorf("CheckRedirect = %v, want http.ErrUseLastResponse", err)
 	}

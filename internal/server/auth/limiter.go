@@ -6,6 +6,8 @@ import (
 	"net/netip"
 	"sync"
 	"time"
+
+	"github.com/MoonWX/isshoni/internal/server/store"
 )
 
 // IPKey is the limiter's key for a client IP (03 §7.3): an IPv4 address (IPv4-mapped IPv6 is unmapped first) as its
@@ -134,7 +136,8 @@ func (l *limiter[K]) window() time.Duration { return time.Duration(l.rate.Burst)
 // take consumes one token for key if there is one. Buckets that count every attempt (auth-ip, register-ip,
 // auth-hash) only take. The buckets of failed password checks (auth-user-ip, auth-user) take the token before the
 // password is hashed and give it back with refund when the attempt was not a failure, so attempts that arrive while
-// earlier ones are still hashing see those in the bucket.
+// earlier ones are still hashing see those in the bucket. The password-change bucket takes its token before the first
+// hash too and gives it back unless the current password was right.
 func (l *limiter[K]) take(key K) verdict {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -277,6 +280,10 @@ var (
 	rateAuthUserIP = rate{Burst: 5, Every: 2 * time.Minute}
 	rateAuthUser   = rate{Burst: 30, Every: 2 * time.Minute}
 	rateRegisterIP = rate{Burst: 5, Every: 12 * time.Minute}
+	// A user's own password changes (README F08): three at once, then one per 10 min. A correct currentPassword
+	// gives the two per-username buckets their tokens back, so without this bucket a member could loop POST
+	// /me/password with the own password and keep every hash slot busy.
+	ratePasswordChange = rate{Burst: 3, Every: 10 * time.Minute}
 	// A blocked attempt logs one warn line per IPKey per minute.
 	rateBlockLog = rate{Burst: 1, Every: time.Minute}
 	// auth.login_failed audit rows: 600 per hour server-wide; beyond that one auth.throttled {scope:"global"} row
@@ -298,6 +305,9 @@ type throttles struct {
 	authUser   *limiter[string]       // from any IP, by username key; known IPs pass
 	registerIP *limiter[netip.Prefix] // sign-ups without an invite, by IPKey
 	authHash   *limiter[struct{}]     // every public request that reaches the hash, server-wide
+	// A user's own password changes, by user ID: the token is taken before the first hash and kept by a change
+	// whose current password was right (changeToken in selfservice.go).
+	passwordChange *limiter[store.UserID]
 
 	blockLog             *limiter[netip.Prefix] // the warn line of a blocked attempt, by IPKey
 	loginFailedAudit     *limiter[struct{}]     // auth.login_failed rows
@@ -316,6 +326,7 @@ func newThrottles(now func() time.Time, hb HashBudget) (*throttles, error) {
 		authUser:             newLimiter[string](rateAuthUser, maxLimiterKeys, now),
 		registerIP:           newLimiter[netip.Prefix](rateRegisterIP, maxLimiterKeys, now),
 		authHash:             newLimiter[struct{}](hashRate, 1, now),
+		passwordChange:       newLimiter[store.UserID](ratePasswordChange, maxLimiterKeys, now),
 		blockLog:             newLimiter[netip.Prefix](rateBlockLog, maxLimiterKeys, now),
 		loginFailedAudit:     newLimiter[struct{}](rateLoginFailedAudit, 1, now),
 		globalThrottledAudit: newLimiter[struct{}](rateGlobalThrottled, 1, now),

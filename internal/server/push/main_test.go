@@ -196,6 +196,7 @@ type fakeSender struct {
 	calls   []sendCall
 	respond func(n int, c sendCall) (SendResult, error) // n counts this subscription's calls from 0
 	hang    bool                                        // Send blocks until its context ends
+	hangIf  func(Subscription) bool                     // ... for these subscriptions only
 	perSub  map[string]int
 }
 
@@ -208,7 +209,7 @@ func (f *fakeSender) Send(ctx context.Context, sub Subscription, payload []byte,
 	}
 	n := f.perSub[sub.ID]
 	f.perSub[sub.ID]++
-	respond, hang := f.respond, f.hang
+	respond, hang := f.respond, f.hang || f.hangIf != nil && f.hangIf(sub)
 	f.mu.Unlock()
 	if hang {
 		<-ctx.Done()

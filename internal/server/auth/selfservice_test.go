@@ -892,3 +892,248 @@ func TestOwnPasswordHashQueueFull(t *testing.T) {
 	close(gate)
 	wg.Wait()
 }
+
+// changesSpent is how many tokens of u's password-change bucket are spent now (0 to its burst of 3).
+func (e *svcEnv) changesSpent(u store.UserID) int {
+	l := e.svc.throttle.passwordChange
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b := l.m[u]
+	if b == nil {
+		return 0
+	}
+	ahead := b.tat.Sub(e.clk.now())
+	if ahead <= 0 {
+		return 0
+	}
+	return int((ahead + l.rate.Every - 1) / l.rate.Every)
+}
+
+// TestChangePasswordBucket is the password-change bucket of 03 §7.3 (README F08, review R2): three changes at once,
+// then one per 10 min, per user. The fourth within 10 minutes is 429 rate_limited and runs no hash, whatever the
+// current password, so a member can't loop POST /me/password with the own password, or with two in turn, and keep
+// the hash slots busy.
+func TestChangePasswordBucket(t *testing.T) {
+	e := newSvcEnv(t)
+	ctx := context.Background()
+	alex, sam := e.addUser("Alex"), e.addUser("Sam")
+	p := principal(e.login("Alex", ipA))
+	e.hashes.Store(0)
+	// Three changes, a minute apart, alternating between two passwords: each runs its two hashes.
+	passwords := []string{testPassword, "password number one", "password number two", testPassword}
+	for i := range 3 {
+		if _, err := e.svc.ChangePassword(ctx, p, passwords[i], passwords[i+1], meta(ipA)); err != nil {
+			t.Fatalf("change %d: %v", i+1, err)
+		}
+		e.advance(time.Minute)
+	}
+	if n, spent := e.hashes.Load(), e.changesSpent(alex.ID); n != 6 || spent != 3 {
+		t.Fatalf("three changes: %d hashes, %d tokens spent; want 6 and 3", n, spent)
+	}
+	changedAt := e.userRow(alex.ID).PasswordChangedAt
+	// The fourth, three minutes after the first: 429 with the wait for the next token (the first's 10 minutes, from
+	// the 3rd minute on), and no hash. A wrong current password is refused the same way: the bucket comes first.
+	e.hashes.Store(0)
+	for _, current := range []string{passwords[3], "not the password"} {
+		_, err := e.svc.ChangePassword(ctx, p, current, "password number three", meta(ipA))
+		if ae := wantCode(t, err, api.CodeRateLimited); ae.RetryAfter != 7*60 {
+			t.Errorf("the 4th change with %q: retryAfter %d, want 420", current, ae.RetryAfter)
+		}
+	}
+	if n, held := e.hashes.Load(), e.heldTokens(); n != 0 || held != [2]int{} {
+		t.Errorf("refused changes: %d hashes, %v keys with tokens taken; want none", n, held)
+	}
+	// A missing current password is still 403 wrong_password: it is answered before the throttle (03 §12.3 #12).
+	_, err := e.svc.ChangePassword(ctx, p, "", "password number three", meta(ipA))
+	wantCode(t, err, api.CodeWrongPassword)
+	// The block is in the log once, with the user's ID and no address.
+	logs := e.logs.String()
+	if n := strings.Count(logs, "password changes throttled"); n != 1 || !strings.Contains(logs, "user_id="+string(alex.ID)) ||
+		strings.Contains(logs, ipA) {
+		t.Errorf("%d warn lines about the throttled changes, want one with the user's ID and no address:\n%s", n, logs)
+	}
+	if u := e.userRow(alex.ID); u == nil || !u.PasswordChangedAt.Equal(changedAt) {
+		t.Errorf("a refused change changed the account: %+v", u)
+	}
+
+	// The bucket is the user's: Sam changes his password at once.
+	ps := principal(e.login("Sam", ipA))
+	if _, err := e.svc.ChangePassword(ctx, ps, testPassword, newPassword, meta(ipA)); err != nil {
+		t.Errorf("another user's change: %v", err)
+	}
+	if spent := e.changesSpent(sam.ID); spent != 1 {
+		t.Errorf("Sam's bucket: %d tokens spent, want 1", spent)
+	}
+
+	// Seven minutes later there is one token, and only one.
+	e.advance(7*time.Minute - time.Second)
+	_, err = e.svc.ChangePassword(ctx, p, passwords[3], "password number three", meta(ipA))
+	wantCode(t, err, api.CodeRateLimited)
+	e.advance(time.Second)
+	if _, err := e.svc.ChangePassword(ctx, p, passwords[3], "password number three", meta(ipA)); err != nil {
+		t.Fatalf("the change 10 minutes after the first: %v", err)
+	}
+	_, err = e.svc.ChangePassword(ctx, p, "password number three", "password number four", meta(ipA))
+	if ae := wantCode(t, err, api.CodeRateLimited); ae.RetryAfter != 600 {
+		t.Errorf("the next change: retryAfter %d, want 600 (one token per 10 minutes once the burst is spent)", ae.RetryAfter)
+	}
+	if n := e.auditCount(auditPasswordChanged); n != 5 {
+		t.Errorf("%d auth.password_changed rows, want 5 (Alex 4, Sam 1)", n)
+	}
+}
+
+// TestChangePasswordBucketInParallel: 20 POST /me/password with the right current password and one cookie, all in
+// flight at once, run at most twice the bucket's burst of hashes. Each takes its token before it hashes, so 17 are
+// 429 at once; the 3 that hash all verified the right password, one of them changes it, and the other two find it
+// changed in their Write (wrong_password) after both hashes, which keep their tokens.
+func TestChangePasswordBucketInParallel(t *testing.T) {
+	e := newSvcEnv(t)
+	alex := e.addUser("Alex")
+	p := principal(e.login("Alex", ipA))
+	gate := make(chan struct{})
+	e.svc.hasher.derive = gatedDerive(&e.hashes, gate)
+	e.hashes.Store(0)
+	const requests, burst = 20, 3
+	errs := make(chan error, requests)
+	for i := range requests {
+		go func() {
+			_, err := e.svc.ChangePassword(context.Background(), p, testPassword, fmt.Sprintf("parallel passphrase %d", i), meta(ipA))
+			errs <- err
+		}()
+	}
+	codes := map[string]int{}
+	count := func(err error) {
+		var ae *api.Error
+		switch {
+		case err == nil:
+			codes["ok"]++
+		case errors.As(err, &ae):
+			codes[ae.Code]++
+		default:
+			t.Errorf("ChangePassword: %v", err)
+		}
+	}
+	// The hashes wait at the gate until every request that could not take a token has its answer.
+	timeout := time.After(10 * time.Second)
+	for range requests - burst {
+		select {
+		case err := <-errs:
+			count(err)
+		case <-timeout:
+			t.Fatalf("answers so far %v, want %d refusals before any hash ends", codes, requests-burst)
+		}
+	}
+	if codes[api.CodeRateLimited] != requests-burst {
+		t.Fatalf("answers before any hash ended: %v, want %d rate_limited", codes, requests-burst)
+	}
+	close(gate)
+	for range burst {
+		count(<-errs)
+	}
+	if n := e.hashes.Load(); n > 2*burst {
+		t.Errorf("%d hashes for %d parallel changes, want at most %d", n, requests, 2*burst)
+	}
+	want := map[string]int{"ok": 1, api.CodeWrongPassword: burst - 1, api.CodeRateLimited: requests - burst}
+	if fmt.Sprint(codes) != fmt.Sprint(want) {
+		t.Errorf("answers %v, want %v", codes, want)
+	}
+	if spent := e.changesSpent(alex.ID); spent != burst {
+		t.Errorf("%d tokens spent, want %d: every request whose current password was right keeps its token", spent, burst)
+	}
+	if n := e.auditCount(auditPasswordChanged); n != 1 {
+		t.Errorf("%d auth.password_changed rows, want 1", n)
+	}
+}
+
+// TestChangePasswordBucketRefunds: what the password-change bucket keeps (README F08). A token is kept by a change
+// whose current password was right, whatever comes after (here a password changed elsewhere in between). Every
+// other end gives it back: a wrong current password, which costs auth-user-ip and auth-user as before; another
+// bucket's 429; a full hash queue (503 server_busy). A current password that can't be one takes none.
+func TestChangePasswordBucketRefunds(t *testing.T) {
+	ctx := context.Background()
+
+	e := newSvcEnv(t)
+	alex := e.addUser("Alex")
+	p := principal(e.login("Alex", ipA))
+	e.hashes.Store(0)
+	for _, current := range []string{"", strings.Repeat("x", passwordMaxBytes+1)} {
+		_, err := e.svc.ChangePassword(ctx, p, current, newPassword, meta(ipA))
+		wantCode(t, err, api.CodeWrongPassword)
+	}
+	if n, spent := e.hashes.Load(), e.changesSpent(alex.ID); n != 0 || spent != 0 {
+		t.Errorf("impossible current passwords: %d hashes, %d tokens spent; want none", n, spent)
+	}
+	// Wrong current passwords: one hash and a token of each per-username bucket each, as before, and none of the
+	// password-change bucket. Five of them from one address block it (429 from auth-user-ip, retryAfter 120), and
+	// that refusal gives the change token back too.
+	for i := range 5 {
+		_, err := e.svc.ChangePassword(ctx, p, fmt.Sprintf("guess number %d", i), newPassword, meta(ipA))
+		wantCode(t, err, api.CodeWrongPassword)
+		if held, spent := e.heldTokens(), e.changesSpent(alex.ID); held != [2]int{1, 1} || spent != 0 {
+			t.Fatalf("after wrong password %d: %v keys with failure tokens, %d change tokens spent; want [1 1] and 0",
+				i+1, held, spent)
+		}
+	}
+	_, err := e.svc.ChangePassword(ctx, p, testPassword, newPassword, meta(ipA))
+	if ae := wantCode(t, err, api.CodeRateLimited); ae.RetryAfter != 120 {
+		t.Errorf("the blocked address: retryAfter %d, want auth-user-ip's 120", ae.RetryAfter)
+	}
+	if n, spent := e.hashes.Load(), e.changesSpent(alex.ID); n != 5 || spent != 0 {
+		t.Errorf("5 wrong passwords and a blocked attempt: %d hashes, %d change tokens spent; want 5 and 0", n, spent)
+	}
+
+	// A full hash queue: 503 server_busy, and no bucket keeps a token.
+	e = newSvcEnv(t)
+	alex = e.addUser("Alex")
+	p = principal(e.login("Alex", ipA))
+	gate := make(chan struct{})
+	var maxInFlight atomic.Int32
+	h := blockingHasher(t, 1, gate, &maxInFlight)
+	e.svc.hasher = h
+	var wg sync.WaitGroup
+	for range 1 + maxHashWaiters {
+		wg.Go(func() { _, _ = h.hash(context.Background(), "a long enough password") })
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for h.waiting.Load() != maxHashWaiters {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d callers wait for the hash slot, want %d", h.waiting.Load(), maxHashWaiters)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	for range 4 { // more than the burst: none of them spends a token
+		_, err = e.svc.ChangePassword(ctx, p, testPassword, newPassword, meta(ipA))
+		wantCode(t, err, api.CodeServerBusy)
+	}
+	if spent, held := e.changesSpent(alex.ID), e.heldTokens(); spent != 0 || held != [2]int{} {
+		t.Errorf("changes that never hashed: %d change tokens spent, %v keys with failure tokens; want none", spent, held)
+	}
+	close(gate)
+	wg.Wait()
+
+	// A right current password keeps the token, also when the change then fails: here the password was changed
+	// elsewhere while it was being verified, so the Write answers wrong_password after both hashes.
+	e = newSvcEnv(t)
+	alex = e.addUser("Alex")
+	p = principal(e.login("Alex", ipA))
+	e.changeDuringCheck(func(q *store.Q, now time.Time) error {
+		return q.SetPasswordHash(alex.ID, strings.Replace(alex.PasswordHash, "$m=64", "$m=65", 1), now)
+	})
+	_, err = e.svc.ChangePassword(ctx, p, testPassword, newPassword, meta(ipA))
+	wantCode(t, err, api.CodeWrongPassword)
+	if spent := e.changesSpent(alex.ID); spent != 1 {
+		t.Errorf("a change that ran its hashes: %d tokens spent, want 1", spent)
+	}
+
+	// Deleting the account is no password change: its re-authentication takes no token of that bucket.
+	e = newSvcEnv(t)
+	alex = e.addUser("Alex")
+	p = principal(e.login("Alex", ipA))
+	wantCode(t, e.svc.DeleteSelf(ctx, p, "not the password", meta(ipA)), api.CodeWrongPassword)
+	if err := e.svc.DeleteSelf(ctx, p, testPassword, meta(ipA)); err != nil {
+		t.Fatal(err)
+	}
+	if spent := e.changesSpent(alex.ID); spent != 0 {
+		t.Errorf("DeleteSelf spent %d password-change tokens, want 0", spent)
+	}
+}
