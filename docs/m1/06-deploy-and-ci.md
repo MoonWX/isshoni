@@ -813,10 +813,9 @@ If isshoni was installed from a package, both refuse and print `apt remove issho
   (`ProtectSystem=` and the rest are mount namespaces). Without it systemd skips the sandbox ("namespace setup is
   prohibited (container manager?)"), and with it the `StateDirectory=` bind mount, so the server, which sees a
   Podman container (`/run/.containerenv`), refuses `/var/lib/isshoni` as not a mounted volume (exit 78, 04 §5.1).
-  A privileged Docker container never met this. `distro-test.sh`'s podman path has no `--cap-add` yet, so its C1
-  would meet the same refusal; CI doesn't take that path (the bullet above). **How a rootless container reaches
-  `relserve`**: through
-  slirp4netns, which connects from the runner to the runner's own address, the one podman puts into the
+  A privileged Docker container never met this; `distro-test.sh`'s podman path gives the capability too (the next
+  bullet). **How a rootless container reaches `relserve`**: through slirp4netns, which connects from the runner to
+  the runner's own address, the one podman puts into the
   container's `/etc/hosts` as `host.containers.internal` (a name in relserve's certificate). So `relserve` listens
   on every address, and the installer's base is `https://host.containers.internal:<port>`. The runner's loopback
   address is not reachable that way (with `allow_host_loopback=true` too, podman 4.9 maps the name to the runner's
@@ -840,6 +839,29 @@ If isshoni was installed from a package, both refuse and print `apt remove issho
   both bases, and without `dbus-user-session` the step fails with its own error. The release dry run on the runner
   is what shows it there: its log says whether the runner had a session already (the step prints `linger` and the
   cgroup manager) and where the container reached `relserve`.
+- **`distro-test.sh`'s podman path, as README F16 built it** (review F09-R4): the containers start with
+  `podman run -d --systemd=always --cap-add=SYS_ADMIN --cap-add=SYS_PTRACE`, with no `--privileged` except V3's
+  firewall container, which has all privileges as before. **`CAP_SYS_ADMIN`** is the one `verify` gives, for the
+  unit's sandbox (the bullet above): without it C1 fails, as the server refuses `/var/lib/isshoni` with exit 78
+  and the installer exits 5. **`CAP_SYS_PTRACE`** is for C4, which `verify` doesn't run: `ss -p` names the
+  program behind another user's socket only with it, and the installer's port check (4.9) takes a listener without
+  a name for another program's, so the upgrade would exit 7 on port 8080, which the running isshoni holds. A
+  machine's root has both. Under rootless podman they are the container's, in its own user namespace, and give
+  nothing on the machine; under rootful podman they are the machine's, still less than the Docker path's
+  `--privileged`. **What the script leaves to the caller**: rootless podman needs the caller's systemd user
+  session, as `verify` sets it up (the bullet above): a login, or lingering with `XDG_RUNTIME_DIR` and
+  `DBUS_SESSION_BUS_ADDRESS` pointing at it, so that `podman info --format '{{.Host.CgroupManager}}'` says
+  `systemd`. Without it podman falls back to cgroupfs, and the run fails: at its wait for systemd, which doesn't
+  come up in the container, or already at `podman build` (the bullet above). The network is podman's default: on
+  Linux, where `relserve` listens on every address, slirp4netns under podman 4.9 and pasta under podman 5.8 both
+  give the container a `host.containers.internal` that reaches it. F16 checked it rootless, as a user with
+  lingering and no login, in privileged Docker containers that stood in for a Linux machine. With podman 4.9.3
+  (Ubuntu 24.04, slirp4netns) the parts `main`, `c7`, `c13` and `c11` passed on debian-12 and ubuntu-24.04 (246
+  checks), and `v3` on ubuntu-24.04 (ufw, 8); with podman 5.8.7 (Fedora 44, pasta) the same four parts passed on
+  debian-12 and fedora-44 (246). Without the capabilities, C1 failed as above (podman 4.9.3); with `SYS_ADMIN`
+  alone, C4 failed with exit 7, and C5 after it (both versions); with no user session (podman 5.8.7 on cgroupfs)
+  the run stopped at the wait for systemd. Podman on macOS (`podman machine`) was not tried. CI still doesn't take this
+  path (the S78 bullet above).
 - `tools/relserve` serves a locally built, test-signed release over HTTPS (section 11.2).
 
 **VMs** (`deploy/test/vm/`):
