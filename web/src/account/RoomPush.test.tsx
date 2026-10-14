@@ -311,6 +311,17 @@ describe('the push state on the room page', () => {
     expect(push.status).toHaveBeenCalledTimes(1);
   });
 
+  it('asks again when the room is mounted again: a sign-in in the same page re-posts (03 §12.4.6)', async () => {
+    const push = fakePush('supported', 'on');
+    const app = await openRoom(platformFor(UA.chromeMac, push));
+    expect(push.status).toHaveBeenCalledTimes(1);
+    // Signed out (or the session was revoked) and in again: a navigation away from the room and back, no reload.
+    app.unmount();
+    renderRoomApp(h.services, '/r/lounge');
+    await advance();
+    expect(push.status).toHaveBeenCalledTimes(2);
+  });
+
   it('follows a click on a notification inside the app: the room and the share of its link', async () => {
     const container = Object.assign(new EventTarget(), {
       getRegistration: () => Promise.resolve(undefined),

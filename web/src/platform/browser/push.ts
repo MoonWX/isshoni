@@ -9,8 +9,10 @@
 // - `supported`: everything is there.
 //
 // The device decides alone where it can: a browser that can't do push asks the server nothing. A server that
-// couldn't be asked counts as one with push (support() never rejects: BrowserPlatform.capabilities() waits for it);
-// enable() then asks again and fails with the real reason. The answer of /info is kept for INFO_MAX_AGE_MS.
+// couldn't be asked counts as one with push, and so does one that hasn't answered within INFO_WAIT_MS: support()
+// never rejects and never waits longer than that, because BrowserPlatform.capabilities() waits for it (and the
+// stage's controls wait for capabilities()). enable() then asks again and fails with the real reason. The answer of
+// /info is kept for INFO_MAX_AGE_MS.
 //
 // - enable(), from a click: Notification.requestPermission() first, in the click's turn (Safari only asks within
 //   the user activation); then the VAPID key from a fresh /info (`push.vapidPublicKey`), pushManager.subscribe()
@@ -19,18 +21,24 @@
 //   user blocked it. A subscription the server refused is taken back, so status() and the server agree.
 // - disable(): POST /api/v1/push/unsubscribe {endpoint}, then PushSubscription.unsubscribe(). A 401 (signed out)
 //   doesn't keep the subscription: the server dropped it with the session (03).
-// - test(): POST /api/v1/push/test (this browser's subscriptions; 1 per 10 s).
-// - status(): 'on' while permission is granted and the worker has a subscription. The first call of a page's life
-//   also does the start-up re-post of 05 §16.3: the subscription goes to the server again (the server binds it to
-//   this session, 03 §12.4.6), and is replaced first when its key isn't /info's (after `rotate-secrets
-//   --include-vapid`). The SPA calls status() only on pages under RequireAuth, once GET /api/v1/me has succeeded
-//   (the room page asks at once, for its notifications card), so logged-out pages never call the push endpoints.
+// - test(): POST /api/v1/push/test (this browser's subscriptions; 1 per 10 s). A 404 means the server has no
+//   subscription of this session (it went with an older session, or was evicted): the subscription is posted again
+//   and the test tried once more.
+// - status(): 'on' while permission is granted and the worker has a subscription. Every such call also does the
+//   start-up re-post of 05 §16.3: the subscription goes to the server again (the server upserts it by endpoint and
+//   binds it to this session, 03 §12.4.6), and is replaced first when its key isn't /info's (after `rotate-secrets
+//   --include-vapid`). There is no once-per-page latch: a login, a logout and a revoked session are navigations
+//   inside the page, and the new session needs the post as much as the first one did (03 §12.4.6 "keeps the
+//   binding current after re-logins"; 05 §16.3: after a 401 in the worker, "the page re-posts after the next
+//   login"). The SPA calls status() only on pages under RequireAuth, once GET /api/v1/me has succeeded (the room
+//   page and the notifications page, on every mount), so logged-out pages never call the push endpoints.
 //
 // A click on a notification (sw/worker.ts) focuses an open window and posts {type: 'open', url} to it. The provider
 // hears it: onNotificationOpen()'s latest handler navigates inside the SPA (the room page registers the router's
 // navigate), else the page goes to the URL with a full navigation. The URL is checked again: this origin only.
 import { createLogger } from '../../lib/log';
 import {
+  CodeNotFound,
   CodePushUnavailable,
   type Info,
   type PushSubscribeRequest,
@@ -43,8 +51,10 @@ import { deviceEnv, isIOSDevice, isStandalone, type DeviceEnv } from './device';
 
 const log = createLogger('push');
 
-/** How long an answer of GET /api/v1/info counts for support(). enable() and the start-up re-post ask again. */
+/** How long an answer of GET /api/v1/info counts for support() and the start-up re-post. enable() asks again. */
 export const INFO_MAX_AGE_MS = 5 * 60_000;
+/** How long support() waits for /info; a server that hasn't answered by then counts as one with push. */
+export const INFO_WAIT_MS = 3_000;
 /** How long enable() waits for an active service worker (a first visit installs it after the first render). */
 export const READY_TIMEOUT_MS = 10_000;
 
@@ -103,6 +113,8 @@ export interface BrowserNotificationsOptions {
   now?: () => number;
   /** Default: READY_TIMEOUT_MS. */
   readyTimeoutMs?: number;
+  /** Default: INFO_WAIT_MS. */
+  infoWaitMs?: number;
 }
 
 function browserServiceWorker(): ServiceWorkerContainer | null {
@@ -204,13 +216,12 @@ export class BrowserNotifications implements NotificationsProvider {
   readonly #assign: (url: string) => void;
   readonly #now: () => number;
   readonly #readyTimeoutMs: number;
+  readonly #infoWaitMs: number;
   readonly #cleanup: (() => void)[] = [];
 
   /** The latest answer of /info: the VAPID key, or null for a server without push. */
   #info: { at: number; key: string | null } | null = null;
   #infoLoad: Promise<string | null> | null = null;
-  /** The start-up re-post succeeded (or enable() posted): later status() calls only read. */
-  #synced = false;
   /** enable(), disable() and status() run one at a time: none of them sees another's half-done subscription. */
   #queue: Promise<unknown> = Promise.resolve();
 
@@ -228,6 +239,7 @@ export class BrowserNotifications implements NotificationsProvider {
       });
     this.#now = opts.now ?? Date.now;
     this.#readyTimeoutMs = opts.readyTimeoutMs ?? READY_TIMEOUT_MS;
+    this.#infoWaitMs = opts.infoWaitMs ?? INFO_WAIT_MS;
 
     const sw = this.#sw;
     if (sw) {
@@ -249,11 +261,21 @@ export class BrowserNotifications implements NotificationsProvider {
     const ios = isIOSDevice(this.#env) && !isStandalone(this.#env);
     if (!ios && !this.#browserCan()) return 'unsupported';
     let key: string | null | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<undefined>((resolve) => {
+      timer = setTimeout(() => {
+        log.debug('GET /api/v1/info is slow; push counts as there');
+        resolve(undefined);
+      }, this.#infoWaitMs);
+    });
     try {
-      key = await this.#serverKey(INFO_MAX_AGE_MS);
+      // The read goes on after a timeout: its answer fills the cache for the next call and the re-post.
+      key = await Promise.race([this.#serverKey(INFO_MAX_AGE_MS), late]);
     } catch (err) {
       log.debug('GET /api/v1/info failed; push counts as there', { error: err });
       key = undefined;
+    } finally {
+      clearTimeout(timer);
     }
     if (key === null) return 'unsupported';
     if (ios) return 'needs-install';
@@ -289,7 +311,6 @@ export class BrowserNotifications implements NotificationsProvider {
         await sub.unsubscribe().catch(() => false);
         throw err;
       }
-      this.#synced = true;
     });
   }
 
@@ -307,7 +328,15 @@ export class BrowserNotifications implements NotificationsProvider {
   }
 
   async test(): Promise<void> {
-    await this.#api('POST', PUSH_TEST_PATH);
+    try {
+      await this.#api('POST', PUSH_TEST_PATH);
+    } catch (err) {
+      // 404: the server has no subscription of this session (03 §12.4.6). The 404 comes before the rate limit, so
+      // the second try after the re-post isn't refused for being the second.
+      if (!(err instanceof ApiError && err.code === CodeNotFound)) throw err;
+      if ((await this.status()) !== 'on') throw err;
+      await this.#api('POST', PUSH_TEST_PATH);
+    }
   }
 
   /** Stops listening for notification clicks (tests; a page keeps its provider). */
@@ -407,19 +436,20 @@ export class BrowserNotifications implements NotificationsProvider {
   async #status(): Promise<'on' | 'off'> {
     if (!this.#browserCan() || this.#notification?.permission !== 'granted') return 'off';
     let sub = await this.#subscription();
-    if (sub && !this.#synced) sub = await this.#resync(sub);
+    if (sub) sub = await this.#resync(sub);
     return sub ? 'on' : 'off';
   }
 
   /**
    * The start-up re-post (05 §16.3): post the subscription again, after replacing it when /info has another key.
-   * A failure is logged and tried again at the next status(); the subscription stays. Returns the subscription the
-   * browser has afterwards (null when a replacement failed half-way).
+   * The key needs to be only as fresh as one app start, so support()'s answer of a moment ago does. A failure is
+   * logged and tried again at the next status(); the subscription stays. Returns the subscription the browser has
+   * afterwards (null when a replacement failed half-way).
    */
   async #resync(sub: PushSubscription): Promise<PushSubscription | null> {
     let key: string | null;
     try {
-      key = await this.#serverKey(0);
+      key = await this.#serverKey(INFO_MAX_AGE_MS);
     } catch (err) {
       log.info('the push subscription was not re-posted: /info failed', { error: err });
       return sub;
@@ -437,7 +467,6 @@ export class BrowserNotifications implements NotificationsProvider {
         if (!current) return null;
       }
       await this.#post(current);
-      this.#synced = true;
     } catch (err) {
       if (isSignedOutError(err)) return current; // logged out meanwhile: the next sign-in's page posts it
       log.warn('the push subscription was not re-posted', { error: err });

@@ -248,6 +248,18 @@ describe('notificationFor: the texts of each type', () => {
     expect(n.options.body).toBe(`Made an admin by ${name}.`);
   });
 
+  // The CLI's actor reads "the server's command line" (lower case: it sits mid-sentence), and the CLI does raise
+  // alerts (`isshoni admin users reset-password` raises admin_password_reset): no text may start with it.
+  it.each(ALERT_KINDS)('admin.alert %s raised from the CLI starts its lines with a capital or a number', (kind) => {
+    const n = notificationFor(
+      adminAlert(kind, { actor: 'cli', target: kind === 'transfer_threshold' ? '80' : 'Kim' }),
+      strings,
+    );
+    expect(n.title).not.toBe(en.push.generic.title);
+    expect(n.title).toMatch(/^[\p{Lu}\d]/u);
+    expect(n.options.body).toMatch(/^[\p{Lu}\d]/u);
+  });
+
   it('keeps a name as it is: a notification is plain text', () => {
     const n = notificationFor({ ...SHARE_STARTED, user: { id: 'u', name: '<b>&amp;{{room}}' } }, strings);
     expect(n.title).toBe('<b>&amp;{{room}} started sharing');

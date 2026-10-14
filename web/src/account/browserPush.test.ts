@@ -1,14 +1,17 @@
-// The browser's NotificationsProvider (05 §16.3) against fakes of the service worker container, the Push API, the
-// Notification API and REST: the support states, the start-up re-post, enable/disable/test, and notification clicks.
+// The browser's NotificationsProvider (platform/browser/push.ts, 05 §16.3) against fakes of the service worker
+// container, the Push API, the Notification API and REST: the support states, the start-up re-post,
+// enable/disable/test, and notification clicks. The test lives in account/, the folder of the slice that wrote the
+// provider (S77), as S35's tests of its platform/browser files live in share/ (05 §3).
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { Info } from '../../protocol/api.gen';
-import { api as restApi, ApiError, NetworkError } from '../../protocol/rest';
-import type { DeviceEnv } from './device';
+import type { Info } from '../protocol/api.gen';
+import { api as restApi, ApiError, NetworkError } from '../protocol/rest';
+import type { DeviceEnv } from '../platform/browser/device';
 import {
   base64UrlBytes,
   BrowserNotifications,
   INFO_MAX_AGE_MS,
+  INFO_WAIT_MS,
   onNotificationOpen,
   openRequest,
   PUSH_SUBSCRIPTIONS_PATH,
@@ -18,7 +21,7 @@ import {
   subscribeRequest,
   type BrowserNotificationsOptions,
   type NotificationApi,
-} from './push';
+} from '../platform/browser/push';
 
 const ORIGIN = 'https://isshoni.test';
 /** A VAPID public key: 65 bytes, 0x04 first, base64url without padding (as 04 writes it). */
@@ -131,14 +134,18 @@ interface Call {
   body: unknown;
 }
 
-/** REST answered from a table; every call is recorded. */
-function fakeApi(answers: { info?: Partial<Info> | Error; fail?: Partial<Record<string, Error>> } = {}) {
+/**
+ * REST answered from a table; every call is recorded. `info: 'never'` is a server that never answers /info; `fail`
+ * may be changed between calls.
+ */
+function fakeApi(answers: { info?: Partial<Info> | Error | 'never'; fail?: Partial<Record<string, Error>> } = {}) {
   const calls: Call[] = [];
   const fn = (method: string, path: string, body?: unknown): Promise<unknown> => {
     calls.push({ method, path, body });
     const failure = answers.fail?.[path];
     if (failure) return Promise.reject(failure);
     if (path === '/api/v1/info') {
+      if (answers.info === 'never') return new Promise(() => undefined);
       if (answers.info instanceof Error) return Promise.reject(answers.info);
       return Promise.resolve({ setupRequired: false, push: { vapidPublicKey: KEY }, ...answers.info });
     }
@@ -229,6 +236,24 @@ describe('support() (05 §16.3)', () => {
     await expect(provider({ api: rest.api }).support()).resolves.toBe('supported');
   });
 
+  it(`waits at most ${String(INFO_WAIT_MS / 1000)} s for /info, then counts the server as one with push`, async () => {
+    vi.useFakeTimers();
+    const rest = fakeApi({ info: 'never' });
+    const p = provider({ api: rest.api });
+    let answer: string | undefined;
+    void p.support().then((s) => {
+      answer = s;
+    });
+    await vi.advanceTimersByTimeAsync(INFO_WAIT_MS - 1);
+    expect(answer).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(answer).toBe('supported');
+    // The read that is still out is shared, not asked again.
+    void p.support();
+    await vi.advanceTimersByTimeAsync(INFO_WAIT_MS);
+    expect(rest.calls).toHaveLength(1);
+  });
+
   it(`keeps the answer of /info for ${String(INFO_MAX_AGE_MS / 60_000)} minutes`, async () => {
     let now = 1_000_000;
     const rest = fakeApi();
@@ -267,20 +292,31 @@ describe('status() and the start-up re-post (05 §16.3, 03 §12.4.6)', () => {
     await expect(p.status()).resolves.toBe('off');
   });
 
-  it('posts the subscription again at its first call, then only reads', async () => {
+  it('posts the subscription again at every call: a later one may be a new session of the same page', async () => {
     const rest = fakeApi();
     registration.current = new FakeSubscription('https://push.example/a', KEY_BYTES);
     const p = provider({ api: rest.api, notification: fakeNotification('granted') });
     await expect(p.status()).resolves.toBe('on');
     await expect(p.status()).resolves.toBe('on');
-    expect(rest.posts()).toEqual([
-      {
-        method: 'POST',
-        path: PUSH_SUBSCRIPTIONS_PATH,
-        body: { endpoint: 'https://push.example/a', keys: { p256dh: 'BPd', auth: 'au' } },
-      },
-    ]);
+    const post = {
+      method: 'POST',
+      path: PUSH_SUBSCRIPTIONS_PATH,
+      body: { endpoint: 'https://push.example/a', keys: { p256dh: 'BPd', auth: 'au' } },
+    };
+    expect(rest.posts()).toEqual([post, post]);
     expect(registration.subscribes).toEqual([]);
+  });
+
+  it('takes the key from support()’s answer of a moment ago: one /info for a room’s start', async () => {
+    const rest = fakeApi();
+    registration.current = new FakeSubscription('https://push.example/a', KEY_BYTES);
+    const p = provider({ api: rest.api, notification: fakeNotification('granted') });
+    await expect(p.support()).resolves.toBe('supported');
+    await expect(p.status()).resolves.toBe('on');
+    expect(rest.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      'GET /api/v1/info',
+      `POST ${PUSH_SUBSCRIPTIONS_PATH}`,
+    ]);
   });
 
   it('subscribes again with the new key when /info has another one (rotate-secrets --include-vapid)', async () => {
@@ -313,25 +349,59 @@ describe('status() and the start-up re-post (05 §16.3, 03 §12.4.6)', () => {
     expect(registration.current.unsubscribed).toBe(0);
   });
 
-  it.each([
-    ['a failed post', { fail: { [PUSH_SUBSCRIPTIONS_PATH]: new ApiError({ status: 503, code: 'server_busy' }) } }],
-    ['a failed /info', { info: new NetworkError() }],
-  ])('tries again at the next call after %s', async (_name, answers) => {
+  it('tries again at the next call after a failed post', async () => {
+    const fail: Partial<Record<string, Error>> = {
+      [PUSH_SUBSCRIPTIONS_PATH]: new ApiError({ status: 503, code: 'server_busy' }),
+    };
+    const rest = fakeApi({ fail });
+    registration.current = new FakeSubscription('https://push.example/a', KEY_BYTES);
+    const p = provider({ api: rest.api, notification: fakeNotification('granted') });
+    await expect(p.status()).resolves.toBe('on');
+    fail[PUSH_SUBSCRIPTIONS_PATH] = undefined;
+    await expect(p.status()).resolves.toBe('on');
+    expect(rest.posts().map((c) => c.path)).toEqual([PUSH_SUBSCRIPTIONS_PATH, PUSH_SUBSCRIPTIONS_PATH]);
+  });
+
+  it('tries again at the next call after a failed /info, asking /info again', async () => {
+    const answers: { info?: Error } = { info: new NetworkError() };
     const rest = fakeApi(answers);
     registration.current = new FakeSubscription('https://push.example/a', KEY_BYTES);
     const p = provider({ api: rest.api, notification: fakeNotification('granted') });
     await expect(p.status()).resolves.toBe('on');
+    expect(rest.posts()).toEqual([]);
+    delete answers.info;
     await expect(p.status()).resolves.toBe('on');
     expect(rest.calls.filter((c) => c.path === '/api/v1/info')).toHaveLength(2);
+    expect(rest.posts().map((c) => c.path)).toEqual([PUSH_SUBSCRIPTIONS_PATH]);
   });
 
-  it('takes a 401 calmly: the page posts again after the next sign-in', async () => {
-    const rest = fakeApi({
-      fail: { [PUSH_SUBSCRIPTIONS_PATH]: new ApiError({ status: 401, code: 'unauthenticated' }) },
-    });
+  it('takes a 401 calmly, and posts again after the next sign-in in the same page', async () => {
+    const fail: Partial<Record<string, Error>> = {
+      [PUSH_SUBSCRIPTIONS_PATH]: new ApiError({ status: 401, code: 'unauthenticated' }),
+    };
+    const rest = fakeApi({ fail });
     registration.current = new FakeSubscription('https://push.example/a', KEY_BYTES);
     const p = provider({ api: rest.api, notification: fakeNotification('granted') });
     await expect(p.status()).resolves.toBe('on');
+    // Signed in again (no reload): the next signed-in page's status() posts the subscription for the new session.
+    fail[PUSH_SUBSCRIPTIONS_PATH] = undefined;
+    await expect(p.status()).resolves.toBe('on');
+    expect(rest.posts().map((c) => c.path)).toEqual([PUSH_SUBSCRIPTIONS_PATH, PUSH_SUBSCRIPTIONS_PATH]);
+    expect(registration.current.unsubscribed).toBe(0);
+  });
+
+  it('posts the endpoint the worker made after a pushsubscriptionchange whose own post got a 401', async () => {
+    const rest = fakeApi();
+    registration.current = new FakeSubscription('https://push.example/a', KEY_BYTES);
+    const p = provider({ api: rest.api, notification: fakeNotification('granted') });
+    await expect(p.status()).resolves.toBe('on');
+    // The browser changed the subscription while signed out; the worker's post was refused (05 §16.3).
+    registration.current = new FakeSubscription('https://push.example/b', KEY_BYTES);
+    await expect(p.status()).resolves.toBe('on');
+    expect(rest.posts().map((c) => (c.body as { endpoint: string }).endpoint)).toEqual([
+      'https://push.example/a',
+      'https://push.example/b',
+    ]);
   });
 });
 
@@ -361,9 +431,12 @@ describe('enable() (05 §16.3)', () => {
         body: { endpoint: 'https://push.example/sub/1', keys: { p256dh: 'BPd', auth: 'au' } },
       },
     ]);
-    // On now, and the start-up re-post is done: status() posts nothing more.
+    // On now. The read that follows posts the same subscription again (the server upserts it), and subscribes
+    // nothing new.
     await expect(p.status()).resolves.toBe('on');
-    expect(rest.posts()).toHaveLength(1);
+    expect(rest.posts()).toHaveLength(2);
+    expect(rest.posts()[1]?.body).toEqual(rest.posts()[0]?.body);
+    expect(registration.subscribes).toHaveLength(1);
   });
 
   it.each([['denied'], ['default']] as const)('resolves without subscribing when the answer is %s', async (answer) => {
@@ -485,6 +558,49 @@ describe('disable() and test()', () => {
     expect(rest.posts()).toEqual([{ method: 'POST', path: PUSH_TEST_PATH, body: undefined }]);
     const limited = new ApiError({ status: 429, code: 'rate_limited', retryAfterSec: 7 });
     await expect(provider({ api: fakeApi({ fail: { [PUSH_TEST_PATH]: limited } }).api }).test()).rejects.toBe(limited);
+  });
+
+  describe('test() when the server has no subscription of this session (404 not_found)', () => {
+    /** A server whose answer to a test is 404 until this session posts a subscription (03 §12.4.6). */
+    function serverWithoutRow() {
+      const notFound = new ApiError({ status: 404, code: 'not_found' });
+      const fail: Partial<Record<string, Error>> = { [PUSH_TEST_PATH]: notFound };
+      const rest = fakeApi({ fail });
+      const api = (async (...args: Parameters<typeof restApi>) => {
+        const out: unknown = await rest.api(...args);
+        const [, path] = args;
+        if (path === PUSH_SUBSCRIPTIONS_PATH) fail[PUSH_TEST_PATH] = undefined;
+        return out;
+      }) as typeof restApi;
+      return { notFound, fail, rest, api };
+    }
+
+    it('posts the subscription again and tries once more', async () => {
+      const server = serverWithoutRow();
+      registration.current = new FakeSubscription('https://push.example/a', KEY_BYTES);
+      await provider({ api: server.api, notification: fakeNotification('granted') }).test();
+      expect(server.rest.posts().map((c) => c.path)).toEqual([PUSH_TEST_PATH, PUSH_SUBSCRIPTIONS_PATH, PUSH_TEST_PATH]);
+    });
+
+    it.each([
+      ['there is no subscription to post', null, 'granted'],
+      ['the permission is gone', 'https://push.example/a', 'default'],
+    ] as const)('passes the 404 on when %s', async (_name, endpoint, permission) => {
+      const server = serverWithoutRow();
+      registration.current = endpoint === null ? null : new FakeSubscription(endpoint, KEY_BYTES);
+      const p = provider({ api: server.api, notification: fakeNotification(permission) });
+      await expect(p.test()).rejects.toBe(server.notFound);
+      expect(server.rest.posts().map((c) => c.path)).toEqual([PUSH_TEST_PATH]);
+    });
+
+    it('passes the second 404 on when the post did not help', async () => {
+      const server = serverWithoutRow();
+      server.fail[PUSH_SUBSCRIPTIONS_PATH] = new ApiError({ status: 503, code: 'server_busy' });
+      registration.current = new FakeSubscription('https://push.example/a', KEY_BYTES);
+      const p = provider({ api: server.api, notification: fakeNotification('granted') });
+      await expect(p.test()).rejects.toBe(server.notFound);
+      expect(server.rest.posts().map((c) => c.path)).toEqual([PUSH_TEST_PATH, PUSH_SUBSCRIPTIONS_PATH, PUSH_TEST_PATH]);
+    });
   });
 });
 

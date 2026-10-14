@@ -6,9 +6,11 @@
 // push reads the same store, so the card in the room and the page's switch never disagree, and an action in one is
 // seen by the other at once.
 //
-// status() is asked only on pages under RequireAuth (the room page, the account pages): its first call of a page's
-// life is the provider's start-up re-post of the subscription (05 §16.3, platform/browser/push.ts), which logged-out
-// pages must never make.
+// status() is asked only on pages under RequireAuth (the room page, the account pages): each call is also the
+// provider's start-up re-post of the subscription (05 §16.3, platform/browser/push.ts), which logged-out pages must
+// never make. The room page and the notifications page read again on every mount, not once per page life: a login
+// after a logout or a revoked session happens inside the same page, and the new session needs the re-post too
+// (03 §12.4.6).
 //
 // The one-time prompts keep their dismissals in prefsStore (`dismissed`, per device): the room's card for 30 days,
 // the iOS Home Screen sheet for 14, the first-launch offer of an iOS Home Screen app for good.
@@ -160,7 +162,10 @@ export function pushErrorMessage(err: unknown, t: TFunction): string {
   return t('account.push.setupFailed');
 }
 
-/** The page's push state; the first reader of a page's life asks the platform. */
+/**
+ * The page's push state; the first reader of a page's life asks the platform. A page that needs a fresh read (and
+ * with it the re-post) on every visit calls refresh() when it mounts, as the room page and the notifications page do.
+ */
 export function usePush(): PushState & PushActions {
   const { platform } = useApp();
   const store = pushStore(platform);

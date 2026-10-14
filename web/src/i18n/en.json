@@ -498,11 +498,11 @@
       },
       "admin_password_reset": {
         "title": "Password reset for an admin",
-        "body": "{{actor}} made a reset link for {{target}}."
+        "body": "A reset link for {{target}} was made by {{actor}}."
       },
       "registration_mode_changed": {
         "title": "Sign-up rules changed",
-        "body": "{{actor}} changed who can create an account."
+        "body": "Who can create an account was changed by {{actor}}."
       },
       "secrets_rotated": {
         "title": "Server keys changed",

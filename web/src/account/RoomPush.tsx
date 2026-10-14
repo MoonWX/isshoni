@@ -1,9 +1,10 @@
 // Web Push on the room page (05 §11.2, §16.3): a lazy chunk that rooms/ loads through roomPushSlots.tsx, so the
 // room's own chunk doesn't carry it, and with it the `account` namespace (05 §16.5).
 //
-// - RoomPushPrompts (mounted with the page): reads this device's push state, whose first status() is the start-up
-//   re-post of the subscription (pushState.ts); counts the time the page is watched; lets a click on a
-//   notification navigate inside the app (useNotificationOpen.ts); and shows the iOS sheet:
+// - RoomPushPrompts (mounted with the page): reads this device's push state again on every mount, and with it does
+//   the start-up re-post of the subscription (pushState.ts: also after a login in the same page, which mounts the
+//   room again); counts the time the page is watched; lets a click on a notification navigate inside the app
+//   (useNotificationOpen.ts); and shows the iOS sheet:
 //   - in a Safari tab (`needs-install`): the Home Screen steps, at most every 14 days;
 //   - on the first launch of the Home Screen app, where push works: "Turn on notifications?", once.
 // - NotificationsCard (in the stage's empty state, "Nobody is sharing yet."): after 3 minutes of watching, "Get a
@@ -110,7 +111,12 @@ function isIOSApp(platform: Platform): boolean {
 /** Mounted with the room page: the push state, the watch time, notification clicks, the iOS sheet. */
 export function RoomPushPrompts() {
   const { platform } = useApp();
-  usePush();
+  const { refresh } = usePush();
+  // Every visit to the room: a new session (a login in this page after a logout or a revoked session) gets the
+  // subscription posted again (03 §12.4.6). A read that is running already is shared.
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
   useNotificationOpen();
   useVisibleFor(CARD_AFTER_MS, () => {
     watchedStore(platform).setState({ watched: true });
