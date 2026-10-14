@@ -22,6 +22,7 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/netx"
 	"github.com/MoonWX/isshoni/internal/server/ops"
 	"github.com/MoonWX/isshoni/internal/server/ops/doctor"
+	"github.com/MoonWX/isshoni/internal/server/push"
 	"github.com/MoonWX/isshoni/internal/server/sfu"
 	"github.com/MoonWX/isshoni/internal/server/sfuplane"
 	"github.com/MoonWX/isshoni/internal/server/signal"
@@ -30,34 +31,38 @@ import (
 )
 
 // This file is the wiring of 04 §6.6: it builds 03's store, account service and REST API, 01's hub, 02's SFU behind
-// 01's sfuplane and the admin socket's server on top of what Start has opened, and it holds every adapter between
-// them. Each adapter is a few lines over a small interface of what it calls, so it has a table test with a fake
-// behind it (wire_test.go).
+// 01's sfuplane, 04's Web Push service and the admin socket's server on top of what Start has opened, and it holds
+// every adapter between them. Each adapter is a few lines over a small interface of what it calls, so it has a table
+// test with a fake behind it (wire_test.go).
 //
 // What the later slices of the M1 plan add here:
-//   - README S71: push.New before auth.New, the push service as signal.Deps.Push, auth.Options.Alerts and
-//     httpapi.Deps.Push;
-//   - README S80 and S85: ops.Metrics as the router's Observer and the hub's Registerer, a collector over the SFU's
-//     Metrics, the transfer counter on the Transport and the multiplexer (with its Flush as ops.DataDir.Flush, so a
-//     backup holds the counters as they are), and the REST routes of ops through API.Handle: the dashboard, and
-//     doctor's and the bandwidth estimate's, over the ops.Doctor that wire builds.
+//   - README S80 and S85: ops.Metrics as the router's Observer, the hub's Registerer and push's Metrics, a collector
+//     over the SFU's Metrics, the transfer counter on the Transport and the multiplexer (with its Flush as
+//     ops.DataDir.Flush, so a backup holds the counters as they are), the transfer alerts through push's AdminAlert,
+//     and the REST routes of ops through API.Handle: the dashboard, and doctor's and the bandwidth estimate's, over
+//     the ops.Doctor that wire builds.
 
 // The adapters and what they adapt: each consumer interface of 04 §6.6 on the left, and on the right the part of
-// 01's hub and 03's service that an adapter calls.
+// 01's hub, 03's service and 04's push service that an adapter calls.
 var (
 	_ signal.Authenticator = (*authenticator)(nil)
 	_ signal.RoomDirectory = roomDirectory{}
 	_ signal.MediaPlane    = (*sfuplane.Plane)(nil)
+	_ signal.PushNotifier  = pushNotifier{}
 	_ auth.ConnCloser      = (*connCloser)(nil)
+	_ auth.AdminAlerter    = adminAlerter{}
 	_ httpapi.Signal       = signalAdapter{}
+	_ httpapi.Push         = pushAPI{}
 	_ httpapi.InfoSource   = buildInfo{}
 	_ ops.AdminAccounts    = (*adminAccounts)(nil)
 	_ ops.MetaStore        = metaStore{}
+	_ push.Store           = pushStore{}
 
 	_ sessionService = (*auth.Service)(nil)
 	_ accountService = (*auth.Service)(nil)
 	_ hubCloser      = (*signal.Hub)(nil)
 	_ hubControl     = (*signal.Hub)(nil)
+	_ pushService    = (*push.Service)(nil)
 )
 
 // ---- step 4: the store and the policy pins ----
@@ -173,18 +178,20 @@ const (
 	setupCheckTimeout = 2 * time.Second
 )
 
-// wire is step 8 of the startup sequence (04 §6.1) for 01's, 02's and 03's parts: the SFU on the Transport with
-// 01's sfuplane in front of it, the account service, whose key fingerprint check purges what a rotated key
-// protected before any listener serves (03 §4.6), then the hub and the REST API with the adapters of 04 §6.6
-// between them, the readiness checks "db", "media" and "signal" (04 §6.2), doctor (04 §13.1), and the admin
-// socket's server. It opens and starts nothing; Start serves what it builds.
+// wire is step 8 of the startup sequence (04 §6.1) for 01's, 02's, 03's and 04's parts: the SFU on the Transport
+// with 01's sfuplane in front of it, the push service and then the account service, whose key fingerprint checks
+// purge what a rotated key protected before any listener serves (04 §5.2, 03 §4.6), then the hub and the REST API
+// with the adapters of 04 §6.6 between them, the readiness checks "db", "media" and "signal" (04 §6.2), doctor
+// (04 §13.1), and the admin socket's server. It opens and starts nothing; Start serves what it builds, and runs the
+// push service with the server's other work (startBackground).
 //
-// A server without a site (ip mode before a public address is known, 04 §7.4) has no accounts, no API and no hub:
-// each needs the public origin, and the router answers 421 to every request but the health endpoints anyway. Its
-// admin socket still answers health, ready, status and doctor, so the operator sees the failing check "public_ip"
-// and what to do about it. It has its SFU all the same, on the ports it has bound: nothing joins it, and the check
-// "media" and the status say what the next start will serve media on. Only when it found no local address to bind
-// them on either does it have no SFU, and a failing check "media" next to "public_ip" (wireMedia).
+// A server without a site (ip mode before a public address is known, 04 §7.4) has no accounts, no API, no hub and
+// no push service: each needs the public origin, and the router answers 421 to every request but the health
+// endpoints anyway. Its admin socket still answers health, ready, status and doctor, so the operator sees the
+// failing check "public_ip" and what to do about it. It has its SFU all the same, on the ports it has bound:
+// nothing joins it, and the check "media" and the status say what the next start will serve media on. Only when it
+// found no local address to bind them on either does it have no SFU, and a failing check "media" next to
+// "public_ip" (wireMedia).
 func (s *Server) wire(ctx context.Context) error {
 	// The wall clock, not Deps.Now: how old an answer is has nothing to do with what time the accounts think it is.
 	s.health.AddCheck("db", newDBCheck(s.run, s.store.Ping, time.Now).ready)
@@ -278,12 +285,12 @@ func (s *Server) doctorEnv(status func(context.Context) (api.ServerStatus, error
 	}
 }
 
-// metaStore is 03's meta table as ops keeps its state in it (ops.MetaStore): the last doctor report, so that a
-// restarted server has it at once (04 §13.1). Each call is one short transaction, and a key that is not there reads
-// as "".
+// metaStore is 03's meta table as ops and push keep their state in it (ops.MetaStore, and the meta half of
+// push.Store): the last doctor report, so that a restarted server has it at once (04 §13.1), and the fingerprint
+// of the VAPID key (04 §5.2). Each call is one short transaction, and a key that is not there reads as "".
 type metaStore struct{ db *store.DB }
 
-// Meta implements ops.MetaStore.
+// Meta implements ops.MetaStore and push.Store.
 func (m metaStore) Meta(ctx context.Context, key string) (string, error) {
 	var value string
 	err := m.db.Read(ctx, func(q *store.Q) error {
@@ -297,7 +304,7 @@ func (m metaStore) Meta(ctx context.Context, key string) (string, error) {
 	return value, err
 }
 
-// SetMeta implements ops.MetaStore.
+// SetMeta implements ops.MetaStore and push.Store.
 func (m metaStore) SetMeta(ctx context.Context, key, value string) error {
 	return m.db.Write(ctx, func(q *store.Q) error { return q.SetMeta(key, value) })
 }
@@ -406,9 +413,28 @@ func aboutNotImplemented(r slog.Record) bool {
 	return found
 }
 
-// wireAccounts builds the account service, the hub and the REST API for the site. media is the hub's MediaPlane.
+// wireAccounts builds the push service, the account service, the hub and the REST API for the site. media is the
+// hub's MediaPlane.
 func (s *Server) wireAccounts(ctx context.Context, media signal.MediaPlane) error {
 	origin := s.site.Origin
+
+	// push comes first (04 §6.1 step 8): its VAPID fingerprint check purges the subscriptions of a rotated key
+	// before anything else reads them, and auth, whose own purges and changes raise admin alerts, sends them
+	// through it. With push.enabled = false there is none, and the three consumers get a nil interface each: the
+	// hub sends no notification, auth only logs its alerts, and the push endpoints answer push_unavailable while
+	// GET /info has no push object (04 §6.6).
+	svc, err := s.wirePush(ctx)
+	if err != nil {
+		return err
+	}
+	var (
+		notifier signal.PushNotifier
+		alerts   auth.AdminAlerter
+		pushREST httpapi.Push
+	)
+	if svc != nil {
+		notifier, alerts, pushREST = pushNotifier{svc: svc}, adminAlerter{svc: svc}, pushAPI{svc: svc}
+	}
 
 	// auth comes before the hub (04 §6.1 step 8), and each needs the other: the hub authenticates through auth, and
 	// auth closes the hub's connections on a revocation. The closer is bound once the hub exists.
@@ -420,10 +446,10 @@ func (s *Server) wireAccounts(ctx context.Context, media signal.MediaPlane) erro
 		Origins:  func() auth.Origins { return auth.Origins{Primary: origin, Public: []string{origin}} },
 		ClientIP: httpapi.ClientIP,
 		Conns:    closer,
-		// Alerts is the push service (README S71); until then admin alerts are only logged.
-		Argon:  s.deps.Argon,
-		Clock:  s.deps.Now,
-		Logger: s.log,
+		Alerts:   alerts,
+		Argon:    s.deps.Argon,
+		Clock:    s.deps.Now,
+		Logger:   s.log,
 	})
 	if err != nil {
 		return fmt.Errorf("server: %w", err)
@@ -441,22 +467,22 @@ func (s *Server) wireAccounts(ctx context.Context, media signal.MediaPlane) erro
 		Rooms:    roomDirectory{db: s.store},
 		Media:    media,
 		Policy:   func() signal.Policy { return policyOf(settings.Get()) },
+		Push:     notifier,
 		ClientIP: httpapi.ClientIP,
 		Log:      s.log,
-		// Push is the push service (README S71) and Metrics is ops.Metrics.Registerer() (README S85).
+		// Metrics is ops.Metrics.Registerer() (README S85).
 	})
 	if err != nil {
 		return fmt.Errorf("server: %w", err)
 	}
 	closer.bind(hub)
 
-	s.accounts, s.hub = accounts, hub
+	s.accounts, s.hub, s.push = accounts, hub, svc
 	s.api = httpapi.New(httpapi.Deps{
-		DB:     s.store,
-		Auth:   accounts,
-		Signal: signalAdapter{hub: hub},
-		// Push stays nil until the push wiring (README S71): the push endpoints answer push_unavailable and GET /info
-		// has no push object, as with push.enabled = false.
+		DB:       s.store,
+		Auth:     accounts,
+		Signal:   signalAdapter{hub: hub},
+		Push:     pushREST,
 		Info:     buildInfo{},
 		Site:     s.site,
 		ClientIP: httpapi.ClientIP,
@@ -470,6 +496,64 @@ func (s *Server) wireAccounts(ctx context.Context, media signal.MediaPlane) erro
 		return false, "signaling is shutting down"
 	})
 	return nil
+}
+
+// wirePush builds 04's Web Push service for the site (04 §6.6 rows push.Options and push.Store, §14): the VAPID
+// pair of secrets.json, the subject that push.DeriveSubject makes of push.subject, tls.acme_email and the site's
+// origin, 03's tables behind pushStore, and the server's own public addresses, which the SSRF guard refuses as a
+// push service. push.New compares the VAPID key with the fingerprint in 03's meta table and, after a rotation,
+// deletes every subscription before it returns (04 §5.2); it starts nothing, and startBackground runs it.
+//
+// With push.enabled = false there is no service: wirePush returns nil and never calls push.New, which refuses a
+// disabled service with push.ErrDisabled. The one push.subject that config lets through and push.New refuses, a
+// bare "mailto:" or "https:" (04 §4.5, §14.1), is a config error here, on which serve exits 78 as on any other.
+//
+// ops.Metrics.Registerer() becomes Options.Metrics with the metrics endpoint (README S85); until then the service
+// counts its results for nobody.
+func (s *Server) wirePush(ctx context.Context) (*push.Service, error) {
+	if !s.cfg.Push.Enabled {
+		return nil, nil
+	}
+	if err := pushSubjectError(&s.cfg); err != nil {
+		return nil, err
+	}
+	svc, err := push.New(ctx, push.Options{
+		Enabled:  true,
+		VAPID:    s.secrets.VAPID,
+		Subject:  push.DeriveSubject(s.cfg.Push.Subject, s.cfg.TLS.ACMEEmail, s.site.Origin),
+		Store:    pushStore{metaStore{db: s.store}},
+		Sender:   s.deps.PushSender,
+		Now:      s.deps.Now,
+		Logger:   s.log,
+		Resolver: s.deps.Resolver,
+		OwnAddrs: []netip.Addr{s.public.V4, s.public.V6}, // a zero address, one that was not found, is ignored
+	})
+	if err != nil {
+		return nil, fmt.Errorf("server: %w", err)
+	}
+	return svc, nil
+}
+
+// pushSubjectFix is config's fix text for push.subject (04 §4.5).
+const pushSubjectFix = `use "mailto:you@example.com" or an https:// URL, or leave it empty (then mailto:<tls.acme_email> or the public origin)`
+
+// pushSubjectError returns a *config.ValidationError for a push.subject that is only a prefix, "mailto:" or
+// "https:": config checks the prefix alone and lets it through, push.New refuses a subject that names no contact
+// (04 §14.1). A subject that config refuses never gets here, and one that push.New takes is nil.
+func pushSubjectError(cfg *config.Config) error {
+	const key = "push.subject"
+	subject := cfg.Push.Subject
+	if subject != "mailto:" && subject != "https:" {
+		return nil
+	}
+	return &config.ValidationError{Problems: []config.Problem{{
+		Key:      key,
+		Value:    strconv.Quote(subject),
+		Source:   cfg.Source(key),
+		Severity: config.SeverityError,
+		Message:  "names no contact after the " + subject + " prefix",
+		Fix:      pushSubjectFix,
+	}}}
 }
 
 // spaStatus is the router's SPAStatus hook (03 §12.6, 04 §9.5): the web app's /setup answers 404 once setup is
@@ -784,6 +868,145 @@ type buildInfo struct{}
 func (buildInfo) ServerVersion() string { return version.Version() }
 
 func (buildInfo) Protocol() (current, minimum int) { return protocol.Version, protocol.MinVersion }
+
+// ---- 04's push service behind 01's PushNotifier, 03's AdminAlerter and httpapi.Push ----
+
+// pushService is the part of *push.Service behind the adapters below. Its triggers and SendTest only queue: they
+// never block, and the work outlives the caller's context.
+type pushService interface {
+	ShareStarted(ev push.ShareStarted)
+	AdminAlert(a push.AdminAlert)
+	VAPIDPublicKey() string
+	ValidateEndpoint(ctx context.Context, endpoint string) error
+	SendTest(ctx context.Context, subs []push.Subscription) error
+}
+
+// pushNotifier implements signal.PushNotifier (04 §6.6): a share went live, and push tells the users who want to
+// know and are not in the room (04 §14.3). The event's fields are the same on both sides. The hub calls it from a
+// goroutine of its own with its own context, which the queue does not need.
+type pushNotifier struct{ svc pushService }
+
+// ShareStarted implements signal.PushNotifier.
+func (n pushNotifier) ShareStarted(_ context.Context, ev signal.PushShareStarted) {
+	n.svc.ShareStarted(push.ShareStarted{
+		RoomID:         ev.RoomID,
+		RoomName:       ev.RoomName,
+		ShareID:        ev.ShareID,
+		UserID:         ev.UserID,
+		UserName:       ev.UserName,
+		PresentUserIDs: ev.PresentUserIDs, // the service keeps a copy of its own
+		At:             ev.At,
+	})
+}
+
+// adminAlerter implements auth.AdminAlerter (auth.Options.Alerts, 04 §6.6): 03's admin alerts go out as admin.alert
+// to the admins whose adminAlerts preference is on (04 §14.3). auth calls it after its commit, and it never blocks.
+type adminAlerter struct{ svc pushService }
+
+// AdminAlert implements auth.AdminAlerter.
+func (a adminAlerter) AdminAlert(_ context.Context, al auth.AdminAlert) {
+	a.svc.AdminAlert(push.AdminAlert{Kind: al.Kind, Actor: al.Actor, Target: al.Target, At: al.At})
+}
+
+// pushAPI implements httpapi.Push (04 §6.6, §14.2): the VAPID public key for GET /info and the endpoint checks of
+// a subscribe go straight through; the test notification takes 03's rows as push's subscriptions.
+type pushAPI struct{ svc pushService }
+
+// VAPIDPublicKey implements httpapi.Push.
+func (p pushAPI) VAPIDPublicKey() string { return p.svc.VAPIDPublicKey() }
+
+// ValidateEndpoint implements httpapi.Push.
+func (p pushAPI) ValidateEndpoint(ctx context.Context, endpoint string) error {
+	return p.svc.ValidateEndpoint(ctx, endpoint)
+}
+
+// SendTest implements httpapi.Push.
+func (p pushAPI) SendTest(ctx context.Context, subs []store.PushSubscription) error {
+	return p.svc.SendTest(ctx, pushSubscriptions(subs))
+}
+
+// pushSubscriptions converts 03's subscription rows to push's: the endpoint, a capability URL, becomes a secret
+// from here on (04 §14.7).
+func pushSubscriptions(rows []store.PushSubscription) []push.Subscription {
+	out := make([]push.Subscription, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, push.Subscription{
+			ID:        string(r.ID),
+			UserID:    string(r.UserID),
+			SessionID: string(r.SessionID),
+			Endpoint:  logx.Secret(r.Endpoint),
+			P256dh:    r.P256dh,
+			Auth:      r.Auth,
+		})
+	}
+	return out
+}
+
+// pushStore implements push.Store over 03's tables (04 §6.6, §14.7): each method is one short transaction on
+// 03's *store.Q methods. The meta keys are metaStore's, which reads a missing key as "". A subscription that is
+// gone by the time a result is recorded or it is deleted is no error: it is gone either way.
+type pushStore struct{ metaStore }
+
+// Recipients implements push.Store with ListPushSubscriptions: active users only. The filter's fields are 03's
+// PushFilter's, and its preference names are 03's (a test checks that they agree).
+func (p pushStore) Recipients(ctx context.Context, f push.RecipientFilter) ([]push.Subscription, error) {
+	filter := store.PushFilter{AdminsOnly: f.AdminsOnly, Pref: f.Pref, SessionID: store.SessionID(f.SessionID)}
+	for _, id := range f.ExcludeUserIDs {
+		filter.ExcludeUserIDs = append(filter.ExcludeUserIDs, store.UserID(id))
+	}
+	var rows []store.PushSubscription
+	err := p.db.Read(ctx, func(q *store.Q) error {
+		var err error
+		rows, err = q.ListPushSubscriptions(filter)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return pushSubscriptions(rows), nil
+}
+
+// RecordResult implements push.Store with RecordPushResult.
+func (p pushStore) RecordResult(ctx context.Context, id string, ok bool, at time.Time) error {
+	err := p.db.Write(ctx, func(q *store.Q) error { return q.RecordPushResult(store.PushSubID(id), ok, at) })
+	return notFoundIsNil(err)
+}
+
+// Delete implements push.Store with DeletePushSubscriptionByID.
+func (p pushStore) Delete(ctx context.Context, id string) error {
+	err := p.db.Write(ctx, func(q *store.Q) error { return q.DeletePushSubscriptionByID(store.PushSubID(id)) })
+	return notFoundIsNil(err)
+}
+
+// DeleteAll implements push.Store with DeleteAllPushSubscriptions.
+func (p pushStore) DeleteAll(ctx context.Context) (int, error) {
+	var n int
+	err := p.db.Write(ctx, func(q *store.Q) error {
+		var err error
+		n, err = q.DeleteAllPushSubscriptions()
+		return err
+	})
+	return n, err
+}
+
+// Prune implements push.Store with PrunePushSubscriptions.
+func (p pushStore) Prune(ctx context.Context, minFailures int, noSuccessSince time.Time) (int, error) {
+	var n int
+	err := p.db.Write(ctx, func(q *store.Q) error {
+		var err error
+		n, err = q.PrunePushSubscriptions(minFailures, noSuccessSince)
+		return err
+	})
+	return n, err
+}
+
+// notFoundIsNil reads store.ErrNotFound as success: the row the call was about is not there.
+func notFoundIsNil(err error) error {
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	return err
+}
 
 // ---- ops.AdminAccounts over 03's auth.Service and store ----
 

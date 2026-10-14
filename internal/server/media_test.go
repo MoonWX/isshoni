@@ -114,6 +114,7 @@ func TestShutdownOrder(t *testing.T) {
 		{step: "transport", socket: true},            // the SFU is closed; its sockets outlived it
 		{step: "http"},                               // media is gone before the HTTP servers stop
 		{step: "tls"},
+		{step: "push"}, // its queue drains once the hub, the REST API and the server's own work have stopped
 		{step: "admin socket"},
 		{step: "store"},
 	}

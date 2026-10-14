@@ -21,7 +21,8 @@ func (s *Server) SetDrainingHook(fn func()) {
 }
 
 // SetShutdownStepHook makes Shutdown call fn right before it stops each component, with the component's name:
-// "signaling", "sfu", "transport", "http", "tls", "admin socket", "store" (04 §6.4).
+// "signaling", "sfu", "transport", "http", "tls", "push", "admin socket", "store" (04 §6.4). A server without a
+// component has no step for it.
 func (s *Server) SetShutdownStepHook(fn func(step string)) {
 	s.life.Lock()
 	defer s.life.Unlock()

@@ -17,11 +17,12 @@
 //     restarted (ErrRestartRequested), or failed.
 //   - Shutdown stops the server in the order of 04 §6.4: readiness and liveness off, the shutdown gate (503
 //     server_shutdown for every new request), the hub (server.shutdown to every connection, close 1012), the SFU
-//     and then the ICE Transport under it, then the HTTP servers and the 443 multiplexer, the TLS manager, the admin
-//     socket, the store, and last the data-directory lock. It finishes within shutdown_timeout (10 s); what is
-//     still open then is closed by force, and its error says so with ErrShutdownForced.
+//     and then the ICE Transport under it, then the HTTP servers and the 443 multiplexer, the TLS manager, the push
+//     service (what is queued goes out, for at most 2 s), the admin socket, the store, and last the data-directory
+//     lock. It finishes within shutdown_timeout (10 s); what is still open then is closed by force, and its error
+//     says so with ErrShutdownForced.
 //
-// What runs in the server (README slices S31, S44, S54 and S59; 04 slices S4, S7, W1 and W2):
+// What runs in the server (README slices S31, S44, S54, S59 and S71; 04 slices S4, S7, W1, W2 and S12b):
 //   - The HTTP side of every TLS mode of 04 §8.1. httpapi's router serves the embedded web app with its fallback,
 //     GET /healthz and GET /readyz from ops.Health, 03's REST API at /api/v1/ and 01's hub at GET /ws.
 //     In off mode the router is on plain HTTP on listen.http, behind the operator's HTTPS proxy, or on localhost for
@@ -47,6 +48,12 @@
 //     carries media, listen.ice_tcp, and the ICE side of the 443 multiplexer), and 02's SFU on it. 01's sfuplane is
 //     the hub's MediaPlane in front of the SFU, so share.start, the pc.* messages and subscribe.update reach it;
 //     the admin's bitrate limit follows 03's settings live. The readiness check "media" is theirs.
+//   - Web Push (04 §14; wire.go): 04's push service on 03's tables, built before the account service so that its
+//     VAPID fingerprint check purges the subscriptions of a rotated key first. A share that goes live reaches it
+//     from the hub (the users who are not in the room get "started sharing"), 03's admin alerts reach it from the
+//     account service, and the REST API's push endpoints call it (the VAPID key in GET /info, the endpoint checks of
+//     a subscription, the test notification). With push.enabled = false there is none: the hub notifies nobody,
+//     admin alerts are only logged, and the push endpoints answer push_unavailable.
 //   - The admin socket of 04 §12 on listen.admin_socket, for the operator's CLI (setup-url, healthcheck, admin …),
 //     with its accounts part over 03's service.
 //   - Backup, restore and secret rotation (README S65; 04 §5.3, §12.3, §12.4). The admin socket serves them over
@@ -56,13 +63,13 @@
 //     are swapped at the end of the shutdown, once the store is closed and still under the data-directory lock;
 //     Start completes a swap that a crash interrupted before it opens anything (ops.RecoverRestore), and removes
 //     the files from before the restore once nothing can fail it any more and before the admin socket takes a
-//     request, the next restore's for one (ops.FinishRestore). What a rotated key protected is
-//     purged by the next start's account service (03 §4.6). Reexec (exec_unix.go) is the restart itself:
-//     cmd/isshoni calls it when Run returns ErrRestartRequested, and the process replaces itself with a new run of
-//     the same command line; where a platform has none (exec_other.go), cmd/isshoni exits 75.
+//     request, the next restore's for one (ops.FinishRestore). What a rotated key protected is purged by the next
+//     start's push service (the VAPID pair, 04 §5.2) and account service (03 §4.6). Reexec (exec_unix.go) is the
+//     restart itself: cmd/isshoni calls it when Run returns ErrRestartRequested, and the process replaces itself
+//     with a new run of the same command line; where a platform has none (exec_other.go), cmd/isshoni exits 75.
 //
-// The later slices of the M1 plan extend Start and Shutdown at the marked steps: push (S71), the ops data, metrics
-// and their REST routes (S80, S85) and the SIGHUP reload (S90), which serve only answers with a log line so far.
+// The later slices of the M1 plan extend Start and Shutdown at the marked steps: the ops data, metrics and their REST
+// routes (S80, S85) and the SIGHUP reload (S90), which serve only answers with a log line so far.
 //
 // Of the packages of 04 §2, only this one, cmd/isshoni and servertest import signal, sfu and sfuplane, or combine
 // store and auth with ops and push.

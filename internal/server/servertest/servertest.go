@@ -18,6 +18,10 @@
 // The harness runs the server in the test's process, so it sets server.Deps.InProcess: the server leaves the
 // umask and the Go memory limit alone. It also turns off the container data-volume check, so the tests pass inside
 // a container, and it configures no STUN servers, so no test asks the public ones for the machine's address.
+//
+// Web Push is on, as push.enabled is by default, with the real sender: it sends nothing until a browser has
+// subscribed. A test of the notifications passes a PushService as server.Deps.PushSender and Resolver, which
+// stands in for the browsers' push services and records every message (push.go).
 package servertest
 
 import (
