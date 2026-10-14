@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("\x00\x01\x00\x0e!\x12\xa4Bisshoni-walk\x00\x06\x00\asrv:cli\x00\x80\"")
