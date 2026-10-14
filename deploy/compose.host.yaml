@@ -1,0 +1,30 @@
+# isshoni on the host's network, for IPv6 or to avoid Docker's NAT. Use it instead of compose.yaml, not with it.
+# Start: docker compose -f compose.host.yaml up -d   Then: docker compose -f compose.host.yaml exec isshoni isshoni setup-url
+# Put ISSHONI_DOMAIN=share.example.com in a .env file next to this file, or leave it empty for an IP certificate.
+# isshoni gets its certificate from Let's Encrypt. Using it means you accept the Let's Encrypt Subscriber Agreement: https://letsencrypt.org/repository/
+# The host's firewall applies here (Docker adds no rules of its own): open TCP 80, 443, 7882 and UDP 7882.
+# The data is in /var/lib/isshoni on the host, not in the volume of compose.yaml: the docs show how to copy it over.
+# Docs: https://moonwx.github.io/isshoni/install/docker
+name: isshoni
+services:
+  isshoni:
+    image: ghcr.io/moonwx/isshoni:latest
+    restart: unless-stopped
+    network_mode: host
+    user: "0:0"                  # host netns: ports < 1024 need the capability, which only root keeps
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    environment:
+      ISSHONI_DOMAIN: ${ISSHONI_DOMAIN:-}   # empty: certificate for the public IP
+    volumes:
+      - /var/lib/isshoni:/var/lib/isshoni   # mandatory: users, rooms, certificates. Docker creates the host directory, owned by root
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run/isshoni:mode=0750              # admin socket (healthcheck, setup-url, backup)
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }

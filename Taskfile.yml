@@ -582,11 +582,13 @@ tasks:
   docker:smoke:
     desc: Run the Docker smoke test (bridge and host networking, backup and restore, no volume, no .env)
     cmds:
-      - cmd: "echo 'docker:smoke: skipped, deploy/test/docker-smoke.sh does not exist yet'"
-        silent: true
-        if: '[ ! -f deploy/test/docker-smoke.sh ]'
-      - cmd: sh deploy/test/docker-smoke.sh
-        if: '[ -f deploy/test/docker-smoke.sh ]'
+      # The image holds the server binary, which embeds the web app, and THIRD_PARTY_NOTICES: all three are made
+      # for one VERSION. `task docker:smoke -- -k` passes flags on to the script (-h lists them).
+      - task: build:web
+        vars: {VERSION: '{{.VERSION}}'}
+      - task: notices
+        vars: {VERSION: '{{.VERSION}}'}
+      - sh deploy/docker/test/docker-smoke.sh -v '{{.VERSION}}' {{.CLI_ARGS}}
 
   # ---------------------------------------------------------------------------------------------------------------
   # Project site
