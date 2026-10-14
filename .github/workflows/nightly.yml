@@ -113,7 +113,8 @@ jobs:
     #   main  C12, C1, then V1's sysctl values, C2, C3, C6, C4, C5, C8, C9, C10, then V6 and, on Fedora, V2
     #   c7    C7, a port taken by another program          c13  C13, a server that does not start
     #   v3    V3: the firewall offer with ufw (Ubuntu 24.04) or firewalld (Fedora) running, and SSH still reachable
-    #   v4    V4: iptables with netfilter-persistent and a REJECT rule; the rules survive a reboot (Ubuntu 24.04)
+    #   v4    V4: iptables with netfilter-persistent and a REJECT rule, IPv4 and IPv6; the rules survive a reboot
+    #         (Ubuntu 24.04)
     #   v5    V5: --domain isshoni.test against Pebble on this runner, ready within 60 s, a certificate from Pebble
     # C11 (no systemd) has no VM form: it stays in ci.yml's distro job.
     needs: vm-release
@@ -308,6 +309,10 @@ jobs:
 
       - name: The scenarios in ${{ matrix.distro }} VMs
         if: steps.kvm.outputs.ok == 'true'
+        # Less than the job's 90 minutes, which also hold the steps above (about 5 minutes): a hang fails this
+        # step before the job times out, so the steps below still have the time to show Pebble's logs and upload
+        # the VMs' consoles.
+        timeout-minutes: 75
         shell: sh
         env:
           VM_DIR: ${{ runner.temp }}/vm
@@ -347,8 +352,12 @@ jobs:
           fi
           VM_SSH_PORT=2200 # each VM gets the next port for its SSH
           VM_ENV=''        # NAME=VALUE words that vm_engine adds to every command (V5's ACME server)
-          # V6: the exposure that 06 §4.5 recorded (1.7, deploy/systemd/README.md) plus 0.2.
-          VM_EXPOSURE_MAX=1.9
+          # V6: the exposure recorded in deploy/systemd/README.md (06 §4.5) plus 0.2, read from there, so that a
+          # newly recorded value moves the limit with it.
+          VM_EXPOSURE_REC=$(sed -n 's/^## Recorded exposure: \([0-9][0-9.]*\)$/\1/p' deploy/systemd/README.md | sed -n 1p)
+          [ -n "$VM_EXPOSURE_REC" ] ||
+            die 'deploy/systemd/README.md has no heading "## Recorded exposure: <value>" (06 §4.5), which V6 reads'
+          VM_EXPOSURE_MAX=$(awk -v r="$VM_EXPOSURE_REC" 'BEGIN { printf "%g", r + 0.2 }')
 
           # sh_quote WORD prints WORD in single quotes, for the VM's shell to read back as the same word.
           sh_quote() {
@@ -482,10 +491,12 @@ jobs:
 
           # vm_ready VM waits until the VM answers on SSH, has finished cloud-init and booting, and resolves this
           # runner's names: relserve's (HOST_NAME) and Pebble's. QEMU's user network reaches the runner at
-          # 10.0.2.2.
+          # 10.0.2.2. Every wait has a limit: cloud-init twice VM_BOOT_TIMEOUT, the boot VM_BOOT_TIMEOUT. A VM that
+          # is not done by then goes on to the scenarios, whose checks tell what is missing.
           vm_ready() {
             vr_dir=$VM_DIR/$1
             vr_start=$(date +%s)
+            vr_wait=$((VM_BOOT_TIMEOUT * 2))
             until vm_ssh_new "$1" true </dev/null >/dev/null 2>&1; do
               vr_pid=$(cat "$vr_dir/qemu.pid" 2>/dev/null) || vr_pid=''
               if [ -z "$vr_pid" ] || ! kill -0 "$vr_pid" 2>/dev/null; then
@@ -499,9 +510,12 @@ jobs:
               sleep 3
             done
             vm_master "$1" start
-            vm_ssh "$1" 'cloud-init status --wait >/dev/null 2>&1; timeout 300 systemctl is-system-running --wait' \
-              </dev/null >"$vr_dir/state" 2>&1 || :
-            say "  the VM $1 is up after $(($(date +%s) - vr_start)) s (systemd: $(cat "$vr_dir/state"))"
+            vr_cmd="timeout $vr_wait cloud-init status --wait >/dev/null 2>&1"
+            # shellcheck disable=SC2016 # the VM's shell expands $? (timeout's status 124: the time was up)
+            vr_cmd="$vr_cmd"'; [ $? -ne 124 ] || printf "cloud-init still running after %s s, " '"$vr_wait"
+            vr_cmd="$vr_cmd; printf 'systemd: '; timeout $VM_BOOT_TIMEOUT systemctl is-system-running --wait"
+            vm_ssh "$1" "$vr_cmd" </dev/null >"$vr_dir/state" 2>&1 || :
+            say "  the VM $1 is up after $(($(date +%s) - vr_start)) s ($(cat "$vr_dir/state"))"
             vm_ssh "$1" "grep -q '^10.0.2.2 $HOST_NAME ' /etc/hosts || echo '10.0.2.2 $HOST_NAME pebble' >>/etc/hosts" \
               </dev/null
           }
@@ -674,7 +688,7 @@ jobs:
 
           # V6: the exposure that systemd-analyze security reports is at most the recorded value + 0.2.
           scenario_vm_v6() {
-            say '' "V6: systemd-analyze security isshoni (at most $VM_EXPOSURE_MAX)"
+            say '' "V6: systemd-analyze security isshoni (at most $VM_EXPOSURE_MAX: $VM_EXPOSURE_REC recorded, + 0.2)"
             v6n_level=$(value systemd-analyze security --no-pager isshoni |
               sed -n 's/.*Overall exposure level for isshoni\.service: \([0-9][0-9.]*\).*/\1/p')
             if [ -z "$v6n_level" ]; then
@@ -740,18 +754,32 @@ jobs:
             vm_stop
           }
 
-          # v4_order prints how many INPUT rules carry the comment isshoni, and how many of them come before the
-          # first REJECT rule: "2 2" when the firewall offer did its job.
+          # v4_order CMD prints how many INPUT rules of CMD (iptables or ip6tables) carry the comment isshoni, and
+          # how many of them come before the first REJECT rule: "2 2" when the firewall offer did its job.
           v4_order() {
-            value iptables -S INPUT | awk '
+            value "$1" -S INPUT | awk '
               /--comment isshoni/ { n++; if (!rejected) before++ }
               / -j REJECT/ { rejected = 1 }
               END { printf "%d %d", n, before }'
           }
 
+          # v4_file CMD prints the name of the file in /etc/iptables that netfilter-persistent saves CMD's rules in.
+          v4_file() {
+            case $1 in
+            iptables) echo rules.v4 ;;
+            ip6tables) echo rules.v6 ;;
+            esac
+          }
+
+          # v4_saved CMD prints how many rules with the comment isshoni that file has.
+          v4_saved() {
+            # shellcheck disable=SC2016 # the VM's shell expands it
+            in_container sh -c 'grep -c -- "--comment isshoni" "$1" || :' sh "/etc/iptables/$(v4_file "$1")"
+          }
+
           # V4: Oracle Cloud's Ubuntu images: no ufw, iptables-persistent, and an INPUT chain that rejects
-          # everything it does not allow. The offer inserts isshoni's rules before the REJECT and saves them; they
-          # survive a reboot; --uninstall removes them, and SSH still gets in.
+          # everything it does not allow. The offer inserts isshoni's rules before the REJECT, for IPv4 and IPv6
+          # (06 §4.9), and saves them; they survive a reboot; --uninstall removes them, and SSH still gets in.
           vm_part_v4() {
             vm_start v4
             say '' 'V4: iptables with netfilter-persistent and a REJECT rule (the Oracle Cloud pattern)'
@@ -773,20 +801,42 @@ jobs:
           -A FORWARD -j REJECT --reject-with icmp-host-prohibited
           COMMIT
           EOF
+            # The same for IPv6, so that the offer has to open ip6tables as well.
+            cat >"$VM_DIR/rules.v6" <<'EOF'
+          *filter
+          :INPUT ACCEPT [0:0]
+          :FORWARD ACCEPT [0:0]
+          :OUTPUT ACCEPT [0:0]
+          -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+          -A INPUT -p ipv6-icmp -j ACCEPT
+          -A INPUT -i lo -j ACCEPT
+          -A INPUT -p tcp -m state --state NEW -m tcp --dport 22 -j ACCEPT
+          -A INPUT -j REJECT --reject-with icmp6-adm-prohibited
+          -A FORWARD -j REJECT --reject-with icmp6-adm-prohibited
+          COMMIT
+          EOF
             vm_put "$VM_DIR/rules.v4" /etc/iptables/rules.v4
+            vm_put "$VM_DIR/rules.v6" /etc/iptables/rules.v6
             in_container netfilter-persistent reload >/dev/null 2>&1 || die 'netfilter-persistent did not load the rules'
-            assert_contains 'V4 before: the INPUT chain rejects' '-A INPUT -j REJECT' "$(value iptables -S INPUT)"
+            for v4n_cmd in iptables ip6tables; do
+              assert_contains "V4 before, $v4n_cmd: the INPUT chain rejects" '-A INPUT -j REJECT' \
+                "$(value "$v4n_cmd" -S INPUT)"
+            done
 
             run_installer "$V1" '' --yes --tls-mode off
             assert_eq 'V4 install: exit code' 0 "$RC"
             assert_contains 'V4 install: the offer' \
               'Firewall: opened ports 80, 443 (TCP) and 7882 (TCP+UDP) in iptables, and saved the rules.' "$OUT"
-            assert_eq 'V4 install: two isshoni rules, both before the REJECT' '2 2' "$(v4_order)"
-            assert_eq 'V4 install: saved in rules.v4' 2 \
-              "$(in_container sh -c 'grep -c -- "--comment isshoni" /etc/iptables/rules.v4 || :')"
+            for v4n_cmd in iptables ip6tables; do
+              assert_eq "V4 install, $v4n_cmd: two isshoni rules, both before the REJECT" '2 2' "$(v4_order "$v4n_cmd")"
+              assert_eq "V4 install, $v4n_cmd: saved in $(v4_file "$v4n_cmd")" 2 "$(v4_saved "$v4n_cmd")"
+            done
 
             vm_reboot
-            assert_eq 'V4 after a reboot: the rules are back, before the REJECT' '2 2' "$(v4_order)"
+            for v4n_cmd in iptables ip6tables; do
+              assert_eq "V4 after a reboot, $v4n_cmd: the rules are back, before the REJECT" '2 2' \
+                "$(v4_order "$v4n_cmd")"
+            done
             if wait_ready; then
               ok 'V4 after a reboot: the server is ready'
             else
@@ -797,18 +847,21 @@ jobs:
             assert_eq 'V4 uninstall: exit code' 0 "$RC"
             assert_contains 'V4 uninstall: the rules are removed' \
               "Firewall: removed isshoni's iptables rules, and saved the rules." "$OUT"
-            assert_eq 'V4 uninstall: no isshoni rule is left' '0 0' "$(v4_order)"
-            assert_contains 'V4 uninstall: the REJECT stays' '-A INPUT -j REJECT' "$(value iptables -S INPUT)"
-            assert_eq 'V4 uninstall: rules.v4 has no isshoni rule' 0 \
-              "$(in_container sh -c 'grep -c -- "--comment isshoni" /etc/iptables/rules.v4 || :')"
+            for v4n_cmd in iptables ip6tables; do
+              assert_eq "V4 uninstall, $v4n_cmd: no isshoni rule is left" '0 0' "$(v4_order "$v4n_cmd")"
+              assert_contains "V4 uninstall, $v4n_cmd: the REJECT stays" '-A INPUT -j REJECT' \
+                "$(value "$v4n_cmd" -S INPUT)"
+              assert_eq "V4 uninstall, $v4n_cmd: $(v4_file "$v4n_cmd") has no isshoni rule" 0 "$(v4_saved "$v4n_cmd")"
+            done
             vm_assert_ssh 'V4 uninstall'
             vm_stop
           }
 
           # V5: --domain isshoni.test against Pebble on this runner. challtestsrv resolves the name to 127.0.0.1,
           # where QEMU forwards Pebble's validation ports to the VM's 80 and 443. The VM finds Pebble's directory at
-          # https://pebble:14000/dir (vm_ready). IP mode (--ip) is not run: ip mode takes only a public address, and
-          # a VM on a runner has none that Pebble could validate, so it stays on the release checklist (06 §11.2).
+          # https://pebble:14000/dir (vm_ready). IP mode (--ip) is not run, although the pinned Pebble issues for IP
+          # addresses (ci.yml's acme job): ip mode takes only a public address (04 §4.5, config/validate.go), and a
+          # VM on a runner has none that Pebble could validate. It stays on the release checklist (06 §9.1 step 2).
           vm_part_v5() {
             [ -s "$PEBBLE_MINICA" ] || die "V5 needs Pebble: $PEBBLE_MINICA is missing"
             vm_start v5 tcp:127.0.0.1:5002-:80 tcp:127.0.0.1:5001-:443
@@ -894,13 +947,13 @@ jobs:
           [ "$FAILED" -eq 0 ]
 
       - name: Show the logs of Pebble and pebble-challtestsrv
-        if: failure() && steps.kvm.outputs.ok == 'true' && contains(matrix.parts, 'v5')
+        if: (failure() || cancelled()) && steps.kvm.outputs.ok == 'true' && contains(matrix.parts, 'v5')
         run: |
           docker logs isshoni-nightly-pebble || true
           docker logs isshoni-nightly-challtestsrv || true
 
       - name: Upload the VMs' console logs
-        if: failure() && steps.kvm.outputs.ok == 'true'
+        if: (failure() || cancelled()) && steps.kvm.outputs.ok == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: distro-vm-${{ matrix.distro }}-consoles
@@ -1078,8 +1131,9 @@ jobs:
     #
     # Not signed (--skip=sign): cosign's keyless signature needs the job's OIDC token, which this job does not
     # get, because it also runs npm (release.yml keeps the two apart, 06 §9.3), and a nightly snapshot needs no
-    # signature in the public transparency log. The asset check therefore expects everything of a release except
-    # the cosign bundle of checksums.txt. release.yml's dry run covers the signing.
+    # signature in the public transparency log. The asset check therefore gets an empty stand-in for the one asset
+    # only a signed run makes, the cosign bundle of checksums.txt, and gates on everything else as for a release.
+    # release.yml's dry run covers the signing.
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -1150,21 +1204,14 @@ jobs:
         # The before hook runs `task release:prepare` (THIRD_PARTY_NOTICES, the stamped install.sh).
         run: PATH="$PWD/.bin:$PATH" .bin/goreleaser release --snapshot --clean --skip=sign
 
-      - name: task release:assets FULL=true (the assets of 06 §3, without the cosign bundle)
+      - name: task release:assets FULL=true (the assets of 06 §3; the cosign bundle is a stand-in)
         run: |
-          status=0
-          task release:assets VERSION="$ISSHONI_SNAPSHOT_VERSION" FULL=true 2> "$RUNNER_TEMP/assets.err" || status=$?
-          cat "$RUNNER_TEMP/assets.err" >&2
-          # The one difference from a release: this run does not sign (see the job's comment).
-          expected='release:assets: dist/ lacks checksums.txt.sigstore.json'
-          if [ "$status" -ne 0 ]; then
-            others=$(grep '^release:assets: ' "$RUNNER_TEMP/assets.err" | grep -vxF "$expected" || true)
-            if [ -n "$others" ] || ! grep -qxF "$expected" "$RUNNER_TEMP/assets.err"; then
-              echo "::error::dist/ does not have the release assets of 06 §3 (see above)"
-              exit 1
-            fi
-          fi
-          echo "dist/ has the assets of a release, except checksums.txt.sigstore.json, which only a signed run makes"
+          # The one difference from a release: this run does not sign (see the job's comment). release:assets only
+          # checks that the cosign bundle exists, and checksums.txt does not list it, so an empty stand-in lets
+          # every other check gate unchanged: any failure of the task fails this step.
+          trap 'rm -f dist/checksums.txt.sigstore.json' EXIT
+          : > dist/checksums.txt.sigstore.json
+          task release:assets VERSION="$ISSHONI_SNAPSHOT_VERSION" FULL=true
 
       - name: The SBOMs describe the archives
         run: |
