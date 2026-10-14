@@ -21,16 +21,14 @@
 //   stopping, failed); the panel is a view of it.
 // - BrowserSharing.start: share.start, then the share's tracks on the pub PC (PublisherPC: transceivers with
 //   complete encodings, codec preferences, gen and neg, recovery). It routes what the server sends about the pub PC
-//   and about its shares itself; the room session only starts and stops the share and tells it when the server
-//   ended it (BrowserShare.serverEnded, the session's ShareRecovery seam).
+//   and about its shares itself; the room session only starts and stops the share and tells it what only the
+//   session sees (the session's ShareRecovery seam): that the server ended it (BrowserShare.serverEnded), and that a
+//   reconnect needs it published again (resync and republish: share.start {replaces}, 01 §10.6).
+// - recovery.ts: the 60 s capture hold, and share.start retried with the same ref across a resumed drop.
 // - uiStore.sharing ("no Reload in the update pill while sharing", 05 §16.2), the toast of a share that was stopped
 //   from another tab, and the app's "Can't connect media" screen when the pub PC's negotiation failed twice within
 //   a minute (05 §9) follow the share state through linkShareUi, which every Share button and panel sets up when
 //   it mounts. It keeps working after the room page is left.
-//
-// Arriving with later slices, inside this folder: following a reconnect (BrowserShare.resync and republish with
-// `replaces`, the 60 s capture hold: the web recovery slice). Until then the room session stops a share whose
-// server side is gone (a welcome that was not resumed).
 export {
   BrowserShare,
   END_NOTICE_GRACE_MS,
@@ -57,6 +55,7 @@ export { noAudioNote } from './notes';
 export { applyVideoContentHint, PRESET_HINTS, presetHints, PRESETS, type PresetHints } from './presets';
 export { kindText, presetText } from './presetText';
 export { PublisherPC, type PublisherPCDeps, type PublisherSignal, type PubMediaState } from './PublisherPC';
+export { CAPTURE_HOLD_MS } from './recovery';
 export { ScreenAudioWarning, type ScreenAudioWarningProps } from './ScreenAudioWarning';
 export { ShareButton, ShareUnavailableNote, type ShareButtonProps } from './ShareButton';
 export { SharePanel, type SharePanelProps } from './SharePanel';

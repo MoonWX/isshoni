@@ -895,6 +895,10 @@ func (q *Q) DeleteRoom(id RoomID) error                              // ErrDefau
 // push subscriptions
 // UpsertPushSubscription: on endpoint conflict it rebinds the row to s.UserID/s.SessionID and replaces the keys.
 func (q *Q) UpsertPushSubscription(s *PushSubscription) (created bool, err error)
+// DeleteSessionPushSubscriptionsExcept (README F08): deletes every subscription of web session s except keep, and
+// returns how many went; the subscribe handler calls it in the Write of its upsert (one per session, §12.4.6). An
+// empty s is an error; a device's subscriptions (later: M2) are not touched.
+func (q *Q) DeleteSessionPushSubscriptionsExcept(s SessionID, keep PushSubID) (int, error)
 func (q *Q) ListPushSubscriptions(f PushFilter) ([]PushSubscription, error)
 func (q *Q) DeletePushSubscription(u UserID, id PushSubID) (bool, error)
 func (q *Q) DeletePushSubscriptionByEndpoint(u UserID, endpoint string) (bool, error)
@@ -1018,6 +1022,7 @@ The throttles are in-memory token buckets (decision 8), in `auth/limiter.go` (al
 | `auth-user` | username key (existing or not) | 30 | 1 per 2 min | Failed password checks, from any IP: a login's, and the password a logged-in user types again (below) | After `auth-user-ip`. When it is empty, the user's known IPs still pass (below) |
 | `register-ip` | client IP | 5 | 1 per 12 min | Every `register` request without an invite, in every mode (only the approval mode lets one through, below). Invite registrations are limited by the invite's own `maxUses` instead (the load test, 02, registers many users from one IP) | Right after `auth-ip`, before the mode check and any other work |
 | `auth-hash` | one for the whole server | 20 | 5 per s | Every public request that reaches the hash: login (the dummy hash too), register, setup/complete, reset/complete, device/password *(later: M2)* | Last: after all of the buckets above, before the semaphore (§7.2) |
+| `password-change` | user ID | 3 | 1 per 10 min | `POST /me/password` whose `currentPassword` was right (README F08): the token is taken before the first hash and kept once that password is verified, whatever comes after. Every other end gives it back: a wrong `currentPassword` (`auth-user-ip` and `auth-user` count it, as before), another bucket's 429, a full hash queue, a store or context error | After the new password's rules and the shape of `currentPassword` (a missing one is 403 first), before `auth-user-ip`. Empty: 429 and no hash, whatever the password |
 | `lookup` *(later: M2)* | session ID | 10 | 1 per min | Failed user-code lookups | Before lookup |
 | `push-test` | user ID | 1 | 1 per 10 s | `POST /push/test` | After the 503 for push that is off and the 404 for a session without a subscription, before sending (below) |
 
@@ -1062,7 +1067,30 @@ The throttles are in-memory token buckets (decision 8), in `auth/limiter.go` (al
   `auth-ip` and `auth-hash` are for anonymous requests and don't apply; the hash still waits for a slot of the
   semaphore (§7.2; a full queue is 503 `server_busy`). A wrong try writes no `auth.login_failed` row: it is no
   login. The password an admin types again to grant admin or to issue a reset link (§7.10, §7.11) comes with
-  README S64, which has `verifyOwnPassword` to call.
+  README S64, which has `verifyOwnPassword` to call. A password change also takes a `password-change` token
+  first (below).
+- **`password-change`** (README F08, from the M1 security review). A right `currentPassword` gives `auth-user-ip`
+  and `auth-user` their tokens back, and the change then hashes the new password with no token at all, so without
+  this bucket a member could loop `POST /me/password` with the own password (or two passwords in turn, so
+  refusing a new password equal to the current one would not help), keep every slot of the semaphore busy and,
+  with 32 waiters queued, have every anonymous login, sign-up and reset answered 503 `server_busy`: the outcome
+  `auth-hash` exists to prevent. Rules (`auth/selfservice.go`, `reauthenticate`):
+  - **Order**: the new password's rules (422), a missing or impossible `currentPassword` (403, no token), then
+    `password-change`, then `auth-user-ip` and `auth-user`, then the hash. An empty bucket is 429 `rate_limited`
+    with `retryAfter` and `Retry-After`, without a hash, whatever the password.
+  - **Kept** once the current password is verified: that change runs at most two hashes (the check and the new
+    hash), so a user's changes with the right password run at most 6 hashes at once and 2 per 10 minutes after
+    that. Requests sent in parallel each take their token before they hash: of 20 in flight together with the
+    right password, 17 are 429 at once; the 3 that hash verify it, one changes it, and the other two find it
+    changed in their `Write` (403 `wrong_password`) and keep their tokens too. A request that reads the account
+    only after such a change checks a password that is no longer the account's: a wrong one (next bullet).
+  - **Given back** by every other end. A wrong `currentPassword` costs one hash and is a failed password check:
+    `auth-user-ip` and `auth-user` count it as before, as they count `POST /me/delete`'s, so the rule "five wrong
+    tries from one address block that address" stays as it was and this bucket would add nothing there. The
+    other ends ran no hash: another bucket's 429, a full hash queue, a store or context error.
+  - Per user, from any session and address. It writes no `auth.throttled` row (§10 has no scope for it); the
+    first refusal of an episode logs one `warn` line with `user_id`. `POST /me/delete` and the admin's own
+    password (§7.10, §7.11) take no token: deleting the account happens once, and admins are trusted.
 - **`register-ip` comes before the mode check** (S42; kept, decided after group 5). A `register` request without
   an invite takes its `register-ip` token as its second step, whatever the registration mode is. So in the `invite`
   and `closed` modes, where such a request can never succeed, an address that has spent its five tokens is answered
@@ -1080,7 +1108,8 @@ The throttles are in-memory token buckets (decision 8), in `auth/limiter.go` (al
   empty, the request gets 503 `server_busy` with `Retry-After` (the seconds until the next token, at least 1) and
   does no hashing. The trade-off: under such an attack, new logins, sign-ups and resets wait. Existing sessions,
   WebSockets and media are unaffected, because nothing on those paths hashes. Password checks by a logged-in user
-  (changing the password, deleting the account, granting admin) don't use this bucket.
+  (changing the password, deleting the account, granting admin) don't use this bucket; a password change has
+  `password-change` instead.
 - **`push-test` lives in `httpapi`** (README S53; `httpapi/push.go`, `pushTestLimiter`). Its handler is its only
   user and `auth.Service` has no call for it, so the slice that wrote the handler kept the bucket next to it.
   - **Order** in `POST /push/test`: push off → 503 `push_unavailable`; this session has no subscription → 404
@@ -1910,7 +1939,7 @@ the rules live in the handlers, not in `auth.Service`: rooms have no credentials
   one with a skin tone and a flag of two regional indicators pass; the red heart (U+2764 U+FE0F), the keycaps and
   the profession and family sequences are `invalid`. That is the profile this section names, taken as it is;
   letting those emoji in would be a change to this rule, and is not decided.
-  - **Open, for the owner** (from README S53's write-back; still open after groups 7, 8 and 9; §19). "Emoji are
+  - **Open, for the owner** (from README S53's write-back; still open after groups 7, 8, 9 and 10; §19). "Emoji are
     allowed" above reads as every emoji; the profile lets in only those that need neither U+FE0F nor a zero-width
     joiner.
     The two ways to close the gap are to keep the profile and say so in the rule (an admin who types
@@ -2292,7 +2321,7 @@ Common errors are not repeated per row: `bad_request`, `payload_too_large`, `uns
 | 9 | `POST /api/v1/auth/reset/check` | Public | 200 `{username}` | 404 `reset_token_invalid`, 403 `account_pending`/`account_disabled` (a live link of an account that is not active, §7.10) | M1 |
 | 10 | `POST /api/v1/auth/reset/complete` | Public | 200 `{user}` + cookie | 404 `reset_token_invalid` and 403 `account_pending`/`account_disabled` (the link, checked first, before the password rules and the hash, §7.10), 422, 503 | M1 |
 | 11 | `GET /api/v1/me` | User | 200 `Me` (may rotate the cookie) | — | M1 |
-| 12 | `POST /api/v1/me/password` | User | 200 `{}` + rotated cookie (the old one works for 60 s more, §7.7) | 422 `validation_failed {newPassword}` first (the new password's rules, before any hash or token); then the current password: 403 `wrong_password` (also for a missing one, which is answered before the throttle), 429 `rate_limited` (too many wrong passwords, §7.3), 503 `server_busy` (the hash queue is full) | M1 |
+| 12 | `POST /api/v1/me/password` | User | 200 `{}` + rotated cookie (the old one works for 60 s more, §7.7) | 422 `validation_failed {newPassword}` first (the new password's rules, before any hash or token); then the current password: 403 `wrong_password` (also for a missing one, which is answered before the throttles), 429 `rate_limited` with `retryAfter` (too many password changes: the user's `password-change` bucket, 3 and then 1 per 10 min, taken before any hash whatever the password, README F08; or too many wrong passwords: `auth-user-ip`, `auth-user`; §7.3), 503 `server_busy` (the hash queue is full) | M1 |
 | 13 | `POST /api/v1/me/delete` | User | 204, cookie cleared | 409 `last_admin` first (before the password is looked at); then the password: 403 `wrong_password` (also for a missing one), 429 `rate_limited` (§7.3), 503 `server_busy` | M1 |
 | 14 | `GET /api/v1/me/sessions` | User | 200 `{sessions}` | — | M1 |
 | 15 | `DELETE /api/v1/me/sessions/{id}` | User | 204 | 404 `not_found` | M1 |
@@ -2303,9 +2332,9 @@ Common errors are not repeated per row: `bad_request`, `payload_too_large`, `uns
 | 21 | `GET /api/v1/invites` | User | 200 `{invites}` (admin: all; member: own) | 403 `forbidden` (member without permission) | M1 |
 | 22 | `POST /api/v1/invites` | Admin, or User if `membersCanInvite` | 201 `{invite, url}` | 403 `forbidden`/`registration_closed`, 409 `limit_reached`, 422 | M1 |
 | 23 | `DELETE /api/v1/invites/{id}` | Admin, or the creator | 204 | 404 `not_found` | M1 |
-| 24 | `POST /api/v1/push/subscriptions` | User | 201 `{id}` (new) · 200 `{id}` (the endpoint was known: rebound to the caller and this session) | 503 `push_unavailable` (checked first), 422 `push_endpoint_rejected` with `params.reason`, 401 `unauthenticated` when the session ended after the request was let in (§12.4.6) | M1 |
+| 24 | `POST /api/v1/push/subscriptions` | User | 201 `{id}` (new) · 200 `{id}` (the endpoint was known: rebound to the caller and this session). Either way the session's other subscriptions are deleted in the same write: one per web session (§12.4.6, README F08) | 503 `push_unavailable` (checked first), 422 `push_endpoint_rejected` with `params.reason`, 401 `unauthenticated` when the session ended after the request was let in (§12.4.6) | M1 |
 | 27 | `POST /api/v1/push/unsubscribe` | User | 204 (idempotent, by endpoint) | — | M1 |
-| 28 | `POST /api/v1/push/test` | User | 202 (this session's subscriptions) | In this order: 503 `push_unavailable`; 404 `not_found` (this session has no subscription; costs no token); 429 `rate_limited` (1 per 10 s per user, §7.3); 503 `server_busy` (04's queue is full) or `server_shutdown`, `Push.SendTest`'s error (04 §14.2), after which the token goes back | M1 |
+| 28 | `POST /api/v1/push/test` | User | 202 (this session's subscription: one, §12.4.6) | In this order: 503 `push_unavailable`; 404 `not_found` (this session has no subscription; costs no token); 429 `rate_limited` (1 per 10 s per user, §7.3); 503 `server_busy` (the queue of 04's `push.test` lane is full) or `server_shutdown`, `Push.SendTest`'s error (04 §14.2), after which the token goes back | M1 |
 | 29 | `GET /api/v1/admin/users` | Admin | 200 `{users}` (`?status=active\|pending\|disabled`) | — | M1 |
 | 30 | `PATCH /api/v1/admin/users/{id}` | Admin | 200 `{user}` | 404 `user_not_found`, 409 `username_taken`/`last_admin`/`self_action_forbidden`, 403 `wrong_password`, 422 | M1 |
 | 31 | `DELETE /api/v1/admin/users/{id}` | Admin | 204 | 404, 409 `last_admin`/`self_action_forbidden` | M1 |
@@ -2545,9 +2574,11 @@ for 30 days.
 
 The handler checks only the body shape; every URL and host rule is 04's.
 
-**Storage**: the row is upserted by endpoint and bound to the current session, with a name from the User-Agent. Each
-user keeps at most 10 subscriptions; the oldest is evicted. The SPA calls this **on every app start** once permission
-is granted. That keeps the binding current after re-logins and makes the call idempotent.
+**Storage**: the row is upserted by endpoint and bound to the current session, with a name from the User-Agent. A
+web session keeps one subscription, the one it posted last: the same write deletes the session's others (README
+F08, below). Each user keeps at most 10 subscriptions across the sessions; the oldest is evicted. The SPA calls this
+**on every app start** once permission is granted (05 §16.3: on every visit to the room page and the notifications
+page). That keeps the binding current after re-logins and makes the call idempotent.
 
 The VAPID public key comes from `GET /api/v1/info` (`push.vapidPublicKey`, §12.4.1); there is no separate config
 endpoint. The SPA re-subscribes when the key differs from its subscription's `applicationServerKey` (after
@@ -2555,11 +2586,12 @@ endpoint. The SPA re-subscribes when the key differs from its subscription's `ap
 
 **Other endpoints**:
 - `POST /api/v1/push/unsubscribe` `{"endpoint": "…"}` → 204.
-- `POST /api/v1/push/test` → 202. It sends a `push.test` notification to **this session's** subscriptions (this
-  browser) through `Push.SendTest`. At most 1 per 10 s per user (`push-test` bucket); that bucket is the only limit
-  on tests, because 04's per-recipient bucket leaves `push.test` out (04 §14.4). `SendTest` only queues: an
-  `*api.Error` it returns (`server_busy`, or `server_shutdown` while the server stops) goes out through
-  `WriteError`.
+- `POST /api/v1/push/test` → 202. It sends a `push.test` notification to **this session's** subscription (this
+  browser; one, since a subscribe deletes the session's others) through `Push.SendTest`, which queues it on a lane of
+  its own and attempts it once (04 §14.4, §14.5; README F08). At most 1 per 10 s per user (`push-test` bucket); that
+  bucket is the only limit on tests, because 04's per-recipient bucket leaves `push.test` out (04 §14.4). `SendTest`
+  only queues: an `*api.Error` it returns (`server_busy`, or `server_shutdown` while the server stops) goes out
+  through `WriteError`.
 - `GET /api/v1/push/preferences` → `{"shareStarted": "all", "adminAlerts": true}`; `PUT` with the same shape → 200.
   `shareStarted` is `all` or `off`; `adminAlerts` matters for admins only. 04's sender reads them through
   `PushFilter.Pref`.
@@ -2584,6 +2616,13 @@ endpoint. The SPA re-subscribes when the key differs from its subscription's `ap
   the same user and cleared for another. Every post sets the row's `created_at`, so "the oldest is evicted" means
   the browsers that have not posted for the longest time, not the ones that subscribed first. The name is
   `auth.DescribeUserAgent` ("Chrome on Windows"): one of a fixed set of labels, never text from the header.
+  **One subscription per web session** (README F08, from the M1 security review): the same `Write` deletes the
+  session's other rows (`DeleteSessionPushSubscriptionsExcept`), so the session keeps the endpoint it posted
+  last, and `POST /push/test`, which sends to this session's subscriptions, reaches one endpoint. Before, one
+  session could hold all 10 of the user's subscriptions, which contradicted "one browser, one subscription" and
+  let one test reach 10 endpoints that never answer. A browser holds one `PushSubscription` per service worker,
+  so the SPA never posts two at once; a new one (after `rotate-secrets`, 04 §5.2) replaces the old. The cap of 10
+  per user still holds across the user's sessions, and is applied after this rule.
 - **The session is checked again inside the write** (`callerLive`), for subscribe and for `PUT` preferences: the
   chain let the request in on a principal that may be up to 30 s old (§7.4), and a logout, a revocation or the
   account's deletion may have removed the session since. Then the answer is 401 `unauthenticated` and nothing is
@@ -3092,8 +3131,9 @@ SPA removes the fragment right after reading it (05).
   case-insensitive duplicate name → 409; deleting Lounge → 409; deleting another room calls `Signal.RoomDeleted`; the
   201st room → 409.
 - **Push**: an endpoint over 2048 bytes → 422 `too_long`; bad keys → 422 `bad_keys`; a fake `ValidateEndpoint`
-  rejection → 422 with its reason; a valid subscription → 201, and the same endpoint again → 200; the 11th
-  subscription evicts the oldest; logout deletes the session's subscriptions.
+  rejection → 422 with its reason; a valid subscription → 201, and the same endpoint again → 200; a second
+  endpoint from the same session leaves that session one row, the newer (README F08); the 11th subscription, from
+  the 11th browser, evicts the oldest; logout deletes the session's subscriptions.
 - **Settings**: a bad value → 422 with `fields`; a pinned field → 409; `OnChange` fires; a registration-mode change
   raises an alert and a security event.
 - **Audit**: every action in §10 that M1 can trigger is produced by at least one test, with the IP from `ClientIP`.
@@ -3334,7 +3374,15 @@ the registration mode.** In the `invite` and `closed` modes a `register` request
 `register-ip` token first, so an address that has used its tokens up gets 429 `rate_limited` where the mode alone
 would answer 403. It stays as S42 built it; §7.3 has the reasons and §7.9 the full order.
 
-**Open, for the owner** (README §6; still open after groups 8 and 9):
+Decided after group 10 (an engineering call the owner delegated; README §6 (1)): **the M1 security review's two
+findings in this doc are fixed by README F08.** The review (read-only, of `main` at f7053dc, before the first
+release candidate) found two gaps where the code followed this spec: a member could loop `POST /me/password` with
+their own password and keep every hash slot busy, because a right password gives `auth-user-ip` and `auth-user`
+their tokens back (R2: the `password-change` bucket of §7.3); and one session could hold all 10 of the user's push
+subscriptions, so one `POST /push/test` reached 10 endpoints (R6, with 04's half in 04 §14.4–§14.5: one
+subscription per web session, §12.4.6, `DeleteSessionPushSubscriptionsExcept` in §6).
+
+**Open, for the owner** (README §6; still open after groups 8, 9 and 10):
 - **Room names and the emoji that need U+FE0F or a zero-width joiner** (§8). The rule says emoji are allowed;
   the PRECIS profile it names refuses the variation selector U+FE0F and a joiner between emoji, so the red
   heart, the keycaps and the profession and family sequences are `invalid` in a room name, while an emoji of one

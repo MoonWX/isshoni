@@ -30,7 +30,7 @@ func udpAddrPortOf(c net.PacketConn) netip.AddrPort {
 func TestCountingPacketConnCounts(t *testing.T) {
 	a, b := listenUDP(t), listenUDP(t)
 	var c TransferCounter
-	w := newCountingPacketConn(a, &c)
+	w := newCountingPacketConn(a, &c, nil)
 	if _, ok := net.PacketConn(w).(ice.AddrPortReaderWriter); !ok {
 		t.Fatal("the counting wrapper does not implement ice.AddrPortReaderWriter")
 	}
@@ -74,7 +74,7 @@ func TestCountingPacketConnFallback(t *testing.T) {
 	m := newMemPacketConn("127.0.0.1:7882")
 	defer func() { _ = m.Close() }()
 	var c TransferCounter
-	w := newCountingPacketConn(m, &c)
+	w := newCountingPacketConn(m, &c, nil)
 	if w.ap != nil {
 		t.Fatal("a socket without AddrPort methods must use the fallback")
 	}
@@ -121,7 +121,7 @@ func (s *addrPortSpy) ReadFrom(b []byte) (int, net.Addr, error) {
 func TestUDPMuxUsesAddrPortPath(t *testing.T) {
 	spy := &addrPortSpy{UDPConn: listenUDP(t)}
 	var c TransferCounter
-	mux := ice.NewUDPMuxDefault(ice.UDPMuxParams{UDPConn: newCountingPacketConn(spy, &c)})
+	mux := ice.NewUDPMuxDefault(ice.UDPMuxParams{UDPConn: newCountingPacketConn(spy, &c, nil)})
 	defer func() { _ = mux.Close() }()
 
 	peer := listenUDP(t)

@@ -11,8 +11,9 @@
 //   collector exists until the runtime goes: it is what puts "Waiting for video…" on a tile whose picture stands
 //   still. It comes with the same chunk.
 // - The handle exists only in a tab with sessionStorage['isshoni.debug'] === '1' (lib/stats/debugHandle.ts). Its
-//   state() has ids and states and no names: nothing the page doesn't show. dropSocket() arrives with the web
-//   recovery slice, which gives the SignalClient its hook.
+//   state() has ids and states and no names: nothing the page doesn't show. dropSocket() needs a public hook on 01's
+//   SignalClient, which it doesn't have yet, so the handle's dropSocket() still throws; reconnect.spec drops the
+//   socket with the harness's cut link instead (e2e/fixtures.ts), which is how a network drops it.
 import type { Logger } from '../lib/log';
 import type { StatsCollector } from '../lib/stats/collector';
 import { installDebugHandle } from '../lib/stats/debugHandle';

@@ -294,7 +294,7 @@ already ended every share with its own reason.
 | DownTrack writer | 1 per DownTrack | RTX first, then munge, pace, write RTP, forward SRs | its queues |
 | DownTrack RTCP reader | 1 per DownTrack | PLI/FIR, NACK, REMB, RR from the viewer | `RTPSender.ReadRTCP` |
 | Ticker | 1 per SFU | 250 ms: event debounce (the `ShareUpdated` calls; `SubscriptionStateEvent`s are paced by their Conn's actor, below). 1 s: rates, cache sizing, stalled checks, allocator ticks, codec-policy timers, uplink policy | time |
-| Probe | 1 per probe PC | 20 s lifetime | timer |
+| Probe | 1 per probe PC, for its life (README S76: `probe.run`) | owns the probe PC once it has started: notes when it connects and reports the result once (1 s later, or when the probe ends first); ends the probe at the end of its 20 s life, when the PC fails or closes, when its data channel closes, or when it is stopped (a newer probe of the same user and transport, `SFU.Close`); then closes the PC and frees the slot. `SFU.Close` stops every probe, replaced ones included, and waits for them within its 1 s, then counts those still closing in one warning | its timers (life, the RTT sample) + a wake of capacity 1 that Pion's state callback fills without blocking + the channel's close + its stop. The echo is no goroutine of ours: it runs in Pion's data-channel read loop, and a send only queues (§7.6) |
 
 Rules:
 - Lock order: `SFU.mu` → `Room.mu` → `Share.mu` → `DownTrack.mu`. Each is held briefly and never across a Pion call,
@@ -687,7 +687,7 @@ type Error struct {
 	Retryable  bool
 	Share      ShareID       // set for no_h264, unknown_track and bad_rid when the failing m-section maps to a share
 	RetryAfter time.Duration // set for pc_rate_limited (§12), busy (1 s) and probe_limit (until the oldest running
-	                         // probe's 20 s lifetime ends)
+	                         // probe's 20 s lifetime ends, never below 1 s)
 	msg        string        // logs only, never sent
 }
 func (e *Error) Error() string          // the code, and ": " + msg when there is one
@@ -705,11 +705,11 @@ that has only `Code` set.
 
 | Code | Returned by | Retryable | Meaning |
 |---|---|---|---|
-| `sfu.closed` | any Conn method | no | Conn or SFU closed |
+| `sfu.closed` | any Conn method; Probe | no | Conn or SFU closed. `Probe` checks `Ready()` before the transport, the offer and the slot (only a contract violation comes first, §7.6), so after `Close` it is `sfu.closed` even for a disabled transport or a bad offer; it is also the answer for a probe that the same user's next probe of the transport replaced before the call returned |
 | `sfu.busy` | any Conn method | yes | actor queue full for 5 s |
 | `sfu.role_forbidden` | StartShare, HandleOffer(pub), UpdateSubscriptions | no | role can't do that |
 | `sfu.bad_pc` | HandleOffer, HandleAnswer, AddICECandidate, RestartICE, ResetPC, ClosePC | no | method not valid for that PC kind (e.g. an offer for `sub`, `RestartICE` or `ResetPC` for `pub`, an unknown kind; for `HandleOffer` a kind above `PCSub` is `sfu.pc_limit` instead), or the PC doesn't exist: a pub offer for a `gen` whose PC has closed, an answer for a closed sub PC's `gen` or without a sub PC, a `RestartICE`, `ResetPC` or `ClosePC{sub}` for a sub `gen` above the current one or without a sub PC. Not returned by `RestartICE`/`ResetPC` when the sub PC was closed: those calls rebuild it (§5.3) |
-| `sfu.bad_sdp` | HandleOffer, HandleAnswer | no | unparsable SDP, data channel in a media PC, >8 m-lines, a pub offer >64 KiB or a sub answer >256 KiB (01 §3.3) |
+| `sfu.bad_sdp` | HandleOffer, HandleAnswer, Probe | no | unparsable SDP, data channel in a media PC, >8 m-lines, a pub offer >64 KiB or a sub answer >256 KiB (01 §3.3). For `Probe` (README S76; 04 answers 400 `bad_sdp`): an offer that is empty, over 64 KiB, unparsable, not exactly one m-section that is `m=application`, or one that Pion's `SetRemoteDescription` refuses (§7.6) |
 | `sfu.no_h264` | HandleOffer | no | the video m-line offers no H.264 packetization-mode=1 (browser without H.264 encoder) |
 | `sfu.bad_rid` | HandleOffer | no | a rid outside {f,q} (M1), or more than 2 |
 | `sfu.unknown_track` | HandleOffer | no | a malformed binding: `tracks` binds one mid twice, a binding of this Conn's share has another kind than its m-section, or one share has a second video or audio m-section. Not for a sending m-section without a binding, or bound to a share that isn't a `pending`/`live`/`stalled` share of this Conn (a share that ended while its offer was in flight): §8.4 answers that m-section `a=inactive` and ignores it (01 §9 rule 4) |
@@ -721,7 +721,7 @@ that has only `Code` set.
 | `sfu.not_owner` | Conn.StopShare, UpdateShare | no | the share belongs to another Conn (the hub always calls the publishing Conn) |
 | `sfu.too_many_shares` | StartShare | no | defense in depth: 4 per participant (the hub enforces 4 per user and the room soft limit first, 01 §8.7) |
 | `sfu.too_many_subscriptions` | UpdateSubscriptions | no | guard: 256 per Conn, 64 items per call |
-| `sfu.probe_limit` | Probe | yes | 20 probes per server already running (a user's new probe of the same transport replaces the old one, §7.6) |
+| `sfu.probe_limit` | Probe | yes | 20 probes per server already running (a user's new probe of the same transport replaces the old one, §7.6). `RetryAfter` runs until the oldest running probe's 20 s life ends and is never below 1 s: a probe whose life has just ended keeps its slot until its PC is closed (README S76). 04 answers 429 with `Retry-After` |
 | `sfu.transport_disabled` | Probe | no | the requested transport has no mux: `udp` with `listen.ice_udp` = "", `tcp443` in `tls.mode=off`, `tcp7882` with `listen.ice_tcp` = "" (04 answers 409 `transport_disabled`) |
 | `sfu.internal` | any | yes; no for the case below | unexpected Pion error (logged with details). Also, with `Retryable` false: a call that breaks the API's contract (and, until README S76, a method that wasn't implemented yet) |
 
@@ -731,8 +731,10 @@ trying again can't help; since README S76 only the first is left:
   `User` or `Conn`, a `Role` or `ClientKind` outside its constants, a nil `Signaler`, a `Conn` id that is already
   joined, or a `Participant` that belongs to another `User`; `StartShare` with an empty share id, an id of a share
   that exists, or an unknown preset; `UpdateShare` with an unknown preset; an `UpdateSubscriptions` item with an
-  unknown quality (a per-item error). These are bugs in the hub or sfuplane, so they get no code of their own: the
-  log message names the call.
+  unknown quality (a per-item error); `Probe` with an empty user or a transport outside the three (README S76;
+  04's endpoint checks the transport before it calls). These are bugs in the hub, sfuplane or the wiring, so they
+  get no code of their own: the log message names the call. (A Pion failure in `Probe`, a PC or an answer it can't
+  make, is the ordinary retryable `sfu.internal`.)
 - **A method of a later slice** ("interfaces first", README §4), until README S76: the whole §6.1 API was declared
   from S29 on, and a method whose slice hadn't landed returned an `*Error{sfu.internal}` whose `Unwrap` was the
   sentinel `ErrNotImplemented`; the message named the method and its README slice. After S29 these were
@@ -824,7 +826,7 @@ on: in the usual VPS case the public address is on an interface and no rule appl
 the local address is replaced by the public one; on a home server the public one is appended, so LAN clients still
 connect directly. `SetNAT1To1IPs` and srflx rewrites are never used.
 
-### 7.3 SettingEngine (shared by the pub and sub APIs; the probe APIs differ only in network types and muxes)
+### 7.3 SettingEngine (shared by the pub and sub APIs; the probe APIs differ in network types, muxes, ICE timeouts and checks per pair)
 
 | Setting | Value | Why |
 |---|---|---|
@@ -833,10 +835,41 @@ connect directly. `SetNAT1To1IPs` and srflx rewrites are never used.
 | `SetLite(false)` | full ICE | S4 tested full ICE; no reason to change |
 | Remote-candidate filter (in `AddICECandidate`, and on the candidates inside every remote SDP: pub offers, sub answers and probe offers, before `SetRemoteDescription`) | drop loopback and the server's own advertised addresses unless `Transport.IncludeLoopback` (04's `network.include_loopback`); drop unparsable candidates, host names (mDNS or not), link-local, multicast, broadcast, unspecified (`0.0.0.0/8`, `::`) and IPv4-compatible IPv6 (`::/96`) addresses always; drop RFC 1918, CGNAT, ULA and site-local (`fec0::/10`) addresses unless any `Transport.Advertised[].LAN` is true (the server itself advertises a private address, 04's LAN/Append case). IPv4-mapped and NAT64 (`64:ff9b::/96`) addresses are judged by the IPv4 address inside. Pion's `SetRemoteIPFilter` is not used: Pion also applies it to prflx candidates, which the server must keep learning | 01 §17: a client must not make the server probe internal networks. Client addresses are learned as prflx from incoming checks anyway |
 | `SetICETimeouts(5 s, 15 s, 2 s)` | disconnected, failed, keepalive | the client drives restarts after 3 s; the server only cleans up |
+| `SetICEMaxBindingRequests` | 75 on the pub and sub APIs: the failed timeout ÷ Pion's 200 ms check interval, at least Pion's 7. Pion's 7 on the probe APIs, which only ever answer a browser's checks | a pair is checked for as long as the client waits for an ICE restart; Pion's 7 give it up after about 1.5 s. A probe gains nothing from more, and its offer's candidates would get more checks. Below |
 | `SetPrflxAcceptanceMinWait(300 ms)`, `SetSrflxAcceptanceMinWait(0)`, `SetHostAcceptanceMinWait(0)` | | when controlling (sub PC), browser pairs are prflx. Pion's default 1 s wait delays the first frame. 300 ms lets a UDP pair win over TCP |
 | `SetDTLSConnectContextMaker` | 10 s timeout | plan guard |
 | `SetSRTPProtectionProfiles` | `SRTP_AEAD_AES_128_GCM`, `SRTP_AES128_CM_HMAC_SHA1_80` | cheaper per-packet encryption |
 | receive MTU | Pion default (1460) | |
+| `DisableCloseByDTLS` | not set: Pion's default, which closes a PC when the peer's DTLS sends `close_notify` | decided in README S57 (§5.3). It works both ways: when the SFU closes a sub PC itself (a codec rebuild, §8.5), a client on Pion's defaults sees its own PC go `closed`, which a browser's never does. So a Go client (the recovery of 01's itest harness, whose viewer is a `sfutest.Viewer`) treats a sub PC closed under it as `disconnected`, not `failed`: the new `gen`'s offer is on its way, and a rebuild request for the old `gen` would be one the client must not send (01 §10.4, README S74) |
+
+**Checks per candidate pair** (README F10, S74-R1). While it connects, Pion's ICE agent sends one binding request
+every 200 ms on each pair that hasn't answered (webrtc's `SettingEngine` can't change that pace), and gives a pair up
+after `MaxBindingRequests` + 1 of them. A controlling agent never checks a pair again once it has given it up: it
+still answers the client's checks, but it nominates only a pair that its own check got through. The SFU controls
+every sub PC (it offers, and browsers are full ICE agents). With Pion's 7, a viewer whose network was still away when
+it sent `pc.restart{sub, ice}` (01 §11.5 B: 3 s after its ICE noticed) had each pair of that restart given up about
+1.5 s after its answer, and got its media back only through the rebuild 15 s after the restart's offer (01 §10.4).
+`maxBindingRequests` (`api.go`) gives a pair the checks of the failed timeout instead: 15 s, as long as the client
+waits for the restart before it rebuilds. It is set in `settingEngine`, so the pub API gets it as well as the sub
+API; `probeAPI` sets Pion's 7 back:
+- A controlled agent doesn't need it, and that is what the SFU is on a pub or probe PC, which the client offers. It
+  answers each of the client's checks with a triggered check of its own on any pair that hasn't succeeded, a
+  given-up one included (Pion skips it only on a pair that has succeeded, once the agent has selected a pair), and
+  that check's answer revives the pair: itest `TestUDPBlackHole` recovered a sharer's pub PC that way with Pion's 7,
+  from an ICE restart that the sharer offered about 2 s before its network came back. On a pub PC the setting only
+  lets the SFU's own checks of a silent pair go on longer, at the same pace and on the same pairs (at most 64 remote
+  candidates per PC and `gen`, below), and they end when the agent fails at the latest: each pair of a candidate
+  that the client names gets up to 76 checks over 15 s, where Pion's 7 sent 8.
+- The role is the negotiation's, not the API's: Pion controls a pub PC whose offer says `a=ice-lite`
+  (RFC 8445 §6.1.1), and switches roles after a 487 role conflict. One setting for both keeps those right too,
+  and the pub and sub APIs keep one `SettingEngine`, as this section's heading says; the prflx wait above is a
+  setting of the same kind, which only matters when the SFU controls.
+- The probe APIs keep Pion's 7. A browser's probe offer has no candidates (§7.6): the SFU learns the browser's
+  address as prflx from its checks and, as the controlled agent, answers each with a triggered check, so a probe
+  gains nothing from more. Only a hand-made `a=ice-lite` probe offer would make the SFU control a probe PC. What more
+  would cost: a probe offer's candidates are the client's (up to 64, at addresses of its choosing; README S76), and
+  any signed-in user may post 12 probe offers a minute (04 §7.7). With the 40 that the probe's 8 s would give, each
+  of those candidates would get 41 checks instead of 8, about five times the STUN that S76 bounded.
 
 **The filter also counts** (README S57; the cap is §12's 64 per PC and `gen`). Pion's ICE agent keeps every remote
 candidate that equals none it already has, pairs it with each local candidate and sends its checks to it, and has
@@ -863,9 +896,15 @@ no cap of its own. So every candidate that reaches Pion goes through one count p
   ignored.
 
 Everything this drops is dropped without an error and logged at debug (a trickled candidate with its reason,
-`limit` for the cap; those of a description as a count). The count is for a Conn's two PCs: the filter without
-it (`filterSDP`) is what the probe offers of §7.6 go through (README S76), since a probe PC takes one offer and
-nothing trickled.
+`limit` for the cap; those of a description as a count). A probe offer of §7.6 goes through the filter and a
+count of its own (README S76, `filterProbeOffer`): its one remote description is all a probe PC ever gets, so the
+count starts and ends with it, and past the first 64 the candidates are dropped like a PC's. A browser's probe
+offer has none, but a 64 KiB one could carry some 1,400, and the probe PC, the controlled agent, sends its checks
+to every pair it has.
+
+Peer-reflexive candidates, which Pion learns from the checks that reach it, never pass through this filter (it
+must keep learning them, the table's row above). Their source addresses are bounded below Pion, in 04's netx: 64
+per local ICE ufrag (§12, 04 §7.8; README F06, from the M1 security review).
 
 ### 7.4 ICE-TCP on 443
 
@@ -893,6 +932,11 @@ type ProbeResult struct {
 	RTT       time.Duration // from the candidate-pair stats
 	Err       string        // "timeout" | "closed"
 }
+// The Err values of a ProbeResult that didn't connect (README S76).
+const (
+	ProbeErrTimeout = "timeout" // its life ended first, or ICE (8 s without a working pair) or DTLS failed
+	ProbeErrClosed  = "closed"  // the client closed its side, a newer probe of the user's replaced it, or the SFU closed
+)
 // offerSDP: a browser offer with one data channel (m=application) and no media. The answer is complete (no trickle)
 // and holds only candidates of the requested transport. Browser candidates are not needed: the browser's checks
 // reach the public address and the server learns prflx.
@@ -923,6 +967,36 @@ func (s *SFU) Probe(ctx context.Context, user UserID, t ProbeTransport, offerSDP
 - Guards: one probe per (user, transport): a new probe closes that user's previous probe of the same transport. 20 per
   server (`sfu.probe_limit`, retryable; 04 answers 429). 04 adds 12 requests per minute per user.
 - Access: any signed-in user (04). Only admins see provider fix text (05).
+
+**As README S76 built it** (`probe.go`, the probe APIs in `api.go`), where the list above leaves a choice:
+- **Order of the checks**: an empty user or an unknown transport is a contract violation (`sfu.internal`, not
+  retryable, §6.3); then `Ready()` (`sfu.closed` after `Close`, whatever else is wrong); `sfu.transport_disabled`;
+  the offer guard; the candidates; the slot (`sfu.probe_limit`, or `sfu.closed` when `Close` came meanwhile). A
+  probe that a newer one of the same user and transport replaced before `Probe` returned gets `sfu.closed`.
+- **The offer guard** is the SFU's own: at most 64 KiB (`maxProbeOfferBytes`, the limit of a pub offer, §12; a
+  browser's probe offer is about 1 KB), parsable, and exactly one m-section, which must be `m=application`. Anything
+  else, and an offer that Pion's `SetRemoteDescription` refuses, is `sfu.bad_sdp` (§6.3; 04 answers 400 `bad_sdp`).
+- **The offer's candidates** go through the remote-candidate filter of §7.3 and a cap of 64 counted as for a PC
+  (§7.3, §12); the excess is dropped and counted at debug. A browser sends none, so the cap costs nothing, and it
+  keeps one request from making the probe PC, the controlled agent, check some 1,400 pairs.
+- **One data channel per probe PC.** The first channel is served; any further one is closed as it opens, because
+  each channel costs Pion a goroutine for the probe's life. The probe ends when its channel closes.
+- **No echo while more than 1 MiB of echoes waits to go out** (`maxProbeEchoBuffered`, the channel's
+  `BufferedAmount`): Pion queues data-channel sends without a bound, so a client that sends without reading would
+  otherwise have the server hold its echoes for the probe's 20 s. The browser's five small pings are far below it.
+  Text comes back as text and binary as binary.
+- **The result**: `res` gets one value. For a probe that connected, 1 s after it connected (`Selected` and `RTT` from
+  the selected candidate pair then), or when the probe ends sooner, with what is readable then (`RTT` 0 when unknown,
+  `Selected` "" once the PC is closed). For one that didn't, `Err` says why: `ProbeErrTimeout` when its life ended, or
+  its ICE (8 s without a working pair) or DTLS failed first; `ProbeErrClosed` when the client closed its side (its
+  data channel, or its PeerConnection with a DTLS `close_notify`), a newer probe of the same user and transport
+  replaced it, or `SFU.Close` stopped it. `Selected` is the server's candidate with its transport label and its
+  address after the rewrite rules (`udp 203.0.113.5:7882`); a TCP candidate that no advertised address matches is
+  labeled `tcp`. One info line per probe that was handed out says how it ended, without addresses (§13).
+- **`SFU.Close`** stops every probe, replaced ones included, and waits for them within its 1 s (§5.4); a probe
+  still closing its PC then is counted in one warning.
+- **What is exported beyond §6 and §18**: `ProbeErrTimeout` and `ProbeErrClosed`; the test helpers of
+  `export_test.go` (`Timings.ProbeLife`, `MaxProbes`, `SFU.Probes`, `SFU.HasProbe`) are for this package's tests.
 
 ## 8. Codecs (M1)
 
@@ -1621,8 +1695,18 @@ requests for a packet that never comes. In integration 19 the publisher now rese
   only once per 5 s (§9.3), so a viewer nothing reaches can't cost the others two keyframes a second.
 - **No lock, any goroutine.** The throttle is a compare-and-swap on the layer's `lastPLI`, so DownTrack writers and
   RTCP readers, the layer's own read loop and any Conn's actor call it directly; a caller that loses the race is
-  counted as throttled. When the write fails (the pub PC isn't connected, or is closing), nothing is retried:
-  whoever still waits asks again after 500 ms. Audio layers never ask.
+  counted as throttled. When the write fails (the pub PC is closing, or went down before its actor saw it),
+  nothing is retried: whoever still waits asks again after 500 ms. Audio layers never ask.
+- **Nothing while the pub PC is away** (README F10, S74-R1). While the publishing Conn's actor has its pub PC as not
+  connected (`Conn.pubUp`, the view that the stalled check of §5.3 and the pending share's requests above go by), a
+  request returns at once: no PLI, and `lastPLI` stays as it was, so it neither starts the 500 ms nor counts as
+  throttled. No PLI could get through then, and the pub PC's connect asks for every layer it carries (the callers
+  above; the actor sets `pubUp` before it asks). Before, such a request started the 500 ms, and the connect's own
+  request, when it came within them, was throttled. That is the order after an outage that took both a viewer's and
+  its sharer's UDP (01 §11.5 B; itest `TestUDPBlackHoleViewer`): the viewer's sub PC connects some 30 ms before the
+  sharer's pub PC and asks for the full layer it watches, the share goes live again on the preview layer's keyframe,
+  and the viewer's DownTrack, which waits for no keyframe, goes on with the full layer's delta frames. A browser asks
+  for a keyframe itself then; the tests' Go viewer doesn't.
 
 ### 9.8 Pacing (keyframe bursts)
 
@@ -1799,17 +1883,31 @@ Guards limit abuse, not people. Every number here is a constant in `config.go`, 
 | Shares | 4 per participant (defense in depth; the hub enforces 4 per user and the room soft limit, 01) | `sfu.too_many_shares` |
 | Publish offer | ≤64 KiB, ≤8 m-lines, ≤2 rids from {f,q}, no data channel | §6.3 codes |
 | Remote candidates | 64 per PC and gen in total, trickled or in the PC's remote descriptions, buffered or applied; a candidate is what Pion keeps as one, and one that comes again counts once (§7.3); the first 64 are kept | later ones dropped, logged at debug |
+| Peer-reflexive sources (04's netx, 04 §7.8) | 64 distinct remote transport addresses per local ICE ufrag, from which STUN with that ufrag reaches Pion: UDP and ICE-TCP, every UDP socket and both TCP ports counted together, probe PCs included; an address counted once costs nothing again; the count starts over with a new ufrag (ICE restart) and ends when Pion removes the ufrag from the muxes (close, failed); a removed ufrag is never counted again (Pion never reuses one); sources count before Pion checks MESSAGE-INTEGRITY, so an on-path party who spoofs UDP sources with a seen ufrag can use up its slots until an ICE restart | STUN from a further address is dropped before Pion: no Binding response, no prflx candidate, no address-map entry; an ICE-TCP connection is closed at its first frame; logged at debug once per ufrag |
 | Subscriptions | 256 per Conn; 64 items per `UpdateSubscriptions` | `sfu.too_many_subscriptions` |
 | Actor command queue | 64; 5 s wait | `sfu.busy` |
 | Share without media | none here: the hub ends shares `starting` or `stalled` for 30 s (`media_timeout`, 01 §4.4) | – |
 | Keyframe requests upstream | 1 per 500 ms per layer | throttled (counted) |
 | NACK | ≤1 s old, ≤3 retransmits per seq, 25% budget | skipped (counted) |
 | DownTrack queues | video 1024, audio 256, RTX 256 | drop newest (counted) |
-| Probe PCs | 1 per user and transport (a new one closes the old one), 20 total, 20 s lifetime | `sfu.probe_limit` (retryable) |
+| Probe PCs | 1 per user and transport (a new one closes the old one), 20 total, 20 s lifetime | `sfu.probe_limit` (retryable; `RetryAfter` at least 1 s) |
+| Probe offer (README S76) | ≤64 KiB, exactly one m-section, `m=application`; its remote candidates through the filter of §7.3 and capped at 64, as a PC's | `sfu.bad_sdp`; candidates past the cap dropped, counted at debug |
+| Probe data channels (README S76) | 1 per probe PC; no echo while more than 1 MiB of echoes waits to go out | a further channel is closed as it opens; a message that comes while 1 MiB waits is not echoed |
 | UDP buffers | 8 MiB requested by 04's netx | warning in doctor (04) |
 
 ICE-TCP first STUN 10 s and ICE-TCP per-IP limits are 04's (netx TCPMux on 443 and 7882); a violation closes the TCP
 connection, not the PC.
+
+**From the M1 security review** (a read-only review of `main` at f7053dc; README §6 "Decided after group 10" (1)).
+Two of its findings are about state that one PC grows from crafted packets, where "Pion has no cap of its own":
+- **R3, peer-reflexive sources**: a member who has a PC's ICE credentials could send valid checks from ever new
+  source addresses, and Pion makes a prflx candidate and pairs for each one, past the 64 of the remote-candidate
+  row. Fixed below Pion, in 04's netx (README F06): the peer-reflexive sources row of this table, 04 §7.8.
+- **R1, pub-PC tracks under SSRC churn**: a publishing member with a custom DTLS-SRTP client can make Pion deliver
+  `OnTrack` again for each new SSRC, and the pub PC then grows tracks, reader goroutines and NACK-filter entries
+  without a bound. README F07 caps the deliveries a pub PC holds and drops the PC past the cap; its change is
+  built but not merged, **waiting for the owner** (its tests are not written yet). Until it lands, nothing in this
+  table bounds them.
 
 **What the PC creation limit counts** (README S57, `Conn.admitPC`; one window of the last 10 per Conn and kind):
 - **pub**: every pub PC the SFU makes for an offer of a new `gen`, whether or not Pion then takes that offer. An
@@ -2473,7 +2571,9 @@ milestone gate before the M1 exit test). `-scenario smoke` runs as a Go test in 
   (`Code…` constants), `ConnStats` and its types (`PCStats`, `OwnShareStats`,
   `SubscriptionStats`, `DownTrackStats`),
   `Snapshot` and its types (`RoomSnapshot`, `ShareSnapshot`, `ViewerCounts`, `ConnSummary`, `SnapshotTotals`),
-  `Metrics` and its label values (§13), `ProbeTransport`, `ProbeResult`. Later: `RoomLimits`, `SetRoomLimits`.
+  `Metrics` and its label values (§13), `ProbeTransport` (with `ProbeUDP`, `ProbeTCP443`, `ProbeTCP7882`),
+  `ProbeResult` and its `Err` values `ProbeErrTimeout` and `ProbeErrClosed` (§7.6, README S76). Later:
+  `RoomLimits`, `SetRoomLimits`.
   `Role`, `ClientKind` and `PCKind` have no valid zero value (§6.1).
 - **Wire-visible conventions** (through 01's `sfuplane`): rids `f`/`q`, at most 2, or none (`h` rejected until M5);
   share ids from the hub; sub msid = share id and track ids `v-`/`a-`+share id (debugging aid; mapping is by
@@ -2674,3 +2774,16 @@ reason, README S79).
 1. **Layer pausing** (§11): on by default, with the switch `sfu.pause_unwatched_layers`; the slice is cuttable to M5.
 2. **Who may run the connection test** (§7.6): every signed-in user, one probe per user and transport (a new one
    replaces the old one); only admins see provider fix text (05).
+
+Decided after group 10 (engineering calls the owner delegated; README §6):
+
+3. **The sub PCs keep checking candidate pairs for the length of the failed timeout**, so a sub ICE restart that a
+   viewer asks for while its network is still gone connects once the network is back (§7.3; 01 §10.4, §11.5 B).
+   With Pion's default the SFU, the controlling agent of a sub PC, gave up on each pair after 7 unanswered checks,
+   about 1.5 s, and such a viewer came back only through the 15 s rebuild. README F10 builds it, together with
+   keyframe requests that wait while the share's pub PC is away, so that the request of the pub PC's own reconnect
+   is not swallowed by the 500 ms throttle (§9.7). The setting is in the shared `SettingEngine`, so the pub PCs get
+   it too; the probe APIs keep Pion's 7 (§7.3).
+4. **The M1 security review's two findings in this doc** (§12): R3, peer-reflexive sources, is bounded below Pion
+   in 04's netx, 64 per local ICE ufrag (README F06); R1, pub-PC tracks under SSRC churn, has a fix that waits for
+   the owner (README F07).

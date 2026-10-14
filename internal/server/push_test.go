@@ -169,10 +169,14 @@ func TestShareStartedPush(t *testing.T) {
 	srv := servertest.Start(t, servertest.Options{Deps: deps})
 	setUp(t, srv)
 	kim, sam, pat := register(t, srv, "Kim"), register(t, srv, "Sam"), register(t, srv, "Pat")
+	// A session keeps only its newest subscription (03 §12.4.6), so Sam's two devices are two logins.
+	samOnPhone := browser(t, srv)
+	wantStatus(t, "Sam's login on a second browser", callAs(t, samOnPhone, srv, http.MethodPost, "/api/v1/auth/login",
+		api.LoginRequest{Username: "Sam", Password: "a long enough password"}), http.StatusOK, "")
 	subscribe(t, srv, srv.Client, pushes, "alex-laptop")
 	subscribe(t, srv, kim, pushes, "kim-laptop")
 	samLaptop := subscribe(t, srv, sam, pushes, "sam-laptop")
-	samPhone := subscribe(t, srv, sam, pushes, "sam-phone")
+	samPhone := subscribe(t, srv, samOnPhone, pushes, "sam-phone")
 	subscribe(t, srv, pat, pushes, "pat-phone")
 	wantStatus(t, "Pat's preferences", callAs(t, pat, srv, http.MethodPut, "/api/v1/push/preferences",
 		api.PushPreferences{ShareStarted: api.ShareStartedPrefOff, AdminAlerts: true}), http.StatusOK, "")

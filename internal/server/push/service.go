@@ -50,8 +50,8 @@ type Options struct {
 	Subject  string                  // the VAPID sub claim: a mailto: or https: URL (DeriveSubject)
 	Store    Store
 	Sender   Sender           // nil: the real one, webpush-go with the guarded HTTP client (04 §14.5)
-	Workers  int              // 0: 4
-	QueueLen int              // 0: 1024
+	Workers  int              // the workers of share.started and admin.alert; 0: 4 (push.test has one of its own)
+	QueueLen int              // the length of each queue (events, jobs, push.test jobs); 0: 1024
 	Now      func() time.Time // nil: time.Now
 	Logger   *slog.Logger     // nil: discard
 
@@ -78,6 +78,10 @@ var ErrDisabled = errors.New("push: disabled by push.enabled = false")
 const (
 	defaultWorkers  = 4
 	defaultQueueLen = 1024
+	// testWorkers is the size of the push.test lane (README F08): one worker of its own, so a member who tests a
+	// subscription whose push service never answers holds that worker and no other, and nobody's share.started or
+	// admin.alert waits for it.
+	testWorkers = 1
 	// drainTimeout is how long Run keeps sending what is queued after its context ended (04 §6.4 step 6).
 	drainTimeout = 2 * time.Second
 	// dropLogEvery bounds the "dropped" warnings.
@@ -85,7 +89,8 @@ const (
 )
 
 // retryDelays are the waits before the second and third attempt of a message that got 429, 5xx or no answer.
-// A Retry-After of at most maxRetryAfter replaces the wait; nothing is retried past the message's TTL.
+// A Retry-After of at most maxRetryAfter replaces the wait; nothing is retried past the message's TTL. A push.test
+// is attempted once (job.once).
 var retryDelays = [...]time.Duration{5 * time.Second, 30 * time.Second}
 
 // result is a value of the result label of isshoni_push_sent_total.
@@ -126,6 +131,11 @@ type job struct {
 	attempt  int       // 0 for the first try
 }
 
+// once reports whether j is attempted once, without the retries of a transient failure: a push.test is (README
+// F08). The member who asked for it sees the result at once or not at all, and a retry would only give one member
+// more time on the push.test lane.
+func (j job) once() bool { return j.kind == api.PushTypeTest }
+
 // Service is the Web Push sender. New builds it (and runs the VAPID fingerprint check), Run drives it until its
 // context ends. The triggers and SendTest only queue; they may be called before Run, and from any goroutine.
 type Service struct {
@@ -140,7 +150,8 @@ type Service struct {
 	workers   int
 
 	events chan event
-	jobs   chan job
+	jobs   chan job      // share.started and admin.alert, for the workers
+	tests  chan job      // push.test, for the one worker of its own lane (SendTest)
 	stop   chan struct{} // closed when Run's context ends: no new work, the queues drain
 
 	running atomic.Bool // Run was called
@@ -151,7 +162,7 @@ type Service struct {
 	buckets *buckets
 
 	mu      sync.Mutex
-	stopped bool                     // set with closed, under mu: no retry is scheduled or queued any more
+	stopped bool                     // set with closed, under mu: no retry or test is scheduled or queued any more
 	retries map[*time.Timer]struct{} // retries that wait for their time
 
 	counts [numResults]atomic.Uint64
@@ -218,6 +229,7 @@ func New(ctx context.Context, opts Options) (*Service, error) {
 	}
 	s.events = make(chan event, queueLen)
 	s.jobs = make(chan job, queueLen)
+	s.tests = make(chan job, queueLen)
 
 	rotated, deleted, err := checkVAPIDFingerprint(ctx, s.store, vapidFingerprint(pub))
 	if err != nil {
@@ -295,9 +307,9 @@ func DeriveSubject(pushSubject, acmeEmail, origin string) string {
 // point that a browser passes to pushManager.subscribe as applicationServerKey. 03 publishes it in GET /info.
 func (s *Service) VAPIDPublicKey() string { return s.publicKey }
 
-// Run starts the workers, the dispatcher and the daily prune, and blocks until ctx ends. Then it stops taking
-// work, keeps sending what is already queued for at most 2 seconds (04 §6.4), drops the rest and the pending
-// retries, and returns nil. Run can be called once.
+// Run starts the workers, the push.test lane's worker, the dispatcher and the daily prune, and blocks until ctx
+// ends. Then it stops taking work, keeps sending what is already queued for at most 2 seconds (04 §6.4), drops the
+// rest and the pending retries, and returns nil. Run can be called once.
 func (s *Service) Run(ctx context.Context) error {
 	if !s.running.CompareAndSwap(false, true) {
 		return errors.New("push: Run called more than once")
@@ -313,7 +325,11 @@ func (s *Service) Run(ctx context.Context) error {
 		s.dispatch(work)
 	})
 	for range s.workers {
-		wg.Go(func() { s.work(work, dispatched) })
+		wg.Go(func() { s.work(work, s.jobs, dispatched) })
+	}
+	// Nothing queues a test once stop is closed (SendTest checks stopped under mu), so the lane drains after it.
+	for range testWorkers {
+		wg.Go(func() { s.work(work, s.tests, s.stop) })
 	}
 	wg.Go(func() { s.pruneLoop(ctx) })
 
@@ -369,9 +385,16 @@ func (s *Service) trigger(ev event) {
 }
 
 // SendTest queues the test notification for the given subscriptions (03's POST /api/v1/push/test passes the
-// caller's current session's). It does not wait for the delivery. The per-recipient rate limit does not apply:
-// 03 limits the endpoint itself, and a test that silently sends nothing would look like broken notifications.
-// It returns an *api.Error with server_busy when the queue is full, and server_shutdown once Run's context ended.
+// caller's current session's, which is one). It does not wait for the delivery. The per-recipient rate limit does
+// not apply: 03 limits the endpoint itself, and a test that silently sends nothing would look like broken
+// notifications.
+//
+// Tests have a lane of their own (README F08): their own queue and one worker, never the workers of share.started
+// and admin.alert, and each is attempted once (job.once). A member whose subscription leads to a push service that
+// never answers holds that one worker for at most sendTimeout per test, and nobody else's notification waits.
+//
+// It returns an *api.Error with server_busy when the lane's queue took none of them, and server_shutdown once Run's
+// context ended.
 func (s *Service) SendTest(ctx context.Context, subs []Subscription) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -389,10 +412,22 @@ func (s *Service) SendTest(ctx context.Context, subs []Subscription) error {
 	}
 	o := SendOptions{TTL: ttlTest, Urgency: UrgencyHigh}
 	queued := 0
-	for _, sub := range subs {
-		if s.enqueue(job{kind: api.PushTypeTest, sub: sub, payload: payload, opts: o, deadline: now.Add(o.TTL)}) {
-			queued++
+	// Queued under mu: shutdown sets stopped under mu before it lets the lane drain, so the lane's worker sees every
+	// test that was queued, and none is queued once it is gone.
+	s.mu.Lock()
+	stopped := s.stopped
+	if !stopped {
+		for _, sub := range subs {
+			select {
+			case s.tests <- job{kind: api.PushTypeTest, sub: sub, payload: payload, opts: o, deadline: now.Add(o.TTL)}:
+				queued++
+			default:
+			}
 		}
+	}
+	s.mu.Unlock()
+	if stopped {
+		return &api.Error{Code: api.CodeServerShutdown, RetryAfter: 5}
 	}
 	if queued < len(subs) {
 		s.dropped(len(subs)-queued, dropQueueFull)
@@ -542,16 +577,18 @@ func (s *Service) fanOut(log *slog.Logger, kind api.PushType, subs []Subscriptio
 	log.Debug("queued", "recipients", len(hasToken), "subscriptions", queued)
 }
 
-// work is one worker: it sends jobs until the dispatcher is done and the queue is empty.
-func (s *Service) work(ctx context.Context, dispatched <-chan struct{}) {
+// work is one worker of a queue: it sends jobs until done is closed (nothing is queued any more) and the queue is
+// empty. The workers of share.started and admin.alert serve jobs until the dispatcher is done; the push.test lane's
+// worker serves tests until stop.
+func (s *Service) work(ctx context.Context, queue <-chan job, done <-chan struct{}) {
 	for {
 		select {
-		case j := <-s.jobs:
+		case j := <-queue:
 			s.deliver(ctx, j)
-		case <-dispatched:
+		case <-done:
 			for {
 				select {
-				case j := <-s.jobs:
+				case j := <-queue:
 					s.deliver(ctx, j)
 				default:
 					return
@@ -641,7 +678,7 @@ func (s *Service) deliver(ctx context.Context, j job) {
 		}
 		s.record(ctx, log, j.sub, false, now)
 	case outcomeTransient:
-		if wait, ok := retryWait(j, res, now); ok {
+		if wait, ok := retryWait(j, res, now); ok && !j.once() {
 			next := j
 			next.attempt++
 			if s.retryLater(next, wait) {
@@ -650,7 +687,11 @@ func (s *Service) deliver(ctx context.Context, j job) {
 			}
 		}
 		s.count(resultError, 1)
-		log.Warn("not sent: the push service keeps failing", append(failure(res, err), "attempts", j.attempt+1)...)
+		msg := "not sent: the push service keeps failing"
+		if j.once() {
+			msg = "not sent: the push service failed, and a test is not retried"
+		}
+		log.Warn(msg, append(failure(res, err), "attempts", j.attempt+1)...)
 		s.record(ctx, log, j.sub, false, now)
 	}
 }

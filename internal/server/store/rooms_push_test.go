@@ -484,3 +484,57 @@ func TestPushPreferences(t *testing.T) {
 		return nil
 	})
 }
+
+// TestDeleteSessionPushSubscriptionsExcept: one subscription per web session (README F08). It deletes the
+// session's other rows and nothing else: not the kept one, not the user's other sessions' rows, not a device's,
+// not another user's.
+func TestDeleteSessionPushSubscriptionsExcept(t *testing.T) {
+	t.Parallel()
+	f := newPushFixture(t)
+	db, t0 := f.db, f.e.clock.Now()
+	sSam2 := f.e.newSession(db, f.sam.ID, "s2", t0)
+	newDevice(t, db, "samdevice001", f.sam.ID, t0)
+	add := func(p PushSubscription) PushSubscription {
+		p.UserID, p.P256dh, p.Auth, p.Name = f.sam.ID, "k", "a", "n"
+		mustWrite(t, db, func(q *Q) error { _, err := q.UpsertPushSubscription(&p); return err })
+		return p
+	}
+	second := add(PushSubscription{SessionID: f.sSam.ID, Endpoint: "https://push.example/sam-2"})
+	newest := add(PushSubscription{SessionID: f.sSam.ID, Endpoint: "https://push.example/sam-3"})
+	otherSession := add(PushSubscription{SessionID: sSam2.ID, Endpoint: "https://push.example/sam-other"})
+	device := add(PushSubscription{DeviceID: "samdevice001", Endpoint: "https://push.example/sam-device"})
+
+	mustWrite(t, db, func(q *Q) error {
+		n, err := q.DeleteSessionPushSubscriptionsExcept(f.sSam.ID, newest.ID)
+		if err != nil || n != 2 {
+			t.Errorf("DeleteSessionPushSubscriptionsExcept = %d, %v; want 2 (the session's first two)", n, err)
+		}
+		if n, err := q.DeleteSessionPushSubscriptionsExcept(f.sSam.ID, newest.ID); err != nil || n != 0 {
+			t.Errorf("a second call = %d, %v; want 0", n, err)
+		}
+		if _, err := q.DeleteSessionPushSubscriptionsExcept("", newest.ID); err == nil {
+			t.Error("a call without a session succeeded")
+		}
+		return nil
+	})
+	var left []PushSubID
+	mustRead(t, db, func(q *Q) error {
+		return q.queryAll("left", "SELECT id FROM push_subscriptions ORDER BY rowid", nil, func(r scanner) error {
+			var id string
+			err := r.Scan(&id)
+			left = append(left, PushSubID(id))
+			return err
+		})
+	})
+	want := []PushSubID{f.pAlex.ID, f.pKim.ID, newest.ID, otherSession.ID, device.ID}
+	if !slices.Equal(left, want) {
+		t.Errorf("left %v, want %v (Sam's first two, %s and %s, gone)", left, want, f.pSam.ID, second.ID)
+	}
+	// It writes, so it is refused inside a Read.
+	mustRead(t, db, func(q *Q) error {
+		if _, err := q.DeleteSessionPushSubscriptionsExcept(sSam2.ID, ""); !errors.Is(err, errReadOnlyTx) {
+			t.Errorf("inside Read = %v, want errReadOnlyTx", err)
+		}
+		return nil
+	})
+}

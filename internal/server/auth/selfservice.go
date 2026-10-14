@@ -94,12 +94,38 @@ func lastActiveAdmin(q *store.Q, user store.User) (bool, error) {
 // A user whose hash is NULL (an admin reset is pending) has no session, so this is only reached by a race; the
 // attempt then costs the same one hash and fails.
 func (s *Service) verifyOwnPassword(ctx context.Context, op string, user store.User, password string, m ReqMeta) error {
+	return s.reauthenticate(ctx, op, user, password, m, false)
+}
+
+// reauthenticate is verifyOwnPassword. With change set it is the currentPassword of a password change, which also
+// holds a token of the password-change bucket (03 §7.3, README F08): taken after the password's shape and before
+// the two per-username buckets, so before the first hash, and kept when the password was right. Every other end
+// gives it back: a refusal of another bucket, a full hash queue, a store or context error, and a wrong password,
+// which is a failed password check that auth-user-ip and auth-user count as before.
+//
+// That bucket bounds the one path the other two can't: a correct password gives them their tokens back, so a
+// member could otherwise loop POST /me/password with the own password (or two passwords in turn) and keep every
+// hash slot busy. A change whose current password was right runs at most two hashes, so such changes run at most
+// twice the bucket's tokens in hashes, and requests sent in parallel can't outrun it: each takes its token before
+// it hashes. A wrong current password costs one hash and the tokens of the two per-username buckets, as on every
+// path that asks for the password again (DeleteSelf's too), so the bucket would add nothing there; it also leaves
+// the rule "five wrong tries from one address block that address" as it was.
+func (s *Service) reauthenticate(ctx context.Context, op string, user store.User, password string, m ReqMeta,
+	change bool,
+) error {
 	if password == "" {
 		return errWrongPassword()
 	}
 	pw, err := normalizePassword(password)
 	if err != nil {
 		return errWrongPassword()
+	}
+	var token *changeToken
+	if change {
+		if token, err = s.takePasswordChange(ctx, user.ID); err != nil {
+			return err
+		}
+		defer token.release()
 	}
 	attempt, err := s.reservePasswordAttempt(ctx, user.UsernameKey, true, m)
 	if err != nil {
@@ -126,9 +152,48 @@ func (s *Service) verifyOwnPassword(ctx context.Context, op string, user store.U
 		return errWrongPassword()
 	}
 	// A correct password from this address: like a login, it gives the auth-user token back and refills this
-	// address's auth-user-ip bucket for the username.
+	// address's auth-user-ip bucket for the username. A password change keeps its token, whatever comes next.
 	attempt.loggedIn()
+	token.keep()
 	return nil
+}
+
+// changeToken is the token one password change holds in the password-change bucket (reauthenticate). A nil
+// *changeToken is the re-authentication of a call that has no such bucket, and its methods do nothing.
+type changeToken struct {
+	l    *limiter[store.UserID]
+	user store.UserID
+	kept bool
+}
+
+// keep spends the token: the current password was right, and the change goes on to hash the new one.
+func (c *changeToken) keep() {
+	if c != nil {
+		c.kept = true
+	}
+}
+
+// release gives the token back unless keep spent it. reauthenticate defers it, so no other end keeps a token.
+func (c *changeToken) release() {
+	if c != nil && !c.kept {
+		c.kept = true
+		c.l.refund(c.user)
+	}
+}
+
+// takePasswordChange takes a token of the user's password-change bucket (03 §7.3). An empty bucket is 429
+// rate_limited with retryAfter, before any hash; the first refusal of an episode logs one warn line with the user's
+// ID. It writes no auth.throttled row: 03 §10 has no scope for this bucket, as for auth-user-ip and push-test.
+func (s *Service) takePasswordChange(ctx context.Context, user store.UserID) (*changeToken, error) {
+	v := s.throttle.passwordChange.take(user)
+	if !v.OK {
+		if v.First {
+			s.log.LogAttrs(ctx, slog.LevelWarn, "password changes throttled", slog.String("bucket", "password-change"),
+				slog.String("user_id", string(user)))
+		}
+		return nil, rateLimited(v)
+	}
+	return &changeToken{l: s.throttle.passwordChange, user: user}, nil
 }
 
 // ---- sessions ----
@@ -253,7 +318,10 @@ func (s *Service) LogoutEverywhere(ctx context.Context, p Principal, m ReqMeta) 
 //  1. the caller: an active account and a live session, else unauthenticated;
 //  2. the new password's rules (CheckPassword, with the username) → 422 validation_failed {newPassword: code}, so
 //     a request that can't succeed costs no hash;
-//  3. the current password (verifyOwnPassword) → 403 wrong_password, 429 rate_limited, 503 server_busy;
+//  3. the current password (reauthenticate): one that is missing or can't be a password → 403 wrong_password;
+//     the user's password-change bucket (03 §7.3: 3, then 1 per 10 min) → 429 rate_limited; then as in
+//     verifyOwnPassword → 429 rate_limited, 403 wrong_password, 503 server_busy. Only a right current password
+//     keeps the bucket's token;
 //  4. the new hash, outside the transaction → 503 server_busy;
 //  5. one Write, which checks the caller again and that the password is still the one that was verified (a
 //     parallel change or an admin reset in between answers wrong_password): the hash and password_changed_at; every
@@ -285,7 +353,7 @@ func (s *Service) ChangePassword(ctx context.Context, p Principal, current, next
 		}
 		return LoginResult{}, internalErr(op, err)
 	}
-	if err := s.verifyOwnPassword(ctx, op, me.user, current, m); err != nil {
+	if err := s.reauthenticate(ctx, op, me.user, current, m, true); err != nil {
 		return LoginResult{}, err
 	}
 	phc, err := s.hasher.hash(ctx, pw)

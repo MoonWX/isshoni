@@ -266,7 +266,8 @@
     "ended": {
       "elsewhere": "Sharing was stopped from another tab or device",
       "mediaTimeout": "Sharing stopped: no video reached the server",
-      "generic": "Sharing stopped by the server"
+      "generic": "Sharing stopped by the server",
+      "unreachable": "Sharing stopped: the server was unreachable"
     }
   },
   "room": {

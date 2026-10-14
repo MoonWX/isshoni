@@ -45,11 +45,17 @@ type Conn struct {
 	events eventQueue
 
 	// pubUp and pubDownAt are what the actor has seen of the Conn's pub PC, for the goroutines that decide the media
-	// state of its shares (02 §5.3): the layers' read loops and the ticker. pubUp is true while the current pub PC is
-	// connected. pubDownAt is the monoNow at which it last stopped being so, 0 before any pub PC was connected. Only
-	// the actor writes them (markPubDown, onPCState).
+	// state of its shares (02 §5.3): the layers' read loops and the ticker. Layer.requestKeyframe, on any goroutine,
+	// reads pubUp too: no keyframe request while the pub PC is away (02 §9.7). pubUp is true while the current pub
+	// PC is connected. pubDownAt is the monoNow at which it last stopped being so, 0 before any pub PC was
+	// connected. Only the actor writes them (markPubDown, onPCState).
 	pubUp     atomic.Bool
 	pubDownAt atomic.Int64
+
+	// views are what the reports of 02 §13 (Stats, Snapshot, Metrics) read of the Conn's current PeerConnection of
+	// each kind, by PCKind, from any goroutine: nil while it has none. Only the actor stores them, when a PC becomes
+	// the Conn's and when it goes (a closed sub PC stays the Conn's, and so stays here).
+	views [PCSub + 1]atomic.Pointer[pcView]
 
 	// actor state
 	pub    *pubPC // nil until the first pub offer, and after the pub PC closed
@@ -256,6 +262,9 @@ func (c *Conn) teardown() {
 		delete(c.subs, id)
 	}
 	c.markPubDown()
+	for i := range c.views {
+		c.views[i].Store(nil)
+	}
 	var wg sync.WaitGroup
 	if p := c.pub; p != nil {
 		c.pub = nil
@@ -360,7 +369,12 @@ func (c *Conn) onPCState(kind PCKind, gen uint32, pc *webrtc.PeerConnection) {
 		return
 	}
 	st.lastState = state
-	c.log.Info("PeerConnection state", "pc", kind.String(), "gen", gen, "state", state.String())
+	attrs := []any{"pc", kind.String(), "gen", gen, "state", state.String()}
+	if state == webrtc.PeerConnectionStateConnected {
+		// With the transport its selected pair runs on (02 §13): the label of 02 §7.1, never an address.
+		attrs = append(attrs, "transport", c.sfu.apis.selectedVia(pc))
+	}
+	c.log.Info("PeerConnection state", attrs...)
 	if kind == PCSub {
 		// The DTLS-ready gate (02 §9.3, S4 finding 1): Pion drops RTP written before DTLS is up, and RTP written to a
 		// PC that has failed, so the DownTracks of this PC forward only while it can send.
@@ -471,6 +485,7 @@ func (c *Conn) dropPub() {
 		return
 	}
 	c.pub = nil
+	c.views[PCPub].Store(nil)
 	c.cands[PCPub] = remoteCandidates{gen: c.pubGen} // the PC's candidates go with it
 	c.markPubDown()
 	p.close(c.log)
@@ -505,9 +520,9 @@ func (c *Conn) handshakeExpired(kind PCKind, gen uint32, pc *webrtc.PeerConnecti
 		c.onPCState(kind, gen, pc) // connected just now: its callback is still on its way
 		return
 	}
-	c.log.Info("PeerConnection closed: not connected in time", "pc", kind.String(), "gen", gen,
+	c.log.Warn("PeerConnection closed: not connected in time", "pc", kind.String(), "gen", gen,
 		"timeout", c.sfu.timing.handshake)
-	c.sfu.handshakeTimeouts[kind].Add(1)
+	c.sfu.counters.handshakeTimeouts[kind].Add(1)
 	if kind == PCPub {
 		c.dropPub()
 	} else {

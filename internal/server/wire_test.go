@@ -1245,6 +1245,150 @@ func TestSPAStatus(t *testing.T) {
 	}
 }
 
+// ---- the connection test: ops.Prober over 02's SFU.Probe ----
+
+// fakeProbeSFU records the probes it is asked for and answers with answer, or with err.
+type fakeProbeSFU struct {
+	asked  []string // "user transport offer"
+	answer string
+	err    error
+}
+
+func (f *fakeProbeSFU) Probe(_ context.Context, user sfu.UserID, t sfu.ProbeTransport, offerSDP string,
+) (string, <-chan sfu.ProbeResult, error) {
+	f.asked = append(f.asked, string(user)+" "+string(t)+" "+offerSDP)
+	if f.err != nil {
+		return "", nil, f.err
+	}
+	return f.answer, make(chan sfu.ProbeResult, 1), nil
+}
+
+// TestProber is the adapter row by row (04 §6.6, §7.7): the user and the transport reach the SFU unchanged, the
+// result channel is dropped, and each of the SFU's errors becomes its answer.
+func TestProber(t *testing.T) {
+	f := &fakeProbeSFU{answer: "v=0 answer"}
+	answer, err := prober{sfu: f}.Probe(context.Background(), "0123456789ab", "tcp7882", "v=0 offer")
+	if err != nil || answer != "v=0 answer" {
+		t.Errorf("Probe = %q, %v; want the SFU's answer", answer, err)
+	}
+	if want := []string{"0123456789ab tcp7882 v=0 offer"}; !slices.Equal(f.asked, want) {
+		t.Errorf("the SFU was asked %q, want %q", f.asked, want)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		err    error
+		want   *api.Error // nil: a failure of the server's (500 internal)
+		status int
+	}{
+		{name: "20 probes run", err: &sfu.Error{Code: sfu.CodeProbeLimit, Retryable: true, RetryAfter: 2500 * time.Millisecond},
+			want: &api.Error{Code: api.CodeRateLimited, RetryAfter: 3}, status: http.StatusTooManyRequests},
+		{name: "20 probes run, a wait under a second", err: &sfu.Error{Code: sfu.CodeProbeLimit, Retryable: true, RetryAfter: time.Millisecond},
+			want: &api.Error{Code: api.CodeRateLimited, RetryAfter: 1}, status: http.StatusTooManyRequests},
+		{name: "no mux for the transport", err: &sfu.Error{Code: sfu.CodeTransportDisabled},
+			want:   &api.Error{Code: api.CodeTransportDisabled, Params: map[string]any{api.ParamTransport: api.TransportUDP}},
+			status: http.StatusConflict},
+		{name: "a bad offer", err: fmt.Errorf("wrapped: %w", &sfu.Error{Code: sfu.CodeBadSDP}),
+			want: api.NewError(api.CodeBadSDP), status: http.StatusBadRequest},
+		{name: "the SFU is closed", err: &sfu.Error{Code: sfu.CodeClosed},
+			want: api.NewError(api.CodeNotReady), status: http.StatusServiceUnavailable},
+		{name: "Pion failed", err: &sfu.Error{Code: sfu.CodeInternal, Retryable: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := prober{sfu: &fakeProbeSFU{err: tc.err}}.Probe(context.Background(), "u1", "udp", "v=0")
+			var ae *api.Error
+			if tc.want == nil {
+				if !errors.Is(err, tc.err) || errors.As(err, &ae) {
+					t.Errorf("err = %v, want %v wrapped, without an *api.Error", err, tc.err)
+				}
+				// The request is still on: a 500 of the server's, which httpapi logs at error.
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					t.Errorf("err = %v, want no context error while the request is on", err)
+				}
+				return
+			}
+			if !errors.As(err, &ae) || !reflect.DeepEqual(ae, tc.want) {
+				t.Fatalf("err = %#v, want %#v", err, tc.want)
+			}
+			if s := api.StatusOf(ae.Code); s != tc.status {
+				t.Errorf("%s is %d, want %d", ae.Code, s, tc.status)
+			}
+		})
+	}
+
+	// The browser left while the SFU gathered: setLocalComplete returns the context's error, which the SFU answers
+	// as sfu.internal without the cause. The prober joins the request's context error in, so that httpapi logs the
+	// 500 of a client that went away at debug, not as a failure of the server's.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	timedOut, cancel := context.WithDeadline(context.Background(), time.Unix(0, 0))
+	defer cancel()
+	for _, end := range []struct {
+		name string
+		ctx  context.Context
+		want error
+	}{
+		{"cancelled", cancelled, context.Canceled},
+		{"timed out", timedOut, context.DeadlineExceeded},
+	} {
+		t.Run("the request ended during gathering, "+end.name, func(t *testing.T) {
+			internal := &sfu.Error{Code: sfu.CodeInternal, Retryable: true}
+			_, err := prober{sfu: &fakeProbeSFU{err: internal}}.Probe(end.ctx, "u1", "udp", "v=0")
+			var ae *api.Error
+			if !errors.Is(err, end.want) || !errors.Is(err, internal) || errors.As(err, &ae) {
+				t.Errorf("err = %v, want %v and %v wrapped, without an *api.Error", err, internal, end.want)
+			}
+			// An error the prober maps stays that answer: the client is gone, and a 4xx or 503 logs no error.
+			_, err = prober{sfu: &fakeProbeSFU{err: &sfu.Error{Code: sfu.CodeClosed}}}.Probe(end.ctx, "u1", "udp", "v=0")
+			if !errors.As(err, &ae) || ae.Code != api.CodeNotReady {
+				t.Errorf("sfu.closed: err = %#v, want %s", err, api.CodeNotReady)
+			}
+		})
+	}
+}
+
+// TestConnTestPorts: a transport has a port when the Transport has its mux, and then it is the bound one.
+func TestConnTestPorts(t *testing.T) {
+	addrs := Addrs{
+		HTTP:   &net.TCPAddr{IP: net.IPv4zero, Port: 80},
+		HTTPS:  &net.TCPAddr{IP: net.IPv4zero, Port: 8443},
+		ICEUDP: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 50000},
+		ICETCP: &net.TCPAddr{Port: 50001},
+	}
+	socket := fakeUDPMux{addrs.ICEUDP}
+	for _, tc := range []struct {
+		name string
+		tr   *netx.Transport
+		want ops.ConnTestPorts
+	}{
+		{"no Transport", nil, ops.ConnTestPorts{}},
+		{"every transport", &netx.Transport{UDPMux: socket, TCPMux443: fakeTCPMux{}, TCPMux7882: fakeTCPMux{}},
+			ops.ConnTestPorts{UDP: 50000, TCP443: 8443, TCP7882: 50001}},
+		{"off mode", &netx.Transport{UDPMux: socket, TCPMux7882: fakeTCPMux{}},
+			ops.ConnTestPorts{UDP: 50000, TCP7882: 50001}},
+		{"UDP off", &netx.Transport{TCPMux443: fakeTCPMux{}, TCPMux7882: fakeTCPMux{}},
+			ops.ConnTestPorts{TCP443: 8443, TCP7882: 50001}},
+	} {
+		if got := connTestPorts(tc.tr, addrs); got != tc.want {
+			t.Errorf("%s: connTestPorts = %+v, want %+v", tc.name, got, tc.want)
+		}
+	}
+	// A mux whose listener has no address has no port: the endpoint answers transport_disabled for it.
+	if got := connTestPorts(&netx.Transport{UDPMux: socket}, Addrs{}); got != (ops.ConnTestPorts{}) {
+		t.Errorf("without addresses: connTestPorts = %+v, want none", got)
+	}
+	for addr, want := range map[net.Addr]int{
+		nil: 0,
+		&net.UnixAddr{Name: "/run/isshoni/admin.sock"}: 0,
+		&net.IPAddr{IP: net.IPv4(192, 0, 2, 1)}:        0,
+		&net.TCPAddr{IP: net.IPv6loopback, Port: 7882}: 7882,
+	} {
+		if got := portOf(addr); got != want {
+			t.Errorf("portOf(%v) = %d, want %d", addr, got, want)
+		}
+	}
+}
+
 // ---- the admin socket's status ----
 
 func TestStatusSource(t *testing.T) {

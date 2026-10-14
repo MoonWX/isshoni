@@ -1,5 +1,6 @@
 // Package ops is the operator's side of the server (docs/m1/04-server-platform.md §11–§12): health, metrics,
-// transfer accounting, the admin dashboard, the release check and the admin socket.
+// transfer accounting, the admin dashboard, the release check and the admin socket, and the REST endpoint of the
+// connection test (§7.7).
 //
 // What exists so far:
 //   - health.go (README slice S31): Health, the liveness and readiness state behind GET /healthz and GET /readyz
@@ -21,8 +22,8 @@
 //     look at the project's releases on GitHub, which an admin can switch off and which sends one GET and nothing
 //     else. Transfer and ReleaseCheck each give the dashboard, `admin status` and doctor their part (Info, Update)
 //     and their alerts (Alerts). sources.go declares what they need from the rest of the server: Policy (the
-//     settings, read on every tick), MetaStore, AdminAlerter, and for the slices to come the dashboard's
-//     LiveSource and AccountsSource and the connection test's Prober.
+//     settings, read on every tick), MetaStore, AdminAlerter, the connection test's Prober (conntest.go, below),
+//     and for the slice to come the dashboard's LiveSource and AccountsSource.
 //     Nothing in the server builds these three yet: the wiring does, in the steps their files describe, when it
 //     gets the metrics listener and the dashboard (README S85); until then `serve` only warns that
 //     metrics.enabled has no listener.
@@ -55,7 +56,14 @@
 //     for its restart through AdminOptions.Restart. ops may not import store, so 03's snapshot and its file-level
 //     functions arrive as function values (DataDir.Snapshot, doctor.DBFiles).
 //
-// The later ops slices add dashboard.go and conntest.go.
+//   - The connection test (README slice S80, 04 §7.7). conntest.go has ConnTest, whose Probe is the typed function
+//     of POST /api/v1/conntest: it checks the transport (validation_failed for one it doesn't know, 409
+//     transport_disabled for one without a listener), holds each user to 12 requests a minute (429 rate_limited),
+//     and asks the SFU for a probe PC through Prober. The answer goes back with the server object
+//     (api.ConnTestServerInfo: the public IPv4 address, provider, container, ports and NAT kind) by which 05 picks
+//     its fix text. The wiring builds it from what Start found and registers the route for every signed-in user.
+//
+// The later ops slices add dashboard.go.
 //
 // Imports (04 §2): config, logx, version, netx and internal/protocol(/api), plus ops/doctor; never httpapi, store,
 // auth, signal, sfu or sfuplane. The wiring (internal/server) adapts those to the small interfaces declared here,

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -30,54 +29,89 @@ var (
 	allowedSigners = filepath.Join("deploy", "keys", "allowed_signers")
 )
 
-// checkKeys compares the embedded key block with deploy/keys/allowed_signers. While either file does not exist yet,
-// it returns a note and no error.
+// checkKeys checks the copies of the release keys against deploy/keys/allowed_signers, their source of truth
+// (06 §10.3), and reports the problems of both checks at once:
+//   - the block embedded in deploy/install.sh must equal the file byte for byte;
+//   - once the file is non-empty, it must hold at least one key, and the "Release signing keys" section of README.md
+//     must list the fingerprint of each of them and no other one (checkReadmeFingerprints). A file of blank or
+//     comment lines only fails: release.yml's `[ -s … ]` guard takes it for one with keys.
+//
+// While deploy/keys/allowed_signers does not exist yet, it returns a note and no error. While deploy/install.sh does
+// not, it notes that the block was not checked.
 func checkKeys(root string) (note string, err error) {
-	var missing []string
-	for _, name := range []string{installScript, allowedSigners} {
-		_, err := os.Stat(filepath.Join(root, name))
-		switch {
-		case errors.Is(err, fs.ErrNotExist):
-			missing = append(missing, filepath.ToSlash(name))
-		case err != nil:
-			return "", err
-		}
-	}
-	switch len(missing) {
-	case 1:
-		return "skipped: " + missing[0] + " does not exist yet", nil
-	case 2:
-		return "skipped: " + missing[0] + " and " + missing[1] + " do not exist yet", nil
-	}
-
-	script, err := os.ReadFile(filepath.Join(root, installScript))
+	haveScript, err := exists(filepath.Join(root, installScript))
 	if err != nil {
 		return "", err
 	}
-	want, err := os.ReadFile(filepath.Join(root, allowedSigners))
+	haveSigners, err := exists(filepath.Join(root, allowedSigners))
+	if err != nil {
+		return "", err
+	}
+	switch {
+	case !haveScript && !haveSigners:
+		return "skipped: " + filepath.ToSlash(installScript) + " and " + filepath.ToSlash(allowedSigners) +
+			" do not exist yet", nil
+	case !haveSigners:
+		return "skipped: " + filepath.ToSlash(allowedSigners) + " does not exist yet", nil
+	}
+
+	data, err := os.ReadFile(filepath.Join(root, allowedSigners))
 	if err != nil {
 		return "", err
 	}
 	// Git for Windows checks text files out with CRLF line ends by default (core.autocrlf), while the committed
 	// files, and so the installer that ships, have LF. Compare the content, not the checkout's line ends.
-	script = bytes.ReplaceAll(script, []byte("\r\n"), []byte("\n"))
-	want = bytes.ReplaceAll(want, []byte("\r\n"), []byte("\n"))
-	if strings.ContainsRune(string(want), '\'') {
-		return "", errors.New("deploy/keys/allowed_signers contains a single quote, which the shell block cannot hold")
+	signers := strings.ReplaceAll(string(data), "\r\n", "\n")
+
+	var blockErr, readmeErr error
+	if haveScript {
+		script, err := os.ReadFile(filepath.Join(root, installScript))
+		if err != nil {
+			return "", err
+		}
+		blockErr = compareBlock(strings.ReplaceAll(string(script), "\r\n", "\n"), signers)
+	} else {
+		note = "skipped the key block: " + filepath.ToSlash(installScript) + " does not exist yet"
 	}
-	value, err := embeddedSigners(string(script))
+	// An empty file has no key whose fingerprint README.md could list (the block check still wants a final newline).
+	// Any other file holds keys, or checkReadmeFingerprints reports that it holds none.
+	if signers != "" {
+		readmeErr = checkReadmeFingerprints(root, signers)
+	}
+	return note, errors.Join(blockErr, readmeErr)
+}
+
+// compareBlock compares the key block of script, the content of deploy/install.sh, with signers, the content of
+// deploy/keys/allowed_signers (both with LF line ends).
+func compareBlock(script, signers string) error {
+	if strings.ContainsRune(signers, '\'') {
+		return errors.New("deploy/keys/allowed_signers contains a single quote, which the shell block cannot hold")
+	}
+	value, err := embeddedSigners(script)
 	if err != nil {
-		return "", fmt.Errorf("deploy/install.sh: %w", err)
+		return fmt.Errorf("deploy/install.sh: %w", err)
 	}
 	got := value + "\n"
 	switch {
-	case got == string(want):
-		return "", nil
-	case value == string(want):
-		return "", errors.New("deploy/keys/allowed_signers must end with a newline")
+	case got == signers:
+		return nil
+	case value == signers:
+		return errors.New("deploy/keys/allowed_signers must end with a newline")
 	}
-	return "", fmt.Errorf("the key block in deploy/install.sh differs from deploy/keys/allowed_signers at line %d: "+
-		"copy the file between the %q and %q lines as %s…'", firstDiffLine(got, string(want)), keysBegin, keysEnd, keysPrefix)
+	return fmt.Errorf("the key block in deploy/install.sh differs from deploy/keys/allowed_signers at line %d: "+
+		"copy the file between the %q and %q lines as %s…'", firstDiffLine(got, signers), keysBegin, keysEnd, keysPrefix)
+}
+
+// exists reports whether path exists. An error other than "does not exist" is returned.
+func exists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, fs.ErrNotExist):
+		return false, nil
+	}
+	return false, err
 }
 
 // embeddedSigners returns the value of ALLOWED_SIGNERS between the BEGIN and END markers.

@@ -8,8 +8,8 @@
 # yet (web/ before the web client lands, for example) is skipped too. The run summary of the
 # changes job says why each job runs or not.
 #
-# Jobs for parts that land later (site of 06 §8.2) come with those parts: each adds a
-# `decide` line to the changes job and, when it gates the merge, its id to ci-ok's needs.
+# A job for a part that lands later comes with that part: it adds a `decide` line to the
+# changes job and, when it gates the merge, its id to ci-ok's needs.
 #
 # Rules for every workflow (06 §8.1): a read-only token by default, with jobs raising their
 # own permissions; third-party actions pinned by full commit SHA with a version comment;
@@ -69,6 +69,7 @@ jobs:
       run-goreleaser-check: ${{ steps.plan.outputs.run-goreleaser-check }}
       run-distro: ${{ steps.plan.outputs.run-distro }}
       run-govulncheck: ${{ steps.plan.outputs.run-govulncheck }}
+      run-site: ${{ steps.plan.outputs.run-site }}
       # Task's pin from .tool-versions (06 §7.1). Go comes from go.mod, Node from .tool-versions.
       task-version: ${{ steps.plan.outputs.task-version }}
     steps:
@@ -116,6 +117,16 @@ jobs:
               - '!docs/m1/**'
             tools:
               - 'tools/**'
+            # The root README.md, which every release archive carries (06 §3): it feeds
+            # goreleaser-check only, so a pull request that deletes it fails there. The release
+            # filter would also run docker-smoke and the six distros on every README edit.
+            readme:
+              - 'README.md'
+            # tools/repocheck, behind lint:keys and lint:pins (06 §7.2). lint-deploy runs both on
+            # the tree, so a change to the checker, or to README.md (whose "Release signing keys"
+            # section lint:keys checks, README F11), runs it as deploy changes do.
+            repocheck:
+              - 'tools/repocheck/**'
             # Inputs of the distro job that neither deploy nor release covers: tools/relserve, which
             # only that job runs, and tools/notices, whose output is in the archives it installs.
             distro_tools:
@@ -134,6 +145,8 @@ jobs:
           FILTER_SITE: ${{ steps.filter.outputs.site }}
           FILTER_TOOLS: ${{ steps.filter.outputs.tools }}
           FILTER_DISTRO_TOOLS: ${{ steps.filter.outputs.distro_tools }}
+          FILTER_README: ${{ steps.filter.outputs.readme }}
+          FILTER_REPOCHECK: ${{ steps.filter.outputs.repocheck }}
         run: |
           # A pull request runs what its paths touch; a push to main and a merge-queue group
           # run everything.
@@ -141,8 +154,10 @@ jobs:
             go=${FILTER_GO:-false} web=${FILTER_WEB:-false} deploy=${FILTER_DEPLOY:-false}
             docker=${FILTER_DOCKER:-false} release=${FILTER_RELEASE:-false} site=${FILTER_SITE:-false}
             tools=${FILTER_TOOLS:-false} distro_tools=${FILTER_DISTRO_TOOLS:-false}
+            readme=${FILTER_README:-false} repocheck=${FILTER_REPOCHECK:-false}
           else
             go=true web=true deploy=true docker=true release=true site=true tools=true distro_tools=true
+            readme=true repocheck=true
           fi
           go_or_web=false
           if [ "$go" = true ] || [ "$web" = true ]; then go_or_web=true; fi
@@ -158,6 +173,12 @@ jobs:
           if [ "$release" = true ]; then deploy_or_release=true; fi
           distro_when=$deploy_or_release
           if [ "$distro_tools" = true ]; then distro_when=true; fi
+          goreleaser_when=$deploy_or_release
+          if [ "$readme" = true ]; then goreleaser_when=true; fi
+          site_or_deploy=$site
+          if [ "$deploy" = true ]; then site_or_deploy=true; fi
+          lint_deploy_when=$deploy
+          if [ "$readme" = true ] || [ "$repocheck" = true ]; then lint_deploy_when=true; fi
           {
             echo "go=$go"
             echo "web=$web"
@@ -170,7 +191,7 @@ jobs:
           {
             echo "### CI plan ($EVENT)"
             echo
-            echo "Filters: go=$go, web=$web, deploy=$deploy, docker=$docker, release=$release, site=$site, tools=$tools, distro_tools=$distro_tools"
+            echo "Filters: go=$go, web=$web, deploy=$deploy, docker=$docker, release=$release, site=$site, tools=$tools, distro_tools=$distro_tools, readme=$readme, repocheck=$repocheck"
             echo
             echo "| Job | Decision |"
             echo "|---|---|"
@@ -211,7 +232,9 @@ jobs:
           # workflow, which the deploy filter covers.
           decide e2e "$go_web_or_deploy" .tool-versions cmd/isshoni web/package.json web/package-lock.json \
             web/playwright.config.ts deploy/dev/isshoni.e2e.toml
-          decide lint-deploy "$deploy" Taskfile.yml .tool-versions
+          # lint:keys checks README.md against deploy/keys/allowed_signers (README F11), and
+          # lint:keys and lint:pins are tools/repocheck: their changes run the job too.
+          decide lint-deploy "$lint_deploy_when" Taskfile.yml .tool-versions
           # The job's own inputs count too: Pebble's config (the go filter's tlsmgr/testdata
           # pattern) and this workflow, which pins the two images (the deploy filter).
           decide acme "$go_or_deploy" go.mod internal/server/tlsmgr/testdata/pebble-config.json
@@ -225,8 +248,10 @@ jobs:
             deploy/compose.yaml deploy/compose.host.yaml
           # 06 §8.2 runs goreleaser-check on release changes. Its other inputs are deploy changes:
           # the files the archives and packages ship, install.sh (the before hook stamps it), the
-          # release tasks in Taskfile.yml and this workflow.
-          decide goreleaser-check "$deploy_or_release" Taskfile.yml .tool-versions go.mod .goreleaser.yaml \
+          # release tasks in Taskfile.yml and this workflow; and the root README.md, which every
+          # archive carries. README.md is no input that skips the job when missing: goreleaser
+          # fails without it, which is the point.
+          decide goreleaser-check "$goreleaser_when" Taskfile.yml .tool-versions go.mod .goreleaser.yaml \
             tools/goreleaser/go.mod cmd/isshoni tools/notices web/package.json web/package-lock.json \
             deploy/install.sh deploy/docker/Dockerfile
           # 06 §8.2 runs the distro scenarios on deploy or release changes. They install the
@@ -237,6 +262,9 @@ jobs:
             tools/goreleaser/go.mod cmd/isshoni tools/notices tools/relserve web/package.json \
             web/package-lock.json deploy/install.sh deploy/test/distro-test.sh deploy/test/distro/Containerfile
           decide govulncheck "$go" Taskfile.yml .tool-versions tools/go.mod
+          # 06 §8.2: the site on site or deploy changes (deploy covers this workflow and
+          # .tool-versions); the site filter has web/src/conntest/codes.json for the anchor test.
+          decide site "$site_or_deploy" docs/package.json docs/package-lock.json .tool-versions go.mod
 
           task_version=''
           if [ -e .tool-versions ]; then
@@ -1119,6 +1147,57 @@ jobs:
           DISTRO: ${{ matrix.distro }}
         run: sh deploy/test/distro-test.sh -r "$RUNNER_TEMP/distro-releases" "$DISTRO"
 
+  site:
+    # The project site (06 §8.2, §10): vitepress build, the check that it loads nothing from
+    # other origins (docs/scripts/check-site.mjs), and the anchor test, TestDocsAnchors: every
+    # doctor check id, connection test code and cloud provider id has its section on the site
+    # (06 §10.4). test-go runs the same test on Go changes; this job runs it for the changes
+    # that test-go doesn't see, a docs-only or a codes.json-only pull request. Deploying is
+    # site.yml's (on main and from release.yml), never this workflow's.
+    needs: changes
+    if: needs.changes.outputs.run-site == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node (version from .tool-versions)
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+
+      - name: npm ci
+        run: npm ci --prefix docs --no-audit --no-fund
+
+      - name: vitepress build
+        run: npx --prefix docs vitepress build docs
+
+      - name: The site loads nothing from other origins (06 §10.1)
+        run: node docs/scripts/check-site.mjs
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # one cache per job below: setup-go's key is shared by every job
+
+      - name: Cache Go modules and builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('go.mod', 'go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+
+      - name: The site's anchors for the product's links (TestDocsAnchors, 06 §10.4)
+        run: go test -count=1 -run '^TestDocsAnchors$' -v ./internal/server/ops/doctor
+
   govulncheck:
     needs: changes
     if: needs.changes.outputs.run-govulncheck == 'true'
@@ -1187,6 +1266,7 @@ jobs:
         goreleaser-check,
         distro-release,
         distro,
+        site,
       ]
     runs-on: ubuntu-24.04
     timeout-minutes: 2

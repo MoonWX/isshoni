@@ -40,11 +40,13 @@ type AccountsSource interface {
 
 // Prober starts a connection-test probe on the SFU (04 §7.7). The wiring adapts 02's SFU.Probe: it converts userID
 // and transport to sfu.UserID and sfu.ProbeTransport, discards the result channel, and maps sfu.probe_limit to 429
-// rate_limited and sfu.transport_disabled to 409 transport_disabled. The endpoint that calls it,
-// POST /api/v1/conntest, comes with README slice S80.
+// rate_limited (with retryAfter), sfu.transport_disabled to 409 transport_disabled, sfu.bad_sdp to 400 bad_sdp and
+// sfu.closed to 503 not_ready. Its caller is ConnTest.Probe (conntest.go), behind POST /api/v1/conntest, which asks
+// only for the three transports, and only for one that has a listener.
 type Prober interface {
 	// Probe answers offerSDP, an offer with one data channel, with an answer that holds only the candidates of
-	// transport ("udp", "tcp443" or "tcp7882").
+	// transport ("udp", "tcp443" or "tcp7882"). Its errors are *api.Error values for the answers above, and any
+	// other error is a failure (500 internal).
 	Probe(ctx context.Context, userID string, transport string, offerSDP string) (answerSDP string, err error)
 }
 

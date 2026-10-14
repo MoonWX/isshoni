@@ -1279,7 +1279,7 @@ table has them; these are the points the table leaves open, and what is still to
   | What | Until | Meanwhile |
   |---|---|---|
   | `push.Options.Metrics` (`isshoni_push_sent_total`, §11.2) | README S85 | the push service counts its results for nobody |
-  | `ops.Metrics` as the router's observer and the hub's registerer; the REST routes of `ops` | README S80, S85 | `signal.Deps.Metrics` is nil; with `metrics.enabled` the server logs a warning that nothing listens on `metrics.listen` |
+  | `ops.Metrics` as the router's observer and the hub's registerer; the REST routes of `ops` other than `POST /api/v1/conntest` (README S80 wired that one, `wireConnTest`) | README S85 | `signal.Deps.Metrics` is nil; with `metrics.enabled` the server logs a warning that nothing listens on `metrics.listen` |
   | Transfer accounting and the release check in `serve` (built in README S55, §11.3, §11.5) | README S85 | nothing counts or checks |
 
 - The tests are `wire_test.go` (each adapter against a fake, and the ones over 03 once more against the real
@@ -1520,7 +1520,10 @@ Construction details:
   `exclude_interfaces` globs), bind `ListenUDP("udp", ip:7882)` per address (the same as
   `ice.NewMultiUDPMuxFromPort`), set SO_RCVBUF/SO_SNDBUF to `udp_buffer_bytes`, wrap each in a byte-counting
   `PacketConn`, then `ice.NewUDPMuxDefault` per socket and `ice.NewMultiUDPMuxDefault(muxes...)`. We build it
-  ourselves only to count bytes and read back buffer sizes. The counting wrapper implements
+  ourselves to count bytes, to read back buffer sizes, and for the ICE source guard of §7.8 (README F06, from the M1
+  security review): the counting wrapper also drops, below the mux, STUN from a source address past a ufrag's 64, and
+  each socket's `ice.UDPMuxDefault` is wrapped (`guardedUDPMux`) so that the guard hears which ufrags the mux serves
+  (`GetConn`, `GetConnByUfrag`) and which Pion removes (`RemoveConnByUfrag`). The counting wrapper implements
   `ice.AddrPortReaderWriter` (`ReadFromAddrPort`/`WriteToAddrPort`) so pion keeps its allocation-free path. Port `0`
   (tests): bind the first address, reuse its port for the others. If `RcvBuf` or `SndBuf` read back below
   `udp_buffer_bytes`, `NewTransport` logs one warn line (`component=netx`) naming the sysctl fix; doctor's
@@ -1531,7 +1534,11 @@ Construction details:
   advertises every local address (then filtered and rewritten). The 7882 listener is wrapped like the 443 ICE route:
   a per-IP limit of `MaxICEConnsPerIP` (64) ICE connections per `IPKey` (IPv4 address or IPv6 /64, §7.2), counted
   together with 443 (excess closed and counted as `Limited`), a byte counter (path `media_tcp`), and the same `ice.TCPMuxParams` (`FirstStunBindTimeout` 10 s,
-  `AliveDurationForConnFromStun` 30 s, `ReadBufferSize` 64, `WriteBufferSize` 4 MiB).
+  `AliveDurationForConnFromStun` 30 s, `ReadBufferSize` 64, `WriteBufferSize` 4 MiB). For the source guard of
+  §7.8 (README F06) both listeners hand each accepted connection to Pion through a first-frame gate, which reads
+  the first RFC 4571 frame and closes the connection when its STUN comes from a source past its ufrag's 64; each
+  `ice.TCPMuxDefault` is wrapped (`guardedTCPMux`) like the UDP ones. The guard is one per `Transport`, shared by
+  every UDP socket and both TCP ports.
 - **Advertised**: `Advertised` holds every advertised address with its final address:port after the rewrite rules
   (§7.5). 02 uses it to label selected candidate pairs (`Via`); the same value set `udp` | `tcp443` | `tcp7882` is used
   everywhere (dashboard, metrics). It lists exactly what pion gathers, no more: a test compares it with the
@@ -1738,6 +1745,7 @@ these types, and `netx` and `doctor` use them instead of their own.
 | Pending (unclassified) connections | 1024 total (when full, the oldest pending one is closed), 32 per IP |
 | Open connections per IP on 443/80 | 256 (`limits.conns_per_ip`) |
 | ICE-TCP connections per IP | 64 across 443 and 7882 |
+| ICE source addresses per ufrag (review R3) | 64 distinct remote transport addresses (protocol, IP, port) per local ICE ufrag, across UDP and ICE-TCP, every UDP socket and both TCP ports. Pion makes a peer-reflexive candidate for every new source of a valid Binding request and has no cap of its own (02 §12). Only STUN with a USERNAME counts: netx reads its ufrag as Pion's muxes route it, at every UDP socket below the UDP mux and at the first RFC 4571 frame of each ICE-TCP connection (before Pion's TCP mux takes it). From the 65th address on such STUN is dropped (no Binding response, no prflx candidate, no address-map entry) and the ICE-TCP connection closed. A ufrag counts from the first `GetConn`/`GetConnByUfrag` of the Transport's muxes (gathering) until `RemoveConnByUfrag` (close, ICE restart, failed), and a removed ufrag is never counted again: a restart or close cancels Pion's gathering without waiting, so the old ufrag can still reach the muxes after its removal (Pion closes that connection at once and its agent rejects the ufrag's STUN). This relies on Pion never reusing a ufrag (random per agent and restart; the server never sets ICE credentials); netx remembers the last 1024 removed ufrags. STUN for a ufrag the muxes don't serve goes to Pion as before (the UDP mux drops it, the TCP mux holds the connection 30 s at most, within the per-IP limit). Sources are counted before Pion checks MESSAGE-INTEGRITY (netx doesn't know the password): someone who sees a PC's ufrag on the path and spoofs UDP sources can use up its 64 slots; sources already admitted keep working and an ICE restart (new ufrag) starts over. Logged at debug once per ufrag, without the ufrag or address |
 | HTTP servers | `ReadHeaderTimeout` 10 s, `IdleTimeout` 120 s, `MaxHeaderBytes` 16 KiB, no server `ReadTimeout`/`WriteTimeout` (WebSocket) |
 | Main server request read deadline | 30 s per request via `http.ResponseController`, except `/ws` (§9.3) |
 | Port 80 server | `ReadHeaderTimeout` 5 s, `IdleTimeout` 30 s |
@@ -2820,6 +2828,14 @@ isshoni-backup-0.3.0-20260929T101500Z.tar.gz
   "Keep it private" line; with `--out -` only the line, on stderr. An offline backup of a data directory with no
   database, no `secrets.json` and no certificates is an error ("nothing to back up"), and a raw one says that the
   database was copied as it was.
+- **Review R5** (the M1 security review; README §6 "Decided after group 10" (1)). As built, the default name takes
+  the pipe-or-device path too: when `O_EXCL` finds something at the default name that is neither a regular file
+  nor a directory, the CLI opens it for writing (following links) and streams the archive into it. Another local
+  user can place FIFOs at the predictable names of the next seconds in a world-writable directory, and an operator
+  who runs `sudo isshoni admin backup` there hands that user the database, `secrets.json` and the TLS keys. The
+  rule above ("a pipe or a device the operator named") is meant: README F09 (group 12) makes any existing file at
+  the default name exit 7, and writes to an explicit `--out` that exists only when it is a FIFO or a character
+  device owned by the caller's euid or by root (a link stays allowed: `--out /dev/fd/N` is one).
 
 ### 12.4 Restore
 
@@ -3439,7 +3455,9 @@ there is no separate config endpoint. This service implements what those handler
   With no subscriptions it does nothing and returns nil (03's handler answers 404 for that case itself). It returns
   `*api.Error{server_busy, retryAfter: 5}` when the queue took none of them, and
   `*api.Error{server_shutdown, retryAfter: 5}` once `Run`'s context has ended; both are 503 through
-  `httpapi.WriteError` (03 §12.3 #28). The per-recipient bucket of §14.4 does not apply to it.
+  `httpapi.WriteError` (03 §12.3 #28). The per-recipient bucket of §14.4 does not apply to it. Since README F08 the
+  queue is the `push.test` lane's own, with one worker that serves nothing else, and each test is attempted once
+  (§14.4, §14.5); 03 passes one subscription, since a web session keeps one (03 §12.4.6).
 
 05 posts its subscription on every app start when permission is granted, and re-subscribes when the key in `/info`
 differs from the subscription's `applicationServerKey`.
@@ -3450,7 +3468,7 @@ differs from the subscription's `applicationServerKey`.
 |---|---|---|---|---|
 | `share.started` | A share goes `starting → live`, without `replaces` (01's hub calls `ShareStarted`, through the wiring) | Active users whose `shareStarted` preference is `all`, except the sharer and except `PresentUserIDs` (participants in that room, who already see it) | 600 s | `high` |
 | `admin.alert` | 03's `AdminAlerter` (§7.11 there: `admin_granted`, `admin_revoked`, `admin_password_reset`, `registration_mode_changed`, `signup_pending`, `secrets_rotated`) and this doc's transfer alerts (`transfer_threshold`, §11.3) | Active admins whose `adminAlerts` preference is on | 86400 s | `normal` |
-| `push.test` | `SendTest` (03's `POST /api/v1/push/test`) | The caller's current-session subscriptions | 60 s | `high` |
+| `push.test` | `SendTest` (03's `POST /api/v1/push/test`) | The caller's current-session subscription (one per web session since README F08, 03 §12.4.6); on the `push.test` lane, attempted once (§14.4, §14.5) | 60 s | `high` |
 
 - Recipients come from 03's store: `ListPushSubscriptions(PushFilter{ExcludeUserIDs, AdminsOnly, Pref, SessionID})`
   (03 §6), which applies the preferences and returns active users only. Per-room muting is *later*.
@@ -3497,8 +3515,9 @@ type Options struct { // only Enabled, VAPID, Subject and Store are required
 	Subject      string                  // the VAPID sub claim: a mailto: or https: URL (DeriveSubject, §14.1)
 	Store        Store
 	Sender       Sender           // nil: the real one, webpush-go with the guarded client (§14.5)
-	Workers      int              // 0: 4
-	QueueLen     int              // 0: 1024
+	Workers      int              // the workers of share.started and admin.alert; 0: 4 (push.test has one of its own,
+	                              // README F08)
+	QueueLen     int              // the length of each queue (events, jobs, push.test jobs); 0: 1024
 	Now          func() time.Time // nil: time.Now
 	Logger       *slog.Logger     // nil: discard; the service adds component=push
 	Resolver     netx.Resolver    // resolves an endpoint's host in ValidateEndpoint; nil: net.DefaultResolver
@@ -3520,8 +3539,9 @@ type Service struct{ /* … */ }
 func New(ctx context.Context, opts Options) (*Service, error) // checks vapid_key_fp and purges before returning (§5.2);
                                                           // starts no goroutine
 func DeriveSubject(pushSubject, acmeEmail, origin string) string // §14.1
-func (s *Service) Run(ctx context.Context) error          // workers, dispatcher and the daily prune; blocks until ctx
-                                                          // ends, drains for ≤ 2 s, returns nil; callable once
+func (s *Service) Run(ctx context.Context) error          // workers, the push.test lane's worker, dispatcher and the
+                                                          // daily prune; blocks until ctx ends, drains for ≤ 2 s,
+                                                          // returns nil; callable once
 func (s *Service) ShareStarted(ev ShareStarted)           // non-blocking; drops when the queue is full
 func (s *Service) AdminAlert(a AdminAlert)                // non-blocking
 func (s *Service) VAPIDPublicKey() string                 // 03's httpapi.Push
@@ -3562,6 +3582,19 @@ are ignored (`SendTest`: `server_shutdown`) once `Run`'s context has ended. `pus
 - **`push.test` is exempt from the bucket** (S32): 03 limits the endpoint itself (1 per 10 s per user, 03 §7.3
   `push-test`), and a test that silently sends nothing would look like broken notifications. A test doesn't take a
   token either, so it never uses up the budget of real notifications.
+- **`push.test` has a lane of its own** (README F08, from the M1 security review): its own queue and one worker,
+  and each test is attempted once (§14.5). Before, tests shared the 4 workers and the retries of everything
+  else: a member with 10 subscriptions on one session whose endpoints never answer (a name that resolves to a
+  public address that drops packets passes `ValidateEndpoint`) could post a test every 10 s and keep all 4
+  workers busy, delaying everyone's `share.started` and `admin.alert` by about a minute. Now such a member holds
+  the test lane's worker and nothing else, and reaches one endpoint per test: 03 keeps one subscription per web
+  session (03 §12.4.6). What remains is the notifications such a member receives. With 10 subscriptions across
+  10 sessions whose endpoints complete the TLS handshake and then never answer (10 s per attempt), and a second
+  account that starts shares in 3 rooms, the per-recipient burst of 3 events is 30 jobs of up to 10 s each on the
+  4 workers (their retries come back later, behind the others). In a test with a fake sender, that delayed another
+  user's `share.started` by about 70 s, about as long as the delay this lane removed. After that, those
+  subscriptions get one event per 10 minutes. A per-user cap on the jobs in flight on the 4 workers would bound
+  this; it is not in M1's plan yet.
 - `Topic` header per (room, sharer): `s` + first 22 chars of base64url(SHA-256(roomID + "/" + userID)) (≤ 32
   URL-safe chars), so a phone that was offline receives only the latest notification per sharer.
 - `admin.alert`: 03 already coalesces `signup_pending` (one per 10 min); transfer alerts fire once per threshold per
@@ -3616,7 +3649,9 @@ At send time (the real guard, because DNS can change):
   ranges, IPv4-mapped/NAT64 forms of those, and the server's own public addresses. Checking in `Control` also defeats
   DNS rebinding between check and connect.
 - `Proxy: nil` (environment proxies ignored), `CheckRedirect` returns `http.ErrUseLastResponse` (no redirects),
-  timeout 10 s, response body read ≤ 4 KiB.
+  timeout 10 s, response body read ≤ 4 KiB. The dial and the TLS handshake have 2 s each (README F08; 5 s
+  before): an endpoint whose address drops every packet holds a worker for 2 s per attempt. Push services answer
+  from nearby data centres, and a SYN lost once (sent again after 1 s) still fits.
 - `webpush.Options{HTTPClient: guarded, Subscriber: subject, VAPIDPublicKey, VAPIDPrivateKey, TTL, Urgency, Topic}`.
 - S32's guard also refuses, in `Control`, any port other than 443, and before each send it runs the stored endpoint
   through the URL rules above again, so a row written in any other way never reaches the client. Both refusals
@@ -3633,9 +3668,17 @@ Results:
 | 404, 410 | delete the subscription (gone) |
 | 401, 403 | delete (the subscription belongs to another VAPID key, e.g. after rotation) |
 | 400, 413 | log a warning (our bug), `failures++` |
-| 429, 5xx, network error | retry at 5 s and 30 s (or `Retry-After` ≤ 60 s) while still within the TTL, then `failures++` |
+| 429, 5xx, network error | retry at 5 s and 30 s (or `Retry-After` ≤ 60 s) while still within the TTL, then `failures++`; a `push.test` is not retried: `failures++` at once |
 
-Queue: 1024 jobs, 4 workers; a full queue drops the job (`dropped`).
+Queue: 1024 jobs, 4 workers; a full queue drops the job (`dropped`). `push.test` has a lane of its own (README F08,
+§14.4): a queue of 1024 (`Options.QueueLen`) and one worker that serves nothing else. `SendTest` queues there,
+under the lock that the shutdown takes, so the lane's worker drains every test that was queued and none is queued
+after the shutdown began (`server_shutdown`); a full lane is `server_busy` as before. A test is attempted once, so
+one test holds the worker for at most the 10 s timeout, and a test that waited past its 60 s TTL is dropped
+unsent. The lane is shared by every user: a member whose endpoint completes the TLS handshake and then never
+answers holds its worker 10 s per test, which at the `push-test` bucket's one test per 10 s (03 §7.3) is all of
+its time, so other members' tests wait; with two such members they can pass their TTL and be dropped (`expired`)
+after the 202.
 
 How S32 reads the table (every status has a row, and the `isshoni_push_sent_total` result is named):
 - **ok**: every 2xx, not only 200, 201 and 202.
@@ -3644,8 +3687,9 @@ How S32 reads the table (every status has a row, and the `isshoni_push_sent_tota
   followed, and any 4xx that has no row of its own), and a send that fails with `ErrUndeliverable` (the
   subscription's keys don't decode, its endpoint breaks the URL rules, or the guard refused the address). One
   warning, `failures++`.
-- **transient**: 408, 429, every 5xx, and no answer at all (a network error, a timeout). At most two retries, 5 s
-  after the first attempt and 30 s after the second; a `Retry-After` of at most 60 s replaces that wait. There is no
+- **transient**: 408, 429, every 5xx, and no answer at all (a network error, a timeout). A `push.test` is not
+  retried (README F08): it is an **error** at once. Every other message gets at most two retries, 5 s after the
+  first attempt and 30 s after the second; a `Retry-After` of at most 60 s replaces that wait. There is no
   retry when the push service asks for more than 60 s, or when the wait would end at or after the end of the
   message's TTL (which runs from the moment the dispatcher takes the event): the message is then an **error**
   (`failures++`) at once, as it is after the third attempt. A retry asks the push service to keep the message only
@@ -4126,3 +4170,14 @@ Decided after group 7 (engineering calls the owner delegated; README §6):
    with `public_ip.none`, whatever the two keys say: that server is not ready, and doctor is where its operator
    reads why. It is `skip` and not `ok` because doctor did not find out whether there is an address. README F04
    implements it (§13.2).
+
+Decided after group 10 (an engineering call the owner delegated; README §6 (1)):
+
+9. **The M1 security review's findings in this doc get fix slices.** The review was read-only, of `main` at f7053dc
+   before the first release candidate, over seven attack surfaces, with every finding checked by three independent
+   reviewers. Its parts here: R3, a member's PC could grow Pion's peer-reflexive candidates without bound, fixed by
+   the ICE source guard of 64 addresses per ufrag (§7.3, §7.8; README F06); R6, one member's `push.test` calls to
+   endpoints that never answer could hold the four shared push workers, fixed by the `push.test` lane, a test
+   attempted once, one subscription per web session and 2 s dial and TLS-handshake timeouts (§14.2–§14.5, 03 §12.4.6;
+   README F08); R5, `admin backup` without `--out` could write into a FIFO that another user placed at the default
+   name, which README F09 fixes in group 12 (§12.3).

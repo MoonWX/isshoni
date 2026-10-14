@@ -39,8 +39,24 @@ type Subscription struct {
 	held  *time.Timer
 
 	// noticed: a notice that the subscription may have changed is in the Conn's event queue and hasn't been looked at
-	// (changed). It is the one field that goroutines other than the actor touch.
+	// (changed).
 	noticed atomic.Bool
+	// shown is what Conn.Stats reports of the subscription besides what its DownTracks do: the client's request and
+	// the reason it last heard. The actor stores it whenever either changes (publish), any goroutine reads it; nil
+	// until the first request is applied. noticed and shown are the fields that goroutines other than the actor touch.
+	shown atomic.Pointer[subShown]
+}
+
+// subShown is the part of a subscription's SubscriptionStats that only its Conn's actor knows (Subscription.shown).
+type subShown struct {
+	requested Quality
+	audio     bool
+	reason    SubReason
+}
+
+// publish stores what Conn.Stats shows of the subscription now. It runs on the Conn's actor.
+func (s *Subscription) publish() {
+	s.shown.Store(&subShown{requested: s.reqVideo, audio: s.reqAudio, reason: s.told.reason})
 }
 
 // subState is what a SubscriptionStateEvent says about a subscription besides the request (02 §6.2).
@@ -221,7 +237,21 @@ func (c *Conn) report(sub *Subscription, paced bool) {
 		}
 		return
 	}
+	c.tell(sub, st, now)
+}
+
+// tell sends the client a SubscriptionStateEvent with st, what the subscription gets now, and notes that the client
+// knows it. A reason the client hasn't heard last is a downgrade (02 §13): the subscription gets less than it asked
+// for, for that reason, from now on. It is counted (isshoni_sfu_downgrades_total) and logged at info, with the ids
+// only. It runs on the Conn's actor.
+func (c *Conn) tell(sub *Subscription, st subState, now int64) {
+	if st.reason != SubReasonNone && st.reason != sub.told.reason {
+		c.sfu.counters.downgrade(st.reason)
+		c.log.Info("subscription downgraded", "share_id", string(sub.share.id), "requested", sub.reqVideo.String(),
+			"forwarded", st.forwarded.String(), "reason", string(st.reason))
+	}
 	sub.told, sub.quiet = st, now+int64(c.sfu.subEventEvery)
+	sub.publish()
 	c.sig.SendEvent(SubscriptionStateEvent{
 		Share: sub.share.id, Requested: sub.reqVideo, Forwarded: st.forwarded, Audio: st.audio, Reason: st.reason,
 	})
@@ -238,11 +268,7 @@ func (c *Conn) resendSubscription(sub *Subscription) {
 		sub.held.Stop()
 		sub.held = nil
 	}
-	st := sub.state()
-	sub.told, sub.quiet = st, monoNow()+int64(c.sfu.subEventEvery)
-	c.sig.SendEvent(SubscriptionStateEvent{
-		Share: sub.share.id, Requested: sub.reqVideo, Forwarded: st.forwarded, Audio: st.audio, Reason: st.reason,
-	})
+	c.tell(sub, sub.state(), monoNow())
 }
 
 // detach takes the subscription's DownTracks off the share's fan-out lists and ends their writers. A report that
@@ -308,6 +334,7 @@ func (c *Conn) updateSubscriptions(items []SubscriptionUpdate) ([]error, error) 
 		created, applied = created || made, true
 		sub.reqVideo, sub.reqAudio = it.Video, it.Audio
 		sub.apply()
+		sub.publish()
 		c.reportSubscription(sub)
 	}
 	switch s := c.sub; {

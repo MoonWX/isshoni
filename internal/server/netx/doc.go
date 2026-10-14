@@ -9,6 +9,9 @@
 //     the advertised addresses;
 //   - udpconn.go and tcpconn.go: the byte-counting UDP socket (it keeps pion's allocation-free AddrPort path) and
 //     the 7882/tcp listener with its per-IP ICE connection limit;
+//   - srcguard.go: the ICE source guard of 04 §7.8 (review R3, slice F06): at most 64 distinct remote addresses per
+//     local ICE ufrag reach pion with STUN, across UDP and ICE-TCP, so a client can't grow pion's peer-reflexive
+//     candidates without bound;
 //   - publicip.go, stun.go and ifaces.go: DetectPublicAddrs (04 §7.4) on an injected STUN client and interface
 //     lister, so every row of the classification table is tested offline;
 //   - rewrite.go: the address plan of 04 §7.5 (rewrite rules, kept addresses, LAN flags);

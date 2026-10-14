@@ -1,0 +1,139 @@
+{
+  "At": "2026-10-01T12:00:00Z",
+  "Rooms": [
+    {
+      "Room": "den",
+      "Shares": [
+        {
+          "Info": {
+            "ID": "s_den",
+            "Room": "den",
+            "Participant": "erin",
+            "User": "erin",
+            "Conn": "c-erin",
+            "Source": 1,
+            "Preset": 0,
+            "State": 0,
+            "Profile": "",
+            "Layers": null,
+            "Audio": false,
+            "Viewers": null,
+            "StartedAt": "2026-10-01T12:00:00Z",
+            "LiveAt": "0001-01-01T00:00:00Z"
+          },
+          "IngressBps": 0,
+          "EgressBps": 0,
+          "Viewers": {
+            "High": 0,
+            "Low": 0,
+            "Audio": 0
+          }
+        }
+      ],
+      "Conns": [
+        {
+          "Conn": "c-dave",
+          "User": "dave",
+          "Transport": "",
+          "RTT": 0
+        },
+        {
+          "Conn": "c-erin",
+          "User": "erin",
+          "Transport": "",
+          "RTT": 0
+        }
+      ]
+    },
+    {
+      "Room": "lounge",
+      "Shares": [
+        {
+          "Info": {
+            "ID": "s_lounge",
+            "Room": "lounge",
+            "Participant": "alice",
+            "User": "alice",
+            "Conn": "c-alice",
+            "Source": 1,
+            "Preset": 0,
+            "State": 1,
+            "Profile": "6400",
+            "Layers": [
+              {
+                "RID": "f",
+                "Width": 640,
+                "Height": 360,
+                "FPS": 30,
+                "Bitrate": 715279,
+                "LossPct": 0,
+                "Active": true
+              },
+              {
+                "RID": "q",
+                "Width": 640,
+                "Height": 360,
+                "FPS": 15,
+                "Bitrate": 57705,
+                "LossPct": 0,
+                "Active": true
+              }
+            ],
+            "Audio": true,
+            "Viewers": [
+              "bob",
+              "carol"
+            ],
+            "StartedAt": "2026-10-01T12:00:00Z",
+            "LiveAt": "2026-10-01T12:00:00Z"
+          },
+          "IngressBps": 812630,
+          "EgressBps": 812630,
+          "Viewers": {
+            "High": 1,
+            "Low": 1,
+            "Audio": 1
+          }
+        }
+      ],
+      "Conns": [
+        {
+          "Conn": "c-alice",
+          "User": "alice",
+          "Transport": "",
+          "RTT": 0
+        },
+        {
+          "Conn": "c-bob",
+          "User": "bob",
+          "Transport": "",
+          "RTT": 0
+        },
+        {
+          "Conn": "c-carol",
+          "User": "carol",
+          "Transport": "",
+          "RTT": 0
+        }
+      ]
+    }
+  ],
+  "Totals": {
+    "IngressBps": 812630,
+    "EgressBps": 812630,
+    "DownTracks": 6,
+    "PCsByState": {
+      "closed": 0,
+      "connected": 0,
+      "connecting": 0,
+      "disconnected": 0,
+      "failed": 0,
+      "new": 1
+    },
+    "PCsByTransport": {
+      "tcp443": 0,
+      "tcp7882": 0,
+      "udp": 0
+    }
+  }
+}

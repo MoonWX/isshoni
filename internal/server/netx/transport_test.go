@@ -437,12 +437,14 @@ func TestTransportCloseIdempotent(t *testing.T) {
 	}
 }
 
-// TestQuietLogger: the muxes' per-connection warnings become debug lines, and so does the UDP mux's error about a
-// packet for a connection that has just closed; every other error keeps its level.
+// TestQuietLogger: the muxes' info lines and per-connection warnings become debug lines, and so does the UDP mux's
+// error about a packet for a connection that has just closed; every other error keeps its level.
 func TestQuietLogger(t *testing.T) {
 	var buf bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	q := quietLogger{logx.NewPionLoggerFactory(log).NewLogger("ice")}
+	q.Infof("Listening TCP on %s", "127.0.0.1:7882")
+	q.Info("Added connection: tcp remote 192.0.2.1:5000 to local 127.0.0.1:7882")
 	q.Warnf("Error reading first packet from %s: %s", "192.0.2.1:5000", "EOF")
 	q.Warn("Not a STUN message")
 	q.Errorf("Failed to read UDP packet: %v", "boom")
@@ -460,7 +462,7 @@ func TestQuietLogger(t *testing.T) {
 		}
 		levels = append(levels, m["level"].(string))
 	}
-	if want := []string{"DEBUG", "DEBUG", "ERROR", "DEBUG", "DEBUG", "ERROR", "ERROR"}; !slices.Equal(levels, want) {
+	if want := []string{"DEBUG", "DEBUG", "DEBUG", "DEBUG", "ERROR", "DEBUG", "DEBUG", "ERROR", "ERROR"}; !slices.Equal(levels, want) {
 		t.Errorf("levels = %v, want %v", levels, want)
 	}
 }

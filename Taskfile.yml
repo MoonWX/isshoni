@@ -344,7 +344,9 @@ tasks:
         if: '[ -d .github/workflows ]'
 
   lint:keys:
-    desc: Check that the key block embedded in deploy/install.sh equals deploy/keys/allowed_signers
+    desc: >-
+      Check that the key block embedded in deploy/install.sh equals deploy/keys/allowed_signers, and that README.md's
+      "Release signing keys" section lists the fingerprint of each key in it and no other one
     cmds:
       - go -C tools run ./repocheck -root .. keys
 
@@ -828,7 +830,9 @@ tasks:
           if grep -q 'PRIVATE KEY' "$keys"; then
             die "$keys holds a PRIVATE key. Do not commit it: delete the file, and use the .pub files' contents"
           fi
-          # What lint:keys rejects is checked before install.sh is written, so that a failed run leaves it as it was.
+          # What lint:keys rejects in the key file is checked before install.sh is written, so that a failed run
+          # leaves it as it was. Its README.md check runs after the write: until README.md lists the fingerprints
+          # printed below, this task ends with that error (deploy/keys/README.md step 2).
           if grep -q "'" "$keys"; then
             die "$keys contains a single quote (comments count too), which install.sh's key block cannot hold"
           fi

@@ -101,7 +101,7 @@ func pipeFrom(t *testing.T, remote string) (server net.Conn, client net.Conn) {
 func TestICEListenerLimitPerSlash64(t *testing.T) {
 	fl := newFakeListener()
 	lim := newConnLimiter(3)
-	l := newICEListener(fl, lim, nil, discardLog())
+	l := newICEListener(fl, lim, nil, nil, discardLog())
 	defer func() { _ = l.Close() }()
 
 	var clients []net.Conn
@@ -148,7 +148,7 @@ func TestICEListenerLimitPerSlash64(t *testing.T) {
 func TestICEListenerRefusesUnknownRemote(t *testing.T) {
 	fl := newFakeListener()
 	lim := newConnLimiter(0)
-	l := newICEListener(fl, lim, nil, discardLog())
+	l := newICEListener(fl, lim, nil, nil, discardLog())
 	defer func() { _ = l.Close() }()
 	s, c := net.Pipe() // RemoteAddr is "pipe"
 	defer func() { _ = c.Close() }()
@@ -173,7 +173,7 @@ func TestICEListenerRefusesUnknownRemote(t *testing.T) {
 // connection is handed out, even one without an IP remote address, and Close still closes the ones handed out.
 func TestICEListenerNoLimit(t *testing.T) {
 	fl := newFakeListener()
-	l := newICEListener(fl, nil, nil, discardLog())
+	l := newICEListener(fl, nil, nil, nil, discardLog())
 	var clients []net.Conn
 	for range 3 {
 		s, c := net.Pipe() // RemoteAddr is "pipe"
@@ -202,7 +202,7 @@ func TestICEListenerNoLimit(t *testing.T) {
 
 func TestICEListenerRetriesTransientErrors(t *testing.T) {
 	fl := newFakeListener()
-	l := newICEListener(fl, newConnLimiter(1), nil, discardLog())
+	l := newICEListener(fl, newConnLimiter(1), nil, nil, discardLog())
 	defer func() { _ = l.Close() }()
 	fl.errs <- errors.New("accept: too many open files")
 	s, _ := pipeFrom(t, "192.0.2.7:1000")
@@ -242,7 +242,7 @@ func TestICEListenerCountsBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	var counter TransferCounter
-	l := newICEListener(raw, newConnLimiter(0), &counter, discardLog())
+	l := newICEListener(raw, newConnLimiter(0), &counter, nil, discardLog())
 	defer func() { _ = l.Close() }()
 
 	var d net.Dialer

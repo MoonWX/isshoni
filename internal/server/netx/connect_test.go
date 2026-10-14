@@ -90,6 +90,13 @@ func clientAPI(nt webrtc.NetworkType) *webrtc.API {
 // returns the server's selected local candidate.
 func connectPair(t *testing.T, tr *Transport, client *webrtc.API) webrtc.ICECandidate {
 	t.Helper()
+	local, _ := connectPairSDP(t, tr, client)
+	return local
+}
+
+// connectPairSDP is connectPair that also returns the client's answer SDP, with the candidates it gathered.
+func connectPairSDP(t *testing.T, tr *Transport, client *webrtc.API) (webrtc.ICECandidate, string) {
+	t.Helper()
 	var se webrtc.SettingEngine
 	if err := tr.Apply(&se); err != nil {
 		t.Fatal(err)
@@ -165,7 +172,7 @@ func connectPair(t *testing.T, tr *Transport, client *webrtc.API) webrtc.ICECand
 	if err != nil || pair == nil {
 		t.Fatalf("no selected pair: %v", err)
 	}
-	return *pair.Local
+	return *pair.Local, peer.LocalDescription().SDP
 }
 
 // checkAdvertised checks that every candidate of the server's SDP is one of tr.Advertised.

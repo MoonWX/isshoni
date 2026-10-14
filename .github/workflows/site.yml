@@ -1,0 +1,293 @@
+# The project site (docs/m1/06-deploy-and-ci.md §10, "06" below): VitePress over docs/, published to GitHub Pages at
+# https://moonwx.github.io/isshoni/.
+#
+#   build ──► deploy ──► check
+#
+# - build checks out main, so the pages always come from main, also when release.yml calls this workflow from a tag.
+#   It fetches the latest release's install.sh and compose files and verifies them: the signature of checksums.txt
+#   with main's deploy/keys/allowed_signers, then each file's SHA-256 (06 §10.3). They go into the site with the public
+#   keys (/keys/allowed_signers), and .vitepress/release.json gets the version, the installer's SHA-256 and the key
+#   fingerprints, which the install and security pages show. While no release exists the step says so and the site
+#   says "not released yet". Then vitepress build, the check that the site loads nothing from other origins
+#   (docs/scripts/check-site.mjs), and the Pages artifact.
+# - deploy publishes the artifact (environment github-pages). It runs only once the owner has turned Pages on
+#   (06 §8.6 step 5: Settings → Pages → Source "GitHub Actions"). Until the first release, a run without Pages stays
+#   green with the site built and checked but not deployed, and build says so in a warning.
+# - check fetches the served /install.sh and compares its SHA-256 with the latest release's install.sh: the asset the
+#   site must serve. Skipped while no release exists. Once one exists, a run on main or a release tag that did not
+#   deploy (Pages still off, or the deploy failed) fails here: the stable install URL would serve nothing or an old
+#   script. Pages sends Cache-Control: max-age=600, so it asks past caches and waits up to 10 minutes for the new
+#   site. It then asks GitHub again which release is the latest: a release published while this run built (whose own
+#   run may have deployed before this one) fails it, and a new run from main serves the new one. A new run, not a
+#   re-run of failed jobs: check would compare with the old build's outputs again.
+#
+# A release made with GITHUB_TOKEN triggers no other workflow, so release.yml calls this one after it publishes
+# (its site job, 06 §9.3). Called from a final release's tag, build makes sure that GitHub's latest release is that
+# tag.
+#
+# Rules for every workflow (06 §8.1): a read-only token by default, with jobs raising their own permissions;
+# third-party actions pinned by full commit SHA with a version comment; checkout without persisted credentials;
+# timeout-minutes on every job. Like release.yml, this workflow uses no caches. GH_TOKEN goes only to the steps that
+# call gh, never to npm or the build, which run third-party code.
+#
+# No top-level concurrency, unlike 06 §8.1's rule: called from release.yml, github.workflow and github.ref are the
+# caller's, so the group would be release.yml's own, a deadlock that GitHub cancels. Deploys are serialized by the
+# deploy job's "pages" group instead.
+
+name: Site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '!docs/PLAN.md'
+      - '!docs/m1/**'
+      - 'deploy/keys/allowed_signers'
+      - '.github/workflows/site.yml'
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: read # whether Pages is on
+    outputs:
+      pages: ${{ steps.pages.outputs.enabled }}
+      released: ${{ steps.release.outputs.released }}
+      version: ${{ steps.release.outputs.version }}
+      install-sh-sha256: ${{ steps.release.outputs.install-sh-sha256 }}
+    steps:
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Set up Node (version from .tool-versions)
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .tool-versions
+
+      - name: npm ci
+        run: npm ci --prefix docs --no-audit --no-fund
+
+      - name: Is GitHub Pages on?
+        id: pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # GET /repos/{repo}/pages answers 404 while Pages is off.
+          if out=$(gh api "repos/$GITHUB_REPOSITORY/pages" --jq .build_type 2>&1); then
+            if [ "$out" != workflow ]; then
+              echo "::error::GitHub Pages builds from a branch ($out): set Settings → Pages → Source to \"GitHub Actions\" (06 §8.6 step 5)"
+              exit 1
+            fi
+            enabled=true
+          elif grep -q 'HTTP 404' <<< "$out"; then
+            echo "::warning::GitHub Pages is not turned on yet (06 §8.6 step 5: Settings → Pages → Source \"GitHub Actions\"). The site is built and checked, not deployed; once a release exists, the check job fails until Pages is on."
+            enabled=false
+          else
+            printf '%s\n' "$out"
+            echo "::error::could not ask GitHub whether Pages is on"
+            exit 1
+          fi
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+
+      - name: The latest release's installer, verified (06 §10.3)
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          fail() {
+            echo "::error::$*"
+            exit 1
+          }
+          # GitHub's latest release, which a prerelease never is (06 §9.3). It answers 404 while there is none.
+          if ! tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2> "$RUNNER_TEMP/latest.err"); then
+            if grep -q 'HTTP 404' "$RUNNER_TEMP/latest.err"; then
+              echo "There is no release yet: the site serves no install.sh, and its pages say so (06 §10.3)."
+              echo "released=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            cat "$RUNNER_TEMP/latest.err"
+            fail "could not look up the latest release"
+          fi
+          re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.[1-9][0-9]*)?$'
+          [[ $tag =~ $re ]] || fail "the latest release's tag \"$tag\" is not vX.Y.Z"
+          # Called by release.yml for a final release, which publish made the latest: a stale answer would serve the
+          # previous installer, and the check below would compare the site with that same stale value.
+          if [[ $GITHUB_REF =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]] && [ "$tag" != "$GITHUB_REF_NAME" ]; then
+            fail "GitHub's latest release is $tag, not $GITHUB_REF_NAME, the tag this run is for"
+          fi
+          version=${tag#v}
+          rel=$RUNNER_TEMP/release
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$rel" \
+            --pattern install.sh --pattern 'compose*.yaml' --pattern 'checksums.txt*'
+          ls -l "$rel"
+
+          # The signature, with the keys of main (06 §9.4: after a rotation the next release is signed with the new key).
+          keys=deploy/keys/allowed_signers
+          [ -s "$keys" ] || fail "$keys is missing or empty, so the release $tag can't be verified (deploy/keys/README.md)"
+          [ -f "$rel/checksums.txt.sig" ] || fail "the release $tag has no checksums.txt.sig"
+          ssh-keygen -Y verify -f "$keys" -I isshoni-release -n isshoni-checksums \
+            -s "$rel/checksums.txt.sig" < "$rel/checksums.txt" ||
+            fail "the signature of checksums.txt of $tag does not verify with $keys"
+
+          # Each file the site serves against the signed list. checksums.txt must list it, once: sha256sum's
+          # --ignore-missing would pass a file that the list leaves out.
+          for f in install.sh compose.yaml compose.host.yaml; do
+            [ -f "$rel/$f" ] || fail "the release $tag has no $f"
+            awk -v f="$f" '$2 == f { n++ } END { exit n != 1 }' "$rel/checksums.txt" ||
+              fail "checksums.txt of $tag does not list $f exactly once"
+          done
+          (cd "$rel" && sha256sum --ignore-missing -c checksums.txt)
+          grep -qx "ISSHONI_INSTALLER_VERSION=\"$version\"" "$rel/install.sh" ||
+            fail "the install.sh of $tag is not stamped with $version"
+          sha=$(sha256sum "$rel/install.sh" | cut -d' ' -f1)
+          keys_sha=$(sha256sum "$keys" | cut -d' ' -f1)
+
+          # The fingerprints of every key, as ssh-keygen -l prints them (the README and /security list them).
+          fingerprints=()
+          while IFS= read -r line || [ -n "$line" ]; do
+            case $line in '' | '#'*) continue ;; esac
+            key=$(grep -oE '(ssh-ed25519|sk-ssh-ed25519@openssh\.com|ecdsa-sha2-nistp[0-9]+|ssh-rsa) [A-Za-z0-9+/=]+' <<< "$line") ||
+              fail "$keys has a line without a public key: $line"
+            printf '%s\n' "$key" > "$RUNNER_TEMP/key.pub"
+            fingerprints+=("$(ssh-keygen -l -f "$RUNNER_TEMP/key.pub" | cut -d' ' -f2)")
+          done < "$keys"
+          [ "${#fingerprints[@]}" -gt 0 ] || fail "$keys has no key"
+
+          mkdir -p docs/public/keys
+          cp "$rel/install.sh" "$rel/compose.yaml" "$rel/compose.host.yaml" docs/public/
+          cp "$keys" docs/public/keys/allowed_signers
+          jq -n --arg version "$version" --arg sha "$sha" \
+            '{version: $version, installShSha256: $sha, keyFingerprints: $ARGS.positional}' \
+            --args "${fingerprints[@]}" > docs/.vitepress/release.json
+          cat docs/.vitepress/release.json
+          {
+            echo "released=true"
+            echo "version=$version"
+            echo "install-sh-sha256=$sha"
+            echo "keys-sha256=$keys_sha"
+          } >> "$GITHUB_OUTPUT"
+          echo "The site serves the install.sh of $tag, SHA-256 $sha." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: vitepress build
+        run: npx --prefix docs vitepress build docs
+
+      - name: The site loads nothing from other origins (06 §10.1)
+        run: node docs/scripts/check-site.mjs
+
+      - name: The built site carries the verified installer and keys
+        # The build ran third-party code (every npm package) after the verification above, and could have changed
+        # any file of the workspace: the SHA-256s come from the verifying step's outputs, not from files.
+        if: steps.release.outputs.released == 'true'
+        env:
+          SHA: ${{ steps.release.outputs.install-sh-sha256 }}
+          KEYS_SHA: ${{ steps.release.outputs.keys-sha256 }}
+        run: |
+          echo "$SHA  docs/.vitepress/dist/install.sh" | sha256sum -c
+          echo "$KEYS_SHA  docs/.vitepress/dist/keys/allowed_signers" | sha256sum -c
+
+      - name: Upload the Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: docs/.vitepress/dist
+
+  deploy:
+    # Only from main or a release tag: the github-pages environment allows nothing else (06 §8.6 step 5).
+    needs: build
+    if: >-
+      needs.build.outputs.pages == 'true' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    # One deployment at a time; a newer one waits rather than cancelling one under way.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    outputs:
+      page-url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+  check:
+    # The served install.sh is the latest release's (06 §10.5, README S82). Once a release exists, a run that deploys
+    # (main or a release tag) must have deployed: with deploy skipped (Pages off) or failed the stable install URL
+    # does not serve the release's installer, and this job fails. The result checks are explicit because a job-level
+    # success() would skip this job with deploy. Before the first release nothing is checked, so main stays green
+    # while Pages is off.
+    needs: [build, deploy]
+    if: >-
+      ${{ !cancelled() && needs.build.result == 'success' && needs.build.outputs.released == 'true' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read # the latest release, asked again
+    env:
+      PAGE_URL: ${{ needs.deploy.outputs.page-url }}
+      VERSION: ${{ needs.build.outputs.version }}
+      WANT: ${{ needs.build.outputs.install-sh-sha256 }}
+    steps:
+      - name: The site was deployed
+        if: needs.deploy.result != 'success'
+        env:
+          DEPLOY: ${{ needs.deploy.result }}
+          PAGES: ${{ needs.build.outputs.pages }}
+        run: |
+          echo "::error::v$VERSION is released but the site was not deployed (deploy: $DEPLOY, Pages on: $PAGES), so the stable install URL does not serve its install.sh. Turn on Pages if it is off (06 §8.6 step 5), then run Site from main (Actions → Site → Run workflow)."
+          exit 1
+
+      - name: The served install.sh has the SHA-256 of the release's
+        run: |
+          url=${PAGE_URL%/}/install.sh
+          # A query string of its own per attempt gets past the caches of Pages' CDN (max-age=600).
+          for i in $(seq 1 30); do
+            if curl -fsSL --retry 2 --max-time 30 -o "$RUNNER_TEMP/install.sh" "$url?check=$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT.$i"; then
+              got=$(sha256sum "$RUNNER_TEMP/install.sh" | cut -d' ' -f1)
+              if [ "$got" = "$WANT" ]; then
+                echo "$url is the install.sh of v$VERSION (SHA-256 $got)" | tee -a "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              echo "attempt $i: $url has SHA-256 $got, the install.sh of v$VERSION has $WANT"
+            else
+              echo "attempt $i: $url could not be fetched"
+            fi
+            sleep 20
+          done
+          echo "::error::$url is not the install.sh of v$VERSION (SHA-256 $WANT) after 10 minutes"
+          exit 1
+
+      - name: v${{ needs.build.outputs.version }} is still the latest release
+        # A run that built just before a release was published (a docs push, say) can deploy after the release's own
+        # run, since deploys queue in the pages group, and serve the previous installer; the step above passes then,
+        # as it compares with what this run's build saw.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+          if [ "$latest" != "v$VERSION" ]; then
+            echo "::error::the latest release is now $latest, not v$VERSION: a newer release was published while this run built; run Site from main again (Actions → Site → Run workflow)"
+            exit 1
+          fi
+          echo "v$VERSION is still the latest release" | tee -a "$GITHUB_STEP_SUMMARY"

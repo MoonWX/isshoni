@@ -4,8 +4,9 @@
 // auth trigger through the wiring (04 §6.6).
 //
 // Files:
-//   - service.go: Options, Service, New, Run, the triggers (ShareStarted, AdminAlert, SendTest), the queue, its
-//     workers, and the result table of 04 §14.5 (record, delete, retry);
+//   - service.go: Options, Service, New, Run, the triggers (ShareStarted, AdminAlert, SendTest), the queues and
+//     their workers (share.started and admin.alert share the workers; push.test has a lane of its own, one worker
+//     and one attempt per job, README F08), and the result table of 04 §14.5 (record, delete, retry);
 //   - store.go: Store, RecipientFilter and Subscription, the small interface over 03's tables (04 §14.7);
 //   - payload.go: the three payloads of 04 §14.3 (api.PushPayload: data, never English text);
 //   - limits.go: the dedup window per (room, sharer), the token bucket per recipient and the Topic header

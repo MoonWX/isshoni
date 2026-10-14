@@ -45,10 +45,10 @@
 //	                                   writer), PLI and FIR for the track, until its sender stops
 //	                                   (DownTrack.readRTCP); owned by the sub PC
 //	Ticker            1 per SFU        every 250 ms, and at once for a state change: the ShareUpdated calls that are
-//	                                   due; every second: each layer's rates and cache size, the stalled check
-//	                                   (a live share whose pub PC has been away for 2 s), and each room's codec
-//	                                   policy (its way back to high after the hold). Started by the first Join,
-//	                                   stopped by Close. README S84 and S88 add to it
+//	                                   due; every second: each layer's rates and cache size, each DownTrack's
+//	                                   bitrate, the stalled check (a live share whose pub PC has been away for 2 s),
+//	                                   and each room's codec policy (its way back to high after the hold). Started
+//	                                   by the first Join, stopped by Close. README S84 and S88 add to it
 //	Probe             1 per probe PC   the connection-test probe's life (probe.run): waits for its PC to connect,
 //	                                   reports the result 1 s later, and ends the probe after 20 s, when the PC
 //	                                   fails or closes, when its data channel closes, or when it is stopped (a
@@ -105,7 +105,8 @@
 //     the layer whose keyframe arrives, live → stalled by the ticker (2 s without a connected pub PC), by the
 //     publishing Conn's actor (the pub PC failed) or by whoever detaches the share's last video layer. What they
 //     know of the pub PC is what its Conn's actor has seen (Conn.pubUp, an atomic), so the ways into stalled and out
-//     of it go by the same view and can't flap against each other.
+//     of it go by the same view and can't flap against each other. Layer.requestKeyframe goes by that view too: a
+//     request made while the pub PC is away does nothing, not even start the 500 ms throttle (02 §9.7).
 //   - A pubTrack reader whose RTP read fails posts the track's end to the actor, which detaches the track and takes
 //     it out of pubPC.tracks (pubTrackEnded). The table holds only tracks that are still read, so an offer never
 //     binds an ended track to a share.
@@ -180,6 +181,19 @@
 //     keeps that timeline the capture timeline, through both layers' reports, to within a tick. So a share's audio
 //     and video reach a viewer on one clock, the publisher's capture clock;
 //   - events.go, errors.go, types.go, config.go, stats.go: the whole interface of 02 §6 and §13;
+//   - stats.go, counters.go, pionlog.go: observability (02 §13). Conn.Stats, SFU.Snapshot and SFU.Metrics never ask
+//     an actor and never wait: they read what the Layers and DownTracks measure (their rates are the ticker's, once
+//     a second), what each Conn publishes of its PeerConnections (Conn.views: the state and the selected pair are
+//     Pion's atomics, labeled by 02 §7.1; the round-trip time is what the PC's RTCP readers read from the pair's
+//     statistics every 5 s) and of its subscriptions (Subscription.shown). The counters of Metrics are totals per
+//     SFU, which every Layer and DownTrack counts into as it counts for itself (a tally), so they never go back when
+//     a share ends; the gauges are read from the object model when Metrics is called. A layer switch is a viewer's
+//     stream going on in another layer than it was in; a downgrade is a reason the client hears that it didn't hear
+//     last (Conn.tell), counted and logged at info. The SFU logs at info only ids, states and reasons: Conn join and
+//     leave, PC states with the transport of the selected pair, the share lifecycle, codec policy changes and
+//     downgrades; handshake timeouts and sub offers sent again are warnings. Pion's own lines come through logx's
+//     bridge with two changes (pionlog.go): its info lines are debug lines, and so are its warnings and errors that
+//     hold an IP address, so that nothing at info or above names a client's address, SDP or a candidate;
 //   - probe.go: the connection-test probe (02 §7.6). Probe answers a browser's data-channel offer on the probe API of
 //     one transport (api.go), so the answer holds only that transport's candidates, and the probe PC echoes every
 //     data-channel message unchanged. A user has one probe per transport (a new one closes the old one), the server
@@ -253,11 +267,10 @@
 // # What later slices add
 //
 // The whole API of 02 §6 is implemented (README S76 did the last method, Probe), and the sentinel ErrNotImplemented
-// that the unbuilt methods wrapped is gone. What later slices add, in README order:
-//   - S79: the transports, RTTs and counters of Snapshot, ConnStats and Metrics (the Layers and DownTracks count,
-//     the repair counters of 02 §13 included; nothing sums them up yet. A sub PC's round-trip time is read already,
-//     for the NACK handling: subPC.rtt).
-//   - S84: the downlink allocator (REMB, receiver reports, queue drops) and the pacer.
+// that the unbuilt methods wrapped is gone; so are the reports of 02 §13 (README S79). What later slices add, in
+// README order:
+//   - S84: the downlink allocator (REMB, what it makes of the receiver reports, queue drops) and the pacer; with it
+//     ConnStats.DownlinkEstimate and the bandwidth downgrades, which Metrics already counts by reason.
 //   - S88: the admin cap as REMB and quality hint (SetLimits already caps new ShareParams), layer pausing, and the
 //     last QualityHintEvent per share in Resync.
 //

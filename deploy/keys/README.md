@@ -46,15 +46,20 @@ release.yml (its dry run too) refuse to build without it.
    for k in isshoni-release-1 isshoni-release-backup-1; do
      printf 'isshoni-release namespaces="isshoni-checksums" %s\n' "$(cat "/path/to/$k.pub")"
    done > deploy/keys/allowed_signers
-   task release:keys        # copies the file into deploy/install.sh, runs lint:keys, prints the fingerprints
-   # now replace the two "not created yet" cells of README.md's "Release signing keys" table with them
+   task release:keys        # copies the file into deploy/install.sh, prints the fingerprints, runs lint:keys
+   # lint:keys fails until README.md lists them: replace the two "not created yet" cells of README.md's
+   # "Release signing keys" table with the printed fingerprints, then check again
+   task lint:keys
    git add deploy/keys/allowed_signers deploy/install.sh README.md
    git commit -m "Release signing keys"
    ```
    The change is data only: the key file, the block in `install.sh` and the two fingerprints that
    `task release:keys` prints (`ssh-keygen -lf <key>.pub` prints the same) in the "Release signing keys" section of
-   the root `README.md` (06 §9.4). Keep the fingerprints: they also go onto the site's `/security` page (06 §10.3),
-   and you compare them in step 5. Merge once `ci-ok` is green.
+   the root `README.md` (06 §9.4). The first `task release:keys` ends with lint:keys' error that README.md does not
+   list them yet; that is expected, and install.sh is already written. `task lint:keys` (CI's too) passes once the
+   section lists each key's fingerprint, no other one, and no row still says a key is not created. Keep the
+   fingerprints: they also go onto the site's `/security` page (06 §10.3), and you compare them in step 5. Merge
+   once `ci-ok` is green.
 3. **Create the environment `release`** (Settings → Environments → New environment; 06 §8.6 step 4):
    - required reviewers: you, with "Prevent self-review" **off** (you approve your own releases);
    - deployment branches and tags: "Selected branches and tags", with one rule for **tags** `v*` (no branches);
@@ -86,7 +91,8 @@ release.yml (its dry run too) refuse to build without it.
 
 1. Add the new key's line to `allowed_signers`. Mark the old one `valid-before="YYYYMMDD"` (append it to the
    namespaces field: `namespaces="isshoni-checksums",valid-before="20271231"`), or delete its line after a leak.
-   Run `task release:keys` and merge the change.
+   Run `task release:keys`, put the new key's fingerprint into README.md's "Release signing keys" section (and
+   remove a deleted key's), run `task lint:keys`, and merge the change.
 2. Replace the secret `RELEASE_SSH_SIGNING_KEY`.
 3. Cut a patch release: the site's `install.sh` then carries the new block.
 

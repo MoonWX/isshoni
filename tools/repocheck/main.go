@@ -1,5 +1,5 @@
 // Command repocheck runs the repository consistency checks behind `task lint:pins` and `task lint:keys`
-// (docs/m1/06-deploy-and-ci.md §7.1, §4.3).
+// (docs/m1/06-deploy-and-ci.md §7.1, §4.3, §9.4, §10.3).
 //
 //	go -C tools run ./repocheck [-root DIR] pins|keys
 //
@@ -8,7 +8,10 @@
 // .bin/, and the goreleaser pin the version that tools/goreleaser/go.mod builds.
 //
 // keys: the allowed-signers block embedded in deploy/install.sh equals deploy/keys/allowed_signers byte for byte.
-// While either file does not exist yet, it prints a note and succeeds.
+// Once that file is non-empty, it holds at least one key, the "## Release signing keys" section of README.md lists
+// the SHA256 fingerprint of each of them, as `ssh-keygen -l` prints it, and no other fingerprint, and none of its
+// lines still says a key is "not created yet". While deploy/keys/allowed_signers does not exist yet, it prints a note
+// and succeeds; while deploy/install.sh does not, it checks only README.md and prints a note.
 //
 // Exit status: 0 when the check passes (or is skipped with a note), 1 when it fails, 2 on a usage error.
 package main
