@@ -112,7 +112,8 @@ export function SharePanel({
   if (phase === 'idle' || phase === 'picking' || phase === 'confirming') return null;
 
   if (phase === 'failed') {
-    const mediaTimeout = error instanceof ShareEndedError && error.kind === 'media_timeout';
+    // No video reached the server, or the server was out of reach: the connection test may say why.
+    const networkEnd = error instanceof ShareEndedError && error.kind !== 'server';
     return (
       <section className={cx(styles.panel, styles.failed)} aria-label={t('share.panel.label')}>
         <div className={styles.bar}>
@@ -120,7 +121,7 @@ export function SharePanel({
             {shareErrorMessage(error, t)}
           </p>
           <div className={styles.actions}>
-            {mediaTimeout && onTestConnection && (
+            {networkEnd && onTestConnection && (
               <Button size="sm" onClick={onTestConnection}>
                 {t('share.panel.testConnection')}
               </Button>

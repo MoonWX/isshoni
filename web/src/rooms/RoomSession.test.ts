@@ -654,6 +654,36 @@ describe('resync (01 §10.5)', () => {
       expect(session().share).toBe(share);
     });
 
+    it('snapshots without the old id while the share is published again are no end of it', async () => {
+      await inRoom();
+      const share = await startShare();
+      h.hub.sendState('lounge', { shares: [shareInfo('s_local', ownUser, ownConnection())] });
+      let finish: () => void = () => undefined;
+      share.republish = () => {
+        share.calls.push('republish');
+        return new Promise<void>((resolve) => {
+          finish = () => {
+            share.shareId = 's_again';
+            resolve();
+          };
+        });
+      };
+      h.hub.shares = [];
+      await reconnect({ roomId: 'lounge' });
+      h.hub.sendState('lounge');
+      h.hub.sendState('lounge'); // the hub's next snapshot, before share.start {replaces} is answered
+      await tick();
+      expect(share.calls).toEqual(['resync:kept', 'republish']);
+      expect(session().share).toBe(share);
+
+      // The new id counts from the first snapshot that lists it: one that doesn't after that is the server's end.
+      finish();
+      await tick();
+      h.hub.sendState('lounge', { shares: [shareInfo('s_again', ownUser, ownConnection())] });
+      h.hub.sendState('lounge', { shares: [] });
+      expect(share.calls).toEqual(['resync:kept', 'republish', 'serverEnded:room.state']);
+    });
+
     it('compares with the snapshot that came before the share finished its own resync', async () => {
       await inRoom();
       const share = await startShare();
@@ -731,6 +761,18 @@ describe('resync (01 §10.5)', () => {
       await tick(BackoffMaxMs * 2);
       expect(h.server.welcomes.at(-1)?.resumed).toBe(false);
       expect(h.hub.subscribes.at(-1)).toEqual(wants(2));
+    });
+
+    it('the old connection’s id never counts again: a snapshot without it after the resync is no end of the share', async () => {
+      await inRoom();
+      const share = await startShare();
+      h.hub.sendState('lounge', { shares: [shareInfo('s_local', ownUser, ownConnection())] });
+      // A re-publish that couldn't get through (its share.start lost the connection): the id stays the old one.
+      await reconnect({ resumed: false });
+      expect(share.calls).toEqual(['resync:lost']);
+      h.hub.sendState('lounge', { shares: [] });
+      expect(share.calls).toEqual(['resync:lost']);
+      expect(session().share).toBe(share);
     });
 
     it('a share without resync() is stopped: the server lost it and it cannot be published again', async () => {

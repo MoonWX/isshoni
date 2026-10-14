@@ -424,6 +424,19 @@ describe('SharePanel: a failed share', () => {
     expect(onTestConnection).toHaveBeenCalledOnce();
   });
 
+  it('the capture hold ran out: "the server was unreachable", with [Test my connection]', async () => {
+    const onTestConnection = vi.fn();
+    renderPanel({ store: failedStore(new ShareEndedError('unreachable')), share: null, onTestConnection });
+    expect(within(panel()).getByRole('alert')).toHaveTextContent('Sharing stopped: the server was unreachable');
+    await userEvent.click(screen.getByRole('button', { name: 'Test my connection' }));
+    expect(onTestConnection).toHaveBeenCalledOnce();
+  });
+
+  it('a share the server ended for another reason offers no connection test', () => {
+    renderPanel({ store: failedStore(new ShareEndedError('server')), share: null, onTestConnection: vi.fn() });
+    expect(screen.queryByRole('button', { name: 'Test my connection' })).not.toBeInTheDocument();
+  });
+
   it('other failures have their own text and no connection test', () => {
     renderPanel({ store: failedStore(new LocalError('webrtc_failed')), share: null, onTestConnection: vi.fn() });
     expect(panel()).toHaveTextContent("Couldn't set up the video connection.");

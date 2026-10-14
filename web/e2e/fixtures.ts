@@ -18,6 +18,10 @@
 //
 // Pages. Every context of the harness has the debug flag set, so the page installs window.__isshoni (05 §10.7),
 // which stats.ts reads. `fakeDisplay` and `openToneTab` give a page something to share.
+//
+// The network. `link` is a SOCKS5 proxy that a browser context can reach the server through, and that the test cuts
+// and restores (rooms.spec, reconnect.spec): Chrome's own offline emulation (context.setOffline) is no cut for a
+// WebSocket that is already open (05 §19.3).
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import dgram from 'node:dgram';
@@ -158,6 +162,11 @@ export interface TestFixtures {
    * "e2e server") which of them exited by itself.
    */
   serverLogs: undefined;
+  /**
+   * A network link that the test can cut (see Link): a browser context made with
+   * `browser.newContext({ proxy: { server: link.proxy } })` reaches the server through it. Closed when the test ends.
+   */
+  link: Link;
 }
 
 export interface WorkerFixtures {
@@ -252,6 +261,115 @@ export async function openToneTab(context: BrowserContext, server: Pick<E2EServe
   const page = await context.newPage();
   await page.goto(url);
   return page;
+}
+
+// ---- The link that can be cut ----
+
+/**
+ * A network link between one browser context and the e2e server: a SOCKS5 proxy that the test cuts. Cut, every
+ * connection through it ends without a goodbye (the server's end of a WebSocket goes away without a close frame,
+ * as a network that goes away does), and no new one gets through until it is restored. Only TCP goes through it:
+ * the WebRTC media of the context, on UDP, does not.
+ */
+export interface Link {
+  /** `socks5://127.0.0.1:<port>`: the proxy of the browser context whose network the test cuts. */
+  readonly proxy: string;
+  /** Closes every connection through the link, without a goodbye, and refuses new ones. */
+  cut(): void;
+  /** Lets new connections through again. */
+  restore(): void;
+  close(): Promise<void>;
+}
+
+/**
+ * A SOCKS5 proxy on a free loopback port: no authentication, CONNECT only, to an IPv4 address or a host name
+ * (RFC 1928). It is all a browser context needs to reach the e2e server through it.
+ */
+export async function startLink(): Promise<Link> {
+  const sockets = new Set<net.Socket>();
+  let down = false;
+  const track = (socket: net.Socket): void => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+    // A reset from either end is what cut() is for.
+    socket.on('error', () => undefined);
+  };
+
+  const listener = net.createServer((client) => {
+    track(client);
+    if (down) {
+      client.destroy();
+      return;
+    }
+    let buffered = Buffer.alloc(0);
+    let greeted = false;
+    const onData = (chunk: Buffer): void => {
+      buffered = Buffer.concat([buffered, chunk]);
+      if (!greeted) {
+        // VER, NMETHODS, METHODS…: answered with "no authentication".
+        const methods = buffered[1];
+        if (methods === undefined || buffered.length < 2 + methods) return;
+        buffered = buffered.subarray(2 + methods);
+        client.write(Buffer.from([5, 0]));
+        greeted = true;
+      }
+      // VER, CMD, RSV, ATYP, the address, the port.
+      const type = buffered[3];
+      if (type === undefined) return;
+      let host: string;
+      let portAt: number;
+      if (type === 1) {
+        if (buffered.length < 10) return;
+        host = [...buffered.subarray(4, 8)].join('.');
+        portAt = 8;
+      } else if (type === 3) {
+        const length = buffered[4];
+        if (length === undefined || buffered.length < 7 + length) return;
+        host = buffered.subarray(5, 5 + length).toString('latin1');
+        portAt = 5 + length;
+      } else {
+        client.destroy();
+        return;
+      }
+      const port = buffered.readUInt16BE(portAt);
+      const early = buffered.subarray(portAt + 2);
+      client.off('data', onData);
+
+      const upstream = net.connect({ host, port });
+      track(upstream);
+      upstream.once('connect', () => {
+        client.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
+        if (early.length > 0) upstream.write(early);
+        client.pipe(upstream);
+        upstream.pipe(client);
+      });
+      upstream.once('close', () => client.destroy());
+      client.once('close', () => upstream.destroy());
+    };
+    client.on('data', onData);
+  });
+  await new Promise<void>((resolve) => listener.listen(0, '127.0.0.1', resolve));
+
+  const closeAll = (): void => {
+    for (const socket of sockets) socket.destroy();
+  };
+  return {
+    proxy: `socks5://127.0.0.1:${String((listener.address() as net.AddressInfo).port)}`,
+    cut() {
+      down = true;
+      closeAll();
+    },
+    restore() {
+      down = false;
+    },
+    close: () =>
+      new Promise<void>((resolve) => {
+        closeAll();
+        listener.close(() => {
+          resolve();
+        });
+      }),
+  };
 }
 
 // ---- Server processes ----
@@ -715,6 +833,13 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
       }
     }
     if (videoDir !== null) await fsp.rm(videoDir, { recursive: true, force: true });
+  },
+
+  // eslint-disable-next-line no-empty-pattern -- as above
+  link: async ({}, use) => {
+    const link = await startLink();
+    await use(link);
+    await link.close();
   },
 
   serverLogs: [

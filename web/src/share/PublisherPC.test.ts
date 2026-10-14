@@ -1109,6 +1109,151 @@ describe('PublisherPC: signaling drops (01 §10.4, §10.5)', () => {
   });
 });
 
+describe('PublisherPC: publishing a share again (01 §10.6)', () => {
+  it('on the current PC: the old transceivers stop, new ones carry the same tracks under the new id, one re-offer', async () => {
+    const stream = await publish('s_a');
+    connect();
+    const states: PubMediaState[] = [];
+    pub.on('state', (s) => states.push(s));
+    const [video, audio] = [stream.getVideoTracks()[0], stream.getAudioTracks()[0]];
+
+    await pub.republish('s_a', shareParams('s_b', { codec: 'h264/42e0' }));
+
+    expect(FakeRTCPeerConnection.instances).toHaveLength(1);
+    expect(lastPc().transceivers.map((t) => t.stopped)).toEqual([true, true, false, false]);
+    expect(lastPc().transceivers[2]?.sender.track).toBe(video);
+    expect(lastPc().transceivers[3]?.sender.track).toBe(audio);
+    expect(pub.shareIds).toEqual(['s_b']);
+    expect(pubOffers(server).at(-1)).toMatchObject({
+      gen: 1,
+      neg: 2,
+      tracks: [
+        { mid: '2', shareId: 's_b', kind: 'video' },
+        { mid: '3', shareId: 's_b', kind: 'audio' },
+      ],
+    });
+    // The new ShareParams: their codec first.
+    const offer = pubOffers(server).at(-1);
+    const videoSection = parseSdpSections(offer?.sdp ?? '').find((s) => s.mid === '2');
+    expect(videoSection?.codecLines?.find((l) => l.includes('profile-level-id'))).toContain('42e0');
+    // The PC stays as it was; nothing is closed.
+    expect(states).toEqual([]);
+    expect(server.messages('pc.close')).toEqual([]);
+    expect(stream.getVideoTracks()[0]?.readyState).toBe('live');
+  });
+
+  it('keeps the share’s place among the shares, and folds into the follow-up of an outstanding offer', async () => {
+    await publish('s_a');
+    await pub.addShare('s_b', asStream(capture()), shareParams('s_b'), 'auto');
+    // The offer with s_b is outstanding: the re-publish goes into the next one.
+    await pub.republish('s_a', shareParams('s_c'));
+    expect(pubOffers(server)).toHaveLength(2);
+    expect(pub.shareIds).toEqual(['s_c', 's_b']);
+    await answerLast();
+    expect(pubOffers(server)).toHaveLength(3);
+    // s_c where s_a was: before s_b.
+    expect(
+      pubOffers(server)
+        .at(-1)
+        ?.tracks.map((t) => `${t.mid} ${t.shareId}`),
+    ).toEqual(['4 s_c', '5 s_c', '2 s_b', '3 s_b']);
+  });
+
+  it('after a welcome that was not resumed: a new PC of gen 1, and no pc.close for the one the server forgot', async () => {
+    await publish('s_a');
+    connect();
+    await pub.rebuild();
+    expect(pub.gen).toBe(2);
+    server.restart();
+    server.drop();
+    await tick(1000);
+    expect(signal.welcome?.resumed).toBe(false);
+
+    await pub.republish('s_a', shareParams('s_b'));
+    expect(FakeRTCPeerConnection.instances).toHaveLength(3);
+    expect(pub.gen).toBe(1);
+    expect(pubOffers(server).at(-1)).toMatchObject({
+      gen: 1,
+      neg: 1,
+      tracks: [
+        { mid: '0', shareId: 's_b', kind: 'video' },
+        { mid: '1', shareId: 's_b', kind: 'audio' },
+      ],
+    });
+    expect(pub.state).toBe('connecting');
+    expect(server.messages('pc.close')).toEqual([]);
+  });
+
+  it('a share it doesn’t know: webrtc_failed, and nothing changes', async () => {
+    await publish('s_a');
+    await expect(pub.republish('s_x', shareParams('s_b'))).rejects.toMatchObject({ code: 'webrtc_failed' });
+    expect(pub.shareIds).toEqual(['s_a']);
+    expect(pubOffers(server)).toHaveLength(1);
+  });
+
+  it('an offer that can’t be made: webrtc_failed, nothing of the share is left, and the PC is closed', async () => {
+    await publish('s_a');
+    lastPc().failNext('createOffer');
+    await expect(pub.republish('s_a', shareParams('s_b'))).rejects.toMatchObject({ code: 'webrtc_failed' });
+    expect(pub.shareIds).toEqual([]);
+    expect(pub.state).toBe('idle');
+    expect(sent<PCClose>('pc.close')).toEqual([{ pc: 'pub', gen: 1 }]);
+  });
+});
+
+describe('PublisherPC: forgetServer (a resumed welcome that needed a room.join, 01 §8.4)', () => {
+  it('drops the PC without a message; the next one has gen 1. Once per welcome', async () => {
+    await publish('s_a');
+    connect();
+    await pub.rebuild();
+    connect();
+    const first = lastPc();
+    // A resumed welcome: the PC keeps its gen until the share's resync says the server has none.
+    server.drop();
+    await tick(1000);
+    const welcome = signal.welcome;
+    if (welcome?.resumed !== true) throw new Error('the connection was not resumed');
+    expect(pub.gen).toBe(2);
+
+    pub.forgetServer(welcome);
+    expect(first.signalingState).toBe('closed');
+    expect(pub.state).toBe('idle');
+    expect(pub.gen).toBe(1);
+    expect(pub.shareIds).toEqual(['s_a']);
+    expect(server.messages('pc.close')).toEqual([]);
+
+    await pub.republish('s_a', shareParams('s_b'));
+    const second = lastPc();
+    expect(pubOffers(server).at(-1)).toMatchObject({
+      gen: 1,
+      neg: 1,
+      tracks: [{ shareId: 's_b' }, { shareId: 's_b' }],
+    });
+
+    // The same welcome again (a second share of the connection): the PC that the re-publish made stays.
+    pub.forgetServer(welcome);
+    expect(second.signalingState).not.toBe('closed');
+    // Another welcome: dropped again.
+    pub.forgetServer({ ...welcome });
+    expect(second.signalingState).toBe('closed');
+    expect(server.messages('pc.close')).toEqual([]);
+  });
+
+  it('a welcome that was not resumed counts as forgotten: the share’s own call after it changes nothing', async () => {
+    await publish('s_a');
+    server.restart();
+    server.drop();
+    await tick(1000);
+    const welcome = signal.welcome;
+    if (!welcome) throw new Error('no welcome');
+    await pub.republish('s_a', shareParams('s_b'));
+    const pc = lastPc();
+    pub.forgetServer(welcome);
+    expect(pc.signalingState).not.toBe('closed');
+    expect(pub.shareIds).toEqual(['s_b']);
+  });
+});
+
 describe('PublisherPC with only ShareContext.signal’s structural type', () => {
   it('works without state, welcome and onState: signaling counts as ready, ICE servers as none', async () => {
     const notify = vi.fn(() => true);

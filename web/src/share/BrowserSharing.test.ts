@@ -12,6 +12,7 @@ import type {
   PickedSource,
   Platform,
   ShareHint,
+  SignalClientLike,
 } from '../platform/types';
 import { isProtocolError } from '../protocol/errors';
 import { SignalClient } from '../protocol/signal-client';
@@ -33,6 +34,7 @@ import {
   STATS_SAMPLE_MS,
 } from './BrowserShare';
 import { BrowserSharing, type BrowserSharingDeps } from './BrowserSharing';
+import { CAPTURE_HOLD_MS } from './recovery';
 import { createShareStore, ShareCancelledError, type ShareStore } from './shareStore';
 import { fakePick, type FakePick } from './testing/fakeCapture';
 import { FakeShareHub, lastPc, pubOffers, shareInfo, shareParams } from './testing/publish';
@@ -154,8 +156,8 @@ describe('BrowserSharing (05 §8)', () => {
     );
   });
 
-  it('its ActiveShare has the session’s serverEnded seam (rooms/RoomSession ShareRecovery)', () => {
-    expectTypeOf<BrowserShare>().toExtend<ActiveShare & Pick<ShareRecovery, 'serverEnded'>>();
+  it('its ActiveShare has the whole of the session’s ShareRecovery seam (rooms/RoomSession, 05 §11.1)', () => {
+    expectTypeOf<BrowserShare>().toExtend<ActiveShare & Required<ShareRecovery>>();
   });
 });
 
@@ -838,5 +840,167 @@ describe('a PickedSource is all start() needs', () => {
     expect(share.kind).toBe('window');
     await share.stop();
     expect(pick.release).toHaveBeenCalledOnce();
+  });
+});
+
+describe('a share published again (01 §10.5, §10.6)', () => {
+  const asBrowserShare = (share: ActiveShare): BrowserShare => share as BrowserShare;
+
+  /** The server restarts: the next welcome is a new connection, after which the session resyncs the share. */
+  async function restartServer(share: ActiveShare): Promise<void> {
+    server.restart();
+    server.drop();
+    await tick(1000);
+    const welcome = signal.welcome;
+    if (welcome?.resumed !== false) throw new Error('the connection was resumed');
+    await asBrowserShare(share).resync({ welcome, roomId: 'lounge', kept: false });
+  }
+
+  it('resync after a welcome that was not resumed: share.start {replaces, ref: new}, then a pub PC of gen 1', async () => {
+    const { share, states } = await start({ preset: 'movie' });
+    await goLive();
+    await restartServer(share);
+    const starts = hub.requests<ShareStart>('share.start');
+    expect(starts[1]).toEqual({
+      kind: 'window',
+      preset: 'movie',
+      audio: true,
+      ref: expect.stringMatching(/^[0-9a-f]{24}$/) as string,
+      replaces: 's_1',
+    });
+    expect(starts[1]?.ref).not.toBe(starts[0]?.ref);
+    expect(share.shareId).toBe('s_2');
+    expect(share.params?.shareId).toBe('s_2');
+    expect(pubOffers(server).at(-1)).toMatchObject({
+      gen: 1,
+      neg: 1,
+      tracks: [{ shareId: 's_2' }, { shareId: 's_2' }],
+    });
+    // The id changed: a state event says so, with the state the share has (05 §8).
+    expect(states).toEqual(['live', 'reconnecting', 'reconnecting']);
+    await goLive('s_2');
+    expect(states.at(-1)).toBe('live');
+  });
+
+  it('a resync that kept the connection does nothing: the pub PC sees to its offer and its ICE itself', async () => {
+    const { share } = await start();
+    await goLive();
+    server.drop();
+    await tick(1000);
+    const welcome = signal.welcome;
+    if (welcome?.resumed !== true) throw new Error('the connection was not resumed');
+    await asBrowserShare(share).resync({ welcome, roomId: 'lounge', kept: true });
+    expect(hub.requests('share.start')).toHaveLength(1);
+    expect(share.shareId).toBe('s_1');
+    expect(FakeRTCPeerConnection.instances).toHaveLength(1);
+  });
+
+  it('what the server sends about the share follows its new id', async () => {
+    const { share } = await start();
+    await goLive();
+    await restartServer(share);
+    hub.answer();
+    await tick();
+    // A hint for the new id is this share's; the old id is nobody's now.
+    server.send('quality.hint', { shareId: 's_1', reason: 'codec', codec: 'h264/42e0' });
+    await tick();
+    expect(share.params?.codec).toBe('h264/6400');
+    server.send('quality.hint', { shareId: 's_2', reason: 'codec', codec: 'h264/42e0' });
+    await tick();
+    expect(share.params?.codec).toBe('h264/42e0');
+    expect(pubOffers(server).at(-1)).toMatchObject({
+      gen: 1,
+      neg: 2,
+      tracks: [{ shareId: 's_2' }, { shareId: 's_2' }],
+    });
+
+    server.error(makeError('codec_not_supported', 'share', { shareId: 's_1' }));
+    await tick();
+    expect(share.state).not.toBe('ended');
+    server.error(makeError('codec_not_supported', 'share', { shareId: 's_2' }));
+    await tick();
+    expect(share.state).toBe('ended');
+  });
+
+  it('a resync while a re-publish is still settling follows it, and publishes the share again on what it left', async () => {
+    const { share } = await start();
+    await goLive();
+    // The server lost the share (republish), and before that settles a welcome needs it published again.
+    const first = asBrowserShare(share).republish();
+    const welcome = signal.welcome;
+    if (!welcome) throw new Error('no welcome');
+    const second = asBrowserShare(share).resync({ welcome: { ...welcome }, roomId: 'lounge', kept: false });
+    await tick();
+    await Promise.all([first, second]);
+    expect(hub.requests<ShareStart>('share.start').map((s) => s.replaces)).toEqual([undefined, 's_1', 's_2']);
+    expect(share.shareId).toBe('s_3');
+    expect(share.state).not.toBe('ended');
+    expect(pubOffers(server).at(-1)).toMatchObject({
+      gen: 1,
+      neg: 1,
+      tracks: [{ shareId: 's_3' }, { shareId: 's_3' }],
+    });
+  });
+
+  it('stop() during the re-publish: the share that the server made meanwhile is stopped too', async () => {
+    const { share, src } = await start();
+    await goLive();
+    server.restart();
+    server.drop();
+    await tick(1000);
+    const welcome = signal.welcome;
+    if (!welcome) throw new Error('no welcome');
+    const resynced = asBrowserShare(share).resync({ welcome, roomId: 'lounge', kept: false });
+    // share.start {replaces} is on its way.
+    const stopped = share.stop();
+    await tick();
+    await Promise.all([resynced, stopped]);
+    expect(hub.requests<ShareStop>('share.stop')).toEqual([{ shareId: 's_1' }, { shareId: 's_2' }]);
+    expect(src.release).toHaveBeenCalledOnce();
+    expect(pubOffers(server)).toHaveLength(1);
+    expect(store.getState().phase).toBe('idle');
+  });
+
+  it('the capture hold: a share without a ready connection for 60 s ends, and nothing is sent for it', async () => {
+    const { share, src, ended } = await start();
+    await goLive();
+    server.autoOpen = false;
+    server.drop();
+    await tick(CAPTURE_HOLD_MS - 1);
+    expect(share.state).toBe('live');
+    await tick(1);
+    expect(share.state).toBe('ended');
+    expect(ended).toEqual(['server-unreachable']);
+    expect(src.release).toHaveBeenCalledOnce();
+    expect(store.getState().error).toBeInstanceOf(ShareEndedError);
+    expect(store.getState().error).toMatchObject({ kind: 'unreachable' });
+    expect(hub.requests('share.stop')).toEqual([]);
+  });
+
+  it('…which a share that is still starting gets too', async () => {
+    const { share } = await start();
+    server.autoOpen = false;
+    server.drop();
+    await tick(CAPTURE_HOLD_MS - 1);
+    expect(share.state).toBe('starting');
+    await tick(1);
+    expect(share.state).toBe('ended');
+  });
+
+  it('without a client state (a bare SignalClientLike) there is no hold: the share counts as connected', async () => {
+    const bare: SignalClientLike = {
+      request: vi.fn(() => Promise.resolve(shareParams('s_9'))),
+      notify: vi.fn(() => true),
+      on: () => () => undefined,
+      probe: vi.fn(),
+    };
+    const share = await sharing.start(
+      fakePick('window', true),
+      { preset: 'auto', withAudio: true },
+      { signal: bare, roomId: 'lounge' },
+    );
+    started.push(share);
+    await tick(CAPTURE_HOLD_MS * 2);
+    expect(share.state).toBe('starting');
   });
 });

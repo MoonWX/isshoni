@@ -95,8 +95,8 @@ export interface ShareResyncContext {
 /**
  * What a local share can add to ActiveShare (05 §8) so that it survives a reconnect: the three transitions that only
  * the session can start, because only it sees every welcome, room.event and room.state. share/'s in-page ActiveShare
- * implements them (serverEnded with the publisher, resync and republish with the web recovery slice). Each is
- * optional; without one the session falls back to ending the share, which is always correct, just less kind.
+ * (BrowserShare) implements all three. Each is optional; without one the session falls back to ending the share,
+ * which is always correct, just less kind.
  */
 export interface ShareRecovery {
   /**
@@ -829,6 +829,9 @@ export class RoomSession {
   async #resyncShare(ctx: ShareResyncContext): Promise<void> {
     const share = this.#share;
     if (share === null || share.state === 'ended') return;
+    // The server lost the share: no snapshot lists its id again, which is no end of the share. Its re-publish gets
+    // a new one, which counts from the first snapshot that lists it.
+    if (!ctx.kept) this.#shareSeenId = null;
     if (typeof share.resync === 'function') {
       try {
         await share.resync(ctx);
@@ -852,6 +855,9 @@ export class RoomSession {
       await this.#stop(share);
       return;
     }
+    // Snapshots without the old id keep coming while the share is published again; they are not "the server ended
+    // it" (05 §13.1's fallback). The new id counts from the first snapshot that lists it.
+    if (this.#shareSeenId === share.shareId) this.#shareSeenId = null;
     try {
       await share.republish();
     } catch (err) {
