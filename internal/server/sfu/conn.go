@@ -29,7 +29,10 @@ type Conn struct {
 	user   UserID
 	role   Role
 	client ClientKind
-	decode DecodeCaps // as joined; README S69 makes it follow SetDecodeCaps
+	// decode is what the viewer can decode: as joined, then as SetDecodeCaps last set it. Only the actor writes it,
+	// with Room.mu held, because the room's codec policy reads every Conn's (Room.wantedPolicyLocked); the actor reads
+	// it without the lock.
+	decode DecodeCaps
 	sig    Signaler
 	log    *slog.Logger
 
@@ -65,6 +68,8 @@ type Conn struct {
 	// writers are the writer goroutines of the Conn's DownTracks. Each ends when its subscription goes
 	// (DownTrack.stop), and at the latest when the Conn closes (stop); teardown waits for all of them.
 	writers sync.WaitGroup
+	// codec is what the Conn knows about its viewer's H.264 decoders beyond its caps (codecstate.go, 02 §8.5).
+	codec decoderState
 }
 
 // newConn builds a Conn; SFU.Join registers it and starts its actor.
@@ -245,6 +250,7 @@ func (c *Conn) run() {
 // Commands still queued get sfu.closed from do.
 func (c *Conn) teardown() {
 	c.events.close()
+	c.codec.retry.stop()
 	for id, sub := range c.subs {
 		sub.detach()
 		delete(c.subs, id)
@@ -877,11 +883,12 @@ func (c *Conn) resync() {
 	}
 }
 
-// ---- methods of later slices (README §4 "Interfaces first") ----
-
-// SetDecodeCaps replaces the viewer's decode capabilities (01's caps.update): the room's codec policy follows, and a
-// viewer that gains H.264 gets a new sub PC with video (02 §8.3, §8.5). README S69 implements it; until then it
-// returns an error that wraps ErrNotImplemented and the caps stay as joined.
-func (c *Conn) SetDecodeCaps(ctx context.Context, caps DecodeCaps) error {
-	return c.do(ctx, func(context.Context) error { return errNotImplemented("Conn.SetDecodeCaps", "S69") })
+// hintCodec tells the client that publishes sh which profile the room's codec policy wants now (02 §8.3): a
+// CodecPolicyEvent, which sfuplane sends as quality.hint{codec}. It runs on the publishing Conn's actor, posted by
+// SFU.updateCodecPolicy in the order of the policy's changes. A share that has ended since gets nothing.
+func (c *Conn) hintCodec(sh *Share, profile ProfileKey) {
+	if _, live := sh.liveState(); !live || sh.conn != c {
+		return
+	}
+	c.sig.SendEvent(CodecPolicyEvent{Share: sh.id, Profile: profile})
 }

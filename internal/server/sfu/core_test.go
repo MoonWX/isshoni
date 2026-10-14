@@ -688,8 +688,7 @@ func TestNotImplemented(t *testing.T) {
 	c, _ := join(t, s, "lounge", "alice", "c-a", RoleFull)
 	_, _, probeErr := s.Probe(ctx, "alice", ProbeUDP, "v=0\r\n")
 	for name, err := range map[string]error{
-		"SFU.Probe":          probeErr,
-		"Conn.SetDecodeCaps": c.SetDecodeCaps(ctx, DecodeCaps{H264: []ProfileKey{ProfileHigh}}),
+		"SFU.Probe": probeErr,
 	} {
 		if !errors.Is(err, ErrNotImplemented) {
 			t.Errorf("%s = %v, want an error that wraps ErrNotImplemented", name, err)
@@ -699,11 +698,12 @@ func TestNotImplemented(t *testing.T) {
 			t.Errorf("%s: a missing method is retryable", name)
 		}
 	}
-	// The methods of README S57 exist now: none of them says "not implemented" any more.
+	// The methods of README S57 and S69 exist now: none of them says "not implemented" any more.
 	for name, err := range map[string]error{
-		"Conn.RestartICE": c.RestartICE(ctx, PCSub, 1),
-		"Conn.ResetPC":    c.ResetPC(ctx, PCSub, 1),
-		"Conn.ClosePC":    c.ClosePC(ctx, PCPub, 1),
+		"Conn.RestartICE":    c.RestartICE(ctx, PCSub, 1),
+		"Conn.ResetPC":       c.ResetPC(ctx, PCSub, 1),
+		"Conn.ClosePC":       c.ClosePC(ctx, PCPub, 1),
+		"Conn.SetDecodeCaps": c.SetDecodeCaps(ctx, DecodeCaps{H264: []ProfileKey{ProfileHigh}}),
 	} {
 		if errors.Is(err, ErrNotImplemented) {
 			t.Errorf("%s = %v", name, err)
@@ -1827,10 +1827,14 @@ func TestDownTrackBind(t *testing.T) {
 	if b := d.binding.Load(); b == nil || !b.unsupported || len(b.ptFor) != 0 {
 		t.Errorf("binding without H.264 = %+v, want unsupported", b)
 	}
-	// No codec at all: the only case Bind fails.
+	// No codec at all, which is how Pion binds an m-section the viewer rejected (02 §8.5): a zero codec and no error,
+	// so the rest of the negotiation stands; the binding is unsupported.
 	d = video()
-	if _, err := d.Bind(fakeTrackContext{}); err == nil || d.binding.Load() != nil {
-		t.Errorf("Bind without codecs: %v, binding %v", err, d.binding.Load())
+	if codec, err := d.Bind(fakeTrackContext{}); err != nil || !reflect.DeepEqual(codec, webrtc.RTPCodecParameters{}) {
+		t.Errorf("Bind without codecs = %+v, %v; want a zero codec and no error", codec, err)
+	}
+	if b := d.binding.Load(); b == nil || !b.unsupported || len(b.ptFor) != 0 || b.sendable() {
+		t.Errorf("binding without codecs = %+v, want unsupported", b)
 	}
 
 	// Audio: Opus.

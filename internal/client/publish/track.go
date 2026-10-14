@@ -20,9 +20,9 @@ import (
 type track struct {
 	kind           webrtc.RTPCodecType
 	id, stream     string
-	rid            string // the encoding's rid; "" for audio and for a single layer
-	layer          string // the Source layer; "" for audio
-	profile        string // H.264 profile key (video)
+	rid            string    // the encoding's rid; "" for audio and for a single layer
+	layer          string    // the Source layer; "" for audio
+	table          h264Table // video: the profiles the Publisher can send; set by New before the track is bound
 	clock          uint32
 	tr             *webrtc.RTPTransceiver // set once in addTracks, before any Bind
 	seq            uint16                 // send loop only, like the fields below
@@ -36,12 +36,15 @@ type track struct {
 	padEvery int
 	repair   *repair
 
-	mu      sync.Mutex // guards the fields below
-	b       *binding
-	sent    bool
-	lastTS  uint32
-	lastNTP uint64
-	stats   TrackStats
+	mu sync.Mutex // guards the fields below
+	b  *binding
+	// profile is the H.264 profile key the video goes out in: Options.Profile until Bind chooses, then what the
+	// negotiation chose. next is the one it switches to with its next keyframe (switchTo), "" while it stays.
+	profile, next string
+	sent          bool
+	lastTS        uint32
+	lastNTP       uint64
+	stats         TrackStats
 }
 
 // binding is what Bind learned from the negotiation.
@@ -59,6 +62,9 @@ type binding struct {
 
 func newTrack(kind webrtc.RTPCodecType, id, stream, rid, layer, profile string) *track {
 	t := &track{kind: kind, id: id, stream: stream, rid: rid, layer: layer, profile: profile, clock: videoClock}
+	if profile != "" {
+		t.table = h264Table{profile}
+	}
 	if kind == webrtc.RTPCodecTypeAudio {
 		t.clock = audioClock
 	}
@@ -73,8 +79,9 @@ func (t *track) RID() string               { return t.rid }
 func (t *track) StreamID() string          { return t.stream }
 func (t *track) Kind() webrtc.RTPCodecType { return t.kind }
 
-// Bind implements webrtc.TrackLocal: it picks the negotiated codec that carries what the Source sends (the H.264
-// profile with packetization-mode=1, or Opus) and the mid and rid header extension IDs.
+// Bind implements webrtc.TrackLocal: it picks the first negotiated codec the track can carry (an H.264 profile of
+// the Publisher's with packetization-mode=1, or Opus), which is the answer's first one, as a browser picks it, and
+// the mid and rid header extension IDs.
 func (t *track) Bind(ctx webrtc.TrackLocalContext) (webrtc.RTPCodecParameters, error) {
 	for _, c := range ctx.CodecParameters() {
 		if !t.carries(c) {
@@ -97,10 +104,42 @@ func (t *track) Bind(ctx webrtc.TrackLocalContext) (webrtc.RTPCodecParameters, e
 		t.mu.Lock()
 		t.b = b
 		t.stats.SSRC = b.ssrc
+		if t.kind == webrtc.RTPCodecTypeVideo {
+			t.profile, t.next = profileKey(c.SDPFmtpLine), ""
+		}
 		t.mu.Unlock()
 		return c, nil
 	}
 	return webrtc.RTPCodecParameters{}, webrtc.ErrUnsupportedCodec
+}
+
+// switchTo has the video track go on in another of the Publisher's profiles from its next keyframe (write), and
+// reports whether it will switch: false when it sends that profile already, or isn't bound.
+func (t *track) switchTo(profile string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.b == nil || t.profile == profile {
+		t.next = ""
+		return false
+	}
+	t.next = profile
+	return true
+}
+
+// switchLocked makes the profile that switchTo set the one the track sends: a new binding with that profile's
+// payload type, and its RTX payload type when the track has an RTX stream. Repairs of packets sent before go out
+// with the new payload types too. t.mu is held.
+func (t *track) switchLocked() {
+	pt, rtx, ok := t.table.pts(t.next)
+	if ok && t.b != nil {
+		b := *t.b
+		b.pt = pt
+		if b.rtxSSRC != 0 {
+			b.rtxPT = rtx
+		}
+		t.b, t.profile = &b, t.next
+	}
+	t.next = ""
 }
 
 // Unbind implements webrtc.TrackLocal. Packets are dropped until the next Bind.
@@ -115,7 +154,11 @@ func (t *track) carries(c webrtc.RTPCodecParameters) bool {
 	if t.kind == webrtc.RTPCodecTypeAudio {
 		return strings.EqualFold(c.MimeType, webrtc.MimeTypeOpus)
 	}
-	return strings.EqualFold(c.MimeType, webrtc.MimeTypeH264) && profileKey(c.SDPFmtpLine) == t.profile
+	if !strings.EqualFold(c.MimeType, webrtc.MimeTypeH264) {
+		return false
+	}
+	_, _, ok := t.table.pts(profileKey(c.SDPFmtpLine))
+	return ok
 }
 
 func (t *track) info() TrackInfo {
@@ -133,6 +176,9 @@ func (t *track) info() TrackInfo {
 // its capture. It returns false when the track isn't bound. Only the send loop calls it.
 func (t *track) write(pkt fake.Packet, ticks uint32, ntp uint64) bool {
 	t.mu.Lock()
+	if t.next != "" && pkt.Keyframe {
+		t.switchLocked() // a new profile starts with a keyframe, as an encoder's switch does
+	}
 	b := t.b
 	t.mu.Unlock()
 	if b == nil {

@@ -30,6 +30,9 @@ type SFU struct {
 	timing timings
 	// handshakeTimeouts counts the new PeerConnections that weren't connected in time, by PCKind (Metrics).
 	handshakeTimeouts [PCSub + 1]atomic.Uint64
+	// clockSkew is added to monoNow for the codec policy's clock (codecNow): 0 but in tests, which move that clock on
+	// to see the policy's 60 s hysteresis pass (02 §17: policy_test and integration 12 use a fake clock).
+	clockSkew atomic.Int64
 	// fullMaxBps is the full layer's MaxBitrate under the admin's cap, in bit/s (fullLayerMax of limits): New and
 	// SetLimits set it with limits. The NACK path reads it for the retransmission budget (Share.maxBitrate), once
 	// per NACK, so it is an atomic and not a field under mu.
@@ -175,8 +178,8 @@ func (s *SFU) Close() error {
 
 // runTicker is the SFU's ticker goroutine. Every 250 ms, and at once when a share changes state (kick), it makes the
 // ShareUpdated calls that are due; once a second it turns the layers' counters into rates, sizes their packet
-// caches, and makes the shares stalled whose pub PC has been away for 2 s. Later slices add the rest of 02 §5.4's
-// ticker work (README S69, S84, S88).
+// caches, makes the shares stalled whose pub PC has been away for 2 s, and lets a room's codec policy go back to
+// high once its hold has passed. Later slices add the rest of 02 §5.4's ticker work (README S84, S88).
 func (s *SFU) runTicker() {
 	defer close(s.tickDone)
 	tick := time.NewTicker(tickInterval)
@@ -219,9 +222,10 @@ func (s *SFU) reportShares(now int64) {
 	}
 }
 
-// everySecond is the ticker's once-a-second work on the media path: each layer's rates and cache size (02 §9.1), and
-// the stalled check of 02 §5.3: a live share whose pub PC hasn't been connected for 2 s is stalled. The other ways
-// into stalled don't wait for the ticker (Share.detach, Conn.stallShares).
+// everySecond is the ticker's once-a-second work: each layer's rates and cache size (02 §9.1); the stalled check of
+// 02 §5.3, a live share whose pub PC hasn't been connected for 2 s is stalled (the other ways into stalled don't wait
+// for the ticker: Share.detach, Conn.stallShares); and each room's codec policy, whose way back to high waits for
+// its hold to pass (02 §8.3). Every other policy change happens where the viewer set changes.
 func (s *SFU) everySecond(now int64) {
 	for _, sh := range s.liveShares() {
 		for _, l := range sh.attached() {
@@ -230,6 +234,51 @@ func (s *SFU) everySecond(now int64) {
 		if sh.conn.pubAway(now) >= s.timing.stalled {
 			sh.stall("the pub PC is not connected")
 		}
+	}
+	s.mu.Lock()
+	rooms := make([]*Room, 0, len(s.rooms))
+	for _, r := range s.rooms {
+		rooms = append(rooms, r)
+	}
+	s.mu.Unlock()
+	for _, r := range rooms {
+		s.updateCodecPolicy(r)
+	}
+}
+
+// codecNow is the codec policy's clock: monoNow, moved on in tests (clockSkew).
+func (s *SFU) codecNow() int64 { return monoNow() + s.clockSkew.Load() }
+
+// updateCodecPolicy brings a room's codec policy in line with its viewers (02 §8.3): at once to cb when a viewer
+// needs it, back to high once no viewer has needed it for a minute. Its callers are where the viewer set changes (a
+// Conn joins or leaves, a viewer's decode caps change) and the ticker, once a second, for the way back.
+//
+// A change is reported to the hub (RoomEvents.CodecPolicyChanged) and to the Conn that publishes each of the room's
+// shares, as a CodecPolicyEvent from that Conn's actor: sfuplane makes it a quality.hint{codec}, on which a sharer
+// re-offers with the profile first, and the pub answer then allows only what the policy allows (02 §8.4). Shares
+// started from now on get the new policy in their ShareParams. The room's policyMu keeps the reports of two changes
+// in the order of the changes; it is held across calls that never block.
+func (s *SFU) updateCodecPolicy(r *Room) {
+	r.policyMu.Lock()
+	defer r.policyMu.Unlock()
+	r.mu.Lock()
+	changed := r.policy.next(r.wantedPolicyLocked(), s.codecNow(), codecPolicyHold)
+	profile := r.policy.profile
+	var shares []*Share
+	if changed {
+		for _, sh := range r.shares {
+			shares = append(shares, sh)
+		}
+	}
+	r.mu.Unlock()
+	if !changed {
+		return
+	}
+	s.log.Info("codec policy changed", "room_id", string(r.id), "profile", string(profile), "shares", len(shares))
+	s.events.CodecPolicyChanged(r.id, profile)
+	sortShares(shares)
+	for _, sh := range shares {
+		sh.conn.post(func() { sh.conn.hintCodec(sh, profile) })
 	}
 }
 
@@ -269,7 +318,9 @@ func (s *SFU) Join(p JoinParams) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.log.Info("connection joined", "role", c.role.String(), "client", c.client.String())
+	c.log.Info("connection joined", "role", c.role.String(), "client", c.client.String(),
+		"h264", len(c.decode.H264) > 0)
+	s.updateCodecPolicy(c.room) // a viewer that decodes only Constrained Baseline makes it cb at once
 	return c, nil
 }
 
@@ -343,6 +394,8 @@ func (s *SFU) removeConn(c *Conn, r EndReason) {
 	for _, sh := range shares {
 		s.endShare(sh, r)
 	}
+	// Without this viewer the room may not need cb any more: its hold starts now.
+	s.updateCodecPolicy(room)
 }
 
 // actorDone forgets a Conn whose actor has stopped.
@@ -451,8 +504,9 @@ func (s *SFU) Share(id ShareID) (ShareInfo, bool) {
 	return sh.info()
 }
 
-// CodecPolicy returns a room's codec policy (02 §8.3): ProfileHigh ("high") or ProfileConstrainedBaseline ("cb").
-// It is ProfileHigh, the default, for every room until README S69 adds the policy.
+// CodecPolicy returns a room's codec policy (02 §8.3): ProfileHigh ("high") or ProfileConstrainedBaseline ("cb"). It
+// is high unless a viewer in the room decodes no High profile, and stays cb for a minute after the last such viewer
+// left or gained one. An unknown room is high.
 func (s *SFU) CodecPolicy(room RoomID) ProfileKey {
 	s.mu.Lock()
 	r := s.rooms[room]

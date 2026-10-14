@@ -15,7 +15,12 @@
 //     header-extension interceptor numbers every packet, so the SFU's feedback generator does real work;
 //   - it can offer again on the same PeerConnection (the next neg of its gen), and every offer it hands out lists
 //     its simulcast rids once, as the ones it sends: Pion's own re-offer repeats the rids of the last answer as
-//     receive rids, which the SFU refuses like any rid listed twice (sendOnlySimulcast).
+//     receive rids, which the SFU refuses like any rid listed twice (sendOnlySimulcast);
+//   - it offers every H.264 profile it can send (Options.Profile first, then Options.Profiles) and sends the first
+//     one the answer lists, as a browser does, so the room's codec policy (02 §8.3–8.4) chooses. On a codec hint
+//     the caller does what a browser sharer does (01 §8.10): SetProfile puts the hinted profile first, and the next
+//     offer's answer has the Publisher switch, each layer with its next keyframe, which it asks the Source for. A
+//     ProfileSource re-encodes in the new profile; another Source keeps its SPS and only the payload type changes.
 //
 // There is no rate control in M1: REMB from the SFU is only recorded in Stats.
 //

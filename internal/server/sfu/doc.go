@@ -1,6 +1,6 @@
 // Package sfu is isshoni's selective forwarding unit on Pion (docs/m1/02-sfu.md): rooms, participants and
 // connections, shares with two simulcast layers, keyframe-aligned layer switches, NACK/RTX from a shared packet
-// cache, forwarded sender reports, downlink adaptation and a per-room H.264 profile policy.
+// cache, forwarded sender reports, downlink adaptation, a per-room H.264 profile policy and viewers without H.264.
 //
 // The SFU never imports signal or protocol: 01's sfuplane adapter is the only translator between this package and
 // the wire. Signal calls the methods of *SFU and *Conn (02 §6.1); the SFU answers through each Conn's Signaler and
@@ -45,9 +45,10 @@
 //	                                   writer), PLI and FIR for the track, until its sender stops
 //	                                   (DownTrack.readRTCP); owned by the sub PC
 //	Ticker            1 per SFU        every 250 ms, and at once for a state change: the ShareUpdated calls that are
-//	                                   due; every second: each layer's rates and cache size, and the stalled check
-//	                                   (a live share whose pub PC has been away for 2 s). Started by the first
-//	                                   Join, stopped by Close. README S69, S84 and S88 add to it
+//	                                   due; every second: each layer's rates and cache size, the stalled check
+//	                                   (a live share whose pub PC has been away for 2 s), and each room's codec
+//	                                   policy (its way back to high after the hold). Started by the first Join,
+//	                                   stopped by Close. README S84 and S88 add to it
 //	Probe             1 per probe PC   README S76
 //
 // Rules:
@@ -56,6 +57,9 @@
 //   - Share.notify is outside that order: it only puts a share's RoomEvents calls in order (every ShareUpdated before
 //     the ShareEnded, and nothing after it). The ticker and SFU.endShare hold it across those calls, which never
 //     block, take Share.mu inside it, and hold no other lock when they take it.
+//   - Room.policyMu is outside that order too: it only puts a room's codec policy changes and their reports in
+//     order. SFU.updateCodecPolicy holds it across CodecPolicyChanged and the posts of the CodecPolicyEvents (which
+//     never block), takes Room.mu inside it, and holds no other lock when it takes it.
 //   - A Conn's PCs, subscriptions, negotiation state and candidate buffers belong to its actor and have no lock.
 //   - Which layer a DownTrack forwards is chosen with Share.mu and then DownTrack.mu held (02 §10.1): by the
 //     subscriber's actor when the request changes, and by whoever attaches or detaches a layer of the share, before
@@ -177,7 +181,18 @@
 //     own for each pub PC, whose NACK filter knows the PC's tracks), the remote-candidate filter (02 §7.3, 01 §17),
 //     the selected-pair label and the complete-SDP helper: the SFU never trickles (02 §7.1–7.3, §7.6);
 //   - codec.go, h264.go, sdpcheck.go: profiles, the payload-type table and both MediaEngines (02 §8.1–8.2),
-//     keyframe-start detection and the SPS parser (02 §9.1), pub-offer validation and the answer edits (02 §8.4–8.5).
+//     keyframe-start detection and the SPS parser (02 §9.1), pub-offer validation and the answer edits (02 §8.4–8.5);
+//   - the codecs (02 §8.3–8.5). room.go: the room's codec policy, high while every viewer (a Conn that subscribes,
+//     with H.264 in its caps) can receive High, else cb at once, and back to high only after 60 s without a viewer
+//     that needs cb; each change goes to the hub (CodecPolicyChanged) and, as a CodecPolicyEvent, to the Conn that
+//     publishes each share (SFU.updateCodecPolicy), and new shares get it in their ShareParams. pubpc.go: the codec
+//     filter of the pub answer, which allows only the policy's profiles, in the order of each offer
+//     (Conn.filterCodecs: Pion answers with a transceiver's codec preferences). codecstate.go: SetDecodeCaps and the
+//     viewers without H.264: no video m-sections while the caps list none (decoder_unavailable), a sub PC rebuilt
+//     when they gain some, and the guard for caps that list H.264 while the answers refuse it (DownTrack.Bind binds
+//     the refused video as unsupported, and the SFU rebuilds the sub PC every 20 s, 9 times, then decoder_failed).
+//     A DownTrack whose viewer has no payload type for the stream's profile forwards nothing, and its subscription
+//     says codec_mismatch, until a keyframe in a profile the viewer takes (DownTrack.mismatched).
 //
 // # PeerConnection states, recovery and guards (02 §5.3, §6.5, §12)
 //
@@ -198,6 +213,9 @@
 //   - Resync, after a WebSocket resume, sends again what signal may have dropped: the outstanding sub offer, each
 //     subscription's state, a CodecPolicyEvent per share the Conn publishes. It ICE-restarts a sub PC that isn't
 //     connected and rebuilds one that has closed.
+//   - The SFU's only rebuilds of its own are for a viewer's decoders (codecstate.go, 02 §8.5): when its caps gain
+//     H.264, and the guard's retries. Neither touches a closed sub PC, which waits for the client's request all the
+//     same, so its successor is always counted (below).
 //
 // The guards of 02 §12 that live here:
 //   - One pub and one sub PC per Conn: an offer for a third is sfu.pc_limit; a second of one kind can't be asked
@@ -207,7 +225,7 @@
 //     builds them (ResetPC, RestartICE, Resync or a subscription change). One more is sfu.pc_rate_limited with
 //     RetryAfter: the error of HandleOffer, ResetPC and RestartICE, and an ErrorEvent about the sub PC for Resync
 //     and a subscription change, which have no error to put it in. Nothing builds the refused PC later; the
-//     client asks again. The SFU's own codec rebuilds (README S69) won't count.
+//     client asks again. The SFU's own codec rebuilds don't count.
 //   - 64 remote candidates per PC and gen, trickled or in the PC's remote descriptions. A candidate is what Pion
 //     keeps as one: its transport address, its type and its related address together (candidateKey), since Pion
 //     pairs and checks each of those and has no cap of its own. One that comes again is counted once. The pub PC's
@@ -219,10 +237,7 @@
 // # What later slices add
 //
 // The whole API is declared; a method that a later slice implements returns an error that wraps ErrNotImplemented
-// (SetDecodeCaps, Probe). In README order:
-//   - S69: the room codec policy with its hysteresis (CodecPolicy is ProfileHigh until then), the codec filter of
-//     the pub answer, SetDecodeCaps, viewers without H.264, and the codec_mismatch state of a DownTrack whose
-//     viewer has no payload type for the stream's profile (it forwards nothing until then, silently);
+// (Probe). In README order:
 //   - S76: Probe. S79: the transports, RTTs and counters of Snapshot, ConnStats and Metrics (the Layers and
 //     DownTracks count, the repair counters of 02 §13 included; nothing sums them up yet. A sub PC's round-trip
 //     time is read already, for the NACK handling: subPC.rtt). S84: the downlink allocator (REMB, receiver
@@ -230,5 +245,6 @@
 //     layer pausing, and the last QualityHintEvent per share in Resync.
 //
 // The server's cap on a subscription (02 §10.1: effective = min(requested, cap), with its reason) is in place
-// (Conn.capSubscription); S69 and S84 are its callers.
+// (Conn.capSubscription) for the allocator of S84; the viewer's decoders have a cap of their own
+// (Subscription.codec).
 package sfu

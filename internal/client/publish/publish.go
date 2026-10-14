@@ -32,6 +32,16 @@ type Source interface {
 	RequestKeyframe(layer string)
 }
 
+// ProfileSource is a Source that can encode another H.264 profile (in M2 the native engine re-initializes its
+// encoder). When an answer has the Publisher send another profile (SetProfile, 02 §8.3), it switches the Source with
+// SetProfile, then asks it for a keyframe of every layer, and sends that keyframe on the new profile's payload type.
+// A Source that isn't a ProfileSource (a fake.Source has one profile) keeps its SPS: only the payload type changes,
+// which is what an SFU goes by, but a decoder would see through it.
+type ProfileSource interface {
+	Source
+	SetProfile(profile string) error
+}
+
 // Options configure a Publisher.
 type Options struct {
 	Source Source
@@ -44,10 +54,16 @@ type Options struct {
 	// as a plain track without a rid, like a browser without simulcast: Pion signals rids only for two or more
 	// encodings (02 §8.4: rids ⊆ {f,q}, or none).
 	Layers []string
-	// Profile is the H.264 profile key the video codec is offered with: DefaultProfile ("6400"), "42e0", or another
-	// 4-hex-digit key. It must match the Source's SPS.
+	// Profile is the H.264 profile key the video codec is offered with first: DefaultProfile ("6400"), "42e0", or
+	// another 4-hex-digit key. It must match the Source's SPS.
 	Profile string
-	Audio   bool
+	// Profiles are the other H.264 profiles the Publisher can send, offered after Profile in this order, the way a
+	// browser offers every profile its encoder has: at most 4, each a 4-hex-digit key other than Profile. The
+	// Publisher sends the first of its profiles that an answer lists (as a browser does), so a codec policy that
+	// allows only some of them (02 §8.4) chooses; SetProfile puts one first for the next offer. Profile i (Profile
+	// being 0) has payload type 96 + 2i, and its RTX 97 + 2i.
+	Profiles []string
+	Audio    bool
 	// StreamID is the msid stream id of the tracks (default DefaultStreamID). The SFU maps tracks by mid.
 	StreamID string
 	// RedundantRTX is a test option (02 §17 test 19) that makes the Publisher repair like a browser. It negotiates
@@ -74,8 +90,9 @@ const (
 	// SRInterval is how often each SSRC gets a sender report.
 	SRInterval = time.Second
 
-	videoPT        = 96
-	rtxPT          = 97 // RedundantRTX: the video's RTX payload type
+	videoPT        = 96 // the first profile's (Options.Profile); profile i has videoPT + 2i
+	rtxPT          = 97 // RedundantRTX: the first profile's RTX payload type; profile i has rtxPT + 2i
+	maxProfiles    = 5  // Profile and 4 more: the profiles of the SFU's table (02 §8.1)
 	opusPT         = 111
 	h264FmtpPrefix = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id="
 	opusFmtp       = "minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1"
@@ -113,6 +130,10 @@ type TrackStats struct {
 	// the RTX stream, and Retransmitted the packets sent again for a NACK (both Options.RedundantRTX; without it
 	// Pion's NACK responder answers, and nothing counts here).
 	Padding, Redundant, Retransmitted uint64
+	// Profile is the H.264 profile key the video goes out in now, and PT its payload type (0 before the track is
+	// bound). Audio has neither.
+	Profile string
+	PT      uint8
 }
 
 // Stats are a Publisher's counters.
@@ -139,11 +160,17 @@ type Publisher struct {
 	cap0     int64
 	wall0    time.Time
 
-	mu      sync.Mutex // guards started, closed and cancel
+	// h264 are the H.264 profiles the Publisher can send, Options.Profile first: their payload types (h264Table).
+	h264 h264Table
+
+	mu      sync.Mutex // guards the fields below
 	started bool
 	closed  bool
 	cancel  context.CancelFunc
-	wg      sync.WaitGroup
+	// chosen is the profile the last answer chose (followAnswer), "" once the send loop has switched to it
+	// (applyProfile); encoding is the profile the Source encodes: Options.Profile, then the last one switched to.
+	chosen, encoding string
+	wg               sync.WaitGroup
 }
 
 // New checks o, builds the PeerConnection with its MediaEngine and interceptors, and adds sendonly transceivers: one
@@ -171,8 +198,17 @@ func New(o Options) (*Publisher, error) {
 	if profile == "" {
 		profile = DefaultProfile
 	}
-	if profileKey(h264FmtpPrefix+profile) != profile || len(profile) != 4 {
-		return nil, fmt.Errorf("%w: Profile %q is not 4 lowercase hex digits", ErrInvalidOptions, profile)
+	table := append(h264Table{profile}, o.Profiles...)
+	for i, k := range table {
+		if profileKey(h264FmtpPrefix+k) != k || len(k) != 4 {
+			return nil, fmt.Errorf("%w: profile %q is not 4 lowercase hex digits", ErrInvalidOptions, k)
+		}
+		if slices.Contains(table[:i], k) {
+			return nil, fmt.Errorf("%w: profile %q is repeated", ErrInvalidOptions, k)
+		}
+	}
+	if len(table) > maxProfiles {
+		return nil, fmt.Errorf("%w: %d profiles (at most %d)", ErrInvalidOptions, len(table), maxProfiles)
 	}
 	stream := o.StreamID
 	if stream == "" {
@@ -183,7 +219,7 @@ func New(o Options) (*Publisher, error) {
 		log = slog.Default()
 	}
 
-	api, err := newAPI(o.Settings, profile, o.RedundantRTX)
+	api, err := newAPI(o.Settings, table, o.RedundantRTX)
 	if err != nil {
 		return nil, err
 	}
@@ -194,7 +230,7 @@ func New(o Options) (*Publisher, error) {
 	if err != nil {
 		return nil, fmt.Errorf("publish: new PeerConnection: %w", err)
 	}
-	p := &Publisher{src: o.Source, pc: pc, log: log}
+	p := &Publisher{src: o.Source, pc: pc, log: log, h264: table, encoding: profile}
 	if err := p.addTracks(layers, o.Audio, profile, stream); err != nil {
 		_ = pc.Close()
 		return nil, err
@@ -204,58 +240,84 @@ func New(o Options) (*Publisher, error) {
 			t.repair = newRepair()
 		}
 		if t.kind == webrtc.RTPCodecTypeVideo {
-			t.padEvery = o.Padding
+			t.padEvery, t.table = o.Padding, table
 		}
 	}
 	return p, nil
 }
 
-// newAPI builds a browser-like publishing API: the one H.264 profile the Source sends and Opus, simulcast and
-// transport-wide-cc header extensions, a NACK responder and the TWCC header-extension interceptor. No sender-report
-// interceptor: the Publisher writes its own SRs. With rtx (Options.RedundantRTX) the video has an RTX payload type
-// and there is no NACK responder: the tracks answer NACKs themselves (repair.go), because the RTX stream has one
-// sequence of numbers, which the second copies they send on it must share with the repairs.
-func newAPI(se webrtc.SettingEngine, profile string, rtx bool) (*webrtc.API, error) {
+// h264Table is a Publisher's H.264 profiles, in the order it offers them at first: profile i has payload type
+// videoPT + 2i, and RTX payload type rtxPT + 2i when RTX is negotiated (Options.RedundantRTX).
+type h264Table []string
+
+// pts returns a profile's payload types; ok is false for a profile that isn't in the table.
+func (h h264Table) pts(profile string) (pt, rtx uint8, ok bool) {
+	i := slices.Index(h, profile)
+	if i < 0 {
+		return 0, 0, false
+	}
+	return uint8(videoPT + 2*i), uint8(rtxPT + 2*i), true
+}
+
+// codecs returns the table's codecs with their feedback, the given profile first and the others in table order,
+// each followed by its RTX codec when rtx is set: the order of the codec preferences of SetProfile, and, with the
+// first profile first, the order of registration.
+func (h h264Table) codecs(first string, rtx bool) []webrtc.RTPCodecParameters {
+	order := append([]string{first}, slices.DeleteFunc(slices.Clone(h), func(k string) bool { return k == first })...)
+	var out []webrtc.RTPCodecParameters
+	for _, k := range order {
+		pt, rpt, ok := h.pts(k)
+		if !ok {
+			continue
+		}
+		out = append(out, webrtc.RTPCodecParameters{
+			RTPCodecCapability: webrtc.RTPCodecCapability{
+				MimeType: webrtc.MimeTypeH264, ClockRate: videoClock, SDPFmtpLine: h264FmtpPrefix + k + "1f",
+				RTCPFeedback: slices.Clone(videoFeedback),
+			},
+			PayloadType: webrtc.PayloadType(pt),
+		})
+		if rtx {
+			out = append(out, webrtc.RTPCodecParameters{
+				RTPCodecCapability: webrtc.RTPCodecCapability{
+					MimeType: webrtc.MimeTypeRTX, ClockRate: videoClock, SDPFmtpLine: "apt=" + strconv.Itoa(int(pt)),
+				},
+				PayloadType: webrtc.PayloadType(rpt),
+			})
+		}
+	}
+	return out
+}
+
+// videoFeedback is the RTCP feedback a browser offers for its video codecs.
+var videoFeedback = []webrtc.RTCPFeedback{
+	{Type: webrtc.TypeRTCPFBGoogREMB}, {Type: webrtc.TypeRTCPFBCCM, Parameter: "fir"},
+	{Type: webrtc.TypeRTCPFBNACK}, {Type: webrtc.TypeRTCPFBNACK, Parameter: "pli"},
+	{Type: webrtc.TypeRTCPFBTransportCC},
+}
+
+// newAPI builds a browser-like publishing API: the H.264 profiles the Publisher can send (h264, in that order) and
+// Opus, simulcast and transport-wide-cc header extensions, a NACK responder and the TWCC header-extension
+// interceptor. No sender-report interceptor: the Publisher writes its own SRs. With rtx (Options.RedundantRTX) each
+// profile has an RTX payload type and there is no NACK responder: the tracks answer NACKs themselves (repair.go),
+// because the RTX stream has one sequence of numbers, which the second copies they send on it must share with the
+// repairs.
+func newAPI(se webrtc.SettingEngine, h264 h264Table, rtx bool) (*webrtc.API, error) {
 	m := &webrtc.MediaEngine{}
-	videoFB := []webrtc.RTCPFeedback{
-		{Type: webrtc.TypeRTCPFBGoogREMB}, {Type: webrtc.TypeRTCPFBCCM, Parameter: "fir"},
-		{Type: webrtc.TypeRTCPFBNACK}, {Type: webrtc.TypeRTCPFBNACK, Parameter: "pli"},
-		{Type: webrtc.TypeRTCPFBTransportCC},
-	}
-	audioFB := []webrtc.RTCPFeedback{{Type: webrtc.TypeRTCPFBNACK}, {Type: webrtc.TypeRTCPFBTransportCC}}
-	for _, c := range []struct {
-		params webrtc.RTPCodecParameters
-		kind   webrtc.RTPCodecType
-	}{
-		{webrtc.RTPCodecParameters{
-			RTPCodecCapability: webrtc.RTPCodecCapability{
-				MimeType: webrtc.MimeTypeH264, ClockRate: videoClock, SDPFmtpLine: h264FmtpPrefix + profile + "1f",
-				RTCPFeedback: videoFB,
-			},
-			PayloadType: videoPT,
-		}, webrtc.RTPCodecTypeVideo},
-		{webrtc.RTPCodecParameters{
-			RTPCodecCapability: webrtc.RTPCodecCapability{
-				MimeType: webrtc.MimeTypeOpus, ClockRate: audioClock, Channels: 2, SDPFmtpLine: opusFmtp,
-				RTCPFeedback: audioFB,
-			},
-			PayloadType: opusPT,
-		}, webrtc.RTPCodecTypeAudio},
-	} {
-		if err := m.RegisterCodec(c.params, c.kind); err != nil {
-			return nil, fmt.Errorf("publish: register %s: %w", c.params.MimeType, err)
+	for _, c := range h264.codecs(h264[0], rtx) {
+		if err := m.RegisterCodec(c, webrtc.RTPCodecTypeVideo); err != nil {
+			return nil, fmt.Errorf("publish: register %s %d: %w", c.MimeType, c.PayloadType, err)
 		}
 	}
-	if rtx {
-		err := m.RegisterCodec(webrtc.RTPCodecParameters{
-			RTPCodecCapability: webrtc.RTPCodecCapability{
-				MimeType: webrtc.MimeTypeRTX, ClockRate: videoClock, SDPFmtpLine: "apt=" + strconv.Itoa(videoPT),
-			},
-			PayloadType: rtxPT,
-		}, webrtc.RTPCodecTypeVideo)
-		if err != nil {
-			return nil, fmt.Errorf("publish: register RTX: %w", err)
-		}
+	opus := webrtc.RTPCodecParameters{
+		RTPCodecCapability: webrtc.RTPCodecCapability{
+			MimeType: webrtc.MimeTypeOpus, ClockRate: audioClock, Channels: 2, SDPFmtpLine: opusFmtp,
+			RTCPFeedback: []webrtc.RTCPFeedback{{Type: webrtc.TypeRTCPFBNACK}, {Type: webrtc.TypeRTCPFBTransportCC}},
+		},
+		PayloadType: opusPT,
+	}
+	if err := m.RegisterCodec(opus, webrtc.RTPCodecTypeAudio); err != nil {
+		return nil, fmt.Errorf("publish: register %s: %w", opus.MimeType, err)
 	}
 	for _, e := range []struct {
 		uri  string
@@ -418,12 +480,79 @@ func sendOnlySimulcast(offer string) string {
 	return out.String()
 }
 
-// SetAnswer applies the remote answer. Pion binds the tracks here.
+// SetAnswer applies the remote answer. Pion binds the tracks here, the first time. The video goes on in the first
+// H.264 profile of the answer's video m-section that the Publisher can send, as a browser's does: after a re-offer
+// that changed the answer's choice (SetProfile, or a codec policy that allows fewer profiles), each layer switches
+// to that profile's payload type with its next keyframe, which the send loop asks the Source for right away. A
+// ProfileSource is switched to the profile first.
 func (p *Publisher) SetAnswer(answer webrtc.SessionDescription) error {
 	if err := p.pc.SetRemoteDescription(answer); err != nil {
 		return fmt.Errorf("publish: set remote description: %w", err)
 	}
+	p.followAnswer(answer.SDP)
 	return nil
+}
+
+// SetProfile puts an H.264 profile of the Publisher first in its video codec preferences, as a browser sharer does
+// on a quality.hint with a codec (01 §8.10): the next Offer lists it first, and the Publisher sends it once an answer
+// puts it first (SetAnswer). It returns an error that wraps ErrInvalidOptions for a profile the Publisher can't send
+// (Options.Profile and Options.Profiles), and for a Publisher without video.
+func (p *Publisher) SetProfile(profile string) error {
+	if len(p.video) == 0 {
+		return fmt.Errorf("%w: SetProfile without video", ErrInvalidOptions)
+	}
+	if !slices.Contains(p.h264, profile) {
+		return fmt.Errorf("%w: profile %q is not one the Publisher can send", ErrInvalidOptions, profile)
+	}
+	rtx := p.video[0].repair != nil
+	if err := p.video[0].tr.SetCodecPreferences(p.h264.codecs(profile, rtx)); err != nil {
+		return fmt.Errorf("publish: codec preferences: %w", err)
+	}
+	return nil
+}
+
+// followAnswer notes an answer's choice of profile, the first H.264 codec of the video m-section with a profile the
+// Publisher can send, for the send loop to switch to (applyProfile). An answer without one changes nothing.
+func (p *Publisher) followAnswer(answer string) {
+	if len(p.video) == 0 {
+		return
+	}
+	profile := answerProfile(answer, p.video[0].tr.Mid(), p.h264)
+	if profile == "" {
+		return
+	}
+	p.mu.Lock()
+	p.chosen = profile // the send loop switches (applyProfile); before Start, its first round does
+	p.mu.Unlock()
+}
+
+// answerProfile returns the profile of the first H.264 codec with packetization-mode=1 in an answer's m-section mid
+// that h264 has, or "".
+func answerProfile(answer, mid string, h264 h264Table) string {
+	var desc sdp.SessionDescription
+	if mid == "" || desc.UnmarshalString(answer) != nil {
+		return ""
+	}
+	for _, md := range desc.MediaDescriptions {
+		if m, _ := md.Attribute(sdp.AttrKeyMID); m != mid || md.MediaName.Port.Value == 0 {
+			continue
+		}
+		section := sdp.SessionDescription{MediaDescriptions: []*sdp.MediaDescription{md}} // its codecs alone
+		for _, f := range md.MediaName.Formats {
+			pt, err := strconv.ParseUint(f, 10, 8)
+			if err != nil {
+				continue
+			}
+			codec, err := section.GetCodecForPayloadType(uint8(pt))
+			if err != nil || !strings.EqualFold(codec.Name, "h264") {
+				continue
+			}
+			if k := profileKey(codec.Fmtp); slices.Contains(h264, k) {
+				return k
+			}
+		}
+	}
+	return ""
 }
 
 // Tracks describes the sent RTP streams, video encodings first. MIDs are known once Offer has run.
@@ -441,6 +570,12 @@ func (p *Publisher) Stats() Stats {
 	for _, t := range p.tracks() {
 		t.mu.Lock()
 		ts := t.stats
+		if t.kind == webrtc.RTPCodecTypeVideo {
+			ts.Profile = t.profile
+			if t.b != nil {
+				ts.PT = t.b.pt
+			}
+		}
 		t.mu.Unlock()
 		ts.TrackInfo = t.info()
 		s.Tracks = append(s.Tracks, ts)
@@ -521,6 +656,7 @@ func (p *Publisher) sendLoop(ctx context.Context) {
 		return
 	}
 	for {
+		p.applyProfile()
 		pkt, err := p.src.Next(ctx)
 		if err != nil {
 			if ctx.Err() == nil {
@@ -529,6 +665,37 @@ func (p *Publisher) sendLoop(ctx context.Context) {
 			return
 		}
 		p.send(pkt)
+	}
+}
+
+// applyProfile switches the video to the profile the last answer chose, if it hasn't yet (followAnswer). The send
+// loop does it between two packets, so that no packet the Source made before the switch goes out after it: a
+// ProfileSource is switched first, then each layer is set to go on in the new profile's payload type from its next
+// keyframe, which the Source is asked for.
+func (p *Publisher) applyProfile() {
+	p.mu.Lock()
+	profile, encoding := p.chosen, p.encoding
+	p.chosen = ""
+	if profile != "" {
+		p.encoding = profile
+	}
+	p.mu.Unlock()
+	if profile == "" {
+		return
+	}
+	if ps, ok := p.src.(ProfileSource); ok && profile != encoding {
+		if err := ps.SetProfile(profile); err != nil {
+			p.log.Warn("publish: the source did not switch profiles", "profile", profile, "err", err)
+		}
+	}
+	switched := false
+	for _, t := range p.video {
+		switched = t.switchTo(profile) || switched
+	}
+	if switched {
+		for _, t := range p.video {
+			p.src.RequestKeyframe(t.layer)
+		}
 	}
 }
 
