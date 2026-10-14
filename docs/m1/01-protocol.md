@@ -1044,7 +1044,10 @@ type ShareStop struct {
 `share.update`:
 - It changes the label or preset of a share of the same user (`share_not_found`, `forbidden` if another user's).
 - The reply carries the new `ShareParams`. The client applies `encodings` with `setParameters`, matched by `rid`.
-  If `audioBitrate` changed, it re-offers the pub PC so the answer carries the new Opus `maxaveragebitrate`.
+  If `audioBitrate` changed, it re-offers the pub PC so the answer carries the new Opus `maxaveragebitrate`. Since
+  README S88 the reply's `encodings` are the share's as they stand: under the admin's cap as it is now and with the
+  layers that layer pausing turned off inactive (02 §6.1, §11), so a client that applies them pauses or resumes
+  nothing behind the server's back.
 - **From another connection of the user** (as README S40 built it). Only the publishing connection's actor may call
   that connection's `MediaPeer` (§15.2), so the hub hands the update to it and replies when it has answered:
   - The requesting connection is not held up meanwhile. It handles its later messages before this reply, and the
@@ -1290,7 +1293,15 @@ type CapsUpdate struct {
   - A `codec` equal to the one the client last applied needs no re-offer, because hints are re-sent after every
     resume.
 - After a resume (`Resync()`), the server re-sends per share the codec hint and the last encodings hint, if one was
-  sent.
+  sent. The encodings hint is rebuilt as it would be now (README S88, 02 §6.2): the current cap, the current pause
+  state and the encodings of the share's current preset, with the reason of the last hint, so a preset changed
+  after that hint is not undone.
+- **The hints M1 sends with `encodings`** (README S88, 02 §11): `admin` when the admin's cap (`maxShareBitrateKbps`)
+  changes, and `viewers` when layer pausing turns `f` off (nobody has asked for `high` for 10 s) or on again (a request
+  for `high`); one hint that carries both changes has the reason `viewers`. Each carries the complete list under the cap
+  with the paused layers inactive, and `maxBitrate`, the cap in bit/s (left out for none). The web sharer applies the
+  encodings and nothing else of it; the cap also reaches the browser as REMB on the pub PC. `congestion` and `preset`
+  are not sent in M1.
 - `caps.update`: the client sends it when its capabilities change (web: poll the capabilities every 5 s while any
   subscription has `reason: codec`). The server updates the room's codec safe set (02) and retries codec-blocked
   subscriptions (§11.7). At most 12 per minute. It is the client's only part in codec recovery: all rebuild retries
@@ -1842,7 +1853,8 @@ Limits:
 
 **Resumed** (`resumed: true`):
 1. Server: `room.state` (if in a room), then `MediaPeer.Resync()`. That re-sends the pending sub offer (same `neg`),
-   re-emits `subscribe.status` and `quality.hint`, and ICE-restarts non-connected sub PCs.
+   re-emits `subscribe.status` and `quality.hint` (the codec hint, and the last encodings hint rebuilt from the
+   current state, §8.10), and ICE-restarts non-connected sub PCs.
 2. Client:
    - if `welcome.roomId` is absent or differs from the room it wants, sends `room.join` for that room;
    - re-sends its pending pub offer if it had one (same `neg`);
