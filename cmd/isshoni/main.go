@@ -16,6 +16,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 
 	"github.com/MoonWX/isshoni/internal/server/config"
@@ -50,8 +51,8 @@ func processInvocation() *invocation {
 // through it too, with an invocation of their own.
 func runMain(inv *invocation) int {
 	// SIGINT cancels ctx. Once it has, the default handling is back, so a second Ctrl-C ends the process at once.
-	// serve adds its own handling of SIGTERM and of the second signal (04 §6.4), and of SIGHUP, which it only
-	// answers with a log line until the reload of 04 §6.5 exists (README S90).
+	// serve adds its own handling of SIGTERM and of the second signal (04 §6.4), and of SIGHUP, the reload of
+	// 04 §6.5.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	context.AfterFunc(ctx, stop)
 	code := run(ctx, inv, os.Args[1:])
@@ -98,6 +99,9 @@ type invocation struct {
 	// data_dir and the socket path).
 	cfg    *config.Config
 	cfgErr *config.ValidationError
+	// configArgs are the command's own arguments that the config was loaded from (its flags, after the command's
+	// name): serve loads the config again from them, with environ, when SIGHUP asks for a reload (04 §6.5).
+	configArgs []string
 }
 
 // runFunc runs a leaf command with its positional arguments, after its flags are parsed.
@@ -255,7 +259,7 @@ func (c *command) parse(inv *invocation, fs *flag.FlagSet, args []string) error 
 	if err != nil && !errors.As(err, &ve) {
 		return err
 	}
-	inv.cfg, inv.cfgErr = cfg, ve
+	inv.cfg, inv.cfgErr, inv.configArgs = cfg, ve, slices.Clone(args)
 	return nil
 }
 

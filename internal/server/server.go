@@ -184,10 +184,16 @@ const (
 // Server is one run of the isshoni server: New, then Run (or Start and later Shutdown). A Server is not reused
 // after its shutdown; a restart builds a new one (04 §6.5).
 type Server struct {
-	cfg      config.Config // New's copy; Start replaces a port 0 in listen.http by the bound port
+	cfg config.Config // New's copy; Start replaces a port 0 in listen.http by the bound port
+	// loaded is New's copy as it came, which a reload compares with the config loaded again: the keys that differ
+	// take a restart (Reload).
+	loaded   config.Config
 	warnings []config.Problem
 	log      *slog.Logger
 	deps     Deps
+	// reloads makes the reloads one at a time (Reload). It is not life: a reload reads the certificate files
+	// without life held, so that a shutdown never waits for that read.
+	reloads sync.Mutex
 
 	// life guards the lifecycle state and what Start fills in for the accessors. Start holds it for the whole
 	// startup, so a Shutdown that arrives meanwhile waits for the startup to finish.
@@ -290,7 +296,8 @@ type Server struct {
 }
 
 // New checks cfg and builds the server. It opens nothing and starts nothing; Run or Start does. cfg is copied: later
-// changes to it don't reach the server. A nil log means slog.Default().
+// changes to it don't reach the server. A nil log means slog.Default(). The server logs through log with a safety
+// net of its own on top: an ICE password in the text of a library's message is redacted (logsafety.go).
 //
 // Its error is a *config.ValidationError when cfg has errors (Load's, or those of values changed since); it
 // satisfies NeedsOperator.
@@ -301,12 +308,14 @@ func New(cfg *config.Config, log *slog.Logger, deps Deps) (*Server, error) {
 	if log == nil {
 		log = slog.Default()
 	}
+	log = newSafeLogger(log) // what a library's message can carry (logsafety.go)
 	problems, warnings := configProblems(cfg)
 	if len(problems) > len(warnings) {
 		return nil, &config.ValidationError{Problems: problems}
 	}
 	return &Server{
 		cfg:          *cfg,
+		loaded:       *cfg,
 		warnings:     warnings,
 		log:          log,
 		deps:         deps,
@@ -532,10 +541,11 @@ func (s *Server) Start(ctx context.Context) (err error) {
 	// multiplexer's ICE side has had its reader since step 6: the Transport's ICE-TCP mux (without a Transport that
 	// side is closed).
 	if mode == config.TLSOff {
-		s.serve(s.httpSrv, s.httpLn)
+		// limits.conns_per_ip, except for the trusted proxies: their connections carry every client (limitListener).
+		s.serve(s.httpSrv, newLimitListener(s.httpLn, s.cfg.Limits.ConnsPerIP, s.cfg.Network.TrustedProxies))
 	} else {
 		s.serveTLS(s.httpSrv, s.mux.TLS())
-		s.serve(s.plainSrv, newLimitListener(s.httpLn, s.cfg.Limits.ConnsPerIP))
+		s.serve(s.plainSrv, newLimitListener(s.httpLn, s.cfg.Limits.ConnsPerIP, nil))
 	}
 	if metrics, ln := s.metrics, s.metricsLn; ln != nil {
 		s.serving.Go(func() {

@@ -116,7 +116,7 @@ func (s *Server) routerOptions() httpapi.RouterOptions {
 		Gate:           s.gate,
 		API:            s.deps.API,
 		WS:             s.deps.WS,
-		Logger:         s.log,
+		Logger:         slog.New(&expected503s{Handler: s.log.Handler(), gate: s.gate}),
 	}
 	// isshoni_http_responses_total{route,class} (04 §9.2, §11.2). A server that has not built its metrics yet (a
 	// test of the options alone) leaves the observer out, not a nil pointer in the interface.
@@ -132,6 +132,68 @@ func (s *Server) routerOptions() httpapi.RouterOptions {
 		opts.WS = s.hub
 	}
 	return opts
+}
+
+// requestFailed is the message of the line that httpapi's transfer step logs for a 5xx whose cause no handler logged
+// (04 §9.3); route and status are its attributes.
+const requestFailed = "http request failed"
+
+// expected503s is the router's log handler (README S90): the server's own, except that it moves to debug the
+// warnings about the 503s that the server gives on purpose and that a client asks for again and again:
+//   - /readyz and /healthz while the server is not ready or shutting down: a monitor or a load balancer polls them,
+//     and the reason is logged once by whoever owns it (the TLS manager, the public-address detection, the
+//     shutdown); a warning per poll would bury it;
+//   - every 503 server_shutdown of the shutdown gate (04 §6.4 step 2): browsers that retry while the server stops.
+//
+// Every other 5xx keeps its warning (server_busy, push_unavailable, an error of a handler). The rule rests on
+// httpapi's line as it is, which TestExpected503sAreQuiet pins.
+type expected503s struct {
+	slog.Handler
+	gate *httpapi.Gate // nil: no shutdown gate (a router built for a test of its options)
+}
+
+func (h *expected503s) Handle(ctx context.Context, r slog.Record) error {
+	if r.Level != slog.LevelWarn || r.Message != requestFailed || !h.expected(r) {
+		return h.Handler.Handle(ctx, r)
+	}
+	if !h.Enabled(ctx, slog.LevelDebug) {
+		return nil
+	}
+	quiet := slog.NewRecord(r.Time, slog.LevelDebug, r.Message, r.PC)
+	r.Attrs(func(a slog.Attr) bool {
+		quiet.AddAttrs(a)
+		return true
+	})
+	return h.Handler.Handle(ctx, quiet)
+}
+
+// expected reports whether the line is about a 503 that the server gives on purpose (see expected503s).
+func (h *expected503s) expected(r slog.Record) bool {
+	var status int64
+	var route string
+	r.Attrs(func(a slog.Attr) bool {
+		switch a.Key {
+		case "status":
+			if a.Value.Kind() == slog.KindInt64 {
+				status = a.Value.Int64()
+			}
+		case "route":
+			route = a.Value.String()
+		}
+		return true
+	})
+	if status != http.StatusServiceUnavailable {
+		return false
+	}
+	return route == "GET /healthz" || route == "GET /readyz" || (h.gate != nil && h.gate.ShuttingDown())
+}
+
+func (h *expected503s) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &expected503s{Handler: h.Handler.WithAttrs(attrs), gate: h.gate}
+}
+
+func (h *expected503s) WithGroup(name string) slog.Handler {
+	return &expected503s{Handler: h.Handler.WithGroup(name), gate: h.gate}
 }
 
 // newRouter builds the main router and adds this package's routes to it.

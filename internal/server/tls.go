@@ -126,23 +126,30 @@ func newPlainServer(h http.Handler, log *slog.Logger, pending *pendingConns) *ht
 	}
 }
 
-// limitListener caps the open connections of one client on the port 80 listener: limits.conns_per_ip, keyed like
-// every per-IP count by netx.IPKey (an IPv4 address, an IPv6 /64). The 443 multiplexer has the same limit of its
-// own (04 §7.2, §7.8). A connection over the limit is closed at once.
+// limitListener caps the open connections of one client on listen.http: limits.conns_per_ip, keyed like every
+// per-IP count by netx.IPKey (an IPv4 address, an IPv6 /64). The 443 multiplexer has the same limit of its own
+// (04 §7.2, §7.8). A connection over the limit is closed at once.
+//
+// It serves the port 80 listener of the TLS modes, and the app's own listener in off mode (README S90), where the
+// connections of a trusted proxy (network.trusted_proxies) are not counted: such a peer carries every client of
+// the site, and one per-IP limit on it would be a limit on the whole site. Everyone else who reaches that port
+// directly is counted like on port 80.
 type limitListener struct {
 	net.Listener
-	max int
+	max    int
+	exempt []netip.Prefix // peers that are not counted: off mode's trusted proxies
 
 	mu   sync.Mutex
 	open map[netip.Prefix]int
 }
 
-// newLimitListener wraps ln. A limit of zero or less means none.
-func newLimitListener(ln net.Listener, perIP int) net.Listener {
+// newLimitListener wraps ln. A limit of zero or less means none. Connections from an address inside exempt are
+// not counted.
+func newLimitListener(ln net.Listener, perIP int, exempt []netip.Prefix) net.Listener {
 	if perIP <= 0 {
 		return ln
 	}
-	return &limitListener{Listener: ln, max: perIP, open: map[netip.Prefix]int{}}
+	return &limitListener{Listener: ln, max: perIP, exempt: exempt, open: map[netip.Prefix]int{}}
 }
 
 func (l *limitListener) Accept() (net.Conn, error) {
@@ -155,7 +162,11 @@ func (l *limitListener) Accept() (net.Conn, error) {
 		if !ok {
 			return c, nil // not counted: there is no address to count by
 		}
-		key := netx.IPKey(tcp.AddrPort().Addr())
+		addr := tcp.AddrPort().Addr().Unmap()
+		if l.exempted(addr) {
+			return c, nil
+		}
+		key := netx.IPKey(addr)
 		l.mu.Lock()
 		over := l.open[key] >= l.max
 		if !over {
@@ -168,6 +179,16 @@ func (l *limitListener) Accept() (net.Conn, error) {
 		}
 		return &limitedConn{Conn: c, release: sync.OnceFunc(func() { l.release(key) })}, nil
 	}
+}
+
+// exempted reports whether a peer is not counted.
+func (l *limitListener) exempted(addr netip.Addr) bool {
+	for _, p := range l.exempt {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 func (l *limitListener) release(key netip.Prefix) {
@@ -188,4 +209,12 @@ func (c *limitedConn) Close() error {
 	err := c.Conn.Close()
 	c.release()
 	return err
+}
+
+// CloseWrite passes a half close on, as countingConn does: net/http asks for one when it is done writing.
+func (c *limitedConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
 }
