@@ -1730,6 +1730,7 @@ Guards limit abuse, not people. Every number here is a constant in `config.go`, 
 | Shares | 4 per participant (defense in depth; the hub enforces 4 per user and the room soft limit, 01) | `sfu.too_many_shares` |
 | Publish offer | ≤64 KiB, ≤8 m-lines, ≤2 rids from {f,q}, no data channel | §6.3 codes |
 | Remote candidates | 64 per PC and gen in total, trickled or in the PC's remote descriptions, buffered or applied; a candidate is what Pion keeps as one, and one that comes again counts once (§7.3); the first 64 are kept | later ones dropped, logged at debug |
+| Peer-reflexive sources (04's netx, 04 §7.8) | 64 distinct remote transport addresses per local ICE ufrag, from which STUN with that ufrag reaches Pion: UDP and ICE-TCP, every UDP socket and both TCP ports counted together, probe PCs included; an address counted once costs nothing again; the count starts over with a new ufrag (ICE restart) and ends when Pion removes the ufrag from the muxes (close, failed) | STUN from a further address is dropped before Pion: no Binding response, no prflx candidate, no address-map entry; an ICE-TCP connection is closed at its first frame; logged at debug once per ufrag |
 | Subscriptions | 256 per Conn; 64 items per `UpdateSubscriptions` | `sfu.too_many_subscriptions` |
 | Actor command queue | 64; 5 s wait | `sfu.busy` |
 | Share without media | none here: the hub ends shares `starting` or `stalled` for 30 s (`media_timeout`, 01 §4.4) | – |

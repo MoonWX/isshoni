@@ -79,6 +79,7 @@ type Transport struct {
 
 	tcpLn     *iceListener // the 7882/tcp listener; nil if listen.ice_tcp is ""
 	ln443     *iceListener // PortMux's ICE sub-listener, wrapped so Close closes its connections; nil in off mode
+	guard     *sourceGuard // the ICE source guard of every mux (srcguard.go)
 	closers   []io.Closer  // what Close closes, in order
 	closeOnce sync.Once
 	closeErr  error
@@ -97,6 +98,11 @@ const (
 // with its per-IP limit and byte counter; and the 443 ICE sub-listener of PortMux. Both TCP listeners get an
 // ice.TCPMuxDefault, combined in an ice.MultiTCPMuxDefault, so every kept address gets a passive TCP candidate on
 // 443 and on 7882. Which addresses are kept and how they are rewritten is the plan of 04 §7.5 (planAddrs).
+//
+// Every mux shares one ICE source guard (04 §7.8, srcguard.go): a local ufrag accepts STUN from at most 64 distinct
+// remote addresses, across UDP and ICE-TCP and every socket and port, so a client can't grow Pion's peer-reflexive
+// candidates without bound. The excess is dropped at the UDP sockets and at the first frame of an ICE-TCP
+// connection, before Pion sees it.
 //
 // Advertised lists what pion really gathers. The one kept address without a TCP candidate is the IPv6 loopback
 // ::1 (development: include_loopback with network.ipv6): pion gathers UDP on it but never ICE-TCP (pionSkipsV6),
@@ -134,6 +140,7 @@ func NewTransport(ctx context.Context, opts TransportOptions) (_ *Transport, err
 		RewriteRules:    plan.rules,
 		InterfaceFilter: ifFilter,
 		IncludeLoopback: opts.IncludeLoopback,
+		guard:           newSourceGuard(maxSourcesPerUfrag, log),
 	}
 	defer func() {
 		if err != nil {
@@ -250,8 +257,10 @@ func (t *Transport) buildUDP(ctx context.Context, opts TransportOptions, plan ad
 		}
 		ap := ua.AddrPort()
 		local = append(local, netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()))
-		mux := ice.NewUDPMuxDefault(ice.UDPMuxParams{Logger: pionLog, UDPConn: newCountingPacketConn(c, opts.Counter)})
-		muxes = append(muxes, mux)
+		mux := ice.NewUDPMuxDefault(ice.UDPMuxParams{
+			Logger: pionLog, UDPConn: newCountingPacketConn(c, opts.Counter, t.guard),
+		})
+		muxes = append(muxes, &guardedUDPMux{UDPMuxDefault: mux, guard: t.guard})
 		t.closers = append(t.closers, mux) // closes the socket too
 	}
 	t.UDPMux = ice.NewMultiUDPMuxDefault(muxes...)
@@ -349,14 +358,14 @@ func (t *Transport) buildTCP(ctx context.Context, opts TransportOptions, plan ad
 		} else if !slices.Contains(hosts, a) {
 			hosts = append(hosts, a)
 		}
-		mux := ice.NewTCPMuxDefault(ice.TCPMuxParams{
+		mux := &guardedTCPMux{guard: t.guard, TCPMuxDefault: ice.NewTCPMuxDefault(ice.TCPMuxParams{
 			Listener:                     ln,
 			Logger:                       pionLog,
 			ReadBufferSize:               tcpReadBufferPackets,
 			WriteBufferSize:              tcpWriteBufferBytes,
 			FirstStunBindTimeout:         tcpFirstStunBindTimeout,
 			AliveDurationForConnFromStun: tcpAliveFromStun,
-		})
+		})}
 		t.closers = append(t.closers, mux) // closes the listener too
 		muxes = append(muxes, mux)
 		ports = append(ports, tcpPort{port: ap.Port(), via: via})
@@ -371,7 +380,7 @@ func (t *Transport) buildTCP(ctx context.Context, opts TransportOptions, plan ad
 	if opts.PortMux != nil {
 		// PortMux already limits and counts these connections. The wrapper makes Close close the ones pion still
 		// holds (see iceListener), whatever PortMux's own Close does, so a silent client can't hold shutdown.
-		t.ln443 = newICEListener(opts.PortMux.ICE(), nil, nil, log)
+		t.ln443 = newICEListener(opts.PortMux.ICE(), nil, nil, t.guard, log)
 		if err := addListener(t.ln443, ViaTCP443); err != nil {
 			return nil, nil, err
 		}
@@ -385,7 +394,7 @@ func (t *Transport) buildTCP(ctx context.Context, opts TransportOptions, plan ad
 		if err != nil {
 			return nil, nil, &ListenError{Proto: "tcp", Addr: opts.TCPAddr, Err: err}
 		}
-		t.tcpLn = newICEListener(raw, limiter, opts.Counter, log)
+		t.tcpLn = newICEListener(raw, limiter, opts.Counter, t.guard, log)
 		t.closers = append(t.closers, t.tcpLn) // for a failure before the mux owns it; Close is idempotent
 		if err := addListener(t.tcpLn, ViaTCP7882); err != nil {
 			return nil, nil, err
