@@ -1,0 +1,117 @@
+{
+  "users": {
+    "active": 3,
+    "pending": 2,
+    "disabled": 1,
+    "admins": 2
+  },
+  "invites": {
+    "active": 2
+  },
+  "sessions": {
+    "active": 4
+  },
+  "devices": {
+    "linked": 1
+  },
+  "registrationMode": "approval",
+  "securityEvents": [
+    {
+      "id": 17,
+      "action": "settings.changed",
+      "outcome": "ok",
+      "actor": {
+        "kind": "user",
+        "id": "<Alex>",
+        "name": "Alex"
+      },
+      "target": {
+        "kind": "settings"
+      },
+      "ip": "203.0.113.7",
+      "detail": {
+        "changes": {
+          "registrationMode": {
+            "from": "invite",
+            "to": "approval"
+          }
+        }
+      },
+      "at": "2026-10-09T12:05:00.000Z"
+    },
+    {
+      "id": 16,
+      "action": "auth.throttled",
+      "outcome": "denied",
+      "actor": {
+        "kind": "anonymous"
+      },
+      "ip": "192.0.2.8",
+      "detail": {
+        "key": "192.0.2.8",
+        "scope": "ip"
+      },
+      "at": "2026-10-09T12:04:00.000Z"
+    },
+    {
+      "id": 15,
+      "action": "user.disabled",
+      "outcome": "ok",
+      "actor": {
+        "kind": "user",
+        "id": "<Alex>",
+        "name": "Alex"
+      },
+      "target": {
+        "kind": "user",
+        "id": "<Dee>",
+        "name": "Dee"
+      },
+      "ip": "203.0.113.7",
+      "detail": {},
+      "at": "2026-10-09T12:03:00.000Z"
+    },
+    {
+      "id": 14,
+      "action": "user.role_changed",
+      "outcome": "ok",
+      "actor": {
+        "kind": "user",
+        "id": "<Alex>",
+        "name": "Alex"
+      },
+      "target": {
+        "kind": "user",
+        "id": "<Dee>",
+        "name": "Dee"
+      },
+      "ip": "203.0.113.7",
+      "detail": {
+        "from": "user",
+        "to": "admin"
+      },
+      "at": "2026-10-09T12:02:00.000Z"
+    },
+    {
+      "id": 13,
+      "action": "user.role_changed",
+      "outcome": "ok",
+      "actor": {
+        "kind": "user",
+        "id": "<Alex>",
+        "name": "Alex"
+      },
+      "target": {
+        "kind": "user",
+        "id": "<Pat>",
+        "name": "Pat"
+      },
+      "ip": "203.0.113.7",
+      "detail": {
+        "from": "user",
+        "to": "admin"
+      },
+      "at": "2026-10-09T12:01:00.000Z"
+    }
+  ]
+}

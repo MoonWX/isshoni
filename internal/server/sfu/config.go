@@ -59,7 +59,7 @@ const (
 	commandQueueLen         = 64  // signal calls waiting for a Conn's actor
 	// maxPCCreations is how many PeerConnections of one kind a client may make a Conn create within pcRateWindow:
 	// pub offers of a new gen, and every sub PC after the Conn's first that isn't a codec rebuild of the SFU's own
-	// (README S69): ResetPC, and the successor of a closed sub PC, whichever request builds it. One more is
+	// (codecstate.go): ResetPC, and the successor of a closed sub PC, whichever request builds it. One more is
 	// sfu.pc_rate_limited. The hub's own limits come first (01 §13: 6 new pub gens and 12 pc.restart a minute).
 	maxPCCreations = 10
 )
@@ -94,15 +94,29 @@ const (
 	stalledAfter = 2 * time.Second
 )
 
+// Codecs (02 §8.3, §8.5).
+const (
+	// codecPolicyHold is how long a room whose codec policy is cb must go without a viewer that decodes only
+	// Constrained Baseline before the policy is high again: a Firefox user who reconnects doesn't flip every sharer
+	// twice. The way down, high → cb, is at once: the viewer who needs it would see nothing meanwhile.
+	codecPolicyHold = time.Minute
+	// codecRetryInterval and codecRetries are the server's guard for a viewer whose answer refuses H.264 although its
+	// caps list some (02 §8.5): the SFU rebuilds its sub PC every codecRetryInterval, at most codecRetries times
+	// (3 min, 05's "Reload the page" hint), and then reports decoder_failed until the next SetDecodeCaps. These
+	// rebuilds are the SFU's own: the limit on PC creations doesn't count them (02 §12).
+	codecRetryInterval = 20 * time.Second
+	codecRetries       = 9
+)
+
 // timings are the durations above as one SFU uses them.
 type timings struct {
-	handshake, grace, offerResend, iceRestart, pcWindow, stalled time.Duration
+	handshake, grace, offerResend, iceRestart, pcWindow, stalled, codecRetry time.Duration
 }
 
 func defaultTimings() timings {
 	return timings{
 		handshake: handshakeTimeout, grace: pcGrace, offerResend: offerResendInterval, iceRestart: iceRestartSpacing,
-		pcWindow: pcRateWindow, stalled: stalledAfter,
+		pcWindow: pcRateWindow, stalled: stalledAfter, codecRetry: codecRetryInterval,
 	}
 }
 

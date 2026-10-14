@@ -33,6 +33,11 @@ type pubPC struct {
 	// bound maps the mids of the latest offer's sending m-sections that carry a share to that share and kind. A
 	// track on any other mid feeds nothing.
 	bound map[string]TrackBinding
+	// offered holds, by mid, the video codecs Pion matched in the offer that made the m-section's transceiver: what
+	// Pion would answer with, and what the codec filter of every later answer chooses from (filterCodecs). Pion reads
+	// a transceiver's codecs from the remote description only when it makes the transceiver, and keeps the codec
+	// preferences the filter sets from then on, so the first list has to be kept here.
+	offered map[string][]webrtc.RTPCodecParameters
 	// tracks are the incoming tracks that are still being read: one whose read failed (the PC closed, or Pion stopped
 	// its receiver because an offer made its m-section inactive) has left the table (pubTrackEnded).
 	tracks map[trackKey]*pubTrack
@@ -184,8 +189,9 @@ func (c *Conn) handleOffer(ctx context.Context, kind PCKind, gen, neg uint32, ra
 	c.rebindTracks(p)
 	c.commitCandidates(PCPub, budget, p.pc)
 
-	// Step 3, the codec filter by room policy (SetCodecPreferences on each video transceiver), is README S69's: until
-	// then the policy is always high, which allows all five profiles.
+	// Step 3: the codec filter. Each video m-section that carries a share is answered with the profiles the room's
+	// codec policy allows, so the sharer has to encode one of them (02 §8.4).
+	c.filterCodecs(p, offer)
 
 	// Step 4: the answer, with every candidate in it. A failure here leaves the offer without an answer; the error is
 	// the retryable sfu.internal, and the retry of a stuck PC gets sfu.bad_sdp, so the client rebuilds.
@@ -239,6 +245,55 @@ func (p *pubPC) offerFailed() {
 	}
 }
 
+// filterCodecs is step 3 of 02 §8.4, between SetRemoteDescription and CreateAnswer: on the transceiver of each video
+// m-section that carries a share, SetCodecPreferences keeps the H.264 profiles that the room's codec policy allows
+// (high: all five; cb: Constrained Baseline and Baseline) with their RTX, in the order of this offer. So the answer
+// puts first what the sharer put first: a sharer that got a codec hint re-offers with the hinted profile first and
+// then encodes it (01 §8.10).
+//
+// Pion answers with a transceiver's codec preferences (RTPTransceiver.getCodecs), which it takes from the remote
+// description only when it makes the transceiver and keeps from then on, so the filter's choice holds for later
+// answers too and every offer sets it anew. What it chooses from is the list of the offer that made the
+// transceiver (pubPC.offered), in the current offer's order; a codec this offer doesn't list is left out.
+//
+// An offer that has no profile the policy allows (a native sharer that can encode only High, say) is answered with
+// every profile it offers, as it would be without a policy: a viewer that can't decode the stream then hears
+// codec_mismatch, which is better than a share without video for everybody.
+func (c *Conn) filterCodecs(p *pubPC, offer *pubOffer) {
+	transceivers := map[string]*webrtc.RTPTransceiver{}
+	for _, tr := range p.pc.GetTransceivers() {
+		mid := tr.Mid()
+		if mid == "" || tr.Kind() != webrtc.RTPCodecTypeVideo || tr.Receiver() == nil {
+			continue
+		}
+		transceivers[mid] = tr
+		if _, ok := p.offered[mid]; !ok {
+			p.offered[mid] = tr.Receiver().GetParameters().Codecs
+		}
+	}
+	policy := c.room.codecPolicy()
+	for _, sec := range offer.sections {
+		tr := transceivers[sec.mid]
+		if sec.kind != webrtc.RTPCodecTypeVideo || tr == nil {
+			continue
+		}
+		ordered := inOfferOrder(p.offered[sec.mid], offer.desc.MediaDescriptions[sec.index])
+		prefs := filterByPolicy(ordered, policy)
+		if len(prefs) == 0 {
+			c.log.Info("the pub offer has no profile the codec policy allows: answered with every one it has",
+				"share_id", string(sec.share), "policy", string(policy))
+			prefs = filterByPolicy(ordered, ProfileHigh)
+		}
+		if len(prefs) == 0 {
+			continue // Pion matched none of the offer's profiles: its answer finds that out as it would without us
+		}
+		if err := tr.SetCodecPreferences(prefs); err != nil {
+			// Every codec here is one Pion matched against the engine, which is all it checks.
+			c.log.Warn("codec preferences not set on a pub transceiver", "share_id", string(sec.share), "err", err)
+		}
+	}
+}
+
 // ownsShare reports whether id is a share this Conn publishes that hasn't ended (pending, live or stalled): what a
 // pub offer's tracks may bind (02 §5.2).
 func (c *Conn) ownsShare(id ShareID) bool {
@@ -258,7 +313,9 @@ func (c *Conn) newPubPC(gen uint32) (*pubPC, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &pubPC{gen: gen, pc: pc, tracks: map[trackKey]*pubTrack{}, nacks: nacks}
+	p := &pubPC{
+		gen: gen, pc: pc, tracks: map[trackKey]*pubTrack{}, nacks: nacks, offered: map[string][]webrtc.RTPCodecParameters{},
+	}
 	p.rtcpSSRC = rand.Uint32() | 1 //nolint:gosec // not a secret
 	pc.OnTrack(func(track *webrtc.TrackRemote, recv *webrtc.RTPReceiver) {
 		// Pion hands the track over once: if the Conn is closing and drops the post, the PC is closing too.

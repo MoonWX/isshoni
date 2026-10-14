@@ -35,11 +35,10 @@
 //
 // # What exists so far (README slice S50; 01 slice P8, the adapter)
 //
-// All of 01 §15.4. The peer calls every method of *sfu.Conn as the table says, also the one that a later slice of
-// the SFU implements: SetDecodeCaps (README S69). Until then the SFU answers it with an sfu.internal that is not
-// retryable, so a caps.update gets only a log line (02 §6.3); nothing here changes when it lands, as nothing did
-// when RestartICE, ResetPC, ClosePC and Resync did (README S57). The integration tests on the hub, this adapter and
-// the SFU together are internal/server/itest's (README S59, S74).
+// All of 01 §15.4. The peer calls every method of *sfu.Conn as the table says, and since README S69 built
+// SetDecodeCaps the SFU implements every one of them; nothing here changed when it landed, as nothing did when
+// RestartICE, ResetPC, ClosePC and Resync did (README S57). The integration tests on the hub, this adapter and the
+// SFU together are internal/server/itest's (README S59, S74).
 //
 // # Concurrency
 //

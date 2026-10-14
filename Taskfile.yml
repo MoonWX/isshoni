@@ -528,21 +528,353 @@ tasks:
         silent: true
         if: '[ -f deploy/install.sh ]'
 
+  release:goreleaser:
+    desc: Build the pinned goreleaser (.tool-versions, tools/goreleaser/go.mod) into .bin/; the release tasks run it
+    # A module of its own, not tools/go.mod: goreleaser needs a newer go directive than the repository's, and its
+    # dependency graph (cloud SDKs, sigstore, ...) would raise versions that the other tools share. Rebuilt when
+    # tools/goreleaser/go.mod or go.sum changes, like the tools:* tasks.
+    run: once
+    env: {CGO_ENABLED: '0'}
+    sources: [tools/goreleaser/go.mod, tools/goreleaser/go.sum]
+    generates: ['.bin/goreleaser{{exeExt}}']
+    cmds:
+      - go -C tools/goreleaser build -o ../../.bin/ github.com/goreleaser/goreleaser/v2
+
   release:snapshot:
-    desc: Local release dry run - build the web app, then goreleaser --snapshot without signing or SBOMs
+    desc: >-
+      Local release dry run - the web app, then goreleaser --snapshot without signing, SBOMs or publishing, then
+      release:assets and the image's version, then removes the two images (KEEP_IMAGES=true keeps them).
+      `task release:snapshot -- --skip=docker` leaves out the images (they need Docker)
     vars:
       SNAPSHOT_VERSION: '{{.ISSHONI_SNAPSHOT_VERSION | default (print "0.0.0-dev." .COMMIT)}}'
+      KEEP_IMAGES: '{{.KEEP_IMAGES | default "false"}}'
     env:
       ISSHONI_SNAPSHOT_VERSION: '{{.SNAPSHOT_VERSION}}'
     cmds:
       - cmd: "echo 'release:snapshot: skipped, .goreleaser.yaml does not exist yet'"
         silent: true
         if: '[ ! -f .goreleaser.yaml ]'
+      - task: release:goreleaser
+        if: '[ -f .goreleaser.yaml ]'
       - task: build:web
         vars: {VERSION: '{{.SNAPSHOT_VERSION}}'}
         if: '[ -f .goreleaser.yaml ]'
-      - cmd: goreleaser release --snapshot --clean --skip=sign,sbom
+      - cmd: .bin/goreleaser{{exeExt}} check
         if: '[ -f .goreleaser.yaml ]'
+      # A snapshot builds each image for one platform, tags it <version>-<arch>, loads it into the local Docker and
+      # pushes nothing. Both images go again when the task ends, whether it passed or not: every commit has its own
+      # version and would leave two more behind. KEEP_IMAGES=true keeps them (for docker:smoke, say).
+      - defer: |
+          command -v docker >/dev/null 2>&1 || exit 0
+          for image in ghcr.io/moonwx/isshoni:{{.SNAPSHOT_VERSION}}-amd64 ghcr.io/moonwx/isshoni:{{.SNAPSHOT_VERSION}}-arm64; do
+            docker image inspect "$image" >/dev/null 2>&1 || continue
+            if [ '{{.KEEP_IMAGES}}' = true ]; then
+              echo "release:snapshot: KEEP_IMAGES=true: keeping $image"
+            elif docker image rm "$image" >/dev/null; then
+              echo "release:snapshot: removed the snapshot image $image (KEEP_IMAGES=true keeps it)"
+            fi
+          done
+        silent: true
+      # The before hook runs `task release:prepare`: with .bin/ first in PATH, it finds the pinned Task there too.
+      - cmd: PATH="$PWD/.bin:$PATH" .bin/goreleaser{{exeExt}} release --snapshot --clean --skip=sign,sbom {{.CLI_ARGS}}
+        if: '[ -f .goreleaser.yaml ]'
+      - task: release:assets
+        vars: {VERSION: '{{.SNAPSHOT_VERSION}}'}
+        if: '[ -f .goreleaser.yaml ]'
+      # The image for this machine's CPU starts and has the version: the build context goreleaser made held the
+      # binary where deploy/docker/Dockerfile copies it from.
+      - cmd: |
+          image='ghcr.io/moonwx/isshoni:{{.SNAPSHOT_VERSION}}-{{ARCH}}'
+          if ! docker image inspect "$image" >/dev/null 2>&1; then
+            echo "release:snapshot: note: there is no image $image (--skip=docker, or no Docker here), so no image was checked"
+            exit 0
+          fi
+          got=$(docker run --rm --name "isshoni-release-snapshot-$$" "$image" version --short)
+          if [ "$got" != '{{.SNAPSHOT_VERSION}}' ]; then
+            echo "release:snapshot: the image $image reports version ${got:-(none)}, not {{.SNAPSHOT_VERSION}}" >&2
+            exit 1
+          fi
+          echo "release:snapshot: the image $image starts and reports version $got"
+        silent: true
+        if: '[ -f .goreleaser.yaml ] && command -v docker >/dev/null 2>&1'
+
+  release:assets:
+    desc: >-
+      Check dist/ after a goreleaser run against the release assets of docs/m1/06-deploy-and-ci.md §3 (VERSION=<v>;
+      FULL=true for a real release, which also has SBOMs and the cosign bundle)
+    vars:
+      FULL: '{{.FULL | default "false"}}'
+    cmds:
+      - cmd: |
+          set -eu
+          v='{{.VERSION}}'
+          full='{{.FULL}}'
+          # The packages' own version puts "~" before a prerelease, so that it sorts before the release: 0.1.0-rc.1
+          # is the deb and rpm version 0.1.0~rc.1. Their file names have "-" there (.goreleaser.yaml): GitHub
+          # renames an asset with a "~" in its name.
+          pv=$(printf '%s' "$v" | sed 's/-/~/')
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          status=0
+          problem() {
+            printf 'release:assets: %s\n' "$@" >&2
+            status=1
+          }
+          # same_set WHAT WANT GOT reports the lines of the file WANT that GOT lacks, and the other way round.
+          same_set() {
+            LC_ALL=C sort -u "$2" >"$tmp/want.sorted"
+            LC_ALL=C sort -u "$3" >"$tmp/got.sorted"
+            LC_ALL=C comm -23 "$tmp/want.sorted" "$tmp/got.sorted" | while IFS= read -r line; do
+              printf 'release:assets: %s lacks %s\n' "$1" "$line" >&2
+            done
+            LC_ALL=C comm -13 "$tmp/want.sorted" "$tmp/got.sorted" | while IFS= read -r line; do
+              printf 'release:assets: %s has %s, which it should not\n' "$1" "$line" >&2
+            done
+            cmp -s "$tmp/want.sorted" "$tmp/got.sorted" || status=1
+          }
+          sha256() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1" | cut -d' ' -f1
+            else
+              shasum -a 256 "$1" | cut -d' ' -f1
+            fi
+          }
+
+          if [ ! -d dist ]; then
+            echo 'release:assets: there is no dist/: run task release:snapshot' >&2
+            exit 1
+          fi
+          echo "release:assets: checking dist/ for isshoni $v (full release: $full)"
+
+          # The assets of 06 §3. install.sh and the compose files are uploaded from where they are
+          # (dist-extra/install.sh, deploy/), so dist/ has the others.
+          : >"$tmp/archives"
+          for target in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64; do
+            echo "isshoni_${v}_$target.tar.gz" >>"$tmp/archives"
+          done
+          for target in windows_amd64 windows_arm64; do
+            echo "isshoni_${v}_$target.zip" >>"$tmp/archives"
+          done
+          printf '%s\n' "isshoni_${v}_amd64.deb" "isshoni_${v}_arm64.deb" \
+            "isshoni-$v-1.x86_64.rpm" "isshoni-$v-1.aarch64.rpm" >"$tmp/packages"
+          sed 's/$/.sbom.json/' "$tmp/archives" >"$tmp/sboms"
+          # checksums.txt: every archive, package, install.sh and compose file, and in a full release the SBOMs.
+          cat "$tmp/archives" "$tmp/packages" >"$tmp/summed"
+          printf '%s\n' install.sh compose.yaml compose.host.yaml >>"$tmp/summed"
+          cat "$tmp/archives" "$tmp/packages" >"$tmp/dist.want"
+          echo checksums.txt >>"$tmp/dist.want"
+          if [ "$full" = true ]; then
+            cat "$tmp/sboms" >>"$tmp/summed"
+            cat "$tmp/sboms" >>"$tmp/dist.want"
+            echo checksums.txt.sigstore.json >>"$tmp/dist.want"
+          fi
+          # checksums.txt.sig never comes from goreleaser: release.yml's sign job adds it to the draft.
+          : >"$tmp/dist.got"
+          for f in dist/*; do
+            [ -f "$f" ] || continue
+            case ${f#dist/} in
+            # goreleaser's own records; a real release also writes the notes and the image digests
+            artifacts.json | metadata.json | config.yaml | CHANGELOG.md | digests.txt) ;;
+            *) echo "${f#dist/}" >>"$tmp/dist.got" ;;
+            esac
+          done
+          same_set dist/ "$tmp/dist.want" "$tmp/dist.got"
+          for f in dist-extra/install.sh deploy/compose.yaml deploy/compose.host.yaml; do
+            [ -f "$f" ] || problem "$f is missing (a release uploads it)"
+          done
+          if ! grep -qx "ISSHONI_INSTALLER_VERSION=\"$v\"" dist-extra/install.sh 2>/dev/null; then
+            problem "dist-extra/install.sh is not stamped with $v"
+          fi
+
+          # checksums.txt: "<sha256>  <name>" for exactly those files, each with the hash the file has.
+          if [ -f dist/checksums.txt ]; then
+            sed 's/^[0-9a-f]\{64\}  //' dist/checksums.txt >"$tmp/summed.got"
+            same_set dist/checksums.txt "$tmp/summed" "$tmp/summed.got"
+            # install.sh refuses a name that is listed twice (06 §4.3).
+            LC_ALL=C sort "$tmp/summed.got" | uniq -d >"$tmp/summed.twice"
+            while read -r name; do
+              problem "checksums.txt lists $name more than once"
+            done <"$tmp/summed.twice"
+            while read -r sum name; do
+              case $name in
+              install.sh) file=dist-extra/install.sh ;;
+              compose.yaml | compose.host.yaml) file=deploy/$name ;;
+              *) file=dist/$name ;;
+              esac
+              [ -f "$file" ] || continue
+              [ "$(sha256 "$file")" = "$sum" ] || problem "checksums.txt has the wrong SHA-256 for $name"
+            done <dist/checksums.txt
+          fi
+
+          # Every name is one that GitHub keeps as it is. It renames a release asset whose name has any other
+          # character ("~" becomes ".") or starts or ends with ".", and the draft would then no longer match
+          # checksums.txt: release.yml's sign job would fail on it, after the owner's approval.
+          cat "$tmp/dist.want" "$tmp/dist.got" "$tmp/summed" >"$tmp/names"
+          [ ! -f "$tmp/summed.got" ] || cat "$tmp/summed.got" >>"$tmp/names"
+          LC_ALL=C grep -Evx '[A-Za-z0-9_-]([A-Za-z0-9._-]*[A-Za-z0-9_-])?' "$tmp/names" >"$tmp/names.bad" || :
+          LC_ALL=C sort -u "$tmp/names.bad" | while IFS= read -r name; do
+            printf 'release:assets: %s is not a name GitHub keeps for a release asset: use only A-Z a-z 0-9 . _ -\n' \
+              "$name" >&2
+          done
+          [ ! -s "$tmp/names.bad" ] || status=1
+
+          # The archives: the binary, the license files, README.md and the files install.sh installs (06 §3), at
+          # the root. A snapshot builds without README.md while the repository has none (.goreleaser.yaml); a
+          # release (FULL=true) never does.
+          printf '%s\n' LICENSE NOTICE THIRD_PARTY_NOTICES deploy/systemd/isshoni.service \
+            deploy/sysctl/60-isshoni.conf deploy/firewall/ufw-isshoni deploy/firewall/firewalld-isshoni.xml \
+            >"$tmp/content"
+          if [ -f README.md ] || [ "$full" = true ]; then
+            echo README.md >>"$tmp/content"
+          fi
+          if [ ! -f README.md ]; then
+            if [ "$full" = true ]; then
+              problem 'the repository has no README.md, and every archive of a release has one (06 §3)'
+            else
+              echo 'release:assets: note: the repository has no README.md yet, so the archives have none (06 §3 lists it; a release fails without it)'
+            fi
+          fi
+          while read -r archive; do
+            [ -f "dist/$archive" ] || continue
+            cp "$tmp/content" "$tmp/content.want"
+            case $archive in
+            *.zip)
+              echo isshoni.exe >>"$tmp/content.want"
+              unzip -Z1 "dist/$archive" >"$tmp/content.got"
+              ;;
+            *)
+              echo isshoni >>"$tmp/content.want"
+              tar -tzf "dist/$archive" >"$tmp/content.got"
+              ;;
+            esac
+            same_set "$archive" "$tmp/content.want" "$tmp/content.got"
+          done <"$tmp/archives"
+
+          # The binary for this machine starts and has the version (the ldflags of 06 §9.2).
+          host=$(go env GOOS)_$(go env GOARCH)
+          case $host in
+          linux_* | darwin_*)
+            if [ -f "dist/isshoni_${v}_$host.tar.gz" ]; then
+              mkdir "$tmp/bin"
+              tar -xzf "dist/isshoni_${v}_$host.tar.gz" -C "$tmp/bin" isshoni
+              got=$("$tmp/bin/isshoni" version --short) || got=''
+              [ "$got" = "$v" ] || problem "the $host binary reports version ${got:-(none)}, not $v"
+            fi
+            ;;
+          esac
+
+          # The packages (06 §5): the same files in the system's paths, and the tools preinstall.sh needs.
+          printf '%s\n' usr/bin/isshoni usr/lib/systemd/system/isshoni.service usr/lib/sysctl.d/60-isshoni.conf \
+            etc/ufw/applications.d/isshoni usr/lib/firewalld/services/isshoni.xml etc/isshoni \
+            usr/share/doc/isshoni/LICENSE usr/share/doc/isshoni/NOTICE usr/share/doc/isshoni/THIRD_PARTY_NOTICES \
+            >"$tmp/package.want"
+          # (Each listing goes to a file first: Task's shell has pipefail on, and grep -q ending a pipe early
+          # would fail the command that writes into it.)
+          for arch in amd64 arm64; do
+            deb=dist/isshoni_${v}_$arch.deb
+            [ -f "$deb" ] || continue
+            ar p "$deb" data.tar.gz | tar -tzf - | sed 's|^\./||' >"$tmp/deb.list"
+            # data.tar.gz lists the parent directories as well; of those only /etc/isshoni is the package's own.
+            grep -v -e '/$' -e '^$' "$tmp/deb.list" >"$tmp/package.got" || :
+            if grep -qx 'etc/isshoni/' "$tmp/deb.list"; then
+              echo etc/isshoni >>"$tmp/package.got"
+            fi
+            same_set "${deb#dist/}" "$tmp/package.want" "$tmp/package.got"
+            ar p "$deb" control.tar.gz | tar -xzOf - ./control >"$tmp/control"
+            for field in "Version: $pv" "Architecture: $arch" 'Pre-Depends: passwd'; do
+              grep -qx "$field" "$tmp/control" || problem "${deb#dist/}: the control file lacks \"$field\""
+            done
+          done
+          # rpm lists the files the package owns, without implicit parent directories.
+          if command -v rpm >/dev/null 2>&1; then
+            rpm_list() { rpm -qlp "$1" 2>/dev/null; }
+          elif command -v bsdtar >/dev/null 2>&1; then
+            rpm_list() { bsdtar -tf "$1"; }
+          else
+            case $(tar --version 2>/dev/null) in
+            *bsdtar*) rpm_list() { tar -tf "$1"; } ;; # macOS
+            *) rpm_list() { return 1; } ;;
+            esac
+          fi
+          for arch in x86_64 aarch64; do
+            rpm=dist/isshoni-$v-1.$arch.rpm
+            [ -f "$rpm" ] || continue
+            if ! rpm_list "$rpm" >"$tmp/rpm.list"; then
+              problem "can't list ${rpm#dist/}: install rpm (or bsdtar, from libarchive)"
+              continue
+            fi
+            sed -e 's|^\./||' -e 's|^/||' "$tmp/rpm.list" >"$tmp/package.got"
+            same_set "${rpm#dist/}" "$tmp/package.want" "$tmp/package.got"
+            if command -v rpm >/dev/null 2>&1; then
+              rpm -qpR "$rpm" >"$tmp/rpm.requires" 2>/dev/null || :
+              grep -qx shadow-utils "$tmp/rpm.requires" || problem "${rpm#dist/} does not require shadow-utils"
+              got=$(rpm -qp --queryformat '%{VERSION} %{ARCH}' "$rpm" 2>/dev/null) || got=''
+              [ "$got" = "$pv $arch" ] || problem "${rpm#dist/}: version and architecture are \"$got\", not \"$pv $arch\""
+            fi
+          done
+          if ! command -v rpm >/dev/null 2>&1; then
+            echo "release:assets: note: rpm is not installed here, so the rpm packages' Requires and version were not checked"
+          fi
+
+          if [ "$status" = 0 ]; then
+            echo "release:assets: dist/ has the release assets of isshoni $v"
+          fi
+          exit "$status"
+        silent: true
+
+  release:keys:
+    desc: >-
+      Write deploy/keys/allowed_signers into the key block of deploy/install.sh, check it (lint:keys) and print the
+      keys' fingerprints (deploy/keys/README.md)
+    cmds:
+      - cmd: |
+          set -eu
+          keys=deploy/keys/allowed_signers
+          die() {
+            printf 'release:keys: %s\n' "$@" >&2
+            exit 1
+          }
+          [ -s "$keys" ] || die "$keys is missing or empty: put the public halves of the release keys there first" \
+            '(deploy/keys/README.md)'
+          if grep -q 'PRIVATE KEY' "$keys"; then
+            die "$keys holds a PRIVATE key. Do not commit it: delete the file, and use the .pub files' contents"
+          fi
+          # What lint:keys rejects is checked before install.sh is written, so that a failed run leaves it as it was.
+          if grep -q "'" "$keys"; then
+            die "$keys contains a single quote (comments count too), which install.sh's key block cannot hold"
+          fi
+          [ -z "$(tail -c 1 "$keys")" ] || die "$keys must end with a newline"
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          # Each line: the principal install.sh asks for, the namespace it verifies, an ed25519 key (06 §4.3, §9.4).
+          # Rotation adds options (valid-before="YYYYMMDD") to the namespaces field; comments and blank lines pass.
+          n=0
+          while IFS= read -r line || [ -n "$line" ]; do
+            n=$((n + 1))
+            line=${line%"$(printf '\r')"}
+            case $line in '' | '#'*) continue ;; esac
+            case $line in
+            'isshoni-release namespaces="isshoni-checksums"'*' ssh-ed25519 AAAA'*) ;;
+            *) die "$keys line $n is not 'isshoni-release namespaces=\"isshoni-checksums\" ssh-ed25519 AAAA… <name>'" ;;
+            esac
+            key=$(printf '%s\n' "$line" | sed 's/.*\(ssh-ed25519 [A-Za-z0-9+/=]*\).*/\1/')
+            printf '%s\n' "$key" >"$tmp/key.pub"
+            fp=$(ssh-keygen -l -f "$tmp/key.pub") || die "$keys line $n: ssh-keygen does not read the key"
+            printf 'release:keys: line %d: %s %s\n' "$n" "$(printf '%s' "$fp" | cut -d' ' -f2)" "${line##* }"
+          done <"$keys"
+          # The block holds the file's lines in single quotes; install.sh writes the value plus a newline back to a
+          # file for ssh-keygen, so a file that ends with its newline round-trips byte for byte.
+          tr -d '\r' <"$keys" >"$tmp/signers"
+          awk -v q="'" '
+            FNR == NR { value = value (FNR > 1 ? "\n" : "") $0; next }
+            /^# BEGIN ALLOWED SIGNERS/ { print; print "ALLOWED_SIGNERS=" q value q; skip = 1; next }
+            /^# END ALLOWED SIGNERS/ { skip = 0 }
+            !skip { print }' "$tmp/signers" deploy/install.sh >"$tmp/install.sh"
+          # cat, not mv: install.sh keeps its mode.
+          cat "$tmp/install.sh" >deploy/install.sh
+          echo "release:keys: wrote $keys into deploy/install.sh"
+        silent: true
+      - task: lint:keys
 
   release:compat:
     desc: Snapshot the protocol fixtures for the final release VERSION=X.Y.Z (run in the release-prep PR)
@@ -624,4 +956,5 @@ tasks:
       - rm -rf bin dist dist-extra .dev .task
       - >-
         rm -rf {{.GOLANGCI_LINT}} {{.TYGO}} {{.GO_LICENSES}} .bin/govulncheck{{exeExt}} {{.SHFMT}}
+        .bin/goreleaser{{exeExt}}
       - rm -rf web/dist/*

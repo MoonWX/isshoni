@@ -6,19 +6,23 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/MoonWX/isshoni/internal/logx"
 	"github.com/MoonWX/isshoni/internal/protocol"
 	"github.com/MoonWX/isshoni/internal/protocol/api"
 	"github.com/MoonWX/isshoni/internal/server/auth"
@@ -27,6 +31,7 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/netx"
 	"github.com/MoonWX/isshoni/internal/server/ops"
 	"github.com/MoonWX/isshoni/internal/server/ops/doctor"
+	"github.com/MoonWX/isshoni/internal/server/push"
 	"github.com/MoonWX/isshoni/internal/server/sfu"
 	"github.com/MoonWX/isshoni/internal/server/signal"
 	"github.com/MoonWX/isshoni/internal/server/store"
@@ -1653,5 +1658,424 @@ func TestDBCheckBehindASlowPing(t *testing.T) {
 	elapsed.Add(int64(time.Millisecond))
 	if ok, _ := check.ready(); ok || pings.Load() != 2 {
 		t.Errorf("one interval after the answer: ready = %v after %d pings, want a second ping", ok, pings.Load())
+	}
+}
+
+// ---- 04's push service: signal.PushNotifier, auth.AdminAlerter, httpapi.Push and push.Store ----
+
+// fakePush is a pushService that records what the adapters pass on and answers what the test says.
+type fakePush struct {
+	shares    []push.ShareStarted
+	alerts    []push.AdminAlert
+	key       string
+	endpoints []string
+	tests     [][]push.Subscription
+	err       error // ValidateEndpoint's and SendTest's
+}
+
+func (f *fakePush) ShareStarted(ev push.ShareStarted) { f.shares = append(f.shares, ev) }
+
+func (f *fakePush) AdminAlert(a push.AdminAlert) { f.alerts = append(f.alerts, a) }
+
+func (f *fakePush) VAPIDPublicKey() string { return f.key }
+
+func (f *fakePush) ValidateEndpoint(_ context.Context, endpoint string) error {
+	f.endpoints = append(f.endpoints, endpoint)
+	return f.err
+}
+
+func (f *fakePush) SendTest(_ context.Context, subs []push.Subscription) error {
+	f.tests = append(f.tests, subs)
+	return f.err
+}
+
+// The hub's event becomes push's, field by field; the hub's context does not matter to a queue.
+func TestPushNotifier(t *testing.T) {
+	f := &fakePush{}
+	at := time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
+	gone, cancel := context.WithCancel(context.Background())
+	cancel()
+	pushNotifier{svc: f}.ShareStarted(gone, signal.PushShareStarted{
+		RoomID: "lounge", RoomName: "Lounge", ShareID: "s_q7m2x9c4v8b1n5k3", UserID: "k3m9p2qxw7ht", UserName: "Alex",
+		PresentUserIDs: []string{"k3m9p2qxw7ht", "a1b2c3d4e5f6"}, At: at,
+	})
+	pushNotifier{svc: f}.ShareStarted(context.Background(), signal.PushShareStarted{RoomID: "movies", ShareID: "s_2"})
+	want := []push.ShareStarted{
+		{
+			RoomID: "lounge", RoomName: "Lounge", ShareID: "s_q7m2x9c4v8b1n5k3", UserID: "k3m9p2qxw7ht", UserName: "Alex",
+			PresentUserIDs: []string{"k3m9p2qxw7ht", "a1b2c3d4e5f6"}, At: at,
+		},
+		{RoomID: "movies", ShareID: "s_2"},
+	}
+	if !reflect.DeepEqual(f.shares, want) {
+		t.Errorf("push got %+v, want %+v", f.shares, want)
+	}
+	if len(f.alerts)+len(f.endpoints)+len(f.tests) != 0 {
+		t.Error("a share event reached another method of the push service")
+	}
+}
+
+// Every alert of 03 becomes push's admin.alert with its kind, actor, target and time. The kinds are the wire's
+// (api.AdminAlertKind), which the service worker renders.
+func TestAdminAlerter(t *testing.T) {
+	at := time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
+	for _, in := range []auth.AdminAlert{
+		{Kind: auth.AlertAdminGranted, Actor: "Alex", Target: "Kim", At: at},
+		{Kind: auth.AlertAdminRevoked, Actor: "cli", Target: "Kim", At: at},
+		{Kind: auth.AlertAdminPasswordReset, Actor: "Alex", Target: "Sam", At: at},
+		{Kind: auth.AlertRegistrationModeChanged, Actor: "Alex", At: at},
+		{Kind: auth.AlertSignupPending, Actor: "system", Target: "sam_k", At: at},
+		{Kind: auth.AlertSecretsRotated, Actor: "system", At: at},
+		{Kind: auth.AlertTransferThreshold, Actor: "system", Target: "80"},
+		{Kind: auth.AlertRefreshTokenReused, Actor: "system", Target: "Kim", At: at},
+	} {
+		f := &fakePush{}
+		adminAlerter{svc: f}.AdminAlert(context.Background(), in)
+		want := []push.AdminAlert{{Kind: in.Kind, Actor: in.Actor, Target: in.Target, At: in.At}}
+		if !reflect.DeepEqual(f.alerts, want) || len(f.shares) != 0 {
+			t.Errorf("%s: push got %+v, want %+v", in.Kind, f.alerts, want)
+		}
+		if !slices.Contains([]api.AdminAlertKind{
+			api.AdminAlertKindAdminGranted, api.AdminAlertKindAdminRevoked, api.AdminAlertKindAdminPasswordReset,
+			api.AdminAlertKindRegistrationModeChanged, api.AdminAlertKindSignupPending,
+			api.AdminAlertKindSecretsRotated, api.AdminAlertKindTransferThreshold, api.AdminAlertKindRefreshTokenReused,
+		}, api.AdminAlertKind(in.Kind)) {
+			t.Errorf("auth's alert kind %q is not one of api.AdminAlertKind", in.Kind)
+		}
+	}
+}
+
+// httpapi.Push: the key and the endpoint checks pass straight through, and the test notification takes 03's rows as
+// push's subscriptions. The push service's errors are the REST answers, so they are passed on as they are.
+func TestPushAPI(t *testing.T) {
+	ctx := context.Background()
+	f := &fakePush{key: "BPublicKey"}
+	p := pushAPI{svc: f}
+	if got := p.VAPIDPublicKey(); got != "BPublicKey" {
+		t.Errorf("VAPIDPublicKey = %q", got)
+	}
+	if err := p.ValidateEndpoint(ctx, "https://push.example.net/send/1"); err != nil {
+		t.Errorf("ValidateEndpoint = %v", err)
+	}
+	rows := []store.PushSubscription{
+		{ID: "pushsub00001", UserID: "k3m9p2qxw7ht", SessionID: "sess00000001", Endpoint: "https://push.example.net/send/1",
+			P256dh: "BP256", Auth: "auth1", Name: "Chrome on macOS", CreatedAt: time.Now(), Failures: 3},
+		{ID: "pushsub00002", UserID: "k3m9p2qxw7ht", SessionID: "sess00000001", Endpoint: "https://push.example.org/2",
+			P256dh: "BP256b", Auth: "auth2"},
+	}
+	if err := p.SendTest(ctx, rows); err != nil {
+		t.Errorf("SendTest = %v", err)
+	}
+	want := [][]push.Subscription{{
+		{ID: "pushsub00001", UserID: "k3m9p2qxw7ht", SessionID: "sess00000001", Endpoint: "https://push.example.net/send/1",
+			P256dh: "BP256", Auth: "auth1"},
+		{ID: "pushsub00002", UserID: "k3m9p2qxw7ht", SessionID: "sess00000001", Endpoint: "https://push.example.org/2",
+			P256dh: "BP256b", Auth: "auth2"},
+	}}
+	if !reflect.DeepEqual(f.tests, want) || !slices.Equal(f.endpoints, []string{"https://push.example.net/send/1"}) {
+		t.Errorf("push got tests %+v and endpoints %v", f.tests, f.endpoints)
+	}
+
+	for _, code := range []string{api.CodePushEndpointRejected, api.CodeServerBusy, api.CodeServerShutdown} {
+		f.err = &api.Error{Code: code, RetryAfter: 5}
+		if err := p.ValidateEndpoint(ctx, "https://push.example.net/x"); !errors.Is(err, f.err) {
+			t.Errorf("ValidateEndpoint with %s = %v", code, err)
+		}
+		if err := p.SendTest(ctx, rows[:1]); !errors.Is(err, f.err) {
+			t.Errorf("SendTest with %s = %v", code, err)
+		}
+	}
+}
+
+// push.RecipientFilter's preference names are 03's PushFilter's: the store adapter passes them as they are.
+func TestPushPrefNamesMatchStore(t *testing.T) {
+	if push.PrefShareStarted != store.PrefShareStarted || push.PrefAdminAlerts != store.PrefAdminAlerts {
+		t.Errorf("push's preferences %q and %q, 03's %q and %q", push.PrefShareStarted, push.PrefAdminAlerts,
+			store.PrefShareStarted, store.PrefAdminAlerts)
+	}
+}
+
+// pushWorld is a database with users of every kind for the store adapter, each with a web session and a push
+// subscription: two admins (Ana does not want admin alerts), two members (Kim has a second browser, Pat does not
+// want share.started) and a disabled member.
+type pushWorld struct {
+	db       *store.DB
+	users    map[string]store.UserID           // by username
+	sessions map[string]store.SessionID        // by username: the session of its first subscription
+	subs     map[string]store.PushSubscription // "<username>", and "Kim-2"
+}
+
+func newPushWorld(t *testing.T) *pushWorld {
+	t.Helper()
+	w := &pushWorld{db: openTestStore(t), users: map[string]store.UserID{}, sessions: map[string]store.SessionID{},
+		subs: map[string]store.PushSubscription{}}
+	now := time.Now()
+	accounts := []struct {
+		name   string
+		role   store.Role
+		status store.UserStatus
+		prefs  *store.PushPreferences
+		subs   int
+	}{
+		{name: "Alex", role: store.RoleAdmin, status: store.StatusActive, subs: 1},
+		{name: "Ana", role: store.RoleAdmin, status: store.StatusActive, subs: 1,
+			prefs: &store.PushPreferences{ShareStarted: "all", AdminAlerts: false}},
+		{name: "Kim", role: store.RoleUser, status: store.StatusActive, subs: 2},
+		{name: "Pat", role: store.RoleUser, status: store.StatusActive, subs: 1,
+			prefs: &store.PushPreferences{ShareStarted: "off", AdminAlerts: true}},
+		{name: "Dan", role: store.RoleUser, status: store.StatusDisabled, subs: 1},
+	}
+	err := w.db.Write(context.Background(), func(q *store.Q) error {
+		for i, a := range accounts {
+			u := store.User{Username: a.name, UsernameKey: strings.ToLower(a.name), PasswordHash: "x", Role: a.role,
+				Status: a.status, CreatedVia: "invite"}
+			if err := q.CreateUser(&u); err != nil {
+				return err
+			}
+			w.users[a.name] = u.ID
+			if a.prefs != nil {
+				if err := q.SetPushPreferences(u.ID, *a.prefs, now); err != nil {
+					return err
+				}
+			}
+			for n := range a.subs {
+				sess := store.Session{UserID: u.ID, TokenHash: []byte{byte(i), byte(n)}, IdleExpiresAt: now.Add(time.Hour),
+					ExpiresAt: now.Add(time.Hour)}
+				if err := q.CreateSession(&sess); err != nil {
+					return err
+				}
+				name := a.name
+				if n == 0 {
+					w.sessions[a.name] = sess.ID
+				} else {
+					name += "-" + strconv.Itoa(n+1)
+				}
+				sub := store.PushSubscription{UserID: u.ID, SessionID: sess.ID, Endpoint: "https://push.example.net/" + name,
+					P256dh: "p256dh-" + name, Auth: "auth-" + name, Name: "Firefox on Linux"}
+				if _, err := q.UpsertPushSubscription(&sub); err != nil {
+					return err
+				}
+				w.subs[name] = sub
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w
+}
+
+// sub is a subscription of the world as push sees it.
+func (w *pushWorld) sub(name string) push.Subscription {
+	s := w.subs[name]
+	return push.Subscription{ID: string(s.ID), UserID: string(s.UserID), SessionID: string(s.SessionID),
+		Endpoint: logx.Secret(s.Endpoint), P256dh: s.P256dh, Auth: s.Auth}
+}
+
+// row is a subscription's failures and last success as 03's table has them; ok is false when it is gone.
+func (w *pushWorld) row(t *testing.T, name string) (failures int, lastSuccess time.Time, ok bool) {
+	t.Helper()
+	err := w.db.Read(context.Background(), func(q *store.Q) error {
+		subs, err := q.ListPushSubscriptions(store.PushFilter{UserIDs: []store.UserID{w.subs[name].UserID}})
+		for _, s := range subs {
+			if s.ID == w.subs[name].ID {
+				failures, lastSuccess, ok = s.Failures, s.LastSuccessAt, true
+			}
+		}
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return failures, lastSuccess, ok
+}
+
+// TestPushStore: the store adapter over 03's real tables (04 §14.7). Recipients applies every field of the filter
+// and returns active users only; a result recorded for, or a deletion of, a subscription that is gone is no error;
+// a meta key that is not there reads ""; any other error of the store is passed on.
+func TestPushStore(t *testing.T) {
+	ctx := context.Background()
+	w := newPushWorld(t)
+	st := pushStore{metaStore{db: w.db}}
+	user := func(name string) string { return string(w.users[name]) }
+	subID := func(name string) string { return string(w.subs[name].ID) }
+
+	recipients := func(f push.RecipientFilter) []string {
+		t.Helper()
+		subs, err := st.Recipients(ctx, f)
+		if err != nil {
+			t.Fatalf("Recipients(%+v): %v", f, err)
+		}
+		var names []string
+		for _, s := range subs {
+			for name := range w.subs {
+				if w.sub(name) == s {
+					names = append(names, name)
+				}
+			}
+		}
+		if len(names) != len(subs) {
+			t.Errorf("Recipients(%+v) returned subscriptions that are not the world's: %+v", f, subs)
+		}
+		slices.Sort(names)
+		return names
+	}
+	for _, c := range []struct {
+		name   string
+		filter push.RecipientFilter
+		want   []string
+	}{
+		{"every active user's", push.RecipientFilter{}, []string{"Alex", "Ana", "Kim", "Kim-2", "Pat"}},
+		{"share.started: not the sharer, not the room, not Pat, who switched it off",
+			push.RecipientFilter{ExcludeUserIDs: []string{user("Alex"), user("Kim")}, Pref: push.PrefShareStarted},
+			[]string{"Ana"}},
+		{"admin.alert: the admins who want them", push.RecipientFilter{AdminsOnly: true, Pref: push.PrefAdminAlerts},
+			[]string{"Alex"}},
+		{"push.test: one session's", push.RecipientFilter{SessionID: string(w.subs["Kim-2"].SessionID)}, []string{"Kim-2"}},
+		{"a disabled user's, never", push.RecipientFilter{SessionID: string(w.sessions["Dan"])}, nil},
+	} {
+		if got := recipients(c.filter); !slices.Equal(got, c.want) {
+			t.Errorf("%s: %v, want %v", c.name, got, c.want)
+		}
+	}
+	if _, err := st.Recipients(ctx, push.RecipientFilter{Pref: "sometimes"}); err == nil {
+		t.Error("Recipients with an unknown preference returned no error")
+	}
+
+	at := time.Now().Add(-time.Minute).Truncate(time.Millisecond)
+	for range 2 {
+		if err := st.RecordResult(ctx, subID("Kim"), false, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if failures, last, ok := w.row(t, "Kim"); !ok || failures != 2 || !last.IsZero() {
+		t.Errorf("Kim's after two failures: %d failures, last success %v, there %v", failures, last, ok)
+	}
+	if err := st.RecordResult(ctx, subID("Kim"), true, at); err != nil {
+		t.Fatal(err)
+	}
+	if failures, last, ok := w.row(t, "Kim"); !ok || failures != 0 || !last.Equal(at) {
+		t.Errorf("Kim's after a success at %v: %d failures, last success %v, there %v", at, failures, last, ok)
+	}
+	if err := st.Delete(ctx, subID("Kim")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := w.row(t, "Kim"); ok {
+		t.Error("Kim's subscription is still there after Delete")
+	}
+	// Gone is gone: the service may record a result for a subscription that was deleted meanwhile.
+	if err := st.RecordResult(ctx, subID("Kim"), true, at); err != nil {
+		t.Errorf("RecordResult for a deleted subscription = %v, want nil", err)
+	}
+	if err := st.Delete(ctx, subID("Kim")); err != nil {
+		t.Errorf("Delete of a deleted subscription = %v, want nil", err)
+	}
+
+	// The daily prune: 20 failures in a row and no success since the cut-off.
+	for range 20 {
+		if err := st.RecordResult(ctx, subID("Pat"), false, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, err := st.Prune(ctx, 20, at.Add(time.Hour)); n != 1 || err != nil {
+		t.Errorf("Prune = %d, %v; want Pat's", n, err)
+	}
+	if _, _, ok := w.row(t, "Pat"); ok {
+		t.Error("Pat's subscription is still there after the prune")
+	}
+	// A VAPID rotation deletes the rest, the disabled user's too.
+	if n, err := st.DeleteAll(ctx); n != 4 || err != nil {
+		t.Errorf("DeleteAll = %d, %v; want the 4 that were left", n, err)
+	}
+
+	if v, err := st.Meta(ctx, "vapid_key_fp"); v != "" || err != nil {
+		t.Errorf("a meta key that is not there = %q, %v; want \"\" and no error", v, err)
+	}
+	if err := st.SetMeta(ctx, "vapid_key_fp", "0123456789abcdef"); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := st.Meta(ctx, "vapid_key_fp"); v != "0123456789abcdef" || err != nil {
+		t.Errorf("the meta key after SetMeta = %q, %v", v, err)
+	}
+
+	if err := w.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Recipients(ctx, push.RecipientFilter{}); err == nil {
+		t.Error("Recipients on a closed store returned no error")
+	}
+	if err := st.RecordResult(ctx, subID("Alex"), true, at); err == nil {
+		t.Error("RecordResult on a closed store returned no error")
+	}
+	if err := st.Delete(ctx, subID("Alex")); err == nil {
+		t.Error("Delete on a closed store returned no error")
+	}
+	if _, err := st.DeleteAll(ctx); err == nil {
+		t.Error("DeleteAll on a closed store returned no error")
+	}
+	if _, err := st.Prune(ctx, 20, at); err == nil {
+		t.Error("Prune on a closed store returned no error")
+	}
+}
+
+// pushSubjectProblem turns the subject that config lets through and push.New refuses into a config error for the
+// key, with its source and config's fix; every other subject is push.New's or config's business, and with push off
+// no subject is. New reports it with config's own problems, errors first, before anything is opened: also on an
+// ip-mode server that would start without a site, and so without a push service, until it finds its address.
+func TestPushSubjectProblem(t *testing.T) {
+	for _, subject := range []string{"", "mailto:ops@example.com", "https://watch.example.com", "https:x"} {
+		if p, bad := pushSubjectProblem(loadFlags(t, "--push.subject="+subject)); bad {
+			t.Errorf("push.subject = %q: %+v", subject, p)
+		}
+	}
+	for _, subject := range []string{"mailto:", "https:"} {
+		p, bad := pushSubjectProblem(loadFlags(t, "--push.subject="+subject))
+		if !bad || p.Key != "push.subject" || p.Value != `"`+subject+`"` || p.Severity != config.SeverityError ||
+			p.Source != (config.Source{Kind: config.SourceFlag, Name: "--push.subject"}) || p.Fix != pushSubjectFix {
+			t.Errorf("push.subject = %q: %v %+v", subject, bad, p)
+		}
+		if p, bad := pushSubjectProblem(loadFlags(t, "--push.subject="+subject, "--push.enabled=false")); bad {
+			t.Errorf("push.subject = %q with push off: %+v", subject, p)
+		}
+	}
+
+	// New: one config error with config's own, sorted with them; nothing is opened.
+	cfg := loadFlags(t, "--tls.mode=ip", "--listen.https=127.0.0.1:0", "--push.subject=mailto:", "--shutdown-timeout=soon")
+	_, err := New(cfg, discardLog(), Deps{})
+	var ve *config.ValidationError
+	if !errors.As(err, &ve) || !NeedsOperator(err) {
+		t.Fatalf("New with push.subject = \"mailto:\": %v, want a config error", err)
+	}
+	var errKeys []string
+	for _, p := range ve.Problems {
+		if p.Severity == config.SeverityError {
+			errKeys = append(errKeys, p.Key)
+		}
+	}
+	slices.Sort(errKeys)
+	if !slices.Equal(errKeys, []string{"push.subject", "shutdown_timeout"}) || !slices.IsSortedFunc(ve.Problems,
+		func(a, b config.Problem) int { return strings.Compare(a.Severity, b.Severity) }) {
+		t.Errorf("New's problems: %v, want the push.subject and shutdown_timeout errors first", ve.Problems)
+	}
+	if _, err := os.Stat(cfg.DataDir); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("New refused the config, and the data directory is there: %v", err)
+	}
+	if msg := err.Error(); !strings.Contains(msg, `push.subject = "mailto:" (flag --push.subject) names no contact`) {
+		t.Errorf("the error says %q", err)
+	}
+
+	// The fix is config's own, word for word: one text for the two halves of the rule.
+	found := false
+	for _, p := range loadFlags(t, "--push.subject=smtp:ops").Validate() {
+		if p.Key == "push.subject" {
+			found = true
+			if p.Fix != pushSubjectFix {
+				t.Errorf("config's fix for push.subject is %q, the wiring's %q", p.Fix, pushSubjectFix)
+			}
+		}
+	}
+	if !found {
+		t.Error("config took push.subject = \"smtp:ops\"")
 	}
 }

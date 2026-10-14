@@ -76,13 +76,14 @@ const (
 // for it again every 100 ms for as long as the sequence number stays in its window. No browser does that, and an
 // SFU that answers NACKs would send every repaired packet several times.)
 type Viewer struct {
-	api    *webrtc.API
+	opts   ViewerOptions
 	cfg    webrtc.Configuration
 	log    *slog.Logger
 	keep   int
 	noNACK bool
 
-	mu       sync.Mutex // guards the fields below
+	mu       sync.Mutex  // guards the fields below
+	api      *webrtc.API // what newPC builds on: SetH264 replaces it
 	pc       *webrtc.PeerConnection
 	recs     []*Recorder
 	rtcpRead map[rtcpKey]bool
@@ -99,19 +100,12 @@ type rtcpKey struct {
 // NewViewer builds the Viewer's API (a browser-like MediaEngine and receiver reports every 1 s; the NACKs are the
 // Viewer's own) and its PeerConnection.
 func NewViewer(o ViewerOptions) (*Viewer, error) {
-	m, err := viewerEngine(o)
+	api, err := viewerAPI(o)
 	if err != nil {
 		return nil, err
 	}
-	rr, err := report.NewReceiverInterceptor(report.ReceiverInterval(time.Second))
-	if err != nil {
-		return nil, fmt.Errorf("sfutest: receiver reports: %w", err)
-	}
-	ir := &interceptor.Registry{}
-	ir.Add(rr)
 	v := &Viewer{
-		api: webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(ir),
-			webrtc.WithSettingEngine(o.Settings)),
+		opts: o, api: api,
 		cfg: webrtc.Configuration{ICEServers: o.ICEServers},
 		log: o.Logger, keep: o.KeepPackets, noNACK: o.NoNACK, rtcpRead: map[rtcpKey]bool{},
 	}
@@ -127,7 +121,43 @@ func NewViewer(o ViewerOptions) (*Viewer, error) {
 	return v, nil
 }
 
-// newPC creates a PeerConnection of the Viewer's API whose tracks the Viewer records.
+// viewerAPI builds a Viewer's API: a browser-like MediaEngine for o, receiver reports every 1 s, o.Settings.
+func viewerAPI(o ViewerOptions) (*webrtc.API, error) {
+	m, err := viewerEngine(o)
+	if err != nil {
+		return nil, err
+	}
+	rr, err := report.NewReceiverInterceptor(report.ReceiverInterval(time.Second))
+	if err != nil {
+		return nil, fmt.Errorf("sfutest: receiver reports: %w", err)
+	}
+	ir := &interceptor.Registry{}
+	ir.Add(rr)
+	return webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(ir),
+		webrtc.WithSettingEngine(o.Settings)), nil
+}
+
+// SetH264 changes the H.264 profile-level-ids the Viewer decodes (ViewerOptions.H264; an empty, non-nil slice is
+// none at all, like ViewerOptions.NoH264) for the PeerConnections it builds from now on (Rebuild). Its current one
+// keeps what it negotiated: a browser whose decoder download has finished uses it on a new PeerConnection, and may
+// not on the one it has (02 §8.5).
+func (v *Viewer) SetH264(profiles []string) error {
+	v.mu.Lock()
+	o := v.opts
+	v.mu.Unlock()
+	o.H264, o.NoH264 = profiles, profiles != nil && len(profiles) == 0
+	api, err := viewerAPI(o)
+	if err != nil {
+		return err
+	}
+	v.mu.Lock()
+	v.opts, v.api = o, api
+	v.mu.Unlock()
+	return nil
+}
+
+// newPC creates a PeerConnection of the Viewer's API whose tracks the Viewer records. NewViewer calls it alone,
+// Rebuild with v.mu held.
 func (v *Viewer) newPC() (*webrtc.PeerConnection, error) {
 	pc, err := v.api.NewPeerConnection(v.cfg)
 	if err != nil {

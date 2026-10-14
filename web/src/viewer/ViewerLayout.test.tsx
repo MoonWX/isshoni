@@ -213,6 +213,71 @@ describe('ViewerLayout: picking a tile (05 §12.2, owner decision)', () => {
   });
 });
 
+describe('ViewerLayout: the list stays at its start (README S72)', () => {
+  const DEE = shareInfo('s_dee', 'u_dee', 4);
+
+  /**
+   * Gives the list a scroll offset that acts like a browser's scroll-snapped strip: a tile that comes in at the start
+   * makes the browser re-snap to the tile it was snapped to, one tile further on, which the next read of the offset
+   * shows. jsdom lays nothing out, so this stands in for it.
+   */
+  function resnappingList(): { list: HTMLElement; scrollTo(left: number): void } {
+    const list = screen.getByRole('list', { name: 'Shares' });
+    let left = 0;
+    let first = list.firstElementChild;
+    Object.defineProperty(list, 'scrollLeft', {
+      configurable: true,
+      get() {
+        if (list.firstElementChild !== first && left !== 0) {
+          // Stays on the tile it was snapped to: that one is further on now.
+          left += 150;
+        } else if (list.firstElementChild !== first) {
+          left = 150;
+        }
+        first = list.firstElementChild;
+        return left;
+      },
+      set(value: number) {
+        left = value;
+        first = list.firstElementChild;
+      },
+    });
+    return {
+      list,
+      scrollTo(value) {
+        left = value;
+        first = list.firstElementChild;
+        list.dispatchEvent(new Event('scroll'));
+      },
+    };
+  }
+
+  it('shows the share that left the stage, at the start of a list that was at its start', () => {
+    render(<ViewerLayout viewer={viewer} />);
+    sync(BEA, CY);
+    const { list } = resnappingList();
+    // Dee's share takes the stage, and Cy's comes in at the start of the list.
+    sync(BEA, CY, DEE);
+    expect(tileNames()[0]).toMatch(/^Watch Cy's tab/);
+    expect(list.scrollLeft).toBe(0);
+  });
+
+  it('leaves a list the user scrolled where it is', () => {
+    render(<ViewerLayout viewer={viewer} />);
+    sync(BEA, CY);
+    const strip = resnappingList();
+    strip.scrollTo(80);
+    sync(BEA, CY, DEE);
+    expect(tileNames()[0]).toMatch(/^Watch Cy's tab/);
+    expect(strip.list.scrollLeft).toBe(230);
+    // Back at the start, the next change keeps it there.
+    strip.scrollTo(0);
+    sync(BEA, CY);
+    sync(BEA, CY, DEE);
+    expect(strip.list.scrollLeft).toBe(0);
+  });
+});
+
 describe('ViewerLayout: fullscreen and phones', () => {
   it('renders only the stage in fullscreen', () => {
     syncRoom(viewer, room(BEA, CY), SELF);

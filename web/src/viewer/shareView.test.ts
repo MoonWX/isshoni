@@ -24,6 +24,7 @@ function viewerShare(overrides: Partial<ViewerShare> = {}, info = shareInfo('s_a
     startedAt: info.startedAt,
     own: false,
     local: false,
+    audio: info.audio,
     ownerName: 'Bea',
     watchers: [],
     info,

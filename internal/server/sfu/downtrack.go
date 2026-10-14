@@ -1,7 +1,6 @@
 package sfu
 
 import (
-	"errors"
 	"math/rand/v2"
 	"strings"
 	"sync"
@@ -125,9 +124,6 @@ type binding struct {
 	unsupported bool
 }
 
-// errNoCodec is Bind's error when the sub PC negotiated no codec of the track's kind at all.
-var errNoCodec = errors.New("sfu: no codec negotiated for the track's kind")
-
 // RTP clock rates of the two codecs the SFU forwards.
 const (
 	videoClockRate = 90000
@@ -165,13 +161,16 @@ func (d *DownTrack) RID() string { return "" }
 // Kind implements webrtc.TrackLocal.
 func (d *DownTrack) Kind() webrtc.RTPCodecType { return d.kind }
 
-// Bind implements webrtc.TrackLocal. Pion calls it from its own goroutine once the sender's m-section is negotiated;
-// it only reads the negotiation and stores the result, so it never blocks. It maps each H.264 profile a publisher
-// may send to the viewer's payload type for it (02 §8.2), finds the RTX payload types and the abs-send-time
-// extension, and returns the codec the sender starts with. It never fails while a codec of its kind is negotiated:
-// with video but no usable H.264 it returns the first video codec and marks the binding unsupported, so one viewer
-// without a decoder doesn't fail the whole negotiation (02 §8.5). On a sub PC that is already connected it asks the
-// publisher for a keyframe: the viewer can't decode anything before one (02 §9.7).
+// Bind implements webrtc.TrackLocal. Pion calls it once the sender's m-section is negotiated, inside the
+// SetRemoteDescription of the viewer's answer; it only reads the negotiation and stores the result, so it never
+// blocks. It maps each H.264 profile a publisher may send to the viewer's payload type for it (02 §8.2), finds the
+// RTX payload types and the abs-send-time extension, and returns the codec the sender starts with. It never fails
+// (02 §8.5): with video but no usable H.264 it returns the first video codec, and with no codec at all, which is how
+// Pion binds the sender of an m-section the viewer rejected (a browser without H.264 answers its video with port 0),
+// a zero codec, which Pion takes as it is. Either binding is unsupported: nothing is written through it. So one
+// viewer without a decoder doesn't fail the whole negotiation, its audio flows, and the SFU's guard takes over
+// (Conn.codecAnswered). On a sub PC that is already connected it asks the publisher for a keyframe: the viewer can't
+// decode anything before one (02 §9.7).
 func (d *DownTrack) Bind(ctx webrtc.TrackLocalContext) (webrtc.RTPCodecParameters, error) {
 	b := &binding{
 		id:       ctx.ID(),
@@ -236,14 +235,35 @@ func (d *DownTrack) Bind(ctx webrtc.TrackLocalContext) (webrtc.RTPCodecParameter
 			}
 		}
 	}
-	if chosen == nil {
-		return webrtc.RTPCodecParameters{}, errNoCodec
-	}
 	d.binding.Store(b)
+	if chosen == nil {
+		return webrtc.RTPCodecParameters{}, nil // a rejected m-section: see above
+	}
 	if b.sendable() {
 		d.requestKeyframe()
 	}
 	return *chosen, nil
+}
+
+// mismatched reports whether the viewer negotiated no payload type for the profile the share's video is in now
+// (02 §8.3, codec_mismatch): a viewer that decodes only Constrained Baseline, say, while the sharer still sends High.
+// The DownTrack then forwards nothing, and goes on with the first keyframe in a profile the viewer takes, which the
+// room's codec policy has the sharer send. It is false for audio, before the share's first keyframe, without a
+// binding, and for a binding without H.264, which is the decoders' matter (Subscription.codec).
+func (d *DownTrack) mismatched() bool {
+	if d.kind != webrtc.RTPCodecTypeVideo {
+		return false
+	}
+	b := d.binding.Load()
+	if b == nil || b.unsupported {
+		return false
+	}
+	profile := d.share.currentProfile()
+	if profile == "" {
+		return false
+	}
+	_, ok := b.ptFor[profile]
+	return !ok
 }
 
 // Unbind implements webrtc.TrackLocal: the sender stopped (the subscription went away, or the PC closed). The writer
@@ -524,10 +544,11 @@ func (d *DownTrack) forward(w *rtpWriteState, p *packet) (changed bool) {
 	}
 	pt, ok := b.ptFor[p.profile]
 	if !ok {
-		// The viewer negotiated no payload type that carries this profile. README S69 reports it (codec_mismatch) and
-		// has the room's codec policy fix it; until a packet in a profile the viewer takes arrives, nothing flows. If
-		// the layer forwarded now has moved to this profile, what the viewer was getting is over (02 §9.4). Nobody is
-		// asked for a keyframe: the viewer couldn't decode it.
+		// The viewer negotiated no payload type that carries this profile: its subscriber's actor reports
+		// codec_mismatch (mismatched), and the room's codec policy has the sharer switch to a profile every viewer
+		// takes (02 §8.3). Until a packet in such a profile arrives, nothing flows. If the layer forwarded now has
+		// moved to this profile, what the viewer was getting is over (02 §9.4). Nobody is asked for a keyframe: the
+		// viewer couldn't decode it.
 		d.stats.noCodec.Add(1)
 		d.mu.Lock()
 		if d.m.unforwardable(p) {

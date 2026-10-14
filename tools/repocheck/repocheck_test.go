@@ -16,6 +16,7 @@ task 3.53.1   # trailing comment
 golangci-lint 2.14.0
 shfmt 3.14.1
 actionlint 1.7.12
+goreleaser 2.18.2
 `
 	goodMainMod = `module github.com/MoonWX/isshoni
 
@@ -36,6 +37,16 @@ require (
 	github.com/golangci/golangci-lint/v2 v2.14.0 // indirect
 	mvdan.cc/sh/v3 v3.14.1 // indirect
 )
+`
+	goodGoreleaserMod = `module github.com/MoonWX/isshoni/tools/goreleaser
+
+go 1.27.1
+
+toolchain go1.27.1
+
+tool github.com/goreleaser/goreleaser/v2
+
+require github.com/goreleaser/goreleaser/v2 v2.18.2 // indirect
 `
 	signers = `isshoni-release namespaces="isshoni-checksums" ssh-ed25519 AAAAone isshoni-release-1
 isshoni-release namespaces="isshoni-checksums" ssh-ed25519 AAAAtwo isshoni-release-backup-1
@@ -72,7 +83,18 @@ func crlf(s string) string {
 }
 
 func pinTree(toolVersions, mainMod, toolsMod string) map[string]string {
-	return map[string]string{".tool-versions": toolVersions, "go.mod": mainMod, "tools/go.mod": toolsMod}
+	return map[string]string{
+		".tool-versions":          toolVersions,
+		"go.mod":                  mainMod,
+		"tools/go.mod":            toolsMod,
+		"tools/goreleaser/go.mod": goodGoreleaserMod,
+	}
+}
+
+// withGoreleaserMod replaces tools/goreleaser/go.mod in a tree from pinTree.
+func withGoreleaserMod(files map[string]string, mod string) map[string]string {
+	files["tools/goreleaser/go.mod"] = mod
+	return files
 }
 
 func TestCheckPins(t *testing.T) {
@@ -130,9 +152,36 @@ func TestCheckPins(t *testing.T) {
 			},
 		},
 		{
+			name: "goreleaser toolchain differs",
+			files: withGoreleaserMod(pinTree(goodToolVersions, goodMainMod, goodToolsMod),
+				strings.Replace(goodGoreleaserMod, "toolchain go1.27.1", "toolchain go1.27.0", 1)),
+			wantErr: []string{`tools/goreleaser/go.mod has "toolchain go1.27.0" but .tool-versions pins golang 1.27.1`},
+		},
+		{
+			name:    "goreleaser pin differs",
+			files:   pinTree(strings.Replace(goodToolVersions, "goreleaser 2.18.2", "goreleaser 2.18.3", 1), goodMainMod, goodToolsMod),
+			wantErr: []string{"tools/goreleaser/go.mod has github.com/goreleaser/goreleaser/v2 v2.18.2 but .tool-versions pins goreleaser 2.18.3"},
+		},
+		{
+			name: "goreleaser missing from tools/goreleaser/go.mod",
+			files: withGoreleaserMod(pinTree(goodToolVersions, goodMainMod, goodToolsMod),
+				"module github.com/MoonWX/isshoni/tools/goreleaser\n\ngo 1.27.1\n\ntoolchain go1.27.1\n"),
+			wantErr: []string{"tools/goreleaser/go.mod does not require github.com/goreleaser/goreleaser/v2 (.tool-versions: goreleaser 2.18.2)"},
+		},
+		{
+			name:    "no goreleaser pin",
+			files:   pinTree(strings.Replace(goodToolVersions, "goreleaser 2.18.2\n", "", 1), goodMainMod, goodToolsMod),
+			wantErr: []string{".tool-versions has no goreleaser line"},
+		},
+		{
+			name:    "missing tools/goreleaser/go.mod",
+			files:   map[string]string{".tool-versions": goodToolVersions, "go.mod": goodMainMod, "tools/go.mod": goodToolsMod},
+			wantErr: []string{"goreleaser"},
+		},
+		{
 			name:    "tool without version",
-			files:   pinTree(goodToolVersions+"goreleaser\n", goodMainMod, goodToolsMod),
-			wantErr: []string{`"goreleaser" has no version`},
+			files:   pinTree(goodToolVersions+"syft\n", goodMainMod, goodToolsMod),
+			wantErr: []string{`"syft" has no version`},
 		},
 		{
 			name:    "tool listed twice",

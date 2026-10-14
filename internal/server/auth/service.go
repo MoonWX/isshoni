@@ -25,10 +25,10 @@ import (
 // (session.go), login and logout (login.go) and setup (setup.go). README S42 filled in the invites (invite.go),
 // registration and the approval queue (register.go), and added UpdateSettings (settings.go). README S58 filled in
 // self-service (selfservice.go) on the revocation table of 03 §7.7 (revoke.go). README S64 filled in the admin's
-// user calls (admin.go) and the password resets (reset.go). The methods still declared below come with the later
-// auth slices (03 §18 slice 13: the janitor; slice 15, M2: the device flow). Until then each one with an error
-// result returns notImplemented(method): an error that names the method and wraps *api.Error{internal}, so an HTTP
-// handler that calls it answers 500 internal (api has no not_implemented code).
+// user calls (admin.go) and the password resets (reset.go), and README S70 the janitor (janitor.go). The methods
+// still declared below come with the device flow (03 §18 slice 15, M2). Until then each one returns
+// notImplemented(method): an error that names the method and wraps *api.Error{internal}, so an HTTP handler that
+// calls it answers 500 internal (api has no not_implemented code).
 //
 // All service errors are *api.Error (03 §12.2) carrying a stable code, so httpapi maps them to statuses in one
 // table: an unexpected failure (the store, a cancelled context) wraps both its cause and *api.Error{internal}
@@ -118,6 +118,9 @@ type Service struct {
 
 	// settingsMu serializes UpdateSettings, so that each call sees exactly its own change (settings.go).
 	settingsMu sync.Mutex
+
+	// prune is the janitor's call (janitor.go): db.Prune. Tests of the schedule wrap it to see each run.
+	prune func(ctx context.Context, now time.Time) (store.PruneStats, error)
 }
 
 // New builds the service (03 §7.13): it validates the keys and the origins, computes the dummy hash, then checks the
@@ -181,6 +184,7 @@ func New(ctx context.Context, db *store.DB, o Options) (*Service, error) {
 		csrf:     csrf,
 		cookie:   cookieFor(primary),
 		sessions: newSessionCache(),
+		prune:    db.Prune,
 	}
 	rotated, err := s.syncKeyFingerprints(ctx)
 	if err != nil {
@@ -502,12 +506,8 @@ type UserChange struct {
 }
 
 // ---- maintenance (03 §4.7) ----
-
-// RunJanitor prunes expired rows on its schedule and blocks until ctx is done. Not implemented yet: it prunes
-// nothing, and only waits for ctx.
-func (s *Service) RunJanitor(ctx context.Context) {
-	<-ctx.Done()
-}
+//
+// RunJanitor is in janitor.go.
 
 // ---- later (M2) ----
 //

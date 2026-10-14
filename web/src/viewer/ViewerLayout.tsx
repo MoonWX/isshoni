@@ -11,6 +11,11 @@
 // Below 1024 px, a window too low for a 16:9 stage and the strip gets a lower stage, down to the row of its controls:
 // the strip keeps its room.
 //
+// The list is newest first, so the share that leaves the stage for a newer one comes in at its start. A list that
+// was at its start stays there (README S72): the browser would re-snap the strip to the tile it was snapped to
+// before, and the share the friend just watched would be out of view, with its video turned off (05 §12.4). A list
+// the user scrolled keeps the tile they scrolled to.
+//
 // It is a view of viewerStore: RoomSession gives the store each room.state (syncRoom), and a pick on a tile goes
 // back to it (focusShare), which holds that share on the stage until it ends (05 §12.2). The stage and the tiles
 // bring their own controls: the sound (the speaker button of a tile, mute and volume on the stage, 05 §12.3), the
@@ -32,6 +37,8 @@ import {
   useContext,
   useEffect,
   useEffectEvent,
+  useLayoutEffect,
+  useRef,
   useState,
   useSyncExternalStore,
   type ReactNode,
@@ -79,6 +86,44 @@ function useMediaQuery(query: string): boolean {
 /** The share of the tile an element is in; null outside the tiles. */
 function tileShareId(el: Element | null): string | null {
   return el?.closest('li[data-share-id]')?.getAttribute('data-share-id') ?? null;
+}
+
+/** Whether a scrolled element is at its start: the strip's left end, the column's top. */
+function atStart(el: Element): boolean {
+  // The absolute value: scrollLeft counts down from 0 in a right-to-left list.
+  return Math.abs(el.scrollLeft) < 1 && el.scrollTop < 1;
+}
+
+/**
+ * Keeps the list of tiles at its start while the tiles change, when it was there (README S72). Returns the ref for
+ * the list; `order` is the tiles' ids in order.
+ */
+function useListStart(order: string): (el: HTMLUListElement | null) => (() => void) | undefined {
+  const list = useRef<HTMLUListElement | null>(null);
+  /** The list was at its start when the user last scrolled it; a new list starts there. */
+  const wasAtStart = useRef(true);
+  const ref = useCallback((el: HTMLUListElement | null) => {
+    list.current = el;
+    if (el === null) return undefined;
+    wasAtStart.current = true;
+    const onScroll = (): void => {
+      wasAtStart.current = atStart(el);
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      el.removeEventListener('scroll', onScroll);
+      list.current = null;
+    };
+  }, []);
+  // After the tiles changed, before the browser paints. Reading the offset lays the list out, and a browser that
+  // re-snaps a strip to its old tile does it then; going back to the start makes the first tile the snapped one.
+  useLayoutEffect(() => {
+    const el = list.current;
+    if (el === null || !wasAtStart.current || order === '' || atStart(el)) return;
+    el.scrollLeft = 0;
+    el.scrollTop = 0;
+  }, [order]);
+  return ref;
 }
 
 /** Whether the element has the focus because of the keyboard (the browser draws its focus ring). */
@@ -150,6 +195,7 @@ export function ViewerLayout({
   const inSheet = showOthers && phoneLandscape;
   // One tab stop for the list: the tile that had the focus, else the first.
   const tabStopId = others.some((s) => s.id === rovingId) ? rovingId : (others[0]?.id ?? null);
+  const listRef = useListStart(others.map((s) => s.id).join(' '));
 
   // The sheet goes away with what it lists (fullscreen, a rotated phone, the last other share ending), and stays
   // closed when the list comes back. Adjusted while rendering, so no frame shows a stale sheet.
@@ -243,7 +289,12 @@ export function ViewerLayout({
   }, [root]);
 
   const tiles = (
-    <ul className={inSheet ? styles.sheetList : styles.others} aria-label={t('viewer.shares')} data-viewer-tiles="">
+    <ul
+      ref={listRef}
+      className={inSheet ? styles.sheetList : styles.others}
+      aria-label={t('viewer.shares')}
+      data-viewer-tiles=""
+    >
       {others.map((share) => (
         <Tile
           key={share.id}

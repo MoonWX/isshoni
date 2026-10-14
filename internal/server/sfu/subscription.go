@@ -21,10 +21,15 @@ type Subscription struct {
 	reqAudio bool
 	// capQ and capReason are the server's cap on the video (02 §10.1), set by capSubscription: while capReason isn't
 	// "", the subscription gets min(reqVideo, capQ), and capReason is why when that is less than the client asked
-	// for. Nothing caps yet: the downlink allocator (README S84) will with SubReasonBandwidth, the codec state (S69)
-	// with SubReasonCodecMismatch and SubReasonDecoderUnavailable.
+	// for. The downlink allocator (README S84) will set it, with SubReasonBandwidth.
 	capQ      Quality
 	capReason SubReason
+	// codec is the cap the viewer's decoders put on the video (02 §8.5, Conn.refreshCodec):
+	// SubReasonDecoderUnavailable or SubReasonDecoderFailed while the viewer can't decode H.264, and then the
+	// subscription gets no video, whatever capQ says; "" otherwise. A stream in a profile the viewer has no payload
+	// type for is no cap: the DownTrack goes on waiting for a keyframe it can take, and only the reason says
+	// codec_mismatch (DownTrack.mismatched).
+	codec SubReason
 	// told is what the client last heard of the subscription (report). A new subscription forwards nothing, without
 	// a reason, and the client knows that without being told.
 	told subState
@@ -99,13 +104,24 @@ func shortfall(requested, allowed Quality, capReason SubReason, present uint32) 
 // tracks returns the subscription's DownTracks, video first.
 func (s *Subscription) tracks() [2]*DownTrack { return [2]*DownTrack{s.video, s.audio} }
 
-// allowed returns the video quality the subscription may get: the client's request under the server's cap
-// (02 §10.1: effective = min(requested, cap)).
+// allowed returns the video quality the subscription may get: the client's request under the server's caps
+// (02 §10.1: effective = min(requested, cap)), nothing while the viewer's decoders can't take the video.
 func (s *Subscription) allowed() Quality {
-	if s.capReason != SubReasonNone {
+	switch {
+	case s.codec != SubReasonNone:
+		return QualityOff
+	case s.capReason != SubReasonNone:
 		return min(s.reqVideo, s.capQ)
 	}
 	return s.reqVideo
+}
+
+// limitReason is why allowed is below the request, when it is: the decoders' cap first, it allows nothing.
+func (s *Subscription) limitReason() SubReason {
+	if s.codec != SubReasonNone {
+		return s.codec
+	}
+	return s.capReason
 }
 
 // apply makes the DownTracks follow what the client asked for (02 §10.1): the video DownTrack gets the requested
@@ -122,19 +138,25 @@ func (s *Subscription) apply() {
 }
 
 // state returns what the subscription gets now: the quality of the video layer forwarded, whether audio flows, and,
-// while the video is less than the client asked for, the reason (shortfall).
+// while the video is less than the client asked for, the reason: the server's caps first, then a stream in a profile
+// the viewer negotiated no payload type for (codec_mismatch, 02 §8.3), then what the share's layers lack (shortfall).
 func (s *Subscription) state() subState {
 	st := subState{forwarded: s.video.forwarded(), audio: s.audio.forwarded() != QualityOff}
 	if st.forwarded < s.reqVideo {
-		st.reason = shortfall(s.reqVideo, s.allowed(), s.capReason, s.share.present())
+		allowed := s.allowed()
+		if allowed >= s.reqVideo && s.video.mismatched() {
+			st.reason = SubReasonCodecMismatch
+		} else {
+			st.reason = shortfall(s.reqVideo, allowed, s.limitReason(), s.share.present())
+		}
 	}
 	return st
 }
 
 // capSubscription sets the server's cap on a subscription's video, or lifts it (reason ""), and applies it
 // (02 §10.1): the client's request stays, the subscription gets at most q, and the client hears why once it gets less
-// than it asked for. It runs on the Conn's actor. Its callers come with the downlink allocator (README S84) and the
-// codec state (S69).
+// than it asked for. It runs on the Conn's actor. Its caller comes with the downlink allocator (README S84); the
+// viewer's decoders have a cap of their own (Subscription.codec, Conn.refreshCodec).
 func (c *Conn) capSubscription(sub *Subscription, q Quality, reason SubReason) {
 	sub.capQ, sub.capReason = q, reason
 	sub.apply()
@@ -294,6 +316,9 @@ func (c *Conn) updateSubscriptions(items []SubscriptionUpdate) ([]error, error) 
 		if applied {
 			c.rebuildClosedSubForEvent("a subscription changed")
 		}
+	case created && c.codec.stale:
+		// The viewer gained H.264 after this PC was negotiated: a new one picks up the decoder (02 §8.5).
+		c.codecRebuild("the sub PC predates the viewer's decoders")
 	case created:
 		c.subChanged()
 	}
@@ -303,7 +328,9 @@ func (c *Conn) updateSubscriptions(items []SubscriptionUpdate) ([]error, error) 
 // subscription returns the Conn's subscription to a share, creating it (and the Conn's first sub PC) when it is new.
 // A new subscription's DownTracks are paused, on the share's fan-out lists and on the sub PC, with their writers
 // running. While the sub PC is closed they are on no PC: the PC that rebuildSub builds takes them, with all the
-// others.
+// others. A viewer without H.264 gets the audio DownTrack on its sub PC and not the video one (02 §8.5): the
+// subscription starts with the decoders' cap (Subscription.codec), and the rebuild that follows the viewer's new
+// decoder puts the video on.
 func (c *Conn) subscription(id ShareID) (sub *Subscription, created bool, err error) {
 	if sub := c.subs[id]; sub != nil {
 		return sub, false, nil
@@ -319,7 +346,7 @@ func (c *Conn) subscription(id ShareID) (sub *Subscription, created bool, err er
 	if err != nil {
 		return nil, false, err
 	}
-	sub = &Subscription{conn: c, share: sh}
+	sub = &Subscription{conn: c, share: sh, codec: c.decoderReason()}
 	sub.video = newDownTrack(sub, webrtc.RTPCodecTypeVideo)
 	sub.audio = newDownTrack(sub, webrtc.RTPCodecTypeAudio)
 	// The share's lists first: they refuse a share that ended since the lookup, before the PC gets transceivers.
@@ -331,6 +358,9 @@ func (c *Conn) subscription(id ShareID) (sub *Subscription, created bool, err er
 	}
 	if !pc.closed {
 		for _, dt := range sub.tracks() {
+			if !c.carries(dt) {
+				continue
+			}
 			if err := pc.addTrack(dt, c.log); err != nil {
 				c.log.Warn("DownTrack not added to the sub PC", "share_id", string(id), "err", err)
 				sub.detach()

@@ -978,6 +978,24 @@ func FuzzSDPCheck(f *testing.F) {
 		if len(raw) <= maxPubOfferBytes {
 			_, _ = setOpusAnswerParams(raw, map[string]int{"0": 1, "1": 256000})
 		}
+		// The codec filter's order (Conn.filterCodecs) takes what the list has, each codec once, whatever the
+		// m-section's formats are.
+		if desc, err := parseSDP(raw); err == nil {
+			list := []webrtc.RTPCodecParameters{h264Param(118, "64001f"), rtxParam(119, 118), h264Param(102, "42001f"),
+				h264Param(0, "42e01f")}
+			for _, md := range desc.MediaDescriptions {
+				got := inOfferOrder(list, md)
+				seen := map[webrtc.PayloadType]bool{}
+				for _, c := range got {
+					if seen[c.PayloadType] || !slices.ContainsFunc(list, func(l webrtc.RTPCodecParameters) bool {
+						return l.PayloadType == c.PayloadType
+					}) {
+						t.Fatalf("inOfferOrder gave %v for formats %v", got, md.MediaName.Formats)
+					}
+					seen[c.PayloadType] = true
+				}
+			}
+		}
 	})
 }
 
@@ -1209,4 +1227,113 @@ func guardedRIDs(kind webrtc.RTPCodecType, ids []string) bool {
 		}
 	}
 	return true
+}
+
+// videoFormats returns the formats of an SDP's first video m-line.
+func videoFormats(t *testing.T, raw string) []string {
+	t.Helper()
+	desc, err := parseSDP(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, md := range desc.MediaDescriptions {
+		if mediaKind(md) == video {
+			return md.MediaName.Formats
+		}
+	}
+	t.Fatal("no video m-line")
+	return nil
+}
+
+// TestPubAnswerCodecFilter is step 3 of 02 §8.4 on Chrome's offer, through a Conn: the answer's video holds the
+// profiles the room's codec policy allows, with their RTX, in the order of the offer it answers. A re-offer that puts
+// the hinted profile first gets it first; when the policy goes back to high, a re-offer gets every profile again,
+// although the transceiver's codec preferences were filtered before. An offer without an allowed profile is
+// answered with what it has.
+func TestPubAnswerCodecFilter(t *testing.T) {
+	s, _ := newTestSFU(t)
+	ctx := testCtx(t)
+	c, _ := joinCaps(t, s, "alice", "c-alice", RoleFull, ProfileHigh)
+	startShare(t, c, shareA)
+	chrome := readSDP(t, "sdp/chrome154-pub-offer.sdp")
+	offer := func(neg uint32, raw string) []string {
+		t.Helper()
+		answer, err := c.HandleOffer(ctx, PCPub, 1, neg, raw, tracksA)
+		if err != nil {
+			t.Fatalf("offer %d: %v", neg, err)
+		}
+		return videoFormats(t, answer)
+	}
+	all := []string{"118", "119", "102", "103", "108", "109", "116", "117"} // the offer's order: High first
+	if got := offer(1, chrome); !slices.Equal(got, all) {
+		t.Errorf("under high: %v, want %v", got, all)
+	}
+
+	// A viewer that decodes only Constrained Baseline: cb, and the same offer again gets only 4200 and 42e0.
+	ff, _ := joinCaps(t, s, "bob", "c-firefox", RoleViewer, ProfileConstrainedBaseline)
+	if got, want := offer(2, chrome), []string{"102", "103", "108", "109"}; !slices.Equal(got, want) {
+		t.Errorf("under cb: %v, want %v", got, want)
+	}
+	// The sharer follows the hint: 42e0 first.
+	hinted := edit(t, chrome, "SAVPF 118 119 102 103 108 109 116 117", "SAVPF 108 109 118 119 102 103 116 117")
+	if got, want := offer(3, hinted), []string{"108", "109", "102", "103"}; !slices.Equal(got, want) {
+		t.Errorf("under cb, 42e0 first: %v, want %v", got, want)
+	}
+
+	// Back to high a minute after the Firefox viewer left: every profile again, in the offer's order.
+	ff.Close(EndReasonLeft)
+	waitDone(t, ff)
+	s.AdvanceCodecClock(codecPolicyHold)
+	s.CheckCodecPolicies()
+	if p := s.CodecPolicy("lounge"); p != ProfileHigh {
+		t.Fatalf("policy %s, want high", p)
+	}
+	if got, want := offer(4, hinted), []string{"108", "109", "118", "119", "102", "103", "116", "117"}; !slices.Equal(got, want) {
+		t.Errorf("high again: %v, want %v", got, want)
+	}
+
+	// A sharer that offers only High while the room needs cb: answered with High, the only thing it can send.
+	joinCaps(t, s, "carol", "c-firefox-2", RoleViewer, ProfileConstrainedBaseline)
+	native, _ := joinCaps(t, s, "dave", "c-native", RoleFull, ProfileHigh)
+	startShare(t, native, shareB)
+	highOnly := edit(t, chrome, "SAVPF 118 119 102 103 108 109 116 117", "SAVPF 118 119")
+	answer, err := native.HandleOffer(ctx, PCPub, 1, 1, highOnly,
+		[]TrackBinding{{MID: "0", Share: shareB, Kind: video}, {MID: "1", Share: shareB, Kind: audio}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := videoFormats(t, answer), []string{"118", "119"}; !slices.Equal(got, want) {
+		t.Errorf("High alone under cb: %v, want %v", got, want)
+	}
+}
+
+// TestInOfferOrder: codecs follow the offer's format order, matched by payload type; what either side lacks is
+// left out.
+func TestInOfferOrder(t *testing.T) {
+	list := []webrtc.RTPCodecParameters{h264Param(102, "42001f"), rtxParam(103, 102), h264Param(108, "42e01f"),
+		rtxParam(109, 108), h264Param(118, "64001f")}
+	pts := func(cs []webrtc.RTPCodecParameters) []webrtc.PayloadType {
+		var out []webrtc.PayloadType
+		for _, c := range cs {
+			out = append(out, c.PayloadType)
+		}
+		return out
+	}
+	for _, tc := range []struct {
+		mline string
+		want  []webrtc.PayloadType
+	}{
+		{"m=video 9 UDP/TLS/RTP/SAVPF 118 102 103 108 109", []webrtc.PayloadType{118, 102, 103, 108, 109}},
+		{"m=video 9 UDP/TLS/RTP/SAVPF 108 109 102 103", []webrtc.PayloadType{108, 109, 102, 103}},
+		{"m=video 9 UDP/TLS/RTP/SAVPF 96 108 x 108", []webrtc.PayloadType{108}},
+		{"m=video 9 UDP/TLS/RTP/SAVPF 96", nil},
+	} {
+		desc, err := parseSDP(crlf("v=0\no=- 1 1 IN IP4 0.0.0.0\ns=-\nt=0 0\n" + tc.mline + "\na=mid:0\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := pts(inOfferOrder(list, desc.MediaDescriptions[0])); !slices.Equal(got, tc.want) {
+			t.Errorf("%s: %v, want %v", tc.mline, got, tc.want)
+		}
+	}
 }

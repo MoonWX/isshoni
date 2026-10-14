@@ -18,7 +18,7 @@
 // error logs its cause instead. URLs, queries and bodies are never logged.
 //
 // The API part (api.go, deps.go, info.go, auth.go, me.go, account.go, rooms.go, invites.go, push.go, admin_users.go,
-// admin_rooms.go, admin_settings.go; 03 §12):
+// admin_rooms.go, admin_settings.go, admin_audit.go, accounts.go; 03 §12):
 //   - API: 03's REST API, mounted by the router at /api/v1/. Its chain (03 §12.1): body limit (16 KiB for auth and
 //     device endpoints, 64 KiB elsewhere) → no-store on every response → route lookup (JSON 404 not_found, 405
 //     method_not_allowed with Allow; a matched route reports its own pattern to the RouteObserver) → any
@@ -71,8 +71,12 @@
 //     rules, the password an admin types again, the revocation rows and the admin alerts. The handlers notify
 //     {Admins}: admin.users, and after a request that names a username or a role also call Signal.UserChanged
 //     and notify {UserID}: me.
-//
-// The audit log (03 §12.3 #42) and DashboardAccounts come with the later account slices.
+//   - The audit log and the dashboard's accounts (README S70; 03 §10, §12.4.8; admin_audit.go, accounts.go):
+//     GET /api/v1/admin/audit, the audit rows newest first, filtered by an action prefix, the acting user and the
+//     target, and paged by the id cursor (?before, with nextBefore null on the last page); and
+//     API.DashboardAccounts, the accounts object that 04's GET /api/v1/admin/dashboard embeds: the accounts by
+//     status, the active admins, invites and sessions, the linked devices, the registration mode and the security
+//     events of the last 7 days. Both read only; the rows are written by the changes they describe.
 //
 // Imports (04 §2): config, logx, version, store, auth and internal/protocol(/api); never ops, push, netx, tlsmgr,
 // signal, sfu or sfuplane, which reach this package through small interfaces declared here (RouteObserver, Signal,

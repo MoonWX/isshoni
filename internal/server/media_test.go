@@ -93,12 +93,14 @@ func TestShutdownOrder(t *testing.T) {
 		step              string
 		signal, mediaOpen bool // the hub takes connections; the SFU does
 		socket            bool // the media socket is bound
+		push              bool // the push service takes work
 	}
 	var mu sync.Mutex
 	var got []moment
 	s.SetShutdownStepHook(func(step string) {
 		_, checks := s.Health().Ready()
-		m := moment{step: step, signal: checks["signal"] == "ok", mediaOpen: media.Ready() == nil, socket: udpBound(udp)}
+		m := moment{step: step, signal: checks["signal"] == "ok", mediaOpen: media.Ready() == nil, socket: udpBound(udp),
+			push: s.PushTakesWork()}
 		if (checks["media"] == "ok") != m.mediaOpen {
 			t.Errorf("before %q: the media check says %q, the SFU is open: %v", step, checks["media"], m.mediaOpen)
 		}
@@ -109,11 +111,14 @@ func TestShutdownOrder(t *testing.T) {
 	srv.Stop(t)
 
 	want := []moment{
-		{step: "signaling", signal: true, mediaOpen: true, socket: true},
-		{step: "sfu", mediaOpen: true, socket: true}, // the hub is down, the SFU and its sockets are not
-		{step: "transport", socket: true},            // the SFU is closed; its sockets outlived it
-		{step: "http"},                               // media is gone before the HTTP servers stop
+		{step: "signaling", signal: true, mediaOpen: true, socket: true, push: true},
+		{step: "sfu", mediaOpen: true, socket: true, push: true}, // the hub is down, the SFU and its sockets are not
+		{step: "transport", socket: true, push: true},            // the SFU is closed; its sockets outlived it
+		{step: "http", push: true},                               // media is gone before the HTTP servers stop
+		// The hub and the REST API are down: the push service has stopped taking work, and drains alongside the TLS
+		// manager's shutdown; the "push" step waits for what is left of that drain.
 		{step: "tls"},
+		{step: "push"},
 		{step: "admin socket"},
 		{step: "store"},
 	}

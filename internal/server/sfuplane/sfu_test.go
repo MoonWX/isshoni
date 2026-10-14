@@ -29,8 +29,8 @@ import (
 // with a Pion publisher and a Pion viewer on loopback. They check what the tables with the fake Conn can't: that
 // the real API takes what the adapter passes, and that the real errors and events come out as 01 §15.4 says.
 //
-// They assert only what holds for every slice of the SFU: a method that a later slice implements (README S69)
-// may return an error today and nil tomorrow, and the SFU may send more events than it does now.
+// They assert only what holds for every slice of the SFU: every Conn method is built since README S69 (only
+// SFU.Probe waits for README S76), but the SFU may send more events than it does now.
 
 // loopbackOnly is a netx.InterfaceLister with only 127.0.0.1, so the Transport doesn't depend on the host.
 type loopbackOnly struct{}
@@ -517,15 +517,10 @@ func TestRealSFU(t *testing.T) {
 		t.Errorf("share_limit params = %v, want the SFU's limit of %d per user", e.Params, sharesPerParticipant)
 	}
 
-	// Nothing so far is the adapter's or the SFU's bug, so nothing was logged as one. (A method of a later slice is
-	// logged as an internal error until its slice lands: that line names its call. README S57 has built RestartICE,
-	// ResetPC and ClosePC, so a line about one of them is a failure now.)
+	// Nothing so far is the adapter's or the SFU's bug, so nothing was logged as one. (Every Conn method is built:
+	// README S57 built RestartICE, ResetPC and ClosePC, and README S69 SetDecodeCaps, so any such line is a failure.)
 	for _, l := range atLeast(rp.logs.take(), slog.LevelWarn) {
-		switch l.Attrs["call"] {
-		case "SetDecodeCaps":
-		default:
-			t.Errorf("logged %+v", l)
-		}
+		t.Errorf("logged %+v", l)
 	}
 
 	// ---- EndShare: Conn.StopShare ----

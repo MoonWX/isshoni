@@ -15,6 +15,7 @@ describe('viewerStore: defaults', () => {
       focusedShareId: null,
       focusMode: 'auto',
       audibleShareId: null,
+      soundDue: null,
       ended: [],
       inRoom: false,
       audio: 'locked',
@@ -264,6 +265,68 @@ describe('viewerStore.syncRoom', () => {
       sync(a2());
       expect(store.getState()).toMatchObject({ focusedShareId: 's_a2', focusMode: 'auto' });
     });
+  });
+
+  it('never makes a share without sound the one heard (README S72)', () => {
+    const store = createViewerStore();
+    const withSound = shareInfo('s_a', 'u_bea', 1);
+    const quiet = shareInfo('s_q', 'u_cy', 2, { audio: false });
+    store.getState().syncRoom(room(withSound, quiet), SELF);
+    // The newest share takes the stage, and nothing is heard.
+    expect(store.getState()).toMatchObject({ focusedShareId: 's_q', audibleShareId: null });
+    expect(store.getState().shares.map((s) => [s.id, s.audio])).toEqual([
+      ['s_q', false],
+      ['s_a', true],
+    ]);
+    // No speaker button can make it heard; the other share's can, and pressed again it gives the sound back to a
+    // stage that has none.
+    store.getState().setAudible('s_q');
+    expect(store.getState().audibleShareId).toBeNull();
+    store.getState().toggleAudible('s_a');
+    expect(store.getState().audibleShareId).toBe('s_a');
+    store.getState().toggleAudible('s_a');
+    expect(store.getState().audibleShareId).toBeNull();
+
+    // Its audio track arrives after all (ShareInfo.audio, once live, says whether one did): now it is heard.
+    store.getState().syncRoom(room(withSound, { ...quiet, audio: true }), SELF);
+    expect(store.getState()).toMatchObject({ focusedShareId: 's_q', audibleShareId: 's_q' });
+    expect(store.getState().shares[0]?.audio).toBe(true);
+    // And when it loses it, nothing is.
+    store.getState().syncRoom(room(withSound, quiet), SELF);
+    expect(store.getState()).toMatchObject({ focusedShareId: 's_q', audibleShareId: null });
+  });
+
+  it('gives the sound back to a share that was without it for a while: its sharer’s PC was rebuilt', () => {
+    // ShareInfo.audio is what the server receives now (01 §8.5): false while a stalled share has no audio track.
+    const store = createViewerStore();
+    const a = shareInfo('s_a', 'u_bea', 1);
+    const b = shareInfo('s_b', 'u_cy', 2);
+    const sync = (...shares: ShareInfo[]) => {
+      store.getState().syncRoom(room(...shares), SELF);
+    };
+    sync(a, b);
+    // Bea's speaker button: her share is heard, Cy's is on the stage.
+    store.getState().toggleAudible('s_a');
+    sync({ ...a, status: 'stalled', audio: false }, b);
+    expect(store.getState()).toMatchObject({ focusedShareId: 's_b', audibleShareId: 's_b', soundDue: 's_a' });
+    sync({ ...a, status: 'stalled', audio: true }, b);
+    expect(store.getState()).toMatchObject({ focusedShareId: 's_b', audibleShareId: 's_a', soundDue: null });
+
+    // The speaker button pressed meanwhile is the user's choice, and it stays.
+    sync({ ...a, audio: false }, b);
+    expect(store.getState()).toMatchObject({ audibleShareId: 's_b', soundDue: 's_a' });
+    store.getState().setAudible('s_b');
+    expect(store.getState()).toMatchObject({ audibleShareId: 's_b', soundDue: null });
+    sync(a, b);
+    expect(store.getState()).toMatchObject({ focusedShareId: 's_b', audibleShareId: 's_b', soundDue: null });
+
+    // Pressed again on a tile while the stage is without sound: the stage gets the sound when its audio is back.
+    store.getState().toggleAudible('s_a');
+    sync(a, { ...b, status: 'stalled', audio: false });
+    store.getState().toggleAudible('s_a');
+    expect(store.getState()).toMatchObject({ focusedShareId: 's_b', audibleShareId: null, soundDue: 's_b' });
+    sync(a, b);
+    expect(store.getState()).toMatchObject({ focusedShareId: 's_b', audibleShareId: 's_b', soundDue: null });
   });
 
   it('keeps the entry of an unchanged share and replaces the one whose details changed', () => {
