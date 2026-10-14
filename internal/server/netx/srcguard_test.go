@@ -781,10 +781,22 @@ func TestSourceGuardTCPAgent(t *testing.T) {
 					_ = c.Close()
 				}
 			}()
+			// Each source must be a new address. Linux can give two connections to different ports of the server the
+			// same local port, and the guard rightly counts that address once, so a dial that reuses the address of an
+			// admitted source is dropped and made again.
+			admitted := map[string]bool{}
 			for i := range floodSources {
-				c, err := d.DialContext(context.Background(), "tcp4", ports[i%len(ports)])
-				if err != nil {
-					t.Fatalf("source %d: %v", i+1, err)
+				var c net.Conn
+				for {
+					var err error
+					c, err = d.DialContext(context.Background(), "tcp4", ports[i%len(ports)])
+					if err != nil {
+						t.Fatalf("source %d: %v", i+1, err)
+					}
+					if !admitted[c.LocalAddr().String()] {
+						break
+					}
+					_ = c.Close()
 				}
 				req := bindingRequest(t, ufrag, pwd)
 				if err := writeFrame(c, req.Raw); err != nil {
@@ -792,6 +804,7 @@ func TestSourceGuardTCPAgent(t *testing.T) {
 					t.Fatalf("source %d: %v", i+1, err)
 				}
 				if i < maxSourcesPerUfrag {
+					admitted[c.LocalAddr().String()] = true
 					open = append(open, c)
 					if err := awaitTCPResponse(c, req); err != nil {
 						t.Fatalf("source %d: no Binding response: %v", i+1, err)
