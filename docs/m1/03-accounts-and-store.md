@@ -1939,7 +1939,7 @@ the rules live in the handlers, not in `auth.Service`: rooms have no credentials
   one with a skin tone and a flag of two regional indicators pass; the red heart (U+2764 U+FE0F), the keycaps and
   the profession and family sequences are `invalid`. That is the profile this section names, taken as it is;
   letting those emoji in would be a change to this rule, and is not decided.
-  - **Open, for the owner** (from README S53's write-back; still open after groups 7, 8, 9, 10 and 11; §19). "Emoji
+  - **Open, for the owner** (from README S53's write-back; still open after groups 7, 8, 9, 10, 11 and 12; §19). "Emoji
     are allowed" above reads as every emoji; the profile lets in only those that need neither U+FE0F nor a zero-width
     joiner.
     The two ways to close the gap are to keep the profile and say so in the rule (an admin who types
@@ -3382,7 +3382,7 @@ their tokens back (R2: the `password-change` bucket of §7.3); and one session c
 subscriptions, so one `POST /push/test` reached 10 endpoints (R6, with 04's half in 04 §14.4–§14.5: one
 subscription per web session, §12.4.6, `DeleteSessionPushSubscriptionsExcept` in §6).
 
-**Open, for the owner** (README §6; still open after groups 8, 9, 10 and 11):
+**Open, for the owner** (README §6; still open after groups 8, 9, 10, 11 and 12):
 - **Room names and the emoji that need U+FE0F or a zero-width joiner** (§8). The rule says emoji are allowed;
   the PRECIS profile it names refuses the variation selector U+FE0F and a joiner between emoji, so the red
   heart, the keycaps and the profession and family sequences are `invalid` in a room name, while an emoji of one

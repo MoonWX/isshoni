@@ -1291,9 +1291,19 @@ actionlint 1.<latest>
 ```
 
 - `<latest>` means: pin the exact latest patch when slice S1 lands. Versions are bumped by hand, monthly, in one PR;
-  Dependabot can't read `.tool-versions`. The same PR bumps the two pins that follow them and that Dependabot doesn't
-  read either (README §6 "Decided after group 9" (3)): `tools/goreleaser/go.mod` with the goreleaser line (below),
-  and the version and digest of the Dockerfile's `# syntax=` line (§6.1).
+  Dependabot can't read `.tool-versions`. The same PR bumps the pins that follow them and that Dependabot doesn't
+  read either (README §6 "Decided after group 9" (3), "Decided after group 12" (8)):
+  - `tools/goreleaser/go.mod` with the goreleaser line (below);
+  - the version and digest of the Dockerfile's `# syntax=` line (§6.1);
+  - the image digests inside workflows, which no Dependabot ecosystem reads (its `docker` ecosystem reads
+    Dockerfiles, its `github-actions` ecosystem `uses:` lines): `release.yml`'s `verify` matrix bases
+    (`docker.io/library/debian@sha256:…` and `ubuntu@sha256:…`, the tag in a comment, 4.13) and the BuildKit image
+    of `build`'s buildx driver (`moby/buildkit:v<x>@sha256:…`, the release that `buildx-stable-1` points to, 9.3;
+    README F09), each to the digest of its multi-arch index that `docker buildx imagetools inspect` prints; and
+    the Pebble and `pebble-challtestsrv` images of `ci.yml`'s `acme` job and of `deploy/test/vm/vm-test.sh`
+    (README F13), which pin the same digests and are bumped together.
+
+  `.github/dependabot.yml`'s "Not covered here" comment names the same list.
 - `go.mod` has `go 1.26.0` and `toolchain go1.27.2`, the `.tool-versions` patch (the plan: language version 1.26,
   newest toolchain). The go line carries a patch because `golang.org/x/text`, `golang.org/x/crypto` and
   `modernc.org/sqlite` require `go 1.26.0`, so `go get` and `go mod tidy` write it that way; the language version is
@@ -1364,7 +1374,7 @@ vars:
 | `test` | `test:go`, `test:web`, `test:sh` | |
 | `test:go` | `CGO_ENABLED=1 go test -race -count=1 -timeout 15m ./...` | the race detector needs cgo; the shipped binary stays `CGO_ENABLED=0` |
 | `test:web` | `npm --prefix web test -- --run`, then `node --test scripts/licenses.test.mjs` in `web/` | Vitest; the license script's tests run under Node's test runner (CI runs them in the `licenses` job) |
-| `test:sh` | `deploy/test/install_unit.sh` under dash, `bash --posix` and busybox | |
+| `test:sh` | `deploy/test/install_unit.sh` under dash, `bash --posix` and busybox, and after it under each shell `deploy/test/vm/vm-test.sh -h`, the VM harness's start-up check that `distro-test.sh` still has every name it takes (4.13; added by the group 12 integration, README F13's review) | Outside CI a shell that isn't installed is skipped with a note (macOS has no busybox); in CI, where `lint-deploy` installs busybox, a missing shell fails the task. The `vm-test.sh -h` check needs no VM, Linux or network, so a rename in `distro-test.sh` fails `lint-deploy` on the PR, not only the nightly. README F15 (group 13) adds the release draft check's test here |
 | `lint` | `lint:go`, `lint:web`, `lint:sh`, `lint:actions`, `lint:keys`, `lint:pins`, `lint:unit` | |
 | `lint:go` | `golangci-lint run`, `go mod tidy -diff`, `GOOS=darwin go vet ./...`, `GOOS=windows go vet ./...` | |
 | `lint:web` | `npm --prefix web run lint && npm --prefix web run typecheck` | |
@@ -1681,7 +1691,10 @@ same holds for git and PulseAudio on runners. The "no GPL" rule covers code in t
   `-r` (the `vm-release` job's releases) and `-o` (the matrix row's parts). S83 first wrote it inline in that step,
   sourcing `distro-test.sh` without its last line, because it could change only `nightly.yml` (README §6 "Decided
   after group 11" (5)); README F13 moved it into the script, behind `distro-test.sh`'s sourced guard, and
-  `lint:sh` covers it. Pebble and challtestsrv start inside the script, not in a step of their own.
+  `lint:sh` covers it. Pebble and challtestsrv start inside the script, not in a step of their own. The job's first
+  real run is the first nightly after `m1/server-web` reaches `main`: F13 never ran the VMs of debian-13,
+  ubuntu-22.04 and ubuntu-26.04 by hand, nor any VM on x86_64 with KVM, the only way the job runs (README §6 "Owner
+  actions").
 - **`goreleaser-full` does not sign**: `goreleaser release --snapshot --clean --skip=sign` with the images and the
   SBOMs, not the plain command of the table. cosign's keyless signature would need `id-token: write` in a job that
   also runs npm, which `release.yml` keeps apart (9.3), and every night would add an entry to the public
@@ -2594,7 +2607,9 @@ rest):
 | V5 | ACME with Pebble plus `pebble-challtestsrv` on the runner. The VM uses `ISSHONI_TLS_ACME_CA` and `ISSHONI_TLS_ACME_CA_ROOT` (04's keys `tls.acme_ca`, `tls.acme_ca_root`), and challtestsrv resolves `isshoni.test` to the VM | `--domain isshoni.test --yes` is ready within 60 s; the certificate issuer is Pebble. IP mode (`--ip`) the same, if the pinned Pebble supports IP identifiers; otherwise IP mode stays on the manual release checklist |
 | V6 | `systemd-analyze security isshoni` | score ≤ the recorded value + 0.2 |
 
-**As README S83 built the VM runs** (`nightly.yml`'s `distro-vm`, 8.5), where the table leaves a choice:
+**As README S83 built the VM runs** (`nightly.yml`'s `distro-vm`, 8.5; since README F13 the script
+`deploy/test/vm/vm-test.sh`, which starts Pebble and challtestsrv for V5 itself, 4.13), where the table leaves a
+choice:
 - **V1** is the `main` part: the container scenarios C1–C6, C8–C10 and C12 in that VM, in the order of the
   container run, plus the sysctl values; C7 and C13 get a VM each, as they get a container each. In a VM, C1's two
   checks that the installer installs the OpenSSH client are skipped and labelled so: an SSH server needs the
@@ -2816,7 +2831,7 @@ Anything beyond these, such as a reload, a second tap, a re-join or a second log
 | Unit | `web/scripts/licenses.test.mjs` (Node's test runner: `task test:web` and the CI `licenses` job) | the SPDX `OR`/`AND` rules; a missing license fails; a GPL-only dev dep fails; `(MIT OR GPL-3.0)` passes; overrides apply |
 | Unit | `tools/notices` golden test on a fixture module tree | deterministic output; Apache `NOTICE` included; a non-allowlisted license fails; the Go runtime entry is present |
 | Unit | `tools/relserve` | `/latest` redirect format matches GitHub's; files served; the CA verifies |
-| Static | `lint-deploy` | shellcheck, shfmt, actionlint, `systemd-analyze verify`, the key block, `.tool-versions` = `go.mod` toolchain |
+| Static | `lint-deploy` | shellcheck, shfmt, actionlint, `systemd-analyze verify`, the key block, `.tool-versions` = `go.mod` toolchain; through `test:sh`, the VM harness's check of the names it takes from `distro-test.sh` (`vm-test.sh -h`, 7.2) |
 | Integration | distro containers C1–C13 (11.2) | install, idempotency, upgrade, downgrade refusal, tamper refusal, port conflict, re-runs after exit 7 and exit 5, uninstall, purge, backup/restore |
 | Integration | Docker smoke (11.3) | bridge and host bind 443 as designed, healthcheck, setup-url via exec, persistence, backup (a `0600` file) → restore through `exec -T` with `--yes`, an IPv6 client seen as the bridge gateway (6.4), no-volume refusal, start with no `.env` |
 | Integration | `goreleaser-check` | the asset names and archive contents of section 3 |
@@ -3018,12 +3033,13 @@ Decided after group 9 (engineering calls the owner delegated; README §6):
 
 Decided after group 10 (an engineering call the owner delegated; README §6 (1)):
 
-- **The M1 security review's finding in the release pipeline (R4) is fixed** by README F09 in group 12, where no other
-  slice touches `release.yml` or `cmd/isshoni` (README S82 has the first in group 11, S90 the second in group 13):
-  `verify` drops its write token and its privileged container from unpinned bases, and `publish` checks the draft
-  again before it publishes it (4.13, 9.3). F09 also fixes R5, which is 04's: `admin backup` without `--out` never
-  writes into a file that already exists at the default name (04 §12.3). The review was read-only, of `main` at
-  f7053dc, before the first release candidate; README §6 has its other findings and their slices.
+- **The M1 security review's finding in the release pipeline (R4) is fixed** by README F09, merged in group 12,
+  where no other slice touched `release.yml` or `cmd/isshoni` (README S82 had the first in group 11, S90 has the
+  second in group 13): `verify` has no write token and runs its container rootless from bases pinned by digest,
+  and `publish` checks the draft again before it publishes it (4.13, 9.3). F09 also fixed R5, which is 04's:
+  `admin backup` without `--out` never writes into a file that already exists at the default name (04 §12.3). The
+  review was read-only, of `main` at f7053dc, before the first release candidate; README §6 has its other findings
+  and their slices. Group 12's notes on F09 are below.
 
 Decided after group 11 (engineering calls the owner delegated; README §6 (3), (5)):
 
@@ -3036,3 +3052,21 @@ Decided after group 11 (engineering calls the owner delegated; README §6 (3), (
   to `deploy/test/vm/vm-test.sh`. The second stays: `goreleaser-full` doesn't sign (`--skip=sign`), because
   cosign's keyless signature would need an OIDC token in a job that runs npm and a public transparency-log entry
   every night, while `release.yml`'s dry run covers the signing.
+
+Decided after group 12 (an engineering call the owner delegated; README §6 (8)):
+
+- **README F09's `verify` departs from the design in three ways, which this doc now has** (4.13, 9.3). Its rootless
+  `podman run -d --systemd=always` also takes `--cap-add SYS_ADMIN` (the container's own, in its user namespace: systemd
+  needs it for the unit's sandbox, or the server refuses `/var/lib/isshoni` as not a mounted volume) and
+  `--network slirp4netns` (with pasta, the default from podman 5 on, the name `host.containers.internal` gets no address
+  that reaches the runner); `relserve` listens on every address, since slirp4netns reaches the runner's own address and
+  not its loopback; and a step first makes sure that the runner's user has a systemd user session, without which
+  rootless podman falls back to cgroupfs and systemd can't come up in the container. `sign` checks the draft's assets as
+  strictly as `publish` and uploads the files it signed, hidden ones included, as `release-signed` (with
+  `actions/upload-artifact`, GitHub's and pinned by SHA like checkout), which `verify` installs.
+- **What F09 left for later**: the release dry run on GitHub (`workflow_dispatch` with `dry_run`) is the proof that
+  the hosted runner boots systemd in a rootless container, and runs once `m1/server-web` is pushed (README §6
+  "Owner actions"); `publish`'s draft check was tested only by one-off runs taken out of the workflow, which README
+  F15 (group 13) turns into `deploy/release/check-draft.sh` with a committed test under `task test:sh`; and
+  `distro-test.sh`'s podman path lacks `--cap-add SYS_ADMIN` and the user session, which README F16 (group 13)
+  adds (4.13). The image digests that F09 and F13 pin are bumped by hand with the tool pins (7.1).
