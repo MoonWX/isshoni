@@ -108,6 +108,22 @@ describe('resumedInto', () => {
     await expect(late).resolves.toBe(false);
   });
 
+  it('false once the abort fires, or at once when it has fired', async () => {
+    const signal = new StandInSignal();
+    const ac = new AbortController();
+    const kept = resumedInto(signal, 'lounge', CAPTURE_HOLD_MS, ac.signal);
+    signal.go('connecting');
+    ac.abort();
+    await expect(kept).resolves.toBe(false);
+    expect(signal.listeners.size).toBe(0);
+    // A ready after the abort changes nothing, and the hold's timer is gone.
+    signal.go('ready', { resumed: true }, { resumed: true, roomId: 'lounge' });
+    await expect(kept).resolves.toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+
+    await expect(resumedInto(new StandInSignal(), 'lounge', CAPTURE_HOLD_MS, ac.signal)).resolves.toBe(false);
+  });
+
   it('false at once for a client that is ready (no drop to wait out), stopped, or that can’t say (no onState)', async () => {
     const ready = new StandInSignal();
     ready.state = 'ready';
@@ -185,6 +201,18 @@ describe('requestShareStart (the real SignalClient on the fake server)', () => {
     const outcome = params.catch((err: unknown) => err);
     await tick(1_000);
     expect(server.welcomes.at(-1)?.resumed).toBe(false);
+    const err = await outcome;
+    expect(isProtocolError(err) && err.code).toBe(LocalErrorCodeConnectionLost);
+    expect(starts).toEqual([START]);
+  });
+
+  it('an abort ends the wait for the resume: connection_lost at once, and nothing is sent again', async () => {
+    server.autoOpen = false;
+    plan = ['drop'];
+    const ac = new AbortController();
+    const outcome = requestShareStart(signal, 'lounge', START, log, ac.signal).catch((err: unknown) => err);
+    await tick(10_000);
+    ac.abort();
     const err = await outcome;
     expect(isProtocolError(err) && err.code).toBe(LocalErrorCodeConnectionLost);
     expect(starts).toEqual([START]);

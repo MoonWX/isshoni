@@ -13,7 +13,7 @@ import { FAKE_AUDIO_CODECS, FAKE_VIDEO_CODECS, FakeRTCPeerConnection } from '../
 import { BrowserShare, END_NOTICE_GRACE_MS, ShareEndedError } from './BrowserShare';
 import { BrowserSharing } from './BrowserSharing';
 import { CAPTURE_HOLD_MS } from './recovery';
-import { createShareStore, type ShareStore } from './shareStore';
+import { createShareStore, ShareCancelledError, type ShareStore } from './shareStore';
 import { linkShareUi, shareErrorMessage } from './shareUi';
 import { fakePick, type FakePick } from './testing/fakeCapture';
 import { FakeShareHub, lastPc, pubOffers, shareInfo, shareParams } from './testing/publish';
@@ -283,7 +283,7 @@ describe('the share across reconnects (01 §10.5, §10.6)', () => {
     expect(h.toasts()).toEqual([]);
   });
 
-  it('a resumed connection whose share the server lost meanwhile: published again on the same pub PC', async () => {
+  it('a resumed connection whose share the server lost meanwhile: published again on a new pub PC of gen 2', async () => {
     const src = await startShare();
     await goLive();
     const share = h.runtime.session.share;
@@ -301,22 +301,21 @@ describe('the share across reconnects (01 §10.5, §10.6)', () => {
     expect(shares.requests<ShareStart>('share.start').at(-1)).toMatchObject({ replaces: 's_1' });
     expect(h.runtime.session.share).toBe(share);
     expect(share?.shareId).toBe('s_2');
-    expect(FakeRTCPeerConnection.instances).toHaveLength(1);
-    expect(pc.transceivers.map((t) => t.stopped)).toEqual([true, true, false, false]);
+    // Like a rebuild (PublisherPC.republish says why not on the same PC): the server replaces its PC on gen 2.
+    expect(FakeRTCPeerConnection.instances).toHaveLength(2);
+    expect(pc.signalingState).toBe('closed');
     expect(pubOffers(h.server).at(-1)).toMatchObject({
-      gen: 1,
-      neg: 2,
+      gen: 2,
+      neg: 1,
       tracks: [
-        { mid: '2', shareId: 's_2' },
-        { mid: '3', shareId: 's_2' },
+        { mid: '0', shareId: 's_2' },
+        { mid: '1', shareId: 's_2' },
       ],
     });
     expect(store.getState().phase).toBe('reconnecting');
 
-    // The answer, and the server lists the new share as live: the PC never stopped being connected.
-    shares.answer();
-    await tick();
-    h.hub.sendState('lounge', { shares: [own('s_2')] });
+    // The answer, the new PC connects, and the server lists the new share as live.
+    await goLive('s_2');
     expect(share?.state).toBe('live');
     expect(store.getState().phase).toBe('live');
     expect(src.release).not.toHaveBeenCalled();
@@ -392,11 +391,10 @@ describe('the share across reconnects (01 §10.5, §10.6)', () => {
   it('a share.start whose answer the socket took goes again with the same ref after the resume, and the share starts', async () => {
     h.server.welcomeDefaults = { roomId: 'lounge' };
     let calls = 0;
-    h.server.handle('share.start', () => {
+    shares.onStart = () => {
       // The server makes the share, but the socket drops before its answer gets out.
       if (calls++ === 0) h.server.drop();
-      return { ok: shareParams('s_1') };
-    });
+    };
     const started = track(h.runtime.session.startShare(fakePick('window', true), { preset: 'auto', withAudio: true }));
     await tick(1000);
     expect(h.runtime.signal.welcome?.resumed).toBe(true);
@@ -408,6 +406,47 @@ describe('the share across reconnects (01 §10.5, §10.6)', () => {
     expect(h.runtime.session.share?.shareId).toBe('s_1');
     expect(pubOffers(h.server)).toHaveLength(1);
     expect(store.getState().phase).toBe('starting');
+  });
+
+  it('a capture that ends while share.start waits for the resume cancels the start at once; the copy is a stray', async () => {
+    h.server.welcomeDefaults = { roomId: 'lounge' };
+    let back: () => void = () => undefined;
+    shares.onStart = () => {
+      // The server makes s_1, and then it is out of reach before the answer gets out.
+      back = loseServer();
+    };
+    const src = fakePick('window', true);
+    const started = track(h.runtime.session.startShare(src, { preset: 'auto', withAudio: true }));
+    await tick(10_000);
+    expect(started.done).toBe(false);
+
+    // The browser's "Stop sharing": the panel has no share to stop yet, and the start doesn't wait out the hold.
+    src.stream.getVideoTracks()[0]?.end();
+    await tick();
+    expect(started.error).toBeInstanceOf(ShareCancelledError);
+    expect(h.runtime.session.share).toBeNull();
+    expect(pubOffers(h.server)).toEqual([]);
+
+    // The connection is resumed: the share the server made is this connection's stray, and the session stops it.
+    back();
+    await tick(BackoffMaxMs);
+    expect(h.runtime.signal.welcome?.resumed).toBe(true);
+    h.hub.sendState('lounge', { shares: [own('s_1', { status: 'starting' })] });
+    expect(shares.requests<ShareStop>('share.stop')).toEqual([{ shareId: 's_1' }]);
+    expect(shares.requests<ShareStart>('share.start')).toHaveLength(1);
+  });
+
+  it('…and so does one of a Share click made while the server is out of reach', async () => {
+    const back = loseServer();
+    await tick(1_000);
+    const src = fakePick('window', true);
+    const started = track(h.runtime.session.startShare(src, { preset: 'auto', withAudio: true }));
+    await tick(5_000);
+    expect(started.done).toBe(false);
+    src.stream.getVideoTracks()[0]?.end();
+    await tick();
+    expect(started.error).toBeInstanceOf(ShareCancelledError);
+    back();
   });
 
   it('…but on a new connection the start fails with connection_lost, and nothing is sent again', async () => {
@@ -430,11 +469,10 @@ describe('the share across reconnects (01 §10.5, §10.6)', () => {
     await goLive();
     const share = h.runtime.session.share;
     let calls = 0;
-    h.server.handle('share.start', () => {
+    shares.onStart = () => {
       // The re-publish's first try: the server makes s_2, and the socket drops before the answer.
       if (calls++ === 0) h.server.drop();
-      return { ok: shareParams('s_2') };
-    });
+    };
     h.server.restart();
     h.server.drop();
     await tick(600);
@@ -452,12 +490,41 @@ describe('the share across reconnects (01 §10.5, §10.6)', () => {
     expect(starts).toHaveLength(3);
     expect(starts[1]).toMatchObject({ replaces: 's_1' });
     expect(starts[2]).toEqual(starts[1]);
+    // s_2 is the share the retry claims, not a stray of this connection: stopping it would end it for every viewer
+    // (share.stopped) and make the retry a third share.
+    expect(shares.requests<ShareStop>('share.stop')).toEqual([]);
+    expect(onSocket()).toEqual(['hello', 'share.start', 'pc.offer']);
     expect(share?.shareId).toBe('s_2');
     expect(pubOffers(h.server).at(-1)).toMatchObject({
       gen: 1,
       neg: 1,
       tracks: [{ shareId: 's_2' }, { shareId: 's_2' }],
     });
+  });
+
+  it('…but if the capture ended meanwhile nothing claims the server’s copy: the session stops it', async () => {
+    const src = await startShare();
+    await goLive();
+    let calls = 0;
+    shares.onStart = () => {
+      if (calls++ === 0) h.server.drop();
+    };
+    h.server.restart();
+    h.server.drop();
+    await tick(600);
+    expect(shares.requests<ShareStart>('share.start')).toHaveLength(2);
+    // A stopped track fires no `ended`: the share finds out when it would ask for its copy again.
+    src.stream.getVideoTracks()[0]?.stop();
+
+    h.server.welcomeDefaults = { roomId: 'lounge' };
+    await tick(BackoffMaxMs);
+    expect(h.runtime.signal.welcome?.resumed).toBe(true);
+    h.hub.sendState('lounge', { shares: [own('s_2', { status: 'starting', replaces: 's_1' })] });
+    await tick();
+    expect(shares.requests<ShareStart>('share.start')).toHaveLength(2);
+    expect(shares.requests<ShareStop>('share.stop')).toEqual([{ shareId: 's_2' }]);
+    expect(h.runtime.session.share).toBeNull();
+    expect(store.getState().phase).toBe('idle');
   });
 
   it('a capture that ended while the server was away is not published again: the share ends quietly', async () => {

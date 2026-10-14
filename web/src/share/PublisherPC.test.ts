@@ -1110,53 +1110,94 @@ describe('PublisherPC: signaling drops (01 §10.4, §10.5)', () => {
 });
 
 describe('PublisherPC: publishing a share again (01 §10.6)', () => {
-  it('on the current PC: the old transceivers stop, new ones carry the same tracks under the new id, one re-offer', async () => {
+  it('with a current PC: a new PC of gen + 1 carries the same tracks under the new id, like a rebuild', async () => {
     const stream = await publish('s_a');
     connect();
+    const first = lastPc();
     const states: PubMediaState[] = [];
     pub.on('state', (s) => states.push(s));
     const [video, audio] = [stream.getVideoTracks()[0], stream.getAudioTracks()[0]];
 
     await pub.republish('s_a', shareParams('s_b', { codec: 'h264/42e0' }));
 
-    expect(FakeRTCPeerConnection.instances).toHaveLength(1);
-    expect(lastPc().transceivers.map((t) => t.stopped)).toEqual([true, true, false, false]);
-    expect(lastPc().transceivers[2]?.sender.track).toBe(video);
-    expect(lastPc().transceivers[3]?.sender.track).toBe(audio);
+    // Not new transceivers on the same PC: rejecting its first m-section, the BUNDLE tag, makes Chrome move the
+    // group to a new transport, which the SFU's PC doesn't follow (reconnect.spec (d)).
+    expect(FakeRTCPeerConnection.instances).toHaveLength(2);
+    expect(first.signalingState).toBe('closed');
+    expect(pub.gen).toBe(2);
+    expect(lastPc().transceivers.map((t) => t.stopped)).toEqual([false, false]);
+    expect(lastPc().transceivers[0]?.sender.track).toBe(video);
+    expect(lastPc().transceivers[1]?.sender.track).toBe(audio);
     expect(pub.shareIds).toEqual(['s_b']);
     expect(pubOffers(server).at(-1)).toMatchObject({
-      gen: 1,
-      neg: 2,
+      gen: 2,
+      neg: 1,
       tracks: [
-        { mid: '2', shareId: 's_b', kind: 'video' },
-        { mid: '3', shareId: 's_b', kind: 'audio' },
+        { mid: '0', shareId: 's_b', kind: 'video' },
+        { mid: '1', shareId: 's_b', kind: 'audio' },
       ],
     });
     // The new ShareParams: their codec first.
     const offer = pubOffers(server).at(-1);
-    const videoSection = parseSdpSections(offer?.sdp ?? '').find((s) => s.mid === '2');
+    const videoSection = parseSdpSections(offer?.sdp ?? '').find((s) => s.mid === '0');
     expect(videoSection?.codecLines?.find((l) => l.includes('profile-level-id'))).toContain('42e0');
-    // The PC stays as it was; nothing is closed.
-    expect(states).toEqual([]);
+    // The server replaces its PC on the higher gen: no pc.close, and the capture goes on.
     expect(server.messages('pc.close')).toEqual([]);
     expect(stream.getVideoTracks()[0]?.readyState).toBe('live');
+    expect(states).toEqual(['reconnecting']);
+    await answerLast();
+    connect();
+    expect(states).toEqual(['reconnecting', 'connected']);
   });
 
-  it('keeps the share’s place among the shares, and folds into the follow-up of an outstanding offer', async () => {
+  it('keeps the share’s place among the shares, carries the others, and drops an offer outstanding on the old PC', async () => {
     await publish('s_a');
     await pub.addShare('s_b', asStream(capture()), shareParams('s_b'), 'auto');
-    // The offer with s_b is outstanding: the re-publish goes into the next one.
+    const outstanding = pubOffers(server).at(-1);
+    if (!outstanding) throw new Error('no offer');
     await pub.republish('s_a', shareParams('s_c'));
-    expect(pubOffers(server)).toHaveLength(2);
     expect(pub.shareIds).toEqual(['s_c', 's_b']);
-    await answerLast();
+    // s_c where s_a was: before s_b, on the new PC's first offer.
     expect(pubOffers(server)).toHaveLength(3);
-    // s_c where s_a was: before s_b.
+    expect(pubOffers(server).at(-1)).toMatchObject({ gen: 2, neg: 1 });
     expect(
       pubOffers(server)
         .at(-1)
         ?.tracks.map((t) => `${t.mid} ${t.shareId}`),
-    ).toEqual(['4 s_c', '5 s_c', '2 s_b', '3 s_b']);
+    ).toEqual(['0 s_c', '1 s_c', '2 s_b', '3 s_b']);
+    // The old PC's answer comes too late for anyone.
+    await pub.handleAnswer(answerFor(outstanding));
+    expect(lastPc().remoteDescription).toBeNull();
+    await answerLast();
+    expect(pubOffers(server)).toHaveLength(3);
+  });
+
+  it('after a welcome that was not resumed, a parked share waits for its own re-publish', async () => {
+    await publish('s_a');
+    await pub.addShare('s_b', asStream(capture()), shareParams('s_b'), 'auto');
+    await answerLast();
+    server.restart();
+    server.drop();
+    await tick(1000);
+    expect(signal.welcome?.resumed).toBe(false);
+
+    // The first share's re-publish: gen 1, with that share only (the new connection doesn't know s_b).
+    await pub.republish('s_a', shareParams('s_c'));
+    expect(pubOffers(server).at(-1)).toMatchObject({
+      gen: 1,
+      neg: 1,
+      tracks: [{ shareId: 's_c' }, { shareId: 's_c' }],
+    });
+    // The second one's: a new PC that carries both.
+    await answerLast();
+    await pub.republish('s_b', shareParams('s_d'));
+    expect(pubOffers(server).at(-1)).toMatchObject({ gen: 2, neg: 1 });
+    expect(
+      pubOffers(server)
+        .at(-1)
+        ?.tracks.map((t) => `${t.mid} ${t.shareId}`),
+    ).toEqual(['0 s_c', '1 s_c', '2 s_d', '3 s_d']);
+    expect(server.messages('pc.close')).toEqual([]);
   });
 
   it('after a welcome that was not resumed: a new PC of gen 1, and no pc.close for the one the server forgot', async () => {
@@ -1193,11 +1234,17 @@ describe('PublisherPC: publishing a share again (01 §10.6)', () => {
 
   it('an offer that can’t be made: webrtc_failed, nothing of the share is left, and the PC is closed', async () => {
     await publish('s_a');
-    lastPc().failNext('createOffer');
+    const create = platform.createPeerConnection.bind(platform);
+    vi.spyOn(platform, 'createPeerConnection').mockImplementationOnce((config) => {
+      const pc = create(config);
+      (pc as unknown as FakeRTCPeerConnection).failNext('createOffer');
+      return pc;
+    });
     await expect(pub.republish('s_a', shareParams('s_b'))).rejects.toMatchObject({ code: 'webrtc_failed' });
     expect(pub.shareIds).toEqual([]);
     expect(pub.state).toBe('idle');
-    expect(sent<PCClose>('pc.close')).toEqual([{ pc: 'pub', gen: 1 }]);
+    // Of the new gen, which closes the server's PC of the gen before it too (02 §5.3).
+    expect(sent<PCClose>('pc.close')).toEqual([{ pc: 'pub', gen: 2 }]);
   });
 });
 

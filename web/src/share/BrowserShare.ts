@@ -26,7 +26,8 @@
 //   period that ran out; or resumed, but with a room.join that gave the connection a new MediaPeer): resync()
 //   publishes the share again, share.start {replaces: its id, ref: new} and its tracks on a new pub PC of gen 1;
 // - the first room.state after a resumed welcome doesn't list the share (it ended while the socket was down):
-//   republish() publishes it again the same way, on the same pub PC.
+//   republish() publishes it again the same way, on a new pub PC of the next gen that replaces the one the server
+//   kept (PublisherPC.republish says why not on that one).
 // The share gets a new id then: it reports it as a `state` event (05 §8), and viewers move their focus, tile and
 // sound to it (01 §10.6). It is `reconnecting` meanwhile, `live` again once the pub PC is connected and the server
 // lists it. A share.start of a re-publish whose answer the socket took goes again with the same ref when the
@@ -467,7 +468,7 @@ export class BrowserShare implements ActiveShare, ShareRecovery {
   /**
    * The first room.state after a resumed welcome doesn't list the share: it ended while the socket was down. The
    * share is published again (01 §10.5): share.start {replaces: its id}, with the ref of an attempt whose answer was
-   * lost if there was one, then its tracks under the new id on the same pub PC. Never rejects.
+   * lost if there was one, then its tracks under the new id on a new pub PC (gen + 1). Never rejects.
    */
   republish(): Promise<void> {
     if (this.#ending !== null) return Promise.resolve();

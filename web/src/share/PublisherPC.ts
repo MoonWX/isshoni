@@ -35,9 +35,12 @@
 //   is dropped without a message, and the shares stay known here, parked, until they are removed or published again.
 //   forgetServer() does the same for a resumed welcome after which the server has no pub PC either (a room.join gave
 //   the connection a new MediaPeer: the room session knows, and the share's resync says so).
-// - Publishing a share again (01 §10.6): republish() moves a share to the id that share.start {replaces} gave it.
-//   Its old transceivers stop and new ones carry the same tracks under the new id: on the current PC with one
-//   re-offer (same gen), or on a new PC when there is none (after one of the welcomes above: gen 1).
+// - Publishing a share again (01 §10.6): republish() moves a share to the id that share.start {replaces} gave it,
+//   always on a new PC: gen + 1 when there is one, which carries every share again like a rebuild, or gen 1 after one
+//   of the welcomes above. Not with new transceivers on the current PC: stopping the old ones rejects the first
+//   m-section, the BUNDLE group's tag, and Chrome then moves the group to a new transport (new ICE credentials in
+//   the re-offer), which the SFU's PC doesn't follow: in reconnect.spec (d) it went back to `connecting` and failed
+//   20 s later.
 // - sdp_invalid or bad_request about this PC, or an offer or answer that can't be applied here: one rebuild; a second
 //   failure within 60 s ends it: state 'failed' (01 §9 rule 8), and whoever owns the shares ends them.
 // - close() closes the PC on purpose and says so: pc.close {pc: 'pub', gen} (01 §9 rule 10).
@@ -452,10 +455,11 @@ export class PublisherPC {
 
   /**
    * Publishes a share again under the id that share.start {replaces} gave it (01 §10.6): the same tracks and preset,
-   * the new shareId and its ShareParams. The share's old transceivers stop, and new ones carry it: on the current PC
-   * with one re-offer (same gen, the next neg; folded into the follow-up when an offer is outstanding), or on a new
-   * PC when there is none, which after a welcome that was not resumed, or forgetServer(), has gen 1. The share keeps
-   * its place among the shares.
+   * the new shareId and its ShareParams, on a new PC (see the header for why never on the current one). With a
+   * current PC (the server kept the connection's media and lost only the share) the new PC replaces it like a
+   * rebuild: gen + 1, every share attached again, the others under the ids they have, and its first offer; the
+   * server replaces its PC on the higher gen (01 §9 rule 2). Without one (after a welcome that was not resumed, or
+   * forgetServer()) it is the connection's first: gen 1. The share keeps its place among the shares.
    *
    * It resolves like addShare, and rejects with LocalError `webrtc_failed` with nothing of the share left on the PC:
    * also for a share this PC doesn't know (it was removed meanwhile).
@@ -467,7 +471,6 @@ export class PublisherPC {
         throw new LocalError('webrtc_failed', { cause: new Error(`PublisherPC: share ${oldId} is not published`) });
       }
       if (this.#fatal) throw new LocalError('webrtc_failed');
-      this.#detach(old);
       const share: PublishedShare = {
         ...old,
         shareId: params.shareId,
@@ -477,15 +480,20 @@ export class PublisherPC {
         audioTx: null,
       };
       const order = [...this.#shares.entries()];
+      // The shares on the current PC go onto the new one with it. Parked ones (a welcome that was not resumed) wait
+      // for their own re-publish: the new connection doesn't know their ids.
+      const carried = new Set(order.filter(([id, s]) => id !== oldId && s.videoTx !== null).map(([, s]) => s));
       this.#shares.clear();
       for (const [id, s] of order) {
         if (id === oldId) this.#shares.set(share.shareId, share);
         else this.#shares.set(id, s);
       }
-      const pc = this.#pc ?? this.#createPc();
-      this.#log.info('publishing a share again', { gen: this.#gen });
+      // The old PC goes, with the old share's transceivers; the server drops its side on the new PC's higher gen.
+      this.#teardownPc();
+      const pc = this.#createPc();
+      this.#log.info('publishing a share again on a new pub PC', { gen: this.#gen });
       try {
-        await this.#attach(pc, share);
+        for (const s of this.#shares.values()) if (s === share || carried.has(s)) await this.#attach(pc, s);
         await this.#negotiate(pc);
       } catch (err) {
         await this.#dropFailedShare(pc, share);

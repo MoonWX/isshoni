@@ -7,6 +7,12 @@
 // (c) The server restarts during a share (01 §11.6): the sharer publishes its share again with `replaces`, without a
 //     new pick, and the friend who watched it decodes the new share within 15 s of the new server being up, on the
 //     stage, with its sound, and still as the pick it was (01 §10.6).
+// (d) The server ends a share while its sharer's socket is down, and the connection is resumed: the sharer publishes
+//     it again with `replaces` (01 §10.5) on a new pub PC of the next gen, which the server takes in place of the
+//     one it kept, and the friend decodes the new share. (Not on the PC it has: the re-offer that rejects the old
+//     m-sections moves Chrome's BUNDLE group to a new transport, and the SFU's PC never connected again. The share
+//     ends by "Stop it" in another tab of the same person, the quickest way to end it on the server while its media
+//     flows: a media_timeout takes 32 s, more than the grace of 30 s that the socket may stay away.)
 //
 // The network is cut with the harness's `link`, a SOCKS proxy that the page's browser context reaches the server
 // through (fixtures.ts), not with context.setOffline: Chrome's offline emulation holds an open WebSocket's frames
@@ -96,6 +102,64 @@ function watchSignaling(page: Page): SignalingWire {
     });
   });
   return wire;
+}
+
+/** A pub offer or answer as the page's signaling socket carried it (01 §9). */
+interface PubNegotiation {
+  readonly gen: number;
+  readonly neg: number;
+  readonly sdp: string;
+}
+
+/** What a page's signaling sockets carried about its pub PC, counted from Node. */
+interface PubWire {
+  readonly offers: PubNegotiation[];
+  readonly answers: PubNegotiation[];
+  /** The codes of the error notifications in scope `pc` (sdp_invalid, …). */
+  readonly errors: string[];
+}
+
+/** Starts recording a page's pub offers and answers. Call it before the page loads. */
+function watchPub(page: Page): PubWire {
+  const wire: PubWire = { offers: [], answers: [], errors: [] };
+  page.on('websocket', (ws) => {
+    if (new URL(ws.url()).pathname !== '/ws') return;
+    const note = (payload: string | Buffer): void => {
+      if (typeof payload !== 'string') return;
+      let msg: {
+        type?: unknown;
+        data?: { pc?: unknown; gen?: unknown; neg?: unknown; sdp?: unknown; scope?: unknown; code?: unknown };
+      };
+      try {
+        msg = JSON.parse(payload) as typeof msg;
+      } catch {
+        return;
+      }
+      const d = msg.data;
+      if (d === undefined) return;
+      if ((msg.type === 'pc.offer' || msg.type === 'pc.answer') && d.pc === 'pub') {
+        const n = { gen: Number(d.gen), neg: Number(d.neg), sdp: String(d.sdp) };
+        (msg.type === 'pc.offer' ? wire.offers : wire.answers).push(n);
+      } else if (msg.type === 'error' && d.scope === 'pc') {
+        wire.errors.push(String(d.code));
+      }
+    };
+    ws.on('framesent', ({ payload }) => {
+      note(payload);
+    });
+    ws.on('framereceived', ({ payload }) => {
+      note(payload);
+    });
+  });
+  return wire;
+}
+
+/** The port of each m-section of an SDP (0: rejected). */
+function mPorts(sdp: string): number[] {
+  return sdp
+    .split(/\r?\nm=/)
+    .slice(1)
+    .map((section) => Number(section.split(' ')[1]));
 }
 
 /** When the connection banner showed what, as the page saw it: `kind` is its data-kind, '' while empty. */
@@ -327,4 +391,91 @@ test('(c) a server restart: the friend decodes the re-published share within 15 
   await expect(page.getByRole('region', { name: 'Your share' })).toContainText("You're live");
   await expect(page.getByTestId('connection-banner')).toHaveText('');
   await expect(friend.page.getByTestId('connection-banner')).toHaveText('');
+});
+
+test('(d) a share the server ended while the socket was down: published again on a new pub PC, and decoded', async ({
+  startServer,
+  browser,
+  context,
+  page,
+  asUser,
+  link,
+}) => {
+  const server = await startServer();
+  const admin = adminOf(server);
+  // The sharer reaches the server through the link; another tab of the same person (the default context) doesn't.
+  const sharerContext = await browser.newContext({ proxy: { server: link.proxy } });
+  try {
+    await enableDebug(sharerContext);
+    await fakeDisplay(sharerContext, 'window+audio');
+    await server.signIn(sharerContext, admin);
+    const sharer = await sharerContext.newPage();
+    const pub = watchPub(sharer);
+    await sharer.goto(`${server.url}/`);
+    const before = await waitForRoom(sharer, 'lounge');
+    await server.signIn(context, admin);
+    await page.goto(`${server.url}/`);
+    await waitForRoom(page, 'lounge');
+    const friend = await asUser(server);
+    await friend.page.goto(`${server.url}/`);
+    await waitForRoom(friend.page, 'lounge');
+
+    const first = await share(sharer);
+    await waitForStats(friend.page, (s) => (videoOf(s, first)?.framesDecoded ?? 0) > 0, {
+      timeout: MEDIA_TIMEOUT_MS,
+      message: 'the friend decodes the share',
+    });
+    const published = pub.offers.at(-1);
+    if (published === undefined) throw new Error('the sharer sent no pub offer');
+    const oldPorts = mPorts(published.sdp);
+
+    // The sharer's socket goes. Its connection waits out the grace on the server, with the share and the pub PC,
+    // whose media doesn't take the link.
+    link.cut();
+    // The other tab stops the share (01 §8.7: its user may): the server ends it, and the sharer doesn't hear of it.
+    await page.bringToFront();
+    await page.getByRole('banner').getByRole('button', { name: 'Share', exact: true }).click();
+    const sheet = page.getByRole('dialog', { name: 'Share your screen' });
+    await expect(sheet).toContainText("You're already sharing from another tab or device");
+    await sheet.getByRole('button', { name: 'Stop it' }).click();
+    await waitForState(friend.page, (s) => s.viewer.shares.every((x) => x.id !== first), {
+      message: 'the server ended the share',
+    });
+    await page.keyboard.press('Escape');
+    // The sharer in front again, as when it shared: its capture is drawn on a timer.
+    await sharer.bringToFront();
+    const restoredAt = Date.now();
+    link.restore();
+
+    // The resumed connection's room.state lacks the share: the sharer publishes it again, with `replaces`.
+    const again = await waitForState(
+      sharer,
+      (s) => {
+        const next = s.viewer.shares.find((x) => x.local && x.id !== first && x.status === 'live');
+        return next !== undefined && { state: s, shareId: next.id };
+      },
+      { timeout: MEDIA_TIMEOUT_MS, message: 'the sharer has its share live again under a new id' },
+    );
+    expect(again.state.connection.resumed).toBe(true);
+    expect(again.state.connection.connectionId).toBe(before.connection.connectionId);
+    await waitForStats(friend.page, (s) => (videoOf(s, again.shareId)?.framesDecoded ?? 0) > 0, {
+      timeout: MEDIA_TIMEOUT_MS,
+      message: 'the friend decodes the share published again',
+    });
+    measured('the friend decodes the share published again after the network was back', Date.now() - restoredAt);
+
+    // The share went onto a new pub PC, the next gen (and no later one), whose first offer carries only it; the SFU
+    // answered that offer, and nothing about the pub PC failed.
+    const offer = pub.offers.find((o) => o.gen === published.gen + 1);
+    if (offer === undefined) throw new Error(`no pub offer of gen ${String(published.gen + 1)}`);
+    expect(offer.neg).toBe(1);
+    expect(Math.max(...pub.offers.map((o) => o.gen))).toBe(offer.gen);
+    expect(mPorts(offer.sdp)).toHaveLength(oldPorts.length);
+    expect(mPorts(offer.sdp).every((port) => port !== 0)).toBe(true);
+    expect(pub.answers.some((a) => a.gen === offer.gen && a.neg === offer.neg)).toBe(true);
+    expect(pub.errors).toEqual([]);
+    await expect(sharer.getByRole('region', { name: 'Your share' })).toContainText("You're live");
+  } finally {
+    await sharerContext.close();
+  }
 });

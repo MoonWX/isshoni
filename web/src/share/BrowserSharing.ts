@@ -36,11 +36,12 @@ import {
   MessageTypeShareStop,
   PCKindPub,
   type Preset,
+  type ShareParams,
 } from '../protocol/types.gen';
 import { BrowserShare } from './BrowserShare';
 import { canSendH264 } from './codecPrefs';
 import { PublisherPC, type PublisherPCDeps, type PublisherSignal } from './PublisherPC';
-import { newRef, requestShareStart } from './recovery';
+import { isConnectionLost, newRef, requestShareStart } from './recovery';
 import { ShareCancelledError, shareStore, type ShareStore } from './shareStore';
 
 export interface BrowserSharingDeps {
@@ -126,6 +127,8 @@ export class BrowserSharing implements SharingProvider {
    *   browser has no H.264 encoder);
    * - with the server's ProtocolError when share.start is refused (share_limit, not_in_room, forbidden, …), and with
    *   connection_lost when the connection went away before the answer and was not resumed in the room;
+   * - with ShareCancelledError when the capture ends while share.start waits for a resumed connection: at once,
+   *   without waiting the rest of the hold;
    * - once the server has the share, with a LocalError when the tracks can't be put on the pub PC, with the
    *   server's error when it reports one about the share meanwhile (codec_not_supported), and with
    *   ShareCancelledError when the capture ended meanwhile (the browser's "Stop sharing"). The share is stopped on
@@ -153,13 +156,31 @@ export class BrowserSharing implements SharingProvider {
     }
     const withAudio = stream.getAudioTracks().some((t) => !hasEnded(t));
 
-    // 01 §8.7. Only what was picked, by kind: a window title never leaves the page (05 §20).
-    const params = await requestShareStart(
-      signal,
-      roomId,
-      { kind: src.kind, preset: opts.preset, audio: withAudio, ref: newRef() },
-      this.#log,
-    );
+    // 01 §8.7. Only what was picked, by kind: a window title never leaves the page (05 §20). The wait for a resumed
+    // connection ends with the capture: the browser's "Stop sharing" is the user's way out of it, since the panel
+    // has no share to stop yet.
+    const captureEnded = new AbortController();
+    const onCaptureEnded = (): void => {
+      captureEnded.abort();
+    };
+    video.addEventListener('ended', onCaptureEnded, { once: true });
+    let params: ShareParams;
+    try {
+      params = await requestShareStart(
+        signal,
+        roomId,
+        { kind: src.kind, preset: opts.preset, audio: withAudio, ref: newRef() },
+        this.#log,
+        captureEnded.signal,
+      );
+    } catch (err) {
+      // Nothing to start any more. A share the server made meanwhile is a stray of a resumed connection, which the
+      // room session stops (01 §10.5); a new connection never had it.
+      if (isConnectionLost(err) && hasEnded(video)) throw new ShareCancelledError();
+      throw err;
+    } finally {
+      video.removeEventListener('ended', onCaptureEnded);
+    }
     const { shareId } = params;
     this.#log.info('share.start answered', {
       kind: src.kind,

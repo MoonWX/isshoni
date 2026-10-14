@@ -33,23 +33,39 @@ export function isConnectionLost(err: unknown): boolean {
 /**
  * Waits for the next `ready` of a client that is down, and says whether the server kept the connection in roomId:
  * the welcome was resumed and names that room (01 §10.3, §10.5). False for a new connection, a welcome in another
- * room or none, a client that stops or has stopped, no `ready` within limitMs, and a signal that can't tell (no
- * onState: the structural ShareContext.signal of tests), or one that is ready already (there is no drop to wait out).
+ * room or none, a client that stops or has stopped, no `ready` within limitMs, an `abort` that fires (or has fired)
+ * first, and a signal that can't tell (no onState: the structural ShareContext.signal of tests), or one that is ready
+ * already (there is no drop to wait out).
  */
-export function resumedInto(signal: PublisherSignal, roomId: string, limitMs: number): Promise<boolean> {
+export function resumedInto(
+  signal: PublisherSignal,
+  roomId: string,
+  limitMs: number,
+  abort?: AbortSignal,
+): Promise<boolean> {
   const { state } = signal;
-  if (signal.onState === undefined || state === undefined || state === 'ready' || state === 'stopped') {
+  if (
+    signal.onState === undefined ||
+    state === undefined ||
+    state === 'ready' ||
+    state === 'stopped' ||
+    abort?.aborted === true
+  ) {
     return Promise.resolve(false);
   }
   return new Promise<boolean>((resolve) => {
     let settled = false;
-    // Neither runs before both are set: the listener is called on the next state change, the timer later.
+    // None runs before all are set: the listeners are called on the next state change or abort, the timer later.
     const settle = (kept: boolean): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       off?.();
+      abort?.removeEventListener('abort', aborted);
       resolve(kept);
+    };
+    const aborted = (): void => {
+      settle(false);
     };
     const timer = setTimeout(() => {
       settle(false);
@@ -58,6 +74,7 @@ export function resumedInto(signal: PublisherSignal, roomId: string, limitMs: nu
       if (state === 'ready') settle(info.resumed === true && signal.welcome?.roomId === roomId);
       else if (state === 'stopped') settle(false);
     });
+    abort?.addEventListener('abort', aborted, { once: true });
   });
 }
 
@@ -66,13 +83,14 @@ export function resumedInto(signal: PublisherSignal, roomId: string, limitMs: nu
  * before the answer and the next welcome resumes the connection in that room within CAPTURE_HOLD_MS (01 §10.5:
  * "retry share.start with the same ref"). Any other outcome rejects with the request's error: the server's, or
  * connection_lost when the connection wasn't kept (a new connection has no such ref, and no room to start it in
- * before the room session has joined again).
+ * before the room session has joined again), or when `abort` fired (the capture ended: nothing is left to start).
  */
 export async function requestShareStart(
   signal: PublisherSignal,
   roomId: string,
   data: ShareStart,
   log: Logger,
+  abort?: AbortSignal,
 ): Promise<ShareParams> {
   for (;;) {
     try {
@@ -80,7 +98,7 @@ export async function requestShareStart(
     } catch (err) {
       if (!isConnectionLost(err)) throw err;
       log.info('share.start lost its connection: it goes again if the connection is resumed');
-      if (!(await resumedInto(signal, roomId, CAPTURE_HOLD_MS))) throw err;
+      if (!(await resumedInto(signal, roomId, CAPTURE_HOLD_MS, abort))) throw err;
     }
   }
 }
