@@ -10,9 +10,14 @@ import { createAppRoutes, type AppRouteSources } from '../../app/router';
 import type {
   AdminUser,
   AuditEntry,
+  BandwidthEstimate,
+  DashboardAccounts,
+  DoctorCheck,
+  DoctorReport,
   Info,
   Invite,
   Me,
+  OpsDashboard,
   PendingUser,
   Room,
   Settings,
@@ -273,6 +278,175 @@ export function auditEntry(overrides: Partial<AuditEntry> = {}): AuditEntry {
     target: { kind: 'user', id: 'b8f2n4r6t0vz', name: 'sam' },
     ip: '203.0.113.7',
     detail: { from: 'user', to: 'admin' },
+    ...overrides,
+  };
+}
+
+/** GET /api/v1/admin/bandwidth for the default session (04 §13.4's M1 exit row). */
+export function bandwidthEstimate(overrides: Partial<BandwidthEstimate> = {}): BandwidthEstimate {
+  return {
+    input: { people: 5, sharing: 2, thumbnails: 8, quality: '1080p60', preset: 'auto', hours: 2 },
+    perViewerMbps: { sharer: 8.13, viewer: 8.43 },
+    egressMediaMbps: 41.54,
+    egressWireMbps: 43.62,
+    ingressMediaMbps: 16.86,
+    transferPerSessionGb: 39.3,
+    ...overrides,
+  };
+}
+
+/** One doctor check: ok unless the overrides say otherwise. */
+export function doctorCheck(overrides: Partial<DoctorCheck> = {}): DoctorCheck {
+  return {
+    id: 'config',
+    status: 'ok',
+    code: 'config.ok',
+    params: { file: '/etc/isshoni/isshoni.toml', fileRead: true },
+    message: '/etc/isshoni/isshoni.toml',
+    localOnly: false,
+    durationMs: 1,
+    ...overrides,
+  };
+}
+
+/** A doctor report (04 §13.5) with these checks, counted. */
+export function doctorReport(checks: DoctorCheck[], overrides: Partial<DoctorReport> = {}): DoctorReport {
+  const summary = { ok: 0, warn: 0, fail: 0, skip: 0, info: 0 };
+  for (const c of checks) summary[c.status] += 1;
+  return {
+    schema: 1,
+    version: '0.3.0',
+    ranAt: '2026-09-29T20:15:00.000Z',
+    mode: 'server',
+    summary,
+    env: {
+      os: 'linux',
+      arch: 'amd64',
+      kernel: '6.8.0-45-generic',
+      container: 'none',
+      systemd: true,
+      provider: 'hetzner',
+      user: 'isshoni',
+    },
+    checks,
+    ...overrides,
+  };
+}
+
+/** The accounts part of the dashboard (03 §12.4.8). */
+export function dashboardAccounts(overrides: Partial<DashboardAccounts> = {}): DashboardAccounts {
+  return {
+    users: { active: 6, pending: 1, disabled: 0, admins: 1 },
+    invites: { active: 2 },
+    sessions: { active: 7 },
+    devices: { linked: 0 },
+    registrationMode: 'approval',
+    securityEvents: [],
+    ...overrides,
+  };
+}
+
+/** GET /api/v1/admin/dashboard: 04 §11.4's example, with alex sharing a window to sam in the lounge. */
+export function opsDashboard(overrides: Partial<OpsDashboard> = {}): OpsDashboard {
+  return {
+    generatedAt: '2026-09-29T20:14:05.000Z',
+    server: {
+      version: '0.3.0',
+      startedAt: '2026-09-29T18:00:00.000Z',
+      origin: 'https://203.0.113.7',
+      process: { cpuSeconds: 1834.2, rssBytes: 187000000, numCpu: 2, goroutines: 412 },
+      tls: {
+        mode: 'ip',
+        names: ['203.0.113.7'],
+        ready: true,
+        notAfter: '2026-10-05T10:00:00.000Z',
+        nextRenewal: '2026-10-02T12:00:00.000Z',
+      },
+      publicIpv4: '203.0.113.7',
+      publicIpv6: '',
+      nat: 'none',
+      advertised: [
+        { proto: 'udp', addr: '203.0.113.7:7882', via: 'udp' },
+        { proto: 'tcp', addr: '203.0.113.7:443', via: 'tcp443' },
+      ],
+    },
+    transfer: {
+      month: '2026-09',
+      egressBytes: 412000000000,
+      ingressBytes: 98000000000,
+      alertGb: 1000,
+      projectedEgressBytes: 428000000000,
+      egressBps: 41500000,
+      ingressBps: 17000000,
+    },
+    media: {
+      ingressBps: 16800000,
+      egressBps: 41200000,
+      downTracks: 18,
+      peerConnections: { udp: 7, tcp443: 1, tcp7882: 0 },
+    },
+    rooms: [
+      {
+        id: 'lounge',
+        name: 'Lounge',
+        participants: [
+          {
+            userId: 'k3m9p2qxw7ht',
+            username: 'alex',
+            connections: [
+              {
+                id: 'c_k3v9q2m7xw4pa8d1',
+                kind: 'web',
+                role: 'full',
+                version: '0.3.0',
+                os: 'macos',
+                transport: 'udp',
+                rttMs: 38,
+                connectedAt: '2026-09-29T19:02:11.000Z',
+              },
+            ],
+            watching: [],
+          },
+          {
+            userId: 'b8f2n4r6t0vz',
+            username: 'sam',
+            connections: [
+              {
+                id: 'c_b8v9q2m7xw4pa8d2',
+                kind: 'web',
+                role: 'viewer',
+                version: '0.3.0',
+                os: 'ios',
+                transport: 'tcp443',
+                rttMs: 61,
+                connectedAt: '2026-09-29T19:04:00.000Z',
+              },
+            ],
+            watching: ['s_q7m2x9c4v8b1n5k3'],
+          },
+        ],
+        shares: [
+          {
+            shareId: 's_q7m2x9c4v8b1n5k3',
+            ownerUserId: 'k3m9p2qxw7ht',
+            kind: 'window',
+            startedAt: '2026-09-29T19:05:00.000Z',
+            codec: 'h264/640c',
+            layers: [
+              { rid: 'f', width: 1920, height: 1080, fps: 59.8, bitrate: 7900000, lossPct: 0.1 },
+              { rid: 'q', width: 640, height: 360, fps: 15.0, bitrate: 290000, lossPct: 0.0 },
+            ],
+            viewers: { high: 1, low: 0, audio: 1 },
+            ingressBps: 8400000,
+            egressBps: 8300000,
+          },
+        ],
+      },
+    ],
+    clients: [{ kind: 'web', version: '0.3.0', count: 2, outdated: false }],
+    doctor: { ranAt: '2026-09-29T18:00:07.000Z', ok: 12, warn: 1, fail: 0 },
+    alerts: [],
+    accounts: dashboardAccounts(),
     ...overrides,
   };
 }

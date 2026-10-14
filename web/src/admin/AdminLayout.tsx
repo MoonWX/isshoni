@@ -52,8 +52,7 @@ export function AdminLayout() {
     }
   }, [pathname, admin]);
 
-  // Every page of 05 §15.3, in its order. The dashboard and the doctor page arrive in a later slice; until then
-  // their routes show the router's "Not in this build yet".
+  // Every page of 05 §15.3, in its order.
   const items: readonly NavItem[] = [
     { to: '/admin', end: true, icon: LayoutDashboard, label: t('admin.nav.dashboard') },
     { to: '/admin/users', icon: Users, label: t('admin.nav.users') },

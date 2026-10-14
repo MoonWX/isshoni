@@ -3,16 +3,18 @@
 import { screen, within } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
-import { meFixture } from '../test/msw';
+import { apiError, meFixture } from '../test/msw';
 import * as folder from './index';
-import { invite, renderAdmin, ROOM_HEADING, selfUser, serve } from './testing/harness';
+import { bandwidthEstimate, invite, on, renderAdmin, ROOM_HEADING, selfUser, serve } from './testing/harness';
 
 describe('the admin folder', () => {
-  it('exports the layout and the six pages of this slice by the names the router loads', () => {
+  it('exports the layout and every admin page by the names the router loads', () => {
     expect(Object.keys(folder).sort()).toEqual([
       'AdminLayout',
       'ApprovalsPage',
       'AuditPage',
+      'DashboardPage',
+      'DoctorPage',
       'InvitesPage',
       'RoomsPage',
       'SettingsPage',
@@ -71,10 +73,15 @@ describe('AdminLayout', () => {
     expect(await screen.findByRole('heading', { name: 'Nothing here' })).toBeInTheDocument();
   });
 
-  it('shows "Not in this build yet" inside the layout for the pages a later slice adds', async () => {
+  it('has the doctor page inside the layout, with the navigation and one <main>', async () => {
+    on('get', '/api/v1/admin/doctor', () => apiError(404, { code: 'not_found' }));
+    serve('/api/v1/admin/bandwidth', () => bandwidthEstimate());
     renderAdmin({ path: '/admin/doctor' });
-    expect(await screen.findByRole('heading', { name: 'Not in this build yet' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { level: 1, name: 'Doctor' })).toBeInTheDocument();
     expect(screen.getByRole('navigation', { name: 'Admin' })).toBeInTheDocument();
+    expect(
+      within(screen.getByRole('navigation', { name: 'Admin' })).getByRole('link', { name: 'Doctor' }),
+    ).toHaveAttribute('aria-current', 'page');
     expect(screen.getAllByRole('main')).toHaveLength(1);
   });
 });

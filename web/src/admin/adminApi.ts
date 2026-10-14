@@ -1,5 +1,6 @@
-// The admin pages' REST calls (05 §6.2, §15.3; 03 §12.3 #19–#42): one query per list, under the shared query keys
-// so 01's `invalidate` topics reach them (protocol/invalidate.ts), and one function per change.
+// The admin pages' REST calls (05 §6.2, §15.3; 03 §12.3 #19–#42; 04 §11.4, §13.1, §13.4): one query per list,
+// under the shared query keys so 01's `invalidate` topics reach them (protocol/invalidate.ts), and one function per
+// change. 04's dashboard, doctor report and bandwidth calculator have queries of their own here too.
 //
 // Lists refetch when the window gets focus again (05 §6.2: "refetchOnWindowFocus only for admin lists"): an admin
 // who comes back to the tab sees what the others did meanwhile. The audit log doesn't: it is paged, and a refetch
@@ -9,30 +10,35 @@
 // for it, but only over the room's WebSocket, which an admin page opened by its address doesn't have.
 import { infiniteQueryOptions, queryOptions, type QueryClient } from '@tanstack/react-query';
 
-import type {
-  AdminUserResponse,
-  AdminUsersResponse,
-  ApprovalsResponse,
-  AuditPage,
-  CreateInviteRequest,
-  CreateInviteResponse,
-  CreateRoomRequest,
-  InvitesResponse,
-  PasswordResetRequest,
-  PatchRoomRequest,
-  PatchUserRequest,
-  RejectAllResponse,
-  RejectRequest,
-  ResetLink,
-  RoomResponse,
-  Rooms,
-  Settings,
-  SettingsResponse,
-  SignOutResponse,
+import {
+  CodeNotFound,
+  type AdminUserResponse,
+  type AdminUsersResponse,
+  type ApprovalsResponse,
+  type AuditPage,
+  type BandwidthEstimate,
+  type BandwidthInput,
+  type CreateInviteRequest,
+  type CreateInviteResponse,
+  type CreateRoomRequest,
+  type DoctorReport,
+  type InvitesResponse,
+  type OpsDashboard,
+  type PasswordResetRequest,
+  type PatchRoomRequest,
+  type PatchUserRequest,
+  type RejectAllResponse,
+  type RejectRequest,
+  type ResetLink,
+  type RoomResponse,
+  type Rooms,
+  type Settings,
+  type SettingsResponse,
+  type SignOutResponse,
 } from '../protocol/api.gen';
 import { applyInvalidate } from '../protocol/invalidate';
 import { queryKeys } from '../protocol/queryKeys';
-import { api, type ApiPath } from '../protocol/rest';
+import { api, isApiError, type ApiPath } from '../protocol/rest';
 import type { Topic } from '../protocol/types.gen';
 
 /** One path segment: IDs are opaque strings from the API (05 §5). */
@@ -125,6 +131,67 @@ export function auditQueryOptions(filters: AuditFilters) {
   });
 }
 
+/** How often the dashboard asks for a new snapshot while the page is visible (05 §15.3, §18; 04 §11.4). */
+export const DASHBOARD_POLL_MS = 2000;
+
+/**
+ * GET /api/v1/admin/dashboard (04 §11.4): every DASHBOARD_POLL_MS while `visible`, never while the page is hidden
+ * (a background tab asks nothing), and at once when it is shown again. The server caches its snapshot for 1 s, so
+ * two admins' pages cost one snapshot a second.
+ */
+export function dashboardQueryOptions(visible: boolean) {
+  return queryOptions({
+    queryKey: queryKeys.adminDashboard,
+    queryFn: ({ signal }) => api<OpsDashboard>('GET', '/api/v1/admin/dashboard', undefined, { signal }),
+    staleTime: DASHBOARD_POLL_MS / 2,
+    refetchInterval: visible ? DASHBOARD_POLL_MS : false,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: true,
+  });
+}
+
+/**
+ * GET /api/v1/admin/doctor (04 §13.1): the last full report. Until the server has its first one (the first 20 s of
+ * a new installation) the answer is 404 not_found, which means "no report yet": the query then has null, not an
+ * error.
+ */
+export function doctorQueryOptions() {
+  return queryOptions({
+    queryKey: queryKeys.adminDoctor,
+    queryFn: async ({ signal }): Promise<DoctorReport | null> => {
+      try {
+        return await api<DoctorReport>('GET', '/api/v1/admin/doctor', undefined, { signal });
+      } catch (err) {
+        if (isApiError(err, CodeNotFound)) return null;
+        throw err;
+      }
+    },
+  });
+}
+
+/** The query of GET /api/v1/admin/bandwidth for one input (04 §13.4); every field is sent. */
+export function bandwidthPath(input: BandwidthInput): ApiPath {
+  const query = new URLSearchParams({
+    people: String(input.people),
+    sharing: String(input.sharing),
+    thumbnails: String(input.thumbnails),
+    quality: input.quality,
+    preset: input.preset,
+    hours: String(input.hours),
+  });
+  return `/api/v1/admin/bandwidth?${query.toString()}`;
+}
+
+/** GET /api/v1/admin/bandwidth (04 §13.4): the calculator, one implementation for the CLI and this page. */
+export function bandwidthQueryOptions(input: BandwidthInput) {
+  return queryOptions({
+    queryKey: [...queryKeys.adminBandwidth, input] as const,
+    queryFn: ({ signal }) => api<BandwidthEstimate>('GET', bandwidthPath(input), undefined, { signal }),
+    // The same input always has the same answer.
+    staleTime: Infinity,
+  });
+}
+
 /** A partial Settings: only the fields that change (03 §9; never a locked field, never null). */
 export type SettingsPatch = Partial<Omit<Settings, 'setupWizardDone'>>;
 
@@ -164,6 +231,11 @@ export const adminApi = {
   deleteRoom: (id: string) => api<undefined>('DELETE', `/api/v1/admin/rooms/${seg(id)}`),
   /** #41 */
   patchSettings: (patch: SettingsPatch) => api<SettingsResponse>('PATCH', '/api/v1/admin/settings', patch),
+  /**
+   * (04 §13.1) POST /api/v1/admin/doctor: runs every check now (up to two minutes) and keeps the report. 429
+   * doctor_busy with retryAfter while a run is under way and for 10 s after one.
+   */
+  runDoctor: () => api<DoctorReport>('POST', '/api/v1/admin/doctor'),
 } as const;
 
 /**
