@@ -8,7 +8,8 @@
 // - Stop ends it for everyone; the same page shares again, and a friend who comes later watches that. The share
 //   also ends, at once, when the sharer's tab closes, and when what is shared goes away.
 // - In a window too low for a 16:9 stage and the tiles under it, the stage gives way: the tiles stay above the
-//   sharer's bar, and the page has nothing to scroll.
+//   sharer's bar, also with the share's settings open, the stage keeps its controls whole, and the page has nothing
+//   to scroll.
 //
 // What is shared: in a headful Chrome (CI, under Xvfb) the tone tab, e2e/tone.html, which Chrome's own tab picker
 // selects by its title. A headless Chrome can't accept the picker, so a local headless run shares the fake display
@@ -148,6 +149,29 @@ async function expectSharerFitsWindow(page: Page): Promise<void> {
   expect(await documentOverflow(page)).toEqual({ x: 0, y: 0 });
 }
 
+/**
+ * Holds a stage with a share on it to the window (05 §12.1): the stage is whole, and so are its Mute and Fullscreen
+ * buttons, inside the stage's own box. A stage lower than the row of its controls would clip them, and
+ * toBeInViewport alone wouldn't see that: their boxes would still be in the window.
+ */
+async function expectStageFits(stage: Locator): Promise<void> {
+  await expect(stage).toBeInViewport({ ratio: 1 });
+  for (const name of ['Mute', 'Fullscreen']) {
+    const button = stage.getByRole('button', { name });
+    await expect(button).toBeInViewport({ ratio: 1 });
+    await expect
+      .poll(
+        async () => {
+          const [stageBox, box] = await Promise.all([stage.boundingBox(), button.boundingBox()]);
+          if (!stageBox || !box) return Number.NaN;
+          return Math.min(box.y - stageBox.y, stageBox.y + stageBox.height - (box.y + box.height));
+        },
+        { message: `from the ${name} button to the nearer of the stage's top and bottom edges (px)` },
+      )
+      .toBeGreaterThanOrEqual(0);
+  }
+}
+
 /** Waits until the page shows no share at all: no tile, nothing on the stage, the room's empty state. */
 async function expectNoShare(page: Page, timeout: number): Promise<void> {
   await waitForState(page, (s) => s.viewer.shares.length === 0 && s.viewer.focusedShareId === null, {
@@ -238,9 +262,7 @@ test('a friend watches a share: both layers, the high one on the stage, with its
 
   // The stage fills what the header leaves of the window (05 §12.1): the whole picture is in it, with the stage's
   // controls, and the page itself has nothing to scroll.
-  await expect(stage).toBeInViewport({ ratio: 1 });
-  await expect(stage.getByRole('button', { name: 'Mute' })).toBeInViewport({ ratio: 1 });
-  await expect(stage.getByRole('button', { name: 'Fullscreen' })).toBeInViewport({ ratio: 1 });
+  await expectStageFits(stage);
   expect(await documentOverflow(friend.page)).toEqual({ x: 0, y: 0 });
 
   // Nobody watches unseen: the sharer sees the friend's name, and the friend sees themselves counted.
@@ -324,6 +346,19 @@ test('a reload watches again; stopping ends the share for everyone; the page sha
   expect(latecomerErrors).toEqual([]);
 });
 
+/**
+ * Windows narrower than 1024 px, so the tiles are a strip under the stage, and too low for a 16:9 stage with the
+ * strip and the sharer's bar under it: at 900 px such a stage is about 500 px high, and the header, the strip and
+ * the bar need about 250 px, close to 500 px with the share's settings open. 683 × 600 is a window that fills half
+ * of a 1366 × 768 laptop screen; 700 × 520 is close to the lowest window that doesn't count as a phone held
+ * sideways (05 §12.8: wider than high and up to 500 px high).
+ */
+const LOW_WINDOWS = [
+  { width: 900, height: 600 },
+  { width: 700, height: 520 },
+  { width: 683, height: 600 },
+] as const;
+
 test('a low window: the stage gives way, and the tiles stay above the bar of the one who shares', async ({
   startServer,
   context,
@@ -342,10 +377,9 @@ test('a low window: the stage gives way, and the tiles stay above the bar of the
   await friend.page.goto(`${server.url}/`);
   await waitForRoom(friend.page, 'lounge');
 
-  // Narrower than 1024 px, so the tiles are a strip under the stage, and too low for a 16:9 stage with them: at
-  // this width such a stage is about 500 px high, and the header, the strip and the bar need about 250 px.
-  await page.setViewportSize({ width: 900, height: 600 });
-  await friend.page.setViewportSize({ width: 900, height: 600 });
+  const [first] = LOW_WINDOWS;
+  await page.setViewportSize(first);
+  await friend.page.setViewportSize(first);
 
   // The admin shares, and watches nothing: an empty stage, the tile with the preview, the bar.
   await clickShare(page);
@@ -364,20 +398,43 @@ test('a low window: the stage gives way, and the tiles stay above the bar of the
   // their bar.
   await clickShare(friend.page);
   const friendShare = await waitForOwnShare(friend.page);
-  for (const [p, other, watched] of [
-    [page, friend.account, friendShare],
-    [friend.page, admin, adminShare],
-  ] as const) {
+  const pages = [
+    { p: page, other: friend.account, watched: friendShare },
+    { p: friend.page, other: admin, watched: adminShare },
+  ] as const;
+  for (const { p, watched } of pages) {
     await waitForStats(p, (sample) => (videoOf(sample, watched.id)?.framesDecoded ?? 0) > 0, {
       timeout: MEDIA_TIMEOUT_MS,
       message: `decoded video of ${watched.id}`,
     });
-    const stage = p.getByRole('region', { name: `Now watching: ${other.username}'s tab` });
-    await expect(stage).toBeInViewport({ ratio: 1 });
-    // The stage's own controls are whole too: a stage that had shrunk to less than their height would clip them.
-    await expect(stage.getByRole('button', { name: 'Mute' })).toBeInViewport({ ratio: 1 });
-    await expect(stage.getByRole('button', { name: 'Fullscreen' })).toBeInViewport({ ratio: 1 });
-    await expectSharerFitsWindow(p);
+    // The toast that told the page about the other one's share lies over the bottom of the window, where the bar
+    // is, for 5 s (pointer away, so it isn't held): the clicks below go to the bar itself.
+    await p.mouse.move(0, 0);
+    await expect(toasts(p).getByRole('listitem')).toHaveCount(0);
+  }
+
+  for (const size of LOW_WINDOWS) {
+    for (const { p, other } of pages) {
+      await p.setViewportSize(size);
+      const where = `${other.username}'s share in ${String(size.width)} × ${String(size.height)}`;
+      const stage = p.getByRole('region', { name: `Now watching: ${other.username}'s tab` });
+      await expectStageFits(stage);
+      await expectSharerFitsWindow(p);
+
+      // The open settings make the bar as high as it gets (it scrolls what does not fit): the stage gives up more,
+      // down to the row of its controls, and the tile still nothing. A plain click opens them and closes them
+      // again: nothing lies over the button.
+      const settings = sharePanel(p).getByRole('button', { name: 'Share settings' });
+      await settings.click();
+      await expect(settings, where).toHaveAttribute('aria-expanded', 'true');
+      await expect(sharePanel(p).getByRole('listitem').filter({ hasText: other.username })).toBeVisible();
+      await expect(sharePanel(p).getByRole('button', { name: 'Stop sharing' }), where).toBeInViewport({ ratio: 1 });
+      await expectStageFits(stage);
+      await expectSharerFitsWindow(p);
+      await settings.click();
+      await expect(settings, where).toHaveAttribute('aria-expanded', 'false');
+      await expectSharerFitsWindow(p);
+    }
   }
 });
 

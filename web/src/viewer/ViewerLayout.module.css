@@ -47,14 +47,17 @@
 }
 
 /*
- * < 1024 px, portrait: full width, 16:9, on top. It may shrink (`flex: 0 1 auto` with no minimum height): in a
- * window too low for a 16:9 stage plus the strip, the stage gives up height, so the strip stays inside the layout
- * instead of lying over the sharer's bar below it (README S66). The picture keeps its shape inside the stage.
+ * < 1024 px, portrait: full width, 16:9, on top. It may shrink (`flex: 0 1 auto`): in a window too low for a 16:9
+ * stage plus the strip, the stage gives up height, so the strip stays inside the layout instead of lying over the
+ * sharer's bar below it (README S66). The picture keeps its shape inside the stage. It keeps the height of its own
+ * controls' row, though (a touch target and its padding), so they stay whole and inside it. The sharer's bar has a
+ * maximum height (share/SharePanel) that leaves the stage this much in a window from about 520 px high; a lower
+ * window that is wider than high counts as a phone held sideways, where the stage fills the window (05 §12.8).
  */
 .stage {
   flex: 0 1 auto;
   width: 100%;
-  min-height: 0;
+  min-height: calc(var(--tap-target) + 2 * var(--space-2));
   max-height: 100%;
   aspect-ratio: 16 / 9;
 }

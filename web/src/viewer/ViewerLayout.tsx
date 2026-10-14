@@ -8,7 +8,8 @@
 // | phone landscape       | fills the viewport       | hidden; a "Shares (N)" button opens a bottom sheet      |
 // | fullscreen            | only the stage           | not rendered                                            |
 //
-// Below 1024 px, a window too low for a 16:9 stage and the strip gets a lower stage: the strip keeps its room.
+// Below 1024 px, a window too low for a 16:9 stage and the strip gets a lower stage, down to the row of its controls:
+// the strip keeps its room.
 //
 // It is a view of viewerStore: RoomSession gives the store each room.state (syncRoom), and a pick on a tile goes
 // back to it (focusShare), which holds that share on the stage until it ends (05 §12.2). The stage and the tiles
