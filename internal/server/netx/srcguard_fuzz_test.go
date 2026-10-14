@@ -32,12 +32,16 @@ import (
 //
 // stunUfrag decodes the message with stun.Message.Decode, as Pion's muxes do. Decode keeps a 32-byte RawAttribute
 // for each attribute, which can be as short as 4 bytes, in a slice that append grows, and the slices it outgrew are
-// garbage too. A message of nothing but empty attributes is the worst case: it measured up to 43 bytes per input
-// byte (at about 14600 attributes; a STUN header's length ends the count at 16380). That is Pion's own cost for every
-// STUN message its muxes route by ufrag and its agent reads, and the guard pays it once more per packet. Linear, and
-// the input is bounded: Pion reads UDP into 8 KiB, and the gate reads at most maxFirstFrame. firstFrameGate also
-// copies the frame it reads ahead, so its bound counts the bytes it took from the connection, which must be at most
-// 2 + maxFirstFrame whatever length the frame's header claims.
+// garbage too. A message of nothing but empty attributes is the worst case: it measured up to 43.3 bytes per input
+// byte (at 14593 attributes, where append has just grown the slice for the last time; a STUN header's length ends the
+// count at 16383). That is Pion's own cost for every STUN message its muxes route by ufrag and its agent reads, and
+// the guard pays it once more per packet. Linear, and the input is bounded: Pion reads UDP into 8 KiB, and the gate
+// reads at most maxFirstFrame. firstFrameGate also copies the frame it reads ahead, so its bound counts the bytes it
+// took from the connection, which must be at most 2 + maxFirstFrame whatever length the frame's header claims.
+//
+// FuzzStunUfrag's seeds of 14593 attributes and of 16381 (the most next to the USERNAME) pin stunAllocPerByte:
+// mutation rarely grows an input to that many, so these seeds check the bound in every go test run, and fail it when
+// an update of pion/stun or Go makes the worst case cost more.
 const (
 	stunAllocPerByte  = 48
 	stunAllocSlack    = 2 << 10
@@ -139,6 +143,17 @@ func paddedRequest(tb testing.TB, size int) []byte {
 		rawAttr{stun.AttrSoftware, bytes.Repeat([]byte{'s'}, size-fixed)})
 }
 
+// emptyAttributes is a Binding request of n empty attributes and then USERNAME "srv:cli" (n+1 attributes in all), the
+// message that costs stun's decoder the most per byte.
+func emptyAttributes(tb testing.TB, n int) []byte {
+	tb.Helper()
+	setters := []stun.Setter{stun.BindingRequest}
+	for range n {
+		setters = append(setters, rawAttr{0x8030, nil})
+	}
+	return seedSTUN(tb, append(setters, stun.NewUsername("srv:cli"))...)
+}
+
 // guardSeeds returns the packets both targets start from: a connectivity check as browsers and Pion send it, STUN
 // without a USERNAME, every way a USERNAME's ufrag can be cut, the attribute orders that stun's decoder treats
 // specially, broken headers and attributes, the sizes around Pion's and the guard's frame limits, and media.
@@ -154,11 +169,6 @@ func guardSeeds(tb testing.TB) []guardSeed {
 		fn(b)
 		return b
 	}
-	manyEmpty := []stun.Setter{stun.BindingRequest}
-	for range 1000 {
-		manyEmpty = append(manyEmpty, rawAttr{0x8030, nil})
-	}
-	manyEmpty = append(manyEmpty, stun.NewUsername("srv:cli"))
 	rtp := []byte{0x80, 0x60, 0x00, 0x01, 0x01, 0x02, 0x03, 0x04, 0x0a, 0x0b, 0x0c, 0x0d, 0xde, 0xad, 0xbe, 0xef,
 		0x01, 0x02, 0x03, 0x04}
 	return []guardSeed{
@@ -197,7 +207,7 @@ func guardSeeds(tb testing.TB) []guardSeed {
 		{"username-then-broken-attribute", patched(seedSTUN(tb, stun.BindingRequest, stun.NewUsername("srv:cli"),
 			rawAttr{stun.AttrSoftware, []byte("x")}), func(b []byte) { binary.BigEndian.PutUint16(b[34:], 200) }),
 			"srv", false, false},
-		{"many-empty-attributes", seedSTUN(tb, manyEmpty...), "srv", true, false},
+		{"many-empty-attributes", emptyAttributes(tb, 1000), "srv", true, false},
 		{"pion-first-frame-max", paddedRequest(tb, pionTCPFirstFrameMax), "srv", true, true},
 		{"pion-first-frame-max-plus-4", paddedRequest(tb, pionTCPFirstFrameMax+4), "srv", true, false},
 		{"guard-first-frame-max", paddedRequest(tb, maxFirstFrame), "srv", true, false},
@@ -217,6 +227,11 @@ func FuzzStunUfrag(f *testing.F) {
 	for _, s := range guardSeeds(f) {
 		f.Add(s.raw)
 	}
+	// The allocation bound's worst case (stunAllocPerByte): 14593 attributes, where the decoder's slice has just grown
+	// for the last time, and the most that fit next to the USERNAME. Not in guardSeeds, whose packets must fit Pion's
+	// 8 KiB reads (TestPionRoutesLikeReference).
+	f.Add(emptyAttributes(f, 14592))
+	f.Add(emptyAttributes(f, 16380))
 	first := netip.MustParseAddrPort("192.0.2.1:1000")
 	second := netip.MustParseAddrPort("[2001:db8::1]:1000")
 	f.Fuzz(func(t *testing.T, b []byte) {
