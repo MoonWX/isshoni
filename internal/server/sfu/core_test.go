@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"reflect"
 	"slices"
 	"strings"
@@ -647,9 +648,28 @@ func TestShareParams(t *testing.T) {
 			ProfileHigh, []EncodingParams{with(full, func(e *EncodingParams) { e.MaxBitrate = 100_000 }), preview}, 128_000,
 		}},
 	} {
-		if got := shareParams(tc.preset, tc.limits, tc.policy); !reflect.DeepEqual(got, tc.want) {
+		if got := shareParams(tc.preset, tc.limits.shareCap(), 0, tc.policy); !reflect.DeepEqual(got, tc.want) {
 			t.Errorf("%s: shareParams = %+v, want %+v", tc.name, got, tc.want)
 		}
+	}
+	// Layer pausing (02 §11) makes the paused layers inactive, and changes nothing else.
+	inactive := func(e EncodingParams) EncodingParams { return with(e, func(e *EncodingParams) { e.Active = false }) }
+	for paused, want := range map[uint32][]EncodingParams{
+		1 << SlotF:                 {inactive(full), preview},
+		1 << SlotQ:                 {full, inactive(preview)},
+		1<<SlotF | 1<<SlotQ:        {inactive(full), inactive(preview)},
+		1 << SlotH:                 {full, preview}, // no such encoding in M1
+		1<<SlotF | 1<<SlotAudio:    {inactive(full), preview},
+		0:                          {full, preview},
+		1<<SlotQ | 1<<SlotF | 1<<7: {inactive(full), inactive(preview)},
+	} {
+		if got := shareParams(PresetAuto, 0, paused, ProfileHigh).Encodings; !reflect.DeepEqual(got, want) {
+			t.Errorf("paused %#b: encodings = %+v, want %+v", paused, got, want)
+		}
+	}
+	// A cap beyond what an int holds in bit/s counts as 1 Tbit/s.
+	if got := (Limits{MaxShareKbps: math.MaxInt}).shareCap(); got != maxShareCapKbps*1000 {
+		t.Errorf("the cap of the largest MaxShareKbps = %d", got)
 	}
 }
 

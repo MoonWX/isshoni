@@ -22,7 +22,10 @@
 //     offer's answer has the Publisher switch, each layer with its next keyframe, which it asks the Source for. A
 //     ProfileSource re-encodes in the new profile; another Source keeps its SPS and only the payload type changes.
 //
-// There is no rate control in M1: REMB from the SFU is only recorded in Stats.
+// There is no rate control in M1: the SFU's REMBs (02 §11: the admin's cap) are only counted in Stats. SetActive
+// turns a video layer off and on again, which is what a browser sharer does with the active flags of a quality hint's
+// encodings when the SFU pauses a full layer that nobody watches (02 §11); a layer turned on again starts with a
+// keyframe.
 //
 // Two options exist for the SFU's tests (02 §17), to send what browsers send and fake media alone doesn't.
 // Options.RedundantRTX negotiates RTX for the video and makes the Publisher answer NACKs itself, on the RTX stream,

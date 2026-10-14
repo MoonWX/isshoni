@@ -1,6 +1,7 @@
 // Package sfu is isshoni's selective forwarding unit on Pion (docs/m1/02-sfu.md): rooms, participants and
 // connections, shares with two simulcast layers, keyframe-aligned layer switches, NACK/RTX from a shared packet
-// cache, forwarded sender reports, downlink adaptation, a per-room H.264 profile policy and viewers without H.264.
+// cache, forwarded sender reports, downlink adaptation, uplink control (the admin's cap, layer pausing), a per-room
+// H.264 profile policy and viewers without H.264.
 //
 // The SFU never imports signal or protocol: 01's sfuplane adapter is the only translator between this package and
 // the wire. Signal calls the methods of *SFU and *Conn (02 §6.1); the SFU answers through each Conn's Signaler and
@@ -48,9 +49,10 @@
 //	Ticker            1 per SFU        every 250 ms, and at once for a state change: the ShareUpdated calls that are
 //	                                   due; every second: each layer's rates and cache size, each DownTrack's
 //	                                   bitrate, the stalled check (a live share whose pub PC has been away for 2 s),
-//	                                   each room's codec policy (its way back to high after the hold), and a look of
-//	                                   every Conn's downlink allocator, which its actor takes (Conn.adapt). Started
-//	                                   by the first Join, stopped by Close. README S88 adds the uplink policy
+//	                                   each room's codec policy (its way back to high after the hold), a look of
+//	                                   every Conn's downlink allocator, which its actor takes (Conn.adapt), and a
+//	                                   look of every Conn that publishes at its uplink, which its actor takes too
+//	                                   (Conn.uplinkTick). Started by the first Join, stopped by Close
 //	Probe             1 per probe PC   the connection-test probe's life (probe.run): waits for its PC to connect,
 //	                                   reports the result 1 s later, and ends the probe after 20 s, when the PC
 //	                                   fails or closes, when its data channel closes, or when it is stopped (a
@@ -98,6 +100,13 @@
 //     reader, never inside the allocator's.
 //   - A video DownTrack's writer waits in its pacer (02 §9.8) holding no lock; its stop and its Conn's close end the
 //     wait. Audio is never paced.
+//   - A share's uplink control (02 §11: its policy, the cap and pause state its sharer was told) belongs to the
+//     publishing Conn's actor, like everything else the Conn publishes: the ticker, SetLimits and a viewer's request
+//     for high only post to that actor. What other goroutines need of it are atomics: Share.paused (a keyframe
+//     request for a paused layer does nothing) and Share.resumedAt, which the actor stores before it clears a bit
+//     of Share.paused (the downlink allocators weigh a paused or just resumed layer at its maximum, allocRate). The
+//     viewers' requests reach the policy as each subscriber's actor published them (Subscription.shown), and a request
+//     for high has that actor post a look after it published it, so the look sees it.
 //   - WriteRTP and WriteRTCP are media calls, not signaling calls: the media goroutines make them, and so may any
 //     actor, also for another Conn's pub PC (a keyframe request). Pion allows them from any goroutine and they
 //     never block. Keyframe requests are throttled per layer by a compare-and-swap, so callers need no lock.
@@ -198,11 +207,25 @@
 //     the viewer's network starts the count again), or more than 50 queue drops a second. It fills a budget cheapest
 //     first (audio, thumbnails, then the newest high requests), and after a backoff of 10 s, doubling up to 120 s
 //     with each trial that fails, lifts the caps for a 6 s trial upgrade: REMB can't grant an upgrade, so one is
-//     tried. A new high request while capped is served at the full layer only if that layer's measured rate fits.
+//     tried. A new high request while capped is served at the full layer only if that layer's measured rate fits
+//     (its maximum while the layer is paused for its sharer, and for 2 s after it resumed: 02 §11).
 //     ConnStats.DownlinkEstimate is its budget while it caps, else the viewer's latest REMB. Each video DownTrack
 //     paces what it sends through a token bucket of max(2.5 × the layer's maximum, 3 × its measured rate, 2 Mbit/s)
 //     holding 20 ms of that: a keyframe after a still screen leaves over tens of milliseconds, not in one burst per
 //     viewer. Retransmissions go through it too, first (decided in README S84);
+//   - uplink.go: publisher-side control (02 §11). Each share has an UplinkPolicy, which its publishing Conn's actor
+//     asks once a second, when the admin's cap changes, and at once when a viewer asks for high, so a paused layer
+//     resumes without waiting. M1's policy is the admin's cap (Limits.MaxShareKbps) for every publisher, and with
+//     sfu.pause_unwatched_layers the full layer paused once no viewer has asked for high for 10 s, counted from the
+//     share's start or from the first look that found the last request for high gone; a viewer held at the preview
+//     layer by its downlink allocator still asks for high, and a share without a preview layer is never paused.
+//     While a layer is paused, and for 2 s after it resumed, the downlink allocators weigh it at its maximum, not at
+//     its measured rate, which is 0 or catching up (Share.allocRate). The sharer hears of a change of its cap or
+//     pause state through a QualityHintEvent with the full encodings (the reason viewers when the pause state
+//     changed, else admin), and a layer that resumes is asked for a keyframe right after the hint; UpdateShare's
+//     encodings and Resync say the same. While every share of a pub PC has a cap, the PC gets a REMB of their sum
+//     every second, naming their video layers, and three REMBs of no limit once the cap is gone. Layers measure
+//     their interarrival jitter for the policy (RFC 3550), one sample per frame;
 //   - events.go, errors.go, types.go, config.go, stats.go: the whole interface of 02 §6 and §13;
 //   - stats.go, counters.go, pionlog.go: observability (02 §13). Conn.Stats, SFU.Snapshot and SFU.Metrics never ask
 //     an actor and never wait: they read what the Layers and DownTracks measure (their rates are the ticker's, once
@@ -260,8 +283,8 @@
 //     Conn's next request (above). ClosePC (01's pc.close) closes either kind without a report, and finds a PC that
 //     the client's close_notify closed first as it wants it.
 //   - Resync, after a WebSocket resume, sends again what signal may have dropped: the outstanding sub offer, each
-//     subscription's state, a CodecPolicyEvent per share the Conn publishes. It ICE-restarts a sub PC that isn't
-//     connected and rebuilds one that has closed.
+//     subscription's state, a CodecPolicyEvent per share the Conn publishes, and the last quality hint of each such
+//     share that got one. It ICE-restarts a sub PC that isn't connected and rebuilds one that has closed.
 //   - The SFU's only rebuilds of its own are for a viewer's decoders (codecstate.go, 02 §8.5): when its caps gain
 //     H.264, and the guard's retries. Neither touches a closed sub PC, which waits for the client's request all the
 //     same, so its successor is always counted (below).
@@ -290,10 +313,9 @@
 // # What later slices add
 //
 // The whole API of 02 §6 is implemented (README S76 did the last method, Probe), and the sentinel ErrNotImplemented
-// that the unbuilt methods wrapped is gone; so are the reports of 02 §13 (README S79) and downlink adaptation
-// (README S84). What later slices add:
-//   - S88: the admin cap as REMB and quality hint (SetLimits already caps new ShareParams), layer pausing, and the
-//     last QualityHintEvent per share in Resync.
+// that the unbuilt methods wrapped is gone; so are the reports of 02 §13 (README S79), downlink adaptation (README
+// S84) and uplink control (README S88). What M1 still adds here is what its load gate finds (README S92). M2 brings
+// an UplinkPolicy for its native publishers (an estimator of their uplink, 02 §11).
 //
 // The server's cap on a subscription (02 §10.1: effective = min(requested, cap), with its reason) is the downlink
 // allocator's (Conn.capSubscription, reason bandwidth; server_limit is M5's); the viewer's decoders have a cap of

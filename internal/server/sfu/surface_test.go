@@ -74,6 +74,15 @@ var (
 	_ sfu.RoomEvents = surfaceEvents{}
 )
 
+// surfaceUplink implements the uplink policy of 02 §11, whose decisions M2's native publishers will make.
+type surfaceUplink struct{}
+
+func (surfaceUplink) Tick(sfu.ShareUplinkStats) sfu.UplinkDecision {
+	return sfu.UplinkDecision{MaxBitrate: 1, Active: map[string]bool{"f": false}}
+}
+
+var _ sfu.UplinkPolicy = surfaceUplink{}
+
 // TestAPISurface writes every exported type of 02 §6 with all its fields and every constant, so a renamed or
 // retyped field no longer compiles, and checks the few values that are fixed strings.
 func TestAPISurface(t *testing.T) {
@@ -107,6 +116,10 @@ func TestAPISurface(t *testing.T) {
 		},
 		sfu.CodecPolicyEvent{Share: "s_1", Profile: sfu.ProfileConstrainedBaseline},
 		sfu.QualityHintEvent{Share: "s_1", Reason: "admin", MaxBitrate: 1, Encodings: []sfu.EncodingParams{encoding}},
+		// Uplink control (02 §11).
+		sfu.ShareUplinkStats{Client: sfu.ClientDesktop, HighRequests: 1, Layers: []sfu.LayerUplinkStats{{
+			RID: "f", Bitrate: 1, LossPct: 2, Jitter: time.Millisecond, Viewers: 3,
+		}}},
 		sfu.PCStateEvent{PC: sfu.PCPub, Gen: 1, State: "failed", Reason: "handshake_timeout"},
 		sfu.ErrorEvent{Err: sfuErr, Scope: sfu.ScopePCSub},
 		// Observability.
@@ -173,6 +186,10 @@ func TestAPISurface(t *testing.T) {
 		if string(got) != want {
 			t.Errorf("SubReason %q, want %q", got, want)
 		}
+	}
+	// The quality hints' reasons are 01's protocol.HintReason values, which sfuplane passes through (01 §15.4).
+	if sfu.HintReasonAdmin != "admin" || sfu.HintReasonViewers != "viewers" {
+		t.Errorf("hint reasons %q and %q", sfu.HintReasonAdmin, sfu.HintReasonViewers)
 	}
 	// Quality is ordered: a smaller value is a cheaper one, so min(requested, cap) works (02 §10.1).
 	if sfu.QualityOff >= sfu.QualityLow || sfu.QualityLow >= sfu.QualityHigh {

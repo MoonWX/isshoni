@@ -79,6 +79,11 @@ type Conn struct {
 	// alloc is the Conn's downlink allocator (02 §10.2, allocator.go): its inputs come from the RTCP readers and
 	// queues of the Conn's DownTracks, its decisions are the actor's (adapt).
 	alloc allocator
+	// remb is what the Conn wrote of the admin's cap as REMB on its pub PC (02 §11, sendREMB).
+	remb rembState
+
+	// upQueued: a look at the uplink of the Conn's shares is in its event queue (wakeUplink), and hasn't begun.
+	upQueued atomic.Bool
 }
 
 // newConn builds a Conn; SFU.Join registers it and starts its actor.
@@ -465,16 +470,7 @@ func (c *Conn) pubAway(now int64) time.Duration {
 
 // stallShares makes the live shares the Conn publishes stalled at once (02 §5.3): its pub PC has failed.
 func (c *Conn) stallShares(cause string) {
-	c.room.mu.Lock()
-	var shares []*Share
-	for _, sh := range c.part.shares {
-		if sh.conn == c {
-			shares = append(shares, sh)
-		}
-	}
-	c.room.mu.Unlock()
-	sortShares(shares)
-	for _, sh := range shares {
+	for _, sh := range c.ownShares() {
 		sh.stall(cause)
 	}
 }
@@ -867,8 +863,8 @@ func (c *Conn) closePC(kind PCKind, gen uint32) error {
 //   - Every subscription's current SubscriptionStateEvent.
 //   - One CodecPolicyEvent per share the Conn publishes, with the room's codec policy: a client re-offers only when
 //     that differs from the profile it last applied (05).
-//
-// The last QualityHintEvent per share follows with README S88, which sends the first ones.
+//   - The last QualityHintEvent per share the Conn publishes, if one was sent (02 §11), as it would be now: with the
+//     current cap, pause state and preset (resendHints).
 func (c *Conn) Resync() {
 	c.post(c.resync)
 }
@@ -899,6 +895,7 @@ func (c *Conn) resync() {
 			c.sig.SendEvent(CodecPolicyEvent{Share: info.ID, Profile: policy})
 		}
 	}
+	c.resendHints()
 }
 
 // hintCodec tells the client that publishes sh which profile the room's codec policy wants now (02 §8.3): a
