@@ -1397,14 +1397,17 @@ task dev:setup-url        # in a second terminal: open the printed link, create 
 | `.github/workflows/ci.yml` | `pull_request`, `push` to `main`, `merge_group` | gate for every change |
 | `.github/workflows/nightly.yml` | `schedule: '17 3 * * *'`, `workflow_dispatch` | slow and flaky-prone checks (8.5) |
 | `.github/workflows/release.yml` | `push` tags `v*`, `workflow_dispatch` (dry run) | section 9 |
-| `.github/workflows/site.yml` | `push` to `main` (paths `docs/**`), `workflow_dispatch`, `workflow_call` | section 10 |
+| `.github/workflows/site.yml` | `push` to `main` (paths `docs/**` without `docs/PLAN.md` and `docs/m1/**`, plus `deploy/keys/allowed_signers`, whose keys the site serves, and `site.yml` itself; README S82), `workflow_dispatch`, `workflow_call` | section 10 |
 | `.github/dependabot.yml` | weekly | `gomod` (`/`, `/tools`), `npm` (`/web`, `/docs`), `github-actions`, and `docker` (`/deploy/docker`), added back by README S68 with the Dockerfile (Dependabot's update job fails on a directory without one); minor and patch updates grouped per ecosystem; `target-branch: m1/server-web` for every ecosystem while M1 lands there (README §4), switched to `main` after M1. The tools pinned in `.tool-versions` (Task, golangci-lint, shfmt) are ignored in `/tools` and bumped by hand. In `npm`, major updates of `eslint`, `@eslint/js` and `typescript` are ignored until eslint-plugin-jsx-a11y and typescript-eslint allow them (05 §2); the file names the blocking peer ranges |
 
 **Rules for every workflow:**
 - Top-level `permissions: contents: read`; jobs raise permissions individually.
 - Every third-party action is pinned by full commit SHA with a version comment.
 - `persist-credentials: false` on checkout unless a step pushes.
-- `concurrency: ${{ github.workflow }}-${{ github.ref }}` with cancel-in-progress for PRs.
+- `concurrency: ${{ github.workflow }}-${{ github.ref }}` with cancel-in-progress for PRs. One exception,
+  `site.yml` (README S82), whose header says why: called from `release.yml`, `github.workflow` and `github.ref` are
+  the caller's, so the group would be `release.yml`'s own, a deadlock that GitHub cancels. Its deploys are one at a
+  time through the `deploy` job's own group, `pages`, which never cancels (10.5).
 - `timeout-minutes` on every job.
 - **No local `gh` is needed for anything.** Secrets, environments, rulesets and Pages are set once in the GitHub web
   UI (8.6), and everything else is YAML in the repo.
@@ -1450,7 +1453,7 @@ The `changes` job (`dorny/paths-filter`) sets these outputs. On `push` to `main`
 | `distro` | as `distro-release` | matrix of the 6 container distros (4.13), scenarios from 11.2, on the releases of `distro-release` (`distro-test.sh -r`), with `CONTAINER_ENGINE=docker` | 30 | yes |
 | `docker-smoke` | docker, deploy or release | `task docker:smoke` (11.3), linux/amd64 | 15 | yes |
 | `goreleaser-check` | release, deploy or readme (below) | setup-node and `npm ci` in `web/`; `goreleaser check`; `task release:snapshot` (builds the SPA first, 7.2); asserts the asset list of section 3 (names and archive contents) | 20 | yes |
-| `site` | site or deploy | `vitepress build`; setup-go (from `go.mod`), then `go test ./internal/server/ops/doctor -run TestDocsAnchors` (10.4) | 10 | yes |
+| `site` | site or deploy | setup-node (with npm's cache) and `npm ci --prefix docs`; `vitepress build`; `node docs/scripts/check-site.mjs`, the check that the site loads nothing from another origin (10.1, README S82); setup-go (from `go.mod`), then `go test ./internal/server/ops/doctor -run TestDocsAnchors` (10.4). It deploys nothing: that is `site.yml`'s (10.5). `ci-ok` needs it | 10 | yes |
 | `govulncheck` | go | `.bin/govulncheck ./...`, `continue-on-error: true` (new CVEs mustn't block unrelated PRs; nightly and release gate on it) | 10 | no |
 | `ci-ok` | always (`if: always()`) | fails if any job in `needs` is `failure` or `cancelled`; `skipped` counts as success | 2 | **the only required check** |
 
@@ -1588,6 +1591,40 @@ same holds for git and PulseAudio on runners. The "no GPL" rule covers code in t
 
 - GitHub e-mails the owner when a scheduled run fails.
 - GitHub disables scheduled workflows after 60 days without repository activity. `CONTRIBUTING.md` notes this.
+
+**`nightly.yml` as README S83 built it**, where the table leaves a choice or the workflow departs from it:
+- **`vm-release` builds the two test releases once** (`0.0.1-ci.1` and `0.0.1-ci.2`, unsigned, as `ci.yml`'s
+  `distro-release` does, 8.2), and each `distro-vm` job signs them with a key of its own. **`distro-vm`** boots
+  each part in a fresh VM from the distro's official cloud image with a cloud-init seed (QEMU with KVM; `/dev/kvm`
+  opened with GitHub's udev rule) and runs it over SSH. The parts: `main` (C12, C1, V1's sysctl values, C2, C3, C6,
+  C4, C5, C8, C9, C10, then V6 and, on Fedora, V2), `c7`, `c13`, `v3` (Ubuntu 24.04 with ufw, Fedora with
+  firewalld), `v4` (Ubuntu 24.04) and `v5` on every distro; C11 has no VM form and stays in `ci.yml`. Without
+  `/dev/kvm` each job is skipped with a warning naming 4.13 and 9.1. The scenario step has a timeout of its own
+  (75 of the job's 90 minutes), so a hang still leaves time to show Pebble's logs and upload the VMs' consoles.
+- **The VM harness is inline in the `distro-vm` job's step**, not a script in `deploy/test/vm/` (4.13): S83 could
+  change only `nightly.yml`. The step sources `deploy/test/distro-test.sh` without its last line (`main "$@"`,
+  which it checks first and fails loudly without) and runs the library's container scenarios in the VMs through
+  an executor over SSH (`vm_engine` in place of the container engine), relying on the library's function and
+  variable names. So a rename there breaks only the nightly, and the harness can't be run by hand before a release
+  without being taken out of the YAML (taken out, `VM_ACCEL=tcg` runs it without KVM, much slower). README F13
+  moves it to `deploy/test/vm/`, with a guard in `distro-test.sh` that skips its main when sourced, and `lint:sh`
+  over the new scripts (README §6 "Decided after group 11" (5)).
+- **`goreleaser-full` does not sign**: `goreleaser release --snapshot --clean --skip=sign` with the images and the
+  SBOMs, not the plain command of the table. cosign's keyless signature would need `id-token: write` in a job that
+  also runs npm, which `release.yml` keeps apart (9.3), and every night would add an entry to the public
+  transparency log; `release.yml`'s dry run covers the signing. `task release:assets FULL=true` then gates on
+  every asset of section 3, with an empty stand-in for the one only a signed run makes,
+  `checksums.txt.sigstore.json`; the job also checks that the SBOMs describe the archives and that both images
+  are loaded and the runner's starts with the snapshot's version.
+- **`go-cross-os`** runs `internal/server/ops` and `cmd/isshoni` (the backup, restore and re-exec code) as a step
+  of their own, then every other package, with `-race` and `CGO_ENABLED=1`. On Windows it takes MinGW-w64's gcc
+  from the runner image and installs it with Chocolatey only when the image has none (`choco install mingw`, not
+  pinned to a version).
+- **`site-links`** builds the site with `task site:build`, lays it out under its base path (`/isshoni/`) so that
+  root-relative links resolve as on Pages, and runs lychee over it; it says so and does nothing while
+  `docs/package.json` doesn't exist.
+- **No caches**: like `release.yml`, the nightly builds from the module proxy and npm, and leaves `ci.yml`'s cache
+  space alone; the jobs' timeouts allow for cold builds. Its own `concurrency` group never cancels a run.
 
 ### 8.6 One-time GitHub setup (owner, in the web UI)
 
@@ -2057,6 +2094,11 @@ After a leak, the backup key signs until a new key exists, and a security adviso
 
 - VitePress (MIT, pinned in `docs/package-lock.json`) with `srcDir: docs`, `base: '/isshoni/'` and
   `srcExclude: ['PLAN.md', 'm1/**']`. Design docs stay on GitHub, not on the site (open question Q3).
+  As README S82 built it (`docs/.vitepress/config.mts`): `vitepress build docs` makes `docs/` the site's root, so
+  `srcDir` stays at its default, which is the same directory; `srcExclude` also has `scripts/**`, the site's own
+  tooling; `cleanUrls`, and no web fonts (`useWebFonts: false`). `docs/package.json` turns off the install scripts
+  of `esbuild` and `fsevents` (`allowScripts`), as `web/` does for `fsevents`, so `npm ci` runs no third-party
+  install script, and `docs/.npmrc` is `web/`'s (`engine-strict`, `fund=false`).
 - **Site URL:** `https://moonwx.github.io/isshoni/`. Adding a custom domain later keeps these URLs working, because
   GitHub Pages redirects `github.io` to the custom domain.
 - **Stable install URL:** `https://moonwx.github.io/isshoni/install.sh`. Mirror:
@@ -2066,7 +2108,14 @@ After a leak, the backup key signs until a new key exists, and a security adviso
   - fonts bundled by the default theme, no Google Fonts;
   - no analytics, no cookies, no external embeds.
 
-  The privacy page says that GitHub hosts the site and may log IPs.
+  The privacy page says that GitHub hosts the site and may log IPs. **`docs/scripts/check-site.mjs`** (README S82)
+  checks the built site for it, in `ci.yml`'s `site` job and in `site.yml` after every build: every attribute
+  that loads something (on any tag but `<a>` and `<area>`), every CSS `url()` and `@import`, and a
+  `<meta http-equiv="refresh">` target must be a path of the site or a `data:` URL; no script, the inline ones of
+  each page included (where a `head` entry would put an analytics loader), names a host that serves fonts,
+  scripts, analytics, search or icons; and the config inlined in every page has local search and no Algolia. The
+  theme's one such fallback, a named social icon from `api.iconify.design`, is accepted only while no page has
+  such an icon (the config gives GitHub's as inline SVG). It is the automated form of S10's network-panel check.
 
 ### 10.2 Pages in M1
 
@@ -2118,6 +2167,25 @@ after the first Windows release):
   5. write `docs/.vitepress/release.json`:
      `{"version":"0.1.0","installShSha256":"…","keyFingerprints":["SHA256:…","SHA256:…"]}`, which the install and
      security pages render.
+
+  As README S82 built it (`site.yml`'s `build` job, the step "The latest release's installer, verified"):
+  - the latest release is GitHub's `releases/latest` (never a prerelease, 9.3), whose tag must look like a
+    release's (`vX.Y.Z`, or with `-rc.N`); called from a final release's tag, the step fails unless that tag is the
+    latest, so a stale answer can't serve the previous installer;
+  - the signature is checked with **main's** `deploy/keys/allowed_signers` (after a rotation the next release is
+    signed with the new key, 9.4); a missing or empty key file, or a release without `checksums.txt.sig`, fails;
+  - `install.sh`, `compose.yaml` and `compose.host.yaml` must each be listed in `checksums.txt` exactly once
+    (`--ignore-missing` alone would pass a file that the list leaves out), then `sha256sum --ignore-missing -c`;
+    `install.sh` must carry the release's version stamp (`ISSHONI_INSTALLER_VERSION`);
+  - the site serves all three at its root (`/install.sh`, `/compose.yaml`, `/compose.host.yaml`), and the keys at
+    `/keys/allowed_signers`; `release.json`'s fingerprints are computed from every key line of the file, as
+    `ssh-keygen -l` prints them. These files are git-ignored. `docs/.vitepress/release.data.ts` reads
+    `release.json` and fails the build when it is malformed; without the file (every local build, and every build
+    before the first release) the pages say "not released yet".
+  - After `vitepress build` and `check-site.mjs`, the step "The built site carries the verified installer and
+    keys" compares `dist/install.sh` and `dist/keys/allowed_signers` with the SHA-256s that the verifying step put
+    in its outputs, not with files: the build ran third-party code (every npm package) after the verification and
+    could have changed any file of the workspace.
 - **Before the first release** there is no `install.sh` on the site, and the install page says "not released yet".
 - **An urgent installer fix** means a patch release. That keeps the served script signed and paired with a binary.
 - **The key is pinned in four places, cross-checked:**
@@ -2127,7 +2195,12 @@ after the first Windows release):
     checked by `repocheck keys` (`lint:keys`, and release.yml) from README F11 on: once `allowed_signers` exists and
     is not empty, `README.md`'s "Release signing keys" section must list the SHA256 fingerprint of every key in it
     and no other one, and no row may still say the key is not created (a file of blank and comment lines only
-    fails, as one without a key). Until F11 nothing checks them (README F05's review);
+    fails, as one without a key). Until F11 nothing checks them (README F05's review). As F11 built it: a line
+    that names one key by its comment but shows another key's fingerprint fails too (the release and backup
+    fingerprints swapped), the "not created" check reads every visible line of the section (HTML comments and
+    what follows the next level-1 or level-2 heading outside a code fence don't count), a key line that
+    `x/crypto/ssh` can't parse fails with its line number, and the README is checked even where `install.sh` is
+    missing (the key block is then skipped with a note);
   - the release notes footer.
 - **Manual verification** (on `/install/` and `/security#verify`):
 
@@ -2148,7 +2221,11 @@ registry (`CheckIDs()`), the `CloudProvider` constants from `internal/protocol/a
 from `web/src/conntest/codes.json`, then checks the headings in `docs/troubleshooting.md` and `docs/install/vps.md`.
 No Vitest test is needed in `docs/`. It lives in the doctor package because no other slice of its group touches that
 package, and because `tools/` is a separate module that can't import `internal/` packages. It runs in `test-go`
-(any Go change) and in the `site` job (8.2), so a docs-only or codes-only PR runs it too.
+(any Go change) and in the `site` job (8.2), so a docs-only or codes-only PR runs it too. As README S82 built it,
+it reads the `CloudProvider` constants from every non-test Go file of `internal/protocol/api`, not only
+`conntest.go`, so the test keeps working if they move, and it also checks the fixed pages and anchors of the last
+row below (the install pages, `/security#verify` and `#keys`, `/install/reverse-proxy#docker`) and the
+`/privacy`, `/code-signing` and `/reference/config` pages that the product links to.
 
 | From | Link | Anchor rule |
 |---|---|---|
@@ -2203,6 +2280,30 @@ page is written):
 - `deploy` job: `environment: github-pages`; permissions `pages: write`, `id-token: write`;
   `actions/deploy-pages`.
 - Pages sets `Cache-Control: max-age=600`, so a new `install.sh` is live within about 10 minutes of a release.
+
+**As README S82 built it** (`build ──► deploy ──► check`):
+- **`build`** runs the steps above and three more: "Is GitHub Pages on?" (`pages: read`;
+  `GET repos/{repo}/pages` answers 404 while Pages is off, and a Pages site that builds from a branch fails the
+  run, since Source must be "GitHub Actions", 8.6 step 5), and after the build `check-site.mjs` (10.1) and the
+  re-check of the served installer and keys (10.3). Its outputs say whether Pages is on, whether a release exists,
+  and the version and the installer's SHA-256.
+- **`deploy` runs only once Pages is on**, and only from `main` or a `v*` tag, which the `github-pages`
+  environment allows (8.6 step 5). Its `concurrency` group `pages` never cancels: a newer deploy waits.
+- **`check`** (a job of its own, with an explicit condition: a job-level `success()` would skip it with `deploy`)
+  runs once a release exists, on `main` or a `v*` tag. It fails when `deploy` didn't succeed (Pages still off, or
+  a failed deploy: the stable install URL would serve nothing or an old script) and says how to fix it; else it
+  fetches the served `/install.sh` with a query string of its own per attempt, to get past the CDN's cache, for up
+  to 10 minutes until its SHA-256 is the release's, and then asks GitHub again which release is the latest: a
+  release published while this run built (a docs push just before a release, whose deploy queued after the
+  release's own) fails it, and a new run from `main` serves the new one.
+- **Before the first release `main` stays green while Pages is off**: the site is built and checked, the step
+  warns that Pages is not on, `deploy` is skipped and `check` doesn't run. Once a release exists, a run without
+  Pages fails in `check`, release.yml's `site` job included (README §6 "Decided after group 11" (3)).
+  Whether the workflow token's `pages: read` may read `GET repos/{repo}/pages` is to be seen in the first run after
+  Pages is on (README §6 "Owner actions").
+- **Rules of 8.1 as applied**: no top-level `concurrency` (8.1's one exception); no caches, like `release.yml`;
+  `GH_TOKEN` only on the steps that call `gh`, never on `npm ci` or the build, which run third-party code. The
+  `push` trigger also has `deploy/keys/allowed_signers` and `site.yml` itself (8.1).
 
 ## 11. Deploy test details
 
@@ -2309,7 +2410,8 @@ rest):
   again. On Fedora the service is first put into a second zone, a policy and a rich rule, and written by hand into
   a third zone's file that firewalld has not read: that file keeps `isshoni.xml` (4.11), and after the uninstall
   firewalld must still load its configuration (`firewall-cmd --reload` succeeds, `--state` is `running`). README
-  S83 runs V3 in the nightly's VMs; reusing these scenario functions there needs an executor over SSH.
+  S83 runs V3 in the nightly's VMs too, with these scenario functions and an executor over SSH in place of the
+  container engine (8.5).
 - **Names**: `IMAGE_NAME` names the images and prefixes the containers (default `isshoni-distro-test`), so a
   run can keep away from another run's images and containers; the images stay as the next run's build cache,
   everything else is deleted at the end. `CONTAINER_ENGINE` picks podman or docker (podman when installed; CI
@@ -2346,6 +2448,21 @@ rest):
 | V4 | Oracle pattern: the Ubuntu VM gets `netfilter-persistent` and a REJECT rule | rules inserted before the REJECT and tagged `isshoni`; they survive a reboot; uninstall removes them |
 | V5 | ACME with Pebble plus `pebble-challtestsrv` on the runner. The VM uses `ISSHONI_TLS_ACME_CA` and `ISSHONI_TLS_ACME_CA_ROOT` (04's keys `tls.acme_ca`, `tls.acme_ca_root`), and challtestsrv resolves `isshoni.test` to the VM | `--domain isshoni.test --yes` is ready within 60 s; the certificate issuer is Pebble. IP mode (`--ip`) the same, if the pinned Pebble supports IP identifiers; otherwise IP mode stays on the manual release checklist |
 | V6 | `systemd-analyze security isshoni` | score ≤ the recorded value + 0.2 |
+
+**As README S83 built the VM runs** (`nightly.yml`'s `distro-vm`, 8.5), where the table leaves a choice:
+- **V1** is the `main` part: the container scenarios C1–C6, C8–C10 and C12 in that VM, in the order of the
+  container run, plus the sysctl values; C7 and C13 get a VM each, as they get a container each. In a VM, C1's two
+  checks that the installer installs the OpenSSH client are skipped and labelled so: an SSH server needs the
+  client, so the VM always has `ssh-keygen`.
+- **V4** inserts and checks the rules for IPv4 and IPv6 (`rules.v4` and `rules.v6`, both with a REJECT rule), as
+  4.9's iptables row does for both; the rules survive a reboot of the VM, and `--uninstall` removes them.
+- **V5 runs domain mode only** (`--domain isshoni.test`). The pinned Pebble does issue for IP addresses (`ci.yml`'s
+  `acme` job), but ip mode takes only a public address (04 §4.5: a documentation or private `public_ip` is a config
+  error), and a VM on a runner has no public address that Pebble could validate. So IP mode stays on the manual
+  release checklist, the fallback the row allows, and the step prints a note saying so. Readiness within 60 s is
+  measured from the service's start.
+- **V6 reads the recorded value** from `deploy/systemd/README.md`'s heading "## Recorded exposure: <value>" (4.5),
+  so a newly recorded score moves the limit with it; without the heading the step fails.
 
 ### 11.3 Docker smoke: `deploy/docker/test/docker-smoke.sh`
 
@@ -2558,7 +2675,8 @@ Anything beyond these, such as a reload, a second tap, a re-join or a second log
 | Integration | distro containers C1–C13 (11.2) | install, idempotency, upgrade, downgrade refusal, tamper refusal, port conflict, re-runs after exit 7 and exit 5, uninstall, purge, backup/restore |
 | Integration | Docker smoke (11.3) | bridge and host bind 443 as designed, healthcheck, setup-url via exec, persistence, backup (a `0600` file) → restore through `exec -T` with `--yes`, an IPv6 client seen as the bridge gateway (6.4), no-volume refusal, start with no `.env` |
 | Integration | `goreleaser-check` | the asset names and archive contents of section 3 |
-| Integration | site | the build, and **anchor coverage**: `go test ./internal/server/ops/doctor -run TestDocsAnchors` (10.4: reads `docs/troubleshooting.md` and `docs/install/vps.md`; ids from the doctor registry, the `CloudProvider` constants and `web/src/conntest/codes.json`) |
+| Integration | site | the build, nothing loaded from another origin (`check-site.mjs`, 10.1, README S82), and **anchor coverage**: `go test ./internal/server/ops/doctor -run TestDocsAnchors` (10.4: reads `docs/troubleshooting.md` and `docs/install/vps.md`; ids from the doctor registry, the `CloudProvider` constants and `web/src/conntest/codes.json`; as README S82 built it, it parses every non-test file of `internal/protocol/api` for the constants and also checks the fixed pages and anchors the product links to) |
+| E2E | `site.yml`'s `check` job (10.5) | the served `/install.sh` is the latest release's, once a release exists |
 | E2E | Playwright in CI (content from `05`) | the CI plumbing: a Chrome sharer → SFU → Chrome viewer; `framesDecoded > 0`; audio energy |
 | E2E | release dry run (9.3) | build → sign → verify on snapshot artifacts with ephemeral keys |
 | E2E | VMs V1–V6 (nightly) | SELinux, sysctl, real firewalls, Pebble ACME, security score |
@@ -2761,3 +2879,15 @@ Decided after group 10 (an engineering call the owner delegated; README §6 (1))
   again before it publishes it (4.13, 9.3). F09 also fixes R5, which is 04's: `admin backup` without `--out` never
   writes into a file that already exists at the default name (04 §12.3). The review was read-only, of `main` at
   f7053dc, before the first release candidate; README §6 has its other findings and their slices.
+
+Decided after group 11 (engineering calls the owner delegated; README §6 (3), (5)):
+
+- **The site deploys only once GitHub Pages is on** (10.5). `site.yml` asks first; before the first release a run
+  without Pages stays green with the site built and checked and a warning, so `main` doesn't go red over a setting
+  of the owner's (8.6 step 5); once a release exists, a run on `main` or a release tag that didn't deploy fails, so
+  a release can't end green while its stable install URL serves nothing.
+- **The nightly departs from this doc twice, the first time until README F13** (8.5): its VM harness is inline in
+  `nightly.yml`, not a script in `deploy/test/vm/` (4.13), because S83 could change only that file; and
+  `goreleaser-full` doesn't sign (`--skip=sign`), because cosign's keyless signature would need an OIDC token in a
+  job that runs npm and a public transparency-log entry every night, while `release.yml`'s dry run covers the
+  signing.

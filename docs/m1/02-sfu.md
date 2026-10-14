@@ -106,6 +106,8 @@ internal/server/sfu/
   events.go       Signaler, RoomEvents, Event types
   errors.go       Error and codes
   stats.go        ShareInfo, ConnStats, Snapshot, Metrics
+  counters.go     the SFU's totals of §13 that Layers and DownTracks count into (README S79)
+  pionlog.go      Pion's logger factory: info lines and lines that hold an address at debug (README S79, §13)
   *_test.go
 internal/server/sfu/sfutest/   Harness, DirectSignaler, Viewer (+Recorder, checks), FaultConn, ProfileSource
 internal/server/sfu/sfutest/rembsim/  REMB model copying libwebrtc's AIMD estimator (no imports of sfu or Pion;
@@ -746,7 +748,9 @@ trying again can't help; since README S76 only the first is left:
 sfuplane needs no special case for either: both are `sfu.internal`, which it maps to 01's `internal` (01 §15.4).
 So until its slice landed, a call that reached one of these methods was answered `internal` on the wire: a
 client's `pc.close` and `pc.restart` until S57, and its `caps.update` until S69. No signaling message reaches
-`Probe`: its one caller is 04's connection-test endpoint, which README S80 wires after S76.
+`Probe`: its one caller is 04's connection-test endpoint, which README S80 wired (04 §7.7: `sfu.bad_sdp` is 400
+`bad_sdp`, `sfu.transport_disabled` 409, `sfu.probe_limit` 429 and `sfu.closed` 503 `not_ready`; any other error,
+`sfu.internal` among them, a 500).
 
 01 owns the error envelope (`error{code, retryable, scope}`); `sfuplane` maps these codes to 01's catalog (01 §15.4)
 and uses `Share` and `RetryAfter` when it builds the wire error. A §8.4 violation changes nothing, so a share whose
@@ -1411,7 +1415,9 @@ type binding struct {
     numbers looked at, across all its NACKs (§9.5).
   - `ReceiverEstimatedMaximumBitrate` → `allocator.onREMB(bitrate, now)`. The same REMB reaches several DownTracks;
     the allocator keeps the latest and compares each new value with it (§10.2), so a repeated copy changes nothing.
-  - `ReceiverReport` blocks for our SSRC → `fractionLost` → DownTrack loss EWMA and `allocator.onLoss`.
+  - `ReceiverReport` blocks for our SSRC → `fractionLost` → DownTrack loss EWMA and `allocator.onLoss`. As README
+    S79 built the first half: the last report's fraction lost, in percent and not averaged, is
+    `DownTrackStats.LossPct` (§13); the EWMA and `allocator.onLoss` are slice 11's (README S84).
 - **RTT** for the sub PC comes from the selected ICE candidate pair, sampled every 5 s. RR-based RTT is meaningless
   here because the forwarded SRs carry the publisher's NTP clock (§9.6). As README S63 built it (`subPC.sampleRTT`,
   `rtt` and `rttAt` atomics on the `subPC`): the RTCP readers of the PC's DownTracks take the sample when the
@@ -1495,8 +1501,12 @@ S52 has added them since: §10.1, §6.2). Beyond the text above it settled five 
 `forwarding atomic.Bool` (the writer forwards a layer now: `ShareInfo.Viewers`; written only with `DownTrack.mu`
 held, so a writer can't leave a paused viewer listed) and `stats` with packets, bytes, queue drops, packets
 without a payload type, unsent packets, write errors, epochs started and the viewer's keyframe requests, and the
-counters above. The RTCP reader handles PLI and FIR (video) and NACK (both kinds); REMB and receiver reports are
-slice 11's.
+counters above. The RTCP reader handles PLI and FIR (video), NACK (both kinds) and, since README S79, the receiver
+reports about its SSRC, for `LossPct`; REMB, and what the downlink allocator makes of the receiver reports, are
+slice 11's (README S84). Since README S79 the counters that §13's totals need are tallies: each also counts into the
+SFU's total of the same thing (`tally`, `counters.go`), so `Metrics` keeps what a DownTrack counted after it is gone;
+and `stats` has `lossPct` and `bitrate`, a 2 s moving average of what the DownTrack sends, media and
+retransmissions, which the ticker updates once a second (`DownTrack.tick`).
 
 Since slice 7 (README S52) the request and the cap are the **Subscription's**, not the DownTrack's: `reqVideo`,
 `reqAudio`, `capQ` and `capReason` belong to the subscriber's actor and need no lock. The DownTrack has one field
@@ -1905,9 +1915,13 @@ Two of its findings are about state that one PC grows from crafted packets, wher
   row. Fixed below Pion, in 04's netx (README F06): the peer-reflexive sources row of this table, 04 §7.8.
 - **R1, pub-PC tracks under SSRC churn**: a publishing member with a custom DTLS-SRTP client can make Pion deliver
   `OnTrack` again for each new SSRC, and the pub PC then grows tracks, reader goroutines and NACK-filter entries
-  without a bound. README F07 caps the deliveries a pub PC holds and drops the PC past the cap; its change is
-  built but not merged, **waiting for the owner** (its tests are not written yet). Until it lands, nothing in this
-  table bounds them.
+  without a bound. README F07 caps the deliveries a pub PC holds and drops the PC past the cap; its change is built
+  but not merged, **waiting for the owner** (its tests are not written yet). Until it lands, nothing in this table
+  bounds them. README F06 found a related cost of SSRC churn below `OnTrack`: for every authenticated SSRC that no
+  m-section declares, Pion keeps an SRTP and an SRTCP read stream until DTLS closes, whose buffers nobody reads
+  (pion/srtp lets them grow to 1 MB and 100 KB). netx can't bound that below the mux, where it sees source addresses
+  and no PCs; a per-PC `SettingEngine.BufferFactory`, which Pion calls with the SSRC of every new read stream, could,
+  in the SFU. That is an option for F07, not built.
 
 **What the PC creation limit counts** (README S57, `Conn.admitPC`; one window of the last 10 per Conn and kind):
 - **pub**: every pub PC the SFU makes for an offer of a new `gen`, whether or not Pion then takes that offer. An
@@ -1961,7 +1975,9 @@ type Config struct {
   04's adapters map the fields one to one.
 - Per room, one `ConnSummary` per Conn: the sub PC's selected transport (`udp` | `tcp443` | `tcp7882`, labeled as in
   §7.1) and RTT from candidate-pair stats, falling back to the pub PC; "" while not connected. `ConnID` is the id 01
-  passes in `JoinParams.Conn`. 04 fills the dashboard's `connections[].transport` and `rttMs` from it.
+  passes in `JoinParams.Conn`. 04 fills the dashboard's `connections[].transport` and `rttMs` from it. As README
+  S79 built it, the transport and the RTT fall back to the pub PC's each on its own: the sub PC's transport is ""
+  while it isn't connected, and its RTT 0 until its first sample.
 - Probe PCs (§7.6) are not counted in `Snapshot` or `Metrics`: no PC count and no PC metric includes them.
 
 ```go
@@ -2037,8 +2053,8 @@ type SubscriptionStats struct {
 	Audio          DownTrackStats
 }
 type DownTrackStats struct { // the egress numbers of one DownTrack
-	Bitrate     int     // bps, 2 s EWMA
-	LossPct     float64 // from the viewer's receiver reports
+	Bitrate     int     // bps, 2 s EWMA, media and retransmissions
+	LossPct     float64 // from the viewer's last receiver report about the track
 	NACKsServed uint64
 	Drops       uint64 // packets dropped by the DownTrack's queues
 }
@@ -2049,6 +2065,8 @@ type DownTrackStats struct { // the egress numbers of one DownTrack
   `PCs`, `Subscriptions` and `DownlinkEstimate` are empty; `Snapshot` lists rooms, shares and Conns without rates,
   viewer counts, transports or totals; `Metrics` has every label value of the table below present, with only
   `Conns` and `Shares` counting. The media path (slice 6, README S41) and slice 12 (README S79) fill in the rest.
+  Since README S79 everything is filled in but `ConnStats.DownlinkEstimate` and the `bandwidth` downgrades, which
+  come with the downlink allocator (slice 11, README S84), and `server_limit`, which has no source in M1.
 - `(*SFU).Metrics() Metrics`: plain atomics, cheap to read. 04 maps them to Prometheus (optional, off by default):
 
 | Metric | Type | Labels | Label values |
@@ -2103,6 +2121,51 @@ type Metrics struct {
 - **Logs** (slog, `component=sfu`): Conn join and leave (IDs only), PC state changes with the selected transport type,
   share lifecycle, codec-policy changes, downgrades (info); handshake timeouts, sub offers re-sent for lack of an
   answer (warn). Never SDP, never ICE candidates or client IPs above debug level, never tokens.
+
+**What README S79 settled** (slice 12; `stats.go`, `counters.go`, `pionlog.go`), where the text above leaves a
+choice:
+- **None of the three reports asks an actor or waits.** They read what the Layers and DownTracks measure (their
+  rates are the ticker's, once a second), what each Conn publishes of its PCs (`Conn.views`: Pion keeps the state
+  and the selected pair in atomics) and of its subscriptions (`Subscription.shown`: the request and the reason the
+  client last heard), and the SFU's totals.
+- **Rates** are 2 s moving averages of RTP payload, up to a second old. A share's `IngressBps` is the sum of its
+  attached layers' bitrates; its `EgressBps` and a DownTrack's `Bitrate` include the retransmissions.
+- **Transport and RTT only while connected**: `PCStats.Transport` and `RTT` are set only while the PC is
+  `connected` (before, there is no pair; after, what was measured no longer holds). The RTT is what the PC's RTCP
+  readers last read from the selected pair's statistics, every 5 s: a sub PC's DownTracks (§9.3), and since S79 a
+  pub PC's track readers too (`samplePairRTT`), for a `ConnSummary` whose sub PC has none.
+- **`Snapshot.Totals` maps hold every label**: `PCsByState` and `PCsByTransport` always have every state and every
+  transport label, zero or not, as `Metrics` does. `PCsByState` counts each Conn's current pub and sub PC (a closed
+  sub PC that is still the Conn's counts as `closed`), `PCsByTransport` the connected ones.
+- **Counters are totals per SFU** (`counters`): every Layer or DownTrack counter that feeds a counter of the table
+  is a tally that also counts into the SFU's total of the same thing, at the same moment, so a counter never goes
+  back when a share, a layer or a subscription ends. The gauges are read from the object model when `Metrics` is
+  called.
+- **A layer switch** (`isshoni_sfu_layer_switches_total`) is a viewer's video stream going on in another layer
+  than the one it was in, at once or after a pause. A resume in the same layer, or a publisher's new track for the
+  same layer, is none; the DownTrack's own `switches` still counts every new epoch.
+- **A downgrade** (`isshoni_sfu_downgrades_total{reason}`) is a `SubscriptionStateEvent` whose reason is not empty
+  and is not the one its client heard last (`Conn.tell`), `no_layer` for a share that is still pending included; a
+  `Resync()` that sends the same state again counts nothing. Each is logged at info ("subscription downgraded",
+  with the share id, the requested and forwarded quality and the reason).
+- **Log levels**: the PC state line carries `transport` (the §7.1 label, never an address) on the `connected` line
+  only. Handshake timeouts are warnings (they were info before S79), and so are sub offers sent again (they were
+  debug).
+- **Pion's own lines** reach the log through 04's bridge (04 §10: Pion's levels kept, its debug and info lines only
+  while debug is on, 20 lines a minute per scope, no SDP-like line), under `component=sfu` with the scope, and the
+  SFU's logger factory (`pionlog.go`) changes two things on top: Pion's info lines are debug lines (they repeat,
+  without ids, what the SFU says itself), and so are its warnings and errors that hold an IP address (a check from a
+  stray address names it). Pion's other warnings and errors keep their level. The group 11 integration made netx's
+  Pion logger send Pion's info lines to debug as well (04 §7.3), so that at info and above no line, Pion's
+  included, names an address (README §6 "Decided after group 11" (2)).
+- **Tests**: `TestMetricsAfterLayerSwitches` (every metric after integration 2, and `Snapshot` and both Conns'
+  `Stats` of the same session), `TestLogsHoldNoSDPOrAddresses` (the log capture test: a session with every kind of
+  SFU line, on the ICE-TCP transports too and with a probe, logged at debug and at info; it fails on SDP, a
+  candidate or an IP address in any component's line at info and above), and in `stats_test.go`
+  `TestSnapshotGolden` (`testdata/golden/snapshot.json`, with exact rates from a hand-fed media path and the test's
+  clock), `TestTotalsOutliveTheirObjects` (every total wired by hand driven to a value of its own, and kept after
+  the share ends), `TestDownTrackTick`, `TestPionLogs`, `TestHoldsAddress` and `TestDowngradeReasons`;
+  integrations 12 and 13 read `codec_mismatch`, `decoder_unavailable` and `decoder_failed` from `Metrics`.
 
 ## 14. Code reuse and attribution
 
@@ -2439,6 +2502,11 @@ with `fake.Source`, `sfutest.Viewer`)**
    5 s of §7.3, so about 5 s rather than 3) and at least 3 s; then `Resync()`, the viewer's `RestartICE` and the
    unblocking follow one another at once. `Resync()` starts the restart and the viewer's request finds it under
    way (§5.3), so the test sees three sub offers in all and none sent into the dead signaling.
+   S57 timed it so because with Pion's 7 checks per pair, a restart asked for while the viewer's network was still
+   away gave each pair up about 1.5 s after its answer and never connected. Since README F10 the sub PCs check a
+   pair for the length of the failed timeout (§7.3), so the request may now come during the outage, as a client's
+   does 3 s after its ICE noticed (01 §11.5 B); 01's `TestUDPBlackHoleViewer` (01 §19 case 5) asks that way.
+   `TestSubICERestart` keeps S57's timing.
 8. `TestPubPCRebuild`: the publisher replaces its pub PC and offers `gen + 1` with the same share ids in `tracks`;
    viewers get no new sub offer; video resumes on a keyframe; the share goes `stalled` → `live`; ShareID unchanged.
 9. `TestSubPCRebuild`: `ResetPC(sub)` → new offer with all subscriptions; media resumes.
@@ -2767,7 +2835,17 @@ filter's tests in `sdpcheck_test.go`).
   `Timings.CodecRetry` in `export_test.go` (§15.1, §17).
 
 Still to come in the paths S69 touched: the codec downgrade counters of §13 (`isshoni_sfu_downgrades_total` by
-reason, README S79).
+reason, README S79). README S79 built them since: integrations 12 and 13 read them from `Metrics`.
+
+**What README S79 built** (slice 12; `stats.go`, `counters.go`, `pionlog.go`, with `observability_test.go` and
+`stats_test.go`). `Conn.Stats`, `SFU.Snapshot` and `SFU.Metrics` report everything of §13 but what slice 11 adds (the
+downlink estimate and the `bandwidth` downgrades) and `server_limit`, which is later. §13 "What README S79 settled"
+has the rules it chose: totals per SFU that Layers and DownTracks count into, so counters never go back; transport and
+RTT only while a PC is connected, the pub PC's RTT read too; every label in `Snapshot`'s totals; what counts as a
+layer switch and as a downgrade; the log levels, with Pion's info lines and its lines that hold an address at debug.
+It also reads the viewer's receiver reports for `DownTrackStats.LossPct` (§9.3) and gives each DownTrack its bitrate
+on the ticker. The SFU's count of handshake timeouts moved into its totals. Its one handover outside the package,
+netx's Pion info lines at info when the log level is debug, the group 11 integration fixed (04 §7.3).
 
 ## Decisions taken at integration (formerly open questions)
 
@@ -2787,3 +2865,11 @@ Decided after group 10 (engineering calls the owner delegated; README §6):
 4. **The M1 security review's two findings in this doc** (§12): R3, peer-reflexive sources, is bounded below Pion
    in 04's netx, 64 per local ICE ufrag (README F06); R1, pub-PC tracks under SSRC churn, has a fix that waits for
    the owner (README F07).
+
+Decided after group 11 (an engineering call the owner delegated; README §6 (2)):
+
+5. **Pion's info lines are debug lines**, and so are its warnings and errors that hold an IP address (§13,
+   `pionlog.go`; README S79). Pion logs about ten info lines for each PeerConnection that connects and closes,
+   which repeat without ids what the SFU logs itself, and its lines about stray checks name the client's address.
+   04's netx does the same for its muxes' Pion logger, whose warnings were debug lines already (04 §7.3). So at
+   info and above no line of Pion's names an address, and the log capture test checks every component (§13).
