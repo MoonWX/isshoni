@@ -12,13 +12,34 @@ import (
 	"strings"
 )
 
-// metricColumn is one scrape column of run.csv: the sum of every series of one metric, or of the series whose label
-// has one value. The metrics are 06 §12.3's list (names from 01 §18, 02 §13 and 04 §11.2).
+// metricColumn is one scrape column of run.csv: the sum of every series of one metric, or of the series whose
+// labels have the given values. The metrics are 06 §12.3's list (names from 01 §18, 02 §13 and 04 §11.2).
 type metricColumn struct {
 	col    string
 	metric string
-	label  string // "" sums every series
-	value  string
+	match  []promLabel // the labels a series must have; none sums every series
+}
+
+// matches reports whether the series is one of the column's.
+func (m *metricColumn) matches(s *promSample) bool {
+	if s.name != m.metric {
+		return false
+	}
+	for _, l := range m.match {
+		if v, ok := s.label(l.name); !ok || v != l.value {
+			return false
+		}
+	}
+	return true
+}
+
+// with is the label match of a column: with("kind", "video", "forwarding", "high").
+func with(nameValues ...string) []promLabel {
+	ls := make([]promLabel, 0, len(nameValues)/2)
+	for i := 0; i+1 < len(nameValues); i += 2 {
+		ls = append(ls, promLabel{name: nameValues[i], value: nameValues[i+1]})
+	}
+	return ls
 }
 
 var metricColumns = []metricColumn{
@@ -30,21 +51,28 @@ var metricColumns = []metricColumn{
 	{col: "participants", metric: "isshoni_participants"},
 	{col: "shares", metric: "isshoni_shares"},
 	{col: "sfu_downtracks", metric: "isshoni_sfu_downtracks"},
+	// The video DownTracks that forward a layer (02 §13: forwarding high or low, not off): one per video track that
+	// a viewer receives, the focus and the thumbnails. Their time is the watch time that the viewers' freezes,
+	// which they report per inbound video track, are a share of.
+	{col: "sfu_video_downtracks_high", metric: "isshoni_sfu_downtracks",
+		match: with("kind", "video", "forwarding", "high")},
+	{col: "sfu_video_downtracks_low", metric: "isshoni_sfu_downtracks",
+		match: with("kind", "video", "forwarding", "low")},
 	// Counters.
 	{col: "sfu_ingress_bytes_total", metric: "isshoni_sfu_ingress_bytes_total"},
 	{col: "sfu_egress_bytes_total", metric: "isshoni_sfu_egress_bytes_total"},
 	{col: "sfu_nack_served_total", metric: "isshoni_sfu_nack_served_total"},
 	{col: "sfu_pli_sent_total", metric: "isshoni_sfu_pli_sent_total"},
 	{col: "sfu_layer_switches_total", metric: "isshoni_sfu_layer_switches_total"},
-	{col: "transfer_ingress_bytes_total", metric: "isshoni_transfer_bytes_total", label: "direction", value: "ingress"},
-	{col: "transfer_egress_bytes_total", metric: "isshoni_transfer_bytes_total", label: "direction", value: "egress"},
+	{col: "transfer_ingress_bytes_total", metric: "isshoni_transfer_bytes_total", match: with("direction", "ingress")},
+	{col: "transfer_egress_bytes_total", metric: "isshoni_transfer_bytes_total", match: with("direction", "egress")},
 	// Signaling reconnects and resumes.
-	{col: "ws_resume_resumed_total", metric: "isshoni_ws_resume_total", label: "result", value: "resumed"},
-	{col: "ws_resume_not_resumed_total", metric: "isshoni_ws_resume_total", label: "result", value: "not_resumed"},
+	{col: "ws_resume_resumed_total", metric: "isshoni_ws_resume_total", match: with("result", "resumed")},
+	{col: "ws_resume_not_resumed_total", metric: "isshoni_ws_resume_total", match: with("result", "not_resumed")},
 	// Connected PeerConnections by the transport of their selected candidate pair.
-	{col: "transport_udp", metric: "isshoni_sfu_selected_transport", label: "transport", value: "udp"},
-	{col: "transport_tcp443", metric: "isshoni_sfu_selected_transport", label: "transport", value: "tcp443"},
-	{col: "transport_tcp7882", metric: "isshoni_sfu_selected_transport", label: "transport", value: "tcp7882"},
+	{col: "transport_udp", metric: "isshoni_sfu_selected_transport", match: with("transport", "udp")},
+	{col: "transport_tcp443", metric: "isshoni_sfu_selected_transport", match: with("transport", "tcp443")},
+	{col: "transport_tcp7882", metric: "isshoni_sfu_selected_transport", match: with("transport", "tcp7882")},
 	// The viewers' own numbers, from their stats reports (01 §8.11).
 	{col: "client_frames_decoded_total", metric: "isshoni_client_frames_decoded_total"},
 	{col: "client_frames_dropped_total", metric: "isshoni_client_frames_dropped_total"},
@@ -202,16 +230,12 @@ func parsePromLabels(s string) ([]promLabel, string, error) {
 // (an empty cell), never a 0 that would read as a measurement. NaN and infinite values are left out.
 func metricValues(samples []promSample) map[string]float64 {
 	vals := make(map[string]float64)
-	for _, m := range metricColumns {
-		for i := range samples {
-			s := &samples[i]
-			if s.name != m.metric || math.IsNaN(s.value) || math.IsInf(s.value, 0) {
+	for i := range metricColumns {
+		m := &metricColumns[i]
+		for j := range samples {
+			s := &samples[j]
+			if !m.matches(s) || math.IsNaN(s.value) || math.IsInf(s.value, 0) {
 				continue
-			}
-			if m.label != "" {
-				if v, ok := s.label(m.label); !ok || v != m.value {
-					continue
-				}
 			}
 			vals[m.col] += s.value
 		}

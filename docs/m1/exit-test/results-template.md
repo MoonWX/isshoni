@@ -32,7 +32,7 @@
 | Time | What to record | Result |
 |---|---|---|
 | T−5 | the dashboard shows E as `tcp443`; E: seconds from the link to video playing | |
-| T+0 | per person: seconds from the link to video playing (sign-up → Lounge → B's share → one tap to unmute) | C …, D …, A … |
+| T+0 | C and D: seconds from the link to video playing (sign-up → Lounge → B's share → one tap to unmute) | C …, D … |
 | T+5 | A's share takes focus; audio and video OK for everyone | |
 | T+10 | switching focus moves the audio | |
 | T+15 | C and D install the app and log in once inside it; notifications allowed (C, D, E) | |
@@ -59,7 +59,9 @@ the unlock) are not manual fixes. Anything else is.
 
 ## Summary
 
-<!-- Paste the output of `exittest summarize run.csv` below, as it is. -->
+<!-- Paste the output of `exittest summarize run.csv` below, as it is: it has no title, and its sections are ###
+     headings that go under this one. Its pass-criteria table is the recording's half; the table below is the
+     verdict. -->
 
 ## Pass criteria
 
@@ -109,8 +111,11 @@ The rows checked on the day; the others in their own run.
 
 ## Journal
 
-<!-- `journalctl -u isshoni -p warning --since … --until …` for T−15 to T+120, with every IP address replaced by
-     <ip> and every name by A–E. -->
+<!-- T−15 to T+120 (run book §3, "The journal"): isshoni's warnings and errors,
+       journalctl -u isshoni --since … --until … -o cat | grep -E '"level":"(WARN|ERROR)|^(panic|fatal error): '
+     and systemd's own messages about the unit,
+       journalctl -u isshoni --since … --until … -p warning --no-hostname
+     with every IP address replaced by <ip> and every name by A–E. -->
 
 ```
 ```

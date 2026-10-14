@@ -36,7 +36,8 @@ func metricsPage(participants, shares, tcp443 int, scale float64) string {
 	p(`isshoni_shares{status="starting"} 0`)
 	p(`isshoni_sfu_downtracks{forwarding="high",kind="audio"} %d`, shares*(participants-1))
 	p(`isshoni_sfu_downtracks{forwarding="high",kind="video"} %d`, shares*(participants-1))
-	p(`isshoni_sfu_downtracks{forwarding="low",kind="video"} 0`)
+	p(`isshoni_sfu_downtracks{forwarding="low",kind="video"} 1`)
+	p(`isshoni_sfu_downtracks{forwarding="off",kind="video"} 2`)
 	p(`isshoni_sfu_ingress_bytes_total{kind="audio"} %g`, 1e6*scale)
 	p(`isshoni_sfu_ingress_bytes_total{kind="video"} %g`, 1e9*scale)
 	p(`isshoni_sfu_egress_bytes_total{kind="audio"} %g`, 4e6*scale)
@@ -73,7 +74,7 @@ func TestParsePromText(t *testing.T) {
 	vals := metricValues(samples)
 	want := map[string]float64{
 		"go_goroutines": 40 + 70 + 60, "process_resident_memory_bytes": 50 << 20, "process_cpu_seconds_total": 12.5,
-		"participants": 5, "shares": 2, "sfu_downtracks": 16,
+		"participants": 5, "shares": 2, "sfu_downtracks": 19, "sfu_video_downtracks_high": 8, "sfu_video_downtracks_low": 1,
 		"sfu_ingress_bytes_total": 1.001e9, "sfu_egress_bytes_total": 4.004e9, "sfu_nack_served_total": 300,
 		"sfu_pli_sent_total": 20, "sfu_layer_switches_total": 30,
 		"transfer_ingress_bytes_total": 1.05e9, "transfer_egress_bytes_total": 4.201e9,

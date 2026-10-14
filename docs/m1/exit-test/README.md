@@ -57,11 +57,12 @@ matrix (05 §19.4), outside the exit test.
 
   then `sudo systemctl restart isshoni`, and check on the VPS:
   `curl -s http://127.0.0.1:9469/metrics | grep -E '^isshoni_(participants|ready)'`.
-- [ ] Build the collector on your machine (one static file; `GOARCH=arm64` for an ARM VPS) and copy it over:
+- [ ] Build the collector on your machine, in the repository's checkout (one static file; `GOARCH=arm64` for an
+  ARM VPS), into the ignored `bin/`, and copy it over:
 
   ```sh
-  GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go -C tools build -o ../exittest ./exittest
-  scp exittest <user>@<domain>:
+  GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go -C tools build -o ../bin/exittest ./exittest
+  scp bin/exittest <user>@<domain>:
   ```
 
 - [ ] Try it on the VPS for a minute, then throw the try away:
@@ -128,20 +129,23 @@ seconds (a phone's stopwatch) is enough.
 - [ ] **T−15** A starts the collector on the VPS, **detached from the SSH session** (A's Wi-Fi drops at T+75):
 
   ```sh
-  sudo systemd-run --unit=exittest-collect --working-directory="$PWD" "$PWD/exittest" collect -o run.csv \
-    -metrics http://127.0.0.1:9469/metrics
+  sudo systemd-run --collect --unit=exittest-collect --working-directory="$PWD" "$PWD/exittest" collect \
+    -o run.csv -metrics http://127.0.0.1:9469/metrics
   systemctl status exittest-collect   # active (running)
   tail -n 3 run.csv                   # a start row, then sample and scrape rows
   ```
 
-  (`tmux` works too: `sudo ./exittest collect -o run.csv -metrics http://127.0.0.1:9469/metrics` inside it.)
+  If the status is not "active (running)" (with `--collect` a collector that exited is unloaded at once, so the
+  status may say the unit "could not be found"), `sudo journalctl -u exittest-collect -n 20` says why; fix it and
+  run the same `systemd-run` command again. (`tmux` works too:
+  `sudo ./exittest collect -o run.csv -metrics http://127.0.0.1:9469/metrics` inside it.)
 - [ ] **T−5** B and E sign up with the invite link. B starts a window share (a video in a window), so the others
   have something to watch from their first second. E's firewall rules are in place.
   *Record:* the admin dashboard shows E's connection as `tcp443` (pre-flight 4; if not, fix E's rules before
   T+0); E's seconds from opening the link to video playing.
 - [ ] **T+0** A posts the invite link in the voice chat. C and D **long-press it → Open in Safari (C) / Chrome
   (D)**, not the chat app's built-in browser, and sign up there.
-  *Record, per person:* seconds from opening the link to video playing (link → sign-up form → Lounge → B's share
+  *Record, for C and D:* seconds from opening the link to video playing (link → sign-up form → Lounge → B's share
   plays → one tap to unmute), the plan's first-join journey.
 - [ ] **T+5** A shares (Movie). Nobody should have clicked a tile before this: once a friend has picked a tile, a
   new share only shows a "… started sharing [Watch]" toast and the stage stays on the picked share (05 §24).
@@ -213,16 +217,31 @@ with a `stop` row. Started again with the same `-o`, it appends.
 every row the recording can measure (server CPU, memory, goroutines, UDP socket errors, and supporting numbers for
 recovery, viewing quality and ICE-TCP), each process's CPU and memory, and every counter's total and rates per
 process and in all. Rates and totals are per process, split at the restart, and a counter that goes down counts
-as reset, the Prometheus way (the scraped counters start again at zero at T+60). T+0 is taken as 60 minutes before
-the restart; if the restart was not at T+60, or did not happen, give T+0 yourself: `-t0 18:00` (UTC) or
-`-t0 2026-10-15T20:00:00+02:00`.
+as reset, the Prometheus way (the scraped counters start again at zero at T+60). A row passes only on what was
+recorded: a gap of more than 2 minutes in the samples, CPU samples that miss the stress or a tenth of the session,
+or counters that reset without a PID change (a restart in place, 04 §6.5) make it `check`. The recovery row gives
+the outage as a range, because the participants are scraped every 30 s; the viewers' freeze time is a share of the
+video tracks they watched, as they report freezes per track. T+0 is taken as 60 minutes before the restart; if the
+restart was not at T+60, or did not happen, give T+0 yourself: `-t0 18:00` (UTC) or `-t0 2026-10-15T20:00:00+02:00`.
 
 **From the people and the admin dashboard:** the per-person times of §2.1, the expected actions and manual fixes,
 freezes longer than 2 s, E's transport (the dashboard's connections show each one's transport and last stats) and
 C's freezes, the survey.
 
-**The journal:** the warnings and errors of the session, `journalctl -u isshoni -p warning --since "<T−15>"
---until "<T+120>"`, with any IP address replaced by `<ip>` and any name by A–E before it goes into the results.
+**The journal:** the warnings and errors of the session. isshoni writes its log as JSON lines that the journal
+stores at one priority, so `-p warning` doesn't find its warnings: filter on the JSON `level` instead, and take
+systemd's own messages about the unit (a crash, the failed state) with `-p warning`. Give the times with their
+zone, such as `"2026-10-15 17:45 UTC"`; without one, journalctl reads them in the VPS's time zone:
+
+```sh
+# isshoni's warnings and errors, and a crash's panic if there was one:
+sudo journalctl -u isshoni --since "<T−15>" --until "<T+120>" -o cat |
+  grep -E '"level":"(WARN|ERROR)|^(panic|fatal error): '
+# systemd's own messages about the unit:
+sudo journalctl -u isshoni --since "<T−15>" --until "<T+120>" -p warning --no-hostname
+```
+
+Replace any IP address by `<ip>` and any name by A–E before the excerpt goes into the results.
 
 ## 4. The survey
 
@@ -255,13 +274,20 @@ dashboard or the survey) or `n/a` (not in the recording).
 
 ## 6. Afterwards
 
-- [ ] Copy the recording off the VPS and keep it private:
-  `scp -r <user>@<domain>:run.csv <user>@<domain>:run-metrics .`
-- [ ] Summarize: on the VPS `./exittest summarize run.csv > summary.md`, or locally
-  `go -C tools run ./exittest summarize "$PWD/run.csv" > summary.md` (`go -C` runs in `tools/`, so give an absolute
-  path).
+- [ ] Copy the recording off the VPS and keep it private: into the checkout's ignored `.dev/` (or anywhere outside
+  the checkout), never next to tracked files, where `git add` would pick it up:
+
+  ```sh
+  mkdir -p .dev/exit-test
+  scp -r <user>@<domain>:run.csv <user>@<domain>:run-metrics .dev/exit-test/
+  ```
+
+- [ ] Summarize, from the checkout (`go -C` runs in `tools/`, so give an absolute path):
+  `go -C tools run ./exittest summarize "$PWD/.dev/exit-test/run.csv" > .dev/exit-test/summary.md`
+  (or on the VPS: `./exittest summarize run.csv > summary.md`).
 - [ ] Turn the metrics off again (remove the `[metrics]` block, `sudo systemctl restart isshoni`), remove E's
-  firewall rules. The collector's unit is gone once stopped (`systemd-run` units are transient).
+  firewall rules. The collector's unit is gone once stopped (`systemd-run --collect` units are transient and
+  unloaded however they end).
 - [ ] Write `docs/m1/exit-test/<yyyy-mm-dd>.md` from [`results-template.md`](results-template.md): the summary,
   the per-person notes, the survey, the rows of the device matrix (05 §19.4) checked that day, and the journal
   excerpt. A to E only: no names, IPs or domains.

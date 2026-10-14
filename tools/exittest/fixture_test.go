@@ -137,6 +137,9 @@ func minutes(d time.Duration) uint64 {
 	return uint64(max(d, 0) / time.Minute) //nolint:gosec // G115: never negative
 }
 
+// videoTracks are the video tracks that the viewers receive: every share, by everyone but its sharer.
+func (s *sim) videoTracks() uint64 { return u(s.shares) * u(s.participants-1) }
+
 func (s *sim) egressKbps() uint64  { return s.watchers() * (8300 + 300*u(s.shares-1)) }
 func (s *sim) ingressKbps() uint64 { return u(s.shares) * 8400 }
 
@@ -192,7 +195,7 @@ func (s *sim) second() {
 	if s.t%(10*time.Second) == 0 {
 		c.dropped += w * 600 / 1250
 	}
-	c.freezeMs += w * 2
+	c.freezeMs += s.videoTracks() * 2 // the viewers report freezes per inbound video track
 	c.lost += eg / 8000
 	c.audio += w * 48000
 	c.concealed += w * 30

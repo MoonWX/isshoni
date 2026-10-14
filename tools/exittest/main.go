@@ -1,8 +1,8 @@
 // Command exittest records and summarizes the M1 exit test (docs/m1/06-deploy-and-ci.md §12, "06" below; the run
 // book is docs/m1/exit-test/README.md). It uses the standard library only, so the binary that runs on the VPS is
-// one static file:
+// one static file, built into the repository's ignored bin/:
 //
-//	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go -C tools build -o ../exittest ./exittest
+//	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go -C tools build -o ../bin/exittest ./exittest
 //
 // # collect
 //
@@ -10,10 +10,11 @@
 //	  [-nic NAME] [-metrics-dir DIR] [-proc /proc] [-interval 10s] [-scrape-interval 30s]
 //
 // runs on the VPS as root (it lists /proc/<pid>/fd of the isshoni user's process) until SIGTERM or SIGINT,
-// detached from the SSH session, because the owner's Wi-Fi drops at T+75 (06 §12.3):
+// detached from the SSH session, because the owner's Wi-Fi drops at T+75 (06 §12.3). --collect unloads the unit
+// however the collector ends, so the same command works again after a failed start:
 //
-//	sudo systemd-run --unit=exittest-collect --working-directory="$PWD" "$PWD/exittest" collect -o run.csv \
-//	  -metrics http://127.0.0.1:9469/metrics
+//	sudo systemd-run --collect --unit=exittest-collect --working-directory="$PWD" "$PWD/exittest" collect \
+//	  -o run.csv -metrics http://127.0.0.1:9469/metrics
 //	sudo systemctl stop exittest-collect   # at T+120
 //
 // Every -interval it appends a sample row to run.csv: the isshoni PID, looked up again each time with
@@ -51,12 +52,17 @@
 //
 //	exittest summarize [-t0 TIME] run.csv
 //
-// prints, as Markdown for the results file, the pass-criteria table of 06 §12.3 with every row that the recording
-// can measure filled in and marked pass, FAIL, check (measured, needs a look) or n/a (the others say "manual": the
-// people, the admin dashboard or the survey answer them), then each process's CPU, memory and gauges, and every
-// counter's total and rates per process and in all. Rates and totals are per process, split where the PID changes,
-// and a counter that goes down counts as reset, the Prometheus way: the increase after a reset is the new value
-// (the scraped counters start again at zero at T+60). T+0, which the windows of the pass criteria count from, is
+// prints, as Markdown for the results file (no title, ### sections: it goes under the file's "## Summary" as it
+// is), the pass-criteria table of 06 §12.3 with every row that the recording can measure filled in and marked
+// pass, FAIL, check (measured, needs a look) or n/a (the others say "manual": the people, the admin dashboard or
+// the survey answer them), then each process's CPU, memory and gauges, and every counter's total and rates per
+// process and in all. A row passes only on what was recorded: a gap of more than 2 minutes in the session, CPU
+// samples that miss a tenth of it or the stress, or a recording that does not span T+0 to T+120 make it "check".
+// Rates and totals are per process, split where the PID changes, and a counter that goes down counts as reset, the
+// Prometheus way: the increase after a reset is the new value (the scraped counters start again at zero at T+60).
+// Several of them going down at once without a PID change is a restart in place (04 §6.5), which the Session row
+// flags. The viewers' freezes are a share of the video tracks' time (the forwarding video DownTracks times time),
+// because they report them per inbound video track. T+0, which the windows of the pass criteria count from, is
 // -t0 (RFC 3339, or HH:MM[:SS] in UTC within 12 hours of the first row); without it, 60 minutes before the first
 // restart (the scripted one at T+60), or 15 minutes after the first row when there is no restart (the collector
 // starts at T-15). The output names no host, address or person.

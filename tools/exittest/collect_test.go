@@ -540,7 +540,7 @@ func TestScrapeRows(t *testing.T) {
 	if got, want := kinds(rows), "start scrape scrape_error scrape_error scrape_error stop"; got != want {
 		t.Fatalf("kinds = %s, want %s", got, want)
 	}
-	if r := rows[1]; r.note != "20261015T180000.000Z.prom; 1 lines skipped, the first: line 48: value \"broken\"" ||
+	if r := rows[1]; r.note != "20261015T180000.000Z.prom; 1 lines skipped, the first: line 49: value \"broken\"" ||
 		r.vals["participants"] != 2 || r.pid != 7 {
 		t.Errorf("scrape row = pid %d %v %q", r.pid, r.vals, r.note)
 	}

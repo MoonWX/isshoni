@@ -33,7 +33,11 @@ func TestSummarizeFixture(t *testing.T) {
 	for _, want := range []string{
 		"| Session | 2 h; the server restarts only at T+60 | recorded T-15:20 to T+119:44; restart at T+60:00; no isshoni process in 1 sample | pass |",
 		"| UDP socket errors | RcvbufErrors + SndbufErrors = 0, or < 0.01% of datagrams | 3 of ",
-		"5 participants back 10s after the restart (scraped every 30s)",
+		// The simulated outage: SIGTERM at T+59:38, all 5 back at T+60:04.
+		"5 participants in the old process's last full scrape (T+59:10) and again from T+60:10: the outage lasted " +
+			"between 10s and 1m0s (scraped every 30s)",
+		"| Viewing quality | freezes < 1% of watch time on desktop, < 3% on phones; no decode errors that need a reload | " +
+			"130.6 s frozen in 16.1 h of video tracks watched (0.23%, every device together)",
 		"none at T+18:40, T+19:10, T+19:40, T+20:10",
 		"| 1 | 4127 | T-15:20 | T+59:40 |",
 		"| 2 | 31877 | T+60:00 | T+119:40 |",
@@ -218,6 +222,24 @@ func TestCounterResets(t *testing.T) {
 	if v := a.sessionVerdict(); v.result != resFail || !strings.Contains(v.measured, "restarts at T+60:00, T+61:20") {
 		t.Errorf("session with two restarts: %+v", v)
 	}
+	// One counter that went down is no restart in place: that takes two of resetCounters at the same scrape.
+	if len(a.resets) != 0 {
+		t.Errorf("in-place restarts at %v, want none", a.resets)
+	}
+	const trOut = "transfer_egress_bytes_total"
+	a, err = analyze(runOf(t,
+		row(0, kindSample, 10, nil),
+		row(0, kindScrape, 10, map[string]float64{egress: 5000, trOut: 6000, "process_cpu_seconds_total": 10}),
+		row(30*s, kindScrape, 10, map[string]float64{egress: 7000, trOut: 8000, "process_cpu_seconds_total": 11}),
+		row(60*s, kindScrape, 10, map[string]float64{egress: 100, trOut: 200, "process_cpu_seconds_total": 12}),
+	), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(a.resets) != 1 || !a.resets[0].Equal(simT0.Add(60*s)) || a.metric[egress].total != 2100 {
+		t.Errorf("in-place restarts at %v, egress %v; want one at %v and 2100", a.resets, a.metric[egress].total,
+			simT0.Add(60*s))
+	}
 }
 
 func TestSummarizeVerdicts(t *testing.T) {
@@ -242,7 +264,7 @@ func TestSummarizeVerdicts(t *testing.T) {
 		if i%3 == 0 {
 			rows = append(rows, row(at, kindScrape, 42, map[string]float64{
 				"go_goroutines": 100 + float64(i), "participants": 5, "shares": 2, "transport_tcp443": 0,
-				"client_freeze_seconds_total": float64(i) * 50,
+				colVideoHigh: 4, colVideoLow: 4, "client_freeze_seconds_total": float64(i) * 50,
 			}))
 		}
 	}
@@ -271,6 +293,148 @@ func TestSummarizeVerdicts(t *testing.T) {
 	}
 	if !strings.Contains(got["Session"].measured, "no restart") {
 		t.Errorf("Session: %s", got["Session"].measured)
+	}
+}
+
+// sessionKnobs change healthySession.
+type sessionKnobs struct {
+	drop      func(at time.Duration) bool // leaves out the rows at these offsets from T+0
+	resetAt   time.Duration               // the counters start again at 0 here, the PID unchanged (0: never)
+	backAt    time.Duration               // the new process has all 5 participants from here (0: T+60:30)
+	freezePct float64                     // the share of the video tracks' time that is frozen
+	traffic   float64                     // UDP datagrams in and out per sample (0: none)
+}
+
+// healthySession records a session that passes: a sample every 10 s and a scrape every 30 s from T-15 to T+120,
+// the restart at T+60 (PID 100, then 200; the 10 s between the two processes' samples are not covered), 5
+// participants who watch 2 shares (8 video tracks), 20% CPU, a flat
+// RSS and goroutine count, no UDP socket error, a PeerConnection on TCP 443.
+func healthySession(k sessionKnobs) []*runRow {
+	if k.backAt == 0 {
+		k.backAt = mm(60, 30)
+	}
+	rows := []*runRow{row(-15*time.Minute, kindStart, 0, nil)}
+	add := func(r *runRow) {
+		if k.drop == nil || !k.drop(r.t.Sub(simT0)) {
+			rows = append(rows, r)
+		}
+	}
+	var ticks, counters, freeze, udp float64
+	for i := 0; i <= 135*6; i++ {
+		at := -15*time.Minute + time.Duration(i)*10*time.Second
+		pid := 100
+		if at >= 60*time.Minute {
+			pid = 200
+		}
+		if at == 60*time.Minute || k.resetAt != 0 && at == k.resetAt {
+			ticks, counters, freeze = 0, 0, 0
+			if at == 60*time.Minute {
+				add(row(at, kindRestart, pid, nil))
+			}
+		}
+		ticks += 0.2 * 2 * 10 * userHZ
+		if at == k.resetAt {
+			ticks += 1000 // the kernel's CPU time survives an exec
+		}
+		udp += k.traffic
+		add(row(at, kindSample, pid, map[string]float64{
+			colCPUTicks: ticks, colCPUs: 2, colRSS: 100e6, colHostCPUPct: 25, colUDPIn: udp, colUDPOut: udp,
+			colUDPRcvbufErrs: 0, colUDPSndbufErrs: 0,
+		}))
+		if i%3 != 0 {
+			continue
+		}
+		participants := 5.0
+		if at >= 60*time.Minute && at < k.backAt {
+			participants = 2
+		}
+		counters += 1e6
+		freeze += 8 * 30 * k.freezePct / 100
+		add(row(at, kindScrape, pid, map[string]float64{
+			"go_goroutines": 200, "participants": participants, "shares": 2, "transport_tcp443": 1,
+			colVideoHigh: 4, colVideoLow: 4, "client_freeze_seconds_total": freeze,
+			"sfu_ingress_bytes_total": counters, "sfu_egress_bytes_total": 4 * counters,
+			"transfer_ingress_bytes_total": counters, "transfer_egress_bytes_total": 4 * counters,
+		}))
+	}
+	return rows
+}
+
+func verdictsOf(t *testing.T, t0 string, rows []*runRow) map[string]verdict {
+	t.Helper()
+	a, err := analyze(runOf(t, rows...), t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]verdict{}
+	for _, v := range a.verdicts() {
+		got[v.measure] = v
+	}
+	return got
+}
+
+// TestSummarizeCoverage: a verdict passes only on what the recording measured. Gaps, a short recording, a missed
+// stress window and a restart that kept its PID make the rows "check"; no traffic is "n/a".
+func TestSummarizeCoverage(t *testing.T) {
+	between := func(from, to time.Duration) func(time.Duration) bool {
+		return func(at time.Duration) bool { return at > from && at < to }
+	}
+	for _, tc := range []struct {
+		name string
+		t0   string
+		rows []*runRow
+		want map[string]string // measure: result, then what the measured text must contain
+	}{
+		{"healthy", "", healthySession(sessionKnobs{freezePct: 0.2, traffic: 1000}), map[string]string{
+			"Session": "pass", "Server CPU": "pass|the samples cover 99.9% of T+0 to T+120", "Memory": "pass",
+			"Goroutines": "pass", "UDP socket errors": "pass|0 of ", "Recovery": "manual|lasted between 0s and 1m0s",
+			"Viewing quality": "manual|(0.20%, every device together)", "ICE-TCP": "manual",
+		}},
+		{"a 53-minute gap", "18:00", healthySession(sessionKnobs{traffic: 1000, drop: between(mm(5, 0), mm(58, 0))}),
+			map[string]string{
+				"Session":    "check|no sample from T+5:00 to T+58:00",
+				"Server CPU": "check|the samples cover 55.7% of T+0 to T+120", "Memory": "pass", "UDP socket errors": "pass",
+			}},
+		{"the stress missed", "", healthySession(sessionKnobs{traffic: 1000, drop: between(mm(90, 0), mm(100, 10))}),
+			map[string]string{
+				"Session":    "check|no sample from T+90:00 to T+100:10",
+				"Server CPU": "check|the samples cover 91.4% of T+0 to T+120, none of the stress (T+90 to T+100)",
+			}},
+		{"ends at T+70", "", healthySession(sessionKnobs{traffic: 1000, drop: func(at time.Duration) bool { return at > mm(70, 0) }}),
+			map[string]string{
+				"Session": "check|recorded T-15:00 to T+70:00", "Server CPU": "check|the samples cover 58.2%",
+				"Memory": "check|short of T+65 to T+120", "UDP socket errors": "check|does not cover T+0 to T+120",
+			}},
+		{"in-place restart", "", healthySession(sessionKnobs{traffic: 1000, resetAt: mm(30, 0)}), map[string]string{
+			"Session": "check|counters reset at T+30:00 without a PID change (in-place restart?)",
+		}},
+		{"9 seconds without traffic", "18:00", []*runRow{
+			row(0, kindStart, 0, nil),
+			row(0, kindSample, 7, map[string]float64{colCPUTicks: 100, colCPUs: 2, colUDPIn: 5, colUDPOut: 5,
+				colUDPRcvbufErrs: 0, colUDPSndbufErrs: 0}),
+			row(9*time.Second, kindSample, 7, map[string]float64{colCPUTicks: 101, colCPUs: 2, colUDPIn: 5, colUDPOut: 5,
+				colUDPRcvbufErrs: 0, colUDPSndbufErrs: 0}),
+		}, map[string]string{
+			"Session": "check", "Server CPU": "check|the samples cover 0.1% of T+0 to T+120", "UDP socket errors": "n/a|0 of 0",
+		}},
+		{"slow recovery", "", healthySession(sessionKnobs{traffic: 1000, backAt: mm(61, 30)}), map[string]string{
+			"Recovery": "check|last full scrape (T+59:30) and again from T+61:30: the outage lasted between 1m0s and 2m0s",
+		}},
+		{"freezes per track", "", healthySession(sessionKnobs{traffic: 1000, freezePct: 2.5}), map[string]string{
+			// 4% of the participants' time, which a viewer of two shares counts twice: under the phones' 3%.
+			"Viewing quality": "manual|(2.51%, every device together)",
+		}},
+		{"freezes over 3%", "", healthySession(sessionKnobs{traffic: 1000, freezePct: 3.5}), map[string]string{
+			"Viewing quality": "FAIL|(3.51%, every device together)",
+		}},
+	} {
+		got := verdictsOf(t, tc.t0, tc.rows)
+		for measure, want := range tc.want {
+			result, text, _ := strings.Cut(want, "|")
+			if v := got[measure]; v.result != result || !strings.Contains(v.measured, text) {
+				t.Errorf("%s: %s: %s (%s), want %s with %q", tc.name, measure, v.result, v.measured, result, text)
+			}
+		}
 	}
 }
 
@@ -389,7 +553,7 @@ func FuzzSummarize(f *testing.F) {
 		if err := a.write(&out, "run.csv"); err != nil {
 			t.Fatal(err)
 		}
-		if !strings.HasPrefix(out.String(), "# Exit test summary (run.csv)") {
+		if !strings.HasPrefix(out.String(), "run.csv: recorded ") {
 			t.Fatalf("output starts %q", out.String()[:min(out.Len(), 80)])
 		}
 	})

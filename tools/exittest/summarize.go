@@ -27,6 +27,10 @@ const (
 	markBaseline   = 85 * time.Minute // goroutines before the stress
 	markStressFrom = 90 * time.Minute
 	markStressTo   = 100 * time.Minute
+	// markGapLimit: a gap in the samples longer than this inside the session leaves part of it unwatched.
+	markGapLimit = 2 * time.Minute
+	// markRecoveryLook: the participants before the restart are the most in the old process's last 5 minutes.
+	markRecoveryLook = 5 * time.Minute
 )
 
 // The pass limits of 06 §12.3.
@@ -36,7 +40,23 @@ const (
 	limitRSSGrowth   = 20.0   // percent
 	limitUDPErrRatio = 0.0001 // 0.01% of datagrams
 	limitFreezeFail  = 3.0    // percent: above the phones' limit, which is the larger, the session failed
-	goroutineSlack   = 0.10   // "back to the baseline": at most 10% above it
+	limitRecovery    = 30 * time.Second
+	goroutineSlack   = 0.10 // "back to the baseline": at most 10% above it
+	limitCPUCover    = 90.0 // percent of T+0 to T+120 that the CPU samples must cover for a pass
+)
+
+// resetCounters are the scraped counters that start again at 0 with the server's state: when several of them go
+// down at the same scrape of one PID, the server restarted in place (04 §6.5: a re-exec after a restore or
+// rotate-secrets, or when it found its public address), which keeps the PID and the process's start time.
+// process_cpu_seconds_total is not one of them: the kernel's count survives the exec.
+var resetCounters = []string{
+	"sfu_ingress_bytes_total", "sfu_egress_bytes_total", "transfer_ingress_bytes_total", "transfer_egress_bytes_total",
+}
+
+// The columns of the video DownTracks that forward a layer (scrape.go).
+const (
+	colVideoHigh = "sfu_video_downtracks_high"
+	colVideoLow  = "sfu_video_downtracks_low"
 )
 
 // hostCounters are the machine's counters (since boot); the scraped counters are the metric columns whose name
@@ -76,6 +96,9 @@ type segment struct {
 
 func (s *segment) contains(t time.Time) bool { return !t.Before(s.from) && !t.After(s.to) }
 
+// span is a stretch of time, from its start to its end.
+type span struct{ from, to time.Time }
+
 // analysis is everything summarize prints.
 type analysis struct {
 	rows        []*runRow
@@ -85,9 +108,10 @@ type analysis struct {
 	anchor      string
 	segs        []*segment
 	interval    time.Duration // the median time between two samples
-	gaps        int
+	gaps        []span        // the samples' gaps: more than 2.5 intervals without a sample or down row
 	longestGap  time.Duration
-	starts      int // start rows: how often the collector started
+	resets      []time.Time // scrapes where the counters reset without a PID change (resetCounters)
+	starts      int         // start rows: how often the collector started
 	samples     int
 	downs       int
 	scrapes     int
@@ -115,6 +139,13 @@ func analyze(rf *runFile, t0 string) (*analysis, error) {
 	return a, nil
 }
 
+// last is a counter's value in the last row that had it, and that row's process (nil for the machine's counters).
+type last struct {
+	v   float64
+	t   time.Time
+	seg *segment
+}
+
 // split assigns the rows to processes and adds up the counters, in one pass in the order of the file.
 func (a *analysis) split() {
 	var cur *segment
@@ -124,11 +155,6 @@ func (a *analysis) split() {
 			host: make(map[string]*counterAcc), metric: make(map[string]*counterAcc),
 		}
 		a.segs = append(a.segs, cur)
-	}
-	type last struct {
-		v   float64
-		t   time.Time
-		seg *segment
 	}
 	prevHost := make(map[string]last)
 	prevMetric := make(map[string]last)
@@ -200,6 +226,9 @@ func (a *analysis) split() {
 		// counts whole (a process that started inside the recording, or a labeled series that client_golang only
 		// shows from its first increase), and one that went down counts as reset.
 		if r.kind == kindScrape && cur != nil && r.pid == cur.pid {
+			if a.countersReset(r, cur, prevMetric) {
+				a.resets = append(a.resets, r.t)
+			}
 			for _, m := range metricColumns {
 				v, ok := r.vals[m.col]
 				if !ok || !isMetricCounter(m.col) {
@@ -225,23 +254,40 @@ func (a *analysis) split() {
 	}
 
 	// The sampling interval and the collector's gaps (more than 2.5 intervals without a sample).
-	var dts []time.Duration
+	var steps []span
 	for i := 1; i < len(sampleTimes); i++ {
-		if dt := sampleTimes[i].Sub(sampleTimes[i-1]); dt > 0 {
-			dts = append(dts, dt)
+		if sampleTimes[i].After(sampleTimes[i-1]) {
+			steps = append(steps, span{sampleTimes[i-1], sampleTimes[i]})
 		}
 	}
-	if len(dts) > 0 {
-		sorted := slices.Clone(dts)
-		slices.Sort(sorted)
-		a.interval = sorted[len(sorted)/2]
-		for _, dt := range dts {
-			if dt > a.interval*5/2 {
-				a.gaps++
+	if len(steps) > 0 {
+		dts := make([]time.Duration, len(steps))
+		for i, st := range steps {
+			dts[i] = st.to.Sub(st.from)
+		}
+		slices.Sort(dts)
+		a.interval = dts[len(dts)/2]
+		for _, st := range steps {
+			if dt := st.to.Sub(st.from); dt > a.interval*5/2 {
+				a.gaps = append(a.gaps, st)
 				a.longestGap = max(a.longestGap, dt)
 			}
 		}
 	}
+}
+
+// countersReset reports whether at least two of resetCounters went down at scrape r of process cur since its
+// previous scrape: an in-place restart, which keeps the PID. One counter alone may be an odd series.
+func (a *analysis) countersReset(r *runRow, cur *segment, prev map[string]last) bool {
+	n := 0
+	for _, col := range resetCounters {
+		v, ok := r.vals[col]
+		p, seen := prev[col]
+		if ok && seen && p.seg == cur && v < p.v {
+			n++
+		}
+	}
+	return n >= 2
 }
 
 func acc(m map[string]*counterAcc, col string) *counterAcc {
@@ -331,9 +377,18 @@ const (
 	resNA     = "n/a"
 )
 
-// cpuWindow is the process's CPU over the sample pairs whose later sample is in (from, to]: the average weighted
-// by time, and the largest pair.
-func (a *analysis) cpuWindow(segs []*segment, from, to time.Time) (avg, peak float64, cpus int, ok bool) {
+// cpuStats is the process's CPU in a window.
+type cpuStats struct {
+	avg, peak float64 // percent of all CPUs: the average weighted by time, and the largest pair of samples
+	cpus      int
+	// covered is the part of the window that pairs of samples no gap apart span: the time whose peak was seen.
+	covered time.Duration
+	ok      bool
+}
+
+// cpuWindow is the process's CPU over the sample pairs whose later sample is in (from, to].
+func (a *analysis) cpuWindow(segs []*segment, from, to time.Time) cpuStats {
+	var st cpuStats
 	var busy, capacity float64
 	for _, s := range segs {
 		for i := 1; i < len(s.samples); i++ {
@@ -344,7 +399,7 @@ func (a *analysis) cpuWindow(segs []*segment, from, to time.Time) (avg, peak flo
 			t1, ok1 := p.vals[colCPUTicks]
 			t2, ok2 := r.vals[colCPUTicks]
 			n, ok3 := r.vals[colCPUs]
-			dt := r.t.Sub(p.t).Seconds()
+			dt := r.t.Sub(p.t)
 			if !ok1 || !ok2 || !ok3 || n <= 0 || dt <= 0 || t2 < t1 {
 				continue
 			}
@@ -352,16 +407,33 @@ func (a *analysis) cpuWindow(segs []*segment, from, to time.Time) (avg, peak flo
 			busy += secs
 			// float64() rounds the product, so Go can't fuse it into a multiply-add on arm64: every machine
 			// prints the same summary.
-			capacity += float64(dt * n)
-			peak = max(peak, 100*secs/(dt*n))
-			cpus = int(n)
-			ok = true
+			capacity += float64(dt.Seconds() * n)
+			st.peak = max(st.peak, 100*secs/(dt.Seconds()*n))
+			st.cpus = int(n)
+			st.ok = true
+			if a.interval == 0 || dt <= a.interval*5/2 { // a pair across a gap averages, but its peak is unseen
+				st.covered += r.t.Sub(later(p.t, from))
+			}
 		}
 	}
-	if !ok {
-		return 0, 0, 0, false
+	if st.ok {
+		st.avg = 100 * busy / capacity
 	}
-	return 100 * busy / capacity, peak, cpus, true
+	return st
+}
+
+func later(t, u time.Time) time.Time {
+	if t.After(u) {
+		return t
+	}
+	return u
+}
+
+func earlier(t, u time.Time) time.Time {
+	if t.Before(u) {
+		return t
+	}
+	return u
 }
 
 // hostCPUWindow is the machine's CPU: the mean and the largest of host_cpu_pct in (from, to].
@@ -430,7 +502,6 @@ func (a *analysis) sessionVerdict() verdict {
 	for _, s := range a.segs[1:] {
 		restarts = append(restarts, a.tOff(s.from))
 	}
-	covered := !a.first.After(a.at(markCoverSlack)) && !a.last.Before(a.at(markEnd-markCoverSlack))
 	v.measured = fmt.Sprintf("recorded %s to %s", a.tOff(a.first), a.tOff(a.last))
 	switch len(restarts) {
 	case 0:
@@ -443,10 +514,28 @@ func (a *analysis) sessionVerdict() verdict {
 	if a.downs > 0 {
 		v.measured += fmt.Sprintf("; no isshoni process in %d %s", a.downs, plural(a.downs, "sample", "samples"))
 	}
+	// A long gap in the session: what happened then is not in the recording, a restart included.
+	var gaps []string
+	for _, g := range a.gaps {
+		if g.to.Sub(g.from) > markGapLimit && g.to.After(a.t0) && g.from.Before(a.at(markEnd)) {
+			gaps = append(gaps, fmt.Sprintf("%s to %s", a.tOff(g.from), a.tOff(g.to)))
+		}
+	}
+	if len(gaps) > 0 {
+		v.measured += "; no sample from " + strings.Join(gaps, ", ")
+	}
+	// A restart in place keeps the PID (04 §6.5); only the counters show it.
+	var resets []string
+	for _, t := range a.resets {
+		resets = append(resets, a.tOff(t))
+	}
+	if len(resets) > 0 {
+		v.measured += "; counters reset at " + strings.Join(resets, ", ") + " without a PID change (in-place restart?)"
+	}
 	switch {
 	case len(restarts) > 1:
 		v.result = resFail
-	case len(restarts) == 0 || !covered:
+	case len(restarts) == 0 || !a.coversSession() || len(gaps) > 0 || len(resets) > 0:
 		v.result = resCheck
 	case absDur(a.segs[1].from.Sub(a.at(markRestart))) > markRestartSlack:
 		v.result = resCheck
@@ -456,20 +545,39 @@ func (a *analysis) sessionVerdict() verdict {
 	return v
 }
 
+// coversSession reports whether the recording runs from T+0 to T+120, give or take markCoverSlack.
+func (a *analysis) coversSession() bool {
+	return !a.first.After(a.at(markCoverSlack)) && !a.last.Before(a.at(markEnd-markCoverSlack))
+}
+
 func (a *analysis) cpuVerdict() verdict {
 	v := verdict{measure: "Server CPU",
 		target: fmt.Sprintf("average < %.0f%%, peak < %.0f%% of all CPUs", limitCPUAvg, limitCPUPeak)}
-	avg, peak, cpus, ok := a.cpuWindow(a.segs, a.t0, a.at(markEnd))
-	if !ok {
+	st := a.cpuWindow(a.segs, a.t0, a.at(markEnd))
+	if !st.ok {
 		v.measured, v.result = "no CPU samples between T+0 and T+120", resNA
 		return v
 	}
-	v.measured = fmt.Sprintf("isshoni T+0 to T+120: average %s, peak %s of %d %s", pct(avg), pct(peak), cpus,
-		plural(cpus, "CPU", "CPUs"))
+	v.measured = fmt.Sprintf("isshoni T+0 to T+120: average %s, peak %s of %d %s", pct(st.avg), pct(st.peak), st.cpus,
+		plural(st.cpus, "CPU", "CPUs"))
 	if havg, hpeak, ok := a.hostCPUWindow(a.t0, a.at(markEnd)); ok {
 		v.measured += fmt.Sprintf(" (whole machine: average %s, peak %s)", pct(havg), pct(hpeak))
 	}
-	v.result = passIf(avg < limitCPUAvg && peak < limitCPUPeak)
+	// The peak counts only where it was seen: most of the session, and the stress in it.
+	cover := 100 * st.covered.Seconds() / (markEnd).Seconds()
+	v.measured += "; the samples cover " + pct(cover) + " of T+0 to T+120"
+	stress := a.cpuWindow(a.segs, a.at(markStressFrom), a.at(markStressTo))
+	if stress.covered == 0 {
+		v.measured += ", none of the stress (T+90 to T+100)"
+	}
+	switch {
+	case st.avg >= limitCPUAvg || st.peak >= limitCPUPeak:
+		v.result = resFail
+	case cover < limitCPUCover || stress.covered == 0:
+		v.result = resCheck
+	default:
+		v.result = resPass
+	}
 	return v
 }
 
@@ -481,7 +589,16 @@ func (a *analysis) memoryVerdict() verdict {
 	} else {
 		v.measured = fmt.Sprintf("%s at %s to %s at %s (%s)", bytesStr(first.vals[colRSS]), a.tOff(first.t),
 			bytesStr(last.vals[colRSS]), a.tOff(last.t), signedPct(growth))
-		v.result = passIf(growth < limitRSSGrowth)
+		short := first.t.After(a.at(markMemFrom+markCoverSlack)) || last.t.Before(a.at(markEnd-markCoverSlack))
+		switch {
+		case growth >= limitRSSGrowth:
+			v.result = resFail
+		case short: // the growth of part of the window says little about a leak
+			v.measured += ", short of T+65 to T+120"
+			v.result = resCheck
+		default:
+			v.result = resPass
+		}
 	}
 	// The first process, T+5 to T+59, is the second sample of the same measure (06 §12.3).
 	if f, l, g, why := a.rssGrowth(a.at(markFirstFrom), a.at(markFirstTo)); why == "" {
@@ -568,7 +685,17 @@ func (a *analysis) udpVerdict() verdict {
 	if dgrams > 0 {
 		v.measured += ", " + smallPct(100*errs/dgrams)
 	}
-	v.result = passIf(errs == 0 || dgrams > 0 && errs/dgrams < limitUDPErrRatio)
+	switch {
+	case errs > 0 && (dgrams == 0 || errs/dgrams >= limitUDPErrRatio):
+		v.result = resFail
+	case dgrams == 0:
+		v.result = resNA // no traffic: nothing was measured
+	case !a.coversSession():
+		v.measured += "; the recording does not cover T+0 to T+120"
+		v.result = resCheck
+	default:
+		v.result = resPass
+	}
 	return v
 }
 
@@ -580,25 +707,67 @@ func (a *analysis) recoveryVerdict() verdict {
 		return v
 	}
 	prev, s := a.segs[0], a.segs[1]
+	// Everyone before the restart: the most participants in the old process's last minutes (its very last scrape
+	// may come while it shuts down, when the clients are already leaving), and its last scrape with all of them.
 	var want float64
 	for _, r := range prev.scrapes {
-		if p, ok := r.vals["participants"]; ok {
-			want = p
+		if p, ok := r.vals["participants"]; ok && !r.t.Before(prev.to.Add(-markRecoveryLook)) {
+			want = max(want, p)
 		}
 	}
 	v.measured = "the per-person notes"
 	if want == 0 {
 		return v
 	}
-	for _, r := range s.scrapes {
+	var lastFull, firstFull *runRow
+	for _, r := range prev.scrapes {
 		if p, ok := r.vals["participants"]; ok && p >= want {
-			v.measured = fmt.Sprintf("%s %s back %s after the restart (scraped every %s); the per-person notes",
-				count(want), plural(int(want), "participant", "participants"), shortDur(r.t.Sub(s.from)), a.scrapeEvery())
-			return v
+			lastFull = r
 		}
 	}
-	v.measured = fmt.Sprintf("the participants never got back to %s after the restart; the per-person notes", count(want))
-	v.result = resCheck
+	for _, r := range s.scrapes {
+		if p, ok := r.vals["participants"]; ok && p >= want {
+			firstFull = r
+			break
+		}
+	}
+	if firstFull == nil {
+		v.measured = fmt.Sprintf("the participants never got back to %s after the restart; the per-person notes",
+			count(want))
+		v.result = resCheck
+		return v
+	}
+	// The outage began after lastFull, and at the latest at its first sign: a scrape with fewer participants or
+	// none, a failed scrape, a sample without a process, or else the new PID's first row. It ended by firstFull,
+	// and after its last sign. The new PID's rows are no sign of that: its restart row comes at the first sample
+	// after it started, up to an interval late, when the clients may be back already.
+	firstSign, lastSign := s.from, time.Time{}
+	for _, r := range a.rows {
+		if !r.t.After(lastFull.t) || !r.t.Before(firstFull.t) {
+			continue
+		}
+		short := r.kind == kindScrapeError || r.kind == kindDown
+		if r.kind == kindScrape {
+			p, ok := r.vals["participants"]
+			short = !ok || p < want
+		}
+		if short {
+			firstSign = earlier(firstSign, r.t)
+			lastSign = later(lastSign, r.t)
+		}
+	}
+	longest := firstFull.t.Sub(lastFull.t)
+	var shortest time.Duration
+	if lastSign.After(firstSign) {
+		shortest = lastSign.Sub(firstSign)
+	}
+	v.measured = fmt.Sprintf("%s %s in the old process's last full scrape (%s) and again from %s: the outage "+
+		"lasted between %s and %s (scraped every %s); the per-person notes", count(want),
+		plural(int(want), "participant", "participants"), a.tOff(lastFull.t), a.tOff(firstFull.t), shortDur(shortest),
+		shortDur(longest), a.scrapeEvery())
+	if shortest > limitRecovery {
+		v.result = resCheck // at least one of them was away for longer than the target
+	}
 	return v
 }
 
@@ -630,22 +799,26 @@ func (a *analysis) viewingVerdict() verdict {
 		v.measured = "no client stats in the scrapes; the per-person notes and the dashboard"
 		return v
 	}
-	// Presence: participants times time, between consecutive scrapes of one process. Everyone present watches
-	// something, so this is the watch time to within the sharers' own screens.
-	var presenceSecs float64
+	// Watch time: the video DownTracks that forward a layer, times time, between consecutive scrapes of one
+	// process. A viewer reports its freezes per inbound video track, the focus and every thumbnail (01 §8.11), and
+	// the SFU has one forwarding video DownTrack for each, so both count per track.
+	var watchSecs float64
 	for _, s := range a.segs {
 		for i := 1; i < len(s.scrapes); i++ {
 			p, r := s.scrapes[i-1], s.scrapes[i]
-			if n, ok := p.vals["participants"]; ok {
-				presenceSecs += float64(n * r.t.Sub(p.t).Seconds()) // no fused multiply-add, as in cpuWindow
+			hi, ok1 := p.vals[colVideoHigh]
+			lo, ok2 := p.vals[colVideoLow]
+			if ok1 || ok2 {
+				watchSecs += float64((hi + lo) * r.t.Sub(p.t).Seconds()) // no fused multiply-add, as in cpuWindow
 			}
 		}
 	}
 	parts := []string{fmt.Sprintf("%s frozen", secondsStr(freeze.total))}
 	share := math.NaN()
-	if presenceSecs > 0 {
-		share = 100 * freeze.total / presenceSecs
-		parts[0] += fmt.Sprintf(" in %s of presence (%.2f%%, every device together)", hours(presenceSecs), share)
+	if watchSecs > 0 {
+		share = 100 * freeze.total / watchSecs
+		parts[0] += fmt.Sprintf(" in %s of video tracks watched (%.2f%%, every device together)", hours(watchSecs),
+			share)
 	}
 	dec, drop := a.metric["client_frames_decoded_total"], a.metric["client_frames_dropped_total"]
 	if dec != nil && drop != nil && dec.total+drop.total > 0 {
@@ -657,7 +830,7 @@ func (a *analysis) viewingVerdict() verdict {
 	}
 	v.measured = strings.Join(parts, "; ") + "; per device: the dashboard and the notes"
 	if share >= limitFreezeFail {
-		v.result = resFail // whatever the split, a device class is over its limit
+		v.result = resFail // whatever the split, a device class is over its limit (desktops 1%, phones 3%)
 	}
 	return v
 }
@@ -762,8 +935,8 @@ func (a *analysis) write(w io.Writer, name string) error {
 	var b strings.Builder
 	p := func(format string, args ...any) { fmt.Fprintf(&b, format, args...) }
 
-	p("# Exit test summary (%s)\n\n", name)
-	p("Recorded %s to %s UTC (%s), %s to %s. T+0 is %s UTC: %s.\n\n",
+	// No title, and ### sections: the output goes under the results file's "## Summary" as it is.
+	p("%s: recorded %s to %s UTC (%s), %s to %s. T+0 is %s UTC: %s.\n\n", name,
 		a.first.UTC().Format("2006-01-02 15:04:05"), a.last.UTC().Format("15:04:05"),
 		shortDur(a.last.Sub(a.first)), a.tOff(a.first), a.tOff(a.last), a.t0.UTC().Format("2006-01-02 15:04:05"),
 		a.anchor)
@@ -771,17 +944,18 @@ func (a *analysis) write(w io.Writer, name string) error {
 		count(float64(a.samples+a.downs)), plural(a.samples+a.downs, "sample", "samples"), a.downs,
 		count(float64(a.scrapes+a.scrapeErrs)), plural(a.scrapes+a.scrapeErrs, "scrape", "scrapes"), a.scrapeErrs,
 		len(a.segs)-1, plural(len(a.segs)-1, "restart", "restarts"), a.starts, plural(a.starts, "time", "times"))
-	if a.gaps == 0 {
+	if len(a.gaps) == 0 {
 		p(", with no gap.\n")
 	} else {
-		p("; %d %s in the samples, the longest %s.\n", a.gaps, plural(a.gaps, "gap", "gaps"), shortDur(a.longestGap))
+		p("; %d %s in the samples, the longest %s.\n", len(a.gaps), plural(len(a.gaps), "gap", "gaps"),
+			shortDur(a.longestGap))
 	}
 	if len(a.skipped) > 0 {
 		p("%d %s could not be read and %s skipped (the first: %s).\n", len(a.skipped),
 			plural(len(a.skipped), "row", "rows"), plural(len(a.skipped), "was", "were"), a.skipped[0])
 	}
 
-	p("\n## Pass criteria (06 §12.3)\n\n")
+	p("\n### Pass criteria (06 §12.3)\n\n")
 	p("| Measure | Target | Measured | Result |\n|---|---|---|---|\n")
 	for _, v := range a.verdicts() {
 		p("| %s | %s | %s | %s |\n", v.measure, v.target, v.measured, v.result)
@@ -789,21 +963,21 @@ func (a *analysis) write(w io.Writer, name string) error {
 	p("\npass: measured and met. FAIL: measured and missed. check: measured, needs a look. manual: from the\n")
 	p("people, the admin dashboard or the survey. n/a: not in the recording.\n")
 
-	p("\n## Processes\n\n")
+	p("\n### Processes\n\n")
 	p("| # | PID | From | To | Length | CPU average | CPU peak | RSS first, last (max) | Threads max | FDs max |" +
 		" Goroutines |\n")
 	p("|---|---|---|---|---|---|---|---|---|---|---|\n")
 	for _, s := range a.segs {
 		cpuAvg, cpuPeak := "-", "-"
-		if avg, peak, _, ok := a.cpuWindow([]*segment{s}, s.from.Add(-time.Nanosecond), s.to); ok {
-			cpuAvg, cpuPeak = pct(avg), pct(peak)
+		if st := a.cpuWindow([]*segment{s}, s.from.Add(-time.Nanosecond), s.to); st.ok {
+			cpuAvg, cpuPeak = pct(st.avg), pct(st.peak)
 		}
 		p("| %d | %d | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", s.n, s.pid, a.tOff(s.from), a.tOff(s.to),
 			shortDur(s.to.Sub(s.from)), cpuAvg, cpuPeak, s.rssCell(), s.maxCell(s.samples, colThreads),
 			s.maxCell(s.samples, colFDs), s.rangeCell("go_goroutines"))
 	}
 
-	p("\n## Counters\n\n")
+	p("\n### Counters\n\n")
 	p("The increase per process (a counter that went down counts as reset), and for rates the average over the\n")
 	p("process's time and the peak between two rows.\n\n")
 	p("| Counter |")
@@ -831,7 +1005,7 @@ func (a *analysis) write(w io.Writer, name string) error {
 		p(" %s |\n", cr.cell(m[cr.col], a.last.Sub(a.first)))
 	}
 
-	p("\n## Gauges\n\n")
+	p("\n### Gauges\n\n")
 	p("The largest value per process.\n\n")
 	p("| Gauge |")
 	for _, s := range a.segs {
@@ -844,6 +1018,7 @@ func (a *analysis) write(w io.Writer, name string) error {
 	p("\n")
 	for _, g := range []struct{ label, col string }{
 		{"Participants", "participants"}, {"Shares", "shares"}, {"DownTracks", "sfu_downtracks"},
+		{"Video DownTracks, high", colVideoHigh}, {"Video DownTracks, low", colVideoLow},
 		{"PCs on udp", "transport_udp"}, {"PCs on tcp443", "transport_tcp443"}, {"PCs on tcp7882", "transport_tcp7882"},
 	} {
 		p("| %s |", g.label)
@@ -918,13 +1093,6 @@ func maxOf(rows []*runRow, col string) (float64, bool) {
 		}
 	}
 	return m, ok
-}
-
-func passIf(ok bool) string {
-	if ok {
-		return resPass
-	}
-	return resFail
 }
 
 func plural(n int, one, many string) string {
