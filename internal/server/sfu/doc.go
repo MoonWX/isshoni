@@ -246,9 +246,9 @@
 //   - 4 shares per participant; 256 subscriptions per Conn and 64 per call; the SDP guards of sdpcheck.go; the
 //     command queue; the keyframe throttle; the DownTrack queues.
 //   - Connection-test probes (probe.go): one per user and transport, 20 per server, 20 s each; a probe offer of at
-//     most 64 KiB with one data channel and no media; one data channel per probe PC (a further one is closed at
-//     once); and no echo while 1 MiB of echoes waits to go out, so a client that doesn't read can't make the server
-//     hold its echoes.
+//     most 64 KiB with one data channel and no media, whose candidates count toward 64 like a Conn PC's (a browser
+//     sends none); one data channel per probe PC (a further one is closed at once); and no echo while 1 MiB of
+//     echoes waits to go out, so a client that doesn't read can't make the server hold its echoes.
 //
 // # What later slices add
 //

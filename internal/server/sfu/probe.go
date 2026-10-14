@@ -67,11 +67,12 @@ func (t ProbeTransport) valid() bool {
 }
 
 // Probe answers a connection-test offer on one ICE transport (02 §7.6). offerSDP is a browser offer with one data
-// channel (m=application) and no media; its candidates go through the remote-candidate filter (02 §7.3), and none
-// are needed: the browser's checks reach the server's candidates, and the server learns the browser's address from
-// them (peer-reflexive). The answer is complete (no trickle) and holds only candidates of transport t. The probe PC
-// echoes every data-channel message unchanged, so the browser measures the round-trip time itself, and it lives at
-// most 20 s, or until its data channel closes. ctx bounds the call only; the probe PC lives on after it returns.
+// channel (m=application) and no media; its candidates go through the remote-candidate filter (02 §7.3) and the cap
+// of 64 (02 §12; past it they are dropped), and none are needed: the browser's checks reach the server's candidates,
+// and the server learns the browser's address from them (peer-reflexive). The answer is complete (no trickle) and
+// holds only candidates of transport t. The probe PC echoes every data-channel message unchanged, so the browser
+// measures the round-trip time itself, and it lives at most 20 s, or until its data channel closes. ctx bounds the
+// call only; the probe PC lives on after it returns.
 //
 // res gets one value, when the probe connects (1 s later, with the RTT from the candidate-pair stats) or when it
 // ends without having connected (Err "timeout" or "closed"). It has capacity 1 and the SFU never blocks on it, so a
@@ -102,7 +103,7 @@ func (s *SFU) Probe(ctx context.Context, user UserID, t ProbeTransport, offerSDP
 	if err := checkProbeOffer(offerSDP); err != nil {
 		return "", nil, err
 	}
-	offer, dropped, err := s.apis.filter.filterSDP(offerSDP)
+	offer, dropped, err := s.apis.filter.filterProbeOffer(offerSDP)
 	if err != nil {
 		return "", nil, err
 	}
@@ -142,6 +143,16 @@ func checkProbeOffer(raw string) error {
 			strconv.Itoa(n)+" m-sections")
 	}
 	return nil
+}
+
+// filterProbeOffer returns a probe offer without the candidates that the remote-candidate filter drops (02 §7.3) and
+// those past the first 64 it keeps (02 §12, counted as remoteCandidates counts a Conn's), and how many it dropped.
+// The offer is the probe PC's only remote description and nothing is trickled to it, so the count starts and ends
+// here. A browser's probe offer has no candidates (02 §7.6), but a client could post a 64 KiB one with some 1,400,
+// and the probe PC, the controlled ICE agent, sends checks to every pair it has.
+func (f candidateFilter) filterProbeOffer(raw string) (string, int, error) {
+	var budget remoteCandidates
+	return f.limitSDP(raw, budget.admit)
 }
 
 // probeKey is what a user's probes are counted by: one per user and transport.

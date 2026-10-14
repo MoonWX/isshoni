@@ -151,54 +151,50 @@ func (s *SFU) Close() error {
 	probes := s.stopProbes()
 	close(s.tickStop)
 
+	// The ticker, then the Conns, then the probes, all within one closeTimeout. Once it has passed, what is still
+	// running is only counted, so every Conn and probe left behind is in a warning whichever wait used the time up.
 	deadline := time.NewTimer(closeTimeout)
 	defer deadline.Stop()
-	if ticking {
+	expired := false
+	ended := func(done <-chan struct{}) bool {
+		if !expired {
+			select {
+			case <-done:
+				return true
+			case <-deadline.C:
+				expired = true
+			}
+		}
 		select {
-		case <-s.tickDone:
-		case <-deadline.C:
-			// Only a RoomEvents call that blocks, against its contract, can keep the ticker this long.
-			s.log.Warn("the ticker was still reporting when the SFU closed", "timeout", closeTimeout)
-			return nil
+		case <-done:
+			return true
+		default:
+			return false
 		}
 	}
-	for i, c := range actors {
-		select {
-		case <-c.done:
-		case <-deadline.C:
-			left := 0
-			for _, rest := range actors[i:] {
-				select {
-				case <-rest.done:
-				default:
-					left++
-				}
-			}
-			if left > 0 {
-				s.log.Warn("connections were still closing their PeerConnections when the SFU closed",
-					"count", left, "timeout", closeTimeout)
-			}
-			return nil
+	if ticking && !ended(s.tickDone) {
+		// Only a RoomEvents call that blocks, against its contract, can keep the ticker this long.
+		s.log.Warn("the ticker was still reporting when the SFU closed", "timeout", closeTimeout)
+	}
+	left := 0
+	for _, c := range actors {
+		if !ended(c.done) {
+			left++
 		}
 	}
-	for i, p := range probes {
-		select {
-		case <-p.done:
-		case <-deadline.C:
-			left := 0
-			for _, rest := range probes[i:] {
-				select {
-				case <-rest.done:
-				default:
-					left++
-				}
-			}
-			if left > 0 {
-				s.log.Warn("connection test probes were still closing their PeerConnections when the SFU closed",
-					"count", left, "timeout", closeTimeout)
-			}
-			return nil
+	if left > 0 {
+		s.log.Warn("connections were still closing their PeerConnections when the SFU closed",
+			"count", left, "timeout", closeTimeout)
+	}
+	left = 0
+	for _, p := range probes {
+		if !ended(p.done) {
+			left++
 		}
+	}
+	if left > 0 {
+		s.log.Warn("connection test probes were still closing their PeerConnections when the SFU closed",
+			"count", left, "timeout", closeTimeout)
 	}
 	return nil
 }

@@ -2,8 +2,10 @@ package sfu
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -174,9 +176,75 @@ func TestProbeSlots(t *testing.T) {
 	wantErr(t, err, CodeClosed)
 }
 
+// TestFilterProbeOffer: a probe offer's candidates go through the remote-candidate filter and the cap of 64 (02 §12):
+// of 100 public host candidates the first 64 stay and 36 are dropped. A candidate that the filter drops uses none of
+// the 64, and one that was kept stays when it comes again.
+func TestFilterProbeOffer(t *testing.T) {
+	cand := func(port int) string {
+		return fmt.Sprintf("a=candidate:%d 1 udp 2122260223 203.0.113.7 %d typ host\r\n", port, port)
+	}
+	var many, first64 strings.Builder
+	for i := range 100 {
+		many.WriteString(cand(50000 + i))
+		if i < maxRemoteCandidates {
+			first64.WriteString(cand(50000 + i))
+		}
+	}
+	filter := candidateFilter{}
+	out, dropped, err := filter.filterProbeOffer(probeOfferSDP + many.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dropped != 36 {
+		t.Errorf("dropped %d of 100 candidates, want 36", dropped)
+	}
+	if got, want := probeCandidates(t, out), probeCandidates(t, probeOfferSDP+first64.String()); !slices.Equal(got, want) {
+		t.Errorf("kept %d candidates %q..., want the first 64", len(got), got[:min(len(got), 3)])
+	}
+
+	// A loopback candidate ahead of them is dropped by the filter and takes no place; the first one again, after
+	// the 100, was kept already.
+	loopback := "a=candidate:1 1 udp 2122260223 127.0.0.1 9 typ host\r\n"
+	out, dropped, err = filter.filterProbeOffer(probeOfferSDP + loopback + many.String() + cand(50000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dropped != 37 {
+		t.Errorf("dropped %d candidates, want the loopback one and 36", dropped)
+	}
+	want := probeCandidates(t, probeOfferSDP+first64.String()+cand(50000))
+	if got := probeCandidates(t, out); !slices.Equal(got, want) {
+		t.Errorf("kept %d candidates, want the first 64 and the repeat", len(got))
+	}
+
+	// Each offer has a count of its own: a probe offer of 64 is whole.
+	if out, dropped, err := filter.filterProbeOffer(probeOfferSDP + first64.String()); err != nil || dropped != 0 ||
+		out != probeOfferSDP+first64.String() {
+		t.Errorf("64 candidates: %d dropped, %v", dropped, err)
+	}
+}
+
+// probeCandidates returns the values of an SDP's candidate attributes, in order.
+func probeCandidates(t *testing.T, raw string) []string {
+	t.Helper()
+	desc, err := parseSDP(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, md := range desc.MediaDescriptions {
+		for _, a := range md.Attributes {
+			if a.IsICECandidate() {
+				out = append(out, a.Value)
+			}
+		}
+	}
+	return out
+}
+
 // FuzzProbeOffer: whatever a client posts as a probe offer, the SDP guard answers it with nil or sfu.bad_sdp; an offer
-// it takes has one m-section, a data channel, and still has it after the remote-candidate filter, which never fails
-// on it with anything but sfu.bad_sdp either.
+// it takes has one m-section, a data channel, and still has it after the remote-candidate filter and its cap, which
+// never fail on it with anything but sfu.bad_sdp either and leave at most 64 candidates.
 func FuzzProbeOffer(f *testing.F) {
 	f.Add(probeOfferSDP)
 	f.Add(probeOfferSDP + "a=candidate:1 1 udp 2122260223 192.0.2.10 54400 typ host\r\n")
@@ -193,10 +261,10 @@ func FuzzProbeOffer(f *testing.F) {
 			}
 			return
 		}
-		out, _, err := filter.filterSDP(raw)
+		out, _, err := filter.filterProbeOffer(raw)
 		if err != nil {
 			if !errors.Is(err, &Error{Code: CodeBadSDP}) {
-				t.Fatalf("filterSDP of a probe offer: %v, want nil or sfu.bad_sdp", err)
+				t.Fatalf("filterProbeOffer: %v, want nil or sfu.bad_sdp", err)
 			}
 			return
 		}
@@ -206,6 +274,21 @@ func FuzzProbeOffer(f *testing.F) {
 		}
 		if len(desc.MediaDescriptions) != 1 || desc.MediaDescriptions[0].MediaName.Media != "application" {
 			t.Fatalf("an accepted probe offer has %d m-sections", len(desc.MediaDescriptions))
+		}
+		keys := map[candidateKey]struct{}{}
+		attrs := slices.Concat(desc.Attributes, desc.MediaDescriptions[0].Attributes)
+		for _, a := range attrs {
+			if !a.IsICECandidate() {
+				continue
+			}
+			key, reason := filter.judge(a.Value)
+			if reason != keepCandidate {
+				t.Fatalf("the filtered offer has a candidate the filter drops (%s)", reason)
+			}
+			keys[key] = struct{}{}
+		}
+		if len(keys) > maxRemoteCandidates {
+			t.Fatalf("the filtered offer has %d candidates", len(keys))
 		}
 	})
 }

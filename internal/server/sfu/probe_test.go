@@ -285,6 +285,49 @@ func checkProbeCandidates(t *testing.T, h *sfutest.Harness, pt sfu.ProbeTranspor
 	return vias
 }
 
+// TestProbeOfferCandidates: a probe offer's candidates count toward the cap of 64 remote candidates (02 §12), so an
+// offer with 100 public host candidates loses 36 of them, and the probe connects as one without any: the server
+// learns the client's address from its checks (peer-reflexive).
+func TestProbeOfferCandidates(t *testing.T) {
+	logs := &logBuffer{}
+	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	h := newHarness(t, sfutest.HarnessOptions{Logger: logger})
+	c := newProbeClient(t, sfu.ProbeUDP)
+	offer := probeOffer(t, c)
+	if strings.Contains(offer, "a=candidate:") {
+		t.Fatal("the client's offer has candidates of its own")
+	}
+	// Documentation addresses (RFC 5737), which the filter keeps: the SFU's loopback socket can't reach them.
+	var many strings.Builder
+	for i := range 100 {
+		fmt.Fprintf(&many, "a=candidate:%d 1 udp 2122260223 203.0.113.%d %d typ host\r\n", i, 1+i%50, 50000+i)
+	}
+	answer, res, err := h.SFU.Probe(testCtx(t), "alice", sfu.ProbeUDP, offer+many.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Accept(answer); err != nil {
+		t.Fatal(err)
+	}
+	waitOpen(t, c, "the probe with 100 candidates")
+	checkEcho(t, c, "the probe with 100 candidates")
+	if r := probeResult(t, res, "the probe with 100 candidates"); !r.Connected {
+		t.Errorf("result %+v, want a connected probe", r)
+	}
+	var found bool
+	for line := range strings.Lines(logs.String()) {
+		if strings.Contains(line, `msg="remote candidates dropped from a probe offer"`) {
+			found = true
+			if !strings.Contains(line, " count=36") {
+				t.Errorf("want 36 of the 100 candidates dropped: %s", line)
+			}
+		}
+	}
+	if !found {
+		t.Error("no debug line about the candidates dropped from the probe offer")
+	}
+}
+
 // TestProbeLimit: 20 probes run on a server; the 21st is sfu.probe_limit, retryable, with RetryAfter until the
 // oldest one's life ends, while a user's new probe of a transport takes the slot of the old one, which ends with
 // "closed". A probe that nothing connects to ends with "timeout" at the end of its life and frees its slot.
