@@ -20,12 +20,15 @@
 // (S47) sets audibleShareId without moving the focus; that choice stays until the user focuses a tile, or its share
 // ends. An automatic focus change moves the audio only when the audio was following the focus.
 //
-// A share without sound (ShareInfo.audio false: shared without it, or no audio track arrived) is never the audible
-// one (README S72). Focus on it, by itself or by a pick, means that nothing is heard: the sound follows the focus to
-// a stage that has none, so the stage offers no Mute, and no audio is asked for. Its tile has no speaker button
-// (AudioControls.tsx). Once live, ShareInfo.audio says whether an audio track arrived, so a share can gain its sound
-// a moment after it took the stage (it is heard then, unless something else is) or lose it (the sound goes back to
-// the stage's share).
+// A share without sound (ShareInfo.audio false) is never the audible one (README S72). That flag is what the server
+// receives now (01 §8.5), not a promise: it is false for a share made without sound, but for a while also for one
+// that has it, at its first live when the first video keyframe beats the first audio packet, and while its sharer's
+// PC is rebuilt. So the rules above give the sound as if every share had one, and settleSound then decides what is
+// heard: the share the rules chose, when it has sound. When it has none it is owed the sound (`soundDue`), and gets
+// it the moment its audio arrives, unless the rules gave the sound to something else in between (a pick, the
+// speaker button, a focus change the sound follows, its end). Meanwhile nothing is heard when that share is on the
+// stage: the stage offers no Mute, and no audio is asked for. When it is another tile (it went quiet after its
+// speaker button chose it) the stage's sound plays meanwhile. Its tile has no speaker button (AudioControls.tsx).
 
 /** How many ended shares are remembered for a re-publish; the oldest are forgotten first. */
 export const MAX_ENDED_SHARES = 32;
@@ -65,8 +68,15 @@ export interface FocusState<S extends FocusShare = FocusShare> {
   readonly shares: readonly S[];
   readonly focusedShareId: string | null;
   readonly focusMode: FocusMode;
-  /** The one share whose audio plays, or null. */
+  /** The one share whose audio plays, or null. Never a share without sound. */
   readonly audibleShareId: string | null;
+  /**
+   * The share that the rules give the sound to but has none now (ShareInfo.audio false), or null: it is heard the
+   * moment its audio arrives. Meanwhile audibleShareId is the stage's share when that is another one and has sound,
+   * else null. It is dropped when the sound goes elsewhere: a pick, the speaker button (viewerStore.setAudible), a
+   * focus change that the sound follows, the end of that share.
+   */
+  readonly soundDue: string | null;
   /** A ?focus= share that isn't live yet. */
   readonly pendingFocusParam: string | null;
   /** The shares that ended, oldest first, at most MAX_ENDED_SHARES. A pick empties it. */
@@ -98,6 +108,7 @@ export function initialFocusState<S extends FocusShare = FocusShare>(): FocusSta
     focusedShareId: null,
     focusMode: 'auto',
     audibleShareId: null,
+    soundDue: null,
     pendingFocusParam: null,
     ended: [],
   };
@@ -130,22 +141,14 @@ export function autoFocusTarget(shares: readonly FocusShare[]): string | null {
   return best?.id ?? null;
 }
 
-/** Whether focus on this share makes it the one heard: someone else's share that has sound. */
-function heardByFocus(share: FocusShare | undefined): share is FocusShare {
-  return share !== undefined && !share.own && share.audio;
-}
-
-/** What is heard when the sound follows the focus to `focusedShareId`: that share when focus makes it heard, else nothing. */
-function soundOfStage(shares: readonly FocusShare[], focusedShareId: string | null): string | null {
-  const focused = shares.find((s) => s.id === focusedShareId);
-  return heardByFocus(focused) ? focused.id : null;
-}
+// ---- The rules. They give the sound as if every share had one: audibleShareId in them is the share the sound
+// belongs to, which settleSound turns into what is heard. ----
 
 /** The audible share after the focus moved from one share to another by itself (not by a pick). */
 function audioAfterAutoFocus<S extends FocusShare>(state: FocusState<S>, shares: readonly S[], focused: string | null) {
   const audible = state.audibleShareId;
   const followsFocus = audible === null || audible === state.focusedShareId || !shares.some((s) => s.id === audible);
-  return followsFocus ? soundOfStage(shares, focused) : audible;
+  return followsFocus ? focused : audible;
 }
 
 /**
@@ -153,10 +156,7 @@ function audioAfterAutoFocus<S extends FocusShare>(state: FocusState<S>, shares:
  * neither the stage nor the sound from what the user chose. Returns state itself when the pick changes nothing.
  */
 function pick<S extends FocusShare>(state: FocusState<S>, share: S): FocusState<S> {
-  // The own share leaves the sound where it was (05 §12.2); a share without sound has none to give.
-  let audible: string | null = share.id;
-  if (share.own) audible = state.audibleShareId;
-  else if (!share.audio) audible = null;
+  const audible = share.own ? state.audibleShareId : share.id;
   if (
     state.focusedShareId === share.id &&
     state.focusMode === 'manual' &&
@@ -178,7 +178,7 @@ function pick<S extends FocusShare>(state: FocusState<S>, share: S): FocusState<
 
 /**
  * The speaker button chose what is heard (05 §12.3): no share that comes back takes the sound from that choice.
- * viewerStore.setAudible stores the result with the new audibleShareId.
+ * viewerStore.setAudible stores the result with the new audibleShareId, and soundDue null.
  */
 export function withoutRememberedSound(ended: readonly EndedShare[]): readonly EndedShare[] {
   return ended.some((e) => e.audible) ? ended.map((e) => (e.audible ? { ...e, audible: false } : e)) : ended;
@@ -186,23 +186,13 @@ export function withoutRememberedSound(ended: readonly EndedShare[]): readonly E
 
 function shareLive<S extends FocusShare>(state: FocusState<S>, share: S): FocusState<S> {
   const at = state.shares.findIndex((s) => s.id === share.id);
-  const known = state.shares[at];
-  if (known !== undefined) {
-    // Known: new details (status, watchers, …). Its place and the focus stay, and so does the audio, unless the
-    // share gained or lost its sound.
-    if (known === share) return state;
+  if (at >= 0) {
+    // Known: new details (status, watchers, whether it has sound, …). Its place, the focus and the audio stay; a
+    // share that gained or lost its sound is settled by settleSound.
+    if (state.shares[at] === share) return state;
     const shares = [...state.shares];
     shares[at] = share;
-    const next = { ...state, shares };
-    if (known.audio === share.audio) return next;
-    if (share.audio) {
-      // Its audio track arrived: the share on the stage is heard, unless something else is.
-      const heard = state.audibleShareId === null && state.focusedShareId === share.id && heardByFocus(share);
-      return heard ? { ...next, audibleShareId: share.id } : next;
-    }
-    // It has no sound anymore: what is heard goes back to the stage.
-    if (state.audibleShareId !== share.id) return next;
-    return { ...next, audibleShareId: soundOfStage(shares, state.focusedShareId) };
+    return { ...state, shares };
   }
   const shares = insertByAge(state.shares, share);
   const next = { ...state, shares };
@@ -237,7 +227,8 @@ function sharesEnded<S extends FocusShare>(state: FocusState<S>, shareIds: reado
   }
   if (was.some((e) => e.audible)) {
     // The share heard through its speaker button ended: the audio goes back to the focused share.
-    return { ...next, audibleShareId: soundOfStage(shares, state.focusedShareId) };
+    const focused = shares.find((s) => s.id === state.focusedShareId);
+    return { ...next, audibleShareId: focused && !focused.own ? focused.id : null };
   }
   return next;
 }
@@ -257,8 +248,7 @@ function shareReturned<S extends FocusShare>(state: FocusState<S>, share: S, was
   if (state.pendingFocusParam === share.id) return pick(next, share);
   const auto = state.focusMode === 'auto';
   const stage = auto && (was.focus !== null || (state.focusedShareId === null && !share.own));
-  const sound =
-    share.audio && (was.audible ? stage || was.focus === null : stage && state.audibleShareId === null && !share.own);
+  const sound = was.audible ? stage || was.focus === null : stage && state.audibleShareId === null && !share.own;
   if (!stage && !sound) return next;
   return {
     ...next,
@@ -281,11 +271,12 @@ function shareReplaced<S extends FocusShare>(state: FocusState<S>, share: S, rep
     // holds the sharer's old connection.
     const shares = [...state.shares];
     shares.splice(at, 0, share);
-    const focusedShareId = state.focusedShareId === replaces ? share.id : state.focusedShareId;
-    let audibleShareId = state.audibleShareId;
-    // The sound moves to the new share when it has sound; a re-publish without it gives the sound to the stage.
-    if (audibleShareId === replaces) audibleShareId = share.audio ? share.id : soundOfStage(shares, focusedShareId);
-    const next = { ...state, shares, focusedShareId, audibleShareId };
+    const next = {
+      ...state,
+      shares,
+      focusedShareId: state.focusedShareId === replaces ? share.id : state.focusedShareId,
+      audibleShareId: state.audibleShareId === replaces ? share.id : state.audibleShareId,
+    };
     return state.pendingFocusParam === share.id ? pick(next, share) : next;
   }
   const was = state.ended.find((e) => e.id === replaces);
@@ -293,7 +284,7 @@ function shareReplaced<S extends FocusShare>(state: FocusState<S>, share: S, rep
   return shareReturned(state, share, was);
 }
 
-export function focusReducer<S extends FocusShare>(state: FocusState<S>, event: FocusEvent<S>): FocusState<S> {
+function applyRules<S extends FocusShare>(state: FocusState<S>, event: FocusEvent<S>): FocusState<S> {
   switch (event.type) {
     case 'shareLive':
       return shareLive(state, event.share);
@@ -315,4 +306,26 @@ export function focusReducer<S extends FocusShare>(state: FocusState<S>, event: 
       return state.pendingFocusParam === event.shareId ? state : { ...state, pendingFocusParam: event.shareId };
     }
   }
+}
+
+// ---- What is heard ----
+
+/**
+ * Turns the share the rules gave the sound to (`audibleShareId` of a state they returned, with soundDue null) into
+ * what is heard: that share when it has sound. One without sound is owed it (soundDue), and meanwhile the stage's
+ * share is heard when it is someone else's and has sound, else nothing.
+ */
+function settleSound<S extends FocusShare>(state: FocusState<S>): FocusState<S> {
+  const due = state.shares.find((s) => s.id === state.audibleShareId);
+  if (due === undefined || due.audio) return state;
+  const stage = state.shares.find((s) => s.id === state.focusedShareId);
+  const heard = stage !== undefined && !stage.own && stage.audio ? stage.id : null;
+  return { ...state, audibleShareId: heard, soundDue: due.id };
+}
+
+export function focusReducer<S extends FocusShare>(state: FocusState<S>, event: FocusEvent<S>): FocusState<S> {
+  // The rules start from the share the sound belongs to: the one owed it, while there is one.
+  const ruled = state.soundDue === null ? state : { ...state, audibleShareId: state.soundDue, soundDue: null };
+  const next = applyRules(ruled, event);
+  return next === ruled ? state : settleSound(next);
 }

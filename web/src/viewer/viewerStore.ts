@@ -125,13 +125,14 @@ export interface ViewerActions {
   focusShare(shareId: string): void;
   /**
    * The speaker button (05 §12.3): hear this share without moving the focus; null for silence. A share without sound
-   * or this page's own preview is refused.
+   * or this page's own preview is refused. The choice drops the sound owed to a share (soundDue) and the one
+   * remembered for a re-publish.
    */
   setAudible(shareId: string | null): void;
   /**
    * A press on a tile's speaker button: hear that share; pressed while it is the one heard, the sound goes back to
-   * the share on the stage (silence when that is a share of this user, which focus never makes audible, or a share
-   * without sound).
+   * the share on the stage (silence when that is a share of this user, which focus never makes audible; a stage
+   * without sound now is silent until its sound arrives).
    */
   toggleAudible(shareId: string): void;
   setAudio(audio: AudioUnlockState): void;
@@ -192,6 +193,7 @@ function focusOf(s: ViewerData): FocusState<ViewerShare> {
     focusedShareId: s.focusedShareId,
     focusMode: s.focusMode,
     audibleShareId: s.audibleShareId,
+    soundDue: s.soundDue,
     pendingFocusParam: s.pendingFocusParam,
     ended: s.ended,
   };
@@ -340,10 +342,11 @@ export function createViewerStore(opts: ViewerStoreOptions = {}): ViewerStore {
         const s = get();
         // Only a share with a tile that this page receives, and that has sound, can be heard: never the own preview.
         if (shareId !== null && !s.shares.some((share) => share.id === shareId && !share.local && share.audio)) return;
-        // The user chose what to hear: a share that comes back later doesn't take the sound from that choice.
+        // The user chose what to hear: neither a share that comes back later nor one whose sound arrives later (the
+        // one owed the sound) takes it from that choice.
         const ended = withoutRememberedSound(s.ended);
-        if (s.audibleShareId === shareId && ended === s.ended) return;
-        set({ audibleShareId: shareId, ended });
+        if (s.audibleShareId === shareId && s.soundDue === null && ended === s.ended) return;
+        set({ audibleShareId: shareId, soundDue: null, ended });
       },
       toggleAudible(shareId) {
         const s = get();
@@ -352,7 +355,13 @@ export function createViewerStore(opts: ViewerStoreOptions = {}): ViewerStore {
           return;
         }
         const focused = s.shares.find((share) => share.id === s.focusedShareId);
-        s.setAudible(focused && !focused.own && focused.audio && focused.id !== shareId ? focused.id : null);
+        if (focused === undefined || focused.own || focused.id === shareId || focused.audio) {
+          s.setAudible(focused && !focused.own && focused.id !== shareId ? focused.id : null);
+          return;
+        }
+        // Back to a stage that has no sound now (ShareInfo.audio false): nothing is heard, and the stage is owed the
+        // sound, as when the focus moved to it (autoFocus.ts): it is heard once its audio arrives.
+        set({ audibleShareId: null, soundDue: focused.id, ended: withoutRememberedSound(s.ended) });
       },
       setAudio(audio) {
         if (get().audio !== audio) set({ audio });
