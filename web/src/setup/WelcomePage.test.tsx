@@ -17,7 +17,7 @@ import type { CreateInviteResponse, SettingsResponse } from '../protocol/api.gen
 import { queryKeys } from '../protocol/queryKeys';
 import { apiError, apiPath, meFixture, server } from '../test/msw';
 import { createTestServices } from '../test/render';
-import { AFTER_WIZARD_PATH, welcomePath, welcomeStep } from './WelcomePage';
+import { welcomePath, welcomeStep } from './WelcomePage';
 
 vi.mock(import('../conntest/runConnTest'), async (importOriginal) => ({
   ...(await importOriginal()),
@@ -308,7 +308,7 @@ describe('step 3: invite friends', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Done, go to the Lounge' }));
     expect(await screen.findByRole('heading', { name: ROOM_HEADING })).toBeInTheDocument();
     expect(patched).toEqual([{ setupWizardDone: true }]);
-    expect(router.state.location.pathname).toBe(AFTER_WIZARD_PATH);
+    expect(router.state.location.pathname).toBe('/r/lounge');
     expect(router.state.historyAction).toBe('REPLACE');
     // The settings (and /info with them) are read again where they are shown.
     expect(services.queryClient.getQueryState(queryKeys.adminSettings)?.isInvalidated).toBe(true);

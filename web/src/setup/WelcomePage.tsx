@@ -7,8 +7,8 @@
 //    the main action after a green result, and secondary to the panel's "Test again" after anything else.
 // 3. Invite friends. Entering the step creates an invite with the server's defaults (POST /api/v1/invites {}: 7 days,
 //    10 uses unless the admin changed them) and shows its link once, in InviteLinkCard. "Done, go to the Lounge"
-//    sets setupWizardDone (PATCH /api/v1/admin/settings, 03 §7.8) and goes to "/", the root redirect, which takes a
-//    fresh admin to the default room, the Lounge.
+//    sets setupWizardDone (PATCH /api/v1/admin/settings, 03 §7.8) and opens the Lounge, the default room, also for
+//    an admin who came back to the wizard after being in another room.
 //
 // The stepper shows all three steps, as on /setup.
 import { useMutation, type QueryClient } from '@tanstack/react-query';
@@ -51,8 +51,12 @@ export function welcomeStep(raw: string | null): WelcomeStep {
   return raw === '3' ? 3 : 2;
 }
 
-/** Where "Done" goes: the root redirect, which takes the admin to the Lounge (05 §5). */
-export const AFTER_WIZARD_PATH = '/';
+/**
+ * Where "Done" goes: the Lounge, as its label says (05 §14.1 "Done → Go to Lounge"). Not "/", whose root redirect
+ * opens the last room the admin was in. The default room's ID is fixed and the room can't be deleted (03, owner
+ * decision 2: `lounge`). A string, not roomPath of rooms/hooks, so the setup chunk doesn't pull in rooms code.
+ */
+export const AFTER_WIZARD_PATH = '/r/lounge';
 
 /**
  * After a change went through: marks the REST data of the topic stale, exactly as the server's `invalidate` message
