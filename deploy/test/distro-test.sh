@@ -411,17 +411,43 @@ build_image() {
 }
 
 # start_container NAME IMAGE starts a container with systemd as PID 1, makes it the one the scenarios run in, waits
-# until systemd is up, and makes the container trust the CA of relserve. A container for a firewall gets all
-# privileges under podman too.
+# until systemd is up, and makes the container trust the CA of relserve. Under podman the container has
+# --systemd=always and the two capabilities below, not --privileged, except for a firewall, whose container gets all
+# privileges (06 §4.13).
 start_container() {
   CONTAINER=$IMAGE_NAME-$1-$$
   CONTAINERS="$CONTAINERS $CONTAINER"
   case $ENGINE in
   podman)
-    sc_priv=''
-    case $1 in *-v3) sc_priv=--privileged ;; esac
-    # shellcheck disable=SC2086 # one flag or none
-    "$ENGINE" run -d --name "$CONTAINER" --systemd=always $sc_priv "$2" >/dev/null
+    # The root of a machine has every capability, and the scenarios need two that podman doesn't give by default.
+    # CAP_SYS_ADMIN, as in release.yml's verify job: systemd builds the unit's sandbox with it (ProtectSystem= and
+    # the rest are mount namespaces, StateDirectory= a bind mount in them). Without it systemd skips the sandbox
+    # ("namespace setup is prohibited (container manager?)"), and the server, which sees a Podman container
+    # (/run/.containerenv), refuses /var/lib/isshoni as not a mounted volume and exits 78: C1 fails.
+    # CAP_SYS_PTRACE: `ss -p` names the program behind another user's socket only with it, and the installer's port
+    # check takes an unnamed listener for another program's. Without it C4's upgrade exits 7, as port 8080 "is used
+    # by another program", which is the running isshoni. Under rootless podman both are the container's, in its own
+    # user namespace, and nothing on this machine; run as root, podman gives the machine's, still less than the
+    # Docker path's --privileged.
+    # Rootless podman also needs a systemd user session of the user who runs this script, through which it uses the
+    # systemd cgroup manager: a login, or lingering (`loginctl enable-linger`) with XDG_RUNTIME_DIR and
+    # DBUS_SESSION_BUS_ADDRESS pointing at it, as verify sets up. Without one podman falls back to cgroupfs: a
+    # `podman build` that has to build the image fails ("sd-bus call: Permission denied"), and systemd does not come
+    # up in a container from an image built before, so the script stops here.
+    # The network is podman's default for the user. slirp4netns (the rootless default up to podman 4.9) and pasta
+    # from podman 5.3 on (host.containers.internal through pasta's --map-guest-addr) both reach relserve. Pasta under
+    # podman 5.0 to 5.2 does not; there, set default_rootless_network_cmd = "slirp4netns" in containers.conf.
+    sc_info=$("$ENGINE" info --format '{{.Host.Security.Rootless}} {{.Host.CgroupManager}}' 2>/dev/null) || :
+    if [ "$sc_info" = 'true cgroupfs' ]; then
+      die 'rootless podman uses the cgroupfs cgroup manager, under which systemd cannot come up in a container' \
+        'run this from a login session, or enable lingering (loginctl enable-linger) and point XDG_RUNTIME_DIR at /run/user/<uid> and DBUS_SESSION_BUS_ADDRESS at unix:path=/run/user/<uid>/bus (06 §4.13)'
+    fi
+    case $1 in
+    *-v3) sc_caps=--privileged ;;
+    *) sc_caps='--cap-add=SYS_ADMIN --cap-add=SYS_PTRACE' ;;
+    esac
+    # shellcheck disable=SC2086 # the flags above
+    "$ENGINE" run -d --name "$CONTAINER" --systemd=always $sc_caps "$2" >/dev/null
     ;;
   *)
     "$ENGINE" run -d --name "$CONTAINER" --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock \
