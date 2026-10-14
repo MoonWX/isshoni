@@ -109,7 +109,7 @@
       "stalled": "Connection unstable",
       "codec": "Your browser is still getting its video decoder (Firefox does this once, about a minute). Retrying…",
       "codecStuck": "No video decoder yet. Reload the page.",
-      "codecMissing": "This browser can't play this video. You still hear it.",
+      "codecMissing": "This browser can't play this video.",
       "bandwidth": "Lower quality (your connection)",
       "unavailable": "The sharer isn't sending this quality right now",
       "reduced": "Lower quality",

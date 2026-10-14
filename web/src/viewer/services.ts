@@ -14,7 +14,7 @@
 // This module is in the room folder's chunk (the room runtime makes the viewer before the page shows), and
 // SubscriberPC is not: its class comes with the room's media chunk (rooms/media.ts), so createSubscriber takes it
 // from the caller, and it is only a type here.
-import type { Logger } from '../lib/log';
+import { createLogger, type Logger } from '../lib/log';
 import type { SignalClient } from '../protocol/signal-client';
 import { MessageTypeSubscribeStatus } from '../protocol/types.gen';
 import { createAudioOut, type AudioOut } from './audioOut';
@@ -150,7 +150,9 @@ export function syncRoom(
 
 /**
  * What attachViewer needs from signaling: 01's SignalClient, by its structural type. `on` brings subscribe.status;
- * `notify`, when the object has it (the app's SignalClient does), sends the codec wait's caps.update.
+ * `notify`, when the object has it (the app's SignalClient does), sends the codec wait's caps.update. It is
+ * optional only because rooms/connectViewer.ts declares its signal as Pick<SignalClient, 'on'>; once that passes
+ * `notify` in its type too, this can require it. Until then a signal without it leaves a debug line in the log.
  */
 export type ViewerSignal = Pick<SignalClient, 'on'> & Partial<Pick<SignalClient, 'notify'>>;
 
@@ -162,8 +164,9 @@ function canSend(signal: ViewerSignal): signal is ViewerSignal & Pick<SignalClie
  * Listens to subscribe.status (01 §8.9) for the viewer: what the server forwards per share goes to
  * viewerStore.status, which the tiles show (05 §10.4). With a signal that can send (`notify`), it also runs the
  * codec wait (codecWait.ts, 05 §10.6): while some subscription has the reason `codec`, the capabilities are read
- * every 5 s and caps.update goes out when the H.264 decoders changed; nothing else is ever sent for codecs.
- * `codec` is for tests. Returns the function that stops both.
+ * every 5 s and caps.update goes out when the H.264 decoders changed; nothing else is ever sent for codecs. A
+ * signal without `notify` gets no codec wait, and the log says so once (at debug). `codec` is for tests. Returns
+ * the function that stops both.
  */
 export function attachViewer(
   signal: ViewerSignal,
@@ -173,7 +176,13 @@ export function attachViewer(
   const offStatus = signal.on(MessageTypeSubscribeStatus, (status) => {
     viewer.store.getState().applyStatus(status.subs);
   });
-  const offCodec = canSend(signal) ? attachCodecWait(signal, viewer.store, codec) : null;
+  let offCodec: (() => void) | null = null;
+  if (canSend(signal)) {
+    offCodec = attachCodecWait(signal, viewer.store, codec);
+  } else {
+    const log = codec.log ?? createLogger('viewer').child('codec');
+    log.debug("no codec wait: this signal can't send caps.update (05 §10.6)");
+  }
   return () => {
     offStatus();
     offCodec?.();

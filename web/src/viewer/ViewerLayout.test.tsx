@@ -421,8 +421,9 @@ describe('ViewerLayout: the codec wait (05 §10.6)', () => {
     expect(
       screen.getByText("This browser can't play isshoni video. Use Chrome, Edge, Safari or Firefox."),
     ).toBeInTheDocument();
-    // The tile says that the sound still comes (Tile.tsx, shareView.ts).
-    expect(screen.getByText("This browser can't play this video. You still hear it.")).toBeInTheDocument();
+    // The tile says only that the video can't play: a thumbnail is silent (05 §12.3), so it promises no sound.
+    expect(screen.getByText("This browser can't play this video.")).toBeInTheDocument();
+    expect(screen.queryByText(/hear/)).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Reload' })).not.toBeInTheDocument();
   });
 

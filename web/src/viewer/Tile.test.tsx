@@ -200,6 +200,11 @@ describe('Tile', () => {
     });
     expect(screen.getByText('No video decoder yet. Reload the page.')).toBeInTheDocument();
     expect(mainButton()).toHaveAccessibleDescription('No video decoder yet. Reload the page.');
+    // No decoder to wait for: the tile promises no sound, since a thumbnail is silent (05 §12.3).
+    act(() => {
+      viewer.store.getState().setCodecWait({ since: 0, stuck: false, noDecoder: true, firefox: false });
+    });
+    expect(mainButton()).toHaveAccessibleDescription("This browser can't play this video.");
     act(() => {
       viewer.store.getState().setCodecWait(null);
     });

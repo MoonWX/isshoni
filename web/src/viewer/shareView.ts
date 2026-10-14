@@ -121,7 +121,9 @@ export function shareView(
 /**
  * The overlay's text. For `codec` it follows the page's codec wait (codecNotice(viewerStore.codecWait), 05 §10.6):
  * "still getting its video decoder… Retrying…" while it waits (and before the wait has begun), "Reload the page"
- * after 3 minutes, and "can't play this video" in a browser that has no H.264 decoder and won't get one.
+ * after 3 minutes, and "can't play this video" in a browser that has no H.264 decoder and won't get one. None of
+ * them promises sound: a thumbnail's audio is off (05 §12.3) and a share may have none; the room banner
+ * (CodecBanner.tsx) says what to do.
  */
 export function overlayText(t: TFunction, overlay: ShareOverlay, codec: CodecNotice | null = null): string {
   switch (overlay) {

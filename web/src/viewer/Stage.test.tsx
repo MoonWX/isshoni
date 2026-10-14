@@ -101,7 +101,7 @@ describe('Stage', () => {
     act(() => {
       viewer.store.getState().setCodecWait({ ...wait, noDecoder: true, firefox: false });
     });
-    expect(live).toHaveTextContent("This browser can't play this video. You still hear it.");
+    expect(live).toHaveTextContent(/^This browser can't play this video\.$/);
   });
 
   it('says "Connection unstable" over a stalled share', () => {

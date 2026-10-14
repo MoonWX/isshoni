@@ -388,7 +388,8 @@ describe('a fresh Firefox against the server (01 §11.7)', () => {
 });
 
 describe('attachViewer', () => {
-  it('runs no codec wait for a signal that cannot send', () => {
+  it('runs no codec wait for a signal that cannot send, and says so once in the log', () => {
+    clearLog();
     const viewer = createViewer();
     let onStatus: ((s: { subs: SubscriptionStatus[] }) => void) | undefined;
     const off = attachViewer(
@@ -402,8 +403,25 @@ describe('attachViewer', () => {
       { caps: () => NO_H264, firefox: false },
     );
     onStatus?.({ subs: [status('s_a', CODEC)] });
+    onStatus?.({ subs: [status('s_b', CODEC)] });
     expect(viewer.store.getState().status['s_a']?.reason).toBe('codec');
     expect(viewer.store.getState().codecWait).toBeNull();
+    // The silent case leaves a trace: one debug line when attached, none per status.
+    const noWait = logLines().filter((l) => l.msg.startsWith('no codec wait'));
+    expect(noWait).toHaveLength(1);
+    expect(noWait[0]).toMatchObject({ level: 'debug', component: 'viewer/codec' });
+    off();
+    viewer.dispose();
+  });
+
+  it('logs nothing about it for a signal that can send', () => {
+    clearLog();
+    const viewer = createViewer();
+    const off = attachViewer({ on: () => () => undefined, notify: () => true }, viewer, {
+      caps: () => CB,
+      firefox: true,
+    });
+    expect(logLines().filter((l) => l.msg.startsWith('no codec wait'))).toEqual([]);
     off();
     viewer.dispose();
   });
