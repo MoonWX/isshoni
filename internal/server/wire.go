@@ -506,16 +506,14 @@ func (s *Server) wireAccounts(ctx context.Context, media signal.MediaPlane) erro
 //
 // With push.enabled = false there is no service: wirePush returns nil and never calls push.New, which refuses a
 // disabled service with push.ErrDisabled. The one push.subject that config lets through and push.New refuses, a
-// bare "mailto:" or "https:" (04 §4.5, §14.1), is a config error here, on which serve exits 78 as on any other.
+// bare "mailto:" or "https:" (04 §4.5, §14.1), never gets here: New refuses it as a config error
+// (pushSubjectProblem), on which serve exits 78 as on any other.
 //
 // ops.Metrics.Registerer() becomes Options.Metrics with the metrics endpoint (README S85); until then the service
 // counts its results for nobody.
 func (s *Server) wirePush(ctx context.Context) (*push.Service, error) {
 	if !s.cfg.Push.Enabled {
 		return nil, nil
-	}
-	if err := pushSubjectError(&s.cfg); err != nil {
-		return nil, err
 	}
 	svc, err := push.New(ctx, push.Options{
 		Enabled:  true,
@@ -537,23 +535,25 @@ func (s *Server) wirePush(ctx context.Context) (*push.Service, error) {
 // pushSubjectFix is config's fix text for push.subject (04 §4.5).
 const pushSubjectFix = `use "mailto:you@example.com" or an https:// URL, or leave it empty (then mailto:<tls.acme_email> or the public origin)`
 
-// pushSubjectError returns a *config.ValidationError for a push.subject that is only a prefix, "mailto:" or
-// "https:": config checks the prefix alone and lets it through, push.New refuses a subject that names no contact
-// (04 §14.1). A subject that config refuses never gets here, and one that push.New takes is nil.
-func pushSubjectError(cfg *config.Config) error {
+// pushSubjectProblem returns the config error of a push.subject that is only a prefix, "mailto:" or "https:", with
+// push on: config checks the prefix alone and lets it through, push.New refuses a subject that names no contact
+// (04 §14.1). configProblems adds it to config's own, so New refuses it with them, before Start opens anything. A
+// subject that config refuses is config's problem, one that push.New takes is none, and with push.enabled = false
+// nothing reads the subject.
+func pushSubjectProblem(cfg *config.Config) (config.Problem, bool) {
 	const key = "push.subject"
 	subject := cfg.Push.Subject
-	if subject != "mailto:" && subject != "https:" {
-		return nil
+	if !cfg.Push.Enabled || subject != "mailto:" && subject != "https:" {
+		return config.Problem{}, false
 	}
-	return &config.ValidationError{Problems: []config.Problem{{
+	return config.Problem{
 		Key:      key,
 		Value:    strconv.Quote(subject),
 		Source:   cfg.Source(key),
 		Severity: config.SeverityError,
 		Message:  "names no contact after the " + subject + " prefix",
 		Fix:      pushSubjectFix,
-	}}}
+	}, true
 }
 
 // spaStatus is the router's SPAStatus hook (03 §12.6, 04 §9.5): the web app's /setup answers 404 once setup is

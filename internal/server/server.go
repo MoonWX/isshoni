@@ -169,7 +169,7 @@ const (
 	sfuShutdownBudget       = 1250 * time.Millisecond
 	transportShutdownBudget = 250 * time.Millisecond
 	httpShutdownBudget      = 5 * time.Second // step 5: http.Server.Shutdown on every server
-	tailShutdownBudget      = 2 * time.Second // step 6: the TLS manager and the admin socket
+	tailShutdownBudget      = 2 * time.Second // step 6: the TLS manager, the push drain and the admin socket
 	// storeCloseBudget is the store's own, at the end of step 6 and outside tailShutdownBudget: what closing it may
 	// take, also when the time above is used up. It is the one thing a shutdown that is out of time still waits for
 	// (see shutdown).
@@ -241,6 +241,11 @@ type Server struct {
 	run        context.Context
 	stopRun    context.CancelFunc
 	background sync.WaitGroup
+	// pushRun is the life of the push service's Run, a child of run. The shutdown ends it on its own, right after
+	// step 5, when nothing can queue a notification any more: the drain that follows then overlaps the TLS
+	// manager's shutdown, and step 6 only waits for what is left of it (pushDone).
+	pushRun  context.Context
+	stopPush context.CancelFunc
 
 	setupDone atomic.Bool                      // an admin account exists: /setup answers 404 (spaStatus)
 	publicNow atomic.Pointer[netx.PublicAddrs] // the public addresses as last seen, once they differ from public
@@ -255,6 +260,7 @@ type Server struct {
 	hookDraining func()
 	// hookStep, set by tests (under life), runs in Shutdown right before a component is stopped, with its name:
 	// "signaling", "sfu", "transport", "http", "tls", "push", "admin socket", "store", in the order of 04 §6.4.
+	// "push" comes before the wait for the push service's drain, which began once the HTTP step was done.
 	hookStep func(step string)
 	// hookDetect, set by tests before Start, stands in for the public-address detection (04 §7.4), which reads
 	// the machine's interfaces: a test says what the server finds, at startup and at every later look.
@@ -302,14 +308,20 @@ func (s *Server) now() time.Time {
 }
 
 // configProblems returns every problem of cfg, errors first, and its warnings alone: those that Load found (a
-// malformed value that Load replaced by the default is only there) and those of the current values (a caller may
-// have changed the config since).
+// malformed value that Load replaced by the default is only there), those of the current values (a caller may
+// have changed the config since), and the one that only the server knows of: a push.subject that names no contact
+// (pushSubjectProblem). push.New would refuse that one only deep into Start, once the data directory, the store and
+// the listeners are open, or, on a server that waits for its public address and has no site yet, only at the
+// re-exec that follows when the address is found.
 func configProblems(cfg *config.Config) (all, warnings []config.Problem) {
 	all = cfg.Problems()
 	for _, p := range cfg.Validate() {
 		if !slices.Contains(all, p) {
 			all = append(all, p)
 		}
+	}
+	if p, bad := pushSubjectProblem(cfg); bad {
+		all = append(all, p)
 	}
 	slices.SortStableFunc(all, func(a, b config.Problem) int {
 		return strings.Compare(a.Severity, b.Severity) // "error" sorts before "warning"
@@ -367,6 +379,7 @@ func (s *Server) Start(ctx context.Context) (err error) {
 	s.logConfigWarnings(ctx)
 	// The server's own work outlives the startup that ctx bounds; the shutdown ends it.
 	s.run, s.stopRun = context.WithCancel(context.WithoutCancel(ctx))
+	s.pushRun, s.stopPush = context.WithCancel(s.run)
 
 	// Step 2: umask, the data directory checks, the data-directory lock, the memory limit (04 §5.1).
 	if !s.deps.InProcess {
@@ -522,9 +535,9 @@ func (s *Server) Start(ctx context.Context) (err error) {
 // startBackground starts what the server does on its own while it runs: the admin socket's API (04 §6.1 step 9),
 // 03's janitor, the push service's workers and its daily prune (04 §14), doctor's own runs, 20 s from now and then
 // once a day (04 §13.1), and the look at the public addresses every ten minutes, or every 30 s while the server
-// waits for the address that is its site (04 §7.4). The admin socket's goroutine ends with its Shutdown, the others
-// with s.run; the push service sends what is queued for at most 2 s more (push.Service.Run), and closes pushDone
-// when it has.
+// waits for the address that is its site (04 §7.4). The admin socket's goroutine ends with its Shutdown, the push
+// service with s.pushRun, the others with s.run; the push service sends what is queued for at most 2 s more
+// (push.Service.Run), and closes pushDone when it has.
 func (s *Server) startBackground() {
 	admin, ln := s.admin, s.adminLn
 	s.background.Go(func() {
@@ -537,10 +550,10 @@ func (s *Server) startBackground() {
 	if accounts := s.accounts; accounts != nil {
 		s.background.Go(func() { accounts.RunJanitor(s.run) })
 	}
-	if svc, done := s.push, s.pushDone; svc != nil {
+	if svc, done, ctx := s.push, s.pushDone, s.pushRun; svc != nil {
 		s.background.Go(func() {
 			defer close(done)
-			_ = svc.Run(s.run) // nil once drained; an error only for a second Run
+			_ = svc.Run(ctx) // nil once drained; an error only for a second Run
 		})
 	}
 	s.background.Go(func() { s.watchPublic(s.run) })
@@ -775,11 +788,16 @@ func (s *Server) shutdown(ctx context.Context, reason ShutdownReason, draining f
 	// Step 5: the HTTP servers, then the 443 multiplexer.
 	before("http")
 	step("http", httpShutdownBudget, s.shutdownHTTP)
+	// Nothing can queue a notification any more: the hub stopped in step 3, the REST API's servers in step 5, and
+	// the admin socket has answered only health, ready and status since step 1. So the push service stops taking
+	// work now and begins its drain (its Run sends what is still queued for at most 2 s and drops what is left
+	// then), alongside the TLS manager's shutdown; step 6 waits for it after that.
+	s.stopPush()
 
 	// Step 6, in tailShutdownBudget altogether: the TLS manager, now that nothing handshakes any more; then the
-	// server's own work, with the push service, which sends what is still queued (its Run drains for at most 2 s,
-	// and drops what is left then); and the admin socket, which the operator's CLI could ask until now (its health
-	// answers have said "shutting down" since step 1). README S85 adds here: flush the transfer counters.
+	// server's own work, and the wait for the push service's drain; and the admin socket, which the operator's CLI
+	// could ask until now (its health answers have said "shutting down" since step 1). README S85 adds here: flush
+	// the transfer counters.
 	tailCtx, cancelTail := context.WithTimeout(ctx, tailShutdownBudget)
 	defer cancelTail()
 	tail := func(name string, fn func(context.Context) error) {
@@ -903,6 +921,7 @@ func (s *Server) release(ctx context.Context) {
 	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tailShutdownBudget)
 	defer cancel()
 	if s.stopRun != nil {
+		s.stopPush()
 		s.stopRun()
 	}
 	if s.hub != nil {

@@ -17,10 +17,10 @@
 //     restarted (ErrRestartRequested), or failed.
 //   - Shutdown stops the server in the order of 04 §6.4: readiness and liveness off, the shutdown gate (503
 //     server_shutdown for every new request), the hub (server.shutdown to every connection, close 1012), the SFU
-//     and then the ICE Transport under it, then the HTTP servers and the 443 multiplexer, the TLS manager, the push
-//     service (what is queued goes out, for at most 2 s), the admin socket, the store, and last the data-directory
-//     lock. It finishes within shutdown_timeout (10 s); what is still open then is closed by force, and its error
-//     says so with ErrShutdownForced.
+//     and then the ICE Transport under it, then the HTTP servers and the 443 multiplexer, the TLS manager while the
+//     push service sends what is queued (for at most 2 s, from the moment the HTTP servers are down), the admin
+//     socket, the store, and last the data-directory lock. It finishes within shutdown_timeout (10 s); what is
+//     still open then is closed by force, and its error says so with ErrShutdownForced.
 //
 // What runs in the server (README slices S31, S44, S54, S59 and S71; 04 slices S4, S7, W1, W2 and S12b):
 //   - The HTTP side of every TLS mode of 04 §8.1. httpapi's router serves the embedded web app with its fallback,

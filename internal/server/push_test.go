@@ -20,6 +20,7 @@ import (
 	"github.com/MoonWX/isshoni/internal/protocol/api"
 	"github.com/MoonWX/isshoni/internal/server"
 	"github.com/MoonWX/isshoni/internal/server/config"
+	"github.com/MoonWX/isshoni/internal/server/netx"
 	"github.com/MoonWX/isshoni/internal/server/push"
 	"github.com/MoonWX/isshoni/internal/server/servertest"
 	"github.com/MoonWX/isshoni/internal/server/sfu/sfutest"
@@ -416,6 +417,17 @@ func TestPushSubjectOnlyAPrefix(t *testing.T) {
 				Flags: []string{"--push.subject=" + subject, "--push.enabled=false"}})
 		})
 	}
+	// An ip-mode server that finds no public address starts without a site, and so without a push service, until it
+	// finds one and re-execs (04 §6.2, §7.4): New refuses the subject all the same, before that first start.
+	t.Run("ip mode without an address", func(t *testing.T) {
+		flags := tlsFlags("--tls.mode=ip", closedCA, "--push.subject=mailto:")
+		_, err := server.New(testConfig(t, flags...), nil, testDeps())
+		var ve *config.ValidationError
+		if !server.NeedsOperator(err) || !errors.As(err, &ve) || len(ve.Problems) != 1 || ve.Problems[0].Key != "push.subject" {
+			t.Fatalf("New in ip mode with push.subject = \"mailto:\": %v, want a config error for that key", err)
+		}
+		startDirect(t, testConfig(t, slices.Concat(flags, []string{"--push.enabled=false"})...), testDeps(), netx.PublicAddrs{})
+	})
 	// A subject with a contact is taken.
 	servertest.Start(t, servertest.Options{Deps: wiredDeps(), Flags: []string{"--push.subject=mailto:ops@example.com"}})
 }

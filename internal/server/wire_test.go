@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -2017,26 +2019,52 @@ func TestPushStore(t *testing.T) {
 	}
 }
 
-// pushSubjectError turns the subject that config lets through and push.New refuses into a config error for the key,
-// with its source and config's fix; every other subject is push.New's or config's business.
-func TestPushSubjectError(t *testing.T) {
+// pushSubjectProblem turns the subject that config lets through and push.New refuses into a config error for the
+// key, with its source and config's fix; every other subject is push.New's or config's business, and with push off
+// no subject is. New reports it with config's own problems, errors first, before anything is opened: also on an
+// ip-mode server that would start without a site, and so without a push service, until it finds its address.
+func TestPushSubjectProblem(t *testing.T) {
 	for _, subject := range []string{"", "mailto:ops@example.com", "https://watch.example.com", "https:x"} {
-		if err := pushSubjectError(loadFlags(t, "--push.subject="+subject)); err != nil {
-			t.Errorf("push.subject = %q: %v", subject, err)
-		}
-	}
-	for _, subject := range []string{"mailto:", "https:"} {
-		err := pushSubjectError(loadFlags(t, "--push.subject="+subject))
-		var ve *config.ValidationError
-		if !errors.As(err, &ve) || len(ve.Problems) != 1 || !NeedsOperator(err) {
-			t.Fatalf("push.subject = %q: %v, want a config error", subject, err)
-		}
-		p := ve.Problems[0]
-		if p.Key != "push.subject" || p.Value != `"`+subject+`"` || p.Severity != config.SeverityError ||
-			p.Source != (config.Source{Kind: config.SourceFlag, Name: "--push.subject"}) || p.Fix != pushSubjectFix {
+		if p, bad := pushSubjectProblem(loadFlags(t, "--push.subject="+subject)); bad {
 			t.Errorf("push.subject = %q: %+v", subject, p)
 		}
 	}
+	for _, subject := range []string{"mailto:", "https:"} {
+		p, bad := pushSubjectProblem(loadFlags(t, "--push.subject="+subject))
+		if !bad || p.Key != "push.subject" || p.Value != `"`+subject+`"` || p.Severity != config.SeverityError ||
+			p.Source != (config.Source{Kind: config.SourceFlag, Name: "--push.subject"}) || p.Fix != pushSubjectFix {
+			t.Errorf("push.subject = %q: %v %+v", subject, bad, p)
+		}
+		if p, bad := pushSubjectProblem(loadFlags(t, "--push.subject="+subject, "--push.enabled=false")); bad {
+			t.Errorf("push.subject = %q with push off: %+v", subject, p)
+		}
+	}
+
+	// New: one config error with config's own, sorted with them; nothing is opened.
+	cfg := loadFlags(t, "--tls.mode=ip", "--listen.https=127.0.0.1:0", "--push.subject=mailto:", "--shutdown-timeout=soon")
+	_, err := New(cfg, discardLog(), Deps{})
+	var ve *config.ValidationError
+	if !errors.As(err, &ve) || !NeedsOperator(err) {
+		t.Fatalf("New with push.subject = \"mailto:\": %v, want a config error", err)
+	}
+	var errKeys []string
+	for _, p := range ve.Problems {
+		if p.Severity == config.SeverityError {
+			errKeys = append(errKeys, p.Key)
+		}
+	}
+	slices.Sort(errKeys)
+	if !slices.Equal(errKeys, []string{"push.subject", "shutdown_timeout"}) || !slices.IsSortedFunc(ve.Problems,
+		func(a, b config.Problem) int { return strings.Compare(a.Severity, b.Severity) }) {
+		t.Errorf("New's problems: %v, want the push.subject and shutdown_timeout errors first", ve.Problems)
+	}
+	if _, err := os.Stat(cfg.DataDir); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("New refused the config, and the data directory is there: %v", err)
+	}
+	if msg := err.Error(); !strings.Contains(msg, `push.subject = "mailto:" (flag --push.subject) names no contact`) {
+		t.Errorf("the error says %q", err)
+	}
+
 	// The fix is config's own, word for word: one text for the two halves of the rule.
 	found := false
 	for _, p := range loadFlags(t, "--push.subject=smtp:ops").Validate() {

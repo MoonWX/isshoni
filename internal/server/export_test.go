@@ -21,12 +21,21 @@ func (s *Server) SetDrainingHook(fn func()) {
 }
 
 // SetShutdownStepHook makes Shutdown call fn right before it stops each component, with the component's name:
-// "signaling", "sfu", "transport", "http", "tls", "push", "admin socket", "store" (04 §6.4). A server without a
-// component has no step for it.
+// "signaling", "sfu", "transport", "http", "tls", "push", "admin socket", "store" (04 §6.4). "push" is the wait for
+// the push service's drain, which began right after "http" was done. A server without a component has no step for
+// it.
 func (s *Server) SetShutdownStepHook(fn func(step string)) {
 	s.life.Lock()
 	defer s.life.Unlock()
 	s.hookStep = fn
+}
+
+// PushTakesWork reports whether the server's push service still takes work: false without one, and from the moment
+// the shutdown has ended its Run (right after the HTTP step), also while its drain still sends.
+func (s *Server) PushTakesWork() bool {
+	s.life.Lock()
+	defer s.life.Unlock()
+	return s.push != nil && s.pushRun.Err() == nil
 }
 
 // Media returns the running server's SFU.
