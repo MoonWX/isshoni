@@ -1293,7 +1293,6 @@ func TestProber(t *testing.T) {
 		{name: "the SFU is closed", err: &sfu.Error{Code: sfu.CodeClosed},
 			want: api.NewError(api.CodeNotReady), status: http.StatusServiceUnavailable},
 		{name: "Pion failed", err: &sfu.Error{Code: sfu.CodeInternal, Retryable: true}},
-		{name: "the request ended", err: context.Canceled},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := prober{sfu: &fakeProbeSFU{err: tc.err}}.Probe(context.Background(), "u1", "udp", "v=0")
@@ -1302,6 +1301,10 @@ func TestProber(t *testing.T) {
 				if !errors.Is(err, tc.err) || errors.As(err, &ae) {
 					t.Errorf("err = %v, want %v wrapped, without an *api.Error", err, tc.err)
 				}
+				// The request is still on: a 500 of the server's, which httpapi logs at error.
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					t.Errorf("err = %v, want no context error while the request is on", err)
+				}
 				return
 			}
 			if !errors.As(err, &ae) || !reflect.DeepEqual(ae, tc.want) {
@@ -1309,6 +1312,36 @@ func TestProber(t *testing.T) {
 			}
 			if s := api.StatusOf(ae.Code); s != tc.status {
 				t.Errorf("%s is %d, want %d", ae.Code, s, tc.status)
+			}
+		})
+	}
+
+	// The browser left while the SFU gathered: setLocalComplete returns the context's error, which the SFU answers
+	// as sfu.internal without the cause. The prober joins the request's context error in, so that httpapi logs the
+	// 500 of a client that went away at debug, not as a failure of the server's.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	timedOut, cancel := context.WithDeadline(context.Background(), time.Unix(0, 0))
+	defer cancel()
+	for _, end := range []struct {
+		name string
+		ctx  context.Context
+		want error
+	}{
+		{"cancelled", cancelled, context.Canceled},
+		{"timed out", timedOut, context.DeadlineExceeded},
+	} {
+		t.Run("the request ended during gathering, "+end.name, func(t *testing.T) {
+			internal := &sfu.Error{Code: sfu.CodeInternal, Retryable: true}
+			_, err := prober{sfu: &fakeProbeSFU{err: internal}}.Probe(end.ctx, "u1", "udp", "v=0")
+			var ae *api.Error
+			if !errors.Is(err, end.want) || !errors.Is(err, internal) || errors.As(err, &ae) {
+				t.Errorf("err = %v, want %v and %v wrapped, without an *api.Error", err, internal, end.want)
+			}
+			// An error the prober maps stays that answer: the client is gone, and a 4xx or 503 logs no error.
+			_, err = prober{sfu: &fakeProbeSFU{err: &sfu.Error{Code: sfu.CodeClosed}}}.Probe(end.ctx, "u1", "udp", "v=0")
+			if !errors.As(err, &ae) || ae.Code != api.CodeNotReady {
+				t.Errorf("sfu.closed: err = %#v, want %s", err, api.CodeNotReady)
 			}
 		})
 	}

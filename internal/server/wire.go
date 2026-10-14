@@ -1177,7 +1177,7 @@ type prober struct{ sfu probeSFU }
 func (p prober) Probe(ctx context.Context, userID, transport, offerSDP string) (string, error) {
 	answer, _, err := p.sfu.Probe(ctx, sfu.UserID(userID), sfu.ProbeTransport(transport), offerSDP)
 	if err != nil {
-		return "", probeError(transport, err)
+		return "", probeError(ctx, transport, err)
 	}
 	return answer, nil
 }
@@ -1193,8 +1193,11 @@ func (p prober) Probe(ctx context.Context, userID, transport, offerSDP string) (
 //     transport replaced this one before it was answered.
 //
 // Anything else (sfu.internal: Pion failed, or a contract violation) stays an error of the server's, wrapped for
-// the log line of the 500 internal that WriteError makes of it.
-func probeError(transport string, err error) error {
+// the log line of the 500 internal that WriteError makes of it. When the request has ended by then, its context
+// error is joined in: the SFU stops waiting for ICE gathering when the browser leaves and answers sfu.internal,
+// whose *sfu.Error doesn't carry the cause, and httpapi logs a 500 of a request whose client went away at debug
+// only when the error says so (errors.Is context.Canceled or DeadlineExceeded).
+func probeError(ctx context.Context, transport string, err error) error {
 	var se *sfu.Error
 	if errors.As(err, &se) {
 		switch se.Code {
@@ -1208,6 +1211,9 @@ func probeError(transport string, err error) error {
 		case sfu.CodeClosed:
 			return api.NewError(api.CodeNotReady)
 		}
+	}
+	if cerr := ctx.Err(); cerr != nil && !errors.Is(err, cerr) {
+		err = errors.Join(err, cerr)
 	}
 	return fmt.Errorf("server: connection-test probe on %s: %w", transport, err)
 }
