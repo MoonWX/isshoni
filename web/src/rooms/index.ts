@@ -6,6 +6,12 @@
 //
 // The room's media code (the stage, the Share button, the sub PC controller: rooms/media.ts) is a lazy chunk and
 // is deliberately not exported from here; the page and the runtime load it themselves.
+//
+// The account menu's "Invite friends" shows setup/'s InviteLinkCard (InviteDialog.tsx), whose texts are the lazy
+// `setup` namespace (05 §16.5): the import below adds them to the catalog with this chunk, before any page of the
+// folder renders.
+import '../i18n/lazy/setup';
+
 export { AccountMenu, type AccountMenuProps } from './AccountMenu';
 export {
   connectionBanner,

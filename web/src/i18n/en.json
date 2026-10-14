@@ -346,10 +346,19 @@
       "account": "Account",
       "notifications": "Notifications",
       "invite": "Invite friends",
+      "myInvites": "My invites",
       "admin": "Admin",
       "install": "Install app",
       "about": "About isshoni",
       "signOut": "Sign out"
+    },
+    "invite": {
+      "title": "Invite friends",
+      "lead": "Send this link to the friends you want to watch with. Each of them makes an account with it.",
+      "creating": "Making an invite link…",
+      "failed": "Couldn't make an invite link. {{message}}",
+      "retry": "Try again",
+      "done": "Done"
     },
     "empty": {
       "title": "Nobody is sharing yet.",
