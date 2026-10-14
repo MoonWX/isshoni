@@ -150,7 +150,9 @@ Conventions:
   `restore -`, whose stdin is the archive); otherwise they need `--yes`. Without it they refuse (exit 2) and print the
   exact command with `--yes` added, in the environment's form (Docker when a container is detected, §5.1; the same
   detection as §6.1 step 4), e.g. `sudo isshoni admin restore --yes /root/backup.tar.gz` under systemd, or
-  `docker compose exec -T isshoni isshoni admin restore --yes - < backup.tar.gz` in Docker.
+  `docker compose exec -T isshoni isshoni admin restore --yes - < backup.tar.gz` in Docker. Any answer but `y` or
+  `yes` (in any case) cancels with exit 1 ("cancelled; nothing was changed"); an input that ends without an answer
+  is treated as no terminal (exit 2, the `--yes` command).
 - The CLI never opens the database or writes to the data directory, except `--offline` commands (§12.6).
 
 ### 3.2 Exit codes

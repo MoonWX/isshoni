@@ -2220,8 +2220,9 @@ with `fake.Source`, `sfutest.Viewer`)**
    of three, and single audio packets (at least 10 of each kind). Every gap closes (video through the RTX stream only, audio through the
    packet itself), nothing is lost for good, each frame and audio packet is the publisher's by a hash of its
    payload, nothing arrives twice on the media stream, the DownTrack's repair counters show no miss and no queue
-   drop, and the sub PC's round-trip time has been read (its value on loopback is not checked: a loaded machine
-   stretches one STUN round trip a long way). The second viewer sees no gap and sends no NACK.
+   drop, and the sub PC's round-trip time has been read: the test wants a value above 0 and under a second, no
+   tighter (a loaded machine stretches one STUN round trip on loopback a long way). The second viewer sees no gap
+   and sends no NACK.
 5. `TestSRTranslationAndAVOffset`: |flash − beep| ≤ 5 ms after 10 layer switches and 5 audio off/on cycles; forwarded
    SR RTP equals upstream RTP + offset.
 6. `TestPaddingNoGaps`: the publisher injects padding-only packets; the viewer sees no seq gaps and sends no NACKs.

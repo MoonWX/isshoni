@@ -845,7 +845,7 @@ The package maintainer field is the owner's GitHub noreply address (filled in on
 ### 6.1 Image: `deploy/docker/Dockerfile`
 
 ```dockerfile
-# syntax=docker/dockerfile:1@sha256:<pinned digest> (pinned by README S73, below; as S68 merged it: dockerfile:1)
+# syntax=docker/dockerfile:1@sha256:<pinned digest>
 # Built by goreleaser dockers_v2 (release) and deploy/docker/test/docker-build.sh (CI, task docker:smoke). No RUN
 # steps: nothing is emulated for arm64, and the image holds only the static binary.
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:<pinned digest, updated by Dependabot>
@@ -896,8 +896,12 @@ says the same for the repository's readers):
   BuildKit fetches the Dockerfile frontend that this line names from Docker Hub before it reads the rest of the
   file, so `docker/dockerfile:1` is a floating tag that every build, the release's included, pulls as it is at
   that moment: the one input of the image that no digest fixed. Like the `FROM` line it becomes
-  `docker/dockerfile:1@sha256:<digest>`, so no build pulls a frontend nobody chose (§9.2); S73 also says how that
-  digest is kept current. As S68 merged it the line is still `# syntax=docker/dockerfile:1`.
+  `docker/dockerfile:1@sha256:<digest>`, so no build pulls a frontend nobody chose (§9.2). S73 also says, in a
+  comment just below the line, how that digest is kept current: by Dependabot's `docker` ecosystem if S73 confirms
+  that it updates the directive, otherwise by hand with the monthly bump of the tool pins (§7.1). The comment can't
+  go above the line: BuildKit looks for parser directives only at the top of the file, before any comment, empty
+  line or instruction, and would read the line as a plain comment. As S68 merged it the line is still
+  `# syntax=docker/dockerfile:1`; the block above shows it as S73 pins it.
 
 ### 6.2 `deploy/compose.yaml` (bridge networking, the default)
 
@@ -2065,8 +2069,9 @@ rest):
 4. **Host:** the same with `compose.host.yaml`, plus `ss -ltnp` on the runner shows :443 owned by the container's
    process.
 5. **No volume:** `docker run --rm <image>` exits 78 within 10 s and logs a message containing `/var/lib/isshoni`.
-6. **No `.env`:** `deploy/compose.yaml` started from a directory without a `.env` file, with an override that only
-   sets the local image. `ISSHONI_DOMAIN` and `ISSHONI_PUBLIC_IP` reach the container as empty strings. Asserts:
+6. **No `.env`:** `deploy/compose.yaml` started from a directory without a `.env` file, with an override that sets
+   the local image and points the ACME directory at a closed loopback port (`ISSHONI_TLS_ACME_CA`, below), so ip
+   mode asks no real CA. `ISSHONI_DOMAIN` and `ISSHONI_PUBLIC_IP` reach the container as empty strings. Asserts:
    - the container keeps running (no exit 78 over an empty value);
    - `docker compose exec -T isshoni isshoni config print --json` shows `domain` and `public_ip` with source
      `default`, not `env`, and the derived TLS mode `ip` (04 §4.2 empty-means-unset rule). No certificate is

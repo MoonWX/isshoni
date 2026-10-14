@@ -3008,9 +3008,10 @@ text above leaves something open:
   display's rate: on a CI machine the sharer encodes both layers in software next to everything else, and half the
   frames leave it room for that. The canvas fills the tab, so what is captured is the tab's size, not the canvas's
   1280×720: S66 measured the tone tab's capture at 1280×658, which still gives the high layer a frame height
-  above the 540 that `watch.spec` asks for. The tone is the fake display's (1 kHz at a quarter of full scale), and
-  `window.__tone` tells the specs that the tab draws and sounds. `fixtures.ts` serves it through `context.route`,
-  so the server's Content-Security-Policy does not apply to its inline script.
+  above the 540 that `watch.spec` asks for. The tab sounds its own 1 kHz sine at a quarter of full scale, the same
+  tone as the fake display's (`src/platform/browser/fakeDisplay.ts`), and `window.__tone` tells the specs that the
+  tab draws and sounds. `fixtures.ts` serves it through `context.route`, so the server's Content-Security-Policy
+  does not apply to its inline script.
 - **The high layer gets 40 s.** A sharer whose machine is busy starts with the low layer alone and adds the high
   one when its bandwidth estimate allows it: within a second on an idle machine, 10 to 17 s after the start in a
   container held to two CPUs. `watch.spec` waits up to 40 s (`HIGH_LAYER_TIMEOUT_MS`) for `room.state` to list both
