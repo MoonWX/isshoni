@@ -35,6 +35,9 @@ type SFU struct {
 	// clockSkew is added to monoNow for the codec policy's clock (codecNow): 0 but in tests, which move that clock on
 	// to see the policy's 60 s hysteresis pass (02 §17: policy_test and integration 12 use a fake clock).
 	clockSkew atomic.Int64
+	// allocSkew is added to monoNow for the downlink allocators' clock (allocNow): 0 but in tests, which move it on to
+	// see backoffs and trials pass (02 §17: allocator_test uses a fake clock).
+	allocSkew atomic.Int64
 	// fullMaxBps is the full layer's MaxBitrate under the admin's cap, in bit/s (fullLayerMax of limits): New and
 	// SetLimits set it with limits. The NACK path reads it for the retransmission budget (Share.maxBitrate), once
 	// per NACK, so it is an atomic and not a field under mu.
@@ -204,8 +207,9 @@ func (s *SFU) Close() error {
 
 // runTicker is the SFU's ticker goroutine. Every 250 ms, and at once when a share changes state (kick), it makes the
 // ShareUpdated calls that are due; once a second it turns the layers' counters into rates, sizes their packet
-// caches, makes the shares stalled whose pub PC has been away for 2 s, and lets a room's codec policy go back to
-// high once its hold has passed. Later slices add the rest of 02 §5.4's ticker work (README S84, S88).
+// caches, makes the shares stalled whose pub PC has been away for 2 s, lets a room's codec policy go back to high
+// once its hold has passed, and has every Conn's downlink allocator look at its viewer. The uplink policy of 02 §11
+// is README S88's.
 func (s *SFU) runTicker() {
 	defer close(s.tickDone)
 	tick := time.NewTicker(tickInterval)
@@ -250,9 +254,11 @@ func (s *SFU) reportShares(now int64) {
 
 // everySecond is the ticker's once-a-second work: each layer's rates and cache size (02 §9.1), and each DownTrack's
 // bitrate (02 §13); the stalled check of 02 §5.3, a live share whose pub PC hasn't been connected for 2 s is stalled
-// (the other ways into stalled don't wait for the ticker: Share.detach, Conn.stallShares); and each room's codec
-// policy, whose way back to high waits for its hold to pass (02 §8.3). Every other policy change happens where the
-// viewer set changes.
+// (the other ways into stalled don't wait for the ticker: Share.detach, Conn.stallShares); each room's codec policy,
+// whose way back to high waits for its hold to pass (02 §8.3), while every other policy change happens where the
+// viewer set changes; and, with the rates of this second in place, a look of every Conn's downlink allocator at its
+// viewer (02 §10.2), which its actor takes (Conn.adapt): backoffs and trials run out, and the rate forwarded to the
+// viewer and the drops of its queues are weighed.
 func (s *SFU) everySecond(now int64) {
 	for _, sh := range s.liveShares() {
 		for _, l := range sh.attached() {
@@ -268,9 +274,16 @@ func (s *SFU) everySecond(now int64) {
 	for _, r := range s.rooms {
 		rooms = append(rooms, r)
 	}
+	conns := make([]*Conn, 0, len(s.conns))
+	for _, c := range s.conns {
+		conns = append(conns, c)
+	}
 	s.mu.Unlock()
 	for _, r := range rooms {
 		s.updateCodecPolicy(r)
+	}
+	for _, c := range conns {
+		c.wakeAllocator()
 	}
 }
 

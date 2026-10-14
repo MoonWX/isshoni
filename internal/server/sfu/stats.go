@@ -62,7 +62,7 @@ type ConnStats struct {
 	PCs              []PCStats           // pub first, then sub; only the PCs that exist
 	Shares           []OwnShareStats     // the shares this Conn publishes, by StartedAt
 	Subscriptions    []SubscriptionStats // by share id
-	DownlinkEstimate int64               // bit/s for the sub PC, from the downlink allocator; 0 while unknown
+	DownlinkEstimate int64               // bit/s for the sub PC, from the downlink allocator (02 §10.2); 0 while unknown
 }
 
 // PCStats describes one PeerConnection of a Conn.
@@ -582,11 +582,12 @@ func (s *SFU) Metrics() Metrics {
 }
 
 // Stats returns the Conn's media view (02 §13): its PeerConnections, the shares it publishes with their layers and
-// audio, its subscriptions with what they forward and count, by share id, and the downlink estimate, which stays 0
-// until the downlink allocator (README S84). It reads atomics and takes each lock briefly, never the Conn's actor, so
-// signal's actor can ask for it every 2 s without waiting.
+// audio, its subscriptions with what they forward and count, by share id, and the downlink estimate of its allocator
+// (02 §10.2): the budget it holds the viewer to while it is limited, else the viewer's latest REMB while that is
+// fresh, else 0. It reads atomics and takes each lock briefly, never the Conn's actor, so signal's actor can ask for
+// it every 2 s without waiting.
 func (c *Conn) Stats() ConnStats {
-	st := ConnStats{PCs: c.pcStats()}
+	st := ConnStats{PCs: c.pcStats(), DownlinkEstimate: c.alloc.estimate.Load()}
 	now := monoNow()
 	for _, sh := range c.room.sortedShares() {
 		info, ok := sh.info()

@@ -18,6 +18,8 @@ import (
 	"github.com/pion/rtp"
 	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v4"
+
+	"github.com/MoonWX/isshoni/internal/server/sfu/sfutest/rembsim"
 )
 
 // ViewerOptions configure a Viewer.
@@ -40,6 +42,12 @@ type ViewerOptions struct {
 	KeepPackets int
 	// Logger gets the Viewer's own logs (default slog.Default()).
 	Logger *slog.Logger
+	// REMB makes the Viewer send REMBs as Chrome's receive-side estimator would on the Link in front of it (the SFU's
+	// FaultConn.SetLink): rembsim's model, stepped every 50 ms with what the SFU sent through the Link and what
+	// passed, sends one with its first estimate, then every second and at once when the estimate falls by 3 %,
+	// naming every video SSRC the Viewer receives (02 §17). nil: a REMB goes out only when the test sends one
+	// (SendREMB).
+	REMB *Link
 }
 
 // DefaultH264 are the profile-level-ids a Viewer decodes by default: the SFU's static table (02 §8.1).
@@ -64,6 +72,8 @@ const (
 	nackTick  = 10 * time.Millisecond
 	// nackSeqs is the most sequence numbers one NACK packet names: more go into the next packet.
 	nackSeqs = 256
+	// rembStep is how often a Viewer with ViewerOptions.REMB steps its model of the link.
+	rembStep = 50 * time.Millisecond
 )
 
 // Viewer is a Pion subscriber that records what it receives. NewViewer creates its PeerConnection; tracks are
@@ -87,8 +97,17 @@ type Viewer struct {
 	pc       *webrtc.PeerConnection
 	recs     []*Recorder
 	rtcpRead map[rtcpKey]bool
+	rembs    []REMB
 	closed   bool
 	wg       sync.WaitGroup
+	// stop ends the REMB loop (ViewerOptions.REMB) at Close.
+	stop chan struct{}
+}
+
+// REMB is one REMB a Viewer sent: when, and its estimate in bit/s.
+type REMB struct {
+	At      time.Time
+	Bitrate float64
 }
 
 // rtcpKey names one RTCP reader: a receiver and, for simulcast, a rid.
@@ -108,6 +127,7 @@ func NewViewer(o ViewerOptions) (*Viewer, error) {
 		opts: o, api: api,
 		cfg: webrtc.Configuration{ICEServers: o.ICEServers},
 		log: o.Logger, keep: o.KeepPackets, noNACK: o.NoNACK, rtcpRead: map[rtcpKey]bool{},
+		stop: make(chan struct{}),
 	}
 	if v.log == nil {
 		v.log = slog.Default()
@@ -118,7 +138,47 @@ func NewViewer(o ViewerOptions) (*Viewer, error) {
 	if v.pc, err = v.newPC(); err != nil {
 		return nil, err
 	}
+	if o.REMB != nil {
+		v.wg.Go(func() { v.sendREMBs(o.REMB) })
+	}
 	return v, nil
+}
+
+// sendREMBs is the REMB loop of a Viewer with ViewerOptions.REMB: every rembStep it hands rembsim's model what the SFU
+// sent through the link since the last step and what of it passed, and sends the REMBs the model sends, until Close.
+// A REMB due before the first video track arrives names nothing and is not sent.
+func (v *Viewer) sendREMBs(link *Link) {
+	tick := time.NewTicker(rembStep)
+	defer tick.Stop()
+	var model rembsim.Model
+	start := time.Now()
+	sent0, passed0, _ := link.Counts()
+	for {
+		select {
+		case <-v.stop:
+			return
+		case now := <-tick.C:
+			sent, passed, _ := link.Counts()
+			bps, send := model.Step(now.Sub(start), float64(sent-sent0)*8, float64(passed-passed0)*8)
+			sent0, passed0 = sent, passed
+			if !send || bps <= 0 {
+				continue
+			}
+			if err := v.SendREMB(float32(bps)); err != nil {
+				continue
+			}
+			v.mu.Lock()
+			v.rembs = append(v.rembs, REMB{At: now, Bitrate: bps})
+			v.mu.Unlock()
+		}
+	}
+}
+
+// REMBs returns the REMBs the Viewer's model sent (ViewerOptions.REMB), in order.
+func (v *Viewer) REMBs() []REMB {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return slices.Clone(v.rembs)
 }
 
 // viewerAPI builds a Viewer's API: a browser-like MediaEngine for o, receiver reports every 1 s, o.Settings.
@@ -484,6 +544,7 @@ func (v *Viewer) Close() error {
 	v.closed = true
 	pc := v.pc
 	v.mu.Unlock()
+	close(v.stop)
 	err := pc.Close()
 	v.wg.Wait()
 	if err != nil {

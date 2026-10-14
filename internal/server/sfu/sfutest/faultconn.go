@@ -5,6 +5,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Direction is the way a datagram goes through a FaultConn.
@@ -18,19 +19,32 @@ const (
 
 // FaultConn wraps a UDP socket and loses datagrams when a test says so: the SFU's socket, injected through 04's
 // netx.TransportOptions.PacketConns, or a Go client's, through webrtc.NewICEUDPMux. Lost datagrams vanish like on a
-// bad network: WriteTo still reports them as written, and ReadFrom waits for the next datagram.
+// bad network: WriteTo still reports them as written, and ReadFrom waits for the next datagram. A Link in front of a
+// peer (SetLink) gives the datagrams sent to it a capacity.
 type FaultConn struct {
 	net.PacketConn
 
-	mu      sync.Mutex // guards drop and blocked
+	mu      sync.Mutex // guards drop, blocked and links
 	drop    func(dir Direction, peer net.Addr, b []byte) bool
-	blocked map[string]bool // peer address → black-holed both ways
+	blocked map[string]bool  // peer address → black-holed both ways
+	links   map[string]*Link // peer address → the bottleneck of what is sent to it
 	dropped atomic.Int64
 }
 
-// NewFaultConn wraps pc. Nothing is lost until SetDrop or BlackHole.
+// NewFaultConn wraps pc. Nothing is lost until SetDrop, BlackHole or SetLink.
 func NewFaultConn(pc net.PacketConn) *FaultConn {
-	return &FaultConn{PacketConn: pc, blocked: map[string]bool{}}
+	return &FaultConn{PacketConn: pc, blocked: map[string]bool{}, links: map[string]*Link{}}
+}
+
+// SetLink puts l in front of peer: what is written to peer goes through it, at its capacity (Link). nil removes it.
+func (c *FaultConn) SetLink(peer net.Addr, l *Link) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if l == nil {
+		delete(c.links, peer.String())
+	} else {
+		c.links[peer.String()] = l
+	}
 }
 
 // SetDrop installs a filter that loses every datagram it returns true for (nil removes it). It runs on the socket's
@@ -59,10 +73,21 @@ func (c *FaultConn) Dropped() int64 { return c.dropped.Load() }
 func (c *FaultConn) lose(dir Direction, peer net.Addr, b []byte) bool {
 	c.mu.Lock()
 	drop, blocked := c.drop, len(c.blocked) > 0 && peer != nil && c.blocked[peer.String()]
+	var link *Link
+	if dir == Outgoing && len(c.links) > 0 && peer != nil {
+		link = c.links[peer.String()]
+	}
 	c.mu.Unlock()
 	if blocked || (drop != nil && drop(dir, peer, b)) {
 		c.dropped.Add(1)
 		return true
+	}
+	if link != nil {
+		_, _, _, rtp := RTPHeader(b)
+		if !link.pass(len(b), rtp, time.Now()) {
+			c.dropped.Add(1)
+			return true
+		}
 	}
 	return false
 }
