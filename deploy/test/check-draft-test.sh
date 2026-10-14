@@ -12,8 +12,10 @@
 # of the check that is meant to catch them. The signing keys are made for the run with ssh-keygen (OpenSSH 8.1 or
 # newer) and deleted with the drafts when the test ends: no key is committed.
 #
-# It also checks that release.yml's publish job still runs the script, and that the inline checks of sign and
-# sign-dry keep their strictness (sha256sum --strict, and hidden files counted with dotglob and nullglob).
+# It also checks that release.yml's publish job still runs the script, between the last download of the draft and
+# --draft=false, with exit 1 on a failure and no if: or continue-on-error: that would publish anyway; and that the
+# inline checks of sign and sign-dry keep their strictness before they sign (sha256sum --strict, then dotglob and
+# nullglob set before the loop that exits 1 on an unlisted asset, so hidden files count).
 set -eu
 
 # check-draft.sh writes its errors as annotations in GitHub Actions; the cases want the plain lines, and CI runs
@@ -352,6 +354,8 @@ test_annotations() {
   nl='
 '
   printf 'added\n' >"$d/evil$nl::warning::injected"
+  # And one with "%0A" in it, which the runner would decode into a line break of the annotation.
+  printf 'added\n' >"$d/x%0Ay"
   GITHUB_ACTIONS=true
   export GITHUB_ACTIONS
   check "$d"
@@ -363,6 +367,12 @@ test_annotations() {
     '::error::check-draft: the draft has evil?::warning::injected, which' "$OUT"
   assert_eq 'in GitHub Actions: no line starts a command of its own' 0 \
     "$(printf '%s\n' "$OUT" | grep -c '^::warning::' || true)"
+  assert_contains 'in GitHub Actions: % is escaped as %25' '::error::check-draft: the draft has x%250Ay, which' "$OUT"
+
+  # Outside GitHub Actions the name stays as it is.
+  check "$d"
+  assert_contains 'outside GitHub Actions: % stays %' 'check-draft: the draft has x%0Ay, which' "$OUT"
+  assert_lacks 'outside GitHub Actions: no annotation' '::error::' "$OUT"
 }
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -376,21 +386,90 @@ job() {
     on { print }' "$RELEASE_YML"
 }
 
+# line_no first|last ERE [AFTER] prints the number of the first or the last line of stdin after the line AFTER
+# (default 0) that matches the extended regular expression ERE, or 0 when there is none. Comment lines don't count.
+# ERE comes from the environment, so that awk -v doesn't turn its backslashes into escapes.
+line_no() {
+  LINE_NO_RE=$2 awk -v which="$1" -v after="${3:-0}" '
+    NR <= after || /^ *#/ { next }
+    $0 ~ ENVIRON["LINE_NO_RE"] { n = NR; if (which == "first") exit }
+    END { print n + 0 }'
+}
+
+# keys_between A B prints how many lines of stdin between the lines A and B are a step's `if:` or
+# `continue-on-error:` (also as the step's first key, after its "- "), either of which could let a later step run
+# after a failed check.
+keys_between() {
+  awk -v a="$1" -v b="$2" 'NR > a && NR < b && /^ *(- )?(if|continue-on-error):/ { n++ } END { print n + 0 }'
+}
+
+# ascending N... prints "ascending" when every N is above the one before it and the first is above 0, and
+# otherwise "not ascending:" with the list.
+ascending() {
+  asc_prev=0
+  for asc_n; do
+    if [ "$asc_n" -le "$asc_prev" ]; then
+      printf 'not ascending: %s\n' "$*"
+      return 0
+    fi
+    asc_prev=$asc_n
+  done
+  printf 'ascending\n'
+}
+
 test_release_yml() {
   publish=$(job publish)
-  assert_eq 'release.yml: publish runs check-draft.sh on rel/ with deploy/keys/allowed_signers' 1 \
-    "$(printf '%s\n' "$publish" | grep -c 'sh deploy/release/check-draft\.sh rel deploy/keys/allowed_signers' || true)"
+  # publish runs the script on rel/ with deploy/keys/allowed_signers, and a failure ends the step with exit 1: an
+  # `|| true` on the line, or an if that goes on, would let the draft go public.
+  assert_eq 'release.yml: publish fails when check-draft.sh fails' 1 \
+    "$(printf '%s\n' "$publish" |
+      grep -c '^ *if ! sh deploy/release/check-draft\.sh rel deploy/keys/allowed_signers; then$' || true)"
+  guard=$(printf '%s\n' "$publish" | awk '
+    /^ *if ! sh deploy\/release\/check-draft\.sh / { on = 1; next }
+    on && /^ *fi$/ { exit }
+    on && /exit/ { sub(/^ */, ""); print }')
+  assert_eq 'release.yml: publish exits 1 when check-draft.sh fails, and exits nowhere else in that if' \
+    'exit 1' "$guard"
+  # In this order: the last download of the draft, the check, and the first --draft=false; and between the
+  # download and --draft=false no step has an if: or continue-on-error: that could publish after a failed check.
+  dl=$(printf '%s\n' "$publish" | line_no last 'gh release download "[$]TAG"')
+  ck=$(printf '%s\n' "$publish" | line_no first 'sh deploy/release/check-draft\.sh')
+  pub=$(printf '%s\n' "$publish" | line_no first '--draft=false')
+  assert_eq 'release.yml: publish downloads the draft, then checks it, then publishes it' ascending \
+    "$(ascending "$dl" "$ck" "$pub")"
+  assert_eq 'release.yml: publish has no if: or continue-on-error: from the download to --draft=false' 0 \
+    "$(printf '%s\n' "$publish" | keys_between "$dl" "$pub")"
   assert_eq 'release.yml: publish checks out deploy/release' 1 \
     "$(printf '%s\n' "$publish" | grep -c '^ *deploy/release$' || true)"
   assert_eq 'release.yml: publish has no inline copy of the check left' 0 \
     "$(printf '%s\n' "$publish" | grep -v '^ *#' | grep -c 'sha256sum\|ssh-keygen' || true)"
-  # sign and sign-dry check the draft inline, before they sign it: with --strict, and over hidden files too.
+
+  # sign and sign-dry check the draft inline, before they sign it: with --strict, then with dotglob and nullglob
+  # set, a loop over rel/ that exits 1 on an asset that checksums.txt does not list, hidden ones included; and no
+  # if: or continue-on-error: from that step to the signature.
   for j in sign sign-dry; do
     body=$(job "$j")
     assert_eq "release.yml: $j runs sha256sum --strict -c" 1 \
-      "$(printf '%s\n' "$body" | grep -c 'sha256sum --strict -c checksums\.txt' || true)"
+      "$(printf '%s\n' "$body" | grep -c '^ *(cd rel && sha256sum --strict -c checksums\.txt)$' || true)"
     assert_eq "release.yml: $j counts hidden files (dotglob nullglob)" 1 \
       "$(printf '%s\n' "$body" | grep -c '^ *shopt -s dotglob nullglob$' || true)"
+    assert_eq "release.yml: $j walks the draft for unlisted assets" 1 \
+      "$(printf '%s\n' "$body" | grep -c '^ *for f in rel/\*; do$' || true)"
+    assert_eq "release.yml: $j fails on an unlisted asset" 1 \
+      "$(printf '%s\n' "$body" | grep -c 'which checksums\.txt does not list"$' || true)"
+    step=$(printf '%s\n' "$body" | line_no first '^ *- name: Every asset matches checksums\.txt$')
+    strict=$(printf '%s\n' "$body" | line_no first 'sha256sum --strict -c')
+    glob=$(printf '%s\n' "$body" | line_no first '^ *shopt -s dotglob nullglob$')
+    loop=$(printf '%s\n' "$body" | line_no first '^ *for f in rel/\*; do$')
+    msg=$(printf '%s\n' "$body" | line_no first 'which checksums\.txt does not list"$')
+    ex=$(printf '%s\n' "$body" | line_no first '^ *exit 1$' "$msg")
+    endif=$(printf '%s\n' "$body" | line_no first '^ *fi$' "$msg")
+    endloop=$(printf '%s\n' "$body" | line_no first '^ *done$' "$msg")
+    sig=$(printf '%s\n' "$body" | line_no first 'ssh-keygen -Y sign ')
+    assert_eq "release.yml: $j checks with --strict, sets dotglob nullglob, walks rel/, exits 1, then signs" \
+      ascending "$(ascending "$step" "$strict" "$glob" "$loop" "$msg" "$ex" "$endif" "$endloop" "$sig")"
+    assert_eq "release.yml: $j has no if: or continue-on-error: from its check to the signature" 0 \
+      "$(printf '%s\n' "$body" | keys_between "$step" "$sig")"
   done
 }
 

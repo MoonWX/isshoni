@@ -2005,7 +2005,9 @@ alone. Registry logins are a plain `docker login` with the job's token, not a th
      itself, its `.sig` and its `.sigstore.json` excepted; a `.sig` is there when the job runs again after it
      uploaded one). It is `publish`'s check without the signature, so a draft that `publish` would refuse is never
      signed. It stays inline in `sign` and `sign-dry`, and `deploy/test/check-draft-test.sh` fails if either
-     loses `--strict` or `dotglob nullglob` (README F15; review F09-R3);
+     loses `--strict`, sets `dotglob nullglob` only after its `for f in rel/*` loop or not at all, drops that loop
+     or its `exit 1`, gets an `if:` or `continue-on-error:` from the check to the signature, or checks after it
+     signs (README F15; reviews F09-R3, F15-R2);
   3. fails when the environment has no secret `RELEASE_SSH_SIGNING_KEY`; removes an earlier `checksums.txt.sig`
      first (without a terminal, `ssh-keygen -Y sign` keeps an existing signature file and still exits 0); writes
      the key under `umask 077` into `$RUNNER_TEMP` and deletes it when the step ends;
@@ -2077,8 +2079,9 @@ alone. Registry logins are a plain `docker login` with the job's token, not a th
   a line of `checksums.txt` is `<hex>  NAME` or `<hex> *NAME` for its whole name (taken from the environment, since
   `awk -v` would turn a backslash into an escape), so a name that starts, ends or extends a listed one is not
   listed. In GitHub Actions (`GITHUB_ACTIONS=true`) each error is an `::error::` annotation, with control
-  characters shown as `?`, so that an asset's name can't start a workflow command of its own; the step adds one
-  annotation that names the tag.
+  characters shown as `?`, so that an asset's name can't start a workflow command of its own, and `%` as `%25`
+  (as `@actions/core` escapes it: the runner decodes `%25`, `%0D` and `%0A` in a message, so a name with `%0A` in
+  it would show as two lines); the step adds one annotation that names the tag.
 - **Its test**, `deploy/test/check-draft-test.sh`, which `task test:sh` runs under dash and `bash --posix` (the
   script under the same shell; not busybox, whose own `sha256sum` has no `--strict`). It makes an ephemeral release
   key and another key with `ssh-keygen`, an `allowed_signers` for the first, and a draft as `sign` leaves it (the
@@ -2092,10 +2095,16 @@ alone. Registry logins are a plain `docker login` with the job's token, not a th
   `checksums.txt` to match (unsigned, and signed by another key), a signature of another key, of the right key in
   the namespace `file`, a broken one, none, no `checksums.txt`, a missing line not signed again, a bad signature
   together with an added asset (only the signature is reported), and an `allowed_signers` that is empty, missing,
-  for another principal or for another namespace. Then usage (exit 2, `-h`), the annotations with a name that
-  holds a line break, and `release.yml` itself: `publish` runs the script and checks out `deploy/release`, keeps no
-  inline copy of the check, and `sign`'s and `sign-dry`'s inline checks keep `--strict` and `dotglob nullglob`.
-  No key is committed: the keys live in the test's temporary directory.
+  for another principal or for another namespace. Then usage (exit 2, `-h`); the annotations with a name that
+  holds a line break and one that holds `%0A` (shown as `%250A`; outside Actions as it is); and `release.yml`
+  itself (review F15-R1, R2), with the lines it looks for matched whole: `publish` runs the script as `if ! sh
+  deploy/release/check-draft.sh rel deploy/keys/allowed_signers; then` with `exit 1` as the only exit before that
+  `if`'s `fi`, after the last `gh release download` and before the first `--draft=false`, with no `if:` or
+  `continue-on-error:` from that download to `--draft=false`; it checks out `deploy/release` and keeps no inline
+  copy of the check. `sign`'s and `sign-dry`'s inline checks run, in this order and before `ssh-keygen -Y sign`,
+  `(cd rel && sha256sum --strict -c checksums.txt)`, `shopt -s dotglob nullglob`, and the `for f in rel/*` loop
+  whose unlisted branch ends in `exit 1`, with no `if:` or `continue-on-error:` from the check's step to the
+  signature. No key is committed: the keys live in the test's temporary directory.
 - A final release: `gh release edit "$TAG" --draft=false --latest`. A prerelease: `--draft=false --prerelease
   --latest=false`, so GitHub's "latest" stays where it is (goreleaser sets none, `make_latest: false`, 9.2).
 - Unless it is a prerelease: `docker buildx imagetools create -t ghcr.io/moonwx/isshoni:<tag> …

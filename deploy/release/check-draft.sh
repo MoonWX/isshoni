@@ -35,10 +35,13 @@ usage() {
 }
 
 # err MESSAGE prints MESSAGE on stderr, as an error annotation in GitHub Actions. Control characters become "?", so
-# an asset whose name has a line break in it can't start a workflow command of its own.
+# an asset whose name has a line break in it can't start a workflow command of its own. In an annotation "%" becomes
+# "%25", as @actions/core's escapeData writes it: the runner decodes %25, %0D and %0A in the message, so a name with
+# "%0A" in it would otherwise be shown as two lines, not as itself.
 err() {
   err_msg=$(printf '%s' "$1" | LC_ALL=C tr -c '[:print:]' '?')
   if [ "${GITHUB_ACTIONS:-}" = true ]; then
+    err_msg=$(printf '%s' "$err_msg" | sed 's/%/%25/g')
     printf '::error::check-draft: %s\n' "$err_msg" >&2
   else
     printf 'check-draft: %s\n' "$err_msg" >&2
