@@ -1,0 +1,18 @@
+/* Dark on light whatever the theme: phone cameras read dark modules on a light background (QrCode.tsx). */
+.qr {
+  display: block;
+  flex: none;
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--radius-sm);
+  /* Forced colors would recolor the modules, and an inverted or low-contrast code may not scan. */
+  forced-color-adjust: none;
+}
+
+.light {
+  fill: #ffffff;
+}
+
+.dark {
+  fill: #000000;
+}

@@ -127,11 +127,14 @@ func checkOriginals(t *testing.T, what string, pkts []sfutest.Packet, want map[i
 
 // mediaLoss returns a FaultConn filter for the SFU's socket that loses media packets on their way to one viewer,
 // each sequence number of each stream once: the video packets (a viewer's H.264 payload types are the even ones
-// from 96 to 104) whose sequence number modulo 40 is 7, or 20, 21 or 22, and the audio packets (payload type 111)
-// where it is 3 modulo 10. Retransmissions on the RTX stream (the odd payload types) always pass. It also returns a
-// function that ends the loss, and one that reports how many packets of each kind were lost, and how many went out
-// on the RTX stream. The filter stays in place after the loss has ended, so that it counts the retransmissions that
-// still answer the last NACKs: a slow machine sends some of them only then.
+// from 96 to 104) whose sequence number modulo 80 is 7, or 40, 41 or 42, and the audio packets (payload type 111)
+// where it is 3 modulo 10. That is 5 % of the video: the loss its receiver reports show (they count a packet that
+// came back on the RTX stream as lost, as Chrome's do) stays under the 10 % at which the downlink allocator takes a
+// viewer to the preview layer (02 §10.2); this test is about the repair, not about that. Retransmissions on the RTX
+// stream (the odd payload types) always pass. It also returns a function that ends the loss, and one that reports
+// how many packets of each kind were lost, and how many went out on the RTX stream. The filter stays in place after
+// the loss has ended, so that it counts the retransmissions that still answer the last NACKs: a slow machine sends
+// some of them only then.
 func mediaLoss(viewer net.Addr) (drop func(sfutest.Direction, net.Addr, []byte) bool, stop func(),
 	counts func() (video, audio, rtx int)) {
 	var (
@@ -155,7 +158,7 @@ func mediaLoss(viewer net.Addr) (drop func(sfutest.Direction, net.Addr, []byte) 
 			return false
 		case stopped:
 			return false
-		case isVideo && (seq%40 == 7 || (seq%40 >= 20 && seq%40 <= 22)):
+		case isVideo && (seq%80 == 7 || (seq%80 >= 40 && seq%80 <= 42)):
 		case pt == 111 && seq%10 == 3:
 		default:
 			return false
@@ -238,7 +241,7 @@ func TestNACKFromCache(t *testing.T) {
 	subscribe(t, otherConn, sfu.SubscriptionUpdate{Share: share, Video: sfu.QualityHigh, Audio: true})
 	otherVideo := streamTrack(t, other, share, webrtc.RTPCodecTypeVideo)
 	// Both streams of the first viewer have begun (a receiver doesn't miss what came before the first packet it
-	// got): from here on the SFU's socket loses media on its way to that viewer, for five seconds, about 30 video and
+	// got): from here on the SFU's socket loses media on its way to that viewer, for five seconds, about 15 video and
 	// 25 audio packets.
 	drop, stopLoss, lostSoFar := mediaLoss(viewerSocket.LocalAddr())
 	h.Wire.SetDrop(drop)

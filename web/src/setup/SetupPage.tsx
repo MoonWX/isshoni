@@ -26,12 +26,10 @@ import { api, isApiError } from '../protocol/rest';
 import { buttonClass } from '../ui/Button';
 import { TextField } from '../ui/Field';
 import { Stepper } from '../ui/Stepper';
+import { welcomePath } from './WelcomePage';
 
-/**
- * Where step 1 goes once the admin exists. The wizard's steps 2–3 (WelcomePage, S87) change it to
- * '/admin/welcome?step=2' (05 §14.1).
- */
-export const AFTER_SETUP_PATH = '/';
+/** Where step 1 goes once the admin exists: the wizard's step 2, the connection test (WelcomePage, 05 §14.1). */
+export const AFTER_SETUP_PATH = welcomePath(2);
 
 interface SetupValues extends AccountValues {
   serverName: string;
@@ -65,8 +63,8 @@ function SetupUrlCommands({ docker, after }: { docker: string; after: string }) 
  *    the command for a new one. setup_unavailable: an admin already exists → Log in.
  * 2. The form: username, password (show/hide, no repeat field, the rules of /info's accountRules) and an optional
  *    server name → POST /api/v1/auth/setup/complete → 201 with the session cookie → the stored token is cleared →
- *    AFTER_SETUP_PATH.
- * The stepper shows all three steps of the wizard; steps 2 and 3 live on /admin/welcome.
+ *    AFTER_SETUP_PATH, /admin/welcome?step=2.
+ * The stepper shows all three steps of the wizard; steps 2 and 3 live on /admin/welcome (WelcomePage).
  */
 export function SetupPage() {
   const { token, clear } = useFragmentToken('setup');

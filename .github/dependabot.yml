@@ -12,7 +12,10 @@
 # Not covered here: the tools pinned in .tool-versions, including the Task, golangci-lint and
 # shfmt modules in tools/go.mod and goreleaser's own module, tools/goreleaser/go.mod (bumped by
 # hand, monthly: 06 §7.1); the Dockerfile's `# syntax=` line, which the docker ecosystem does
-# not read (bumped by hand with those pins); and spikes/, which is throwaway.
+# not read (bumped by hand with those pins); the image digests inside workflows, which no
+# ecosystem reads (release.yml's verify matrix bases and its BuildKit driver image, and the
+# Pebble images of ci.yml's acme job and deploy/test/vm/vm-test.sh; bumped by hand with those
+# pins: 06 §4.13, §7.1); and spikes/, which is throwaway.
 
 version: 2
 updates:

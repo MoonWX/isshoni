@@ -538,13 +538,16 @@ func (s *AdminServer) handleDoctor(w http.ResponseWriter, r *http.Request) error
 		}
 	}()
 	rep, err := s.doctor.RunFor(ctx, in)
+	// Once the server stops, every caller is told so, also one whose run ended with a report: a request that was
+	// waiting gets its turn when the shutdown ends the run before it, and its own run can finish before the goroutine
+	// above has cancelled it.
+	select {
+	case <-s.stopping:
+		return api.NewError(api.CodeServerShutdown)
+	default:
+	}
 	if err != nil {
-		select {
-		case <-s.stopping:
-			return api.NewError(api.CodeServerShutdown)
-		default:
-			return err
-		}
+		return err
 	}
 	writeAdminJSON(w, http.StatusOK, rep)
 	return nil

@@ -19,8 +19,8 @@
 // back and leaves its TCP connection alone, so the page would not notice a cut of 5 s (05 §19.3). The link carries
 // only TCP: the media, on UDP, is not cut with it. For (a) the link is cut and restored at once: the socket's TCP
 // connection ends under it without a close frame, which is how a carrier NAT timeout or a proxy reset drops it, and
-// the page's next try gets through. (05 §19.3 names `__isshoni.dropSocket()` for (a); the SignalClient has no public
-// hook for it yet, and the link drops the socket more like a network does.)
+// the page's next try gets through. (05 §19.3 names `__isshoni.dropSocket()` for (a); README F12 made it work, but
+// it closes the socket with a close frame, and the link drops the socket more like a network does.)
 //
 // What is shared: the fake display of 05 §19.3 (a canvas, with a 1 kHz tone), in a headful run too. Every test has a
 // server of its own: (c) restarts it, and the others count what a room's pages do.

@@ -128,7 +128,7 @@ func NeedsOperator(err error) bool {
 }
 
 // Addrs are the addresses the server listens on, as bound: a configured port 0 (tests) shows as the port the
-// kernel picked. A later slice adds the metrics listener (README S85).
+// kernel picked.
 type Addrs struct {
 	// HTTP is the listener on listen.http: the app itself in off mode; in the other modes the plain-HTTP port,
 	// which answers ACME http-01 challenges and redirects everything else to HTTPS (04 §8.3).
@@ -145,6 +145,9 @@ type Addrs struct {
 	// Both are nil on a server that started without media sockets: one that waits for its public address on a
 	// machine without a local address for media (04 §6.2).
 	ICETCP net.Addr
+	// Metrics is the metrics listener on metrics.listen (04 §11.2): /metrics, /healthz, /readyz and, with
+	// metrics.pprof, /debug/pprof/. nil unless metrics.enabled.
+	Metrics net.Addr
 }
 
 // lifecycle states of a Server; they only move forward.
@@ -168,8 +171,10 @@ const (
 	// then closes sockets, which takes no time to speak of.
 	sfuShutdownBudget       = 1250 * time.Millisecond
 	transportShutdownBudget = 250 * time.Millisecond
-	httpShutdownBudget      = 5 * time.Second // step 5: http.Server.Shutdown on every server
-	tailShutdownBudget      = 2 * time.Second // step 6: the TLS manager, the push drain and the admin socket
+	// step 5: http.Server.Shutdown on every server, the metrics listener's too
+	httpShutdownBudget = 5 * time.Second
+	// step 6: the TLS manager, the last flush of the transfer counters, the push drain and the admin socket
+	tailShutdownBudget = 2 * time.Second
 	// storeCloseBudget is the store's own, at the end of step 6 and outside tailShutdownBudget: what closing it may
 	// take, also when the time above is used up. It is the one thing a shutdown that is out of time still waits for
 	// (see shutdown).
@@ -206,24 +211,32 @@ type Server struct {
 	secrets *config.SecretStore // the session, invite and resume keys and the VAPID pair (wire.go)
 	store   *store.DB           // 03's database (wire.go); closed last but the lock
 	public  netx.PublicAddrs    // the public addresses as detected at startup, in every mode (public.go)
-	mux     *netx.PortMux       // the 443 multiplexer on listen.https; nil in off mode
-	httpLn  net.Listener        // listen.http
-	adminLn net.Listener        // listen.admin_socket (04 §12.1)
+	// counter counts the bytes on the wire (04 §11.3): the 443 multiplexer, listen.http and the ICE Transport add
+	// to it, the transfer accounting and the metrics read it.
+	counter   *netx.TransferCounter
+	mux       *netx.PortMux // the 443 multiplexer on listen.https; nil in off mode
+	httpLn    net.Listener  // listen.http
+	metricsLn net.Listener  // metrics.listen (04 §11.2); nil unless metrics.enabled
+	adminLn   net.Listener  // listen.admin_socket (04 §12.1)
 	// transport is the ICE sockets and muxes: listen.ice_udp, listen.ice_tcp, the multiplexer's ICE side. It is nil
 	// on the one server that starts without media: it waits for its public address on a machine that has no local
 	// address for media either (listenICE), and then media is nil too.
 	transport *netx.Transport
 	tls       *tlsmgr.Manager // the certificate, in every mode (off: a manager with nothing to do)
 	health    *ops.Health
-	media     *sfu.SFU         // 02's SFU on transport, behind 01's sfuplane (wire.go); closed before transport
-	accounts  *auth.Service    // 03's account service; nil on a server without a site (wire.go)
-	hub       *signal.Hub      // 01's hub, mounted at GET /ws; nil without a site
-	api       *httpapi.API     // 03's REST API, mounted at /api/v1/; nil without a site
-	push      *push.Service    // 04's Web Push service (wire.go); nil without a site and with push.enabled = false
-	pushDone  chan struct{}    // closed when push's Run, a background goroutine, has returned: the queue is drained
-	logLevel  *ops.LogLevel    // the runtime log level; nil without Deps.LogLevel
-	doctor    *ops.Doctor      // doctor inside the server: its own runs, and the admin socket's (wire.go)
-	admin     *ops.AdminServer // the admin socket's API, served on adminLn
+	metrics   *ops.Metrics      // the server's Prometheus registry, served on metricsLn with metrics.enabled (wire.go)
+	transfer  *ops.Transfer     // the transfer accounting over counter (wire.go)
+	releases  *ops.ReleaseCheck // the daily look at the project's releases (wire.go)
+	dashboard *ops.Dashboard    // GET /api/v1/admin/dashboard; nil without a site (wire.go)
+	media     *sfu.SFU          // 02's SFU on transport, behind 01's sfuplane (wire.go); closed before transport
+	accounts  *auth.Service     // 03's account service; nil on a server without a site (wire.go)
+	hub       *signal.Hub       // 01's hub, mounted at GET /ws; nil without a site
+	api       *httpapi.API      // 03's REST API, mounted at /api/v1/; nil without a site
+	push      *push.Service     // 04's Web Push service (wire.go); nil without a site and with push.enabled = false
+	pushDone  chan struct{}     // closed when push's Run, a background goroutine, has returned: the queue is drained
+	logLevel  *ops.LogLevel     // the runtime log level; nil without Deps.LogLevel
+	doctor    *ops.Doctor       // doctor inside the server: its own runs, and the admin socket's (wire.go)
+	admin     *ops.AdminServer  // the admin socket's API, served on adminLn
 	gate      *httpapi.Gate
 	httpSrv   *http.Server   // the main server: on httpLn in off mode, on the multiplexer's TLS side otherwise
 	plainSrv  *http.Server   // the port 80 server on httpLn (04 §8.3); nil in off mode
@@ -246,6 +259,12 @@ type Server struct {
 	// manager's shutdown, and step 6 only waits for what is left of it (pushDone).
 	pushRun  context.Context
 	stopPush context.CancelFunc
+	// transferRun is the life of the transfer accounting's Run, a child of run, and transferDone is closed when
+	// that Run has returned. The shutdown ends it on its own in step 6, after the sockets have closed, and waits
+	// for its last flush (04 §6.4, §11.3).
+	transferRun  context.Context
+	stopTransfer context.CancelFunc
+	transferDone chan struct{}
 
 	setupDone atomic.Bool                      // an admin account exists: /setup answers 404 (spaStatus)
 	publicNow atomic.Pointer[netx.PublicAddrs] // the public addresses as last seen, once they differ from public
@@ -259,7 +278,8 @@ type Server struct {
 	// the listeners still accept: the window in which the hub and the SFU say goodbye (steps 3 and 4).
 	hookDraining func()
 	// hookStep, set by tests (under life), runs in Shutdown right before a component is stopped, with its name:
-	// "signaling", "sfu", "transport", "http", "tls", "push", "admin socket", "store", in the order of 04 §6.4.
+	// "signaling", "sfu", "transport", "http", "tls", "transfer", "push", "admin socket", "store", in the order of
+	// 04 §6.4.
 	// "push" comes before the wait for the push service's drain, which began once the HTTP step was done.
 	hookStep func(step string)
 	// hookDetect, set by tests before Start, stands in for the public-address detection (04 §7.4), which reads
@@ -295,6 +315,8 @@ func New(cfg *config.Config, log *slog.Logger, deps Deps) (*Server, error) {
 		failed:       make(chan struct{}),
 		restartAsked: make(chan struct{}),
 		pushDone:     make(chan struct{}),
+		transferDone: make(chan struct{}),
+		counter:      &netx.TransferCounter{},
 		stopLimits:   func() {},
 	}, nil
 }
@@ -309,10 +331,11 @@ func (s *Server) now() time.Time {
 
 // configProblems returns every problem of cfg, errors first, and its warnings alone: those that Load found (a
 // malformed value that Load replaced by the default is only there), those of the current values (a caller may
-// have changed the config since), and the one that only the server knows of: a push.subject that names no contact
-// (pushSubjectProblem). push.New would refuse that one only deep into Start, once the data directory, the store and
-// the listeners are open, or, on a server that waits for its public address and has no site yet, only at the
-// re-exec that follows when the address is found.
+// have changed the config since), and the two that only the server knows of: a push.subject that names no contact
+// (pushSubjectProblem), and an updates.release_url that the release check would refuse (releaseURLProblem). push.New
+// would refuse the first only deep into Start, once the data directory, the store and the listeners are open, or, on
+// a server that waits for its public address and has no site yet, only at the re-exec that follows when the address
+// is found; the release check the second in step 8.
 func configProblems(cfg *config.Config) (all, warnings []config.Problem) {
 	all = cfg.Problems()
 	for _, p := range cfg.Validate() {
@@ -321,6 +344,9 @@ func configProblems(cfg *config.Config) (all, warnings []config.Problem) {
 		}
 	}
 	if p, bad := pushSubjectProblem(cfg); bad {
+		all = append(all, p)
+	}
+	if p, bad := releaseURLProblem(cfg); bad {
 		all = append(all, p)
 	}
 	slices.SortStableFunc(all, func(a, b config.Problem) int {
@@ -380,6 +406,7 @@ func (s *Server) Start(ctx context.Context) (err error) {
 	// The server's own work outlives the startup that ctx bounds; the shutdown ends it.
 	s.run, s.stopRun = context.WithCancel(context.WithoutCancel(ctx))
 	s.pushRun, s.stopPush = context.WithCancel(s.run)
+	s.transferRun, s.stopTransfer = context.WithCancel(s.run)
 
 	// Step 2: umask, the data directory checks, the data-directory lock, the memory limit (04 §5.1).
 	if !s.deps.InProcess {
@@ -426,10 +453,11 @@ func (s *Server) Start(ctx context.Context) (err error) {
 		s.public = s.detectPublicAddrs(ctx)
 	}
 
-	// Step 6: bind the listeners: the 443 multiplexer (not in off mode), listen.http, the admin socket, and then
-	// the ICE Transport: the only code that binds listen.ice_udp and listen.ice_tcp, and the reader of the
-	// multiplexer's ICE side (04 §7.3). A busy port ends the start; so does a machine without an address for media,
-	// except on a server that has to wait for its public address anyway.
+	// Step 6: bind the listeners: the 443 multiplexer (not in off mode), listen.http, the metrics listener (with
+	// metrics.enabled), the admin socket, and then the ICE Transport: the only code that binds listen.ice_udp and
+	// listen.ice_tcp, and the reader of the multiplexer's ICE side (04 §7.3). A busy port ends the start; so does a
+	// machine without an address for media, except on a server that has to wait for its public address anyway.
+	// Every byte that the multiplexer, listen.http and the Transport move is counted on s.counter (04 §11.3).
 	if mode != config.TLSOff {
 		if s.mux, err = s.listenHTTPS(); err != nil {
 			return err
@@ -437,12 +465,20 @@ func (s *Server) Start(ctx context.Context) (err error) {
 		s.addrs.HTTPS = s.mux.Addr()
 		s.cfg.Listen.HTTPS = withBoundPort(s.cfg.Listen.HTTPS, s.addrs.HTTPS)
 	}
-	if s.httpLn, err = listenHTTP(ctx, s.cfg.Listen.HTTP, mode); err != nil {
+	ln, err := listenHTTP(ctx, s.cfg.Listen.HTTP, mode)
+	if err != nil {
 		return err
 	}
+	s.httpLn = countWeb(ln, s.counter)
 	s.addrs.HTTP = s.httpLn.Addr()
 	// With port 0 (tests) the site needs the ports the kernel picked.
 	s.cfg.Listen.HTTP = withBoundPort(s.cfg.Listen.HTTP, s.addrs.HTTP)
+	if s.cfg.Metrics.Enabled {
+		if s.metricsLn, err = listenMetrics(ctx, s.cfg.Metrics.Listen); err != nil {
+			return err
+		}
+		s.addrs.Metrics = s.metricsLn.Addr()
+	}
 	// A socket on which another isshoni answers, or a path that is no socket, is a runtime error like a busy port.
 	s.adminLn, err = ops.ListenAdmin(ctx, ops.AdminListenOptions{Path: s.cfg.Listen.AdminSocket, Logger: s.log})
 	if err != nil {
@@ -491,18 +527,22 @@ func (s *Server) Start(ctx context.Context) (err error) {
 		s.httpSrv.TLSConfig = s.tls.TLSConfig()
 		s.plainSrv = newPlainServer(s.tls.HTTPHandler(nil), s.log, &s.pending)
 	}
-	if s.cfg.Metrics.Enabled {
-		s.log.Warn("metrics.enabled is set, but this build has no metrics endpoint yet; nothing listens on metrics.listen",
-			slog.String("component", "ops"))
-	}
 
-	// Step 9: start the HTTP servers and the admin socket, then the server's own work. The multiplexer's ICE side
-	// has had its reader since step 6: the Transport's ICE-TCP mux (without a Transport that side is closed).
+	// Step 9: start the HTTP servers, the metrics listener and the admin socket, then the server's own work. The
+	// multiplexer's ICE side has had its reader since step 6: the Transport's ICE-TCP mux (without a Transport that
+	// side is closed).
 	if mode == config.TLSOff {
 		s.serve(s.httpSrv, s.httpLn)
 	} else {
 		s.serveTLS(s.httpSrv, s.mux.TLS())
 		s.serve(s.plainSrv, newLimitListener(s.httpLn, s.cfg.Limits.ConnsPerIP))
+	}
+	if metrics, ln := s.metrics, s.metricsLn; ln != nil {
+		s.serving.Go(func() {
+			if err := metrics.Serve(ln); err != nil {
+				s.fail(err)
+			}
+		})
 	}
 	// The server runs on what the last restore put in place, and nothing from here on can fail the start: the
 	// files from before that restore are no longer needed (04 §12.4 step 7). Their pre-restore backup stays in
@@ -520,6 +560,9 @@ func (s *Server) Start(ctx context.Context) (err error) {
 	if mode != config.TLSOff {
 		listen = []any{slog.String("listen", s.addrs.HTTPS.String()), slog.String("listen_http", s.addrs.HTTP.String())}
 	}
+	if s.addrs.Metrics != nil {
+		listen = append(listen, slog.String("listen_metrics", s.addrs.Metrics.String()))
+	}
 	if s.awaitsAddress {
 		s.log.Warn(fmt.Sprintf("isshoni %s started without a public IP address (tls=%s) and is not ready: set public_ip "+
 			"to this server's public address, or set domain, and restart. isshoni looks for the address again every %s "+
@@ -534,10 +577,13 @@ func (s *Server) Start(ctx context.Context) (err error) {
 
 // startBackground starts what the server does on its own while it runs: the admin socket's API (04 §6.1 step 9),
 // 03's janitor, the push service's workers and its daily prune (04 §14), doctor's own runs, 20 s from now and then
-// once a day (04 §13.1), and the look at the public addresses every ten minutes, or every 30 s while the server
-// waits for the address that is its site (04 §7.4). The admin socket's goroutine ends with its Shutdown, the push
-// service with s.pushRun, the others with s.run; the push service sends what is queued for at most 2 s more
-// (push.Service.Run), and closes pushDone when it has.
+// once a day (04 §13.1), the transfer accounting, which stores the counted bytes every minute (04 §11.3), the
+// release check, 5 to 60 minutes from now and then once a day (04 §11.5), and the look at the public addresses
+// every ten minutes, or every 30 s while the server waits for the address that is its site (04 §7.4). The admin
+// socket's goroutine ends with its Shutdown, the push service with s.pushRun, the transfer accounting with
+// s.transferRun, the others with s.run; the push service sends what is queued for at most 2 s more
+// (push.Service.Run) and closes pushDone when it has, and the transfer accounting stores what is left (at most
+// 2 s) and closes transferDone.
 func (s *Server) startBackground() {
 	admin, ln := s.admin, s.adminLn
 	s.background.Go(func() {
@@ -547,6 +593,15 @@ func (s *Server) startBackground() {
 	})
 	doc := s.doctor
 	s.background.Go(func() { _ = doc.Run(s.run) }) // nil when the server stops; an error only for a second Run
+	if transfer, done, ctx := s.transfer, s.transferDone, s.transferRun; transfer != nil {
+		s.background.Go(func() {
+			defer close(done)
+			_ = transfer.Run(ctx) // nil after the last flush; an error only for a second Run
+		})
+	}
+	if releases := s.releases; releases != nil {
+		s.background.Go(func() { _ = releases.Run(s.run) }) // nil when the server stops
+	}
 	if accounts := s.accounts; accounts != nil {
 		s.background.Go(func() { accounts.RunJanitor(s.run) })
 	}
@@ -794,10 +849,10 @@ func (s *Server) shutdown(ctx context.Context, reason ShutdownReason, draining f
 	// then), alongside the TLS manager's shutdown; step 6 waits for it after that.
 	s.stopPush()
 
-	// Step 6, in tailShutdownBudget altogether: the TLS manager, now that nothing handshakes any more; then the
-	// server's own work, and the wait for the push service's drain; and the admin socket, which the operator's CLI
-	// could ask until now (its health answers have said "shutting down" since step 1). README S85 adds here: flush
-	// the transfer counters.
+	// Step 6, in tailShutdownBudget altogether: the TLS manager, now that nothing handshakes any more; the last
+	// flush of the transfer counters, now that every socket that counts is closed; then the server's own work, and
+	// the wait for the push service's drain; and the admin socket, which the operator's CLI could ask until now
+	// (its health answers have said "shutting down" since step 1).
 	tailCtx, cancelTail := context.WithTimeout(ctx, tailShutdownBudget)
 	defer cancelTail()
 	tail := func(name string, fn func(context.Context) error) {
@@ -807,6 +862,20 @@ func (s *Server) shutdown(ctx context.Context, reason ShutdownReason, draining f
 	}
 	before("tls")
 	tail("tls", s.tls.Shutdown)
+	if s.transfer != nil {
+		// Its Run stores what was counted since the last flush and returns; it has 2 s of its own for that
+		// (ops.Transfer), and this step waits for it within what is left of the step's.
+		before("transfer")
+		s.stopTransfer()
+		tail("transfer", func(ctx context.Context) error {
+			select {
+			case <-s.transferDone:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+	}
 	s.stopRun()
 	s.stopLimits() // a settings change no longer reaches the SFU, which is closed
 	if s.push != nil {
@@ -887,8 +956,9 @@ func stepError(stepCtx context.Context, name string, err error) error {
 // TLS handshake) are closed right away: net/http alone would wait up to 5 s for each (see pendingConns). Hijacked
 // connections (WebSockets) are the hub's, closed in step 3.
 //
-// The 443 multiplexer closes last: its raw listener, both sub-listeners and every connection that came through it
-// and is still open (04 §6.4 step 5).
+// The metrics listener stops with them (ops.Metrics.Shutdown): a scrape or a profile in flight may finish until ctx
+// ends. The 443 multiplexer closes last: its raw listener, both sub-listeners and every connection that came through
+// it and is still open (04 §6.4 step 5).
 func (s *Server) shutdownHTTP(ctx context.Context) error {
 	s.pending.closeAll()
 	var errs []error
@@ -902,6 +972,11 @@ func (s *Server) shutdownHTTP(ctx context.Context) error {
 			if ctx.Err() != nil { // out of time; any other error is the listener's own, from closing it
 				err = fmt.Errorf("requests still running were cut off: %w", err)
 			}
+			errs = append(errs, err)
+		}
+	}
+	if s.metricsLn != nil {
+		if err := s.metrics.Shutdown(ctx); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -922,6 +997,7 @@ func (s *Server) release(ctx context.Context) {
 	defer cancel()
 	if s.stopRun != nil {
 		s.stopPush()
+		s.stopTransfer()
 		s.stopRun()
 	}
 	if s.hub != nil {
@@ -942,6 +1018,9 @@ func (s *Server) release(ctx context.Context) {
 	}
 	if s.adminLn != nil {
 		_ = s.adminLn.Close() // removes the socket file
+	}
+	if s.metricsLn != nil {
+		_ = s.metricsLn.Close()
 	}
 	if s.httpLn != nil {
 		_ = s.httpLn.Close()

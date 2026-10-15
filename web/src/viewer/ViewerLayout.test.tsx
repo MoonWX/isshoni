@@ -1,6 +1,6 @@
 // ViewerLayout (05 §12.1): the stage with the focused share, the others newest first, the own share's preview, no
 // tile for `starting` shares; a pick holds the stage (05 §12.2); fullscreen and a phone held sideways show only the
-// stage; the banner when the media port can't be reached (05 §9).
+// stage; the banner when the media port can't be reached (05 §9), and the codec wait's banner (05 §10.6).
 import { act, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -12,8 +12,10 @@ import {
   installFakeMediaElement,
   type FakeMediaElementControl,
 } from '../test/fakeMedia';
+import { createTestPlatform } from '../test/platform';
+import { createTestServices, renderWithApp } from '../test/render';
 import { createViewer, syncRoom, type ViewerServices } from './services';
-import { room, SELF, shareInfo } from './testing';
+import { room, SELF, shareInfo, status } from './testing';
 import { PHONE_LANDSCAPE_QUERY, ViewerLayout } from './ViewerLayout';
 
 const watcher = (userId: string) => ({ userId, video: 'high' as const, audio: 'on' as const });
@@ -371,5 +373,66 @@ describe('ViewerLayout: the media connection (05 §9)', () => {
     render(<ViewerLayout viewer={viewer} />);
     expect(screen.getByText(/media port/)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Test my connection' })).not.toBeInTheDocument();
+  });
+});
+
+describe('ViewerLayout: the codec wait (05 §10.6)', () => {
+  const WAIT = { since: 0, stuck: false, noDecoder: false, firefox: true };
+
+  it('shows no banner while the page still waits: the tiles say it', () => {
+    syncRoom(viewer, room(BEA), SELF);
+    viewer.store.getState().setCodecWait(WAIT);
+    render(<ViewerLayout viewer={viewer} />);
+    expect(screen.queryByRole('button', { name: 'Reload' })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Reload the page\. If/)).not.toBeInTheDocument();
+  });
+
+  it('after 3 minutes asks for a reload, with Firefox’s plugin help, and the button reloads', async () => {
+    const reload = vi.fn();
+    const services = createTestServices({
+      platform: createTestPlatform({ versionActions: () => ({ reload }) }),
+    });
+    syncRoom(viewer, room(BEA), SELF);
+    renderWithApp(<ViewerLayout viewer={viewer} />, { services });
+    act(() => {
+      viewer.store.getState().setCodecWait({ ...WAIT, stuck: true });
+    });
+    expect(screen.getByText(/^Firefox hasn't got its video decoder yet\. Reload the page\./)).toBeInTheDocument();
+    expect(screen.getByText(/OpenH264 Video Codec provided by Cisco Systems, Inc\./)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Reload' }));
+    expect(reload).toHaveBeenCalledOnce();
+
+    // Another browser that has H.264 gets the plain text; the video coming back takes the banner away.
+    act(() => {
+      viewer.store.getState().setCodecWait({ ...WAIT, stuck: true, firefox: false });
+    });
+    expect(screen.getByText(/^Your browser still can't play the video\. Reload the page\./)).toBeInTheDocument();
+    act(() => {
+      viewer.store.getState().setCodecWait(null);
+    });
+    expect(screen.queryByRole('button', { name: 'Reload' })).not.toBeInTheDocument();
+  });
+
+  it('tells a browser without any H.264 decoder that it can’t play isshoni video', () => {
+    syncRoom(viewer, room(BEA), SELF);
+    viewer.store.getState().applyStatus([status('s_bea', { video: 'off', reason: 'codec' })]);
+    viewer.store.getState().setCodecWait({ ...WAIT, noDecoder: true, firefox: false });
+    render(<ViewerLayout viewer={viewer} />);
+    expect(
+      screen.getByText("This browser can't play isshoni video. Use Chrome, Edge, Safari or Firefox."),
+    ).toBeInTheDocument();
+    // The tile says only that the video can't play: a thumbnail is silent (05 §12.3), so it promises no sound.
+    expect(screen.getByText("This browser can't play this video.")).toBeInTheDocument();
+    expect(screen.queryByText(/hear/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Reload' })).not.toBeInTheDocument();
+  });
+
+  it('leaves the place to the media banner', () => {
+    syncRoom(viewer, room(BEA), SELF);
+    viewer.store.getState().setCodecWait({ ...WAIT, stuck: true });
+    viewer.store.getState().setMedia('unreachable');
+    render(<ViewerLayout viewer={viewer} />);
+    expect(screen.getByText(/media port/)).toBeInTheDocument();
+    expect(screen.queryByText(/video decoder yet/)).not.toBeInTheDocument();
   });
 });

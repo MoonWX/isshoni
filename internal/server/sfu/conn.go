@@ -76,6 +76,9 @@ type Conn struct {
 	writers sync.WaitGroup
 	// codec is what the Conn knows about its viewer's H.264 decoders beyond its caps (codecstate.go, 02 §8.5).
 	codec decoderState
+	// alloc is the Conn's downlink allocator (02 §10.2, allocator.go): its inputs come from the RTCP readers and
+	// queues of the Conn's DownTracks, its decisions are the actor's (adapt).
+	alloc allocator
 }
 
 // newConn builds a Conn; SFU.Join registers it and starts its actor.

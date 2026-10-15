@@ -714,6 +714,84 @@ describe('changes while live (05 §13.5, §13.6)', () => {
     expect(share.params?.codec).toBe('h264/42e0');
   });
 
+  it('quality.hint {encodings}: active, maxBitrate, maxFramerate and the scale of every rid, within 1 s, also while the offer waits for its answer', async () => {
+    const { share } = await start();
+    // The offer is out and not answered yet: the hint doesn't wait for it (01 §8.10: within 1 s).
+    expect(pubOffers(server)).toHaveLength(1);
+    const sender = lastPc().transceivers[0]?.sender;
+    if (!sender) throw new Error('no video sender');
+    const calls = sender.setParametersCalls.length;
+    const encodings = [
+      { rid: 'f', layer: 'high' as const, active: false, maxBitrate: 2_500_000, maxFramerate: 30, maxPixels: 921_600 },
+      { rid: 'q', layer: 'low' as const, active: true, maxBitrate: 150_000, maxFramerate: 10, maxPixels: 230_400 },
+    ];
+    server.send('quality.hint', { shareId: 's_1', reason: 'viewers', encodings });
+    await tick(999);
+    expect(sender.setParametersCalls).toHaveLength(calls + 1);
+    const byRid = new Map(sender.parameters.encodings.map((e) => [e.rid, e]));
+    // 1920 × 1080 captured: f has a 720p budget now (√(2 073 600 / 921 600) = 1.5), q stays at 360p.
+    expect(byRid.get('f')).toMatchObject({
+      active: false,
+      maxBitrate: 2_500_000,
+      maxFramerate: 30,
+      scaleResolutionDownBy: 1.5,
+    });
+    expect(byRid.get('q')).toMatchObject({
+      active: true,
+      maxBitrate: 150_000,
+      maxFramerate: 10,
+      scaleResolutionDownBy: 3,
+    });
+    expect(share.params?.encodings).toEqual(encodings);
+    // No renegotiation for encodings.
+    expect(pubOffers(server)).toHaveLength(1);
+
+    // The layer comes back with the next hint.
+    server.send('quality.hint', { shareId: 's_1', reason: 'viewers', encodings: shareParams('s_1').encodings });
+    await tick();
+    expect(sender.parameters.encodings.find((e) => e.rid === 'f')).toMatchObject({
+      active: true,
+      maxBitrate: 8_000_000,
+    });
+  });
+
+  it('quality.hint {codec} while the offer waits for its answer: one follow-up offer after it, that profile first', async () => {
+    await start();
+    server.send('quality.hint', { shareId: 's_1', reason: 'codec', codec: 'h264/42e0' });
+    await tick();
+    // At most one offer outstanding (01 §9): the change waits for the answer.
+    expect(pubOffers(server)).toHaveLength(1);
+    await goLive();
+    expect(pubOffers(server)).toHaveLength(2);
+    const reoffer = pubOffers(server)[1];
+    expect(reoffer).toMatchObject({ gen: 1, neg: 2 });
+    expect(parseSdpSections(reoffer?.sdp ?? '')[0]?.codecLines?.[1]).toContain('42e01f');
+  });
+
+  it('quality.hint {codec}: the hint the server sends again after a resume needs no re-offer', async () => {
+    await start();
+    await goLive();
+    server.send('quality.hint', { shareId: 's_1', reason: 'codec', codec: 'h264/42e0' });
+    await tick();
+    expect(pubOffers(server)).toHaveLength(2);
+    hub.answer();
+    await tick();
+
+    server.drop();
+    await tick(1000);
+    expect(signal.welcome?.resumed).toBe(true);
+    // 01 §8.10: after a resume the server sends each share's codec hint again.
+    server.send('quality.hint', { shareId: 's_1', reason: 'codec', codec: 'h264/42e0' });
+    await tick();
+    expect(pubOffers(server)).toHaveLength(2);
+    // A later switch back is a change again.
+    server.send('quality.hint', { shareId: 's_1', reason: 'codec', codec: 'h264/6400' });
+    await tick();
+    expect(pubOffers(server)).toHaveLength(3);
+    expect(pubOffers(server)[2]).toMatchObject({ gen: 1, neg: 3 });
+    expect(parseSdpSections(pubOffers(server)[2]?.sdp ?? '')[0]?.codecLines?.[1]).toContain('640034');
+  });
+
   it('setAudioEnabled: the panel’s sound switch mutes the track and tells the store', async () => {
     const { share, src } = await start();
     await goLive();

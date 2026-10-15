@@ -3030,6 +3030,7 @@ export class SignalClient {
     fn: (data: ServerMessages[K], env: ServerEnvelope<K>) => void): () => void;
   onState(fn: (s: SignalState, info: SignalStateInfo) => void): () => void;
   retryNow(): void;   // skip the current backoff wait, except a rate-limit wait (§10.2); the UI's Retry button
+  dropSocket(): void; // closes with 3000 as a network drop would, then resumes; 05 §10.7's debug hook (README F12)
 }
 ```
 
@@ -3051,7 +3052,11 @@ Behavior (normative):
   ones included, is a plain backoff with no error.
 - `connecting` has a 10 s connect timeout. When the client drops a socket itself to reconnect (a timeout, a
   connection error), it closes with `ReconnectCloseCode` 4000, so the server keeps the grace period and the next
-  `hello` can resume.
+  `hello` can resume. `dropSocket()` (05 §10.7's `window.__isshoni.dropSocket()`, for tests) closes the socket with
+  `DropSocketCloseCode` 3000, which keeps the grace too and which neither side uses otherwise, so the server's log
+  and its close count tell it apart from the client's own reconnects; the client then goes on as after any drop
+  (pending requests reject with `connection_lost`, backoff, and the next `hello` resumes). It is a no-op without a
+  socket.
 
 ## 17. Security and privacy (M1)
 
@@ -3375,7 +3380,9 @@ generated arrays; this imports the Go fixtures with `import.meta.glob`, so one f
 - **Watch**: the sharer tab (canvas + tone source, S4 finding 7) and the viewer tab assert `framesDecoded > 0` and
   audio energy.
 - **Reconnect**: `context.setOffline(true)` for 5 s on the viewer, then back online. It asserts "Reconnecting…"
-  appeared, playback continues, and the same `connectionId` is in the debug overlay (`resumed`).
+  appeared, playback continues, and the same `connectionId` is in the debug overlay (`resumed`). As README S81
+  built it (05 §19.3): Chrome's offline emulation leaves an open WebSocket alone, so the viewer's network is cut
+  with the harness's SOCKS link instead, which carries only TCP and ends the socket without a close frame.
 - **Restart**: restart the server process during a share; the viewer shows the replaced share within 15 s, focused,
   with audio.
 - **Focus**: two sharers; clicking the second tile moves audio; axe checks pass.

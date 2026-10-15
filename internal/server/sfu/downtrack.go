@@ -3,6 +3,7 @@ package sfu
 import (
 	"math"
 	"math/rand/v2"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,8 +36,9 @@ import (
 // across layer switches and pauses (sendSR).
 //
 // What it counts, its bitrate and the loss its viewer reports are what Conn.Stats, Snapshot and Metrics show of it
-// (02 §13, stats.go). Later slices add the rest of 02 §9.3: the pacer, REMB and the downlink allocator's use of the
-// receiver reports (README S84).
+// (02 §13, stats.go). The viewer's REMBs, the loss its receiver reports give for a video DownTrack and the drops of
+// both queues go to the subscriber Conn's downlink allocator (02 §10.2, allocator.go), and a video DownTrack's writer
+// paces what it sends (02 §9.8, pacer.go).
 type DownTrack struct {
 	share *Share
 	sub   *Subscription
@@ -84,6 +86,16 @@ type DownTrack struct {
 	// totals are the SFU's (counters.go), which the tallies of stats count into, and the layer switches; nil for a
 	// DownTrack that a unit test builds without a Conn.
 	totals *counters
+
+	// alloc is the subscriber Conn's downlink allocator (02 §10.2), which the DownTrack's RTCP reader hands the
+	// viewer's REMBs and receiver reports, and its queues their drops; nil for a DownTrack that a unit test builds
+	// without a Conn. rr is what the last receiver report about the video stream said (noteReport), under alloc's
+	// lock; gaps the own sequence numbers the writer passed over without sending them (noteSeq).
+	alloc *allocator
+	rr    rrState
+	gaps  seqGaps
+	// pacer is the video writer's token bucket (02 §9.8): only the writer touches it.
+	pacer pacer
 }
 
 // dtStats are a DownTrack's counters and rates (02 §13). The writer and the RTCP reader count; the ticker turns the
@@ -162,6 +174,7 @@ func newDownTrack(sub *Subscription, kind webrtc.RTPCodecType) *DownTrack {
 	}
 	if sub.conn != nil {
 		d.countInto(&sub.conn.sfu.counters)
+		d.alloc = &sub.conn.alloc
 	}
 	return d
 }
@@ -425,14 +438,18 @@ func (d *DownTrack) noteLocked() bool {
 // ---- the writer (02 §9.3) ----
 
 // enqueue hands a packet, a padding marker or a sender report notice of an interesting layer to the writer. It never
-// blocks: a full queue drops the packet and counts it, so a writer that falls behind costs only its own viewer. (A
-// notice that finds no room is not a packet lost: the next report comes in a second.) Layer read loops call it.
+// blocks: a full queue drops the packet and counts it, so a writer that falls behind costs only its own viewer, and
+// its Conn's downlink allocator hears of it (more than 50 drops a second are congestion, 02 §10.2). (A notice that
+// finds no room is not a packet lost: the next report comes in a second.) Layer read loops call it.
 func (d *DownTrack) enqueue(p *packet) {
 	select {
 	case d.queue <- p:
 	default:
 		if !p.report {
 			d.stats.drops.Add(1)
+			if d.alloc != nil {
+				d.alloc.drops.Add(1)
+			}
 		}
 	}
 }
@@ -442,10 +459,16 @@ func (d *DownTrack) enqueue(p *packet) {
 // starts it and waits for it (Conn.writers).
 //
 // Retransmissions come first (02 §9.3): a viewer that waits for one can't show anything newer, so a repair that
-// queued behind new media would only add its delay to every frame after it.
+// queued behind new media would only add its delay to every frame after it. A video DownTrack paces both (02 §9.8),
+// in that order, so a repair takes its share of the rate before new media does.
 func (d *DownTrack) run(connClosed <-chan struct{}) {
 	// Not a secret: RFC 3550 asks for a random first sequence number, and the RTX stream is a stream of its own.
-	w := rtpWriteState{rtxSeq: uint16(rand.Uint32())} //nolint:gosec // see above
+	w := rtpWriteState{rtxSeq: uint16(rand.Uint32()), stop: d.done, connClosed: connClosed} //nolint:gosec // see above
+	defer func() {
+		if w.timer != nil {
+			w.timer.Stop()
+		}
+	}()
 	for {
 		select {
 		case it := <-d.rtxQueue:
@@ -495,13 +518,23 @@ type rtpWriteState struct {
 
 	// rtxSeq is the next sequence number of the DownTrack's RTX stream (02 §9.5).
 	rtxSeq uint16
+
+	// seqHigh is the highest own sequence number written through binding, once seqKnown: a number the writer goes
+	// past without writing it is one the SFU never sent (DownTrack.noteSeq, 02 §10.2).
+	seqKnown bool
+	seqHigh  uint16
+
+	// The pacer's wait (02 §9.8): its timer, made with the first wait and reused, and what ends a wait early: the
+	// DownTrack's stop and its Conn's close (nil for a writer that a unit test drives by hand).
+	timer            *time.Timer
+	stop, connClosed <-chan struct{}
 }
 
 // bind makes b the binding the writer's state is about: with another one than before, the stream's start and its
 // counts begin again.
 func (w *rtpWriteState) bind(b *binding) {
 	if b != w.binding {
-		w.binding, w.sent, w.unsentStarts, w.packets, w.octets = b, false, 0, 0, 0
+		w.binding, w.sent, w.unsentStarts, w.packets, w.octets, w.seqKnown = b, false, 0, 0, 0, false
 	}
 }
 
@@ -522,10 +555,14 @@ func (w *rtpWriteState) count(n int) {
 //  3. a fresh header: the viewer's payload type for the packet's profile, the munger's seq and ts, the binding's
 //     SSRC, the publisher's marker bit and nothing else of the publisher's header (no CSRCs, no padding, none of its
 //     extensions, whose ids are the pub PC's); abs-send-time when the viewer negotiated it;
-//  4. pacing is README S84's;
+//  4. pacing (02 §9.8, video only): the packet waits for its turn in the DownTrack's token bucket, so a keyframe
+//     leaves over tens of milliseconds and not in one burst per viewer. A writer told to stop meanwhile drops it;
 //  5. the write, which never blocks (02 §5.4). A packet that Pion takes without sending it is unsent's. The first
 //     packet of an epoch is followed by the layer's latest sender report (sendSR), so the viewer knows the new
 //     layer's place in time at once: after a switch, and when audio is turned on.
+//
+// An own sequence number the writer goes past without writing it is one the SFU never sent, which the downlink
+// allocator takes out of the loss the viewer reports (noteSeq, 02 §10.2).
 //
 // A padding marker only moves the munger (skipPadding), and a sender report notice sends the layer's report on
 // (sendSR).
@@ -620,7 +657,12 @@ func (d *DownTrack) forward(w *rtpWriteState, p *packet) (changed bool) {
 		Version: 2, Marker: p.marker, PayloadType: pt, SequenceNumber: seq, Timestamp: ts, SSRC: b.ssrc,
 		Extensions: w.hdr.Extensions[:0],
 	}
+	d.noteSeq(w, seq)
+	if !d.pace(w, p.layer, len(p.payload)) {
+		return changed // the writer is stopping
+	}
 	if b.absSendTimeID != 0 {
+		// The time it leaves, after the pacer: the viewer's estimator reads the spacing of the packets from it.
 		putAbsSendTime(&w.absSendTime, time.Now())
 		_ = w.hdr.SetExtension(b.absSendTimeID, w.absSendTime[:]) // 3 bytes always fit the one-byte form
 	}
@@ -738,22 +780,32 @@ func (d *DownTrack) readRTCP(pc *subPC, sender *webrtc.RTPSender) {
 // so each DownTrack looks only at what names its own SSRC. A NACK is answered from the packet cache (02 §9.5,
 // handleNACK), for audio as for video. A PLI or FIR about a video track becomes a keyframe request to the publisher
 // for the layer forwarded now (a FIR is translated to a PLI upstream, 02 §9.7). A receiver report about the track
-// gives its loss (DownTrackStats.LossPct, 02 §13). REMB, and what the downlink allocator makes of the receiver reports,
-// are README S84's.
+// gives its loss (DownTrackStats.LossPct, 02 §13), and for video what the link lost to the downlink allocator; a REMB
+// that names the track goes to the allocator too (02 §10.2). The allocator decides at once, rather than at its next
+// tick, when a REMB fell or a report shows enough loss to matter.
 func (d *DownTrack) handleRTCP(pkts []rtcp.Packet) {
 	b := d.binding.Load()
 	if b == nil {
 		return
 	}
-	wanted := false
+	wanted, wake := false, false
 	left := nackBatch
+	var now int64
+	if d.alloc != nil {
+		now = d.sub.conn.sfu.allocNow()
+	}
 	for _, pkt := range pkts {
 		switch pkt := pkt.(type) {
 		case *rtcp.ReceiverReport:
 			for _, r := range pkt.Reports {
 				if r.SSRC == b.ssrc {
 					d.stats.lossPct.Store(math.Float64bits(100 * float64(r.FractionLost) / 256))
+					wake = d.noteReport(r, now) || wake
 				}
+			}
+		case *rtcp.ReceiverEstimatedMaximumBitrate:
+			if slices.Contains(pkt.SSRCs, b.ssrc) {
+				wake = d.noteREMB(pkt.Bitrate, now) || wake
 			}
 		case *rtcp.TransportLayerNack:
 			if pkt.MediaSSRC == b.ssrc {
@@ -766,6 +818,9 @@ func (d *DownTrack) handleRTCP(pkts []rtcp.Packet) {
 				wanted = wanted || e.SSRC == b.ssrc
 			}
 		}
+	}
+	if wake {
+		d.sub.conn.wakeAllocator()
 	}
 	if !wanted || d.kind != webrtc.RTPCodecTypeVideo {
 		return

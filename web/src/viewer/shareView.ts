@@ -13,6 +13,7 @@ import {
   type ShareKind,
   type SubscriptionStatus,
 } from '../protocol/types.gen';
+import type { CodecNotice } from './codecWait';
 import type { ViewerShare } from './viewerStore';
 
 /**
@@ -87,7 +88,8 @@ export interface ShareView {
 
 /**
  * The state a share's tile shows (05 §10.4, §12.6):
- * - the server's `codec` reason: this browser can't decode the video yet; audio keeps playing (05 §10.6);
+ * - the server's `codec` reason: this browser can't decode the video yet; audio keeps playing (05 §10.6; what the
+ *   overlay says follows the page's codec wait, codecWait.ts);
  * - the share is `stalled`: the sharer's connection dropped; the last frame stays;
  * - no video track yet, or the `waiting` reason: connecting;
  * - `frozen` (viewerStore.frozen: no frame decoded for 3 s while video is asked for and the share is live): the
@@ -116,13 +118,22 @@ export function shareView(
   return { overlay: null, badge };
 }
 
-export function overlayText(t: TFunction, overlay: ShareOverlay): string {
+/**
+ * The overlay's text. For `codec` it follows the page's codec wait (codecNotice(viewerStore.codecWait), 05 §10.6):
+ * "still getting its video decoder… Retrying…" while it waits (and before the wait has begun), "Reload the page"
+ * after 3 minutes, and "can't play this video" in a browser that has no H.264 decoder and won't get one. None of
+ * them promises sound: a thumbnail's audio is off (05 §12.3) and a share may have none; the room banner
+ * (CodecBanner.tsx) says what to do.
+ */
+export function overlayText(t: TFunction, overlay: ShareOverlay, codec: CodecNotice | null = null): string {
   switch (overlay) {
     case 'connecting':
       return t('viewer.state.connecting');
     case 'stalled':
       return t('viewer.state.stalled');
     case 'codec':
+      if (codec === 'missing') return t('viewer.state.codecMissing');
+      if (codec === 'stuck' || codec === 'stuckFirefox') return t('viewer.state.codecStuck');
       return t('viewer.state.codec');
     case 'frozen':
       return t('viewer.state.frozen');

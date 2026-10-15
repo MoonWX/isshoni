@@ -21,9 +21,12 @@ type Subscription struct {
 	reqAudio bool
 	// capQ and capReason are the server's cap on the video (02 §10.1), set by capSubscription: while capReason isn't
 	// "", the subscription gets min(reqVideo, capQ), and capReason is why when that is less than the client asked
-	// for. The downlink allocator (README S84) will set it, with SubReasonBandwidth.
+	// for. The downlink allocator sets it, at low with SubReasonBandwidth (02 §10.2, allocator.go).
 	capQ      Quality
 	capReason SubReason
+	// highAt orders the requests for high (allocator.order): the allocator serves the most recently made first, so
+	// the oldest are capped first. It changes when the client asks for high after asking for less.
+	highAt uint64
 	// codec is the cap the viewer's decoders put on the video (02 §8.5, Conn.refreshCodec):
 	// SubReasonDecoderUnavailable or SubReasonDecoderFailed while the viewer can't decode H.264, and then the
 	// subscription gets no video, whatever capQ says; "" otherwise. A stream in a profile the viewer has no payload
@@ -171,8 +174,8 @@ func (s *Subscription) state() subState {
 
 // capSubscription sets the server's cap on a subscription's video, or lifts it (reason ""), and applies it
 // (02 §10.1): the client's request stays, the subscription gets at most q, and the client hears why once it gets less
-// than it asked for. It runs on the Conn's actor. Its caller comes with the downlink allocator (README S84); the
-// viewer's decoders have a cap of their own (Subscription.codec, Conn.refreshCodec).
+// than it asked for. It runs on the Conn's actor. Its caller is the downlink allocator (02 §10.2: Conn.capWithin and
+// Conn.liftCaps); the viewer's decoders have a cap of their own (Subscription.codec, Conn.refreshCodec).
 func (c *Conn) capSubscription(sub *Subscription, q Quality, reason SubReason) {
 	sub.capQ, sub.capReason = q, reason
 	sub.apply()
@@ -332,7 +335,14 @@ func (c *Conn) updateSubscriptions(items []SubscriptionUpdate) ([]error, error) 
 			continue
 		}
 		created, applied = created || made, true
+		wasHigh := !made && sub.reqVideo == QualityHigh
+		changed := made || sub.reqVideo != it.Video || sub.reqAudio != it.Audio
 		sub.reqVideo, sub.reqAudio = it.Video, it.Audio
+		if changed {
+			// The downlink allocator's say (02 §10.2): while it is limited, what fits its budget is decided again,
+			// before the client hears what the request got.
+			c.requestChanged(sub, wasHigh)
+		}
 		sub.apply()
 		sub.publish()
 		c.reportSubscription(sub)

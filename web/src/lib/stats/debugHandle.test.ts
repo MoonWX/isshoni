@@ -3,7 +3,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createMemoryStorage } from '../../platform/browser/storage';
-import { NotImplementedError } from '../errors';
 import { DEBUG_FLAG_KEY, debugEnabled, installDebugHandle, type DebugHandle } from './debugHandle';
 import type { StatsSample } from './summarize';
 
@@ -19,6 +18,7 @@ const deps = (flag?: string) => ({
   storage: storage(flag),
   stats: vi.fn(() => Promise.resolve(SAMPLE)),
   state: vi.fn(() => ({ viewer: { focusedShareId: 's_a' } })),
+  dropSocket: vi.fn(),
 });
 
 let uninstall: (() => void) | undefined;
@@ -42,17 +42,16 @@ describe('installDebugHandle', () => {
 
   it("puts stats(), state() and dropSocket() on window when sessionStorage['isshoni.debug'] is '1'", async () => {
     const d = deps('1');
-    const dropSocket = vi.fn();
     expect(DEBUG_FLAG_KEY).toBe('isshoni.debug');
     expect(debugEnabled(d.storage)).toBe(true);
-    uninstall = installDebugHandle({ ...d, dropSocket });
+    uninstall = installDebugHandle(d);
 
     const handle = window.__isshoni;
     expect(Object.keys(handle ?? {}).sort()).toEqual(['dropSocket', 'state', 'stats']);
     await expect(handle?.stats()).resolves.toBe(SAMPLE);
     expect(handle?.state()).toEqual({ viewer: { focusedShareId: 's_a' } });
     handle?.dropSocket();
-    expect(dropSocket).toHaveBeenCalledTimes(1);
+    expect(d.dropSocket).toHaveBeenCalledTimes(1);
     // Asked each time: nothing is cached.
     await handle?.stats();
     expect(d.stats).toHaveBeenCalledTimes(2);
@@ -70,9 +69,21 @@ describe('installDebugHandle', () => {
     expect(Object.keys(window)).not.toContain('__isshoni');
   });
 
-  it('says so when no way to drop the socket was given', () => {
-    uninstall = installDebugHandle(deps('1'));
-    expect(() => window.__isshoni?.dropSocket()).toThrow(NotImplementedError);
+  it('dropSocket() calls through to the SignalClient’s hook every time, and nothing else does', () => {
+    const d = deps('1');
+    uninstall = installDebugHandle(d);
+    expect(d.dropSocket).not.toHaveBeenCalled(); // installing drops nothing
+    window.__isshoni?.dropSocket();
+    window.__isshoni?.dropSocket();
+    expect(d.dropSocket).toHaveBeenCalledTimes(2);
+    expect(d.stats).not.toHaveBeenCalled();
+    expect(d.state).not.toHaveBeenCalled();
+  });
+
+  it('throws when it was given no socket to drop, rather than dropping nothing', () => {
+    const { storage, stats, state } = deps('1');
+    uninstall = installDebugHandle({ storage, stats, state });
+    expect(() => window.__isshoni?.dropSocket()).toThrow(/no signaling client/);
   });
 
   it('goes where it is told, and the returned function removes it', () => {

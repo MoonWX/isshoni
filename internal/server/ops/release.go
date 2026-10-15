@@ -151,21 +151,10 @@ func NewReleaseCheck(o ReleaseCheckOptions) (*ReleaseCheck, error) {
 	if o.Policy == nil {
 		panic("ops: NewReleaseCheck: nil Policy")
 	}
-	raw := o.URL
-	if raw == "" {
-		raw = DefaultReleasesURL
-	}
-	u, err := url.Parse(raw)
+	u, err := releasesURL(o.URL)
 	if err != nil {
-		return nil, fmt.Errorf("ops: release check: updates.release_url: %w", err)
+		return nil, err
 	}
-	if (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil {
-		return nil, fmt.Errorf("ops: release check: updates.release_url must be an http(s) URL without credentials, got %q", raw)
-	}
-	q := u.Query()
-	q.Set("per_page", strconv.Itoa(releasePerPage))
-	u.RawQuery = q.Encode()
-	u.Fragment = ""
 
 	running := o.Version
 	if running == "" {
@@ -192,13 +181,67 @@ func NewReleaseCheck(o ReleaseCheckOptions) (*ReleaseCheck, error) {
 
 	return &ReleaseCheck{
 		policy:  o.Policy,
-		url:     u.String(),
+		url:     u,
 		version: running,
 		meta:    o.Meta,
 		client:  &client,
 		now:     now,
 		log:     log.With(slog.String("component", "ops")),
 	}, nil
+}
+
+// CheckReleasesURL reports whether raw is a value of updates.release_url that the check takes: "" (the default), or
+// an absolute http or https URL without credentials. The wiring asks it before the start, so that a value the check
+// would refuse is a config error (exit 78) like every other.
+func CheckReleasesURL(raw string) error {
+	_, err := releasesURL(raw)
+	return err
+}
+
+// releasesURL is the URL the check asks: raw ("" means DefaultReleasesURL) with per_page=20 and no fragment.
+func releasesURL(raw string) (string, error) {
+	if raw == "" {
+		raw = DefaultReleasesURL
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		// Not url.Parse's error, whose text holds the whole value, credentials and all.
+		return "", fmt.Errorf("ops: release check: updates.release_url is not a URL: %q", RedactURL(raw))
+	}
+	if (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil {
+		return "", fmt.Errorf("ops: release check: updates.release_url must be an http(s) URL without credentials, got %q",
+			RedactURL(raw))
+	}
+	q := u.Query()
+	q.Set("per_page", strconv.Itoa(releasePerPage))
+	u.RawQuery = q.Encode()
+	u.Fragment = ""
+	return u.String(), nil
+}
+
+// RedactURL returns raw for an error or a log line with whatever may be a credential replaced by "xxxxx" (README §4
+// "Logging": passwords are never logged): the whole user info of a URL that has one, since a user name alone can be
+// a token, and in a value that does not parse as a URL with an authority ("user:secret@host" parses as the scheme
+// user), everything between its "://" (or its start) and its last "@". Any other value is returned as it is.
+func RedactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err == nil && u.Opaque == "" {
+		if u.User == nil {
+			return raw
+		}
+		r := *u
+		r.User = url.User("xxxxx")
+		return r.String()
+	}
+	at := strings.LastIndex(raw, "@")
+	if at < 0 {
+		return raw
+	}
+	start := 0
+	if i := strings.Index(raw, "://"); i >= 0 && i < at {
+		start = i + len("://")
+	}
+	return raw[:start] + "xxxxx" + raw[at:]
 }
 
 // sameHostRedirect is the client's redirect policy: follow a redirect only to the host and scheme of the first

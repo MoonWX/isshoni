@@ -17,12 +17,14 @@
 //     restarted (ErrRestartRequested), or failed.
 //   - Shutdown stops the server in the order of 04 §6.4: readiness and liveness off, the shutdown gate (503
 //     server_shutdown for every new request), the hub (server.shutdown to every connection, close 1012), the SFU
-//     and then the ICE Transport under it, then the HTTP servers and the 443 multiplexer, the TLS manager while the
-//     push service sends what is queued (for at most 2 s, from the moment the HTTP servers are down), the admin
-//     socket, the store, and last the data-directory lock. It finishes within shutdown_timeout (10 s); what is
-//     still open then is closed by force, and its error says so with ErrShutdownForced.
+//     and then the ICE Transport under it, then the HTTP servers (the metrics listener's too) and the 443
+//     multiplexer, the TLS manager and the last flush of the transfer counters while the push service sends what is
+//     queued (for at most 2 s, from the moment the HTTP servers are down), the admin socket, the store, and last the
+//     data-directory lock. It finishes within shutdown_timeout (10 s); what is still open then is closed by force,
+//     and its error says so with ErrShutdownForced.
 //
-// What runs in the server (README slices S31, S44, S54, S59, S71 and S80; 04 slices S4, S7, W1, W2, S12b and S13):
+// What runs in the server (README slices S31, S44, S54, S59, S71, S80 and S85; 04 slices S4, S7, W1, W2, S10, S10b,
+// S12b and S13):
 //   - The HTTP side of every TLS mode of 04 §8.1. httpapi's router serves the embedded web app with its fallback,
 //     GET /healthz and GET /readyz from ops.Health, 03's REST API at /api/v1/ and 01's hub at GET /ws.
 //     In off mode the router is on plain HTTP on listen.http, behind the operator's HTTPS proxy, or on localhost for
@@ -71,9 +73,16 @@
 //     start's push service (the VAPID pair, 04 §5.2) and account service (03 §4.6). Reexec (exec_unix.go) is the
 //     restart itself: cmd/isshoni calls it when Run returns ErrRestartRequested, and the process replaces itself
 //     with a new run of the same command line; where a platform has none (exec_other.go), cmd/isshoni exits 75.
+//   - The ops data (README S85; 04 §11, wire.go): the server's Prometheus registry on every server, with the hub's,
+//     the push service's and the SFU's series on it (sfuCollector), served on metrics.listen with metrics.enabled
+//     (Addrs.Metrics) and stopped with the HTTP servers; the transfer counter on the 443 multiplexer, listen.http
+//     and the ICE Transport, which ops.Transfer stores per month (its last flush is step 6 of the shutdown, and a
+//     backup flushes it first) and alerts the admins on; the daily release check; and the admin routes of ops on
+//     the REST API: the dashboard (ops.Dashboard over the status, the hub and the SFU, 03's accounts and the other
+//     ops parts), doctor's report and run, and the bandwidth estimate.
 //
-// The later slices of the M1 plan extend Start and Shutdown at the marked steps: the ops data, metrics and the other
-// REST routes of ops (S85) and the SIGHUP reload (S90), which serve only answers with a log line so far.
+// The later slices of the M1 plan extend Start and Shutdown at the marked steps: the SIGHUP reload (S90), which
+// serve only answers with a log line so far.
 //
 // Of the packages of 04 §2, only this one, cmd/isshoni and servertest import signal, sfu and sfuplane, or combine
 // store and auth with ops and push.

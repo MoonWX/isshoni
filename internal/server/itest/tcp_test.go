@@ -10,6 +10,7 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"github.com/MoonWX/isshoni/internal/protocol"
+	"github.com/MoonWX/isshoni/internal/protocol/api"
 	"github.com/MoonWX/isshoni/internal/server/config"
 	"github.com/MoonWX/isshoni/internal/server/servertest"
 	"github.com/MoonWX/isshoni/internal/server/sfu/sfutest"
@@ -19,8 +20,9 @@ import (
 // listen.ice_tcp in off mode. A network that blocks UDP leaves a friend these two ways in.
 
 // watchOverTCP runs one share from a publisher to a viewer whose PeerConnections know nothing but TCP, and checks
-// that the viewer gets the media and that both PeerConnections selected a TCP pair to the server's port.
-func watchOverTCP(t *testing.T, w *world, port int) {
+// that the viewer gets the media and that both PeerConnections selected a TCP pair to the server's port. It returns
+// the publisher's client and the viewer's, which are still connected.
+func watchOverTCP(t *testing.T, w *world, port int) (*client, *client) {
 	t.Helper()
 	alice := w.connect(w.member("alice"), protocol.RoleFull)
 	sh := alice.publish(7, sfutest.LoopbackTCPSettings())
@@ -64,15 +66,18 @@ func watchOverTCP(t *testing.T, w *world, port int) {
 	}
 	alice.check()
 	bob.check()
+	return alice, bob
 }
 
 // TestICETCPVia443 is the check of 04 §17: a TLS-mode server with UDP and listen.ice_tcp both turned off has one
 // port for everything. A Go publisher that knows only TCP shares, a Viewer decodes its media, and the WSS
 // signaling of both runs on that same port: both clients' selected candidate pairs are TCP with the TLS listener's
-// port as the remote port.
+// port as the remote port. The server says the same (README S85): isshoni_sfu_selected_transport{transport="tcp443"}
+// counts both PeerConnections, and the admin dashboard has them as tcp443, in its totals and on each connection.
 func TestICETCPVia443(t *testing.T) {
 	w := newWorld(t, servertest.Options{TLS: true, Config: func(c *config.Config) {
 		c.Listen.ICEUDP, c.Listen.ICETCP = "", ""
+		withMetrics(c)
 	}})
 	addrs := w.srv.Srv.Addrs()
 	https, ok := addrs.HTTPS.(*net.TCPAddr)
@@ -84,21 +89,27 @@ func TestICETCPVia443(t *testing.T) {
 	if err != nil || u.Scheme != "wss" || u.Port() != strconv.Itoa(https.Port) {
 		t.Fatalf("the signaling URL is %s (%v), want wss on port %d", w.srv.WSURL, err, https.Port)
 	}
-	watchOverTCP(t, w, https.Port)
+	alice, bob := watchOverTCP(t, w, https.Port)
 	// No other port could have carried it: the server's log names the one.
 	if want := " (tls=manual) media udp/off ice-tcp " + strconv.Itoa(https.Port) + `"`; !strings.Contains(w.srv.Logs(), want) {
 		t.Errorf("no ready line with %q:\n%s", want, w.srv.Logs())
 	}
+	wantTransport(t, w, api.TransportTCP443, alice, bob)
 }
 
 // TestICETCPVia7882 is the same in off mode, where the operator's proxy owns port 443 and the server has no
-// multiplexer (04 §8.5): with UDP turned off, media runs over the ICE-TCP listener of listen.ice_tcp.
+// multiplexer (04 §8.5): with UDP turned off, media runs over the ICE-TCP listener of listen.ice_tcp, and the server
+// counts both PeerConnections as tcp7882.
 func TestICETCPVia7882(t *testing.T) {
-	w := newWorld(t, servertest.Options{Config: func(c *config.Config) { c.Listen.ICEUDP = "" }})
+	w := newWorld(t, servertest.Options{Config: func(c *config.Config) {
+		c.Listen.ICEUDP = ""
+		withMetrics(c)
+	}})
 	addrs := w.srv.Srv.Addrs()
 	tcp, ok := addrs.ICETCP.(*net.TCPAddr)
 	if !ok || addrs.ICEUDP != nil || addrs.HTTPS != nil {
 		t.Fatalf("Addrs = %+v, want the ICE-TCP listener alone", addrs)
 	}
-	watchOverTCP(t, w, tcp.Port)
+	alice, bob := watchOverTCP(t, w, tcp.Port)
+	wantTransport(t, w, api.TransportTCP7882, alice, bob)
 }

@@ -311,6 +311,7 @@ describe('window.__isshoni (05 §10.7)', () => {
         pageHidden: false,
         media: 'connected',
         subGen: 1,
+        codecWait: null,
         shares: [
           {
             id: 's_bea',
@@ -320,6 +321,7 @@ describe('window.__isshoni (05 §10.7)', () => {
             kind: 'window',
             status: 'live',
             layers: ['high', 'low'],
+            codec: 'h264/6400',
             watchers: 0,
             visible: false,
             frozen: false,
@@ -333,6 +335,7 @@ describe('window.__isshoni (05 §10.7)', () => {
             kind: 'window',
             status: 'live',
             layers: ['high', 'low'],
+            codec: 'h264/6400',
             watchers: 0,
             visible: false,
             frozen: false,

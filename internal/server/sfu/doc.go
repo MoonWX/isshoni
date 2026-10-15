@@ -38,17 +38,19 @@
 //	                  track            side's interceptors; keeps the layer's latest sender report and tells the
 //	                                   DownTracks that want the layer of it
 //	DownTrack writer  1 per DownTrack  sends the retransmissions its viewer asked for, before anything else; takes
-//	                                   packets off the DownTrack's queue: gate, munge, fresh header, write; sends
-//	                                   the forwarded layer's sender reports on (DownTrack.run); owned by the
-//	                                   subscriber's Conn
+//	                                   packets off the DownTrack's queue: gate, munge, fresh header, pace (video),
+//	                                   write; sends the forwarded layer's sender reports on (DownTrack.run); owned
+//	                                   by the subscriber's Conn
 //	DownTrack RTCP    1 per DownTrack  the viewer's NACKs (looked up in the packet caches and queued for the
-//	                                   writer), PLI and FIR for the track, until its sender stops
-//	                                   (DownTrack.readRTCP); owned by the sub PC
+//	                                   writer), PLI and FIR for the track, and its REMBs and receiver reports for
+//	                                   the Conn's downlink allocator, until its sender stops (DownTrack.readRTCP);
+//	                                   owned by the sub PC
 //	Ticker            1 per SFU        every 250 ms, and at once for a state change: the ShareUpdated calls that are
 //	                                   due; every second: each layer's rates and cache size, each DownTrack's
 //	                                   bitrate, the stalled check (a live share whose pub PC has been away for 2 s),
-//	                                   and each room's codec policy (its way back to high after the hold). Started
-//	                                   by the first Join, stopped by Close. README S84 and S88 add to it
+//	                                   each room's codec policy (its way back to high after the hold), and a look of
+//	                                   every Conn's downlink allocator, which its actor takes (Conn.adapt). Started
+//	                                   by the first Join, stopped by Close. README S88 adds the uplink policy
 //	Probe             1 per probe PC   the connection-test probe's life (probe.run): waits for its PC to connect,
 //	                                   reports the result 1 s later, and ends the probe after 20 s, when the PC
 //	                                   fails or closes, when its data channel closes, or when it is stopped (a
@@ -87,6 +89,15 @@
 //   - The NACKs a pub PC sends its publisher go through the PC's NACK filter, on the goroutine of Pion's NACK
 //     generator, which holds none of its locks then. The filter reads the PC's track table, an atomic pointer that
 //     the Conn's actor replaces when a track comes or goes, and takes each cache's lock for one lookup at a time.
+//   - A Conn's downlink allocator has a lock of its own, a leaf: the RTCP readers of the Conn's DownTracks put what
+//     the viewer's REMBs and receiver reports say under it, and the actor takes it when it decides (02 §10.2).
+//     The rest of the allocator's state is the actor's, and so are its caps (Conn.capSubscription). A REMB that
+//     falls, or a report that shows loss, wakes the actor with one post at most (Conn.wakeAllocator), like the
+//     ticker once a second; the queues' drops and the rate forwarded to the viewer are atomics. The own sequence
+//     numbers a video DownTrack's writer passed over (seqGaps) have a leaf lock too, taken by the writer and by the
+//     reader, never inside the allocator's.
+//   - A video DownTrack's writer waits in its pacer (02 §9.8) holding no lock; its stop and its Conn's close end the
+//     wait. Audio is never paced.
 //   - WriteRTP and WriteRTCP are media calls, not signaling calls: the media goroutines make them, and so may any
 //     actor, also for another Conn's pub PC (a keyframe request). Pion allows them from any goroutine and they
 //     never block. Keyframe requests are throttled per layer by a compare-and-swap, so callers need no lock.
@@ -180,6 +191,18 @@
 //     on the viewer's timeline, every one that arrives and one right after each start of an epoch; a layer switch
 //     keeps that timeline the capture timeline, through both layers' reports, to within a tick. So a share's audio
 //     and video reach a viewer on one clock, the publisher's capture clock;
+//   - allocator.go, pacer.go: downlink adaptation (02 §9.8, §10.2). Each viewer Conn has an allocator that caps its
+//     high requests at the preview layer (the reason bandwidth) when its downlink is congested: a REMB at least 3 %
+//     below the last one and below the rate forwarded to it, loss of 10 % over 2 s in its receiver reports (as the
+//     link lost it: the sequence numbers the SFU itself never sent are taken out, and a report after an outage of
+//     the viewer's network starts the count again), or more than 50 queue drops a second. It fills a budget cheapest
+//     first (audio, thumbnails, then the newest high requests), and after a backoff of 10 s, doubling up to 120 s
+//     with each trial that fails, lifts the caps for a 6 s trial upgrade: REMB can't grant an upgrade, so one is
+//     tried. A new high request while capped is served at the full layer only if that layer's measured rate fits.
+//     ConnStats.DownlinkEstimate is its budget while it caps, else the viewer's latest REMB. Each video DownTrack
+//     paces what it sends through a token bucket of max(2.5 × the layer's maximum, 3 × its measured rate, 2 Mbit/s)
+//     holding 20 ms of that: a keyframe after a still screen leaves over tens of milliseconds, not in one burst per
+//     viewer. Retransmissions go through it too, first (decided in README S84);
 //   - events.go, errors.go, types.go, config.go, stats.go: the whole interface of 02 §6 and §13;
 //   - stats.go, counters.go, pionlog.go: observability (02 §13). Conn.Stats, SFU.Snapshot and SFU.Metrics never ask
 //     an actor and never wait: they read what the Layers and DownTracks measure (their rates are the ticker's, once
@@ -267,14 +290,12 @@
 // # What later slices add
 //
 // The whole API of 02 §6 is implemented (README S76 did the last method, Probe), and the sentinel ErrNotImplemented
-// that the unbuilt methods wrapped is gone; so are the reports of 02 §13 (README S79). What later slices add, in
-// README order:
-//   - S84: the downlink allocator (REMB, what it makes of the receiver reports, queue drops) and the pacer; with it
-//     ConnStats.DownlinkEstimate and the bandwidth downgrades, which Metrics already counts by reason.
+// that the unbuilt methods wrapped is gone; so are the reports of 02 §13 (README S79) and downlink adaptation
+// (README S84). What later slices add:
 //   - S88: the admin cap as REMB and quality hint (SetLimits already caps new ShareParams), layer pausing, and the
 //     last QualityHintEvent per share in Resync.
 //
-// The server's cap on a subscription (02 §10.1: effective = min(requested, cap), with its reason) is in place
-// (Conn.capSubscription) for the allocator of S84; the viewer's decoders have a cap of their own
-// (Subscription.codec).
+// The server's cap on a subscription (02 §10.1: effective = min(requested, cap), with its reason) is the downlink
+// allocator's (Conn.capSubscription, reason bandwidth; server_limit is M5's); the viewer's decoders have a cap of
+// their own (Subscription.codec).
 package sfu

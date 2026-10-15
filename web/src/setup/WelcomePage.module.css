@@ -1,0 +1,22 @@
+/* The step's own buttons, under its content: "Continue", "Done, go to the Lounge". */
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  justify-content: flex-end;
+  padding-top: var(--space-4);
+  border-top: var(--border-width) solid var(--color-border);
+}
+
+.creating {
+  display: flex;
+  gap: var(--space-3);
+  align-items: center;
+  color: var(--color-text-muted);
+}
+
+@media (max-width: 30rem) {
+  .actions > * {
+    flex: 1;
+  }
+}
