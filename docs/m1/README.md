@@ -939,7 +939,8 @@ and the three questions that are still the owner's. S00L wrote each into the spe
     logging no WARN when a server stops right after it started (S90's blocked items). Both merged in group 14
     ("Decided after group 14" (1)–(3)). F17-R3 (`ViewerSignal` as `Pick<SignalClient, 'on' | 'notify'>`,
     `canSend` and its debug branch gone) is a carry-over for README S93, which owns `web/src/viewer/` in group 14;
-    S93 did it (05 §10.6). Done in group 15: decision 2's doctor check in CI (README F21). Not scheduled yet: `sign` and `sign-dry` calling `check-draft.sh` in a mode without the signature check (F15's note);
+    S93 did it (05 §10.6). Done in group 15: decision 2's doctor check in CI (README F21). Not scheduled yet:
+    `sign` and `sign-dry` calling `check-draft.sh` in a mode without the signature check (F15's note);
     `task e2e` building `isshoni-loadtest` and passing `LOADTEST_BIN` (S89's option; locally the spec builds the
     tool itself).
 13. **Still waiting for the owner: README F07** (R1 of the security review, point 1 of "Decided after group 10").

@@ -3263,8 +3263,8 @@ Decided after group 13 (engineering calls the owner delegated; README §6 "Decid
   address, run with the exit test** (12.1 pre-flight 5; README S90's last acceptance item). Docker Desktop can't
   produce an all-ok report (its user-space NAT makes `public_ip` symmetric, its fake-IP DNS answers for a test
   domain, its VM's clock and UDP buffers warn), and neither can 11.3's smoke overrides on a Linux runner (the test
-  domain resolves nowhere). README F21 (group 15) runs `isshoni doctor --json` in the `docker-smoke` job and asserts per code (11.3), after
-  revising two `public_ip` rules (04 §13.2).
+  domain resolves nowhere). README F21 (group 15) runs `isshoni doctor --json` in the `docker-smoke` job and
+  asserts per code (11.3), after revising two `public_ip` rules (04 §13.2).
 - **README S94 (this doc's S12) is split** (16): `tools/exittest` and the run book in `docs/m1/exit-test/` are
   built in group 14; the session, 05 §19.4's device matrix and the `v0.1.0` tag stay with the owner, after README
   S92's load gate on a VPS.
