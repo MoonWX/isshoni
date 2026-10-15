@@ -1474,6 +1474,15 @@ task dev:setup-url        # in a second terminal: open the printed link, create 
 - the license rule: section 8.3;
 - that `spikes/` is throwaway and not built by CI.
 
+**The Go tests in a Linux container, from a checkout set up on a Mac** (the group 14 integration). `.bin/` holds
+binaries for the machine that built them (7.1), so a container that mounts such a checkout (`golang:<version>`,
+to run the tests on Linux as CI does) sees darwin binaries there: `go -C tools test ./...` then fails
+`tools/notices`' `TestGoLicensesGate` with "exec format error", because the test runs `.bin/go-licenses` whenever
+it exists (8.3). In such a container run only the root module's `go test ./...`, or the `tools/` packages other
+than `notices` (`go -C tools test ./exittest/` runs `exittest`'s Linux-only `TestRealProc`), or point
+`GO_LICENSES_BIN` at a Linux build of the pinned go-licenses. The root module's suite is unaffected, and so is CI,
+whose jobs build `.bin/` on Linux.
+
 ## 8. CI (GitHub Actions)
 
 ### 8.1 Workflows
@@ -2827,22 +2836,122 @@ can watch.
 
 **`tools/exittest collect -o run.csv -metrics http://127.0.0.1:9469/metrics`** (Go, stdlib only, runs as root). A
 starts it detached from the SSH session, because A drops Wi-Fi at T+75:
-`sudo systemd-run --unit=exittest-collect --working-directory="$PWD" "$PWD/exittest" collect -o run.csv -metrics
-http://127.0.0.1:9469/metrics` (or inside `tmux`). Every 10 s it records:
+`sudo systemd-run --collect --unit=exittest-collect --working-directory="$PWD" "$PWD/exittest" collect -o run.csv
+-metrics http://127.0.0.1:9469/metrics` (or inside `tmux`). `--collect` unloads the transient unit however the
+collector ends, so the same command works again after a start that failed (a typo is exit 2, and without it the
+failed unit would stay loaded under that name; review S94-F7). Every 10 s it records:
 - the isshoni PID, re-resolved on every sample with `systemctl show -p MainPID --value isshoni`; a changed PID is
   written to `run.csv` as a `restart` row, so the T+60 restart is marked;
 - isshoni CPU % (from `/proc/<pid>/stat` of that PID), RSS, threads and open fds;
 - load average;
 - NIC rx/tx bytes (`/proc/net/dev`);
-- UDP `InDatagrams`, `OutDatagrams`, `RcvbufErrors`, `SndbufErrors` and `InErrors` (`/proc/net/snmp`);
+- UDP `InDatagrams`, `OutDatagrams`, `RcvbufErrors`, `SndbufErrors` and `InErrors` (`/proc/net/snmp`, plus the
+  `Udp6*` lines of `/proc/net/snmp6`, which Linux counts apart; clients may come over IPv6);
 - TCP `RetransSegs`.
 
 Every 30 s it saves a `/metrics` scrape.
 
-`tools/exittest summarize run.csv` prints the table below. It computes every rate and total per process (split at
-the `restart` rows) and treats a counter that goes down as a reset, the Prometheus way (the increase after a reset is
-the new value), because the saved `/metrics` counters start again at zero at T+60. The owner then adds the journal
-excerpt (`journalctl -u isshoni --since …`, with warnings and errors only).
+`tools/exittest summarize run.csv` prints the table below. It computes every rate and total per process (split at the
+`restart` rows) and treats a counter that goes down as a reset, the Prometheus way (the increase after a reset is the
+new value), because the saved `/metrics` counters start again at zero at T+60. The owner then adds the journal
+excerpt: the session's warnings and errors, with every IP address and name replaced. isshoni writes JSON lines (04
+§10) without a `<N>` priority prefix, which journald stores at one priority, so `journalctl -p warning` doesn't find
+them: the run book filters `journalctl -u isshoni --since … --until … -o cat` on the JSON `level` (`WARN`, `ERROR`)
+and on a panic's first line, and takes systemd's own messages about the unit (a crash, the failed state) with `-p
+warning` (review S94-F1).
+
+**As README S94 built it** (`tools/exittest` in the module `tools/`; the run book `docs/m1/exit-test/README.md` and
+its results template `results-template.md`):
+- **Build and copy.** `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go -C tools build -o ../bin/exittest ./exittest`
+  writes the binary into the checkout's ignored `bin/`, from where it is copied to the VPS. `run.csv`, the saved
+  scrapes and the journal stay off the repository: they are copied off the VPS into the ignored `.dev/` (or outside
+  the checkout), never next to tracked files (review S94-F6).
+- **Flags.** `exittest collect [-o run.csv] [-metrics URL] [-unit isshoni | -pid-file FILE] [-nic NAME]
+  [-metrics-dir DIR] [-proc /proc] [-interval 10s] [-scrape-interval 30s]`, with defaults that match the command
+  line above. `-unit` names the systemd unit whose `MainPID` is isshoni; `-pid-file` reads the PID from a file
+  instead (a server that systemd doesn't run, and the SIGTERM test); `-nic` defaults to the interface of the IPv4
+  default route with the lowest metric (`/proc/net/route`), and without one, or with `all`, counts every interface
+  except `lo`; `-metrics ""` scrapes nothing; `-metrics-dir` defaults to `-o`'s name without `.csv` plus `-metrics`;
+  `-proc` is where the proc file system is (the tests give a fake one). Exit 0 when a signal stopped it, 1 when
+  `run.csv` can't be written, 2 on a usage error. `exittest summarize [-t0 TIME] run.csv` is below.
+- **`run.csv`.** One header line, then one row per event, oldest first, each row one write (a killed collector
+  leaves whole rows). `time` is UTC with milliseconds; `kind` is one of `start` (the collector started; started
+  again with the same `-o`, it appends after a new `start` row and still marks a restart in between; the note says
+  how it samples, `user_hz=100` among it), `sample`, `down` (a sample without an isshoni process: systemd names
+  none, or the process ended between the lookup and the read; the machine's columns are still filled), `restart`
+  (the PID differs from the last one, or the same PID now belongs to a process that started later, told by
+  `/proc/<pid>/stat`'s `starttime`; the note names the old PID), `scrape`, `scrape_error` (no metrics: refused,
+  failed, timed out or not the text format; the note says why) and `stop` (the note says why: a signal, or the
+  error it couldn't go on after); then `pid` and the columns, an empty cell where the row's kind doesn't fill a
+  column or the value couldn't be read, and a free-text `note` last:
+  - the process: `cpu_ticks` (utime + stime) and `cpu_pct`, its CPU since the previous sample **in percent of all
+    CPUs** (100 = every CPU busy), `rss_bytes` (`VmRSS`), `threads` and `fds`;
+  - the machine: `cpus` and `host_cpu_pct` (the whole machine's CPU since the previous sample, from `/proc/stat`,
+    in percent of all CPUs; two columns beyond the list above, because "Server CPU" can be read as the machine's,
+    so the summary shows both and judges by isshoni's own), `load1`, `load5`, `load15`, `nic_rx_bytes`,
+    `nic_tx_bytes`, `udp_in_datagrams`, `udp_out_datagrams`, `udp_rcvbuf_errors`, `udp_sndbuf_errors`,
+    `udp_in_errors` and `tcp_retrans_segs` (counters since boot);
+  - the scrape: each one is saved whole as `<metrics-dir>/<UTC time>.prom` (the row's note names the file), and
+    the series of the list below become columns, each the sum of a metric's series or of those with given labels:
+    `go_goroutines`, `process_resident_memory_bytes`, `process_cpu_seconds_total`, `participants`, `shares`,
+    `sfu_downtracks`, `sfu_video_downtracks_high` and `sfu_video_downtracks_low` (the video DownTracks forwarding
+    `high` or `low`), the SFU's ingress and egress bytes, NACKs served, PLIs sent and layer switches,
+    `transfer_ingress_bytes_total`, `transfer_egress_bytes_total`, `ws_resume_resumed_total`,
+    `ws_resume_not_resumed_total`, `transport_udp`, `transport_tcp443`, `transport_tcp7882` and the six `client_*`
+    counters, so `summarize` needs only `run.csv`. The parser skips and counts a line it can't read rather than
+    failing the scrape.
+- **CPU ticks** are read with a constant USER_HZ of 100: the standard library has no `sysconf` without cgo, and 100
+  holds on x86-64, arm64 and riscv64.
+- **How `summarize` judges.** It prints Markdown with `###` sections and no title, so it goes under the results
+  file's "## Summary" as it is. A row is `pass`, `FAIL`, `check` (measured, needs a look), `n/a` (nothing to
+  measure) or `manual` (the people, the dashboard or the survey answer it: manual fixes, phones and the survey,
+  and the numbers it gives for recovery, viewing quality and ICE-TCP). Where the pass criteria are not numeric:
+  - **T+0** is `-t0` (RFC 3339, or `HH:MM[:SS]` in UTC within 12 hours of the first row); without it, 60 minutes
+    before the first restart, or 15 minutes after the first row when there is none (the collector starts at T−15).
+  - **The recording covers the session** when it starts by T+2 and ends at T+118 or later: 2 minutes of slack at
+    each end, because T+0 often comes from the restart, which the collector sees seconds late. A gap of more than
+    2 minutes without a sample inside the session is listed.
+  - **Session**: a restart within 5 minutes of T+60 is the scripted one, and more than one restart is `FAIL`. No
+    restart, a restart elsewhere, a recording that doesn't cover the session, a gap, or several scraped byte
+    counters going down at once without a PID change make it `check`; the last is a restart in place by re-exec
+    (04 §6.5), which keeps the PID and its start time (review S94-F5).
+  - **Server CPU**: isshoni's CPU from T+0 to T+120, the average and the peak (the largest pair of samples) in
+    percent of all CPUs, with the machine's beside it; `FAIL` at 50 % average or 80 % peak; `check` when the
+    samples cover less than 90 % of T+0 to T+120 or none of the stress, T+90 to T+100 (review S94-F4).
+  - **Memory**: RSS from the first sample at or after T+65 to the last at or before T+120, in the process that runs
+    at T+65; `FAIL` at 20 % growth, `check` when those samples are more than 2 minutes inside the window; the first
+    process's T+5 to T+59 is reported beside it. **Goroutines** is a row of its own: the last scrape after the
+    stress (T+100 to T+120) against the last one at or before T+85 of the same process; `pass` up to 10 % above
+    that baseline, otherwise `check` (more people or shares raise it too).
+  - **UDP socket errors**: the machine's `RcvbufErrors + SndbufErrors` against all datagrams; `FAIL` at 0.01 %,
+    `check` when the recording doesn't cover the session.
+  - **Recovery** stays `manual`. For the server restart the summary gives the outage as a range: at most from the
+    old process's last scrape with everyone (the most participants of its last 5 minutes) to the new one's first,
+    at least from the first sign of the outage, or the new PID's `restart` row when that comes first (the old
+    process had stopped by then), to the last sign in between (a scrape with fewer participants, a failed scrape, a
+    `down` row), since participants are scraped every 30 s. The new PID's row is no sign that the outage went on:
+    it comes up to a sample late. It is `check` when even the shorter end is over 30 s, or when the participants
+    never came back (review S94-F2).
+  - **Viewing quality** is `FAIL` only when the viewers' freeze time is at least 3 % of the video tracks' watch
+    time, every device together (the phones' limit, the larger one); otherwise `manual`, because the split per
+    device comes from the dashboard and the notes. The watch time is the forwarding video DownTracks times time,
+    because a viewer reports its freezes per inbound video track, the focus and each thumbnail (review S94-F3);
+    dropped frames and concealed audio are shown beside it.
+  - **ICE-TCP** is `FAIL` only when no scrape between T+0 and T+120 has a PeerConnection on `tcp443`; otherwise
+    `manual`, listing the scrapes that had none, because E's own transport is on the dashboard.
+
+  Then come each process's CPU, memory and gauges, and every counter's total and rates per process and in all.
+  The output names no host, address or person. The golden fixture is `tools/exittest/testdata/run.csv` (about
+  196 KB, a simulated session with the restart) with `summary.md`; after a format change
+  `go -C tools test ./exittest -run 'Fixture|Summarize' -update` writes both again. Tests: `TestCollectSample`,
+  `TestCollectNIC`, `TestCollectAppends`, `TestCollectSurvivesRestartAndOutage`, `TestScrapeRows`,
+  `TestCollectStopsOnSIGTERM` (the binary as a child process), the parsers' tests, `TestRealProc` (Linux only: the
+  real `/proc`), `TestStdlibOnly`, `TestFixtureIsCurrent`, `TestSummarizeFixture`, `TestSummarizeVerdicts`,
+  `TestSummarizeCoverage`, `TestCounterResets` and `TestSummarizeT0`; the fuzz targets `FuzzParsePromText` and
+  `FuzzSummarize`. `TestRealProc` has passed on linux/arm64; CI's linux/amd64 job is its first amd64 run.
+- **The results template** has the timeline's per-person rows (at T+0 C and D; B and E signed up at T−5), the
+  summary pasted under its "## Summary", the journal excerpt, the survey and the device-matrix rows checked that
+  day (review S94-F8).
 
 **Metrics read from the server** (names from 01 §18, 02 §13 and 04 §11.2):
 - Go and process collectors (`go_goroutines`, `process_resident_memory_bytes`, `process_cpu_seconds_total`);
@@ -3060,11 +3169,13 @@ M1 timeline:
 | S9 | goreleaser and release pipeline (2.5 d) | `.goreleaser.yaml`, `release.yml` (web, build, sign, verify, publish, dry run), keys generated by the owner, `allowed_signers`, environment `release` | The dry run passes end to end; tag `v0.1.0-rc.1` → draft → approval → signed → verified → published without moving `:latest` or GitHub's "latest"; `curl …/v0.1.0-rc.1/install.sh \| sh` works on a real VPS | S6, S8 |
 | S10 | Project site (2.5 d) | VitePress skeleton, all M1 pages (10.2), `site.yml`, `release.json`, the anchor test `internal/server/ops/doctor/docsanchors_test.go` (10.4) and the `site` job's Go step, Pages settings (8.6 step 5) | The site is live; the served `install.sh` equals the latest release asset (sha256 test in `site.yml`); the anchor tests pass for the doctor ids, `ct-` codes and provider ids; no request leaves for a third-party origin (checked in the browser's network panel) | S9 (install.sh), 04/05 id lists |
 | S11 | Nightly and VMs (2 d) | `nightly.yml`: VM matrix V1–V6 (Pebble), multi-arch smoke, cross-OS Go tests, govulncheck, full goreleaser snapshot, link check | One green nightly with all rows (or KVM rows marked skipped with the reason, and run by hand in UTM/Tart once) | S7, S8, S9 |
-| S12 | Exit test (1 d prep + the session) | `tools/exittest` (collect, summarize), the run book as a checklist, the session, the results file | All pass criteria in 12.3 met on an rc; `v0.1.0` tagged from that commit (or a fixed one after a re-run) | everything |
+| S12 | Exit test (1 d prep + the session) | `tools/exittest` (collect, summarize; as README S94 built them, 12.3), the run book as a checklist, the session, the results file | All pass criteria in 12.3 met on an rc; `v0.1.0` tagged from that commit (or a fixed one after a re-run) | everything |
 
 README S94 is this slice, split after group 13 (README §6 "Decided after group 13"): its code, `tools/exittest` and
-the run book in `docs/m1/exit-test/`, is built in group 14; the session itself, 05 §19.4's device matrix and the
-`v0.1.0` tag stay with the owner, after README S92's load gate on a VPS.
+the run book in `docs/m1/exit-test/`, was built in group 14 (12.3 "As README S94 built it": `run.csv`'s rows and
+columns, the flags beyond the command line, the `Udp6` counters, USER_HZ 100 and the summary's rules where the pass
+criteria are not numeric); the session itself, 05 §19.4's device matrix and the `v0.1.0` tag stay with the owner
+(README S94-day), after README S92's load gate on a VPS.
 
 ## 17. Decisions taken at integration (formerly open questions)
 
@@ -3162,3 +3273,23 @@ Decided after group 13 (engineering calls the owner delegated; README §6 "Decid
   `CGO_ENABLED=0 go build -trimpath`, uploaded as its own artifact and passed to the specs as `LOADTEST_BIN`, so
   `decodable.spec` doesn't build the tool with an unpinned Go inside the 15 minutes that the whole Playwright run has in
   CI (05 §19.3). The tool is no release artifact.
+- The first item's later slice is README F21 (group 15): `isshoni doctor --json` asserted per code in
+  `docker-smoke`, with an allow-list for what a runner can't satisfy, and the two `public_ip` rules reviewed
+  (11.3; 04 §13.2).
+
+Decided after group 14 (engineering calls the owner delegated; README §6 "Decided after group 14"):
+
+- **The exit test's collector and summary as README S94 built them** (12.3 "As README S94 built it", 16). CPU is
+  in percent of all CPUs, as the pass criteria count it, and `run.csv` also has the machine's (`cpus`,
+  `host_cpu_pct`), because "Server CPU" can be read either way; the verdict uses isshoni's own. The UDP counters
+  add `/proc/net/snmp6`'s `Udp6*`. Each scrape is saved whole and its series are a row of `run.csv`, so the
+  summary needs that one file. Where the pass criteria are not numeric the summary applies rules of its own (T+0,
+  2 minutes of coverage slack, the scripted restart within 5 minutes of T+60, goroutines within 10 % of the T+85
+  baseline, viewing quality `FAIL` only at 3 % frozen, ICE-TCP `FAIL` only with no `tcp443` PeerConnection, and
+  recovery left `manual` with the outage as a range); a row passes only on what was recorded.
+- **The run book reads the journal by the JSON `level`** (12.3; review S94-F1): journald stores isshoni's JSON
+  lines at one priority, so `journalctl -p warning` would show only systemd's lines about the unit. The collector
+  runs under `systemd-run --collect`, the binary goes to the ignored `bin/`, and the recording to the ignored
+  `.dev/` or outside the checkout.
+- **A Linux container over a checkout set up on a Mac runs the root module's tests, not `tools/notices`'** (7.4;
+  the group 14 integration): `.bin/go-licenses` is a darwin binary there.

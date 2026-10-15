@@ -183,10 +183,12 @@ web/
    │                         mediaSession.ts · useControls.ts (their React hooks) · StageControls.tsx ·
    │                         keyboard.ts · ShortcutsDialog.tsx · focusParam.ts · FocusFromUrl.tsx · freeze.ts ·
    │                         IosHint.tsx · and W9's (README S86, §10.6): codecWait.ts (the codec wait) ·
-   │                         CodecBanner.tsx
+   │                         CodecBanner.tsx · and W13's (README S93, §10.7, §16.6): statsLink.ts · debugStats.ts ·
+   │                         DebugOverlay.tsx · debugText.ts · listening.ts
    ├─ share/                 BrowserSharing.ts (SharingProvider) · PublisherPC.ts · presets.ts · encodings.ts ·
    │                         codecPrefs.ts · shareStore.ts · ShareButton.tsx · ShareSheet.tsx · ScreenAudioWarning.tsx ·
-   │                         notes.ts · elsewhere.ts · SharePanel.tsx · LevelMeter.tsx · hints.ts
+   │                         notes.ts · elsewhere.ts · SharePanel.tsx · LevelMeter.tsx · hints.ts · stats.ts (the pub
+   │                         PC as a stats source, README S93)
    ├─ auth/                  LoginPage · InvitePage · SignupPage · PendingPage · ResetPage · AboutPage ·
    │                         fragmentToken.ts · useMe.ts · session.ts (startSession, endSession) · logout.ts ·
    │                         useLogout.ts · loginNotice.ts · the form pieces (AuthForm, AccountFields, PasswordField, …)
@@ -1058,13 +1060,11 @@ background (about a minute), and that Firefox decodes only Constrained Baseline 
 - **No toast.** The "toast, if any" above is none: the overlay (the stage's `role=status`, the tile's description)
   says it where the video would be, and `attachViewer` has no UI store.
 - **Firefox** is told by its user agent (`lib/ua.ts`), which picks the help text and nothing else.
-- **The signal.** `attachViewer` takes a `ViewerSignal`: `on`, and `notify` where the object has it; a signal without
-  `notify` gets no codec wait and one debug line in the log (`canSend` in `viewer/services.ts`). Since README F17 (group
-  13) `rooms/connectViewer.ts` declares its signal as `Pick<SignalClient, 'on' | 'notify'>` (it was `Pick<SignalClient,
-  'on'>` before, with the full `SignalClient` passed), so the app's only caller always has `notify`. `ViewerSignal`
-  itself still makes `notify` optional, and `canSend` with its debug branch is dead for the app: README S93 (group 14,
-  which owns `viewer/`) has the carry-over to make it `Pick<SignalClient, 'on' | 'notify'>` and drop both (review
-  F17-R3).
+- **The signal.** `attachViewer` takes a `ViewerSignal`, `Pick<SignalClient, 'on' | 'notify'>`: `on` brings
+  `subscribe.status`, `notify` sends the codec wait's `caps.update`, and every signal runs the codec wait. Since
+  README F17 (group 13) `rooms/connectViewer.ts` declares its signal the same way, and README S93 (group 14) made
+  `ViewerSignal` require `notify` and dropped `canSend` with its debug branch for a signal without it, which the app
+  never had (review F17-R3).
 - The debug handle's `state()` has the notice (`viewer.codecWait`) and each share's `codec` (§10.7).
 
 ### 10.7 Stats collection (for "Copy diagnostics", M5)
@@ -1082,7 +1082,7 @@ background (about a minute), and that Firefox decodes only Constrained Baseline 
 - Keeps a ring buffer of 150 samples (5 minutes).
 - Consumers in M1:
   - the `stats` notification every 10 s, in 01's `ClientStats` shape (`pcs`, `inbound`, `outbound`, §8.11), mapped
-    as below;
+    as below (`intervalMs`: the time since the sample of the report before);
   - tile freeze detection (§12.6) and the sharer hints (§13.7);
   - the debug overlay (`Shift+D` or `?debug=1`), which also turns on 01's `stats.watch` for the server's view;
   - e2e assertions.
@@ -1103,25 +1103,76 @@ socket with a code that keeps the server's grace, so the server treats it as a n
 when `sessionStorage['isshoni.debug'] === '1'`, which e2e sets with `addInitScript`. It exposes nothing the user
 can't see in the debug overlay.
 
-As wired so far (`rooms/connectStats.ts`, group 5 integration): the collector starts with the first `room.state` of a
-room and stops when the session has no room anymore, which also drops its samples. Its only source is the sub PC
-(`viewer/stats.ts`); the pub PC's source, the `stats` notification and the overlay come with W13. `dropSocket()`
-calls 01's `SignalClient.dropSocket()` (README F12; `rooms/runtime.ts` passes the tab's client to
-`connectStats.ts`): the socket closes with `DropSocketCloseCode` 3000 and the client resumes with the same
-connection id (01 §16). Without a client (a test of the stats alone) the handle's `dropSocket()` throws.
-`reconnect.spec` doesn't use it: it drops the socket with the harness's `link`, which ends the socket's TCP
-connection the way a network does (§19.3). `stats()` resolves with a fresh `StatsSample` (`pcs`,
-`shares[shareId].video|audio`, `outbound`), and `state()` returns ids and states, no names:
-`{connection: {state, resumed, connectionId}, room: {roomId, joinState, rev, participants}, viewer}`, where `viewer`
-is `viewerDebugState` (`focusedShareId`, `audibleShareId`, `audio`, `audioPlaying`, `media`, `subGen`, `shares[]`;
-since README S86 also `codecWait`, the codec wait's notice of §10.6 or `null`, and each share's `codec`, the H.264
-profile `room.state` gives it, or `null` before the server knows it). `web/e2e/stats.ts`'s `DebugState` declares
-`viewer.codecWait` (the notice, or `null`) and `DebugShare` declares `codec` (a `CodecKey`, or `null`) since README
-F17 (group 13), and `hint.spec` reads them as typed fields (it used `Reflect.get` before).
+As wired (`rooms/connectStats.ts`, group 5 integration; README S93 and the group 14 integration): the collector starts
+with the first `room.state` of a room and stops when the session has no room anymore, which also drops its samples.
+Its sources are the sub PC (`viewer/stats.ts`, `viewerStatsSources`) and, while the page shares, the pub PC
+(`share/stats.ts`, `shareStatsSources`: `sources: () => [...viewerStatsSources(viewer), ...shareStatsSources()]`,
+asked at every sample). `dropSocket()` calls 01's `SignalClient.dropSocket()` (README F12; `rooms/runtime.ts` passes
+the tab's client to `connectStats.ts`): the socket closes with `DropSocketCloseCode` 3000 and the client resumes with
+the same connection id (01 §16). Without a client (a test of the stats alone) the handle's `dropSocket()` throws.
+`reconnect.spec` doesn't use it: it drops the socket with the harness's `link`, which ends the socket's TCP connection
+the way a network does (§19.3). `stats()` resolves with a fresh `StatsSample` (`pcs`, `shares[shareId].video|audio`,
+`outbound`), and `state()` returns ids and states, no names: `{connection: {state, resumed, connectionId}, room:
+{roomId, joinState, rev, participants}, viewer}`, where `viewer` is `viewerDebugState` (`focusedShareId`,
+`audibleShareId`, `audio`, `audioPlaying`, `media`, `subGen`, `shares[]`; since README S86 also `codecWait`, the codec
+wait's notice of §10.6 or `null`, and each share's `codec`, the H.264 profile `room.state` gives it, or `null` before
+the server knows it). `web/e2e/stats.ts`'s `DebugState` declares `viewer.codecWait` (the notice, or `null`) and
+`DebugShare` declares `codec` (a `CodecKey`, or `null`) since README F17 (group 13), and `hint.spec` reads them as
+typed fields (it used `Reflect.get` before).
 
-Since the group 6 integration the tiles' freeze watch (§12.6, `viewer/freeze.ts`) reads the same collector:
-`connectStats` calls `attachFreezeWatch(viewer, collector)` when the collector exists and ends it with the runtime.
-It comes with the media chunk (`rooms/media.ts`), like the collector.
+**What reads the samples, as README S93 built it** (`viewer/statsLink.ts`, `debugStats.ts`, `DebugOverlay.tsx`,
+`debugText.ts`, `share/stats.ts`; the group 14 integration wired it into `rooms/connectStats.ts` and
+`rooms/media.ts`, review S93-R2):
+- **`attachViewerStats({ viewer, collector, signal, log })`** (`statsLink.ts`) is the one consumer of the
+  collector besides the handle. `connectStats` runs it when the collector exists, with the tab's `SignalClient`
+  (its `signal` is `Pick<SignalClient, 'dropSocket'> & StatsLinkSignal`, where `StatsLinkSignal` is
+  `Pick<SignalClient, 'state' | 'on' | 'onState' | 'notify' | 'request'>`; `rooms/runtime.ts` passes the full
+  client), and stops it with the runtime. It comes with the media chunk (`rooms/media.ts` exports it in the place
+  of `attachFreezeWatch`), like the collector. It runs three things:
+  - the tiles' **freeze watch** (§12.6, `viewer/freeze.ts`), on the same samples as before (since the group 6
+    integration `connectStats` had called `attachFreezeWatch` itself);
+  - the **`stats` notification** (01 §8.11): every 10 s (`STATS_REPORT_INTERVAL_MS`) the newest sample goes out as
+    `toClientStats(sample, intervalMs)`, while the sample lists a PC and signaling is `ready`. A sample goes out
+    once: a stopped collector (no room) or a socket that is down sends nothing, and after a `notify` that signaling
+    refuses the next tick sends the newest sample. `intervalMs` is the time since the sample of the report before
+    (the first report says 10 000). The hub keeps the last report for the admin's live view and turns the growth of
+    its inbound counters into the `isshoni_client_*` metrics (01 §18), which the exit test reads (06 §12.3);
+  - the **debug overlay's feed**: while `viewer.debug.open`, the collector samples every second (`setFast`), each
+    sample goes to `viewer.debug.sample`, and `stats.watch {on: true}` asks the server for its view of this
+    connection, whose `stats` messages go to `viewer.debug.server`. Closing the overlay sends `stats.watch {on:
+    false}` and forgets both. A connection that was not resumed has no watch, so it is asked again while the overlay
+    is open, also when the overlay opened while the socket was down; a resumed one keeps it (01 §8.11). A refused
+    `stats.watch` is a debug line and is asked again on the next connection.
+- **`viewer.debug`** (`debugStats.ts`, `createDebugStats()`, a vanilla Zustand store in `ViewerServices`): `open`,
+  `sample` and `server`; the overlay sets `open`, `attachViewerStats` fills the other two, and closing forgets them.
+- **The overlay, "Stats for nerds"** (`DebugOverlay`, which renders `DebugPanel`; `ViewerLayout` mounts it inside
+  the layout, so it shows over a fullscreen stage too, and only inside the app's providers). It shows while
+  `prefsStore.debug` is on (`Shift+D` switches it, §12.7; the device keeps it) or while the page's URL has
+  `?debug=1` (`debugInUrl`, `DEBUG_PARAM`), which shows it **on that page only** and leaves `prefsStore.debug` as it
+  was, so a shared link with the parameter doesn't leave the overlay, its 1 s sampling and the server's
+  `stats.watch` on for every later visit from the device (review S93-R4). `Shift+D` while it shows, or its close
+  button, hides it and ends the URL's part too. It is an `<aside>` named by its heading ("Stats for nerds",
+  `data-debug-overlay`) with a close button ("Close the stats"), "Waiting for the first stats…" before the first
+  sample, then:
+  - **Connections**: each PC of the sample (`sub PC 2`, `pub PC 1`: state, the selected pair's candidate type and
+    transport, RTT, outgoing bitrate) and the server's downlink estimate of this connection;
+  - **one section per tile** (`data-debug-share`), the stage first, this page's own preview left out: Video (size,
+    fps, rate, codec), Decoder (its name, hardware or software, where the browser says), Frames (decoded, dropped,
+    key frames, freezes), Network (lost, jitter buffer, PLI, NACK), Audio (rate, level, concealed, lost, codec), and
+    Server video and Server audio, what the server forwards of it (`ServerStats.subs`: layer, rate, loss, dropped);
+    "Nothing received for this tile yet." before any of it;
+  - **Sending**: each layer and track this page sends (`OutboundSample`: size, fps, rate, what limits it, the
+    encoder) and what the server receives of each (`ServerStats.layers`: rate, loss).
+
+  The texts are `viewer.debug.*` in `en.json`, the numbers formatted for `i18n.language` (`debugText.ts`). **No IP
+  address**: a sample keeps only the selected pair's candidate type and transport (`lib/stats/summarize.ts`), and
+  `ServerStats` has none (01 §8.11).
+- **The pub PC as a source** (`share/stats.ts`): `PublisherPC.statsSource()` is the PC while there is one (`pc:
+  'pub'`, its `gen` and state; a PC that was replaced reports nothing), and a sent stream belongs to the share whose
+  transceiver has its mid, or whose capture track has its id. `PublisherPC` lists itself in the module's set
+  (`addShareStatsPublisher`) when it makes a PC and leaves it when the PC goes; the set is module-level because the
+  publisher comes with its own lazy chunk and the room's chunk imports only `share/stats.ts`. The sharer's upload
+  and CPU hints keep their own sampling (§13.7).
 
 ---
 
@@ -1295,7 +1346,8 @@ Other rules:
 - People panel (drawer): each participant with a "sharing" badge and an admin badge. Clicking a sharing person focuses
   their share. OS and version of others are not shown (01 §8.5 privacy).
 - Members with `me.permissions.createInvites` and admins get "Invite friends" in the account menu, which creates an
-  invite and shows the `InviteLinkCard` (§14.1); nobody gets it while registration is closed. Under the same
+  invite and shows the `InviteLinkCard` (§14.1), whose text says where the user finds the invite again in their own
+  menu; nobody gets it while registration is closed. Under the same
   `createInvites` condition, members also get "My invites", a link to `/admin/invites` (§5, `RequireInviter`), also
   while registration is closed.
 - Empty state: "Nobody is sharing yet." plus [Share your screen] (if `canShare`) or "Sharing from phones isn't
@@ -1330,16 +1382,28 @@ the stats into it, §5 and §10.7). Where it differs from the list above, or set
     to `/admin/invites`, where they see and revoke their own invites (`RequireInviter`, §5). Admins get there through
     Admin → Invites. Without it, members would have lost their only menu way to that page when "Invite friends"
     became a dialog.
-  - **The texts**: `room.menu.invite`, `room.menu.myInvites` and `room.invite.{title,lead,creating,failed,retry,done}`
-    in `en.json` (the rooms folder's own namespace); the card's texts stay in the lazy `setup` namespace, which
-    `rooms/index.ts` imports (`import '../i18n/lazy/setup'`; check:i18n says so when it is missing, §16.5), so that
-    namespace is in the room's chunk and `check:size` passes with it. The card's "once" text says "under Admin →
-    Invites", which a member's menu calls "My invites": README F19 (group 14) gives `InviteLinkCard` an optional key
-    for that text, which the dialog passes for members (review F17-R2).
+  - **The card names the user's own way to their invites, as README F19 built it** (review F17-R2). The card's
+    "once" text (`setup.inviteCard.once`) says "under Admin → Invites", right for an admin, but a member's menu has
+    no Admin entry and calls the page "My invites". `InviteDialog` takes the menu's `me` as a required prop
+    (`InviteDialogProps.me`; `AccountMenu` passes the one it has, so the dialog makes no `['me']` query of its own)
+    and gives the card `onceKey="room.invite.once"` when `isAdmin(me)` is false: "Copy it now: for safety it can't be
+    shown again. You'll find the invite under <a>My invites</a> in your account menu, where you can always make a new
+    one." An admin's dialog passes nothing, so the card keeps its own text, as in the wizard (§14.1). In both the
+    `<a>` is the link to `/admin/invites`.
+  - **The texts**: `room.menu.invite`, `room.menu.myInvites` and
+    `room.invite.{title,lead,creating,failed,retry,done,once}` in `en.json` (the rooms folder's own namespace;
+    `once` is README F19's); the card's texts stay in the lazy `setup` namespace, which `rooms/index.ts` imports
+    (`import '../i18n/lazy/setup'`; check:i18n says so when it is missing, §16.5), so that namespace is in the
+    room's chunk and `check:size` passes with it. `room.invite.once` reaches the card as a prop, not as a literal
+    `t('…')` or `i18nKey="…"`, so check:i18n's rule 1 doesn't check that it exists (the tests below assert the
+    member's full text instead); rule 4 counts the string literal in `InviteDialog.tsx` as a use, so it gives no
+    unused-key warning (§16.5).
   - Tests: `rooms/InviteDialog.test.tsx` (nothing created while closed, one invite per opening with the server's
-    defaults, the link once in the card with the focus, "Try again" after `limit_reached` and a server failure, none
-    after a refusal, a new invite on the next opening, the invites list marked stale, the link kept out of the REST
-    cache, one invite under StrictMode), and `RoomHeader.test.tsx` for the entries.
+    defaults, the link once in the card with the focus, the "once" text a member and an admin get, each with its one
+    link to `/admin/invites`, "Try again" after `limit_reached` and a server failure, none after a refusal, a new
+    invite on the next opening, the invites list marked stale, the link kept out of the REST cache, one invite under
+    StrictMode), and `RoomHeader.test.tsx` for the entries (the member's dialog opened from the menu links "My
+    invites").
 - **The account menu's entries**, in order: Account (`/account`), Notifications (`/account/notifications`),
   Invite friends (as above), My invites (members only, as above), Admin (`/admin`, admins only: other users would
   get NotFound), Install app (only while the browser offers an install prompt, §16.3; read when the menu opens),
@@ -1513,7 +1577,7 @@ with a list that re-snaps the way a browser does.
 - `autoFocus.test.ts` holds the rules and the settle step, the two cases of the review included: a speaker-button
   choice that survives its share's audio going away and coming back, and a re-published share whose first live has
   no audio yet, which gets the sound when its audio comes.
-- **Open, for the owner** (README §6 "Decided after group 9"; still open after groups 10, 11, 12 and 13): when the
+- **Open, for the owner** (README §6 "Decided after group 9"; still open after groups 10, 11, 12, 13 and 14): when the
   focused share has no sound, nothing from the stage is heard. The alternative is to keep the previous share's sound
   playing until a share with sound is focused. Until the owner answers, the rule above stands and the code stays as
   README S72 built it (§24).
@@ -1650,9 +1714,9 @@ pseudo-fullscreen and the keyboard, and nothing else.
     `document.pictureInPictureEnabled` and not iOS (§8; an iPad that calls itself a Mac counts as iOS). That is
     the desktop browsers, and it is also **Android Chrome**, which reports PiP too, where the rule above says
     "desktop only". Whether Android keeps the button is an **open question for the owner** (asked after group 6,
-    still open after groups 7, 8, 9, 10, 11, 12 and 13): the rule above stands as written, the code stays as built until
-    the answer, and the manual matrix row M-AND-1 (§19.4) is where it shows. iOS is not part of the question: no
-    PiP there in M1.
+    still open after groups 7, 8, 9, 10, 11, 12, 13 and 14): the rule above stands as written, the code stays as
+    built until the answer, and the manual matrix row M-AND-1 (§19.4) is where it shows. iOS is not part of the
+    question: no PiP there in M1.
 - **Wake lock.** `platform.requestWakeLock()` is the browser's side (§8) and answers `null` where the API is
   missing or refuses (battery saver, iOS Low Power Mode); the viewer asks for it only where
   `capabilities.wakeLock` is true, and only decides when to hold one: while the page is visible and a share that
@@ -1727,8 +1791,9 @@ handlers and listens on the document while it is mounted; `ShortcutsDialog.tsx`)
     `<dialog>` closes itself.
   - `?` opens the shortcuts dialog, and so does the keyboard button on the stage (§12.5). The dialog lists the
     rows of the table.
-  - `Shift+D` switches `prefsStore.debug`. The overlay that reads it comes with W13 (README S93); outside the
-    app's providers there is no such preference, and the dialog leaves the row out.
+  - `Shift+D` switches the debug overlay (README S93, §10.7): it sets `prefsStore.debug` to the opposite of what is
+    on screen, so it also hides an overlay that only `?debug=1` showed, and ends the URL's part. Outside the app's
+    providers there is no such preference: the overlay isn't there, and the dialog leaves the row out.
 - **A key that did nothing goes on to the browser.** A handled key is `preventDefault`ed (no page scroll for an
   arrow key); an action that found nothing to do (no such share, not in fullscreen) is not.
 - **Rules that keep the shortcuts out of the way:**
@@ -2289,7 +2354,13 @@ where the list above leaves a choice:
 - **The card's second user** is the account menu's "Invite friends" dialog of README F17 (`rooms/InviteDialog.tsx`,
   §11.2; its tests are `rooms/InviteDialog.test.tsx`), which renders the card with the invite it created, as step 3
   does. Its "once" text names "Admin → Invites", which is right for an admin; a member's way to their invites is "My
-  invites", so README F19 (group 14) gives the card an optional key for that text, which the wizard leaves out.
+  invites". **As README F19 built it**, `InviteLinkCardProps.onceKey` (optional) is the message key of that text, a
+  `<Trans>` message whose `<a>…</a>` becomes the link to `/admin/invites`; without it the card says
+  `setup.inviteCard.once` ("Copy it now: for safety it can't be shown again. You can always make a new one under
+  <a>Admin → Invites</a>."), which the card writes as a literal `i18nKey` so that check:i18n sees it. The wizard
+  and an admin's dialog leave it out; a member's dialog passes `room.invite.once` (§11.2). check:i18n doesn't check
+  a key given as the prop, so its caller's test asserts the card's text. Tests: `setup/InviteLinkCard.test.tsx`
+  (the default text with its link, and the caller's text with the link still to `/admin/invites`).
 - **"Done, go to the Lounge"** sets `setupWizardDone` and opens `/r/lounge` (`AFTER_WIZARD_PATH`), the default
   room, whose id is fixed (03's owner decision 2: `lounge`, never deleted). Not `/`, whose root redirect opens the
   last room the admin was in: an admin who came back to the wizard from another room landed there (S87's review).
@@ -3070,6 +3141,32 @@ and, on Android, in the room's one-time card. iOS: the Home Screen sheet above, 
   key; W10 adds the `CloudProvider`/`NATKind` rule and its `fix.firewall.*` and `conntest.nat.*` texts; W00 adds the
   lazy files and the two lazy-namespace rules; W13 adds the unused-key warnings and a test that a removed key fails
   the check.
+
+  **The unused-key warnings as README S93 built them** (rule 4 of `scripts/check-i18n.mjs`, `unusedMessages`). A
+  message of the catalog that no code asks for is reported as `<file>:<line>:<column>: warning: …` at its place in
+  the catalog file that holds it, followed by a count line; warnings and their count go to **stderr** and never
+  change the exit code (the summary line on stdout stays as it was, since `conntest/checkI18nFixTexts.node.test.ts`
+  matches its end). Code under `src/` asks for a message, tests and generated files aside (a message only tests use
+  is unused):
+  - by a literal key, as rule 1 reads them, or by the base of a plural form (`viewer.watching` for
+    `viewer.watching_one`);
+  - by a string that is the key, anywhere in the code (`{ label: 'room.menu.leave' }` then `t(item.label)`; README
+    F19's `room.invite.once`, which reaches `InviteLinkCard` as a prop, §11.2);
+  - by a key built at run time, through its written part: the head of a template literal
+    (`` t(`doctor.part.firewall.${p}`) ``) or a string that ends in a dot (`'viewer.title.' + kind`) covers every key
+    it begins. A template head needs a namespace and a dot; a string needs a part below the namespace as well, because
+    a lone `'room.'` is more often something else (the audit page's action groups, `admin/AuditPage.tsx`) and would
+    cover the whole namespace (review S93-R3). A template head that is a namespace alone (`` `doctor.${check.code}`
+    ``, `` `errors.${code}` ``, `` `fieldErrors.${field}.${code}` ``) does cover all of it, and the run says in a note
+    on stdout that rule 4 can't find unused messages there;
+  - by rules 2 and 3: every `errors.<code>`, `fix.firewall.<provider>` and `conntest.nat.<nat>` they require;
+  - as a namespace that code outside the `t()` calls reads whole (`READ_WHOLE = ['push']`: the service worker's
+    texts, §16.2), or through `$t(…)` nesting in another message.
+
+  The warnings never fail the check: a key may wait for a later slice's code, and keys built at run time are
+  followed only as far as their written part. The group 14 integration's run warned about two keys, `common.tagline`
+  and `common.loading` (S09's scaffold), which the `common` namespace's owner may remove. Tests:
+  `app/checkI18nUnused.node.test.ts` (§19.1).
 - The catalog is the single source for Go-rendered strings later (plan): *later (M2)* the tray embeds it. 04's doctor
   CLI keeps its own English templates of the same codes (04 §13.2).
 
@@ -3080,6 +3177,23 @@ and, on Android, in the room's one-time card. iOS: the Home Screen sheet above, 
   watching: alex's window">` with a `role="toolbar"` control bar.
 - Two live regions in `Announcer`: polite (`room.event`s such as "alex started sharing", "Now listening to bo",
   "Reconnected", "3 watching"), assertive (errors, "You're live", "Sharing stopped").
+
+  **As README S93 built the announcements** where the list left them to W13:
+  - "Now listening to bo" (`viewer.announce.listening`; "Now listening to your share",
+    `viewer.announce.listeningOwn`, for this user's share from another device) comes from
+    `attachListeningAnnouncer` (`viewer/listening.ts`), which `ViewerLayout` runs with the app's UI store, politely,
+    when the sound (`viewerStore.audibleShareId`) moves to a share that was already there: a pick, a speaker button,
+    the stage's "Listen here", the end of the share that was heard. The sound of a new share gets no words of its
+    own: its `room.event` ("bo started sharing") is announced at the same moment and a second message would replace
+    it in the region; that covers a published-again share too, which takes the sound of the one it replaces under a
+    new id (01 §10.6).
+  - "You're live" and "Sharing stopped" (`share.announce.live`, `share.announce.stopped`) come from `linkShareUi`
+    (`share/shareUi.ts`), assertively: the first when a share goes from `starting` to `live` (not when it is live
+    again after a reconnect), the second when a share that went live ends without a word of its own. A notice is a
+    toast, which is announced anyway, and a failed share's panel says why with `role="alert"`.
+  - `a11y.spec` runs axe's WCAG A and AA rules, contrast among them, in the light and the dark scheme (§19.3); what
+    axe can't judge (a screen reader's reading order, the timing of the live regions) is the manual matrix's and
+    the component tests'.
 - After a route change, focus moves to the page `<h1>`. Dialogs are native `<dialog>` with `showModal()` (focus trap
   and Esc for free).
 - `prefers-reduced-motion`: no layout transitions, toasts appear without sliding, spinners become a static indicator.
@@ -3210,10 +3324,11 @@ export default defineConfig({
 | `viewer/keyboard.ts`, and `shortcuts.test.tsx` (through the layout; README S56) | every row of §12.7 and its row in the dialog; the rules (modifiers, IME, a held key, letters without Shift, digits and `?` as characters, the key's position on a non-Latin layout, a `keydown` without a `key`); `isTextField`, `shortcutAllowed` (text fields, dialogs, popovers, controls that use the arrows, the "Shares" sheet); `moveIndex`, `moveTileFocus`; the roving tab stop, and the focus that follows a pick to the tile of the share that left the stage; `M` as the tap that starts the sound |
 | `viewer/focusParam.ts`, `FocusFromUrl.tsx` (README S56) | a live share is picked at once; one that isn't live yet is waited for; the 5 s start with the room's first snapshot, also for a room with no share, and the next room gets the whole 5 s; a pick by the user or a newer request ends the wait; the parameter is dropped with a replace, picked or not, and the URL's other parameters stay; an empty one is dropped at once; a link that arrives while the page is open is followed; nothing is read outside a router |
 | `viewer/freeze.ts`, `mediaSession.ts`, `IosHint.tsx` (README S56) | frozen after 3 s without a decoded frame (two samples at the collector's pace), thawed by the first new frame, never for a share the sample doesn't measure, and only the shares of §12.6; the media session names the audible share and the room, follows the sound and clears; the iOS hint shows on iOS while a share is watched, goes for good with "Got it", and waits behind fullscreen and the media banner |
+| `viewer/statsLink.ts` (README S93, §10.7) | `attachViewerStats`: the newest sample goes out as `stats` every 10 s in the `ClientStats` shape, each sample once, with `intervalMs` since the report before; nothing without a PC or a sample or while signaling is down; it stops with the function it returns; while the overlay is open the collector samples fast, the samples and the server's `stats` go to `viewer.debug`, and `stats.watch` is on; a new connection is asked again, a resumed one not, one that was down when the overlay opened once it is ready; a refused `stats.watch` is logged and asked again on the next connection; an overlay already open is followed from the start, and stopping turns everything off; the freeze watch runs on the same samples |
 | `viewer/autoFocus.ts` | newest share auto-focused; manual holds; resumes after the manual share ends; `replaces` carries focus and audio only for the same user; `?focus=`; own share never focused |
-| `viewer/codecWait.ts`, with the codec wait's texts in `CodecBanner.tsx`, `Tile`, `Stage`, `ViewerLayout` and `shareView` tests (README S86, §10.6) | `codecNotice` maps the wait to what the page says; nothing while no subscription has the reason `codec`; the capabilities read at once when a wait begins and then every 5 s; one `caps.update` when H.264 arrives, the decoders compared as sets and only the H.264 ones, at most one per 5 s, and again at the next poll when signaling wasn't ready; after 3 minutes the reload text, Firefox's with its plugin help and the plain one for another browser; "can't play" for a browser other than Firefox without any H.264; a gap under 30 s keeps the 3 minutes and a longer one starts them again; capabilities that throw; the detach; against a fake server, a fresh Firefox sends only `caps.update`, never `pc.restart`, through the server's own rebuilds; `attachViewer` runs no wait for a signal without `notify` and logs it once at debug. The tile, stage and layout tests pin the exact texts, none of which promises sound |
+| `viewer/codecWait.ts`, with the codec wait's texts in `CodecBanner.tsx`, `Tile`, `Stage`, `ViewerLayout` and `shareView` tests (README S86, §10.6) | `codecNotice` maps the wait to what the page says; nothing while no subscription has the reason `codec`; the capabilities read at once when a wait begins and then every 5 s; one `caps.update` when H.264 arrives, the decoders compared as sets and only the H.264 ones, at most one per 5 s, and again at the next poll when signaling wasn't ready; after 3 minutes the reload text, Firefox's with its plugin help and the plain one for another browser; "can't play" for a browser other than Firefox without any H.264; a gap under 30 s keeps the 3 minutes and a longer one starts them again; capabilities that throw; the detach; against a fake server, a fresh Firefox sends only `caps.update`, never `pc.restart`, through the server's own rebuilds; `attachViewer` runs the wait through the signal it is given and stops it with its status listener (since README S93, which made `notify` required; before, it ran no wait for a signal without `notify`). The tile, stage and layout tests pin the exact texts, none of which promises sound |
 | `viewer/audioOut.ts` (fake media element) | locked → blocked on `NotAllowedError` → playing after tap; swap keeps playing |
-| `viewer/SubscriberPC.ts`, `share/PublisherPC.ts` (fake RTCPeerConnection) | `gen`/`neg` rules of §9: stale gen dropped, repeated neg resends the stored answer, one outstanding offer with folding, candidate buffering (64), `probe()` on `disconnected`, recovery timers (3 s, 15 s, spacing 5 s/10 s, 5 rebuilds → UI state), no sub `pc.restart` after a resumed welcome; a sub offer with a new `ice-ufrag` cancels the 3 s timer (no `pc.restart {mode:'ice'}` follows) and starts the 15 s rebuild timer from that offer, also when the client had already sent its own request |
+| `viewer/SubscriberPC.ts`, `share/PublisherPC.ts` (fake RTCPeerConnection) | `gen`/`neg` rules of §9: stale gen dropped, repeated neg resends the stored answer, one outstanding offer with folding, candidate buffering (64), `probe()` on `disconnected`, recovery timers (3 s, 15 s, spacing 5 s/10 s, 5 rebuilds → UI state), no sub `pc.restart` after a resumed welcome; a sub offer with a new `ice-ufrag` cancels the 3 s timer (no `pc.restart {mode:'ice'}` follows) and starts the 15 s rebuild timer from that offer, also when the client had already sent its own request; `PublisherPC` as a source of the stats collector (README S93, §10.7): listed in `shareStatsSources` while it has a PC, with its gen, state and report, the next gen after a rebuild, off the list once closed, and an old source reports nothing |
 | `rooms/RoomSession.ts` (fake SignalClient) | resync after resumed and not-resumed welcomes (01 §10.5): pending offer re-sent, full `subscribe.update` only when non-empty and in chunks of 64, re-publish with `replaces`, stray server share stopped; `join()` before `ready` joins on the next resync; a resumed welcome with a missing or other `roomId` re-joins the desired room; own `share.stopped` (each reason) and the `room.state` fallback drive §13.1 |
 | `protocol/invalidate.ts` | each topic → its query keys |
 | `protocol/rest.ts` | both error envelopes parse to the same `ApiError`; `Content-Type` always set on unsafe methods |
@@ -3227,6 +3342,8 @@ export default defineConfig({
 | `platform/browser/displayMedia.ts`, the lazy publisher (`platform/browser/displayMedia.test.ts`; README W00, §5) | making the provider loads nothing; `pick()` opens the picker first, in the same turn, then asks for the publisher and doesn't wait for it; `start()` hands over to the publisher the pick loaded (one for every share), waits for one that is still loading, and loads it itself when no pick did; when the chunk can't be loaded the pick still resolves, `start()` rejects with `offline`, and the next start loads again |
 | the lazy namespaces (`i18n/lazy.test.ts`, `app/lazyNamespaces.test.tsx`, `i18n/check-i18n-lazy.node.test.ts`; README W00, §16.5) | the catalog starts with the main bundle's namespaces only and gets a lazy one when its page folder's chunk runs; a lazy route never shows a bare key; in test mode every namespace is there from the start; `check:i18n` reads the main file and the lazy files as one catalog, names the file a missing key belongs in, and fails when a folder uses a lazy namespace that its entry module doesn't load, when the main bundle uses one, and when a lazy namespace is in the main file too |
 | i18n | every generated error code maps to an existing `en.json` key (also enforced by `check:i18n`) |
+| `check:i18n`'s unused-key warnings (`app/checkI18nUnused.node.test.ts`; README S93, §16.5) | `unusedMessages` counts literal keys and plural bases, a key written out anywhere, a key built at run time as far as it is written (a string head only below a namespace), what rules 2 and 3 require, the namespaces read whole and `$t()` nesting, and names the namespaces a template head covers whole; `messagePositions` gives each message's line and column; the script warns about each unused message at its place and passes, notes the namespaces it can't check, and fails when a message the code asks for is gone; on this package it passes, and a copy of `en.json` without a used message fails while one with a message no code uses warns |
+| `viewer/listening.ts`, `share/shareUi.ts` (README S93, §16.6) | "Now listening to …" when the sound moves to a share that was there, not for a new share, "your share" for this user's share from another device, nothing once detached; "You're live" and "Sharing stopped" in the assertive region |
 | `admin/doctorText.ts` and `doctorCatalog.node.test.ts` (README S91, §15.3; `dashboardText.ts` is tested through `DashboardPage.test.tsx`, §19.2) | doctor's golden report renders from the catalog with no key or placeholder left and reads like the CLI's text; the variant the params pick (contexts, plurals), owners named as the CLI names them, every provider's firewall text, the server's English for an unknown code or fix code; fixes with the environment's commands, quoted paths, both owner cases, the server's own certificate sentence, a certificate code's fix without a report and without a command that depends on how the server runs; the links of a check; the catalog against the CLI's codes both ways and a name for every check id |
 
 01 owns the `SignalClient`, `codecs.ts` and registry tests (01 §19).
@@ -3241,11 +3358,17 @@ invites show the link once; locked settings are read-only; with an Instagram UA 
 banner and its Copy link includes `#<token>` (S48, which also tests it on the login page and its dismissal), and in
 the room (iOS UA) the banner shows and the Home Screen sheet stays hidden until the banner is dismissed (S77); the
 room's "Invite friends" dialog creates one invite per opening and shows it in the invite card, with Try again only
-where a retry can help (`rooms/InviteDialog.test.tsx`, README F17, §11.2); the admin Dashboard and Doctor pages
+where a retry can help (`rooms/InviteDialog.test.tsx`, README F17, §11.2), and the card says "My invites" to a
+member and "Admin → Invites" to an admin, each a link to `/admin/invites` (README F19; `setup/InviteLinkCard.test.tsx`
+for the card's default and given texts, §14.1); the admin Dashboard and Doctor pages
 (`admin/DashboardPage.test.tsx`, which also covers `dashboardText.ts`, and `admin/DoctorPage.test.tsx`, README S91,
 §15.3: the snapshot's parts, the alerts, the certificate's last error, failed sources shown as not available, the
 polling while visible; no report yet, a run, a busy server, the checks with their fixes and links, the bandwidth
-calculator).
+calculator); the debug overlay (`viewer/DebugOverlay.test.tsx`, README S93, §10.7: it says it is open while
+mounted; the PCs, each tile with what the server forwards of it, the stage first, and what the page sends; never an
+IP address, though the browser's report has them; the texts for a tile with nothing yet and a page without a PC;
+in the layout `Shift+D` and the close button, `?debug=1` on this page only with the preference left off, and no
+overlay outside the app).
 
 **Web Push, as README S77 tested it** (`account/RoomPush.test.tsx`, `NotificationsPage.test.tsx`,
 `pushState.test.ts`, and the provider's own tests in `account/browserPush.test.ts`, the folder of the slice that
@@ -3506,14 +3629,14 @@ Stats are read through `window.__isshoni.stats()` (§10.7).
 | `layers.spec` | thumbnail `frameHeight ≤ 360`; a tile scrolled out of view stops receiving video bytes within 3 s; fullscreen turns thumbnails off. As README S72 built it (fake display, a server per test): a tile scrolled into view receives video again; a tile whose video stops says "Waiting for video…" and plays again when it comes back (§12.6) |
 | `unmute.spec` | without the autoplay flag, "Tap to unmute" appears; after a click, the audio element plays and `audioLevel > 0.05`. As README S72 built it (fake display, Chrome's default autoplay policy stated, a CDP reader and a trace without DOM snapshots: above): a later change of what is heard needs no tap; the M key and the header's pill are the tap too |
 | `reconnect.spec` | (a) `__isshoni.dropSocket()`: resumed with the same `connectionId`, `framesDecoded` keeps rising, no new sub offer; (b) `context.setOffline(true)` for 5 s: the banner appears after 2 s, then clears; (c) own server, `restart()` (same data dir and ports): the viewer decodes the re-published share within 15 s, focused, with audio. As README S81 built it (fake display, a server per test, the `link` fixture, above): (a) cuts the viewer's link and restores it at once, which ends the socket's TCP connection without a close frame (the way a network drops it; `dropSocket()`, §10.7, closes with a frame): resumed with the same `connectionId`, the same sub `gen`, the video still decoding and no sub offer from the server's `Resync()`; (b) cuts the link for 5 s: "Reconnecting…" shows 2 s after the cut and not before, goes once the page is back, and the connection is resumed; (c) also checks that the friend's pick is kept (`focusMode` manual) and that the sharer was never asked to pick again; (d) the server ends a share while its sharer's link is cut (another tab of the same person stops it), the link comes back within the grace: the sharer publishes it again with `replaces` on a new pub PC of the next `gen`, whose first offer the SFU answers with nothing failing, and the friend decodes the new share |
-| `hint.spec` (README S86; a server per test; 01 §8.10, §11.7, 02 §8.3, §8.5) | (1) A share goes out in High while everybody decodes it; a friend whose `RTCRtpReceiver.getCapabilities('video')` an init script cuts to Constrained Baseline joins: the room's policy drops to `cb`, the sharer gets `quality.hint {reason: codec, codec: h264/42e0}`, re-offers in the same `gen` with `neg + 1` and `42e0` first, `room.state` says the share is `h264/42e0`, and both viewers keep decoding with nothing sent for it. A Chrome that can't encode High starts in `42e0` (05 §13.4), and the test takes that branch with a note; only macOS headless Chrome, which encodes High, has run it so far, so CI's Linux Chrome may take the other. (2) A "fresh Firefox" (its user agent, and no H.264 in its capabilities until the test adds it) hears the share while its stage says the decoder is coming; nothing is sent while nothing changes; when H.264 appears the page sends one `caps.update`, never `pc.restart`, the server rebuilds its sub PC (a new `gen`) and the stage plays the video. The browser still decodes everything: the test is about what the pages and the server do, and the manual M-FF-1 (§19.4) is the real one. `stats.ts`'s `DebugState` doesn't declare `codecWait` and the per-share `codec` yet (§10.7), so the spec reads `codec` with `Reflect.get` until README F17 |
+| `hint.spec` (README S86; a server per test; 01 §8.10, §11.7, 02 §8.3, §8.5) | (1) A share goes out in High while everybody decodes it; a friend whose `RTCRtpReceiver.getCapabilities('video')` an init script cuts to Constrained Baseline joins: the room's policy drops to `cb`, the sharer gets `quality.hint {reason: codec, codec: h264/42e0}`, re-offers in the same `gen` with `neg + 1` and `42e0` first, `room.state` says the share is `h264/42e0`, and both viewers keep decoding with nothing sent for it. A Chrome that can't encode High starts in `42e0` (05 §13.4), and the test takes that branch with a note. CI's Linux Chrome is one (a software encoder only): since the PR #22 fix that came after group 13, the test asks whether the sharer encodes High before it checks `share.start`'s `ShareParams.codec`, which is `h264/` and that start profile (it had asserted `h264/6400`, which only macOS headless Chrome gives). (2) A "fresh Firefox" (its user agent, and no H.264 in its capabilities until the test adds it) hears the share while its stage says the decoder is coming; nothing is sent while nothing changes; when H.264 appears the page sends one `caps.update`, never `pc.restart`, the server rebuilds its sub PC (a new `gen`) and the stage plays the video. The browser still decodes everything: the test is about what the pages and the server do, and the manual M-FF-1 (§19.4) is the real one. Since README F17 `stats.ts`'s `DebugState` declares `codecWait` and the per-share `codec` (§10.7), and the spec reads them as typed fields (it used `Reflect.get` before) |
 | `warning.spec` | fake display `monitor+audio` shows the warning; "Share without sound" publishes without an audio track; "Pick something else" reopens the picker. As README S66 built it (a server per test): nothing is shared before the answer; "Share with sound anyway" publishes both tracks, and the friend gets both; what is picked behind "Pick something else" is shared (the tone tab through the real picker when headful, another fake display when headless) |
-| `a11y.spec` | axe (`wcag2a`, `wcag2aa`, `wcag21aa`) on login, invite, reset, setup, the room with a share, admin users: no serious or critical violations; the tile list is keyboard-reachable; `F` toggles fullscreen |
+| `a11y.spec` | axe (`wcag2a`, `wcag2aa`, `wcag21aa`) on login, invite, reset, setup, the room with a share, admin users: no serious or critical violations; the tile list is keyboard-reachable; `F` toggles fullscreen. As README S93 wrote it (with the overlay step of the group 14 integration): every page in the light and the dark colour scheme (§16.6: AA in both), each under reduced motion and after the page's computed colours stood still (Chrome applies a scheme switch to some elements a few frames late, and axe would read a mix of the two), and axe must have checked something; in the room, where a friend shares a window with sound and this page shares too, `Tab` reaches the tile list from the top of the page, `F` switches fullscreen and back, and the debug overlay (`Shift+D`, §10.7) shows the friend's tile as `Video` and `Server video`, both PCs under Connections, and Sending, with no IPv4 or IPv6 address in its text; axe runs on it as well, and its close button hides it |
 | `pwa.spec` | the manifest parses; the service worker activates; offline navigation shows the Offline screen from the cached shell. As README S77 wrote it: the manifest has what an install needs (Chrome's own parser reads it too); the worker activates, controls the page and precaches the shell; an offline navigation, and a navigation after the server has stopped (every byte from the worker's cache), both show the Offline screen; the notifications page against the real server (push on by default): the switch where Chrome can push, the preferences saved and there after a reload, and a block set through Chrome's DevTools protocol (`Browser.setPermission`, which Playwright lacks) showing the help instead of the switch. The spec turns service workers on for itself (`test.use({serviceWorkers: 'allow'})`), and each test that registers one has a server of its own, because the port makes the origin. Real pushes are the manual rows M-IOS-2 and M-AND-1 (§19.4) |
-| `version.spec` | `page.routeWebSocket` rewrites `serverVersion` in `welcome`: the page reloads once, then shows VersionMismatch; a routed `protocol_unsupported` error shows it at once |
+| `version.spec` | `page.routeWebSocket` rewrites `serverVersion` in `welcome`: the page reloads once before it joins the room; when the welcome after that reload is still of another version, the page runs on, joins and logs a warning (the handshake worked, §16.4), and a later welcome after a reconnect doesn't reload it again; while the page shares, the update pill says to reload after sharing and offers its Reload once the share is over, without a reload meanwhile. VersionMismatch comes through a routed `protocol_unsupported` error, at once: "Reload" for a newer server and, when the reload didn't help (`stillStale`), the screen stays with both versions; an older server asks for the admin, without a Reload. The stale-build tests skip against a dev build (01 §6.1; README S93); `task e2e` builds `0.0.0-e2e.local` (06 §7.2) |
 | `admin.spec` | own server (approval mode is server-wide): create and revoke an invite; approve a pending sign-up in approval mode; doctor page renders results. As README S91 wrote it, a server per test (the invite and doctor tests count what the server lists), with a fourth test beyond these three: the dashboard against a real server shows the live server and asks for a new snapshot every 2 s. On an e2e server the `public_ip` check is skipped with its own text (README F04) |
 | `decodable.spec` (README S89, 02 §17; 02's slice, not 05's) | `isshoni-loadtest -scenario smoke -decodable -publishers 1 -subscribers 0` (02 §15.2) publishes one share of the fake Decodable video with its Opus tone through a server of the test's own; a friend in Chrome sees it go live, puts it on the stage, and decodes it (`framesDecoded > 0` at the full layer's 640×360); the tool then exits 0 with a report that passes and has deleted the account it made. The tool's binary is `LOADTEST_BIN` (below) or a build of `./cmd/isshoni-loadtest` with the Go on the `PATH`, once per worker |
-| `tcp-only.spec` (04 S14, README S90) | own server with `{'listen.ice_udp': ''}` (no UDP media stands in for a network that blocks UDP): the viewer's focused tile has `framesDecoded` rising, and its selected candidate pair is TCP. As README S90 wrote it: in off mode that is `listen.ice_tcp` (no 443 multiplexer); the sharer's pub PC, which the debug stats don't list (§10.7), is checked in the server's log (04 §17): the SFU's `PeerConnection state` lines say both PCs connected over `tcp7882`, and none over UDP |
+| `tcp-only.spec` (04 S14, README S90) | own server with `{'listen.ice_udp': ''}` (no UDP media stands in for a network that blocks UDP): the viewer's focused tile has `framesDecoded` rising, and its selected candidate pair is TCP. As README S90 wrote it: in off mode that is `listen.ice_tcp` (no 443 multiplexer); the sharer's pub PC is checked in the server's log (04 §17; README S90 wrote it before README S93 added the pub PC to the page's stats, §10.7): the SFU's `PeerConnection state` lines say both PCs connected over `tcp7882`, and none over UDP |
 
 01 §19 lists the same watch, reconnect, restart and focus scenarios; they are these specs, not a second copy.
 
@@ -3694,15 +3817,28 @@ Decided after group 13 (engineering calls the owner delegated; README §6 "Decid
   closed, which the menu reads from `/info` when it opens (§11.2; README F17). A refusal that no retry ends (403
   `registration_closed` or `forbidden`) has no "Try again" in the dialog.
 
+Decided after group 14 (engineering calls the owner delegated; README §6 "Decided after group 14"):
+- **The invite card names the reader's own way to their invites** (§11.2, §14.1; README F19): "My invites" for a
+  member, through the card's optional `onceKey`, and "Admin → Invites" for an admin and the wizard. The dialog
+  takes the account menu's `me` rather than a query of its own.
+- **`?debug=1` shows the debug overlay on that page only** (§10.7; README S93, review S93-R4). Only `Shift+D` and
+  the overlay's close button change the device's `prefsStore.debug`, so a shared link with the parameter doesn't
+  leave the overlay, its 1 s sampling and the server's `stats.watch` on for every later visit.
+- **`check:i18n`'s unused-key warnings go to stderr and never fail the check**, and a string that ends in a dot
+  covers keys only below a namespace (§16.5; README S93, review S93-R3). The two keys it warns about today,
+  `common.tagline` and `common.loading`, are left to the `common` namespace's owner.
+- **`a11y.spec` checks both colour schemes** and waits until the page's colours stand still before axe runs
+  (§16.6, §19.3; README S93).
+
 **Open, for the owner** (README §6):
-- **Picture-in-picture on Android Chrome** (§12.5; raised after group 6, still open after groups 7, 8, 9, 10, 11, 12
-  and 13). The rule says "desktop only" and hides PiP on iOS. README S56 built it by capability: the button is there
+- **Picture-in-picture on Android Chrome** (§12.5; raised after group 6, still open after groups 7, 8, 9, 10, 11, 12,
+  13 and 14). The rule says "desktop only" and hides PiP on iOS. README S56 built it by capability: the button is there
   wherever the browser reports PiP and the device is not iOS, which includes Android Chrome. The two readings differ
   only there. Until the owner answers, the rule in §12.5 is not changed and the code stays as built; "keep it" needs
   one sentence in §12.5, "hide it" one more condition in the platform's `pip` capability (§8).
 - **The sound when the focused share has none** (§12.3; raised after group 9, from README S72; still open after groups
-  10, 11, 12 and 13). Focus on a share without sound, automatic or picked, leaves nothing from the stage heard ("audio
-  follows focus" taken literally). The alternative is to keep the previous share's sound playing until a share with
-  sound is focused. It is not blocking: before S72 such a page was silent too. Until the owner answers, the rule in
-  §12.3 is not changed and the code stays as S72 built it; keeping the previous sound would be a change to the
+  10, 11, 12, 13 and 14). Focus on a share without sound, automatic or picked, leaves nothing from the stage heard
+  ("audio follows focus" taken literally). The alternative is to keep the previous share's sound playing until a share
+  with sound is focused. It is not blocking: before S72 such a page was silent too. Until the owner answers, the rule
+  in §12.3 is not changed and the code stays as S72 built it; keeping the previous sound would be a change to the
   settle step of §12.3 (`settleSound`), which today gives the sound to the stage's share or to nothing.
