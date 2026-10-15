@@ -26,6 +26,11 @@ export interface ConnTestResult {
     provider: string;
     /** A NATKind of 04 §7.4. */
     nat: string;
+    /**
+     * The server's dockerBridge (04 §7.7, README F22): its symmetric NAT is a container bridge's, which doctor lets
+     * pass because friends reach the published ports. Present only when the server says so.
+     */
+    dockerBridge?: true;
     /** 0 when UDP is off. */
     udpPort: number;
     tcpPorts: number[];
@@ -104,6 +109,7 @@ export function summarizeServer(info: ConnTestServerInfo): NonNullable<ConnTestR
   return {
     provider: idOf(raw.provider, CloudProviderUnknown),
     nat: idOf(raw.nat, NATKindUnknown),
+    ...(raw.dockerBridge === true ? { dockerBridge: true as const } : {}),
     udpPort: portOf(raw.udpPort),
     tcpPorts,
     container: idOf(raw.container, ContainerKindNone),

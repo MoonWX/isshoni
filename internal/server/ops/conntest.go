@@ -27,6 +27,7 @@ import (
 //		Prober:     prober{sfu: media}, // ops.Prober over 02's SFU.Probe, with its errors mapped
 //		Ports:      ops.ConnTestPorts{UDP: 7882, TCP443: 443, TCP7882: 7882}, // 0: no listener
 //		PublicIPv4: public.V4, NAT: public.NAT, Provider: provider, Container: container,
+//		DockerBridge: bridge, // doctor's public_ip lets the bridge's symmetric NAT pass (README F22)
 //	})
 //	api.Handle("POST /api/v1/conntest", httpapi.User, …) // ct.Probe(r.Context(), principal.UserID, request)
 
@@ -84,6 +85,10 @@ type ConnTestOptions struct {
 	Container api.ContainerKind
 	// NAT is the classification of the public IPv4 path (04 §7.4); "" means unknown.
 	NAT api.NATKind
+	// DockerBridge says that NAT is a container's bridge network, which doctor's public_ip lets pass with its
+	// param dockerBridge (04 §13.2, README F21): the wiring runs that check on the server's own detection. The
+	// answer's dockerBridge is true only next to NAT symmetric, the one kind the rule lets pass (README F22).
+	DockerBridge bool
 	// Now is the clock of the per-user limit. nil means time.Now.
 	Now func() time.Time
 	// Logger is the server's logger; ConnTest adds component=ops. nil means slog.Default().
@@ -120,16 +125,17 @@ func NewConnTest(o ConnTestOptions) *ConnTest {
 }
 
 // serverInfo is the server object of the answers (04 §7.7): publicIp only for a known IPv4 address, the provider,
-// the container and the NAT kind with their defaults, and the ports of the transports that have a listener:
-// udpPort 0 when UDP is off, and tcpPorts in the order 443, 7882 (05 shows the first one that isn't 443 in its fix
-// text). tcpPorts is [] rather than null when both TCP transports are off.
+// the container and the NAT kind with their defaults, dockerBridge only next to a symmetric NAT, and the ports of
+// the transports that have a listener: udpPort 0 when UDP is off, and tcpPorts in the order 443, 7882 (05 shows the
+// first one that isn't 443 in its fix text). tcpPorts is [] rather than null when both TCP transports are off.
 func (o ConnTestOptions) serverInfo() api.ConnTestServerInfo {
 	info := api.ConnTestServerInfo{
-		Provider:  o.Provider,
-		Container: o.Container,
-		UDPPort:   max(o.Ports.UDP, 0),
-		TCPPorts:  []int{},
-		NAT:       o.NAT,
+		Provider:     o.Provider,
+		Container:    o.Container,
+		UDPPort:      max(o.Ports.UDP, 0),
+		TCPPorts:     []int{},
+		NAT:          o.NAT,
+		DockerBridge: o.DockerBridge && o.NAT == api.NATKindSymmetric,
 	}
 	if ip := o.PublicIPv4.Unmap(); ip.Is4() {
 		info.PublicIP = ip.String()

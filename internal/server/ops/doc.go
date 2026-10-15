@@ -57,8 +57,9 @@
 //     of POST /api/v1/conntest: it checks the transport (validation_failed for one it doesn't know, 409
 //     transport_disabled for one without a listener), holds each user to 12 requests a minute (429 rate_limited),
 //     and asks the SFU for a probe PC through Prober. The answer goes back with the server object
-//     (api.ConnTestServerInfo: the public IPv4 address, provider, container, ports and NAT kind) by which 05 picks
-//     its fix text. The wiring builds it from what Start found and registers the route for every signed-in user.
+//     (api.ConnTestServerInfo: the public IPv4 address, provider, container, ports and NAT kind, with dockerBridge
+//     next to a symmetric NAT that doctor's public_ip lets pass, README F22) by which 05 picks its fix text. The
+//     wiring builds it from what Start found and registers the route for every signed-in user.
 //
 //   - The admin dashboard (README slice S85, 04 §11.4). dashboard.go has Dashboard, whose Snapshot is the typed
 //     function of GET /api/v1/admin/dashboard: the server's status, the process, the release check's update, the

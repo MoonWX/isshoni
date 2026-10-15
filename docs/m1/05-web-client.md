@@ -2388,6 +2388,7 @@ export interface ConnTestResult {
   probes: ProbeVerdict[];
   server?: {
     provider: string; nat: string; udpPort: number; tcpPorts: number[];
+    dockerBridge?: true;                      // README F22: the server's dockerBridge, present only when true
     container: string;                        // 04, as in the doctor's env.container: none | docker | podman | other
     publicIpKnown: boolean;                   // derived: server.publicIp non-empty
     publicIpPrivate: boolean;                 // derived: server.publicIp empty, private or loopback (the IP itself isn't kept)
@@ -2406,7 +2407,9 @@ As S37 built it (`conntest/`):
   wire and are read defensively: a missing provider or NAT kind reads as `unknown`, a missing container as `none`,
   `udpPort` is 0 when UDP is off, and an empty `tcpPorts` (Go's `null`) is `[]`. A provider or NAT id that this
   build doesn't know (a newer server's) stays in the result as it came and is treated as `unknown` when the fix
-  text is chosen.
+  text is chosen. **`dockerBridge`** (README F22) is in the result only when the server sent `true`; anything else,
+  an older server's answer without the key included, leaves it out, so "Copy result" is what it was for every other
+  server.
 - **`runConnTest` resolves with a result** also when probes failed, are disabled or couldn't run: those are
   verdicts. It rejects only when there is nothing to show: the `signal` aborted (its reason), the server says the
   user is signed out (the `ApiError`, so the 401 rule of §6.2 runs), or this browser can't make a data-channel
@@ -2491,6 +2494,16 @@ RTT labels: ≤ 80 ms good, ≤ 200 ms OK, above that "high latency". Every resu
   this machine"; `cgnat_likely`/`symmetric` → "This server has no public address; isshoni needs one (a VPS or a
   router port forward)". When `server.nat` is `port_forward`, admins also see "You may be testing from the server's
   own network. Test again from your phone's mobile data" on every result, including green.
+  **A container bridge's symmetric NAT** (README F22): when `server.nat` is `symmetric` and the server sent
+  `dockerBridge: true`, doctor's `public_ip` lets that NAT pass (04 §13.2: friends reach the published ports), and
+  the line is `conntest.nat.symmetric_dockerBridge` instead: "This server runs in a container on a bridge network.
+  Its NAT gives each outgoing connection its own port (symmetric NAT), which doesn't matter here: friends reach the
+  ports the container publishes. Open them in the provider's firewall. At home, also forward TCP 80, 443, 7882 and
+  UDP 7882 on your router to this machine.", without a troubleshooting link (not `nat_cgnat`: the server has its
+  public address), in the same place among the lines. The flag qualifies `symmetric` alone; every other kind, with
+  or without it, keeps its line (`natIsDockerBridge`). Tests: `fixText.test.ts` ("NAT text in a container bridge":
+  the line and its ports, the symmetric text without the flag, every other kind with it, green, non-admins, and the
+  server's golden answers `ConnTestResponse*.json` of `internal/protocol/api/testdata` through `summarizeServer`).
 - **Docker** (when `server.container` is `docker` or `podman`): "Check that compose publishes `7882:7882/udp`;
   published ports bypass ufw."
 - **macOS Local Network** (S4 finding 6): when `server.publicIp` is empty, private or loopback (`publicIpPrivate`) and
@@ -2693,6 +2706,8 @@ S91's):
 - **`clients[].outdated`** is also true for a client older than the server's own version (a tab not reloaded since
   an upgrade), not only below `minClientVersion`. A share's `codec` is `""` while the server doesn't know its
   profile.
+- **`server.dockerBridge`** (README F22, 04 §11.4) is `true` next to `"nat": "symmetric"` where doctor lets a
+  container bridge's symmetric NAT pass (04 §13.2), and absent otherwise.
 
 **The pages as README S49 built them** (`web/src/admin/`: Users, Approvals, Invites, Rooms, Settings and Audit;
 the Dashboard and Doctor pages are README S91's, below. Until S91 their routes showed the router's `PageUnavailable`
@@ -2812,7 +2827,13 @@ choice:
   A code that is no certificate code shows as it is.
 - **Wire identifiers have names** (review S91-5): the TLS mode as the certificate's kind, the NAT kind in a few
   words, a client's kind and OS ("Web 0.3.0 on iOS"), the transport; a value this build doesn't know shows as it
-  is, and a connection without a selected pair reads "no media yet", without an RTT.
+  is, and a connection without a selected pair reads "no media yet", without an RTT. **The NAT kind comes with
+  `server.dockerBridge`** (README F22): `natName` takes the server object, and a symmetric NAT with the flag reads
+  "NAT: symmetric in the container's bridge network, which doesn't matter: friends reach the published ports"
+  (`admin.dashboard.natKind.symmetric_dockerBridge`) instead of "symmetric, friends probably can't connect", as the
+  Doctor page's `public_ip` line does with its bridge note; every other kind, with or without the flag, reads as
+  before. Tests: `dashboardText.test.ts` (the names against the server's golden documents `OpsDashboard*.json` of
+  `internal/protocol/api/testdata`).
 - **Accounts and security events** show without IP addresses (those are on the Approvals and Audit pages only). The
   setup checklist card leads to the wizard's steps until `settings.setupWizardDone`. A member who opens `/admin` gets
   NotFound.

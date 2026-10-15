@@ -93,4 +93,10 @@ type ConnTestServerInfo struct {
 	UDPPort   int           `json:"udpPort"`  // 0 when UDP is off
 	TCPPorts  []int         `json:"tcpPorts"` // e.g. [443, 7882]
 	NAT       NATKind       `json:"nat"`
+	// DockerBridge qualifies a symmetric NAT: the server runs in a container on a bridge network, whose NAT gives
+	// each connection that starts inside the container a port of its own, and friends reach the ports the runtime
+	// publishes all the same. It is true exactly where doctor's public_ip lets that NAT pass with its param
+	// dockerBridge (04 §13.2, README F21), and only next to NAT symmetric; absent otherwise (README F22). 05 then
+	// shows a bridge note instead of the symmetric NAT text.
+	DockerBridge bool `json:"dockerBridge,omitempty"`
 }

@@ -552,7 +552,7 @@ function ServerStatusFacts({ data }: { data: OpsDashboard }) {
         <Lines>
           <span>{server.publicIpv4 === '' ? t('admin.dashboard.server.noIpv4') : server.publicIpv4}</span>
           {server.publicIpv6 !== '' && <span>{server.publicIpv6}</span>}
-          <Note>{t('admin.dashboard.server.nat', { nat: natName(server.nat, t) })}</Note>
+          <Note>{t('admin.dashboard.server.nat', { nat: natName(server, t) })}</Note>
         </Lines>
       </Fact>
       <Fact term={t('admin.dashboard.server.media')}>

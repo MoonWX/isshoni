@@ -160,9 +160,12 @@ func wantServerInfo(t *testing.T, srv *servertest.Server, got api.ConnTestServer
 		UDPPort:   srv.UDPPort,
 		TCPPorts:  tcpPorts,
 		NAT:       status.NAT,
+		// No STUN here, so no symmetric NAT for a bridge to excuse (README F22; TestDockerBridgeInServer).
+		DockerBridge: false,
 	}
 	if got.PublicIP != want.PublicIP || got.Provider != want.Provider || got.Container != want.Container ||
-		got.UDPPort != want.UDPPort || !slices.Equal(got.TCPPorts, want.TCPPorts) || got.NAT != want.NAT {
+		got.UDPPort != want.UDPPort || !slices.Equal(got.TCPPorts, want.TCPPorts) || got.NAT != want.NAT ||
+		got.DockerBridge != want.DockerBridge {
 		t.Errorf("server = %+v, want %+v", got, want)
 	}
 }

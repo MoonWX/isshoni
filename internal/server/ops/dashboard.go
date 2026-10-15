@@ -29,6 +29,7 @@ import (
 //		Status: status, Live: live, Accounts: accounts, // the admin socket's GET /v1/status; hub + SFU; 03's API
 //		Transfer: transfer, Release: release, Doctor: doc, // the other ops parts
 //		PublicAddrs: …, MinClientVersion: …,
+//		DockerBridge: bridge, // doctor's public_ip lets the bridge's symmetric NAT pass (README F22)
 //	})
 //	api.Handle("GET /api/v1/admin/dashboard", httpapi.Admin, …) // d.Snapshot(r.Context())
 //
@@ -108,6 +109,12 @@ type DashboardOptions struct {
 	Release UpdateSource
 	// Doctor gives the summary of the last doctor report and the doctor.fail alert.
 	Doctor DoctorSource
+	// DockerBridge says that the status's NAT is a container's bridge network, which doctor's public_ip lets pass
+	// with its param dockerBridge (04 §13.2, README F21): the wiring runs that check on the server's own detection,
+	// as the connection test's server object has it (ConnTestOptions.DockerBridge). server.dockerBridge is true
+	// only next to a symmetric server.nat, the one kind the rule lets pass, and only while the status source works
+	// (README F22).
+	DockerBridge bool
 	// PublicAddrs returns the public addresses as the server's last periodic look found them (04 §7.4), and false
 	// while they are the ones it started with. An address that differs from the status's is the alert
 	// public_ip.changed. nil: no such alert.
@@ -136,6 +143,7 @@ type Dashboard struct {
 	transfer         TransferSource
 	release          UpdateSource
 	doctor           DoctorSource
+	dockerBridge     bool
 	publicAddrs      func() (netx.PublicAddrs, bool)
 	minClientVersion func() string
 	version          string
@@ -164,6 +172,7 @@ func NewDashboard(o DashboardOptions) *Dashboard {
 		transfer:         o.Transfer,
 		release:          o.Release,
 		doctor:           o.Doctor,
+		dockerBridge:     o.DockerBridge,
 		publicAddrs:      o.PublicAddrs,
 		minClientVersion: o.MinClientVersion,
 		version:          cmp.Or(o.Version, version.Version()),
@@ -237,14 +246,15 @@ func (d *Dashboard) build(ctx context.Context, now time.Time) api.OpsDashboard {
 	})
 	if statusOK {
 		out.Server = api.ServerInfo{
-			Version:    status.Version,
-			StartedAt:  status.StartedAt,
-			Origin:     status.Origin,
-			TLS:        status.TLS,
-			PublicIPv4: status.PublicIPv4,
-			PublicIPv6: status.PublicIPv6,
-			NAT:        status.NAT,
-			Advertised: status.Advertised,
+			Version:      status.Version,
+			StartedAt:    status.StartedAt,
+			Origin:       status.Origin,
+			TLS:          status.TLS,
+			PublicIPv4:   status.PublicIPv4,
+			PublicIPv6:   status.PublicIPv6,
+			NAT:          status.NAT,
+			DockerBridge: d.dockerBridge && status.NAT == api.NATKindSymmetric,
+			Advertised:   status.Advertised,
 		}
 	}
 	var process api.ProcessInfo
