@@ -95,8 +95,9 @@ internal/server/sfu/
   downtrack.go    DownTrack (webrtc.TrackLocal): Bind, queue, writer, RTCP reader
   munger.go       seq/ts rewrite, epochs (the sequence map), SR-aligned switching, padding gaps
   rtx.go          NACK handling, RTX packets, retransmission budget
-  pacer.go        per-DownTrack token bucket
-  allocator.go    per-subscriber downlink controller
+  pacer.go        per-DownTrack token bucket (video, retransmissions included; README S84)
+  allocator.go    per-subscriber downlink controller, and what the viewer's REMBs and receiver reports tell it
+                  (README S84)
   uplink.go       UplinkPolicy (M1: admin cap and layer pausing; M2: native estimator)
   codec.go        ProfileKey, compatibility matrix, PT table, codec policy helpers
   codecstate.go   SetDecodeCaps, viewers without H.264: caps-driven video, codec rebuilds, the guard (§8.5)
@@ -109,7 +110,8 @@ internal/server/sfu/
   counters.go     the SFU's totals of §13 that Layers and DownTracks count into (README S79)
   pionlog.go      Pion's logger factory: info lines and lines that hold an address at debug (README S79, §13)
   *_test.go
-internal/server/sfu/sfutest/   Harness, DirectSignaler, Viewer (+Recorder, checks), FaultConn, ProfileSource
+internal/server/sfu/sfutest/   Harness, DirectSignaler, Viewer (+Recorder, checks), FaultConn, ProfileSource, Link
+                               (a downlink bottleneck on the SFU's FaultConn, README S84)
 internal/server/sfu/sfutest/rembsim/  REMB model copying libwebrtc's AIMD estimator (no imports of sfu or Pion;
                                       used by allocator_test and sfutest.Viewer, §17)
 internal/media/fake/           Source, synthetic and decodable H.264, Opus asset, testdata/
@@ -1417,7 +1419,23 @@ type binding struct {
     the allocator keeps the latest and compares each new value with it (§10.2), so a repeated copy changes nothing.
   - `ReceiverReport` blocks for our SSRC → `fractionLost` → DownTrack loss EWMA and `allocator.onLoss`. As README
     S79 built the first half: the last report's fraction lost, in percent and not averaged, is
-    `DownTrackStats.LossPct` (§13); the EWMA and `allocator.onLoss` are slice 11's (README S84).
+    `DownTrackStats.LossPct` (§13).
+
+  **Both go to the Conn's downlink allocator as README S84 built it** (`allocator.go`: `DownTrack.noteREMB`,
+  `noteReport`; §10.2 has what the allocator makes of them):
+  - **A REMB** counts on every DownTrack whose SSRC it names, video or audio, through the subscriber Conn's one
+    allocator. A REMB of 0, NaN or above 100 Gbit/s is ignored before Pion's float32 is converted (past an int64
+    the conversion differs between arm64 and amd64, and the allocator's products would overflow).
+  - **A receiver report** goes to the allocator for a video DownTrack only. There is no EWMA: the DownTrack keeps
+    what the last report of its stream said (SSRC, extended highest sequence number, cumulative loss, when; `rr`,
+    under the allocator's lock), and hands the allocator what the next one adds, as the link lost it (§10.2): the
+    packets expected and lost since the last report, less the own sequence numbers the writer passed over without
+    sending them (`seqGaps`). The first report of a stream, one for another SSRC (a rebuilt binding) and one more
+    than 2 s after the last only start the count again; one less than 200 ms after the last that counted changes
+    nothing and is folded into the next, which covers both intervals (§12).
+  - Either may need the allocator's decision before its next tick: a REMB that fell, or a report with 5 % loss or
+    more, wakes the Conn's actor (`Conn.wakeAllocator`, one queued look at most). `LossPct` stays the last report's
+    fraction lost, as above.
 - **RTT** for the sub PC comes from the selected ICE candidate pair, sampled every 5 s. RR-based RTT is meaningless
   here because the forwarded SRs carry the publisher's NTP clock (§9.6). As README S63 built it (`subPC.sampleRTT`,
   `rtt` and `rttAt` atomics on the `subPC`): the RTCP readers of the PC's DownTracks take the sample when the
@@ -1496,14 +1514,15 @@ S52 has added them since: §10.1, §6.2). Beyond the text above it settled five 
   `nackMissed`, `rtxSkipped`, `rtxDrops`, `rtxPackets` and `rtxBytes` (§9.5 says what each counts). `packets`
   and `bytes` count forwarded media only, retransmissions not included.
 
-`DownTrack` as built differs from the struct above in what later slices add: there is no pacer (slice 11). It has
+`DownTrack` as built differs from the struct above in what later slices add (the pacer came with slice 11, README
+S84, below). It has
 `pc atomic.Pointer[subPC]` (set by the actor before Pion can call `Bind`, so the binding gets its gate),
 `forwarding atomic.Bool` (the writer forwards a layer now: `ShareInfo.Viewers`; written only with `DownTrack.mu`
 held, so a writer can't leave a paused viewer listed) and `stats` with packets, bytes, queue drops, packets
 without a payload type, unsent packets, write errors, epochs started and the viewer's keyframe requests, and the
 counters above. The RTCP reader handles PLI and FIR (video), NACK (both kinds) and, since README S79, the receiver
-reports about its SSRC, for `LossPct`; REMB, and what the downlink allocator makes of the receiver reports, are
-slice 11's (README S84). Since README S79 the counters that §13's totals need are tallies: each also counts into the
+reports about its SSRC, for `LossPct`; since README S84 also REMB, and the receiver reports for the downlink
+allocator (above). Since README S79 the counters that §13's totals need are tallies: each also counts into the
 SFU's total of the same thing (`tally`, `counters.go`), so `Metrics` keeps what a DownTrack counted after it is gone;
 and `stats` has `lossPct` and `bitrate`, a 2 s moving average of what the DownTrack sends, media and
 retransmissions, which the ticker updates once a second (`DownTrack.tick`).
@@ -1513,6 +1532,24 @@ Since slice 7 (README S52) the request and the cap are the **Subscription's**, n
 for them, `want` (under `DownTrack.mu`): what its subscription asks of it, the video quality under the cap, or for
 audio "on" or "off". It chooses its layer for that among the layers the share has (§10.1), again whenever those
 change. `sender` and `transceiver` are the actor's too: the m-section the DownTrack is on (the reuse above).
+
+**What README S84 added to the DownTrack** (slice 11; `downtrack.go`, `pacer.go`, `allocator.go`, `rtx.go`):
+- **`alloc`**, a pointer to the subscriber Conn's allocator (nil for a DownTrack a unit test builds without a
+  Conn), which the RTCP reader hands REMBs and receiver reports (above), and which both queues tell of every drop:
+  a full `queue` and a full `rtxQueue` add to `allocator.drops` as well as to the DownTrack's own counters (§10.2:
+  more than 50 a second is congestion). `rr` is what the last receiver report of the video stream said, under the
+  allocator's lock.
+- **`gaps seqGaps`**: the own sequence numbers a video DownTrack's writer went past without sending them, a gap the
+  publisher left that no repair filled in time, or packets its queue dropped. The viewer counts them as lost, but
+  the link didn't lose them, so the next receiver report that covers them has them taken out (§10.2). The writer
+  notes each own number it hands Pion (`noteSeq`, before pacing): a jump past the highest one adds the numbers in
+  between, a late number that falls into such a gap takes one back. At most 64 entries are kept, the newest
+  taking in the count past that; the lock is a leaf of its own, taken by the writer and by the reader, never inside
+  the allocator's.
+- **`pacer`**, the video writer's token bucket (§9.8), which only the writer touches. Step 4 of the writer loop is
+  `DownTrack.pace` after the header is built and before abs-send-time is stamped, so the time a packet leaves is
+  the one the viewer's estimator reads; a writer told to stop meanwhile (the DownTrack's stop, its Conn's close)
+  drops the packet. Retransmissions go through the same bucket, first (§9.5, §9.8).
 
 ### 9.4 Munger and the sequence map
 
@@ -1639,6 +1676,15 @@ built it so, `rtx.go` `handleNACK` and `serveNACKs`; the DownTrack's RTCP reader
    on another binding than the one the DownTrack has now (the sub PC was rebuilt meanwhile), or that the viewer can
    no longer get or decode (the gate closed, no PT for the profile), is skipped (counted).
 
+**Retransmissions are paced, ahead of new media** (README S84, the open question that S63 left; §9.8). A video
+retransmission goes through the DownTrack's token bucket like a forwarded packet, after its header and payload are
+built and before abs-send-time is stamped, and the writer serves the RTX queue first, so a repair takes its tokens
+before new media does and never waits behind a frame. A viewer whose NACKs ask for a large frame again gets it
+spread like the frame itself, not as a second burst on top of the one that was lost. The budget of step 5 bounds how
+much of the rate repair may use on average; the pacer bounds how fast any of it leaves. A retransmission whose
+writer is told to stop while it waits is not sent and counts as skipped. Audio and its retransmissions are never
+paced. A full RTX queue (step 6) is a queue drop for the downlink allocator too (§10.2).
+
 The locks are taken one after the other, never inside each other: `DownTrack.mu` for the epochs (step 2), each
 cache's own for the packet, and the NACK state's (a leaf) for the records and the budget (steps 3–5).
 
@@ -1732,6 +1778,24 @@ requests for a packet that never comes. In integration 19 the publisher now rese
 - Queue drops feed the allocator (§10.2); at these rates they mean the writer is starved of CPU, not that the pacer
   is slow. Time spent in the pacer is not an allocator input.
 
+**As README S84 built it** (`pacer.go`, `DownTrack.pace`; the tests are §17's `pacer_test`):
+- **The bucket starts full** with the DownTrack's first video packet, fills at the rate up to its depth, and holds
+  bits; a packet takes its payload's bits and leaves when the bucket is back at zero. The rate is worked out for
+  every packet from the layer the packet belongs to (`pacerRate`: the layer's `MaxBitrate` after the admin cap from
+  `Share.maxBitrate`, and its measured rate, the ticker's 2 s average; every number an atomic or a constant, so no
+  lock), and a lower rate than before (a smaller layer) also lowers what the bucket holds. Time a writer oversleeps
+  counts at the next fill, so the rate holds over a burst however coarse the sleeps are; one fill counts at most
+  1 s. The wait is the writer's own reused timer, so pacing allocates nothing per packet, and the DownTrack's stop
+  or its Conn's close ends it (the packet is then not sent).
+- **The keyframe numbers above are from an empty bucket**, as right after another burst. From a full bucket its
+  20 ms of the rate leave at once: for an 8 Mbit/s `f` (20 Mbit/s, a 50 KB bucket) a 150 KB keyframe takes about
+  40 ms, a 300 KB frame about 100 ms.
+- **What goes through it** (decided in README S84, S63's open question): every video packet the writer sends,
+  forwarded media and retransmissions alike, in the writer's order, which serves the RTX queue first (§9.5). Audio
+  and its retransmissions never are.
+- **abs-send-time is stamped after the pacer**: the viewer's receive-side estimator reads the spacing of the
+  packets from it (§10.2), so it must be the time a packet leaves, not the time it was taken off the queue.
+
 ## 10. Layer selection and downlink adaptation (M1)
 
 ### 10.1 Requested quality → layer
@@ -1770,9 +1834,10 @@ requests for a packet that never comes. In integration 19 the publisher now rese
     (`TestForwardedLayerEnds`). Viewers of another layer notice nothing.
   - *A track that Pion delivers again with another SSRC* attaches its Layer before the old one is taken off, so
     its viewers wait for the new track's keyframe and don't fall back.
-- **The cap exists and nothing sets it yet.** `Conn.capSubscription(sub, q, reason)` stores the cap and its reason
-  on the subscription, applies `min(requested, cap)` and reports at once; its caller is the allocator (slice 11,
-  README S84). `server_limit` is later.
+- **The cap is the allocator's.** `Conn.capSubscription(sub, q, reason)` stores the cap and its reason on the
+  subscription, applies `min(requested, cap)` and reports at once. Its caller is the downlink allocator (slice 11,
+  README S84: `Conn.capWithin` and `Conn.liftCaps`, §10.2), which caps at `low` with `bandwidth`; S52 built the
+  cap before anything set it. `server_limit` is later.
 - **The decoders' cap is `Subscription.codec`, not `capSubscription`** (README S69, §8.5). It is
   `decoder_unavailable` or `decoder_failed` while the viewer can't decode H.264, and then the subscription gets no
   video, whatever the other cap says; it is empty otherwise. The Conn's actor sets it for every subscription
@@ -1841,6 +1906,63 @@ can't carry `f` usually fails on loss (the bottleneck drops the excess), not on 
 screen to motion is never compared with REMB, so it can't cause a downgrade; only a falling REMB (real overuse), loss
 or drops can. TWCC downlink in v2 replaces trial upgrades; the allocator's interface stays.
 
+**As README S84 built it** (`allocator.go`: `allocator.step`, `allocate`, and on the Conn `adapt`, `capWithin`,
+`liftCaps`, `requestChanged`; the tests are §17's `allocator_test` and integration 16), where the text above leaves
+a choice:
+- **Who does what.** The RTCP readers of the Conn's DownTracks put what the viewer's REMBs and receiver reports say
+  under the allocator's own lock, a leaf (§9.3, §5.4); both queues count their drops in an atomic. The decisions
+  are the Conn's actor's (`Conn.adapt`): once a second, when the ticker wakes it with this second's rates in place,
+  and at once when a REMB falls or a report shows 5 % loss or more. A backoff's end and a trial's end are seen by
+  those looks, so each takes effect up to 1 s after its time: a trial starts up to a second after its backoff, and
+  passes up to a second after its 6 s. A change of state is logged at debug, with the cause and the budget.
+- **The loss input is what the link lost**, with four rules the text above doesn't spell out:
+  - the own sequence numbers the SFU never sent (an upstream gap that no repair filled, packets a queue dropped;
+    `seqGaps`, §9.3) are taken out of both the packets expected and the packets lost: the viewer counts them as
+    lost, but the link didn't lose them;
+  - a report that comes more than 2 s after the last one of its stream covers an outage of the viewer's network,
+    not congestion (its RTCP didn't reach the SFU either, which downlink congestion doesn't do: the reports travel
+    the other way), and only starts the count again;
+  - a report is evidence about the allocator's last decision (a cap, or the start of a trial) only when all of the
+    time it covers came after that decision: a report covers the second or so before it, so one that began before
+    a trial says what the viewer got before the trial;
+  - a loss verdict needs at least 20 packets: one lost of three is no 33 % of anything.
+
+  "Loss averaged over 2 s" is then the packets lost over the packets expected, summed over the reports of the last 2 s
+  that pass these rules, with no EWMA; "loss < 2 % over the last 3 s" is the same over 3 s, and fewer than 20 packets is
+  no loss. The reports are kept for 3 s, at most 1024 per Conn, and one that comes less than 200 ms after the last that
+  counted for its stream is folded into the next (§12). S84 found the rules needed: without them the black-hole cases of
+  01 §19 in `internal/server/itest` failed. Pion's receivers, like Chrome's, also count a packet that came back on the
+  RTX stream as lost, so repair shows up as loss: 10 % of the video lost and repaired is congestion by this section,
+  which is why integration 4 loses 5 % (§17).
+- **The budget.** On an overuse REMB, 0.9 × the lowest overuse REMB since the actor's last look; on loss or drops,
+  min(0.85 × the forwarded rate, 0.9 × the latest REMB when one came in the last 5 s). During a trial any REMB that
+  fell by 3 % fails it, overuse or not, and the budget is 0.9 × that REMB. In `limited`, congestion only ever lowers
+  the budget (the lower of the old and the new one) and starts the backoff again. Drops are a rate measured over at
+  least 0.9 s.
+- **The allocation** (`allocate`) weighs every subscription at measured rates: the share's audio when the client
+  asks for it; a `low` at its preview layer's rate; a `high` at its full layer's rate, or at its preview layer's
+  once capped. The `high` requests are served newest first, by when the client last asked for `high` after asking
+  for less (`Subscription.highAt`). A subscription whose viewer can't decode the video (§8.5) weighs its audio only.
+- **A share without a smaller layer is never capped.** A `high` request whose share has no other layer for a cap at
+  `low` to give (a single-layer share, or one with only its preview layer) keeps the layer it has, whatever the
+  budget: a cap would leave its viewer with no video at all. Its rate still counts against the budget.
+- **While `limited`, any change to a subscription's request decides every cap again** (`requestChanged` →
+  `capWithin`), newest `high` first, before the client hears what its request got. A new `high` is served at `f`
+  only if its rate fits, as the table says, and a cap that no longer needs to be is lifted too: when a request
+  goes down to `low` or `off`, an older `high` may get its full layer back. In `normal` and `probing` nothing is
+  capped, and a new or raised target is forwarded at once.
+- **The caps** are the subscriptions' server cap (§10.1), at `low` with the reason `bandwidth`; a trial lifts every
+  cap at once (`liftCaps`), and a trial that fails caps again within its new budget. Every cap the client hears is a
+  `bandwidth` downgrade in `Metrics` (§13).
+- **`ConnStats.DownlinkEstimate`** (§13) is the budget while `limited`, else the viewer's latest REMB while it is
+  less than 5 s old, else 0.
+- **The trial in integration 16 fails on a falling REMB, not on loss.** The text above expects a trial on a link
+  that still can't carry `f` to fail on loss more often. With `rembsim` as §17 specifies it, the estimate never
+  falls without overuse, so it is still at the throttled link's rate when the trial starts; the trial's overuse
+  then cuts it to 0.85 × the ramping received rate within about 250 ms, before a receiver report shows the loss.
+  It did so in every run, so the test wants the trial to fail for either reason and logs which. Either cause fails
+  a trial, so a real Chrome may come first with either.
+
 *Later (M5)*: `server_limit`, a server-wide egress soft cap: while total egress (2 s EWMA) is above it, new or
 upgraded `high` requests are capped at low. M1 has no such setting (03 stores none); the reason value is reserved.
 
@@ -1870,10 +1992,12 @@ type UplinkDecision struct {
   protocol change): when no video DownTrack has requested `high` for 10 s, send `QualityHintEvent{Reason: "viewers"}`
   with the full `Encodings` and `f.Active` false. As soon as one does, send it again with `f.Active` true, and a PLI.
   "Requested" is the viewer's request before the allocator's `bandwidth` cap (§10.2), so `f` keeps flowing while a
-  viewer is capped, and its trial upgrades test a real layer rather than one measured at 0 bps. Browsers apply the
-  list with `setParameters` (05). This saves the sharer about 8 Mbps of upload while nobody focuses the
-  share, at the cost of 0.2–0.5 s more on the first focus. `q` is never paused while anyone is subscribed. A paused
-  layer stays in `ShareInfo.Layers`, and pausing never changes `room.state` (§5.3).
+  viewer is capped, and its trial upgrades test a real layer rather than one measured at 0 bps. As README S84 left it
+  for S88: that is `Subscription.reqVideo` (the client's request, which the actor holds), not the effective quality
+  under `capQ` and not what a DownTrack forwards; a viewer whose `high` is capped at `low` still counts as requesting
+  `f`. Browsers apply the list with `setParameters` (05). This saves the sharer about 8 Mbps of upload while nobody
+  focuses the share, at the cost of 0.2–0.5 s more on the first focus. `q` is never paused while anyone is subscribed. A
+  paused layer stays in `ShareInfo.Layers`, and pausing never changes `room.state` (§5.3).
 - Every hint carries both the current cap and the current pause state. When a single hint carries both a cap change
   and a pausing change, the pausing change wins: `Reason` is "viewers".
 - **Later (M2), native publishers**: a loss and receive-rate estimator per share (Galene's estimator design). It sends
@@ -1900,6 +2024,7 @@ Guards limit abuse, not people. Every number here is a constant in `config.go`, 
 | Keyframe requests upstream | 1 per 500 ms per layer | throttled (counted) |
 | NACK | ≤1 s old, ≤3 retransmits per seq, 25% budget | skipped (counted) |
 | DownTrack queues | video 1024, audio 256, RTX 256 | drop newest (counted) |
+| The viewer's RTCP for the downlink allocator (README S84, §10.2) | a receiver report of a video stream counts at most once per 200 ms; at most 1024 reports kept per Conn, each for 3 s; a REMB counts only above 0 and up to 100 Gbit/s | a report sooner than 200 ms is folded into the next one; past 1024 the oldest goes; any other REMB is ignored. A viewer that floods reports costs no more than one that reports five times a second (`TestAllocatorReportFlood`) |
 | Probe PCs | 1 per user and transport (a new one closes the old one), 20 total, 20 s lifetime | `sfu.probe_limit` (retryable; `RetryAfter` at least 1 s) |
 | Probe offer (README S76) | ≤64 KiB, exactly one m-section, `m=application`; its remote candidates through the filter of §7.3 and capped at 64, as a PC's | `sfu.bad_sdp`; candidates past the cap dropped, counted at debug |
 | Probe data channels (README S76) | 1 per probe PC; no echo while more than 1 MiB of echoes waits to go out | a further channel is closed as it opens; a message that comes while 1 MiB waits is not echoed |
@@ -1914,14 +2039,14 @@ Two of its findings are about state that one PC grows from crafted packets, wher
   source addresses, and Pion makes a prflx candidate and pairs for each one, past the 64 of the remote-candidate
   row. Fixed below Pion, in 04's netx (README F06): the peer-reflexive sources row of this table, 04 §7.8.
 - **R1, pub-PC tracks under SSRC churn**: a publishing member with a custom DTLS-SRTP client can make Pion deliver
-  `OnTrack` again for each new SSRC, and the pub PC then grows tracks, reader goroutines and NACK-filter entries
-  without a bound. README F07 caps the deliveries a pub PC holds and drops the PC past the cap; its change is built
-  but not merged, **waiting for the owner** (its tests are not written yet). Until it lands, nothing in this table
-  bounds them. README F06 found a related cost of SSRC churn below `OnTrack`: for every authenticated SSRC that no
-  m-section declares, Pion keeps an SRTP and an SRTCP read stream until DTLS closes, whose buffers nobody reads
-  (pion/srtp lets them grow to 1 MB and 100 KB). netx can't bound that below the mux, where it sees source addresses
-  and no PCs; a per-PC `SettingEngine.BufferFactory`, which Pion calls with the SSRC of every new read stream, could,
-  in the SFU. That is an option for F07, not built.
+  `OnTrack` again for each new SSRC, and the pub PC then grows tracks, reader goroutines and NACK-filter entries without
+  a bound. README F07 caps the deliveries a pub PC holds and drops the PC past the cap; its change is built but not
+  merged, **waiting for the owner** (its tests are not written yet; still so after group 12). Until it lands, nothing in
+  this table bounds them. README F06 found a related cost of SSRC churn below `OnTrack`: for every authenticated SSRC
+  that no m-section declares, Pion keeps an SRTP and an SRTCP read stream until DTLS closes, whose buffers nobody reads
+  (pion/srtp lets them grow to 1 MB and 100 KB). netx can't bound that below the mux, where it sees source addresses and
+  no PCs; a per-PC `SettingEngine.BufferFactory`, which Pion calls with the SSRC of every new read stream, could, in the
+  SFU. That is an option for F07, not built.
 
 **What the PC creation limit counts** (README S57, `Conn.admitPC`; one window of the last 10 per Conn and kind):
 - **pub**: every pub PC the SFU makes for an offer of a new `gen`, whether or not Pion then takes that offer. An
@@ -2066,7 +2191,8 @@ type DownTrackStats struct { // the egress numbers of one DownTrack
   viewer counts, transports or totals; `Metrics` has every label value of the table below present, with only
   `Conns` and `Shares` counting. The media path (slice 6, README S41) and slice 12 (README S79) fill in the rest.
   Since README S79 everything is filled in but `ConnStats.DownlinkEstimate` and the `bandwidth` downgrades, which
-  come with the downlink allocator (slice 11, README S84), and `server_limit`, which has no source in M1.
+  came with the downlink allocator (slice 11, README S84: the estimate is the allocator's budget while it caps,
+  else the viewer's latest REMB while it is fresh, §10.2), and `server_limit`, which has no source in M1.
 - `(*SFU).Metrics() Metrics`: plain atomics, cheap to read. 04 maps them to Prometheus (optional, off by default):
 
 | Metric | Type | Labels | Label values |
@@ -2281,6 +2407,19 @@ link capacity (§17) or fixed values injected by the test) that records per trac
 (`CheckContinuous`, `CheckStartsOnSPS`) plus `AVOffset()` (flash vs beep, both mapped to NTP through the last
 forwarded SRs).
 
+**The scripted link and its REMBs, as README S84 built them** (`sfutest/link.go`, `faultconn.go`, `viewer.go`):
+- **`sfutest.Link`** is the bottleneck of one client's downlink: `NewLink(capacity)`, `SetCapacity` while a test
+  runs, `Counts()` (RTP bytes sent through it and passed, datagrams lost). `FaultConn.SetLink(peer, link)` puts it
+  in front of a client's address on the SFU's socket (`HarnessOptions.FaultyUDP`): every datagram to that client
+  takes its size from a buffer that fills at the capacity and holds 100 ms of it (`LinkBuffer`). An RTP datagram
+  that finds too little there is lost; everything else (STUN, DTLS, RTCP) always passes but takes its share, so ICE
+  and the reports go on as they would beside a congested media stream. This is the "rate limit added for this" of
+  §17's `rembsim`.
+- **`ViewerOptions.REMB`** (a `*Link`) makes the Viewer send REMBs as Chrome's estimator would on that link: every
+  50 ms it steps `rembsim`'s model with what the SFU sent through the Link and what passed, and sends the REMBs the
+  model sends (the first estimate, then every second, and at once on a fall of 3 %), naming every video SSRC it
+  receives; `Viewer.REMBs()` lists them. Without it a REMB goes out only when the test sends one (`SendREMB`).
+
 **The Viewer's NACKs are its own** (README S63), not Pion's generator, which never sees what Pion's receiver
 recovered from an RTX stream and would ask for it again every interval for as long as its window holds the
 sequence number: no browser does that, and an SFU that answers NACKs would send every repaired packet several
@@ -2450,6 +2589,34 @@ the defaults (20 s, `CodecRetries` = 9, `CodecPolicyHold` = 60 s).
 - `pacer_test`: a 150 KB burst at 24 Mbps takes 50 ms ± 10%; a 1 fps idle stream followed by a 300-packet frame
   arriving at 20 Mbps adds less than 20 ms; the same frame injected all at once leaves at the configured rate
   (20 Mbps for an 8 Mbps `f`, ± 10%).
+
+As README S84 wrote the three (`allocator_test.go`, `sfutest/rembsim`, `pacer_test.go`). The allocator's clock is
+`monoNow` plus a skew (`SFU.allocSkew`, like the codec policy's), which the allocator's tests move by hand or step
+past by passing the time to the state machine; for integration 16, `export_test.go` has `Conn.Downlink` (the
+state, budget, backoff and cause), `BackoffStart` and `ProbeTime`:
+- **`allocator_test`**: `TestAllocatorREMB` (which REMBs fall; a copy changes nothing; a fall is an overuse only
+  below the forwarded rate), `TestAllocatorStates` (every row of §10.2's table, the budget each time, the backoff
+  doubling to 120 s and its reset, the estimate), `TestAllocate` (cheapest first, newest `high` first, a share
+  without a smaller layer never capped), `TestAllocatorRembsim` (integration 16's three cases in fake time with
+  `rembsim`'s REMBs, then a throttle long enough for the backoff to reach 120 s, and its end),
+  `TestAllocatorReports` (loss as the link lost it: the SFU's own gaps out, a late number counted again, the first
+  report of a stream or an SSRC and one after 2 s only a start), `TestAllocatorReportFlood` (10 000 reports in a
+  second keep 5 that still add up; at most 1024 kept) and `TestAllocatorEvents` (a viewer Conn with real
+  DownTracks: the events the client hears, the newest request served first, a failed trial, the `bandwidth`
+  downgrades and the estimate).
+- **`rembsim`** has the rules above, with one the text leaves open: **overuse is judged on each step by itself**, a step
+  in which the link lost more than 1 % of what was forwarded, not on the 0.5 s average. Chrome sees overuse in the delay
+  of the packets that queue at the bottleneck, which stops growing as soon as the sender slows down; the model's
+  equivalent is the link dropping now. `sfutest.Viewer` steps it every 50 ms (§15.1). Its tests are `TestModel` (the
+  rules against hand-worked values, stepped every 100 ms) and `TestModelCeiling` (1.5 × the received rate plus 10 kbit/s
+  however long the link has room, and no fall without overuse); `sfutest`'s `TestLink` and `TestFaultConnLink` check the
+  Link.
+- **`pacer_test`**: `TestPacerRate` (the rate and the depth), `TestPacerSchedule` (the three cases on the bucket
+  alone in simulated time, exact), `TestPacerWriter` (the same through a DownTrack's writer goroutine in real time,
+  within 10 %) and `TestPacerRTX` (retransmissions are paced like media and first, audio never; §9.5). **The
+  150 KB burst takes 50 ms from an empty bucket**, as right after another burst, which is what the case means; from
+  a full one its 60 KB leave at once and the burst takes 30 ms (§9.8). `TestPacerSchedule` checks both, and
+  `TestPacerWriter` empties the bucket with a 60 KB burst first.
 - `sdpcheck_test`: each validation code; a sending m-section without a binding, or bound to a share that isn't this
   Conn's, carries no share and is no error (and skips the per-share checks, the kind check included); the Opus edit
   per m-line (stereo and `maxaveragebitrate`) and `a=inactive` on the m-lines without a share; the answer check for
@@ -2492,6 +2659,10 @@ with `fake.Source`, `sfutest.Viewer`)**
    tighter (a loaded machine stretches one STUN round trip on loopback a long way). The second viewer sees no gap
    and sends no NACK. Since README S79 the SFU's `Metrics` must show at least the NACKs and retransmissions that the
    DownTracks counted (`NACKReceived`, `NACKServed`, egress `rtx` packets), and some egress `rtx` bytes.
+   **Since README S84 it loses 5 % of the video, not 10 %** (sequence numbers 7 and 40–42 modulo 80, still at
+   least 10 video packets). Pion's receiver reports, like Chrome's, count a packet that came back on the RTX
+   stream as lost, so 10 % lost and repaired is congestion by §10.2, and the downlink allocator rightly moved that
+   viewer to `q`, which broke a test about repair. At 5 % the reports stay under the 10 %.
 5. `TestSRTranslationAndAVOffset`: |flash − beep| ≤ 5 ms after 10 layer switches and 5 audio off/on cycles; forwarded
    SR RTP equals upstream RTP + offset.
 6. `TestPaddingNoGaps`: the publisher injects padding-only packets; the viewer sees no seq gaps and sends no NACKs.
@@ -2555,6 +2726,18 @@ with `fake.Source`, `sfutest.Viewer`)**
     3 Mbps while `f` runs at 8 Mbps; within 3 s the focused share is forwarded `low` with reason `bandwidth`, and the
     first trial upgrade fails (on loss, §10.2). (c) Recovery: capacity returns to 20 Mbps; the viewer is back on `high` within one
     backoff period (here 20 s) plus the 6 s probe, with no action from the test.
+    As README S84 wrote it (`adaptation_test.go`, with `FaultyUDP`): the bottleneck is an `sfutest.Link` on the SFU's
+    `FaultConn` in front of the viewer's own socket, and the viewer's REMBs are `rembsim`'s model of that link
+    (`ViewerOptions.REMB`, §15.1); the publisher sends the Auto preset with audio, its GOP longer than the test. (a)
+    also checks that the last REMB stayed below 8 Mbps (the case is about a REMB below the forwarded rate) and that
+    the allocator is in `normal`. In (b) the first trial **fails on a falling REMB in every run, not on loss**: with
+    `rembsim`'s rules the estimate never falls without overuse, so it is still at the throttle's level when the
+    trial begins, and the trial's overuse cuts it within about 250 ms, before a receiver report shows the loss
+    (§10.2). The test wants the trial to fail on loss or on REMB, logs which, and wants the backoff at 20 s after
+    it. (c) wants `high` within the 20 s backoff plus the 6 s probe, and the allocator back in `normal` within 30 s:
+    those 26 s, up to 1 s for each of the two ticker looks that end the backoff and the trial, and 2 s of room for
+    a loaded machine. At the end `isshoni_sfu_downgrades_total{bandwidth}` counts at least the cap and the failed
+    trial.
 17. `TestTenByTen` (skipped with `-short`, S4 port): 10 publishers × 10 viewers; all 100 subscriptions on the right
     layer within 5 s; audio only on focused shares; integrity checks; heap growth per DownTrack < 1 MB.
 18. `TestProbe`: a Pion data-channel offer per transport (`udp`, `tcp443`, `tcp7882`) → connected; the answer holds
@@ -2853,6 +3036,20 @@ reports for `DownTrackStats.LossPct` (§9.3) and gives each DownTrack its bitrat
 handshake timeouts moved into its totals. Its one handover outside the package, netx's Pion info lines at info when
 the log level is debug, the group 11 integration fixed (04 §7.3).
 
+**What README S84 built** (slice 11; `allocator.go` and `pacer.go`, with `allocator_test.go`, `pacer_test.go`,
+`adaptation_test.go`, `sfutest/link.go` and the package `sfutest/rembsim`). One downlink allocator per subscriber
+Conn (§10.2), fed by the RTCP readers and queues of its DownTracks (§9.3) and run by the Conn's actor on the
+ticker's once-a-second look and at once on a fall or loss; one pacer per video DownTrack (§9.8), which
+retransmissions go through first (§9.5); `ConnStats.DownlinkEstimate` and the `bandwidth` downgrades of §13.
+`server_limit` stays later. Where the design left a choice it settled: loss as the link lost it, with the SFU's own
+gaps out, an outage only a new start, evidence only from after a decision and a verdict only on 20 packets; a
+share without a smaller layer never capped; every cap decided again when a request changes while `limited`; and
+the guards on the viewer's RTCP of §12 (from its review: a flood of receiver reports had cost quadratic work under
+the allocator's lock, and a REMB past an int64 broke the arithmetic on arm64). Two tests changed with it: integration
+4 loses 5 % of the video instead of 10 %, and integration 16's first trial fails on REMB (§17). The `rembsim`
+subpackage was outside S84's listed paths (README §5: a package means its own directory); the spec asks for it, and
+group 12 accepted it.
+
 ## Decisions taken at integration (formerly open questions)
 
 1. **Layer pausing** (§11): on by default, with the switch `sfu.pause_unwatched_layers`; the slice is cuttable to M5.
@@ -2879,3 +3076,21 @@ Decided after group 11 (an engineering call the owner delegated; README §6 (2))
    which repeat without ids what the SFU logs itself, and its lines about stray checks name the client's address.
    04's netx does the same for its muxes' Pion logger, whose warnings were debug lines already (04 §7.3). So at
    info and above no line of Pion's names an address, and the log capture test checks every component (§13).
+
+Decided after group 12 (engineering calls the owner delegated; README §6 (1), (2), (3)):
+
+6. **Retransmissions are paced, ahead of new media** (§9.5, §9.8; README S84, the question S63 left open). A video
+   retransmission goes through the DownTrack's token bucket like new media, and the writer serves the RTX queue
+   first, so a repair never waits behind a frame and a large frame asked for again leaves spread like the frame
+   itself. Audio and its retransmissions are never paced.
+7. **The downlink allocator reads loss as the link lost it** (§9.3, §10.2, §12). The own sequence numbers the SFU
+   never sent are taken out; a receiver report more than 2 s after the last is an outage and only starts the count
+   again; a report is evidence about a decision only when all of its interval came after it; a verdict needs 20
+   packets; and a viewer's reports count at most once per 200 ms each, at most 1024 kept. Since receivers count
+   packets that RTX brought back as lost, integration 4 loses 5 % of the video, under the 10 % that is congestion
+   (§17).
+8. **Two rules of the allocation, and what integration 16 shows** (§10.2, §17). A share without a smaller layer
+   is never capped, since a cap would leave its viewer without video; while `limited`, any change to a request
+   decides every cap again, newest `high` first, which can also give an older request its full layer back. With
+   `rembsim`, the first failed trial of integration 16 fails on a falling REMB rather than on loss; either fails a
+   trial, and the test accepts both.

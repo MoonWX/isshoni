@@ -433,11 +433,11 @@ func TestRestartInPlace(t *testing.T) {
 	}
 }
 
-// logSignals says its line once per signal and stops when told to.
-func TestLogSignals(t *testing.T) {
+// onSignals calls its function once per signal and stops when told to.
+func TestOnSignals(t *testing.T) {
 	sigs := make(chan os.Signal, 1)
 	said := make(chan struct{}, 8)
-	stop := logSignals(sigs, func() { said <- struct{}{} })
+	stop := onSignals(sigs, func() { said <- struct{}{} })
 	for range 3 {
 		sigs <- syscall.SIGHUP
 		select {
@@ -453,6 +453,32 @@ func TestLogSignals(t *testing.T) {
 		t.Error("a signal after stop was answered")
 	case <-time.After(20 * time.Millisecond):
 	}
+}
+
+// onSignals' stop waits for a call that is under way, but not for one that hangs (a reload whose read of the
+// certificate files does not end): the process exits after its shutdown all the same.
+func TestOnSignalsStopDoesNotWaitForAHungCall(t *testing.T) {
+	sigs := make(chan os.Signal, 1)
+	started, release := make(chan struct{}), make(chan struct{})
+	returned := make(chan struct{})
+	stop := onSignals(sigs, func() {
+		defer close(returned)
+		close(started)
+		<-release
+	})
+	sigs <- syscall.SIGHUP
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the signal was not answered")
+	}
+	begin := time.Now()
+	stop()
+	if took := time.Since(begin); took < onSignalsWait || took > onSignalsWait+2*time.Second {
+		t.Errorf("stop returned after %v with a call that hangs, want about %v", took, onSignalsWait)
+	}
+	close(release) // the call ends after all, and so does the watcher (leakCheck)
+	<-returned
 }
 
 // The first signal ends the context; the second one calls for the immediate exit; stop ends the watching.

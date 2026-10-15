@@ -165,13 +165,9 @@ async function share(page: Page): Promise<string> {
   return own.id;
 }
 
-/**
- * The share's H.264 profile as the page's last room.state has it: viewer/stats.ts puts `codec` into each share of
- * state() (README S86), a field stats.ts's DebugShare doesn't declare.
- */
+/** The share's H.264 profile as the page's last room.state has it (state()'s per-share `codec`, 05 §10.7). */
 function codecOf(share: DebugShare | undefined): string | null {
-  const codec: unknown = share === undefined ? undefined : Reflect.get(share, 'codec');
-  return typeof codec === 'string' ? codec : null;
+  return share?.codec ?? null;
 }
 
 /** The exceptions nobody caught on a page, from now on: a test expects none. */
@@ -337,6 +333,9 @@ test('a fresh Firefox hears the share while it waits for its decoder, and sends 
   });
   const stage = dan.getByRole('region', { name: /^Now watching:/ });
   await expect(stage.getByText(/still getting its video decoder/)).toBeVisible();
+  // The page's state says so too: a Firefox waits for its decoder, it doesn't lack one (state()'s codecWait).
+  const notice = await waitForState(dan, (s) => s.viewer.codecWait, { message: "the friend's page has a codec wait" });
+  expect(notice, "the friend's codec wait").toBe('waiting');
   await waitForStats(
     dan,
     (s) => (audioOf(s, shareId)?.bytesReceived ?? 0) > 0 && (audioOf(s, shareId)?.audioLevel ?? 0) > 0.05,
@@ -372,6 +371,7 @@ test('a fresh Firefox hears the share while it waits for its decoder, and sends 
   });
   await keepsDecoding(dan, shareId, 'the friend');
   await expect(stage.getByText(/still getting its video decoder/)).toBeHidden();
+  await waitForState(dan, (s) => s.viewer.codecWait === null, { message: "the friend's codec wait is over" });
 
   // The page's whole part was that caps.update: never a pc.restart for codecs (01 §11.7).
   expect(sent(wire, 'pc.restart'), "the friend's pc.restart").toEqual([]);

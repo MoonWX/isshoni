@@ -16,7 +16,8 @@ type SFU struct {
 	log    *slog.Logger
 	events RoomEvents
 	apis   *apis
-	// pauseUnwatched is Config.PauseUnwatchedLayers, for the uplink policy (README S88).
+	// pauseUnwatched is Config.PauseUnwatchedLayers: the uplink policy pauses a share's full layer while nobody asks
+	// for high (02 §11).
 	pauseUnwatched bool
 	// commandWait is how long a signal call waits for room in a Conn's command queue: commandWait (5 s), shorter in
 	// tests. It is set before the first Join and never changes.
@@ -38,6 +39,9 @@ type SFU struct {
 	// allocSkew is added to monoNow for the downlink allocators' clock (allocNow): 0 but in tests, which move it on to
 	// see backoffs and trials pass (02 §17: allocator_test uses a fake clock).
 	allocSkew atomic.Int64
+	// uplinkSkew is added to monoNow for the uplink policies' clock (uplinkNow): 0 but in tests, which move it on to
+	// see the 10 s of layer pausing pass.
+	uplinkSkew atomic.Int64
 	// fullMaxBps is the full layer's MaxBitrate under the admin's cap, in bit/s (fullLayerMax of limits): New and
 	// SetLimits set it with limits. The NACK path reads it for the retransmission budget (Share.maxBitrate), once
 	// per NACK, so it is an atomic and not a field under mu.
@@ -104,7 +108,7 @@ func New(cfg Config, deps Deps) (*SFU, error) {
 		probes:         map[probeKey]*probe{},
 		probing:        map[*probe]struct{}{},
 	}
-	s.fullMaxBps.Store(int64(fullLayerMax(cfg.Limits)))
+	s.fullMaxBps.Store(int64(fullLayerMax(cfg.Limits.shareCap())))
 	return s, nil
 }
 
@@ -208,8 +212,8 @@ func (s *SFU) Close() error {
 // runTicker is the SFU's ticker goroutine. Every 250 ms, and at once when a share changes state (kick), it makes the
 // ShareUpdated calls that are due; once a second it turns the layers' counters into rates, sizes their packet
 // caches, makes the shares stalled whose pub PC has been away for 2 s, lets a room's codec policy go back to high
-// once its hold has passed, and has every Conn's downlink allocator look at its viewer. The uplink policy of 02 §11
-// is README S88's.
+// once its hold has passed, has every Conn's downlink allocator look at its viewer, and has every Conn that
+// publishes look at its uplink (02 §11).
 func (s *SFU) runTicker() {
 	defer close(s.tickDone)
 	tick := time.NewTicker(tickInterval)
@@ -256,10 +260,13 @@ func (s *SFU) reportShares(now int64) {
 // bitrate (02 §13); the stalled check of 02 §5.3, a live share whose pub PC hasn't been connected for 2 s is stalled
 // (the other ways into stalled don't wait for the ticker: Share.detach, Conn.stallShares); each room's codec policy,
 // whose way back to high waits for its hold to pass (02 §8.3), while every other policy change happens where the
-// viewer set changes; and, with the rates of this second in place, a look of every Conn's downlink allocator at its
+// viewer set changes; with the rates of this second in place, a look of every Conn's downlink allocator at its
 // viewer (02 §10.2), which its actor takes (Conn.adapt): backoffs and trials run out, and the rate forwarded to the
-// viewer and the drops of its queues are weighed.
+// viewer and the drops of its queues are weighed; and a look of every Conn that publishes at its uplink (02 §11),
+// which its actor takes too (Conn.uplinkTick): each share's uplink policy with its quality hints, and the REMB of the
+// admin's cap on the pub PC.
 func (s *SFU) everySecond(now int64) {
+	var publishers []*Conn
 	for _, sh := range s.liveShares() {
 		for _, l := range sh.attached() {
 			l.tick(now)
@@ -267,6 +274,9 @@ func (s *SFU) everySecond(now int64) {
 		sh.tickEgress(now)
 		if sh.conn.pubAway(now) >= s.timing.stalled {
 			sh.stall("the pub PC is not connected")
+		}
+		if !slices.Contains(publishers, sh.conn) {
+			publishers = append(publishers, sh.conn)
 		}
 	}
 	s.mu.Lock()
@@ -285,6 +295,20 @@ func (s *SFU) everySecond(now int64) {
 	for _, c := range conns {
 		c.wakeAllocator()
 	}
+	for _, c := range publishers {
+		c.wakeUplink()
+	}
+}
+
+// publishers returns the Conns that publish a share that hasn't ended, each once.
+func (s *SFU) publishers() []*Conn {
+	var out []*Conn
+	for _, sh := range s.liveShares() {
+		if !slices.Contains(out, sh.conn) {
+			out = append(out, sh.conn)
+		}
+	}
+	return out
 }
 
 // codecNow is the codec policy's clock: monoNow, moved on in tests (clockSkew).
@@ -468,6 +492,8 @@ func (s *SFU) addShare(c *Conn, p StartShareParams) (*Share, error) {
 	}
 	sh.awaitsKeyframe.Store(true)
 	sh.audioBps.Store(int64(presetAudioBitrate(p.Preset)))
+	// The cap of the ShareParams that StartShare returns, read under s.mu, where SetLimits sets it.
+	sh.up = newShareUplink(s, s.limits.shareCap())
 	s.shares[sh.id] = sh
 	c.room.shares[sh.id] = sh
 	c.part.shares[sh.id] = sh
@@ -597,8 +623,10 @@ func (s *SFU) CloseRoom(room RoomID, r EndReason) {
 }
 
 // SetLimits replaces the admin's soft limits; the wiring calls it when 03's settings change. New ShareParams follow
-// the new cap at once, and so do the retransmission budgets of the full layers' viewers (02 §9.5). Telling running
-// shares (REMB on the pub PC and a quality hint, 02 §11) is README S88's. An invalid value is logged and ignored.
+// the new cap at once, and so do the retransmission budgets of the full layers' viewers (02 §9.5). Running shares
+// follow at once too, not at the ticker's next second: every Conn that publishes looks at its uplink, so a share
+// whose cap changed gets a quality hint with the reason admin, and its pub PC the REMB of the new cap (02 §11). An
+// invalid value is logged and ignored.
 func (s *SFU) SetLimits(l Limits) {
 	if err := l.validate(); err != nil {
 		s.log.Warn("limits ignored", "err", err)
@@ -606,8 +634,11 @@ func (s *SFU) SetLimits(l Limits) {
 	}
 	s.mu.Lock()
 	s.limits = l
-	s.fullMaxBps.Store(int64(fullLayerMax(l)))
+	s.fullMaxBps.Store(int64(fullLayerMax(l.shareCap())))
 	s.mu.Unlock()
+	for _, c := range s.publishers() {
+		c.wakeUplink()
+	}
 }
 
 // currentLimits returns the admin's soft limits.

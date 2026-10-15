@@ -16,7 +16,8 @@ type Config struct {
 	// closes it after SFU.Close; the SFU never binds or closes a socket. Tests inject sockets (sfutest.FaultConn)
 	// through netx.TransportOptions.PacketConns.
 	Transport *netx.Transport
-	// PauseUnwatchedLayers is 04's key sfu.pause_unwatched_layers (02 §11, README S88).
+	// PauseUnwatchedLayers is 04's key sfu.pause_unwatched_layers (02 §11): a share's full layer is paused while
+	// nobody has asked for high for 10 s (uplink.go).
 	PauseUnwatchedLayers bool
 	Limits               Limits
 }
@@ -24,8 +25,8 @@ type Config struct {
 // Limits are the admin's soft limits (02 §12): 0 means unlimited, the default. They are stored by 03 and pushed
 // live with SFU.SetLimits. The room share limit and the participant limit are the hub's (01), not here.
 type Limits struct {
-	// MaxShareKbps caps each share's full layer: ShareParams (02 §8.6) and, with README S88, REMB and the quality
-	// hint (02 §11). It is 03's maxShareBitrateKbps.
+	// MaxShareKbps caps each share: its full layer in ShareParams and quality hints (02 §8.6), and what REMB lets its
+	// pub PC send (02 §11). It is 03's maxShareBitrateKbps.
 	MaxShareKbps int
 }
 
@@ -34,6 +35,12 @@ func (l Limits) validate() error {
 		return fmt.Errorf("sfu: Limits.MaxShareKbps is %d (0 means unlimited)", l.MaxShareKbps)
 	}
 	return nil
+}
+
+// shareCap is the admin's cap on a share in bit/s, 0 for none. A cap beyond maxShareCapKbps counts as that much, so
+// the REMB of a pub PC with four shares can't overflow: a cap that large limits nothing anyway.
+func (l Limits) shareCap() int {
+	return min(l.MaxShareKbps, maxShareCapKbps) * 1000
 }
 
 func (c Config) validate() error {
@@ -148,6 +155,25 @@ const (
 	// A layer's rates are 2 s moving averages, and a layer without a packet for 2 s isn't active (02 §9.1).
 	rateWindow  = 2 * time.Second
 	activeAfter = 2 * time.Second
+	// jitterGap: a packet that arrives this long after the last one a layer's jitter estimate took starts the
+	// estimate again from there, as the first packet does (Layer.sampleJitter). A layer that its sharer paused for an
+	// hour has no interarrival time to speak of, and the arithmetic in clock ticks stays far from overflowing.
+	jitterGap = 10 * time.Second
+)
+
+// Uplink control (02 §11, uplink.go).
+const (
+	// pauseAfter: a share's full layer is paused once no viewer has asked for high for this long, with
+	// sfu.pause_unwatched_layers on.
+	pauseAfter = 10 * time.Second
+	// rembLifts is how many REMBs of rembUncapped a pub PC gets once the cap that its REMBs carried is gone: a browser
+	// keeps the last REMB as its limit until another one comes, and one REMB may be lost.
+	rembLifts = 3
+	// rembUncapped is the REMB that limits nothing (1 Gbit/s), far above what any share sends. A REMB of 0 means no
+	// limit to libwebrtc, but a stop to a receiver that reads it literally.
+	rembUncapped = 1 << 30
+	// maxShareCapKbps bounds Limits.MaxShareKbps where it is turned into bit/s (shareCap): 1 Tbit/s.
+	maxShareCapKbps = 1 << 30
 )
 
 // Repair: what a viewer's NACKs get from the packet cache (02 §9.5).

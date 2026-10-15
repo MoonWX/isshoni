@@ -795,8 +795,9 @@ If isshoni was installed from a package, both refuse and print `apt remove issho
 **Containers** (`deploy/test/distro/`):
 - `Containerfile` takes `ARG BASE` and installs `systemd`, `dbus`, `curl`, `ca-certificates`, `iproute2`, `procps`
   and `python3`. It deliberately does **not** install openssh-client, which exercises the auto-install path.
-- Started with `podman run -d --systemd=always` on CI, or `docker run -d --privileged --cgroupns=private --tmpfs /run
-  --tmpfs /run/lock` locally (Docker Desktop works on macOS). `CONTAINER_ENGINE` selects which.
+- Started with `podman run -d --systemd=always --cap-add=SYS_ADMIN --cap-add=SYS_PTRACE` (the F16 bullet below), or
+  `docker run -d --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock` (Docker Desktop works on macOS; CI
+  uses Docker, the S78 bullet below). `CONTAINER_ENGINE` selects which.
 - **As README S78 built it, CI uses Docker too**: the `distro` job sets `CONTAINER_ENGINE=docker`, with the same
   `--privileged`, `--cgroupns=private` and host-gateway setup that release.yml's `verify` job used until README
   F09, because the runner's podman is rootless and its containers reach the runner's `relserve` another way (the
@@ -813,10 +814,9 @@ If isshoni was installed from a package, both refuse and print `apt remove issho
   (`ProtectSystem=` and the rest are mount namespaces). Without it systemd skips the sandbox ("namespace setup is
   prohibited (container manager?)"), and with it the `StateDirectory=` bind mount, so the server, which sees a
   Podman container (`/run/.containerenv`), refuses `/var/lib/isshoni` as not a mounted volume (exit 78, 04 §5.1).
-  A privileged Docker container never met this. `distro-test.sh`'s podman path has no `--cap-add` yet, so its C1
-  would meet the same refusal; CI doesn't take that path (the bullet above). **How a rootless container reaches
-  `relserve`**: through
-  slirp4netns, which connects from the runner to the runner's own address, the one podman puts into the
+  A privileged Docker container never met this; `distro-test.sh`'s podman path gives the capability too (the next
+  bullet). **How a rootless container reaches `relserve`**: through slirp4netns, which connects from the runner to
+  the runner's own address, the one podman puts into the
   container's `/etc/hosts` as `host.containers.internal` (a name in relserve's certificate). So `relserve` listens
   on every address, and the installer's base is `https://host.containers.internal:<port>`. The runner's loopback
   address is not reachable that way (with `allow_host_loopback=true` too, podman 4.9 maps the name to the runner's
@@ -840,6 +840,35 @@ If isshoni was installed from a package, both refuse and print `apt remove issho
   both bases, and without `dbus-user-session` the step fails with its own error. The release dry run on the runner
   is what shows it there: its log says whether the runner had a session already (the step prints `linger` and the
   cgroup manager) and where the container reached `relserve`.
+- **`distro-test.sh`'s podman path, as README F16 built it** (review F09-R4): the containers start with
+  `podman run -d --systemd=always --cap-add=SYS_ADMIN --cap-add=SYS_PTRACE`, with no `--privileged` except V3's
+  firewall container, which has all privileges as before. **`CAP_SYS_ADMIN`** is the one `verify` gives, for the
+  unit's sandbox (the bullet above): without it C1 fails, as the server refuses `/var/lib/isshoni` with exit 78
+  and the installer exits 5. **`CAP_SYS_PTRACE`** is for C4, which `verify` doesn't run: `ss -p` names the
+  program behind another user's socket only with it, and the installer's port check (4.9) takes a listener without
+  a name for another program's, so the upgrade would exit 7 on port 8080, which the running isshoni holds. A
+  machine's root has both. Under rootless podman they are the container's, in its own user namespace, and give
+  nothing on the machine; under rootful podman they are the machine's, still less than the Docker path's
+  `--privileged`. **What the script leaves to the caller**: rootless podman needs the caller's systemd user
+  session, as `verify` sets it up (the bullet above): a login, or lingering with `XDG_RUNTIME_DIR` and
+  `DBUS_SESSION_BUS_ADDRESS` pointing at it, so that podman uses the systemd cgroup manager. Without it podman falls
+  back to cgroupfs, with a warning: `podman build` then fails when it has to build the image
+  (`sd-bus call: Permission denied`, the bullet above), and in a container from an image built before, systemd doesn't
+  come up. The script checks for the latter as `verify` does: before each container it asks `podman info`, and when that
+  says rootless and `cgroupfs` it stops and names the cause and the session it needs, instead of waiting a minute for
+  systemd. The network is podman's default: on Linux, where `relserve` listens on every address, slirp4netns (the
+  rootless default up to podman 4.9, checked with 4.9.3) and pasta from podman 5.3 on (its `--map-guest-addr`, checked
+  with 5.8.7) both give the container a `host.containers.internal` that reaches it. Pasta under podman 5.0 to 5.2 gives
+  the name no address that reaches `relserve`, as under 4.9 (the bullet above), and the run stops at "the container does
+  not reach relserve"; there, set `default_rootless_network_cmd = "slirp4netns"` in the `[network]` table of
+  `containers.conf`. F16 checked it rootless, as a user with lingering and no login, in privileged Docker containers
+  that stood in for a Linux machine. With podman 4.9.3 (Ubuntu 24.04, slirp4netns) the parts `main`, `c7`, `c13` and
+  `c11` passed on debian-12 and ubuntu-24.04 (246 checks), and `v3` on ubuntu-24.04 (ufw, 8); with podman 5.8.7 (Fedora
+  44, pasta) the same four parts passed on debian-12 and fedora-44 (246). Without the capabilities, C1 failed as above
+  (podman 4.9.3); with `SYS_ADMIN` alone, C4 failed with exit 7, and C5 after it (both versions). Without a user session
+  (podman 5.8.7 on cgroupfs), `podman build` failed on an empty image store, and with the image built before, the run
+  stopped at the check, before it started a container. Podman on macOS (`podman machine`) was not tried. CI still
+  doesn't take this path (the S78 bullet above).
 - `tools/relserve` serves a locally built, test-signed release over HTTPS (section 11.2).
 
 **VMs** (`deploy/test/vm/`):
@@ -1262,9 +1291,19 @@ actionlint 1.<latest>
 ```
 
 - `<latest>` means: pin the exact latest patch when slice S1 lands. Versions are bumped by hand, monthly, in one PR;
-  Dependabot can't read `.tool-versions`. The same PR bumps the two pins that follow them and that Dependabot doesn't
-  read either (README §6 "Decided after group 9" (3)): `tools/goreleaser/go.mod` with the goreleaser line (below),
-  and the version and digest of the Dockerfile's `# syntax=` line (§6.1).
+  Dependabot can't read `.tool-versions`. The same PR bumps the pins that follow them and that Dependabot doesn't
+  read either (README §6 "Decided after group 9" (3), "Decided after group 12" (8)):
+  - `tools/goreleaser/go.mod` with the goreleaser line (below);
+  - the version and digest of the Dockerfile's `# syntax=` line (§6.1);
+  - the image digests inside workflows, which no Dependabot ecosystem reads (its `docker` ecosystem reads
+    Dockerfiles, its `github-actions` ecosystem `uses:` lines): `release.yml`'s `verify` matrix bases
+    (`docker.io/library/debian@sha256:…` and `ubuntu@sha256:…`, the tag in a comment, 4.13) and the BuildKit image
+    of `build`'s buildx driver (`moby/buildkit:v<x>@sha256:…`, the release that `buildx-stable-1` points to, 9.3;
+    README F09), each to the digest of its multi-arch index that `docker buildx imagetools inspect` prints; and
+    the Pebble and `pebble-challtestsrv` images of `ci.yml`'s `acme` job and of `deploy/test/vm/vm-test.sh`
+    (README F13), which pin the same digests and are bumped together.
+
+  `.github/dependabot.yml`'s "Not covered here" comment names the same list.
 - `go.mod` has `go 1.26.0` and `toolchain go1.27.2`, the `.tool-versions` patch (the plan: language version 1.26,
   newest toolchain). The go line carries a patch because `golang.org/x/text`, `golang.org/x/crypto` and
   `modernc.org/sqlite` require `go 1.26.0`, so `go get` and `go mod tidy` write it that way; the language version is
@@ -1335,7 +1374,7 @@ vars:
 | `test` | `test:go`, `test:web`, `test:sh` | |
 | `test:go` | `CGO_ENABLED=1 go test -race -count=1 -timeout 15m ./...` | the race detector needs cgo; the shipped binary stays `CGO_ENABLED=0` |
 | `test:web` | `npm --prefix web test -- --run`, then `node --test scripts/licenses.test.mjs` in `web/` | Vitest; the license script's tests run under Node's test runner (CI runs them in the `licenses` job) |
-| `test:sh` | `deploy/test/install_unit.sh` under dash, `bash --posix` and busybox | |
+| `test:sh` | `deploy/test/install_unit.sh` under dash, `bash --posix` and busybox, and after it under each shell `deploy/test/vm/vm-test.sh -h`, the VM harness's start-up check that `distro-test.sh` still has every name it takes (4.13; added by the group 12 integration, README F13's review) | Outside CI a shell that isn't installed is skipped with a note (macOS has no busybox); in CI, where `lint-deploy` installs busybox, a missing shell fails the task. The `vm-test.sh -h` check needs no VM, Linux or network, so a rename in `distro-test.sh` fails `lint-deploy` on the PR, not only the nightly. Under dash and `bash --posix` (not busybox, whose own `sha256sum` has no `--strict`) it then runs `deploy/test/check-draft-test.sh`, the test of `publish`'s draft check (9.3, README F15) |
 | `lint` | `lint:go`, `lint:web`, `lint:sh`, `lint:actions`, `lint:keys`, `lint:pins`, `lint:unit` | |
 | `lint:go` | `golangci-lint run`, `go mod tidy -diff`, `GOOS=darwin go vet ./...`, `GOOS=windows go vet ./...` | |
 | `lint:web` | `npm --prefix web run lint && npm --prefix web run typecheck` | |
@@ -1493,8 +1532,8 @@ The `changes` job (`dorny/paths-filter`) sets these outputs. On `push` to `main`
 | `web` | always (`build` always needs its artifact) | `npm ci`, then `lint`, `typecheck`, `test -- --run`, `check:i18n`, `build`, `check:size` (05 §2). Uploads `web/dist` | 10 | yes |
 | `protocol` | go or web | `task gen:check` (tygo drift). The golden fixtures (`01`) run inside `test-go` and `web` | 5 | yes |
 | `licenses` | go, web or site | `task licenses` | 10 | yes |
-| `build` | always | downloads `web/dist`, `task notices`, `task build:go` (no Node on this runner); `bin/isshoni version --json` must show the commit and `0.0.0-ci.<run>`; warns above 60 MB. Uploads `bin/isshoni` | 10 | yes |
-| `e2e` | go, web or deploy (below) | setup-node and `npm ci` in `web/`; downloads the binary and runs `chmod +x bin/isshoni` (artifacts lose the mode bit); env `ISSHONI_BIN: ${{ github.workspace }}/bin/isshoni`; the runner's preinstalled Google Chrome stable, plus Playwright's ffmpeg for the videos (`npx --prefix web playwright install ffmpeg`; `… install chrome`, which brings ffmpeg along, only if Chrome is missing); installs `xvfb`, `openbox` and `pulseaudio` and starts a PulseAudio null sink as the default sink (Chrome gets an output device for tab audio; the step can go if the specs that play audio pass without it); `xvfb-run -a --server-args="-screen 0 1920x1080x24" sh -c 'openbox & exec npm --prefix web run e2e'`: Chrome's capture picker needs a window manager under X11. One Playwright worker and one retry (05 §19.3). After every run that was not cancelled, green or red, uploads `web/test-results/` (the Playwright trace and video of a failed attempt, the per-server JSON logs `server-*.log`, 14) and `web/playwright-report/` as `e2e-results`, kept 7 days | 20 | yes |
+| `build` | always | downloads `web/dist`, `task notices`, `task build:go` (no Node on this runner); `bin/isshoni version --json` must show the commit and `0.0.0-ci.<run>`; warns above 60 MB. Uploads `bin/isshoni`; then builds `bin/isshoni-loadtest` (`CGO_ENABLED=0 go build -trimpath`, not a release artifact) and uploads it as `isshoni-loadtest-linux-amd64` for e2e's `decodable.spec` (README S89) | 10 | yes |
+| `e2e` | go, web or deploy (below) | setup-node and `npm ci` in `web/`; downloads the two binaries and runs `chmod +x` on both (artifacts lose the mode bit); env `ISSHONI_BIN: ${{ github.workspace }}/bin/isshoni` and `LOADTEST_BIN: ${{ github.workspace }}/bin/isshoni-loadtest` (`decodable.spec`'s tool, README S89; without it the spec builds the tool with the Go on the `PATH`); the runner's preinstalled Google Chrome stable, plus Playwright's ffmpeg for the videos (`npx --prefix web playwright install ffmpeg`; `… install chrome`, which brings ffmpeg along, only if Chrome is missing); installs `xvfb`, `openbox` and `pulseaudio` and starts a PulseAudio null sink as the default sink (Chrome gets an output device for tab audio; the step can go if the specs that play audio pass without it); `xvfb-run -a --server-args="-screen 0 1920x1080x24" sh -c 'openbox & exec npm --prefix web run e2e'`: Chrome's capture picker needs a window manager under X11. One Playwright worker and one retry (05 §19.3). After every run that was not cancelled, green or red, uploads `web/test-results/` (the Playwright trace and video of a failed attempt, the per-server JSON logs `server-*.log`, 14) and `web/playwright-report/` as `e2e-results`, kept 7 days | 20 | yes |
 | `lint-deploy` | deploy, readme or repocheck | `task lint:sh lint:actions lint:keys lint:unit lint:pins test:sh` | 10 | yes |
 | `distro-release` | deploy or release, or `tools/relserve` or `tools/notices` (below) | builds the two test releases once for the matrix (README S78): setup-node and `npm ci` in `web/`, because `task release:snapshot` builds the SPA (7.2); rpm on the runner; `sh deploy/test/distro-test.sh -b`; uploads them as the artifact `distro-releases`, kept 1 day | 20 | yes |
 | `distro` | as `distro-release` | matrix of the 6 container distros (4.13), scenarios from 11.2, on the releases of `distro-release` (`distro-test.sh -r`), with `CONTAINER_ENGINE=docker` | 30 | yes |
@@ -1652,7 +1691,10 @@ same holds for git and PulseAudio on runners. The "no GPL" rule covers code in t
   `-r` (the `vm-release` job's releases) and `-o` (the matrix row's parts). S83 first wrote it inline in that step,
   sourcing `distro-test.sh` without its last line, because it could change only `nightly.yml` (README §6 "Decided
   after group 11" (5)); README F13 moved it into the script, behind `distro-test.sh`'s sourced guard, and
-  `lint:sh` covers it. Pebble and challtestsrv start inside the script, not in a step of their own.
+  `lint:sh` covers it. Pebble and challtestsrv start inside the script, not in a step of their own. The job's first
+  real run is the first nightly after `m1/server-web` reaches `main`: F13 never ran the VMs of debian-13,
+  ubuntu-22.04 and ubuntu-26.04 by hand, nor any VM on x86_64 with KVM, the only way the job runs (README §6 "Owner
+  actions").
 - **`goreleaser-full` does not sign**: `goreleaser release --snapshot --clean --skip=sign` with the images and the
   SBOMs, not the plain command of the table. cosign's keyless signature would need `id-token: write` in a job that
   also runs npm, which `release.yml` keeps apart (9.3), and every night would add an entry to the public
@@ -2001,9 +2043,13 @@ alone. Registry logins are a plain `docker login` with the job's token, not a th
   1. `gh release download "$TAG" --dir rel` (the draft is visible to `GITHUB_TOKEN`);
   2. `(cd rel && sha256sum --strict -c checksums.txt)`, so every asset matches what is about to be signed and a
      malformed line fails, and **nothing is in the draft that the signature would not cover**: the job fails on an
-     asset, hidden ones included (`shopt -s dotglob`), that `checksums.txt` does not list (`checksums.txt` itself,
-     its `.sig` and its `.sigstore.json` excepted; a `.sig` is there when the job runs again after it uploaded
-     one). It is `publish`'s check without the signature, so a draft that `publish` would refuse is never signed;
+     asset, hidden ones included (`shopt -s dotglob nullglob`), that `checksums.txt` does not list (`checksums.txt`
+     itself, its `.sig` and its `.sigstore.json` excepted; a `.sig` is there when the job runs again after it
+     uploaded one). It is `publish`'s check without the signature, so a draft that `publish` would refuse is never
+     signed. It stays inline in `sign` and `sign-dry`, and `deploy/test/check-draft-test.sh` fails if either
+     loses `--strict`, sets `dotglob nullglob` only after its `for f in rel/*` loop or not at all, drops that loop
+     or its `exit 1`, gets an `if:` or `continue-on-error:` from the check to the signature, or checks after it
+     signs (README F15; reviews F09-R3, F15-R2);
   3. fails when the environment has no secret `RELEASE_SSH_SIGNING_KEY`; removes an earlier `checksums.txt.sig`
      first (without a terminal, `ssh-keygen -Y sign` keeps an existing signature file and still exits 0); writes
      the key under `umask 077` into `$RUNNER_TEMP` and deletes it when the step ends;
@@ -2058,20 +2104,49 @@ alone. Registry logins are a plain `docker login` with the job's token, not a th
   `sign-dry` is skipped, so a plain condition would skip `publish` after a green `verify`, and the run would end
   green with the release still a draft and the floating tags not moved (actions/runner#491; the dry run can't show
   it, because it skips `publish` by design).
-- Permissions: `contents: write`, `packages: write`. Checks out `deploy/keys` (sparse).
+- Permissions: `contents: write`, `packages: write`. Checks out `deploy/keys` and `deploy/release` (sparse).
 - Fails if the draft body still contains `TODO` ("edit them on GitHub, then re-run this job").
 - **Checks the draft once more, right before it goes public** (README F09, review R4): `gh release download` into
-  a new `rel/`, then fails unless all three pass, in this order: `ssh-keygen -Y verify -f
+  a new `rel/`, then `sh deploy/release/check-draft.sh rel deploy/keys/allowed_signers` (README F15, review
+  F09-R1), which fails unless all three checks pass, in this order: `ssh-keygen -Y verify -f
   deploy/keys/allowed_signers -I isshoni-release -n isshoni-checksums -s rel/checksums.txt.sig <
   rel/checksums.txt`; `(cd rel && sha256sum --strict -c checksums.txt)`; and the asset check of `sign`: every
   file of the draft, hidden ones included, is listed in `checksums.txt`, except `checksums.txt`, its `.sig` and
-  its `.sigstore.json`. The step reads nothing but `rel/` and `deploy/keys/allowed_signers`; F09 ran it on
-  fixture directories (a draft as signed passes, and so does one without the cosign bundle; an added asset, an
-  added hidden asset, a changed `install.sh`, a changed `install.sh` with `checksums.txt` to match, a signature of
-  another key, no signature, a missing asset and an empty `allowed_signers` each fail), and `sign`'s and
-  `sign-dry`'s check too (an added asset, a hidden one, a changed `install.sh` and a malformed line each fail).
-  Those were one-off runs of the steps taken out of the workflow: the checks are inline, and no test in the
-  repository runs them again.
+  its `.sigstore.json`. The signature comes first, so `sha256sum` reads only names that the key signed.
+- **`deploy/release/check-draft.sh DIR ALLOWED_SIGNERS`** as README F15 built it: POSIX sh, run with the runner's
+  `sh` (dash). It reads nothing but the two paths and changes nothing; exit 0 with a line that says `ok`, 1 when a
+  check fails (or the draft has no `checksums.txt` or `.sig`, or `ALLOWED_SIGNERS` is missing or empty), 2 for
+  usage. Hidden files count without `dotglob`: it walks both `DIR/*` and `DIR/.*`, skips `.`, `..` and a pattern
+  that matched nothing, and names every unlisted file, a directory too, not only the first. A file is listed when
+  a line of `checksums.txt` is `<hex>  NAME` or `<hex> *NAME` for its whole name (taken from the environment, since
+  `awk -v` would turn a backslash into an escape), so a name that starts, ends or extends a listed one is not
+  listed. In GitHub Actions (`GITHUB_ACTIONS=true`) each error is an `::error::` annotation, with control
+  characters shown as `?`, so that an asset's name can't start a workflow command of its own, and `%` as `%25`
+  (as `@actions/core` escapes it: the runner decodes `%25`, `%0D` and `%0A` in a message, so a name with `%0A` in
+  it would show as two lines); the step adds one annotation that names the tag.
+- **Its test**, `deploy/test/check-draft-test.sh`, which `task test:sh` runs under dash and `bash --posix` (the
+  script under the same shell; not busybox, whose own `sha256sum` has no `--strict`). It makes an ephemeral release
+  key and another key with `ssh-keygen`, an `allowed_signers` for the first, and a draft as `sign` leaves it (the
+  asset names of §3, `checksums.txt`, its cosign bundle and `.sig`); each case copies that draft, changes one thing
+  and asserts the exit code and the error of the check meant to catch it. Passing: the draft as signed, from
+  another directory and with relative paths as `publish` gives them; without the cosign bundle; with a hidden asset
+  that the signed `checksums.txt` lists; with a `<hex> *NAME` line. Failing at the asset list: an added asset, an
+  added hidden file, a name that extends, starts or ends a listed one, two added assets (both named), a directory,
+  a missing `checksums.txt` line signed again, a hidden copy of `checksums.txt`. At the checksums: a changed
+  `install.sh`, a missing asset, a malformed line signed again. At the signature: a changed `install.sh` with
+  `checksums.txt` to match (unsigned, and signed by another key), a signature of another key, of the right key in
+  the namespace `file`, a broken one, none, no `checksums.txt`, a missing line not signed again, a bad signature
+  together with an added asset (only the signature is reported), and an `allowed_signers` that is empty, missing,
+  for another principal or for another namespace. Then usage (exit 2, `-h`); the annotations with a name that
+  holds a line break and one that holds `%0A` (shown as `%250A`; outside Actions as it is); and `release.yml`
+  itself (review F15-R1, R2), with the lines it looks for matched whole: `publish` runs the script as `if ! sh
+  deploy/release/check-draft.sh rel deploy/keys/allowed_signers; then` with `exit 1` as the only exit before that
+  `if`'s `fi`, after the last `gh release download` and before the first `--draft=false`, with no `if:` or
+  `continue-on-error:` from that download to `--draft=false`; it checks out `deploy/release` and keeps no inline
+  copy of the check. `sign`'s and `sign-dry`'s inline checks run, in this order and before `ssh-keygen -Y sign`,
+  `(cd rel && sha256sum --strict -c checksums.txt)`, `shopt -s dotglob nullglob`, and the `for f in rel/*` loop
+  whose unlisted branch ends in `exit 1`, with no `if:` or `continue-on-error:` from the check's step to the
+  signature. No key is committed: the keys live in the test's temporary directory.
 - A final release: `gh release edit "$TAG" --draft=false --latest`. A prerelease: `--draft=false --prerelease
   --latest=false`, so GitHub's "latest" stays where it is (goreleaser sets none, `make_latest: false`, 9.2).
 - Unless it is a prerelease: `docker buildx imagetools create -t ghcr.io/moonwx/isshoni:<tag> …
@@ -2532,7 +2607,9 @@ rest):
 | V5 | ACME with Pebble plus `pebble-challtestsrv` on the runner. The VM uses `ISSHONI_TLS_ACME_CA` and `ISSHONI_TLS_ACME_CA_ROOT` (04's keys `tls.acme_ca`, `tls.acme_ca_root`), and challtestsrv resolves `isshoni.test` to the VM | `--domain isshoni.test --yes` is ready within 60 s; the certificate issuer is Pebble. IP mode (`--ip`) the same, if the pinned Pebble supports IP identifiers; otherwise IP mode stays on the manual release checklist |
 | V6 | `systemd-analyze security isshoni` | score ≤ the recorded value + 0.2 |
 
-**As README S83 built the VM runs** (`nightly.yml`'s `distro-vm`, 8.5), where the table leaves a choice:
+**As README S83 built the VM runs** (`nightly.yml`'s `distro-vm`, 8.5; since README F13 the script
+`deploy/test/vm/vm-test.sh`, which starts Pebble and challtestsrv for V5 itself, 4.13), where the table leaves a
+choice:
 - **V1** is the `main` part: the container scenarios C1–C6, C8–C10 and C12 in that VM, in the order of the
   container run, plus the sysctl values; C7 and C13 get a VM each, as they get a container each. In a VM, C1's two
   checks that the installer installs the OpenSSH client are skipped and labelled so: an SSH server needs the
@@ -2751,10 +2828,11 @@ Anything beyond these, such as a reload, a second tap, a re-join or a second log
 | Level | Test | Asserts |
 |---|---|---|
 | Unit | `deploy/test/install_unit.sh` (11.1) | parsing, normalization, version order, checksum lookup, signature fail-closed cases, `ss` parsing, key block |
+| Unit | `deploy/test/check-draft-test.sh` (9.3; `test:sh` under dash and `bash --posix`, 7.2) | `deploy/release/check-draft.sh` passes a good draft signed with throwaway keys and fails an added asset, a hidden file, a changed `install.sh`, a bad or missing signature and a missing checksums line; `release.yml`'s `publish` calls it, and `sign`/`sign-dry` keep `--strict` and `dotglob nullglob` (README F15) |
 | Unit | `web/scripts/licenses.test.mjs` (Node's test runner: `task test:web` and the CI `licenses` job) | the SPDX `OR`/`AND` rules; a missing license fails; a GPL-only dev dep fails; `(MIT OR GPL-3.0)` passes; overrides apply |
 | Unit | `tools/notices` golden test on a fixture module tree | deterministic output; Apache `NOTICE` included; a non-allowlisted license fails; the Go runtime entry is present |
 | Unit | `tools/relserve` | `/latest` redirect format matches GitHub's; files served; the CA verifies |
-| Static | `lint-deploy` | shellcheck, shfmt, actionlint, `systemd-analyze verify`, the key block, `.tool-versions` = `go.mod` toolchain |
+| Static | `lint-deploy` | shellcheck, shfmt, actionlint, `systemd-analyze verify`, the key block, `.tool-versions` = `go.mod` toolchain; through `test:sh`, the VM harness's check of the names it takes from `distro-test.sh` (`vm-test.sh -h`, 7.2) |
 | Integration | distro containers C1–C13 (11.2) | install, idempotency, upgrade, downgrade refusal, tamper refusal, port conflict, re-runs after exit 7 and exit 5, uninstall, purge, backup/restore |
 | Integration | Docker smoke (11.3) | bridge and host bind 443 as designed, healthcheck, setup-url via exec, persistence, backup (a `0600` file) → restore through `exec -T` with `--yes`, an IPv6 client seen as the bridge gateway (6.4), no-volume refusal, start with no `.env` |
 | Integration | `goreleaser-check` | the asset names and archive contents of section 3 |
@@ -2956,12 +3034,13 @@ Decided after group 9 (engineering calls the owner delegated; README §6):
 
 Decided after group 10 (an engineering call the owner delegated; README §6 (1)):
 
-- **The M1 security review's finding in the release pipeline (R4) is fixed** by README F09 in group 12, where no other
-  slice touches `release.yml` or `cmd/isshoni` (README S82 has the first in group 11, S90 the second in group 13):
-  `verify` drops its write token and its privileged container from unpinned bases, and `publish` checks the draft
-  again before it publishes it (4.13, 9.3). F09 also fixes R5, which is 04's: `admin backup` without `--out` never
-  writes into a file that already exists at the default name (04 §12.3). The review was read-only, of `main` at
-  f7053dc, before the first release candidate; README §6 has its other findings and their slices.
+- **The M1 security review's finding in the release pipeline (R4) is fixed** by README F09, merged in group 12,
+  where no other slice touched `release.yml` or `cmd/isshoni` (README S82 had the first in group 11, S90 has the
+  second in group 13): `verify` has no write token and runs its container rootless from bases pinned by digest,
+  and `publish` checks the draft again before it publishes it (4.13, 9.3). F09 also fixed R5, which is 04's:
+  `admin backup` without `--out` never writes into a file that already exists at the default name (04 §12.3). The
+  review was read-only, of `main` at f7053dc, before the first release candidate; README §6 has its other findings
+  and their slices. Group 12's notes on F09 are below.
 
 Decided after group 11 (engineering calls the owner delegated; README §6 (3), (5)):
 
@@ -2974,3 +3053,21 @@ Decided after group 11 (engineering calls the owner delegated; README §6 (3), (
   to `deploy/test/vm/vm-test.sh`. The second stays: `goreleaser-full` doesn't sign (`--skip=sign`), because
   cosign's keyless signature would need an OIDC token in a job that runs npm and a public transparency-log entry
   every night, while `release.yml`'s dry run covers the signing.
+
+Decided after group 12 (an engineering call the owner delegated; README §6 (8)):
+
+- **README F09's `verify` departs from the design in three ways, which this doc now has** (4.13, 9.3). Its rootless
+  `podman run -d --systemd=always` also takes `--cap-add SYS_ADMIN` (the container's own, in its user namespace: systemd
+  needs it for the unit's sandbox, or the server refuses `/var/lib/isshoni` as not a mounted volume) and
+  `--network slirp4netns` (with pasta, the default from podman 5 on, the name `host.containers.internal` gets no address
+  that reaches the runner); `relserve` listens on every address, since slirp4netns reaches the runner's own address and
+  not its loopback; and a step first makes sure that the runner's user has a systemd user session, without which
+  rootless podman falls back to cgroupfs and systemd can't come up in the container. `sign` checks the draft's assets as
+  strictly as `publish` and uploads the files it signed, hidden ones included, as `release-signed` (with
+  `actions/upload-artifact`, GitHub's and pinned by SHA like checkout), which `verify` installs.
+- **What F09 left for later**: the release dry run on GitHub (`workflow_dispatch` with `dry_run`) is the proof that
+  the hosted runner boots systemd in a rootless container, and runs once `m1/server-web` is pushed (README §6
+  "Owner actions"); `publish`'s draft check was tested only by one-off runs taken out of the workflow, which README
+  F15 (group 13) turned into `deploy/release/check-draft.sh` with a committed test under `task test:sh` (9.3); and
+  `distro-test.sh`'s podman path lacked `--cap-add SYS_ADMIN`, which README F16 (group 13) added with `SYS_PTRACE`,
+  leaving the user session to the caller and stopping with its cause when there is none (4.13). The image digests that F09 and F13 pin are bumped by hand with the tool pins (7.1).

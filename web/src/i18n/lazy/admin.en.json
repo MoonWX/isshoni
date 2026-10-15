@@ -35,6 +35,221 @@
       "copyManually": "Couldn't copy for you. The link is selected: copy it yourself.",
       "done": "Done"
     },
+    "dashboard": {
+      "title": "Dashboard",
+      "lead": "What the server is doing right now. The numbers update every 2 seconds while this page is open.",
+      "updated": "Updated",
+      "stale": "Couldn't update: these numbers may be old. {{reason}}",
+      "unavailable": "Not available right now",
+      "overview": "Right now",
+      "alerts": "Alerts",
+      "severity": {
+        "error": "Problem",
+        "warn": "Warning",
+        "info": "Note"
+      },
+      "alert": {
+        "transfer80": "The server has sent more than 80% of the {{limit}} transfer alert in {{month}}.",
+        "transfer100": "The server has sent more than the {{limit}} transfer alert in {{month}}.",
+        "releaseUpdate": "isshoni {{version}} is available.",
+        "releaseSecurityUpdate": "isshoni {{version}} is available (security fix).",
+        "publicIpChanged": "The server's public {{family}} address changed from {{from}} to {{to}}. isshoni keeps using the old one until it restarts.",
+        "publicIpNew": "The server has a public {{family}} address now, {{to}}. isshoni uses it after a restart.",
+        "tlsRenewalFailing": "The certificate can't be renewed. It is valid until {{notAfter}}.",
+        "tlsRenewalExpired": "The certificate can't be renewed, and it is no longer valid since {{notAfter}}.",
+        "tlsRenewalNotServed": "The certificate can't be renewed, and the server isn't using it any more. It would be valid until {{notAfter}}.",
+        "doctorFail_one": "Doctor found a problem: {{checks}}.",
+        "doctorFail_other": "Doctor found {{count}} problems: {{checks}}.",
+        "sourceFailed": "Couldn't read {{source}}: that part of the dashboard is empty."
+      },
+      "source": {
+        "server": "the server's state",
+        "process": "the process's numbers",
+        "rooms": "the live rooms",
+        "media": "the media totals",
+        "transfer": "the transfer counts",
+        "update": "the release check",
+        "doctor": "doctor's last report",
+        "accounts": "the accounts"
+      },
+      "family": {
+        "ipv4": "IPv4",
+        "ipv6": "IPv6"
+      },
+      "openDoctor": "Open Doctor",
+      "releaseNotes": "Release notes",
+      "checklist": {
+        "title": "Finish setting up",
+        "lead": "Two steps of the setup are left. You can come back to them at any time.",
+        "admin": "Create the admin account",
+        "doneHint": "(done)",
+        "two": "2",
+        "three": "3",
+        "conntest": "Test the connection",
+        "invite": "Invite friends",
+        "continue": "Continue the setup"
+      },
+      "stat": {
+        "sending": "Sending now",
+        "receiving": "Receiving {{rate}}",
+        "people": "People online",
+        "connections_one": "{{count}} connection",
+        "connections_other": "{{count}} connections",
+        "shares": "Live shares",
+        "media": "Media: UDP {{udp}}, TCP 443 {{tcp443}}, TCP 7882 {{tcp7882}}",
+        "month": "Sent in {{month}}",
+        "monthUnknown": "Sent this month",
+        "projected": "On course for {{size}} this month",
+        "alertAt": "Alert at {{size}}",
+        "noAlert": "No transfer alert set"
+      },
+      "transport": {
+        "udp": "UDP",
+        "tcp443": "TCP 443",
+        "tcp7882": "TCP 7882",
+        "none": "no media yet"
+      },
+      "tlsMode": {
+        "auto": "Let's Encrypt certificate",
+        "ip": "Let's Encrypt IP certificate",
+        "manual": "Your own certificate"
+      },
+      "natKind": {
+        "none": "none",
+        "one_to_one": "1:1, a cloud network or a container",
+        "port_forward": "a router forwards the ports",
+        "symmetric": "symmetric, friends probably can't connect",
+        "cgnat_likely": "carrier-grade NAT likely, no public address",
+        "unknown": "unknown"
+      },
+      "clientKind": {
+        "web": "Web",
+        "desktop": "Desktop",
+        "mobile": "Mobile",
+        "tool": "Tool"
+      },
+      "os": {
+        "windows": "Windows",
+        "macos": "macOS",
+        "linux": "Linux",
+        "ios": "iOS",
+        "android": "Android",
+        "chromeos": "ChromeOS",
+        "other": "another system"
+      },
+      "connection": "{{kind}} {{version}} on {{os}}",
+      "rooms": {
+        "title": "Live rooms",
+        "empty": "Nobody is in a room right now.",
+        "people_one": "{{count}} person",
+        "people_other": "{{count}} people",
+        "peopleIn": "People in {{room}}",
+        "col": {
+          "person": "Person",
+          "connection": "Connection",
+          "watching": "Watching"
+        },
+        "via": "over {{transport}}, {{rtt}} ms",
+        "watchingNothing": "Nothing",
+        "watchingShares_one": "{{count}} share",
+        "watchingShares_other": "{{count}} shares"
+      },
+      "share": {
+        "screen": "{{name}}'s screen",
+        "window": "{{name}}'s window",
+        "tab": "{{name}}'s tab",
+        "other": "{{name}}'s share",
+        "meta": "{{codec}}, started",
+        "layersOf": "Layers of {{share}}",
+        "col": {
+          "layer": "Layer",
+          "size": "Size",
+          "fps": "Frames/s",
+          "bitrate": "Bitrate",
+          "loss": "Loss"
+        },
+        "layer": {
+          "high": "High",
+          "low": "Low"
+        },
+        "size": "{{width}} × {{height}}",
+        "viewers": "Watching: {{high}} in high quality, {{low}} in low quality, {{audio}} with sound.",
+        "egress": "Sending {{rate}} to them"
+      },
+      "server": {
+        "title": "Server",
+        "version": "Version",
+        "started": "Started",
+        "origin": "Address",
+        "tls": "Certificate",
+        "tlsOff": "Off: a proxy in front has the certificate",
+        "tlsFor": "{{mode}} for {{names}}",
+        "tlsReady": "Ready",
+        "tlsNotReady": "Not ready",
+        "tlsValid": "Valid until {{notAfter}}",
+        "tlsValidRenews": "Valid until {{notAfter}}, renews on {{nextRenewal}}",
+        "tlsLastError": "Last error",
+        "publicIp": "Public address",
+        "noIpv4": "No public IPv4 address",
+        "nat": "NAT: {{nat}}",
+        "media": "Media addresses",
+        "noMedia": "None advertised",
+        "process": "Process",
+        "memory": "{{size}} of memory",
+        "cpu": "{{seconds}} CPU seconds on {{cpus}} CPUs, {{goroutines}} goroutines",
+        "update": "Updates",
+        "latest": "Latest release {{version}}",
+        "security": "Security fix",
+        "checked": "Checked"
+      },
+      "doctor": {
+        "title": "Doctor",
+        "ran": "Last run",
+        "ok_one": "{{count}} ok",
+        "ok_other": "{{count}} ok",
+        "warn_one": "{{count}} warning",
+        "warn_other": "{{count}} warnings",
+        "fail_one": "{{count}} problem",
+        "fail_other": "{{count}} problems",
+        "none": "Doctor hasn't run yet. The server runs it 20 seconds after it starts."
+      },
+      "clients": {
+        "title": "App versions",
+        "empty": "Nobody is connected.",
+        "col": {
+          "app": "App",
+          "version": "Version",
+          "count": "Connected"
+        },
+        "outdated": "Outdated"
+      },
+      "accounts": {
+        "title": "Accounts",
+        "registration": "Registration: {{mode}}.",
+        "mode": {
+          "invite": "invite only",
+          "approval": "invite, or ask an admin",
+          "closed": "closed"
+        },
+        "users": "Active accounts",
+        "admins_one": "{{count}} admin",
+        "admins_other": "{{count}} admins",
+        "pending": "Waiting for approval",
+        "answer": "Answer them",
+        "disabled": "Disabled",
+        "invites": "Working invite links",
+        "sessions_one": "{{count}} signed-in browser",
+        "sessions_other": "{{count}} signed-in browsers",
+        "events": "Security events of the last 7 days",
+        "noEvents": "No security events in the last 7 days.",
+        "col": {
+          "what": "What",
+          "who": "Who",
+          "when": "When"
+        },
+        "audit": "Open the audit log"
+      }
+    },
     "users": {
       "title": "Users",
       "lead": "Everyone with an account on this server.",
@@ -437,6 +652,103 @@
           "revoked": "Unlinked an app",
           "refresh_reused": "Unlinked an app after its sign-in was reused"
         }
+      }
+    },
+    "doctor": {
+      "title": "Doctor",
+      "lead": "Checks how the server is set up, and says how to fix what it finds.",
+      "report": {
+        "title": "Checks"
+      },
+      "run": "Run doctor",
+      "runAgain": "Run doctor again",
+      "running": "Running every check. This can take up to two minutes.",
+      "runFailed": "Doctor couldn't run. {{reason}}",
+      "busy_one": "Doctor ran a moment ago. You can run it again in {{count}} second.",
+      "busy_other": "Doctor ran a moment ago. You can run it again in {{count}} seconds.",
+      "noReport": "No report yet. The server runs doctor 20 seconds after it starts, or you can run it now.",
+      "ran": "Ran",
+      "version": "on isshoni {{version}}",
+      "checks": "Checks",
+      "count": {
+        "ok_one": "{{count}} ok",
+        "ok_other": "{{count}} ok",
+        "warn_one": "{{count}} warning",
+        "warn_other": "{{count}} warnings",
+        "fail_one": "{{count}} problem",
+        "fail_other": "{{count}} problems",
+        "info_one": "{{count}} note",
+        "info_other": "{{count}} notes",
+        "skip_one": "{{count}} not checked",
+        "skip_other": "{{count}} not checked"
+      },
+      "status": {
+        "ok": "OK",
+        "warn": "Warning",
+        "fail": "Problem",
+        "skip": "Not checked",
+        "info": "Note"
+      },
+      "check": {
+        "config": "Config",
+        "data_dir": "Data directory",
+        "secrets": "Secrets",
+        "schema": "Database",
+        "public_ip": "Public IP",
+        "dns": "DNS",
+        "tls": "Certificate",
+        "clock": "Clock",
+        "udp_buffers": "UDP buffers",
+        "ports": "Ports",
+        "firewall_hint": "Firewall",
+        "container": "Container",
+        "lan_privacy": "Local network",
+        "transfer": "Transfer",
+        "release": "Release",
+        "nofile": "Open files",
+        "bandwidth": "Bandwidth"
+      },
+      "localOnly": "This machine only",
+      "localOnlyNote": "This only checks this machine. The connection test below checks from outside.",
+      "fix": "Fix",
+      "more": "More about this check",
+      "vpsGuide": "Firewall guide for this provider",
+      "releaseNotes": "Release notes",
+      "conntest": {
+        "title": "Connection test",
+        "lead": "Checks the server's media ports from this browser, as a friend's browser would reach them."
+      },
+      "bandwidth": {
+        "title": "Bandwidth calculator",
+        "lead": "How much the server sends while friends watch, for planning a server's uplink and its monthly transfer.",
+        "people": "People",
+        "sharing": "Sharing at once",
+        "thumbnails": "Thumbnails per person",
+        "hours": "Hours",
+        "quality": "Quality",
+        "qualities": {
+          "1080p60": "1080p, 60 fps",
+          "1440p60": "1440p, 60 fps",
+          "2160p60": "4K, 60 fps"
+        },
+        "preset": "Preset",
+        "presets": {
+          "auto": "Auto",
+          "movie": "Movie (better sound)"
+        },
+        "submit": "Calculate",
+        "range": "From {{min}} to {{max}}.",
+        "sharingRange": "From 0 to the number of people.",
+        "hoursRange": "More than 0, up to {{max}}.",
+        "scenario": "{{people}} people, {{sharing}} sharing, for {{hours}} hours:",
+        "mbps": "{{value}} Mbps",
+        "egress": "The server sends",
+        "wire": "{{value}} on the wire",
+        "session": "Per session",
+        "gb": "{{value}} GB",
+        "perViewer": "To each person",
+        "perSharer": "{{value}} to someone who shares",
+        "ingress": "The server receives"
       }
     }
   }

@@ -497,14 +497,16 @@ func TestOnRTCP(t *testing.T) {
 		{&rtcp.PictureLossIndication{MediaSSRC: 7}, false},
 		{&rtcp.FullIntraRequest{FIR: []rtcp.FIREntry{{SSRC: 7}, {SSRC: 42}}}, true},
 		{&rtcp.TransportLayerNack{MediaSSRC: 42}, false},
-		{&rtcp.ReceiverEstimatedMaximumBitrate{Bitrate: 1e6, SSRCs: []uint32{1, 42}}, false},
+		{&rtcp.ReceiverEstimatedMaximumBitrate{Bitrate: 2e6, SSRCs: []uint32{1, 42}}, false},
+		{&rtcp.ReceiverEstimatedMaximumBitrate{Bitrate: 1e6, SSRCs: []uint32{42}}, false},
+		{&rtcp.ReceiverEstimatedMaximumBitrate{Bitrate: 5e5, SSRCs: []uint32{1, 2}}, false}, // not this track's
 	} {
 		layer, key := tr.onRTCP(tc.pkt)
 		if key != tc.key || (key && layer != "q") {
 			t.Errorf("%T: keyframe %v for %q", tc.pkt, key, layer)
 		}
 	}
-	if s := tr.stats; s.PLIs != 1 || s.FIRs != 1 || s.NACKs != 1 || s.LastREMB != 1e6 {
+	if s := tr.stats; s.PLIs != 1 || s.FIRs != 1 || s.NACKs != 1 || s.REMBs != 2 || s.LastREMB != 1e6 {
 		t.Errorf("stats %+v", s)
 	}
 	audio := newTrack(webrtc.RTPCodecTypeAudio, "audio", "s", "", "", "")

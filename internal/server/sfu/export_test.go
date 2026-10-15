@@ -330,3 +330,49 @@ const (
 	BackoffStart = backoffStart
 	ProbeTime    = probeTime
 )
+
+// PauseAfter is how long a share's full layer goes without a request for high before it is paused (02 §11), and
+// REMBLifts and REMBUncapped are the REMBs of no limit that a pub PC gets once its cap is gone.
+const (
+	PauseAfter   = pauseAfter
+	REMBLifts    = rembLifts
+	REMBUncapped = rembUncapped
+)
+
+// AdvanceUplinkClock moves the clock of the SFU's uplink policies on by d: the fake clock with which a test sees the
+// 10 s of layer pausing pass without waiting for them (02 §11). The ticker has every publishing Conn look at its
+// uplink once a second; CheckUplink looks at once.
+func (s *SFU) AdvanceUplinkClock(d time.Duration) { s.uplinkSkew.Add(int64(d)) }
+
+// CheckUplink has the Conn look at the uplink of the shares it publishes now, as the ticker has it do once a second:
+// each share's policy with its hints, then the pub PC's REMB.
+func (c *Conn) CheckUplink(ctx context.Context) error {
+	return c.do(ctx, func(context.Context) error {
+		c.uplinkTick()
+		return nil
+	})
+}
+
+// UplinkState is a share's uplink control as its publishing Conn's actor has it (02 §11).
+type UplinkState struct {
+	MaxBitrate int      // the cap the sharer was told last, bit/s
+	Paused     []string // the rids of the layers it was told to pause
+	Reason     string   // of the last hint; "" before the first
+}
+
+// Uplink returns the uplink control of a share the Conn publishes; false for another Conn's share or one that ended.
+func (c *Conn) Uplink(ctx context.Context, id ShareID) (UplinkState, bool, error) {
+	var (
+		st UplinkState
+		ok bool
+	)
+	err := c.do(ctx, func(context.Context) error {
+		for _, sh := range c.ownShares() {
+			if sh.id == id {
+				st, ok = UplinkState{MaxBitrate: sh.up.capBps, Paused: pausedRIDs(sh.up.paused), Reason: sh.up.reason}, true
+			}
+		}
+		return nil
+	})
+	return st, ok, err
+}

@@ -18,8 +18,9 @@ import (
 type pubPC struct {
 	gen uint32
 	pc  *webrtc.PeerConnection
-	// rtcpSSRC is the sender SSRC of the RTCP the SFU writes to the publisher on this PC (PLI now, REMB with README
-	// S88): random and never 0. Receivers match such feedback by its media SSRC; the sender SSRC only names the SFU.
+	// rtcpSSRC is the sender SSRC of the RTCP the SFU writes to the publisher on this PC (PLI, and the REMB of the
+	// admin's cap, 02 §11): random and never 0. Receivers match such feedback by its media SSRC; the sender SSRC only
+	// names the SFU.
 	rtcpSSRC uint32
 	// neg is the last negotiation answered in this gen and answer what it got: a repeated neg gets answer again, a
 	// lower one is stale (01 §9 rule 3).

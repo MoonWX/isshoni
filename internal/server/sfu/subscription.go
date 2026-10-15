@@ -62,6 +62,15 @@ func (s *Subscription) publish() {
 	s.shown.Store(&subShown{requested: s.reqVideo, audio: s.reqAudio, reason: s.told.reason})
 }
 
+// requested returns the client's video request (reqVideo) as the actor last published it, for other goroutines: the
+// publishing Conn's uplink policy counts the requests for high (02 §11). It is off before the first request.
+func (s *Subscription) requested() Quality {
+	if shown := s.shown.Load(); shown != nil {
+		return shown.requested
+	}
+	return QualityOff
+}
+
 // subState is what a SubscriptionStateEvent says about a subscription besides the request (02 §6.2).
 type subState struct {
 	forwarded Quality   // the video the viewer gets now
@@ -346,6 +355,9 @@ func (c *Conn) updateSubscriptions(items []SubscriptionUpdate) ([]error, error) 
 		sub.apply()
 		sub.publish()
 		c.reportSubscription(sub)
+		if changed && sub.reqVideo == QualityHigh && !wasHigh {
+			sub.share.askedForHigh() // resumes a paused full layer at once (02 §11)
+		}
 	}
 	switch s := c.sub; {
 	case s == nil:

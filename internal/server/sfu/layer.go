@@ -96,6 +96,10 @@ type Layer struct {
 	highSeq    uint16 // the highest sequence number seen (int16 order)
 	tsStarted  bool
 	highTS     uint32 // the highest timestamp of a cached packet (int32 order): a newer one is a new frame
+	// The last packet the jitter estimate took (sampleJitter): its arrival (monoNow, 0 before the first) and its
+	// timestamp.
+	jitterAt int64
+	jitterTS uint32
 }
 
 // layerStats are a Layer's counters and rates (02 §9.1). The RTP loop counts; the ticker turns the counts into rates
@@ -115,6 +119,9 @@ type layerStats struct {
 	unique       atomic.Uint64
 	pliSent      tally // keyframe requests written to the publisher
 	pliThrottled tally // requests that fell within 500 ms of the last one
+	// jitter is the stream's interarrival jitter (RFC 3550 §6.4.1) in ticks of its RTP clock, times 16: the RFC's
+	// estimator in fixed point. The RTP loop updates it (sampleJitter), the uplink policy reads it (02 §11).
+	jitter atomic.Int64
 
 	// Rates, written by the ticker.
 	bitrate atomic.Int64  // bit/s of payload, 2 s moving average
@@ -206,7 +213,7 @@ func (l *Layer) handleRTP(pkt *rtp.Packet, profile ProfileKey, now int64) {
 		l.stats.badPT.Add(1)
 		return
 	}
-	l.span(pkt.SequenceNumber)
+	newest := l.span(pkt.SequenceNumber)
 	p := &packet{
 		layer: l, seq: pkt.SequenceNumber, ts: pkt.Timestamp, marker: pkt.Marker, pt: pkt.PayloadType,
 		profile: profile, arrival: now,
@@ -230,6 +237,9 @@ func (l *Layer) handleRTP(pkt *rtp.Packet, profile ProfileKey, now int64) {
 	case cacheInserted:
 	}
 	l.stats.unique.Add(1)
+	if newest {
+		l.sampleJitter(p.ts, now)
+	}
 	if !l.tsStarted || int32(p.ts-l.highTS) > 0 {
 		l.tsStarted, l.highTS = true, p.ts
 		l.stats.frames.Add(1)
@@ -248,17 +258,55 @@ func (l *Layer) handleRTP(pkt *rtp.Packet, profile ProfileKey, now int64) {
 	l.fanOut(p)
 }
 
-// span widens the Layer's sequence space to seq: the count of numbers between the first and the highest one seen.
-func (l *Layer) span(seq uint16) {
+// span widens the Layer's sequence space to seq: the count of numbers between the first and the highest one seen. It
+// reports whether seq is the highest now, the first one included.
+func (l *Layer) span(seq uint16) (newest bool) {
 	if !l.seqStarted {
 		l.seqStarted, l.highSeq = true, seq
 		l.stats.expected.Store(1)
-		return
+		return true
 	}
 	if ahead := int16(seq - l.highSeq); ahead > 0 {
 		l.highSeq = seq
 		l.stats.expected.Add(uint64(ahead))
+		return true
 	}
+	return false
+}
+
+// sampleJitter feeds the stream's interarrival jitter estimate (RFC 3550 §6.4.1) one packet: its RTP timestamp and
+// its arrival. The RTP loop calls it for the packets that are the newest of the stream when they arrive, and only a
+// packet with a new timestamp (the first of a video frame) is a sample, against the last packet before it, as
+// libwebrtc does (receive_statistics_impl.cc): a late or repaired packet would count its own delay as jitter, and
+// the packets of one frame, which leave together, would count how close together they arrive, so many samples near
+// 0 would hide the frames' jitter. Each newest packet still moves the reference on, so a frame is measured from the
+// last packet of the one before. Only the track's reader calls it.
+func (l *Layer) sampleJitter(ts uint32, now int64) {
+	last, lastTS := l.jitterAt, l.jitterTS
+	l.jitterAt, l.jitterTS = now, ts
+	if last == 0 || now-last > int64(jitterGap) || now < last || ts == lastTS {
+		return
+	}
+	clock := int64(videoClockRate)
+	if l.kind == webrtc.RTPCodecTypeAudio {
+		clock = audioClockRate
+	}
+	// D(i, j) = (Rj − Ri) − (Sj − Si), in ticks of the RTP clock.
+	d := (now-last)*clock/int64(time.Second) - int64(int32(ts-lastTS))
+	if d < 0 {
+		d = -d
+	}
+	j := l.stats.jitter.Load()
+	l.stats.jitter.Store(j + d - (j+8)>>4) // J += (|D| − J) / 16, J kept times 16
+}
+
+// jitterNow returns the stream's interarrival jitter as a duration (sampleJitter).
+func (l *Layer) jitterNow() time.Duration {
+	clock := int64(videoClockRate)
+	if l.kind == webrtc.RTPCodecTypeAudio {
+		clock = audioClockRate
+	}
+	return time.Duration(l.stats.jitter.Load() >> 4 * int64(time.Second) / clock)
 }
 
 // keyframe notes a packet that starts a keyframe: the SPS gives the layer's size, and the share hears of it, because
@@ -311,8 +359,13 @@ func (l *Layer) handleSR(sr *rtcp.SenderReport, now int64) {
 // Spent here, the throttle would swallow that request when it came within 500 ms. It did when a viewer's sub PC
 // connected just before the publisher's pub PC after both had lost their network: the viewer's DownTrack went on
 // with the layer's delta frames and never got a keyframe (02 §9.7).
+//
+// A request for a layer the sharer was told to pause (Share.paused, 02 §11) does nothing either, for the same
+// reason: the viewer who asks for it has asked for high, the publishing Conn's actor resumes the layer for that, and
+// its own request, which follows the hint, must not find the throttle spent on a PLI the sharer got while the layer
+// was off.
 func (l *Layer) requestKeyframe(now int64) bool {
-	if l.kind != webrtc.RTPCodecTypeVideo || !l.share.conn.pubUp.Load() {
+	if l.kind != webrtc.RTPCodecTypeVideo || !l.share.conn.pubUp.Load() || l.share.paused.Load()&(1<<l.slot) != 0 {
 		return false
 	}
 	last := l.lastPLI.Load()

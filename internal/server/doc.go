@@ -23,8 +23,8 @@
 //     data-directory lock. It finishes within shutdown_timeout (10 s); what is still open then is closed by force,
 //     and its error says so with ErrShutdownForced.
 //
-// What runs in the server (README slices S31, S44, S54, S59, S71, S80 and S85; 04 slices S4, S7, W1, W2, S10, S10b,
-// S12b and S13):
+// What runs in the server (README slices S31, S44, S54, S59, S71, S80, S85 and S90; 04 slices S4, S7, W1, W2, S10,
+// S10b, S12b, S13 and S14):
 //   - The HTTP side of every TLS mode of 04 §8.1. httpapi's router serves the embedded web app with its fallback,
 //     GET /healthz and GET /readyz from ops.Health, 03's REST API at /api/v1/ and 01's hub at GET /ws.
 //     In off mode the router is on plain HTTP on listen.http, behind the operator's HTTPS proxy, or on localhost for
@@ -80,9 +80,14 @@
 //     backup flushes it first) and alerts the admins on; the daily release check; and the admin routes of ops on
 //     the REST API: the dashboard (ops.Dashboard over the status, the hub and the SFU, 03's accounts and the other
 //     ops parts), doctor's report and run, and the bandwidth estimate.
-//
-// The later slices of the M1 plan extend Start and Shutdown at the marked steps: the SIGHUP reload (S90), which
-// serve only answers with a log line so far.
+//   - The reload of 04 §6.5 (README S90, reload.go): cmd/isshoni's serve answers SIGHUP by loading the config
+//     again and calling Reload, which reads the manual TLS files again and makes log.level the configured level
+//     (a level that `isshoni admin log-level` set for a while falls back to it); every other key that changed is
+//     logged by name, to be applied by a restart.
+//   - Hardening (README S90): the server logs through a safety net that redacts an ICE password in the text of a
+//     library's message (logsafety.go); the 503s that it gives on purpose (a polled /readyz that is not ready, the
+//     shutdown's) are debug lines, not warnings (http.go); and in off mode the app's listener has the per-IP
+//     connection limit too, except for the trusted proxies, whose connections carry every client (tls.go).
 //
 // Of the packages of 04 §2, only this one, cmd/isshoni and servertest import signal, sfu and sfuplane, or combine
 // store and auth with ops and push.
