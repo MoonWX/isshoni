@@ -3401,7 +3401,7 @@ templates live in `messages_en.go` for the CLI; 05 renders the same codes from i
 | `data_dir` | Exists, owned by the service uid, 0700, free space; in a container: is a mount (§5.1) | free < 1 GB; mode wider than 0700 | not writable; ephemeral in a container |
 | `secrets` | Present, 0600, parseable | mode wider (server fixes it) | unreadable or corrupt |
 | `schema` | DB schema vs binary (offline: through `DBFiles`, §13.1) | – | newer than binary (the server refuses to start; the fix is 03's message plus the restore command for the environment, from the same formatter as §6.1 step 4) |
-| `public_ip` | Detection result, method and NAT kind (§7.4) | `port_forward` ("forward TCP 80, 443, 7882 and UDP 7882 to {local}"); IPv6 missing (`info`); `ip` mode on provider `aws` or `gcp` (§13.3), otherwise ok (`info`, code `public_ip.ephemeral`): "The default public IPv4 changes on stop/start; in IP mode that moves the server's address and breaks every link, installed app and push subscription. Attach an Elastic IP (AWS) / reserve a static external IP (GCP), or use a domain", the same advice as 06's `/install/vps#aws` and `#gcp` | `symmetric`, `cgnat_likely`, or no public IPv4/IPv6 |
+| `public_ip` | Detection result, method and NAT kind (§7.4) | `port_forward` ("forward TCP 80, 443, 7882 and UDP 7882 to {local}"); IPv6 missing (`info`); `ip` mode on provider `aws` or `gcp` (§13.3), otherwise ok (`info`, code `public_ip.ephemeral`): "The default public IPv4 changes on stop/start; in IP mode that moves the server's address and breaks every link, installed app and push subscription. Attach an Elastic IP (AWS) / reserve a static external IP (GCP), or use a domain", the same advice as 06's `/install/vps#aws` and `#gcp` | `symmetric` (not a container's bridge, below), `cgnat_likely`, or no public IPv4/IPv6 (an address only this machine reaches, such as `127.0.0.1`, is none; below) |
 | `dns` | `auto`/`manual` with domain: A/AAAA via the system resolver vs public IPs; CAA allows `letsencrypt.org` | AAAA present but not this server | no A/AAAA, or A points elsewhere |
 | `tls` | Mode, names, issuer, `not_after`, next renewal, last ACME error code (§8.7) | no cert yet and at least one ACME attempt has failed (from the first failure, not after 10 min: `fixCode` = `Status.LastErrorCode`, `fix` = its §8.7 fix text, so install.sh's doctor output at its 180 s timeout names the cause); renewal failing but cert valid; manual cert < 14 days | no cert after 10 min (with the same `fixCode`/`fix` when an attempt failed); expired; key mismatch |
 | `clock` | Linux `adjtimex` `STA_UNSYNC` flag (no network); in `auto`/`ip`, skew vs the `Date` header of the ACME directory. If `adjtimex` fails with EPERM or ENOSYS (systemd `ProtectClock=`/`SystemCallFilter=` in 06's unit, or a container seccomp profile), the sync flag is reported as unknown (no warn) and only the skew check against the ACME directory's `Date` header decides; in `manual`/`off` mode without that check the status is `info` | not synchronized, or skew 30 s–5 min | skew > 5 min |
@@ -3445,15 +3445,65 @@ cases: `udp_buffers.unknown` (above) and `public_ip.loopback` (README F04: `publ
 below), which carries no params and no fix code. 05's catalog renders it as `doctor.public_ip.loopback` like every
 other code (the Doctor page is README S91's, 05 §15.3).
 
-**Two rules of `public_ip` to review** (README S90's report, recorded in README §6 "Decided after group 13"; not changed
-yet). In a Docker bridge container `public_ip` reports `public_ip.symmetric`, a fail, whenever the outbound NAT maps
-each STUN server to its own port (Docker Desktop's user-space NAT always does), although the published ports carry
-inbound media whatever kind the outbound NAT is. And a configured literal `public_ip = "127.0.0.1"` (the smoke override
-of `deploy/docker/test`) is reported as the server's public address ("127.0.0.1 (set in the config)") and then judged by
-the NAT kind, although no friend can reach a loopback address. A later slice that owns this package and
-`deploy/docker/test` reviews both, and can then have CI's Linux docker-smoke run `isshoni doctor --json` and assert per
-code; until then "doctor reports ok in the Docker bridge and host setups" is a manual check on a Linux host with a real
-address (§17 "Manual").
+**Two rules of `public_ip`, as README F21 decided them** (README S90's report, recorded in README §6 "Decided after
+group 13" (2) for review). As group 13 merged it, a Docker bridge container reported `public_ip.symmetric`, a fail,
+whenever its outbound NAT mapped each STUN server to its own port (Docker Desktop's user-space NAT always does), and a
+configured literal `public_ip = "127.0.0.1"` (the smoke override of `deploy/docker/test`) was the server's public
+address ("127.0.0.1 (set in the config)"), then judged by the NAT kind. Both rules changed
+(`ops/doctor/checks_net.go` `checkPublicIP`, `publicAddrs`; the texts in `messages_en.go`):
+
+- **(a) In a container on a bridge network, symmetric NAT is no failure.** Friends reach the server on the ports the
+  runtime publishes on the host, and the server advertises its public address with the container's own port numbers
+  (§7.5's rule for a Docker bridge; the `container` check holds the operator to publishing them under the same
+  numbers). Every media flow starts with the browser's packet to such a port, and the server's answers, its ICE
+  checks on that pair included, go back through the same mapping, so the bridge's NAT kind for connections that
+  start inside the container decides nothing: Docker's own NAT on Linux keeps ports, Docker Desktop's and rootless
+  Docker's user-space NAT gives each destination its own port, and the published ports work the same with both.
+  STUN's reading from inside the container is therefore judged as a container's 1:1 NAT already was (§7.4):
+  `public_ip.ok` (or `no_ipv6`, `ephemeral` as anywhere), with the measured `nat` (`symmetric`) and the param
+  `dockerBridge: true`, and the CLI adds the line "the container's bridge network gives each outgoing connection its
+  own port (symmetric NAT), which doesn't matter here: friends reach the published ports". The rule needs the
+  `container` check's `bridge` (the default route's interface is a veth end, §13.2 `container`); on the host's
+  network, in a container whose network doctor can't tell, and outside a container, symmetric NAT is the NAT in front
+  of the machine and stays `public_ip.symmetric`. What doctor can't see from inside a bridge is a router in front of
+  the host: a home router with a port-preserving NAT already read as the container's 1:1 NAT before F21, and a
+  symmetric one now reads the same; the browser's connection test (§7.7) checks from outside. `cgnat_likely` is
+  unchanged.
+- **(b) An address that only this machine can reach is no public address.** A loopback address (`127.0.0.0/8`,
+  `::1`) or the unspecified one (`0.0.0.0`, `::`), which config accepts as a `public_ip` or `public_ipv6` literal
+  outside ip mode (§4.5) and the server advertises as it is given, is left out of the run's public addresses
+  (`publicAddrs`, with a running server and offline alike) and named in the param `unreachable` (a list). So
+  `public_ip` judges the server as one without it, whatever the NAT kind: `public_ip.none` (fail) when it was the
+  only address, `ipv6_only` or `no_ipv6` when the other family has a public one. The NAT kind is the IPv4 path's
+  (§7.4), so with the IPv4 address left out it stands in front of no public address, and neither `symmetric` nor
+  `cgnat_likely` fails the check (`publicState.v4Unreachable`); an IPv4 address that was simply not found keeps its
+  kind, and `cgnat_likely` without an address is still `public_ip.cgnat`. And `dns` has no address to compare
+  the records with (`dns.unverified` for a record, `dns.missing` without one; never `dns.ok` for a record that
+  points at `127.0.0.1`, nor `dns.wrong`). Such a server is ready (it has the address it was given), so the CLI's
+  `none` text says what it is instead of "not ready": "no public IP address: 127.0.0.1 can only be reached from this
+  machine", then "the site opens, but friends can't share or watch: media has no public address to offer", or, where
+  the site is that address, "the site is at that address too, so only this machine can open it". The fix
+  `public_ip.fix_set` names the key without the domain and the late network: "set public_ip to this server's public
+  address, or to auto to detect it, then restart isshoni: sudo systemctl restart isshoni" (Docker: "set
+  ISSHONI_PUBLIC_IP in .env to this server's public address, or leave it empty to detect it, then run docker compose
+  up -d"). A private address (`192.168.1.20`, a LAN setup) is still the server's address.
+- **No new code.** Both rules use the codes above, so 05's catalog has a text for each; its texts don't know the
+  params yet (the Doctor page shows `public_ip.ok` without the bridge line, and `public_ip.none` with the words of
+  the address that wasn't found), which is a follow-up for 05 §15.3.
+- **Tests** (`ops/doctor/publicip_test.go`): `TestPublicIPBridgeSymmetric` (a running server: symmetric NAT in a
+  bridge is `ok`, `no_ipv6` or `ephemeral` with `dockerBridge`; on the host's network, with the network unknown,
+  outside a container it stays a failure; 1:1 NAT and `cgnat_likely` are unchanged; every case also asserts the
+  network that the `container` check sees, so the `cgnat_likely` case runs in a bridge and a case can't lose its
+  setup), `TestPublicIPBridgeSymmetricOffline` (doctor's own detection with two STUN servers that see two ports),
+  `TestPublicIPUnreachable` (`127.0.0.1`, any loopback, `0.0.0.0`, `::1`, both families, the site at that address,
+  in a container, with a public address of the other family, `127.0.0.1` with a public IPv6 address and `symmetric`
+  or `cgnat_likely`, no IPv4 found with `cgnat_likely`, which stays `public_ip.cgnat`, and a private address that
+  stays), `TestPublicIPUnreachableOffline`, `TestDNSWithUnreachablePublicIP` and `TestOnlyThisMachine`.
+- **CI's docker-smoke asserts doctor per code** in the bridge and the host setup (06 §11.3, the step `doctor`), with
+  an allow-list for what the test's setup and the runner can't give. The step's two lists pin this package's checks
+  and codes; `TestDockerSmokeExpectations` (`ops/doctor`) holds them to the package on every Go change (06 §11.3).
+  "doctor reports ok in the Docker bridge and host setups" stays a manual check on a Linux host with a real address
+  (§17 "Manual"): the smoke overrides have no public address and a test domain that resolves nowhere.
 
 Fix codes: `config.fix_check`; `data_dir.fix_sudo`, `fix_owner`, `fix_not_dir`, `fix_mount`, `fix_mode`,
 `fix_space`; `secrets.fix_sudo`, `fix_owner`, `fix_restore`, `fix_mode`; `schema.fix_sudo`, `fix_restore` (03's

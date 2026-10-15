@@ -2630,7 +2630,9 @@ choice:
    context laid out like goreleaser's (`linux/<arch>/isshoni` plus the extra files).
 2. Make a test certificate with openssl (a throwaway CA). Manual TLS mode proves 443 binds without depending on ACME.
 3. **Bridge:** `docker compose -f deploy/compose.yaml -f deploy/docker/test/compose.smoke.yaml up -d`. The override
-   sets the local image, `ISSHONI_TLS_MODE=manual`, the certificate mount and `ISSHONI_PUBLIC_IP=127.0.0.1`. Asserts:
+   sets the local image, `ISSHONI_TLS_MODE=manual`, the certificate mount and `ISSHONI_PUBLIC_IP=127.0.0.1`, and
+   puts `smoke.test` on `127.0.0.1` in the container's `/etc/hosts` (`extra_hosts`, README F21: the doctor step's
+   `dns`). Asserts:
    - health is `healthy` within 90 s;
    - `curl --cacert ca.pem --resolve smoke.test:443:127.0.0.1 https://smoke.test/api/v1/info` → 200 with the
      version;
@@ -2648,6 +2650,10 @@ choice:
    - `docker inspect` shows `ReadonlyRootfs: true` and `CapDrop: [ALL]`.
 4. **Host:** the same with `compose.host.yaml`, plus `ss -ltnp` on the runner shows :443 owned by the container's
    process.
+   In both setups also **doctor** (README F21): `docker compose exec -T isshoni isshoni doctor --json` reports
+   from the running server (`mode` `cli-with-server`), exits 5 exactly when a check fails (0 otherwise), and every
+   check of `isshoni doctor --list-checks` has the code the script wants for it, or one its allow-list names for
+   this engine (below).
 5. **No volume:** `docker run --rm <image>` exits 78 within 10 s and logs a message containing `/var/lib/isshoni`.
 6. **No `.env`:** `deploy/compose.yaml` started from a directory without a `.env` file, with an override that sets
    the local image and points the ACME directory at a closed loopback port (`ISSHONI_TLS_ACME_CA`, below), so ip
@@ -2672,7 +2678,8 @@ choice:
   (`ISSHONI_TLS_ACME_CA: https://127.0.0.1:9/directory`): ip mode would otherwise ask Let's Encrypt for a
   certificate at every test run. No certificate is expected there.
 - **Parts and flags**: `image` (the HEALTHCHECK, the user, that the binary starts without capabilities, the
-  version), `novolume`, `bridge`, `backup` (in bridge and in host), `ipv6`, `host` and `noenv`; `-s` skips parts,
+  version), `novolume`, `bridge`, `backup` and `doctor` (each in bridge and in host; `doctor` from README F21),
+  `ipv6`, `host` and `noenv`; `-s` skips parts,
   `-i IMAGE` tests an image that exists (a release image) and builds nothing, `-a` picks the architecture, `-k`
   keeps what the test made. `task docker:smoke` builds the web app and the notices first; flags after `--` go to the
   script.
@@ -2681,6 +2688,53 @@ choice:
   part checks only what it can see from outside (healthy, confined, `setup-url` through `exec`, the data surviving
   `down` and `up`) and skips the HTTPS checks, the owner of port 443, the admin account and the backup, with a note.
   CI runs every part on Linux.
+
+**The doctor step as README F21 built it** (`check_doctor` in `docker-smoke.sh`; part `doctor`, `-s doctor` skips
+it). It runs right after the hardening checks, in the bridge and in the host setup, on every engine (the host part's
+doctor runs through `exec`, so it needs nothing from outside the machine), and makes doctor's report a CI assertion
+that the manual check of 04 §17 can't be:
+
+- **Per code.** `doctor_want` lists one code per check of 04 §13.2: what a server with this setup gives on a host
+  that has what a real install has (`ok`, or the `info` code where `info` is the best a check gives: `ports`,
+  `firewall_hint`, `container`, `nofile`, `bandwidth`; `release.not_checked`, since the first look is 5 to 60
+  minutes after the start). A check that `--list-checks` names and the list doesn't fails the step, so a new check
+  gets an expectation of its own (on its own pull request: below); so does a report whose checks differ from that
+  list.
+- **The allow-list** (`doctor_allowed`), each entry with its reason in the script, replaces a check's code for one
+  engine: `local` (a Docker engine on the Linux machine that runs the test, as CI's runner), `vm` (an engine in a
+  virtual machine or on another host: Docker Desktop) or `any`. Nothing else is allowed, a `fail` or `warn` that it
+  doesn't name included:
+
+  | Check | Engine | Allowed | Why |
+  |---|---|---|---|
+  | `public_ip` | any | `public_ip.none` (local also `ipv6_only`) | The test has no public address, so the overrides set `ISSHONI_PUBLIC_IP=127.0.0.1`, which doctor must not take for a public one (04 §13.2 rule b). The step also checks that `params.unreachable` is `["127.0.0.1"]` and that there is no `ipv4`. A host part on a Linux machine with a global IPv6 address finds that one: `ipv6_only`, whatever the NAT kind of its IPv4 path, which stands in front of no public address (rule b) |
+  | `dns` | any | `dns.unverified` | `smoke.test` is known to no DNS server; the overrides put it on `127.0.0.1` in the container's `/etc/hosts` (`extra_hosts`), so every machine resolves it alike, whatever its resolver answers for the name (Docker Desktop asks the computer's own, which may be a proxy tool's that answers every name). With no public address doctor can't judge the record: never `dns.ok`, never `dns.wrong` |
+  | `clock` | local, vm | `clock.ok`, `clock.unsynced` | Manual mode has no ACME directory for the skew, so only the kernel's sync flag decides, and it is the Docker host's: a runner whose time daemon hasn't marked the clock synchronized yet, Docker Desktop's VM whose clock the hypervisor keeps |
+  | `udp_buffers` | local, vm | `udp_buffers.ok`, `udp_buffers.low` | `net.core.rmem_max`/`wmem_max` are the Docker host's (6.4), and a test doesn't change a host's sysctls: the runner keeps the kernel's default, and Docker Desktop's VM has a limit of its own below the 8 MiB isshoni wants |
+
+- **Two more facts**: `container`'s `params.network` is the setup's (`bridge`, `host`), which 04 §13.2's rule (a)
+  needs; and the summary line names the allowed results it saw.
+- **As run after F21** on Docker Desktop for Mac (the `vm` engine), both setups: `public_ip.none`, `dns.unverified`,
+  `clock.unsynced`, `udp_buffers.low`, every other check its wanted code; exit 5. 04 §13.2's rule (a) is not part of
+  the step (the loopback public address decides `public_ip` first); its Go tests hold it, and F21 checked it by hand
+  with the same image: an offline `isshoni doctor --only public_ip` in a bridge container on Docker Desktop, whose
+  STUN reading is `symmetric`, gives `public_ip.no_ipv6` with `dockerBridge`, and with `--network host`
+  `public_ip.symmetric` as before.
+- "doctor reports ok in the Docker bridge and host setups" stays the manual pre-flight item 5 of 12.1, on a Linux
+  host with a real public address: the step checks every code, but the smoke overrides can't give an all-ok report.
+- **Doctor's package is an input of the step.** `doctor_want` and `doctor_allowed` pin every check and its codes, so
+  a pull request that changes doctor's checks or codes (`internal/server/ops/doctor`, the `go` filter alone) must
+  run docker-smoke, which a pull request runs only for the `docker`, `deploy` or `release` filters (8.2). Two things
+  see to it:
+  - `TestDockerSmokeExpectations` (`ops/doctor`, in `test-go` on every Go change) holds both lists to doctor:
+    `doctor_want` names every check of `--list-checks` in its order, and every code either list names is one of
+    doctor's codes and its check's; an allow-list entry is `local`, `vm` or `any`, one per check and engine. A pull
+    request that adds or removes a check, or renames or removes a code the lists name, fails there until the script
+    knows it, and that edit of `deploy/docker/**` runs docker-smoke on the same pull request.
+  - Which of its existing codes a check gives in the smoke's setup only the step can tell, so ci.yml's `changes`
+    job gets a filter `doctor` (`internal/server/ops/doctor/**`) that runs docker-smoke as well (README F21 listed
+    it for the integrator: ci.yml is S02's, and 8.2's table names the filter). Until it is there, such a change
+    passes its own pull request and fails on the push to main and in nightly's `docker-multiarch`.
 
 ## 12. M1 exit test run book
 
