@@ -119,6 +119,7 @@
         "one_to_one": "1:1, a cloud network or a container",
         "port_forward": "a router forwards the ports",
         "symmetric": "symmetric, friends probably can't connect",
+        "symmetric_dockerBridge": "symmetric in the container's bridge network, which doesn't matter: friends reach the published ports",
         "cgnat_likely": "carrier-grade NAT likely, no public address",
         "unknown": "unknown"
       },

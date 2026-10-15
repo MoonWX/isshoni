@@ -1,11 +1,13 @@
 package server
 
 import (
+	"io/fs"
 	"net/http"
 	"time"
 
 	"github.com/MoonWX/isshoni/internal/server/netx"
 	"github.com/MoonWX/isshoni/internal/server/ops"
+	"github.com/MoonWX/isshoni/internal/server/ops/doctor"
 	"github.com/MoonWX/isshoni/internal/server/sfu"
 	"github.com/MoonWX/isshoni/internal/server/tlsmgr"
 )
@@ -91,6 +93,15 @@ func (s *Server) SetPublicAddrsFunc(fn func() netx.PublicAddrs) {
 	s.life.Lock()
 	defer s.life.Unlock()
 	s.hookDetect = fn
+}
+
+// SetDoctorMachine makes doctor in the server read these files (from the machine's root: "sys/class/net/eth0/
+// iflink") and these network interfaces in place of the machine's: its own runs, the admin socket's, and the look
+// at a container bridge's NAT that the dashboard and the connection test report (README F22). Call it before Start.
+func (s *Server) SetDoctorMachine(files fs.FS, ifaces netx.InterfaceLister) {
+	s.life.Lock()
+	defer s.life.Unlock()
+	s.hookDoctorEnv = func(env *doctor.Env) { env.FS, env.Interfaces = files, ifaces }
 }
 
 // SetRedetectEvery makes the running server look at its public addresses every d, in place of every ten minutes.

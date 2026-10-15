@@ -53,7 +53,9 @@
 //   - The connection test (README S80; 04 §7.7, wire.go): POST /api/v1/conntest on the REST API for every signed-in
 //     user, ops.ConnTest over the SFU's probe PCs. A transport without a listener (tcp443 in off mode, udp or
 //     tcp7882 when the operator turned it off) is 409 transport_disabled; the answer's server object is the public
-//     IPv4 address, NAT kind, provider, container and media ports that Start found.
+//     IPv4 address, NAT kind, provider, container and media ports that Start found. Its dockerBridge, like the
+//     dashboard's, is what doctor's public_ip, run once in the environment of doctor's own runs, says of a
+//     container bridge's symmetric NAT (README F22, dockerBridgeNAT).
 //   - Web Push (04 §14; wire.go): 04's push service on 03's tables, built before the account service so that its
 //     VAPID fingerprint check purges the subscriptions of a rotated key first. A share that goes live reaches it
 //     from the hub (the users who are not in the room get "started sharing"), 03's admin alerts reach it from the

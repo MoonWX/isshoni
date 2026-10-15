@@ -8,7 +8,9 @@
 //   doctor.fail                     {fail, checks}: the number of failed checks and their ids
 //   dashboard.source_failed         {source}: server, process, rooms, media, transfer, update, doctor or accounts
 // An alert this build doesn't know (a newer server's) shows its code. The snapshot's other ids (the TLS mode, the
-// NAT kind, a client's kind and OS) have short names here, and a value this build doesn't know shows as it is.
+// NAT kind, a client's kind and OS) have short names here, and a value this build doesn't know shows as it is. The
+// NAT kind comes with server.dockerBridge (README F22): a symmetric NAT in a container's bridge network, which
+// doctor lets pass, has a name of its own.
 import type { TFunction } from 'i18next';
 
 import { parseWireTime } from '../lib/time';
@@ -33,6 +35,7 @@ import {
   TLSModeManual,
   type Alert,
   type OpsDashboard,
+  type ServerInfo,
 } from '../protocol/api.gen';
 import {
   ClientKindDesktop,
@@ -204,8 +207,13 @@ export function tlsModeName(mode: string, t: TFunction): string {
   }
 }
 
-/** The NAT kind of the public IPv4 path (04 §7.4), in a few words. */
-export function natName(nat: string, t: TFunction): string {
+/**
+ * The NAT kind of the public IPv4 path (04 §7.4), in a few words. A symmetric NAT that the server marks dockerBridge
+ * is a container bridge's, which doctor's public_ip lets pass because friends reach the published ports (04 §13.2,
+ * README F22): it reads as that, not as "friends probably can't connect". The flag qualifies symmetric alone.
+ */
+export function natName(server: Pick<ServerInfo, 'nat' | 'dockerBridge'>, t: TFunction): string {
+  const nat: string = server.nat;
   switch (nat) {
     case NATKindNone:
       return t('admin.dashboard.natKind.none');
@@ -214,7 +222,9 @@ export function natName(nat: string, t: TFunction): string {
     case NATKindPortForward:
       return t('admin.dashboard.natKind.port_forward');
     case NATKindSymmetric:
-      return t('admin.dashboard.natKind.symmetric');
+      return server.dockerBridge === true
+        ? t('admin.dashboard.natKind.symmetric_dockerBridge')
+        : t('admin.dashboard.natKind.symmetric');
     case NATKindCGNATLikely:
       return t('admin.dashboard.natKind.cgnat_likely');
     case NATKindUnknown:

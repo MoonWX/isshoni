@@ -242,13 +242,19 @@ func (s *Server) wire(ctx context.Context) error {
 	// One status source for `isshoni admin status`, for doctor, which examines the server through it, and for the
 	// dashboard. Doctor's own runs start with the server's other work (startBackground).
 	status := s.statusSource()
+	env := s.doctorEnv(status)
 	s.doctor = ops.NewDoctor(ops.DoctorOptions{
-		Env:    s.doctorEnv(status),
+		Env:    env,
 		Meta:   metaStore{db: s.store},
 		Logger: s.log,
 	})
 	if s.api != nil {
-		s.wireOpsRoutes(status)
+		// The dashboard and the connection test name the NAT as doctor's public_ip judges it: a container bridge's
+		// symmetric NAT, which the check lets pass, is dockerBridge next to nat in both (README F22). The check runs
+		// once, here, in the environment of doctor's own runs.
+		bridge := dockerBridgeNAT(ctx, env(ctx))
+		s.wireConnTest(bridge)
+		s.wireOpsRoutes(status, bridge)
 	}
 	// Backup, restore and rotate-secrets work on every server, with a site or without: the data directory and the
 	// keys are there either way. The database's snapshot is 03's (*store.DB).BackupTo, with a full disk marked as
@@ -297,8 +303,11 @@ func (s *Server) restartFor(why ops.RestartReason) {
 // The certificate's last error travels in the status as a code only; its fix text, which names what doctor can't
 // know from the code (the address a domain points to, the end of a rate limit), comes from the TLS manager, and
 // only while it is the text of that same error.
+//
+// A test may stand in for what doctor reads of the machine (hookDoctorEnv, SetDoctorMachine): its files and its
+// network interfaces.
 func (s *Server) doctorEnv(status func(context.Context) (api.ServerStatus, error)) func(context.Context) doctor.Env {
-	cfg, tls, deps := &s.cfg, s.tls, s.deps
+	cfg, tls, deps, hook := &s.cfg, s.tls, s.deps, s.hookDoctorEnv
 	return func(ctx context.Context) doctor.Env {
 		live, _ := status(ctx) // statusSource has no error to give
 		env := doctor.Env{
@@ -314,8 +323,44 @@ func (s *Server) doctorEnv(status func(context.Context) (api.ServerStatus, error
 		if cert := tls.Status(); cert.LastErrorCode != "" && cert.LastErrorCode == live.TLS.LastErrorCode {
 			env.TLSLastError = cert.LastError
 		}
+		if hook != nil {
+			hook(&env)
+		}
 		return env
 	}
+}
+
+// The check of doctor's that judges the NAT (04 §13.2), and the param with which it lets a container bridge's
+// symmetric NAT pass (README F21's rule (a)).
+const (
+	doctorCheckPublicIP     = "public_ip"
+	doctorParamDockerBridge = "dockerBridge"
+)
+
+// dockerBridgeNAT reports whether doctor's public_ip check, run in env (a run inside this server, on the addresses
+// and the NAT kind that Start detected), lets the server's symmetric NAT pass because the server runs in a
+// container on a bridge network: README F21's rule (a), the check's param dockerBridge (04 §13.2). The dashboard and
+// the connection test then say the same with their dockerBridge (README F22, 04 §7.7, §11.4). It asks doctor rather
+// than judging the bridge a second time, so the three can't disagree: one rule, and one look at the container's
+// network (the default route's interface is one end of a veth pair).
+//
+// Only a symmetric NAT can pass this way, so any other kind is false without a run. The run is the one check: with
+// the server's own status doctor sends nothing and only reads the machine: the interface list, the default-route
+// interface's ifindex and iflink under /sys, and the host description that every doctor report carries (kernel
+// release, DMI, systemd, the user name). A check that doesn't run (a loopback setup skips it, 04 §13.2) or doesn't
+// let the NAT pass is false.
+func dockerBridgeNAT(ctx context.Context, env doctor.Env) bool {
+	if env.Live == nil || env.Live.NAT != api.NATKindSymmetric {
+		return false
+	}
+	rep := doctor.Run(ctx, env, api.BandwidthInput{}, []string{doctorCheckPublicIP})
+	for _, c := range rep.Checks {
+		if c.ID == doctorCheckPublicIP {
+			bridge, _ := c.Params[doctorParamDockerBridge].(bool)
+			return bridge
+		}
+	}
+	return false
 }
 
 // metaStore is 03's meta table as ops and push keep their state in it (ops.MetaStore, and the meta half of
@@ -403,8 +448,9 @@ func mediaCheck(udp bool, tr *netx.Transport, sfuReady func() error) func() (ok 
 	}
 }
 
-// wireAccounts builds the push service, the account service, the hub and the REST API for the site, with the
-// connection test's route on the API (wireConnTest). media is the hub's MediaPlane.
+// wireAccounts builds the push service, the account service, the hub and the REST API for the site. media is the
+// hub's MediaPlane. The connection test's route comes onto the API later in wire (wireConnTest), next to the routes
+// of ops, once doctor's environment is there.
 func (s *Server) wireAccounts(ctx context.Context, media signal.MediaPlane) error {
 	origin := s.site.Origin
 
@@ -479,7 +525,6 @@ func (s *Server) wireAccounts(ctx context.Context, media signal.MediaPlane) erro
 		Clock:    s.deps.Now,
 		Logger:   s.log,
 	})
-	s.wireConnTest()
 	s.health.AddCheck("signal", func() (bool, string) {
 		if hub.Ready() {
 			return true, ""
@@ -1118,22 +1163,25 @@ func userLister(db *store.DB) func(context.Context) ([]store.UserRow, error) {
 // address that the ICE candidates name, the NAT kind, the provider and container that the detection and the
 // Transport got, and the ports of the transports that have a listener (connTestPorts). Each is fixed for the life
 // of the process, like the candidates themselves: a public address that changes later takes a restart (04 §7.4).
+// bridge is what doctor's public_ip says of the NAT (dockerBridgeNAT): a container bridge's symmetric NAT that it
+// lets pass, the object's dockerBridge (README F22).
 //
 // The limiter's clock is the wall clock, not Deps.Now: how long ago a user tested has nothing to do with what time
 // the accounts think it is.
-func (s *Server) wireConnTest() {
+func (s *Server) wireConnTest(bridge bool) {
 	var pr ops.Prober // a server without an SFU has no site and no API, so nil only stands for "not ready"
 	if s.media != nil {
 		pr = prober{sfu: s.media}
 	}
 	ct := ops.NewConnTest(ops.ConnTestOptions{
-		Prober:     pr,
-		Ports:      connTestPorts(s.transport, s.addrs),
-		PublicIPv4: s.public.V4,
-		Provider:   s.cloudProvider(),
-		Container:  api.ContainerKind(s.deps.Host.Container()),
-		NAT:        s.public.NAT,
-		Logger:     s.log,
+		Prober:       pr,
+		Ports:        connTestPorts(s.transport, s.addrs),
+		PublicIPv4:   s.public.V4,
+		Provider:     s.cloudProvider(),
+		Container:    api.ContainerKind(s.deps.Host.Container()),
+		NAT:          s.public.NAT,
+		DockerBridge: bridge,
+		Logger:       s.log,
 	})
 	s.api.Handle("POST /api/v1/conntest", httpapi.User, connTestHandler(ct))
 }
@@ -1450,8 +1498,9 @@ const doctorRouteDeadline = 3 * time.Minute
 //
 // The dashboard's sources are the status (the admin socket's), the hub and the SFU (liveSource, with the rooms'
 // current names from 03's store), 03's DashboardAccounts, the transfer accounting, the release check, doctor, the
-// public addresses as the server's last look found them, and the setting minClientVersion.
-func (s *Server) wireOpsRoutes(status func(context.Context) (api.ServerStatus, error)) {
+// public addresses as the server's last look found them, and the setting minClientVersion. bridge is what doctor's
+// public_ip says of the status's NAT (dockerBridgeNAT), the server object's dockerBridge (README F22).
+func (s *Server) wireOpsRoutes(status func(context.Context) (api.ServerStatus, error), bridge bool) {
 	settings := s.store.Settings()
 	live := liveSource{hub: s.hub, names: roomNames(s.store)}
 	if s.media != nil {
@@ -1464,6 +1513,7 @@ func (s *Server) wireOpsRoutes(status func(context.Context) (api.ServerStatus, e
 		Transfer:         s.transfer,
 		Release:          s.releases,
 		Doctor:           s.doctor,
+		DockerBridge:     bridge,
 		PublicAddrs:      s.publicAddrsSeen,
 		MinClientVersion: func() string { return settings.Get().MinClientVersion },
 		Logger:           s.log,

@@ -362,6 +362,28 @@ func goldenCases() []goldenCase {
 				Params: map[string]any{"source": "accounts"},
 			}},
 		}},
+		// README F22: a container on a bridge network, whose symmetric NAT doctor's public_ip lets pass (04 §13.2).
+		// The field is additive: every other sample leaves it out, and their files have no dockerBridge key.
+		{"OpsDashboard.docker-bridge", OpsDashboard{
+			GeneratedAt: at("2026-10-15T09:00:00Z"),
+			Server: ServerInfo{
+				Version: "0.3.0", StartedAt: at("2026-10-15T08:00:00Z"), Origin: "https://watch.example.com",
+				Process: ProcessInfo{CPUSeconds: 12.5, RSSBytes: 64000000, NumCPU: 4, Goroutines: 120},
+				TLS: TLSInfo{
+					Mode: TLSModeAuto, Names: []string{"watch.example.com"}, Ready: true,
+					NotAfter: at("2027-01-13T08:00:00Z"), NextRenewal: at("2026-12-14T08:00:00Z"),
+				},
+				PublicIPv4: "203.0.113.7", PublicIPv6: "", NAT: NATKindSymmetric, DockerBridge: true,
+				Advertised: []AdvertisedAddr{
+					{Proto: "udp", Addr: "203.0.113.7:7882", Via: TransportUDP},
+					{Proto: "tcp", Addr: "203.0.113.7:443", Via: TransportTCP443},
+				},
+			},
+			Transfer: TransferInfo{Month: "2026-10"},
+			Rooms:    []RoomLive{},
+			Clients:  []ClientVersionCount{},
+			Alerts:   []Alert{},
+		}},
 		{"ServerStatus", ServerStatus{
 			Version: "0.3.0", StartedAt: at("2026-09-29T18:00:00Z"), UptimeS: 8045, Origin: "https://203.0.113.7",
 			TLS: TLSInfo{
@@ -424,6 +446,15 @@ func goldenCases() []goldenCase {
 			Server: ConnTestServerInfo{
 				PublicIP: "203.0.113.7", Provider: CloudProviderHetzner, Container: ContainerKindNone,
 				UDPPort: 7882, TCPPorts: []int{443, 7882}, NAT: NATKindNone,
+			},
+		}},
+		// README F22: the same server object from a container on a bridge network (04 §7.7, §13.2).
+		{"ConnTestResponse.docker-bridge", ConnTestResponse{
+			Answer:     "v=0\r\no=- 1 1 IN IP4 203.0.113.7\r\ns=-\r\nt=0 0\r\nm=application 7882 UDP/DTLS/SCTP webrtc-datachannel\r\n",
+			ExpiresInS: 20,
+			Server: ConnTestServerInfo{
+				PublicIP: "203.0.113.7", Provider: CloudProviderHetzner, Container: ContainerKindDocker,
+				UDPPort: 7882, TCPPorts: []int{443, 7882}, NAT: NATKindSymmetric, DockerBridge: true,
 			},
 		}},
 
