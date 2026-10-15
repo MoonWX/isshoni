@@ -345,8 +345,10 @@ const (
 // network (the default route's interface is one end of a veth pair).
 //
 // Only a symmetric NAT can pass this way, so any other kind is false without a run. The run is the one check: with
-// the server's own status doctor sends nothing, and reads the interface list and two files under /sys. A check
-// that doesn't run (a loopback setup skips it, 04 §13.2) or doesn't let the NAT pass is false.
+// the server's own status doctor sends nothing and only reads the machine: the interface list, the default-route
+// interface's ifindex and iflink under /sys, and the host description that every doctor report carries (kernel
+// release, DMI, systemd, the user name). A check that doesn't run (a loopback setup skips it, 04 §13.2) or doesn't
+// let the NAT pass is false.
 func dockerBridgeNAT(ctx context.Context, env doctor.Env) bool {
 	if env.Live == nil || env.Live.NAT != api.NATKindSymmetric {
 		return false

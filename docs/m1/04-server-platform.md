@@ -1702,7 +1702,7 @@ IPv4 algorithm:
 | STUN IP equals a local interface address | that IP (`interface`) | `none` |
 | No STUN answer, a public (global unicast, not CGNAT) IPv4 on an interface | that IP (`interface`) | `unknown` |
 | STUN IP ≠ local, both servers agree on IP **and** port | STUN IP (`stun`) | `one_to_one` if a cloud provider or a container is detected, else `port_forward` |
-| Servers see different mapped ports | STUN IP | `symmetric` (typical of CGNAT; friends probably can't connect; not in a container's bridge network, below) |
+| Servers see different mapped ports | STUN IP | `symmetric` (typical of CGNAT; friends probably can't connect, except in a container's bridge network: below) |
 | `LocalV4` in `100.64.0.0/10` on a non-Tailscale interface | STUN IP | `cgnat_likely` |
 | Nothing found | none | `unknown` (ip mode not ready; doctor explains) |
 
@@ -1884,9 +1884,11 @@ text above leaves a choice:
   wiring asks doctor rather than judging the bridge a second time (`wire.go`, `dockerBridgeNAT`): once, when it
   builds the routes, it runs the one check `public_ip` in the environment of doctor's own runs (`doctorEnv`: the
   config, the server's status with the addresses and the NAT kind that Start detected, the container detection),
-  which sends nothing and reads the interface list and two files under `/sys`; any NAT kind but `symmetric` is
-  `false` without a run. The result goes to `ops.ConnTestOptions.DockerBridge` and `ops.DashboardOptions.DockerBridge`,
-  and each builder drops it next to any other kind, whatever the wiring says. Like the rest of the server object it
+  which sends nothing and only reads the machine: the interface list, the default-route interface's `ifindex` and
+  `iflink` under `/sys`, and the host description that every doctor report carries (kernel release, DMI, systemd,
+  the user name); any NAT kind but `symmetric` is `false` without a run. The result goes to
+  `ops.ConnTestOptions.DockerBridge` and `ops.DashboardOptions.DockerBridge`, and each builder drops it next to any
+  other kind, whatever the wiring says. Like the rest of the server object it
   is fixed for the process's life. Tests: `TestConnTestServerInfo` (the flag next to `symmetric`, not without it,
   dropped next to `cgnat_likely`, and the wire form with and without the key), `TestDockerBridgeNAT` (`internal/server`:
   a bridge with the address seen by STUN or set in the config, and with IPv6 on, against the host's network, a
