@@ -239,6 +239,10 @@ test('a quality.hint{codec} makes the sharer re-offer, and the viewers keep deco
   expect(videoProfiles(before.sdp)[0], 'the first profile of the first offer').toBe(startProfile);
   await keepsDecoding(page, shareId, 'the admin');
 
+  // The rest needs a switch away from High. A sharer whose Chrome can't encode High (CI's Linux runners) starts in
+  // Constrained Baseline already, so a friend who decodes only that changes nothing and no hint comes (02 §8.3).
+  test.skip(!encodesHigh, "the sharer's Chrome can't encode High, so there is no codec switch to test");
+
   // A friend whose browser decodes only Constrained Baseline joins.
   let danWire: Frame[] = [];
   const dan = await joinLounge(server, asUser, async (p) => {
