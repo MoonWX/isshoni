@@ -2388,6 +2388,7 @@ export interface ConnTestResult {
   probes: ProbeVerdict[];
   server?: {
     provider: string; nat: string; udpPort: number; tcpPorts: number[];
+    dockerBridge?: true;                      // README F22: the server's dockerBridge, present only when true
     container: string;                        // 04, as in the doctor's env.container: none | docker | podman | other
     publicIpKnown: boolean;                   // derived: server.publicIp non-empty
     publicIpPrivate: boolean;                 // derived: server.publicIp empty, private or loopback (the IP itself isn't kept)
@@ -2406,7 +2407,9 @@ As S37 built it (`conntest/`):
   wire and are read defensively: a missing provider or NAT kind reads as `unknown`, a missing container as `none`,
   `udpPort` is 0 when UDP is off, and an empty `tcpPorts` (Go's `null`) is `[]`. A provider or NAT id that this
   build doesn't know (a newer server's) stays in the result as it came and is treated as `unknown` when the fix
-  text is chosen.
+  text is chosen. **`dockerBridge`** (README F22) is in the result only when the server sent `true`; anything else,
+  an older server's answer without the key included, leaves it out, so "Copy result" is what it was for every other
+  server.
 - **`runConnTest` resolves with a result** also when probes failed, are disabled or couldn't run: those are
   verdicts. It rejects only when there is nothing to show: the `signal` aborted (its reason), the server says the
   user is signed out (the `ApiError`, so the 401 rule of §6.2 runs), or this browser can't make a data-channel
@@ -2491,6 +2494,16 @@ RTT labels: ≤ 80 ms good, ≤ 200 ms OK, above that "high latency". Every resu
   this machine"; `cgnat_likely`/`symmetric` → "This server has no public address; isshoni needs one (a VPS or a
   router port forward)". When `server.nat` is `port_forward`, admins also see "You may be testing from the server's
   own network. Test again from your phone's mobile data" on every result, including green.
+  **A container bridge's symmetric NAT** (README F22): when `server.nat` is `symmetric` and the server sent
+  `dockerBridge: true`, doctor's `public_ip` lets that NAT pass (04 §13.2: friends reach the published ports), and
+  the line is `conntest.nat.symmetric_dockerBridge` instead: "This server runs in a container on a bridge network.
+  Its NAT gives each outgoing connection its own port (symmetric NAT), which doesn't matter here: friends reach the
+  ports the container publishes. Open them in the provider's firewall. At home, also forward TCP 80, 443, 7882 and
+  UDP 7882 on your router to this machine.", without a troubleshooting link (not `nat_cgnat`: the server has its
+  public address), in the same place among the lines. The flag qualifies `symmetric` alone; every other kind, with
+  or without it, keeps its line (`natIsDockerBridge`). Tests: `fixText.test.ts` ("NAT text in a container bridge":
+  the line and its ports, the symmetric text without the flag, every other kind with it, green, non-admins, and the
+  server's golden answers `ConnTestResponse*.json` of `internal/protocol/api/testdata` through `summarizeServer`).
 - **Docker** (when `server.container` is `docker` or `podman`): "Check that compose publishes `7882:7882/udp`;
   published ports bypass ufw."
 - **macOS Local Network** (S4 finding 6): when `server.publicIp` is empty, private or loopback (`publicIpPrivate`) and
@@ -2693,6 +2706,8 @@ S91's):
 - **`clients[].outdated`** is also true for a client older than the server's own version (a tab not reloaded since
   an upgrade), not only below `minClientVersion`. A share's `codec` is `""` while the server doesn't know its
   profile.
+- **`server.dockerBridge`** (README F22, 04 §11.4) is `true` next to `"nat": "symmetric"` where doctor lets a
+  container bridge's symmetric NAT pass (04 §13.2), and absent otherwise.
 
 **The pages as README S49 built them** (`web/src/admin/`: Users, Approvals, Invites, Rooms, Settings and Audit;
 the Dashboard and Doctor pages are README S91's, below. Until S91 their routes showed the router's `PageUnavailable`
@@ -2812,7 +2827,13 @@ choice:
   A code that is no certificate code shows as it is.
 - **Wire identifiers have names** (review S91-5): the TLS mode as the certificate's kind, the NAT kind in a few
   words, a client's kind and OS ("Web 0.3.0 on iOS"), the transport; a value this build doesn't know shows as it
-  is, and a connection without a selected pair reads "no media yet", without an RTT.
+  is, and a connection without a selected pair reads "no media yet", without an RTT. **The NAT kind comes with
+  `server.dockerBridge`** (README F22): `natName` takes the server object, and a symmetric NAT with the flag reads
+  "NAT: symmetric in the container's bridge network, which doesn't matter: friends reach the published ports"
+  (`admin.dashboard.natKind.symmetric_dockerBridge`) instead of "symmetric, friends probably can't connect", as the
+  Doctor page's `public_ip` line does with its bridge note; every other kind, with or without the flag, reads as
+  before. Tests: `dashboardText.test.ts` (the names against the server's golden documents `OpsDashboard*.json` of
+  `internal/protocol/api/testdata`).
 - **Accounts and security events** show without IP addresses (those are on the Approvals and Audit pages only). The
   setup checklist card leads to the wizard's steps until `settings.setupWizardDone`. A member who opens `/admin` gets
   NotFound.
@@ -3332,7 +3353,7 @@ export default defineConfig({
 | `rooms/RoomSession.ts` (fake SignalClient) | resync after resumed and not-resumed welcomes (01 §10.5): pending offer re-sent, full `subscribe.update` only when non-empty and in chunks of 64, re-publish with `replaces`, stray server share stopped; `join()` before `ready` joins on the next resync; a resumed welcome with a missing or other `roomId` re-joins the desired room; own `share.stopped` (each reason) and the `room.state` fallback drive §13.1 |
 | `protocol/invalidate.ts` | each topic → its query keys |
 | `protocol/rest.ts` | both error envelopes parse to the same `ApiError`; `Content-Type` always set on unsafe methods |
-| `conntest/verdict.ts`, `fixText.ts` | status table; provider/nat/docker/macOS key selection (`server.container`, empty or private `publicIp`); empty `publicIp` with every tested probe ✗ → only `conntest.noPublicIp` (no provider, host firewall, Docker or macOS lines) and code `no_public_ip`; empty `publicIp` with a probe ✓ → the normal text; a disabled TCP row hidden, a disabled UDP row ✗ with `conntest.udpDisabled` and counted as UDP ✗; `rate_limited`/`server` probes "not tested" (no ✓/✗, out of the verdict, no fix text, the "Couldn't finish the test" line), and a status with not-tested probes only when they can't change it; `retryAfterSec` from a 429; the ports in the rows, the fix texts and the commands are the server's, with 7882 only as the fallback; the UDP-port lines only for a UDP probe that failed, not for one that is off; the `port_forward` hint on a green result; non-admin text |
+| `conntest/verdict.ts`, `fixText.ts` | status table; provider/nat/docker/macOS key selection (`server.container`, empty or private `publicIp`); empty `publicIp` with every tested probe ✗ → only `conntest.noPublicIp` (no provider, host firewall, Docker or macOS lines) and code `no_public_ip`; empty `publicIp` with a probe ✓ → the normal text; a disabled TCP row hidden, a disabled UDP row ✗ with `conntest.udpDisabled` and counted as UDP ✗; `rate_limited`/`server` probes "not tested" (no ✓/✗, out of the verdict, no fix text, the "Couldn't finish the test" line), and a status with not-tested probes only when they can't change it; `retryAfterSec` from a 429; the ports in the rows, the fix texts and the commands are the server's, with 7882 only as the fallback; the UDP-port lines only for a UDP probe that failed, not for one that is off; the `port_forward` hint on a green result; non-admin text; a symmetric NAT with the server's `dockerBridge` → `conntest.nat.symmetric_dockerBridge` instead of the symmetric line, every other kind unchanged with the flag, and the server's golden `ConnTestResponse*.json` as input (README F22, §14.2) |
 | `sw/routes.ts`, `sw/push.ts` | strategy per URL class; payload → notification options for every known type; same-origin guard on click URLs; generic fallback |
 | `lib/ua.ts` | `inAppBrowser()` matches each known token (`FBAN`, `FBAV`, `Instagram`, `Line/`, `MicroMessenger`) and returns `null` for plain Safari, Chrome, iOS Chrome (`CriOS`), Firefox and Edge UAs |
 | `app/boot.tsx` (`stashFragmentToken`), `auth/fragmentToken.ts` | boot step 0 stores the token for `/setup`, `/invite` and `/reset` and removes the fragment via `replaceState` before the first fetch (`/info` included); other paths and empty fragments are left alone; `fragmentToken.ts` reads the stored token and clears it |
@@ -3344,7 +3365,7 @@ export default defineConfig({
 | i18n | every generated error code maps to an existing `en.json` key (also enforced by `check:i18n`) |
 | `check:i18n`'s unused-key warnings (`app/checkI18nUnused.node.test.ts`; README S93, §16.5) | `unusedMessages` counts literal keys and plural bases, a key written out anywhere, a key built at run time as far as it is written (a string head only below a namespace), what rules 2 and 3 require, the namespaces read whole and `$t()` nesting, and names the namespaces a template head covers whole; `messagePositions` gives each message's line and column; the script warns about each unused message at its place and passes, notes the namespaces it can't check, and fails when a message the code asks for is gone; on this package it passes, and a copy of `en.json` without a used message fails while one with a message no code uses warns |
 | `viewer/listening.ts`, `share/shareUi.ts` (README S93, §16.6) | "Now listening to …" when the sound moves to a share that was there, not for a new share, "your share" for this user's share from another device, nothing once detached; "You're live" and "Sharing stopped" in the assertive region |
-| `admin/doctorText.ts` and `doctorCatalog.node.test.ts` (README S91, §15.3; `dashboardText.ts` is tested through `DashboardPage.test.tsx`, §19.2) | doctor's golden report renders from the catalog with no key or placeholder left and reads like the CLI's text; the variant the params pick (contexts, plurals), owners named as the CLI names them, every provider's firewall text, the server's English for an unknown code or fix code; fixes with the environment's commands, quoted paths, both owner cases, the server's own certificate sentence, a certificate code's fix without a report and without a command that depends on how the server runs; the links of a check; the catalog against the CLI's codes both ways and a name for every check id |
+| `admin/doctorText.ts` and `doctorCatalog.node.test.ts` (README S91, §15.3; `dashboardText.ts` is tested through `DashboardPage.test.tsx`, §19.2, and its NAT names, `dockerBridge` included, in `dashboardText.test.ts`, README F22) | doctor's golden report renders from the catalog with no key or placeholder left and reads like the CLI's text; the variant the params pick (contexts, plurals), owners named as the CLI names them, every provider's firewall text, the server's English for an unknown code or fix code; fixes with the environment's commands, quoted paths, both owner cases, the server's own certificate sentence, a certificate code's fix without a report and without a command that depends on how the server runs; the links of a check; the catalog against the CLI's codes both ways and a name for every check id |
 
 01 owns the `SignalClient`, `codecs.ts` and registry tests (01 §19).
 

@@ -21,6 +21,7 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/httpapi"
 	"github.com/MoonWX/isshoni/internal/server/netx"
 	"github.com/MoonWX/isshoni/internal/server/ops"
+	"github.com/MoonWX/isshoni/internal/server/ops/doctor"
 	"github.com/MoonWX/isshoni/internal/server/push"
 	"github.com/MoonWX/isshoni/internal/server/sfu"
 	"github.com/MoonWX/isshoni/internal/server/signal"
@@ -291,6 +292,10 @@ type Server struct {
 	// hookDetect, set by tests before Start, stands in for the public-address detection (04 §7.4), which reads
 	// the machine's interfaces: a test says what the server finds, at startup and at every later look.
 	hookDetect func() netx.PublicAddrs
+	// hookDoctorEnv, set by tests before Start, adjusts what doctor sees of the machine in the server (doctorEnv):
+	// its files and its network interfaces, which doctor's run inside the server reads for itself. The server's
+	// own doctor runs and the dashboard's and the connection test's dockerBridge (dockerBridgeNAT) all see it.
+	hookDoctorEnv func(*doctor.Env)
 	// redetectEvery, set by tests before Start, replaces publicRedetectEvery.
 	redetectEvery time.Duration
 }

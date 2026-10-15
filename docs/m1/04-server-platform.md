@@ -1702,9 +1702,16 @@ IPv4 algorithm:
 | STUN IP equals a local interface address | that IP (`interface`) | `none` |
 | No STUN answer, a public (global unicast, not CGNAT) IPv4 on an interface | that IP (`interface`) | `unknown` |
 | STUN IP ≠ local, both servers agree on IP **and** port | STUN IP (`stun`) | `one_to_one` if a cloud provider or a container is detected, else `port_forward` |
-| Servers see different mapped ports | STUN IP | `symmetric` (typical of CGNAT; friends probably can't connect) |
+| Servers see different mapped ports | STUN IP | `symmetric` (typical of CGNAT; friends probably can't connect, except in a container's bridge network: below) |
 | `LocalV4` in `100.64.0.0/10` on a non-Tailscale interface | STUN IP | `cgnat_likely` |
 | Nothing found | none | `unknown` (ip mode not ready; doctor explains) |
+
+**A symmetric NAT inside a container's bridge network** (README F21 and F22). The kind is what STUN measured, and it
+stays `symmetric` everywhere. Inside a bridge it is the container runtime's own NAT for connections that start in the
+container (Docker Desktop's and rootless Docker's user-space NAT give each destination its own port), and it decides
+nothing: friends reach the ports the runtime publishes. doctor's `public_ip` lets it pass with the param
+`dockerBridge` (§13.2, rule (a)), and the dashboard (§11.4) and the connection test (§7.7) say the same with
+`dockerBridge: true` next to `nat`, from that check; 05 then names it as a bridge's NAT (05 §14.2, §15.3).
 
 Tailscale interfaces (`tailscale*`, `utun*` with 100.64/10) are ignored for the CGNAT rule. Detection runs once at
 startup and then every 10 minutes; a change is logged as a warning and shown on the dashboard ("Public IP changed from
@@ -1806,6 +1813,7 @@ Request:  {"transport": "udp" | "tcp443" | "tcp7882", "offer": "<SDP with one da
 Response: 200 {"answer": "<SDP>", "expiresInS": 20,
                "server": {"publicIp": "203.0.113.7", "provider": "hetzner", "container": "none",
                           "udpPort": 7882, "tcpPorts": [443, 7882], "nat": "none"}}
+               (in a container's bridge network: "container": "docker", "nat": "symmetric", "dockerBridge": true)
 Errors:   400 bad_sdp · 409 transport_disabled (params.transport) · 422 validation_failed (fields.transport)
           · 429 rate_limited · 503 not_ready
 ```
@@ -1836,7 +1844,7 @@ type Prober interface {
   (user, transport), where a new one replaces the old, and 20 globally (`sfu.probe_limit` → 429).
 - Probe answers hold IPv4 candidates only when a public IPv4 is known (02 §7.6).
 - `provider` (§13.3) and `nat` (§7.4) let 05 show provider-specific fix text from its catalog; 05 shows it to admins
-  only.
+  only. `dockerBridge` (README F22, below) qualifies a symmetric `nat`: a container bridge's, which doctor lets pass.
 
 Types (`internal/protocol/api/conntest.go`): `ConnTestRequest`, `ConnTestResponse`, `ConnTestServerInfo`, plus
 `type CloudProvider string` with one constant per §13.3 id and `type NATKind string` with the §7.4 values, so
@@ -1865,7 +1873,32 @@ text above leaves a choice:
 - **Which transports have a listener** is `ops.ConnTestPorts` (0 for none), filled from the Transport's muxes and
   the bound addresses. The answer's `server` object is built once at start: `udpPort` 0 without UDP, `tcpPorts` in
   the order 443, 7882 (`[]`, not null, without either), `publicIp` only for a known IPv4 address, and `unknown`,
-  `none` and `unknown` for a provider, container and NAT kind that weren't found.
+  `none` and `unknown` for a provider, container and NAT kind that weren't found. Since README F22 the routes are
+  built in `wire` next to the routes of ops, once doctor's environment is there (`wireConnTest(bridge)`), and the
+  object has `dockerBridge` where it applies (below).
+- **`dockerBridge`, as README F22 added it** (F21's follow-up; `api.ConnTestServerInfo.DockerBridge`, the same
+  field as the dashboard's `server.dockerBridge`, §11.4). It is `true` exactly where doctor's `public_ip` lets the
+  server's symmetric NAT pass because the server runs in a container on a bridge network (§13.2, rule (a): the
+  check's param `dockerBridge`), and only next to `nat: "symmetric"`; otherwise the key is absent (`omitempty`), so
+  the answer of every other server is what it was, and an older SPA ignores the key (01's compatibility rules). The
+  wiring asks doctor rather than judging the bridge a second time (`wire.go`, `dockerBridgeNAT`): once, when it
+  builds the routes, it runs the one check `public_ip` in the environment of doctor's own runs (`doctorEnv`: the
+  config, the server's status with the addresses and the NAT kind that Start detected, the container detection),
+  which sends nothing and only reads the machine: the interface list, the default-route interface's `ifindex` and
+  `iflink` under `/sys`, and the host description that every doctor report carries (kernel release, DMI, systemd,
+  the user name); any NAT kind but `symmetric` is `false` without a run. The result goes to
+  `ops.ConnTestOptions.DockerBridge` and `ops.DashboardOptions.DockerBridge`, and each builder drops it next to any
+  other kind, whatever the wiring says. Like the rest of the server object it
+  is fixed for the process's life. Tests: `TestConnTestServerInfo` (the flag next to `symmetric`, not without it,
+  dropped next to `cgnat_likely`, and the wire form with and without the key), `TestDockerBridgeNAT` (`internal/server`:
+  a bridge with the address seen by STUN or set in the config, and with IPv6 on, against the host's network, a
+  network doctor can't tell, no container, 1:1 NAT, `cgnat_likely`, a loopback `public_ip`, no IPv4 address, a
+  loopback setup and no status; in each case doctor's own report has the same param, and its `container` check sees
+  the network the case is about), and `TestDockerBridgeInServer` (a running server in a Docker container with a
+  symmetric NAT and a fake machine for doctor, `SetDoctorMachine`: on a bridge the admin socket's doctor run, the
+  dashboard and the connection test's answer all carry `dockerBridge`, on the host's network none does and
+  `public_ip` fails). The golden files `ConnTestResponse.docker-bridge.json` and `OpsDashboard.docker-bridge.json`
+  (`internal/protocol/api/testdata`) hold the wire form; the other golden files are unchanged.
 - **Tests**: `ops/conntest_test.go` with a fake `Prober` (the answers, the server object, validation, each
   transport without a listener, the limit and how it forgets, the `Prober`'s errors passed on); `wire_test.go`'s
   `TestProber` (the mapping, a request that ended among it) and `TestConnTestPorts`; and in `internal/server`
@@ -2833,6 +2866,14 @@ file `ops/testdata/dashboard.json`), where the text above leaves a choice:
   profile**, not `"h264/"`.
 - **`server.process`**: CPU seconds and resident memory from Prometheus's process collector (the one the metrics
   endpoint has too, so both agree; 0 where the platform has none), the CPUs and goroutines from the runtime.
+- **`server.dockerBridge`** (README F22): `true` next to `"nat": "symmetric"` where doctor's `public_ip` lets that
+  NAT pass because the server runs in a container on a bridge network (§13.2, rule (a)); absent otherwise, and absent
+  when the `server` source failed. It is the connection test's field with the same name and the same source (§7.7,
+  "`dockerBridge`, as README F22 added it"): `DashboardOptions.DockerBridge`, which the wiring fills once from that
+  check, and the dashboard keeps only next to the status's symmetric NAT. 05 names the NAT as a bridge's instead of
+  "friends probably can't connect" (05 §15.3). Tests: `TestDashboardDockerBridge` (the flag next to `symmetric`; not
+  without it, next to 1:1 NAT or `cgnat_likely`, or for a failed status; the key only where it is true) and, in the
+  server, `TestDockerBridgeInServer` (§7.7).
 - Tests: `TestDashboardGolden`, `TestDashboardSourceFailed` (an error, a panic and a source past its second each cost
   their section and add the alert), `TestDashboardCache`, `TestDashboardWithoutSources`, `TestClientCounts`,
   `TestPublicIPAlerts`, `TestTLSAlerts` and `TestProcessReader` (`ops/dashboard_test.go`); in the server
@@ -3523,9 +3564,11 @@ address ("127.0.0.1 (set in the config)"), then judged by the NAT kind. Both rul
   address, or to auto to detect it, then restart isshoni: sudo systemctl restart isshoni" (Docker: "set
   ISSHONI_PUBLIC_IP in .env to this server's public address, or leave it empty to detect it, then run docker compose
   up -d"). A private address (`192.168.1.20`, a LAN setup) is still the server's address.
-- **No new code.** Both rules use the codes above, so 05's catalog has a text for each; its texts don't know the
-  params yet (the Doctor page shows `public_ip.ok` without the bridge line, and `public_ip.none` with the words of
-  the address that wasn't found), which is a follow-up for 05 §15.3.
+- **No new code.** Both rules use the codes above, so 05's catalog has a text for each, and since the group 15
+  integration its texts know both params: the Doctor page adds the bridge line to `public_ip.ok`, `no_ipv6` and
+  `ephemeral` with `dockerBridge`, and names the address of `unreachable` on `none`, `no_ipv6` and `ipv6_only`, in
+  the CLI's words (`web/src/admin/doctorText.ts`). README F22 carries the bridge verdict to the dashboard and the
+  connection test, as their `dockerBridge` next to `nat` (§7.7, §11.4; 05 §14.2, §15.3).
 - **Tests** (`ops/doctor/publicip_test.go`): `TestPublicIPBridgeSymmetric` (a running server: symmetric NAT in a
   bridge is `ok`, `no_ipv6` or `ephemeral` with `dockerBridge`; on the host's network, with the network unknown,
   outside a container it stays a failure; 1:1 NAT and `cgnat_likely` are unchanged; every case also asserts the
@@ -4191,6 +4234,7 @@ no tokens, SDP, push endpoints or usernames.
 | `cmd/isshoni` | `testscript` (rogpeppe/go-internal, test-only): every subcommand's usage, exit codes (incl. healthcheck 0/1 only), a permission case run as a non-root uid that is not the server's (a socket directory it can't enter, and a server whose peer-cred filter rejects it): `setup-url` and `admin status` exit 4 with the `sudo` message, `doctor` prints it and runs no offline checks (skipped when the tests run as root), `--json` shapes, confirmation prompts and `--yes`, the no-TTY refusal without `--yes` (exit 2, printing the `--yes` command in the systemd form and, with container detection faked, the `docker compose exec -T` form), container `--out` requirement, `admin backup --out -` refused with exit 2 and the umask Docker form when stdout is a terminal (testscript `ttyout`) |
 | `internal/server` hardening (README S90) | The reload (§6.5): `TestReloadLogLevel` (the reloaded level becomes the configured one, a level set with `admin log-level --for` stays until it ends and then falls back to the reloaded one, the changed keys are named, a config with errors changes nothing), `TestReloadBeforeStart`, `TestReloadManualCertificate` (new files serve; unusable ones are refused, the old pair serves, `Reload` returns the error) and `TestReloadReadDoesNotHoldUpShutdown` (unix: a FIFO as `tls.cert_file`, the shutdown goes on while the read hangs); `TestExpected503sAreQuiet` (§9.3: a not-ready `/readyz` and the shutdown's 503s are debug lines, every other 5xx keeps its warning); `TestOffModeConnectionLimit` (§7.8: `limits.conns_per_ip` on off mode's `listen.http`, trusted proxies exempt); `TestRedactMessage` and `TestSafeLogger` (§10: the ICE password in a message's text, in the forms Pion and SDP write it, for every logger derived from the server's, attributes kept; a second layer since README F20 redacts in logx's Pion bridge) |
 | `cmd/isshoni` serve (README S90) | `TestServeReloadsOnSIGHUP` (`serve` as a real process: SIGHUP loads the config again from the flags, environment and file, applies `log.level`, names the other changed keys, a broken file changes nothing and names none, and the process never stops for the signal); `TestOnSignals` and `TestOnSignalsStopDoesNotWaitForAHungCall` (a hung reload delays the exit by at most 1 s); `TestRouteStdLog` (the standard log package's lines become JSON records with a level from their prefix and the component `stdlog`, and its settings come back afterwards) and `TestStdLogWriterLimits` (no SDP or candidate, 20 lines a minute) |
+| `ops` and `internal/server`: a Docker bridge's NAT (README F22, §7.7, §11.4) | `TestConnTestServerInfo` and `TestDashboardDockerBridge` (`ops`: `dockerBridge` only next to `symmetric`, dropped next to `cgnat_likely`, absent without the flag, next to 1:1 NAT and for a failed status, the key only where it is true); `TestDockerBridgeNAT` (the wiring's one run of doctor's `public_ip` gives the flag exactly where doctor's own report has the param) and `TestDockerBridgeInServer` (a running server in a container with a fake machine for doctor: on a bridge network doctor, the dashboard and the connection test all carry `dockerBridge`, on the host's network none does); the golden files `ConnTestResponse.docker-bridge.json` and `OpsDashboard.docker-bridge.json`, which 05's `fixText.test.ts` and `dashboardText.test.ts` read too |
 
 ### Integration (in-process, `servertest`)
 

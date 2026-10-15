@@ -191,6 +191,45 @@ func TestConnTestServerInfo(t *testing.T) {
 				TCPPorts: []int{443}, NAT: api.NATKindUnknown,
 			},
 		},
+		// README F22: where doctor's public_ip lets a container bridge's symmetric NAT pass, the server object says
+		// so next to the NAT kind.
+		{
+			name: "in Docker on a bridge network, symmetric NAT that doctor lets pass",
+			o: ConnTestOptions{
+				Ports:        allPorts,
+				PublicIPv4:   netip.MustParseAddr("203.0.113.7"),
+				Provider:     api.CloudProviderHetzner,
+				Container:    api.ContainerKindDocker,
+				NAT:          api.NATKindSymmetric,
+				DockerBridge: true,
+			},
+			want: api.ConnTestServerInfo{
+				PublicIP: "203.0.113.7", Provider: api.CloudProviderHetzner, Container: api.ContainerKindDocker,
+				UDPPort: 7882, TCPPorts: []int{443, 7882}, NAT: api.NATKindSymmetric, DockerBridge: true,
+			},
+		},
+		{
+			name: "symmetric NAT that doctor doesn't let pass (the host's network, no container)",
+			o: ConnTestOptions{
+				Ports: allPorts, PublicIPv4: netip.MustParseAddr("203.0.113.7"), NAT: api.NATKindSymmetric,
+			},
+			want: api.ConnTestServerInfo{
+				PublicIP: "203.0.113.7", Provider: api.CloudProviderUnknown, Container: api.ContainerKindNone,
+				UDPPort: 7882, TCPPorts: []int{443, 7882}, NAT: api.NATKindSymmetric,
+			},
+		},
+		{
+			// The rule lets only symmetric NAT pass (cgnat_likely stays a failure in a bridge), so the flag never
+			// stands next to another kind, whatever the wiring says.
+			name: "a bridge flag next to another NAT kind is dropped",
+			o: ConnTestOptions{
+				Ports: allPorts, Container: api.ContainerKindDocker, NAT: api.NATKindCGNATLikely, DockerBridge: true,
+			},
+			want: api.ConnTestServerInfo{
+				Provider: api.CloudProviderUnknown, Container: api.ContainerKindDocker, UDPPort: 7882,
+				TCPPorts: []int{443, 7882}, NAT: api.NATKindCGNATLikely,
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ct, _, _ := newTestConnTest(tc.o)
@@ -221,6 +260,24 @@ func TestConnTestServerInfo(t *testing.T) {
 	const wire = `{"publicIp":"","provider":"unknown","container":"none","udpPort":7882,"tcpPorts":[],"nat":"unknown"}`
 	if string(b) != wire {
 		t.Errorf("server JSON = %s, want %s", b, wire)
+	}
+
+	// The bridge's flag is an additive field (README F22): it is on the wire next to nat where it is true, and an
+	// older SPA ignores it; everywhere else the server object is what it was, without the key.
+	ct, _, _ = newTestConnTest(ConnTestOptions{
+		Ports: ConnTestPorts{UDP: 7882}, Container: api.ContainerKindDocker, NAT: api.NATKindSymmetric, DockerBridge: true,
+	})
+	res, err = ct.Probe(context.Background(), "u1", probeReq(api.TransportUDP))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, err = json.Marshal(res.Server); err != nil {
+		t.Fatal(err)
+	}
+	const bridgeWire = `{"publicIp":"","provider":"unknown","container":"docker","udpPort":7882,"tcpPorts":[],` +
+		`"nat":"symmetric","dockerBridge":true}`
+	if string(b) != bridgeWire {
+		t.Errorf("server JSON = %s, want %s", b, bridgeWire)
 	}
 }
 

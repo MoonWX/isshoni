@@ -8,7 +8,9 @@
 // - "Open UDP port N" on amber;
 // - provider: fix.firewall.<provider> for 04 §13.3's ids, linking to the install guide's section;
 // - host firewall: always both commands, labeled (ufw, firewalld);
-// - nat: conntest.nat.<nat> (04 §7.4);
+// - nat: conntest.nat.<nat> (04 §7.4). A symmetric NAT that the server marks dockerBridge (README F22) is a
+//   container bridge's, which doctor lets pass: conntest.nat.symmetric_dockerBridge, the published ports and a home
+//   router, instead of the text for a server without a public address;
 // - Docker: when the server runs in docker or podman;
 // - macOS Local Network: when the admin's OS is macOS and the server's address is empty, private or loopback;
 // - blocked network: under a red UDP row.
@@ -96,6 +98,14 @@ const NAT_CODES: Readonly<Record<NATKind, CtCode | null>> = {
 /** The NAT kinds this build has text for, in 04 §7.4's order. */
 export const NAT_KINDS = Object.keys(NAT_CODES) as readonly NATKind[];
 
+/**
+ * The line for a symmetric NAT in a container's bridge network (the server's dockerBridge, README F22). Doctor lets
+ * that NAT pass (04 §13.2): friends reach the published ports, so the server has its public address, and the
+ * symmetric text ("no public address", nat_cgnat) would send the admin the wrong way. Like one_to_one's, the line
+ * has no troubleshooting section of its own.
+ */
+export const NAT_DOCKER_BRIDGE_KEY = 'conntest.nat.symmetric_dockerBridge';
+
 /** A NAT kind from the server as one this build knows: a newer server's unknown kind becomes "unknown". */
 export function knownNat(id: string): NATKind {
   return Object.hasOwn(NAT_CODES, id) ? (id as NATKind) : NATKindUnknown;
@@ -107,6 +117,13 @@ export function providerKey(provider: CloudProvider): string {
 
 export function natKey(nat: NATKind): string {
   return `conntest.nat.${nat}`;
+}
+
+/** Whether the server's symmetric NAT is a container bridge's that doctor lets pass (dockerBridge, README F22). */
+export function natIsDockerBridge(
+  server: Pick<NonNullable<ConnTestResult['server']>, 'nat' | 'dockerBridge'>,
+): boolean {
+  return server.dockerBridge === true && knownNat(server.nat) === NATKindSymmetric;
 }
 
 export function fixText(result: ConnTestResult, verdict: ConnTestVerdict, { admin }: { admin: boolean }): FixText {
@@ -138,9 +155,13 @@ export function fixText(result: ConnTestResult, verdict: ConnTestVerdict, { admi
       );
     }
     if (server) {
-      const nat = knownNat(server.nat);
-      const code = NAT_CODES[nat];
-      lines.push(line('nat', natKey(nat), code ? { code } : {}));
+      if (natIsDockerBridge(server)) {
+        lines.push(line('nat', NAT_DOCKER_BRIDGE_KEY));
+      } else {
+        const nat = knownNat(server.nat);
+        const code = NAT_CODES[nat];
+        lines.push(line('nat', natKey(nat), code ? { code } : {}));
+      }
       if (udpFailed && (server.container === ContainerKindDocker || server.container === ContainerKindPodman)) {
         lines.push(line('docker', 'conntest.docker', { code: 'docker_ports' }));
       }

@@ -1,13 +1,24 @@
 // fixText.ts (05 §14.2, §19.1): which lines an admin sees for a result, that every provider id of 04 §13.3 and every
-// NAT kind of 04 §7.4 has its text, and what everyone else gets instead.
+// NAT kind of 04 §7.4 has its text, the line for a container bridge's symmetric NAT (README F22), and what everyone
+// else gets instead.
 import { describe, expect, it } from 'vitest';
 
 import { i18n } from '../i18n';
 import en from '../i18n/en.json';
-import { fixText, knownNat, NAT_KINDS, natKey, providerKey, type FixLine } from './fixText';
+import type { ConnTestResponse } from '../protocol/api.gen';
+import {
+  fixText,
+  knownNat,
+  NAT_DOCKER_BRIDGE_KEY,
+  NAT_KINDS,
+  natIsDockerBridge,
+  natKey,
+  providerKey,
+  type FixLine,
+} from './fixText';
 import { CLOUD_PROVIDERS, knownProvider, type CtCode } from './links';
-import type { ConnTestResult } from './runConnTest';
-import { resultFixture, type ResultFixtureOptions } from './testing';
+import { summarizeServer, type ConnTestResult } from './runConnTest';
+import { resultFixture, serverInfo, type ResultFixtureOptions } from './testing';
 import { verdictOf } from './verdict';
 
 /** 04 §13.3's provider ids, written out: the list this slice must cover. */
@@ -140,6 +151,93 @@ describe('NAT text', () => {
   it('falls back to "unknown" for a kind this build does not know', () => {
     expect(byId(fix({ ...udpBlocked, server: { nat: 'double' } }).lines, 'nat')?.key).toBe('conntest.nat.unknown');
     expect(knownNat('toString')).toBe('unknown');
+  });
+});
+
+// README F22: doctor's public_ip lets a container bridge's symmetric NAT pass (04 §13.2), because friends reach the
+// ports the container publishes. The server says so with dockerBridge next to nat, and the NAT line says what such a
+// server needs instead of "This server has no public address".
+describe('NAT text in a container bridge', () => {
+  const bridge = { nat: 'symmetric', container: 'docker', dockerBridge: true } as const;
+
+  /** The server's own answers (internal/protocol/api/testdata), as the browser gets them. */
+  const answers = import.meta.glob<ConnTestResponse>('../../../internal/protocol/api/testdata/ConnTestResponse*.json', {
+    eager: true,
+    import: 'default',
+  });
+  function answer(name: string): ConnTestResponse {
+    const a = answers[`../../../internal/protocol/api/testdata/${name}.json`];
+    if (!a) throw new Error(`no golden ${name}.json`);
+    return a;
+  }
+
+  it('a bridge note instead of the text for a server without a public address', () => {
+    const { lines } = fix({ ...udpBlocked, server: bridge });
+    const line = byId(lines, 'nat');
+    expect(line?.key).toBe(NAT_DOCKER_BRIDGE_KEY);
+    expect(line?.key).toBe('conntest.nat.symmetric_dockerBridge');
+    expect(line?.code).toBeUndefined(); // not nat_cgnat: the server has its public address
+    expect(typeof catalogString(NAT_DOCKER_BRIDGE_KEY)).toBe('string');
+    expect(text(line as FixLine)).toBe(
+      'This server runs in a container on a bridge network. Its NAT gives each outgoing connection its own port ' +
+        "(symmetric NAT), which doesn't matter here: friends reach the ports the container publishes. Open them in " +
+        "the provider's firewall. At home, also forward TCP 80, 443, 7882 and UDP 7882 on your router to this machine.",
+    );
+    // The other lines are the ones every server in Docker gets.
+    expect(ids(lines)).toEqual(['openUdp', 'provider', 'ufw', 'firewalld', 'nat', 'docker', 'blockedNetwork']);
+    expect(ids(fix({ ...allBlocked, server: bridge }).lines)).toEqual([
+      'provider',
+      'ufw',
+      'firewalld',
+      'nat',
+      'docker',
+      'blockedNetwork',
+    ]);
+  });
+
+  it("names the server's own ports", () => {
+    const server = { ...bridge, udpPort: 5000, tcpPorts: [443, 5001] };
+    const shown = text(byId(fix({ ...udpBlocked, server }).lines, 'nat') as FixLine);
+    expect(shown).toContain('forward TCP 80, 443, 5001 and UDP 5000 on your router to this machine');
+    expect(shown).not.toMatch(/\{\{|\}\}/);
+  });
+
+  it('the same NAT without the flag keeps the symmetric text', () => {
+    const { lines } = fix({ ...udpBlocked, server: { nat: 'symmetric', container: 'docker' } });
+    expect(byId(lines, 'nat')).toMatchObject({ key: 'conntest.nat.symmetric', code: 'nat_cgnat' });
+  });
+
+  // The flag qualifies symmetric alone: doctor lets no other kind pass in a bridge (cgnat_likely stays a failure).
+  it.each(NAT_IDS.filter((n) => n !== 'symmetric'))('%s with the flag keeps its own text', (nat) => {
+    const { lines } = fix({ ...udpBlocked, server: { ...bridge, nat } });
+    expect(byId(lines, 'nat')?.key).toBe(`conntest.nat.${nat}`);
+    expect(natIsDockerBridge({ nat, dockerBridge: true })).toBe(false);
+  });
+
+  it('green: no fix text, and no hint about the own network', () => {
+    expect(fix({ server: bridge })).toEqual({ lines: [], sendToAdmin: false });
+  });
+
+  it('everyone else: "Send this to your admin", as before', () => {
+    expect(fix({ ...udpBlocked, server: bridge }, { admin: false })).toEqual({ lines: [], sendToAdmin: true });
+  });
+
+  it("from the server's answer: the flag reaches the result only when the server sends true", () => {
+    const server = summarizeServer(answer('ConnTestResponse.docker-bridge').server);
+    expect(server).toMatchObject({ nat: 'symmetric', container: 'docker', dockerBridge: true });
+    expect(byId(fix({ ...udpBlocked, server }).lines, 'nat')?.key).toBe(NAT_DOCKER_BRIDGE_KEY);
+
+    // An answer without the key (every other server, and an older one) reads as before.
+    const plain = summarizeServer(answer('ConnTestResponse').server);
+    expect(Object.hasOwn(plain, 'dockerBridge')).toBe(false);
+    const symmetric = summarizeServer(serverInfo({ nat: 'symmetric', container: 'docker' }));
+    expect(byId(fix({ ...udpBlocked, server: symmetric }).lines, 'nat')?.key).toBe('conntest.nat.symmetric');
+
+    // Read defensively, like every field off the wire.
+    const odd = { ...serverInfo({ nat: 'symmetric' }), dockerBridge: 'yes' };
+    expect(
+      Object.hasOwn(summarizeServer(odd as unknown as Parameters<typeof summarizeServer>[0]), 'dockerBridge'),
+    ).toBe(false);
   });
 });
 
@@ -350,6 +448,7 @@ describe('every key fixText uses', () => {
     const servers: ResultFixtureOptions['server'][] = [null];
     for (const provider of PROVIDER_IDS) servers.push({ provider });
     for (const nat of NAT_IDS) servers.push({ nat, container: 'docker', publicIpPrivate: true });
+    servers.push({ nat: 'symmetric', container: 'docker', dockerBridge: true, publicIpPrivate: true });
     servers.push({ publicIpKnown: false, publicIpPrivate: true });
     const keys = new Set<string>();
     const codes = new Set<CtCode>();
@@ -370,8 +469,8 @@ describe('every key fixText uses', () => {
       }
     }
     for (const key of keys) expect(typeof catalogString(key), key).toBe('string');
-    // 13 providers, 6 NAT kinds, and the 8 fixed lines.
-    expect(keys.size).toBe(PROVIDER_IDS.length + NAT_IDS.length + 8);
+    // 13 providers, 6 NAT kinds, the bridge's NAT line (README F22), and the 8 fixed lines.
+    expect(keys.size).toBe(PROVIDER_IDS.length + NAT_IDS.length + 1 + 8);
     expect([...codes].sort()).toEqual([
       'docker_ports',
       'mac_local_network',

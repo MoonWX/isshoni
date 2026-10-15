@@ -53,16 +53,19 @@ type OpsDashboard struct {
 
 // ServerInfo is OpsDashboard.Server.
 type ServerInfo struct {
-	Version    string           `json:"version"`
-	StartedAt  time.Time        `json:"startedAt"`
-	Origin     string           `json:"origin"`
-	Process    ProcessInfo      `json:"process"`
-	TLS        TLSInfo          `json:"tls"`
-	PublicIPv4 string           `json:"publicIpv4"` // "" when none is known
-	PublicIPv6 string           `json:"publicIpv6"`
-	NAT        NATKind          `json:"nat"`
-	Advertised []AdvertisedAddr `json:"advertised"`
-	Update     *UpdateInfo      `json:"update,omitempty"` // absent before the first release check or when it is off
+	Version    string      `json:"version"`
+	StartedAt  time.Time   `json:"startedAt"`
+	Origin     string      `json:"origin"`
+	Process    ProcessInfo `json:"process"`
+	TLS        TLSInfo     `json:"tls"`
+	PublicIPv4 string      `json:"publicIpv4"` // "" when none is known
+	PublicIPv6 string      `json:"publicIpv6"`
+	NAT        NATKind     `json:"nat"`
+	// DockerBridge qualifies a symmetric NAT as ConnTestServerInfo.DockerBridge does: a container's bridge network,
+	// which doctor's public_ip lets pass (04 §13.2). Only next to NAT symmetric; absent otherwise (README F22).
+	DockerBridge bool             `json:"dockerBridge,omitempty"`
+	Advertised   []AdvertisedAddr `json:"advertised"`
+	Update       *UpdateInfo      `json:"update,omitempty"` // absent before the first release check or when it is off
 }
 
 // ProcessInfo is ServerInfo.Process.

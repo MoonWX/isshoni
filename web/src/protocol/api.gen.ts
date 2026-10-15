@@ -74,6 +74,14 @@ export interface ConnTestServerInfo {
   udpPort: number /* int */; // 0 when UDP is off
   tcpPorts: number /* int */[]; // e.g. [443, 7882]
   nat: NATKind;
+  /**
+   * DockerBridge qualifies a symmetric NAT: the server runs in a container on a bridge network, whose NAT gives
+   * each connection that starts inside the container a port of its own, and friends reach the ports the runtime
+   * publishes all the same. It is true exactly where doctor's public_ip lets that NAT pass with its param
+   * dockerBridge (04 §13.2, README F21), and only next to NAT symmetric; absent otherwise (README F22). 05 then
+   * shows a bridge note instead of the symmetric NAT text.
+   */
+  dockerBridge?: boolean;
 }
 
 //////////
@@ -379,6 +387,11 @@ export interface ServerInfo {
   publicIpv4: string; // "" when none is known
   publicIpv6: string;
   nat: NATKind;
+  /**
+   * DockerBridge qualifies a symmetric NAT as ConnTestServerInfo.DockerBridge does: a container's bridge network,
+   * which doctor's public_ip lets pass (04 §13.2). Only next to NAT symmetric; absent otherwise (README F22).
+   */
+  dockerBridge?: boolean;
   advertised: AdvertisedAddr[];
   update?: UpdateInfo; // absent before the first release check or when it is off
 }

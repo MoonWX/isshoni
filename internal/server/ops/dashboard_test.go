@@ -48,6 +48,7 @@ type fakeStatus struct {
 	err   error
 	block bool // wait for the context to end
 	panic bool
+	nat   api.NATKind // the detected NAT kind; "" is the example's none
 }
 
 func (f *fakeStatus) status(ctx context.Context) (api.ServerStatus, error) {
@@ -61,6 +62,10 @@ func (f *fakeStatus) status(ctx context.Context) (api.ServerStatus, error) {
 	case f.err != nil:
 		return api.ServerStatus{}, f.err
 	}
+	nat := f.nat
+	if nat == "" {
+		nat = api.NATKindNone
+	}
 	return api.ServerStatus{
 		Version:   "0.3.0",
 		StartedAt: at("2026-09-29T18:00:00Z"),
@@ -71,7 +76,7 @@ func (f *fakeStatus) status(ctx context.Context) (api.ServerStatus, error) {
 			NotAfter: at("2026-10-05T10:00:00Z"), NextRenewal: at("2026-10-02T12:00:00Z"),
 		},
 		PublicIPv4: "203.0.113.7",
-		NAT:        api.NATKindNone,
+		NAT:        nat,
 		Advertised: []api.AdvertisedAddr{
 			{Proto: "udp", Addr: "203.0.113.7:7882", Via: api.TransportUDP},
 			{Proto: "tcp", Addr: "203.0.113.7:443", Via: api.TransportTCP443},
@@ -437,6 +442,48 @@ func TestDashboardWithoutSources(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("no %s in:\n%s", want, body)
 		}
+	}
+}
+
+// TestDashboardDockerBridge: where doctor's public_ip lets a container bridge's symmetric NAT pass, the server
+// object says so next to nat (README F22, 04 §11.4): only next to a symmetric NAT, the one kind the rule lets pass,
+// and only while the status source works. The key is additive: a document without it is the one it was before.
+func TestDashboardDockerBridge(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		bridge bool        // DashboardOptions.DockerBridge, as the wiring found it
+		nat    api.NATKind // the status's NAT kind
+		err    error       // the status source's error
+		want   bool
+	}{
+		{name: "a bridge's symmetric NAT", bridge: true, nat: api.NATKindSymmetric, want: true},
+		{name: "symmetric NAT that doctor doesn't let pass", nat: api.NATKindSymmetric},
+		{name: "a bridge's 1:1 NAT", nat: api.NATKindOneToOne},
+		{name: "the flag next to cgnat_likely", bridge: true, nat: api.NATKindCGNATLikely},
+		{name: "the status source failed", bridge: true, nat: api.NATKindSymmetric, err: errors.New("status down")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &fakeStatus{nat: tc.nat, err: tc.err}
+			d := NewDashboard(DashboardOptions{
+				Status: st.status, DockerBridge: tc.bridge, Version: "0.3.0", Process: fakeProcess,
+				Now: func() time.Time { return dashNow }, Logger: slog.New(&logRecorder{}),
+			})
+			snap, err := d.Snapshot(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if snap.Server.DockerBridge != tc.want {
+				t.Errorf("server.dockerBridge = %v, want %v (nat %q)", snap.Server.DockerBridge, tc.want, snap.Server.NAT)
+			}
+			body := string(encodeGolden(t, snap))
+			if tc.want {
+				if !strings.Contains(body, `"nat": "symmetric",`+"\n"+`    "dockerBridge": true,`) {
+					t.Errorf("no dockerBridge next to nat in:\n%s", body)
+				}
+			} else if strings.Contains(body, "dockerBridge") {
+				t.Errorf("a dockerBridge key without a bridge's symmetric NAT:\n%s", body)
+			}
+		})
 	}
 }
 

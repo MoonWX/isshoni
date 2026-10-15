@@ -637,6 +637,7 @@
       "one_to_one": "This server is behind 1:1 NAT (a cloud network or a container). Open the ports in the provider's firewall. In a container, also publish them. At home, also forward TCP 80, 443, {{tcpPort}} and UDP {{udpPort}} on your router to this machine.",
       "port_forward": "Forward TCP 80, 443, {{tcpPort}} and UDP {{udpPort}} on your router to this machine.",
       "symmetric": "This server has no public address; isshoni needs one (a VPS or a router port forward).",
+      "symmetric_dockerBridge": "This server runs in a container on a bridge network. Its NAT gives each outgoing connection its own port (symmetric NAT), which doesn't matter here: friends reach the ports the container publishes. Open them in the provider's firewall. At home, also forward TCP 80, 443, {{tcpPort}} and UDP {{udpPort}} on your router to this machine.",
       "cgnat_likely": "This server has no public address; isshoni needs one (a VPS or a router port forward).",
       "unknown": "isshoni couldn't tell how this server reaches the internet. Run <code>isshoni doctor</code> on the server for details."
     },
