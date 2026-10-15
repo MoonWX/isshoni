@@ -4634,7 +4634,10 @@ Decided after group 13 (engineering calls the owner delegated; README §6 "Decid
     address, run with the exit test (§17 "Manual"; 06 §12.1). Docker Desktop and the smoke overrides can't give an
     all-ok report; every server check was ok or info there. A later slice may assert per code in CI's Linux
     docker-smoke, after reviewing two rules of `public_ip` (§13.2): a Docker bridge reported as symmetric NAT, and a
-    configured literal `127.0.0.1` taken as the public address. README F21 (group 15) is that slice.
+    configured literal `127.0.0.1` taken as the public address. README F21 (group 15) did both: docker-smoke
+    asserts every check by its code in the bridge and host setups, with a named allow-list; a Docker bridge's
+    symmetric NAT passes with the param `dockerBridge`; and a loopback or unspecified `public_ip` counts as no public
+    address (param `unreachable`).
 
 Decided after group 14 (engineering calls the owner delegated; README §6 "Decided after group 14"):
 
