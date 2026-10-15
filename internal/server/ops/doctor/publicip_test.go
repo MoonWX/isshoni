@@ -57,12 +57,13 @@ func TestPublicIPBridgeSymmetric(t *testing.T) {
 		fix     string
 		message string // "" = not compared
 		bridge  bool   // the param dockerBridge
+		network string // the container check's params.network: the setup the case is about ("" = no container)
 	}{
 		{
 			name:   "Docker bridge, symmetric NAT, address seen by STUN",
 			args:   []string{"--network.ipv6=false"},
 			setup:  func(w *world) { bridgeWorld(w, api.NATKindSymmetric) },
-			status: api.DoctorStatusOK, code: codePublicIPOK, bridge: true,
+			status: api.DoctorStatusOK, code: codePublicIPOK, bridge: true, network: networkBridge,
 			message: testIP + " (seen by STUN)" + bridgeNote,
 		},
 		{
@@ -72,13 +73,13 @@ func TestPublicIPBridgeSymmetric(t *testing.T) {
 				bridgeWorld(w, api.NATKindSymmetric)
 				w.live.PublicIPv4Method = "config"
 			},
-			status: api.DoctorStatusOK, code: codePublicIPOK, bridge: true,
+			status: api.DoctorStatusOK, code: codePublicIPOK, bridge: true, network: networkBridge,
 			message: testIP + " (set in the config)" + bridgeNote,
 		},
 		{
 			name:   "Docker bridge, symmetric NAT, no IPv6 (the bridge has none)",
 			setup:  func(w *world) { bridgeWorld(w, api.NATKindSymmetric) },
-			status: api.DoctorStatusInfo, code: codePublicIPNoIPv6, bridge: true,
+			status: api.DoctorStatusInfo, code: codePublicIPNoIPv6, bridge: true, network: networkBridge,
 			message: testIP + " (seen by STUN); IPv6 media off (Docker bridge)" + bridgeNote,
 		},
 		{
@@ -89,26 +90,30 @@ func TestPublicIPBridgeSymmetric(t *testing.T) {
 				w.files["sys/class/dmi/id/sys_vendor"].Data = []byte("Amazon EC2\n")
 			},
 			status: api.DoctorStatusInfo, code: codePublicIPEphemeral, fix: fixPublicIPStatic, bridge: true,
+			network: networkBridge,
 		},
 		{
 			name:   "Docker bridge, 1:1 NAT, as before",
 			args:   []string{"--network.ipv6=false"},
 			setup:  func(w *world) { bridgeWorld(w, api.NATKindOneToOne) },
-			status: api.DoctorStatusOK, code: codePublicIPOK,
+			status: api.DoctorStatusOK, code: codePublicIPOK, network: networkBridge,
 			message: testIP + " (seen by STUN, 1:1 NAT from 172.18.0.2)",
 		},
 		{
+			// The bridge's own address is in 100.64.0.0/10 (the veth end keeps its iflink 17): the rule of the bridge
+			// is considered, and carrier-grade NAT is no symmetric NAT it lets pass.
 			name: "Docker bridge, carrier-grade NAT stays a failure",
 			setup: func(w *world) {
 				bridgeWorld(w, api.NATKindCGNATLikely)
+				w.env.Interfaces = &fakeIfaces{ifs: []netx.Interface{iface("lo", "127.0.0.1"), iface("eth0", "100.72.3.4")}, route: "100.72.3.4"}
 				w.live.LocalIPv4 = "100.72.3.4"
 			},
-			status: api.DoctorStatusFail, code: codePublicIPCGNAT, fix: fixPublicIPNAT,
+			status: api.DoctorStatusFail, code: codePublicIPCGNAT, fix: fixPublicIPNAT, network: networkBridge,
 		},
 		{
 			name:   "container on the host's network, symmetric NAT",
 			setup:  func(w *world) { hostNetworkWorld(w, api.NATKindSymmetric) },
-			status: api.DoctorStatusFail, code: codePublicIPSymmetric, fix: fixPublicIPNAT,
+			status: api.DoctorStatusFail, code: codePublicIPSymmetric, fix: fixPublicIPNAT, network: networkHost,
 		},
 		{
 			name: "container whose network doctor can't tell, symmetric NAT",
@@ -116,7 +121,7 @@ func TestPublicIPBridgeSymmetric(t *testing.T) {
 				bridgeWorld(w, api.NATKindSymmetric)
 				delete(w.files, "sys/class/net/eth0/iflink")
 			},
-			status: api.DoctorStatusFail, code: codePublicIPSymmetric, fix: fixPublicIPNAT,
+			status: api.DoctorStatusFail, code: codePublicIPSymmetric, fix: fixPublicIPNAT, network: networkUnknown,
 		},
 		{
 			name: "no container, symmetric NAT",
@@ -157,6 +162,11 @@ func TestPublicIPBridgeSymmetric(t *testing.T) {
 			}
 			if stun.calls != 0 {
 				t.Error("with a running server the check asked a STUN server")
+			}
+			// The case is about the setup it names: the container check sees that network (none outside a
+			// container), so a precondition of the bridge rule can't silently go away.
+			if got, _ := w.check("container").Params["network"].(string); got != tt.network {
+				t.Errorf("the container check sees network %q, want %q", got, tt.network)
 			}
 		})
 	}
@@ -294,6 +304,28 @@ func TestPublicIPUnreachable(t *testing.T) {
 			status: api.DoctorStatusWarn, code: codePublicIPv6Only, unreachable: []string{"127.0.0.1"},
 			message: testIPv6 + "; no public IPv4 address (127.0.0.1 can only be reached from this machine), so " +
 				"friends without IPv6 can't connect",
+		},
+		{
+			// The NAT kind is the IPv4 path's (04 §7.4): with 127.0.0.1 it stands in front of no public address.
+			name: "127.0.0.1 and a public IPv6 address, and STUN saw symmetric NAT", args: manualDomain,
+			v4: addr{"127.0.0.1", "config"}, v6: addr{testIPv6, "interface"}, nat: api.NATKindSymmetric,
+			status: api.DoctorStatusWarn, code: codePublicIPv6Only, unreachable: []string{"127.0.0.1"},
+			message: testIPv6 + "; no public IPv4 address (127.0.0.1 can only be reached from this machine), so " +
+				"friends without IPv6 can't connect",
+		},
+		{
+			name: "127.0.0.1 and a public IPv6 address, and a carrier-grade NAT", args: manualDomain,
+			v4: addr{"127.0.0.1", "config"}, v6: addr{testIPv6, "interface"}, nat: api.NATKindCGNATLikely,
+			status: api.DoctorStatusWarn, code: codePublicIPv6Only, unreachable: []string{"127.0.0.1"},
+			message: testIPv6 + "; no public IPv4 address (127.0.0.1 can only be reached from this machine), so " +
+				"friends without IPv6 can't connect",
+		},
+		{
+			// Without the literal the NAT kind still counts: carrier-grade NAT is why no IPv4 address was found (04
+			// §7.4), as before README F21.
+			name: "no IPv4 address found, a public IPv6 address, and a carrier-grade NAT", args: manualDomain,
+			v6: addr{testIPv6, "interface"}, nat: api.NATKindCGNATLikely,
+			status: api.DoctorStatusFail, code: codePublicIPCGNAT, fix: fixPublicIPNAT,
 		},
 		{
 			name: "a public IPv4 address and ::1", args: manualDomain,

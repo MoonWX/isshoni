@@ -283,6 +283,9 @@ check_hardening() {
 # what a real install has: CHECK CODE, one line per check, in the order of `isshoni doctor --list-checks`. The
 # checks that are information by nature give info codes at best (ports, firewall_hint, container, nofile,
 # bandwidth); release has not looked yet (its first look is 5 to 60 minutes after the start, 04 §11.5).
+#
+# doctor_want and doctor_allowed pin doctor's checks and codes, so internal/server/ops/doctor is an input of this
+# step (06 §11.3): its TestDockerSmokeExpectations holds both lists to doctor's checks and codes on every Go change.
 doctor_want() {
   cat <<'EOF'
 config         config.ok

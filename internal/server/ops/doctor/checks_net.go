@@ -41,6 +41,9 @@ type publicState struct {
 	// public_ip or public_ipv6 literal such as 127.0.0.1. They are no public addresses, so v4 and v6 leave them
 	// out, and every check judges the server as one without them (README F21).
 	unreachable []netip.Addr
+	// v4Unreachable is true when the IPv4 address was one of them. nat is the IPv4 path's NAT kind (§7.4), which
+	// then belongs to no public address and judges nothing.
+	v4Unreachable bool
 }
 
 // onlyThisMachine reports an address that no other machine can reach: a loopback address (127.0.0.0/8, ::1) or
@@ -65,7 +68,7 @@ func addrStrings(addrs []netip.Addr) []string {
 func (st *publicState) dropUnreachable() {
 	if st.v4.IsValid() && onlyThisMachine(st.v4) {
 		st.unreachable = append(st.unreachable, st.v4)
-		st.v4, st.v4Method = netip.Addr{}, ""
+		st.v4, st.v4Method, st.v4Unreachable = netip.Addr{}, "", true
 	}
 	if st.v6.IsValid() && onlyThisMachine(st.v6) {
 		st.unreachable = append(st.unreachable, st.v6)
@@ -142,7 +145,7 @@ func (r *run) loopbackSetup() bool {
 //
 // Two rules of README F21 (04 §13.2):
 //   - An address that only this machine can reach (a public_ip literal such as 127.0.0.1) is no public address:
-//     the check judges the server as one without it, and names it in the param unreachable.
+//     the check judges the server as one without it, whatever the NAT kind, and names it in the param unreachable.
 //   - In a container on a bridge network, symmetric NAT is no failure. Friends reach the server on the ports the
 //     container runtime publishes on the host, and the server advertises its public address with those port
 //     numbers (04 §7.5); every media flow starts with the browser's packet to such a port, and the server's answers
@@ -171,7 +174,12 @@ func checkPublicIP(ctx context.Context, r *run) result {
 	if len(pub.unreachable) > 0 {
 		p["unreachable"] = addrStrings(pub.unreachable)
 	}
-	symmetric := pub.nat == api.NATKindSymmetric
+	// The NAT kind is the IPv4 path's (§7.4). Where the IPv4 address was one that only this machine can reach, the
+	// server has no public IPv4 for that NAT to stand in front of, and the server is judged without it (an IPv6
+	// address alone is ipv6_only, whatever the kind). An IPv4 address that was simply not found keeps its NAT kind:
+	// cgnat_likely without an address (§7.4) is still the reason there is none.
+	natCounts := !pub.v4Unreachable
+	symmetric := natCounts && pub.nat == api.NATKindSymmetric
 	if symmetric && pub.v4.IsValid() && r.inContainer() && r.containerNetwork(ctx) == networkBridge {
 		p["dockerBridge"] = true
 		symmetric = false
@@ -189,7 +197,7 @@ func checkPublicIP(ctx context.Context, r *run) result {
 		return failResult(codePublicIPNone, p, fixPublicIPSet)
 	case symmetric:
 		return failResult(codePublicIPSymmetric, p, fixPublicIPNAT)
-	case pub.nat == api.NATKindCGNATLikely:
+	case natCounts && pub.nat == api.NATKindCGNATLikely:
 		return failResult(codePublicIPCGNAT, p, fixPublicIPNAT)
 	case !pub.v4.IsValid():
 		return warnResult(codePublicIPv6Only, p, "")

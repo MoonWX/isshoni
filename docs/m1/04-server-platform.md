@@ -3474,7 +3474,10 @@ address ("127.0.0.1 (set in the config)"), then judged by the NAT kind. Both rul
   outside ip mode (§4.5) and the server advertises as it is given, is left out of the run's public addresses
   (`publicAddrs`, with a running server and offline alike) and named in the param `unreachable` (a list). So
   `public_ip` judges the server as one without it, whatever the NAT kind: `public_ip.none` (fail) when it was the
-  only address, `ipv6_only` or `no_ipv6` when the other family has a public one; and `dns` has no address to compare
+  only address, `ipv6_only` or `no_ipv6` when the other family has a public one. The NAT kind is the IPv4 path's
+  (§7.4), so with the IPv4 address left out it stands in front of no public address, and neither `symmetric` nor
+  `cgnat_likely` fails the check (`publicState.v4Unreachable`); an IPv4 address that was simply not found keeps its
+  kind, and `cgnat_likely` without an address is still `public_ip.cgnat`. And `dns` has no address to compare
   the records with (`dns.unverified` for a record, `dns.missing` without one; never `dns.ok` for a record that
   points at `127.0.0.1`, nor `dns.wrong`). Such a server is ready (it has the address it was given), so the CLI's
   `none` text says what it is instead of "not ready": "no public IP address: 127.0.0.1 can only be reached from this
@@ -3489,15 +3492,18 @@ address ("127.0.0.1 (set in the config)"), then judged by the NAT kind. Both rul
   the address that wasn't found), which is a follow-up for 05 §15.3.
 - **Tests** (`ops/doctor/publicip_test.go`): `TestPublicIPBridgeSymmetric` (a running server: symmetric NAT in a
   bridge is `ok`, `no_ipv6` or `ephemeral` with `dockerBridge`; on the host's network, with the network unknown,
-  outside a container it stays a failure; 1:1 NAT and `cgnat_likely` are unchanged), `TestPublicIPBridgeSymmetricOffline`
-  (doctor's own detection with two STUN servers that see two ports), `TestPublicIPUnreachable` (`127.0.0.1`, any
-  loopback, `0.0.0.0`, `::1`, both families, the site at that address, in a container, with a public address of the
-  other family, and a private address that stays), `TestPublicIPUnreachableOffline`, `TestDNSWithUnreachablePublicIP`
-  and `TestOnlyThisMachine`.
+  outside a container it stays a failure; 1:1 NAT and `cgnat_likely` are unchanged; every case also asserts the
+  network that the `container` check sees, so the `cgnat_likely` case runs in a bridge and a case can't lose its
+  setup), `TestPublicIPBridgeSymmetricOffline` (doctor's own detection with two STUN servers that see two ports),
+  `TestPublicIPUnreachable` (`127.0.0.1`, any loopback, `0.0.0.0`, `::1`, both families, the site at that address,
+  in a container, with a public address of the other family, `127.0.0.1` with a public IPv6 address and `symmetric`
+  or `cgnat_likely`, no IPv4 found with `cgnat_likely`, which stays `public_ip.cgnat`, and a private address that
+  stays), `TestPublicIPUnreachableOffline`, `TestDNSWithUnreachablePublicIP` and `TestOnlyThisMachine`.
 - **CI's docker-smoke asserts doctor per code** in the bridge and the host setup (06 §11.3, the step `doctor`), with
-  an allow-list for what the test's setup and the runner can't give. "doctor reports ok in the Docker bridge and host
-  setups" stays a manual check on a Linux host with a real address (§17 "Manual"): the smoke overrides have no public
-  address and a test domain that resolves nowhere.
+  an allow-list for what the test's setup and the runner can't give. The step's two lists pin this package's checks
+  and codes; `TestDockerSmokeExpectations` (`ops/doctor`) holds them to the package on every Go change (06 §11.3).
+  "doctor reports ok in the Docker bridge and host setups" stays a manual check on a Linux host with a real address
+  (§17 "Manual"): the smoke overrides have no public address and a test domain that resolves nowhere.
 
 Fix codes: `config.fix_check`; `data_dir.fix_sudo`, `fix_owner`, `fix_not_dir`, `fix_mount`, `fix_mode`,
 `fix_space`; `secrets.fix_sudo`, `fix_owner`, `fix_restore`, `fix_mode`; `schema.fix_sudo`, `fix_restore` (03's

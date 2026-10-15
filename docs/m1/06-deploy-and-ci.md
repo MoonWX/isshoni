@@ -2698,7 +2698,8 @@ that the manual check of 04 §17 can't be:
   that has what a real install has (`ok`, or the `info` code where `info` is the best a check gives: `ports`,
   `firewall_hint`, `container`, `nofile`, `bandwidth`; `release.not_checked`, since the first look is 5 to 60
   minutes after the start). A check that `--list-checks` names and the list doesn't fails the step, so a new check
-  gets an expectation of its own; so does a report whose checks differ from that list.
+  gets an expectation of its own (on its own pull request: below); so does a report whose checks differ from that
+  list.
 - **The allow-list** (`doctor_allowed`), each entry with its reason in the script, replaces a check's code for one
   engine: `local` (a Docker engine on the Linux machine that runs the test, as CI's runner), `vm` (an engine in a
   virtual machine or on another host: Docker Desktop) or `any`. Nothing else is allowed, a `fail` or `warn` that it
@@ -2706,7 +2707,7 @@ that the manual check of 04 §17 can't be:
 
   | Check | Engine | Allowed | Why |
   |---|---|---|---|
-  | `public_ip` | any | `public_ip.none` (local also `ipv6_only`) | The test has no public address, so the overrides set `ISSHONI_PUBLIC_IP=127.0.0.1`, which doctor must not take for a public one (04 §13.2 rule b). The step also checks that `params.unreachable` is `["127.0.0.1"]` and that there is no `ipv4`. A host part on a Linux machine with a global IPv6 address finds that one: `ipv6_only` |
+  | `public_ip` | any | `public_ip.none` (local also `ipv6_only`) | The test has no public address, so the overrides set `ISSHONI_PUBLIC_IP=127.0.0.1`, which doctor must not take for a public one (04 §13.2 rule b). The step also checks that `params.unreachable` is `["127.0.0.1"]` and that there is no `ipv4`. A host part on a Linux machine with a global IPv6 address finds that one: `ipv6_only`, whatever the NAT kind of its IPv4 path, which stands in front of no public address (rule b) |
   | `dns` | any | `dns.unverified` | `smoke.test` is known to no DNS server; the overrides put it on `127.0.0.1` in the container's `/etc/hosts` (`extra_hosts`), so every machine resolves it alike, whatever its resolver answers for the name (Docker Desktop asks the computer's own, which may be a proxy tool's that answers every name). With no public address doctor can't judge the record: never `dns.ok`, never `dns.wrong` |
   | `clock` | local, vm | `clock.ok`, `clock.unsynced` | Manual mode has no ACME directory for the skew, so only the kernel's sync flag decides, and it is the Docker host's: a runner whose time daemon hasn't marked the clock synchronized yet, Docker Desktop's VM whose clock the hypervisor keeps |
   | `udp_buffers` | local, vm | `udp_buffers.ok`, `udp_buffers.low` | `net.core.rmem_max`/`wmem_max` are the Docker host's (6.4), and a test doesn't change a host's sysctls: the runner keeps the kernel's default, and Docker Desktop's VM has a limit of its own below the 8 MiB isshoni wants |
@@ -2721,7 +2722,19 @@ that the manual check of 04 §17 can't be:
   `public_ip.symmetric` as before.
 - "doctor reports ok in the Docker bridge and host setups" stays the manual pre-flight item 5 of 12.1, on a Linux
   host with a real public address: the step checks every code, but the smoke overrides can't give an all-ok report.
-  CI's job needs no new input: `task docker:smoke` runs the step.
+- **Doctor's package is an input of the step.** `doctor_want` and `doctor_allowed` pin every check and its codes, so
+  a pull request that changes doctor's checks or codes (`internal/server/ops/doctor`, the `go` filter alone) must
+  run docker-smoke, which a pull request runs only for the `docker`, `deploy` or `release` filters (8.2). Two things
+  see to it:
+  - `TestDockerSmokeExpectations` (`ops/doctor`, in `test-go` on every Go change) holds both lists to doctor:
+    `doctor_want` names every check of `--list-checks` in its order, and every code either list names is one of
+    doctor's codes and its check's; an allow-list entry is `local`, `vm` or `any`, one per check and engine. A pull
+    request that adds or removes a check, or renames or removes a code the lists name, fails there until the script
+    knows it, and that edit of `deploy/docker/**` runs docker-smoke on the same pull request.
+  - Which of its existing codes a check gives in the smoke's setup only the step can tell, so ci.yml's `changes`
+    job gets a filter `doctor` (`internal/server/ops/doctor/**`) that runs docker-smoke as well (README F21 listed
+    it for the integrator: ci.yml is S02's, and 8.2's table names the filter). Until it is there, such a change
+    passes its own pull request and fails on the push to main and in nightly's `docker-multiarch`.
 
 ## 12. M1 exit test run book
 
