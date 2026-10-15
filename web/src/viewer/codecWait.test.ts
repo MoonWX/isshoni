@@ -388,41 +388,47 @@ describe('a fresh Firefox against the server (01 §11.7)', () => {
 });
 
 describe('attachViewer', () => {
-  it('runs no codec wait for a signal that cannot send, and says so once in the log', () => {
-    clearLog();
-    const viewer = createViewer();
-    let onStatus: ((s: { subs: SubscriptionStatus[] }) => void) | undefined;
-    const off = attachViewer(
-      {
-        on: ((_type: string, fn: (s: { subs: SubscriptionStatus[] }) => void) => {
-          onStatus = fn;
-          return () => undefined;
-        }) as never,
-      },
-      viewer,
-      { caps: () => NO_H264, firefox: false },
-    );
-    onStatus?.({ subs: [status('s_a', CODEC)] });
-    onStatus?.({ subs: [status('s_b', CODEC)] });
-    expect(viewer.store.getState().status['s_a']?.reason).toBe('codec');
-    expect(viewer.store.getState().codecWait).toBeNull();
-    // The silent case leaves a trace: one debug line when attached, none per status.
-    const noWait = logLines().filter((l) => l.msg.startsWith('no codec wait'));
-    expect(noWait).toHaveLength(1);
-    expect(noWait[0]).toMatchObject({ level: 'debug', component: 'viewer/codec' });
-    off();
-    viewer.dispose();
-  });
+  it('runs the codec wait through the signal it is given, and stops it with the status listener', () => {
+    vi.useFakeTimers();
+    try {
+      const viewer = createViewer();
+      const listener: { onStatus: ((s: { subs: SubscriptionStatus[] }) => void) | null } = { onStatus: null };
+      const sent: unknown[] = [];
+      const b = browser(NO_H264);
+      const off = attachViewer(
+        {
+          on: ((_type: string, fn: (s: { subs: SubscriptionStatus[] }) => void) => {
+            listener.onStatus = fn;
+            return () => {
+              listener.onStatus = null;
+            };
+          }) as never,
+          notify: (type: string, data: unknown) => {
+            sent.push({ type, data });
+            return true;
+          },
+        },
+        viewer,
+        { caps: b.caps, firefox: true },
+      );
+      listener.onStatus?.({ subs: [status('s_a', CODEC)] });
+      expect(viewer.store.getState().status['s_a']?.reason).toBe('codec');
+      expect(viewer.store.getState().codecWait).not.toBeNull();
+      b.set(CB);
+      vi.advanceTimersByTime(CAPS_POLL_MS);
+      expect(sent).toEqual([{ type: 'caps.update', data: { caps: CB } }]);
 
-  it('logs nothing about it for a signal that can send', () => {
-    clearLog();
-    const viewer = createViewer();
-    const off = attachViewer({ on: () => () => undefined, notify: () => true }, viewer, {
-      caps: () => CB,
-      firefox: true,
-    });
-    expect(logLines().filter((l) => l.msg.startsWith('no codec wait'))).toEqual([]);
-    off();
-    viewer.dispose();
+      off();
+      expect(listener.onStatus).toBeNull();
+      // The wait is over with it: no more polls, nothing more sent.
+      const reads = b.reads();
+      b.set(NO_H264);
+      vi.advanceTimersByTime(CAPS_POLL_MS * 3);
+      expect(b.reads()).toBe(reads);
+      expect(sent).toHaveLength(1);
+      viewer.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

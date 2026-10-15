@@ -9,16 +9,19 @@
 // - attachSubscriptions() (subscriptions.ts) gives the session's SubscriptionSync the desired set;
 // - viewer.createSubscriber() makes the session's sub PC (05 §10.1, §11.1): it is SessionMedia.createSubscriber.
 //   The session routes pc.offer and pc.ice {pc: 'sub'} to the PC's handleOffer and handleIce, and calls close()
-//   when the server's side is gone. The viewer remembers the PC for the stats (stats.ts).
+//   when the server's side is gone. The viewer remembers the PC for the stats (stats.ts);
+// - viewer.debug is the debug overlay's state (debugStats.ts), which attachViewerStats (statsLink.ts) fills from
+//   the stats collector while the overlay is open.
 //
 // This module is in the room folder's chunk (the room runtime makes the viewer before the page shows), and
 // SubscriberPC is not: its class comes with the room's media chunk (rooms/media.ts), so createSubscriber takes it
 // from the caller, and it is only a type here.
-import { createLogger, type Logger } from '../lib/log';
+import type { Logger } from '../lib/log';
 import type { SignalClient } from '../protocol/signal-client';
 import { MessageTypeSubscribeStatus } from '../protocol/types.gen';
 import { createAudioOut, type AudioOut } from './audioOut';
 import { attachCodecWait, type CodecWaitOptions } from './codecWait';
+import { createDebugStats, type DebugStatsStore } from './debugStats';
 import { createMediaRegistry, type MediaRegistry } from './mediaRegistry';
 import { attachPage } from './page';
 import type { SubscriberDeps, SubscriberPC } from './SubscriberPC';
@@ -43,6 +46,11 @@ export interface ViewerServices {
   readonly videos: VideoPlayback;
   /** The sub PC that createSubscriber() made last; null before the first. */
   readonly subscriber: SubscriberPC | null;
+  /**
+   * The debug overlay's state (debugStats.ts, 05 §10.7): DebugOverlay says when it is open, and attachViewerStats
+   * (statsLink.ts) fills it from the stats collector and the server's stats.watch while it is.
+   */
+  readonly debug: DebugStatsStore;
   /**
    * Makes the session's sub PC, with the viewer's registry and store: SessionMedia.createSubscriber (05 §10.1),
    * `(deps) => viewer.createSubscriber({ ...deps, ui }, SubscriberPC)`. `ui` shows the Fatal screen "Can't connect
@@ -107,12 +115,14 @@ export function createViewer(opts: ViewerOptions = {}): ViewerServices {
   const offPage = attachPage({ store, videos, audio, ...(opts.document ? { doc: opts.document } : {}) });
 
   let subscriber: SubscriberPC | null = null;
+  const debug = createDebugStats();
 
   return {
     store,
     registry,
     audio,
     videos,
+    debug,
     get subscriber() {
       return subscriber;
     },
@@ -150,23 +160,16 @@ export function syncRoom(
 
 /**
  * What attachViewer needs from signaling: 01's SignalClient, by its structural type. `on` brings subscribe.status;
- * `notify`, when the object has it (the app's SignalClient does), sends the codec wait's caps.update. It is
- * optional only because rooms/connectViewer.ts declares its signal as Pick<SignalClient, 'on'>; once that passes
- * `notify` in its type too, this can require it. Until then a signal without it leaves a debug line in the log.
+ * `notify` sends the codec wait's caps.update (rooms/connectViewer.ts passes the tab's client).
  */
-export type ViewerSignal = Pick<SignalClient, 'on'> & Partial<Pick<SignalClient, 'notify'>>;
-
-function canSend(signal: ViewerSignal): signal is ViewerSignal & Pick<SignalClient, 'notify'> {
-  return typeof signal.notify === 'function';
-}
+export type ViewerSignal = Pick<SignalClient, 'on' | 'notify'>;
 
 /**
  * Listens to subscribe.status (01 §8.9) for the viewer: what the server forwards per share goes to
- * viewerStore.status, which the tiles show (05 §10.4). With a signal that can send (`notify`), it also runs the
- * codec wait (codecWait.ts, 05 §10.6): while some subscription has the reason `codec`, the capabilities are read
- * every 5 s and caps.update goes out when the H.264 decoders changed; nothing else is ever sent for codecs. A
- * signal without `notify` gets no codec wait, and the log says so once (at debug). `codec` is for tests. Returns
- * the function that stops both.
+ * viewerStore.status, which the tiles show (05 §10.4). It also runs the codec wait (codecWait.ts, 05 §10.6): while
+ * some subscription has the reason `codec`, the capabilities are read every 5 s and caps.update goes out when the
+ * H.264 decoders changed; nothing else is ever sent for codecs. `codec` is for tests. Returns the function that
+ * stops both.
  */
 export function attachViewer(
   signal: ViewerSignal,
@@ -176,15 +179,9 @@ export function attachViewer(
   const offStatus = signal.on(MessageTypeSubscribeStatus, (status) => {
     viewer.store.getState().applyStatus(status.subs);
   });
-  let offCodec: (() => void) | null = null;
-  if (canSend(signal)) {
-    offCodec = attachCodecWait(signal, viewer.store, codec);
-  } else {
-    const log = codec.log ?? createLogger('viewer').child('codec');
-    log.debug("no codec wait: this signal can't send caps.update (05 §10.6)");
-  }
+  const offCodec = attachCodecWait(signal, viewer.store, codec);
   return () => {
     offStatus();
-    offCodec?.();
+    offCodec();
   };
 }

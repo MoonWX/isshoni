@@ -1,5 +1,6 @@
 // "Invite friends" in the room (05 §11.2, §14.1): each opening of the dialog creates one invite with the server's
 // defaults (POST /api/v1/invites {}) and shows its link once in setup/'s InviteLinkCard; closing it forgets the link.
+// The card names the user's way to their invites: My invites for a member, Admin → Invites for an admin.
 import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
@@ -8,7 +9,7 @@ import { createMemoryRouter, RouterProvider } from 'react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AppProviders } from '../app/App';
-import type { CreateInviteResponse } from '../protocol/api.gen';
+import type { CreateInviteResponse, Me } from '../protocol/api.gen';
 import { queryKeys } from '../protocol/queryKeys';
 import { apiError, apiPath, meFixture, server } from '../test/msw';
 import { createTestServices, renderRoute } from '../test/render';
@@ -53,8 +54,11 @@ function invites(...responses: (Response | null)[]): unknown[] {
   return bodies;
 }
 
+/** A member who may invite, the user the dialog shows to unless a test says otherwise. */
+const MEMBER = meFixture({ createInvites: true });
+
 /** The dialog behind a button that opens it, as the account menu has it: kept mounted, closed through `open`. */
-function Opener({ onClose }: { onClose?: () => void }) {
+function Opener({ me, onClose }: { me: Me; onClose?: () => void }) {
   const [open, setOpen] = useState(false);
   return (
     <>
@@ -67,6 +71,7 @@ function Opener({ onClose }: { onClose?: () => void }) {
         Open
       </button>
       <InviteDialog
+        me={me}
         open={open}
         onClose={() => {
           setOpen(false);
@@ -77,11 +82,11 @@ function Opener({ onClose }: { onClose?: () => void }) {
   );
 }
 
-function renderOpener(onClose?: () => void) {
+function renderOpener({ me = MEMBER, onClose }: { me?: Me; onClose?: () => void } = {}) {
   return renderRoute({
     path: '/r/lounge',
     routes: [
-      { path: '/r/:roomId', element: <Opener {...(onClose ? { onClose } : {})} /> },
+      { path: '/r/:roomId', element: <Opener me={me} {...(onClose ? { onClose } : {})} /> },
       { path: '/admin/invites', element: <h1>Invites</h1> },
     ],
   });
@@ -122,9 +127,38 @@ describe('InviteDialog', () => {
     expect(within(dialog()).getByRole('img', { name: 'QR code of the invite link' })).toBeInTheDocument();
     expect(within(dialog()).getByText(/^Works for up to 10 people, until /)).toBeInTheDocument();
     expect(within(dialog()).getByText(/can't be shown again/)).toBeInTheDocument();
-    expect(within(dialog()).getByRole('link', { name: 'Admin → Invites' })).toHaveAttribute('href', '/admin/invites');
     // Every field left to the server: 7 days and 10 uses unless an admin changed the defaults (03 §12.4.5).
     expect(created).toEqual([{}]);
+  });
+
+  // The card names the way to /admin/invites that the user's own account menu has (05 §11.2): a member has no Admin
+  // entry, but My invites.
+  it.each([
+    [
+      'a member',
+      'My invites',
+      MEMBER,
+      "Copy it now: for safety it can't be shown again. You'll find the invite under My invites in your account " +
+        'menu, where you can always make a new one.',
+    ],
+    [
+      'an admin',
+      'Admin → Invites',
+      meFixture({ admin: true }),
+      "Copy it now: for safety it can't be shown again. You can always make a new one under Admin → Invites.",
+    ],
+  ])('tells %s where the invite is: under %s', async (_who, place, me, text) => {
+    invites();
+    const { router } = renderOpener({ me });
+    await open();
+    await within(dialog()).findByRole('textbox', { name: 'Invite link' });
+    const link = within(dialog()).getByRole('link', { name: place });
+    expect(link).toHaveAttribute('href', '/admin/invites');
+    expect(link.closest('p')).toHaveTextContent(text);
+    expect(within(dialog()).getAllByRole('link')).toHaveLength(1);
+
+    await userEvent.click(link);
+    expect(router.state.location.pathname).toBe('/admin/invites');
   });
 
   it('says it is making the link until the server answers', async () => {
@@ -225,7 +259,7 @@ describe('InviteDialog', () => {
   it('closes with Done and with ✕, and the next opening makes a new invite: the old link is not kept', async () => {
     const onClose = vi.fn();
     const created = invites();
-    renderOpener(onClose);
+    renderOpener({ onClose });
     await open();
     expect(await within(dialog()).findByRole('textbox', { name: 'Invite link' })).toHaveValue(linkOf(1));
 
@@ -272,7 +306,9 @@ describe('InviteDialog', () => {
 
   it('creates one invite under StrictMode too', async () => {
     const created = invites();
-    const router = createMemoryRouter([{ path: '/', element: <InviteDialog open onClose={() => undefined} /> }]);
+    const router = createMemoryRouter([
+      { path: '/', element: <InviteDialog me={MEMBER} open onClose={() => undefined} /> },
+    ]);
     render(
       <StrictMode>
         <AppProviders services={createTestServices()}>

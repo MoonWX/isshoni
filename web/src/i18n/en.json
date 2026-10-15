@@ -190,6 +190,53 @@
     "iosHint": {
       "text": "Keep isshoni open while watching. Video pauses when you switch apps.",
       "dismiss": "Got it"
+    },
+    "announce": {
+      "listening": "Now listening to {{name}}",
+      "listeningOwn": "Now listening to your share"
+    },
+    "debug": {
+      "title": "Stats for nerds",
+      "close": "Close the stats",
+      "waiting": "Waiting for the first stats…",
+      "connections": "Connections",
+      "noPc": "No media connection yet.",
+      "pc": "{{pc}} PC {{gen}}",
+      "downlink": "Downlink (server)",
+      "noTileStats": "Nothing received for this tile yet.",
+      "sending": "Sending",
+      "layer": "{{kind}} {{rid}}",
+      "serverReceives": "{{name}} at the server",
+      "label": {
+        "video": "Video",
+        "decoder": "Decoder",
+        "frames": "Frames",
+        "network": "Network",
+        "audio": "Audio",
+        "serverVideo": "Server video",
+        "serverAudio": "Server audio"
+      },
+      "value": {
+        "size": "{{width}}×{{height}}",
+        "fps": "{{fps}} fps",
+        "kbps": "{{kbps}} kbit/s",
+        "rtt": "RTT {{ms}} ms",
+        "out": "out {{kbps}} kbit/s",
+        "hardware": "{{name}} (hardware)",
+        "software": "{{name}} (software)",
+        "decoded": "decoded {{count}}",
+        "dropped": "dropped {{count}}",
+        "keyFrames": "key frames {{count}}",
+        "freezes": "freezes {{count}} ({{seconds}} s)",
+        "lost": "lost {{count}}",
+        "jitter": "jitter buffer {{ms}} ms",
+        "pli": "PLI {{count}}",
+        "nack": "NACK {{count}}",
+        "level": "level {{level}}",
+        "concealed": "concealed {{percent}} %",
+        "loss": "loss {{percent}} %",
+        "limited": "limited by {{reason}}"
+      }
     }
   },
   "share": {
@@ -275,6 +322,10 @@
       "mediaTimeout": "Sharing stopped: no video reached the server",
       "generic": "Sharing stopped by the server",
       "unreachable": "Sharing stopped: the server was unreachable"
+    },
+    "announce": {
+      "live": "You're live",
+      "stopped": "Sharing stopped"
     }
   },
   "room": {
@@ -358,7 +409,8 @@
       "creating": "Making an invite link…",
       "failed": "Couldn't make an invite link. {{message}}",
       "retry": "Try again",
-      "done": "Done"
+      "done": "Done",
+      "once": "Copy it now: for safety it can't be shown again. You'll find the invite under <a>My invites</a> in your account menu, where you can always make a new one."
     },
     "empty": {
       "title": "Nobody is sharing yet.",
@@ -667,7 +719,9 @@
       "ok": "{{addresses}}.",
       "no_ipv6": "{{addresses}}. No public IPv6 address.",
       "no_ipv6_container": "{{addresses}}. IPv6 media is off (Docker bridge).",
+      "no_ipv6_unreachable": "{{addresses}}. No public IPv6 address ({{unreachable}}).",
       "ipv6_only": "{{addresses}}. No public IPv4 address, so friends without IPv6 can't connect.",
+      "ipv6_only_unreachable": "{{addresses}}. No public IPv4 address ({{unreachable}}), so friends without IPv6 can't connect.",
       "ephemeral": "{{addresses}}. The default public IPv4 changes on stop/start; in IP mode that moves the server's address and breaks every link, installed app and push subscription.",
       "port_forward": "{{addresses}}. This machine is behind a router.",
       "port_forward_local": "{{addresses}}. This machine is {{local}} behind a router.",
@@ -676,6 +730,8 @@
       "none": "No public IP address found: no public address on a network interface, and no STUN answer. The site opens, but nobody can share or watch: media has no address to offer.",
       "none_running": "No public IP address found: no public address on a network interface, and no STUN answer. isshoni is running but not ready, and nobody can open it.",
       "none_offline": "No public IP address found: no public address on a network interface, and no STUN answer. isshoni will start, but it won't be ready.",
+      "none_unreachable": "No public IP address: {{unreachable}}. The site opens, but friends can't share or watch: media has no public address to offer.",
+      "none_unreachableSite": "No public IP address: {{unreachable}}. The site is at that address too, so only this machine can open it.",
       "loopback": "Not checked: network.include_loopback is on and network.stun_servers is empty (a development setup, which needs no public address)."
     },
     "dns": {
@@ -886,6 +942,8 @@
     },
     "part": {
       "noAddress": "No public address",
+      "unreachable": "{{addresses}} can only be reached from this machine",
+      "bridgeNAT": "The container's bridge network gives each outgoing connection its own port (symmetric NAT), which doesn't matter here: friends reach the published ports.",
       "ip": {
         "config": "{{ip}} (set in the config)",
         "interface": "{{ip}} (on a network interface)",

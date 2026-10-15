@@ -9,6 +9,8 @@
 #             443, setup-url through `docker compose exec`, the admin survives `down` and `up`, a read-only root
 #             without capabilities
 #   backup    in bridge and host: the backup and restore commands of 06 §6.4, through `exec -T`
+#   doctor    in bridge and host: `isshoni doctor --json` through `exec -T`, every check asserted by its code, with an
+#             allow-list for what the test's setup and the machine it runs on can't give (doctor_allowed below)
 #   ipv6      in bridge: a client on the IPv6 loopback is seen with the address of Docker's proxy (06 §6.4)
 #   host      deploy/compose.host.yaml (compose.smoke.host.yaml): the same, and the container's process owns the
 #             host's port 443
@@ -19,7 +21,7 @@
 #   -a ARCH     build for amd64 or arm64 (default: the architecture of the Docker engine; ignored with -i)
 #   -i IMAGE    test this image instead of building one (a release image, for example)
 #   -k          keep what the test made (the last deployment, the image, the work directory) for a look around
-#   -s PARTS    skip parts, comma-separated: novolume, bridge, backup, ipv6, host, noenv
+#   -s PARTS    skip parts, comma-separated: novolume, bridge, backup, doctor, ipv6, host, noenv
 #   -v VERSION  version of the binary to build (default: the version web/dist was built for; ignored with -i)
 #
 # The test uses the host's ports 80, 443 and 7882 and the compose project "isshoni-smoke"; a project of that name
@@ -277,6 +279,137 @@ check_hardening() {
   ok "ReadonlyRootfs is true and CapDrop is [ALL]"
 }
 
+# doctor_want prints the code that each check of 04 §13.2 gives for a server with this test's setup on a host that has
+# what a real install has: CHECK CODE, one line per check, in the order of `isshoni doctor --list-checks`. The
+# checks that are information by nature give info codes at best (ports, firewall_hint, container, nofile,
+# bandwidth); release has not looked yet (its first look is 5 to 60 minutes after the start, 04 §11.5).
+#
+# doctor_want and doctor_allowed pin doctor's checks and codes, so internal/server/ops/doctor is an input of this
+# step (06 §11.3): its TestDockerSmokeExpectations holds both lists to doctor's checks and codes on every Go change.
+doctor_want() {
+  cat <<'EOF'
+config         config.ok
+data_dir       data_dir.ok
+secrets        secrets.ok
+schema         schema.ok
+public_ip      public_ip.ok
+dns            dns.ok
+tls            tls.ok
+clock          clock.ok
+udp_buffers    udp_buffers.ok
+ports          ports.listening
+firewall_hint  firewall_hint.open_ports
+container      container.detected
+lan_privacy    lan_privacy.not_macos
+transfer       transfer.no_limit
+release        release.not_checked
+nofile         nofile.ok
+bandwidth      bandwidth.estimate
+EOF
+}
+
+# doctor_allowed prints the allow-list: what this test's setup, or the machine the test runs on, can't give, with
+# the reason above each entry. An entry is CHECK ENGINE CODES: on that engine its codes ("|" between them) replace
+# the check's code in doctor_want. ENGINE is local (a Docker engine on this Linux machine, as on CI's runner), vm (an
+# engine in a virtual machine or on another host: Docker Desktop on macOS and Windows) or any. Nothing else is
+# allowed: a check whose code is neither wanted nor allowed fails the step, a fail or warn that this list doesn't
+# name among them.
+doctor_allowed() {
+  cat <<'EOF'
+# What the test's setup gives on every engine.
+#
+# A test machine has no public address that friends could reach, so the overrides set ISSHONI_PUBLIC_IP=127.0.0.1,
+# and doctor must not take a loopback address for a public one (04 §13.2, README F21): no public address, a
+# failure. check_doctor also checks that the result names 127.0.0.1 and has no IPv4 address. In the host setup on a
+# Linux machine with a global IPv6 address the server finds that one: IPv6 only, a warning.
+public_ip    vm     public_ip.none
+public_ip    local  public_ip.none|public_ip.ipv6_only
+# smoke.test is a test name that no DNS server knows. The overrides put it on 127.0.0.1 in the container's
+# /etc/hosts (extra_hosts), so every machine resolves it alike, and with no public address to compare that record
+# with, doctor can't call it right or wrong: a warning, never dns.ok or dns.wrong.
+dns          any    dns.unverified
+#
+# What a CI runner (a local Linux engine) can't give.
+#
+# In manual TLS mode there is no ACME directory to measure the skew against, so only the kernel's sync flag decides,
+# and that flag is the runner's: its time daemon may not have marked the clock as synchronized yet (a warning; the
+# skew can't fail here).
+clock        local  clock.ok|clock.unsynced
+# net.core.rmem_max and wmem_max are the Docker host's (06 §6.4), and a test doesn't change a host's sysctls: the
+# runner keeps the kernel's default.
+udp_buffers  local  udp_buffers.ok|udp_buffers.low
+#
+# What Docker Desktop's virtual machine (the vm engine) can't give.
+#
+# The machine's kernel keeps the clock that the hypervisor gives it, and no time daemon there clears its sync flag.
+clock        vm     clock.ok|clock.unsynced
+# The machine's kernel has its own socket buffer limits, below 8 MiB, which only Docker Desktop's settings change.
+udp_buffers  vm     udp_buffers.ok|udp_buffers.low
+EOF
+}
+
+# check_doctor runs `isshoni doctor --json` in the container as the docs do (06 §6.4), so the checks run inside the
+# server (04 §13.1), and asserts every check by its code (doctor_want, doctor_allowed). A check that doctor lists and
+# doctor_want doesn't fails the step, so a new check gets an expectation of its own.
+check_doctor() {
+  if skipping doctor; then
+    skip "isshoni doctor --json ($mode): -s doctor"
+    return 0
+  fi
+  report=$work/doctor-$mode.json
+  status=0
+  ctl doctor --json >"$report" 2>"$work/doctor.err" || status=$?
+  case $status in
+  0 | 5) ;;
+  *)
+    sed 's/^/    /' "$work/doctor.err" >&2
+    fail "isshoni doctor --json exits $status ($mode), want 0 or 5"
+    ;;
+  esac
+  jq -e '.schema == 1 and .mode == "cli-with-server"' "$report" >/dev/null 2>&1 ||
+    fail "isshoni doctor --json ($mode) printed no report of the running server: $(head -c 300 "$report")"
+  fails=$(jq '.summary.fail' "$report")
+  if [ "$fails" -gt 0 ]; then want_status=5; else want_status=0; fi
+  [ "$status" = "$want_status" ] || fail "isshoni doctor --json ($mode) exits $status with $fails failed checks, want $want_status"
+
+  ctl doctor --list-checks --json >"$work/checks.json" 2>"$work/doctor.err" || {
+    sed 's/^/    /' "$work/doctor.err" >&2
+    fail "isshoni doctor --list-checks --json failed"
+  }
+  ids=$(jq -r '.[]' "$work/checks.json") || fail "isshoni doctor --list-checks --json printed no list"
+  listed=$(printf '%s\n' "$ids" | tr '\n' ' ')
+  got_ids=$(jq -r '[.checks[].id] | join(" ")' "$report")
+  [ "$got_ids " = "$listed" ] || fail "the report's checks are '$got_ids', doctor --list-checks says '$listed'"
+  engine=vm
+  [ "$engine_local" = 0 ] || engine=local
+  allowed_seen=''
+  for id in $ids; do
+    wanted=$(doctor_want | awk -v id="$id" '$1 == id { print $2 }')
+    [ -n "$wanted" ] || fail "doctor has a check '$id' that docker-smoke.sh doesn't know: add it to doctor_want"
+    allowed=$(doctor_allowed | awk -v id="$id" -v engine="$engine" \
+      '$1 == id && ($2 == engine || $2 == "any") { print $3; exit }')
+    [ -z "$allowed" ] || wanted=$allowed
+    got=$(jq -r --arg id "$id" '.checks[] | select(.id == $id) | .status + " " + .code' "$report")
+    case "|$wanted|" in
+    *"|${got#* }|"*) ;;
+    *)
+      message=$(jq -r --arg id "$id" '.checks[] | select(.id == $id) | .message' "$report" | tr '\n' ' ')
+      fail "isshoni doctor ($mode): $id is $got ($message), want $wanted"
+      ;;
+    esac
+    [ -z "$allowed" ] || allowed_seen="$allowed_seen ${got#* }"
+  done
+
+  # The allow-list's public_ip entry is the rule of README F21: the loopback address is named, and is not the
+  # server's address.
+  got=$(jq -r '.checks[] | select(.id == "public_ip") | [(.params.unreachable // [] | join(",")), (.params.ipv4 // "-")] | join(" ")' "$report")
+  [ "$got" = '127.0.0.1 -' ] || fail "public_ip's params unreachable and ipv4 are '$got', want '127.0.0.1 -'"
+  # The container check sees the network of the deployment.
+  got=$(jq -r '.checks[] | select(.id == "container") | .params.network' "$report")
+  [ "$got" = "$mode" ] || fail "doctor's container check sees a $got network, the deployment is $mode"
+  ok "isshoni doctor --json ($mode, $engine engine): every check as wanted, allowed here:$allowed_seen"
+}
+
 test_image() {
   say "docker-smoke: image $image"
   got=$(docker image inspect -f '{{json .Config.Healthcheck.Test}}' "$image")
@@ -363,6 +496,7 @@ test_bridge() {
   check_info 127.0.0.1
   check_setup_url
   check_hardening
+  check_doctor
 
   seed_admin 127.0.0.1
   down
@@ -395,6 +529,7 @@ test_host() {
   *) fail "NetworkMode, user and CapAdd are '$got', want 'host 0:0 [\"NET_BIND_SERVICE\"]'" ;;
   esac
   ok "host network, user 0:0, and NET_BIND_SERVICE is the only capability"
+  check_doctor
 
   if [ "$engine_local" = 1 ]; then
     check_info 127.0.0.1
@@ -516,9 +651,9 @@ main() {
   fi
   for part in $(printf '%s' "$skip_parts" | tr ',' ' '); do
     case $part in
-    novolume | bridge | backup | ipv6 | host | noenv) ;;
+    novolume | bridge | backup | doctor | ipv6 | host | noenv) ;;
     *)
-      printf 'docker-smoke: -s %s: the parts are novolume, bridge, backup, ipv6, host and noenv\n' "$part" >&2
+      printf 'docker-smoke: -s %s: the parts are novolume, bridge, backup, doctor, ipv6, host and noenv\n' "$part" >&2
       exit 2
       ;;
     esac

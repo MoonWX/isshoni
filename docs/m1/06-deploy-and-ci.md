@@ -392,19 +392,19 @@ Why these settings:
 - **`SystemCallErrorNumber=EPERM`**: a filtered syscall returns an error instead of killing the process.
 - **`ExecReload`**: `systemctl reload isshoni` sends SIGHUP, which re-reads manual TLS files and `log.level`
   (04 §6.5). Everything else needs `systemctl restart isshoni`.
-  - **Until that reload exists, the server ignores SIGHUP, and `systemctl reload isshoni` neither reloads nor
-    stops it** (decided after group 7; README S65 implements the ignoring, README S90 the reload; 04 §6.5). As
-    merged after group 7 `serve` did not handle the signal at all, so it ended the process, and systemd takes
-    an end by SIGHUP for a clean exit that `Restart=on-failure` does not answer: a `reload` would have left the
-    server stopped. The unit keeps the line all the same. Taking it out would make `systemctl reload` an error
-    for now and change a file that the tarball and the packages ship (D3), only to put it back with S90. Nothing
-    is lost meanwhile: manual TLS files are picked up within 60 s without a signal (04 §8.4), and
-    `isshoni admin log-level` changes the level at runtime.
-  - **From README S65 on, `systemctl reload isshoni` is harmless until S90**: `serve` takes the signal from before
-    the server starts, logs `reload is not supported yet; restart to apply changes` at INFO for each one, and goes
-    on serving; across a restart in place (a restore, `rotate-secrets`) the signal is ignored until the new
-    process takes it again (04 §6.5). The journal line is what an operator who tried a reload sees; `systemctl
-    restart isshoni` applies a changed config.
+  - **The reload as README S90 built it** (group 13; 04 §6.5): `serve` loads the config again from its own flags,
+    the unit's environment and the file as it is now, reads the manual TLS files again and applies `log.level`.
+    Every other key that changed is named in one WARN line in the journal ("the config has changes that a reload
+    does not apply; restart isshoni to apply them", with the attribute `keys`), and a config with errors changes
+    nothing and says that a restart would refuse it (exit 78). The server never stops for the signal; across a
+    restart in place (a restore, `rotate-secrets`) the signal is ignored until the new process takes it again.
+    `docker compose kill -s HUP isshoni` does the same in a container.
+  - **Before S90 the server ignored SIGHUP** (decided after group 7; README S65 built the ignoring). As merged
+    after group 7 `serve` did not handle the signal at all, so it ended the process, and systemd takes an end by
+    SIGHUP for a clean exit that `Restart=on-failure` does not answer: a `reload` would have left the server
+    stopped. From S65 to S90 `serve` took the signal, logged `reload is not supported yet; restart to apply
+    changes` at INFO and went on serving. The unit kept the line throughout, so no file that the tarball and the
+    packages ship (D3) had to change for the reload.
 - **`ProtectClock=yes`** (and `@system-service`) also blocks the read-only `adjtimex` call, so the server-side doctor
   can't read the kernel's clock-sync flag. 04's `clock` check then treats the sync state as unknown and relies on the
   Date-header skew check (04 §13.2). Don't relax `ProtectClock` for this.
@@ -1473,6 +1473,15 @@ task dev:setup-url        # in a second terminal: open the printed link, create 
 - the protocol rule: edit Go types in `internal/protocol`, then `task gen` (`01`);
 - the license rule: section 8.3;
 - that `spikes/` is throwaway and not built by CI.
+
+**The Go tests in a Linux container, from a checkout set up on a Mac** (the group 14 integration). `.bin/` holds
+binaries for the machine that built them (7.1), so a container that mounts such a checkout (`golang:<version>`,
+to run the tests on Linux as CI does) sees darwin binaries there: `go -C tools test ./...` then fails
+`tools/notices`' `TestGoLicensesGate` with "exec format error", because the test runs `.bin/go-licenses` whenever
+it exists (8.3). In such a container run only the root module's `go test ./...`, or the `tools/` packages other
+than `notices` (`go -C tools test ./exittest/` runs `exittest`'s Linux-only `TestRealProc`), or point
+`GO_LICENSES_BIN` at a Linux build of the pinned go-licenses. The root module's suite is unaffected, and so is CI,
+whose jobs build `.bin/` on Linux.
 
 ## 8. CI (GitHub Actions)
 
@@ -2630,7 +2639,9 @@ choice:
    context laid out like goreleaser's (`linux/<arch>/isshoni` plus the extra files).
 2. Make a test certificate with openssl (a throwaway CA). Manual TLS mode proves 443 binds without depending on ACME.
 3. **Bridge:** `docker compose -f deploy/compose.yaml -f deploy/docker/test/compose.smoke.yaml up -d`. The override
-   sets the local image, `ISSHONI_TLS_MODE=manual`, the certificate mount and `ISSHONI_PUBLIC_IP=127.0.0.1`. Asserts:
+   sets the local image, `ISSHONI_TLS_MODE=manual`, the certificate mount and `ISSHONI_PUBLIC_IP=127.0.0.1`, and
+   puts `smoke.test` on `127.0.0.1` in the container's `/etc/hosts` (`extra_hosts`, README F21: the doctor step's
+   `dns`). Asserts:
    - health is `healthy` within 90 s;
    - `curl --cacert ca.pem --resolve smoke.test:443:127.0.0.1 https://smoke.test/api/v1/info` → 200 with the
      version;
@@ -2648,6 +2659,10 @@ choice:
    - `docker inspect` shows `ReadonlyRootfs: true` and `CapDrop: [ALL]`.
 4. **Host:** the same with `compose.host.yaml`, plus `ss -ltnp` on the runner shows :443 owned by the container's
    process.
+   In both setups also **doctor** (README F21): `docker compose exec -T isshoni isshoni doctor --json` reports
+   from the running server (`mode` `cli-with-server`), exits 5 exactly when a check fails (0 otherwise), and every
+   check of `isshoni doctor --list-checks` has the code the script wants for it, or one its allow-list names for
+   this engine (below).
 5. **No volume:** `docker run --rm <image>` exits 78 within 10 s and logs a message containing `/var/lib/isshoni`.
 6. **No `.env`:** `deploy/compose.yaml` started from a directory without a `.env` file, with an override that sets
    the local image and points the ACME directory at a closed loopback port (`ISSHONI_TLS_ACME_CA`, below), so ip
@@ -2672,7 +2687,8 @@ choice:
   (`ISSHONI_TLS_ACME_CA: https://127.0.0.1:9/directory`): ip mode would otherwise ask Let's Encrypt for a
   certificate at every test run. No certificate is expected there.
 - **Parts and flags**: `image` (the HEALTHCHECK, the user, that the binary starts without capabilities, the
-  version), `novolume`, `bridge`, `backup` (in bridge and in host), `ipv6`, `host` and `noenv`; `-s` skips parts,
+  version), `novolume`, `bridge`, `backup` and `doctor` (each in bridge and in host; `doctor` from README F21),
+  `ipv6`, `host` and `noenv`; `-s` skips parts,
   `-i IMAGE` tests an image that exists (a release image) and builds nothing, `-a` picks the architecture, `-k`
   keeps what the test made. `task docker:smoke` builds the web app and the notices first; flags after `--` go to the
   script.
@@ -2681,6 +2697,53 @@ choice:
   part checks only what it can see from outside (healthy, confined, `setup-url` through `exec`, the data surviving
   `down` and `up`) and skips the HTTPS checks, the owner of port 443, the admin account and the backup, with a note.
   CI runs every part on Linux.
+
+**The doctor step as README F21 built it** (`check_doctor` in `docker-smoke.sh`; part `doctor`, `-s doctor` skips
+it). It runs right after the hardening checks, in the bridge and in the host setup, on every engine (the host part's
+doctor runs through `exec`, so it needs nothing from outside the machine), and makes doctor's report a CI assertion
+that the manual check of 04 §17 can't be:
+
+- **Per code.** `doctor_want` lists one code per check of 04 §13.2: what a server with this setup gives on a host
+  that has what a real install has (`ok`, or the `info` code where `info` is the best a check gives: `ports`,
+  `firewall_hint`, `container`, `nofile`, `bandwidth`; `release.not_checked`, since the first look is 5 to 60
+  minutes after the start). A check that `--list-checks` names and the list doesn't fails the step, so a new check
+  gets an expectation of its own (on its own pull request: below); so does a report whose checks differ from that
+  list.
+- **The allow-list** (`doctor_allowed`), each entry with its reason in the script, replaces a check's code for one
+  engine: `local` (a Docker engine on the Linux machine that runs the test, as CI's runner), `vm` (an engine in a
+  virtual machine or on another host: Docker Desktop) or `any`. Nothing else is allowed, a `fail` or `warn` that it
+  doesn't name included:
+
+  | Check | Engine | Allowed | Why |
+  |---|---|---|---|
+  | `public_ip` | any | `public_ip.none` (local also `ipv6_only`) | The test has no public address, so the overrides set `ISSHONI_PUBLIC_IP=127.0.0.1`, which doctor must not take for a public one (04 §13.2 rule b). The step also checks that `params.unreachable` is `["127.0.0.1"]` and that there is no `ipv4`. A host part on a Linux machine with a global IPv6 address finds that one: `ipv6_only`, whatever the NAT kind of its IPv4 path, which stands in front of no public address (rule b) |
+  | `dns` | any | `dns.unverified` | `smoke.test` is known to no DNS server; the overrides put it on `127.0.0.1` in the container's `/etc/hosts` (`extra_hosts`), so every machine resolves it alike, whatever its resolver answers for the name (Docker Desktop asks the computer's own, which may be a proxy tool's that answers every name). With no public address doctor can't judge the record: never `dns.ok`, never `dns.wrong` |
+  | `clock` | local, vm | `clock.ok`, `clock.unsynced` | Manual mode has no ACME directory for the skew, so only the kernel's sync flag decides, and it is the Docker host's: a runner whose time daemon hasn't marked the clock synchronized yet, Docker Desktop's VM whose clock the hypervisor keeps |
+  | `udp_buffers` | local, vm | `udp_buffers.ok`, `udp_buffers.low` | `net.core.rmem_max`/`wmem_max` are the Docker host's (6.4), and a test doesn't change a host's sysctls: the runner keeps the kernel's default, and Docker Desktop's VM has a limit of its own below the 8 MiB isshoni wants |
+
+- **Two more facts**: `container`'s `params.network` is the setup's (`bridge`, `host`), which 04 §13.2's rule (a)
+  needs; and the summary line names the allowed results it saw.
+- **As run after F21** on Docker Desktop for Mac (the `vm` engine), both setups: `public_ip.none`, `dns.unverified`,
+  `clock.unsynced`, `udp_buffers.low`, every other check its wanted code; exit 5. 04 §13.2's rule (a) is not part of
+  the step (the loopback public address decides `public_ip` first); its Go tests hold it, and F21 checked it by hand
+  with the same image: an offline `isshoni doctor --only public_ip` in a bridge container on Docker Desktop, whose
+  STUN reading is `symmetric`, gives `public_ip.no_ipv6` with `dockerBridge`, and with `--network host`
+  `public_ip.symmetric` as before.
+- "doctor reports ok in the Docker bridge and host setups" stays the manual pre-flight item 5 of 12.1, on a Linux
+  host with a real public address: the step checks every code, but the smoke overrides can't give an all-ok report.
+- **Doctor's package is an input of the step.** `doctor_want` and `doctor_allowed` pin every check and its codes, so
+  a pull request that changes doctor's checks or codes (`internal/server/ops/doctor`, the `go` filter alone) must
+  run docker-smoke, which a pull request runs only for the `docker`, `deploy` or `release` filters (8.2). Two things
+  see to it:
+  - `TestDockerSmokeExpectations` (`ops/doctor`, in `test-go` on every Go change) holds both lists to doctor:
+    `doctor_want` names every check of `--list-checks` in its order, and every code either list names is one of
+    doctor's codes and its check's; an allow-list entry is `local`, `vm` or `any`, one per check and engine. A pull
+    request that adds or removes a check, or renames or removes a code the lists name, fails there until the script
+    knows it, and that edit of `deploy/docker/**` runs docker-smoke on the same pull request.
+  - Which of its existing codes a check gives in the smoke's setup only the step can tell, so ci.yml's `changes`
+    job gets a filter `doctor` (`internal/server/ops/doctor/**`) that runs docker-smoke as well (README F21 listed
+    it for the integrator: ci.yml is S02's, and 8.2's table names the filter). Until it is there, such a change
+    passes its own pull request and fails on the push to main and in nightly's `docker-multiarch`.
 
 ## 12. M1 exit test run book
 
@@ -2732,6 +2795,21 @@ can watch.
    minutes. Pass: CPU under 40% of 2 vCPU, loss under 0.5%, RSS flat.
 4. On the day, before T+0 (the T−5 row): with E's firewall rules in place, the admin dashboard must show E's
    connection as `tcp443`. If it doesn't, fix E's rules before starting.
+5. **Doctor in Docker** (README S90's last acceptance item, made manual after group 13, README §6 "Decided after
+   group 13"), run earlier than T−1 and never on the installed VPS: there the systemd isshoni holds 80, 443 and 7882,
+   and `compose.host.yaml` would mount its data directory, `/var/lib/isshoni`, as root. So during Setup, on the VPS
+   before `install.sh`, or on another Linux host with a real public address, in a directory with `deploy/`'s two
+   compose files and a `.env`: both files' `image:` set to the rc's `ghcr.io/moonwx/isshoni:0.1.0-rc.N` (a
+   prerelease never moves `:latest`, 3), `ISSHONI_DOMAIN` naming that host (or empty, for an IP certificate), and
+   the host's UDP buffers raised (6.4). In this order:
+   - bridge: `docker compose up -d`, `docker compose exec isshoni isshoni doctor`, record the output, then
+     `docker compose down -v`, which frees the ports and deletes the volume (the host setup doesn't use it);
+   - host: `docker compose -f compose.host.yaml up -d`, `docker compose -f compose.host.yaml exec isshoni isshoni
+     doctor`, record the output, then `docker compose -f compose.host.yaml down` and `sudo rm -rf /var/lib/isshoni`,
+     the directory it created on the host as root, which `install.sh` would otherwise take over.
+
+   Both report ok. Docker Desktop on a Mac can't give this result (its user-space NAT makes `public_ip` symmetric),
+   nor can CI's docker-smoke with its test overrides (04 §13.2, §17).
 
 ### 12.2 Timeline
 
@@ -2758,22 +2836,122 @@ can watch.
 
 **`tools/exittest collect -o run.csv -metrics http://127.0.0.1:9469/metrics`** (Go, stdlib only, runs as root). A
 starts it detached from the SSH session, because A drops Wi-Fi at T+75:
-`sudo systemd-run --unit=exittest-collect --working-directory="$PWD" "$PWD/exittest" collect -o run.csv -metrics
-http://127.0.0.1:9469/metrics` (or inside `tmux`). Every 10 s it records:
+`sudo systemd-run --collect --unit=exittest-collect --working-directory="$PWD" "$PWD/exittest" collect -o run.csv
+-metrics http://127.0.0.1:9469/metrics` (or inside `tmux`). `--collect` unloads the transient unit however the
+collector ends, so the same command works again after a start that failed (a typo is exit 2, and without it the
+failed unit would stay loaded under that name; review S94-F7). Every 10 s it records:
 - the isshoni PID, re-resolved on every sample with `systemctl show -p MainPID --value isshoni`; a changed PID is
   written to `run.csv` as a `restart` row, so the T+60 restart is marked;
 - isshoni CPU % (from `/proc/<pid>/stat` of that PID), RSS, threads and open fds;
 - load average;
 - NIC rx/tx bytes (`/proc/net/dev`);
-- UDP `InDatagrams`, `OutDatagrams`, `RcvbufErrors`, `SndbufErrors` and `InErrors` (`/proc/net/snmp`);
+- UDP `InDatagrams`, `OutDatagrams`, `RcvbufErrors`, `SndbufErrors` and `InErrors` (`/proc/net/snmp`, plus the
+  `Udp6*` lines of `/proc/net/snmp6`, which Linux counts apart; clients may come over IPv6);
 - TCP `RetransSegs`.
 
 Every 30 s it saves a `/metrics` scrape.
 
-`tools/exittest summarize run.csv` prints the table below. It computes every rate and total per process (split at
-the `restart` rows) and treats a counter that goes down as a reset, the Prometheus way (the increase after a reset is
-the new value), because the saved `/metrics` counters start again at zero at T+60. The owner then adds the journal
-excerpt (`journalctl -u isshoni --since …`, with warnings and errors only).
+`tools/exittest summarize run.csv` prints the table below. It computes every rate and total per process (split at the
+`restart` rows) and treats a counter that goes down as a reset, the Prometheus way (the increase after a reset is the
+new value), because the saved `/metrics` counters start again at zero at T+60. The owner then adds the journal
+excerpt: the session's warnings and errors, with every IP address and name replaced. isshoni writes JSON lines (04
+§10) without a `<N>` priority prefix, which journald stores at one priority, so `journalctl -p warning` doesn't find
+them: the run book filters `journalctl -u isshoni --since … --until … -o cat` on the JSON `level` (`WARN`, `ERROR`)
+and on a panic's first line, and takes systemd's own messages about the unit (a crash, the failed state) with `-p
+warning` (review S94-F1).
+
+**As README S94 built it** (`tools/exittest` in the module `tools/`; the run book `docs/m1/exit-test/README.md` and
+its results template `results-template.md`):
+- **Build and copy.** `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go -C tools build -o ../bin/exittest ./exittest`
+  writes the binary into the checkout's ignored `bin/`, from where it is copied to the VPS. `run.csv`, the saved
+  scrapes and the journal stay off the repository: they are copied off the VPS into the ignored `.dev/` (or outside
+  the checkout), never next to tracked files (review S94-F6).
+- **Flags.** `exittest collect [-o run.csv] [-metrics URL] [-unit isshoni | -pid-file FILE] [-nic NAME]
+  [-metrics-dir DIR] [-proc /proc] [-interval 10s] [-scrape-interval 30s]`, with defaults that match the command
+  line above. `-unit` names the systemd unit whose `MainPID` is isshoni; `-pid-file` reads the PID from a file
+  instead (a server that systemd doesn't run, and the SIGTERM test); `-nic` defaults to the interface of the IPv4
+  default route with the lowest metric (`/proc/net/route`), and without one, or with `all`, counts every interface
+  except `lo`; `-metrics ""` scrapes nothing; `-metrics-dir` defaults to `-o`'s name without `.csv` plus `-metrics`;
+  `-proc` is where the proc file system is (the tests give a fake one). Exit 0 when a signal stopped it, 1 when
+  `run.csv` can't be written, 2 on a usage error. `exittest summarize [-t0 TIME] run.csv` is below.
+- **`run.csv`.** One header line, then one row per event, oldest first, each row one write (a killed collector
+  leaves whole rows). `time` is UTC with milliseconds; `kind` is one of `start` (the collector started; started
+  again with the same `-o`, it appends after a new `start` row and still marks a restart in between; the note says
+  how it samples, `user_hz=100` among it), `sample`, `down` (a sample without an isshoni process: systemd names
+  none, or the process ended between the lookup and the read; the machine's columns are still filled), `restart`
+  (the PID differs from the last one, or the same PID now belongs to a process that started later, told by
+  `/proc/<pid>/stat`'s `starttime`; the note names the old PID), `scrape`, `scrape_error` (no metrics: refused,
+  failed, timed out or not the text format; the note says why) and `stop` (the note says why: a signal, or the
+  error it couldn't go on after); then `pid` and the columns, an empty cell where the row's kind doesn't fill a
+  column or the value couldn't be read, and a free-text `note` last:
+  - the process: `cpu_ticks` (utime + stime) and `cpu_pct`, its CPU since the previous sample **in percent of all
+    CPUs** (100 = every CPU busy), `rss_bytes` (`VmRSS`), `threads` and `fds`;
+  - the machine: `cpus` and `host_cpu_pct` (the whole machine's CPU since the previous sample, from `/proc/stat`,
+    in percent of all CPUs; two columns beyond the list above, because "Server CPU" can be read as the machine's,
+    so the summary shows both and judges by isshoni's own), `load1`, `load5`, `load15`, `nic_rx_bytes`,
+    `nic_tx_bytes`, `udp_in_datagrams`, `udp_out_datagrams`, `udp_rcvbuf_errors`, `udp_sndbuf_errors`,
+    `udp_in_errors` and `tcp_retrans_segs` (counters since boot);
+  - the scrape: each one is saved whole as `<metrics-dir>/<UTC time>.prom` (the row's note names the file), and
+    the series of the list below become columns, each the sum of a metric's series or of those with given labels:
+    `go_goroutines`, `process_resident_memory_bytes`, `process_cpu_seconds_total`, `participants`, `shares`,
+    `sfu_downtracks`, `sfu_video_downtracks_high` and `sfu_video_downtracks_low` (the video DownTracks forwarding
+    `high` or `low`), the SFU's ingress and egress bytes, NACKs served, PLIs sent and layer switches,
+    `transfer_ingress_bytes_total`, `transfer_egress_bytes_total`, `ws_resume_resumed_total`,
+    `ws_resume_not_resumed_total`, `transport_udp`, `transport_tcp443`, `transport_tcp7882` and the six `client_*`
+    counters, so `summarize` needs only `run.csv`. The parser skips and counts a line it can't read rather than
+    failing the scrape.
+- **CPU ticks** are read with a constant USER_HZ of 100: the standard library has no `sysconf` without cgo, and 100
+  holds on x86-64, arm64 and riscv64.
+- **How `summarize` judges.** It prints Markdown with `###` sections and no title, so it goes under the results
+  file's "## Summary" as it is. A row is `pass`, `FAIL`, `check` (measured, needs a look), `n/a` (nothing to
+  measure) or `manual` (the people, the dashboard or the survey answer it: manual fixes, phones and the survey,
+  and the numbers it gives for recovery, viewing quality and ICE-TCP). Where the pass criteria are not numeric:
+  - **T+0** is `-t0` (RFC 3339, or `HH:MM[:SS]` in UTC within 12 hours of the first row); without it, 60 minutes
+    before the first restart, or 15 minutes after the first row when there is none (the collector starts at T−15).
+  - **The recording covers the session** when it starts by T+2 and ends at T+118 or later: 2 minutes of slack at
+    each end, because T+0 often comes from the restart, which the collector sees seconds late. A gap of more than
+    2 minutes without a sample inside the session is listed.
+  - **Session**: a restart within 5 minutes of T+60 is the scripted one, and more than one restart is `FAIL`. No
+    restart, a restart elsewhere, a recording that doesn't cover the session, a gap, or several scraped byte
+    counters going down at once without a PID change make it `check`; the last is a restart in place by re-exec
+    (04 §6.5), which keeps the PID and its start time (review S94-F5).
+  - **Server CPU**: isshoni's CPU from T+0 to T+120, the average and the peak (the largest pair of samples) in
+    percent of all CPUs, with the machine's beside it; `FAIL` at 50 % average or 80 % peak; `check` when the
+    samples cover less than 90 % of T+0 to T+120 or none of the stress, T+90 to T+100 (review S94-F4).
+  - **Memory**: RSS from the first sample at or after T+65 to the last at or before T+120, in the process that runs
+    at T+65; `FAIL` at 20 % growth, `check` when those samples are more than 2 minutes inside the window; the first
+    process's T+5 to T+59 is reported beside it. **Goroutines** is a row of its own: the last scrape after the
+    stress (T+100 to T+120) against the last one at or before T+85 of the same process; `pass` up to 10 % above
+    that baseline, otherwise `check` (more people or shares raise it too).
+  - **UDP socket errors**: the machine's `RcvbufErrors + SndbufErrors` against all datagrams; `FAIL` at 0.01 %,
+    `check` when the recording doesn't cover the session.
+  - **Recovery** stays `manual`. For the server restart the summary gives the outage as a range: at most from the
+    old process's last scrape with everyone (the most participants of its last 5 minutes) to the new one's first,
+    at least from the first sign of the outage, or the new PID's `restart` row when that comes first (the old
+    process had stopped by then), to the last sign in between (a scrape with fewer participants, a failed scrape, a
+    `down` row), since participants are scraped every 30 s. The new PID's row is no sign that the outage went on:
+    it comes up to a sample late. It is `check` when even the shorter end is over 30 s, or when the participants
+    never came back (review S94-F2).
+  - **Viewing quality** is `FAIL` only when the viewers' freeze time is at least 3 % of the video tracks' watch
+    time, every device together (the phones' limit, the larger one); otherwise `manual`, because the split per
+    device comes from the dashboard and the notes. The watch time is the forwarding video DownTracks times time,
+    because a viewer reports its freezes per inbound video track, the focus and each thumbnail (review S94-F3);
+    dropped frames and concealed audio are shown beside it.
+  - **ICE-TCP** is `FAIL` only when no scrape between T+0 and T+120 has a PeerConnection on `tcp443`; otherwise
+    `manual`, listing the scrapes that had none, because E's own transport is on the dashboard.
+
+  Then come each process's CPU, memory and gauges, and every counter's total and rates per process and in all.
+  The output names no host, address or person. The golden fixture is `tools/exittest/testdata/run.csv` (about
+  196 KB, a simulated session with the restart) with `summary.md`; after a format change
+  `go -C tools test ./exittest -run 'Fixture|Summarize' -update` writes both again. Tests: `TestCollectSample`,
+  `TestCollectNIC`, `TestCollectAppends`, `TestCollectSurvivesRestartAndOutage`, `TestScrapeRows`,
+  `TestCollectStopsOnSIGTERM` (the binary as a child process), the parsers' tests, `TestRealProc` (Linux only: the
+  real `/proc`), `TestStdlibOnly`, `TestFixtureIsCurrent`, `TestSummarizeFixture`, `TestSummarizeVerdicts`,
+  `TestSummarizeCoverage`, `TestCounterResets` and `TestSummarizeT0`; the fuzz targets `FuzzParsePromText` and
+  `FuzzSummarize`. `TestRealProc` has passed on linux/arm64; CI's linux/amd64 job is its first amd64 run.
+- **The results template** has the timeline's per-person rows (at T+0 C and D; B and E signed up at T−5), the
+  summary pasted under its "## Summary", the journal excerpt, the survey and the device-matrix rows checked that
+  day (review S94-F8).
 
 **Metrics read from the server** (names from 01 §18, 02 §13 and 04 §11.2):
 - Go and process collectors (`go_goroutines`, `process_resident_memory_bytes`, `process_cpu_seconds_total`);
@@ -2853,8 +3031,9 @@ Anything beyond these, such as a reload, a second tap, a re-join or a second log
   (only `/var/lib/isshoni` and `/run/isshoni` are writable), `PrivateTmp`, `AF_NETLINK` allowed, `UMask=0077`,
   journald captures stdout.
   - stderr is not a TTY under systemd, so 04's `log.format = "auto"` writes JSON lines (04 §10).
-  - `systemctl reload` sends SIGHUP (`ExecReload`, 4.5). The server reloads on it from README S90 on and ignores
-    it from S65 until then (04 §6.5).
+  - `systemctl reload` sends SIGHUP (`ExecReload`, 4.5): the server reads manual TLS files and `log.level` again
+    and names every other changed key for a restart (README S90; it ignored the signal from S65 until then, 04
+    §6.5).
   - Exit 78 stops restarts.
   - `TimeoutStopSec=20`: graceful shutdown must finish in under 15 s.
 - **Container environment:** image `ghcr.io/moonwx/isshoni`; binary `/usr/local/bin/isshoni`; uid 65532; env
@@ -2990,7 +3169,13 @@ M1 timeline:
 | S9 | goreleaser and release pipeline (2.5 d) | `.goreleaser.yaml`, `release.yml` (web, build, sign, verify, publish, dry run), keys generated by the owner, `allowed_signers`, environment `release` | The dry run passes end to end; tag `v0.1.0-rc.1` → draft → approval → signed → verified → published without moving `:latest` or GitHub's "latest"; `curl …/v0.1.0-rc.1/install.sh \| sh` works on a real VPS | S6, S8 |
 | S10 | Project site (2.5 d) | VitePress skeleton, all M1 pages (10.2), `site.yml`, `release.json`, the anchor test `internal/server/ops/doctor/docsanchors_test.go` (10.4) and the `site` job's Go step, Pages settings (8.6 step 5) | The site is live; the served `install.sh` equals the latest release asset (sha256 test in `site.yml`); the anchor tests pass for the doctor ids, `ct-` codes and provider ids; no request leaves for a third-party origin (checked in the browser's network panel) | S9 (install.sh), 04/05 id lists |
 | S11 | Nightly and VMs (2 d) | `nightly.yml`: VM matrix V1–V6 (Pebble), multi-arch smoke, cross-OS Go tests, govulncheck, full goreleaser snapshot, link check | One green nightly with all rows (or KVM rows marked skipped with the reason, and run by hand in UTM/Tart once) | S7, S8, S9 |
-| S12 | Exit test (1 d prep + the session) | `tools/exittest` (collect, summarize), the run book as a checklist, the session, the results file | All pass criteria in 12.3 met on an rc; `v0.1.0` tagged from that commit (or a fixed one after a re-run) | everything |
+| S12 | Exit test (1 d prep + the session) | `tools/exittest` (collect, summarize; as README S94 built them, 12.3), the run book as a checklist, the session, the results file | All pass criteria in 12.3 met on an rc; `v0.1.0` tagged from that commit (or a fixed one after a re-run) | everything |
+
+README S94 is this slice, split after group 13 (README §6 "Decided after group 13"): its code, `tools/exittest` and
+the run book in `docs/m1/exit-test/`, was built in group 14 (12.3 "As README S94 built it": `run.csv`'s rows and
+columns, the flags beyond the command line, the `Udp6` counters, USER_HZ 100 and the summary's rules where the pass
+criteria are not numeric); the session itself, 05 §19.4's device matrix and the `v0.1.0` tag stay with the owner
+(README S94-day), after README S92's load gate on a VPS.
 
 ## 17. Decisions taken at integration (formerly open questions)
 
@@ -3007,7 +3192,7 @@ Decided after group 7 (an engineering call the owner delegated; README §6):
 - **`systemctl reload isshoni` does nothing until the server can reload.** The unit keeps
   `ExecReload=/bin/kill -HUP $MAINPID`; the server ignores SIGHUP from README S65 on and reloads manual TLS files
   and `log.level` on it from README S90 on (4.5; 04 §6.5). Before S65 the signal would stop the server without a
-  restart.
+  restart. README S90 merged in group 13, so the reload is there now.
 
 Decided after group 8 (an engineering call the owner delegated; README §6):
 
@@ -3071,3 +3256,39 @@ Decided after group 12 (an engineering call the owner delegated; README §6 (8))
   F15 (group 13) turned into `deploy/release/check-draft.sh` with a committed test under `task test:sh` (9.3); and
   `distro-test.sh`'s podman path lacked `--cap-add SYS_ADMIN`, which README F16 (group 13) added with `SYS_PTRACE`,
   leaving the user session to the caller and stopping with its cause when there is none (4.13). The image digests that F09 and F13 pin are bumped by hand with the tool pins (7.1).
+
+Decided after group 13 (engineering calls the owner delegated; README §6 "Decided after group 13"):
+
+- **"doctor reports ok in the Docker bridge and host setups" is a manual check on a Linux host with a real
+  address, run with the exit test** (12.1 pre-flight 5; README S90's last acceptance item). Docker Desktop can't
+  produce an all-ok report (its user-space NAT makes `public_ip` symmetric, its fake-IP DNS answers for a test
+  domain, its VM's clock and UDP buffers warn), and neither can 11.3's smoke overrides on a Linux runner (the test
+  domain resolves nowhere). README F21 (group 15) runs `isshoni doctor --json` in the `docker-smoke` job and
+  asserts per code (11.3), after revising two `public_ip` rules (04 §13.2).
+- **README S94 (this doc's S12) is split** (16): `tools/exittest` and the run book in `docs/m1/exit-test/` are
+  built in group 14; the session, 05 §19.4's device matrix and the `v0.1.0` tag stay with the owner, after README
+  S92's load gate on a VPS.
+- **The e2e job gets `isshoni-loadtest` from the `build` job** (8.2; the group 13 integration, README S89-R2):
+  `CGO_ENABLED=0 go build -trimpath`, uploaded as its own artifact and passed to the specs as `LOADTEST_BIN`, so
+  `decodable.spec` doesn't build the tool with an unpinned Go inside the 15 minutes that the whole Playwright run has in
+  CI (05 §19.3). The tool is no release artifact.
+- The first item's later slice is README F21 (group 15): `isshoni doctor --json` asserted per code in
+  `docker-smoke`, with an allow-list for what a runner can't satisfy, and the two `public_ip` rules reviewed
+  (11.3; 04 §13.2).
+
+Decided after group 14 (engineering calls the owner delegated; README §6 "Decided after group 14"):
+
+- **The exit test's collector and summary as README S94 built them** (12.3 "As README S94 built it", 16). CPU is
+  in percent of all CPUs, as the pass criteria count it, and `run.csv` also has the machine's (`cpus`,
+  `host_cpu_pct`), because "Server CPU" can be read either way; the verdict uses isshoni's own. The UDP counters
+  add `/proc/net/snmp6`'s `Udp6*`. Each scrape is saved whole and its series are a row of `run.csv`, so the
+  summary needs that one file. Where the pass criteria are not numeric the summary applies rules of its own (T+0,
+  2 minutes of coverage slack, the scripted restart within 5 minutes of T+60, goroutines within 10 % of the T+85
+  baseline, viewing quality `FAIL` only at 3 % frozen, ICE-TCP `FAIL` only with no `tcp443` PeerConnection, and
+  recovery left `manual` with the outage as a range); a row passes only on what was recorded.
+- **The run book reads the journal by the JSON `level`** (12.3; review S94-F1): journald stores isshoni's JSON
+  lines at one priority, so `journalctl -p warning` would show only systemd's lines about the unit. The collector
+  runs under `systemd-run --collect`, the binary goes to the ignored `bin/`, and the recording to the ignored
+  `.dev/` or outside the checkout.
+- **A Linux container over a checkout set up on a Mac runs the root module's tests, not `tools/notices`'** (7.4;
+  the group 14 integration): `.bin/go-licenses` is a darwin binary there.

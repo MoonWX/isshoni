@@ -119,7 +119,7 @@ governed by the license gate (06).
 
 | Command | What it does | Talks to |
 |---|---|---|
-| `isshoni serve [config flags]` | Runs the server until SIGTERM or SIGINT, then shuts down gracefully (§6.4). After a restore, `rotate-secrets`, or the public address that a server waited for, it restarts in place with the same PID (the re-exec of §6.5). SIGHUP is ignored until the reload of §6.5 exists (decided after group 7: README S65 ignores it, README S90 reloads). As S65 built it, `serve` takes the signal, logs one INFO line, `reload is not supported yet; restart to apply changes`, and goes on, so `systemctl reload isshoni` neither reloads nor stops the server. Docker `CMD ["serve"]` | – |
+| `isshoni serve [config flags]` | Runs the server until SIGTERM or SIGINT, then shuts down gracefully (§6.4). After a restore, `rotate-secrets`, or the public address that a server waited for, it restarts in place with the same PID (the re-exec of §6.5). SIGHUP (`systemctl reload isshoni`) is the reload of §6.5, as README S90 built it: `serve` loads the config again from its own flags, the environment it started with and the file as it is now, reads the manual TLS files again and applies `log.level`; every other key that changed is named in a WARN line, to be applied by a restart. From README S65 until S90 the signal was ignored (decided after group 7). Docker `CMD ["serve"]` | – |
 | `isshoni setup-url [--qr\|--no-qr] [--wait DUR] [--json]` | Mints a one-time setup link and prints it (plus a QR code on a TTY). `--wait` is for Docker and manual use; install.sh waits with `healthcheck --ready` and then calls `setup-url` once | admin socket |
 | `isshoni doctor [--json] [--strict] [--only ID,…] [--list-checks] [--bandwidth-flags…]` | Diagnostics (§13). Works with or without a running server. `--only` runs the named checks (install.sh uses `dns,public_ip,clock` before the first start); `--list-checks --json` prints a JSON array of the check ids (06's anchor test, §13.1) | admin socket if up |
 | `isshoni healthcheck [--ready] [--wait DUR]` | Liveness (default) or readiness. Docker `HEALTHCHECK` (liveness); install.sh uses `--ready` | admin socket |
@@ -256,7 +256,8 @@ flag  >  env  >  file  >  [policy keys only: admin UI setting in the DB]  >  bui
   path is fine (Docker runs on env only). A missing file at an explicit path is error 78.
 - The file is read-only to the service (install.sh: `root:isshoni 0640`, 06). The server never writes it.
 - Changes need a restart (`systemctl restart isshoni`); clients reconnect on their own (§6.4). `SIGHUP` reloads only
-  manual TLS files and `log.level` (§6.5), from README S90 on; until then `serve` ignores the signal (§6.5).
+  manual TLS files and `log.level` (§6.5, README S90). A reload loads the config the same way as the start, so this
+  precedence holds for it too: a `log.level` set by a flag or `ISSHONI_LOG_LEVEL` wins over the file's.
 - Relative paths (dev only) are resolved against the working directory at startup.
 
 ### 4.2 Naming rule (mechanical, one registry)
@@ -773,6 +774,10 @@ func (s *Server) Start(ctx context.Context) error
 // Run blocks until ctx is cancelled (then shuts down gracefully) or a restore requests a restart.
 func (s *Server) Run(ctx context.Context) error
 func (s *Server) Shutdown(ctx context.Context, reason ShutdownReason) error
+// Reload is the reload of §6.5 (SIGHUP; README S90): cfg is the config loaded again, nil when it could not be
+// loaded at all. It reads the manual TLS files again and applies cfg's log.level, nothing else; it returns the TLS
+// manager's error when new certificate files were refused (the old pair keeps serving).
+func (s *Server) Reload(ctx context.Context, cfg *config.Config) error
 func (s *Server) Site() config.Site
 func (s *Server) Addrs() Addrs // as bound: a configured port 0 shows as the port the kernel picked
 
@@ -1136,21 +1141,52 @@ A second SIGTERM/SIGINT exits immediately with code 1. 06 sets systemd `TimeoutS
 
 - `SIGHUP`: reload manual TLS files and `log.level` from the config file; everything else needs a restart.
   06: `ExecReload=/bin/kill -HUP $MAINPID`.
-- **Until the reload exists, `serve` ignores `SIGHUP`** (decided after group 7; README S65 implements the
-  ignoring, README S90 the reload). As merged after group 7, `serve` handles SIGTERM and SIGINT and nothing
-  else, so a SIGHUP has Go's default effect: the process dies of the signal, at once and without the shutdown of
-  §6.4. systemd counts a death by SIGHUP as a clean exit, which `Restart=on-failure` does not answer, so
-  `systemctl reload isshoni` (06's `ExecReload`) would stop the server and leave it stopped. From S65 on `serve`
-  ignores the signal, so `systemctl reload isshoni` then **neither reloads nor stops** the server. Nothing is
-  lost meanwhile: manual TLS files are picked up by the 60 s poll (§8.4), the log level changes at runtime with
-  `isshoni admin log-level` (§12.2), and every other change needs a restart anyway. S90 replaces the ignoring
-  with the reload of the first bullet. The unit keeps `ExecReload` throughout (06 §4.5).
-- **As README S65 built the ignoring** (`cmd/isshoni/serve.go`): `serve` takes SIGHUP (`signal.Notify`) before
-  the server starts, so a reload during a slow start is harmless too, and answers each one with the INFO line
-  `reload is not supported yet; restart to apply changes`, nothing more. Across a re-exec (below) the signal is
-  ignored outright (`signal.Ignore` right before the exec; an ignored signal stays ignored across `exec`, a handled
-  one goes back to its default, which would end the process), until the new process's `serve` takes it again.
-  `TestServeIgnoresSIGHUP` runs `serve` as a real process.
+- **Until README S90, `serve` ignored `SIGHUP`** (decided after group 7; README S65 built the ignoring). A process
+  that doesn't handle the signal dies of it, at once and without the shutdown of §6.4, and systemd counts a death
+  by SIGHUP as a clean exit, which `Restart=on-failure` does not answer: `systemctl reload isshoni` would have
+  stopped the server and left it stopped. From S65 on `serve` took the signal and answered it with an INFO line,
+  `reload is not supported yet; restart to apply changes`; S90 replaced that with the reload of the first bullet.
+  The unit kept `ExecReload` throughout (06 §4.5).
+- **The reload as README S90 built it** (`cmd/isshoni/serve.go` `reload`, `internal/server/reload.go`
+  `Server.Reload`):
+  - **`serve` takes SIGHUP before the server is built** (`signal.Notify`), so the signal never ends the process.
+    For each one it loads the config again with `config.Load`, from its own flags, the environment it started with
+    and the file as it is now, so the precedence of §4.1 holds (a `log.level` set by a flag or
+    `ISSHONI_LOG_LEVEL` wins over the file's), and calls `Server.Reload`. Reloads run one at a time. Across a
+    re-exec (below) the signal is ignored outright (`signal.Ignore` right before the exec; an ignored signal stays
+    ignored across `exec`, a handled one goes back to its default, which would end the process), until the new
+    process's `serve` takes it again. Once the server has shut down, `serve` waits at most 1 s for a reload that is
+    still under way (`onSignals`), so a hung one can't keep the process from exiting.
+  - **What a reload applies.** In manual mode it reads `tls.cert_file` and `tls.key_file` again
+    (`tlsmgr.Manager.Reload`, §8.4; in the other modes there is nothing to read); a pair that can't be used is
+    refused, the old pair keeps serving, and the TLS manager logs why with the fix. And it makes the config's
+    `log.level` the configured level (`ops.LogLevel.SetBase`): a level that `isshoni admin log-level` set for a
+    while (§12.2) stays until its time is up and then falls back to the reloaded one, not to the start's. Nothing
+    else is applied. Every other key whose effective value differs from the config the server started with is
+    named, never with its value, in one WARN line, `the config has changes that a reload does not apply; restart
+    isshoni to apply them`, with the attribute `keys`.
+  - **A config with errors changes nothing.** Each error is logged at WARN (component `config`, with `key` and
+    `fix` when it has them; a problem of the file as a whole has no `key`), then one WARN line says that
+    `log.level` is not reloaded and that isshoni would refuse to start with this config (exit 78) until the errors
+    are fixed, with the attribute `errors`. No key is named for a restart then: the keys it could not use hold
+    their defaults, which are no change of the operator's, and a restart would refuse to start anyway. A config
+    that can't be loaded at all (an ERROR line, `reload: the config could not be loaded again`) reloads only the
+    certificate. The certificate files are read again in both cases: they are no part of the config. A process
+    whose level is fixed (`Deps.LogLevel` nil) logs that `log.level` is not reloaded.
+  - **The timing.** A reload that comes during the startup waits for it (`Start` holds the lifecycle lock); one
+    that comes before `Start` only sets the level, which the start then takes as the configured one; one that
+    comes once the shutdown has begun logs `reload ignored: the server is shutting down` and does nothing. The
+    certificate files are read **without** the lifecycle lock held: a read that hangs (a mount that stopped
+    answering) must not hold up the shutdown that SIGTERM begins, which takes that lock first (review F3). A
+    shutdown that begins during the read leaves the level as it is.
+  - **The log.** One INFO line, `reloaded (SIGHUP)`, with the attributes `certificate` (`read again`, `rejected:
+    …`, or why it was not read) and `log_level`, written at whichever level, the old or the new one, shows it; or
+    `reloaded (SIGHUP) without the log level` with `certificate` alone. `Reload` returns the TLS manager's error
+    when the new files were refused.
+  - Tests: `TestServeReloadsOnSIGHUP` (`serve` as a real process: the level changes, the changed keys are named, a
+    broken file changes nothing and names no key, the process never stops), `TestReloadLogLevel`,
+    `TestReloadBeforeStart`, `TestReloadManualCertificate` and `TestReloadReadDoesNotHoldUpShutdown` (a FIFO as
+    `tls.cert_file`, unix only), and `TestOnSignals` with `TestOnSignalsStopDoesNotWaitForAHungCall` (§17).
 - No `sd_notify` in M1: 06's unit uses `Type=exec`, and install.sh polls `isshoni healthcheck --ready`. *Later*:
   `Type=notify` with `READY=1`/`STATUS=` if the unit ever needs it.
 - Restart after a restore or `rotate-secrets`: `Run` returns `ErrRestartRequested` after a full graceful shutdown;
@@ -1181,10 +1217,12 @@ A second SIGTERM/SIGINT exits immediately with code 1. 06 sets systemd `TimeoutS
   `ErrNoReexec`) and when the exec itself failed (the process is still the old one, its server shut down). The
   message says why the server stopped ("after a restore or rotate-secrets, or because it found the public address
   it was waiting for") and to start it again; systemd and Docker do.
-- Tests: the re-exec in a process of its own (`TestReexec`), `serve` as a real process started under the bare
-  name `isshoni` for SIGHUP and for the restarts in place after `rotate-secrets` and after a restore
-  (`TestServeIgnoresSIGHUP`, `TestServeRestartsInPlace`), and `restartInPlace` for every way out, a stop during
-  the shutdown included (`TestRestartInPlace`).
+- Tests: the re-exec in a process of its own (`TestReexec`, and on Linux `TestReexecDeletedBinary`, README S90:
+  a copy of the test binary that deletes itself before it re-execs, so the `/proc/self/exe` fallback runs), `serve`
+  as a real process started under the bare name `isshoni` for SIGHUP and for the restarts in place after
+  `rotate-secrets` and after a restore (`TestServeReloadsOnSIGHUP`, which replaced S65's `TestServeIgnoresSIGHUP`,
+  and `TestServeRestartsInPlace`), and `restartInPlace` for every way out, a stop during the shutdown included
+  (`TestRestartInPlace`).
 
 ### 6.6 Wiring (`internal/server/wire.go`)
 
@@ -1845,9 +1883,9 @@ text above leaves a choice:
 | DTLS handshake (02 sets it) | 10 s |
 | Per-IP key (every row below that says "per IP") | IPv4 address, or the IPv6 /64 (`netx.IPKey`, §7.2) |
 | Pending (unclassified) connections | 1024 total (when full, the oldest pending one is closed), 32 per IP |
-| Open connections per IP on 443/80 | 256 (`limits.conns_per_ip`) |
+| Open connections per IP on 443/80 | 256 (`limits.conns_per_ip`). In off mode the same limit is on `listen.http`, the app's own listener (README S90), except for peers inside `network.trusted_proxies` (by default the loopback proxy of a loopback `listen.http`, §4.4, §8.5): a trusted proxy carries every client of the site, and a per-IP limit on it would be a limit on the whole site. Everyone else who reaches that port directly is counted as on port 80. A connection over the limit is closed at once |
 | ICE-TCP connections per IP | 64 across 443 and 7882 |
-| ICE source addresses per ufrag (review R3) | 64 distinct remote transport addresses (protocol, IP, port) per local ICE ufrag, across UDP and ICE-TCP, every UDP socket and both TCP ports. Pion makes a peer-reflexive candidate for every new source of a valid Binding request and has no cap of its own (02 §12). Only STUN with a USERNAME counts: netx reads its ufrag as Pion's muxes route it, at every UDP socket below the UDP mux and at the first RFC 4571 frame of each ICE-TCP connection (before Pion's TCP mux takes it). From the 65th address on such STUN is dropped (no Binding response, no prflx candidate, no address-map entry) and the ICE-TCP connection closed. A ufrag counts from the first `GetConn`/`GetConnByUfrag` of the Transport's muxes (gathering) until `RemoveConnByUfrag` (close, ICE restart, failed), and a removed ufrag is never counted again: a restart or close cancels Pion's gathering without waiting, so the old ufrag can still reach the muxes after its removal (Pion closes that connection at once and its agent rejects the ufrag's STUN). This relies on Pion never reusing a ufrag (random per agent and restart; the server never sets ICE credentials); netx remembers the last 1024 removed ufrags. STUN for a ufrag the muxes don't serve goes to Pion as before (the UDP mux drops it, the TCP mux holds the connection 30 s at most, within the per-IP limit). Sources are counted before Pion checks MESSAGE-INTEGRITY (netx doesn't know the password): someone who sees a PC's ufrag on the path and spoofs UDP sources can use up its 64 slots; sources already admitted keep working and an ICE restart (new ufrag) starts over. Logged at debug once per ufrag, without the ufrag or address |
+| ICE source addresses per ufrag (review R3) | 64 distinct remote transport addresses (protocol, IP, port) per local ICE ufrag, across UDP and ICE-TCP, every UDP socket and both TCP ports. Pion makes a peer-reflexive candidate for every new source of a valid Binding request and has no cap of its own (02 §12). Only STUN with a USERNAME counts: netx reads its ufrag as Pion's muxes route it, at every UDP socket below the UDP mux and at the first RFC 4571 frame of each ICE-TCP connection (before Pion's TCP mux takes it). Since README F18 it reads it with an allocation-free walk of the attribute list in place (`stunUfrag`), not with `stun.Message.Decode`, which allocated up to 43 bytes per input byte (about 190 KB for one 8 KiB packet); the walk takes and refuses exactly what `Decode` followed by `Message.Get` does (pion/stun v4.0.1), and its tests hold the two together (`FuzzStunUfragDecode`, `TestStunUfragWalk`, `TestStunUfragAllocations`, §17). From the 65th address on such STUN is dropped (no Binding response, no prflx candidate, no address-map entry) and the ICE-TCP connection closed. A ufrag counts from the first `GetConn`/`GetConnByUfrag` of the Transport's muxes (gathering) until `RemoveConnByUfrag` (close, ICE restart, failed), and a removed ufrag is never counted again: a restart or close cancels Pion's gathering without waiting, so the old ufrag can still reach the muxes after its removal (Pion closes that connection at once and its agent rejects the ufrag's STUN). This relies on Pion never reusing a ufrag (random per agent and restart; the server never sets ICE credentials); netx remembers the last 1024 removed ufrags. STUN for a ufrag the muxes don't serve goes to Pion as before (the UDP mux drops it, the TCP mux holds the connection 30 s at most, within the per-IP limit). Sources are counted before Pion checks MESSAGE-INTEGRITY (netx doesn't know the password): someone who sees a PC's ufrag on the path and spoofs UDP sources can use up its 64 slots; sources already admitted keep working and an ICE restart (new ufrag) starts over. Logged at debug once per ufrag, without the ufrag or address |
 | HTTP servers | `ReadHeaderTimeout` 10 s, `IdleTimeout` 120 s, `MaxHeaderBytes` 16 KiB, no server `ReadTimeout`/`WriteTimeout` (WebSocket) |
 | Main server request read deadline | 30 s per request via `http.ResponseController`, except `/ws` (none after the upgrade) and `POST /api/v1/admin/doctor` (3 min, README S85) (§9.3) |
 | Port 80 server | `ReadHeaderTimeout` 5 s, `IdleTimeout` 30 s |
@@ -2033,7 +2071,9 @@ is a 404, never a redirect. The page of step 3 reloads itself every 30 s (`<meta
 sent with `Cache-Control: no-store`. **A server without a site** (ip mode, or manual mode without a domain, that
 found no public address, §6.2) has no origin to redirect to: it answers every other request with the same 503
 page, in manual mode too. The port 80 server speaks HTTP/1.1 only, bounds every exchange at 30 s, and applies
-`limits.conns_per_ip` like the 443 multiplexer (§7.8).
+`limits.conns_per_ip` like the 443 multiplexer (§7.8). In off mode, where `listen.http` serves the app itself (step 2),
+README S90 put the same limit on it, with the trusted proxies of §8.5 not counted: their connections carry every
+client of the site (§7.8).
 
 ### 8.4 Manual mode
 
@@ -2061,9 +2101,10 @@ own (§8.7 lists them with their fix texts), and the readiness check `tls` fails
   next poll finds the second file changed.
 - The two warnings are log lines with a `fix` attribute: the certificate doesn't cover `Site.Hostname` ("browsers
   will show a warning"), and fewer than 14 days are left. Neither touches readiness or `Status.LastError`.
-- `Reload()` returns the load's error, which says what is wrong with the files and how to fix it. `serve` calls it
-  on SIGHUP once the hardening slice handles that signal (§6.5, README S90); until then the 60 s poll is what
-  picks up new files.
+- `Reload()` returns the load's error, which says what is wrong with the files and how to fix it. Since README
+  S90 `serve` calls it on SIGHUP (`Server.Reload`, §6.5), without the server's lifecycle lock held, so a read
+  that hangs can't hold up a shutdown; before S90 the 60 s poll was the only way new files were picked up, and it
+  still is besides the signal.
 
 ### 8.5 Off mode and trusted proxies
 
@@ -2074,6 +2115,8 @@ own (§8.7 lists them with their fix texts), and the readiness check `tls` fails
   without setting it. Client IP = the right-most `X-Forwarded-For` entry that is not itself a trusted proxy. `X-Forwarded-Host` and
   `Forwarded` are ignored; links always use `Site.Origin`.
 - In `auto`, `ip` and `manual` modes all `X-Forwarded-*` headers are ignored.
+- `limits.conns_per_ip` applies to `listen.http` in off mode too (README S90, §7.8), counted by the TCP peer, but
+  not for a peer inside `network.trusted_proxies`: the proxy's connections carry every client.
 - 06 documents example Caddy/nginx configs, including the WebSocket upgrade headers.
 
 ### 8.6 Why there is no self-signed mode
@@ -2242,6 +2285,17 @@ func (g *Gate) ShuttingDown() bool // a nil *Gate is serving
 
 No access log (plan). 5xx responses log one line with `route` (the pattern, not the URL), status and request ID.
 
+**The 503s the server gives on purpose are debug lines** (README S90, `expected503s` in `internal/server/http.go`).
+httpapi's transfer step logs WARN `http request failed` for every 5xx whose cause no handler logged. The router's
+logger in `internal/server` moves that line to debug for two kinds of 503 that clients ask for again and again:
+`GET /readyz` and `GET /healthz` while the server is not ready or is shutting down (a monitor or a load balancer
+polls them, and the reason is logged once by whoever owns it: the TLS manager, the public-address detection, the
+shutdown), and every 503 logged while the shutdown gate is shutting down (step 5's `server_shutdown` for browsers
+that retry, and any other 503 then, a handler's `server_busy` too). Every other 5xx keeps its warning (`server_busy`
+or `push_unavailable` outside a shutdown, an error of a handler). The rule keys on httpapi's message, its `route`
+and `status` attributes as they are, and the gate's state (`Gate.ShuttingDown`), which `TestExpected503sAreQuiet`
+pins; httpapi itself did not change.
+
 ### 9.4 Error envelope
 
 Every JSON error from any `/api` route uses 03's envelope and code table (03 §12.2; `api.Error`, `api.StatusOf`):
@@ -2382,10 +2436,56 @@ Rules:
   `sdp`, `offer`, `answer`, `candidate`, `endpoint` or ends in `_token` are replaced with `[redacted]`, whatever
   their type.
 - **No SDP**: our code never logs signaling payloads. The pion bridge maps pion levels to slog (trace/debug → debug),
-  defaults to warn, rate-limits each scope to 20 lines per minute ("N messages suppressed"), and drops any message
-  containing `a=` lines or `candidate:`. Its two users go further: the SFU's and netx's Pion loggers log Pion's
-  info lines at debug, the SFU also Pion's warnings and errors that hold an address, and netx its muxes' warnings
-  (02 §13, §7.3 here).
+  defaults to warn, rate-limits each scope to 20 lines per minute, and drops any message containing `a=` lines or
+  `candidate:`. Its two users go further: the SFU's and netx's Pion loggers log Pion's info lines at debug, the SFU
+  also Pion's warnings and errors that hold an address, and netx its muxes' warnings (02 §13, §7.3 here).
+- **The limiter's own lines have the level of the lines they stand for** (README F20, `logx/ratelimit.go`). A
+  scope's window is a fixed minute that starts with its first line after the previous one ended. The first line
+  the window drops logs "further messages suppressed" (with `suppressed_until`, the window's end) at that line's
+  level, and a later dropped line whose level is higher than that of every line dropped before it in the window
+  says so again, at its own level: at most one notice per level and window, so a burst of debug lines says so at
+  debug and a warning dropped after it says so at warn. The dropped lines are counted, and the count, "N messages
+  suppressed" (attribute `suppressed`), is logged with the scope's first line after the window, at the highest
+  level among them. The budget is one per scope across levels: at `log.level = debug` Pion's debug lines can use
+  up a scope's 20 lines, and a warning after them is then dropped. That stays as it is; the notice at warn says
+  that a warning was dropped.
+- **An ICE password in a message's text** (README F20 in logx's Pion bridge; README S90's net in
+  `internal/server/logsafety.go` as a second layer). The attribute net above can't see a credential inside the
+  text of a library's message, and the log canary (§17) found one: Pion's ICE agent writes the remote ICE password
+  at debug when it starts (`Started agent: … remoteUfrag: "…", remotePwd: "…"`, pion/ice v4.4.7), through the
+  SFU's and netx's Pion loggers. That is SDP's `a=ice-pwd`, which is never logged. **The Pion bridge redacts before
+  it writes**, at every level and through every method, in each line its limiter lets through
+  (`redactCredentials`, `logx/pion.go`):
+  - a **named password**: a name that ends in `pwd`, `password`, `passwd` or `credential`, or their plural (any
+    case, after any letters, digits and `_`: `remotePwd`, `localPwd`, `icePwd`, the `pwd` of `ice-pwd`, a struct's
+    `Password` field as `%+v` prints it, a JSON key, a TURN server's `Credential`), then `:` or `=`; its value
+    becomes `[redacted]` inside the quotes it had (`"…"` with Go's escapes, `'…'` or `` `…` ``), and a value without
+    them (an escaped JSON quote counts as none) up to the next space, comma, semicolon, `&` or closing bracket;
+  - the password of a **ufrag:password pair**: in a run of ICE characters (letters, digits, `+` and `/`) and colons,
+    a part of at least 22 characters that follows a part of at least 4 (RFC 8445's lengths for a password and a
+    ufrag) becomes `[redacted]`. A ufrag is no secret (every connectivity check carries it in the clear) and stays.
+    The parts of addresses with ports, fingerprints and times are shorter. The rule is a heuristic that leans
+    toward redacting: a URL whose scheme has 4 or more letters (`http`, `https`, `stun`, `turn`) looks like a pair
+    when what follows the scheme's colon (the `//`, the host and the path, up to the next colon or the first dot,
+    `-`, `_`, `?` or other character that is not an ICE character) has 22 or more characters, and that whole part
+    is redacted: `http://localhost/api/v1/rooms/abc` becomes `http:[redacted]`, and a `turn:` URL with a long
+    dotless host loses the host. A port and the path after it make such a part too
+    (`http://localhost:8080/api/v1/rooms/abcdefgh` becomes `http://localhost:[redacted]`).
+
+  `server.New` still wraps the logger it is given in README S90's handler, which replaces the value of `remotePwd`,
+  `localPwd`, `ice-pwd` (or `icePwd`) or a bare `pwd` (any case, quoted or not, after `:` or `=`) by `"[redacted]"` in
+  every record's message and keeps its attributes, so every part the server builds logs through it. Since README
+  F20 it is a second layer, for a message that reaches the server's logger some other way: F20's review found that
+  the log canary passes with it turned off.
+- **The standard log package** (README S90, `cmd/isshoni/stdlog.go`). A few lines of certmagic's bypass zap and go
+  to Go's `log` package (a panic in one of its workers, an error of its challenge servers, an OCSP staple it can't
+  delete); without a route they reached the journal as plain text among the JSON lines. `serve` routes `log` into
+  its own logger from the moment that logger is built (`forbidigo` keeps `log.*` out of `internal/server`, so the
+  route is in `cmd/isshoni`), one record per line, component `stdlog`. The level comes from the prefix: `[ERROR]`
+  and a `panic:` line are errors, `[WARNING]` and `[WARN]` warnings, `[INFO]` info, `[DEBUG]` debug, and a line
+  without one is a warning. Like the Pion bridge it drops a line that looks like SDP or holds a candidate (with a
+  debug line that says so) and lets 20 lines a minute through; the rest are counted and reported once ("N lines of
+  the standard log were suppressed", at warn). The previous output, flags and prefix come back when `serve` returns.
 - **No access logs.** Security events (rate-limit hits, login failures) may carry `remote_ip`; 03's audit log in the DB
   holds the durable record (30-day pruning).
 - **Attribute names**: `component` (e.g. `tls`, `netx`, `push`, `sfu`, `signal`, `store`), `user_id`, `room_id`,
@@ -2577,6 +2677,14 @@ func (t *Transfer) Alerts() []api.Alert             // transfer.80 or transfer.1
   flush at a month's end that the store refuses is remembered with the counter's reading at that moment, and
   every later flush stores what is owed to that month before anything else, in order, so the bytes never move
   into the new month. Several months can be owed. `Info` leaves the owed bytes out of the new month's total.
+- **A tick that the stop cuts short is a normal stop** (README F20). When `Run`'s context is cancelled (step 6 of
+  §6.4) while a tick's store calls are under way, they fail with `context.Canceled`; a server that stops right
+  after it starts does so in its first tick, which reads the month's row. The tick then logs, only if a call
+  failed, the debug line "transfer flush cut short by the stop; the last flush follows", skips the alert check,
+  and the alert memory's read and write (`loadSent`, `rememberSent`) log no warning for a cancelled context
+  either. `Run`'s last flush, on a context of its own, stores what the tick could not, and warns if the store
+  fails then. A store call that runs out of its own time while the server runs (`context.DeadlineExceeded`)
+  is a failing store and still warns.
 - **`Info`**: the month's totals including the bytes not flushed yet, `alertGb`, the projection and the current
   rate. The rate is the average over the last 5 s (the counter is sampled every second). The projection is `mtd ×
   the month's length / the time elapsed`, with the elapsed time as a fraction of days, so it does not jump at
@@ -3329,7 +3437,7 @@ templates live in `messages_en.go` for the CLI; 05 renders the same codes from i
 | `data_dir` | Exists, owned by the service uid, 0700, free space; in a container: is a mount (§5.1) | free < 1 GB; mode wider than 0700 | not writable; ephemeral in a container |
 | `secrets` | Present, 0600, parseable | mode wider (server fixes it) | unreadable or corrupt |
 | `schema` | DB schema vs binary (offline: through `DBFiles`, §13.1) | – | newer than binary (the server refuses to start; the fix is 03's message plus the restore command for the environment, from the same formatter as §6.1 step 4) |
-| `public_ip` | Detection result, method and NAT kind (§7.4) | `port_forward` ("forward TCP 80, 443, 7882 and UDP 7882 to {local}"); IPv6 missing (`info`); `ip` mode on provider `aws` or `gcp` (§13.3), otherwise ok (`info`, code `public_ip.ephemeral`): "The default public IPv4 changes on stop/start; in IP mode that moves the server's address and breaks every link, installed app and push subscription. Attach an Elastic IP (AWS) / reserve a static external IP (GCP), or use a domain", the same advice as 06's `/install/vps#aws` and `#gcp` | `symmetric`, `cgnat_likely`, or no public IPv4/IPv6 |
+| `public_ip` | Detection result, method and NAT kind (§7.4) | `port_forward` ("forward TCP 80, 443, 7882 and UDP 7882 to {local}"); IPv6 missing (`info`); `ip` mode on provider `aws` or `gcp` (§13.3), otherwise ok (`info`, code `public_ip.ephemeral`): "The default public IPv4 changes on stop/start; in IP mode that moves the server's address and breaks every link, installed app and push subscription. Attach an Elastic IP (AWS) / reserve a static external IP (GCP), or use a domain", the same advice as 06's `/install/vps#aws` and `#gcp` | `symmetric` (not a container's bridge, below), `cgnat_likely`, or no public IPv4/IPv6 (an address only this machine reaches, such as `127.0.0.1`, is none; below) |
 | `dns` | `auto`/`manual` with domain: A/AAAA via the system resolver vs public IPs; CAA allows `letsencrypt.org` | AAAA present but not this server | no A/AAAA, or A points elsewhere |
 | `tls` | Mode, names, issuer, `not_after`, next renewal, last ACME error code (§8.7) | no cert yet and at least one ACME attempt has failed (from the first failure, not after 10 min: `fixCode` = `Status.LastErrorCode`, `fix` = its §8.7 fix text, so install.sh's doctor output at its 180 s timeout names the cause); renewal failing but cert valid; manual cert < 14 days | no cert after 10 min (with the same `fixCode`/`fix` when an attempt failed); expired; key mismatch |
 | `clock` | Linux `adjtimex` `STA_UNSYNC` flag (no network); in `auto`/`ip`, skew vs the `Date` header of the ACME directory. If `adjtimex` fails with EPERM or ENOSYS (systemd `ProtectClock=`/`SystemCallFilter=` in 06's unit, or a container seccomp profile), the sync flag is reported as unknown (no warn) and only the skew check against the ACME directory's `Date` header decides; in `manual`/`off` mode without that check the status is `info` | not synchronized, or skew 30 s–5 min | skew > 5 min |
@@ -3372,6 +3480,66 @@ The table has no column for `skip`. Besides the four `skip.*` codes, a check's o
 cases: `udp_buffers.unknown` (above) and `public_ip.loopback` (README F04: `public_ip` on a development server,
 below), which carries no params and no fix code. 05's catalog renders it as `doctor.public_ip.loopback` like every
 other code (the Doctor page is README S91's, 05 §15.3).
+
+**Two rules of `public_ip`, as README F21 decided them** (README S90's report, recorded in README §6 "Decided after
+group 13" (2) for review). As group 13 merged it, a Docker bridge container reported `public_ip.symmetric`, a fail,
+whenever its outbound NAT mapped each STUN server to its own port (Docker Desktop's user-space NAT always does), and a
+configured literal `public_ip = "127.0.0.1"` (the smoke override of `deploy/docker/test`) was the server's public
+address ("127.0.0.1 (set in the config)"), then judged by the NAT kind. Both rules changed
+(`ops/doctor/checks_net.go` `checkPublicIP`, `publicAddrs`; the texts in `messages_en.go`):
+
+- **(a) In a container on a bridge network, symmetric NAT is no failure.** Friends reach the server on the ports the
+  runtime publishes on the host, and the server advertises its public address with the container's own port numbers
+  (§7.5's rule for a Docker bridge; the `container` check holds the operator to publishing them under the same
+  numbers). Every media flow starts with the browser's packet to such a port, and the server's answers, its ICE
+  checks on that pair included, go back through the same mapping, so the bridge's NAT kind for connections that
+  start inside the container decides nothing: Docker's own NAT on Linux keeps ports, Docker Desktop's and rootless
+  Docker's user-space NAT gives each destination its own port, and the published ports work the same with both.
+  STUN's reading from inside the container is therefore judged as a container's 1:1 NAT already was (§7.4):
+  `public_ip.ok` (or `no_ipv6`, `ephemeral` as anywhere), with the measured `nat` (`symmetric`) and the param
+  `dockerBridge: true`, and the CLI adds the line "the container's bridge network gives each outgoing connection its
+  own port (symmetric NAT), which doesn't matter here: friends reach the published ports". The rule needs the
+  `container` check's `bridge` (the default route's interface is a veth end, §13.2 `container`); on the host's
+  network, in a container whose network doctor can't tell, and outside a container, symmetric NAT is the NAT in front
+  of the machine and stays `public_ip.symmetric`. What doctor can't see from inside a bridge is a router in front of
+  the host: a home router with a port-preserving NAT already read as the container's 1:1 NAT before F21, and a
+  symmetric one now reads the same; the browser's connection test (§7.7) checks from outside. `cgnat_likely` is
+  unchanged.
+- **(b) An address that only this machine can reach is no public address.** A loopback address (`127.0.0.0/8`,
+  `::1`) or the unspecified one (`0.0.0.0`, `::`), which config accepts as a `public_ip` or `public_ipv6` literal
+  outside ip mode (§4.5) and the server advertises as it is given, is left out of the run's public addresses
+  (`publicAddrs`, with a running server and offline alike) and named in the param `unreachable` (a list). So
+  `public_ip` judges the server as one without it, whatever the NAT kind: `public_ip.none` (fail) when it was the
+  only address, `ipv6_only` or `no_ipv6` when the other family has a public one. The NAT kind is the IPv4 path's
+  (§7.4), so with the IPv4 address left out it stands in front of no public address, and neither `symmetric` nor
+  `cgnat_likely` fails the check (`publicState.v4Unreachable`); an IPv4 address that was simply not found keeps its
+  kind, and `cgnat_likely` without an address is still `public_ip.cgnat`. And `dns` has no address to compare
+  the records with (`dns.unverified` for a record, `dns.missing` without one; never `dns.ok` for a record that
+  points at `127.0.0.1`, nor `dns.wrong`). Such a server is ready (it has the address it was given), so the CLI's
+  `none` text says what it is instead of "not ready": "no public IP address: 127.0.0.1 can only be reached from this
+  machine", then "the site opens, but friends can't share or watch: media has no public address to offer", or, where
+  the site is that address, "the site is at that address too, so only this machine can open it". The fix
+  `public_ip.fix_set` names the key without the domain and the late network: "set public_ip to this server's public
+  address, or to auto to detect it, then restart isshoni: sudo systemctl restart isshoni" (Docker: "set
+  ISSHONI_PUBLIC_IP in .env to this server's public address, or leave it empty to detect it, then run docker compose
+  up -d"). A private address (`192.168.1.20`, a LAN setup) is still the server's address.
+- **No new code.** Both rules use the codes above, so 05's catalog has a text for each; its texts don't know the
+  params yet (the Doctor page shows `public_ip.ok` without the bridge line, and `public_ip.none` with the words of
+  the address that wasn't found), which is a follow-up for 05 §15.3.
+- **Tests** (`ops/doctor/publicip_test.go`): `TestPublicIPBridgeSymmetric` (a running server: symmetric NAT in a
+  bridge is `ok`, `no_ipv6` or `ephemeral` with `dockerBridge`; on the host's network, with the network unknown,
+  outside a container it stays a failure; 1:1 NAT and `cgnat_likely` are unchanged; every case also asserts the
+  network that the `container` check sees, so the `cgnat_likely` case runs in a bridge and a case can't lose its
+  setup), `TestPublicIPBridgeSymmetricOffline` (doctor's own detection with two STUN servers that see two ports),
+  `TestPublicIPUnreachable` (`127.0.0.1`, any loopback, `0.0.0.0`, `::1`, both families, the site at that address,
+  in a container, with a public address of the other family, `127.0.0.1` with a public IPv6 address and `symmetric`
+  or `cgnat_likely`, no IPv4 found with `cgnat_likely`, which stays `public_ip.cgnat`, and a private address that
+  stays), `TestPublicIPUnreachableOffline`, `TestDNSWithUnreachablePublicIP` and `TestOnlyThisMachine`.
+- **CI's docker-smoke asserts doctor per code** in the bridge and the host setup (06 §11.3, the step `doctor`), with
+  an allow-list for what the test's setup and the runner can't give. The step's two lists pin this package's checks
+  and codes; `TestDockerSmokeExpectations` (`ops/doctor`) holds them to the package on every Go change (06 §11.3).
+  "doctor reports ok in the Docker bridge and host setups" stays a manual check on a Linux host with a real address
+  (§17 "Manual"): the smoke overrides have no public address and a test domain that resolves nowhere.
 
 Fix codes: `config.fix_check`; `data_dir.fix_sudo`, `fix_owner`, `fix_not_dir`, `fix_mount`, `fix_mode`,
 `fix_space`; `secrets.fix_sudo`, `fix_owner`, `fix_restore`, `fix_mode`; `schema.fix_sudo`, `fix_restore` (03's
@@ -4011,16 +4179,18 @@ no tokens, SDP, push endpoints or usernames.
 | `netx` transport | Counting `PacketConn` keeps `AddrPortReaderWriter`; byte counts match; port 0 reuse; interface filter globs; buffer read-back and the one warn line when it is below target; 7882/tcp per-IP ICE limit shared with 443 (65th connection across both closed, also from different addresses in one /64); `Advertised` holds post-rewrite addresses with `Via` `udp`/`tcp443`/`tcp7882`, and equals the candidates of a real pion offer; with `include_loopback` and `ipv6`, `::1` is advertised for UDP only (no `tcp` entry, no `tcp6` type from it alone, `IPFilter` drops it; §7.6); a setter called after `Apply` wins |
 | `netx` public IP | Fake STUN (pion/stun) + fake interfaces: each row of §7.4's table; timeouts; literal config skips STUN for the result |
 | `netx` rewrite | Rules/filters for each row of §7.5 (direct, 1:1 NAT, Docker bridge, home LAN Append, IPv6 literal) |
-| `netx` source guard (README F06, §7.3, §7.8; `srcguard_test.go`) | The counts (`TestSourceGuardCounts`: 64 distinct sources per known ufrag, a source admitted once costs nothing again, a UDP and a TCP source on one address and port are two, ufrags count apart, an unknown ufrag passes, a forgotten ufrag's count is gone for good, an ICE restart's new ufrag starts at zero); removed ufrags never known again (`TestSourceGuardRemovedUfrags`); `TestCanonicalSource`; the parsing (`TestStunUfrag`, `TestAdmitUDP`: only STUN with a USERNAME is judged; `TestFirstFrameGate`: the first frame and what follows byte for byte however Pion reads it, unless it names a ufrag past its limit or is too long); the acceptance through a real Pion agent, 1000 sources over UDP on two sockets (`TestSourceGuardUDPAgent`) and over ICE-TCP on 7882, 443 and both (`TestSourceGuardTCPAgent`): 64 responses and 64 peer-reflexive candidates, nothing for the rest; `TestSourceGuardRemoveConnByUfrag`, `TestSourceGuardNormalClient` (a client with host and server-reflexive candidates in both families is refused nothing) and `TestSourceGuardRestartWhileGathering`. **Fuzz targets** (README F14, `srcguard_fuzz_test.go`, seeds in `testdata/fuzz`): `FuzzStunUfrag` (for any packet, `stunUfrag` returns the ufrag Pion's UDP mux routes it by, or nothing when the mux doesn't route it by ufrag, without changing the packet and within its allocation bound, and `admitUDP` counts the source exactly then) and `FuzzFirstFrameGate` (whatever a connection sends and however it arrives, the gate takes no more than the first frame and allocates within its bound, refuses a frame over `maxFirstFrame` or one Pion would route to a known ufrag with no slot left for the address, fails a stream that ends inside the first frame, and otherwise hands the reader every byte and has counted the address). The allocation bound is linear: 48 bytes per input byte for `stunUfrag`, which decodes the message as Pion's muxes do, plus a constant; two seeds with 14593 and 16381 attributes, all empty but a USERNAME, pin its worst case (43.3 bytes per byte measured) in every `go test`. **`TestPionRoutesLikeReference`** sends every seed through a real Pion UDP mux and TCP mux and checks that each reaches its ufrag's connection exactly when the targets' reference (`pionUfrag`, `pionTCPTakes`, a copy of pion/ice v4.4.7's routing) says so, so a pion/ice update that changes the routing fails here first |
+| `netx` source guard (README F06, §7.3, §7.8; `srcguard_test.go`) | The counts (`TestSourceGuardCounts`: 64 distinct sources per known ufrag, a source admitted once costs nothing again, a UDP and a TCP source on one address and port are two, ufrags count apart, an unknown ufrag passes, a forgotten ufrag's count is gone for good, an ICE restart's new ufrag starts at zero); removed ufrags never known again (`TestSourceGuardRemovedUfrags`); `TestCanonicalSource`; the parsing (`TestStunUfrag`, `TestAdmitUDP`: only STUN with a USERNAME is judged; `TestFirstFrameGate`: the first frame and what follows byte for byte however Pion reads it, unless it names a ufrag past its limit or is too long); the acceptance through a real Pion agent, 1000 sources over UDP on two sockets (`TestSourceGuardUDPAgent`) and over ICE-TCP on 7882, 443 and both (`TestSourceGuardTCPAgent`, which since the PR #22 fix after group 13 dials again when a connection gets the local address of a source already admitted: Linux may give connections to the server's two ports the same local port, and the guard rightly counts that address once): 64 responses and 64 peer-reflexive candidates, nothing for the rest; `TestSourceGuardRemoveConnByUfrag`, `TestSourceGuardNormalClient` (a client with host and server-reflexive candidates in both families is refused nothing) and `TestSourceGuardRestartWhileGathering`. **Fuzz targets** (README F14, `srcguard_fuzz_test.go`, seeds in `testdata/fuzz`): `FuzzStunUfrag` (for any packet, `stunUfrag` returns the ufrag Pion's UDP mux routes it by, or nothing when the mux doesn't route it by ufrag, without changing the packet and, since README F18, without allocating: `testing.AllocsPerRun` is 0 for every input; and `admitUDP` counts the source exactly then) and `FuzzFirstFrameGate` (whatever a connection sends and however it arrives, the gate takes no more than the first frame and allocates within its bound, refuses a frame over `maxFirstFrame` or one Pion would route to a known ufrag with no slot left for the address, fails a stream that ends inside the first frame, and otherwise hands the reader every byte and has counted the address). The gate's bound is 2 bytes per byte it took from the connection (its copy of the frame) plus 4 KiB; before README F18 it was 50 per byte, because `stunUfrag` decoded the message as Pion's muxes do. **README F18 made `stunUfrag` an allocation-free walk of the attribute list held to `Decode`** (§7.8): `FuzzStunUfragDecode` is the differential target (for any packet, alone and behind a STUN header whose length covers it, `stunUfrag` returns exactly what the decoding version, `stun.Message.Decode` then `Get(AttrUsername)`, returns: nothing, or the same part of the packet; its seeds are every packet of the other two targets' corpora and the walk's table, each also as a bare attribute list, plus five committed files in `testdata/fuzz/FuzzStunUfragDecode`); `TestStunUfragWalk` pins the rules of the walk on a table that both versions must agree with (the header's length bounds the message, every attribute with its padding lies inside it, the first USERNAME that `Decode` keeps counts, none after MESSAGE-INTEGRITY or MESSAGE-INTEGRITY-SHA256), so it fails when an update of pion/stun changes them; and `TestStunUfragAllocations` finds no allocation for the seeds, for the two longest attribute lists a STUN header allows (14593 and 16381 attributes, all empty but a USERNAME, where `Decode` allocated 43.3 bytes per byte), for an 8 KiB packet of empty attributes (about 190 KB with `Decode`), nor in `admitUDP`. **`TestPionRoutesLikeReference`** sends every seed through a real Pion UDP mux and TCP mux and checks that each reaches its ufrag's connection exactly when the targets' reference (`pionUfrag`, `pionTCPTakes`, a copy of pion/ice v4.4.7's routing) says so, so a pion/ice update that changes the routing fails here first |
 | `tlsmgr` | Manual: load, reload on file change and SIGHUP, bad new pair keeps the old, key mismatch, expiry warning; `HTTPHandler`: ACME path passthrough, 503 while not ready, 308 to config host (ignores request Host), off-mode passthrough; ACME problem → hint code table |
 | `httpapi` | Middleware order; read deadline: a request body trickled past it (shortened in tests) is cut, and `/ws` has no deadline after the upgrade; security headers per response type (`/sw.js` carries the HTML CSP, with `connect-src` including `'self'`; other non-HTML files carry `default-src 'none'`); HSTS only with domain+TLS; host check incl. dev localhost; trusted-proxy XFF (right-most untrusted) and ignoring XFF in non-off modes; error envelope; `DecodeJSON` limits; SPA table of §9.5 (asset 404, dotted path 404, deep link → index 200, `/setup` → 404 via hook, ETag/304, `.br` negotiation, MIME types without `/etc/mime.types`) |
-| `logx` | `Secret` redacted in text and JSON handlers, every fmt verb except `%p` and `%w` (fmt prints both raw; vet rejects only `%w`), `json.Marshal`; `ReplaceAttr` key list; pion bridge drops SDP-like lines and rate-limits; format auto-detection |
-| `ops` | Health state machine (starting → ready → shutting_down); conntest function (transport validation, `transport_disabled` with `params.transport` for each transport without a listener, per-user rate limit, `sfu.probe_limit` → 429, `publicIp` `""` without a public IPv4, `container` value) with a fake `Prober`; transfer flush, month rollover at UTC midnight, 80/100 % alerts once; release parser (drafts, prereleases, semver order, security marker, ETag 304); dashboard JSON golden file |
+| `logx` | `Secret` redacted in text and JSON handlers, every fmt verb except `%p` and `%w` (fmt prints both raw; vet rejects only `%w`), `json.Marshal`; `ReplaceAttr` key list; pion bridge drops SDP-like lines and rate-limits; format auto-detection. README F20's (§10): `TestRedactCredentials` (redacted: the named passwords of Pion's `Started agent` line, of `ICEParameters` printed with `%+v` and as JSON, a TURN server's `Credential`, `ice-pwd` and `localPwd`, quoted, unquoted and escaped, and ufrag:password pairs, with passwords of Pion's, Chrome's and Firefox's lengths; kept: Pion's other lines, STUN usernames, addresses with ports, fingerprints, times and URLs), `TestPionRedactsAtEveryLevel` (every method of the bridge redacts and keeps the line's level), `TestPionRedactsICEAgentPassword` (a real pion/ice agent on the bridge at debug: its `Started agent` line comes and holds neither password, so a pion/ice that stops logging it fails here), `TestPionRateLimitLevels` and `TestLineLimiterLevels` (the notice at the dropped line's level and again for a higher one, the count at the highest). The package has a `goleak.VerifyTestMain` (`main_test.go`), since the agent test starts pion/ice's goroutines |
+| `ops` | Health state machine (starting → ready → shutting_down); conntest function (transport validation, `transport_disabled` with `params.transport` for each transport without a listener, per-user rate limit, `sfu.probe_limit` → 429, `publicIp` `""` without a public IPv4, `container` value) with a fake `Prober`; transfer flush, month rollover at UTC midnight, 80/100 % alerts once; `TestTransferStopInFirstTick` (README F20, §11.3: a stop during the first tick's `AddTransfer`, `TransferMonth`, `Meta` or `SetMeta` logs no WARN, sends no alert, and the last flush stores the bytes; a store call that timed out while the server ran still warns); release parser (drafts, prereleases, semver order, security marker, ETag 304); dashboard JSON golden file |
 | `ops` admin | Peer-cred filter (injected creds); every endpoint via `httptest` over a real unix socket (short path under `/tmp`: macOS `sun_path` is 104 bytes); backup tar layout and manifest; offline backup falls back to raw files only when `BackupFile` fails; restore validation rejects traversal, symlinks, extra names, bad hashes, and (through `InspectFile`, whatever the manifest says) a newer schema, a history mismatch or a failed integrity check; offline commands exit 7 while the data-directory lock is held; swap crash recovery from each `plan.json` state; old WAL never next to the new DB |
 | `doctor` | Each check with fake FS/resolver/STUN/clock/DMI; `tls` with no certificate is `warn` with `fixCode` = the §8.7 code right after one failed ACME attempt and `fail` after 10 min; `public_ip` in `ip` mode with DMI `aws`/`gcp` adds the `public_ip.ephemeral` info (not in `auto` mode or on other providers); `clock` with a fake `adjtimex` returning EPERM (sync unknown, no warn; skew check decides; `info` in `manual`/`off`); provider table; bandwidth numbers (plan example 10.53 Mbps/viewer and 105 Mbps; exit scenario 41.5 Mbps); JSON golden; text render; exit codes 0/5 and `--strict` |
 | `push` | `ValidateEndpoint` table (http, :8443, userinfo, IP literal, localhost, 10/8, [::1], fd00::/8, 169.254.169.254, 100.64/10, name resolving private → `push_endpoint_rejected` with the right `reason`; also the order of the reasons for an endpoint that breaks several rules, the IPv4 spellings `2130706433`, `127.1` and `0x7f.0.0.1`, a host that is no DNS name, an empty port, the server's own address, and a fuzz target for the URL rules: §14.5); `Control` blocks a rebinding resolver and any port but 443; no redirects followed; the result table per status (every 2xx ok; 3xx and other 4xx an error without a retry; 408 retried; a `Retry-After` over 60 s and a wait past the TTL end the retries); `push.test` is not rate-limited per recipient; `New` with `Enabled: false` → `ErrDisabled`; `DeriveSubject` (an `http://` origin becomes `https://`); recipient filter passed to the store (sharer and `PresentUserIDs` excluded, `Pref`); `admin.alert` payload per 03 alert kind; VAPID fingerprint change deletes all subscriptions before `push.New` returns; dedup window; per-recipient bucket; 404/410/401/403 prune; 429 retry with `Retry-After`; payload < 1 KB; round trip through a fake push service that **decrypts** `aes128gcm` with the test subscription's private key and checks the VAPID JWT (`aud`, `exp`, `sub`) |
 | `version` | Build with `-ldflags -X …` in a test and check `isshoni version --json`; BuildInfo fallback |
 | `cmd/isshoni` | `testscript` (rogpeppe/go-internal, test-only): every subcommand's usage, exit codes (incl. healthcheck 0/1 only), a permission case run as a non-root uid that is not the server's (a socket directory it can't enter, and a server whose peer-cred filter rejects it): `setup-url` and `admin status` exit 4 with the `sudo` message, `doctor` prints it and runs no offline checks (skipped when the tests run as root), `--json` shapes, confirmation prompts and `--yes`, the no-TTY refusal without `--yes` (exit 2, printing the `--yes` command in the systemd form and, with container detection faked, the `docker compose exec -T` form), container `--out` requirement, `admin backup --out -` refused with exit 2 and the umask Docker form when stdout is a terminal (testscript `ttyout`) |
+| `internal/server` hardening (README S90) | The reload (§6.5): `TestReloadLogLevel` (the reloaded level becomes the configured one, a level set with `admin log-level --for` stays until it ends and then falls back to the reloaded one, the changed keys are named, a config with errors changes nothing), `TestReloadBeforeStart`, `TestReloadManualCertificate` (new files serve; unusable ones are refused, the old pair serves, `Reload` returns the error) and `TestReloadReadDoesNotHoldUpShutdown` (unix: a FIFO as `tls.cert_file`, the shutdown goes on while the read hangs); `TestExpected503sAreQuiet` (§9.3: a not-ready `/readyz` and the shutdown's 503s are debug lines, every other 5xx keeps its warning); `TestOffModeConnectionLimit` (§7.8: `limits.conns_per_ip` on off mode's `listen.http`, trusted proxies exempt); `TestRedactMessage` and `TestSafeLogger` (§10: the ICE password in a message's text, in the forms Pion and SDP write it, for every logger derived from the server's, attributes kept; a second layer since README F20 redacts in logx's Pion bridge) |
+| `cmd/isshoni` serve (README S90) | `TestServeReloadsOnSIGHUP` (`serve` as a real process: SIGHUP loads the config again from the flags, environment and file, applies `log.level`, names the other changed keys, a broken file changes nothing and names none, and the process never stops for the signal); `TestOnSignals` and `TestOnSignalsStopDoesNotWaitForAHungCall` (a hung reload delays the exit by at most 1 s); `TestRouteStdLog` (the standard log package's lines become JSON records with a level from their prefix and the component `stdlog`, and its settings come back afterwards) and `TestStdLogWriterLimits` (no SDP or candidate, 20 lines a minute) |
 
 ### Integration (in-process, `servertest`)
 
@@ -4042,7 +4212,12 @@ no tokens, SDP, push endpoints or usernames.
   answer that connects through the 443 multiplexer (README S80, `TestConnTestOverTLS`; §7.7 lists the others). The
   browser e2e harness runs in off mode only, so this Go test is the only `tcp443` probe check (05 §19.3).
 - **Graceful shutdown**: connected clients receive `server.shutdown`, `error{server_shutdown}` and close code 1012
-  within 2 s; REST gets 503 `server_shutdown`; `Run` returns within `shutdown_timeout`; goleak clean.
+  within 2 s; REST gets 503 `server_shutdown`; `Run` returns within `shutdown_timeout`; goleak clean. As README S90
+  wrote it (`TestShutdownWhatClientsSee`): SIGTERM (`Run`'s context ends) stops a server with two people in the
+  Lounge, one of them sharing; readiness says `shutting_down` at once, every REST call and new WebSocket gets 503
+  `server_shutdown` with `Retry-After: 5`, every connection gets `server.shutdown` and the `server_shutdown` error
+  and is closed with 1012 within 2 s, and `Run` returns well within `shutdown_timeout`, with nothing forced and no
+  warning of the server's own (the machine's own warnings, `hostWarning`, aside).
 - **Refusing to start**: seed a DB with a newer schema → `serve` exits 78 and prints 03's message with the backup
   name, followed by the restore command for the environment; `admin restore --offline <pre-*.db>` → the next `serve`
   starts. A `store.Open` error without `store.ErrNeedsOperator` → exit 1. A container without a data mount (fake
@@ -4078,10 +4253,40 @@ no tokens, SDP, push endpoints or usernames.
 - **Log canary**: run the full flow at `debug`, capture logs, assert that no token, SDP line (`a=`), `candidate:` or
   push endpoint appears.
 
+  As README S90 wrote it (`TestLogCanary`, `internal/server/canary_test.go`; skipped with `-short`). The flow of an
+  evening against an off-mode server that logs at debug, with two browsers behind the operator's proxy (each request
+  carries a documentation-range client IP in `X-Forwarded-For`): setup, a logout, a login with a wrong password and one
+  with the right one, an invite, the member's sign-up, a password reset the admin hands out and a password change, Web
+  Push (both subscribe, the admin sends a test), signaling and media (the admin shares with a label, the member
+  watches), the connection test, a second connection of the member that drops and one that resumes it with its token,
+  the operator's commands over the admin socket, the member's sign-out, and one security event (a WebSocket from another
+  site's page, refused by the Origin check). Then the log is searched for: every secret at any level (the setup, invite
+  and reset tokens, the passwords, the session cookies, the resume token, the keys of `secrets.json`, a push
+  subscription's keys, every ICE password of the session descriptions), SDP and candidates (their attribute lines and
+  markers), a push endpoint beyond its host, the usernames and the share label; and a client's address, its IP or the
+  local ICE transport address of a PeerConnection's selected pair, in any line at info or above, except as the
+  `remote_ip` of a security event at warn (01 §17, 03 §7.3), which carries it there and nowhere else. **What the canary
+  allows**: Pion's own warnings (they carry the attribute `scope`), which the SFU keeps at warn when they name no
+  address (02 §13). Two come with every PeerConnection in a normal evening, at `log.level = info` as well: "Failed to
+  ping without candidate pairs. Connection is not possible yet." (scope `ice`) at its start, and "Failed to accept RTP
+  stream is already closed" with its RTCP twin (scope `pc`) when it closes, so the journal has warnings for every share,
+  every viewer and every probe; "Incoming unhandled RTCP ssrc(…), OnTrack will not be fired" comes now and then. Their
+  number depends on timing and on logx's limit per scope, so the canary doesn't count them but holds them to the same
+  content rules as every other line. The machine's own warnings are allowed too (`hostWarning`: UDP socket buffers below
+  `network.udp_buffer_bytes`, a slow write transaction of the store, the container data-volume check turned off), and
+  client addresses at debug, where Pion's ICE lines name the pairs it checks: debug is for an operator who looks for a
+  problem, for a while. It found the ICE password in Pion's "Started agent" line, which logx's Pion bridge redacts
+  since README F20, with the server's safety net as a second layer (§10).
+
 ### End-to-end (Playwright harness from 05; assertions owned here)
 
 - TCP-only viewer (`tcp-only.spec`): its own server (05's `startServer` fixture) with `listen.ice_udp = ""`; Chrome
-  viewer plays (`framesDecoded > 0`) and the selected candidate pair is TCP.
+  viewer plays (`framesDecoded > 0`) and the selected candidate pair is TCP. As README S90 wrote it: in off mode
+  there is no 443 multiplexer, so the TCP is `listen.ice_tcp` (7882 in production); the friend's stage keeps
+  decoding, its sub PC is `connected` with transport `tcp`, and the sharer's pub PC is checked in the server's log
+  (README S90 wrote it before README S93 added the pub PC to the page's stats, 05 §10.7): the SFU's
+  `PeerConnection state` lines for both PCs say `connected` with transport `tcp7882`, and none connected over UDP.
+  A headful Chrome shares the tone tab, a headless one the fake display (05 §19.3).
 - Connection test: wizard step 2 reports UDP ✓ and TCP 7882 ✓ on localhost with the TCP 443 row hidden (the harness
   runs in off mode, so `tcp443` answers `transport_disabled`; the TLS case is the Go test above); with
   `listen.ice_udp = ""` the UDP row shows ✗ with the "UDP turned off" text.
@@ -4089,6 +4294,11 @@ no tokens, SDP, push endpoints or usernames.
 ### Manual (M1 exit)
 
 - Fresh VPS (2 vCPU, 2–4 GB): install.sh in IP mode, a real staging then production IP certificate, `doctor` all ok.
+- `doctor` reports ok in the Docker bridge and host setups (README S90's last acceptance item, made manual after
+  group 13, README §6): on a Linux host with a real public address, run with the exit test (06 §12). Docker
+  Desktop can't give an all-ok report (its user-space NAT makes `public_ip` symmetric, and its VM's clock and UDP
+  buffers warn), and neither can the smoke overrides of `deploy/docker/test` (a test domain that resolves
+  nowhere); every check about the server itself was ok or info there.
 - 5 friends, 2 hours: dashboard numbers plausible, transfer counter vs provider's graph within 5 %, no errors, RSS flat.
 - iPhone (Home Screen app) and Android Chrome receive "X started streaming"; tapping opens the room.
 - `docker compose` bridge mode: setup-url, backup to host via `--out -`, restore via stdin.
@@ -4133,13 +4343,13 @@ Packages and names (exact):
   `ValidateEndpoint`, `SendTest`, `Run`), `ShareStarted`, `AdminAlert`, `Store`, `RecipientFilter`
   (`PrefShareStarted`, `PrefAdminAlerts`), `Sender`, `SendOptions`, `SendResult`, `ErrUndeliverable`,
   `ErrBlockedAddress`, `Subscription`.
-- `internal/server`: `Server`, `New`, `Start`, `Run`, `Shutdown`, `Site`, `Addrs` (`HTTP`; `HTTPS` from S44
-  on: the 443 multiplexer, nil in off mode; and from S59 on the bound ICE listeners, **`ICEUDP`**, a
+- `internal/server`: `Server`, `New`, `Start`, `Run`, `Shutdown`, `Reload` (README S90, §6.5), `Site`, `Addrs` (`HTTP`;
+  `HTTPS` from S44 on: the 443 multiplexer, nil in off mode; and from S59 on the bound ICE listeners, **`ICEUDP`**, a
   `*net.UDPAddr` for `listen.ice_udp`, the first of its sockets, and **`ICETCP`**, a `*net.TCPAddr` for
-  `listen.ice_tcp`: each nil when its listener is off, both nil on a server that started without media sockets,
-  §6.2; ICE-TCP on the HTTPS port has no address of its own; from S85 on **`Metrics`**, the metrics listener, nil
-  unless `metrics.enabled`), `ShutdownReason`, `ErrRestartRequested`,
-  `ErrShutdownForced`, `NeedsOperator`, `Deps`, and the wiring table of §6.6.
+  `listen.ice_tcp`: each nil when its listener is off, both nil on a server that started without media sockets, §6.2;
+  ICE-TCP on the HTTPS port has no address of its own; from S85 on **`Metrics`**, the metrics listener, nil unless
+  `metrics.enabled`), `ShutdownReason`, `ErrRestartRequested`, `ErrShutdownForced`, `NeedsOperator`, `Deps`, and the
+  wiring table of §6.6.
 - `internal/server/tlsmgr` (S44; §8.2): `Options` (with `PublicIPv6`, `Site`, `HTTPAddr`, `HTTPSAddr`, `Resolver`),
   `New`, `Manager` (`Start`, `Shutdown`, `TLSConfig`, `HTTPHandler`, `Reload`, `Status`, `Ready`), `Status`, and the
   ten `Code…` constants of `Status.LastErrorCode`: the seven ACME hints of §8.7 (`tls.acme_unreachable`,
@@ -4200,7 +4410,8 @@ Packages and names (exact):
   4 unreachable, 7 `setup_unavailable`; doctor 0/5), the output of the link commands (§3.3: off a terminal the bare
   link is the first line of stdout and everything else is on stderr), env names (§4.2, including the
   empty-means-unset rule and the reserved names; §4.3 env-only switches), the data-directory lock `isshoni.lock`
-  (§5.1), `SIGHUP` reload (from README S90 on; ignored from S65 until then, §6.5), re-exec after restore and
+  (§5.1), `SIGHUP` reload (since README S90: manual TLS files and `log.level`, every other change named for a
+  restart; ignored from S65 until then, §6.5), re-exec after restore and
   rotation, no `sd_notify` (unit `Type=exec`), Docker needs `/run/isshoni` writable by uid 65532 (tmpfs with a
   read-only root) and a data volume at `/var/lib/isshoni`, the release-note marker `<!-- isshoni:security -->`.
 
@@ -4347,7 +4558,7 @@ Decided after group 7 (engineering calls the owner delegated; README §6):
 6. **`serve` ignores SIGHUP until the reload exists.** The reload of §6.5 is README S90's. Until then a SIGHUP
    would end the process, and systemd would not start it again, because it counts an end by SIGHUP as a clean
    exit. From README S65 on the signal is ignored, so `systemctl reload isshoni` neither reloads nor stops the
-   server (§3.1, §6.5; 06 §4.5).
+   server (§3.1, §6.5; 06 §4.5). README S90 (group 13) built the reload, which took the ignoring's place.
 7. **A server that waits for its public address looks for it every 30 s, not every 10 minutes.** This amends
    decision 5's "at the next 10-minute look": the server that restarts itself when it finds its address should
    find it soon after the network is up. Every other server keeps the 10 minutes. README S65 implements it
@@ -4399,3 +4610,44 @@ Decided after group 12 (engineering calls the owner delegated; README §6 (4), (
     `listen.http`'s bytes count as `web`, through a counting listener in `internal/server` (§11.3). With them, the
     ready line names the metrics listener (`listen_metrics`, §6.1), and `POST /api/v1/admin/doctor` raises its read
     deadline to 3 minutes for a run that may take 2 (§9.3).
+
+Decided after group 13 (engineering calls the owner delegated; README §6 "Decided after group 13"):
+
+14. **What a reload does, as README S90 built it** (§6.5). SIGHUP loads the config again from `serve`'s flags, its
+    environment and the file, so §4.1's precedence holds; it reads the manual TLS files again and applies
+    `log.level` (a level set with `isshoni admin log-level --for` stays until its time is up), and names every other
+    changed key in one WARN line, without values, for a restart. A config with errors changes nothing and names no
+    key. The certificate files are read without the lifecycle lock, so a hung read never holds up a shutdown; a
+    reload during the start waits for it, one after the shutdown began does nothing. `Server.Reload` is a new public
+    method (§6).
+15. **`limits.conns_per_ip` applies in off mode too**, to `listen.http`, except for peers inside
+    `network.trusted_proxies` (§7.8, §8.5): a per-IP limit on the proxy would be one on the whole site.
+16. **The server's log hardening** (README S90; §9.3, §10, §17). The 503s it gives on purpose (a polled `/readyz`
+    or `/healthz` while not ready, the shutdown gate's) are debug lines, not warnings; an ICE password in the text of
+    a library's message is redacted by a safety net in `internal/server` (Pion's ICE agent logs `remotePwd` at
+    debug), which became a second layer when README F20 (group 14) had logx's Pion bridge do it (decision 18); what
+    libraries write to Go's `log` package goes into the
+    server's log as records of the component `stdlog`. The log canary allows Pion's own warnings that name no
+    address (two come with every PeerConnection, at info as well) and holds them to the same rules, and allows
+    client addresses at debug; at info and above a client's IP appears only as the `remote_ip` of a security event.
+17. **"doctor reports ok in the Docker bridge and host setups" is a manual check** on a Linux host with a real
+    address, run with the exit test (§17 "Manual"; 06 §12.1). Docker Desktop and the smoke overrides can't give an
+    all-ok report; every server check was ok or info there. A later slice may assert per code in CI's Linux
+    docker-smoke, after reviewing two rules of `public_ip` (§13.2): a Docker bridge reported as symmetric NAT, and a
+    configured literal `127.0.0.1` taken as the public address. README F21 (group 15) did both: docker-smoke
+    asserts every check by its code in the bridge and host setups, with a named allow-list; a Docker bridge's
+    symmetric NAT passes with the param `dockerBridge`; and a loopback or unspecified `public_ip` counts as no public
+    address (param `unreachable`).
+
+Decided after group 14 (engineering calls the owner delegated; README §6 "Decided after group 14"):
+
+18. **logx's Pion bridge redacts ICE passwords itself, and its limiter's lines have the level of the lines they
+    stand for** (README F20; §10, §17). The bridge redacts a named password and the password of a ufrag:password
+    pair in every line it writes, at every level; the pair rule leans toward redacting (a URL with a dotless host
+    and path of 22 or more characters after a scheme of 4 or more letters loses both, §10).
+    `internal/server/logsafety.go`'s net stays as a second layer. The "further messages suppressed" notice comes
+    at the dropped line's level, and again within the same minute for a dropped line of a higher level; the count
+    comes at the highest dropped level. The limiter keeps one budget per scope across levels, so at
+    `log.level = debug` Pion's debug lines can crowd out a warning; the notice then says so at warn.
+19. **A transfer tick that the stop cuts short is a normal stop** (README F20; §11.3): a debug line, no alert
+    check and no warning from the alert memory for a cancelled context; a store call's own timeout still warns.

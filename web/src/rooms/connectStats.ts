@@ -6,10 +6,13 @@
 //   it is loaded with the first room.state, or with the handle's first stats() call. It starts when the session has
 //   a room's snapshot and stops when it has none anymore (leave(), a room switch, a room the server closed), which
 //   also forgets its samples.
-// - Its sources are the viewer's sub PC (viewer/stats.ts). The pub PC joins them when share/ has its source.
-// - The viewer's freeze watch (viewer/freeze.ts, 05 §12.6) reads the collector's samples from the moment the
-//   collector exists until the runtime goes: it is what puts "Waiting for video…" on a tile whose picture stands
-//   still. It comes with the same chunk.
+// - Its sources are the viewer's sub PC (viewer/stats.ts) and the sharer's pub PC while there is one
+//   (share/stats.ts).
+// - attachViewerStats (viewer/statsLink.ts) reads the collector's samples from the moment the collector exists
+//   until the runtime goes, with the tab's SignalClient: the tiles' freeze watch (viewer/freeze.ts, 05 §12.6), which
+//   puts "Waiting for video…" on a tile whose picture stands still; the `stats` notification every 10 s (01 §8.11),
+//   from which the hub counts the isshoni_client_* metrics; and the debug overlay's samples and stats.watch while
+//   it is open (05 §10.7). It comes with the same chunk.
 // - The handle exists only in a tab with sessionStorage['isshoni.debug'] === '1' (lib/stats/debugHandle.ts). Its
 //   state() has ids and states and no names: nothing the page doesn't show. Its dropSocket() is the tab's
 //   SignalClient.dropSocket(): the socket closes with 3000, which the server treats as a network drop, and the
@@ -20,8 +23,10 @@ import type { StatsCollector } from '../lib/stats/collector';
 import { installDebugHandle } from '../lib/stats/debugHandle';
 import type { KeyValueStore } from '../platform/types';
 import type { SignalClient } from '../protocol/signal-client';
+import { shareStatsSources } from '../share/stats';
 import type { ViewerServices } from '../viewer/services';
 import { viewerDebugState, viewerStatsSources } from '../viewer/stats';
+import type { StatsLinkSignal } from '../viewer/statsLink';
 import type { ConnectionStore } from './connection';
 import { loadRoomMedia } from './loadMedia';
 import type { RoomStore } from './roomStore';
@@ -30,8 +35,11 @@ export interface ConnectStatsDeps {
   viewer: ViewerServices;
   room: RoomStore;
   connection: ConnectionStore;
-  /** The tab's SignalClient: the debug handle's dropSocket() drops its socket. */
-  signal: Pick<SignalClient, 'dropSocket'>;
+  /**
+   * The tab's SignalClient: the `stats` reports and stats.watch go through it (attachViewerStats), and the debug
+   * handle's dropSocket() drops its socket.
+   */
+  signal: Pick<SignalClient, 'dropSocket'> & StatsLinkSignal;
   /** platform.storage.session: holds the debug flag. */
   storage: Pick<KeyValueStore, 'get'>;
   log: Logger;
@@ -62,15 +70,18 @@ export function connectStats(deps: ConnectStatsDeps): () => void {
   const { viewer, room, log } = deps;
   let collector: StatsCollector | null = null;
   let loading: Promise<StatsCollector> | null = null;
-  let offFreeze: (() => void) | null = null;
+  let offViewerStats: (() => void) | null = null;
   let disconnected = false;
 
   const get = (): Promise<StatsCollector> => {
     loading ??= loadRoomMedia().then(
-      ({ createStatsCollector, attachFreezeWatch }) => {
-        collector = createStatsCollector({ sources: () => viewerStatsSources(viewer), log });
-        // A runtime that is gone by now never starts the collector, so there is nothing to watch either.
-        if (!disconnected) offFreeze = attachFreezeWatch(viewer, collector);
+      ({ createStatsCollector, attachViewerStats }) => {
+        collector = createStatsCollector({
+          sources: () => [...viewerStatsSources(viewer), ...shareStatsSources()],
+          log,
+        });
+        // A runtime that is gone by now never starts the collector, so there is nothing to read its samples either.
+        if (!disconnected) offViewerStats = attachViewerStats({ viewer, collector, signal: deps.signal, log });
         return collector;
       },
       (err: unknown) => {
@@ -119,8 +130,8 @@ export function connectStats(deps: ConnectStatsDeps): () => void {
     disconnected = true;
     offRoom();
     uninstall();
-    offFreeze?.();
-    offFreeze = null;
+    offViewerStats?.();
+    offViewerStats = null;
     collector?.stop();
   };
 }

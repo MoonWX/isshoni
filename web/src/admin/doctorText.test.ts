@@ -132,6 +132,23 @@ describe('checkMessage', () => {
     expect(message({ code: 'public_ip.none', params: { siteIsAddress: false } })).toMatch(
       /media has no address to offer\.$/,
     );
+    // README F21: a public_ip that only this machine can reach, and a bridge NAT the check let pass.
+    expect(message({ code: 'public_ip.none', params: { unreachable: ['127.0.0.1'], siteIsAddress: false } })).toBe(
+      "No public IP address: 127.0.0.1 can only be reached from this machine. The site opens, but friends can't " +
+        'share or watch: media has no public address to offer.',
+    );
+    expect(message({ code: 'public_ip.none', params: { unreachable: ['127.0.0.1'], siteIsAddress: true } })).toMatch(
+      /The site is at that address too, so only this machine can open it\.$/,
+    );
+    expect(message({ code: 'public_ip.no_ipv6', params: { ipv4: '203.0.113.7', unreachable: ['::1'] } }, DOCKER)).toBe(
+      '203.0.113.7. No public IPv6 address (::1 can only be reached from this machine).',
+    );
+    expect(message({ code: 'public_ip.ipv6_only', params: { ipv6: '2001:db8::7', unreachable: ['127.0.0.1'] } })).toBe(
+      "2001:db8::7. No public IPv4 address (127.0.0.1 can only be reached from this machine), so friends without IPv6 can't connect.",
+    );
+    expect(message({ code: 'public_ip.ok', params: { ipv4: '203.0.113.7', dockerBridge: true } })).toMatch(
+      /^203\.0\.113\.7\. The container's bridge network gives each outgoing connection its own port/,
+    );
     expect(
       message({
         code: 'public_ip.port_forward',

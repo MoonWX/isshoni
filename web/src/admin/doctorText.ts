@@ -174,6 +174,20 @@ interface Ctx {
 /** A rule returns null when the params can't make a sentence: the server's English message shows instead. */
 type Rule = (c: Ctx) => Msg | null;
 
+/**
+ * The addresses that only this machine can reach (the param unreachable, README F21: a public_ip literal such as
+ * 127.0.0.1), or "" (messages_en.go unreachableText).
+ */
+function unreachableText({ p, f, t }: Ctx): string {
+  const addrs = p.list('unreachable');
+  return addrs.length === 0 ? '' : t('doctor.part.unreachable', { addresses: f.list(addrs) });
+}
+
+/** The note where public_ip let a container's bridge NAT pass (the param dockerBridge, README F21; bridgeNATNote). */
+function bridgeNATNote({ p, t }: Ctx): string[] {
+  return p.bool('dockerBridge') ? [t('doctor.part.bridgeNAT')] : [];
+}
+
 /** The first part of the public_ip messages: the addresses and how they were found (messages_en.go publicIPText). */
 function addressText({ p, f, t }: Ctx): string {
   const parts: string[] = [];
@@ -342,20 +356,36 @@ const MESSAGES: Readonly<Record<string, Rule>> = {
     return p.has('path') ? { values, context: 'path' } : { values };
   },
 
-  'public_ip.ok': (c) => ({ values: { addresses: addressText(c) } }),
-  'public_ip.no_ipv6': (c) => ({
-    values: { addresses: addressText(c) },
-    ...(inContainer(c.e) ? { context: 'container' } : {}),
-  }),
-  'public_ip.ipv6_only': (c) => ({ values: { addresses: addressText(c) } }),
-  'public_ip.ephemeral': (c) => ({ values: { addresses: addressText(c) } }),
+  'public_ip.ok': (c) => ({ values: { addresses: addressText(c) }, extra: bridgeNATNote(c) }),
+  'public_ip.no_ipv6': (c): Msg => {
+    const unreachable = unreachableText(c);
+    if (unreachable !== '') {
+      return { values: { addresses: addressText(c), unreachable }, context: 'unreachable', extra: bridgeNATNote(c) };
+    }
+    return {
+      values: { addresses: addressText(c) },
+      ...(inContainer(c.e) ? { context: 'container' } : {}),
+      extra: bridgeNATNote(c),
+    };
+  },
+  'public_ip.ipv6_only': (c): Msg => {
+    const unreachable = unreachableText(c);
+    return unreachable !== ''
+      ? { values: { addresses: addressText(c), unreachable }, context: 'unreachable' }
+      : { values: { addresses: addressText(c) } };
+  },
+  'public_ip.ephemeral': (c) => ({ values: { addresses: addressText(c) }, extra: bridgeNATNote(c) }),
   'public_ip.port_forward': (c) => {
     const values = { addresses: addressText(c), local: c.p.str('local') };
     return c.p.has('local') ? { values, context: 'local' } : { values };
   },
   'public_ip.symmetric': (c) => ({ values: { addresses: addressText(c) } }),
-  'public_ip.none': ({ p }) => {
-    if (p.bool('siteIsAddress')) return { context: p.bool('running') ? 'running' : 'offline' };
+  'public_ip.none': (c) => {
+    const unreachable = unreachableText(c);
+    if (unreachable !== '') {
+      return { values: { unreachable }, context: c.p.bool('siteIsAddress') ? 'unreachableSite' : 'unreachable' };
+    }
+    if (c.p.bool('siteIsAddress')) return { context: c.p.bool('running') ? 'running' : 'offline' };
     return {};
   },
 

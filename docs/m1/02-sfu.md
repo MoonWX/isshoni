@@ -98,7 +98,8 @@ internal/server/sfu/
   pacer.go        per-DownTrack token bucket (video, retransmissions included; README S84)
   allocator.go    per-subscriber downlink controller, and what the viewer's REMBs and receiver reports tell it
                   (README S84)
-  uplink.go       UplinkPolicy (M1: admin cap and layer pausing; M2: native estimator)
+  uplink.go       UplinkPolicy (M1: admin cap and layer pausing; M2: native estimator), quality hints, the REMB of
+                  the cap on the pub PC (README S88)
   codec.go        ProfileKey, compatibility matrix, PT table, codec policy helpers
   codecstate.go   SetDecodeCaps, viewers without H.264: caps-driven video, codec rebuilds, the guard (§8.5)
   h264.go         SPS detection (keyframe start), SPS parser (size), NAL helpers
@@ -111,12 +112,15 @@ internal/server/sfu/
   pionlog.go      Pion's logger factory: info lines and lines that hold an address at debug (README S79, §13)
   *_test.go
 internal/server/sfu/sfutest/   Harness, DirectSignaler, Viewer (+Recorder, checks), FaultConn, ProfileSource, Link
-                               (a downlink bottleneck on the SFU's FaultConn, README S84)
+                               (a downlink bottleneck on the SFU's FaultConn, README S84), ApplyHint (a quality
+                               hint's active flags on a publish.Publisher, README S88)
 internal/server/sfu/sfutest/rembsim/  REMB model copying libwebrtc's AIMD estimator (no imports of sfu or Pion;
                                       used by allocator_test and sfutest.Viewer, §17)
 internal/media/fake/           Source, synthetic and decodable H.264, Opus asset, testdata/
-internal/client/publish/       Publisher: simulcast TrackLocal with mid/rid, H.264/Opus packetizing, SRs, PLI
-cmd/isshoni-loadtest/          main.go, auth.go, scenario.go, measure.go, report.go
+internal/client/publish/       Publisher: simulcast TrackLocal with mid/rid, H.264/Opus packetizing, SRs, PLI,
+                               SetActive (a layer off and on again, README S88)
+cmd/isshoni-loadtest/          main.go, auth.go, client.go (the simulated clients, README S89), scenario.go,
+                               measure.go, report.go
 ```
 
 Dependencies (all permissive): `pion/webrtc/v4` v4.2.x (v4.2.22 in S4), `pion/ice/v4`, `pion/interceptor`, `pion/rtp`,
@@ -366,6 +370,15 @@ Rules:
   itself and hands the DownTrack the result (§10.1), so the `setRequested` and `setCap` of the first design are
   one call.
 - `Signaler` and `RoomEvents` implementations must not block and must not call into the SFU synchronously.
+- **A share's uplink control belongs to the publishing Conn's actor** (README S88, §11): its policy, the cap and
+  pause state its sharer was told, and the pub PC's REMB state. The ticker and `SetLimits` only post to that actor,
+  a look of all its shares queued at most once at a time (`Conn.upQueued`, `wakeUplink`); a viewer's new request for
+  `high` posts a look of that one share (`Share.askedForHigh`), which writes no REMB. What other goroutines
+  need of it are atomics: `Share.paused` (a keyframe request for a paused layer does nothing, §9.7) and
+  `Share.resumedAt`, which the actor stores before it clears a bit of `Share.paused`, so a downlink allocator never
+  sees a resumed layer as neither paused nor resumed (§10.2). The viewers' requests reach the policy as each
+  subscriber's actor published them (`Subscription.shown`); a request for `high` has that actor post a look after
+  it published it, so the look sees it.
 
 ## 6. The signal ↔ sfu interface (M1)
 
@@ -551,9 +564,17 @@ connections, each of which ends its shares with its own reason and closes its pe
 - `UpdateShare(id, ShareUpdate{Preset})` stores the new preset and returns the share's new `ShareParams`; a nil
   `Preset` changes nothing and returns the current ones. The encodings apply at once (the client sets them); the
   audio bitrate reaches the publisher with the next pub offer's answer (§8.4 step 5 reads the share's preset when it
-  writes `maxaveragebitrate`). Errors: `sfu.share_not_found`, `sfu.not_owner`.
+  writes `maxaveragebitrate`). Errors: `sfu.share_not_found`, `sfu.not_owner`. **Since README S88 its encodings are
+  the share's as they stand**: under the admin's cap as it is now, and with the layers inactive that layer pausing
+  told the sharer to pause (§11), so a sharer that applies them pauses or resumes nothing behind the SFU's back.
+  The uplink control doesn't count them as told: the hub also runs another of the user's connections'
+  `share.update` on the publishing Conn and replies to that connection (01 §8.7), so the sharer may never see them,
+  and a cap that differs from what its last hint said still gets a hint at the next look (review S88-R4).
 - `SetLimits` replaces the cap for every `ShareParams` returned from then on; an invalid value (a negative number)
-  is logged and ignored. Telling running shares (REMB on the pub PC, a `QualityHintEvent`) is slice 13 (§11).
+  is logged and ignored. Since README S88 running shares follow at once too, not at the ticker's next second: every
+  Conn that publishes looks at its uplink, so a share whose cap changed gets a `QualityHintEvent` with the reason
+  `admin` and its pub PC the REMB of the new cap (§11). A cap beyond 2^30 kbit/s counts as that much
+  (`Limits.shareCap`), so the REMB of a pub PC with several shares can't overflow.
 
 ### 6.2 SFU → signal
 
@@ -613,7 +634,12 @@ The SFU computes the content of every hint; sfuplane only converts types (01 §1
   sfuplane copies `Gen` into `pc.restart`'s `gen`.
 - On `Resync()` the SFU re-sends one `CodecPolicyEvent` per share the Conn publishes and the last `QualityHintEvent`
   per share, if one was sent. A client re-offers only when the hinted codec differs from the one it last applied (05),
-  so the re-send costs nothing.
+  so the re-send costs nothing. **As README S88 built it** (`Conn.resendHints`), the quality hint is not the stored
+  event sent again but **rebuilt as it would be now**: the current cap, the current pause state and the encodings of
+  the current preset, with the reason of the last hint. A preset changed after the hint would otherwise be undone by
+  the old encodings. A share that never got a hint gets none.
+- `QualityHintEvent.Reason` is one of the exported constants `HintReasonAdmin` (`"admin"`) and `HintReasonViewers`
+  (`"viewers"`), 01's `protocol.HintReason` values, which sfuplane passes through (README S88).
 
 **`SubscriptionStateEvent` as README S52 built it** (`subscription.go`; the layer choice itself is §10.1).
 
@@ -793,7 +819,7 @@ version for SFU implementers:
 
 | Case | Client (05) | Signal (01) | SFU |
 |---|---|---|---|
-| WebSocket drops, media fine | reconnect with jittered backoff, `hello{resumeToken}` | same session → `Conn.Resync()` | re-sends an outstanding sub offer (same `gen`/`neg`), current `SubscriptionStateEvent`s, one `CodecPolicyEvent` per own share, the last `QualityHintEvent` per share (if one was sent); ICE-restarts a sub PC that isn't connected, or builds a new one if it was closed |
+| WebSocket drops, media fine | reconnect with jittered backoff, `hello{resumeToken}` | same session → `Conn.Resync()` | re-sends an outstanding sub offer (same `gen`/`neg`), current `SubscriptionStateEvent`s, one `CodecPolicyEvent` per own share, the last `QualityHintEvent` per share (if one was sent), rebuilt from the current cap, pause state and preset (§6.2); ICE-restarts a sub PC that isn't connected, or builds a new one if it was closed |
 | WebSocket gone for 30 s | – | `Conn.StopShare(id, disconnected)` per share, then `Conn.Close` | removes its shares and DownTracks, closes PCs |
 | ICE `disconnected` ≥3 s on sub | `pc.restart{pc: sub, gen, mode: ice}` | `Conn.RestartICE(PCSub, gen)` | ICE-restart offer, same `gen`, next `neg` (after a pending answer if one is outstanding). Nothing new if an ICE restart for this `gen` is queued or was offered less than 5 s ago with no `connected` or `failed` since, e.g. from `Resync()` on the same resume (§5.3); the client counts that offer (new `ice-ufrag`) as its restart. No server timer: the client rebuilds if it isn't connected 15 s after that offer (01 §10.4) |
 | ICE `disconnected` ≥3 s on pub | re-offer with fresh ICE credentials, same `gen` | `Conn.HandleOffer(PCPub, gen, neg+1, …)` | normal answer. Pion restarts ICE; SSRCs stay |
@@ -1212,7 +1238,10 @@ the same numbers.
   0.3 Mbps.
 - S29 already returns this table from `StartShare` and `UpdateShare` (`share.go`; §6.1), ahead of slice 7: `q` is
   never touched by the cap, and a cap at or above 8000 kbps changes nothing.
-- Both encodings start `Active: true`. Layer pausing (§11) later sends `quality.hint` with `f` inactive.
+- Both encodings start `Active: true` in `StartShare`. Layer pausing (§11) later sends `quality.hint` with `f`
+  inactive, and from then on `UpdateShare`'s and every hint's encodings carry the pause state (README S88: the
+  paused layers inactive, the others active); `StartShare`, `UpdateShare` and the hints build their lists in one
+  place (`presetEncodings`).
 - `Profile` is the room's codec policy (§8.3): `6400` or `42e0`.
 - Advanced sizes (1440p60, 4K60) are later (M3, native senders); the table grows additively.
 
@@ -1276,6 +1305,14 @@ type packet struct { // immutable after insert; shared by the cache and every Do
   It reuses the parser from `spikes/s2-mac-vt/h264.go` (our own code) and its tests.
 - **Stats**, every 1 s from the ticker: bitrate and pps (2 s EWMA), FPS (distinct timestamps per second), loss (from
   seq gaps not filled within 1 s), `Active` = a packet within 2 s.
+- **Interarrival jitter** (README S88, for the uplink policy of §11, `LayerUplinkStats.Jitter`): RFC 3550 §6.4.1's
+  estimator in fixed point (×16, in ticks of the stream's RTP clock), updated by the RTP loop. Only a packet that is
+  the newest of the stream when it arrives counts, and of those only one with a new timestamp (the first of a video
+  frame) is a sample, against the last newest packet before it, as libwebrtc does (`receive_statistics_impl.cc`): a
+  late or repaired packet would count its own delay, and the packets of one frame, which leave together, would add
+  many samples near 0 that hide the frames' jitter (review S88-R3). Every newest packet still moves the reference
+  on, so a frame is measured from the last packet of the one before. A packet more than 10 s after the last sample
+  (`jitterGap`, a layer paused for a while) starts the estimate again from there, as the first packet does.
 
 ### 9.2 Packet cache (one per Layer)
 
@@ -1753,6 +1790,11 @@ requests for a packet that never comes. In integration 19 the publisher now rese
   RTCP readers, the layer's own read loop and any Conn's actor call it directly; a caller that loses the race is
   counted as throttled. When the write fails (the pub PC is closing, or went down before its actor saw it),
   nothing is retried: whoever still waits asks again after 500 ms. Audio layers never ask.
+- **Nothing for a paused layer** (README S88, §11). A request for a layer that the sharer was told to pause
+  (`Share.paused`) returns at once, like one while the pub PC is away (below): no PLI, and `lastPLI` stays as it
+  was. The viewer who asks has asked for `high`, the publishing Conn's actor resumes the layer for that, and the
+  keyframe request that follows the resume hint must not find the throttle spent on a PLI the sharer got while the
+  layer was off.
 - **Nothing while the pub PC is away** (README F10, S74-R1). While the publishing Conn's actor has its pub PC as not
   connected (`Conn.pubUp`, the view that the stalled check of §5.3 and the pending share's requests above go by), a
   request returns at once: no PLI, and `lastPLI` stays as it was, so it neither starts the 500 ms nor counts as
@@ -1939,10 +1981,15 @@ a choice:
   fell by 3 % fails it, overuse or not, and the budget is 0.9 × that REMB. In `limited`, congestion only ever lowers
   the budget (the lower of the old and the new one) and starts the backoff again. Drops are a rate measured over at
   least 0.9 s.
-- **The allocation** (`allocate`) weighs every subscription at measured rates: the share's audio when the client
-  asks for it; a `low` at its preview layer's rate; a `high` at its full layer's rate, or at its preview layer's
-  once capped. The `high` requests are served newest first, by when the client last asked for `high` after asking
-  for less (`Subscription.highAt`). A subscription whose viewer can't decode the video (§8.5) weighs its audio only.
+- **The allocation** (`allocate`) weighs every subscription at measured rates: the share's audio when the client asks
+  for it; a `low` at its preview layer's rate; a `high` at its full layer's rate, or at its preview layer's once capped.
+  **A layer paused for its sharer, or resumed less than 2 s ago, weighs its maximum instead** (`Share.allocRate`, README
+  S88, review S88-R1): a paused layer measures 0 within seconds, and a resumed one less than it sends while its 2 s
+  moving average catches up, so a `high` for a paused share in `limited` would always "fit" and resume at up to 8 Mbit/s
+  for a viewer the allocator knows is congested. It is capped unless the full layer's maximum fits; the request still
+  counts for the uplink policy, so the layer resumes, and the next trial tests a layer that flows (§11). The `high`
+  requests are served newest first, by when the client last asked for `high` after asking for less
+  (`Subscription.highAt`). A subscription whose viewer can't decode the video (§8.5) weighs its audio only.
 - **A share without a smaller layer is never capped.** A `high` request whose share has no other layer for a cap at
   `low` to give (a single-layer share, or one with only its preview layer) keeps the layer it has, whatever the
   budget: a cap would leave its viewer with no video at all. Its rate still counts against the budget.
@@ -1969,17 +2016,26 @@ upgraded `high` requests are capped at low. M1 has no such setting (03 stores no
 ## 11. Publisher-side control (uplink)
 
 ```go
-type UplinkPolicy interface { // one per Share, called from the ticker every 1 s
+type UplinkPolicy interface { // one per Share, asked on the publishing Conn's actor (below)
 	Tick(s ShareUplinkStats) UplinkDecision
 }
 type ShareUplinkStats struct {
-	Client ClientKind
-	Layers []LayerUplinkStats // RID, bitrate, loss fraction, jitter, number of DownTracks forwarding or waiting for it
+	Client       ClientKind
+	HighRequests int                // the share's viewers whose request is high, before the allocator's cap
+	Layers       []LayerUplinkStats // the video layers attached now, sorted f, h, q; paused ones included
+}
+type LayerUplinkStats struct {
+	RID     string
+	Bitrate int           // bps, 2 s moving average (LayerInfo.Bitrate)
+	LossPct float64       // loss over the last 2 s, in percent (LayerInfo.LossPct)
+	Jitter  time.Duration // interarrival jitter (RFC 3550 §6.4.1, §9.1)
+	Viewers int           // video DownTracks that forward the layer now or wait for its keyframe
 }
 type UplinkDecision struct {
 	MaxBitrate int             // bps; 0 = none
 	Active     map[string]bool // per rid; nil = no change
 }
+const HintReasonAdmin, HintReasonViewers = "admin", "viewers" // QualityHintEvent.Reason (README S88)
 ```
 
 - **M1, every publisher**: `MaxBitrate` = `Limits.MaxShareKbps` (03 setting `maxShareBitrateKbps`, pinnable by 04's
@@ -2003,6 +2059,67 @@ type UplinkDecision struct {
 - **Later (M2), native publishers**: a loss and receive-rate estimator per share (Galene's estimator design). It sends
   REMB plus `QualityHintEvent{MaxBitrate}` with the plan's hysteresis (changes of at least 15%, at most every 2 s).
   Browsers keep their own GCC over TWCC.
+
+**As README S88 built it** (`uplink.go`, with `Share.paused`, `Share.resumedAt` and `Share.up` in `share.go`,
+`Layer.sampleJitter` in `layer.go`, `Conn.resendHints`; the tests are §17's), where the text above leaves a choice
+or the code goes past it:
+- **Who asks the policy, and when.** Each share has an `UplinkPolicy` (M1's `m1Uplink`, the same for every
+  publisher) that the publishing Conn's actor asks: once a second (the ticker wakes every Conn that publishes,
+  `Conn.uplinkTick`), at once when `SetLimits` may have changed the cap (§6.1), and at once when a viewer's request
+  becomes `high` (`Share.askedForHigh`, posted by the viewer's actor after it published the request). The last one
+  is posted whenever pausing is on, not only while a layer is paused: a look that is deciding to pause right now
+  stores the paused bit only after it decided, and the look posted here, which sees the new request, comes after
+  it, so a resume never waits up to 1 s for the next tick. The ticker's and `SetLimits`' looks, which take every
+  share the Conn publishes, end with the pub PC's REMB (below); a viewer's look takes only its share and writes none.
+- **The cap** is `Limits.MaxShareKbps` for every share, in bit/s (`Limits.shareCap`, at most 2^30 kbit/s).
+- **One REMB per pub PC, not per share.** Chrome applies a REMB's bitrate as the upper bound of everything the PC sends,
+  whichever SSRCs it names, so while every share on the PC has a cap the PC gets one REMB a second (and one at once
+  after `SetLimits`): the **sum of its shares' caps**, naming every video SSRC of those shares (paused layers too, audio
+  not), sorted; its sender SSRC is the pub PC's RTCP SSRC (§9.7). **None while any share on the PC has no cap**: a REMB
+  can't say "no limit" for one share. **When the cap goes**, a browser keeps the last REMB as its limit until another
+  one arrives, so the PC gets **three REMBs of 1 Gbit/s** (`rembUncapped`, one per such look; one may be lost), then
+  none. 0 is avoided: libwebrtc reads it as no limit, but a receiver that reads it literally would stop sending. Nothing
+  is written while the actor has the pub PC as away, and a new pub PC (a new `gen`) is owed no lifts from the old one's
+  REMBs.
+- **A hint when the cap or the pause state changes.** A look sends a `QualityHintEvent` when the cap differs from
+  what the sharer was told last (by `StartShare`'s `ShareParams` or a hint; `UpdateShare`'s don't count, §6.1) or
+  the paused layers changed; the reason is `viewers` when the pause state changed, else `admin`. Every hint carries
+  the full encodings of the current preset under the cap with the paused layers inactive, and `MaxBitrate`. So an
+  `admin` hint also goes out when the cap changes without changing `f`'s encodings (a cap of 8 Mbit/s or more), and
+  for a share that is still `pending`.
+- **Pausing** (with `sfu.pause_unwatched_layers`, on by default, README §6 "Decided after group 13"): the full
+  layer is paused once no video DownTrack has requested `high` for 10 s, and **the 10 s are counted from the
+  share's start (`StartShare`), or from the first look that found no request for `high` after one that found
+  some**: the last request ended between those two looks, a second apart at most, so the layer is paused 10 to
+  11 s after it ended, never before (review S88-R2). **Any new request for `high` resumes it**, also one from a
+  viewer whose decoders can't take the video (`decoder_unavailable`, `decoder_failed`): it is the request that
+  counts, as the text above says for the allocator's cap. **A share without a preview layer is never paused**: its
+  full layer is the only video it has (a single-layer share, which the text above doesn't cover). `q` is never
+  paused, and `h` (M5) neither.
+- **The resume.** The hint with `f` active goes out first, then one keyframe request for the layer (a sharer that
+  sends it again starts with a keyframe of its own accord; this asks one that never stopped it, a client that
+  applies no encodings). While a layer is paused, keyframe requests for it do nothing and don't start the 500 ms
+  throttle (§9.7), so that request goes out. The time of the resume goes to `Share.resumedAt`, before the paused
+  bit is cleared, for the downlink allocators: a paused layer, and one resumed less than 2 s ago, weighs its
+  maximum (§10.2, `Share.allocRate`).
+- **The uplink control is the publishing Conn's actor's**, like everything else the Conn publishes (§5.4): the
+  policy, the cap and pause state the sharer was told (`shareUplink`), and the REMB state. Other goroutines read
+  two atomics: `Share.paused` (the slot bits of the paused layers) and `Share.resumedAt`. The viewers' requests
+  reach the policy as each subscriber's actor published them (`Subscription.requested`, from
+  `Subscription.shown`). `uplinkStats` reads the layer set under `Share.mu`, a leaf, and atomics otherwise (review
+  S88-R5).
+- **`ShareUplinkStats` as built**: `HighRequests` counts the share's viewers, not its layers; `Layers` lists the
+  video layers attached now, paused ones included; `LayerUplinkStats.Viewers` counts the video DownTracks that
+  forward the layer or wait for its keyframe; loss is `LossPct`, in percent like `LayerInfo`, not a fraction; and
+  `Jitter` is §9.1's per-frame estimate. M1's policy reads only `HighRequests` and the layers' rids; the rest is
+  for M2's estimator.
+- **`UpdateShare` and `Resync` say the same as the hints** (§6.1, §6.2): `UpdateShare`'s encodings carry the cap
+  as it is now and the pause state, and `Resync` sends each share's last hint again, rebuilt from the current cap,
+  pause state and preset with the last hint's reason.
+- **The Go publisher can follow a hint** (§15.1): `publish.Publisher.SetActive` turns a video layer off and on
+  again, and `sfutest.ApplyHint` does with a hint's encodings what a browser does with `setParameters`.
+- **Logs**: a hint is a debug line (`quality hint`, with the share, reason, cap and paused rids); a REMB that
+  can't be written is a debug line.
 
 ## 12. Limits and guards (M1)
 
@@ -2278,7 +2395,8 @@ choice:
   only. Handshake timeouts are warnings (they were info before S79), and so are sub offers sent again (they were
   debug).
 - **Pion's own lines** reach the log through 04's bridge (04 §10: Pion's levels kept, its debug and info lines only
-  while debug is on, 20 lines a minute per scope, no SDP-like line), under `component=sfu` with the scope, and the
+  while debug is on, 20 lines a minute per scope, no SDP-like line, and since README F20 a named ICE password, or
+  the password of a ufrag:password pair, in a line's text redacted), under `component=sfu` with the scope, and the
   SFU's logger factory (`pionlog.go`) changes two things on top: Pion's info lines are debug lines (they repeat,
   without ids, what the SFU says itself), and so are its warnings and errors that hold an IP address (a check from a
   stray address names it). Pion's other warnings and errors keep their level. The group 11 integration made netx's
@@ -2454,13 +2572,29 @@ between the SFU and one client (integration 4).
   `CodecPolicyHold` and `Conn.Decoders` (the guard's state: H.264 in the caps, refused, rebuilds, failed, a retry
   set), §17.
 
+**Layer pausing and the admin's cap in the test tools** (README S88, for §11):
+- **`publish.Publisher.SetActive(layer, active)`** turns a video layer off and on again, as a browser sharer does with
+  the `active` flag of a quality hint's encodings (01 §8.10). An inactive layer sends nothing (its Source packets are
+  dropped and counted in `TrackStats.Paused`) and writes no sender reports, while its RTCP is still read; turned on
+  again it asks the Source for a keyframe and sends nothing before one, as an encoder starts an encoding it turns
+  back on. Turning a layer to the state it has changes nothing; a layer the Publisher doesn't send is
+  `ErrInvalidOptions`. M1's Publisher still has no rate control: the SFU's REMBs are only counted
+  (`TrackStats.REMBs`, and `LastREMB` the bitrate of the last one naming the SSRC).
+- **`sfutest.ApplyHint(pub, ev)`** does with a `QualityHintEvent`'s encodings what a browser does with
+  `setParameters`: each layer that an encoding names by its rid is turned on or off (`SetActive`); an encoding of a
+  layer the Publisher doesn't send (M5's `h`) is passed over, and a hint without encodings changes nothing.
+- **`export_test.go`** has `PauseAfter` (10 s), `REMBLifts` (3) and `REMBUncapped` (1 Gbit/s), `SFU.AdvanceUplinkClock`
+  (the uplink policies' clock is `monoNow` plus a skew, `SFU.uplinkSkew`, like the allocator's and the codec
+  policy's), `Conn.CheckUplink` (the look the ticker has the actor take once a second, at once) and `Conn.Uplink`
+  (a share's `UplinkState`: the cap the sharer was told, the paused rids, the last hint's reason).
+
 ### 15.2 `cmd/isshoni-loadtest`
 
 ```
 isshoni-loadtest -server https://example.org -admin admin   # password from ISSHONI_LOADTEST_PASSWORD or a prompt
   [-scenario focus|all-high|smoke]  [-publishers 10] [-subscribers 10] [-duration 10m] [-warmup 60s]
   [-full 1920x1080@60:8M] [-preview 640x360@15:300k] [-gop 3s] [-profile 6400|42e0] [-decodable]
-  [-focus-rotate 30s] [-login-interval 3s] [-json out.json] [-keep-users]
+  [-focus-rotate 30s] [-login-interval 3s] [-json out.json] [-keep-users] [-v]
 ```
 
 - **Setup**: log in as admin, create an invite with `publishers + subscribers` uses (`POST /api/v1/invites`, 03),
@@ -2488,7 +2622,7 @@ isshoni-loadtest -server https://example.org -admin admin   # password from ISSH
 - **Client data**: per track from `sfutest.Viewer`; per rotation, the switch latency (update sent → first packet of
   the new layer); A/V offset per focused share.
 
-Pass criteria for `focus` (after warm-up; exit 0 = pass, 1 = fail, 2 = setup error):
+Pass criteria for `focus` (after warm-up; exit 0 = pass, 1 = fail, 2 = setup error, 130 = interrupted, README S89):
 
 | Check | Pass |
 |---|---|
@@ -2502,6 +2636,72 @@ Pass criteria for `focus` (after warm-up; exit 0 = pass, 1 = fail, 2 = setup err
 
 Output: a human summary plus JSON: `{"scenario","params","server":{"cpu":{avg,p95},"rssPerDownTrack","egressMbps"},
 "loss":{"raw","final"},"pli":{…},"switchMs":{p50,p95,max},"avOffsetMs":{p50,p99},"pass":true,"failures":[]}`.
+
+**As README S89 built it** (`cmd/isshoni-loadtest`: `main.go`, `auth.go`, `client.go`, `scenario.go`, `measure.go`,
+`report.go`; the tests are §17's), where the text above leaves a choice or the tool goes past it:
+- **Files**: besides the five of §4, `client.go` holds the simulated clients: 01's Go signaling client on `/ws` with
+  the account's session cookie and client kind `tool`, a `publish.Publisher` on `internal/media/fake` (Synthetic, or
+  Decodable with `-decodable`) for a publisher, an `sfutest.Viewer` for a subscriber. Against a server on this
+  machine the clients use loopback UDP candidates only.
+- **The command line.** `-v` logs at debug, Pion's lines included (without it the clients' Pion stacks log errors
+  only: forty clients that connect at once log many harmless warnings). Explicit flags override a scenario's
+  defaults. `-subscribers 0` with `all-high` is a usage error. Every layer and profile is also checked by
+  `fake.New` before any account exists, so a layer above H.264 level 6.2 (`-full 8192x8192@30:8M`) is a usage
+  error, exit 2, not a setup failure halfway through a run (review S89-R4). The password comes from
+  `ISSHONI_LOADTEST_PASSWORD` (04 §4.2 reserves it) or a no-echo prompt on a terminal (`golang.org/x/term`, a module
+  of its own that `bin/isshoni` doesn't link).
+- **Exit codes.** 0 the run passed; 1 it failed: a check, a client that lost its connection, a teardown that left
+  accounts behind, and **media that never came** (shares that never go live, subscriptions that never deliver,
+  within 60 s each): media flow is the server's job under test; 2 a setup error: a usage error, a server that can't
+  be reached, a refused login, an account, a connection, a `share.start` or a pub negotiation the server would not
+  make; **130 interrupted** (SIGINT or SIGTERM): the teardown still deletes the accounts, and from the first signal
+  on a second one has its default action again and quits at once, leaving them (review S89-R6).
+- **`-duration` covers the whole run from the moment every client is up, the warm-up included**; the checks use only
+  the part after the warm-up. So `-subscribers 0` publishes for exactly `-duration`.
+- **Teardown** closes every client, deletes the run's accounts (unless `-keep-users`), revokes the invite, then
+  deletes any account `lt-<run>-<n>` that the admin's user list has and the run doesn't know: one whose sign-up the
+  server committed but whose answer never came (an interrupt, the 30 s request timeout, a dropped connection;
+  review S89-R5). It has 60 s, and logs the admin out last. The report's `users` says how many were created and
+  deleted.
+- **Expected egress is computed from the publishers' measured rates**, not from the nominal `-full`/`-preview`
+  bitrates: per dashboard sample, the subscriptions the subscribers want then (by share: full, preview, audio) ×
+  the payload rate each publisher's Publisher counters measured for that layer and its audio. It works for
+  Decodable video too, whose bitrate follows from the picture. The report adds `receivedMbps`, what the subscribers
+  received after the warm-up (payload and repairs), as a check from the other end; it matched `media.egressBps`
+  within about 2 % in every run.
+- **The memory check counts as "nothing to measure" when the dashboard reports `rssBytes` 0**, as a server built with
+  `CGO_ENABLED=0` on macOS does (its process collector reads no RSS). A check with nothing to measure is reported
+  as such and is not checked; so are the subscribers' checks with `-subscribers 0`.
+- **Switching, seq and ts continuous per track** (review S89-R1): each focus move measures the switch of both
+  subscriptions to their new layers (`subscribe.update` sent → first packet of the new layer, within 5 s), which
+  must start on a keyframe with its SPS in front. **Once repairs have had their chance** (`FinalLossAfter` + 200 ms
+  after that first packet) each switch is checked again, in the packets as they stand then: the packet in front of
+  the new layer's first one must have arrived (seq continuous) and the new layer's first frame must come after it
+  (ts forward). A switch whose SPS packet came late or by a repair is checked then too, not counted as a lost start.
+  A switch the run's end cuts short keeps what its first look found. The report's `switchMs` has `verified`,
+  `seqGaps` and `tsBack`; both must be 0.
+- **A/V** pairs every flash frame with its beep at each viewer, both mapped to NTP through the sender reports the SFU
+  forwarded (`avPairs`, `mapNTP`), after the warm-up only; `sfutest.Viewer.AVOffset` can't leave out the warm-up and
+  errs when a share's audio comes back on a second track.
+- **`smoke`'s relaxed limits** (2 × 2, 30 s with a 5 s warm-up, `-decodable`): final loss < 2 %, egress 50–200 % of
+  the expected, PLIs ≤ 1/s per layer and ≤ 20 in any 10 s, switch p95 < 3 s, A/V p99 ≤ 20 ms. CPU and memory are
+  reported only: in CI the clients share the machine, or the process, with the server.
+- **`all-high`** needs at least one subscriber. It starts as `focus` without the rotation; after the warm-up, every
+  30 s it records the step that ends (full layers, egress and its expected value, average and highest CPU, loss
+  before and after NACK/RTX) and raises the next 10 thumbnails, in random order, to the full layer without sound.
+  **The knee** is the first step whose final (unrecovered) loss exceeds 2 % or whose average server CPU exceeds
+  90 %; it ends the run, and so does a step with no thumbnail left to raise, long before `-duration`. The report
+  has `steps` and `knee`; all-high has no pass criteria (report only).
+- **The JSON report** (`-json FILE`, or `-json -` for stdout with the summary on stderr): CPU and loss in percent,
+  RSS in bytes, rates in Mbit/s, times in ms. Beyond the shape above: `startedAt`, `measuredSeconds`; `server`'s
+  `cpu.max`, `baselineRss`, `peakRss`, `downTracks`, `expectedEgressMbps`, `receivedMbps`, `samples`; `loss`'s
+  `expectedPackets`, `tracks`, `duplicates`; `pli`'s `maxPerSecond`, `maxIn10s`, `total` and per layer; `switchMs`'s
+  `count`, `withoutKeyframe`, `lostStart`, `verified`, `seqGaps`, `tsBack`; `avOffsetMs`'s `count` and `max`;
+  `steps` and `knee` (all-high); `checks` (every criterion with its value, its limit and whether it was checked);
+  `users` (`created`, `deleted`, `kept`); `resumes` (signaling connections that dropped and resumed); `setupError`.
+- **`decodable.spec`** finds the tool through `LOADTEST_BIN` (05 §19.3), which CI sets to a binary its `build` job
+  made with `CGO_ENABLED=0 go build -trimpath` (06 §8.2); without it the spec builds the tool with the Go on the
+  `PATH`. The tool is test tooling: the release builds only `cmd/isshoni` (06).
 
 ## 16. Room for later milestones
 
@@ -2617,6 +2817,31 @@ state, budget, backoff and cause), `BackoffStart` and `ProbeTime`:
   150 KB burst takes 50 ms from an empty bucket**, as right after another burst, which is what the case means; from
   a full one its 60 KB leave at once and the burst takes 30 ms (§9.8). `TestPacerSchedule` checks both, and
   `TestPacerWriter` empties the bucket with a 60 KB burst first.
+- **Uplink control** (README S88, `uplink_test.go` and `pausing_test.go`, §11): `TestM1UplinkPolicy` (the policy on a
+  fake clock: the admin's cap always; the full layer off once nobody has asked for `high` for 10 s, not a nanosecond
+  before, counted from the share's start or from the first look that finds the request gone; on again with the first
+  request; never off without a preview layer), `TestUplinkHints` (a hint when the cap changes, with the reason
+  `admin`, and when the pause state does, `viewers`; both in one hint with `viewers`; a request that ended 0.9 s after
+  a look is not paused 9.1 s later; a paused layer's keyframe requests do nothing, so the one after the resume finds
+  the throttle unspent; a viewer held at the preview layer by its allocator still counts as asking for `high`;
+  `UpdateShare` and `Resync` say the same), `TestUplinkUpdateShare` (an `UpdateShare` between a new cap and the look
+  `SetLimits` posts returns the new cap, and the look still sends the `admin` hint), `TestAllocatorPausedLayer` (a
+  `high` for a paused share in `limited` is capped with `bandwidth` when the full layer's maximum doesn't fit, still
+  resumes it, and weighs the maximum for 2 s after the resume), `TestUplinkREMB` (one REMB per look while every
+  share of the pub PC has a cap: the sum, naming the video SSRCs, paused ones included, sorted; none while one share
+  has no cap or the PC is away; three of 1 Gbit/s once the cap goes, then none; a new pub PC is owed none),
+  `TestLayerJitter` (§9.1: 0 for packets on time, |D| for a delay that alternates by D, late packets and a pause of
+  more than 10 s change nothing, a frame of many packets is one sample), and the three on real PCs:
+  `TestAdminCapREMB` (the slice's acceptance: with `MaxShareKbps` set the pub PC gets the REMB every second, naming
+  its video layers; a new cap reaches the sharer at once as an `admin` hint and the next REMB; when the cap goes the
+  hint says so, then three REMBs of no limit, then none), `TestLayerPausing` (nobody asks for `high` for 10 s, and
+  the sharer, which applies the hint as a browser would through `sfutest.ApplyHint`, pauses the full layer; the
+  share stays live with both layers listed; a WebSocket resume brings the hint again; a request for `high` resumes
+  it at once with a PLI, and the viewer's stream goes on in the full layer from its keyframe; back on the preview
+  layer it is paused again 10 s after the first look that finds the request gone) and `TestLayerPausingOff`
+  (`sfu.pause_unwatched_layers = false`: no hint for an hour, and the full layer keeps flowing). `core_test`'s
+  `TestShareParams` has the paused encodings, `surface_test` the new types and the two reasons, `publish`'s
+  `TestSetActive` the Publisher's side and `sfutest`'s `TestApplyHint` the hint's.
 - `sdpcheck_test`: each validation code; a sending m-section without a binding, or bound to a share that isn't this
   Conn's, carries no share and is no error (and skips the per-share checks, the kind check included); the Opus edit
   per m-line (stereo and `maxaveragebitrate`) and `a=inactive` on the m-lines without a share; the answer check for
@@ -2812,7 +3037,16 @@ throttle, with no reload.
 
 **Load (M1)**: `isshoni-loadtest -scenario focus` on a 4 vCPU VPS from a second VM, pass criteria in §15.2 (a manual
 milestone gate before the M1 exit test). `-scenario smoke` runs as a Go test in `test-go` against an in-process server
-(S89).
+(S89). As README S89 wrote the tool's tests (`cmd/isshoni-loadtest`, each against an in-process server, with goleak
+in `TestMain`): `TestSmoke` (`-scenario smoke` exits 0 with a JSON report that passes, and the accounts it made from
+its invite are gone afterwards), `TestFocusRotation` (a short `focus` run whose subscribers move their focus every
+3 s: every switch measured, on a keyframe, with seq and ts continuous), `TestAllHighSteps` (steps of one thumbnail
+each, ending when nothing is left to raise), `TestInterrupted` (exit 130, the accounts deleted all the same),
+`TestLostSignUpAnswer` (an account whose sign-up answer never came is deleted too), `TestUnreachableServer` and
+`TestWrongPassword` (exit 2), `TestUsage` and `TestFlagDefaults`; and the analysis on its own in `measure_test.go`
+(`TestParseLayer` with `FuzzParseLayer`, the percentiles, CPU, PLI windows, rates and expected egress, loss totals,
+`TestFindSwitch`, `TestCheckSwitch` (the second look after repairs: a seq gap at the layer change, an SPS packet
+that came late, a timestamp that doesn't move forward), the timestamps and the A/V pairs' NTP mapping).
 
 ## 18. Interfaces other docs rely on
 
@@ -2828,8 +3062,9 @@ milestone gate before the M1 exit test). `-scenario smoke` runs as a Go test in 
   `SubscriptionStats`, `DownTrackStats`),
   `Snapshot` and its types (`RoomSnapshot`, `ShareSnapshot`, `ViewerCounts`, `ConnSummary`, `SnapshotTotals`),
   `Metrics` and its label values (§13), `ProbeTransport` (with `ProbeUDP`, `ProbeTCP443`, `ProbeTCP7882`),
-  `ProbeResult` and its `Err` values `ProbeErrTimeout` and `ProbeErrClosed` (§7.6, README S76). Later:
-  `RoomLimits`, `SetRoomLimits`.
+  `ProbeResult` and its `Err` values `ProbeErrTimeout` and `ProbeErrClosed` (§7.6, README S76), and the uplink
+  control of §11 (README S88): `UplinkPolicy`, `ShareUplinkStats`, `LayerUplinkStats`, `UplinkDecision`,
+  `HintReasonAdmin` and `HintReasonViewers`. Later: `RoomLimits`, `SetRoomLimits`.
   `Role`, `ClientKind` and `PCKind` have no valid zero value (§6.1).
 - **Wire-visible conventions** (through 01's `sfuplane`): rids `f`/`q`, at most 2, or none (`h` rejected until M5);
   share ids from the hub; sub msid = share id and track ids `v-`/`a-`+share id (debugging aid; mapping is by
@@ -2843,8 +3078,9 @@ milestone gate before the M1 exit test). `-scenario smoke` runs as a Go test in 
 - **`internal/media/fake`** (`Source`, `Packet`, `Config`, `Mode`) for M2's fake engine; **`internal/client/publish`**
   (`Publisher`) as the start of M2's client core; **`internal/server/sfu/sfutest`** (`Harness`, `DirectSignaler`,
   `Viewer`, `FaultConn`) for 01's integration tests in `internal/server/itest`.
-- **`cmd/isshoni-loadtest`** CLI and exit codes (§15.2) for the `smoke` Go test in `test-go` against an in-process
-  server (S89), `web/e2e/decodable.spec.ts` (S89, §17) and the exit-test pre-flight.
+- **`cmd/isshoni-loadtest`** CLI and exit codes (§15.2: 0, 1, 2 and 130) for the `smoke` Go test in `test-go`
+  against an in-process server (S89), `web/e2e/decodable.spec.ts` (S89, §17; the binary through `LOADTEST_BIN`,
+  05 §19.3, 06 §8.2), README S92's load gate and the exit-test pre-flight.
 
 ## 19. Depends on
 
@@ -2986,9 +3222,9 @@ tests of the timers and guards in `guards_test.go`).
   `TestRemoteCandidateCapIsPions`, `TestPubCandidatesOfALaterGen`, and `TestCandidateKey` with `FuzzCandidateKey`,
   which tie the count's key to `ice.Candidate.Equal`.
 
-Still to come in the paths S57 touched: the last `QualityHintEvent` per share in `Resync()` (README S88, which
-sends the first ones), and the SFU's own codec rebuilds, which the creation limit won't count (README S69 built
-them, §8.5).
+Still to come in the paths S57 touched, when S57 merged: the last `QualityHintEvent` per share in `Resync()` (README
+S88 built it, rebuilt from the current state, §6.2), and the SFU's own codec rebuilds, which the creation limit won't
+count (README S69 built them, §8.5).
 
 **What README S63 built** (slice 8; integration 4, 5, 6 and 19 in `repair_test.go`, the unit tests in
 `rtx_test.go`). Repair is §9.5 in the order of its steps, with the cap of 256 sequence numbers per compound
@@ -3050,6 +3286,25 @@ the allocator's lock, and a REMB past an int64 broke the arithmetic on arm64). T
 subpackage was outside S84's listed paths (README §5: a package means its own directory); the spec asks for it, and
 group 12 accepted it.
 
+**What README S88 built** (slice 13, cuttable and not cut: §11 "As README S88 built it"; `uplink.go`, with changes
+to `share.go`, `layer.go`, `allocator.go`, `subscription.go`, `conn.go` and `sfu.go`; `publish.Publisher.SetActive`;
+`sfutest.ApplyHint`; the tests in §17). The admin's cap reaches running shares as a quality hint with the reason
+`admin` and as one REMB per pub PC with the sum of its shares' caps, and three REMBs of 1 Gbit/s once the cap goes;
+layer pausing is on by default (README §6 "Decided after group 13") and pauses only the full layer of a share with a
+preview layer, 10 s after the last request for `high` ended (counted from the share's start or the first look that
+found the request gone) and resumes it at once on any new request, with a PLI that a paused layer's dropped keyframe
+requests leave unthrottled; `UpdateShare`'s encodings and `Resync`'s rebuilt hint carry the cap and pause state; the
+downlink allocator weighs a paused or just resumed layer at its maximum; and layers measure their interarrival
+jitter per frame. Its review fixes are in the text: the allocator's weight (S88-R1), the 10 s counted from when the
+request ended (S88-R2), one jitter sample per frame (S88-R3), `UpdateShare` no longer taken as told (S88-R4), the
+lock claim of `uplinkStats` (S88-R5). The group 13 e2e run, with pausing on, passed every spec.
+
+**What README S89 built** (slice 15's tool: §15.2 "As README S89 built it"; `cmd/isshoni-loadtest`,
+`web/e2e/decodable.spec.ts`; the tests in §17). It adds `-v`, exit 130, `client.go`, the reported fields beyond
+§15.2's shape, `smoke`'s limits, the expected egress from the measured rates, all-high's knee rule, the memory check
+skipped without an RSS, and `LOADTEST_BIN` for the spec, which the group 13 integration wired into CI (06 §8.2). It
+added the module `golang.org/x/term` v0.47.0 (BSD-3-Clause), which only the tool links.
+
 ## Decisions taken at integration (formerly open questions)
 
 1. **Layer pausing** (§11): on by default, with the switch `sfu.pause_unwatched_layers`; the slice is cuttable to M5.
@@ -3094,3 +3349,22 @@ Decided after group 12 (engineering calls the owner delegated; README §6 (1), (
    decides every cap again, newest `high` first, which can also give an older request its full layer back. With
    `rembsim`, the first failed trial of integration 16 fails on a falling REMB rather than on loss; either fails a
    trial, and the test accepts both.
+
+Decided after group 13 (engineering calls the owner delegated; README §6 "Decided after group 13"):
+
+9. **Layer pausing is on by default** (§11; README S88, which was cuttable and was not cut). With it on, the group 13
+   integration ran every Go test and the whole e2e suite green, `isshoni-loadtest`'s smoke run and S90's tests
+   included. `sfu.pause_unwatched_layers = false` turns it off.
+10. **The admin's cap is one REMB per pub PC** (§11): the sum of the caps of the shares the PC carries, naming all
+    their video SSRCs, and none while one of them has no cap, because Chrome applies a REMB's bitrate to everything
+    the PC sends whichever SSRCs it names. When the cap goes, three REMBs of 1 Gbit/s lift the limit a browser keeps
+    from the last REMB; never a REMB of 0.
+11. **What pausing counts and when** (§11, §9.7, §10.2): any request for `high`, also from a viewer whose decoders
+    can't take the video; the 10 s from the share's start or from the first look that found the last request gone,
+    so a layer is never paused before 10 s without one; never the only layer of a share without a preview layer.
+    A paused layer's keyframe requests do nothing, and the downlink allocator weighs a paused or just resumed layer
+    at its maximum. `UpdateShare`'s encodings and `Resync`'s hint carry the current cap and pause state.
+12. **`isshoni-loadtest` departs from §15.2 in five places** (README S89): exit 130 for an interrupt (the accounts
+    are still deleted); media that never came is a failure (1), not a setup error; `-duration` includes the
+    warm-up; the expected egress comes from the publishers' measured rates; and the memory check is skipped when
+    the server reports no RSS. `smoke`'s limits and all-high's knee are §15.2's "As built".

@@ -6,6 +6,10 @@
 // that wants it (the room's account menu, 05 §11.2) imports this file. Its texts are in the lazy `setup` namespace,
 // so that folder's entry module imports i18n/lazy/setup too (05 §16.5; check:i18n names the file that misses it).
 //
+// "Where to make another" names the way to /admin/invites in the user's menu: Admin → Invites by default, the
+// wizard's and an admin's. A member's menu has "My invites" there instead, so the room's invite dialog gives the
+// card that text with `onceKey` (05 §11.2).
+//
 // The link lives in the caller's state until the admin is done with it: never in the REST cache, never in storage
 // (05 §20). The clipboard is written only on a click.
 import { Check, Copy, Share } from 'lucide-react';
@@ -27,9 +31,20 @@ import { QrCode } from './QrCode';
 
 const log = createLogger('setup');
 
+/** The `<a>` of the "once" text: the page where a user sees and revokes their invites and makes new ones. */
+const invitesLink = { a: <Link to="/admin/invites" /> };
+
 export interface InviteLinkCardProps {
   /** POST /api/v1/invites's answer (03 §12.4.5): the link, and the invite with its expiry and its uses. */
   created: CreateInviteResponse;
+  /**
+   * The message key of the text that says the link can't be shown again and where to find the invite and make
+   * another: a <Trans> message whose `<a>…</a>` becomes the link to /admin/invites. Its text names that page as the
+   * user's menu does. Default `setup.inviteCard.once`, "under Admin → Invites", for an admin (the wizard).
+   * check:i18n reads only literal keys (t('…'), i18nKey="…"), so it doesn't check a key given here: the caller's
+   * test asserts the card's text, which shows the bare key when the catalog lacks it.
+   */
+  onceKey?: string;
   className?: string;
 }
 
@@ -46,7 +61,7 @@ function isAbort(err: unknown): boolean {
   return err instanceof DOMException && err.name === 'AbortError';
 }
 
-export function InviteLinkCard({ created, className }: InviteLinkCardProps) {
+export function InviteLinkCard({ created, onceKey, className }: InviteLinkCardProps) {
   const { t, i18n } = useTranslation();
   const { ui } = useApp();
   const serverName = useInfo().data?.server.name ?? '';
@@ -158,7 +173,12 @@ export function InviteLinkCard({ created, className }: InviteLinkCardProps) {
             </p>
           )}
           <p className={styles.once}>
-            <Trans i18nKey="setup.inviteCard.once" components={{ a: <Link to="/admin/invites" /> }} />
+            {/* The default key as a literal, so that check:i18n sees it (05 §16.5: `setup` is a lazy namespace). */}
+            {onceKey === undefined ? (
+              <Trans i18nKey="setup.inviteCard.once" components={invitesLink} />
+            ) : (
+              <Trans i18nKey={onceKey} components={invitesLink} />
+            )}
           </p>
           {share && (
             <Button

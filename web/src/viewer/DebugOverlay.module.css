@@ -1,0 +1,104 @@
+/*
+ * The debug overlay (05 §10.7): a dark panel over the layout's top corner, above the stage's controls, in small
+ * monospace text. It scrolls by itself and never grows past the layout, so the stage stays usable under it. White
+ * on near-black passes WCAG AA, also over a bright picture.
+ */
+.overlay {
+  position: absolute;
+  inset-block-start: calc(var(--space-2) + var(--safe-top));
+  inset-inline-start: calc(var(--space-2) + var(--safe-left));
+  z-index: calc(var(--z-stage-controls) + 1);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: min(26rem, calc(100% - 2 * var(--space-2)));
+  max-height: calc(100% - 2 * var(--space-2));
+  padding: var(--space-2) var(--space-3);
+  overflow: auto;
+  overscroll-behavior: contain;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--leading-tight);
+  color: var(--color-on-stage);
+  background-color: rgb(0 0 0 / 0.82);
+  border-radius: var(--radius-md);
+}
+
+.header {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  justify-content: space-between;
+}
+
+.title {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-bold);
+}
+
+.close {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--tap-target);
+  min-height: var(--tap-target);
+  margin: calc(-1 * var(--space-2));
+  color: inherit;
+  background: none;
+  border: 0;
+  border-radius: var(--radius-md);
+}
+
+.close:hover {
+  background-color: rgb(255 255 255 / 0.15);
+}
+
+/* The page's focus colour is too dark on the panel's black. */
+.close:focus-visible {
+  outline-color: var(--color-on-stage);
+  outline-offset: calc(-1 * var(--focus-ring-width));
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.heading {
+  overflow: hidden;
+  font-size: var(--text-xs);
+  font-weight: var(--weight-bold);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rows {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 2px var(--space-2);
+}
+
+/* Each label and value pair is a row of the grid. */
+.row {
+  display: contents;
+}
+
+.row > dt {
+  color: rgb(255 255 255 / 0.75);
+}
+
+.row > dd {
+  overflow-wrap: anywhere;
+}
+
+.note {
+  color: rgb(255 255 255 / 0.75);
+}
+
+@media (forced-colors: active) {
+  .overlay {
+    border: var(--border-width) solid CanvasText;
+  }
+}
