@@ -1,9 +1,11 @@
 # Developer tasks for isshoni (https://taskfile.dev). `task --list` shows them; the contract for each one is
-# docs/m1/06-deploy-and-ci.md §7.2.
+# docs/m1/06-deploy-and-ci.md §7.2, and for the Windows app's tasks (desktop:*, native:*, ffmpeg:*, release:wails3,
+# release:update-keys, lint:ps, test:ps, the Wails part of lint:pins) docs/m2/06-windows-release.md §17.
 #
 # Task runs every command through its built-in POSIX shell, so the tasks work on macOS, Linux and Windows (a few are
-# Linux-only and say so). A task whose inputs do not exist yet (the web app, the installer, the site, ...) prints a
-# note and exits 0.
+# Linux-only, Windows-only or Mac-and-Linux-only and say so). A task whose inputs do not exist yet (the web app, the
+# installer, the site, ...) prints a note and exits 0. So does each M2 task that a later slice of docs/m2/README.md
+# fills in: its note names that slice, and only that slice changes its body.
 #
 # No Task yet? Build the pinned one: `go -C tools build -o ../.bin/ github.com/go-task/task/v3/cmd/task`, then run
 # `.bin/task setup` (see CONTRIBUTING.md).
@@ -32,6 +34,8 @@ vars:
   GO_LICENSES: '.bin/go-licenses{{exeExt}}'
   TYGO: '.bin/tygo{{exeExt}}'
   SHFMT: '.bin/shfmt{{exeExt}}'
+  # The wails3 CLI, from its own module tools/wails3/go.mod (`task release:wails3`).
+  WAILS3: '.bin/wails3{{exeExt}}'
 
 tasks:
   # ---------------------------------------------------------------------------------------------------------------
@@ -182,29 +186,61 @@ tasks:
         if: '[ -d internal/protocol/gen/tsregistry ]'
 
   gen:check:
-    desc: Fail when web/src/protocol/*.gen.ts differs from what `task gen` writes (the CI drift check)
+    desc: >-
+      Fail when web/src/protocol/*.gen.ts or web/src/platform/desktop/*.gen.ts differs from what `task gen` writes (the
+      CI drift check)
     cmds:
       - task: gen
       # Only the generated files: uncommitted hand-written files next to them (signal-client.ts, rest.ts, ...) are
-      # not drift.
+      # not drift. tygo.yaml's desktop entry writes web/src/platform/desktop/codes.gen.ts (docs/m2/06 §10.1).
       - cmd: |
-          drift=$(git status --porcelain -- 'web/src/protocol/*.gen.ts')
+          drift=$(git status --porcelain -- 'web/src/protocol/*.gen.ts' 'web/src/platform/desktop/*.gen.ts')
           if [ -n "$drift" ]; then
             echo "$drift"
-            echo 'gen:check: the generated TypeScript in web/src/protocol/*.gen.ts is out of date: run "task gen" and commit the result' >&2
+            echo 'gen:check: the generated TypeScript (web/src/protocol/*.gen.ts, web/src/platform/desktop/*.gen.ts) is out of date: run "task gen" and commit the result' >&2
             exit 1
           fi
         silent: true
+
+  gen:bindings:
+    desc: >-
+      Generate the TypeScript bindings of the desktop app's bound services into web/src/platform/desktop/bindings/
+      (GOOS=windows wails3 generate bindings; run it after a change to the services and commit the result)
+    cmds:
+      - cmd: "echo 'gen:bindings: note: cmd/isshoni-desktop does not exist yet, nothing to generate'"
+        silent: true
+        if: '[ ! -d cmd/isshoni-desktop ]'
+      - task: release:wails3
+        if: '[ -d cmd/isshoni-desktop ]'
+      # GOOS=windows: on Linux the generator would see only the stub main of docs/m2/06 D18, so no services. -clean
+      # (the default) empties the folder first, so a removed method leaves no stale file behind.
+      - cmd: GOOS=windows {{.WAILS3}} generate bindings -ts -silent -d web/src/platform/desktop/bindings ./cmd/isshoni-desktop
+        if: '[ -d cmd/isshoni-desktop ]'
+
+  gen:bindings:check:
+    desc: Fail when web/src/platform/desktop/bindings/ differs from what `task gen:bindings` writes (the CI drift check)
+    cmds:
+      - task: gen:bindings
+      - cmd: |
+          drift=$(git status --porcelain -- web/src/platform/desktop/bindings)
+          if [ -n "$drift" ]; then
+            echo "$drift"
+            echo 'gen:bindings:check: the bindings in web/src/platform/desktop/bindings/ are out of date: run "task gen:bindings" and commit the result' >&2
+            exit 1
+          fi
+        silent: true
+        if: '[ -d cmd/isshoni-desktop ]'
 
   # ---------------------------------------------------------------------------------------------------------------
   # Tests
 
   test:
-    desc: Run every test suite (test:go, test:web, test:sh)
+    desc: Run every test suite (test:go, test:web, test:sh, test:ps); native:test is separate (it fetches vcpkg)
     cmds:
       - task: test:go
       - task: test:web
       - task: test:sh
+      - task: test:ps
 
   test:go:
     desc: >-
@@ -278,11 +314,21 @@ tasks:
         silent: true
         if: '[ -f deploy/test/install_unit.sh ]'
 
+  test:ps:
+    desc: >-
+      Run the Pester tests of install-desktop.ps1 under pwsh (deploy/test/install-desktop.Tests.ps1; Windows
+      PowerShell 5.1 runs them in CI's windows-desktop job)
+    cmds:
+      - cmd: "echo 'test:ps: note: not implemented yet; README WA49 adds it with deploy/install-desktop.ps1 (docs/m2/06 §16). Nothing was run.'"
+        silent: true
+
   # ---------------------------------------------------------------------------------------------------------------
   # Linters
 
   lint:
-    desc: Run every linter (lint:go, lint:web, lint:sh, lint:actions, lint:keys, lint:pins, lint:unit)
+    desc: >-
+      Run every linter (lint:go, lint:web, lint:sh, lint:actions, lint:keys, lint:pins, lint:unit, lint:native,
+      lint:ps)
     cmds:
       - task: lint:go
       - task: lint:web
@@ -291,28 +337,64 @@ tasks:
       - task: lint:keys
       - task: lint:pins
       - task: lint:unit
+      - task: lint:native
+      - task: lint:ps
 
   lint:go:
-    desc: golangci-lint, go mod tidy -diff, and go vet for GOOS darwin and windows (the main module and tools/)
+    desc: >-
+      golangci-lint (also with GOOS=windows), go mod tidy -diff, go vet for GOOS darwin and windows, and the
+      cross-builds of lint:go:cross (the main module; golangci-lint, vet and tidy for tools/ too)
     deps: [tools:golangci-lint]
     vars:
       # As in test:go: empty only while the main module has no packages.
       GO_PKGS:
         sh: go list -e ./... 2>/dev/null || echo 'go list failed'
     cmds:
-      - cmd: "echo 'lint:go: note: the main module has no Go packages yet, skipping golangci-lint and go vet for it'"
+      - cmd: "echo 'lint:go: note: the main module has no Go packages yet, skipping golangci-lint, go vet and the cross-builds for it'"
         silent: true
         if: '{{if .GO_PKGS}}false{{else}}true{{end}}'
       - cmd: '{{.GOLANGCI_LINT}} run'
+        if: '{{if .GO_PKGS}}true{{else}}false{{end}}'
+      # The Windows-only files (the x/sys/windows loader of internal/media/native, the updater's apply_windows.go,
+      # the app's winos) are linted only with GOOS=windows (docs/m2/06 §10.1).
+      - cmd: GOOS=windows {{.GOLANGCI_LINT}} run
         if: '{{if .GO_PKGS}}true{{else}}false{{end}}'
       - cmd: GOOS=darwin go vet ./...
         if: '{{if .GO_PKGS}}true{{else}}false{{end}}'
       - cmd: GOOS=windows go vet ./...
         if: '{{if .GO_PKGS}}true{{else}}false{{end}}'
+      - task: lint:go:cross
+        if: '{{if .GO_PKGS}}true{{else}}false{{end}}'
       - go mod tidy -diff
       - cd tools && ../{{.GOLANGCI_LINT}} run ./...
       - go -C tools vet ./...
       - go -C tools mod tidy -diff
+
+  lint:go:cross:
+    desc: >-
+      Cross-builds without cgo: GOOS=windows go build ./internal/... ./cmd/... (the Windows app needs no cgo), and the
+      gomobile check, package builds of ./internal/client/... and ./internal/media for android and ios on arm64
+    env:
+      CGO_ENABLED: '0'
+    vars:
+      # ./internal/media joins once its root package exists (README WA02); a directory without Go files would fail
+      # go build. Only shell builtins, so this works in Task's shell on Windows too.
+      MOBILE_PKGS:
+        sh: |
+          pkgs=./internal/client/...
+          for f in internal/media/*.go; do
+            case $f in
+            *_test.go) ;;
+            *) if [ -f "$f" ]; then pkgs="$pkgs ./internal/media"; break; fi ;;
+            esac
+          done
+          echo "$pkgs"
+    cmds:
+      # docs/m1/01 §14 and docs/m2/06 §10.1: whatever the app links must stay buildable for Windows from any host.
+      - GOOS=windows GOARCH=amd64 go build ./internal/... ./cmd/...
+      # The gomobile check of docs/m2/01 §4: package builds only (no linking), so no mobile toolchain is needed.
+      - for: [android, ios]
+        cmd: GOOS={{.ITEM}} GOARCH=arm64 go build {{.MOBILE_PKGS}}
 
   lint:web:
     desc: Lint and type-check the web app
@@ -367,9 +449,52 @@ tasks:
       - go -C tools run ./repocheck -root .. keys
 
   lint:pins:
-    desc: Check that .tool-versions, the go.mod toolchain and the tools/go.mod versions agree
+    desc: >-
+      Check that .tool-versions, the go.mod toolchain and the versions of tools/go.mod, tools/goreleaser/go.mod and
+      tools/wails3/go.mod agree, and that Wails is one version in go.mod, tools/wails3/go.mod and (exactly, without the
+      "v") @wailsio/runtime in web/package.json and web/package-lock.json
     cmds:
       - go -C tools run ./repocheck -root .. pins
+
+  lint:native:
+    desc: >-
+      Check the format of the C and C++ files under native/ with clang-format --dry-run --Werror and
+      native/.clang-format (CLANG_FORMAT=<binary> picks the binary; outside CI a missing clang-format is skipped)
+    vars:
+      CLANG_FORMAT: '{{.CLANG_FORMAT | default "clang-format"}}'
+    cmds:
+      - cmd: "echo 'lint:native: note: native/.clang-format does not exist yet, nothing to check'"
+        silent: true
+        if: '[ ! -f native/.clang-format ]'
+      # Tracked files only: build trees under native/ (CMake's compiler-id sources, vcpkg_installed/) are not ours.
+      # clang-format takes the nearest .clang-format above each file, which is native/.clang-format.
+      - cmd: |
+          cf='{{.CLANG_FORMAT}}'
+          if ! command -v "$cf" >/dev/null 2>&1; then
+            if [ -n "${CI:-}" ]; then
+              echo "lint:native: $cf is not installed" >&2
+              exit 1
+            fi
+            echo "lint:native: skipped, $cf is not installed here (CI runs clang-format-18; CLANG_FORMAT=<binary> picks another one, on a Mac with Xcode CLANG_FORMAT=\$(xcrun --find clang-format))"
+            exit 0
+          fi
+          set -- $(git ls-files -- 'native/*.h' 'native/*.c' 'native/*.cpp')
+          if [ $# -eq 0 ]; then
+            echo 'lint:native: note: there are no C or C++ files under native/ yet'
+            exit 0
+          fi
+          echo "lint:native: $("$cf" --version) --dry-run --Werror over $# files"
+          "$cf" --dry-run --Werror --style=file "$@"
+        silent: true
+        if: '[ -f native/.clang-format ]'
+
+  lint:ps:
+    desc: >-
+      PSScriptAnalyzer (Warning and Error) and the ASCII check over deploy/install-desktop.ps1, deploy/test/windows/*.ps1,
+      deploy/windows/msvc-env.ps1 and native/windows/tools/*.ps1
+    cmds:
+      - cmd: "echo 'lint:ps: note: not implemented yet; README WA49 adds it with deploy/install-desktop.ps1 (docs/m2/06 §10.1). Nothing was checked.'"
+        silent: true
 
   lint:unit:
     desc: Verify the systemd unit with systemd-analyze (Linux only; skipped elsewhere)
@@ -476,6 +601,235 @@ tasks:
         if: '[ -f web/playwright.config.ts ]'
 
   # ---------------------------------------------------------------------------------------------------------------
+  # Desktop app (docs/m2/03-desktop-app.md, docs/m2/06-windows-release.md §5.2-§5.4)
+
+  desktop:dev:
+    desc: Run the desktop app on this machine with the fake engine and Vite's live reload (docs/m2/03 D3)
+    cmds:
+      - cmd: "echo 'desktop:dev: note: not implemented yet; README WA22 adds it with cmd/isshoni-desktop. Nothing was started.'"
+        silent: true
+
+  desktop:exe:windows:
+    desc: >-
+      Cross-build isshoni.exe (GOOS=windows, no cgo) into dist-desktop/windows_amd64/, stamped with VERSION; TAGS
+      defaults to production, and other tags build into dist-desktop/windows_amd64-test/ (docs/m2/06 §5.2)
+    vars:
+      TAGS: '{{.TAGS | default "production"}}'
+    cmds:
+      - cmd: "echo 'desktop:exe:windows: note: not implemented yet; README WA22 adds it with cmd/isshoni-desktop (WA67 adds its checks). Nothing was built (TAGS={{.TAGS}}).'"
+        silent: true
+
+  desktop:build:e2e:
+    desc: Build the e2e isshoni.exe for the CDP spec (desktop:exe:windows TAGS=e2e; never shipped, docs/m2/03 §22.4)
+    cmds:
+      - task: desktop:exe:windows
+        vars: {TAGS: e2e, VERSION: '{{.VERSION}}'}
+
+  desktop:package:windows:
+    desc: >-
+      Build the NSIS installer from dist-desktop/ and the engine DLLs in NATIVE_DIR (on the Mac with Homebrew's
+      makensis and a plain WriteUninstaller; never released, docs/m2/06 §5.4, §6)
+    cmds:
+      - cmd: "echo 'desktop:package:windows: note: not implemented yet; README WA67 adds it with deploy/windows/nsis/. Nothing was built.'"
+        silent: true
+
+  # ---------------------------------------------------------------------------------------------------------------
+  # Native engine and FFmpeg (docs/m2/04-windows-engine.md §13, docs/m2/06-windows-release.md §4, §5.1, §17)
+  #
+  # Fetched dependencies (vcpkg, the FFmpeg zip, the FFmpeg build's sources) live in .deps/, which these tasks keep
+  # out of git with a .deps/.gitignore of their own. Delete .deps/ to fetch them again.
+
+  native:test:
+    desc: >-
+      Build and test native/common on macOS or Linux - vcpkg at native/vcpkg.json's baseline in .deps/vcpkg
+      (VCPKG_DIR=<dir> elsewhere), then CMake preset host-debug (PRESET=host-tsan, host-asan for the sanitizers)
+    vars:
+      PRESET: '{{.PRESET | default "host-debug"}}'
+      VCPKG_DIR: '{{.VCPKG_DIR | default (print .ROOT_DIR "/.deps/vcpkg")}}'
+    env:
+      VCPKG_DISABLE_METRICS: '1'
+    cmds:
+      - cmd: "echo 'native:test: skipped, the host presets build on macOS and Linux; on Windows run task native:build'"
+        silent: true
+        if: '{{if eq OS "windows"}}true{{else}}false{{end}}'
+      - cmd: "echo 'native:test: note: native/CMakePresets.json and native/vcpkg.json do not both exist yet, nothing to build'"
+        silent: true
+        if: '{{if eq OS "windows"}}false{{else}}! [ -f native/CMakePresets.json ] || ! [ -f native/vcpkg.json ]{{end}}'
+      - cmd: |
+          set -eu
+          die() {
+            printf 'native:test: %s\n' "$@" >&2
+            exit 1
+          }
+          preset='{{.PRESET}}'
+          case $preset in
+          host-*) ;;
+          *) die "PRESET=$preset is not a host preset (host-debug, host-tsan, host-asan): this task builds native/common only" ;;
+          esac
+          # The vcpkg commit that native/vcpkg.json's builtin-baseline names (docs/m2/04 §13.1).
+          baseline=$(sed -n 's/.*"builtin-baseline"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' native/vcpkg.json)
+          [ -n "$baseline" ] || die 'native/vcpkg.json has no "builtin-baseline" with a 40-hex vcpkg commit'
+          deps() {
+            mkdir -p .deps
+            [ -f .deps/.gitignore ] || printf '%s\n' '# Fetched by the native and ffmpeg tasks (Taskfile.yml).' '*' >.deps/.gitignore
+          }
+          dir='{{.VCPKG_DIR}}'
+          # A relative VCPKG_DIR is the repository's: the presets read $VCPKG_ROOT from native/ and its build tree.
+          case $dir in
+          /*) ;;
+          *) dir='{{.ROOT_DIR}}'/${dir#./} ;;
+          esac
+          case $dir in '{{.ROOT_DIR}}/.deps/'*) deps ;; esac
+          # vcpkg's binary packages go to .deps/ too, not to ~/.cache/vcpkg, unless the caller chose a binary cache
+          # (CI's native-host does).
+          if [ -z "${VCPKG_BINARY_SOURCES:-}" ] && [ -z "${VCPKG_DEFAULT_BINARY_CACHE:-}" ]; then
+            deps
+            mkdir -p .deps/vcpkg-cache
+            export VCPKG_DEFAULT_BINARY_CACHE='{{.ROOT_DIR}}/.deps/vcpkg-cache'
+          fi
+          # A shallow fetch of exactly the baseline: vcpkg resolves every port at that commit, whose trees are in it.
+          if [ "$(git -C "$dir" rev-parse -q --verify HEAD 2>/dev/null || :)" != "$baseline" ]; then
+            echo "native:test: fetching vcpkg $baseline into $dir"
+            if [ ! -d "$dir/.git" ]; then
+              mkdir -p "$dir"
+              git -C "$dir" init -q
+              git -C "$dir" remote add origin https://github.com/microsoft/vcpkg.git
+            fi
+            git -C "$dir" fetch -q --depth 1 origin "$baseline"
+            git -C "$dir" checkout -q --detach FETCH_HEAD
+            # The vcpkg tool is pinned by the checkout (scripts/vcpkg-tool-metadata.txt): fetch it again.
+            rm -f "$dir/vcpkg"
+          fi
+          if [ ! -x "$dir/vcpkg" ]; then
+            # Downloads the vcpkg tool release that the checkout pins and checks its SHA-512.
+            "$dir/bootstrap-vcpkg.sh" -disableMetrics
+          fi
+          # CMake 3.28 or newer and Ninja (the presets' generator): the ones on PATH, else the copies vcpkg pins and
+          # verifies by SHA-512 (vcpkg fetch), so no global install is needed.
+          if command -v cmake >/dev/null 2>&1; then cmake=$(command -v cmake); else cmake=$("$dir/vcpkg" fetch cmake | tail -n 1); fi
+          if command -v ninja >/dev/null 2>&1; then ninja=$(command -v ninja); else ninja=$("$dir/vcpkg" fetch ninja | tail -n 1); fi
+          [ -x "$cmake" ] || die "no cmake: vcpkg fetch cmake gave '$cmake'"
+          [ -x "$ninja" ] || die "no ninja: vcpkg fetch ninja gave '$ninja'"
+          ctest=$(dirname "$cmake")/ctest
+          echo "native:test: $preset with vcpkg $baseline, $("$cmake" --version | sed -n 1p), ninja $("$ninja" --version)"
+          export VCPKG_ROOT="$dir"
+          export PATH="$(dirname "$ninja"):$PATH"
+          cd native
+          "$cmake" --preset "$preset" -DCMAKE_MAKE_PROGRAM="$ninja"
+          "$cmake" --build --preset "$preset"
+          "$ctest" --preset "$preset" --output-on-failure
+        silent: true
+        if: '{{if eq OS "windows"}}false{{else}}[ -f native/CMakePresets.json ] && [ -f native/vcpkg.json ]{{end}}'
+
+  native:build:
+    desc: >-
+      Build isshoni-media.dll on a Windows PC - the MSVC environment of deploy/windows/msvc-env.ps1, then presets
+      win-x64-release and win-x64-ci with IM_FFMPEG_ROOT = the ffmpeg:fetch output in .deps/ffmpeg/
+    cmds:
+      - cmd: "echo 'native:build: note: not implemented yet; README WA11 adds it with native/windows/. Nothing was built.'"
+        silent: true
+
+  native:dist:
+    desc: >-
+      Zip the Windows test tools for the owner's PC - isshoni-enginetest.exe, g2g.exe, hwcheck.ps1, the release
+      isshoni-media.dll and the FFmpeg DLLs (docs/m2/06 §17)
+    cmds:
+      - cmd: "echo 'native:dist: note: not implemented yet; README WA24 adds it (WA76 adds hwcheck.ps1 and g2g.exe). Nothing was built.'"
+        silent: true
+
+  ffmpeg:fetch:
+    desc: >-
+      Download the locked FFmpeg build (native/ffmpeg/lock.json) from its deps release into .deps/ffmpeg/ and check
+      its SHA-256 (works on the Mac too)
+    cmds:
+      - cmd: "echo 'ffmpeg:fetch: note: not implemented yet; README WA24 adds it (go -C tools run ./desktoppkg ffmpeg-fetch). Nothing was fetched.'"
+        silent: true
+
+  ffmpeg:build:
+    desc: >-
+      Build the LGPL FFmpeg zip on a Windows PC as ffmpeg.yml does (docs/m2/06 §4.3) - the pins.json sources checked
+      by SHA-256, the MSVC environment, native/ffmpeg/build.sh under MSYS2 (MSYS2_ROOT, default C:/msys64) - in
+      .deps/ffmpeg-build/
+    vars:
+      MSYS2_ROOT: '{{.MSYS2_ROOT | default "C:/msys64"}}'
+    env:
+      MSYS2_ROOT: '{{.MSYS2_ROOT}}'
+      # Step 1 of docs/m2/06 §4.3, in Windows PowerShell 5.1 (every Windows 10 and 11 has it): download each
+      # pins.json URL into .deps/ffmpeg-build/src/ (3 tries) under the name native/ffmpeg/build.sh gives it there
+      # (<project>-<version or tag>.tar.*, so build.sh reuses the file and downloads nothing twice) and fail unless its
+      # SHA-256 matches; then the MSVC environment step (docs/m2/06 §3), run as a script, not dot-sourced, and failing
+      # the task on a nonzero exit code; the variables it sets are process-wide, so build.sh in MSYS2's bash inherits
+      # them (steps 2-7) and gets the same work directory with -w. Passed through the environment, so no file is
+      # written.
+      ISSHONI_FFMPEG_BUILD_PS1: |
+        $ErrorActionPreference = 'Stop'
+        Set-StrictMode -Version 3.0
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $ProgressPreference = 'SilentlyContinue'
+        $root = (Get-Location).Path
+        $work = Join-Path $root '.deps\ffmpeg-build'
+        $src = Join-Path $work 'src'
+        New-Item -ItemType Directory -Force -Path $src | Out-Null
+        $ignore = Join-Path $root '.deps\.gitignore'
+        if (-not (Test-Path -LiteralPath $ignore)) {
+          Set-Content -LiteralPath $ignore -Encoding Ascii -Value @('# Fetched by the native and ffmpeg tasks (Taskfile.yml).', '*')
+        }
+        $pins = Get-Content -Raw -Path (Join-Path $root 'native\ffmpeg\pins.json') | ConvertFrom-Json
+        # Each pins.json entry: the field that names its release and build.sh's file name for its tarball.
+        $tarballs = [ordered]@{
+          ffmpeg         = @('version', 'ffmpeg-{0}.tar.xz')
+          nvCodecHeaders = @('tag', 'nv-codec-headers-{0}.tar.gz')
+          amfHeaders     = @('tag', 'AMF-headers-{0}.tar.gz')
+          libvpl         = @('tag', 'libvpl-{0}.tar.gz')
+        }
+        foreach ($name in $tarballs.Keys) {
+          $entry = $pins.PSObject.Properties[$name]
+          if ($null -eq $entry) { throw "ffmpeg:build: native/ffmpeg/pins.json has no $name entry" }
+          $field, $format = $tarballs[$name]
+          $release = $entry.Value.PSObject.Properties[$field]
+          if ($null -eq $release -or [string]::IsNullOrEmpty([string]$release.Value)) {
+            throw "ffmpeg:build: native/ffmpeg/pins.json has no $name.$field"
+          }
+          $url = [string]$entry.Value.url
+          $want = ([string]$entry.Value.sha256).ToLowerInvariant()
+          $file = Join-Path $src ($format -f [string]$release.Value)
+          for ($try = 1; $true; $try++) {
+            if (Test-Path -LiteralPath $file) {
+              $got = (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant()
+              if ($got -eq $want) { break }
+              Remove-Item -LiteralPath $file
+              if ($try -gt 3) { throw "ffmpeg:build: $url has SHA-256 $got, but native/ffmpeg/pins.json pins $want" }
+            } elseif ($try -gt 3) {
+              throw "ffmpeg:build: could not download $url"
+            }
+            Write-Host "ffmpeg:build: downloading $url"
+            try { Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $file } catch { Write-Host "ffmpeg:build: $($_.Exception.Message)" }
+          }
+        }
+        # The script reports a missing VS instance, toolset or SDK with a nonzero exit code, not an exception.
+        $global:LASTEXITCODE = 0
+        & (Join-Path $root 'deploy\windows\msvc-env.ps1')
+        if ($LASTEXITCODE -ne 0) { throw "ffmpeg:build: deploy/windows/msvc-env.ps1 failed (exit code $LASTEXITCODE)" }
+        $bash = Join-Path $env:MSYS2_ROOT 'usr\bin\bash.exe'
+        if (-not (Test-Path -LiteralPath $bash)) { throw "ffmpeg:build: no MSYS2 bash at $bash (install MSYS2, or set MSYS2_ROOT)" }
+        $env:MSYS2_PATH_TYPE = 'inherit'
+        $env:CHERE_INVOKING = '1'
+        $env:SOURCE_DATE_EPOCH = (& git log -1 --format=%ct).Trim()
+        # The exit code decides: Windows PowerShell 5.1 can turn a native program's stderr into errors under 'Stop'.
+        $ErrorActionPreference = 'Continue'
+        & $bash -lc 'native/ffmpeg/build.sh -w .deps/ffmpeg-build'
+        if ($LASTEXITCODE -ne 0) { throw "ffmpeg:build: native/ffmpeg/build.sh failed (exit code $LASTEXITCODE)" }
+    cmds:
+      - cmd: "echo 'ffmpeg:build: skipped, FFmpeg builds with MSVC on Windows only: run it on a Windows PC, or use ffmpeg.yml (task ffmpeg:fetch downloads the locked build)'"
+        silent: true
+        if: '{{if eq OS "windows"}}false{{else}}true{{end}}'
+      - cmd: "echo 'ffmpeg:build: note: native/ffmpeg/build.sh, native/ffmpeg/pins.json and deploy/windows/msvc-env.ps1 do not all exist yet, nothing to build'"
+        silent: true
+        if: '{{if eq OS "windows"}}! [ -f native/ffmpeg/build.sh ] || ! [ -f native/ffmpeg/pins.json ] || ! [ -f deploy/windows/msvc-env.ps1 ]{{else}}false{{end}}'
+      - cmd: powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command '& ([scriptblock]::Create($env:ISSHONI_FFMPEG_BUILD_PS1))'
+        if: '{{if eq OS "windows"}}[ -f native/ffmpeg/build.sh ] && [ -f native/ffmpeg/pins.json ] && [ -f deploy/windows/msvc-env.ps1 ]{{else}}false{{end}}'
+
+  # ---------------------------------------------------------------------------------------------------------------
   # Licenses
 
   licenses:
@@ -557,6 +911,28 @@ tasks:
     generates: ['.bin/goreleaser{{exeExt}}']
     cmds:
       - go -C tools/goreleaser build -o ../../.bin/ github.com/goreleaser/goreleaser/v2
+
+  release:wails3:
+    desc: >-
+      Build the pinned wails3 CLI (tools/wails3/go.mod, the Wails version of go.mod) into .bin/; the bindings generator
+      and the Windows resource step run it
+    # A module of its own, like tools/goreleaser (docs/m2/06 §3): the CLI's dependency graph stays out of tools/go.mod,
+    # and Dependabot's /tools entry never bumps it. lint:pins keeps its Wails version equal to go.mod's. Rebuilt when
+    # tools/wails3/go.mod or go.sum changes, like the tools:* tasks; it builds without cgo on every OS.
+    run: once
+    env: {CGO_ENABLED: '0'}
+    sources: [tools/wails3/go.mod, tools/wails3/go.sum]
+    generates: ['{{.WAILS3}}']
+    cmds:
+      - go -C tools/wails3 build -o ../../.bin/ github.com/wailsapp/wails/v3/cmd/wails3
+
+  release:update-keys:
+    desc: >-
+      Write deploy/keys/update_signers into internal/update/signers.go, print the update keys' fingerprints and run
+      lint:keys (docs/m2/06 §8.12, §11.5)
+    cmds:
+      - cmd: "echo 'release:update-keys: note: not implemented yet; README WA25 adds it with internal/update. Nothing was written.'"
+        silent: true
 
   release:snapshot:
     desc: >-
@@ -1013,14 +1389,14 @@ tasks:
 
   clean:
     desc: >-
-      Remove build output (bin/, dist/, dist-extra/, web/dist/* except .gitkeep), .dev/, and the pinned tools in .bin/
-      except task
+      Remove build output (bin/, dist/, dist-extra/, dist-desktop/, web/dist/* except .gitkeep), .dev/, and the pinned
+      tools in .bin/ except task; the fetched dependencies in .deps/ stay (delete the folder to fetch them again)
     cmds:
       # .bin/task stays (06 §7.2 says .bin/): it is often the Task running this command, and deleting it would leave
       # a contributor without the go-built Task (Windows cannot delete a running .exe anyway). `task tools` builds
       # the others again.
-      - rm -rf bin dist dist-extra .dev .task
+      - rm -rf bin dist dist-extra dist-desktop .dev .task
       - >-
         rm -rf {{.GOLANGCI_LINT}} {{.TYGO}} {{.GO_LICENSES}} .bin/govulncheck{{exeExt}} {{.SHFMT}}
-        .bin/goreleaser{{exeExt}}
+        .bin/goreleaser{{exeExt}} {{.WAILS3}}
       - rm -rf web/dist/*
