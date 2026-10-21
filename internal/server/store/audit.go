@@ -42,8 +42,8 @@ const (
 	defaultSecurityMax = 20 // the dashboard's security events list (03 §12.4.8)
 )
 
-// securityActions are the actions 03 §10 flags as security events (column Sec). settings.changed counts only when
-// it changed registrationMode (securityEventSQL).
+// securityActions are the actions 03 §10 and M2 02 §8 flag as security events (column Sec). settings.changed counts
+// only when it changed registrationMode (securityEventSQL).
 var securityActions = []string{
 	"setup.completed",
 	"auth.throttled",
@@ -52,6 +52,7 @@ var securityActions = []string{
 	"user.deleted",
 	"user.password_reset_issued",
 	"secrets.rotated",
+	"device.linked", // M2 02 §8: a new device on the account (§5.5, remote phishing)
 	"device.refresh_reused",
 }
 

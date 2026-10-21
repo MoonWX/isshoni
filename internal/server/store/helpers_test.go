@@ -223,7 +223,8 @@ func (e *testEnv) newSession(db *DB, u UserID, h string, at time.Time, opts ...f
 	return s
 }
 
-// newDevice inserts a linked device of u (CreateDevice is M2, so this uses SQL).
+// newDevice inserts a linked device of u with SQL, created and last seen at lastSeen (the M1 tests' fixture;
+// devices_test.go uses CreateDevice).
 func newDevice(t *testing.T, db *DB, id DeviceID, u UserID, lastSeen time.Time) {
 	t.Helper()
 	mustExecW(t, db, `INSERT INTO devices (id, user_id, name, client_kind, os, app_version, linked_via, created_at,
