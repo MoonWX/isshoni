@@ -66,6 +66,8 @@ type Engine struct {
 	seed       uint64
 	flashEvery time.Duration
 
+	done chan struct{} // closed by Close: ends a Pick that waits out PickDelay
+
 	mu       sync.Mutex // guards the fields below
 	closed   bool
 	picking  bool
@@ -108,7 +110,7 @@ var encoderTokens = []string{"nvenc", "qsv", "amf", "mf-hw", "mf-sw", "openh264"
 func NewEngine(cfg EngineConfig) *Engine {
 	e := &Engine{
 		mode: cfg.Mode, sourceSize: cfg.SourceSize, cancel: cfg.Cancel, pickDelay: cfg.PickDelay,
-		scenario: cfg.AudioScenario, seed: cfg.Seed, flashEvery: cfg.FlashEvery,
+		scenario: cfg.AudioScenario, seed: cfg.Seed, flashEvery: cfg.FlashEvery, done: make(chan struct{}),
 	}
 	if e.sourceSize[0] <= 0 || e.sourceSize[1] <= 0 {
 		e.sourceSize = [2]int{DefaultSourceWidth, DefaultSourceHeight}
@@ -198,8 +200,9 @@ func (e *Engine) Sources(ctx context.Context) ([]media.Source, error) {
 // Pick implements media.Engine: after EngineConfig.PickDelay it returns EngineConfig.PickResult under a fresh
 // "pick:<n>" ID, or ErrCancelled with EngineConfig.Cancel. When req.Timeout (0 = 120 s, at most 600 s) passes first it
 // returns ErrCancelled, as the native picker does when it times out. When ctx ends first it returns an error that
-// matches both media.ErrCancelled (the native binding's im_cancel_pick) and ctx's error. One pick runs at a time: a
-// second concurrent Pick is ErrBusy.
+// matches both media.ErrCancelled (the native binding's im_cancel_pick) and ctx's error; when the Engine is closed
+// first it returns a stopped error (Reason "closed") at once. One pick runs at a time: a second concurrent Pick is
+// ErrBusy with Reason "pick_busy" (IM_ERR_LIMIT, 04 §5.7: the picker is already open).
 func (e *Engine) Pick(ctx context.Context, req media.PickRequest) (media.Source, error) {
 	const op = "pick"
 	timeout := req.Timeout
@@ -216,7 +219,7 @@ func (e *Engine) Pick(ctx context.Context, req media.PickRequest) (media.Source,
 		return media.Source{}, errClosed(op)
 	case e.picking:
 		e.mu.Unlock()
-		return media.Source{}, errorf(media.CodeBusy, op, "", "another pick is running")
+		return media.Source{}, errorf(media.CodeBusy, op, "pick_busy", "another pick is running")
 	}
 	e.picking = true
 	e.mu.Unlock()
@@ -236,6 +239,9 @@ func (e *Engine) Pick(ctx context.Context, req media.PickRequest) (media.Source,
 		case <-ctx.Done():
 			t.Stop()
 			return media.Source{}, pickCtxError(ctx.Err())
+		case <-e.done:
+			t.Stop()
+			return media.Source{}, errClosed(op)
 		}
 		if e.pickDelay > timeout {
 			return media.Source{}, errorf(media.CodeCancelled, op, "", "the picker timed out after %v", timeout)
@@ -281,8 +287,9 @@ func (e *Engine) prunePicksLocked(now time.Time) {
 
 // Start implements media.Engine. It checks cfg as the native engine does (unknown values, ranges and the source rules
 // are CodeInvalid, a consumed, expired, evicted or unknown pick is source_gone with Reason "pick_expired", a second
-// session is ErrBusy, a forced encoder the probe lacks is no_encoder) and starts a Session: one Source layer per
-// cfg.Layers entry, audio when cfg.Audio is set. A successful Start consumes a picked source; a failed one keeps it.
+// session is ErrBusy with Reason "session_limit" (IM_ERR_LIMIT, 04 §5.7), a forced encoder the probe lacks is
+// no_encoder) and starts a Session: one Source layer per cfg.Layers entry, audio when cfg.Audio is set. A successful
+// Start consumes a picked source; a failed one keeps it.
 func (e *Engine) Start(ctx context.Context, cfg media.Config) (media.Session, error) {
 	const op = "start"
 	if err := ctx.Err(); err != nil {
@@ -294,7 +301,7 @@ func (e *Engine) Start(ctx context.Context, cfg media.Config) (media.Session, er
 	case e.closed:
 		return nil, errClosed(op)
 	case e.sess != nil:
-		return nil, errorf(media.CodeBusy, op, "", "a session is running (the fake runs one at a time)")
+		return nil, errorf(media.CodeBusy, op, "session_limit", "a session is running (the fake runs one at a time)")
 	}
 	plan, err := e.planLocked(cfg)
 	if err != nil {
@@ -311,11 +318,14 @@ func (e *Engine) Start(ctx context.Context, cfg media.Config) (media.Session, er
 	return s, nil
 }
 
-// Close implements media.Engine: it stops the running Session. Afterwards Probe, Sources, Pick and Start return a
-// stopped error (Reason "closed"). Idempotent; it always returns nil.
+// Close implements media.Engine: it stops the running Session and ends a Pick that waits. Afterwards Probe, Sources,
+// Pick and Start return a stopped error (Reason "closed"). Idempotent; it always returns nil.
 func (e *Engine) Close() error {
 	e.mu.Lock()
-	e.closed = true
+	if !e.closed {
+		e.closed = true
+		close(e.done)
+	}
 	e.picks = nil
 	s := e.sess
 	e.mu.Unlock()

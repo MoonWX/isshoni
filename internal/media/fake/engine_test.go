@@ -367,14 +367,43 @@ func TestPickCancelTimeoutCtx(t *testing.T) {
 			done <- err
 		}()
 		synctest.Wait()
-		if _, err := e.Pick(t.Context(), media.PickRequest{}); !errors.Is(err, media.ErrBusy) {
-			t.Errorf("a concurrent Pick: %v, want busy", err)
+		if _, err := e.Pick(t.Context(), media.PickRequest{}); !errors.Is(err, media.ErrBusy) ||
+			reasonOf(err) != "pick_busy" {
+			t.Errorf("a concurrent Pick: %v, want busy (pick_busy)", err)
 		}
 		if err := <-done; err != nil {
 			t.Errorf("the first Pick: %v", err)
 		}
 		if src, err := e.Pick(t.Context(), media.PickRequest{}); err != nil || src.ID != "pick:2" {
 			t.Errorf("a Pick after it: %+v, %v", src, err)
+		}
+	})
+}
+
+// TestCloseEndsPick: Close ends a Pick that waits out PickDelay at once, with a stopped error.
+func TestCloseEndsPick(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := NewEngine(EngineConfig{PickDelay: time.Minute})
+		type result struct {
+			err error
+			d   time.Duration
+		}
+		done := make(chan result)
+		go func() {
+			t0 := time.Now()
+			_, err := e.Pick(t.Context(), media.PickRequest{})
+			done <- result{err, time.Since(t0)}
+		}()
+		synctest.Wait()
+		if err := e.Close(); err != nil {
+			t.Fatal(err)
+		}
+		r := <-done
+		if !errors.Is(r.err, media.ErrStopped) || reasonOf(r.err) != "closed" || r.d != 0 {
+			t.Errorf("Pick when the Engine closes: %v after %v, want stopped (closed) at once", r.err, r.d)
+		}
+		if err := e.Close(); err != nil {
+			t.Errorf("second Close: %v", err)
 		}
 	})
 }
@@ -482,8 +511,8 @@ func TestStartBusyAndCtx(t *testing.T) {
 	defer e.Close()
 	s := mustStart(t, e, testConfig())
 	audioOnly := media.Config{Audio: &media.AudioConfig{}}
-	if _, err := e.Start(t.Context(), audioOnly); !errors.Is(err, media.ErrBusy) {
-		t.Errorf("a second Start: %v, want busy", err)
+	if _, err := e.Start(t.Context(), audioOnly); !errors.Is(err, media.ErrBusy) || reasonOf(err) != "session_limit" {
+		t.Errorf("a second Start: %v, want busy (session_limit)", err)
 	}
 	_ = s.Stop()
 	ctx, cancel := context.WithCancel(t.Context())

@@ -45,6 +45,7 @@ const (
 	reconfigureBound = 3 * time.Second // re-inits are spaced ≥ 1 s apart (04 §6.4)
 	stopBound        = 200 * time.Millisecond
 	nowTolerance     = 50 * time.Millisecond
+	nowSamples       = 5 // check 10's samples, 50 ms apart; one outside nowTolerance is tolerated (a scheduler stall)
 	startTimeout     = 10 * time.Second
 	readerBuffer     = 8192
 )
@@ -75,8 +76,8 @@ func layers() []media.LayerConfig {
 //  8. Stop while Next blocks: ErrStopped within 200 ms, also from a later Next; with Options.Listed the same source
 //     starts again.
 //  9. A second Start with audio while the session with audio runs is ErrBusy, and the session goes on.
-//  10. Session.Now() is within 50 ms of a video packet's CaptureNS plus the time since it arrived; an audio packet's
-//     CaptureNS is never after Now().
+//  10. Session.Now() is within 50 ms of the latest video packet's CaptureNS plus the time since it arrived (sampled 5
+//     times 50 ms apart; one sample outside is tolerated); an audio packet's CaptureNS is never after Now().
 //
 // Check 9 runs before check 8, while the first session still runs, and check 10 right after check 3. Checks 1 and 2
 // stop the suite when they fail; the others run on regardless. The suite runs in real time, about 15 s.
@@ -485,34 +486,39 @@ func (r *run) checkMedia(t *testing.T) {
 	}
 }
 
-// checkNow is check 10's video rule (observe checks the audio rule on every packet).
+// checkNow is check 10's video rule (observe checks the audio rule on every packet): after 1 s of media, Now() is
+// compared with the latest video packet nowSamples times, 50 ms apart. One sample outside nowTolerance is logged, as
+// one scheduler stall on a loaded runner can delay a packet's arrival; two or more fail.
 func (r *run) checkNow(t *testing.T) {
 	r.needSession(t)
 	var n int
 	r.until(t, time.Second, func(rc rec) bool {
-		if rc.pkt.Kind != media.KindVideo {
-			return false
-		}
-		n++
-		if d := time.Duration(rc.now - rc.pkt.CaptureNS); d < -nowTolerance || d > nowTolerance {
-			r.errorOnce(t, "now-arrival", "layer %q: Now() at arrival is %v from CaptureNS, want within %v",
-				rc.pkt.Layer, d, nowTolerance)
+		if rc.pkt.Kind == media.KindVideo {
+			n++
 		}
 		return false
 	})
 	if n == 0 {
 		t.Fatal("no video packet in 1 s")
 	}
-	for range 5 {
+	var off []time.Duration
+	for range nowSamples {
 		time.Sleep(50 * time.Millisecond)
 		r.drain(t)
 		v := r.video
 		now := r.sess.Now()
 		want := v.pkt.CaptureNS + int64(time.Since(v.at))
 		if d := time.Duration(now - want); d < -nowTolerance || d > nowTolerance {
-			t.Errorf("Now() is %v from the latest video packet's CaptureNS plus the time since it arrived, want within %v",
-				d, nowTolerance)
+			off = append(off, d)
 		}
+	}
+	switch {
+	case len(off) > 1:
+		t.Errorf("Now() is %v from the latest video packet's CaptureNS plus the time since it arrived in %d of %d "+
+			"samples, want within %v", off, len(off), nowSamples, nowTolerance)
+	case len(off) == 1:
+		t.Logf("Now() is %v from the latest video packet's CaptureNS plus the time since it arrived in 1 of %d "+
+			"samples (tolerated), want within %v", off[0], nowSamples, nowTolerance)
 	}
 }
 

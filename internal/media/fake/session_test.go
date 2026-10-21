@@ -1140,6 +1140,18 @@ func TestAudioControllerStub(t *testing.T) {
 			t.Errorf("%v, want internal (not_implemented)", err)
 		}
 	}
+	// The mode is checked before the session (05 §13.1: in Go, without a call).
+	for m, want := range map[media.AudioMode]media.ErrorCode{
+		media.AudioOff: media.CodeAudioNotRunning, media.AudioExcludeApps: media.CodeAudioNotRunning,
+		media.AudioEverything: media.CodeInvalid, media.AudioTestTone: media.CodeInvalid, "": media.CodeInvalid,
+	} {
+		if err := ac.SetAudioMode(ctx, m); codeOf(err) != want {
+			t.Errorf("SetAudioMode(%q) without a session = %v, want %q", m, err, want)
+		}
+	}
+	if err := ac.SetAudioMode(ctx, media.AudioOff); !errors.Is(err, media.ErrAudioNotRunning) {
+		t.Errorf("SetAudioMode(off) without a session: %v, want ErrAudioNotRunning", err)
+	}
 	done, cancel := context.WithCancel(ctx)
 	cancel()
 	for _, err := range []error{

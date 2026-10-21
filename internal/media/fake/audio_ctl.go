@@ -10,8 +10,8 @@ import (
 // This file is 05's (docs/m2/05-windows-audio.md §13.3): *Engine's media.AudioController. Until slice WA26 brings the
 // scripted scenarios (EngineConfig.AudioScenario), it is a stub: the watcher and the exclusions are no-ops (an
 // SetExclusions made while a session runs is recorded in its Calls), SetAudioMode and SetAudioMuted follow 05 §13.1's
-// rules (a running session with audio, the M2 modes) and SetAudioMuted silences the session's audio, and the report,
-// the levels and the sound check return a not-implemented error.
+// rules (the M2 modes, then a running session with audio) and SetAudioMuted silences the session's audio, and the
+// report, the levels and the sound check return a not-implemented error.
 
 var _ media.AudioController = (*Engine)(nil)
 
@@ -37,22 +37,23 @@ func (e *Engine) SetExclusions(ctx context.Context, ex media.Exclusions) error {
 	return nil
 }
 
-// SetAudioMode implements media.AudioController: it needs a running session with audio (else ErrAudioNotRunning)
-// and accepts only media.AudioOff and media.AudioExcludeApps (else CodeInvalid, 05 §13.1). The stub changes nothing
-// else.
+// SetAudioMode implements media.AudioController: it accepts only media.AudioOff and media.AudioExcludeApps (else
+// CodeInvalid, checked first, as 05 §13.1's binding does in Go without a call) and needs a running session with audio
+// (else ErrAudioNotRunning). The stub changes nothing else.
 func (e *Engine) SetAudioMode(ctx context.Context, m media.AudioMode) error {
 	const op = "audio_set_mode"
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	switch m {
+	case media.AudioOff, media.AudioExcludeApps:
+	default:
+		return errorf(media.CodeInvalid, op, "", "audio mode %q", m)
+	}
 	if s := e.Session(); s == nil || !s.liveAudio() {
 		return &media.Error{Code: media.CodeAudioNotRunning, Op: op}
 	}
-	switch m {
-	case media.AudioOff, media.AudioExcludeApps:
-		return nil
-	}
-	return errorf(media.CodeInvalid, op, "", "audio mode %q", m)
+	return nil
 }
 
 // SetAudioMuted implements media.AudioController: it needs a running session with audio (else ErrAudioNotRunning);
