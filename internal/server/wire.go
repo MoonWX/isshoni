@@ -239,8 +239,9 @@ func (s *Server) wire(ctx context.Context) error {
 	if err := s.wireOps(); err != nil {
 		return err
 	}
-	// One status source for `isshoni admin status`, for doctor, which examines the server through it, and for the
-	// dashboard. Doctor's own runs start with the server's other work (startBackground).
+	// One status source, statusSource, for doctor, which examines the server through it; the admin socket
+	// (`isshoni admin status`) and the dashboard read it with its dockerBridge added (withDockerBridge, below).
+	// Doctor's own runs start with the server's other work (startBackground).
 	status := s.statusSource()
 	env := s.doctorEnv(status)
 	s.doctor = ops.NewDoctor(ops.DoctorOptions{
@@ -300,7 +301,8 @@ func (s *Server) restartFor(why ops.RestartReason) {
 // doctorEnv returns what a doctor run inside this server sees (doctor.Env, 04 §13.1): the config as the server
 // runs it, with the ports it bound, the server's own status, which is what makes it a run inside the server (the
 // checks then report the bound listeners, the certificate and the detected addresses instead of probing for them),
-// the uid of the process, and the server's test seams. status is the admin socket's GET /v1/status.
+// the uid of the process, and the server's test seams. status is statusSource: the admin socket's GET /v1/status
+// without its dockerBridge, which is public_ip's own verdict (withDockerBridge).
 //
 // The certificate's last error travels in the status as a code only; its fix text, which names what doctor can't
 // know from the code (the address a domain points to, the end of a rate limit), comes from the TLS manager, and
