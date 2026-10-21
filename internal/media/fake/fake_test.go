@@ -5,11 +5,14 @@ import (
 	"context"
 	"errors"
 	"math"
+	"reflect"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"go.uber.org/goleak"
+
+	"github.com/MoonWX/isshoni/internal/media"
 )
 
 func TestMain(m *testing.M) {
@@ -73,6 +76,18 @@ func TestNewConfig(t *testing.T) {
 	}
 }
 
+// TestAliases: the packet types are the media contract's (01 §6.1), so M1's users of fake.Packet compile unchanged
+// against a publish.Source of media.Packet.
+func TestAliases(t *testing.T) {
+	if reflect.TypeFor[Packet]() != reflect.TypeFor[media.Packet]() ||
+		reflect.TypeFor[Kind]() != reflect.TypeFor[media.Kind]() {
+		t.Error("fake.Packet and fake.Kind are not aliases of media.Packet and media.Kind")
+	}
+	if Video != media.KindVideo || Audio != media.KindAudio {
+		t.Errorf("Video = %v, Audio = %v", Video, Audio)
+	}
+}
+
 // collect pulls packets from s for d of (fake) time.
 func collect(t *testing.T, s *Source, d time.Duration) []Packet {
 	t.Helper()
@@ -87,6 +102,25 @@ func collect(t *testing.T, s *Source, d time.Duration) []Packet {
 		}
 		out = append(out, p)
 	}
+}
+
+// packetMarker returns the Marker of a packet a Source made: a frame's from its last NAL unit, an audio packet's from
+// its Opus padding. The packet carries no flash or beep flag of its own (it is a media.Packet, 01 §6.1): the tests
+// read them from the Marker, as sfutest and the load test do.
+func packetMarker(t *testing.T, p Packet) Marker {
+	t.Helper()
+	var m Marker
+	var ok bool
+	if p.Kind == Audio {
+		m, ok = ParseAudioMarker(p.Data)
+	} else {
+		nals := splitAnnexB(t, p.Data)
+		m, ok = ParseVideoMarker(nals[len(nals)-1][1:])
+	}
+	if !ok {
+		t.Fatalf("%s packet %q at %d ns has no marker", p.Kind, p.Layer, p.CaptureNS)
+	}
+	return m
 }
 
 // TestSyntheticBitrate is the 02 §17 fake test: every layer averages its bitrate within ±5% over 30 s, frames come
@@ -125,7 +159,7 @@ func TestSyntheticBitrate(t *testing.T) {
 						t.Errorf("layer %s: keyframe at frame %d, want one every %d frames", l.RID, frames-1, 3*l.FPS)
 					}
 				}
-				if p.Flash {
+				if packetMarker(t, p).Flash {
 					flashes = append(flashes, p.CaptureNS)
 				}
 			}
@@ -151,8 +185,8 @@ func TestSyntheticBitrate(t *testing.T) {
 			if p.Kind != Audio {
 				continue
 			}
-			if m, ok := ParseAudioMarker(p.Data); !ok || m.Frame != uint32(audio) || m.Beep != p.Beep ||
-				m.CaptureNS != p.CaptureNS {
+			m, ok := ParseAudioMarker(p.Data)
+			if !ok || m.Frame != uint32(audio) || m.CaptureNS != p.CaptureNS {
 				t.Fatalf("audio packet %d: marker %+v %v, packet %+v", audio, m, ok, p)
 			}
 			if op, err := parseOpus(p.Data); err != nil || op.samples() != audioPacketSamples {
@@ -161,7 +195,7 @@ func TestSyntheticBitrate(t *testing.T) {
 			if p.CaptureNS != int64(audio)*int64(AudioPacketDuration) {
 				t.Fatalf("audio packet %d at %d ns", audio, p.CaptureNS)
 			}
-			if p.Beep {
+			if m.Beep {
 				if p.CaptureNS%int64(time.Second) != 0 {
 					t.Errorf("beep at %d ns, want whole seconds", p.CaptureNS)
 				}
@@ -195,8 +229,10 @@ func TestSyntheticAU(t *testing.T) {
 				if !ok {
 					t.Fatalf("%s %s: no marker in %x", prof, p.Layer, nals[len(nals)-1][:24])
 				}
-				want := Marker{RID: p.Layer, Keyframe: p.Keyframe, Flash: p.Flash, Frame: next[p.Layer],
-					CaptureNS: p.CaptureNS}
+				// The default flash every second falls on a frame of each of these layers (60, 15 and 30 fps), and
+				// only there.
+				want := Marker{RID: p.Layer, Keyframe: p.Keyframe, Flash: p.CaptureNS%int64(time.Second) == 0,
+					Frame: next[p.Layer], CaptureNS: p.CaptureNS}
 				if m != want {
 					t.Fatalf("%s: marker %+v, want %+v", prof, m, want)
 				}

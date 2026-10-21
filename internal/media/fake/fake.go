@@ -7,38 +7,26 @@ import (
 	"math/rand/v2"
 	"sync"
 	"time"
+
+	"github.com/MoonWX/isshoni/internal/media"
 )
 
-// Kind is a packet's media kind.
-type Kind uint8
+// Kind is a packet's media kind: media.Kind, the media contract's (docs/m2/01-client-core.md §6.1).
+type Kind = media.Kind
 
-// The media kinds. The zero Kind is invalid.
+// The media kinds a Source makes. The zero Kind is invalid.
 const (
-	Video Kind = iota + 1
-	Audio
+	Video = media.KindVideo
+	Audio = media.KindAudio
 )
 
-func (k Kind) String() string {
-	switch k {
-	case Video:
-		return "video"
-	case Audio:
-		return "audio"
-	}
-	return fmt.Sprintf("Kind(%d)", uint8(k))
-}
-
-// Packet is one access unit or one audio packet. It mirrors the native engine's C ABI packet {kind, layer, keyframe,
-// capture_ts_ns, annexb|opus, reinit} (docs/PLAN.md); a fake never re-initializes, so there is no reinit field.
-type Packet struct {
-	Kind      Kind
-	Layer     string // "f" | "q" (a VideoLayer's RID) | "" (audio)
-	Keyframe  bool   // video: an IDR access unit with SPS and PPS in front
-	CaptureNS int64  // monotonic capture time in ns; 0 is the first packet the Source returned
-	Data      []byte // Annex B access unit (with emulation prevention) or one Opus packet; owned by the caller
-	Flash     bool   // this frame shows the sync flash
-	Beep      bool   // this audio packet starts the sync beep
-}
+// Packet is one access unit or one audio packet: media.Packet, the media contract's (docs/m2/01-client-core.md
+// §6.1). A Source sets Kind (Video or Audio), Layer (a VideoLayer's RID, "" for audio), Keyframe, CaptureNS
+// (monotonic, in ns; 0 is the first packet the Source returned) and Data (an Annex B access unit with emulation
+// prevention, or one Opus packet; owned by the caller). It never re-initializes, so Reinit stays false. Whether a
+// frame shows the sync flash, or an audio packet starts the sync beep, is what its Marker says (ParseVideoMarker,
+// ParseAudioMarker).
+type Packet = media.Packet
 
 // Mode picks how video is made.
 type Mode uint8
@@ -399,7 +387,7 @@ func (st *stream) videoFrame(flashEvery int64) Packet {
 	}
 	st.index++
 	st.next = int64(st.index) * int64(time.Second) / int64(st.fps)
-	return Packet{Kind: Video, Layer: st.rid, Keyframe: key, CaptureNS: capture, Data: data, Flash: flash}
+	return Packet{Kind: Video, Layer: st.rid, Keyframe: key, CaptureNS: capture, Data: data}
 }
 
 // frameSize is the access unit size in bytes (02 §15.1): over a GOP of n frames, P = n·avg/(n − 1 + 8) and K = 8·P,
@@ -431,5 +419,5 @@ func (st *stream) audioPacket(flashEvery int64) Packet {
 	data := opusWithMarker(st.opus[st.index%uint32(len(st.opus))], m)
 	st.index++
 	st.next = int64(st.index) * int64(AudioPacketDuration)
-	return Packet{Kind: Audio, CaptureNS: capture, Data: data, Beep: beep}
+	return Packet{Kind: Audio, CaptureNS: capture, Data: data}
 }

@@ -13,7 +13,7 @@ import (
 	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v4"
 
-	"github.com/MoonWX/isshoni/internal/media/fake"
+	"github.com/MoonWX/isshoni/internal/media"
 )
 
 // track is the Publisher's webrtc.TrackLocal: one simulcast encoding, or the audio. Pion binds it when the answer is
@@ -178,7 +178,7 @@ func (t *track) info() TrackInfo {
 
 // write packetizes and writes one Source packet with RTP timestamp tsBase + ticks and the sender-report NTP time of
 // its capture. It returns false when the track isn't bound. Only the send loop calls it.
-func (t *track) write(pkt fake.Packet, ticks uint32, ntp uint64) bool {
+func (t *track) write(pkt media.Packet, ticks uint32, ntp uint64) bool {
 	t.mu.Lock()
 	if t.next != "" && pkt.Keyframe {
 		t.switchLocked() // a new profile starts with a keyframe, as an encoder's switch does
@@ -281,7 +281,7 @@ func (t *track) pad(b *binding, ts uint32) (written uint64) {
 // admit reports whether a Source packet of the track goes out (Publisher.SetActive): not while the video layer is
 // off, and after it was turned on again not before its first keyframe, as an encoder that starts a layer again
 // starts it with one. A packet that doesn't go out is counted in TrackStats.Paused. Only the send loop calls it.
-func (t *track) admit(pkt fake.Packet) bool {
+func (t *track) admit(pkt media.Packet) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	switch {

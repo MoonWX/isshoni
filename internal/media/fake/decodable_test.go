@@ -34,7 +34,8 @@ func newDecodableCheck(t *testing.T, l VideoLayer) *decodableCheck {
 func (c *decodableCheck) check(p Packet) {
 	t := c.t
 	t.Helper()
-	m := Marker{RID: c.l.RID, Keyframe: p.Keyframe, Flash: p.Flash, Frame: c.next, CaptureNS: p.CaptureNS}
+	m := Marker{RID: c.l.RID, Keyframe: p.Keyframe, Flash: packetMarker(t, p).Flash, Frame: c.next,
+		CaptureNS: p.CaptureNS}
 	c.next++
 	nals := splitAnnexB(t, p.Data)
 	if p.Keyframe {
@@ -247,7 +248,7 @@ func TestDecodableStream(t *testing.T) {
 				}
 			}
 			c.check(p)
-			if p.Flash {
+			if packetMarker(t, p).Flash {
 				flashes[p.Layer]++
 			}
 			if !requested && p.Layer == "f" && p.CaptureNS >= int64(1500*time.Millisecond) {
