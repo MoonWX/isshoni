@@ -2258,7 +2258,7 @@ After a leak, the backup key signs until a new key exists, and a security adviso
 ### 10.1 Hosting and URLs
 
 - VitePress (MIT, pinned in `docs/package-lock.json`) with `srcDir: docs`, `base: '/isshoni/'` and
-  `srcExclude: ['PLAN.md', 'm1/**']`. Design docs stay on GitHub, not on the site (open question Q3).
+  `srcExclude: ['PLAN.md', 'm1/**', 'm2/**']`. Design docs stay on GitHub, not on the site (open question Q3).
   As README S82 built it (`docs/.vitepress/config.mts`): `vitepress build docs` makes `docs/` the site's root, so
   `srcDir` stays at its default, which is the same directory; `srcExclude` also has `scripts/**`, the site's own
   tooling; `cleanUrls`, and no web fonts (`useWebFonts: false`). `docs/package.json` turns off the install scripts
@@ -3183,7 +3183,7 @@ criteria are not numeric); the session itself, 05 §19.4's device matrix and the
   budget-conscious stance); a custom domain can come later, and GitHub redirects the old URLs.
 - **Merging into `main`**: pull requests only, with `ci-ok` required and an admin bypass for emergencies. M1 work
   lands on `m1/server-web` first (see `README.md`, "Branches and PRs").
-- **Design docs on the site**: `docs/PLAN.md` and `docs/m1/` stay on GitHub only (`srcExclude`).
+- **Design docs on the site**: `docs/PLAN.md`, `docs/m1/` and `docs/m2/` stay on GitHub only (`srcExclude`).
 - **Docker image tag in `compose.yaml` during 0.x**: `:latest`; release notes flag migrations, and the server backs
   up before migrating. The docs show how to pin `:0.<minor>`.
 
