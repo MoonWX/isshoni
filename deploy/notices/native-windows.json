@@ -1,0 +1,6 @@
+[
+  {"name": "libopus", "vcpkgPort": "opus", "license": "BSD-3-Clause",
+   "linking": "static, inside isshoni-media.dll", "licenseFiles": ["vcpkg/opus/copyright"]},
+  {"name": "speexdsp", "vcpkgPort": "speexdsp", "license": "BSD-3-Clause",
+   "linking": "static, inside isshoni-media.dll", "licenseFiles": ["vcpkg/speexdsp/copyright"]}
+]

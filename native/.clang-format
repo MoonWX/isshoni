@@ -1,0 +1,7 @@
+# Formatting of every C and C++ file under native/ (docs/m2/04-windows-engine.md §13.1): LLVM base with 120 columns,
+# the Go and TypeScript line length. CI runs `clang-format --dry-run --Werror` over native/**/*.{h,c,cpp}.
+BasedOnStyle: LLVM
+ColumnLimit: 120
+Standard: c++20
+# The C ABI header is mostly tables of #defined constants: keep their values in one column.
+AlignConsecutiveMacros: Consecutive

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "isshoni-media",
+  "description": "The isshoni native media engine (docs/m2/04-windows-engine.md §13.1). The ports are linked statically into isshoni-media.dll; the feature tests is never shipped.",
+  "license": "Apache-2.0",
+  "builtin-baseline": "9eec002df1cd109f8f104cd966a763daf9751489",
+  "dependencies": [
+    "opus",
+    "speexdsp"
+  ],
+  "features": {
+    "tests": {
+      "description": "GoogleTest for the unit tests (presets win-x64-ci, win-x64-debug, win-x64-asan and host-*)",
+      "dependencies": [
+        "gtest"
+      ]
+    }
+  }
+}
