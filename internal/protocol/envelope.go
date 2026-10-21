@@ -41,7 +41,7 @@ const (
 	MessageTypeServerShutdown  MessageType = "server.shutdown"
 	MessageTypeAgentSend       MessageType = "agent.send"
 	MessageTypeAgentRecv       MessageType = "agent.recv"
-	MessageTypeUserConnections MessageType = "user.connections" // later (M2, feature user.connections)
+	MessageTypeUserConnections MessageType = "user.connections" // M2, feature user.connections
 )
 
 // Envelope is every WebSocket message (01 §5).
