@@ -452,6 +452,42 @@ func TestParams(t *testing.T) {
 		checkActions(t, "re-init encoder", c.Params(presetParams(protocol.PresetAuto, 5000), at(10.5)),
 			reinitBitrate("f", 5_000_000))
 	})
+	t.Run("a pending change keeps its guards", func(t *testing.T) {
+		// Every M2 preset has the same ceilings (M1 02 §8.6): a preset change only changes the audio, and a change
+		// waiting for its guards goes on waiting.
+		c := ramped(t, fReinit) // the one step at 10
+		checkActions(t, "25 %", c.Hint(congestion(6_300_000), at(12)))
+		checkActions(t, "movie, 3 s after the one step", c.Params(presetParams(protocol.PresetMovie, 0), at(13)),
+			audioBitrate(256_000))
+		if st := c.State(); st.Applied["f"] != 8_000_000 || st.Wanted["f"] != 6_000_000 {
+			t.Errorf("f applied %d wanted %d, want 6000000 still waiting at 8000000", st.Applied["f"], st.Wanted["f"])
+		}
+		checkEvents(t, "ticks", tickRange(c, 13.5, 40), nil)
+
+		c = ramped(t, bothLive) // f's last change at 10
+		checkActions(t, "12.5 %", c.Hint(congestion(7_300_000), at(10.5)))
+		checkActions(t, "movie, 1 s after f's change", c.Params(presetParams(protocol.PresetMovie, 0), at(11)),
+			audioBitrate(256_000))
+		if st := c.State(); st.Applied["f"] != 8_000_000 {
+			t.Errorf("f applied %d, want 8000000", st.Applied["f"])
+		}
+		// 22.5 % within 2 s of f's change still waits for the interval, too.
+		checkActions(t, "22.5 %", c.Hint(congestion(6_500_000), at(11.2)))
+		checkActions(t, "back to auto", c.Params(presetParams(protocol.PresetAuto, 0), at(11.5)),
+			audioBitrate(128_000))
+		checkEvents(t, "ticks", tickRange(c, 12, 13), []event{{12, bitrate("f", 6_200_000)}})
+	})
+	t.Run("only the layers whose ceiling changed", func(t *testing.T) {
+		// q's change (24 %, 0.5 s after its last one) keeps its guards while f's new ceiling applies at once.
+		c := ramped(t, bothLive)
+		checkActions(t, "600 kbit/s", c.Hint(congestion(600_000), at(12)),
+			bitrate("f", 420_000), bitrate("q", 180_000))
+		checkActions(t, "800 kbit/s", c.Hint(congestion(800_000), at(12.2)))
+		p := presetParams(protocol.PresetAuto, 0)
+		p.Encodings[0].MaxBitrate = 400_000
+		checkActions(t, "f's ceiling 400 kbit/s", c.Params(p, at(12.5)), bitrate("f", 400_000))
+		checkEvents(t, "ticks", tickRange(c, 13, 15), []event{{14, bitrate("q", 240_000)}})
+	})
 }
 
 func TestHintWithoutRateInfo(t *testing.T) {

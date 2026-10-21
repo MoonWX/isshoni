@@ -175,11 +175,53 @@ func TestAdminCap(t *testing.T) {
 		if st := c.State(); st.Cap != 5_000_000 || st.Ceiling["f"] != 5_000_000 {
 			t.Errorf("Cap %d, f ceiling %d", st.Cap, st.Ceiling["f"])
 		}
-		// The admin's cap holds no ramp: once lifted, f goes back at once.
-		checkActions(t, "lifted", c.Hint(admin(0), at(14)), bitrate("f", 8_000_000))
-		if st := c.State(); st.Cap != 0 || st.Ramping {
+		// The admin's cap holds no ramp, but f applied 4.7 under it, so the ramp starts again from there: once the cap
+		// is lifted, f ramps back up, 2 s per step, rather than jumping (§9.3: the ramp is the uplink's probe).
+		checkActions(t, "lifted", c.Hint(admin(0), at(14)))
+		if st := c.State(); st.Cap != 0 || !st.Ramping {
 			t.Errorf("Cap %d, Ramping %v", st.Cap, st.Ramping)
 		}
+		checkEvents(t, "the ramp back", tickRange(c, 14.5, 30), []event{
+			{14.5, bitrate("f", 5_405_000)},
+			{16.5, bitrate("f", 6_215_750)},
+			{18.5, bitrate("f", 7_148_113)},
+			{20.5, bitrate("f", 8_000_000)},
+		})
+	})
+	t.Run("a raised cap is no ramp step", func(t *testing.T) {
+		// The ramp at 6.0835 when an admin cap of 6000 kbit/s brings f to 5.7: the ramp starts again from 5.7, so
+		// when the admin raises the cap to 6500, f doesn't jump to the old ramp (6.7 %, no ramp step) but ramps to the
+		// new cap's split, 6.2, in one step (8.8 %, the ramp's step clamped at the cap).
+		c := newController(bothLive, autoParams)
+		c.Live(at(0))
+		checkEvents(t, "the ramp", tickRange(c, 0.5, 6), []event{
+			{2, bitrate("f", 4_600_000)}, {4, bitrate("f", 5_290_000)}, {6, bitrate("f", 6_083_500)},
+		})
+		checkActions(t, "admin 6000 kbit/s, 0.2 s after a change", c.Hint(admin(6000), at(6.2)))
+		checkEvents(t, "down to the cap's split", tickRange(c, 6.5, 10), []event{{8, bitrate("f", 5_700_000)}})
+		checkActions(t, "admin 6500 kbit/s", c.Hint(admin(6500), at(10.2)))
+		checkEvents(t, "the ramp to the new cap", tickRange(c, 10.5, 20), []event{{10.5, bitrate("f", 6_200_000)}})
+	})
+	t.Run("a raised ceiling is no ramp step", func(t *testing.T) {
+		// A ceiling alone (no cap) lowers the ramp in the same way: from 7 back up to 9, f ramps 7 → 8.05 → 9, and
+		// never steps 14.3 % to the old ramp of 8.
+		ceiling := func(fMax int64) protocol.QualityHint {
+			return protocol.QualityHint{Reason: protocol.HintReasonAdmin, Encodings: encs(fMax, 60, true, true)}
+		}
+		c := ramped(t, bothLive)
+		checkActions(t, "ceiling 7 Mbit/s", c.Hint(ceiling(7_000_000), at(12)), bitrate("f", 7_000_000))
+		checkActions(t, "ceiling 9 Mbit/s", c.Hint(ceiling(9_000_000), at(20)))
+		checkEvents(t, "the ramp to the new ceiling", tickRange(c, 20.5, 30),
+			[]event{{20.5, bitrate("f", 8_050_000)}, {22.5, bitrate("f", 9_000_000)}})
+
+		// The same from the start: f starts at its ceiling of 3.6, below DefaultStartBps, and the ramp with it.
+		c = newController(bothLive, presetParams(protocol.PresetAuto, 3600))
+		checkActions(t, "Initial", c.Initial(), bitrate("f", 3_600_000), bitrate("q", 300_000), audioBitrate(128_000))
+		c.Live(at(0))
+		checkEvents(t, "at the ceiling", tickRange(c, 0.5, 20), nil)
+		checkActions(t, "ceiling 5 Mbit/s", c.Hint(ceiling(5_000_000), at(20)))
+		checkEvents(t, "the ramp to the new ceiling", tickRange(c, 20.5, 30),
+			[]event{{20.5, bitrate("f", 4_140_000)}, {22.5, bitrate("f", 4_761_000)}, {24.5, bitrate("f", 5_000_000)}})
 	})
 	t.Run("a small step down to the cap", func(t *testing.T) {
 		// 7500 kbit/s: f must come down from 8 to 7.2, although that is only 10 %.

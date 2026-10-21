@@ -2,6 +2,7 @@ package ratectl
 
 import (
 	"fmt"
+	"math"
 	"testing"
 
 	"github.com/MoonWX/isshoni/internal/protocol"
@@ -21,34 +22,64 @@ func TestRequired(t *testing.T) {
 		{1080, 60, 21.0 / 9, 8_164_800}, // ultrawide: 2520 × 1080
 	}
 	for _, tc := range cases {
-		if got := required(tc.h, tc.fps, tc.aspect); got != tc.want {
-			t.Errorf("required(%d, %d, %.3f) = %d, want %d", tc.h, tc.fps, tc.aspect, got, tc.want)
+		if got := required(tc.h, tc.fps, tc.aspect); got != float64(tc.want) {
+			t.Errorf("required(%d, %d, %.3f) = %g, want %d", tc.h, tc.fps, tc.aspect, got, tc.want)
 		}
+	}
+	// An absurd aspect needs more than any bitrate, beyond the int range, which a conversion to int would not survive.
+	if got := required(1080, 60, 1e300); !(got > math.MaxInt64) {
+		t.Errorf("required at an aspect of 1e300 = %g, want more than MaxInt64", got)
 	}
 }
 
 func TestApproxHeight(t *testing.T) {
 	cases := []struct {
 		bps, fps int
+		aspect   float64
 		want     int
 	}{
-		{8_000_000, 60, 1080},
-		{6_220_800, 60, 1080},
-		{6_220_799, 60, 900},
-		{4_700_000, 60, 900},
-		{2_764_800, 60, 720},
-		{2_300_000, 60, 540},
-		{1_555_200, 60, 540},
-		{1_500_000, 60, 480},
-		{700_000, 60, 360},
-		{250_000, 60, 360}, // none fits: 360
-		{2_300_000, 30, 900},
-		{3_110_400, 30, 1080},
+		{8_000_000, 60, 16.0 / 9, 1080},
+		{6_220_800, 60, 16.0 / 9, 1080},
+		{6_220_799, 60, 16.0 / 9, 900},
+		{4_700_000, 60, 16.0 / 9, 900},
+		{2_764_800, 60, 16.0 / 9, 720},
+		{2_300_000, 60, 16.0 / 9, 540},
+		{1_555_200, 60, 16.0 / 9, 540},
+		{1_500_000, 60, 16.0 / 9, 480},
+		{700_000, 60, 16.0 / 9, 360},
+		{250_000, 60, 16.0 / 9, 360}, // none fits: 360
+		{2_300_000, 30, 16.0 / 9, 900},
+		{3_110_400, 30, 16.0 / 9, 1080},
+		// The server's MaxFramerate is not validated: none (0) counts as defaultFPS, anything above 04 §6.4's 240 as
+		// 240 (540p240 needs 6.2 Mbit/s).
+		{8_000_000, 0, 16.0 / 9, 1080},
+		{2_300_000, -5, 16.0 / 9, 540},
+		{8_000_000, 1 << 40, 16.0 / 9, 540},
+		{8_000_000, 241, 16.0 / 9, 540},
+		{8_000_000, 60, 1e300, 360}, // nothing fits
+		{8_000_000, 60, math.Inf(1), 360},
+		{8_000_000, 60, math.NaN(), 360},
 	}
 	for _, tc := range cases {
-		if got := approxHeight(tc.bps, tc.fps, 16.0/9); got != tc.want {
-			t.Errorf("approxHeight(%d, %d) = %d, want %d", tc.bps, tc.fps, got, tc.want)
+		if got := approxHeight(tc.bps, tc.fps, tc.aspect); got != tc.want {
+			t.Errorf("approxHeight(%d, %d, %g) = %d, want %d", tc.bps, tc.fps, tc.aspect, got, tc.want)
 		}
+	}
+}
+
+func TestSourceAspect(t *testing.T) {
+	for _, tc := range []struct{ in, want float64 }{
+		{0, 16.0 / 9}, {-1, 16.0 / 9}, {math.NaN(), 16.0 / 9}, {math.Inf(1), 16.0 / 9}, {1e300, 16.0 / 9},
+		{0.2, 16.0 / 9}, {8.5, 16.0 / 9}, {0.25, 0.25}, {8, 8}, {21.0 / 9, 21.0 / 9}, {4.0 / 3, 4.0 / 3},
+	} {
+		if got := sourceAspect(tc.in); got != tc.want {
+			t.Errorf("sourceAspect(%g) = %g, want %g", tc.in, got, tc.want)
+		}
+	}
+	// New takes it: 1e300 would otherwise say about 360p at any bitrate.
+	c := New(Config{Live: bothLive, Params: autoParams, SourceAspect: 1e300, TargetHeight: 1080})
+	if c.aspect != 16.0/9 {
+		t.Errorf("New with an aspect of 1e300: aspect %g, want 16/9", c.aspect)
 	}
 }
 
@@ -158,6 +189,55 @@ func TestUploadHint(t *testing.T) {
 					t.Errorf("Upload = %+v, want %+v (state %+v)", got, tc.want, c.State())
 				}
 			})
+		}
+	})
+	t.Run("a cap raised during the backoff's hold keeps the count", func(t *testing.T) {
+		// The cap still binds at 3.0 (f's split 2.7, below the ceiling), while the hold keeps the ramp, and f, at 2.3:
+		// those Ticks keep the run that started at 20.5, so the hint comes 6 s after it.
+		c := ramped(t, bothLive)
+		c.Hint(congestion(2_600_000), at(20.2))
+		tickRange(c, 20.5, 24)
+		c.Hint(congestion(3_000_000), at(24.2))
+		tl := uploadTimeline(c, 24.5, 30)
+		if tl[26] != (UploadHint{}) {
+			t.Errorf("Upload at 26 s = %+v, want off", tl[26])
+		}
+		if want := (UploadHint{true, 540}); tl[26.5] != want {
+			t.Errorf("Upload at 26.5 s = %+v, want %+v", tl[26.5], want)
+		}
+		// The hold ends at 30.2; the ramp reaches the cap's split, and the hint follows f to 2.7.
+		tickRange(c, 30.5, 34)
+		if st := c.State(); st.Applied["f"] != 2_700_000 || c.Upload(at(34)) != (UploadHint{true, 540}) {
+			t.Errorf("f applied %d, Upload %+v", st.Applied["f"], c.Upload(at(34)))
+		}
+	})
+	t.Run("a pause of the Ticks ends the hint", func(t *testing.T) {
+		// The core ticks only while the share is live: a reconnect can stop the Ticks. A hint whose condition ended
+		// UploadOff before the next Tick is off, and a new run needs UploadOn again.
+		c := ramped(t, bothLive)
+		c.Hint(congestion(2_600_000), at(20.2))
+		tickRange(c, 20.5, 30)
+		if !c.Upload(at(30)).Limited {
+			t.Fatal("not limited at 30 s")
+		}
+		pause := protocol.QualityHint{Reason: protocol.HintReasonViewers, MaxBitrate: 2_600_000,
+			Encodings: encs(8_000_000, 60, false, true)}
+		c.Hint(pause, at(30.2))
+		c.Tick(at(30.5)) // the condition ends: the last Tick that saw it was at 30
+		if c.Upload(at(41)).Limited {
+			t.Errorf("Upload at 41 s = %+v, want off", c.Upload(at(41)))
+		}
+		resume := pause
+		resume.Encodings = encs(8_000_000, 60, true, true)
+		c.Hint(resume, at(41.2))
+		tl := uploadTimeline(c, 41.5, 47.5)
+		for s := 41.5; s < 47.5; s += 0.5 {
+			if tl[s].Limited {
+				t.Errorf("limited at %gs, before 6 s of the new run", s)
+			}
+		}
+		if want := (UploadHint{true, 540}); tl[47.5] != want {
+			t.Errorf("Upload at 47.5 s = %+v, want %+v", tl[47.5], want)
 		}
 	})
 	t.Run("the height follows the applied full layer", func(t *testing.T) {

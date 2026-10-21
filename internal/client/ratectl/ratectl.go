@@ -19,7 +19,6 @@ package ratectl
 
 import (
 	"fmt"
-	"math"
 	"time"
 
 	"github.com/MoonWX/isshoni/internal/media"
@@ -102,7 +101,7 @@ type Config struct {
 	Params protocol.ShareParams
 	// StartBps is the full layer's start in bit/s; 0 = DefaultStartBps.
 	StartBps int
-	// SourceAspect is the source's width/height, for the upload hint; 0 = 16/9.
+	// SourceAspect is the source's width/height, for the upload hint; 0 (or anything outside 1:4 to 8:1) = 16/9.
 	SourceAspect float64
 	// TargetHeight is the full layer's encoded height (from the engine's EventLayer); SetTargetHeight updates it.
 	// 0 (unknown) shows no upload hint.
@@ -114,9 +113,8 @@ type Controller struct {
 	layers []*layer // in the wire order of the share.start encodings (f, then q)
 	live   map[string]bool
 
-	capBps       int  // the server's total for the video layers (QualityHint.MaxBitrate); 0 = none
-	capAdmin     bool // the hint that set capBps was an admin hint (the admin's cap, not an estimate)
-	audioWanted  int  // ShareParams.AudioBitrate within the Opus range; 0 = none given
+	capBps       int // the server's total for the video layers (QualityHint.MaxBitrate); 0 = none
+	audioWanted  int // ShareParams.AudioBitrate within the Opus range; 0 = none given
 	audioApplied int
 
 	aspect       float64
@@ -165,10 +163,7 @@ func New(cfg Config) *Controller {
 		l.on = l.active
 		c.layers = append(c.layers, l)
 	}
-	c.aspect = cfg.SourceAspect
-	if !(c.aspect > 0) || math.IsInf(c.aspect, 0) {
-		c.aspect = 16.0 / 9
-	}
+	c.aspect = sourceAspect(cfg.SourceAspect)
 	start := cfg.StartBps
 	if start <= 0 {
 		start = DefaultStartBps
@@ -179,6 +174,7 @@ func New(cfg Config) *Controller {
 	c.recompute()
 	for _, l := range c.layers {
 		l.applied = l.wanted
+		c.settled(l, l.applied)
 	}
 	return c
 }
@@ -209,14 +205,21 @@ func (c *Controller) Live(now time.Time) {
 }
 
 // Params applies a share.update reply (a preset change): new ceilings and Active flags from its encodings, and its
-// AudioBitrate. Like the first targets, the resulting changes apply at once, without the guards (§9.4).
+// AudioBitrate. A layer whose ceiling changed takes its new target at once, without the guards, like the first
+// targets (§9.4: a share.update with new ceilings applies at once). The other layers keep their guards: in M2 every
+// preset has the same ceilings (M1 02 §8.6), so a preset change must not push through a change that is still
+// waiting for them. Layers turned on or off and the audio bitrate change at once.
 func (c *Controller) Params(p protocol.ShareParams, now time.Time) []Action {
+	prev := make(map[*layer]int, len(c.layers))
+	for _, l := range c.layers {
+		prev[l] = l.ceiling
+	}
 	c.applyEncodings(p.Encodings)
 	if a := audioTarget(p.AudioBitrate); a > 0 {
 		c.audioWanted = a
 	}
 	c.recompute()
-	return c.apply(now, true)
+	return c.apply(now, func(l *layer) bool { return l.ceiling != prev[l] })
 }
 
 // Hint applies a quality.hint for the share. A hint with encodings is complete: they set the ceilings and the
@@ -224,11 +227,12 @@ func (c *Controller) Params(p protocol.ShareParams, now time.Time) []Action {
 // one; one with neither (a codec hint) changes nothing. Layers turned on or off change at once (OpActive, a resume
 // with its target); bitrate changes pass the guards now or wait for a later Tick, the latest target winning.
 //
-// A hint that lowers the full layer through its cap is a backoff (§9.3): it holds the ramp for HoldAfterCongestion,
-// and once the lower target applies, the ramp starts again from it, toward the cap, or the ceiling once the server
-// lifts the cap. That is a congestion hint, but also any other non-admin hint that carries a lower cap: when a pause
-// change and a lower estimate go out together, the server names the pause (M1 02 §11). The admin's cap is a policy,
-// not a measurement, and holds nothing. A lower target that is still waiting for its guards when a later hint raises
+// A hint that lowers the full layer through its cap is a backoff (§9.3): it holds the ramp for HoldAfterCongestion.
+// That is a congestion hint, but also any other non-admin hint that carries a lower cap: when a pause change and a
+// lower estimate go out together, the server names the pause (M1 02 §11). The admin's cap is a policy, not a
+// measurement, and holds nothing. Whatever the reason, once a lower target of the full layer applies, the ramp
+// starts again from it, toward the cap, or the ceiling once the server lifts the cap; so a lifted admin cap, too,
+// ramps back up rather than jumping. A lower target that is still waiting for its guards when a later hint raises
 // the cap again never applies and leaves the ramp where it was: the latest target wins.
 func (c *Controller) Hint(h protocol.QualityHint, now time.Time) []Action {
 	if len(h.Encodings) == 0 && h.MaxBitrate <= 0 {
@@ -240,12 +244,11 @@ func (c *Controller) Hint(h protocol.QualityHint, now time.Time) []Action {
 	}
 	c.applyEncodings(h.Encodings)
 	c.capBps = int(min(max(h.MaxBitrate, 0), maxCap))
-	c.capAdmin = h.Reason == protocol.HintReasonAdmin
-	if !c.capAdmin {
+	if h.Reason != protocol.HintReasonAdmin {
 		c.backoff(before, now)
 	}
 	c.recompute()
-	return c.apply(now, false)
+	return c.apply(now, nil)
 }
 
 // SetLive records whether a layer's encoder changes bitrate live, from a later EventLayer (an encoder fallback or a
@@ -259,9 +262,14 @@ func (c *Controller) SetLive(layer string, live bool, now time.Time) {
 	}
 }
 
-// SetLimit records the encoder's limit from media.EventLimit: "cpu" or "gpu" while it can't keep up, "none" when it
-// can again (04 applies the hysteresis). A limit holds the ramp while it lasts and for HoldAfterLimit after it
-// cleared, and makes CPU true. Any other value counts as no limit.
+// SetLimit records the share's encoder limit: "cpu" or "gpu" while it can't keep up, "none" when it can again (04
+// applies the hysteresis). A limit holds the ramp while it lasts and for HoldAfterLimit after it cleared, and makes
+// CPU true. Any other value counts as no limit.
+//
+// media.EventLimit is per layer (04 sends {layer, limit} edges for each layer), but the Controller keeps one value
+// for the share, so the caller passes the share-wide value: "cpu" or "gpu" while any layer's last EventLimit is cpu
+// or gpu, and "none" once every layer has reported none. Passing each layer's edge straight through would let one
+// layer's "none" clear the CPU hint and start the ramp hold's release while another layer is still limited.
 func (c *Controller) SetLimit(limit string, now time.Time) {
 	was := c.limited()
 	c.limit = limit
@@ -280,7 +288,7 @@ func (c *Controller) SetTargetHeight(h int) {
 func (c *Controller) Tick(now time.Time) []Action {
 	c.rampStep(now)
 	c.recompute()
-	acts := c.apply(now, false)
+	acts := c.apply(now, nil)
 	c.sampleUpload(now)
 	return acts
 }
@@ -402,10 +410,12 @@ func (c *Controller) backoff(before int, now time.Time) {
 	c.holdUntil = now.Add(HoldAfterCongestion)
 }
 
-// settled records that the full layer's applied value is now bps: when a cap other than the admin's brought it below
-// the ramp (a backoff, or a resume under such a cap), the ramp starts again from there.
+// settled records that the full layer's applied value is now bps: when that is below the ramp (a backoff, an admin
+// cap, a lower ceiling, a resume or a start under them), the ramp starts again from there. So the applied value is
+// never above the ramp, and the ramp is above it only after a ramp step that hasn't applied yet: passes relies on
+// that to tell a ramp step (wanted is the ramp) from any other change.
 func (c *Controller) settled(l *layer, bps int) {
-	if l.full && c.capBps > 0 && !c.capAdmin && bps < c.ramp {
+	if l.full && bps < c.ramp {
 		c.ramp = bps
 	}
 }
@@ -418,8 +428,8 @@ func (c *Controller) limited() bool { return c.limit == "cpu" || c.limit == "gpu
 // no congestion hold runs and the encoder isn't limited now or in the last HoldAfterLimit. The full layer of an
 // encoder without live bitrate takes one step instead, OneStepDelay after Live, straight to its ceiling or the cap;
 // its guards (30 %, 10 s) then decide whether the step applies. A live full layer's ramp steps only from a value in
-// effect (applied at the ramp or above), so a step the guards hold back is not followed by another; a ramp held by
-// the cap takes its next step at the first Tick after the cap rises or goes.
+// effect (applied at the ramp: settled keeps it from being below), so a step the guards hold back is not followed by
+// another; a ramp held by the cap takes its next step at the first Tick after the cap rises or goes.
 func (c *Controller) rampStep(now time.Time) {
 	f := c.fullLayer()
 	if f == nil || !c.isLive || !f.active || c.ramp >= f.ceiling {
@@ -461,9 +471,9 @@ func (c *Controller) recompute() {
 }
 
 // apply turns the differences between wanted and applied into Actions: OpActive at once for layers turned on or
-// off (a resume with its target), OpBitrate for the active layers whose change passes the guards (or all of them
-// with bypass), and OpAudioBitrate at once. Actions come in wire order, audio last.
-func (c *Controller) apply(now time.Time, bypass bool) []Action {
+// off (a resume with its target), OpBitrate for the active layers whose change passes the guards or for which bypass
+// (nil: none) says the guards don't apply, and OpAudioBitrate at once. Actions come in wire order, audio last.
+func (c *Controller) apply(now time.Time, bypass func(*layer) bool) []Action {
 	var acts []Action
 	for _, l := range c.layers {
 		reinit := !c.live[l.rid]
@@ -478,7 +488,7 @@ func (c *Controller) apply(now time.Time, bypass bool) []Action {
 		case !l.active && l.on:
 			acts = append(acts, Action{Op: OpActive, Layer: l.rid, Active: false})
 			l.on = false
-		case l.active && l.wanted != l.applied && (bypass || c.passes(l, now)):
+		case l.active && l.wanted != l.applied && ((bypass != nil && bypass(l)) || c.passes(l, now)):
 			acts = append(acts, Action{Op: OpBitrate, Layer: l.rid, Bps: l.wanted, Reinit: reinit})
 			l.applied = l.wanted
 			l.changed, l.hasChanged = now, true
@@ -495,9 +505,10 @@ func (c *Controller) apply(now time.Time, bypass bool) []Action {
 // passes reports whether the active layer l's change from applied to wanted may apply now (§9.4), by the guards of
 // its encoder: live, at least MinChange and MinInterval since the layer's last change; re-init, ReinitMinChange
 // and ReinitMinInterval. The interval always holds. These changes pass without the minimum step:
-//   - a ramp step of a live full layer (wanted is the ramp): the ramp grows by 15 %, rounded up, so only its last
-//     step, clamped at the ceiling or the cap, is smaller (6.996 → 8 Mbit/s is 14.4 %). Held back, it would leave
-//     f short of the ceiling for good, or short of the cap with an upload hint the cap doesn't call for;
+//   - a ramp step of a live full layer (wanted is the ramp, which is above the applied value only after a ramp step:
+//     settled): the ramp grows by 15 %, rounded up, so only its last step, clamped at the ceiling or the cap, is
+//     smaller (6.996 → 8 Mbit/s is 14.4 %). Held back, it would leave f short of the ceiling for good, or short of
+//     the cap with an upload hint the cap doesn't call for;
 //   - a live layer's step up to exactly its ceiling, such as the preview's way back once the server lifts a cap;
 //   - a decrease of a layer applied above its ceiling, whatever its encoder: the ceilings carry the admin's cap,
 //     which the layer must come down to, however small the step.
