@@ -20,8 +20,13 @@ import (
 const unavailableSkip = "Credential Manager is unavailable: this process has no user profile loaded " +
 	"(ERROR_NO_SUCH_LOGON_SESSION); the manual check M-DA-1 covers the store"
 
+// probeOrigin is the origin openTestStore writes and deletes to learn whether Credential Manager takes writes.
+const probeOrigin = "https://probe.invalid"
+
 // openTestStore opens a store under a fresh random prefix and deletes everything under it when the test ends. It
-// skips the test when Credential Manager is unavailable.
+// skips the test when Credential Manager is unavailable: in a logon session without a credential set (a network,
+// WinRM or service-for-user logon) CredEnumerateW may answer ERROR_NOT_FOUND while CredWriteW and CredReadW fail
+// with ERROR_NO_SUCH_LOGON_SESSION, so it probes with a write as well as with List.
 func openTestStore(t *testing.T, log *slog.Logger) *winStore {
 	t.Helper()
 	random := make([]byte, 8)
@@ -36,13 +41,12 @@ func openTestStore(t *testing.T, log *slog.Logger) *winStore {
 		t.Fatalf("Open: %v", err)
 	}
 	s := st.(*winStore)
-	if _, err := s.List(); errors.Is(err, ErrUnavailable) {
-		t.Skip(unavailableSkip)
-	} else if err != nil {
-		t.Fatalf("List: %v", err)
-	}
+	// Registered before the probes, so a probe credential left behind by a failing probe is deleted too.
 	t.Cleanup(func() {
 		origins, err := s.List()
+		if errors.Is(err, ErrUnavailable) {
+			return // the test skipped: nothing was written
+		}
 		if err != nil {
 			t.Errorf("cleanup: List: %v", err)
 			return
@@ -53,6 +57,19 @@ func openTestStore(t *testing.T, log *slog.Logger) *winStore {
 			}
 		}
 	})
+	if _, err := s.List(); errors.Is(err, ErrUnavailable) {
+		t.Skip(unavailableSkip)
+	} else if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if err := s.Put(probeOrigin, Credential{RefreshToken: "isr_test-probe"}); errors.Is(err, ErrUnavailable) {
+		t.Skip(unavailableSkip)
+	} else if err != nil {
+		t.Fatalf("probe Put: %v", err)
+	}
+	if err := s.Delete(probeOrigin); err != nil {
+		t.Fatalf("probe Delete: %v", err)
+	}
 	return s
 }
 

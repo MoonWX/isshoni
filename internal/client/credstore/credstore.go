@@ -11,11 +11,14 @@
 //     with the macOS Keychain on darwin; M4's Linux agent keeps it as the headless fallback.
 //   - NewMemory: a map, for tests and for the e2e harness.
 //
-// Every Store applies the same rules, so a test against the memory store holds for Credential Manager too: Put
-// refuses a credential whose Credential Manager blob would exceed 2,560 bytes (CRED_MAX_CREDENTIAL_BLOB_SIZE), an
-// empty or NUL-carrying origin, an empty refresh token and an over-long user name; SavedAt is kept in UTC to the
-// millisecond; List returns origins sorted. All implementations are safe for concurrent use. Store methods take no
-// context: each is a local call (Credential Manager, or one small file) that never waits on the network.
+// Every Store applies the same rules: Put refuses a credential whose Credential Manager blob would exceed 2,560
+// bytes (CRED_MAX_CREDENTIAL_BLOB_SIZE), an empty or NUL-carrying origin, an empty refresh token and an over-long
+// user name; SavedAt is kept in UTC to the millisecond; List returns origins sorted. So a test against the memory
+// store holds for Credential Manager too, with one exception: Credential Manager compares target names without
+// regard to case; the memory and file stores compare them exactly. Callers pass origins normalized by
+// deeplink.NormalizeOrigin, so the difference never shows. All implementations are safe for concurrent use. Store
+// methods take no context: each is a local call (Credential Manager, or one small file) that never waits on the
+// network.
 //
 // A stored credential that can't be read back (a blob that doesn't parse, another "v", no refresh token) is
 // reported as ErrNotFound with a WARN, so the app links again; List still names its origin, so Delete (and the
