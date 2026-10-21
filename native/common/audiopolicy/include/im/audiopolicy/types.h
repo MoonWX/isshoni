@@ -80,7 +80,9 @@ enum class StreamKind : uint8_t {
   kEndpoint, // the default render endpoint's loopback
 };
 
-// Why a live stream has to go (Plan::remove). The watcher fades each one out over 10 ms of its buffer (05 §9.4).
+// Why a stream has to go (Plan::remove). The watcher fades a running one out over 10 ms of its buffer (05 §9.4),
+// drops one in preroll without output and cancels one still activating. Two reasons wait: until then the stream
+// stays in PlanInput::streams, and the next plans see it (and remove it again, or for another reason).
 enum class RemovalReason : uint8_t {
   kExited,      // its process is gone from the snapshot
   kKeyMismatch, // the pid is there with another creation time (or, unknown, another exe or parent): a reused PID
@@ -88,9 +90,12 @@ enum class RemovalReason : uint8_t {
   kLauncher,    // the target is a launcher (I2)
   kUnsafe,      // a kept-out process appeared in its OS tree (I1, 05 §6.2 step 6)
   kSessionGone, // its process lives, but it has had no render session for the 3 s grace (S1's 3 polls)
-  kCovered,     // an ancestor's stream covers it; fade it when the covering stream runs (05 §6.2 step 3)
+  kCovered,     // an ancestor's stream (or another stream on the same target) covers it (05 §6.2 step 3). Waits:
+                // fade it when the covering stream runs, so the sound has no gap; while it waits it still counts
+                // against the include cap (PlannerOptions::max_include_streams)
   kLimit,       // more live include streams than the cap (never in practice: live streams keep their slots)
-  kEngine,      // the engine changed (include set <-> exclude-self <-> endpoint, or off)
+  kEngine,      // the engine changed (include set <-> exclude-self <-> endpoint, or off). Waits for the 20 ms
+                // crossfade into the new engine's stream (05 §6.4, §6.5); with sound off it fades at once
   kTarget,      // an exclusive stream whose target is no longer the fast path's R
 };
 

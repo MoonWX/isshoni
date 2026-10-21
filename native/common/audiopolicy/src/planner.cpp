@@ -218,14 +218,20 @@ private:
 Row1 Classifier::ComputeRow1(std::size_t i) const {
   const Process &p = t_.at(i);
   const LineageEntry *le = Lineage(i);
-  // An instance's OS tree, strict or loose (05 §5.3 row 1); an instance pid that doesn't exist is ignored (§5.3).
+  // An instance's OS tree by strict links (05 §5.3 row 1); an instance pid that doesn't exist is ignored (§5.3).
+  // Strict only, although row 1's text still says "strict or loose" (a spec write-back is pending): a process linked
+  // to the instance only loosely is older than it, so it can't be one of its descendants, and an INCLUDE stream on it
+  // can't capture the instance's playback. The loose union guards the other direction, which stays as it is: an
+  // instance in a target's loose tree blocks the target (I1, pid_reuse), and a heard session in R's loose tree blocks
+  // the fast path (I4). With loose links here, a game whose exited bootstrapper's pid isshoni.exe got was kept out
+  // as `isshoni`, locked, with no way to hear it.
   for (const int32_t ri : rx_.instances) {
     const auto k = t_.Find(ex_.rules[static_cast<std::size_t>(ri)].pid);
     if (!k) {
       continue;
     }
     const auto ki = static_cast<int32_t>(*k);
-    if (t_.InTree(i, *k, true)) {
+    if (t_.InTree(i, *k, false)) {
       return Row1{ri, ki, ki, false};
     }
     if (le != nullptr && Contains(le->ancestors, t_.at(*k).key)) {
@@ -431,7 +437,8 @@ void UpdateMicRoots(const ProcessTable &t, const Classifier &cls, std::span<cons
   }
 }
 
-// The lineage cache (05 §5.7): every kept-out process remembers its walk, app roots and pid chain for its lifetime.
+// The lineage cache (05 §5.7): every kept-out process remembers its walk, app roots and strict parent chain for its
+// lifetime (the chain is what row 1's instance trees follow, by strict links).
 void RecordLineage(const ProcessTable &t, const Classifier &cls, const std::vector<ProcessResult> &pr,
                    LineageMap &lineage) {
   for (std::size_t i = 0; i < t.size(); ++i) {
@@ -443,7 +450,7 @@ void RecordLineage(const ProcessTable &t, const Classifier &cls, const std::vect
       AddBounded(e.exes, t.at(static_cast<std::size_t>(w)).exe, kMaxLineageExes);
     }
     AddBounded(e.roots, t.at(cls.AppRoot(i)).key, kMaxLineageRoots);
-    ForEachAncestor(t, i, true, [&](std::size_t a) {
+    ForEachAncestor(t, i, false, [&](std::size_t a) {
       AddBounded(e.ancestors, t.at(a).key, kMaxLineageAncestors);
       return true;
     });
@@ -836,9 +843,11 @@ Plan Planner::Reconcile(const ProcessTable &t, const PlanInput &in) {
     }
   }
 
-  // Live include streams: re-checked on every reconcile (05 §6.2 step 6).
+  // Live include streams: re-checked on every reconcile (05 §6.2 step 6). The re-check comes first, so a removal that
+  // waits (kEngine for the crossfade, kCovered for the covering stream) only goes to a stream that is still safe.
   const bool include_set = engine == Engine::kIncludeSet;
   std::vector<int32_t> live_of(n, -1); // table index → the live include stream kept on it
+  int64_t duplicates = 0;              // second streams on one target: covered, they wait for the first one
   std::unordered_map<ProcessKey, int64_t, ProcessKeyHash> missing;
   for (std::size_t j = 0; j < in.streams.size(); ++j) {
     const LiveStream &s = in.streams[j];
@@ -852,16 +861,17 @@ Plan Planner::Reconcile(const ProcessTable &t, const PlanInput &in) {
       continue;
     }
     const std::size_t i = *m;
-    if (!include_set) {
-      why = RemovalReason::kEngine;
-    } else if (pr[i].verdict == Verdict::kKeptOut) {
+    if (pr[i].verdict == Verdict::kKeptOut) {
       why = RemovalReason::kKeptOut;
     } else if (pr[i].launcher) {
       why = RemovalReason::kLauncher;
     } else if (dirty.strict[i] >= 0 || dirty.loose[i] >= 0) {
       why = RemovalReason::kUnsafe;
+    } else if (!include_set) {
+      why = RemovalReason::kEngine;
     } else if (live_of[i] >= 0) {
       why = RemovalReason::kCovered; // a second stream on the same target
+      ++duplicates;
     } else if (!agg[i].render) {
       const auto it = missing_since_.find(t.at(i).key);
       const int64_t since = it == missing_since_.end() ? in.now_ns : it->second;
@@ -928,7 +938,8 @@ Plan Planner::Reconcile(const ProcessTable &t, const PlanInput &in) {
 
     // Step 3: coverage, ancestors first. A candidate is covered by a root among its strict ancestors whose stream
     // includes it: a new root always (its stream starts after the candidate exists), a live one unless the
-    // late-child fallback is on and the candidate was created after that stream's activation.
+    // late-child fallback is on and the candidate was created after that stream's activation (an activation still
+    // running, activated_filetime 0, completes after every process of this snapshot started).
     std::vector<int> depth(n, 0);
     for (const std::size_t c : cands) {
       depth[c] = Depth(t, c);
@@ -939,8 +950,9 @@ Plan Planner::Reconcile(const ProcessTable &t, const PlanInput &in) {
       if (live_of[a] < 0 || !opts_.late_child_own_stream) {
         return true;
       }
+      const uint64_t activated = in.streams[static_cast<std::size_t>(live_of[a])].activated_filetime;
       const uint64_t created = t.at(c).key.created;
-      return created == 0 || created < in.streams[static_cast<std::size_t>(live_of[a])].activated_filetime;
+      return activated == 0 || created == 0 || created < activated;
     };
     std::vector<int32_t> coverer(n, -1);
     std::vector<char> is_root(n, 0);
@@ -995,14 +1007,42 @@ Plan Planner::Reconcile(const ProcessTable &t, const PlanInput &in) {
       return ka.created != kb.created ? ka.created < kb.created : ka.pid < kb.pid;
     });
 
-    // Slots count the streams that exist once the plan is applied. A live stream below a new root ("pinned": an
-    // ancestor started playing after it) holds its slot until that root is selected, whose stream then covers it.
+    // Live streams below a root. A redundant one has a live ancestor whose stream covers it: it goes once that
+    // stream runs, whatever happens to the root. A pinned one is the topmost live stream below a new root (an
+    // ancestor started playing after it): it holds its slot until that root is selected, whose stream then covers it.
+    std::vector<int32_t> live_coverer(n, -1); // the nearest live ancestor whose stream covers a live candidate
+    for (const std::size_t c : cands) {
+      if (live_of[c] < 0) {
+        continue;
+      }
+      ForEachAncestor(t, c, false, [&](std::size_t a) {
+        if (live_of[a] >= 0 && covers(a, c)) {
+          live_coverer[c] = static_cast<int32_t>(a);
+          return false;
+        }
+        return true;
+      });
+    }
     const auto pinned_under_new_root = [&](std::size_t c) {
-      return live_of[c] >= 0 && coverer[c] >= 0 && live_of[static_cast<std::size_t>(coverer[c])] < 0;
+      return live_of[c] >= 0 && coverer[c] >= 0 && live_of[static_cast<std::size_t>(coverer[c])] < 0 &&
+             live_coverer[c] < 0;
     };
+
+    // Slots (§17). `used` counts the include streams once the plan is applied and its handovers are over (at the
+    // end, the targets); `held` the ones the engine holds while they run. A covered stream fades only once its
+    // coverer's stream runs (RemovalReason::kCovered), so every live stream below a root and every second stream on
+    // a target stays in `held` (the few a cut root's limit removes at once are counted anyway, erring toward fewer
+    // new streams). A live root keeps its slot. A new root needs a slot in both counts; one that replaces pinned
+    // streams frees their slots in `used` and may take `held` one over the cap, so a parent that starts playing above
+    // its own playing children gets in when the set is full: the engine then holds at most cap + 1 include streams,
+    // until the handover ends.
     std::vector<int64_t> pinned(n, 0); // per new root: the live streams it would replace
     int64_t used = 0;
+    int64_t held = duplicates;
     for (const std::size_t c : cands) {
+      if (live_of[c] >= 0 && coverer[c] >= 0) {
+        ++held;
+      }
       if (pinned_under_new_root(c)) {
         ++pinned[static_cast<std::size_t>(coverer[c])];
         ++used;
@@ -1012,16 +1052,24 @@ Plan Planner::Reconcile(const ProcessTable &t, const PlanInput &in) {
     std::vector<char> selected(n, 0);
     for (const std::size_t r : roots) {
       const bool live = live_of[r] >= 0;
-      const int64_t delta = live ? 1 : 1 - pinned[r]; // a new root adds its stream and frees the ones it covers
-      if (used + std::max<int64_t>(delta, 0) <= cap) {
+      bool take = false;
+      int64_t delta = 1;
+      if (live) {
+        take = used + 1 <= cap;
+      } else {
+        delta = 1 - pinned[r]; // a new root adds its stream and frees the ones it covers
+        take = used + std::max<int64_t>(delta, 0) <= cap && held + 1 <= cap + (pinned[r] > 0 ? 1 : 0);
+      }
+      if (take) {
         selected[r] = 1;
         used += delta;
+        ++held;
         targets.push_back(r);
       } else if (live) {
         plan.remove.push_back(Removal{static_cast<std::size_t>(live_of[r]), RemovalReason::kLimit});
       }
     }
-    // Live streams below a root: redundant once that root's stream runs; kept while their root is not selected.
+    // Ancestors first, so a live coverer's fate is known before the streams below it are decided.
     std::vector<char> in_targets(n, 0);
     for (const std::size_t r : targets) {
       in_targets[r] = 1;
@@ -1032,7 +1080,8 @@ Plan Planner::Reconcile(const ProcessTable &t, const PlanInput &in) {
       }
       const auto a = static_cast<std::size_t>(coverer[c]);
       const auto stream = static_cast<std::size_t>(live_of[c]);
-      if (selected[a]) {
+      const int32_t lc = live_coverer[c];
+      if (selected[a] || (lc >= 0 && in_targets[static_cast<std::size_t>(lc)])) {
         plan.remove.push_back(Removal{stream, RemovalReason::kCovered});
       } else if (pinned_under_new_root(c) || used < cap) {
         if (!pinned_under_new_root(c)) {

@@ -178,6 +178,88 @@ TEST(AudioPolicyPlanner, FortyEightStreamCap) {
   EXPECT_EQ(e.SessionOf(apps[48]).reason, Reason::kLimit);
 }
 
+TEST(AudioPolicyPlanner, HandoverToANewParentHoldsAtMostOneStreamOverTheCap) {
+  // Three playing children of a game and another app fill a cap of 4. The parent starts playing while three more
+  // apps wait: its stream replaces the children's, which fade only once it runs (RemovalReason::kCovered waits), so
+  // no other app may take the slots they free before that.
+  World w;
+  const uint32_t game = w.Spawn("game.exe", kGames + R"(\G)");
+  std::vector<uint32_t> kids;
+  for (int i = 0; i < 3; ++i) {
+    kids.push_back(w.Spawn("game.exe", kGames + R"(\G)", game));
+    w.Render(kids.back(), true, 100);
+  }
+  const uint32_t other = w.Spawn("other.exe", R"(C:\Other)");
+  w.Render(other, true, 100);
+  PlannerOptions opts;
+  opts.max_include_streams = 4;
+  Sim e(Standard().Build(), opts);
+  e.defer_covered = true; // the watcher keeps a covered stream until its coverer runs: one more step here
+  e.Step(w, 0);
+  ASSERT_EQ(e.IncludeStreams(), 4u);
+  w.Render(game, true, 500);
+  std::vector<uint32_t> apps;
+  for (int i = 0; i < 3; ++i) {
+    apps.push_back(w.Spawn("app" + std::to_string(i) + ".exe", R"(C:\Apps\app)" + std::to_string(i)));
+    w.Render(apps.back(), true, 400);
+  }
+  auto before = e.streams;
+  e.Step(w, kSec);
+  EXPECT_EQ(e.plan.activate.size(), 1u);
+  EXPECT_TRUE(e.HasStream(game));
+  for (const uint32_t k : kids) {
+    EXPECT_EQ(e.RemovalsOf(k, before), std::vector<RemovalReason>{RemovalReason::kCovered});
+    EXPECT_EQ(e.SessionOf(k).note, Note::kCovered);
+  }
+  for (const uint32_t a : apps) {
+    EXPECT_EQ(e.SessionOf(a).reason, Reason::kLimit);
+  }
+  EXPECT_EQ(e.held, 5u); // the cap + 1: the children, the other app and the parent's new stream
+  EXPECT_EQ(e.IncludeStreams(), 5u);
+  // The parent's stream runs and the children fade with this plan: their slots are still taken during it.
+  e.Step(w, 2 * kSec);
+  EXPECT_TRUE(e.plan.activate.empty());
+  EXPECT_EQ(e.held, 5u);
+  EXPECT_EQ(e.IncludeStreams(), 2u);
+  // Now the waiting apps take the free slots, the most active first.
+  e.Step(w, 3 * kSec);
+  EXPECT_EQ(e.IncludeStreams(), 4u);
+  EXPECT_TRUE(e.HasStream(game));
+  EXPECT_TRUE(e.HasStream(other));
+  EXPECT_EQ(e.SessionOf(apps[2]).reason, Reason::kLimit);
+}
+
+TEST(AudioPolicyPlanner, HandoverUnderAHandoverStaysWithinTheCapPlusOne) {
+  // Cap 1: a child plays, then its parent (which takes over), then the grandparent while the child still waits for
+  // the parent's stream. The grandparent waits too; the child, covered by the parent's live stream, isn't kept as a
+  // target of its own.
+  World w;
+  const uint32_t grand = w.Spawn("game.exe", kGames + R"(\G)");
+  const uint32_t parent = w.Spawn("game.exe", kGames + R"(\G)", grand);
+  const uint32_t child = w.Spawn("game.exe", kGames + R"(\G)", parent);
+  w.Render(child, true, 100);
+  PlannerOptions opts;
+  opts.max_include_streams = 1;
+  Sim e(Standard().Build(), opts);
+  e.defer_covered = true;
+  e.Step(w, 0);
+  w.Render(parent, true, 200);
+  e.Step(w, kSec);
+  EXPECT_EQ(e.plan.include_targets, std::vector<ProcessKey>{w.Key(parent)});
+  EXPECT_EQ(e.IncludeStreams(), 2u);
+  w.Render(grand, true, 300);
+  auto before = e.streams;
+  e.Step(w, 2 * kSec);
+  EXPECT_EQ(e.plan.include_targets, std::vector<ProcessKey>{w.Key(parent)});
+  EXPECT_EQ(e.RemovalsOf(child, before), std::vector<RemovalReason>{RemovalReason::kCovered});
+  EXPECT_EQ(e.SessionOf(grand).reason, Reason::kLimit);
+  EXPECT_EQ(e.held, 2u);
+  e.Step(w, 3 * kSec);
+  EXPECT_EQ(e.plan.include_targets, std::vector<ProcessKey>{w.Key(grand)});
+  EXPECT_EQ(e.SessionOf(parent).note, Note::kCovered);
+  EXPECT_EQ(e.SessionOf(child).note, Note::kCovered);
+}
+
 // ----------------------------------------------------------------------------------------- step 5: commit
 
 TEST(AudioPolicyPlanner, CommitCheckOnAFreshSnapshot) {
@@ -219,6 +301,68 @@ TEST(AudioPolicyPlanner, CommitCheckOnAFreshSnapshot) {
   World w5;
   Activation l{StreamKind::kInclude, w5.Key(kExplorer), 4, "explorer.exe"};
   EXPECT_EQ(e.planner.CommitCheck(w5.Table(), l).reason, Reason::kLauncher);
+}
+
+TEST(AudioPolicyPlanner, ActivatingStreamsAreHeldStreams) {
+  // The watcher passes every stream it holds from the start of its activation (activated_filetime 0 until it
+  // completes): the next plan doesn't open the target again, and one that finds it unsafe removes it, so the
+  // watcher cancels it or drops it without output (05 §6.2 step 5).
+  World w;
+  const uint32_t game = w.Spawn("game.exe", kGames + R"(\G)");
+  w.Render(game);
+  const std::vector<Session> sessions = w.sessions;
+  Planner p;
+  p.SetExclusions(Standard().Build());
+  Plan plan = p.Reconcile(w.Table(), Input(0, sessions));
+  ASSERT_EQ(plan.activate.size(), 1u);
+  const Activation a = plan.activate.front();
+  std::vector<LiveStream> streams(1);
+  streams[0].kind = a.kind;
+  streams[0].target = a.target;
+  streams[0].parent_pid = a.parent_pid;
+  streams[0].exe = a.exe;
+  streams[0].activated_filetime = 0;
+  PlanInput in = Input(20'000'000, sessions);
+  in.streams = streams;
+  plan = p.Reconcile(w.Table(), in);
+  EXPECT_TRUE(plan.violations.empty());
+  EXPECT_TRUE(plan.activate.empty());
+  EXPECT_TRUE(plan.remove.empty());
+  EXPECT_EQ(plan.include_targets, std::vector<ProcessKey>{w.Key(game)});
+  // Discord starts from the game while the stream is still activating or in preroll.
+  w.Spawn("discord.exe", kDiscordApp, game);
+  in = Input(40'000'000, sessions);
+  in.streams = streams;
+  plan = p.Reconcile(w.Table(), in);
+  EXPECT_TRUE(plan.violations.empty());
+  EXPECT_TRUE(plan.activate.empty());
+  ASSERT_EQ(plan.remove.size(), 1u);
+  EXPECT_EQ(plan.remove[0].stream, 0u);
+  EXPECT_EQ(plan.remove[0].reason, RemovalReason::kUnsafe);
+
+  // Under the late-child fallback an activation that still runs covers every process of the snapshot: they all
+  // started before it completes.
+  World v;
+  const uint32_t g = v.Spawn("game.exe", kGames + R"(\G)");
+  const uint32_t c = v.Spawn("game.exe", kGames + R"(\G)", g);
+  v.Render(g);
+  v.Render(c);
+  PlannerOptions opts;
+  opts.late_child_own_stream = true;
+  Planner q(opts);
+  q.SetExclusions(Standard().Build());
+  std::vector<LiveStream> activating(1);
+  activating[0].target = v.Key(g);
+  activating[0].parent_pid = kExplorer;
+  activating[0].exe = "game.exe";
+  in = Input(0, v.sessions);
+  in.streams = activating;
+  plan = q.Reconcile(v.Table(), in);
+  EXPECT_TRUE(plan.violations.empty());
+  EXPECT_TRUE(plan.activate.empty());
+  EXPECT_EQ(plan.include_targets, std::vector<ProcessKey>{v.Key(g)});
+  ASSERT_EQ(plan.sessions.size(), 2u);
+  EXPECT_EQ(plan.sessions[1].note, Note::kCovered);
 }
 
 // ----------------------------------------------------------------------------------------- step 6: re-checks

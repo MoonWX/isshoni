@@ -50,12 +50,13 @@ std::vector<Violation> CheckInvariants(const ProcessTable &t, const PlanInput &i
   const auto kids_loose = Children(t, true);
   const auto &kids_i1 = opts.loose_links ? kids_loose : kids_strict;
 
-  // isshoni's own tree: the SELF instance rules' processes and everything below them (loose, as row 1 matches).
+  // isshoni's own tree: the SELF instance rules' processes and everything below them by strict links, as row 1
+  // matches (a loose-only "child" is older than isshoni, so it isn't one).
   std::vector<char> self_tree(t.size(), 0);
   for (const Rule &r : ex.rules) {
     if (r.kind == IM_RULE_INSTANCE && r.source == IM_RULE_SRC_SELF) {
       if (const auto k = t.Find(r.pid)) {
-        const auto d = Descendants(kids_loose, *k);
+        const auto d = Descendants(kids_strict, *k);
         for (std::size_t i = 0; i < t.size(); ++i) {
           self_tree[i] = static_cast<char>(self_tree[i] | d[i]);
         }
@@ -64,11 +65,17 @@ std::vector<Violation> CheckInvariants(const ProcessTable &t, const PlanInput &i
   }
   const auto kept_out = [&](std::size_t i) { return plan.processes.at(i).verdict == Verdict::kKeptOut; };
 
-  // The streams that run after the plan: live ones it doesn't remove, and the ones it opens.
+  // The streams that run after the plan: live ones it doesn't remove, include streams whose removal waits (kCovered
+  // until the covering stream runs, kEngine until the crossfade ends), and the ones it opens. An exclusive stream
+  // being replaced fades in the crossfade, which I5 allows for.
   std::vector<char> removed(in.streams.size(), 0);
   for (const Removal &r : plan.remove) {
     if (r.stream < removed.size()) {
-      removed[r.stream] = 1;
+      const bool waits = in.streams[r.stream].kind == StreamKind::kInclude &&
+                         (r.reason == RemovalReason::kCovered || r.reason == RemovalReason::kEngine);
+      if (!waits) {
+        removed[r.stream] = 1;
+      }
     }
   }
   std::vector<LiveStream> running;

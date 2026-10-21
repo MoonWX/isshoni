@@ -3,11 +3,12 @@
 // re-checks of live streams.
 //
 // The Windows watcher calls Planner::Reconcile on its thread on every reconcile (05 §7.3) with a fresh ProcessTable,
-// the session list and the streams it holds, then acts on the Plan: it starts the activations (each passes
-// CommitCheck on a fresh snapshot right before its stream joins the mixer, 05 §6.2 step 5), fades out the removals and
-// writes the report from the plan's rows. The Planner holds what lasts across reconciles: the rules, the sticky mic
-// roots (05 §5.6), the lineage cache (05 §5.7), the fast path's 10 s timer (05 §6.4), the 3 s grace of streams whose
-// session vanished and the pid_reuse blocks already counted. It is not thread-safe: one thread owns it.
+// the session list and the streams it holds (activating ones included, see LiveStream), then acts on the Plan: it
+// starts the activations (each passes CommitCheck on a fresh snapshot right before its stream joins the mixer, 05
+// §6.2 step 5), removes the streams of Plan::remove (see Removal) and writes the report from the plan's rows. The
+// Planner holds what lasts across reconciles: the rules, the sticky mic roots (05 §5.6), the lineage cache (05 §5.7),
+// the fast path's 10 s timer (05 §6.4), the 3 s grace of streams whose session vanished and the pid_reuse blocks
+// already counted. It is not thread-safe: one thread owns it.
 #pragma once
 
 #include <cstddef>
@@ -40,13 +41,19 @@ struct Session {
 };
 
 // A stream the engine holds when it reconciles (05 §8). The exclusive stream (EXCLUDE or endpoint) is one of them.
+// The engine holds a stream from the moment it starts its activation until the stream is gone: while it activates,
+// waits for its commit check, prerolls (05 §9.2) and runs, and while a removal that waits for something keeps it
+// (RemovalReason::kCovered, kEngine). Leaving out a stream that is still activating would make the next plan open
+// it again, and would leave a reconcile in the preroll window unable to drop it (05 §6.2 step 5).
 struct LiveStream {
   StreamKind kind = StreamKind::kInclude;
   ProcessKey target;       // the key it was planned for (I3); {0, 0} for the endpoint stream
-  bool has_handle = true;  // a SYNCHRONIZE handle on the target is held (05 §5.7); false: checked by snapshot
+  bool has_handle = true;  // a SYNCHRONIZE handle on the target is held (05 §5.7, taken before the activation
+                           // starts); false: checked by snapshot
   uint32_t parent_pid = 0; // the target's parent pid and folded exe when planned: a target whose creation time is
   std::string exe;         // unknown matches a process whose time is still unknown with the same exe and parent
-  uint64_t activated_filetime = 0; // when the activation completed, FILETIME: the late-child fallback (§6.2 step 3)
+  uint64_t activated_filetime = 0; // when the activation completed, FILETIME, for the late-child fallback (§6.2
+                                   // step 3); 0 while it still runs (it then covers every process of the snapshot)
 };
 
 // What one reconcile's planner needs besides the table.
@@ -56,7 +63,7 @@ struct PlanInput {
                                               // the reserved EVERYTHING plan no stream (engine none)
   bool process_loopback = true;               // the startup probe passed or still runs (05 §6.1, §11.2)
   std::span<const Session> sessions;          // expired and system-sounds sessions already left out
-  std::span<const LiveStream> streams;        // every stream the engine holds now
+  std::span<const LiveStream> streams;        // every stream the engine holds now, activating ones included
   std::span<const ProcessKey> capture_failed; // include targets the watcher gave up on (05 §8.5)
 };
 
@@ -68,6 +75,8 @@ struct Activation {
   std::string exe;
 };
 
+// A stream to remove: the watcher cancels it while it activates, drops it without output before it is mixed, and
+// fades it out once it runs (05 §9.4), at once unless the reason says it waits (kCovered, kEngine).
 struct Removal {
   std::size_t stream = 0; // index into PlanInput::streams
   RemovalReason reason = RemovalReason::kExited;
@@ -150,7 +159,8 @@ struct Plan {
   Engine previous_engine = Engine::kNone;  // the engine of the previous plan (fastpath_enter, fastpath_exit events)
   ProcessKey exclude_target;               // kExcludeSelf: R
   std::vector<ProcessKey> include_targets; // kIncludeSet: every target with a stream after this plan, kept and new,
-                                           // in priority order, at most PlannerOptions::max_include_streams
+                                           // in priority order, at most PlannerOptions::max_include_streams (covered
+                                           // streams that still wait for their coverer are not targets)
   std::vector<Activation> activate;        // streams to open (new include targets, or the exclusive stream)
   std::vector<Removal> remove;             // live streams to fade out
   std::vector<ProcessResult> processes;    // per table index
@@ -169,7 +179,9 @@ struct CommitResult {
 };
 
 struct PlannerOptions {
-  uint32_t max_include_streams = 48;             // 05 §6.2 step 4, §17
+  uint32_t max_include_streams = 48;             // 05 §6.2 step 4, §17: targets per plan. Counting the covered
+                                                 // streams that wait for their coverer, the engine holds at most
+                                                 // one more, while a parent's new stream replaces its children's
   int64_t fast_path_enter_ns = 10'000'000'000;   // the fast path's condition must hold this long (05 §6.4)
   int64_t session_grace_ns = 3'000'000'000;      // a stream whose session vanished lives this long (05 §6.2 step 6)
   bool loose_links = true;                       // the loose union of 05 §5.2 (off if case 27 shows Windows ignores
@@ -186,7 +198,7 @@ using KeySet = std::unordered_set<ProcessKey, ProcessKeyHash>;
 struct LineageEntry {
   std::vector<std::string> exes;     // the exes of its app walks while its links were intact
   std::vector<ProcessKey> roots;     // the app roots it had then (row 6)
-  std::vector<ProcessKey> ancestors; // its pid chain then (row 1's instance trees)
+  std::vector<ProcessKey> ancestors; // its strict parent chain then (row 1's instance trees)
 };
 using LineageMap = std::unordered_map<ProcessKey, LineageEntry, ProcessKeyHash>;
 } // namespace detail
@@ -238,14 +250,16 @@ private:
 // table's links) so a planner bug can't hide in a shared helper:
 //   I1 no include stream that runs after the plan has a kept-out process in its target's OS tree (strict ∪ loose, or
 //      strict only when opts.loose_links is off);
-//   I2 no include stream targets a launcher, a kept-out process or isshoni's own tree (the SELF instance rules);
+//   I2 no include stream targets a launcher, a kept-out process or isshoni's own tree (the SELF instance rules'
+//      strict trees, as row 1 matches them);
 //   I3 every stream that runs after the plan targets the key it was planned for: the key is in the table (a target
 //      planned with an unknown creation time: the same pid, still unknown, with the same exe and parent pid);
 //   I4 in exclude-self every kept-out process is in R's strict tree and no heard render-session process is in R's
 //      loose tree;
 //   I5 at most one exclusive (EXCLUDE or endpoint) stream is kept or opened by the plan (the one it replaces fades out
 //      in the 20 ms crossfade).
-// "Runs after the plan" means: a live stream the plan doesn't remove, or one it activates.
+// "Runs after the plan" means: a live stream the plan doesn't remove, an include stream whose removal waits
+// (RemovalReason::kCovered, kEngine), or one it activates.
 std::vector<Violation> CheckInvariants(const ProcessTable &table, const PlanInput &in, const Plan &plan,
                                        const Exclusions &ex, const PlannerOptions &opts);
 

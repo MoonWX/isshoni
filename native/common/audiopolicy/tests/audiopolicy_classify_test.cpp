@@ -206,14 +206,73 @@ TEST(AudioPolicyClassify, Row1InstanceTreeStrictAndLoose) {
   World w;
   const uint32_t me = w.Spawn("isshoni.exe", kIsshoniDir);
   const uint32_t strict_child = w.Spawn("helper.exe", R"(C:\Other)", me);
-  // A process older than isshoni whose (dead) parent's pid isshoni now holds: linked only loosely.
+  // A process older than isshoni whose (dead) parent's pid isshoni now holds: linked only loosely. It is no
+  // descendant of isshoni, and an INCLUDE stream on it can't capture isshoni, so row 1 takes strict links only.
   const uint32_t old = w.SpawnAt(5000, 10, "old.exe", R"(C:\Old)", me);
   w.Render(strict_child);
   w.Render(old);
   Sim e(Standard().Build(me));
   e.Step(w);
   EXPECT_EQ(e.SessionOf(strict_child).reason, Reason::kIsshoni);
-  EXPECT_EQ(e.SessionOf(old).reason, Reason::kIsshoni); // row 1 takes strict or loose links
+  EXPECT_EQ(e.SessionOf(old).verdict, Verdict::kHeard);
+  EXPECT_TRUE(e.SessionOf(old).target);
+}
+
+TEST(AudioPolicyClassify, Row1GameWhoseExitedBootstrappersPidIsshoniGotIsHeard) {
+  // A bootstrapper starts the game and exits; isshoni.exe starts later and gets its pid. The game is shared.
+  World w;
+  const uint32_t boot = w.Spawn("launcherx.exe", R"(C:\Program Files\LauncherX)");
+  const uint32_t game = w.Spawn("game.exe", kGames + R"(\Game)", boot);
+  w.Exit(boot);
+  const uint32_t me = w.SpawnAt(boot, 0, "isshoni.exe", kIsshoniDir, kExplorer);
+  const uint32_t wv = w.Spawn("msedgewebview2.exe", kEdgeWebView, me);
+  w.Proc(wv).user_data_dir = kWebViewData + R"(\EBWebView)";
+  w.Render(game);
+  w.Render(wv);
+  for (const bool fast_path : {false, true}) {
+    SCOPED_TRACE(fast_path ? "fast path on" : "fast path off");
+    const uint32_t flags = IM_EXCLF_KEEP_OUT_MIC_USERS | (fast_path ? IM_EXCLF_FAST_PATH : 0u);
+    Sim e(Standard().Self(me, kWebViewData).Shared(game).Flags(flags).Build(me));
+    e.Step(w);
+    EXPECT_EQ(e.SessionOf(wv).reason, Reason::kIsshoni);
+    EXPECT_EQ(e.ProcessOf(game).verdict, Verdict::kHeard);
+    EXPECT_EQ(e.SessionOf(game).verdict, Verdict::kHeard);
+    EXPECT_TRUE(e.SessionOf(game).target);
+    EXPECT_TRUE(e.HasStream(game));
+    const AppRow *row = e.App("exe:game.exe");
+    ASSERT_NE(row, nullptr);
+    EXPECT_TRUE(row->shared);
+    EXPECT_EQ(row->verdict, Verdict::kHeard);
+    EXPECT_EQ(row->warnings & kWarnSharedAppKeptOut, 0u);
+    // The game lies in isshoni's loose tree: an EXCLUDE stream on isshoni might take it along if Windows follows the
+    // reused pid, so its session keeps the engine on the include set (I4).
+    EXPECT_EQ(e.plan.engine, Engine::kIncludeSet);
+  }
+  // The lineage cache records strict links too: kept out by a user rule first (so the cache remembers it), the game
+  // is heard again once the rule goes, not kept out as isshoni.
+  Sim f(Standard().Self(me).UserKeepOut("game.exe").Build(me));
+  f.Step(w, 0);
+  EXPECT_EQ(f.SessionOf(game).reason, Reason::kUser);
+  f.planner.SetExclusions(Standard().Self(me).Build(me));
+  f.Step(w, 1);
+  EXPECT_EQ(f.SessionOf(game).verdict, Verdict::kHeard);
+  EXPECT_TRUE(f.SessionOf(game).target);
+}
+
+TEST(AudioPolicyClassify, Row1OrphanOfIsshoniKeepsItsLineage) {
+  World w;
+  const uint32_t me = w.Spawn("isshoni.exe", kIsshoniDir);
+  const uint32_t helper = w.Spawn("helper.exe", R"(C:\Tools)", me); // another folder: an app of its own
+  const uint32_t sub = w.Spawn("sub.exe", R"(C:\Tools)", helper);
+  w.Render(sub);
+  Sim e(Standard().Build(me));
+  e.Step(w, 0);
+  EXPECT_EQ(e.SessionOf(sub).reason, Reason::kIsshoni);
+  EXPECT_FALSE(e.ProcessOf(sub).lineage);
+  w.Exit(helper); // orphaned: only the lineage cache still links it to isshoni
+  e.Step(w, 1);
+  EXPECT_EQ(e.SessionOf(sub).reason, Reason::kIsshoni);
+  EXPECT_TRUE(e.ProcessOf(sub).lineage);
 }
 
 TEST(AudioPolicyClassify, Row1OtherIsshoniInstancesByExeName) {

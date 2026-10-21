@@ -261,13 +261,34 @@ private:
   uint64_t clock_ = 1000;
 };
 
+// The include streams an engine holds while a plan's handovers run: the live ones it keeps, the ones whose removal
+// waits (RemovalReason::kCovered until the coverer runs, kEngine until the crossfade ends) and the new ones.
+inline std::size_t HeldIncludeStreams(const PlanInput &in, const Plan &plan) {
+  std::vector<char> gone(in.streams.size(), 0);
+  for (const Removal &r : plan.remove) {
+    if (r.reason != RemovalReason::kCovered && r.reason != RemovalReason::kEngine) {
+      gone.at(r.stream) = 1;
+    }
+  }
+  std::size_t held = 0;
+  for (std::size_t j = 0; j < in.streams.size(); ++j) {
+    held += in.streams[j].kind == StreamKind::kInclude && !gone[j] ? 1 : 0;
+  }
+  for (const Activation &a : plan.activate) {
+    held += a.kind == StreamKind::kInclude ? 1 : 0;
+  }
+  return held;
+}
+
 // A planner and the streams a fake engine holds: Step() reconciles and applies the plan.
 class Sim {
 public:
   explicit Sim(Exclusions ex, PlannerOptions opts = {}) : planner(opts) { planner.SetExclusions(std::move(ex)); }
 
   // One reconcile at now_ns; activations pass the commit check against the same snapshot and become live streams
-  // (with a held handle unless no_handle names their pid).
+  // (with a held handle unless no_handle names their pid). Removals apply at once, except that with defer_covered a
+  // kCovered stream stays for one more step, as the watcher keeps it until its coverer runs. Every step checks the
+  // invariants and the include cap (cap + 1 while a handover runs).
   const Plan &Step(const World &w, int64_t now_ns = 0, uint32_t mode = IM_AUDIO_MODE_EXCLUDE_APPS,
                    bool process_loopback = true) {
     table = w.Table();
@@ -283,14 +304,33 @@ public:
     EXPECT_TRUE(plan.violations.empty()) << Describe(plan.violations);
     const auto check = CheckInvariants(table, in, plan, planner.exclusions(), planner.options());
     EXPECT_TRUE(check.empty()) << Describe(check);
+    const std::size_t cap = planner.options().max_include_streams;
+    EXPECT_LE(plan.include_targets.size(), cap);
+    held = HeldIncludeStreams(in, plan);
+    EXPECT_LE(held, cap + 1);
+    waiting.resize(streams.size(), 0);
     std::vector<char> removed(streams.size(), 0);
+    std::vector<char> waits(streams.size(), 0);
     for (const Removal &r : plan.remove) {
-      removed.at(r.stream) = 1;
+      if (defer_covered && r.reason == RemovalReason::kCovered && !waiting.at(r.stream)) {
+        waits.at(r.stream) = 1;
+      } else {
+        removed.at(r.stream) = 1;
+      }
     }
     std::vector<LiveStream> next;
+    std::vector<char> next_waiting;
     for (std::size_t j = 0; j < streams.size(); ++j) {
       if (!removed[j]) {
         next.push_back(streams[j]);
+        next_waiting.push_back(waits[j]);
+      }
+    }
+    // Activations complete after every process of the snapshot started, unless the test sets the clock.
+    uint64_t activated = activation_clock;
+    if (activated == 0) {
+      for (const Process &p : table.processes()) {
+        activated = std::max(activated, p.key.created + 1);
       }
     }
     for (const Activation &a : plan.activate) {
@@ -303,10 +343,13 @@ public:
       s.parent_pid = a.parent_pid;
       s.exe = a.exe;
       s.has_handle = std::find(no_handle.begin(), no_handle.end(), a.target.pid) == no_handle.end();
-      s.activated_filetime = activation_clock;
+      s.activated_filetime = activated;
       next.push_back(std::move(s));
+      next_waiting.push_back(0);
     }
     streams = std::move(next);
+    waiting = std::move(next_waiting);
+    EXPECT_LE(IncludeStreams(), cap + 1);
     return plan;
   }
 
@@ -375,7 +418,10 @@ public:
   std::vector<LiveStream> streams;
   std::vector<ProcessKey> capture_failed;
   std::vector<uint32_t> no_handle;
-  uint64_t activation_clock = 0;
+  uint64_t activation_clock = 0; // activated_filetime of new streams; 0: just after the snapshot's newest process
+  bool defer_covered = false;    // kCovered streams stay one more step (their coverer starts running)
+  std::vector<char> waiting;     // per stream: its kCovered removal was deferred in the last step
+  std::size_t held = 0;          // HeldIncludeStreams of the last step's plan
   Plan plan;
 };
 

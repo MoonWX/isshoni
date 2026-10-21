@@ -12,8 +12,10 @@
 //     target's tree, at the target, or outside R's tree in exclude-self, and none in a stream that just passed the
 //     commit check on the changed world;
 //   - I5 holds over the streams the engine holds, the fading one of a crossfade included;
+//   - the engine never holds more than cap + 1 include streams, counting covered streams that wait for their coverer
+//     (some seeds keep them for one more step, as the watcher does until the coverer runs);
 //   - nothing heard is lost needlessly: a heard, safe render session is a target, covered by one, or cut only when
-//     the include set is full.
+//     the include set is full (or the streams a handover still holds fill it).
 // Seeds run on several threads, each with its own planner, which also gives ThreadSanitizer (host-tsan) something to
 // look at: the library must keep no shared state.
 #include <gtest/gtest.h>
@@ -110,6 +112,31 @@ struct UserRule {
   std::string exe;
 };
 
+// A removal that waits (05 §6.2 step 3's covered stream until its coverer runs, an include stream until the engine's
+// crossfade ends): the stream still runs after the plan.
+bool Waits(const PlanInput &in, const Removal &r) {
+  return in.streams[r.stream].kind == StreamKind::kInclude &&
+         (r.reason == RemovalReason::kCovered || r.reason == RemovalReason::kEngine);
+}
+
+// The include streams an engine holds while a plan's handovers run: kept, waiting and new ones.
+std::size_t HeldIncludeStreams(const PlanInput &in, const Plan &plan) {
+  std::vector<char> gone(in.streams.size(), 0);
+  for (const Removal &r : plan.remove) {
+    if (!Waits(in, r)) {
+      gone.at(r.stream) = 1;
+    }
+  }
+  std::size_t held = 0;
+  for (std::size_t j = 0; j < in.streams.size(); ++j) {
+    held += in.streams[j].kind == StreamKind::kInclude && !gone[j] ? 1 : 0;
+  }
+  for (const Activation &a : plan.activate) {
+    held += a.kind == StreamKind::kInclude ? 1 : 0;
+  }
+  return held;
+}
+
 // What the runs reached, so a generator that stopped producing interesting worlds fails instead of passing vacuously.
 struct Coverage {
   uint64_t engines[4] = {};      // by Engine
@@ -122,9 +149,13 @@ struct Coverage {
   uint64_t pid_reuse_blocks = 0; // the counter
   uint64_t fast_path_exits = 0;  // exclude-self -> include-set
   uint64_t voice_root = 0;       // exclude-self with R = the voice app that started isshoni
+  uint64_t deferred = 0;         // covered streams the engine kept until their coverer ran
+  uint64_t over_cap = 0;         // plans whose handover holds cap + 1 include streams
 
   void Add(const Coverage &o) {
     voice_root += o.voice_root;
+    deferred += o.deferred;
+    over_cap += o.over_cap;
     for (int i = 0; i < 4; ++i) {
       engines[i] += o.engines[i];
     }
@@ -192,6 +223,7 @@ private:
     opts.fast_path_exit_on_new_descendant = rng_.Chance(25);
     opts.max_include_streams = rng_.Chance(30) ? 1 + rng_.Below(4) : 48;
     planner_ = Planner(opts);
+    defer_covered_ = rng_.Chance(50);
     flags_ = (rng_.Chance(70) ? IM_EXCLF_KEEP_OUT_MIC_USERS : 0u) | (rng_.Chance(60) ? IM_EXCLF_FAST_PATH : 0u);
     for (int i = 0; i < 3; ++i) {
       if (rng_.Chance(40)) {
@@ -301,6 +333,71 @@ private:
 
   uint32_t RandomPid() { return procs_[rng_.Below(procs_.size())].pid; }
 
+  // Families for 05 §6.2 step 3: the parent of an include target starts playing (its stream takes over the target's,
+  // a handover), a target starts a child that plays (covered by its stream), or an app starts with one to three
+  // playing children (whose parent may play later).
+  void Family() {
+    Session s;
+    s.flow = Flow::kRender;
+    s.state = SessionState::kActive;
+    s.playing = true;
+    s.last_active_ns = now_;
+    uint32_t c = rng_.Below(4);
+    if (c < 2) {
+      std::vector<uint32_t> parents;
+      for (const LiveStream &x : streams_) {
+        const ProcessEntry *t = x.kind == StreamKind::kInclude ? Get(x.target.pid) : nullptr;
+        const ProcessEntry *p = t != nullptr ? Get(t->parent_pid) : nullptr;
+        if (p != nullptr && p->pid != kMe &&
+            std::find(kLauncherExes.begin(), kLauncherExes.end(), p->exe) == kLauncherExes.end()) {
+          parents.push_back(p->pid);
+        }
+      }
+      if (!parents.empty()) {
+        s.pid = rng_.Pick(parents);
+        sessions_.push_back(s);
+        return;
+      }
+      c = 3; // no such parent yet: start an app with a playing child
+    }
+    if (procs_.size() + 4 > kMaxProcs) {
+      return;
+    }
+    uint32_t parent = 0;
+    std::string folder;
+    if (c == 2) {
+      std::vector<uint32_t> targets;
+      for (const LiveStream &x : streams_) {
+        if (x.kind == StreamKind::kInclude && Get(x.target.pid) != nullptr) {
+          targets.push_back(x.target.pid);
+        }
+      }
+      if (targets.empty()) {
+        return;
+      }
+      parent = rng_.Pick(targets);
+      folder = Get(parent)->folder;
+    } else {
+      parent = FreePid();
+      if (parent == 0) {
+        return;
+      }
+      clock_ += 1;
+      folder = rng_.Pick(kFolders);
+      Add(parent, clock_, rng_.Pick(kAppExes), folder, kExplorerPid);
+    }
+    // One to three playing children: a parent that starts playing later replaces several streams at once.
+    const uint32_t kids = c == 2 ? 1 : 1 + rng_.Below(3);
+    for (uint32_t k = 0; k < kids; ++k) {
+      if (const uint32_t pid = FreePid()) {
+        clock_ += 1;
+        Add(pid, clock_, rng_.Pick(kAppExes), folder, parent);
+        s.pid = pid;
+        sessions_.push_back(s);
+      }
+    }
+  }
+
   void AddUserRule() {
     std::vector<std::string> pool = kAppExes;
     pool.insert(pool.end(), kBrowserExes.begin(), kBrowserExes.end());
@@ -359,6 +456,8 @@ private:
       Spawn();
     } else if (e < 28) {
       Exit(RandomPid());
+    } else if (e < 33) {
+      Family();
     } else if (e < 44) {
       Session s;
       s.pid = RandomPid();
@@ -405,6 +504,7 @@ private:
     } else if (e < 82) {
       planner_.Restart(); // a new share: the engine starts again with no streams
       streams_.clear();
+      waiting_.clear();
       fading_until_ = 0;
     } else if (e < 86) {
       // An include stream fails for good (05 §8.5): the watcher drops it and reports capture_failed.
@@ -412,6 +512,9 @@ private:
         if (streams_[j].kind == StreamKind::kInclude) {
           failed_.push_back(streams_[j].target);
           streams_.erase(streams_.begin() + static_cast<std::ptrdiff_t>(j));
+          if (j < waiting_.size()) {
+            waiting_.erase(waiting_.begin() + static_cast<std::ptrdiff_t>(j));
+          }
           break;
         }
       }
@@ -455,10 +558,13 @@ private:
     in.capture_failed = failed_;
     const Plan plan = planner_.Reconcile(table, in);
     const std::string where = " (seed " + std::to_string(seed_) + ", step " + std::to_string(step) + ")";
-    for (const Violation &v : plan.violations) {
+    if (!plan.violations.empty()) {
+      const Violation &v = plan.violations.front();
       return Fail("planner debug check: I" + std::to_string(static_cast<int>(v.invariant)) + " " + v.what + where);
     }
-    for (const Violation &v : CheckInvariants(table, in, plan, planner_.exclusions(), planner_.options())) {
+    if (const auto check = CheckInvariants(table, in, plan, planner_.exclusions(), planner_.options());
+        !check.empty()) {
+      const Violation &v = check.front();
       return Fail("I" + std::to_string(static_cast<int>(v.invariant)) + " " + v.what + where);
     }
     if (const std::string o = OracleAfterPlan(table, in, plan); !o.empty()) {
@@ -467,6 +573,13 @@ private:
     if (const std::string l = NoNeedlessLoss(table, in, plan); !l.empty()) {
       return Fail(l + where);
     }
+    const std::size_t cap = planner_.options().max_include_streams;
+    const std::size_t handover = HeldIncludeStreams(in, plan);
+    if (handover > cap + 1) {
+      return Fail("the handover holds " + std::to_string(handover) + " include streams, cap " + std::to_string(cap) +
+                  where);
+    }
+    cov_.over_cap += handover == cap + 1 ? 1 : 0;
     digest_ = digest_ * 31 + static_cast<uint64_t>(plan.engine);
     for (const ProcessKey &k : plan.include_targets) {
       digest_ = digest_ * 31 + k.pid;
@@ -488,19 +601,29 @@ private:
     cov_.fast_path_exits += plan.previous_engine == Engine::kExcludeSelf && plan.engine == Engine::kIncludeSet ? 1 : 0;
     cov_.voice_root += plan.engine == Engine::kExcludeSelf && plan.exclude_target.pid == kVoiceParent ? 1 : 0;
 
-    // Apply: removals at once (an exclusive one fades for the 20 ms crossfade), then activations, each through the
-    // commit check on a snapshot that may have changed meanwhile.
+    // Apply: removals at once (an exclusive one fades for the 20 ms crossfade; with defer_covered_ a covered stream
+    // stays one more step, until its coverer runs), then activations, each through the commit check on a snapshot
+    // that may have changed meanwhile.
+    waiting_.resize(streams_.size(), 0);
     std::vector<char> removed(streams_.size(), 0);
+    std::vector<char> waits(streams_.size(), 0);
     for (const Removal &r : plan.remove) {
+      if (defer_covered_ && r.reason == RemovalReason::kCovered && !waiting_.at(r.stream)) {
+        waits.at(r.stream) = 1;
+        ++cov_.deferred;
+        continue;
+      }
       removed.at(r.stream) = 1;
       if (streams_[r.stream].kind != StreamKind::kInclude) {
         fading_until_ = now_ + 20 * kMs;
       }
     }
     std::vector<LiveStream> next;
+    std::vector<char> next_waiting;
     for (std::size_t j = 0; j < streams_.size(); ++j) {
       if (!removed[j]) {
         next.push_back(streams_[j]);
+        next_waiting.push_back(waits[j]);
       }
     }
     if (rng_.Chance(20)) {
@@ -526,9 +649,17 @@ private:
         return Fail(o + where);
       }
       next.push_back(std::move(s));
+      next_waiting.push_back(0);
     }
     streams_ = std::move(next);
+    waiting_ = std::move(next_waiting);
     clock_ += 2;
+    const auto include = static_cast<std::size_t>(std::count_if(
+        streams_.begin(), streams_.end(), [](const LiveStream &x) { return x.kind == StreamKind::kInclude; }));
+    if (include > cap + 1) {
+      return Fail("the engine holds " + std::to_string(include) + " include streams, cap " + std::to_string(cap) +
+                  where);
+    }
     std::size_t exclusive = 0;
     for (const LiveStream &s : streams_) {
       exclusive += s.kind != StreamKind::kInclude ? 1 : 0;
@@ -578,13 +709,13 @@ private:
     Oracle o;
     o.must_keep_out.assign(t.size(), 0);
     o.kids.assign(t.size(), {});
-    std::vector<std::vector<std::size_t>> loose_kids(t.size());
+    std::vector<std::vector<std::size_t>> strict_kids(t.size());
     for (std::size_t i = 0; i < t.size(); ++i) {
       if (const int32_t p = t.Parent(i, loose); p >= 0) {
         o.kids[static_cast<std::size_t>(p)].push_back(i);
       }
-      if (const int32_t p = t.Parent(i, true); p >= 0) {
-        loose_kids[static_cast<std::size_t>(p)].push_back(i);
+      if (const int32_t p = t.Parent(i, false); p >= 0) {
+        strict_kids[static_cast<std::size_t>(p)].push_back(i);
       }
     }
     std::set<std::string> out(kVoiceExes.begin(), kVoiceExes.end());
@@ -613,7 +744,7 @@ private:
         }
       }
     }
-    if (const auto me = t.Find(kMe)) { // isshoni's tree, loose: row 1
+    if (const auto me = t.Find(kMe)) { // isshoni's tree by strict links: row 1 (a loose-only child is older)
       std::deque<std::size_t> q{*me};
       std::vector<char> seen(t.size(), 0);
       seen[*me] = 1;
@@ -621,7 +752,7 @@ private:
         const std::size_t i = q.front();
         q.pop_front();
         o.must_keep_out[i] = 1;
-        for (const std::size_t c : loose_kids[i]) {
+        for (const std::size_t c : strict_kids[i]) {
           if (!seen[c]) {
             seen[c] = 1;
             q.push_back(c);
@@ -670,7 +801,9 @@ private:
     const Oracle o = MakeOracle(t, planner_.options().loose_links);
     std::vector<char> removed(in.streams.size(), 0);
     for (const Removal &r : plan.remove) {
-      removed.at(r.stream) = 1;
+      if (!Waits(in, r)) {
+        removed.at(r.stream) = 1; // a removal that waits leaves the stream running for now
+      }
     }
     std::vector<ProcessKey> running;
     for (std::size_t j = 0; j < in.streams.size(); ++j) {
@@ -791,9 +924,10 @@ private:
         }
         continue;
       }
+      const std::size_t cap = planner_.options().max_include_streams;
       if (sr.verdict == Verdict::kNotCaptured && sr.reason == Reason::kLimit &&
-          plan.include_targets.size() >= planner_.options().max_include_streams) {
-        continue;
+          (plan.include_targets.size() >= cap || HeldIncludeStreams(in, plan) >= cap)) {
+        continue; // the set is full, or the streams a handover still holds fill it
       }
       return "session of " + std::to_string(s.pid) + " lost: verdict " + std::string(VerdictName(sr.verdict)) + " " +
              std::string(ReasonName(sr.reason));
@@ -813,6 +947,8 @@ private:
   std::vector<ProcessEntry> procs_;
   std::vector<Session> sessions_;
   std::vector<LiveStream> streams_;
+  std::vector<char> waiting_; // per stream: its kCovered removal was deferred in the last step
+  bool defer_covered_ = false;
   std::vector<ProcessKey> failed_;
   std::vector<UserRule> user_rules_;
   uint32_t flags_ = 0;
@@ -887,12 +1023,15 @@ TEST(AudioPolicyProperty, InvariantsHoldAfterRandomEventSequences) {
   EXPECT_GT(cov.pid_reuse_blocks, 0u);
   EXPECT_GT(cov.fast_path_exits, 0u);
   EXPECT_GT(cov.voice_root, 0u);
+  EXPECT_GT(cov.deferred, 0u);
+  EXPECT_GT(cov.over_cap, 0u);
   std::string summary;
   for (int i = 0; i < 4; ++i) {
     summary += std::string(EngineName(static_cast<Engine>(i))) + "=" + std::to_string(cov.engines[i]) + " ";
   }
   summary += "covered=" + std::to_string(cov.covered) + " commit_rejected=" + std::to_string(cov.commit_rejected) +
-             " lineage=" + std::to_string(cov.lineage) + " pid_reuse_blocks=" + std::to_string(cov.pid_reuse_blocks);
+             " lineage=" + std::to_string(cov.lineage) + " pid_reuse_blocks=" + std::to_string(cov.pid_reuse_blocks) +
+             " deferred=" + std::to_string(cov.deferred) + " over_cap=" + std::to_string(cov.over_cap);
   RecordProperty("coverage", summary);
   std::printf("coverage: %s\n", summary.c_str());
 }
