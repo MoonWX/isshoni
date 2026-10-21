@@ -1,10 +1,14 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -194,6 +198,193 @@ func TestHeaderNotices(t *testing.T) {
 	}
 }
 
+// TestBannerVersion runs build.sh's banner_version, which reads the compiler and linker builds of the toolset build
+// (06 §3) from cl.exe's and link.exe's banners, under the script's own shell options (sourcing it applies set -Eeuo
+// pipefail), with a fake program: a CRLF banner, then a usage text larger than a pipe buffer, and an exit status that
+// is not always 0, as link.exe's. A reader that left early (head -n 1 straight after the program or after tr) would
+// kill the program or tr with SIGPIPE, and pipefail would fail the build.
+func TestBannerVersion(t *testing.T) {
+	bash := needBash(t)
+	usage := strings.Repeat("  /OPTION:value    a usage line that names a version 1.2.3.4 too\r\n", 2500)
+	if len(usage) <= 128<<10 {
+		t.Fatalf("a usage text of %d bytes, want more than 128 KiB", len(usage))
+	}
+	const copyright = "Copyright (C) Microsoft Corporation.  All rights reserved.\r\n\r\n"
+	for _, tc := range []struct {
+		name, out string
+		status    int
+		want      string
+	}{
+		{"cl.exe", "Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35229 for x64\r\n" + copyright + usage, 0, "19.44.35229"},
+		{"link.exe", "Microsoft (R) Incremental Linker Version 14.44.35229.0\r\n" + copyright + usage, 1, "14.44.35229.0"},
+		{"localized cl.exe", "用于 x64 的 Microsoft (R) C/C++ 优化编译器 19.44.35229 版\r\n" + copyright + usage, 2, "19.44.35229"},
+		{"four-part compiler build", "Microsoft (R) C/C++ Optimizing Compiler Version 19.00.24215.1 for x64\n", 0, "19.00.24215.1"},
+		{"MSYS2's coreutils link", "link: missing operand\nTry 'link --help' for more information.\n" + usage, 1, ""},
+		{"the number not on the first line", "Microsoft (R) Incremental Linker\r\nVersion 14.44.35229.0\r\n", 0, ""},
+		{"a two-part version", "Some Tool Version 14.44 for x64\r\n" + usage, 0, ""},
+		{"a five-part version", "Some Tool Version 1.2.3.4.5\r\n", 0, ""},
+		{"no output", "", 0, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := filepath.Join(t.TempDir(), "banner.txt")
+			writeFile(t, out, tc.out)
+			got, stderr, err := bannerVersion(t, bash, "fake", "FAKE_OUT="+out, "FAKE_STATUS="+strconv.Itoa(tc.status))
+			if err != nil {
+				t.Fatalf("banner_version: %v; stderr %q", err, stderr)
+			}
+			if want := tc.want; want != "" {
+				want += "\n"
+				if got != want {
+					t.Errorf("banner_version printed %q, want %q", got, want)
+				}
+			} else if got != "" {
+				t.Errorf("banner_version printed %q, want nothing (build.sh then fails)", got)
+			}
+		})
+	}
+	// A program that is not there prints no build number either (build.sh checks both are there first).
+	got, stderr, err := bannerVersion(t, bash, filepath.Join(t.TempDir(), "cl.exe"))
+	if err != nil || got != "" {
+		t.Errorf("a missing program: %q, %v; stderr %q", got, err, stderr)
+	}
+}
+
+// bannerVersion runs build.sh's banner_version on prog, where the program "fake" prints the file $FAKE_OUT and
+// exits with $FAKE_STATUS.
+func bannerVersion(t *testing.T, bash, prog string, env ...string) (stdout, stderr string, err error) {
+	t.Helper()
+	const script = `. native/ffmpeg/build.sh
+fake() {
+  cat "$FAKE_OUT"
+  return "$FAKE_STATUS"
+}
+banner_version "$1"
+`
+	cmd := exec.CommandContext(t.Context(), bash, "-c", script, "bash", prog)
+	cmd.Dir = repoRoot(t)
+	cmd.Env = append(os.Environ(), env...)
+	var errBuf strings.Builder
+	cmd.Stderr = &errBuf
+	out, err := cmd.Output()
+	return string(out), errBuf.String(), err
+}
+
+// TestBuildScriptRecords expands the three JSON files native/ffmpeg/build.sh writes (build-manifest.json, result.json
+// and lock-candidate.json, 06 §4.3) with bash, the script's functions and sample values: each is JSON and records the
+// toolset build (msvcToolset, msvcCompiler and msvcLinker, 06 §3), and lock-candidate.json passes parseLock, which
+// decodes lock.json with no unknown field, so the lock a publishing run prints can be committed as it is.
+func TestBuildScriptRecords(t *testing.T) {
+	bash := needBash(t)
+	script := readRepoFile(t, "native/ffmpeg/build.sh")
+	heredocs := map[string]string{}
+	for _, m := range regexp.MustCompile(`(?s)cat >"\$(?:dist|out)/([a-z-]+)\.json" <<EOF\n(.*?)\nEOF\n`).FindAllStringSubmatch(script, -1) {
+		heredocs[m[1]] = m[2]
+	}
+	hash := func(c string) string { return strings.Repeat(c, 64) }
+	vars := map[string]string{
+		"name": "ffmpeg-9.0.2-r1", "tag": "deps-ffmpeg-9.0.2-r1", "revision": "1", "inputs": hash("a"),
+		"commit": "0123456789abcdef0123456789abcdef01234567", "epoch": "1792000000",
+		"ff_version": "9.0.2", "ff_tar": "ffmpeg-9.0.2.tar.xz", "ff_sha": hash("b"),
+		"nv_tag": "n12.1.14.1", "nv_tar": "nv-codec-headers-n12.1.14.1.tar.gz", "nv_sha": hash("c"),
+		"amf_tag": "v1.5.3", "amf_tar": "AMF-headers-v1.5.3.tar.gz", "amf_sha": hash("d"),
+		"vpl_tag": "v2.17.0", "vpl_tar": "libvpl-v2.17.0.tar.gz", "vpl_sha": hash("e"),
+		"toolset": "14.44.35207", "compiler": "19.44.35229", "linker": "14.44.35229.0", "sdk": "10.0.26100.0",
+		"cmake_version": "4.1.2", "msys_pkgs": `"make": "4.4.1-3", "zip": "3.0-5"`,
+		"avcodec_major": "63", "avutil_major": "61", "avcodec_dll": "avcodec-63.dll", "avutil_dll": "avutil-61.dll",
+		"avcodec_sha": hash("1"), "avutil_sha": hash("2"), "zip_sha": hash("3"), "tar_sha": hash("4"),
+	}
+	env := os.Environ()
+	for k, v := range vars {
+		env = append(env, k+"="+v)
+	}
+	for _, name := range []string{"build-manifest", "result", "lock-candidate"} {
+		t.Run(name, func(t *testing.T) {
+			body, ok := heredocs[name]
+			if !ok {
+				t.Fatalf("build.sh writes no %s.json with a heredoc (cat >\"$dist/%[1]s.json\" <<EOF)", name)
+			}
+			cmd := exec.CommandContext(t.Context(), bash, "-c", `. native/ffmpeg/build.sh && eval "cat <<EOF"$'\n'"$1"$'\n'EOF`,
+				"bash", body)
+			cmd.Dir = repoRoot(t)
+			cmd.Env = env
+			var stderr strings.Builder
+			cmd.Stderr = &stderr
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("expanding the heredoc: %v; stderr %q (a new variable needs a sample value here)", err, stderr.String())
+			}
+			var fields map[string]any
+			if err := json.Unmarshal(out, &fields); err != nil {
+				t.Fatalf("%s.json is not JSON: %v\n%s", name, err, out)
+			}
+			for key, want := range map[string]string{"msvcToolset": "14.44.35207", "msvcCompiler": "19.44.35229", "msvcLinker": "14.44.35229.0"} {
+				if got := fields[key]; got != want {
+					t.Errorf("%s.json: %s is %v, want %q", name, key, got, want)
+				}
+			}
+			if name != "lock-candidate" {
+				return
+			}
+			l, err := parseLock(out)
+			if err != nil {
+				t.Fatalf("lock-candidate.json: %v\n%s", err, out)
+			}
+			if l.MSVCCompiler != "19.44.35229" || l.MSVCLinker != "14.44.35229.0" || l.AvcodecDLL() != "avcodec-63.dll" {
+				t.Errorf("lock-candidate.json decodes as %+v", l)
+			}
+		})
+	}
+}
+
+// TestReadmeLGPLPlaceholders: build.sh's render call fills every @NAME@ of native/ffmpeg/README-LGPL.txt (render
+// fails the build on one it leaves) and passes no name the template lacks; the README names the toolset, compiler
+// and linker builds (06 §3, §9.1).
+func TestReadmeLGPLPlaceholders(t *testing.T) {
+	script := readRepoFile(t, "native/ffmpeg/build.sh")
+	call := regexp.MustCompile(`(?s)\brender "\$here/README-LGPL\.txt" (.*?)>"\$dist/licenses/ffmpeg/README-LGPL\.txt"`).FindStringSubmatch(script)
+	if call == nil {
+		t.Fatal(`build.sh has no render "$here/README-LGPL.txt" ... >"$dist/licenses/ffmpeg/README-LGPL.txt"`)
+	}
+	names := func(re, text string) []string {
+		var out []string
+		for _, m := range regexp.MustCompile(re).FindAllStringSubmatch(text, -1) {
+			out = append(out, m[1])
+		}
+		slices.Sort(out)
+		return slices.Compact(out)
+	}
+	given := names(`(?:^|\s)([A-Z_]+)=`, call[1])
+	used := names(`@([A-Z_]+)@`, readRepoFile(t, "native/ffmpeg/README-LGPL.txt"))
+	if !slices.Equal(given, used) {
+		t.Errorf("build.sh fills %v, README-LGPL.txt has %v", given, used)
+	}
+	for _, want := range []string{"MSVC_TOOLSET", "MSVC_COMPILER", "MSVC_LINKER"} {
+		if !slices.Contains(used, want) {
+			t.Errorf("README-LGPL.txt does not name @%s@", want)
+		}
+	}
+}
+
+// needBash returns the path of bash, or skips the test without one.
+func needBash(t *testing.T) string {
+	t.Helper()
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("no bash")
+	}
+	return bash
+}
+
+// readRepoFile reads a file of the repository (a slash-separated path), with CRLF line ends made LF.
+func readRepoFile(t *testing.T, rel string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(repoRoot(t), filepath.FromSlash(rel)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.ReplaceAll(string(data), "\r\n", "\n")
+}
+
 func TestFFmpegInputsCommand(t *testing.T) {
 	root := t.TempDir()
 	writeFFmpegInputs(t, root)
@@ -248,12 +439,26 @@ func TestParseLock(t *testing.T) {
 	if l.AvcodecDLL() != "avcodec-63.dll" || l.AvutilDLL() != "avutil-61.dll" {
 		t.Errorf("DLL names %s %s", l.AvcodecDLL(), l.AvutilDLL())
 	}
+	if l.MSVCToolset != "14.44.35207" || l.MSVCCompiler != "19.44.35229" || l.MSVCLinker != "14.44.35229.0" {
+		t.Errorf("toolset build %q, cl.exe %q, link.exe %q", l.MSVCToolset, l.MSVCCompiler, l.MSVCLinker)
+	}
+	// A compiler build of four parts (cl.exe printed one before VS 2017) is a build as well.
+	if _, err := parseLock([]byte(strings.Replace(good, `"19.44.35229"`, `"19.00.24215.1"`, 1))); err != nil {
+		t.Errorf("a four-part compiler build: %v", err)
+	}
 	for _, tc := range []struct{ name, old, new, want string }{
 		{"tag", `"tag": "deps-ffmpeg-9.0.2-r1"`, `"tag": "v9.0.2"`, "tag"},
 		{"asset name", `ffmpeg-9.0.2-r1-win-x64.zip`, `ffmpeg-win.zip`, "assets must be exactly"},
 		{"dll name", `"avcodec-63.dll"`, `"avcodec-62.dll"`, "dlls must be exactly"},
 		{"major", `"avutilMajor": 61`, `"avutilMajor": 0`, "avutilMajor"},
 		{"toolset", `"msvcToolset": "14.44.35207"`, `"msvcToolset": "14.44"`, "msvcToolset"},
+		{"toolset of four parts", `"msvcToolset": "14.44.35207"`, `"msvcToolset": "14.44.35207.1"`, "msvcToolset"},
+		{"compiler", `"msvcCompiler": "19.44.35229"`, `"msvcCompiler": "19.44"`, "msvcCompiler"},
+		{"compiler banner", `"msvcCompiler": "19.44.35229"`, `"msvcCompiler": "Version 19.44.35229 for x64"`, "msvcCompiler"},
+		{"compiler missing", `"msvcCompiler": "19.44.35229",`, ``, `msvcCompiler ""`},
+		{"linker", `"msvcLinker": "14.44.35229.0"`, `"msvcLinker": "14.44.35229.0.1"`, "msvcLinker"},
+		{"linker empty", `"msvcLinker": "14.44.35229.0"`, `"msvcLinker": ""`, `msvcLinker ""`},
+		{"linker missing", `"msvcLinker": "14.44.35229.0",`, ``, `msvcLinker ""`},
 		{"commit", `"commit": "0123456789abcdef0123456789abcdef01234567"`, `"commit": "main"`, "commit"},
 		{"unknown field", `"revision": 1,`, `"revision": 1, "x": 1,`, "unknown field"},
 		{"inputs", `"inputsSha256": "aaaa`, `"inputsSha256": "AAAA`, "inputsSha256"},
@@ -371,6 +576,8 @@ func sampleLock(inputs string) string {
   "avutilMajor": 61,
   "dlls": {"avcodec-63.dll": "` + strings.Repeat("3", 64) + `", "avutil-61.dll": "` + strings.Repeat("4", 64) + `"},
   "msvcToolset": "14.44.35207",
+  "msvcCompiler": "19.44.35229",
+  "msvcLinker": "14.44.35229.0",
   "commit": "0123456789abcdef0123456789abcdef01234567"
 }
 `

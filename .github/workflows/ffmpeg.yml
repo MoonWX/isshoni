@@ -12,15 +12,17 @@
 #   the Windows SDK of deploy/windows/tools.json; it prints the instance, the toolset build and the SDK to the log and
 #   the summary), then native/ffmpeg/build.sh in MSYS2's bash: sources from native/ffmpeg/pins.json, libvpl, configure
 #   (06 §4.2), make, and the gating checks of 06 §4.4 (ffcheck, imports, names). Uploads the zip and the source
-#   archive as the artifact ffmpeg-build and their SHA-256s as job outputs. It also checks that msvc-env.ps1 fails,
-#   naming the toolsets it found, for a toolset the image lacks.
+#   archive as the artifact ffmpeg-build, and their SHA-256s, the DLLs' and the toolset build as job outputs. It also
+#   checks that msvc-env.ps1 fails, naming the toolsets it found, for a toolset the image lacks.
 # - rebuild: the same steps on a second runner, so a pull request shows whether a second build is byte-identical.
 # - report (ubuntu-24.04): build.sh's inputsSha256 equals `desktoppkg ffmpeg-inputs`'s; the DLLs against rebuild's and
 #   against lock.json's (06 §4.6). With the same toolset build a difference fails the run (FFMPEG_REPRO: strict); with
-#   another toolset build it is a warning, since the shipped bytes stay the locked ones. The DLLs are compared with
-#   lock.json's whenever its inputsSha256 is the one build hashed (in the weekly run, too, while a pins bump waits for
-#   its publishing run). lock.json absent or stale (a pins.json, build.sh or ffcheck.c change) is a note: publishing
-#   after the merge fixes it.
+#   another toolset build it is a warning, since the shipped bytes stay the locked ones. The toolset build (06 §3) is
+#   the toolset folder (msvcToolset, VCToolsVersion) and the builds of cl.exe and link.exe in it (msvcCompiler,
+#   msvcLinker, from their banners): Visual Studio's servicing updates those in place under the same folder name, so
+#   the same toolset build means all three are equal. The DLLs are compared with lock.json's whenever its inputsSha256
+#   is the one build hashed (in the weekly run, too, while a pins bump waits for its publishing run). lock.json absent
+#   or stale (a pins.json, build.sh or ffcheck.c change) is a note: publishing after the merge fixes it.
 # - publish (ubuntu-24.04, contents: write, id-token: write, attestations: write; runs no build code): only a manual
 #   run with publish on, from any ref. It refuses when the tag exists (raise "revision" in pins.json instead), checks
 #   the artifact against build's SHA-256s, attests both files, creates deps-ffmpeg-<ver>-r<rev> as a prerelease that
@@ -68,8 +70,9 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  # strict: DLLs that differ with the same toolset build fail the run (06 §4.6). If MSVC turns out not to be
-  # bit-reproducible even with /Brepro, this becomes warn, and 06 §4.6 records why (README WA07, WB1).
+  # strict: DLLs that differ with the same toolset build (the same toolset folder, cl.exe and link.exe builds) fail the
+  # run (06 §4.6). If MSVC turns out not to be bit-reproducible even with /Brepro, this becomes warn, and 06 §4.6
+  # records why (README WA07, WB1).
   FFMPEG_REPRO: strict
 
 jobs:
@@ -91,6 +94,8 @@ jobs:
       inputs: ${{ steps.result.outputs.inputs }}
       commit: ${{ steps.result.outputs.commit }}
       toolset: ${{ steps.result.outputs.toolset }}
+      compiler: ${{ steps.result.outputs.compiler }}
+      linker: ${{ steps.result.outputs.linker }}
       avcodec-dll: ${{ steps.result.outputs.avcodec-dll }}
       avcodec-sha256: ${{ steps.result.outputs.avcodec-sha256 }}
       avutil-dll: ${{ steps.result.outputs.avutil-dll }}
@@ -174,13 +179,14 @@ jobs:
           @(
             "zip=$($r.zip)", "zip-sha256=$($r.zipSha256)", "source=$($r.sourceTar)", "source-sha256=$($r.sourceTarSha256)",
             "tag=$($r.tag)", "inputs=$($r.inputsSha256)", "commit=$($r.commit)", "toolset=$($r.msvcToolset)",
+            "compiler=$($r.msvcCompiler)", "linker=$($r.msvcLinker)",
             "avcodec-dll=$($r.avcodecDll)", "avcodec-sha256=$($r.avcodecSha256)",
             "avutil-dll=$($r.avutilDll)", "avutil-sha256=$($r.avutilSha256)"
           ) | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           @(
             "### FFmpeg $($r.tag) ($env:JOB)",
             '',
-            "Commit $($r.commit), MSVC toolset $($r.msvcToolset), Windows SDK $($r.windowsSdk), inputsSha256 $($r.inputsSha256).",
+            "Commit $($r.commit), MSVC toolset $($r.msvcToolset) (cl.exe $($r.msvcCompiler), link.exe $($r.msvcLinker)), Windows SDK $($r.windowsSdk), inputsSha256 $($r.inputsSha256).",
             '',
             '| File | SHA-256 |',
             '|---|---|',
@@ -255,11 +261,15 @@ jobs:
           INPUTS: ${{ needs.build.outputs.inputs }}
           TAG: ${{ needs.build.outputs.tag }}
           TOOLSET: ${{ needs.build.outputs.toolset }}
+          COMPILER: ${{ needs.build.outputs.compiler }}
+          LINKER: ${{ needs.build.outputs.linker }}
           AVCODEC_DLL: ${{ needs.build.outputs.avcodec-dll }}
           AVCODEC_SHA256: ${{ needs.build.outputs.avcodec-sha256 }}
           AVUTIL_DLL: ${{ needs.build.outputs.avutil-dll }}
           AVUTIL_SHA256: ${{ needs.build.outputs.avutil-sha256 }}
           RE_TOOLSET: ${{ needs.rebuild.outputs.toolset }}
+          RE_COMPILER: ${{ needs.rebuild.outputs.compiler }}
+          RE_LINKER: ${{ needs.rebuild.outputs.linker }}
           RE_AVCODEC_SHA256: ${{ needs.rebuild.outputs.avcodec-sha256 }}
           RE_AVUTIL_SHA256: ${{ needs.rebuild.outputs.avutil-sha256 }}
         run: |
@@ -275,6 +285,19 @@ jobs:
             fi
             summary "- **$1**"
           }
+          # A difference with another toolset build: a warning, since the shipped bytes stay the locked ones.
+          other_build() {
+            echo "::warning::$1"
+            summary "- $1"
+          }
+          # The toolset build (06 §3): the toolset folder (VCToolsVersion) and the cl.exe and link.exe builds in it,
+          # which Visual Studio's servicing updates in place under the same folder name. Two are the same only when
+          # all three parts are known and equal: same_build TOOLSET COMPILER LINKER TOOLSET2 COMPILER2 LINKER2.
+          toolset_build() { printf 'toolset %s, cl.exe %s, link.exe %s' "${1:-unknown}" "${2:-unknown}" "${3:-unknown}"; }
+          same_build() {
+            [ -n "$1" ] && [ -n "$2" ] && [ -n "$3" ] && [ "$1" = "$4" ] && [ "$2" = "$5" ] && [ "$3" = "$6" ]
+          }
+          this_build=$(toolset_build "$TOOLSET" "$COMPILER" "$LINKER")
 
           # build.sh and desktoppkg must agree on inputsSha256: consumers compare desktoppkg's with lock.json. The
           # weekly run built lock.json's commit, not this one, and only compares with this commit's lock.json below.
@@ -301,29 +324,34 @@ jobs:
             fi
           fi
 
+          # The toolset build's columns: the toolset folder (msvcToolset) and the cl.exe and link.exe builds.
           summary "### FFmpeg reproducibility ($TAG)" '' \
-            "| | $AVCODEC_DLL | $AVUTIL_DLL | MSVC toolset |" '|---|---|---|---|' \
-            "| build | \`$AVCODEC_SHA256\` | \`$AVUTIL_SHA256\` | $TOOLSET |"
+            "| | $AVCODEC_DLL | $AVUTIL_DLL | MSVC toolset | cl.exe | link.exe |" '|---|---|---|---|---|---|' \
+            "| build | \`$AVCODEC_SHA256\` | \`$AVUTIL_SHA256\` | ${TOOLSET:-unknown} | ${COMPILER:-unknown} | ${LINKER:-unknown} |"
           if [ "$REBUILD_RESULT" = success ]; then
-            summary "| rebuild | \`$RE_AVCODEC_SHA256\` | \`$RE_AVUTIL_SHA256\` | $RE_TOOLSET |"
+            summary "| rebuild | \`$RE_AVCODEC_SHA256\` | \`$RE_AVUTIL_SHA256\` | ${RE_TOOLSET:-unknown} | ${RE_COMPILER:-unknown} | ${RE_LINKER:-unknown} |"
           fi
           if [ "$lock_state" = current ]; then
+            # desktoppkg ffmpeg-inputs -check above parsed the lock: msvcCompiler and msvcLinker are there.
             lock_c=$(jq -r --arg n "$AVCODEC_DLL" '.dlls[$n] // "-"' "$lock")
             lock_u=$(jq -r --arg n "$AVUTIL_DLL" '.dlls[$n] // "-"' "$lock")
-            lock_toolset=$(jq -r '.msvcToolset' "$lock")
-            summary "| lock.json | \`$lock_c\` | \`$lock_u\` | $lock_toolset |"
+            lock_toolset=$(jq -r '.msvcToolset // ""' "$lock")
+            lock_compiler=$(jq -r '.msvcCompiler // ""' "$lock")
+            lock_linker=$(jq -r '.msvcLinker // ""' "$lock")
+            lock_build=$(toolset_build "$lock_toolset" "$lock_compiler" "$lock_linker")
+            summary "| lock.json | \`$lock_c\` | \`$lock_u\` | ${lock_toolset:-unknown} | ${lock_compiler:-unknown} | ${lock_linker:-unknown} |"
           fi
           summary ''
 
           case $REBUILD_RESULT in
           success)
+            re_build=$(toolset_build "$RE_TOOLSET" "$RE_COMPILER" "$RE_LINKER")
             if [ "$RE_AVCODEC_SHA256" = "$AVCODEC_SHA256" ] && [ "$RE_AVUTIL_SHA256" = "$AVUTIL_SHA256" ]; then
               summary '- A second build on another runner gave byte-identical DLLs.'
-            elif [ "$RE_TOOLSET" = "$TOOLSET" ]; then
-              differs "A second build with the same toolset ($TOOLSET) gave different DLLs: MSVC's output is not reproducible here (06 §4.6)"
+            elif same_build "$TOOLSET" "$COMPILER" "$LINKER" "$RE_TOOLSET" "$RE_COMPILER" "$RE_LINKER"; then
+              differs "A second build with the same toolset build ($this_build) gave different DLLs: MSVC's output is not reproducible here (06 §4.6)"
             else
-              echo "::warning::The second build used toolset $RE_TOOLSET, the first $TOOLSET: not compared"
-              summary "- The second build used toolset $RE_TOOLSET, the first $TOOLSET: not compared."
+              other_build "The second build's DLLs differ, but it used another toolset build ($re_build) than the first ($this_build): not a reproducibility failure (06 §4.6)."
             fi
             ;;
           skipped) summary '- No second build on this trigger.' ;;
@@ -337,11 +365,10 @@ jobs:
           current)
             if [ "$lock_c" = "$AVCODEC_SHA256" ] && [ "$lock_u" = "$AVUTIL_SHA256" ]; then
               summary "- The DLLs are byte-identical to lock.json's ($(jq -r .tag "$lock"))."
-            elif [ "$lock_toolset" = "$TOOLSET" ]; then
-              differs "The DLLs differ from lock.json's, built with the same toolset ($TOOLSET) (06 §4.6)"
+            elif same_build "$TOOLSET" "$COMPILER" "$LINKER" "$lock_toolset" "$lock_compiler" "$lock_linker"; then
+              differs "The DLLs differ from lock.json's, built with the same toolset build ($this_build) (06 §4.6)"
             else
-              echo "::warning::The DLLs differ from lock.json's: this build used toolset $TOOLSET, the lock $lock_toolset. The shipped bytes stay the locked ones (06 §4.6)."
-              summary "- The DLLs differ from lock.json's: toolset $TOOLSET here, $lock_toolset in the lock. The shipped bytes stay the locked ones (06 §4.6)."
+              other_build "The DLLs differ from lock.json's, but this build used another toolset build ($this_build) than the lock ($lock_build). The shipped bytes stay the locked ones (06 §4.6)."
             fi
             ;;
           stale)

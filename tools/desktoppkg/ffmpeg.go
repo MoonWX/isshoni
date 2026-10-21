@@ -72,6 +72,12 @@ func (p *Pins) ZipName() string { return p.Name() + "-win-x64.zip" }
 func (p *Pins) SourceName() string { return p.Name() + "-source.tar" }
 
 // Lock is native/ffmpeg/lock.json: what a publishing run built (06 §4.1).
+//
+// MSVCToolset, MSVCCompiler and MSVCLinker are the toolset build of 06 §3 and §4.6, which decides whether DLLs that
+// differ from the lock's are a reproducibility failure (the same toolset build) or a warning (another one): the
+// toolset folder that deploy/windows/msvc-env.ps1 selected (VCToolsVersion, such as 14.44.35207) and the builds that
+// cl.exe and link.exe in it print in their banners (such as 19.44.35229 and 14.44.35229.0). Visual Studio's servicing
+// updates the compiler and linker in place under the same folder name, so the folder alone is not enough.
 type Lock struct {
 	Revision     int               `json:"revision"`
 	Tag          string            `json:"tag"`
@@ -81,6 +87,8 @@ type Lock struct {
 	AvutilMajor  int               `json:"avutilMajor"`
 	DLLs         map[string]string `json:"dlls"`
 	MSVCToolset  string            `json:"msvcToolset"`
+	MSVCCompiler string            `json:"msvcCompiler"`
+	MSVCLinker   string            `json:"msvcLinker"`
 	Commit       string            `json:"commit"`
 }
 
@@ -98,6 +106,9 @@ var (
 	reCommit   = regexp.MustCompile(`^[0-9a-f]{40}$`)
 	pinEntries = []string{"ffmpeg", "nvCodecHeaders", "amfHeaders", "libvpl"}
 )
+
+// reToolBuild is a build number as cl.exe and link.exe print it in their banners: 19.44.35229, 14.44.35229.0.
+var reToolBuild = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$`)
 
 // expectedURL is where each pinned tarball comes from; a pin bump changes only the version or tag and the SHA-256,
 // so a new download location is a reviewed change of this table.
@@ -226,7 +237,13 @@ func parseLock(data []byte) (*Lock, error) {
 		problems = append(problems, fmt.Sprintf("dlls must be exactly %s and %s with their SHA-256s", l.AvcodecDLL(), l.AvutilDLL()))
 	}
 	if !reToolset.MatchString(l.MSVCToolset) {
-		problems = append(problems, fmt.Sprintf("msvcToolset %q is not a toolset build such as 14.44.35207", l.MSVCToolset))
+		problems = append(problems, fmt.Sprintf("msvcToolset %q is not a toolset folder such as 14.44.35207", l.MSVCToolset))
+	}
+	if !reToolBuild.MatchString(l.MSVCCompiler) {
+		problems = append(problems, fmt.Sprintf("msvcCompiler %q is not a cl.exe build such as 19.44.35229", l.MSVCCompiler))
+	}
+	if !reToolBuild.MatchString(l.MSVCLinker) {
+		problems = append(problems, fmt.Sprintf("msvcLinker %q is not a link.exe build such as 14.44.35229.0", l.MSVCLinker))
 	}
 	if !reCommit.MatchString(l.Commit) {
 		problems = append(problems, "commit is not a full commit hash")

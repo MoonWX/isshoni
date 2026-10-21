@@ -13,8 +13,9 @@ project.
 How they were built
 -------------------
 
-Build @TAG@ (FFmpeg @FFMPEG_VERSION@, build revision @REVISION@) with the MSVC toolset @MSVC_TOOLSET@ and the build
-script native/ffmpeg/build.sh. The configuration, as avcodec_configuration() reports it:
+Build @TAG@ (FFmpeg @FFMPEG_VERSION@, build revision @REVISION@) with the MSVC toolset @MSVC_TOOLSET@, whose compiler
+cl.exe is build @MSVC_COMPILER@ and whose linker link.exe is build @MSVC_LINKER@, and the build script
+native/ffmpeg/build.sh. The configuration, as avcodec_configuration() reports it:
 
   @CONFIGURATION@
 
@@ -51,4 +52,6 @@ v14.44 x64 build tools and the Windows 11 SDK 10.0.26100; unpack the archive and
 
   powershell -NoProfile -File deploy\windows\msvc-env.ps1 C:\msys64\usr\bin\bash.exe native/ffmpeg/build.sh
 
-The DLLs appear in .deps\ffmpeg-build\out\@NAME@-win-x64\bin.
+The DLLs appear in .deps\ffmpeg-build\out\@NAME@-win-x64\bin. Built with the toolset, cl.exe and link.exe builds
+named above, they should be byte-identical to the shipped ones; other builds of the v14.44 tools give equivalent
+DLLs whose bytes can differ. build.sh prints the builds it used and records them in build-manifest.json.

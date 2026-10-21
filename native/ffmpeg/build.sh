@@ -25,14 +25,20 @@
 #   6. the layout ffmpeg-<ver>-r<rev>-win-x64/: bin/ (avcodec-<C>.dll, avutil-<U>.dll), pdb/, lib/ (import
 #      libraries), include/, licenses/, ffmpeg-config.json (ffcheck's output) and build-manifest.json;
 #   7. WORKDIR/out/ffmpeg-<ver>-r<rev>-win-x64.zip and the source archive ffmpeg-<ver>-r<rev>-source.tar, both with
-#      the commit time as their timestamps (SOURCE_DATE_EPOCH), plus result.json (names, SHA-256s, majors, toolset)
-#      and lock-candidate.json (the native/ffmpeg/lock.json a publishing run prints, 06 §4.1).
+#      the commit time as their timestamps (SOURCE_DATE_EPOCH), plus result.json (names, SHA-256s, majors, the toolset
+#      build) and lock-candidate.json (the native/ffmpeg/lock.json a publishing run prints, 06 §4.1).
 #
 # Reproducibility (06 §4.6): configure runs in WORKDIR/build on the source in WORKDIR/build/src, and every path it
 # is given (the prefixes, -I, -LIBPATH, PKG_CONFIG_PATH and the .pc files) is relative to that folder, so neither the
 # compiled-in source file names nor the configuration string that avcodec_configuration() returns (../install,
 # ../prefix) name a path of the build machine. /Brepro removes the timestamps and -PDBALTPATH keeps the PDB's path
 # out of the DLLs, which should then depend only on the inputs and the toolset build, wherever WORKDIR is.
+#
+# The toolset build (06 §3, §4.6) is three values, recorded in build-manifest.json, result.json and lock.json:
+# msvcToolset, the toolset folder that msvc-env.ps1 selected (VCToolsVersion, such as 14.44.35207), and msvcCompiler
+# and msvcLinker, the builds that cl.exe and link.exe in it print in their banners (such as 19.44.35229 and
+# 14.44.35229.0). Visual Studio's servicing updates the compiler and linker in place under the same folder name, so
+# the folder alone does not say which compiler built the DLLs.
 #
 # Changing this file, pins.json or ffcheck.c changes inputsSha256 (06 §4.1): the FFmpeg workflow must then publish a
 # new revision and lock.json be updated, or every consumer fails as stale.
@@ -189,6 +195,18 @@ render() {
   printf '%s\n' "$text"
 }
 
+# banner_version PROGRAM prints the build number in the first line PROGRAM prints when run without arguments, its
+# banner: 19.44.35229 for cl.exe's "Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35229 for x64", 14.44.35229.0
+# for link.exe's "Microsoft (R) Incremental Linker Version 14.44.35229.0". It prints nothing when that line holds no
+# dotted number of three or four parts. The number is found without the word "Version", so a localized banner reads
+# the same. Both programs print their usage after the banner and may exit nonzero, so the status is ignored, and sed
+# reads all of their output and prints at most one line: an early-exiting reader (head -n 1) right after PROGRAM could
+# kill it with SIGPIPE, which pipefail turns into a failed build.
+banner_version() {
+  { "$1" 2>&1 </dev/null || true; } | tr -d '\r' |
+    sed -n '1s/^\(.*[^0-9.]\)\{0,1\}\([0-9][0-9]*\(\.[0-9][0-9]*\)\{2,3\}\)\([^0-9.].*\)\{0,1\}$/\2/p' | head -n 1
+}
+
 # imports DLL prints "static NAME" and "delay NAME" for each DLL that DLL imports, as dumpbin lists them.
 imports() {
   MSYS2_ARG_CONV_EXCL='*' dumpbin.exe -nologo -dependents "$(cygpath -m "$1")" | tr -d '\r' | awk '
@@ -311,16 +329,23 @@ main() {
   sdk=${sdk%\\}
   # MSVC's tools before MSYS2's /usr/bin, whose coreutils link.exe would otherwise shadow MSVC's linker; /usr/bin
   # before the rest of the Windows PATH (Git's and other Unix-like tools there).
-  local msvc_bin
+  local msvc_bin tool
   msvc_bin=$(cygpath -u "$vc_tools_dir")
   msvc_bin=${msvc_bin%/}/bin/Hostx64/x64
-  [ -x "$msvc_bin/cl.exe" ] || die "no cl.exe in $msvc_bin"
+  for tool in cl.exe link.exe; do
+    [ -x "$msvc_bin/$tool" ] || die "no $tool in $msvc_bin"
+  done
   export PATH="$msvc_bin:/usr/bin:$PATH"
-  local tool
   for tool in make pkg-config cmp diff tar xz gzip curl sha256sum zip cygpath dumpbin.exe lib.exe; do
     command -v "$tool" >/dev/null || die "$tool not found (MSYS2: pacman -S --needed make pkgconf diffutils zip)"
   done
-  log "MSVC toolset $toolset, Windows SDK $sdk, $(cl.exe 2>&1 | tr -d '\r' | head -n 1)"
+  # The toolset build: the folder (VCToolsVersion) and the compiler and linker builds in it (see the header).
+  local compiler linker
+  compiler=$(banner_version "$msvc_bin/cl.exe")
+  linker=$(banner_version "$msvc_bin/link.exe")
+  [ -n "$compiler" ] || die "cl.exe in $msvc_bin printed no build number in the first line of its banner"
+  [ -n "$linker" ] || die "link.exe in $msvc_bin printed no build number in the first line of its banner"
+  log "MSVC toolset $toolset (cl.exe $compiler, link.exe $linker), Windows SDK $sdk"
 
   # CMake and Ninja of the VS instance (the component "C++ CMake tools for Windows"), else from PATH.
   local cmake_exe='' ninja_exe='' vs_cmake=''
@@ -533,7 +558,9 @@ main() {
     if grep -q "\"$avcodec_dll\": \"$avcodec_sha\"" "$lock_file" && grep -q "\"$avutil_dll\": \"$avutil_sha\"" "$lock_file"; then
       log "the DLLs are byte-identical to lock.json's ($(json_string "$lock_file" tag))"
     else
-      log "the DLLs differ from lock.json's ($(json_string "$lock_file" tag), toolset $(json_string "$lock_file" msvcToolset); this build: $toolset)"
+      log "the DLLs differ from lock.json's ($(json_string "$lock_file" tag): toolset" \
+        "$(json_string "$lock_file" msvcToolset), cl.exe $(json_string "$lock_file" msvcCompiler), link.exe" \
+        "$(json_string "$lock_file" msvcLinker); this build: toolset $toolset, cl.exe $compiler, link.exe $linker)"
     fi
   else
     log 'lock.json does not describe these inputs (absent, or pins.json, build.sh or ffcheck.c changed): names checked against ffcheck only'
@@ -559,7 +586,8 @@ main() {
   avutil_version=$avutil_major.$(json_number "$dist/ffmpeg-config.json" avutilMinor).$(json_number "$dist/ffmpeg-config.json" avutilMicro)
   render "$here/README-LGPL.txt" FFMPEG_VERSION="$ff_version" REVISION="$revision" TAG="$tag" NAME="$name" \
     AVCODEC_DLL="$avcodec_dll" AVUTIL_DLL="$avutil_dll" AVCODEC_VERSION="$avcodec_version" \
-    AVUTIL_VERSION="$avutil_version" MSVC_TOOLSET="$toolset" CONFIGURATION="$configuration" \
+    AVUTIL_VERSION="$avutil_version" MSVC_TOOLSET="$toolset" MSVC_COMPILER="$compiler" MSVC_LINKER="$linker" \
+    CONFIGURATION="$configuration" \
     >"$dist/licenses/ffmpeg/README-LGPL.txt"
 
   # The versions of the MSYS2 packages that are installed; one that is not (a PC whose pkg-config comes from another
@@ -586,6 +614,8 @@ main() {
     "libvpl": {"tag": "$vpl_tag", "file": "$vpl_tar", "sha256": "$vpl_sha"}
   },
   "msvcToolset": "$(json_escape "$toolset")",
+  "msvcCompiler": "$(json_escape "$compiler")",
+  "msvcLinker": "$(json_escape "$linker")",
   "windowsSdk": "$(json_escape "$sdk")",
   "vsInstance": "$(json_escape "${MSVC_ENV_VS_VERSION:-}")",
   "vsName": "$(json_escape "${MSVC_ENV_VS_NAME:-}")",
@@ -618,7 +648,7 @@ EOF
   {
     printf 'FFmpeg %s for isshoni (%s), libavcodec %s and libavutil %s\n\n' "$ff_version" "$tag" "$avcodec_version" "$avutil_version"
     printf 'Configuration (avcodec_configuration()):\n%s\n\n' "$configuration"
-    printf 'MSVC toolset %s, Windows SDK %s\n' "$toolset" "$sdk"
+    printf 'MSVC toolset %s (cl.exe %s, link.exe %s), Windows SDK %s\n' "$toolset" "$compiler" "$linker" "$sdk"
     printf 'Build: native/ffmpeg/build.sh in MSYS2 bash, inside deploy/windows/msvc-env.ps1 (see README-LGPL.txt)\n'
   } >"$srcpkg/CONFIGURE.txt"
   tar --format=gnu --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" --mode='u=rwX,go=rX' \
@@ -645,6 +675,8 @@ EOF
   "avutilDll": "$avutil_dll",
   "avutilSha256": "$avutil_sha",
   "msvcToolset": "$(json_escape "$toolset")",
+  "msvcCompiler": "$(json_escape "$compiler")",
+  "msvcLinker": "$(json_escape "$linker")",
   "windowsSdk": "$(json_escape "$sdk")"
 }
 EOF
@@ -661,6 +693,8 @@ EOF
   "avutilMajor": $avutil_major,
   "dlls": {"$avcodec_dll": "$avcodec_sha", "$avutil_dll": "$avutil_sha"},
   "msvcToolset": "$(json_escape "$toolset")",
+  "msvcCompiler": "$(json_escape "$compiler")",
+  "msvcLinker": "$(json_escape "$linker")",
   "commit": "$(json_escape "$commit")"
 }
 EOF
