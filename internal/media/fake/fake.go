@@ -67,8 +67,9 @@ type Config struct {
 	// FlashEvery puts one flash frame on every layer and one beep in the audio at the same capture instant, every
 	// FlashEvery (default 1 s; negative: none). The instants are k·FlashEvery for k = 0, 1, 2, …; the flash frame is
 	// the first frame at or after each instant, so flash and beep share their capture time exactly when FlashEvery is
-	// a multiple of 20 ms and of every layer's frame interval (as with the defaults). The flags are what the Markers
-	// say; the asset's audible beep comes every second, so it matches the Beep flags when FlashEvery is 1 s.
+	// a multiple of 20 ms and of every layer's frame interval (as with the defaults). The Markers' Flash and Beep
+	// flags mark those frames and packets (ParseVideoMarker, ParseAudioMarker). The asset's audible beep comes every
+	// second, so it matches the Markers' Beep flags when FlashEvery is 1 s.
 	FlashEvery time.Duration
 	Seed       uint64 // Synthetic's filler bytes and frame-size jitter are a function of the seed alone
 }
