@@ -85,8 +85,9 @@ int main(int argc, char **argv) {
     if (av_codec_is_decoder(codec) && ndec < MAX_NAMES)
       decoders[ndec++] = codec->name;
   }
-  qsort(encoders, (size_t)nenc, sizeof encoders[0], cmp_names);
-  qsort(decoders, (size_t)ndec, sizeof decoders[0], cmp_names);
+  /* The casts: MSVC's C4090 takes const char *[] to void * for a dropped const (it is the pointees that are const). */
+  qsort((void *)encoders, (size_t)nenc, sizeof encoders[0], cmp_names);
+  qsort((void *)decoders, (size_t)ndec, sizeof decoders[0], cmp_names);
 
   if (strcmp(license, WANT_LICENSE) != 0)
     problem("avcodec_license() is not \"" WANT_LICENSE "\": ", license);
