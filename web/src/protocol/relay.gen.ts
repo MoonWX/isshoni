@@ -65,6 +65,9 @@ export type Browser = typeof BrowserChrome | typeof BrowserEdge | typeof Browser
  * stops (03 §12.2). Receiver: the core on the app's publisher connection, which emits EventPlaybackState{From,
  * Playing, Browser, OS} for a payload that DecodePlaybackState accepts and ignores any other (01 §11.11 rule 1); the
  * desktop SPA's own connection ignores the kind.
+ * Unlike playback.stop, the payload has no v (01 §11.11): a sender sends playing, browser and os, with browser its
+ * client.browser mapped to a family (safari and anything else to other). The core ignores a report whose browser is
+ * not one of the four families, so that tab would get neither a viewer rule nor 05's viewer-unknown-browser banner.
  */
 export interface PlaybackState {
   playing: boolean;
