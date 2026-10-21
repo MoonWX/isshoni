@@ -1,0 +1,3 @@
+# lock.json's inputsSha256 hashes pins.json, build.sh and ffcheck.c byte for byte (docs/m2/06-windows-release.md
+# §4.1), so every checkout, Git for Windows' core.autocrlf=true included, must have the same bytes.
+* text eol=lf

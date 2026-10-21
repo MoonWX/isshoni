@@ -1,0 +1,17 @@
+{
+  "avcodecVersion": 4129126,
+  "avcodecMajor": 63,
+  "avcodecMinor": 1,
+  "avcodecMicro": 102,
+  "avutilVersion": 3998054,
+  "avutilMajor": 61,
+  "avutilMinor": 1,
+  "avutilMicro": 102,
+  "license": "LGPL version 2.1 or later",
+  "avutilLicense": "LGPL version 2.1 or later",
+  "configuration": "--prefix=../install --cc=clang --disable-programs --disable-doc --disable-everything --disable-autodetect --disable-network --disable-x86asm --enable-shared --disable-static --disable-avformat --disable-avdevice --disable-avfilter --disable-swscale --disable-swresample --enable-avcodec --enable-avutil --disable-gpl --disable-nonfree --disable-version3 --enable-encoder='h264_nvenc,h264_amf,h264_qsv,h264_mf,rawvideo'",
+  "encoders": ["rawvideo"],
+  "decoders": [],
+  "ok": false,
+  "problems": ["the encoders are not exactly h264_amf, h264_mf, h264_nvenc, h264_qsv"]
+}
