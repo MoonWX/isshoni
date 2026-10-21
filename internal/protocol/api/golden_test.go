@@ -512,6 +512,30 @@ func goldenCases() []goldenCase {
 			Rooms: 1, Participants: 3, Shares: 1, SchemaVersion: 1,
 			Transfer: &transfer, Update: updateInfo,
 		}},
+		// README F23: the status of a server in a container on a bridge network, whose symmetric NAT doctor's
+		// public_ip lets pass (04 §13.2), as the dashboard has it (OpsDashboard.docker-bridge). The field is
+		// additive: ServerStatus.json has no dockerBridge key.
+		{"ServerStatus.docker-bridge", ServerStatus{
+			Version: "0.3.0", StartedAt: at("2026-10-15T08:00:00Z"), UptimeS: 3600, Origin: "https://watch.example.com",
+			TLS: TLSInfo{
+				Mode: TLSModeAuto, Names: []string{"watch.example.com"}, Ready: true,
+				NotAfter: at("2027-01-13T08:00:00Z"), NextRenewal: at("2026-12-14T08:00:00Z"),
+			},
+			PublicIPv4: "203.0.113.7", PublicIPv4Method: "stun", PublicIPv6Method: "none",
+			LocalIPv4: "172.18.0.2", NAT: NATKindSymmetric, DockerBridge: true,
+			Advertised: []AdvertisedAddr{
+				{Proto: "udp", Addr: "203.0.113.7:7882", Via: TransportUDP},
+				{Proto: "tcp", Addr: "203.0.113.7:443", Via: TransportTCP443},
+			},
+			Listeners: []ListenerInfo{
+				{Key: "listen.https", Network: "tcp", Addr: "[::]:443"},
+				{Key: "listen.http", Network: "tcp", Addr: "[::]:80"},
+				{Key: "listen.ice_udp", Network: "udp", Addr: "172.18.0.2:7882"},
+				{Key: "listen.admin_socket", Network: "unix", Addr: "/run/isshoni/admin.sock"},
+			},
+			UDPRcvBufBytes: 425984, UDPSndBufBytes: 425984,
+			SchemaVersion: 1,
+		}},
 
 		// ---- 04: doctor and bandwidth ----
 		{"DoctorReport", DoctorReport{

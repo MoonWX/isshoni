@@ -878,6 +878,9 @@
       "public_ip": {
         "fix_set": "Set public_ip to this server's public address, or set domain, then restart isshoni.",
         "fix_set_container": "Set ISSHONI_PUBLIC_IP in .env to this server's public address, or set a domain, then run:",
+        "fix_set_unreachable": "Set public_ip to this server's public address, or to auto to detect it, then restart isshoni:",
+        "fix_set_unreachablePlain": "Set public_ip to this server's public address, or to auto to detect it, then restart isshoni.",
+        "fix_set_unreachableContainer": "Set ISSHONI_PUBLIC_IP in .env to this server's public address, or leave it empty to detect it, then run:",
         "fix_nat": "Run isshoni where it has a public IPv4 address of its own, for example on a small VPS, or ask your internet provider for a public address.",
         "fix_forward": "On your router, forward {{ports}} to this machine.",
         "fix_forward_local": "On your router, forward {{ports}} to {{local}}.",

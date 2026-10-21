@@ -150,9 +150,11 @@ const (
 //     becomes remotePwd: "[redacted]";
 //   - a ufrag:password pair: in a run of ICE characters (letters, digits, + and /) and colons, a part of at least 22
 //     characters that follows a part of at least 4 becomes [redacted], so ufrag:password becomes ufrag:[redacted].
-//     The parts of IP addresses with ports, fingerprints and times are shorter. A URL whose host has no dot and is
-//     at least 20 characters long looks like a pair after its scheme and is redacted as well: a safety net errs on
-//     that side.
+//     The parts of IP addresses with ports, fingerprints and times are shorter. A URL can look like a pair too: a
+//     scheme of 4 or more letters is the first part, and the second runs from the colon to the first character
+//     that is neither an ICE character nor a colon. '/' is an ICE character and '.' is not, so the second part is
+//     the "//", the host and the path up to the first dot; when it has 22 or more characters it is redacted, and
+//     http://localhost/api/v1/rooms/abc becomes http:[redacted]. A safety net errs on that side.
 //
 // Pion's other lines come back as they are. The bridge redacts only the lines its limiter lets through.
 func redactCredentials(msg string) string {

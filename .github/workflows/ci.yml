@@ -139,6 +139,10 @@ jobs:
             # section lint:keys checks, README F11), runs it as deploy changes do.
             repocheck:
               - 'tools/repocheck/**'
+            # Doctor's checks and their codes, which docker-smoke's doctor step pins one by one
+            # (deploy/docker/test/docker-smoke.sh, README F21): a change to them runs that job.
+            doctor:
+              - 'internal/server/ops/doctor/**'
             # Inputs of the distro job that neither deploy nor release covers: tools/relserve, which
             # only that job runs, and tools/notices, whose output is in the archives it installs.
             distro_tools:
@@ -222,6 +226,7 @@ jobs:
           FILTER_PINS: ${{ steps.filter.outputs.pins }}
           FILTER_DESKTOP_E2E: ${{ steps.filter.outputs.desktop_e2e }}
           FILTER_DESKTOP_PROTOCOL: ${{ steps.filter.outputs.desktop_protocol }}
+          FILTER_DOCTOR: ${{ steps.filter.outputs.doctor }}
         run: |
           # A pull request runs what its paths touch; a push to main and a merge-queue group
           # run everything.
@@ -229,13 +234,13 @@ jobs:
             go=${FILTER_GO:-false} web=${FILTER_WEB:-false} deploy=${FILTER_DEPLOY:-false}
             docker=${FILTER_DOCKER:-false} release=${FILTER_RELEASE:-false} site=${FILTER_SITE:-false}
             tools=${FILTER_TOOLS:-false} distro_tools=${FILTER_DISTRO_TOOLS:-false}
-            readme=${FILTER_README:-false} repocheck=${FILTER_REPOCHECK:-false}
+            readme=${FILTER_README:-false} repocheck=${FILTER_REPOCHECK:-false} doctor=${FILTER_DOCTOR:-false}
             desktop=${FILTER_DESKTOP:-false} native=${FILTER_NATIVE:-false} update=${FILTER_UPDATE:-false}
             ps=${FILTER_PS:-false} pins=${FILTER_PINS:-false} desktop_e2e=${FILTER_DESKTOP_E2E:-false}
             desktop_protocol=${FILTER_DESKTOP_PROTOCOL:-false}
           else
             go=true web=true deploy=true docker=true release=true site=true tools=true distro_tools=true
-            readme=true repocheck=true
+            readme=true repocheck=true doctor=true
             desktop=true native=true update=true ps=true pins=true desktop_e2e=true desktop_protocol=true
           fi
           go_or_web=false
@@ -251,7 +256,7 @@ jobs:
           e2e_when=$go_web_or_deploy
           if [ "$desktop_e2e" = true ]; then e2e_when=true; fi
           docker_deploy_or_release=$deploy
-          if [ "$docker" = true ] || [ "$release" = true ]; then docker_deploy_or_release=true; fi
+          if [ "$docker" = true ] || [ "$release" = true ] || [ "$doctor" = true ]; then docker_deploy_or_release=true; fi
           deploy_or_release=$deploy
           if [ "$release" = true ]; then deploy_or_release=true; fi
           distro_when=$deploy_or_release
@@ -333,8 +338,9 @@ jobs:
           decide acme "$go_or_deploy" go.mod internal/server/tlsmgr/testdata/pebble-config.json
           # 06 §8.2 runs the Docker smoke test on docker, deploy or release changes: the image
           # and the compose files, the Taskfile and this workflow, and what a release builds
-          # next to the image. A pull request that changes only the server does not run it;
-          # the push to main does.
+          # next to the image, and doctor's checks, which its doctor step pins (the doctor filter).
+          # A pull request that changes only the rest of the server does not run it; the push to
+          # main does.
           decide docker-smoke "$docker_deploy_or_release" Taskfile.yml .tool-versions go.mod \
             cmd/isshoni tools/go.mod tools/notices web/package.json web/package-lock.json \
             deploy/docker/Dockerfile deploy/docker/test/docker-smoke.sh \

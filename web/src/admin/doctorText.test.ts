@@ -381,6 +381,24 @@ describe('checkFix', () => {
         command: 'docker compose restart',
       },
     ]);
+    // README F21: a public_ip that only this machine can reach was given, so a restart alone doesn't help.
+    const unreachable = {
+      code: 'public_ip.none',
+      fixCode: 'public_ip.fix_set',
+      params: { unreachable: ['127.0.0.1'] },
+    };
+    expect(fix(unreachable)).toEqual([
+      {
+        text: "Set public_ip to this server's public address, or to auto to detect it, then restart isshoni:",
+        command: 'sudo systemctl restart isshoni',
+      },
+    ]);
+    expect(fix(unreachable, DOCKER)).toEqual([
+      {
+        text: "Set ISSHONI_PUBLIC_IP in .env to this server's public address, or leave it empty to detect it, then run:",
+        command: 'docker compose up -d',
+      },
+    ]);
   });
 
   it('shows the server’s English fix for a fix code this build doesn’t know', () => {

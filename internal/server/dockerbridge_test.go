@@ -20,9 +20,9 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/servertest"
 )
 
-// README F22 in a running server: where doctor's public_ip lets a container bridge's symmetric NAT pass (README
-// F21, 04 §13.2), the dashboard (04 §11.4) and the connection test (04 §7.7) say so next to nat, from the same look;
-// elsewhere neither has the key.
+// README F22 and F23 in a running server: where doctor's public_ip lets a container bridge's symmetric NAT pass
+// (README F21, 04 §13.2), the dashboard (04 §11.4), the connection test (04 §7.7) and the admin socket's status
+// (04 §12.2) say so next to nat, from the same look; elsewhere none has the key.
 
 // doctorIfaces is the interface list that doctor in the test server reads.
 type doctorIfaces struct{ ifs []netx.Interface }
@@ -93,8 +93,9 @@ func startInContainer(t *testing.T, iflink string) *servertest.Server {
 }
 
 // TestDockerBridgeInServer: in a container on a bridge network, doctor's public_ip lets the symmetric NAT pass with
-// dockerBridge, and the dashboard's server object and the connection test's carry dockerBridge: true next to nat
-// symmetric. On the host's network the same NAT fails the check, and neither object has the key.
+// dockerBridge, and the admin socket's status (README F23), the dashboard's server object and the connection test's
+// carry dockerBridge: true next to nat symmetric. On the host's network the same NAT fails the check, and none of
+// them has the flag.
 func TestDockerBridgeInServer(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -129,6 +130,15 @@ func TestDockerBridgeInServer(t *testing.T) {
 							c.Status, c.Code, c.Params, tc.bridge)
 					}
 				}
+			}
+
+			// The admin socket's status, as `isshoni admin status` asks it (README F23).
+			st, err := admin.Status(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if st.NAT != api.NATKindSymmetric || st.DockerBridge != tc.bridge {
+				t.Errorf("status: nat %q, dockerBridge %v; want symmetric, %v", st.NAT, st.DockerBridge, tc.bridge)
 			}
 
 			// The dashboard.

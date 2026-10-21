@@ -2,7 +2,7 @@ module github.com/MoonWX/isshoni
 
 go 1.26.0
 
-toolchain go1.27.2
+toolchain go1.27.3
 
 // Node's dependency trees are not Go code: keep them out of ./... patterns.
 ignore (
@@ -16,7 +16,7 @@ require (
 	github.com/coder/websocket v1.8.15
 	github.com/mholt/acmez/v3 v3.1.7
 	github.com/pelletier/go-toml/v2 v2.4.3
-	github.com/pion/dtls/v3 v3.1.10
+	github.com/pion/dtls/v3 v3.1.14
 	github.com/pion/ice/v4 v4.4.7
 	github.com/pion/interceptor v0.1.49
 	github.com/pion/logging v0.2.4
@@ -24,7 +24,7 @@ require (
 	github.com/pion/rtp v1.10.5
 	github.com/pion/sdp/v3 v3.0.20
 	github.com/pion/stun/v4 v4.0.1
-	github.com/pion/webrtc/v4 v4.2.23
+	github.com/pion/webrtc/v4 v4.2.24
 	github.com/prometheus/client_golang v1.25.0
 	github.com/rogpeppe/go-internal v1.16.0
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e

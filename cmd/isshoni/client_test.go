@@ -621,6 +621,83 @@ func TestStatusText(t *testing.T) {
 	}
 }
 
+// The NAT kind as the status names it (README F23): a symmetric NAT that the server marks dockerBridge gets doctor's
+// bridge note on the line below, and only that one; every other status reads as it did.
+func TestStatusTextNAT(t *testing.T) {
+	const note = "              the container's bridge network gives each outgoing connection its own port " +
+		"(symmetric NAT), which doesn't matter here: friends reach the published ports\n"
+	for _, tt := range []struct {
+		name   string
+		nat    api.NATKind
+		bridge bool
+		want   string
+	}{
+		{"a bridge's symmetric NAT", api.NATKindSymmetric, true, "  public IP   203.0.113.7 (stun); NAT: symmetric\n" + note},
+		{"symmetric NAT that doctor doesn't let pass", api.NATKindSymmetric, false, "  public IP   203.0.113.7 (stun); NAT: symmetric\n"},
+		// The flag qualifies symmetric alone; a server never sends it next to another kind.
+		{"the flag next to 1:1 NAT", api.NATKindOneToOne, true, "  public IP   203.0.113.7 (stun); NAT: one_to_one\n"},
+		{"no NAT", api.NATKindNone, false, "  public IP   203.0.113.7 (stun); NAT: none\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := statusText(api.ServerStatus{
+				Version: "0.3.0", StartedAt: time.Date(2026, 10, 15, 8, 0, 0, 0, time.UTC), UptimeS: 3600,
+				PublicIPv4: "203.0.113.7", PublicIPv4Method: "stun", NAT: tt.nat, DockerBridge: tt.bridge,
+			})
+			want := "isshoni 0.3.0, up 1h (since 2026-10-15 08:00 UTC)\n" + tt.want +
+				"  live        0 rooms, 0 participants, 0 shares\n"
+			if got != want {
+				t.Errorf("statusText:\n%s\nwant:\n%s", got, want)
+			}
+		})
+	}
+	if bridgeNATNote != strings.TrimSpace(note) {
+		t.Errorf("bridgeNATNote = %q", bridgeNATNote)
+	}
+}
+
+// TestAdminStatusDockerBridge: a server in a Docker container on a bridge network, whose symmetric NAT doctor's
+// public_ip lets pass, has dockerBridge in its status (README F23). `isshoni admin status` then adds the note that
+// `isshoni doctor` adds under public_ip on the same server, in the same words; --json is the server's document with
+// the flag next to nat. Out of the container both read as before.
+func TestAdminStatusDockerBridge(t *testing.T) {
+	f, env := startTestServer(t, false)
+	f.machine.setBridge(true)
+
+	code, stdout, stderr := runCLIEnv(t, env, "admin", "status")
+	nat := "  public IP   203.0.113.7 (stun); NAT: symmetric\n              " + bridgeNATNote + "\n"
+	if code != exitOK || stderr != "" || !strings.Contains(stdout, "\n"+nat+"  listening ") {
+		t.Errorf("admin status in a bridge: exit %d, stderr %q\n got:\n%s\nwant the lines:\n%s", code, stderr, stdout, nat)
+	}
+
+	// doctor, run inside the same server, says the same under its public_ip line.
+	res := runDoctorCLI(t, false, env, nil, "doctor", "--only", "container,public_ip")
+	// (IPv6 is on in the config and the container has no IPv6 address: an info.)
+	want := "[info] public_ip     203.0.113.7 (seen by STUN); IPv6 media off (Docker bridge)\n       " + bridgeNATNote + "\n"
+	if res.code != exitOK || res.stderr != "" || !strings.Contains(res.stdout, want) ||
+		!strings.Contains(res.stdout, "[info] container     Docker, bridge network: ") {
+		t.Errorf("doctor in a bridge: exit %d, stderr %q\n got:\n%s\nwant the lines:\n%s", res.code, res.stderr, res.stdout, want)
+	}
+
+	code, stdout, stderr = runCLIEnv(t, env, "admin", "status", "--json")
+	var st api.ServerStatus
+	if err := json.Unmarshal([]byte(stdout), &st); err != nil || code != exitOK || stderr != "" {
+		t.Fatalf("admin status --json: exit %d, stderr %q, %v\n%s", code, stderr, err, stdout)
+	}
+	if !st.DockerBridge || st.NAT != api.NATKindSymmetric || !strings.Contains(stdout, `"nat":"symmetric","dockerBridge":true,`) {
+		t.Errorf("admin status --json in a bridge: %s", stdout)
+	}
+
+	// Out of the container: no note, and no key.
+	f.machine.setBridge(false)
+	code, stdout, _ = runCLIEnv(t, env, "admin", "status")
+	if code != exitOK || strings.Contains(stdout, "bridge") || !strings.Contains(stdout, "  public IP   203.0.113.7 (stun); NAT: none\n  listening ") {
+		t.Errorf("admin status on the host:\n%s", stdout)
+	}
+	if _, stdout, _ = runCLIEnv(t, env, "admin", "status", "--json"); strings.Contains(stdout, "dockerBridge") {
+		t.Errorf("admin status --json on the host has dockerBridge: %s", stdout)
+	}
+}
+
 // An answer the CLI has no words for still names the code; a timeout is a runtime error.
 func TestAdminFailure(t *testing.T) {
 	inv := &invocation{args: []string{"admin", "status"}}

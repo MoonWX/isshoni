@@ -239,12 +239,15 @@ SFU API, S27 for the web `Platform`. Adapters and fakes then never chase a movin
 ## 5. Implementation plan
 
 ### How the plan works
-- 94 slices in 15 groups, plus follow-up slices (S00, S00B, S00C, S00D, S00E, S00F, S00G, S00H, S00I, S00J, S00K, S00L,
-  S00M: spec write-backs, with small code fixes in S00 and S00B; W00, F02, F03, F04, F05, F10, F11, F12, F13, F14,
-  F15, F16, F17, F18, F19, F20, F21 and F22: code or files that a group's integration or review found missing; F06,
-  F07, F08 and F09: the fixes of the security review of `main` before the first release candidate, §6 "Decided
-  after group 10") and dependency slices (D01) that the integrator adds to a group. A group starts when the previous
-  one is merged into `m1/server-web` and green.
+- 94 planned slices in 15 groups, plus follow-up slices (S00, S00B, S00C, S00D, S00E, S00F, S00G, S00H, S00I, S00J,
+  S00K, S00L, S00M and S00N: spec write-backs, with small code fixes in S00 and S00B; W00, F02, F03, F04, F05, F10,
+  F11, F12, F13, F14, F15, F16, F17, F18, F19, F20, F21, F22 and F23: code or files that a group's integration or
+  review found missing; F06, F07, F08 and F09: the fixes of the security review of `main` before the first release
+  candidate, §6 "Decided after group 10") and dependency slices (D01) that the integrator adds to a group. Groups 16
+  and 17 hold follow-up slices only: F22 in group 16, F23 and S00N in group 17. Of the planned slices, two are left
+  for the owner: README S92, the load gate on a VPS, and `S94-day`, the exit test's session with the device matrix
+  and the `v0.1.0` tag (S94's code part merged in group 14); F07 waits for the owner's call (§6 "Owner actions"). A
+  group starts when the previous one is merged into `m1/server-web` and green.
 - Slices in one group touch **disjoint paths** ("Touches"), so separate agents can build them at the same time in
   separate worktrees. A Go package means its own directory only, not its subpackages; other paths are prefixes. A
   slice changes only its listed paths and the shared files below; if it needs more, it stops and asks the integrator.
@@ -338,7 +341,9 @@ current release; later slices keep that version.
 | F20 | 14 | Log hygiene: Pion's ICE password redacted; no shutdown WARN from Transfer's first tick | 04 §10, §11.3, §17 (the log canary); PLAN privacy; S90's blocked items (group 13); §6 "Decided after group 13" (12) | `internal/logx` (the Pion log bridge and its rate limiter, with tests), `internal/server/ops` (Transfer's first tick only, with a test) | S90 | 0.5 | The Pion bridge redacts ICE passwords before writing, at every level: the value of `remotePwd`, `localPwd`, `ice-pwd`/`icePwd` or a bare `pwd` after `:` or `=`, quoted or not, in any case (the forms `internal/server/logsafety.go`'s `icePassword` matches; pion/ice logs `remotePwd` at debug in its `Started agent` line), with a test that feeds Pion's own message formats, `Started agent` among them; the rate limiter's "further messages suppressed" line is logged at the level of the suppressed lines (not WARN for debug lines), with a test; Transfer's first tick does not log a WARN when the server stops right after starting (a cancelled context is a normal stop), with a test; S90's log canary still passes; `go test -race ./internal/logx/... ./internal/server/...` |
 | S00M | 15 | Group 14 follow-ups: spec write-backs and recorded decisions | the group 14 integrator and review notes; §6 "Decided after group 14" | `docs/m1/*.md` (not 04 §13.2 and 06 §11.3, which F21 edits in this group) | – | 0.5 | The write-backs are in the specs and match the code as merged, with no code change: 04 §10, §11.3, §17 and its decisions list, with 02 §13 (F20: the Pion bridge redacting named passwords and the password of a ufrag:password pair at every level, the pair rule's lean toward redacting, `internal/server/logsafety.go` as a second layer; the limiter's notice at the dropped line's level and again for a higher one, the count at the highest, one budget per scope across levels; a tick that the stop cuts short logs at debug and skips the alert check, `loadSent` and `rememberSent` quiet for a cancelled context, a store timeout still a warning; `TestRedactCredentials`, `TestPionRedactsAtEveryLevel`, `TestPionRedactsICEAgentPassword`, `TestPionRateLimitLevels`, `TestLineLimiterLevels`, `TestTransferStopInFirstTick` and logx's goleak); 05 §11.2, §14.1 and §19.2 (F19: `InviteLinkCardProps.onceKey`, default `setup.inviteCard.once`; `InviteDialogProps.me` from `AccountMenu`; `room.invite.once` ("My invites") for members, among the `room.invite.*` keys); 05 §3, §10.6, §10.7, §12.7, §16.5, §16.6, §19.1, §19.2, §19.3 and §24 (S93 with the group 14 integration's wiring: `attachViewerStats` in `viewer/statsLink.ts`, `viewer.debug` in `debugStats.ts`, `DebugOverlay`/`DebugPanel` with `?debug=1` for one page, `share/stats.ts` as the pub PC's source, `stats`'s `intervalMs` as the time since the report before; the stale W13 sentences of §10.7 and §12.7 gone; the F17-R3 carry-over done; rule 4 of `check:i18n` with its use rules, `READ_WHOLE = ['push']` and its warnings on stderr; the announcements; the `a11y.spec` row with both colour schemes, the overlay and the settle wait, and the `version.spec` row as §16.4 has it; the new test files); 06 §7.4, §12.3, §16 and §17 (S94: `run.csv`'s row kinds and columns, `cpus` and `host_cpu_pct`, the `<out>-metrics/` scrapes, the flags `-unit`, `-pid-file`, `-nic`, `-metrics-dir`, `-proc`, `-interval` and `-scrape-interval`, the `Udp6` counters, USER_HZ 100, the summary's verdict rules, the journal read by the JSON level, `systemd-run --collect`; a Linux container's `go -C tools test ./...` and the darwin `.bin/go-licenses`); 05 §19.3 and 04 §17 (the PR #22 test fixes merged after group 13: `hint.spec`'s start profile, `TestSourceGuardTCPAgent`'s distinct sources). The sentences that still described F19 and F20 as planned are in the past tense (04 §10 and its decision 16; §6 "Decided after group 13" (8), (12)). The decisions of §6 "Decided after group 14" are recorded where the specs discuss them (04's decisions list; 05 §24; 06 §17), and §6 keeps S00L's numbering of "Decided after group 13"; F07 stays waiting for the owner; the owner questions stay open (the sound when the focused share has none, 05 §12.3 and §24; PiP on Android Chrome, 05 §12.5 and §24; room names and the emoji that need U+FE0F or a joiner, 03 §8 and §19); this table has rows for S00M and F21, and S93's row records the integration's extension of its Touches |
 | F21 | 15 | Doctor asserted per code in CI's Linux docker-smoke; two doctor rules reviewed | 04 §13.2; 06 §6, §11.3; §6 "Decided after group 13" (2), "Decided after group 14" (11) | `deploy/docker/test/` (the smoke script's doctor step), `internal/server/ops/doctor` (the `public_ip` rules and their tests); `docs/m1/04-server-platform.md` (§13.2 only), `docs/m1/06-deploy-and-ci.md` (§11.3 only) | S90 | 1 | `docker-smoke` runs `isshoni doctor --json` inside the container in both the bridge and the host setup and asserts each check by its code, with an explicit allow-list for what a CI runner can't satisfy, each entry named and justified in the script; on the developer's Mac the same step runs under Docker Desktop with that environment's allow-list and passes; the two `public_ip` rules are decided and tested: (a) a Docker bridge is not reported as symmetric NAT when the published ports don't depend on the outbound NAT kind (or 04 §13.2 says why it stays), (b) a configured literal `127.0.0.1`, or any loopback address, is not taken for a public address; table tests for both; `go test -race ./internal/server/ops/...`; shellcheck and shfmt clean; every container and image it creates is named `isshoni-*` or `s<NN>-*` and removed afterwards, and no other is touched. CI's `docker-smoke` job changes only if the step needs a new input (`.github/workflows/ci.yml` is not in the Touches: the report says so, and the integrator applies it). The integrator runs `task docker:smoke` on the Mac after the merge |
-| F22 | 16 | Dashboard and connection test don't call a Docker bridge "symmetric NAT" (F21 follow-up) | 04 §7.4, §7.7, §11.4, §13.2 (F21's rule (a), the param `dockerBridge`); 05 §14.2, §15.3 | `internal/protocol/api` (an additive field next to the dashboard's and the connection test's `nat`), `internal/server/ops` and `internal/server` (where they are filled), `web/src/admin/dashboardText.ts`, `web/src/conntest/fixText.ts` and their tests, `web/src/i18n/en.json` (new keys only), `web/src/protocol/*.gen.ts` (regenerated); `docs/m1/04-server-platform.md` (§7.4, §7.7, §11.4 only), `docs/m1/05-web-client.md` (§14.1 and §15.3 in the plan; the slice edited §14.2, where `ConnTestResult` and the NAT fix texts are, instead of §14.1). The group 16 integration recorded three one-line extensions the slice needed: `web/src/conntest/runConnTest.ts` (the result's `server.dockerBridge`, copied only when the server sent `true`), `web/src/admin/DashboardPage.tsx` (`natName` takes the server object) and the key `admin.dashboard.natKind.symmetric_dockerBridge` in `web/src/i18n/lazy/admin.en.json`, the file of the `admin` namespace | F21 | 1 | Where F21's doctor rule lets a container's bridge NAT pass (`dockerBridge`), the dashboard and the connection test say the same: an additive `dockerBridge: true` next to `nat` in the dashboard and conntest JSON, filled from the same detection (the wiring runs doctor's `public_ip` once, `dockerBridgeNAT`); the web shows a bridge note instead of "symmetric NAT" or the cgnat fix text for it, and unchanged text otherwise; the protocol change is additive (golden fixtures and the compat test pass; `task gen` leaves no diff after regeneration); Go tests for the field's filling, Vitest for both texts; `go test -race ./internal/server/... ./internal/protocol/...`; npm lint, typecheck, Vitest, `check:i18n`, `check:size` pass. Not in it: `isshoni admin status` still prints the raw NAT kind (`api.ServerStatus` has no flag) |
+| F22 | 16 | Dashboard and connection test don't call a Docker bridge "symmetric NAT" (F21 follow-up) | 04 §7.4, §7.7, §11.4, §13.2 (F21's rule (a), the param `dockerBridge`); 05 §14.2, §15.3 | `internal/protocol/api` (an additive field next to the dashboard's and the connection test's `nat`), `internal/server/ops` and `internal/server` (where they are filled), `web/src/admin/dashboardText.ts`, `web/src/conntest/fixText.ts` and their tests, `web/src/i18n/en.json` (new keys only), `web/src/protocol/*.gen.ts` (regenerated); `docs/m1/04-server-platform.md` (§7.4, §7.7, §11.4 only), `docs/m1/05-web-client.md` (§14.1 and §15.3 in the plan; the slice edited §14.2, where `ConnTestResult` and the NAT fix texts are, instead of §14.1). The group 16 integration recorded three one-line extensions the slice needed: `web/src/conntest/runConnTest.ts` (the result's `server.dockerBridge`, copied only when the server sent `true`), `web/src/admin/DashboardPage.tsx` (`natName` takes the server object) and the key `admin.dashboard.natKind.symmetric_dockerBridge` in `web/src/i18n/lazy/admin.en.json`, the file of the `admin` namespace | F21 | 1 | Where F21's doctor rule lets a container's bridge NAT pass (`dockerBridge`), the dashboard and the connection test say the same: an additive `dockerBridge: true` next to `nat` in the dashboard and conntest JSON, filled from the same detection (the wiring runs doctor's `public_ip` once, `dockerBridgeNAT`); the web shows a bridge note instead of "symmetric NAT" or the cgnat fix text for it, and unchanged text otherwise; the protocol change is additive (golden fixtures and the compat test pass; `task gen` leaves no diff after regeneration); Go tests for the field's filling, Vitest for both texts; `go test -race ./internal/server/... ./internal/protocol/...`; npm lint, typecheck, Vitest, `check:i18n`, `check:size` pass. Not in it: `isshoni admin status`, which printed the raw NAT kind until README F23 (group 17) gave `api.ServerStatus` the same flag |
+| S00N | 17 | Groups 15 and 16 follow-ups: spec write-backs, decisions, the slice count | the group 15 and 16 integrator and review notes; §5; §6 "Decided after group 15", "Decided after group 16" | `docs/m1/*.md` (not 04 §3.1 and §12.2, which F23 edits in this group) | – | 0.5 | The write-backs are in the specs and match the code as merged, with no code change: 04 §13.2, §17 and its decision 20, with 06 §8.2, §11.3, §12.1, §13 and §17 (F21: the doctor step's lists per engine, `TestDockerSmokeExpectations`, rule (b) leaving the IPv4 path's NAT kind out with its address, no new codes; the step's first Linux run and its allowed results; ci.yml without the `doctor` filter; the manual check and pre-flight item 5 as they read since F21; F21's tests in 04 §17's unit table); 05 §15.3, §19.1 and §24 with 04 §13.2 (the group 15 integration's Doctor page for `unreachable` and `dockerBridge`, and `public_ip.fix_set` without an `unreachable` variant); 04 §13.1 and its decision 21 (the doctor fix of PR #22 merged after group 15: `handleDoctor` checks the stop first); 04 §6.6, §7.7, §17 and its decision 22, with 05 §24 and 06 §11.3 (F22: `wireConnTest` in `wire` with the bridge flag, `TestDockerBridgeNATCancelled`, the coverage gap of the bridge path in a real container); 06 §7.1 and §17 (go1.27.3 for GO-2026-6809, outside the monthly bump). §5's count says what the plan holds (94 planned slices in 15 groups, the follow-up S00 and F slices, groups 16 and 17 with follow-ups only, S92 and `S94-day` left for the owner); §6 has "Decided after group 15" and "Decided after group 16", and "Decided after group 13" (2) and "Decided after group 14" (11) point to F21's results; F07 stays waiting for the owner; the owner questions stay open (the sound when the focused share has none, 05 §12.3 and §24; PiP on Android Chrome, 05 §12.5 and §24; room names and the emoji that need U+FE0F or a joiner, 03 §8 and §19); this table has rows for S00N, F22 and F23 |
+| F23 | 17 | `isshoni admin status` shows a Docker bridge's NAT the way the dashboard does (F22 follow-up) | 04 §3.1 (`admin status`), §12.2 (`ServerStatus`), §7.4; F22's `dockerBridge` rule (04 §7.7, §11.4, §13.2); §6 "Decided after group 16" (2), (5) | `internal/protocol/api` (`ServerStatus`: an additive `dockerBridge` field only), `internal/server` and `internal/server/ops` (where `ServerStatus` is filled), `cmd/isshoni` (`admin status`'s output and its tests), `web/src/protocol/*.gen.ts` (regenerated by `task gen` only); `docs/m1/04-server-platform.md` (§3.1 and §12.2 only) | F22 | 0.5 | `api.ServerStatus` gains an additive `dockerBridge` field filled from the same detection as F22's dashboard field; `isshoni admin status` prints the NAT line with a bridge note (as the CLI's doctor text words it) instead of a bare "symmetric" when it is set, and unchanged otherwise; the golden fixtures and the compat test pass; `task gen` leaves no diff after regeneration; tests for the field and the CLI output; `go test -race ./internal/server/... ./cmd/isshoni/... ./internal/protocol/...` |
 | S01 | 1 | Repo skeleton and dev loop | 06 S1; 06 §7.1–7.3 | root: `go.mod`, `go.sum`, `Taskfile.yml`, `.tool-versions`, `.golangci.yml`, `.gitignore`, `tygo.yaml`, `LICENSE`, `NOTICE`, `CONTRIBUTING.md`; `tools/`, `deploy/dev/` | – | 1 | Fresh clone: `mise install && task setup` succeed; `task lint:go lint:pins test:go` pass on the empty module; `task --list` shows every task of 06 §7.2 (tasks whose inputs do not exist yet exit 0 with a note); `.bin/tygo` is v0.2.21; `task build:go` stops with a clear message while `web/dist/index.html` is missing |
 | S02 | 1 | CI core | 06 S2; 06 §8.1–8.2, §8.6 | `.github/workflows/ci.yml`, `.github/dependabot.yml` | – | 1.5 | `actionlint` clean; once group 1 is merged, a PR with a gofmt error turns `ci-ok` red and a clean PR is green in < 12 min; jobs whose inputs are missing are skipped and count as success. Owner: 06 §8.6 steps 1–3 and 6–7 |
 | S03 | 1 | Protocol types and fixtures | 01 P1; 01 §5, §8, §14.3, §15.1 | `internal/protocol` | – | 3 | `go test -race ./internal/protocol/...`: round-trip, registry coverage, no-null, unknown-field tolerance, validation tables, codec table and secret redaction pass; each fuzz target runs 30 s clean; `go list -deps` shows only the standard library |
@@ -430,10 +435,10 @@ current release; later slices keep that version.
 | S89 | 13 | Load test tool | 02 slice 15 (tool); 02 §15.2 | `cmd/isshoni-loadtest`, `web/e2e/decodable.spec.ts` (not `sfutest` or `publish`, which S88 owns in this group; M1 has no publisher rate control) | S22, S39, S42, S59, S61, S64, S85 | 2.5 | A Go test runs `-scenario smoke` against an in-process server and exits 0 with the JSON report (so it runs in `test-go`); users come from an invite and are deleted afterwards; an unreachable server gives the documented exit code; `decodable.spec` runs `isshoni-loadtest -scenario smoke -decodable -publishers 1 -subscribers 0` (or a `-publish-only` flag) against the e2e server fixture, and a Chrome viewer shows `framesDecoded > 0`. As built (§6 "Decided after group 13" (6), 02 §15.2): `-v`, exit 130 for an interrupt, media that never came is exit 1, `-duration` with the warm-up, the expected egress from the publishers' measured rates, the memory check skipped while the server reports no RSS, `smoke`'s relaxed limits and all-high's knee; `decodable.spec` takes the tool from `LOADTEST_BIN`, which CI's `e2e` job sets to the `build` job's binary (06 §8.2), and otherwise builds it with the Go on the `PATH` (05 §19.3) |
 | S90 | 13 | Server hardening | 04 S14; 04 §6.4–6.5, §17 | `internal/server`, `cmd/isshoni`, `web/e2e/tcp-only.spec.ts` | S65, S66, S68, S71, S85 | 2 | SIGHUP reload test; shutdown test (`server.shutdown`, close 1012, REST 503 `server_shutdown`, `Run` returns in time); a log canary finds no secrets, SDP or client IPs at info; `tcp-only.spec` (UDP blocked, off mode, so TCP 7882) plays over TCP; S59's ICE-TCP-via-443 itest (04 §17) still passes with the hardened server; doctor reports ok in the Docker bridge and host setups. Merged in group 13 with every item but the last met; the last is **Manual** since then, on a Linux host with a real address with the exit test (§6 "Decided after group 13" (2); 06 §12.1 pre-flight 5): Docker Desktop and the smoke overrides can't give an all-ok report. As built: §6 "Decided after group 13" (7), (8) |
 | S91 | 13 | Admin dashboard, doctor, bandwidth; admin e2e | 05 W12 (part); 05 §15.3 | `web/src/admin/`, `web/e2e/admin.spec.ts` | S49, S61, S64, S70, S85 | 2 | `admin.spec` (create and revoke an invite, approve a pending sign-up, doctor page renders); the dashboard polls every 2 s while visible and stops when hidden; the catalog has `doctor.<code>` for every code of 04 §13.2, `doctor.public_ip.loopback` (README F04, a `skip` without params or fix, which an e2e server reports) and `doctor.udp_buffers.unknown` among them (05 §15.3). As built (§6 "Decided after group 13" (1), (9); 05 §15.3): the `doctor` namespace stayed in `en.json`, and `admin.spec` has a fourth test, the dashboard polling a real server |
-| S92 | 14 | Load gate on a VPS | 02 slice 16; 02 §15.2 | `internal/server/sfu` | S88, S89 | 2 | Manual (VPS): `-scenario focus` against a 4 vCPU VPS, run from a second VM, meets every 02 §15.2 criterion; the `all-high` knee goes into the release-notes draft. **Waits for the owner's OK for the two machines** (§6 decision 4; "Owner actions"): not in group 14's parallel run of F19, F20, S00L, S93 and S94's code, nor in group 15's of F21 and S00M (§6 "Decided after group 14" (12)). S88 merged with layer pausing on by default, so S92 runs with it |
+| S92 | 14 | Load gate on a VPS | 02 slice 16; 02 §15.2 | `internal/server/sfu` | S88, S89 | 2 | Manual (VPS): `-scenario focus` against a 4 vCPU VPS, run from a second VM, meets every 02 §15.2 criterion; the `all-high` knee goes into the release-notes draft. **Waits for the owner's OK for the two machines** (§6 decision 4; "Owner actions"): not in group 14's parallel run of F19, F20, S00L, S93 and S94's code, nor in group 15's of F21 and S00M, nor in group 16's (F22) or group 17's (F23, S00N) (§6 "Decided after group 14" (12)). S88 merged with layer pausing on by default, so S92 runs with it |
 | S93 | 14 | Web hardening: overlay, a11y, i18n check, versions | 05 W13; 05 §16.4–16.6 | `web/src/{app,viewer,share}/`, `web/scripts/check-i18n.mjs`, `web/e2e/{a11y,version}.spec.ts`; the group 14 integration extended them, for review S93-R2, to `web/src/rooms/connectStats.ts` and `web/src/rooms/media.ts` (the wiring of the collector's pub source, `attachViewerStats` and the `stats` reports, which S93 wrote and verified as a patch) and the overlay step of `a11y.spec`, which needs that wiring (§6 "Decided after group 14" (10)) | S72, S77, S86, S87, S91 | 3 | `a11y.spec` and `version.spec` pass; a test shows `check:i18n` fails when a key is removed, and the script warns about unused keys (its earlier rules came in S09, S27 and S37); the debug overlay (`stats.watch`) shows per-tile stats with no IPs; `stats` notifications raise the hub's client metrics. Manual: the upload hint under DevTools throttling |
 | S94 | 14 | M1 exit test: the collector tool and the run book (code part; split after group 13, §6 "Decided after group 13" (4)) | 06 S12, 05 W14; 06 §12; 05 §19.4 | `tools/exittest/`, `docs/m1/exit-test/` | S90 (the rest of S94's needs gate the test day, the row below, not this code) | 1 | `tools/exittest` builds with the Go standard library only and its tests pass: `collect` samples every 10 s what 06 §12.3 lists (the isshoni PID re-resolved each sample, with a restart row when it changes; the metrics scraped from a fake `/metrics` server in the test), writes `run.csv`, survives the server restarting and the metrics endpoint going away for a while, and stops cleanly on SIGTERM; any summarize or report subcommand 06 §12.3 asks for works on a recorded fixture; `docs/m1/exit-test/` holds the run book as 06 §12 describes it (setup, pre-flight, timeline, measurements, the survey, the pass criteria) ready for the owner, without real names, IPs or domains; `go -C tools test -race ./exittest/...` (or the module 06 names); lint clean. Not in this slice: the device matrix, the test day and the `v0.1.0` tag (the next row) |
-| S94-day | 15 | M1 exit test: the session, the device matrix and `v0.1.0` (the owner's; split from S94 after group 13) | 06 §12; 05 §19.4 | the run's results in `docs/m1/exit-test/` | S51, S75, S82, S83, S90, S92, S93, S94 | 0.5 + the session | Manual (the owner): the 05 §19.4 device matrix is filled in; on an rc, after S92's load gate, every pass criterion of 06 §12.3 is met (5 friends, 2 hours, no manual fixes, iPhone and Android watch), with 06 §12.1's pre-flight, its doctor check in Docker included (§6 "Decided after group 13" (2)); `v0.1.0` is tagged from that commit. Not in group 15's run of F21 and S00M: it follows S92, which waits for the owner's OK for its two machines (§6 "Decided after group 14" (12)) |
+| S94-day | 15 | M1 exit test: the session, the device matrix and `v0.1.0` (the owner's; split from S94 after group 13) | 06 §12; 05 §19.4 | the run's results in `docs/m1/exit-test/` | S51, S75, S82, S83, S90, S92, S93, S94 | 0.5 + the session | Manual (the owner): the 05 §19.4 device matrix is filled in; on an rc, after S92's load gate, every pass criterion of 06 §12.3 is met (5 friends, 2 hours, no manual fixes, iPhone and Android watch), with 06 §12.1's pre-flight, its doctor check in Docker included (§6 "Decided after group 13" (2)); `v0.1.0` is tagged from that commit. Not in the runs of groups 15 to 17: it follows S92, which waits for the owner's OK for its two machines (§6 "Decided after group 14" (12)) |
 
 ## 6. Owner decisions (2026-09-30)
 
@@ -866,7 +871,11 @@ and the three questions that are still the owner's. S00L wrote each into the spe
    `internal/server/ops/doctor` may run `isshoni doctor --json` in CI's Linux docker-smoke and assert per code, and
    review two rules of `public_ip`: it calls a Docker bridge "symmetric" although published ports don't depend on
    the outbound NAT kind, and it takes a configured literal `127.0.0.1` for the public address (04 §13.2, §17;
-   06 §17). That later slice is README F21, in group 15 ("Decided after group 14" (11)).
+   06 §17). That later slice is README F21, in group 15 ("Decided after group 14" (11)), and it did both: CI's
+   docker-smoke asserts every check by its code in the bridge and the host setup, with an allow-list whose every
+   entry is named and justified in the script; a Docker bridge's symmetric NAT passes (the param `dockerBridge`);
+   and a loopback or unspecified `public_ip` is no public address (the param `unreachable`) ("Decided after group
+   15" (1), (2)). The manual check stays, because the smoke overrides have no public address.
 3. **Layer pausing is on by default** (README S88, cuttable and not cut). Every Go test and the whole e2e suite ran
    green with it in the group 13 integration; `sfu.pause_unwatched_layers = false` turns it off (02 §11 and its
    decision 9).
@@ -1048,10 +1057,11 @@ discusses it. The numbering of "Decided after group 13" above stays as S00L set 
 11. **One follow-up slice in group 15: README F21**, decision (2) of "Decided after group 13": `isshoni doctor
     --json` asserted per code in CI's Linux `docker-smoke` and under Docker Desktop on the Mac, with an allow-list
     for what each environment can't satisfy, and the two `public_ip` rules reviewed (a Docker bridge called
-    symmetric; a literal loopback `public_ip` taken for a public address). The manual check on a Linux host with a
-    real address stays in the exit test's pre-flight (06 §12.1 item 5). Still not scheduled: `sign` and `sign-dry`
-    calling `check-draft.sh` without the signature check (F15's note); `task e2e` building `isshoni-loadtest` and
-    passing `LOADTEST_BIN` (S89's option). Two stale comments wait for the next slice that edits their file:
+    symmetric; a literal loopback `public_ip` taken for a public address). F21 merged in group 15 ("Decided after
+    group 15" (1)–(3)). The manual check on a Linux host with a real address stays in the exit test's pre-flight
+    (06 §12.1 item 5). Still not scheduled: `sign` and `sign-dry` calling `check-draft.sh` without the signature
+    check (F15's note); `task e2e` building `isshoni-loadtest` and passing `LOADTEST_BIN` (S89's option). Two stale
+    comments wait for the next slice that edits their file:
     `web/e2e/tcp-only.spec.ts` still says the page's stats have only the viewer's PCs (S93 added the pub PC), and
     `redactCredentials` in `internal/logx/pion.go` describes the pair rule's URL case by a dotless host of at
     least 20 characters, where 04 §10 has what the code does (review S00M-R1, R2).
@@ -1064,6 +1074,152 @@ discusses it. The numbering of "Decided after group 13" above stays as S00L set 
     13"; neither the rule nor the code changes until the owner answers (05 §12.5, §24).
 15. **Open, for the owner: room names and the emoji that need U+FE0F or a zero-width joiner.** Unchanged from
     point 16 of "Decided after group 13"; the rule and the code stay as they are (03 §8, §19).
+
+### Decided after group 15 (engineering calls the owner delegated)
+
+Five engineering calls that group 15's slices and its integration made where the specs left a choice or the code
+went past them, one of them a fix merged after the integration, what the group did beyond its listed paths, one
+follow-up slice, F07 and the owner's slices still waiting, and the three questions that are still the owner's.
+S00N wrote each into the spec that discusses it.
+
+1. **Doctor asserted per code in CI's docker-smoke, as README F21 built it** (06 §11.3, §13; 04 §13.2, §17). In
+   the bridge and the host setup, `docker compose exec -T isshoni isshoni doctor --json` reports from the running
+   server (`cli-with-server`), exits 5 exactly when a check fails, and every check of `doctor --list-checks` has the
+   code the script's `doctor_want` names for it or one that `doctor_allowed` names for this engine: `local` (a
+   Docker engine on the Linux machine that runs the test, as CI's runner), `vm` (Docker Desktop) or `any`, each
+   entry with its reason in the script. The overrides set `ISSHONI_PUBLIC_IP=127.0.0.1` and put `smoke.test` on
+   `127.0.0.1` in the container's `/etc/hosts` (`extra_hosts`), so `public_ip.none` (on `local` also `ipv6_only`)
+   and `dns.unverified` are allowed everywhere, and `clock.unsynced` and `udp_buffers.low` on both engines (the
+   Docker host's clock flag and sysctls). The step also checks that `public_ip` names `127.0.0.1` in `unreachable`
+   and has no `ipv4`, and that `container` sees the setup's network. `TestDockerSmokeExpectations` (`ops/doctor`,
+   in `test-go` on every Go change) holds both lists to doctor's checks and codes (review F21-R2). The step's first
+   Linux run, on the pull request that brought group 15 into `main` (PR #25), passed with the allowed results
+   `public_ip.none`, `dns.unverified`, `clock.ok` and `udp_buffers.low`, so the `local` list, chosen by reasoning,
+   held; on Docker Desktop the integration's `task docker:smoke` gave `public_ip.none`, `dns.unverified`,
+   `clock.unsynced` and `udp_buffers.low`. Point 2's rule (a) is not part of the step, because the loopback
+   address decides `public_ip` first; its Go tests and F21's one manual run on Docker Desktop hold it.
+2. **Two rules of `public_ip`, as README F21 decided them** (04 §13.2 and its decisions 17 and 20). (a) In a container
+   on a bridge network, symmetric NAT is no failure: friends reach the published ports, whatever the bridge's NAT does
+   with connections that start inside the container, so the check judges the address as behind a container's 1:1 NAT
+   (`ok`, `no_ipv6` or `ephemeral`), with the measured `nat` and the param `dockerBridge`; on the host's network, in a
+   container whose network doctor can't tell and outside a container it stays `public_ip.symmetric`, and `cgnat_likely`
+   is unchanged. (b) An address that only this machine can reach, a loopback or the unspecified address given as a
+   `public_ip` or `public_ipv6` literal, is no public address: it is named in the param `unreachable`, and `public_ip`
+   and `dns` judge the server without it (`public_ip.none`, `ipv6_only` or `no_ipv6`; `dns.unverified` for a record and
+   `dns.missing` without one when no other public address is left, never `dns.ok` against the left-out address); the
+   CLI's `none` text says what the address is, and its fix `public_ip.fix_set` leaves out the domain and the late
+   network. Since review F21-R1 the IPv4 path's NAT kind judges nothing once its address was left out
+   (`publicState.v4Unreachable`): a loopback `public_ip` with a public IPv6 address is `ipv6_only` whatever the kind,
+   while an IPv4 address that was simply not found keeps `cgnat_likely` as `public_ip.cgnat`. No new codes: both rules
+   give the existing ones new params, since a new code needs 05's catalog in the same slice.
+3. **CI's `changes` job had no `doctor` filter** (06 §8.2, §11.3; review F21-R2). Doctor's package is an input of
+   the smoke step, and a pull request that changes only doctor (the `go` filter) doesn't run docker-smoke.
+   `TestDockerSmokeExpectations` catches a check added or removed and a code renamed or removed, but which of its codes
+   a check gives in the smoke's setup only the step can tell, so such a change passes its own pull request and fails on
+   the push to `main` and in nightly's `docker-multiarch`. F21's own 06 §11.3 text named a filter `doctor`
+   (`internal/server/ops/doctor/**`) as the integrator's to add, but F21's report did not carry it among its blocked
+   items, and the group 15 integration judged `ci.yml` needed no change (its own pull request touched
+   `deploy/docker/**`, which selects the job). Added after group 17: the `doctor` filter runs docker-smoke on such a
+   pull request (06 §8.2).
+4. **The Doctor page follows F21's params since the group 15 integration** (05 §15.3, §19.1; 04 §13.2). Right
+   after the merge the integration had `web/src/admin/doctorText.ts` name the addresses of `unreachable` on
+   `public_ip.none` (the contexts `unreachable`, and `unreachableSite` where the site is that address), `no_ipv6`
+   and `ipv6_only`, and add the bridge note `doctor.part.bridgeNAT` to `ok`, `no_ipv6` and `ephemeral`, in the
+   CLI's words, with their keys in `en.json`; `deploy/docker/README.md`'s table of smoke parts got its `doctor`
+   row (F21's blocked items). Still missing: the page's `public_ip.fix_set` has no variant for `unreachable`, so a
+   loopback `public_ip` gets the generic fix (set `public_ip` or a domain; a restart if the network came up late),
+   where the CLI's says to set `public_ip` to the server's public address or to `auto`. Not scheduled yet: a few
+   lines in `doctorText.ts` and their keys in `en.json`.
+5. **A doctor request that ends while the server stops is told so** (04 §13.1 and its decision 21). The doctor
+   fix of PR #22, merged into group 13 after the group 15 integration and from there into groups 14 and 15: the
+   admin socket's `POST /v1/doctor` answered with a report instead of 503 `server_shutdown` when the shutdown ended
+   the run it waited for and gave it its turn, or when its own short run finished before the shutdown cancelled
+   it, which `TestAdminDoctorShutdown` caught now and then on CI. `handleDoctor` now checks the stop first,
+   whatever the run's result.
+6. **What group 15 did beyond its listed paths and notes, accepted at the merge.** README F21 also changed
+   `compose.smoke.yaml` and `compose.smoke.host.yaml` (inside `deploy/docker/test/`, beyond "the smoke script's
+   doctor step": `extra_hosts` for `smoke.test`, so `dns` reads alike whatever the machine's resolver answers),
+   annotated `public_ip`'s row of 04 §13.2's first table, and let rule (b) cover the unspecified address as well
+   as loopback. README S00M's write-backs went beyond the sections its notes named, inside its paths: the PR #22
+   test fixes where the specs had gone stale (05 §19.3, 04 §17), the Linux-container note in 06 §7.4 rather than
+   §8.2, and consistency edits in 02 §13, 05 §3, 05 §19.1, 06 §16 and §17. The integration needed no fixes commit;
+   point 4's Doctor page change and the write-backs of 04's decision 17, 06 §17 and point 12 of "Decided after
+   group 13" went in as commits of their own after it.
+7. **One follow-up slice in group 16: README F22**, F21's blocked item: the dashboard (`dashboardText.ts`'s
+   `natName`) and the connection test (`conntest/fixText.ts`) still named a Docker Desktop bridge's NAT
+   "symmetric" or gave it the text for a server without a public address. It merged in group 16 ("Decided after
+   group 16" (1)). The two stale comments of "Decided after group 14" (11) still wait for the next slice that edits
+   their file (`web/e2e/tcp-only.spec.ts`, `internal/logx/pion.go`'s `redactCredentials`), and the two items it
+   lists as not scheduled stay so (`sign` and `sign-dry` calling `check-draft.sh` without the signature check;
+   `task e2e` building `isshoni-loadtest`).
+8. **Still waiting for the owner: README F07** (R1 of the security review, point 1 of "Decided after group 10"),
+   unchanged and in no group since; **README S92**, the load gate, which needs the owner's OK for its two
+   machines; and **README S94-day**, the exit test, the device matrix and `v0.1.0`, after S92 ("Owner actions").
+9. **Open, for the owner: the sound when the focused share has none.** Unchanged from point 13 of "Decided after
+   group 14"; the rule and the code stay as they are (05 §12.3, §24).
+10. **Open, for the owner: picture-in-picture on Android Chrome.** Unchanged from point 14 of "Decided after group
+    14"; neither the rule nor the code changes until the owner answers (05 §12.5, §24).
+11. **Open, for the owner: room names and the emoji that need U+FE0F or a zero-width joiner.** Unchanged from
+    point 15 of "Decided after group 14"; the rule and the code stay as they are (03 §8, §19).
+
+### Decided after group 16 (engineering calls the owner delegated)
+
+One engineering call of group 16's only slice, what it left for later, what the group did outside its listed
+paths, a coverage gap, the slices of group 17, the toolchain and dependency updates merged after the group, F07 and
+the owner's slices still waiting, and the three questions that are still the owner's. S00N wrote each into the spec
+that discusses it.
+
+1. **The dashboard and the connection test name a bridge's NAT as doctor judges it** (README F22; 04 §7.4, §7.7,
+   §11.4 and its decision 22; 05 §14.2, §15.3). Both server objects carry an additive `dockerBridge: true` next to
+   `nat` (`api.ConnTestServerInfo.DockerBridge`, the dashboard's `server.dockerBridge`; `omitempty`, so every
+   other server's answer is what it was, and an older SPA ignores the key), exactly where doctor's `public_ip` lets
+   a container bridge's symmetric NAT pass ("Decided after group 15" (2)). The wiring asks doctor rather than
+   judging the bridge a second time: once, when `wire` builds the routes, it runs the one check `public_ip` in the
+   environment of doctor's own runs (`dockerBridgeNAT`), which sends nothing and only reads the machine; any NAT
+   kind but `symmetric` is `false` without a run, and so is a start whose context ended. The flag is fixed for the
+   process's life, and `ops` keeps it only next to `symmetric`, whatever the wiring says. The dashboard reads
+   "symmetric in the container's bridge network, which doesn't matter: friends reach the published ports"
+   (`admin.dashboard.natKind.symmetric_dockerBridge`), and the connection test gives a bridge line
+   (`conntest.nat.symmetric_dockerBridge`, with the published ports and a home router's forward) instead of the
+   text for a server without a public address; every other kind reads as before. `runConnTest` copies the flag
+   only when the server sent `true`, so "Copy result" is unchanged for every other server.
+2. **What F22 left for later: `isshoni admin status` still printed the raw NAT kind** ("NAT: symmetric" for a
+   Docker Desktop bridge), because `api.ServerStatus` had no flag. That is README F23, in group 17 (point 5), which
+   the group 17 integration merged: the status has the flag, and `admin status` prints doctor's bridge note. Since
+   then the wiring's one run of `public_ip` (point 1) happens on every server, before the routes (04 §7.7, §12.2).
+3. **What group 16 did outside its listed paths, accepted at the merge** (review F22-R1: the plan's Touches were
+   short, not the code). README F22 changed `web/src/conntest/runConnTest.ts` (`ConnTestResult.server.dockerBridge`,
+   copied by `summarizeServer`, which drops the wire fields it doesn't know), one line of
+   `web/src/admin/DashboardPage.tsx` (`natName` takes the server object), added the key
+   `admin.dashboard.natKind.symmetric_dockerBridge` to `web/src/i18n/lazy/admin.en.json` (the `admin` namespace's
+   file; `check:i18n` refuses `admin` keys in `en.json`), and edited 05 §14.2, where `ConnTestResult` and the NAT
+   fix texts are, instead of §14.1. Inside its paths it moved `wireConnTest` from `wireAccounts` to `wire`, after
+   the status source and doctor exist, gave it and `wireOpsRoutes` the bridge flag, and added the test hook
+   `SetDoctorMachine` (`export_test.go`, the server's `hookDoctorEnv`). The integration's fixes commit was docs
+   only: F22's row here, 04 §13.2's stale paragraph about 05's catalog, a unit row in 04 §17, and the `conntest`
+   and `doctorText` rows of 05 §19.1.
+4. **A coverage gap that stays** (04 §17; 06 §11.3). The bridge path inside a real container is held only by
+   `TestDockerBridgeInServer`, with a fake machine for doctor: `task docker:smoke` reports `public_ip.none` (the
+   loopback override decides first), and CI's docker-smoke asserts neither the dashboard's nor the connection
+   test's flag. Not scheduled.
+5. **Two slices in group 17**: README F23, an additive `dockerBridge` in `api.ServerStatus` from the same detection
+   as F22's, which `isshoni admin status` prints as a bridge note instead of a bare "symmetric"; and README S00N,
+   the write-backs of groups 15 and 16, these two parts and §5's slice count.
+6. **The Go toolchain is go1.27.3, for GO-2026-6809**, merged after group 16 (06 §7.1, §17). govulncheck reported
+   the vulnerability in `crypto/x509`, reachable from the server and fixed in go1.27.3. The toolchain line moved in
+   `go.mod`, `tools/go.mod`, `tools/goreleaser/go.mod` and `.tool-versions` together (`task lint:pins` checks that
+   they agree), outside the monthly bump of the tool pins: a fix that govulncheck reports doesn't wait for it.
+   Dependabot's minor and patch updates went into `m1/server-web` with it: the distroless base image's digest
+   (#28), `pion/dtls/v3` 3.1.14 and `pion/webrtc/v4` 4.2.24 (#29) and twelve npm packages of `web/` (#30); PR #31
+   brought all of it into `main`.
+7. **Still waiting for the owner: README F07**, unchanged and in no group; **README S92**, the load gate, which
+   needs the owner's OK for its two machines; and **README S94-day**, after S92 ("Owner actions").
+8. **Open, for the owner: the sound when the focused share has none.** Unchanged from point 9 of "Decided after
+   group 15"; the rule and the code stay as they are (05 §12.3, §24).
+9. **Open, for the owner: picture-in-picture on Android Chrome.** Unchanged from point 10 of "Decided after group
+   15"; neither the rule nor the code changes until the owner answers (05 §12.5, §24).
+10. **Open, for the owner: room names and the emoji that need U+FE0F or a zero-width joiner.** Unchanged from
+    point 11 of "Decided after group 15"; the rule and the code stay as they are (03 §8, §19).
 
 ### Owner actions (not decisions)
 - The one-time GitHub setup of 06 §8.6 (default branch `main`, rulesets, the `release` environment, Pages), before
@@ -1091,7 +1247,8 @@ discusses it. The numbering of "Decided after group 13" above stays as S00L set 
   debian-13, ubuntu-22.04 and ubuntu-26.04 were never run by hand, nor any run on x86_64 with KVM, which is how the
   nightly runs every row, so that run is their first.
 - Say yes to README S92's two machines (§6 decision 4: a 4 vCPU VPS and a second VM, for about a day) when M1 is
-  ready for its load gate; S92 is not in group 14's or group 15's run until then, and the exit test comes after it.
+  ready for its load gate; S92 is in none of the runs of groups 14 to 17 until then, and the exit test comes after
+  it.
 - Once group 13 is pushed (after the group 12 PR merges): its first CI run is the first run of the `e2e` job's
   `isshoni-loadtest` artifact (06 §8.2). Two more paths have not run on GitHub yet: `publish`'s
   `deploy/release/check-draft.sh` first runs at the first real tag (a dry run skips `publish`), and

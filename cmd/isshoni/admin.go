@@ -84,8 +84,15 @@ func runAdminStatus(ctx context.Context, inv *invocation, o jsonOptions, _ []str
 	return err
 }
 
+// bridgeNATNote is the line under the NAT kind where the server's symmetric NAT is a container's bridge network,
+// which doctor's public_ip lets pass (dockerBridge, README F23): the words of the line that `isshoni doctor` adds
+// under public_ip there (04 §13.2), so that both commands say the same.
+const bridgeNATNote = "the container's bridge network gives each outgoing connection its own port (symmetric NAT), " +
+	"which doesn't matter here: friends reach the published ports"
+
 // statusText is `isshoni admin status` for people: version, uptime, TLS, addresses, rooms and connections. A part
-// the server did not report is left out.
+// the server did not report is left out. A symmetric NAT that the server marks dockerBridge gets doctor's bridge
+// note on the line below; the flag qualifies symmetric alone, as on the dashboard (05 §15.3).
 func statusText(st api.ServerStatus) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "isshoni %s, up %s (since %s)\n", st.Version,
@@ -123,6 +130,9 @@ func statusText(st api.ServerStatus) string {
 			nat = "; NAT: " + string(st.NAT)
 		}
 		row("public IP", "%s%s", strings.Join(ips, ", "), nat)
+		if st.DockerBridge && st.NAT == api.NATKindSymmetric {
+			row("", "%s", bridgeNATNote)
+		}
 	}
 	if len(st.Listeners) > 0 {
 		parts := make([]string, len(st.Listeners))
