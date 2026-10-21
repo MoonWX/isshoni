@@ -3,9 +3,13 @@
 //
 //	go -C tools run ./repocheck [-root DIR] pins|keys
 //
-// pins: the Go version pinned in .tool-versions equals the toolchain directive of go.mod, tools/go.mod and
-// tools/goreleaser/go.mod; the Task, golangci-lint and shfmt pins equal the versions that tools/go.mod builds into
-// .bin/, and the goreleaser pin the version that tools/goreleaser/go.mod builds.
+// pins: the Go version pinned in .tool-versions equals the toolchain directive of go.mod, tools/go.mod,
+// tools/goreleaser/go.mod and tools/wails3/go.mod; the Task, golangci-lint and shfmt pins equal the versions that
+// tools/go.mod builds into .bin/, and the goreleaser pin the version that tools/goreleaser/go.mod builds. Wails
+// (docs/m2/06-windows-release.md §3): tools/wails3/go.mod requires github.com/wailsapp/wails/v3, at go.mod's version
+// once go.mod requires it; @wailsio/runtime in web/package.json and web/package-lock.json is then exactly that version
+// without the "v", never a range or a tag. While go.mod does not require Wails, only the CLI's pin is checked (with a
+// note), and web/package.json must not list the runtime.
 //
 // keys: the allowed-signers block embedded in deploy/install.sh equals deploy/keys/allowed_signers byte for byte.
 // Once that file is non-empty, it holds at least one key, the "## Release signing keys" section of README.md lists
@@ -53,7 +57,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	)
 	switch fs.Arg(0) {
 	case "pins":
-		err = checkPins(*root)
+		note, err = checkPins(*root)
 	case "keys":
 		note, err = checkKeys(*root)
 	default:
