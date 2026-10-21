@@ -2084,7 +2084,7 @@ agree; a unit test reads both.
   | Preset | Host | Generator, config | What |
   |---|---|---|---|
   | `win-x64-release` | Windows | Ninja, RelWithDebInfo | the shipped DLL and PDB; `IM_TEST_HOOKS=OFF`; no `VCPKG_MANIFEST_FEATURES` (libopus and speexdsp only) |
-  | `win-x64-debug` | Windows | Ninja, Debug | development |
+  | `win-x64-debug` | Windows | Ninja, Debug | development; `IM_TEST_HOOKS=OFF`, `IM_BUILD_TESTS=ON`, feature `tests` |
   | `win-x64-ci` | Windows | Ninja, RelWithDebInfo | `IM_TEST_HOOKS=ON`, `IM_BUILD_TESTS=ON`, vcpkg feature `tests`: the DLL CI tests and Go's Windows tests load |
   | `win-x64-asan` | Windows | Ninja, Debug, `/fsanitize=address` | owner's PC and the nightly; `IM_TEST_HOOKS=ON` (it runs `win-x64-ci`'s tests), `IM_BUILD_TESTS=ON`, feature `tests`; without `/guard:cf` and `/RTC1`, linked with `/INCREMENTAL:NO` (WA03's conservative choice for `/fsanitize=address`, unverified until WA11 or the nightly runs it) |
   | `host-debug` | macOS, Linux | Ninja, Debug, clang or gcc | `common/` and its tests only; feature `tests` |
@@ -2100,13 +2100,16 @@ agree; a unit test reads both.
   (BSD-3-Clause, 05's resampler), both static (`x64-windows-static`: static libs, static CRT) and linked into
   `isshoni-media.dll`; feature `tests` adds `gtest` (BSD-3-Clause, never shipped). `win-x64-release` sets no
   `VCPKG_MANIFEST_FEATURES`, so its port set is exactly libopus and speexdsp (06's port-set gate, 06 §9.3);
-  `win-x64-ci`, `win-x64-asan` and the host presets add `tests`. `builtin-baseline` pins a vcpkg commit (set in E1).
-  Elsewhere the default host triplet. `native/vcpkg-configuration.json` declares no `default-registry`, which would
-  override `builtin-baseline`: it has the schema and empty `registries`, `overlay-ports` and `overlay-triplets` only.
+  `win-x64-debug`, `win-x64-ci`, `win-x64-asan` and the host presets add `tests`. `builtin-baseline` pins a vcpkg
+  commit (set in E1). Elsewhere the default host triplet. `native/vcpkg-configuration.json` declares no
+  `default-registry`, which would override `builtin-baseline`: it has the schema and empty `registries`,
+  `overlay-ports` and `overlay-triplets` only.
 - **MSVC flags**: `/std:c++20 /W4 /WX /permissive- /utf-8 /EHsc /Zc:__cplusplus /Zc:preprocessor /sdl /guard:cf /Zi
-  /Gy /Gw`, `/MT` (Release) or `/MTd` (Debug); defines `WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE
-  _WIN32_WINNT=0x0A00 WINVER=0x0A00 IM_BUILDING_DLL`. Linker: `/DEBUG:FULL /OPT:REF /OPT:ICF /guard:cf /CETCOMPAT
-  /DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT /DEF:isshoni-media.def`, output `isshoni-media.dll` and `isshoni-media.pdb`.
+  /Gy /Gw /FS` (`/FS`: Ninja's parallel compiles share a PDB), `/MT` (Release) or `/MTd` (Debug); defines
+  `WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _WIN32_WINNT=0x0A00 WINVER=0x0A00 IM_BUILDING_DLL`. Linker:
+  `/DEBUG:FULL`, `/OPT:REF /OPT:ICF` (not in Debug), `/guard:cf /CETCOMPAT /DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT
+  /DEF:isshoni-media.def`, output `isshoni-media.dll` and `isshoni-media.pdb`. `/guard:cf` (compiler and linker)
+  only when `IM_SANITIZE` is empty (see `win-x64-asan`).
   Libraries: `d3d11 dxgi dxguid user32 ole32 oleaut32 windowsapp dwmapi shcore synchronization delayimp`, plus 05's
   audio libraries. **Delay-loaded**: `mfplat.dll` (absent on N editions; the probe checks it with
   `__HrLoadAllImportsForDll` before any call) and `avrt.dll`. Any new system DLL import goes onto 06's

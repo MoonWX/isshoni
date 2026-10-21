@@ -1827,7 +1827,8 @@ The component the client core owns, capture → last packet sent, is measured on
   white, black half, grey): the guards' black halves give each copy's scale, and the guards' ends place every cell to
   a fraction of a pixel, so every scale in the range decodes, not only steps of 0.05 (whose far cells would be off by
   almost a cell at, say, 0.43). Then it reads both strips in each screenshot, follows the copy when the viewer moves
-  (`copyMoves`), and records `Δ = v_clock − v_copy` (mod 65536) per screenshot.
+  (`copyMoves`: a move counts only when an edge shifts by more than half a cell), and records `Δ = v_clock − v_copy`
+  (mod 65536) per screenshot.
 - **A strip caught mid-transition** has cells between two frames. With millisecond values a 17 ms step changes
   several Gray bits, so reading those cells either way could be off by up to 31 ms; the decoder takes the closest
   complementary resolution of the ambiguous cells and its midpoint, which is within **half a frame** (checked
@@ -1851,7 +1852,9 @@ The component the client core owns, capture → last packet sent, is measured on
   machine or path. Exit 0 when p95 < 200 ms with ≥ 90 % of screenshots decoded, 1 when the latency fails, 2 when too
   few decoded or the run was interrupted (inconclusive, S1's convention); there are only these three codes, so a usage
   error or a measurement that couldn't run (not on Windows, no clock or copy on the screen) is 2 too. Every run
-  computes this, and only the `gate` run decides the criterion.
+  computes this, and only the `gate` run decides the criterion. `-o` is written through a temporary file next to it,
+  created before the calibration (an unwritable path fails at once), and replaces `-o` only when a whole result has
+  been written; an earlier file is never truncated by a failed run.
 - The decoder tests' recorded fixtures are headless-Chrome renders of the real clock page (`?freeze=`): Chrome
   scales the viewer copy, and a JPEG round trip stands in for codec artefacts. They are not Windows GDI screenshots,
   which only the owner's-PC run gives; re-recording them is reproducible byte for byte (`G2G_CHROME=<chrome> go -C

@@ -339,11 +339,14 @@ manifest). No third-party action. The same command rebuilds the DLLs from an unp
    come from the VS instance ("C++ CMake tools for Windows"), else from `PATH`.
 2. **Sources**: each `pins.json` tarball into `WORKDIR/src/`, downloaded with MSYS2's `curl` (3 retries) unless
    already there or in the source archive's `src/`, and checked against its SHA-256 either way.
-3. **libvpl**: `cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+3. **libvpl**: `cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DCMAKE_POLICY_DEFAULT_CMP0091=NEW
    -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DUSE_MSVC_STATIC_RUNTIME=ON -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF
-   -DINSTALL_EXAMPLES=OFF`, build, install into `WORKDIR/prefix` (gives `vpl.lib` and `vpl.pc`). `vpl.pc` gets
-   `Libs.private: -ladvapi32 -lole32`: libvpl names the static dispatcher's system libraries for MinGW only, and
-   without them configure's libvpl check can't link under MSVC.
+   -DINSTALL_EXAMPLES=OFF`, build, install into `WORKDIR/prefix` (gives `vpl.lib` and `vpl.pc`). libvpl sets CMP0091
+   inside `if(MSVC)` before `project()` defines `MSVC`, so without the policy default CMake ignores the runtime
+   setting and compiles with `/MD`. After the install, `dumpbin -directives vpl.lib` must name `LIBCMT` and no
+   `MSVCRT`/`msvcprt` (D7), or the build fails. `vpl.pc` gets `Libs.private: -ladvapi32 -lole32`: libvpl names the
+   static dispatcher's system libraries for MinGW only, and without them configure's libvpl check can't link under
+   MSVC.
 4. **Headers**: nv-codec-headers with `make PREFIX=… install` (headers and `ffnvcodec.pc`, whose `prefix=` is made
    relative, §4.2). The AMF headers tarball has `AMF/` at its top (not `amf/public/include`); it is copied to
    `prefix/include/AMF`.
@@ -364,11 +367,11 @@ Time: about 10 minutes on a hosted runner, most of it `configure` under MSYS2.
 
 ### 4.4 Checks (gating, in `ffmpeg.yml` and again in every consumer job)
 
-- `native/ffmpeg/ffcheck.c` (ASCII only, compiled with `cl -MT` against the build) loads both DLLs and writes
-  `ffmpeg-config.json`: `avcodec_version()`, `avutil_version()` (major, minor and micro), `avcodec_configuration()`,
-  `avcodec_license()`, `avutil_license()`, the names of the encoders and decoders `av_codec_iterate` returns, `ok`
-  and `problems` (each failed check, also on stderr). Exit 0 when every check passes, 1 when one fails, 2 on a usage
-  or I/O error.
+- `native/ffmpeg/ffcheck.c` (ASCII only, compiled with `cl -MT -W4 -WX`, the FFmpeg headers as `-external:I` at
+  `-external:W0`, against the build) loads both DLLs and writes `ffmpeg-config.json`: `avcodec_version()`,
+  `avutil_version()` (major, minor and micro), `avcodec_configuration()`, `avcodec_license()`, `avutil_license()`,
+  the names of the encoders and decoders `av_codec_iterate` returns, `ok` and `problems` (each failed check, also on
+  stderr). Exit 0 when every check passes, 1 when one fails, 2 on a usage or I/O error.
 - Fails unless: `avcodec_license()` and `avutil_license()` are `"LGPL version 2.1 or later"`; the configuration
   contains none of `--enable-gpl`, `--enable-nonfree`, `--enable-version3`; the encoder list is exactly `h264_amf`,
   `h264_mf`, `h264_nvenc`, `h264_qsv`, and there is no decoder; each DLL's major equals its header's
