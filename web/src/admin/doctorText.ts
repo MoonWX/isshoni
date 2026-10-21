@@ -712,7 +712,14 @@ const FIXES: Readonly<Record<string, FixRule>> = {
     ),
   ],
 
-  'public_ip.fix_set': ({ e, t }, key) => {
+  'public_ip.fix_set': ({ p, e, t }, key) => {
+    if (p.has('unreachable')) {
+      // The address was given, so a network that came up late is no cause, and a domain alone doesn't replace it
+      // (messages_en.go fixPublicIPSet, README F21).
+      if (inContainer(e)) return [step(t, key, { context: 'unreachableContainer' }, 'docker compose up -d')];
+      const restart = restartCommand(e);
+      return [step(t, key, { context: restart !== '' ? 'unreachable' : 'unreachablePlain' }, restart)];
+    }
     if (inContainer(e)) {
       return [
         step(t, key, { context: 'container' }, 'docker compose up -d'),
