@@ -28,6 +28,11 @@ type Options struct {
 	// SkipBitrate skips check 5 with a message, for an engine whose bitrate does not follow its target: the fake
 	// engine in Decodable mode (01 §6.4).
 	SkipBitrate bool
+	// FirstPacket is check 2's bound on each video layer's first packet after Start (check 8 allows twice it after
+	// the listed source starts again); 0 is 01 §5.3's 500 ms. Only the fake's own test raises it, for coverage
+	// builds: its Decodable mode makes every frame in Go, and coverage counters (atomic ones under -race) slow that
+	// by an order of magnitude.
+	FirstPacket time.Duration
 }
 
 // The bounds of 01 §5.3, §6.4 and §13.
@@ -376,9 +381,10 @@ func (r *run) checkStart(t *testing.T) {
 		Layers: layers(), Audio: r.audio(), Borderless: r.borderless,
 	}
 	r.start(t)
+	bound := r.firstPacketBound()
 	first := map[string]rec{}
 	events := map[string]int{} // EventLayers before the layer's first packet
-	r.until(t, 2*time.Second, func(rc rec) bool {
+	r.until(t, 4*bound, func(rc rec) bool {
 		p := rc.pkt
 		switch {
 		case p.Kind == media.KindEvent && p.Event.Code == media.EventLayer:
@@ -395,11 +401,11 @@ func (r *run) checkStart(t *testing.T) {
 	for _, l := range r.cfg.Layers {
 		rc, ok := first[l.RID]
 		if !ok {
-			t.Errorf("layer %q: no packet within 2 s of Start", l.RID)
+			t.Errorf("layer %q: no packet within %v of Start", l.RID, 4*bound)
 			continue
 		}
-		if d := rc.at.Sub(r.started); d > firstPacketBound {
-			t.Errorf("layer %q: first packet %v after Start, want ≤ %v", l.RID, d, firstPacketBound)
+		if d := rc.at.Sub(r.started); d > bound {
+			t.Errorf("layer %q: first packet %v after Start, want ≤ %v", l.RID, d, bound)
 		}
 		if !rc.pkt.Keyframe || !rc.pkt.Reinit {
 			t.Errorf("layer %q: first packet has Keyframe %v and Reinit %v, want both", l.RID, rc.pkt.Keyframe,
@@ -772,9 +778,17 @@ wait:
 		return
 	}
 	r.start(t)
-	if !r.until(t, 2*firstPacketBound, func(rc rec) bool { return rc.pkt.Kind == media.KindVideo }) {
-		t.Errorf("the listed source started again, but no video came within %v", 2*firstPacketBound)
+	if !r.until(t, 2*r.firstPacketBound(), func(rc rec) bool { return rc.pkt.Kind == media.KindVideo }) {
+		t.Errorf("the listed source started again, but no video came within %v", 2*r.firstPacketBound())
 	}
+}
+
+// firstPacketBound is Options.FirstPacket, or 01 §5.3's bound when it is 0.
+func (r *run) firstPacketBound() time.Duration {
+	if r.o.FirstPacket > 0 {
+		return r.o.FirstPacket
+	}
+	return firstPacketBound
 }
 
 // hasStartCode reports whether b starts with an Annex B start code (00 00 01 or 00 00 00 01).

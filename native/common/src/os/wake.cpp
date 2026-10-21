@@ -59,9 +59,10 @@ bool FallbackWaitWord(const std::atomic<uint32_t> &word, uint32_t expected, uint
 
 void FallbackWakeWordAll(const std::atomic<uint32_t> &word) noexcept {
   Bucket &b = BucketFor(&word);
-  {
-    std::lock_guard<std::mutex> lock(b.mu);
-  }
+  // Taking the mutex and releasing it before the notify (no bare block: clang-format 17 and 18 lay one out
+  // differently) is what orders this wake after a waiter's check (see Bucket).
+  std::unique_lock<std::mutex> lock(b.mu);
+  lock.unlock();
   b.cv.notify_all();
 }
 

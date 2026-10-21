@@ -1597,7 +1597,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/vcpkg-cache
-          key: vcpkg-host-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg.outputs.image }}-${{ hashFiles('native/vcpkg.json', 'native/vcpkg-configuration.json') }}
+          key: vcpkg-host-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg.outputs.image }}-${{ hashFiles('native/vcpkg.json', 'native/vcpkg-configuration.json', 'native/triplets/*.cmake') }}
 
       - name: task lint:native (clang-format 18)
         if: runner.os == 'Linux'
@@ -1696,11 +1696,12 @@ jobs:
           "cache=$cache" >> $env:GITHUB_OUTPUT
 
       - name: Cache vcpkg's binary packages
-        # M2 06 §5.1: keyed on the manifest, the triplet and the toolset build, no restore keys.
+        # M2 06 §5.1: keyed on the manifest, the triplet (native/triplets/ pins its toolset) and the toolset
+        # build, no restore keys.
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.vcpkg.outputs.cache }}
-          key: vcpkg-x64-windows-static-${{ steps.msvc.outputs.toolset }}-${{ hashFiles('native/vcpkg.json', 'native/vcpkg-configuration.json') }}
+          key: vcpkg-x64-windows-static-${{ steps.msvc.outputs.toolset }}-${{ hashFiles('native/vcpkg.json', 'native/vcpkg-configuration.json', 'native/triplets/*.cmake') }}
 
       - name: CMake and Ninja
         id: tools

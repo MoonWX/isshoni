@@ -50,6 +50,17 @@ var (
 	webPackageLock = filepath.Join("web", "package-lock.json")
 )
 
+// The MSVC toolset (docs/m2/06-windows-release.md §3): deploy/windows/tools.json's "msvc".toolset is the one
+// deploy/windows/msvc-env.ps1 sets up for the project's own build, and the overlay triplet native/triplets/
+// x64-windows-static.cmake gives vcpkg the same one (VCPKG_PLATFORM_TOOLSET_VERSION) for the ports it builds; a port
+// built with a newer toolset than the project's fails to link into it.
+var (
+	windowsToolsJSON = filepath.Join("deploy", "windows", "tools.json")
+	vcpkgTriplet     = filepath.Join("native", "triplets", "x64-windows-static.cmake")
+)
+
+var tripletToolset = regexp.MustCompile(`(?m)^[ \t]*set\(VCPKG_PLATFORM_TOOLSET_VERSION[ \t]+"?([0-9]+\.[0-9]+)"?[ \t]*\)`)
+
 // exactVersion is a plain SemVer 2.0.0 version, the only form of a dependency in package.json that names one version
 // (npm install --save-exact writes it). Ranges (^, ~, >=, x, *, ||), tags (latest), "v" or "=" prefixes, URLs and
 // npm: aliases do not match.
@@ -135,10 +146,16 @@ func checkPins(root string) (note string, err error) {
 		return "", err
 	}
 	problems = append(problems, wailsProblems...)
+	toolsetProblems, err := checkMSVCToolset(root)
+	if err != nil {
+		return "", err
+	}
+	problems = append(problems, toolsetProblems...)
 	if len(problems) > 0 {
 		return "", fmt.Errorf("the pins differ:\n  - %s\nChange .tool-versions, go.mod, tools/go.mod, tools/goreleaser/go.mod and "+
 			"tools/wails3/go.mod together; Wails moves in go.mod, tools/wails3/go.mod, web/package.json and "+
-			"web/package-lock.json at once (docs/m2/06-windows-release.md §3)", strings.Join(problems, "\n  - "))
+			"web/package-lock.json at once, and the MSVC toolset in deploy/windows/tools.json and "+
+			"native/triplets/x64-windows-static.cmake (docs/m2/06-windows-release.md §3)", strings.Join(problems, "\n  - "))
 	}
 	return note, nil
 }
@@ -312,6 +329,48 @@ func checkRuntimeLock(path, want, lib string) ([]string, error) {
 		}
 	}
 	return problems, nil
+}
+
+// checkMSVCToolset returns the differences between deploy/windows/tools.json's MSVC toolset and the overlay
+// triplet's (see vcpkgTriplet). A tree without tools.json (before the Windows app) is not checked; once it exists, the
+// triplet must exist and set VCPKG_PLATFORM_TOOLSET_VERSION to the same major.minor. It fails only when tools.json
+// can't be read or parsed.
+func checkMSVCToolset(root string) ([]string, error) {
+	data, err := os.ReadFile(filepath.Join(root, windowsToolsJSON))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+	var tools struct {
+		MSVC struct {
+			Toolset string `json:"toolset"`
+		} `json:"msvc"`
+	}
+	if err := json.Unmarshal(data, &tools); err != nil {
+		return nil, fmt.Errorf("%s: %w", filepath.ToSlash(windowsToolsJSON), err)
+	}
+	want := tools.MSVC.Toolset
+	if want == "" {
+		return []string{"deploy/windows/tools.json has no \"msvc\".toolset"}, nil
+	}
+	triplet, err := os.ReadFile(filepath.Join(root, vcpkgTriplet))
+	if errors.Is(err, os.ErrNotExist) {
+		return []string{fmt.Sprintf("native/triplets/x64-windows-static.cmake does not exist; it must set "+
+			"VCPKG_PLATFORM_TOOLSET_VERSION %s (deploy/windows/tools.json's MSVC toolset)", want)}, nil
+	} else if err != nil {
+		return nil, err
+	}
+	m := tripletToolset.FindSubmatch(triplet)
+	switch {
+	case m == nil:
+		return []string{fmt.Sprintf("native/triplets/x64-windows-static.cmake does not set VCPKG_PLATFORM_TOOLSET_VERSION; "+
+			"want %s (deploy/windows/tools.json's MSVC toolset)", want)}, nil
+	case string(m[1]) != want:
+		return []string{fmt.Sprintf("native/triplets/x64-windows-static.cmake sets VCPKG_PLATFORM_TOOLSET_VERSION %s but "+
+			"deploy/windows/tools.json's MSVC toolset is %s", m[1], want)}, nil
+	}
+	return nil, nil
 }
 
 // readToolVersions parses an asdf/mise .tool-versions file into tool name → first listed version.

@@ -9,7 +9,8 @@
 // (docs/m2/06-windows-release.md §3): tools/wails3/go.mod requires github.com/wailsapp/wails/v3, at go.mod's version
 // once go.mod requires it; @wailsio/runtime in web/package.json and web/package-lock.json is then exactly that version
 // without the "v", never a range or a tag. While go.mod does not require Wails, only the CLI's pin is checked (with a
-// note), and web/package.json must not list the runtime.
+// note), and web/package.json must not list the runtime. Once deploy/windows/tools.json exists, its MSVC toolset equals
+// the VCPKG_PLATFORM_TOOLSET_VERSION of the overlay triplet native/triplets/x64-windows-static.cmake.
 //
 // keys: the allowed-signers block embedded in deploy/install.sh equals deploy/keys/allowed_signers byte for byte.
 // Once that file is non-empty, it holds at least one key, the "## Release signing keys" section of README.md lists
