@@ -21,20 +21,15 @@ func repoRoot(t *testing.T) string {
 
 // TestCommittedPins checks native/ffmpeg/pins.json: its schema (known fields, the URL each entry must come from,
 // lower-case SHA-256s) and the one-line-per-entry layout that native/ffmpeg/build.sh reads without a JSON parser.
+// The versions it pins are not checked here, so a security bump (06 §4.7) changes only pins.json and lock.json;
+// TestCommittedLock checks that a current lock names the same revision and tag.
 func TestCommittedPins(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join(repoRoot(t), pinsPath))
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := parsePins(data)
-	if err != nil {
+	if _, err := parsePins(data); err != nil {
 		t.Fatal(err)
-	}
-	if p.FFmpeg.Version != "9.0.2" || p.Revision < 1 {
-		t.Errorf("pins.json pins FFmpeg %s revision %d; the M2 plan pins 9.0.2", p.FFmpeg.Version, p.Revision)
-	}
-	if got, want := p.Tag(), "deps-ffmpeg-9.0.2-r"; !strings.HasPrefix(got, want) {
-		t.Errorf("Tag() = %q, want %q<revision>", got, want)
 	}
 }
 
@@ -147,10 +142,61 @@ func TestInputsSHA256MatchesBuildScript(t *testing.T) {
 	}
 }
 
+// TestHeaderNotices runs build.sh's header_notices, which writes the license files of nv-codec-headers and the AMF
+// headers, under the script's own shell options (sourcing it applies set -Eeuo pipefail) over headers larger than a
+// pipe buffer, as nvEncodeAPI.h (291 KB) is: a /* */ notice with CRLF line ends and a // notice.
+func TestHeaderNotices(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("no bash")
+	}
+	dir := t.TempDir()
+	body := strings.Repeat("#define ISSHONI_TEST_PADDING_VALUE_OF_A_LONG_HEADER 0x0123456789abcdef\n", 2200) // > 128 KiB
+	block := strings.ReplaceAll("/*\n * Copyright (c) 2026 Block Notice Inc.\n *\n * Permission is hereby granted.\n */\n"+body, "\n", "\r\n")
+	slashes := "// Copyright (c) 2026 Slash Notice Inc.\n//\n// Permission is hereby granted.\n" + body
+	writeFile(t, filepath.Join(dir, "a", "block.h"), block)
+	writeFile(t, filepath.Join(dir, "a", "block2.h"), block)
+	writeFile(t, filepath.Join(dir, "slashes.h"), slashes)
+	if len(block) <= 128<<10 || len(slashes) <= 128<<10 {
+		t.Fatalf("headers of %d and %d bytes, want more than 128 KiB", len(block), len(slashes))
+	}
+
+	run := func() (string, string, error) {
+		cmd := exec.CommandContext(t.Context(), bash, "-c", `. native/ffmpeg/build.sh && header_notices "$1" "$2"`,
+			"bash", dir, "Test headers: MIT.")
+		cmd.Dir = repoRoot(t)
+		var stderr strings.Builder
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
+		return string(out), stderr.String(), err
+	}
+	out, stderr, err := run()
+	if err != nil {
+		t.Fatalf("header_notices: %v; stderr %q", err, stderr)
+	}
+	for _, want := range []string{
+		"Test headers: MIT.\n",
+		"Files:\n  a/block.h\n  a/block2.h\n\nCopyright (c) 2026 Block Notice Inc.\n\nPermission is hereby granted.\n",
+		"Files:\n  slashes.h\n\nCopyright (c) 2026 Slash Notice Inc.\n\nPermission is hereby granted.\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the output lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "\r") || strings.Contains(out, "ISSHONI_TEST_PADDING") {
+		t.Errorf("the output has a CR or text after the notice:\n%s", out)
+	}
+
+	// A header without a notice fails the build.
+	writeFile(t, filepath.Join(dir, "bare.h"), body)
+	if _, stderr, err = run(); err == nil || !strings.Contains(stderr, "bare.h has no license notice") {
+		t.Errorf("a header without a notice: %v, stderr %q", err, stderr)
+	}
+}
+
 func TestFFmpegInputsCommand(t *testing.T) {
 	root := t.TempDir()
-	copyTree(t, filepath.Join(repoRoot(t), "native", "ffmpeg"), filepath.Join(root, "native", "ffmpeg"),
-		"pins.json", "build.sh", "ffcheck.c")
+	writeFFmpegInputs(t, root)
 	want, err := inputsSHA256(root)
 	if err != nil {
 		t.Fatal(err)
@@ -311,7 +357,7 @@ func TestCheckFFmpegConfig(t *testing.T) {
 	}
 }
 
-// sampleLock is a lock.json for goodPins (and the committed pins), with inputsSha256 set to inputs.
+// sampleLock is a lock.json for goodPins, with inputsSha256 set to inputs.
 func sampleLock(inputs string) string {
 	return `{
   "revision": 1,
@@ -328,6 +374,15 @@ func sampleLock(inputs string) string {
   "commit": "0123456789abcdef0123456789abcdef01234567"
 }
 `
+}
+
+// writeFFmpegInputs writes the inputs of inputsSha256 under root: goodPins as pins.json (not the committed pins, so
+// a bump of pins.json needs no test change) and the committed build.sh and ffcheck.c.
+func writeFFmpegInputs(t *testing.T, root string) {
+	t.Helper()
+	writeFile(t, filepath.Join(root, pinsPath), goodPins)
+	copyTree(t, filepath.Join(repoRoot(t), "native", "ffmpeg"), filepath.Join(root, "native", "ffmpeg"),
+		"build.sh", "ffcheck.c")
 }
 
 // copyTree copies the named files of src into dst.

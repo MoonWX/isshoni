@@ -83,13 +83,12 @@ func hexSHA256(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// newFetchFixture writes the repository (the committed native/ffmpeg files and a lock.json for zipData) and starts
-// the server.
+// newFetchFixture writes the repository (native/ffmpeg's inputs with goodPins, and a lock.json for zipData) and
+// starts the server.
 func newFetchFixture(t *testing.T, zipData []byte) *fetchFixture {
 	t.Helper()
 	f := &fetchFixture{root: t.TempDir(), zip: zipData, source: []byte("source tar")}
-	copyTree(t, filepath.Join(repoRoot(t), "native", "ffmpeg"), filepath.Join(f.root, "native", "ffmpeg"),
-		"pins.json", "build.sh", "ffcheck.c")
+	writeFFmpegInputs(t, f.root)
 	inputs, err := inputsSHA256(f.root)
 	if err != nil {
 		t.Fatal(err)

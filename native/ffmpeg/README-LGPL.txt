@@ -4,9 +4,10 @@ FFmpeg in isshoni
 The isshoni Windows app uses two libraries of FFmpeg @FFMPEG_VERSION@, libavcodec and libavutil, as the DLLs
 @AVCODEC_DLL@ (libavcodec @AVCODEC_VERSION@) and @AVUTIL_DLL@ (libavutil @AVUTIL_VERSION@) in its install folder.
 FFmpeg is free software under the GNU Lesser General Public License, version 2.1 or (at your option) any later
-version (LGPL-2.1-or-later): see COPYING.LGPLv2.1 and LICENSE.md in this folder. isshoni itself is under the Apache
-License 2.0 and links these DLLs dynamically. The DLLs are built from unmodified FFmpeg source and are not signed by
-the isshoni project.
+version (LGPL-2.1-or-later). The license text and FFmpeg's LICENSE.md are in this folder: COPYING.LGPLv2.1 (named
+COPYING.LGPLv2.1.txt in an isshoni installation) and LICENSE.md. isshoni itself is under the Apache License 2.0 and
+links these DLLs dynamically. The DLLs are built from unmodified FFmpeg source and are not signed by the isshoni
+project.
 
 
 How they were built

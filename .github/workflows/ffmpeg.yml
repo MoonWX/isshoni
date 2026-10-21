@@ -17,13 +17,17 @@
 # - rebuild: the same steps on a second runner, so a pull request shows whether a second build is byte-identical.
 # - report (ubuntu-24.04): build.sh's inputsSha256 equals `desktoppkg ffmpeg-inputs`'s; the DLLs against rebuild's and
 #   against lock.json's (06 §4.6). With the same toolset build a difference fails the run (FFMPEG_REPRO: strict); with
-#   another toolset build it is a warning, since the shipped bytes stay the locked ones. lock.json absent or stale (a
-#   pins.json, build.sh or ffcheck.c change) is a note: publishing after the merge fixes it.
+#   another toolset build it is a warning, since the shipped bytes stay the locked ones. The DLLs are compared with
+#   lock.json's whenever its inputsSha256 is the one build hashed (in the weekly run, too, while a pins bump waits for
+#   its publishing run). lock.json absent or stale (a pins.json, build.sh or ffcheck.c change) is a note: publishing
+#   after the merge fixes it.
 # - publish (ubuntu-24.04, contents: write, id-token: write, attestations: write; runs no build code): only a manual
 #   run with publish on, from any ref. It refuses when the tag exists (raise "revision" in pins.json instead), checks
 #   the artifact against build's SHA-256s, attests both files, creates deps-ffmpeg-<ver>-r<rev> as a prerelease that
 #   is never "latest" (the server's release check, the site and the updater ignore non-SemVer tags), and prints the
-#   native/ffmpeg/lock.json to commit (06 §4.5, §14 item 2).
+#   native/ffmpeg/lock.json to commit (06 §4.5, §14 item 2). GitHub offers "Run workflow" only for a workflow file
+#   on the default branch: the first publish waits until this file reaches main (the end of group 1), then runs
+#   with "Use workflow from" set to the branch to publish from, and its lock.json is committed before WA24.
 #
 # Rules for every workflow (M1 06 §8.1): a read-only token by default, with jobs raising their own permissions;
 # third-party actions pinned by full commit SHA with a version comment; checkout without persisted credentials;
@@ -283,13 +287,17 @@ jobs:
           lock=native/ffmpeg/lock.json
           lock_state=absent
           if [ -f "$lock" ]; then
-            if check=$(go -C tools run ./desktoppkg ffmpeg-inputs -check 2>&1); then
-              lock_state=current
-            elif grep -q 'lock.json is stale' <<<"$check"; then
-              lock_state=stale
-            else
+            # This commit's lock.json must parse and agree with its pins.json; being stale is no error here.
+            if ! check=$(go -C tools run ./desktoppkg ffmpeg-inputs -check 2>&1) && ! grep -q 'lock.json is stale' <<<"$check"; then
               echo "::error::$check"
               exit 1
+            fi
+            # It describes this build when it locks the inputs build hashed: this commit's on a pull request or push,
+            # those of lock.json's commit in the weekly run, also while a pins bump waits for its publishing run.
+            if [ "$(jq -r .inputsSha256 "$lock")" = "$INPUTS" ]; then
+              lock_state=current
+            else
+              lock_state=stale
             fi
           fi
 

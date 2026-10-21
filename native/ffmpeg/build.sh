@@ -127,9 +127,11 @@ inputs_sha256() {
 }
 
 # leading_comment FILE prints the comment a header starts with (its license notice), without comment markers,
-# trailing blanks and empty first and last lines.
+# trailing blanks and empty first and last lines. awk reads the file itself: it stops after the comment, and a
+# command piping a large header into it would die of SIGPIPE, which pipefail turns into a failed build.
 leading_comment() {
-  tr -d '\r' <"$1" | awk '
+  awk '
+		{ sub(/\r$/, "") }
 		NR == 1 && /^[[:space:]]*\/\*/ { block = 1 }
 		NR == 1 && /^[[:space:]]*\/\// { slashes = 1 }
 		block {
@@ -149,7 +151,7 @@ leading_comment() {
 			first = 1; while (first <= n && lines[first] == "") first++
 			while (n >= first && lines[n] == "") n--
 			for (i = first; i <= n; i++) print lines[i]
-		}'
+		}' "$1"
 }
 
 # header_notices DIR TITLE writes the license notices of a header-only package that ships no license file
@@ -548,9 +550,11 @@ main() {
     AVUTIL_VERSION="$avutil_version" MSVC_TOOLSET="$toolset" CONFIGURATION="$configuration" \
     >"$dist/licenses/ffmpeg/README-LGPL.txt"
 
+  # The versions of the MSYS2 packages that are installed; one that is not (a PC whose pkg-config comes from another
+  # package) is left out rather than failing the build here, after the checks.
   local msys_pkgs=''
   if command -v pacman >/dev/null; then
-    msys_pkgs=$(pacman -Q make pkgconf diffutils zip tar 2>/dev/null |
+    msys_pkgs=$({ pacman -Q make pkgconf diffutils zip tar 2>/dev/null || true; } |
       awk '{printf "%s\"%s\": \"%s\"", sep, $1, $2; sep = ", "}')
   fi
   local cmake_version

@@ -19,8 +19,19 @@ deploy/windows/tools.json ({"vs": "[17.0,19.0)", "toolset": "14.44", "windowsSdk
    (VCToolsVersion) and the SDK (WindowsSDKVersion). The same values go to GITHUB_OUTPUT (vs-name, vs-version,
    toolset, windows-sdk) and to MSVC_ENV_VS_NAME and MSVC_ENV_VS_VERSION, for the build manifests.
 
-Run it (don't dot-source it). In a PowerShell window it sets up that window. With a command after the options it
-runs that command in the environment and exits with its exit code.
+Usage (run it, don't dot-source it):
+
+    msvc-env.ps1 [-Toolset <minor>] [-WindowsSdk <version>] [-ToolsJson <path>] [--] [<program> [<argument>...]]
+
+    -Toolset     use this MSVC toolset (an exact minor, such as 14.44) instead of tools.json's
+    -WindowsSdk  use this Windows SDK (such as 10.0.26100.0) instead of tools.json's
+    -ToolsJson   read the pins from this file instead of tools.json next to this script
+
+Without a program it sets up the PowerShell window it runs in. With one it runs the program in the environment and
+exits with its exit code. Options are read only before the program (or up to "--"): every argument after the program
+reaches it as given, its own options (build.sh -w, sh -c, cmake -D) included. PowerShell's -File itself passes an
+argument of the form -name:value as two (-name and value), so give a program such an option without the colon
+(cmake -DX=ON, not -DX:BOOL=ON).
 
 Why the range [17.0,19.0) and not the versioned component as the only selector: GitHub's windows-2025 image has
 Visual Studio 2026 (18.x) and no VS 2022 instance, with 14.44 only as the component
@@ -28,37 +39,53 @@ Microsoft.VisualStudio.Component.VC.14.44.17.14.x86.x64; VS 2022 17.14 ships 14.
 and has no such component. A PC needs VS 2022 17.14 Build Tools ("Desktop development with C++") or VS 2026 Build
 Tools with "MSVC v143 - VS 2022 C++ x64/x86 build tools (v14.44)", plus the Windows 11 SDK 10.0.26100.
 
-Exit status: 0 when the environment is set up (or the command's exit code), 1 when something is missing.
-
-.PARAMETER Toolset
-Use this MSVC toolset (an exact minor, such as 14.44) instead of tools.json's.
-
-.PARAMETER WindowsSdk
-Use this Windows SDK (such as 10.0.26100.0) instead of tools.json's.
-
-.PARAMETER ToolsJson
-Read the pins from this file instead of tools.json next to this script.
-
-.PARAMETER Command
-A program and its arguments to run in the environment.
+Exit status: 0 when the environment is set up, or the program's exit code; 1 when something is missing; 2 for a bad
+command line; 127 when the program cannot be started.
 
 .EXAMPLE
-powershell -NoProfile -File deploy\windows\msvc-env.ps1 C:\msys64\usr\bin\bash.exe native/ffmpeg/build.sh
+powershell -NoProfile -File deploy\windows\msvc-env.ps1 C:\msys64\usr\bin\bash.exe native/ffmpeg/build.sh -j 4
 
 .EXAMPLE
 .\deploy\windows\msvc-env.ps1 -Toolset 14.99
 #>
-[CmdletBinding(PositionalBinding = $false)]
-param(
-    [string]$Toolset = '',
-    [string]$WindowsSdk = '',
-    [string]$ToolsJson = '',
-    [Parameter(ValueFromRemainingArguments = $true)]
-    [string[]]$Command = @()
-)
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
+
+# The command line is read by hand, not by a param block: PowerShell's parameter binder would take the program's own
+# options (build.sh's -w as -WindowsSdk, sh's -c as -Command, by prefix, wherever they stand). Only the leading
+# option pairs and an optional "--" are this script's; the rest is the program and its arguments. [string] keeps a
+# number typed in PowerShell as written (14.50, not 14.5).
+$Toolset = ''
+$WindowsSdk = ''
+$ToolsJson = ''
+$next = 0
+while ($next -lt $args.Count) {
+    $opt = [string]$args[$next]
+    if ($opt -eq '--') {
+        $next++
+        break
+    }
+    if (-not $opt.StartsWith('-')) { break }
+    if ($opt -notin '-Toolset', '-WindowsSdk', '-ToolsJson') {
+        [Console]::Error.WriteLine("msvc-env: unknown option $opt (the options are -Toolset, -WindowsSdk and " +
+            "-ToolsJson; put -- before a program whose name starts with -)")
+        exit 2
+    }
+    if ($next + 1 -ge $args.Count) {
+        [Console]::Error.WriteLine("msvc-env: $opt needs a value")
+        exit 2
+    }
+    $value = [string]$args[$next + 1]
+    switch ($opt) {
+        '-Toolset' { $Toolset = $value }
+        '-WindowsSdk' { $WindowsSdk = $value }
+        default { $ToolsJson = $value }
+    }
+    $next += 2
+}
+$Command = @()
+if ($next -lt $args.Count) { $Command = @(foreach ($a in $args[$next..($args.Count - 1)]) { [string]$a }) }
 
 $VcToolsComponent = 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64'
 
@@ -253,7 +280,15 @@ try {
 if ($Command.Count -gt 0) {
     $program = $Command[0]
     $arguments = @($Command | Select-Object -Skip 1)
-    & $program @arguments
+    # The program's output on stderr is not an error of this script (Windows PowerShell 5.1 turns it into error
+    # records when the output is redirected, which 'Stop' would make fatal); its exit code says how it went.
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $program @arguments
+    } catch {
+        [Console]::Error.WriteLine("msvc-env: cannot run ${program}: $($_.Exception.Message)")
+        exit 127
+    }
     exit $LASTEXITCODE
 }
 exit 0
