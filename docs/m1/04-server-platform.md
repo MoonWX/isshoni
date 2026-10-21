@@ -1438,7 +1438,9 @@ end of `wire.go`, the listeners in `server.go` and `http.go`, the tests in `ops_
   its own read deadline to 3 minutes** before it runs (`doctorRouteDeadline`): a run takes up to 2 minutes (§13.1), and
   the router's 30 s read deadline (§9.3) would end the request's context under it. `wire` calls it right after
   building doctor; since README F22 `wireConnTest` comes just before it (moved there from `wireAccounts`), and both
-  take the flag of `dockerBridgeNAT` for their server objects (§7.7, §11.4).
+  take the flag of `dockerBridgeNAT` for their server objects (§7.7, §11.4). Since README F23 `wire` runs
+  `dockerBridgeNAT` before both on every server, with a site or without, and gives the flag to the status behind the
+  admin socket too (`withDockerBridge`, §12.2), which the dashboard reads.
 - **The dashboard's sources** (§11.4): the status is the admin socket's (`statusSource`, which since S85 also has
   the month's transfer and the release check's result, so doctor's two checks read them); `liveSource` joins 01's
   `Hub.Snapshot()` and 02's `SFU.Snapshot()` on the connection id, and takes each room's current name from 03's
@@ -1883,15 +1885,17 @@ text above leaves a choice:
   server's symmetric NAT pass because the server runs in a container on a bridge network (§13.2, rule (a): the
   check's param `dockerBridge`), and only next to `nat: "symmetric"`; otherwise the key is absent (`omitempty`), so
   the answer of every other server is what it was, and an older SPA ignores the key (01's compatibility rules). The
-  wiring asks doctor rather than judging the bridge a second time (`wire.go`, `dockerBridgeNAT`): once, when it
-  builds the routes, it runs the one check `public_ip` in the environment of doctor's own runs (`doctorEnv`: the
-  config, the server's status with the addresses and the NAT kind that Start detected, the container detection),
-  which sends nothing and only reads the machine: the interface list, the default-route interface's `ifindex` and
-  `iflink` under `/sys`, and the host description that every doctor report carries (kernel release, DMI, systemd,
-  the user name); any NAT kind but `symmetric` is `false` without a run. The result goes to
-  `ops.ConnTestOptions.DockerBridge` and `ops.DashboardOptions.DockerBridge`, and each builder drops it next to any
-  other kind, whatever the wiring says. Like the rest of the server object it
-  is fixed for the process's life. Tests: `TestConnTestServerInfo` (the flag next to `symmetric`, not without it,
+  wiring asks doctor rather than judging the bridge a second time (`wire.go`, `dockerBridgeNAT`): once, in `wire`
+  right after it builds doctor and before the routes (on every server since README F23, with a site or without,
+  because the admin socket's status carries the flag too, §12.2), it runs the one check `public_ip` in the
+  environment of doctor's own runs (`doctorEnv`: the config, the server's status with the addresses and the NAT
+  kind that Start detected, the container detection), which sends nothing and only reads the machine: the interface
+  list, the default-route interface's `ifindex` and `iflink` under `/sys`, and the host description that every
+  doctor report carries (kernel release, DMI, systemd, the user name); any NAT kind but `symmetric` is `false`
+  without a run. The result goes to `ops.ConnTestOptions.DockerBridge` and `ops.DashboardOptions.DockerBridge`, and
+  since README F23 to the admin socket's status (`withDockerBridge`); each drops it next to any other kind, whatever
+  the wiring says. Like the rest of the server object it is fixed for the process's life. Tests:
+  `TestConnTestServerInfo` (the flag next to `symmetric`, not without it,
   dropped next to `cgnat_likely`, and the wire form with and without the key), `TestDockerBridgeNAT` (`internal/server`:
   a bridge with the address seen by STUN or set in the config, and with IPv6 on, against the host's network, a
   network doctor can't tell, no container, 1:1 NAT, `cgnat_likely`, a loopback `public_ip`, no IPv4 address, a
@@ -4271,6 +4275,7 @@ no tokens, SDP, push endpoints or usernames.
 | `internal/server` hardening (README S90) | The reload (§6.5): `TestReloadLogLevel` (the reloaded level becomes the configured one, a level set with `admin log-level --for` stays until it ends and then falls back to the reloaded one, the changed keys are named, a config with errors changes nothing), `TestReloadBeforeStart`, `TestReloadManualCertificate` (new files serve; unusable ones are refused, the old pair serves, `Reload` returns the error) and `TestReloadReadDoesNotHoldUpShutdown` (unix: a FIFO as `tls.cert_file`, the shutdown goes on while the read hangs); `TestExpected503sAreQuiet` (§9.3: a not-ready `/readyz` and the shutdown's 503s are debug lines, every other 5xx keeps its warning); `TestOffModeConnectionLimit` (§7.8: `limits.conns_per_ip` on off mode's `listen.http`, trusted proxies exempt); `TestRedactMessage` and `TestSafeLogger` (§10: the ICE password in a message's text, in the forms Pion and SDP write it, for every logger derived from the server's, attributes kept; a second layer since README F20 redacts in logx's Pion bridge) |
 | `cmd/isshoni` serve (README S90) | `TestServeReloadsOnSIGHUP` (`serve` as a real process: SIGHUP loads the config again from the flags, environment and file, applies `log.level`, names the other changed keys, a broken file changes nothing and names none, and the process never stops for the signal); `TestOnSignals` and `TestOnSignalsStopDoesNotWaitForAHungCall` (a hung reload delays the exit by at most 1 s); `TestRouteStdLog` (the standard log package's lines become JSON records with a level from their prefix and the component `stdlog`, and its settings come back afterwards) and `TestStdLogWriterLimits` (no SDP or candidate, 20 lines a minute) |
 | `ops` and `internal/server`: a Docker bridge's NAT (README F22, §7.7, §11.4) | `TestConnTestServerInfo` and `TestDashboardDockerBridge` (`ops`: `dockerBridge` only next to `symmetric`, dropped next to `cgnat_likely`, absent without the flag, next to 1:1 NAT and for a failed status, the key only where it is true); `TestDockerBridgeNAT` (the wiring's one run of doctor's `public_ip` gives the flag exactly where doctor's own report has the param), `TestDockerBridgeNATCancelled` (no flag from a start whose context ended) and `TestDockerBridgeInServer` (a running server in a container with a fake machine for doctor: on a bridge network doctor, the dashboard and the connection test all carry `dockerBridge`, on the host's network none does); the golden files `ConnTestResponse.docker-bridge.json` and `OpsDashboard.docker-bridge.json`, which 05's `fixText.test.ts` and `dashboardText.test.ts` read too. Only `TestDockerBridgeInServer`, with its fake machine, holds the bridge path of a server in a container: `task docker:smoke` reports `public_ip.none` (its loopback override decides first), and CI's docker-smoke asserts neither the dashboard's nor the connection test's flag (README §6 "Decided after group 16" (4)) |
+| `internal/server` and `cmd/isshoni`: the status's `dockerBridge` (README F23, §3.1, §12.2) | `TestWithDockerBridge` (`internal/server`: the flag only next to `symmetric`, the rest of the status untouched, the source's error passed on) and `TestDockerBridgeInServer` (the admin socket's status has the flag on a bridge network and not on the host's, next to doctor, the dashboard and the connection test); `TestStatusTextNAT` and `TestAdminStatusDockerBridge` (`cmd/isshoni`: the note only for a symmetric NAT with the flag, in doctor's words; a fake server in a bridge, whose doctor run prints the same line under `public_ip`, and the `--json` key next to `nat`) and `admin.txtar` (`fakeserver set nat bridge\|none`); the golden file `ServerStatus.docker-bridge.json`, with `ServerStatus.json` unchanged |
 
 ### Integration (in-process, `servertest`)
 
@@ -4758,5 +4763,6 @@ Decided after group 16 (an engineering call the owner delegated; README §6 "Dec
     `public_ip` lets a bridge's symmetric NAT pass (decision 17), from one run of that check when `wire` builds the
     routes (`dockerBridgeNAT`, in the environment of doctor's own runs, sending nothing), so the three can't
     disagree; the flag is fixed for the process's life, and `ops` keeps it only next to `symmetric`. As group 16
-    merged it, `isshoni admin status` still prints the raw kind, because `api.ServerStatus` has no flag; README
-    F23 (group 17) gives it the same one (§3.1, §12.2).
+    merged it, `isshoni admin status` still printed the raw kind, because `api.ServerStatus` had no flag; README
+    F23 (group 17) gave the status the same one from the same run, which since then runs on every server, with a
+    site or without, before the routes are built (§3.1, §7.7, §12.2).
