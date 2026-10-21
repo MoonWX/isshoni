@@ -39,7 +39,8 @@ var loopbackHosts = map[string]bool{"localhost": true, "127.0.0.1": true, "[::1]
 // slash.
 //
 // Any other scheme, a path other than "/", a query or a fragment (even an empty "?" or "#"), userinfo, a host that
-// isn't a DNS name or IP literal, or a port outside 1–65535 is refused with an error wrapping ErrInvalidOrigin.
+// isn't a DNS name or IP literal, an unspecified (0.0.0.0, ::) or multicast IP literal, or a port outside 1–65535 is
+// refused with an error wrapping ErrInvalidOrigin.
 // 03-desktop-app's address field drops a URL's path, query and fragment itself before it calls this.
 func NormalizeOrigin(raw string, allowInsecureLoopback bool) (string, error) {
 	s := strings.TrimSpace(raw)
@@ -154,6 +155,7 @@ func validPort(p string) bool {
 // canonicalHost returns the one spelling of a host (02 §12.1):
 //   - "[IPv6]": a valid IPv6 address without a zone, compressed and lower case in brackets ("[2001:db8::1]");
 //   - an IPv4 address in dotted decimal, exactly as netip parses it (no leading zeros, four parts);
+//   - neither IP form may be the unspecified address or a multicast one (serverAddr);
 //   - otherwise a DNS name, IDN allowed: idna.Lookup.ToASCII (lower case, UTS #46 mapping, STD3 rules, the bidi
 //     and joiner checks), then labels of 1–63 bytes, at most 253 bytes, no trailing dot, and the result must be its
 //     own ToASCII. A name whose last label is a number ("127.1", "a.0x7f", a fullwidth "１２７.０.０.１") is refused:
@@ -170,11 +172,17 @@ func canonicalHost(h string) (string, string) {
 		if err != nil || !a.Is6() || a.Zone() != "" || !strings.HasSuffix(h, "]") {
 			return "", "not an IPv6 literal"
 		}
+		if !serverAddr(a) {
+			return "", "not a server address"
+		}
 		return "[" + a.String() + "]", ""
 	}
 	if a, err := netip.ParseAddr(h); err == nil {
 		if !a.Is4() {
 			return "", "an IPv6 literal needs brackets"
+		}
+		if !serverAddr(a) {
+			return "", "not a server address"
 		}
 		return a.String(), ""
 	}
@@ -198,6 +206,15 @@ func canonicalHost(h string) (string, string) {
 		return "", "a host name that ends in a number"
 	}
 	return ascii, ""
+}
+
+// serverAddr reports whether an IP literal can name a server: not the unspecified address (0.0.0.0, ::), which
+// macOS and Linux connect to loopback, so "Add server 0.0.0.0?" would point at a local service without reading as
+// "this computer" the way localhost does (browsers block it for the same reason), and not a multicast address. An
+// IPv4-mapped IPv6 address ([::ffff:0.0.0.0]) is judged as the IPv4 address it maps.
+func serverAddr(a netip.Addr) bool {
+	a = a.Unmap()
+	return !a.IsUnspecified() && !a.IsMulticast()
 }
 
 // numericLabel reports whether a label is a number as the WHATWG URL parser's IPv4 rules see it ("ends in a
