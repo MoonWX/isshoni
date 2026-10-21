@@ -1,5 +1,7 @@
 # Keep LF line ends in files that are read byte for byte or run by a POSIX shell, also in a Git for Windows
 # checkout (core.autocrlf=true): shell scripts, and the release key list that `task lint:keys` compares with the
-# block embedded in deploy/install.sh (docs/m1/06-deploy-and-ci.md §4.3, §9.4).
+# block embedded in deploy/install.sh (docs/m1/06-deploy-and-ci.md §4.3, §9.4), and the generated copy of the SFU's
+# H.264 parser, which TestSFUParserCopy compares byte for byte with go/format's output (LF) on the windows-go job too.
 *.sh text eol=lf
 deploy/keys/allowed_signers text eol=lf
+internal/media/fake/sfuh264_copy_test.go text eol=lf
