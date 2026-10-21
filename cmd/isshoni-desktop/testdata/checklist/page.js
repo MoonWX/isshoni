@@ -28,13 +28,15 @@ window.addEventListener('unhandledrejection', (e) => {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// raw sends a /wails/runtime request as runtime.ts builds it (a JSON body), or in the transport's query form.
-async function raw({ object, method, args, query, headers, body }) {
+// raw sends a /wails/runtime request as runtime.ts builds it (a JSON body), or in the transport's query form. simple
+// sends it as a CORS simple request instead (text/plain, no x-wails-client-id), as another origin could without a
+// preflight.
+async function raw({ object, method, args, query, headers, body, simple }) {
   let url = '/wails/runtime';
-  const init = {
-    method: 'POST',
-    headers: { 'x-wails-client-id': 'checklist', 'Content-Type': 'application/json', ...(headers || {}) },
-  };
+  const base = simple
+    ? { 'Content-Type': 'text/plain' }
+    : { 'x-wails-client-id': 'checklist', 'Content-Type': 'application/json' };
+  const init = { method: 'POST', headers: { ...base, ...(headers || {}) } };
   if (query) {
     const q = new URLSearchParams({ object: String(object), method: String(method) });
     if (args !== undefined) q.set('args', JSON.stringify(args));
@@ -160,6 +162,7 @@ async function main() {
     }),
     oversize: await raw({ body: JSON.stringify({ object: 0, method: 0, args: { pad: 'x'.repeat(70000) } }) }),
     unparsable: await raw({ body: 'object=9&method=0' }),
+    simpleCall: await raw({ object: 0, method: 0, args: { ...callArgs, 'call-id': 'checklist-s' }, simple: true }),
   });
 
   // W13: viewer audio plays without a click.

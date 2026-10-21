@@ -2,8 +2,9 @@
 <!--
   isshoni.exe's application manifest (docs/m2/03-desktop-app.md §4.5, 06 §5.2): asInvoker, Per-Monitor V2 DPI
   awareness with Per-Monitor as the fallback, the Windows 10/11 supportedOS GUID, Common Controls v6 (the pill's
-  BUTTON controls), the UTF-8 active code page and long paths. `task desktop:exe:windows` compiles it into the exe's
-  resources with the icon next to it.
+  BUTTON controls), the UTF-8 active code page and long paths. `task desktop:exe:windows` puts it into the exe's
+  resources byte for byte, with the icon next to it (syso.go, which checks these settings first; `wails3 generate
+  syso` would rewrite it without activeCodePage and with a System DPI fallback).
 -->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">

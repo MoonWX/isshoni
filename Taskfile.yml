@@ -652,10 +652,13 @@ tasks:
     desc: >-
       Cross-build isshoni.exe (GOOS=windows, no cgo) into dist-desktop/windows_amd64/, stamped with VERSION; TAGS
       defaults to production, and other tags build into dist-desktop/windows_amd64-test/ (docs/m2/06 §5.2)
-    # 06 §5.2 steps 1 and 2 (README WA67 adds step 3's checks): the exe's resources (icon, manifest, version info)
-    # from wails3's syso step, then the cross-build. The .syso exists only during the build. The version resource's
-    # four-part number follows 06 §5.3 (WA67 moves it to tools/desktoppkg winver).
-    deps: [release:wails3]
+    # 06 §5.2 steps 1 and 2 (README WA67 adds step 3's checks): the exe's resources (icon, manifest, version info),
+    # then the cross-build, then a check that the exe carries app.manifest unchanged. The resources come from
+    # cmd/isshoni-desktop/build/windows/syso.go, built in the tools/wails3 module (its graph pins tc-hib/winres for
+    # wails3's own syso step), not from `wails3 generate syso`: that one parses the manifest and writes it back
+    # without <activeCodePage> and with a System instead of a PerMonitor DPI fallback. The .syso exists only during
+    # the build and is git-ignored (cmd/isshoni-desktop/.gitignore), so the exe's vcs.modified stays false on a clean
+    # checkout. The version resource's four-part number follows 06 §5.3 (WA67 moves it to tools/desktoppkg winver).
     preconditions:
       - sh: '[ -f web/dist/index.html ]'
         msg: >-
@@ -665,16 +668,22 @@ tasks:
       TAGS: '{{.TAGS | default "production"}}'
       OUT: '{{if eq .TAGS "production"}}dist-desktop/windows_amd64{{else}}dist-desktop/windows_amd64-test{{end}}'
       SYSO: cmd/isshoni-desktop/rsrc_windows_amd64.syso
+      MANIFEST: cmd/isshoni-desktop/build/windows/app.manifest
+      SYSO_TOOL: 'dist-desktop/.build/syso{{exeExt}}'
     cmds:
       - cmd: |
           set -e
           v='{{.VERSION}}'
+          bad() { echo "desktop:exe:windows: VERSION $v is not X.Y.Z[-pre][+build]" >&2; exit 1; }
+          case $v in *-|*-+*|*+|*-.*|*.) bad ;; esac
           core=${v%%+*}
           pre=
           case $core in *-*) pre=${core#*-}; core=${core%%-*} ;; esac
-          x=${core%%.*}; rest=${core#*.}; y=${rest%%.*}; z=${rest#*.}
+          x=${core%%.*}; rest=${core#*.}
+          case $rest in *.*) ;; *) bad ;; esac
+          y=${rest%%.*}; z=${rest#*.}
           for n in "$x" "$y" "$z"; do
-            case $n in ''|*[!0-9]*) echo "desktop:exe:windows: VERSION $v is not X.Y.Z[-pre][+build]" >&2; exit 1 ;; esac
+            case $n in ''|*[!0-9]*) bad ;; esac
             if [ "$n" -gt 65535 ]; then echo "desktop:exe:windows: VERSION $v has a part above 65535" >&2; exit 1; fi
           done
           w=65000
@@ -691,9 +700,9 @@ tasks:
             "LegalCopyright": "Copyright the isshoni authors. Apache-2.0.", "OriginalFilename": "isshoni.exe",
             "InternalName": "isshoni"}}}
           EOF
-          '{{.WAILS3}}' generate syso -arch amd64 -icon cmd/isshoni-desktop/build/windows/icon.ico \
-            -manifest cmd/isshoni-desktop/build/windows/app.manifest -info dist-desktop/.build/info.json \
-            -out '{{.SYSO}}'
+          CGO_ENABLED=0 go build -C tools/wails3 -o '../../{{.SYSO_TOOL}}' ../../cmd/isshoni-desktop/build/windows/syso.go
+          '{{.SYSO_TOOL}}' -arch amd64 -icon cmd/isshoni-desktop/build/windows/icon.ico -manifest '{{.MANIFEST}}' \
+            -info dist-desktop/.build/info.json -out '{{.SYSO}}'
           commit=$(git rev-parse HEAD)
           date=$(TZ=UTC0 git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd)
           ldflags="-s -w -H windowsgui -X {{.VERSION_PKG}}.version=$v -X {{.VERSION_PKG}}.commit=$commit"
@@ -703,6 +712,7 @@ tasks:
             -o '{{.OUT}}/isshoni.exe' ./cmd/isshoni-desktop || status=$?
           rm -f '{{.SYSO}}'
           if [ "$status" -ne 0 ]; then exit "$status"; fi
+          '{{.SYSO_TOOL}}' -check '{{.OUT}}/isshoni.exe' -manifest '{{.MANIFEST}}'
           echo "desktop:exe:windows: {{.OUT}}/isshoni.exe ($v, file version $winver, tags {{.TAGS}})"
 
   desktop:build:e2e:

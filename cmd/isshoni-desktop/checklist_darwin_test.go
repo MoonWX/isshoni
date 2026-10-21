@@ -10,3 +10,6 @@ func isNativeWindow(h uintptr) bool { return h != 0 }
 
 // pipeExists is false on macOS: WebView2's script-debugger pipe is Windows-only (W19).
 func pipeExists(string) bool { return false }
+
+// webviewCommandLines is empty on macOS: there are no WebView2 processes (W19).
+func webviewCommandLines() ([]string, error) { return nil, nil }

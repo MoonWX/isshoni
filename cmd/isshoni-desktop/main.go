@@ -3,6 +3,7 @@
 package main
 
 import (
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -38,15 +39,10 @@ func main() {
 }
 
 // run starts the app and returns its exit code. So far it is 03 §13.4's step 7 without the app's services: the
-// environment scrub, the asset handler and Wails with the main window. WA41 puts the mode dispatch, single instance,
-// the running mutex and the rest of §13.4 in front of it.
+// environment scrub, the WebView2 runtime check, the asset handler and Wails with the main window. WA41 puts the mode
+// dispatch, single instance, the running mutex and the rest of §13.4 in front of it.
 func run(args []string) int {
-	level := new(slog.LevelVar)
-	if debugLogging(args) {
-		level.Set(slog.LevelDebug)
-	}
-	log := logx.New(logx.Options{Level: level}).With("component", "app")
-	slog.SetDefault(log)
+	log := setupLogging(args, nil)
 
 	// Before application.New: Wails reads its updater-helper variables there, and WebView2 reads WEBVIEW2_* when
 	// the window's environment is created.
@@ -54,6 +50,13 @@ func run(args []string) int {
 		if err := os.Unsetenv(name); err != nil {
 			log.Warn("desktop: environment variable not removed", "err", err)
 		}
+	}
+
+	// 03 §5.4: without a current WebView2 runtime the window would stay blank (the pinned Wails only logs it).
+	if v, ok := checkWebView2(); !ok {
+		log.Error("desktop: no usable WebView2 runtime", "version", v, "min", webview2Min)
+		webView2Missing()
+		return 1
 	}
 
 	dataDir, err := webviewDataDir()
@@ -75,7 +78,7 @@ func run(args []string) int {
 	// Wails' own logger never logs below Info, whatever --log-level says: at Debug the pinned Wails logs every bound
 	// call's raw arguments and result (03 §17).
 	wailsLog := logx.New(logx.Options{}).With("component", "wails")
-	app := application.New(appOptions(handler, assets.Guard(assetOrigin), dataDir, wailsLog))
+	app := application.New(appOptions(handler, assetGuard(), dataDir, wailsLog))
 	s := newShell(app, mainWindowOptions())
 	log.Info("desktop: starting", "version", version.Version(), "os", runtime.GOOS, "dev", insecureLoopback())
 	if err := s.Run(); err != nil {
@@ -83,6 +86,19 @@ func run(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// setupLogging makes the process's default logger and returns the app's own, which adds component=app. The default
+// stays unscoped: packages that log through slog.Default() name their own component (internal/desktop/assets adds
+// component=assets), and a second component key would make a JSON line with a duplicate key. out nil is stderr.
+func setupLogging(args []string, out io.Writer) *slog.Logger {
+	level := new(slog.LevelVar)
+	if debugLogging(args) {
+		level.Set(slog.LevelDebug)
+	}
+	base := logx.New(logx.Options{Level: level, Out: out})
+	slog.SetDefault(base)
+	return base.With("component", "app")
 }
 
 // debugLogging reports --log-level debug (or --log-level=debug) among args (03 §4.2).
@@ -104,7 +120,9 @@ var scrubbedEverywhere = []string{"FRONTEND_DEVSERVER_URL", "WAILS_UPDATER_HELPE
 // wailsWebView2Values are the values the pinned Wails gives five WEBVIEW2_* variables on Windows, in every build, at
 // package init (before main) and again right before it creates the webview environment, overwriting what the parent
 // passed: a variable that exists makes WebView2 skip its registry override of the same setting
-// (internal/webview2/webviewloader, preventEnvAndRegistryOverrides). scrubEnv leaves these values in place.
+// (internal/webview2/webviewloader, preventEnvAndRegistryOverrides). scrubEnv leaves these values in place. So in
+// e2e builds too, which keep WEBVIEW2_*, a parent's WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS never reaches the webview
+// at beta.34: 03 §22.4 B's CDP port needs another way in (WA72).
 var wailsWebView2Values = map[string]string{
 	"WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS": "",
 	"WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER":     "",

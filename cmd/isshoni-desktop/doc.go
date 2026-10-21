@@ -8,13 +8,17 @@
 //
 // Files:
 //
-//	main.go              the start (03 §13.4 step 7 so far: the env scrub, the asset handler, Wails, the window)
+//	main.go              the start (03 §13.4 step 7 so far: the env scrub, the WebView2 runtime check, the asset
+//	                     handler, Wails, the window)
 //	shell.go             the Wails shell the app drives (03 §6.1 Shell; minimal until 03 DK9)
-//	platform_windows.go  Windows facts: the asset origin, the WebView2 profile folder, the OS build
-//	platform_darwin.go   macOS dev-build facts
+//	webview2.go          the WebView2 runtime minimum and its message box text (03 §5.4)
+//	platform_windows.go  Windows facts: the asset origin and its Guard, the WebView2 runtime check and profile
+//	                     folder, the OS build
+//	platform_darwin.go   macOS dev-build facts (WKWebView's Guard)
 //	flavor_*.go          what the build tags production, dev and e2e change (03 §5.3, §5.4)
 //	main_other.go        the stub of every other OS
-//	build/windows/       icon.ico and app.manifest, compiled into the exe's resources by `task desktop:exe:windows`
+//	build/windows/       icon.ico and app.manifest, which `task desktop:exe:windows` puts into the exe's resources
+//	                     with syso.go (a //go:build ignore program built in the tools/wails3 module)
 //	checklist_test.go    03 §3.2's Wails checklist in the real webview (-tags isshoni_hw: the owner's PC, a Mac)
 //
 // Build tags: production (every release, and Wails' own release mode: no DevTools), dev (`task desktop:dev`: Vite's

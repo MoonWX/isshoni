@@ -18,8 +18,7 @@ import (
 // outside /wails/ pass through unchanged. Under /wails/:
 //
 //  1. Origin: the Origin header equals origin, or there is no Origin and Sec-Fetch-Site is same-origin; otherwise
-//     403 and one rate-limited WARN line. For a custom-scheme origin (wails://localhost, the macOS dev build) a
-//     request with neither header passes too: WKWebView sends neither to the scheme handler (guard.customScheme).
+//     403 and one rate-limited WARN line. This is §5.6's rule exactly; GuardWKWebView is the one exception to it.
 //  2. /wails/runtime: only POST; the object and method are read the way the pinned transport reads them (the JSON
 //     body, or the query when the body is empty; runtime_allow.go), from at most 64 KiB of body (413 above), which
 //     is then restored for the runtime. Only Call and CancelCall pass; every other object, a request whose object
@@ -30,29 +29,38 @@ import (
 //
 // The WARN lines go to slog.Default() with component=assets.
 func Guard(origin string) func(http.Handler) http.Handler {
-	return newGuard(origin, nil, time.Now).middleware
+	return newGuard(origin, false, nil, time.Now).middleware
+}
+
+// GuardWKWebView is Guard for an asset origin that WKWebView serves through a URL-scheme handler (wails://localhost:
+// Wails on macOS, the dev build of 03 D3). WKWebView hands its scheme handler no Origin and no Sec-Fetch-Site at
+// all, not even on a POST (measured with the checklist at beta.34), so check 1 also lets through a request that has
+// neither header, but on /wails/runtime only when it carries the runtime's own x-wails-client-id header: no simple
+// request can carry it, so a sender on another origin would need a CORS preflight, which the Guard never answers
+// with a 2xx (an OPTIONS request without the header gets 403, and /wails/runtime takes only POST). A request that
+// names another origin or another site is refused as by Guard. An http or https origin gets no exception (it is
+// then exactly Guard). The macOS release (M3) re-checks this against its webview.
+func GuardWKWebView(origin string) func(http.Handler) http.Handler {
+	return newGuard(origin, true, nil, time.Now).middleware
 }
 
 // guard is Guard's state: the rate limit of its WARN lines.
 type guard struct {
 	origin string
-	// customScheme is true for an asset origin whose scheme isn't http or https (wails://localhost, Wails on
-	// macOS): WKWebView hands its URL-scheme handler no Origin and no Sec-Fetch-Site at all, not even on a POST
-	// (measured with the checklist at beta.34), and a custom scheme is reachable only from the app's own webview,
-	// so a request without both headers counts as same-origin there. A request that names another origin or
-	// another site is still refused.
-	customScheme bool
-	log          *slog.Logger // nil: slog.Default() at the time of the line
-	warn         *warnLimiter
+	// headerless is GuardWKWebView's exception to check 1 (requests with neither Origin nor Sec-Fetch-Site), set
+	// only for a custom-scheme origin.
+	headerless bool
+	log        *slog.Logger // nil: slog.Default() at the time of the line
+	warn       *warnLimiter
 }
 
-func newGuard(origin string, log *slog.Logger, now func() time.Time) *guard {
+func newGuard(origin string, wkwebview bool, log *slog.Logger, now func() time.Time) *guard {
 	scheme, _, _ := strings.Cut(origin, "://")
 	return &guard{
-		origin:       origin,
-		customScheme: origin != "" && scheme != "http" && scheme != "https",
-		log:          log,
-		warn:         newWarnLimiter(time.Minute, now),
+		origin:     origin,
+		headerless: wkwebview && origin != "" && scheme != "http" && scheme != "https",
+		log:        log,
+		warn:       newWarnLimiter(time.Minute, now),
 	}
 }
 
@@ -103,8 +111,14 @@ func (g *guard) sameOrigin(r *http.Request) bool {
 	origins := r.Header.Values("Origin")
 	switch len(origins) {
 	case 0:
-		site := r.Header.Get("Sec-Fetch-Site")
-		return site == "same-origin" || (site == "" && g.customScheme)
+		switch site := r.Header.Get("Sec-Fetch-Site"); {
+		case site == "same-origin":
+			return true
+		case site != "" || !g.headerless:
+			return false
+		default: // GuardWKWebView: neither header
+			return r.URL.Path != runtimePath || r.Header.Get(headerClientID) != ""
+		}
 	case 1:
 		return origins[0] == g.origin
 	default:

@@ -103,6 +103,7 @@ const (
 	eventPayloadPath  = "/wails/eventpayload/"
 	runtimeBodyLimit  = 64 << 10 // the Guard reads at most this much of a /wails/runtime body (§5.6, §20)
 	headerChunkPrefix = "x-wails-chunk-"
+	headerClientID    = "x-wails-client-id" // runtime.ts sends it on every /wails/runtime request
 )
 
 // staticRuntimePaths are the runtime's GET paths that serve fixed content and reach no Go code beyond Wails' own

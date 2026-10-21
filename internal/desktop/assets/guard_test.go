@@ -96,9 +96,14 @@ type guardFixture struct {
 	h     http.Handler
 }
 
-func newGuardFixture(origin string) *guardFixture {
+func newGuardFixture(origin string) *guardFixture { return newGuardFixtureFor(origin, false) }
+
+// newWKWebViewGuardFixture is GuardWKWebView's fixture.
+func newWKWebViewGuardFixture(origin string) *guardFixture { return newGuardFixtureFor(origin, true) }
+
+func newGuardFixtureFor(origin string, wkwebview bool) *guardFixture {
 	f := &guardFixture{next: &recordingHandler{}, log: &logRecorder{}, clock: &fakeClock{now: time.Unix(1e9, 0)}}
-	f.h = newGuard(origin, slog.New(f.log), f.clock.Now).middleware(f.next)
+	f.h = newGuard(origin, wkwebview, slog.New(f.log), f.clock.Now).middleware(f.next)
 	return f
 }
 
@@ -217,30 +222,37 @@ func TestGuardOrigin(t *testing.T) {
 	}
 }
 
-// TestGuardCustomSchemeOrigin: with wails://localhost (Wails on macOS) a request without Origin and Sec-Fetch-Site
-// passes, as WKWebView sends neither to the scheme handler; anything naming another origin or site doesn't.
-func TestGuardCustomSchemeOrigin(t *testing.T) {
+// TestGuardWKWebView: GuardWKWebView with wails://localhost (Wails on macOS) lets a request without Origin and
+// Sec-Fetch-Site through, as WKWebView sends neither to the scheme handler, but on /wails/runtime only with the
+// runtime's own x-wails-client-id header; anything naming another origin or site is refused.
+func TestGuardWKWebView(t *testing.T) {
 	const macOrigin = "wails://localhost"
 	cases := []struct {
-		name    string
-		origin  string
-		fetch   string
-		allowed bool
+		name     string
+		origin   string
+		fetch    string
+		clientID bool
+		allowed  bool
 	}{
-		{"neither header", "", "", true},
-		{"the asset origin", macOrigin, "", true},
-		{"same-origin fetch", "", "same-origin", true},
-		{"cross-site", "", "cross-site", false},
-		{"same-site", "", "same-site", false},
-		{"none", "", "none", false},
-		{"foreign Origin", "https://evil.example", "", false},
-		{"null Origin", "null", "", false},
-		{"the Windows origin", testOrigin, "", false},
+		{"neither header, the runtime's client id", "", "", true, true},
+		{"neither header, no client id", "", "", false, false},
+		{"the asset origin", macOrigin, "", true, true},
+		{"the asset origin, no client id", macOrigin, "", false, true},
+		{"same-origin fetch", "", "same-origin", true, true},
+		{"cross-site", "", "cross-site", true, false},
+		{"same-site", "", "same-site", true, false},
+		{"none", "", "none", true, false},
+		{"foreign Origin", "https://evil.example", "", true, false},
+		{"null Origin", "null", "", true, false},
+		{"the Windows origin", testOrigin, "", true, false},
 	}
 	for _, c := range cases {
-		f := newGuardFixture(macOrigin)
+		f := newWKWebViewGuardFixture(macOrigin)
 		r := newRuntimeRequest(formBody, objectCall, 0, callArgs)
 		r.Header.Del("Origin")
+		if !c.clientID {
+			r.Header.Del("x-wails-client-id")
+		}
 		if c.origin != "" {
 			r.Header.Set("Origin", c.origin)
 		}
@@ -252,19 +264,88 @@ func TestGuardCustomSchemeOrigin(t *testing.T) {
 			t.Errorf("%s: %d, next %d; allowed %v", c.name, rec.Code, f.next.calls, c.allowed)
 		}
 	}
+
+	// A header-less simple POST (text/plain, no custom header: no preflight) gets 403, in both request forms; a
+	// header-less preflight gets no 2xx either.
+	for _, form := range []string{formBody, formQuery} {
+		f := newWKWebViewGuardFixture(macOrigin)
+		r := newRuntimeRequest(form, objectCall, 0, callArgs)
+		r.Header.Del("Origin")
+		r.Header.Del("x-wails-client-id")
+		r.Header.Set("Content-Type", "text/plain")
+		if rec := f.do(r); rec.Code != http.StatusForbidden || f.next.calls != 0 {
+			t.Errorf("%s form, simple POST: %d, next %d", form, rec.Code, f.next.calls)
+		}
+	}
+	f := newWKWebViewGuardFixture(macOrigin)
+	pre := httptest.NewRequestWithContext(context.Background(), http.MethodOptions, macOrigin+runtimePath, nil)
+	pre.Header.Set("Access-Control-Request-Method", http.MethodPost)
+	pre.Header.Set("Access-Control-Request-Headers", "content-type,x-wails-client-id")
+	if rec := f.do(pre); rec.Code < 300 || f.next.calls != 0 {
+		t.Errorf("header-less preflight: %d, next %d", rec.Code, f.next.calls)
+	}
+
+	// The runtime's static GETs need no client id (fixed content), and the other checks still hold.
+	f = newWKWebViewGuardFixture(macOrigin)
+	get := httptest.NewRequestWithContext(context.Background(), http.MethodGet, macOrigin+"/wails/runtime.js", nil)
+	if rec := f.do(get); rec.Code != http.StatusOK || f.next.calls != 1 {
+		t.Errorf("GET /wails/runtime.js: %d", rec.Code)
+	}
+	f = newWKWebViewGuardFixture(macOrigin)
+	get = httptest.NewRequestWithContext(context.Background(), http.MethodGet, macOrigin+"/wails/stream/poll", nil)
+	if rec := f.do(get); rec.Code != http.StatusForbidden {
+		t.Errorf("GET /wails/stream/poll: %d", rec.Code)
+	}
+
 	// The allowlist holds there too.
-	f := newGuardFixture(macOrigin)
+	f = newWKWebViewGuardFixture(macOrigin)
 	r := newRuntimeRequest(formBody, 9, 0, map[string]any{"url": "x-apple.systempreferences:"})
 	r.Header.Del("Origin")
 	if rec := f.do(r); rec.Code != http.StatusForbidden {
 		t.Errorf("Browser.OpenURL: %d", rec.Code)
 	}
-	// An http origin never gets the exception.
-	f = newGuardFixture(testOrigin)
+
+	// An http origin never gets the exception, not even from GuardWKWebView.
+	f = newWKWebViewGuardFixture(testOrigin)
 	r = newRuntimeRequest(formBody, objectCall, 0, callArgs)
 	r.Header.Del("Origin")
 	if rec := f.do(r); rec.Code != http.StatusForbidden {
-		t.Errorf("http origin, neither header: %d", rec.Code)
+		t.Errorf("GuardWKWebView with an http origin, neither header: %d", rec.Code)
+	}
+}
+
+// TestGuardHasNoSchemeException: Guard keeps §5.6's rule for every origin; a custom scheme alone doesn't let a
+// request without Origin and Sec-Fetch-Site through (only GuardWKWebView does).
+func TestGuardHasNoSchemeException(t *testing.T) {
+	for _, origin := range []string{"wails://localhost", "isshoni-app://localhost", testOrigin} {
+		f := newGuardFixture(origin)
+		r := newRuntimeRequest(formBody, objectCall, 0, callArgs)
+		r.Header.Del("Origin")
+		if rec := f.do(r); rec.Code != http.StatusForbidden || f.next.calls != 0 {
+			t.Errorf("%s, neither header: %d, next %d", origin, rec.Code, f.next.calls)
+		}
+		f = newGuardFixture(origin)
+		r = newRuntimeRequest(formBody, objectCall, 0, callArgs)
+		r.Header.Set("Origin", origin)
+		if rec := f.do(r); rec.Code != http.StatusOK {
+			t.Errorf("%s, its own Origin: %d", origin, rec.Code)
+		}
+	}
+	// The exported constructors: Guard refuses the header-less request that GuardWKWebView lets through.
+	r := newRuntimeRequest(formBody, objectCall, 0, callArgs)
+	r.Header.Del("Origin")
+	next := &recordingHandler{}
+	rec := httptest.NewRecorder()
+	Guard("wails://localhost")(next).ServeHTTP(rec, r.Clone(context.Background()))
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("Guard: %d", rec.Code)
+	}
+	r = newRuntimeRequest(formBody, objectCall, 0, callArgs)
+	r.Header.Del("Origin")
+	rec = httptest.NewRecorder()
+	GuardWKWebView("wails://localhost")(next).ServeHTTP(rec, r)
+	if rec.Code != http.StatusOK || next.calls != 1 {
+		t.Errorf("GuardWKWebView: %d, next %d", rec.Code, next.calls)
 	}
 }
 

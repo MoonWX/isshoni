@@ -4,15 +4,20 @@ package main
 
 import (
 	"errors"
+	"net/http"
 	"path/filepath"
 
 	"golang.org/x/sys/windows"
 
+	"github.com/MoonWX/isshoni/internal/desktop/assets"
 	"github.com/MoonWX/isshoni/internal/protocol"
 )
 
 // assetOrigin is the origin of the SPA's pages: Wails v3's asset server in WebView2 (03 §5.7, W1).
 const assetOrigin = protocol.DesktopAssetOriginWindows
+
+// assetGuard is the /wails/* guard with 03 §5.6's rule as written: WebView2 sends Origin or Sec-Fetch-Site.
+func assetGuard() func(http.Handler) http.Handler { return assets.Guard(assetOrigin) }
 
 // clientOS is BridgeConfig.App.OS.
 const clientOS = protocol.ClientOSWindows

@@ -3,7 +3,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -70,6 +72,43 @@ func TestDebugLogging(t *testing.T) {
 		if got := debugLogging(strings.Fields(args)); got != want {
 			t.Errorf("%q: %v", args, got)
 		}
+	}
+}
+
+// TestSetupLogging: the default logger is unscoped, so a line that internal/desktop/assets logs through it (here a
+// Guard refusal) has exactly one component key; the app's own logger adds component=app.
+func TestSetupLogging(t *testing.T) {
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	var buf bytes.Buffer
+	log := setupLogging(nil, &buf) // a buffer is no terminal: JSON lines
+
+	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, assetOrigin+"/wails/runtime",
+		strings.NewReader(`{"object":0,"method":0}`))
+	r.Header.Set("Origin", "https://evil.example")
+	rec := httptest.NewRecorder()
+	assetGuard()(http.NotFoundHandler()).ServeHTTP(rec, r)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("foreign Origin: %d", rec.Code)
+	}
+	log.Info("desktop: test line")
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("log lines %q", lines)
+	}
+	for i, want := range []string{"assets", "app"} {
+		if n := strings.Count(lines[i], `"component":`); n != 1 {
+			t.Errorf("line %d has %d component keys: %s", i, n, lines[i])
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(lines[i]), &m); err != nil || m["component"] != want {
+			t.Errorf("line %d: component %v, want %s (%v)", i, m["component"], want, err)
+		}
+	}
+	setupLogging([]string{"--log-level", "debug"}, io.Discard)
+	if !slog.Default().Enabled(context.Background(), slog.LevelDebug) {
+		t.Error("--log-level debug did not reach the default logger")
 	}
 }
 

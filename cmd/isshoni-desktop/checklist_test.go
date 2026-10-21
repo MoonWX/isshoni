@@ -10,14 +10,23 @@ package main
 //
 //	go test -tags isshoni_hw -count=1 -v -run TestWailsChecklist ./cmd/isshoni-desktop
 //
-// W19 needs a production build started with the WEBVIEW2_* variables set by its parent (Wails clears five of them
-// at package init, before any test code runs), and the port and pipe names told to the test:
+// W19 needs a production build started with the WEBVIEW2_* variables set by its parent, and the port and pipe names
+// told to the test:
 //
 //	$env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = '--remote-debugging-port=9333'
 //	$env:WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER = 'isshoni-test-w19'
 //	$env:WEBVIEW2_X = '1'
 //	$env:ISSHONI_CHECKLIST_W19_PORT = '9333'; $env:ISSHONI_CHECKLIST_W19_PIPE = 'isshoni-test-w19'
 //	go test -tags "isshoni_hw production" -count=1 -v -run TestWailsChecklist ./cmd/isshoni-desktop
+//
+// The pinned Wails overwrites five WEBVIEW2_* variables in every build (at package init, before any test code, and
+// again right before it creates the webview environment; main.go wailsWebView2Values), the two above included, so
+// "no port, no pipe" alone would pass without the scrub. The row therefore also checks that WEBVIEW2_X, which Wails
+// leaves alone, was there before the scrub and is gone after it, that no other WEBVIEW2_* value survives, and that no
+// msedgewebview2.exe below this process has the port or the pipe on its command line. The same run without
+// "production" is the control (WEBVIEW2_X stays). By hand, while the window is open:
+//
+//	Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" | Select-Object ProcessId, ParentProcessId, CommandLine
 //
 // ISSHONI_CHECKLIST_OUT=<file> also writes the rows there. The run opens the app's window for a few seconds and
 // closes it; nothing it writes names the machine or the user.
@@ -109,7 +118,11 @@ type checklist struct {
 
 var theChecklist *checklist
 
+// envBeforeScrub is the environment TestMain found, after Wails' package init and before the scrub (W19).
+var envBeforeScrub []string
+
 func TestMain(m *testing.M) {
+	envBeforeScrub = os.Environ()
 	for _, name := range scrubEnv(os.Environ(), flavor.production) {
 		_ = os.Unsetenv(name)
 	}
@@ -155,7 +168,7 @@ func newChecklist() (*checklist, error) {
 	handler.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, assetOrigin+"/", nil))
 	c.csp = rec.Header().Get("Content-Security-Policy")
 
-	guard := assets.Guard(assetOrigin)
+	guard := assetGuard()
 	middleware := func(next http.Handler) http.Handler { return c.record(guard(next)) }
 	opts := appOptions(c.routes(handler), middleware, dataDir, logx.New(logx.Options{}).With("component", "wails"))
 	opts.Services = []application.Service{application.NewService(c.svc)}
@@ -461,15 +474,9 @@ func TestWailsChecklist(t *testing.T) {
 		info("W13", "n/a", "WebView2 only; WKWebView autoplay without a click: %v (%s)", m.W13.Autoplay, m.W13.Error)
 	}
 
-	if port, pipe := os.Getenv("ISSHONI_CHECKLIST_W19_PORT"), os.Getenv("ISSHONI_CHECKLIST_W19_PIPE"); flavor.production &&
-		port != "" && pipe != "" {
-		d := net.Dialer{Timeout: time.Second}
-		conn, err := d.DialContext(t.Context(), "tcp", net.JoinHostPort("127.0.0.1", port)) //nolint:gosec // G704: the caller's loopback port
-		if err == nil {
-			_ = conn.Close()
-		}
-		check("W19", err != nil && !pipeExists(pipe), "debugging port %s open: %v; pipe %s exists: %v", port,
-			err == nil, pipe, pipeExists(pipe))
+	if port, pipe := os.Getenv("ISSHONI_CHECKLIST_W19_PORT"), os.Getenv("ISSHONI_CHECKLIST_W19_PIPE"); port != "" &&
+		pipe != "" {
+		w19(t, port, pipe, check)
 	} else {
 		info("W19", "not run", "needs -tags \"isshoni_hw production\" with WEBVIEW2_* and ISSHONI_CHECKLIST_W19_* set")
 	}
@@ -487,17 +494,24 @@ func TestWailsChecklist(t *testing.T) {
 		raw["openURLBody"].Status == http.StatusForbidden && raw["openURLQuery"].Status == http.StatusForbidden &&
 		raw["windowHideQuery"].Status == http.StatusForbidden && raw["chunked"].Status == http.StatusForbidden &&
 		raw["oversize"].Status == http.StatusRequestEntityTooLarge && raw["unparsable"].Status == http.StatusForbidden
+	// A simple request (text/plain, no x-wails-client-id): WebView2 sends the page's Origin, so the Guard lets it
+	// through; WKWebView sends no Origin, and GuardWKWebView then needs the runtime's header.
+	if runtime.GOOS == "windows" {
+		rawOK = rawOK && raw["simpleCall"].Status != http.StatusForbidden && raw["simpleCall"].Status != 0
+	} else {
+		rawOK = rawOK && raw["simpleCall"].Status == http.StatusForbidden
+	}
 	// The window's own state, not document.visibilityState (a window behind others reads "hidden" on macOS):
 	// Window.Hide from the page must not have changed it.
 	visible := c.shell.WindowVisible()
 	check("W21", allRefused && rawOK && m.Echo.Resolved && m.Echo.Value == "checklist" && visible == c.visibleAtStart.Load(),
 		"runtime objects refused: %d of %d %v; bound Echo answered %v; raw: Call body %d, Call query %d, "+
-			"Browser.OpenURL body %d, query %d, Window.Hide query %d, chunked %d, 70 KB %d, unparsable %d; the "+
-			"window visible before %v, after %v (page visibilityState %s, then %s)", len(m.W21runtime)-len(refusedOK),
-		len(m.W21runtime), refusedOK, m.Echo.Value, raw["callBody"].Status, raw["callQuery"].Status,
-		raw["openURLBody"].Status, raw["openURLQuery"].Status, raw["windowHideQuery"].Status, raw["chunked"].Status,
-		raw["oversize"].Status, raw["unparsable"].Status, c.visibleAtStart.Load(), visible, m.Visibility.Before,
-		m.Visibility.After)
+			"Browser.OpenURL body %d, query %d, Window.Hide query %d, chunked %d, 70 KB %d, unparsable %d, Call as a "+
+			"simple request %d; the window visible before %v, after %v (page visibilityState %s, then %s)",
+		len(m.W21runtime)-len(refusedOK), len(m.W21runtime), refusedOK, m.Echo.Value, raw["callBody"].Status,
+		raw["callQuery"].Status, raw["openURLBody"].Status, raw["openURLQuery"].Status, raw["windowHideQuery"].Status,
+		raw["chunked"].Status, raw["oversize"].Status, raw["unparsable"].Status, raw["simpleCall"].Status,
+		c.visibleAtStart.Load(), visible, m.Visibility.Before, m.Visibility.After)
 	info("events", map[bool]string{true: "pass", false: "FAIL"}[m.BigEvent.Delivered],
 		"a 12 KiB Go event (fetched from /wails/eventpayload/) reached the page: %v", m.BigEvent.Delivered)
 	info("runtime", "info", "the page used the %s runtime; stray page errors: %q", m.Runtime.From, m.Stray)
@@ -515,6 +529,44 @@ func TestWailsChecklist(t *testing.T) {
 			t.Error(err)
 		}
 	}
+}
+
+// w19 decides W19 (03 §3.2, §5.4): in a production run the scrub removed every WEBVIEW2_* the parent set and the
+// webview opened no debugging port or pipe; without production it is the control run, where WEBVIEW2_X stays.
+func w19(t *testing.T, port, pipe string, check func(id string, ok bool, detail string, args ...any)) {
+	d := net.Dialer{Timeout: time.Second}
+	conn, err := d.DialContext(t.Context(), "tcp", net.JoinHostPort("127.0.0.1", port)) //nolint:gosec // G704: the caller's loopback port
+	if err == nil {
+		_ = conn.Close()
+	}
+	portOpen, pipeOpen := err == nil, pipeExists(pipe)
+	xBefore := slices.ContainsFunc(envBeforeScrub, func(kv string) bool { return strings.HasPrefix(kv, "WEBVIEW2_X=") })
+	_, xAfter := os.LookupEnv("WEBVIEW2_X")
+	// What a production scrub would still remove now: nothing, after a production scrub.
+	left := slices.DeleteFunc(scrubEnv(os.Environ(), true), func(name string) bool {
+		return !strings.HasPrefix(strings.ToUpper(name), "WEBVIEW2_")
+	})
+	cmdlines, cmdErr := webviewCommandLines()
+	var carrying int
+	for _, cl := range cmdlines {
+		if strings.Contains(cl, "--remote-debugging-port") || strings.Contains(cl, pipe) {
+			carrying++
+		}
+	}
+	// On Windows the command lines must have been read; macOS has no WebView2 processes.
+	cmdOK := cmdErr == nil && carrying == 0 && (runtime.GOOS != "windows" || len(cmdlines) > 0)
+	if !flavor.production {
+		check("W19", xBefore && xAfter, "control run without production: WEBVIEW2_X before the scrub %v, after %v "+
+			"(it stays without the scrub); WEBVIEW2_* a production scrub would remove: %v; debugging port %s open: "+
+			"%v; pipe exists: %v; %d of %d msedgewebview2.exe command lines carry the port or pipe (%v) - Wails "+
+			"overwrites WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS and WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER in every build",
+			xBefore, xAfter, left, port, portOpen, pipeOpen, carrying, len(cmdlines), cmdErr)
+		return
+	}
+	check("W19", xBefore && !xAfter && len(left) == 0 && !portOpen && !pipeOpen && cmdOK,
+		"WEBVIEW2_X before the scrub %v, after %v; other WEBVIEW2_* left: %v; debugging port %s open: %v; pipe "+
+			"exists: %v; %d of %d msedgewebview2.exe command lines carry the port or pipe (%v)", xBefore, xAfter,
+		left, port, portOpen, pipeOpen, carrying, len(cmdlines), cmdErr)
 }
 
 // webviewName names the run's OS and webview for the table's title.
