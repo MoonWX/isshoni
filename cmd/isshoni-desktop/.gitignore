@@ -1,0 +1,3 @@
+# The exe's resource object, which `task desktop:exe:windows` writes here for the length of one build (docs/m2/06
+# §5.2 step 1). Ignored, so that a build from a clean checkout records vcs.modified=false in the exe.
+/rsrc_windows_*.syso

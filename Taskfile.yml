@@ -608,19 +608,112 @@ tasks:
 
   desktop:dev:
     desc: Run the desktop app on this machine with the fake engine and Vite's live reload (docs/m2/03 D3)
+    # macOS only (the dev build of 03 D3; Windows builds with desktop:exe:windows). A -tags dev build of
+    # cmd/isshoni-desktop whose asset handler takes the SPA from Vite on :5173 (ISSHONI_DESKTOP_DEV_URL, 03 §5.3):
+    # edits in web/src show in the window at once. A Vite already running on :5173 (task dev:web) is used as it is;
+    # otherwise this starts one and stops it when the app quits. The engine is the fake from README WA41 on.
+    # Task's own shell gives a background job no real PID, so the script runs in sh. cgo on a Mac whose Command Line
+    # Tools are older than the SDK needs SDKROOT (CONTRIBUTING.md).
+    env:
+      ISSHONI_VERSION: '{{.VERSION}}'
+      DESKTOP_DEV_SH: |
+        set -eu
+        vite=http://localhost:5173
+        up() { curl -fsS -o /dev/null --max-time 2 "$vite/@vite/client" 2>/dev/null; }
+        if up; then
+          echo "desktop:dev: using the Vite dev server already on $vite"
+        else
+          (cd web && exec node node_modules/vite/bin/vite.js --clearScreen false) &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT INT TERM
+          n=0
+          until up; do
+            n=$((n + 1))
+            if [ "$n" -gt 120 ] || ! kill -0 "$pid" 2>/dev/null; then
+              echo "desktop:dev: Vite did not start on $vite" >&2
+              exit 1
+            fi
+            sleep 0.5
+          done
+        fi
+        ISSHONI_DESKTOP_DEV_URL=$vite go run -tags dev -ldflags "-X $VERSION_PKG.version=$ISSHONI_VERSION" ./cmd/isshoni-desktop "$@"
+      VERSION_PKG: '{{.VERSION_PKG}}'
     cmds:
-      - cmd: "echo 'desktop:dev: note: not implemented yet; README WA22 adds it with cmd/isshoni-desktop. Nothing was started.'"
+      - cmd: "echo 'desktop:dev: note: the dev build runs on macOS; on Windows build the app with task desktop:exe:windows. Nothing was started.'"
         silent: true
+        if: '{{if eq OS "darwin"}}false{{else}}true{{end}}'
+      - cmd: "echo 'desktop:dev: note: web/node_modules is missing; run task setup first.' >&2; exit 1"
+        silent: true
+        if: '{{if eq OS "darwin"}}[ ! -d web/node_modules/vite ]{{else}}false{{end}}'
+      - cmd: sh -c "$DESKTOP_DEV_SH" desktop-dev {{.CLI_ARGS}}
+        if: '{{if eq OS "darwin"}}[ -d web/node_modules/vite ]{{else}}false{{end}}'
 
   desktop:exe:windows:
     desc: >-
       Cross-build isshoni.exe (GOOS=windows, no cgo) into dist-desktop/windows_amd64/, stamped with VERSION; TAGS
       defaults to production, and other tags build into dist-desktop/windows_amd64-test/ (docs/m2/06 §5.2)
+    # 06 §5.2 steps 1 and 2 (README WA67 adds step 3's checks): the exe's resources (icon, manifest, version info),
+    # then the cross-build, then a check that the exe carries app.manifest unchanged. The resources come from
+    # cmd/isshoni-desktop/build/windows/syso.go, built in the tools/wails3 module (its graph pins tc-hib/winres for
+    # wails3's own syso step), not from `wails3 generate syso`: that one parses the manifest and writes it back
+    # without <activeCodePage> and with a System instead of a PerMonitor DPI fallback. The .syso exists only during
+    # the build and is git-ignored (cmd/isshoni-desktop/.gitignore), so the exe's vcs.modified stays false on a clean
+    # checkout. The version resource's four-part number follows 06 §5.3 (WA67 moves it to tools/desktoppkg winver).
+    preconditions:
+      - sh: '[ -f web/dist/index.html ]'
+        msg: >-
+          web/dist/index.html is missing, and isshoni.exe embeds the web app from web/dist/.
+          Run "task build:web" first (CI downloads the web job's artifact).
     vars:
       TAGS: '{{.TAGS | default "production"}}'
+      OUT: '{{if eq .TAGS "production"}}dist-desktop/windows_amd64{{else}}dist-desktop/windows_amd64-test{{end}}'
+      SYSO: cmd/isshoni-desktop/rsrc_windows_amd64.syso
+      MANIFEST: cmd/isshoni-desktop/build/windows/app.manifest
+      SYSO_TOOL: 'dist-desktop/.build/syso{{exeExt}}'
     cmds:
-      - cmd: "echo 'desktop:exe:windows: note: not implemented yet; README WA22 adds it with cmd/isshoni-desktop (WA67 adds its checks). Nothing was built (TAGS={{.TAGS}}).'"
-        silent: true
+      - cmd: |
+          set -e
+          v='{{.VERSION}}'
+          bad() { echo "desktop:exe:windows: VERSION $v is not X.Y.Z[-pre][+build]" >&2; exit 1; }
+          case $v in *-|*-+*|*+|*-.*|*.) bad ;; esac
+          core=${v%%+*}
+          pre=
+          case $core in *-*) pre=${core#*-}; core=${core%%-*} ;; esac
+          x=${core%%.*}; rest=${core#*.}
+          case $rest in *.*) ;; *) bad ;; esac
+          y=${rest%%.*}; z=${rest#*.}
+          for n in "$x" "$y" "$z"; do
+            case $n in ''|*[!0-9]*) bad ;; esac
+            if [ "$n" -gt 65535 ]; then echo "desktop:exe:windows: VERSION $v has a part above 65535" >&2; exit 1; fi
+          done
+          w=65000
+          if [ -n "$pre" ]; then
+            last=${pre##*.}
+            case $last in ''|*[!0-9]*) w=0 ;; *) w=$((last % 65000)) ;; esac
+          fi
+          winver="$x.$y.$z.$w"
+          mkdir -p dist-desktop/.build '{{.OUT}}'
+          cat > dist-desktop/.build/info.json <<EOF
+          {"fixed": {"file_version": "$winver", "product_version": "$winver"},
+           "info": {"0000": {"ProductVersion": "$v", "FileVersion": "$winver", "ProductName": "isshoni",
+            "FileDescription": "isshoni", "CompanyName": "isshoni project",
+            "LegalCopyright": "Copyright the isshoni authors. Apache-2.0.", "OriginalFilename": "isshoni.exe",
+            "InternalName": "isshoni"}}}
+          EOF
+          CGO_ENABLED=0 go build -C tools/wails3 -o '../../{{.SYSO_TOOL}}' ../../cmd/isshoni-desktop/build/windows/syso.go
+          '{{.SYSO_TOOL}}' -arch amd64 -icon cmd/isshoni-desktop/build/windows/icon.ico -manifest '{{.MANIFEST}}' \
+            -info dist-desktop/.build/info.json -out '{{.SYSO}}'
+          commit=$(git rev-parse HEAD)
+          date=$(TZ=UTC0 git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd)
+          ldflags="-s -w -H windowsgui -X {{.VERSION_PKG}}.version=$v -X {{.VERSION_PKG}}.commit=$commit"
+          ldflags="$ldflags -X {{.VERSION_PKG}}.date=$date"
+          status=0
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -tags '{{.TAGS}}' -ldflags "$ldflags" \
+            -o '{{.OUT}}/isshoni.exe' ./cmd/isshoni-desktop || status=$?
+          rm -f '{{.SYSO}}'
+          if [ "$status" -ne 0 ]; then exit "$status"; fi
+          '{{.SYSO_TOOL}}' -check '{{.OUT}}/isshoni.exe' -manifest '{{.MANIFEST}}'
+          echo "desktop:exe:windows: {{.OUT}}/isshoni.exe ($v, file version $winver, tags {{.TAGS}})"
 
   desktop:build:e2e:
     desc: Build the e2e isshoni.exe for the CDP spec (desktop:exe:windows TAGS=e2e; never shipped, docs/m2/03 §22.4)

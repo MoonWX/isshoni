@@ -1,0 +1,29 @@
+<!doctype html>
+<!--
+  The SPA shell (05 §4, §16.1). No inline scripts or styles: the server's CSP allows only same-origin files.
+  /boot-check.js, /manifest.webmanifest and /icons/* are served from public/.
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="description" content="Watch your friends' screens together" />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/icons/icon.svg" type="image/svg+xml" />
+    <title>isshoni</title>
+    <script type="module" crossorigin src="/assets/index-ZhGWVs6R.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-ByXtkcz9.css">
+  </head>
+  <body>
+    <noscript>
+      <div class="boot-message">
+        <h1>isshoni needs JavaScript</h1>
+        <p>Turn on JavaScript for this site, then reload the page.</p>
+      </div>
+    </noscript>
+    <div id="root"></div>
+    <script src="/boot-check.js"></script>
+  </body>
+</html>

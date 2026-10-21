@@ -21,6 +21,7 @@
   },
   "dependencies": {
     "@tanstack/react-query": "^5.104.4",
+    "@wailsio/runtime": "3.0.0-beta.34",
     "i18next": "^26.5.2",
     "lucide-react": "^1.59.0",
     "react": "^19.3.1",
