@@ -456,6 +456,10 @@ jobs:
       - name: go vet (tools module)
         run: go -C tools vet ./...
 
+      - name: go vet (tools module, windows)
+        # g2g's GDI capture builds only for Windows (M2 01 §12.2).
+        run: GOOS=windows go -C tools vet ./...
+
       - name: task lint:pins
         run: task lint:pins
 

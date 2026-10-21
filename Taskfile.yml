@@ -343,7 +343,8 @@ tasks:
   lint:go:
     desc: >-
       golangci-lint (also with GOOS=windows), go mod tidy -diff, go vet for GOOS darwin and windows, and the
-      cross-builds of lint:go:cross (the main module; golangci-lint, vet and tidy for tools/ too)
+      cross-builds of lint:go:cross (the main module; golangci-lint, vet (also with GOOS=windows) and tidy for tools/
+      too)
     deps: [tools:golangci-lint]
     vars:
       # As in test:go: empty only while the main module has no packages.
@@ -368,6 +369,8 @@ tasks:
       - go mod tidy -diff
       - cd tools && ../{{.GOLANGCI_LINT}} run ./...
       - go -C tools vet ./...
+      # tools/ has Windows-only files too (g2g's GDI capture, docs/m2/01 §12.2).
+      - GOOS=windows go -C tools vet ./...
       - go -C tools mod tidy -diff
 
   lint:go:cross:
