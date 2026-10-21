@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -25,20 +26,29 @@ import (
 )
 
 // Source is the media a Publisher sends, as media contract packets (docs/m2/01-client-core.md §5): *fake.Source in
-// M1, the native engine in M2. Video packets of a sent layer and audio packets go out; any other packet is counted in
-// Stats as dropped.
+// M1, the core's media pump over a media.Session in M2. Video packets of a sent layer and audio packets go out; any
+// other packet (media.KindEvent, media.KindPCM, an unknown layer) is counted in Stats as dropped (§8.1).
+//
+// Packets come in capture order per stream (kind + layer); there is no order across streams (04 §6.2). The anchoring
+// of the RTP timestamps handles a packet older than one already sent on another track (rtpTicks takes negative
+// offsets). A Source that is also a Clock has its capture times read on that clock (§8.2).
 type Source interface {
-	// Next blocks until the next packet is due and returns it; packets come in capture order.
+	// Next blocks until the next packet is due and returns it.
 	Next(ctx context.Context) (media.Packet, error)
-	// RequestKeyframe makes the next frame of a layer a keyframe.
+	// RequestKeyframe makes a coming frame of a layer a keyframe.
 	RequestKeyframe(layer string)
 }
 
-// ProfileSource is a Source that can encode another H.264 profile (in M2 the native engine re-initializes its
-// encoder). When an answer has the Publisher send another profile (SetProfile, 02 §8.3), it switches the Source with
-// SetProfile, then asks it for a keyframe of every layer, and sends that keyframe on the new profile's payload type.
+// ProfileSource is a Source that can encode another H.264 profile (in M2 the core forwards SetProfile as
+// media.Session.Reconfigure{Profile}, and the engine re-initializes its encoders). When an answer has the Publisher
+// send a profile of another engine profile (EngineProfile; SetProfile, 02 §8.3), it switches the Source with
+// SetProfile(the engine profile), then asks it for a keyframe of every layer, and each layer goes on in the new
+// profile's payload type from the first keyframe of the new encoder: the first one whose SPS has the new profile_idc
+// (a Reinit keyframe of a native engine, or the first keyframe of sfutest.ProfileSource's new Source). A switch to the
+// SDP alias of what is sent (HighAlias and HighProfile) only changes the payload type, at the next keyframe.
+//
 // A Source that isn't a ProfileSource (a fake.Source has one profile) keeps its SPS: only the payload type changes,
-// which is what an SFU goes by, but a decoder would see through it.
+// at the next keyframe, which is what an SFU goes by, but a decoder would see through it.
 type ProfileSource interface {
 	Source
 	SetProfile(profile string) error
@@ -81,6 +91,14 @@ type Options struct {
 	Padding int
 	// Logger gets the Publisher's own logs (default slog.Default()). Pion logs through Settings.LoggerFactory.
 	Logger *slog.Logger
+	// Pacing turns the video pacer on (docs/m2/01-client-core.md D8, §8.5): the video packets of all layers leave
+	// through one token bucket at max(PacingFactor × Σ active layer targets, MinPacingRate), PacingDepth deep and
+	// starting full, written by a goroutine of their own; audio is written at once, never behind video. While more
+	// than PacingBacklog of video waits, the send loop doesn't take the next packet from the Source; nothing is
+	// dropped. The core always sets it and calls SetPacingTargets with its initial targets before media flows. Off
+	// (the default), every packet is written when the Source hands it out, as in M1, so the load test, sfutest and
+	// M1's tests keep their behavior and numbers.
+	Pacing bool
 }
 
 // Defaults and fixed values.
@@ -91,6 +109,10 @@ const (
 	PayloadMTU = 1200
 	// SRInterval is how often each SSRC gets a sender report.
 	SRInterval = time.Second
+	// NACKResponderSize is how many sent packets Pion's NACK responder keeps per SSRC to answer NACKs with plain
+	// retransmissions (D7, §8.4: no RTX is negotiated): ≥ 4 s of an 8 Mbit/s layer, 1 s at 40 Mbit/s. M1 used Pion's
+	// default of 1024.
+	NACKResponderSize = 4096
 
 	videoPT        = 96 // the first profile's (Options.Profile); profile i has videoPT + 2i
 	rtxPT          = 97 // RedundantRTX: the first profile's RTX payload type; profile i has rtxPT + 2i
@@ -140,12 +162,25 @@ type TrackStats struct {
 	// bound). Audio has neither.
 	Profile string
 	PT      uint8
+	// The live numbers (docs/m2/01-client-core.md §8.7). Bitrate is in bit/s over the last 2 s, the media packets'
+	// payloads and RTP headers (the interceptors' TWCC extension, padding and repairs not counted); FPS is frames
+	// (audio: packets) over the last 2 s.
+	Bitrate int
+	FPS     float64
+	// CaptureToSend is, for video, the time from a frame's CaptureNS to the moment its last packet was written (left
+	// the pacer, with Options.Pacing), over the last 10 s. It needs a Source that is a Clock; without one it stays
+	// zero, and audio has none.
+	CaptureToSend LatencyStats
+	// RTT is the round-trip time from the last receiver report about this track (its LSR and DLSR against the
+	// sender reports the track wrote, RFC 3550 §6.4.1); 0 until one arrived.
+	RTT time.Duration
 }
 
 // Stats are a Publisher's counters.
 type Stats struct {
 	Tracks []TrackStats
-	// Dropped counts Source packets that no track sent: an unknown layer, or a track not bound yet.
+	// Dropped counts Source packets that no track sent: packets of media.KindEvent and media.KindPCM (the core's pump
+	// never passes one), an unknown layer, or a track not bound yet. The pacer drops nothing.
 	Dropped int64
 }
 
@@ -153,6 +188,7 @@ type Stats struct {
 // caller negotiates (Offer, then SetAnswer), then calls Start, and finally Close.
 type Publisher struct {
 	src     Source
+	clock   Clock // src as a Clock, or nil
 	pc      *webrtc.PeerConnection
 	log     *slog.Logger
 	video   []*track // in encoding order
@@ -160,6 +196,12 @@ type Publisher struct {
 	vsender *webrtc.RTPSender
 	asender *webrtc.RTPSender
 	dropped atomic.Int64
+	pacer   *pacer // Options.Pacing, else nil
+
+	// rateMu serializes the pacing rate's updates (SetPacingTargets, SetActive) and guards targets, the last ones
+	// SetPacingTargets gave.
+	rateMu  sync.Mutex
+	targets map[string]int
 
 	// The capture-to-wall-clock anchor, set from the first packet sent (send loop only).
 	anchored bool
@@ -237,6 +279,7 @@ func New(o Options) (*Publisher, error) {
 		return nil, fmt.Errorf("publish: new PeerConnection: %w", err)
 	}
 	p := &Publisher{src: o.Source, pc: pc, log: log, h264: table, encoding: profile}
+	p.setSending(o.Pacing)
 	if err := p.addTracks(layers, o.Audio, profile, stream); err != nil {
 		_ = pc.Close()
 		return nil, err
@@ -250,6 +293,15 @@ func New(o Options) (*Publisher, error) {
 		}
 	}
 	return p, nil
+}
+
+// setSending sets up what the send loop needs besides the tracks: the Source's Clock, if it is one, and the pacer
+// with Options.Pacing, at MinPacingRate until SetPacingTargets.
+func (p *Publisher) setSending(pacing bool) {
+	p.clock, _ = p.src.(Clock)
+	if pacing {
+		p.pacer = newPacer(p.clock)
+	}
 }
 
 // h264Table is a Publisher's H.264 profiles, in the order it offers them at first: profile i has payload type
@@ -303,11 +355,11 @@ var videoFeedback = []webrtc.RTCPFeedback{
 }
 
 // newAPI builds a browser-like publishing API: the H.264 profiles the Publisher can send (h264, in that order) and
-// Opus, simulcast and transport-wide-cc header extensions, a NACK responder and the TWCC header-extension
-// interceptor. No sender-report interceptor: the Publisher writes its own SRs. With rtx (Options.RedundantRTX) each
-// profile has an RTX payload type and there is no NACK responder: the tracks answer NACKs themselves (repair.go),
-// because the RTX stream has one sequence of numbers, which the second copies they send on it must share with the
-// repairs.
+// Opus, simulcast and transport-wide-cc header extensions, a NACK responder (NACKResponderSize) and the TWCC
+// header-extension interceptor. No sender-report interceptor: the Publisher writes its own SRs. With rtx
+// (Options.RedundantRTX) each profile has an RTX payload type and there is no NACK responder: the tracks answer NACKs
+// themselves (repair.go), because the RTX stream has one sequence of numbers, which the second copies they send on it
+// must share with the repairs.
 func newAPI(se webrtc.SettingEngine, h264 h264Table, rtx bool) (*webrtc.API, error) {
 	m := &webrtc.MediaEngine{}
 	for _, c := range h264.codecs(h264[0], rtx) {
@@ -339,7 +391,7 @@ func newAPI(se webrtc.SettingEngine, h264 h264Table, rtx bool) (*webrtc.API, err
 	}
 	ir := &interceptor.Registry{}
 	if !rtx {
-		responder, err := nack.NewResponderInterceptor()
+		responder, err := newNACKResponder()
 		if err != nil {
 			return nil, fmt.Errorf("publish: nack responder: %w", err)
 		}
@@ -352,6 +404,11 @@ func newAPI(se webrtc.SettingEngine, h264 h264Table, rtx bool) (*webrtc.API, err
 	ir.Add(tcc)
 	return webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(ir),
 		webrtc.WithSettingEngine(se)), nil
+}
+
+// newNACKResponder returns the factory of Pion's NACK responder at NACKResponderSize.
+func newNACKResponder() (*nack.ResponderInterceptorFactory, error) {
+	return nack.NewResponderInterceptor(nack.ResponderSize(NACKResponderSize))
 }
 
 // addTracks adds the video transceiver (one encoding per layer) and the audio transceiver, both sendonly.
@@ -521,8 +578,9 @@ func (p *Publisher) SetProfile(profile string) error {
 // a quality hint's encodings (01 §8.10; the SFU pauses a full layer that nobody watches, 02 §11). An inactive layer
 // sends nothing: its Source packets are dropped (TrackStats.Paused) and it writes no sender reports, while its RTCP
 // is still read. A layer turned on again starts with a keyframe, which the Source is asked for, as an encoder starts
-// an encoding it turns back on. Turning a layer to the state it has changes nothing. It returns an error that wraps
-// ErrInvalidOptions for a layer the Publisher doesn't send.
+// an encoding it turns back on. Turning a layer to the state it has changes nothing. With Options.Pacing an inactive
+// layer's target leaves the pacing rate (SetPacingTargets). It returns an error that wraps ErrInvalidOptions for a
+// layer the Publisher doesn't send.
 func (p *Publisher) SetActive(layer string, active bool) error {
 	for _, t := range p.video {
 		if t.layer != layer {
@@ -531,9 +589,38 @@ func (p *Publisher) SetActive(layer string, active bool) error {
 		if t.setActive(active) {
 			p.src.RequestKeyframe(layer)
 		}
+		p.rateMu.Lock()
+		p.updatePacingLocked()
+		p.rateMu.Unlock()
 		return nil
 	}
 	return fmt.Errorf("%w: no video layer %q", ErrInvalidOptions, layer)
+}
+
+// SetPacingTargets gives a pacing Publisher (Options.Pacing) the bitrate targets the core last applied, in bit/s per
+// video layer (its rid), as the core does after every rate change (§8.5, §11.8). The pacing rate becomes
+// max(PacingFactor × Σ targets of the layers SetActive left on, MinPacingRate), with a bucket PacingDepth deep at that
+// rate that keeps the tokens it has. Targets of layers the Publisher doesn't send (media.LayerAudio among them) and
+// negative ones count 0; the map is copied. Without Options.Pacing it changes nothing.
+func (p *Publisher) SetPacingTargets(targets map[string]int) {
+	p.rateMu.Lock()
+	defer p.rateMu.Unlock()
+	p.targets = maps.Clone(targets)
+	p.updatePacingLocked()
+}
+
+// updatePacingLocked sets the pacer's rate from the targets and the active layers. p.rateMu is held.
+func (p *Publisher) updatePacingLocked() {
+	if p.pacer == nil {
+		return
+	}
+	var active []string
+	for _, t := range p.video {
+		if t.isActive() {
+			active = append(active, t.layer)
+		}
+	}
+	p.pacer.setRate(pacingRate(p.targets, active))
 }
 
 // followAnswer notes an answer's choice of profile, the first H.264 codec of the video m-section with a profile the
@@ -589,17 +676,20 @@ func (p *Publisher) Tracks() []TrackInfo {
 	return out
 }
 
-// Stats returns a snapshot of the counters.
+// Stats returns a snapshot of the counters and of the live numbers.
 func (p *Publisher) Stats() Stats {
 	s := Stats{Dropped: p.dropped.Load()}
+	now := time.Now()
 	for _, t := range p.tracks() {
 		t.mu.Lock()
 		ts := t.stats
+		ts.Bitrate, ts.FPS = t.rates(now)
 		if t.kind == webrtc.RTPCodecTypeVideo {
 			ts.Profile = t.profile
 			if t.b != nil {
 				ts.PT = t.b.pt
 			}
+			ts.CaptureToSend = t.latency.latency(now)
 		}
 		t.mu.Unlock()
 		ts.TrackInfo = t.info()
@@ -617,9 +707,10 @@ func (p *Publisher) tracks() []*track {
 }
 
 // Start starts sending: the send loop pulls from the Source once the PeerConnection is connected (so the first frame,
-// a keyframe, isn't lost to the DTLS handshake), one RTCP reader per track handles PLI, FIR, NACK and REMB, and a
-// ticker writes the sender reports. The send loop and the SR ticker stop when ctx ends; the RTCP readers, which
-// block in Pion reads that only closing the PeerConnection ends, stop at Close, which waits for every goroutine.
+// a keyframe, isn't lost to the DTLS handshake), one RTCP reader per track handles PLI, FIR, NACK, REMB and receiver
+// reports, a ticker writes the sender reports, and with Options.Pacing the pacer writes the video. The send loop, the
+// pacer and the SR ticker stop when ctx ends; the RTCP readers, which block in Pion reads that only closing the
+// PeerConnection ends, stop at Close, which waits for every goroutine.
 func (p *Publisher) Start(ctx context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -634,6 +725,13 @@ func (p *Publisher) Start(ctx context.Context) error {
 	p.wg.Add(2)
 	go p.sendLoop(ctx)
 	go p.srLoop(ctx)
+	if p.pacer != nil {
+		p.wg.Add(1)
+		go func() {
+			defer p.wg.Done()
+			p.pacer.run(ctx)
+		}()
+	}
 	for _, t := range p.video {
 		read := func(b []byte) (int, error) { n, _, err := p.vsender.Read(b); return n, err }
 		if t.rid != "" {
@@ -673,15 +771,24 @@ func (p *Publisher) Close() error {
 	return nil
 }
 
-// sendLoop pulls packets from the Source and writes them, until ctx ends or the Source fails.
+// sendLoop pulls packets from the Source and sends them once the PeerConnection is connected (pump).
 func (p *Publisher) sendLoop(ctx context.Context) {
 	defer p.wg.Done()
 	if err := p.waitConnected(ctx); err != nil {
 		p.log.Debug("publish: not sending", "err", err)
 		return
 	}
+	p.pump(ctx)
+}
+
+// pump pulls packets from the Source and sends them, until ctx ends or the Source fails. With Options.Pacing it
+// takes no packet while the pacer's queue is backlogged.
+func (p *Publisher) pump(ctx context.Context) {
 	for {
 		p.applyProfile()
+		if p.pacer != nil && p.pacer.waitRoom(ctx) != nil {
+			return
+		}
 		pkt, err := p.src.Next(ctx)
 		if err != nil {
 			if ctx.Err() == nil {
@@ -695,8 +802,9 @@ func (p *Publisher) sendLoop(ctx context.Context) {
 
 // applyProfile switches the video to the profile the last answer chose, if it hasn't yet (followAnswer). The send
 // loop does it between two packets, so that no packet the Source made before the switch goes out after it: a
-// ProfileSource is switched first, then each layer is set to go on in the new profile's payload type from its next
-// keyframe, which the Source is asked for.
+// ProfileSource is switched first when the engine profile changes (EngineProfile), then each layer is set to go on in
+// the new profile's payload type from its next keyframe, which the Source is asked for: after a ProfileSource's
+// switch, from the first keyframe of the new profile_idc (track.switchesAt).
 func (p *Publisher) applyProfile() {
 	p.mu.Lock()
 	profile, encoding := p.chosen, p.encoding
@@ -708,14 +816,17 @@ func (p *Publisher) applyProfile() {
 	if profile == "" {
 		return
 	}
-	if ps, ok := p.src.(ProfileSource); ok && profile != encoding {
-		if err := ps.SetProfile(profile); err != nil {
+	var idc byte // the profile_idc of the keyframe each layer switches at; 0: its next keyframe
+	if ps, ok := p.src.(ProfileSource); ok && EngineProfile(profile) != EngineProfile(encoding) {
+		if err := ps.SetProfile(EngineProfile(profile)); err != nil {
 			p.log.Warn("publish: the source did not switch profiles", "profile", profile, "err", err)
+		} else {
+			idc = profileIDC(profile)
 		}
 	}
 	switched := false
 	for _, t := range p.video {
-		switched = t.switchTo(profile) || switched
+		switched = t.switchWhen(profile, idc) || switched
 	}
 	if switched {
 		for _, t := range p.video {
@@ -743,7 +854,9 @@ func (p *Publisher) waitConnected(ctx context.Context) error {
 	}
 }
 
-// send writes one Source packet on its track, unless SetActive keeps it back.
+// send writes one Source packet on its track, unless SetActive keeps it back: audio, and video without
+// Options.Pacing, at once; paced video through the pacer. A packet of no track (media.KindEvent, media.KindPCM, an
+// unknown layer) is dropped.
 func (p *Publisher) send(pkt media.Packet) {
 	t := p.trackFor(pkt)
 	if t == nil {
@@ -754,12 +867,18 @@ func (p *Publisher) send(pkt media.Packet) {
 		return
 	}
 	if !p.anchored {
-		// The Source returns a packet when it is due, so its capture instant is now.
-		p.anchored, p.cap0, p.wall0 = true, pkt.CaptureNS, time.Now()
+		// The wall-clock instant of the first capture (§8.2): now, less the packet's age on a Clock.
+		p.anchored, p.cap0, p.wall0 = true, pkt.CaptureNS, anchorWall(time.Now(), p.clock, pkt.CaptureNS)
 	}
 	d := pkt.CaptureNS - p.cap0
-	if !t.write(pkt, rtpTicks(d, t.clock), ntpTime(p.wall0.Add(time.Duration(d)))) {
+	f := t.packetize(pkt, rtpTicks(d, t.clock), ntpTime(p.wall0.Add(time.Duration(d))))
+	switch {
+	case f == nil:
 		p.dropped.Add(1)
+	case p.pacer != nil && t.kind == webrtc.RTPCodecTypeVideo:
+		p.pacer.push(f)
+	default:
+		t.writeFrame(f, p.clock)
 	}
 }
 
@@ -793,19 +912,18 @@ func (p *Publisher) srLoop(ctx context.Context) {
 			if !ok {
 				continue
 			}
+			at := time.Now() // before the write: an RTT taken against it never comes out below the real one
 			if err := p.pc.WriteRTCP([]rtcp.Packet{sr}); err != nil {
 				p.log.Debug("publish: write SR", "err", err)
 				continue
 			}
-			t.mu.Lock()
-			t.stats.SRs++
-			t.mu.Unlock()
+			t.wroteSR(sr, at)
 		}
 	}
 }
 
 // rtcpLoop reads one track's RTCP until the sender stops. Reading also runs the interceptors' RTCP handling (the
-// NACK responder); with Options.RedundantRTX the track answers the NACKs here.
+// NACK responder); with Options.RedundantRTX the track answers the NACKs here. Receiver reports give its RTT.
 func (p *Publisher) rtcpLoop(t *track, read func([]byte) (int, error)) {
 	defer p.wg.Done()
 	buf := make([]byte, 1500)
