@@ -2,6 +2,7 @@ package audiorules
 
 import (
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -189,6 +190,33 @@ func TestIDsUnique(t *testing.T) {
 			t.Errorf("browser family %q appears twice", b.Family)
 		}
 		families[b.Family] = true
+	}
+}
+
+// abiAppID is the C ABI's rule for an explicit app id (05 §4.1 im_rule.app_id, §4.3 Validation, §17: at most 63
+// bytes). One id outside it makes im_set_exclusions reject the whole rule set (IM_ERR_INVALID_ARG) and apply nothing,
+// the built-in voice apps included.
+var abiAppID = regexp.MustCompile(`^[a-z0-9:._-]{1,63}$`)
+
+// Every app id built from this data that reaches the DLL as an explicit im_rule.app_id fits the ABI: a voice app's
+// id (05 §14.3 step 3, RuleAppExclude(exe, SourceBuiltin, id, name)) and the viewer rule's "exe:<browser exe>"
+// (05 §5.9 step 3, source VIEWER). A voice app's id also has no ':', which marks the ids the service and the
+// audiotest build themselves ("exe:…", "fixture:…"). Launchers and shared runtimes are exempt: their rules carry no
+// app id (05 §14.3 step 2), so the DLL derives "exe:<value>" and checks nothing, and "battle.net launcher.exe", with
+// its space, is a valid launcher.
+func TestAppIDsFitTheABI(t *testing.T) {
+	for _, a := range VoiceApps() {
+		if !abiAppID.MatchString(a.ID) || strings.Contains(a.ID, ":") {
+			t.Errorf("voice app id %q is not 1–63 bytes of [a-z0-9._-] (05 §4.3)", a.ID)
+		}
+	}
+	for _, b := range Browsers() {
+		for _, name := range b.Windows {
+			if id := "exe:" + name; !abiAppID.MatchString(id) {
+				t.Errorf("browser family %s: viewer rule app id %q is not 1–63 bytes of [a-z0-9:._-] (05 §4.3)",
+					b.Family, id)
+			}
+		}
 	}
 }
 

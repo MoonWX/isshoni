@@ -36,7 +36,7 @@ func (n OSNames) clone() OSNames {
 // VoiceApp is one built-in voice app. Every process whose app walk hits one of its names is kept out with source
 // BUILTIN and reason "builtin", and the user can't include it (05 §5.3 row 2; the service's ErrLockedApp, 05 §14.2).
 type VoiceApp struct {
-	ID   string // app id of the report rows and decisions, e.g. "discord"; never "exe:…" and never "isshoni"
+	ID   string // app id of the report rows and decisions, e.g. "discord": [a-z0-9._-]{1,63} (05 §4.3), never "isshoni"
 	Name string // display name, e.g. "Discord": the name the service puts into the app's rules (05 §5.1)
 	OSNames
 }
