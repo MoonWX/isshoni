@@ -472,7 +472,8 @@ func TestHistoryMismatch(t *testing.T) {
 	if !errors.Is(err, ErrNeedsOperator) {
 		t.Fatalf("Open = %v, want ErrNeedsOperator", err)
 	}
-	want := `store: schema history mismatch at version 2 (DB has "0002_fake_2", binary has "0002_renamed")`
+	// The names come from the list: version 2 is a real migration or a fake one, depending on the binary.
+	want := fmt.Sprintf(`store: schema history mismatch at version 2 (DB has %q, binary has "0002_renamed")`, all[1].name)
 	if !strings.HasPrefix(err.Error(), want) {
 		t.Errorf("message = %q, want prefix %q", err, want)
 	}
@@ -483,14 +484,14 @@ func TestHistoryMismatch(t *testing.T) {
 	}
 	_ = raw.Close()
 	_, err = Open(context.Background(), e.opts(all))
-	if !errors.Is(err, ErrNeedsOperator) || !strings.Contains(err.Error(), `version 3 (DB has "0003_other", binary has "0003_fake_3")`) {
+	if !errors.Is(err, ErrNeedsOperator) || !strings.Contains(err.Error(), fmt.Sprintf(`version 3 (DB has "0003_other", binary has %q)`, all[2].name)) {
 		t.Errorf("renamed row: %v", err)
 	}
-	if err := checkHistory([]appliedRow{{1, "0001_init"}, {3, "0003_fake_3"}}, all); err == nil ||
+	if err := checkHistory([]appliedRow{{1, all[0].name}, {3, all[2].name}}, all); err == nil ||
 		!strings.Contains(err.Error(), "mismatch at version 2") {
 		t.Errorf("gap: %v", err)
 	}
-	if err := checkHistory([]appliedRow{{1, "0001_init"}, {2, "0002_fake_2"}, {3, "0003_fake_3"}, {4, "0004_newer"}}, all); err != nil {
+	if err := checkHistory([]appliedRow{{1, all[0].name}, {2, all[1].name}, {3, all[2].name}, {4, "0004_newer"}}, all); err != nil {
 		t.Errorf("versions beyond the binary are not a mismatch: %v", err)
 	}
 }
@@ -533,7 +534,7 @@ func TestNeedsOperator(t *testing.T) {
 		"new DB with a failed migration": func(t *testing.T) (string, error) {
 			ms := slices.Clone(all)
 			ms[1].sql = "CREATE TABLE fake_2 (x INTEGER) STRICT; CREATE TABLE fake_2 (y INTEGER) STRICT;"
-			return "migration 0002_fake_2 failed", newEnv(t).openClose(ms)
+			return "migration " + ms[1].name + " failed", newEnv(t).openClose(ms)
 		},
 		"not a database": func(t *testing.T) (string, error) {
 			e := newEnv(t)
@@ -668,12 +669,15 @@ func TestCancelledContextIsNotAnOperatorError(t *testing.T) {
 func TestGoStepRunsInTheMigrationTransaction(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	all := fakeMigrations(2)
-	if err := e.openClose(all[:1]); err != nil {
+	// The step belongs to the first fake version after the embedded ones.
+	v := LatestSchemaVersion() + 1
+	all := fakeMigrations(v)
+	if err := e.openClose(all[:v-1]); err != nil {
 		t.Fatal(err)
 	}
 	ms := slices.Clone(all)
-	ms[1].goStep = func(ctx context.Context, tx *sql.Tx) error {
+	ms[v-1].sql = "CREATE TABLE step_target (x INTEGER NOT NULL) STRICT;\nINSERT INTO step_target VALUES (1);"
+	ms[v-1].goStep = func(ctx context.Context, tx *sql.Tx) error {
 		// The SQL of this version ran first, and foreign keys are off (table rebuilds need that).
 		var fk int
 		if err := tx.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&fk); err != nil {
@@ -682,12 +686,12 @@ func TestGoStepRunsInTheMigrationTransaction(t *testing.T) {
 		if fk != 0 {
 			return fmt.Errorf("foreign_keys = %d during a migration", fk)
 		}
-		_, err := tx.ExecContext(ctx, "UPDATE fake_2 SET x = 42")
+		_, err := tx.ExecContext(ctx, "UPDATE step_target SET x = 42")
 		return err
 	}
 	db := e.open(ms)
-	if n := queryInt(t, db, "SELECT x FROM fake_2"); n != 42 {
-		t.Errorf("fake_2.x = %d, want 42", n)
+	if n := queryInt(t, db, "SELECT x FROM step_target"); n != 42 {
+		t.Errorf("step_target.x = %d, want 42", n)
 	}
 	// Foreign keys are back on for normal writes.
 	err := execW(t, db, `INSERT INTO sessions (id, user_id, token_hash, name, created_at, rotated_at, last_seen_at,

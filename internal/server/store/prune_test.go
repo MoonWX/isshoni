@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -133,6 +135,19 @@ func TestPruneBoundaries(t *testing.T) {
 			left:  "SELECT count(*) FROM device_codes",
 		},
 		{
+			name: "devices: created more than 1 h ago, without a live refresh token",
+			setup: func(e *testEnv, db *DB) time.Time {
+				u := e.newUser(db, "Alex")
+				d := e.linkDevice(db, u.ID, "Gaming PC", e.clock.Now())
+				// Tokens that keep no device alive: an access token and a spent refresh token, both unexpired.
+				e.newToken(db, d.ID, "access", "a", 30*24*time.Hour)
+				e.newToken(db, d.ID, "refresh", "r", 30*24*time.Hour, func(t *DeviceToken) { t.SpentAt = d.CreatedAt })
+				return d.CreatedAt.Add(time.Hour)
+			},
+			count: func(s PruneStats) int { return s.Devices },
+			left:  "SELECT count(*) FROM devices",
+		},
+		{
 			name: "device tokens: expires_at < now",
 			setup: func(e *testEnv, db *DB) time.Time {
 				u := e.newUser(db, "Alex")
@@ -202,6 +217,13 @@ func TestPruneLeavesLiveRows(t *testing.T) {
 	alex := e.newUser(db, "Alex", func(u *User) { u.Role = RoleAdmin })
 	kim := e.newUser(db, "Kim", func(u *User) { u.Status, u.CreatedVia = StatusPending, "signup" })
 	e.newSession(db, alex.ID, "live", later, func(s *Session) { s.LastSeenAt = later })
+	// A device that refreshed recently: its live refresh token keeps it, and its spent chain stays too.
+	dev := e.linkDevice(db, alex.ID, "Gaming PC", t0)
+	e.newToken(db, dev.ID, "refresh", "old", 90*24*time.Hour, func(t *DeviceToken) { t.ExpiresAt = later.Add(time.Hour) })
+	e.newToken(db, dev.ID, "refresh", "new", 0, func(t *DeviceToken) {
+		t.CreatedAt, t.ExpiresAt = later.Add(-time.Hour), later.Add(90*24*time.Hour)
+	})
+	mustWrite(t, db, func(q *Q) error { return q.SpendRefreshToken([]byte("old"), []byte("new"), nil, later) })
 	inv := Invite{TokenHash: []byte("i"), CreatedAt: t0, ExpiresAt: later.Add(time.Hour), MaxUses: 5}
 	mustWrite(t, db, func(q *Q) error {
 		if err := q.CreateInvite(&inv); err != nil {
@@ -217,10 +239,12 @@ func TestPruneLeavesLiveRows(t *testing.T) {
 		t.Errorf("Prune = %+v, want only the pending sign-up", st)
 	}
 	for query, want := range map[string]int{
-		"SELECT count(*) FROM users":    1,
-		"SELECT count(*) FROM sessions": 1,
-		"SELECT count(*) FROM invites":  1,
-		"SELECT count(*) FROM rooms":    1,
+		"SELECT count(*) FROM users":         1,
+		"SELECT count(*) FROM sessions":      1,
+		"SELECT count(*) FROM invites":       1,
+		"SELECT count(*) FROM rooms":         1,
+		"SELECT count(*) FROM devices":       1,
+		"SELECT count(*) FROM device_tokens": 2,
 	} {
 		if n := queryInt(t, db, query); n != want {
 			t.Errorf("%s = %d, want %d", query, n, want)
@@ -241,6 +265,125 @@ func TestPruneLeavesLiveRows(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+// TestPruneDevices: the devices rule of M2 02 §6.7. A device older than an hour goes when it has no unspent,
+// unexpired refresh token, with its tokens and push subscriptions and one device.expired row (actor system); a
+// younger one, or one with a live refresh token, stays. Expired devices count in PruneStats.Devices, and their
+// tokens do not count in DeviceTokens.
+func TestPruneDevices(t *testing.T) {
+	t.Parallel()
+	const day = 24 * time.Hour
+	e := newEnv(t)
+	db := e.open(nil)
+	t0 := e.clock.Now()
+	alex := e.newUser(db, "Alex")
+	sam := e.newUser(db, "Sam")
+	spentAt := func(at time.Time) func(*DeviceToken) { return func(t *DeviceToken) { t.SpentAt = at } }
+
+	onlySpent := e.linkDevice(db, alex.ID, "Only spent", t0) // spent refresh tokens and an access token
+	e.newToken(db, onlySpent.ID, "refresh", "s1", 90*day, spentAt(t0))
+	e.newToken(db, onlySpent.ID, "access", "s2", 90*day)
+	mustExecW(t, db, `INSERT INTO push_subscriptions (id, user_id, device_id, endpoint, p256dh, auth_secret, name,
+		created_at) VALUES ('p1', ?, ?, 'https://push.example/1', 'k', 'a', 'App', 0)`, string(alex.ID),
+		string(onlySpent.ID))
+	expiredTok := e.linkDevice(db, sam.ID, "Expired token", t0) // its unspent refresh token expired
+	e.newToken(db, expiredTok.ID, "refresh", "e1", 30*time.Minute)
+	live := e.linkDevice(db, alex.ID, "Live", t0) // a live refresh token, and an expired access token
+	e.newToken(db, live.ID, "refresh", "l1", 90*day)
+	e.newToken(db, live.ID, "access", "l2", 15*time.Minute)
+	young := e.linkDevice(db, alex.ID, "Young", t0.Add(30*time.Minute)) // no token yet, but under an hour old
+
+	now := t0.Add(time.Hour + time.Millisecond)
+	st, err := db.Prune(context.Background(), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != (PruneStats{Devices: 2, DeviceTokens: 1}) {
+		t.Errorf("Prune = %+v, want 2 devices and the live device's expired access token", st)
+	}
+	var left []DeviceID
+	mustRead(t, db, func(q *Q) error {
+		for _, u := range []UserID{alex.ID, sam.ID} {
+			ds, err := q.ListDevices(u)
+			if err != nil {
+				return err
+			}
+			for _, d := range ds {
+				left = append(left, d.ID)
+			}
+		}
+		return nil
+	})
+	slices.Sort(left)
+	want := []DeviceID{live.ID, young.ID}
+	slices.Sort(want)
+	if !slices.Equal(left, want) {
+		t.Errorf("devices left = %v, want the live and the young one %v", left, want)
+	}
+	for query, want := range map[string]int{
+		"SELECT count(*) FROM device_tokens":      1, // l1
+		"SELECT count(*) FROM push_subscriptions": 0,
+	} {
+		if n := queryInt(t, db, query); n != want {
+			t.Errorf("%s = %d, want %d", query, n, want)
+		}
+	}
+	// One device.expired row per device, in device ID order: actor system, the device as target, no IP, no detail.
+	gone := []Device{onlySpent, expiredTok}
+	slices.SortFunc(gone, func(a, b Device) int { return strings.Compare(string(a.ID), string(b.ID)) })
+	mustRead(t, db, func(q *Q) error {
+		rows, err := q.ListAudit(AuditQuery{ActionPrefix: "device."})
+		if err != nil {
+			return err
+		}
+		if len(rows) != 2 {
+			t.Fatalf("device audit rows = %+v, want 2", rows)
+		}
+		slices.Reverse(rows) // oldest first
+		for i, r := range rows {
+			if r.Action != "device.expired" || !r.At.Equal(now) || r.Actor != SystemActor || r.Outcome != "ok" ||
+				r.TargetKind != "device" || r.TargetID != string(gone[i].ID) || r.TargetName != gone[i].Name ||
+				len(r.Detail) != 0 {
+				t.Errorf("audit row %d = %+v, want device.expired for %s", i, r, gone[i].Name)
+			}
+		}
+		return nil
+	})
+
+	// The young device turns an hour old: it goes exactly after its limit, like every rule.
+	limit := young.CreatedAt.Add(time.Hour)
+	for _, at := range []time.Time{limit.Add(-time.Millisecond), limit} {
+		if st, err := db.Prune(context.Background(), at); err != nil || st.Devices != 0 {
+			t.Fatalf("Prune(young limit%+v) = %+v, %v; want the young device kept", at.Sub(limit), st, err)
+		}
+	}
+	if st, err := db.Prune(context.Background(), limit.Add(time.Millisecond)); err != nil || st.Devices != 1 {
+		t.Errorf("Prune(young limit+1ms) = %+v, %v; want the young device gone", st, err)
+	}
+}
+
+// TestPruneDevicesTokenBoundary: a device lives while its unspent refresh token has expires_at > now; at the token's
+// expires_at it is no longer live (the rule of DeviceTokenByHash), and the device goes.
+func TestPruneDevicesTokenBoundary(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	db := e.open(nil)
+	t0 := e.clock.Now()
+	d := e.linkDevice(db, e.newUser(db, "Alex").ID, "Gaming PC", t0)
+	tok := e.newToken(db, d.ID, "refresh", "r", 90*24*time.Hour)
+	for _, at := range []time.Time{tok.ExpiresAt.Add(-time.Hour), tok.ExpiresAt.Add(-time.Millisecond)} {
+		if st, err := db.Prune(context.Background(), at); err != nil || st != (PruneStats{}) {
+			t.Fatalf("Prune(expiry%+v) = %+v, %v; want the device kept", at.Sub(tok.ExpiresAt), st, err)
+		}
+	}
+	st, err := db.Prune(context.Background(), tok.ExpiresAt)
+	if err != nil || st != (PruneStats{Devices: 1}) {
+		t.Errorf("Prune(at the token's expiry) = %+v, %v; want the device gone with its token", st, err)
+	}
+	if n := queryInt(t, db, "SELECT count(*) FROM device_tokens"); n != 0 {
+		t.Errorf("device tokens left = %d", n)
+	}
 }
 
 // TestPruneUpkeep: PRAGMA optimize runs at most once per 24 h of Prune's now, counted from Open's own run.

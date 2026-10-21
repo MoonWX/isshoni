@@ -222,6 +222,9 @@ func TestSecurityEvents(t *testing.T) {
 		{At: t0, Action: "user.deleted"},
 		{At: t0, Action: "user.password_reset_issued"},
 		{At: t0, Action: "secrets.rotated"},
+		{At: t0, Action: "device.linked"}, // M2 02 §8
+		{At: t0, Action: "device.approved"},
+		{At: t0, Action: "device.expired"},
 		{At: t0, Action: "device.refresh_reused"},
 		{At: t0, Action: "user.role_changed"},
 	}
@@ -245,8 +248,9 @@ func TestSecurityEvents(t *testing.T) {
 		})
 		return out
 	}
-	want := []string{"user.role_changed", "device.refresh_reused", "secrets.rotated", "user.password_reset_issued",
-		"user.deleted", "user.disabled", "settings.changed", "auth.throttled", "setup.completed"}
+	want := []string{"user.role_changed", "device.refresh_reused", "device.linked", "secrets.rotated",
+		"user.password_reset_issued", "user.deleted", "user.disabled", "settings.changed", "auth.throttled",
+		"setup.completed"}
 	if got := get(0); !slices.Equal(got, want) {
 		t.Errorf("SecurityEvents =\n %v\nwant\n %v", got, want)
 	}

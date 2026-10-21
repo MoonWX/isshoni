@@ -13,7 +13,8 @@ import (
 var (
 	// ErrNotFound means the row does not exist (or, for methods documented so, is not in the required state).
 	ErrNotFound = errors.New("store: not found")
-	// ErrConflict is wrapped by *ConflictError: a UNIQUE constraint rejected the write.
+	// ErrConflict is wrapped by *ConflictError (a UNIQUE constraint rejected the write), and by the errors of
+	// SpendRefreshToken and SupersedeRefreshToken when the refresh token was spent in parallel.
 	ErrConflict = errors.New("store: unique constraint")
 	// ErrInviteUnusable is returned by UseInvite when the invite is expired, used up or revoked.
 	ErrInviteUnusable = errors.New("store: invite expired, used up or revoked")
@@ -26,23 +27,15 @@ var (
 	ErrNeedsOperator = errors.New("store: needs operator action")
 )
 
-// errNotImplemented marks the parts of the public API that later slices fill in. Callers see a clear error instead
-// of a silent no-op.
-var errNotImplemented = errors.New("not implemented yet")
-
 // errClosed is returned by every DB method called after Close.
 var errClosed = errors.New("store: database is closed")
 
 // errReadOnlyTx is returned by a write method called inside Read.
 var errReadOnlyTx = errors.New("store: write inside a read transaction")
 
-func notImplemented(method string) error {
-	return fmt.Errorf("store: %s: %w", method, errNotImplemented)
-}
-
 // ConflictError reports the UNIQUE column that rejected a write.
 type ConflictError struct {
-	Column string // "username_key" | "name_key" | "endpoint"
+	Column string // "username_key" | "name_key" | "endpoint" | "user_code_hash"
 }
 
 func (e *ConflictError) Error() string { return "store: " + e.Column + " is already taken" }

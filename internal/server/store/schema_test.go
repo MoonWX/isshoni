@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -16,6 +17,11 @@ import (
 
 // goldenSchema is a verbatim copy of the SQL block in docs/m1/03-accounts-and-store.md §5 (schema version 1).
 const goldenSchema = "testdata/schema_v1.sql"
+
+// goldenSchemaOf is the golden schema of a new database at version v: testdata/schema_v1.sql is 03 §5, and each
+// later testdata/schema_v<v>.sql is what SQLite stores after migration v (M2: 0002_device_flow, 02 §4.1). A new
+// migration comes with its golden file.
+func goldenSchemaOf(v int) string { return fmt.Sprintf("testdata/schema_v%d.sql", v) }
 
 // canonicalSQL removes -- comments, collapses whitespace and drops the trailing semicolon. SQLite stores each
 // CREATE statement's own text (from CREATE up to the semicolon, comments included), so two statements compare equal
@@ -80,30 +86,74 @@ func schemaDump(t *testing.T, db *DB) []string {
 	return out
 }
 
-// TestSchemaMatchesGolden: the schema of a new database is exactly 03 §5.
+// TestSchemaMatchesGolden: the schema of a new database at version 1 is exactly 03 §5, and at each later version
+// exactly its golden file; the newest is the schema every database has after Open.
 func TestSchemaMatchesGolden(t *testing.T) {
 	t.Parallel()
-	golden, err := os.ReadFile(goldenSchema)
+	if LatestSchemaVersion() < 2 {
+		t.Fatalf("LatestSchemaVersion() = %d, want at least 2 (0002_device_flow)", LatestSchemaVersion())
+	}
+	for v := 1; v <= LatestSchemaVersion(); v++ {
+		t.Run(fmt.Sprintf("v%d", v), func(t *testing.T) {
+			t.Parallel()
+			golden, err := os.ReadFile(goldenSchemaOf(v))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := splitStatements(string(golden))
+			db := newEnv(t).open(embeddedMigrations()[:v])
+			got := schemaDump(t, db)
+			if len(want) < 20 {
+				t.Fatalf("golden has only %d statements", len(want))
+			}
+			for i := range max(len(got), len(want)) {
+				var g, w string
+				if i < len(got) {
+					g = got[i]
+				}
+				if i < len(want) {
+					w = want[i]
+				}
+				if g != w {
+					t.Errorf("statement %d:\n got: %s\nwant: %s", i+1, g, w)
+				}
+			}
+		})
+	}
+}
+
+// TestMigration0002MatchesSpec: migrations/0002_device_flow.sql is the SQL block of docs/m2/02-device-auth.md §4.1,
+// byte for byte. Skipped outside a repository checkout.
+func TestMigration0002MatchesSpec(t *testing.T) {
+	t.Parallel()
+	doc, err := os.ReadFile(filepath.Join("..", "..", "..", "docs", "m2", "02-device-auth.md"))
+	if errors.Is(err, os.ErrNotExist) {
+		t.Skip("docs/m2 is not available")
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := splitStatements(string(golden))
-	db := newEnv(t).open(embeddedMigrations()[:1])
-	got := schemaDump(t, db)
-	if len(want) < 20 {
-		t.Fatalf("golden has only %d statements", len(want))
+	s := string(doc)
+	i := strings.Index(s, "\n### 4.1 Migration `0002_device_flow.sql`")
+	if i < 0 {
+		t.Fatal("02 has no §4.1 heading for 0002_device_flow.sql")
 	}
-	for i := range max(len(got), len(want)) {
-		var g, w string
-		if i < len(got) {
-			g = got[i]
-		}
-		if i < len(want) {
-			w = want[i]
-		}
-		if g != w {
-			t.Errorf("statement %d:\n got: %s\nwant: %s", i+1, g, w)
-		}
+	s = s[i:]
+	start := strings.Index(s, "\n```sql\n")
+	if start < 0 {
+		t.Fatal("02 §4.1 has no sql block")
+	}
+	s = s[start+len("\n```sql\n"):]
+	end := strings.Index(s, "\n```\n")
+	if end < 0 {
+		t.Fatal("02 §4.1's sql block does not end")
+	}
+	m := embeddedMigrations()[1]
+	if m.name != "0002_device_flow" {
+		t.Fatalf("migration 2 is %s, want 0002_device_flow", m.name)
+	}
+	if block := s[:end+1]; m.sql != block {
+		t.Errorf("migrations/%s.sql differs from the SQL block of docs/m2/02-device-auth.md §4.1", m.name)
 	}
 }
 
