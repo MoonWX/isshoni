@@ -16,7 +16,7 @@ gate.
 ## 1. Scope
 
 In this doc (all M2 unless tagged):
-- The audio half of the Windows engine (`isshoni_media.dll`), up to 04's `im::audio::PcmSink::OnChunk`: session
+- The audio half of the Windows engine (`isshoni-media.dll`), up to 04's `im::audio::PcmSink::OnChunk`: session
   watcher, process table, exclusion policy, include-set planner, process-loopback capture, mixer, adaptive resampling,
   chunk timestamps, startup probe, sound check, "What friends hear" report and level meters. It implements the C++
   boundary 04 §10.2 defines (§10.5 here).
@@ -1219,7 +1219,7 @@ Errors follow 01 §5.2 (`*media.Error{Code, Op, Detail}`, `Error.Is` by code). T
 | `IM_ERR_BAD_STATE` | `im_audio_levels_get`, `im_audio_set_mode`, `im_audio_set_muted`, and any audio call after `IM_INIT_NO_AUDIO` | `&Error{Code: CodeAudioNotRunning, Op, Detail}`, so `errors.Is(err, media.ErrAudioNotRunning)` holds. This is the audio exception to 04 §12.2's table, which maps `IM_ERR_BAD_STATE` from other calls to `internal`; `internal/media/native` declares no sentinels of its own |
 | `IM_ERR_INVALID_ARG` | `im_set_exclusions`, `im_audio_watch`, `im_audio_set_mode` | `&Error{Code: CodeInvalid, Op, Detail: im_last_error}`, e.g. `Op: "set_exclusions"`; matches 01's `ErrInvalid` |
 | `IM_ERR_TIMEOUT` (−15) | the COM wait of `im_list_audio_apps` and `im_audio_sound_check` | `&Error{Code: CodeTimeout, Op}`, e.g. `Op: "list_audio_apps"` (01's `CodeTimeout` unwraps to `context.DeadlineExceeded`, 04 §12.2); never retried |
-| `IM_ERR_ABI` | a struct the DLL doesn't accept | `&Error{Code: CodeInternal, Op, Detail}` (an installation mixing two releases) |
+| `IM_ERR_ABI` | a struct the DLL doesn't accept | `&Error{Code: CodeDependency, Reason: "abi", Op, Detail}` (01 §5.2, README §3 item 17: an installation mixing two releases gets 03's reinstall text) |
 | others | — | 01 §7.2's mapping |
 
 `Op` is the export's name without `im_`. **Mode validation** happens in Go, without a call, in the binding's single
@@ -1981,14 +1981,15 @@ Exact manual run (≈ 10 minutes per OS):
    `cmd/isshoni-audiotest/results/YYYY-MM-DD-<win10|win11>-<build>.json` and adds a row (date, OS build, harness and
    DLL version, summary, notes) to the results table in `cmd/isshoni-audiotest/README.md`.
 
-Self-hosted runner (optional, owner's decision, §25 question 2): an ephemeral runner (`config.cmd --ephemeral`, labels
-`self-hosted, windows, audio, win11|win10`) started by hand with `run.cmd` in the owner's interactive desktop session
-(process loopback and explorer-parented fixtures need the user session; a service in session 0 can't do this), online
-only while the owner runs a test. The workflow `audiotest.yml` (06) triggers only on `workflow_dispatch`, runs only
-`if: github.repository == 'MoonWX/isshoni'`, uses an environment that requires the owner's approval, downloads the
-`isshoni-exit-tools` artifact of the release run named by its `release_run_id` input (suite `release`; 06 §10.4), runs
-`run -gate`, and uploads the redacted report as an artifact. No `pull_request` trigger ever targets these labels, and
-"Require approval for all outside collaborators" stays on for fork workflows.
+Self-hosted runner (optional, owner's decision, §25 question 2): an ephemeral runner (`config.cmd --ephemeral`, 06's
+labels `self-hosted, windows, x64, isshoni-audio, win11|win10`, 06 §10.4–§10.5) started by hand with `run.cmd` in the
+owner's interactive desktop session (process loopback and explorer-parented fixtures need the user session; a service in
+session 0 can't do this), online only while the owner runs a test. The workflow `audiotest.yml` (06) triggers only on
+`workflow_dispatch`, runs only `if: github.repository == 'MoonWX/isshoni'`, uses an environment that requires the
+owner's approval (06's `audiotest`), downloads the `isshoni-exit-tools` artifact of the release run named by its
+`release_run_id` input (suite `release`; 06 §10.4), runs `run -gate` (suite `full`: `run -gate -long`), and uploads the
+redacted report as an artifact. No `pull_request` trigger ever targets these labels, and "Require approval for all
+outside collaborators" stays on for fork workflows.
 
 ### 18.9 Manual real-app checks
 
@@ -2073,11 +2074,11 @@ Native tests use GoogleTest through 04's vcpkg `tests` feature and run with `tas
 - **Go binding logic** (`internal/media/native`, 01 §7.7's `caller` fake, Mac and CI ubuntu): `im_exclusions` and
   `im_audio_levels` layouts; the status → error table of §13.1 (`IM_ERR_BAD_STATE` from an audio call matches
   `media.ErrAudioNotRunning`; `IM_ERR_INVALID_ARG` → `CodeInvalid` with `im_last_error` as `Detail`; `IM_ERR_TIMEOUT` →
-  `CodeTimeout`, called exactly once); the snprintf retry through 01 §7.3's helper; mode mapping and Go-side rejection
-  (`AudioConfig.Mode`: `""`, exclude-apps and `AudioTestTone` → modes 1, 1, 100; `AudioOff` and everything →
-  `CodeInvalid` with no `im_start` call; `SetAudioMode`: off and exclude-apps only, `AudioTestTone` and everything →
-  `CodeInvalid` with no call); `SetBitrate(media.LayerAudio, …)` → `im_set_audio_bitrate`; `IM_PACKET_PCM` becomes
-  `KindPCM` and appears only with `TapPCM`.
+  `CodeTimeout`, called exactly once; `IM_ERR_ABI` → `CodeDependency` with Reason `abi`); the snprintf retry through
+  01 §7.3's helper; mode mapping and Go-side rejection (`AudioConfig.Mode`: `""`, exclude-apps and `AudioTestTone` →
+  modes 1, 1, 100; `AudioOff` and everything → `CodeInvalid` with no `im_start` call; `SetAudioMode`: off and
+  exclude-apps only, `AudioTestTone` and everything → `CodeInvalid` with no call); `SetBitrate(media.LayerAudio, …)` →
+  `im_set_audio_bitrate`; `IM_PACKET_PCM` becomes `KindPCM` and appears only with `TapPCM`.
 - **Go service** (`go test -race`): `ParseAudioReport` on the goldens (and fuzzed, 60 s); `audiorules` (lower case,
   unique, no browser is a launcher, `msedgewebview2.exe` not a browser); the rules builder (§14.3) for every settings
   combination; `AudioConfig` flushes the debounce and returns `Mode: exclude-apps`; `SetSharedPID` (pick, release,
@@ -2267,15 +2268,16 @@ R1–R7 (§18.9); the first-run sound check on both OSes; a 2-hour watch-togethe
   - Logs no audio app names at any level (§16); 03 §17's "image names only at debug" becomes "never".
   - Carries §14.8's keys in `web/src/i18n/lazy/desktop.en.json`.
 - **04-windows-engine.md**
-  - Owns `isshoni_media.h` and the DLL (`isshoni_media.dll`); carries §4.1 in its conventions, including
+  - Owns `isshoni_media.h` and the DLL (`isshoni-media.dll`); carries §4.1 in its conventions, including
     `IM_ERR_TIMEOUT` (−15), `IM_PACKET_PCM`, the `im_start_config.exclusions` pointer, the `flags` argument of
     `im_list_audio_apps` (0, reserved), `int32_t timeout_ms` in `im_audio_sound_check`, and §4.1's layouts in 04 §5.4
     and `im_abi_layout`. Its call-reference note for `im_audio_set_muted` reads "the pause mute 01's core sets", not
     "the user's Sound off" (§4.3).
-  - Build: one CMake root `native/`; 04's `native/common/CMakeLists.txt` adds `im_audiopolicy` and `im_audiomix`
-    (`native/common/audiopolicy/`, `native/common/audiomix/`); `speexdsp` (BSD-3-Clause) in `native/vcpkg.json` beside
-    `opus`; GoogleTest through the `tests` feature; presets `host-debug`, `host-tsan`, `win-x64-ci`; `task
-    native:test`; CI ubuntu-24.04, macos-15, windows-2025.
+  - Build: one CMake root `native/`; 04's `native/common/CMakeLists.txt` (README WA03) adds `audio/`, `audiopolicy/`
+    (`im_audiopolicy`) and `audiomix/` (`im_audiomix`) behind `if(EXISTS …)` guards, and each library globs its own
+    `tests/*_test.cpp`, so 05's slices only add files in their folders; `speexdsp` (BSD-3-Clause) in
+    `native/vcpkg.json` beside `opus`; GoogleTest through the `tests` feature; presets `host-debug`, `host-tsan`,
+    `win-x64-ci`; `task native:test`; CI ubuntu-24.04, macos-15, windows-2025.
   - The C++ boundary of 04 §10.2 as §10.5 implements it; the Opus stage adopts §10.1 and §10.2; the rings of 04 §6.2.
   - The start-at-`epoch_ns` drop (04 §10.3) assumes only L ≥ 0 (chunks stamped L ≈ 50 ms in the past at start, L0),
     not L ≥ 50 ms (§10.3).
@@ -2313,9 +2315,9 @@ Each slice is independently testable. "Mac" means `task test` on the developer's
 | A2 | Go audio types and fake | `internal/media/audio.go` (§13.1), goldens, `fake/audio_ctl.go` (`EngineConfig.AudioScenario`, the scenarios of §13.3, the call-log fields) | goldens parse; fake scenarios scripted under synctest; the fake's `AudioController` works before `Start`; `GOOS=windows/darwin/linux` and the gomobile package builds pass | Mac, CI | 01's C01 (media package) | 1.5 |
 | A3 | `audiopolicy` core | portable C++20 of §5–6 as CMake target `im_audiopolicy` in `native/common/audiopolicy/` (added by 04's `native/common/CMakeLists.txt`): snapshot, rules, classifier, lineage, mic state, planner, invariants, the WebView2 path rule | ≈ 60 GoogleTest table cases and the 10 000-seed property test pass under `task native:test` in `host-debug` and `host-tsan` (macOS clang, ubuntu-24.04) and `win-x64-ci` (windows-2025, MSVC) | Mac, CI | 04's E1 | 3 |
 | A4 | `audiomix` core | target `im_audiomix` in `native/common/audiomix/`: rings with QPC side ring, PI resampler (speexdsp from `native/vcpkg.json`, `init_frac` creation, \|ppm\| ≥ 1, `reset_mem` on leaving the bypass), silence drop/pad, channel states, fades, onset fade (saturated counter for new channels), soft clip, levels, silence flags, chunk timestamps (mix time, L0 = 50 ms, re-anchor only in silence) and the `OnGap` rules (§10.3, §10.4); report writer producing the goldens | §19.1 `audiomix` and report-writer tests pass, including the 30 ms-silence onset, ppm never 0, no mixer-thread allocation (Linux `host-debug`) and sound from t = 0; the drift simulation meets §17 | Mac, CI | A2 (goldens), 04's E1 | 3 |
-| A5 | Windows watcher (no capture) | process table, endpoints, session notifications, meters, mic detection, device notifications, `AudioEngine::Init/Shutdown/Watch/Unwatch/SetRules/ListAppsJson/LevelsGet/ProbeFlags`, `im_caps.audio_flags`; Go `internal/media/native/audio.go` and `audio_windows.go` | caller-fake tests on the Mac and CI ubuntu; hosted CI windows: process-table tests, 100 start/stop cycles without leaks, `no-device` state, `IM_INIT_NO_AUDIO` returns. PC: `isshoni-audiotest apps` lists playing apps with correct verdicts for Discord, a browser and a Steam game | Mac, CI, PC | A3, 04's E2 (DLL skeleton and loader) | 2.5 |
-| A6 | Windows capture and mixer | activators, held handles (and the no-handle path, §5.7), commit check, loopback streams, capture thread, include set (`pid_reuse` verdicts, `covered` notes), fast path with retroactive cut, endpoint engine, probe, mode/mute/pause flags, sound check, health checks, `Mixer` of §10.5 calling 04's `PcmSink` (packets reach `im_next_packet` through 04's bridge), test exports (`im_test_render_bursts` predicting from `IAudioClock`, §13.2), `AudioTestHooks` | hosted CI builds and `selfcheck` passes. PC: cases 1–4, 10, 15, 19–21 pass, and 04's E13 acceptance: `enginetest capture -audio mix` gives a playable `audio.ogg` | CI windows, PC | A0, A4, A5, 04's E13 | 4 |
-| A7 | Audiotest harness | §18 complete: analyzer (S1's as base, plus the 50 ms short-window rule and measured cut/onset of §18.6), runner, the `SetExclusions` recorder, fixtures (`firstRenderNs`, `reuse-pid`), all cases (24–27 included), gate configuration, report, redaction, summary, `record`, `merge`, README with the "unverified" column for R7 | Mac: analyzer and verdict tests, including the 20 ms burst that must FAIL absent and the faded 1000 Hz tone that must not trip 907 Hz. PC: all required cases run; any failure is a real engine bug, fixed in A6's code (a case 25 or 26 failure switches on its fallback, §6.2, §6.4) | Mac, CI, PC | A6 (runs), A2, A8 (the harness drives the service) | 3 |
+| A5 | Windows watcher (no capture) | process table, endpoints, session notifications, meters, mic detection, device notifications, `AudioEngine::Init/Shutdown/Watch/Unwatch/SetRules/ListAppsJson/LevelsGet/ProbeFlags`, `im_caps.audio_flags`; Go `internal/media/native/audio.go` and `audio_windows.go` | caller-fake tests on the Mac and CI ubuntu; hosted CI windows: process-table tests, 100 start/stop cycles without leaks, `no-device` state, `IM_INIT_NO_AUDIO` returns. PC (right after README group 6 merges, with A7's harness core, README WA62a; a hardware failure becomes a `WF` fix slice that lists `native/windows/src/audio/`, never a change in a harness PR): `isshoni-audiotest apps` lists playing apps with correct verdicts for Discord, a browser and a Steam game | Mac, CI, PC | A3, 04's E2 (DLL skeleton and loader) | 2.5 |
+| A6 | Windows capture and mixer | activators, held handles (and the no-handle path, §5.7), commit check, loopback streams, capture thread, include set (`pid_reuse` verdicts, `covered` notes), fast path with retroactive cut, endpoint engine, probe, mode/mute/pause flags, sound check, health checks, `Mixer` of §10.5 calling 04's `PcmSink` (packets reach `im_next_packet` through 04's bridge), test exports (`im_test_render_bursts` predicting from `IAudioClock`, §13.2), `AudioTestHooks` | hosted CI builds and `selfcheck` passes. PC: cases 1–4, 10, 15, 19–21 pass (right after README group 6 merges, with A7's harness core, README WA62a; a hardware failure becomes a `WF` fix slice that lists `native/windows/src/audio/`, never a change in a harness PR), and 04's E13 acceptance: `enginetest capture -audio mix` gives a playable `audio.ogg` | CI windows, PC | A0, A4, A5, 04's E13 | 4 |
+| A7 | Audiotest harness | §18 complete: analyzer (S1's as base, plus the 50 ms short-window rule and measured cut/onset of §18.6), runner, the `SetExclusions` recorder, fixtures (`firstRenderNs`, `reuse-pid`), all cases (24–27 included), gate configuration, report, redaction, summary, `record`, `merge`, README with the "unverified" column for R7 | Mac: analyzer and verdict tests, including the 20 ms burst that must FAIL absent and the faded 1000 Hz tone that must not trip 907 Hz. PC: all required cases run; any failure is a real engine bug, fixed in A6's code by a `WF` fix slice that lists `native/windows/src/audio/`, never in a harness PR (README §3 item 13; a case 25 or 26 failure switches on its fallback, §6.2, §6.4) | Mac, CI, PC | A6 (runs), A2, A8 (the harness drives the service) | 3 |
 | A8 | Desktop policy service | `internal/desktop/audio`: settings, rules builder, prompts, viewer browser (connIDs, override), banners/tips (`ducking_windows.go`/`ducking_other.go`), `FriendsHear` (with `alert`), `AppRules`, errors, `AudioConfig`, `SetSharedPID`, `SetShareSound`, `SetPaused`, `WatchLevels` polling, events (`audio.alert` included), `RunSoundCheckHelper` (`helper_windows.go`/`helper_other.go`) | §19.1 Go tests and the lifecycle integration test with the fake pass with goleak, on the Mac and CI ubuntu, macos, windows | Mac, CI | A1, A2 | 2.5 |
 | A9 | App integration (audio part) | with 03: `bridge.Audio` wrapping and events, the `--sound-check-helper` dispatch, viewer mute in endpoint mode, `SetViewerBrowser` from `EventPlaybackState`, `SetSharedPID` after the pick, `OnShare*`/`SetPaused`/`SetShareSound` from the share controller, `core.Options.AudioConfig` | Mac: share sheet driven by every fake scenario (`ISSHONI_FAKE_AUDIO`). PC: share with Discord in a call shows Discord kept out; Share sound off, pause, resume stays silent; R4 passes | Mac, PC | A8, 03's shell, 04's picker | 1.5 |
 | A10 | Gate | §18.10 on Win11 and Win10, R1–R5, R7 (Win11), `soak`, `enginetest avsync` (§19.3, 04's tool); results committed | `run -gate` exit 0 on both in the gate configuration; manual checks pass; avsync \|median\| ≤ 20 ms on both; reports in `cmd/isshoni-audiotest/results/` | PC | A7, A9, 04's `avsync`, release candidate (06) | 1 |
