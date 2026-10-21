@@ -73,10 +73,12 @@ int64_t TestToneSource::Pump(int64_t now_ns) noexcept {
   }
   int64_t due = (now_ns - next_ns_ - kDueAfterNs) / kChunkNs + 1;
   if (due > kMaxLagChunks) {
-    // Too far behind to catch up: a new grid at the newest due chunk, skipping a whole number of 20 ms frames so that
-    // the packets stay on epoch_ns + k * 20 ms.
+    // Too far behind to catch up: a new grid at one of the newest due chunks. The stage starts a frame with a grid's
+    // first chunk (its OnGap drops a half-filled frame, which the last chunk handed over may have begun), so the new
+    // grid starts a whole number of 20 ms frames after first_ns_, not after next_ns_: the packets stay on epoch_ns +
+    // k * 20 ms. skip stays positive (due - 1 >= kMaxLagChunks), and 1 to kFrameChunks chunks remain due.
     int64_t skip = due - 1;
-    skip -= skip % int64_t{kFrameChunks};
+    skip -= ((next_ns_ - first_ns_) / kChunkNs + skip) % int64_t{kFrameChunks};
     next_ns_ += skip * kChunkNs;
     due -= skip;
     skips_++;

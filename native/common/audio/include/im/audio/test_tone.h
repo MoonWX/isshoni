@@ -62,14 +62,15 @@ public:
   // A chunk is handed over once its last frame is in the past: at its captureNs + 10 ms.
   static constexpr int64_t kDueAfterNs = kChunkNs;
   // A source that fell more than this many chunks behind (a stalled thread, a suspended PC) doesn't catch up: it
-  // starts a new grid (OnGap) at its newest due chunk, keeping the 20 ms frame phase.
+  // starts a new grid (OnGap) at one of its two newest due chunks, the one a whole number of 20 ms frames after
+  // first_chunk_ns, so the frame phase is kept whatever chunk the stall began after.
   static constexpr int64_t kMaxLagChunks = 20;
 
   // epoch_ns: the session's; first_chunk_ns: the first chunk's captureNs. The session passes epoch_ns +
   // OpusStage::lookahead_ns(), so the Opus packets are stamped epoch_ns + k * 20 ms (the first one exactly at epoch_ns,
   // with IM_PKT_REINIT) and the beeps start on packet boundaries, like M1's fake audio. sink must outlive the source.
   TestToneSource(int64_t epoch_ns, int64_t first_chunk_ns, PcmSink *sink) noexcept
-      : tone_(epoch_ns), sink_(sink), next_ns_(first_chunk_ns) {}
+      : tone_(epoch_ns), sink_(sink), first_ns_(first_chunk_ns), next_ns_(first_chunk_ns) {}
 
   // Hands every chunk that is due at now_ns to the sink (OnGap first, before the very first chunk) and returns the
   // engine clock time at which the next chunk is due: the thread's next timer deadline. Never blocks, never allocates.
@@ -83,6 +84,7 @@ public:
 private:
   TestTone tone_;
   PcmSink *const sink_;
+  const int64_t first_ns_; // the grids' origin: every grid starts an even number of chunks after it
   int64_t next_ns_;
   bool started_ = false;
   uint64_t chunks_ = 0;

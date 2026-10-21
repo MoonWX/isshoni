@@ -178,4 +178,37 @@ TEST(TestToneSource, CatchesUpShortStallsAndSkipsLongOnes) {
   EXPECT_EQ(sink.first.back(), TestTone::PeriodSample(ref.PeriodIndex(sink.calls.back().ns)));
 }
 
+TEST(TestToneSource, SkipKeepsTheFramePhaseAfterAnyChunkCount) {
+  // A long stall can begin after an odd number of chunks: the last one handed over then began a frame, which the
+  // stage's OnGap drops. The new grid must still start a whole number of 20 ms frames after the first chunk, or every
+  // later packet (and beep Marker) would be stamped 10 ms off epoch_ns + k * 20 ms.
+  const int64_t first = 6'500'000;
+  for (const int before : {1, 2, 3, 4, 15, 16, 17, 20}) {
+    for (const int64_t late : {int64_t{0}, kChunkNs}) { // the newest due chunk's index even, then odd
+      SCOPED_TRACE(testing::Message() << before << " chunks, then a stall " << late << " ns longer");
+      Sink sink;
+      TestToneSource src(0, first, &sink);
+      (void)src.Pump(first + before * kChunkNs); // chunks 0 .. before - 1, caught up without a skip
+      ASSERT_EQ(src.chunks(), static_cast<uint64_t>(before));
+      ASSERT_EQ(src.skips(), 0u);
+      const std::size_t at = sink.calls.size();
+      const int64_t now = first + 1016 * kChunkNs + late + 3'000'000; // about 10 s on
+      const int64_t newest = first + 1015 * kChunkNs + late;          // the newest chunk due at now
+      (void)src.Pump(now);
+      ASSERT_EQ(src.skips(), 1u);
+      ASSERT_GT(sink.calls.size(), at + 1);
+      ASSERT_TRUE(sink.calls[at].gap);
+      const int64_t restart = sink.calls[at].ns;
+      EXPECT_EQ((restart - first) % (2 * kChunkNs), 0) << "the 20 ms frame phase is kept";
+      EXPECT_LE(sink.calls.size() - at - 1, 2u);
+      for (std::size_t i = at + 1; i < sink.calls.size(); i++) {
+        EXPECT_FALSE(sink.calls[i].gap);
+        EXPECT_EQ(sink.calls[i].ns, restart + static_cast<int64_t>(i - at - 1) * kChunkNs);
+      }
+      EXPECT_EQ(sink.calls.back().ns, newest);
+      EXPECT_EQ(src.next_chunk_ns(), newest + kChunkNs);
+    }
+  }
+}
+
 } // namespace

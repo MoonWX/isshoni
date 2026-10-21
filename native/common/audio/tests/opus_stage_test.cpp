@@ -7,6 +7,7 @@
 
 #include <opus.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -634,6 +635,51 @@ TEST(OpusStage, TestToneBeepsStartOnPacketBoundaries) {
   }
   RecordProperty("beep_min", std::to_string(beep_min));
   RecordProperty("quiet_max", std::to_string(quiet_max));
+}
+
+TEST(OpusStage, TestToneStaysOnThe20msGridAfterAStall) {
+  // The source's skip after a long stall (a suspended PC, a loaded CI runner) starts a new grid on a frame boundary,
+  // also when the stall began halfway through a frame: every packet stays on epoch_ns + k * 20 ms, so the beeps after
+  // it keep their capture instants (k * 1 s), which the A/V checks pair with the video's flashes.
+  constexpr int64_t kEpoch = 7 * kSecond;
+  Recorder audio;
+  auto s = MakeStage({.epoch_ns = kEpoch, .audio = &audio, .marker = true});
+  ASSERT_TRUE(s);
+  const int64_t first = kEpoch + s->lookahead_ns();
+  im::audio::TestToneSource src(kEpoch, first, s.get());
+  (void)src.Pump(first + kChunkNs);     // chunk 0
+  (void)src.Pump(first + 3 * kChunkNs); // chunks 1 and 2: packet 0 and the first half of packet 1
+  ASSERT_EQ(audio.packets.size(), 1u);
+  // A 10 s stall, then the thread runs on time again for 2 s.
+  int64_t now = first + 1016 * kChunkNs + 3'000'000;
+  (void)src.Pump(now);
+  ASSERT_EQ(src.skips(), 1u);
+  for (const int64_t end = now + 2 * kSecond; now < end; now += 1'000'000) {
+    (void)src.Pump(now);
+  }
+  EXPECT_EQ(src.skips(), 1u);
+  ASSERT_EQ(audio.packets.size(), 102u); // packet 0, then 10.14 s to 12.14 s
+  EXPECT_EQ(audio.packets[0].ts, kEpoch);
+  EXPECT_EQ(audio.packets[1].ts, kEpoch + 10'140'000'000);
+  EXPECT_EQ(audio.packets[1].flags, uint32_t{IM_PKT_REINIT}) << "the new grid";
+  int beeps = 0;
+  for (std::size_t j = 0; j < audio.packets.size(); j++) {
+    SCOPED_TRACE(j);
+    const Recorded &p = audio.packets[j];
+    EXPECT_EQ((p.ts - kEpoch) % kFrameNs, 0) << "on epoch_ns + k * 20 ms";
+    if (j >= 2) {
+      EXPECT_EQ(p.ts, audio.packets[j - 1].ts + kFrameNs);
+      EXPECT_EQ(p.flags, 0u);
+    }
+    Marker m;
+    ASSERT_TRUE(im::audio::ParseAudioMarker(p.data, &m));
+    EXPECT_EQ(m.capture_ns, p.ts - kEpoch);
+    if (m.capture_ns % kSecond == 0) {
+      EXPECT_TRUE(m.beep) << "the beep starts with this packet";
+      beeps++;
+    }
+  }
+  EXPECT_EQ(beeps, 3); // 0 s, 11 s and 12 s
 }
 
 TEST(OpusStage, MarkerGoldenBytes) {

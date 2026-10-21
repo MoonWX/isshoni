@@ -26,15 +26,25 @@ void *Allocate(std::size_t n) {
 }
 } // namespace
 
-void *operator new(std::size_t n) { return Allocate(n); }
-void *operator new[](std::size_t n) { return Allocate(n); }
-void *operator new(std::size_t n, const std::nothrow_t &) noexcept {
+// The replacements carry the SAL annotations of vcruntime_new.h's declarations: without them MSVC reports C28251
+// ("Inconsistent annotation for 'new'"), which /WX makes an error.
+#if defined(_MSC_VER)
+#define IM_NEW_RESULT(n)         _Ret_notnull_ _Post_writable_byte_size_(n)
+#define IM_NEW_NOTHROW_RESULT(n) _Ret_maybenull_ _Success_(return != NULL) _Post_writable_byte_size_(n)
+#else
+#define IM_NEW_RESULT(n)
+#define IM_NEW_NOTHROW_RESULT(n)
+#endif
+
+IM_NEW_RESULT(n) void *operator new(std::size_t n) { return Allocate(n); }
+IM_NEW_RESULT(n) void *operator new[](std::size_t n) { return Allocate(n); }
+IM_NEW_NOTHROW_RESULT(n) void *operator new(std::size_t n, const std::nothrow_t &) noexcept {
   if (t_counting) {
     t_allocations++;
   }
   return std::malloc(n == 0 ? 1 : n);
 }
-void *operator new[](std::size_t n, const std::nothrow_t &) noexcept {
+IM_NEW_NOTHROW_RESULT(n) void *operator new[](std::size_t n, const std::nothrow_t &) noexcept {
   if (t_counting) {
     t_allocations++;
   }

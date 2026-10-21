@@ -5,8 +5,11 @@
 # Each line: packet <frame> <capture_ns> <beep> <input> <framed>: the Marker's fields, an Opus packet (codes 0 to 3)
 # and what the framing makes of it, in hex. opus_stage_test.cpp (MarkerGoldenBytes) writes <framed> from <input> with
 # the C++ framing, which is byte for byte M1's appendOpusPadded (CBR when the frames are the same size, else VBR; old
-# padding dropped); marker_golden_test.go reads every <framed> with M1's fake.ParseAudioMarker. The first lines are a
-# tone's packets 0, 1 and 50 (beeps on 0 and 50); the others cover long frames, codes 1 to 3 and the largest values.
+# padding dropped); marker_golden_test.go reads every <framed> with M1's fake.ParseAudioMarker. The lines for frames 0,
+# 1, 50, 51 and 100 put the Markers of the tone's packets with those numbers (capture ns = frame * 20 ms, beeps on 0,
+# 50 and 100) on synthetic Opus payloads, not on the tone's encoded packets, since libopus's float output is not
+# bit-exact across CPUs. The payloads cover codes 0 to 3, long frames, code 3 input with old padding (VBR and CBR), and
+# one line the largest field values.
 packet 0 0 1 fcfffe ff4112fffe4953484e0004000000000000000000000000
 packet 1 20000000 0 fc0b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186abd0f51a3f6489ae ff41120b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186abd0f51a3f6489ae4953484e0000000000010000000001312d00
 packet 50 1000000000 1 fc05121f2c394653606d7a8794a1aebbc8d5e2effc091623303d4a5764717e8b98a5b2bfccd9e6f3000d1a2734414e5b6875828f9ca9b6c3d0ddeaf704111e2b3845525f6c798693a0adbac7d4e1eefb0815222f3c495663707d8a97a4b1becbd8e5f2ff0c192633404d5a6774818e9ba8b5c2cfdce9f603101d2a3744515e6b7885929facb9c6d3e0edfa0714212e3b4855626f7c8996a3b0bdcad7e4f1fe0b1825323f4c596673808d9aa7b4c1cedbe8f5020f1c293643505d6a7784919eabb8c5d2dfecf90613202d3a4754616e7b8895a2afbcc9d6e3f0fd0a1724313e4b5865727f8c99a6b3c0cddae7f4010e1b2835424f5c697683909daab7c4d1deebf805121f2c394653606d7a8794a1aebbc8d5e2effc091623303d4a5764717e8b98a5b2bfccd9e6f3000d1a2734 ff411205121f2c394653606d7a8794a1aebbc8d5e2effc091623303d4a5764717e8b98a5b2bfccd9e6f3000d1a2734414e5b6875828f9ca9b6c3d0ddeaf704111e2b3845525f6c798693a0adbac7d4e1eefb0815222f3c495663707d8a97a4b1becbd8e5f2ff0c192633404d5a6774818e9ba8b5c2cfdce9f603101d2a3744515e6b7885929facb9c6d3e0edfa0714212e3b4855626f7c8996a3b0bdcad7e4f1fe0b1825323f4c596673808d9aa7b4c1cedbe8f5020f1c293643505d6a7784919eabb8c5d2dfecf90613202d3a4754616e7b8895a2afbcc9d6e3f0fd0a1724313e4b5865727f8c99a6b3c0cddae7f4010e1b2835424f5c697683909daab7c4d1deebf805121f2c394653606d7a8794a1aebbc8d5e2effc091623303d4a5764717e8b98a5b2bfccd9e6f3000d1a27344953484e000400000032000000003b9aca00
