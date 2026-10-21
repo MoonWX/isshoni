@@ -546,7 +546,7 @@ type conn struct {
 	inbox chan func()
 	done  chan struct{} // closed when the actor has ended
 
-	ident     atomic.Pointer[Identity] // Name and Admin change; the ids never do
+	ident     atomic.Pointer[Identity] // Name, Admin and DeviceName change; the ids never do
 	sockP     atomic.Pointer[socket]   // the current socket, for other goroutines (post)
 	lastStats atomic.Pointer[protocol.ClientStats]
 	lost      atomic.Bool                    // the full inbox dropped a post: the connection closes for good (post)
@@ -554,7 +554,10 @@ type conn struct {
 
 	// Guarded by h.mu.
 	slotUser string // the user whose per-user slot the connection holds
-	roomID   string // the id of the room the connection is in, for Notify; "" = none. Set by attach and detach
+	// roomID is the id of the room the connection is in, for Notify and user.connections; "" = none. Set by attach and
+	// detach.
+	roomID string
+	listed bool // user.connections lists the connection: from its first welcome until it closes (userconns.go)
 
 	// Owned by the actor.
 	sock         *socket // nil while detached
@@ -573,6 +576,7 @@ type conn struct {
 	peer      MediaPeer          // the media side in that room (MediaPlane.NewPeer at room.join)
 	peerSeq   uint64             // numbers the connection's MediaPeers, so the actor drops a previous peer's events
 	stateRev  uint64             // the rev of the last room.state sent for the room; older snapshots are skipped
+	connsRev  uint64             // the rev of the last user.connections handled; older lists are skipped (userconns.go)
 	endReason protocol.EndReason // set by revoke and shutdown: why the connection's shares end when it closes
 
 	// The connection's media in its room (share.go, stats.go); all of it goes when the connection leaves the room.
@@ -735,6 +739,9 @@ func (c *conn) postWait(f func()) bool {
 // new connection, and for one that resumes on s (resumed; conn.resume), whose welcome names the room it is in. Every
 // welcome carries a new resume token, and the connection keeps only that token's hash, so an older token of the same
 // connection resumes nothing (01 §10.3).
+//
+// The user's user.connections changes after the welcome (M2 01 §10.4): a new connection is listed from now on, and a
+// resumed one is online again. With the feature, the connection gets the list after its welcome.
 func (c *conn) attach(s *socket, re, defaultRoom string, pol Policy, resumed bool) {
 	c.sock = s
 	c.sockP.Store(s)
@@ -781,6 +788,11 @@ func (c *conn) attach(s *socket, re, defaultRoom string, pol Policy, resumed boo
 	}
 	c.h.log.Info(msg, slog.String("conn_id", c.id), slog.String("user_id", c.userID),
 		slog.Bool("resumed", resumed), slog.String("kind", string(c.client.Kind)), slog.String("role", string(c.role)))
+	if resumed {
+		c.h.userConnsChanged(c)
+	} else {
+		c.h.listConn(c)
+	}
 }
 
 // socketEnded handles the end of socket s, which closed with code (byHub: the hub chose the code). When s was the
@@ -1014,7 +1026,8 @@ func (c *conn) revalidate() {
 
 // applyRevalidation applies the result of Revalidate for identity id (01 §3.2). Only ErrInvalid closes the
 // connection (session_revoked, 4401); any other error keeps it, and the next tick retries. A changed name or admin
-// flag is applied like UpdateUser.
+// flag is applied like UpdateUser. A changed device name (M2 02 §6.3) is recorded, and the user's connections with
+// the feature get a new user.connections (M2 01 §10.4).
 //
 // An unchanged result still goes to the connection's room. The participant there can have its name and role from
 // another of the user's connections, one that knew less than this one and has left since (a change that only
@@ -1024,9 +1037,16 @@ func (c *conn) applyRevalidation(id, nid Identity, err error) {
 	switch {
 	case errors.Is(err, ErrInvalid):
 		c.revoke(protocol.NewError(protocol.ErrorCodeSessionRevoked, protocol.ErrorScopeSession))
+		return
 	case err != nil:
 		c.h.log.Warn("revalidate", slog.String("conn_id", c.id), slog.String("user_id", c.userID),
 			slog.Any("err", err))
+		return
+	}
+	if nid.DeviceName != id.DeviceName && c.setDeviceName(nid.DeviceName) {
+		c.h.userConnsChanged(c)
+	}
+	switch {
 	case nid.Name != id.Name || nid.Admin != id.Admin:
 		c.setUser(nid.Name, nid.Admin)
 	case c.room != nil:

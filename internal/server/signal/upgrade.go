@@ -458,7 +458,8 @@ func (s *socket) handshake(b []byte) *conn {
 		s.fail(protocol.NewError(protocol.ErrorCodeTooManyConnections, protocol.ErrorScopeConnection), env.ID)
 		return nil
 	}
-	// Revalidate at connect: marks the session as seen and picks up a rename or role change (01 §3.2).
+	// Revalidate at connect: marks the session as seen and picks up a rename or role change (01 §3.2), and a device
+	// rename (M2 02 §6.3).
 	switch rid, err := h.deps.Auth.Revalidate(ctx, id, s.ip); {
 	case errors.Is(err, ErrInvalid):
 		s.fail(protocol.NewError(protocol.ErrorCodeSessionRevoked, protocol.ErrorScopeSession), env.ID)
@@ -466,7 +467,7 @@ func (s *socket) handshake(b []byte) *conn {
 	case err != nil:
 		h.log.Warn("revalidate at connect", slog.String("user_id", id.UserID), slog.Any("err", err))
 	default:
-		id.Name, id.Admin = rid.Name, rid.Admin
+		id.Name, id.Admin, id.DeviceName = rid.Name, rid.Admin, rid.DeviceName
 	}
 
 	// Step 4: version and client floor (01 §6.1).
@@ -559,13 +560,16 @@ func (h *Hub) addConn(c *conn, s *socket) (protocol.ShutdownReason, bool) {
 }
 
 // removeConn unregisters a closed connection and releases its per-user slot, which it has held since it opened,
-// through every socket and every grace.
+// through every socket and every grace. The close is a change of the user's user.connections (M2 01 §10.4).
 func (h *Hub) removeConn(c *conn) {
+	var o outbox
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	delete(h.conns, c.id)
 	if c.slotUser != "" {
 		h.releaseSlotLocked(c.slotUser)
 		c.slotUser = ""
 	}
+	h.unlistConnLocked(&o, c)
+	h.mu.Unlock()
+	o.send()
 }

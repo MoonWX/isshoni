@@ -39,9 +39,10 @@ func TestHandshakeWelcome(t *testing.T) {
 			t.Errorf("welcome protocol %d, serverVersion %q, minClientVersion %q", w.Protocol, w.ServerVersion,
 				w.MinClientVersion)
 		}
-		// The intersection of the hello's features and the server's (01 §6.2): the server has agent.relay only.
-		if !slices.Equal(w.Features, []protocol.Feature{protocol.FeatureAgentRelay}) {
-			t.Errorf("features %v, want agent.relay alone", w.Features)
+		// The intersection of the hello's features and the server's (01 §6.2), in the server's order: the server has
+		// agent.relay, user.connections and share.pause (M2 01 §10.3, §10.4), and future.thing is nobody's.
+		if !slices.Equal(w.Features, []protocol.Feature{protocol.FeatureAgentRelay, protocol.FeatureSharePause}) {
+			t.Errorf("features %v, want agent.relay and share.pause", w.Features)
 		}
 		want := protocol.Limits{
 			MaxMessageBytes: 65536, MaxSDPBytes: 262144, MaxSharesPerUser: 4, MaxRoomParticipants: 8,

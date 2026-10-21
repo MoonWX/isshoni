@@ -21,6 +21,10 @@ import (
 // its own (02 §5.3). A share is published through one connection, whose MediaPeer holds its media, and belongs to
 // that connection's user: any connection of the user in the room may update or stop it.
 //
+// M2 adds the pause bit (M2 01 §10.3, feature share.pause): share.update{paused} sets or clears it, the MediaPeer
+// stops asking the sharer for keyframes meanwhile, and room.state shows the share as paused while it would be live.
+// Stalled wins over paused, a starting share shows paused once it goes live, and no timeout applies to paused.
+//
 // Share records live in their room, under the room's lock. Everything that calls a MediaPeer for a share runs on the
 // actor of the share's publishing connection, which is the only goroutine that may call that peer: a request from
 // another connection of the user is handed to that actor (endAtOwner, updateShareAt), and no actor waits for another.
@@ -34,9 +38,14 @@ func newShareID() string {
 }
 
 // share is one share in a room (01 §4.4), guarded by the room's lock. info holds what room.state shows, except
-// Watchers, which each snapshot computes from the members' desired subscriptions.
+// Watchers, which each snapshot computes from the members' desired subscriptions, and Status: info.Status is the
+// share's lifecycle (starting, live or stalled, from the media facts), and room.state shows status(), which adds the
+// pause bit (M2 01 §10.3).
 type share struct {
 	info protocol.ShareInfo
+	// paused is the share's pause bit (M2 01 §10.3): set and cleared by share.update{paused} from a connection of the
+	// user with the feature share.pause. It is kept through every lifecycle change and has no timeout of its own.
+	paused bool
 	// ref is share.start's idempotency key on the publishing connection, and params the ShareParams of the latest
 	// share.start or share.update: a share.start with the same ref gets them again (01 §8.7).
 	ref    string
@@ -74,10 +83,32 @@ func (s *share) applyMedia(ev ShareMediaEvent) bool {
 	return changed
 }
 
-// setStatusLocked changes the share's status and its count in isshoni_shares{status}.
+// status is the share's status as room.state shows it (M2 01 §10.3): stalled while the pub PC is down (stalled
+// wins), else paused while the pause bit is set and the share is live, else starting or live as in M1. A share paused
+// while starting stays starting, under its start timeout, and shows paused once it goes live.
+func (s *share) status() protocol.ShareStatus {
+	if s.paused && s.info.Status == protocol.ShareStatusLive {
+		return protocol.ShareStatusPaused
+	}
+	return s.info.Status
+}
+
+// setStatusLocked changes the share's lifecycle status, and its count in isshoni_shares{status}, which counts the
+// shares by the status room.state shows.
 func (r *room) setStatusLocked(s *share, st protocol.ShareStatus) {
-	r.h.metrics.shareStatus(s.info.Status, st)
+	from := s.status()
 	s.info.Status = st
+	r.h.metrics.shareStatus(from, s.status())
+}
+
+// setPausedLocked sets or clears the share's pause bit (M2 01 §10.3) and reports whether the status that room.state
+// shows changed: it doesn't for a share that is starting or stalled.
+func (r *room) setPausedLocked(s *share, paused bool) bool {
+	from := s.status()
+	s.paused = paused
+	to := s.status()
+	r.h.metrics.shareStatus(from, to)
+	return from != to
 }
 
 // connLocked returns the connection connID of user userID in the room, or nil.
@@ -269,9 +300,16 @@ func (c *conn) onShareStart(env protocol.Envelope) {
 }
 
 // onShareUpdate handles share.update (01 §8.7): it changes the label or the preset of a share of the connection's
-// user in its room (share_not_found; forbidden for another user's) and replies with the new ShareParams, which the
-// share's publishing connection's MediaPeer computes: on this actor for the connection's own share, where the reply
-// goes out before the room.state with the change, else on the publishing connection's (updateShareAt).
+// user in its room (share_not_found; forbidden for another user's), or pauses or resumes it (M2 01 §10.3), and
+// replies with the new ShareParams, which the share's publishing connection's MediaPeer computes: on this actor for
+// the connection's own share, where the reply goes out before the room.state with the change, else on the publishing
+// connection's (updateShareAt).
+//
+// paused is read only when this connection has the feature share.pause active, and only for a share whose publishing
+// connection has it too: a publisher that doesn't know the feature would neither stop its media nor show the pause,
+// while its share showed paused and the SFU swallowed the keyframe requests for it. Otherwise the field is dropped
+// before the MediaPeer sees the update, without an error, and the rest of the update applies (old and new clients
+// interoperate). Any connection of the user may pause or resume the share (01 §4.1).
 func (c *conn) onShareUpdate(env protocol.Envelope) {
 	v, ok := decode[protocol.ShareUpdate](c, env)
 	if !ok || !c.requireRoom(env) {
@@ -291,6 +329,12 @@ func (c *conn) onShareUpdate(env protocol.Envelope) {
 		owner, seq = r.connLocked(s.info.UserID, s.info.ConnectionID), s.peerSeq
 	}
 	r.mu.Unlock()
+	pausable := c.hasFeature(protocol.FeatureSharePause) && owner != nil && owner.hasFeature(protocol.FeatureSharePause)
+	if code == "" && v.Paused != nil && !pausable {
+		c.h.log.Debug("share.update: paused ignored without the feature", slog.String("conn_id", c.id),
+			slog.String("share_id", v.ShareID), slog.Bool("sender", c.hasFeature(protocol.FeatureSharePause)))
+		v.Paused = nil
+	}
 	switch {
 	case code != "":
 		c.reject(env, protocol.NewError(code, protocol.ErrorScopeRequest))
@@ -392,8 +436,10 @@ func (c *conn) updateShareAt(owner *conn, r *room, seq uint64, env protocol.Enve
 }
 
 // updateShare applies share.update v to a share that this connection publishes in room r: the MediaPeer returns the
-// new ShareParams, then the label and the preset change in room.state. It runs on the connection's actor, with r its
-// room.
+// new ShareParams (and pauses or resumes the share's media, M2 01 §10.3), then the label, the preset and the pause bit
+// change in room.state. A pause or resume shows only in room.state, never as a room.event, and only once the share is
+// live: the bit of a starting share is kept until its first keyframe. It runs on the connection's actor, with r its
+// room; v.Paused has passed onShareUpdate's feature check.
 func (c *conn) updateShare(r *room, v protocol.ShareUpdate) shareUpdated {
 	r.mu.Lock()
 	s := r.shares[v.ShareID]
@@ -408,6 +454,7 @@ func (c *conn) updateShare(r *room, v protocol.ShareUpdate) shareUpdated {
 	}
 	params.ShareID = v.ShareID
 	var o outbox
+	paused := false // the update set or cleared the pause bit
 	r.mu.Lock()
 	if s := r.shares[v.ShareID]; s != nil {
 		changed := false
@@ -419,6 +466,10 @@ func (c *conn) updateShare(r *room, v protocol.ShareUpdate) shareUpdated {
 			s.info.Preset = v.Preset
 			changed = true
 		}
+		if v.Paused != nil && s.paused != *v.Paused {
+			paused = true
+			changed = r.setPausedLocked(s, *v.Paused) || changed
+		}
 		s.params = params
 		if changed {
 			r.changedLocked(&o)
@@ -426,6 +477,14 @@ func (c *conn) updateShare(r *room, v protocol.ShareUpdate) shareUpdated {
 	}
 	r.mu.Unlock()
 	o.send()
+	if paused {
+		msg := "share resumed"
+		if *v.Paused {
+			msg = "share paused"
+		}
+		c.h.log.Info(msg, slog.String("share_id", v.ShareID), slog.String("room_id", r.id),
+			slog.String("conn_id", c.id), slog.String("user_id", c.userID))
+	}
 	return shareUpdated{params: params}
 }
 
@@ -560,7 +619,8 @@ func (c *conn) shareTimeouts() {
 //   - gone (reserved, 01 §15.2): the share's tracks are gone for good; it ends with stopped.
 //
 // Each event also carries what the SFU receives now, which room.state shows once the share has been live. Events
-// about a share that has ended, or that another connection publishes, are dropped.
+// about a share that has ended, or that another connection publishes, are dropped. These are the share's lifecycle;
+// a share whose pause bit is set shows paused wherever it would show live (share.status, M2 01 §10.3).
 func (c *conn) onShareMedia(id string, ev ShareMediaEvent) {
 	r := c.room
 	now := time.Now()

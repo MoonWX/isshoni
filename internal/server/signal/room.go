@@ -225,10 +225,12 @@ func (r *room) stateLocked() protocol.RoomState {
 	return st
 }
 
-// shareInfo returns what room.state shows about the share, with its watchers among parts (sorted participants). Its
-// slices are its own and never nil (Snapshot); slices.Clone would keep a nil Layers nil.
+// shareInfo returns what room.state shows about the share, with its watchers among parts (sorted participants) and
+// its status with the pause bit (share.status). Its slices are its own and never nil (Snapshot); slices.Clone would
+// keep a nil Layers nil.
 func (s *share) shareInfo(parts []*participant) protocol.ShareInfo {
 	si := s.info
+	si.Status = s.status()
 	si.Layers = append([]protocol.VideoLayer{}, si.Layers...)
 	si.Watchers = watchers(s, parts)
 	return si
@@ -328,7 +330,7 @@ func (r *room) eventLocked(o *outbox, ev protocol.RoomEvent, skip *conn) {
 // records the change (changedLocked).
 func (r *room) endShareLocked(o *outbox, s *share, reason protocol.EndReason, now time.Time) {
 	delete(r.shares, s.info.ID)
-	r.h.metrics.shareStatus(s.info.Status, "")
+	r.h.metrics.shareStatus(s.status(), "")
 	r.membersLocked(func(m *member) { delete(m.subs, s.info.ID) })
 	name := ""
 	if p := r.participants[s.info.UserID]; p != nil {
@@ -434,6 +436,7 @@ func (h *Hub) attach(c *conn, info protocol.RoomInfo, limit int) (*room, *protoc
 	}
 	p.members = append(p.members, &member{c: c, subs: make(map[string]protocol.SubscriptionWant)})
 	c.roomID = r.id
+	h.userConnsChangedLocked(&o, c) // the connection changed room (M2 01 §10.4)
 	r.changedLocked(&o)
 	h.metrics.roomCounts(len(h.rooms), h.participants)
 	r.mu.Unlock()
@@ -447,6 +450,10 @@ func (h *Hub) attach(c *conn, info protocol.RoomInfo, limit int) (*room, *protoc
 // room goes with its last participant. It returns the ids of the ended shares, which the caller ends at the
 // MediaPeer before closing it (no lock is held while calling a MediaPeer). In a room that CloseRoom closed, nothing
 // is sent.
+//
+// Leaving the room is a change of the user's user.connections (M2 01 §10.4), unless the connection is closing, whose
+// close is the change (removeConn), or has joined another room already. detach runs on c's actor, which owns
+// c.closed.
 func (h *Hub) detach(c *conn, r *room, reason protocol.EndReason) []string {
 	now := time.Now()
 	var o outbox
@@ -455,6 +462,9 @@ func (h *Hub) detach(c *conn, r *room, reason protocol.EndReason) []string {
 	h.mu.Lock()
 	if c.roomID == r.id {
 		c.roomID = ""
+		if !c.closed {
+			h.userConnsChangedLocked(&o, c)
+		}
 	}
 	r.mu.Lock()
 	for _, s := range r.sortedSharesLocked() {
