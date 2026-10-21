@@ -2,9 +2,10 @@
 # Linters and formatters: docs/m1/06-deploy-and-ci.md §8.2. The depguard rules encode the import table of
 # docs/m1/04-server-platform.md §2, the single source for which package of this repository may import which, plus
 # what that table leaves to 01, 02 and 03 (internal/protocol, internal/protocol/api, sfu) and the cmd/isshoni rule
-# of 02 §15.1: change those docs first, then the rules here. The rules cover packages of this repository (and
-# Prometheus for the SFU) in non-test files, unless a rule says "test files too"; third-party modules are governed
-# by the license gate (`task licenses`).
+# of 02 §15.1, and M2's import rules (docs/m2/01-client-core.md §4, docs/m2/03-desktop-app.md §4.5 and the rows
+# of 05 and 06; see the M2 block below): change those docs first, then the rules here. The rules cover packages of
+# this repository (and Prometheus for the SFU, Wails for M2) in non-test files, unless a rule says "test files too";
+# third-party modules are governed by the license gate (`task licenses`).
 version: "2"
 
 linters:
@@ -174,7 +175,145 @@ linters:
           deny:
             - pkg: github.com/MoonWX/isshoni/internal/server/config
               desc: only cmd/isshoni, the wiring, httpapi, tlsmgr, ops and push read config; pass a plain option struct instead (04 §2)
-        # Later (M2): internal/client may import only Pion, x/net and internal/protocol (06 §8.2).
+
+        # M2 (docs/m2/README.md §5: WA02 writes every M2 rule, then only the integrator changes them). "01 §4" is the
+        # import table of docs/m2/01-client-core.md §4 (D1–D3), which also holds 05's rows (audiorules,
+        # internal/desktop/audio); "03" is docs/m2/03-desktop-app.md (§3.1, §4.5); "06" is
+        # docs/m2/06-windows-release.md. A trailing $ makes an allow entry match that package only, not its
+        # subpackages. Only internal/media and internal/media/audiorules also restrict third-party modules: their
+        # specs make them standard library only.
+        media:
+          list-mode: strict
+          files: ["**/internal/media/*.go", "!$test"]
+          allow:
+            - $gostd
+          deny:
+            - pkg: github.com/MoonWX/isshoni
+              desc: internal/media, the media contract, imports only the standard library (01 D1, §4)
+        media-audiorules:
+          list-mode: strict
+          files: ["**/internal/media/audiorules/*.go", "!$test"]
+          allow:
+            - $gostd
+          deny:
+            - pkg: github.com/MoonWX/isshoni
+              desc: internal/media/audiorules imports only the standard library (01 §4, 05 §5.4)
+        media-fake:
+          list-mode: lax
+          files: ["**/internal/media/fake/*.go", "!$test"]
+          allow:
+            - github.com/MoonWX/isshoni/internal/media$
+          deny:
+            - pkg: github.com/MoonWX/isshoni
+              desc: internal/media/fake imports only internal/media from this repository, never internal/client or internal/server (01 §4)
+        media-mediatest:
+          list-mode: lax
+          files: ["**/internal/media/mediatest/*.go", "!$test"]
+          allow:
+            - github.com/MoonWX/isshoni/internal/media$
+          deny:
+            - pkg: github.com/MoonWX/isshoni
+              desc: internal/media/mediatest imports only internal/media from this repository (01 §4)
+        media-native:
+          list-mode: lax
+          files: ["**/internal/media/native/*.go", "**/internal/media/native/**/*.go", "!$test"]
+          allow:
+            - github.com/MoonWX/isshoni/internal/logx
+            - github.com/MoonWX/isshoni/internal/media$
+          deny:
+            - pkg: github.com/MoonWX/isshoni
+              desc: internal/media/native imports only internal/media and internal/logx from this repository, never internal/client or internal/server (01 §4, D3)
+        client:
+          list-mode: lax
+          files: ["**/internal/client/*.go", "**/internal/client/**/*.go", "!$test"]
+          allow:
+            - github.com/MoonWX/isshoni/internal/client
+            - github.com/MoonWX/isshoni/internal/logx
+            - github.com/MoonWX/isshoni/internal/media$
+            - github.com/MoonWX/isshoni/internal/protocol
+            - github.com/MoonWX/isshoni/internal/version
+          deny:
+            - pkg: github.com/MoonWX/isshoni
+              desc: internal/client imports from this repository only its sibling packages, internal/protocol (and /api, /relay), the internal/media root (never its subpackages), internal/version and internal/logx; never internal/server or internal/desktop; its test files may import the fakes (01 D2, §4)
+        protocol-relay:
+          list-mode: lax
+          files: ["**/internal/protocol/relay/*.go", "!$test"]
+          allow:
+            - github.com/MoonWX/isshoni/internal/protocol$
+          deny:
+            - pkg: github.com/MoonWX/isshoni
+              desc: internal/protocol/relay imports only internal/protocol from this repository (01 §4, §11.11)
+        desktop-audio:
+          list-mode: lax
+          files: ["**/internal/desktop/audio/*.go", "**/internal/desktop/audio/**/*.go", "!$test"]
+          allow:
+            - github.com/MoonWX/isshoni/internal/logx
+            - github.com/MoonWX/isshoni/internal/media$
+            - github.com/MoonWX/isshoni/internal/media/audiorules
+          deny:
+            - pkg: github.com/MoonWX/isshoni
+              desc: internal/desktop/audio imports only the internal/media root, internal/media/audiorules and internal/logx from this repository; never internal/client, internal/server, internal/media/native or internal/media/fake (01 §4, 05 §14)
+        desktop-no-wails: # test files too
+          list-mode: lax
+          files: ["**/internal/desktop/**"]
+          deny:
+            - pkg: github.com/wailsapp/wails
+              desc: only cmd/isshoni-desktop imports Wails; internal/desktop builds and tests on every OS (03 D2, §4.5)
+        desktop-no-server:
+          list-mode: lax
+          files: ["**/internal/desktop/**", "**/cmd/isshoni-desktop/**", "!$test"]
+          deny:
+            - pkg: github.com/MoonWX/isshoni/internal/server
+              desc: the app is a client; it never imports internal/server (03 §4.5)
+        server-no-desktop: # test files too
+          list-mode: lax
+          files: ["**/internal/server/**", "**/cmd/isshoni/**"]
+          deny:
+            - pkg: github.com/MoonWX/isshoni/internal/desktop
+              desc: the server binary never links the app (03 §4.5)
+            - pkg: github.com/wailsapp/wails
+              desc: the server binary never links the app (03 §4.5)
+        desktop-no-engine-impl:
+          list-mode: lax
+          files: ["**/internal/desktop/**", "!**/internal/desktop/e2ehost/**", "!$test"]
+          deny:
+            - pkg: github.com/MoonWX/isshoni/internal/media/fake
+              desc: engines enter through the app's main (cmd/isshoni-desktop); of internal/desktop only e2ehost links the fake (03 §4.5, 01 §4)
+            - pkg: github.com/MoonWX/isshoni/internal/media/native
+              desc: engines enter through the app's main (cmd/isshoni-desktop), never through internal/desktop (03 §4.5, 01 §4)
+        desktop-main-no-fake: # test files too
+          list-mode: lax
+          files: ["**/cmd/isshoni-desktop/**"]
+          deny:
+            - pkg: github.com/MoonWX/isshoni/internal/media/fake
+              desc: only engine_fake.go (build tags dev || e2e, which this lint run doesn't set) imports the fake engine; no release artifact links it (03 §4.5, 01 §6.3)
+        wails: # test files too; internal/desktop, internal/server and cmd/isshoni have their own rules above
+          list-mode: lax
+          files:
+            - $all
+            - "!**/cmd/isshoni-desktop/**"
+            - "!**/internal/desktop/**"
+            - "!**/internal/server/**"
+            - "!**/cmd/isshoni/**"
+            - "!**/tools/wails3/**"
+          deny:
+            - pkg: github.com/wailsapp/wails
+              desc: Wails is imported only by cmd/isshoni-desktop (03 D2, §3.1)
+        deploy-importers:
+          list-mode: lax
+          files: [$all, "!$test", "!**/internal/server/*.go"]
+          deny:
+            - pkg: github.com/MoonWX/isshoni/deploy
+              desc: only internal/server (the wiring) imports deploy, and passes its embedded files on (06 §7.4)
+        update:
+          list-mode: lax
+          files: ["**/internal/update/*.go", "**/internal/update/**/*.go", "!$test"]
+          allow:
+            - github.com/MoonWX/isshoni/internal/logx
+            - github.com/MoonWX/isshoni/internal/version
+          deny:
+            - pkg: github.com/MoonWX/isshoni
+              desc: internal/update imports only internal/version and internal/logx from this repository, never internal/server (06 §8.9)
 
     forbidigo:
       analyze-types: true

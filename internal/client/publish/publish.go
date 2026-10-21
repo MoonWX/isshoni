@@ -21,13 +21,15 @@ import (
 	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v4"
 
-	"github.com/MoonWX/isshoni/internal/media/fake"
+	"github.com/MoonWX/isshoni/internal/media"
 )
 
-// Source is the media a Publisher sends: *fake.Source in M1, the native engine in M2.
+// Source is the media a Publisher sends, as media contract packets (docs/m2/01-client-core.md §5): *fake.Source in
+// M1, the native engine in M2. Video packets of a sent layer and audio packets go out; any other packet is counted in
+// Stats as dropped.
 type Source interface {
 	// Next blocks until the next packet is due and returns it; packets come in capture order.
-	Next(ctx context.Context) (fake.Packet, error)
+	Next(ctx context.Context) (media.Packet, error)
 	// RequestKeyframe makes the next frame of a layer a keyframe.
 	RequestKeyframe(layer string)
 }
@@ -742,7 +744,7 @@ func (p *Publisher) waitConnected(ctx context.Context) error {
 }
 
 // send writes one Source packet on its track, unless SetActive keeps it back.
-func (p *Publisher) send(pkt fake.Packet) {
+func (p *Publisher) send(pkt media.Packet) {
 	t := p.trackFor(pkt)
 	if t == nil {
 		p.dropped.Add(1)
@@ -761,15 +763,15 @@ func (p *Publisher) send(pkt fake.Packet) {
 	}
 }
 
-func (p *Publisher) trackFor(pkt fake.Packet) *track {
+func (p *Publisher) trackFor(pkt media.Packet) *track {
 	switch pkt.Kind {
-	case fake.Video:
+	case media.KindVideo:
 		for _, t := range p.video {
 			if t.layer == pkt.Layer {
 				return t
 			}
 		}
-	case fake.Audio:
+	case media.KindAudio:
 		return p.audio
 	}
 	return nil
