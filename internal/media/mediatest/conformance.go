@@ -28,11 +28,11 @@ type Options struct {
 	// SkipBitrate skips check 5 with a message, for an engine whose bitrate does not follow its target: the fake
 	// engine in Decodable mode (01 §6.4).
 	SkipBitrate bool
-	// FirstPacket is check 2's bound on each video layer's first packet after Start (check 8 allows twice it after
-	// the listed source starts again); 0 is 01 §5.3's 500 ms. Only the fake's own test raises it, for coverage
-	// builds: its Decodable mode makes every frame in Go, and coverage counters (atomic ones under -race) slow that
-	// by an order of magnitude.
-	FirstPacket time.Duration
+	// Slack is added to every latency bound below (a first packet, a resume, a re-init, Stop, Now's tolerance and
+	// the grace for packets in flight); 0 for an engine. Only the fake's own test sets it, in coverage builds: its
+	// Decodable mode makes every frame in Go, which coverage counters (atomic under -race) slow tenfold, so packets
+	// arrive about 100 ms after their capture time. The uninstrumented runs (windows-go, desktop-macos) keep 0.
+	Slack time.Duration
 }
 
 // The bounds of 01 §5.3, §6.4 and §13.
@@ -381,7 +381,7 @@ func (r *run) checkStart(t *testing.T) {
 		Layers: layers(), Audio: r.audio(), Borderless: r.borderless,
 	}
 	r.start(t)
-	bound := r.firstPacketBound()
+	bound := r.bound(firstPacketBound)
 	first := map[string]rec{}
 	events := map[string]int{} // EventLayers before the layer's first packet
 	r.until(t, 4*bound, func(rc rec) bool {
@@ -507,6 +507,7 @@ func (r *run) checkNow(t *testing.T) {
 	if n == 0 {
 		t.Fatal("no video packet in 1 s")
 	}
+	tol := r.bound(nowTolerance)
 	var off []time.Duration
 	for range nowSamples {
 		time.Sleep(50 * time.Millisecond)
@@ -514,17 +515,17 @@ func (r *run) checkNow(t *testing.T) {
 		v := r.video
 		now := r.sess.Now()
 		want := v.pkt.CaptureNS + int64(time.Since(v.at))
-		if d := time.Duration(now - want); d < -nowTolerance || d > nowTolerance {
+		if d := time.Duration(now - want); d < -tol || d > tol {
 			off = append(off, d)
 		}
 	}
 	switch {
 	case len(off) > 1:
 		t.Errorf("Now() is %v from the latest video packet's CaptureNS plus the time since it arrived in %d of %d "+
-			"samples, want within %v", off, len(off), nowSamples, nowTolerance)
+			"samples, want within %v", off, len(off), nowSamples, tol)
 	case len(off) == 1:
 		t.Logf("Now() is %v from the latest video packet's CaptureNS plus the time since it arrived in 1 of %d "+
-			"samples (tolerated), want within %v", off[0], nowSamples, nowTolerance)
+			"samples (tolerated), want within %v", off[0], nowSamples, tol)
 	}
 }
 
@@ -605,7 +606,7 @@ func (r *run) checkLayerActive(t *testing.T) {
 	if err := r.sess.SetLayerActive("f", false); err != nil {
 		t.Fatalf("SetLayerActive(f, false): %v", err)
 	}
-	from := off.Add(inactiveGrace)
+	from := off.Add(r.bound(inactiveGrace))
 	end := from.Add(inactiveWindow)
 	var f, q, audio int
 	r.until(t, time.Until(end)+100*time.Millisecond, func(rc rec) bool {
@@ -638,18 +639,19 @@ func (r *run) checkLayerActive(t *testing.T) {
 	if err := r.sess.SetLayerActive("f", true); err != nil {
 		t.Fatalf("SetLayerActive(f, true): %v", err)
 	}
+	resume := r.bound(resumeBound)
 	var first rec
-	if !r.until(t, 2*resumeBound, func(rc rec) bool {
+	if !r.until(t, 2*resume, func(rc rec) bool {
 		if rc.pkt.Kind == media.KindVideo && rc.pkt.Layer == "f" && rc.at.After(on) {
 			first = rc
 			return true
 		}
 		return false
 	}) {
-		t.Fatalf("f did not resume within %v of SetLayerActive(f, true)", 2*resumeBound)
+		t.Fatalf("f did not resume within %v of SetLayerActive(f, true)", 2*resume)
 	}
-	if d := first.at.Sub(on); d > resumeBound {
-		t.Errorf("f resumed %v after SetLayerActive(f, true), want ≤ %v", d, resumeBound)
+	if d := first.at.Sub(on); d > resume {
+		t.Errorf("f resumed %v after SetLayerActive(f, true), want ≤ %v", d, resume)
 	}
 	if !first.pkt.Keyframe || first.pkt.Reinit {
 		t.Errorf("f resumed with Keyframe %v and Reinit %v, want a keyframe that is not a Reinit", first.pkt.Keyframe,
@@ -666,7 +668,7 @@ func (r *run) checkProfile(t *testing.T) {
 	}
 	events := map[string]int{} // EventLayers after Reconfigure, before the layer's Reinit keyframe
 	done := map[string]bool{}
-	ok := r.until(t, reconfigureBound, func(rc rec) bool {
+	ok := r.until(t, r.bound(reconfigureBound), func(rc rec) bool {
 		p := rc.pkt
 		if !rc.at.After(asked) {
 			return false
@@ -704,7 +706,7 @@ func (r *run) checkProfile(t *testing.T) {
 				missing = append(missing, l.RID)
 			}
 		}
-		t.Errorf("no Reinit keyframe on %v within %v of Reconfigure", missing, reconfigureBound)
+		t.Errorf("no Reinit keyframe on %v within %v of Reconfigure", missing, r.bound(reconfigureBound))
 	}
 }
 
@@ -760,8 +762,8 @@ wait:
 	if !errors.Is(end.err, media.ErrStopped) {
 		t.Errorf("Next after Stop: %v, want ErrStopped", end.err)
 	}
-	if d := end.at.Sub(stopped); d > stopBound {
-		t.Errorf("Next returned %v after Stop, want ≤ %v", d, stopBound)
+	if d := end.at.Sub(stopped); d > r.bound(stopBound) {
+		t.Errorf("Next returned %v after Stop, want ≤ %v", d, r.bound(stopBound))
 	}
 	<-r.rd.done
 	r.rd = nil
@@ -778,18 +780,13 @@ wait:
 		return
 	}
 	r.start(t)
-	if !r.until(t, 2*r.firstPacketBound(), func(rc rec) bool { return rc.pkt.Kind == media.KindVideo }) {
-		t.Errorf("the listed source started again, but no video came within %v", 2*r.firstPacketBound())
+	if !r.until(t, 2*r.bound(firstPacketBound), func(rc rec) bool { return rc.pkt.Kind == media.KindVideo }) {
+		t.Errorf("the listed source started again, but no video came within %v", 2*r.bound(firstPacketBound))
 	}
 }
 
-// firstPacketBound is Options.FirstPacket, or 01 §5.3's bound when it is 0.
-func (r *run) firstPacketBound() time.Duration {
-	if r.o.FirstPacket > 0 {
-		return r.o.FirstPacket
-	}
-	return firstPacketBound
-}
+// bound is the latency bound d plus Options.Slack.
+func (r *run) bound(d time.Duration) time.Duration { return d + r.o.Slack }
 
 // hasStartCode reports whether b starts with an Annex B start code (00 00 01 or 00 00 00 01).
 func hasStartCode(b []byte) bool {

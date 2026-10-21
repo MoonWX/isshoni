@@ -11,10 +11,22 @@
 #include "im/audio/opus_stage.h"
 #include "im/audio/test_tone.h"
 
+// Under AddressSanitizer or ThreadSanitizer the runtime owns operator new (on Linux it is linked statically, so a
+// second definition fails to link), and the counts would be the sanitizer's: such builds keep the stage's run but skip
+// the allocation checks. host-debug and win-x64-ci run them.
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define IM_SANITIZED_NEW 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define IM_SANITIZED_NEW 1
+#endif
+#endif
+
 namespace {
 thread_local bool t_counting = false;
 thread_local long t_allocations = 0;
 
+#if !defined(IM_SANITIZED_NEW)
 void *Allocate(std::size_t n) {
   if (t_counting) {
     t_allocations++;
@@ -24,6 +36,7 @@ void *Allocate(std::size_t n) {
   }
   throw std::bad_alloc();
 }
+#endif
 } // namespace
 
 // The replacements carry the SAL annotations of vcruntime_new.h's declarations: without them MSVC reports C28251
@@ -36,6 +49,7 @@ void *Allocate(std::size_t n) {
 #define IM_NEW_NOTHROW_RESULT(n)
 #endif
 
+#if !defined(IM_SANITIZED_NEW)
 IM_NEW_RESULT(n) void *operator new(std::size_t n) { return Allocate(n); }
 IM_NEW_RESULT(n) void *operator new[](std::size_t n) { return Allocate(n); }
 IM_NEW_NOTHROW_RESULT(n) void *operator new(std::size_t n, const std::nothrow_t &) noexcept {
@@ -56,6 +70,17 @@ void operator delete(void *p, std::size_t) noexcept { std::free(p); }
 void operator delete[](void *p, std::size_t) noexcept { std::free(p); }
 void operator delete(void *p, const std::nothrow_t &) noexcept { std::free(p); }
 void operator delete[](void *p, const std::nothrow_t &) noexcept { std::free(p); }
+#endif
+
+namespace {
+// kCounted: whether this build counts allocations (not when the sanitizer's runtime owns operator new).
+constexpr bool kCounted =
+#if defined(IM_SANITIZED_NEW)
+    false;
+#else
+    true;
+#endif
+} // namespace
 
 namespace {
 
@@ -94,7 +119,9 @@ TEST(OpusStageRealTime, NoAllocationAfterCreate) {
   (void)stage->stats();
   t_counting = false;
 
-  EXPECT_EQ(t_allocations, 0);
+  if (kCounted) {
+    EXPECT_EQ(t_allocations, 0);
+  }
   EXPECT_GT(audio.calls, 200);
   EXPECT_GT(pcm.calls, 400);
   EXPECT_GT(stage->stats().drops, 0u);
@@ -103,6 +130,9 @@ TEST(OpusStageRealTime, NoAllocationAfterCreate) {
 }
 
 TEST(OpusStageRealTime, TheCounterWorks) {
+  if (!kCounted) {
+    GTEST_SKIP() << "built with a sanitizer, whose runtime owns operator new";
+  }
   t_counting = true;
   t_allocations = 0;
   auto p = std::make_unique<int>(1);

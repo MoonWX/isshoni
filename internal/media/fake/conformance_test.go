@@ -24,9 +24,10 @@ func TestConformanceDecodable(t *testing.T) {
 	t.Parallel()
 	o := mediatest.Options{Listed: true, TestTone: true, SkipBitrate: true}
 	if testing.CoverMode() != "" {
-		// decodable.go renders and copies every sample in Go: with coverage counters (atomic under -race), a CI
-		// runner's first packets came 0.7 s and 1.4 s after Start, against about 20 ms without them.
-		o.FirstPacket = 3 * time.Second
+		// decodable.go renders every sample in Go: with coverage counters (atomic under -race), a CI runner's first
+		// packets came 0.7 s and 1.4 s after Start (about 20 ms without them), and packets about 100 ms after
+		// their capture time. windows-go and desktop-macos run this without coverage, at the real bounds.
+		o.Slack = time.Second
 	}
 	mediatest.Conformance(t, func(*testing.T) media.Engine {
 		return NewEngine(EngineConfig{Mode: Decodable, SourceSize: [2]int{640, 360}})
