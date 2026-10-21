@@ -3,7 +3,9 @@
 //
 // Owners: 03 (docs/m1/03-accounts-and-store.md §12) owns the REST DTOs in types.go and the envelope and code table
 // in errors.go; 04 (docs/m1/04-server-platform.md §2, §18) adds the dashboard (ops.go), doctor and bandwidth
-// (doctor.go), connection test (conntest.go) and push payload (push.go) types and its rows of the code table.
+// (doctor.go), connection test (conntest.go) and push payload (push.go) types and its rows of the code table. M2's 02
+// (docs/m2/02-device-auth.md §7.3) adds the device-flow and device-token DTOs and the user-code helpers (device.go),
+// DeviceInfo.Current and the params of its error codes.
 //
 // Rules:
 //   - The package imports only the standard library. store, auth, httpapi, netx, ops, doctor and push import it, and
@@ -21,8 +23,8 @@
 //     ([] rather than null, and AuditEntry.Detail is {} when empty), also when a producer leaves a slice nil: the
 //     same MarshalJSON methods replace nil collections. The only null on the wire is AuditPage.NextBefore on the last
 //     page.
-//   - Passwords, tokens, SDP, push endpoints and token links are redacted in fmt and log/slog output (secret.go);
-//     JSON carries them unchanged.
+//   - Passwords, tokens, device codes, exchange ids, SDP, push endpoints and token links are redacted in fmt and
+//     log/slog output (secret.go); JSON carries them unchanged.
 //   - Within v1 every change is additive (03 §12.1): a field is never renamed, removed or retyped, and an error code is
 //     never reused with another meaning. Clients ignore unknown fields and the server ignores unknown request fields.
 //   - Enum constants are declared in const groups named <Type><Value>, which tygo turns into TypeScript unions.

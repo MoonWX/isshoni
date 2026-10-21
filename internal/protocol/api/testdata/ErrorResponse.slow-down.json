@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": "slow_down",
+    "params": {
+      "interval": 10
+    }
+  }
+}

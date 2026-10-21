@@ -1,5 +1,7 @@
 // Package protocol is isshoni's signaling protocol, version 1 (docs/m1/01-protocol.md): the WebSocket envelope,
-// every message payload and enum, the error codes and close codes, the message registry, and payload validation.
+// every message payload and enum, the error codes and close codes, the message registry, and payload validation. It
+// also names the desktop app's asset origins, which the server accepts with bearer tokens only (desktop.go, M2 02
+// §6.4).
 //
 // It is the single source of truth for the wire format. The TypeScript types in web/src/protocol are generated from
 // it (tygo for the types, internal/protocol/gen/tsregistry for the registry; 01 §14.4), and the golden fixtures in

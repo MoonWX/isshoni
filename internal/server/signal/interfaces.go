@@ -15,17 +15,21 @@ import (
 // adapters over 03's auth and store, 04's push service and 01's sfuplane; package signaltest has fakes of each.
 
 // Identity is who a connection authenticated as (01 §3.2). UserID, SessionID and DeviceID are fixed for the
-// connection's lifetime; Name and Admin follow UpdateUser and Revalidate.
+// connection's lifetime; Name and Admin follow UpdateUser and Revalidate, and so does DeviceName (M2 02 §6.3).
 type Identity struct {
 	UserID    string
 	Name      string // the username in M1; never logged
 	Admin     bool
 	SessionID string // cookie sessions
 	DeviceID  string // bearer (native apps, M2)
+	// DeviceName is the device's current name, for bearer identities only ("" for cookie sessions; M2 02 §6.3). The
+	// wiring's AuthenticateBearer and Revalidate copy it from auth.Principal.DeviceName (M2 slice DA6), and the hub
+	// puts it into user.connections' OwnConnection.DeviceName (M2 01 §10.4). It is user content: never logged.
+	DeviceName string
 }
 
-// LogValue implements slog.LogValuer: the user id and the admin flag only. Usernames are never logged (README
-// "Logging"), and the session and device ids stay out of the log as well.
+// LogValue implements slog.LogValuer: the user id and the admin flag only. Usernames and device names are never
+// logged (README "Logging"), and the session and device ids stay out of the log as well.
 func (id Identity) LogValue() slog.Value {
 	return slog.GroupValue(slog.String("user_id", id.UserID), slog.Bool("admin", id.Admin))
 }

@@ -85,6 +85,140 @@ export interface ConnTestServerInfo {
 }
 
 //////////
+// source: device.go
+
+/**
+ * UserCodeAlphabet is the alphabet of user codes (M2 02 §3, RFC 8628 §6.1): 20 consonants, no vowels (so no words) and
+ * no digits (so no 0/O or 1/I mix-ups). The server draws 8 symbols by rejection sampling over random bytes.
+ */
+export const UserCodeAlphabet = "BCDFGHJKLMNPQRSTVWXZ";
+/**
+ * UserCodeLength is the number of letters of a user code: 8 of 20 symbols, about 34.6 bits.
+ */
+export const UserCodeLength = 8;
+/**
+ * DeviceCodeRequest is POST /api/v1/device/code (#44, M2 02 §5.2): an app asks to be linked.
+ */
+export interface DeviceCodeRequest {
+  clientKind: string; // desktop | mobile (01's ClientKind)
+  deviceName: string; // the app's proposal, e.g. the PC's host name; the approver may change it
+  os: string; // windows | macos | linux | ios | android
+  appVersion: string; // 1–32 bytes of [0-9A-Za-z.+-]; not necessarily SemVer (dev builds)
+}
+/**
+ * DeviceCodeResponse is the reply to POST /api/v1/device/code (#44, M2 02 §5.2). The app shows UserCode and a QR code
+ * of VerificationURIComplete, and polls /device/token with DeviceCode every Interval seconds.
+ */
+export interface DeviceCodeResponse {
+  deviceCode: string; // 43 base64url characters; redacted in fmt/slog
+  userCode: string; // formatted, "WDJB-MJHT"
+  verificationUri: string; // "<origin>/link"
+  verificationUriComplete: string; // "<origin>/link?code=WDJB-MJHT"
+  expiresIn: number /* int */; // seconds (600)
+  interval: number /* int */; // seconds between polls (5)
+}
+/**
+ * GrantType is DeviceTokenRequest.GrantType.
+ */
+export const GrantTypeDeviceCode = "device_code"; // RFC 8628 polling (M2 02 §5.4)
+export const GrantTypeRefreshToken = "refresh_token"; // rotation (M2 02 §6.2)
+export type GrantType = typeof GrantTypeDeviceCode | typeof GrantTypeRefreshToken;
+/**
+ * DeviceTokenRequest is POST /api/v1/device/token (#45): a device-code poll (M2 02 §5.4) or a refresh (M2 02 §6.2).
+ * Only the app's Go code sends it, never its webview.
+ */
+export interface DeviceTokenRequest {
+  grantType: GrantType;
+  deviceCode?: string; // device_code grant; redacted
+  refreshToken?: string; // refresh_token grant, "isr_" + 43; redacted
+  exchangeId?: string; // refresh_token grant, optional, kept by retries; redacted
+  appVersion?: string; // refresh_token grant, optional: updates the device row
+}
+/**
+ * DeviceTokenResponse is the reply of both grants of POST /api/v1/device/token (#45) and of POST
+ * /api/v1/device/password (#48): a new access and refresh token pair.
+ */
+export interface DeviceTokenResponse {
+  accessToken: string; // "isa_" + 43; redacted
+  tokenType: string; // "Bearer"
+  expiresIn: number /* int */; // the access token's lifetime in seconds (900)
+  refreshToken: string; // "isr_" + 43; redacted
+  refreshExpiresIn: number /* int */; // the refresh token's lifetime in seconds (7776000, 90 days)
+  device: DeviceRef;
+  user: User; // {id, username, role}
+}
+/**
+ * DeviceRef names a device: DeviceTokenResponse.Device.
+ */
+export interface DeviceRef {
+  id: string;
+  name: string;
+}
+/**
+ * DeviceLookupRequest is POST /api/v1/device/lookup (#46, M2 02 §5.3), sent by the approval page /link with a cookie
+ * session.
+ */
+export interface DeviceLookupRequest {
+  userCode: string; // as typed or from ?code=; the server normalizes it (NormalizeUserCode)
+}
+/**
+ * NetworkMatch is DeviceLookup.Network: whether the app asked for its code from the approving browser's own network
+ * (M2 02 §5.3). Every value but same requires the approver's "I started this myself" tick.
+ */
+export const NetworkMatchSame = "same";
+export const NetworkMatchDifferent = "different";
+export const NetworkMatchUnknown = "unknown"; // e.g. the app and the browser used different address families
+export type NetworkMatch = typeof NetworkMatchSame | typeof NetworkMatchDifferent | typeof NetworkMatchUnknown;
+/**
+ * DeviceLookup is the reply to POST /api/v1/device/lookup (#46, M2 02 §5.3): what the approval page shows about the
+ * request before the approver decides.
+ */
+export interface DeviceLookup {
+  userCode: string; // formatted, "WDJB-MJHT"
+  clientKind: string;
+  os: string;
+  deviceName: string;
+  appVersion: string;
+  requestIp: string; // the address the app asked for the code from
+  network: NetworkMatch;
+  requestedAt: string;
+  expiresAt: string;
+}
+/**
+ * DeviceDecideRequest is POST /api/v1/device/decide (#47, M2 02 §5.3); the reply is 204.
+ */
+export interface DeviceDecideRequest {
+  userCode: string;
+  approve: boolean;
+  deviceName?: string; // absent = keep the app's name
+}
+/**
+ * DevicePasswordRequest is POST /api/v1/device/password (#48, M2 02 §14; M1 03 §12.4.7's sketch): the in-app
+ * username/password fallback, which links a device without a browser. Sent by the app's Go code, never by its webview.
+ * The reply is DeviceTokenResponse.
+ */
+export interface DevicePasswordRequest {
+  username: string;
+  password: string; // redacted in fmt/slog
+  clientKind: string; // as DeviceCodeRequest
+  deviceName: string;
+  os: string;
+  appVersion: string;
+}
+/**
+ * RenameDeviceRequest is PATCH /api/v1/me/devices/{id} (#52, M2 02 §7.2); the reply is DeviceResponse.
+ */
+export interface RenameDeviceRequest {
+  name: string;
+}
+/**
+ * DeviceResponse is {device}: the reply to PATCH /api/v1/me/devices/{id} (#52).
+ */
+export interface DeviceResponse {
+  device: DeviceInfo;
+}
+
+//////////
 // source: doctor.go
 
 /**
@@ -273,13 +407,13 @@ export const CodeBackupInvalid = "backup_invalid"; // 400 (04, admin socket only
 export const CodeBackupNewer = "backup_newer"; // 409 (04, admin socket only): the backup's schema is newer than this binary
 export const CodeRestoreInProgress = "restore_in_progress"; // 409 (04, admin socket only)
 export const CodeInsufficientStorage = "insufficient_storage"; // 507 (04, admin socket only): not enough free disk space
-export const CodeInvalidToken = "invalid_token"; // 401, later (M2): bearer access token expired or unknown: refresh
-export const CodeAuthorizationPending = "authorization_pending"; // 400, later (M2): RFC 8628
-export const CodeSlowDown = "slow_down"; // 400, later (M2): RFC 8628
-export const CodeAccessDenied = "access_denied"; // 400, later (M2): RFC 8628
-export const CodeExpiredToken = "expired_token"; // 400, later (M2): RFC 8628
-export const CodeInvalidGrant = "invalid_grant"; // 400, later (M2): OAuth refresh token reuse or unknown grant
-export const CodeDeviceCodeInvalid = "device_code_invalid"; // 404, later (M2): unknown or expired user code
+export const CodeInvalidToken = "invalid_token"; // 401 (M2 02 §6.1): bearer access token expired or unknown: refresh
+export const CodeAuthorizationPending = "authorization_pending"; // 400 (M2 02 §5.4): RFC 8628
+export const CodeSlowDown = "slow_down"; // 400 (M2 02 §5.4): RFC 8628; params.interval
+export const CodeAccessDenied = "access_denied"; // 400 (M2 02 §5.4): RFC 8628
+export const CodeExpiredToken = "expired_token"; // 400 (M2 02 §5.4): RFC 8628
+export const CodeInvalidGrant = "invalid_grant"; // 400 (M2 02 §5.4, §6.2): unknown, used or reused grant; params.reason
+export const CodeDeviceCodeInvalid = "device_code_invalid"; // 404 (M2 02 §5.3): unknown or expired user code
 /**
  * Error codes (03 §12.2). A code is stable forever: it is never renamed or reused with another meaning. Every code is
  * M1 unless marked; (04) marks the rows of 04's routes and middleware (04 §9.4). Eight codes are shared with 01's
@@ -302,12 +436,26 @@ export const FieldNotAllowed = "not_allowed";
 export type Field = typeof FieldRequired | typeof FieldTooShort | typeof FieldTooLong | typeof FieldInvalid | typeof FieldReserved | typeof FieldTooCommon | typeof FieldSameAsUsername | typeof FieldOutOfRange | typeof FieldNotAllowed;
 export const ParamLimit = "limit"; // limit_reached: a LimitKind
 export const ParamField = "field"; // setting_locked: the setting's JSON name (Settings)
-export const ParamReason = "reason"; // push_endpoint_rejected: a PushRejectReason
+export const ParamReason = "reason"; // push_endpoint_rejected: a PushRejectReason; invalid_grant: InvalidGrantReused
 export const ParamTransport = "transport"; // transport_disabled: a Transport
+export const ParamCredential = "credential"; // forbidden (M2 02 §6.4): the CredentialKind the route takes
+export const ParamInterval = "interval"; // slow_down (M2 02 §5.4): the new polling interval in seconds
 /**
  * Keys of Error.Params.
  */
-export type Param = typeof ParamLimit | typeof ParamField | typeof ParamReason | typeof ParamTransport;
+export type Param = typeof ParamLimit | typeof ParamField | typeof ParamReason | typeof ParamTransport | typeof ParamCredential | typeof ParamInterval;
+/**
+ * InvalidGrantReused is params.reason of invalid_grant when a spent refresh token was presented again and the server
+ * revoked the device (M2 02 §6.2).
+ */
+export const InvalidGrantReused = "reused";
+/**
+ * CredentialKind is params.credential of forbidden (M2 02 §6.4): the only credential the route accepts, sent when the
+ * request carried the other one.
+ */
+export const CredentialKindSession = "session"; // a cookie session: UserSession and Admin routes refuse a bearer
+export const CredentialKindDevice = "device"; // a bearer device token: UserDevice routes refuse a cookie
+export type CredentialKind = typeof CredentialKindSession | typeof CredentialKindDevice;
 /**
  * LimitKind is params.limit of limit_reached (03 §12.2).
  */
@@ -747,7 +895,7 @@ export interface UserResponse {
 }
 export const InfoFeaturePush = "push"; // present exactly when Info.Push is present
 export const InfoFeaturePasswordReset = "passwordReset"; // M1
-export const InfoFeatureDeviceFlow = "deviceFlow"; // later (M2)
+export const InfoFeatureDeviceFlow = "deviceFlow"; // M2: every route of M2 02 §7.1 (device flow and device tokens)
 /**
  * Info feature strings (Info.Features). The set is open: clients ignore unknown values.
  */
@@ -864,7 +1012,7 @@ export interface ResetCompleteRequest {
 export interface Me {
   user: User;
   session?: SessionInfo; // the caller's web session (always set in M1)
-  device?: DeviceInfo; // later (M2): a bearer principal gets its device instead
+  device?: DeviceInfo; // M2: a bearer principal gets its device (current) instead
   permissions: Permissions;
   badges?: Badges; // admins only
 }
@@ -895,8 +1043,8 @@ export interface SessionInfo {
   current: boolean; // this request's session
 }
 /**
- * DeviceInfo is one linked app: the items of GET /api/v1/me/devices (#17, empty until M2) and, later (M2), Me.Device
- * with only id, name and clientKind.
+ * DeviceInfo is one linked app: the items of GET /api/v1/me/devices (#17, empty until M2), Me.Device for a bearer
+ * principal and DeviceResponse.Device (M2 02 §7.2).
  */
 export interface DeviceInfo {
   id: string;
@@ -907,6 +1055,7 @@ export interface DeviceInfo {
   createdAt?: string;
   lastSeenAt?: string;
   lastIp?: string;
+  current: boolean; // M2: the caller's own device (bearer only; always false for a cookie caller)
 }
 /**
  * ChangePasswordRequest is POST /api/v1/me/password (#12); the reply is Empty.

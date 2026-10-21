@@ -38,10 +38,28 @@ func at(s string) time.Time {
 
 func ptr[T any](v T) *T { return &v }
 
-// Sample values follow the examples of 03 §12.4 and 04 §7.7, §11.4, §13.4–§13.5 and §14.3. Values inside
-// map[string]any are strings or float64, the types encoding/json decodes them to, so the round trip is exact.
+// Device-flow secrets of the samples (M2 02 §3): shape-valid values (43 or 22 canonical base64url characters), so
+// tests of later packages may reuse them.
+//
+//nolint:gosec // G101 false positive: made-up example values for the golden files.
+const (
+	exampleDeviceCode   = "EXAMPLEdeviceCODE0123456789abcdefghijklmnoQ"
+	exampleAccessToken  = "isa_EXAMPLEaccessTOKEN0123456789abcdefghijklmno"
+	exampleRefreshToken = "isr_EXAMPLErefreshTOKEN0123456789abcdefghijklmo"
+	exampleExchangeID   = "q9V3xT0bLm2Rk7aZ4cWfYg"
+)
+
+// Sample values follow the examples of 03 §12.4, 04 §7.7, §11.4, §13.4–§13.5 and §14.3, and M2 02 §5, §6.2 and §7.
+// Values inside map[string]any are strings or float64, the types encoding/json decodes them to, so the round trip is
+// exact.
 func goldenCases() []goldenCase {
 	alex := User{ID: "k3m9p2qxw7ht", Username: "Alex", Role: RoleAdmin}
+	gamingPC := DeviceInfo{
+		ID: "m4q8x2c6v0bn", Name: "Gaming PC", ClientKind: "desktop", OS: "windows", AppVersion: "0.2.0",
+		CreatedAt: at("2026-11-02T19:05:01.004Z"),
+	}
+	gamingPCCurrent := gamingPC
+	gamingPCCurrent.Current = true
 	alexRef := UserRef{ID: "k3m9p2qxw7ht", Username: "Alex"}
 	samRef := UserRef{ID: "b8f2n4r6t0vz", Username: "Sam"}
 	lounge := Room{
@@ -188,6 +206,94 @@ func goldenCases() []goldenCase {
 			CreatedAt: at("2026-11-01T10:00:00Z"), LastSeenAt: at("2026-11-02T21:45:10.300Z"), LastIP: "203.0.113.7",
 		}}}},
 		{"DevicesResponse.empty", DevicesResponse{Devices: []DeviceInfo{}}},
+		// M2 02 §7.2: a bearer caller's own device is current.
+		{"DevicesResponse.bearer", DevicesResponse{Devices: []DeviceInfo{
+			{
+				ID: "m4q8x2c6v0bn", Name: "Gaming PC", ClientKind: "desktop", OS: "windows", AppVersion: "0.2.1",
+				CreatedAt: at("2026-11-02T19:05:01.004Z"), LastSeenAt: at("2026-11-03T08:00:00Z"),
+				LastIP: "203.0.113.7", Current: true,
+			},
+			{
+				ID: "d2f4h6k8m0p2", Name: "Alex-PC", ClientKind: "desktop", OS: "windows", AppVersion: "0.2.0",
+				CreatedAt: at("2026-11-01T10:00:00Z"), LastSeenAt: at("2026-11-02T21:45:10.300Z"),
+				LastIP: "198.51.100.23",
+			},
+		}}},
+
+		// ---- M2 02 §5, §6.2, §7: the device flow and device tokens ----
+		// GET /info of an M2 server (02 §7.1): deviceFlow brings every device route.
+		{"Info.device-flow", Info{
+			Server:       InfoServer{Name: "Alex's server", Version: "0.2.0", PublicURL: "https://watch.example.com"},
+			Protocol:     InfoProtocol{Current: 1, Min: 1},
+			Registration: RegistrationModeInvite,
+			Features:     []string{InfoFeaturePush, InfoFeaturePasswordReset, InfoFeatureDeviceFlow},
+			AccountRules: AccountRules{UsernameMinLength: 2, UsernameMaxLength: 32, PasswordMinLength: 8, PasswordMaxLength: 128},
+			Push:         &InfoPush{VAPIDPublicKey: "BEXAMPLEvapidPublicKey0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXY"},
+		}},
+		{"DeviceCodeRequest", DeviceCodeRequest{
+			ClientKind: "desktop", DeviceName: "DESKTOP-7F3K2LQ", OS: "windows", AppVersion: "0.2.0",
+		}},
+		{"DeviceCodeResponse", DeviceCodeResponse{
+			DeviceCode: exampleDeviceCode, UserCode: "WDJB-MJHT",
+			VerificationURI:         "https://watch.example.com/link",
+			VerificationURIComplete: "https://watch.example.com/link?code=WDJB-MJHT",
+			ExpiresIn:               600, Interval: 5,
+		}},
+		{"DeviceTokenRequest", DeviceTokenRequest{GrantType: GrantTypeDeviceCode, DeviceCode: exampleDeviceCode}},
+		{"DeviceTokenRequest.refresh", DeviceTokenRequest{
+			GrantType: GrantTypeRefreshToken, RefreshToken: exampleRefreshToken, ExchangeID: exampleExchangeID,
+			AppVersion: "0.2.1",
+		}},
+		// A refresh without the optional fields: exchangeId and appVersion are absent.
+		{"DeviceTokenRequest.refresh-minimal", DeviceTokenRequest{
+			GrantType: GrantTypeRefreshToken, RefreshToken: exampleRefreshToken,
+		}},
+		{"DeviceTokenResponse", DeviceTokenResponse{
+			AccessToken: exampleAccessToken, TokenType: "Bearer", ExpiresIn: 900,
+			RefreshToken: exampleRefreshToken, RefreshExpiresIn: 7776000,
+			Device: DeviceRef{ID: "m4q8x2c6v0bn", Name: "Gaming PC"}, User: alex,
+		}},
+		{"DeviceRef", DeviceRef{ID: "m4q8x2c6v0bn", Name: "Gaming PC"}},
+		{"DeviceLookupRequest", DeviceLookupRequest{UserCode: "WDJB-MJHT"}},
+		{"DeviceLookup", DeviceLookup{
+			UserCode: "WDJB-MJHT", ClientKind: "desktop", OS: "windows", DeviceName: "DESKTOP-7F3K2LQ",
+			AppVersion: "0.2.0", RequestIP: "203.0.113.7", Network: NetworkMatchSame,
+			RequestedAt: at("2026-11-02T19:04:12.250Z"), ExpiresAt: at("2026-11-02T19:14:12.250Z"),
+		}},
+		// The app asked over IPv6 and the browser over IPv4: the networks can't be compared (02 §5.3).
+		{"DeviceLookup.unknown-network", DeviceLookup{
+			UserCode: "WDJB-MJHT", ClientKind: "desktop", OS: "windows", DeviceName: "DESKTOP-7F3K2LQ",
+			AppVersion: "0.2.0", RequestIP: "2001:db8::7", Network: NetworkMatchUnknown,
+			RequestedAt: at("2026-11-02T19:04:12.250Z"), ExpiresAt: at("2026-11-02T19:14:12.250Z"),
+		}},
+		{"DeviceDecideRequest", DeviceDecideRequest{UserCode: "WDJB-MJHT", Approve: true, DeviceName: ptr("Gaming PC")}},
+		// A denial, or an approval that keeps the app's name: deviceName is absent.
+		{"DeviceDecideRequest.deny", DeviceDecideRequest{UserCode: "WDJB-MJHT", Approve: false}},
+		{"DevicePasswordRequest", DevicePasswordRequest{
+			Username: "Alex", Password: "correct horse battery", ClientKind: "desktop",
+			DeviceName: "DESKTOP-7F3K2LQ", OS: "windows", AppVersion: "0.2.0",
+		}},
+		{"RenameDeviceRequest", RenameDeviceRequest{Name: "Gaming PC"}},
+		{"DeviceResponse", DeviceResponse{Device: gamingPCCurrent}},
+		// GET /me for a bearer (02 §7.2): device instead of session.
+		{"Me.device", Me{
+			User:        User{ID: "k3m9p2qxw7ht", Username: "Alex", Role: RoleAdmin, CreatedAt: at("2026-10-01T12:00:00Z")},
+			Device:      &gamingPCCurrent,
+			Permissions: Permissions{Admin: true, CreateInvites: true},
+			Badges:      &Badges{PendingApprovals: 0},
+		}},
+		{"ErrorResponse.slow-down", ErrorResponse{Error: Error{
+			Code: CodeSlowDown, Params: map[string]any{ParamInterval: float64(10)},
+		}}},
+		{"ErrorResponse.refresh-reused", ErrorResponse{Error: Error{
+			Code: CodeInvalidGrant, Params: map[string]any{ParamReason: InvalidGrantReused},
+		}}},
+		{"ErrorResponse.credential-session", ErrorResponse{Error: Error{
+			Code: CodeForbidden, Params: map[string]any{ParamCredential: string(CredentialKindSession)},
+		}}},
+		{"ErrorResponse.credential-device", ErrorResponse{Error: Error{
+			Code: CodeForbidden, Params: map[string]any{ParamCredential: string(CredentialKindDevice)},
+		}}},
 
 		// ---- 03: rooms ----
 		{"Rooms", Rooms{DefaultRoomID: "lounge", ShowRoomList: true, Rooms: []Room{lounge, movies}}},
