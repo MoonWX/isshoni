@@ -1,0 +1,17 @@
+{
+  "avcodecVersion": 4129126,
+  "avcodecMajor": 63,
+  "avcodecMinor": 1,
+  "avcodecMicro": 102,
+  "avutilVersion": 3998054,
+  "avutilMajor": 61,
+  "avutilMinor": 1,
+  "avutilMicro": 102,
+  "license": "LGPL version 2.1 or later",
+  "avutilLicense": "LGPL version 2.1 or later",
+  "configuration": "--toolchain=msvc --arch=x86_64 --target-os=win64 --prefix=../install --disable-gpl --disable-nonfree --disable-version3 --enable-shared --disable-static --disable-programs --disable-doc --disable-everything --disable-autodetect --disable-network --disable-x86asm --disable-avformat --disable-avdevice --disable-avfilter --disable-swscale --disable-swresample --enable-avcodec --enable-avutil --enable-d3d11va --enable-mediafoundation --enable-ffnvcodec --enable-nvenc --enable-amf --enable-libvpl --enable-encoder='h264_nvenc,h264_amf,h264_qsv,h264_mf' --extra-cflags='-MT -Brepro -I../prefix/include' --extra-ldflags='-Brepro -PDBALTPATH:%_PDB% -INCREMENTAL:NO -LIBPATH:../prefix/lib' --pkg-config-flags=--static",
+  "encoders": ["h264_amf", "h264_mf", "h264_nvenc", "h264_qsv"],
+  "decoders": [],
+  "ok": true,
+  "problems": []
+}

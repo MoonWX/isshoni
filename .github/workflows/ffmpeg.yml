@@ -1,0 +1,444 @@
+# FFmpeg: the LGPL build of libavcodec and libavutil that the Windows app ships (docs/m2/06-windows-release.md §4,
+# "06" below). The build runs once per pin; CI, releases and `task ffmpeg:fetch` download the published deps release
+# and verify it against native/ffmpeg/lock.json, never rebuild it (06 D5).
+#
+#   pull request (*) ──► build + rebuild ──► report
+#   push to main (*) ──► build ──► report
+#   Run workflow ──────► build + rebuild ──► report ──► publish (only with "publish" on)
+#   weekly (Sunday) ───► build of lock.json's commit ──► report (still byte-identical to the lock?)
+#   (*) touching native/ffmpeg/, this file, deploy/windows/msvc-env.ps1 or deploy/windows/tools.json
+#
+# - build (windows-2025, contents: read, no secrets): deploy/windows/msvc-env.ps1 (VS 2022/2026 with toolset 14.44 and
+#   the Windows SDK of deploy/windows/tools.json; it prints the instance, the toolset build and the SDK to the log and
+#   the summary), then native/ffmpeg/build.sh in MSYS2's bash: sources from native/ffmpeg/pins.json, libvpl, configure
+#   (06 §4.2), make, and the gating checks of 06 §4.4 (ffcheck, imports, names). Uploads the zip and the source
+#   archive as the artifact ffmpeg-build and their SHA-256s as job outputs. It also checks that msvc-env.ps1 fails,
+#   naming the toolsets it found, for a toolset the image lacks.
+# - rebuild: the same steps on a second runner, so a pull request shows whether a second build is byte-identical.
+# - report (ubuntu-24.04): build.sh's inputsSha256 equals `desktoppkg ffmpeg-inputs`'s; the DLLs against rebuild's and
+#   against lock.json's (06 §4.6). With the same toolset build a difference fails the run (FFMPEG_REPRO: strict); with
+#   another toolset build it is a warning, since the shipped bytes stay the locked ones. lock.json absent or stale (a
+#   pins.json, build.sh or ffcheck.c change) is a note: publishing after the merge fixes it.
+# - publish (ubuntu-24.04, contents: write, id-token: write, attestations: write; runs no build code): only a manual
+#   run with publish on, from any ref. It refuses when the tag exists (raise "revision" in pins.json instead), checks
+#   the artifact against build's SHA-256s, attests both files, creates deps-ffmpeg-<ver>-r<rev> as a prerelease that
+#   is never "latest" (the server's release check, the site and the updater ignore non-SemVer tags), and prints the
+#   native/ffmpeg/lock.json to commit (06 §4.5, §14 item 2).
+#
+# Rules for every workflow (M1 06 §8.1): a read-only token by default, with jobs raising their own permissions;
+# third-party actions pinned by full commit SHA with a version comment; checkout without persisted credentials;
+# timeout-minutes on every job. No cache: the sources come from pins.json and are verified on every run.
+
+name: FFmpeg
+
+on:
+  pull_request:
+    paths:
+      - native/ffmpeg/**
+      - .github/workflows/ffmpeg.yml
+      - deploy/windows/msvc-env.ps1
+      - deploy/windows/tools.json
+  push:
+    branches: [main]
+    paths:
+      - native/ffmpeg/**
+      - .github/workflows/ffmpeg.yml
+      - deploy/windows/msvc-env.ps1
+      - deploy/windows/tools.json
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: >-
+          Publish deps-ffmpeg-<version>-r<revision> from this ref and print the native/ffmpeg/lock.json to commit.
+          Off: build and compare only.
+        type: boolean
+        default: false
+  schedule:
+    - cron: '41 4 * * 0' # Sunday: the reproducibility check against lock.json
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # strict: DLLs that differ with the same toolset build fail the run (06 §4.6). If MSVC turns out not to be
+  # bit-reproducible even with /Brepro, this becomes warn, and 06 §4.6 records why (README WA07, WB1).
+  FFMPEG_REPRO: strict
+
+jobs:
+  build:
+    if: github.event_name != 'schedule' || github.repository == 'MoonWX/isshoni'
+    runs-on: windows-2025
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    outputs: &build-outputs
+      zip: ${{ steps.result.outputs.zip }}
+      zip-sha256: ${{ steps.result.outputs.zip-sha256 }}
+      source: ${{ steps.result.outputs.source }}
+      source-sha256: ${{ steps.result.outputs.source-sha256 }}
+      tag: ${{ steps.result.outputs.tag }}
+      inputs: ${{ steps.result.outputs.inputs }}
+      commit: ${{ steps.result.outputs.commit }}
+      toolset: ${{ steps.result.outputs.toolset }}
+      avcodec-dll: ${{ steps.result.outputs.avcodec-dll }}
+      avcodec-sha256: ${{ steps.result.outputs.avcodec-sha256 }}
+      avutil-dll: ${{ steps.result.outputs.avutil-dll }}
+      avutil-sha256: ${{ steps.result.outputs.avutil-sha256 }}
+    steps: &build-steps
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Pick the commit to build
+        # The weekly run rebuilds what lock.json describes, from the commit its publishing run built (06 §4.5).
+        id: ref
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          $sha = git rev-parse HEAD
+          if ($env:EVENT -eq 'schedule' -and (Test-Path -LiteralPath native/ffmpeg/lock.json)) {
+            $sha = (Get-Content -LiteralPath native/ffmpeg/lock.json -Raw | ConvertFrom-Json).commit
+            Write-Output "Rebuilding lock.json's commit $sha"
+          }
+          "sha=$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Check out lock.json's commit
+        if: steps.ref.outputs.sha != github.sha && github.event_name == 'schedule'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ steps.ref.outputs.sha }}
+
+      - name: Commit and commit time
+        # build.sh records the commit and stamps the archives with its time (SOURCE_DATE_EPOCH).
+        run: |
+          $commit = git rev-parse HEAD
+          $epoch = git log -1 --format=%ct HEAD
+          if (-not $commit -or -not $epoch) { throw 'git could not read the commit' }
+          "BUILD_COMMIT=$commit", "SOURCE_DATE_EPOCH=$epoch" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: msvc-env.ps1 fails on a toolset the image lacks, naming the ones it found
+        # 06 R2's acceptance: no image has a 14.0 toolset. The child sees no GITHUB_* file, so it changes nothing.
+        if: github.job == 'build'
+        run: |
+          $ErrorActionPreference = 'Continue'
+          foreach ($name in 'GITHUB_ENV', 'GITHUB_OUTPUT', 'GITHUB_STEP_SUMMARY', 'GITHUB_ACTIONS') {
+            Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+          }
+          $out = (& pwsh -NoProfile -File deploy/windows/msvc-env.ps1 -Toolset 14.0 2>&1 | ForEach-Object { "$_" }) -join "`n"
+          $code = $LASTEXITCODE
+          Write-Output $out
+          if ($code -eq 0) { Write-Output '::error::msvc-env.ps1 -Toolset 14.0 succeeded'; exit 1 }
+          if ($out -notmatch 'the MSVC toolset 14\.0 is not installed in .*toolsets found: \d+\.\d+\.\d+') {
+            Write-Output '::error::msvc-env.ps1 failed without naming the toolsets it found'
+            exit 1
+          }
+          exit 0
+
+      - name: MSVC environment
+        run: ./deploy/windows/msvc-env.ps1
+
+      - name: MSYS2 packages
+        shell: C:\msys64\usr\bin\bash.exe --login -eo pipefail {0}
+        env: &msys2-env
+          MSYS2_PATH_TYPE: inherit # MSYS2's tools first, then the Windows PATH with the MSVC environment
+          CHERE_INVOKING: '1' # stay in the workspace
+          MSYSTEM: MSYS
+        run: |
+          pacman -Sy --noconfirm --needed make pkgconf diffutils zip
+          pacman -Q make pkgconf diffutils zip tar
+
+      - name: Build FFmpeg
+        shell: C:\msys64\usr\bin\bash.exe --login -eo pipefail {0}
+        env: *msys2-env
+        run: bash native/ffmpeg/build.sh -w "$(cygpath -u "$RUNNER_TEMP")/ffmpeg"
+
+      - name: Outputs and summary
+        id: result
+        env:
+          JOB: ${{ github.job }}
+        run: |
+          $r = Get-Content -LiteralPath "$env:RUNNER_TEMP/ffmpeg/out/result.json" -Raw | ConvertFrom-Json
+          @(
+            "zip=$($r.zip)", "zip-sha256=$($r.zipSha256)", "source=$($r.sourceTar)", "source-sha256=$($r.sourceTarSha256)",
+            "tag=$($r.tag)", "inputs=$($r.inputsSha256)", "commit=$($r.commit)", "toolset=$($r.msvcToolset)",
+            "avcodec-dll=$($r.avcodecDll)", "avcodec-sha256=$($r.avcodecSha256)",
+            "avutil-dll=$($r.avutilDll)", "avutil-sha256=$($r.avutilSha256)"
+          ) | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          @(
+            "### FFmpeg $($r.tag) ($env:JOB)",
+            '',
+            "Commit $($r.commit), MSVC toolset $($r.msvcToolset), Windows SDK $($r.windowsSdk), inputsSha256 $($r.inputsSha256).",
+            '',
+            '| File | SHA-256 |',
+            '|---|---|',
+            "| $($r.zip) | ``$($r.zipSha256)`` |",
+            "| $($r.sourceTar) | ``$($r.sourceTarSha256)`` |",
+            "| $($r.avcodecDll) | ``$($r.avcodecSha256)`` |",
+            "| $($r.avutilDll) | ``$($r.avutilSha256)`` |"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload the build
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ffmpeg-${{ github.job }}
+          path: |
+            ${{ runner.temp }}/ffmpeg/out/*.zip
+            ${{ runner.temp }}/ffmpeg/out/*.tar
+            ${{ runner.temp }}/ffmpeg/out/result.json
+            ${{ runner.temp }}/ffmpeg/out/lock-candidate.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload configure's log
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ffmpeg-${{ github.job }}-logs
+          path: |
+            ${{ runner.temp }}/ffmpeg/build/ffbuild/config.log
+            ${{ runner.temp }}/ffmpeg/deps/libvpl-build/CMakeFiles/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  rebuild:
+    # A second, independent build: are the DLLs byte-identical (06 §4.6)? Pull requests and manual runs only.
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-2025
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    outputs: *build-outputs
+    steps: *build-steps
+
+  report:
+    needs: [build, rebuild]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: tools/go.mod
+          cache: false # `go run ./desktoppkg` needs only golang.org/x/mod
+
+      - name: Compare (06 §4.6)
+        env:
+          REBUILD_RESULT: ${{ needs.rebuild.result }}
+          BUILT_COMMIT: ${{ needs.build.outputs.commit }}
+          INPUTS: ${{ needs.build.outputs.inputs }}
+          TAG: ${{ needs.build.outputs.tag }}
+          TOOLSET: ${{ needs.build.outputs.toolset }}
+          AVCODEC_DLL: ${{ needs.build.outputs.avcodec-dll }}
+          AVCODEC_SHA256: ${{ needs.build.outputs.avcodec-sha256 }}
+          AVUTIL_DLL: ${{ needs.build.outputs.avutil-dll }}
+          AVUTIL_SHA256: ${{ needs.build.outputs.avutil-sha256 }}
+          RE_TOOLSET: ${{ needs.rebuild.outputs.toolset }}
+          RE_AVCODEC_SHA256: ${{ needs.rebuild.outputs.avcodec-sha256 }}
+          RE_AVUTIL_SHA256: ${{ needs.rebuild.outputs.avutil-sha256 }}
+        run: |
+          failed=0
+          summary() { printf '%s\n' "$@" >> "$GITHUB_STEP_SUMMARY"; }
+          # A difference with the same toolset build: an error, or a warning when FFMPEG_REPRO is warn.
+          differs() {
+            if [ "$FFMPEG_REPRO" = strict ]; then
+              echo "::error::$1"
+              failed=1
+            else
+              echo "::warning::$1"
+            fi
+            summary "- **$1**"
+          }
+
+          # build.sh and desktoppkg must agree on inputsSha256: consumers compare desktoppkg's with lock.json. The
+          # weekly run built lock.json's commit, not this one, and only compares with this commit's lock.json below.
+          inputs=$(go -C tools run ./desktoppkg ffmpeg-inputs)
+          if [ "$BUILT_COMMIT" = "$GITHUB_SHA" ] && [ "$inputs" != "$INPUTS" ]; then
+            echo "::error::build.sh recorded inputsSha256 $INPUTS, desktoppkg ffmpeg-inputs says $inputs"
+            exit 1
+          fi
+
+          lock=native/ffmpeg/lock.json
+          lock_state=absent
+          if [ -f "$lock" ]; then
+            if check=$(go -C tools run ./desktoppkg ffmpeg-inputs -check 2>&1); then
+              lock_state=current
+            elif grep -q 'lock.json is stale' <<<"$check"; then
+              lock_state=stale
+            else
+              echo "::error::$check"
+              exit 1
+            fi
+          fi
+
+          summary "### FFmpeg reproducibility ($TAG)" '' \
+            "| | $AVCODEC_DLL | $AVUTIL_DLL | MSVC toolset |" '|---|---|---|---|' \
+            "| build | \`$AVCODEC_SHA256\` | \`$AVUTIL_SHA256\` | $TOOLSET |"
+          if [ "$REBUILD_RESULT" = success ]; then
+            summary "| rebuild | \`$RE_AVCODEC_SHA256\` | \`$RE_AVUTIL_SHA256\` | $RE_TOOLSET |"
+          fi
+          if [ "$lock_state" = current ]; then
+            lock_c=$(jq -r --arg n "$AVCODEC_DLL" '.dlls[$n] // "-"' "$lock")
+            lock_u=$(jq -r --arg n "$AVUTIL_DLL" '.dlls[$n] // "-"' "$lock")
+            lock_toolset=$(jq -r '.msvcToolset' "$lock")
+            summary "| lock.json | \`$lock_c\` | \`$lock_u\` | $lock_toolset |"
+          fi
+          summary ''
+
+          case $REBUILD_RESULT in
+          success)
+            if [ "$RE_AVCODEC_SHA256" = "$AVCODEC_SHA256" ] && [ "$RE_AVUTIL_SHA256" = "$AVUTIL_SHA256" ]; then
+              summary '- A second build on another runner gave byte-identical DLLs.'
+            elif [ "$RE_TOOLSET" = "$TOOLSET" ]; then
+              differs "A second build with the same toolset ($TOOLSET) gave different DLLs: MSVC's output is not reproducible here (06 §4.6)"
+            else
+              echo "::warning::The second build used toolset $RE_TOOLSET, the first $TOOLSET: not compared"
+              summary "- The second build used toolset $RE_TOOLSET, the first $TOOLSET: not compared."
+            fi
+            ;;
+          skipped) summary '- No second build on this trigger.' ;;
+          *)
+            echo "::warning::The second build did not finish ($REBUILD_RESULT): reproducibility not checked in this run"
+            summary "- The second build did not finish ($REBUILD_RESULT): reproducibility not checked in this run."
+            ;;
+          esac
+
+          case $lock_state in
+          current)
+            if [ "$lock_c" = "$AVCODEC_SHA256" ] && [ "$lock_u" = "$AVUTIL_SHA256" ]; then
+              summary "- The DLLs are byte-identical to lock.json's ($(jq -r .tag "$lock"))."
+            elif [ "$lock_toolset" = "$TOOLSET" ]; then
+              differs "The DLLs differ from lock.json's, built with the same toolset ($TOOLSET) (06 §4.6)"
+            else
+              echo "::warning::The DLLs differ from lock.json's: this build used toolset $TOOLSET, the lock $lock_toolset. The shipped bytes stay the locked ones (06 §4.6)."
+              summary "- The DLLs differ from lock.json's: toolset $TOOLSET here, $lock_toolset in the lock. The shipped bytes stay the locked ones (06 §4.6)."
+            fi
+            ;;
+          stale)
+            echo "::notice::native/ffmpeg/lock.json does not describe these inputs: after the merge, run this workflow with publish and commit the lock it prints"
+            summary '- lock.json does not describe these inputs (pins.json, build.sh or ffcheck.c changed): after the merge, run this workflow with publish and commit the lock it prints.'
+            ;;
+          absent)
+            echo "::notice::native/ffmpeg/lock.json does not exist yet: run this workflow with publish and commit the lock it prints"
+            summary '- No lock.json yet: run this workflow with publish and commit the lock it prints.'
+            ;;
+          esac
+          exit "$failed"
+
+  publish:
+    needs: [build, report]
+    if: >-
+      ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.publish &&
+      github.repository == 'MoonWX/isshoni' && needs.build.result == 'success' && needs.report.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # the release and its tag
+      id-token: write # the attestations
+      attestations: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      TAG: ${{ needs.build.outputs.tag }}
+      ZIP: ${{ needs.build.outputs.zip }}
+      ZIP_SHA256: ${{ needs.build.outputs.zip-sha256 }}
+      SOURCE: ${{ needs.build.outputs.source }}
+      SOURCE_SHA256: ${{ needs.build.outputs.source-sha256 }}
+      COMMIT: ${{ needs.build.outputs.commit }}
+    steps:
+      - name: The tag is new
+        # A deps release is never replaced: a changed build is a new revision in pins.json (06 §4.5).
+        run: |
+          if [[ ! $TAG =~ ^deps-ffmpeg-[0-9]+(\.[0-9]+)+-r[1-9][0-9]*$ ]]; then
+            echo "::error::$TAG is not a deps-ffmpeg-<version>-r<revision> tag"
+            exit 1
+          fi
+          if [ "$COMMIT" != "$GITHUB_SHA" ]; then
+            echo "::error::build built $COMMIT, not this run's commit $GITHUB_SHA"
+            exit 1
+          fi
+          set +e
+          git ls-remote --exit-code --tags "https://github.com/$GITHUB_REPOSITORY" "refs/tags/$TAG"
+          status=$?
+          set -e
+          case $status in
+          2) echo "$TAG does not exist yet" ;;
+          0)
+            echo "::error::$TAG already exists: raise \"revision\" in native/ffmpeg/pins.json for a new build"
+            exit 1
+            ;;
+          *)
+            echo "::error::git ls-remote failed ($status)"
+            exit 1
+            ;;
+          esac
+
+      - name: Download the build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ffmpeg-build
+          path: dist
+
+      - name: The files are the ones build hashed
+        working-directory: dist
+        run: |
+          printf '%s  %s\n' "$ZIP_SHA256" "$ZIP" "$SOURCE_SHA256" "$SOURCE" | sha256sum --strict -c -
+          jq -e --arg tag "$TAG" --arg commit "$COMMIT" --arg zip "$ZIP" --arg zs "$ZIP_SHA256" \
+            --arg src "$SOURCE" --arg ss "$SOURCE_SHA256" \
+            '.tag == $tag and .commit == $commit and .assets == {($zip): $zs, ($src): $ss}' lock-candidate.json
+          sha256sum "$ZIP" "$SOURCE" > SHA256SUMS
+
+      - name: Attest the zip and the source archive
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/${{ needs.build.outputs.zip }}
+            dist/${{ needs.build.outputs.source }}
+
+      - name: Create the prerelease
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rest=${TAG#deps-ffmpeg-}
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --latest=false \
+            --title "FFmpeg ${rest%-r*} (r${rest##*-r}) for isshoni" \
+            --notes "Build input of the isshoni Windows app; not an isshoni release" \
+            "$ZIP" "$SOURCE" SHA256SUMS
+
+      - name: The lock.json to commit
+        working-directory: dist
+        run: |
+          jq . lock-candidate.json
+          {
+            echo "### native/ffmpeg/lock.json for $TAG"
+            echo
+            echo 'Commit this file as native/ffmpeg/lock.json (06 §4.1, §14 item 2):'
+            echo
+            echo '```json'
+            jq . lock-candidate.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

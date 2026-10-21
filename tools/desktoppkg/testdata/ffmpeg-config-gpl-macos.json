@@ -1,0 +1,17 @@
+{
+  "avcodecVersion": 4129126,
+  "avcodecMajor": 63,
+  "avcodecMinor": 1,
+  "avcodecMicro": 102,
+  "avutilVersion": 3998054,
+  "avutilMajor": 61,
+  "avutilMinor": 1,
+  "avutilMicro": 102,
+  "license": "GPL version 2 or later",
+  "avutilLicense": "GPL version 2 or later",
+  "configuration": "--prefix=../install --cc=clang --disable-programs --disable-doc --disable-everything --disable-autodetect --disable-network --disable-x86asm --enable-shared --disable-static --disable-avformat --disable-avdevice --disable-avfilter --disable-swscale --disable-swresample --enable-avcodec --enable-avutil --enable-gpl --enable-encoder=rawvideo --enable-decoder=rawvideo",
+  "encoders": ["rawvideo"],
+  "decoders": ["rawvideo"],
+  "ok": false,
+  "problems": ["avcodec_license() is not \"LGPL version 2.1 or later\": GPL version 2 or later", "avutil_license() is not \"LGPL version 2.1 or later\": GPL version 2 or later", "the configuration contains --enable-gpl", "the encoders are not exactly h264_amf, h264_mf, h264_nvenc, h264_qsv", "the build has decoders, the first is rawvideo"]
+}
