@@ -26,6 +26,24 @@ func IPKey(a netip.Addr) netip.Prefix {
 	return p
 }
 
+// IPKey48 is device-code-ip48's key (M2 02 §5.5): the /48 of an IPv6 address, with IPv4-mapped addresses unmapped
+// first and the zone dropped. It is false for IPv4 (and IPv4-mapped IPv6) and for the zero Addr, which skip that
+// bucket: an IPv4 client's /32 key of device-code-ip is one address already.
+//
+// A /48 is the usual allocation of one site or tunnel-broker account, so the bucket bounds what one holder of many
+// /64s can do to the server-wide pending-code cap (maxPendingDeviceCodes).
+func IPKey48(a netip.Addr) (netip.Prefix, bool) {
+	a = a.Unmap().WithZone("")
+	if !a.Is6() {
+		return netip.Prefix{}, false
+	}
+	p, err := a.Prefix(48)
+	if err != nil {
+		return netip.Prefix{}, false
+	}
+	return p, true
+}
+
 // HashBudget is the server-wide auth-hash bucket (03 §7.3): at most Burst anonymous hashes at once, refilled at
 // PerSecond. The zero value means DefaultHashBudget; only tests change it. Both must be at least 1, PerSecond at most
 // 1e9 (one token per nanosecond), and the time to refill an empty bucket, Burst ÷ PerSecond seconds, at most about
@@ -292,7 +310,18 @@ var (
 	rateGlobalThrottled  = rate{Burst: 1, Every: time.Hour}
 	// The signup_pending admin alert: at most one per 10 min, however many sign-ups arrive (03 §7.9).
 	rateSignupAlert = rate{Burst: 1, Every: 10 * time.Minute}
+
+	// The device flow's buckets (M2 02 §5.5, §6.8). POST /device/password takes login's buckets instead (§14).
+	rateDeviceCodeIP   = rate{Burst: 10, Every: 6 * time.Minute}
+	rateDeviceCodeIP48 = rate{Burst: 30, Every: 2 * time.Minute} // IPv6 /48 (IPKey48)
+	rateDeviceTokenIP  = rate{Burst: 60, Every: time.Second}
+	rateDeviceLookup   = rate{Burst: 10, Every: time.Minute}
 )
+
+// maxPendingDeviceCodes is the server-wide cap of pending, unexpired device codes (M2 02 §5.2 step 4): a backstop for
+// memory and disk (a row is about 200 bytes, so about 1 MB), checked last, in the Write that would add the code. The
+// per-prefix buckets keep one holder of many IPv6 /64s from reaching it.
+const maxPendingDeviceCodes = 5000
 
 // throttles are the in-memory buckets of 03 §7.3. Each is checked before any hashing or DB access; the service
 // decides the order (auth-ip first, auth-hash last).
@@ -308,6 +337,14 @@ type throttles struct {
 	// A user's own password changes, by user ID: the token is taken before the first hash and kept by a change
 	// whose current password was right (changeToken in selfservice.go).
 	passwordChange *limiter[store.UserID]
+
+	// The device flow's buckets (M2 02 §5.5). Each is checked before any DB access.
+	deviceCodeIP   *limiter[netip.Prefix] // every POST /device/code, by IPKey, after auth-ip
+	deviceCodeIP48 *limiter[netip.Prefix] // every POST /device/code from IPv6, by IPKey48, after device-code-ip
+	deviceTokenIP  *limiter[netip.Prefix] // every POST /device/token (both grants), by IPKey, first
+	// Wrong user codes at /device/lookup and /device/decide, by user ID: the token is taken before the read and
+	// given back unless the code was wrong (lookupAttempt in deviceflow.go).
+	deviceLookup *limiter[store.UserID]
 
 	blockLog             *limiter[netip.Prefix] // the warn line of a blocked attempt, by IPKey
 	loginFailedAudit     *limiter[struct{}]     // auth.login_failed rows
@@ -327,6 +364,10 @@ func newThrottles(now func() time.Time, hb HashBudget) (*throttles, error) {
 		registerIP:           newLimiter[netip.Prefix](rateRegisterIP, maxLimiterKeys, now),
 		authHash:             newLimiter[struct{}](hashRate, 1, now),
 		passwordChange:       newLimiter[store.UserID](ratePasswordChange, maxLimiterKeys, now),
+		deviceCodeIP:         newLimiter[netip.Prefix](rateDeviceCodeIP, maxLimiterKeys, now),
+		deviceCodeIP48:       newLimiter[netip.Prefix](rateDeviceCodeIP48, maxLimiterKeys, now),
+		deviceTokenIP:        newLimiter[netip.Prefix](rateDeviceTokenIP, maxLimiterKeys, now),
+		deviceLookup:         newLimiter[store.UserID](rateDeviceLookup, maxLimiterKeys, now),
 		blockLog:             newLimiter[netip.Prefix](rateBlockLog, maxLimiterKeys, now),
 		loginFailedAudit:     newLimiter[struct{}](rateLoginFailedAudit, 1, now),
 		globalThrottledAudit: newLimiter[struct{}](rateGlobalThrottled, 1, now),
