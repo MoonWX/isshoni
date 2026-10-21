@@ -2269,7 +2269,10 @@ After a leak, the backup key signs until a new key exists, and a security adviso
   `srcDir` stays at its default, which is the same directory; `srcExclude` also has `scripts/**`, the site's own
   tooling; `cleanUrls`, and no web fonts (`useWebFonts: false`). `docs/package.json` turns off the install scripts
   of `esbuild` and `fsevents` (`allowScripts`), as `web/` does for `fsevents`, so `npm ci` runs no third-party
-  install script, and `docs/.npmrc` is `web/`'s (`engine-strict`, `fund=false`).
+  install script, and `docs/.npmrc` is `web/`'s (`engine-strict`, `fund=false`). It also overrides VitePress 1.6's
+  Vite 5 with Vite 6.4.4 (`overrides`): the dev server advisories against Vite 5.4 and its esbuild 0.21 have no 5.x
+  fix, and the built pages are the same (their text compared page by page; only the asset hashes differ). The
+  override goes once a VitePress release requires a fixed Vite itself.
 - **Site URL:** `https://moonwx.github.io/isshoni/`. Adding a custom domain later keeps these URLs working, because
   GitHub Pages redirects `github.io` to the custom domain.
 - **Stable install URL:** `https://moonwx.github.io/isshoni/install.sh`. Mirror:

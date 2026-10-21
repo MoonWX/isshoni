@@ -20,5 +20,8 @@
   "allowScripts": {
     "esbuild": false,
     "fsevents": false
+  },
+  "overrides": {
+    "vite": "6.4.4"
   }
 }
