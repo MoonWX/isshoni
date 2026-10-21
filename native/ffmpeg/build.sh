@@ -393,10 +393,14 @@ main() {
   endgroup
 
   group "libvpl $vpl_tag (static, /MT)"
+  # libvpl sets CMP0091 (which makes CMake honour CMAKE_MSVC_RUNTIME_LIBRARY) inside if(MSVC), before project() has
+  # defined MSVC, so it stays unset under its cmake_minimum_required(3.13) and CMake compiles with its default /MD:
+  # the policy's default is given here instead, and the check after the install catches a dispatcher with the DLL CRT.
   MSYS2_ARG_CONV_EXCL='*' "$cmake_exe" -G Ninja -S "$(cygpath -m "$deps/libvpl")" -B "$(cygpath -m "$deps/libvpl-build")" \
     -DCMAKE_MAKE_PROGRAM="$(cygpath -m "$ninja_exe")" \
     -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl \
     -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+    -DCMAKE_POLICY_DEFAULT_CMP0091=NEW \
     -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DUSE_MSVC_STATIC_RUNTIME=ON \
     -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF -DINSTALL_EXAMPLES=OFF \
     -DCMAKE_INSTALL_PREFIX="$(cygpath -m "$prefix")"
@@ -405,6 +409,14 @@ main() {
   if [ ! -f "$prefix/lib/vpl.lib" ] || [ ! -f "$prefix/lib/pkgconfig/vpl.pc" ]; then
     die 'libvpl did not install vpl.lib and vpl.pc'
   fi
+  # Each object's linker directives name its CRT: LIBCMT and libcpmt for /MT, MSVCRT and msvcprt for /MD.
+  local vpl_directives
+  vpl_directives=$(MSYS2_ARG_CONV_EXCL='*' dumpbin.exe -nologo -directives "$(cygpath -m "$prefix/lib/vpl.lib")" | tr -d '\r')
+  if grep -Eiq '/DEFAULTLIB:"?(msvcrt|msvcprt)"?( |$)' <<<"$vpl_directives"; then
+    die 'vpl.lib was compiled with the DLL CRT (/MD): its objects name MSVCRT or msvcprt (06 D7 needs /MT)'
+  fi
+  grep -Eiq '/DEFAULTLIB:"?LIBCMT"?( |$)' <<<"$vpl_directives" ||
+    die 'vpl.lib names no LIBCMT: dumpbin -directives found no static CRT in it'
   # vpl.pc names the dispatcher's system libraries for MinGW only (whose gcc links advapi32 anyway); with MSVC the
   # static dispatcher needs the registry API (advapi32) and COM (ole32), or configure's libvpl check cannot link.
   sed -i 's/^Libs\.private:.*$/Libs.private: -ladvapi32 -lole32/' "$prefix/lib/pkgconfig/vpl.pc"
