@@ -752,6 +752,64 @@ func TestTrimDevices(t *testing.T) {
 	})
 }
 
+// TestTrimDevicesCap: the cap path of M2 02 §5.4 and §6.7, a user at 20 devices before the 21st link. TrimDevices(u,
+// 19) evicts exactly one device; of the two least recently seen, seen at the same time, the one created first goes
+// (the tie-break is the SQL's, not the sort of the returned slice), with only its own tokens and push subscription.
+func TestTrimDevicesCap(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	db := e.open(nil)
+	t0 := e.clock.Now()
+	alex := e.newUser(db, "Alex")
+	// The newer device is inserted first, so its rowid is the lower one: only created_at keeps it.
+	newer := e.linkDevice(db, alex.ID, "Laptop", t0.Add(time.Minute))
+	older := e.linkDevice(db, alex.ID, "Old PC", t0)
+	others := make([]Device, 0, 18)
+	for i := range 18 {
+		others = append(others, e.linkDevice(db, alex.ID, "PC "+itoa(i), t0.Add(time.Duration(i+2)*time.Minute)))
+	}
+	mustWrite(t, db, func(q *Q) error { return q.TouchDevice(newer.ID, "", "", t0) })
+	newer.LastSeenAt = t0
+	e.newToken(db, older.ID, "refresh", "r-old", time.Hour)
+	e.newToken(db, older.ID, "access", "a-old", time.Hour)
+	e.newToken(db, newer.ID, "refresh", "r-new", time.Hour)
+	e.newToken(db, newer.ID, "access", "a-new", time.Hour)
+	e.newToken(db, others[0].ID, "access", "a-other", time.Hour)
+	for id, d := range map[string]DeviceID{"p-old": older.ID, "p-new": newer.ID} {
+		mustExecW(t, db, `INSERT INTO push_subscriptions (id, user_id, device_id, endpoint, p256dh, auth_secret, name,
+			created_at) VALUES (?, ?, ?, ?, 'k', 'a', 'App', 0)`, id, string(alex.ID), string(d),
+			"https://push.example/"+id)
+	}
+
+	var trimmed, left []Device
+	mustWrite(t, db, func(q *Q) (err error) {
+		if trimmed, err = q.TrimDevices(alex.ID, 19); err != nil {
+			return err
+		}
+		left, err = q.ListDevices(alex.ID)
+		return err
+	})
+	if !slices.Equal(trimmed, []Device{older}) {
+		t.Errorf("TrimDevices(19) at 20 devices =\n %+v\nwant\n %+v", trimmed, []Device{older})
+	}
+	if len(left) != 19 || !slices.Contains(left, newer) || slices.ContainsFunc(left, func(d Device) bool {
+		return d.ID == older.ID
+	}) {
+		t.Errorf("after TrimDevices(19), ListDevices = %+v\nwant 19 devices with %+v and without %s", left, newer,
+			older.ID)
+	}
+	for h, want := range map[string]bool{"r-old": false, "a-old": false, "r-new": true, "a-new": true, "a-other": true} {
+		if _, found := tokenRow(t, db, h); found != want {
+			t.Errorf("after TrimDevices(19), token %s exists = %t, want %t", h, found, want)
+		}
+	}
+	for id, want := range map[string]int{"p-old": 0, "p-new": 1} {
+		if n := queryInt(t, db, `SELECT count(*) FROM push_subscriptions WHERE id = ?`, id); n != want {
+			t.Errorf("after TrimDevices(19), push subscription %s count = %d, want %d", id, n, want)
+		}
+	}
+}
+
 // ---- device tokens ----
 
 func TestDeviceTokens(t *testing.T) {

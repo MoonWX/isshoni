@@ -15,7 +15,7 @@ var (
 	ErrNotFound = errors.New("store: not found")
 	// ErrConflict is wrapped by *ConflictError (a UNIQUE constraint rejected the write), and by the errors of
 	// SpendRefreshToken and SupersedeRefreshToken when the refresh token was spent in parallel.
-	ErrConflict = errors.New("store: unique constraint")
+	ErrConflict = errors.New("store: conflict")
 	// ErrInviteUnusable is returned by UseInvite when the invite is expired, used up or revoked.
 	ErrInviteUnusable = errors.New("store: invite expired, used up or revoked")
 	// ErrDefaultRoom is returned by DeleteRoom for the default room.
