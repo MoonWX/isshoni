@@ -1,0 +1,12 @@
+{
+  "type": "agent.recv",
+  "data": {
+    "from": "c_4hq8m2v7kx9p3w1d",
+    "kind": "playback.state",
+    "payload": {
+      "playing": true,
+      "browser": "chrome",
+      "os": "windows"
+    }
+  }
+}

@@ -7,12 +7,14 @@
 /**
  * AgentSend relays an opaque payload to other connections of the same user (01 §8.14, feature agent.relay). Only the
  * transport is defined in v1; the server never parses Payload.
- * Reserved kinds: share.request, share.status (M4); playback.stop, exclusions.get, exclusions.set (M2).
+ * The kinds and their payloads are registered in internal/protocol/relay (M2 01 §11.11): playback.stop and
+ * playback.state (M2); share.request and share.status (reserved, M4); exclusions.get and exclusions.set (reserved,
+ * M4's agent spec declares their payloads). Receivers ignore kinds they don't know.
  */
 export interface AgentSend {
   to?: string; // a connectionId of the same user, or
   toRole?: Role; // all the user's connections with this role (exactly one of To/ToRole)
-  kind: string; // [a-z.]{1,32}; registry in 04/M2 docs
+  kind: string; // [a-z.]{1,32}; registry: internal/protocol/relay
   payload: unknown; // any JSON value but null, <= 16 KiB; opaque to the server
 }
 /**
@@ -30,7 +32,11 @@ export interface AgentRecv {
   payload: unknown; // the agent.send's payload: never null
 }
 /**
- * UserConnections (later M2, feature user.connections): all of the user's connections, sent to each of them on change.
+ * UserConnections (M2, feature user.connections): all of the user's connections, sorted by connection id. The hub
+ * sends it to each of the user's online connections that has the feature active (M2 01 §10.4): after its welcome,
+ * and whenever one of the user's connections opens, closes, detaches, re-attaches or changes room, or a
+ * revalidation changed a connection's DeviceName; at most one per 200 ms per user. Only the user's own connections
+ * ever see it (01 §17: OS and version stay private).
  */
 export interface UserConnections {
   connections: OwnConnection[];
@@ -38,11 +44,16 @@ export interface UserConnections {
 /**
  * OwnConnection is one of the user's own connections, with the details other users never see. The embedded
  * ConnectionInfo's fields are inlined in JSON; the tstype tag makes tygo emit "extends ConnectionInfo" to match.
+ * The list holds every connection of the user, the recipient included; a detached one has status reconnecting.
+ * DeviceName (M2) is the name the user gave the device of a bearer connection (02's signal.Identity.DeviceName),
+ * absent for cookie connections. It may lag a rename by up to 5 minutes (the hub's revalidation interval). It is
+ * user content: never logged.
  */
 export interface OwnConnection extends ConnectionInfo {
   os: ClientOS;
   version: string;
   roomId?: string;
+  deviceName?: string; // M2: the device's name for a bearer connection; may lag a rename by <= 5 min
 }
 
 //////////
@@ -159,7 +170,7 @@ export const MessageTypeInvalidate = "invalidate";
 export const MessageTypeServerShutdown = "server.shutdown";
 export const MessageTypeAgentSend = "agent.send";
 export const MessageTypeAgentRecv = "agent.recv";
-export const MessageTypeUserConnections = "user.connections"; // later (M2, feature user.connections)
+export const MessageTypeUserConnections = "user.connections"; // M2, feature user.connections
 export type MessageType = typeof MessageTypeHello | typeof MessageTypeWelcome | typeof MessageTypeOK | typeof MessageTypeError | typeof MessageTypePing | typeof MessageTypePong | typeof MessageTypeRoomJoin | typeof MessageTypeRoomLeave | typeof MessageTypeRoomState | typeof MessageTypeRoomEvent | typeof MessageTypeShareStart | typeof MessageTypeShareUpdate | typeof MessageTypeShareStop | typeof MessageTypePCOffer | typeof MessageTypePCAnswer | typeof MessageTypePCICE | typeof MessageTypePCRestart | typeof MessageTypePCClose | typeof MessageTypeSubscribeUpdate | typeof MessageTypeSubscribeStatus | typeof MessageTypeQualityHint | typeof MessageTypeCapsUpdate | typeof MessageTypeStats | typeof MessageTypeStatsWatch | typeof MessageTypeInvalidate | typeof MessageTypeServerShutdown | typeof MessageTypeAgentSend | typeof MessageTypeAgentRecv | typeof MessageTypeUserConnections;
 /**
  * Envelope is every WebSocket message (01 §5).
@@ -348,9 +359,9 @@ export type Role = typeof RoleFull | typeof RoleViewer | typeof RolePublisher | 
  * Feature is a named optional capability within a protocol version (01 §6.2). A feature is active only if it is in
  * welcome.features.
  */
-export const FeatureAgentRelay = "agent.relay";
-export const FeatureUserConnections = "user.connections"; // later (M2)
-export const FeatureSharePause = "share.pause"; // later (M2)
+export const FeatureAgentRelay = "agent.relay"; // agent.send and agent.recv; the kinds are in internal/protocol/relay
+export const FeatureUserConnections = "user.connections"; // M2: the user.connections message (M2 01 §10.4)
+export const FeatureSharePause = "share.pause"; // M2: share.update's paused and ShareStatusPaused (M2 01 §10.3)
 export const FeatureLayerMid = "layer.mid"; // later (M5)
 export const FeatureICERefresh = "ice.refresh"; // later (TURN)
 export type Feature = typeof FeatureAgentRelay | typeof FeatureUserConnections | typeof FeatureSharePause | typeof FeatureLayerMid | typeof FeatureICERefresh;
@@ -818,12 +829,17 @@ export interface Encoding {
   maxPixels: number /* int */; // pixel budget, aspect-ratio neutral (ultrawide screens)
 }
 /**
- * ShareUpdate changes the label or preset of a share of the same user. The reply carries the new ShareParams.
+ * ShareUpdate changes the label or preset of a share of the same user, or pauses and resumes it (M2 01 §10.3). The
+ * reply carries the share's ShareParams. Any connection of the share's user may send it (01 §4.1).
+ * Paused is read only from a connection that has the feature share.pause active; from any other connection the hub
+ * ignores it without an error, so old and new clients interoperate. Absent leaves the share's pause bit as it is,
+ * true sets it, false clears it; room.state shows the bit as ShareStatusPaused.
  */
 export interface ShareUpdate {
   shareId: string;
   label?: string; // "" clears the label
   preset?: Preset;
+  paused?: boolean; // M2, feature share.pause: ignored without it
 }
 /**
  * ShareStop ends a share. It is idempotent: an unknown or already ended share replies ok.
@@ -848,11 +864,14 @@ export const PresetText = "text";
 export type Preset = typeof PresetAuto | typeof PresetGame | typeof PresetMovie | typeof PresetText;
 /**
  * ShareStatus is a share's state (01 §4.4). Clients treat unknown values as live.
+ * Precedence (M2 01 §10.3): stalled while the pub PC is down, else paused while the share's pause bit is set, else
+ * starting or live as in M1. A share paused while starting shows paused once it would be live.
  */
 export const ShareStatusStarting = "starting";
 export const ShareStatusLive = "live";
 export const ShareStatusStalled = "stalled";
-export type ShareStatus = typeof ShareStatusStarting | typeof ShareStatusLive | typeof ShareStatusStalled;
+export const ShareStatusPaused = "paused"; // M2, feature share.pause; old clients treat it as live (01 §4.4)
+export type ShareStatus = typeof ShareStatusStarting | typeof ShareStatusLive | typeof ShareStatusStalled | typeof ShareStatusPaused;
 
 //////////
 // source: stats.go

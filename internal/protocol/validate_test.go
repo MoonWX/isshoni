@@ -225,6 +225,14 @@ func TestValidateShareUpdateStop(t *testing.T) {
 		{"label clears", `{"shareId":"s_1","label":""}`, ""},
 		{"label invalid", `{"shareId":"s_1","label":"a\u0000b"}`, "label:invalid"},
 		{"label too long", `{"shareId":"s_1","label":"` + strings.Repeat("x", 41) + `"}`, "label:too_long"},
+		// M2 01 §10.3: paused needs no other field and is never refused for the feature (the hub ignores it).
+		{"pause only", `{"shareId":"s_1","paused":true}`, ""},
+		{"resume only", `{"shareId":"s_1","paused":false}`, ""},
+		{"paused null is absent", `{"shareId":"s_1","paused":null}`, ""},
+		{"paused with preset and label", `{"shareId":"s_1","preset":"game","label":"Game","paused":true}`, ""},
+		{"paused not a bool", `{"shareId":"s_1","paused":"yes"}`, "paused:invalid"},
+		{"paused as a number", `{"shareId":"s_1","paused":1}`, "paused:invalid"},
+		{"paused without share id", `{"paused":true}`, "shareId:required"},
 	})
 	runValidation(t, ShareStop{}, []vcase{
 		{"valid", `{"shareId":"s_q7m2x9c4v8b1n5k3"}`, ""},

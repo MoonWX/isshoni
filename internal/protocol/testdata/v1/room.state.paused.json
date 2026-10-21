@@ -1,0 +1,41 @@
+{
+  "type": "room.state",
+  "data": {
+    "roomId": "lounge",
+    "rev": 42,
+    "participants": [
+      {
+        "userId": "k3m9p2qxw7ht",
+        "name": "Alex",
+        "status": "present",
+        "joinedAt": "2026-11-20T19:03:58.004Z",
+        "connections": [
+          {
+            "id": "c_k3v9q2m7xw4pa8d1",
+            "kind": "desktop",
+            "role": "publisher",
+            "status": "online"
+          }
+        ]
+      }
+    ],
+    "shares": [
+      {
+        "id": "s_q7m2x9c4v8b1n5k3",
+        "userId": "k3m9p2qxw7ht",
+        "connectionId": "c_k3v9q2m7xw4pa8d1",
+        "kind": "window",
+        "preset": "auto",
+        "audio": true,
+        "status": "paused",
+        "layers": [
+          "high",
+          "low"
+        ],
+        "codec": "h264/6400",
+        "startedAt": "2026-11-20T19:04:05.123Z",
+        "watchers": []
+      }
+    ]
+  }
+}

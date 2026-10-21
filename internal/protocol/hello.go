@@ -119,9 +119,9 @@ func (r Role) AllowsPC(pc PCKind) bool {
 type Feature string
 
 const (
-	FeatureAgentRelay      Feature = "agent.relay"
-	FeatureUserConnections Feature = "user.connections" // later (M2)
-	FeatureSharePause      Feature = "share.pause"      // later (M2)
+	FeatureAgentRelay      Feature = "agent.relay"      // agent.send and agent.recv; the kinds are in internal/protocol/relay
+	FeatureUserConnections Feature = "user.connections" // M2: the user.connections message (M2 01 §10.4)
+	FeatureSharePause      Feature = "share.pause"      // M2: share.update's paused and ShareStatusPaused (M2 01 §10.3)
 	FeatureLayerMid        Feature = "layer.mid"        // later (M5)
 	FeatureICERefresh      Feature = "ice.refresh"      // later (TURN)
 )

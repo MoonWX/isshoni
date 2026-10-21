@@ -1,0 +1,12 @@
+{
+  "type": "agent.send",
+  "id": "41",
+  "data": {
+    "toRole": "full",
+    "kind": "playback.stop",
+    "payload": {
+      "v": 1,
+      "roomId": "lounge"
+    }
+  }
+}

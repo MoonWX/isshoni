@@ -1,0 +1,25 @@
+{
+  "type": "user.connections",
+  "data": {
+    "connections": [
+      {
+        "id": "c_4hq8m2v7kx9p3w1d",
+        "kind": "web",
+        "role": "full",
+        "status": "online",
+        "os": "windows",
+        "version": "0.2.0",
+        "roomId": "lounge"
+      },
+      {
+        "id": "c_k3v9q2m7xw4pa8d1",
+        "kind": "desktop",
+        "role": "publisher",
+        "status": "online",
+        "os": "windows",
+        "version": "0.2.0",
+        "deviceName": "Gaming PC"
+      }
+    ]
+  }
+}

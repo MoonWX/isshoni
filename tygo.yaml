@@ -16,3 +16,10 @@ packages:
       time.Time: "string"
       json.RawMessage: "unknown"
     frontmatter: "// Source: internal/protocol/api. Regenerate with \"task gen\".\n"
+  - path: "github.com/MoonWX/isshoni/internal/protocol/relay" # same-user relay kinds and payloads (docs/m2/01-client-core.md §11.11)
+    output_path: "web/src/protocol/relay.gen.ts"
+    enum_style: "union"
+    type_mappings:
+      # The relay's payloads use protocol's enums; relay.gen.ts imports them from types.gen.ts (the frontmatter).
+      protocol.ClientOS: "ClientOS"
+    frontmatter: "// Source: internal/protocol/relay. Regenerate with \"task gen\".\nimport type { ClientOS } from './types.gen';\n"
