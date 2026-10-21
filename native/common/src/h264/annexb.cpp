@@ -58,20 +58,24 @@ bool ProfileMatches(uint32_t session_profile, uint8_t profile_idc) noexcept {
 } // namespace
 
 std::size_t Normalizer::MaxOutputSize(std::size_t n) noexcept {
-  // The smallest unit is a 3-byte start code and one byte: it grows by a quarter. Plus an inserted SPS and PPS.
-  return n + n / 4 + 2 * (sizeof(kStartCode) + MaxEscapedSize(kMaxSpsBytes)) + 8;
+  // The smallest unit is a 3-byte start code and one byte: it grows by a quarter. Plus an SPS and a PPS: the cache
+  // holds none larger than kMaxSpsBytes, and a rewritten SPS fits in it too (SetConstraintByte).
+  return n + n / 4 + 2 * (sizeof(kStartCode) + kMaxSpsBytes) + 8;
 }
 
 void Normalizer::Reserve(std::size_t au_bytes) {
   out_.reserve(MaxOutputSize(au_bytes));
-  sps_.reserve(MaxEscapedSize(kMaxSpsBytes));
+  sps_.reserve(kMaxSpsBytes);
   pps_.reserve(kMaxSpsBytes);
-  scratch_.reserve(MaxEscapedSize(kMaxSpsBytes));
 }
 
 void Normalizer::Reset() noexcept {
-  sps_.clear();
+  ForgetSps();
   pps_.clear();
+}
+
+void Normalizer::ForgetSps() noexcept {
+  sps_.clear();
   sps_info_ = Sps{};
   sps_ok_ = false;
 }
@@ -81,34 +85,43 @@ void Normalizer::Append(std::span<const uint8_t> nal) {
   out_.insert(out_.end(), nal.begin(), nal.end());
 }
 
-void Normalizer::TakeSps(std::span<const uint8_t> nal, const NormalizeOptions &options, AuInfo &info) {
+bool Normalizer::TakeSps(std::span<const uint8_t> nal, const NormalizeOptions &options, AuInfo &info) {
+  if (nal.size() > kMaxSpsBytes) {
+    // Larger than the cache, MaxOutputSize and Reserve allow (it doesn't parse either): dropped.
+    ForgetSps();
+    info.sps_invalid = true;
+    return false;
+  }
   Sps parsed;
   if (ParseSps(nal, &parsed) != SpsError::kOk) {
     Assign(sps_, nal);
     sps_info_ = Sps{};
     sps_ok_ = false;
     info.sps_invalid = true;
-    return;
+    return true;
   }
   const int want = WantedConstraint(options.session_profile, parsed.profile_idc);
   if (want < 0 || parsed.constraint_flags == static_cast<uint8_t>(want)) {
     Assign(sps_, nal);
     sps_info_ = parsed;
     sps_ok_ = true;
-    return;
+    return true;
   }
-  // Unescape the whole unit (the header byte is never 00, so the RBSP's escaping is unchanged by including it), set the
-  // constraint byte (header, profile_idc, constraint: index 2) and escape it again.
-  scratch_.resize(nal.size());
-  const std::size_t n = UnescapeRbsp(nal, std::span<uint8_t>(scratch_));
-  scratch_.resize(n);
-  scratch_[2] = static_cast<uint8_t>(want);
-  sps_.resize(MaxEscapedSize(n));
-  sps_.resize(EscapeRbsp(std::span<const uint8_t>(scratch_), std::span<uint8_t>(sps_)));
-  parsed.constraint_flags = static_cast<uint8_t>(want);
-  sps_info_ = parsed;
+  // Set the constraint byte, then check that the result parses with the new byte (SetConstraintByte keeps the rest
+  // of the RBSP, so it does); the AU's profile and size come from the rewritten SPS that goes out.
+  sps_.resize(kMaxSpsBytes);
+  sps_.resize(SetConstraintByte(nal, static_cast<uint8_t>(want), std::span<uint8_t>(sps_)));
+  Sps rewritten;
+  if (sps_.empty() || ParseSps(sps_, &rewritten) != SpsError::kOk || rewritten.profile_idc != parsed.profile_idc ||
+      rewritten.constraint_flags != static_cast<uint8_t>(want)) {
+    ForgetSps();
+    info.sps_invalid = true;
+    return false;
+  }
+  sps_info_ = rewritten;
   sps_ok_ = true;
   info.sps_rewritten = true;
+  return true;
 }
 
 std::span<const uint8_t> Normalizer::Normalize(std::span<const uint8_t> au, const NormalizeOptions &options,
@@ -149,11 +162,17 @@ std::span<const uint8_t> Normalizer::Normalize(std::span<const uint8_t> au, cons
     info.dropped_nals += pps_count - 1;
   }
 
-  // The cache follows the stream, also for an AU that carries only parameter sets.
-  if (!last_sps.empty()) {
-    TakeSps(last_sps, options, info);
+  // The cache follows the stream, also for an AU that carries only parameter sets. An SPS or PPS that can't be carried
+  // is dropped and leaves its cache entry empty: inserting the one it replaced before the next IDR would be wrong.
+  if (!last_sps.empty() && !TakeSps(last_sps, options, info)) {
+    ++info.dropped_nals;
+    last_sps = {};
   }
-  if (!last_pps.empty()) {
+  if (last_pps.size() > kMaxSpsBytes) {
+    pps_.clear();
+    ++info.dropped_nals;
+    last_pps = {};
+  } else if (!last_pps.empty()) {
     Assign(pps_, last_pps);
   }
   if (sps_ok_) {

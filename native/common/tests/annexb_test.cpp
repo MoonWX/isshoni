@@ -1,7 +1,7 @@
 // The access-unit normalizer (docs/m2/04-windows-engine.md §9.4, §18.1): synthetic cases (3-byte start codes,
 // AUD/SEI/filler/EOS dropped, an IDR without SPS/PPS gets them from the cache, duplicates removed, CB byte → e0, a
-// non-100 profile in a High session flagged, KEYFRAME from NAL type 5, idempotence), the annexb_fuzz properties over
-// seeds and mutations, and the golden AUs per encoder.
+// non-100 profile in a High session flagged, KEYFRAME from NAL type 5, idempotence, SPS and PPS at and past the size
+// limits), the annexb_fuzz properties over seeds and mutations, and the golden AUs per encoder.
 //
 // Golden AUs (WA44, captured with `isshoni-enginetest capture -dump-aus` in 04 E7): testdata/aus/<encoder token>/
 // holds one <name>.h264 file per access unit exactly as the encoder produced it (Annex B, before normalization),
@@ -369,6 +369,100 @@ TEST(AnnexB, OutputBoundAndReserve) {
   const auto out = n.Normalize(au, Opts(), nullptr);
   EXPECT_LE(out.size(), Normalizer::MaxOutputSize(au.size()));
   EXPECT_EQ(out.size(), 4 + sps.size() + 4 + pps.size() + 1001u * 5);
+}
+
+TEST(AnnexB, SpsNearTheSizeLimit) {
+  // A 4096-byte SPS whose unread tail holds 00 00 02 without emulation prevention (the annexb_fuzz seed
+  // sps_near_limit_unescaped), and one whose RBSP is exactly kMaxSpsRbspBytes and ends in an odd run of zero bytes:
+  // in a CB session both are rewritten to e0, the rewritten SPS parses, and the output is idempotent.
+  Bytes unescaped = {0x67, 0x42, 0x40, 0x28, 0xED, 0x00, 0xA0, 0x0B, 0x72};
+  for (int i = 0; i < 1362; ++i) {
+    unescaped.insert(unescaped.end(), {0x00, 0x00, 0x02});
+  }
+  unescaped.push_back(0x05);
+  Bytes odd = Sps(66, 0x40);
+  Bytes rbsp(odd.size());
+  rbsp.resize(im::h264::UnescapeRbsp(std::span<const uint8_t>(odd).subspan(1), rbsp));
+  odd.resize(odd.size() + (im::h264::kMaxSpsRbspBytes - 3 - rbsp.size()), 0x80);
+  odd.insert(odd.end(), {0x00, 0x00, 0x00, 0x03});
+  const Bytes pps = MakePps();
+  const Bytes idr = MakeSlice(nal::kIdr);
+  for (const Bytes *sps : {&unescaped, &odd}) {
+    Normalizer n;
+    AuInfo info;
+    const Bytes au = AnnexB({*sps, pps, idr});
+    const Bytes out = Norm(n, au, Opts(IM_PROFILE_CB), &info);
+    EXPECT_TRUE(info.sps_rewritten);
+    EXPECT_FALSE(info.sps_invalid);
+    EXPECT_EQ(info.profile, 0x42E0u);
+    const auto units = Units(out);
+    ASSERT_EQ(units.size(), 3u);
+    im::h264::Sps parsed;
+    ASSERT_EQ(im::h264::ParseSps(units[0], &parsed), im::h264::SpsError::kOk);
+    EXPECT_EQ(parsed.constraint_flags, 0xE0u);
+    ExpectIdempotent(out, Opts(IM_PROFILE_CB));
+    // The annexb_fuzz properties, in a High session (a mismatch, left alone) and a CB session.
+    for (uint8_t options : {uint8_t{0x01}, uint8_t{0x02}}) {
+      Bytes input = {options, 0x00};
+      input.insert(input.end(), au.begin(), au.end());
+      const char *err = im::h264::fuzzing::CheckAnnexB(input);
+      EXPECT_EQ(err, nullptr) << err;
+    }
+  }
+}
+
+TEST(AnnexB, OversizedParameterSetsAreDropped) {
+  // An SPS or PPS larger than kMaxSpsBytes, cached and inserted before every later IDR, would exceed MaxOutputSize
+  // and the buffers Reserve sized: it's dropped, and it empties its cache entry (the encoder replaced the one cached).
+  const Bytes sps = Sps();
+  const Bytes pps = MakePps();
+  const Bytes idr = MakeSlice(nal::kIdr);
+  const Bytes p = MakeSlice(nal::kSlice);
+  Bytes big_sps = sps; // parses up to frame_cropping, then a 20 KB tail
+  big_sps.resize(20004, 0x55);
+  Bytes big_pps = pps;
+  big_pps.resize(im::h264::kMaxSpsBytes + 1, 0x55);
+  const Bytes idr_au = AnnexB({idr});
+  Normalizer n;
+  n.Reserve(4096);
+  AuInfo info;
+  const auto first = n.Normalize(AnnexB({sps, pps, idr}), Opts(), &info);
+  ASSERT_FALSE(first.empty());
+  const uint8_t *buffer = first.data();
+
+  EXPECT_EQ(Norm(n, AnnexB({big_sps, pps, idr}), Opts(), &info), AnnexB({pps, idr}));
+  EXPECT_TRUE(info.sps_invalid);
+  EXPECT_TRUE(info.missing_parameter_sets);
+  EXPECT_EQ(info.dropped_nals, 1u);
+  EXPECT_EQ(info.profile, 0u);
+  EXPECT_FALSE(n.has_sps());
+  auto out = n.Normalize(idr_au, Opts(), &info);
+  EXPECT_EQ(Bytes(out.begin(), out.end()), AnnexB({pps, idr}));
+  EXPECT_LE(out.size(), Normalizer::MaxOutputSize(idr_au.size()));
+  EXPECT_EQ(out.data(), buffer) << "the output buffer Reserve made";
+
+  // A PPS likewise; a P frame that carries one isn't flagged as missing headers.
+  Norm(n, AnnexB({sps, pps, idr}));
+  EXPECT_EQ(Norm(n, AnnexB({big_pps, p}), Opts(), &info), AnnexB({p}));
+  EXPECT_EQ(info.dropped_nals, 1u);
+  EXPECT_FALSE(info.missing_parameter_sets);
+  EXPECT_FALSE(n.has_pps());
+  out = n.Normalize(idr_au, Opts(), &info);
+  EXPECT_EQ(Bytes(out.begin(), out.end()), AnnexB({sps, idr}));
+  EXPECT_TRUE(info.missing_parameter_sets);
+  EXPECT_LE(out.size(), Normalizer::MaxOutputSize(idr_au.size()));
+  EXPECT_EQ(out.data(), buffer);
+
+  // Up to kMaxSpsBytes an SPS that doesn't parse (its RBSP is too large) is still carried, unchanged and flagged.
+  Bytes edge = sps;
+  edge.resize(im::h264::kMaxSpsBytes, 0x55);
+  EXPECT_EQ(Norm(n, AnnexB({edge, pps, idr}), Opts(), &info), AnnexB({edge, pps, idr}));
+  EXPECT_TRUE(info.sps_invalid);
+  EXPECT_EQ(info.dropped_nals, 0u);
+  out = n.Normalize(idr_au, Opts(), &info);
+  EXPECT_EQ(Bytes(out.begin(), out.end()), AnnexB({edge, pps, idr}));
+  EXPECT_LE(out.size(), Normalizer::MaxOutputSize(idr_au.size()));
+  EXPECT_EQ(out.data(), buffer);
 }
 
 TEST(AnnexB, Idempotence) {

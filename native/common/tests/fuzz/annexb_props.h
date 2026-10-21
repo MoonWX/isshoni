@@ -155,7 +155,11 @@ inline const char *CheckAnnexB(std::span<const uint8_t> data) {
     const std::size_t begin = stream.size() * p / parts;
     const std::size_t end = stream.size() * (p + 1) / parts;
     AuInfo info;
-    const auto out = n.Normalize(stream.subspan(begin, end - begin), o, &info);
+    const std::span<const uint8_t> au = stream.subspan(begin, end - begin);
+    const auto out = n.Normalize(au, o, &info);
+    if (out.size() > Normalizer::MaxOutputSize(au.size())) {
+      return "the output is larger than MaxOutputSize";
+    }
     if (const char *err = CheckOutput(out, info, o)) {
       return err;
     }

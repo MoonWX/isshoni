@@ -1,6 +1,7 @@
 // The SPS parser and the emulation-prevention transforms (docs/m2/04-windows-engine.md §9.4, §18.1): the size after
-// cropping (1920×1088 coded → 1080), profile, constraint flags, level, emulation prevention, the error cases, and the
-// sps_fuzz properties over the seeds and a few thousand mutations of them.
+// cropping (1920×1088 coded → 1080), profile, constraint flags, level, emulation prevention, the error cases, the
+// size limit on the RBSP, the normalizer's constraint-byte rewrite, and the sps_fuzz properties over the seeds and a
+// few thousand mutations of them.
 #include <gtest/gtest.h>
 
 #include <filesystem>
@@ -17,9 +18,14 @@
 namespace {
 
 using im::h264::BitReader;
+using im::h264::kMaxSpsBytes;
+using im::h264::kMaxSpsRbspBytes;
 using im::h264::ParseSps;
+using im::h264::SetConstraintByte;
 using im::h264::Sps;
 using im::h264::SpsError;
+using im::h264::fuzzing::CheckSps;
+using im::h264::fuzzing::SameSps;
 using im::h264::testing::BitWriter;
 using im::h264::testing::Bytes;
 using im::h264::testing::MakeSps;
@@ -29,6 +35,31 @@ Sps MustParse(const Bytes &nal) {
   Sps s;
   EXPECT_EQ(ParseSps(nal, &s), SpsError::kOk);
   return s;
+}
+
+// The RBSP of an SPS NAL unit, header byte excluded.
+Bytes RbspOf(const Bytes &unit) {
+  Bytes rbsp(unit.size());
+  rbsp.resize(im::h264::UnescapeRbsp(std::span<const uint8_t>(unit).subspan(1), rbsp));
+  return rbsp;
+}
+
+// An SPS NAL unit from its RBSP, canonically escaped.
+Bytes SpsUnit(const Bytes &rbsp) {
+  Bytes nal(1 + im::h264::MaxEscapedSize(rbsp.size()));
+  nal[0] = 0x67;
+  nal.resize(1 + im::h264::EscapeRbsp(rbsp, std::span<uint8_t>(nal).subspan(1)));
+  return nal;
+}
+
+// A Constrained Baseline SPS whose constraint byte the CB rewrite changes (40 → e0); level 40, 640×360.
+Bytes BaselineSps() {
+  SpsParams p;
+  p.profile_idc = 66;
+  p.constraint = 0x40;
+  p.width = 640;
+  p.height = 360;
+  return MakeSps(p);
 }
 
 TEST(Sps, HighWithCropping) {
@@ -327,6 +358,135 @@ TEST(Sps, RbspTransforms) {
   Bytes raw(odd.size());
   raw.resize(im::h264::UnescapeRbsp(odd, raw));
   EXPECT_EQ(raw, (Bytes{0x11, 0x00, 0x00, 0x04}));
+}
+
+TEST(Sps, SizeLimitIsOnTheRbsp) {
+  // kMaxSpsRbspBytes bounds the RBSP, so an SPS whose tail carries 00 00 02 without emulation prevention parses like
+  // its canonical form, which is a third longer; one RBSP byte more and both are too large.
+  const Bytes head = RbspOf(BaselineSps());
+  const Sps want = MustParse(BaselineSps());
+  for (const std::size_t size : {kMaxSpsRbspBytes, kMaxSpsRbspBytes + 1}) {
+    Bytes rbsp = head;
+    while (rbsp.size() + 3 <= size) {
+      rbsp.insert(rbsp.end(), {0x00, 0x00, 0x02});
+    }
+    rbsp.resize(size, 0x80);
+    Bytes raw = {0x67};
+    raw.insert(raw.end(), rbsp.begin(), rbsp.end());
+    const Bytes canonical = SpsUnit(rbsp);
+    ASSERT_GT(canonical.size(), raw.size() + 1000);
+    ASSERT_LE(canonical.size(), kMaxSpsBytes);
+    Sps a;
+    Sps b;
+    const SpsError ea = ParseSps(raw, &a);
+    const SpsError eb = ParseSps(canonical, &b);
+    if (size <= kMaxSpsRbspBytes) {
+      ASSERT_EQ(ea, SpsError::kOk);
+      ASSERT_EQ(eb, SpsError::kOk);
+      EXPECT_TRUE(SameSps(a, want, false));
+      EXPECT_TRUE(SameSps(b, want, false));
+    } else {
+      EXPECT_EQ(ea, SpsError::kTooLarge);
+      EXPECT_EQ(eb, SpsError::kTooLarge);
+    }
+  }
+}
+
+TEST(Sps, NearTheLimitWithoutEmulationPrevention) {
+  // A 4096-byte SPS whose tail, which the parser never reads, holds 00 00 02 without emulation prevention (the sps_fuzz
+  // seed near_limit_unescaped). Re-escaping it gives 5458 bytes: with a limit on the escaped size the canonical form
+  // and the normalizer's rewrite stopped parsing.
+  Bytes unit = {0x67, 0x42, 0x40, 0x28, 0xED, 0x00, 0xA0, 0x0B, 0x72};
+  for (int i = 0; i < 1362; ++i) {
+    unit.insert(unit.end(), {0x00, 0x00, 0x02});
+  }
+  unit.push_back(0x05);
+  ASSERT_EQ(unit.size(), 4096u);
+  const Sps s = MustParse(unit);
+  const Bytes canonical = SpsUnit(RbspOf(unit));
+  EXPECT_EQ(canonical.size(), 5458u);
+  Sps again;
+  ASSERT_EQ(ParseSps(canonical, &again), SpsError::kOk);
+  EXPECT_TRUE(SameSps(s, again, false));
+  Bytes rewritten(kMaxSpsBytes);
+  rewritten.resize(SetConstraintByte(unit, 0xE0, rewritten));
+  Sps after;
+  ASSERT_EQ(ParseSps(rewritten, &after), SpsError::kOk);
+  EXPECT_EQ(after.profile_key(), 0x42E0u);
+  EXPECT_TRUE(SameSps(s, after, true));
+  const char *err = CheckSps(unit);
+  EXPECT_EQ(err, nullptr) << err;
+}
+
+TEST(Sps, SetConstraintByte) {
+  // A canonical unit changes in that one byte.
+  const Bytes unit = BaselineSps();
+  Bytes out(kMaxSpsBytes);
+  out.resize(SetConstraintByte(unit, 0xE0, out));
+  Bytes expected = unit;
+  expected[2] = 0xE0;
+  EXPECT_EQ(out, expected);
+
+  // An RBSP of exactly kMaxSpsRbspBytes that ends in an odd run of zero bytes (the unit ends in 00 00 00 03: three
+  // zeros of data and an emulation-prevention byte). No escaped form unescapes to it, so escaping the whole RBSP again
+  // brings it back a byte longer, past the limit; SetConstraintByte keeps that tail as it is.
+  Bytes odd = unit;
+  odd.resize(odd.size() + (kMaxSpsRbspBytes - 3 - RbspOf(unit).size()), 0x80);
+  odd.insert(odd.end(), {0x00, 0x00, 0x00, 0x03});
+  const Bytes odd_rbsp = RbspOf(odd);
+  ASSERT_EQ(odd_rbsp.size(), kMaxSpsRbspBytes);
+  ASSERT_EQ(odd_rbsp.back(), 0x00u);
+  const Sps before = MustParse(odd);
+  Bytes changed = odd_rbsp;
+  changed[1] = 0xE0;
+  EXPECT_EQ(RbspOf(SpsUnit(changed)).size(), kMaxSpsRbspBytes + 1) << "the whole RBSP escaped again comes back longer";
+  Bytes rewritten(kMaxSpsBytes);
+  rewritten.resize(SetConstraintByte(odd, 0xE0, rewritten));
+  EXPECT_EQ(RbspOf(rewritten), changed);
+  Sps after;
+  ASSERT_EQ(ParseSps(rewritten, &after), SpsError::kOk);
+  EXPECT_EQ(after.constraint_flags, 0xE0u);
+  EXPECT_TRUE(SameSps(before, after, true));
+  const char *err = CheckSps(odd);
+  EXPECT_EQ(err, nullptr) << err;
+
+  // An emulation-prevention byte that is one only because the constraint byte is 00 (67 42 00 00 03 ..., level_idc 0):
+  // after e0 it would be data, so replacing the byte alone isn't enough; the head is escaped again.
+  BitWriter w;
+  w.Bits(66, 8);
+  w.Bits(0x00, 8);
+  w.Bits(0, 8); // level_idc 0
+  w.Ue(0);      // sps_id
+  w.Ue(0);      // log2_max_frame_num_minus4
+  w.Ue(2);      // poc type 2
+  w.Ue(1);      // max_num_ref_frames
+  w.Bit(0);     // gaps
+  w.Ue(39);     // 640 wide
+  w.Ue(21);     // 352 high
+  w.Bit(1);     // frame_mbs_only
+  w.Bit(1);     // direct_8x8
+  w.Bit(0);     // no cropping
+  w.Bit(0);     // no VUI
+  const Bytes rbsp = w.Finish();
+  ASSERT_GE(rbsp[3], 0x80u) << "sps_id 0 starts with a one bit";
+  Bytes with_epb = {0x67, 0x42, 0x00, 0x00, 0x03}; // an emulation-prevention byte before rbsp[3] (not needed, legal)
+  with_epb.insert(with_epb.end(), rbsp.begin() + 3, rbsp.end());
+  EXPECT_EQ(MustParse(with_epb).width, 640u);
+  Bytes got(kMaxSpsBytes);
+  got.resize(SetConstraintByte(with_epb, 0xE0, got));
+  Bytes want = {0x67, 0x42, 0xE0, 0x00};
+  want.insert(want.end(), rbsp.begin() + 3, rbsp.end());
+  EXPECT_EQ(got, want);
+  EXPECT_EQ(MustParse(got).profile_key(), 0x42E0u);
+
+  // Refusals: no room, too short, no non-zero byte after the constraint byte.
+  Bytes small(4);
+  EXPECT_EQ(SetConstraintByte(unit, 0xE0, small), 0u);
+  Bytes room(kMaxSpsBytes);
+  EXPECT_EQ(SetConstraintByte(Bytes{0x67, 0x42, 0x40}, 0xE0, room), 0u);
+  Bytes zeros = {0x67, 0x42, 0x40};
+  zeros.resize(40, 0x00);
+  EXPECT_EQ(SetConstraintByte(zeros, 0xE0, room), 0u);
 }
 
 std::vector<Bytes> Seeds() {

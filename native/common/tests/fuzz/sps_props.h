@@ -1,6 +1,7 @@
-// The properties the SPS parser and the emulation-prevention transforms (im/h264/sps.h, nal.h; docs/m2/04-windows-
-// engine.md §9.4) hold on any input. Shared by the libFuzzer target sps_fuzz and sps_test's deterministic mutation
-// run. The input is tried as a NAL unit as is and with an SPS header byte (0x67) in front.
+// The properties the SPS parser, the normalizer's constraint rewrite and the emulation-prevention transforms
+// (im/h264/sps.h, nal.h; docs/m2/04-windows-engine.md §9.4) hold on any input. Shared by the libFuzzer target sps_fuzz
+// and sps_test's deterministic mutation run. The input is tried as a NAL unit as is and with an SPS header byte (0x67)
+// in front.
 #pragma once
 
 #include <algorithm>
@@ -13,6 +14,16 @@
 #include "im/h264/sps.h"
 
 namespace im::h264::fuzzing {
+
+// Whether data holds 00 00 00, 00 00 01 or 00 00 02.
+inline bool HasStartCodeLike(std::span<const uint8_t> data) {
+  for (std::size_t i = 0; i + 2 < data.size(); ++i) {
+    if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] <= 2) {
+      return true;
+    }
+  }
+  return false;
+}
 
 inline bool SameSps(const Sps &a, const Sps &b, bool ignore_constraint) {
   return a.profile_idc == b.profile_idc && (ignore_constraint || a.constraint_flags == b.constraint_flags) &&
@@ -44,10 +55,8 @@ inline const char *CheckSpsUnit(std::span<const uint8_t> nal) {
   rbsp.resize(UnescapeRbsp(nal, rbsp));
   std::vector<uint8_t> esc(MaxEscapedSize(rbsp.size()));
   esc.resize(EscapeRbsp(rbsp, esc));
-  for (std::size_t i = 0; i + 2 < esc.size(); ++i) {
-    if (esc[i] == 0 && esc[i + 1] == 0 && esc[i + 2] <= 2) {
-      return "escaped data holds a start-code-like sequence";
-    }
+  if (HasStartCodeLike(esc)) {
+    return "escaped data holds a start-code-like sequence";
   }
   if (!esc.empty() && esc.back() == 0) {
     return "escaped data ends in a zero byte";
@@ -65,16 +74,32 @@ inline const char *CheckSpsUnit(std::span<const uint8_t> nal) {
       return "re-escaping the SPS changed what it parses to";
     }
   }
-  // The normalizer's constraint rewrite (unescape, set byte 2, escape) keeps every other field.
-  if (err == SpsError::kOk && rbsp.size() >= 3) {
-    std::vector<uint8_t> changed = rbsp;
-    changed[2] = 0xE0;
-    std::vector<uint8_t> out(MaxEscapedSize(changed.size()));
-    out.resize(EscapeRbsp(changed, out));
-    Sps rewritten;
-    if (ParseSps(out, &rewritten) != SpsError::kOk || rewritten.constraint_flags != 0xE0 ||
-        !SameSps(sps, rewritten, true)) {
-      return "rewriting the constraint byte changed another field";
+  // The normalizer's constraint rewrite (SetConstraintByte, CB's e0 and High's 00) changes RBSP byte 2 (counting the
+  // header byte) and nothing else, so it parses to the same fields; it fits in kMaxSpsBytes and adds no start-code-like
+  // sequence.
+  if (err == SpsError::kOk) {
+    const bool clean = !HasStartCodeLike(nal);
+    for (const uint8_t value : {uint8_t{0xE0}, uint8_t{0x00}}) {
+      std::vector<uint8_t> out(kMaxSpsBytes);
+      out.resize(SetConstraintByte(nal, value, out));
+      if (out.empty()) {
+        return "SetConstraintByte refused an SPS that parses (or its result exceeds kMaxSpsBytes)";
+      }
+      std::vector<uint8_t> changed = rbsp;
+      changed[2] = value;
+      std::vector<uint8_t> out_rbsp(out.size());
+      out_rbsp.resize(UnescapeRbsp(out, out_rbsp));
+      if (out_rbsp != changed) {
+        return "rewriting the constraint byte changed another byte of the RBSP";
+      }
+      Sps rewritten;
+      if (ParseSps(out, &rewritten) != SpsError::kOk || rewritten.constraint_flags != value ||
+          !SameSps(sps, rewritten, true)) {
+        return "rewriting the constraint byte changed another field";
+      }
+      if (clean && HasStartCodeLike(out)) {
+        return "rewriting the constraint byte made a start-code-like sequence";
+      }
     }
   }
   return nullptr;

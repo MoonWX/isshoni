@@ -7,13 +7,16 @@
 //   STAP/FU types), units with forbidden_zero_bit set, and bytes before the first start code.
 // - The latest SPS and PPS are cached. SPS and PPS go first, SPS then PPS, one of each: duplicates are removed, and an
 //   IDR access unit always goes out as SPS, PPS, then the slices, the missing headers inserted from the cache (the
-//   plan's "SPS/PPS in-band before every IDR").
+//   plan's "SPS/PPS in-band before every IDR"). An SPS or PPS larger than kMaxSpsBytes is dropped and empties its
+//   cache entry (the encoder replaced what was cached), so the output stays within MaxOutputSize and the buffers
+//   Reserve sized.
 // - The SPS is parsed (sps.h): profile, constraint byte, level and the size after cropping fill the AU's profile key,
 //   width and height (the cached SPS's for an AU that carries none).
 // - The constraint byte is normalized for the session profile: Constrained Baseline (profile_idc 66) gets 0xE0, so the
 //   stream's key is 42e0 as the SFU's table expects; High (profile_idc 100) gets 0x00, so the key is 6400 (04 §12.2:
 //   the engine never sets constraint_set4/5; clearing a constraint flag only withdraws a promise, so the stream stays
-//   valid). The SPS is unescaped, changed and escaped again, so no emulation-prevention sequence can break.
+//   valid). Only that byte changes (SetConstraintByte keeps the rest of the RBSP, emulation prevention included), and
+//   the normalizer parses the rewritten SPS again before it uses it.
 // - A session-profile mismatch (a High session whose SPS isn't profile_idc 100, a CB session whose SPS isn't 66) is
 //   flagged: the caller closes that encoder and tries the next one (ENCODER_CHANGED, reason encode_error).
 // - KEYFRAME = the AU contains an IDR slice (type 5); the encoder's own key flag is only cross-checked.
@@ -46,14 +49,14 @@ struct AuInfo {
   bool inserted_parameter_sets = false; // an IDR got SPS and/or PPS from the cache
   bool missing_parameter_sets = false;  // an IDR without SPS or PPS and none cached: output without them
   bool profile_mismatch = false;        // the SPS doesn't match the session profile
-  bool sps_invalid = false;             // an SPS that doesn't parse (passed through unchanged)
+  bool sps_invalid = false;             // an SPS that doesn't parse: passed through unchanged, or dropped (too large)
   bool sps_rewritten = false;           // the constraint byte was changed
   bool key_mismatch = false;            // encoder_keyframe disagrees with keyframe
   uint32_t profile = 0;                 // the active SPS's key (0x6400, 0x42E0), 0 when none is known
   uint16_t width = 0;                   // the active SPS's size after cropping, 0 when none is known
   uint16_t height = 0;
   uint32_t nal_count = 0;     // NAL units written
-  uint32_t dropped_nals = 0;  // NAL units dropped (by type, forbidden bit, duplicates)
+  uint32_t dropped_nals = 0;  // NAL units dropped (by type, forbidden bit, duplicates, size)
   uint32_t leading_bytes = 0; // bytes before the first start code (dropped)
 };
 
@@ -77,13 +80,15 @@ public:
   // The active SPS (valid when has_sps() and it parsed).
   const Sps &sps() const noexcept { return sps_info_; }
 
-  // The worst-case output size for an input of n bytes (start codes grow from 3 to 4 bytes, the cached SPS and PPS
-  // may be inserted, an SPS rewrite may add emulation-prevention bytes).
+  // The worst-case output size for an input of n bytes: start codes grow from 3 to 4 bytes, and an SPS and a PPS of
+  // up to kMaxSpsBytes each may come from the cache or from a rewrite.
   static std::size_t MaxOutputSize(std::size_t n) noexcept;
 
 private:
-  // An SPS from the AU (or none) after the profile rewrite, in sps_scratch_.
-  void TakeSps(std::span<const uint8_t> nal, const NormalizeOptions &options, AuInfo &info);
+  // Caches the AU's SPS, rewritten for the session profile. False when it can't be carried (larger than kMaxSpsBytes,
+  // or a rewrite that doesn't parse back): the cache is emptied and the caller drops the SPS.
+  bool TakeSps(std::span<const uint8_t> nal, const NormalizeOptions &options, AuInfo &info);
+  void ForgetSps() noexcept;
   void Append(std::span<const uint8_t> nal);
 
   std::vector<uint8_t> out_;
@@ -91,7 +96,6 @@ private:
   std::vector<uint8_t> pps_; // cached PPS NAL
   Sps sps_info_;
   bool sps_ok_ = false; // sps_ parsed
-  std::vector<uint8_t> scratch_;
 };
 
 } // namespace im::h264

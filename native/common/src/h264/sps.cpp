@@ -1,5 +1,6 @@
 #include "im/h264/sps.h"
 
+#include <algorithm>
 #include <array>
 
 #include "im/h264/nal.h"
@@ -122,6 +123,9 @@ SpsError ParseSps(std::span<const uint8_t> unit, Sps *out) noexcept {
   }
   std::array<uint8_t, kMaxSpsBytes> buf;
   const std::size_t n = UnescapeRbsp(unit.subspan(1), std::span<uint8_t>(buf));
+  if (n > kMaxSpsRbspBytes) {
+    return SpsError::kTooLarge;
+  }
   BitReader br(std::span<const uint8_t>(buf.data(), n));
 
   Sps s;
@@ -268,6 +272,48 @@ SpsError ParseSps(std::span<const uint8_t> unit, Sps *out) noexcept {
   s.height = s.coded_height - static_cast<uint32_t>(crop_y);
   *out = s;
   return SpsError::kOk;
+}
+
+std::size_t SetConstraintByte(std::span<const uint8_t> unit, uint8_t value, std::span<uint8_t> out) noexcept {
+  // The head: the RBSP (header byte included) up to the first non-zero byte after the constraint byte (index 2),
+  // unescaped as UnescapeRbsp does; split is where the rest of the unit starts.
+  constexpr std::size_t kHeadMax = 16;
+  std::array<uint8_t, kHeadMax> head{};
+  std::size_t w = 0;
+  std::size_t split = 0;
+  int zeros = 0;
+  for (std::size_t i = 0; i < unit.size() && split == 0; ++i) {
+    const uint8_t b = unit[i];
+    if (zeros >= 2 && b == 3) {
+      zeros = 0; // emulation_prevention_three_byte
+      continue;
+    }
+    if (w == kHeadMax) {
+      return 0;
+    }
+    head[w++] = b;
+    zeros = b == 0 ? zeros + 1 : 0;
+    if (w > 3 && b != 0) {
+      split = i + 1;
+    }
+  }
+  if (split == 0) {
+    return 0;
+  }
+  head[2] = value;
+  // The new head escaped again. It ends in a non-zero byte, as the old head did, and after a non-zero data byte both
+  // EscapeRbsp and UnescapeRbsp are back in their first state: the rest of the unit unescapes after the new head
+  // exactly as it did after the old one, and no 00 00 0x sequence spans the join.
+  std::array<uint8_t, MaxEscapedSize(kHeadMax)> esc{};
+  const std::size_t esc_size = EscapeRbsp(std::span<const uint8_t>(head.data(), w), std::span<uint8_t>(esc));
+  const std::size_t rest = unit.size() - split;
+  if (esc_size + rest > out.size()) {
+    return 0;
+  }
+  std::copy_n(esc.begin(), esc_size, out.begin());
+  std::copy(unit.begin() + static_cast<std::ptrdiff_t>(split), unit.end(),
+            out.begin() + static_cast<std::ptrdiff_t>(esc_size));
+  return esc_size + rest;
 }
 
 } // namespace im::h264
