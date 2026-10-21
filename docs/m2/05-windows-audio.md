@@ -387,6 +387,17 @@ always out, and mic detection stays the backstop). An M2 built-in that hasn't be
 listed as "unverified" in the results table of `cmd/isshoni-audiotest/README.md`. A built-in added after M2 needs its
 check before it ships.
 
+The package (standard library only, README WA06) exposes the data as functions that return fresh copies, never as
+exported variables, so no importer can change the built-in list: `VoiceApps() []VoiceApp` (`ID`, `Name`, `OSNames`),
+`Launchers() OSNames`, `SharedRuntimes() OSNames`, `Browsers() []Browser` (`Family`, `OSNames`), in the order of the
+tables above. `OSNames{Windows, MacOS, Linux}` has `For(os)` and `Contains(os, name)`; `os` is a GOOS value or M1's
+`ClientOS` (`macos` for `darwin`), because `SetViewerBrowser` gets the `ClientOS` spelling (§14.2), and names compare
+exactly (lower-case exe names, §5.1). The browser families are the constants `FamilyChrome`, `FamilyEdge` and
+`FamilyFirefox` (M1's `safari` and `other` are no family: the Service adds no rule for them). The lookups
+`VoiceAppByID(id)`, `VoiceAppByProcess(os, name)`, `BrowserByFamily(family)` and `BrowserByProcess(os, name)`
+(`msedgewebview2.exe` finds no browser) serve the Service's `ErrLockedApp` and the viewer rule (§5.9, §14.2); 03's
+shell relaunch (03 §13.4) reads `Launchers()`.
+
 ### 5.5 Browsers
 
 Every Chromium browser plays all tabs from one audio-service utility process (`--utility-sub-type=audio.mojom.AudioService`),
@@ -1152,8 +1163,10 @@ type AudioConfig struct {
 	TestFlags  uint32     // audiotest only: IM_AUDIOF_TEST_FAIL_PROBE
 }
 
-// AudioReport mirrors §12.1 (json tags camelCase, as the DLL writes them); AudioSession, AudioCounters, AudioEvent
-// likewise. Parse with ParseAudioReport, which rejects v != 1 and ignores unknown fields.
+// AudioReport mirrors §12.1 (json tags camelCase, as the DLL writes them); its parts likewise, one type each:
+// AudioProbeResult (probe), AudioDeviceState (device), AudioApp (apps[]), AudioSession (sessions[]), AudioWarning
+// (warnings[]), AudioCounters (counters) and AudioEvent (events[]). Parse with ParseAudioReport, which rejects v != 1
+// and ignores unknown fields.
 type AudioReport struct { /* fields of §12.1 */ }
 
 // AudioStatus is 01's name for "What friends hear" (Session.AudioStatus, core events).
@@ -1759,7 +1772,7 @@ encoder as `IM_ERR_DEPENDENCY`, which the audiotest ignores.
 | `selfcheck` | Loads the DLL (`native.Open`), checks `im_version` and every export (audio and `im_test_*` included), runs `im_probe`, starts and stops the watcher, runs the analyzer on synthetic signals. No sound. Exit 0/1. Runs on GitHub-hosted Windows |
 | `probe` | Prints caps, the startup-probe result, ducking preference, endpoints (redacted names) |
 | `apps` | One-shot "What friends hear" with the built-in rules, as text |
-| `run [-case a,b] [-gate] [-long] [-keep-wav dir] [-out file] [-no-redact]` | Runs cases (§18.5). `-gate`: every required case with the gate configuration (§18.10); INFO and optional cases still run but never change the exit code |
+| `run [-case a,b] [-gate] [-long] [-keep-wav dir] [-out dir] [-no-redact]` | Runs cases (§18.5). `-gate`: every required case with the gate configuration (§18.10); INFO and optional cases still run but never change the exit code. `-out`: the folder the report goes into, under §18.7's name (default `.`; README §3 item 25) |
 | `record -d SEC -o file.wav [-label R1] [-exclude exe,…]` | Real-app checks: records the PCM tap, prints "friends hear … / kept out …" every second, then asks "Pass? [y/n]" and stores `{label, pass, os}` in `manual-<label>.json` |
 | `merge report.json manual-*.json` | Adds the manual entries to a gate report (§18.8 step 5); refuses entries from another OS build |
 | `fixture <verb> …` | Internal: what a fixture copy runs |
@@ -1989,7 +2002,7 @@ session 0 can't do this), online only while the owner runs a test. The workflow 
 owner's approval (06's `audiotest`), downloads the `isshoni-exit-tools` artifact of the release run named by its
 `release_run_id` input (suite `release`; 06 §10.4), runs `run -gate` (suite `full`: `run -gate -long`), and uploads the
 redacted report as an artifact. No `pull_request` trigger ever targets these labels, and "Require approval for all
-outside collaborators" stays on for fork workflows.
+external contributors" (06 §10.5, §14 item 4) stays on for fork workflows.
 
 ### 18.9 Manual real-app checks
 

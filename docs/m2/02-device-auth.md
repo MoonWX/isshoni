@@ -824,6 +824,10 @@ Cache-Control: no-store
 ```go
 package api
 
+// The user-code alphabet and length of §3 (no vowels, no digits; 8 of 20 symbols).
+const UserCodeAlphabet = "BCDFGHJKLMNPQRSTVWXZ"
+const UserCodeLength = 8
+
 type DeviceCodeRequest struct {
 	ClientKind string `json:"clientKind"` // desktop | mobile
 	DeviceName string `json:"deviceName"`
@@ -876,10 +880,12 @@ type DeviceLookupRequest struct {
 
 type NetworkMatch string
 
+// <Type><Value> names: the package's enum test requires them, and tygo builds the TS union only from constants that
+// start with the type's name. The wire values are §5.3's.
 const (
-	NetworkSame      NetworkMatch = "same"
-	NetworkDifferent NetworkMatch = "different"
-	NetworkUnknown   NetworkMatch = "unknown"
+	NetworkMatchSame      NetworkMatch = "same"
+	NetworkMatchDifferent NetworkMatch = "different"
+	NetworkMatchUnknown   NetworkMatch = "unknown"
 )
 
 type DeviceLookup struct {
@@ -922,7 +928,24 @@ type DeviceResponse struct {
 //	Current bool `json:"current"` // the caller's own device (bearer); M2
 
 func NormalizeUserCode(s string) (string, bool) // §3
-func FormatUserCode(normalized string) string   // "WDJBMJHT" → "WDJB-MJHT"
+func FormatUserCode(normalized string) string   // "WDJBMJHT" → "WDJB-MJHT"; any other input is returned unchanged
+
+// errors.go additions (keys of Error.Params and their values):
+const (
+	ParamCredential = "credential" // forbidden (§6.4): the CredentialKind the route takes
+	ParamInterval   = "interval"   // slow_down (§5.4): the new polling interval in seconds
+)
+
+// InvalidGrantReused is params.reason of invalid_grant when a spent refresh token came back and the device was
+// revoked (§6.2).
+const InvalidGrantReused = "reused"
+
+type CredentialKind string
+
+const (
+	CredentialKindSession CredentialKind = "session" // UserSession and Admin routes refuse a bearer
+	CredentialKindDevice  CredentialKind = "device"  // UserDevice routes refuse a cookie
+)
 ```
 
 Golden JSON for each type goes in `internal/protocol/api/testdata/`; `task gen` regenerates
@@ -1660,6 +1683,8 @@ server whose admin set one.
 ```go
 package version // internal/version/semver.go (moved from internal/server/signal/semver.go, behavior unchanged)
 
+var ErrNotSemVer = errors.New("version: not a SemVer 2.0 version") // Parse and Compare wrap it
+
 type SemVer struct {
 	Major, Minor, Patch uint64
 	Pre                 []string // build metadata is dropped: it has no precedence
@@ -1668,7 +1693,12 @@ type SemVer struct {
 func Parse(s string) (SemVer, error)          // SemVer 2.0; a leading "v" is accepted
 func Compare(a, b string) (int, error)         // -1, 0, +1 by precedence; an error when either isn't SemVer
 func Below(v, floor string) (below, ok bool)   // the hub's versionBelow, exported
+func (a SemVer) Compare(b SemVer) int          // -1, 0, +1 by precedence (what Compare and Below use)
 ```
+
+The hub calls `version.Below`; its M1 `semver.go` and `versionBelow` are gone, and the hub's SemVer table test moved
+with the code (`TestBelow` in `internal/version/semver_test.go`, unchanged rows plus new ones). M1's
+`docs/m1/01-protocol.md` §15.2 still lists `semver.go` among the hub's files: that line describes M1 as built.
 
 ### 13.3 The screens (03-desktop-app draws them)
 
@@ -1702,11 +1732,12 @@ func Below(v, floor string) (below, ok bool)   // the hub's versionBelow, export
   route of §7.1.
 - Tokens, the JSON of §7.3 and the credential blob (`"v": 1`) are stable across releases; a change adds fields.
 - CI: the test is 02's, 06's nightly `compat-servers` job runs it. `TestCompatServerDeviceFlow`
-  (`internal/client/deviceauth/compat_server_test.go`) skips unless `ISSHONI_COMPAT_SERVER_URL` is set, and reads 06's
-  `ISSHONI_COMPAT_ADMIN_FILE` (JSON `{origin, username, password}`). If `/info` lists `deviceFlow`, it logs in with
-  `POST /api/v1/auth/login` (cookie), runs `Manager.Link` with a memory store, approves through `/device/lookup` and
-  `/device/decide` with the cookie, then calls `AccessToken(ctx, true)` once (one refresh) and `Unlink` (revoke),
-  asserting `linked`, a new access token after the refresh, and `Unlink` returning nil (the revoke was confirmed).
+  (`internal/client/deviceauth/compat_server_test.go`) skips unless `ISSHONI_COMPAT_SERVER_URL` is set (the server's
+  origin), and reads 06's `ISSHONI_COMPAT_ADMIN_FILE` (JSON `{username, password}`; README §3 item 24). If `/info`
+  lists `deviceFlow`, it logs in with `POST /api/v1/auth/login` (cookie), runs `Manager.Link` with a memory store,
+  approves through `/device/lookup` and `/device/decide` with the cookie, then calls `AccessToken(ctx, true)` once
+  (one refresh) and `Unlink` (revoke), asserting `linked`, a new access token after the refresh, and `Unlink`
+  returning nil (the revoke was confirmed).
   Otherwise (a 0.1.x server) it asserts `compat.FromInfo` = `update_server`/`no_device_flow`. Its name matches 06's
   `-run TestCompatServer`.
 
@@ -1929,15 +1960,19 @@ Recorded in the PR of slice DA13; they don't block merges (README §4 Testing).
 
 - **Wire and REST**: the endpoints, access levels and errors of §7.1 and §6.4; the JSON of §5, §6.2 and §7.2; the DTOs
   of §7.3 (`api.DeviceCodeRequest`, `DeviceCodeResponse`, `GrantType`, `DeviceTokenRequest`, `DeviceTokenResponse`,
-  `DeviceRef`, `DeviceLookupRequest`, `DeviceLookup`, `NetworkMatch`, `DeviceDecideRequest`, `DevicePasswordRequest`,
-  `RenameDeviceRequest`, `DeviceResponse`, `DeviceInfo.Current`, `NormalizeUserCode`, `FormatUserCode`);
+  `DeviceRef`, `DeviceLookupRequest`, `DeviceLookup`, `NetworkMatch` with `NetworkMatchSame`, `NetworkMatchDifferent`
+  and `NetworkMatchUnknown`, `DeviceDecideRequest`, `DevicePasswordRequest`, `RenameDeviceRequest`, `DeviceResponse`,
+  `DeviceInfo.Current`, `UserCodeAlphabet`, `UserCodeLength`, `NormalizeUserCode`, `FormatUserCode`; in `errors.go`
+  `ParamCredential`, `ParamInterval`, `InvalidGrantReused`, `CredentialKind` with `CredentialKindSession` and
+  `CredentialKindDevice`);
   `POST /api/v1/device/password` (#48, §14); `/info.features` `deviceFlow`; `Authorization: Bearer isa_…` on REST and
   `hello.auth` on `/ws`; `401 invalid_token` with `WWW-Authenticate`; the CORS headers of §6.4.
 - **`protocol.DesktopAssetOriginWindows = "http://wails.localhost"`** and **`protocol.DesktopOrigins() []string`**
   (§6.4; `DesktopOrigins()[0] == DesktopAssetOriginWindows`): 03-desktop-app's asset handler uses the constant as its
   `Options.Origin` and its W1 test pins the pinned Wails' origin against it. *Later (M3)*: `DesktopAssetOriginMacOS`.
-- **`version.Parse(s) (SemVer, error)`, `version.Compare(a, b string) (int, error)`, `version.Below(v, floor string) (below, ok bool)`**
-  in `internal/version` (§13.2): available to 06-windows-release's "no downgrades" check and 01-client-core.
+- **`version.Parse(s) (SemVer, error)`, `version.Compare(a, b string) (int, error)`, `version.Below(v, floor string) (below, ok bool)`**,
+  `SemVer.Compare` and `version.ErrNotSemVer` in `internal/version` (§13.2): available to 06-windows-release's "no
+  downgrades" check and 01-client-core.
 - **Server Go**: `auth.(*Service)` methods of §6.8 (with `PasswordDeviceLogin` and `Touch` returning the principal);
   `auth.Principal.DeviceName` and `signal.Identity.DeviceName` (bearer only, never logged; copied by `wire.go`'s
   `AuthenticateBearer` and `Revalidate`; 01-client-core's `OwnConnection.DeviceName` reads it);
@@ -2046,8 +2081,8 @@ Recorded in the PR of slice DA13; they don't block merges (README §4 Testing).
 - Release notes flag schema version 2 (06-windows-release.md §11.8, §4.1 here).
 - Its Windows Go test job (`windows-go`, windows-2025) runs `go test -race ./internal/client/...` (MinGW), then
   `CGO_ENABLED=0`, per PR, and `lint-go` cross-lints `GOOS=windows`; its nightly `compat-servers` job runs
-  `TestCompatServerDeviceFlow` (§13.4) with `ISSHONI_COMPAT_SERVER_URL` and `ISSHONI_COMPAT_ADMIN_FILE` (`{origin,
-  username, password}`).
+  `TestCompatServerDeviceFlow` (§13.4) with `ISSHONI_COMPAT_SERVER_URL` and `ISSHONI_COMPAT_ADMIN_FILE` (`{username,
+  password}`).
 - Its R14: the `/privacy#desktop` section takes §9's "On the PC" facts (and drops "which come later"), and
   `docsanchors_test.go` gains `/troubleshooting#desktop-linking`.
 
