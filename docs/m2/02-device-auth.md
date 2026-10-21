@@ -1449,7 +1449,7 @@ shapes (field names as below; 03-desktop-app owns the binding code and the scree
 |---|---|---|
 | `State()` | `AuthState` | the active server's state |
 | `Link()`, `CancelLink()` | — | §11.3; `Link` returns once the code is shown, polling goes on in Go |
-| `LinkWithPassword(username, password)` | `AuthState` | `Manager.LinkWithPassword` on the active server with `AppInfo`'s device name; 03-desktop-app's `Link.Password` maps to it; rejects with the `*api.Error` code (`invalid_credentials`, `rate_limited` with `retryAfter`, …) |
+| `LinkWithPassword(username, password)` | `AuthState` | `Manager.LinkWithPassword` on the active server with `AppInfo`'s device name; 03-desktop-app binds it as `Auth.LinkWithPassword`; rejects with the `*api.Error` code (`invalid_credentials`, `rate_limited` with `retryAfter`, …) |
 | `AccessToken(origin, force)` | `{token, expiresAt}` or `null` (not linked, or `origin` isn't the active server's) | `Manager.AccessTokenWithExpiry(ctx, force)` of the active `Manager`, **only when `origin` equals that `Manager`'s origin** (read once, so the token is always `origin`'s own even if the active server changes during the call); any other origin gets `null` without touching a `Manager`, plus one debug line with no origin in it (03 §5.8). `force: true` after the server refused the token the SPA had (there is no separate "token rejected" call, and no `TokenRejected`); `expiresAt` in ms since the epoch; the token goes to the SPA's memory only |
 | `SessionEnded(origin, code)` | `AuthState` | `Manager.SessionEnded` (single flight with C2's call) when `origin` is the active server's, else rejects `not_found` with a debug line: the SPA redials C1 when the result is `linked` and shows relink otherwise |
 | `HelloRefused(origin, {code, params})` | `AuthState` | `Manager.HelloRefused` for C1's `client_outdated` and `protocol_unsupported`, with the same origin rule as `SessionEnded` |
@@ -1478,8 +1478,9 @@ on every change):
      access token; a failure of either is ignored;
   3. delete every credential under the prefix whatever the revoke results, clear `user` and `device` of every entry in
      `servers.json`, and exit 0.
-  The whole call takes about 6 s whatever the number of servers, inside the 30 s the uninstaller gives it. 06's flag
-  then deletes the data folder, `servers.json` included (06's rule). 03-desktop-app parses both flags.
+  The whole call takes about 6 s whatever the number of servers, inside the 30 s the uninstaller gives it.
+  `--purge-data` then deletes the data root (`%LOCALAPPDATA%\isshoni`), `servers.json` included (06's rule);
+  `--forget-credentials` leaves it. 03-desktop-app parses both flags.
 - **Logs and diagnostics** (03-desktop-app's log file, M5's "Copy diagnostics") contain no token, code or exchange id;
   `State` has no secret, so it may be logged.
 
@@ -1748,8 +1749,8 @@ WebView2's autofill off for it (03-desktop-app's note).
 
 **Client side**: `deviceauth.Client.PasswordLink(ctx, username, password)` (§11.2), `Manager.LinkWithPassword(ctx,
 username, password)` (§11.3, which also checks compat first), and the `AuthService` row `LinkWithPassword(username,
-password)` (§11.7), to which 03-desktop-app's `Link.Password` maps (on the active server, with `AppInfo`'s device
-name). The password crosses the binding once as a `protocol.Secret`, is sent once over TLS, and is never stored,
+password)` (§11.7), which 03-desktop-app binds as `Auth.LinkWithPassword` (on the active server, with `AppInfo`'s
+device name). The password crosses the binding once as a `protocol.Secret`, is sent once over TLS, and is never stored,
 retried or logged.
 
 Why it is safe enough: a guess here costs exactly what one at `/auth/login` costs (same buckets, same hash), so it
@@ -2010,12 +2011,12 @@ Recorded in the PR of slice DA13; they don't block merges (README §4 Testing).
 **docs/m2/03-desktop-app.md**
 - The `AuthService` binding and the `isshoni:auth.state` event of §11.7 (its adapter maps `AccessToken(origin, force)`
   onto the active `Manager` only when the origins match, reloads the window on every change of the active server, and
-  maps `Link.Start`/`Link.Cancel` and `Link.Password` onto them); the "Link this app" screen (code, URL, the QR code of
-  `verificationUriComplete` rendered in the SPA with M1's uqr-based `QrCode` component, "Copy link", "Get a new code",
-  the notices of §11.3, and `ErrBadResponse` from `Link` shown as its generic link error), the password form ("Sign in
-  with username and password instead") over `LinkWithPassword`, the "Add server" modal and its rules (§12.3; "This
-  server calls itself {host}" from `AddResult`), the update screens (§13.3, over 06's updater states), first-run wizard
-  step 1 = `Manager.Link`.
+  binds `Link`, `CancelLink` and `LinkWithPassword` as `Auth.Link`, `Auth.CancelLink` and `Auth.LinkWithPassword`);
+  the "Link this app" screen (code, URL, the QR code of `verificationUriComplete` rendered in the SPA with M1's
+  uqr-based `QrCode` component, "Copy link", "Get a new code", the notices of §11.3, and `ErrBadResponse` from `Link`
+  shown as its generic link error), the password form ("Sign in with username and password instead") over
+  `LinkWithPassword`, the "Add server" modal and its rules (§12.3; "This server calls itself {host}" from
+  `AddResult`), the update screens (§13.3, over 06's updater states), first-run wizard step 1 = `Manager.Link`.
 - C2's adapter calls `Manager.HelloRefused` on `client_outdated` and `protocol_unsupported` and
   `Manager.SessionEnded` on `unauthenticated`, `session_revoked` and `account_disabled`, and starts a new core client
   when `State().Status` is `linked` afterwards.
@@ -2089,7 +2090,8 @@ About 20 days of work; DA1–DA7 (server and web, ~12 days) and DA8–DA10 (clie
 ## 20. Decisions left to the owner
 
 None open. The in-app username/password fallback follows the plan ("Privacy and trust model") and M1 03 §12.3 and is
-built in M2 (§14, decision 12). Should the owner prefer to defer it after all, 03-desktop-app drops `Link.Password`,
-the wizard's "Sign in with username and password instead", its autofill note and the password cases of its e2e
-specs (its CDP spec then approves through `/device/lookup` and `/device/decide` with a cookie session), and this
-document drops #48, `PasswordDeviceLogin`, `PasswordLink`, `LinkWithPassword` and their tests.
+built in M2 (§14, decision 12). Should the owner prefer to defer it after all, 03-desktop-app drops
+`Auth.LinkWithPassword`, the wizard's "Sign in with username and password instead", its autofill note and the
+password cases of its e2e specs (its CDP spec then approves through `/device/lookup` and `/device/decide` with a
+cookie session), and this document drops #48, `PasswordDeviceLogin`, `PasswordLink`, `LinkWithPassword` and their
+tests.

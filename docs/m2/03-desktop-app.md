@@ -580,7 +580,7 @@ like tygo's output).
 | `Auth.SwitchServer(origin)` | → — | `not_found`, `busy` (live share) | makes it active and reloads the window (for a server that isn't linked, the reloaded page shows its link step, §7.5's `RequireAuth`, §13.2) |
 | `Auth.RemoveServer(origin)` | → — | `not_found`, `busy` (live share on it) | 02's `Servers.Remove` (Unlink, then drop the entry) |
 | `Auth.Link()`, `Auth.CancelLink()` | → — | `server_unreachable`, `incompatible_server`, `rate_limited` | 02's `Manager.Link` on the active server; progress arrives as `auth.state` |
-| `Auth.LinkWithPassword(username, password)` | `string`, `string` → `AuthState` | `invalid_argument`, `invalid_credentials`, `account_pending`, `account_disabled`, `rate_limited` (`params.retryAfter`), `server_busy` (02's `*api.Error` codes, passed through), `server_unreachable`, `incompatible_server` | the link step's "Sign in with username and password instead" (§8.2; 02 §11.7 and README §3 item 8 call it `Link.Password`): 02's `Manager.LinkWithPassword` on the active server with `AppInfo`'s device name (02 §14); the password crosses the binding once as a `protocol.Secret` and is never stored, retried or logged |
+| `Auth.LinkWithPassword(username, password)` | `string`, `string` → `AuthState` | `invalid_argument`, `invalid_credentials`, `account_pending`, `account_disabled`, `rate_limited` (`params.retryAfter`), `server_busy`, `validation_failed` (`params.fields`: M1's login field codes `required`, `too_long`, `invalid` for `username` and `password`) (02's `*api.Error` codes, passed through), `server_unreachable`, `incompatible_server` | the link step's "Sign in with username and password instead" (§8.2): 02's `Manager.LinkWithPassword` on the active server with `AppInfo`'s device name (02 §14); the password crosses the binding once as a `protocol.Secret` and is never stored, retried or logged (Wails' own logger too, §17) |
 | `Auth.Unlink()` | → `{confirmed: bool}` | — | Sign out (§8.3); a live share on the active server is stopped first |
 | `Auth.Recheck()` | → `AuthState` | — | the version screen's "Try again" (02 §13.1) |
 | `Auth.AccessToken(origin, force)` | `string`, `bool` → `{token, expiresAt}` or `null` (not linked, or `origin` isn't the active server's) | `server_unreachable` (02's `ErrOffline`), `incompatible_server` (`ErrIncompatible`) | §5.8; 02's `Manager.AccessTokenWithExpiry(ctx, force)` on the active server only |
@@ -699,7 +699,7 @@ parses the rejection's message into `BridgeError {code, params}` (W12). Codes ar
 | `already_sharing`, `not_sharing`, `pick_expired` | share controller | `desktop.errors.*` |
 | `engine.` + 01's `media.ErrorCode` (01 §5.2): `engine.permission_denied`, `engine.encoder_lost`, `engine.source_gone`, `engine.unsupported_os`, `engine.no_encoder`, `engine.dependency`, `engine.internal`, `engine.invalid`, `engine.busy`; `params.reason` = `media.Error.Reason` (04 §5.7's detail token: `pick_expired`, `self_window`, `driver_too_old`, `no_media_foundation`, `blocked_by_policy`, `missing`, `version`, `abi`, …; `""` when none) | the engine (§10.5) | `desktop.errors.engine.*`, chosen by code and then by `params.reason` (§10.5's reason rows win over the code's row); `invalid` and `busy` share `internal`'s text; an unknown media code or reason is shown with its code's text, else `internal`'s; `engine.cancelled` is never surfaced (`Pick` returns `null`) |
 | `update.` + 06's code (06 §8.10), plus `update.not_ready` | `Updates.*` | `desktop.update.error.<code>` |
-| any 01 §12.1 wire code; the M1 REST codes `Auth.LinkWithPassword` passes through (`invalid_credentials`, `account_pending`, `account_disabled`, `server_busy`) | passed through from C2 or 02 | `errors.<code>` (M1 catalog) |
+| any 01 §12.1 wire code; the M1 REST codes `Auth.LinkWithPassword` passes through (`invalid_credentials`, `account_pending`, `account_disabled`, `server_busy`, `validation_failed` with `params.fields`) | passed through from C2 or 02 | `errors.<code>` (M1 catalog); `validation_failed` also shows M1's `fieldErrors.<field>.<code>` under each field |
 
 ---
 
@@ -844,6 +844,7 @@ export interface NativeBridge {
   auth: { state(): Promise<AuthState>; servers(): Promise<ServerInfo[]>; probe(address: string): Promise<ServerProbe>;
           addServer(origin: string): Promise<void>; switchServer(origin: string): Promise<void>;
           removeServer(origin: string): Promise<void>; link(): Promise<void>; cancelLink(): Promise<void>;
+          linkWithPassword(username: string, password: string): Promise<AuthState>;
           unlink(): Promise<{ confirmed: boolean }>; recheck(): Promise<AuthState>;
           accessToken(origin: string, force: boolean): Promise<AccessToken | null>;
           sessionEnded(origin: string, code: 'unauthenticated' | 'session_revoked' | 'account_disabled'): Promise<AuthState>;
@@ -1038,10 +1039,11 @@ in settings (per install) records that the sound and voice steps were seen once.
     default): a link below the code opens a form with username and password fields and [Sign in] [Back]. [Sign in]
     calls `Auth.LinkWithPassword(username, password)` (§6.2), which cancels a running device-flow link first;
     `linked` continues as above; an error stays on the form with its text (`invalid_credentials`, `account_pending`,
-    `account_disabled`, `rate_limited` with its wait, `server_busy`, `server_unreachable`) and clears the password
-    field. [Back] returns to the code (`Auth.Link()`). The fields carry `autocomplete="off"`, WebView2's general
-    autofill and password saving stay off (§5.4), and the SPA keeps the password only in the field until the call
-    returns.
+    `account_disabled`, `rate_limited` with its wait, `server_busy`, `server_unreachable`; `validation_failed` with
+    M1's `fieldErrors.username.*` / `fieldErrors.password.*` text under the field, e.g. a username that is too long)
+    and clears the password field. [Back] returns to the code (`Auth.Link()`). The fields carry
+    `autocomplete="off"`, WebView2's general autofill and password saving stay off (§5.4), and the SPA keeps the
+    password only in the field until the call returns.
   Cancel (or leaving the page) calls `Auth.CancelLink()`. The app sends 02's default device name; the page says "You
   can rename this PC on the approval page or later on your Devices page." There is no name field.
 - **Sound check step** (§8.4).
@@ -1675,9 +1677,9 @@ checks it on windows-2025.
 1. **One-shot modes** (skipped entirely when `--open-url` is present, §13.1): each runs first, opens no window, skips
    single instance and does not create the mutex:
    - `--version`: prints exactly one JSON line `{"version","commit","date","protocol":{"min","max"},"engineAbi"}`
-     (`internal/version`, `protocol.MinVersion`/`Version`, `media.ABIVersion`) to stdout and exits 0. A GUI-subsystem
-     process writes to its inherited stdout handle; when it has none, it calls `AttachConsole(ATTACH_PARENT_PROCESS)`
-     first.
+     (`internal/version`, `protocol.MinVersion`/`Version`, `media.ABIVersion`: the ABI major, 1, as 06 §2.4) to stdout
+     and exits 0. A GUI-subsystem process writes to its inherited stdout handle; when it has none, it calls
+     `AttachConsole(ATTACH_PARENT_PROCESS)` first.
    - `--self-check=<path>`: loads `isshoni-media.dll` and FFmpeg from the exe's folder (`native.Open`), reads
      `Info().ABI`, runs `Probe(ctx, false)` (20 s; no encoder required, so it passes on a GPU-less VM) and reads
      `BuildInfo()`, builds `assets.New(assets.Options{Dist: web.Dist(), …})`, and writes 06 §2.4's JSON `{"ok",
@@ -1931,6 +1933,11 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
   line that needs to tell apps apart uses a count or 05's reason code. `remote_ip` never (the app knows only the
   server). 01 §11.12's list applies to the core's lines. `log.level` is a persisted setting (§14.2), and log files are
   what users attach to public issues, so debug is held to the same rule as info.
+- **Wails' own logger**: the Wails application's `Options.Logger` is never applog's debug-capable logger. It is
+  applog's handler with a fixed minimum level of Info whatever `log.level` is, because the pinned Wails logs each bound
+  call's raw JSON arguments and result at Debug ("Binding call complete"), before Go wraps a password in
+  `protocol.Secret`: otherwise `Auth.LinkWithPassword`'s password and `Auth.AccessToken`'s token would reach the log
+  at `log.level: debug`.
 - **SPA log**: `lib/log.ts` (05) forwards `warn` and `error` to `App.Log` in the desktop (≤ 10 per second; above that
   one "N messages dropped" line per minute), with `component: spa`. The SPA's desktop code never passes an app name,
   app id, window title or share label to `log` (the same rule as above).
@@ -2077,7 +2084,7 @@ there.
 | `tray` | `Render` for every mode, tooltip truncation at 127 characters with a 40-character source, menu items and hotkey labels, "Restart and update" only in Idle |
 | `hotkey` | parse/format round trip, rejected combos (one modifier, Win), the defaults are `Ctrl+Alt+Shift+F9`/`F10`, fuzz |
 | `i18n` | interpolation, plurals, missing key; every Go-used key exists in `desktop.en.json` |
-| `applog` | rotation at 5 MiB keeping 5; `Secret` redacted; profile path replaced; crash-file detection; at `log.level: debug`, a run of the `app`, `share` and `bridge` tests over 05's fake `normal` scenario writes no exe name (`*.exe`), no app display name, window title or share label from the fixtures into the log (§17) |
+| `applog` | rotation at 5 MiB keeping 5; `Secret` redacted; profile path replaced; crash-file detection; at `log.level: debug`, a run of the `app`, `share` and `bridge` tests over 05's fake `normal` scenario writes no exe name (`*.exe`), no app display name, window title or share label from the fixtures into the log (§17); at `log.level: debug`, the logger `main` gives Wails as `Options.Logger` has Debug disabled, and Wails' "Binding call complete" lines for `Auth.LinkWithPassword` (the password in `args`) and `Auth.AccessToken` (the token in `result`) sent through it leave neither the password nor the token in the log (§17) |
 | `bridge` | each method validates arguments and maps errors to §6.4's JSON (02's `ErrOffline` → `server_unreachable`, `ErrIncompatible` → `incompatible_server`, `ErrTooManyServers` → `too_many_servers`; media codes → `engine.<code>`; `engine.cancelled` never returned); `Audio.Watch`/`WatchLevels`/`Share.WatchServerStats` reference counts; `OpenExternal` accepts only https (and dev http localhost); `Shell.OpenURL` refuses `file:`, `ms-settings:`, `search-ms:`, `javascript:` and a UNC path (`\\host\share`) with `invalid_argument` and opens nothing, even when called from Go code paths that skip `OpenExternal`; `OpenOSSettings` URI builder incl. `sound-communications`; `Log` rate limit; no method returns a refresh token (type check over every result type); `Auth.AccessToken(origin, force)` with an origin that isn't the active server's → `null` and no `Manager` call, with the active one → the token (and `force` reaches `AccessTokenWithExpiry`); a call racing an `AddServer` returns either `null` or the requested origin's own token, never the new server's; `SessionEnded`/`HelloRefused` with another origin → `not_found` and no `Manager` call; no `Audio` method sets a sound mode (the service type has no such method); `Audio.Decide` with `auto` → `invalid_argument`; `Audio.DismissPrompt` → 05's `DismissPrompt`, `ErrUnknownPrompt` → `not_found`; `TestHotkey` sets `typesChar` from a fake layout |
 | `cmd/isshoni-desktop` (start order) | §13.4 with fakes for the mutex probe, the registry and the updater: installer mutex present → a start from `--open-url` writes `PendingServer`/`PendingRoom` (replacing older values) and exits 0, a plain start writes nothing and exits 0, and neither calls single instance, creates the running mutex, builds the updater or calls `Apply`; mutex absent → the normal order; `--sound-check-helper` still runs after the first action only |
 | `cmd/isshoni-desktop` (build) | `GOOS=darwin CGO_ENABLED=0 go vet ./...` and `GOOS=linux go build ./...` pass (the stub prints its line and exits 1) |
@@ -2166,7 +2173,9 @@ there.
   `/desktop/setup?link=1` drops the parameter and calls `link()` exactly once, only when the state is `unlinked`
   without a notice; link states from `AuthState` (`linking` with code, QR, short URL, the server name and the trust
   line; `linked`; `denied`; `code_expired`; `incompatible` with `recheck`); an `auth.state` event for another origin
-  changes nothing on the page; the QR code encodes `verificationUriComplete`; the voice step calls
+  changes nothing on the page; the QR code encodes `verificationUriComplete`; the password form: each error text of
+  §8.2 (`validation_failed` per field), the password field cleared after an error, `autocomplete="off"` on both
+  fields, exactly one `linkWithPassword` call per [Sign in], and [Back] calling `link()`; the voice step calls
   `audio.watch(true)` on mount and shows `voiceApps[].running`; sound check results by `backend` and `reason`, incl.
   `device_busy` with its text, [Open sound settings], [Try again] and [Continue], and an unknown reason with the
   generic text; relink texts per notice and the `save_failed` banner; Unlink with `confirmed: false`.
@@ -2319,7 +2328,7 @@ The shapes below are what this doc assumes; each sibling's own names win, and th
   its own on C2.
 - The encoder fallback of D15 in the core.
 - The `media` contract of 01 §5 (`Pick(ctx, PickRequest)`, `ErrCancelled`, `Source{Kind, Name, PID, …}` with no self
-  flag (a self pick is `invalid`/`self_window`), `Probe.Audio.Mode`, `ErrorCode` incl. `dependency`, `Error.Reason`
+  flag (a self pick is `invalid`/`self_window`), `Probe.Audio.Backend`, `ErrorCode` incl. `dependency`, `Error.Reason`
   and `EncoderInfo.Status`/`Reason` with 04's tokens, `ShareSnapshot.Minimized`), `native.Open` (01 §7.1), and
   `fake.NewEngine` with `Mode: fake.Decodable, SourceSize: [2]int{640, 360}` as the app's dev/e2e configuration (01
   §6.3 should name it).
@@ -2348,7 +2357,7 @@ The shapes below are what this doc assumes; each sibling's own names win, and th
 
 **04-windows-engine.md**
 - The engine behind 01's `media.Engine`: `Probe` once at start (encoders, borderless support, OS build,
-  `unsupported_os`; the audio backend as `Probe.Audio.Mode`; `avcodec_license()` for `--self-check`),
+  `unsupported_os`; the audio backend as `Probe.Audio.Backend`; `avcodec_license()` for `--self-check`),
   `Pick(ctx, media.PickRequest{OwnerWindow})` returning a `media.Source` with `Kind`, `Name`, `PID`, and
   `OSBorder` (whether Windows will draw the yellow border; 04 adds it), the monitor of a window source when 04 can add
   it; `media.ErrCancelled` for a closed picker; picker cancellation when the context ends.

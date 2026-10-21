@@ -1670,8 +1670,8 @@ type Notice struct {
   coalesced to ≤ 4 per second; callers read counters with `Share.Snapshot()` (03 polls every 2 s for its stats and
   caps `share.state` at ≤ 4 per second, 03 §6.3, §20).
 - 03 maps events to Wails events; the core never formats text. `EventPlaybackState` goes to 05's
-  `Service.SetViewerBrowser(browser, os, playing)`. Audio state ("What friends hear", levels, prompts, banners) never
-  passes through the core: 05's Service reads it from the engine (05 §14).
+  `Service.SetViewerBrowser(From, Browser, OS, Playing)`. Audio state ("What friends hear", levels, prompts, banners)
+  never passes through the core: 05's Service reads it from the engine (05 §14).
 
 ### 11.11 The same-user relay (`internal/protocol/relay`)
 
@@ -1721,7 +1721,8 @@ Core rules:
 1. `playback.state`: decode strictly (unknown fields ignored, size already bounded at 16 KiB by the server); a
    payload that doesn't decode, or a `browser` outside the four families, is ignored (debug log with the kind only).
    Otherwise emit `EventPlaybackState{From, Playing, Browser, OS}`; 03 forwards it to 05's
-   `Service.SetViewerBrowser(browser, os, playing)`. The server delivers only messages of the same user (01 §8.14).
+   `Service.SetViewerBrowser(From, Browser, OS, Playing)` (05 §14.2). The server delivers only messages of the same
+   user (01 §8.14).
 2. `playback.stop` is never sent or handled by the core (03 owns sender and receiver); the type lives here only for
    `relay.gen.ts`.
 3. Every other kind (`share.request`, `share.status`, `exclusions.*`, unknown) is ignored (debug log with the kind
