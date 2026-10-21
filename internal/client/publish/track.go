@@ -17,7 +17,8 @@ import (
 )
 
 // track is the Publisher's webrtc.TrackLocal: one simulcast encoding, or the audio. Pion binds it when the answer is
-// applied; the send loop writes to it, stamping the mid and rid header extensions itself.
+// applied; the send loop packetizes into it, stamping the mid and rid header extensions itself, and writes the
+// packets, or hands a video frame's packets to the pacer to write (Options.Pacing).
 type track struct {
 	kind           webrtc.RTPCodecType
 	id, stream     string
@@ -30,7 +31,7 @@ type track struct {
 	tsBase         uint32
 	pay            codecs.H264Payloader
 	midExt, ridExt []byte
-	frames         int // frames written (video)
+	frames         int // frames packetized (video)
 
 	// The test options, set by New before the track is bound: padEvery is Options.Padding (video), and repair is
 	// there with Options.RedundantRTX (repair.go).
@@ -40,8 +41,13 @@ type track struct {
 	mu sync.Mutex // guards the fields below
 	b  *binding
 	// profile is the H.264 profile key the video goes out in: Options.Profile until Bind chooses, then what the
-	// negotiation chose. next is the one it switches to with its next keyframe (switchTo), "" while it stays.
+	// negotiation chose. next is the one it switches to at a coming keyframe (switchWhen), "" while it stays.
 	profile, next string
+	// nextIDC is, while a switch waits, the profile_idc its keyframe must have, or 0 when any keyframe will do. The
+	// Publisher sets it when it asked its ProfileSource for another engine profile, whether or not SetProfile
+	// succeeded (applyProfile): a keyframe that the old encoder made, still on its way or because the switch failed,
+	// must not go out on the new payload type (switchesAt).
+	nextIDC byte
 	// inactive: SetActive turned the video layer off, and it sends nothing. resuming: it was turned on again and
 	// sends nothing until its next keyframe (admit).
 	inactive, resuming bool
@@ -49,6 +55,10 @@ type track struct {
 	lastTS             uint32
 	lastNTP            uint64
 	stats              TrackStats
+	// The live numbers of TrackStats (stats.go): the wire bytes of each frame written, over rateWindow (Bitrate,
+	// FPS); video's capture-to-send latencies, over latencyWindow; the last sender reports written (RTT).
+	rate, latency window
+	srs           []srSent
 }
 
 // binding is what Bind learned from the negotiation.
@@ -65,7 +75,10 @@ type binding struct {
 }
 
 func newTrack(kind webrtc.RTPCodecType, id, stream, rid, layer, profile string) *track {
-	t := &track{kind: kind, id: id, stream: stream, rid: rid, layer: layer, profile: profile, clock: videoClock}
+	t := &track{
+		kind: kind, id: id, stream: stream, rid: rid, layer: layer, profile: profile, clock: videoClock,
+		rate: newWindow(rateWindow), latency: newWindow(latencyWindow),
+	}
 	if profile != "" {
 		t.table = h264Table{profile}
 	}
@@ -109,7 +122,7 @@ func (t *track) Bind(ctx webrtc.TrackLocalContext) (webrtc.RTPCodecParameters, e
 		t.b = b
 		t.stats.SSRC = b.ssrc
 		if t.kind == webrtc.RTPCodecTypeVideo {
-			t.profile, t.next = profileKey(c.SDPFmtpLine), ""
+			t.profile, t.next, t.nextIDC = profileKey(c.SDPFmtpLine), "", 0
 		}
 		t.mu.Unlock()
 		return c, nil
@@ -117,20 +130,37 @@ func (t *track) Bind(ctx webrtc.TrackLocalContext) (webrtc.RTPCodecParameters, e
 	return webrtc.RTPCodecParameters{}, webrtc.ErrUnsupportedCodec
 }
 
-// switchTo has the video track go on in another of the Publisher's profiles from its next keyframe (write), and
-// reports whether it will switch: false when it sends that profile already, or isn't bound.
-func (t *track) switchTo(profile string) bool {
+// switchWhen has the video track go on in another of the Publisher's profiles from a coming keyframe (packetize):
+// its next one when idc is 0, else the first whose SPS has profile_idc idc (switchesAt). It reports whether it will
+// switch: false when it sends that profile already, or isn't bound.
+func (t *track) switchWhen(profile string, idc byte) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.b == nil || t.profile == profile {
-		t.next = ""
+		t.next, t.nextIDC = "", 0
 		return false
 	}
-	t.next = profile
+	t.next, t.nextIDC = profile, idc
 	return true
 }
 
-// switchLocked makes the profile that switchTo set the one the track sends: a new binding with that profile's
+// switchesAt reports whether a keyframe is the one a waiting switch happens at: any keyframe, unless the switch
+// waits for the new encoder's (nextIDC). Then it is the first keyframe whose SPS has the new profile_idc. A keyframe
+// without an SPS in front (which the media contract doesn't allow) switches when it is a Reinit one, the first after
+// the encoder's re-initialization. A re-init that didn't change the profile (a CB-only encoder asked for High stays
+// CB, 04 §9.6) leaves the layer on the payload type that names what it sends; the core then re-offers with the
+// actual profile (§8.6). t.mu is held.
+func (t *track) switchesAt(pkt media.Packet) bool {
+	if t.nextIDC == 0 {
+		return true
+	}
+	if idc, ok := spsProfileIDC(pkt.Data); ok {
+		return idc == t.nextIDC
+	}
+	return pkt.Reinit
+}
+
+// switchLocked makes the profile that switchWhen set the one the track sends: a new binding with that profile's
 // payload type, and its RTX payload type when the track has an RTX stream. Repairs of packets sent before go out
 // with the new payload types too. t.mu is held.
 func (t *track) switchLocked() {
@@ -143,7 +173,7 @@ func (t *track) switchLocked() {
 		}
 		t.b, t.profile = &b, t.next
 	}
-	t.next = ""
+	t.next, t.nextIDC = "", 0
 }
 
 // Unbind implements webrtc.TrackLocal. Packets are dropped until the next Bind.
@@ -176,17 +206,52 @@ func (t *track) info() TrackInfo {
 	return i
 }
 
-// write packetizes and writes one Source packet with RTP timestamp tsBase + ticks and the sender-report NTP time of
-// its capture. It returns false when the track isn't bound. Only the send loop calls it.
-func (t *track) write(pkt media.Packet, ticks uint32, ntp uint64) bool {
+// outKind is what one packet of an outFrame is.
+type outKind uint8
+
+const (
+	outMedia   outKind = iota // a packet of the frame on the media stream
+	outCopy                   // Options.RedundantRTX: the second copy of the frame's last packet, on the RTX stream
+	outPadding                // Options.Padding: a padding-only packet on the media stream
+)
+
+// outPacket is one RTP packet of an outFrame.
+type outPacket struct {
+	kind    outKind
+	hdr     rtp.Header // outCopy: only the sequence number of the packet to copy
+	payload []byte
+	size    int // its bytes on the wire, as far as the track knows them (the interceptors add the TWCC extension)
+}
+
+// outFrame is one Source packet as the RTP packets of its track. The send loop makes it (packetize); then the send
+// loop or, for paced video, the pacer writes its packets in order (writePacket) and counts the frame (finish).
+type outFrame struct {
+	t        *track
+	b        *binding // the binding when it was made: its packets carry its payload type and SSRC
+	pkts     []outPacket
+	media    int // pkts[:media] are the media packets, then come a copy and padding
+	ts       uint32
+	ntp      uint64
+	capture  int64
+	keyframe bool
+	// What writing it did, filled in by its writer.
+	errs           int
+	copied, padded uint64
+}
+
+// packetize turns one Source packet into its RTP packets, with RTP timestamp tsBase + ticks and the sender-report NTP
+// time of its capture: a video access unit through the H.264 payloader (the marker bit on its last packet), an Opus
+// packet as it is. A keyframe that a waiting profile switch waits for switches it first, as an encoder's switch
+// starts with a keyframe. It returns nil when the track isn't bound. Only the send loop calls it.
+func (t *track) packetize(pkt media.Packet, ticks uint32, ntp uint64) *outFrame {
 	t.mu.Lock()
-	if t.next != "" && pkt.Keyframe {
-		t.switchLocked() // a new profile starts with a keyframe, as an encoder's switch does
+	if t.next != "" && pkt.Keyframe && t.switchesAt(pkt) {
+		t.switchLocked()
 	}
 	b := t.b
 	t.mu.Unlock()
 	if b == nil {
-		return false
+		return nil
 	}
 	if t.midExt == nil && t.tr != nil {
 		if mid := t.tr.Mid(); mid != "" {
@@ -197,13 +262,15 @@ func (t *track) write(pkt media.Packet, ticks uint32, ntp uint64) bool {
 		t.ridExt = []byte(t.rid)
 	}
 	ts := t.tsBase + ticks
+	video := t.kind == webrtc.RTPCodecTypeVideo
 	payloads := [][]byte{pkt.Data}
-	if t.kind == webrtc.RTPCodecTypeVideo {
+	if video {
 		payloads = t.pay.Payload(PayloadMTU, pkt.Data)
 	}
-	video := t.kind == webrtc.RTPCodecTypeVideo
-	var octets uint64
-	errs := 0
+	f := &outFrame{
+		t: t, b: b, pkts: make([]outPacket, 0, len(payloads)+1), ts: ts, ntp: ntp, capture: pkt.CaptureNS,
+		keyframe: pkt.Keyframe,
+	}
 	for i, payload := range payloads {
 		hdr := rtp.Header{
 			Version:        2,
@@ -215,38 +282,84 @@ func (t *track) write(pkt media.Packet, ticks uint32, ntp uint64) bool {
 		}
 		t.seq++
 		t.identify(&hdr, b)
-		if t.repair != nil {
-			t.repair.keep(hdr.SequenceNumber, ts, hdr.Marker, payload)
-		}
-		if _, err := b.w.WriteRTP(&hdr, payload); err != nil {
-			errs++
-		}
-		octets += uint64(len(payload))
+		f.pkts = append(f.pkts, outPacket{hdr: hdr, payload: payload, size: hdr.MarshalSize() + len(payload)})
 	}
-	var padding, redundant uint64
+	f.media = len(f.pkts)
 	if video && len(payloads) > 0 {
 		t.frames++
 		// The second copy of the frame's last packet, on the RTX stream (Options.RedundantRTX).
-		if t.repair != nil && b.rtxSSRC != 0 && t.frames > redundantAfter && t.resend(b, t.seq-1) {
-			redundant = 1
+		if t.repair != nil && b.rtxSSRC != 0 && t.frames > redundantAfter {
+			last := f.pkts[f.media-1]
+			f.pkts = append(f.pkts, outPacket{
+				kind: outCopy, hdr: rtp.Header{SequenceNumber: last.hdr.SequenceNumber}, size: last.size + 2,
+			})
 		}
 		if t.padEvery > 0 && t.frames%t.padEvery == 0 {
-			padding = t.pad(b, ts)
+			t.pad(f)
 		}
+	}
+	return f
+}
+
+// writePacket writes packet i of f. Only f's writer calls it: the send loop, or the pacer for paced video.
+func (t *track) writePacket(f *outFrame, i int) {
+	p := &f.pkts[i]
+	switch p.kind {
+	case outCopy:
+		if t.resend(f.b, p.hdr.SequenceNumber) {
+			f.copied++
+		}
+	case outPadding:
+		if _, err := f.b.w.WriteRTP(&p.hdr, nil); err == nil {
+			f.padded++
+		}
+	default:
+		if t.repair != nil {
+			t.repair.keep(p.hdr.SequenceNumber, p.hdr.Timestamp, p.hdr.Marker, p.payload)
+		}
+		if _, err := f.b.w.WriteRTP(&p.hdr, p.payload); err != nil {
+			f.errs++
+		}
+	}
+}
+
+// writeFrame writes all of f's packets at once and counts the frame (the send loop, for audio and unpaced video).
+func (t *track) writeFrame(f *outFrame, clock Clock) {
+	for i := range f.pkts {
+		t.writePacket(f, i)
+	}
+	t.finish(f, time.Now(), clock)
+}
+
+// finish counts a frame whose last packet was written at now: the counters, the frame for the next sender report,
+// its wire bytes for Bitrate and FPS, and, for video with a Clock, its capture-to-send latency.
+func (t *track) finish(f *outFrame, now time.Time, clock Clock) {
+	var octets, wire uint64
+	for _, p := range f.pkts[:f.media] {
+		octets += uint64(len(p.payload))
+		wire += uint64(p.size)
+	}
+	video := t.kind == webrtc.RTPCodecTypeVideo
+	var age int64
+	if video && clock != nil {
+		age = clock.Now() - f.capture
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.sent, t.lastTS, t.lastNTP = true, ts, ntp
-	t.stats.Packets += uint64(len(payloads))
+	t.sent, t.lastTS, t.lastNTP = true, f.ts, f.ntp
+	t.stats.Packets += uint64(f.media)
 	t.stats.Octets += octets
-	t.stats.WriteErrors += errs
-	t.stats.Padding += padding
-	t.stats.Redundant += redundant
+	t.stats.WriteErrors += f.errs
+	t.stats.Padding += f.padded
+	t.stats.Redundant += f.copied
 	t.stats.Frames++
-	if pkt.Keyframe {
+	if f.keyframe {
 		t.stats.Keyframes++
 	}
-	return true
+	t.rate.add(now, int64(wire))
+	if video && clock != nil {
+		t.latency.add(now, age)
+	}
 }
 
 // identify adds the mid and rid header extensions to a packet of the track's media stream, when they are
@@ -260,22 +373,18 @@ func (t *track) identify(hdr *rtp.Header, b *binding) {
 	}
 }
 
-// pad writes padPackets padding-only packets after a frame with timestamp ts (Options.Padding): the next sequence
-// numbers of the media stream, the frame's timestamp, no payload, padSize bytes of padding. It returns how many were
-// written. Only the send loop calls it.
-func (t *track) pad(b *binding, ts uint32) (written uint64) {
+// pad adds padPackets padding-only packets to a frame (Options.Padding): the next sequence numbers of the media
+// stream, the frame's timestamp, no payload, padSize bytes of padding. Only the send loop calls it.
+func (t *track) pad(f *outFrame) {
 	for range padPackets {
 		hdr := rtp.Header{
-			Version: 2, Padding: true, PaddingSize: padSize, PayloadType: b.pt, SequenceNumber: t.seq, Timestamp: ts,
-			SSRC: b.ssrc,
+			Version: 2, Padding: true, PaddingSize: padSize, PayloadType: f.b.pt, SequenceNumber: t.seq, Timestamp: f.ts,
+			SSRC: f.b.ssrc,
 		}
 		t.seq++
-		t.identify(&hdr, b)
-		if _, err := b.w.WriteRTP(&hdr, nil); err == nil {
-			written++
-		}
+		t.identify(&hdr, f.b)
+		f.pkts = append(f.pkts, outPacket{kind: outPadding, hdr: hdr, size: hdr.MarshalSize() + padSize})
 	}
-	return written
 }
 
 // admit reports whether a Source packet of the track goes out (Publisher.SetActive): not while the video layer is
@@ -305,6 +414,13 @@ func (t *track) setActive(active bool) (resumed bool) {
 	return resumed
 }
 
+// isActive reports whether SetActive left the video layer on.
+func (t *track) isActive() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return !t.inactive
+}
+
 // senderReport returns the SR for the last frame sent: NTP = wall clock at its capture, RTP = its timestamp, and the
 // packet and octet counts (RFC 3550 §6.4.1). ok is false before the first packet, while unbound, and while the video
 // layer is off (Publisher.SetActive): an encoding that sends nothing reports nothing.
@@ -323,8 +439,16 @@ func (t *track) senderReport() (*rtcp.SenderReport, bool) {
 	}, true
 }
 
-// onRTCP counts one RTCP packet addressed to this track and reports whether the Source must make a keyframe for
-// layer (PLI or FIR on a video track).
+// wroteSR counts a sender report written at at and remembers it for the RTT (onReceptionReport).
+func (t *track) wroteSR(sr *rtcp.SenderReport, at time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.stats.SRs++
+	t.noteSRLocked(sr.NTPTime, at)
+}
+
+// onRTCP counts one RTCP packet addressed to this track, takes the RTT from a reception report about it, and reports
+// whether the Source must make a keyframe for layer (PLI or FIR on a video track).
 func (t *track) onRTCP(pkt rtcp.Packet) (layer string, keyframe bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -352,8 +476,22 @@ func (t *track) onRTCP(pkt rtcp.Packet) (layer string, keyframe bool) {
 			t.stats.REMBs++
 			t.stats.LastREMB = uint64(pkt.Bitrate)
 		}
+	case *rtcp.ReceiverReport:
+		t.onReceptionReports(pkt.Reports, ssrc)
+	case *rtcp.SenderReport:
+		t.onReceptionReports(pkt.Reports, ssrc)
 	}
 	return "", false
+}
+
+// onReceptionReports takes the RTT from the reports about ssrc, arrived now. t.mu is held.
+func (t *track) onReceptionReports(reports []rtcp.ReceptionReport, ssrc uint32) {
+	now := time.Now()
+	for _, r := range reports {
+		if r.SSRC == ssrc {
+			t.onReceptionReport(r, now)
+		}
+	}
 }
 
 // rtpTicks converts a capture-time difference in ns to clock ticks, rounded to the nearest tick, modulo 2^32.
