@@ -357,6 +357,11 @@ func startFakeServer(path string, rejectPeers bool) (*fakeServer, error) {
 		Status: func(context.Context) (api.ServerStatus, error) {
 			st := fakeStatus()
 			st.StartedAt = st.StartedAt.Add(time.Duration(f.started.Load()) * time.Second)
+			if machine.inBridge() {
+				// The server's own status, which doctor's public_ip lets pass, with the flag that says so.
+				bridgeStatus(&st)
+				st.DockerBridge = true
+			}
 			return st, nil
 		},
 		Doctor: ops.NewDoctor(ops.DoctorOptions{Env: machine.serverEnv, Logger: log}),
@@ -490,6 +495,9 @@ func (sf *scriptFake) close() {
 //	fakeserver set shutting-down         the graceful shutdown has begun
 //	fakeserver set doctor ok|warn|fail   what doctor finds on the server's machine: nothing, socket buffer limits
 //	                                     that are too low, or a certificate that could not be had
+//	fakeserver set nat bridge|none       the server runs in a Docker container on a bridge network, behind its
+//	                                     symmetric NAT, which doctor lets pass (dockerBridge), or on the host
+//	                                     with no NAT
 //	fakeserver set restart ok|stuck      whether the server comes back after a restore or rotate-secrets
 //	fakeserver show restarts|database    print how often the server was asked to restart, or what its database is
 //	fakeserver after DUR start|set …     the same, DUR from now, while the script goes on
@@ -608,6 +616,8 @@ func (sf *scriptFake) do(args []string, stdout io.Writer) error {
 		srv.health.SetShuttingDown()
 	case "set doctor ok", "set doctor warn", "set doctor fail":
 		srv.machine.set(arg(2))
+	case "set nat bridge", "set nat none":
+		srv.machine.setBridge(arg(2) == "bridge")
 	case "set restart ok", "set restart stuck":
 		srv.stuck.Store(arg(2) == "stuck")
 	case "show restarts":

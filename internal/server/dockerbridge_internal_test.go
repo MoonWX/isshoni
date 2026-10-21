@@ -242,3 +242,44 @@ func TestDockerBridgeNATCancelled(t *testing.T) {
 		t.Error("dockerBridgeNAT = true with a cancelled context")
 	}
 }
+
+// TestWithDockerBridge: the admin socket's status carries the flag that dockerBridgeNAT gave (README F23), only next
+// to a symmetric NAT, as the dashboard and the connection test keep it, and leaves the rest of the status as it is;
+// the status source's error passes through.
+func TestWithDockerBridge(t *testing.T) {
+	errDown := errors.New("status down")
+	for _, tc := range []struct {
+		name   string
+		nat    api.NATKind
+		err    error
+		bridge bool // what dockerBridgeNAT said
+		want   bool
+	}{
+		{name: "a bridge's symmetric NAT", nat: api.NATKindSymmetric, bridge: true, want: true},
+		{name: "symmetric NAT that doctor doesn't let pass", nat: api.NATKindSymmetric},
+		{name: "the flag next to 1:1 NAT", nat: api.NATKindOneToOne, bridge: true},
+		{name: "the flag next to cgnat_likely", nat: api.NATKindCGNATLikely, bridge: true},
+		{name: "the status source failed", nat: api.NATKindSymmetric, err: errDown, bridge: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			source := func(context.Context) (api.ServerStatus, error) {
+				calls++
+				if tc.err != nil {
+					return api.ServerStatus{}, tc.err
+				}
+				return api.ServerStatus{Version: "0.3.0", PublicIPv4: "203.0.113.7", NAT: tc.nat}, nil
+			}
+			st, err := withDockerBridge(source, tc.bridge)(context.Background())
+			if !errors.Is(err, tc.err) || calls != 1 {
+				t.Fatalf("err = %v after %d calls, want %v after one", err, calls, tc.err)
+			}
+			if st.DockerBridge != tc.want {
+				t.Errorf("dockerBridge = %v, want %v (nat %q)", st.DockerBridge, tc.want, st.NAT)
+			}
+			if tc.err == nil && (st.Version != "0.3.0" || st.PublicIPv4 != "203.0.113.7" || st.NAT != tc.nat) {
+				t.Errorf("the rest of the status changed: %+v", st)
+			}
+		})
+	}
+}

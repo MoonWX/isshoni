@@ -230,10 +230,14 @@ type ServerStatus struct {
 	PublicIPv6Method string `json:"publicIpv6Method,omitempty"`
 	// LocalIPv4 is the IPv4 of the default-route interface (netx.PublicAddrs.LocalV4; may equal PublicIPv4), the
 	// {local} of public_ip's port_forward fix text.
-	LocalIPv4  string           `json:"localIpv4,omitempty"`
-	NAT        NATKind          `json:"nat"`
-	Advertised []AdvertisedAddr `json:"advertised"`
-	Listeners  []ListenerInfo   `json:"listeners"`
+	LocalIPv4 string  `json:"localIpv4,omitempty"`
+	NAT       NATKind `json:"nat"`
+	// DockerBridge qualifies a symmetric NAT as ServerInfo.DockerBridge does, from the same look: a container's
+	// bridge network, which doctor's public_ip lets pass (04 §13.2). Only next to NAT symmetric; absent otherwise
+	// (README F23). doctor.Env.Live never has it: it is that check's own verdict.
+	DockerBridge bool             `json:"dockerBridge,omitempty"`
+	Advertised   []AdvertisedAddr `json:"advertised"`
+	Listeners    []ListenerInfo   `json:"listeners"`
 	// UDPRcvBufBytes and UDPSndBufBytes are the effective SO_RCVBUF and SO_SNDBUF of the media sockets, read back
 	// with getsockopt (netx.Transport.RcvBuf and SndBuf); absent when UDP is off.
 	UDPRcvBufBytes int           `json:"udpRcvBufBytes,omitempty"`

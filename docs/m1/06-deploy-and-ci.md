@@ -1308,7 +1308,11 @@ actionlint 1.<latest>
   newest toolchain). The go line carries a patch because `golang.org/x/text`, `golang.org/x/crypto` and
   `modernc.org/sqlite` require `go 1.26.0`, so `go get` and `go mod tidy` write it that way; the language version is
   still 1.26. `tools/go.mod` has the same two lines. CI reads the version from `go.mod`, not from `.tool-versions`,
-  and `task lint:pins` fails if the two differ.
+  and `task lint:pins` fails if the two differ. A toolchain patch that fixes a vulnerability govulncheck reports
+  (the non-gating CI job, 8.2; nightly and release gate on it) doesn't wait for the monthly bump: go1.27.3 came
+  that way after group 16, for GO-2026-6809 in `crypto/x509`, which the server reaches, with the toolchain line of
+  `go.mod`, `tools/go.mod`, `tools/goreleaser/go.mod` and `.tool-versions` moved together (README §6 "Decided
+  after group 16" (6)).
 - Node's bundled npm (11.x) is used; `package.json` has `"engines": {"node": ">=26"}` and
   `"packageManager": "npm@<exact 11.x version>"`.
 
@@ -1546,7 +1550,7 @@ The `changes` job (`dorny/paths-filter`) sets these outputs. On `push` to `main`
 | `lint-deploy` | deploy, readme or repocheck | `task lint:sh lint:actions lint:keys lint:unit lint:pins test:sh` | 10 | yes |
 | `distro-release` | deploy or release, or `tools/relserve` or `tools/notices` (below) | builds the two test releases once for the matrix (README S78): setup-node and `npm ci` in `web/`, because `task release:snapshot` builds the SPA (7.2); rpm on the runner; `sh deploy/test/distro-test.sh -b`; uploads them as the artifact `distro-releases`, kept 1 day | 20 | yes |
 | `distro` | as `distro-release` | matrix of the 6 container distros (4.13), scenarios from 11.2, on the releases of `distro-release` (`distro-test.sh -r`), with `CONTAINER_ENGINE=docker` | 30 | yes |
-| `docker-smoke` | docker, deploy or release | `task docker:smoke` (11.3), linux/amd64 | 15 | yes |
+| `docker-smoke` | docker, deploy or release (no filter for `internal/server/ops/doctor`, whose checks and codes the step pins: a pull request that changes only doctor doesn't run it, 11.3) | `task docker:smoke` (11.3), linux/amd64 | 15 | yes |
 | `goreleaser-check` | release, deploy or readme (below) | setup-node and `npm ci` in `web/`; `goreleaser check`; `task release:snapshot` (builds the SPA first, 7.2); asserts the asset list of section 3 (names and archive contents) | 20 | yes |
 | `site` | site or deploy | setup-node (with npm's cache) and `npm ci --prefix docs`; `vitepress build`; `node docs/scripts/check-site.mjs`, the check that the site loads nothing from another origin (10.1, README S82); setup-go (from `go.mod`), then `go test ./internal/server/ops/doctor -run TestDocsAnchors` (10.4). It deploys nothing: that is `site.yml`'s (10.5). `ci-ok` needs it | 10 | yes |
 | `govulncheck` | go | `.bin/govulncheck ./...`, `continue-on-error: true` (new CVEs mustn't block unrelated PRs; nightly and release gate on it) | 10 | no |
@@ -2729,22 +2733,32 @@ that the manual check of 04 §17 can't be:
   with the same image: an offline `isshoni doctor --only public_ip` in a bridge container on Docker Desktop, whose
   STUN reading is `symmetric`, gives `public_ip.no_ipv6` with `dockerBridge`, and with `--network host`
   `public_ip.symmetric` as before.
+- **As first run on CI's Linux runner** (the `local` engine), on the pull request that brought group 15 into `main`:
+  the step passed, with the allowed results `public_ip.none`, `dns.unverified`, `clock.ok` and `udp_buffers.low`.
+  The `local` list had been chosen by reasoning, not seen; that run is its proof (README §6 "Decided after group
+  15" (1)).
+- The step doesn't reach README F22's `dockerBridge` in the dashboard or the connection test (04 §7.7, §11.4): the
+  loopback `public_ip` decides `public_ip` first, so no smoke run has a bridge NAT that passes, and the step asks
+  neither endpoint. `TestDockerBridgeInServer` (04 §17), with a fake machine for doctor, is what holds that path
+  (README §6 "Decided after group 16" (4)).
 - "doctor reports ok in the Docker bridge and host setups" stays the manual pre-flight item 5 of 12.1, on a Linux
   host with a real public address: the step checks every code, but the smoke overrides can't give an all-ok report.
 - **Doctor's package is an input of the step.** `doctor_want` and `doctor_allowed` pin every check and its codes, so
   a pull request that changes doctor's checks or codes (`internal/server/ops/doctor`, the `go` filter alone) must
-  run docker-smoke, which a pull request runs only for the `docker`, `deploy` or `release` filters (8.2). Two things
-  see to it:
+  run docker-smoke, which a pull request runs only for the `docker`, `deploy` or `release` filters (8.2). One thing
+  covers part of it, and the rest is still missing:
   - `TestDockerSmokeExpectations` (`ops/doctor`, in `test-go` on every Go change) holds both lists to doctor:
     `doctor_want` names every check of `--list-checks` in its order, and every code either list names is one of
     doctor's codes and its check's; an allow-list entry is `local`, `vm` or `any`, one per check and engine. A pull
     request that adds or removes a check, or renames or removes a code the lists name, fails there until the script
     knows it, and that edit of `deploy/docker/**` runs docker-smoke on the same pull request.
-  - Which of its existing codes a check gives in the smoke's setup only the step can tell, so ci.yml's `changes`
-    job gets a filter `doctor` (`internal/server/ops/doctor/**`) that runs docker-smoke as well (README F21 listed
-    it for the integrator: ci.yml is S02's, and 8.2's table names the filter). Until it is there, such a change
+  - Which of its existing codes a check gives in the smoke's setup only the step can tell. README F21's own text of this
+    section named a filter `doctor` (`internal/server/ops/doctor/**`) in ci.yml's `changes` job, running docker-smoke as
+    well, as the integrator's to add (ci.yml is S02's, and the text said 8.2's table names the filter, which it
+    doesn't), but F21's report did not carry it among its blocked items, and the group 15 integration judged ci.yml
+    needed no change (its own pull request touched `deploy/docker/**`, which selects the job). Neither ci.yml nor 8.2's
+    list has the filter. Until a slice adds it (not scheduled; README §6 "Decided after group 15" (3)), such a change
     passes its own pull request and fails on the push to main and in nightly's `docker-multiarch`.
-
 ## 12. M1 exit test run book
 
 **Exit criterion (plan):** 5 friends finish a 2-hour session on a small VPS with no manual fixes; iPhone and Android
@@ -2808,8 +2822,11 @@ can watch.
      doctor`, record the output, then `docker compose -f compose.host.yaml down` and `sudo rm -rf /var/lib/isshoni`,
      the directory it created on the host as root, which `install.sh` would otherwise take over.
 
-   Both report ok. Docker Desktop on a Mac can't give this result (its user-space NAT makes `public_ip` symmetric),
-   nor can CI's docker-smoke with its test overrides (04 §13.2, §17).
+   Both report ok. Docker Desktop on a Mac can't give this result: since README F21 a bridge's symmetric NAT passes
+   (04 §13.2 rule (a)), but in the host setup the NAT is the VM's own and stays `public_ip.symmetric`, and the VM's
+   clock and UDP buffers warn. Nor can CI's docker-smoke, which since F21 asserts every check by its code in both
+   setups (11.3) but whose overrides have no public address (`127.0.0.1`, 04 §13.2 rule (b)) and a test name that
+   no DNS server knows (04 §13.2, §17).
 
 ### 12.2 Timeline
 
@@ -3012,7 +3029,7 @@ Anything beyond these, such as a reload, a second tap, a re-join or a second log
 | Unit | `tools/relserve` | `/latest` redirect format matches GitHub's; files served; the CA verifies |
 | Static | `lint-deploy` | shellcheck, shfmt, actionlint, `systemd-analyze verify`, the key block, `.tool-versions` = `go.mod` toolchain; through `test:sh`, the VM harness's check of the names it takes from `distro-test.sh` (`vm-test.sh -h`, 7.2) |
 | Integration | distro containers C1–C13 (11.2) | install, idempotency, upgrade, downgrade refusal, tamper refusal, port conflict, re-runs after exit 7 and exit 5, uninstall, purge, backup/restore |
-| Integration | Docker smoke (11.3) | bridge and host bind 443 as designed, healthcheck, setup-url via exec, persistence, backup (a `0600` file) → restore through `exec -T` with `--yes`, an IPv6 client seen as the bridge gateway (6.4), no-volume refusal, start with no `.env` |
+| Integration | Docker smoke (11.3) | bridge and host bind 443 as designed, healthcheck, setup-url via exec, persistence, backup (a `0600` file) → restore through `exec -T` with `--yes`, an IPv6 client seen as the bridge gateway (6.4), no-volume refusal, start with no `.env`; in bridge and host, `isshoni doctor --json` with every check asserted by its code and a named allow-list per engine (README F21) |
 | Integration | `goreleaser-check` | the asset names and archive contents of section 3 |
 | Integration | site | the build, nothing loaded from another origin (`check-site.mjs`, 10.1, README S82), and **anchor coverage**: `go test ./internal/server/ops/doctor -run TestDocsAnchors` (10.4: reads `docs/troubleshooting.md` and `docs/install/vps.md`; ids from the doctor registry, the `CloudProvider` constants and `web/src/conntest/codes.json`; as README S82 built it, it parses every non-test file of `internal/protocol/api` for the constants and also checks the fixed pages and anchors the product links to) |
 | E2E | `site.yml`'s `check` job (10.5) | the served `/install.sh` is the latest release's, once a release exists |
@@ -3292,3 +3309,24 @@ Decided after group 14 (engineering calls the owner delegated; README §6 "Decid
   `.dev/` or outside the checkout.
 - **A Linux container over a checkout set up on a Mac runs the root module's tests, not `tools/notices`'** (7.4;
   the group 14 integration): `.bin/go-licenses` is a darwin binary there.
+
+Decided after group 15 (engineering calls the owner delegated; README §6 "Decided after group 15" (1), (3)):
+
+- **docker-smoke asserts doctor per code, as README F21 built it** (11.3, 13). In the bridge and the host setup,
+  every check of `isshoni doctor --list-checks` has the code `doctor_want` names or one that `doctor_allowed` names
+  for the engine (`local`, `vm`, `any`), each entry with its reason in the script; the overrides put `smoke.test`
+  on `127.0.0.1` in the container's `/etc/hosts`, so `dns` reads alike on every machine. The `local` list was
+  chosen by reasoning, and the step's first run on CI's runner passed with it (`public_ip.none`, `dns.unverified`,
+  `clock.ok`, `udp_buffers.low`). The manual pre-flight item 5 of 12.1 stays.
+- **ci.yml has no `doctor` filter** (8.2, 11.3; review F21-R2). `TestDockerSmokeExpectations` holds the step's lists to
+  doctor's checks and codes on every Go change, but a pull request that changes only doctor doesn't run docker-smoke, so
+  a change of which existing code a check gives in the smoke's setup shows only on the push to `main` and in the
+  nightly. F21's own 11.3 text named the filter as the integrator's to add, but F21's report did not carry it among its
+  blocked items, and the group 15 integration judged ci.yml needed no change (its own pull request touched
+  `deploy/docker/**`); not scheduled.
+
+Decided after group 16 (an engineering call the owner delegated; README §6 "Decided after group 16" (6)):
+
+- **A toolchain patch for a vulnerability govulncheck reports is bumped at once**, outside the monthly bump of the
+  tool pins (7.1): go1.27.3 for GO-2026-6809 (`crypto/x509`, reachable from the server), with `go.mod`,
+  `tools/go.mod`, `tools/goreleaser/go.mod` and `.tool-versions` moved together, which `task lint:pins` checks.
