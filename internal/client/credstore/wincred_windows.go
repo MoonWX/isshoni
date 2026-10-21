@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -51,6 +52,11 @@ type credentialW struct {
 	TargetAlias        *uint16
 	UserName           *uint16
 }
+
+// credMu makes this process's Credential Manager calls one at a time. CredWriteW calls for different targets at once
+// lose writes: on windows-2025, one of eight goroutines' writes returned success and the credential was gone at
+// once, and stayed gone. The app writes a credential at sign-in and on token rotation, so serializing costs nothing.
+var credMu sync.Mutex
 
 // winStore is Open's Store on Windows.
 type winStore struct {
@@ -119,7 +125,9 @@ func (s *winStore) Delete(origin string) error {
 	if err != nil {
 		return err
 	}
+	credMu.Lock()
 	r, _, e := procCredDeleteW.Call(uintptr(unsafe.Pointer(target)), credTypeGeneric, 0)
+	credMu.Unlock()
 	if r == 0 {
 		if errors.Is(e, windows.ERROR_NOT_FOUND) {
 			return nil
@@ -134,6 +142,8 @@ func (s *winStore) List() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	credMu.Lock()
+	defer credMu.Unlock()
 	var count uint32
 	var list **credentialW
 	r, _, e := procCredEnumerateW.Call(uintptr(unsafe.Pointer(filter)), 0,
@@ -190,7 +200,9 @@ func (s *winStore) write(target, userName string, data []byte) error {
 		Persist:            credPersistLocalMachine,
 		UserName:           userW,
 	}
+	credMu.Lock()
 	r, _, e := procCredWriteW.Call(uintptr(unsafe.Pointer(cred)), 0)
+	credMu.Unlock()
 	runtime.KeepAlive(cred)
 	runtime.KeepAlive(data)
 	if r == 0 {
@@ -205,6 +217,8 @@ func (s *winStore) read(target string) (rawCredential, error) {
 	if err != nil {
 		return rawCredential{}, err
 	}
+	credMu.Lock()
+	defer credMu.Unlock()
 	var p *credentialW
 	r, _, e := procCredReadW.Call(uintptr(unsafe.Pointer(targetW)), credTypeGeneric, 0, uintptr(unsafe.Pointer(&p)))
 	if r == 0 {
