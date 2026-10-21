@@ -1304,7 +1304,7 @@ actionlint 1.<latest>
     (README F13), which pin the same digests and are bumped together.
 
   `.github/dependabot.yml`'s "Not covered here" comment names the same list.
-- `go.mod` has `go 1.26.0` and `toolchain go1.27.2`, the `.tool-versions` patch (the plan: language version 1.26,
+- `go.mod` has `go 1.26.0` and `toolchain go1.27.3`, the `.tool-versions` patch (the plan: language version 1.26,
   newest toolchain). The go line carries a patch because `golang.org/x/text`, `golang.org/x/crypto` and
   `modernc.org/sqlite` require `go 1.26.0`, so `go get` and `go mod tidy` write it that way; the language version is
   still 1.26. `tools/go.mod` has the same two lines. CI reads the version from `go.mod`, not from `.tool-versions`,
