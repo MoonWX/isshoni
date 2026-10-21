@@ -1,0 +1,62 @@
+{
+  "version": "0.3.0",
+  "uptimeS": 3600,
+  "origin": "https://watch.example.com",
+  "tls": {
+    "mode": "auto",
+    "names": [
+      "watch.example.com"
+    ],
+    "ready": true,
+    "notAfter": "2027-01-13T08:00:00.000Z",
+    "nextRenewal": "2026-12-14T08:00:00.000Z"
+  },
+  "publicIpv4": "203.0.113.7",
+  "publicIpv6": "",
+  "publicIpv4Method": "stun",
+  "publicIpv6Method": "none",
+  "localIpv4": "172.18.0.2",
+  "nat": "symmetric",
+  "dockerBridge": true,
+  "advertised": [
+    {
+      "proto": "udp",
+      "addr": "203.0.113.7:7882",
+      "via": "udp"
+    },
+    {
+      "proto": "tcp",
+      "addr": "203.0.113.7:443",
+      "via": "tcp443"
+    }
+  ],
+  "listeners": [
+    {
+      "key": "listen.https",
+      "network": "tcp",
+      "addr": "[::]:443"
+    },
+    {
+      "key": "listen.http",
+      "network": "tcp",
+      "addr": "[::]:80"
+    },
+    {
+      "key": "listen.ice_udp",
+      "network": "udp",
+      "addr": "172.18.0.2:7882"
+    },
+    {
+      "key": "listen.admin_socket",
+      "network": "unix",
+      "addr": "/run/isshoni/admin.sock"
+    }
+  ],
+  "udpRcvBufBytes": 425984,
+  "udpSndBufBytes": 425984,
+  "rooms": 0,
+  "participants": 0,
+  "shares": 0,
+  "schemaVersion": 1,
+  "startedAt": "2026-10-15T08:00:00.000Z"
+}

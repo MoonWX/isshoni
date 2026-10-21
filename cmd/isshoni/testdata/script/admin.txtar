@@ -107,6 +107,19 @@ exec isshoni admin status --json
 stdout '^\{"version":"0\.3\.0",.*"uptimeS":11520,.*"schemaVersion":7,.*"startedAt":"2026-09-29T10:00:00\.000Z"\}$'
 ! stderr .
 
+# In a Docker container on a bridge network doctor lets the symmetric NAT pass, and the status says so, with the
+# line doctor adds under public_ip (README F23); out of it the status is what it was.
+fakeserver set nat bridge
+exec isshoni admin status
+cmp stdout status-bridge.txt
+exec isshoni admin status --json
+stdout '"nat":"symmetric","dockerBridge":true,'
+fakeserver set nat none
+exec isshoni admin status
+cmp stdout status.txt
+exec isshoni admin status --json
+! stdout dockerBridge
+
 # A server that shuts down still tells its status; everything else is refused until it is back.
 fakeserver set shutting-down
 exec isshoni admin status
@@ -133,6 +146,18 @@ isshoni 0.3.0, up 3h12m (since 2026-09-29 10:00 UTC)
   site        https://203.0.113.7
   tls         ip: certificate ready, expires 2026-10-06
   public IP   203.0.113.7 (stun); NAT: none
+  listening   tcp [::]:443, unix /run/isshoni/admin.sock
+  media       udp 203.0.113.7:7882, tcp 203.0.113.7:443
+  live        1 room, 3 participants, 2 shares
+  database    schema 7
+  transfer    2026-09: 12.3 GB out, 0.4 GB in
+  update      0.3.1 is available (security release): https://github.com/MoonWX/isshoni/releases/tag/v0.3.1
+-- status-bridge.txt --
+isshoni 0.3.0, up 3h12m (since 2026-09-29 10:00 UTC)
+  site        https://203.0.113.7
+  tls         ip: certificate ready, expires 2026-10-06
+  public IP   203.0.113.7 (stun); NAT: symmetric
+              the container's bridge network gives each outgoing connection its own port (symmetric NAT), which doesn't matter here: friends reach the published ports
   listening   tcp [::]:443, unix /run/isshoni/admin.sock
   media       udp 203.0.113.7:7882, tcp 203.0.113.7:443
   live        1 room, 3 participants, 2 shares
