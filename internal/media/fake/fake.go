@@ -139,7 +139,12 @@ type stream struct {
 	bitrate   int    // bps, SetBitrate
 	index     uint32 // of the next frame or audio packet
 	next      int64  // capture ns of the next frame or audio packet
-	sinceKey  int    // frames since the last keyframe (video)
+	// base and baseIndex anchor a video stream's frame times: frame baseIndex is captured at base, and the frames
+	// after it follow at the stream's rate. Both are 0 (frame 0 at 0) unless a fake Engine re-initialized the layer
+	// at another rate on the same timeline (session.go).
+	base      int64
+	baseIndex uint32
+	sinceKey  int // frames since the last keyframe (video)
 	forceKey  bool
 	nextFlash int64
 	jitter    float64 // the last odd delta frame's jitter, which the next even one mirrors (Synthetic video)
@@ -342,6 +347,26 @@ func (s *Source) SetBitrate(layer string, bps int) {
 	}
 }
 
+// Now returns the Source's clock, the clock of Packet.CaptureNS: the nanoseconds since its first Next, minus the
+// time the 200 ms lag cap skipped (see Next). It is 0 before the first Next. Any goroutine may call it.
+func (s *Source) Now() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.started {
+		return 0
+	}
+	return int64(time.Since(s.origin))
+}
+
+// Origin returns the wall-clock instant of CaptureNS 0: the first Next, moved forward by every skip of the lag cap,
+// so Origin().Add(time.Duration(p.CaptureNS)) is when packet p was due (docs/m2/01-client-core.md §12.4). It is the
+// zero Time before the first Next. Any goroutine may call it.
+func (s *Source) Origin() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.origin
+}
+
 // Close makes Next return ErrClosed, also a Next that is waiting. It is idempotent and always returns nil.
 func (s *Source) Close() error {
 	s.closeOnce.Do(func() { close(s.closed) })
@@ -387,7 +412,7 @@ func (st *stream) videoFrame(flashEvery int64) Packet {
 		st.sinceKey++
 	}
 	st.index++
-	st.next = int64(st.index) * int64(time.Second) / int64(st.fps)
+	st.next = st.base + int64(st.index-st.baseIndex)*int64(time.Second)/int64(st.fps)
 	return Packet{Kind: Video, Layer: st.rid, Keyframe: key, CaptureNS: capture, Data: data}
 }
 
