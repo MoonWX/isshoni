@@ -65,7 +65,8 @@ func TestPacingRate(t *testing.T) {
 
 // TestPacerKeyframe: at 24 Mbit/s (an 8 Mbit/s full layer) a 300 KB keyframe's last packet leaves 55–70 ms after it
 // was taken from a full bucket, 95–110 ms after it from an empty one (a 120 KB keyframe went first), and the audio
-// written meanwhile is not delayed by more than 2 ms: it never waits behind video (§8.5, §14). Every packet leaves.
+// written meanwhile is not delayed by more than 2 ms: it never waits in the pacer's queue (§8.5, §14). Every packet
+// leaves.
 func TestPacerKeyframe(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -184,6 +185,49 @@ func TestPacerBackpressure(t *testing.T) {
 					pkts[i-1].hdr.SequenceNumber)
 			}
 		}
+	})
+}
+
+// TestPacerBackpressureAudio: audio comes from the same Source, so while the send loop waits for room it waits too,
+// but never longer than the queue takes to drain to PacingBacklog: (queued − PacingBacklog × rate)/rate. A 300 KB
+// keyframe at the 6 Mbit/s floor (no targets) is more than its 225 KB; every packet leaves.
+func TestPacerBackpressureAudio(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		script := []scripted{{pkt: videoFrame("f", 300_000, true)}}
+		const audio = 11
+		for i := range audio {
+			script = append(script, scripted{at: time.Duration(i) * 20 * time.Millisecond, pkt: audioPacket()})
+		}
+		b := newBench(newScriptSource(script), []string{"f"}, true, true)
+		start := time.Now()
+		b.run(t.Context())
+		time.Sleep(time.Second)
+		synctest.Wait()
+		b.stop()
+
+		var queued int
+		for _, w := range b.writers["f"].all() {
+			queued += w.hdr.MarshalSize() + w.n
+		}
+		backlog := float64(MinPacingRate) * PacingBacklog.Seconds() / 8
+		if float64(queued) <= backlog {
+			t.Fatalf("the keyframe is %d bytes on the wire, not more than the %v-byte backlog", queued, backlog)
+		}
+		bound := time.Duration((float64(queued) - backlog) * 8 / MinPacingRate * float64(time.Second))
+		got := b.writers[""].all()
+		if len(got) != audio || len(b.writers["f"].markers()) != 1 || b.p.Stats().Dropped != 0 {
+			t.Fatalf("%d audio packets and %d frames left, %d dropped; want %d, 1 and 0", len(got),
+				len(b.writers["f"].markers()), b.p.Stats().Dropped, audio)
+		}
+		var worst time.Duration
+		for i, a := range got {
+			late := a.at.Sub(start.Add(time.Duration(i) * 20 * time.Millisecond))
+			if late > bound {
+				t.Errorf("audio packet %d left %v late, more than the %v the backlog takes to drain", i, late, bound)
+			}
+			worst = max(worst, late)
+		}
+		t.Logf("audio waited up to %v behind a backlogged queue (bound %v)", worst, bound)
 	})
 }
 

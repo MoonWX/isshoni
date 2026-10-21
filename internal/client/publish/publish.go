@@ -44,8 +44,10 @@ type Source interface {
 // send a profile of another engine profile (EngineProfile; SetProfile, 02 §8.3), it switches the Source with
 // SetProfile(the engine profile), then asks it for a keyframe of every layer, and each layer goes on in the new
 // profile's payload type from the first keyframe of the new encoder: the first one whose SPS has the new profile_idc
-// (a Reinit keyframe of a native engine, or the first keyframe of sfutest.ProfileSource's new Source). A switch to the
-// SDP alias of what is sent (HighAlias and HighProfile) only changes the payload type, at the next keyframe.
+// (a Reinit keyframe of a native engine, or the first keyframe of sfutest.ProfileSource's new Source). When SetProfile
+// fails, the layers wait for that keyframe all the same, so the old profile's keyframes keep their payload type, and
+// the next answer that chooses the profile asks the Source again. A switch to the SDP alias of what is sent
+// (HighAlias and HighProfile) only changes the payload type, at the next keyframe.
 //
 // A Source that isn't a ProfileSource (a fake.Source has one profile) keeps its SPS: only the payload type changes,
 // at the next keyframe, which is what an SFU goes by, but a decoder would see through it.
@@ -93,11 +95,12 @@ type Options struct {
 	Logger *slog.Logger
 	// Pacing turns the video pacer on (docs/m2/01-client-core.md D8, §8.5): the video packets of all layers leave
 	// through one token bucket at max(PacingFactor × Σ active layer targets, MinPacingRate), PacingDepth deep and
-	// starting full, written by a goroutine of their own; audio is written at once, never behind video. While more
-	// than PacingBacklog of video waits, the send loop doesn't take the next packet from the Source; nothing is
-	// dropped. The core always sets it and calls SetPacingTargets with its initial targets before media flows. Off
-	// (the default), every packet is written when the Source hands it out, as in M1, so the load test, sfutest and
-	// M1's tests keep their behavior and numbers.
+	// starting full, written by a goroutine of their own; audio never waits in the pacer's queue, the send loop
+	// writes it when the Source hands it out. While more than PacingBacklog of video is queued, the send loop
+	// doesn't take the next packet from the Source, and since audio comes from the same Source, audio waits too, up
+	// to (queued − PacingBacklog × rate)/rate; nothing is dropped. The core always sets it and calls SetPacingTargets with
+	// its initial targets before media flows. Off (the default), every packet is written when the Source hands it
+	// out, as in M1, so the load test, sfutest and M1's tests keep their behavior and numbers.
 	Pacing bool
 }
 
@@ -216,7 +219,8 @@ type Publisher struct {
 	closed  bool
 	cancel  context.CancelFunc
 	// chosen is the profile the last answer chose (followAnswer), "" once the send loop has switched to it
-	// (applyProfile); encoding is the profile the Source encodes: Options.Profile, then the last one switched to.
+	// (applyProfile); encoding is the profile the Source encodes: Options.Profile, then the last one switched to (a
+	// SetProfile that failed switched nothing).
 	chosen, encoding string
 	wg               sync.WaitGroup
 }
@@ -598,7 +602,8 @@ func (p *Publisher) SetActive(layer string, active bool) error {
 }
 
 // SetPacingTargets gives a pacing Publisher (Options.Pacing) the bitrate targets the core last applied, in bit/s per
-// video layer (its rid), as the core does after every rate change (§8.5, §11.8). The pacing rate becomes
+// video layer (the Source's layer name, which is the rid in simulcast; a single layer has no rid), as the core does
+// after every rate change (§8.5, §11.8). The pacing rate becomes
 // max(PacingFactor × Σ targets of the layers SetActive left on, MinPacingRate), with a bucket PacingDepth deep at that
 // rate that keeps the tokens it has. Targets of layers the Publisher doesn't send (media.LayerAudio among them) and
 // negative ones count 0; the map is copied. Without Options.Pacing it changes nothing.
@@ -803,27 +808,33 @@ func (p *Publisher) pump(ctx context.Context) {
 // applyProfile switches the video to the profile the last answer chose, if it hasn't yet (followAnswer). The send
 // loop does it between two packets, so that no packet the Source made before the switch goes out after it: a
 // ProfileSource is switched first when the engine profile changes (EngineProfile), then each layer is set to go on in
-// the new profile's payload type from its next keyframe, which the Source is asked for: after a ProfileSource's
-// switch, from the first keyframe of the new profile_idc (track.switchesAt).
+// the new profile's payload type from its next keyframe, which the Source is asked for: after a ProfileSource was
+// asked for another engine profile, from the first keyframe of the new profile_idc (track.switchesAt).
+//
+// That wait holds when SetProfile fails too (the core's Session.Reconfigure can): the Source then goes on in its old
+// profile, and its keyframes keep the payload type that names what they are, while the core, which sees the error
+// itself, re-offers with the profile actually sent (§8.6). A failed switch leaves the profile the Source encodes as
+// it was, so the next answer that chooses the new profile asks the Source again.
 func (p *Publisher) applyProfile() {
 	p.mu.Lock()
 	profile, encoding := p.chosen, p.encoding
 	p.chosen = ""
-	if profile != "" {
-		p.encoding = profile
-	}
 	p.mu.Unlock()
 	if profile == "" {
 		return
 	}
 	var idc byte // the profile_idc of the keyframe each layer switches at; 0: its next keyframe
+	encodes := profile
 	if ps, ok := p.src.(ProfileSource); ok && EngineProfile(profile) != EngineProfile(encoding) {
+		idc = profileIDC(profile)
 		if err := ps.SetProfile(EngineProfile(profile)); err != nil {
 			p.log.Warn("publish: the source did not switch profiles", "profile", profile, "err", err)
-		} else {
-			idc = profileIDC(profile)
+			encodes = encoding
 		}
 	}
+	p.mu.Lock()
+	p.encoding = encodes
+	p.mu.Unlock()
 	switched := false
 	for _, t := range p.video {
 		switched = t.switchWhen(profile, idc) || switched

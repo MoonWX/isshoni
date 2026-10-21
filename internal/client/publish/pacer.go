@@ -35,8 +35,11 @@ func pacingRate(targets map[string]int, active []string) int64 {
 // pacer writes a Publisher's video (Options.Pacing, D8): the send loop queues each frame's packets (push), and the
 // pacer's goroutine (run) writes them in order through one token bucket for all layers, so that a keyframe doesn't
 // hit the user's router as a line-rate burst. Audio never goes through it: the send loop writes audio itself, so it
-// never waits behind video. The pacer drops nothing: the send loop waits (waitRoom) while the queue holds more than
-// PacingBacklog at the pacing rate, and dropping whole frames is the core's pump's job (§11.5).
+// never waits in the queue. The pacer drops nothing: the send loop waits (waitRoom) while the queue holds more than
+// PacingBacklog at the pacing rate, and dropping whole frames is the core's pump's job (§11.5). Audio comes from the
+// same Source.Next, so while the send loop waits audio waits as well, at most (queued − PacingBacklog × rate)/rate.
+// That needs more queued video than PacingBacklog at the pacing rate (225 KB at the 6 Mbit/s floor, 900 KB at
+// 24 Mbit/s): a keyframe larger than that, or video that comes faster than the pacing rate for a while.
 type pacer struct {
 	clock Clock // the Publisher's Source as a Clock, or nil: for CaptureToSend
 

@@ -1,6 +1,8 @@
 package publish
 
 import (
+	"errors"
+	"log/slog"
 	"slices"
 	"testing"
 
@@ -149,6 +151,48 @@ func TestAliasAndReinitSwitch(t *testing.T) {
 	if got := pts(); !slices.Equal(got, []uint8{98}) || len(rec.profiles) != 2 {
 		t.Errorf("a plain Source: payload types %v, SetProfile calls %v", got, rec.profiles)
 	}
+
+	// A ProfileSource whose SetProfile fails (the core's Session.Reconfigure can) goes on in High: its keyframes,
+	// the Reinit one too, stay on 96, since the layer waits for a CB keyframe all the same. The next answer that
+	// chooses 42e0 asks the Source again; going back to 6400 (the core re-offers with the profile actually sent,
+	// §8.6) needs no SetProfile and switches nothing.
+	failing := failingSource{&profileSource{Source: newSource(t)}}
+	fp, err := New(Options{
+		Source: failing, Layers: []string{"f"}, Profile: "6400", Profiles: []string{"42e0"},
+		Logger: slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fp.Close()
+	w = &recWriter{}
+	tr = fp.video[0]
+	tr.b = &binding{w: w, pt: videoPT}
+	fp.chosen = "42e0"
+	fp.applyProfile()
+	write(frame(true, false, 0x64), frame(false, false, 0), frame(true, true, 0x64), frame(false, false, 0))
+	if got := pts(); !slices.Equal(got, []uint8{96}) {
+		t.Errorf("after a failed SetProfile: payload types %v, want 96 for the High keyframes", got)
+	}
+	fp.chosen = "42e0"
+	fp.applyProfile()
+	if want := []string{"42e0", "42e0"}; !slices.Equal(failing.profiles, want) {
+		t.Errorf("SetProfile calls %v, want %v: a failed switch is tried again", failing.profiles, want)
+	}
+	fp.chosen = "6400"
+	fp.applyProfile()
+	write(frame(true, false, 0x64), frame(false, false, 0))
+	if got := pts(); !slices.Equal(got, []uint8{96}) || len(failing.profiles) != 2 {
+		t.Errorf("back to 6400: payload types %v, SetProfile calls %v; want 96 and none more", got, failing.profiles)
+	}
+}
+
+// failingSource is a ProfileSource whose SetProfile records the call and fails: the Source goes on in its profile.
+type failingSource struct{ *profileSource }
+
+func (s failingSource) SetProfile(profile string) error {
+	_ = s.profileSource.SetProfile(profile)
+	return errors.New("reconfigure failed")
 }
 
 // FuzzSPSProfileIDC: whatever the bytes, the scan doesn't panic, and what it finds is the byte after an SPS NAL

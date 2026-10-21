@@ -41,11 +41,12 @@ type track struct {
 	mu sync.Mutex // guards the fields below
 	b  *binding
 	// profile is the H.264 profile key the video goes out in: Options.Profile until Bind chooses, then what the
-	// negotiation chose. next is the one it switches to with its next keyframe (switchTo), "" while it stays.
+	// negotiation chose. next is the one it switches to at a coming keyframe (switchWhen), "" while it stays.
 	profile, next string
 	// nextIDC is, while a switch waits, the profile_idc its keyframe must have, or 0 when any keyframe will do. The
-	// Publisher sets it when it switched its ProfileSource to another engine profile (applyProfile): a keyframe that
-	// the encoder made before the switch, still on its way, must not go out on the new payload type (switchesAt).
+	// Publisher sets it when it asked its ProfileSource for another engine profile, whether or not SetProfile
+	// succeeded (applyProfile): a keyframe that the old encoder made, still on its way or because the switch failed,
+	// must not go out on the new payload type (switchesAt).
 	nextIDC byte
 	// inactive: SetActive turned the video layer off, and it sends nothing. resuming: it was turned on again and
 	// sends nothing until its next keyframe (admit).
@@ -129,11 +130,9 @@ func (t *track) Bind(ctx webrtc.TrackLocalContext) (webrtc.RTPCodecParameters, e
 	return webrtc.RTPCodecParameters{}, webrtc.ErrUnsupportedCodec
 }
 
-// switchTo has the video track go on in another of the Publisher's profiles from its next keyframe (write), and
-// reports whether it will switch: false when it sends that profile already, or isn't bound.
-func (t *track) switchTo(profile string) bool { return t.switchWhen(profile, 0) }
-
-// switchWhen is switchTo for a switch that waits for a keyframe whose SPS has profile_idc idc (0: any keyframe).
+// switchWhen has the video track go on in another of the Publisher's profiles from a coming keyframe (packetize):
+// its next one when idc is 0, else the first whose SPS has profile_idc idc (switchesAt). It reports whether it will
+// switch: false when it sends that profile already, or isn't bound.
 func (t *track) switchWhen(profile string, idc byte) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -161,7 +160,7 @@ func (t *track) switchesAt(pkt media.Packet) bool {
 	return pkt.Reinit
 }
 
-// switchLocked makes the profile that switchTo set the one the track sends: a new binding with that profile's
+// switchLocked makes the profile that switchWhen set the one the track sends: a new binding with that profile's
 // payload type, and its RTX payload type when the track has an RTX stream. Repairs of packets sent before go out
 // with the new payload types too. t.mu is held.
 func (t *track) switchLocked() {
@@ -238,17 +237,6 @@ type outFrame struct {
 	// What writing it did, filled in by its writer.
 	errs           int
 	copied, padded uint64
-}
-
-// write packetizes and writes one Source packet with RTP timestamp tsBase + ticks and the sender-report NTP time of
-// its capture, without a Clock. It returns false when the track isn't bound. Only the send loop calls it.
-func (t *track) write(pkt media.Packet, ticks uint32, ntp uint64) bool {
-	f := t.packetize(pkt, ticks, ntp)
-	if f == nil {
-		return false
-	}
-	t.writeFrame(f, nil)
-	return true
 }
 
 // packetize turns one Source packet into its RTP packets, with RTP timestamp tsBase + ticks and the sender-report NTP

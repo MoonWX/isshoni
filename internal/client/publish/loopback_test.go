@@ -2,6 +2,9 @@ package publish
 
 import (
 	"context"
+	"encoding/binary"
+	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,8 +22,11 @@ import (
 
 // receiver is the far end of a Publisher's PeerConnection: a Pion PeerConnection without interceptors, so that it
 // asks for no repair and sends no report on its own, that takes H.264 6400 (with NACK feedback, so the Publisher's
-// responder keeps the stream), and records what arrives. Its SRTP replay protection is off: Pion's 64-packet window
-// would drop a plain retransmission of a packet that far back before the test could see it arrive.
+// responder keeps the stream), and records what arrives. Its socket loses one chosen RTP packet (lossyConn), so that
+// a NACK asks for a packet that really is missing. Its SRTP replay window is NACKResponderSize packets: a plain
+// retransmission reuses the lost packet's SRTP index, which Pion's default window of 64 rejects once 64 newer packets
+// of the stream arrived. Every receiver of a native publisher's repairs needs a window that large, the SFU's pub PCs
+// included (D7: no RTX, so a repair is the packet again with its own sequence number).
 type receiver struct {
 	pc *webrtc.PeerConnection
 
@@ -36,8 +42,36 @@ type srArrival struct {
 	at time.Time
 }
 
-func newReceiver(t *testing.T) *receiver {
+// lossyConn is the receiver's UDP socket: it loses the first RTP datagram with sequence number drop, as a network
+// would. The RTP header of an SRTP packet is in the clear.
+type lossyConn struct {
+	net.PacketConn
+	drop    uint16
+	dropped atomic.Bool
+}
+
+func (c *lossyConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	for {
+		n, addr, err := c.PacketConn.ReadFrom(b)
+		// RTP, not RTCP (RFC 5761 §4: RTCP packet types 192–223 in the second byte), with that sequence number.
+		rtpPkt := err == nil && n >= 12 && b[0]>>6 == 2 && (b[1] < 192 || b[1] > 223)
+		if rtpPkt && binary.BigEndian.Uint16(b[2:4]) == c.drop && c.dropped.CompareAndSwap(false, true) {
+			continue
+		}
+		return n, addr, err
+	}
+}
+
+// newReceiver returns a receiver whose socket loses the RTP packet with sequence number drop.
+func newReceiver(t *testing.T, drop uint16) (*receiver, *lossyConn) {
 	t.Helper()
+	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &lossyConn{PacketConn: udp, drop: drop}
+	mux := webrtc.NewICEUDPMux(nil, conn)
+	t.Cleanup(func() { _ = mux.Close() })
 	m := &webrtc.MediaEngine{}
 	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
@@ -52,7 +86,8 @@ func newReceiver(t *testing.T) *receiver {
 		t.Fatal(err)
 	}
 	se := loopbackSettings()
-	se.DisableSRTPReplayProtection(true)
+	se.SetICEUDPMux(mux)
+	se.SetSRTPReplayProtectionWindow(NACKResponderSize)
 	pc, err := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithSettingEngine(se),
 		webrtc.WithInterceptorRegistry(&interceptor.Registry{})).NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
@@ -91,7 +126,7 @@ func newReceiver(t *testing.T) *receiver {
 			}
 		}()
 	})
-	return r
+	return r, conn
 }
 
 // connect negotiates the Publisher with the receiver, the Publisher offering, and starts it.
@@ -178,10 +213,11 @@ func waitFor(t *testing.T, d time.Duration, what string, cond func() bool) {
 	}
 }
 
-// TestNACKAndRTT runs a Publisher against a real PeerConnection: a NACK for the packet 3000 before the newest is
-// answered with that packet again, which Pion's NACK responder can only do with NACKResponderSize (4096) packets
-// kept (D7, §8.4; Pion's default of 1024 couldn't); and a receiver report crafted from a sender report the receiver
-// got, with the delay it held it as DLSR, gives the Publisher a loopback RTT (§8.7). With and without pacing.
+// TestNACKAndRTT runs a Publisher against a real PeerConnection: the receiver's socket loses the packet 3000 before
+// the newest, and a NACK for it is answered with that packet again, which Pion's NACK responder can only do with
+// NACKResponderSize (4096) packets kept (D7, §8.4; Pion's default of 1024 couldn't), and which gets through an SRTP
+// replay window of that size; and a receiver report crafted from a sender report the receiver got, with the delay
+// it held it as DLSR, gives the Publisher a loopback RTT (§8.7). With and without pacing.
 func TestNACKAndRTT(t *testing.T) {
 	for _, pacing := range []bool{false, true} {
 		name := "unpaced"
@@ -189,7 +225,7 @@ func TestNACKAndRTT(t *testing.T) {
 			name = "paced"
 		}
 		t.Run(name, func(t *testing.T) {
-			const n = 3100
+			const n, back = 3100, 3000
 			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 			defer cancel()
 			p, err := New(Options{Source: &burstSource{n: n}, Layers: []string{"f"}, Settings: loopbackSettings(), Pacing: pacing})
@@ -197,7 +233,10 @@ func TestNACKAndRTT(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer p.Close()
-			r := newReceiver(t)
+			// Every frame is one RTP packet, so the last one has sequence number base + n − 1; the receiver loses
+			// the one 3000 before it. The send loop hasn't started: the base is safe to read.
+			target := p.video[0].seq + n - 1 - back
+			r, conn := newReceiver(t, target)
 			r.connect(ctx, t, p)
 
 			// Once the burst is written and nothing more arrives for 200 ms, the newest arrival is the last packet
@@ -216,8 +255,12 @@ func TestNACKAndRTT(t *testing.T) {
 			if len(seqs) < n/2 {
 				t.Fatalf("%d of %d packets arrived", len(seqs), n)
 			}
-			newest := seqs[len(seqs)-1]
-			target := newest - 3000
+			if !conn.dropped.Load() || slices.Contains(seqs, target) {
+				t.Fatalf("the packet %d back was not lost (lost: %v)", back, conn.dropped.Load())
+			}
+			if newest := seqs[len(seqs)-1]; newest-target < back-100 {
+				t.Fatalf("the newest packet that arrived is only %d after the lost one", newest-target)
+			}
 			before := len(seqs)
 			nack := &rtcp.TransportLayerNack{SenderSSRC: 1, MediaSSRC: ssrc, Nacks: []rtcp.NackPair{{PacketID: target}}}
 			if err := r.pc.WriteRTCP([]rtcp.Packet{nack}); err != nil {

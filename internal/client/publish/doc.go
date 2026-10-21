@@ -29,9 +29,10 @@
 //
 // M2 adds, for the core (01 §8): Options.Pacing, a token bucket for all video layers at
 // max(3 × Σ the targets SetPacingTargets gives, 6 Mbit/s), 40 ms deep, written by a goroutine of its own (pacer.go),
-// which never delays audio and never drops: the send loop stops taking packets while 300 ms of video waits. And the
-// live numbers of TrackStats (stats.go): Bitrate and FPS over 2 s, CaptureToSend over 10 s (with a Clock), and the
-// RTT from the SFU's receiver reports. A packet of media.KindEvent or media.KindPCM is dropped and counted.
+// which drops nothing. Audio never waits in its queue, but while more than 300 ms of video is queued the send loop
+// takes nothing from the Source, so audio waits too, until the queue is down to 300 ms. And the live numbers of
+// TrackStats (stats.go): Bitrate and FPS over 2 s, CaptureToSend over 10 s (with a Clock), and the RTT from the SFU's
+// receiver reports. A packet of media.KindEvent or media.KindPCM is dropped and counted.
 //
 // The SFU's REMBs (02 §11: the admin's cap) are only counted in Stats; rate control is the core's (internal/client/
 // ratectl). SetActive turns a video layer off and on again, which is what a browser sharer does with the active flags
