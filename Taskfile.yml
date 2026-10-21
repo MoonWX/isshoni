@@ -674,6 +674,11 @@ tasks:
             [ -f .deps/.gitignore ] || printf '%s\n' '# Fetched by the native and ffmpeg tasks (Taskfile.yml).' '*' >.deps/.gitignore
           }
           dir='{{.VCPKG_DIR}}'
+          # A relative VCPKG_DIR is the repository's: the presets read $VCPKG_ROOT from native/ and its build tree.
+          case $dir in
+          /*) ;;
+          *) dir='{{.ROOT_DIR}}'/${dir#./} ;;
+          esac
           case $dir in '{{.ROOT_DIR}}/.deps/'*) deps ;; esac
           # vcpkg's binary packages go to .deps/ too, not to ~/.cache/vcpkg, unless the caller chose a binary cache
           # (CI's native-host does).
@@ -750,9 +755,12 @@ tasks:
     env:
       MSYS2_ROOT: '{{.MSYS2_ROOT}}'
       # Step 1 of docs/m2/06 §4.3, in Windows PowerShell 5.1 (every Windows 10 and 11 has it): download each
-      # pins.json URL into .deps/ffmpeg-build/src/ (3 tries) and fail unless its SHA-256 matches; then the MSVC
-      # environment step, dot-sourced so it sets up this PowerShell process (docs/m2/06 §3); then build.sh in MSYS2's
-      # bash with that environment inherited (steps 2-7). Passed through the environment, so no file is written.
+      # pins.json URL into .deps/ffmpeg-build/src/ (3 tries) under the name native/ffmpeg/build.sh gives it there
+      # (<project>-<version or tag>.tar.*, so build.sh reuses the file and downloads nothing twice) and fail unless its
+      # SHA-256 matches; then the MSVC environment step (docs/m2/06 §3), run as a script, not dot-sourced, and failing
+      # the task on a nonzero exit code; the variables it sets are process-wide, so build.sh in MSYS2's bash inherits
+      # them (steps 2-7) and gets the same work directory with -w. Passed through the environment, so no file is
+      # written.
       ISSHONI_FFMPEG_BUILD_PS1: |
         $ErrorActionPreference = 'Stop'
         Set-StrictMode -Version 3.0
@@ -767,12 +775,24 @@ tasks:
           Set-Content -LiteralPath $ignore -Encoding Ascii -Value @('# Fetched by the native and ffmpeg tasks (Taskfile.yml).', '*')
         }
         $pins = Get-Content -Raw -Path (Join-Path $root 'native\ffmpeg\pins.json') | ConvertFrom-Json
-        foreach ($name in @('ffmpeg', 'nvCodecHeaders', 'amfHeaders', 'libvpl')) {
+        # Each pins.json entry: the field that names its release and build.sh's file name for its tarball.
+        $tarballs = [ordered]@{
+          ffmpeg         = @('version', 'ffmpeg-{0}.tar.xz')
+          nvCodecHeaders = @('tag', 'nv-codec-headers-{0}.tar.gz')
+          amfHeaders     = @('tag', 'AMF-headers-{0}.tar.gz')
+          libvpl         = @('tag', 'libvpl-{0}.tar.gz')
+        }
+        foreach ($name in $tarballs.Keys) {
           $entry = $pins.PSObject.Properties[$name]
           if ($null -eq $entry) { throw "ffmpeg:build: native/ffmpeg/pins.json has no $name entry" }
+          $field, $format = $tarballs[$name]
+          $release = $entry.Value.PSObject.Properties[$field]
+          if ($null -eq $release -or [string]::IsNullOrEmpty([string]$release.Value)) {
+            throw "ffmpeg:build: native/ffmpeg/pins.json has no $name.$field"
+          }
           $url = [string]$entry.Value.url
           $want = ([string]$entry.Value.sha256).ToLowerInvariant()
-          $file = Join-Path $src ([IO.Path]::GetFileName(([Uri]$url).AbsolutePath))
+          $file = Join-Path $src ($format -f [string]$release.Value)
           for ($try = 1; $true; $try++) {
             if (Test-Path -LiteralPath $file) {
               $got = (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant()
@@ -786,16 +806,18 @@ tasks:
             try { Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $file } catch { Write-Host "ffmpeg:build: $($_.Exception.Message)" }
           }
         }
-        . (Join-Path $root 'deploy\windows\msvc-env.ps1')
+        # The script reports a missing VS instance, toolset or SDK with a nonzero exit code, not an exception.
+        $global:LASTEXITCODE = 0
+        & (Join-Path $root 'deploy\windows\msvc-env.ps1')
+        if ($LASTEXITCODE -ne 0) { throw "ffmpeg:build: deploy/windows/msvc-env.ps1 failed (exit code $LASTEXITCODE)" }
         $bash = Join-Path $env:MSYS2_ROOT 'usr\bin\bash.exe'
         if (-not (Test-Path -LiteralPath $bash)) { throw "ffmpeg:build: no MSYS2 bash at $bash (install MSYS2, or set MSYS2_ROOT)" }
         $env:MSYS2_PATH_TYPE = 'inherit'
         $env:CHERE_INVOKING = '1'
-        $env:WORK = $work
         $env:SOURCE_DATE_EPOCH = (& git log -1 --format=%ct).Trim()
         # The exit code decides: Windows PowerShell 5.1 can turn a native program's stderr into errors under 'Stop'.
         $ErrorActionPreference = 'Continue'
-        & $bash -lc 'native/ffmpeg/build.sh'
+        & $bash -lc 'native/ffmpeg/build.sh -w .deps/ffmpeg-build'
         if ($LASTEXITCODE -ne 0) { throw "ffmpeg:build: native/ffmpeg/build.sh failed (exit code $LASTEXITCODE)" }
     cmds:
       - cmd: "echo 'ffmpeg:build: skipped, FFmpeg builds with MSVC on Windows only: run it on a Windows PC, or use ffmpeg.yml (task ffmpeg:fetch downloads the locked build)'"

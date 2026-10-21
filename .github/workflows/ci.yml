@@ -1387,11 +1387,14 @@ jobs:
 
   windows-go:
     # The Go packages of the Windows app that need no engine DLL, on Windows (M2 06 §10.1): the
-    # client core, the updater and the media packages with the fake engine, first with the race
-    # detector, which needs cgo and so the image's MinGW-w64 gcc (as the nightly's go-cross-os),
-    # then with CGO_ENABLED=0, the mode the app ships in. The engine DLL's tests skip without
-    # ISSHONI_TEST_ENGINE_DLL; windows-desktop runs them with the DLL. Patterns whose package does
-    # not exist yet (internal/update before README WA25) are left out.
+    # client core, the updater, the media packages with the fake engine and the app's own
+    # packages (internal/desktop/..., cmd/isshoni-desktop/...), first with the race detector,
+    # which needs cgo and so the image's MinGW-w64 gcc (as the nightly's go-cross-os), then with
+    # CGO_ENABLED=0, the mode the app ships in. Every Go test on Windows runs here except the
+    # engine DLL's (README §3 item 11, 06 §10.1's windows-desktop row, 03 §22): those skip without
+    # ISSHONI_TEST_ENGINE_DLL, and windows-desktop runs them with the DLL. A directory that holds
+    # no Go file yet (internal/update before README WA25, cmd/isshoni-desktop before WA22) is
+    # left out.
     needs: changes
     if: needs.changes.outputs.run-windows-go == 'true'
     runs-on: windows-2025
@@ -1448,10 +1451,12 @@ jobs:
       - name: The packages to test
         id: pkgs
         run: |
-          # A pattern counts once its directory exists; go test fails on a pattern that matches
-          # nothing in the module.
-          $race = @('internal/client', 'internal/update', 'internal/media') | Where-Object { Test-Path $_ } | ForEach-Object { "./$_/..." }
-          $nocgo = @('internal/client', 'internal/update') | Where-Object { Test-Path $_ } | ForEach-Object { "./$_/..." }
+          # A pattern counts once its directory holds a Go file; go test fails on a pattern that
+          # matches no package. A directory alone is not enough: cmd/isshoni-desktop can hold only
+          # build/windows/ (README WA22).
+          $hasGo = { param($dir) [bool](Get-ChildItem -LiteralPath $dir -Recurse -File -Filter *.go -ErrorAction SilentlyContinue | Select-Object -First 1) }
+          $race = @('internal/client', 'internal/update', 'internal/media', 'internal/desktop', 'cmd/isshoni-desktop') | Where-Object { & $hasGo $_ } | ForEach-Object { "./$_/..." }
+          $nocgo = @('internal/client', 'internal/update', 'internal/desktop', 'cmd/isshoni-desktop') | Where-Object { & $hasGo $_ } | ForEach-Object { "./$_/..." }
           "race=$($race -join ' ')" >> $env:GITHUB_OUTPUT
           "nocgo=$($nocgo -join ' ')" >> $env:GITHUB_OUTPUT
           "go test -race: $($race -join ' ')"
@@ -1482,9 +1487,9 @@ jobs:
 
   desktop-macos:
     # The Windows app's Go packages on macOS (M2 06 §10.1): the client core, the media packages,
-    # the updater and the app's own packages with the race detector, then the darwin app itself
-    # (cgo, the fake engine until M3) once cmd/isshoni-desktop exists (README WA22). Packages
-    # that do not exist yet are left out.
+    # the updater and the app's own packages (internal/desktop/..., cmd/isshoni-desktop/...) with
+    # the race detector, then the darwin app itself (cgo, the fake engine until M3) once
+    # cmd/isshoni-desktop exists (README WA22). Packages that do not exist yet are left out.
     needs: changes
     if: needs.changes.outputs.run-desktop-macos == 'true'
     runs-on: macos-15
@@ -1512,9 +1517,12 @@ jobs:
 
       - name: go test -race (client core, media, updater, the app's packages)
         run: |
+          # A pattern counts once its directory holds a Go file: cmd/isshoni-desktop can hold only
+          # build/windows/ (README WA22). Here, darwin with cgo, the app's main package is the real
+          # one (03 §4.5, D18), which ubuntu's test-go never builds.
           pkgs=()
-          for dir in internal/client internal/media internal/update internal/desktop; do
-            if [ -d "$dir" ]; then pkgs+=("./$dir/..."); fi
+          for dir in internal/client internal/media internal/update internal/desktop cmd/isshoni-desktop; do
+            if [ -n "$(find "$dir" -name '*.go' -type f 2>/dev/null | head -n 1)" ]; then pkgs+=("./$dir/..."); fi
           done
           echo "go test -race ${pkgs[*]}"
           go test -race -count=1 -timeout 15m "${pkgs[@]}"
