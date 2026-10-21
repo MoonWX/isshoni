@@ -3,13 +3,15 @@
 // parsed); null and invalid arguments return their documented codes, with the 04 §5.7 token where one applies;
 // struct_size below the v1.0 size is IM_ERR_ABI and above it is accepted; calls before im_init are not_initialized;
 // JSON outputs follow snprintf; im_clock is monotonic and near the system time; im_abi_layout equals the golden file;
-// a stalled engine worker makes a posted call return IM_ERR_TIMEOUT (engine_timeout) after its bound + 1 s; a refused
-// audio argument never reaches the AudioEngine (README §3 item 15).
+// a stalled engine worker makes a posted call return IM_ERR_TIMEOUT (engine_timeout) after its bound + 1 s and leaves
+// its output alone; a refused audio argument never reaches the AudioEngine (README §3 item 15); a failed
+// AudioEngine::Init doesn't fail im_init, and one that finishes after im_init gave up is shut down by the worker.
 //
 // The test links the engine's objects (im_engine), so it can reach the worker and the AudioEngine override directly.
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -259,6 +261,11 @@ TEST(Exports, InitChecksItsArguments) {
   p = InitParams();
   p.openh264_path = "openh264-2.6.0-win64.dll";
   EXPECT_TRUE(Fails(im_init(&p), IM_ERR_INVALID_ARG, nullptr, "openh264_path"));
+  for (const uint32_t level : {IM_LOG_DEBUG + 1, 0xFFFFFFFFu}) {
+    p = InitParams();
+    p.log_level = level;
+    EXPECT_TRUE(Fails(im_init(&p), IM_ERR_INVALID_ARG, nullptr, "log_level")) << level;
+  }
   EXPECT_FALSE(im::engine::Initialized()) << "a refused im_init left the engine initialized";
 }
 
@@ -624,6 +631,16 @@ TEST_F(Engine, OtherArgumentsAreChecked) {
   EXPECT_TRUE(Fails(im_request_keyframe(1, IM_MAX_LAYERS), IM_ERR_INVALID_ARG, nullptr, "layer"));
   EXPECT_TRUE(Fails(im_set_bitrate(1, IM_ALL_LAYERS, 1000000), IM_ERR_INVALID_ARG, nullptr, "layer"));
   EXPECT_TRUE(Fails(im_set_bitrate(1, IM_NO_LAYER, 1000000), IM_ERR_INVALID_ARG, nullptr, "layer"));
+  // 04 §6.4's ranges (§9.5): layer 0 100 kbps..50 Mbps, the other layers 50 kbps..2 Mbps; 0 is no bitrate.
+  for (const uint32_t bps : {0u, 99999u, 50000001u, 0xFFFFFFFFu}) {
+    EXPECT_TRUE(Fails(im_set_bitrate(1, 0, bps), IM_ERR_INVALID_ARG, nullptr, "bps")) << "layer 0, " << bps;
+  }
+  for (const uint32_t upper_layer : {1u, 2u}) {
+    for (const uint32_t bps : {0u, 49999u, 2000001u}) {
+      EXPECT_TRUE(Fails(im_set_bitrate(1, upper_layer, bps), IM_ERR_INVALID_ARG, nullptr, "bps"))
+          << "layer " << upper_layer << ", " << bps;
+    }
+  }
   EXPECT_TRUE(Fails(im_set_layer_active(1, 3, 1), IM_ERR_INVALID_ARG, nullptr, "layer"));
   EXPECT_TRUE(Fails(im_set_layer_active(1, 0, 2), IM_ERR_INVALID_ARG, nullptr, "active"));
   im_layer_config layer = LayerConfig();
@@ -652,6 +669,12 @@ TEST_F(Engine, UnknownSessionHandlesAreInvalid) {
     EXPECT_TRUE(Fails(im_next_packet(s, 0, &pkt), IM_ERR_INVALID_ARG)) << s;
     EXPECT_TRUE(Fails(im_request_keyframe(s, IM_ALL_LAYERS), IM_ERR_INVALID_ARG)) << s;
     EXPECT_TRUE(Fails(im_set_bitrate(s, 0, 4000000), IM_ERR_INVALID_ARG)) << s;
+    // The ends of 04 §6.4's ranges pass the check and reach the session area, which refuses the handle.
+    const std::pair<uint32_t, uint32_t> range_ends[] = {{0u, 100000u}, {0u, 50000000u}, {1u, 50000u}, {2u, 2000000u}};
+    for (const auto &end : range_ends) {
+      EXPECT_TRUE(Fails(im_set_bitrate(s, end.first, end.second), IM_ERR_INVALID_ARG)) << s;
+      EXPECT_EQ(LastError().find("bps"), std::string::npos) << "layer " << end.first << ", " << end.second;
+    }
     EXPECT_TRUE(Fails(im_set_layer_active(s, 1, 0), IM_ERR_INVALID_ARG)) << s;
     EXPECT_TRUE(Fails(im_update_layer(s, 1, &layer), IM_ERR_INVALID_ARG)) << s;
     EXPECT_TRUE(Fails(im_set_profile(s, IM_PROFILE_CB), IM_ERR_INVALID_ARG)) << s;
@@ -765,6 +788,27 @@ TEST(Exports, BuildInfoFfmpegDirIsRelative) {
   EXPECT_NE(doc.find("\"dir\":\"ffmpeg/bin\""), std::string::npos) << doc;
   EXPECT_EQ(doc.find(module_dir), std::string::npos) << "the absolute path leaked into " << doc;
 }
+
+TEST(Exports, BuildInfoFfmpegDirOutsideTheDllFolderIsNull) {
+  im_shutdown();
+  const std::string module_dir = im::engine::os::ModuleDirectory();
+  ASSERT_FALSE(module_dir.empty());
+  const std::size_t sep = module_dir.find_last_of("\\/");
+  ASSERT_NE(sep, std::string::npos);
+  // A sibling of the DLL's folder: neither its name nor a ".." may reach the document.
+  const std::string ffmpeg_dir = module_dir.substr(0, sep) + "\\im-other-ffmpeg";
+  im_init_params p = InitParams();
+  p.ffmpeg_dir = ffmpeg_dir.c_str();
+  ASSERT_EQ(im_init(&p), IM_OK) << LastError();
+  std::vector<char> buf(4096);
+  const int32_t n = im_build_info(buf.data(), static_cast<int32_t>(buf.size()));
+  im_shutdown();
+  ASSERT_GT(n, 0);
+  const std::string doc(buf.data(), static_cast<std::size_t>(n));
+  EXPECT_NE(doc.find("\"dir\":null"), std::string::npos) << doc;
+  EXPECT_EQ(doc.find("im-other-ffmpeg"), std::string::npos) << "a folder outside the DLL's leaked into " << doc;
+  EXPECT_EQ(doc.find(".."), std::string::npos) << doc;
+}
 #endif
 
 // ---------------------------------------------------------------------------------------------- im_clock
@@ -832,10 +876,15 @@ TEST_F(Engine, StalledWorkerGivesEngineTimeout) {
   EXPECT_GE(waited, 1000);
   EXPECT_LT(waited, 3000);
 
-  // im_probe's bound is 100 ms + 1 s for a quick probe.
-  auto caps = Sized<im_caps>(sizeof(im_caps));
+  // im_probe's bound is 100 ms + 1 s for a quick probe. A timed-out call leaves the caller's struct alone (a write
+  // would have zeroed these fields: the job's output starts zeroed).
+  im_caps caps{};
+  std::memset(&caps, 0xAB, sizeof caps);
+  caps.struct_size = sizeof caps;
   EXPECT_TRUE(Fails(im_probe(IM_PROBE_QUICK, &caps), IM_ERR_TIMEOUT, "engine_timeout", "1100 ms"));
-  EXPECT_EQ(caps.struct_size, sizeof(im_caps)) << "a timed-out call wrote its output";
+  EXPECT_EQ(caps.struct_size, sizeof(im_caps));
+  EXPECT_EQ(caps.os_build, 0xABABABABu) << "a timed-out call wrote its output";
+  EXPECT_EQ(caps.probe_ms, 0xABABABABu) << "a timed-out call wrote its output";
 
   // Released, the worker runs the late jobs (their results are discarded) and serves new calls.
   release.set_value();
@@ -883,17 +932,20 @@ TEST_F(Engine, ReadLogsDrainsWholeLines) {
 
 // ---------------------------------------------------------------------------------------------- the AudioEngine
 
-// A fake AudioEngine that counts the calls reaching it.
+// A fake AudioEngine that counts the calls reaching it. Init and Shutdown run on the engine worker, so their counters
+// are atomic; init_hook (when set) decides what Init returns.
 class CountingAudioEngine final : public im::audio::AudioEngine {
 public:
-  int inits = 0, shutdowns = 0, rules = 0, watches = 0, modes = 0, mutes = 0, mixers = 0;
+  std::atomic<int> inits{0}, shutdowns{0};
+  int rules = 0, watches = 0, modes = 0, mutes = 0, mixers = 0;
   uint32_t last_mode = 0xFFFFFFFF;
-  uint32_t init_flags = 0xFFFFFFFF;
+  std::atomic<uint32_t> init_flags{0xFFFFFFFF};
+  std::function<im_status()> init_hook;
 
   im_status Init(uint32_t flags) override {
     ++inits;
     init_flags = flags;
-    return IM_OK;
+    return init_hook ? init_hook() : IM_OK;
   }
   void Shutdown() override { ++shutdowns; }
   uint32_t ProbeFlags() override { return 0; }
@@ -938,8 +990,8 @@ TEST(Exports, RefusedAudioArgumentsNeverReachTheAudioEngine) {
   im_init_params p = InitParams();
   p.flags = 0;
   ASSERT_EQ(im_init(&p), IM_OK) << LastError();
-  EXPECT_EQ(fake.inits, 1);
-  EXPECT_EQ(fake.init_flags, 0u);
+  EXPECT_EQ(fake.inits.load(), 1);
+  EXPECT_EQ(fake.init_flags.load(), 0u);
 
   // IM_AUDIO_MODE_EVERYTHING is refused before any AudioEngine call (README §3 item 15).
   EXPECT_TRUE(Fails(im_audio_set_mode(IM_AUDIO_MODE_EVERYTHING), IM_ERR_INVALID_ARG));
@@ -972,7 +1024,96 @@ TEST(Exports, RefusedAudioArgumentsNeverReachTheAudioEngine) {
   EXPECT_EQ(fake.mutes, 1);
 
   im_shutdown();
-  EXPECT_EQ(fake.shutdowns, 1);
+  EXPECT_EQ(fake.shutdowns.load(), 1);
+}
+
+// Audio never fails a call (04 §10.1): a failed AudioEngine::Init is logged, im_init succeeds without a detail, and
+// im_shutdown still shuts the audio engine down.
+TEST(Exports, FailedAudioInitDoesNotFailInit) {
+  im_shutdown();
+  CountingAudioEngine fake;
+  fake.init_hook = []() -> im_status {
+    return im::abi::Fail(IM_ERR_INTERNAL, {}, "test: the audio watcher can't start");
+  };
+  im::audio_bridge::SetEngineForTest(&fake);
+  struct Restore {
+    ~Restore() {
+      im_shutdown();
+      im::audio_bridge::SetEngineForTest(nullptr);
+    }
+  } restore;
+  std::vector<char> logs(64 * 1024);
+  while (im_read_logs(logs.data(), static_cast<int32_t>(logs.size())) > 0) {
+  }
+
+  im_init_params p = InitParams();
+  p.flags = 0;
+  ASSERT_EQ(im_init(&p), IM_OK) << LastError();
+  EXPECT_EQ(LastError(), "") << "a successful im_init left a detail";
+  EXPECT_TRUE(im::engine::Initialized());
+  EXPECT_EQ(fake.inits.load(), 1);
+  const int32_t n = im_read_logs(logs.data(), static_cast<int32_t>(logs.size()));
+  ASSERT_GT(n, 0) << LastError();
+  const std::string out(logs.data(), static_cast<std::size_t>(n));
+  EXPECT_NE(out.find("\"msg\":\"audio init failed\""), std::string::npos) << out;
+  EXPECT_NE(out.find("the audio watcher can't start"), std::string::npos) << out;
+
+  // Video calls keep working: im_probe reaches its area (the skeleton's stub answers whatever it answers).
+  im_caps caps = Sized<im_caps>(sizeof(im_caps));
+  EXPECT_NE(im_probe(IM_PROBE_QUICK, &caps), IM_ERR_BAD_STATE) << LastError();
+
+  im_shutdown();
+  EXPECT_EQ(fake.shutdowns.load(), 1);
+}
+
+// 04 §6.1: an AudioEngine::Init that outlasts im_init's bound (500 ms + 1 s) makes im_init fail with IM_ERR_TIMEOUT;
+// when it finishes with IM_OK, the worker calls Shutdown itself, since no im_shutdown will.
+TEST(Exports, LateAudioInitIsShutDownByTheWorker) {
+  im_shutdown();
+  // Static: the abandoned worker thread may reach the fake after a failed assertion returned from this test. The
+  // promise is released at the latest when it is destroyed (a broken promise makes the future ready too).
+  static CountingAudioEngine fake;
+  fake.inits = 0;
+  fake.shutdowns = 0;
+  std::promise<void> release;
+  std::shared_future<void> released = release.get_future().share();
+  fake.init_hook = [released]() -> im_status {
+    released.wait();
+    return IM_OK;
+  };
+  im::audio_bridge::SetEngineForTest(&fake);
+  struct Restore {
+    ~Restore() {
+      im_shutdown();
+      im::audio_bridge::SetEngineForTest(nullptr);
+    }
+  } restore;
+
+  im_init_params p = InitParams();
+  p.flags = 0;
+  const auto t0 = steady_clock::now();
+  const im_status st = im_init(&p);
+  const auto waited = duration_cast<milliseconds>(steady_clock::now() - t0).count();
+  EXPECT_TRUE(Fails(st, IM_ERR_TIMEOUT, "engine_timeout", "AudioEngine::Init did not finish within 1500 ms"));
+  EXPECT_GE(waited, 1400); // the bound, less a timer tick
+  EXPECT_LT(waited, 5000); // the bound and the 1 s wait for the stuck worker
+  EXPECT_FALSE(im::engine::Initialized());
+  EXPECT_EQ(fake.shutdowns.load(), 0) << "Shutdown ran before the late Init finished";
+
+  release.set_value(); // the late Init returns IM_OK on the abandoned worker
+  const auto deadline = steady_clock::now() + std::chrono::seconds(10);
+  while (fake.shutdowns.load() == 0 && steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(milliseconds(10));
+  }
+  EXPECT_EQ(fake.shutdowns.load(), 1) << "the worker didn't shut down the audio engine a late Init started";
+  EXPECT_EQ(fake.inits.load(), 1);
+
+  // The engine starts again afterwards, on a new worker.
+  fake.init_hook = nullptr;
+  ASSERT_EQ(im_init(&p), IM_OK) << LastError();
+  EXPECT_EQ(fake.inits.load(), 2);
+  im_shutdown();
+  EXPECT_EQ(fake.shutdowns.load(), 2);
 }
 
 } // namespace

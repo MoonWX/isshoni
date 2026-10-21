@@ -48,6 +48,10 @@ im_status CheckStartConfig(const char *fn, const im_start_config &cfg) noexcept;
 // A video layer index (< IM_MAX_LAYERS), or also IM_ALL_LAYERS when all_ok.
 im_status CheckLayerIndex(const char *fn, uint32_t layer, bool all_ok) noexcept;
 
+// im_set_bitrate's target for a video layer (04 §6.4, §9.5), after CheckLayerIndex: layer 0 100 000..50 000 000 bps,
+// the other layers 50 000..2 000 000. 0 is out of range too (Go turns a layer off with im_set_layer_active).
+im_status CheckVideoBitrate(const char *fn, uint32_t layer, uint32_t bps) noexcept;
+
 // A uint32_t boolean argument: 0 or 1 (04 §5.1).
 im_status CheckBool(const char *fn, const char *what, uint32_t value) noexcept;
 

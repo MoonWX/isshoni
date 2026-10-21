@@ -268,6 +268,16 @@ im_status CheckLayerIndex(const char *fn, uint32_t layer, bool all_ok) noexcept 
                all_ok ? " or IM_ALL_LAYERS" : "");
 }
 
+im_status CheckVideoBitrate(const char *fn, uint32_t layer, uint32_t bps) noexcept {
+  const uint32_t lo = layer == 0 ? 100000u : 50000u;
+  const uint32_t hi = layer == 0 ? 50000000u : 2000000u;
+  if (bps >= lo && bps <= hi) {
+    return IM_OK;
+  }
+  return Failf(IM_ERR_INVALID_ARG, {}, "%s: bps %u is outside %u..%u for layer %u", fn, static_cast<unsigned>(bps),
+               static_cast<unsigned>(lo), static_cast<unsigned>(hi), static_cast<unsigned>(layer));
+}
+
 im_status CheckBool(const char *fn, const char *what, uint32_t value) noexcept {
   if (value <= 1) {
     return IM_OK;

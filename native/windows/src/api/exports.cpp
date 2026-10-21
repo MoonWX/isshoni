@@ -13,6 +13,7 @@
 //      which the export copies back to the caller after a success (engine/worker.h).
 // Output structs are written up to min(struct_size, sizeof) with struct_size set to the bytes written; JSON outputs
 // follow snprintf (04 §5.1).
+#include <cstddef>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -52,6 +53,85 @@ using im::abi::Failf;
     }                                                                                                                  \
   } while (0)
 
+// The struct layouts of 04 §5.4, pinned in the DLL's own build too (the release preset builds no tests): a size or an
+// offset that changes without a minor ABI bump fails here. The numbers are v1.0's; a minor bump that appends fields to
+// a top-level struct updates its size here and in native/common/tests/abi_layout_test.cpp with the bump.
+static_assert(IM_ABI_VERSION == 0x00010000u, "the layouts below are v1.0's: update them with the ABI bump");
+#define IM_SIZE(T, n)  static_assert(sizeof(T) == (n), #T " has the size of 04 §5.4")
+#define IM_AT(T, f, n) static_assert(offsetof(T, f) == (n), #T "." #f " has the offset of 04 §5.4")
+IM_SIZE(im_init_params, 32);
+IM_AT(im_init_params, ffmpeg_dir, 16);
+IM_AT(im_init_params, openh264_path, 24);
+IM_SIZE(im_clock_sample, 32);
+IM_SIZE(im_adapter_info, 160);
+IM_AT(im_adapter_info, name, 24);
+IM_SIZE(im_encoder_info, 104);
+IM_AT(im_encoder_info, codec, 40);
+IM_AT(im_encoder_info, reason, 72);
+IM_SIZE(im_caps, 1568);
+IM_AT(im_caps, adapters, 24);
+IM_AT(im_caps, encoder_count, 664);
+IM_AT(im_caps, encoders, 672);
+IM_AT(im_caps, probe_ms, 1504);
+IM_SIZE(im_pick_params, 24);
+IM_AT(im_pick_params, parent_window, 8);
+IM_SIZE(im_source_info, 440);
+IM_AT(im_source_info, id, 8);
+IM_AT(im_source_info, name, 72);
+IM_AT(im_source_info, monitor_id, 328);
+IM_AT(im_source_info, width, 392);
+IM_AT(im_source_info, pid, 408);
+IM_AT(im_source_info, window, 416);
+IM_SIZE(im_rule, 32);
+IM_AT(im_rule, value, 8);
+IM_AT(im_rule, app_id, 16);
+IM_AT(im_rule, name, 24);
+IM_SIZE(im_exclusions, 24);
+IM_AT(im_exclusions, rules, 8);
+IM_AT(im_exclusions, rule_count, 16);
+IM_AT(im_exclusions, shared_pid, 20);
+IM_SIZE(im_audio_config, 32);
+IM_AT(im_audio_config, mode, 0);
+IM_AT(im_audio_config, bitrate_bps, 4);
+IM_AT(im_audio_config, frame_ms, 8);
+IM_AT(im_audio_config, flags, 12);
+IM_SIZE(im_audio_level, 80);
+IM_AT(im_audio_level, peak_db, 64);
+IM_AT(im_audio_level, rms_db, 68);
+IM_AT(im_audio_level, source, 72);
+IM_SIZE(im_audio_levels, 5152);
+IM_AT(im_audio_levels, qpc_ns, 8);
+IM_AT(im_audio_levels, mix_peak_db, 16);
+IM_AT(im_audio_levels, count, 24);
+IM_AT(im_audio_levels, apps, 32);
+IM_SIZE(im_layer_config, 40);
+IM_SIZE(im_start_config, 224);
+IM_AT(im_start_config, source_id, 8);
+IM_AT(im_start_config, layers, 32);
+IM_AT(im_start_config, audio, 152);
+IM_AT(im_start_config, exclusions, 184);
+IM_AT(im_start_config, reserved, 192);
+IM_SIZE(im_layer_info, 40);
+IM_SIZE(im_session_info, 184);
+IM_AT(im_session_info, epoch_ns, 16);
+IM_AT(im_session_info, layers, 32);
+IM_SIZE(im_packet, 72);
+IM_AT(im_packet, capture_ts_ns, 16);
+IM_AT(im_packet, data, 24);
+IM_AT(im_packet, size, 32);
+IM_AT(im_packet, width, 40);
+IM_AT(im_packet, profile, 44);
+IM_AT(im_packet, event, 48);
+IM_AT(im_packet, status, 52);
+#undef IM_SIZE
+#undef IM_AT
+
+// Every top-level struct is exactly its v1.0 size (the struct_size floor of ReadIn and CheckOut), struct_size first.
+template <class T> constexpr bool kV1Exact = sizeof(T) == im::abi::V1Size<T>::value && offsetof(T, struct_size) == 0;
+static_assert(kV1Exact<im_init_params> && kV1Exact<im_clock_sample> && kV1Exact<im_caps> && kV1Exact<im_pick_params> &&
+              kV1Exact<im_source_info> && kV1Exact<im_exclusions> && kV1Exact<im_audio_levels> &&
+              kV1Exact<im_start_config> && kV1Exact<im_session_info> && kV1Exact<im_packet>);
+
 template <class T> T Zeroed() noexcept {
   T v{};
   v.struct_size = sizeof(T);
@@ -78,6 +158,10 @@ IM_API im_status IM_CALL im_init(const im_init_params *params) {
       return Failf(IM_ERR_ABI, im::abi::token::kAbi, "im_init: the caller's ABI %u.%u has another major than %u.%u",
                    static_cast<unsigned>(p.abi_version >> 16), static_cast<unsigned>(p.abi_version & 0xFFFFu),
                    IM_ABI_MAJOR, IM_ABI_MINOR);
+    }
+    if (p.log_level > IM_LOG_DEBUG) {
+      return Failf(IM_ERR_INVALID_ARG, {}, "im_init: params->log_level %u is not an IM_LOG_* level",
+                   static_cast<unsigned>(p.log_level));
     }
     im::engine::Options o;
     o.init_flags = p.flags;
@@ -367,6 +451,7 @@ IM_API im_status IM_CALL im_set_bitrate(im_session s, uint32_t layer, uint32_t b
   return im::api::Guard("im_set_bitrate", [&]() -> im_status {
     ClearLastError();
     IM_CHECK(im::api::CheckLayerIndex("im_set_bitrate", layer, false));
+    IM_CHECK(im::api::CheckVideoBitrate("im_set_bitrate", layer, bps));
     IM_CHECK(im::engine::RequireInit("im_set_bitrate"));
     return im::session::SetBitrate(s, layer, bps);
   });

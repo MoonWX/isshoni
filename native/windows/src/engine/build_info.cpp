@@ -51,8 +51,9 @@ std::filesystem::path PathFromUtf8(const std::string &s) {
   return std::filesystem::path(std::u8string(s.begin(), s.end()));
 }
 
-// ffmpeg.dir: the FFmpeg folder relative to the engine DLL's, or nothing when there is no relative path (another
-// drive) or the DLL's folder is unknown.
+// ffmpeg.dir: the FFmpeg folder relative to the engine DLL's, or nothing when it isn't below that folder (another
+// drive, or a path that climbs out with "..", which would put folder names such as the user's into logs and
+// diagnostics) or the DLL's folder is unknown.
 std::optional<std::string> FfmpegDirRelative() {
   const Options o = CurrentOptions();
   if (!o.ffmpeg_dir) {
@@ -64,7 +65,7 @@ std::optional<std::string> FfmpegDirRelative() {
   }
   const auto rel =
       PathFromUtf8(*o.ffmpeg_dir).lexically_normal().lexically_relative(PathFromUtf8(module_dir).lexically_normal());
-  if (rel.empty() || rel.is_absolute()) {
+  if (rel.empty() || rel.is_absolute() || rel.has_root_name() || *rel.begin() == "..") {
     return std::nullopt;
   }
   const std::u8string u8 = rel.generic_u8string();

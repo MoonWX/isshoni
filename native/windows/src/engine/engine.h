@@ -39,7 +39,10 @@ inline constexpr std::chrono::milliseconds kWorkerExit{1000};
 } // namespace bound
 
 // im_init after its argument checks: sets the log level, clears libvpl's search paths (04 §13.3), starts the worker
-// and runs 05's AudioEngine::Init on it. A second im_init without im_shutdown is IM_ERR_BAD_STATE.
+// and runs 05's AudioEngine::Init on it. A second im_init without im_shutdown is IM_ERR_BAD_STATE. A failed
+// AudioEngine::Init is logged and im_init still succeeds (audio never fails a call, 04 §10.1); one that doesn't finish
+// within its bound fails im_init with IM_ERR_TIMEOUT, and the worker calls AudioEngine::Shutdown when a late Init
+// succeeds (04 §6.1).
 im_status Init(Options options);
 
 // im_shutdown: stops every session, cancels a pick, runs AudioEngine::Shutdown on the worker, then stops the worker.

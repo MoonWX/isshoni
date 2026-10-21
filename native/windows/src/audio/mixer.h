@@ -53,9 +53,11 @@ public:
   // im::audio_bridge::Engine(), which tests can point at a fake (04 §18.2).
   static AudioEngine &Get();
 
-  // im_init, on 04's worker: starts the watcher thread unless IM_INIT_NO_AUDIO; <= 100 ms.
+  // im_init, on 04's worker: starts the watcher thread unless IM_INIT_NO_AUDIO; <= 100 ms. A failure doesn't fail
+  // im_init (audio never fails a call): 04 logs it, and the audio calls and the report go on against this engine.
   virtual im_status Init(uint32_t init_flags) = 0;
-  // im_shutdown: Mixer::Stop, unwatch, joins every audio thread (<= 2 s); Init may follow.
+  // im_shutdown: Mixer::Stop, unwatch, joins every audio thread (<= 2 s); Init may follow. Also called after an Init
+  // that failed, and on the worker after an Init that succeeded too late for im_init (04 §6.1).
   virtual void Shutdown() = 0;
   // im_caps.audio_flags (05 §11.1); cached, <= 50 ms the first time. Called by the probe on 04's worker.
   virtual uint32_t ProbeFlags() = 0;

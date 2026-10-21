@@ -51,10 +51,24 @@ im_status Init(Options options) {
 
   im_status st = s.worker.Start();
   if (st == IM_OK) {
-    st = s.worker.Post("im_init: AudioEngine::Init", bound::kInit,
-                       [flags]() -> int32_t { return audio_bridge::Engine().Init(flags); });
-    if (st < 0) {
+    st = s.worker.Post(
+        "im_init: AudioEngine::Init", bound::kInit, [flags]() -> int32_t { return audio_bridge::Engine().Init(flags); },
+        [](int32_t late) {
+          // im_init gave up waiting (04 §6.1) and failed, so no im_shutdown will stop what this Init started: the
+          // worker does, before Stop below lets it exit.
+          if (late == IM_OK) {
+            audio_bridge::Engine().Shutdown();
+          }
+        });
+    if (st == IM_ERR_TIMEOUT) {
+      // The worker is stuck in AudioEngine::Init: im_init fails, and the late handler above cleans up.
       s.worker.Stop(bound::kWorkerExit);
+    } else if (st < 0) {
+      // Audio never fails a call (04 §10.1, 05 §4.3): video sharing works without it. 05's report shows the audio
+      // state, and im_shutdown still calls AudioEngine::Shutdown, which copes with a failed Init.
+      log::Warn("engine", "audio init failed", {{"status", st}, {"detail", abi::LastErrorText()}});
+      abi::ClearLastError(); // im_init succeeds: no detail is left behind
+      st = IM_OK;
     }
   }
   if (st < 0) {

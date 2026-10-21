@@ -10,10 +10,14 @@
 
 namespace im::engine {
 
-// Resolves every delay-loaded import of `dll` (a name as given to /DELAYLOAD, "mfplat.dll") now, through
-// __HrLoadAllImportsForDll, with the delay-load helper's exceptions (VcppException ERROR_MOD_NOT_FOUND or
-// ERROR_PROC_NOT_FOUND) turned into HRESULT_FROM_WIN32 of that code. Returns an HRESULT: S_OK when the DLL and every
-// imported function were found. The probe checks Media Foundation with it before any call (04 §13.1).
+// Resolves every delay-loaded import of `dll` now, through __HrLoadAllImportsForDll, with the delay-load helper's
+// exceptions (VcppException ERROR_MOD_NOT_FOUND or ERROR_PROC_NOT_FOUND) turned into HRESULT_FROM_WIN32 of that code.
+// `dll` is matched without case against the names in this image's delay-import table, which are the import
+// libraries' spellings ("MFPlat.DLL", "AVRT.dll"), not /DELAYLOAD's: the helper itself compares case-sensitively, so
+// it gets the stored name. Returns an HRESULT: S_OK when the DLL and every imported function were found;
+// HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND) when the DLL isn't in System32 (or a dependency of it can't load);
+// HRESULT_FROM_WIN32(ERROR_INVALID_NAME) when the image delay-loads no DLL of that name (a build mistake: nothing is
+// loaded); E_INVALIDARG for NULL. The probe checks Media Foundation with it before any call (04 §13.1).
 long LoadDelayedImports(const char *dll);
 
 } // namespace im::engine

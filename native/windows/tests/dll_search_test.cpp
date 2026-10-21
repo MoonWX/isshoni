@@ -7,9 +7,10 @@
 // Each case runs this executable again as a child process (DllSearchChild.Run) whose current directory and one PATH
 // entry each hold a copy of the marker DLL tests/support/marker_dll.cpp, which leaves "<its path>.loaded" behind when
 // it loads:
-//   - the hook refuses the planted im-test-missing.dll: __HrLoadAllImportsForDll fails, the module isn't loaded and no
-//     marker file appears;
-//   - the hook still loads mfplat.dll, from System32;
+//   - the hook refuses the planted im-test-missing.dll: LoadDelayedImports gives ERROR_MOD_NOT_FOUND, the module isn't
+//     loaded and no marker file appears;
+//   - the hook still loads mfplat.dll, from System32, whatever the spelling (mfplat.lib stores "MFPlat.DLL", and the
+//     delay-load helper's own lookup is case-sensitive);
 //   - for the record (06 §5.1's conditional load-config check): what the default delay-load helper does without the
 //     hook, in a DLL linked plain and in one linked with /DEPENDENTLOADFLAG:0x800. The verdict goes to the test log
 //     and to <build>/windows/dependentloadflag-verdict.txt, which the windows-native job puts in its summary.
@@ -117,16 +118,25 @@ TEST(DllSearchChild, Run) {
   }
 
   if (*mode == L"hook-missing") {
+    // ERROR_MOD_NOT_FOUND exactly: the descriptor was found and the hook refused the DLL. A name the image doesn't
+    // delay-load gives ERROR_INVALID_NAME instead (DllSearch.UnknownNameIsNotADelayImport), so a lookup that missed
+    // can't pass for a refusal. The upper-case spelling must reach the hook too (the lookup ignores case).
     const long hr = im::engine::LoadDelayedImports("im-test-missing.dll");
+    const long upper = im::engine::LoadDelayedImports("IM-TEST-MISSING.DLL");
     const HMODULE marker = GetModuleHandleW(kMarker);
-    EXPECT_TRUE(FAILED(hr)) << "the engine's delay-load hook loaded a planted im-test-missing.dll";
+    EXPECT_EQ(hr, HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND))
+        << Hex(hr) << ": the engine's delay-load hook didn't refuse a planted im-test-missing.dll";
+    EXPECT_EQ(upper, HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND)) << "IM-TEST-MISSING.DLL: " << Hex(upper);
     EXPECT_EQ(marker, nullptr);
     WriteResult(marker != nullptr ? "loaded " + Narrow(ModulePath(marker)) : "refused " + Hex(hr));
     return;
   }
   if (*mode == L"hook-mfplat") {
+    // mfplat.lib stores the name "MFPlat.DLL": every spelling finds it.
     const long hr = im::engine::LoadDelayedImports("mfplat.dll");
-    ASSERT_TRUE(SUCCEEDED(hr)) << "mfplat.dll's delay-loaded imports: " << Hex(hr);
+    ASSERT_EQ(hr, S_OK) << "mfplat.dll's delay-loaded imports: " << Hex(hr);
+    EXPECT_EQ(im::engine::LoadDelayedImports("MFPLAT.DLL"), S_OK);
+    EXPECT_EQ(im::engine::LoadDelayedImports("MFPlat.DLL"), S_OK);
     const HMODULE mf = GetModuleHandleW(L"mfplat.dll");
     ASSERT_NE(mf, nullptr);
     const fs::path path = ModulePath(mf);
@@ -241,6 +251,15 @@ TEST(DllSearch, HookLoadsMfplatFromSystem32) {
   EXPECT_EQ(c.result, "system32");
   EXPECT_FALSE(c.marker_in_cwd);
   EXPECT_FALSE(c.marker_in_path);
+}
+
+// A name this image doesn't delay-load is reported as such (and loads nothing), never as a refused DLL.
+TEST(DllSearch, UnknownNameIsNotADelayImport) {
+  EXPECT_EQ(im::engine::LoadDelayedImports("im-not-delay-loaded.dll"), HRESULT_FROM_WIN32(ERROR_INVALID_NAME));
+  EXPECT_EQ(im::engine::LoadDelayedImports("mfplat"), HRESULT_FROM_WIN32(ERROR_INVALID_NAME));
+  EXPECT_EQ(im::engine::LoadDelayedImports(""), HRESULT_FROM_WIN32(ERROR_INVALID_NAME));
+  EXPECT_EQ(im::engine::LoadDelayedImports(nullptr), E_INVALIDARG);
+  EXPECT_EQ(GetModuleHandleW(L"im-not-delay-loaded.dll"), nullptr);
 }
 
 // Records, never fails: what the default delay-load helper does without the engine's hook, and whether it honors the
