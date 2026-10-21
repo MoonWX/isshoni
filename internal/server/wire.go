@@ -239,8 +239,9 @@ func (s *Server) wire(ctx context.Context) error {
 	if err := s.wireOps(); err != nil {
 		return err
 	}
-	// One status source for `isshoni admin status`, for doctor, which examines the server through it, and for the
-	// dashboard. Doctor's own runs start with the server's other work (startBackground).
+	// One status source, statusSource, for doctor, which examines the server through it; the admin socket
+	// (`isshoni admin status`) and the dashboard read it with its dockerBridge added (withDockerBridge, below).
+	// Doctor's own runs start with the server's other work (startBackground).
 	status := s.statusSource()
 	env := s.doctorEnv(status)
 	s.doctor = ops.NewDoctor(ops.DoctorOptions{
@@ -248,11 +249,13 @@ func (s *Server) wire(ctx context.Context) error {
 		Meta:   metaStore{db: s.store},
 		Logger: s.log,
 	})
+	// The status, the dashboard and the connection test name the NAT as doctor's public_ip judges it: a container
+	// bridge's symmetric NAT, which the check lets pass, is dockerBridge next to nat in all three (README F22, F23).
+	// The check runs once, here, in the environment of doctor's own runs, on every server: the admin socket's status
+	// is there with a site or without. Doctor itself goes on seeing the status without the flag (withDockerBridge).
+	bridge := dockerBridgeNAT(ctx, env(ctx))
+	status = withDockerBridge(status, bridge)
 	if s.api != nil {
-		// The dashboard and the connection test name the NAT as doctor's public_ip judges it: a container bridge's
-		// symmetric NAT, which the check lets pass, is dockerBridge next to nat in both (README F22). The check runs
-		// once, here, in the environment of doctor's own runs.
-		bridge := dockerBridgeNAT(ctx, env(ctx))
 		s.wireConnTest(bridge)
 		s.wireOpsRoutes(status, bridge)
 	}
@@ -298,7 +301,8 @@ func (s *Server) restartFor(why ops.RestartReason) {
 // doctorEnv returns what a doctor run inside this server sees (doctor.Env, 04 §13.1): the config as the server
 // runs it, with the ports it bound, the server's own status, which is what makes it a run inside the server (the
 // checks then report the bound listeners, the certificate and the detected addresses instead of probing for them),
-// the uid of the process, and the server's test seams. status is the admin socket's GET /v1/status.
+// the uid of the process, and the server's test seams. status is statusSource: the admin socket's GET /v1/status
+// without its dockerBridge, which is public_ip's own verdict (withDockerBridge).
 //
 // The certificate's last error travels in the status as a code only; its fix text, which names what doctor can't
 // know from the code (the address a domain points to, the end of a rate limit), comes from the TLS manager, and
@@ -340,9 +344,10 @@ const (
 // dockerBridgeNAT reports whether doctor's public_ip check, run in env (a run inside this server, on the addresses
 // and the NAT kind that Start detected), lets the server's symmetric NAT pass because the server runs in a
 // container on a bridge network: README F21's rule (a), the check's param dockerBridge (04 §13.2). The dashboard and
-// the connection test then say the same with their dockerBridge (README F22, 04 §7.7, §11.4). It asks doctor rather
-// than judging the bridge a second time, so the three can't disagree: one rule, and one look at the container's
-// network (the default route's interface is one end of a veth pair).
+// the connection test then say the same with their dockerBridge (README F22, 04 §7.7, §11.4), and so does the admin
+// socket's status, for `isshoni admin status` (README F23, withDockerBridge, 04 §12.2). It asks doctor rather than
+// judging the bridge a second time, so they can't disagree: one rule, and one look at the container's network (the
+// default route's interface is one end of a veth pair).
 //
 // Only a symmetric NAT can pass this way, so any other kind is false without a run. The run is the one check: with
 // the server's own status doctor sends nothing and only reads the machine: the interface list, the default-route
@@ -361,6 +366,22 @@ func dockerBridgeNAT(ctx context.Context, env doctor.Env) bool {
 		}
 	}
 	return false
+}
+
+// withDockerBridge is status with its dockerBridge (README F23): bridge is what doctor's public_ip says of the
+// status's NAT (dockerBridgeNAT), and like the dashboard's and the connection test's flag it is kept only next to a
+// symmetric NAT, whatever bridge says. The admin socket's GET /v1/status and the dashboard read the result; doctor's
+// own runs (doctorEnv) keep the status without it, because the flag is that check's verdict and must not feed it.
+// Without a bridge it is status itself, so every other server's status is what it was.
+func withDockerBridge(status func(context.Context) (api.ServerStatus, error), bridge bool) func(context.Context) (api.ServerStatus, error) {
+	if !bridge {
+		return status
+	}
+	return func(ctx context.Context) (api.ServerStatus, error) {
+		st, err := status(ctx)
+		st.DockerBridge = st.NAT == api.NATKindSymmetric
+		return st, err
+	}
 }
 
 // metaStore is 03's meta table as ops and push keep their state in it (ops.MetaStore, and the meta half of
@@ -1307,7 +1328,9 @@ func probeError(ctx context.Context, transport string, err error) error {
 // what the running process knows about itself. The site, the listeners, the public addresses and what the ICE
 // Transport advertises are fixed once Start has bound everything, so the function keeps its own copies; the
 // certificate, the live counts, the uptime, the month's transfer and the release check's result are read at each
-// call: doctor's transfer and release checks see them there (04 §13.2).
+// call: doctor's transfer and release checks see them there (04 §13.2). Its dockerBridge is left out: that is
+// doctor's verdict on this very status, which wire adds afterwards for the socket and the dashboard
+// (withDockerBridge, README F23).
 func (s *Server) statusSource() func(context.Context) (api.ServerStatus, error) {
 	started := s.now()
 	base := api.ServerStatus{

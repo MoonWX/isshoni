@@ -123,7 +123,7 @@ governed by the license gate (06).
 | `isshoni setup-url [--qr\|--no-qr] [--wait DUR] [--json]` | Mints a one-time setup link and prints it (plus a QR code on a TTY). `--wait` is for Docker and manual use; install.sh waits with `healthcheck --ready` and then calls `setup-url` once | admin socket |
 | `isshoni doctor [--json] [--strict] [--only ID,…] [--list-checks] [--bandwidth-flags…]` | Diagnostics (§13). Works with or without a running server. `--only` runs the named checks (install.sh uses `dns,public_ip,clock` before the first start); `--list-checks --json` prints a JSON array of the check ids (06's anchor test, §13.1) | admin socket if up |
 | `isshoni healthcheck [--ready] [--wait DUR]` | Liveness (default) or readiness. Docker `HEALTHCHECK` (liveness); install.sh uses `--ready` | admin socket |
-| `isshoni admin status [--json]` | Version, uptime, TLS, rooms, connections | admin socket |
+| `isshoni admin status [--json]` | Version, uptime, TLS, rooms, connections. A symmetric NAT that the status marks `dockerBridge` (a container's bridge network, which doctor lets pass, §12.2) gets the line that `isshoni doctor` adds under `public_ip` for it, below the NAT kind: "the container's bridge network gives each outgoing connection its own port (symmetric NAT), which doesn't matter here: friends reach the published ports" (README F23); every other status reads as before | admin socket |
 | `isshoni admin backup [--out PATH\|-] [--no-certs] [--offline]` | Writes a backup archive (§12.3); never overwrites a file (exit 7) | admin socket |
 | `isshoni admin restore PATH\|- [--yes] [--offline]` | Restores a backup archive, or only the database from a pre-migration `backups/pre-*.db` file, and restarts the server; waits up to 60 s for it to answer again (§12.4) | admin socket |
 | `isshoni admin users list [--json]` | Lists accounts | admin socket |
@@ -3012,7 +3012,7 @@ func (r *ReleaseCheck) Alerts() []api.Alert           // release.update or relea
 |---|---|---|---|
 | `GET /v1/health` | – | `{"status":"ok","version":"0.3.0"}` | 503 `{"status":"shutting_down"}` |
 | `GET /v1/ready` | – | `{"status":"ready","checks":{…}}` | 503 not ready |
-| `GET /v1/status` | – | version, uptime, site, TLS status, public addrs, listeners, rooms/participants/shares counts, schema version | – |
+| `GET /v1/status` | – | version, uptime, site, TLS status, public addrs, NAT kind (with `dockerBridge` for a container bridge's symmetric NAT, below), listeners, rooms/participants/shares counts, schema version | – |
 | `POST /v1/setup-url` | `{"waitReadyS": 0}` | `{"url":"https://…/setup#…","expiresAt":"…","tlsReady":true}` | 404 `setup_unavailable` |
 | `GET /v1/users` | – | `{"users":[{"id","username","role","status","createdAt","lastSeenAt"}]}` | – |
 | `POST /v1/users/{name}/reset-link` | – | `{"url":"https://…/reset#…","expiresAt":"…"}` | 404 `user_not_found` |
@@ -3081,6 +3081,30 @@ side is `ops/backup.go` and `restore.go`, §12.3, §12.4):
 - **`POST /v1/restore`** takes at most 2 GiB (`ops.RestoreMaxBytes`): a `Content-Length` above it, or a body that
   goes past it, is 413 `payload_too_large`. The server reads what the body is from its first bytes (`ops.KindOf`:
   gzip, or the SQLite header; anything else is `backup_invalid`); the CLI's `Content-Type` is informational.
+
+**`dockerBridge` in the status, as README F23 added it** (F22's follow-up; `api.ServerStatus.DockerBridge`). The
+status carries the dashboard's and the connection test's `dockerBridge` (§7.7, §11.4): `true` next to
+`"nat": "symmetric"` where doctor's `public_ip` lets that NAT pass because the server runs in a container on a bridge
+network (§13.2, rule (a)); otherwise the key is absent (`omitempty`), so every other server's status is what it was,
+and an older CLI ignores the key (01's compatibility rules).
+- **The same look.** The flag is the wiring's one run of `public_ip` (`wire.go`, `dockerBridgeNAT`, §7.7), which
+  since README F23 runs on every server, with a site or without, because the socket answers on both (any NAT kind
+  but `symmetric` is still `false` without a run). `withDockerBridge` adds it to the status function behind the
+  socket and keeps it only next to a symmetric NAT, whatever the run said. The dashboard reads the same function
+  and keeps its own `DashboardOptions.DockerBridge` from the same run (§11.4). Like the NAT kind, it is fixed for
+  the process's life.
+- **Doctor doesn't see it.** Doctor's own runs examine the status without the flag (`doctorEnv`, `doctor.Env.Live`):
+  it is that check's verdict on this very status, and must not feed it.
+- **`isshoni admin status`** prints the NAT kind as before and, for the flag, the line that `isshoni doctor` adds
+  under `public_ip` in the same setup, in the same words, on the line below and indented like the values (§3.1).
+  The flag qualifies `symmetric` alone, as on the dashboard (05 §15.3). `--json` prints the document as it is.
+- **Tests**: `TestWithDockerBridge` (the flag only next to `symmetric`, the rest of the status untouched, the
+  source's error passed on) and `TestDockerBridgeInServer` (`internal/server`: the socket's status has the flag on a
+  bridge network and not on the host's, next to doctor, the dashboard and the connection test); `TestStatusTextNAT`
+  and `TestAdminStatusDockerBridge` (`cmd/isshoni`: the note only for a symmetric NAT with the flag; a fake server in
+  a bridge, whose doctor run prints the same line under `public_ip`, and the `--json` key next to `nat`) and
+  `admin.txtar` (`fakeserver set nat bridge`); the golden file `ServerStatus.docker-bridge.json`
+  (`internal/protocol/api/testdata`), with `ServerStatus.json` unchanged.
 
 User, invite and setup operations call 03's service layer (§19); this doc only defines the socket surface. Timestamps
 in these bodies (`expiresAt`, `createdAt`, `lastSeenAt`) have 03 §3.3's fixed form, `2026-09-30T10:00:00.000Z`, the

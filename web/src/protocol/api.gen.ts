@@ -581,6 +581,12 @@ export interface ServerStatus {
    */
   localIpv4?: string;
   nat: NATKind;
+  /**
+   * DockerBridge qualifies a symmetric NAT as ServerInfo.DockerBridge does, from the same look: a container's
+   * bridge network, which doctor's public_ip lets pass (04 §13.2). Only next to NAT symmetric; absent otherwise
+   * (README F23). doctor.Env.Live never has it: it is that check's own verdict.
+   */
+  dockerBridge?: boolean;
   advertised: AdvertisedAddr[];
   listeners: ListenerInfo[];
   /**

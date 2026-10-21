@@ -63,7 +63,8 @@
 //     a subscription, the test notification). With push.enabled = false there is none: the hub notifies nobody,
 //     admin alerts are only logged, and the push endpoints answer push_unavailable.
 //   - The admin socket of 04 §12 on listen.admin_socket, for the operator's CLI (setup-url, healthcheck, admin …),
-//     with its accounts part over 03's service.
+//     with its accounts part over 03's service. Its status (`isshoni admin status`) carries the same dockerBridge
+//     next to nat as the dashboard and the connection test (README F23, withDockerBridge).
 //   - Backup, restore and secret rotation (README S65; 04 §5.3, §12.3, §12.4). The admin socket serves them over
 //     ops.DataDir, with 03's snapshot of the running database and its file-level functions (DBFiles), and over
 //     secrets.json. A restore and a rotation answer and then ask for the server's restart (restartFor): the

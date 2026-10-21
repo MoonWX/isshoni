@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/netip"
@@ -116,8 +117,46 @@ type fakeMachine struct {
 	dir string // holds the data directory and the empty root
 	cfg *config.Config
 
-	mu    sync.Mutex
-	state string // "ok", "warn" or "fail"
+	mu     sync.Mutex
+	state  string // "ok", "warn" or "fail"
+	bridge bool   // the server runs in a Docker container on a bridge network (bridgeMachine)
+}
+
+// The fake server in a Docker container on a bridge network (README F23): the container's address, which the
+// server found as the default route's source, and the interface that holds it, one end of a veth pair (its iflink
+// is the other end's index).
+const bridgeLocalV4 = "172.18.0.2"
+
+// bridgeNet is the container's network as doctor reads it: eth0 holds the container's address alone.
+type bridgeNet struct{ fakeNet }
+
+func (bridgeNet) Interfaces() ([]netx.Interface, error) {
+	return []netx.Interface{{Name: "eth0", Flags: net.FlagUp, Addrs: []netx.InterfaceAddr{
+		{Addr: netip.MustParseAddr(bridgeLocalV4)},
+	}}}, nil
+}
+
+func (bridgeNet) RouteSource(context.Context, netip.Addr) (netip.Addr, error) {
+	return netip.MustParseAddr(bridgeLocalV4), nil
+}
+
+// bridgeStatus makes st the status of fakeStatus's server in a Docker container on a bridge network, the way it
+// detected its address: seen by STUN behind a symmetric NAT (Docker Desktop's user-space NAT gives each
+// destination its own port). The dockerBridge that the server adds for the admin socket is not part of it: doctor
+// in the server sees the status without it.
+func bridgeStatus(st *api.ServerStatus) {
+	st.PublicIPv4Method, st.LocalIPv4, st.NAT = "stun", bridgeLocalV4, api.NATKindSymmetric
+}
+
+// bridgeMachine makes env the machine of a Docker container on a bridge network (bridgeNet), after fakeProbes.
+func bridgeMachine(env *doctor.Env) {
+	env.Host.Environ = []string{"container=docker"}
+	files := fstest.MapFS{
+		"sys/class/net/eth0/ifindex": {Data: []byte("16\n")},
+		"sys/class/net/eth0/iflink":  {Data: []byte("17\n")},
+	}
+	maps.Copy(files, env.FS.(fstest.MapFS))
+	env.FS, env.Interfaces = files, bridgeNet{}
 }
 
 func newFakeMachine() (*fakeMachine, error) {
@@ -151,10 +190,23 @@ func (m *fakeMachine) set(state string) {
 	m.state = state
 }
 
+// setBridge puts the server into a Docker container on a bridge network, or takes it out again.
+func (m *fakeMachine) setBridge(on bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.bridge = on
+}
+
+func (m *fakeMachine) inBridge() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.bridge
+}
+
 // serverEnv is ops.DoctorOptions.Env of the fake server: fakeStatus's server, seen from inside.
 func (m *fakeMachine) serverEnv(context.Context) doctor.Env {
 	m.mu.Lock()
-	state := m.state
+	state, bridge := m.state, m.bridge
 	m.mu.Unlock()
 
 	live := fakeStatus()
@@ -163,6 +215,9 @@ func (m *fakeMachine) serverEnv(context.Context) doctor.Env {
 	live.Advertised = append(live.Advertised, api.AdvertisedAddr{Proto: "tcp", Addr: "203.0.113.7:7882", Via: api.TransportTCP7882})
 	live.UDPRcvBufBytes, live.UDPSndBufBytes = 8388608, 8388608
 	live.Update = &api.UpdateInfo{Latest: live.Version}
+	if bridge {
+		bridgeStatus(&live)
+	}
 	rmem := "8388608"
 	switch state {
 	case "warn":
@@ -183,6 +238,9 @@ func (m *fakeMachine) serverEnv(context.Context) doctor.Env {
 		env.TLSLastError = "Let's Encrypt couldn't connect to 203.0.113.7 on port 80 or 443. Open TCP 80 and 443 in your cloud firewall."
 	}
 	fakeProbes(&env, filepath.Join(m.dir, "root"), rmem)
+	if bridge {
+		bridgeMachine(&env)
+	}
 	return env
 }
 
