@@ -1,0 +1,32 @@
+# The system DLLs isshoni-media.dll may import (docs/m2/06-windows-release.md section 5.1; README WA11 owns the file,
+# later slices only append). `tools/desktoppkg dll-check` fails on any import of the win-x64-release DLL that is not
+# listed in the section matching how it is imported: "static:" for the import table, "delay:" for the delay-load
+# table (/DELAYLOAD, loaded from System32 only by native/windows/src/engine/delayload.cpp). One DLL per line, compared
+# without case; '#' starts a comment. Add a DLL in the same change as the code that imports it, with its reason.
+#
+# Never allowed, whatever this file says (dll-check refuses them, and refuses this file if it lists them): avcodec-*
+# and avutil-* (FFmpeg is loaded at run time, so the engine works without it, docs/m2/04-windows-engine.md section
+# 9.2), the C runtime DLLs (VCRUNTIME*, MSVCP*, MSVCR*, api-ms-win-crt-*, ucrtbase*, concrt*, vccorlib* and their
+# debug builds: the DLL links the static CRT), opus*.dll (libopus is linked in), and mfplat.dll or avrt.dll as static
+# imports.
+
+static:
+  kernel32.dll      # the engine core and the static CRT
+  ole32.dll         # CoInitializeEx on the engine worker (04 section 6.1); COM for capture, audio and the probe
+  oleaut32.dll      # BSTR and VARIANT helpers of COM interfaces (04 section 13.1's libraries)
+  user32.dll        # the picker's owner window, window identity, WDA_EXCLUDEFROMCAPTURE (04 sections 7.2, 7.6, 11)
+  d3d11.dll         # the GPU path (04 section 8)
+  dxgi.dll          # adapters, outputs and Desktop Duplication (04 sections 7.4, 8.1)
+  dwmapi.dll        # window cloaking and frame bounds (04 section 7.6)
+  shcore.dll        # GetDpiForMonitor (04 section 5.6's dpi)
+  # synchronization.lib: WaitOnAddress and WakeByAddressSingle for the rings' wake-up (04 section 6.2)
+  api-ms-win-core-synch-l1-2-0.dll
+  # windowsapp.lib, through C++/WinRT (Windows.Graphics.Capture and its picker, 04 sections 7.2, 7.3)
+  api-ms-win-core-winrt-l1-1-0.dll
+  api-ms-win-core-winrt-string-l1-1-0.dll
+  api-ms-win-core-winrt-error-l1-1-0.dll
+  api-ms-win-core-winrt-error-l1-1-1.dll
+
+delay:
+  mfplat.dll        # Media Foundation: absent on N editions and Windows Server without it (04 section 13.1)
+  avrt.dll          # MMCSS for the capture, video and audio threads (04 section 6.1)

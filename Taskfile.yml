@@ -726,11 +726,130 @@ tasks:
 
   native:build:
     desc: >-
-      Build isshoni-media.dll on a Windows PC - the MSVC environment of deploy/windows/msvc-env.ps1, then presets
-      win-x64-release and win-x64-ci with IM_FFMPEG_ROOT = the ffmpeg:fetch output in .deps/ffmpeg/
+      Build isshoni-media.dll on a Windows PC - the MSVC environment of deploy/windows/msvc-env.ps1, vcpkg at
+      native/vcpkg.json's baseline in .deps/vcpkg (VCPKG_DIR=<dir> elsewhere), then presets win-x64-release and
+      win-x64-ci (PRESETS=<names>; TEST=true also runs their ctest) with IM_FFMPEG_ROOT = the ffmpeg:fetch output in
+      .deps/ffmpeg/ when it is there (FFMPEG_ROOT=<dir> picks another)
+    vars:
+      PRESETS: '{{.PRESETS | default "win-x64-release win-x64-ci"}}'
+      TEST: '{{.TEST | default "false"}}'
+    env:
+      VCPKG_DISABLE_METRICS: '1'
+      ISSHONI_NATIVE_PRESETS: '{{.PRESETS}}'
+      ISSHONI_NATIVE_TEST: '{{.TEST}}'
+      # In Windows PowerShell 5.1 (every Windows 10 and 11 has it), as ffmpeg:build: vcpkg fetched at the
+      # baseline (shallow) and bootstrapped, its binary packages in .deps/vcpkg-cache unless VCPKG_BINARY_SOURCES
+      # or VCPKG_DEFAULT_BINARY_CACHE is set; the MSVC environment step (docs/m2/06 section 3), run as a script so
+      # its variables are this process's; CMake and Ninja from PATH (Visual Studio's, once the step ran) or the
+      # copies vcpkg pins; then each preset. Native programs run with ErrorActionPreference Continue and their exit
+      # codes decide: Windows PowerShell 5.1 can turn a native program's stderr into errors under 'Stop'.
+      ISSHONI_NATIVE_BUILD_PS1: |
+        $ErrorActionPreference = 'Stop'
+        Set-StrictMode -Version 3.0
+        $root = (Get-Location).Path
+        function Invoke-Native([string]$What, [string]$Exe, [string[]]$Arguments) {
+          $ErrorActionPreference = 'Continue'
+          & $Exe @Arguments
+          if ($LASTEXITCODE -ne 0) { throw "native:build: $What failed (exit code $LASTEXITCODE)" }
+        }
+        $deps = Join-Path $root '.deps'
+        New-Item -ItemType Directory -Force -Path $deps | Out-Null
+        $ignore = Join-Path $deps '.gitignore'
+        if (-not (Test-Path -LiteralPath $ignore)) {
+          Set-Content -LiteralPath $ignore -Encoding Ascii -Value @('# Fetched by the native and ffmpeg tasks (Taskfile.yml).', '*')
+        }
+
+        $baseline = [string](Get-Content -Raw -Path (Join-Path $root 'native\vcpkg.json') | ConvertFrom-Json).'builtin-baseline'
+        if ($baseline -notmatch '^[0-9a-f]{40}$') { throw 'native:build: native/vcpkg.json has no 40-hex builtin-baseline' }
+        $vcpkg = Join-Path $deps 'vcpkg'
+        if ($env:VCPKG_DIR) { $vcpkg = [IO.Path]::GetFullPath((Join-Path $root $env:VCPKG_DIR)) }
+        $head = ''
+        if (Test-Path -LiteralPath (Join-Path $vcpkg '.git')) {
+          $ErrorActionPreference = 'Continue'
+          $head = [string](& git -C $vcpkg rev-parse -q --verify HEAD 2>$null)
+          $ErrorActionPreference = 'Stop'
+        }
+        if ($head.Trim() -ne $baseline) {
+          Write-Host "native:build: fetching vcpkg $baseline into $vcpkg"
+          if (-not (Test-Path -LiteralPath (Join-Path $vcpkg '.git'))) {
+            New-Item -ItemType Directory -Force -Path $vcpkg | Out-Null
+            Invoke-Native 'git init' 'git' @('-C', $vcpkg, 'init', '-q')
+            Invoke-Native 'git remote add' 'git' @('-C', $vcpkg, 'remote', 'add', 'origin', 'https://github.com/microsoft/vcpkg.git')
+          }
+          Invoke-Native 'git fetch' 'git' @('-C', $vcpkg, 'fetch', '-q', '--depth', '1', 'origin', $baseline)
+          Invoke-Native 'git checkout' 'git' @('-C', $vcpkg, 'checkout', '-q', '--detach', 'FETCH_HEAD')
+          # The vcpkg tool is pinned by the checkout: fetch it again.
+          Remove-Item -LiteralPath (Join-Path $vcpkg 'vcpkg.exe') -Force -ErrorAction SilentlyContinue
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $vcpkg 'vcpkg.exe'))) {
+          Invoke-Native 'bootstrap-vcpkg.bat' (Join-Path $vcpkg 'bootstrap-vcpkg.bat') @('-disableMetrics')
+        }
+        $env:VCPKG_ROOT = $vcpkg
+        if (-not $env:VCPKG_BINARY_SOURCES -and -not $env:VCPKG_DEFAULT_BINARY_CACHE) {
+          $cache = Join-Path $deps 'vcpkg-cache'
+          New-Item -ItemType Directory -Force -Path $cache | Out-Null
+          $env:VCPKG_DEFAULT_BINARY_CACHE = $cache
+        }
+
+        $global:LASTEXITCODE = 0
+        & (Join-Path $root 'deploy\windows\msvc-env.ps1')
+        if ($LASTEXITCODE -ne 0) { throw "native:build: deploy/windows/msvc-env.ps1 failed (exit code $LASTEXITCODE)" }
+
+        $tools = @{}
+        foreach ($tool in 'cmake', 'ninja') {
+          $cmd = Get-Command $tool -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($cmd) {
+            $tools[$tool] = $cmd.Source
+          } else {
+            $ErrorActionPreference = 'Continue'
+            $fetched = [string](& (Join-Path $vcpkg 'vcpkg.exe') fetch $tool | Select-Object -Last 1)
+            $ErrorActionPreference = 'Stop'
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $fetched.Trim())) { throw "native:build: vcpkg fetch $tool failed" }
+            $tools[$tool] = $fetched.Trim()
+          }
+        }
+        $ctest = Join-Path (Split-Path -Parent $tools['cmake']) 'ctest.exe'
+
+        $ffmpeg = ''
+        if ($env:FFMPEG_ROOT) {
+          $ffmpeg = [IO.Path]::GetFullPath((Join-Path $root $env:FFMPEG_ROOT))
+        } else {
+          $found = @(Get-ChildItem -Path (Join-Path $deps 'ffmpeg') -Directory -Filter '*-win-x64' -ErrorAction SilentlyContinue |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'include\libavcodec\avcodec.h') } |
+            Sort-Object Name)
+          if ($found.Count -gt 0) { $ffmpeg = $found[-1].FullName }
+        }
+        if ($ffmpeg) {
+          Write-Host "native:build: IM_FFMPEG_ROOT=$ffmpeg"
+        } else {
+          Write-Host 'native:build: no FFmpeg build in .deps/ffmpeg (task ffmpeg:fetch): building without IM_FFMPEG_ROOT'
+        }
+
+        Push-Location (Join-Path $root 'native')
+        try {
+          foreach ($preset in ($env:ISSHONI_NATIVE_PRESETS -split '\s+' | Where-Object { $_ })) {
+            if ($preset -notmatch '^win-x64-') { throw "native:build: PRESETS: $preset is not a Windows preset (win-x64-*)" }
+            $configure = @('--preset', $preset, "-DCMAKE_MAKE_PROGRAM=$($tools['ninja'])")
+            if ($ffmpeg) { $configure += "-DIM_FFMPEG_ROOT=$ffmpeg" }
+            Invoke-Native "cmake --preset $preset" $tools['cmake'] $configure
+            Invoke-Native "cmake --build --preset $preset" $tools['cmake'] @('--build', '--preset', $preset)
+            if ($env:ISSHONI_NATIVE_TEST -eq 'true' -and $preset -ne 'win-x64-release') {
+              Invoke-Native "ctest --preset $preset" $ctest @('--preset', $preset, '--output-on-failure')
+            }
+            Write-Host "native:build: $(Join-Path $root "native\build\$preset\windows\isshoni-media.dll")"
+          }
+        } finally {
+          Pop-Location
+        }
     cmds:
-      - cmd: "echo 'native:build: note: not implemented yet; README WA11 adds it with native/windows/. Nothing was built.'"
+      - cmd: "echo 'native:build: skipped, isshoni-media.dll builds with MSVC on Windows only (on macOS and Linux, task native:test builds native/common)'"
         silent: true
+        if: '{{if eq OS "windows"}}false{{else}}true{{end}}'
+      - cmd: "echo 'native:build: note: native/windows/CMakeLists.txt or deploy/windows/msvc-env.ps1 does not exist yet, nothing to build'"
+        silent: true
+        if: '{{if eq OS "windows"}}! [ -f native/windows/CMakeLists.txt ] || ! [ -f deploy/windows/msvc-env.ps1 ]{{else}}false{{end}}'
+      - cmd: powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command '& ([scriptblock]::Create($env:ISSHONI_NATIVE_BUILD_PS1))'
+        if: '{{if eq OS "windows"}}[ -f native/windows/CMakeLists.txt ] && [ -f deploy/windows/msvc-env.ps1 ]{{else}}false{{end}}'
 
   native:dist:
     desc: >-
