@@ -1577,10 +1577,10 @@ with a list that re-snaps the way a browser does.
 - `autoFocus.test.ts` holds the rules and the settle step, the two cases of the review included: a speaker-button
   choice that survives its share's audio going away and coming back, and a re-published share whose first live has
   no audio yet, which gets the sound when its audio comes.
-- **Open, for the owner** (README §6 "Decided after group 9"; still open after groups 10, 11, 12, 13 and 14): when the
-  focused share has no sound, nothing from the stage is heard. The alternative is to keep the previous share's sound
-  playing until a share with sound is focused. Until the owner answers, the rule above stands and the code stays as
-  README S72 built it (§24).
+- **Open, for the owner** (README §6 "Decided after group 9"; still open after groups 10, 11, 12, 13, 14, 15 and 16):
+  when the focused share has no sound, nothing from the stage is heard. The alternative is to keep the previous share's
+  sound playing until a share with sound is focused. Until the owner answers, the rule above stands and the code stays
+  as README S72 built it (§24).
 
 ### 12.4 Layer policy
 
@@ -1713,10 +1713,10 @@ pseudo-fullscreen and the keyboard, and nothing else.
   - **Where it is offered: as built, wherever the platform reports it.** `capabilities.pip` is
     `document.pictureInPictureEnabled` and not iOS (§8; an iPad that calls itself a Mac counts as iOS). That is
     the desktop browsers, and it is also **Android Chrome**, which reports PiP too, where the rule above says
-    "desktop only". Whether Android keeps the button is an **open question for the owner** (asked after group 6,
-    still open after groups 7, 8, 9, 10, 11, 12, 13 and 14): the rule above stands as written, the code stays as
-    built until the answer, and the manual matrix row M-AND-1 (§19.4) is where it shows. iOS is not part of the
-    question: no PiP there in M1.
+    "desktop only". Whether Android keeps the button is an **open question for the owner** (asked after group 6, still
+    open after groups 7, 8, 9, 10, 11, 12, 13, 14, 15 and 16): the rule above stands as written, the code stays as built
+    until the answer, and the manual matrix row M-AND-1 (§19.4) is where it shows. iOS is not part of the question: no
+    PiP there in M1.
 - **Wake lock.** `platform.requestWakeLock()` is the browser's side (§8) and answers `null` where the API is
   missing or refuses (battery saver, iOS Low Power Mode); the viewer asks for it only where
   `capabilities.wakeLock` is true, and only decides when to hold one: while the page is visible and a share that

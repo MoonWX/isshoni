@@ -1436,8 +1436,8 @@ end of `wire.go`, the listeners in `server.go` and `http.go`, the tests in `ops_
   `forbidden` for a member, 401 without a session; `TestOpsRoutesForAdminsOnly`), each a typed function of `ops` wrapped
   by `opsRoute` (its answer through `WriteJSON`, its error through `WriteError`). **`POST /api/v1/admin/doctor` raises
   its own read deadline to 3 minutes** before it runs (`doctorRouteDeadline`): a run takes up to 2 minutes (§13.1), and
-  the router's 30 s read deadline (§9.3) would end the request's context under it. Since README F22, `wire` calls it
-  once doctor's environment exists, right after `wireConnTest` (which moved there from `wireAccounts`), and both
+  the router's 30 s read deadline (§9.3) would end the request's context under it. `wire` calls it right after
+  building doctor; since README F22 `wireConnTest` comes just before it (moved there from `wireAccounts`), and both
   take the flag of `dockerBridgeNAT` for their server objects (§7.7, §11.4).
 - **The dashboard's sources** (§11.4): the status is the admin socket's (`statusSource`, which since S85 also has
   the month's transfer and the release check's result, so doctor's two checks read them); `liveSource` joins 01's
@@ -1897,10 +1897,11 @@ text above leaves a choice:
   network doctor can't tell, no container, 1:1 NAT, `cgnat_likely`, a loopback `public_ip`, no IPv4 address, a
   loopback setup and no status; in each case doctor's own report has the same param, and its `container` check sees
   the network the case is about), `TestDockerBridgeNATCancelled` (a start whose context has ended gets no flag),
-  and `TestDockerBridgeInServer` (a running server in a Docker container with a symmetric NAT and a fake machine
-  for doctor, `SetDoctorMachine`: on a bridge the admin socket's doctor run, the dashboard and the connection
-  test's answer all carry `dockerBridge`, on the host's network none does and `public_ip` fails). The golden files `ConnTestResponse.docker-bridge.json` and `OpsDashboard.docker-bridge.json`
-  (`internal/protocol/api/testdata`) hold the wire form; the other golden files are unchanged.
+  and `TestDockerBridgeInServer` (a running server in a Docker container with a symmetric NAT and a fake machine for
+  doctor, `SetDoctorMachine`: on a bridge the admin socket's doctor run, the dashboard and the connection test's answer
+  all carry `dockerBridge`, on the host's network none does and `public_ip` fails). The golden files
+  `ConnTestResponse.docker-bridge.json` and `OpsDashboard.docker-bridge.json` (`internal/protocol/api/testdata`) hold
+  the wire form; the other golden files are unchanged.
 - **Tests**: `ops/conntest_test.go` with a fake `Prober` (the answers, the server object, validation, each
   transport without a listener, the limit and how it forgets, the `Prober`'s errors passed on); `wire_test.go`'s
   `TestProber` (the mapping, a request that ended among it) and `TestConnTestPorts`; and in `internal/server`
@@ -3556,16 +3557,18 @@ address ("127.0.0.1 (set in the config)"), then judged by the NAT kind. Both rul
   only address, `ipv6_only` or `no_ipv6` when the other family has a public one. The NAT kind is the IPv4 path's
   (§7.4), so with the IPv4 address left out it stands in front of no public address, and neither `symmetric` nor
   `cgnat_likely` fails the check (`publicState.v4Unreachable`); an IPv4 address that was simply not found keeps its
-  kind, and `cgnat_likely` without an address is still `public_ip.cgnat`. And `dns` has no address to compare
-  the records with (`dns.unverified` for a record, `dns.missing` without one; never `dns.ok` for a record that
-  points at `127.0.0.1`, nor `dns.wrong`). Such a server is ready (it has the address it was given), so the CLI's
-  `none` text says what it is instead of "not ready": "no public IP address: 127.0.0.1 can only be reached from this
-  machine", then "the site opens, but friends can't share or watch: media has no public address to offer", or, where
-  the site is that address, "the site is at that address too, so only this machine can open it". The fix
-  `public_ip.fix_set` names the key without the domain and the late network: "set public_ip to this server's public
-  address, or to auto to detect it, then restart isshoni: sudo systemctl restart isshoni" (Docker: "set
-  ISSHONI_PUBLIC_IP in .env to this server's public address, or leave it empty to detect it, then run docker compose
-  up -d"). A private address (`192.168.1.20`, a LAN setup) is still the server's address.
+  kind, and `cgnat_likely` without an address is still `public_ip.cgnat`. And `dns`, when the left-out address was the
+  only one, has no address to compare the records with (`dns.unverified` for a record, `dns.missing` without one; never
+  `dns.ok` for a record that points at `127.0.0.1`, nor `dns.wrong`); when the other family has a public address, it
+  compares the records with that one alone, so an AAAA record at it can be `dns.ok` and an A record at `127.0.0.1` is
+  `dns.wrong`. Such a server is ready (it has the address it was given), so the CLI's `none` text says what it is
+  instead of "not ready": "no public IP address: 127.0.0.1 can only be reached from this machine", then "the site opens,
+  but friends can't share or watch: media has no public address to offer", or, where the site is that address, "the site
+  is at that address too, so only this machine can open it". The fix `public_ip.fix_set` names the key without the
+  domain and the late network: "set public_ip to this server's public address, or to auto to detect it, then restart
+  isshoni: sudo systemctl restart isshoni" (Docker: "set ISSHONI_PUBLIC_IP in .env to this server's public address, or
+  leave it empty to detect it, then run docker compose up -d"). A private address (`192.168.1.20`, a LAN setup) is still
+  the server's address.
 - **No new code.** Both rules use the codes above, so 05's catalog has a text for each, and since the group 15
   integration its texts know both params: the Doctor page adds the bridge line to `public_ip.ok`, `no_ipv6` and
   `ephemeral` with `dockerBridge`, and names the address of `unreachable` on `none`, `no_ipv6` and `ipv6_only`, in

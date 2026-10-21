@@ -2745,20 +2745,20 @@ that the manual check of 04 §17 can't be:
   host with a real public address: the step checks every code, but the smoke overrides can't give an all-ok report.
 - **Doctor's package is an input of the step.** `doctor_want` and `doctor_allowed` pin every check and its codes, so
   a pull request that changes doctor's checks or codes (`internal/server/ops/doctor`, the `go` filter alone) must
-  run docker-smoke, which a pull request runs only for the `docker`, `deploy` or `release` filters (8.2). Two things
-  see to it:
+  run docker-smoke, which a pull request runs only for the `docker`, `deploy` or `release` filters (8.2). One thing
+  covers part of it, and the rest is still missing:
   - `TestDockerSmokeExpectations` (`ops/doctor`, in `test-go` on every Go change) holds both lists to doctor:
     `doctor_want` names every check of `--list-checks` in its order, and every code either list names is one of
     doctor's codes and its check's; an allow-list entry is `local`, `vm` or `any`, one per check and engine. A pull
     request that adds or removes a check, or renames or removes a code the lists name, fails there until the script
     knows it, and that edit of `deploy/docker/**` runs docker-smoke on the same pull request.
-  - Which of its existing codes a check gives in the smoke's setup only the step can tell. README F21 listed a
-    filter `doctor` (`internal/server/ops/doctor/**`) in ci.yml's `changes` job, running docker-smoke as well, for
-    the integrator (ci.yml is S02's). The group 15 integration left ci.yml as it was, since its own pull request
-    touched `deploy/docker/**`, which selects the job, and neither ci.yml nor 8.2's list has the filter. Until a
-    slice adds it (not scheduled; README §6 "Decided after group 15" (3)), such a change passes its own pull request
-    and fails on the push to main and in nightly's `docker-multiarch`.
-
+  - Which of its existing codes a check gives in the smoke's setup only the step can tell. README F21's own text of this
+    section named a filter `doctor` (`internal/server/ops/doctor/**`) in ci.yml's `changes` job, running docker-smoke as
+    well, as the integrator's to add (ci.yml is S02's, and the text said 8.2's table names the filter, which it
+    doesn't), but F21's report did not carry it among its blocked items, and the group 15 integration judged ci.yml
+    needed no change (its own pull request touched `deploy/docker/**`, which selects the job). Neither ci.yml nor 8.2's
+    list has the filter. Until a slice adds it (not scheduled; README §6 "Decided after group 15" (3)), such a change
+    passes its own pull request and fails on the push to main and in nightly's `docker-multiarch`.
 ## 12. M1 exit test run book
 
 **Exit criterion (plan):** 5 friends finish a 2-hour session on a small VPS with no manual fixes; iPhone and Android
@@ -3318,11 +3318,12 @@ Decided after group 15 (engineering calls the owner delegated; README §6 "Decid
   on `127.0.0.1` in the container's `/etc/hosts`, so `dns` reads alike on every machine. The `local` list was
   chosen by reasoning, and the step's first run on CI's runner passed with it (`public_ip.none`, `dns.unverified`,
   `clock.ok`, `udp_buffers.low`). The manual pre-flight item 5 of 12.1 stays.
-- **ci.yml has no `doctor` filter** (8.2, 11.3; review F21-R2). `TestDockerSmokeExpectations` holds the step's
-  lists to doctor's checks and codes on every Go change, but a pull request that changes only doctor doesn't run
-  docker-smoke, so a change of which existing code a check gives in the smoke's setup shows only on the push to
-  `main` and in the nightly. F21 listed the filter for the integrator, and the group 15 integration left ci.yml as
-  it was; not scheduled.
+- **ci.yml has no `doctor` filter** (8.2, 11.3; review F21-R2). `TestDockerSmokeExpectations` holds the step's lists to
+  doctor's checks and codes on every Go change, but a pull request that changes only doctor doesn't run docker-smoke, so
+  a change of which existing code a check gives in the smoke's setup shows only on the push to `main` and in the
+  nightly. F21's own 11.3 text named the filter as the integrator's to add, but F21's report did not carry it among its
+  blocked items, and the group 15 integration judged ci.yml needed no change (its own pull request touched
+  `deploy/docker/**`); not scheduled.
 
 Decided after group 16 (an engineering call the owner delegated; README §6 "Decided after group 16" (6)):
 
