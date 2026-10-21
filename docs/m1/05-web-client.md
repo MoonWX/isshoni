@@ -2802,6 +2802,15 @@ choice:
   itself a region of the same name, so the page has no two "Connection test" landmarks. The bandwidth calculator
   starts with the exit scenario of 04 §13.4 (5 people, 2 sharing, 8 thumbnails, 1080p60, Auto, 2 hours), checks the
   ranges before it asks, and marks the field the server refuses.
+- **`public_ip`'s two params of README F21** (04 §13.2), which the page renders since the group 15 integration
+  (README §6 "Decided after group 15" (4)): `unreachable`, the addresses only the server's machine can reach (a
+  `public_ip` such as `127.0.0.1`), as `doctor.part.unreachable` ("127.0.0.1 can only be reached from this
+  machine") in the contexts `doctor.public_ip.none_unreachable` (`none_unreachableSite` where the site is that
+  address), `no_ipv6_unreachable` and `ipv6_only_unreachable`; and `dockerBridge`, a container bridge's symmetric
+  NAT that the check let pass, as the note `doctor.part.bridgeNAT` after `public_ip.ok`, `no_ipv6` and `ephemeral`.
+  Both follow the CLI's words. Not yet: `doctor.fix.public_ip.fix_set` has no variant for `unreachable`, so the page
+  gives such a server the generic fix (set `public_ip` or a domain; a restart if the network came up late), where
+  the CLI says to set `public_ip` to the server's public address or to `auto`.
 - **The dashboard polls every 2 s while the page is visible** (`usePageVisible`: the Page Visibility API), never
   while it is hidden, and at once when it is shown again. **The freshness line** says when the snapshot was made,
   to the second (`generatedAt`, not announced to screen readers: a time that changes every 2 s would talk over the
@@ -3365,7 +3374,7 @@ export default defineConfig({
 | i18n | every generated error code maps to an existing `en.json` key (also enforced by `check:i18n`) |
 | `check:i18n`'s unused-key warnings (`app/checkI18nUnused.node.test.ts`; README S93, §16.5) | `unusedMessages` counts literal keys and plural bases, a key written out anywhere, a key built at run time as far as it is written (a string head only below a namespace), what rules 2 and 3 require, the namespaces read whole and `$t()` nesting, and names the namespaces a template head covers whole; `messagePositions` gives each message's line and column; the script warns about each unused message at its place and passes, notes the namespaces it can't check, and fails when a message the code asks for is gone; on this package it passes, and a copy of `en.json` without a used message fails while one with a message no code uses warns |
 | `viewer/listening.ts`, `share/shareUi.ts` (README S93, §16.6) | "Now listening to …" when the sound moves to a share that was there, not for a new share, "your share" for this user's share from another device, nothing once detached; "You're live" and "Sharing stopped" in the assertive region |
-| `admin/doctorText.ts` and `doctorCatalog.node.test.ts` (README S91, §15.3; `dashboardText.ts` is tested through `DashboardPage.test.tsx`, §19.2, and its NAT names, `dockerBridge` included, in `dashboardText.test.ts`, README F22) | doctor's golden report renders from the catalog with no key or placeholder left and reads like the CLI's text; the variant the params pick (contexts, plurals), owners named as the CLI names them, every provider's firewall text, the server's English for an unknown code or fix code; fixes with the environment's commands, quoted paths, both owner cases, the server's own certificate sentence, a certificate code's fix without a report and without a command that depends on how the server runs; the links of a check; the catalog against the CLI's codes both ways and a name for every check id |
+| `admin/doctorText.ts` and `doctorCatalog.node.test.ts` (README S91, §15.3; `dashboardText.ts` is tested through `DashboardPage.test.tsx`, §19.2, and its NAT names, `dockerBridge` included, in `dashboardText.test.ts`, README F22) | doctor's golden report renders from the catalog with no key or placeholder left and reads like the CLI's text; the variant the params pick (contexts, plurals; since the group 15 integration `public_ip`'s `unreachable` on `none`, both of its site cases, `no_ipv6` and `ipv6_only`, and the bridge note of `dockerBridge` on `ok`, README F21, §15.3), owners named as the CLI names them, every provider's firewall text, the server's English for an unknown code or fix code; fixes with the environment's commands, quoted paths, both owner cases, the server's own certificate sentence, a certificate code's fix without a report and without a command that depends on how the server runs; the links of a check; the catalog against the CLI's codes both ways and a name for every check id |
 
 01 owns the `SignalClient`, `codecs.ts` and registry tests (01 §19).
 
@@ -3851,15 +3860,30 @@ Decided after group 14 (engineering calls the owner delegated; README §6 "Decid
 - **`a11y.spec` checks both colour schemes** and waits until the page's colours stand still before axe runs
   (§16.6, §19.3; README S93).
 
+Decided after group 15 (an engineering call the owner delegated; README §6 "Decided after group 15" (4)):
+- **The Doctor page renders README F21's `public_ip` params** (§15.3; 04 §13.2), done by the group 15 integration
+  in `admin/doctorText.ts` and `en.json`, outside a slice: the addresses of `unreachable` on `none`, `no_ipv6` and
+  `ipv6_only`, and the bridge note of `dockerBridge` on `ok`, `no_ipv6` and `ephemeral`, in the CLI's words. The fix
+  `public_ip.fix_set` has no variant for `unreachable` yet; not scheduled.
+
+Decided after group 16 (an engineering call the owner delegated; README §6 "Decided after group 16" (1), (3)):
+- **A container bridge's symmetric NAT reads as the bridge's** on the dashboard and in the connection test (§14.2,
+  §15.3; README F22), from the server's `dockerBridge` next to `nat`, which doctor's own rule fills: "symmetric in
+  the container's bridge network, which doesn't matter: friends reach the published ports", and a connection-test
+  line with the published ports instead of the text for a server without a public address. Every other kind reads
+  as before, with or without the flag, and `ConnTestResult.server.dockerBridge` is there only when the server sent
+  `true`, so "Copy result" is unchanged for every other server. The slice needed `runConnTest.ts`,
+  `DashboardPage.tsx` and the `admin` namespace's lazy file beyond its listed paths.
+
 **Open, for the owner** (README §6):
 - **Picture-in-picture on Android Chrome** (§12.5; raised after group 6, still open after groups 7, 8, 9, 10, 11, 12,
-  13 and 14). The rule says "desktop only" and hides PiP on iOS. README S56 built it by capability: the button is there
-  wherever the browser reports PiP and the device is not iOS, which includes Android Chrome. The two readings differ
-  only there. Until the owner answers, the rule in §12.5 is not changed and the code stays as built; "keep it" needs
-  one sentence in §12.5, "hide it" one more condition in the platform's `pip` capability (§8).
+  13, 14, 15 and 16). The rule says "desktop only" and hides PiP on iOS. README S56 built it by capability: the
+  button is there wherever the browser reports PiP and the device is not iOS, which includes Android Chrome. The two
+  readings differ only there. Until the owner answers, the rule in §12.5 is not changed and the code stays as built;
+  "keep it" needs one sentence in §12.5, "hide it" one more condition in the platform's `pip` capability (§8).
 - **The sound when the focused share has none** (§12.3; raised after group 9, from README S72; still open after groups
-  10, 11, 12, 13 and 14). Focus on a share without sound, automatic or picked, leaves nothing from the stage heard
-  ("audio follows focus" taken literally). The alternative is to keep the previous share's sound playing until a share
-  with sound is focused. It is not blocking: before S72 such a page was silent too. Until the owner answers, the rule
-  in §12.3 is not changed and the code stays as S72 built it; keeping the previous sound would be a change to the
-  settle step of §12.3 (`settleSound`), which today gives the sound to the stage's share or to nothing.
+  10, 11, 12, 13, 14, 15 and 16). Focus on a share without sound, automatic or picked, leaves nothing from the stage
+  heard ("audio follows focus" taken literally). The alternative is to keep the previous share's sound playing until
+  a share with sound is focused. It is not blocking: before S72 such a page was silent too. Until the owner answers,
+  the rule in §12.3 is not changed and the code stays as S72 built it; keeping the previous sound would be a change
+  to the settle step of §12.3 (`settleSound`), which today gives the sound to the stage's share or to nothing.
