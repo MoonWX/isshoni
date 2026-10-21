@@ -1,7 +1,7 @@
 // The project site (docs/m1/06-deploy-and-ci.md §10, "06" below): VitePress over docs/, published to GitHub Pages
 // at https://moonwx.github.io/isshoni/ by .github/workflows/site.yml.
 //
-// - The design documents stay on GitHub: docs/PLAN.md and docs/m1/ are not pages of the site (srcExclude).
+// - The design documents stay on GitHub: docs/PLAN.md, docs/m1/ and docs/m2/ are not pages of the site (srcExclude).
 // - No request leaves for another origin (06 §10.1): local search, the default theme's bundled Inter font (never
 //   Google Fonts), no analytics, no cookies, no embeds. scripts/check-site.mjs checks the built site for it.
 // - The server, the installer and the web client link to fixed anchors here (06 §10.4): /troubleshooting#doctor-<id>,
@@ -26,7 +26,7 @@ export default defineConfig({
   // /install/docker, not /install/docker.html. GitHub Pages serves docker.html for both.
   cleanUrls: true,
   // The design documents (06 D11, §17) and this site's own tooling are no pages.
-  srcExclude: ['PLAN.md', 'm1/**', 'scripts/**'],
+  srcExclude: ['PLAN.md', 'm1/**', 'm2/**', 'scripts/**'],
   // The default theme's Inter comes from its own files; the Google Fonts import is never used (06 §10.1).
   useWebFonts: false,
   // Last-updated dates would need the git history of every page in CI, and say little on a small site.

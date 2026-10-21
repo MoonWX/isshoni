@@ -43,6 +43,7 @@ on:
       - 'docs/**'
       - '!docs/PLAN.md'
       - '!docs/m1/**'
+      - '!docs/m2/**'
       - 'deploy/keys/allowed_signers'
       - '.github/workflows/site.yml'
   workflow_dispatch:

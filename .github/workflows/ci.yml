@@ -115,6 +115,7 @@ jobs:
               - 'web/src/conntest/codes.json'
               - '!docs/PLAN.md'
               - '!docs/m1/**'
+              - '!docs/m2/**'
             tools:
               - 'tools/**'
             # The root README.md, which every release archive carries (06 §3): it feeds
