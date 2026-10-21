@@ -2,9 +2,12 @@ package media_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/MoonWX/isshoni/internal/media"
@@ -38,32 +41,121 @@ func TestAudioConstants(t *testing.T) {
 	}
 }
 
-// TestParseAudioReportNotImplemented: until WA26, ParseAudioReport says so with an internal *media.Error.
-func TestParseAudioReportNotImplemented(t *testing.T) {
+// TestParseAudioReport: 05 §12.1's example parses into the strict decode's value; unknown fields are ignored (the
+// report changes only additively).
+func TestParseAudioReport(t *testing.T) {
+	want := strictDecode(t, []byte(reportV1))
 	r, err := media.ParseAudioReport([]byte(reportV1))
-	var me *media.Error
-	if !errors.As(err, &me) || me.Code != media.CodeInternal || me.Reason != "not_implemented" ||
-		me.Op != "parse_audio_report" {
-		t.Fatalf("ParseAudioReport = %v, want an internal not_implemented *media.Error", err)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(r, media.AudioReport{}) {
-		t.Errorf("ParseAudioReport returned %+v with its error", r)
+	if !reflect.DeepEqual(r, want) {
+		t.Errorf("ParseAudioReport =\n%+v\nwant\n%+v", r, want)
 	}
-	if errors.Is(err, media.ErrInvalid) {
-		t.Error("not implemented is not invalid input")
+	extended := strings.Replace(reportV1, `"v": 1,`, `"v": 1, "later": {"x": [1, "a"]}, "flags": 3,`, 1)
+	extended = strings.Replace(extended, `"pids": 6,`, `"pids": 6, "cpu": 0.5,`, 1)
+	if extended == reportV1 {
+		t.Fatal("the test document did not change")
 	}
+	if r, err := media.ParseAudioReport([]byte(extended)); err != nil || !reflect.DeepEqual(r, want) {
+		t.Errorf("with unknown fields: %v, %+v", err, r)
+	}
+}
+
+// TestParseAudioReportErrors: a document that is not a report is internal, a report of another version is
+// dependency with Reason "abi" (05 §13.1: a DLL of another release), and neither error quotes the document.
+func TestParseAudioReportErrors(t *testing.T) {
+	const secret = "Secret Voice App"
+	for _, tc := range []struct {
+		name   string
+		doc    string
+		code   media.ErrorCode
+		reason string
+	}{
+		{"empty", ``, media.CodeInternal, ""},
+		{"not JSON", `Secret Voice App`, media.CodeInternal, ""},
+		{"truncated", reportV1[:len(reportV1)/2], media.CodeInternal, ""},
+		{"trailing data", reportV1 + `{"v": 1}`, media.CodeInternal, ""},
+		{"a list", `[{"v": 1}]`, media.CodeInternal, ""},
+		{"a wrong type", `{"v": 1, "apps": [{"name": "Secret Voice App", "pids": "Secret Voice App"}]}`,
+			media.CodeInternal, ""},
+		{"a negative seq", `{"v": 1, "seq": -1}`, media.CodeInternal, ""},
+		{"null", `null`, media.CodeDependency, "abi"},
+		{"no version", `{"seq": 1, "apps": [{"name": "Secret Voice App"}]}`, media.CodeDependency, "abi"},
+		{"version 0", `{"v": 0}`, media.CodeDependency, "abi"},
+		{"version 2", strings.Replace(reportV1, `"v": 1,`, `"v": 2,`, 1), media.CodeDependency, "abi"},
+	} {
+		r, err := media.ParseAudioReport([]byte(tc.doc))
+		me, ok := errors.AsType[*media.Error](err)
+		if !ok || me.Code != tc.code || me.Reason != tc.reason || me.Op != "parse_audio_report" {
+			t.Errorf("%s: ParseAudioReport = %v, want %s (%q) with Op parse_audio_report", tc.name, err, tc.code,
+				tc.reason)
+			continue
+		}
+		if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "Spotify") {
+			t.Errorf("%s: the error quotes the document: %v", tc.name, err)
+		}
+		if !reflect.DeepEqual(r, media.AudioReport{}) {
+			t.Errorf("%s: a report %+v with the error", tc.name, r)
+		}
+	}
+	if _, err := media.ParseAudioReport([]byte(`{"v": 2}`)); !errors.Is(err, media.ErrDependency) {
+		t.Errorf("version 2: %v, want ErrDependency", err)
+	}
+}
+
+// TestAudioControllerErrors pins the Go side of 05 §13.1's status → error table: what errors.Is finds for each
+// row's error, so every implementation's errors are handled alike.
+func TestAudioControllerErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		err   *media.Error
+		is    []error
+		isNot []error
+	}{
+		{"IM_ERR_BAD_STATE", &media.Error{Code: media.CodeAudioNotRunning, Op: "audio_set_muted",
+			Detail: "im_audio_set_muted: IM_ERR_BAD_STATE"},
+			[]error{media.ErrAudioNotRunning}, []error{media.ErrAudioUnavailable, media.ErrStopped, media.ErrInvalid}},
+		{"IM_ERR_INVALID_ARG", &media.Error{Code: media.CodeInvalid, Op: "set_exclusions", Detail: "rule 3: kind"},
+			[]error{media.ErrInvalid}, []error{media.ErrAudioNotRunning}},
+		{"IM_ERR_TIMEOUT", &media.Error{Code: media.CodeTimeout, Op: "list_audio_apps"},
+			[]error{context.DeadlineExceeded}, []error{context.Canceled, media.ErrCancelled}},
+		{"IM_ERR_ABI", &media.Error{Code: media.CodeDependency, Reason: "abi", Op: "audio_watch", Detail: "struct_size"},
+			[]error{media.ErrDependency}, []error{media.ErrInvalid}},
+		{"IM_ERR_AUDIO_UNAVAILABLE", &media.Error{Code: media.CodeAudioUnavailable, Op: "audio_sound_check"},
+			[]error{media.ErrAudioUnavailable}, []error{media.ErrAudioNotRunning}},
+	} {
+		wrapped := fmt.Errorf("audio service: %w", tc.err)
+		for _, target := range tc.is {
+			if !errors.Is(tc.err, target) || !errors.Is(wrapped, target) {
+				t.Errorf("%s: %v is not %v", tc.name, tc.err, target)
+			}
+		}
+		for _, target := range tc.isNot {
+			if errors.Is(tc.err, target) {
+				t.Errorf("%s: %v is %v", tc.name, tc.err, target)
+			}
+		}
+	}
+}
+
+// strictDecode decodes doc as AudioReport with unknown fields disallowed.
+func strictDecode(t *testing.T, doc []byte) media.AudioReport {
+	t.Helper()
+	dec := json.NewDecoder(bytes.NewReader(doc))
+	dec.DisallowUnknownFields()
+	var r media.AudioReport
+	if err := dec.Decode(&r); err != nil {
+		t.Fatal(err)
+	}
+	return r
 }
 
 // TestAudioReportFields decodes 05 §12.1's example strictly: every field the DLL writes has a field with its name in
 // AudioReport (the json tags are the DLL's camelCase names), and every field of AudioReport and of the first element
 // of each list is filled from it.
 func TestAudioReportFields(t *testing.T) {
-	dec := json.NewDecoder(bytes.NewReader([]byte(reportV1)))
-	dec.DisallowUnknownFields()
-	var r media.AudioReport
-	if err := dec.Decode(&r); err != nil {
-		t.Fatal(err)
-	}
+	r := strictDecode(t, []byte(reportV1))
 	checkFilled(t, "AudioReport", reflect.ValueOf(r))
 	if r.Seq != 118 || r.QPCNanos != 81234567890123 || r.Mode != media.AudioExcludeApps || r.Probe.LevelDB != -60.1 ||
 		r.Sessions[0].Created != "133725183442731234" || r.Counters.AudioCPUMsPerS != 6.2 || len(r.Apps) != 2 ||

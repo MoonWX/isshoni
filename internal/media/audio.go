@@ -2,6 +2,8 @@ package media
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -126,23 +128,24 @@ type AudioDeviceState struct {
 	CaptureEndpoints int  `json:"captureEndpoints"`
 }
 
-// AudioApp is one apps[] row of 05 §12.1. 01 relies on ID, Name and UsesMic.
+// AudioApp is one apps[] row of 05 §12.1. 01 relies on ID, Name and UsesMic. The fields are in the order the DLL
+// writes them (05 §12.1), so encoding/json writes a report in the order of the golden files.
 type AudioApp struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
+	ID      string `json:"id"`   // the app id of the rule that matched ("discord"), else "exe:" + the app root's exe
+	Name    string `json:"name"` // local only: never logged, never sent
 	Exe     string `json:"exe"`
 	Verdict string `json:"verdict"` // "heard" | "kept_out" | "not_captured" | "pending"
 	// Reason is, when kept out: "builtin", "user", "mic", "viewer", "isshoni"; when not captured: "launcher",
 	// "tree", "pid_reuse", "limit", "capture_failed"; when heard: "".
 	Reason   string `json:"reason"`
-	Detail   string `json:"detail"` // for "tree" and "pid_reuse": the kept-out app's name; else ""
-	Playing  bool   `json:"playing"`
+	Playing  bool   `json:"playing"` // a session active, or its meter above −70 dBFS, within the last 2 s
 	UsesMic  bool   `json:"usesMic"`
 	Browser  bool   `json:"browser"`
 	Shared   bool   `json:"shared"`
 	PIDs     int    `json:"pids"`
 	Sessions int    `json:"sessions"`
 	Streams  int    `json:"streams"`
+	Detail   string `json:"detail"` // for "tree" and "pid_reuse": the kept-out app's name; else ""
 	// Warnings are "shared_app_uses_mic", "shared_app_kept_out", "included_uses_mic" and "multi_process_session".
 	Warnings []string `json:"warnings"`
 }
@@ -196,12 +199,28 @@ type AudioEvent struct {
 	Detail string `json:"detail"`
 }
 
-// ParseAudioReport parses im_list_audio_apps' JSON (05 §12.1). It rejects v != 1 and ignores unknown fields.
+// reportVersion is the version of im_list_audio_apps' JSON that this package reads (05 §12.1: "v": 1).
+const reportVersion = 1
+
+// ParseAudioReport parses im_list_audio_apps' JSON (05 §12.1). It ignores unknown fields (the report changes only
+// additively) and rejects every version but 1. Its errors are *Error with Op "parse_audio_report": a document that is
+// not a report is internal; a report of another version is dependency with Reason "abi", like every other mismatch
+// between the binding and the DLL (an installation that mixes two releases gets 03's reinstall text). An error never
+// quotes the document, which names apps (docs/m2/README.md §4, "Logging").
 //
-// It is not implemented yet (slice WA26 fills it in): it returns an internal *Error with Reason "not_implemented",
-// as the engine answers IM_ERR_NOT_IMPLEMENTED (01 §5.2).
+// The golden reports in testdata/audio (05 §13.1) are parsed by this package's tests and written byte for byte by
+// the C++ report writer's tests, so the two sides can't drift.
 func ParseAudioReport(b []byte) (AudioReport, error) {
-	return AudioReport{}, &Error{Code: CodeInternal, Op: "parse_audio_report", Reason: "not_implemented"}
+	const op = "parse_audio_report"
+	var r AudioReport
+	if err := json.Unmarshal(b, &r); err != nil {
+		return AudioReport{}, &Error{Code: CodeInternal, Op: op, Detail: "the report is not JSON: " + err.Error()}
+	}
+	if r.V != reportVersion {
+		return AudioReport{}, &Error{Code: CodeDependency, Op: op, Reason: "abi",
+			Detail: fmt.Sprintf("report version %d, want %d", r.V, reportVersion)}
+	}
+	return r, nil
 }
 
 // AudioLevel is one app's level (05 §12.2).
@@ -233,6 +252,31 @@ type SoundCheckResult struct {
 // eng.(media.AudioController). Every method is safe for concurrent use. WatchAudio, UnwatchAudio, SetExclusions,
 // AudioReport, AudioLevels and SoundCheck work without a Session; SetAudioMode and SetAudioMuted need a running
 // Session with audio (else ErrAudioNotRunning).
+//
+// Its errors are 05 §13.1's status → error table, the same from every implementation (the Windows binding maps the
+// DLL's statuses, the fake makes them itself), so callers handle one set of errors whatever the engine. Each is an
+// *Error whose Op is the C export's name without "im_" ("audio_watch", "audio_unwatch", "set_exclusions",
+// "audio_set_mode", "audio_set_muted", "list_audio_apps", "audio_levels_get", "audio_sound_check"), and errors.Is
+// matches it by its code:
+//
+//	Native status, from                          Go error                                   errors.Is target
+//	IM_ERR_BAD_STATE: im_audio_levels_get,       {CodeAudioNotRunning, Op, Detail}          ErrAudioNotRunning
+//	  im_audio_set_mode, im_audio_set_muted,
+//	  any audio call after IM_INIT_NO_AUDIO
+//	IM_ERR_INVALID_ARG: im_set_exclusions,       {CodeInvalid, Op, Detail: im_last_error}   ErrInvalid
+//	  im_audio_watch, im_audio_set_mode
+//	IM_ERR_TIMEOUT (−15): the COM wait of        {CodeTimeout, Op}; never retried           context.DeadlineExceeded
+//	  im_list_audio_apps, im_audio_sound_check
+//	IM_ERR_ABI: a struct the DLL refuses         {CodeDependency, Reason "abi", Op, Detail} ErrDependency
+//	others                                       01 §5.2's mapping (audio_unavailable, internal, …)
+//
+// IM_ERR_BAD_STATE from every other call of the engine is internal (04 §12.2); the first row is the audio exception.
+// Mode validation needs no call and comes first: AudioConfig.Mode at start accepts "", AudioExcludeApps and
+// AudioTestTone, and SetAudioMode accepts AudioOff and AudioExcludeApps; any other mode (AudioEverything included,
+// docs/m2/README.md §3 item 15) is CodeInvalid, also when no session runs. Exclusions that the DLL refuses (more
+// than 512 rules, an unknown kind or source, an empty value, a malformed pid, an app id outside [a-z0-9:._-]{1,63},
+// a NUL byte) are CodeInvalid, with a Detail that names the rule's index, never its value. A report that the binding
+// can't read is ParseAudioReport's error.
 type AudioController interface {
 	WatchAudio(ctx context.Context, ex Exclusions) error
 	UnwatchAudio(ctx context.Context) error
