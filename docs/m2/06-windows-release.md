@@ -65,7 +65,7 @@ page, `install-desktop.ps1`, the updater and the site build URLs from them. `<v>
 | `isshoni-desktop-update.json` | update manifest (§8.2), fixed name so `releases/latest/download/…` works | yes |
 | `isshoni-desktop-update.json.sig` | SSHSIG of the manifest by the update key (§8.3), uploaded by `sign` | **no** (it is a signature, like `checksums.txt.sig`) |
 | `install-desktop.ps1` | the generic script, stamped with `<v>` and an empty server (§7) | yes |
-| `isshoni-desktop_<v>_windows_amd64_tools.zip` | **reserved**: the `native:dist` zip (§17: `isshoni-enginetest.exe`, `isshoni-latency.exe`, `hwcheck.ps1`, the release DLL and the FFmpeg DLLs), published only if the owner answers 04 §17 Q3 (community testing) yes | yes, when published |
+| `isshoni-desktop_<v>_windows_amd64_tools.zip` | **reserved**: the `native:dist` zip (§17: `isshoni-enginetest.exe`, `g2g.exe`, `hwcheck.ps1`, the release DLL and the FFmpeg DLLs), published only if the owner answers 04 §17 Q3 (community testing) yes | yes, when published |
 
 All but the `.sig` get GitHub build-provenance attestations (M1 06 §9.3 `build` step 9). The release notes say that
 `isshoni_<v>_windows_{amd64,arm64}.zip` are the experimental **server** builds, not the app (§11.7).
@@ -94,18 +94,19 @@ Not installed: OpenH264 (downloaded at runtime into `%LOCALAPPDATA%\isshoni\code
 notice, by 03 through 04's `native.InstallOpenH264`; never in an installer), x264 (dev builds only), the WebView2
 bootstrapper (it runs from `$PLUGINSDIR` and is deleted with it).
 
-**Two data roots** (both per user; `os.UserConfigDir()` is the Roaming folder on Windows):
+**One data root** (per user and per PC; nothing roams, because device ids and the `CRED_PERSIST_LOCAL_MACHINE`
+credentials are per PC; 03 §14.1):
 
 | Root | Holds | Owner |
 |---|---|---|
-| `%APPDATA%\isshoni\` | `settings.json` (+ `.bak`) | 03 (§14.1) |
+| `%LOCALAPPDATA%\isshoni\` | `settings.json` (+ `.bak`) | 03 (§14.1) |
 | | `servers.json` (origins, server names, usernames, device ids, last room) | 02 (§11.6) |
-| `%LOCALAPPDATA%\isshoni\` | `logs\`, `WebView2\` | 03 |
+| | `logs\`, `WebView2\` | 03 |
 | | `codecs\` (OpenH264, written through 04's `native.InstallOpenH264`) | 03 |
 | | `updates\` (§8.7) | this document |
 
-The refresh tokens are not in either root: they are Windows Credential Manager entries `isshoni:v1:<origin>` (02
-§11.5). Every uninstall forgets the credentials (§6.8); both data roots stay unless the user asks to purge.
+The refresh tokens are not in the data root: they are Windows Credential Manager entries `isshoni:v1:<origin>` (02
+§11.5). Every uninstall forgets the credentials (§6.8); the data root stays unless the user asks to purge.
 
 ### 2.3 Registry
 
@@ -124,7 +125,7 @@ All values are written by the installer unless noted. HKLM is never written.
 | `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\isshoni` | `DisplayName` = `isshoni`, `DisplayVersion` = `<v>`, `Publisher` = `isshoni project`, `DisplayIcon` = `"$INSTDIR\isshoni.exe",0`, `InstallLocation` = `$INSTDIR`, `UninstallString` = `"$INSTDIR\uninstall.exe"`, `QuietUninstallString` = `"$INSTDIR\uninstall.exe" /S`, `URLInfoAbout` = `https://moonwx.github.io/isshoni/`, `HelpLink` = `https://moonwx.github.io/isshoni/download#windows`, `NoModify` = 1, `NoRepair` = 1, `EstimatedSize` (KiB) | | Apps & features entry |
 | `HKCU\Software\Classes\isshoni` | (Default) = `URL:isshoni`, `URL Protocol` = `""` | SZ | the `isshoni://` scheme |
 | `HKCU\Software\Classes\isshoni\DefaultIcon` | (Default) = `"$INSTDIR\isshoni.exe",0` | SZ | |
-| `HKCU\Software\Classes\isshoni\shell\open\command` | (Default) = `"$INSTDIR\isshoni.exe" --deeplink -- "%1"` | SZ | 02 §12.2: in a `--deeplink` launch the app takes exactly one argument after `--` as the link and honors no other flag, so `--purge-data`, `--forget-credentials` and `--update-now` cannot be smuggled in |
+| `HKCU\Software\Classes\isshoni\shell\open\command` | (Default) = `"$INSTDIR\isshoni.exe" --open-url "%1"` | SZ | 02 §12.2, 03 §13.1: a launch that contains `--open-url` takes exactly the next argument as the link, which must start with `isshoni:`, and honors no other flag, so `--purge-data`, `--forget-credentials` and `--update-now` cannot be smuggled in |
 | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` | `isshoni` | SZ | written by 03's "Start with Windows" setting, **removed** by the uninstaller |
 | `HKCU\Software\Classes\AppUserModelId\io.isshoni.desktop` | `DisplayName`, `IconUri`, `CustomActivator` = `{<guid>}`, … | SZ | **written by the app (03)**: Wails' notifications service registers the toast AUMID at run time (03 §15); deleted by the uninstaller (§6.8) |
 | `HKCU\Software\Classes\CLSID\{<guid>}` (the `CustomActivator` above) | `LocalServer32` (Default) = `"$INSTDIR\isshoni.exe" …` | SZ | **written by the app (03)**: the toast COM activator; deleted by the uninstaller only when `LocalServer32` points into `$INSTDIR` (§6.8) |
@@ -141,12 +142,12 @@ Shortcut: `$SMPROGRAMS\isshoni.lnk` (the user's Start menu) → `$INSTDIR\isshon
 |---|---|---|
 | Named mutex `Local\io.isshoni.desktop.running` | 03 creates it at start and holds it until the process exits | the installer and uninstaller wait for it to disappear (§6.7) |
 | Named mutex `Local\io.isshoni.desktop.installing` | the installer (`installer.nsi`) creates it in `.onInit`, in every mode (interactive, `/S`, `/S /UPDATE`), and holds it for its whole run; it closes the handle only right before it starts the app (`/LAUNCH`, `/RELAUNCH`, the Finish checkbox), which is its last action, or when it exits | 03 probes it with `OpenMutexW(SYNCHRONIZE, FALSE, …)` at every normal start, after the shell relaunch and before single instance and the running mutex (03 §13.4, new step 2a): when it exists, a start from a link writes the link's origin to `PendingServer` and its room id to `PendingRoom` (§2.3; the newest link wins), any start then exits 0 without becoming the first instance, without building the updater and without calling `Apply`. The installer's own app start then handles the link. A second installer that finds it exits 8 (§6.4, §6.7) |
-| `isshoni.exe --version` | 03 | prints one JSON line `{"version","commit","date","protocol","engineAbi",…}` to stdout (also when stdout is redirected from a GUI-subsystem process) and exits 0; opens no window; `engineAbi` is Go's compiled `IM_ABI_VERSION` (`65536` = major 1 << 16 \| minor 0), read without loading the DLL |
-| `isshoni.exe --self-check=<path>` | 03 with 04 | opens no window; `native.Load(native.Options{Dir: <exe dir>})`, then `Engine.Probe(ctx, false)` (quick; it loads FFmpeg, 04 §5.3), then `Engine.BuildInfo()`; writes `{"ok": bool, "version": "<v>", "engine": {"loaded": bool, "abi": 65536, "ffmpegLoaded": bool, "ffmpegLicense": "<BuildInfo.ffmpeg.license>", "testHooks": false}}` and exits 0 when `ok`. `ok` requires `loaded`, ABI major 1, `ffmpegLoaded`, `ffmpegLicense` = `"LGPL version 2.1 or later"` and `testHooks` false; no encoder is required, so it passes on a GPU-less CI VM |
-| `isshoni.exe --deeplink -- <url>` | 03 parses it; grammar 02 §12 | the protocol handler's entry (§2.3); exactly one argument after `--`, no other flag honored in that launch |
+| `isshoni.exe --version` | 03 | prints one JSON line `{"version","commit","date","protocol","engineAbi",…}` to stdout (also when stdout is redirected from a GUI-subsystem process) and exits 0; opens no window; `engineAbi` is the ABI major Go was built for (`media.ABIVersion`, `1`; 01 §5.1), read without loading the DLL |
+| `isshoni.exe --self-check=<path>` | 03 with 04 | opens no window; `native.Open(native.Options{Dir: <exe dir>})`, then `Engine.Probe(ctx, false)` (quick; it loads FFmpeg, 04 §5.3), then `Engine.BuildInfo()`, then 03's asset handler over the bundled SPA (03 §13.4); writes `{"ok": bool, "version": "<v>", "engine": {"loaded": bool, "abi": 1, "ffmpegLoaded": bool, "ffmpegLicense": "<BuildInfo.ffmpeg.license>", "testHooks": false}, "spa": {"ok": bool}}` and exits 0 when `ok`; `abi` is the DLL's ABI major (01 §5.1's `Info().ABI`). `ok` requires `loaded`, `abi` 1, `ffmpegLoaded`, `ffmpegLicense` = `"LGPL version 2.1 or later"`, `testHooks` false and `spa.ok`; no encoder is required, so it passes on a GPU-less CI VM |
+| `isshoni.exe --open-url <url>` | 03 parses it; grammar 02 §12 | the protocol handler's entry (§2.3); a launch that contains `--open-url` takes exactly the next argument, which must start with `isshoni:`, and honors no other flag (02 §12.2, 03 §13.1) |
 | `isshoni.exe --updated-from=<old>` | 03 | started by the installer after an update (§8.7) |
-| `isshoni.exe --forget-credentials` | 03 parses it; 02 implements it | opens no window; runs 02 §11.7's `deviceauth.Servers.ForgetAll` (`Unlink` for each linked server with a 5 s budget each, then deletes every `isshoni:v1:*` credential); exits 0 even when offline. Run by **every** uninstall (§6.8) |
-| `isshoni.exe --purge-data` | 03 with 02 | opens no window; runs 02's `deviceauth.Servers.ForgetAll` exactly as `--forget-credentials`, then deletes both data roots of §2.2 (`%APPDATA%\isshoni\` and `%LOCALAPPDATA%\isshoni\`); exit 0 |
+| `isshoni.exe --forget-credentials` | 03 parses it; 02 implements it | opens no window; runs 02 §11.7's `deviceauth.Servers.ForgetAll` (every linked server revoked concurrently under one 5 s budget, then every `isshoni:v1:*` credential deleted); exits 0 even when offline. Run by **every** uninstall (§6.8) |
+| `isshoni.exe --purge-data` | 03 with 02 | opens no window; runs 02's `deviceauth.Servers.ForgetAll` exactly as `--forget-credentials` (the same one 5 s budget), then deletes the data root of §2.2 (`%LOCALAPPDATA%\isshoni\`); exit 0. Run by a `/PURGE` uninstall (§6.8) |
 | `isshoni.exe --update-now` | 03, only in builds with the `updatetest` tag | runs one check without waiting for `WizardDone` and applies a found update without a window (§8.11) |
 | No job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` around the app | 03 | the installer started by the updater must outlive the app |
 
@@ -155,7 +156,7 @@ Shortcut: `$SMPROGRAMS\isshoni.lnk` (the user's Start menu) → `$INSTDIR\isshon
 | What | Pin (as of 2026-10-21) | Where pinned | Bumped |
 |---|---|---|---|
 | Go | the M1 toolchain (`go.mod` `toolchain`, `.tool-versions`) | unchanged | M1's monthly tool PR |
-| Wails v3 | `v3.0.0-beta.34` unless 03 picks another exact tag; follows the GA | `go.mod` (03), `tools/wails3/go.mod` (`tool github.com/wailsapp/wails/v3/cmd/wails3`) and `@wailsio/runtime` in `web/package.json` + `web/package-lock.json` (the exact version 03's DA1 records for the pinned Wails), checked by `task lint:pins` | by hand, all three together (03 §3.3), with a Windows smoke and 03's origin test against `protocol.DesktopOrigins()` (D19; Dependabot ignores both) |
+| Wails v3 | `v3.0.0-beta.34` unless 03 picks another exact tag; follows the GA | `go.mod` (03), `tools/wails3/go.mod` (`tool github.com/wailsapp/wails/v3/cmd/wails3`) and `@wailsio/runtime` in `web/package.json` + `web/package-lock.json` (the exact version 03's DK1 records for the pinned Wails), checked by `task lint:pins` | by hand, all three together (03 §3.3), with a Windows smoke and 03's origin test against `protocol.DesktopOrigins()` (D19; Dependabot ignores both) |
 | Windows runner | `windows-2025` (not `windows-latest`, which moves) | workflows | when GitHub retires it |
 | Visual Studio / MSVC | any VS 2022 or VS 2026 instance (`[17.0,19.0)`) with the base C++ tools component, **toolset `14.44`** (an exact minor, not a prefix), Windows SDK `10.0.26100.0`; the selection step is below | `deploy/windows/tools.json`; the exact toolset build (`14.44.<build>`) is recorded in every build manifest | when the runner image drops the 14.44 toolset: a hand-made tool PR moves `toolset`, which also changes FFmpeg's reproducibility record (§4.6) |
 | vcpkg | the commit in `native/vcpkg.json` `builtin-baseline` (04 owns the file and `native/vcpkg-configuration.json`, both at the CMake root `native/`, 04 §2) | 04 | by hand, monthly with the tool pins |
@@ -616,7 +617,7 @@ starts without `--updated-from`).
 | 8 | another isshoni setup is running (the named mutex `Local\io.isshoni.desktop.installing` already existed in `.onInit`, §6.7); nothing was changed. Interactive: a message box `$(AnotherSetupRunning)` "Another isshoni setup is running. Wait for it to finish, then try again." first |
 
 Uninstaller: `/S`, `/PURGE` (run `isshoni.exe --purge-data` instead of `--forget-credentials`, then remove everything,
-both data roots included; §6.8); exit 0, 1 (cancelled), 3 (running).
+the data root included; §6.8); exit 0, 1 (cancelled), 3 (running).
 
 ### 6.5 System checks
 
@@ -680,11 +681,11 @@ both data roots included; §6.8); exit 0, 1 (cancelled), 3 (running).
 
 Removes, in order:
 1. Waits for the mutex (§6.7).
-2. **Always** (also under `/S`) runs `"$INSTDIR\isshoni.exe" --forget-credentials` (02 §11.7: every linked device is
-   revoked where reachable and every `isshoni:v1:*` credential deleted), so no live 90-day refresh token stays in
-   Credential Manager and no dead device on the Devices page. With `/PURGE` or the checkbox it runs `"$INSTDIR\isshoni.exe"
-   --purge-data` instead (the same `ForgetAll`, then both data roots). Either has a 30 s cap; a timeout or a non-zero
-   exit is logged and the uninstall continues.
+2. **Always** (also under `/S`) runs `"$INSTDIR\isshoni.exe" --forget-credentials` (02 §11.7's `Servers.ForgetAll`:
+   every linked device is revoked where reachable, under one 5 s budget for all servers, and every `isshoni:v1:*`
+   credential deleted), so no live 90-day refresh token stays in Credential Manager and no dead device on the Devices
+   page. With `/PURGE` or the checkbox it runs `"$INSTDIR\isshoni.exe" --purge-data` instead (the same `ForgetAll`,
+   then the data root). Either has a 30 s cap; a timeout or a non-zero exit is logged and the uninstall continues.
 3. The files listed in `install-files.txt` (and any `<file>.old` left by §6.7), then `install-files.txt`,
    `uninstall.exe` (NSIS deletes itself from its temp copy), then empty folders; both shortcuts.
 4. The Uninstall key; `HKCU\Software\Classes\isshoni` **only when its command points into `$INSTDIR`** (another
@@ -695,7 +696,7 @@ Removes, in order:
    otherwise stay); then `DeleteRegKey HKCU "Software\Classes\AppUserModelId\io.isshoni.desktop"`.
 6. `DeleteRegKey HKCU "Software\isshoni"`: the whole key, values and subkeys (for example `NotificationCategories`).
 
-Both data roots of §2.2 stay unless purged.
+The data root of §2.2 stays unless purged.
 
 ### 6.9 Prebuilt-uninstaller mode (SignPath-ready)
 
@@ -1283,7 +1284,7 @@ Only in builds with `-tags updatetest` (CI test builds, never a release):
   the app's channel setting, so the CI builds `0.0.1-ci.N` of §16 check and update;
 - 03's `--update-now` flag exists and skips the `WizardDone` wait.
 
-03's DA12 tests (an update offered in a test channel) build with `-tags updatetest` (`internal/desktop/e2ehost`, and
+03's DK12 tests (an update offered in a test channel) build with `-tags updatetest` (`internal/desktop/e2ehost`, and
 the CDP build if it is used) and set `ISSHONI_UPDATE_TEST_BASE` and `ISSHONI_UPDATE_TEST_SIGNERS`. Release builds keep
 the strict rule (`Eligible`: empty or `rc.N` only); the check of §5.2 step 3 fails if either variable name is in a
 shipped binary or the build tags are not exactly `production`.
@@ -1452,7 +1453,7 @@ The FFmpeg zip is not cached: it is a 1-second download from the deps release, v
 | `native-fuzz` | ubuntu-24.04: preset `host-fuzz` (04 §18.1), each fuzz target (`annexb_fuzz`, `sps_fuzz`, …) for 60 s with the corpus `native/common/tests/fuzz/corpus/`; a crash uploads the input as an artifact; 20 min |
 | `windows-asan` | windows-2025: the MSVC environment and vcpkg of §5.1 (no cache), `cmake --preset win-x64-asan`, build, `ctest --preset win-x64-asan --output-on-failure`; 45 min |
 | `goreleaser-full` (changed) | needs `windows-full`'s artifacts, so the snapshot carries real desktop files and `release:assets FULL=true DESKTOP=true` runs (the cosign bundle stand-in stays, M1 06 §8.5) |
-| `compat-servers` | the client core against the last two final server releases (§11.6): downloads each `isshoni_<v>_linux_amd64.tar.gz`, `checksums.txt` and `.sig`, verifies with `deploy/keys/allowed_signers`, starts each with `deploy/dev/isshoni.e2e.toml` on free ports and a temp data dir, creates the admin through `setup-url --json` and `POST /api/v1/auth/setup/complete` (as M1's distro tests do), then writes `ISSHONI_COMPAT_ADMIN_FILE` (below) and runs `go test ./internal/client/... -run '^TestCompatServer' -count=1` with `ISSHONI_COMPAT_SERVER_URL` and `ISSHONI_COMPAT_ADMIN_FILE`, so 02's `TestCompatServerDeviceFlow` (link and refresh against N−1, 02 §13.4) runs next to 01's media test (join, publish with the fake engine, receive). Against a server whose `/api/v1/info` lacks `deviceFlow` (every 0.1.x server), the tests assert only the `compat.FromInfo` verdict `update_server`/`no_device_flow` (02 §13.4), never join or publish: no M2 app can link to or use such a server. Skips with a note while fewer releases exist. 01 must still add its `TestCompatServer…` test (an open 01↔06 gap; 01 defines none yet) |
+| `compat-servers` | the client core against the last two final server releases (§11.6): downloads each `isshoni_<v>_linux_amd64.tar.gz`, `checksums.txt` and `.sig`, verifies with `deploy/keys/allowed_signers`, starts each with `deploy/dev/isshoni.e2e.toml` on free ports and a temp data dir, creates the admin through `setup-url --json` and `POST /api/v1/auth/setup/complete` (as M1's distro tests do), then writes `ISSHONI_COMPAT_ADMIN_FILE` (below) and runs `go test ./internal/client/... -run '^TestCompatServer' -count=1` with `ISSHONI_COMPAT_SERVER_URL` and `ISSHONI_COMPAT_ADMIN_FILE`, so 02's `TestCompatServerDeviceFlow` (link and refresh against N−1, 02 §13.4) runs next to 01's `TestCompatServer` (01 §14: join, publish with the fake engine, receive). Against a server whose `/api/v1/info` lacks `deviceFlow` (every 0.1.x server), the tests assert only the `compat.FromInfo` verdict `update_server`/`no_device_flow` (02 §13.4), never join or publish: no M2 app can link to or use such a server. Skips with a note while fewer releases exist |
 
 `ISSHONI_COMPAT_ADMIN_FILE` is a JSON file, mode 0600, written by the job after `setup/complete`:
 
@@ -1486,6 +1487,7 @@ jobs:
       !cancelled() && github.repository == 'MoonWX/isshoni' && github.actor == github.repository_owner &&
       (needs.build.result == 'success' || needs.fetch.result == 'success')
     runs-on: [self-hosted, windows, x64, isshoni-audio, "${{ inputs.os }}"]
+    environment: audiotest   # required reviewer: the owner, so every run waits for the owner's approval (05 §18.8)
     timeout-minutes: 30
 ```
 
@@ -1495,9 +1497,11 @@ jobs:
   Without it (suites `full` and `hwcheck` on any ref), `build` rebuilds from the dispatched ref with CI's stamping;
   such a report is diagnostic and never gates a release. The token that reads another run stays on GitHub's runner.
 - `run` downloads this run's artifact (no checkout, no secrets, no token use), runs `isshoni-audiotest.exe probe`, then
-  `isshoni-audiotest.exe run --suite <suite> --report audiotest-report.json` (05's CLI; exit 0 pass, 1 fail, 2
-  inconclusive, as spike S1's), uploads the report and writes a summary table (scenario, verdict, excluded-tone level).
-  An inconclusive result fails the job with "re-run with `-only <scenario>`".
+  the suite through 05's CLI (05 §18.2, the interface): suite `release` → `isshoni-audiotest.exe run -gate -out .`
+  (on the `isshoni-exit-tools` of the run named by `release_run_id`), suite `full` → `isshoni-audiotest.exe run -gate
+  -long -out .`; exit codes are 05's (0 every required case PASS, 1 a FAIL, 2 INCONCLUSIVE, 3 a required case
+  SKIPPED, 4 setup error), and any non-zero code fails the job. It uploads the report and writes a summary table
+  (scenario, verdict, excluded-tone level). An inconclusive result fails the job with "re-run with `-case <id>`".
 - **`suite: hwcheck`** (04 §14, §18.4): `run` unpacks `isshoni-native-tools` and executes `hwcheck.ps1` (probe,
   `capture` per available encoder, `bench`, `sessions -count 5`, `protect-check`) under the same guard and labels,
   with no checkout and no token, and uploads its result bundle (which carries no machine names or paths, 04 §14).
@@ -1508,8 +1512,9 @@ jobs:
 ### 10.5 The self-hosted runner (on the owner's PC; written up in `deploy/windows/runner/README.md`)
 
 - One registration per installed OS (the PC dual-boots Win11 and Win10 22H2): Settings → Actions → Runners → New
-  self-hosted runner → Windows x64, into `C:\actions-runner`, labels `isshoni-audio` and `win11` (or `win10`). Names
-  are generic labels, never the machine's host name.
+  self-hosted runner → Windows x64, into `C:\actions-runner`, labels `isshoni-audio` and `win11` (or `win10`), as an
+  **ephemeral** runner (`config.cmd --ephemeral`, 05 §18.8: it takes one job and then deregisters, so each test
+  session registers it again). Names are generic labels, never the machine's host name.
 - Runs as a **dedicated non-admin local account** (suggested name `isshoni-ci`) with no access to the owner's files or
   credentials, and **not as a service**: the owner signs in to that account (local or over RDP with "Remote Audio";
   spike S1's second run used RDP audio) and starts `run.cmd` for a test session, then stops it. WASAPI process
@@ -1517,7 +1522,8 @@ jobs:
 - The account's audio setup follows spike S1: Windows volume ≥ 50 %, Communications → "Do nothing", no other app
   playing.
 - Repository settings: Actions → General → "Require approval for all external contributors" (stricter than M1's
-  first-time-only default). The runner being offline except during a session is the real protection: a public
+  first-time-only default), and the environment `audiotest` with the owner as required reviewer (§10.4's `run` job
+  waits for that approval). The runner being offline except during a session is the real protection: a public
   repository's pull request can bring its own workflow file.
 - The manual Discord check (real Discord desktop in a call, YouTube in a browser, `isshoni-audiotest record`) runs in
   the same session and its one-line result goes into the release-prep PR (§11.8).
@@ -1617,13 +1623,13 @@ stage's list.
    dry-run key, as M1's `verify` does for `install.sh`) and runs it in **Windows PowerShell 5.1** with
    `ISSHONI_DOWNLOAD_BASE=https://127.0.0.1:<port>` and `ISSHONI_NO_LAUNCH=1`.
 6. `deploy/test/windows/smoke.ps1 -Version <v> -Mode release`: files and their SHA-256 against the stage list,
-   registry values, the protocol handler command exactly `"<InstallDir>\isshoni.exe" --deeplink -- "%1"`, shortcut
-   and its AUMID, `isshoni.exe --version` = `<v>` (with `engineAbi` 65536), `--self-check` `ok` with `ffmpegLoaded`
+   registry values, the protocol handler command exactly `"<InstallDir>\isshoni.exe" --open-url "%1"`, shortcut
+   and its AUMID, `isshoni.exe --version` = `<v>` (with `engineAbi` 1), `--self-check` `ok` with `ffmpegLoaded`
    true, `ffmpegLicense` `LGPL version 2.1 or later` and `testHooks` false, `licenses\` complete; then seeds
    `cmdkey /generic:isshoni:v1:https://smoke.invalid /user:t /pass:x` and the toast keys of §2.3 (an
    `AppUserModelId\io.isshoni.desktop` key with `CustomActivator` and its `CLSID` key whose `LocalServer32` points
    into `InstallDir`, plus a `Software\isshoni\NotificationCategories` subkey), runs `uninstall.exe /S /PURGE` and
-   asserts: nothing of §2.2 (both data roots included) and §2.3 left, and `cmdkey /list` shows no `isshoni:v1:`
+   asserts: nothing of §2.2 (the data root included) and §2.3 left, and `cmdkey /list` shows no `isshoni:v1:`
    target.
 
 ### 11.5 Signing keys (M1 06 §9.4's table, updated)
@@ -1694,11 +1700,12 @@ PC or a GitHub setting.
    run); both PASS with `dll.sha256` equal to the rc's `native-manifest.json`; the reports are attached to the
    release-prep PR. **Discord desktop** real-app check on both (§10.5). This is half of the exit
    criterion.
-6. (owner) **Latency**, the other half of the exit criterion: **M-LATENCY** (04 §15): p95 < 200 ms over 60 s with
-   `isshoni-latency.exe` on Win11 (window share, WGC) and on Win10 22H2 (`-monitor`, DD), each with a hardware
-   encoder, Chrome and the rc server at RTT ≤ 40 ms; `latency.json` attached to the release-prep PR with the GPU,
-   driver and encoder used. Plus 04's **M-WDA**, **M-DD** and **M-WGC-WIN** (04 §18.4, §18.5) repeated on the rc
-   installer build. The release isn't cut with only one OS measured.
+6. (owner) **Latency**, the other half of the exit criterion: **M-LATENCY** (01 §12.2's `tools/g2g` run book; 04
+   §15, §18.4): p95 < 200 ms over 60 s in the `gate` run of `g2g.exe` with a monitor share on one monitor, on Win11
+   (borderless WGC) and on Win10 22H2 (Desktop Duplication), each with a hardware encoder, Chrome and the rc server at
+   RTT ≤ 50 ms; the `g2g` JSON files attached to the release-prep PR with the GPU, driver and encoder used. Plus 04's
+   **M-WDA**, **M-DD** and **M-WGC-WIN** (04 §18.4, §18.5) repeated on the rc installer build. The release isn't cut
+   with only one OS measured.
 7. (owner) **Install paths**: (a) Win11, Edge and Chrome: the browser download, the SmartScreen path, then the
    `/download` page's "Open isshoni" button (`appLinkFor`, §7.5) opens the app for the rc server, which then links
    through 02's device flow; also once as Finish → Start isshoni, then "Open isshoni" on the page: it passes with no
@@ -1726,7 +1733,7 @@ PC or a GitHub setting.
    `Apply` and one start that exited at the installing mutex; no "The update didn't install" notice), and the
    relaunched app opens that room.
 9. (owner) Uninstall keeping data: the device disappears from the Devices page and the `isshoni:v1:` entry from
-   Credential Manager, and settings remain. Then reinstall and uninstall with purge: both data roots are gone.
+   Credential Manager, and settings remain. Then reinstall and uninstall with purge: the data root is gone.
 10. (owner) The relink check of §9.1 (first FFmpeg pin).
 11. The previous release's web client against the rc server: watch and share both ways. The rc app against `v0.1.x`
     shows "Ask your admin to update the server" with Open in browser, and nothing gets linked (§11.6).
@@ -1815,8 +1822,8 @@ application sent.
 
 | Page | Change |
 |---|---|
-| `docs/download.md` (`/download`) | from "Coming" to the Windows page: `#windows` requirements (Windows 10 22H2 or later, 64-bit; a current GPU driver, NVIDIA 531.61 or newer for NVIDIA encoding, linking `/troubleshooting#desktop-gpu-driver`; Windows N and KN editions need the Media Feature Pack, linking `#desktop-media-feature-pack`; 04 §19); install from your server's Download page; `#windows-powershell`; `#windows-smartscreen`; `#windows-smart-app-control`; `#windows-verify`; `#windows-updates` (how updates work, channels, turning them off, the policy value, what to do when an update fails); `#windows-uninstall` (every uninstall unlinks the app from its servers and removes its sign-ins; keep settings and logs vs purge, both data roots); `#windows-firewall` (the prompt, either answer works); `#windows-webview2`; `#ffmpeg-source` (the LGPL source and how to replace the DLLs); `#macos` (M3) and `#linux` (M4) "coming". It shows the latest version and the installer's SHA-256 from `release.json` |
-| `docs/privacy.md` | **R14 owns `/privacy#desktop`** and removes "(with the desktop apps, which come later)" from "What never leaves your device"; 02's DA12 adds only its server-side device rows and links here for the PC side (one owner, no merge conflict). The `#desktop` section (03 §19, 02 §9): **connections** (the servers you link; GitHub for update checks, once a day, with `User-Agent: isshoni-desktop/<version>`, off in settings, at install or by policy; Cisco for OpenH264 only when turned on, 04's URL; Microsoft's WebView2 bootstrapper only when missing; Windows' own SmartScreen check of browser downloads); **sent to a server at linking**: the device name (the computer's name by default, editable in the wizard); **never sent**: window titles, share labels, app lists, exclusion rules, levels, logs; **kept on the PC**: settings (`%APPDATA%\isshoni\settings.json`), the server list (`%APPDATA%\isshoni\servers.json`: origins, server names, usernames, device ids, last room), the refresh token in Windows Credential Manager (target `isshoni:v1:<origin>`), no access token on disk (memory only), and under `%LOCALAPPDATA%\isshoni\` the WebView2 profile, logs, `codecs\` and the updates folder; **no telemetry** |
+| `docs/download.md` (`/download`) | from "Coming" to the Windows page: `#windows` requirements (Windows 10 22H2 or later, 64-bit; a current GPU driver, NVIDIA 531.61 or newer for NVIDIA encoding, linking `/troubleshooting#desktop-gpu-driver`; Windows N and KN editions need the Media Feature Pack, linking `#desktop-media-feature-pack`; 04 §19); install from your server's Download page; `#windows-powershell`; `#windows-smartscreen`; `#windows-smart-app-control`; `#windows-verify`; `#windows-updates` (how updates work, channels, turning them off, the policy value, what to do when an update fails); `#windows-uninstall` (every uninstall unlinks the app from its servers and removes its sign-ins; keep settings and logs vs purge, which removes the data root `%LOCALAPPDATA%\isshoni\`); `#windows-firewall` (the prompt, either answer works); `#windows-webview2`; `#ffmpeg-source` (the LGPL source and how to replace the DLLs); `#macos` (M3) and `#linux` (M4) "coming". It shows the latest version and the installer's SHA-256 from `release.json` |
+| `docs/privacy.md` | **R14 owns `/privacy#desktop`** and removes "(with the desktop apps, which come later)" from "What never leaves your device"; 02's DA12 adds only its server-side device rows and links here for the PC side (one owner, no merge conflict). The `#desktop` section (03 §19, 02 §9): **connections** (the servers you link; GitHub for update checks, once a day, with `User-Agent: isshoni-desktop/<version>`, off in settings, at install or by policy; Cisco for OpenH264 only when turned on, 04's URL; Microsoft's WebView2 bootstrapper only when missing; Windows' own SmartScreen check of browser downloads); **sent to a server at linking**: the device name (the computer's name by default, editable in the wizard); **never sent**: window titles, share labels, app lists, exclusion rules, levels, logs; **kept on the PC**, all under `%LOCALAPPDATA%\isshoni\` (nothing roams): settings (`settings.json`), the server list (`servers.json`: origins, server names, usernames, device ids, last room), the WebView2 profile, logs, `codecs\` and the updates folder; the refresh token in Windows Credential Manager (target `isshoni:v1:<origin>`), no access token on disk (memory only); **no telemetry** |
 | `docs/code-signing.md` | §12.3 |
 | `docs/security.md` | the update keys in `#keys`; `#verify-desktop`: verifying the installer on Windows (below) and a manifest with `ssh-keygen`; the limit of key revocation (§8.12) |
 | `docs/troubleshooting.md` | `#desktop-update-failed`, `#desktop-smart-app-control`, `#desktop-webview2`, `#desktop-openssh`; `#desktop-windows-n` (Windows N or KN: viewing H.264 fails in the app and in Edge until the Media Feature Pack is installed; 03 links it from its codec-banner text, 03 §5.4, and from its N-edition guided fix); `#desktop-media-feature-pack` (installing the Media Feature Pack and what it restores: H.264 decoding for viewing and the MF encoders for sharing, 04 §9.1); `#desktop-gpu-driver` (NVIDIA 531.61 or newer for NVENC, current AMD and Intel drivers, what 03's `driver_too_old` fix means); `#desktop-fullscreen-games` (full-screen exclusive games may capture black or the desktop; use borderless, 04 §7.7); `#desktop-crash-dumps` (Windows Error Reporting `LocalDumps` steps and the release's `…_symbols.zip`, 04 §13.4); `#desktop-windows10-border` (the yellow border around a shared window on Windows 10, expected); and **`#desktop-linking`**, a fixed anchor for 02's "Linking the app" section (02 DA12 writes the section's content; this document fixes the anchor and checks it) |
@@ -1856,7 +1863,8 @@ Before the first rc with the app:
 3. **Rulesets**: a tag ruleset for `deps-*` (block update and deletion; creation by repository writers, which is only
    the owner).
 4. **Actions setting**: "Require approval for all external contributors".
-5. **Self-hosted runner** on the Win11 and the Win10 22H2 install (§10.5).
+5. **Self-hosted runner** on the Win11 and the Win10 22H2 install (§10.5, ephemeral), and the environment `audiotest`
+   with the owner as required reviewer, created before the first dispatch (§10.4).
 6. Consider GitHub's immutable releases (M1's suggestion); with them the deps releases can't change either.
 
 During the release: the checklist items marked (owner) in §11.8.
@@ -1897,7 +1905,7 @@ Nothing needs to be bought or rented: the rc server is M1's test VPS.
 | Unit | `deploy/test/install-desktop.Tests.ps1` (Pester) | the checksum-line lookup (exact name, both forms, duplicates refused), version regex, the quoting helper with spaces, `ssh-keygen` discovery (mocked), the exit-code messages (8 included), no `exit` anywhere in the script; the Smart App Control read (mocked `Get-ItemProperty`): `1` → the `isshoni:` Smart App Control line, "Nothing was installed." and no `Invoke-WebRequest` call; `2`, `0` and a missing key → the download proceeds; a mocked `Start-Process` that throws → "isshoni: Windows blocked the installer (" with the exception's message, no error record escapes the script block | `pwsh` on CI ubuntu; Windows PowerShell 5.1 on CI windows |
 | Unit | `check-draft-test.sh` new cases (§11.3); `repocheck` tests for `update_signers` (exactly one `isshoni-update-backup-<n>` line and at least one other; `Backup` set in `signers.go` exactly for it), `signers.go` block, ps1 block, the 8.1-option rule | | CI ubuntu; Mac |
 | Static | PSScriptAnalyzer, ASCII-only, PowerShell 5.1 parse (`[System.Management.Automation.Language.Parser]::ParseFile` under `powershell.exe`), `makensis -WX`, actionlint, the DLL export/import/version checks, FFmpeg's license checks | | CI ubuntu and windows |
-| Integration | `smoke.ps1 -Mode ci` in `windows-desktop` | fresh silent install: files, registry, the protocol command exactly `"<InstallDir>\isshoni.exe" --deeplink -- "%1"`, shortcut AUMID, `--version` (`engineAbi` 65536), `--self-check` (`ok`, `ffmpegLoaded`, `testHooks` false); upgrade from a build with an extra fake `avcodec-00.dll` in `install-files.txt` removes it; an upgrade while a helper process keeps `isshoni-media.dll` and an FFmpeg DLL mapped for 3 s after the mutex is gone succeeds (the `.old` rename loop, §6.7); same-version reinstall; an older build over a newer one exits 4 and `/ALLOWDOWNGRADE` works; a process holding the mutex makes `/UPDATE` exit 3 after 60 s; `/D=` into a folder with a foreign file, then uninstall: the foreign file and the folder stay. **The installing mutex**: while a helper process holds `Local\io.isshoni.desktop.installing` (`[System.Threading.Mutex]::new($false, 'Local\io.isshoni.desktop.installing')` in a second PowerShell), a second `setup.exe /S` exits 8 and changes no file or registry value, and starting the installed `isshoni.exe` through the registered protocol command (read from the registry, `%1` = `isshoni://smoke.invalid/r/abc`) exits 0 within 10 s with no `isshoni.exe` left running and no `Local\io.isshoni.desktop.running` ever created (polled every 100 ms), and leaves `PendingServer` = `https://smoke.invalid` and `PendingRoom` = `abc` (deleted by the test afterwards); during a `/S /UPDATE` run the installer's own process holds the mutex (`OpenMutexW` succeeds) and after it exits the mutex is gone. **Both uninstall modes** first seed `cmdkey /generic:isshoni:v1:https://smoke.invalid /user:t /pass:x`, the toast keys of §2.3 (an `AppUserModelId\io.isshoni.desktop` key whose `CustomActivator` names a `CLSID` key with `LocalServer32` in `InstallDir`, plus a second `CLSID` key pointing elsewhere) and a `Software\isshoni\NotificationCategories` subkey; afterwards `cmdkey /list` shows no `isshoni:v1:` target, the AUMID key, the matching `CLSID` key and `Software\isshoni` are gone and the foreign `CLSID` key stays. A keep-data uninstall keeps both `%APPDATA%\isshoni` and `%LOCALAPPDATA%\isshoni`; `/PURGE` removes both, and nothing of §2.2 and §2.3 is left | CI windows |
+| Integration | `smoke.ps1 -Mode ci` in `windows-desktop` | fresh silent install: files, registry, the protocol command exactly `"<InstallDir>\isshoni.exe" --open-url "%1"`, shortcut AUMID, `--version` (`engineAbi` 1), `--self-check` (`ok`, `ffmpegLoaded`, `testHooks` false); upgrade from a build with an extra fake `avcodec-00.dll` in `install-files.txt` removes it; an upgrade while a helper process keeps `isshoni-media.dll` and an FFmpeg DLL mapped for 3 s after the mutex is gone succeeds (the `.old` rename loop, §6.7); same-version reinstall; an older build over a newer one exits 4 and `/ALLOWDOWNGRADE` works; a process holding the mutex makes `/UPDATE` exit 3 after 60 s; `/D=` into a folder with a foreign file, then uninstall: the foreign file and the folder stay. **The installing mutex**: while a helper process holds `Local\io.isshoni.desktop.installing` (`[System.Threading.Mutex]::new($false, 'Local\io.isshoni.desktop.installing')` in a second PowerShell), a second `setup.exe /S` exits 8 and changes no file or registry value, and starting the installed `isshoni.exe` through the registered protocol command (read from the registry, `%1` = `isshoni://smoke.invalid/r/abc`) exits 0 within 10 s with no `isshoni.exe` left running and no `Local\io.isshoni.desktop.running` ever created (polled every 100 ms), and leaves `PendingServer` = `https://smoke.invalid` and `PendingRoom` = `abc` (deleted by the test afterwards); during a `/S /UPDATE` run the installer's own process holds the mutex (`OpenMutexW` succeeds) and after it exits the mutex is gone. **Both uninstall modes** first seed `cmdkey /generic:isshoni:v1:https://smoke.invalid /user:t /pass:x`, the toast keys of §2.3 (an `AppUserModelId\io.isshoni.desktop` key whose `CustomActivator` names a `CLSID` key with `LocalServer32` in `InstallDir`, plus a second `CLSID` key pointing elsewhere) and a `Software\isshoni\NotificationCategories` subkey; afterwards `cmdkey /list` shows no `isshoni:v1:` target, the AUMID key, the matching `CLSID` key and `Software\isshoni` are gone and the foreign `CLSID` key stays. A keep-data uninstall keeps `%LOCALAPPDATA%\isshoni`; `/PURGE` removes it, and nothing of §2.2 and §2.3 is left | CI windows |
 | Integration | server-rendered ps1 (`windows-desktop`) | `isshoni serve` (the CI binary, off mode on loopback) serves `/install-desktop.ps1`; with `ISSHONI_DOWNLOAD_BASE` pointing to relserve holding the CI installer signed by an ephemeral key (the block replaced as in §11.4), Windows PowerShell 5.1 installs it, `PendingServer` equals the server's origin; a tampered installer is refused with nothing installed; a `checksums.txt` signed by another key is refused; an `isshoni-desktop_<v>_windows_amd64_setup.exe` that is not an executable (a text file, correctly listed in a correctly signed `checksums.txt`) ends with the line `isshoni: Windows blocked the installer (` and "Nothing was installed.", and the `powershell.exe -NoProfile -Command "irm … \| iex"` process exits 0 with nothing on stderr (no unhandled error) | CI windows |
 | Integration | updater e2e (`windows-desktop` on `update` changes; nightly always) | two `updatetest` builds (`TAGS="production updatetest"`, §5.2; eligible only through §8.11's `ci.N` rule) `0.0.1-ci.1` and `0.0.1-ci.2`, manifests with channel `ci` signed by an ephemeral key, served by relserve over `http://127.0.0.1`; install ci.1; `isshoni.exe --update-now`; within 120 s the registry says ci.2 and `--version` agrees and the relaunched process has `--updated-from=0.0.1-ci.1`; a manifest whose SHA-256 is wrong leaves ci.1 intact; a manifest for `0.0.1-ci.0` is ignored. **A start during an update** (`smoke.ps1 -Mode update`, the cases that need an eligible pending update): with ci.1 installed, ci.2's installer staged as the pending update (`updates\state.json`, `attempts` 0) and a helper holding `Local\io.isshoni.desktop.installing`, a start through the protocol command with `isshoni://smoke.invalid/r/abc` exits 0 within 10 s, `attempts` is still 0, no process runs from the staged installer's path and the registry still says ci.1; after the helper releases the mutex, a plain start applies ci.2 at start (`attempts` 1), and the relaunched ci.2 reads and deletes `PendingServer`/`PendingRoom` | CI windows |
 | Integration | Go tests with the real DLL (04's content, 04 §18.2) | `go test -race ./internal/media/...` with `ISSHONI_TEST_ENGINE_DLL` = the `win-x64-ci` DLL of the artifact's `ci\` folder: load, probe, sessions with the fake encoder, `TestNativeIntoPublisher` | CI windows (`windows-desktop`) |
@@ -1911,7 +1919,7 @@ Nothing needs to be bought or rented: the rc server is M1's test VPS.
 | E2E | nightly `compat-servers` | against servers with `deviceFlow`: the client core joins, publishes with the fake engine and receives media, and 02's test links and refreshes; against a 0.1.x server: only the `compat.FromInfo` verdict `update_server`/`no_device_flow` | GitHub |
 | Manual | `audiotest.yml` on Win11 and Win10 22H2; Discord real-app check | the exit criterion (audio) | owner's PC |
 | Manual | `audiotest.yml` suite `hwcheck` (04's `hwcheck.ps1`) | 04 §18.4's automated set; the result bundle attached | owner's PC (self-hosted runner) |
-| Manual | **M-LATENCY** (04 §15) | p95 < 200 ms over 60 s with `isshoni-latency.exe` on Win11 (window share) and on Win10 22H2 (`-monitor`, DD), hardware encoder, Chrome, rc server RTT ≤ 40 ms; `latency.json` attached with GPU, driver and encoder; plus 04's M-WDA, M-DD and M-WGC-WIN on the rc installer build | owner's PC |
+| Manual | **M-LATENCY** (01 §12.2; 04 §15, §18.4) | p95 < 200 ms over 60 s in `g2g.exe`'s `gate` run, a monitor share on one monitor, on Win11 (borderless WGC) and on Win10 22H2 (DD), hardware encoder, Chrome, rc server RTT ≤ 50 ms; the `g2g` JSON files attached with GPU, driver and encoder; plus 04's M-WDA, M-DD and M-WGC-WIN on the rc installer build | owner's PC |
 | Manual | §11.8 items 7–11 | install paths, SmartScreen, inbox OpenSSH, Defender, update rc.1 → rc.2 (the "Updating isshoni to {v}…" window shows from the click to the relaunch; a double-click, and a second "Open in the isshoni app" click, during a start-time update end with one install and the link handled), uninstall keeping data (device and credential gone, settings kept) then purge, relink, cross-version (0.1.x: "update the server" screen) | owner's PC, rc server |
 
 Everything automatable runs on the Mac (`task test`, `task lint`, `task native:test`, `task desktop:exe:windows`,
@@ -1923,13 +1931,13 @@ Homebrew makensis) or in GitHub Actions; only §11.8's manual items, the audiote
   `…/releases/latest/download/isshoni-desktop-update.json`.
 - **Install layout** (§2.2): `$INSTDIR` = `%LOCALAPPDATA%\Programs\isshoni`, `isshoni.exe`, `isshoni-media.dll`,
   `avcodec-<N>.dll`, `avutil-<N>.dll` in the same folder, `licenses\THIRD_PARTY_NOTICES.txt` (03's About → Licenses
-  opens it), `licenses\ffmpeg\README-LGPL.txt`. Two data roots: `%APPDATA%\isshoni\` (03's `settings.json`, 02's
-  `servers.json`) and `%LOCALAPPDATA%\isshoni\`, where `codecs\` is 03's (OpenH264, written through 04's
-  `native.InstallOpenH264`), `updates\` is this document's, and the rest (`logs\`, `WebView2\`) is 03's.
+  opens it), `licenses\ffmpeg\README-LGPL.txt`. One data root, `%LOCALAPPDATA%\isshoni\` (nothing roams): 03's
+  `settings.json`, 02's `servers.json`, `codecs\` (03's: OpenH264, written through 04's `native.InstallOpenH264`),
+  `updates\` (this document's), and `logs\` and `WebView2\` (03's).
 - **Registry** (§2.3): `HKCU\Software\isshoni\{InstallDir,Version,DesktopShortcut,UpdateChecks,WinVer,PendingServer,
   PendingRoom}` (`PendingRoom` written by 03 next to `PendingServer` before a start-time update, §8.7, or at a start
   from a link that found the installing mutex, §2.4; the whole key,
-  subkeys included, is deleted by the uninstaller), the protocol handler command `"…\isshoni.exe" --deeplink -- "%1"`,
+  subkeys included, is deleted by the uninstaller), the protocol handler command `"…\isshoni.exe" --open-url "%1"`,
   the `Run` value name `isshoni`, the policy `HKLM\SOFTWARE\Policies\isshoni\DisableUpdateChecks`; AUMID
   `io.isshoni.desktop` on the Start-menu shortcut; the app-written toast keys
   `HKCU\Software\Classes\AppUserModelId\io.isshoni.desktop` and its `CustomActivator`'s `CLSID` key, which the
@@ -1938,16 +1946,16 @@ Homebrew makensis) or in GitHub Actions; only §11.8's manual items, the audiote
   `Local\io.isshoni.desktop.installing` (held for the installer's whole run, closed right before it starts the app;
   `update.Apply` returns once it exists; 03 §13.4 step 2a exits 0 at a start that finds it, after writing a link to
   `PendingServer`/`PendingRoom`); the flags `--version` (with `engineAbi`
-  = 65536 without loading the DLL), `--self-check=<path>` (its JSON and `ok` rule), `--deeplink -- <url>`,
-  `--updated-from=<v>`, `--forget-credentials` (every uninstall), `--purge-data` (purge), `--update-now`
-  (updatetest only); no kill-on-close job object.
+  = 1, the ABI major, without loading the DLL), `--self-check=<path>` (its JSON with 03's `spa.ok`, and the `ok` rule),
+  `--open-url <url>`, `--updated-from=<v>`, `--forget-credentials` (every uninstall), `--purge-data` (purge),
+  `--update-now` (updatetest only); no kill-on-close job object.
 - **Installer flags and exit codes** (§6.4, exit 8 = another setup is running); the `/UPDATE` banner; the
   installer's WebView2 minimum `WEBVIEW2_MIN` = 03 §5.4's 120.0.
 - **`internal/update`** Go API (incl. `Ready()`, `PendingAtStartup(autostart)`, `Apply`'s re-verify and
   `ErrNotInstalled`), states and error codes (§8.9, §8.10); its use of `internal/version` for every comparison.
 - **Manifest** format (§8.2), signature format and namespace `isshoni-update`, principal `isshoni-update`,
   `deploy/keys/update_signers`, `deploy/desktop/min-version`, `deploy/keys/update_revoked`; the `updatetest` hooks
-  (§8.11) that 03's DA12 tests use.
+  (§8.11) that 03's DK12 tests use.
 - **Build**: `task desktop:exe:windows [TAGS=…]` (default `production`), `task desktop:package:windows`,
   `task ffmpeg:fetch`, `task ffmpeg:build`, `task release:wails3`, `task release:update-keys`, `task lint:ps` (also
   `native/windows/tools/*.ps1` and `deploy/test/windows/*.ps1`), `task test:ps`, `task lint:pins` (Wails library, CLI
@@ -1956,7 +1964,7 @@ Homebrew makensis) or in GitHub Actions; only §11.8's manual items, the audiote
     and ctest of preset `host-debug` (Mac, Linux);
   - `task native:build` (Windows): presets `win-x64-release` and `win-x64-ci` with `IM_FFMPEG_ROOT` = the
     `ffmpeg:fetch` output in `.deps/ffmpeg/`;
-  - `task native:dist`: a flat zip of `GOOS=windows` `isshoni-enginetest.exe`, `isshoni-latency.exe`,
+  - `task native:dist`: a flat zip of `GOOS=windows` `isshoni-enginetest.exe`, `g2g.exe` (01's `tools/g2g`),
     `native/windows/tools/hwcheck.ps1`, the release `isshoni-media.dll` and the FFmpeg DLLs (CI uploads it as
     `isshoni-native-tools`, §5.1);
 
@@ -2011,15 +2019,15 @@ Homebrew makensis) or in GitHub Actions; only §11.8's manual items, the audiote
   start-time update from a link (§8.7), the `Run` value, and, through Wails' notifications service, the toast AUMID and
   `CLSID` keys and any subkey of `HKCU\Software\isshoni` (§2.3). `Version`, `DesktopShortcut` and `WinVer` are the
   installer's only.
-- Parsing the flags of §2.4 (`--deeplink -- <url>` with 02 §12.2's one-argument rule, `--forget-credentials`,
+- Parsing the flags of §2.4 (`--open-url <url>` with 02 §12.2's one-argument rule, `--forget-credentials`,
   `--purge-data`, `--self-check`, `--version`, `--updated-from`, `--update-now` in updatetest builds, `--autostart`).
 - **03 §13.4 step 2a** (new, between the shell relaunch and single instance): `OpenMutexW(SYNCHRONIZE, FALSE,
   "Local\io.isshoni.desktop.installing")`; when it succeeds, a start from a link writes the link's origin to
   `PendingServer` and its room id to `PendingRoom` (overwriting older values), and every start then exits 0 without
   single instance, the running mutex, the updater or `Apply`. Tested by an app unit test with a fake mutex probe (03)
   and by §16's smoke cases.
-- 03's "Link the app" on `/download` is this document's **"Open isshoni"** button (§7.5); 03 renames it in §23, §24
-  and M-DESK-1. Its link comes from 02's `appLinkFor`, not from a 03 format.
+- The `/download` page's app button is this document's **"Open isshoni"** button (§7.5); 03 calls it that in §23,
+  §24 and M-DESK-1. Its link comes from 02's `appLinkFor`, not from a 03 format.
 - Two settings this document assumes, named `updates.check` (bool, default true, initial value from `UpdateChecks`)
   and `updates.channel` (`stable`|`beta`, default `stable`), passed to `update.Options`; the desktop SPA's
   stale-build reload turned off; About → Licenses opening `licenses\THIRD_PARTY_NOTICES.txt`; whether the app uses
@@ -2040,7 +2048,7 @@ Homebrew makensis) or in GitHub Actions; only §11.8's manual items, the audiote
   every export in `native/include/isshoni_media.h`; static CRT; ctest tests in `win-x64-ci`; the DLL output
   `isshoni-media.dll` + `.pdb`; `native/.clang-format`; the fuzz corpus `native/common/tests/fuzz/corpus/`.
 - The x/sys/windows loader in `internal/media/native` (04 §12: `engine_windows.go`, `session_windows.go`,
-  `call_windows.go`): `native.Load(native.Options{Dir: <exe folder>})` loads `isshoni-media.dll` by full path with
+  `call_windows.go`): `native.Open(native.Options{Dir: <exe folder>})` loads `isshoni-media.dll` by full path with
   `LoadLibraryExW(…, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32)`, so FFmpeg resolves from the same
   folder and never from the PATH or the working directory; no hash check of the FFmpeg DLLs at load (D22); `Engine.Probe`
   and `Engine.BuildInfo` (with `ffmpeg.license` and `testHooks`) for `--self-check`; `ISSHONI_TEST_ENGINE_DLL` for its
@@ -2048,25 +2056,26 @@ Homebrew makensis) or in GitHub Actions; only §11.8's manual items, the audiote
 - FFmpeg loaded at run time only (never import-linked), with the major/minor version check of 04 §9.2; DllMain doing no
   work on `DLL_PROCESS_DETACH` (§6.7).
 - `--self-check`'s engine part works without a GPU; the minimum NVIDIA driver (nv-codec-headers choice, §4.1); the
-  OpenH264 URL and checksum for the privacy page; M-LATENCY (04 §15) and the manual checks M-WDA, M-DD, M-WGC-WIN;
-  `isshoni-enginetest`, `isshoni-latency.exe` and `native/windows/tools/hwcheck.ps1` (04 §14).
+  OpenH264 URL and checksum for the privacy page; the component checks next to M-LATENCY (04 §15; the measurement is
+  01 §12.2's `tools/g2g`) and the manual checks M-WDA, M-DD, M-WGC-WIN; `isshoni-enginetest` and
+  `native/windows/tools/hwcheck.ps1` (04 §14).
 - Any new system DLL import added to `deploy/windows/dll-imports.txt` (the `api-ms-win-core-*` sets in slice E2), any
   native dependency to `deploy/notices/native-windows.json`; the C++/WinRT license file under
   `native/windows/third_party/cppwinrt/LICENSE` and OpenH264's under `native/windows/third_party/openh264/LICENSE`.
 
 **From `05-windows-audio.md`**
-- `cmd/isshoni-audiotest` and its fixtures, built on `windows-2025` (Go and CMake), the CLI `probe`,
-  `run --suite release|full --report <file>`, `record`, exit codes 0/1/2, a report JSON with per-scenario verdicts, and
-  the requirement of an interactive session with an audio endpoint; its audio system DLLs in
+- `cmd/isshoni-audiotest` and its fixtures, built on `windows-2025` (Go and CMake), the CLI of 05 §18.2 (`selfcheck`,
+  `probe`, `run -gate [-long] -out …`, `record`, `merge`), exit codes 0–4, a report JSON with per-scenario
+  verdicts, and the requirement of an interactive session with an audio endpoint; its audio system DLLs in
   `deploy/windows/dll-imports.txt`.
 
 **From `02-device-auth.md`**
 - `deviceauth.Servers.ForgetAll` (02 §11.7, slice DA10) behind `--forget-credentials` and `--purge-data`;
-  `servers.json` in `os.UserConfigDir()/isshoni` (§2.2); `POST /api/v1/device/revoke` for the best-effort
+  `servers.json` in `%LOCALAPPDATA%\isshoni` (§2.2); `POST /api/v1/device/revoke` for the best-effort
   self-revoke; the `deviceFlow` feature in `/info` and `compat.FromInfo`'s `update_server`/`no_device_flow` (02
   §13.2); `TestCompatServerDeviceFlow` (§10.3).
 - The deep-link grammar of 02 §12 (`isshoni://<host>[:port]/[r/<roomId>]`, https only), the handler command
-  `--deeplink -- "%1"` (02 §12.2), `appLinkFor(serverOrigin, roomId?)` in `web/src/lib/appLink.ts` (02 §10.2, slice
+  `--open-url "%1"` (02 §12.2), `appLinkFor(serverOrigin, roomId?)` in `web/src/lib/appLink.ts` (02 §10.2, slice
   DA7), `deeplink.Parse`, `deeplink.Build`, `deeplink.NormalizeOrigin` and the §12.3 behavior table.
 - `internal/version` `Parse`, `Compare`, `Below` (02 §13.2, slice DA1) for every updater comparison.
 - `protocol.DesktopOrigins()` (02 §6.4) for the Wails bump rule (D19).
@@ -2074,9 +2083,9 @@ Homebrew makensis) or in GitHub Actions; only §11.8's manual items, the audiote
   server side only (R14 owns `/privacy#desktop`).
 
 **From `01-client-core.md`**
-- The client core building and testing on linux, darwin and windows with the fake engine; a `TestCompatServer…` test
-  driven by `ISSHONI_COMPAT_SERVER_URL` and `ISSHONI_COMPAT_ADMIN_FILE` (§10.3; not yet defined by 01, an open gap);
-  protocol N/N−1 kept by the desktop.
+- The client core building and testing on linux, darwin and windows with the fake engine; 01's `TestCompatServer`
+  (01 §14, `internal/client/core/compat_test.go`) driven by `ISSHONI_COMPAT_SERVER_URL` and `ISSHONI_COMPAT_ADMIN_FILE`
+  (§10.3); protocol N/N−1 kept by the desktop.
 
 **From M1 (as built)**
 - M1 06: `release.yml` (`version`, `web`, `build`, `sign`, `sign-dry`, `verify`, `publish`, `site`), `.goreleaser.yaml`,
@@ -2095,11 +2104,11 @@ In order; each is testable on its own. Days are rough, for one developer (about 
 
 | # | Slice | Scope | Acceptance | Depends on | Verified |
 |---|---|---|---|---|---|
-| R1 | Cross-OS desktop CI (1 d) | `lint-go`'s Windows steps, `desktop-macos` job, the DLL-free `windows-go` job (windows-2025, `desktop` filter, no needs, 15 min, in `ci-ok`), the `native-host` job and `task native:test`, `tools/wails3` + `task release:wails3` + the extended `lint:pins` (Wails library, CLI and `@wailsio/runtime` in `web/package.json` and `web/package-lock.json`), the Dependabot ignores (gomod and npm), `changes` filters (`desktop`, `native`) | a PR touching the app: ubuntu cross-builds `isshoni.exe` (`CGO_ENABLED=0`), macOS builds the darwin app with the fake engine, client-core tests pass on both and on `windows-go` (02's DA9/DA10 and this document's R7/R8 get Windows CI from here on); `native-host` is green on 04 E1's host tests on ubuntu and macOS; `lint:pins` fails when `tools/wails3` and `go.mod` name different Wails versions, and when `@wailsio/runtime` is a range or differs from the version DA1 recorded | 03's app skeleton with the build constraints; 04 E1 for `native-host` | CI ubuntu, macos, windows; Mac |
+| R1 | Cross-OS desktop CI (1 d) | `lint-go`'s Windows steps, `desktop-macos` job, the DLL-free `windows-go` job (windows-2025, `desktop` filter, no needs, 15 min, in `ci-ok`), the `native-host` job and `task native:test`, `tools/wails3` + `task release:wails3` + the extended `lint:pins` (Wails library, CLI and `@wailsio/runtime` in `web/package.json` and `web/package-lock.json`), the Dependabot ignores (gomod and npm), `changes` filters (`desktop`, `native`) | a PR touching the app: ubuntu cross-builds `isshoni.exe` (`CGO_ENABLED=0`), macOS builds the darwin app with the fake engine, client-core tests pass on both and on `windows-go` (02's DA9/DA10 and this document's R7/R8 get Windows CI from here on); `native-host` is green on 04 E1's host tests on ubuntu and macOS; `lint:pins` fails when `tools/wails3` and `go.mod` name different Wails versions, and when `@wailsio/runtime` is a range or differs from the version 03's DK1 recorded | 03's app skeleton with the build constraints; 04 E1 for `native-host` | CI ubuntu, macos, windows; Mac |
 | R2 | FFmpeg LGPL build (2 d) | `native/ffmpeg/{pins.json,build.sh,ffcheck.c,README-LGPL.txt}`, `ffmpeg.yml` (build, publish, weekly), `tools/desktoppkg ffmpeg-inputs/ffmpeg-fetch`, `lock.json`; the MSVC environment step `deploy/windows/msvc-env.ps1` and the `msvc` entry of `deploy/windows/tools.json` (§3; R3a adds the other entries) | the PR build is green on `windows-2025` (VS 2026 image) with toolset 14.44, and the log and summary name the VS instance, the toolset build and the SDK; with `toolset` set to a version the image lacks, the step fails naming the toolsets it found; the zip holds the two DLLs, import libs, headers, PDBs and licenses; `ffcheck` shows LGPL 2.1+, exactly the four encoders, no gpl/nonfree/version3; dependents are system DLLs only; a second build is byte-identical (or the slice records that MSVC isn't and the check becomes a warning, §4.6); the owner's dispatch creates `deps-ffmpeg-9.0.2-r1` as a non-latest prerelease with attestations; `lock.json` merged | — | CI windows; owner dispatch |
 | R3a | `windows-native` job, no FFmpeg yet (0.75 d) | lands **in the same PR as 04 E2**: vcpkg clone at `native/vcpkg.json`'s baseline + cache, the MSVC environment, presets `win-x64-ci` (build, ctest) and `win-x64-release` (build), `tools/desktoppkg dll-check` (exports, `static:`/`delay:` imports, version resource), `deploy/windows/dll-imports.txt` and the rest of `tools.json` (NSIS, WebView2, Pester, PSScriptAnalyzer; R2's `msvc-env.ps1` reused), the WebView2 bootstrapper check, the `release\`/`ci\` artifact, `task native:build`; `IM_FFMPEG_ROOT` optional until R3b; the Go load test (`ISSHONI_TEST_ENGINE_DLL`) in this job until R5 exists | green on 04's skeleton DLL (E2's acceptance: both presets with `/W4 /WX`, exports equal the `.def`, Go loads the DLL); an extra export, a `VCRUNTIME140.dll` or `avcodec-62.dll` import, a static `mfplat.dll` import or a wrong `ProductVersion` each fail the job | R1, 04 E2 (same PR) | CI windows |
-| R3b | FFmpeg in `windows-native` (0.5 d) | the locked zip from the deps release as `IM_FFMPEG_ROOT`, the lock staleness check (§4.1), the FFmpeg DLL hash check, `task native:dist` and the `isshoni-native-tools` artifact | a changed `pins.json` without a new lock fails the job; the `ci\` folder carries the FFmpeg DLLs next to the DLL; the tools zip unpacks and `isshoni-enginetest probe -quick` runs on the owner's PC; lands **before 04 E7** | R2, R3a | CI windows; owner's PC |
-| R4 | Installer (2.5 d) | `deploy/windows/nsis/*` (incl. the `.old` rename loop for every overwritten PE file, the WebView2 120.0 minimum, the toast-key cleanup, `--forget-credentials` on every uninstall, the installing mutex with exit 8 and the `/UPDATE` banner), `tools/desktoppkg {winver,stage,nsis,check}`, `task desktop:exe:windows [TAGS]`, `task desktop:package:windows`, `deploy/test/windows/smoke.ps1` | on the Mac: an installer builds with Homebrew makensis; on Windows CI: every `smoke.ps1 -Mode ci` case of §16 passes (credentials and toast keys gone in both uninstall modes, both data roots only on purge; a second setup exits 8 and an app start exits 0 with the Pending values written while the installing mutex is held); `makensis -WX` clean; the strings rule holds (`Banner::show` included); on the owner's PC, `setup.exe /S /UPDATE /RELAUNCH` over an installed copy shows the "Updating isshoni to {v}…" window until the relaunch (or the slice records the §6.4 fallback) | R3b, 03's flag parsing (`--deeplink`, `--forget-credentials`, `--purge-data`, `--self-check`), the running mutex and step 2a (the installing-mutex probe, 03 §13.4), 02 DA10 (`ForgetAll`) | CI windows; Mac; owner's PC (pages, interactive prompts, the banner) |
+| R3b | FFmpeg in `windows-native` (0.5 d) | the locked zip from the deps release as `IM_FFMPEG_ROOT`, the lock staleness check (§4.1), the FFmpeg DLL hash check, `task native:dist` and the `isshoni-native-tools` artifact | a changed `pins.json` without a new lock fails the job; the `ci\` folder carries the FFmpeg DLLs next to the DLL; the tools zip unpacks on the owner's PC (its `isshoni-enginetest probe -quick` check is 04 E7's, README WA44, since the tool comes with E7); lands **before 04 E7** | R2, R3a | CI windows; owner's PC |
+| R4 | Installer (2.5 d) | `deploy/windows/nsis/*` (incl. the `.old` rename loop for every overwritten PE file, the WebView2 120.0 minimum, the toast-key cleanup, `--forget-credentials` on every uninstall, the installing mutex with exit 8 and the `/UPDATE` banner), `tools/desktoppkg {winver,stage,nsis,check}`, `task desktop:exe:windows [TAGS]`, `task desktop:package:windows`, `deploy/test/windows/smoke.ps1` | on the Mac: an installer builds with Homebrew makensis; on Windows CI: every `smoke.ps1 -Mode ci` case of §16 passes (credentials and toast keys gone in both uninstall modes, the data root only on purge; a second setup exits 8 and an app start exits 0 with the Pending values written while the installing mutex is held); `makensis -WX` clean; the strings rule holds (`Banner::show` included); on the owner's PC, `setup.exe /S /UPDATE /RELAUNCH` over an installed copy shows the "Updating isshoni to {v}…" window until the relaunch (or the slice records the §6.4 fallback) | R3b, 03's flag parsing (`--open-url`, `--forget-credentials`, `--purge-data`, `--self-check`), the running mutex and step 2a (the installing-mutex probe, 03 §13.4), 02 DA10 (`ForgetAll`) | CI windows; Mac; owner's PC (pages, interactive prompts, the banner) |
 | R5 | `windows-desktop` job (0.75 d) | the job of §10.1: the DLL-dependent Go tests (`go test -race ./internal/media/...` with the `ci\` DLL), the installer and smoke, 03's CDP spec with the `TAGS=e2e` build, the PR artifact, `ci-ok` wiring; plus `protocol`'s bindings and `codes.gen.ts` drift checks and `build`/`e2e`'s `DESKTOP_E2E_BIN` | a PR changing the app runs it; 04's `TestNativeIntoPublisher` runs (not skipped) on the runner; the CDP spec passes; a hand-edited binding fails `protocol`; the artifact installs on the owner's PC | R4, 03's `e2ehost` and CDP config | CI ubuntu, windows; owner's PC |
 | R6 | Desktop notices and native gate (1 d) | `tools/notices` `-native`, `deploy/notices/native-windows.json`, `deploy/notices/licenses/webview2-bootstrapper.txt`, the LGPL files in the stage, `go-licenses` on macOS | the installed `THIRD_PARTY_NOTICES.txt` lists Wails' modules, the npm packages and the native section; the §16 negative cases fail | R5 | CI ubuntu, windows, macos |
 | R7 | Manifest and signature format (1.5 d) | `internal/update/{manifest,sshsig,signers}.go` with tests and fuzzing, `tools/desktoppkg manifest`, `deploy/desktop/min-version`, `deploy/keys/update_revoked`, `task release:update-keys`, `repocheck keys` extension (signers block with the `Backup` flag, exactly one backup line, ps1 block, README rows, the 8.1 option rule), the `sign` job's backup-only rule for a non-empty `revokedKeys` (lands with R13) | §16's sshsig and manifest tests pass (SemVer through `internal/version`), including: an active-key manifest revoking the backup is ignored, a backup-key manifest revoking the active key is persisted; `ssh-keygen`-made signatures verify; `lint:keys` fails on a drifted block and on an `update_signers` with zero or two backup lines | 02 DA1 (`internal/version` exported) | CI all OS; Mac |
@@ -2112,7 +2121,7 @@ In order; each is testable on its own. Days are rough, for one developer (about 
 | R14 | Site and docs (1 d) | §13's pages (R14 owns `/privacy#desktop` incl. 02 §9's "On the PC" facts; the troubleshooting anchors incl. `#desktop-linking` for 02's section), `site.yml` and `release.json`, `TestDocsAnchors` additions, README keys table, `deploy/keys/README.md` and `deploy/windows/runner/README.md` | the `site` job and the anchor test pass with every §17 anchor; nothing is loaded from another origin | R13 | CI ubuntu |
 | R15 | Audiotest workflow (0.5 d) | `audiotest.yml` with the suites `release`, `full` and `hwcheck`, the `release_run_id` input and the `fetch` job | a dispatch on the owner's PC under Win11 and under Win10 produces a report artifact and a summary; the `fetch` job and `release_run_id` exist (exercised end to end by R13's dry run); `suite: hwcheck` uploads `hwcheck.ps1`'s bundle; the workflow has no PR trigger (a test in `repocheck` reads the file) | 05's audiotest, R3b (`isshoni-native-tools`) | owner's PC |
 | R16 | Nightly additions (1 d) | `windows-full`, `native-fuzz`, `windows-asan`, `goreleaser-full` with real desktop files, `compat-servers` (with `ISSHONI_COMPAT_ADMIN_FILE` and the `no_device_flow` branch for 0.1.x), the cross-OS legs | one green nightly with every row (or `compat-servers` skipped with its note before two releases exist; against `v0.1.0` it asserts only `update_server`/`no_device_flow`) | R13, 01's compat test, 02's `TestCompatServerDeviceFlow`, 04 E1 (fuzz targets) | GitHub |
-| R17 | First release with the app (1 d of agent work plus the owner's checks) | §11.8 | the exit criterion recorded: audiotest PASS on Win10 and Win11, and M-LATENCY (04 §15) p95 < 200 ms over 60 s with `isshoni-latency.exe` on Win11 (window share) and on Win10 22H2 (`-monitor`, DD), hardware encoder, Chrome, rc server RTT ≤ 40 ms, `latency.json` attached with GPU, driver and encoder; plus 04's M-WDA, M-DD and M-WGC-WIN on the rc installer build; `v0.2.0` published; the site serves the new `/download` | everything above, 03/04/05 done | owner's PC; GitHub |
+| R17 | First release with the app (1 d of agent work plus the owner's checks) | §11.8 | the exit criterion recorded: audiotest PASS on Win10 and Win11, and M-LATENCY (01 §12.2's `tools/g2g`; 04 §15, §18.4) p95 < 200 ms over 60 s in `g2g.exe`'s `gate` run, a monitor share on one monitor, on Win11 (borderless WGC) and on Win10 22H2 (DD), hardware encoder, Chrome, rc server RTT ≤ 50 ms, the `g2g` JSON files attached with GPU, driver and encoder; plus 04's M-WDA, M-DD and M-WGC-WIN on the rc installer build; `v0.2.0` published; the site serves the new `/download` | everything above, 03/04/05 done | owner's PC; GitHub |
 | R18 | SignPath (**later**; owner application in M2, integration after approval, 2 d) | §12.3 application; §12.4 jobs, Authenticode checks, the ps1 fallback, `/code-signing` and README lines | a signed release: Authenticode `Valid` with SignPath Foundation's subject on the four files, FFmpeg DLLs unsigned; Smart App Control measured | R17 and SignPath's approval | GitHub; owner's PC |
 
 ## 20. Open questions for the owner

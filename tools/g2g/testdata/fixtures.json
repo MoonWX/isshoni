@@ -1,0 +1,27 @@
+[
+  {
+    "file": "text-half.png",
+    "what": "the text page, a copy at 50 %",
+    "clock": 62480,
+    "copy": 62343,
+    "scale": 0.5
+  },
+  {
+    "file": "noise-nested.png",
+    "what": "the noise, a copy at 50 % with a nested copy at 25 %",
+    "clock": 664,
+    "copy": 484,
+    "scale": 0.5,
+    "nested": [
+      304
+    ]
+  },
+  {
+    "file": "cut-transition.png",
+    "what": "the noise, a copy of the text page at 42.5 % caught between two frames",
+    "clock": 9514,
+    "copy": 9354,
+    "copyTo": 9371,
+    "scale": 0.425
+  }
+]

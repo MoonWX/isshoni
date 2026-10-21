@@ -7,6 +7,9 @@ build/msvc/
 *.out
 dist-extra/
 THIRD_PARTY_NOTICES
+# M2: the desktop app's builds (task desktop:exe:windows) and the native CMake build trees (native/CMakePresets.json)
+dist-desktop/
+native/build/
 # web/dist holds the built SPA, but its .gitkeep is committed so `go:embed all:dist` works on a fresh clone.
 !web/dist/
 web/dist/*
@@ -17,8 +20,9 @@ web/dist/*
 .task/
 .dev/
 
-# dependencies
+# dependencies; .deps/ holds what the native and ffmpeg tasks fetch (vcpkg, the FFmpeg zip and sources)
 node_modules/
+.deps/
 
 # web test and build reports
 web/build-report.json

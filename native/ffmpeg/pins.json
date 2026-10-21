@@ -1,0 +1,7 @@
+{
+  "revision": 1,
+  "ffmpeg":         {"version": "9.0.2", "url": "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz", "sha256": "8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e"},
+  "nvCodecHeaders": {"tag": "n12.1.14.1", "url": "https://github.com/FFmpeg/nv-codec-headers/archive/refs/tags/n12.1.14.1.tar.gz", "sha256": "f40c8a27417eb2688412da32985e382e811196311c4d103d1fcaafad2876cfc1"},
+  "amfHeaders":     {"tag": "v1.5.3", "url": "https://github.com/GPUOpen-LibrariesAndSDKs/AMF/releases/download/v1.5.3/AMF-headers-v1.5.3.tar.gz", "sha256": "0f521ad98041f8001147cded4a660127f18b1c27a801a5cd691bda1fa48381be"},
+  "libvpl":         {"tag": "v2.17.0", "url": "https://github.com/intel/libvpl/archive/refs/tags/v2.17.0.tar.gz", "sha256": "4de3e2faf1e8307fb282e4a43f443191810f6a6b0a484fffa7995ba1c814c6ec"}
+}

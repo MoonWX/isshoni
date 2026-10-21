@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -52,6 +53,23 @@ toolchain go1.27.1
 tool github.com/goreleaser/goreleaser/v2
 
 require github.com/goreleaser/goreleaser/v2 v2.18.2 // indirect
+`
+	goodWailsMod = `module github.com/MoonWX/isshoni/tools/wails3
+
+go 1.26.0
+
+toolchain go1.27.1
+
+tool github.com/wailsapp/wails/v3/cmd/wails3
+
+require (
+	github.com/wailsapp/task/v3 v3.40.1-patched3 // indirect
+	github.com/wailsapp/wails/v3 v3.0.0-beta.34 // indirect
+)
+`
+	// goodMainModWails is goodMainMod once the desktop app has added Wails.
+	goodMainModWails = goodMainMod + `
+require github.com/wailsapp/wails/v3 v3.0.0-beta.34
 `
 
 	// readmeTemplate mirrors the root README.md around its "Release signing keys" section, with RELEASE and BACKUP
@@ -172,12 +190,70 @@ func pinTree(toolVersions, mainMod, toolsMod string) map[string]string {
 		"go.mod":                  mainMod,
 		"tools/go.mod":            toolsMod,
 		"tools/goreleaser/go.mod": goodGoreleaserMod,
+		"tools/wails3/go.mod":     goodWailsMod,
 	}
 }
 
 // withGoreleaserMod replaces tools/goreleaser/go.mod in a tree from pinTree.
 func withGoreleaserMod(files map[string]string, mod string) map[string]string {
-	files["tools/goreleaser/go.mod"] = mod
+	return withFile(files, "tools/goreleaser/go.mod", mod)
+}
+
+// mustJSON marshals v with two-space indentation, as npm writes its files.
+func mustJSON(v any) string {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		panic(err)
+	}
+	return string(data) + "\n"
+}
+
+// packageJSON returns a web/package.json that lists @wailsio/runtime as spec in section ("" leaves it out).
+func packageJSON(section, spec string) string {
+	pkg := map[string]any{
+		"name":            "isshoni-web",
+		"dependencies":    map[string]string{"react": "^19.3.0"},
+		"devDependencies": map[string]string{"vite": "^8.0.0"},
+	}
+	if section != "" {
+		pkg[section].(map[string]string)[wailsRuntime] = spec
+	}
+	return mustJSON(pkg)
+}
+
+// packageLock returns a lockfileVersion 3 web/package-lock.json whose root entry lists @wailsio/runtime as rootSpec
+// ("" leaves it out) and which installs it at the given versions, keyed by path (nil installs nothing).
+func packageLock(rootSpec string, installed map[string]string) string {
+	rootDeps := map[string]string{"react": "^19.3.0"}
+	if rootSpec != "" {
+		rootDeps[wailsRuntime] = rootSpec
+	}
+	packages := map[string]any{
+		"": map[string]any{
+			"name":            "isshoni-web",
+			"dependencies":    rootDeps,
+			"devDependencies": map[string]string{"vite": "^8.0.0"},
+		},
+		"node_modules/react": map[string]string{"version": "19.3.0"},
+	}
+	for key, version := range installed {
+		packages[key] = map[string]string{"version": version, "license": "MIT"}
+	}
+	return mustJSON(map[string]any{"name": "isshoni-web", "lockfileVersion": 3, "requires": true, "packages": packages})
+}
+
+const runtimeKey = "node_modules/@wailsio/runtime"
+
+// wailsTree is a pinTree with go.mod, web/package.json and web/package-lock.json given ("" leaves a web file out).
+func wailsTree(mainMod, pkg, lock string) map[string]string {
+	files := pinTree(goodToolVersions, mainMod, goodToolsMod)
+	for name, content := range map[string]string{"web/package.json": pkg, "web/package-lock.json": lock} {
+		if content == "" {
+			withoutFile(files, name)
+		} else {
+			withFile(files, name, content)
+		}
+	}
 	return files
 }
 
@@ -277,10 +353,22 @@ func TestCheckPins(t *testing.T) {
 			files:   map[string]string{".tool-versions": goodToolVersions, "go.mod": goodMainMod},
 			wantErr: []string{"go.mod"},
 		},
+		{
+			name: "wails3 toolchain differs",
+			files: withFile(pinTree(goodToolVersions, goodMainMod, goodToolsMod), "tools/wails3/go.mod",
+				strings.Replace(goodWailsMod, "toolchain go1.27.1", "toolchain go1.27.0", 1)),
+			wantErr: []string{`tools/wails3/go.mod has "toolchain go1.27.0" but .tool-versions pins golang 1.27.1`},
+		},
+		{
+			name: "missing tools/wails3/go.mod",
+			files: map[string]string{".tool-versions": goodToolVersions, "go.mod": goodMainMod, "tools/go.mod": goodToolsMod,
+				"tools/goreleaser/go.mod": goodGoreleaserMod},
+			wantErr: []string{"wails3"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := checkPins(writeTree(t, tt.files))
+			_, err := checkPins(writeTree(t, tt.files))
 			if tt.wantErr == nil {
 				if err != nil {
 					t.Fatalf("checkPins: %v", err)
@@ -296,6 +384,209 @@ func TestCheckPins(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCheckPinsWails(t *testing.T) {
+	goodLock := packageLock("3.0.0-beta.34", map[string]string{runtimeKey: "3.0.0-beta.34"})
+	otherCLI := strings.Replace(goodWailsMod, "beta.34", "beta.33", 1)
+	noWailsCLI := "module github.com/MoonWX/isshoni/tools/wails3\n\ngo 1.26.0\n\ntoolchain go1.27.1\n"
+	const noWailsNote = "go.mod does not require github.com/wailsapp/wails/v3 yet, so only tools/wails3/go.mod's Wails pin was checked"
+	tests := []struct {
+		name     string
+		files    map[string]string
+		wantNote string   // substring of the note; "" means no note
+		wantErr  []string // substrings of the error; nil means no error
+	}{
+		{
+			// Before the desktop app adds Wails to go.mod (README WA22), the CLI alone is pinned.
+			name:     "go.mod has no Wails yet",
+			files:    wailsTree(goodMainMod, packageJSON("", ""), packageLock("", nil)),
+			wantNote: noWailsNote,
+		},
+		{
+			name:     "go.mod has no Wails yet, no web/",
+			files:    wailsTree(goodMainMod, "", ""),
+			wantNote: noWailsNote,
+		},
+		{
+			name:     "go.mod has no Wails yet, tools/wails3 names any version",
+			files:    withFile(wailsTree(goodMainMod, packageJSON("", ""), ""), "tools/wails3/go.mod", otherCLI),
+			wantNote: noWailsNote,
+		},
+		{
+			name:  "all three equal",
+			files: wailsTree(goodMainModWails, packageJSON("dependencies", "3.0.0-beta.34"), goodLock),
+		},
+		{
+			name:  "all three equal, the runtime in devDependencies",
+			files: wailsTree(goodMainModWails, packageJSON("devDependencies", "3.0.0-beta.34"), goodLock),
+		},
+		{
+			name:    "tools/wails3 differs from go.mod",
+			files:   withFile(wailsTree(goodMainModWails, packageJSON("dependencies", "3.0.0-beta.34"), goodLock), "tools/wails3/go.mod", otherCLI),
+			wantErr: []string{"tools/wails3/go.mod has github.com/wailsapp/wails/v3 v3.0.0-beta.33 but go.mod has v3.0.0-beta.34"},
+		},
+		{
+			name:    "tools/wails3 lacks the Wails module",
+			files:   withFile(wailsTree(goodMainModWails, packageJSON("dependencies", "3.0.0-beta.34"), goodLock), "tools/wails3/go.mod", noWailsCLI),
+			wantErr: []string{"tools/wails3/go.mod does not require github.com/wailsapp/wails/v3"},
+		},
+		{
+			name:    "tools/wails3 lacks the Wails module while go.mod has none",
+			files:   withFile(wailsTree(goodMainMod, packageJSON("", ""), ""), "tools/wails3/go.mod", noWailsCLI),
+			wantErr: []string{"tools/wails3/go.mod does not require github.com/wailsapp/wails/v3"},
+		},
+		{
+			name:    "caret range",
+			files:   wailsTree(goodMainModWails, packageJSON("dependencies", "^3.0.0-beta.34"), goodLock),
+			wantErr: []string{`web/package.json has @wailsio/runtime "^3.0.0-beta.34" in dependencies, which is a range or a tag, not an exact version; it must be "3.0.0-beta.34"`},
+		},
+		{
+			name:    "tilde range",
+			files:   wailsTree(goodMainModWails, packageJSON("dependencies", "~3.0.0-beta.34"), goodLock),
+			wantErr: []string{"which is a range or a tag"},
+		},
+		{
+			name:    "comparator range",
+			files:   wailsTree(goodMainModWails, packageJSON("dependencies", ">=3.0.0-beta.34 <3.0.1"), goodLock),
+			wantErr: []string{"which is a range or a tag"},
+		},
+		{
+			name:    "dist-tag",
+			files:   wailsTree(goodMainModWails, packageJSON("dependencies", "latest"), goodLock),
+			wantErr: []string{`"latest" in dependencies, which is a range or a tag`},
+		},
+		{
+			name:    "v prefix",
+			files:   wailsTree(goodMainModWails, packageJSON("dependencies", "v3.0.0-beta.34"), goodLock),
+			wantErr: []string{"which is a range or a tag"},
+		},
+		{
+			name:    "x range",
+			files:   wailsTree(goodMainModWails, packageJSON("dependencies", "3.0.x"), goodLock),
+			wantErr: []string{"which is a range or a tag"},
+		},
+		{
+			name:    "exact but another version",
+			files:   wailsTree(goodMainModWails, packageJSON("dependencies", "3.0.0-beta.33"), goodLock),
+			wantErr: []string{`web/package.json has @wailsio/runtime "3.0.0-beta.33" in dependencies but go.mod has github.com/wailsapp/wails/v3 v3.0.0-beta.34, so it must be "3.0.0-beta.34"`},
+		},
+		{
+			name:    "go.mod has Wails, web/package.json lacks the runtime",
+			files:   wailsTree(goodMainModWails, packageJSON("", ""), packageLock("", nil)),
+			wantErr: []string{`web/package.json does not list @wailsio/runtime; go.mod has github.com/wailsapp/wails/v3 v3.0.0-beta.34, so it must be exactly "3.0.0-beta.34"`},
+		},
+		{
+			name:    "the runtime without Wails in go.mod",
+			files:   wailsTree(goodMainMod, packageJSON("dependencies", "3.0.0-beta.34"), goodLock),
+			wantErr: []string{`web/package.json has @wailsio/runtime "3.0.0-beta.34" in dependencies, but go.mod does not require github.com/wailsapp/wails/v3`},
+		},
+		{
+			name:    "lockfile installs another version",
+			files:   wailsTree(goodMainModWails, packageJSON("dependencies", "3.0.0-beta.34"), packageLock("3.0.0-beta.34", map[string]string{runtimeKey: "3.0.0-beta.35"})),
+			wantErr: []string{`web/package-lock.json installs @wailsio/runtime "3.0.0-beta.35" at node_modules/@wailsio/runtime but go.mod has github.com/wailsapp/wails/v3 v3.0.0-beta.34`},
+		},
+		{
+			name:    "lockfile root entry still has a range",
+			files:   wailsTree(goodMainModWails, packageJSON("dependencies", "3.0.0-beta.34"), packageLock("^3.0.0-beta.34", map[string]string{runtimeKey: "3.0.0-beta.34"})),
+			wantErr: []string{`web/package-lock.json's root entry has @wailsio/runtime "^3.0.0-beta.34" in dependencies, which is a range or a tag`},
+		},
+		{
+			name:    "lockfile root entry lacks the runtime",
+			files:   wailsTree(goodMainModWails, packageJSON("dependencies", "3.0.0-beta.34"), packageLock("", map[string]string{runtimeKey: "3.0.0-beta.34"})),
+			wantErr: []string{"web/package-lock.json's root entry does not list @wailsio/runtime"},
+		},
+		{
+			name:    "lockfile does not install the runtime",
+			files:   wailsTree(goodMainModWails, packageJSON("dependencies", "3.0.0-beta.34"), packageLock("3.0.0-beta.34", nil)),
+			wantErr: []string{"web/package-lock.json installs no node_modules/@wailsio/runtime"},
+		},
+		{
+			name: "a nested copy of another version",
+			files: wailsTree(goodMainModWails, packageJSON("dependencies", "3.0.0-beta.34"), packageLock("3.0.0-beta.34", map[string]string{
+				runtimeKey: "3.0.0-beta.34", "node_modules/some-lib/node_modules/@wailsio/runtime": "3.0.0-beta.20",
+			})),
+			wantErr: []string{`installs @wailsio/runtime "3.0.0-beta.20" at node_modules/some-lib/node_modules/@wailsio/runtime`},
+		},
+		{
+			name:    "no lockfile",
+			files:   wailsTree(goodMainModWails, packageJSON("dependencies", "3.0.0-beta.34"), ""),
+			wantErr: []string{"web/package-lock.json does not exist"},
+		},
+		{
+			name:    "lockfile version 1",
+			files:   wailsTree(goodMainModWails, packageJSON("dependencies", "3.0.0-beta.34"), `{"lockfileVersion": 1, "dependencies": {}}`),
+			wantErr: []string{`web/package-lock.json has no "packages" (lockfileVersion 1)`},
+		},
+		{
+			name: "several problems at once",
+			files: withFile(wailsTree(goodMainModWails, packageJSON("dependencies", "^3.0.0-beta.33"),
+				packageLock("^3.0.0-beta.33", map[string]string{runtimeKey: "3.0.0-beta.33"})), "tools/wails3/go.mod", otherCLI),
+			wantErr: []string{
+				"tools/wails3/go.mod has github.com/wailsapp/wails/v3 v3.0.0-beta.33 but go.mod has v3.0.0-beta.34",
+				`web/package.json has @wailsio/runtime "^3.0.0-beta.33"`,
+				`web/package-lock.json's root entry has @wailsio/runtime "^3.0.0-beta.33"`,
+				`web/package-lock.json installs @wailsio/runtime "3.0.0-beta.33"`,
+				"Wails moves in go.mod, tools/wails3/go.mod, web/package.json and web/package-lock.json at once",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			note, err := checkPins(writeTree(t, tt.files))
+			if tt.wantErr == nil && err != nil {
+				t.Fatalf("checkPins: %v", err)
+			}
+			if tt.wantErr != nil {
+				if err == nil {
+					t.Fatalf("checkPins: no error, want one containing %q", tt.wantErr)
+				}
+				for _, want := range tt.wantErr {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error %q does not contain %q", err, want)
+					}
+				}
+				return
+			}
+			if tt.wantNote == "" && note != "" {
+				t.Errorf("unexpected note %q", note)
+			}
+			if !strings.Contains(note, tt.wantNote) {
+				t.Errorf("note %q does not contain %q", note, tt.wantNote)
+			}
+		})
+	}
+}
+
+// A web file that doesn't parse fails the check, naming the file, rather than passing it.
+func TestCheckPinsWailsBadJSON(t *testing.T) {
+	for _, tt := range []struct {
+		name, pkg, lock, want string
+	}{
+		{name: "package.json", pkg: "{", lock: packageLock("", nil), want: "web/package.json"},
+		{name: "package-lock.json", pkg: packageJSON("dependencies", "3.0.0-beta.34"), lock: "{", want: "web/package-lock.json"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := checkPins(writeTree(t, wailsTree(goodMainModWails, tt.pkg, tt.lock)))
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("checkPins: %v, want an error naming %s", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestExactVersion(t *testing.T) {
+	for _, v := range []string{"3.0.0", "3.0.0-beta.34", "0.1.0-rc.1", "1.2.3+build.5", "1.0.0-alpha-a.b-c"} {
+		if !exactVersion.MatchString(v) {
+			t.Errorf("%q is not taken for an exact version", v)
+		}
+	}
+	for _, v := range []string{"", "^3.0.0", "~3.0.0", ">=3.0.0", "3.0", "3.0.x", "*", "latest", "v3.0.0", "=3.0.0",
+		"3.0.0 || 3.0.1", "01.0.0", "3.0.0-beta.034", "npm:@wailsio/runtime@3.0.0", "file:../runtime"} {
+		if exactVersion.MatchString(v) {
+			t.Errorf("%q is taken for an exact version", v)
+		}
 	}
 }
 
@@ -436,7 +727,7 @@ func TestRun(t *testing.T) {
 		wantStdout string
 		wantStderr string
 	}{
-		{name: "pins ok", args: []string{"-root", good, "pins"}, wantCode: 0},
+		{name: "pins ok", args: []string{"-root", good, "pins"}, wantCode: 0, wantStdout: "repocheck pins: note: go.mod does not require github.com/wailsapp/wails/v3 yet"},
 		{name: "pins fail", args: []string{"-root", bad, "pins"}, wantCode: 1, wantStderr: "repocheck pins: the pins differ"},
 		{name: "keys skipped", args: []string{"-root", good, "keys"}, wantCode: 0, wantStdout: "repocheck keys: skipped"},
 		{name: "keys ok", args: []string{"-root", keysGood, "keys"}, wantCode: 0},

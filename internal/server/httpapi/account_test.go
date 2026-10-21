@@ -231,7 +231,7 @@ func TestSessionsOverREST(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &shape); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := fmt.Sprint(keysOf(shape["devices"][0])), "[appVersion clientKind createdAt id lastIp lastSeenAt name os]"; got != want {
+	if got, want := fmt.Sprint(keysOf(shape["devices"][0])), "[appVersion clientKind createdAt current id lastIp lastSeenAt name os]"; got != want {
 		t.Errorf("device keys = %s, want %s (03 §12.4.3)", got, want)
 	}
 	for _, id := range []string{"aaaaaaaaaaaa", "d2d2d2d2d2d2"} { // unknown, and another user's

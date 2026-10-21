@@ -1,0 +1,228 @@
+{
+  "abi": 65536,
+  "structs": {
+    "im_init_params": {
+      "size": 32,
+      "fields": {
+        "struct_size": 0,
+        "abi_version": 4,
+        "flags": 8,
+        "log_level": 12,
+        "ffmpeg_dir": 16,
+        "openh264_path": 24
+      }
+    },
+    "im_clock_sample": {
+      "size": 32,
+      "fields": {
+        "struct_size": 0,
+        "reserved": 4,
+        "mono_ns": 8,
+        "unix_ns": 16,
+        "uncertainty_ns": 24
+      }
+    },
+    "im_adapter_info": {
+      "size": 160,
+      "fields": {
+        "luid": 0,
+        "vendor_id": 8,
+        "device_id": 12,
+        "driver_version": 16,
+        "name": 24,
+        "flags": 152,
+        "reserved": 156
+      }
+    },
+    "im_encoder_info": {
+      "size": 104,
+      "fields": {
+        "kind": 0,
+        "adapter_index": 4,
+        "flags": 8,
+        "status": 12,
+        "max_width": 16,
+        "max_height": 20,
+        "test_encode_us": 24,
+        "reserved": 28,
+        "codec": 40,
+        "reason": 72
+      }
+    },
+    "im_caps": {
+      "size": 1568,
+      "fields": {
+        "struct_size": 0,
+        "os_build": 4,
+        "os_ubr": 8,
+        "os_flags": 12,
+        "audio_flags": 16,
+        "adapter_count": 20,
+        "adapters": 24,
+        "encoder_count": 664,
+        "reserved0": 668,
+        "encoders": 672,
+        "probe_ms": 1504,
+        "reserved": 1508
+      }
+    },
+    "im_pick_params": {
+      "size": 24,
+      "fields": {
+        "struct_size": 0,
+        "flags": 4,
+        "parent_window": 8,
+        "timeout_ms": 16,
+        "reserved": 20
+      }
+    },
+    "im_source_info": {
+      "size": 440,
+      "fields": {
+        "struct_size": 0,
+        "kind": 4,
+        "id": 8,
+        "name": 72,
+        "monitor_id": 328,
+        "width": 392,
+        "height": 396,
+        "capture_path": 400,
+        "flags": 404,
+        "pid": 408,
+        "reserved0": 412,
+        "window": 416,
+        "reserved": 424
+      }
+    },
+    "im_rule": {
+      "size": 32,
+      "fields": {
+        "kind": 0,
+        "source": 4,
+        "value": 8,
+        "app_id": 16,
+        "name": 24
+      }
+    },
+    "im_exclusions": {
+      "size": 24,
+      "fields": {
+        "struct_size": 0,
+        "flags": 4,
+        "rules": 8,
+        "rule_count": 16,
+        "shared_pid": 20
+      }
+    },
+    "im_audio_config": {
+      "size": 32,
+      "fields": {
+        "mode": 0,
+        "bitrate_bps": 4,
+        "frame_ms": 8,
+        "flags": 12,
+        "reserved": 16
+      }
+    },
+    "im_audio_level": {
+      "size": 80,
+      "fields": {
+        "app_id": 0,
+        "peak_db": 64,
+        "rms_db": 68,
+        "source": 72,
+        "reserved": 76
+      }
+    },
+    "im_audio_levels": {
+      "size": 5152,
+      "fields": {
+        "struct_size": 0,
+        "report_seq": 4,
+        "qpc_ns": 8,
+        "mix_peak_db": 16,
+        "mix_rms_db": 20,
+        "count": 24,
+        "reserved": 28,
+        "apps": 32
+      }
+    },
+    "im_layer_config": {
+      "size": 40,
+      "fields": {
+        "rid": 0,
+        "width": 4,
+        "height": 8,
+        "max_pixels": 12,
+        "fps": 16,
+        "bitrate_bps": 20,
+        "gop_ms": 24,
+        "flags": 28,
+        "reserved": 32
+      }
+    },
+    "im_start_config": {
+      "size": 224,
+      "fields": {
+        "struct_size": 0,
+        "flags": 4,
+        "source_id": 8,
+        "profile": 16,
+        "content_hint": 20,
+        "encoder": 24,
+        "layer_count": 28,
+        "layers": 32,
+        "audio": 152,
+        "exclusions": 184,
+        "reserved": 192
+      }
+    },
+    "im_layer_info": {
+      "size": 40,
+      "fields": {
+        "rid": 0,
+        "encoder": 4,
+        "width": 8,
+        "height": 12,
+        "fps": 16,
+        "bitrate_bps": 20,
+        "profile": 24,
+        "flags": 28,
+        "reserved": 32
+      }
+    },
+    "im_session_info": {
+      "size": 184,
+      "fields": {
+        "struct_size": 0,
+        "flags": 4,
+        "capture_path": 8,
+        "layer_count": 12,
+        "epoch_ns": 16,
+        "audio_state": 24,
+        "reserved0": 28,
+        "layers": 32,
+        "reserved": 152
+      }
+    },
+    "im_packet": {
+      "size": 72,
+      "fields": {
+        "struct_size": 0,
+        "kind": 4,
+        "layer": 8,
+        "flags": 12,
+        "capture_ts_ns": 16,
+        "data": 24,
+        "size": 32,
+        "duration_us": 36,
+        "width": 40,
+        "height": 42,
+        "profile": 44,
+        "event": 48,
+        "status": 52,
+        "reserved": 56
+      }
+    }
+  }
+}

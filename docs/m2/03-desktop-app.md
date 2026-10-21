@@ -67,7 +67,7 @@ release CI (06), the client core and the protocol additions (01).
 
 **Later**: the macOS build that shares (M3, §21), the Linux agent's relay transport for `NativeBridge` (M4, §21),
 "Copy diagnostics" and desktop "X started sharing" toasts (M5), a taskbar overlay icon while sharing (M5),
-web-initiated desktop shares through `share.request` (01 serves the relay kind; the desktop UI may adopt it in M4),
+web-initiated desktop shares through `share.request` (M4; in M2 the core serves no relay request kind, 01 D16),
 Windows on ARM64 (later).
 
 ---
@@ -162,7 +162,7 @@ records the result in its PR under the heading "Wails checklist"; README's WA87 
 | `isshoni.exe` | `explorer.exe`: the Start menu, autostart, Explorer-launched installer starts, or the shell relaunch of §13.4 when a browser, the installer or another non-launcher started it; a launcher of 05 §5.4 (terminal, Steam, …) is kept | until Quit | Loads `isshoni-media.dll` in-process (04). A native crash ends the app and the share; §17 covers crash files |
 | `msedgewebview2.exe` (browser, renderer, GPU, utility/audio, network) | `isshoni.exe` | with the window's environment | Its own user data folder (§14.1), so the WebView2 browser process is always a child of `isshoni.exe`: 05's instance rule "exclude all isshoni.exe descendants" keeps viewer audio out of shares |
 | `isshoni.exe --sound-check-helper` | `isshoni.exe` | ≤ 3 s, during a sound check | 05's helper (05 §11.3): plays the chime and exits. `main` dispatches it before anything else (§13.4) |
-| `isshoni.exe` in a one-shot mode (`--version`, `--self-check=…`, `--purge-data`, `--update-now`, `-Embedding`) | the installer, a test, COM | seconds | No window, no single instance, no mutex (§13.4) |
+| `isshoni.exe` in a one-shot mode (`--version`, `--self-check=…`, `--forget-credentials`, `--purge-data`, `--update-now`, `-Embedding`) | the installer, a test, COM | seconds | No window, no single instance, no mutex (§13.4) |
 | `isshoni.exe <args>` (second instance) | whoever launched it | ≤ 2 s | Forwards its arguments to the first instance (§13.3), calls `AllowSetForegroundWindow(ASFW_ANY)` first, exits 0 |
 
 The binary is named `isshoni.exe` (the installer's name, 06). `-H windowsgui`: no console. `--log-level debug`
@@ -367,7 +367,7 @@ font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-s
 | Default context menu | off in production | the SPA cancels `contextmenu` outside text fields |
 | Zoom control (Ctrl + wheel, Ctrl +/−) | off; OS text scaling still applies | the SPA cancels `wheel` with Ctrl and the zoom keys |
 | Browser accelerator keys (F5, Ctrl+R, Ctrl+P, Ctrl+F, Ctrl+U, Ctrl+Shift+I) | off | the SPA cancels those `keydown`s (capture phase) |
-| General autofill, password save | off (the app has no password field in M2, 02 §14; the setting stays off so nothing a future form or page holds is stored by WebView2) | `autocomplete="off"` on any form; accepted residual risk, recorded |
+| General autofill, password save | off (the link step's password form, 02 §14 and §8.2, is the app's only password field; the setting stays off so WebView2 stores nothing that form or any page holds) | `autocomplete="off"` on any form; accepted residual risk, recorded |
 | Status bar (link preview) | off | none needed |
 | Swipe navigation, pinch zoom | off | `touch-action` in CSS |
 | External drop (a dropped file or link navigates) | off | the SPA cancels `dragover` and `drop` on `document` |
@@ -580,6 +580,7 @@ like tygo's output).
 | `Auth.SwitchServer(origin)` | → — | `not_found`, `busy` (live share) | makes it active and reloads the window (for a server that isn't linked, the reloaded page shows its link step, §7.5's `RequireAuth`, §13.2) |
 | `Auth.RemoveServer(origin)` | → — | `not_found`, `busy` (live share on it) | 02's `Servers.Remove` (Unlink, then drop the entry) |
 | `Auth.Link()`, `Auth.CancelLink()` | → — | `server_unreachable`, `incompatible_server`, `rate_limited` | 02's `Manager.Link` on the active server; progress arrives as `auth.state` |
+| `Auth.LinkWithPassword(username, password)` | `string`, `string` → `AuthState` | `invalid_argument`, `invalid_credentials`, `account_pending`, `account_disabled`, `rate_limited` (`params.retryAfter`), `server_busy`, `validation_failed` (`params.fields`: M1's login field codes `required`, `too_long`, `invalid` for `username` and `password`) (02's `*api.Error` codes, passed through), `server_unreachable`, `incompatible_server` | the link step's "Sign in with username and password instead" (§8.2): 02's `Manager.LinkWithPassword` on the active server with `AppInfo`'s device name (02 §14); the password crosses the binding once as a `protocol.Secret` and is never stored, retried or logged (Wails' own logger too, §17) |
 | `Auth.Unlink()` | → `{confirmed: bool}` | — | Sign out (§8.3); a live share on the active server is stopped first |
 | `Auth.Recheck()` | → `AuthState` | — | the version screen's "Try again" (02 §13.1) |
 | `Auth.AccessToken(origin, force)` | `string`, `bool` → `{token, expiresAt}` or `null` (not linked, or `origin` isn't the active server's) | `server_unreachable` (02's `ErrOffline`), `incompatible_server` (`ErrIncompatible`) | §5.8; 02's `Manager.AccessTokenWithExpiry(ctx, force)` on the active server only |
@@ -698,7 +699,7 @@ parses the rejection's message into `BridgeError {code, params}` (W12). Codes ar
 | `already_sharing`, `not_sharing`, `pick_expired` | share controller | `desktop.errors.*` |
 | `engine.` + 01's `media.ErrorCode` (01 §5.2): `engine.permission_denied`, `engine.encoder_lost`, `engine.source_gone`, `engine.unsupported_os`, `engine.no_encoder`, `engine.dependency`, `engine.internal`, `engine.invalid`, `engine.busy`; `params.reason` = `media.Error.Reason` (04 §5.7's detail token: `pick_expired`, `self_window`, `driver_too_old`, `no_media_foundation`, `blocked_by_policy`, `missing`, `version`, `abi`, …; `""` when none) | the engine (§10.5) | `desktop.errors.engine.*`, chosen by code and then by `params.reason` (§10.5's reason rows win over the code's row); `invalid` and `busy` share `internal`'s text; an unknown media code or reason is shown with its code's text, else `internal`'s; `engine.cancelled` is never surfaced (`Pick` returns `null`) |
 | `update.` + 06's code (06 §8.10), plus `update.not_ready` | `Updates.*` | `desktop.update.error.<code>` |
-| any 01 §12.1 wire code | passed through from C2 | `errors.<code>` (M1 catalog) |
+| any 01 §12.1 wire code; the M1 REST codes `Auth.LinkWithPassword` passes through (`invalid_credentials`, `account_pending`, `account_disabled`, `server_busy`, `validation_failed` with `params.fields`) | passed through from C2 or 02 | `errors.<code>` (M1 catalog); `validation_failed` also shows M1's `fieldErrors.<field>.<code>` under each field |
 
 ---
 
@@ -843,6 +844,7 @@ export interface NativeBridge {
   auth: { state(): Promise<AuthState>; servers(): Promise<ServerInfo[]>; probe(address: string): Promise<ServerProbe>;
           addServer(origin: string): Promise<void>; switchServer(origin: string): Promise<void>;
           removeServer(origin: string): Promise<void>; link(): Promise<void>; cancelLink(): Promise<void>;
+          linkWithPassword(username: string, password: string): Promise<AuthState>;
           unlink(): Promise<{ confirmed: boolean }>; recheck(): Promise<AuthState>;
           accessToken(origin: string, force: boolean): Promise<AccessToken | null>;
           sessionEnded(origin: string, code: 'unauthenticated' | 'session_revoked' | 'account_disabled'): Promise<AuthState>;
@@ -982,6 +984,7 @@ in settings (per install) records that the sound and voice steps were seen once.
      │      "or open watch.example.com/link and enter WDJB-MJHT" · browser opened at /link?code=…
      │      [Open browser again] [Copy link] · 10-minute countdown
      │      "You can rename this PC on the approval page or later on your Devices page."
+     │      "Sign in with username and password instead" → username, password [Sign in] (02 §14)
      │ status linked
      ▼
  [sound]   sound check (first install only)        [voice]   "Friends won't hear: …" (first install only) → [Done]
@@ -1032,9 +1035,17 @@ in settings (per install) records that the sound and voice steps were seen once.
   - a `Link()` error (`server_unreachable`, `rate_limited`) → its text with [Try again]; 02's `ErrBadResponse` (a
     verification URI that failed 02 §11.2's check) → the generic link error "Couldn't start linking with this server"
     with [Try again].
+  - **"Sign in with username and password instead"** (02 §14: the plan's in-app fallback; the device flow stays the
+    default): a link below the code opens a form with username and password fields and [Sign in] [Back]. [Sign in]
+    calls `Auth.LinkWithPassword(username, password)` (§6.2), which cancels a running device-flow link first;
+    `linked` continues as above; an error stays on the form with its text (`invalid_credentials`, `account_pending`,
+    `account_disabled`, `rate_limited` with its wait, `server_busy`, `server_unreachable`; `validation_failed` with
+    M1's `fieldErrors.username.*` / `fieldErrors.password.*` text under the field, e.g. a username that is too long)
+    and clears the password field. [Back] returns to the code (`Auth.Link()`). The fields carry
+    `autocomplete="off"`, WebView2's general autofill and password saving stay off (§5.4), and the SPA keeps the
+    password only in the field until the call returns.
   Cancel (or leaving the page) calls `Auth.CancelLink()`. The app sends 02's default device name; the page says "You
-  can rename this PC on the approval page or later on your Devices page." There is no name field and no password
-  form (02 §14: the QR code covers approving from a phone).
+  can rename this PC on the approval page or later on your Devices page." There is no name field.
 - **Sound check step** (§8.4).
 - **Voice step**: calls `Audio.Watch(true)` on mount (`false` on unmount). "Friends won't hear:" with 05's built-in
   voice apps from `FriendsHear.voiceApps` (Discord, TeamSpeak, Mumble, …; "running" from its `running` flag),
@@ -1104,7 +1115,7 @@ in settings (per install) records that the sound and voice steps were seen once.
 | Opened by | the SPA's room runtime (05 §7), like a browser tab | `internal/desktop/session` when a server is active and linked |
 | `hello` | `role: viewer`, `client {kind: desktop, os, version, browser: edge}`, `auth` bearer, features `agent.relay`, `user.connections` | `role: publisher`, `client {kind: desktop, …}`, bearer, features exactly 01 §11.1's (`agent.relay`, `share.pause`) |
 | In a room | from the room page's join until leave, logout or quit (05 §11.1) | **only while sharing**: 01's `StartShare` joins the share's room, `Share.Stop` leaves after the share ends (01 §11.4, D12) |
-| Carries | `room.state`, subscriptions, the sub PC, `stats`, `agent.send` (`playback.stop`), `user.connections` | `share.*`, the pub PC, `quality.hint`, the relay (`share.request` in, `share.status`/`playback.stop` out, `playback.state` in → 05, §12.2) |
+| Carries | `room.state`, subscriptions, the sub PC, `stats`, `agent.send` (`playback.stop`), `user.connections` | `share.*`, the pub PC, `quality.hint`, the relay (`playback.state` in → 05, §12.2; it serves no relay request kind and sends none in M2, 01 D16) |
 | Recovery | 05 §11.1 and 01 §10 unchanged | 01-client-core (resume, `replaces`, the 30 s hold) |
 
 - Both attach to the same Participant (01 §4.1), so presence shows one person; the people panel may show two
@@ -1557,9 +1568,9 @@ The relay kind `playback.stop` is reserved in 01 §8.14 and defined here; `playb
   connection with `kind: desktop` in the tab's `user.connections`, whenever the tab's audible playback starts or stops
   (any subscription with audio on and an unmuted element), and again to a desktop connection that newly appears in
   the list. Errors are ignored like `playback.stop`'s.
-- **Receiver**: the Go App on C2 (01's `EventRelay` for the kinds the core doesn't serve, §24). It decodes strictly
-  (unknown `v` ignored) and calls `audio.Service.SetViewerBrowser(fromConnID, browser, os, playing)`. The desktop's
-  C1 also receives it and ignores the kind.
+- **Receiver**: the Go App on C2, through 01's typed `EventPlaybackState{From, Playing, Browser, OS}`, which the core
+  emits after decoding the payload strictly (01 §11.11 rule 1; §24). The App calls
+  `audio.Service.SetViewerBrowser(From, Browser, OS, Playing)`. The desktop's C1 also receives it and ignores the kind.
 - **Expiry**: the desktop SPA sends C1's online `user.connections` ids to Go (`App.OwnConnections`); when a sender
   disappears from that list, the App calls `SetViewerBrowser(fromConnID, …, false)`. 05 also drops every viewer rule
   when the share ends.
@@ -1666,18 +1677,22 @@ checks it on windows-2025.
 1. **One-shot modes** (skipped entirely when `--open-url` is present, §13.1): each runs first, opens no window, skips
    single instance and does not create the mutex:
    - `--version`: prints exactly one JSON line `{"version","commit","date","protocol":{"min","max"},"engineAbi"}`
-     (`internal/version`, `protocol.MinVersion`/`Version`, `media.ABIVersion`) to stdout and exits 0. A GUI-subsystem
-     process writes to its inherited stdout handle; when it has none, it calls `AttachConsole(ATTACH_PARENT_PROCESS)`
-     first.
+     (`internal/version`, `protocol.MinVersion`/`Version`, `media.ABIVersion`: the ABI major, 1, as 06 §2.4) to stdout
+     and exits 0. A GUI-subsystem process writes to its inherited stdout handle; when it has none, it calls
+     `AttachConsole(ATTACH_PARENT_PROCESS)` first.
    - `--self-check=<path>`: loads `isshoni-media.dll` and FFmpeg from the exe's folder (`native.Open`), reads
-     `Info().ABI` and runs `Probe(ctx, false)` (20 s; no encoder required, so it passes on a GPU-less VM), builds
-     `assets.New(assets.Options{Dist: web.Dist(), …})`, and writes 06 §2.4's JSON `{"ok", "version", "engine":
-     {"loaded", "abi", "ffmpegLicense"}}` plus `"spa": {"ok": bool}` to `<path>`, so 06's smoke catches a broken
-     bundle too. Exits 0 only when `ok` (engine loaded, `abi == media.ABIVersion`, `spa.ok`).
-   - `--purge-data`: 02's `Servers.ForgetAll(ctx)`: revoke every linked server in parallel, 5 s each (so at most 5 s
-     in all, inside the uninstaller's 30 s), then delete every credential under the `isshoni:v1:` prefix (02's
-     `DeleteAll`), whatever the revokes answered; then delete `%LOCALAPPDATA%\isshoni`, retrying locked files for up
-     to 10 s (WebView2 children may still be exiting); exit 0.
+     `Info().ABI`, runs `Probe(ctx, false)` (20 s; no encoder required, so it passes on a GPU-less VM) and reads
+     `BuildInfo()`, builds `assets.New(assets.Options{Dist: web.Dist(), …})`, and writes 06 §2.4's JSON `{"ok",
+     "version", "engine": {"loaded", "abi", "ffmpegLoaded", "ffmpegLicense", "testHooks"}}` plus `"spa": {"ok":
+     bool}` to `<path>`, so 06's smoke catches a broken bundle too. Exits 0 only when `ok`, which needs all of them:
+     engine loaded, `abi == media.ABIVersion` (major 1), `ffmpegLoaded`, `ffmpegLicense` = `"LGPL version 2.1 or
+     later"`, `testHooks` false and `spa.ok`.
+   - `--forget-credentials` (run by **every** uninstall, 06 §2.4, §6.8): 02's `Servers.ForgetAll(ctx)`: revoke every
+     linked server in parallel under one 5 s budget (inside the uninstaller's 30 s), then delete every credential under
+     the `isshoni:v1:` prefix (02's `DeleteAll`), whatever the revokes answered; exit 0, also when offline.
+   - `--purge-data` (run by a `/PURGE` uninstall instead): the same `Servers.ForgetAll(ctx)` with the same one 5 s
+     budget, then delete `%LOCALAPPDATA%\isshoni`, retrying locked files for up to 10 s (WebView2 children may still
+     be exiting); exit 0.
    - `--update-now` (only in `updatetest` builds, 06 §8.11): one `CheckNow`; when `ready`, `Apply(ctx, p, true)`;
      exits 0 (applied or up to date) or 1.
    - `-Embedding` (COM activation of a toast button while no instance runs, §15): registers the Wails notification
@@ -1918,6 +1933,11 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
   line that needs to tell apps apart uses a count or 05's reason code. `remote_ip` never (the app knows only the
   server). 01 §11.12's list applies to the core's lines. `log.level` is a persisted setting (§14.2), and log files are
   what users attach to public issues, so debug is held to the same rule as info.
+- **Wails' own logger**: the Wails application's `Options.Logger` is never applog's debug-capable logger. It is
+  applog's handler with a fixed minimum level of Info whatever `log.level` is, because the pinned Wails logs each bound
+  call's raw JSON arguments and result at Debug ("Binding call complete"), before Go wraps a password in
+  `protocol.Secret`: otherwise `Auth.LinkWithPassword`'s password and `Auth.AccessToken`'s token would reach the log
+  at `log.level: debug`.
 - **SPA log**: `lib/log.ts` (05) forwards `warn` and `error` to `App.Log` in the desktop (≤ 10 per second; above that
   one "N messages dropped" line per minute), with `component: spa`. The SPA's desktop code never passes an app name,
   app id, window title or share label to `log` (the same rule as above).
@@ -2010,7 +2030,7 @@ for 06's uninstaller and shortcut. A toast button pressed after the app exited s
 | Deep links | ≤ 1 handled per second; ≤ 2048 bytes |
 | Second instance forward | 2 s |
 | `-Embedding` start without an `open` action | exits within 5 s |
-| `--purge-data` | revokes ≤ 5 s in all; locked files retried ≤ 10 s |
+| `--forget-credentials`, `--purge-data` | revokes ≤ 5 s in all (one budget); `--purge-data`'s locked files retried ≤ 10 s |
 | `--self-check` probe | 20 s |
 | Quit waiting for the server | 3 s; after `Updates.Install()` the app quits within 5 s |
 | End of session | share stopped within 2 s |
@@ -2064,7 +2084,7 @@ there.
 | `tray` | `Render` for every mode, tooltip truncation at 127 characters with a 40-character source, menu items and hotkey labels, "Restart and update" only in Idle |
 | `hotkey` | parse/format round trip, rejected combos (one modifier, Win), the defaults are `Ctrl+Alt+Shift+F9`/`F10`, fuzz |
 | `i18n` | interpolation, plurals, missing key; every Go-used key exists in `desktop.en.json` |
-| `applog` | rotation at 5 MiB keeping 5; `Secret` redacted; profile path replaced; crash-file detection; at `log.level: debug`, a run of the `app`, `share` and `bridge` tests over 05's fake `normal` scenario writes no exe name (`*.exe`), no app display name, window title or share label from the fixtures into the log (§17) |
+| `applog` | rotation at 5 MiB keeping 5; `Secret` redacted; profile path replaced; crash-file detection; at `log.level: debug`, a run of the `app`, `share` and `bridge` tests over 05's fake `normal` scenario writes no exe name (`*.exe`), no app display name, window title or share label from the fixtures into the log (§17); at `log.level: debug`, the logger `main` gives Wails as `Options.Logger` has Debug disabled, and Wails' "Binding call complete" lines for `Auth.LinkWithPassword` (the password in `args`) and `Auth.AccessToken` (the token in `result`) sent through it leave neither the password nor the token in the log (§17) |
 | `bridge` | each method validates arguments and maps errors to §6.4's JSON (02's `ErrOffline` → `server_unreachable`, `ErrIncompatible` → `incompatible_server`, `ErrTooManyServers` → `too_many_servers`; media codes → `engine.<code>`; `engine.cancelled` never returned); `Audio.Watch`/`WatchLevels`/`Share.WatchServerStats` reference counts; `OpenExternal` accepts only https (and dev http localhost); `Shell.OpenURL` refuses `file:`, `ms-settings:`, `search-ms:`, `javascript:` and a UNC path (`\\host\share`) with `invalid_argument` and opens nothing, even when called from Go code paths that skip `OpenExternal`; `OpenOSSettings` URI builder incl. `sound-communications`; `Log` rate limit; no method returns a refresh token (type check over every result type); `Auth.AccessToken(origin, force)` with an origin that isn't the active server's → `null` and no `Manager` call, with the active one → the token (and `force` reaches `AccessTokenWithExpiry`); a call racing an `AddServer` returns either `null` or the requested origin's own token, never the new server's; `SessionEnded`/`HelloRefused` with another origin → `not_found` and no `Manager` call; no `Audio` method sets a sound mode (the service type has no such method); `Audio.Decide` with `auto` → `invalid_argument`; `Audio.DismissPrompt` → 05's `DismissPrompt`, `ErrUnknownPrompt` → `not_found`; `TestHotkey` sets `typesChar` from a fake layout |
 | `cmd/isshoni-desktop` (start order) | §13.4 with fakes for the mutex probe, the registry and the updater: installer mutex present → a start from `--open-url` writes `PendingServer`/`PendingRoom` (replacing older values) and exits 0, a plain start writes nothing and exits 0, and neither calls single instance, creates the running mutex, builds the updater or calls `Apply`; mutex absent → the normal order; `--sound-check-helper` still runs after the first action only |
 | `cmd/isshoni-desktop` (build) | `GOOS=darwin CGO_ENABLED=0 go vet ./...` and `GOOS=linux go build ./...` pass (the stub prints its line and exits 1) |
@@ -2087,7 +2107,8 @@ there.
   `explorer.exe`; started with `--relaunched` it stays; skipped with a reason when `GetShellWindow` returns 0 (no
   shell on the runner), and run on the owner's PC runner.
 - `--version` prints one JSON line with the fields of §13.4 when stdout is redirected; `--self-check=<path>` on a
-  GPU-less runner writes `ok: true` with `engine.loaded` and `spa.ok` (06's smoke runs the same against the install).
+  GPU-less runner, against `windows-native`'s `release\` DLL and FFmpeg DLLs, writes `ok: true` with `engine.loaded`,
+  `ffmpegLoaded`, `testHooks: false` and `spa.ok` (06's smoke runs the same against the install).
 - Notifications (W8): after one toast, the three HKCU keys of §14.1 exist under `Options.Name =
   io.isshoni.desktop`, and `CustomActivator` matches the CLSID key.
 - AppUserModelID set; `OpenSettingsPage` maps pages to the right URIs by build, and `sound-communications` to
@@ -2152,7 +2173,9 @@ there.
   `/desktop/setup?link=1` drops the parameter and calls `link()` exactly once, only when the state is `unlinked`
   without a notice; link states from `AuthState` (`linking` with code, QR, short URL, the server name and the trust
   line; `linked`; `denied`; `code_expired`; `incompatible` with `recheck`); an `auth.state` event for another origin
-  changes nothing on the page; the QR code encodes `verificationUriComplete`; the voice step calls
+  changes nothing on the page; the QR code encodes `verificationUriComplete`; the password form: each error text of
+  §8.2 (`validation_failed` per field), the password field cleared after an error, `autocomplete="off"` on both
+  fields, exactly one `linkWithPassword` call per [Sign in], and [Back] calling `link()`; the voice step calls
   `audio.watch(true)` on mount and shows `voiceApps[].running`; sound check results by `backend` and `reason`, incl.
   `device_busy` with its text, [Open sound settings], [Try again] and [Continue], and an unknown reason with the
   generic text; relink texts per notice and the `save_failed` banner; Unlink with `confirmed: false`.
@@ -2193,7 +2216,7 @@ never a config key. The CSP of a dev/e2e build allows the http loopback server (
 
 | Spec | Asserts |
 |---|---|
-| `desktop-link.spec` | wizard: server address → confirm → device code, QR code and short URL shown → a second browser context signed in on the server approves at `/link` → sound step (05's fake: `captured`) → voice step (`voiceApps` from the scenario) → the room; a denied code shows "declined"; an unknown server delivered as `--server` shows "Add server {host}?" and the harness records no request to it before Add, and after Add (same host) the link step follows with no confirm step. **Second server, no token crosses**: with the page in a room on server A (C1 open) and a second e2e server B from `fixtures.ts` (its own port and data dir), the harness started with `-reload-delay=2s`: add B through `--server`, Add; during the delay the spec creates a room on A (A's `invalidate` makes the page refetch `['rooms']` from A) and closes C1 through Playwright's `page.routeWebSocket` (C1 reconnects and resumes), so the page's refetch and C1's resume hello reach A while B is active; then B's link step renders on B's `bridge.js` and is approved. Asserted: no request to A (`page.on('request')`, the `Authorization` header) and no `hello` to A (`page.on('websocket')`, `framesent`) carries a token whose hash `/__e2e/state` lists for B; the harness lists no token handed out for origin A while B was active; the window reloaded exactly once, at `/desktop/setup?link=1` |
+| `desktop-link.spec` | wizard: server address → confirm → device code, QR code and short URL shown → a second browser context signed in on the server approves at `/link` → sound step (05's fake: `captured`) → voice step (`voiceApps` from the scenario) → the room; a denied code shows "declined"; the password path: "Sign in with username and password instead", a wrong password shows the error and clears the field, the right one links; an unknown server delivered as `--server` shows "Add server {host}?" and the harness records no request to it before Add, and after Add (same host) the link step follows with no confirm step. **Second server, no token crosses**: with the page in a room on server A (C1 open) and a second e2e server B from `fixtures.ts` (its own port and data dir), the harness started with `-reload-delay=2s`: add B through `--server`, Add; during the delay the spec creates a room on A (A's `invalidate` makes the page refetch `['rooms']` from A) and closes C1 through Playwright's `page.routeWebSocket` (C1 reconnects and resumes), so the page's refetch and C1's resume hello reach A while B is active; then B's link step renders on B's `bridge.js` and is approved. Asserted: no request to A (`page.on('request')`, the `Authorization` header) and no `hello` to A (`page.on('websocket')`, `framesent`) carries a token whose hash `/__e2e/state` lists for B; the harness lists no token handed out for origin A while B was active; the window reloaded exactly once, at `/desktop/setup?link=1` |
 | `desktop-share.spec` | Share → sheet → fake pick → first-share sheet → live; afterwards the harness's debug-level log contains no exe name (`.exe`), no app display name of the scenario, no window title and no share label (§17); a web viewer tab decodes frames and audio energy (M1's `stats.ts`); the desktop's own tile shows the preview layer only (`low`, no audio subscription); tray state `Live`, "1 watching"; Pause (button, then `/__e2e/hotkey?id=pause`) → viewer tile "Paused", no new frames, no audio energy; a viewer that joins while paused gets no frame; Resume; the `normal` scenario's mic prompt at t = 5 s shows the card and a recorded toast while hidden; Stop by hotkey → share gone, hotkeys unregistered, keep-awake off |
 | `desktop-share.spec` (audio alert case) | with `ISSHONI_FAKE_AUDIO=degrade-live`: Share → live; 5 s later the fake degrades to `endpoint`; the harness's debug endpoint shows `tray.Render` with `tray-warn`, the first menu line "Friends hear voice apps" and, with a scripted prompt, "1 question waiting"; `PillState` with `VoiceAppsHeard` and `Questions` 1; exactly one recorded `desktop.native.toast.voiceAppsHeard` toast; a second degrade within 60 s records none |
 | `desktop-handoff.spec` | a web tab of the same user watches Lounge; the desktop page joins Lounge → the tab shows "Now watching in the isshoni app" and its subscriptions are all off; "Watch here instead" resumes and the tab's `playback.state {playing: true}` reaches the app (`/__e2e/state` shows 05's viewer rule input); closing the tab sets it to `playing: false`; a phone-emulated tab (role `viewer`) keeps playing |
@@ -2253,7 +2276,7 @@ shows the encoder and the full layer's bitrate, and its windows stay out of the 
 | Relay kinds `playback.stop` (payload `{v: 1, roomId}`) and `playback.state` (payload `{v: 1, playing, browser, os}`), sender and receiver rules | §12.2 | 01 (relay registry: `KindPlaybackState`, `PlaybackState`), 05 (`SetViewerBrowser`), web client |
 | Web client hello features `agent.relay`, `user.connections`; C2's features are exactly 01 §11.1's | §7.6, §9 | 01-client-core (server side of `user.connections`) |
 | Consumes 02 §12 (`deeplink.Parse/Build/NormalizeOrigin`, `appLinkFor`); command line `--open-url <url>` (the only link entry, with the injection rule), `--server <origin>`, `--autostart`, `--updated-from=<v>`, `--relaunched` | §13.1 | 02, 06 (scheme registration `"…\isshoni.exe" --open-url "%1"`, 06 §2.3) |
-| Process contract (§13.4): mutex `Local\io.isshoni.desktop.running`; `--version` JSON; `--self-check=<path>` JSON with `spa.ok`; `--purge-data` (02's `ForgetAll`, 5 s, data dir); `--update-now` (updatetest); `-Embedding`; no job object; PendingServer/PendingRoom read and delete; PendingRoom written before a start-time update; the initial `updates.check` from `UpdateChecks` | §13.4, §14.2 | 06 (installer, uninstaller, smoke, R4, R9) |
+| Process contract (§13.4): mutex `Local\io.isshoni.desktop.running`; `--version` JSON; `--self-check=<path>` JSON (06 §2.4's engine fields plus `spa.ok`; `ok` needs all); `--forget-credentials` (every uninstall: 02's `ForgetAll`, one 5 s budget); `--purge-data` (`/PURGE`: the same `ForgetAll`, then the data dir); `--update-now` (updatetest); `-Embedding`; no job object; PendingServer/PendingRoom read and delete; PendingRoom written before a start-time update; the initial `updates.check` from `UpdateChecks` | §13.4, §14.2 | 06 (installer, uninstaller, smoke, R4, R9) |
 | `--sound-check-helper` mode: 03 dispatches it first in `main`, 05 implements it (05 §11.3) | §4.2, §13.4 | 05 |
 | Shell relaunch under `explorer.exe` (§13.4 step 2) | §13.4 | 05 (§6.2's include rules assume it) |
 | AppUserModelID, Wails `Options.Name` and single-instance id `io.isshoni.desktop`; exe name `isshoni.exe`; Run value name `isshoni` | §4.2, §13.3, §14.1, §15 | 06 (shortcut, uninstall), 05 (own tree by PID, plus the exe name `isshoni.exe` and the WebView2 user data folder; changing either needs 05's rule change) |
@@ -2287,7 +2310,7 @@ The shapes below are what this doc assumes; each sibling's own names win, and th
   c, _ := core.New(core.Options{ServerURL, Auth, Client, Engine, Logger})
   c.Run(ctx)                                    // until ctx ends or a terminal *StopError
   c.Status()                                    // Conn, Stop, ConnectionID (01 adds), Features, Share
-  c.Subscribe()                                 // EventStatus, EventShare, EventNotice, EventRelay (01 adds), EventResync, …
+  c.Subscribe()                                 // EventStatus, EventShare, EventNotice, EventPlaybackState (01 adds), EventResync, …
   c.StartShare(ctx, core.ShareRequest{RoomID, Source, Preset, Audio, Exclusions, Borderless, Label: ""})
   c.ActiveShare()
   c.StopOther(ctx, roomID, shareID)             // 01 adds: share.stop for another connection's share of this user
@@ -2297,17 +2320,18 @@ The shapes below are what this doc assumes; each sibling's own names win, and th
   ```
   `core.Auth` is implemented by `internal/desktop/session` over 02's `Manager` (§9). `ShareSnapshot` as 01 §11.9 plus
   `AudioSentBps int` (§11.9 adds it), `NoOSIndicator bool`, and `EndInfo.Server`, `EndInfo.ByThisApp` (for
-  `elsewhere`). `EventNotice` codes `encoder_fallback {encoder}` and `audio_rebuilt`. `EventRelay {From, Kind,
-  Payload json.RawMessage}` for relay kinds the core doesn't serve (`playback.state`).
+  `elsewhere`). `EventNotice` codes `encoder_fallback {encoder}` and `audio_rebuilt`. `EventPlaybackState{From,
+  Playing, Browser, OS}` for a decoded `playback.state` (01 §11.11); the core serves no relay request kind (01 D16).
 - `Share.SetPaused` per 01 §11.8 / D14 (pump drops at once, keyframe requests ignored while paused, `share.update
   {paused}`); `share.pause` on the server (`ShareUpdate.Paused`, `ShareStatus paused`, `sharerPaused` in the SFU).
 - `StartShare` joins the room and `Share.Stop` leaves it (01 §11.4, D12); the app sends no room or share messages of
   its own on C2.
 - The encoder fallback of D15 in the core.
-- The `media` contract of 01 §5 (`Pick(ctx, PickRequest)`, `ErrCancelled`, `Source{Kind, Name, PID, Self, …}`,
-  `Probe.Audio.Mode`, `ErrorCode` incl. `dependency`, `Error.Reason` and `EncoderInfo.Status`/`Reason` with 04's
-  tokens, `ShareSnapshot.Minimized`), `native.Open` (01 §7.1), and `fake.NewEngine` with `Mode: fake.Decodable,
-  SourceSize: [2]int{640, 360}` as the app's dev/e2e configuration (01 §6.3 should name it).
+- The `media` contract of 01 §5 (`Pick(ctx, PickRequest)`, `ErrCancelled`, `Source{Kind, Name, PID, …}` with no self
+  flag (a self pick is `invalid`/`self_window`), `Probe.Audio.Backend`, `ErrorCode` incl. `dependency`, `Error.Reason`
+  and `EncoderInfo.Status`/`Reason` with 04's tokens, `ShareSnapshot.Minimized`), `native.Open` (01 §7.1), and
+  `fake.NewEngine` with `Mode: fake.Decodable, SourceSize: [2]int{640, 360}` as the app's dev/e2e configuration (01
+  §6.3 should name it).
 - `internal/protocol/relay` registers `KindPlaybackState` and `PlaybackState {V, Playing, Browser, OS}` (§12.2).
 
 **02-device-auth.md**
@@ -2315,8 +2339,8 @@ The shapes below are what this doc assumes; each sibling's own names win, and th
   (CORS, bearer-only allowed origins), revocation closing C1 and C2, the `/link` approval page, linked devices on the
   Devices page, `deviceFlow` in `/info.features`.
 - Client (Go): `deviceauth.OpenServers(ServersOptions{Dir, Store, App, AllowInsecureLoopback, OnState})` with `Add`,
-  `SetActive`, `Remove`, `Active`, `List`, `ForgetAll` (§11.6; this doc passes `Dir = %LOCALAPPDATA%\isshoni`, where
-  02's comment names `os.UserConfigDir()`, so the purge removes it); `Manager` with `Link`, `CancelLink`,
+  `SetActive`, `Remove`, `Active`, `List`, `ForgetAll` (§11.6; this doc passes `Dir = %LOCALAPPDATA%\isshoni`, the data
+  root, so the purge removes it); `Manager` with `Link`, `CancelLink`, `LinkWithPassword`,
   `AccessToken(ctx, force)`, `AccessTokenWithExpiry(ctx, force)`, `SessionEnded`, `HelloRefused`, `Unlink`
   (`ErrRevokeNotConfirmed` → `confirmed: false`), `State`, and a `Recheck` (no `Rejected`: a forced refresh is
   `force`); errors `ErrNotLinked`, `ErrOffline`, `ErrIncompatible`,
@@ -2327,14 +2351,13 @@ The shapes below are what this doc assumes; each sibling's own names win, and th
   method names its origin, `AccessToken(origin, force)`, `SessionEnded(origin, code)`, `HelloRefused(origin, error)`,
   and Go answers only when the origin is the active server's (§5.8).
 - Web: `appLinkFor(serverOrigin, roomId?)` in `web/src/lib/appLink.ts`; the `/link` route.
-- 02's names to align with this doc's: the uninstall flag is 06's `--purge-data` (02 §11.7 says
-  `--forget-credentials`), and the scheme command is 06's `--open-url "%1"` (02 §12.2 says `--deeplink -- "%1"`);
-  this doc implements 02's injection rule on `--open-url`. The QR code is drawn in the SPA (uqr), not with
-  `skip2/go-qrcode`.
+- The uninstall flags are 06's: `--forget-credentials` on every uninstall and `--purge-data` on `/PURGE`, both over
+  `ForgetAll` (02 §11.7, §15); the scheme command is `--open-url "%1"` (02 §12.2, 06 §2.3); this doc implements 02's
+  injection rule on `--open-url`. The QR code is drawn in the SPA (uqr), not with `skip2/go-qrcode`.
 
 **04-windows-engine.md**
 - The engine behind 01's `media.Engine`: `Probe` once at start (encoders, borderless support, OS build,
-  `unsupported_os`; the audio backend as `Probe.Audio.Mode`; `avcodec_license()` for `--self-check`),
+  `unsupported_os`; the audio backend as `Probe.Audio.Backend`; `avcodec_license()` for `--self-check`),
   `Pick(ctx, media.PickRequest{OwnerWindow})` returning a `media.Source` with `Kind`, `Name`, `PID`, and
   `OSBorder` (whether Windows will draw the yellow border; 04 adds it), the monitor of a window source when 04 can add
   it; `media.ErrCancelled` for a closed picker; picker cancellation when the context ends.
@@ -2371,10 +2394,9 @@ The shapes below are what this doc assumes; each sibling's own names win, and th
 - The installer: per-user install, the scheme command `--open-url "%1"`, the Start-menu shortcut with AppUserModelID
   `io.isshoni.desktop`, WebView2 bootstrap, `licenses\THIRD_PARTY_NOTICES.txt`, `/SERVER=` → `PendingServer`,
   `/LAUNCH` (through explorer.exe when elevated), `UpdateChecks`, uninstall removing the Run value and the
-  notification keys of §14.1, `/PURGE` → `--purge-data`; `/download` with "Link the app", which turns
-  `?room=<id>` into its link to that room (§12.3) and shows the Windows steps Download, Run it, Open isshoni;
-  `install-desktop.ps1`
-  passing the server through `/SERVER=`.
+  notification keys of §14.1, every uninstall → `--forget-credentials`, `/PURGE` → `--purge-data`; `/download` with
+  its "Open isshoni" button (06 §7.5), which turns `?room=<id>` into its link to that room (§12.3) and shows the
+  Windows steps Download, Run it, Open isshoni; `install-desktop.ps1` passing the server through `/SERVER=`.
 - Build: `cmd/isshoni-desktop/build/windows/icon.ico` and `build/windows/app.manifest` (this doc's files, contents in
   §4.5), `info.json` generated by `tools/desktoppkg` from the tag, `task desktop:exe:windows` with a `TAGS` variable
   (default `production`; `e2e` for §22.4 B), `tools/wails3` and `task release:wails3`; the release build with
@@ -2400,13 +2422,13 @@ keeps `DA` for "device auth"). Cross-doc needs name the sibling's slice.
 | DK3 | **Go foundations and the process contract, part 1**: `settings` (LOCALAPPDATA, `serverPrefs`, `UpdateChecks` initial read, `audio.SettingsStore`), `applog` (rotation, crash output, marker), `i18n` (+ `web.DesktopCatalog()`, `desktop.en.json` seeded), `hotkey`, `servers` (`Normalize`, `LocalID`, `Probe` on 02's client and `compat`), `app` skeleton with `HandleArgs`/`HandleLink` (the `--open-url` rule, `--server`, bare-argument logging); `main`'s §13.4 order with the running mutex, `--version`, `--updated-from`, the PendingServer/PendingRoom read; single instance (W6) | M | DK1; 02 DA8 (`deeplink`, `compat`), DA10 (`deviceauth.Client`) | §22.1 rows for these packages pass on all OSes; W6, mutex and `--version` tests pass on CI windows; §22.2's DLL search-order marker test passes on windows-2025 (main's first action); a link forwarded as `--open-url` to the running app reaches `HandleLink`; a `PendingServer` value opens the add step | Mac, CI ubuntu/windows |
 | DK4 | **SPA platform**: `types.ts` changes, `detect.ts`, `DesktopPlatform` (entry chunk), `NativeBridge`, `WailsBridge` + generated bindings + drift check, `HttpBridge`, `tokens.ts`, prefixed storage, link interception, `SignalClient` `auth`, boot desktop branch, `buildVersion: ''`, routes and guards (`RequireDesktop`, `RequireBrowser` with `/link`, desktop `RequireAuth` by `AuthState`), `desktop/` folder with stub pages, `role` audit | L | DK1 | §22.3 platform, signal, router and chunk tests pass; `check:size` passes with DesktopPlatform ≤ 4 KB gzip in the entry; the browser e2e suite stays green unchanged | Mac, CI ubuntu |
 | DK5 | **Bridge services and the e2e harness**: `internal/desktop/bridge` (every method of §6.2, unfinished ones returning `not_implemented`), events, error JSON (W11, W12), `bridge/codes` with its `tygo.yaml` entry and `desktop.errors.*` texts (incl. `engine.internal`); `internal/desktop/e2ehost` at `http://wails.localhost` (host-resolver mapping) with `deviceauth.OpenServers` on `credstore.NewMemory`, fake shell, OS hooks and `/__e2e/*`; `DESKTOP_E2E_BIN` in `fixtures.ts`; `desktop-security.spec` | M | DK3, DK4; 02 DA9, DA10 | `desktop-security.spec` passes in Chrome on the Mac and CI; bridge unit tests pass; the CDP spec skeleton attaches to the real app on CI windows and checks W1–W3, W5, W7 | Mac, CI ubuntu/windows |
-| DK6 | **Wizard and servers**: `SetupPage` (server step with the "Open isshoni" hint, add step without network that skips the confirm step for the same host, confirm, the reload at activation, link step with QR, short URL, name and trust line), `RelinkPage` (notices, `save_failed` banner), server switcher, Sign out (`confirmed`) and Remove, `Auth.*` over 02's `Servers` and `Manager` with the origin-bound token methods (§5.8), the `auth.state` event, `Auth.SessionEnded`/`HelloRefused` from C1 | M | DK5; 02 DA10 (client), DA5–DA7 (server, `/link`) | `desktop-link.spec` (with its second-server case: no token of B reaches A) and `desktop-relink.spec` pass; probe and link texts shown for each code and notice, both add-step branches (component tests); the QR test passes | Mac, CI ubuntu |
+| DK6 | **Wizard and servers**: `SetupPage` (server step with the "Open isshoni" hint, add step without network that skips the confirm step for the same host, confirm, the reload at activation, link step with QR, short URL, name and trust line, and its "Sign in with username and password instead" form over `Auth.LinkWithPassword`), `RelinkPage` (notices, `save_failed` banner), server switcher, Sign out (`confirmed`) and Remove, `Auth.*` over 02's `Servers` and `Manager` with the origin-bound token methods (§5.8), the `auth.state` event, `Auth.SessionEnded`/`HelloRefused` from C1 | M | DK5; 02 DA10 (client), DA5–DA7 (server, `/link`) | `desktop-link.spec` (with its password path and its second-server case: no token of B reaches A) and `desktop-relink.spec` pass; probe and link texts shown for each code and notice, both add-step branches (component tests); the QR test passes | Mac, CI ubuntu |
 | DK7 | **Native sharing on the fake engine**: `session` (C2) on 01's core with the `core.Auth` adapter, `share` controller (§10.1, both mapping tables), `Share.*`, `ShareView`, `DesktopSharing`/`DesktopShare` (hint from the snapshot), desktop ShareSheet, first-share sheet, panel bar and Details disclosure (`WatchServerStats`), unreachable state with Test connection (`?conntest=1`), §10.5's engine errors by code and reason (pick again, self window, driver, Media Feature Pack, Smart App Control, reinstall, minimized), `RoomSession.adoptShare`, `findShareElsewhere` list and `stopOther(roomId, shareId)`, own-share `low` rule in `layerPolicy` | L | DK5; 01 C10, C14 (core, server stats), C02 (fake engine) | `desktop-share.spec` (without Pause) and `desktop-reload.spec` pass; §22.1 `share` and `session` tests pass; on the Mac, `task desktop:dev` shares the 640×360 Decodable test pattern into a room that a browser watches | Mac, CI ubuntu |
 | DK8 | **Audio integration and UI**: `bridge.Audio` over 05's Service (`Watch` and `WatchLevels` counts, `SetAppDecision`, `Decide`, `DismissPrompt`, `DismissTip`, `AppRules`, `SoundCheck`; no sound-mode binding); the controller's `OnShareStarted`, `OnShareStopped`, `SetPaused`, `SetShareSound` and the SharedPID hand-off; What friends hear (sheet summary, first-share groups, panel list, levels, tips), mic prompt card and toasts by `Prompt.kind` (dismiss → `DismissPrompt`), banners from `FriendsHear`, the `volumeNote`, "Nothing is playing right now" (no M1 "No sound captured" rule); sound and voice wizard steps (incl. `device_busy`); Settings → Audio; the `--sound-check-helper` dispatch and the shell relaunch (§13.4); the endpoint viewer mute; `audio.SelfInfo` wiring | M | DK7; 05 A2 (fake scenarios), A8 (Service) | Component tests of §22.3 for the panel, sheets and wizard steps pass; the share sheet renders correctly under every `ISSHONI_FAKE_AUDIO` scenario (one Vitest/Playwright snapshot each); `desktop-link.spec` runs the real sound and voice steps on 05's fake; the relaunch test passes where a shell exists; on the owner's PC with 05's engine, the list shows Discord kept out and a browser heard, and R4 (05 §18.9) passes | Mac, CI ubuntu/windows, owner's PC |
 | DK9 | **Tray, window, notifications, system events**: `tray` + Wails tray (W18), close and quit policy (W7, W14), one-time notice, toasts with nonce actions (W8, `Options.Name`, the registry keys test), `-Embedding`, WDA on the main window, `hideFromCapture`, keep-awake, `winos` thread with lock/unlock/suspend/end-session, crash watchdog (W17) | M | DK7 | §22.1 `app` and `tray` tests, §22.2 tests and `desktop-system.spec` pass; M-DESK-4, M-DESK-6, M-DESK-11 pass on the owner's PC | Mac, CI ubuntu/windows, owner's PC |
 | DK10 | **Share safety**: global hotkeys (F9/F10 defaults, the `typesChar` warning), Pause end to end (controls, hotkey, tray, lock with its 5 min and 30 min bounds and keep-awake release; `Share.SetPaused` then `audio.SetPaused`; viewer `paused` tile with no freeze detection), the pill (§11.4), the DND tip | L | DK9; 01 C08, C09, C12 (`share.pause`), 04 (`OSBorder`, `NoOSIndicator` through 01) | `desktop-share.spec` with Pause, the late joiner and hotkeys passes; `desktop-system.spec`'s lock cases (resume within the bound, "Resume sharing?" after it, the stop at the second bound, keep-awake released and re-taken) and the controller's synctest lock cases pass; pill tests of §22.2 pass; M-DESK-2, M-DESK-3, M-DESK-6, M-DESK-8 (Win10) pass | Mac, CI ubuntu/windows, owner's PC |
-| DK11 | **Handoff and web entries**: `playback.stop` sender and receiver, the `playback.state` sender (`rooms/handoff.ts`) and receiver (01's `EventRelay` → `SetViewerBrowser`, expiry through `App.OwnConnections`), web hello features, `handedOff` viewer state, "Open in the isshoni app" with `appLinkFor`, deep links end to end (§13.2) | M | DK7; 01 C07, C08, C14 (relay kinds, `user.connections`, `EventRelay`); 02 DA7 (`appLink.ts`) | `desktop-handoff.spec` passes; deep link table tests pass; M-DESK-7 and M-DESK-9 pass | Mac, CI ubuntu, owner's PC |
-| DK12 | **Settings page, autostart, updates UI, version screens, process contract part 2**: `SettingsPage` (all sections of §14.4), `Settings.*` and hotkey field, autostart (`--autostart` without a window), `Updates.*` on 06's updater with every state of §16.2 (required banner, expired and failed texts, beta channel, `policyOff`), the start-time apply and `PendingRoom`, `--update-now`, `--purge-data` (after 02's `DeleteAll`), `--self-check` (after 04's probe), About (versions, logs, notices, copy version info, anchors), VersionMismatch desktop actions (02 §13.3, server `/download`), OpenH264 opt-in placement | M | DK9; 06 R8 (updater), 02 DA10 (`ForgetAll`), 04 (probe and encoder caps) | Component tests per section pass; autostart round trip on CI windows; an update offered in a 06 test channel is shown, refused while live, and applied at start with the Pending values (06 R9's `--update-now` e2e); `--purge-data` leaves no `%LOCALAPPDATA%\isshoni` and no test credential; `--self-check` passes on CI windows; §22.1's start-order row (step 2a, the installing mutex) passes; M-DESK-10 passes | Mac, CI ubuntu/windows, owner's PC |
+| DK11 | **Handoff and web entries**: `playback.stop` sender and receiver, the `playback.state` sender (`rooms/handoff.ts`) and receiver (01's `EventPlaybackState` → `SetViewerBrowser`, expiry through `App.OwnConnections`), web hello features, `handedOff` viewer state, "Open in the isshoni app" with `appLinkFor`, deep links end to end (§13.2) | M | DK7; 01 C07, C08, C14 (relay kinds, `user.connections`, `EventPlaybackState`); 02 DA7 (`appLink.ts`) | `desktop-handoff.spec` passes; deep link table tests pass; M-DESK-7 and M-DESK-9 pass | Mac, CI ubuntu, owner's PC |
+| DK12 | **Settings page, autostart, updates UI, version screens, process contract part 2**: `SettingsPage` (all sections of §14.4), `Settings.*` and hotkey field, autostart (`--autostart` without a window), `Updates.*` on 06's updater with every state of §16.2 (required banner, expired and failed texts, beta channel, `policyOff`), the start-time apply and `PendingRoom`, `--update-now`, `--forget-credentials` and `--purge-data` (after 02's `DeleteAll`), `--self-check` (after 04's probe), About (versions, logs, notices, copy version info, anchors), VersionMismatch desktop actions (02 §13.3, server `/download`), OpenH264 opt-in placement | M | DK9; 06 R8 (updater), 02 DA10 (`ForgetAll`), 04 (probe and encoder caps) | Component tests per section pass; autostart round trip on CI windows; an update offered in a 06 test channel is shown, refused while live, and applied at start with the Pending values (06 R9's `--update-now` e2e); `--forget-credentials` leaves no test credential, and `--purge-data` no `%LOCALAPPDATA%\isshoni` and no test credential; `--self-check` passes on CI windows; §22.1's start-order row (step 2a, the installing mutex) passes; M-DESK-10 passes | Mac, CI ubuntu/windows, owner's PC |
 | DK13 | **Real-app e2e and the manual matrix**: the CDP spec complete (§22.4 B), the remaining checklist rows (W8, W16, W17, W18), the manual matrix M-DESK-1…12 on Win11 and Win10, the budgets of §20 measured and recorded | M | DK1–DK12; 06 R4 (installer for M-DESK-1), R10 (ps1) | CDP spec green on CI windows; every M-DESK row passed or has a recorded, accepted exception; §3.2 fully filled in | CI windows, owner's PC |
 
 The cross-doc order that matters: DK1 before 02's DA6 (the W1 result); DK3 after 02's DA8; DK6 after 02's DA10;

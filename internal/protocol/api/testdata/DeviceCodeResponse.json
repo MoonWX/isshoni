@@ -1,0 +1,8 @@
+{
+  "deviceCode": "EXAMPLEdeviceCODE0123456789abcdefghijklmnoQ",
+  "userCode": "WDJB-MJHT",
+  "verificationUri": "https://watch.example.com/link",
+  "verificationUriComplete": "https://watch.example.com/link?code=WDJB-MJHT",
+  "expiresIn": 600,
+  "interval": 5
+}

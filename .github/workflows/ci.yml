@@ -1,4 +1,5 @@
-# CI: the gate for every change (docs/m1/06-deploy-and-ci.md §8.1–8.2, "06" below).
+# CI: the gate for every change (docs/m1/06-deploy-and-ci.md §8.1–8.2, "06" below; the Windows
+# app's jobs and filters are docs/m2/06-windows-release.md §10.1, "M2 06" below).
 #
 # There is one required check, ci-ok (06 D7). Path-filtered jobs live in this one workflow,
 # so a job with nothing to check is skipped, and ci-ok counts a skipped job as a pass.
@@ -55,6 +56,13 @@ jobs:
       site: ${{ steps.plan.outputs.site }}
       # A part of go, for lint-go's step that only a tools/ change can fail.
       tools: ${{ steps.plan.outputs.tools }}
+      # The filters of M2 06 §10.1, for the Windows app's jobs here and for the ones added later
+      # (windows-native and windows-desktop on desktop, the updater e2e on update, lint:ps and
+      # test:ps on ps).
+      desktop: ${{ steps.plan.outputs.desktop }}
+      native: ${{ steps.plan.outputs.native }}
+      update: ${{ steps.plan.outputs.update }}
+      ps: ${{ steps.plan.outputs.ps }}
       # One flag per job: its filter matched and all of its inputs exist.
       run-lint-go: ${{ steps.plan.outputs.run-lint-go }}
       run-test-go: ${{ steps.plan.outputs.run-test-go }}
@@ -70,6 +78,9 @@ jobs:
       run-distro: ${{ steps.plan.outputs.run-distro }}
       run-govulncheck: ${{ steps.plan.outputs.run-govulncheck }}
       run-site: ${{ steps.plan.outputs.run-site }}
+      run-windows-go: ${{ steps.plan.outputs.run-windows-go }}
+      run-desktop-macos: ${{ steps.plan.outputs.run-desktop-macos }}
+      run-native-host: ${{ steps.plan.outputs.run-native-host }}
       # Task's pin from .tool-versions (06 §7.1). Go comes from go.mod, Node from .tool-versions.
       task-version: ${{ steps.plan.outputs.task-version }}
     steps:
@@ -137,6 +148,62 @@ jobs:
             distro_tools:
               - 'tools/relserve/**'
               - 'tools/notices/**'
+            # The Windows app (M2 06 §10.1): everything the app, its engine, its installer or
+            # its packaging reads, the SPA it bundles included. windows-go and desktop-macos run
+            # on it now; windows-native and windows-desktop join when they land.
+            desktop:
+              - 'cmd/isshoni-desktop/**'
+              - 'internal/client/**'
+              - 'internal/media/**'
+              - 'internal/update/**'
+              - 'internal/desktop/**'
+              - 'native/**'
+              - 'deploy/windows/**'
+              - 'deploy/install-desktop.ps1'
+              - 'deploy/embed.go'
+              - 'deploy/notices/native-windows.json'
+              - 'tools/desktoppkg/**'
+              - 'tools/wails3/**'
+              - 'tools/notices/**'
+              - 'go.mod'
+              - 'go.sum'
+              - 'web/**'
+              - '.github/workflows/ci.yml'
+            # The portable C++ (native-host). The job runs `task native:test` and `task
+            # lint:native`, so the Taskfile is one of its inputs too, as for acme and e2e above.
+            native:
+              - 'native/**'
+              - '.github/workflows/ci.yml'
+              - 'Taskfile.yml'
+            # The updater end to end (windows-desktop, from README WA88).
+            update:
+              - 'internal/update/**'
+              - 'deploy/windows/nsis/**'
+              - 'tools/desktoppkg/**'
+            # The PowerShell scripts (lint:ps and test:ps in lint-deploy, from README WA49).
+            ps:
+              - 'deploy/install-desktop.ps1'
+              - 'deploy/test/install-desktop.Tests.ps1'
+              - 'deploy/test/windows/*.ps1'
+              - 'native/windows/tools/*.ps1'
+              - 'deploy/windows/msvc-env.ps1'
+              - 'deploy/windows/tools.json'
+            # The npm side of lint:pins (@wailsio/runtime equals go.mod's Wails, M2 06 §3), which
+            # neither the go filter (lint-go) nor the deploy filter (lint-deploy) sees.
+            pins:
+              - 'web/package.json'
+              - 'web/package-lock.json'
+            # Inputs of e2e outside the go filter: the desktop e2e specs' Go host and its assets
+            # (M2 06 §10.1).
+            desktop_e2e:
+              - 'internal/desktop/**'
+            # Inputs of protocol outside the go and web filters: the desktop bridge, whose codes
+            # and bindings are generated (M2 06 §10.1).
+            desktop_protocol:
+              - 'internal/desktop/bridge/**'
+              - 'cmd/isshoni-desktop/**'
+              - 'tools/wails3/**'
+              - 'web/src/platform/desktop/**'
 
       - name: Decide which jobs run
         id: plan
@@ -152,6 +219,13 @@ jobs:
           FILTER_DISTRO_TOOLS: ${{ steps.filter.outputs.distro_tools }}
           FILTER_README: ${{ steps.filter.outputs.readme }}
           FILTER_REPOCHECK: ${{ steps.filter.outputs.repocheck }}
+          FILTER_DESKTOP: ${{ steps.filter.outputs.desktop }}
+          FILTER_NATIVE: ${{ steps.filter.outputs.native }}
+          FILTER_UPDATE: ${{ steps.filter.outputs.update }}
+          FILTER_PS: ${{ steps.filter.outputs.ps }}
+          FILTER_PINS: ${{ steps.filter.outputs.pins }}
+          FILTER_DESKTOP_E2E: ${{ steps.filter.outputs.desktop_e2e }}
+          FILTER_DESKTOP_PROTOCOL: ${{ steps.filter.outputs.desktop_protocol }}
           FILTER_DOCTOR: ${{ steps.filter.outputs.doctor }}
         run: |
           # A pull request runs what its paths touch; a push to main and a merge-queue group
@@ -161,18 +235,26 @@ jobs:
             docker=${FILTER_DOCKER:-false} release=${FILTER_RELEASE:-false} site=${FILTER_SITE:-false}
             tools=${FILTER_TOOLS:-false} distro_tools=${FILTER_DISTRO_TOOLS:-false}
             readme=${FILTER_README:-false} repocheck=${FILTER_REPOCHECK:-false} doctor=${FILTER_DOCTOR:-false}
+            desktop=${FILTER_DESKTOP:-false} native=${FILTER_NATIVE:-false} update=${FILTER_UPDATE:-false}
+            ps=${FILTER_PS:-false} pins=${FILTER_PINS:-false} desktop_e2e=${FILTER_DESKTOP_E2E:-false}
+            desktop_protocol=${FILTER_DESKTOP_PROTOCOL:-false}
           else
             go=true web=true deploy=true docker=true release=true site=true tools=true distro_tools=true
             readme=true repocheck=true doctor=true
+            desktop=true native=true update=true ps=true pins=true desktop_e2e=true desktop_protocol=true
           fi
           go_or_web=false
           if [ "$go" = true ] || [ "$web" = true ]; then go_or_web=true; fi
+          protocol_when=$go_or_web
+          if [ "$desktop_protocol" = true ]; then protocol_when=true; fi
           go_web_or_site=$go_or_web
           if [ "$site" = true ]; then go_web_or_site=true; fi
           go_or_deploy=false
           if [ "$go" = true ] || [ "$deploy" = true ]; then go_or_deploy=true; fi
           go_web_or_deploy=$go_or_web
           if [ "$deploy" = true ]; then go_web_or_deploy=true; fi
+          e2e_when=$go_web_or_deploy
+          if [ "$desktop_e2e" = true ]; then e2e_when=true; fi
           docker_deploy_or_release=$deploy
           if [ "$docker" = true ] || [ "$release" = true ] || [ "$doctor" = true ]; then docker_deploy_or_release=true; fi
           deploy_or_release=$deploy
@@ -184,7 +266,9 @@ jobs:
           site_or_deploy=$site
           if [ "$deploy" = true ]; then site_or_deploy=true; fi
           lint_deploy_when=$deploy
-          if [ "$readme" = true ] || [ "$repocheck" = true ]; then lint_deploy_when=true; fi
+          if [ "$readme" = true ] || [ "$repocheck" = true ] || [ "$ps" = true ] || [ "$pins" = true ]; then
+            lint_deploy_when=true
+          fi
           {
             echo "go=$go"
             echo "web=$web"
@@ -193,11 +277,15 @@ jobs:
             echo "release=$release"
             echo "site=$site"
             echo "tools=$tools"
+            echo "desktop=$desktop"
+            echo "native=$native"
+            echo "update=$update"
+            echo "ps=$ps"
           } >> "$GITHUB_OUTPUT"
           {
             echo "### CI plan ($EVENT)"
             echo
-            echo "Filters: go=$go, web=$web, deploy=$deploy, docker=$docker, release=$release, site=$site, tools=$tools, distro_tools=$distro_tools, readme=$readme, repocheck=$repocheck"
+            echo "Filters: go=$go, web=$web, deploy=$deploy, docker=$docker, release=$release, site=$site, tools=$tools, distro_tools=$distro_tools, readme=$readme, repocheck=$repocheck, desktop=$desktop, native=$native, update=$update, ps=$ps, pins=$pins, desktop_e2e=$desktop_e2e, desktop_protocol=$desktop_protocol"
             echo
             echo "| Job | Decision |"
             echo "|---|---|"
@@ -226,8 +314,9 @@ jobs:
           decide web true web/package.json web/package-lock.json .tool-versions
           # The drift check needs the generator and the committed output, which land together
           # (README S10). Before that, `task gen` would write web/src/protocol/*.gen.ts as new
-          # untracked files, and gen:check would fail on every go or web change.
-          decide protocol "$go_or_web" Taskfile.yml .tool-versions tygo.yaml tools/go.mod \
+          # untracked files, and gen:check would fail on every go or web change. The desktop
+          # bridge's generated codes and bindings count too (M2 06 §10.1).
+          decide protocol "$protocol_when" Taskfile.yml .tool-versions tygo.yaml tools/go.mod \
             internal/protocol/gen/tsregistry
           # The site's npm packages (docs/) join the check when docs/package.json lands.
           decide licenses "$go_web_or_site" Taskfile.yml .tool-versions tools/go.mod tools/notices \
@@ -235,11 +324,14 @@ jobs:
           decide build true Taskfile.yml .tool-versions cmd/isshoni web/package.json web/package-lock.json
           # 06 §8.2 runs e2e on go or web changes. The job's own inputs count too, as for acme
           # below: the servers' base config (deploy/dev/isshoni.e2e.toml), the Node pin and this
-          # workflow, which the deploy filter covers.
-          decide e2e "$go_web_or_deploy" .tool-versions cmd/isshoni web/package.json web/package-lock.json \
+          # workflow, which the deploy filter covers. M2 adds the desktop e2e specs' host,
+          # internal/desktop (M2 06 §10.1).
+          decide e2e "$e2e_when" .tool-versions cmd/isshoni web/package.json web/package-lock.json \
             web/playwright.config.ts deploy/dev/isshoni.e2e.toml
           # lint:keys checks README.md against deploy/keys/allowed_signers (README F11), and
-          # lint:keys and lint:pins are tools/repocheck: their changes run the job too.
+          # lint:keys and lint:pins are tools/repocheck: their changes run the job too, and so do
+          # the PowerShell scripts (M2 06 §10.1; lint:ps and test:ps join the job with them) and
+          # web/package.json and its lockfile, whose @wailsio/runtime lint:pins checks (M2 06 §3).
           decide lint-deploy "$lint_deploy_when" Taskfile.yml .tool-versions
           # The job's own inputs count too: Pebble's config (the go filter's tlsmgr/testdata
           # pattern) and this workflow, which pins the two images (the deploy filter).
@@ -272,6 +364,12 @@ jobs:
           # 06 §8.2: the site on site or deploy changes (deploy covers this workflow and
           # .tool-versions); the site filter has web/src/conntest/codes.json for the anchor test.
           decide site "$site_or_deploy" docs/package.json docs/package-lock.json .tool-versions go.mod
+          # M2 06 §10.1: the client core (and, as they land, the updater, the media packages and the
+          # app's own packages) on Windows and macOS, and the portable C++ on Linux and macOS. The
+          # C++ needs the CMake root and the vcpkg manifest of README WA03.
+          decide windows-go "$desktop" go.mod internal/client
+          decide desktop-macos "$desktop" go.mod internal/client
+          decide native-host "$native" Taskfile.yml .tool-versions native/CMakePresets.json native/vcpkg.json
 
           task_version=''
           if [ -e .tool-versions ]; then
@@ -286,7 +384,9 @@ jobs:
   lint-go:
     # The checks of `task lint:go`, for the main module and the tools/ module, plus lint:pins:
     # a go.mod or tools/go.mod change must not leave .tool-versions behind (06 §7.1), and
-    # only the go filter sees those files.
+    # only the go filter sees those files. M2 06 §10.1 adds golangci-lint with GOOS=windows (the
+    # Windows-only files) and lint:go:cross: the Windows cross-build without cgo and the gomobile
+    # check (package builds of internal/client and internal/media for android and ios).
     needs: changes
     if: needs.changes.outputs.run-lint-go == 'true'
     runs-on: ubuntu-24.04
@@ -322,6 +422,16 @@ jobs:
         with:
           version-file: .tool-versions
 
+      - name: golangci-lint run (windows)
+        # The x/sys/windows loader of internal/media/native, the updater's apply_windows.go and
+        # the app's winos build only for Windows (M2 06 §10.1). The binary is the runner's own;
+        # GOOS only picks the files it loads.
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        env:
+          GOOS: windows
+        with:
+          version-file: .tool-versions
+
       - name: go mod tidy -diff
         run: go mod tidy -diff
 
@@ -330,6 +440,9 @@ jobs:
 
       - name: go vet (windows)
         run: GOOS=windows go vet ./...
+
+      - name: task lint:go:cross (windows without cgo; android and ios package builds)
+        run: task lint:go:cross
 
       - name: golangci-lint run (tools module)
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
@@ -348,6 +461,10 @@ jobs:
 
       - name: go vet (tools module)
         run: go -C tools vet ./...
+
+      - name: go vet (tools module, windows)
+        # g2g's GDI capture builds only for Windows (M2 01 §12.2).
+        run: GOOS=windows go -C tools vet ./...
 
       - name: task lint:pins
         run: task lint:pins
@@ -1278,6 +1395,214 @@ jobs:
       - name: govulncheck ./...
         run: .bin/govulncheck ./...
 
+  windows-go:
+    # The Go packages of the Windows app that need no engine DLL, on Windows (M2 06 §10.1): the
+    # client core, the updater, the media packages with the fake engine and the app's own
+    # packages (internal/desktop/..., cmd/isshoni-desktop/...), first with the race detector,
+    # which needs cgo and so the image's MinGW-w64 gcc (as the nightly's go-cross-os), then with
+    # CGO_ENABLED=0, the mode the app ships in. Every Go test on Windows runs here except the
+    # engine DLL's (README §3 item 11, 06 §10.1's windows-desktop row, 03 §22): those skip without
+    # ISSHONI_TEST_ENGINE_DLL, and windows-desktop runs them with the DLL. A directory that holds
+    # no Go file yet (internal/update before README WA25, cmd/isshoni-desktop before WA22) is
+    # left out.
+    needs: changes
+    if: needs.changes.outputs.run-windows-go == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # one cache per job below: setup-go's key is shared by every job
+
+      - name: Find Go's module and build caches
+        id: goenv
+        run: |
+          "modcache=$(go env GOMODCACHE)" >> $env:GITHUB_OUTPUT
+          "gocache=$(go env GOCACHE)" >> $env:GITHUB_OUTPUT
+
+      - name: Cache Go modules and builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ steps.goenv.outputs.modcache }}
+            ${{ steps.goenv.outputs.gocache }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('go.mod', 'go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+
+      - name: gcc for cgo (MinGW-w64, for the race detector)
+        run: |
+          if (Get-Command gcc -ErrorAction SilentlyContinue) {
+            gcc --version | Select-Object -First 1
+            exit 0
+          }
+          # The runner images keep MinGW-w64 in one of these places; Chocolatey is the fallback.
+          foreach ($dir in 'C:\mingw64\bin', 'C:\msys64\ucrt64\bin', 'C:\msys64\mingw64\bin') {
+            if (Test-Path (Join-Path $dir 'gcc.exe')) {
+              $dir >> $env:GITHUB_PATH
+              & (Join-Path $dir 'gcc.exe') --version | Select-Object -First 1
+              exit 0
+            }
+          }
+          "::notice::no gcc on this runner image; installing MinGW-w64 with Chocolatey"
+          choco install mingw --no-progress -y
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          'C:\ProgramData\mingw64\mingw64\bin' >> $env:GITHUB_PATH
+
+      - name: The packages to test
+        id: pkgs
+        run: |
+          # A pattern counts once its directory holds a Go file; go test fails on a pattern that
+          # matches no package. A directory alone is not enough: cmd/isshoni-desktop can hold only
+          # build/windows/ (README WA22).
+          $hasGo = { param($dir) [bool](Get-ChildItem -LiteralPath $dir -Recurse -File -Filter *.go -ErrorAction SilentlyContinue | Select-Object -First 1) }
+          $race = @('internal/client', 'internal/update', 'internal/media', 'internal/desktop', 'cmd/isshoni-desktop') | Where-Object { & $hasGo $_ } | ForEach-Object { "./$_/..." }
+          $nocgo = @('internal/client', 'internal/update', 'internal/desktop', 'cmd/isshoni-desktop') | Where-Object { & $hasGo $_ } | ForEach-Object { "./$_/..." }
+          "race=$($race -join ' ')" >> $env:GITHUB_OUTPUT
+          "nocgo=$($nocgo -join ' ')" >> $env:GITHUB_OUTPUT
+          "go test -race: $($race -join ' ')"
+          "go test with CGO_ENABLED=0: $($nocgo -join ' ')"
+
+      - name: go env
+        env:
+          CGO_ENABLED: '1'
+        run: |
+          go version
+          go env GOOS GOARCH CGO_ENABLED CC
+
+      - name: go test -race (MinGW-w64)
+        env:
+          CGO_ENABLED: '1'
+          PKGS: ${{ steps.pkgs.outputs.race }}
+        run: |
+          go test -race -count=1 -timeout 12m @(-split $env:PKGS)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: go test (CGO_ENABLED=0, as the app ships)
+        env:
+          CGO_ENABLED: '0'
+          PKGS: ${{ steps.pkgs.outputs.nocgo }}
+        run: |
+          go test -count=1 -timeout 12m @(-split $env:PKGS)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  desktop-macos:
+    # The Windows app's Go packages on macOS (M2 06 §10.1): the client core, the media packages,
+    # the updater and the app's own packages (internal/desktop/..., cmd/isshoni-desktop/...) with
+    # the race detector, then the darwin app itself (cgo, the fake engine until M3) once
+    # cmd/isshoni-desktop exists (README WA22). Packages that do not exist yet are left out.
+    needs: changes
+    if: needs.changes.outputs.run-desktop-macos == 'true'
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # one cache per job below: setup-go's key is shared by every job
+
+      - name: Cache Go modules and builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/Library/Caches/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('go.mod', 'go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+
+      - name: go test -race (client core, media, updater, the app's packages)
+        run: |
+          # A pattern counts once its directory holds a Go file: cmd/isshoni-desktop can hold only
+          # build/windows/ (README WA22). Here, darwin with cgo, the app's main package is the real
+          # one (03 §4.5, D18), which ubuntu's test-go never builds.
+          pkgs=()
+          for dir in internal/client internal/media internal/update internal/desktop cmd/isshoni-desktop; do
+            if [ -n "$(find "$dir" -name '*.go' -type f 2>/dev/null | head -n 1)" ]; then pkgs+=("./$dir/..."); fi
+          done
+          echo "go test -race ${pkgs[*]}"
+          go test -race -count=1 -timeout 15m "${pkgs[@]}"
+
+      - name: go build ./cmd/isshoni-desktop (darwin, cgo)
+        if: hashFiles('cmd/isshoni-desktop/**/*.go') != ''
+        run: go build -o "$RUNNER_TEMP/isshoni-desktop" ./cmd/isshoni-desktop
+
+  native-host:
+    # The portable C++ of native/ on Linux and macOS (M2 06 §10.1, docs/m2/04 §18.1): `task
+    # native:test` for the presets host-debug and host-tsan, which fetches vcpkg at
+    # native/vcpkg.json's baseline (shallow, into the runner's temp directory), bootstraps it
+    # with metrics off and builds native/common and its tests with CMake, as on a Mac. vcpkg's
+    # binary packages (libopus, speexdsp, gtest) are cached per OS, image and manifest, without
+    # restore keys: vcpkg rebuilds a stale one anyway. On ubuntu also `task lint:native`
+    # (clang-format --dry-run --Werror).
+    needs: changes
+    if: needs.changes.outputs.run-native-host == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Task
+        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: ${{ needs.changes.outputs.task-version }}
+
+      - name: vcpkg's binary cache
+        id: vcpkg
+        run: |
+          # The image version keys the cache, so a new compiler in a new image starts a new one.
+          echo "image=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/vcpkg-cache"
+          echo "VCPKG_BINARY_SOURCES=clear;files,$RUNNER_TEMP/vcpkg-cache,readwrite" >> "$GITHUB_ENV"
+
+      - name: Cache vcpkg's binary packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/vcpkg-cache
+          key: vcpkg-host-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg.outputs.image }}-${{ hashFiles('native/vcpkg.json', 'native/vcpkg-configuration.json') }}
+
+      - name: task lint:native (clang-format 18)
+        if: runner.os == 'Linux'
+        run: |
+          if ! command -v clang-format-18 > /dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends clang-format-18
+          fi
+          task lint:native CLANG_FORMAT=clang-format-18
+
+      - name: task native:test PRESET=host-debug
+        run: task native:test PRESET=host-debug VCPKG_DIR="$RUNNER_TEMP/vcpkg"
+
+      - name: Let ThreadSanitizer map its shadow memory (ubuntu)
+        # Ubuntu 24.04's kernel randomizes mmap with 32 bits, where TSan's fixed shadow layout
+        # fails with "unexpected memory mapping"; 28 bits is the older default.
+        if: runner.os == 'Linux'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: task native:test PRESET=host-tsan
+        run: task native:test PRESET=host-tsan VCPKG_DIR="$RUNNER_TEMP/vcpkg"
+
   ci-ok:
     # The only required check (06 §8.6). It fails when a gating job failed or was cancelled;
     # a skipped job counts as a pass. always(), so it also reports when a job it needs failed.
@@ -1299,6 +1624,9 @@ jobs:
         distro-release,
         distro,
         site,
+        windows-go,
+        desktop-macos,
+        native-host,
       ]
     runs-on: ubuntu-24.04
     timeout-minutes: 2

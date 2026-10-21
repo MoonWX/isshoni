@@ -324,3 +324,14 @@ func (s ConnTestServerInfo) MarshalJSON() ([]byte, error) {
 	p.TCPPorts = nonNil(p.TCPPorts)
 	return marshal(p)
 }
+
+// ---- device.go ----
+
+func (d DeviceLookup) MarshalJSON() ([]byte, error) {
+	type plain DeviceLookup
+	return marshal(struct {
+		plain
+		RequestedAt WireTime `json:"requestedAt"`
+		ExpiresAt   WireTime `json:"expiresAt"`
+	}{plain(d), WireTime(d.RequestedAt), WireTime(d.ExpiresAt)})
+}

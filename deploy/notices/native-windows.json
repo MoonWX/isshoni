@@ -1,0 +1,16 @@
+[
+  {"name": "libopus", "vcpkgPort": "opus", "license": "BSD-3-Clause",
+   "linking": "static, inside isshoni-media.dll", "licenseFiles": ["vcpkg/opus/copyright"]},
+  {"name": "speexdsp", "vcpkgPort": "speexdsp", "license": "BSD-3-Clause",
+   "linking": "static, inside isshoni-media.dll", "licenseFiles": ["vcpkg/speexdsp/copyright"]},
+  {"name": "FFmpeg (libavcodec, libavutil)", "version": "9.0.2", "license": "LGPL-2.1-or-later",
+   "linking": "dynamic", "files": ["avcodec-*.dll", "avutil-*.dll"],
+   "source": "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz",
+   "licenseFiles": ["ffmpeg/COPYING.LGPLv2.1", "ffmpeg/LICENSE.md"]},
+  {"name": "Intel libvpl (dispatcher)", "version": "2.17.0", "license": "MIT",
+   "linking": "static, inside avcodec", "licenseFiles": ["libvpl/LICENSE"]},
+  {"name": "nv-codec-headers", "version": "12.1.14.1", "license": "MIT",
+   "linking": "headers, inside avcodec", "licenseFiles": ["nv-codec-headers/LICENSE"]},
+  {"name": "AMD AMF headers", "version": "1.5.3", "license": "MIT",
+   "linking": "headers, inside avcodec", "licenseFiles": ["amf/LICENSE.txt"]}
+]

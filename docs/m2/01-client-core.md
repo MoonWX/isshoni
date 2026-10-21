@@ -53,7 +53,7 @@ Every item is marked **M2**, or **later (M3/M4/M5)** when M2 only leaves room fo
 - `internal/media`: the contract (§5).
 - `internal/media/fake`: `fake.Engine`, the contract's test double (§6), on top of M1's `fake.Source`.
 - `internal/media/mediatest`: a conformance suite every engine must pass (§6.4).
-- `internal/media/native`: what 04's binding of `isshoni_media.dll` must do to implement the contract (§7); 04 §12
+- `internal/media/native`: what 04's binding of `isshoni-media.dll` must do to implement the contract (§7); 04 §12
   owns and implements the package.
 - `internal/client/publish`: the M2 changes to M1's Publisher (§8).
 - `internal/client/ratectl`: uplink rate control (§9).
@@ -708,9 +708,9 @@ type Options struct {
 With `Encoder: "fake"` (IM_ENC_FAKE), checks 5 and 7 run only once 04 specifies IM_ENC_FAKE's output (a bitrate
 that follows the target, a CB profile); until then they are skipped with a message.
 
-The fake runs it in CI on every OS (`src` = `mon:fake`, `Listed`). The Windows engine runs it on windows-latest with
-the `win-x64-ci` DLL, `test:pattern`, `{Listed, TestTone, Encoder: "fake"}`, and on the owner's PC runner with a
-real monitor (`Listed`) per probed encoder (§14).
+The fake runs it in CI on every OS (`src` = `mon:fake`, `Listed`). The Windows engine runs it on windows-2025 (06's
+`windows-desktop`) with the `win-x64-ci` DLL, `test:pattern`, `{Listed, TestTone, Encoder: "fake"}`, and on the
+owner's PC runner with a real monitor (`Listed`) per probed encoder (§14).
 
 ## 7. The Windows binding (`internal/media/native`, M2)
 
@@ -722,14 +722,13 @@ the core needs from it.
 ```go
 package native
 
-// Open loads the engine. On windows it loads isshoni_media.dll, checks its ABI and calls im_init; elsewhere (until
+// Open loads the engine. On windows it loads isshoni-media.dll, checks its ABI and calls im_init; elsewhere (until
 // M3/M4) it returns an error that wraps media.ErrUnsupportedOS. The returned *Engine implements media.Engine and 05's
-// media.AudioController. (04 §12.2 currently calls this loader Load; the name is 04's, the shape is what 03 and the
-// core rely on.)
+// media.AudioController. (04 §12.2 owns it; the shape is what 03 and the core rely on.)
 func Open(o Options) (*Engine, error)
 
 type Options struct { // 04 §12.2's fields
-	Dir          string       // directory of isshoni_media.dll; "" = the executable's
+	Dir          string       // directory of isshoni-media.dll; "" = the executable's
 	FFmpegDir    string       // "" = <Dir>\ffmpeg
 	OpenH264Path string       // "" = none; must have passed VerifyOpenH264
 	Logger       *slog.Logger // engine logs with component=engine
@@ -1671,8 +1670,8 @@ type Notice struct {
   coalesced to ≤ 4 per second; callers read counters with `Share.Snapshot()` (03 polls every 2 s for its stats and
   caps `share.state` at ≤ 4 per second, 03 §6.3, §20).
 - 03 maps events to Wails events; the core never formats text. `EventPlaybackState` goes to 05's
-  `Service.SetViewerBrowser(browser, os, playing)`. Audio state ("What friends hear", levels, prompts, banners) never
-  passes through the core: 05's Service reads it from the engine (05 §14).
+  `Service.SetViewerBrowser(From, Browser, OS, Playing)`. Audio state ("What friends hear", levels, prompts, banners)
+  never passes through the core: 05's Service reads it from the engine (05 §14).
 
 ### 11.11 The same-user relay (`internal/protocol/relay`)
 
@@ -1722,7 +1721,8 @@ Core rules:
 1. `playback.state`: decode strictly (unknown fields ignored, size already bounded at 16 KiB by the server); a
    payload that doesn't decode, or a `browser` outside the four families, is ignored (debug log with the kind only).
    Otherwise emit `EventPlaybackState{From, Playing, Browser, OS}`; 03 forwards it to 05's
-   `Service.SetViewerBrowser(browser, os, playing)`. The server delivers only messages of the same user (01 §8.14).
+   `Service.SetViewerBrowser(From, Browser, OS, Playing)` (05 §14.2). The server delivers only messages of the same
+   user (01 §8.14).
 2. `playback.stop` is never sent or handled by the core (03 owns sender and receiver); the type lives here only for
    `relay.gen.ts`.
 3. Every other kind (`share.request`, `share.status`, `exclusions.*`, unknown) is ignored (debug log with the kind
@@ -1915,8 +1915,9 @@ The component the client core owns, capture → last packet sent, is measured on
 
 ## 14. Test plan
 
-Everything below runs with `go test -race` unless marked. **Windows rows** (CI windows-latest and the owner's PC):
-`CGO_ENABLED=0`, without `-race` (race needs cgo, and the plan says no cgo on Windows), matching 02 §16.1. "Mac" =
+Everything below runs with `go test -race` unless marked. **Windows rows**: CI windows-2025 runs the Go tests in 06's
+`windows-go` (`-race` with MinGW, then `CGO_ENABLED=0`, the shipped mode) and, with the DLL, in `windows-desktop`; the
+owner's PC runs `CGO_ENABLED=0` without `-race` (race needs cgo, and the plan says no cgo on Windows). "Mac" =
 the developer's machine (`task test`); "CI" jobs per 06; "owner's PC" = the Windows PC, by hand or as the
 self-hosted runner (06 names its labels).
 
@@ -1925,8 +1926,8 @@ self-hosted runner (06 names its labels).
 | Package | What is asserted | Where |
 |---|---|---|
 | `internal/media` | `Error.Is` by code (also with a Reason), `errors.Is(wrapped, media.ErrSourceGone)`, `Is(media.ErrAudioNotRunning)` for `CodeAudioNotRunning`; `Error()` formats; `AudioCapsFromFlags` for all 16 values of the four bits (`Backend` "process-loopback" whenever 0x1 is set, "endpoint" with only 0x2 of the loopback bits, else "none"; unknown higher bits ignored) | Mac, CI ubuntu |
-| `internal/media/fake` | `fake.Engine` passes `mediatest.Conformance` (Synthetic; Decodable minus check 5); single-use picks, `Release`, `Listed` enforcement; `SetBitrate(0)` is `invalid`; `SetLayerActive` pause and resume (keyframe, no `Reinit`); `SetPaused` stops video only; re-init mode marks `Reinit`; `Reconfigure{Profile}` swaps the SPS and emits `EventLayer`; audio-only and `TapPCM` sessions; `Pick` cancel, timeout and ctx; `Fail`, `Emit`, `Calls` (incl. `audio_muted`); the `AudioController` scenarios are 05's tests; M1's tests unchanged except reading flags from Markers | Mac, CI ubuntu, macos; CI windows (`CGO_ENABLED=0`, no `-race`) |
-| `internal/media/native` | 04 §12 and §18.3: the binding's fake-caller tests (04 owns them); among their assertions, §7.1's requirements: ABI major/minor and export checks (05's audio exports required, `im_test_*` optional), the status and event tables of §5.2, `Next` honors ctx within 50 ms, the copy rule, packet validation (audio layer value, PCM size), `EventLayer` before every `REINIT` | Mac, CI ubuntu (logic); CI windows (`CGO_ENABLED=0`, no `-race`; with the DLL, 04 §18.2) |
+| `internal/media/fake` | `fake.Engine` passes `mediatest.Conformance` (Synthetic; Decodable minus check 5); single-use picks, `Release`, `Listed` enforcement; `SetBitrate(0)` is `invalid`; `SetLayerActive` pause and resume (keyframe, no `Reinit`); `SetPaused` stops video only; re-init mode marks `Reinit`; `Reconfigure{Profile}` swaps the SPS and emits `EventLayer`; audio-only and `TapPCM` sessions; `Pick` cancel, timeout and ctx; `Fail`, `Emit`, `Calls` (incl. `audio_muted`); the `AudioController` scenarios are 05's tests; M1's tests unchanged except reading flags from Markers | Mac, CI ubuntu, macos; CI windows (06's `windows-go`) |
+| `internal/media/native` | 04 §12 and §18.3: the binding's fake-caller tests (04 owns them); among their assertions, §7.1's requirements: ABI major/minor and export checks (05's audio exports required, `im_test_*` optional), the status and event tables of §5.2, `Next` honors ctx within 50 ms, the copy rule, packet validation (audio layer value, PCM size), `EventLayer` before every `REINIT` | Mac, CI ubuntu (logic); CI windows (`windows-go`; with the DLL, `windows-desktop`, 04 §18.2) |
 | `internal/client/publish` | M1 suite unchanged (pacing off by default); SR NTP equals `wall(now) − (Now − capture)` within 1 ms with a `Clock` Source whose packets are 25 ms old; pacer at 24 Mbit/s: a 300 KB frame's last packet leaves after 55–70 ms from a full bucket and 95–110 ms from an empty one, and audio written meanwhile is not delayed > 2 ms; backpressure blocks `Next` and never drops; responder size 4096 (a NACK for a packet 3000 back is answered); RTT from a crafted RR; `CaptureToSend`; `KindPCM` dropped | Mac, CI |
 | `internal/client/ratectl` | table tests at fixed instants: initial targets per preset; split examples of §9.2; clamps to 04 §6.4's ranges; ramp 4 → 8 Mbit/s in 5 steps and 10 s; congestion hold; live guards (15 %, 2 s, latest wins) and re-init guards (30 %, 10 s, one-step ramp) chosen per layer, `SetLive` switching a layer mid-share; `OpActive` at once with the resume target; admin cap; upload hint on after 6 s with a binding cap, never during the ramp, off after 10 s; `SetLimit` cpu/gpu → `CPU` true and the ramp held for 10 s after `none` | Mac, CI |
 | `internal/protocol` | fixtures for `share.update{paused}`, `room.state` with `paused`, `user.connections` with `deviceName`; compat replay of v1 fixtures; validation ignores nothing new | Mac, CI |
@@ -1980,8 +1981,9 @@ Skipped unless `ISSHONI_COMPAT_SERVER_URL` is set. `ISSHONI_COMPAT_ADMIN_FILE` n
    `no_device_flow`.
 
 **Windows**
-- CI windows-latest (06; `CGO_ENABLED=0`, no `-race`): `go test ./internal/client/...` and 04's binding tests
-  (04 §18.2) with the DLL built in the same workflow; `mediatest.Conformance` on the `win-x64-ci` DLL with
+- CI windows-2025 (06): `windows-go` runs `go test -race` (MinGW), then `CGO_ENABLED=0 go test` (the shipped mode),
+  of `./internal/client/...` with the fake engine; `windows-desktop` runs 04's binding tests (04 §18.2) with the DLL
+  built in the same workflow, and `mediatest.Conformance` on the `win-x64-ci` DLL with
   `test:pattern` and `{Listed, TestTone, Encoder: "fake"}` (checks 5 and 7 skipped with a message until 04 specifies
   IM_ENC_FAKE's output).
 - Owner's PC, self-hosted runner, tag `isshoni_hw` (`CGO_ENABLED=0`, no `-race`): Conformance with a real monitor
@@ -2063,8 +2065,8 @@ go vet ./...` (M1); the gomobile check of §4.
   and its ABI check (04 §5.5); `im_session_info` flags and per-layer encoder and profile; single-use picks with
   `im_release_source`; the rules of §5.3 (first keyframe ≤ 500 ms, keyframe on request also on a static screen within
   04's 250 ms spacing, `Reconfigure` without capture restart, `Stop` ≤ 200 ms); per-encoder `IM_ENCF_LIVE_BITRATE`;
-  the `test:pattern` source; IM_ENC_FAKE's output for Conformance checks 5 and 7; the loader name (04 §12.2 says
-  `Load`, this spec and 05 say `Open`); `Probe.Audio` filled with `media.AudioCapsFromFlags(im_caps.audio_flags)`
+  the `test:pattern` source; IM_ENC_FAKE's output for Conformance checks 5 and 7; the loader
+  `native.Open(native.Options)` (04 §12.2); `Probe.Audio` filled with `media.AudioCapsFromFlags(im_caps.audio_flags)`
   (§5.1: no `Mode`, no `Degraded`); E7's comparison of layer-0 VBV at 0.5 s against 0.1–0.2 s (frame-size p99, g2g
   p95 with cuts, text quality after the static refresh), with the chosen value recorded in 04 §9.3 (§12.1).
 - **05-windows-audio.md**: `audio.go` (`AudioConfig`, `AudioMode`, `Exclusions`, `AudioController`, `AudioReport`,
@@ -2076,8 +2078,8 @@ go vet ./...` (M1); the gomobile check of §4.
   (05 §11.1) that `AudioCaps` decodes; §10.3's chunk times at the Windows mix time, checked by audiotest case 20
   before the g2g run (§12.1 lever 1); and, only if the sound-on g2g run misses, A4/A6 lowering §9.3's running fill
   target to 20–25 ms with the drift simulation still passing (§12.1 lever 2).
-- **06-windows-release.md**: CI jobs (windows-latest Go tests with the DLL, `CGO_ENABLED=0` without `-race` as 02
-  §16.1 also has it, where 06's `windows-desktop` row currently lists `-race` with MinGW; macos-15 `go test
+- **06-windows-release.md**: CI jobs (on windows-2025: `windows-go` with the DLL-free Go tests, `-race` with MinGW and
+  then `CGO_ENABLED=0`, and `windows-desktop` with the Go tests that need the DLL; macos-15 `go test
   ./internal/client/... ./internal/media/...`; the gomobile and cross-compile checks in lint-go; the self-hosted
   runner and its labels for `isshoni_hw`); the nightly `compat-servers` job running `TestCompatServer` with the env
   vars and the admin file of §14; the release check that no `-tags production` build of `cmd/isshoni-desktop` links

@@ -346,8 +346,9 @@ func TestSourceAudioLoops(t *testing.T) {
 		if err != nil || !equalFrames(got.frames, loop[i%assetLoopPackets].frames) {
 			t.Fatalf("packet %d is not loop packet %d: %v", i, i%assetLoopPackets, err)
 		}
-		if p.Beep != (i%assetLoopPackets == 0) || p.CaptureNS != int64(i)*int64(AudioPacketDuration) {
-			t.Fatalf("packet %d: beep %v at %v", i, p.Beep, time.Duration(p.CaptureNS))
+		m, ok := ParseAudioMarker(p.Data)
+		if !ok || m.Beep != (i%assetLoopPackets == 0) || p.CaptureNS != int64(i)*int64(AudioPacketDuration) {
+			t.Fatalf("packet %d: marker %v, beep %v at %v", i, ok, m.Beep, time.Duration(p.CaptureNS))
 		}
 	}
 }

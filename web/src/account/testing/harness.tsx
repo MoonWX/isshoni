@@ -100,6 +100,7 @@ export function deviceFixture(overrides: Partial<DeviceInfo> = {}): DeviceInfo {
     createdAt: '2026-09-30T12:00:00.000Z',
     lastSeenAt: new Date().toISOString(),
     lastIp: '203.0.113.7',
+    current: false,
     ...overrides,
   };
 }

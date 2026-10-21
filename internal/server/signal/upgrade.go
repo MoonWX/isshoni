@@ -17,6 +17,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/MoonWX/isshoni/internal/protocol"
+	"github.com/MoonWX/isshoni/internal/version"
 )
 
 // depTimeout bounds each dependency call the hub makes after the upgrade (authentication, revalidation, the room
@@ -482,7 +483,7 @@ func (s *socket) handshake(b []byte) *conn {
 	}
 	pol := h.policy()
 	if checksClientVersion(hello.Client.Kind) && pol.MinClientVersion != "" {
-		below, ok := versionBelow(hello.Client.Version, pol.MinClientVersion)
+		below, ok := version.Below(hello.Client.Version, pol.MinClientVersion)
 		if !ok {
 			h.log.Warn("unparseable minClientVersion policy, not enforced",
 				slog.String("min_client_version", pol.MinClientVersion))
