@@ -104,7 +104,13 @@ jobs:
               - 'go.sum'
               - 'tools/**'
               - 'internal/protocol/testdata/**'
+              - 'internal/protocol/relay/testdata/**'
               - 'internal/server/tlsmgr/testdata/**'
+              # Non-Go inputs of Go tests elsewhere: the deep-link cases, the ABI layouts that
+              # internal/media/native's layout_test compares, and the test tone's golden Markers.
+              - 'internal/client/deeplink/testdata/**'
+              - 'native/common/tests/testdata/abi_layout.json'
+              - 'native/common/audio/tests/testdata/**'
               - '.golangci.yml'
               - 'tygo.yaml'
             web:
@@ -1400,6 +1406,11 @@ jobs:
 
       - name: govulncheck ./...
         run: .bin/govulncheck ./...
+
+      # On linux cmd/isshoni-desktop is the stub of M2 06 D18, so the Windows app gets its own
+      # run (M2 03 §3.2 W20).
+      - name: govulncheck of the Windows app (GOOS=windows)
+        run: GOOS=windows GOARCH=amd64 .bin/govulncheck ./cmd/isshoni-desktop
 
   windows-go:
     # The Go packages of the Windows app that need no engine DLL, on Windows (M2 06 §10.1): the

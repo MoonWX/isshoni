@@ -92,6 +92,8 @@ var auditActions = []auditAction{
 	{action: "device.revoked", actors: byUser, targets: []string{"device"}},
 	{action: "device.refresh_reused", targets: []string{"device"}, sec: true,
 		later: "M2: no refresh tokens exist before the device flow (03 slice 15)"},
+	{action: "device.expired", targets: []string{"device"},
+		later: "M2 02 §8: the janitor's devices rule (WA19); TestAuditCoverage produces it from WA47"},
 }
 
 // auditActionOf returns the table row of an action.
@@ -571,7 +573,7 @@ func TestAuditActionsInSource(t *testing.T) {
 			}
 		}
 	}
-	if len(auditActions) != 32 {
-		t.Errorf("the table has %d actions; 03 §10 lists 32", len(auditActions))
+	if len(auditActions) != 33 {
+		t.Errorf("the table has %d actions; 03 §10 lists 32, M2 02 §8 adds device.expired", len(auditActions))
 	}
 }

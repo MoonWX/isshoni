@@ -46,6 +46,11 @@ export default defineConfig(
       'no-restricted-syntax': [
         'error',
         { selector: "JSXAttribute[name.name='dangerouslySetInnerHTML']", message: 'No raw HTML (CSP + XSS).' },
+        // No markup may trigger a desktop runtime call by itself (docs/m2/03 §5.6).
+        {
+          selector: 'JSXAttribute[name.name=/^(data-)?wml-/]',
+          message: 'No Wails WML attributes (docs/m2/03 §5.6).',
+        },
       ],
       // Use platform.storage (a try/catch wrapper that falls back to memory).
       'no-restricted-globals': ['error', 'localStorage', 'sessionStorage'],
