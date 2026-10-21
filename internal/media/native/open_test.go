@@ -132,7 +132,8 @@ func TestOpenABICheck(t *testing.T) {
 	}
 }
 
-// TestOpenInitFails: im_init's status becomes Open's error, mapped, with no shutdown (nothing was initialized).
+// TestOpenInitFails: im_init's status becomes Open's error, mapped, with no shutdown (nothing was initialized); the
+// engine's records about the failure are drained into the log first (04 §12.3).
 func TestOpenInitFails(t *testing.T) {
 	for st, code := range statusCodes {
 		if st >= 0 {
@@ -140,7 +141,9 @@ func TestOpenInitFails(t *testing.T) {
 		}
 		f := newFakeCaller(t)
 		f.set(procInit, fakeFails(st, "dpi_unaware: the process is not per-monitor DPI aware"))
-		_, err := openEngine(f, Options{})
+		f.queueLogs(`{"level":"error","component":"engine","msg":"worker did not start"}` + "\n")
+		sink, log := newSinkLogger(slog.LevelInfo)
+		_, err := openEngine(f, Options{Logger: log})
 		reason := tokenDPIUnaware
 		switch st {
 		case imErrABI:
@@ -152,6 +155,19 @@ func TestOpenInitFails(t *testing.T) {
 		}
 		if n := f.count(procShutdown); n != 0 {
 			t.Errorf("%s: im_shutdown called %d times", statusName(st), n)
+		}
+		// After the failed im_init only the drain ran, and it ran before Open returned.
+		seq := f.sequence()
+		if len(seq) < 3 || !slices.Equal(seq[:2], []proc{procVersion, procInit}) ||
+			slices.ContainsFunc(seq[2:], func(p proc) bool { return p != procReadLogs }) {
+			t.Errorf("%s: calls %v, want im_version, im_init, then im_read_logs only", statusName(st), seq)
+		}
+		logged := false
+		for _, r := range sink.records(t) {
+			logged = logged || r["msg"] == "worker did not start"
+		}
+		if !logged {
+			t.Errorf("%s: the engine's record was not logged: %v", statusName(st), sink.records(t))
 		}
 	}
 }
@@ -392,8 +408,11 @@ func TestClose(t *testing.T) {
 	if n := f.count(procShutdown); n != 1 {
 		t.Errorf("im_shutdown called %d times", n)
 	}
-	if f.count(procCancelPick) != 1 {
+	if f.count(procCancelPick) == 0 {
 		t.Error("Close did not cancel a pick")
+	}
+	if seq := f.sequence(); slices.Contains(seq[slices.Index(seq, procShutdown):], procCancelPick) {
+		t.Errorf("im_cancel_pick after im_shutdown: %v", seq)
 	}
 	calls := f.total()
 	if _, err := e.Clock(); !errors.Is(err, &media.Error{Code: media.CodeInternal}) {
@@ -451,6 +470,129 @@ func TestCloseWaitsForCalls(t *testing.T) {
 	<-closed
 	if f.count(procShutdown) != 1 {
 		t.Error("no im_shutdown")
+	}
+}
+
+// TestCloseCancelsLatePick: a pick that passed begin before Close and enters im_pick_source only after Close's first
+// im_cancel_pick is cancelled too, so Close does not wait for the picker's timeout, and im_shutdown never runs
+// while im_pick_source blocks.
+func TestCloseCancelsLatePick(t *testing.T) {
+	f := newFakeCaller(t)
+	e := openFake(t, f, Options{Logger: slog.New(slog.DiscardHandler)})
+	var (
+		mu       sync.Mutex
+		cancels  int
+		picking  bool
+		shutdown bool
+	)
+	firstCancel, pickCancel := make(chan struct{}), make(chan struct{}, 1)
+	f.set(procCancelPick, func([]uintptr) (uintptr, string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if shutdown {
+			t.Error("im_cancel_pick after im_shutdown")
+		}
+		if cancels++; cancels == 1 {
+			close(firstCancel)
+		}
+		if picking {
+			select {
+			case pickCancel <- struct{}{}:
+			default:
+			}
+		}
+		return fakeResult(imOK), ""
+	})
+	f.set(procPickSource, func([]uintptr) (uintptr, string) {
+		mu.Lock()
+		picking = true
+		mu.Unlock()
+		<-pickCancel // the OS picker stays open until a cancel
+		mu.Lock()
+		picking = false
+		mu.Unlock()
+		return fakeResult(imErrCancelled), ""
+	})
+	f.set(procShutdown, func([]uintptr) (uintptr, string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if picking {
+			t.Error("im_shutdown while im_pick_source blocks")
+		}
+		shutdown = true
+		return fakeGarbage, ""
+	})
+
+	// WA23's Pick, reduced to its calls: begin, then im_pick_source after Close's first cancel.
+	began, picked := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(picked)
+		if err := e.begin("pick"); err != nil {
+			t.Error(err)
+			close(began)
+			return
+		}
+		defer e.end()
+		close(began)
+		<-firstCancel
+		e.c.call(procPickSource)
+	}()
+	<-began
+	start := time.Now()
+	closed := make(chan struct{})
+	go func() {
+		_ = e.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		if d := time.Since(start); d > 500*time.Millisecond {
+			t.Errorf("Close took %v", d)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("Close waits for a pick that entered after its first cancel")
+		pickCancel <- struct{}{}
+		<-closed
+	}
+	<-picked
+	mu.Lock()
+	defer mu.Unlock()
+	if cancels < 2 || !shutdown {
+		t.Errorf("%d cancels, shutdown %v: want a cancel after the pick entered, then im_shutdown", cancels, shutdown)
+	}
+}
+
+// TestCloseConcurrent: a Close running beside the first returns only after the first's im_shutdown has finished,
+// so that a caller may exit on either.
+func TestCloseConcurrent(t *testing.T) {
+	f := newFakeCaller(t)
+	e := openFake(t, f, Options{Logger: slog.New(slog.DiscardHandler)})
+	entered, release := make(chan struct{}), make(chan struct{})
+	f.set(procShutdown, func([]uintptr) (uintptr, string) {
+		close(entered)
+		<-release
+		return fakeGarbage, ""
+	})
+	done := make(chan struct{}, 2)
+	go func() {
+		_ = e.Close()
+		done <- struct{}{}
+	}()
+	<-entered
+	go func() {
+		_ = e.Close()
+		done <- struct{}{}
+	}()
+	select {
+	case <-done:
+		t.Fatal("a Close returned while im_shutdown was running")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	<-done
+	<-done
+	if n := f.count(procShutdown); n != 1 {
+		t.Errorf("im_shutdown called %d times", n)
 	}
 }
 

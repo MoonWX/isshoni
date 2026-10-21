@@ -175,13 +175,14 @@ func TestNotImplemented(t *testing.T) {
 
 func TestLoadErrorReason(t *testing.T) {
 	for code, want := range map[uint32]string{
-		winErrorFileNotFound:           tokenMissing,
-		winErrorPathNotFound:           tokenMissing,
-		winErrorModNotFound:            tokenMissing,
-		winErrorInvalidImageHash:       tokenBlockedByPolicy,
-		winErrorAccessDisabledByPolicy: tokenBlockedByPolicy,
-		winErrorBadExeFormat:           "",
-		0:                              "",
+		winErrorFileNotFound:                   tokenMissing,
+		winErrorPathNotFound:                   tokenMissing,
+		winErrorModNotFound:                    tokenMissing,
+		winErrorInvalidImageHash:               tokenBlockedByPolicy,
+		winErrorAccessDisabledByPolicy:         tokenBlockedByPolicy,
+		winErrorSystemIntegrityPolicyViolation: tokenBlockedByPolicy,
+		winErrorBadExeFormat:                   "",
+		0:                                      "",
 	} {
 		if got := loadErrorReason(code); got != want {
 			t.Errorf("loadErrorReason(%d) = %q, want %q", code, got, want)

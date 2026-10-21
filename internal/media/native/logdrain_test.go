@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"log/slog"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -103,6 +104,21 @@ func TestEngineRecord(t *testing.T) {
 	}
 	if _, ok := engineRecord([]byte(`not json`)); ok {
 		t.Error("garbage parsed")
+	}
+
+	// The ring's unsigned attrs (Attr::Kind::kUint) keep every bit above math.MaxInt64.
+	rec, ok = engineRecord([]byte(`{"msg":"m","attrs":{"u":18446744073709551615,"i":-9223372036854775808,` +
+		`"big":18446744073709551616}}`))
+	if !ok {
+		t.Fatal("not parsed")
+	}
+	attrs = map[string]any{}
+	rec.Attrs(func(a slog.Attr) bool {
+		attrs[a.Key] = a.Value.Any()
+		return true
+	})
+	if attrs["u"] != uint64(math.MaxUint64) || attrs["i"] != int64(math.MinInt64) || attrs["big"] != float64(1<<64) {
+		t.Errorf("attrs %#v", attrs)
 	}
 }
 

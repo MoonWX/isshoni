@@ -198,6 +198,10 @@ const (
 	winErrorBadExeFormat           = 193
 	winErrorInvalidImageHash       = 577  // STATUS_INVALID_IMAGE_HASH: Smart App Control, WDAC
 	winErrorAccessDisabledByPolicy = 1260 // software restriction or AppLocker policy
+
+	// ERROR_SYSTEM_INTEGRITY_POLICY_VIOLATION ("An Application Control policy has blocked this file"): how current
+	// Windows reports an App Control for Business or Smart App Control block of a DLL load.
+	winErrorSystemIntegrityPolicyViolation = 4551
 )
 
 // loadErrorReason is the Reason of a failed load of isshoni-media.dll (Code dependency, 03's "Reinstall isshoni"):
@@ -207,7 +211,7 @@ func loadErrorReason(winErr uint32) string {
 	switch winErr {
 	case winErrorFileNotFound, winErrorPathNotFound, winErrorModNotFound:
 		return tokenMissing
-	case winErrorInvalidImageHash, winErrorAccessDisabledByPolicy:
+	case winErrorInvalidImageHash, winErrorAccessDisabledByPolicy, winErrorSystemIntegrityPolicyViolation:
 		return tokenBlockedByPolicy
 	}
 	return ""

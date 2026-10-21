@@ -190,3 +190,20 @@ func TestDLLLastError(t *testing.T) {
 		t.Errorf("im_version = %#x, %q", uint32(r), lastErr)
 	}
 }
+
+// TestWinErrorNumbers: loadErrorReason's numbers are winerror.h's (no DLL needed).
+func TestWinErrorNumbers(t *testing.T) {
+	for got, want := range map[uint32]windows.Errno{
+		winErrorFileNotFound:                   windows.ERROR_FILE_NOT_FOUND,
+		winErrorPathNotFound:                   windows.ERROR_PATH_NOT_FOUND,
+		winErrorModNotFound:                    windows.ERROR_MOD_NOT_FOUND,
+		winErrorBadExeFormat:                   windows.ERROR_BAD_EXE_FORMAT,
+		winErrorInvalidImageHash:               windows.ERROR_INVALID_IMAGE_HASH,
+		winErrorAccessDisabledByPolicy:         windows.ERROR_ACCESS_DISABLED_BY_POLICY,
+		winErrorSystemIntegrityPolicyViolation: windows.ERROR_SYSTEM_INTEGRITY_POLICY_VIOLATION,
+	} {
+		if got != uint32(want) {
+			t.Errorf("%d, want %d (%v)", got, uint32(want), want)
+		}
+	}
+}

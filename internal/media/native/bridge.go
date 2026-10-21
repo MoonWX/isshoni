@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -367,9 +368,11 @@ type Engine struct {
 	info media.Info
 
 	// life orders im_shutdown after every other call (04 §5.1: im_init and im_shutdown must not race other calls):
-	// each call holds it for reading (begin, end), Close for writing.
-	life   sync.RWMutex
-	closed atomic.Bool
+	// each call holds it for reading (begin, end), Close for writing. closed fails every begin once Close has
+	// begun; closeOnce runs Close's body once, and every other Close waits for it.
+	life      sync.RWMutex
+	closed    atomic.Bool
+	closeOnce sync.Once
 
 	mu    sync.Mutex
 	build BuildInfo // the last im_build_info read
@@ -384,8 +387,10 @@ type Engine struct {
 }
 
 // openEngine is Open's portable half, on a resolved caller: the ABI check, im_init, the clock cross-check
-// (04 §12.3) and the build info; then it starts the log drain. Any failure after im_init shuts the engine down again,
-// so that a later Open can call im_init.
+// (04 §12.3) and the build info; then it starts the log drain. A failure of im_init or after it drains the engine's
+// log ring first (04 §12.3: right after any error), so its records about the failure reach the log. Any failure
+// after im_init shuts the engine down again, so that a later Open can call im_init; a failed im_init is not shut
+// down (nothing was initialized, and the engine of another Open may be running).
 func openEngine(c caller, o Options) (*Engine, error) {
 	log := o.Logger
 	if log == nil {
@@ -414,13 +419,6 @@ func openEngine(c caller, o Options) (*Engine, error) {
 	if params.openh264Path, err = cPath("open", "OpenH264Path", o.OpenH264Path); err != nil {
 		return nil, err
 	}
-	var pn runtime.Pinner
-	r, lastErr := c.call(procInit, addrOf(&pn, params))
-	pn.Unpin()
-	if st := int32(r); st != imOK {
-		return nil, statusError("open", procInit.String(), st, lastErr)
-	}
-
 	e := &Engine{
 		c:       c,
 		log:     log,
@@ -429,6 +427,14 @@ func openEngine(c caller, o Options) (*Engine, error) {
 		logStop: make(chan struct{}),
 		logDone: make(chan struct{}),
 	}
+	var pn runtime.Pinner
+	r, lastErr := c.call(procInit, addrOf(&pn, params))
+	pn.Unpin()
+	if st := int32(r); st != imOK {
+		e.drainLogs()
+		return nil, statusError("open", procInit.String(), st, lastErr)
+	}
+
 	err = checkClock(c)
 	var b BuildInfo
 	if err == nil {
@@ -528,22 +534,49 @@ func (e *Engine) Release(sourceID string) {
 }
 
 // Close stops every running session, then im_shutdown (04 §5.3: ≤ 3 s); the DLL stays loaded (no FreeLibrary,
-// ever). Later calls fail with internal/not_initialized without reaching the DLL. Idempotent.
+// ever). Later calls fail with internal/not_initialized without reaching the DLL. Idempotent: every Close, also one
+// running concurrently with the first, returns only after the shutdown has finished, so a caller may exit then.
 func (e *Engine) Close() error {
-	if !e.closed.CompareAndSwap(false, true) {
-		return nil
-	}
-	// A blocked im_pick_source would hold the shutdown back for up to its timeout: cancel it (a no-op without one).
-	e.c.call(procCancelPick)
+	e.closeOnce.Do(e.close)
+	return nil
+}
+
+// cancelPickEvery is how often Close repeats im_cancel_pick while it waits for the calls in flight.
+const cancelPickEvery = 20 * time.Millisecond
+
+func (e *Engine) close() {
+	e.closed.Store(true)
+	// A blocked im_pick_source would hold the shutdown back for up to its timeout (120 s), and a Pick that passed
+	// begin just before closed was set may enter it only after a first im_cancel_pick has run as a no-op: Close
+	// cancels every cancelPickEvery until it holds life, and stops before im_shutdown.
+	locked, cancelDone := make(chan struct{}), make(chan struct{})
+	go e.cancelPicks(locked, cancelDone)
 	// README WA23 stops the running sessions here (im_stop, ≤ 2 s each), before the shutdown.
 	close(e.logStop)
 	<-e.logDone
 	e.life.Lock() // the calls in flight end first
 	defer e.life.Unlock()
+	close(locked)
+	<-cancelDone
 	e.drainLogs()
 	e.c.call(procShutdown)
 	e.drainLogs()
-	return nil
+}
+
+// cancelPicks calls im_cancel_pick (a no-op without a pick) at once and every cancelPickEvery until locked is
+// closed; it closes done after its last call.
+func (e *Engine) cancelPicks(locked <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	t := time.NewTicker(cancelPickEvery)
+	defer t.Stop()
+	for {
+		e.c.call(procCancelPick)
+		select {
+		case <-locked:
+			return
+		case <-t.C:
+		}
+	}
 }
 
 // Probe reports what the PC can do: im_probe(FULL) on the first call and with refresh, cached otherwise, decoded
@@ -716,7 +749,8 @@ func engineLevel(s string) slog.Level {
 	return slog.LevelInfo
 }
 
-// attrValue decodes one attr value: integers stay int64, other numbers float64, the rest as encoding/json decodes it.
+// attrValue decodes one attr value: integers stay int64, or uint64 above math.MaxInt64 (the log ring's unsigned
+// attrs), other numbers float64, the rest as encoding/json decodes it.
 func attrValue(raw json.RawMessage) any {
 	d := json.NewDecoder(bytes.NewReader(raw))
 	d.UseNumber()
@@ -727,6 +761,9 @@ func attrValue(raw json.RawMessage) any {
 	if n, ok := v.(json.Number); ok {
 		if i, err := n.Int64(); err == nil {
 			return i
+		}
+		if u, err := strconv.ParseUint(n.String(), 10, 64); err == nil {
+			return u
 		}
 		if f, err := n.Float64(); err == nil {
 			return f
