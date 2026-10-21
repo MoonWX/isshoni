@@ -492,8 +492,9 @@ func (s *SFU) addShare(c *Conn, p StartShareParams) (*Share, error) {
 	}
 	sh.awaitsKeyframe.Store(true)
 	sh.audioBps.Store(int64(presetAudioBitrate(p.Preset)))
-	// The cap of the ShareParams that StartShare returns, read under s.mu, where SetLimits sets it.
-	sh.up = newShareUplink(s, s.limits.shareCap())
+	// The cap of the ShareParams that StartShare returns, read under s.mu, where SetLimits sets it. The policy follows
+	// the kind of the publishing Conn (M2 01 §10.1).
+	sh.up = newShareUplink(s, sh, c.client, s.limits.shareCap())
 	s.shares[sh.id] = sh
 	c.room.shares[sh.id] = sh
 	c.part.shares[sh.id] = sh

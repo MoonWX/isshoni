@@ -105,7 +105,7 @@ func TestAPISurface(t *testing.T) {
 			Decode: sfu.DecodeCaps{H264: []sfu.ProfileKey{sfu.ProfileHigh}}, Signaler: surfaceSignaler{},
 		},
 		sfu.StartShareParams{ID: "s_1", Preset: preset, Audio: true, Source: sfu.SourceScreen},
-		sfu.ShareUpdate{Preset: &preset},
+		sfu.ShareUpdate{Preset: &preset, Paused: new(true)},
 		sfu.ShareParams{Profile: sfu.ProfileHigh, Encodings: []sfu.EncodingParams{encoding}, AudioBitrate: 1},
 		sfu.SubscriptionUpdate{Share: "s_1", Video: sfu.QualityHigh, Audio: true},
 		binding, info,
@@ -119,7 +119,9 @@ func TestAPISurface(t *testing.T) {
 		// Uplink control (02 §11).
 		sfu.ShareUplinkStats{Client: sfu.ClientDesktop, HighRequests: 1, Layers: []sfu.LayerUplinkStats{{
 			RID: "f", Bitrate: 1, LossPct: 2, Jitter: time.Millisecond, Viewers: 3,
+			RawLossPct: 4, QueueDelay: time.Millisecond, // M2 01 §10.1
 		}}},
+		sfu.UplinkDecision{MaxBitrate: 1, Active: map[string]bool{"f": true}, Reason: sfu.HintReasonCongestion},
 		sfu.PCStateEvent{PC: sfu.PCPub, Gen: 1, State: "failed", Reason: "handshake_timeout"},
 		sfu.ErrorEvent{Err: sfuErr, Scope: sfu.ScopePCSub},
 		// Observability.
@@ -188,8 +190,8 @@ func TestAPISurface(t *testing.T) {
 		}
 	}
 	// The quality hints' reasons are 01's protocol.HintReason values, which sfuplane passes through (01 §15.4).
-	if sfu.HintReasonAdmin != "admin" || sfu.HintReasonViewers != "viewers" {
-		t.Errorf("hint reasons %q and %q", sfu.HintReasonAdmin, sfu.HintReasonViewers)
+	if sfu.HintReasonAdmin != "admin" || sfu.HintReasonViewers != "viewers" || sfu.HintReasonCongestion != "congestion" {
+		t.Errorf("hint reasons %q, %q and %q", sfu.HintReasonAdmin, sfu.HintReasonViewers, sfu.HintReasonCongestion)
 	}
 	// Quality is ordered: a smaller value is a cheaper one, so min(requested, cap) works (02 §10.1).
 	if sfu.QualityOff >= sfu.QualityLow || sfu.QualityLow >= sfu.QualityHigh {

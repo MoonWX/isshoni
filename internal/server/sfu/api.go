@@ -62,6 +62,12 @@ const (
 	// gatherTimeout caps the wait for ICE gathering before a local description goes out (02 §5.3). Gathering is
 	// instant with the muxes.
 	gatherTimeout = 2 * time.Second
+	// pubSRTPReplayWindow is the SRTP replay window of the publish PCs (M2 01 D7, §8.4): a native publisher answers
+	// NACKs with plain retransmissions on the media SSRC from a history of 4096 packets per SSRC, so a retransmission
+	// arrives with its original sequence number, up to 4096 packets behind the newest. Pion's default window of 64
+	// would drop it as a replay once 64 newer packets had arrived: about 26 ms while a keyframe drains at 24 Mbit/s.
+	// The subscribe and probe PCs keep Pion's defaults, and so does SRTCP: RTCP is never retransmitted.
+	pubSRTPReplayWindow = 4096
 )
 
 // srtpProfiles puts AES-GCM first: egress encryption is the main per-packet CPU cost, and GCM uses AES-NI or ARMv8
@@ -118,7 +124,10 @@ func newAPIs(tr *netx.Transport, log *slog.Logger) (*apis, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The publish side's copy gets the wider SRTP replay window; the setter replaces the copy's own pointer, so the
+	// subscribe API built from se below keeps Pion's default.
 	a.pubSettings = se
+	a.pubSettings.SetSRTPReplayProtectionWindow(pubSRTPReplayWindow)
 	if _, err := a.pubAPI(nil); err != nil { // so that a pub engine that can't be built fails New, not every offer
 		return nil, err
 	}

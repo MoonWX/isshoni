@@ -90,6 +90,9 @@ type Layer struct {
 	lastRTP atomic.Int64            // monoNow of the last packet
 	sps     atomic.Pointer[spsInfo] // from the last SPS that parsed: size and profile, for LayerInfo
 	stats   layerStats
+	// delay is a video layer's queueing-delay trend (M2 01 §10.1): the RTP loop samples each frame's first packet,
+	// the ticker turns the samples into stats.queueDelay. It has its own leaf lock.
+	delay delayTrend
 
 	// The RTP loop's own state: only the track's reader goroutine touches it.
 	seqStarted bool
@@ -115,8 +118,11 @@ type layerStats struct {
 	frames     atomic.Uint64 // distinct timestamps, counted as they move forward
 	// expected is how many sequence numbers the stream has spanned (highest − first + 1), unique how many of them
 	// arrived in time (not a duplicate, not too late). Their difference over an interval is the interval's loss.
-	expected     atomic.Uint64
-	unique       atomic.Uint64
+	expected atomic.Uint64
+	unique   atomic.Uint64
+	// rawMissing counts the sequence numbers that were missing when a higher one arrived (span), whether or not a
+	// retransmission filled them later: the loss before repair (M2 01 §10.1, LayerUplinkStats.RawLossPct).
+	rawMissing   atomic.Uint64
 	pliSent      tally // keyframe requests written to the publisher
 	pliThrottled tally // requests that fell within 500 ms of the last one
 	// jitter is the stream's interarrival jitter (RFC 3550 §6.4.1) in ticks of its RTP clock, times 16: the RFC's
@@ -128,6 +134,10 @@ type layerStats struct {
 	pps     atomic.Uint64 // packets per second, 2 s moving average (math.Float64bits)
 	fps     atomic.Uint64 // frames per second, 2 s moving average (math.Float64bits)
 	lossPct atomic.Uint64 // loss over the last two seconds, in percent (math.Float64bits)
+	// rawLossPct is the loss before repair over the last two seconds, in percent (math.Float64bits); queueDelay the
+	// video layer's queueing delay in ns, −1 while unknown (M2 01 §10.1). The native uplink estimator reads them.
+	rawLossPct atomic.Uint64
+	queueDelay atomic.Int64
 
 	// The ticker's own state: only SFU.everySecond touches it.
 	ticks  int         // how many ticks the Layer has seen, up to 2: the first is the baseline, the second the first rates
@@ -137,18 +147,20 @@ type layerStats struct {
 
 // layerSample is what the ticker read from a Layer's counters at one tick.
 type layerSample struct {
-	at                                       int64
-	packets, bytes, frames, expected, unique uint64
+	at                                                   int64
+	packets, bytes, frames, expected, unique, rawMissing uint64
 }
 
-// lossSample is one second of a Layer's sequence space: how many numbers it spanned and how many arrived.
-type lossSample struct{ expected, received uint64 }
+// lossSample is one second of a Layer's sequence space: how many numbers it spanned, how many arrived in time, and
+// how many were missing when a higher one arrived (before any repair).
+type lossSample struct{ expected, received, missing uint64 }
 
 // newLayer returns a Layer for a slot with an empty packet cache sized for its kind.
 func newLayer(slot Slot, kind webrtc.RTPCodecType) *Layer {
 	l := &Layer{slot: slot, cache: newPacketCache(kind), kind: kind}
 	l.srNotice = &packet{layer: l, report: true}
 	l.lastPLI.Store(-int64(pliInterval)) // the first request is never throttled
+	l.stats.queueDelay.Store(-1)
 	return l
 }
 
@@ -239,6 +251,11 @@ func (l *Layer) handleRTP(pkt *rtp.Packet, profile ProfileKey, now int64) {
 	l.stats.unique.Add(1)
 	if newest {
 		l.sampleJitter(p.ts, now)
+		if video {
+			// The first packet of a frame is a queueing-delay sample (M2 01 §10.1); a retransmission is never the
+			// newest, and padding never gets here.
+			l.delay.sample(p.ts, now)
+		}
 	}
 	if !l.tsStarted || int32(p.ts-l.highTS) > 0 {
 		l.tsStarted, l.highTS = true, p.ts
@@ -259,7 +276,8 @@ func (l *Layer) handleRTP(pkt *rtp.Packet, profile ProfileKey, now int64) {
 }
 
 // span widens the Layer's sequence space to seq: the count of numbers between the first and the highest one seen. It
-// reports whether seq is the highest now, the first one included.
+// reports whether seq is the highest now, the first one included. The numbers it skips are the gaps before any
+// repair (rawMissing, M2 01 §10.1): a retransmission or a late packet that fills one later is never the highest.
 func (l *Layer) span(seq uint16) (newest bool) {
 	if !l.seqStarted {
 		l.seqStarted, l.highSeq = true, seq
@@ -269,6 +287,9 @@ func (l *Layer) span(seq uint16) (newest bool) {
 	if ahead := int16(seq - l.highSeq); ahead > 0 {
 		l.highSeq = seq
 		l.stats.expected.Add(uint64(ahead))
+		if ahead > 1 {
+			l.stats.rawMissing.Add(uint64(ahead - 1))
+		}
 		return true
 	}
 	return false
@@ -364,8 +385,13 @@ func (l *Layer) handleSR(sr *rtcp.SenderReport, now int64) {
 // reason: the viewer who asks for it has asked for high, the publishing Conn's actor resumes the layer for that, and
 // its own request, which follows the hint, must not find the throttle spent on a PLI the sharer got while the layer
 // was off.
+//
+// While the sharer has paused the whole share (Share.sharerPaused, M2 01 §10.3), a request does nothing either: no
+// PLI at a share that sends nothing, and no throttle spent. The unpause asks each watched layer for its keyframe
+// (Share.setSharerPaused).
 func (l *Layer) requestKeyframe(now int64) bool {
-	if l.kind != webrtc.RTPCodecTypeVideo || !l.share.conn.pubUp.Load() || l.share.paused.Load()&(1<<l.slot) != 0 {
+	if l.kind != webrtc.RTPCodecTypeVideo || !l.share.conn.pubUp.Load() || l.share.paused.Load()&(1<<l.slot) != 0 ||
+		l.share.sharerPaused.Load() {
 		return false
 	}
 	last := l.lastPLI.Load()
@@ -407,12 +433,17 @@ func (l *Layer) info(now int64) LayerInfo {
 
 // tick turns the Layer's counters into its rates and sizes its packet cache; the SFU's ticker calls it once a second
 // (02 §9.1). Bitrate, packet rate and frame rate are 2 s moving averages. Loss is what the last two seconds of the
-// sequence space are missing: a gap that a late or retransmitted packet fills within that time is no loss.
+// sequence space are missing: a gap that a late or retransmitted packet fills within that time is no loss. Raw loss
+// is what the same two seconds were missing before any repair, and a video layer's queueing delay comes from its
+// delayTrend (M2 01 §10.1).
 func (l *Layer) tick(now int64) {
 	st := &l.stats
+	if l.kind == webrtc.RTPCodecTypeVideo {
+		st.queueDelay.Store(int64(l.delay.tick(now)))
+	}
 	cur := layerSample{
 		at: now, packets: st.packets.Load(), bytes: st.bytes.Load(), frames: st.frames.Load(),
-		expected: st.expected.Load(), unique: st.unique.Load(),
+		expected: st.expected.Load(), unique: st.unique.Load(), rawMissing: st.rawMissing.Load(),
 	}
 	prev := st.prev
 	st.prev = cur
@@ -437,14 +468,22 @@ func (l *Layer) tick(now int64) {
 	st.fps.Store(math.Float64bits(average(math.Float64frombits(st.fps.Load()), per(cur.frames-prev.frames))))
 
 	st.window[0] = st.window[1]
-	st.window[1] = lossSample{expected: cur.expected - prev.expected, received: cur.unique - prev.unique}
+	st.window[1] = lossSample{
+		expected: cur.expected - prev.expected, received: cur.unique - prev.unique,
+		missing: cur.rawMissing - prev.rawMissing,
+	}
 	expected := st.window[0].expected + st.window[1].expected
 	received := st.window[0].received + st.window[1].received
-	loss := 0.0
+	missing := st.window[0].missing + st.window[1].missing
+	loss, raw := 0.0, 0.0
 	if expected > received {
 		loss = 100 * float64(expected-received) / float64(expected)
 	}
+	if expected > 0 {
+		raw = 100 * float64(min(missing, expected)) / float64(expected)
+	}
 	st.lossPct.Store(math.Float64bits(loss))
+	st.rawLossPct.Store(math.Float64bits(raw))
 
 	l.cache.resize(pps, now)
 }

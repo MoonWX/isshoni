@@ -267,8 +267,14 @@ type StartShareParams struct {
 	Source SourceKind // informational, copied into ShareInfo
 }
 
-// ShareUpdate changes a share: new encodings at once, the audio bitrate on the next publish offer.
-type ShareUpdate struct{ Preset *Preset }
+// ShareUpdate changes a share: new encodings at once, the audio bitrate on the next publish offer. Paused is the
+// sharer's own pause (M2 01 §10.3, feature share.pause): true makes keyframe requests for the share do nothing and
+// the native uplink estimator skip its ticks; false undoes that and asks the publisher for a keyframe of each video
+// layer that has viewers. nil leaves either as it is. The hub passes it only from a connection that has the feature.
+type ShareUpdate struct {
+	Preset *Preset
+	Paused *bool
+}
 
 // ShareParams tells the sharer how to encode (01's protocol.ShareParams without the wire types). Numbers: 02 §8.6.
 type ShareParams struct {

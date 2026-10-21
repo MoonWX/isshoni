@@ -353,6 +353,16 @@ func (c *Conn) CheckUplink(ctx context.Context) error {
 	})
 }
 
+// UplinkStats returns what a share's uplink policy decides by as of the ticker's last second (M2 01 §10.1: with each
+// layer's raw loss and queueing delay); false for an unknown or ended share.
+func (s *SFU) UplinkStats(id ShareID) (ShareUplinkStats, bool) {
+	sh := s.lookupShare(id)
+	if sh == nil {
+		return ShareUplinkStats{}, false
+	}
+	return sh.uplinkStats(sh.conn.client), true
+}
+
 // UplinkState is a share's uplink control as its publishing Conn's actor has it (02 §11).
 type UplinkState struct {
 	MaxBitrate int      // the cap the sharer was told last, bit/s
