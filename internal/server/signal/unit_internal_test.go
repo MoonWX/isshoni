@@ -120,35 +120,6 @@ func TestResumeToken(t *testing.T) {
 	}
 }
 
-func TestVersionBelow(t *testing.T) {
-	for _, tc := range []struct {
-		v, floor  string
-		below, ok bool
-	}{
-		{"0.1.0", "0.2.0", true, true},
-		{"0.2.0", "0.2.0", false, true},
-		{"v0.2.1", "0.2.0", false, true},
-		{"0.10.0", "0.9.0", false, true},
-		{"1.0.0", "0.99.99", false, true},
-		{"0.2.0-rc.1", "0.2.0", true, true},
-		{"0.2.0-rc.2", "0.2.0-rc.10", true, true},
-		{"0.2.0-alpha", "0.2.0-1", false, true},
-		{"0.2.0-rc", "0.2.0-rc.1", true, true},
-		{"0.2.0+build.5", "0.2.0", false, true},
-		{"dev", "0.2.0", true, true},
-		{"", "0.2.0", true, true},
-		{"01.2.0", "0.2.0", true, true},
-		{"0.2", "0.2.0", true, true},
-		{"0.2.0-01", "0.2.0", true, true},
-		{"0.2.0", "latest", false, false},
-	} {
-		below, ok := versionBelow(tc.v, tc.floor)
-		if below != tc.below || ok != tc.ok {
-			t.Errorf("versionBelow(%q, %q) = %v, %v; want %v, %v", tc.v, tc.floor, below, ok, tc.below, tc.ok)
-		}
-	}
-}
-
 func TestSendQueue(t *testing.T) {
 	var q sendQueue
 	q.init(3, 10)

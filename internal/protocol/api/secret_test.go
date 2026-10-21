@@ -62,6 +62,27 @@ func secretSamples() []struct {
 		{ConnTestResponse{
 			Answer: testSDP, ExpiresInS: 20, Server: ConnTestServerInfo{Provider: CloudProviderHetzner},
 		}, fmt.Sprintf("[sdp %d B]", len(testSDP))},
+
+		// M2 02 §3: device codes, access and refresh tokens, exchange ids and the link form's password (the user code
+		// and device names these types also hide: TestDeviceSecretsRedacted).
+		{DeviceCodeResponse{
+			DeviceCode: testToken, UserCode: "WDJB-MJHT", VerificationURI: "https://watch.example.com/link",
+			VerificationURIComplete: "https://watch.example.com/link?code=WDJB-MJHT", ExpiresIn: 600, Interval: 5,
+		}, "https://watch.example.com/link"},
+		{DeviceTokenRequest{GrantType: GrantTypeDeviceCode, DeviceCode: testToken}, "device_code"},
+		{DeviceTokenRequest{
+			GrantType: GrantTypeRefreshToken, RefreshToken: "isr_" + testToken, ExchangeID: "q9V3" + marker + "Rk7aZ4cW",
+			AppVersion: "0.2.1",
+		}, "0.2.1"},
+		{DeviceTokenResponse{
+			AccessToken: "isa_" + testToken, TokenType: "Bearer", ExpiresIn: 900, RefreshToken: "isr_" + testToken,
+			RefreshExpiresIn: 7776000, Device: DeviceRef{ID: "m4q8x2c6v0bn", Name: "Gaming PC"},
+			User: User{ID: "k3m9p2qxw7ht", Username: "Alex", Role: RoleAdmin},
+		}, "m4q8x2c6v0bn"},
+		{DevicePasswordRequest{
+			Username: "Alex", Password: testPassword, ClientKind: "desktop", DeviceName: "DESKTOP-7F3K2LQ",
+			OS: "windows", AppVersion: "0.2.0",
+		}, "Alex"},
 	}
 }
 
@@ -160,11 +181,11 @@ func TestSecretsStayOnTheWire(t *testing.T) {
 	}
 }
 
-// secretName matches the JSON names of fields that carry a secret.
+// secretName matches the JSON names of fields that carry a secret: M2 02 §3 adds device codes and exchange ids.
 func secretName(name string) bool {
 	n := strings.ToLower(name)
 	return strings.Contains(n, "password") || strings.Contains(n, "token") || strings.Contains(n, "endpoint") ||
-		n == "offer" || n == "answer" || n == "auth"
+		n == "offer" || n == "answer" || n == "auth" || n == "devicecode" || n == "exchangeid"
 }
 
 // TestSecretFieldsRedacted: every string field whose JSON name marks it as a secret belongs to a type that redacts
@@ -198,8 +219,74 @@ func TestSecretFieldsRedacted(t *testing.T) {
 			t.Errorf("%s carries a secret but has no sample in secretSamples", rt.Name())
 		}
 	}
-	if len(need) < 16 {
+	if len(need) < 20 {
 		t.Errorf("found only %d types with secrets", len(need))
+	}
+}
+
+// TestDeviceSecretsRedacted pins M2 02 §16.1's list: in a DTO's fmt and slog output, deviceCode, accessToken,
+// refreshToken, exchangeId and DevicePasswordRequest.password are "[redacted]", under their JSON names in slog, while
+// the other fields stay readable. The user code and device names, never logged either (M2 README §4 Logging, 02 §3),
+// are hidden by the types that redact anyway: DeviceCodeResponse's userCode and verificationUriComplete (which carries
+// the code), DeviceTokenResponse's device.name and DevicePasswordRequest's deviceName.
+func TestDeviceSecretsRedacted(t *testing.T) {
+	const userCode, deviceName = "WDJB-MJHT", "Gaming PC"
+	cases := []struct {
+		v       any
+		hidden  []string // JSON names whose value must be "[redacted]" in the slog group
+		visible string   // a field that stays readable
+	}{
+		{DeviceCodeResponse{
+			DeviceCode: testToken, UserCode: userCode, VerificationURI: "https://watch.example.com/link",
+			VerificationURIComplete: "https://watch.example.com/link?code=" + userCode,
+		}, []string{"deviceCode", "userCode", "verificationUriComplete"}, "https://watch.example.com/link"},
+		{DeviceTokenRequest{
+			GrantType: GrantTypeRefreshToken, DeviceCode: testToken, RefreshToken: "isr_" + testToken,
+			ExchangeID: marker + "exchange",
+		}, []string{"deviceCode", "refreshToken", "exchangeId"}, "refresh_token"},
+		{DeviceTokenResponse{
+			AccessToken: "isa_" + testToken, RefreshToken: "isr_" + testToken, TokenType: "Bearer",
+			Device: DeviceRef{ID: "m4q8x2c6v0bn", Name: deviceName},
+		}, []string{"accessToken", "refreshToken"}, "m4q8x2c6v0bn"},
+		{DevicePasswordRequest{Username: "Alex", Password: testPassword, DeviceName: deviceName},
+			[]string{"password", "deviceName"}, "Alex"},
+	}
+	for _, c := range cases {
+		var b bytes.Buffer
+		slog.New(slog.NewJSONHandler(&b, nil)).Info("m", "req", c.v)
+		var line struct {
+			Req map[string]any `json:"req"`
+		}
+		if err := json.Unmarshal(b.Bytes(), &line); err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range c.hidden {
+			if line.Req[key] != redacted {
+				t.Errorf("%T: slog shows %s = %v, want %q", c.v, key, line.Req[key], redacted)
+			}
+		}
+		if dev, ok := line.Req["device"].(map[string]any); ok && dev["name"] != redacted {
+			t.Errorf("%T: slog shows device.name = %v, want %q", c.v, dev["name"], redacted)
+		}
+		fmtOut := fmt.Sprintf("%+v", c.v)
+		if leaks(fmtOut) || !strings.Contains(fmtOut, redacted) {
+			t.Errorf("%T: %%+v = %s", c.v, fmtOut)
+		}
+		for _, out := range []string{fmtOut, fmt.Sprintf("%#v", c.v), b.String()} {
+			if strings.Contains(out, "WDJB") || strings.Contains(out, deviceName) {
+				t.Errorf("%T shows the user code or the device name: %s", c.v, out)
+			}
+			if !strings.Contains(out, c.visible) {
+				t.Errorf("%T hides %q: %s", c.v, c.visible, out)
+			}
+		}
+	}
+
+	// An empty secret stays empty, so a log line still tells which grant a request used.
+	var b bytes.Buffer
+	slog.New(slog.NewJSONHandler(&b, nil)).Info("m", "req", DeviceTokenRequest{GrantType: GrantTypeDeviceCode})
+	if !strings.Contains(b.String(), `"grantType":"device_code","deviceCode":"","refreshToken":"","exchangeId":""`) {
+		t.Errorf("logged %s", b.String())
 	}
 }
 

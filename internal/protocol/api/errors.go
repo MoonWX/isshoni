@@ -107,13 +107,13 @@ const (
 	CodeRestoreInProgress   = "restore_in_progress"  // 409 (04, admin socket only)
 	CodeInsufficientStorage = "insufficient_storage" // 507 (04, admin socket only): not enough free disk space
 
-	CodeInvalidToken         = "invalid_token"         // 401, later (M2): bearer access token expired or unknown: refresh
-	CodeAuthorizationPending = "authorization_pending" // 400, later (M2): RFC 8628
-	CodeSlowDown             = "slow_down"             // 400, later (M2): RFC 8628
-	CodeAccessDenied         = "access_denied"         // 400, later (M2): RFC 8628
-	CodeExpiredToken         = "expired_token"         // 400, later (M2): RFC 8628
-	CodeInvalidGrant         = "invalid_grant"         // 400, later (M2): OAuth refresh token reuse or unknown grant
-	CodeDeviceCodeInvalid    = "device_code_invalid"   // 404, later (M2): unknown or expired user code
+	CodeInvalidToken         = "invalid_token"         // 401 (M2 02 §6.1): bearer access token expired or unknown: refresh
+	CodeAuthorizationPending = "authorization_pending" // 400 (M2 02 §5.4): RFC 8628
+	CodeSlowDown             = "slow_down"             // 400 (M2 02 §5.4): RFC 8628; params.interval
+	CodeAccessDenied         = "access_denied"         // 400 (M2 02 §5.4): RFC 8628
+	CodeExpiredToken         = "expired_token"         // 400 (M2 02 §5.4): RFC 8628
+	CodeInvalidGrant         = "invalid_grant"         // 400 (M2 02 §5.4, §6.2): unknown, used or reused grant; params.reason
+	CodeDeviceCodeInvalid    = "device_code_invalid"   // 404 (M2 02 §5.3): unknown or expired user code
 )
 
 var statusByCode = map[string]int{
@@ -188,10 +188,25 @@ const (
 
 // Keys of Error.Params.
 const (
-	ParamLimit     = "limit"     // limit_reached: a LimitKind
-	ParamField     = "field"     // setting_locked: the setting's JSON name (Settings)
-	ParamReason    = "reason"    // push_endpoint_rejected: a PushRejectReason
-	ParamTransport = "transport" // transport_disabled: a Transport
+	ParamLimit      = "limit"      // limit_reached: a LimitKind
+	ParamField      = "field"      // setting_locked: the setting's JSON name (Settings)
+	ParamReason     = "reason"     // push_endpoint_rejected: a PushRejectReason; invalid_grant: InvalidGrantReused
+	ParamTransport  = "transport"  // transport_disabled: a Transport
+	ParamCredential = "credential" // forbidden (M2 02 §6.4): the CredentialKind the route takes
+	ParamInterval   = "interval"   // slow_down (M2 02 §5.4): the new polling interval in seconds
+)
+
+// InvalidGrantReused is params.reason of invalid_grant when a spent refresh token was presented again and the server
+// revoked the device (M2 02 §6.2).
+const InvalidGrantReused = "reused"
+
+// CredentialKind is params.credential of forbidden (M2 02 §6.4): the only credential the route accepts, sent when the
+// request carried the other one.
+type CredentialKind string
+
+const (
+	CredentialKindSession CredentialKind = "session" // a cookie session: UserSession and Admin routes refuse a bearer
+	CredentialKindDevice  CredentialKind = "device"  // a bearer device token: UserDevice routes refuse a cookie
 )
 
 // LimitKind is params.limit of limit_reached (03 §12.2).

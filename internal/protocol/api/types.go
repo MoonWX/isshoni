@@ -100,7 +100,7 @@ type UserResponse struct {
 const (
 	InfoFeaturePush          = "push"          // present exactly when Info.Push is present
 	InfoFeaturePasswordReset = "passwordReset" // M1
-	InfoFeatureDeviceFlow    = "deviceFlow"    // later (M2)
+	InfoFeatureDeviceFlow    = "deviceFlow"    // M2: every route of M2 02 §7.1 (device flow and device tokens)
 )
 
 // Info is GET /api/v1/info (#1, 03 §12.4.1).
@@ -202,7 +202,7 @@ type ResetCompleteRequest struct {
 type Me struct {
 	User        User         `json:"user"`
 	Session     *SessionInfo `json:"session,omitempty"` // the caller's web session (always set in M1)
-	Device      *DeviceInfo  `json:"device,omitempty"`  // later (M2): a bearer principal gets its device instead
+	Device      *DeviceInfo  `json:"device,omitempty"`  // M2: a bearer principal gets its device (current) instead
 	Permissions Permissions  `json:"permissions"`
 	Badges      *Badges      `json:"badges,omitempty"` // admins only
 }
@@ -230,8 +230,8 @@ type SessionInfo struct {
 	Current    bool      `json:"current"` // this request's session
 }
 
-// DeviceInfo is one linked app: the items of GET /api/v1/me/devices (#17, empty until M2) and, later (M2), Me.Device
-// with only id, name and clientKind.
+// DeviceInfo is one linked app: the items of GET /api/v1/me/devices (#17, empty until M2), Me.Device for a bearer
+// principal and DeviceResponse.Device (M2 02 §7.2).
 type DeviceInfo struct {
 	ID         string    `json:"id"`
 	Name       string    `json:"name"`
@@ -241,6 +241,7 @@ type DeviceInfo struct {
 	CreatedAt  time.Time `json:"createdAt,omitzero"`
 	LastSeenAt time.Time `json:"lastSeenAt,omitzero"`
 	LastIP     string    `json:"lastIp,omitempty"`
+	Current    bool      `json:"current"` // M2: the caller's own device (bearer only; always false for a cookie caller)
 }
 
 // ChangePasswordRequest is POST /api/v1/me/password (#12); the reply is Empty.

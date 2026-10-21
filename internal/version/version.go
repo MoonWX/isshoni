@@ -12,6 +12,9 @@
 // v0.3.0 from "go install …@v0.3.0"; otherwise 0.0.0-dev+<12-char commit>, plus -dirty for a modified tree; without
 // VCS information either, 0.0.0-dev.
 //
+// The package also parses and compares SemVer 2.0 versions (semver.go: Parse, Compare, Below), so the hub's
+// minClientVersion floor, the desktop app's compatibility checks and its updater share one rule (M2 02 §13.2).
+//
 // This package is a leaf: it imports nothing from this repository.
 package version
 

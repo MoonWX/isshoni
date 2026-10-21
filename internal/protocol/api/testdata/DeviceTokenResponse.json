@@ -1,0 +1,16 @@
+{
+  "accessToken": "isa_EXAMPLEaccessTOKEN0123456789abcdefghijklmno",
+  "tokenType": "Bearer",
+  "expiresIn": 900,
+  "refreshToken": "isr_EXAMPLErefreshTOKEN0123456789abcdefghijklmo",
+  "refreshExpiresIn": 7776000,
+  "device": {
+    "id": "m4q8x2c6v0bn",
+    "name": "Gaming PC"
+  },
+  "user": {
+    "id": "k3m9p2qxw7ht",
+    "username": "Alex",
+    "role": "admin"
+  }
+}

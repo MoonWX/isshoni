@@ -1,0 +1,11 @@
+{
+  "device": {
+    "id": "m4q8x2c6v0bn",
+    "name": "Gaming PC",
+    "clientKind": "desktop",
+    "os": "windows",
+    "appVersion": "0.2.0",
+    "current": true,
+    "createdAt": "2026-11-02T19:05:01.004Z"
+  }
+}

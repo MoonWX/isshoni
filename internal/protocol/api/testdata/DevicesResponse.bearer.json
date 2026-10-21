@@ -1,0 +1,26 @@
+{
+  "devices": [
+    {
+      "id": "m4q8x2c6v0bn",
+      "name": "Gaming PC",
+      "clientKind": "desktop",
+      "os": "windows",
+      "appVersion": "0.2.1",
+      "lastIp": "203.0.113.7",
+      "current": true,
+      "createdAt": "2026-11-02T19:05:01.004Z",
+      "lastSeenAt": "2026-11-03T08:00:00.000Z"
+    },
+    {
+      "id": "d2f4h6k8m0p2",
+      "name": "Alex-PC",
+      "clientKind": "desktop",
+      "os": "windows",
+      "appVersion": "0.2.0",
+      "lastIp": "198.51.100.23",
+      "current": false,
+      "createdAt": "2026-11-01T10:00:00.000Z",
+      "lastSeenAt": "2026-11-02T21:45:10.300Z"
+    }
+  ]
+}
