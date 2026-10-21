@@ -1537,6 +1537,8 @@ The `changes` job (`dorny/paths-filter`) sets these outputs. On `push` to `main`
   request that deletes it fails there (README S82), and `lint-deploy`, whose `lint:keys` checks its "Release
   signing keys" section (README F11)
 - `repocheck`: `tools/repocheck/**`, the checker behind `lint:keys` and `lint:pins`: it runs `lint-deploy`
+- `doctor`: `internal/server/ops/doctor/**`, the checks and codes that docker-smoke's doctor step pins (11.3): it
+  runs `docker-smoke` (added after README group 17; review F21-R2)
 
 | Job | Runs when | Steps and assertions | Timeout | Gates merge |
 |---|---|---|---|---|
@@ -1550,7 +1552,7 @@ The `changes` job (`dorny/paths-filter`) sets these outputs. On `push` to `main`
 | `lint-deploy` | deploy, readme or repocheck | `task lint:sh lint:actions lint:keys lint:unit lint:pins test:sh` | 10 | yes |
 | `distro-release` | deploy or release, or `tools/relserve` or `tools/notices` (below) | builds the two test releases once for the matrix (README S78): setup-node and `npm ci` in `web/`, because `task release:snapshot` builds the SPA (7.2); rpm on the runner; `sh deploy/test/distro-test.sh -b`; uploads them as the artifact `distro-releases`, kept 1 day | 20 | yes |
 | `distro` | as `distro-release` | matrix of the 6 container distros (4.13), scenarios from 11.2, on the releases of `distro-release` (`distro-test.sh -r`), with `CONTAINER_ENGINE=docker` | 30 | yes |
-| `docker-smoke` | docker, deploy or release (no filter for `internal/server/ops/doctor`, whose checks and codes the step pins: a pull request that changes only doctor doesn't run it, 11.3) | `task docker:smoke` (11.3), linux/amd64 | 15 | yes |
+| `docker-smoke` | docker, deploy, release or doctor (doctor's checks and codes, which the step pins, 11.3) | `task docker:smoke` (11.3), linux/amd64 | 15 | yes |
 | `goreleaser-check` | release, deploy or readme (below) | setup-node and `npm ci` in `web/`; `goreleaser check`; `task release:snapshot` (builds the SPA first, 7.2); asserts the asset list of section 3 (names and archive contents) | 20 | yes |
 | `site` | site or deploy | setup-node (with npm's cache) and `npm ci --prefix docs`; `vitepress build`; `node docs/scripts/check-site.mjs`, the check that the site loads nothing from another origin (10.1, README S82); setup-go (from `go.mod`), then `go test ./internal/server/ops/doctor -run TestDocsAnchors` (10.4). It deploys nothing: that is `site.yml`'s (10.5). `ci-ok` needs it | 10 | yes |
 | `govulncheck` | go | `.bin/govulncheck ./...`, `continue-on-error: true` (new CVEs mustn't block unrelated PRs; nightly and release gate on it) | 10 | no |
@@ -2752,13 +2754,10 @@ that the manual check of 04 §17 can't be:
     doctor's codes and its check's; an allow-list entry is `local`, `vm` or `any`, one per check and engine. A pull
     request that adds or removes a check, or renames or removes a code the lists name, fails there until the script
     knows it, and that edit of `deploy/docker/**` runs docker-smoke on the same pull request.
-  - Which of its existing codes a check gives in the smoke's setup only the step can tell. README F21's own text of this
-    section named a filter `doctor` (`internal/server/ops/doctor/**`) in ci.yml's `changes` job, running docker-smoke as
-    well, as the integrator's to add (ci.yml is S02's, and the text said 8.2's table names the filter, which it
-    doesn't), but F21's report did not carry it among its blocked items, and the group 15 integration judged ci.yml
-    needed no change (its own pull request touched `deploy/docker/**`, which selects the job). Neither ci.yml nor 8.2's
-    list has the filter. Until a slice adds it (not scheduled; README §6 "Decided after group 15" (3)), such a change
-    passes its own pull request and fails on the push to main and in nightly's `docker-multiarch`.
+  - Which of its existing codes a check gives in the smoke's setup only the step can tell. ci.yml's `changes` job has
+    a `doctor` filter (`internal/server/ops/doctor/**`, 8.2) that runs docker-smoke on a pull request that changes
+    doctor's package, so such a change fails on its own pull request. README F21 named the filter; it was added after
+    group 17 (README §6 "Decided after group 15" (3)).
 ## 12. M1 exit test run book
 
 **Exit criterion (plan):** 5 friends finish a 2-hour session on a small VPS with no manual fixes; iPhone and Android
@@ -3318,12 +3317,9 @@ Decided after group 15 (engineering calls the owner delegated; README §6 "Decid
   on `127.0.0.1` in the container's `/etc/hosts`, so `dns` reads alike on every machine. The `local` list was
   chosen by reasoning, and the step's first run on CI's runner passed with it (`public_ip.none`, `dns.unverified`,
   `clock.ok`, `udp_buffers.low`). The manual pre-flight item 5 of 12.1 stays.
-- **ci.yml has no `doctor` filter** (8.2, 11.3; review F21-R2). `TestDockerSmokeExpectations` holds the step's lists to
-  doctor's checks and codes on every Go change, but a pull request that changes only doctor doesn't run docker-smoke, so
-  a change of which existing code a check gives in the smoke's setup shows only on the push to `main` and in the
-  nightly. F21's own 11.3 text named the filter as the integrator's to add, but F21's report did not carry it among its
-  blocked items, and the group 15 integration judged ci.yml needed no change (its own pull request touched
-  `deploy/docker/**`); not scheduled.
+- **ci.yml's `doctor` filter** (8.2, 11.3; review F21-R2): a pull request that changes only doctor runs docker-smoke,
+  which tells which code each check gives in the smoke's setup; `TestDockerSmokeExpectations` holds the step's lists to
+  doctor's checks and codes on every Go change. Added after group 17.
 
 Decided after group 16 (an engineering call the owner delegated; README §6 "Decided after group 16" (6)):
 

@@ -88,7 +88,8 @@ test('with UDP blocked, a friend watches a share over ICE-TCP', async ({
   );
   expect((await readState(friend.page)).viewer).toMatchObject({ focusedShareId: own.id, media: 'connected' });
 
-  // The server's side, where the sharer's pub PC shows too (the page's stats have only the viewer's PCs, 05 §10.7):
+  // The server's side, where both PCs show in one place (the friend's page has its sub PC, the sharer's page its pub
+  // PC, 05 §10.7):
   // the SFU logs each PC's connected state with the listener its selected pair came through (02 §13). Both are
   // listen.ice_tcp's, and nothing connected over UDP.
   await expect

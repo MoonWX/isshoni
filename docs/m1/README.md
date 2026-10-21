@@ -1112,14 +1112,15 @@ S00N wrote each into the spec that discusses it.
    (`publicState.v4Unreachable`): a loopback `public_ip` with a public IPv6 address is `ipv6_only` whatever the kind,
    while an IPv4 address that was simply not found keeps `cgnat_likely` as `public_ip.cgnat`. No new codes: both rules
    give the existing ones new params, since a new code needs 05's catalog in the same slice.
-3. **CI's `changes` job has no `doctor` filter yet** (06 §8.2, §11.3; review F21-R2). Doctor's package is an input of
+3. **CI's `changes` job had no `doctor` filter** (06 §8.2, §11.3; review F21-R2). Doctor's package is an input of
    the smoke step, and a pull request that changes only doctor (the `go` filter) doesn't run docker-smoke.
    `TestDockerSmokeExpectations` catches a check added or removed and a code renamed or removed, but which of its codes
    a check gives in the smoke's setup only the step can tell, so such a change passes its own pull request and fails on
    the push to `main` and in nightly's `docker-multiarch`. F21's own 06 §11.3 text named a filter `doctor`
    (`internal/server/ops/doctor/**`) as the integrator's to add, but F21's report did not carry it among its blocked
    items, and the group 15 integration judged `ci.yml` needed no change (its own pull request touched
-   `deploy/docker/**`, which selects the job). Not scheduled yet.
+   `deploy/docker/**`, which selects the job). Added after group 17: the `doctor` filter runs docker-smoke on such a
+   pull request (06 §8.2).
 4. **The Doctor page follows F21's params since the group 15 integration** (05 §15.3, §19.1; 04 §13.2). Right
    after the merge the integration had `web/src/admin/doctorText.ts` name the addresses of `unreachable` on
    `public_ip.none` (the contexts `unreachable`, and `unreachableSite` where the site is that address), `no_ipv6`
