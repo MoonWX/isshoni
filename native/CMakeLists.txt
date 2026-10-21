@@ -4,6 +4,20 @@
 # they take their dependencies from vcpkg in manifest mode (vcpkg.json, VCPKG_ROOT).
 cmake_minimum_required(VERSION 3.28)
 
+# Build trees, checked before project() writes anything: no in-source build (it would litter native/ with CMake's
+# files). A preset's build/<preset> ignores itself, so git status stays clean, and turns clang-format off for itself, so
+# a native/**/*.{h,c,cpp} glob that reaches the headers vcpkg installs there (vcpkg_installed/) still passes
+# `clang-format --dry-run --Werror`.
+file(RELATIVE_PATH _im_bin_rel "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_BINARY_DIR}")
+if(_im_bin_rel STREQUAL "")
+  message(FATAL_ERROR "in-source builds are not supported: use a preset (cmake --preset host-debug: build/<preset>)")
+endif()
+if(_im_bin_rel MATCHES "^build(/|$)")
+  file(WRITE "${CMAKE_BINARY_DIR}/.gitignore" "# written by native/CMakeLists.txt\n*\n")
+  file(WRITE "${CMAKE_BINARY_DIR}/.clang-format"
+       "# written by native/CMakeLists.txt\nDisableFormat: true\nSortIncludes: Never\n")
+endif()
+
 project(isshoni_media LANGUAGES C CXX)
 
 # ---------------------------------------------------------------------------------------------------------- options
@@ -70,12 +84,6 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # x64-windows-static triplet builds libopus and speexdsp the same way.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "ProgramDatabase")
-
-# A build directory inside the source tree (the presets' build/<preset>) ignores itself, so git status stays clean.
-file(RELATIVE_PATH _im_bin_rel "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_BINARY_DIR}")
-if(NOT _im_bin_rel MATCHES "^\\.\\.")
-  file(WRITE "${CMAKE_BINARY_DIR}/.gitignore" "# written by native/CMakeLists.txt\n*\n")
-endif()
 
 # im_build_flags: the warning, hardening and sanitizer flags every target of this tree links (04 §13.1).
 add_library(im_build_flags INTERFACE)

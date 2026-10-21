@@ -55,16 +55,16 @@ bool Append(ErrorBuffer &b, std::string_view s) noexcept {
   return n == s.size();
 }
 
-// Starts a detail with "<token>: " ("<token>" without a detail to follow; nothing for an empty token).
-void Begin(ErrorBuffer &b, std::string_view tok, bool more) noexcept {
+// Writes "<token>: <detail>", or just the detail for an empty token. An empty detail becomes the status's name, so the
+// text after a failure is never empty and a token is always followed by ": " (04 §5.1: Go splits it off there).
+void Write(ErrorBuffer &b, im_status status, std::string_view tok, std::string_view detail) noexcept {
   b.len = 0;
   b.text[0] = '\0';
   if (!tok.empty()) {
     Append(b, tok);
-    if (more) {
-      Append(b, ": ");
-    }
+    Append(b, ": ");
   }
+  Append(b, detail.empty() ? StatusName(status) : detail);
 }
 
 // One line only: control characters (CR, LF, tab, ...) become spaces.
@@ -150,14 +150,13 @@ im_status Fail(im_status status, std::string_view tok, std::string_view detail) 
     std::memmove(copy, detail.data(), n);
     detail = std::string_view(copy, n);
   }
-  Begin(b, tok, !detail.empty());
-  Append(b, detail);
+  Write(b, status, tok, detail);
   Flatten(b);
   return status;
 }
 
 im_status Failf(im_status status, std::string_view tok, const char *fmt, ...) noexcept {
-  // Format first: an argument may point into the current detail, which Begin overwrites.
+  // Format first: an argument may point into the current detail, which Write overwrites.
   char tmp[kMaxErrorBytes + 1];
   std::size_t len = 0;
   if (fmt != nullptr) {
@@ -169,10 +168,8 @@ im_status Failf(im_status status, std::string_view tok, const char *fmt, ...) no
       len = static_cast<std::size_t>(n) < sizeof tmp ? static_cast<std::size_t>(n) : sizeof tmp - 1;
     }
   }
-  ErrorBuffer &b = t_error;
-  Begin(b, tok, len > 0);
-  Append(b, std::string_view(tmp, len));
-  Flatten(b);
+  Write(t_error, status, tok, std::string_view(tmp, len));
+  Flatten(t_error);
   return status;
 }
 

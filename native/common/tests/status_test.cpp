@@ -63,7 +63,11 @@ TEST(LastError, TokenPrefixAndClear) {
   EXPECT_EQ(Fail(IM_ERR_INVALID_ARG, {}, "im_start: cfg is NULL"), IM_ERR_INVALID_ARG);
   EXPECT_EQ(LastErrorText(), "im_start: cfg is NULL") << "no token, no prefix";
   EXPECT_EQ(Fail(IM_ERR_BAD_STATE, im::abi::token::kNotInitialized, ""), IM_ERR_BAD_STATE);
-  EXPECT_EQ(LastErrorText(), "not_initialized");
+  EXPECT_EQ(LastErrorText(), "not_initialized: IM_ERR_BAD_STATE") << "a token is always followed by \": \"";
+  EXPECT_EQ(Failf(IM_ERR_TIMEOUT, im::abi::token::kEngineTimeout, "%s", ""), IM_ERR_TIMEOUT);
+  EXPECT_EQ(LastErrorText(), "engine_timeout: IM_ERR_TIMEOUT");
+  EXPECT_EQ(Fail(IM_ERR_INVALID_ARG, {}, ""), IM_ERR_INVALID_ARG);
+  EXPECT_EQ(LastErrorText(), "IM_ERR_INVALID_ARG") << "never empty after a failure";
   EXPECT_EQ(Failf(IM_ERR_LIMIT, im::abi::token::kSessionLimit, "%d of %d sessions in use", 4, 4), IM_ERR_LIMIT);
   EXPECT_EQ(LastErrorText(), "session_limit: 4 of 4 sessions in use");
   im::abi::ClearLastError();

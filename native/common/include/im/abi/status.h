@@ -66,8 +66,9 @@ inline constexpr std::size_t kMaxErrorBytes = 1023;
 void ClearLastError() noexcept;
 
 // Records "<token>: <detail>" (or just <detail> when token is empty) as this thread's detail and returns status, so an
-// export can `return Fail(IM_ERR_INVALID_ARG, {}, "im_start: cfg is NULL");`. Control characters in the text become
-// spaces, so the detail is always one line.
+// export can `return Fail(IM_ERR_INVALID_ARG, {}, "im_start: cfg is NULL");`. An empty detail is replaced by the
+// status's name ("not_initialized: IM_ERR_BAD_STATE"), so a token is always followed by ": ". Control characters in
+// the text become spaces, so the detail is always one line.
 im_status Fail(im_status status, std::string_view token, std::string_view detail) noexcept;
 
 // Fail with a printf-style detail.

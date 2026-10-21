@@ -8,8 +8,21 @@
 #   tests/*_test.c           the same for C tests (no GoogleTest)
 #   tests/testdata/          read through the IM_TESTDATA_DIR define
 #   tests/fuzz/*_fuzz.cpp    libFuzzer targets (IM_BUILD_FUZZ, clang), seeds in tests/fuzz/corpus/<target>/
+# A test or fuzz target is named after its file, so test and fuzz file names must be unique across common/ and its
+# areas (configure stops on a clash): an area's file carries a prefix where a name could repeat (audiomix/tests/
+# mix_ring_test.cpp beside common's ring_test.cpp). Sources are compiled on every OS, so OS-specific code (the os/
+# shim's src/os/*.cpp) is guarded with #if (_WIN32, __linux__, __APPLE__); the system libraries it needs are linked
+# below.
 # im_common is this folder. im_audio (audio/: PcmSink, the Opus stage, the PCM tap, the test tone; 04 §10.3),
 # im_audiopolicy (audiopolicy/, 05) and im_audiomix (audiomix/, 05) are added below when their folder exists.
+
+# im_check_target_name(<name> <file>): stops with a clear message when another library already has a target <name>.
+function(im_check_target_name name file)
+  if(TARGET ${name})
+    message(FATAL_ERROR "${file}: a target named ${name} already exists; test and fuzz file names must be unique "
+                        "across native/common and its areas (rename the file, e.g. with the area as a prefix)")
+  endif()
+endfunction()
 
 # im_add_tests(<library> <dir>): the tests and fuzz targets of the library whose folder is <dir>.
 function(im_add_tests lib dir)
@@ -17,6 +30,7 @@ function(im_add_tests lib dir)
     file(GLOB _tests CONFIGURE_DEPENDS "${dir}/tests/*_test.cpp" "${dir}/tests/*_test.c")
     foreach(_src IN LISTS _tests)
       get_filename_component(_name "${_src}" NAME_WE)
+      im_check_target_name(${_name} "${_src}")
       add_executable(${_name} "${_src}")
       target_link_libraries(${_name} PRIVATE ${lib})
       if(_src MATCHES "\\.cpp$")
@@ -30,6 +44,7 @@ function(im_add_tests lib dir)
     file(GLOB _fuzzers CONFIGURE_DEPENDS "${dir}/tests/fuzz/*_fuzz.cpp")
     foreach(_src IN LISTS _fuzzers)
       get_filename_component(_name "${_src}" NAME_WE)
+      im_check_target_name(${_name} "${_src}")
       add_executable(${_name} "${_src}")
       target_link_libraries(${_name} PRIVATE ${lib})
       target_link_options(${_name} PRIVATE -fsanitize=fuzzer)
@@ -50,6 +65,10 @@ file(GLOB_RECURSE IM_COMMON_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DI
 add_library(im_common STATIC ${IM_COMMON_SOURCES})
 target_include_directories(im_common PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(im_common PUBLIC im_abi im_build_flags)
+if(WIN32)
+  # The os/ shim's wake-up (WaitOnAddress, WakeByAddressSingle; 04 §6.2) for the DLL and common's own tests.
+  target_link_libraries(im_common PUBLIC synchronization)
+endif()
 im_add_tests(im_common "${CMAKE_CURRENT_SOURCE_DIR}")
 
 # ----------------------------------------------------------------------------------------- the areas of 04 and 05

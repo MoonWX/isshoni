@@ -476,8 +476,10 @@ IM_API im_status IM_CALL im_stop(im_session s); /* blocks <= 2 s */
 IM_API im_status IM_CALL im_protect_window(void *native_window, uint32_t flags);
 
 /* ---------------------------------------------------------------- diagnostics */
-IM_API int32_t IM_CALL im_last_error(char *buf, int32_t cap);  /* this thread's last failure ("<token>: ...") */
-IM_API int32_t IM_CALL im_read_logs(char *buf, int32_t cap);   /* drains whole NDJSON lines; 0 = empty */
+IM_API int32_t IM_CALL im_last_error(char *buf, int32_t cap); /* this thread's last failure ("<token>: ...") */
+/* Drains whole NDJSON lines (docs/m2/04 §5.6), oldest first, each at most 8192 bytes: cap must exceed 8192 (else
+   IM_ERR_INVALID_ARG). Returns the bytes written; 0 = empty. The first record after drops carries "dropped":N. */
+IM_API int32_t IM_CALL im_read_logs(char *buf, int32_t cap);
 IM_API int32_t IM_CALL im_abi_layout(char *json, int32_t cap); /* sizeof and offsetof of every struct */
 
 /* -------------------------------------------- test exports: shipped, capture nothing (docs/m2/05 §4.1) */

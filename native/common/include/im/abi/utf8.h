@@ -10,7 +10,7 @@
 
 namespace im::abi {
 
-inline constexpr char32_t kReplacementChar = U'�';
+inline constexpr char32_t kReplacementChar = U'\uFFFD';
 
 // Decodes the code point at s[i]. On success it returns the code point and sets len to its byte length (1..4). An
 // invalid sequence (a stray continuation byte, an overlong form, an encoded surrogate, a value above U+10FFFF, a cut

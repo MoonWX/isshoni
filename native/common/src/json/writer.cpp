@@ -35,10 +35,10 @@ void AppendCodePoint(std::string &out, char32_t cp) {
   case U'\t':
     out += "\\t";
     return;
-  case U' ':
+  case U'\u2028':
     out += "\\u2028";
     return;
-  case U' ':
+  case U'\u2029':
     out += "\\u2029";
     return;
   default:
