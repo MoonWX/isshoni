@@ -1,0 +1,2 @@
+go test fuzz v1
+string("i\xc5\xbf\xc5\xbfhoni://watch.example.com/")

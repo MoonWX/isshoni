@@ -1,0 +1,2 @@
+go test fuzz v1
+string("isshoni://[fe80::1%25en0]:8443/r/lounge")
