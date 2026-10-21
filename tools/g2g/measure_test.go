@@ -143,8 +143,9 @@ func TestMeasureResults(t *testing.T) {
 	}
 }
 
-// TestMeasureTracksAndFilters: a viewer that moves is followed, a misread copy and a jumping clock count as
-// implausible, and a lasting change of the clock is followed.
+// TestMeasureTracksAndFilters: a viewer that moves is followed and counted, a copy found again in about the same
+// place is not counted as a move, a misread copy and a jumping clock count as implausible, and a lasting change
+// of the clock is followed.
 func TestMeasureTracksAndFilters(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := &fakeScreen{
@@ -156,8 +157,13 @@ func TestMeasureTracksAndFilters(t *testing.T) {
 				return 150, true
 			},
 			copyAt: func(i int) (float64, float64) {
-				if i >= 70 {
+				switch {
+				case i >= 70:
 					return 330.5, 200.2 // the viewer moved
+				case i == 60 || i == 64:
+					// Off by a quarter of a cell for one screenshot: the copy doesn't decode where it was, and it
+					// is found again less than half a cell away, and then back in its place.
+					return 302.7, 186.8
 				}
 				return 300.3, 180.6
 			},
@@ -214,13 +220,17 @@ func (errCapturer) grab() (*Frame, error) { return nil, errors.New("the desktop 
 func (errCapturer) refreshHz() int        { return 0 }
 func (errCapturer) close() error          { return nil }
 
-// TestMeasureInterrupted: Ctrl+C during the measurement writes what was measured, and the result is inconclusive.
+// TestMeasureInterrupted: Ctrl+C during the measurement writes what was measured, in place of an earlier result
+// file, and the result is inconclusive.
 func TestMeasureInterrupted(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		useScreen(t, &fakeScreen{origin: time.Now(), lag: func(int) (int, bool) { return 100, true }})
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second) // calibration 2 s, then 1 s of 60
 		defer cancel()
 		out := filepath.Join(t.TempDir(), "r.json")
+		if err := os.WriteFile(out, []byte(`{"run":"an earlier one"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
 		var stderr bytes.Buffer
 		code := run(ctx, []string{"measure", "-o", out}, &bytes.Buffer{}, &stderr)
 		b, err := os.ReadFile(out) //nolint:gosec // G304: the test's own file

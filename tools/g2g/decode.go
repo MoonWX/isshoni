@@ -3,7 +3,7 @@ package main
 import (
 	"errors"
 	"image"
-	"image/color"
+	"image/draw"
 	"math"
 	"math/bits"
 	"slices"
@@ -47,16 +47,14 @@ func newFrame(w, h int) *Frame {
 	return &Frame{W: w, H: h, Stride: 4 * w, Pix: make([]byte, 4*w*h)}
 }
 
-// frameFromImage converts any image into a Frame (the tests' PNG fixtures).
+// frameFromImage converts any image into a Frame (the tests' PNG fixtures and JPEG round trips).
 func frameFromImage(img image.Image) *Frame {
 	b := img.Bounds()
+	rgba := image.NewRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+	draw.Draw(rgba, rgba.Bounds(), img, b.Min, draw.Src)
 	f := newFrame(b.Dx(), b.Dy())
-	for y := range f.H {
-		for x := range f.W {
-			c := color.RGBAModel.Convert(img.At(b.Min.X+x, b.Min.Y+y)).(color.RGBA)
-			i := y*f.Stride + 4*x
-			f.Pix[i], f.Pix[i+1], f.Pix[i+2], f.Pix[i+3] = c.B, c.G, c.R, 0xff
-		}
+	for i := 0; i < len(f.Pix); i += 4 {
+		f.Pix[i], f.Pix[i+1], f.Pix[i+2], f.Pix[i+3] = rgba.Pix[i+2], rgba.Pix[i+1], rgba.Pix[i], 0xff
 	}
 	return f
 }
@@ -459,18 +457,22 @@ type guard struct {
 }
 
 // Run lengths of the guard patterns, in pixels. At the smallest scale find reports, a half cell is 4.8 px and the
-// frame is as wide; video compression and scaling blur each edge by a pixel or two.
+// frame is as wide; video compression and scaling blur each edge by a pixel or two, and a soft edge (a blurred
+// video, scaled again) by a few.
 const (
 	minRun = 3 // the black and the grey run
-	maxGap = 4 // pixels of clsOther allowed between two runs (an edge)
+	maxGap = 4 // pixels of transition runs allowed between two runs (an edge)
 )
 
-// step is the index of the run next to runs[i] in direction dir (±1), passing over one transition run: a short
-// clsOther run, or with greyEdge also a short grey run (the pixels of an edge between black and white are
-// mid-grey). -1 when there is none.
+// step is the index of the run next to runs[i] in direction dir (±1), passing over the transition runs between
+// them, at most maxGap pixels in all: clsOther runs, and with greyEdge also grey runs. An edge between black and
+// white passes through every level, so a soft one is several short runs (other, grey, other); an edge between black
+// and the grey frame is at most one clsOther run. -1 when there is none.
 func step(runs []seg, i, dir int, greyEdge bool) int {
-	j := i + dir
-	if j >= 0 && j < len(runs) && runs[j].len() <= maxGap && (runs[j].c == clsOther || greyEdge && runs[j].c == clsGrey) {
+	j, gap := i+dir, 0
+	for j >= 0 && j < len(runs) && (runs[j].c == clsOther || greyEdge && runs[j].c == clsGrey) &&
+		gap+runs[j].len() <= maxGap {
+		gap += runs[j].len()
 		j += dir
 	}
 	if j < 0 || j >= len(runs) {

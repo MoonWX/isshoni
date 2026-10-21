@@ -9,6 +9,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"os"
+	"slices"
 	"testing"
 )
 
@@ -201,6 +202,71 @@ func scaleInto(dst, src *Frame, s, ox, oy float64) {
 				dst.Pix[i+c] = byte(math.Round(acc[c] / wsum))
 			}
 			dst.Pix[i+3] = 0xff
+		}
+	}
+}
+
+// scaleBilinear draws src scaled by s with its top-left corner at (ox, oy) into dst, sampling src bilinearly at
+// each destination pixel's centre, as a GPU's GL_LINEAR filter does without mipmaps (below half size it skips
+// source pixels, so its edges are not area averages). Only the pixels whose centres the scaled src covers change.
+func scaleBilinear(dst, src *Frame, s, ox, oy float64) {
+	at := func(x, y, c int) float64 {
+		return float64(src.Pix[min(max(y, 0), src.H-1)*src.Stride+4*min(max(x, 0), src.W-1)+c])
+	}
+	for dy := max(int(math.Floor(oy)), 0); dy < min(int(math.Ceil(oy+float64(src.H)*s)), dst.H); dy++ {
+		v := (float64(dy)+0.5-oy)/s - 0.5 // in source pixels, between pixel centres
+		if v < -0.5 || v >= float64(src.H)-0.5 {
+			continue
+		}
+		sy := int(math.Floor(v))
+		fy := v - float64(sy)
+		for dx := max(int(math.Floor(ox)), 0); dx < min(int(math.Ceil(ox+float64(src.W)*s)), dst.W); dx++ {
+			u := (float64(dx)+0.5-ox)/s - 0.5
+			if u < -0.5 || u >= float64(src.W)-0.5 {
+				continue
+			}
+			sx := int(math.Floor(u))
+			fx := u - float64(sx)
+			i := dy*dst.Stride + 4*dx
+			for c := range 3 {
+				top := at(sx, sy, c)*(1-fx) + at(sx+1, sy, c)*fx
+				bottom := at(sx, sy+1, c)*(1-fx) + at(sx+1, sy+1, c)*fx
+				dst.Pix[i+c] = byte(math.Round(top*(1-fy) + bottom*fy))
+			}
+			dst.Pix[i+3] = 0xff
+		}
+	}
+}
+
+// boxBlur blurs the pixels of f inside r with a separable box filter of taps pixels (odd), along the rows and then
+// down the columns, reading the neighbours outside r too: the soft edges that a video codec at a modest bitrate and a
+// viewer's scaler leave.
+func boxBlur(f *Frame, r image.Rectangle, taps int) {
+	r = r.Intersect(f.bounds())
+	h := taps / 2
+	for _, d := range []image.Point{{1, 0}, {0, 1}} {
+		y0 := max(r.Min.Y-h*d.Y, 0) // the rows this pass reads
+		src := slices.Clone(f.Pix[y0*f.Stride : min(r.Max.Y+h*d.Y, f.H)*f.Stride])
+		for y := r.Min.Y; y < r.Max.Y; y++ {
+			for x := r.Min.X; x < r.Max.X; x++ {
+				var acc [3]int
+				n := 0
+				for k := -h; k <= h; k++ {
+					p := image.Pt(x+k*d.X, y+k*d.Y)
+					if !p.In(f.bounds()) {
+						continue
+					}
+					j := (p.Y-y0)*f.Stride + 4*p.X
+					for c := range 3 {
+						acc[c] += int(src[j+c])
+					}
+					n++
+				}
+				i := y*f.Stride + 4*x
+				for c := range 3 {
+					f.Pix[i+c] = byte((acc[c] + n/2) / n) //nolint:gosec // G115: an average of bytes
+				}
+			}
 		}
 	}
 }

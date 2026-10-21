@@ -62,6 +62,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
@@ -193,25 +194,35 @@ func runMeasure(ctx context.Context, args []string, stdout, stderr io.Writer) in
 			rep.Versions.Server = v
 		}
 	}
-	// The result file is created first, so a path that can't be written fails before the minute of measuring; it
-	// is removed again when no result is written into it.
-	w, closeOut := stdout, func(bool) error { return nil }
+	// The result goes into a temporary file next to -o, created first, so that a path that can't be written fails
+	// before the minute of measuring. It replaces -o only once the whole result is in it: a run that measures
+	// nothing (no copy on the screen yet, Ctrl+C during the calibration) leaves an earlier result file as it was.
+	w, commit := stdout, func() error { return nil }
 	if *out != "" {
-		f, err := os.Create(*out) //nolint:gosec // G304: the file the operator named with -o
+		if err := checkReplaceable(*out); err != nil {
+			return fail("-o: %v", err)
+		}
+		f, err := os.CreateTemp(filepath.Dir(*out), ".g2g-*.json")
 		if err != nil {
-			return fail("%v", err)
+			return fail("-o %s: %v", *out, err)
 		}
-		written := false
-		closeOut = func(ok bool) error {
-			written = ok
-			return f.Close()
-		}
+		committed := false
 		defer func() {
-			if !written {
+			if !committed {
 				_ = f.Close()
-				_ = os.Remove(*out)
+				_ = os.Remove(f.Name())
 			}
 		}()
+		commit = func() error {
+			if err := f.Close(); err != nil {
+				return err
+			}
+			if err := os.Rename(f.Name(), *out); err != nil { // replaces *out, on Windows too
+				return err
+			}
+			committed = true
+			return nil
+		}
 		w = f
 	}
 	var dump *dumper
@@ -245,8 +256,8 @@ func runMeasure(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	rep.summarize()
 
 	err = rep.writeJSON(w)
-	if cerr := closeOut(err == nil); err == nil {
-		err = cerr
+	if err == nil {
+		err = commit()
 	}
 	if err != nil {
 		return fail("writing the result: %v", err)
@@ -256,6 +267,26 @@ func runMeasure(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	}
 	fmt.Fprintln(stderr, rep.summaryLine())
 	return rep.ExitCode
+}
+
+// checkReplaceable reports why the result can't be written to path: it is a directory, or a file that can't be
+// written (opened without truncating it, so an earlier result stays as it is).
+func checkReplaceable(path string) error {
+	fi, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if fi.IsDir() {
+		return fmt.Errorf("%s is a directory", path)
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY, 0) //nolint:gosec // G304: the file the operator named with -o
+	if err != nil {
+		return err
+	}
+	return f.Close()
 }
 
 // roundTo rounds x to n decimals.

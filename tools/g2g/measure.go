@@ -75,7 +75,7 @@ type meter struct {
 	clock, copy strip
 	anchor      int   // the clock's value minus the capture time in ms since base, mod 65536
 	recent      []int // the last accepted Δ
-	moves       int   // times the copy was found again somewhere else
+	moves       int   // times the copy was found again somewhere else (more than half a cell away)
 
 	clockMiss, deltaMiss  int // implausible readings in a row
 	lastMissOff, lastMiss int
@@ -278,13 +278,13 @@ func (m *meter) sample(f *Frame, tms int, p *point) {
 		return
 	}
 	m.clockMiss = 0
-	moved := m.copy
+	was := m.copy
 	rp, err := m.read(f, &m.copy, copyScaleTol)
 	if err != nil {
 		p.Fail = failCopy
 		return
 	}
-	if moved != m.copy {
+	if !was.near(m.copy) { // not the same strip with other sub-pixel ends (a decode that failed in place)
 		m.moves++
 	}
 	delta := wrap16(int(rc.Value) - int(rp.Value))
@@ -336,6 +336,13 @@ func (m *meter) read(f *Frame, s *strip, tol float64) (reading, error) {
 		}
 	}
 	return reading{}, err
+}
+
+// near reports whether o is s found again in the same place: each of its edges within half a cell of s's.
+func (s strip) near(o strip) bool {
+	tol := s.cell() / 2
+	return math.Abs(o.X0-s.X0) <= tol && math.Abs(o.X1-s.X1) <= tol && math.Abs(o.Y0-s.Y0) <= tol &&
+		math.Abs(o.Y1-s.Y1) <= tol
 }
 
 // dist is how far apart two strips' top-left corners are, in pixels.

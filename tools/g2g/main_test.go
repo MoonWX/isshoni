@@ -64,25 +64,44 @@ func TestMeasureNeedsWindows(t *testing.T) {
 	}
 }
 
-// TestMeasureOutputFirst: a result file that can't be created fails before anything is measured.
+// TestMeasureOutputFirst: a result file that can't be written fails before anything is measured, and a run that
+// can't measure leaves an earlier result file as it was.
 func TestMeasureOutputFirst(t *testing.T) {
 	old := openCapturer
 	defer func() { openCapturer = old }()
 	opened := false
 	openCapturer = func() (capturer, error) { opened = true; return nil, errNoScreen }
-	out := filepath.Join(t.TempDir(), "missing", "result.json")
-	var stderr bytes.Buffer
-	if code := run(context.Background(), []string{"measure", "-o", out}, io.Discard, &stderr); code != exitInconclusive ||
-		opened || !strings.Contains(stderr.String(), "result.json") {
-		t.Errorf("exit %d, capture opened %v, stderr %q; want 2 before the capture", code, opened, stderr.String())
+	dir := t.TempDir()
+	for _, tc := range []struct{ out, want string }{
+		{filepath.Join(dir, "missing", "result.json"), "result.json"},
+		{dir, "is a directory"},
+	} {
+		var stderr bytes.Buffer
+		if code := run(context.Background(), []string{"measure", "-o", tc.out}, io.Discard, &stderr); code != exitInconclusive ||
+			opened || !strings.Contains(stderr.String(), tc.want) {
+			t.Errorf("-o %s: exit %d, capture opened %v, stderr %q; want 2 and %q before the capture", tc.out, code, opened,
+				stderr.String(), tc.want)
+		}
 	}
-	// A run that can't measure leaves no result file behind.
-	out = filepath.Join(t.TempDir(), "result.json")
-	if code := run(context.Background(), []string{"measure", "-o", out}, io.Discard, io.Discard); code != exitInconclusive {
-		t.Errorf("exit %d, want 2", code)
+	// A run that can't measure leaves no result file behind, and an earlier one unchanged.
+	fresh, earlier := filepath.Join(dir, "result.json"), filepath.Join(dir, "g2g-win11-gate.json")
+	const result = `{"tool":"g2g","run":"gate"}` + "\n"
+	if err := os.WriteFile(earlier, []byte(result), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(out); !errors.Is(err, os.ErrNotExist) {
+	for _, out := range []string{fresh, earlier} {
+		if code := run(context.Background(), []string{"measure", "-o", out}, io.Discard, io.Discard); code != exitInconclusive {
+			t.Errorf("-o %s: exit %d, want 2", out, code)
+		}
+	}
+	if _, err := os.Stat(fresh); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the result file is there after a run that could not measure: %v", err)
+	}
+	if b, err := os.ReadFile(earlier); err != nil || string(b) != result { //nolint:gosec // G304: the test's own file
+		t.Errorf("the earlier result file holds %q, %v after a run that could not measure; want it unchanged", b, err)
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, ".g2g-*")); len(left) != 0 {
+		t.Errorf("temporary files left behind: %v", left)
 	}
 }
 

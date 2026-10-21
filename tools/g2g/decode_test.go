@@ -54,7 +54,9 @@ func TestResolveBound(t *testing.T) {
 
 // screen draws a test screenshot: a background, the clock's panel at the top-left with value clockV, and the
 // screen's copy at scale s with its top-left at (ox, oy) holding copyV, the copy after a JPEG round trip of
-// quality q (0: none), as the video codec leaves it.
+// quality q (0: none), as the video codec leaves it. The copy is scaled by area averaging (scaleInto), or with
+// bilinear by scaleBilinear; pre and post blur it (box filters of that many taps, 0: none) before and after the
+// scaling, for the soft edges of a video at a modest bitrate.
 type screen struct {
 	w, h          int
 	bg            string // "noise", "text" or "dark"
@@ -62,6 +64,8 @@ type screen struct {
 	s, ox, oy     float64
 	q             int
 	seed          uint64
+	bilinear      bool
+	pre, post     int
 }
 
 func (sc screen) render(t testing.TB) *Frame {
@@ -85,7 +89,18 @@ func (sc screen) render(t testing.TB) *Frame {
 		if sc.q > 0 {
 			inner = jpegRoundTrip(t, inner, sc.q)
 		}
-		scaleInto(f, inner, sc.s, sc.ox, sc.oy)
+		if sc.pre > 0 {
+			boxBlur(inner, inner.bounds(), sc.pre)
+		}
+		if sc.bilinear {
+			scaleBilinear(f, inner, sc.s, sc.ox, sc.oy)
+		} else {
+			scaleInto(f, inner, sc.s, sc.ox, sc.oy)
+		}
+		if sc.post > 0 {
+			boxBlur(f, image.Rect(int(sc.ox), int(sc.oy), int(math.Ceil(sc.ox+float64(sc.w)*sc.s)),
+				int(math.Ceil(sc.oy+float64(sc.h)*sc.s))), sc.post)
+		}
 	}
 	return f // the screenshot itself is lossless
 }
@@ -97,13 +112,14 @@ func checkScreen(t *testing.T, f *Frame, clockV, copyV uint16, s float64) {
 	all := find(f, f.bounds())
 	var clock, copies []found
 	for _, c := range all {
-		if math.Abs(c.scale()-1) < clockScaleTo {
+		if c.overlaps(clockStrip()) { // by place, not by scale: a copy can be at scale 0.97–1.0 too
 			clock = append(clock, c)
 		} else {
 			copies = append(copies, c)
 		}
 	}
-	if len(clock) != 1 || dist(clock[0].strip, clockStrip()) > 1 || clock[0].Value != clockV {
+	if len(clock) != 1 || dist(clock[0].strip, clockStrip()) > 1 || math.Abs(clock[0].scale()-1) > 0.005 ||
+		clock[0].Value != clockV {
 		t.Fatalf("clock: found %+v, want one strip at (24, 24) reading %d", clock, clockV)
 	}
 	if s == 0 {
@@ -146,7 +162,45 @@ func TestFindAndDecodeScales(t *testing.T) {
 	}
 }
 
-// TestFindNoFalseStrips: the content-cut images, plain and scaled, hold no strip.
+// TestFindSoftEdges: copies whose edges are several pixels wide, as Chrome's video scaling and H.264 at a modest
+// bitrate leave them, are found and decode exactly at any scale and sub-pixel position: a box blur of 3 or 5 taps
+// after an area-averaging scaler, a bilinear scaler without and with a 3-tap blur, and a 5-tap blur at the screen's
+// resolution before either scaler. An edge between black and white then passes through every class (black, other,
+// grey, other, white), and which scales show it depends on the sub-pixel phase, so the scales are 0.02 apart over
+// the whole range at random positions.
+func TestFindSoftEdges(t *testing.T) {
+	rng := rand.New(rand.NewPCG(11, 3)) //nolint:gosec // G404: the same cases in every run, not a secret
+	bgs := []string{"noise", "text", "dark"}
+	for _, v := range []struct {
+		name      string
+		bilinear  bool
+		pre, post int
+	}{
+		{"area-blur3", false, 0, 3},
+		{"area-blur5", false, 0, 5},
+		{"bilinear", true, 0, 0},
+		{"bilinear-blur3", true, 0, 3},
+		{"preblur5-area", false, 5, 0},
+		{"preblur5-bilinear", true, 5, 0},
+	} {
+		for k := range 38 { // 0.25–0.99
+			s := 0.25 + 0.02*float64(k)
+			bg := bgs[k%len(bgs)]
+			sc := screen{
+				w: 1000, h: 300 + int(math.Ceil(panelH*s)), bg: bg,
+				clockV: v16(rng.IntN(1 << 16)), copyV: v16(rng.IntN(1 << 16)),
+				s: s, ox: 20 + rng.Float64()*20, oy: 170 + rng.Float64()*20, q: 60, seed: uint64(k),
+				bilinear: v.bilinear, pre: v.pre, post: v.post,
+			}
+			t.Run(fmt.Sprintf("%s/%.2f/%s", v.name, s, bg), func(t *testing.T) {
+				t.Parallel()
+				checkScreen(t, sc.render(t), sc.clockV, sc.copyV, s)
+			})
+		}
+	}
+}
+
+// TestFindNoFalseStrips: the content-cut images, plain, scaled and blurred, hold no strip.
 func TestFindNoFalseStrips(t *testing.T) {
 	for _, bg := range []string{"noise", "text"} {
 		f := newFrame(1200, 700)
@@ -160,7 +214,20 @@ func TestFindNoFalseStrips(t *testing.T) {
 		for _, s := range []float64{0.25, 0.37, 0.5, 0.75} {
 			scaleInto(small, f, s, 10, 10)
 		}
-		for name, fr := range map[string]*Frame{bg: jpegRoundTrip(t, f, 70), bg + "-scaled": jpegRoundTrip(t, small, 70)} {
+		bilinear := newFrame(f.W, f.H)
+		bilinear.fill(bilinear.bounds(), 128, 128, 128)
+		for _, s := range []float64{0.29, 0.45, 0.62, 0.9} {
+			scaleBilinear(bilinear, f, s, 10.4, 10.7)
+		}
+		frames := map[string]*Frame{bg: jpegRoundTrip(t, f, 70), bg + "-scaled": jpegRoundTrip(t, small, 70)}
+		for _, taps := range []int{3, 5} {
+			for name, src := range map[string]*Frame{bg: f, bg + "-scaled": small, bg + "-bilinear": bilinear} {
+				b := jpegRoundTrip(t, src, 70)
+				boxBlur(b, b.bounds(), taps)
+				frames[fmt.Sprintf("%s-blur%d", name, taps)] = b
+			}
+		}
+		for name, fr := range frames {
 			if got := find(fr, fr.bounds()); len(got) != 0 {
 				t.Errorf("%s: found %+v, want no strip", name, got)
 			}

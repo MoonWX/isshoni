@@ -47,7 +47,7 @@ type report struct {
 	DecodedPct   float64   `json:"decodedPct"`
 	Failures     failures  `json:"decodeFailures"`
 	Transitions  int       `json:"transitions"` // samples with a strip caught between two frames
-	CopyMoves    int       `json:"copyMoves"`   // times the copy was found again after it moved
+	CopyMoves    int       `json:"copyMoves"`   // times the copy was found again after it moved by over half a cell
 	LatencyMs    *latency  `json:"latencyMs"`   // null without samples
 	RefreshHz    int       `json:"refreshHz"`   // the monitor's refresh rate, 0 when unknown
 	Screen       size      `json:"screen"`
