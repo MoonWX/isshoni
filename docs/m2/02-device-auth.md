@@ -1377,7 +1377,7 @@ fallback. *Pending*: mobile apps bring their own `Store` (Keychain, Keystore).
 
 ```go
 type ServersOptions struct {
-	Dir                   string // os.UserConfigDir()/isshoni (03-desktop-app passes it)
+	Dir                   string // the data root, %LOCALAPPDATA%\isshoni on Windows (03-desktop-app §14.1 passes it)
 	Store                 credstore.Store
 	App                   AppInfo
 	HTTP                  *http.Client
@@ -1412,7 +1412,7 @@ func (s *Servers) Active() *Manager // nil when no server was added
 func (s *Servers) Add(ctx context.Context, origin string) (AddResult, error)
 func (s *Servers) SetActive(origin string) error
 func (s *Servers) Remove(ctx context.Context, origin string) error // Unlink, then drop the entry
-func (s *Servers) ForgetAll(ctx context.Context) error             // --purge-data (§11.7)
+func (s *Servers) ForgetAll(ctx context.Context) error             // --forget-credentials, --purge-data (§11.7)
 func (s *Servers) Close() error
 ```
 
@@ -1471,14 +1471,15 @@ on every change):
 ```
 
 - **Uninstall**: the uninstaller (06-windows-release §6.8, which owns the command line) runs
-  `isshoni.exe --purge-data`, which calls `Servers.ForgetAll` (06's "DeleteAll"):
+  `isshoni.exe --forget-credentials` on every uninstall and `isshoni.exe --purge-data` instead on a `/PURGE` one; both
+  call `Servers.ForgetAll` (06's "DeleteAll") with one 5 s budget:
   1. list every credential under the prefix (`credstore` `List`), whether or not `servers.json` names it;
   2. for all of them **concurrently, under one shared 5 s deadline**: refresh, then `POST /device/revoke` with the new
      access token; a failure of either is ignored;
   3. delete every credential under the prefix whatever the revoke results, clear `user` and `device` of every entry in
      `servers.json`, and exit 0.
   The whole call takes about 6 s whatever the number of servers, inside the 30 s the uninstaller gives it. 06's flag
-  then deletes the data folder, `servers.json` included (06's rule). 03-desktop-app parses the flag.
+  then deletes the data folder, `servers.json` included (06's rule). 03-desktop-app parses both flags.
 - **Logs and diagnostics** (03-desktop-app's log file, M5's "Copy diagnostics") contain no token, code or exchange id;
   `State` has no secret, so it may be logged.
 
@@ -1776,7 +1777,7 @@ other linked device.
 | Client refresh | when < 120 s left; at least daily; retries 1, 2, 4, 8, 16, 30 s then every 30 s (±20 %) |
 | Client forced refresh | at most once per 10 s (`AccessToken(ctx, true)`); a forced call within 10 s of the last forced refresh gets that refresh's token |
 | `SessionEnded` | one refresh attempt, bounded by the caller's ctx; concurrent calls share it |
-| Unlink | 10 s for the revoke call; uninstall (`--purge-data`): one 5 s budget for all servers, concurrent; credentials deleted regardless |
+| Unlink | 10 s for the revoke call; uninstall (`--forget-credentials` on every uninstall, `--purge-data` on `/PURGE`): one 5 s budget for all servers, concurrent; credentials deleted regardless |
 | Servers | 20 per app |
 | Deep link | ≤ 2048 bytes; room id 1–64 `[A-Za-z0-9_-]` |
 | Compat recheck | every 10 min while incompatible |
@@ -1801,13 +1802,14 @@ before their slice's PR; their seeds live in `testdata/fuzz`.
 | `internal/server/auth` (tokens) | refresh rotates (old spent, `replaced_by` set, new pair `issued_by` old); **reuse**: replay after the child was used → device and tokens gone, `device.refresh_reused`, alert raised, `ConnCloser{UserID, DeviceID}` called after the commit, cache forgotten; **grace**: replay with the same `exchangeId` at +10 min while the child is unused → new pair, the old child's access token gone, the old child kept as a spent row (`replaced_by` = the new refresh, `exchange_hash` NULL); replay without id at +100 s → new pair once, a second replay at +110 s → reuse; replay at +121 s without id → reuse; replay with another id at +10 min → reuse (inside 120 s another id takes the restart row, since a restarted client draws a new id); **grace, then the superseded child**: replay without id at +100 s, then present the old child C → 400 `invalid_grant {reason: reused}`, device and tokens gone, `device.refresh_reused`, alert raised (once with C presented at +101 s, inside the 120 s window, and once at +15 min); the same after a same-`exchangeId` retry; a request without `exchangeId` never matches a NULL `exchange_hash`; bearer: wrong shapes → `invalid_token` without a DB read (counting fake), expired → `invalid_token`, cache hit within 30 s, a revoke invalidates the cache before `ConnCloser` runs; `Touch` for a bearer: device gone → `unauthenticated`, use recorded at most once per 5 min, the returned principal carries the device's current `DeviceName` (also from `AuthenticateBearerToken`); a session principal comes back unchanged; `MaybeRotate` no-op; `LogoutEverywhere` and `RevokeDevice` for a bearer; `NormalizeDeviceName` table; `FuzzDeviceToken` (random bodies never panic, never return 5xx) | Mac, CI ubuntu |
 | `internal/server/httpapi` | the §7.1 endpoint table (statuses and codes) through the real chain with a real `auth.Service`; the **credential matrix**: each of `Public`, `User`, `Admin`, `UserSession`, `UserDevice` × {none, cookie, bearer, bad bearer, cookie + bearer}, where `Admin` with an admin user's valid bearer → 403 `forbidden {credential: session}`, with a bad bearer → 401 `invalid_token`, with the admin's cookie → as M1; #29–#42 are registered `Admin`; #21–#23 accept an admin's bearer; a bearer request with a cross-site `Origin` and no CSRF headers passes, a cookie one doesn't; the **CORS matrix**: preflights from each desktop origin (allowed and refused methods and headers), from another origin (405 as M1), a desktop-origin request's `Cookie` header ignored, `Vary: Origin` everywhere, never `Allow-Credentials`, CORS headers on 401/413/429 answers; `/me` and `/me/devices` for a bearer (`device`, `current`); `/info` lists `deviceFlow`; `TestAuditCoverage` and `TestAuditActionsInSource` with §8's rows | Mac, CI ubuntu |
 | `internal/server/signal` | a socket from `http://wails.localhost` with `hello.auth` is accepted; with a valid cookie it gets 403 (as built); a successful bearer `hello` refunds the per-IP pre-auth token (21 bearer sockets of two users from one IP, opened one after another within a minute, all succeed; 21 sockets whose `hello` fails get 429 on the 21st); `Identity.DeviceName` never appears in `LogValue` output; a `Revalidate` result whose `DeviceName` changed is applied like a changed `Name` (M1 01 §3.2); `wire.go`'s `AuthenticateBearer` and `Revalidate` copy `DeviceName` (the wiring test of `internal/server`) | Mac, CI ubuntu |
-| `internal/client/deviceauth` | against an `httptest` server with scripted answers: the poll loop (pending, `slow_down` with and without `params.interval`, denied, expired, network errors until `ExpiresAt`); the credential is written before `linked` and before a refreshed token is returned (an ordering fake); `save_failed`; single flight (100 concurrent `AccessToken(ctx, false)` calls → one refresh); retries keep the `exchangeId` and stop on `invalid_grant`; `AccessToken(ctx, true)` refreshes even with a fresh cached token, a second forced call within 10 s returns that refresh's token without a request, one after 10 s refreshes again; **errors**: no credential → `errors.Is(err, ErrNotLinked)` and the chain has `RelinkRequired() == true`; the call whose refresh gets `invalid_grant` returns the same, after the store is empty; `ErrIncompatible` has `UpdateRequired() == true`; `ErrOffline` has neither method and unwraps to its network cause; `*deviceauth.Manager` satisfies `core.Auth` (a compile-time assertion in a test file); `Link` returns once `linking` is reached and polling continues after its ctx is cancelled, until `CancelLink` or `Close`; `LinkWithPassword`: 200 → credential then `linked`, 401 → stays `unlinked` with the `*api.Error`, compat refusal → `incompatible`; `SessionEnded` (each of its three codes) → refresh → `invalid_grant` → unlinked with `signed_out` or `account_disabled`, → success → stays `linked`, two concurrent calls → one refresh, another code → no request; `HelloRefused` with `client_outdated` → `incompatible`/`update_app`, with `protocol_unsupported` and no `serverMax` → a `/info` request (Recheck) decides; **verification URIs** (§11.2): `StartLink` → `ErrBadResponse`, the state unchanged and nothing to open, when either URI is `file:///C:/x`, `ms-settings:display`, `search-ms:query=x`, `javascript:alert(1)`, a UNC path (`\\host\share\x` and `file://host/share/x`), `https` on another host, `http` on a non-loopback host, carries userinfo or a fragment, has the path `/link/` or `/Link`, an extra query parameter (`code=…&next=…`), or a code that differs from `userCode`; accepted with an upper-case host or an explicit `:443`, and `LinkState` then holds Go's canonical strings, not the server's; `Recheck` back to `linked`; daily refresh under `synctest`; `Unlink` offline → `ErrRevokeNotConfirmed` and the credential deleted; redirects are not followed; the `User-Agent` is `isshoni-desktop/<version>`; a TLS failure is `ErrNetwork` with a reachable `*tls.CertificateVerificationError`; `Servers.Add` stores `info.server.publicUrl` normalized (a server reached as `alt.example` that calls itself `watch.example.com` → entry and credential key `https://watch.example.com`, `RequestedOrigin` kept), an adopted origin already listed → `Existing` and no second entry; `ForgetAll` with 20 servers, half of them hanging: returns within 6 s, every credential gone, users and devices cleared; `servers.json` round trip, the 20 cap, a corrupt file renamed `.bad` | Mac, CI ubuntu, CI windows (06 windows-desktop) |
-| `internal/client/credstore` | file and memory stores: put/get/delete/list, 0600, atomic replace, a corrupt file; the Windows store with a random test prefix: put/get/overwrite/delete/list, the 2,560-byte check, a missing target → `ErrNotFound`; `ERROR_NO_SUCH_LOGON_SESSION` → `t.Skip` with a message (the manual check M-DA-1 covers it) | Mac, CI ubuntu (file); CI windows (06 windows-desktop; Credential Manager) |
+| `internal/client/deviceauth` | against an `httptest` server with scripted answers: the poll loop (pending, `slow_down` with and without `params.interval`, denied, expired, network errors until `ExpiresAt`); the credential is written before `linked` and before a refreshed token is returned (an ordering fake); `save_failed`; single flight (100 concurrent `AccessToken(ctx, false)` calls → one refresh); retries keep the `exchangeId` and stop on `invalid_grant`; `AccessToken(ctx, true)` refreshes even with a fresh cached token, a second forced call within 10 s returns that refresh's token without a request, one after 10 s refreshes again; **errors**: no credential → `errors.Is(err, ErrNotLinked)` and the chain has `RelinkRequired() == true`; the call whose refresh gets `invalid_grant` returns the same, after the store is empty; `ErrIncompatible` has `UpdateRequired() == true`; `ErrOffline` has neither method and unwraps to its network cause; `*deviceauth.Manager` satisfies `core.Auth` (a compile-time assertion in a test file); `Link` returns once `linking` is reached and polling continues after its ctx is cancelled, until `CancelLink` or `Close`; `LinkWithPassword`: 200 → credential then `linked`, 401 → stays `unlinked` with the `*api.Error`, compat refusal → `incompatible`; `SessionEnded` (each of its three codes) → refresh → `invalid_grant` → unlinked with `signed_out` or `account_disabled`, → success → stays `linked`, two concurrent calls → one refresh, another code → no request; `HelloRefused` with `client_outdated` → `incompatible`/`update_app`, with `protocol_unsupported` and no `serverMax` → a `/info` request (Recheck) decides; **verification URIs** (§11.2): `StartLink` → `ErrBadResponse`, the state unchanged and nothing to open, when either URI is `file:///C:/x`, `ms-settings:display`, `search-ms:query=x`, `javascript:alert(1)`, a UNC path (`\\host\share\x` and `file://host/share/x`), `https` on another host, `http` on a non-loopback host, carries userinfo or a fragment, has the path `/link/` or `/Link`, an extra query parameter (`code=…&next=…`), or a code that differs from `userCode`; accepted with an upper-case host or an explicit `:443`, and `LinkState` then holds Go's canonical strings, not the server's; `Recheck` back to `linked`; daily refresh under `synctest`; `Unlink` offline → `ErrRevokeNotConfirmed` and the credential deleted; redirects are not followed; the `User-Agent` is `isshoni-desktop/<version>`; a TLS failure is `ErrNetwork` with a reachable `*tls.CertificateVerificationError`; `Servers.Add` stores `info.server.publicUrl` normalized (a server reached as `alt.example` that calls itself `watch.example.com` → entry and credential key `https://watch.example.com`, `RequestedOrigin` kept), an adopted origin already listed → `Existing` and no second entry; `ForgetAll` with 20 servers, half of them hanging: returns within 6 s, every credential gone, users and devices cleared; `servers.json` round trip, the 20 cap, a corrupt file renamed `.bad` | Mac, CI ubuntu, CI windows (06 windows-go) |
+| `internal/client/credstore` | file and memory stores: put/get/delete/list, 0600, atomic replace, a corrupt file; the Windows store with a random test prefix: put/get/overwrite/delete/list, the 2,560-byte check, a missing target → `ErrNotFound`; `ERROR_NO_SUCH_LOGON_SESSION` → `t.Skip` with a message (the manual check M-DA-1 covers it) | Mac, CI ubuntu (file); CI windows (06 windows-go; Credential Manager) |
 | `internal/client/deeplink` | `testdata/links.json`; `NormalizeOrigin` table (paths, ports, userinfo, IDN, loopback http only when allowed); `FuzzParse` (never panics; an accepted link always rebuilds with `Build` to an equal `Link`) | Mac, CI ubuntu |
 | `internal/client/compat` | §13.2's table, both functions, dev versions, a floor that isn't SemVer; `FromError` for `protocol_unsupported` with `serverMax` absent and with 0 → `(Check{}, false)` (M1's `errorForClose` case), with `serverMax` 1 and `MinProtocol` 1 → `update_app`/`protocol_too_new`; `client_outdated` → `update_app`/`min_client_version`; nil and other codes → `false` | Mac, CI ubuntu |
 
-Windows: 06's Windows Go test job (`windows-desktop`, windows-2025) runs `go test -race ./internal/client/...` on every
-PR that touches them; 06's `lint-go` cross-lints with `GOOS=windows`. This document adds no CI step of its own.
+Windows: 06's Windows Go test job (`windows-go`, windows-2025) runs `go test -race ./internal/client/...` (MinGW) and
+then `CGO_ENABLED=0 go test ./internal/client/...` (the shipped mode) on every PR that touches them; 06's `lint-go`
+cross-lints with `GOOS=windows`. This document adds no CI step of its own.
 
 ### 16.2 Integration (Go, in-process server)
 
@@ -1908,10 +1910,11 @@ Recorded in the PR of slice DA13; they don't block merges (README §4 Testing).
   running: the first time "Add server <host>?" appears (after removing the server), later the Lounge opens; no share
   starts.
 - **M-DA-6 (Win10 22H2)**: M-DA-1 and M-DA-2.
-- **M-DA-7**: uninstall with "remove my data" (06's `/PURGE`, which runs `isshoni.exe --purge-data`): the Credential
-  Manager entry is gone and the device disappears from the Devices page. Repeat with the network cable unplugged: the
-  uninstaller still finishes within its 30 s and the entry is gone (the device then stays on the Devices page until
-  removed there or expired).
+- **M-DA-7**: uninstall keeping the data (every uninstall runs `isshoni.exe --forget-credentials`), then reinstall,
+  link and uninstall with "remove my data" (06's `/PURGE`, which runs `isshoni.exe --purge-data`): each time the
+  Credential Manager entry is gone and the device disappears from the Devices page. Repeat with the network cable
+  unplugged: the uninstaller still finishes within its 30 s and the entry is gone (the device then stays on the Devices
+  page until removed there or expired).
 - **M-DA-8**: with the app linked and a room open, set the admin's `minClientVersion` above the app's version: the app
   shows "Update the app"; "Open in browser" opens that room in the default browser; "Update now" shows one of §13.3's
   states (on a build without update keys: "This build doesn't update itself" and the Download-page link, which opens
@@ -1956,7 +1959,8 @@ Recorded in the PR of slice DA13; they don't block merges (README §4 Testing).
     `AuthService` contract with `AuthState` JSON and the `isshoni:auth.state` event (§11.7), including the rows
     `AccessToken(origin, force)`, `SessionEnded(origin, code)`, `HelloRefused(origin, error)` (each answering only
     for the active server's origin) and `LinkWithPassword(username, password)`;
-    `Servers.ForgetAll` behind `isshoni.exe --purge-data` (06's "DeleteAll");
+    `Servers.ForgetAll` behind `isshoni.exe --forget-credentials` (every uninstall) and `--purge-data` (purge) (06's
+    "DeleteAll");
   - `deviceauth.AppInfo`, `deviceauth.Client` (with `PasswordLink`), `DefaultHTTPClient`, `ErrNetwork` (wrapping the
     transport cause with `%w: %w`), `ErrBadResponse` (also for verification URIs that fail §11.2's check);
   - `LinkState.VerificationURI` and `VerificationURIComplete` are always Go's canonical `origin + "/link"` and
@@ -2017,9 +2021,9 @@ Recorded in the PR of slice DA13; they don't block merges (README §4 Testing).
   when `State().Status` is `linked` afterwards.
 - `DesktopPlatform` follows §11.8; the desktop router leaves out `/link`; `versionActions().openInBrowser` opens
   `origin + "/r/" + <the current room>` (or `origin + "/"`), changed from `serverOrigin` only.
-- Wails single-instance forwarding of `--open-url <url>`, and parsing the `--purge-data` flag (06-windows-release
-  owns the command line; §11.7, §12.2); the app's config directory (`os.UserConfigDir()/isshoni`) passed as
-  `ServersOptions.Dir`.
+- Wails single-instance forwarding of `--open-url <url>`, and parsing the `--forget-credentials` and `--purge-data`
+  flags (06-windows-release owns the command line; §11.7, §12.2); the app's data root (`%LOCALAPPDATA%\isshoni`)
+  passed as `ServersOptions.Dir`.
 - 03's CSP allows `connect-src` to the active server's https and wss origin (03 §5.3); 02 needs nothing more, because
   the SPA calls only the active server and Go makes every other request. In dev and e2e builds with an http loopback
   server (`AllowInsecureLoopback`), 03 uses `http://` and `ws://` for that host.
@@ -2034,13 +2038,15 @@ Recorded in the PR of slice DA13; they don't block merges (README §4 Testing).
 
 **docs/m2/06-windows-release.md**
 - The NSIS installer registers `isshoni://` with `--open-url "%1"` (§12.2), and the uninstaller runs
-  `isshoni.exe --purge-data` (calling `Servers.ForgetAll`, which 06 calls "DeleteAll") before removing files.
+  `isshoni.exe --forget-credentials` (every uninstall) or `--purge-data` (`/PURGE`), both calling `Servers.ForgetAll`
+  (which 06 calls "DeleteAll"), before removing files.
 - The updater backs "Update now" (§13.3) with `CheckNow`, `Status` (`State`, `PolicyOff`, `ErrorCode`, `Progress`)
   and `Apply`; it compares versions with `internal/version`.
 - Release notes flag schema version 2 (06-windows-release.md §11.8, §4.1 here).
-- Its Windows Go test job (`windows-desktop`, windows-2025) runs `go test -race ./internal/client/...` per PR, and
-  `lint-go` cross-lints `GOOS=windows`; its nightly `compat-servers` job runs `TestCompatServerDeviceFlow` (§13.4) with
-  `ISSHONI_COMPAT_SERVER_URL` and `ISSHONI_COMPAT_ADMIN_FILE` (`{origin, username, password}`).
+- Its Windows Go test job (`windows-go`, windows-2025) runs `go test -race ./internal/client/...` (MinGW), then
+  `CGO_ENABLED=0`, per PR, and `lint-go` cross-lints `GOOS=windows`; its nightly `compat-servers` job runs
+  `TestCompatServerDeviceFlow` (§13.4) with `ISSHONI_COMPAT_SERVER_URL` and `ISSHONI_COMPAT_ADMIN_FILE` (`{origin,
+  username, password}`).
 - Its R14: the `/privacy#desktop` section takes §9's "On the PC" facts (and drops "which come later"), and
   `docsanchors_test.go` gains `/troubleshooting#desktop-linking`.
 
@@ -2070,8 +2076,8 @@ DA1 and can run beside them; DA13 waits for 03-desktop-app's and 06-windows-rele
 | DA6 | **Hub and wiring**: the pre-auth refund; `signal.Identity.DeviceName`; `wire.go`: `site.ExtraOrigins = protocol.DesktopOrigins()` after `config.NewSite` (the hub's `AllowedOrigins` line stays as built) and `httpapi.Deps.DesktopOrigins = s.site.ExtraOrigins`, `AuthenticateBearer` → `AuthenticateBearerToken`, `identityOf` and `Revalidate` copying `DeviceName` (a change applied like a changed `Name`); `itest/device_helpers_test.go` with `linkDevice`; `itest/device_test.go` cases 1–3 and 5 with `linkDevice` and raw HTTP in place of the manager (the manager comes in DA11), and cases 9–12 (raw HTTP only) | `internal/server/signal`, `internal/server` (wire.go), `internal/server/itest` | §16.1 signal row; §16.2 cases 1–3, 5 through `linkDevice`, and 9–12; `goleak` clean | DA5 | Mac, CI ubuntu | 1 |
 | DA7 | **Web**: `web/src/link/`, the router line, DevicesPage app rows, `lib/appLink.ts`, i18n (`lazy/link.en.json`, two `errors.*` keys), Vitest, `web/e2e/link.spec.ts`, `a11y.spec` states | `web/src/link`, `web/src/app/router.tsx` (one line), `web/src/account`, `web/src/lib/appLink.ts`, `web/src/i18n`, `web/e2e` | §16.3; `task lint typecheck test e2e` green; initial JS stays under 05's 200 KB budget (the page is lazy) | DA6 | Mac, CI ubuntu | 2 |
 | DA8 | **Client compat and deep links**: `internal/client/compat` (with the undecided `FromError` case), `internal/client/deeplink` with `links.json` and the fuzz target | `internal/client/compat`, `internal/client/deeplink` | §16.1 compat and deeplink rows; 06's `lint-go` (`GOOS=windows`) green | DA1 | Mac, CI ubuntu | 1 |
-| DA9 | **Credential store**: interface, memory, file (non-Windows), Windows Credential Manager | `internal/client/credstore` | §16.1 credstore row on ubuntu and on 06's `windows-desktop` job | — | Mac, CI ubuntu, CI windows (06 windows-desktop) | 1.5 |
-| DA10 | **deviceauth**: `Client` (with `PasswordLink`, `ErrNetwork` wrapping), `Manager` (link with its own polling context, `LinkWithPassword`, refresh, rotation, retries, `AccessToken(ctx, forceRefresh)`, the errors with `RelinkRequired`/`UpdateRequired`, `SessionEnded`, `HelloRefused`, `SetIncompatible`, `Recheck`, `Unlink`, daily refresh), `Servers` and `servers.json` (`Add` adopting `publicUrl`), concurrent `ForgetAll` | `internal/client/deviceauth` | §16.1 deviceauth row (httptest server, memory store, synctest) | DA8, DA9 | Mac, CI ubuntu, CI windows (06 windows-desktop) | 3 |
+| DA9 | **Credential store**: interface, memory, file (non-Windows), Windows Credential Manager | `internal/client/credstore` | §16.1 credstore row on ubuntu and on 06's `windows-go` job | — | Mac, CI ubuntu, CI windows (06 windows-go) | 1.5 |
+| DA10 | **deviceauth**: `Client` (with `PasswordLink`, `ErrNetwork` wrapping), `Manager` (link with its own polling context, `LinkWithPassword`, refresh, rotation, retries, `AccessToken(ctx, forceRefresh)`, the errors with `RelinkRequired`/`UpdateRequired`, `SessionEnded`, `HelloRefused`, `SetIncompatible`, `Recheck`, `Unlink`, daily refresh), `Servers` and `servers.json` (`Add` adopting `publicUrl`), concurrent `ForgetAll` | `internal/client/deviceauth` | §16.1 deviceauth row (httptest server, memory store, synctest) | DA8, DA9 | Mac, CI ubuntu, CI windows (06 windows-go) | 3 |
 | DA11 | **End to end**: `itest/device_helpers_test.go` gains `linkedManager`; `itest/device_test.go` cases 1–8 with the real `Manager` and 01's Go signal client; `internal/client/deviceauth/compat_server_test.go` (`TestCompatServerDeviceFlow`, §13.4) | `internal/server/itest`, `internal/client/deviceauth` (test file) | §16.2 complete; `goleak` clean; `TestCompatServerDeviceFlow` skips without `ISSHONI_COMPAT_SERVER_URL` and passes against a locally started current server with an admin file | DA6, DA10 | Mac, CI ubuntu; nightly `compat-servers` (06) | 1.5 |
 | DA12 | **Docs and write-back**: `docs/privacy.md` server-side device rows only (§9's table; the "On the PC" facts and the "which come later" edit are 06's R14 in `#desktop`), `docs/security.md` credential threat model, `docs/troubleshooting.md` "Linking the app" with the fixed anchor `#desktop-linking` (the proxy limit, worded for a friend who sees the server open in the browser but the app say "Can't reach the server": the browser and the app's window use the Windows proxy settings, the app's own connection doesn't yet, and setting `HTTPS_PROXY` for the user is the workaround; "code expired", "signed out", "wrong password", Credential Manager; 06 R14 adds the anchor to `docsanchors_test.go` so the app may link to it), pointers from the 03 sections named at the top to this document, and in M1 03 §7.12 the bearer line becomes "works on every user endpoint and on the WebSocket; admin routes are cookie-only (02 §6.4)" | `docs/privacy.md`, `docs/security.md`, `docs/troubleshooting.md`, `docs/m1/03-accounts-and-store.md` | `task site:build` green; the privacy page's device rows match §9 | DA5 | Mac, CI ubuntu | 0.5 |
 | DA13 | **Manual checks** M-DA-1 to M-DA-9 on Win11 and Win10, recorded in the PR | — | every check passes or has an issue filed | DA11, DA12, 03-desktop-app's first-run wizard, password form and `AuthService`, 06-windows-release's installer and updater | owner's PC | 0.5 |
