@@ -728,8 +728,12 @@ func TestCheckKeys(t *testing.T) {
 	}
 }
 
+// noUpdateKeysNote is checkKeys' note while deploy/keys/update_signers does not exist.
+const noUpdateKeysNote = "skipped the update keys: deploy/keys/update_signers does not exist yet"
+
 // assertCheckKeys runs checkKeys on a tree of files. wantNote is a substring of the note ("" means no note), and
-// wantErr the substrings of the error (nil means no error).
+// wantErr the substrings of the error (nil means no error). A tree without deploy/keys/update_signers must get
+// noUpdateKeysNote too, which wantNote need not repeat.
 func assertCheckKeys(t *testing.T, files map[string]string, wantNote string, wantErr []string) {
 	t.Helper()
 	note, err := checkKeys(writeTree(t, files))
@@ -745,7 +749,14 @@ func assertCheckKeys(t *testing.T, files map[string]string, wantNote string, wan
 			}
 		}
 	}
-	if wantNote == "" && note != "" {
+	rest := note
+	if _, ok := files["deploy/keys/update_signers"]; !ok {
+		if !strings.Contains(note, noUpdateKeysNote) {
+			t.Errorf("note %q does not contain %q", note, noUpdateKeysNote)
+		}
+		rest = strings.TrimSuffix(strings.TrimSuffix(note, noUpdateKeysNote), "; ")
+	}
+	if wantNote == "" && rest != "" {
 		t.Errorf("unexpected note %q", note)
 	}
 	if !strings.Contains(note, wantNote) {

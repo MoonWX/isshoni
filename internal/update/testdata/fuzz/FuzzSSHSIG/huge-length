@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAf////8=\n-----END SSH SIGNATURE-----\n")

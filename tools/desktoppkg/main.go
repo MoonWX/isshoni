@@ -20,7 +20,9 @@
 //	stage [-release]                copy the install tree into dist-desktop/stage/ (06 §6.2; slices WA67, WA78)
 //	nsis                            the defines passed to makensis (06 §6.2; slice WA67)
 //	check                           the stage and installer source rules (06 §6.10, §9.3; slice WA67)
-//	manifest                        write isshoni-desktop-update.json (06 §8.2; slice WA25)
+//	manifest -version V -installer FILE [-date T] [-out FILE]
+//	                                write the update manifest isshoni-desktop-update.json from the installer, the
+//	                                version and deploy/desktop/min-version, deploy/keys/update_revoked (06 §8.2)
 //
 // A command whose slice has not landed yet fails with "not implemented yet".
 //
@@ -78,7 +80,7 @@ var commands = []command{
 	{"stage", "[-release] (slices WA67, WA78)", runStage},
 	{"nsis", "(slice WA67)", runNSIS},
 	{"check", "(slice WA67)", runCheck},
-	{"manifest", "(slice WA25)", runManifest},
+	{"manifest", "-version V -installer FILE [-date T] [-out FILE]", runManifest},
 }
 
 func main() {
