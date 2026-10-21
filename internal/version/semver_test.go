@@ -137,14 +137,10 @@ func TestCompare(t *testing.T) {
 }
 
 // FuzzCompare: Parse never panics, Compare is antisymmetric and reflexive on SemVer input, and Below agrees with
-// Compare whenever both are SemVer.
+// Compare whenever both are SemVer. The seeds are in testdata/fuzz/FuzzCompare (M2 02 §16): a release against its
+// pre-release, a "v" prefix and build metadata, a dev build, numeric against alphanumeric identifiers, a leading zero,
+// input that isn't SemVer, and pre-release numbers past uint64.
 func FuzzCompare(f *testing.F) {
-	for _, s := range [][2]string{
-		{"1.0.0", "1.0.0-rc.1"}, {"v0.2.0", "0.2.0+x"}, {"0.0.0-dev+abc", "0.1.0"}, {"1.0.0-a.1", "1.0.0-a.b"},
-		{"01.0.0", "1.0.0"}, {"", "latest"}, {"1.0.0-99999999999999999999", "1.0.0-100000000000000000000"},
-	} {
-		f.Add(s[0], s[1])
-	}
 	f.Fuzz(func(t *testing.T, a, b string) {
 		va, errA := Parse(a)
 		vb, errB := Parse(b)

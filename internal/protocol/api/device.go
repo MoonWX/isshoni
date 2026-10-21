@@ -10,7 +10,8 @@ import (
 // /device/password (#48) and PATCH /api/v1/me/devices/{id} (#52), and the user-code helpers. POST /device/revoke (#49)
 // takes and returns Empty. Device codes, access and refresh tokens, exchange ids and the password of the link form
 // are redacted in fmt and log/slog (secret.go). The user code and the device name are not secrets, but they are never
-// logged either (README §4 Logging): callers leave them out of log lines.
+// logged either (README §4 Logging): the DTOs that redact a secret hide them too (DeviceCodeResponse,
+// DeviceTokenResponse, DevicePasswordRequest), and callers leave the others out of log lines.
 
 // UserCodeAlphabet is the alphabet of user codes (M2 02 §3, RFC 8628 §6.1): 20 consonants, no vowels (so no words) and
 // no digits (so no 0/O or 1/I mix-ups). The server draws 8 symbols by rejection sampling over random bytes.
@@ -31,9 +32,9 @@ type DeviceCodeRequest struct {
 // of VerificationURIComplete, and polls /device/token with DeviceCode every Interval seconds.
 type DeviceCodeResponse struct {
 	DeviceCode              string `json:"deviceCode"`              // 43 base64url characters; redacted in fmt/slog
-	UserCode                string `json:"userCode"`                // formatted, "WDJB-MJHT"
+	UserCode                string `json:"userCode"`                // formatted, "WDJB-MJHT"; redacted in fmt/slog
 	VerificationURI         string `json:"verificationUri"`         // "<origin>/link"
-	VerificationURIComplete string `json:"verificationUriComplete"` // "<origin>/link?code=WDJB-MJHT"
+	VerificationURIComplete string `json:"verificationUriComplete"` // "<origin>/link?code=WDJB-MJHT"; redacted
 	ExpiresIn               int    `json:"expiresIn"`               // seconds (600)
 	Interval                int    `json:"interval"`                // seconds between polls (5)
 }
@@ -64,8 +65,8 @@ type DeviceTokenResponse struct {
 	ExpiresIn        int       `json:"expiresIn"`        // the access token's lifetime in seconds (900)
 	RefreshToken     string    `json:"refreshToken"`     // "isr_" + 43; redacted
 	RefreshExpiresIn int       `json:"refreshExpiresIn"` // the refresh token's lifetime in seconds (7776000, 90 days)
-	Device           DeviceRef `json:"device"`
-	User             User      `json:"user"` // {id, username, role}
+	Device           DeviceRef `json:"device"`           // its name redacted in fmt/slog
+	User             User      `json:"user"`             // {id, username, role}
 }
 
 // DeviceRef names a device: DeviceTokenResponse.Device.
@@ -118,7 +119,7 @@ type DevicePasswordRequest struct {
 	Username   string `json:"username"`
 	Password   string `json:"password"`   // redacted in fmt/slog
 	ClientKind string `json:"clientKind"` // as DeviceCodeRequest
-	DeviceName string `json:"deviceName"`
+	DeviceName string `json:"deviceName"` // redacted in fmt/slog
 	OS         string `json:"os"`
 	AppVersion string `json:"appVersion"`
 }

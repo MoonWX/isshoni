@@ -111,9 +111,9 @@ export interface DeviceCodeRequest {
  */
 export interface DeviceCodeResponse {
   deviceCode: string; // 43 base64url characters; redacted in fmt/slog
-  userCode: string; // formatted, "WDJB-MJHT"
+  userCode: string; // formatted, "WDJB-MJHT"; redacted in fmt/slog
   verificationUri: string; // "<origin>/link"
-  verificationUriComplete: string; // "<origin>/link?code=WDJB-MJHT"
+  verificationUriComplete: string; // "<origin>/link?code=WDJB-MJHT"; redacted
   expiresIn: number /* int */; // seconds (600)
   interval: number /* int */; // seconds between polls (5)
 }
@@ -144,7 +144,7 @@ export interface DeviceTokenResponse {
   expiresIn: number /* int */; // the access token's lifetime in seconds (900)
   refreshToken: string; // "isr_" + 43; redacted
   refreshExpiresIn: number /* int */; // the refresh token's lifetime in seconds (7776000, 90 days)
-  device: DeviceRef;
+  device: DeviceRef; // its name redacted in fmt/slog
   user: User; // {id, username, role}
 }
 /**
@@ -201,7 +201,7 @@ export interface DevicePasswordRequest {
   username: string;
   password: string; // redacted in fmt/slog
   clientKind: string; // as DeviceCodeRequest
-  deviceName: string;
+  deviceName: string; // redacted in fmt/slog
   os: string;
   appVersion: string;
 }

@@ -21,6 +21,12 @@ import (
 // logs only push_host); a link whose fragment is a one-time token (CreateInviteResponse.URL, ResetLink.URL) keeps
 // everything before the fragment.
 //
+// User codes and device names are not secrets, but they are never logged either (M2 README §4 Logging, M2 02 §3). A
+// device DTO that redacts anyway hides them too, so logging one never shows them: DeviceCodeResponse's user code and
+// the verification URI that carries it, DeviceTokenResponse's device name and DevicePasswordRequest's device name
+// become "[redacted]". The device DTOs without these methods (DeviceLookup, DeviceDecideRequest, ...) are left out of
+// log lines by their callers.
+//
 // A new field that carries a secret needs its type's redact method updated. TestSecretFieldsRedacted fails on a field
 // whose JSON name marks it as one (password, token, endpoint, offer, answer, auth, deviceCode, exchangeId) in a type
 // without these methods.
@@ -329,13 +335,17 @@ func (r DeviceCodeResponse) redact() any {
 	type plain DeviceCodeResponse
 	p := plain(r)
 	p.DeviceCode = secret(p.DeviceCode)
+	p.UserCode = secret(p.UserCode)
+	p.VerificationURIComplete = secret(p.VerificationURIComplete) // "<origin>/link?code=<user code>"
 	return p
 }
 
-// Format implements fmt.Formatter: the device code is redacted for every verb.
+// Format implements fmt.Formatter: the device code, the user code and the verification URI that carries it are
+// redacted for every verb.
 func (r DeviceCodeResponse) Format(f fmt.State, verb rune) { formatRedacted(f, verb, r, r.redact()) }
 
-// LogValue implements slog.LogValuer: the device code is redacted.
+// LogValue implements slog.LogValuer: the device code, the user code and the verification URI that carries it are
+// redacted.
 func (r DeviceCodeResponse) LogValue() slog.Value { return logGroup(r.redact()) }
 
 func (r DeviceTokenRequest) redact() any {
@@ -359,24 +369,26 @@ func (r DeviceTokenResponse) redact() any {
 	p := plain(r)
 	p.AccessToken = secret(p.AccessToken)
 	p.RefreshToken = secret(p.RefreshToken)
+	p.Device.Name = secret(p.Device.Name)
 	return p
 }
 
-// Format implements fmt.Formatter: both tokens are redacted for every verb.
+// Format implements fmt.Formatter: both tokens and the device name are redacted for every verb.
 func (r DeviceTokenResponse) Format(f fmt.State, verb rune) { formatRedacted(f, verb, r, r.redact()) }
 
-// LogValue implements slog.LogValuer: both tokens are redacted.
+// LogValue implements slog.LogValuer: both tokens and the device name are redacted.
 func (r DeviceTokenResponse) LogValue() slog.Value { return logGroup(r.redact()) }
 
 func (r DevicePasswordRequest) redact() any {
 	type plain DevicePasswordRequest
 	p := plain(r)
 	p.Password = secret(p.Password)
+	p.DeviceName = secret(p.DeviceName)
 	return p
 }
 
-// Format implements fmt.Formatter: the password is redacted for every verb.
+// Format implements fmt.Formatter: the password and the device name are redacted for every verb.
 func (r DevicePasswordRequest) Format(f fmt.State, verb rune) { formatRedacted(f, verb, r, r.redact()) }
 
-// LogValue implements slog.LogValuer: the password is redacted.
+// LogValue implements slog.LogValuer: the password and the device name are redacted.
 func (r DevicePasswordRequest) LogValue() slog.Value { return logGroup(r.redact()) }

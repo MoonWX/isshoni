@@ -97,13 +97,13 @@ func TestUserCodeAlphabet(t *testing.T) {
 }
 
 // FuzzNormalizeUserCode: never panics; the output is always 8 alphabet letters or invalid; a valid result is the
-// input upper-cased without its spaces, tabs and dashes, normalizes to itself and survives FormatUserCode.
+// input upper-cased without its spaces, tabs and dashes, normalizes to itself and survives FormatUserCode. The seeds
+// are 02 §3's table and testdata/fuzz/FuzzNormalizeUserCode (M2 02 §16): tabs and lower case, a no-break space, nine
+// letters, invalid UTF-8 and the table's harder rows.
 func FuzzNormalizeUserCode(f *testing.F) {
 	for _, c := range userCodeCases {
 		f.Add(c.in)
 	}
-	f.Add("\tbcdf-ghjk ")
-	f.Add("WDJB MJHT")
 	f.Fuzz(func(t *testing.T, s string) {
 		n, ok := NormalizeUserCode(s)
 		if !ok {

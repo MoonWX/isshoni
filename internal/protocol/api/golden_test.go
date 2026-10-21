@@ -38,8 +38,8 @@ func at(s string) time.Time {
 
 func ptr[T any](v T) *T { return &v }
 
-// Device-flow secrets of the samples (M2 02 §3): shape-valid values (43 or 22 canonical base64url characters), so
-// tests of later packages may reuse them.
+// Device-flow secrets of the samples (M2 02 §3): shape-valid values (43 or 22 canonical base64url characters,
+// decoding to 32 or 16 bytes), which 02 §3's shape checks accept; later packages' tests may copy them.
 //
 //nolint:gosec // G101 false positive: made-up example values for the golden files.
 const (
