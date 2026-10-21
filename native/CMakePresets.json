@@ -1,0 +1,160 @@
+{
+  "version": 8,
+  "cmakeMinimumRequired": {"major": 3, "minor": 28, "patch": 0},
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "windows",
+      "hidden": true,
+      "inherits": "base",
+      "description": "MSVC x64 from the environment deploy/windows/msvc-env.ps1 sets up (toolset 14.44, SDK 10.0.26100)",
+      "condition": {"type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows"},
+      "architecture": {"value": "x64", "strategy": "external"},
+      "toolset": {"value": "host=x64", "strategy": "external"},
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "cl",
+        "CMAKE_CXX_COMPILER": "cl",
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static"
+      }
+    },
+    {
+      "name": "host",
+      "hidden": true,
+      "inherits": "base",
+      "description": "native/common and its tests on macOS or Linux (the default compiler, clang or gcc)",
+      "condition": {"type": "notEquals", "lhs": "${hostSystemName}", "rhs": "Windows"},
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "IM_BUILD_TESTS": "ON",
+        "VCPKG_MANIFEST_FEATURES": "tests"
+      }
+    },
+    {
+      "name": "host-clang",
+      "hidden": true,
+      "inherits": "host",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++"
+      }
+    },
+    {
+      "name": "win-x64-release",
+      "inherits": "windows",
+      "displayName": "Windows x64 release",
+      "description": "The shipped isshoni-media.dll and its PDB: no test hooks, no vcpkg features (libopus and speexdsp only)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "IM_TEST_HOOKS": "OFF",
+        "IM_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "win-x64-debug",
+      "inherits": "windows",
+      "displayName": "Windows x64 debug",
+      "description": "Development build with the unit tests",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "IM_TEST_HOOKS": "OFF",
+        "IM_BUILD_TESTS": "ON",
+        "VCPKG_MANIFEST_FEATURES": "tests"
+      }
+    },
+    {
+      "name": "win-x64-ci",
+      "inherits": "windows",
+      "displayName": "Windows x64 CI",
+      "description": "Test hooks and tests: the DLL CI's ctest and Go's Windows tests load (never shipped)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "IM_TEST_HOOKS": "ON",
+        "IM_BUILD_TESTS": "ON",
+        "VCPKG_MANIFEST_FEATURES": "tests"
+      }
+    },
+    {
+      "name": "win-x64-asan",
+      "inherits": "windows",
+      "displayName": "Windows x64 AddressSanitizer",
+      "description": "Debug with /fsanitize=address: the owner's PC and the nightly",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "IM_SANITIZE": "address",
+        "IM_TEST_HOOKS": "ON",
+        "IM_BUILD_TESTS": "ON",
+        "VCPKG_MANIFEST_FEATURES": "tests"
+      }
+    },
+    {
+      "name": "host-debug",
+      "inherits": "host",
+      "displayName": "Host debug",
+      "description": "native/common and its tests, Debug (task native:test)"
+    },
+    {
+      "name": "host-tsan",
+      "inherits": "host-clang",
+      "displayName": "Host ThreadSanitizer",
+      "description": "host-debug with clang and ThreadSanitizer",
+      "cacheVariables": {
+        "IM_SANITIZE": "thread"
+      }
+    },
+    {
+      "name": "host-asan",
+      "inherits": "host-clang",
+      "displayName": "Host AddressSanitizer",
+      "description": "host-debug with clang, AddressSanitizer and UndefinedBehaviorSanitizer",
+      "cacheVariables": {
+        "IM_SANITIZE": "address,undefined"
+      }
+    },
+    {
+      "name": "host-fuzz",
+      "inherits": "host-clang",
+      "displayName": "Host fuzzing",
+      "description": "The libFuzzer targets with AddressSanitizer (needs a clang with libFuzzer: not Apple's)",
+      "cacheVariables": {
+        "IM_BUILD_TESTS": "OFF",
+        "IM_BUILD_FUZZ": "ON",
+        "IM_SANITIZE": "address"
+      }
+    }
+  ],
+  "buildPresets": [
+    {"name": "win-x64-release", "configurePreset": "win-x64-release"},
+    {"name": "win-x64-debug", "configurePreset": "win-x64-debug"},
+    {"name": "win-x64-ci", "configurePreset": "win-x64-ci"},
+    {"name": "win-x64-asan", "configurePreset": "win-x64-asan"},
+    {"name": "host-debug", "configurePreset": "host-debug"},
+    {"name": "host-tsan", "configurePreset": "host-tsan"},
+    {"name": "host-asan", "configurePreset": "host-asan"},
+    {"name": "host-fuzz", "configurePreset": "host-fuzz"}
+  ],
+  "testPresets": [
+    {
+      "name": "test-base",
+      "hidden": true,
+      "output": {"outputOnFailure": true},
+      "execution": {"noTestsAction": "error", "timeout": 300}
+    },
+    {"name": "win-x64-release", "configurePreset": "win-x64-release", "output": {"outputOnFailure": true}},
+    {"name": "win-x64-debug", "inherits": "test-base", "configurePreset": "win-x64-debug"},
+    {"name": "win-x64-ci", "inherits": "test-base", "configurePreset": "win-x64-ci"},
+    {"name": "win-x64-asan", "inherits": "test-base", "configurePreset": "win-x64-asan"},
+    {"name": "host-debug", "inherits": "test-base", "configurePreset": "host-debug"},
+    {"name": "host-tsan", "inherits": "test-base", "configurePreset": "host-tsan"},
+    {"name": "host-asan", "inherits": "test-base", "configurePreset": "host-asan"},
+    {"name": "host-fuzz", "inherits": "test-base", "configurePreset": "host-fuzz"}
+  ]
+}

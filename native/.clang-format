@@ -1,0 +1,10 @@
+# Formatting of every C and C++ file under native/ (docs/m2/04-windows-engine.md §13.1): LLVM base with 120 columns,
+# the Go and TypeScript line length. CI checks the tracked files:
+#   git ls-files -- 'native/*.h' 'native/*.c' 'native/*.cpp' | xargs clang-format --dry-run --Werror
+# A preset's build tree (build/<preset>, with vcpkg's installed headers) holds a .clang-format that turns formatting
+# off (native/CMakeLists.txt writes it), so a plain native/**/*.{h,c,cpp} glob passes too.
+BasedOnStyle: LLVM
+ColumnLimit: 120
+Standard: c++20
+# The C ABI header is mostly tables of #defined constants: keep their values in one column.
+AlignConsecutiveMacros: Consecutive
