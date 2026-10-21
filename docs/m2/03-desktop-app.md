@@ -1541,7 +1541,7 @@ The relay kind `playback.stop` is reserved in 01 §8.14 and defined here; `playb
 {"type": "agent.send", "id": "41", "data": {"toRole": "full", "kind": "playback.stop",
   "payload": {"v": 1, "roomId": "lounge"}}}
 {"type": "agent.send", "id": "57", "data": {"to": "c_k3v9q2m7xw4pa8d1", "kind": "playback.state",
-  "payload": {"v": 1, "playing": true, "browser": "firefox", "os": "windows"}}}
+  "payload": {"playing": true, "browser": "firefox", "os": "windows"}}}
 ```
 
 **`playback.stop`**:
@@ -1563,7 +1563,9 @@ The relay kind `playback.stop` is reserved in 01 §8.14 and defined here; `playb
   kinds (01 §8.14).
 
 **`playback.state`** (05 §5.9: a browser that plays the user's isshoni viewer is kept out of the share):
-- **Payload**: `{v: 1, playing: bool, browser: client.browser, os: client.os}` (the sender's own M1 `ClientInfo`).
+- **Payload**: `{playing: bool, browser: client.browser, os: client.os}` (the sender's own M1 `ClientInfo`; 01's
+  `relay.PlaybackState`). It has no `v`: its only receiver, the core, ignores unknown fields, so a later field is
+  additive, and a change of meaning takes a new kind (README §3 item 21). `playback.stop` keeps its `v: 1`.
 - **Sender**: `rooms/handoff.ts` in every browser. Addressed with `to` (never `toRole`, 01 §11.11) to each online
   connection with `kind: desktop` in the tab's `user.connections`, whenever the tab's audible playback starts or stops
   (any subscription with audio on and an unmuted element), and again to a desktop connection that newly appears in
@@ -2273,7 +2275,7 @@ shows the encoder and the full layer's bitrate, and its windows stay out of the 
 | Export | Where | Consumers |
 |---|---|---|
 | Consumes 02's `protocol.DesktopAssetOriginWindows` (asset origin, W1) and `protocol.DesktopOrigins()`; adds nothing on the server | §5.7 | 02 (its wiring and W1 result for DA6) |
-| Relay kinds `playback.stop` (payload `{v: 1, roomId}`) and `playback.state` (payload `{v: 1, playing, browser, os}`), sender and receiver rules | §12.2 | 01 (relay registry: `KindPlaybackState`, `PlaybackState`), 05 (`SetViewerBrowser`), web client |
+| Relay kinds `playback.stop` (payload `{v: 1, roomId}`) and `playback.state` (payload `{playing, browser, os}`), sender and receiver rules | §12.2 | 01 (relay registry: `KindPlaybackState`, `PlaybackState`), 05 (`SetViewerBrowser`), web client |
 | Web client hello features `agent.relay`, `user.connections`; C2's features are exactly 01 §11.1's | §7.6, §9 | 01-client-core (server side of `user.connections`) |
 | Consumes 02 §12 (`deeplink.Parse/Build/NormalizeOrigin`, `appLinkFor`); command line `--open-url <url>` (the only link entry, with the injection rule), `--server <origin>`, `--autostart`, `--updated-from=<v>`, `--relaunched` | §13.1 | 02, 06 (scheme registration `"…\isshoni.exe" --open-url "%1"`, 06 §2.3) |
 | Process contract (§13.4): mutex `Local\io.isshoni.desktop.running`; `--version` JSON; `--self-check=<path>` JSON (06 §2.4's engine fields plus `spa.ok`; `ok` needs all); `--forget-credentials` (every uninstall: 02's `ForgetAll`, one 5 s budget); `--purge-data` (`/PURGE`: the same `ForgetAll`, then the data dir); `--update-now` (updatetest); `-Embedding`; no job object; PendingServer/PendingRoom read and delete; PendingRoom written before a start-time update; the initial `updates.check` from `UpdateChecks` | §13.4, §14.2 | 06 (installer, uninstaller, smoke, R4, R9) |
@@ -2326,13 +2328,16 @@ The shapes below are what this doc assumes; each sibling's own names win, and th
   {paused}`); `share.pause` on the server (`ShareUpdate.Paused`, `ShareStatus paused`, `sharerPaused` in the SFU).
 - `StartShare` joins the room and `Share.Stop` leaves it (01 §11.4, D12); the app sends no room or share messages of
   its own on C2.
-- The encoder fallback of D15 in the core.
+- No encoder fallback in the core: D15's fallback is the engine's (04 §9.8, README §3 item 16). The core raises the
+  `encoder_fallback` notice from `EventEncoderChanged`, never restarts a session for it, and ends the share on
+  `encoder_lost` from `Next` (§10.5).
 - The `media` contract of 01 §5 (`Pick(ctx, PickRequest)`, `ErrCancelled`, `Source{Kind, Name, PID, …}` with no self
   flag (a self pick is `invalid`/`self_window`), `Probe.Audio.Backend`, `ErrorCode` incl. `dependency`, `Error.Reason`
   and `EncoderInfo.Status`/`Reason` with 04's tokens, `ShareSnapshot.Minimized`), `native.Open` (01 §7.1), and
   `fake.NewEngine` with `Mode: fake.Decodable, SourceSize: [2]int{640, 360}` as the app's dev/e2e configuration (01
   §6.3 should name it).
-- `internal/protocol/relay` registers `KindPlaybackState` and `PlaybackState {V, Playing, Browser, OS}` (§12.2).
+- `internal/protocol/relay` registers `KindPlaybackState` and `PlaybackState {Playing, Browser, OS}` (§12.2; no `V`,
+  README §3 item 21).
 
 **02-device-auth.md**
 - Server: device flow endpoints (03 §12.4.7), bearer on REST and `/ws`, `protocol.DesktopOrigins()` and its wiring

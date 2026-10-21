@@ -72,7 +72,7 @@ The engine needs only the main window's `HWND`, which 03 passes in as the picker
 | Build root | CMake root, presets and vcpkg manifest at `native/` (not `native/windows/` as the plan's layout shows) | `common/` and the host test presets need one root; the Windows sources stay in `native/windows/` |
 | Go package | `internal/media/native` instead of `internal/media/engine_windows.go`; its public surface is 01's `media.Engine`/`media.Session` contract plus 05's `media.AudioController`, errors are always `*media.Error` | The binding logic and its tests compile on the Mac and Linux CI; 01's `internal/media` stays free of OS code; the core and 03 see one engine type and one error type |
 | Tools | `cmd/isshoni-enginetest` (Go) for probe, capture, bench, sessions and soak; glass-to-glass is 01's `tools/g2g` | One Go latency tool, cross-compiled from the Mac, that works with a single monitor (01 §12.2) |
-| Test builds | `IM_TEST_HOOKS` (fake encoder, failure injection, luma tap) only in the `win-x64-ci` preset. Shipped exceptions: the GPU test pattern, the test tone, 05's test exports (`im_test_render_tone`, `im_test_render_bursts`, `im_test_opus_decode`) and the audio test flags `IM_AUDIOF_TAP_PCM` and `IM_AUDIOF_TEST_FAIL_PROBE` | M1's rule that test code doesn't ship; these capture nothing, the smoke tool needs the pattern and tone, and 05's gate must run on the release DLL itself (its report's `dll.sha256` equals the release candidate's) |
+| Test builds | `IM_TEST_HOOKS` (fake encoder, failure injection, luma tap) only in the test presets `win-x64-ci` and `win-x64-asan` (which runs the same tests), never in a shipped build. Shipped exceptions: the GPU test pattern, the test tone, 05's test exports (`im_test_render_tone`, `im_test_render_bursts`, `im_test_opus_decode`) and the audio test flags `IM_AUDIOF_TAP_PCM` and `IM_AUDIOF_TEST_FAIL_PROBE` | M1's rule that test code doesn't ship; these capture nothing, the smoke tool needs the pattern and tone, and 05's gate must run on the release DLL itself (its report's `dll.sha256` equals the release candidate's) |
 | CRT | Static CRT (`/MT`) in `isshoni-media.dll`; FFmpeg built with `-MT` too | No VC++ redistributable on users' PCs (S1 did the same) |
 
 ## 3. From the spikes and M1 to this design
@@ -166,12 +166,25 @@ cmd/isshoni-enginetest/            Go tool (§14)                               
 
 ### 5.2 The header
 
+This is `native/include/isshoni_media.h` as README WA03 wrote it, formatted with `native/.clang-format`; the longer
+notes (audio modes, packet flags, events) sit in block comments above their defines, because clang-format breaks
+multi-line trailing comments on `#define` lines. The file is the source of truth: it changes only through the
+integrator with 04's and 05's owners (README §5, shared files), and this listing follows it.
+
 ```c
 /*
  * isshoni_media.h: the native media engine C ABI, v1.
  * Spec: docs/m2/04-windows-engine.md (audio block: docs/m2/05-windows-audio.md §4). Implemented by the Windows DLL
  * isshoni-media.dll (M2), the macOS engine (M3, static) and the Linux shim (M4, static).
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * Conventions (04 §5.1): plain C, fixed-width integers, booleans are uint32_t 0/1, enumerations are #defined
+ * constants on uint32_t fields. Every top-level struct starts with struct_size (the caller sets it to the sizeof it
+ * was built with; below the v1.0 size is IM_ERR_ABI); structs embedded by value or used as array elements have no
+ * struct_size and are frozen in v1. Strings are UTF-8 and NUL-terminated. JSON outputs follow snprintf: they return
+ * the full length n and write min(n, cap - 1) bytes and a NUL when cap > 0. The engine copies all input before a call
+ * returns. After a negative status, im_last_error on the same OS thread returns "<token>: detail" for logs.
+ * A minor ABI bump only appends fields, constants or functions (04 §5.5).
  */
 #ifndef ISSHONI_MEDIA_H
 #define ISSHONI_MEDIA_H
@@ -179,17 +192,17 @@ cmd/isshoni-enginetest/            Go tool (§14)                               
 #include <stdint.h>
 
 #if defined(_WIN32)
-#  if defined(IM_BUILDING_DLL)
-#    define IM_API __declspec(dllexport)
-#  elif defined(IM_STATIC)
-#    define IM_API
-#  else
-#    define IM_API __declspec(dllimport)
-#  endif
-#  define IM_CALL __cdecl
+#if defined(IM_BUILDING_DLL)
+#define IM_API __declspec(dllexport)
+#elif defined(IM_STATIC)
+#define IM_API
 #else
-#  define IM_API __attribute__((visibility("default")))
-#  define IM_CALL
+#define IM_API __declspec(dllimport)
+#endif
+#define IM_CALL __cdecl
+#else
+#define IM_API __attribute__((visibility("default")))
+#define IM_CALL
 #endif
 
 #ifdef __cplusplus
@@ -197,30 +210,30 @@ extern "C" {
 #endif
 
 /* ---------------------------------------------------------------- version */
-#define IM_ABI_MAJOR 1u
-#define IM_ABI_MINOR 0u
+#define IM_ABI_MAJOR   1u
+#define IM_ABI_MINOR   0u
 #define IM_ABI_VERSION ((IM_ABI_MAJOR << 16) | IM_ABI_MINOR)
 
 /* ---------------------------------------------------------------- status */
 typedef int32_t im_status;
-#define IM_OK                         0
-#define IM_TIMEOUT                    1   /* im_next_packet: nothing within timeout_ms */
-#define IM_ENDED                      2   /* im_next_packet: the session ended (its last event said why) */
-#define IM_ERR_INVALID_ARG           -1
-#define IM_ERR_BAD_STATE             -2   /* not initialized, stopped session, call in the wrong state */
-#define IM_ERR_ABI                   -3   /* struct_size too small, ABI major mismatch */
-#define IM_ERR_UNSUPPORTED_OS        -4
-#define IM_ERR_PERMISSION_DENIED     -5
-#define IM_ERR_AUDIO_DEVICE_CHANGED  -6   /* never returned by the Windows engine in M2 (S1 value kept) */
-#define IM_ERR_SOURCE_GONE           -7   /* also a consumed, expired or evicted pick token (token pick_expired) */
-#define IM_ERR_ENCODER_LOST          -8
-#define IM_ERR_NO_ENCODER            -9
-#define IM_ERR_CANCELLED            -10   /* the user closed the OS picker, or the pick timed out */
-#define IM_ERR_LIMIT                -11   /* too many sessions or picks */
-#define IM_ERR_DEPENDENCY           -12   /* FFmpeg or OpenH264 missing, wrong version or blocked */
-#define IM_ERR_AUDIO_UNAVAILABLE    -13   /* never returned in M2 on Windows (audio never fails a call, 05) */
+#define IM_OK                       0
+#define IM_TIMEOUT                  1 /* im_next_packet: nothing within timeout_ms */
+#define IM_ENDED                    2 /* im_next_packet: the session ended (its last event said why) */
+#define IM_ERR_INVALID_ARG          -1
+#define IM_ERR_BAD_STATE            -2 /* not initialized, stopped session, call in the wrong state */
+#define IM_ERR_ABI                  -3 /* struct_size too small, ABI major mismatch */
+#define IM_ERR_UNSUPPORTED_OS       -4
+#define IM_ERR_PERMISSION_DENIED    -5
+#define IM_ERR_AUDIO_DEVICE_CHANGED -6 /* never returned by the Windows engine in M2 (S1 value kept) */
+#define IM_ERR_SOURCE_GONE          -7 /* also a consumed, expired or evicted pick token (token pick_expired) */
+#define IM_ERR_ENCODER_LOST         -8
+#define IM_ERR_NO_ENCODER           -9
+#define IM_ERR_CANCELLED            -10 /* the user closed the OS picker, or the pick timed out */
+#define IM_ERR_LIMIT                -11 /* too many sessions or picks */
+#define IM_ERR_DEPENDENCY           -12 /* FFmpeg or OpenH264 missing, wrong version or blocked */
+#define IM_ERR_AUDIO_UNAVAILABLE    -13 /* never returned in M2 on Windows (audio never fails a call, 05) */
 #define IM_ERR_NOT_IMPLEMENTED      -14
-#define IM_ERR_TIMEOUT              -15   /* an engine thread didn't answer in time (§6.1) */
+#define IM_ERR_TIMEOUT              -15 /* an engine thread didn't answer in time (04 §6.1) */
 #define IM_ERR_INTERNAL             -99
 
 /* ---------------------------------------------------------------- init, build info, clock */
@@ -229,29 +242,29 @@ typedef int32_t im_status;
 #define IM_LOG_INFO  2u
 #define IM_LOG_DEBUG 3u
 
-#define IM_INIT_NO_AUDIO 0x1u        /* never touch audio APIs (video-only tools) */
+#define IM_INIT_NO_AUDIO 0x1u /* never touch audio APIs (video-only tools) */
 
 typedef struct im_init_params {
   uint32_t struct_size;
-  uint32_t abi_version;              /* IM_ABI_VERSION the caller was built with */
-  uint32_t flags;                    /* IM_INIT_* */
-  uint32_t log_level;                /* IM_LOG_* */
-  const char *ffmpeg_dir;            /* absolute dir of the FFmpeg DLLs; NULL = the engine DLL's own directory */
-  const char *openh264_path;         /* absolute path of a verified OpenH264 library; NULL = none */
+  uint32_t abi_version;      /* IM_ABI_VERSION the caller was built with */
+  uint32_t flags;            /* IM_INIT_* */
+  uint32_t log_level;        /* IM_LOG_* */
+  const char *ffmpeg_dir;    /* absolute dir of the FFmpeg DLLs; NULL = the engine DLL's own directory */
+  const char *openh264_path; /* absolute path of a verified OpenH264 library; NULL = none */
 } im_init_params;
 
-IM_API uint32_t  IM_CALL im_version(void);                 /* the DLL's IM_ABI_VERSION; callable before im_init */
+IM_API uint32_t IM_CALL im_version(void); /* the DLL's IM_ABI_VERSION; callable before im_init */
 IM_API im_status IM_CALL im_init(const im_init_params *params);
-IM_API void      IM_CALL im_shutdown(void);                /* stops every session; im_init may follow */
-IM_API int32_t   IM_CALL im_build_info(char *json, int32_t cap);
+IM_API void IM_CALL im_shutdown(void); /* stops every session; im_init may follow */
+IM_API int32_t IM_CALL im_build_info(char *json, int32_t cap);
 IM_API im_status IM_CALL im_set_openh264_path(const char *path_or_null);
 
 typedef struct im_clock_sample {
   uint32_t struct_size;
   uint32_t reserved;
-  int64_t mono_ns;                   /* engine clock: QPC ns (§12.3), mach_absolute_time (macOS), CLOCK_MONOTONIC (Linux) */
-  int64_t unix_ns;                   /* wall clock at the same instant */
-  int64_t uncertainty_ns;            /* half the bracket around the wall-clock read */
+  int64_t mono_ns;        /* engine clock: QPC ns (04 §12.3), mach_absolute_time (macOS), CLOCK_MONOTONIC (Linux) */
+  int64_t unix_ns;        /* wall clock at the same instant */
+  int64_t uncertainty_ns; /* half the bracket around the wall-clock read */
 } im_clock_sample;
 
 IM_API im_status IM_CALL im_clock(im_clock_sample *out);
@@ -260,127 +273,127 @@ IM_API im_status IM_CALL im_clock(im_clock_sample *out);
 #define IM_MAX_ADAPTERS 4u
 #define IM_MAX_ENCODERS 8u
 
-#define IM_ENC_AUTO          0u
-#define IM_ENC_NVENC         1u          /* token "nvenc" (§5.6) */
-#define IM_ENC_QSV           2u          /* "qsv" */
-#define IM_ENC_AMF           3u          /* "amf" */
-#define IM_ENC_MF_HW         4u          /* "mf-hw" */
-#define IM_ENC_MF_SW         5u          /* "mf-sw" */
-#define IM_ENC_OPENH264      6u          /* "openh264" */
-#define IM_ENC_VIDEOTOOLBOX  7u          /* "videotoolbox", later (M3) */
-#define IM_ENC_GSTREAMER     8u          /* "gstreamer", later (M4) */
-#define IM_ENC_FAKE        100u          /* "fake", IM_TEST_HOOKS builds only (§18.2) */
+#define IM_ENC_AUTO         0u
+#define IM_ENC_NVENC        1u   /* token "nvenc" (04 §5.6) */
+#define IM_ENC_QSV          2u   /* "qsv" */
+#define IM_ENC_AMF          3u   /* "amf" */
+#define IM_ENC_MF_HW        4u   /* "mf-hw" */
+#define IM_ENC_MF_SW        5u   /* "mf-sw" */
+#define IM_ENC_OPENH264     6u   /* "openh264" */
+#define IM_ENC_VIDEOTOOLBOX 7u   /* "videotoolbox", later (M3) */
+#define IM_ENC_GSTREAMER    8u   /* "gstreamer", later (M4) */
+#define IM_ENC_FAKE         100u /* "fake", IM_TEST_HOOKS builds only (04 §18.2) */
 
-#define IM_ENCF_AVAILABLE    0x01u       /* opened and passed the one-frame test encode */
+#define IM_ENCF_AVAILABLE    0x01u /* opened and passed the one-frame test encode */
 #define IM_ENCF_HARDWARE     0x02u
-#define IM_ENCF_LIVE_BITRATE 0x04u       /* bitrate changes apply without a re-init */
-#define IM_ENCF_ZERO_COPY    0x08u       /* takes D3D11 textures (no CPU readback) */
-#define IM_ENCF_HIGH         0x10u       /* can encode High (6400) */
-#define IM_ENCF_CB           0x20u       /* can encode Constrained Baseline (42e0) */
-#define IM_ENCF_FORCED_IDR   0x40u       /* honours a per-frame IDR request */
+#define IM_ENCF_LIVE_BITRATE 0x04u /* bitrate changes apply without a re-init */
+#define IM_ENCF_ZERO_COPY    0x08u /* takes D3D11 textures (no CPU readback) */
+#define IM_ENCF_HIGH         0x10u /* can encode High (6400) */
+#define IM_ENCF_CB           0x20u /* can encode Constrained Baseline (42e0) */
+#define IM_ENCF_FORCED_IDR   0x40u /* honours a per-frame IDR request */
 
-#define IM_ADAPTER_SOFTWARE    0x1u      /* WARP / Microsoft Basic Render Driver */
+#define IM_ADAPTER_SOFTWARE    0x1u /* WARP / Microsoft Basic Render Driver */
 #define IM_ADAPTER_HAS_OUTPUTS 0x2u
 
-#define IM_OS_SUPPORTED              0x00000001u  /* meets isshoni's minimum (Win10 22H2 = build 19045) */
-#define IM_OS_WGC                    0x00000002u  /* GraphicsCaptureSession::IsSupported() */
-#define IM_OS_WGC_PICKER             0x00000004u
-#define IM_OS_WGC_BORDERLESS         0x00000008u  /* IsBorderRequired present and access Allowed */
-#define IM_OS_WGC_MIN_INTERVAL       0x00000010u  /* MinUpdateInterval present (24H2+): > 60 fps possible */
-#define IM_OS_WGC_SECONDARY_WINDOWS  0x00000020u  /* IncludeSecondaryWindows present (24H2+) */
-#define IM_OS_WGC_CURSOR_TOGGLE      0x00000040u  /* IsCursorCaptureEnabled present (19041+) */
-#define IM_OS_DESKTOP_DUPLICATION    0x00000080u  /* DuplicateOutput1 works on at least one output */
-#define IM_OS_EXCLUDE_FROM_CAPTURE   0x00000100u  /* WDA_EXCLUDEFROMCAPTURE (19041+) */
-#define IM_OS_MEDIA_FOUNDATION       0x00000200u  /* MFStartup works (absent on N editions without the Media Feature Pack) */
-#define IM_OS_HDR_DISPLAY            0x00000400u  /* at least one output has advanced color on */
+#define IM_OS_SUPPORTED             0x00000001u /* meets isshoni's minimum (Win10 22H2 = build 19045) */
+#define IM_OS_WGC                   0x00000002u /* GraphicsCaptureSession::IsSupported() */
+#define IM_OS_WGC_PICKER            0x00000004u
+#define IM_OS_WGC_BORDERLESS        0x00000008u /* IsBorderRequired present and access Allowed */
+#define IM_OS_WGC_MIN_INTERVAL      0x00000010u /* MinUpdateInterval present (24H2+): > 60 fps possible */
+#define IM_OS_WGC_SECONDARY_WINDOWS 0x00000020u /* IncludeSecondaryWindows present (24H2+) */
+#define IM_OS_WGC_CURSOR_TOGGLE     0x00000040u /* IsCursorCaptureEnabled present (19041+) */
+#define IM_OS_DESKTOP_DUPLICATION   0x00000080u /* DuplicateOutput1 works on at least one output */
+#define IM_OS_EXCLUDE_FROM_CAPTURE  0x00000100u /* WDA_EXCLUDEFROMCAPTURE (19041+) */
+#define IM_OS_MEDIA_FOUNDATION      0x00000200u /* MFStartup works (not on N editions without the Media Feature Pack) */
+#define IM_OS_HDR_DISPLAY           0x00000400u /* at least one output has advanced color on */
 
-/* audio_flags (probe flags; their names stay IM_AUDIO_*): semantics in docs/m2/05-windows-audio.md */
-#define IM_AUDIO_PROCESS_LOOPBACK    0x1u
-#define IM_AUDIO_ENDPOINT_LOOPBACK   0x2u
-#define IM_AUDIO_SESSION_EVENTS      0x4u
-#define IM_AUDIO_MIC_DETECTION       0x8u
+/* audio_flags (probe flags; their names stay IM_AUDIO_*): semantics in docs/m2/05-windows-audio.md §11.1 */
+#define IM_AUDIO_PROCESS_LOOPBACK  0x1u
+#define IM_AUDIO_ENDPOINT_LOOPBACK 0x2u
+#define IM_AUDIO_SESSION_EVENTS    0x4u
+#define IM_AUDIO_MIC_DETECTION     0x8u
 
 typedef struct im_adapter_info {
-  uint64_t luid;                     /* (HighPart << 32) | LowPart */
-  uint32_t vendor_id;                /* PCI vendor: 0x10DE NVIDIA, 0x8086 Intel, 0x1002 AMD, 0x1414 Microsoft */
+  uint64_t luid;      /* (HighPart << 32) | LowPart */
+  uint32_t vendor_id; /* PCI vendor: 0x10DE NVIDIA, 0x8086 Intel, 0x1002 AMD, 0x1414 Microsoft */
   uint32_t device_id;
-  uint64_t driver_version;           /* UMD version, four 16-bit parts */
+  uint64_t driver_version; /* UMD version, four 16-bit parts */
   char name[128];
-  uint32_t flags;                    /* IM_ADAPTER_* */
+  uint32_t flags; /* IM_ADAPTER_* */
   uint32_t reserved;
 } im_adapter_info;
 
 typedef struct im_encoder_info {
-  uint32_t kind;                     /* IM_ENC_*; its token names the encoder everywhere (§5.6) */
-  uint32_t adapter_index;            /* into im_caps.adapters; 0xFFFFFFFF for software encoders */
-  uint32_t flags;                    /* IM_ENCF_* */
-  im_status status;                  /* IM_OK, or why it is unavailable */
-  uint32_t max_width, max_height;    /* 0 = unknown */
-  uint32_t test_encode_us;           /* open + one 1080p IDR + close, wall time */
+  uint32_t kind;                  /* IM_ENC_*; its token names the encoder everywhere (04 §5.6) */
+  uint32_t adapter_index;         /* into im_caps.adapters; 0xFFFFFFFF for software encoders */
+  uint32_t flags;                 /* IM_ENCF_* */
+  im_status status;               /* IM_OK, or why it is unavailable */
+  uint32_t max_width, max_height; /* 0 = unknown */
+  uint32_t test_encode_us;        /* open + one 1080p IDR + close, wall time */
   uint32_t reserved[3];
-  char codec[32];                    /* diagnostic: the FFmpeg codec name ("h264_nvenc") or "openh264" */
-  char reason[32];                   /* the §5.7 token when status != IM_OK ("driver_too_old"); "" when IM_OK */
+  char codec[32];  /* diagnostic: the FFmpeg codec name ("h264_nvenc") or "openh264" */
+  char reason[32]; /* the 04 §5.7 token when status != IM_OK ("driver_too_old"); "" when IM_OK */
 } im_encoder_info;
 
 typedef struct im_caps {
   uint32_t struct_size;
-  uint32_t os_build;                 /* e.g. 19045, 22631, 26100, 26200 */
-  uint32_t os_ubr;                   /* update build revision */
-  uint32_t os_flags;                 /* IM_OS_* */
-  uint32_t audio_flags;              /* IM_AUDIO_* probe flags */
+  uint32_t os_build;    /* e.g. 19045, 22631, 26100, 26200 */
+  uint32_t os_ubr;      /* update build revision */
+  uint32_t os_flags;    /* IM_OS_* */
+  uint32_t audio_flags; /* IM_AUDIO_* probe flags */
   uint32_t adapter_count;
   im_adapter_info adapters[IM_MAX_ADAPTERS];
   uint32_t encoder_count;
   uint32_t reserved0;
-  im_encoder_info encoders[IM_MAX_ENCODERS];   /* in the engine's fallback order */
+  im_encoder_info encoders[IM_MAX_ENCODERS]; /* in the engine's fallback order */
   uint32_t probe_ms;
   uint32_t reserved[15];
 } im_caps;
 
-#define IM_PROBE_QUICK 0x0u          /* OS flags and which encoders load; no test encodes (< 100 ms) */
-#define IM_PROBE_FULL  0x1u          /* plus a one-frame test encode per encoder (< 2 s) */
+#define IM_PROBE_QUICK 0x0u /* OS flags and which encoders load; no test encodes (< 100 ms) */
+#define IM_PROBE_FULL  0x1u /* plus a one-frame test encode per encoder (< 2 s) */
 
 IM_API im_status IM_CALL im_probe(uint32_t flags, im_caps *caps);
 
 /* ---------------------------------------------------------------- sources */
-#define IM_SOURCE_MONITOR       1u
-#define IM_SOURCE_WINDOW        2u
-#define IM_SOURCE_TEST_PATTERN  3u
+#define IM_SOURCE_MONITOR      1u
+#define IM_SOURCE_WINDOW       2u
+#define IM_SOURCE_TEST_PATTERN 3u
 
-#define IM_CAPTURE_WGC   1u
-#define IM_CAPTURE_DD    2u
-#define IM_CAPTURE_TEST  3u
-#define IM_CAPTURE_SCK   4u                 /* later (M3) */
-#define IM_CAPTURE_PORTAL 5u                /* later (M4) */
-#define IM_CAPTURE_X11   6u                 /* later (M4) */
+#define IM_CAPTURE_WGC    1u
+#define IM_CAPTURE_DD     2u
+#define IM_CAPTURE_TEST   3u
+#define IM_CAPTURE_SCK    4u /* later (M3) */
+#define IM_CAPTURE_PORTAL 5u /* later (M4) */
+#define IM_CAPTURE_X11    6u /* later (M4) */
 
-#define IM_SRCF_OS_BORDER 0x1u              /* Windows will draw its yellow capture border */
-#define IM_SRCF_SELF      0x2u              /* the user picked an isshoni window */
-#define IM_SRCF_MAPPED    0x4u              /* Win10: picked monitor mapped to a DD output */
+#define IM_SRCF_OS_BORDER 0x1u /* Windows will draw its yellow capture border */
+#define IM_SRCF_SELF      0x2u /* the user picked an isshoni window */
+#define IM_SRCF_MAPPED    0x4u /* Win10: picked monitor mapped to a DD output */
 
-/* JSON: {"monitors":[…],"windows":[]} (§5.6). Windows lists monitors only: windows come from the OS picker. */
+/* JSON: {"monitors":[...],"windows":[]} (04 §5.6). Windows lists monitors only: windows come from the OS picker. */
 IM_API int32_t IM_CALL im_list_sources(uint32_t flags, char *json, int32_t cap);
 
 typedef struct im_pick_params {
   uint32_t struct_size;
-  uint32_t flags;                    /* reserved (macOS M3: picker modes) */
-  void *parent_window;               /* HWND (Windows), NSWindow* (macOS); NULL = an engine-owned owner window */
-  uint32_t timeout_ms;               /* 0 = 120000; at most 600000 */
+  uint32_t flags;      /* reserved (macOS M3: picker modes) */
+  void *parent_window; /* HWND (Windows), NSWindow* (macOS); NULL = an engine-owned owner window */
+  uint32_t timeout_ms; /* 0 = 120000; at most 600000 */
   uint32_t reserved;
 } im_pick_params;
 
 typedef struct im_source_info {
   uint32_t struct_size;
-  uint32_t kind;                     /* IM_SOURCE_* */
-  char id[64];                       /* opaque: "pick:7", "mon:\\.\DISPLAY1", "test:pattern" */
-  char name[256];                    /* window title or monitor name: shown locally, never sent anywhere */
-  char monitor_id[64];               /* monitor sources: the im_list_sources id; else "" */
-  uint32_t width, height;            /* physical pixels at pick time */
-  uint32_t capture_path;             /* IM_CAPTURE_*: what im_start will use */
-  uint32_t flags;                    /* IM_SRCF_* */
-  uint32_t pid;                      /* window sources: owning process if identified (§7.6), else 0 */
+  uint32_t kind;          /* IM_SOURCE_* */
+  char id[64];            /* opaque: "pick:7", "mon:\\.\DISPLAY1", "test:pattern" */
+  char name[256];         /* window title or monitor name: shown locally, never sent anywhere */
+  char monitor_id[64];    /* monitor sources: the im_list_sources id; else "" */
+  uint32_t width, height; /* physical pixels at pick time */
+  uint32_t capture_path;  /* IM_CAPTURE_*: what im_start will use */
+  uint32_t flags;         /* IM_SRCF_* */
+  uint32_t pid;           /* window sources: owning process if identified (04 §7.6), else 0 */
   uint32_t reserved0;
-  uint64_t window;                   /* window sources: HWND if identified, else 0 */
+  uint64_t window; /* window sources: HWND if identified, else 0 */
   uint32_t reserved[4];
 } im_source_info;
 
@@ -388,228 +401,232 @@ typedef struct im_source_info {
    the pick; at most 4 unused ones are kept (the oldest is evicted). im_start with a consumed, expired or evicted token
    is IM_ERR_SOURCE_GONE with token pick_expired. */
 IM_API im_status IM_CALL im_pick_source(const im_pick_params *params, im_source_info *out);
-IM_API im_status IM_CALL im_cancel_pick(void);               /* makes a blocked im_pick_source return IM_ERR_CANCELLED */
-IM_API void      IM_CALL im_release_source(const char *id);  /* forget an unused pick */
+IM_API im_status IM_CALL im_cancel_pick(void);         /* makes a blocked im_pick_source return IM_ERR_CANCELLED */
+IM_API void IM_CALL im_release_source(const char *id); /* forget an unused pick */
 
 /* ---- audio (docs/m2/05-windows-audio.md §4; semantics, report JSON and rule matching are 05's) ---- */
 #define IM_AUDIO_SAMPLE_RATE 48000u
 #define IM_AUDIO_CHANNELS    2u
 #define IM_MAX_RULES         512u
-#define IM_MAX_RULE_VALUE    520u      /* bytes including the NUL (MAX_PATH-sized paths, UTF-8) */
-#define IM_APP_ID_LEN        64u       /* bytes including the NUL */
+#define IM_MAX_RULE_VALUE    520u /* bytes including the NUL (MAX_PATH-sized paths, UTF-8) */
+#define IM_APP_ID_LEN        64u  /* bytes including the NUL */
 #define IM_MAX_LEVEL_APPS    64u
 
-#define IM_AUDIO_MODE_OFF          0u  /* im_start: no audio packets; im_audio_set_mode mid-share: muted, no capture */
-#define IM_AUDIO_MODE_EXCLUDE_APPS 1u  /* default: everything except kept-out apps and isshoni */
-#define IM_AUDIO_MODE_EVERYTHING   2u  /* reserved (later): everything except isshoni ("All sound"); in M2, im_start and
-                                          im_audio_set_mode answer IM_ERR_INVALID_ARG (README §3 item 15) */
-#define IM_AUDIO_MODE_TEST_TONE  100u  /* 04 (§10.3): 440 Hz, a 1 kHz beep in the first 100 ms of each second; no capture */
+/* im_audio_config.mode and im_audio_set_mode: modes 0..99 are 05's; 100 is 04's test tone (04 §10.3: 440 Hz, a 1 kHz
+   beep in the first 100 ms of each second, no capture). EVERYTHING is reserved for later ("All sound": everything
+   except isshoni); in M2 im_start and im_audio_set_mode answer it with IM_ERR_INVALID_ARG (docs/m2/README.md §3 item
+   15). */
+#define IM_AUDIO_MODE_OFF          0u   /* im_start: no audio packets; mid-share: silence, no capture */
+#define IM_AUDIO_MODE_EXCLUDE_APPS 1u   /* default: everything except kept-out apps and isshoni */
+#define IM_AUDIO_MODE_EVERYTHING   2u   /* reserved (later); IM_ERR_INVALID_ARG in M2 */
+#define IM_AUDIO_MODE_TEST_TONE    100u /* 04's test tone; no capture */
 
-#define IM_RULE_APP_EXCLUDE      0u    /* value: exe file name; matches the process or an app ancestor */
-#define IM_RULE_APP_ALLOW        1u    /* value: exe name; the "Include" answer */
-#define IM_RULE_INSTANCE         2u    /* value: decimal pid; matches it and every OS descendant */
-#define IM_RULE_STOP             3u    /* value: launcher/shell exe name; ends app walks */
-#define IM_RULE_SHARED_RUNTIME   4u    /* value: exe name that belongs to its parent's app whatever its folder */
-#define IM_RULE_BROWSER          5u    /* value: exe name of a browser */
-#define IM_RULE_WEBVIEW_DATA_DIR 6u    /* value: full path of isshoni's WebView2 user data folder */
+#define IM_RULE_APP_EXCLUDE      0u /* value: exe file name; matches the process or an app ancestor */
+#define IM_RULE_APP_ALLOW        1u /* value: exe name; the "Include" answer */
+#define IM_RULE_INSTANCE         2u /* value: decimal pid; matches it and every OS descendant */
+#define IM_RULE_STOP             3u /* value: launcher/shell exe name; ends app walks */
+#define IM_RULE_SHARED_RUNTIME   4u /* value: exe name that belongs to its parent's app whatever its folder */
+#define IM_RULE_BROWSER          5u /* value: exe name of a browser */
+#define IM_RULE_WEBVIEW_DATA_DIR 6u /* value: full path of isshoni's WebView2 user data folder */
 
-#define IM_RULE_SRC_BUILTIN 0u         /* the built-in voice-app list */
-#define IM_RULE_SRC_USER    1u         /* a remembered user decision */
-#define IM_RULE_SRC_SELF    2u         /* isshoni itself */
-#define IM_RULE_SRC_VIEWER  3u         /* a browser that plays the user's isshoni viewer */
-#define IM_RULE_SRC_DATA    4u         /* launchers, shared runtimes, browsers */
+#define IM_RULE_SRC_BUILTIN 0u /* the built-in voice-app list */
+#define IM_RULE_SRC_USER    1u /* a remembered user decision */
+#define IM_RULE_SRC_SELF    2u /* isshoni itself */
+#define IM_RULE_SRC_VIEWER  3u /* a browser that plays the user's isshoni viewer */
+#define IM_RULE_SRC_DATA    4u /* launchers, shared runtimes, browsers */
 
-typedef struct im_rule {             /* an array element: frozen in v1; new behavior means new kind values */
-  uint32_t kind;                     /* IM_RULE_* */
-  uint32_t source;                   /* IM_RULE_SRC_* */
-  const char *value;                 /* UTF-8, < IM_MAX_RULE_VALUE; compared case-insensitively */
-  const char *app_id;                /* report id, < IM_APP_ID_LEN, [a-z0-9:._-]; NULL or "" = "exe:<value>" */
-  const char *name;                  /* display name for reports; NULL = the exe's FileDescription */
+typedef struct im_rule { /* an array element: frozen in v1; new behavior means new kind values */
+  uint32_t kind;         /* IM_RULE_* */
+  uint32_t source;       /* IM_RULE_SRC_* */
+  const char *value;     /* UTF-8, < IM_MAX_RULE_VALUE; compared case-insensitively */
+  const char *app_id;    /* report id, < IM_APP_ID_LEN, [a-z0-9:._-]; NULL or "" = "exe:<value>" */
+  const char *name;      /* display name for reports; NULL = the exe's FileDescription */
 } im_rule;
 
-#define IM_EXCLF_KEEP_OUT_MIC_USERS 0x1u  /* "Keep out apps that use my microphone" (default on) */
-#define IM_EXCLF_FAST_PATH          0x2u  /* allow the single-EXCLUDE fast path (default on) */
+#define IM_EXCLF_KEEP_OUT_MIC_USERS 0x1u /* "Keep out apps that use my microphone" (default on) */
+#define IM_EXCLF_FAST_PATH          0x2u /* allow the single-EXCLUDE fast path (default on) */
 
 typedef struct im_exclusions {
-  uint32_t struct_size;              /* sizeof(im_exclusions) */
-  uint32_t flags;                    /* IM_EXCLF_* */
+  uint32_t struct_size; /* sizeof(im_exclusions) */
+  uint32_t flags;       /* IM_EXCLF_* */
   const im_rule *rules;
-  uint32_t rule_count;               /* <= IM_MAX_RULES */
-  uint32_t shared_pid;               /* the shared window's process (from the pick, via Go); 0 = monitor or unknown */
+  uint32_t rule_count; /* <= IM_MAX_RULES */
+  uint32_t shared_pid; /* the shared window's process (from the pick, via Go); 0 = monitor or unknown */
 } im_exclusions;
 
-#define IM_AUDIOF_TAP_PCM          0x1u         /* also emit IM_PACKET_PCM chunks (audiotest; shipped) */
-#define IM_AUDIOF_TEST_FAIL_PROBE  0x80000000u  /* audiotest only: behave as if the startup probe failed (shipped) */
+#define IM_AUDIOF_TAP_PCM         0x1u        /* also emit IM_PACKET_PCM chunks (audiotest; shipped) */
+#define IM_AUDIOF_TEST_FAIL_PROBE 0x80000000u /* audiotest only: behave as if the startup probe failed (shipped) */
 
-typedef struct im_audio_config {     /* embedded by value in im_start_config: fixed size, no struct_size */
-  uint32_t mode;                     /* IM_AUDIO_MODE_* */
-  uint32_t bitrate_bps;              /* 32000..510000, 0 = 128000 */
-  uint32_t frame_ms;                 /* 0 = 20; M2 only 20 */
-  uint32_t flags;                    /* IM_AUDIOF_* */
+typedef struct im_audio_config { /* embedded by value in im_start_config: fixed size, no struct_size */
+  uint32_t mode;                 /* IM_AUDIO_MODE_* */
+  uint32_t bitrate_bps;          /* 32000..510000, 0 = 128000 */
+  uint32_t frame_ms;             /* 0 = 20; M2 only 20 */
+  uint32_t flags;                /* IM_AUDIOF_* */
   uint32_t reserved[4];
 } im_audio_config;
 
 typedef struct im_audio_level {
-  char     app_id[IM_APP_ID_LEN];    /* NUL-terminated; matches apps[].id of the report */
-  float    peak_db;                  /* max over the last 100 ms, dBFS; -120 = silence */
-  float    rms_db;                   /* captured: RMS over 100 ms; activity: = peak_db */
-  uint32_t source;                   /* 0 = captured (what friends hear), 1 = activity (session peak meter) */
+  char app_id[IM_APP_ID_LEN]; /* NUL-terminated; matches apps[].id of the report */
+  float peak_db;              /* max over the last 100 ms, dBFS; -120 = silence */
+  float rms_db;               /* captured: RMS over 100 ms; activity: = peak_db */
+  uint32_t source;            /* 0 = captured (what friends hear), 1 = activity (session peak meter) */
   uint32_t reserved;
 } im_audio_level;
 
 typedef struct im_audio_levels {
-  uint32_t       struct_size;        /* sizeof(im_audio_levels), set by the caller */
-  uint32_t       report_seq;         /* equals the report's "seq"; a change means: fetch the report */
-  int64_t        qpc_ns;             /* QPC time of this sample */
-  float          mix_peak_db;        /* the mix fed to Opus, last 100 ms; -120 when not live or muted */
-  float          mix_rms_db;
-  uint32_t       count;              /* entries written to apps[] */
-  uint32_t       reserved;
+  uint32_t struct_size; /* sizeof(im_audio_levels), set by the caller */
+  uint32_t report_seq;  /* equals the report's "seq"; a change means: fetch the report */
+  int64_t qpc_ns;       /* engine clock (QPC ns, im_clock().mono_ns) of this sample */
+  float mix_peak_db;    /* the mix fed to Opus, last 100 ms; -120 when not live or silenced */
+  float mix_rms_db;
+  uint32_t count; /* entries written to apps[] */
+  uint32_t reserved;
   im_audio_level apps[IM_MAX_LEVEL_APPS];
 } im_audio_levels;
 
-/* "What friends hear": 05's report JSON (05 §12.1). Live or watching: the current report; otherwise a one-shot
-   snapshot (<= 500 ms). */
-IM_API int32_t   IM_CALL im_list_audio_apps(char *json, int32_t cap);
+/* "What friends hear": 05's report JSON (05 §12.1). flags: 0 (reserved). Live or watching: the current report;
+   otherwise a one-shot snapshot (<= 500 ms). */
+IM_API int32_t IM_CALL im_list_audio_apps(uint32_t flags, char *json, int32_t cap);
 /* Watcher without capture (the share sheet before going live). Idempotent; the rules replace the previous ones. */
 IM_API im_status IM_CALL im_audio_watch(const im_exclusions *ex);
-IM_API im_status IM_CALL im_audio_unwatch(void);                  /* no-op while a share with audio runs */
+IM_API im_status IM_CALL im_audio_unwatch(void); /* no-op while a share with audio runs */
 /* Replaces the rules (and flags, shared_pid) of the watcher and of a running share (copied). Applied within 50 ms;
    without a watcher or share they are stored for the next im_audio_watch or im_start. */
 IM_API im_status IM_CALL im_set_exclusions(const im_exclusions *ex);
 /* Mid-share: set_mode (OFF, EXCLUDE_APPS; EVERYTHING is IM_ERR_INVALID_ARG in M2) crossfades in 20 ms; set_muted is
-   the pause mute 01's core sets:
-   it fades in 10 ms and silent Opus frames keep flowing. */
+   the pause mute 01's core sets: it fades in 10 ms and silent Opus frames keep flowing. */
 IM_API im_status IM_CALL im_audio_set_mode(uint32_t mode);
 IM_API im_status IM_CALL im_audio_set_muted(uint32_t muted);
-/* Level meters (05 §12.2). Lock-free, < 50 µs. IM_ERR_BAD_STATE (token not_watching) when neither watching nor live. */
+/* Level meters (05 §12.2). Lock-free, < 50 us. IM_ERR_BAD_STATE (token not_watching) unless watching or live. */
 IM_API im_status IM_CALL im_audio_levels_get(im_audio_levels *out);
-/* First-run sound check (05 §11.3): captures the process tree of helper_pid, outside the policy, and looks for the
-   chime. Result JSON as 05 §11.3. */
-IM_API int32_t   IM_CALL im_audio_sound_check(uint32_t helper_pid, uint32_t timeout_ms, char *json, int32_t cap);
+/* First-run sound check (05 §11.3): captures the chime of helper_pid's process tree, outside the policy; 0 = the DLL
+   plays the chime itself. timeout_ms: 1000..10000. Result JSON as 05 §11.3, snprintf rule. */
+IM_API int32_t IM_CALL im_audio_sound_check(uint32_t helper_pid, int32_t timeout_ms, char *json, int32_t cap);
 
 /* ---------------------------------------------------------------- sessions */
-#define IM_MAX_LAYERS   3u           /* M2 uses 2: "f" and "q"; "h" is M5 */
-#define IM_ALL_LAYERS   0xFFFFFFFEu
-#define IM_NO_LAYER     0xFFFFFFFFu  /* audio and PCM packets; events that name no layer */
+#define IM_MAX_LAYERS 3u /* M2 uses 2: "f" and "q"; "h" is M5 */
+#define IM_ALL_LAYERS 0xFFFFFFFEu
+#define IM_NO_LAYER   0xFFFFFFFFu /* audio and PCM packets; events that name no layer */
 
-#define IM_PROFILE_HIGH 0x6400u      /* profile_idc << 8 | constraint byte, as protocol CodecKey "h264/6400" */
-#define IM_PROFILE_CB   0x42E0u      /* "h264/42e0" */
+#define IM_PROFILE_HIGH 0x6400u /* profile_idc << 8 | constraint byte, as protocol CodecKey "h264/6400" */
+#define IM_PROFILE_CB   0x42E0u /* "h264/42e0" */
 
-#define IM_CONTENT_AUTO   0u         /* presets Auto */
-#define IM_CONTENT_MOTION 1u         /* Game, Movie */
-#define IM_CONTENT_DETAIL 2u         /* Text */
+#define IM_CONTENT_AUTO   0u /* presets Auto */
+#define IM_CONTENT_MOTION 1u /* Game, Movie */
+#define IM_CONTENT_DETAIL 2u /* Text */
 
-#define IM_LAYER_INACTIVE 0x1u       /* start with this layer paused (im_set_layer_active) */
+#define IM_LAYER_INACTIVE 0x1u /* start with this layer paused (im_set_layer_active) */
 
 typedef struct im_layer_config {
-  char rid[4];                       /* "f", "q"; NUL-terminated */
-  uint32_t width, height;            /* bounding box in pixels; 0 = none */
-  uint32_t max_pixels;               /* pixel budget (ShareParams maxPixels); 0 = none */
-  uint32_t fps;                      /* 1..240 */
-  uint32_t bitrate_bps;              /* initial target (01: ratectl's initial value, <= maxBitrate) */
-  uint32_t gop_ms;                   /* 0 = default (layer 0: 4000, others: 2000); 1000..10000 */
-  uint32_t flags;                    /* IM_LAYER_* */
+  char rid[4];            /* "f", "q"; NUL-terminated */
+  uint32_t width, height; /* bounding box in pixels; 0 = none */
+  uint32_t max_pixels;    /* pixel budget (ShareParams maxPixels); 0 = none */
+  uint32_t fps;           /* 1..240 */
+  uint32_t bitrate_bps;   /* initial target (01: ratectl's initial value, <= maxBitrate) */
+  uint32_t gop_ms;        /* 0 = default (layer 0: 4000, others: 2000); 1000..10000 */
+  uint32_t flags;         /* IM_LAYER_* */
   uint32_t reserved[2];
 } im_layer_config;
 
-#define IM_START_HIDE_CURSOR          0x1u  /* don't draw the pointer (0 = drawn: WGC cursor capture on, DD blends it) */
-#define IM_START_PAUSED               0x2u
-#define IM_START_ALLOW_LISTED_SOURCE  0x4u  /* accept "mon:" and "test:" ids (tools, tests); the app never sets it */
-#define IM_START_KEEP_BORDER          0x8u  /* don't ask for borderless capture */
+#define IM_START_HIDE_CURSOR         0x1u /* don't draw the pointer (0 = drawn: WGC cursor capture on, DD blends it) */
+#define IM_START_PAUSED              0x2u
+#define IM_START_ALLOW_LISTED_SOURCE 0x4u /* accept "mon:" and "test:" ids (tools, tests); the app never sets it */
+#define IM_START_KEEP_BORDER         0x8u /* don't ask for borderless capture */
 
 typedef struct im_start_config {
   uint32_t struct_size;
-  uint32_t flags;                    /* IM_START_* */
-  const char *source_id;             /* from im_pick_source (or im_list_sources with ALLOW_LISTED); NULL = audio only */
-  uint32_t profile;                  /* IM_PROFILE_* */
-  uint32_t content_hint;             /* IM_CONTENT_* */
-  uint32_t encoder;                  /* IM_ENC_AUTO, or one kind to force */
-  uint32_t layer_count;              /* 0 (audio only) .. IM_MAX_LAYERS */
-  im_layer_config layers[IM_MAX_LAYERS];   /* wire order: "f" first */
-  im_audio_config audio;             /* mode IM_AUDIO_MODE_OFF = no audio packets at all */
-  const im_exclusions *exclusions;   /* NULL = the set from the last im_set_exclusions/im_audio_watch */
+  uint32_t flags;        /* IM_START_* */
+  const char *source_id; /* from im_pick_source (or im_list_sources with ALLOW_LISTED); NULL = audio only */
+  uint32_t profile;      /* IM_PROFILE_* */
+  uint32_t content_hint; /* IM_CONTENT_* */
+  uint32_t encoder;      /* IM_ENC_AUTO, or one kind to force */
+  uint32_t layer_count;  /* 0 (audio only) .. IM_MAX_LAYERS */
+  im_layer_config layers[IM_MAX_LAYERS]; /* wire order: "f" first */
+  im_audio_config audio;                 /* mode IM_AUDIO_MODE_OFF = no audio packets at all */
+  const im_exclusions *exclusions;       /* NULL = the set from the last im_set_exclusions/im_audio_watch */
   uint32_t reserved[8];
 } im_start_config;
 
 #define IM_SESS_NO_OS_INDICATOR 0x1u /* no OS border (WGC borderless or DD): the app must show its own indicator */
 #define IM_SESS_AUDIO           0x2u
 
-#define IM_AUDIO_STATE_OFF       0u  /* mirrors 05's report "state" (05 §12.1); stats JSON uses the strings */
-#define IM_AUDIO_STATE_STARTING  1u  /* "starting": the startup probe runs */
-#define IM_AUDIO_STATE_OK        2u  /* "ok" */
-#define IM_AUDIO_STATE_DEGRADED  3u  /* "degraded": probe failed or unsupported, endpoint loopback (05) */
-#define IM_AUDIO_STATE_NO_DEVICE 4u  /* "no-device": silent frames until a render endpoint appears */
+#define IM_AUDIO_STATE_OFF       0u /* mirrors 05's report "state" (05 §12.1); stats JSON uses the strings */
+#define IM_AUDIO_STATE_STARTING  1u /* "starting": the startup probe runs */
+#define IM_AUDIO_STATE_OK        2u /* "ok" */
+#define IM_AUDIO_STATE_DEGRADED  3u /* "degraded": probe failed or unsupported, endpoint loopback (05) */
+#define IM_AUDIO_STATE_NO_DEVICE 4u /* "no-device": silent frames until a render endpoint appears */
 
 typedef struct im_layer_info {
   char rid[4];
-  uint32_t encoder;                  /* IM_ENC_* in use */
+  uint32_t encoder; /* IM_ENC_* in use */
   uint32_t width, height, fps, bitrate_bps;
-  uint32_t profile;                  /* the SPS's key, e.g. 0x6400 */
-  uint32_t flags;                    /* IM_ENCF_* of that encoder */
+  uint32_t profile; /* the SPS's key, e.g. 0x6400 */
+  uint32_t flags;   /* IM_ENCF_* of that encoder */
   uint32_t reserved[2];
 } im_layer_info;
 
 typedef struct im_session_info {
   uint32_t struct_size;
-  uint32_t flags;                    /* IM_SESS_* */
-  uint32_t capture_path;             /* IM_CAPTURE_* */
+  uint32_t flags;        /* IM_SESS_* */
+  uint32_t capture_path; /* IM_CAPTURE_* */
   uint32_t layer_count;
-  int64_t epoch_ns;                  /* engine clock at im_start; every capture_ts_ns, of every kind, >= epoch_ns */
-  uint32_t audio_state;              /* IM_AUDIO_STATE_* */
+  int64_t epoch_ns;     /* engine clock at im_start; every capture_ts_ns, of every kind, >= epoch_ns */
+  uint32_t audio_state; /* IM_AUDIO_STATE_* */
   uint32_t reserved0;
   im_layer_info layers[IM_MAX_LAYERS];
   uint32_t reserved[8];
 } im_session_info;
 
-typedef uint64_t im_session;         /* 0 is never a valid session */
+typedef uint64_t im_session; /* 0 is never a valid session */
 
 IM_API im_status IM_CALL im_start(const im_start_config *cfg, im_session *out, im_session_info *info);
 IM_API im_status IM_CALL im_get_session_info(im_session s, im_session_info *info);
 
 /* ---------------------------------------------------------------- packets and events */
 #define IM_PACKET_VIDEO 1u
-#define IM_PACKET_AUDIO 2u           /* one 20 ms Opus packet */
+#define IM_PACKET_AUDIO 2u /* one 20 ms Opus packet */
 #define IM_PACKET_EVENT 3u
-#define IM_PACKET_PCM   4u           /* 480 float32 stereo frames (3840 bytes), only with IM_AUDIOF_TAP_PCM */
-#define IM_PACKET_DEBUG 100u         /* IM_TEST_HOOKS builds only */
+#define IM_PACKET_PCM   4u   /* 480 float32 stereo frames (3840 bytes), only with IM_AUDIOF_TAP_PCM */
+#define IM_PACKET_DEBUG 100u /* IM_TEST_HOOKS builds only */
 
-#define IM_PKT_KEYFRAME      0x1u    /* video: IDR access unit with SPS and PPS in front */
-#define IM_PKT_REINIT        0x2u    /* video: the first AU after an encoder (re)open (with KEYFRAME): new SPS/PPS,
-                                        maybe size or profile. Audio: the first packet of a session and the first
-                                        after a new timestamp grid starts (PcmSink::OnGap); the time step may be any
-                                        value */
-#define IM_PKT_REFRESH       0x4u    /* video: a re-encode of an unchanged frame */
-#define IM_PKT_DISCONTINUITY 0x8u    /* packets of this stream were dropped before this one (ring full, stale); the
-                                        audio grid is unchanged */
+/* im_packet.flags. REINIT on video: the first AU after an encoder (re)open (always with KEYFRAME): new SPS/PPS, maybe
+   a new size or profile. REINIT on audio: the first packet of a session and the first after a new timestamp grid
+   starts (PcmSink::OnGap); the time step may be any value. DISCONTINUITY: packets of this stream were dropped before
+   this one (ring full, stale); the audio grid is unchanged. */
+#define IM_PKT_KEYFRAME      0x1u /* video: IDR access unit with SPS and PPS in front */
+#define IM_PKT_REINIT        0x2u /* video: first AU after an encoder (re)open; audio: a new timestamp grid */
+#define IM_PKT_REFRESH       0x4u /* video: a re-encode of an unchanged frame */
+#define IM_PKT_DISCONTINUITY 0x8u /* packets of this stream were dropped before this one */
 
-#define IM_EVENT_ENDED                 1   /* final; status = the cause (IM_OK after im_stop) */
-#define IM_EVENT_SOURCE_RESIZED        2
-#define IM_EVENT_SOURCE_MINIMIZED      3
-#define IM_EVENT_SOURCE_RESTORED       4
-#define IM_EVENT_CAPTURE_INTERRUPTED   5   /* secure desktop, mode change: the last frame repeats */
-#define IM_EVENT_CAPTURE_RESUMED       6
-#define IM_EVENT_ENCODER_CHANGED       7   /* status IM_ERR_ENCODER_LOST: fell back to the next encoder; queued
-                                              before the new encoder's first REINIT|KEYFRAME packet */
-#define IM_EVENT_DEVICE_RESET          8   /* reserved: the GPU was reset or removed and the pipeline was rebuilt
-                                              (device-loss recovery, M5); the M2 Windows engine never sends it */
-#define IM_EVENT_LIMIT_CHANGED         9   /* the encoder can't keep up ("cpu", "gpu") or can again ("none") */
-#define IM_EVENT_RING_OVERFLOW        10   /* the consumer fell behind; packets were dropped */
+/* im_packet.event of IM_PACKET_EVENT packets; the detail JSON is 04 §5.6's. ENCODER_CHANGED (status
+   IM_ERR_ENCODER_LOST) is queued before the new encoder's first REINIT|KEYFRAME packet. DEVICE_RESET is reserved for
+   M5's device-loss recovery (the GPU was reset or removed and the pipeline was rebuilt); the M2 Windows engine never
+   sends it. */
+#define IM_EVENT_ENDED               1 /* final; status = the cause (IM_OK after im_stop) */
+#define IM_EVENT_SOURCE_RESIZED      2
+#define IM_EVENT_SOURCE_MINIMIZED    3
+#define IM_EVENT_SOURCE_RESTORED     4
+#define IM_EVENT_CAPTURE_INTERRUPTED 5 /* secure desktop, mode change: the last frame repeats */
+#define IM_EVENT_CAPTURE_RESUMED     6
+#define IM_EVENT_ENCODER_CHANGED     7  /* status IM_ERR_ENCODER_LOST: fell back to the next encoder */
+#define IM_EVENT_DEVICE_RESET        8  /* reserved (M5); never sent in M2 */
+#define IM_EVENT_LIMIT_CHANGED       9  /* the encoder can't keep up ("cpu", "gpu") or can again ("none") */
+#define IM_EVENT_RING_OVERFLOW       10 /* the consumer fell behind; packets were dropped */
 /* 32..63 reserved (audio reports go through im_list_audio_apps and im_audio_levels_get, 05) */
 
 typedef struct im_packet {
   uint32_t struct_size;
-  uint32_t kind;                     /* IM_PACKET_* */
-  uint32_t layer;                    /* video: layer index; audio, PCM: IM_NO_LAYER; events may name one */
-  uint32_t flags;                    /* IM_PKT_* */
-  int64_t capture_ts_ns;             /* engine clock (im_clock), >= epoch_ns; events: when it happened */
-  const uint8_t *data;               /* Annex B AU, one Opus packet, PCM f32 interleaved, or event detail JSON */
+  uint32_t kind;         /* IM_PACKET_* */
+  uint32_t layer;        /* video: layer index; audio, PCM: IM_NO_LAYER; events may name one */
+  uint32_t flags;        /* IM_PKT_* */
+  int64_t capture_ts_ns; /* engine clock (im_clock), >= epoch_ns; events: when it happened */
+  const uint8_t *data;   /* Annex B AU, one Opus packet, PCM f32 interleaved, or event detail JSON */
   uint32_t size;
-  uint32_t duration_us;              /* audio: 20000 (Opus); PCM: 10000; else 0 */
-  uint16_t width, height;            /* video */
-  uint32_t profile;                  /* video: the SPS's key */
-  int32_t event;                     /* IM_EVENT_*; 0 for media */
-  im_status status;                  /* events: the code this event carries */
+  uint32_t duration_us;   /* audio: 20000 (Opus); PCM: 10000; else 0 */
+  uint16_t width, height; /* video */
+  uint32_t profile;       /* video: the SPS's key */
+  int32_t event;          /* IM_EVENT_*; 0 for media */
+  im_status status;       /* events: the code this event carries */
   uint32_t reserved[4];
 } im_packet;
 
@@ -622,27 +639,33 @@ IM_API im_status IM_CALL im_set_bitrate(im_session s, uint32_t layer, uint32_t b
 IM_API im_status IM_CALL im_set_layer_active(im_session s, uint32_t layer, uint32_t active);
 IM_API im_status IM_CALL im_update_layer(im_session s, uint32_t layer, const im_layer_config *cfg);
 IM_API im_status IM_CALL im_set_profile(im_session s, uint32_t profile);
-IM_API im_status IM_CALL im_set_content_hint(im_session s, uint32_t hint);  /* IM_CONTENT_*: re-inits every layer */
+IM_API im_status IM_CALL im_set_content_hint(im_session s, uint32_t hint); /* IM_CONTENT_*: re-inits every layer */
 IM_API im_status IM_CALL im_set_paused(im_session s, uint32_t paused);
 IM_API im_status IM_CALL im_set_audio_bitrate(im_session s, uint32_t bps);
-IM_API int32_t   IM_CALL im_get_stats(im_session s, char *json, int32_t cap);
-IM_API im_status IM_CALL im_stop(im_session s);                                     /* blocks <= 2 s */
+IM_API int32_t IM_CALL im_get_stats(im_session s, char *json, int32_t cap);
+IM_API im_status IM_CALL im_stop(im_session s); /* blocks <= 2 s */
 
 /* ---------------------------------------------------------------- own windows */
-#define IM_PROTECT_OFF 0x1u                   /* undo (tests) */
+#define IM_PROTECT_OFF 0x1u /* undo (tests) */
 IM_API im_status IM_CALL im_protect_window(void *native_window, uint32_t flags);
 
 /* ---------------------------------------------------------------- diagnostics */
-IM_API int32_t IM_CALL im_last_error(char *buf, int32_t cap);   /* this thread's last failure ("<token>: …") */
-IM_API int32_t IM_CALL im_read_logs(char *buf, int32_t cap);    /* drains whole NDJSON lines; 0 = empty */
-IM_API int32_t IM_CALL im_abi_layout(char *json, int32_t cap);  /* sizeof and offsetof of every struct */
+IM_API int32_t IM_CALL im_last_error(char *buf, int32_t cap); /* this thread's last failure ("<token>: ...") */
+/* Drains whole NDJSON lines (docs/m2/04 §5.6), oldest first, each at most 8192 bytes: cap must exceed 8192 (else
+   IM_ERR_INVALID_ARG). Returns the bytes written; 0 = empty. The first record after drops carries "dropped":N. */
+IM_API int32_t IM_CALL im_read_logs(char *buf, int32_t cap);
+IM_API int32_t IM_CALL im_abi_layout(char *json, int32_t cap); /* sizeof and offsetof of every struct */
 
 /* -------------------------------------------- test exports: shipped, capture nothing (docs/m2/05 §4.1) */
-/* For cmd/isshoni-audiotest only; stable within v1, not for apps. They render or decode test signals. */
+/* For cmd/isshoni-audiotest only; stable within v1, not for apps. They render or decode test signals.
+   endpoint_id: an IMMDevice id (UTF-8); NULL or "" = the default render endpoint (eConsole). */
 IM_API im_status IM_CALL im_test_render_tone(const char *endpoint_id, float hz, float amp, int32_t ms);
-IM_API int32_t   IM_CALL im_test_render_bursts(const char *endpoint_id, float hz, float amp, int32_t burst_ms,
-                                               int32_t period_ms, int32_t count, int64_t *onset_qpc_ns, int32_t cap);
-IM_API int32_t   IM_CALL im_test_opus_decode(const uint8_t *pkt, int32_t len, float *pcm, int32_t max_frames);
+/* Returns the number of onsets written to onset_ns, or a negative status. onset_ns: each burst's predicted
+   device-position time (engine clock), from the render client's IAudioClock, never from the mixer (05 §13.2). */
+IM_API int32_t IM_CALL im_test_render_bursts(const char *endpoint_id, float hz, float amp, int32_t burst_ms,
+                                             int32_t period_ms, int32_t count, int64_t *onset_ns, int32_t cap);
+/* Returns the frames per channel decoded into pcm (interleaved stereo float), or a negative status. */
+IM_API int32_t IM_CALL im_test_opus_decode(const uint8_t *pkt, int32_t len, float *pcm, int32_t max_frames);
 
 #ifdef __cplusplus
 }
@@ -657,7 +680,10 @@ instead of C enums (`IM_RULE_SRC_*` for 05's `IM_SRC_*`, `IM_EXCLF_*` for 05's `
 `im_audio_config` is a fixed 32-byte struct and `im_start_config` points at `im_exclusions` instead of nesting it, so
 the start config keeps append-only evolution; audio and PCM packets carry `layer = IM_NO_LAYER` and the Opus target
 is set with `im_set_audio_bitrate` (05's `IM_LAYER_AUDIO` is not defined); 05's `im_test_qpc_ns` is
-`im_clock().mono_ns` (no separate export). Everything here is v1.0 (`IM_ABI_MINOR 0`) and lands in slice E1.
+`im_clock().mono_ns` (no separate export). The audio exports keep 05 §4.1's shapes: `im_list_audio_apps` takes a
+`flags` argument (0, reserved), `im_audio_sound_check` an `int32_t timeout_ms` (1000..10000; `helper_pid` 0 means the
+DLL plays the chime itself), and `im_test_render_bursts` writes `onset_ns`, the bursts' predicted device-position
+times on the engine clock (05 §13.2). Everything here is v1.0 (`IM_ABI_MINOR 0`) and lands in slice E1.
 
 ### 5.3 Call reference
 
@@ -676,7 +702,7 @@ is set with `im_set_audio_bitrate` (05's `IM_LAYER_AUDIO` is not defined); 05's 
 | `im_pick_source` | until the user picks; default timeout 120 s | picker thread (STA) | Go `Pick` (03 share flow), enginetest `pick` | §7.2. Never call it from the UI thread. One pick at a time (`IM_ERR_LIMIT`, `pick_busy`, otherwise) |
 | `im_cancel_pick` | no | caller | Go `Pick`'s ctx (03: Escape in the share sheet, app quit) | |
 | `im_release_source` | no | caller | Go `Release` (03 when the user backs out) | Token rules: §7.2 |
-| `im_list_audio_apps` | < 1 ms watching or live; ≤ 500 ms one-shot | 05's watcher | 05's `audio.Service` (`AudioController.AudioReport`); Go `AudioApps` | 05's report (05 §12.1) |
+| `im_list_audio_apps` | < 1 ms watching or live; ≤ 500 ms one-shot | 05's watcher | 05's `audio.Service` (`AudioController.AudioReport`) | 05's report (05 §12.1); `flags` 0 |
 | `im_audio_watch`, `im_audio_unwatch` | < 10 ms (posted) | 05's watcher | 05's `audio.Service` (`WatchAudio`, `UnwatchAudio`) | 05 §4 |
 | `im_set_exclusions` | < 10 ms; applied ≤ 50 ms | caller (copies, posts to 05's watcher) | 05's `audio.Service` (`SetExclusions`) | 05's semantics; `im_start_config.exclusions` is the same set at start |
 | `im_audio_set_mode`, `im_audio_set_muted` | < 10 ms (posted) | 05's watcher and mixer | 01's core (`SetAudioMuted`, the pause mute) and 05's `audio.Service` (`SetAudioMode` for "Share sound" off/on) | `im_audio_set_muted` is the pause mute 01's core sets (05 owns the mix bus); "Share sound" off is `im_audio_set_mode(OFF)`; `IM_AUDIO_MODE_EVERYTHING` → `IM_ERR_INVALID_ARG` in M2; pause is `im_set_paused` |
@@ -692,7 +718,7 @@ is set with `im_set_audio_bitrate` (05's `IM_LAYER_AUDIO` is not defined); 05's 
 | `im_set_profile` | no (async) | caller | 01 on `quality.hint{codec}` (M1 01 §8.10) through `Reconfigure{Profile}` | Re-inits every layer; the next packets carry `REINIT\|KEYFRAME` and the new `profile` |
 | `im_set_content_hint` | no (async) | caller | 01 on a preset change (`Reconfigure{Preset}`) | Re-inits every layer with `REINIT\|KEYFRAME`, coalesced with the other re-inits, spaced at least 1 s apart (§9.5) |
 | `im_set_paused` | no | caller | 01's core (`Share.SetPaused`, which 03's controls and hotkeys call; feature `share.pause`) | §8.5: no new captured content after the next frame interval; calls `Mixer::SetPaused` |
-| `im_set_audio_bitrate` | no | caller | 01 on a preset change (Movie 256 kbps) through `Reconfigure{AudioBitrate}` or `SetBitrate(media.LayerAudio)` | Live (`OPUS_SET_BITRATE`) |
+| `im_set_audio_bitrate` | no | caller | 01 on a preset change (Movie 256 kbps) through `SetBitrate(media.LayerAudio)` (`media.Reconfig` has no audio field) | Live (`OPUS_SET_BITRATE`) |
 | `im_get_stats` | < 5 ms | caller (snapshot) | 01's core, polled at 1 Hz into `ShareSnapshot` for 03's stats panel and debug overlay; enginetest | §5.6 |
 | `im_stop` | ≤ 2 s | caller + session threads | 01 (`Session.Stop`); the Go binding after `ENDED` | Idempotent on a live handle; after it returns the handle is invalid (`IM_ERR_INVALID_ARG`) |
 | `im_protect_window` | < 5 ms | caller | `enginetest protect-check` (Go `ProtectWindow`) in M2; the macOS engine's SCContentFilter exclusions in M3. Not the app: 03's `winos` sets `WDA_EXCLUDEFROMCAPTURE` itself (§11) | §11 |
@@ -827,12 +853,17 @@ Event detail JSON (`im_packet.data` of `IM_PACKET_EVENT`):
 Event JSON is at most 1 KiB. Audio has no events: its state, banners and report events come from
 `im_list_audio_apps` and `im_audio_levels_get` (05 §12).
 
-`im_read_logs`: newline-delimited JSON records, oldest first, whole lines only, at most `cap − 1` bytes; records that
-don't fit stay queued; 0 = empty. Record: `{"t":"2026-10-21T12:00:00.000Z","level":"info","component":"encode",
-"msg":"encoder opened","attrs":{"layer":"f","encoder":"nvenc","w":1920,"h":1080}}`. The log ring holds 512
-records; real-time threads drop records when it is full (counted in the next record). **Privacy**: no record at any
-level, debug included, contains a window title or names an executable, a process or an app (README §3 item 18; 03
-§17 drains this ring at every level). Logs stay on the device (plan "Privacy and trust model").
+`im_read_logs`: newline-delimited JSON records, oldest first, whole lines only, at most `cap − 1` bytes plus a NUL;
+records that don't fit stay queued; 0 = empty. A formatted record is at most **8192 bytes**, newline included, and
+`cap` must be larger than that: a NULL buffer or `cap ≤ 8192` is `IM_ERR_INVALID_ARG`, so a record can never be
+stuck (the binding drains with a larger buffer). Record: `{"t":"2026-10-21T12:00:00.000Z","level":"info",
+"component":"encode","msg":"encoder opened","attrs":{"layer":"f","encoder":"nvenc","w":1920,"h":1080}}`. `attrs` is
+always present, possibly `{}`. Strings are cut on a UTF-8 boundary: `component` at 23 bytes, `msg` at 159, keys at 23,
+string values at 63; at most 8 attributes (more are left out). Records above `im_init`'s `log_level` are not
+recorded. The log ring holds 512 records; a push into a full ring drops the record (real-time threads never wait),
+and the next record that gets in carries the count as a top-level `"dropped":N` after `"msg"`. **Privacy**: no record
+at any level, debug included, contains a window title or names an executable, a process or an app (README §3 item 18;
+03 §17 drains this ring at every level). Logs stay on the device (plan "Privacy and trust model").
 
 ### 5.7 Status codes, events and the UI state each maps to
 
@@ -1613,15 +1644,15 @@ class AudioEngine {      // process-wide (05)
   virtual im_status Init(uint32_t init_flags) = 0;          // im_init: starts 05's watcher (not with IM_INIT_NO_AUDIO)
   virtual void Shutdown() = 0;                              // im_shutdown; Init may follow
   virtual uint32_t ProbeFlags() = 0;                        // im_caps.audio_flags (runs on 05's watcher)
-  virtual int32_t ListAppsJson(char* buf, int32_t cap) = 0; // im_list_audio_apps (snprintf convention)
+  virtual int32_t ListAppsJson(uint32_t flags, char* buf, int32_t cap) = 0;  // im_list_audio_apps (snprintf)
   virtual im_status SetRules(const im_exclusions* ex) = 0;  // im_set_exclusions, im_start_config.exclusions; copies
   virtual im_status Watch(const im_exclusions* ex) = 0;     // im_audio_watch
   virtual im_status Unwatch() = 0;                          // im_audio_unwatch
   virtual im_status SetMode(uint32_t mode) = 0;             // im_audio_set_mode
   virtual im_status SetMuted(bool muted) = 0;               // im_audio_set_muted (the user's mute)
   virtual im_status LevelsGet(im_audio_levels* out) = 0;    // im_audio_levels_get
-  virtual int32_t SoundCheck(uint32_t helper_pid, uint32_t timeout_ms, char* json, int32_t cap) = 0;
-                                                            // im_audio_sound_check
+  virtual int32_t SoundCheck(uint32_t helper_pid, int32_t timeout_ms, char* buf, int32_t cap) = 0;
+                                                            // im_audio_sound_check (05 §11.3)
   virtual std::unique_ptr<Mixer> NewMixer() = 0;
 };
 }
@@ -1629,8 +1660,10 @@ class AudioEngine {      // process-wide (05)
 
 There is no event sink: 05 reports through `im_list_audio_apps` (`seq`, `state`, `events[]`) and `im_audio_levels_get`
 (`report_seq`), which Go polls (05 §14.4). `api/exports.cpp` forwards the audio exports to `AudioEngine` after its
-argument checks. In M2 those checks refuse `IM_AUDIO_MODE_EVERYTHING` in `im_start` and `im_audio_set_mode` with
-`IM_ERR_INVALID_ARG` (README §3 item 15; the value stays reserved). `audio_bridge/` creates the session's `Mixer` in
+argument checks, with their arguments as the header declares them (05 §10.5 has the same signatures: `ListAppsJson`
+takes `im_list_audio_apps`' `flags`, `SoundCheck` its `int32_t timeout_ms`). In M2 those checks refuse
+`IM_AUDIO_MODE_EVERYTHING` in `im_start` and `im_audio_set_mode` with `IM_ERR_INVALID_ARG` (README §3 item 15; the
+value stays reserved). `audio_bridge/` creates the session's `Mixer` in
 `im_start` (for `audio.mode` EXCLUDE_APPS), calls `SetRules` first when `im_start_config.exclusions` is non-NULL, wires
 the session's Opus stage as the sink, and maps `im_set_paused` to `Mixer::SetPaused`. 04's tests run against a fake
 `AudioEngine` (§18.2).
@@ -1736,6 +1769,11 @@ Windows-only extras of §12.2 and the OpenH264 helpers.
 
 ### 12.2 API
 
+The contract types are 01 §5's as `internal/media` declares them (README WA02): `media.EngineStats`, `media.Probe`
+with `EncoderInfo` and `CaptureCaps`, `media.Config` with `Listed`, `media.Reconfig`. Where this section once named
+them otherwise (`media.Stats`, `EncoderInfo.MaxLayers`, `CaptureCaps.MonitorList`, `Engine.AudioApps`, a `GOP` field,
+`Reconfig.AudioBitrate`), 01's names won and the text below follows them.
+
 ```go
 package native // import "github.com/MoonWX/isshoni/internal/media/native"
 
@@ -1765,7 +1803,6 @@ func (e *Engine) Info() media.Info                                             /
 func (e *Engine) Probe(ctx context.Context, refresh bool) (media.Probe, error) // im_probe(FULL) first and on refresh
 func (e *Engine) Sources(ctx context.Context) ([]media.Source, error)          // im_list_sources: monitors
 func (e *Engine) Pick(ctx context.Context, r media.PickRequest) (media.Source, error) // ctx done → im_cancel_pick
-func (e *Engine) AudioApps(ctx context.Context) ([]media.AudioApp, error)      // the apps of 05's report
 func (e *Engine) Start(ctx context.Context, cfg media.Config) (media.Session, error) // ErrBusy while one runs
 func (e *Engine) Close() error                                                 // stops sessions, im_shutdown; DLL stays
 // Contract addition (01 §5.1).
@@ -1810,7 +1847,7 @@ func (s *session) Stop() error                                    // §12.3
 // Contract additions (01 §5.1).
 func (s *session) SetLayerActive(layer string, active bool) error // im_set_layer_active
 func (s *session) SetPaused(paused bool) error                    // im_set_paused (video frozen, Mixer::SetPaused)
-func (s *session) Stats() (media.Stats, error)                    // im_get_stats (§5.6), decoded
+func (s *session) Stats() (media.EngineStats, error)              // im_get_stats (§5.6), decoded
 // Windows-only extras (type assertion).
 func (s *session) SetAudioBitrate(bps int) error                  // im_set_audio_bitrate
 func (s *session) PCMTap() <-chan PCMChunk                        // buffered 128; nil unless AudioConfig.TapPCM
@@ -1836,12 +1873,13 @@ func (s *session) PCMTap() <-chan PCMChunk                        // buffered 12
 
 | `media.Config` | `im_start_config` |
 |---|---|
-| `Source` | `source_id`. A `mon:` or `test:` id adds `IM_START_ALLOW_LISTED_SOURCE`: the app (03) passes only `Pick` results (plan "OS pickers only"); listed ids serve Conformance, 01 §12.3 and enginetest |
+| `Source` | `source_id` (`NULL` for `""`: an audio-only session) |
+| `Listed` | `IM_START_ALLOW_LISTED_SOURCE`, so a `mon:` or `test:` id is accepted: the app (03) never sets it and passes only `Pick` results (plan "OS pickers only"); listed ids serve Conformance, 01 §12.3 and enginetest |
 | `Encoder` | `""` → `IM_ENC_AUTO` (what 01 always passes); a token of §5.6 → that kind (enginetest, 03's hidden support override) |
 | `Profile` | `"6400"` → `IM_PROFILE_HIGH`, `"42e0"` → `IM_PROFILE_CB`, `"640c"` → `IM_PROFILE_HIGH` (the engine never sets constraint_set4/5, so packets and `EventLayer` say `6400`) |
 | `Preset` | `content_hint`: `auto` → `AUTO`, `game` and `movie` → `MOTION`, `text` → `DETAIL` |
-| `GOP` | `layers[0].gop_ms`; other layers 0 (default 2000) |
-| `Layers[i]` | `layers[i]`: `rid`; `max_pixels` = `MaxPixels`; `fps` = `MaxFPS`; `bitrate_bps` = `Bitrate` (01's ratectl initial target, ≤ `maxBitrate`); `width`/`height` 0 |
+| (no GOP field, 01 §5.1) | every `layers[i].gop_ms` 0: the defaults of §9.4 (`f` 4000, others 2000) |
+| `Layers[i]` | `layers[i]`: `rid`; `max_pixels` = `MaxPixels`; `fps` = `MaxFPS`; `bitrate_bps` = `Bitrate` (01's ratectl initial target, ≤ `maxBitrate`); `flags` `IM_LAYER_INACTIVE` when `Inactive`; `width`/`height` 0 |
 | `Audio == nil` | `audio.mode` = `IM_AUDIO_MODE_OFF` |
 | `Audio` (05's `media.AudioConfig`) | `audio.mode` from `Mode` through 05 §13.1's single mode mapping (`""` and `exclude-apps` → `EXCLUDE_APPS`, `media.AudioTestTone` → `TEST_TONE`; `everything` and `off` → `*media.Error{Code: invalid}` without a DLL call in M2); `bitrate_bps` = `BitrateBPS`; `flags`: `TapPCM` → `IM_AUDIOF_TAP_PCM`, `TestFlags` passed through (`IM_AUDIOF_TEST_FAIL_PROBE`); `exclusions` → an `imExclusions` built from `Exclusions` (rules in order, `KeepOutMicUsers` → `IM_EXCLF_KEEP_OUT_MIC_USERS`, `FastPath` → `IM_EXCLF_FAST_PATH`, `SharedPID`) |
 | `Borderless == false` | `IM_START_KEEP_BORDER` |
@@ -1850,23 +1888,28 @@ func (s *session) PCMTap() <-chan PCMChunk                        // buffered 12
 **`Reconfigure`** maps zero fields to "keep" and applies, in this order, returning the first error:
 `Profile` → `im_set_profile`; `Preset` → `im_set_content_hint` (the mapping above); each `Layers[i]` (by `RID`) with
 `MaxFPS` or `MaxPixels` set → `im_update_layer` with the layer's current config and those fields replaced (its
-`Bitrate`, if set, goes in the same call), with only `Bitrate` set → `im_set_bitrate`; `AudioBitrate` →
-`im_set_audio_bitrate`. The engine coalesces the resulting re-inits (§9.5).
+`Bitrate`, if set, goes in the same call), with only `Bitrate` set → `im_set_bitrate`. `media.Reconfig` has no audio
+field: the Opus target changes only through `SetBitrate(media.LayerAudio, bps)` → `im_set_audio_bitrate`. The engine
+coalesces the resulting re-inits (§9.5).
 
-**`im_caps` → `media.Probe`**: `OS` = `{"windows", "10.0.<os_build>", os_build}`. `Encoders`: the usable ones
-(`status == IM_OK`) in the engine's order, then the unusable ones with `Tested = false` and `Reason` = their token;
-`Name` = token, `HW` = `IM_ENCF_HARDWARE`, `Profiles` = `"6400"` if `IM_ENCF_HIGH` and `"42e0"` if `IM_ENCF_CB`,
-`LiveBitrate` = `IM_ENCF_LIVE_BITRATE`, `MaxLayers` = 2 (NVENC's limit is per system and can't be probed, §9.7),
-`Tested` = `IM_ENCF_AVAILABLE`. `Capture` = `{Picker: IM_OS_WGC_PICKER, Borderless: IM_OS_WGC_BORDERLESS,
-MonitorList: IM_OS_DESKTOP_DUPLICATION, MaxFPS: 60}`. `Audio` =
-`media.AudioCapsFromFlags(im_caps.audio_flags)` (01 §5.1: `ProcessLoopback`, `EndpointLoopback`, `SessionEvents`,
-`MicDetection`, `Backend`), decoded in that one place so the binding and the fake agree; there is no `Mode` or
-`Degraded` field (05's report carries banners).
+**`im_caps` → `media.Probe`** (01 §5.1's `probe.go`): `OS` = `{Name: "windows", Version:
+"10.0.<os_build>.<os_ubr>", Build: os_build, Supported: IM_OS_SUPPORTED}`. `Encoders`: every `encoders[]` entry in
+the engine's order, unavailable ones included: `Name` = token, `Adapter` = `adapter_index` (−1 for `0xFFFFFFFF`, a
+software encoder), `HW` = `IM_ENCF_HARDWARE`, `Tested` = `IM_ENCF_AVAILABLE`, `LiveBitrate` = `IM_ENCF_LIVE_BITRATE`,
+`Profiles` = `"6400"` if `IM_ENCF_HIGH` and `"42e0"` if `IM_ENCF_CB`, `ZeroCopy` = `IM_ENCF_ZERO_COPY`, `Status` = ""
+when `Tested`, else `status` mapped by the table below, `Reason` = `reason`. There is no layer count per encoder
+(NVENC's session limit is per system and can't be probed, §9.7). `Capture` = `{Picker: IM_OS_WGC_PICKER, Borderless:
+IM_OS_WGC_BORDERLESS, DesktopDuplication: IM_OS_DESKTOP_DUPLICATION, ExcludeFromCapture: IM_OS_EXCLUDE_FROM_CAPTURE,
+MaxFPS: 240 with IM_OS_WGC_MIN_INTERVAL, else 60}`. `Audio` = `media.AudioCapsFromFlags(im_caps.audio_flags)` (01
+§5.1: `ProcessLoopback`, `EndpointLoopback`, `SessionEvents`, `MicDetection`, `Backend`), decoded in that one place
+so the binding and the fake agree; there is no `Mode` or `Degraded` field (05's report carries banners).
 
 **`Pick`**: `OwnerWindow` → `parent_window`; `Kinds` is ignored on Windows (the picker shows both, §7.2); the result
-becomes `media.Source{ID, Kind: screen|window, Name, Width, Height, PID, Exe}` with `Exe` = the base name of
-`QueryFullProcessImageNameW` for `PID` ("" when `PID` is 0 or the query fails). A pick with `IM_SRCF_SELF` is
-released at once and returns `*media.Error{Code: invalid, Reason: "self_window"}` (03: "pick again"). `Sources`
+becomes `media.Source{ID, Kind: screen|window, Name, Width, Height, PID, Exe, MonitorID, Capture, OSBorder}` with
+`Exe` = the base name of `QueryFullProcessImageNameW` for `PID` ("" when `PID` is 0 or the query fails), `MonitorID`
+= `monitor_id`, `Capture` = `"wgc"`, `"dd"` or `"test"` from `capture_path`, `OSBorder` = `IM_SRCF_OS_BORDER`. A
+pick with `IM_SRCF_SELF` is released at once and returns `*media.Error{Code: invalid, Reason: "self_window"}` (03:
+"pick again"). `Sources`
 returns each monitor as `media.Source{ID: "mon:…", Kind: screen, Name, Width, Height}`.
 
 **Errors**: always `*media.Error{Code, Op, Detail, Reason}`. `Op` is the Go method (`"start"`, `"pick"`, `"next"`,
@@ -2027,8 +2070,15 @@ agree; a unit test reads both.
   only add files in their folders); `windows/` when `WIN32`; tests with `IM_BUILD_TESTS=ON`. Options: `IM_TEST_HOOKS`
   (OFF), `IM_FFMPEG_ROOT` (path to the unpacked FFmpeg build zip; only its `include/` is used at build time, its
   `bin/` only at run time), `IM_VERSION` (SemVer, default `0.0.0-dev`), `IM_WINVER` (four 16-bit numbers, default
-  `0.0.0.0`, set by 06 from `tools/desktoppkg winver`, 06 §5.3), `IM_COMMIT`. CMake reads `native/ffmpeg/lock.json`
-  (§9.2).
+  `0.0.0.0`, set by 06 from `tools/desktoppkg winver`, 06 §5.3), `IM_COMMIT`. CMake reads `native/ffmpeg/lock.json`,
+  when it exists, into `IM_FFMPEG_TAG`, `IM_AVCODEC_MAJOR` and `IM_AVUTIL_MAJOR` (§9.2; empty, with a status note,
+  until the lock names a published build). So that later slices needn't edit this integrator-owned file, WA03 also
+  wrote `IM_SANITIZE` (`address`, `thread`, `undefined` or `address,undefined`; MSVC takes `address` only, the
+  presets set it) and `IM_BUILD_FUZZ` (the libFuzzer targets of `tests/fuzz/`, clang), and `IM_TEST_HOOKS=ON` defines
+  `IM_TEST_HOOKS=1` for every target. An in-source build is refused; a preset builds in `native/build/<preset>/`,
+  which is git-ignored, and the root writes a `*` `.gitignore` and a `DisableFormat` `.clang-format` into any build
+  directory under `native/build/`, so neither `git status` nor `lint:native` sees vcpkg's installed headers there.
+  Test executables link `GTest::gmock_main` (gtest_main included), so fakes can use gMock.
 - **`native/CMakePresets.json`** (configure, build and test presets with the same names):
 
   | Preset | Host | Generator, config | What |
@@ -2036,7 +2086,7 @@ agree; a unit test reads both.
   | `win-x64-release` | Windows | Ninja, RelWithDebInfo | the shipped DLL and PDB; `IM_TEST_HOOKS=OFF`; no `VCPKG_MANIFEST_FEATURES` (libopus and speexdsp only) |
   | `win-x64-debug` | Windows | Ninja, Debug | development |
   | `win-x64-ci` | Windows | Ninja, RelWithDebInfo | `IM_TEST_HOOKS=ON`, `IM_BUILD_TESTS=ON`, vcpkg feature `tests`: the DLL CI tests and Go's Windows tests load |
-  | `win-x64-asan` | Windows | Ninja, Debug, `/fsanitize=address` | owner's PC and the nightly; feature `tests` |
+  | `win-x64-asan` | Windows | Ninja, Debug, `/fsanitize=address` | owner's PC and the nightly; `IM_TEST_HOOKS=ON` (it runs `win-x64-ci`'s tests), `IM_BUILD_TESTS=ON`, feature `tests`; without `/guard:cf` and `/RTC1`, linked with `/INCREMENTAL:NO` (WA03's conservative choice for `/fsanitize=address`, unverified until WA11 or the nightly runs it) |
   | `host-debug` | macOS, Linux | Ninja, Debug, clang or gcc | `common/` and its tests only; feature `tests` |
   | `host-tsan`, `host-asan` | macOS, Linux | clang | the same with ThreadSanitizer / AddressSanitizer+UBSan |
   | `host-fuzz` | macOS, Linux | clang `-fsanitize=fuzzer,address` | the fuzz targets |
@@ -2051,7 +2101,8 @@ agree; a unit test reads both.
   `isshoni-media.dll`; feature `tests` adds `gtest` (BSD-3-Clause, never shipped). `win-x64-release` sets no
   `VCPKG_MANIFEST_FEATURES`, so its port set is exactly libopus and speexdsp (06's port-set gate, 06 §9.3);
   `win-x64-ci`, `win-x64-asan` and the host presets add `tests`. `builtin-baseline` pins a vcpkg commit (set in E1).
-  Elsewhere the default host triplet.
+  Elsewhere the default host triplet. `native/vcpkg-configuration.json` declares no `default-registry`, which would
+  override `builtin-baseline`: it has the schema and empty `registries`, `overlay-ports` and `overlay-triplets` only.
 - **MSVC flags**: `/std:c++20 /W4 /WX /permissive- /utf-8 /EHsc /Zc:__cplusplus /Zc:preprocessor /sdl /guard:cf /Zi
   /Gy /Gw`, `/MT` (Release) or `/MTd` (Debug); defines `WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE
   _WIN32_WINNT=0x0A00 WINVER=0x0A00 IM_BUILDING_DLL`. Linker: `/DEBUG:FULL /OPT:REF /OPT:ICF /guard:cf /CETCOMPAT
@@ -2285,6 +2336,14 @@ Run on the Mac (`task native:test`, preset `host-debug`), in CI on ubuntu-24.04 
 | `resize_test` | 1 s debounce; letterbox meanwhile; no re-init when the computed output size is unchanged |
 | `opus_stage_test` | 05 §10.1's settings read back with `OPUS_GET_*` (constrained VBR, FEC 0, loss 0, fullband, DTX 0); 10 ms → 20 ms framing; packet time = first chunk − lookahead, consecutive packets exactly 20 000 000 ns apart; `REINIT` on the first packet and after `OnGap` (a half frame dropped, any time step); `DISCONTINUITY` after a ring drop with the grid unchanged; chunks before `epoch_ns` dropped and the first packet ≥ `epoch_ns` with `REINIT`; a decoded 1 kHz tone at 128 kbps has SNR ≥ 30 dB; zero chunks (muted bus) → encoded silence keeps flowing at 50 packets/s; PCM tap: 3840-byte packets stamped at chunk time, flowing together with Opus; live bitrate change; the test tone's code-3 padding holds an 18-byte Marker that M1's `ParseAudioMarker` reads (golden bytes) |
 | `json_test` | escaping (quotes, control characters, emoji, lone surrogates → U+FFFD), snprintf return values |
+| `status_test` | the `im_status` values and §5.7's detail tokens; the thread-local `im_last_error` detail (`<token>: ` prefix, one line, bounded, per thread, cleared, snprintf copy); §5.1's `struct_size` rule (older and newer callers read, below v1.0 → `IM_ERR_ABI`, output stops at the caller's size) |
+| `log_ring_test` | §5.6's records: the NDJSON format and timestamp, escaping and the string bounds, levels, a record that doesn't fit stays queued, `im_read_logs`' argument checks (`cap ≤ 8192` → `IM_ERR_INVALID_ARG`), a full ring's drops as `"dropped":N` in the next record, wrap-around, concurrent producers and a drainer (clean under `host-tsan`) |
+| `abi_header_c_test` | `isshoni_media.h` compiled as C11 with every warning an error and `-Wpadded` (MSVC C4820): no ABI struct has implicit padding, and the sizes and offsets are §5.4's |
+
+`native/common` holds, besides the status codes, the handle table, the JSON writer and the log ring that README WA03
+names, the helpers the exports of WA11 need: `abi/struct_size.h` (`ReadIn`, `CheckOut`, `WriteOut`: the
+`struct_size` rule of §5.1), `abi/layout.h` (`Layouts` and `LayoutJson` behind `im_abi_layout`, and `V1Size`, each
+top-level struct's v1.0 size) and `abi/utf8.h` (UTF-16 conversion, fixed `char[N]` copies cut on a UTF-8 boundary).
 
 **Fuzzing** (`host-fuzz`): `annexb_fuzz`, `sps_fuzz` (no crash, no out-of-bounds, idempotent output), 60 s per
 target in the slice that adds it and in the nightly; seeds in `native/common/tests/fuzz/corpus/`.
@@ -2455,10 +2514,12 @@ build that 06 produces.
 
 **01-client-core.md**
 - `internal/media` (01 §5) as the contract this binding implements: `media.Engine` (`Info`, `Probe`, `Sources`,
-  `Pick`, `AudioApps`, `Start`, `Close`, plus the addition `Release`), `media.Session` (`Next`, `Now`,
-  `RequestKeyframe`, `SetBitrate`, `Reconfigure`, `Stop`, plus the additions `SetLayerActive`, `SetPaused` and
-  `Stats() (media.Stats, error)` with §5.6's fields), `media.Packet` with `KindEvent` and `Event`, `media.Config`,
-  `media.Reconfig`, `media.Probe`, `media.Source`, `media.PickRequest`, `media.LayerAudio`, and `*media.Error`. The
+  `Pick`, `Start`, `Close`, plus the addition `Release`; the audio apps come from 05's `AudioController.AudioReport`,
+  not from an `Engine` method), `media.Session` (`Next`, `Now`, `RequestKeyframe`, `SetBitrate`, `Reconfigure`,
+  `Stop`, plus the additions `SetLayerActive`, `SetPaused` and `Stats() (media.EngineStats, error)`, decoded from
+  §5.6's JSON), `media.Packet` with `KindEvent` and `Event`, `media.Config` (with `Listed`), `media.Reconfig`,
+  `media.Probe` (`EncoderInfo` without a layer count, `CaptureCaps` with `DesktopDuplication`), `media.Source`,
+  `media.PickRequest`, `media.LayerAudio`, and `*media.Error`. The
   additions 04 assumes in 01's types: `media.Error.Reason`, `media.EncoderInfo.Reason`, `CodeTimeout` (whose `Unwrap`
   returns `context.DeadlineExceeded`), `media.Event` fields `Profile`, `LiveBitrate`, `NoOSIndicator`, `Limit`, and
   01 §5.2's event codes as the binding uses them (`EventLimit`, `EventEncoderChanged`, `EventSourceMinimized`,
@@ -2473,7 +2534,8 @@ build that 06 produces.
 - 01 applies `quality.hint`: `codec` → re-offer then `Reconfigure{Profile}`; `encodings[].active` →
   `SetLayerActive`/`SetBitrate(layer, 0)`; `maxBitrate` → `SetBitrate` with the plan's hysteresis (≥ 15 %, ≤ every
   2 s) and, for layers without `LiveBitrate`, only changes ≥ 30 %. A preset change goes through `Reconfigure`
-  (`Preset` → `im_set_content_hint`, fps → `im_update_layer`, Opus target → `im_set_audio_bitrate`). Resolution stays
+  (`Preset` → `im_set_content_hint`, fps → `im_update_layer`) and, for the Opus target, `SetBitrate(media.LayerAudio)`
+  → `im_set_audio_bitrate`. Resolution stays
   fixed per share in M2 (01 D11).
 - 01 calls `RequestKeyframe` on PLI/FIR, anchors SR NTP once per Publisher from `Session.Now` and Go's wall clock
   (01 §8.2; `im_clock` is not used for SRs), pulls `Next` continuously while a session runs (one pump goroutine), polls

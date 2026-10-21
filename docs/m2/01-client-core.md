@@ -469,8 +469,9 @@ type Error struct {
 }
 
 func (e *Error) Error() string        // "media: <op>: <code>" (+ " (<reason>)") (+ ": detail")
-func (e *Error) Is(target error) bool // true for a target *Error with the same Code and empty Op, Reason and Detail;
-                                      // also true for 05's ErrAudioNotRunning when Code is audio_not_running
+func (e *Error) Is(target error) bool // true for a target *Error with the same Code and empty Op, Reason and Detail
+                                      // (every sentinel below, and 05's ErrAudioNotRunning, is such a target)
+func (e *Error) Unwrap() error        // context.DeadlineExceeded for CodeTimeout (04 §12.2), else nil
 
 var (
 	ErrPermissionDenied = &Error{Code: CodePermissionDenied}
@@ -485,7 +486,8 @@ var (
 	ErrStopped          = &Error{Code: CodeStopped}
 	ErrInvalid          = &Error{Code: CodeInvalid}
 )
-// 05's audio.go declares ErrAudioNotRunning and ErrInvalidAudioConfig (plain errors); no second sentinel here.
+// 05's audio.go declares ErrAudioNotRunning = &Error{Code: CodeAudioNotRunning} (05 §13.1); invalid audio input is
+// CodeInvalid. There is no ErrInvalidAudioConfig and no plain errors.New sentinel.
 
 // EventCode is Go-only: the binding maps 04's IM_EVENT_* to it (table below); the numbers are not the header's.
 type EventCode uint8
@@ -729,7 +731,7 @@ func Open(o Options) (*Engine, error)
 
 type Options struct { // 04 §12.2's fields
 	Dir          string       // directory of isshoni-media.dll; "" = the executable's
-	FFmpegDir    string       // "" = <Dir>\ffmpeg
+	FFmpegDir    string       // "" = Dir, where the FFmpeg DLLs are installed (im_init_params.ffmpeg_dir = NULL)
 	OpenH264Path string       // "" = none; must have passed VerifyOpenH264
 	Logger       *slog.Logger // engine logs with component=engine
 	LogLevel     slog.Level   // mapped to IM_LOG_*
@@ -1812,19 +1814,48 @@ The component the client core owns, capture → last packet sent, is measured on
   - **A continuous quiet tone**: a 440 Hz sine at −30 dBFS through Web Audio, so the share carries real audio. It
     starts with a click on the page's **Start** button (browsers allow audio only after a user gesture), and the page
     shows "tone on".
-  The counter line also shows `cuts on|off`.
-- `g2g measure -d 60s -o result.json [-server https://…]` grabs the whole desktop 20 times a second with GDI
-  (`GetDC(0)`, `CreateDIBSection`, `BitBlt` with `SRCCOPY|CAPTUREBLT`, through `x/sys/windows` lazy procs; no cgo),
-  decodes the clock's own strip at its known position and the **largest other copy** of the strip (found once during
-  a 2 s calibration by matching the guard pattern at scales 0.25–1.0 in steps of 0.05, then tracked), and records
-  `Δ = v_clock − v_copy` (mod 65536) per screenshot. A Gray code changes one bit per step, so a screenshot taken
-  during a transition is off by at most one frame. With `-server` it also measures the TCP connect time to the
-  server's 443 five times and records the median as the RTT.
+  The counter line also shows `cuts on|off` and `tone on|off`. `?freeze=<ms>` draws one frame as at that time and
+  stops (the decoder's fixtures are recorded so), and the page has a read-only debug hook, `window.g2gClock`.
+- `g2g measure [-d 60s] [-run gate|nosound|nocuts] [-o result.json] [-server https://…] [-dump DIR]` grabs the
+  **primary monitor** (`(0,0)` at `SM_CXSCREEN` × `SM_CYSCREEN`) 20 times a second with GDI (`GetDC(0)`,
+  `CreateDIBSection`, `BitBlt` with `SRCCOPY|CAPTUREBLT`, through `x/sys/windows` lazy procs, per-monitor DPI aware
+  so the pixels are physical; no cgo). With the run book's one monitor, or the primary one of a larger setup (step
+  2), that is the shared screen; it avoids slow multi-monitor BitBlts, and the clock's known position is relative to
+  that monitor. A 2 s calibration finds the clock's own strip (scale 1, normally at the top-left of the full-screen
+  page) and the **largest other copy** of the strip at a scale of 0.25–1.0 that is in at least 30 % of the
+  calibration screenshots. Strips are found by scanning rows for the guard pattern (grey, black half, white, then
+  white, black half, grey): the guards' black halves give each copy's scale, and the guards' ends place every cell to
+  a fraction of a pixel, so every scale in the range decodes, not only steps of 0.05 (whose far cells would be off by
+  almost a cell at, say, 0.43). Then it reads both strips in each screenshot, follows the copy when the viewer moves
+  (`copyMoves`), and records `Δ = v_clock − v_copy` (mod 65536) per screenshot.
+- **A strip caught mid-transition** has cells between two frames. With millisecond values a 17 ms step changes
+  several Gray bits, so reading those cells either way could be off by up to 31 ms; the decoder takes the closest
+  complementary resolution of the ambiguous cells and its midpoint, which is within **half a frame** (checked
+  exhaustively). Such samples count in `transitions`.
+- **Plausibility filter**: a strip that decodes can still be wrong (a cell flipped by the codec, and one wrong high
+  bit moves the value by seconds), so these screenshots count as decode failures of cause `implausible`, not as
+  samples: the clock's value disagrees with the capture time (anchored during calibration) by more than 150 ms; Δ
+  is over 30 s; or Δ is more than 3 s from the median of the last 21 accepted samples (once there are 5). After 20
+  implausible readings in a row that agree with each other, the tool takes them as the new normal (a reloaded page,
+  a latency step) and follows them, with a warning.
+- With `-server` it also measures the TCP connect time to the server (443 for https) five times after one DNS lookup,
+  records the median as the RTT (a warning above 50 ms), and reads the server's version from `/api/v1/info`.
+  `-dump DIR` saves PNG crops of the two strips at calibration and for the first screenshots that fail to decode, for
+  diagnosis (look at them before sharing them).
 - `-run gate|nosound|nocuts` (default `gate`) names the run in the JSON. The operator states what the run is; the
-  tool doesn't check it.
-- Output: the run name, samples, p50, p95, max, decode failures, the monitor's refresh rate, the RTT, and the
-  versions. Exit 0 when p95 < 200 ms with ≥ 90 % of screenshots decoded, 1 when the latency fails, 2 when too few
-  decoded (inconclusive, S1's convention). Every run computes this, and only the `gate` run decides the criterion.
+  tool doesn't check it. `g2g version` prints the tool's, Go's and Windows' versions.
+- Output (to `-o`, or stdout): the run name, `startedAt`, the samples, `decodedPct`, p50, p95, max, the decode
+  failures by cause (`capture`, `clock`, `copy`, `implausible`), `transitions`, `copyMoves`, the monitor's refresh
+  rate, the screen size, the copy's scale and position, the RTT and its five samples, the versions (g2g, Go, Windows,
+  the server), the `criterion`, the `result`, the `exitCode` and every screenshot's Δ (`series`); no host, user,
+  machine or path. Exit 0 when p95 < 200 ms with ≥ 90 % of screenshots decoded, 1 when the latency fails, 2 when too
+  few decoded or the run was interrupted (inconclusive, S1's convention); there are only these three codes, so a usage
+  error or a measurement that couldn't run (not on Windows, no clock or copy on the screen) is 2 too. Every run
+  computes this, and only the `gate` run decides the criterion.
+- The decoder tests' recorded fixtures are headless-Chrome renders of the real clock page (`?freeze=`): Chrome
+  scales the viewer copy, and a JPEG round trip stands in for codec artefacts. They are not Windows GDI screenshots,
+  which only the owner's-PC run gives; re-recording them is reproducible byte for byte (`G2G_CHROME=<chrome> go -C
+  tools test ./g2g -run TestRecordFixtures -args -record`).
 
 **The run** (manual, owner's PC, Win11 and Win10 22H2, with the release candidate):
 1. An isshoni server with RTT ≤ 50 ms from the PC (the M1 exit-test VPS, or a LAN server); note the RTT.

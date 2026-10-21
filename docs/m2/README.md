@@ -156,7 +156,11 @@ frame and mutes its audio (01 D14).
 packages, `internal/protocol` (and `api`, `relay`), the `internal/media` root, `internal/version` and `internal/logx`;
 engines enter only through `cmd/isshoni-desktop` (`native` always, `fake` in `dev || e2e` files) and
 `internal/desktop/e2ehost`; the server never imports `internal/desktop` or Wails, and the app never imports
-`internal/server`. Third-party modules are governed by the license gate, not by depguard (01 D2).
+`internal/server`. Third-party modules are governed by the license gate, not by depguard (01 D2). As WA02 wrote
+them: a catch-all `wails` rule keeps Wails out of every package except `cmd/isshoni-desktop` (and `tools/wails3`);
+06's `deploy-importers` (only `internal/server` imports `deploy`, 06 §7.4) and `update` (06 §8.9) rows are there
+too; `media` and `media-audiorules` allow only the standard library; and `desktop-no-wails`, `server-no-desktop`,
+`desktop-main-no-fake` and `wails` also cover test files, while the other M2 rules, like M1's, cover non-test files.
 
 ## 3. Integration decisions
 
@@ -193,7 +197,7 @@ The specs were written in parallel and then reconciled. The outcomes:
   Taskfile's structure.
 - Glass-to-glass is 01's `tools/g2g`; 04 supplies the component numbers (stats `latencyMs`, `enginetest bench`).
 
-**Conflicts between the specs, decided here** (WA01 writes each into the named sections)
+**Conflicts between the specs, decided here** (WA01 wrote each into the named sections)
 1. **Deep-link command line**: `"<install dir>\isshoni.exe" --open-url "%1"` (02 §12.2, 03 §13.1). A launch that
    contains `--open-url` takes exactly the next argument, which must start with `isshoni:`, and honors no other flag.
    06 §2.3, §2.4, §16, §17, §18 and R4 drop `--deeplink -- "%1"`.
@@ -255,7 +259,36 @@ The specs were written in parallel and then reconciled. The outcomes:
     engine's log ring that the binding drains (03 §17; 04 §5.6 and E14's log test at info and at debug level; 05 §16
     and its debug-level log test).
 
-Items 15–18 came out of the design review and are already written into the named sections; WA01 only checks them.
+Items 15–18 came out of the design review and were in the named sections before WA01, which checked them.
+
+**Decided after group 1** (WB1 wrote each into the named sections; they are the inconsistencies (a)–(h) that WA01's
+review found and left open)
+19. **`FFmpegDir` default**: `native.Options.FFmpegDir` `""` means `Dir`, so the binding passes
+    `im_init_params.ffmpeg_dir = NULL`, the engine DLL's own folder: the installer puts the FFmpeg DLLs next to
+    `isshoni-media.dll` (06 §2.2), and `im_build_info`'s `ffmpeg.dir` is `"."` then (04 §5.2, §5.6, §12.2, §13.3).
+    01 §7.1 drops `<Dir>\ffmpeg`.
+20. **Audio backend in the probe**: `Probe.Audio.Backend`, computed by `media.AudioCapsFromFlags`; there is no `Mode`
+    (or `Degraded`) field (01 §5.1, 03 §6.3, §24, 04 §12.2). WA01's review fixes already removed 03 §24's
+    `Probe.Audio.Mode`; no spec names it now.
+21. **`playback.state` has no `v`**: the payload is `{playing, browser, os}`, `relay.PlaybackState{Playing, Browser,
+    OS}` (01 §11.11, WA18). Its only receiver is the core, which ignores unknown fields, so a later field is additive
+    and a change of meaning takes a new kind. `playback.stop` keeps `v: 1` (its receiver is the web client). 03
+    §12.2, §23 and §24 drop `v: 1` and `V`.
+22. **`SetViewerBrowser` takes the sender's connection first**: `SetViewerBrowser(connID, family, os string, playing
+    bool)` (05 §14.2), called with `EventPlaybackState`'s `From`, `Browser`, `OS`, `Playing` in that order (01
+    §11.10–§11.11, 03 §12.2, 05 §22), so several tabs are tracked apart. `os` is M1's `ClientOS` spelling, which
+    `audiorules.OSNames.For` accepts next to GOOS (05 §5.4, WA06).
+23. **Link binding names**: 03's `Auth` service binds 02 §11.7's methods as `Auth.Link`, `Auth.CancelLink` and
+    `Auth.LinkWithPassword` (item 8; 02 §11.7, §14, §18, §20; 03 §6.2, §8.2); there is no `Link` service and no
+    `Link.Password`.
+24. **The compat admin file**: `ISSHONI_COMPAT_ADMIN_FILE` is `{"username", "password"}` (mode 0600), and both compat
+    tests, 01's `TestCompatServer` and 02's `TestCompatServerDeviceFlow`, take the server only from
+    `ISSHONI_COMPAT_SERVER_URL`: one source for the URL (01 §14, §15; 02 §13.4, §18; 06 §10.3). 02 and 06 drop the
+    file's `origin`.
+25. **Audiotest `-out` is a folder**: `run … -out <dir>` (default `.`) writes the report into that folder under 05
+    §18.7's name, as 05 §18.8, 06 §10.4 and the exit run book (§6) call it with `-out .`; 05 §18.2 drops `-out file`.
+26. **The Actions approval setting** is GitHub's "Require approval for all external contributors" (06 §10.5, §14
+    item 4; §8 here); 05 §18.8 drops "outside collaborators".
 
 **Re-cut in this plan**
 - 04 E1 splits into the header and native skeleton (WA03) and the binding's pure Go half, which joins E2's Go loader
@@ -327,7 +360,8 @@ first, branches and PRs) apply unchanged. This section lists only what M2 adds o
   (02 §11.6) under `%LOCALAPPDATA%\isshoni\`, the registry values of 06 §2.3, and the refresh token only in Credential
   Manager. Release builds read no environment variable for paths (04 §13.3).
 - Build tags: `production` (the only tags a release has), `dev` and `e2e` (fake engine, never shipped), `updatetest`,
-  `isshoni_hw` (owner's-PC tests). The CMake option `IM_TEST_HOOKS` is on only in `win-x64-ci`. 06's release check
+  `isshoni_hw` (owner's-PC tests). The CMake option `IM_TEST_HOOKS` is on only in the test presets `win-x64-ci` and
+  `win-x64-asan` (04 §13.1), never in a shipped build. 06's release check
   fails a release build that links `internal/media/fake` or test hooks.
 
 ### Testing
@@ -441,7 +475,7 @@ fake), WA29 (`internal/client/core` §11.2), WA41 (`internal/desktop/app` and `O
 | `deploy/notices/native-windows.json` | WA03 | created in 06 §9.2's format; append-only, one entry per native dependency with the slice that adds it; WA78 adds the gate |
 | `deploy/windows/dll-imports.txt` | WA11 | append-only: any new system DLL import in the same PR |
 | `deploy/windows/tools.json`, `deploy/windows/msvc-env.ps1` | WA07 (the `msvc` entry and the script) | WA11 adds the other entries (NSIS, WebView2, Pester, PSScriptAnalyzer) and reuses the script; later changes are hand-made tool PRs (06 §3) |
-| `docs/m2/*.md` | WA01 | then only write-back slices, WA60 (04 §7.5) and WA87 (03 §3.2, §20). A slice that measures something a spec records puts the result in its PR body under the heading "Results for the spec": WA07 (06 §4.6), WA22, WA48 and WA68 (their 03 §3.2 rows, under "Wails checklist"), WA44 (04 §9.3, layer 0's VBV included). WA87 copies the 03 §3.2 rows; the integrator's `WB1` and `WB5` copy 06 §4.6 and 04 §9.3 |
+| `docs/m2/*.md` | WA01 | then only write-back slices, WA60 (04 §7.5) and WA87 (03 §3.2, §20). A slice that measures something a spec records puts the result in its PR body under the heading "Results for the spec": WA07 (06 §4.6), WA22, WA48 and WA68 (their 03 §3.2 rows, under "Wails checklist"), WA44 (04 §9.3, layer 0's VBV included). WA87 copies the 03 §3.2 rows; the integrator's `WB2` and `WB5` copy 06 §4.6 and 04 §9.3 (`WB1` could not: WA07's first PR run summary is on GitHub) |
 | `docs/*.md` (site pages) | 06 | WA57 (device rows, `#desktop-linking`), then WA85 |
 
 **Dependencies and pins** (each must pass the license gate; the first slice to need one adds it at the pin below)
@@ -487,6 +521,7 @@ fake), WA29 (`internal/client/core` §11.2), WA41 (`internal/desktop/app` and `O
 | WA20 | 2 | Version verdicts and deep links | 02 DA8; 02 §12, §13 | `internal/client/compat`, `internal/client/deeplink` | WA05 | 1 | Mac, CI ubuntu | The compat table, including the undecided `FromError` case; the `testdata/links.json` cases (query and fragment never read, ≤ 2048 bytes, the room-id rule); the `NormalizeOrigin` table; `FuzzParse` runs 30–60 s clean; `GOOS=windows go vet` clean |
 | WA21 | 2 | Credential store | 02 DA9; 02 §11.5 | `internal/client/credstore` | – | 1.5 | Mac, CI ubuntu, CI windows | The memory and file stores (non-Windows, mode 0600, atomic writes) pass; in `windows-go`: put, get, overwrite, delete and list under a random prefix, the blob size check and `ErrNotFound`, with `ERROR_NO_SUCH_LOGON_SESSION` mapped to a skip |
 | WA22 | 2 | Wails shell skeleton | 03 DK1 (without the engine files); 03 §3, §4.5, §5 | `cmd/isshoni-desktop` (`main.go`, a minimal `shell.go`, `main_other.go`, `doc.go`, `build/windows/`), `internal/desktop/assets`, `go.mod`/`go.sum`, `web/package.json` and its lockfile, `Taskfile.yml` (`desktop:dev`, `desktop:exe:windows`) | WA04, WA05 | 3 | Mac, CI ubuntu/macos/windows, owner's PC | The app opens the SPA on the owner's PC and with `task desktop:dev` on the Mac; `CGO_ENABLED=0` windows/amd64 builds from the Mac and ubuntu; `GOOS=darwin CGO_ENABLED=0 go vet ./...` passes on ubuntu; `go mod tidy` changes none of the server's direct requirements; the `assets` tests (`bridge.js`, the CSP header and meta, no service worker, the `/wails/*` guard with 03 §5.6's allowlist: object and method from the body or `?object=`, chunked bodies refused, 64 KiB cap, every runtime object but bound `Call`/`CancelCall` refused) pass on all three OSes; the license gate and govulncheck pass for the Windows binary; 03 §3.2's rows W1–W4, W9–W13 and W19–W21 recorded in the PR under "Wails checklist" (rows that need CDP by hand on the owner's PC until WA72; W15 comes with the generated bindings in WA48) |
+| WB1 | 2 | Group 1 write-backs into docs/m2 | group 1's integration and review notes (the slices' deviations and blocked items, the integration fixes); §3 items 19–26 | `docs/m2/*.md` | – | 0.5 | Mac | The write-backs are in the named sections and match the code as merged, with no code change: 04 §5.2 (the header as WA03 wrote it, with 05 §4.1's `flags`, `int32_t timeout_ms` and `onset_ns`), §5.3, §5.6 (`im_read_logs`: the 8192-byte line bound, `"dropped":N`, the string bounds), §10.2 (05 §10.5's `ListAppsJson`/`SoundCheck`), §2, §13.1 (WA03's CMake options, build folders, vcpkg configuration, the `win-x64-asan` flags), §18.1 (WA03's helpers and tests), §12.2, §20 (WA02: 01 §5's names, `media.EngineStats`, no `MaxLayers`, `MonitorList` or `Engine.AudioApps`, `Config.Listed`, no GOP or audio reconfig field); 05 §5.4 (WA06's API), §13.1 (WA02's report type names); 02 §7.3, §13.2, §17 (WA05: `NetworkMatch*`, the user-code constants, the params names, `ErrNotSemVer`, `SemVer.Compare`); 01 §5.2 (`ErrAudioNotRunning`, `Unwrap`), §12.2 (WA08: the primary monitor, the measured scale, half a frame, the plausibility filter, the JSON and the fixtures); 06 §4.1–§4.6 (WA07's build as written and the `FFMPEG_REPRO` rule; the first run's numbers wait for WB2), §10.1, §17 (WA04's filters, jobs and tasks, WA08-R5's tools vet); 03 §24's encoder-fallback line; README §2, §4, §3 wording and the shared-files row. The open inconsistencies (a)–(h) of WA01's review are settled as §3 items 19–26 and written into their sections |
 | WA23 | 3 | Engine session core on fakes | 04 E5; 04 §6.3, §6.4, §12.3, §18.2 | `native/windows/src/{session,engine,testhooks}/`, `native/windows/tests/` (`session_fake_test.cpp`), `internal/media/native` (`bridge.go`, `session_windows.go`) | WA10, WA11, WA12, WA13, WA15, WA16 | 3 | CI windows; Mac, CI ubuntu | `session_fake_test` (04 §18.2: each layer's first packet is `KEYFRAME\|REINIT` within 500 ms, also on a static pattern; a keyframe within one interval; `im_set_layer_active`; pause; profile switch; injected failures; ring overflow; `im_stop` ≤ 2 s with a blocked consumer; the fifth session is `IM_ERR_LIMIT`; the pick-token rules); `bridge_test` through `fakeCaller` on the Mac and ubuntu (04 §18.3); with the `win-x64-ci` DLL under goleak: `mediatest.Conformance` on `test:pattern` with `IM_ENC_FAKE` (checks 5 and 7 included) and `TestNativeIntoPublisher` (frames on both layers, a PLI answered within one frame, flash/beep offset < 45 ms) |
 | WA24 | 3 | FFmpeg in `windows-native` | 06 R3b; 06 §4.1, §5.1 | `.github/workflows/ci.yml` (`windows-native`: the locked zip as `IM_FFMPEG_ROOT`, the lock staleness and DLL hash checks, the `isshoni-native-tools` artifact), `Taskfile.yml` (`ffmpeg:fetch`, `native:dist`) | WA07 (with `lock.json`), WA11 | 0.5 | CI windows; owner's PC | A `pins.json` change without a new `lock.json` fails the job; the `ci\` folder carries the FFmpeg DLLs next to `isshoni-media.dll`; `task native:dist` builds the zip; `isshoni-native-tools` also carries `ci\` with the `win-x64-ci` DLL and the FFmpeg DLLs (for `enginetest avsync`, 06 §5.1). Manual: the zip unpacks on the owner's PC (the `enginetest probe -quick` check is WA44's) |
 | WA25 | 3 | Update manifest and signature | 06 R7; 06 §8.2, §8.3, §8.12, §11.5 | `internal/update` (`manifest.go`, `sshsig.go`, `signers.go` with the `Backup` flag), `tools/desktoppkg` (`manifest`), `tools/repocheck` (`keys`: the signers block, README rows, the OpenSSH 8.1 option rule), `deploy/desktop/min-version`, `deploy/keys/update_revoked`, `Taskfile.yml` (`release:update-keys`) | WA05 | 1.5 | Mac, CI ubuntu/macos/windows | 06 §16's sshsig and manifest tests: committed vectors verify; a flipped byte, the wrong namespace, `sha256`, an untrusted or revoked key, trailing bytes, bad armor and oversize input fail; signatures made by `ssh-keygen` verify when it is on the PATH; versions compare through `internal/version`; `FuzzSSHSIG` 30–60 s; `lint:keys` fails on a drifted signers block and on an `update_signers` with zero or two `isshoni-update-backup-<n>` lines; an active-key manifest revoking the backup is ignored and a backup-key manifest revoking the active key is persisted |
