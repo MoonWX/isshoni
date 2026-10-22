@@ -5,6 +5,9 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"github.com/MoonWX/isshoni/internal/desktop/i18n"
+	"github.com/MoonWX/isshoni/web"
 )
 
 // TestWebView2Usable is 03 §5.4's minimum, Evergreen 120.0, compared part by part as numbers.
@@ -34,7 +37,11 @@ func TestWebView2Usable(t *testing.T) {
 
 // TestWebView2Message: 03 §5.4's sentence, Microsoft's download and the project site's anchor.
 func TestWebView2Message(t *testing.T) {
-	m := webview2Message()
+	cat, err := i18n.Load(web.DesktopCatalog(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := webview2Message(cat)
 	for _, want := range []string{"isshoni needs the Microsoft Edge WebView2 Runtime",
 		"https://developer.microsoft.com/microsoft-edge/webview2/",
 		"https://moonwx.github.io/isshoni/troubleshooting#desktop-webview2"} {

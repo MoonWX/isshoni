@@ -1,0 +1,108 @@
+{
+  "desktop": {
+    "native": {
+      "tray": {
+        "tooltip": {
+          "idle": "isshoni",
+          "live": "Sharing {{source}} · {{count}} watching",
+          "paused": "Sharing paused · {{count}} watching",
+          "lockPrompt": "Sharing paused since you locked your PC · Resume sharing?",
+          "reconnecting": "Sharing · reconnecting…"
+        },
+        "open": "Open isshoni",
+        "quit": "Quit",
+        "pause": "Pause sharing",
+        "resume": "Resume sharing",
+        "stop": "Stop sharing",
+        "stopAndQuit": "Stop sharing and quit",
+        "withHotkey": "{{action}} ({{hotkey}})",
+        "restartAndUpdate": "Restart and update to {{version}}",
+        "pauseNeedsNewerServer": "Pause needs a newer server"
+      },
+      "pill": {
+        "live": "Sharing · {{count}} watching",
+        "paused": "Paused",
+        "lockPrompt": "Paused · Resume sharing?",
+        "reconnecting": "Reconnecting…",
+        "pause": "Pause",
+        "resume": "Resume",
+        "stop": "Stop"
+      },
+      "audio": {
+        "voiceAppsHeard": "Friends hear voice apps",
+        "questionsWaiting_one": "1 question waiting",
+        "questionsWaiting_other": "{{count}} questions waiting"
+      },
+      "toast": {
+        "stillSharing": "isshoni is still sharing. Stop it from the tray icon (^).",
+        "micPrompt": "{{app}} is using your microphone. Keep it out of your stream?",
+        "browserMicPrompt": "Your browser is using the mic (Discord Web?). Keep the whole browser out; friends won't hear any of its tabs. Tip: the Discord app works best.",
+        "keepOut": "Keep out",
+        "keepBrowserOut": "Keep browser out",
+        "include": "Include",
+        "voiceAppsHeard": "Voice apps can't be kept out right now, so friends hear everything, including your calls. Open isshoni to turn sound off.",
+        "paused": "Sharing paused. {{hotkey}} resumes.",
+        "lockPaused": "Sharing is still paused since you locked your PC. Resume sharing?",
+        "stoppedLocked": "Sharing stopped while your PC was locked",
+        "stoppedSleep": "Sharing stopped because your PC went to sleep",
+        "updateReady": "isshoni {{version}} is ready. Restart to update.",
+        "restartNow": "Restart now",
+        "open": "Open",
+        "resume": "Resume",
+        "stop": "Stop"
+      },
+      "webview2": {
+        "missing": "isshoni needs the Microsoft Edge WebView2 Runtime, version 120 or newer.\n\nInstall or update it from Microsoft, then start isshoni again:\n{{downloadUrl}}\n\nHelp:\n{{helpUrl}}"
+      }
+    },
+    "audio": {
+      "banner": {
+        "exclusionUnavailable": "Voice apps can't be kept out on this PC, so friends hear everything it plays, including your calls. Set your voice app to a different output device, or turn sound off.",
+        "windowsTooOld": "Update Windows to keep voice apps out. Until then, friends hear everything this PC plays.",
+        "noOutputDevice": "No speakers or headphones are connected. Friends hear nothing until you connect one.",
+        "reconnectingSound": "Your sound device changed. Reconnecting sound…",
+        "soundOff": "Sound is off. Friends hear nothing.",
+        "soundPaused": "Sharing is paused. Friends hear nothing.",
+        "captureTrouble": "Friends can't hear {{app}} right now. isshoni keeps trying.",
+        "viewerMuted": "Sound from shares you watch is off while you share sound, so friends don't hear themselves.",
+        "viewerUnknownBrowser": "isshoni is playing in a browser on this PC. Pause it there, or friends may hear themselves."
+      },
+      "prompt": {
+        "mic": "{{app}} is using your microphone. Keep it out of your stream?",
+        "browserMic": "Your browser is using the mic (Discord Web?). Keep the whole browser out; friends won't hear any of its tabs. Tip: the Discord app works best.",
+        "keepOut": "Keep out",
+        "keepBrowserOut": "Keep browser out",
+        "include": "Include"
+      },
+      "warning": {
+        "sharedUsesMic": "{{app}} is the app you're sharing and it uses your microphone. Friends will hear its voice chat.",
+        "sharedKeptOut": "You're sharing {{app}}, but its sound is kept out.",
+        "sharedVoiceApp": "{{app}} is a voice app, so its sound is always kept out.",
+        "includedUsesMic": "{{app}} uses your microphone and friends hear it, because you chose Include."
+      },
+      "reason": {
+        "builtin": "Voice app",
+        "mic": "Uses your microphone",
+        "user": "You kept it out",
+        "viewer": "Your browser is playing isshoni",
+        "isshoni": "isshoni",
+        "launcher": "Launcher sounds aren't shared",
+        "tree": "Started {{detail}}, which is kept out",
+        "limit": "Too many apps are playing",
+        "captureFailed": "Can't be captured right now",
+        "pidReuse": "Not shared, to be safe: Windows may count {{detail}} as part of it"
+      },
+      "sheet": {
+        "voiceApps": "Friends won't hear: {{apps}}. Apps that use your microphone are kept out too; you'll be asked.",
+        "volumeNote": "Muting your PC doesn't mute your stream. Use Pause or turn Share sound off."
+      },
+      "tip": {
+        "ducking": "Windows turns other sounds down during calls, and friends hear that too. To stop it: Sound settings → More sound settings → Communications → Do nothing."
+      },
+      "soundCheck": {
+        "failed": "We couldn't capture the test sound, so friends would hear nothing from this PC.",
+        "deviceBusy": "Another app is using your speakers on its own (exclusive mode). Close it, or turn off \"Allow applications to take exclusive control of this device\" in the device's Sound properties, then Try again."
+      }
+    }
+  }
+}

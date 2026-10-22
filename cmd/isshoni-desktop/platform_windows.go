@@ -22,6 +22,9 @@ func assetGuard() func(http.Handler) http.Handler { return assets.Guard(assetOri
 // clientOS is BridgeConfig.App.OS.
 const clientOS = protocol.ClientOSWindows
 
+// defaultDeviceName is 02's device name when the computer has no name (AppInfo.DeviceName).
+const defaultDeviceName = "Windows PC"
+
 // dataRoot returns %LOCALAPPDATA%\isshoni (03 §14.1) from the shell's known folder, never from the environment
 // (README §4: release builds read no environment variable for paths).
 func dataRoot() (string, error) {
@@ -35,8 +38,17 @@ func dataRoot() (string, error) {
 	return filepath.Join(local, "isshoni"), nil
 }
 
+// profileDir is the user's profile folder (FOLDERID_Profile), which the log writes as %USERPROFILE% (03 §17).
+func profileDir() string {
+	p, err := windows.KnownFolderPath(windows.FOLDERID_Profile, windows.KF_FLAG_DEFAULT)
+	if err != nil {
+		return ""
+	}
+	return p
+}
+
 // webviewDataDir is WebView2's user data folder, %LOCALAPPDATA%\isshoni\WebView2, absolute and without a trailing
-// separator (03 §5.4; the same string becomes audio.SelfInfo.WebViewDataDir in WA41's wiring).
+// separator (03 §5.4; the same string becomes audio.SelfInfo.WebViewDataDir in README WA77's wiring).
 func webviewDataDir() (string, error) {
 	root, err := dataRoot()
 	if err != nil {

@@ -1,0 +1,13 @@
+{
+  "serverPrefs": {"https://watch.example.com": {"preset": "game"}},
+  "wizardDone": true,
+  "window": {"x": 120, "y": 80, "w": 1200, "h": 760, "maximized": true},
+  "closeToTray": true,
+  "hotkeys": null,
+  "pill": {"mode": "always", "positions": {"\\\\.\\DISPLAY1": {"x": 830, "y": 8}}},
+  "updates": {"check": false, "channel": "beta"},
+  "tips": {"firstShareShown": true},
+  "log": null,
+  "audio": {"keepOutMicUsers": false},
+  "fromAnOlderBuild": {"kept": true}
+}

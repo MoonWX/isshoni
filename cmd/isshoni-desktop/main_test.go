@@ -18,6 +18,7 @@ import (
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 
+	"github.com/MoonWX/isshoni/internal/desktop/app"
 	"github.com/MoonWX/isshoni/internal/desktop/assets"
 	"github.com/MoonWX/isshoni/internal/protocol"
 )
@@ -63,7 +64,7 @@ func TestDebugLogging(t *testing.T) {
 	for args, want := range map[string]bool{
 		"--log-level debug":                         true,
 		"--log-level=debug":                         true,
-		"--open-url isshoni://x/ --log-level debug": true,
+		"--open-url isshoni://x/ --log-level debug": false, // a link launch honors no other flag (03 §13.1)
 		"--log-level info":                          false,
 		"--log-level":                               false,
 		"debug":                                     false,
@@ -117,7 +118,7 @@ func TestBridgeConfig(t *testing.T) {
 	if facts.Version == "" || facts.OS != string(clientOS) || facts.Arch == "" {
 		t.Fatalf("appFacts %+v", facts)
 	}
-	c := bridgeConfig(facts)()
+	c := bridgeConfig(facts, nil)()
 	if c.V != 1 || c.Transport != "wails" || c.Server != nil || c.ServerIDs == nil || c.Dev != insecureLoopback() {
 		t.Fatalf("bridgeConfig %+v", c)
 	}
@@ -188,7 +189,9 @@ func TestAppOptions(t *testing.T) {
 		t.Errorf("AdditionalBrowserArgs %v", o.Windows.AdditionalBrowserArgs)
 	}
 	if o.SingleInstance != nil || len(o.Services) != 0 || o.Transport != nil {
-		t.Errorf("single instance, services and the transport are later slices': %+v", o)
+		// Single instance is winos's (before 03 §13.4's step 4, which Wails' option can't be); the services and the
+		// transport are later slices'.
+		t.Errorf("Wails' single instance, services or transport: %+v", o)
 	}
 }
 
@@ -216,7 +219,7 @@ func TestMainWindowOptions(t *testing.T) {
 func TestAppStartsOverTheBundle(t *testing.T) {
 	dist := fstest.MapFS{"index.html": {Data: []byte(
 		`<html><head><meta charset="utf-8"></head><body><script src="/boot-check.js"></script></body></html>`)}}
-	h, err := assets.New(assets.Options{Dist: dist, Bridge: bridgeConfig(appFacts()), Origin: assetOrigin,
+	h, err := assets.New(assets.Options{Dist: dist, Bridge: bridgeConfig(appFacts(), nil), Origin: assetOrigin,
 		Dev: insecureLoopback(), DevServer: devServerOrigin()})
 	if err != nil {
 		t.Fatal(err)
@@ -235,5 +238,8 @@ func TestShellIsNotImplementedYetWhereSaid(t *testing.T) {
 	var s wailsShell
 	if err := s.OpenURL("https://example.com"); err == nil {
 		t.Fatal("OpenURL works before its slice")
+	}
+	if err := s.Notify(app.Notification{Title: "x"}); err == nil {
+		t.Fatal("Notify works before its slice")
 	}
 }

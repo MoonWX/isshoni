@@ -159,7 +159,7 @@ func newChecklist() (*checklist, error) {
 		arrived: make(chan struct{}, 16),
 	}
 	handler, err := assets.New(assets.Options{
-		Dist: dist, Bridge: bridgeConfig(appFacts()), Origin: assetOrigin, Dev: insecureLoopback(),
+		Dist: dist, Bridge: bridgeConfig(appFacts(), nil), Origin: assetOrigin, Dev: insecureLoopback(),
 	})
 	if err != nil {
 		return nil, err

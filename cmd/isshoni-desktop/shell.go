@@ -6,29 +6,17 @@ import (
 	"errors"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
+
+	"github.com/MoonWX/isshoni/internal/desktop/app"
 )
 
 // errNotImplemented is returned by the Shell methods whose slices have not landed yet.
 var errNotImplemented = errors.New("desktop: not implemented yet")
 
-// shell is 03 §6.1's app.Shell as far as this slice has it: the window, events and quit. internal/desktop/app
-// declares the interface (WA41); SetTray and Notify come with the tray and toasts (WA68), OpenURL's validated
-// system-browser open with the bridge (WA48).
-type shell interface {
-	ShowWindow(focus bool) // creates it first after --autostart (WA84)
-	HideWindow()
-	WindowVisible() bool
-	SetFullscreen(on bool)
-	Reload() // reloads the SPA (every change of the active server, crash recovery)
-	MainWindowHandle() uintptr
-	Emit(name string, data any) // a Wails event to the SPA
-	OpenURL(url string) error   // the system browser, for absolute https URLs only (03 §5.5); not implemented yet
-	Quit()
-}
+var _ app.Shell = (*wailsShell)(nil)
 
-var _ shell = (*wailsShell)(nil)
-
-// wailsShell is the Shell over Wails: one application with its main window (03 §4.4).
+// wailsShell is internal/desktop/app's Shell over Wails: one application with its main window (03 §4.4). OpenURL's
+// validated system-browser open comes with the bridge (README WA48), Notify and the tray with WA68.
 type wailsShell struct {
 	app  *application.App
 	main *application.WebviewWindow
@@ -69,5 +57,7 @@ func (s *wailsShell) MainWindowHandle() uintptr { return uintptr(s.main.NativeWi
 func (s *wailsShell) Emit(name string, data any) { s.app.Event.Emit(name, data) }
 
 func (s *wailsShell) OpenURL(string) error { return errNotImplemented }
+
+func (s *wailsShell) Notify(app.Notification) error { return errNotImplemented }
 
 func (s *wailsShell) Quit() { s.app.Quit() }
