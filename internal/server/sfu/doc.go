@@ -113,8 +113,11 @@
 //     delay, which the ticker computes, and the sharer's own pause (Share.sharerPaused, Share.sharerResumedAt),
 //     which only the publishing Conn's actor writes (UpdateShare). A video Layer's queueing-delay trend (delayTrend)
 //     has a leaf lock of its own: the Layer's RTP loop takes it to sample the first packet of each frame, the ticker
-//     once a second to compute the delay; neither holds another lock then. While the sharer has paused the share, a
-//     keyframe request for it does nothing (Layer.requestKeyframe), like one for a paused layer.
+//     once a second to compute the delay; neither holds another lock then. The ticker's seconds are counted
+//     (SFU.uplinkGen, an atomic it adds to once the layers have their stats), so the estimator runs its rows once
+//     per second of stats, also when the actor looks more often. While the sharer has paused the share, a keyframe
+//     request for it does nothing (Layer.requestKeyframe), like one for a paused layer, and the downlink allocators
+//     weigh its video layers as paused ones; its end stores Share.resumedAt before it clears the pause.
 //   - WriteRTP and WriteRTCP are media calls, not signaling calls: the media goroutines make them, and so may any
 //     actor, also for another Conn's pub PC (a keyframe request). Pion allows them from any goroutine and they
 //     never block. Keyframe requests are throttled per layer by a compare-and-swap, so callers need no lock.

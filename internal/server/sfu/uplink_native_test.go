@@ -36,25 +36,42 @@ func layerStat(rid string, bps int, loss float64, delay time.Duration) LayerUpli
 	return LayerUplinkStats{RID: rid, Bitrate: bps, RawLossPct: loss, QueueDelay: delay}
 }
 
-// nativeRig is a native policy on a fake clock that a test ticks a second at a time.
+// nativeRig is a native policy on a fake clock that a test ticks a second at a time, each tick a new generation of
+// stats as the ticker's seconds are (SFU.uplinkGen).
 type nativeRig struct {
 	t     *testing.T
 	p     *nativeUplink
 	sh    *Share
 	clock int64
+	gen   uint64
 }
 
 func newNativeRig(t *testing.T, s *SFU, id ShareID) *nativeRig {
 	t.Helper()
 	r := &nativeRig{t: t, sh: testShare(t, s, id), clock: int64(time.Hour)}
 	r.p = newNativeUplink(s, r.sh, func() int64 { return r.clock })
+	r.gen = r.p.gen
 	return r
+}
+
+// next moves the clock on a second and runs the policy on st as the ticker's next second.
+func (r *nativeRig) next(st ShareUplinkStats) UplinkDecision {
+	r.clock += int64(time.Second)
+	r.gen++
+	st.gen = r.gen
+	return r.p.Tick(st)
 }
 
 // tick moves the clock on a second and runs the policy on layers.
 func (r *nativeRig) tick(layers ...LayerUplinkStats) UplinkDecision {
-	r.clock += int64(time.Second)
-	return r.p.Tick(ShareUplinkStats{Client: ClientDesktop, Layers: layers})
+	return r.next(ShareUplinkStats{Client: ClientDesktop, Layers: layers})
+}
+
+// again runs the policy on layers as a look between the ticker's seconds does (a viewer's request for high, the
+// admin's cap): the clock moves on by d, the generation stays.
+func (r *nativeRig) again(d time.Duration, layers ...LayerUplinkStats) UplinkDecision {
+	r.clock += int64(d)
+	return r.p.Tick(ShareUplinkStats{Client: ClientDesktop, Layers: layers, gen: r.gen})
 }
 
 // want ticks once and fails unless the decision's cap and reason are as given (and no layer changes).
@@ -207,6 +224,35 @@ func TestNativeUplinkRows(t *testing.T) {
 		r.want(3_200_000, cong, f(5_000_000, 20, unknown))
 	})
 
+	t.Run("looks between ticks", func(t *testing.T) {
+		// The policy is asked between the ticker's seconds too (askedForHigh, SetLimits). Such a look runs no row:
+		// one second of 3 % loss or of a 50 ms queue stays one tick, however many looks see it.
+		for _, tc := range []struct {
+			name    string
+			stats   LayerUplinkStats
+			wantCap int
+		}{
+			{"loss", f(4_000_000, 3, unknown), 3_104_000},
+			{"delay", f(4_000_000, 0, 50*time.Millisecond), 3_400_000},
+		} {
+			r := newNativeRig(t, s, ShareID("s_between_"+tc.name))
+			r.want(0, "", tc.stats)
+			for range 3 {
+				if d := r.again(100*time.Millisecond, tc.stats); d.MaxBitrate != 0 || d.Reason != "" {
+					t.Fatalf("%s: a look between ticks = %+v, want no cap", tc.name, d)
+				}
+			}
+			r.want(tc.wantCap, cong, tc.stats) // the second tick of the streak
+			// The looks between ticks apply the estimate as it is, and change it no further.
+			for range 3 {
+				if d := r.again(100*time.Millisecond, f(4_000_000, 50, 100*time.Millisecond)); d.MaxBitrate != tc.wantCap ||
+					d.Reason != cong {
+					t.Fatalf("%s: a look between ticks after the backoff = %+v, want the cap %d", tc.name, d, tc.wantCap)
+				}
+			}
+		}
+	})
+
 	t.Run("admin cap", func(t *testing.T) {
 		r := newNativeRig(t, s, "s_admin")
 		s.SetLimits(Limits{MaxShareKbps: 2000})
@@ -255,8 +301,7 @@ func TestNativeUplinkLayerPausing(t *testing.T) {
 	r.want(nativeMinCap, HintReasonCongestion, both(50, 50)...)
 	// A request for high resumes f: no verdict for 3 s, then the estimate follows the stats again.
 	st := ShareUplinkStats{Client: ClientDesktop, HighRequests: 1, Layers: both(0, 0)}
-	r.clock += int64(time.Second)
-	if d := r.p.Tick(st); !reflect.DeepEqual(d.Active, map[string]bool{"f": true}) || d.MaxBitrate != nativeMinCap {
+	if d := r.next(st); !reflect.DeepEqual(d.Active, map[string]bool{"f": true}) || d.MaxBitrate != nativeMinCap {
 		t.Fatalf("the resume: %+v", d)
 	}
 	r.want(nativeMinCap, HintReasonCongestion, both(50, 50)...)
@@ -711,12 +756,24 @@ func TestLayerQueueDelay(t *testing.T) {
 		t.Fatalf("QueueDelay with three frames in the window = %v, want 0", d)
 	}
 
-	// A 60 ms queue for two ticks: the delay row backs off to 0.85 × the rate, and the sharer hears of it.
+	// A 60 ms queue for two ticks: the delay row backs off to 0.85 × the rate, and the sharer hears of it. Each tick
+	// is a new second for the uplink policy (as SFU.everySecond has it) and its look, as the ticker's.
+	look := func() {
+		t.Helper()
+		s.uplinkGen.Add(1)
+		if err := pub.CheckUplink(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
 	for i := 180; i < 210; i++ {
 		frame(i, 2, 60*time.Millisecond)
 	}
 	if d := delay(at(7000)); !near(d, 59500*time.Microsecond) {
 		t.Fatalf("QueueDelay in a 60 ms queue = %v, want 59.5 ms (the baseline rose 0.5 ms)", d)
+	}
+	look()
+	if got := pubSig.hints(); len(got) != 0 {
+		t.Fatalf("hints after one tick of a 60 ms queue = %+v, want none", got)
 	}
 	for i := 210; i < 240; i++ {
 		frame(i, 2, 60*time.Millisecond)
@@ -724,11 +781,7 @@ func TestLayerQueueDelay(t *testing.T) {
 	if d := delay(at(8000)); !near(d, 59*time.Millisecond) {
 		t.Fatalf("QueueDelay a second later = %v, want 59 ms", d)
 	}
-	for range 2 {
-		if err := pub.CheckUplink(ctx); err != nil {
-			t.Fatal(err)
-		}
-	}
+	look()
 	got := pubSig.hints()
 	rate := int(l.stats.bitrate.Load())
 	if len(got) != 1 || got[0].Reason != HintReasonCongestion ||
@@ -737,9 +790,66 @@ func TestLayerQueueDelay(t *testing.T) {
 	}
 }
 
+// TestNativeUplinkLooksBetweenTicks: the publishing Conn's actor also looks at the uplink between the ticker's
+// seconds, on the layer stats of its last one: at once when a viewer's request becomes high (askedForHigh, whenever
+// layers may be paused, which is the default), and when the admin's cap may have changed (SetLimits). Such a look
+// never counts that second again: one second of 3 % raw loss, or of a 50 ms queue, with the ticker's look and those
+// looks in it, sends no hint; the next second with the same stats sends the backoff.
+func TestNativeUplinkLooksBetweenTicks(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		loss    float64
+		delay   time.Duration
+		wantCap int
+	}{
+		{"loss", 3, -1, 3_104_000},
+		{"delay", 0, 50 * time.Millisecond, 3_400_000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := newTicklessSFU(t)
+			s.pauseUnwatched = true // before any Join: no actor reads it yet
+			ctx := testCtx(t)
+			pub, pubSig := joinAs(t, s, "alice", "c-pub", RolePublisher, ClientDesktop)
+			startShare(t, pub, "s_between")
+			sh := s.lookupShare("s_between")
+			l, _ := testLayer(t, sh, SlotF, 0xf0)
+			// second gives the layer the stats of the ticker's next second, and has the Conn look as the ticker does.
+			second := func() {
+				t.Helper()
+				l.stats.bitrate.Store(4_000_000)
+				l.stats.rawLossPct.Store(math.Float64bits(tc.loss))
+				l.stats.queueDelay.Store(int64(tc.delay))
+				s.uplinkGen.Add(1)
+				s.AdvanceUplinkClock(time.Second)
+				if err := pub.CheckUplink(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+			second()
+			for range 2 {
+				s.AdvanceUplinkClock(100 * time.Millisecond)
+				sh.askedForHigh()
+				settle(pub)
+			}
+			s.SetLimits(Limits{})
+			settle(pub)
+			if got := pubSig.hints(); len(got) != 0 {
+				t.Fatalf("hints after one second of stats = %+v, want none", got)
+			}
+			second()
+			if got := pubSig.hints(); len(got) != 1 || got[0].Reason != HintReasonCongestion ||
+				got[0].MaxBitrate != tc.wantCap {
+				t.Fatalf("hints after two seconds = %+v, want one congestion hint of %d", got, tc.wantCap)
+			}
+		})
+	}
+}
+
 // TestSharerPause: share.update{paused} (01 §10.3). While the sharer has paused the share, a keyframe request for
 // any of its layers writes nothing and spends no throttle; the unpause asks once for the keyframe of each video layer
-// that has viewers, and none of the others. The params UpdateShare returns don't change.
+// that has viewers, and none of the others. The params UpdateShare returns don't change. Like a layer pause and
+// resume (02 §11), the downlink allocators weigh the video layers at their maximum while the share is paused and for
+// rateWindow after the unpause, while their 2 s averages catch up (allocRate).
 func TestSharerPause(t *testing.T) {
 	s, _ := newTicklessSFU(t)
 	ctx := testCtx(t)
@@ -759,10 +869,26 @@ func TestSharerPause(t *testing.T) {
 		}
 	}
 
+	// allocRates fails unless the allocators weigh f and q at fRate and qRate.
+	allocRates := func(when string, fRate, qRate int64) {
+		t.Helper()
+		if got, gotQ := sh.allocRate(f), sh.allocRate(q); got != fRate || gotQ != qRate {
+			t.Errorf("%s: allocRate f %d, q %d; want %d and %d", when, got, gotQ, fRate, qRate)
+		}
+	}
+	fMax, qMax := sh.maxBitrate(SlotF), sh.maxBitrate(SlotQ)
+	f.stats.bitrate.Store(3_000_000)
+	q.stats.bitrate.Store(200_000)
+	allocRates("before the pause", 3_000_000, 200_000)
+
 	update(true)
 	if !sh.sharerPaused.Load() {
 		t.Fatal("the share is not paused")
 	}
+	allocRates("paused, as the layers still measure their last rates", fMax, qMax)
+	f.stats.bitrate.Store(0) // within 2 s the paused share measures nothing
+	q.stats.bitrate.Store(0)
+	allocRates("paused", fMax, qMax)
 	now := monoNow()
 	if f.requestKeyframe(now) || q.requestKeyframe(now) {
 		t.Error("a keyframe request went out for a paused share")
@@ -781,6 +907,17 @@ func TestSharerPause(t *testing.T) {
 	if sh.sharerPaused.Load() || sh.sharerResumedAt.Load() == 0 {
 		t.Fatalf("after the unpause: paused %v, resumed at %d", sh.sharerPaused.Load(), sh.sharerResumedAt.Load())
 	}
+	if at := sh.sharerResumedAt.Load(); sh.resumedAt[SlotF].Load() != at || sh.resumedAt[SlotQ].Load() != at {
+		t.Errorf("the layers' resumes at %d and %d, want the unpause's %d", sh.resumedAt[SlotF].Load(),
+			sh.resumedAt[SlotQ].Load(), at)
+	}
+	f.stats.bitrate.Store(1_000_000) // the 2 s averages catching up
+	q.stats.bitrate.Store(100_000)
+	allocRates("just after the unpause", fMax, qMax)
+	s.AdvanceUplinkClock(rateWindow - time.Millisecond)
+	allocRates("just within rateWindow of the unpause", fMax, qMax)
+	s.AdvanceUplinkClock(time.Millisecond)
+	allocRates("rateWindow after the unpause", 1_000_000, 100_000)
 	if p := fPub.plis(); len(p) != 1 || p[0].MediaSSRC != 0xf00 {
 		t.Errorf("the watched layer's PLIs after the unpause = %+v, want one", p)
 	}

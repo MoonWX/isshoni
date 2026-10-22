@@ -35,6 +35,10 @@ type ShareUplinkStats struct {
 	// preview layer for its bandwidth keeps the full layer flowing, and its trial upgrades try a layer that is there.
 	HighRequests int
 	Layers       []LayerUplinkStats // the video layers attached now, sorted f, h, q; paused ones included
+	// gen is the ticker's second whose layer stats these are (SFU.uplinkGen). The policy is also asked between the
+	// ticker's seconds (askedForHigh, SetLimits), on the same layer stats; a policy that counts consecutive seconds
+	// (nativeUplink) counts a generation once.
+	gen uint64
 }
 
 // LayerUplinkStats are the numbers of one video layer of a share, as it arrives.
@@ -180,9 +184,10 @@ func (u *shareUplink) congestionDue(capBps int, now int64) bool {
 
 // uplinkStats returns what the share's uplink policy decides by. It reads the viewers' requests as their actors
 // published them (Subscription.requested), the layers' rates, raw loss and queueing delay of the ticker's last second
-// and their jitter (atomics), and the share's layer set under Share.mu, a leaf.
+// and their jitter (atomics), and the share's layer set under Share.mu, a leaf. The generation comes first: the ticker
+// adds one only after the layers' stats are in place, so stats read after it are at least that second's.
 func (s *Share) uplinkStats(client ClientKind) ShareUplinkStats {
-	st := ShareUplinkStats{Client: client}
+	st := ShareUplinkStats{Client: client, gen: s.conn.sfu.uplinkGen.Load()}
 	viewers := s.downTracks(webrtc.RTPCodecTypeVideo)
 	for _, dt := range viewers {
 		if dt.sub.requested() == QualityHigh {
@@ -218,13 +223,14 @@ func (s *Share) uplinkStats(client ClientKind) ShareUplinkStats {
 // (Share.maxBitrate). So a request for high made while the viewer's allocator is limited is capped unless the full
 // layer's maximum fits, rather than served at a layer measured at 0 bps; the request still counts for the uplink
 // policy (ShareUplinkStats.HighRequests), so the layer resumes, and the next trial upgrade tests a layer that flows
-// (02 §11). It reads atomics only.
+// (02 §11). The sharer's own pause of the whole share (Share.sharerPaused, M2 01 §10.3) counts as a pause of every
+// video layer, and its end as their resume (setSharerPaused stores resumedAt). It reads atomics only.
 func (s *Share) allocRate(l *Layer) int64 {
 	rate := l.stats.bitrate.Load()
 	if l.slot >= SlotAudio {
 		return rate
 	}
-	if s.paused.Load()&(1<<l.slot) != 0 {
+	if s.paused.Load()&(1<<l.slot) != 0 || s.sharerPaused.Load() {
 		return max(rate, s.maxBitrate(l.slot))
 	}
 	if at := s.resumedAt[l.slot].Load(); at != 0 && s.conn.sfu.uplinkNow()-at < int64(rateWindow) {

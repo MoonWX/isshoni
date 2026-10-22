@@ -345,13 +345,18 @@ const (
 func (s *SFU) AdvanceUplinkClock(d time.Duration) { s.uplinkSkew.Add(int64(d)) }
 
 // CheckUplink has the Conn look at the uplink of the shares it publishes now, as the ticker has it do once a second:
-// each share's policy with its hints, then the pub PC's REMB.
+// each share's policy with its hints, then the pub PC's REMB. It starts no new second of stats (SFU.uplinkGen), so
+// the native estimator runs its rows only on a second that it hasn't seen (M2 01 §10.1).
 func (c *Conn) CheckUplink(ctx context.Context) error {
 	return c.do(ctx, func(context.Context) error {
 		c.uplinkTick()
 		return nil
 	})
 }
+
+// Ticks returns how many seconds the SFU's ticker has done (SFU.uplinkGen): it changes the moment the layers have their
+// new stats, before the publishers' uplink looks.
+func (s *SFU) Ticks() uint64 { return s.uplinkGen.Load() }
 
 // UplinkStats returns what a share's uplink policy decides by as of the ticker's last second (M2 01 §10.1: with each
 // layer's raw loss and queueing delay); false for an unknown or ended share.

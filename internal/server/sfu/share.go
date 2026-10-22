@@ -60,16 +60,19 @@ type Share struct {
 	// other than the publishing Conn's actor. A keyframe request for a paused layer does nothing
 	// (Layer.requestKeyframe), and a viewer's new request for high has the actor look at once (askedForHigh).
 	paused atomic.Uint32
-	// resumedAt holds, per video slot, when the sharer was last told to resume the layer, on the uplink policies'
-	// clock (SFU.uplinkNow), 0 for never: the publishing Conn's actor stores it before it clears the slot's bit in
-	// paused. For rateWindow after it the layer's measured rate lags what the sharer sends, and the downlink
-	// allocators weigh the layer at its maximum (allocRate).
+	// resumedAt holds, per video slot, when the sharer was last told to resume the layer, or ended its own pause of
+	// the share (sharerPaused), on the uplink policies' clock (SFU.uplinkNow), 0 for never: the publishing Conn's
+	// actor stores it before it clears the slot's bit in paused, or sharerPaused. For rateWindow after it the layer's
+	// measured rate lags what the sharer sends, and the downlink allocators weigh the layer at its maximum
+	// (allocRate).
 	resumedAt [SlotAudio]atomic.Int64
 	// sharerPaused is the sharer's own pause of the whole share (M2 01 §10.3, share.update{paused}), named apart from
 	// the layer-pausing bits in paused: while it is set, a keyframe request for the share does nothing
-	// (Layer.requestKeyframe) and the native uplink estimator skips its ticks. sharerResumedAt is when the pause last
-	// ended, on the uplink policies' clock (SFU.uplinkNow), 0 for never: the estimator waits out the resume as it does
-	// a layer's. Only the publishing Conn's actor writes them (setSharerPaused); the media path reads sharerPaused.
+	// (Layer.requestKeyframe), the native uplink estimator skips its ticks, and the downlink allocators weigh every
+	// video layer at its maximum, as a paused one (allocRate). sharerResumedAt is when the pause last ended, on the
+	// uplink policies' clock (SFU.uplinkNow), 0 for never: the estimator waits out the resume as it does a layer's.
+	// Only the publishing Conn's actor writes them (setSharerPaused); the media path and the allocators read
+	// sharerPaused.
 	sharerPaused    atomic.Bool
 	sharerResumedAt atomic.Int64
 	// up is the share's uplink control (02 §11, uplink.go). It belongs to the publishing Conn's actor, like the rest of
@@ -387,22 +390,32 @@ func (s *Share) attached() []*Layer {
 	return out
 }
 
-// setSharerPaused applies the sharer's own pause (M2 01 §10.3). A pause only sets Share.sharerPaused. Its end clears
-// it, notes the time for the native uplink estimator, and asks the publisher for one keyframe per video layer that
-// has viewers (a DownTrack that forwards the layer or waits for its keyframe), as a layer resume does (02 §11): the
-// requests made during the pause did nothing. It reports whether the state changed. Only the publishing Conn's actor
-// calls it.
+// setSharerPaused applies the sharer's own pause (M2 01 §10.3). A pause only sets Share.sharerPaused, which the
+// downlink allocators take as a pause of every video layer (allocRate). Its end works like a layer resume (02 §11):
+// it notes the time for the native uplink estimator and, for each attached video layer, in Share.resumedAt for the
+// downlink allocators (before the pause goes, so an allocator never sees a layer as neither), clears the pause, and
+// asks the publisher for one keyframe per video layer that has viewers (a DownTrack that forwards the layer or waits
+// for its keyframe): the requests made during the pause did nothing. It reports whether the state changed. Only the
+// publishing Conn's actor calls it.
 func (s *Share) setSharerPaused(paused bool) bool {
 	if paused {
 		return !s.sharerPaused.Swap(true)
 	}
-	if !s.sharerPaused.Swap(false) {
+	if !s.sharerPaused.Load() {
 		return false
 	}
-	s.sharerResumedAt.Store(max(s.conn.sfu.uplinkNow(), 1))
+	at := max(s.conn.sfu.uplinkNow(), 1)
+	s.sharerResumedAt.Store(at)
+	layers := s.attached()
+	for _, l := range layers {
+		if l.kind == webrtc.RTPCodecTypeVideo {
+			s.resumedAt[l.slot].Store(at)
+		}
+	}
+	s.sharerPaused.Store(false)
 	now := monoNow()
 	viewers := s.downTracks(webrtc.RTPCodecTypeVideo)
-	for _, l := range s.attached() {
+	for _, l := range layers {
 		if l.kind != webrtc.RTPCodecTypeVideo {
 			continue
 		}

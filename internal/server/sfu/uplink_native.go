@@ -65,6 +65,11 @@ const HintReasonCongestion = "congestion"
 // cap is the smaller of the admin's cap and the estimate (0 = none for either), with Reason HintReasonCongestion
 // when the estimate binds. Like every UplinkPolicy it runs on the publishing Conn's actor only.
 //
+// A tick is one second of the ticker's stats (ShareUplinkStats.gen): the policy is also asked between the ticker's
+// seconds (a viewer's new request for high, the admin's cap), on the same layer stats, and those looks get M1's
+// decision and the cap of the current estimate but run no row, so a streak of consecutive ticks counts each second
+// once and one second of loss or delay is never two.
+//
 // Each tick looks at the active video layers (the ones the policy hasn't paused): rate is the sum of their bitrates,
 // loss their raw loss weighted by bitrate, delay the full layer's QueueDelay (else the preview layer's; −1 when
 // neither is active or known). The rows of M2 01 §10.1 are checked top-down and the first that matches decides:
@@ -86,18 +91,20 @@ type nativeUplink struct {
 	m1Uplink
 	share *Share // the sharer's pause (sharerPaused, sharerResumedAt) and the preset's ceilings
 
-	estimate  int   // bit/s; 0 = none
-	heldUntil int64 // growth is held until then (the uplink clock)
-	grewAt    int64 // the last growth step; 0 = none yet
-	resumedAt int64 // the last layer resume this policy decided; 0 = none
+	estimate  int    // bit/s; 0 = none
+	heldUntil int64  // growth is held until then (the uplink clock)
+	grewAt    int64  // the last growth step; 0 = none yet
+	resumedAt int64  // the last layer resume this policy decided; 0 = none
+	gen       uint64 // the generation of the stats the rows last ran on (SFU.uplinkGen)
 	// The streaks: how many consecutive ticks with a verdict had loss ≥ nativeLossMid, loss < nativeLossLow, delay ≥
 	// nativeDelayHigh, and delay < nativeDelayLow or unknown.
 	lossMid, lossLow, delayHigh, delayLow int
 }
 
-// newNativeUplink returns the native policy of share sh, which starts now, on a clock.
+// newNativeUplink returns the native policy of share sh, which starts now, on a clock. Its first tick is the ticker's
+// next second.
 func newNativeUplink(s *SFU, sh *Share, now func() int64) *nativeUplink {
-	return &nativeUplink{m1Uplink: m1Uplink{sfu: s, now: now, wantedAt: now()}, share: sh}
+	return &nativeUplink{m1Uplink: m1Uplink{sfu: s, now: now, wantedAt: now()}, share: sh, gen: s.uplinkGen.Load()}
 }
 
 func (p *nativeUplink) Tick(s ShareUplinkStats) UplinkDecision {
@@ -106,7 +113,10 @@ func (p *nativeUplink) Tick(s ShareUplinkStats) UplinkDecision {
 	if d.Active[ridFull] {
 		p.resumedAt = now
 	}
-	p.step(s, now)
+	if s.gen != p.gen { // a new second of stats: the rows run once on it
+		p.gen = s.gen
+		p.step(s, now)
+	}
 	if p.estimate > 0 && (d.MaxBitrate == 0 || p.estimate < d.MaxBitrate) {
 		d.MaxBitrate, d.Reason = p.estimate, HintReasonCongestion
 	}

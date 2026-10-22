@@ -123,13 +123,17 @@ func wantCongestionHint(t *testing.T, h sfu.QualityHintEvent, share sfu.ShareID,
 	}
 }
 
-// waitTick waits until the SFU's ticker has just measured the share's layers (their 2 s averages change once a
-// second) and returns that moment.
-func waitTick(t *testing.T, h *sfutest.Harness, share sfu.ShareID) time.Time {
+// waitTick waits until the SFU's ticker has just done a second (sfu.SFU.Ticks) and returns that moment.
+func waitTick(t *testing.T, h *sfutest.Harness) time.Time {
 	t.Helper()
-	before := layerRate(h, share, "f")
-	eventually(t, func() bool { return layerRate(h, share, "f") != before },
-		func() string { return "the layer's rate didn't change for 15 s" })
+	before := h.SFU.Ticks()
+	deadline := time.Now().Add(5 * time.Second)
+	for h.SFU.Ticks() == before {
+		if time.Now().After(deadline) {
+			t.Fatal("the SFU's ticker did no second in 5 s")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	return time.Now()
 }
 
@@ -166,23 +170,32 @@ func TestNativeUplinkPolicer(t *testing.T) {
 	wantCongestionHint(t, hint, share, 3_000_000)
 }
 
-// TestNativeUplinkQueue: the same publisher sending 4 Mbit/s behind a queueing link of 3 Mbit/s with a 1 s buffer,
-// like a home router's (01 §14 C09, the SFU half of D19): the queueing delay backs the estimate off before the
-// buffer overflows, so the congestion hint comes before any datagram is lost at the queue.
+// queueWireMax is the most the queue test's publisher may send into the link, in bit/s of datagrams: about 4 Mbit/s
+// into 3 grows the queue by a third of a second per second, so the 1 s buffer overflows about 3 s after the start.
+const queueWireMax = 4_050_000
+
+// TestNativeUplinkQueue: the same publisher sending about 4 Mbit/s on the wire behind a queueing link of 3 Mbit/s with
+// a 1 s buffer, like a home router's (01 §14 C09, the SFU half of D19): the queueing delay backs the estimate off
+// before the buffer overflows, so the congestion hint comes before any datagram is lost at the queue, whatever the
+// ticker's phase. The estimator needs two consecutive ticks at 40 ms or more, on the minimum of their last 500 ms, so
+// its worst case after a step is about 0.5 s + 40 ms ÷ the queue's growth per second + 2 s: 2.62 s here, against the
+// overflow at about 3 s. The queue starts at two phases of the ticker, about 150 and about 420 ms after a tick.
 func TestNativeUplinkQueue(t *testing.T) {
+	for _, phase := range []time.Duration{150 * time.Millisecond, 420 * time.Millisecond} {
+		t.Run(fmt.Sprintf("%v after a tick", phase), func(t *testing.T) { nativeQueueCase(t, phase) })
+	}
+}
+
+// nativeQueueCase is TestNativeUplinkQueue with the queue starting phase after one of the SFU's ticks.
+func nativeQueueCase(t *testing.T, phase time.Duration) {
 	h := newHarness(t, sfutest.HarnessOptions{FaultyUDP: true})
 	const share = sfu.ShareID("s_queued")
-	sig, _, sock := nativePublisher(t, h, share, nativeSource(t, 3_700_000, 300_000))
+	sig, _, sock := nativePublisher(t, h, share, nativeSource(t, 3_500_000, 300_000))
 	eventually(t, func() bool { return layerRate(h, share, "f") > 3_000_000 },
 		func() string { return fmt.Sprintf("the full layer arrives at %d bit/s", layerRate(h, share, "f")) })
 	before := layerRate(h, share, "f") + layerRate(h, share, "q")
 
-	// The queue starts 150 ms after a tick, so the ticks that see it come at the same moments of its growth on every
-	// run: 0.85 s and 1.85 s after its start. The estimator needs two consecutive ticks over 40 ms, on the minimum of
-	// their last 500 ms; 4 Mbit/s into 3 fill the 1 s buffer about 2.6 s after the start, and a tick that came just
-	// before the queue reached 40 ms at the window's start would leave the second qualifying tick only that close to
-	// it (01 §10.1's "about 2–3 s after the step" holds for the ramp's 15 % steps; this step is 33 %).
-	time.Sleep(time.Until(waitTick(t, h, share).Add(150 * time.Millisecond)))
+	time.Sleep(time.Until(waitTick(t, h).Add(phase)))
 	link := sfutest.NewQueueLink(3_000_000, time.Second)
 	h.Wire.SetInboundLink(sock.LocalAddr(), link)
 	limited := time.Now()
@@ -192,11 +205,17 @@ func TestNativeUplinkQueue(t *testing.T) {
 		lost    int64
 		queued  time.Duration
 		deepest time.Duration
+		wire    = -1 // bit/s into the link over its first second
 	)
 	lastDelay := time.Duration(-2)
 	for deadline := limited.Add(8 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
 		queued = link.Queued()
 		deepest = max(deepest, queued)
+		if since := time.Since(limited); wire < 0 && since >= time.Second {
+			sent, _, _ := link.Counts()
+			wire = int(float64(sent) * 8 / since.Seconds())
+			t.Logf("%v after the start: %d bit/s into the link", since.Round(time.Millisecond), wire)
+		}
 		if st, ok := h.SFU.UplinkStats(share); ok && st.Layers[0].QueueDelay != lastDelay {
 			lastDelay = st.Layers[0].QueueDelay // a tick
 			t.Logf("%v after the start: the full layer's QueueDelay %v at %d bit/s; %v queued now",
@@ -212,8 +231,11 @@ func TestNativeUplinkQueue(t *testing.T) {
 	}
 	_, _, lostAtHint := link.Counts()
 	took := time.Since(limited)
-	t.Logf("arriving at %d bit/s, behind a 3 Mbit/s queue of 1 s: hint %v after %v with %v queued (%d datagrams "+
-		"lost)", before, got, took, queued, lostAtHint)
+	t.Logf("arriving at %d bit/s, behind a 3 Mbit/s queue of 1 s from %v after a tick: hint %v after %v with %v "+
+		"queued (%d datagrams lost)", before, phase, got, took, queued, lostAtHint)
+	if wire > queueWireMax {
+		t.Errorf("%d bit/s went into the link in its first second, want at most %d", wire, queueWireMax)
+	}
 	switch {
 	case !got && lost > 0:
 		t.Fatalf("%d datagrams were lost at the queue (%v deep) before any congestion hint", lost, deepest)
