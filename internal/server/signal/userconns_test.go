@@ -268,6 +268,54 @@ func TestUserConnectionsResume(t *testing.T) {
 	})
 }
 
+// A list encoded while the connection was detached, which reaches its actor behind the resume, is not sent after
+// the resumed welcome: it shows the connection reconnecting. The next list, with it online, is.
+func TestUserConnectionsResumeSkipsDetachedList(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newEnv(t)
+		defer e.close()
+		cookieA, a := e.user(false)
+		a1, w1 := e.connect(cookieA, connsHello())
+		expectConns(t, a1)
+		a2, w2 := e.connect(e.session(a, "sessionA2"), signaltest.DefaultHello())
+		expectList(t, "two connections", onlyConns(t, a1), webConn(w1.ConnectionID, online, ""),
+			webConn(w2.ConnectionID, online, ""))
+		a1.Close()
+		settle()
+		time.Sleep(time.Second) // the next change goes out at once
+
+		// a1's actor is busy while the resume is queued; a2's room change is encoded with a1 still detached and
+		// reaches a1's inbox behind the resume.
+		release := signal.Stall(e.hub, w1.ConnectionID)
+		if release == nil {
+			t.Fatal("no connection to hold")
+		}
+		defer release()
+		h := connsHello()
+		h.ResumeToken = w1.ResumeToken
+		r1 := e.mustDial(headers(cookieA, testOrigin, ""))
+		type hello struct {
+			w   protocol.Welcome
+			err error
+		}
+		done, ctx := make(chan hello, 1), ctxT(t)
+		go func() {
+			w, err := r1.Hello(ctx, h)
+			done <- hello{w, err}
+		}()
+		settle()
+		join(t, a2, "lounge")
+		release()
+		if res := <-done; res.err != nil || !res.w.Resumed || res.w.ConnectionID != w1.ConnectionID {
+			t.Fatalf("resume: %v, resumed %v", res.err, res.w.Resumed)
+		}
+		expectList(t, "after the resume", expectConns(t, r1), webConn(w1.ConnectionID, online, ""),
+			webConn(w2.ConnectionID, online, "lounge"))
+		settle()
+		expectOpen(t, r1)
+	})
+}
+
 // Changes within the coalescing interval go out as one list, at the last list + 200 ms, with every change; lists of
 // one user are never closer than 200 ms.
 func TestUserConnectionsCoalesced(t *testing.T) {

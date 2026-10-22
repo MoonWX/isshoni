@@ -90,8 +90,21 @@ func (h *Hub) unlistConnLocked(o *outbox, c *conn) {
 	h.scheduleUserConnsLocked(o, u)
 }
 
-// userConnsChanged records a change of what user.connections shows about connection c (M2 01 §10.4): it detached or
-// re-attached, or its device name changed.
+// relistConn records that connection c has re-attached (resumed): a change for the user's connections, c included,
+// which gets the list after its resumed welcome. A list encoded while c was detached shows it reconnecting and may
+// still be queued in c's inbox, behind the resume: c's floor rises to the hub's last rev, so it skips those, and the
+// next list, sent now or the scheduled one, is newer. It runs on c's actor, after attach (connsRev is the actor's).
+func (h *Hub) relistConn(c *conn) {
+	var o outbox
+	h.mu.Lock()
+	c.connsRev = max(c.connsRev, h.connsRev)
+	h.userConnsChangedLocked(&o, c)
+	h.mu.Unlock()
+	o.send()
+}
+
+// userConnsChanged records a change of what user.connections shows about connection c (M2 01 §10.4): it detached,
+// or its device name changed.
 func (h *Hub) userConnsChanged(c *conn) {
 	var o outbox
 	h.mu.Lock()
@@ -202,8 +215,9 @@ func (c *conn) ownConnectionLocked() protocol.OwnConnection {
 }
 
 // sendUserConns sends a user.connections list with rev. Nothing is sent when the connection has had that rev or a
-// newer one already (two lists may reach the actor out of order), or while it is detached: its resume brings a new
-// list.
+// newer one already (two lists may reach the actor out of order), or while it is detached. A list encoded before the
+// connection re-attached is not sent after it either, even when it reaches the actor after the resume: relistConn
+// raised the floor to its rev at least, and the list that the re-attach brings is newer.
 func (c *conn) sendUserConns(rev uint64, msg []byte) {
 	if rev <= c.connsRev {
 		return

@@ -357,6 +357,53 @@ func TestSharePauseWithoutFeature(t *testing.T) {
 	})
 }
 
+// A connection without the feature can't pause a share whose publishing connection has it (an M1 tab and the
+// desktop app's share): paused is dropped, the reply is the usual one, and the share stays live.
+func TestSharePauseFromConnectionWithoutFeature(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newEnv(t)
+		defer e.close()
+		cookieA, a := e.user(false)
+		cookieB, _ := e.user(false)
+		pub, wp := e.pauseConn(cookieA)
+		plain, wl := e.connect(e.session(a, "sessionA2"), signaltest.DefaultHello()) // no share.pause
+		cb, _ := e.connect(cookieB, signaltest.DefaultHello())
+		for _, c := range []*signaltest.Client{pub, plain, cb} {
+			join(t, c, "lounge")
+		}
+		id := startShare(t, pub, screen("r1")).ShareID
+		goLive(e, wp.ConnectionID, id)
+		quiet(t, pub, plain, cb)
+		peer := e.media.Peer(wp.ConnectionID)
+
+		if p := setPaused(t, plain, id, true); jsonOf(t, p) != jsonOf(t, signaltest.ShareParamsFor(id)) {
+			t.Errorf("ShareParams %s, want the publishing connection's", jsonOf(t, p))
+		}
+		if u := lastUpdate(t, peer); u.Paused != nil || u.ShareID != id {
+			t.Errorf("UpdateShare got %+v, want no paused", u)
+		}
+		for _, c := range []*signaltest.Client{pub, cb} {
+			if st := statusAfter(t, c, id); st != "" {
+				t.Errorf("room.state with %s, want none: the share stays live", st)
+			}
+		}
+		drain(t, plain)
+		if snap := e.hub.Snapshot(); snap.Rooms[0].Shares[0].Info.Status != protocol.ShareStatusLive {
+			t.Errorf("snapshot status %s, want live", snap.Rooms[0].Shares[0].Info.Status)
+		}
+		if got := e.shareCounts(); got != [4]float64{0, 1, 0, 0} {
+			t.Errorf("isshoni_shares %v, want only live", got)
+		}
+		if e.logs.count("level=DEBUG", "paused ignored without the feature", "share_id="+id,
+			"conn_id="+wl.ConnectionID, "sender=false") != 1 {
+			t.Errorf("want a debug line for the ignored pause:\n%s", e.logs)
+		}
+		if e.logs.count("msg=\"share paused\"") != 0 {
+			t.Errorf("a share paused line for an ignored pause:\n%s", e.logs)
+		}
+	})
+}
+
 // The welcome lists the server's M2 features that the hello asks for, in the server's order (01 §6.2).
 func TestWelcomeM2Features(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {

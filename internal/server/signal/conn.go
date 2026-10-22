@@ -789,7 +789,7 @@ func (c *conn) attach(s *socket, re, defaultRoom string, pol Policy, resumed boo
 	c.h.log.Info(msg, slog.String("conn_id", c.id), slog.String("user_id", c.userID),
 		slog.Bool("resumed", resumed), slog.String("kind", string(c.client.Kind)), slog.String("role", string(c.role)))
 	if resumed {
-		c.h.userConnsChanged(c)
+		c.h.relistConn(c)
 	} else {
 		c.h.listConn(c)
 	}
