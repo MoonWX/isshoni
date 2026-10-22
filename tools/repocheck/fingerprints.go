@@ -12,11 +12,12 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// The root README.md publishes the release keys' fingerprints in its "Release signing keys" section, so that a user
-// can compare them with what `ssh-keygen -Y verify` prints (06 §9.4, §10.3). README F05 wrote the section with a
-// "not created yet" placeholder in each key's row; the owner replaces the placeholders with the fingerprints in the
-// pull request that adds deploy/keys/allowed_signers (deploy/keys/README.md step 2). From then on the section must
-// list the fingerprint of every key in the file and no other one.
+// The root README.md publishes the signing keys' fingerprints in its "Release signing keys" section, so that a user
+// can compare them with what `ssh-keygen -Y verify` prints (M1 06 §9.4, §10.3; M2 06 §11.5). README F05 wrote the
+// section with a "not created yet" placeholder in each key's row; the owner replaces the placeholders with the
+// fingerprints in the pull request that adds the key file (deploy/keys/README.md step 2). From then on the section
+// must list the fingerprint of every key in the key files that exist (deploy/keys/allowed_signers, the release keys,
+// and deploy/keys/update_signers, the desktop app's update keys) and no other one.
 const (
 	readmeFile    = "README.md"
 	readmeSection = "Release signing keys" // the heading text of a level-2 (##) heading
@@ -28,41 +29,52 @@ const (
 // matches no key.
 var fingerprintRE = regexp.MustCompile(`SHA256:[A-Za-z0-9+/]+`)
 
-// signerKey is one key of deploy/keys/allowed_signers.
+// signerKey is one key of an allowed-signers file.
 type signerKey struct {
+	file        string // the file, slash-separated: deploy/keys/allowed_signers
 	line        int    // 1-based line number in the file
 	name        string // the key's comment, such as isshoni-release-1; empty when the line has none
 	fingerprint string // as `ssh-keygen -l` prints it: SHA256:…
+	badOption   string // the first option of the line that OpenSSH 8.1 does not parse (opensshOptionOK), or ""
 }
 
 func (k signerKey) String() string {
 	if k.name == "" {
-		return fmt.Sprintf("the key on %s line %d", filepath.ToSlash(allowedSigners), k.line)
+		return fmt.Sprintf("the key on %s line %d", k.file, k.line)
 	}
-	return fmt.Sprintf("%s (%s line %d)", k.name, filepath.ToSlash(allowedSigners), k.line)
+	return fmt.Sprintf("%s (%s line %d)", k.name, k.file, k.line)
 }
 
-// checkReadmeFingerprints cross-checks the "Release signing keys" section of README.md with signers, the content of
-// deploy/keys/allowed_signers (LF line ends). It reports every problem at once:
-//   - a key of the file whose fingerprint the section does not list;
+// keyFile is a key file whose keys' fingerprints README.md lists.
+type keyFile struct {
+	path   string // slash-separated, such as deploy/keys/allowed_signers
+	prefix string // the names of its keys start with prefix + "-": isshoni-release, isshoni-update
+	keys   []signerKey
+}
+
+// checkReadmeFingerprints cross-checks the "Release signing keys" section of README.md with files, the key files
+// that exist and hold keys. It reports every problem at once:
+//   - a key of a file whose fingerprint the section does not list;
 //   - a fingerprint in the section that is no key's (a stale, mistyped or rotated-out one);
 //   - a line of the section that names one key (its comment) but lists another key's fingerprint;
-//   - a line of the section that still says a key is "not created yet".
+//   - a line of the section that still says a key is "not created yet", unless every key it names belongs to a key
+//     file that does not exist yet: absent holds those files' name prefixes (the update keys' rows may say so until
+//     deploy/keys/update_signers exists).
 //
 // Only what a reader sees counts: HTML comments are left out, and the section ends at the next heading of level 1 or
 // 2 outside a fenced code block (markdownSection).
-func checkReadmeFingerprints(root, signers string) error {
-	keys, err := parseAllowedSigners(signers)
-	if err != nil {
-		return err
+func checkReadmeFingerprints(root string, files []keyFile, absent []string) error {
+	var keys []signerKey
+	paths := make([]string, len(files))
+	for i, f := range files {
+		keys = append(keys, f.keys...)
+		paths[i] = f.path
 	}
-	if len(keys) == 0 {
-		return fmt.Errorf("%s has no key, only blank and comment lines", filepath.ToSlash(allowedSigners))
-	}
+	all, anyOf := joinList(paths, "and"), joinList(paths, "or")
 	data, err := os.ReadFile(filepath.Join(root, readmeFile))
 	if errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("there is no %s, whose %q section must list the fingerprints of the keys in %s "+
-			"(deploy/keys/README.md step 2)", readmeFile, "## "+readmeSection, filepath.ToSlash(allowedSigners))
+			"(deploy/keys/README.md step 2)", readmeFile, "## "+readmeSection, all)
 	}
 	if err != nil {
 		return err
@@ -71,7 +83,7 @@ func checkReadmeFingerprints(root, signers string) error {
 	section, ok := markdownSection(strings.ReplaceAll(string(data), "\r\n", "\n"), readmeSection)
 	if !ok {
 		return fmt.Errorf("%s has no %q section, which lists the fingerprints of the keys in %s "+
-			"(06 §9.4; deploy/keys/README.md step 2)", readmeFile, "## "+readmeSection, filepath.ToSlash(allowedSigners))
+			"(06 §9.4; deploy/keys/README.md step 2)", readmeFile, "## "+readmeSection, all)
 	}
 
 	byFingerprint := make(map[string]signerKey, len(keys))
@@ -83,7 +95,7 @@ func checkReadmeFingerprints(root, signers string) error {
 	listed := make(map[string]bool, len(keys))
 	var problems []string
 	for _, l := range section {
-		if strings.Contains(strings.ToLower(l.text), notCreated) {
+		if strings.Contains(strings.ToLower(l.text), notCreated) && !onlyAbsentKeys(l.text, files, absent) {
 			problems = append(problems, fmt.Sprintf("%s:%d still says a key is not created yet: %s",
 				readmeFile, l.n, strings.TrimSpace(l.text)))
 		}
@@ -92,7 +104,7 @@ func checkReadmeFingerprints(root, signers string) error {
 			k, ok := byFingerprint[fp]
 			if !ok {
 				problems = append(problems, fmt.Sprintf("%s:%d lists %s, which is not the fingerprint of any key in %s",
-					readmeFile, l.n, fp, filepath.ToSlash(allowedSigners)))
+					readmeFile, l.n, fp, anyOf))
 				continue
 			}
 			listed[fp] = true
@@ -110,17 +122,49 @@ func checkReadmeFingerprints(root, signers string) error {
 	}
 	if len(problems) > 0 {
 		return fmt.Errorf("the %q section of %s does not match %s:\n  - %s\n"+
-			"Put each key's fingerprint, as `task release:keys` or `ssh-keygen -lf` prints it, into the key's row of "+
-			"the table, and remove any other (deploy/keys/README.md step 2)",
-			readmeSection, readmeFile, filepath.ToSlash(allowedSigners), strings.Join(problems, "\n  - "))
+			"Put each key's fingerprint, as `task release:keys`, `task release:update-keys` or `ssh-keygen -lf` "+
+			"prints it, into the key's row of the table, and remove any other (deploy/keys/README.md step 2)",
+			readmeSection, readmeFile, all, strings.Join(problems, "\n  - "))
 	}
 	return nil
 }
 
-// parseAllowedSigners returns the keys of an allowed-signers file (ssh-keygen(1), "ALLOWED SIGNERS"): one key per
-// line as principals, optional options, the key and an optional comment; blank lines and lines starting with # are
-// skipped. Each key's fingerprint is the one `ssh-keygen -l` prints.
+// onlyAbsentKeys reports whether text names keys (by their name prefix) of a key file that does not exist yet, and
+// none of a file that does.
+func onlyAbsentKeys(text string, present []keyFile, absent []string) bool {
+	for _, f := range present {
+		if strings.Contains(text, f.prefix+"-") {
+			return false
+		}
+	}
+	for _, prefix := range absent {
+		if strings.Contains(text, prefix+"-") {
+			return true
+		}
+	}
+	return false
+}
+
+// joinList joins items as "a", "a and b" or "a, b and c" (with conj "and" or "or").
+func joinList(items []string, conj string) string {
+	switch len(items) {
+	case 0:
+		return ""
+	case 1:
+		return items[0]
+	}
+	return strings.Join(items[:len(items)-1], ", ") + " " + conj + " " + items[len(items)-1]
+}
+
+// parseAllowedSigners returns the keys of deploy/keys/allowed_signers (parseSignerFile).
 func parseAllowedSigners(data string) ([]signerKey, error) {
+	return parseSignerFile(filepath.ToSlash(allowedSigners), data)
+}
+
+// parseSignerFile returns the keys of an allowed-signers file (ssh-keygen(1), "ALLOWED SIGNERS"): one key per line as
+// principals, optional options, the key and an optional comment; blank lines and lines starting with # are skipped.
+// Each key's fingerprint is the one `ssh-keygen -l` prints. path names the file in errors.
+func parseSignerFile(path, data string) ([]signerKey, error) {
 	var keys []signerKey
 	for i, line := range strings.Split(data, "\n") {
 		line = strings.TrimSpace(line)
@@ -129,36 +173,77 @@ func parseAllowedSigners(data string) ([]signerKey, error) {
 		}
 		rest, ok := cutPrincipals(line)
 		if !ok {
-			return nil, fmt.Errorf("%s line %d: no key after the principals", filepath.ToSlash(allowedSigners), i+1)
+			return nil, fmt.Errorf("%s line %d: no key after the principals", path, i+1)
 		}
 		// What follows the principals has the authorized_keys format: [options] keytype base64 [comment].
-		pub, comment, _, _, err := ssh.ParseAuthorizedKey([]byte(rest))
+		pub, comment, options, _, err := ssh.ParseAuthorizedKey([]byte(rest))
 		if err != nil {
-			return nil, fmt.Errorf("%s line %d: no public key that can be read: %w", filepath.ToSlash(allowedSigners), i+1, err)
+			return nil, fmt.Errorf("%s line %d: no public key that can be read: %w", path, i+1, err)
 		}
-		keys = append(keys, signerKey{line: i + 1, name: comment, fingerprint: ssh.FingerprintSHA256(pub)})
+		k := signerKey{file: path, line: i + 1, name: comment, fingerprint: ssh.FingerprintSHA256(pub)}
+		for _, opt := range options {
+			if !opensshOptionOK(opt) {
+				k.badOption = opt
+				break
+			}
+		}
+		keys = append(keys, k)
 	}
 	return keys, nil
+}
+
+// opensshOptionOK reports whether opt, an option of an allowed-signers line, is one that Windows 10's inbox OpenSSH
+// 8.1 parses: namespaces="…" or cert-authority, whose names OpenSSH matches ignoring case (06 §7.2). valid-before and
+// valid-after came with OpenSSH 8.8.
+func opensshOptionOK(opt string) bool {
+	name, _, hasValue := strings.Cut(opt, "=")
+	switch {
+	case strings.EqualFold(name, "namespaces"):
+		return hasValue
+	case strings.EqualFold(name, "cert-authority"):
+		return !hasValue
+	}
+	return false
+}
+
+// optionProblems returns a problem for each key whose line has an option that OpenSSH 8.1 does not parse.
+func optionProblems(keys []signerKey) []string {
+	var problems []string
+	for _, k := range keys {
+		if k.badOption != "" {
+			problems = append(problems, fmt.Sprintf("%s line %d: the option %s is not one that Windows 10's OpenSSH 8.1 "+
+				"parses; only namespaces=\"…\" and cert-authority are allowed (06 §7.2). To retire a key, delete its line "+
+				"instead of marking it valid-before", k.file, k.line, k.badOption))
+		}
+	}
+	return problems
 }
 
 // cutPrincipals returns what follows the principals field of a non-blank allowed-signers line. As in OpenSSH, the
 // field is a run of characters up to a space or tab, or a double-quoted string.
 func cutPrincipals(line string) (rest string, ok bool) {
+	_, rest, ok = splitPrincipals(line)
+	return rest, ok
+}
+
+// splitPrincipals splits a non-blank allowed-signers line into its principals field (without quotes) and what
+// follows it.
+func splitPrincipals(line string) (principals, rest string, ok bool) {
 	if strings.HasPrefix(line, `"`) {
 		end := strings.IndexByte(line[1:], '"')
 		if end < 0 {
-			return "", false
+			return "", "", false
 		}
-		rest = line[end+2:]
+		principals, rest = line[1:end+1], line[end+2:]
 	} else {
 		i := strings.IndexAny(line, " \t")
 		if i < 0 {
-			return "", false
+			return "", "", false
 		}
-		rest = line[i:]
+		principals, rest = line[:i], line[i:]
 	}
 	rest = strings.TrimLeft(rest, " \t")
-	return rest, rest != ""
+	return principals, rest, rest != ""
 }
 
 // keysNamedIn returns the keys whose name (the comment of their allowed-signers line) text contains as a whole word.

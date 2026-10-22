@@ -1,0 +1,22 @@
+{
+  "artifacts": [
+    {
+      "arch": "amd64",
+      "kind": "nsis",
+      "name": "isshoni-desktop_0.2.1_windows_amd64_setup.exe",
+      "os": "windows",
+      "sha256": "0b4f5e16a4168546ff41084a44b976aab6e5b54dbc4f9984e18d4a240c2f51c3",
+      "size": 27,
+      "url": "https://github.com/MoonWX/isshoni/releases/download/v0.2.1/isshoni-desktop_0.2.1_windows_amd64_setup.exe"
+    }
+  ],
+  "channel": "stable",
+  "expiresAt": "2027-05-30T10:00:00.000Z",
+  "minVersion": "0.2.0-rc.1",
+  "notesUrl": "https://github.com/MoonWX/isshoni/releases/tag/v0.2.1",
+  "product": "isshoni-desktop",
+  "publishedAt": "2026-12-01T10:00:00.000Z",
+  "revokedKeys": [],
+  "schema": 1,
+  "version": "0.2.1"
+}
