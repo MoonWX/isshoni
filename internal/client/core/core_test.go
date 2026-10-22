@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"slices"
 	"strings"
@@ -502,20 +503,49 @@ func TestTransientTokenError(t *testing.T) {
 	}
 }
 
-// TestStopEndsShare: a terminal stop ends the share locally (unlinked, the stop's code) and stops the engine.
+// TestStopEndsShare: a terminal stop ends the share locally (unlinked, the stop's code) and stops the engine
+// before Auth.SessionEnded runs (the manager's refresh may take up to 15 s; capture must not wait for it), and Run
+// returns after SessionEnded.
 func TestStopEndsShare(t *testing.T) {
 	fs := newFakeServer(t)
-	e := newEnv(t, fs, envOptions{auth: &fakeAuth{}})
+	auth := &fakeAuth{endedDelay: 500 * time.Millisecond}
+	e := newEnv(t, fs, envOptions{auth: auth})
 	r := e.run()
 	e.waitOnline()
 	sh, err := e.start(ctxFor(t))
 	if err != nil {
 		t.Fatal(err)
 	}
+	var mu sync.Mutex
+	var atEnded []string // what was still running when SessionEnded was called
+	auth.setEndedHook(func() {
+		mu.Lock()
+		defer mu.Unlock()
+		select {
+		case <-sh.Done():
+		default:
+			atEnded = append(atEnded, "the share")
+		}
+		if e.engine.Session() != nil {
+			atEnded = append(atEnded, "the engine session")
+		}
+		if e.c.ActiveShare() != nil {
+			atEnded = append(atEnded, "ActiveShare")
+		}
+	})
 	fs.endSession(protocol.ErrorCodeSessionRevoked, protocol.ErrorScopeSession)
 	var se *StopError
 	if err := r.wait(t); !errors.As(err, &se) || se.Reason != StopUnlinked {
 		t.Fatalf("Run = %v, want unlinked", err)
+	}
+	_, _, ended, _, endedAt := auth.snapshot()
+	mu.Lock()
+	if len(ended) != 1 || len(atEnded) > 0 {
+		t.Errorf("SessionEnded calls %v; still running when it was called: %v (want none)", ended, atEnded)
+	}
+	mu.Unlock()
+	if r.at.Before(endedAt) {
+		t.Errorf("Run returned %v before SessionEnded did", endedAt.Sub(r.at))
 	}
 	select {
 	case <-sh.Done():
@@ -702,8 +732,8 @@ func TestStartShareErrors(t *testing.T) {
 	})
 }
 
-// TestCloseBound: Close sends share.stop and stops the engine session, waits at most 3 s for the reply (here it
-// never comes), then closes the socket (§11.2).
+// TestCloseBound: Close sends share.stop and stops the engine session at once, waits at most 3 s for the reply (here
+// it never comes), then closes the socket (§11.2).
 func TestCloseBound(t *testing.T) {
 	fs := newFakeServer(t)
 	fs.silent = []protocol.MessageType{protocol.MessageTypeShareStop}
@@ -714,8 +744,17 @@ func TestCloseBound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if e.engine.Session() == nil {
+		t.Fatal("no engine session after StartShare")
+	}
 	began := time.Now()
-	if err := e.c.Close(); err != nil {
+	closed := make(chan error, 1)
+	go func() { closed <- e.c.Close() }()
+	// Capture ends at once (within one frame interval, §11.2), not after the wait for the reply.
+	if took := engineStopped(t, e.engine); took > engineStopBound {
+		t.Errorf("the engine session stopped %v after Close was called, want within %v", took, engineStopBound)
+	}
+	if err := <-closed; err != nil {
 		t.Errorf("Close = %v", err)
 	}
 	took := time.Since(began)
@@ -735,6 +774,159 @@ func TestCloseBound(t *testing.T) {
 	if e.engine.Session() != nil {
 		t.Error("the engine session outlived Close")
 	}
+}
+
+// engineStopBound is how soon a share's end must stop the engine session: far less than the waits for the replies
+// (3 s in Close, the caller's ctx in Stop), with the race detector's slack.
+const engineStopBound = 300 * time.Millisecond
+
+// engineStopped polls the fake engine until its session has stopped and returns how long that took (at most 5 s).
+func engineStopped(t *testing.T, eng *fake.Engine) time.Duration {
+	t.Helper()
+	began := time.Now()
+	for eng.Session() != nil {
+		if time.Since(began) > 5*time.Second {
+			t.Fatal("the engine session did not stop")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return time.Since(began)
+}
+
+// TestStopWithoutReply: Share.Stop stops the engine at once while it waits for the share.stop reply (here it never
+// comes), keeps share.stop → pc.close on the wire, and returns ctx's error.
+func TestStopWithoutReply(t *testing.T) {
+	fs := newFakeServer(t)
+	fs.silent = []protocol.MessageType{protocol.MessageTypeShareStop}
+	e := newEnv(t, fs, envOptions{})
+	e.run()
+	e.waitOnline()
+	sh, err := e.start(ctxFor(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, func() bool { return slices.Contains(fs.types(), protocol.MessageTypePCOffer) },
+		func() string { return fmt.Sprintf("the server got %v, want a pub offer", fs.types()) })
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	stopped := make(chan error, 1)
+	go func() { stopped <- sh.Stop(ctx) }()
+	if took := engineStopped(t, e.engine); took > engineStopBound {
+		t.Errorf("the engine session stopped %v after Stop was called, want within %v", took, engineStopBound)
+	}
+	select {
+	case <-sh.Done():
+		t.Error("the share ended before the wait for the share.stop reply did")
+	default:
+	}
+	if err := <-stopped; !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Stop = %v, want context.DeadlineExceeded", err)
+	}
+	got := fs.types()
+	stop, pcClose := slices.Index(got, protocol.MessageTypeShareStop), slices.Index(got, protocol.MessageTypePCClose)
+	if stop < 0 || pcClose < stop {
+		t.Errorf("the server got %v, want share.stop, then pc.close", got)
+	}
+	if end := sh.Snapshot().End; end == nil || *end != (EndInfo{Reason: EndUser, ByThisApp: true}) {
+		t.Errorf("the share ended with %+v, want user, by this app", end)
+	}
+}
+
+// TestEndCutsOfferShort: Close ends a share whose actor waits for an offer's ICE gathering (here a STUN server that
+// never answers holds it for Pion's 5 s): the gathering is cut short, Close keeps its bound, and the share ends as
+// Close asked (user, by this app).
+func TestEndCutsOfferShort(t *testing.T) {
+	stun, err := (&net.ListenConfig{}).ListenPacket(ctxFor(t), "udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stun.Close() })
+	go func() { // reads the binding requests and never answers
+		b := make([]byte, 1500)
+		for {
+			if _, _, err := stun.ReadFrom(b); err != nil {
+				return
+			}
+		}
+	}()
+	fs := newFakeServer(t)
+	fs.iceServers = []protocol.ICEServer{{URLs: []string{"stun:" + stun.LocalAddr().String()}}}
+	e := newEnv(t, fs, envOptions{})
+	r := e.run()
+	e.waitOnline()
+	sh, err := e.start(ctxFor(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first EventLayer fills in the layer's encoder right before the actor makes the Publisher and its offer.
+	eventually(t, func() bool { return layerEncoder(sh.Snapshot()) != "" },
+		func() string { return "no EventLayer reached the share" })
+	time.Sleep(200 * time.Millisecond)
+	began := time.Now()
+	if err := e.c.Close(); err != nil {
+		t.Errorf("Close = %v", err)
+	}
+	took := time.Since(began)
+	if took > time.Second {
+		t.Errorf("Close took %v while an offer gathered, want well within its 3 s bound", took)
+	}
+	if err := r.wait(t); err != nil {
+		t.Errorf("Run after Close = %v, want nil", err)
+	}
+	got := fs.types()
+	if slices.Contains(got, protocol.MessageTypePCOffer) || !slices.Contains(got, protocol.MessageTypeShareStop) {
+		t.Errorf("the server got %v, want a share.stop and no pub offer (the gathering was cut short)", got)
+	}
+	if end := sh.Snapshot().End; end == nil || *end != (EndInfo{Reason: EndUser, ByThisApp: true}) {
+		t.Errorf("the share ended with %+v, want user, by this app", end)
+	}
+}
+
+// layerEncoder returns the encoder of the snapshot's first layer that has one.
+func layerEncoder(snap ShareSnapshot) string {
+	for _, l := range snap.Layers {
+		if l.Encoder != "" {
+			return l.Encoder
+		}
+	}
+	return ""
+}
+
+// TestStopOtherJoinLost: StopOther from no room leaves again when its room.join's reply never came (the join may
+// have put the connection in the room), and doesn't when the server refused the join.
+func TestStopOtherJoinLost(t *testing.T) {
+	t.Run("no reply", func(t *testing.T) {
+		fs := newFakeServer(t)
+		fs.silent = []protocol.MessageType{protocol.MessageTypeRoomJoin}
+		e := newEnv(t, fs, envOptions{})
+		e.run()
+		e.waitOnline()
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+		if err := e.c.StopOther(ctx, "lounge", "s_9"); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("StopOther = %v, want context.DeadlineExceeded", err)
+		}
+		if got := fs.types(); !slices.Equal(got, []protocol.MessageType{protocol.MessageTypeRoomJoin, protocol.MessageTypeRoomLeave}) {
+			t.Errorf("the server got %v, want room.join, room.leave", got)
+		}
+	})
+	t.Run("refused", func(t *testing.T) {
+		fs := newFakeServer(t)
+		fs.reject = map[protocol.MessageType]protocol.Error{
+			protocol.MessageTypeRoomJoin: protocol.NewError(protocol.ErrorCodeRoomNotFound, protocol.ErrorScopeRequest),
+		}
+		e := newEnv(t, fs, envOptions{})
+		e.run()
+		e.waitOnline()
+		err := e.c.StopOther(ctxFor(t), "lounge", "s_9")
+		var perr *protocol.Error
+		if !errors.As(err, &perr) || perr.Code != protocol.ErrorCodeRoomNotFound {
+			t.Fatalf("StopOther = %v, want room_not_found", err)
+		}
+		if got := fs.types(); !slices.Equal(got, []protocol.MessageType{protocol.MessageTypeRoomJoin}) {
+			t.Errorf("the server got %v, want room.join only", got)
+		}
+	})
 }
 
 // TestSubscriberOverflow: a subscriber that falls behind loses its oldest events and gets an EventResync; the
@@ -801,6 +993,67 @@ func TestShareEventsCoalesced(t *testing.T) {
 	time.Sleep(2 * shareEventEvery)
 	if n := count(); n != 4 {
 		t.Errorf("%d emits after the last change and flush, want 4 (nothing after the flush)", n)
+	}
+}
+
+// TestShareEventsLastIsFlush: a timer's emit that took its snapshot before the share ended can't publish after
+// flush's: flush waits for it, so the ended snapshot is always the last one out.
+func TestShareEventsLastIsFlush(t *testing.T) {
+	var mu sync.Mutex
+	state := "live"
+	var out []string
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	block := false
+	k := &coalescer{}
+	k.emit = func() {
+		mu.Lock()
+		snap, wait := state, block
+		block = false
+		mu.Unlock()
+		if wait { // the snapshot is taken; the publish waits
+			entered <- struct{}{}
+			<-release
+		}
+		mu.Lock()
+		out = append(out, snap)
+		mu.Unlock()
+	}
+	k.changed() // emits at once
+	mu.Lock()
+	block = true
+	mu.Unlock()
+	k.changed() // emits at the end of the interval: fire
+	select {
+	case <-entered:
+	case <-time.After(waitTimeout):
+		t.Fatal("the timer's emit never ran")
+	}
+	mu.Lock()
+	state = "ended"
+	mu.Unlock()
+	flushed := make(chan struct{})
+	go func() {
+		k.flush()
+		close(flushed)
+	}()
+	time.Sleep(50 * time.Millisecond) // flush runs into the emit in progress
+	close(release)
+	select {
+	case <-flushed:
+	case <-time.After(waitTimeout):
+		t.Fatal("flush never returned")
+	}
+	emitted := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(out)
+	}
+	eventually(t, func() bool { return emitted() >= 3 }, func() string { return fmt.Sprintf("%d emits, want 3", emitted()) })
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"live", "live", "ended"}; !slices.Equal(out, want) {
+		t.Errorf("emitted %v, want %v (the ended snapshot last)", out, want)
 	}
 }
 

@@ -151,7 +151,7 @@ type Share struct {
 	sess   media.Session
 	ctl    *ratectl.Controller
 	pump   *pump
-	ctx    context.Context // the actor's: ends when the share does
+	ctx    context.Context // the actor's: ends when end asks the actor to end the share, or when the share ends
 	cancel context.CancelFunc
 	// The actor's alone.
 	drv     pubDriver
@@ -468,9 +468,9 @@ func (s *Share) Snapshot() ShareSnapshot {
 	return *snap
 }
 
-// Stop ends the share (§11.4): share.stop, pc.close, the Publisher closed, the engine stopped, room.leave. ctx bounds
-// the requests; the local part always runs. It returns when the share has ended, with ctx's error when ctx ended
-// before the requests did.
+// Stop ends the share (§11.4): share.stop (the engine stops while its reply is awaited), pc.close, the Publisher
+// closed, room.leave. ctx bounds the requests; the local part always runs. It returns when the share has ended, with
+// ctx's error when ctx ended before the requests did.
 func (s *Share) Stop(ctx context.Context) error {
 	s.end(ctx, endRequest{info: EndInfo{Reason: EndUser, ByThisApp: true}, stop: true, leave: true})
 	return ctx.Err()
@@ -479,12 +479,15 @@ func (s *Share) Stop(ctx context.Context) error {
 // Done is closed when the share has ended; Snapshot().End says why.
 func (s *Share) Done() <-chan struct{} { return s.done }
 
-// end has the actor end the share and waits until it has ended. A start in progress is aborted instead.
+// end has the actor end the share and waits until it has ended. A start in progress is aborted instead. The actor's
+// ctx ends first, so blocking work it is doing (an offer's ICE gathering, up to offerTimeout) returns at once and the
+// request is taken within the bound of Close and Stop; finish's requests use req.ctx.
 func (s *Share) end(ctx context.Context, req endRequest) {
 	s.abort() // a start in progress ends; a running share isn't affected
 	req.ctx = ctx
 	select {
 	case <-s.run:
+		s.cancel() // set before the actor ran (start), so reading it after run closed is race-free
 		select {
 		case s.ends <- req:
 		case <-s.done:
@@ -717,6 +720,10 @@ func (s *Share) onEngineEvent(ev media.Event) *EndInfo {
 		if first {
 			s.profile = ev.Profile
 			if err := s.startPublisher(); err != nil {
+				if s.ctx.Err() != nil {
+					// end cut the offer short: the share ends with the EndInfo it asks for, which the actor takes next.
+					return nil
+				}
 				s.log.Warn("pub PC start failed", logx.Err(err))
 				return &EndInfo{Reason: EndError, Protocol: protocol.ErrorCodeInternal}
 			}
@@ -823,9 +830,10 @@ func (s *Share) videoTargets() map[string]int {
 	return targets
 }
 
-// finish ends the share (§11.4 "Stop"): media stops leaving at once, then share.stop, pc.close, the Publisher
-// closed, the engine stopped, room.leave when the connection has no other share. Requests that fail are logged:
-// the local part always runs.
+// finish ends the share (§11.4 "Stop"): media stops leaving at once; share.stop goes out and the engine stops
+// while its reply is awaited (capture ends within one frame interval, §11.2, not after the reply's wait of up to
+// ctx's end); then pc.close, the Publisher closed, room.leave when the connection has no other share. On the wire
+// the order stays share.stop → pc.close → room.leave. Requests that fail are logged: the local part always runs.
 func (s *Share) finish(req endRequest) {
 	ctx := req.ctx
 	if ctx == nil {
@@ -834,13 +842,20 @@ func (s *Share) finish(req endRequest) {
 		defer cancel()
 	}
 	s.pump.halt()
+	var stopped chan error // share.stop's result
 	if req.stop {
-		if err := s.c.request(ctx, protocol.MessageTypeShareStop, protocol.ShareStop{ShareID: s.params.ShareID}, nil); err != nil {
+		stopped = make(chan error, 1)
+		go func() {
+			stopped <- s.c.request(ctx, protocol.MessageTypeShareStop, protocol.ShareStop{ShareID: s.params.ShareID}, nil)
+		}()
+	}
+	s.pump.stop() // capture ends now; the halted pump puts nothing on the wire
+	if stopped != nil {
+		if err := <-stopped; err != nil {
 			s.log.Debug("share.stop", logx.Err(err))
 		}
 	}
-	s.closePublisher(true)
-	s.pump.stop()
+	s.closePublisher(true) // its consumer's detach is safe on a stopped pump
 	s.cancel()
 	if req.leave {
 		s.c.roomMu.Lock()
@@ -916,16 +931,21 @@ func (c *Client) StopOther(ctx context.Context, roomID, shareID string) error {
 	switch cur := c.roomID(); cur {
 	case roomID:
 	case "":
-		if err := c.join(ctx, roomID); err != nil {
-			return requestErr(ctx, err)
-		}
+		joined := true // a room.join went out: whatever its reply, StopOther leaves (as an aborted start does)
 		defer func() {
 			lctx, lcancel := context.WithTimeout(context.Background(), cleanupTimeout)
 			defer lcancel()
-			if err := c.leave(lctx); err != nil {
+			if err := c.leaveRoom(lctx, joined); err != nil {
 				c.log.Debug("room.leave after stopping another share", logx.Err(err))
 			}
 		}()
+		if err := c.join(ctx, roomID); err != nil {
+			var perr *protocol.Error
+			if errors.As(err, &perr) {
+				joined = false // the server refused it: the connection is in no room
+			}
+			return requestErr(ctx, err)
+		}
 		// The room.state that follows the join tells what the room has.
 		if err := c.waitRoom(ctx, roomID, func(_ protocol.RoomState, seq uint64) bool { return seq > 0 }); err != nil {
 			return err

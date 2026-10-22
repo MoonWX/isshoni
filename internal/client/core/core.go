@@ -266,13 +266,13 @@ func (c *Client) Run(ctx context.Context) error {
 	stopWatch := context.AfterFunc(c.life, cancel) // Close
 	defer stopWatch()
 
-	stop := c.connect(runCtx, c.helloCaps(runCtx))
+	stop, ended := c.connect(runCtx, c.helloCaps(runCtx))
 	c.cancelLife() // StartShare and StopOther calls in flight end now
 	if stop == nil {
 		c.shutdown()
 		return nil
 	}
-	c.terminate(stop)
+	c.terminate(stop, ended)
 	return stop
 }
 

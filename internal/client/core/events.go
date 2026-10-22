@@ -181,11 +181,15 @@ func sameStatus(a, b Status) bool {
 const shareEventEvery = 250 * time.Millisecond
 
 // coalescer limits a share's EventShare to one per shareEventEvery. A change inside the interval is emitted at its
-// end, with the snapshot as it is then.
+// end, with the snapshot as it is then. Emits never overlap (emitMu), and none follows flush's: an emit takes its
+// snapshot and then publishes it, so without that a timer's emit holding an older snapshot could publish after the
+// share's last one (ended).
 type coalescer struct {
-	mu      sync.Mutex
-	last    time.Time   // the last emit
-	timer   *time.Timer // a pending emit, or nil
+	emitMu sync.Mutex  // held around every emit; taken before mu, never inside it
+	mu     sync.Mutex  // guards the fields below
+	last   time.Time   // the last emit
+	timer  *time.Timer // a pending emit, or nil
+	// stopped is set by flush, before its emit: an emit that has not begun by then is dropped.
 	stopped bool
 	emit    func()
 }
@@ -205,7 +209,7 @@ func (k *coalescer) changed() {
 	}
 	k.last = now
 	k.mu.Unlock()
-	k.emit()
+	k.emitUnlessStopped()
 }
 
 func (k *coalescer) fire() {
@@ -217,11 +221,23 @@ func (k *coalescer) fire() {
 	}
 	k.last = time.Now()
 	k.mu.Unlock()
-	k.emit()
+	k.emitUnlessStopped()
+}
+
+// emitUnlessStopped emits unless flush has stopped the coalescer meanwhile: flush's emit is then the last.
+func (k *coalescer) emitUnlessStopped() {
+	k.emitMu.Lock()
+	defer k.emitMu.Unlock()
+	k.mu.Lock()
+	stopped := k.stopped
+	k.mu.Unlock()
+	if !stopped {
+		k.emit()
+	}
 }
 
 // flush emits a pending change at once and stops the coalescer: the share's last event (ended) goes out without
-// waiting.
+// waiting, after any emit in progress, and nothing follows it.
 func (k *coalescer) flush() {
 	k.mu.Lock()
 	if k.stopped {
@@ -234,5 +250,7 @@ func (k *coalescer) flush() {
 		k.timer = nil
 	}
 	k.mu.Unlock()
+	k.emitMu.Lock()
+	defer k.emitMu.Unlock()
 	k.emit()
 }

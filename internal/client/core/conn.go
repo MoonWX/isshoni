@@ -50,8 +50,9 @@ func (c *Client) helloCaps(ctx context.Context) protocol.Caps {
 }
 
 // connect runs connections until ctx ends (nil) or a terminal stop (§11.3). It dials anew after a forced token
-// refresh: the new connection's welcome is not resumed.
-func (c *Client) connect(ctx context.Context, caps protocol.Caps) *StopError {
+// refresh: the new connection's welcome is not resumed. ended is the code terminate reports to Auth.SessionEnded, ""
+// for none.
+func (c *Client) connect(ctx context.Context, caps protocol.Caps) (stop *StopError, ended protocol.ErrorCode) {
 	forced := false // the next hello carries the token of a forced refresh
 	first := true
 	for n := 0; ctx.Err() == nil; {
@@ -69,15 +70,15 @@ func (c *Client) connect(ctx context.Context, caps protocol.Caps) *StopError {
 			if sig != nil {
 				_ = sig.Close()
 			}
-			return authErr
+			return authErr, ""
 		case err == nil:
 			n = 0
 			var se *StopError
 			if perr, se = c.serve(ctx, sig); se != nil {
-				return se
+				return se, ""
 			}
 			if perr == nil {
-				return nil // ctx ended: the signaling client stays open for shutdown's share.stop
+				return nil, "" // ctx ended: the signaling client stays open for shutdown's share.stop
 			}
 			c.dropSignaling()
 			forced = false // a welcome came since the forced refresh
@@ -91,13 +92,13 @@ func (c *Client) connect(ctx context.Context, caps protocol.Caps) *StopError {
 			}
 			continue
 		}
-		se, again := c.onStop(ctx, perr, forced)
+		se, again, ended := c.onStop(ctx, perr, forced)
 		if !again {
-			return se
+			return se, ended
 		}
 		forced = true
 	}
-	return nil
+	return nil, ""
 }
 
 // dial opens a signaling client and returns after its first welcome (signal.Dial retries with its backoff until
@@ -214,35 +215,35 @@ func chainHas(err error, match func(error) bool) bool {
 
 // onStop applies §11.3's table to the server's error that stopped the signaling client. again means: dial anew,
 // with the token of the forced refresh that onStop made (unauthenticated, the first time). afterForced says the
-// stopped hello carried such a token.
-func (c *Client) onStop(ctx context.Context, perr *protocol.Error, afterForced bool) (se *StopError, again bool) {
+// stopped hello carried such a token. ended is the code for Auth.SessionEnded ("" for none), which terminate reports
+// once the share has ended: capture stops at once, not after the manager's refresh (up to 15 s).
+func (c *Client) onStop(ctx context.Context, perr *protocol.Error, afterForced bool) (se *StopError, again bool,
+	ended protocol.ErrorCode) {
 	stop := func(r StopReason) *StopError { return &StopError{Reason: r, Code: perr.Code, Err: perr} }
 	switch perr.Code {
 	case protocol.ErrorCodeUnauthenticated:
 		switch {
 		case c.o.Auth == nil:
-			return stop(StopUnlinked), false
+			return stop(StopUnlinked), false, ""
 		case afterForced:
-			c.sessionEnded(perr.Code)
-			return stop(StopUnlinked), false
+			return stop(StopUnlinked), false, perr.Code
 		}
-		return c.forceRefresh(ctx)
+		se, again := c.forceRefresh(ctx)
+		return se, again, ""
 	case protocol.ErrorCodeSessionRevoked:
-		c.sessionEnded(perr.Code)
-		return stop(StopUnlinked), false
+		return stop(StopUnlinked), false, perr.Code
 	case protocol.ErrorCodeAccountDisabled:
-		c.sessionEnded(perr.Code)
-		return stop(StopDisabled), false
+		return stop(StopDisabled), false, perr.Code
 	case protocol.ErrorCodeProtocolUnsupported, protocol.ErrorCodeClientOutdated:
-		return stop(StopUpdateRequired), false
+		return stop(StopUpdateRequired), false, ""
 	case protocol.ErrorCodeTooManyConnections:
-		return stop(StopTooMany), false
+		return stop(StopTooMany), false, ""
 	case protocol.ErrorCodeReplaced:
-		return stop(StopReplaced), false
+		return stop(StopReplaced), false, ""
 	}
 	// bad_message, and any other code that reconnecting can't fix (forbidden for a 4403 close without an error):
 	// a bug on one side.
-	return stop(StopProtocol), false
+	return stop(StopProtocol), false, ""
 }
 
 // forceRefresh asks Auth once for a new token after an unauthenticated (§11.3). A transient error is retried with
@@ -271,9 +272,9 @@ func (c *Client) forceRefresh(ctx context.Context) (*StopError, bool) {
 }
 
 // sessionEnded calls Auth.SessionEnded, bounded at 15 s, before the stop is reported (§11.3). Without Auth (cookie
-// auth) there is nobody to tell.
+// auth) or without a code there is nobody to tell.
 func (c *Client) sessionEnded(code protocol.ErrorCode) {
-	if c.o.Auth == nil {
+	if c.o.Auth == nil || code == "" {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), sessionEndedTimeout)
@@ -483,8 +484,9 @@ func (c *Client) shutdown() {
 }
 
 // terminate ends the connection after a terminal stop: the share ends locally (the signaling client is stopped),
-// and Status reports the stop.
-func (c *Client) terminate(stop *StopError) {
+// then Auth.SessionEnded hears of ended (when set; the share's capture has stopped by then), and Status reports the
+// stop.
+func (c *Client) terminate(stop *StopError, ended protocol.ErrorCode) {
 	c.waitOps()
 	if sh := c.ActiveShare(); sh != nil {
 		info := EndInfo{Reason: EndError, Protocol: stop.Code}
@@ -495,6 +497,7 @@ func (c *Client) terminate(stop *StopError) {
 		sh.end(ctx, endRequest{info: info})
 		cancel()
 	}
+	c.sessionEnded(ended)
 	c.dropSignaling()
 	c.setStatus(func(st *Status) {
 		st.Conn = ConnStopped

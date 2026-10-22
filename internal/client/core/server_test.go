@@ -34,7 +34,9 @@ type fakeServer struct {
 	// silent lists request types the server never answers; reject answers request types with an error.
 	silent []protocol.MessageType
 	reject map[protocol.MessageType]protocol.Error
-	nextID int
+	// iceServers go into every welcome (none when nil, as M1's server sends).
+	iceServers []protocol.ICEServer
+	nextID     int
 }
 
 // setHello replaces the hello answers while the server runs.
@@ -129,12 +131,13 @@ func (fs *fakeServer) serve(w http.ResponseWriter, r *http.Request) {
 	fs.nextID++
 	c := &fakeConn{ws: ws, connID: "c_" + strconv.Itoa(fs.nextID)}
 	fs.conns = append(fs.conns, c)
+	ice := append([]protocol.ICEServer{}, fs.iceServers...)
 	fs.mu.Unlock()
 	fs.write(ws, protocol.MessageTypeWelcome, "", env.ID, protocol.Welcome{
 		Protocol: protocol.Version, ServerVersion: "0.2.0-test",
 		Features:      []protocol.Feature{protocol.FeatureAgentRelay},
 		Limits:        protocol.Limits{PingIntervalMs: 15000, GraceMs: 30000},
-		ICEServers:    []protocol.ICEServer{},
+		ICEServers:    ice,
 		ConnectionID:  c.connID,
 		ResumeToken:   protocol.Secret("rt-" + c.connID),
 		Resumed:       ans.resumed,
@@ -274,6 +277,7 @@ type fakeAuth struct {
 	endedLeft   time.Duration // the time SessionEnded's ctx had left
 	endedAt     time.Time
 	endedDelay  time.Duration // SessionEnded takes this long
+	endedHook   func()        // runs when SessionEnded is called, before its delay
 }
 
 type tokenAnswer struct {
@@ -300,8 +304,11 @@ func (a *fakeAuth) AccessToken(_ context.Context, force bool) (protocol.Secret, 
 
 func (a *fakeAuth) SessionEnded(ctx context.Context, code protocol.ErrorCode) {
 	a.mu.Lock()
-	delay := a.endedDelay
+	delay, hook := a.endedDelay, a.endedHook
 	a.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	if delay > 0 {
 		time.Sleep(delay)
 	}
@@ -312,6 +319,13 @@ func (a *fakeAuth) SessionEnded(ctx context.Context, code protocol.ErrorCode) {
 	if d, ok := ctx.Deadline(); ok {
 		a.endedLeft = time.Until(d)
 	}
+}
+
+// setEndedHook sets the function SessionEnded runs first.
+func (a *fakeAuth) setEndedHook(f func()) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.endedHook = f
 }
 
 func (a *fakeAuth) snapshot() (calls, forced int, ended []protocol.ErrorCode, left time.Duration, at time.Time) {
