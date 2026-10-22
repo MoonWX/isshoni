@@ -59,6 +59,7 @@ func (c *Client) connect(ctx context.Context, caps protocol.Caps) (stop *StopErr
 		if first {
 			c.setConn(ConnConnecting)
 		} else {
+			c.signalDown() // a signaling client that stopped (a forced refresh's new dial): the share's hold runs
 			c.setConn(ConnReconnecting)
 		}
 		first = false
@@ -334,11 +335,14 @@ func (c *Client) dropSignaling() {
 
 // onState maps the signaling client's states to Status.Conn (§11.3) and takes the welcome's values. A welcome that
 // is not the connection's first and not resumed starts a new connection: the server forgot the room and the share.
+// Leaving ready and coming back are the share's too (§11.7): its hold, its resume or its republish.
 func (c *Client) onState(sig *signal.Client, sc signal.StateChange) {
 	switch sc.State {
 	case signal.StateConnecting, signal.StateHandshaking:
+		c.signalDown()
 		c.setConn(ConnConnecting)
 	case signal.StateBackoff:
+		c.signalDown()
 		c.setConn(ConnReconnecting)
 	case signal.StateReady:
 		w := sig.Welcome()
@@ -353,7 +357,8 @@ func (c *Client) onState(sig *signal.Client, sc signal.StateChange) {
 				c.room.reset(w.RoomID)
 			}
 		}
-		sh := c.share
+		noShare := c.share == nil
+		room, seq := c.room.id, c.room.seq
 		c.mu.Unlock()
 		c.setStatus(func(st *Status) {
 			st.Conn = ConnOnline
@@ -361,8 +366,9 @@ func (c *Client) onState(sig *signal.Client, sc signal.StateChange) {
 			st.ServerVersion = w.ServerVersion
 			st.Features = slices.Clone(w.Features)
 		})
-		if sh != nil {
-			sh.post(msgWelcome{resumed: sc.Resumed && !reset})
+		c.signalReady(w.ConnectionID, sc.Resumed)
+		if sc.Resumed && noShare && room != "" {
+			c.leaveAfterResume(room, seq)
 		}
 	}
 }

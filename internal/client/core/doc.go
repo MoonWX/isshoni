@@ -16,11 +16,12 @@
 //     owns the engine session, the Publisher, the rate controller and the pub PC; Share.Stop and the share's end;
 //   - pump.go: the media pump, the only caller of Session.Next (D5): bounded queues to the Publisher, whole-frame
 //     drops with a keyframe request, keyframe requests throttled to one per layer per 300 ms;
-//   - pubdriver.go: the pub PC's negotiation (01 §9);
+//   - pubdriver.go: the pub PC's negotiation (01 §9) and its recovery (§11.6): ICE restarts, rebuilds, unreachable;
+//   - recovery.go: reconnects (§11.7): the 30 s hold while signaling is down, the resume, the republish on a new
+//     connection, the reconcile with room.state;
 //   - events.go: Status, the events for the app, Subscribe's channels and EventShare's coalescing;
 //   - hints.go, relay.go, stats.go: hints and pause, the relay, and stats, which later slices of docs/m2/README.md
-//     fill in (README WA46 and WA55); recovery (§11.6, §11.7) comes with README WA38, and bearer auth's integration
-//     tests with WA73.
+//     fill in (README WA46 and WA55); bearer auth's integration tests come with WA73.
 //
 // The core never stores a token: 02's manager owns the credential. Nothing it logs holds a token, an SDP, an ICE
 // candidate, a window title, a source or app name, or a relay payload (§11.12). It has no Wails dependency (D18) and
