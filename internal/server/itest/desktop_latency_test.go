@@ -18,9 +18,13 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/sfu/sfutest"
 )
 
-// Case D16 of docs/m2/01-client-core.md §14: the Go pipeline's latency proxy of §12.4 item 1, which runs on every PR
-// (ubuntu, macOS and Windows; under -race except on Windows). It catches a pump, pacer or SFU change that holds
-// frames back; the glass-to-glass number itself is the owner's-PC run of §12.2.
+// Case D16 of docs/m2/01-client-core.md §14: the Go pipeline's latency proxy of §12.4 item 1. It catches a pump,
+// pacer or SFU change that holds frames back; the glass-to-glass number itself is the owner's-PC run of §12.2.
+//
+// Where it runs: CI runs it in test:go on ubuntu (-race), and the Mac in `task test`. §12.4 also names macOS and
+// Windows CI (under -race except on Windows), whose jobs don't test this package yet. test:go lists packages without
+// -v, so a passing run prints only the package's ok line; the values show with
+// `go test -race -count=1 -run '^TestDesktopLatency$' -v ./internal/server/itest/`, or in a failing run's output.
 
 // The load and the bounds of D16 (§12.4 item 1).
 const (
