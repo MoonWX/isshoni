@@ -84,6 +84,7 @@ std::string FakePick(uint32_t kind, uint32_t width, uint32_t height) {
   spec.test = true;
   spec.pattern = o.pattern;
   spec.pattern_hz = o.pattern_hz;
+  spec.pattern_late_ns = o.pattern_late_ns;
   return session::Sources().AddPick(std::move(spec));
 }
 

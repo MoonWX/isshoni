@@ -1915,7 +1915,9 @@ func (s *session) Stop() error {
 	return s.free("stop")
 }
 
-// control runs one control export on the session (thread-safe in the engine, 04 §5.1).
+// control runs one control export on the session (thread-safe in the engine, 04 §5.1). A Stop whose im_stop runs
+// between the stopping check and the call leaves the engine a stale handle, which it answers with
+// IM_ERR_INVALID_ARG: that is ErrStopped, as in Next (04 §12.3).
 func (s *session) control(op string, p proc, args ...uintptr) error {
 	if s.stopping.Load() {
 		return errStopped(op)
@@ -1926,6 +1928,9 @@ func (s *session) control(op string, p proc, args ...uintptr) error {
 	defer s.e.end()
 	r, lastErr := s.c.call(p, args...)
 	if st := int32(r); st != imOK {
+		if st == imErrInvalidArg && s.stopping.Load() {
+			return errStopped(op)
+		}
 		return s.e.failed(statusError(op, p.String(), st, lastErr))
 	}
 	return nil
@@ -2108,7 +2113,8 @@ type statsDoc struct {
 	} `json:"layers"`
 }
 
-// Stats is im_get_stats (04 §5.6), decoded into media.EngineStats; Drops is pacer + ring + stale.
+// Stats is im_get_stats (04 §5.6), decoded into media.EngineStats; Drops is pacer + ring + stale. A failure while
+// a Stop runs is ErrStopped, as in control.
 func (s *session) Stats() (media.EngineStats, error) {
 	const op = "stats"
 	if s.stopping.Load() {
@@ -2120,6 +2126,9 @@ func (s *session) Stats() (media.EngineStats, error) {
 	doc, err := callJSON(s.c, op, procGetStats, jsonMaxCap, uintptr(s.h))
 	s.e.end()
 	if err != nil {
+		if s.stopping.Load() {
+			return media.EngineStats{}, errStopped(op)
+		}
 		return media.EngineStats{}, s.e.failed(err)
 	}
 	var d statsDoc

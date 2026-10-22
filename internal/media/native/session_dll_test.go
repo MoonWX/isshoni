@@ -218,7 +218,7 @@ func TestDLLStartErrors(t *testing.T) {
 
 // TestNativeIntoPublisher is 04 §18.2's milestone (README §5): a native session (IM_ENC_FAKE and the test tone, both
 // carrying M1's Markers) → publish.Publisher → M1's in-process SFU harness → sfutest.Viewer. Frames arrive on both
-// layers, a PLI gets a keyframe within a frame or two, and the flash/beep A/V offset read from the video and audio
+// layers, the next encoded frame answers a PLI, and the flash/beep A/V offset read from the video and audio
 // Markers through the sender reports is under 45 ms (M1 integration 5's check, now on native timing). The offset is
 // asserted on f, which carries every frame of the 60 Hz pattern, so its flash frame is the beep's instant; q thins
 // the pattern to 15 fps on the pacer's schedule (04 §8.4), so its flash is its first frame at or after the beep (04
@@ -317,26 +317,56 @@ func TestNativeIntoPublisher(t *testing.T) {
 	// Four seconds of f: four flashes and beeps, and sender reports on both tracks.
 	waitUntil(t, 20*time.Second, func() bool { return frames("f") >= 240 }, "240 frames of f")
 
-	// A PLI: the next keyframe of f comes within a frame or two (the engine coalesces to 250 ms after an IDR, which
-	// the 4 s just waited covers; at 60 fps a frame is 16.7 ms).
-	before := len(sfutest.Frames(videoRec.Packets()))
+	// A PLI, away from any IDR: f's GOP (4 s) restarts at every keyframe, so its GOP IDR comes 240 frames after the
+	// subscription's keyframe, just as the wait above ends, and the engine holds a request back until 250 ms after an
+	// IDR (04 §6.4). The PLI goes 30 frames (500 ms) or more after f's newest keyframe and 40 or more before the next
+	// GOP IDR, and the next encoded frame must answer it: its Marker frame at most 3 past the newest one the viewer had
+	// (the frames on their way), its first packet within 100 ms (at 60 fps a frame is 16.7 ms).
+	fMarks := func(fs []sfutest.Frame) (newest, key uint32, ok bool) {
+		for _, f := range fs {
+			if f.HasMark && f.Mark.RID == "f" {
+				newest, ok = max(newest, f.Mark.Frame), true
+				if f.Mark.Keyframe {
+					key = max(key, f.Mark.Frame)
+				}
+			}
+		}
+		return newest, key, ok
+	}
+	var askedFrame uint32
+	var before int
+	waitUntil(t, 10*time.Second, func() bool {
+		fs := sfutest.Frames(videoRec.Packets())
+		newest, key, ok := fMarks(fs)
+		if !ok || newest < key+30 || newest > key+200 {
+			return false
+		}
+		askedFrame, before = newest, len(fs)
+		return true
+	}, "f 30 to 200 frames past its newest keyframe")
 	asked := time.Now()
 	if err := viewer.RequestKeyframe(videoRec); err != nil {
 		t.Fatal(err)
 	}
-	var keyAt time.Time
+	var answer sfutest.Frame
 	waitUntil(t, 5*time.Second, func() bool {
 		fs := sfutest.Frames(videoRec.Packets())
 		for _, f := range fs[min(before, len(fs)):] {
 			if f.HasMark && f.Mark.RID == "f" && f.Mark.Keyframe {
-				keyAt = time.Now()
+				answer = f
 				return true
 			}
 		}
 		return false
 	}, "a keyframe of f after the PLI")
-	if d := keyAt.Sub(asked); d > 250*time.Millisecond {
-		t.Errorf("the PLI's keyframe came %v after it", d)
+	t.Logf("a PLI at frame %d of f: keyframe at frame %d, %v later", askedFrame, answer.Mark.Frame,
+		answer.First.Sub(asked))
+	if answer.Mark.Frame > askedFrame+3 {
+		t.Errorf("the PLI's keyframe is frame %d of f, asked at frame %d: want the next encoded frame (at most +3)",
+			answer.Mark.Frame, askedFrame)
+	}
+	if d := answer.First.Sub(asked); d > 100*time.Millisecond {
+		t.Errorf("the PLI's keyframe came %v after it, want within 100 ms", d)
 	}
 
 	// q: frames arrive on the low layer too.

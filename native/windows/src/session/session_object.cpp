@@ -877,15 +877,18 @@ void Session::EncodeOne(const pace::Encode &e, int64_t now) {
       return;
     }
   }
+  // Every capture path goes through here: two AUs of a layer are at least one RTP tick apart (kMinAuSpacingNs). A
+  // static IDR stamped now, followed by a new frame that arrived a little late, is the case the pacer's 1 µs misses.
+  const int64_t ts = L.last_ts == 0 ? e.ts_ns : std::max(e.ts_ns, L.last_ts + kMinAuSpacingNs);
   EncodeInput in;
-  in.ts_ns = e.ts_ns;
+  in.ts_ns = ts;
   in.idr = e.idr || L.reinit_next;
   in.refresh = e.refresh;
   in.black = e.input == pace::Input::kLast && e.frame == 0;
   in.index = L.index;
-  if (e.ts_ns >= L.next_flash) {
+  if (ts >= L.next_flash) {
     in.flash = true;
-    while (L.next_flash <= e.ts_ns) {
+    while (L.next_flash <= ts) {
       L.next_flash += kFlashEveryNs;
     }
   }
@@ -913,6 +916,7 @@ void Session::EncodeOne(const pace::Encode &e, int64_t now) {
     Recover(e.layer, encpolicy::Failure::kEncodeError, st, now);
     return;
   }
+  L.last_ts = ts;
   L.encode_ns.Add(t1 - t0);
   if (au.data.empty()) {
     return;
@@ -933,7 +937,7 @@ void Session::EncodeOne(const pace::Encode &e, int64_t now) {
   ring::PacketMeta m;
   m.flags = (info.keyframe ? IM_PKT_KEYFRAME : 0u) | (e.refresh ? IM_PKT_REFRESH : 0u) |
             (L.reinit_next && info.keyframe ? IM_PKT_REINIT : 0u);
-  m.capture_ts_ns = e.ts_ns;
+  m.capture_ts_ns = ts;
   m.width = info.width;
   m.height = info.height;
   m.profile = info.profile;
@@ -953,7 +957,7 @@ void Session::EncodeOne(const pace::Encode &e, int64_t now) {
     ++L.refreshes;
   }
   L.bytes.Add(pushed, static_cast<uint32_t>(norm.size()));
-  L.latency_ns.Add(pushed - e.ts_ns);
+  L.latency_ns.Add(pushed - ts);
 }
 
 void Session::PublishLimits() {
@@ -1014,6 +1018,16 @@ int64_t Session::PatternFrameNs(uint64_t k) const noexcept {
   return epoch_ + static_cast<int64_t>(k / hz * 1'000'000'000ull + (k % hz) * 1'000'000'000ull / hz);
 }
 
+// When pattern frame k reaches the video thread: its grid instant, or later for the test hooks' late frames (two of
+// every three; the flash frames, k = n × hz, are on time when hz is a multiple of 3).
+int64_t Session::PatternDueNs(uint64_t k) const noexcept {
+  if (k % 3 == 0 || source_.pattern_late_ns <= 0) {
+    return PatternFrameNs(k);
+  }
+  const int64_t half = 500'000'000 / std::max<int64_t>(source_.pattern_hz, 1);
+  return PatternFrameNs(k) + std::min(source_.pattern_late_ns, half - 1);
+}
+
 void Session::SupervisorLoop() noexcept {
   const uintptr_t token = engine::os::EnterThread("isshoni supervisor", engine::os::ThreadClass::kNormal);
   const bool pattern = has_video_ && source_.capture_path == IM_CAPTURE_TEST && source_.pattern != Pattern::kNone;
@@ -1025,12 +1039,12 @@ void Session::SupervisorLoop() noexcept {
     if (!pattern_done && (capture_stopped_.load(std::memory_order_acquire) || ended_.load(std::memory_order_acquire))) {
       pattern_done = true;
     }
-    if (!pattern_done && now >= PatternFrameNs(next_k)) {
+    if (!pattern_done && now >= PatternDueNs(next_k)) {
       // The newest frame that is due; the ones the timer missed are skipped, as a capture source keeps only the
       // newest. Its capture time is its grid time, so the flashes land on epoch_ns + k × 1 s exactly.
       const auto elapsed = static_cast<uint64_t>(now - epoch_);
       uint64_t k = elapsed / 1'000'000'000ull * hz + (elapsed % 1'000'000'000ull) * hz / 1'000'000'000ull;
-      while (k > next_k && PatternFrameNs(k) > now) {
+      while (k > next_k && PatternDueNs(k) > now) {
         --k;
       }
       k = std::max(k, next_k);
@@ -1047,7 +1061,7 @@ void Session::SupervisorLoop() noexcept {
     api::Guard("session supervisor", [&] { SuperviseEvents(now); });
     int64_t deadline = now + kSupervisorPollNs;
     if (!pattern_done) {
-      deadline = std::min(deadline, PatternFrameNs(next_k));
+      deadline = std::min(deadline, PatternDueNs(next_k));
     }
     supervisor_waiter_.WaitUntil(deadline);
   }

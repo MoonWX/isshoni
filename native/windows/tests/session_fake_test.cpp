@@ -3,15 +3,16 @@
 // and the test tone; no GPU and no audio device (the engine runs with IM_INIT_NO_AUDIO, which the tone doesn't need).
 //
 // It asserts: each layer's first packet is KEYFRAME|REINIT within 500 ms after im_start returns, also on a static
-// pattern and with no captured frame at all; IM_ENC_FAKE's output (real SPS/PPS for the profile and size, CB byte
-// e0, AU sizes, the Marker's CaptureNS = capture_ts_ns − epoch_ns); every capture_ts_ns ≥ epoch_ns; f ≈ 60 fps, q
-// 15 fps; a keyframe within one interval, also on a static screen; im_set_layer_active; pause (only REFRESH and IDR
-// packets, audio keeps 50 packets/s); im_set_profile; im_set_content_hint coalesced with an im_update_layer; an
-// injected encode error (the same encoder re-opened, or ENCODER_CHANGED before the next candidate's first
-// REINIT|KEYFRAME); an injected device removal (ENDED{IM_ERR_ENCODER_LOST} device_removed within 1 s, then a new
-// session on a new device); exhausted candidates; a consumer that stops for 2 s (RING_OVERFLOW, stale drops, an IDR
-// when it resumes); im_stop with a blocked consumer; the session limits; the pick-token rules; the test tone's
-// Marker and its beeps on the video flashes; stats and session info.
+// pattern and with no captured frame at all; IM_ENC_FAKE's output (real SPS/PPS for the profile and size, CB byte e0,
+// AU sizes, the Marker's CaptureNS = capture_ts_ns − epoch_ns); every capture_ts_ns ≥ epoch_ns; f ≈ 60 fps, q 15 fps; a
+// keyframe within one interval, also on a static screen; two AUs of a layer at least one 90 kHz tick apart (a static
+// IDR followed by a late frame); im_set_layer_active; pause (only REFRESH and IDR packets, audio keeps 50 packets/s);
+// im_set_profile; im_set_content_hint coalesced with an im_update_layer; an injected encode error (the same encoder
+// re-opened, or ENCODER_CHANGED before the next candidate's first REINIT|KEYFRAME); an injected device removal
+// (ENDED{IM_ERR_ENCODER_LOST} device_removed within 1 s, then a new session on a new device); exhausted candidates; a
+// consumer that stops for 2 s (RING_OVERFLOW, stale drops, an IDR when it resumes); im_stop with a blocked consumer;
+// the session limits; the pick-token rules; the test tone's Marker and its beeps on the video flashes; stats and
+// session info.
 //
 // The test links the engine's objects (im_engine), so it calls the test hooks directly.
 #include <gtest/gtest.h>
@@ -24,6 +25,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <iterator>
 #include <optional>
 #include <span>
 #include <string>
@@ -394,7 +396,7 @@ TEST_F(Session, FrameRatesAndAccessUnitSizesFollowTheTargets) {
   // f over its 3 s carries no GOP IDR (4 s): the P size is lowered for the GOP's IDR, so 3 s of P frames are a bit
   // below the target, and within ±10 % of it.
   const double f_bps = static_cast<double>(bytes[0]) * 8.0 / seconds;
-  EXPECT_GT(f_bps, 4'000'000 * 0.88) << f_bps;
+  EXPECT_GT(f_bps, 4'000'000 * 0.90) << f_bps;
   EXPECT_LT(f_bps, 4'000'000 * 1.10) << f_bps;
   const auto sizes = im::testhooks::FakeFrameSizes(4'000'000, 60, 0, 0);
   EXPECT_EQ(sizes.idr, sizes.p * 10);
@@ -457,6 +459,43 @@ TEST_F(Session, KeyframeOnAStaticScreenWithinOneInterval) {
     EXPECT_LE(std::chrono::duration_cast<milliseconds>(key[l]->at - asked).count(), l == 0 ? 50 : 100);
     EXPECT_GE(key[l]->ts, epoch_ + kSecond / 2) << "a static IDR is stamped now";
   }
+  EXPECT_EQ(im_stop(s), IM_OK);
+}
+
+TEST_F(Session, AccessUnitsOfALayerAreAtLeastOneRtpTickApart) {
+  // A pending keyframe request and a frame that arrives late: the pacer re-encodes the last frame as an IDR stamped
+  // now (§8.5), and the late frame, captured before that instant, follows with the pacer's 1 µs bump (§8.4). The
+  // session keeps two AUs of a layer one 90 kHz tick apart, or 01's publisher would send both under one RTP timestamp
+  // and the viewer would lose the IDR. Two of every three pattern frames arrive 8 ms late, so most requests hit this.
+  constexpr int64_t kRtpTickNs = 11'112; // ceil(1e9 / 90000)
+  im::testhooks::Options o;
+  o.pattern_late_ns = 8'000'000;
+  im::testhooks::Configure(o);
+  const im_session s = Start(Config("test:pattern", false));
+  ASSERT_NE(s, 0u);
+  std::vector<Pkt> pkts = Pull(s, milliseconds(600));
+  for (int i = 0; i < 20; ++i) {
+    ASSERT_EQ(im_request_keyframe(s, 0), IM_OK) << LastError();
+    std::vector<Pkt> more = Pull(s, milliseconds(250 + (i * 13) % 61)); // 250–310 ms: past the IDR spacing (§6.4)
+    pkts.insert(pkts.end(), std::make_move_iterator(more.begin()), std::make_move_iterator(more.end()));
+  }
+  std::vector<int64_t> last(2, 0);
+  int keys = 0, one_tick = 0;
+  for (const Pkt &p : pkts) {
+    if (!p.video()) {
+      continue;
+    }
+    ASSERT_LT(p.layer, 2u);
+    if (last[p.layer] != 0) {
+      const int64_t step = p.ts - last[p.layer];
+      EXPECT_GE(step, kRtpTickNs) << "layer " << p.layer << " at " << p.ts - epoch_ << " ns, flags " << p.flags;
+      one_tick += step == kRtpTickNs ? 1 : 0;
+    }
+    last[p.layer] = p.ts;
+    keys += p.layer == 0 && p.key() ? 1 : 0;
+  }
+  EXPECT_GE(keys, 18) << "the first IDR and the 20 requests' (some may coalesce)";
+  EXPECT_GT(one_tick, 0) << "no static IDR was followed by a late frame: the case went untested";
   EXPECT_EQ(im_stop(s), IM_OK);
 }
 

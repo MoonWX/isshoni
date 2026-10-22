@@ -68,6 +68,10 @@ inline constexpr int64_t kOverflowEventEveryNs = 1'000'000'000; // RING_OVERFLOW
 inline constexpr int64_t kStatsEveryNs = 250'000'000;           // the video thread's stats snapshot
 inline constexpr int64_t kRoomRetryNs = 5'000'000;              // a full ring's IDR waits for room (§6.2)
 inline constexpr int64_t kFlashEveryNs = 1'000'000'000;         // the test pattern's flash, the tone's beep (§10.3)
+// The least capture_ts_ns step between two access units of a layer: one 90 kHz RTP tick, ceil(1e9 / 90000) ns. The
+// pacer's own bump (§8.4) is 1 µs, and two AUs 1 µs apart share one RTP timestamp: the SFU and the viewer would take
+// a static IDR and the late new frame right after it for one frame, and the IDR would be lost.
+inline constexpr int64_t kMinAuSpacingNs = 11'112;
 
 // The engine clock (QPC ns) as im::os::Clock, for the pump's stale rule (§6.2).
 class EngineClock final : public os::Clock {
@@ -146,6 +150,7 @@ private:
     bool ring_idr_asked = false; // RequireKeyframe was issued for a ring that waits for a keyframe
     uint32_t index = 0;          // the next access unit's index (the fake's Marker frame)
     int64_t next_flash = 0;      // the next flash instant (epoch_ns + k × 1 s)
+    int64_t last_ts = 0;         // the last encoded AU's capture_ts_ns (0: none yet)
     uint32_t last_idr_bytes = 0;
     uint64_t keyframes = 0;
     uint64_t refreshes = 0;
@@ -207,6 +212,7 @@ private:
   // The supervisor.
   void SupervisorLoop() noexcept;
   int64_t PatternFrameNs(uint64_t k) const noexcept;
+  int64_t PatternDueNs(uint64_t k) const noexcept;
   void SuperviseEvents(int64_t now);
 
   // The test-tone thread.

@@ -46,6 +46,9 @@ struct SourceSpec {
   bool test = true;   // a test source: IM_ENC_FAKE comes first under test hooks (04 §18.2)
   Pattern pattern = Pattern::kMoving;
   uint32_t pattern_hz = 60;
+  // kMoving: frames k with k mod 3 ≠ 0 reach the session this long after their grid instants (their capture times stay
+  // the grid instants, as a capture's time precedes its delivery), clamped below half an interval. Test hooks only.
+  int64_t pattern_late_ns = 0;
   // The capture area's object for this source (a GraphicsCaptureItem, README WA50); opaque here.
   std::shared_ptr<void> item;
 };

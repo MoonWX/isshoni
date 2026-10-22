@@ -98,6 +98,7 @@ im_status SourceRegistry::Resolve(std::string_view id, bool allow_listed, Source
     spec.height = o.pattern_height;
     spec.pattern = o.pattern;
     spec.pattern_hz = o.pattern_hz;
+    spec.pattern_late_ns = o.pattern_late_ns;
 #endif
     *out = std::move(spec);
     return IM_OK;

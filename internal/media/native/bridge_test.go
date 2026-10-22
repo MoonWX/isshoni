@@ -936,6 +936,29 @@ func TestStopRaceAndFailure(t *testing.T) {
 	}
 }
 
+func TestControlsAndStatsRacingStop(t *testing.T) {
+	// A Stop whose im_stop frees the handle between the stopping check and the call: the engine answers
+	// IM_ERR_INVALID_ARG for the stale handle, which is ErrStopped, as in Next, not CodeInvalid.
+	stale := func(s *session, export string) fakeProc {
+		return func([]uintptr) (uintptr, string) {
+			s.stopping.Store(true) // Stop's first step, while the call runs
+			return fakeResult(imErrInvalidArg), export + ": no session 0x0000000300000007 (stopped, or never started)"
+		}
+	}
+	sf := newSessionFake(t)
+	_, s := startFake(t, sf, baseConfig())
+	sf.f.set(procSetBitrate, stale(s, "im_set_bitrate"))
+	if err := s.SetBitrate("f", 1_000_000); !errors.Is(err, media.ErrStopped) {
+		t.Errorf("SetBitrate racing Stop: %v", err)
+	}
+	sf2 := newSessionFake(t)
+	_, s2 := startFake(t, sf2, baseConfig())
+	sf2.f.set(procGetStats, stale(s2, "im_get_stats"))
+	if _, err := s2.Stats(); !errors.Is(err, media.ErrStopped) {
+		t.Errorf("Stats racing Stop: %v", err)
+	}
+}
+
 func TestNextContext(t *testing.T) {
 	sf := newSessionFake(t)
 	_, s := startFake(t, sf, baseConfig())

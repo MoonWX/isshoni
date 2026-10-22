@@ -26,6 +26,9 @@ struct Options {
   uint32_t pattern_width = 1920;
   uint32_t pattern_height = 1080;
   uint32_t pattern_hz = 60;
+  // Two of every three frames of the moving pattern (k mod 3 ≠ 0) reach the session this long after their grid
+  // instants (capture times unchanged; clamped below half an interval): a capture whose frames arrive with jitter.
+  int64_t pattern_late_ns = 0;
   // Encoder kinds the catalog lists after IM_ENC_FAKE (in this order), each backed by the fake encoder but reported
   // as its own kind with that kind's traits (hardware, live bitrate, profiles): the next candidates of the fallback
   // cases (04 §9.8). Kinds without traits are ignored.
