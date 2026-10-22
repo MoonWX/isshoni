@@ -265,6 +265,22 @@ func (fs *fakeServer) types() []protocol.MessageType {
 	return out
 }
 
+// settledTypes is types once the server has read nothing new for 100 ms (within waitTimeout). A call such as Stop
+// returns when its last message is queued on the connection, before the server has read it, so a check of the whole
+// sequence waits for it to settle.
+func (fs *fakeServer) settledTypes() []protocol.MessageType {
+	const quiet = 100 * time.Millisecond
+	deadline := time.Now().Add(waitTimeout)
+	last, since := fs.types(), time.Now()
+	for time.Since(since) < quiet && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+		if now := fs.types(); len(now) != len(last) {
+			last, since = now, time.Now()
+		}
+	}
+	return last
+}
+
 // fakeAuth is a scripted core.Auth: AccessToken answers from tokens (forceRefresh false) and forced (true), the last
 // answer repeating; SessionEnded is recorded.
 type fakeAuth struct {

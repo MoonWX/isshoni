@@ -620,7 +620,7 @@ func TestStartShareBusy(t *testing.T) {
 	}
 	want := []protocol.MessageType{protocol.MessageTypeRoomJoin, protocol.MessageTypeShareStart,
 		protocol.MessageTypePCOffer, protocol.MessageTypeShareStop, protocol.MessageTypePCClose, protocol.MessageTypeRoomLeave}
-	if got := e.fs.types(); !slices.Equal(got, want) {
+	if got := e.fs.settledTypes(); !slices.Equal(got, want) {
 		t.Errorf("the server got %v, want %v", got, want)
 	}
 }
@@ -647,7 +647,7 @@ func TestStartShareCancel(t *testing.T) {
 		}
 		want := []protocol.MessageType{protocol.MessageTypeRoomJoin, protocol.MessageTypeShareStart,
 			protocol.MessageTypeShareStop, protocol.MessageTypeRoomLeave}
-		if got := fs.types(); !slices.Equal(got, want) {
+		if got := fs.settledTypes(); !slices.Equal(got, want) {
 			t.Errorf("the server got %v, want %v", got, want)
 		}
 		if e.c.ActiveShare() != nil || e.engine.Session() != nil {
@@ -678,7 +678,7 @@ func TestStartShareCancel(t *testing.T) {
 			t.Fatalf("StartShare = %v, want context.DeadlineExceeded", err)
 		}
 		// The join may have reached the server: the abort leaves.
-		if got := fs.types(); !slices.Equal(got, []protocol.MessageType{protocol.MessageTypeRoomJoin, protocol.MessageTypeRoomLeave}) {
+		if got := fs.settledTypes(); !slices.Equal(got, []protocol.MessageType{protocol.MessageTypeRoomJoin, protocol.MessageTypeRoomLeave}) {
 			t.Errorf("the server got %v, want room.join, room.leave", got)
 		}
 		if e.c.ActiveShare() != nil {
@@ -703,7 +703,7 @@ func TestStartShareErrors(t *testing.T) {
 		if !errors.As(err, &perr) || perr.Code != protocol.ErrorCodeShareLimit {
 			t.Fatalf("StartShare = %v, want share_limit", err)
 		}
-		if got := fs.types(); !slices.Equal(got, []protocol.MessageType{protocol.MessageTypeRoomJoin,
+		if got := fs.settledTypes(); !slices.Equal(got, []protocol.MessageType{protocol.MessageTypeRoomJoin,
 			protocol.MessageTypeShareStart, protocol.MessageTypeRoomLeave}) {
 			t.Errorf("the server got %v", got)
 		}
@@ -722,7 +722,7 @@ func TestStartShareErrors(t *testing.T) {
 		if !errors.Is(err, media.ErrSourceGone) {
 			t.Fatalf("StartShare = %v, want source_gone", err)
 		}
-		if got := fs.types(); !slices.Equal(got, []protocol.MessageType{protocol.MessageTypeRoomJoin,
+		if got := fs.settledTypes(); !slices.Equal(got, []protocol.MessageType{protocol.MessageTypeRoomJoin,
 			protocol.MessageTypeShareStart, protocol.MessageTypeShareStop, protocol.MessageTypeRoomLeave}) {
 			t.Errorf("the server got %v", got)
 		}
@@ -822,7 +822,7 @@ func TestStopWithoutReply(t *testing.T) {
 	if err := <-stopped; !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("Stop = %v, want context.DeadlineExceeded", err)
 	}
-	got := fs.types()
+	got := fs.settledTypes()
 	stop, pcClose := slices.Index(got, protocol.MessageTypeShareStop), slices.Index(got, protocol.MessageTypePCClose)
 	if stop < 0 || pcClose < stop {
 		t.Errorf("the server got %v, want share.stop, then pc.close", got)
@@ -873,7 +873,7 @@ func TestEndCutsOfferShort(t *testing.T) {
 	if err := r.wait(t); err != nil {
 		t.Errorf("Run after Close = %v, want nil", err)
 	}
-	got := fs.types()
+	got := fs.settledTypes()
 	if slices.Contains(got, protocol.MessageTypePCOffer) || !slices.Contains(got, protocol.MessageTypeShareStop) {
 		t.Errorf("the server got %v, want a share.stop and no pub offer (the gathering was cut short)", got)
 	}
@@ -906,7 +906,7 @@ func TestStopOtherJoinLost(t *testing.T) {
 		if err := e.c.StopOther(ctx, "lounge", "s_9"); !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("StopOther = %v, want context.DeadlineExceeded", err)
 		}
-		if got := fs.types(); !slices.Equal(got, []protocol.MessageType{protocol.MessageTypeRoomJoin, protocol.MessageTypeRoomLeave}) {
+		if got := fs.settledTypes(); !slices.Equal(got, []protocol.MessageType{protocol.MessageTypeRoomJoin, protocol.MessageTypeRoomLeave}) {
 			t.Errorf("the server got %v, want room.join, room.leave", got)
 		}
 	})
@@ -923,7 +923,7 @@ func TestStopOtherJoinLost(t *testing.T) {
 		if !errors.As(err, &perr) || perr.Code != protocol.ErrorCodeRoomNotFound {
 			t.Fatalf("StopOther = %v, want room_not_found", err)
 		}
-		if got := fs.types(); !slices.Equal(got, []protocol.MessageType{protocol.MessageTypeRoomJoin}) {
+		if got := fs.settledTypes(); !slices.Equal(got, []protocol.MessageType{protocol.MessageTypeRoomJoin}) {
 			t.Errorf("the server got %v, want room.join only", got)
 		}
 	})
