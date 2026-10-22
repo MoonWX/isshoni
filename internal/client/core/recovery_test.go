@@ -13,9 +13,10 @@ import (
 
 // The recovery paths of docs/m2/01-client-core.md §11.6 and §11.7 against fakeServer, with the timers shortened:
 // the hold, the resume (the pending offer sent again, a reconcile that stops a share the core doesn't have), the
-// republish on a new connection, share.start tried again after a drop, the pub PC's rebuilds (the server's
-// pc.restart, a refused offer, unreachable) and the cleanup of a share that ended while signaling was down. The ICE
-// restart and the rebuilds of a real outage are the itests' (internal/server/itest, D3–D6).
+// republish (on a new connection, on the same one at the next gen, after a resume into no room, and tried again
+// after a retryable refusal), share.start tried again after a drop, the pub PC's rebuilds (the server's pc.restart,
+// a refused offer, unreachable) and the cleanup of a share that ended while signaling was down. The ICE restarts and
+// the rebuilds of a real outage are the itests' (internal/server/itest, D3–D6 and their neighbors).
 
 // fastTiming is defaultTiming shortened for the tests that set it.
 func fastTiming(change func(*timing)) func(*Options) {
@@ -167,8 +168,9 @@ func TestRepublishNewConnection(t *testing.T) {
 
 // TestResumeLostShare: a resumed welcome whose room.state lacks the share (the server ended it while the socket was
 // away) publishes it again on the same connection: no room.join (the connection is in the room), share.start
-// {replaces: the old id}, and a new pub PC of gen 1 for the new id. (The pending offer goes again first, as §11.7
-// orders it; the server ignores its tracks, which name a share it no longer has.)
+// {replaces: the old id}, and a new pub PC for the new id at the next gen, neg 1: the server keeps the connection's
+// pub gen (M1 01 §9 rule 2), so a gen-1 offer would be stale. (The pending offer goes again first, as §11.7 orders
+// it; the server ignores its tracks, which name a share it no longer has.)
 func TestResumeLostShare(t *testing.T) {
 	fs := newFakeServer(t)
 	e := newEnv(t, fs, envOptions{tweak: fastTiming(nil)})
@@ -177,19 +179,50 @@ func TestResumeLostShare(t *testing.T) {
 	fs.shares = nil
 	fs.mu.Unlock()
 	fs.kill()
-	eventually(t, func() bool {
-		offers := received[protocol.PCOffer](fs, protocol.MessageTypePCOffer)
-		last := offers[len(offers)-1]
-		return last.Gen == 1 && last.Neg == 1 && len(last.Tracks) > 0 && last.Tracks[0].ShareID == "s_2"
-	}, func() string {
-		return fmt.Sprintf("the server got the pub offers %s, want one of gen 1 for s_2", offerList(fs))
-	})
+	waitOffers(t, fs, "1/1 1/1 2/1")
+	offers := received[protocol.PCOffer](fs, protocol.MessageTypePCOffer)
+	if tracks := offers[2].Tracks; len(tracks) == 0 || tracks[0].ShareID != "s_2" {
+		t.Errorf("the new PC's offer has the tracks %+v, want the new share s_2's", tracks)
+	}
 	starts := received[protocol.ShareStart](fs, protocol.MessageTypeShareStart)
 	if len(starts) != 2 || starts[1].Replaces != "s_1" || starts[1].Ref == starts[0].Ref {
 		t.Errorf("share.start requests %+v, want a second one replacing s_1 with a ref of its own", starts)
 	}
 	if n := len(received[protocol.RoomJoin](fs, protocol.MessageTypeRoomJoin)); n != 1 {
 		t.Errorf("the server got %d room.join, want the first alone: the resumed connection is in the room", n)
+	}
+	if snap := sh.Snapshot(); snap.ID != "s_2" || snap.End != nil || e.c.Status().ConnectionID != "c_1" {
+		t.Errorf("the share is %+v on %s, want it running as s_2 on c_1", snap, e.c.Status().ConnectionID)
+	}
+	if n := fs.staleOffers(); n != 0 {
+		t.Errorf("the server answered %d pub offers with stale_negotiation, want none", n)
+	}
+}
+
+// TestResumeWithoutRoom: a resumed welcome that names no room (the connection was taken out of the share's room
+// while the socket was away, and the share with it) publishes the share again at once (M1 01 §10.5): room.join,
+// share.start{replaces: the old id}, a new pub PC at the next gen; nothing goes to the old PC, whose offer would get
+// not_in_room outside the room.
+func TestResumeWithoutRoom(t *testing.T) {
+	fs := newFakeServer(t)
+	e := newEnv(t, fs, envOptions{tweak: fastTiming(nil)})
+	sh := startedShare(t, e)
+	fs.mu.Lock()
+	fs.shares = nil
+	fs.conns[len(fs.conns)-1].room = ""
+	fs.mu.Unlock()
+	fs.kill()
+	waitOffers(t, fs, "1/1 2/1")
+	once := []protocol.MessageType{protocol.MessageTypeRoomJoin, protocol.MessageTypeShareStart, protocol.MessageTypePCOffer}
+	if got := fs.settledTypes(); !slices.Equal(got, slices.Concat(once, once)) {
+		t.Errorf("the server got %v, want room.join, share.start and a pub offer, then the same again", got)
+	}
+	starts := received[protocol.ShareStart](fs, protocol.MessageTypeShareStart)
+	if len(starts) != 2 || starts[1].Replaces != "s_1" || starts[1].Ref == starts[0].Ref {
+		t.Errorf("share.start requests %+v, want a second one replacing s_1 with a ref of its own", starts)
+	}
+	if joins := received[protocol.RoomJoin](fs, protocol.MessageTypeRoomJoin); len(joins) != 2 || joins[1].RoomID != "lounge" {
+		t.Errorf("room.join requests %+v, want the share's room joined again", joins)
 	}
 	if snap := sh.Snapshot(); snap.ID != "s_2" || snap.End != nil || e.c.Status().ConnectionID != "c_1" {
 		t.Errorf("the share is %+v on %s, want it running as s_2 on c_1", snap, e.c.Status().ConnectionID)
@@ -225,6 +258,97 @@ func TestRepublishRefused(t *testing.T) {
 	}
 	if e.engine.Session() != nil || e.c.ActiveShare() != nil {
 		t.Error("the engine session or the share outlived the refused republish")
+	}
+}
+
+// TestRepublishRetried: a republish that the server refuses with a retryable code goes again (M1 01 §12.1):
+// rate_limited after its retryAfterMs, a retryable internal once after republishRetry. A second internal ends the
+// share (error, internal).
+func TestRepublishRetried(t *testing.T) {
+	rateLimited := protocol.NewError(protocol.ErrorCodeRateLimited, protocol.ErrorScopeRequest)
+	rateLimited.RetryAfterMs = 200
+	internal := protocol.NewError(protocol.ErrorCodeInternal, protocol.ErrorScopeRequest)
+	for _, tc := range []struct {
+		name     string
+		err      protocol.Error
+		always   bool          // every share.start of the republish is refused, not only the first
+		retry    time.Duration // the test's republishRetry
+		min, max time.Duration // the wait between the refused share.start and the next
+	}{
+		// republishRetry is long here, so a retry that ignored retryAfterMs would come too late.
+		{name: "rate_limited", err: rateLimited, retry: 10 * time.Second, min: 150 * time.Millisecond, max: 2 * time.Second},
+		{name: "internal", err: internal, retry: 300 * time.Millisecond, min: 250 * time.Millisecond, max: 2 * time.Second},
+		{name: "internal twice", err: internal, always: true, retry: 300 * time.Millisecond,
+			min: 250 * time.Millisecond, max: 2 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := newFakeServer(t)
+			e := newEnv(t, fs, envOptions{tweak: fastTiming(func(t *timing) { t.republishRetry = tc.retry })})
+			sh := startedShare(t, e)
+			fs.mu.Lock()
+			if tc.always {
+				fs.reject = map[protocol.MessageType]protocol.Error{protocol.MessageTypeShareStart: tc.err}
+			} else {
+				fs.rejectOnce = map[protocol.MessageType]protocol.Error{protocol.MessageTypeShareStart: tc.err}
+			}
+			fs.mu.Unlock()
+			fs.setHello(func(int, protocol.Hello) fakeAnswer { return fakeAnswer{resumed: false} })
+			fs.kill()
+			starts := func() int { return len(received[protocol.ShareStart](fs, protocol.MessageTypeShareStart)) }
+			eventually(t, func() bool { return starts() >= 2 }, func() string { return "no republish" })
+			refused := time.Now()
+			eventually(t, func() bool { return starts() >= 3 }, func() string {
+				return fmt.Sprintf("the server got %v, want the refused share.start tried again", fs.types())
+			})
+			if took := time.Since(refused); took < tc.min || took > tc.max {
+				t.Errorf("the refused share.start went again %v later, want %v to %v", took, tc.min, tc.max)
+			}
+			if tc.always {
+				select {
+				case <-sh.Done():
+				case <-time.After(waitTimeout):
+					t.Fatal("the share didn't end after its republish failed twice")
+				}
+				if end := sh.Snapshot().End; end == nil || *end != (EndInfo{Reason: EndError, Protocol: protocol.ErrorCodeInternal}) {
+					t.Errorf("the share ended with %+v, want error, internal", end)
+				}
+				if n := starts(); n != 3 {
+					t.Errorf("the server got %d share.start, want the first, the refused republish and one retry", n)
+				}
+				return
+			}
+			waitOffers(t, fs, "1/1 1/1")
+			if snap := sh.Snapshot(); snap.ID != "s_2" || snap.End != nil {
+				t.Errorf("the share is %+v, want it running as s_2", snap)
+			}
+			if n := len(received[protocol.RoomJoin](fs, protocol.MessageTypeRoomJoin)); n != 2 {
+				t.Errorf("the server got %d room.join, want one on each connection: the retry is in the room", n)
+			}
+		})
+	}
+}
+
+// TestBeginWithoutDownTime: an actor that begins while signaling isn't ready and has no time it went down holds the
+// share from now; it doesn't end it at once (a hold from the zero time would be over).
+func TestBeginWithoutDownTime(t *testing.T) {
+	fs := newFakeServer(t)
+	e := newEnv(t, fs, envOptions{})
+	s := newShare(e.c, ShareRequest{RoomID: "lounge"}, func() {})
+	defer s.events.flush()
+	if req := s.begin(); req != nil {
+		t.Fatalf("begin = %+v, want the share held", req)
+	}
+	defer s.rec.stopHold()
+	if s.rec.downAt.IsZero() || s.rec.holdC() == nil {
+		t.Fatalf("after begin the hold runs from %v (timer %v), want from now", s.rec.downAt, s.rec.hold)
+	}
+	select {
+	case <-s.rec.holdC():
+		t.Error("the hold was over at once")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if st := s.Snapshot().State; st != StateReconnecting {
+		t.Errorf("the share is %s, want reconnecting", st)
 	}
 }
 

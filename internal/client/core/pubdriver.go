@@ -19,10 +19,10 @@ import (
 //
 //   - ICE disconnected: signal.Probe at once (is signaling down too?), and after 3 s an ICE restart (the same gen,
 //     neg + 1, new ICE credentials), at most one per 5 s;
-//   - an ICE restart (or a rebuilt PC) that isn't connected within 15 s of its offer, a PC that failed or was closed
-//     under the core, the server's pc.restart{pub, rebuild}, an offer the server refused (sdp_invalid, bad_request)
-//     or an answer the Publisher refused: a rebuild, at most one per 10 s. The Publisher is closed and a new one
-//     offers gen + 1 with the same share id; the media pump re-attaches with keyframe requests;
+//   - an ICE restart (or the new PC of a rebuild or a republish) that isn't connected within 15 s, a PC that failed
+//     or was closed under the core, the server's pc.restart{pub, rebuild}, an offer the server refused (sdp_invalid,
+//     bad_request) or an answer the Publisher refused: a rebuild, at most one per 10 s. The Publisher is closed and a
+//     new one offers gen + 1 with the same share id; the media pump re-attaches with keyframe requests;
 //   - a second refused offer or answer within 60 s ends the share (error, sdp_invalid);
 //   - 5 rebuilds without connecting: the share is unreachable (03: "Can't reach the server's media port"), and the
 //     rebuilds go on every 30 s.
@@ -47,7 +47,7 @@ type pubDriver struct {
 	everConnected bool      // a PC of this share on this connection has been connected: one that isn't is recovering
 	down          time.Time // when ICE was first seen disconnected; zero while it isn't
 	probed        bool      // signal.Probe went out for this disconnection
-	connectBy     time.Time // an ICE restart or a rebuilt PC not connected by then is rebuilt; zero once connected
+	connectBy     time.Time // an ICE restart or a rebuilt or republished PC not connected by then is rebuilt; zero once up
 	icedAt        time.Time // the last ICE restart
 	rebuiltAt     time.Time // the last rebuild
 	owed          string    // why a rebuild is owed (the server asked, a refused offer), until the spacing lets it
@@ -222,8 +222,9 @@ func iceUp(pc *webrtc.PeerConnection) bool {
 
 // drive looks at the pub PC once (§11.6's table). It records ICE's state, and while signaling is ready it acts:
 // signal.Probe when ICE has just become disconnected, an ICE restart after 3 s of it, a rebuild when the PC failed
-// or closed, when an ICE restart or a rebuilt PC hasn't connected within 15 s, or when one is owed. Each action
-// keeps its spacing; one that has to wait is taken by a later look. The EndInfo is set when the share must end.
+// or closed, when an ICE restart or a rebuilt (or republished) PC hasn't connected within 15 s, or when one is owed.
+// Each action keeps its spacing; one that has to wait is taken by a later look. The EndInfo is set when the share
+// must end.
 func (s *Share) drive(now time.Time) *EndInfo {
 	pub := s.publisher()
 	if pub == nil || s.rec.republish {

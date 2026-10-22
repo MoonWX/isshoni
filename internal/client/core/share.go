@@ -565,11 +565,13 @@ type (
 	msgHint      struct{ h protocol.QualityHint }
 	msgError     struct{ e protocol.Error }
 	msgResend    struct{ gen, neg uint32 }
-	// msgWelcome: signaling is ready (seq counts the readies), on connection connID, resumed or a new connection.
+	// msgWelcome: signaling is ready (seq counts the readies), on connection connID, resumed or a new connection,
+	// in the welcome's room (a resumed welcome names the room the connection is in, "" for none).
 	msgWelcome struct {
 		seq     uint64
 		connID  string
 		resumed bool
+		roomID  string
 	}
 	// msgOffline: signaling left the ready of seq at at: the share's hold starts (§11.7).
 	msgOffline struct {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -26,17 +27,21 @@ import (
 // Cases D3 to D6 of docs/m2/01-client-core.md §14: the client core's recovery (§11.6, §11.7) against the test's
 // server. A socket that dies mid-share is resumed and the media never stops; a UDP outage of the pub PC is an ICE
 // restart, and a rebuild when the restart can't connect; a server restart is a republish with replaces on a new
-// connection; and a server that stays away ends the share after the 30 s hold. The viewers are M1's harness clients,
-// which recover by themselves (client_test.go); D17 (no leaks) is every case's.
+// connection; and a server that stays away ends the share after the 30 s hold. Next to D3, two resumes that have
+// more to do: a pub PC that went disconnected while the socket was away restarts ICE on the welcome (M1 01 §10.4),
+// and a share that the server ended meanwhile is published again on the same connection, at the pub PC's next gen
+// (M1 01 §9 rule 2, §10.5). The viewers are M1's harness clients, which recover by themselves (client_test.go); D17
+// (no leaks) is every case's.
 //
 // The core's own view comes from what it reports (Status, the share's snapshot, its events) and, for its pub offers,
 // from its debug log: the "pub offer" lines name each offer's gen and neg, and whether it restarts ICE.
 
 // recoveryApp is a desktop app for these cases: the core of desktopApp, whose WebSocket connections are recorded so
-// that a test can cut the one in use, with the Pion settings the case gives its pub PC.
+// that a test can cut the one in use and hold back the next, with the Pion settings the case gives its pub PC.
 type recoveryApp struct {
 	*desktopApp
 	sock *sockets
+	gate redialGate
 
 	mu       sync.Mutex
 	statuses []timedStatus // every EventStatus, with when it arrived
@@ -49,7 +54,12 @@ type timedStatus struct {
 }
 
 // recoveringDesktop starts a desktop app for m, as desktop does, with settings for its pub PC (nil: loopback) and
-// its sockets recorded. It waits until the connection is online; the app is closed and checked when the test ends.
+// its sockets recorded and their redials gated (redialGate). It waits until the connection is online; the app is
+// closed and checked when the test ends.
+//
+// Its authentication is desktop()'s (desktop_helpers_test.go), the member's session cookie in Options.Header. README
+// WA73's switch of that file to a linked device's bearer token has to switch this function too, so that D3 runs on
+// bearer auth as WA73's acceptance asks.
 func (w *world) recoveringDesktop(m *member, engine fake.EngineConfig, settings *webrtc.SettingEngine) *recoveryApp {
 	w.t.Helper()
 	t := w.t
@@ -70,22 +80,32 @@ func (w *world) recoveringDesktop(m *member, engine fake.EngineConfig, settings 
 	}
 	logs := &lockedBuffer{}
 	eng := fake.NewEngine(engine)
-	sock := &sockets{}
+	a := &recoveryApp{sock: &sockets{}}
+	tr, ok := a.sock.transport(t, w.srv.Client.Transport).(*http.Transport)
+	if !ok {
+		t.Fatal("the recorded transport isn't an *http.Transport")
+	}
+	dial := tr.DialContext
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if err := a.gate.wait(ctx); err != nil {
+			return nil, err
+		}
+		return dial(ctx, network, addr)
+	}
+	t.Cleanup(a.gate.release) // registered before the core's close, so it runs after it: nothing waits by then
 	c, err := core.New(core.Options{
 		ServerURL:  w.srv.URL,
 		Header:     http.Header{"Cookie": {strings.Join(cookies, "; ")}},
 		Engine:     eng,
 		Settings:   settings,
-		HTTPClient: &http.Client{Transport: sock.transport(t, w.srv.Client.Transport)},
+		HTTPClient: &http.Client{Transport: tr},
 		Logger:     slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := &recoveryApp{
-		desktopApp: &desktopApp{t: t, name: m.name + "'s app", core: c, engine: eng, runErr: make(chan error, 1), logs: logs},
-		sock:       sock,
-	}
+	a.desktopApp = &desktopApp{t: t, name: m.name + "'s app", core: c, engine: eng, runErr: make(chan error, 1),
+		logs: logs}
 	d := a.desktopApp
 	events, unsub := c.Subscribe()
 	d.unsub = unsub
@@ -152,6 +172,48 @@ func (a *recoveryApp) dialed() int {
 	a.sock.mu.Lock()
 	defer a.sock.mu.Unlock()
 	return a.sock.n
+}
+
+// redialGate holds back the TCP dials of an app's WebSocket while a test says so: the core's signaling stays down,
+// for as long as the test needs to set up what the resume is to find, and its next attempt goes out once released.
+type redialGate struct {
+	mu   sync.Mutex
+	held chan struct{} // closed when released; nil while not held
+}
+
+// hold holds back the dials from now on.
+func (g *redialGate) hold() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.held == nil {
+		g.held = make(chan struct{})
+	}
+}
+
+// release lets the dials go, the waiting one included.
+func (g *redialGate) release() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.held != nil {
+		close(g.held)
+		g.held = nil
+	}
+}
+
+// wait waits while the gate holds, until ctx ends.
+func (g *redialGate) wait(ctx context.Context) error {
+	g.mu.Lock()
+	held := g.held
+	g.mu.Unlock()
+	if held == nil {
+		return nil
+	}
+	select {
+	case <-held:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // pubOffer is one of the core's pub offers, as its log names it.
@@ -291,6 +353,195 @@ func TestDesktopSocketKilled(t *testing.T) {
 	}
 	t.Logf("the share's states since the cut: %s", app.shareStates(shareMark))
 	bob.check()
+}
+
+// TestDesktopResumeICERestart is D3 after a network switch: the core's UDP and its WebSocket go at once, and the
+// socket can come back only once the pub PC's ICE is disconnected. On the resumed welcome the core restarts ICE at
+// once (01 §11.7; M1 01 §10.4, the pub column's last row): its first pub offer after the welcome is of the same gen
+// with the next neg and new ICE credentials, for the same share. Nothing is published again, and when the UDP is
+// back the viewer's video starts again on a keyframe on the track it had.
+//
+// The UDP comes back only after that offer went, so the PC can't reconnect by itself before the welcome; its ICE
+// checks go on until the network returns (faultySettings).
+func TestDesktopResumeICERestart(t *testing.T) {
+	noLeaks(t)
+	w := newWorld(t, servertest.Options{})
+	bob := w.connect(w.member("bob"), protocol.RoleViewer)
+	viewer := bob.watch(sfutest.LoopbackSettings(), 0)
+	pubNet, pubWire := faultySettings(t)
+	app := w.recoveringDesktop(w.member("alice"), appEngine(32).engine, &pubNet)
+	sh, snap, video, audio := watched(t, app, bob, viewer)
+	connID := app.core.Status().ConnectionID
+	dialed := app.dialed()
+	statusMark, shareMark := app.statusMark(), len(app.shareEvents())
+	eventMark := len(bob.roomEvents())
+
+	// ---- the network goes: the UDP, and the socket, whose redial waits ----
+	app.gate.hold()
+	blackHole(pubWire, true)
+	gone := time.Now()
+	app.cutSocket()
+	eventually(t, func() bool {
+		_, away := app.wentAway(statusMark)
+		return away && strings.Contains(app.logs.String(), `msg="pub PC" connected=false`)
+	}, func() string {
+		return fmt.Sprintf("%v into the outage the core's statuses are %+v, want it away with its pub PC disconnected",
+			time.Since(gone).Round(time.Millisecond), app.statusesSince(statusMark))
+	})
+	t.Logf("the pub PC went disconnected %v into the outage", time.Since(gone).Round(time.Millisecond))
+	if offers := pubOfferList(app.offers()); offers != "1/1" {
+		t.Errorf("the core's pub offers while signaling was down are %s, want its first alone: it only records", offers)
+	}
+	videoMark, audioMark := len(video.Packets()), len(audio.Packets())
+
+	// ---- the socket comes back: an ICE restart on the welcome ----
+	// At once on the welcome, not by the 3 s rule of a disconnected PC, which would wait 3 s from when ICE went
+	// disconnected, just before the redial.
+	released := time.Now()
+	app.gate.release()
+	eventually(t, func() bool { return app.core.Status().Conn == core.ConnOnline && len(app.offers()) >= 2 },
+		func() string {
+			return fmt.Sprintf("the core is %s with the pub offers %s, want it online and an offer after the welcome",
+				app.core.Status().Conn, pubOfferList(app.offers()))
+		})
+	if took := time.Since(released); took > 1500*time.Millisecond {
+		t.Errorf("the core's first pub offer after the welcome came %v after its redial was let through, want it at "+
+			"once on the welcome", took.Round(time.Millisecond))
+	}
+	blackHole(pubWire, false)
+	back := time.Now()
+	t.Logf("the UDP was gone for %v", back.Sub(gone).Round(time.Millisecond))
+
+	// ---- the media is back, from a keyframe ----
+	resumed, stragglers := waitResumed(t, video, videoMark, "f", 15)
+	took := resumed[0].Arrival.Sub(back)
+	t.Logf("the video came back %v after the network (%d packets of the old stream came first)",
+		took.Round(time.Millisecond), stragglers)
+	if took > 5*time.Second {
+		t.Errorf("the video came back %v after the network, want within 5 s", took.Round(time.Millisecond))
+	}
+	if err := audio.Wait(waitCtx(t), func(r *sfutest.Recorder) bool {
+		return slices.ContainsFunc(r.Packets()[audioMark:], func(p sfutest.Packet) bool { return p.Arrival.After(back) })
+	}); err != nil {
+		t.Fatalf("the audio didn't come back: %v", err)
+	}
+	videoTo := newestSeq(video)
+	time.Sleep(sfutest.FinalLossAfter + 200*time.Millisecond)
+	vp := seqRange(video, resumed[0].Seq, videoTo)
+	for _, check := range []func([]sfutest.Packet) error{sfutest.CheckContinuous, sfutest.CheckStartsOnSPS} {
+		if err := check(sfutest.WithoutPartialTail(vp)); err != nil {
+			t.Errorf("the video since the network came back: %v", err)
+		}
+	}
+	bob.waitLive(snap.ID)
+	app.waitState(sh, core.StateLive)
+	t.Logf("the share's states since the outage: %s", app.shareStates(shareMark))
+
+	// ---- resumed with an ICE restart, not republished ----
+	if got := pubOfferList(app.offers()); got != "1/1 1/2r" {
+		t.Errorf("the core's pub offers are %s, want 1/1 1/2r: an ICE restart of the same gen on the welcome", got)
+	}
+	if st := app.core.Status(); st.ConnectionID != connID {
+		t.Errorf("the core's connection is %s after the resume, want %s as before", st.ConnectionID, connID)
+	}
+	if n := app.dialed() - dialed; n != 1 {
+		t.Errorf("the core dialed %d sockets to resume, want one", n)
+	}
+	if id := sh.Snapshot().ID; id != snap.ID {
+		t.Errorf("the share's id is %s after the resume, want %s: it was published again", id, snap.ID)
+	}
+	if strings.Contains(app.logs.String(), "publishing the share again") {
+		t.Error("the core published the share again after a resume")
+	}
+	if evs := bob.roomEvents()[eventMark:]; len(evs) != 0 {
+		t.Errorf("the viewer got the room events %+v since the outage, want none: a resume is no leave and no republish",
+			evs)
+	}
+	for _, kind := range []webrtc.RTPCodecType{webrtc.RTPCodecTypeVideo, webrtc.RTPCodecTypeAudio} {
+		if n := tracksOf(viewer, snap.ID, kind); n != 1 {
+			t.Errorf("the viewer has %d %s tracks of the share, want the one it had", n, kind)
+		}
+	}
+	bob.check()
+}
+
+// TestDesktopResumeLostShare is D3 with a share that the server ended while the core's socket was away: alice stops
+// it from her web tab, and the socket comes back. The room.state after the resumed welcome lacks the share, and the
+// core publishes it again on the same connection (01 §11.7, M1 01 §10.5): share.start{replaces: the old id}, no
+// room.join, and a new pub PC at the next gen with neg 1. The server keeps the connection's pub gen (M1 01 §9
+// rule 2), so the new PC's offer is taken as it is: no refusal, no rebuild. The new share goes live on the same
+// connection, and the viewer follows it by replaces.
+func TestDesktopResumeLostShare(t *testing.T) {
+	noLeaks(t)
+	w := newWorld(t, servertest.Options{})
+	bob := w.connect(w.member("bob"), protocol.RoleViewer)
+	viewer := bob.watch(sfutest.LoopbackSettings(), 0)
+	alice := w.member("alice")
+	app := w.recoveringDesktop(alice, appEngine(33).engine, nil)
+	tab := w.connect(alice, protocol.RolePublisher) // alice's web tab, in the room
+	sh, snap, _, _ := watched(t, app, bob, viewer)
+	connID := app.core.Status().ConnectionID
+	statusMark := app.statusMark()
+
+	// ---- the socket dies, and the share ends meanwhile ----
+	app.gate.hold()
+	app.cutSocket()
+	eventually(t, func() bool {
+		_, away := app.wentAway(statusMark)
+		return away
+	}, func() string {
+		return fmt.Sprintf("the core's statuses since the cut %+v, want it away", app.statusesSince(statusMark))
+	})
+	tab.request(protocol.MessageTypeShareStop, protocol.ShareStop{ShareID: snap.ID}, nil)
+	eventually(t, func() bool {
+		_, in := bob.shareIn(snap.ID)
+		return !in
+	}, func() string {
+		return fmt.Sprintf("the viewer's room.state %+v still has %s", bob.roomState(), snap.ID)
+	})
+
+	// ---- the socket comes back: the share is published again ----
+	app.gate.release()
+	var next string
+	eventually(t, func() bool {
+		next = sh.Snapshot().ID
+		return next != snap.ID && next != ""
+	}, func() string { return fmt.Sprintf("the share is %+v, want a new id", sh.Snapshot()) })
+	info := bob.waitLive(next)
+	if info.Replaces != snap.ID || info.ConnectionID != connID {
+		t.Errorf("the new share is %+v, want the core's on its connection %s, replacing %s", info, connID, snap.ID)
+	}
+	video := track(t, viewer, next, webrtc.RTPCodecTypeVideo)
+	waitFrames(t, video, 0, "f", 30)
+	if err := sfutest.CheckStartsOnSPS(video.Packets()); err != nil {
+		t.Errorf("the new share's video: %v", err)
+	}
+	waitPackets(t, track(t, viewer, next, webrtc.RTPCodecTypeAudio), 50)
+	bob.waitStatus(want(next, true))
+	app.waitState(sh, core.StateLive)
+
+	// ---- on the same connection, at the next gen, at the first try ----
+	if st := app.core.Status(); st.ConnectionID != connID {
+		t.Errorf("the core's connection is %s after the resume, want %s as before", st.ConnectionID, connID)
+	}
+	if got := pubOfferList(app.offers()); got != "1/1 2/1" {
+		t.Errorf("the core's pub offers are %s, want 1/1 2/1: the new PC at the next gen", got)
+	}
+	for _, line := range []string{"pub offer refused", "pub answer refused", "pub PC rebuild", "pub offer failed"} {
+		if strings.Contains(app.logs.String(), line) {
+			t.Errorf("the core's log has %q: the republished PC's offer should be taken at once", line)
+		}
+	}
+	if shares := bob.roomState().Shares; len(shares) != 1 {
+		t.Errorf("the room has the shares %+v, want the new one alone", shares)
+	}
+	select {
+	case <-sh.Done():
+		t.Errorf("the share ended: %+v", sh.Snapshot().End)
+	default:
+	}
+	bob.check()
+	tab.check()
 }
 
 // TestDesktopUDPBlackHole is D4: the core's UDP is gone for a while, its WebSocket is fine. The pub PC's ICE goes

@@ -360,13 +360,15 @@ func (c *Client) onState(sig *signal.Client, sc signal.StateChange) {
 		noShare := c.share == nil
 		room, seq := c.room.id, c.room.seq
 		c.mu.Unlock()
+		// The ready is recorded first: a StartShare that sees online (isOnline) then finds it, and its share's actor
+		// begins from it (takeSignal).
+		c.signalReady(w.ConnectionID, sc.Resumed, w.RoomID)
 		c.setStatus(func(st *Status) {
 			st.Conn = ConnOnline
 			st.ConnectionID = w.ConnectionID
 			st.ServerVersion = w.ServerVersion
 			st.Features = slices.Clone(w.Features)
 		})
-		c.signalReady(w.ConnectionID, sc.Resumed)
 		if sc.Resumed && noShare && room != "" {
 			c.leaveAfterResume(room, seq)
 		}

@@ -18,11 +18,14 @@ import (
 //     again within 30 s stops it; else the share ends server-unreachable.
 //   - A resumed welcome: the pending pub offer goes again (the same neg), a pub PC that isn't connected restarts
 //     ICE, and the first room.state is reconciled: a share the server lost is published again; the connection's
-//     shares that the core doesn't have are stopped.
+//     shares that the core doesn't have are stopped. A resumed welcome without the share's room (the connection
+//     was taken out of it meanwhile) publishes the share again at once, from room.join (M1 01 §10.5).
 //   - A new connection (a server restart, the grace over, a forced token refresh): the pub PC is dropped without a
 //     message, room.join, share.start{replaces: the last id} with a new ref, a new Publisher at gen 1. The engine
 //     session goes on and the pump asks for keyframes when the new Publisher attaches. The share keeps its local
-//     identity; its id changes, and so does the connection's (Status.ConnectionID).
+//     identity; its id changes, and so does the connection's (Status.ConnectionID). A share published again on the
+//     connection it was on gets its new Publisher at the next gen instead: the server keeps a connection's pub gen
+//     (M1 01 §9 rule 2 resets it only after welcome{resumed: false}).
 //   - A request that a drop cut short goes again once ready: share.start with the same ref on the same connection,
 //     and a share.stop as the reconcile of the next resumed welcome (leaveAfterResume, stopOrphans).
 //
@@ -35,12 +38,14 @@ type timing struct {
 	hold               time.Duration // signaling not ready this long ends the share (server-unreachable)
 	pcPoll             time.Duration // how often a share's actor looks at its pub PC
 	iceRestartAfter    time.Duration // ICE disconnected this long: an ICE restart
-	connectWithin      time.Duration // an ICE restart or a rebuilt PC not connected this long after its offer: a rebuild
+	connectWithin      time.Duration // an ICE restart or a rebuilt or republished PC not connected this long: a rebuild
 	restartSpacing     time.Duration // at most one ICE restart per this
 	rebuildSpacing     time.Duration // at most one rebuild per this
 	unreachableSpacing time.Duration // the rebuilds of an unreachable share
 	refusedWindow      time.Duration // a second refused offer within this ends the share
-	republishRetry     time.Duration // a republish that failed for want of signaling or a reply goes again after this
+	// republishRetry: a republish that failed for want of signaling or a reply, or that the server refused with a
+	// retryable code and no retryAfterMs, goes again after this.
+	republishRetry time.Duration
 }
 
 // defaultTiming are §13's values.
@@ -73,6 +78,7 @@ type recovery struct {
 	republishing bool            // a republish began, until its share is live
 	ref, refConn string          // the ref of a republish's share.start that may have reached the server, and its connection
 	retryAt      time.Time       // a republish cut short goes again from then on
+	retried      bool            // the republish was tried again after a retryable internal error (once, M1 01 §12.1)
 	orphans      map[string]bool // the connection's shares that the core stopped
 }
 
@@ -109,9 +115,13 @@ func (s *Share) takeSignal() {
 }
 
 // begin is the actor's first step: the hold when signaling is down, and a republish when signaling is ready on
-// another connection than the one share.start reached (it changed while StartShare's steps ran).
+// another connection than the one share.start reached (it changed while StartShare's steps ran). Signaling down
+// without a time it went down (never ready, which StartShare's isOnline rules out) holds from now.
 func (s *Share) begin() *endRequest {
 	if !s.rec.online {
+		if s.rec.downAt.IsZero() {
+			s.rec.downAt = time.Now()
+		}
 		s.rec.startHold(s.rec.downAt, s.c.timing.hold)
 		s.syncState()
 		return nil
@@ -178,6 +188,16 @@ func (s *Share) onWelcome(m msgWelcome) *endRequest {
 		s.rec.republish = true
 		return s.republish()
 	}
+	if m.roomID != s.req.RoomID {
+		// The connection was taken out of the share's room while it was away (kicked, the room closed: the hub names
+		// the room of a resumed welcome only while the connection is in it), and the share and the pub PC went with
+		// it. M1 01 §10.5: join the room again, then publish the share again. Nothing goes to the old pub PC: an offer
+		// outside the room would get not_in_room.
+		s.log.Info("the connection left the share's room: publishing the share again",
+			slog.String("share_id", s.params.ShareID))
+		s.rec.republish = true
+		return s.republish()
+	}
 	s.syncState()
 	if s.rec.republish {
 		return s.republish() // one that a drop cut short, on the same connection: the same ref
@@ -210,19 +230,32 @@ func (s *Share) onResumed() *EndInfo {
 }
 
 // republish publishes the share again for a server that has no share of ours (§11.7): the pub PC is dropped without
-// a message and gen goes back to 1; room.join unless the connection is in the share's room; share.start{replaces:
-// the last id}; a new Publisher once the session has its profile (else its first EventLayer makes one). A request
-// that signaling's drop or a missing reply cut short goes again later (tick, onWelcome); a server's refusal
-// (room_not_found, room_full, forbidden, share_limit, …) ends the share with its code.
+// a message; room.join unless the connection is in the share's room; share.start{replaces: the last id}; a new
+// Publisher once the session has its profile (else its first EventLayer makes one). On a new connection the new
+// Publisher offers gen 1; on the connection the share was on it offers the next gen with neg 1, as a rebuild does,
+// since the server keeps the connection's pub gen (M1 01 §9 rule 2; a gen-1 offer there would be stale, or answered
+// for the old PC). A republish's PC that isn't connected within 15 s is rebuilt, as a rebuilt one is. A request that
+// signaling's drop or a missing reply cut short goes again later (tick, onWelcome), and so does one the server
+// refused with a retryable code (republishFailed); any other refusal (room_not_found, room_full, forbidden,
+// share_limit, …) ends the share with its code.
 func (s *Share) republish() *endRequest {
 	if !s.rec.online || time.Now().Before(s.rec.retryAt) {
 		return nil
 	}
 	s.rec.republish, s.rec.republishing = true, true
 	s.rec.resync = false
-	if s.publisher() != nil || s.drv.gen != 0 {
+	switch {
+	case s.connID == "" || s.connID != s.rec.conn:
+		// A new connection: the server has no pub PC of ours, and gen starts at 1 again.
+		if s.publisher() != nil || s.drv.gen != 0 {
+			s.closePublisher(false)
+			s.drv = pubDriver{}
+		}
+	case s.publisher() != nil:
+		// The same connection: the next gen, taken once (a retry finds no Publisher to close, and keeps it).
+		gen := s.drv.gen
 		s.closePublisher(false)
-		s.drv = pubDriver{}
+		s.drv = pubDriver{gen: gen + 1}
 	}
 	s.syncState()
 	params, conn, err := s.startAgain()
@@ -231,13 +264,14 @@ func (s *Share) republish() *endRequest {
 	}
 	old := s.params.ShareID
 	s.params, s.connID = params, conn
-	s.rec.republish, s.rec.ref, s.rec.refConn, s.rec.orphans = false, "", "", nil
+	s.rec.republish, s.rec.ref, s.rec.refConn, s.rec.orphans, s.rec.retried = false, "", "", nil, false
 	s.inState = false
 	s.update(func(snap *ShareSnapshot) { snap.ID = params.ShareID })
 	s.log.Info("share published again", slog.String("share_id", params.ShareID), slog.String("replaces", old))
 	if len(s.seen) == 0 {
 		return nil
 	}
+	s.drv.connectBy = time.Now().Add(s.c.timing.connectWithin)
 	if err := s.startPublisher(); err != nil {
 		if s.ctx.Err() != nil {
 			return nil
@@ -279,9 +313,11 @@ func (s *Share) startAgain() (protocol.ShareParams, string, error) {
 	return params, conn, nil
 }
 
-// republishFailed handles a republish's failed request: the share's end lets it be; the server's refusal ends the
-// share (not_in_room only forgets the room, so the next try joins); anything else (signaling down, no reply) is
-// tried again.
+// republishFailed handles a republish's failed request: the share's end lets it be; anything but the server's
+// refusal (signaling down, no reply) is tried again. Of the server's refusals (M1 01 §12.1), not_in_room only
+// forgets the room, so the next try joins; rate_limited (room.join and share.start have their buckets) is tried
+// again after its retryAfterMs (1 s when absent); a retryable internal is tried again once; any other code ends the
+// share with it, room_full included, which the user has to be told of.
 func (s *Share) republishFailed(err error) *endRequest {
 	if s.ctx.Err() != nil {
 		return nil // the share is ending: the actor takes that request next
@@ -290,6 +326,17 @@ func (s *Share) republishFailed(err error) *endRequest {
 	switch {
 	case errors.As(err, &perr) && perr.Code == protocol.ErrorCodeNotInRoom:
 		s.c.forgetRoom(s.req.RoomID)
+	case errors.As(err, &perr) && perr.Code == protocol.ErrorCodeRateLimited:
+		wait := s.c.timing.republishRetry
+		if perr.RetryAfterMs > 0 {
+			wait = time.Duration(perr.RetryAfterMs) * time.Millisecond
+		}
+		s.rec.retryAt = time.Now().Add(wait)
+		s.log.Info("publishing the share again: rate limited", slog.Duration("retry_after", wait))
+	case errors.As(err, &perr) && perr.Code == protocol.ErrorCodeInternal && perr.Retryable && !s.rec.retried:
+		s.rec.retried = true
+		s.rec.retryAt = time.Now().Add(s.c.timing.republishRetry)
+		s.log.Info("publishing the share again: the server failed, trying once more")
 	case errors.As(err, &perr):
 		s.log.Warn("publishing the share again was refused", slog.String("code", string(perr.Code)))
 		return &endRequest{info: EndInfo{Reason: EndError, Protocol: perr.Code}, leave: true}
@@ -348,8 +395,10 @@ func (s *Share) syncState() {
 
 // ---- the connection's side ----
 
-// signalReady records that signaling is ready on connection connID and tells the share.
-func (c *Client) signalReady(connID string, resumed bool) {
+// signalReady records that signaling is ready on connection connID, resumed or not and in room roomID (the
+// welcome's), and tells the share. The connection actor calls it before Status says online, so a StartShare that
+// sees online finds the ready recorded.
+func (c *Client) signalReady(connID string, resumed bool, roomID string) {
 	c.mu.Lock()
 	c.readySeq++
 	c.sigReady, c.connID = true, connID
@@ -357,7 +406,7 @@ func (c *Client) signalReady(connID string, resumed bool) {
 	c.wakeReadyLocked()
 	c.mu.Unlock()
 	if sh != nil {
-		sh.post(msgWelcome{seq: seq, connID: connID, resumed: resumed})
+		sh.post(msgWelcome{seq: seq, connID: connID, resumed: resumed, roomID: roomID})
 	}
 }
 

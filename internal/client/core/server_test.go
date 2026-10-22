@@ -24,7 +24,9 @@ import (
 //
 // Like the hub, a resumed welcome keeps the connection's id and room, and is followed by a room.state that lists
 // the connection's shares (as live); share.start gives each share an id of its own (s_1, s_2, …), and the same one
-// again for a ref it has seen on the connection.
+// again for a ref it has seen on the connection. Like the SFU (M1 01 §9 rules 2 and 3), it keeps the gen and neg of
+// the connection's pub offers while the connection is in a room, resumes included, and answers an offer of an older
+// gen, or of an older neg in the current gen, with error{stale_negotiation, scope pc}.
 type fakeServer struct {
 	t   *testing.T
 	srv *httptest.Server
@@ -37,9 +39,13 @@ type fakeServer struct {
 	// hello answers the n-th hello (0-based); nil answers each with a welcome, resumed when it carries a resume
 	// token of this server.
 	hello func(n int, h protocol.Hello) fakeAnswer
-	// silent lists request types the server never answers; reject answers request types with an error.
-	silent []protocol.MessageType
-	reject map[protocol.MessageType]protocol.Error
+	// silent lists request types the server never answers; reject answers request types with an error, and
+	// rejectOnce the next request of a type (then it answers that type again).
+	silent     []protocol.MessageType
+	reject     map[protocol.MessageType]protocol.Error
+	rejectOnce map[protocol.MessageType]protocol.Error
+	// stale counts the pub offers answered with stale_negotiation.
+	stale int
 	// iceServers go into every welcome (none when nil, as M1's server sends).
 	iceServers []protocol.ICEServer
 	nextID     int
@@ -70,6 +76,9 @@ type fakeConn struct {
 	ws     *websocket.Conn
 	connID string
 	room   string
+	// pubGen and pubNeg are the newest pub offer's, as the SFU keeps them for the connection while it is in a room
+	// (the SFU's Conn of a room membership); 0 before the first.
+	pubGen, pubNeg uint32
 }
 
 func newFakeServer(t *testing.T) *fakeServer {
@@ -149,7 +158,7 @@ func (fs *fakeServer) serve(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if old != nil {
-		c.connID, c.room = old.connID, old.room
+		c.connID, c.room, c.pubGen, c.pubNeg = old.connID, old.room, old.pubGen, old.pubNeg
 	} else {
 		ans.resumed = false
 		fs.nextID++
@@ -195,6 +204,10 @@ func (fs *fakeServer) serve(w http.ResponseWriter, r *http.Request) {
 		fs.got = append(fs.got, env)
 		silent := slices.Contains(fs.silent, env.Type)
 		rej, rejected := fs.reject[env.Type]
+		if once, ok := fs.rejectOnce[env.Type]; ok && !rejected {
+			rej, rejected = once, true
+			delete(fs.rejectOnce, env.Type)
+		}
 		fs.mu.Unlock()
 		switch {
 		case silent:
@@ -214,14 +227,14 @@ func (fs *fakeServer) answer(c *fakeConn, env protocol.Envelope) {
 	case protocol.MessageTypeRoomJoin:
 		j, _ := protocol.Decode[protocol.RoomJoin](env)
 		fs.mu.Lock()
-		c.room = j.RoomID
+		c.room, c.pubGen, c.pubNeg = j.RoomID, 0, 0
 		fs.mu.Unlock()
 		fs.write(c.ws, protocol.MessageTypeOK, "", env.ID, protocol.RoomJoinResult{Room: protocol.RoomInfo{ID: j.RoomID, Name: j.RoomID}})
 		fs.write(c.ws, protocol.MessageTypeRoomState, "", "", protocol.RoomState{RoomID: j.RoomID, Rev: 1,
 			Participants: []protocol.ParticipantInfo{}, Shares: []protocol.ShareInfo{}})
 	case protocol.MessageTypeRoomLeave:
 		fs.mu.Lock()
-		c.room = ""
+		c.room, c.pubGen, c.pubNeg = "", 0, 0
 		fs.shares = slices.DeleteFunc(fs.shares, func(s fakeShare) bool { return s.connID == c.connID })
 		fs.mu.Unlock()
 		fs.write(c.ws, protocol.MessageTypeOK, "", env.ID, protocol.Empty{})
@@ -246,7 +259,32 @@ func (fs *fakeServer) answer(c *fakeConn, env protocol.Envelope) {
 		fs.write(c.ws, protocol.MessageTypeOK, "", env.ID, protocol.Empty{})
 	case protocol.MessageTypeShareUpdate, protocol.MessageTypeStatsWatch:
 		fs.write(c.ws, protocol.MessageTypeOK, "", env.ID, protocol.Empty{})
+	case protocol.MessageTypePCOffer:
+		o, err := protocol.Decode[protocol.PCOffer](env)
+		if err != nil || o.PC != protocol.PCKindPub {
+			return
+		}
+		fs.mu.Lock()
+		stale := o.Gen < c.pubGen || (o.Gen == c.pubGen && o.Neg < c.pubNeg)
+		if stale {
+			fs.stale++
+		} else {
+			c.pubGen, c.pubNeg = o.Gen, o.Neg
+		}
+		fs.mu.Unlock()
+		if stale {
+			e := protocol.NewError(protocol.ErrorCodeStaleNegotiation, protocol.ErrorScopePC)
+			e.PC, e.Gen, e.Neg = protocol.PCKindPub, o.Gen, o.Neg
+			fs.write(c.ws, protocol.MessageTypeError, "", "", e)
+		}
 	}
+}
+
+// staleOffers returns how many pub offers the server answered with stale_negotiation.
+func (fs *fakeServer) staleOffers() int {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.stale
 }
 
 // send writes a notification to the newest socket, as the hub sends one.
