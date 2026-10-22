@@ -9,7 +9,7 @@
 # anonymous volume would hide a missing data volume, and the server refuses to start without one (exit 78).
 #
 # The digest is the multi-arch index of the :nonroot tag. Dependabot updates it (.github/dependabot.yml).
-FROM gcr.io/distroless/static-debian13:nonroot@sha256:516757106de35205efb70b91ba03f6f1298424a0678c603255cf2852a7000087
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:d62067879de890a1def9da0e7766b7d20810a5e5555cef8506b752437d7a3e88
 ARG TARGETPLATFORM
 # The data directory and the admin socket's directory, both owned by nonroot (65532): a new named volume is then
 # writable (Docker copies the ownership and the mode into an empty volume), and the admin socket has a home when no
