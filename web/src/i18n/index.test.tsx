@@ -46,10 +46,11 @@ describe('initI18n', () => {
 
 describe('initI18n in tests', () => {
   it('loads every lazy namespace up front: a test renders a page without its folder’s entry module', () => {
-    expect(Object.keys(lazyFiles).sort()).toEqual(['account', 'admin', 'setup']);
+    expect(Object.keys(lazyFiles).sort()).toEqual(['account', 'admin', 'desktop', 'setup']);
     expect(i18n.t('admin.title')).toBe('Admin');
     expect(i18n.t('account.back')).toBe('Back to isshoni');
     expect(i18n.t('setup.steps.label')).toBe('Setup');
+    expect(i18n.t('desktop.native.tray.open')).toBe('Open isshoni');
   });
 });
 
