@@ -17,18 +17,20 @@ import (
 	"github.com/MoonWX/isshoni/internal/server/store"
 )
 
-// This file declares the whole Go API of 03 §7.13 (README S24, "interfaces first"): the Service with every M1 method
-// (the four M2 device-flow methods come with their DTOs, see "later (M2)" below), Options, New, Principal, ActorOf,
-// ConnSelector, ConnCloser, LoginResult, RegisterResult, UserChange and the smaller types.
+// This file declares the whole Go API of 03 §7.13 (README S24, "interfaces first"): the Service with every M1 method,
+// Options, New, Principal, ActorOf, ConnSelector, ConnCloser, LoginResult, RegisterResult, UserChange and the smaller
+// types; and the M2 methods of M2 02 §6.8 that no file of their own holds yet (see "the device flow and device
+// tokens" below).
 //
 // README S30 filled in New (this file; the key-rotation purge is in tokens.go), the sessions and the CSRF wrapper
 // (session.go), login and logout (login.go) and setup (setup.go). README S42 filled in the invites (invite.go),
 // registration and the approval queue (register.go), and added UpdateSettings (settings.go). README S58 filled in
 // self-service (selfservice.go) on the revocation table of 03 §7.7 (revoke.go). README S64 filled in the admin's
-// user calls (admin.go) and the password resets (reset.go), and README S70 the janitor (janitor.go). The methods
-// still declared below come with the device flow (03 §18 slice 15, M2). Until then each one returns
-// notImplemented(method): an error that names the method and wraps *api.Error{internal}, so an HTTP handler that
-// calls it answers 500 internal (api has no not_implemented code).
+// user calls (admin.go) and the password resets (reset.go), and README S70 the janitor (janitor.go). M2's README
+// WA30 filled in the device flow (deviceflow.go, devicepassword.go, devicename.go). The methods still declared below
+// come with README WA39. Until then each one returns notImplemented(method): an error that names the method and
+// wraps *api.Error{internal}, so an HTTP handler that calls it answers 500 internal (api has no not_implemented
+// code).
 //
 // All service errors are *api.Error (03 §12.2) carrying a stable code, so httpapi maps them to statuses in one
 // table: an unexpected failure (the store, a cancelled context) wraps both its cause and *api.Error{internal}
@@ -121,6 +123,10 @@ type Service struct {
 
 	// prune is the janitor's call (janitor.go): db.Prune. Tests of the schedule wrap it to see each run.
 	prune func(ctx context.Context, now time.Time) (store.PruneStats, error)
+
+	// userCode draws a normalized device-flow user code (deviceflow.go): newUserCode. Tests of the collision rule
+	// replace it.
+	userCode func() string
 }
 
 // New builds the service (03 §7.13): it validates the keys and the origins, computes the dummy hash, then checks the
@@ -185,6 +191,7 @@ func New(ctx context.Context, db *store.DB, o Options) (*Service, error) {
 		cookie:   cookieFor(primary),
 		sessions: newSessionCache(),
 		prune:    db.Prune,
+		userCode: newUserCode,
 	}
 	rotated, err := s.syncKeyFingerprints(ctx)
 	if err != nil {
@@ -224,7 +231,7 @@ type Method uint8
 
 const (
 	MethodSession Method = 1 // web session cookie
-	MethodBearer  Method = 2 // later (M2): device access token
+	MethodBearer  Method = 2 // M2: device access token (bearer authentication comes with README WA39)
 )
 
 // Principal is the authenticated caller of a REST request or WebSocket.
@@ -236,6 +243,9 @@ type Principal struct {
 	SessionID  store.SessionID // Method == MethodSession
 	DeviceID   store.DeviceID  // Method == MethodBearer (M2)
 	ClientKind string          // "web" for sessions; the device's kind ("desktop"|"mobile", 01 ClientKind) for bearer
+	// DeviceName is the device's current name for a bearer principal (M2 02 §6.1, §6.8), "" for sessions. It is user
+	// content and is never logged. README WA39 fills it in, from the device row.
+	DeviceName string
 }
 
 // IsAdmin reports whether the principal has the admin role.
@@ -509,20 +519,32 @@ type UserChange struct {
 //
 // RunJanitor is in janitor.go.
 
-// ---- later (M2) ----
+// ---- the device flow and device tokens (M2 02 §6.8) ----
 //
-// 03 §7.13 also lists StartDeviceFlow, DeviceToken, LookupUserCode and PasswordDeviceLogin. They take and return the
-// device-flow DTOs of 03 §12.4.7 (api.DeviceCodeRequest, DeviceCodeResponse, DeviceTokenRequest,
-// DeviceTokenResponse, DeviceLookup, DevicePasswordRequest), which internal/protocol/api does not declare yet
-// (03 §12.5 lists them as later). The four methods come together with those DTOs in the device-flow slice
-// (03 §18 slice 15, M2); no M1 handler, adapter or fake calls them.
+// README WA30 filled in the device authorization flow: StartDeviceFlow, LookupUserCode, DecideUserCode and the
+// device_code grant of DeviceToken in deviceflow.go, PasswordDeviceLogin in devicepassword.go, NormalizeDeviceName in
+// devicename.go and the device buckets with IPKey48 in limiter.go. README WA39 fills in device tokens: the
+// refresh_token grant of DeviceToken, AuthenticateBearerToken and the bearer path of Authenticate (with
+// Principal.DeviceName), RenameDevice, RevokeOwnDevice, and the bearer cases of Touch, RevokeDevice and
+// LogoutEverywhere. Until then the methods below, the refresh_token grant and those bearer cases return
+// notImplemented. (Touch's M2 signature, which returns the principal, comes with WA39 too: the wiring calls Touch.)
 
-// AuthenticateBearerToken authenticates a device access token from 01's hello.auth. Later (M2).
+// AuthenticateBearerToken checks a device access token: 01's hello.auth, and the REST bearer path through
+// Authenticate (M2 02 §6.1). The principal carries DeviceName from the device row. Errors: *api.Error{invalid_token};
+// any other failure wraps *api.Error{internal}. README WA39.
 func (s *Service) AuthenticateBearerToken(ctx context.Context, token string) (Principal, error) {
 	return Principal{}, notImplemented("AuthenticateBearerToken")
 }
 
-// DecideUserCode approves or denies a device-flow user code. Later (M2).
-func (s *Service) DecideUserCode(ctx context.Context, p Principal, userCode string, approve bool, m ReqMeta) error {
-	return notImplemented("DecideUserCode")
+// RenameDevice renames one of the principal's devices (PATCH /api/v1/me/devices/{id}, M2 02 §7.2) with the rules of
+// NormalizeDeviceName, and writes device.renamed {from, to}; a name equal to the current one writes nothing.
+// README WA39.
+func (s *Service) RenameDevice(ctx context.Context, p Principal, id store.DeviceID, name string, m ReqMeta) (store.Device, error) {
+	return store.Device{}, notImplemented("RenameDevice")
+}
+
+// RevokeOwnDevice is the app's own sign-out (POST /api/v1/device/revoke, M2 02 §7.2): the bearer principal's device,
+// its tokens and push subscriptions go, with device.revoked {via: "app"}. README WA39.
+func (s *Service) RevokeOwnDevice(ctx context.Context, p Principal, m ReqMeta) error {
+	return notImplemented("RevokeOwnDevice")
 }
