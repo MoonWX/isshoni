@@ -62,15 +62,31 @@
 //   - alerts.go: admin alerts (§7.11);
 //   - janitor.go (README S70): RunJanitor, below.
 //
+// The device flow (docs/m2/02-device-auth.md §5 and §14; M2 README WA30):
+//   - deviceflow.go: StartDeviceFlow (POST /device/code: auth-ip, device-code-ip and, for IPv6, device-code-ip48,
+//     the app's fields, then the server-wide cap of 5,000 pending codes in the Write that adds the code),
+//     LookupUserCode and DecideUserCode (the approval page, cookie sessions only, with the device-lookup bucket that
+//     keeps its token only for a wrong code), and the device_code grant of DeviceToken: one Write per poll that
+//     decides the RFC 8628 answer (authorization_pending, slow_down with the interval raised by 5 s up to 60 s,
+//     access_denied, expired_token, invalid_grant) and commits its bookkeeping. An approved code's poll runs the
+//     success steps of a link (linkDevice): the cap of 20 devices with device.revoked {via: "cap"} rows, the device,
+//     its first token pair and device.linked; device.approved and device.denied are the approver's rows;
+//   - devicepassword.go: PasswordDeviceLogin, the in-app password fallback, with Login's order and buckets
+//     (checkLogin in login.go) and the same success steps with linked_via password;
+//   - devicename.go: NormalizeDeviceName (PRECIS Nickname, 1–64 code points);
+//   - limiter.go: the device buckets and IPKey48.
+//
+// Device tokens (the refresh_token grant, bearer authentication, RenameDevice, RevokeOwnDevice and the bearer cases
+// of Touch, RevokeDevice and LogoutEverywhere) come with M2 README WA39; until then they return a not-implemented
+// error wrapping api internal (service.go).
+//
 // A call that acts for an account takes a store.Actor and reads that account inside its own transaction (actingAs
 // in service.go): the CLI acts as an admin, a user actor has the role its row has at that moment, and an account
 // that is gone or not active is forbidden. A self-service call takes the request's Principal and reads the account
 // and the caller's session the same way (loadSelf): without a live session it is unauthenticated.
 //
 // The janitor (README S70; janitor.go): RunJanitor prunes the expired rows of §4.7 through store.DB.Prune at startup
-// and then every hour, until its context ends. The two M2 methods declared so far (AuthenticateBearerToken,
-// DecideUserCode) return a not-implemented error wrapping api internal; the other device-flow methods come with
-// their api DTOs in 03 slice 15.
+// and then every hour, until its context ends.
 //
 // Service errors are *api.Error values with the codes of 03 §12.2: the rules' FieldErrors become validation_failed
 // with a code per field, a refused throttle becomes rate_limited or server_busy with retryAfter, and an unexpected

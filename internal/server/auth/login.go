@@ -128,19 +128,11 @@ func (s *Service) logBlocked(ctx context.Context, m ReqMeta, bucket string) {
 		slog.String("bucket", bucket), slog.String("remote_ip", ipString(m.IP)))
 }
 
-// takeAuthIP is the auth-ip bucket: every attempt at login, register, setup, reset and invite check takes a token,
-// first and before any other work. The first block of an episode writes an auth.throttled {scope: ip} row.
+// takeAuthIP is the auth-ip bucket: every attempt at login, register, setup, reset and invite check, and (M2) every
+// POST /device/code and /device/password, takes a token, first and before any other work. The first block of an
+// episode writes an auth.throttled {scope: ip} row (takeIPBucket in deviceflow.go).
 func (s *Service) takeAuthIP(ctx context.Context, m ReqMeta) error {
-	v := s.throttle.authIP.take(IPKey(m.IP))
-	if v.OK {
-		return nil
-	}
-	if v.First {
-		s.auditAlone(ctx, store.AuditEntry{At: s.now(), Action: auditThrottled, Outcome: outcomeDenied,
-			Actor: anonymous(m), Detail: map[string]any{"scope": scopeIP, "key": ipKeyText(m.IP)}})
-	}
-	s.logBlocked(ctx, m, "auth-ip")
-	return rateLimited(v)
+	return s.takeIPBucket(ctx, m, s.throttle.authIP, IPKey(m.IP), ipKeyText(m.IP), "auth-ip")
 }
 
 // takeHashBudget is the auth-hash bucket: every public request that reaches the hash takes a token, last, after all
@@ -343,9 +335,65 @@ func loginKey(username string) (key string, isKey bool) {
 //     it was before the attempt, so a friend's login never hands an attacker a fresh budget.
 //
 // The returned token is the raw cookie value; httpapi sets it with SetSessionCookie.
+//
+// Steps 1–7 are checkLogin, which the in-app password fallback shares (PasswordDeviceLogin, M2 02 §14); step 8 starts
+// with currentAccount, as the fallback's Write does.
 func (s *Service) Login(ctx context.Context, username, password string, m ReqMeta) (LoginResult, error) {
-	if err := s.takeAuthIP(ctx, m); err != nil {
+	v, err := s.checkLogin(ctx, "login", username, password, m, nil)
+	if err != nil {
 		return LoginResult{}, err
+	}
+	defer v.attempt.release()
+
+	now := s.now()
+	token := newToken(sessionTokenBytes)
+	var ns newSession
+	err = s.db.Write(ctx, func(q *store.Q) error {
+		cur, err := currentAccount(q, v, now)
+		if err != nil {
+			return err
+		}
+		if err := q.TouchLogin(cur.ID, now); err != nil {
+			return err
+		}
+		cur.LastLoginAt = now
+		if err := s.openSession(q, cur, token, m, now, &ns); err != nil {
+			return err
+		}
+		sess := ns.result.Session
+		return q.AppendAudit(store.AuditEntry{At: now, Action: auditLogin, Actor: userActor(cur, m),
+			TargetKind: targetSession, TargetID: string(sess.ID), TargetName: sess.Name})
+	})
+	if err != nil {
+		return LoginResult{}, serviceErr("login", err)
+	}
+	v.attempt.loggedIn()
+	s.sessionOpened(&ns)
+	return ns.result, nil
+}
+
+// verifiedLogin is a password check of checkLogin that passed: the account as it was read before the hash, the
+// rehash computed outside any transaction ("" for none), and the attempt's place in the two per-username buckets.
+// The caller defers attempt.release and calls attempt.loggedIn once its Write committed.
+type verifiedLogin struct {
+	user    store.User
+	newHash string
+	attempt passwordAttempt
+}
+
+// checkLogin is steps 1–7 of Login, in that order: auth-ip; the fields (more, when set, adds the field codes of a
+// caller's own fields to the same answer, M2 02 §14 step 2); the two per-username buckets; auth-hash; exactly one
+// verification (the dummy hash for an unknown username or a NULL hash); 401 invalid_credentials with
+// auth.login_failed; 403 account_pending or account_disabled only after a correct password. Login's rehash rule
+// follows: a stored hash with other argon2 parameters is hashed again here, outside the caller's Write, and the
+// login goes on with the old hash when the hash queue is full. op names the call in internal errors.
+//
+// On an error the attempt is settled already (kept for a failed password check, given back otherwise).
+func (s *Service) checkLogin(ctx context.Context, op, username, password string, m ReqMeta,
+	more func(fields map[string]string),
+) (verifiedLogin, error) {
+	if err := s.takeAuthIP(ctx, m); err != nil {
+		return verifiedLogin{}, err
 	}
 
 	fields := map[string]string{}
@@ -367,18 +415,26 @@ func (s *Service) Login(ctx context.Context, username, password string, m ReqMet
 			fields["password"] = FieldInvalid
 		}
 	}
+	if more != nil {
+		more(fields)
+	}
 	if len(fields) > 0 {
-		return LoginResult{}, validationFailed(fields)
+		return verifiedLogin{}, validationFailed(fields)
 	}
 
 	key, isKey := loginKey(username)
 	attempt, err := s.reservePasswordAttempt(ctx, key, isKey, m)
 	if err != nil {
-		return LoginResult{}, err
+		return verifiedLogin{}, err
 	}
-	defer attempt.release()
+	passed := false
+	defer func() {
+		if !passed {
+			attempt.release()
+		}
+	}()
 	if err := s.takeHashBudget(ctx, m); err != nil {
-		return LoginResult{}, err
+		return verifiedLogin{}, err
 	}
 
 	var user store.User
@@ -393,7 +449,7 @@ func (s *Service) Login(ctx context.Context, username, password string, m ReqMet
 		case err == nil:
 			found = true
 		case !errors.Is(err, store.ErrNotFound):
-			return LoginResult{}, internalErr("login", err)
+			return verifiedLogin{}, internalErr(op, err)
 		}
 	}
 
@@ -411,7 +467,7 @@ func (s *Service) Login(ctx context.Context, username, password string, m ReqMet
 		err = s.hasher.verifyDummy(ctx, pw)
 	}
 	if err != nil {
-		return LoginResult{}, hashErr("login", err)
+		return verifiedLogin{}, hashErr(op, err)
 	}
 	if !ok {
 		attempt.failed()
@@ -420,7 +476,7 @@ func (s *Service) Login(ctx context.Context, username, password string, m ReqMet
 		} else {
 			s.auditLoginFailed(ctx, nil, failUnknownUser, m)
 		}
-		return LoginResult{}, api.NewError(api.CodeInvalidCredentials)
+		return verifiedLogin{}, api.NewError(api.CodeInvalidCredentials)
 	}
 	if user.Status != store.StatusActive {
 		reason := failAccountDisabled
@@ -428,7 +484,7 @@ func (s *Service) Login(ctx context.Context, username, password string, m ReqMet
 			reason = failAccountPending
 		}
 		s.auditLoginFailed(ctx, &user, reason, m)
-		return LoginResult{}, statusErr(user.Status)
+		return verifiedLogin{}, statusErr(user.Status)
 	}
 
 	// The rehash runs outside the transaction (03 decision 4). When the hash queue is full, the login goes on with
@@ -438,49 +494,35 @@ func (s *Service) Login(ctx context.Context, username, password string, m ReqMet
 		if h, err := s.hasher.hash(ctx, pw); err == nil {
 			newHash = h
 		} else if !errors.Is(err, errHashBusy) {
-			return LoginResult{}, internalErr("login", err)
+			return verifiedLogin{}, internalErr(op, err)
 		}
 	}
+	passed = true
+	return verifiedLogin{user: user, newHash: newHash, attempt: attempt}, nil
+}
 
-	now := s.now()
-	token := newToken(sessionTokenBytes)
-	var ns newSession
-	err = s.db.Write(ctx, func(q *store.Q) error {
-		// The account may have changed since the password was verified: an admin reset or a password change between
-		// the read and this Write must not end in a session for the old password.
-		cur, err := q.UserByID(user.ID)
-		if errors.Is(err, store.ErrNotFound) || (err == nil && cur.PasswordHash != user.PasswordHash) {
-			return api.NewError(api.CodeInvalidCredentials)
-		}
-		if err != nil {
-			return err
-		}
-		if cur.Status != store.StatusActive {
-			return statusErr(cur.Status)
-		}
-		if newHash != "" {
-			if err := q.SetPasswordHash(cur.ID, newHash, now); err != nil {
-				return err
-			}
-			cur.PasswordHash, cur.PasswordChangedAt, cur.UpdatedAt = newHash, now, now
-		}
-		if err := q.TouchLogin(cur.ID, now); err != nil {
-			return err
-		}
-		cur.LastLoginAt = now
-		if err := s.openSession(q, cur, token, m, now, &ns); err != nil {
-			return err
-		}
-		sess := ns.result.Session
-		return q.AppendAudit(store.AuditEntry{At: now, Action: auditLogin, Actor: userActor(cur, m),
-			TargetKind: targetSession, TargetID: string(sess.ID), TargetName: sess.Name})
-	})
-	if err != nil {
-		return LoginResult{}, serviceErr("login", err)
+// currentAccount is the first step of the Write that follows checkLogin. The account may have changed since its
+// password was verified: an admin reset or a password change between the read and the Write must not end in a
+// credential for the old password (401 invalid_credentials), and an account that is no longer active gets 403
+// account_pending or account_disabled. The rehash is stored here. It returns the account as it is now.
+func currentAccount(q *store.Q, v verifiedLogin, now time.Time) (store.User, error) {
+	cur, err := q.UserByID(v.user.ID)
+	if errors.Is(err, store.ErrNotFound) || (err == nil && cur.PasswordHash != v.user.PasswordHash) {
+		return store.User{}, api.NewError(api.CodeInvalidCredentials)
 	}
-	attempt.loggedIn()
-	s.sessionOpened(&ns)
-	return ns.result, nil
+	if err != nil {
+		return store.User{}, err
+	}
+	if cur.Status != store.StatusActive {
+		return store.User{}, statusErr(cur.Status)
+	}
+	if v.newHash != "" {
+		if err := q.SetPasswordHash(cur.ID, v.newHash, now); err != nil {
+			return store.User{}, err
+		}
+		cur.PasswordHash, cur.PasswordChangedAt, cur.UpdatedAt = v.newHash, now, now
+	}
+	return cur, nil
 }
 
 // ---- logout ----

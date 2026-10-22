@@ -14,7 +14,7 @@ interface Window {
    * SPA needs; it has already written the "too old" message into `#root`, and main.tsx does nothing (05 §4).
    */
   __ISSHONI_UNSUPPORTED__?: boolean;
-  /** Reserved name (05 §8): the desktop app's bridge, M2/M3. Nothing reads it in M1. */
+  /** Reserved name (05 §8): the desktop app's config, which platform/detect.ts reads (M2: docs/m2/03 §7.2). */
   __ISSHONI_DESKTOP__?: unknown;
   /** Reserved name (05 §8): the mobile apps' runtime. Nothing reads it in M1. */
   Capacitor?: unknown;

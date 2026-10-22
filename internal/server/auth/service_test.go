@@ -554,5 +554,11 @@ func TestLaterMethodsSayNotImplemented(t *testing.T) {
 	}
 	_, err := e.svc.AuthenticateBearerToken(ctx, "")
 	check("AuthenticateBearerToken", err)
-	check("DecideUserCode", e.svc.DecideUserCode(ctx, p, "", false, m))
+	_, err = e.svc.RenameDevice(ctx, p, "d1d1d1d1d1d1", "Gaming PC", m)
+	check("RenameDevice", err)
+	check("RevokeOwnDevice", e.svc.RevokeOwnDevice(ctx, p, m))
+	// README WA39 brings the refresh_token grant; the device_code grant is WA30's (deviceflow_test.go).
+	_, err = e.svc.DeviceToken(ctx, api.DeviceTokenRequest{GrantType: api.GrantTypeRefreshToken,
+		RefreshToken: refreshTokenPrefix + newToken(deviceTokenBytes)}, meta(ipA))
+	check("DeviceToken (refresh_token grant)", err)
 }

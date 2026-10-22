@@ -7,6 +7,8 @@ it installs anything (06 §4.3).
 | File | What it is |
 |---|---|
 | `allowed_signers` | one line per key, in `ssh-keygen`'s allowed-signers format (below). It does not exist until the owner adds the keys: until then `task lint:keys` skips, and release.yml refuses to build a release |
+| `update_signers` | the desktop app's update keys (`docs/m2/06-windows-release.md` §8.3), in the same format with the principal and namespace `isshoni-update`: one `isshoni-update-<n>` line or more and exactly one `isshoni-update-backup-<n>`. `task release:update-keys` writes it into `internal/update/signers.go`, and `task lint:keys` fails when the two differ. It does not exist until the owner creates the update keys (`docs/m2/README.md` §8) |
+| `update_revoked` | update key fingerprints that the next desktop release revokes, empty normally (`docs/m2/06-windows-release.md` §8.1, §8.12) |
 | `README.md` | this page |
 
 Each line of `allowed_signers` names the principal and the namespace that `install.sh` and release.yml's `sign`
@@ -89,8 +91,9 @@ release.yml (its dry run too) refuse to build without it.
 
 ## Rotation, or a leaked key (06 §9.4)
 
-1. Add the new key's line to `allowed_signers`. Mark the old one `valid-before="YYYYMMDD"` (append it to the
-   namespaces field: `namespaces="isshoni-checksums",valid-before="20271231"`), or delete its line after a leak.
+1. Add the new key's line to `allowed_signers`, and delete the old key's line: at once after a leak, otherwise in a
+   later change. Do not mark it `valid-before=` instead: Windows 10's OpenSSH 8.1 can't parse that option, so
+   `task lint:keys` refuses it (`docs/m2/06-windows-release.md` §7.2).
    Run `task release:keys`, put the new key's fingerprint into README.md's "Release signing keys" section (and
    remove a deleted key's), run `task lint:keys`, and merge the change.
 2. Replace the secret `RELEASE_SSH_SIGNING_KEY`.

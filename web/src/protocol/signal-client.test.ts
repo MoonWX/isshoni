@@ -1,7 +1,8 @@
 // SignalClient and ProtocolError (01 §10.1–§10.3, §12, §16; the TypeScript cases of §19) against the fake server
 // of ./testing, with Vitest's fake timers: handshake, backoff and its reset rule, skip-wait, ping and probe, resume,
 // dropSocket() (05 §10.7), requests, the close-code and error → state mapping, unknown codes, stale builds,
-// server.shutdown, the order of state events when a listener changes the state, and page events.
+// the auth option (M2: docs/m2/03 §7.3), server.shutdown, the order of state events when a listener changes the
+// state, and page events.
 import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
 
 import type * as api from './api.gen';
@@ -14,9 +15,11 @@ import {
   ProtocolError,
 } from './errors';
 import {
+  AuthTimeoutMs,
   backoffDelay,
   BackoffMaxMs,
   BackoffMinMs,
+  BackoffResetMs,
   DropSocketCloseCode,
   isDevVersion,
   isStaleBuild,
@@ -999,6 +1002,226 @@ describe('staleBuild (01 §6.1)', () => {
     ['', false],
   ])('isDevVersion(%j) is %s, like Go version.IsDev', (v, dev) => {
     expect(isDevVersion(v)).toBe(dev);
+  });
+
+  it("is never set for the desktop's buildVersion '' (no stale-build reload, docs/m2/03 §7.2)", async () => {
+    server.welcomeDefaults = { serverVersion: '0.3.0' };
+    await readyClient({ buildVersion: '' });
+    expect(lastInfo()).toEqual({ resumed: false, staleBuild: false });
+    server.drop();
+    await tick(BackoffMaxMs);
+    expect(lastInfo()).toEqual({ resumed: true, staleBuild: false });
+  });
+});
+
+describe('auth (M2: docs/m2/03 §7.3, 02 §11.8)', () => {
+  const bearer = (token: string): P.HelloAuth => ({ scheme: 'bearer', token });
+
+  /** An auth provider that hands out isa_t1, isa_t2, … and records each call's forceRefresh. */
+  function tokenSource(): { auth: NonNullable<SignalClientOptions['auth']>; calls: boolean[] } {
+    const calls: boolean[] = [];
+    return {
+      calls,
+      auth: ({ forceRefresh }) => {
+        calls.push(forceRefresh);
+        return Promise.resolve(bearer(`isa_t${String(calls.length)}`));
+      },
+    };
+  }
+
+  it('awaits auth before every hello, the resuming ones too, and puts the result into hello.auth', async () => {
+    const src = tokenSource();
+    await readyClient({ auth: src.auth });
+    server.drop();
+    await tick(BackoffMaxMs);
+    expect(client?.state).toBe('ready');
+    expect(server.hellos.map((h) => h.auth)).toEqual([bearer('isa_t1'), bearer('isa_t2')]);
+    expect(server.hellos[1]?.resumeToken).toBeDefined();
+    expect(src.calls).toEqual([false, false]);
+  });
+
+  it('opens no socket before auth has answered, and none when stopped meanwhile', async () => {
+    let answer: ((a: P.HelloAuth | undefined) => void) | undefined;
+    const c = makeClient({
+      auth: () =>
+        new Promise((resolve) => {
+          answer = resolve;
+        }),
+    });
+    c.start();
+    await tick();
+    expect(c.state).toBe('connecting');
+    expect(server.sockets).toHaveLength(0);
+    c.stop();
+    answer?.(bearer('isa_late'));
+    await tick();
+    expect(server.sockets).toHaveLength(0);
+    expect(states()).toEqual(['connecting', 'stopped']);
+  });
+
+  it('sends a hello without auth when the provider gives undefined', async () => {
+    await readyClient({ auth: () => Promise.resolve(undefined) });
+    expect(server.hellos[0]).not.toHaveProperty('auth');
+  });
+
+  it('fails the attempt like a failed connect when auth rejects or never answers', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    let n = 0;
+    const c = makeClient({
+      auth: () => {
+        n++;
+        if (n === 1) return Promise.reject(new Error('offline'));
+        if (n === 2) return new Promise<undefined>(() => undefined);
+        return Promise.resolve(bearer('isa_t3'));
+      },
+    });
+    c.start();
+    await tick();
+    expect(c.state).toBe('backoff');
+    expect(server.sockets).toHaveLength(0);
+    expect(error).toHaveBeenCalledWith('SignalClient: auth() failed', expect.any(Error));
+    await tick(1_000); // the second attempt (after 0.5–0.6 s) waits for an answer that never comes
+    expect(c.state).toBe('connecting');
+    await tick(AuthTimeoutMs - 300); // past its auth timeout, before the next attempt (0.8–1.2 s later)
+    expect(c.state).toBe('backoff');
+    expect(server.sockets).toHaveLength(0);
+    await tick(BackoffMaxMs);
+    expect(c.state).toBe('ready');
+    expect(server.hellos.map((h) => h.auth)).toEqual([bearer('isa_t3')]);
+  });
+
+  it('waits longer for auth than the desktop bridge waits for AccessToken (15 s)', async () => {
+    expect(AuthTimeoutMs).toBeGreaterThan(15_000);
+    const c = makeClient({
+      auth: () =>
+        new Promise((resolve) => {
+          setTimeout(() => {
+            resolve(bearer('isa_slow'));
+          }, 15_000);
+        }),
+    });
+    c.start();
+    await tick(15_000);
+    expect(c.state).toBe('ready');
+    expect(server.hellos.map((h) => h.auth)).toEqual([bearer('isa_slow')]);
+    expect(states()).toEqual(['connecting', 'handshaking', 'ready']);
+  });
+
+  it.each([
+    ['rejects', () => Promise.reject(new Error('server_unreachable'))],
+    ['outlasts the auth wait', () => new Promise<undefined>(() => undefined)],
+  ])(
+    'after unauthenticated, a forced call that %s leaves the refresh for the next attempt, which forces again',
+    async (_n, fail: () => Promise<P.HelloAuth | undefined>) => {
+      const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const calls: boolean[] = [];
+      const c = await readyClient({
+        auth: ({ forceRefresh }) => {
+          calls.push(forceRefresh);
+          if (calls.length === 2) return fail();
+          return Promise.resolve(bearer(`isa_t${String(calls.length)}`));
+        },
+      });
+      server.error(makeError(P.ErrorCodeUnauthenticated, P.ErrorScopeSession));
+      await tick(AuthTimeoutMs + BackoffMaxMs);
+      expect(calls).toEqual([false, true, true]);
+      expect(server.hellos.map((h) => h.auth)).toEqual([bearer('isa_t1'), bearer('isa_t3')]);
+      expect(server.hellos[1]?.resumeToken).toBeUndefined();
+      expect(c.state).toBe('ready');
+      expect(states()).not.toContain('stopped');
+      // The next attempt (a drop) asks without forceRefresh again.
+      server.drop();
+      await tick(BackoffMaxMs);
+      expect(c.state).toBe('ready');
+      expect(calls).toEqual([false, true, true, false]);
+      error.mockRestore();
+    },
+  );
+
+  it.each([
+    [
+      'an unauthenticated answer to hello',
+      (s: FakeSignalServer) => {
+        s.autoWelcome = false;
+      },
+    ],
+    ['a session-scope unauthenticated on a live socket', () => undefined],
+  ])('after %s: auth({forceRefresh: true}) once, a new connection, then a second one stops', async (_n, prep) => {
+    const src = tokenSource();
+    prep(server);
+    const c = makeClient({ auth: src.auth });
+    c.start();
+    await tick();
+    const refuse = (): void => {
+      const hello = server.messages('hello').at(-1);
+      if (server.autoWelcome) server.error(makeError(P.ErrorCodeUnauthenticated, P.ErrorScopeSession));
+      else if (hello) server.replyError(hello, makeError(P.ErrorCodeUnauthenticated, P.ErrorScopeSession));
+    };
+    refuse();
+    await tick();
+    expect(c.state).toBe('backoff');
+    expect(lastInfo().error?.code).toBe(P.ErrorCodeUnauthenticated);
+    await tick(1_000);
+    expect(src.calls).toEqual([false, true]);
+    expect(server.hellos[1]?.auth).toEqual(bearer('isa_t2'));
+    expect(server.hellos[1]?.resumeToken).toBeUndefined();
+    refuse();
+    await tick();
+    expect(c.state).toBe('stopped');
+    expect(lastInfo().error?.code).toBe(P.ErrorCodeUnauthenticated);
+    await tick(BackoffMaxMs);
+    expect(src.calls).toEqual([false, true]);
+    expect(server.sockets).toHaveLength(2);
+  });
+
+  it('forces a refresh after close 4401 too; a later case, once the connection was stable, forces again', async () => {
+    const src = tokenSource();
+    const c = await readyClient({ auth: src.auth });
+    server.close(P.CloseCodeUnauthenticated);
+    await tick(1_000);
+    expect(c.state).toBe('ready');
+    expect(server.welcomes[1]?.resumed).toBe(false);
+    await tick(BackoffResetMs);
+    server.close(P.CloseCodeUnauthenticated);
+    await tick(1_000);
+    expect(c.state).toBe('ready');
+    expect(src.calls).toEqual([false, true, true]);
+    // Right after that welcome (not yet stable), another one stops it.
+    server.close(P.CloseCodeUnauthenticated);
+    await tick(1_000);
+    expect(c.state).toBe('stopped');
+    expect(src.calls).toEqual([false, true, true]);
+  });
+
+  it('stops at once on unauthenticated when the hello carried no token', async () => {
+    const calls: boolean[] = [];
+    const c = await readyClient({
+      auth: ({ forceRefresh }) => {
+        calls.push(forceRefresh);
+        return Promise.resolve(undefined);
+      },
+    });
+    server.error(makeError(P.ErrorCodeUnauthenticated, P.ErrorScopeSession));
+    await tick(BackoffMaxMs);
+    expect(c.state).toBe('stopped');
+    expect(calls).toEqual([false]);
+  });
+
+  it('stops on session_revoked as in M1, without a forced refresh', async () => {
+    const src = tokenSource();
+    const c = await readyClient({ auth: src.auth });
+    server.error(makeError(P.ErrorCodeSessionRevoked, P.ErrorScopeSession));
+    await tick(BackoffMaxMs);
+    expect(c.state).toBe('stopped');
+    expect(src.calls).toEqual([false]);
+  });
+
+  it('a client without auth sends no hello.auth and stops on unauthenticated (the browser, unchanged)', async () => {
+    const c = await readyClient();
+    expect(server.hellos[0]).not.toHaveProperty('auth');
+    server.error(makeError(P.ErrorCodeUnauthenticated, P.ErrorScopeSession));
+    await tick();
+    expect(c.state).toBe('stopped');
   });
 });
 

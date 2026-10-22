@@ -30,7 +30,7 @@ and the deep-link grammar (`02`; deep-link grammar: 02 §12), the Go client core
 | D4 | **Stable channel reads `releases/latest/download/isshoni-desktop-update.json`; the opt-in beta channel reads the releases API** | The stable path has no API rate limit and no JSON listing to parse; GitHub's "latest" is only ever a final release (M1 06 §9.3 `publish`) |
 | D5 | **FFmpeg is built once per pin** by `.github/workflows/ffmpeg.yml` and published as a non-SemVer prerelease `deps-ffmpeg-<ver>-r<rev>`; the repository pins its assets by SHA-256 in `native/ffmpeg/lock.json`; CI and releases download and verify, never rebuild | The shipped DLLs are byte-identical across releases until the pin changes, so the LGPL source tarball corresponds exactly; release day doesn't depend on MSYS2 mirrors; GitHub Actions caches evict after 7 days, a release asset doesn't. The server's release check, the site and the updater ignore non-SemVer tags (M1 04 §11.5) |
 | D6 | **FFmpeg configure: LGPL, shared, only `libavcodec` + `libavutil`, four H.264 encoders, `--disable-autodetect`, static CRT, `/Brepro`** (§4.2) | Exactly the plan's line, made explicit; no decoders, demuxers or parsers means most FFmpeg CVEs (which are in decoders and demuxers) don't reach isshoni |
-| D7 | **Static CRT everywhere** (`/MT` for `isshoni-media.dll`, FFmpeg and libvpl; vcpkg triplet `x64-windows-static`), checked with `dumpbin /dependents` | No Visual C++ Redistributable to install or ship; spike S1's DLL already used it (`spikes/s1-win-audio/CMakeLists.txt`) |
+| D7 | **Static CRT everywhere** (`/MT` for `isshoni-media.dll`, FFmpeg and libvpl; vcpkg triplet `x64-windows-static`, overlaid with the project's toolset), checked with `dumpbin /dependents` for FFmpeg (§4.4) and by dll-check's PE reader for `isshoni-media.dll` (§5.1) | No Visual C++ Redistributable to install or ship; spike S1's DLL already used it (`spikes/s1-win-audio/CMakeLists.txt`) |
 | D8 | **The installer is built with makensis 3.13 on `windows-2025`** (pinned portable zip, SHA-256), in **prebuilt-uninstaller mode** in CI; local builds on the Mac use Homebrew's makensis and plain `WriteUninstaller` | SignPath can later sign `uninstall.exe` and the installer as separate requests without restructuring the pipeline (§12.4); the `.nsi` builds on both hosts |
 | D9 | **The WebView2 Evergreen bootstrapper is embedded** in the installer and run only when the runtime is missing; CI checks its Authenticode signer | Windows 11 always has the runtime and most Windows 10 22H2 PCs do, but not all; NSIS can't download over HTTPS without third-party plugins |
 | D10 | **The executable is `isshoni.exe`** (the plan's name), AppUserModelID `io.isshoni.desktop` (the macOS bundle id) | One name in Task Manager, audio-exclusion logs and docs |
@@ -158,8 +158,8 @@ Shortcut: `$SMPROGRAMS\isshoni.lnk` (the user's Start menu) → `$INSTDIR\isshon
 | Go | the M1 toolchain (`go.mod` `toolchain`, `.tool-versions`) | unchanged | M1's monthly tool PR |
 | Wails v3 | `v3.0.0-beta.34` unless 03 picks another exact tag; follows the GA | `go.mod` (03), `tools/wails3/go.mod` (`tool github.com/wailsapp/wails/v3/cmd/wails3`) and `@wailsio/runtime` in `web/package.json` + `web/package-lock.json` (the exact version 03's DK1 records for the pinned Wails), checked by `task lint:pins` | by hand, all three together (03 §3.3), with a Windows smoke and 03's origin test against `protocol.DesktopOrigins()` (D19; Dependabot ignores both) |
 | Windows runner | `windows-2025` (not `windows-latest`, which moves) | workflows | when GitHub retires it |
-| Visual Studio / MSVC | any VS 2022 or VS 2026 instance (`[17.0,19.0)`) with the base C++ tools component, **toolset `14.44`** (an exact minor, not a prefix), Windows SDK `10.0.26100.0`; the selection step is below | `deploy/windows/tools.json`; the exact toolset build (`14.44.<build>`) is recorded in every build manifest | when the runner image drops the 14.44 toolset: a hand-made tool PR moves `toolset`, which also changes FFmpeg's reproducibility record (§4.6) |
-| vcpkg | the commit in `native/vcpkg.json` `builtin-baseline` (04 owns the file and `native/vcpkg-configuration.json`, both at the CMake root `native/`, 04 §2) | 04 | by hand, monthly with the tool pins |
+| Visual Studio / MSVC | any VS 2022 or VS 2026 instance (`[17.0,19.0)`) with the base C++ tools component, **toolset `14.44`** (an exact minor, not a prefix), Windows SDK `10.0.26100.0`; the selection step is below | `deploy/windows/tools.json`; every build manifest records the toolset folder (`msvcToolset`, `14.44.<build>` from `VCToolsVersion`) and FFmpeg's also the **toolset build**, the compiler's and linker's own versions (below) | when the runner image drops the 14.44 toolset: a hand-made tool PR moves `toolset` (and the vcpkg triplet's `VCPKG_PLATFORM_TOOLSET_VERSION` with it), which also changes FFmpeg's reproducibility record (§4.6) |
+| vcpkg | the commit in `native/vcpkg.json` `builtin-baseline` (04 owns the file and `native/vcpkg-configuration.json`, both at the CMake root `native/`, 04 §2); its ports build with the MSVC toolset above through the overlay triplet `native/triplets/x64-windows-static.cmake` (`VCPKG_PLATFORM_TOOLSET_VERSION 14.44`, 04 §13.1) | 04; `task lint:pins` checks the triplet's toolset against `tools.json` | by hand, monthly with the tool pins |
 | NSIS | 3.13, portable zip from SourceForge with SHA-256 | `deploy/windows/tools.json` | by hand |
 | FFmpeg | `9.0.2` tarball, SHA-256, plus nv-codec-headers, AMF headers, libvpl (§4.1) | `native/ffmpeg/pins.json` | on an FFmpeg point release or a security fix (§4.7) |
 | Pester, PSScriptAnalyzer | newest 5.x / 1.x at slice time, exact versions | `deploy/windows/tools.json` | by hand |
@@ -192,8 +192,24 @@ Shortcut: `$SMPROGRAMS\isshoni.lnk` (the user's Start menu) → `$INSTDIR\isshon
   3. `cmd /c "call ""<instance>\VC\Auxiliary\Build\vcvars64.bat"" -vcvars_ver=<msvc.toolset> <msvc.windowsSdk> && set"`,
      then `PATH`, `INCLUDE`, `LIB` and `LIBPATH` go to `GITHUB_ENV` (CI) or the current session (a PC).
   4. Prints one line to the log and the job summary: the instance's `installationVersion` and `displayName`, the
-     toolset build (`14.44.<build>`, from `VCToolsVersion`) and the SDK (`WindowsSDKVersion`); the build manifests
+     toolset folder (`14.44.<build>`, from `VCToolsVersion`) and the SDK (`WindowsSDKVersion`); the build manifests
      record the same values.
+
+  **The toolset build** (README §3 item 30, WF1) means the compiler's and linker's own builds, not the folder: VS
+  servicing updates `cl.exe` and `link.exe` in place under the same `VCToolsVersion` folder name (the first FFmpeg run:
+  folder `14.44.35207`, `cl.exe` 19.44.35229). FFmpeg's `build.sh` therefore reads `cl.exe`'s and `link.exe`'s banner
+  versions (`{ cl.exe 2>&1 || true; } | tr -d '\r' | sed -n … | head -n 1`, no early-exiting reader under
+  `pipefail`) and dies when either is empty; `build-manifest.json`, `result.json` and `lock-candidate.json` carry them
+  as `msvcCompiler` and `msvcLinker` next to `msvcToolset`, which stays the `VCToolsVersion` folder (it still selects
+  the toolset). `tools/desktoppkg`'s `Lock` has both fields, validated like the other versions. "Same toolset build"
+  in §4.6 means the same `msvcToolset` **and** the same `msvcCompiler` and `msvcLinker`.
+- **vcpkg's toolset**: without the overlay triplet vcpkg builds its ports with the newest toolset on the machine
+  (14.51 on windows-2025), whose STL objects call helpers (`__std_rotate`) that 14.44's static libraries lack, so the
+  14.44 build fails to link them. `native/vcpkg-configuration.json`'s `"overlay-triplets": ["triplets"]` makes vcpkg
+  use `native/triplets/x64-windows-static.cmake`: vcpkg's own `x64-windows-static` plus `VCPKG_PLATFORM_TOOLSET v143`
+  and `VCPKG_PLATFORM_TOOLSET_VERSION 14.44`. `task lint:pins` (`repocheck pins`) fails when that version differs
+  from `tools.json`'s `msvc.toolset` (once `tools.json` exists, the triplet must too), and both vcpkg cache keys
+  (`native-host`'s and `windows-native`'s, §5.1) hash `native/triplets/*.cmake`.
 
   Why not `-version "[17.0,18.0)"`: GitHub's `windows-2025` label runs the Windows Server 2025 image with Visual
   Studio 2026 (18.x) and no VS 2022 instance; it carries the 14.44 toolset only as the component
@@ -216,7 +232,8 @@ Shortcut: `$SMPROGRAMS\isshoni.lnk` (the user's Start menu) → `$INSTDIR\isshon
 - `task lint:pins` (extended): the Wails version in `go.mod` equals `tools/wails3/go.mod`'s; the exact
   `@wailsio/runtime` version in `web/package.json` (no range) and in `web/package-lock.json` equals the Go module
   version of Wails in `go.mod` without the leading `v` (03 §3.1: library, CLI and runtime share one version; no
-  separate file records it).
+  separate file records it); the vcpkg triplet's `VCPKG_PLATFORM_TOOLSET_VERSION` equals `tools.json`'s
+  `msvc.toolset` (above).
 - **Hand-bump checklist** (the PR template's Wails section): library, CLI and `@wailsio/runtime` moved together;
   03's checklist re-run; the Windows smoke; 03's origin test against `protocol.DesktopOrigins()` green, and the new
   asset-origin spelling present in the **previous** release's `DesktopOrigins()` (else the bump waits, D19).
@@ -273,9 +290,13 @@ by hand against FFmpeg's release key):
   "avutilMajor": 60,
   "dlls": {"avcodec-<avcodecMajor>.dll": "<sha256>", "avutil-<avutilMajor>.dll": "<sha256>"},
   "msvcToolset": "14.44.yyyyy",
+  "msvcCompiler": "<cl.exe's banner version, e.g. 19.44.35229>",
+  "msvcLinker": "<link.exe's banner version>",
   "commit": "<the commit the run built>"
 }
 ```
+
+`msvcToolset` is the `VCToolsVersion` folder; `msvcCompiler` and `msvcLinker` are the toolset build of §3 (WF1).
 
 `avcodecMajor` and `avutilMajor` (integers; the numbers above are placeholders) are written by the publish run from
 `ffcheck`'s `avcodec_version() >> 16` and `avutil_version() >> 16` in `ffmpeg-config.json` (§4.4). 04's CMake reads
@@ -354,16 +375,18 @@ manifest). No third-party action. The same command rebuilds the DLLs from an unp
 6. **Checks** of §4.4, then the layout `ffmpeg-<ver>-r<rev>-win-x64/`: `bin/` (the two DLLs), `pdb/`, `lib/`
    (`avcodec.lib`, `avutil.lib` import libraries), `include/`, `licenses/{ffmpeg/COPYING.LGPLv2.1,ffmpeg/LICENSE.md,
    ffmpeg/README-LGPL.txt,libvpl/LICENSE,nv-codec-headers/LICENSE,amf/LICENSE.txt}`, `ffmpeg-config.json` (§4.4) and
-   `build-manifest.json` (every input's SHA-256, the toolset, SDK and MSYS2 package versions, the commit). Neither
+   `build-manifest.json` (every input's SHA-256, the toolset folder and the compiler and linker builds of §3, SDK and
+   MSYS2 package versions, the commit; `README-LGPL.txt` names the compiler build too). Neither
    the AMF headers nor nv-codec-headers ship a license file, so `build.sh` writes `amf/LICENSE.txt` and
    `nv-codec-headers/LICENSE` from the headers' own MIT notices: each distinct notice once, after the files that
    carry it.
 7. **Archives** in `WORKDIR/out/`: `ffmpeg-<ver>-r<rev>-win-x64.zip` (the layout folder at its top; names sorted, no
    extra fields, every timestamp `SOURCE_DATE_EPOCH`, the commit time) and the source archive (§4.5) with `tar
    --format=gnu --sort=name --owner=0 --group=0 --numeric-owner --mtime=@$SOURCE_DATE_EPOCH`; plus `result.json`
-   (names, SHA-256s, majors, toolset) and `lock-candidate.json`, the `lock.json` a publishing run prints (§4.1).
+   (names, SHA-256s, majors, `msvcToolset`, `msvcCompiler`, `msvcLinker`) and `lock-candidate.json`, the `lock.json` a
+   publishing run prints (§4.1).
 
-Time: about 10 minutes on a hosted runner, most of it `configure` under MSYS2.
+Time: about 4 minutes on a hosted runner (the first complete run, §4.6), most of it `configure` under MSYS2.
 
 ### 4.4 Checks (gating, in `ffmpeg.yml` and again in every consumer job)
 
@@ -398,7 +421,8 @@ Time: about 10 minutes on a hosted runner, most of it `configure` under MSYS2.
 
 - **`build`** (`windows-2025`, `contents: read`, no secrets, timeout 40 min): the MSVC environment step (§3), MSYS2's
   packages, §4.3 and §4.4, then uploads the zip and the source tar as the artifact `ffmpeg-build` and their
-  SHA-256s, the DLL names and hashes, the toolset build and `inputsSha256` as job outputs. It also checks that
+  SHA-256s, the DLL names and hashes, the toolset folder, the compiler and linker builds and `inputsSha256` as job
+  outputs. It also checks that
   `msvc-env.ps1` fails, naming the toolsets it found, for a toolset the image lacks.
 - **`rebuild`** (pull requests and manual runs): the same steps on a second runner (one set of steps for both, through
   YAML anchors), so a pull request shows automatically whether a second build is byte-identical.
@@ -406,7 +430,8 @@ Time: about 10 minutes on a hosted runner, most of it `configure` under MSYS2.
   `desktoppkg ffmpeg-inputs` prints; the DLLs are compared with `rebuild`'s, and with `lock.json`'s whenever its
   `inputsSha256` is the one `build` hashed (also in the weekly run while a pins bump waits for its publishing run),
   under §4.6's rule; a `lock.json` that is absent or stale is a note (publishing after the merge fixes it). A table of
-  the hashes and toolsets goes into the job summary.
+  the hashes, toolset folders and compiler and linker builds goes into the job summary, and the warning texts name
+  them.
 - **`publish`** (`ubuntu-24.04`, `needs: [build, report]`, both successful, permissions `contents: write`,
   `id-token: write`, `attestations: write`, timeout 10 min; runs no build code): downloads the artifact, checks both
   SHA-256s against `build`'s outputs, `actions/attest-build-provenance` on both, then `gh release create
@@ -433,15 +458,40 @@ Time: about 10 minutes on a hosted runner, most of it `configure` under MSYS2.
   `-PDBALTPATH` the PDB path, the relative paths of §4.2 the build folder, the zip and tar are normalized, and
   `SOURCE_DATE_EPOCH` is the commit time.
 - Every PR and manual run compares `build`'s DLLs with `rebuild`'s, and every run with `lock.json`'s while the lock
-  describes these inputs (§4.5). A difference with **the same toolset** build is something non-deterministic; a
-  difference with **another toolset build** (the runner image moved from one `14.44.<build>` to another, or a tool PR
-  moved `toolset`) is a warning in the summary, since the shipped bytes stay the locked ones.
+  describes these inputs (§4.5). The comparison is of the **DLLs**: the zip also carries the PDBs, which MSVC doesn't
+  make reproducible even with `-Brepro` (below), and the lock pins the published zip's own hash anyway. A difference
+  with **the same toolset build** (the same `msvcToolset` and the same `msvcCompiler` and `msvcLinker`, §3) is
+  something non-deterministic; a difference with **another toolset build** (the runner image moved from one
+  `14.44.<build>` folder to another, VS servicing updated `cl.exe` or `link.exe` inside the same folder, or a tool PR
+  moved `toolset`) is a warning in the summary, since the shipped bytes stay the locked ones. Both of `report`'s
+  strict/warn branches, the rebuild's and the lock's, compare all three values (README §3 item 30, WF1).
 - **`FFMPEG_REPRO`**, the workflow-level `env` of `ffmpeg.yml`, decides what a same-toolset difference does: `strict`
   (the value now) fails `report`; `warn` makes it a warning and keeps it in the summary. If a same-toolset rebuild
   differs (in a PR's `rebuild`, a manual run or the weekly run) and `build.sh` can't remove the cause, a tool PR sets
   `FFMPEG_REPRO: warn`, and this section records why and what differs; `build-manifest.json` stays the record of the
-  inputs, so the fallback is documented, not hidden. The first PR run's report summary (README WA07's "Results for
-  the spec") is recorded here by README WB2: WB1 could not read it, since it lives on GitHub.
+  inputs, so the fallback is documented, not hidden. `strict` stays: the first run's DLLs were byte-identical.
+- **The first complete run** (README WA07's "Results for the spec", copied by WB2): `pull_request` on PR #35 (group
+  1), run 39667809435, head `9ca94dd`, built commit `eaf64b7`. `build` and `rebuild` took about 4 minutes each, `report`
+  27 s (`publish` doesn't run on a PR). Two earlier runs of the same PR failed and were fixed before the merge: libvpl
+  built with `/MD` (§4.3 step 3's CMP0091 policy and `vpl.lib` check) and `ffcheck.c` failing `-W4 -WX` on C4090 at
+  its two `qsort` calls (fixed with `(void *)` casts).
+
+  | | Measured |
+  |---|---|
+  | Runner (both jobs) | image `windows-2025-vs2026`, release `win25-vs2026/20261007.264`; Visual Studio Enterprise 2026 18.10.12224.181 with the toolsets 14.29.30133, 14.44.35207 and 14.51.36231 |
+  | MSVC | `msvc-env.ps1` picked toolset folder 14.44.35207 (`VCToolsVersion`) and SDK 10.0.26100.0; the negative check (toolset 14.0) failed as specified, naming the three toolsets; `cl.exe` banner "Version 19.44.35229 for x64" (only logged then; WF1 records it as `msvcCompiler`) |
+  | MSYS2 | make 4.4.1-3, pkgconf 3.0.10-1, diffutils 3.12-1, zip 3.0-5 |
+  | Inputs | `inputsSha256` `cefe933933b2edcea0833c7486865f33a2ad85bc892420d1914dbf25e30ecc38`, equal to `desktoppkg ffmpeg-inputs` |
+  | License | `config.h`: `CONFIG_GPL 0`, `CONFIG_NONFREE 0`, `CONFIG_VERSION3 0`; `ffcheck`: "LGPL version 2.1 or later"; encoders `h264_nvenc`, `h264_amf`, `h264_qsv`, `h264_mf` |
+  | Imports | `avutil-61.dll`: ADVAPI32, ole32, bcrypt, KERNEL32; `avcodec-63.dll`: avutil-61, ole32, ADVAPI32, KERNEL32; all static, system DLLs only (no CRT, no Media Foundation) |
+  | DLLs, build = rebuild | `avcodec-63.dll` `954840c9dc68d9f9d5caeea07977391bd984f39e5c32ff18cc1db6cdcf3d47a1`; `avutil-61.dll` `4e8d2abe33af4789f8554b6264a06271fb8f3ec59b59a7f02e3574ceea6436e1` |
+  | Source archive, build = rebuild | `ffmpeg-9.0.2-r1-source.tar`, 25,262,080 bytes, `b5e988bd53fa58a466fd14e93b21dbc96a17ce3722180f2fe0cc8946f658daf2` |
+  | Zip | **not** byte-identical (build 9,638,114 bytes, rebuild 9,697,488 bytes): member by member only `pdb/avcodec-63.pdb` and `pdb/avutil-61.pdb` differ (same sizes, different bytes); every other member (DLLs, import libraries, headers, licenses, `ffmpeg-config.json`, `build-manifest.json`) has the same CRC, and every member's time is `SOURCE_DATE_EPOCH` |
+  | `report` | `lock.json` absent → a note; `FFMPEG_REPRO` strict; build and rebuild on the same toolset with equal DLLs → pass |
+
+  So MSVC's PDBs are not reproducible even with `-Brepro`, which is expected, not a failure: the report compares the
+  DLLs, and consumers check the zip against the hash the lock pins. The majors of this build are `avcodec` 63 and
+  `avutil` 61 (§4.1's numbers are placeholders until the publishing run writes the lock).
 
 ### 4.7 Security updates
 
@@ -457,13 +507,17 @@ Time: about 10 minutes on a hosted runner, most of it `configure` under MSYS2.
 - **MSVC environment**: the MSVC environment step of §3 (`deploy/windows/msvc-env.ps1`, as for §4.3: VS 2022 or
   2026 with the C++ tools, fail fast without toolset `14.44` or SDK `10.0.26100.0`, `vcvars64.bat
   -vcvars_ver=14.44`), writing `PATH`, `INCLUDE`, `LIB` and `LIBPATH` to `GITHUB_ENV` and printing the instance,
-  toolset build and SDK it found; no third-party action.
+  toolset folder and SDK it found; no third-party action.
 - vcpkg: CI clones `https://github.com/microsoft/vcpkg` at the `builtin-baseline` commit of `native/vcpkg.json` into
   `$RUNNER_TEMP\vcpkg`, runs `bootstrap-vcpkg.bat -disableMetrics`, sets `VCPKG_ROOT` and `VCPKG_DISABLE_METRICS=1`.
-  Manifest mode with triplet `x64-windows-static` (static libraries, static CRT; libopus is linked into the DLL).
+  Manifest mode with triplet `x64-windows-static` (static libraries, static CRT; libopus is linked into the DLL),
+  overlaid by `native/triplets/x64-windows-static.cmake`, which builds every port with the toolset of `tools.json`
+  (`VCPKG_PLATFORM_TOOLSET_VERSION 14.44`, §3); without it vcpkg took the image's newest toolset (14.51) and gtest's
+  objects failed to link into the 14.44 test executables.
 - **Binary cache (CI only)**: `VCPKG_BINARY_SOURCES=clear;files,$RUNNER_TEMP\vcpkg-cache,readwrite` with
-  `actions/cache` keyed on `hashFiles('native/vcpkg.json', 'native/vcpkg-configuration.json')`, the triplet and the
-  toolset build the MSVC step printed (`14.44.<build>`), no restore keys. `release.yml` uses no cache (M1 06 §9.3); libopus builds in about a minute.
+  `actions/cache` keyed on the triplet name, the toolset folder the MSVC step printed (`14.44.<build>`) and
+  `hashFiles('native/vcpkg.json', 'native/vcpkg-configuration.json', 'native/triplets/*.cmake')`, no restore keys.
+  `release.yml` uses no cache (M1 06 §9.3); libopus builds in about a minute.
 - FFmpeg: the locked zip is unpacked to `$RUNNER_TEMP\ffmpeg` and passed as `-DIM_FFMPEG_ROOT=…`. 04's CMake uses only
   `include/` from the zip (FFmpeg is loaded at run time, never import-linked, 04 §9.2); `lib/` stays informational.
   Until slice R3b, `IM_FFMPEG_ROOT` is optional (04's skeleton DLL builds without it).
@@ -475,26 +529,41 @@ Time: about 10 minutes on a hosted runner, most of it `configure` under MSYS2.
      -DIM_COMMIT=<short sha>` (§5.3), `cmake --build --preset win-x64-release`. `dll-check`, the notices and packaging
      use **only** this output. release.yml's `windows-native` builds `win-x64-release` only.
   3. `clang-format` runs in `native-host` (§10.1); `win-x64-asan` runs nightly (`windows-asan`, §10.3).
-- **Checks** (`tools/desktoppkg dll-check`, PowerShell around `dumpbin` from the VS environment):
-  - **ABI**: the names in `dumpbin /exports isshoni-media.dll` equal the functions declared with `IM_API` in
-    `native/include/isshoni_media.h` (04 marks every exported function with that macro). An extra or missing export
-    fails.
-  - **Imports**: `deploy/windows/dll-imports.txt` has two sections, `static:` and `delay:`. Every DLL in `dumpbin
-    /dependents` must be listed in the section that matches how it is imported. `mfplat.dll` and `avrt.dll` are
-    allowed only under `delay:` (04 §13.1; mfplat is absent on N editions and Windows Server). The `api-ms-win-core-*`
-    API sets that `windowsapp.lib` and `synchronization.lib` pull in are listed by 04 in slice E2; 05's audio DLLs by
-    05; any other system DLL by PR with a reason. An import of `avcodec-*` or `avutil-*` **always fails**, like
-    `VCRUNTIME*`, `MSVCP*`, `api-ms-win-crt-*`, `ucrtbase*`, debug CRTs and `opus*.dll`: the engine must load, probe
-    and capture audio when FFmpeg is missing or blocked (04 §9.2, §13.3).
-  - **Load config** (conditional): only if slice E2 (README WA11) shows that the delay-load helper honors
-    `/DEPENDENTLOADFLAG:0x800` (04 §13.1), `dumpbin /loadconfig isshoni-media.dll` must show `DependentLoadFlags`
-    0x800 (`LOAD_LIBRARY_SEARCH_SYSTEM32`); otherwise this check doesn't exist and 04's delay-load hook is the guard.
-    WA11's PR records the verdict.
-  - **Version resource**: `ProductVersion` = `<v>`, `FileVersion` = `<winver>`, `ProductName` = `isshoni`,
-    `CompanyName` = `isshoni project`, `LegalCopyright` = `Copyright the isshoni authors. Apache-2.0.`,
-    `OriginalFilename` = `isshoni-media.dll` (04's `.rc`, fed from `IM_VERSION` and `IM_WINVER`). SignPath requires
-    product metadata on every file it signs.
-  - The FFmpeg DLLs' SHA-256 equal `lock.json`'s (unmodified).
+- **Checks** (`go -C tools run ./desktoppkg dll-check -dll <file> -version <v> -winver <winver> [-ffmpeg <dir>]
+  [-load-config]`, README WA11). dll-check **reads the PE image itself** (`debug/pe` plus `pe.go`'s parsing of the
+  export, delay-import, resource and load-config directories) instead of dumpbin's text: dumpbin can't print
+  VERSIONINFO, and this way the check needs no VS environment and runs on the Mac and Linux too. The `windows-native`
+  job still prints `dumpbin /dependents /exports` and the load-config line to its log, for people. Every problem is
+  reported, not only the first; exit 1 when there is one.
+  - **Image**: an x64 DLL with `DYNAMIC_BASE`, `HIGH_ENTROPY_VA`, `NX_COMPAT` and `GUARD_CF` (04 §13.1's linker
+    flags).
+  - **ABI**: the DLL's export names equal the functions declared with `IM_API` in `native/include/isshoni_media.h`
+    (04 marks every exported function with that macro), and `native/windows/isshoni-media.def` lists the same; the
+    export directory's DLL name is `isshoni-media.dll`; no ordinal-only and no forwarded export. An extra or missing
+    export fails.
+  - **Imports**: `deploy/windows/dll-imports.txt` has two sections, `static:` and `delay:`. Every imported DLL must
+    be listed in the section that matches how it is imported. `mfplat.dll` and `avrt.dll` are allowed only under
+    `delay:` (04 §13.1; mfplat is absent on N editions and Windows Server). The `api-ms-win-core-*` API sets that
+    `windowsapp.lib` and `synchronization.lib` pull in are listed by 04 in slice E2; 05's audio DLLs by 05; any other
+    system DLL by PR with a reason. An import of `avcodec-*` or `avutil-*` **always fails**, like the C runtime
+    (`VCRUNTIME*`, `MSVCP*`, `MSVCR*` such as `msvcrt.dll`, `api-ms-win-crt-*`, `ucrtbase*`, `concrt*`, `vccorlib*`,
+    their debug builds) and `opus*.dll`: the engine must load, probe and capture audio when FFmpeg is missing or
+    blocked (04 §9.2, §13.3).
+  - **Load config** (conditional, `-load-config`): only if WA11's `dll_search_test` shows that the delay-load helper
+    honors `/DEPENDENTLOADFLAG:0x800` (04 §13.1, §18.2), the DLL must carry `DependentLoadFlags` 0x800
+    (`LOAD_LIBRARY_SEARCH_SYSTEM32`) in its load config; otherwise this check doesn't exist, dll-check only prints the
+    value, and 04's delay-load hook is the guard. The DLL is linked without the flag and the job runs without
+    `-load-config` until the verdict, which the test writes to `dependentloadflag-verdict.txt` and the job puts into
+    its summary, is read from the group PR's first `windows-native` run.
+  - **Version resource**: `FILEVERSION` and `PRODUCTVERSION` = `<winver>`; the strings `ProductVersion` = `<v>`,
+    `FileVersion` = `<winver>`, `ProductName` = `isshoni`, `CompanyName` = `isshoni project`, `LegalCopyright` =
+    `Copyright the isshoni authors. Apache-2.0.`, `OriginalFilename` = `isshoni-media.dll`, `FileDescription` =
+    `isshoni media engine` and `InternalName` = `isshoni-media` (04 §13.4; 04's `.rc`, fed from `IM_VERSION` and
+    `IM_WINVER`). SignPath requires product metadata on every file it signs.
+  - With `-ffmpeg <dir>` (from README WA24 on): the FFmpeg DLLs there are exactly the two that `lock.json` names after
+    its majors, have its SHA-256s (unmodified), and import neither Media Foundation nor a C runtime DLL (§4.4).
+- **The four-part version** in CI: until README WA67's `desktoppkg winver` exists, the job computes §5.3's rule inline
+  for CI's `0.0.0-ci.<N>`: `0.0.0.<N mod 65000>`.
 - **WebView2 bootstrapper**: downloaded from the `tools.json` URL; `Get-AuthenticodeSignature` must say `Valid` with
   exactly the pinned signer subject; its SHA-256 is recorded.
 - Artifact `windows-native`, two folders:
@@ -512,7 +581,8 @@ Time: about 10 minutes on a hosted runner, most of it `configure` under MSYS2.
   PC and the `hwcheck` run (§10.4), plus a `ci\` folder with the `win-x64-ci` `isshoni-media.dll` and the FFmpeg DLLs
   for the checks that need 04's luma tap (`isshoni-enginetest avsync -dll ci`, 04 §14, 05 §19.3). Never staged.
 
-`native-manifest.json`:
+`native-manifest.json` (`"ffmpeg": null` until README WA24 wires the locked FFmpeg build into the job; the vcpkg
+ports and their versions come from the release tree's `vcpkg_installed/vcpkg/status`):
 
 ```json
 {"version": "0.2.0", "winver": "0.2.0.65000",
@@ -530,13 +600,23 @@ defaults to `production`, and the release passes nothing. Test builds pass other
 03's `task desktop:build:e2e` wraps; the updater e2e: `TAGS="production updatetest"`) and are written to
 `dist-desktop/windows_amd64-test/` instead, a folder that `tools/desktoppkg stage -release` refuses.
 
-1. `.bin/wails3 generate syso -arch amd64 -icon cmd/isshoni-desktop/build/windows/icon.ico -manifest
+1. `cmd/isshoni-desktop/build/windows/syso.go` (`//go:build ignore`, built in the `tools/wails3` module, whose graph
+   already pins `github.com/tc-hib/winres` (0BSD) for wails3's own syso command, so no module is added anywhere):
+   `go build -C tools/wails3 -o ../../dist-desktop/.build/syso ../../cmd/isshoni-desktop/build/windows/syso.go`, then
+   `syso -arch amd64 -icon cmd/isshoni-desktop/build/windows/icon.ico -manifest
    cmd/isshoni-desktop/build/windows/app.manifest -info <generated info.json> -out
-   cmd/isshoni-desktop/rsrc_windows_amd64.syso` (git-ignored). The icon and the application manifest are 03's files;
-   the manifest's contents are 03 §24's list: `asInvoker`, PerMonitorV2 DPI awareness, the Windows 10/11
-   `supportedOS` GUID, Common Controls v6, `activeCodePage` UTF-8, `longPathAware`. `info.json` carries the version
-   fields of §5.1 with `OriginalFilename` = `isshoni.exe` and `FileDescription` = `isshoni`. If the pinned wails3
-   lacks `generate syso`, `github.com/tc-hib/go-winres` (0BSD) in `tools/go.mod` does the same.
+   cmd/isshoni-desktop/rsrc_windows_amd64.syso`. It writes the manifest **byte for byte**, after checking it for 03
+   §4.5's settings: `wails3 generate syso` parses the manifest into `winres.AppManifest` and writes that struct back,
+   which at beta.34 (winres v0.3.1) drops `<activeCodePage>` and turns "PerMonitorV2, PerMonitor" into
+   "permonitorv2,system" (README WA22's review). After the build, `syso -check <exe> -manifest …` fails unless the exe
+   carries the manifest unchanged. The `.syso` exists only for the length of one build: the task deletes it after
+   `go build`, and `cmd/isshoni-desktop/.gitignore` ignores `/rsrc_windows_*.syso`, so an interrupted build leaves
+   nothing `git status` shows and a build from a clean checkout records `vcs.modified=false`. The icon and the
+   application manifest are 03's files; the manifest's contents are 03 §24's list: `asInvoker`, PerMonitorV2 DPI
+   awareness, the Windows 10/11 `supportedOS` GUID, Common Controls v6, `activeCodePage` UTF-8, `longPathAware`.
+   `info.json` (wails3's `-info` format) carries the version fields of §5.1 with `OriginalFilename` = `isshoni.exe`,
+   `FileDescription` = `isshoni` and `InternalName` = `isshoni`; until README WA67's `desktoppkg winver`, the task's
+   shell computes §5.3's four-part number itself and refuses a `VERSION` that isn't `X.Y.Z[-pre][+build]`.
 2. `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -tags "$TAGS" -ldflags "-s -w -H windowsgui
    -X github.com/MoonWX/isshoni/internal/version.version=<v> -X …version.commit=<sha> -X …version.date=<commit date>"
    -o dist-desktop/windows_amd64/isshoni.exe ./cmd/isshoni-desktop` (test builds: `-o
@@ -1443,7 +1523,9 @@ Whoever adds a native dependency (04, 05) adds its entry in the same pull reques
   windows run covers `cmd/isshoni-desktop` and its Wails modules. The darwin run on Linux sees the stub (no cgo), so
   the `desktop-macos` job runs `go-licenses check ./cmd/isshoni-desktop` natively with cgo, so M3 finds no surprise.
 - The SPA bundled in the app is the server's `web/dist`, already under the npm gate.
-- `govulncheck` covers `cmd/isshoni-desktop` through `./...`.
+- `govulncheck ./...` runs with `GOOS=linux`, where `cmd/isshoni-desktop` compiles only `main_other.go`, so the
+  `govulncheck` job also runs `GOOS=windows GOARCH=amd64 .bin/govulncheck ./cmd/isshoni-desktop`, which scans Wails
+  and its Windows-only modules (03 §3.2 W20; group 2's integration fix).
 
 ### 9.5 Never shipped
 
@@ -1467,6 +1549,10 @@ New `changes` filters:
 - `pins`: `web/package.json`, `web/package-lock.json`: they run `lint-deploy`, so a pull request that changes only
   `@wailsio/runtime` still runs `lint:pins` (§3), which neither the `go` nor the `deploy` filter would trigger.
 - M1's `run-e2e` decision also counts `internal/desktop/**` (the desktop e2e specs).
+- M1's `go` filter also counts the non-Go inputs of M2's Go tests (group 2's integration fix):
+  `internal/protocol/relay/testdata/**`, `internal/client/deeplink/testdata/**`,
+  `native/common/tests/testdata/abi_layout.json` (which `internal/media/native`'s `layout_test` compares) and
+  `native/common/audio/tests/testdata/**` (the golden Markers `markergolden` reads).
 - M1's `protocol` filter also counts `internal/desktop/bridge/**`, `cmd/isshoni-desktop/**`, `tools/wails3/**` and
   `web/src/platform/desktop/**`.
 
@@ -1933,7 +2019,7 @@ Nothing needs to be bought or rented: the rc server is M1's test VPS.
 | Unsigned 0.x: SmartScreen friction, Smart App Control blocks, Defender false positives | the ps1 path (no Mark of the Web), honest docs, Defender/VirusTotal check per release with false-positive submissions, SignPath right after the first public release, no packers |
 | Smart App Control may block the unsigned FFmpeg DLLs even after SignPath | measured after approval (§12.4); the owner's decision (§20) |
 | Wails v3 beta churn | exact pin, hand bumps with the Windows smoke, no Dependabot; the app's Wails surface is 03's to keep small |
-| Runner image drift (MSVC, MSYS2, makensis) | VS selected by version range `[17.0,19.0)` plus the C++ tools component, toolset pinned to `14.44` with a fail-fast check that prints the instance, toolset build and SDK found (§3; `windows-2025` already moved to VS 2026); pinned NSIS zip; FFmpeg built once and locked; toolset recorded; static CRT; `dumpbin` checks catch a new runtime import |
+| Runner image drift (MSVC, MSYS2, makensis) | VS selected by version range `[17.0,19.0)` plus the C++ tools component, toolset pinned to `14.44` with a fail-fast check that prints the instance, toolset folder and SDK found (§3; `windows-2025` already moved to VS 2026); vcpkg's ports built with the same toolset (the overlay triplet); pinned NSIS zip; FFmpeg built once and locked; toolset folder and compiler and linker builds recorded (VS servicing changes `cl.exe` inside the same folder); static CRT; FFmpeg's `dumpbin` and dll-check's import checks catch a new runtime import |
 | FFmpeg security fixes | small build (encoders only), §4.7's process, a patch release |
 | Update key leak | separate key in the protected environment, offline backup, `revokedKeys`, an advisory (§8.12) |
 | Self-hosted runner abuse from a public repository | dispatch-only workflow, runner offline outside sessions, non-admin account, approval for all external contributors |
@@ -1951,7 +2037,7 @@ Nothing needs to be bought or rented: the rc server is M1's test VPS.
 | Unit | `manifest_test.go` | schema, product, channel acceptance per app channel (`ci` only with the `updatetest` tag), SemVer compare through `internal/version` (rc < final; a `version` or `minVersion` that doesn't parse → `bad_manifest`), `Eligible` (empty and `rc.N` yes, `ci.N` only with `updatetest`, dev no), expiry at the boundary, `minVersion` → required, artifact selection per OS/arch, the exact URL rule; `revokedKeys`: an active-key manifest revoking the backup → ignored, nothing persisted, the backup still verifies the next manifest; an active-key manifest revoking another active key → ignored; a backup-key manifest revoking the active key → persisted in `state.json` (also when the manifest is not newer) and a later manifest signed by that key → `bad_signature`; a backup-key manifest listing the backup itself → that entry dropped, the rest honoured; the internal `applyRevocations` helper called directly with a list that covers every trusted key (unreachable through a manifest, since the backup entry is always dropped; the check is defence in depth) → refused as a whole, nothing persisted; unknown fields ignored, 64 KiB limit | same |
 | Unit | `update_test.go` (httptest TLS server, `testing/synctest`) | first check in 60–300 s and not before the wizard; `CheckNow` before `WizardDone` makes the request (and makes none when `Enabled` is false); daily ± 1 h; 6 h after an error; `CheckNow` debounce; `Ready()` non-nil only in `StateReady`; a newer verified manifest in a copy outside `InstallDir` → `error`/`not_installed` with `Available` and `NotesURL` and zero download requests; after 2 failed attempts → `error`/`install_failed` with `Available` until a newer manifest appears, which downloads; `Apply` re-verifies (a changed file → `hash_mismatch`, deleted) and returns `ErrNotInstalled` outside `InstallDir`; `PendingAtStartup(true)` (an `--autostart` start) returns nil while `PendingAtStartup(false)` returns the same pending update; `Enabled` false → the server counts zero requests; redirects to another host or to http refused; stall and total timeouts; size and hash mismatch delete the partial file; disk check; `state.json` atomic and versioned; `PendingAtStartup` rules (newer, not expired, verifies, attempts < 2); `ErrNotInstalled`; beta listing parse, 403/429 → `rate_limited`, non-SemVer tags skipped; goleak | same |
 | Unit | `apply_windows_test.go`, `policy_windows_test.go` | the installer is started with exactly `/S /UPDATE /RELAUNCH` (a fake installer, a Go test binary, records its arguments); `Apply` returns only once the fake installer has created `Local\io.isshoni.desktop.installing`, and returns nil with one WARN after 10 s when it never does (an injected clock and mutex probe); the HKLM policy value is read (a test key under HKCU through an injected root) | CI windows |
-| Unit | `tools/desktoppkg` | the winver table; stage list and mtimes; NSIS defines; manifest golden; `check` rules (unknown binary, literal strings in NSIS, size budget: warn above 40 MB, fail above 100 MB); `ffmpeg-inputs` hash; `dll-check` against fixture `dumpbin` output (an `avcodec-*`/`avutil-*` import fails; `mfplat.dll` and `avrt.dll` pass only as delay imports; an FFmpeg DLL importing `mfplat.dll` fails; DLL names unequal to `lock.json`'s majors fail); `stage -release` refuses a `windows_amd64-test` exe and a DLL whose `--self-check` reports `testHooks: true` (fixture) | CI ubuntu; Mac |
+| Unit | `tools/desktoppkg` | the winver table; stage list and mtimes; NSIS defines; manifest golden; `check` rules (unknown binary, literal strings in NSIS, size budget: warn above 40 MB, fail above 100 MB); `ffmpeg-inputs` hash; `dll-check` against synthetic PE images that a test builder writes (`pebuild_test.go`; dll-check reads PE files, not dumpbin text, §5.1): an extra or missing export, an ordinal-only or forwarded export, another export name, a `VCRUNTIME140.dll`, UCRT, `opus.dll`, unlisted or `avcodec-*`/`avutil-*` import fail; `mfplat.dll` and `avrt.dll` pass only as delay imports; a 32-bit image, an executable, no Control Flow Guard, a wrong `ProductVersion`, `FileVersion`, `OriginalFilename` or binary `FILEVERSION` and a missing VERSIONINFO fail; the load-config cases; an FFmpeg DLL importing `mfplat.dll` fails; DLL names unequal to `lock.json`'s majors fail; `stage -release` refuses a `windows_amd64-test` exe and a DLL whose `--self-check` reports `testHooks: true` (fixture) | CI ubuntu; Mac |
 | Unit | `tools/notices` desktop golden | the native section; LGPL accepted only dynamic and with the bundle; a GPL native entry fails; an unlisted vcpkg port fails; a `LicenseRef` without an exception fails | CI ubuntu |
 | Unit | `internal/server/httpapi` `desktopscripts_test.go` | `RenderInstallPS1`: `'` doubled, a non-ASCII origin or an `http://` non-loopback origin gives an empty server, a dev/CI/e2e version gives an empty version, rc kept, missing or doubled markers error; the route: 200, content type with charset, `Cache-Control`, `ETag`, `HEAD` without body; `/install-desktop.sh` is 404 text, never the SPA; the template itself (`deploy.InstallDesktopPS1`) renders | CI ubuntu; Mac |
 | Unit | `web/src/download/links.test.ts`, `DownloadPage.test.tsx` | release vs non-release links, the exact installer URL, the ps1 command, `openAppUrl` exactly `isshoni://watch.example.com/` for `https://watch.example.com` (via `appLinkFor`) and `""` for an `http://localhost` origin, the "Open isshoni" button hidden then, the requirement lines, the three warning lines (browser download, SmartScreen, Smart App Control) with their project-site anchors, OS ordering | CI ubuntu; Mac |
@@ -2012,7 +2098,7 @@ Homebrew makensis) or in GitHub Actions; only §11.8's manual items, the audiote
 - **Build**: `task desktop:exe:windows [TAGS=…]` (default `production`), `task desktop:package:windows`,
   `task ffmpeg:fetch`, `task ffmpeg:build`, `task release:wails3`, `task release:update-keys`, `task lint:ps` (also
   `native/windows/tools/*.ps1` and `deploy/test/windows/*.ps1`), `task test:ps`, `task lint:pins` (Wails library, CLI
-  and `@wailsio/runtime`); four tasks WA04 added beyond this list, so CI and the Mac share one command each:
+  and `@wailsio/runtime`; the vcpkg triplet's toolset against `tools.json`, §3); four tasks WA04 added beyond this list, so CI and the Mac share one command each:
   `task lint:native` (`clang-format --dry-run --Werror` over the tracked C and C++ files under `native/`;
   `CLANG_FORMAT=<binary>` picks the binary, and outside CI a missing clang-format is skipped with a note),
   `task lint:go:cross` (§10.1's cross-builds), `task gen:bindings` (`GOOS=windows wails3 generate bindings` into

@@ -1,0 +1,5 @@
+# Update keys that the next release revokes: one SHA256 fingerprint per line, as `ssh-keygen -l` prints it
+# (SHA256:...). Empty normally. Used only for the release after a leak of the active update key, which the backup
+# key signs; never lists the backup key itself or a key that deploy/keys/update_signers still holds
+# (docs/m2/06-windows-release.md §8.1, §8.12). `tools/desktoppkg manifest` copies the list into the update
+# manifest's revokedKeys; blank lines and lines starting with # are skipped.

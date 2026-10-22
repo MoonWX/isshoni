@@ -446,8 +446,10 @@ tasks:
 
   lint:keys:
     desc: >-
-      Check that the key block embedded in deploy/install.sh equals deploy/keys/allowed_signers, and that README.md's
-      "Release signing keys" section lists the fingerprint of each key in it and no other one
+      Check that the key block embedded in deploy/install.sh equals deploy/keys/allowed_signers and uses only options
+      that OpenSSH 8.1 parses, that the update signers block in internal/update/signers.go equals
+      deploy/keys/update_signers (docs/m2/06 §8.3), and that README.md's "Release signing keys" section lists the
+      fingerprint of each key in them and no other one
     cmds:
       - go -C tools run ./repocheck -root .. keys
 
@@ -1145,9 +1147,14 @@ tasks:
     desc: >-
       Write deploy/keys/update_signers into internal/update/signers.go, print the update keys' fingerprints and run
       lint:keys (docs/m2/06 §8.12, §11.5)
+    # repocheck update-keys checks the file as lint:keys does (one `isshoni-update namespaces="isshoni-update"
+    # ssh-ed25519 AAAA… <name>` line per key, exactly one isshoni-update-backup-<n>, at least one isshoni-update-<n>)
+    # before it writes the block between `// BEGIN UPDATE SIGNERS` and `// END UPDATE SIGNERS`, so a failed run
+    # leaves signers.go as it was. Then lint:keys: until README.md's "Release signing keys" section lists the printed
+    # fingerprints, it ends with that error, as release:keys does (deploy/keys/README.md).
     cmds:
-      - cmd: "echo 'release:update-keys: note: not implemented yet; README WA25 adds it with internal/update. Nothing was written.'"
-        silent: true
+      - go -C tools run ./repocheck -root .. update-keys
+      - task: lint:keys
 
   release:snapshot:
     desc: >-
@@ -1446,8 +1453,9 @@ tasks:
           [ -z "$(tail -c 1 "$keys")" ] || die "$keys must end with a newline"
           tmp=$(mktemp -d)
           trap 'rm -rf "$tmp"' EXIT
-          # Each line: the principal install.sh asks for, the namespace it verifies, an ed25519 key (06 §4.3, §9.4).
-          # Rotation adds options (valid-before="YYYYMMDD") to the namespaces field; comments and blank lines pass.
+          # Each line: the principal install.sh asks for, the namespace it verifies, an ed25519 key (06 §4.3, §9.4);
+          # comments and blank lines pass. Rotation adds the new key's line and later deletes the old one: lint:keys
+          # refuses options such as valid-before, which Windows 10's OpenSSH 8.1 does not parse (docs/m2/06 §7.2).
           n=0
           while IFS= read -r line || [ -n "$line" ]; do
             n=$((n + 1))

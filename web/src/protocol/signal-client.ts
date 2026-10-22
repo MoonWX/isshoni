@@ -23,6 +23,7 @@ import {
   CloseCodeMessageTooBig,
   CloseCodeNormal,
   ErrorCodeRateLimited,
+  ErrorCodeUnauthenticated,
   ErrorScopeConnection,
   ErrorScopeSession,
   MessageTypeError,
@@ -39,10 +40,17 @@ import {
   type ClientInfo,
   type Feature,
   type Hello,
+  type HelloAuth,
   type Role,
   type ServerShutdown,
   type Welcome,
 } from './types.gen';
+
+/**
+ * Gives the hello.auth of the next hello (M2: docs/m2/03 §7.1, the desktop's bearer token). The same type as
+ * platform/types.ts's HelloAuthProvider, declared here so that protocol/ doesn't depend on platform/.
+ */
+export type HelloAuthProvider = (o: { forceRefresh: boolean }) => Promise<HelloAuth | undefined>;
 
 /** The states of 01 §10.1. A new client is stopped; only start() (or a reload) leaves stopped. */
 export type SignalState = 'connecting' | 'handshaking' | 'ready' | 'backoff' | 'stopped';
@@ -90,9 +98,22 @@ export interface SignalClientOptions {
   onResync?: (w: Welcome) => void | Promise<void>;
   /**
    * The build version that welcome.serverVersion is compared with for staleBuild (01 §6.1). Default: this build's
-   * __ISSHONI_VERSION__ (01's BUILD_VERSION). Tests set it; the app leaves it alone.
+   * __ISSHONI_VERSION__ (01's BUILD_VERSION). Tests set it; the desktop passes '' (docs/m2/03 §7.2), which turns
+   * staleBuild off: its SPA is the app's own build, and a reload can't change it.
    */
   buildVersion?: string;
+  /**
+   * M2 (docs/m2/03 §7.3): before every hello, the resuming ones too, the client awaits auth({forceRefresh: false})
+   * and puts the result into hello.auth (none for undefined). It is called before the socket opens, so the server's
+   * hello timeout never waits for it; a rejection or no answer within AuthTimeoutMs (longer than the desktop bridge's
+   * own 15 s AccessToken budget, docs/m2/03 §20) fails that attempt like a failed connect. When a connection whose
+   * hello carried a token is stopped with a session-scope unauthenticated (01 §3.2), the client asks with
+   * forceRefresh: true and reconnects as a new connection; it keeps asking with forceRefresh in each attempt until one
+   * such call answers (a failed forced call doesn't use up the refresh). A second unauthenticated before that
+   * connection has been ready for BackoffResetMs stops it as in M1. The browser gives none: its cookie authenticates
+   * the upgrade.
+   */
+  auth?: HelloAuthProvider;
 }
 
 /** The requests SignalClient.request sends: every client request except hello, which the client sends itself. */
@@ -111,6 +132,11 @@ export type StateListener = (state: SignalState, info: SignalStateInfo) => void;
 export const RequestTimeoutMs = 10_000;
 /** connecting: no open socket within this → backoff (a guard: a black-holed server could otherwise hang for long). */
 export const ConnectTimeoutMs = 10_000;
+/**
+ * opts.auth (M2): no answer within this → backoff. Longer than the desktop bridge's AccessToken budget (15 s,
+ * docs/m2/03 §20), so a slow forced refresh in Go is waited for rather than abandoned.
+ */
+export const AuthTimeoutMs = 20_000;
 /** handshaking: no welcome within this after the socket opened → backoff. */
 export const HandshakeTimeoutMs = 10_000;
 /** The ping interval when welcome.limits.pingIntervalMs is missing. */
@@ -265,6 +291,16 @@ export class SignalClient {
   #pageListeners = false;
   /** Stopped by pagehide: a pageshow from the bfcache starts again. */
   #suspended = false;
+  /** Counts attempts that await opts.auth: an answer for an older attempt (or after stop()) is dropped. */
+  #authSeq = 0;
+  /** The hello.auth for the socket being opened; dropped once hello is sent (the token isn't kept). */
+  #helloAuth: HelloAuth | undefined;
+  /** The current socket's hello carried a token. */
+  #bearer = false;
+  /** The next attempt asks opts.auth with forceRefresh; cleared once such a call answers. */
+  #forceAuth = false;
+  /** The forced refresh after an unauthenticated is spent, until a connection has been ready for BackoffResetMs. */
+  #forcedRefreshUsed = false;
 
   constructor(opts: SignalClientOptions) {
     this.#opts = opts;
@@ -295,6 +331,8 @@ export class SignalClient {
     this.#shutdown = undefined;
     this.#shutdownWaitPending = false;
     this.#rateLimitWaitMs = undefined;
+    this.#forceAuth = false;
+    this.#forcedRefreshUsed = false;
     this.#addPageListeners();
     this.#connect();
   }
@@ -409,12 +447,66 @@ export class SignalClient {
   #connect(): void {
     this.#backoffTimer.clear();
     this.#backoffRateLimited = false;
+    const auth = this.#opts.auth;
+    if (auth === undefined) {
+      this.#openSocket(undefined);
+      return;
+    }
+    // M2: the hello's token first, then the socket (opts.auth). The attempt is connecting meanwhile.
+    const seq = ++this.#authSeq;
+    // #forceAuth stays set until a forced call answers: after a rejection or a timeout the next attempt forces again
+    // (Go refreshes at most once per 10 s and shares that refresh's token).
+    const forceRefresh = this.#forceAuth;
+    const current = (): boolean => seq === this.#authSeq && this.#state === 'connecting' && this.#ws === undefined;
+    this.#attemptTimer.set(() => {
+      if (current()) {
+        this.#authSeq++;
+        this.#enterBackoff({});
+      }
+    }, AuthTimeoutMs);
+    this.#state = 'connecting';
+    this.#emit('connecting', this.#downInfo());
+    if (!current()) {
+      return; // a state listener stopped the client
+    }
+    let answer: Promise<HelloAuth | undefined>;
+    try {
+      answer = auth({ forceRefresh });
+    } catch (err) {
+      answer = Promise.reject(err instanceof Error ? err : new Error(String(err)));
+    }
+    answer.then(
+      (helloAuth) => {
+        if (current()) {
+          this.#forceAuth = false;
+          this.#openSocket(helloAuth ?? undefined, true);
+        }
+      },
+      (err: unknown) => {
+        if (current()) {
+          report('SignalClient: auth() failed', err);
+          this.#attemptTimer.clear();
+          this.#enterBackoff({});
+        }
+      },
+    );
+  }
+
+  /**
+   * Creates the attempt's socket. helloAuth goes into its hello. announced: #connect already reported connecting
+   * (an attempt that awaited opts.auth), so this doesn't again.
+   */
+  #openSocket(helloAuth: HelloAuth | undefined, announced = false): void {
+    this.#helloAuth = helloAuth;
+    this.#bearer = false;
     let ws: WebSocket;
     try {
       ws = new WebSocket(this.#opts.url);
     } catch (err) {
       // A malformed URL or a blocked port: a failed attempt like any other.
       report('SignalClient: cannot create the WebSocket', err);
+      this.#helloAuth = undefined;
+      this.#attemptTimer.clear();
       this.#enterBackoff({});
       return;
     }
@@ -439,8 +531,10 @@ export class SignalClient {
         this.#end({});
       }
     }, ConnectTimeoutMs);
-    this.#state = 'connecting';
-    this.#emit('connecting', this.#downInfo());
+    if (!announced) {
+      this.#state = 'connecting';
+      this.#emit('connecting', this.#downInfo());
+    }
   }
 
   #onOpen(ws: WebSocket): void {
@@ -458,6 +552,11 @@ export class SignalClient {
     if (this.#resumeToken !== undefined) {
       hello.resumeToken = this.#resumeToken;
     }
+    if (this.#helloAuth !== undefined) {
+      hello.auth = this.#helloAuth;
+      this.#bearer = true;
+    }
+    this.#helloAuth = undefined;
     this.#helloId = this.#newId();
     this.#state = 'handshaking';
     if (!this.#send({ type: MessageTypeHello, id: this.#helloId, data: hello })) {
@@ -520,6 +619,8 @@ export class SignalClient {
     this.#state = 'ready';
     this.#stableTimer.set(() => {
       this.#attempt = 0;
+      // The forced refresh worked: a later unauthenticated is a new case, with a forced refresh of its own.
+      this.#forcedRefreshUsed = false;
     }, BackoffResetMs);
     this.#schedulePing();
     const serverVersion = data['serverVersion'];
@@ -597,6 +698,14 @@ export class SignalClient {
     if (error !== undefined) {
       if (error.scope === ErrorScopeSession) {
         stop = true;
+        if (error.code === ErrorCodeUnauthenticated && this.#bearer && !this.#forcedRefreshUsed) {
+          // M2 (opts.auth): the server refused the token; ask for a fresh one once and connect again as a new
+          // connection (the session is gone, so its resume token is too).
+          stop = false;
+          this.#forcedRefreshUsed = true;
+          this.#forceAuth = true;
+          this.#resumeToken = undefined;
+        }
       } else if (error.scope === ErrorScopeConnection || cause.hello === true) {
         stop = !error.retryable;
       }
@@ -647,6 +756,8 @@ export class SignalClient {
     if (this.#state === 'stopped') {
       return;
     }
+    this.#authSeq++; // an auth() answer still on its way opens nothing
+    this.#helloAuth = undefined;
     this.#closeSocket(CloseCodeNormal);
     this.#backoffTimer.clear();
     this.#resumeToken = undefined;

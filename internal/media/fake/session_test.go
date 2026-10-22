@@ -805,6 +805,8 @@ func TestCalls(t *testing.T) {
 		_ = s.Reconfigure(rc)
 		rc.Layers[0].MaxFPS = 1 // the recorded call is a copy
 		_ = e.SetAudioMuted(ctx, true)
+		_ = e.SetAudioMode(ctx, media.AudioEverything) // invalid: not recorded
+		_ = e.SetAudioMode(ctx, media.AudioOff)
 		_ = e.SetExclusions(ctx, media.Exclusions{KeepOutMicUsers: true})
 		_ = s.Stop()
 		_ = s.Stop()
@@ -817,7 +819,8 @@ func TestCalls(t *testing.T) {
 			{At: t1, Op: "paused", On: true},
 			{At: t1, Op: "reconfigure", Reconf: media.Reconfig{Preset: "game",
 				Layers: []media.LayerConfig{{RID: "f", MaxFPS: 30}}}},
-			{At: t1, Op: "audio_muted", On: true},
+			{At: t1, Op: "audio_muted", On: true, Muted: true},
+			{At: t1, Op: "audio_mode", Mode: media.AudioOff},
 			{At: t1, Op: "exclusions"},
 			{At: t1, Op: "stop"},
 		}
@@ -864,6 +867,9 @@ func TestAudioMuted(t *testing.T) {
 			if err := e.SetAudioMode(ctx, m); codeOf(err) != want {
 				t.Errorf("SetAudioMode(%q) = %v, want %q", m, err, want)
 			}
+		}
+		if err := e.SetAudioMode(ctx, media.AudioExcludeApps); err != nil { // sound on, whatever the map's order
+			t.Fatal(err)
 		}
 		skipEvents(t, s, 2)
 		tone := ofKind(pullFor(t, s, 200*time.Millisecond), media.KindAudio)
@@ -1114,52 +1120,4 @@ func TestSourceNowOrigin(t *testing.T) {
 				s.Now(), p.CaptureNS, skip, time.Second-skip)
 		}
 	})
-}
-
-// TestAudioControllerStub: until WA26, the watcher and the exclusions are no-ops and the report, the levels and the
-// sound check are not implemented.
-func TestAudioControllerStub(t *testing.T) {
-	e := NewEngine(EngineConfig{AudioScenario: "degraded"})
-	defer e.Close()
-	var ac media.AudioController = e
-	ctx := t.Context()
-	if err := ac.WatchAudio(ctx, media.Exclusions{}); err != nil {
-		t.Errorf("WatchAudio: %v", err)
-	}
-	if err := ac.SetExclusions(ctx, media.Exclusions{}); err != nil {
-		t.Errorf("SetExclusions: %v", err)
-	}
-	if err := ac.UnwatchAudio(ctx); err != nil {
-		t.Errorf("UnwatchAudio: %v", err)
-	}
-	_, err1 := ac.AudioReport(ctx)
-	_, err2 := ac.AudioLevels(ctx)
-	_, err3 := ac.SoundCheck(ctx, 0, time.Second)
-	for _, err := range []error{err1, err2, err3} {
-		if codeOf(err) != media.CodeInternal || reasonOf(err) != "not_implemented" {
-			t.Errorf("%v, want internal (not_implemented)", err)
-		}
-	}
-	// The mode is checked before the session (05 §13.1: in Go, without a call).
-	for m, want := range map[media.AudioMode]media.ErrorCode{
-		media.AudioOff: media.CodeAudioNotRunning, media.AudioExcludeApps: media.CodeAudioNotRunning,
-		media.AudioEverything: media.CodeInvalid, media.AudioTestTone: media.CodeInvalid, "": media.CodeInvalid,
-	} {
-		if err := ac.SetAudioMode(ctx, m); codeOf(err) != want {
-			t.Errorf("SetAudioMode(%q) without a session = %v, want %q", m, err, want)
-		}
-	}
-	if err := ac.SetAudioMode(ctx, media.AudioOff); !errors.Is(err, media.ErrAudioNotRunning) {
-		t.Errorf("SetAudioMode(off) without a session: %v, want ErrAudioNotRunning", err)
-	}
-	done, cancel := context.WithCancel(ctx)
-	cancel()
-	for _, err := range []error{
-		ac.WatchAudio(done, media.Exclusions{}), ac.UnwatchAudio(done), ac.SetExclusions(done, media.Exclusions{}),
-		ac.SetAudioMode(done, media.AudioOff), ac.SetAudioMuted(done, true),
-	} {
-		if !errors.Is(err, context.Canceled) {
-			t.Errorf("with a cancelled ctx: %v", err)
-		}
-	}
 }

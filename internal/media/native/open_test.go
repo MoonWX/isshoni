@@ -663,18 +663,13 @@ func TestRelease(t *testing.T) {
 }
 
 // TestNotImplementedYet: the parts later slices fill answer internal/not_implemented, with the Go method as Op.
+// (README WA23 implemented Probe, Sources, Pick, Start, StartExtra, SourceDetail and the session: bridge_test.go.)
 func TestNotImplementedYet(t *testing.T) {
 	f := newFakeCaller(t)
 	e := openFake(t, f, Options{})
 	ctx := context.Background()
-	s := &session{c: f}
 	calls := f.total()
 	for op, err := range map[string]error{
-		"probe":             second(e.Probe(ctx, false)),
-		"sources":           second(e.Sources(ctx)),
-		"pick":              second(e.Pick(ctx, media.PickRequest{})),
-		"start":             second(e.Start(ctx, media.Config{})),
-		"start_extra":       second(e.StartExtra(ctx, media.Config{})),
 		"protect_window":    e.ProtectWindow(0),
 		"set_openh264_path": e.SetOpenH264Path(""),
 		"audio_watch":       e.WatchAudio(ctx, media.Exclusions{}),
@@ -686,14 +681,6 @@ func TestNotImplementedYet(t *testing.T) {
 		"audio_levels_get":  second(e.AudioLevels(ctx)),
 		"audio_sound_check": second(e.SoundCheck(ctx, 0, time.Second)),
 		"audio_apps":        second(e.AudioApps(ctx)),
-		"next":              second(s.Next(ctx)),
-		"set_bitrate":       s.SetBitrate("f", 1e6),
-		"reconfigure":       s.Reconfigure(media.Reconfig{}),
-		"stop":              s.Stop(),
-		"set_layer_active":  s.SetLayerActive("f", false),
-		"set_paused":        s.SetPaused(true),
-		"stats":             second(s.Stats()),
-		"set_audio_bitrate": s.SetAudioBitrate(128000),
 		"install_openh264":  second(InstallOpenH264(ctx, nil, t.TempDir())),
 		"verify_openh264":   VerifyOpenH264("x"),
 		"remove_openh264":   RemoveOpenH264(t.TempDir()),
@@ -708,13 +695,6 @@ func TestNotImplementedYet(t *testing.T) {
 	} {
 		wantError(t, err, media.CodeInternal, reasonNotImplemented, op)
 	}
-	if d, ok := e.SourceDetail("pick:1"); ok || d != (SourceDetail{}) {
-		t.Errorf("SourceDetail = %+v, %v", d, ok)
-	}
-	if s.PCMTap() != nil {
-		t.Error("PCMTap is not nil")
-	}
-	s.RequestKeyframe("f")
 	if f.total() != calls {
 		t.Errorf("the stubs made %d DLL calls", f.total()-calls)
 	}

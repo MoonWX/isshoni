@@ -20,7 +20,9 @@ truth for product decisions; the M1 specs are the record of what exists.
 `docs/m1/01-protocol.md` §8.10; "M1 01 §3.2" only stresses it). `02 §…` to `06 §…` and bare numbers
 are the **M2** specs (`04 §12` is `docs/m2/04-windows-engine.md` §12, `03` is `docs/m2/03-desktop-app.md`). The M1
 specs 02–06 carry an **M1** prefix (`M1 02 §9.1` is `docs/m1/02-sfu.md` §9.1, `M1 05 §13.7` is
-`docs/m1/05-web-client.md` §13.7). `README §3` is `docs/m1/README.md` §3 and `S88` an M1 slice.
+`docs/m1/05-web-client.md` §13.7). `README §3` is `docs/m1/README.md` §3 and `S88` an M1 slice, except that a
+numbered `README §3 item N` and the slice ids `README WAnn`/`WBn` are `docs/m2/README.md` (M1's §3 has no numbered
+items).
 
 Every item is marked **M2**, or **later (M3/M4/M5)** when M2 only leaves room for it.
 
@@ -34,7 +36,7 @@ Every item is marked **M2**, or **later (M3/M4/M5)** when M2 only leaves room fo
 | D4 | The Windows binding uses **`golang.org/x/sys/windows`** (`LoadLibraryEx`, `SyscallN`), not purego (04 §12.4) | `x/sys` is already a module of the repo (v0.49.0) and S1's loader used it; purego adds a dependency and on Windows wraps the same `SyscallN` |
 | D5 | **Pull-based, one drain goroutine**: the core's media pump is the only caller of `Session.Next` (`im_next_packet`) and hands packets to the current Publisher through bounded queues | The engine must outlive PeerConnections (30 s hold, rebuilds); native rings never overflow because nobody pulls; backpressure drops whole frames and asks for a keyframe instead of leaking latency |
 | D6 | RTP timestamps come from capture times and **the SR anchor uses the engine's clock** (`Session.Now`, QPC on Windows), not "now" | M1's Publisher assumed a packet is due when the fake hands it out; a real engine hands out a frame 10–30 ms after capture. `NTP = wall(now) − (engine.Now − capture)` keeps "NTP = wall clock at capture" true (plan "A/V sync") |
-| D7 | The native publisher negotiates **no RTX**: NACKs are answered with plain retransmissions by Pion's NACK responder, sized **4096 packets** per SSRC | The SFU caches and forwards plain retransmissions like RTX ones (M1 02 §9.1) and bounds its requests (≤ 10 per packet, M1 02 §8.1); no second SSRC per layer. 4096 covers ≥ 4 s of an 8 Mbit/s layer and 1 s at 40 Mbit/s (M3 4K) |
+| D7 | The native publisher negotiates **no RTX**: NACKs are answered with plain retransmissions by Pion's NACK responder, sized **4096 packets** per SSRC | The SFU caches and forwards plain retransmissions like RTX ones (M1 02 §9.1), accepts them with an SRTP replay window of 4096 on its publish PCs (§10.5), and bounds its requests (≤ 10 per packet, M1 02 §8.1); no second SSRC per layer. 4096 covers ≥ 4 s of an 8 Mbit/s layer and 1 s at 40 Mbit/s (M3 4K) |
 | D8 | The core's publisher **paces video** (an opt-in `publish` option, so M1's users are unchanged) with a token bucket at `max(3 × Σ active layer targets, 6 Mbit/s)`, depth 40 ms of that rate; audio is never paced | A 1080p screen IDR is 150–400 KB; written at once it hits the user's router as a line-rate burst, which is loss or bufferbloat. Same reasoning as the SFU's pacer (M1 02 §9.8) and Chrome's 2.5× pacing factor |
 | D9 | **Rate control is server-estimated, client-applied** (plan "Rate control"): the SFU's native estimator (§10.1) sends `quality.hint{reason: congestion, maxBitrate}` with ≥ 15 % / ≥ 2 s hysteresis; the client applies a hint at most every 2 s (live encoders), or only for ≥ 30 % changes at most every 10 s (encoders that need a re-init + IDR). The client also **ramps** the full layer from 4 Mbit/s by +15 % per 2 s up to its ceiling while no cap binds | Pion GCC stays off until `pion/bwe` ships (plan). The plan's Auto preset "starts at ~4 Mbps and ramps to 8 Mbps, never above ~80 % of measured uplink": the client ramps, the server's estimator caps at 80 % of what arrived when loss shows |
 | D10 | Whether an encoder changes bitrate live comes **only from the engine**: `EncoderInfo.LiveBitrate` in the probe and, per layer, `Event.LiveBitrate` of the layer's `EventLayer` (the encoder really running it), never from encoder names in Go | The plan lists AMF and MF via FFmpeg as re-init; the M2 task text lists MF as live. 04 decides per encoder (FFmpeg's `h264_mf` has no runtime reconfigure; a direct ICodecAPI path would be live); the layers of one session may run on different encoders (04 §9.7), so the controller follows each layer's flag |
@@ -149,8 +151,9 @@ internal/media/                 media.go probe.go errors.go                    (
 internal/media/fake/            fake.go h264.go decodable.go opus.go marker.go (M1) + engine.go session.go (M2)
                                 + audio_ctl.go                                 (05 §13.3)
 internal/media/mediatest/       conformance.go                                 (test helper, imported by _test files)
-internal/media/native/          04 §12.1's files (abi.go, types.go, errors.go, engine_windows.go, session_windows.go,
-                                call_windows.go, engine_other.go, …) + audio_windows.go (05's AudioController binding)
+internal/media/native/          04 §12.1's files (abi.go, types.go, errors.go, bridge.go, engine_windows.go,
+                                session_windows.go, call_windows.go, engine_other.go, …) + audio.go (05's
+                                AudioController binding)
 internal/client/publish/        publish.go track.go repair.go (M1) + pacer.go stats.go clock.go
 internal/client/ratectl/        ratectl.go split.go upload.go
 internal/client/core/           core.go conn.go share.go pump.go pubdriver.go hints.go relay.go stats.go events.go
@@ -226,8 +229,9 @@ type Packet struct {
 }
 
 // Engine is one OS media engine: the native one (internal/media/native) or the fake (internal/media/fake). Its
-// methods are safe for concurrent use. An engine may run several sessions (native: up to 4, at most one with audio;
-// beyond that Start returns ErrBusy, from IM_ERR_LIMIT); one share at a time is the core's rule (D12).
+// methods are safe for concurrent use. Start runs one session at a time: while a session it started runs, Start
+// returns ErrBusy (README §3 item 28; one share at a time is also the core's rule, D12). The native DLL can run up to
+// 4 sessions, at most one with audio (04 §6.4); only native's StartExtra (enginetest) uses more than one (04 §12.2).
 type Engine interface {
 	Info() Info                                                // no I/O
 	Probe(ctx context.Context, refresh bool) (Probe, error)    // native: IM_PROBE_FULL on the first call or with refresh; cached otherwise
@@ -552,7 +556,7 @@ Event mapping (the binding implements it):
 | `CAPTURE_INTERRUPTED`, `CAPTURE_RESUMED` | `EventCaptureInterrupted`, `EventCaptureResumed` | log |
 | `ENCODER_CHANGED` | `EventEncoderChanged{Layer, Encoder}` | an `EventLayer` follows |
 | `DEVICE_RESET` | `EventDeviceReset` | log |
-| `LIMIT_CHANGED` | `EventLimit{Layer, Limit}` | edge-triggered; `ratectl.SetLimit` |
+| `LIMIT_CHANGED` | `EventLimit{Layer, Limit}` | edge-triggered, per layer; the core feeds `ratectl.SetLimit` the share-wide value (§9.1) |
 | `RING_OVERFLOW` | none: logged by the binding | |
 | 32–63 (audio) | none: dropped by the binding (debug log) | 05's Service reads audio state from the report |
 
@@ -588,8 +592,9 @@ come from 05's Service.
 - **Stop**: `Stop` makes a blocked `Next` return `ErrStopped` within 200 ms; `Next` after `Stop` returns `ErrStopped`.
 - **Concurrency**: `Next` from one goroutine; every other `Session` method concurrently with it.
 - **Sources**: a picked source is single use and expires after 5 min; a listed source needs `Config.Listed`.
-- **Sessions**: several may run (native: up to 4, at most one with audio); a second `Start` with audio while a
-  session with audio runs is `ErrBusy`. The fake runs one session at a time.
+- **Sessions**: one at a time: a second `Start` while a session the engine started runs is `ErrBusy`, with or
+  without audio, native and fake alike (README §3 item 28). Native's `StartExtra` (enginetest only, never the app)
+  runs up to the DLL's 4 video-only sessions (04 §12.2).
 
 `internal/media/mediatest.Conformance(t *testing.T, newEngine func(t *testing.T) media.Engine, src media.Source,
 o mediatest.Options)` asserts each rule (§6.4).
@@ -615,13 +620,22 @@ type EngineConfig struct {
 	Probe         media.Probe    // default: OS {runtime.GOOS, Supported}; one encoder {Name "fake", Adapter −1, Tested, LiveBitrate true,
 	                             // Profiles ["6400","42e0"] (Decodable: ["42e0"])}; Capture {Picker, Borderless, MaxFPS 60};
 	                             // Audio = media.AudioCapsFromFlags(0xF) (all four bits, Backend "process-loopback")
-	Sources       []media.Source // default: one listed monitor "mon:fake" (Capture "test")
-	PickResult    *media.Source  // what Pick returns, with a fresh "pick:<n>" ID each time; nil = a window "Fake window" with OSBorder
+	Sources       []media.Source // default: one listed monitor ListedMonitorID ("mon:fake", Capture "test") of SourceSize
+	PickResult    *media.Source  // what Pick returns, with a fresh "pick:<n>" ID each time; nil = a window "Fake window"
+	                             // of SourceSize with Capture "wgc" and OSBorder
 	Cancel        bool           // Pick returns ErrCancelled
+	PickDelay     time.Duration  // how long the fake user takes to pick (or, with Cancel, to close the picker); 0 = at once
 	AudioScenario string         // 05 §13.3's scenarios for the AudioController ("" = "normal")
 	Seed          uint64
 	FlashEvery    time.Duration  // as Config.FlashEvery
 }
+
+// Exported defaults (README WA15).
+const (
+	DefaultSourceWidth, DefaultSourceHeight = 1920, 1080 // the fake screen without SourceSize
+	ListedMonitorID                         = "mon:fake" // the default listed monitor's ID
+	EncoderName                             = "fake"     // the default probe's encoder (native IM_ENC_FAKE's token)
+)
 
 func NewEngine(cfg EngineConfig) *Engine // implements media.Engine and media.AudioController (05 §13.3)
 
@@ -644,26 +658,43 @@ type Call struct {
 
 Behavior:
 - The fake enforces the native engine's source rules, so core tests take the app's real path: `Pick` returns
-  `PickResult` under a fresh single-use `pick:<n>` ID (or `ErrCancelled` with `Cancel`; it honors ctx and
-  `PickRequest.Timeout`); `Start` consumes it; `Release` forgets an unused one; a listed ID needs `Config.Listed`
-  (else `invalid`).
-- `Start` builds a `fake.Source` with one `VideoLayer` per `LayerConfig`: size = `SourceSize` scaled to `MaxPixels`
-  (aspect kept, even sizes), `FPS = MaxFPS`, `Bitrate` = the initial target, GOP f 4 s / q 2 s; audio when
-  `Config.Audio` is set; profile = `Config.Profile` ("6400" or "42e0"; other keys are `invalid`; Decodable is always
-  "42e0" and refuses "6400" with `CodeInvalid`). It emits one `EventLayer` per layer (with `Profile`, `LiveBitrate`
-  from its encoder, `NoOSIndicator = Config.Borderless`), then media. `Source ""` with no layers and `Audio` set
-  runs audio only; with `AudioConfig.TapPCM` it also emits `KindPCM` chunks of its tone (3840 bytes per 10 ms). A
-  second `Start` while a session runs is `ErrBusy`.
-- `SetBitrate(layer, 0)` is `invalid`. With `Probe.Encoders[0].LiveBitrate == false` every `SetBitrate` forces a
-  `Reinit` keyframe, so tests see what a re-init encoder costs.
+  `PickResult` under a fresh single-use `pick:<n>` ID after `PickDelay` (or `ErrCancelled` with `Cancel`); a
+  `PickDelay` longer than `PickRequest.Timeout` (0 = 120 s, at most 600 s) times out as `ErrCancelled`, a ctx that ends
+  first gives an error matching both `ErrCancelled` and ctx's error, and `Close` ends a waiting `Pick` at once
+  (`stopped`, Reason `closed`). One pick runs at a time: a second concurrent `Pick` is `busy` with Reason
+  `pick_busy`, as natively (04 §5.7: the picker is already open, the UI shows nothing). A pick expires 5 min after it
+  was made and at most 4 unused ones are kept (a fifth evicts the oldest); `Start` consumes it, a failed `Start` keeps
+  it, a consumed, expired, evicted or released one is `source_gone`/`pick_expired`; `Release` forgets an unused one; a
+  listed ID needs `Config.Listed` (else `invalid`).
+- `Start` checks the config as the native engine does (unknown values and 04 §6.4's ranges are `invalid`, a forced
+  encoder the probe lacks is `no_encoder`/`forced_failed`) and builds a `fake.Source` with one `VideoLayer` per
+  `LayerConfig`: size = the picked or listed source's `Width`×`Height` (else `SourceSize`) scaled to `MaxPixels`
+  (aspect kept, even sizes, never upscaled), `FPS = MaxFPS`, `Bitrate` = the initial target, GOP f 4 s / q 2 s; audio
+  when `Config.Audio` is set; profile = `Config.Profile` ("6400" or "42e0"; other keys, `""` and `640c` included, are
+  `invalid`, since 04's binding maps `640c` to High; Decodable is always "42e0" and refuses "6400" with
+  `CodeInvalid`); when the encoder doesn't list the requested profile, the session runs the encoder's first one, as 04
+  §9.6 does, and its `EventLayer`s say so. It emits one `EventLayer` per layer (with `Profile`, `LiveBitrate` from
+  its encoder, `NoOSIndicator = Config.Borderless`), then media. `Source ""` with no layers and `Audio` set runs audio
+  only; with `AudioConfig.TapPCM` it also emits `KindPCM` chunks of its tone (3840 bytes per 10 ms). A second `Start`
+  while a session runs is `busy` with Reason `session_limit` (04 §5.7: "Stop your other share first").
+- `SetBitrate(layer, 0)` is `invalid`. With `Probe.Encoders[0].LiveBitrate == false` every `SetBitrate` that changes a
+  layer's target forces a `Reinit` keyframe, so tests see what a re-init encoder costs; the same target again changes
+  nothing. Only accepted calls are recorded in `Calls`.
 - `SetLayerActive(layer, false)`: no packets on that layer; `true`: it resumes with a keyframe whose `Reinit` is false.
 - `SetPaused(true)`: no video packets (audio goes on unless muted); `SetPaused(false)`: video resumes (the core asks
   for keyframes).
 - `Reconfigure{Profile}` swaps the `fake.Source` for one in the new profile on the same timeline (like
-  `sfutest.ProfileSource`), every layer starting with a `Reinit` keyframe and a new `EventLayer`.
-- `AudioController` follows 05 §13.3 (scripted scenarios). `SetAudioMuted(true)` makes the audio packets carry a
-  constant 20 ms Opus silence frame instead of the tone until `SetAudioMuted(false)`. Calls made while a session runs
-  are recorded in its `Calls` (`"audio_muted"`, `"exclusions"`).
+  `sfutest.ProfileSource`), every layer starting with a `Reinit` keyframe and a new `EventLayer`; it re-initializes
+  also when the profile is the current one (otherwise Decodable, which runs only `42e0`, could not pass check 7). A
+  changed `Preset`, `MaxPixels` or `MaxFPS` re-initializes the layers it affects (frame indices, capture times and
+  flash instants go on from the old layer, so `sfutest.CheckVideoMarkers` keeps working); the same `Preset` again
+  changes nothing; an invalid `Reconfig` changes nothing.
+- `AudioController` follows 05 §13.3 (scripted scenarios). `SetAudioMode` checks the mode first (`AudioEverything`
+  and `AudioTestTone` are `invalid` without a session too, as natively in Go), then needs a running session with audio
+  (`ErrAudioNotRunning`). `SetAudioMuted(true)` makes the audio packets carry a constant 20 ms Opus silence frame
+  instead of the tone, with their Marker kept (its beep flag cleared, since nothing beeps), until
+  `SetAudioMuted(false)`. Calls made while a session runs are recorded in its `Calls` (`"audio_muted"`,
+  `"exclusions"`).
 - `Stats` fills `EngineStats` from the fake source's own counters (`Limit` "none", latencies 0).
 
 ### 6.3 Use outside tests
@@ -682,6 +713,9 @@ type Options struct {
 	TestTone bool   // audio from 04's IM_AUDIO_MODE_TEST_TONE (no audio device needed), requested as
 	                // Config.Audio = &media.AudioConfig{Mode: media.AudioTestTone} (05 §13.1, the one carrier)
 	Encoder  string // Config.Encoder: "" = automatic; "fake" = IM_ENC_FAKE (win-x64-ci build)
+	// SkipBitrate skips check 5 with a message, for an engine whose bitrate does not follow its target: the fake in
+	// Decodable mode (Conformance has no other way to know it runs against it).
+	SkipBitrate bool
 }
 ```
 
@@ -695,22 +729,30 @@ type Options struct {
    within 2 frames.
 5. `SetBitrate("f", 1_000_000)` → when `f`'s `EventLayer.LiveBitrate` is false, wait for its `Reinit` keyframe
    (≤ 11 s, 04 §9.5 defers re-inits up to 10 s); then `f`'s bitrate over the next 4 s within 50–150 % of the target
-   (skipped for the fake in Decodable mode).
+   (skipped with `o.SkipBitrate`: the fake in Decodable mode).
 6. `SetLayerActive("f", false)` → no `f` packets for 1 s while `q` and audio go on; `SetLayerActive("f", true)` →
    `f` resumes with a keyframe within 500 ms.
 7. `Reconfigure{Profile: "42e0"}` → the next `f` and `q` packets are `Reinit` keyframes whose SPS has
    `profile_idc` 66 with `constraint_set1`, and the following `EventLayer`s report `Profile` "42e0".
 8. `Stop` while `Next` blocks → `ErrStopped` within 200 ms; with `o.Listed`, `Start` again with the same `Source`
    works (a picked source would be consumed).
-9. A second `Start` with `Audio` while a session with audio runs → `errors.Is(err, media.ErrBusy)`.
+9. A second `Start` with `Audio` while a session with audio runs → `errors.Is(err, media.ErrBusy)`, and the first
+   session goes on.
 10. `Session.Now()` is within 50 ms of the latest **video** packet's `CaptureNS` plus the time since that packet
-    arrived. For audio (stamped `tick − L − look-ahead`, 05 §10.3, about 55–80 ms old when emitted, §12.1), only
-    `CaptureNS ≤ Now()` and the 20 ms spacing of check 3 are asserted.
+    arrived, sampled 5 times 50 ms apart (one sample outside is tolerated: a scheduler stall on a loaded runner). For
+    audio (stamped `tick − L − look-ahead`, 05 §10.3, about 55–80 ms old when emitted, §12.1), only `CaptureNS ≤
+    Now()` and the 20 ms spacing of check 3 are asserted.
 
-With `Encoder: "fake"` (IM_ENC_FAKE), checks 5 and 7 run only once 04 specifies IM_ENC_FAKE's output (a bitrate
-that follows the target, a CB profile); until then they are skipped with a message.
+The checks run in the order 1, 2, 3, 10, 4, 5, 6, 7, 9, 8 (check 9 while the first session still runs, check 10 right
+after check 3); checks 1 and 2 stop the suite when they fail, the others run on regardless. The suite runs in real
+time, about 15 s. With `Encoder: "fake"` (IM_ENC_FAKE), checks 5 and 7 run: 04 §18.2 specifies IM_ENC_FAKE's output
+(a bitrate that follows the target, a real SPS for the CB profile), and WA23's acceptance includes them.
 
-The fake runs it in CI on every OS (`src` = `mon:fake`, `Listed`). The Windows engine runs it on windows-2025 (06's
+The fake runs it in CI on every OS (`src` = `mon:fake`): Synthetic with `{Listed}`, and Decodable at 640×360 (the app's
+dev and e2e configuration) with `{Listed, TestTone, SkipBitrate}`. Every engine meets the same bounds: the checks
+run in real time, and the pure-Go Decodable encoder can't keep up with real time under coverage counters (atomic under
+`-race`), so the Decodable run skips in coverage builds (`testing.CoverMode() != ""`); `windows-go` and
+`desktop-macos` run it under `-race` without coverage. The Windows engine runs it on windows-2025 (06's
 `windows-desktop`) with the `win-x64-ci` DLL, `test:pattern`, `{Listed, TestTone, Encoder: "fake"}`, and on the
 owner's PC runner with a real monitor (`Listed`) per probed encoder (§14).
 
@@ -747,11 +789,11 @@ Requirements the binding meets (04 §12 implements them; 04 §18 asserts them):
 2. **ABI check** (04 §5.5): `im_version()` major == `media.ABIVersion` (1) and minor ≥ `goMinMinor` (0 in M2); every
    required export resolves: the header's video and session exports and 05's non-test audio exports
    (`im_audio_watch`, `im_audio_unwatch`, `im_set_exclusions`, `im_audio_set_mode`, `im_audio_set_muted`,
-   `im_list_audio_apps`, `im_audio_levels_get`, `im_audio_sound_check`, as 04's header carries them, bound by 05's
-   `internal/media/native/audio_windows.go`). Exports of newer minors resolve as optional and gate their feature;
-   `im_test_*` resolve only through `native.AudioTestHooks`. A failure is `CodeDependency` with Reason `abi` and a
-   detail naming the export or both versions. `Info().ABI = int(im_version() >> 16)`, `Info().Build =
-   im_build_info().engine`.
+   `im_list_audio_apps`, `im_audio_levels_get`, `im_audio_sound_check`, as 04's header carries them, called by 05's
+   `internal/media/native/audio.go`) and the three `im_test_*` exports: all 39 `IM_API` functions of v1.0 are
+   required at load (04 §12.4), and `native.AudioTestHooks` only wraps the test ones. Exports of newer minors resolve
+   as optional and gate their feature. A failure is `CodeDependency` with Reason `abi` and a detail naming every
+   missing export or both versions. `Info().ABI = int(im_version() >> 16)`, `Info().Build = im_build_info().engine`.
 3. **Thread affinity**: every call that can fail runs under `runtime.LockOSThread` together with its `im_last_error`
    read (thread-local), as S1's `engine.do` did.
 4. **Serialization**: one mutex per Session covers only the session control calls (keyframe, bitrate, layer active,
@@ -759,8 +801,9 @@ Requirements the binding meets (04 §12 implements them; 04 §18 asserts them):
    without it (some block: a one-shot `im_list_audio_apps` takes ≤ 500 ms with a 3 s COM limit, `im_audio_sound_check`
    1.5–3 s, and 05's Service calls `im_audio_levels_get` at 10 Hz), so they never delay `im_request_keyframe` or
    `im_set_bitrate` mid-share.
-5. **Structs, not JSON**: input structs and their strings are heap-allocated (`new`, `windows.BytePtrFromString`) and
-   kept alive with `runtime.KeepAlive` until the call returns; the engine copies everything during the call
+5. **Structs, not JSON**: input structs and their strings (NUL-terminated byte slices) live in Go memory and are
+   pinned with a `runtime.Pinner` for the one call (04 §12.4's `addrOf`: arguments reach the DLL as `uintptr` through
+   the `caller` interface, which `runtime.KeepAlive` would not cover); the engine copies everything during the call
    (04 §12.4, 05 §4.3, §13.2). The mapping:
 
    | `media` | Native |
@@ -846,17 +889,32 @@ at resume.
 - What the SFU does with it (M1 02 §8.1, §9.1, §9.5): its NACK generator asks for a missing sequence number every 50 ms,
   at most 10 times, and its filter stops asking once the packet is in its cache; a plain retransmission arrives on the
   media SSRC with its original sequence number and fills the cache slot. Audio is repaired the same way.
+- **The SFU's SRTP replay window is 4096 on its publish PCs** (README §3 item 31, WA28; §10.5): a plain retransmission
+  reuses the original SRTP index, and Pion's default window of 64 per SSRC would drop it before the SFU's packet cache
+  sees it once 64 newer packets of that SSRC arrived (about 77 ms at 8 Mbit/s, about 26 ms while the pacer drains a
+  keyframe at 24 Mbit/s), so most video repairs would be discarded. 4096 matches the responder. Browsers aren't
+  affected: their repairs travel on RTX with fresh sequence numbers. A test receiver of this package sets the same
+  window (`SetSRTPReplayProtectionWindow(NACKResponderSize)`).
 
 ### 8.5 Pacing (D8)
 
 - Video packets of all layers go through one token bucket per Publisher: rate
-  `max(3 × Σ targets of the active video layers, 6 Mbit/s)`, depth 40 ms at that rate, starting full. The targets are
-  the ones the core last applied (`SetPacingTargets(map[string]int)`, called by the core after every rate change).
+  `max(PacingFactor (3) × Σ targets of the active video layers, MinPacingRate (6 Mbit/s))`, depth `PacingDepth`
+  (40 ms) at that rate, starting full. The targets are the ones the core last applied
+  (`SetPacingTargets(map[string]int)`, called by the core after every rate change), keyed by the Source's layer name:
+  the rid in simulcast, while a single layer has no rid but its Source layer (`f`). Targets of layers the Publisher
+  doesn't send (`media.LayerAudio` among them), of layers `SetActive` turned off, and negative ones count 0; the map
+  is copied. "Starting full" means full at the rate in effect when the first packet takes tokens: a
+  `SetPacingTargets` before any packet fills the bucket at the new depth; after that a rate change keeps the tokens,
+  capped at the new depth.
 - The send loop packetizes and hands video packets to a writer goroutine (`pacer.go`) through a queue; audio packets
-  are written by the send loop directly, never behind video.
-- **Backpressure, never drops**: when the queue holds more than 300 ms of data at the pacing rate, the send loop
-  blocks before taking the next video packet from its Source. Dropping is the pump's job (§11.5), which drops whole
-  frames and asks for a keyframe; a packet dropped here would cost a NACK round trip or a PLI.
+  are written by the send loop directly, never queued behind video.
+- **Backpressure, never drops**: when the queue holds more than `PacingBacklog` (300 ms) of data at the pacing rate,
+  the send loop blocks before taking the next packet from its Source. Audio comes from the same `Source.Next`, so it
+  waits too, at most `(queued − PacingBacklog × rate) / rate`; that needs more queued video than 300 ms at the pacing
+  rate (225 KB at the 6 Mbit/s floor, 900 KB at 24 Mbit/s): a keyframe larger than that, or video coming faster than
+  the pacing rate for a while. Dropping is the pump's job (§11.5), which drops whole frames and asks for a keyframe; a
+  packet dropped here would cost a NACK round trip or a PLI.
 - Numbers: an 8 Mbit/s full layer paces at 24 Mbit/s (25.2 with `q`); from a full bucket a 300 KB IDR leaves in
   about 60 ms after the bucket's 120 KB, which a GOP of 4 s makes rare (§12.1).
 - **Opt-in**: `Options.Pacing` (default off) turns the pacer on, so the load test, `sfutest` and every M1 test keep
@@ -874,10 +932,22 @@ at resume.
   order `6400`, `640c`, `42e0` (`640c` only next to `6400`; `42e0` when an available encoder lists it).
 - A `quality.hint` with `codec` (M1 02 §8.3: High → Constrained Baseline when a Firefox viewer joins, and back after
   60 s) runs M1's path: `Publisher.SetProfile`, a re-offer (same `gen`, `neg + 1`), and on the answer the send loop
-  calls `ProfileSource.SetProfile`, which the pump forwards as `Session.Reconfigure{Profile}`. Each layer switches
-  payload type at its first `Reinit` keyframe. A hint naming the profile already sent needs nothing (01 §8.10). If
-  the `EventLayer` after that re-init reports another profile than requested (a CB-only encoder stays CB and returns
-  OK, 04 §9.6), the core re-offers with the actual profile.
+  calls `ProfileSource.SetProfile` (always with an engine key, `EngineProfile`), which the pump forwards as
+  `Session.Reconfigure{Profile}`. **The switch point**: after `SetProfile`, each layer switches payload type at its
+  first keyframe whose SPS has the new profile_idc, and only a keyframe without an SPS in front (which the contract
+  doesn't allow) switches by its `Reinit` flag. So a `Reinit` keyframe still in the old profile (a bitrate re-init, or
+  a CB-only encoder asked for High that stays CB, 04 §9.6) keeps the payload type that names what it really is, and
+  M1's `sfutest.ProfileSource`, which never marks `Reinit`, still switches. When `SetProfile` fails (the core's
+  `Session.Reconfigure` can), the Source goes on in its old profile, its keyframes keep their payload type, and the
+  profile the Source encodes stays as it was, so the next answer that chooses the new profile asks again. A switch
+  between `6400` and its alias `640c`, or on a Source that isn't a `ProfileSource`, changes only the payload type, at
+  the next keyframe, as in M1. A hint naming the profile already sent needs nothing (01 §8.10). If the `EventLayer`
+  after that re-init reports another profile than requested, or `SetProfile` failed, the core re-offers with the
+  actual profile.
+- **API additions** (`profile.go`, README WA16): `HighProfile` (`6400`), `ConstrainedBaselineProfile` (`42e0`) and
+  `HighAlias` (`640c`); `EngineProfile(sdpKey)` (`HighAlias` → `HighProfile`); `OfferProfiles(running, available)`,
+  the `Options.Profiles` rule above in one place. `publish.go` and `pacer.go` export `NACKResponderSize` (4096),
+  `PacingFactor`, `MinPacingRate`, `PacingDepth` and `PacingBacklog`.
 
 ### 8.7 Statistics
 
@@ -898,7 +968,9 @@ type LatencyStats struct {
 }
 ```
 
-`CaptureToSend` needs a `Clock` Source; without one it stays zero.
+`CaptureToSend` needs a `Clock` Source; without one it stays zero. Since an SR's NTP is the capture time of its frame
+(§8.2), not the time it is written, the RTT looks the quoted LSR up among the SRs the track wrote and takes each SR's
+send time just before `WriteRTCP`, so the computed RTT never comes out lower than the real one.
 
 ## 9. Uplink rate control (`internal/client/ratectl`, M2)
 
@@ -926,7 +998,10 @@ func (c *Controller) Live(now time.Time)                                 // the 
 func (c *Controller) Params(p protocol.ShareParams, now time.Time) []Action // a share.update reply (preset change)
 func (c *Controller) Hint(h protocol.QualityHint, now time.Time) []Action
 func (c *Controller) SetLive(layer string, live bool, now time.Time)     // a later EventLayer (encoder fallback, re-init)
-func (c *Controller) SetLimit(limit string, now time.Time)               // media.EventLimit: "cpu" | "gpu" | "none"
+// SetLimit takes the share-wide limit, not one layer's edge: the caller passes "cpu" or "gpu" while any layer's last
+// media.EventLimit is cpu or gpu, and "none" once every layer reported none (04 sends {layer, limit} edges per layer,
+// and one layer's "none" must not clear the CPU hint while another is still limited). Other values count as none.
+func (c *Controller) SetLimit(limit string, now time.Time)
 func (c *Controller) SetTargetHeight(h int)
 func (c *Controller) Tick(now time.Time) []Action                        // every 500 ms
 func (c *Controller) State() State
@@ -986,10 +1061,20 @@ type UploadHint struct {
 
 - Start: `f` at `min(DefaultStartBps (4 Mbit/s), f.ceiling, split f)` (plan: Auto "starts at ~4 Mbps and ramps to
   8 Mbps"); every preset uses the same start in M2.
-- From 2 s after `Live`, every 2 s while no cap binds below the ramp and the encoder is not limited (`SetLimit` cpu or
-  gpu) now or in the last 10 s: `ramp = ramp × 1.15`, until it reaches `f.ceiling` (4 → 8 Mbit/s in 5 steps, 10 s).
-- A congestion hint that lowers `f` holds the ramp for 10 s; after that it grows again toward the cap (or the ceiling
-  once the server lifts the cap).
+- From 2 s after `Live`, every 2 s while `f` is active, no cap binds at or below the ramp and the encoder is not
+  limited (`SetLimit` cpu or gpu) now or in the last 10 s: `ramp = ⌈ramp × RampFactor / 100⌉` with the integer
+  `RampFactor` 115 (×1.15, rounded up, so every full step is at least 15 % and passes the live guard; a float ×1.15
+  produced steps a hair under 15 %), until it reaches `f.ceiling` (4 → 8 Mbit/s in 5 steps, 10 s), and toward the cap.
+  A live `f`'s ramp takes its next step only once its last step applied (the guards may hold one back); a ramp held by
+  the cap doesn't advance its schedule, so it steps at the first `Tick` after the cap rises or goes; the ramp is held
+  while `f` is paused.
+- A hint that lowers `f` through its cap is a backoff: it holds the ramp for 10 s; after that it grows again toward the
+  cap (or the ceiling once the server lifts the cap). That is a `congestion` hint, but also any other non-admin hint
+  with a lower cap, since the server names the pause when a pause change and a lower estimate go out together (M1 02
+  §11); the admin's cap is a policy and holds nothing. Whatever the reason, the ramp starts again from a lower target
+  of `f` only once that target **applies**: a lower target still waiting for its guards when a later hint raises the
+  cap never applies and leaves the ramp where it was (latest wins). So a lifted admin cap, too, ramps back up rather
+  than jumping.
 - When `f`'s encoder has no live bitrate (`Live["f"]` false), it ramps in **one step**: 10 s after `Live`, straight
   to `min(f.ceiling, split f)` when that is ≥ 30 % above the start. On an uplink slower than that step, the
   backoff can apply only 10 s later (§10.1's known limit).
@@ -1007,8 +1092,19 @@ For each layer, `Wanted` becomes `Applied` (an `OpBitrate`) when (chosen **per l
 | re-init | `wanted` differs from `applied` by ≥ 30 % of `applied` (either way), and ≥ 10 s since the layer's last change (plan); smaller changes are not applied at all until they grow to 30 % |
 
 - **Exceptions**: a layer turned active or inactive (`OpActive`) applies at once, with the resumed layer's target in
-  the same step; the first targets (`Initial`) and a `share.update` that changes the preset (new ceilings) apply at
-  once.
+  the same step; the first targets (`Initial`) apply at once; a `share.update` (`Params`) applies at once only for the
+  layers whose ceiling it changed: in M2 every preset has the same ceilings (M1 02 §8.6), so a preset change must not
+  push through a change that is still waiting for its guards (the other layers keep them).
+- **Waivers of the minimum change** (the interval always holds): a live `f`'s ramp step (`wanted` is the ramp, which
+  is above the applied value only right after a ramp step, since the ramp restarts from any lower applied value): the
+  ramp grows by at least 15 %, so only its last step, clamped at the ceiling or the cap, is smaller (6.996 → 8 Mbit/s is
+  14.4 %), and held back it would leave `f` short of the ceiling for good; a live layer's step up to exactly its
+  ceiling (the preview's way back once a cap is lifted); and a decrease of a layer applied above its ceiling, whatever
+  its encoder, since the ceilings carry the admin's cap, which the layer must come down to however small the step
+  (without it an admin cap of 7500 kbit/s would leave `f` at 8 Mbit/s for good). So for a re-init encoder only the
+  admin's cap ever passes a step below 30 %.
+- A switch of a layer from a live to a re-init encoder (`SetLive`) counts as that layer's change at that moment: the
+  new encoder just started, so the 10 s run from then.
 - Audio: `OpAudioBitrate` at once when `ShareParams.AudioBitrate` changes (Opus changes bitrate live).
 - The server already spaces its congestion hints (§10.1); the client's guards matter for the ramp, for re-init
   encoders and for hints of different reasons arriving close together.
@@ -1018,9 +1114,18 @@ For each layer, `Wanted` becomes `Applied` (an `OpBitrate`) when (chosen **per l
 - Required bitrate for height `h` at the layer's frame rate: `req(h) = 0.05 × (h × aspect) × h × fps` bit/s
   (1080p60: 6.2 Mbit/s; 720p60: 2.8; 540p60: 1.6; 360p60: 0.7; half of each at 30 fps).
 - `approx = max{h ∈ 360, 480, 540, 720, 900, 1080 : req(h) ≤ applied f}` (360 if none).
-- **Limited** when the server's cap binds (the split for `f` from the cap is below `f.ceiling`), and
-  `approx < 0.95 × TargetHeight`, for 3 consecutive `Tick`s 2 s apart (6 s), the web sharer's rule (M1 05 §13.7).
-  It clears after 10 s without that condition. The ramp alone never shows it.
+- **Limited** when the server's cap binds (the split for `f` from the cap is below `f.ceiling`), `f` is active, and
+  `approx < 0.95 × TargetHeight` (`TargetHeight` 0 shows nothing), on every `Tick` for 6 s (the web sharer's 3 samples
+  2 s apart, M1 05 §13.7). It clears 10 s after the last `Tick` that saw the condition; `Upload` reads off once those
+  10 s passed even without a `Tick`, and a run that starts after such a gap (Ticks pause while the share isn't live)
+  has to last 6 s again. While on, `approx` follows the applied `f`.
+- The ramp alone never shows it: while the ramp is below the cap's split (it climbs toward the cap, or a backoff holds
+  it), a `Tick` that sees the condition is neutral: it keeps a run that is going on (a cap raised during a backoff's
+  hold doesn't restart the 6 s) but starts none.
+- **Bounds on server values**: the frame rate is the encodings' `MaxFramerate` within 04 §6.4's 1–240 (60 when none
+  is given), the aspect `Config.SourceAspect` within 1:4 to 8:1 (16/9 otherwise), the cap at most 1 Gbit/s, and
+  `req` is compared as a float, so no server value can overflow the arithmetic or reach a platform-dependent
+  float-to-int conversion.
 - The app shows "Your upload allows about {approx}p" (03); the same `ShareHint {kind: 'upload-limited', approxHeight}`
   shape as the web sharer.
 - **CPU hint**: `CPU(now)` is true while the last `SetLimit` was `cpu` or `gpu`. 04 already applies the hysteresis
@@ -1033,14 +1138,15 @@ For each layer, `Wanted` becomes `Applied` (an `OpBitrate`) when (chosen **per l
 | Name | Value |
 |---|---|
 | `DefaultStartBps` | 4 000 000 |
-| `RampFactor`, `RampEvery`, `RampDelay` | 1.15, 2 s, 2 s after live |
+| `RampFactor`, `RampEvery`, `RampDelay` | 115 (an integer percent: ×1.15, each step rounded up), 2 s, 2 s after live |
+| `OneStepDelay` | 10 s after live (the one step of a re-init `f`, §9.3) |
 | `HoldAfterCongestion`, `HoldAfterLimit` | 10 s, 10 s |
-| `MinChange`, `MinInterval` (live) | 15 %, 2 s |
-| `ReinitMinChange`, `ReinitMinInterval` | 30 %, 10 s |
+| `MinChange`, `MinInterval` (live) | 15 (percent), 2 s |
+| `ReinitMinChange`, `ReinitMinInterval` | 30 (percent), 10 s |
 | `FloorF`, `FloorQ`, `QShare` | 250 kbit/s, 150 kbit/s, 0.3 |
-| Engine ranges (04 §6.4) | `f` 100 kbit/s–50 Mbit/s; other layers 50 kbit/s–2 Mbit/s; Opus 32–510 kbit/s |
+| Engine ranges (04 §6.4) | `MinBitrateF`–`MaxBitrateF` 100 kbit/s–50 Mbit/s; `MinBitrateLayer`–`MaxBitrateLayer` 50 kbit/s–2 Mbit/s; `MinBitrateAudio`–`MaxBitrateAudio` 32–510 kbit/s |
 | `TickEvery` | 500 ms |
-| Upload hint on / off | 6 s (3 samples 2 s apart) / 10 s |
+| `UploadOn` / `UploadOff`, `UploadBelow` | 6 s (3 samples 2 s apart) / 10 s, 95 (percent of `TargetHeight`) |
 | `BitsPerPixel` | 0.05 |
 
 ## 10. Server counterparts (M2)
@@ -1224,6 +1330,15 @@ type OwnConnection struct {
 - It is how a web tab learns that the user's desktop app is online, for 03 §12.3's "Open in the isshoni app", and
   which connection id (the `desktop` connection with role `publisher`) to address with `playback.state` (§11.11).
   Only the user's own connections ever see it (01 §17: OS and version stay private).
+
+### 10.5 The publish PCs' settings (SFU)
+
+M1's `SettingEngine` for publish PCs (`internal/server/sfu/api.go`, `pubSettings`) stays as built, with one M2 change
+(README §3 item 31, WA28): `SetSRTPReplayProtectionWindow(4096)`, a local constant citing D7 and §8.4, so a plain
+retransmission from the native publisher's 4096-packet NACK responder is accepted however far behind the newest packet
+of its SSRC it is, up to 4096. Only the publish PCs get it; subscribe and probe PCs keep Pion's default, and the SRTCP
+window stays Pion's default on every PC (repairs are RTP). WA28's test sends, through `sfutest.FaultConn`, a
+retransmission more than 64 and up to 4096 packets behind and sees it accepted (§14).
 
 ## 11. The client core (`internal/client/core`, M2)
 
@@ -1474,7 +1589,8 @@ Session.Next ──► pump goroutine ──► per-kind queues ──► consum
     `ratectl.SetTargetHeight` (for `f`) and `ratectl.SetLive`; the first one per layer sets the Publisher's profile
     (§11.4 step 4); one after a `SetProfile` re-init that reports another profile than requested makes the core
     re-offer with the actual profile (§8.6).
-  - `EventLimit`: `ratectl.SetLimit` and the layer's `Limit`.
+  - `EventLimit`: the layer's `Limit`, and `ratectl.SetLimit` with the share-wide value: `cpu` or `gpu` while any
+    layer's last limit is one of them, `none` once every layer reported `none` (§9.1).
   - `EventEncoderChanged`: the layer's encoder in the snapshot and `EventNotice{"encoder_fallback", {encoder}}`. The
     share id, the Publisher and the pub PC stay; 04 re-inits the layer with a `Reinit` keyframe, and decoders handle
     the new SPS at the IDR.
@@ -1694,20 +1810,46 @@ const (
 	KindExclusionsSet = "exclusions.set" // reserved (M4)
 )
 
-// PlaybackStop: "Now watching in the isshoni app" (03 §12.2). V = 1. Sender: the desktop SPA (C1), with
-// toRole "full", once each time the user brings the app into a room. Receiver rules (rooms/handoff.ts): v === 1,
+// PlaybackStop: "Now watching in the isshoni app" (03 §12.2). V = PlaybackStopVersion. Sender: the desktop SPA (C1),
+// with toRole "full", once each time the user brings the app into a room. Receiver rules (rooms/handoff.ts): v === 1,
 // roomId equals the session's room, from is a desktop connection of the user in room.state; anything else ignored.
+const PlaybackStopVersion = 1
+
 type PlaybackStop struct {
 	V      int    `json:"v"`
 	RoomID string `json:"roomId"`
 }
 
-// PlaybackState: a web tab reports whether it plays isshoni audio, so 05 can keep that browser out (05 §5.9).
+// Browser families of PlaybackState.Browser (05 §5.4's families plus other); tygo makes them the TS union Browser. A
+// web tab maps its M1 client.browser to one: chrome, edge and firefox as they are, anything else (safari included) to
+// other.
+const (
+	BrowserChrome  = "chrome"
+	BrowserEdge    = "edge"
+	BrowserFirefox = "firefox"
+	BrowserOther   = "other"
+)
+
+// PlaybackState: a web tab reports whether it plays isshoni audio, so 05 can keep that browser out (05 §5.9). No v
+// (README §3 item 21).
 type PlaybackState struct {
 	Playing bool              `json:"playing"`
-	Browser string            `json:"browser"` // "chrome" | "edge" | "firefox" | "other" (05 §5.4 families)
+	Browser string            `json:"browser" tstype:"Browser"` // one of the four families
 	OS      protocol.ClientOS `json:"os"`
 }
+
+// Validate checks what every receiver checks of the payload alone: PlaybackStop's v and room id (1–64 of
+// [A-Za-z0-9_-]); PlaybackState's browser family (rule 1 below; os is not checked, 05 acts on windows only). Errors
+// are a *protocol.FieldError naming the field, never its value.
+func (p PlaybackStop) Validate() error
+func (p PlaybackState) Validate() error
+
+// DecodePlaybackStop and DecodePlaybackState decode a payload and validate it; every error wraps ErrInvalidPayload
+// with a *protocol.FieldError ("payload" when it isn't an object of the kind's shape). Unknown fields are ignored.
+func DecodePlaybackStop(payload json.RawMessage) (PlaybackStop, error)
+func DecodePlaybackState(payload json.RawMessage) (PlaybackState, error)
+
+var ErrInvalidPayload = errors.New("relay: invalid payload")
 ```
 
 ```json
@@ -1926,11 +2068,12 @@ The component the client core owns, capture → last packet sent, is measured on
 | First keyframe after `Start` | ≤ 500 ms | §5.3 |
 | Forced IDR spacing in the engine | ≤ 1 per layer per 250 ms (04 §6.4) | §5.3 |
 | Picks | single use; expire after 5 min; ≤ 4 unused kept; picker 120 s default, ≤ 600 s (04) | §5.1 |
-| Sessions per engine | native ≤ 4, ≤ 1 with audio; fake 1 | §5.3 |
+| Sessions per engine | `Start`: 1 (native and fake); native `StartExtra` (enginetest): ≤ 4, video only | §5.3 |
 | Pump queues | video 6 frames per layer, audio 10 packets | §11.5 |
 | Keyframe requests to the engine | ≤ 1 per layer per 300 ms | §8.3, §11.5 |
 | Pacer | max(3 × targets, 6 Mbit/s), depth 40 ms, backpressure at 300 ms queued | §8.5 |
 | NACK responder | 4096 packets per SSRC | §8.4 |
+| SFU SRTP replay window (publish PCs) | 4096 packets per SSRC (Pion's default is 64) | §8.4, §10.5 |
 | Packet checks | per 04 §6.2's rings; PCM exactly 3840 B | §7.1 |
 | Share start | ≤ 30 s overall (server start timeout); `StartShare` returns after `Engine.Start` (03 gives it 10 s) | §11.4 |
 | `Auth.SessionEnded` call | ≤ 15 s, before `Run` returns | §11.3 |
@@ -1960,13 +2103,13 @@ self-hosted runner (06 names its labels).
 | Package | What is asserted | Where |
 |---|---|---|
 | `internal/media` | `Error.Is` by code (also with a Reason), `errors.Is(wrapped, media.ErrSourceGone)`, `Is(media.ErrAudioNotRunning)` for `CodeAudioNotRunning`; `Error()` formats; `AudioCapsFromFlags` for all 16 values of the four bits (`Backend` "process-loopback" whenever 0x1 is set, "endpoint" with only 0x2 of the loopback bits, else "none"; unknown higher bits ignored) | Mac, CI ubuntu |
-| `internal/media/fake` | `fake.Engine` passes `mediatest.Conformance` (Synthetic; Decodable minus check 5); single-use picks, `Release`, `Listed` enforcement; `SetBitrate(0)` is `invalid`; `SetLayerActive` pause and resume (keyframe, no `Reinit`); `SetPaused` stops video only; re-init mode marks `Reinit`; `Reconfigure{Profile}` swaps the SPS and emits `EventLayer`; audio-only and `TapPCM` sessions; `Pick` cancel, timeout and ctx; `Fail`, `Emit`, `Calls` (incl. `audio_muted`); the `AudioController` scenarios are 05's tests; M1's tests unchanged except reading flags from Markers | Mac, CI ubuntu, macos; CI windows (06's `windows-go`) |
-| `internal/media/native` | 04 §12 and §18.3: the binding's fake-caller tests (04 owns them); among their assertions, §7.1's requirements: ABI major/minor and export checks (05's audio exports required, `im_test_*` optional), the status and event tables of §5.2, `Next` honors ctx within 50 ms, the copy rule, packet validation (audio layer value, PCM size), `EventLayer` before every `REINIT` | Mac, CI ubuntu (logic); CI windows (`windows-go`; with the DLL, `windows-desktop`, 04 §18.2) |
-| `internal/client/publish` | M1 suite unchanged (pacing off by default); SR NTP equals `wall(now) − (Now − capture)` within 1 ms with a `Clock` Source whose packets are 25 ms old; pacer at 24 Mbit/s: a 300 KB frame's last packet leaves after 55–70 ms from a full bucket and 95–110 ms from an empty one, and audio written meanwhile is not delayed > 2 ms; backpressure blocks `Next` and never drops; responder size 4096 (a NACK for a packet 3000 back is answered); RTT from a crafted RR; `CaptureToSend`; `KindPCM` dropped | Mac, CI |
+| `internal/media/fake` | `fake.Engine` passes `mediatest.Conformance` (Synthetic; Decodable minus check 5, skipped in coverage builds, §6.4); single-use picks, `Release`, `Listed` enforcement; `SetBitrate(0)` is `invalid`; `SetLayerActive` pause and resume (keyframe, no `Reinit`); `SetPaused` stops video only; re-init mode marks `Reinit`; `Reconfigure{Profile}` swaps the SPS and emits `EventLayer`; audio-only and `TapPCM` sessions; `Pick` cancel, timeout and ctx; `Fail`, `Emit`, `Calls` (incl. `audio_muted`); the `AudioController` scenarios are 05's tests; M1's tests unchanged except reading flags from Markers | Mac, CI ubuntu, macos; CI windows (06's `windows-go`) |
+| `internal/media/native` | 04 §12 and §18.3: the binding's fake-caller tests (04 owns them); among their assertions, §7.1's requirements: ABI major/minor and export checks (all 39 exports required, 05's audio and the `im_test_*` exports included), the status and event tables of §5.2, `Next` honors ctx within 50 ms, the copy rule, packet validation (audio layer value, PCM size), `EventLayer` before every `REINIT` | Mac, CI ubuntu (logic); CI windows (`windows-go`; with the DLL, `windows-desktop`, 04 §18.2) |
+| `internal/client/publish` | M1 suite unchanged (pacing off by default); SR NTP equals `wall(now) − (Now − capture)` within 1 ms with a `Clock` Source whose packets are 25 ms old; pacer at 24 Mbit/s: a 300 KB frame's last packet leaves after 55–70 ms from a full bucket and 95–110 ms from an empty one, and audio written meanwhile is not delayed > 2 ms; backpressure blocks `Next` and never drops; responder size 4096 (a NACK for a packet 3000 back is answered, with a receiver whose SRTP replay window is 4096 like the SFU's, §8.4); RTT from a crafted RR; `CaptureToSend`; `KindPCM` dropped | Mac, CI |
 | `internal/client/ratectl` | table tests at fixed instants: initial targets per preset; split examples of §9.2; clamps to 04 §6.4's ranges; ramp 4 → 8 Mbit/s in 5 steps and 10 s; congestion hold; live guards (15 %, 2 s, latest wins) and re-init guards (30 %, 10 s, one-step ramp) chosen per layer, `SetLive` switching a layer mid-share; `OpActive` at once with the resume target; admin cap; upload hint on after 6 s with a binding cap, never during the ramp, off after 10 s; `SetLimit` cpu/gpu → `CPU` true and the ramp held for 10 s after `none` | Mac, CI |
 | `internal/protocol` | fixtures for `share.update{paused}`, `room.state` with `paused`, `user.connections` with `deviceName`; compat replay of v1 fixtures; validation ignores nothing new | Mac, CI |
 | `internal/protocol/relay` | round-trip fixtures for `playback.stop` (`{v: 1, roomId}`) and `playback.state`; tygo drift check covers `relay.gen.ts` | Mac, CI |
-| `internal/server/sfu` | `nativeUplink` table tests per §10.1 row (fixed stats sequences → decisions), including the delay rows: `delay ≥ 40 ms` on one tick doesn't back off, on two it does (to 0.85 × rate, never above the current estimate); growth blocked at `delay ≥ 15 ms`, allowed when unknown; `RawLossPct` counts gaps before repair; queueing delay at fixed instants: samples only at a frame's first packet (not retransmissions, padding or an older timestamp), unwrap across the 32-bit timestamp wrap, 500 ms window minimum, baseline rising ≤ 0.5 ms per s under a simulated +300 ppm sender drift (`QueueDelay` stays < 5 ms) and dropping at once when a queue drains, −1 with < 3 samples and in the first 2 s; hint spacing 15 %/2 s; `sharerPaused` swallows keyframe requests and requests one per watched layer on unpause; web and tool kinds keep `m1Uplink` | Mac, CI |
+| `internal/server/sfu` | `nativeUplink` table tests per §10.1 row (fixed stats sequences → decisions), including the delay rows: `delay ≥ 40 ms` on one tick doesn't back off, on two it does (to 0.85 × rate, never above the current estimate); growth blocked at `delay ≥ 15 ms`, allowed when unknown; `RawLossPct` counts gaps before repair; queueing delay at fixed instants: samples only at a frame's first packet (not retransmissions, padding or an older timestamp), unwrap across the 32-bit timestamp wrap, 500 ms window minimum, baseline rising ≤ 0.5 ms per s under a simulated +300 ppm sender drift (`QueueDelay` stays < 5 ms) and dropping at once when a queue drains, −1 with < 3 samples and in the first 2 s; hint spacing 15 %/2 s; `sharerPaused` swallows keyframe requests and requests one per watched layer on unpause; web and tool kinds keep `m1Uplink`; the publish PCs' SRTP replay window (§8.4): a plain retransmission more than 64 and up to 4096 packets behind the newest is accepted, through `sfutest.FaultConn` (README WA28) | Mac, CI |
 | `internal/server/sfu/sfutest` | `NewQueueLink`: departures at the capacity in FIFO order, `Queued()` grows by `size × 8 / capacity` per datagram, RTP lost only beyond `limit`, STUN/DTLS/RTCP never lost; `ReadFrom` delivers at the departure time; other peers pass at once; `Close` ends the reader goroutine (goleak); `SetLink` with a queueing Link panics; M1's `Link` tests unchanged | Mac, CI |
 | `internal/server/signal` | `paused` ignored without the feature; status precedence stalled > paused > live; pause of a starting share; any same-user connection may pause; `user.connections` on welcome, open, close, detach, room change, and after a `Revalidate` that changed `DeviceName`; coalesced ≤ 1/200 ms, only to feature holders of the same user | Mac, CI |
 | `internal/client/core` (unit, with `signaltest`-style fake server where cheap) | stop table of §11.3: forced refresh once; `Auth.SessionEnded` called (bounded 15 s) before `Run` returns on `session_revoked`, `account_disabled` and a second `unauthenticated`; `RelinkRequired` → `unlinked`; `UpdateRequired` → `update_required`; `StopError.Err` carries the server error's params; `Run` after return or `Close` → `ErrClosed`; `Close` waits ≤ 3 s; `StartShare` → `ErrNotReady` when not online, ctx cancel aborts cleanly; `Status.ConnectionID` and its `EventStatus`; `playback.state` rules 1–3; `EventShare` not fired by live counters; subscriber overflow → `EventResync` | Mac, CI |
@@ -2104,7 +2247,7 @@ go vet ./...` (M1); the gomobile check of §4.
   (§5.1: no `Mode`, no `Degraded`); E7's comparison of layer-0 VBV at 0.5 s against 0.1–0.2 s (frame-size p99, g2g
   p95 with cuts, text quality after the static refresh), with the chosen value recorded in 04 §9.3 (§12.1).
 - **05-windows-audio.md**: `audio.go` (`AudioConfig`, `AudioMode`, `Exclusions`, `AudioController`, `AudioReport`,
-  …) and `internal/media/native/audio_windows.go`; the fake's `AudioController` with 05 §13.3's scenarios;
+  …) and `internal/media/native/audio.go`; the fake's `AudioController` with 05 §13.3's scenarios;
   `Service.AudioConfig()` and `SetViewerBrowser`; `SetAudioMuted` semantics on pause (10 ms fade, silent frames);
   audio never fails `Start` or `Next`; the audiotest's audio-only sessions and `KindPCM` through `media.Session.Next`;
   `AudioTestTone` as the test-tone carrier for Conformance (`AudioConfig.Mode`, 05 §13.1); `AudioEverything` rejected

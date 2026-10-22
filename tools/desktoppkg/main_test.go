@@ -64,7 +64,7 @@ func TestUsageListsEveryCommand(t *testing.T) {
 func TestNotImplemented(t *testing.T) {
 	root := t.TempDir()
 	for cmd, slice := range map[string]string{
-		"winver": "WA67", "stage": "WA67", "nsis": "WA67", "check": "WA67", "manifest": "WA25",
+		"winver": "WA67", "stage": "WA67", "nsis": "WA67", "check": "WA67",
 	} {
 		code, _, stderr := runCmd(t, "-root", root, cmd)
 		want := "desktoppkg " + cmd + ": not implemented yet (slice " + slice + ")"

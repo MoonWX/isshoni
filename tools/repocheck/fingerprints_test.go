@@ -26,11 +26,14 @@ func withoutFile(files map[string]string, name string) map[string]string {
 // README.md (06 §9.4, §10.3).
 func TestCheckKeysReadme(t *testing.T) {
 	notCreatedReadme := readmeWith("not created yet", "not created yet") // the README as F05 wrote it
-	// A rotation: the old key is marked valid-before, a new one, without a comment, is added.
-	rotated := strings.Replace(releaseKey.line, `"isshoni-checksums"`, `"isshoni-checksums",valid-before="20271231"`, 1) +
-		"\n" + backupKey.line + "\n" + `isshoni-release namespaces="isshoni-checksums" ` + otherKey.key + "\n"
+	// A rotation: a new key, without a comment, is added next to the old one, whose line goes in a later release.
+	// Marking the old one valid-before would break Windows 10's OpenSSH 8.1 (06 §7.2).
+	rotated := releaseKey.line + "\n" + backupKey.line + "\n" + `isshoni-release namespaces="isshoni-checksums" ` +
+		otherKey.key + "\n"
 	rotatedReadme := strings.Replace(goodReadme, "| `isshoni-release-backup-1`",
 		"| (new) | signs every release from 2028 | "+otherKey.fingerprint+" |\n| `isshoni-release-backup-1`", 1)
+	validBefore := strings.Replace(rotated, `"isshoni-checksums" ssh`, `"isshoni-checksums",valid-before="20271231" ssh`, 1)
+	certAuthority := strings.Replace(rotated, `isshoni-release namespaces`, `isshoni-release CERT-AUTHORITY,namespaces`, 1)
 	staleRow := "| `isshoni-release-0` | replaced | " + otherKey.fingerprint + " |\n"
 	mistyped := releaseKey.fingerprint[:len(releaseKey.fingerprint)-1]
 	noKey := releaseKey.line + "\n" +
@@ -73,8 +76,25 @@ func TestCheckKeysReadme(t *testing.T) {
 			files: withFile(keyTree(goodScript, signers), "README.md", strings.Replace(goodReadme, "## Release signing keys", "## Release signing keys ##", 1)),
 		},
 		{
-			name:  "rotation: a valid-before option and a key without a comment",
+			name:  "rotation: a key without a comment",
 			files: withFile(keyTree(scriptWith(rotated), rotated), "README.md", rotatedReadme),
+		},
+		{
+			// 06 §7.2: Windows 10's inbox OpenSSH 8.1 parses only namespaces= and cert-authority.
+			name:  "rotation: a valid-before option fails the OpenSSH 8.1 rule",
+			files: withFile(keyTree(scriptWith(validBefore), validBefore), "README.md", rotatedReadme),
+			wantErr: []string{`deploy/keys/allowed_signers line 1: the option valid-before="20271231" is not one that ` +
+				"Windows 10's OpenSSH 8.1 parses", "delete its line instead"},
+		},
+		{
+			name:  "cert-authority passes the OpenSSH 8.1 rule, in any case",
+			files: withFile(keyTree(scriptWith(certAuthority), certAuthority), "README.md", rotatedReadme),
+		},
+		{
+			name: "an unknown option fails the OpenSSH 8.1 rule",
+			files: withFile(keyTree(scriptWith(strings.Replace(rotated, "namespaces=", "no-touch-required,namespaces=", 1)),
+				strings.Replace(rotated, "namespaces=", "no-touch-required,namespaces=", 1)), "README.md", rotatedReadme),
+			wantErr: []string{"line 1: the option no-touch-required is not one"},
 		},
 		{
 			name:  "rotation: the new key's fingerprint is missing",
@@ -265,10 +285,11 @@ func TestParseAllowedSigners(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	const file = "deploy/keys/allowed_signers"
 	want := []signerKey{
-		{line: 3, name: releaseKey.name, fingerprint: releaseKey.fingerprint},
-		{line: 4, name: backupKey.name, fingerprint: backupKey.fingerprint},
-		{line: 5, name: "", fingerprint: otherKey.fingerprint},
+		{file: file, line: 3, name: releaseKey.name, fingerprint: releaseKey.fingerprint},
+		{file: file, line: 4, name: backupKey.name, fingerprint: backupKey.fingerprint},
+		{file: file, line: 5, name: "", fingerprint: otherKey.fingerprint},
 	}
 	if len(keys) != len(want) {
 		t.Fatalf("parseAllowedSigners = %+v, want %+v", keys, want)

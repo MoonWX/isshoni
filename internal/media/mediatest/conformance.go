@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -139,6 +140,7 @@ type rec struct {
 	err error
 	at  time.Time // when Next returned
 	now int64     // Session.Now() right after Next returned
+	seq uint64    // its place in the reader's order: 1 for the session's first record
 }
 
 // reader is the one goroutine that calls a session's Next.
@@ -146,7 +148,13 @@ type reader struct {
 	ch     chan rec
 	done   chan struct{}
 	cancel context.CancelFunc
+	pulled atomic.Uint64 // records Next has returned so far
 }
+
+// mark is the place in the reader's order before a control call: the records that answer the call come after it
+// (rc.seq > mark). Wall-clock times can't tell: Windows' clock advances in timer ticks of up to 15.6 ms, so a quick
+// answer often has the call's own time.
+func (r *run) mark() uint64 { return r.rd.pulled.Load() }
 
 func startReader(s media.Session) *reader {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -156,7 +164,7 @@ func startReader(s media.Session) *reader {
 		defer close(r.ch)
 		for {
 			p, err := s.Next(ctx)
-			rc := rec{pkt: p, err: err, at: time.Now(), now: s.Now()}
+			rc := rec{pkt: p, err: err, at: time.Now(), now: s.Now(), seq: r.pulled.Add(1)}
 			if ctx.Err() != nil {
 				return
 			}
@@ -532,11 +540,11 @@ func (r *run) checkKeyframe(t *testing.T) {
 	if !quiet() && !r.until(t, 2*time.Second, func(rec) bool { return quiet() }) && !quiet() {
 		t.Fatal("no keyframe on f to wait from")
 	}
-	asked := time.Now()
+	asked := r.mark()
 	r.sess.RequestKeyframe("f")
 	frames, key := 0, false
 	r.until(t, 2*time.Second, func(rc rec) bool {
-		if rc.pkt.Kind != media.KindVideo || rc.pkt.Layer != "f" || !rc.at.After(asked) {
+		if rc.pkt.Kind != media.KindVideo || rc.pkt.Layer != "f" || rc.seq <= asked {
 			return false
 		}
 		frames++
@@ -555,7 +563,7 @@ func (r *run) checkBitrate(t *testing.T) {
 		t.Skip("skipped: this engine's bitrate does not follow its target (Options.SkipBitrate)")
 	}
 	live := r.info["f"].LiveBitrate
-	set := time.Now()
+	set, setSeq := time.Now(), r.mark()
 	if err := r.sess.SetBitrate("f", bitrateTarget); err != nil {
 		t.Fatalf("SetBitrate(f, %d): %v", bitrateTarget, err)
 	}
@@ -563,7 +571,7 @@ func (r *run) checkBitrate(t *testing.T) {
 	if !live {
 		var reinit rec
 		if !r.until(t, reinitBound, func(rc rec) bool {
-			if rc.pkt.Kind == media.KindVideo && rc.pkt.Layer == "f" && rc.pkt.Reinit && rc.at.After(set) {
+			if rc.pkt.Kind == media.KindVideo && rc.pkt.Layer == "f" && rc.pkt.Reinit && rc.seq > setSeq {
 				reinit = rc
 				return true
 			}
@@ -628,13 +636,13 @@ func (r *run) checkLayerActive(t *testing.T) {
 	if r.cfg.Audio != nil && audio < 25 {
 		t.Errorf("%d audio packets in %v while f was inactive, want audio to go on", audio, inactiveWindow)
 	}
-	on := time.Now()
+	on, onSeq := time.Now(), r.mark()
 	if err := r.sess.SetLayerActive("f", true); err != nil {
 		t.Fatalf("SetLayerActive(f, true): %v", err)
 	}
 	var first rec
 	if !r.until(t, 2*resumeBound, func(rc rec) bool {
-		if rc.pkt.Kind == media.KindVideo && rc.pkt.Layer == "f" && rc.at.After(on) {
+		if rc.pkt.Kind == media.KindVideo && rc.pkt.Layer == "f" && rc.seq > onSeq {
 			first = rc
 			return true
 		}
@@ -654,7 +662,7 @@ func (r *run) checkLayerActive(t *testing.T) {
 // checkProfile is check 7.
 func (r *run) checkProfile(t *testing.T) {
 	r.needSession(t)
-	asked := time.Now()
+	asked := r.mark()
 	if err := r.sess.Reconfigure(media.Reconfig{Profile: "42e0"}); err != nil {
 		t.Fatalf("Reconfigure{Profile: 42e0}: %v", err)
 	}
@@ -662,7 +670,7 @@ func (r *run) checkProfile(t *testing.T) {
 	done := map[string]bool{}
 	ok := r.until(t, reconfigureBound, func(rc rec) bool {
 		p := rc.pkt
-		if !rc.at.After(asked) {
+		if rc.seq <= asked {
 			return false
 		}
 		switch {

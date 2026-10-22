@@ -1,7 +1,8 @@
 // Package sfu is isshoni's selective forwarding unit on Pion (docs/m1/02-sfu.md): rooms, participants and
 // connections, shares with two simulcast layers, keyframe-aligned layer switches, NACK/RTX from a shared packet
-// cache, forwarded sender reports, downlink adaptation, uplink control (the admin's cap, layer pausing), a per-room
-// H.264 profile policy and viewers without H.264.
+// cache, forwarded sender reports, downlink adaptation, uplink control (the admin's cap, layer pausing, and M2's
+// estimator of a native publisher's uplink), the sharer's pause, a per-room H.264 profile policy and viewers without
+// H.264.
 //
 // The SFU never imports signal or protocol: 01's sfuplane adapter is the only translator between this package and
 // the wire. Signal calls the methods of *SFU and *Conn (02 §6.1); the SFU answers through each Conn's Signaler and
@@ -107,6 +108,16 @@
 //     of Share.paused (the downlink allocators weigh a paused or just resumed layer at its maximum, allocRate). The
 //     viewers' requests reach the policy as each subscriber's actor published them (Subscription.shown), and a request
 //     for high has that actor post a look after it published it, so the look sees it.
+//   - M2's native uplink estimator (uplink_native.go, M2 01 §10.1) is one more such policy, for the shares of desktop
+//     and mobile clients. What it reads besides the policy's stats are atomics: each layer's raw loss and queueing
+//     delay, which the ticker computes, and the sharer's own pause (Share.sharerPaused, Share.sharerResumedAt),
+//     which only the publishing Conn's actor writes (UpdateShare). A video Layer's queueing-delay trend (delayTrend)
+//     has a leaf lock of its own: the Layer's RTP loop takes it to sample the first packet of each frame, the ticker
+//     once a second to compute the delay; neither holds another lock then. The ticker's seconds are counted
+//     (SFU.uplinkGen, an atomic it adds to once the layers have their stats), so the estimator runs its rows once
+//     per second of stats, also when the actor looks more often. While the sharer has paused the share, a keyframe
+//     request for it does nothing (Layer.requestKeyframe), like one for a paused layer, and the downlink allocators
+//     weigh its video layers as paused ones; its end stores Share.resumedAt before it clears the pause.
 //   - WriteRTP and WriteRTCP are media calls, not signaling calls: the media goroutines make them, and so may any
 //     actor, also for another Conn's pub PC (a keyframe request). Pion allows them from any goroutine and they
 //     never block. Keyframe requests are throttled per layer by a compare-and-swap, so callers need no lock.
@@ -226,6 +237,16 @@
 //     encodings and Resync say the same. While every share of a pub PC has a cap, the PC gets a REMB of their sum
 //     every second, naming their video layers, and three REMBs of no limit once the cap is gone. Layers measure
 //     their interarrival jitter for the policy (RFC 3550), one sample per frame;
+//   - uplink_native.go: M2's native uplink estimator (M2 01 §10.1), the policy of the shares of desktop and mobile
+//     clients; every other kind keeps M1's. It embeds M1's policy and caps the share at the smaller of the admin's
+//     cap and an estimate: 80 % of what arrived after loss before repair (LayerUplinkStats.RawLossPct, counted at
+//     each gap), 85 % of the rate once the queueing delay (LayerUplinkStats.QueueDelay: the minimum one-way delay of
+//     each frame's first packet over 500 ms, above a baseline that rises at most 0.5 ms per s) has been 40 ms or more
+//     on two ticks, and 10 % more every 2 s once both are low, until it is none again. Its changes reach the sharer
+//     as hints with the reason congestion, at least 15 % and 2 s apart; admin and pause changes go out at once. The
+//     sharer's own pause (share.update{paused}, Share.sharerPaused) makes keyframe requests for the share do nothing
+//     and the estimator skip its ticks; its end asks each watched video layer for a keyframe. The publish PCs keep an
+//     SRTP replay window of 4096 packets (api.go), so a native publisher's plain retransmissions are accepted;
 //   - events.go, errors.go, types.go, config.go, stats.go: the whole interface of 02 §6 and §13;
 //   - stats.go, counters.go, pionlog.go: observability (02 §13). Conn.Stats, SFU.Snapshot and SFU.Metrics never ask
 //     an actor and never wait: they read what the Layers and DownTracks measure (their rates are the ticker's, once
@@ -314,8 +335,8 @@
 //
 // The whole API of 02 §6 is implemented (README S76 did the last method, Probe), and the sentinel ErrNotImplemented
 // that the unbuilt methods wrapped is gone; so are the reports of 02 §13 (README S79), downlink adaptation (README
-// S84) and uplink control (README S88). What M1 still adds here is what its load gate finds (README S92). M2 brings
-// an UplinkPolicy for its native publishers (an estimator of their uplink, 02 §11).
+// S84) and uplink control (README S88). What M1 still adds here is what its load gate finds (README S92). M2's
+// native uplink estimator and the sharer's pause came with M2 WA28 (M2 01 §10.1, §10.3).
 //
 // The server's cap on a subscription (02 §10.1: effective = min(requested, cap), with its reason) is the downlink
 // allocator's (Conn.capSubscription, reason bandwidth; server_limit is M5's); the viewer's decoders have a cap of

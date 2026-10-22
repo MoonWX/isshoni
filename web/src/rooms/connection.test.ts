@@ -48,6 +48,28 @@ describe('createConnection (05 §7)', () => {
     });
   });
 
+  it('says hello without auth in the browser, and with the platform’s auth (M2: docs/m2/03 §7.3)', async () => {
+    await h.connect();
+    expect(h.server.hellos[0]).not.toHaveProperty('auth');
+    h.close();
+    const calls: boolean[] = [];
+    const url = h.platform.signaling().url;
+    h = createHarness({
+      platform: {
+        signaling: () => ({
+          url,
+          auth: ({ forceRefresh }) => {
+            calls.push(forceRefresh);
+            return Promise.resolve({ scheme: 'bearer', token: 'isa_t1' });
+          },
+        }),
+      },
+    });
+    await h.connect();
+    expect(h.server.hellos[0]?.auth).toEqual({ scheme: 'bearer', token: 'isa_t1' });
+    expect(calls).toEqual([false]);
+  });
+
   it('re-reads the caps on every reconnect', async () => {
     h.close();
     let decode = ['opus'];

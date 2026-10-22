@@ -41,6 +41,9 @@ type auditAction struct {
 	sec     bool // a security event (§10's Sec column); settings.changed only when registrationMode changed
 	// later is why M1 has no code that writes the action (§10 marks it later); "" for the actions M1 writes.
 	later string
+	// inAuth marks a later action that auth already writes although no route reaches it yet (M2 README WA30);
+	// WA47 produces it in TestAuditCoverage and drops later and inAuth.
+	inAuth bool
 }
 
 // Actor kinds of the table.
@@ -85,8 +88,12 @@ var auditActions = []auditAction{
 	{action: "room.deleted", actors: byUser, targets: []string{"room"}},
 	{action: "settings.changed", actors: byUser, targets: []string{"settings"}, sec: true},
 	{action: "secrets.rotated", actors: bySystem, targets: []string{""}, sec: true},
-	{action: "device.linked", targets: []string{"device"},
-		later: "M2: no M1 code links a device; the device flow is 03 slice 15"},
+	{action: "device.approved", targets: []string{"device"}, inAuth: true,
+		later: "M2 02 §5.3: auth writes it (WA30); TestAuditCoverage produces it from WA47"},
+	{action: "device.denied", targets: []string{"device"}, inAuth: true,
+		later: "M2 02 §5.3: auth writes it (WA30); TestAuditCoverage produces it from WA47"},
+	{action: "device.linked", targets: []string{"device"}, sec: true, inAuth: true,
+		later: "M2 02 §5.4, §14: auth writes it (WA30); TestAuditCoverage produces it from WA47"},
 	// §10 marks it later, but S58's DELETE /api/v1/me/devices/{id} writes it for any device row. No M1 path links
 	// a device, so TestAuditCoverage inserts one row, as M2's linking would, and revokes it over REST.
 	{action: "device.revoked", actors: byUser, targets: []string{"device"}},
@@ -567,13 +574,17 @@ func TestAuditActionsInSource(t *testing.T) {
 			continue
 		}
 		for _, dir := range []string{".", "../auth"} {
+			if dir == "../auth" && a.inAuth {
+				continue
+			}
 			if where := writers[dir][a.action]; len(where) > 0 {
 				t.Errorf("%s names %s, which the table marks later (%s): produce it in TestAuditCoverage", where[0],
 					a.action, a.later)
 			}
 		}
 	}
-	if len(auditActions) != 33 {
-		t.Errorf("the table has %d actions; 03 §10 lists 32, M2 02 §8 adds device.expired", len(auditActions))
+	if len(auditActions) != 35 {
+		t.Errorf("the table has %d actions; 03 §10 lists 32, M2 02 §8 adds device.approved, device.denied and "+
+			"device.expired", len(auditActions))
 	}
 }

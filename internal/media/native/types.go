@@ -46,13 +46,12 @@ type ClockSample struct {
 	UncertaintyNS int64 // half the QPC bracket around the wall-clock read
 }
 
-// SourceDetail is what im_source_info says about a source beyond media.Source (04 §12.2). Local data, never logged.
+// SourceDetail holds only what im_source_info says about a source beyond media.Source (04 §12.2, M2 README §3 item
+// 29): its monitor_id, capture_path and IM_SRCF_OS_BORDER are media.Source's MonitorID, Capture and OSBorder. Local
+// data, never logged.
 type SourceDetail struct {
-	MonitorID   string  // monitor sources: the im_list_sources id (03 places the pill on it); "" otherwise
-	CapturePath string  // "wgc" | "dd" | "test"
-	OSBorder    bool    // IM_SRCF_OS_BORDER: Windows draws its yellow border
-	Mapped      bool    // IM_SRCF_MAPPED: a Win10 monitor pick mapped to a DD output
-	Window      uintptr // the HWND when identified (04 §7.6), else 0
+	Mapped bool    // IM_SRCF_MAPPED: a Win10 monitor pick mapped to a DD output (04 §7.5)
+	Window uintptr // the HWND when identified (04 §7.6), else 0
 }
 
 // PCMChunk is one IM_PACKET_PCM chunk of a session started with media.AudioConfig.TapPCM: 10 ms of the mix fed to

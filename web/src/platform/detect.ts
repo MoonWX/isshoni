@@ -1,12 +1,14 @@
-// Picks the Platform for this page (05 §8, boot step 2). The global names __ISSHONI_DESKTOP__ and Capacitor are
-// reserved now (types/globals.d.ts); nothing reads them in M1.
+// Picks the Platform for this page (05 §8, boot step 2; docs/m2/03 §7.2). The desktop app's asset handler serves
+// bridge.js before the module entry, which sets window.__ISSHONI_DESKTOP__; only a valid config makes the page a
+// DesktopPlatform, anything else is a browser. The global name Capacitor stays reserved (types/globals.d.ts).
 import { BrowserPlatform } from './browser/BrowserPlatform';
+import { readDesktopConfig } from './desktop/config';
+import { DesktopPlatform } from './desktop/DesktopPlatform';
 import type { Platform } from './types';
 
 export function detectPlatform(): Platform {
-  // later (M2/M3): window.__ISSHONI_DESKTOP__ (the Wails bridge) → new DesktopPlatform(bridge)
-  //   Two transports (plan): Wails bindings, and the same-user agent relay (01 §8.14; Linux agent M4,
-  //   web → desktop handoff M2).
+  const cfg = readDesktopConfig(typeof window === 'undefined' ? undefined : window.__ISSHONI_DESKTOP__);
+  if (cfg) return new DesktopPlatform(cfg);
   // pending (mobile apps): window.Capacitor?.isNativePlatform?.() → new MobilePlatform()
   return new BrowserPlatform();
 }
