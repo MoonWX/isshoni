@@ -212,19 +212,25 @@ type Hub struct {
 	mu             sync.Mutex
 	closing        bool
 	shutdownReason protocol.ShutdownReason
-	stopped        chan struct{}        // closed once wg reaches zero after Shutdown began
-	sockets        map[*socket]struct{} // every accepted socket until its reader has ended
-	conns          map[string]*conn     // connections by id, ready or detached, until they close
-	userSlots      map[string]int       // per user: connections (detached ones too) plus handshaking sockets (01 §3.1 step 5)
-	overCap        map[string]int       // per user: cookie sockets that wait at the cap for a hello that resumes (ServeHTTP)
-	preAuth        int                  // concurrent pre-auth sockets (01 §3.1 step 4)
-	rooms          map[string]*room     // rooms with at least one participant, by id
-	participants   int                  // participants over all rooms, CloseRoom's included until they are detached
-	closedRooms    map[string]struct{}  // rooms closed by CloseRoom, for this process's lifetime
+	stopped        chan struct{}         // closed once wg reaches zero after Shutdown began
+	sockets        map[*socket]struct{}  // every accepted socket until its reader has ended
+	conns          map[string]*conn      // connections by id, ready or detached, until they close
+	userSlots      map[string]int        // per user: connections (detached ones too) plus handshaking sockets (01 §3.1 step 5)
+	overCap        map[string]int        // per user: cookie sockets that wait at the cap for a hello that resumes (ServeHTTP)
+	preAuth        int                   // concurrent pre-auth sockets (01 §3.1 step 4)
+	rooms          map[string]*room      // rooms with at least one participant, by id
+	participants   int                   // participants over all rooms, CloseRoom's included until they are detached
+	closedRooms    map[string]struct{}   // rooms closed by CloseRoom, for this process's lifetime
+	userConns      map[string]*userConns // per user with a welcomed connection: its user.connections state (userconns.go)
+	connsRev       uint64                // the last user.connections rev (userconns.go)
 }
 
-// serverFeatures are the features this server enables (01 §6.2): agent.relay, the same-user relay (relay.go).
-var serverFeatures = []protocol.Feature{protocol.FeatureAgentRelay}
+// serverFeatures are the features this server enables (01 §6.2), in the order welcome.features lists them:
+// agent.relay, the same-user relay (relay.go); user.connections, the list of the user's own connections (M2 01 §10.4,
+// userconns.go); share.pause, the pause bit of share.update and the paused status (M2 01 §10.3, share.go).
+var serverFeatures = []protocol.Feature{
+	protocol.FeatureAgentRelay, protocol.FeatureUserConnections, protocol.FeatureSharePause,
+}
 
 // New returns a hub. It validates cfg and deps, builds the metrics (registering them with deps.Metrics), and starts
 // nothing.
@@ -283,6 +289,7 @@ func New(cfg Config, deps Deps) (*Hub, error) {
 		overCap:     make(map[string]int),
 		rooms:       make(map[string]*room),
 		closedRooms: make(map[string]struct{}),
+		userConns:   make(map[string]*userConns),
 	}
 	return h, nil
 }

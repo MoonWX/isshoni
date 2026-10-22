@@ -122,12 +122,14 @@ func (c *conn) endsWith(code int, byHub bool) (reason protocol.EndReason, ends b
 // startGrace leaves the connection detached after its socket was lost (01 §4.2, §10.3): the connection, its
 // participant slot, its shares, its subscriptions and its MediaPeer are kept for Config.Grace, and room.state shows
 // the connection as reconnecting (its participant too, when all of the user's connections in the room are). Media
-// keeps flowing if the PeerConnections are healthy: a WebSocket drop is not a media drop.
+// keeps flowing if the PeerConnections are healthy: a WebSocket drop is not a media drop. user.connections shows it
+// as reconnecting too (M2 01 §10.4).
 func (c *conn) startGrace() {
 	c.grace.Reset(c.h.cfg.Grace)
 	if c.room != nil {
 		c.room.setDetached(c, true)
 	}
+	c.h.userConnsChanged(c)
 	c.h.log.Info("connection detached", slog.String("conn_id", c.id), slog.String("user_id", c.userID),
 		slog.Int("code", c.lastCode))
 }
@@ -145,7 +147,7 @@ type resumeRequest struct {
 	sock        *socket
 	re          string            // the hello's request id: welcome answers it
 	hash        [sha256.Size]byte // SHA-256 of the hello's token
-	id          Identity          // who the socket authenticated as, revalidated: the name and admin flag are current
+	id          Identity          // who the socket authenticated as, revalidated: the name, admin flag and device name are current
 	role        protocol.Role
 	version     int // the protocol version the hello negotiated
 	caps        protocol.Caps
@@ -239,7 +241,8 @@ func (h *Hub) tryResume(tok protocol.Secret, req *resumeRequest) (*conn, string)
 //
 // What the hub sent while the connection was detached is not replayed. The connection keeps its client info,
 // features and rate-limit buckets. The hello's caps replace the connection's: they are the client's current ones,
-// which can have changed while it was away (a codec that became available, 01 §11.7).
+// which can have changed while it was away (a codec that became available, 01 §11.7). So does the device name that
+// the handshake's Revalidate reported (M2 02 §6.3), which the user.connections after the welcome carries.
 func (c *conn) resume(req *resumeRequest) string {
 	switch {
 	case c.closed, c.endReason != "", c.revoked.Load() != nil, c.lost.Load():
@@ -257,6 +260,7 @@ func (c *conn) resume(req *resumeRequest) string {
 	if id := c.identity(); id.Name != req.id.Name || id.Admin != req.id.Admin {
 		c.setUser(req.id.Name, req.id.Admin)
 	}
+	c.setDeviceName(req.id.DeviceName) // the re-attach below is a user.connections change anyway
 	if !capsEqual(c.caps, req.caps) {
 		c.caps = req.caps
 		if c.peer != nil {

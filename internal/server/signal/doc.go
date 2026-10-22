@@ -7,7 +7,7 @@
 // wiring (04 §6.6) adapts each one; package signaltest has fakes for tests. The hub never imports config, store,
 // auth or sfu.
 //
-// # What exists so far (README slices S11, S19, S28, S40, S51 and F03; 01 slices P3 to P5, P7 and P12)
+// # What exists so far (README slices S11, S19, S28, S40, S51 and F03; 01 slices P3 to P5, P7 and P12; M2 slice WA27)
 //
 //   - upgrade.go: the six upgrade checks of 01 §3.1 (shutdown, the exact Origin allowlist, cookie authentication,
 //     pre-auth limits per IP key and server-wide, 16 connections per user, Accept) and the hello handshake of
@@ -28,12 +28,17 @@
 //   - share.go: shares (01 §4.4, §8.7): share.start with the limits per user and per room, ref and replaces;
 //     share.update and share.stop, also from the user's other connections; the lifecycle starting → live ↔ stalled
 //     from the MediaPeer's media facts, both 30 s timeouts, room.event share.started and the Web Push call, once per
-//     share; and subscribe.update (01 §8.9), the desired subscriptions from which room.state computes the watchers;
+//     share; and subscribe.update (01 §8.9), the desired subscriptions from which room.state computes the watchers.
+//     M2 adds the pause bit (M2 01 §10.3, feature share.pause): share.update{paused} from a connection of the user
+//     with the feature, shown as paused while the share would be live (stalled wins), with no timeout;
 //   - stats.go: stats (01 §8.11): the client metrics from the counters of the clients' reports, and the MediaPeer's
 //     stats, read every 2 s for stats.watch and kept for the live snapshot;
 //   - relay.go: the same-user relay (01 §8.14, feature agent.relay): agent.send goes out as agent.recv to the
 //     user's other connections that are online and have the feature, by connection id or by role, and never to
 //     another user's; the payload is opaque but never null;
+//   - userconns.go: user.connections (M2 01 §10.4, feature user.connections): the full list of a user's connections,
+//     sent to those of them with the feature after their welcome and whenever one opens, closes, detaches,
+//     re-attaches, changes room or has its device name changed by Revalidate; at most one per 200 ms per user;
 //   - room.go: rooms and participants (01 §4.1, §8.4–8.6): a participant merges a user's connections in a room;
 //     room.state snapshots are coalesced (at most one broadcast per StateCoalesce per room) and encoded once per
 //     broadcast; room.events; watchers from the desired subscriptions; the room_full policy; the MediaPeer of each
