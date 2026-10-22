@@ -267,18 +267,16 @@ func (s *Service) takeDeviceTokenIP(ctx context.Context, m ReqMeta) error {
 // the token; every other end gives it back: a found code, a decision made (also an idempotent repeat), and the ends
 // that say nothing about the code (the caller's session is gone, a store or context error).
 type lookupAttempt struct {
-	l     *limiter[store.UserID]
-	user  store.UserID
-	wrong bool
+	l    *limiter[store.UserID]
+	user store.UserID
 }
 
-// end settles the attempt by the call's error: the token stays only for device_code_invalid.
+// end settles the attempt by the call's error: the token stays only for device_code_invalid (a wrong code keeps
+// it); every other end gives it back.
 func (a *lookupAttempt) end(err error) {
-	if api.IsCode(err, api.CodeDeviceCodeInvalid) {
-		a.wrong = true
-		return
+	if !api.IsCode(err, api.CodeDeviceCodeInvalid) {
+		a.l.refund(a.user)
 	}
-	a.l.refund(a.user)
 }
 
 // takeDeviceLookup reserves the caller's device-lookup token. The first refusal of an episode writes auth.throttled
