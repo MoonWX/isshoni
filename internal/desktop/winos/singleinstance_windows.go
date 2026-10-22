@@ -18,6 +18,12 @@ const (
 	pipeBuffer  = 64 << 10
 	readTimeout = 2 * time.Second // a client that connects and sends nothing is dropped after this
 	asfwAny     = 0xFFFFFFFF      // ASFW_ANY
+	// closeWait bounds Close's wait for the serving goroutine: onArgs is the caller's code and may block.
+	closeWait = time.Second
+	// firstPipeWait bounds how long the first instance tries to create the pipe's name: an instance that is still
+	// finishing (its client may still hold its last pipe instance, or a forwarded command line is still being
+	// handled) can hold the name for a few seconds after it released the lock.
+	firstPipeWait = 5 * time.Second
 )
 
 var (
@@ -125,42 +131,80 @@ func (s *SingleInstance) serve(onArgs func([]string), sa *windows.SecurityAttrib
 	if err != nil {
 		return
 	}
-	// The first instance of the pipe must be ours (FILE_FLAG_FIRST_PIPE_INSTANCE: nobody squats the name). Later
-	// instances don't take the flag: a client that still holds a handle keeps its old instance alive for a while.
-	flags := uint32(windows.PIPE_ACCESS_INBOUND | windows.FILE_FLAG_OVERLAPPED | windows.FILE_FLAG_FIRST_PIPE_INSTANCE)
-	for {
-		var h windows.Handle
-		for attempt := 0; ; attempt++ {
-			h, err = windows.CreateNamedPipe(name, flags,
-				windows.PIPE_TYPE_BYTE|windows.PIPE_READMODE_BYTE|windows.PIPE_WAIT|windows.PIPE_REJECT_REMOTE_CLIENTS,
-				windows.PIPE_UNLIMITED_INSTANCES, 0, pipeBuffer, 0, sa)
-			if err == nil || attempt == 2 || flags&windows.FILE_FLAG_FIRST_PIPE_INSTANCE != 0 {
-				break
-			}
-			time.Sleep(50 * time.Millisecond)
-		}
-		if err != nil {
+	// The first instance of the pipe must be ours (FILE_FLAG_FIRST_PIPE_INSTANCE: nobody squats the name).
+	h, err := s.createPipe(name, sa, true)
+	if err != nil {
+		if !errors.Is(err, errStopped) {
 			s.log.Warn("winos: the single-instance pipe can't be created; second launches can't reach this one",
 				"err", err)
+		}
+		return
+	}
+	for {
+		if s.stopped() { // Close ran while onArgs handled the last command line
+			_ = windows.CloseHandle(h)
 			return
 		}
-		flags &^= windows.FILE_FLAG_FIRST_PIPE_INSTANCE
 		data, err := s.accept(h)
+		quit := errors.Is(err, errStopped)
+		// The next instance is created before this one is closed, so the name is never free for another account to
+		// create while this process serves; a launch that comes while onArgs runs connects to it and waits there.
+		var next windows.Handle
+		var nextErr error
+		if !quit {
+			next, nextErr = s.createPipe(name, sa, false)
+		}
 		_ = windows.DisconnectNamedPipe(h)
 		_ = windows.CloseHandle(h)
-		switch {
-		case errors.Is(err, errStopped):
+		if quit {
 			return
-		case err != nil:
-			s.log.Info("winos: a second launch's message was dropped", "err", err)
-			continue
 		}
-		args, err := decodeArgs(data)
+		var args []string
+		if err == nil {
+			args, err = decodeArgs(data)
+		}
 		if err != nil {
 			s.log.Info("winos: a second launch's message was dropped", "err", err)
-			continue
+		} else {
+			onArgs(args)
 		}
-		onArgs(args)
+		if nextErr != nil {
+			if !errors.Is(nextErr, errStopped) {
+				s.log.Warn("winos: the single-instance pipe can't be created; second launches can't reach this one",
+					"err", nextErr)
+			}
+			return
+		}
+		h = next
+	}
+}
+
+// stopped reports whether Close has set the stop event.
+func (s *SingleInstance) stopped() bool {
+	r, err := windows.WaitForSingleObject(s.stop, 0)
+	return err == nil && r == windows.WAIT_OBJECT_0
+}
+
+// createPipe creates an instance of the pipe. The first one takes FILE_FLAG_FIRST_PIPE_INSTANCE and is retried for
+// up to firstPipeWait (another instance of this app that is finishing may still hold the name); later ones don't
+// take the flag and are retried briefly. Close ends the retries (errStopped).
+func (s *SingleInstance) createPipe(name *uint16, sa *windows.SecurityAttributes, first bool) (windows.Handle, error) {
+	flags := uint32(windows.PIPE_ACCESS_INBOUND | windows.FILE_FLAG_OVERLAPPED)
+	pauseMS, deadline := uint32(50), time.Now().Add(150*time.Millisecond)
+	if first {
+		flags |= windows.FILE_FLAG_FIRST_PIPE_INSTANCE
+		pauseMS, deadline = 100, time.Now().Add(firstPipeWait)
+	}
+	for {
+		h, err := windows.CreateNamedPipe(name, flags,
+			windows.PIPE_TYPE_BYTE|windows.PIPE_READMODE_BYTE|windows.PIPE_WAIT|windows.PIPE_REJECT_REMOTE_CLIENTS,
+			windows.PIPE_UNLIMITED_INSTANCES, 0, pipeBuffer, 0, sa)
+		if err == nil || time.Now().After(deadline) {
+			return h, err
+		}
+		if r, _ := windows.WaitForSingleObject(s.stop, pauseMS); r == windows.WAIT_OBJECT_0 {
+			return windows.InvalidHandle, errStopped
+		}
 	}
 }
 
@@ -173,7 +217,9 @@ func (s *SingleInstance) accept(h windows.Handle) ([]byte, error) {
 	defer func() { _ = windows.CloseHandle(ev) }()
 	ov := &windows.Overlapped{HEvent: ev}
 	switch err := windows.ConnectNamedPipe(h, ov); {
-	case err == nil, errors.Is(err, windows.ERROR_PIPE_CONNECTED):
+	// ERROR_NO_DATA: a client connected, wrote and closed before this call (while onArgs ran); what it wrote is
+	// still read below.
+	case err == nil, errors.Is(err, windows.ERROR_PIPE_CONNECTED), errors.Is(err, windows.ERROR_NO_DATA):
 	case errors.Is(err, windows.ERROR_IO_PENDING):
 		if err := s.wait(h, ov, windows.INFINITE); err != nil {
 			return nil, err
@@ -255,9 +301,14 @@ func (s *SingleInstance) Forward(args []string) error {
 	}
 	deadline := time.Now().Add(ForwardTimeout)
 	for {
-		h, err := windows.CreateFile(name, windows.GENERIC_WRITE, 0, nil, windows.OPEN_EXISTING, 0, 0)
+		// SECURITY_IDENTIFICATION: the server may learn who this is, but never act as this user.
+		h, err := windows.CreateFile(name, windows.GENERIC_WRITE, 0, nil, windows.OPEN_EXISTING,
+			windows.SECURITY_SQOS_PRESENT|windows.SECURITY_IDENTIFICATION, 0)
 		if err == nil {
 			defer func() { _ = windows.CloseHandle(h) }()
+			if err := s.checkServer(h); err != nil {
+				return err
+			}
 			for len(data) > 0 {
 				var n uint32
 				if err := windows.WriteFile(h, data, &n, nil); err != nil {
@@ -278,7 +329,35 @@ func (s *SingleInstance) Forward(args []string) error {
 	}
 }
 
-// Close stops serving and releases the lock.
+// checkServer makes sure that the pipe's server runs as this user: another account that created the name while no
+// first instance held it gets no command line.
+func (s *SingleInstance) checkServer(pipe windows.Handle) error {
+	var pid uint32
+	if err := windows.GetNamedPipeServerProcessId(pipe, &pid); err != nil {
+		return fmt.Errorf("winos: the pipe's server: %w", err)
+	}
+	p, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		return fmt.Errorf("winos: the pipe's server: %w", err)
+	}
+	defer func() { _ = windows.CloseHandle(p) }()
+	var tok windows.Token
+	if err := windows.OpenProcessToken(p, windows.TOKEN_QUERY, &tok); err != nil {
+		return fmt.Errorf("winos: the pipe's server: %w", err)
+	}
+	defer func() { _ = tok.Close() }()
+	u, err := tok.GetTokenUser()
+	if err != nil {
+		return fmt.Errorf("winos: the pipe's server: %w", err)
+	}
+	if u.User.Sid.String() != s.sid {
+		return errors.New("winos: the pipe is served by another account; nothing was forwarded")
+	}
+	return nil
+}
+
+// Close stops serving and releases the lock. It waits at most closeWait for a forwarded command line that onArgs is
+// still handling; that goroutine then ends by itself once onArgs returns.
 func (s *SingleInstance) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -291,8 +370,13 @@ func (s *SingleInstance) Close() error {
 	s.mu.Unlock()
 	if stop != 0 {
 		_ = windows.SetEvent(stop)
-		<-done
-		_ = windows.CloseHandle(stop)
+		select {
+		case <-done:
+			_ = windows.CloseHandle(stop)
+		case <-time.After(closeWait):
+			// The goroutine still waits on the event when onArgs returns: the handle stays open for it.
+			s.log.Warn("winos: a forwarded command line is still being handled; the lock is released without it")
+		}
 	}
 	if mutex != 0 {
 		return windows.CloseHandle(mutex)

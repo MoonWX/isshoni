@@ -17,7 +17,8 @@
 //	                     WebView2 runtime check, logs, servers, settings, the engine, the asset handler, Wails and
 //	                     the app (internal/desktop/app), which gets the command line, the Pending values and every
 //	                     second launch's forwarded arguments
-//	start.go             03 §13.4's order with its OS parts behind functions (tested with fakes), --version
+//	start.go             03 §13.4's order with its OS parts behind functions (tested with fakes), --version, and
+//	                     the queue of second launches' command lines, served from step 3 on
 //	firstaction_*.go     main's first action (SetDefaultDllDirectories, SetDllDirectory) and --version's stdout
 //	engine_release.go    the engine of every release: native.Open (01 §7.1)
 //	engine_fake.go       the engine of dev and e2e builds: 01's fake with 05's audio scenarios (03 §4.5, §22.4)

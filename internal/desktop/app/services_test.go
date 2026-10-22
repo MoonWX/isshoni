@@ -1,13 +1,17 @@
 package app
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/MoonWX/isshoni/internal/desktop/applog"
 	"github.com/MoonWX/isshoni/internal/desktop/settings"
 	"github.com/MoonWX/isshoni/internal/version"
 )
@@ -143,4 +147,81 @@ func TestSPALog(t *testing.T) {
 	if got := cut("añb", 2); got != "a" {
 		t.Errorf("cut on a rune boundary: %q", got)
 	}
+}
+
+// TestSPALogKeys: an SPA line through the app's own handler (applog) is a JSON object without a duplicate key: one
+// component, spa, and the page's attributes in a group of their own, whatever they are named (03 §17).
+func TestSPALogKeys(t *testing.T) {
+	e := newEnv(t, nil, nil)
+	var buf bytes.Buffer
+	a, err := New(Deps{Settings: e.app.d.Settings, Servers: e.srv, Shell: e.shell, OS: fakeOS{}, Clock: e.clock.Now,
+		Log: slog.New(applog.NewHandler(&lockedWriter{w: &buf}, slog.LevelDebug, ""))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.cancel()
+	long := strings.Repeat("k", 70)
+	a.Log("warn", "hello", map[string]string{"component": "evil", "msg": "x", "level": "ERROR", "time": "y",
+		"source": "z", "attrs": "w", long + "1": "a", long + "2": "b"})
+	a.Log("error", "plain", nil)
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("%d lines:\n%s", len(lines), buf.String())
+	}
+	for _, line := range lines {
+		if err := noDuplicateKeys(json.NewDecoder(strings.NewReader(line))); err != nil {
+			t.Errorf("%v: %s", err, line)
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatal(err)
+		}
+		if m["component"] != "spa" {
+			t.Errorf("component %v: %s", m["component"], line)
+		}
+	}
+	var first map[string]any
+	_ = json.Unmarshal([]byte(lines[0]), &first)
+	group, _ := first["attrs"].(map[string]any)
+	if first["msg"] != "hello" || first["level"] != "WARN" || group["component"] != "evil" || group["msg"] != "x" ||
+		len(group) != 7 || group[long[:64]] == nil {
+		t.Errorf("the line: %s", lines[0])
+	}
+}
+
+// noDuplicateKeys reads one JSON value from dec and fails on an object that has a key twice.
+func noDuplicateKeys(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	switch tok {
+	case json.Delim('{'):
+		seen := map[string]bool{}
+		for dec.More() {
+			k, err := dec.Token()
+			if err != nil {
+				return err
+			}
+			key, _ := k.(string)
+			if seen[key] {
+				return fmt.Errorf("the key %q twice", key)
+			}
+			seen[key] = true
+			if err := noDuplicateKeys(dec); err != nil {
+				return err
+			}
+		}
+		_, err = dec.Token()
+		return err
+	case json.Delim('['):
+		for dec.More() {
+			if err := noDuplicateKeys(dec); err != nil {
+				return err
+			}
+		}
+		_, err = dec.Token()
+		return err
+	}
+	return nil
 }

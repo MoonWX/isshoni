@@ -118,12 +118,22 @@ func TestUnknownFieldsKept(t *testing.T) {
 	  "schema": 1,
 	  "future": {"x": [1, 2.50, "y"], "big": 12345678901234567890},
 	  "updates": {"check": true, "channel": "stable", "autoInstall": true},
-	  "pill": {"mode": "auto", "positions": {}, "size": "small"},
+	  "pill": {"mode": "auto", "positions": {"D1": {"x": 1, "y": 2, "dpi": 144}, "D2": {"x": 3, "y": 4}}, "size": "small"},
 	  "tips": {"firstShareShown": true, "laterTip": true},
-	  "audio": {"keepOutMicUsers": true, "newAudioKey": 3}
+	  "audio": {"keepOutMicUsers": true, "newAudioKey": 3},
+	  "serverPrefs": {
+	    "https://a.example.com": {"preset": "game", "newerField": {"on": true}},
+	    "https://b.example.com": {"preset": "movie", "newerField": 1}
+	  }
 	}`)
 	s := open(t, Options{Dir: dir})
-	if err := s.Update(func(v *Settings) { v.CloseToTray = true }); err != nil {
+	err := s.Update(func(v *Settings) {
+		v.CloseToTray = true
+		v.ServerPrefs["https://a.example.com"] = ServerPrefs{Preset: protocol.PresetText}
+		delete(v.ServerPrefs, "https://b.example.com")
+		delete(v.Pill.Positions, "D2")
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Flush(); err != nil {
@@ -150,6 +160,16 @@ func TestUnknownFieldsKept(t *testing.T) {
 	}
 	if m["audio"].(map[string]any)["newAudioKey"] != 3.0 {
 		t.Errorf("the audio section lost a key: %v", m["audio"])
+	}
+	// Inside the keyed objects, the entries that stay keep a newer build's fields; the removed ones stay removed.
+	prefs := m["serverPrefs"].(map[string]any)
+	a, _ := prefs["https://a.example.com"].(map[string]any)
+	if len(prefs) != 1 || a["preset"] != "text" || a["newerField"].(map[string]any)["on"] != true {
+		t.Errorf("serverPrefs = %v", prefs)
+	}
+	pos := m["pill"].(map[string]any)["positions"].(map[string]any)
+	if d1, _ := pos["D1"].(map[string]any); len(pos) != 1 || d1["x"] != 1.0 || d1["dpi"] != 144.0 {
+		t.Errorf("pill.positions = %v", pos)
 	}
 }
 
@@ -388,6 +408,105 @@ func TestUpdateValidates(t *testing.T) {
 	}
 }
 
+// TestUnparsableHotkeyKept: a hotkey this build can't parse (a newer build's key, or a hand edit) is kept as it was
+// loaded, and Update checks only what it changes: other settings still save, and the hotkey itself is checked when it
+// changes.
+func TestUnparsableHotkeyKept(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, FileName)
+	writeFile(t, path, `{"schema": 1, "updates": {"check": true, "channel": "stable"},
+	  "hotkeys": {"pause": "Ctrl+Alt+Shift+F25", "stop": "Ctrl+Alt+Shift+F10"}}`)
+	s := open(t, Options{Dir: dir})
+	if g := s.Get(); g.Hotkeys.Pause != "Ctrl+Alt+Shift+F25" {
+		t.Fatalf("the hotkey wasn't kept: %+v", g.Hotkeys)
+	}
+	for name, fn := range map[string]func(*Settings){
+		"tips.dndShown": func(v *Settings) { v.Tips.DNDShown = true },
+		"wizardDone":    func(v *Settings) { v.WizardDone = true },
+		"log.level":     func(v *Settings) { v.Log.Level = LogDebug },
+		"window":        func(v *Settings) { v.Window = &Window{W: 900, H: 600} },
+		"hotkeys.stop":  func(v *Settings) { v.Hotkeys.Stop = "Ctrl+Alt+F10" },
+		"same pause":    func(v *Settings) { v.Hotkeys.Pause = "Ctrl+Alt+Shift+F25" },
+	} {
+		if err := s.Update(fn); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	err := s.Update(func(v *Settings) { v.WizardDone = false; v.Hotkeys.Pause = "Ctrl+Alt+Shift+F26" })
+	var fe *FieldError
+	if !errors.As(err, &fe) || fe.Field != "hotkeys.pause" {
+		t.Errorf("an unparsable new hotkey: %v", err)
+	}
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	m := readJSON(t, path)
+	if h := m["hotkeys"].(map[string]any); h["pause"] != "Ctrl+Alt+Shift+F25" || h["stop"] != "Ctrl+Alt+F10" ||
+		m["wizardDone"] != true || m["tips"].(map[string]any)["dndShown"] != true {
+		t.Errorf("written: %v", m)
+	}
+	if err := s.Update(func(v *Settings) { v.Hotkeys.Pause = "Ctrl+Alt+F8" }); err != nil {
+		t.Errorf("a valid hotkey in its place: %v", err)
+	}
+}
+
+// TestUnreadableFileLeftAlone: a settings.json that exists but can't be read (an antivirus holding it) is neither
+// set aside nor overwritten at start, and the installer's UpdateChecks isn't asked for it; settings.json.bak is used
+// meanwhile, and the next start reads the file as it was.
+func TestUnreadableFileLeftAlone(t *testing.T) {
+	const content = `{"schema": 1, "closeToTray": true, "updates": {"check": true, "channel": "beta"}}`
+	for _, withBak := range []bool{false, true} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, FileName)
+		writeFile(t, path, content)
+		if withBak {
+			writeFile(t, filepath.Join(dir, bakName), `{"schema": 1, "closeToTray": true, "autostart": true,
+			  "updates": {"check": true, "channel": "beta"}}`)
+		}
+		ffs := &faultFS{failRead: map[string]int{FileName: 1}}
+		s := open(t, Options{Dir: dir, fs: ffs, UpdateChecks: func() (uint32, bool) {
+			t.Error("UpdateChecks read for an unreadable settings.json")
+			return 0, true
+		}})
+		g := s.Get()
+		switch {
+		case withBak && (!g.CloseToTray || !g.Autostart || g.Updates.Channel != ChannelBeta):
+			t.Errorf("not the last good copy: %+v", g)
+		case !withBak && !reflect.DeepEqual(g, Defaults()):
+			t.Errorf("not the defaults: %+v", g)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if data, err := os.ReadFile(path); err != nil || string(data) != content {
+			t.Errorf("settings.json changed at start: %s (%v)", data, err)
+		}
+		if bad, _ := filepath.Glob(filepath.Join(dir, badName+"*")); len(bad) != 0 {
+			t.Errorf("set aside: %v", bad)
+		}
+		if ffs.count(FileName) != 0 || ffs.count(tmpName) != 0 {
+			t.Error("written at start")
+		}
+		again := open(t, Options{Dir: dir})
+		if g := again.Get(); !g.CloseToTray || g.Updates.Channel != ChannelBeta || !g.Updates.Check {
+			t.Errorf("the next start: %+v", g)
+		}
+	}
+	// A change after such a start is written.
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, FileName), content)
+	s := open(t, Options{Dir: dir, fs: &faultFS{failRead: map[string]int{FileName: 1}}})
+	if err := s.Update(func(v *Settings) { v.Notifications = false }); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if m := readJSON(t, filepath.Join(dir, FileName)); m["notifications"] != false {
+		t.Errorf("the change wasn't written: %v", m)
+	}
+}
+
 // TestNoSecrets: no field of Settings can hold a token, a password, a window title or a share label (03 §14.2).
 func TestNoSecrets(t *testing.T) {
 	banned := []string{"token", "password", "secret", "credential", "title", "label", "cookie"}
@@ -429,8 +548,22 @@ type faultFS struct {
 	osFS
 	mu         sync.Mutex
 	failWrite  map[string]bool // by base name
+	failRead   map[string]int  // by base name: how many reads fail with fs.ErrPermission
 	failRename bool
 	writes     map[string]int
+}
+
+func (f *faultFS) ReadFile(name string) ([]byte, error) {
+	f.mu.Lock()
+	fail := f.failRead[filepath.Base(name)] > 0
+	if fail {
+		f.failRead[filepath.Base(name)]--
+	}
+	f.mu.Unlock()
+	if fail {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrPermission}
+	}
+	return f.osFS.ReadFile(name)
 }
 
 func (f *faultFS) WriteFile(name string, data []byte, perm fs.FileMode) error {

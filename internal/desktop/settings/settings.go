@@ -9,8 +9,10 @@
 //
 // Reads: unknown fields are kept and written back, so a newer app's settings survive a downgrade. A file that
 // doesn't parse is renamed settings.json.bad-<UTC timestamp> and settings.json.bak (the last good copy) is tried; if
-// both fail, the defaults apply. Migrations are forward-only, one function per schema step, run at load; a file with
-// a newer schema than this build knows is read best-effort and not migrated (its schema is written back unchanged).
+// both fail, the defaults apply. A file that exists but can't be read (an antivirus holding it, an ACL) is left as it
+// is: settings.json.bak or the defaults are used in memory, and nothing is written until a setting changes.
+// Migrations are forward-only, one function per schema step, run at load; a file with a newer schema than this build
+// knows is read best-effort and not migrated (its schema is written back unchanged).
 //
 // Writes: debounced (500 ms), then settings.json.tmp is written and fsynced, the old settings.json is copied to
 // settings.json.bak, and the temporary file is renamed over settings.json (os.Rename: MoveFileEx with
@@ -211,7 +213,8 @@ type Store struct {
 // Open loads settings.json from o.Dir (03 §14.2). A missing file gives the defaults; a broken one is set aside and
 // the last good copy or the defaults are used, so Open fails only when o.Dir is unusable. When settings.json had no
 // updates.check, the installer's value is read (o.UpdateChecks) and the result is saved at once, so it is read
-// only once ever.
+// only once ever. A settings.json that can't be read is neither written nor answered from the installer's value at
+// start.
 func Open(o Options) (*Store, error) {
 	if o.Dir == "" {
 		return nil, errors.New("settings: Open needs a Dir")
@@ -240,12 +243,14 @@ func Open(o Options) (*Store, error) {
 		return nil, fmt.Errorf("settings: the data folder can't be created: %w", pathless(err))
 	}
 
-	raw, found, save := s.read()
-	cur, repaired := decode(raw, s.log)
+	l := s.read()
+	cur, repaired := decode(l.raw, s.log)
 	// A newer app's file is written back only when something else needs it: a repair would replace its values with
 	// this build's defaults.
-	save = save || (repaired && cur.Schema <= CurrentSchema)
-	if !hasUpdateCheck(raw) {
+	save := l.save || (repaired && cur.Schema <= CurrentSchema)
+	// A settings.json that exists but can't be read most likely has updates.check: the installer's value is not
+	// asked for it (it is read only when the file has none, once ever).
+	if !hasUpdateCheck(l.raw) && !l.unreadable {
 		cur.Updates.Check = true
 		if o.UpdateChecks != nil {
 			if v, ok := o.UpdateChecks(); ok && v == 0 {
@@ -262,8 +267,10 @@ func Open(o Options) (*Store, error) {
 			}
 		}
 	}
-	s.cur, s.raw = cur, raw
-	if save || !found {
+	s.cur, s.raw = cur, l.raw
+	// An unreadable settings.json is not overwritten at start: what was read stays in memory, and only a later change
+	// writes.
+	if (save || !l.found) && !l.unreadable {
 		s.dirty = true
 		if err := s.Flush(); err != nil {
 			s.log.Warn("settings: settings.json not written at start; the next change tries again", "err", err)
@@ -272,21 +279,36 @@ func Open(o Options) (*Store, error) {
 	return s, nil
 }
 
+// loaded is what read found.
+type loaded struct {
+	raw   map[string]any // the file's JSON object, migrated (settings.json, else settings.json.bak, else empty)
+	found bool           // there was a settings.json
+	save  bool           // something had to be repaired: write it back at start
+	// unreadable: settings.json exists but couldn't be read (an antivirus holding it, an ACL), so raw is
+	// settings.json.bak or empty. Nothing is written or asked at start: the file may be fine at the next start.
+	unreadable bool
+}
+
 // read returns the file's JSON object, migrated: settings.json, else settings.json.bak, else an empty object.
-// found is false when there was no settings.json at all; save is true when something had to be repaired.
-func (s *Store) read() (raw map[string]any, found, save bool) {
+func (s *Store) read() loaded {
 	path := filepath.Join(s.dir, FileName)
 	data, err := s.fs.ReadFile(path)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		return map[string]any{}, false, true
+		return loaded{raw: map[string]any{}, save: true}
 	case err != nil:
-		s.log.Warn("settings: settings.json can't be read; using the defaults", "err", pathless(err))
-		return map[string]any{}, true, false
+		// Not set aside: the file itself may be fine.
+		s.log.Warn("settings: settings.json can't be read; it is left as it is until a setting changes",
+			"err", pathless(err))
+		raw, ok := s.readBak()
+		if !ok {
+			s.log.Warn("settings: no usable copy; using the defaults")
+		}
+		return loaded{raw: raw, found: true, unreadable: true}
 	}
 	if raw, err := parse(data); err == nil {
 		raw, migrated := migrate(raw, s.log)
-		return raw, true, migrated
+		return loaded{raw: raw, found: true, save: migrated}
 	}
 	bad := s.badName()
 	if err := s.fs.Rename(path, filepath.Join(s.dir, bad)); err != nil {
@@ -294,16 +316,27 @@ func (s *Store) read() (raw map[string]any, found, save bool) {
 	} else {
 		s.log.Warn("settings: settings.json doesn't parse; set it aside", "file", bad)
 	}
-	bak, err := s.fs.ReadFile(filepath.Join(s.dir, bakName))
-	if err == nil {
-		if raw, err := parse(bak); err == nil {
-			s.log.Warn("settings: using the last good copy, settings.json.bak")
-			raw, _ = migrate(raw, s.log)
-			return raw, true, true
-		}
+	raw, ok := s.readBak()
+	if !ok {
+		s.log.Warn("settings: no usable copy; using the defaults")
 	}
-	s.log.Warn("settings: no usable copy; using the defaults")
-	return map[string]any{}, true, true
+	return loaded{raw: raw, found: true, save: true}
+}
+
+// readBak returns settings.json.bak's JSON object, migrated; ok false (and an empty object) when there is none
+// that parses.
+func (s *Store) readBak() (raw map[string]any, ok bool) {
+	bak, err := s.fs.ReadFile(filepath.Join(s.dir, bakName))
+	if err != nil {
+		return map[string]any{}, false
+	}
+	raw, err = parse(bak)
+	if err != nil {
+		return map[string]any{}, false
+	}
+	s.log.Warn("settings: using the last good copy, settings.json.bak")
+	raw, _ = migrate(raw, s.log)
+	return raw, true
 }
 
 // badName is settings.json.bad-<UTC timestamp>, with a counter when that name is taken.
@@ -408,33 +441,53 @@ func repair(s *Settings) bool {
 	return changed
 }
 
-// validate checks what Update was given; the error names the field.
-func validate(s *Settings) error {
-	for origin, p := range s.ServerPrefs {
+// validate checks the values Update changed (prev to next); the error names the field. A value that didn't change
+// is not checked: a hotkey this build can't parse is kept as it was loaded (a newer build's key, or a hand edit;
+// see Hotkeys), and it must not make every later change of another setting fail.
+func validate(prev, next *Settings) error {
+	for origin, p := range next.ServerPrefs {
+		if old, ok := prev.ServerPrefs[origin]; ok && old == p {
+			continue
+		}
 		if !p.Preset.Valid() {
 			return fieldError("serverPrefs[" + origin + "].preset")
 		}
 	}
 	for _, h := range []struct {
-		name, value string
-	}{{"hotkeys.pause", s.Hotkeys.Pause}, {"hotkeys.stop", s.Hotkeys.Stop}} {
-		if _, err := hotkey.Parse(h.value); err != nil {
+		name, prev, next string
+	}{
+		{"hotkeys.pause", prev.Hotkeys.Pause, next.Hotkeys.Pause},
+		{"hotkeys.stop", prev.Hotkeys.Stop, next.Hotkeys.Stop},
+	} {
+		if h.next == h.prev {
+			continue
+		}
+		if _, err := hotkey.Parse(h.next); err != nil {
 			return fieldError(h.name)
 		}
 	}
+	w := next.Window
 	switch {
-	case s.Window != nil && (s.Window.W <= 0 || s.Window.H <= 0):
+	case !sameWindow(prev.Window, w) && w != nil && (w.W <= 0 || w.H <= 0):
 		return fieldError("window")
-	case s.Pill.Mode != PillAuto && s.Pill.Mode != PillAlways:
+	case next.Pill.Mode != prev.Pill.Mode && next.Pill.Mode != PillAuto && next.Pill.Mode != PillAlways:
 		return fieldError("pill.mode")
-	case s.Updates.Channel != ChannelStable && s.Updates.Channel != ChannelBeta:
+	case next.Updates.Channel != prev.Updates.Channel && next.Updates.Channel != ChannelStable &&
+		next.Updates.Channel != ChannelBeta:
 		return fieldError("updates.channel")
-	case s.Log.Level != LogInfo && s.Log.Level != LogDebug:
+	case next.Log.Level != prev.Log.Level && next.Log.Level != LogInfo && next.Log.Level != LogDebug:
 		return fieldError("log.level")
-	case !isObject(s.Audio):
+	case !bytes.Equal(next.Audio, prev.Audio) && !isObject(next.Audio):
 		return fieldError("audio")
 	}
 	return nil
+}
+
+func sameWindow(a, b *Window) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 // FieldError is Update's error for one field; it wraps ErrInvalid.
@@ -476,7 +529,7 @@ func (s *Store) Update(fn func(*Settings)) error {
 	next := s.cur.clone()
 	fn(&next)
 	next.Schema = s.cur.Schema
-	if err := validate(&next); err != nil {
+	if err := validate(&s.cur, &next); err != nil {
 		return err
 	}
 	s.cur = next
@@ -561,9 +614,14 @@ func (s *Store) write(data []byte) error {
 	return nil
 }
 
-// owned are the objects this build writes whole: their keys are data (origins, monitor names) that a change may
-// remove, so a key the file had and the settings no longer have must not come back.
-var owned = map[string]bool{"serverPrefs": true, "pill.positions": true, "audio": true}
+// keyed are the objects whose keys are data (origins, monitor names) that a change may remove: a key the file had
+// and the settings no longer have must not come back. Each entry that stays is merged like any known object, so the
+// fields a newer build added inside it are kept.
+var keyed = map[string]bool{"serverPrefs": true, "pill.positions": true}
+
+// replaced are the objects this build writes whole: 05's audio section, whose keys that 05's Settings doesn't have
+// AudioStore keeps itself.
+var replaced = map[string]bool{"audio": true}
 
 // encode returns the file's new JSON object, cur over raw: unknown fields of raw (and of its known objects) stay.
 func encode(raw map[string]any, cur Settings) (map[string]any, []byte, error) {
@@ -584,18 +642,26 @@ func encode(raw map[string]any, cur Settings) (map[string]any, []byte, error) {
 }
 
 // mergeKnown returns base with every key of known set to known's value; objects present in both are merged the same
-// way, except the owned ones, which known replaces.
+// way, except the replaced ones, which known replaces. path is the object's place in the file ("" for the file,
+// "serverPrefs[]" for an entry of a keyed object); a keyed object keeps only known's keys.
 func mergeKnown(base, known map[string]any, path string) map[string]any {
 	out := make(map[string]any, len(base)+len(known))
-	maps.Copy(out, base)
+	if !keyed[path] {
+		maps.Copy(out, base)
+	}
 	for k, v := range known {
-		p := k
-		if path != "" {
+		var p string
+		switch {
+		case keyed[path]:
+			p = path + "[]"
+		case path != "":
 			p = path + "." + k
+		default:
+			p = k
 		}
 		bo, bok := base[k].(map[string]any)
 		ko, kok := v.(map[string]any)
-		if bok && kok && !owned[p] {
+		if bok && kok && !replaced[p] {
 			out[k] = mergeKnown(bo, ko, p)
 			continue
 		}

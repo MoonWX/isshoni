@@ -157,6 +157,7 @@ const (
 	spaLogPerSecond = 10
 	spaLogMaxMsg    = 1 << 10
 	spaLogMaxAttrs  = 16
+	spaLogMaxKey    = 64
 	spaLogMaxValue  = 256
 	spaDropReport   = time.Minute
 )
@@ -172,8 +173,9 @@ type spaLog struct {
 }
 
 // Log writes a line the SPA sent (lib/log.ts forwards warn and error) with component=spa: level debug, info, warn or
-// error (another level is info); the message cut to 1 KiB, at most 16 attributes cut to 256 bytes each. The SPA's
-// own code never passes an app name, window title or share label (03 §17).
+// error (another level is info); the message cut to 1 KiB, at most 16 attributes cut to 256 bytes each, in a group
+// "attrs" so that no attribute of the page can stand in for the line's own time, level, msg or component. The
+// SPA's own code never passes an app name, window title or share label (03 §17).
 func (a *App) Log(level, msg string, attrs map[string]string) {
 	now := a.clock()
 	l := &a.spaLog
@@ -193,9 +195,8 @@ func (a *App) Log(level, msg string, attrs map[string]string) {
 	}
 	l.mu.Unlock()
 
-	log := a.log.With("component", "spa")
 	if dropped > 0 {
-		log.Warn("spa: messages dropped", "count", dropped)
+		a.spa.Warn("spa: messages dropped", "count", dropped)
 	}
 	lv := slog.LevelInfo
 	switch level {
@@ -206,16 +207,24 @@ func (a *App) Log(level, msg string, attrs map[string]string) {
 	case "error":
 		lv = slog.LevelError
 	}
-	args := make([]any, 0, 2*min(len(attrs), spaLogMaxAttrs))
-	n := 0
-	for k, v := range attrs {
-		if n == spaLogMaxAttrs {
-			break
+	var args []any
+	if len(attrs) > 0 {
+		group := make([]any, 0, min(len(attrs), spaLogMaxAttrs))
+		seen := make(map[string]bool, min(len(attrs), spaLogMaxAttrs))
+		for k, v := range attrs {
+			if len(group) == spaLogMaxAttrs {
+				break
+			}
+			k = cut(k, spaLogMaxKey)
+			if seen[k] { // two long keys that differ only after the cut
+				continue
+			}
+			seen[k] = true
+			group = append(group, slog.String(k, cut(v, spaLogMaxValue)))
 		}
-		n++
-		args = append(args, slog.String(cut(k, 64), cut(v, spaLogMaxValue)))
+		args = []any{slog.Group("attrs", group...)}
 	}
-	log.Log(a.ctx, lv, cut(msg, spaLogMaxMsg), args...)
+	a.spa.Log(a.ctx, lv, cut(msg, spaLogMaxMsg), args...)
 }
 
 // cut shortens s to at most n bytes, on a rune boundary.

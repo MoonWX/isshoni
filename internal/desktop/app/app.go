@@ -70,7 +70,8 @@ const probeWait = 2 * time.Second
 // App is the desktop app. Its methods are safe for concurrent use.
 type App struct {
 	d     Deps
-	log   *slog.Logger
+	log   *slog.Logger // component=app
+	spa   *slog.Logger // component=spa: App.Log's lines (the same unscoped logger, so one component key)
 	clock func() time.Time
 
 	ctx    context.Context // the app's life: cancelled by Quit, or when Run returns
@@ -118,6 +119,7 @@ func New(d Deps) (*App, error) {
 	a := &App{
 		d:         d,
 		log:       d.Log.With("component", "app"),
+		spa:       d.Log.With("component", "spa"),
 		clock:     d.Clock,
 		ctx:       ctx,
 		cancel:    cancel,

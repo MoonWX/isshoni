@@ -30,6 +30,8 @@ type fakeInstance struct {
 	acquireErr error
 	forwardErr error
 	forwarded  []string
+	onArgs     func([]string) // what Serve was given: a test calls it as a second launch would
+	closed     int
 }
 
 func (f *fakeInstance) Acquire() (bool, error) {
@@ -37,8 +39,9 @@ func (f *fakeInstance) Acquire() (bool, error) {
 	return f.first, f.acquireErr
 }
 
-func (f *fakeInstance) Serve(func([]string)) error {
+func (f *fakeInstance) Serve(onArgs func([]string)) error {
 	*f.rec = append(*f.rec, "serve")
+	f.onArgs = onArgs
 	return nil
 }
 
@@ -48,7 +51,7 @@ func (f *fakeInstance) Forward(args []string) error {
 	return f.forwardErr
 }
 
-func (f *fakeInstance) Close() error { return nil }
+func (f *fakeInstance) Close() error { f.closed++; return nil }
 
 type startRun struct {
 	rec     []string
@@ -75,7 +78,7 @@ func newStarter(r *startRun) *starter {
 		},
 		holdRunning: func() error { r.rec = append(r.rec, "running-mutex"); return nil },
 		takePending: func() (app.Pending, error) { r.rec = append(r.rec, "take-pending"); return r.pending, nil },
-		runApp: func(p app.Args, _ []string, pending app.Pending, inst instance) int {
+		runApp: func(p app.Args, _ []string, pending app.Pending, _ *forwarded, _ instance) int {
 			r.rec = append(r.rec, "app")
 			r.gotArgs, r.gotPend = p, pending
 			return 0
@@ -83,19 +86,56 @@ func newStarter(r *startRun) *starter {
 	}
 }
 
-// TestStartOrder is 03 §13.4's order for a first instance: single instance, the running mutex, the Pending values,
-// the app.
+// TestStartOrder is 03 §13.4's order for a first instance: single instance (served at once), the running mutex,
+// the Pending values, the app; the lock is released when the start returns.
 func TestStartOrder(t *testing.T) {
 	r := &startRun{pending: app.Pending{Server: "https://watch.example.com", Room: "lounge"}}
 	if code := newStarter(r).start([]string{"--updated-from=0.2.0"}); code != 0 {
 		t.Fatalf("exit %d", code)
 	}
-	want := []string{"single-instance", "acquire", "running-mutex", "take-pending", "app"}
+	want := []string{"single-instance", "acquire", "serve", "running-mutex", "take-pending", "app"}
 	if !slices.Equal(r.rec, want) {
 		t.Errorf("steps %v, want %v", r.rec, want)
 	}
 	if r.gotPend != r.pending || r.gotArgs.UpdatedFrom != "0.2.0" {
 		t.Errorf("the app got %+v and %+v", r.gotArgs, r.gotPend)
+	}
+	if r.inst.closed == 0 {
+		t.Error("the single-instance lock wasn't released")
+	}
+}
+
+// TestForwardBeforeTheApp (03 §13.3, DK3): a second launch that comes while the first instance is still in its
+// slow steps (the running mutex, the Pending values, step 7's engine, WebView2 check and Credential Manager) is
+// taken at once and handed to the app after its own command line and the Pending values (Boot), in order.
+func TestForwardBeforeTheApp(t *testing.T) {
+	r := &startRun{}
+	s := newStarter(r)
+	early := []string{"--open-url", "isshoni://watch.example.com/r/early"}
+	s.takePending = func() (app.Pending, error) {
+		r.inst.onArgs(early) // during step 6
+		return app.Pending{Server: "https://watch.example.com"}, nil
+	}
+	var handled []string
+	s.runApp = func(_ app.Args, args []string, pending app.Pending, fwd *forwarded, inst instance) int {
+		r.inst.onArgs([]string{"--open-url", "isshoni://watch.example.com/r/later"}) // while step 7 loads
+		if len(handled) != 0 {
+			t.Errorf("handed over before the app booted: %v", handled)
+		}
+		// Boot: the start's own command line and the Pending values, then what second launches forwarded.
+		handled = append(handled, "boot "+strings.Join(args, " ")+" "+pending.Server)
+		fwd.start(func(args []string) { handled = append(handled, strings.Join(args, " ")) })
+		r.inst.onArgs([]string{"--autostart"}) // after the boot: at once
+		return exitOK
+	}
+	if code := s.start([]string{"--server", "https://a.example.com"}); code != exitOK {
+		t.Fatalf("exit %d", code)
+	}
+	want := []string{"boot --server https://a.example.com https://watch.example.com",
+		"--open-url isshoni://watch.example.com/r/early", "--open-url isshoni://watch.example.com/r/later",
+		"--autostart"}
+	if !slices.Equal(handled, want) {
+		t.Errorf("handled %q, want %q", handled, want)
 	}
 }
 
@@ -192,7 +232,7 @@ func TestSingleInstanceUnavailable(t *testing.T) {
 	s := newStarter(&startRun{})
 	s.singleInstance = func() (instance, error) { return nil, errors.New("no SID") }
 	ran := false
-	s.runApp = func(app.Args, []string, app.Pending, instance) int { ran = true; return 0 }
+	s.runApp = func(app.Args, []string, app.Pending, *forwarded, instance) int { ran = true; return 0 }
 	if code := s.start(nil); code != 0 || !ran {
 		t.Errorf("exit %d, app ran %v", code, ran)
 	}
@@ -300,22 +340,41 @@ type failingWriter struct{}
 func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("closed") }
 
 // TestForwardedQueue: command lines that second launches forward before the app booted wait, in order, and at most
-// maxQueuedForwards of them; afterwards each goes to the app at once.
+// maxQueuedForwards of them; afterwards each goes to the app at once; once Wails shuts down (stop) they are dropped.
 func TestForwardedQueue(t *testing.T) {
 	var got []string
-	f := &forwarded{handle: func(args []string) { got = append(got, strings.Join(args, " ")) }}
+	handle := func(args []string) { got = append(got, strings.Join(args, " ")) }
+	var logs bytes.Buffer
+	f := newForwarded(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	for i := range maxQueuedForwards + 2 {
 		f.receive([]string{"--open-url", "isshoni://x/r/" + string(rune('a'+i))})
 	}
 	if len(got) != 0 {
 		t.Fatalf("handled before the app booted: %v", got)
 	}
-	f.start()
+	f.start(handle)
 	if len(got) != maxQueuedForwards || got[0] != "--open-url isshoni://x/r/a" || got[7] != "--open-url isshoni://x/r/h" {
 		t.Fatalf("queued: %v", got)
 	}
 	f.receive([]string{"--autostart"})
 	if got[len(got)-1] != "--autostart" {
 		t.Errorf("after the boot: %v", got)
+	}
+	f.stop()
+	n := len(got)
+	f.receive([]string{"--open-url", "isshoni://x/r/late"})
+	if len(got) != n || !strings.Contains(logs.String(), "dropped") {
+		t.Errorf("handled after stop: %v\n%s", got, logs.String())
+	}
+
+	// Stopped before the boot (Wails quit before it started): nothing queued is handed over.
+	got = nil
+	g := newForwarded(slog.New(slog.DiscardHandler))
+	g.receive([]string{"--autostart"})
+	g.stop()
+	g.start(handle)
+	g.receive([]string{"--autostart"})
+	if len(got) != 0 {
+		t.Errorf("handled after stop: %v", got)
 	}
 }

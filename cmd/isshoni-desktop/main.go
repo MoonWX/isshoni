@@ -85,8 +85,9 @@ func run(args []string) int {
 
 // runApp is 03 §13.4 step 7 in the first instance: the env scrub, the AppUserModelID, the WebView2 runtime check,
 // logs, servers, settings, the engine, the asset handler, Wails and the app; then, once Wails runs, the app's Run,
-// HandleArgs with the Pending values (App.Boot) and the forwarded command lines of second instances.
-func runApp(p app.Args, args []string, pending app.Pending, inst instance) int {
+// HandleArgs with the Pending values (App.Boot) and the command lines second instances forwarded (fwd, served since
+// step 3).
+func runApp(p app.Args, args []string, pending app.Pending, fwd *forwarded, inst instance) int {
 	log := slog.Default().With("component", "app")
 
 	// Before application.New: Wails reads its updater-helper variables there, and WebView2 reads WEBVIEW2_* when
@@ -236,18 +237,12 @@ func runApp(p app.Args, args []string, pending app.Pending, inst instance) int {
 	}
 	theApp.Store(a)
 
-	// Second launches are served from here on, so one that comes while WebView2 starts doesn't wait past its 2 s;
-	// what arrives before Wails runs waits in fwd until Boot has run.
-	fwd := &forwarded{handle: a.HandleArgs}
-	if inst != nil {
-		if err := inst.Serve(fwd.receive); err != nil {
-			log.Warn("desktop: second launches can't reach this one", "err", err)
-		}
-	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	runDone := make(chan struct{})
 	var started sync.Once
+	// Once Wails shuts down, its window can't be shown: a forwarded command line would block on it for good.
+	wailsApp.OnShutdown(fwd.stop)
 	wailsApp.Event.OnApplicationEvent(events.Common.ApplicationStarted, func(*application.ApplicationEvent) {
 		started.Do(func() {
 			go func() {
@@ -257,10 +252,17 @@ func runApp(p app.Args, args []string, pending app.Pending, inst instance) int {
 				}
 			}()
 			a.Boot(args, pending)
-			fwd.start()
+			fwd.start(a.HandleArgs)
 		})
 	})
 	err = shell.Run()
+	// Nothing of Wails runs any more. Forwarded command lines are dropped, and the pipe and the single-instance lock
+	// go first: a launch from now on starts a new first instance instead of forwarding to this one while it finishes
+	// (the running mutex stays held until the process exits, 03 §13.4 step 4).
+	fwd.stop()
+	if inst != nil {
+		_ = inst.Close()
+	}
 	cancel()
 	started.Do(func() { close(runDone) }) // Wails never started: nothing runs
 	select {
@@ -268,59 +270,11 @@ func runApp(p app.Args, args []string, pending app.Pending, inst instance) int {
 	case <-time.After(app.QuitTimeout):
 		log.Warn("desktop: the app didn't stop in time")
 	}
-	if inst != nil {
-		_ = inst.Close()
-	}
 	if err != nil {
 		log.Error("desktop: the app stopped", "err", err)
 		return exitFailed
 	}
 	return exitOK
-}
-
-// maxQueuedForwards bounds what a second launch can queue before the first instance's window runs.
-const maxQueuedForwards = 8
-
-// forwarded holds the command lines second launches forward until the app has booted (Boot ran), then hands each to
-// handle (App.HandleArgs), in the order they came.
-type forwarded struct {
-	handle func(args []string)
-
-	mu      sync.Mutex
-	started bool
-	queue   [][]string
-}
-
-// receive is single instance's callback.
-func (f *forwarded) receive(args []string) {
-	f.mu.Lock()
-	if !f.started {
-		if len(f.queue) < maxQueuedForwards {
-			f.queue = append(f.queue, args)
-		}
-		f.mu.Unlock()
-		return
-	}
-	f.mu.Unlock()
-	f.handle(args)
-}
-
-// start hands over what was queued, in order (also what comes meanwhile); later command lines go to handle at once.
-func (f *forwarded) start() {
-	for {
-		f.mu.Lock()
-		queue := f.queue
-		f.queue = nil
-		if len(queue) == 0 {
-			f.started = true
-			f.mu.Unlock()
-			return
-		}
-		f.mu.Unlock()
-		for _, args := range queue {
-			f.handle(args)
-		}
-	}
 }
 
 // setupLogging makes the process's default logger and returns the app's own, which adds component=app. The default

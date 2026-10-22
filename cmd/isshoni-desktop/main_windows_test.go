@@ -89,12 +89,18 @@ func childStart(role string) int {
 		takePending: func() (app.Pending, error) { return app.Pending{}, nil },
 	}
 	switch role {
-	case "first": // the app: serve forwarded command lines and write the first one to out
-		s.runApp = func(_ app.Args, _ []string, _ app.Pending, inst instance) int {
-			got := make(chan []string, 1)
-			if err := inst.Serve(func(args []string) { got <- args }); err != nil {
+	case "first": // the app: take forwarded command lines (start serves them) and write the first one to out
+		s.runApp = func(_ app.Args, _ []string, _ app.Pending, fwd *forwarded, inst instance) int {
+			if inst == nil {
 				return 5
 			}
+			got := make(chan []string, 1)
+			fwd.start(func(args []string) {
+				select {
+				case got <- args:
+				default:
+				}
+			})
 			if err := os.WriteFile(out+".ready", nil, 0o600); err != nil { //nolint:gosec // G703: the test's temp file
 				return 6
 			}
@@ -110,7 +116,7 @@ func childStart(role string) int {
 			}
 		}
 	default: // a second launch or a one-shot mode: never the app
-		s.runApp = func(app.Args, []string, app.Pending, instance) int { return 9 }
+		s.runApp = func(app.Args, []string, app.Pending, *forwarded, instance) int { return 9 }
 	}
 	i := slices.Index(os.Args, "--")
 	code := s.start(os.Args[i+1:])

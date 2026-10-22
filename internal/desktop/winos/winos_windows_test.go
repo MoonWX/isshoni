@@ -195,6 +195,145 @@ func TestSingleInstanceInProcess(t *testing.T) {
 
 func windowsPipeName(s *SingleInstance) (string, error) { return s.pipeName, nil }
 
+// serving returns a first instance of a new id that serves onArgs, and a second instance of the same id.
+func serving(t *testing.T, onArgs func([]string)) (a, b *SingleInstance) {
+	t.Helper()
+	id := randomID(t)
+	a, err := NewSingleInstance(id, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first, err := a.Acquire(); err != nil || !first {
+		t.Fatalf("first Acquire: %v %v", first, err)
+	}
+	if err := a.Serve(onArgs); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+	b, err = NewSingleInstance(id, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a, b
+}
+
+// TestForwardChecksTheServer: a second launch forwards nothing to a pipe whose server runs as another account (one
+// that created the name while no first instance held it); the account is compared by SID.
+func TestForwardChecksTheServer(t *testing.T) {
+	got := make(chan []string, 2)
+	_, b := serving(t, func(args []string) { got <- args })
+	own := b.sid
+	b.sid = "S-1-5-18" // as if this launch ran as another account than the server
+	if err := b.Forward([]string{"--open-url", "isshoni://watch.example.com/"}); err == nil {
+		t.Error("forwarded to a server of another account")
+	}
+	b.sid = own
+	if err := b.Forward([]string{"--autostart"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case g := <-got:
+		if !slices.Equal(g, []string{"--autostart"}) {
+			t.Errorf("received %q: the refused forward arrived", g)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("nothing received")
+	}
+}
+
+// TestServesWhileHandling: while onArgs handles one command line, the pipe's name stays served (the next instance
+// exists before the last one closes), so another launch's forward succeeds at once and arrives afterwards.
+func TestServesWhileHandling(t *testing.T) {
+	entered, release := make(chan struct{}, 1), make(chan struct{})
+	got := make(chan []string, 2)
+	_, b := serving(t, func(args []string) {
+		select {
+		case entered <- struct{}{}:
+			<-release
+		default:
+		}
+		got <- args
+	})
+	defer close(release)
+	if err := b.Forward([]string{"one"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("onArgs wasn't called")
+	}
+	start := time.Now()
+	if err := b.Forward([]string{"two"}); err != nil {
+		t.Fatalf("a forward while onArgs runs: %v", err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("the forward waited %v for a pipe instance", d)
+	}
+	release <- struct{}{}
+	for _, want := range []string{"one", "two"} {
+		select {
+		case g := <-got:
+			if !slices.Equal(g, []string{want}) {
+				t.Errorf("received %q, want %q", g, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s wasn't received", want)
+		}
+	}
+}
+
+// TestCloseDoesntWaitForOnArgs: Close releases the lock within its bound even while onArgs blocks (the caller's
+// code: a window that can't be shown any more), and a new first instance can take the lock and serve.
+func TestCloseDoesntWaitForOnArgs(t *testing.T) {
+	entered, release := make(chan struct{}, 1), make(chan struct{})
+	defer close(release)
+	a, b := serving(t, func([]string) {
+		entered <- struct{}{}
+		<-release
+	})
+	if err := b.Forward([]string{"--autostart"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("onArgs wasn't called")
+	}
+	start := time.Now()
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > closeWait+time.Second {
+		t.Errorf("Close took %v", d)
+	}
+	if first, err := b.Acquire(); err != nil || !first {
+		t.Fatalf("Acquire after Close: %v %v", first, err)
+	}
+	got := make(chan []string, 1)
+	if err := b.Serve(func(args []string) { got <- args }); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = b.Close() }()
+	release <- struct{}{} // the old server's goroutine ends and lets go of the name
+	select {
+	case <-a.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the old server's goroutine didn't end once onArgs returned")
+	}
+	if err := b.Forward([]string{"after"}); err != nil { // b, now the first instance, forwards to itself
+		t.Fatal(err)
+	}
+	select {
+	case g := <-got:
+		if !slices.Equal(g, []string{"after"}) {
+			t.Errorf("received %q", g)
+		}
+	case <-time.After(firstPipeWait + 5*time.Second):
+		t.Fatal("the new first instance doesn't serve")
+	}
+}
+
 // TestSingleInstanceAcrossProcesses (W6, 03 §22.2): a second process forwards an --open-url link and exits 0 within
 // 2 s; the first receives it.
 func TestSingleInstanceAcrossProcesses(t *testing.T) {

@@ -15,7 +15,9 @@ import (
 // read and delete the Pending values and take the running mutex's place in the order (README WA41's PR).
 //
 // The pipe accepts only the current user (its DACL) and no remote client; the first instance treats what arrives as
-// untrusted arguments (app.HandleArgs).
+// untrusted arguments (app.HandleArgs). The first instance creates the next pipe instance before it closes the one it
+// served, so the name is never free while it serves; a second launch connects at identification level only (the
+// server can't impersonate it) and forwards nothing to a server that runs as another account.
 
 // ForwardTimeout bounds a second instance's forward (03 §13.3, §20).
 const ForwardTimeout = 2 * time.Second
