@@ -1,6 +1,7 @@
 // The watcher's portable parts (docs/m2/05-windows-audio.md §12; README WA35): the report writer against the golden
 // reports that Go's media.ParseAudioReport reads (internal/media/testdata/audio, 05 §13.1), byte for byte, and the
-// level store's lock-free sample (05 §12.2). Pure C++: no audio device needed.
+// level store's lock-free sample (05 §12.2). Pure C++: no audio device needed. The writer is interim (report.h): its
+// golden tests go with it when README WA45 switches to audiomix's writer.
 #include <atomic>
 #include <cmath>
 #include <cstring>

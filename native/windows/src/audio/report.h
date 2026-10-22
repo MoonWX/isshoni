@@ -5,6 +5,11 @@
 //
 // The rows come straight from im_audiopolicy's plan (AppRow); names, exe names and app ids are local data that the
 // report carries to Go and never into a log (05 §16).
+//
+// Interim (README WA35): 05 A4 puts the report writer in native/common/audiomix (README WA36, checked against the same
+// goldens), and this one exists only because the watcher lands first. When README WA45 wires the mixer, audiomix's
+// writer replaces this one (WriteReportJson and its golden test here go; VisibleState moves next to that writer or
+// stays here), so one writer and one golden test remain.
 #pragma once
 
 #include <cstddef>

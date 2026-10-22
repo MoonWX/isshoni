@@ -11,6 +11,7 @@
 // thread.
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -45,13 +46,15 @@ public:
   void SetRules(audiopolicy::Exclusions ex);
   // im_audio_watch: replaces the rules and starts watching (idempotent). Returns once the first report is out.
   im_status Watch(audiopolicy::Exclusions ex);
-  // im_audio_unwatch: stops watching (idempotent), forgets mic and lineage state (audiopolicy::Planner::Reset).
+  // im_audio_unwatch: stops watching (idempotent). Mic roots and lineage are kept, keyed by process key (05 §5.6,
+  // §5.7: for the process's lifetime, whether or not the sheet stays open); every reconcile prunes the exited ones.
   im_status Unwatch();
   bool watching() const noexcept;
 
   // im_list_audio_apps (05 §12.1), snprintf rule: the latest report while watching; otherwise a one-shot snapshot
-  // (state "stopped") taken on the thread. A one-shot document is kept for a second, so the snprintf rule's retry with
-  // a larger buffer gets the same document.
+  // (state "stopped") taken on the thread with the remembered mic roots and lineage. The thread keeps a one-shot
+  // document for a second, so the snprintf rule's retry with a larger buffer gets the same document, and drops it when
+  // rules, watch or unwatch change what a report says.
   int32_t ListAppsJson(char *buf, int32_t cap);
   // im_audio_levels_get (05 §12.2): lock-free; IM_ERR_BAD_STATE (token not_watching) while not watching. out passed
   // CheckOut; it is written up to its struct_size.
@@ -64,7 +67,8 @@ public:
 
 private:
   std::shared_ptr<State> st_;
-  std::thread thread_;
+  std::thread thread_;              // used by Start and Stop only (the engine's Init and Shutdown)
+  std::atomic<bool> started_{false}; // what the other methods check: set once the thread runs
 };
 
 } // namespace im::audio

@@ -27,6 +27,7 @@
 #include "im/abi/struct_size.h"
 #include "im/audiopolicy/planner.h"
 #include "im/audiopolicy/process_table.h"
+#include "im/audiopolicy/text.h"
 #include "im/log/ring.h"
 
 namespace im::audio {
@@ -63,9 +64,23 @@ struct Request {
   bool done = false;
   im_status status = IM_OK;
   std::string detail;
-  std::string doc;    // kOneShot
-  uint32_t flags = 0; // kProbeFlags
+  std::shared_ptr<const std::string> doc; // kOneShot
+  uint32_t flags = 0;                     // kProbeFlags
 };
+
+// The rules before the first im_set_exclusions or im_audio_watch: none of Go's, only the implicit instance rule on this
+// process that the DLL always adds (05 §4.3), so even a one-shot report before them shows isshoni's own sessions as
+// kept out.
+audiopolicy::Exclusions ImplicitRules() {
+  im_exclusions e{};
+  e.struct_size = sizeof e;
+  e.flags = audiopolicy::Exclusions{}.flags;
+  audiopolicy::Exclusions x;
+  if (audiopolicy::ParseExclusions(&e, static_cast<uint32_t>(GetCurrentProcessId()), x) != IM_OK) {
+    log::Error("audio", "audio watcher: the implicit rule was refused");
+  }
+  return x;
+}
 
 } // namespace
 
@@ -77,8 +92,8 @@ struct Watcher::State {
 
   std::mutex mu; // guards what follows
   std::deque<std::shared_ptr<Request>> requests;
-  std::shared_ptr<const std::string> report; // the latest report while watching
-  std::shared_ptr<const std::string> oneshot;
+  std::shared_ptr<const std::string> report;  // the latest report while watching
+  std::shared_ptr<const std::string> oneshot; // the last one-shot report, set on the thread only
   int64_t oneshot_ns = 0;
 
   std::mutex done_mu;
@@ -91,7 +106,10 @@ namespace {
 // The thread's state: everything COM lives here and dies on the thread, before CoUninitialize.
 class Loop {
 public:
-  Loop(std::shared_ptr<Watcher::State> st, HRESULT com) : st_(std::move(st)), com_(com), endpoints_(st_->signals) {}
+  Loop(std::shared_ptr<Watcher::State> st, HRESULT com)
+      : st_(std::move(st)), com_(com), endpoints_(st_->signals), rules_(ImplicitRules()) {
+    planner_.SetExclusions(rules_);
+  }
 
   void Run() {
     EnsureEnumerator(engine::os::QpcNs());
@@ -153,6 +171,7 @@ private:
     switch (r.kind) {
     case RequestKind::kRules:
       ApplyRules(std::move(r.rules), now);
+      DropOneShot();
       r.Finish(IM_OK);
       return;
     case RequestKind::kWatch:
@@ -167,10 +186,12 @@ private:
         planner_.SetExclusions(rules_);
         StartWatching(now);
       }
+      DropOneShot();
       r.Finish(IM_OK);
       return;
     case RequestKind::kUnwatch:
       StopWatching();
+      DropOneShot();
       r.Finish(IM_OK);
       return;
     case RequestKind::kOneShot:
@@ -198,6 +219,14 @@ private:
     for (auto &r : left) {
       r->Finish(IM_ERR_BAD_STATE, why);
     }
+  }
+
+  // A request that changes what a report says (rules, watch, unwatch) drops the kept one-shot report once it applied.
+  // The queue is FIFO, so a one-shot served before the request can't outlive it; Enqueue drops it as well, for a
+  // caller that reads the cache before the request is served.
+  void DropOneShot() {
+    std::lock_guard<std::mutex> l(st_->mu);
+    st_->oneshot.reset();
   }
 
   void ApplyRules(audiopolicy::Exclusions ex, int64_t now) {
@@ -270,6 +299,11 @@ private:
               {{"render_endpoints", endpoints_.render_count()}, {"capture_endpoints", endpoints_.capture_count()}});
   }
 
+  // The sheet closed (05 §14.2). The planner keeps its mic roots and lineage cache (Restart, not Reset): a mic root
+  // stays one until its process exits (05 §5.6) and lineage lasts for the process's lifetime (§5.7), even when the
+  // sheet closes in between. Both are keyed by process key (pid and creation time), and every reconcile, the next
+  // watch's or a one-shot's, prunes the keys that are no longer in the table, so a reused pid inherits nothing (only a
+  // process whose creation time can't be read, key time 0, could, and that keeps more out, never less).
   void StopWatching() {
     if (!watching_) {
       return;
@@ -278,13 +312,13 @@ private:
     st_->watching.store(false, std::memory_order_release);
     endpoints_.Clear();
     endpoints_.TakeGone();
-    planner_.Reset();
+    planner_.Restart();
     snapshotter_.Clear();
     {
       std::lock_guard<std::mutex> l(st_->mu);
       st_->report.reset();
     }
-    st_->signals->sessions.store(0, std::memory_order_release);
+    st_->signals->sessions.exchange(0, std::memory_order_acq_rel);
     st_->signals->first_session_ns.store(0, std::memory_order_release);
     log::Info("audio", "watch stopped");
   }
@@ -340,7 +374,7 @@ private:
       }
     }
     if (!watching_) {
-      s.sessions.store(0, std::memory_order_release);
+      s.sessions.exchange(0, std::memory_order_acq_rel);
       s.first_session_ns.store(0, std::memory_order_release);
       return;
     }
@@ -351,9 +385,12 @@ private:
     if (first != 0 && now - first < kDebounceNs) {
       return; // more may follow: Deadline() wakes the loop when the 20 ms are up
     }
-    // Reset before the refresh: an event during it starts the next round, so none is lost.
+    // Reset before the refresh: an event during it starts the next round, so none is lost. The count goes first
+    // (Signals::OnSession counts, then sets the time): an event counted between the two resets leaves sessions > 0
+    // with first_session_ns == 0, which Deadline() turns into an immediate wake-up; one whose count the exchange took
+    // happened before the refresh below, which sees it.
+    s.sessions.exchange(0, std::memory_order_acq_rel);
     s.first_session_ns.store(0, std::memory_order_release);
-    s.sessions.store(0, std::memory_order_release);
     if (endpoints_.RefreshSessions(true, now) == AUDCLNT_E_SERVICE_NOT_RUNNING) {
       ServiceGone(now);
     }
@@ -394,9 +431,9 @@ private:
 
   // --------------------------------------------------------------------------------------------- reconcile
 
-  // One plan over a fresh process table and eps' sessions, as a report (05 §7.3, §12.1). With track, the sessions
-  // keep their app ids (the levels' rows) and announce themselves, and the report gets the watcher's events.
-  Report Plan(EndpointSet &eps, audiopolicy::Planner &planner, int64_t now, bool track) {
+  // One plan by planner_ over a fresh process table and eps' sessions, as a report (05 §7.3, §12.1). With track, the
+  // sessions keep their app ids (the levels' rows) and announce themselves, and the report gets the watcher's events.
+  Report Plan(EndpointSet &eps, int64_t now, bool track) {
     std::vector<audiopolicy::ProcessEntry> entries;
     snapshotter_.Take(entries);
     std::vector<TrackedSession *> tracked = eps.sessions();
@@ -413,14 +450,14 @@ private:
       s.last_active_ns = t->last_active_ns;
       sessions.push_back(s);
     }
-    DescribeSessionLineage(entries, tracked);
+    DescribeRowProcesses(entries, tracked);
     const audiopolicy::ProcessTable table(std::move(entries));
     audiopolicy::PlanInput in;
     in.now_ns = now;
     in.mode = IM_AUDIO_MODE_OFF; // no capture runs (README WA45 adds it): the include set's prediction, engine none
     in.process_loopback = true;
     in.sessions = sessions;
-    const audiopolicy::Plan plan = planner.Reconcile(table, in);
+    const audiopolicy::Plan plan = planner_.Reconcile(table, in);
     if (!plan.violations.empty()) {
       log::Error("audio", "audio policy invariant broken", {{"violations", plan.violations.size()}});
     }
@@ -464,8 +501,9 @@ private:
         }
       }
     }
+    // The planner counts each block once across watching and one-shots (they share it), so both add theirs.
+    counters_.pid_reuse_blocks += plan.pid_reuse_blocks;
     if (track) {
-      counters_.pid_reuse_blocks += plan.pid_reuse_blocks;
       for (std::string &app : eps.TakeGone()) {
         Event(now, "session_expired", std::move(app));
       }
@@ -476,10 +514,13 @@ private:
     return r;
   }
 
-  // FileDescription for the processes a row can be named after: those with a session and their parent chains
-  // (05 §5.1; descriptions are cached per image path).
-  void DescribeSessionLineage(std::vector<audiopolicy::ProcessEntry> &entries,
-                              const std::vector<TrackedSession *> &tracked) {
+  // FileDescription for the processes a report row can be named after (05 §5.1; descriptions are cached per image
+  // path), each with its parent chain, which the app walk that finds a row's app root and rule match follows: the
+  // processes with a session; the shared window's process (its app is a row even when silent, 05 §12.1); and the
+  // processes an exe rule without a name matches (a row without a session, such as a silent built-in, is named after
+  // the process its rule matched).
+  void DescribeRowProcesses(std::vector<audiopolicy::ProcessEntry> &entries,
+                            const std::vector<TrackedSession *> &tracked) {
     std::unordered_map<uint32_t, std::size_t> by_pid;
     by_pid.reserve(entries.size());
     for (std::size_t i = 0; i < entries.size(); ++i) {
@@ -487,8 +528,7 @@ private:
     }
     std::unordered_set<std::size_t> picked;
     std::vector<std::size_t> want;
-    for (const TrackedSession *t : tracked) {
-      uint32_t pid = t->pid;
+    const auto chain = [&](uint32_t pid) {
       for (int step = 0; step < audiopolicy::kMaxWalk && pid != 0; ++step) {
         const auto it = by_pid.find(pid);
         if (it == by_pid.end() || !picked.insert(it->second).second) {
@@ -496,6 +536,23 @@ private:
         }
         want.push_back(it->second);
         pid = entries[it->second].parent_pid;
+      }
+    };
+    for (const TrackedSession *t : tracked) {
+      chain(t->pid);
+    }
+    chain(rules_.shared_pid);
+    std::unordered_set<std::string> unnamed; // rule values are case-folded (audiopolicy::Rule)
+    for (const audiopolicy::Rule &rule : rules_.rules) {
+      if ((rule.kind == IM_RULE_APP_EXCLUDE || rule.kind == IM_RULE_APP_ALLOW) && rule.name.empty()) {
+        unnamed.insert(rule.value);
+      }
+    }
+    if (!unnamed.empty()) {
+      for (std::size_t i = 0; i < entries.size(); ++i) {
+        if (unnamed.count(audiopolicy::FoldCase(entries[i].exe)) != 0) {
+          chain(entries[i].pid);
+        }
       }
     }
     snapshotter_.Describe(entries, want);
@@ -505,7 +562,7 @@ private:
     if (!watching_) {
       return;
     }
-    Report r = Plan(endpoints_, planner_, now, true);
+    Report r = Plan(endpoints_, now, true);
     std::string visible = VisibleState(r);
     if (visible != visible_) {
       ++seq_; // anything visible changed (05 §12.1)
@@ -517,15 +574,19 @@ private:
     st_->report = std::move(doc);
   }
 
-  std::string OneShot(int64_t now) {
+  // The report for im_list_audio_apps when the caller had none: the live one while watching, else a one-shot snapshot
+  // that is kept for the snprintf rule's retry (ListAppsJson). It is stored here, on the thread, so it is ordered with
+  // the requests that drop it (DropOneShot).
+  std::shared_ptr<const std::string> OneShot(int64_t now) {
     if (watching_) {
       std::lock_guard<std::mutex> l(st_->mu);
       if (st_->report) {
-        return *st_->report;
+        return st_->report;
       }
     }
-    // A snapshot without registrations, planned with the current rules by a planner of its own (no mic stickiness
-    // or lineage to remember), state "stopped" (05 §12.1).
+    // A snapshot without registrations, planned with the current rules and the planner's remembered mic roots and
+    // lineage (a voice app that was a mic root while the sheet was open still is), state "stopped" (05 §12.1). The
+    // plan runs in mode off, so the engine state it leaves is the one Restart leaves.
     EndpointSet eps(st_->signals);
     if (EnsureEnumerator(now)) {
       if (eps.Rebuild(en_.Get(), false) == AUDCLNT_E_SERVICE_NOT_RUNNING ||
@@ -534,13 +595,17 @@ private:
         ServiceGone(now);
       }
     }
-    audiopolicy::Planner planner;
-    planner.SetExclusions(rules_);
-    Report r = Plan(eps, planner, now, false);
+    Report r = Plan(eps, now, false);
     eps.Clear();
     r.state = "stopped";
     r.seq = seq_;
-    return WriteReportJson(r);
+    auto doc = std::make_shared<const std::string>(WriteReportJson(r));
+    if (!watching_) {
+      std::lock_guard<std::mutex> l(st_->mu);
+      st_->oneshot = doc;
+      st_->oneshot_ns = engine::os::QpcNs();
+    }
+    return doc;
   }
 
   void PublishLevels(int64_t now) {
@@ -664,6 +729,7 @@ im_status Watcher::Start() {
   } catch (const std::system_error &e) {
     return abi::Failf(IM_ERR_INTERNAL, {}, "audio watcher: the thread did not start: %s", e.what());
   }
+  started_.store(true, std::memory_order_release);
   return IM_OK;
 }
 
@@ -702,7 +768,8 @@ void Watcher::Stop() noexcept {
 namespace {
 
 // Queues r; false when the thread doesn't run (any more). A request that changes what a report says (rules, watch,
-// unwatch) also drops the kept one-shot report.
+// unwatch) also drops the kept one-shot report, here for the callers that read it before the request is served, and
+// again on the thread once it applied (Loop::DropOneShot).
 bool Enqueue(Watcher::State &st, std::shared_ptr<Request> r) {
   {
     std::lock_guard<std::mutex> l(st.mu);
@@ -723,7 +790,7 @@ bool Enqueue(Watcher::State &st, std::shared_ptr<Request> r) {
 void Watcher::SetRules(audiopolicy::Exclusions ex) {
   auto r = std::make_shared<Request>(RequestKind::kRules);
   r->rules = std::move(ex);
-  if (thread_.joinable()) {
+  if (started_.load(std::memory_order_acquire)) {
     Enqueue(*st_, std::move(r));
   }
 }
@@ -731,7 +798,7 @@ void Watcher::SetRules(audiopolicy::Exclusions ex) {
 im_status Watcher::Watch(audiopolicy::Exclusions ex) {
   auto r = std::make_shared<Request>(RequestKind::kWatch);
   r->rules = std::move(ex);
-  if (!thread_.joinable() || !Enqueue(*st_, r)) {
+  if (!started_.load(std::memory_order_acquire) || !Enqueue(*st_, r)) {
     return abi::Fail(IM_ERR_BAD_STATE, {}, "im_audio_watch: the audio watcher is not running");
   }
   return Await(*r, "im_audio_watch", true);
@@ -739,7 +806,7 @@ im_status Watcher::Watch(audiopolicy::Exclusions ex) {
 
 im_status Watcher::Unwatch() {
   auto r = std::make_shared<Request>(RequestKind::kUnwatch);
-  if (!thread_.joinable() || !Enqueue(*st_, r)) {
+  if (!started_.load(std::memory_order_acquire) || !Enqueue(*st_, r)) {
     return IM_OK; // nothing watches
   }
   return Await(*r, "im_audio_unwatch", true);
@@ -749,27 +816,26 @@ bool Watcher::watching() const noexcept { return st_->watching.load(std::memory_
 
 int32_t Watcher::ListAppsJson(char *buf, int32_t cap) {
   std::shared_ptr<const std::string> doc;
-  const int64_t now = engine::os::QpcNs();
   {
     std::lock_guard<std::mutex> l(st_->mu);
     if (st_->watching.load(std::memory_order_acquire) && st_->report) {
       doc = st_->report;
-    } else if (st_->oneshot && now - st_->oneshot_ns < kOneShotReuseNs) {
-      doc = st_->oneshot;
+    } else if (st_->oneshot && engine::os::QpcNs() - st_->oneshot_ns < kOneShotReuseNs) {
+      doc = st_->oneshot; // the thread keeps it (Loop::OneShot); the caller only reads it
     }
   }
   if (!doc) {
     auto r = std::make_shared<Request>(RequestKind::kOneShot);
-    if (!thread_.joinable() || !Enqueue(*st_, r)) {
+    if (!started_.load(std::memory_order_acquire) || !Enqueue(*st_, r)) {
       return abi::Fail(IM_ERR_BAD_STATE, {}, "im_list_audio_apps: the audio watcher is not running");
     }
     if (const im_status st = Await(*r, "im_list_audio_apps", true); st != IM_OK) {
       return st;
     }
-    doc = std::make_shared<const std::string>(std::move(r->doc));
-    std::lock_guard<std::mutex> l(st_->mu);
-    st_->oneshot = doc;
-    st_->oneshot_ns = engine::os::QpcNs();
+    doc = std::move(r->doc);
+    if (!doc) {
+      return abi::Fail(IM_ERR_INTERNAL, {}, "im_list_audio_apps: the audio watcher gave no report");
+    }
   }
   const int32_t n = abi::CopyOut(*doc, buf, cap);
   if (n < 0) {
@@ -788,7 +854,7 @@ im_status Watcher::LevelsGet(im_audio_levels *out) {
 
 uint32_t Watcher::ProbeFlags() {
   auto r = std::make_shared<Request>(RequestKind::kProbeFlags);
-  if (!thread_.joinable() || !Enqueue(*st_, r)) {
+  if (!started_.load(std::memory_order_acquire) || !Enqueue(*st_, r)) {
     return 0;
   }
   if (Await(*r, "audio probe flags", false) != IM_OK) {
