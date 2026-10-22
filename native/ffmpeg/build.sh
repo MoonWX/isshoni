@@ -199,9 +199,9 @@ render() {
 # banner: 19.44.35229 for cl.exe's "Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35229 for x64", 14.44.35229.0
 # for link.exe's "Microsoft (R) Incremental Linker Version 14.44.35229.0". It prints nothing when that line holds no
 # dotted number of three or four parts. The number is found without the word "Version", so a localized banner reads
-# the same. Both programs print their usage after the banner and may exit nonzero, so the status is ignored, and sed
-# reads all of their output and prints at most one line: an early-exiting reader (head -n 1) right after PROGRAM could
-# kill it with SIGPIPE, which pipefail turns into a failed build.
+# the same. Both programs print their usage after the banner and may exit nonzero, so the status is ignored (|| true),
+# and sed reads all of the output and prints at most one line: an early-exiting reader (head -n 1) after tr would kill
+# tr with SIGPIPE, which pipefail turns into a failed build.
 banner_version() {
   { "$1" 2>&1 </dev/null || true; } | tr -d '\r' |
     sed -n '1s/^\(.*[^0-9.]\)\{0,1\}\([0-9][0-9]*\(\.[0-9][0-9]*\)\{2,3\}\)\([^0-9.].*\)\{0,1\}$/\2/p' | head -n 1

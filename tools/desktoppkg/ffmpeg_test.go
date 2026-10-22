@@ -123,10 +123,7 @@ func TestInputsSHA256(t *testing.T) {
 // TestInputsSHA256MatchesBuildScript: native/ffmpeg/build.sh's inputs_sha256 (what the build records) and this
 // command (what consumers compare with lock.json) give the same hash for the committed files.
 func TestInputsSHA256MatchesBuildScript(t *testing.T) {
-	bash, err := exec.LookPath("bash")
-	if err != nil {
-		t.Skip("no bash")
-	}
+	bash := needBash(t)
 	if _, err := exec.LookPath("sha256sum"); err != nil {
 		t.Skip("no sha256sum")
 	}
@@ -150,10 +147,7 @@ func TestInputsSHA256MatchesBuildScript(t *testing.T) {
 // headers, under the script's own shell options (sourcing it applies set -Eeuo pipefail) over headers larger than a
 // pipe buffer, as nvEncodeAPI.h (291 KB) is: a /* */ notice with CRLF line ends and a // notice.
 func TestHeaderNotices(t *testing.T) {
-	bash, err := exec.LookPath("bash")
-	if err != nil {
-		t.Skip("no bash")
-	}
+	bash := needBash(t)
 	dir := t.TempDir()
 	body := strings.Repeat("#define ISSHONI_TEST_PADDING_VALUE_OF_A_LONG_HEADER 0x0123456789abcdef\n", 2200) // > 128 KiB
 	block := strings.ReplaceAll("/*\n * Copyright (c) 2026 Block Notice Inc.\n *\n * Permission is hereby granted.\n */\n"+body, "\n", "\r\n")
@@ -201,8 +195,8 @@ func TestHeaderNotices(t *testing.T) {
 // TestBannerVersion runs build.sh's banner_version, which reads the compiler and linker builds of the toolset build
 // (06 §3) from cl.exe's and link.exe's banners, under the script's own shell options (sourcing it applies set -Eeuo
 // pipefail), with a fake program: a CRLF banner, then a usage text larger than a pipe buffer, and an exit status that
-// is not always 0, as link.exe's. A reader that left early (head -n 1 straight after the program or after tr) would
-// kill the program or tr with SIGPIPE, and pipefail would fail the build.
+// is not always 0, as link.exe's. A reader that left early (head -n 1 straight after tr) would kill tr with SIGPIPE,
+// and pipefail would fail the build.
 func TestBannerVersion(t *testing.T) {
 	bash := needBash(t)
 	usage := strings.Repeat("  /OPTION:value    a usage line that names a version 1.2.3.4 too\r\n", 2500)
