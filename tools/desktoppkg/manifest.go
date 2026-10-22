@@ -11,11 +11,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,7 +34,11 @@ import (
 //
 // The JSON has sorted keys, two-space indentation and LF line ends, so the same inputs give the same bytes on every
 // OS; an empty revocation list is the exact line `  "revokedKeys": [],`, which check-draft.sh relies on (06 §11.3).
-// The app's parser (internal/update's ParseManifest) reads the golden file of this command's test.
+// The app's parser (internal/update's ParseManifest) reads the golden files of this command's tests.
+//
+// notesUrl and the installer's url point into https://github.com/MoonWX/isshoni/releases. -releases names another
+// releases URL for the updater e2e's ci manifests (06 §16), which relserve serves and an updatetest build reads
+// through ISSHONI_UPDATE_TEST_BASE (06 §8.11): internal/update then wants every URL under that base instead.
 
 const (
 	manifestName    = "isshoni-desktop-update.json"
@@ -55,7 +61,7 @@ var (
 	backupNameRE  = regexp.MustCompile(`^isshoni-update-backup-[0-9]+$`)
 )
 
-// runManifest is `desktoppkg manifest -version V -installer FILE [-date T] [-out FILE]`.
+// runManifest is `desktoppkg manifest -version V -installer FILE [-date T] [-out FILE] [-releases URL]`.
 func runManifest(ctx context.Context, e *env, args []string) error {
 	fs := flag.NewFlagSet("manifest", flag.ContinueOnError)
 	fs.SetOutput(e.stderr)
@@ -63,6 +69,9 @@ func runManifest(ctx context.Context, e *env, args []string) error {
 	installer := fs.String("installer", "", "the NSIS installer, isshoni-desktop_<version>_windows_amd64_setup.exe (required)")
 	date := fs.String("date", "", "publishedAt: the tag commit's date, RFC 3339 (default: `git log -1 --format=%cI HEAD` in the root)")
 	out := fs.String("out", "", "the file to write (default: <root>/dist-desktop/"+manifestName+")")
+	releases := fs.String("releases", releasesURL, "the releases URL that notesUrl and the installer's url point "+
+		"into; another one only for a ci version (X.Y.Z-ci.N): https://…, or http://127.0.0.1:<port>, with an "+
+		"optional path, as ISSHONI_UPDATE_TEST_BASE names it (06 §8.11)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return err
@@ -87,7 +96,8 @@ func runManifest(ctx context.Context, e *env, args []string) error {
 	if err != nil {
 		return fmt.Errorf("%w: -date %q is not RFC 3339", errUsage, dateText)
 	}
-	in := manifestInput{version: strings.TrimPrefix(*ver, "v"), installer: *installer, published: published}
+	in := manifestInput{version: strings.TrimPrefix(*ver, "v"), installer: *installer, published: published,
+		releases: *releases}
 	if in.minVersion, err = readMinVersion(e.root); err != nil {
 		return err
 	}
@@ -109,8 +119,12 @@ func runManifest(ctx context.Context, e *env, args []string) error {
 	if err := os.WriteFile(path, data, 0o644); err != nil { //nolint:gosec // G306, G703: a public release asset, where the caller asked
 		return err
 	}
-	_, err = fmt.Fprintf(e.stdout, "wrote %s: version %s, channel %s, minVersion %s, %d revoked keys\n",
-		path, in.version, channelFor(in.version), in.minVersion, len(in.revoked))
+	var under string
+	if in.releases != "" && in.releases != releasesURL {
+		under = ", releases URL " + in.releases
+	}
+	_, err = fmt.Fprintf(e.stdout, "wrote %s: version %s, channel %s, minVersion %s, %d revoked keys%s\n",
+		path, in.version, channelFor(in.version), in.minVersion, len(in.revoked), under)
 	return err
 }
 
@@ -121,6 +135,7 @@ type manifestInput struct {
 	published  time.Time // the tag commit's date
 	minVersion string    // deploy/desktop/min-version
 	revoked    []string  // deploy/keys/update_revoked
+	releases   string    // the releases URL the manifest's URLs point into; "" is releasesURL
 }
 
 // buildManifest returns the manifest's bytes (06 §8.2).
@@ -132,6 +147,10 @@ func buildManifest(in manifestInput) ([]byte, error) {
 	if channel != "ci" && semver.Compare("v"+in.minVersion, "v"+in.version) > 0 {
 		return nil, fmt.Errorf("%s is %s, above the release's version %s: every app, the updated ones too, would show "+
 			"the update as required", minVersionFile, in.minVersion, in.version)
+	}
+	releases, err := releasesBase(in.releases, channel)
+	if err != nil {
+		return nil, err
 	}
 	name := fmt.Sprintf("isshoni-desktop_%s_windows_amd64_setup.exe", in.version)
 	if base := filepath.Base(in.installer); base != name {
@@ -159,13 +178,13 @@ func buildManifest(in manifestInput) ([]byte, error) {
 		"minVersion":  in.minVersion,
 		"publishedAt": in.published.UTC().Format(wireTimeLayout),
 		"expiresAt":   in.published.Add(manifestExpiry).UTC().Format(wireTimeLayout),
-		"notesUrl":    releasesURL + "/tag/v" + in.version,
+		"notesUrl":    releases + "/tag/v" + in.version,
 		"artifacts": []map[string]any{{
 			"os":     "windows",
 			"arch":   "amd64",
 			"kind":   "nsis",
 			"name":   name,
-			"url":    releasesURL + "/download/v" + in.version + "/" + name,
+			"url":    releases + "/download/v" + in.version + "/" + name,
 			"size":   size,
 			"sha256": sum,
 		}},
@@ -180,6 +199,46 @@ func buildManifest(in manifestInput) ([]byte, error) {
 		return nil, err
 	}
 	return b.Bytes(), nil
+}
+
+// releasePathRE is the path of a test releases URL: "" or /-separated segments of unreserved characters, none of them
+// starting with a dot (so no . or ..), and no trailing slash.
+var releasePathRE = regexp.MustCompile(`^(/[A-Za-z0-9_~-][A-Za-z0-9._~-]*)*$`)
+
+// releasesBase returns the releases URL that a manifest in channel points into: releasesURL for "" and for
+// releasesURL itself. Any other base is a test base, the ISSHONI_UPDATE_TEST_BASE of an updatetest build (06 §8.11),
+// which internal/update then takes in place of its ReleasesURL. Only a ci manifest may have one, since no release
+// build accepts the ci channel, and the base is an https URL or an http://127.0.0.1:<port> origin (relserve's in the
+// updater e2e, 06 §16), with an optional path to a release root, and no trailing slash, query, fragment or user.
+func releasesBase(base, channel string) (string, error) {
+	if base == "" || base == releasesURL {
+		return releasesURL, nil
+	}
+	if channel != "ci" {
+		return "", fmt.Errorf("-releases %q: a %s release's manifest points into %s; another releases URL is only "+
+			"for a ci version, X.Y.Z-ci.N (06 §8.11)", base, channel, releasesURL)
+	}
+	u, err := url.Parse(base)
+	if err != nil {
+		return "", fmt.Errorf("-releases %q: %w", base, err)
+	}
+	switch {
+	case u.User != nil || u.Opaque != "" || u.RawQuery != "" || u.ForceQuery || strings.ContainsAny(base, "?#%") ||
+		!releasePathRE.MatchString(u.Path) || u.String() != base:
+		return "", fmt.Errorf("-releases %q: want a scheme, a host and an optional path, without a trailing slash, "+
+			"query, fragment or user", base)
+	case u.Scheme == "https" && u.Hostname() != "" && (u.Port() == "" || validPort(u.Port())):
+	case u.Scheme == "http" && u.Hostname() == "127.0.0.1" && validPort(u.Port()):
+	default:
+		return "", fmt.Errorf("-releases %q: want https://…, or http://127.0.0.1:<port> (06 §8.11)", base)
+	}
+	return base, nil
+}
+
+// validPort reports whether p is a TCP port number, 1 to 65535, without leading zeros.
+func validPort(p string) bool {
+	n, err := strconv.ParseUint(p, 10, 16)
+	return err == nil && n > 0 && strconv.FormatUint(n, 10) == p
 }
 
 // channelFor returns the channel of a release of version v (06 §8.2): stable for X.Y.Z, beta for X.Y.Z-rc.N, and ci

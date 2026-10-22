@@ -9,6 +9,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -17,9 +18,16 @@ import (
 
 var update = flag.Bool("update", false, "rewrite the golden files in testdata")
 
-// goldenManifest is the manifest of manifestTree's release. internal/update's tests parse it too, so the writer and
-// the app's parser can't drift apart.
-var goldenManifest = filepath.Join("testdata", "manifest", manifestName)
+// goldenManifest is the manifest of manifestTree's release, and goldenTestBaseManifest an updater e2e manifest under
+// testBase. internal/update's tests parse both, so the writer and the app's parser can't drift apart.
+var (
+	goldenManifest         = filepath.Join("testdata", "manifest", manifestName)
+	goldenTestBaseManifest = filepath.Join("testdata", "manifest", "test-base", manifestName)
+)
+
+// testBase is the -releases URL of goldenTestBaseManifest: relserve's origin as ISSHONI_UPDATE_TEST_BASE names it in
+// the updater e2e (06 §8.11, §16). internal/update's test of that file uses the same value.
+const testBase = "http://127.0.0.1:8123"
 
 const (
 	testVersion   = "0.2.1"
@@ -75,11 +83,53 @@ func TestManifestGolden(t *testing.T) {
 	}
 }
 
+// TestManifestGoldenTestBase writes an updater e2e manifest, a ci version under a test releases URL (06 §16).
+func TestManifestGoldenTestBase(t *testing.T) {
+	const version = "0.0.1-ci.2"
+	root, _ := manifestTree(t, "0.2.0-rc.1\n", revokedHeader)
+	installer := filepath.Join(root, "dist-desktop", "isshoni-desktop_"+version+"_windows_amd64_setup.exe")
+	writeFile(t, installer, "MZ not really an installer either\n")
+	out := filepath.Join(root, "relserve", "download", "v"+version, manifestName)
+	code, stdout, stderr := runCmd(t, "-root", root, "manifest", "-version", version, "-installer", installer,
+		"-date", testDate, "-out", out, "-releases", testBase)
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	if !strings.Contains(stdout, "wrote "+out+": version 0.0.1-ci.2, channel ci, minVersion 0.2.0-rc.1, 0 revoked "+
+		"keys, releases URL "+testBase+"\n") {
+		t.Errorf("stdout %q", stdout)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *update {
+		writeFile(t, goldenTestBaseManifest, string(got))
+	}
+	want, err := os.ReadFile(goldenTestBaseManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, bytes.ReplaceAll(want, []byte("\r\n"), []byte("\n"))) {
+		t.Errorf("manifest differs from %s (rerun with -update to accept):\n%s", goldenTestBaseManifest, got)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(got, &m); err != nil {
+		t.Fatal(err)
+	}
+	wantField(t, m, "channel", "ci")
+	wantField(t, m, "notesUrl", testBase+"/tag/v0.0.1-ci.2")
+	if a := m["artifacts"].([]any)[0].(map[string]any); a["url"] != testBase+"/download/v0.0.1-ci.2/"+filepath.Base(installer) {
+		t.Errorf("artifact url %v", a["url"])
+	}
+}
+
 func TestManifestFields(t *testing.T) {
 	fp1 := newFingerprint("leaked")
 	fp2 := newFingerprint("other")
 	tests := []struct {
 		name, version, minVersion, revoked string
+		args                               []string // more flags
 		check                              func(t *testing.T, m map[string]any)
 	}{
 		{
@@ -92,6 +142,25 @@ func TestManifestFields(t *testing.T) {
 		{
 			name: "updater e2e build", version: "0.0.1-ci.2", minVersion: "0.2.0-rc.1", revoked: "",
 			check: func(t *testing.T, m map[string]any) { wantField(t, m, "channel", "ci") },
+		},
+		{
+			name: "updater e2e build under a release root of relserve", version: "0.0.1-ci.3", minVersion: "0.2.0",
+			args: []string{"-releases", "https://127.0.0.1:8443/tampered"},
+			check: func(t *testing.T, m map[string]any) {
+				wantField(t, m, "notesUrl", "https://127.0.0.1:8443/tampered/tag/v0.0.1-ci.3")
+				a := m["artifacts"].([]any)[0].(map[string]any)
+				wantField(t, a, "url", "https://127.0.0.1:8443/tampered/download/v0.0.1-ci.3/"+
+					"isshoni-desktop_0.0.1-ci.3_windows_amd64_setup.exe")
+			},
+		},
+		{
+			name: "the default releases URL named", version: "0.3.0", minVersion: "0.2.0", args: []string{"-releases", releasesURL},
+			check: func(t *testing.T, m map[string]any) {
+				wantField(t, m, "notesUrl", "https://github.com/MoonWX/isshoni/releases/tag/v0.3.0")
+				a := m["artifacts"].([]any)[0].(map[string]any)
+				wantField(t, a, "url", "https://github.com/MoonWX/isshoni/releases/download/v0.3.0/"+
+					"isshoni-desktop_0.3.0_windows_amd64_setup.exe")
+			},
 		},
 		{
 			name: "release dry run", version: "0.0.0-dryrun.15", minVersion: "0.2.0-rc.1\r\n", revoked: "",
@@ -115,8 +184,9 @@ func TestManifestFields(t *testing.T) {
 			installer := filepath.Join(root, "in", "isshoni-desktop_"+tt.version+"_windows_amd64_setup.exe")
 			writeFile(t, installer, strings.Repeat("x", 1000))
 			out := filepath.Join(root, "out", "m.json")
-			code, _, stderr := runCmd(t, "-root", root, "manifest", "-version", tt.version, "-installer", installer,
-				"-date", "2027-01-31T23:59:59.9999Z", "-out", out)
+			args := append([]string{"-root", root, "manifest", "-version", tt.version, "-installer", installer,
+				"-date", "2027-01-31T23:59:59.9999Z", "-out", out}, tt.args...)
+			code, stdout, stderr := runCmd(t, args...)
 			if code != 0 {
 				t.Fatalf("exit %d: %s", code, stderr)
 			}
@@ -127,6 +197,14 @@ func TestManifestFields(t *testing.T) {
 			var m map[string]any
 			if err := json.Unmarshal(data, &m); err != nil {
 				t.Fatal(err)
+			}
+			// stdout names the releases URL only when it is a test one.
+			var under string
+			if i := slices.Index(tt.args, "-releases"); i >= 0 && tt.args[i+1] != releasesURL {
+				under = ", releases URL " + tt.args[i+1]
+			}
+			if !strings.HasSuffix(stdout, " revoked keys"+under+"\n") {
+				t.Errorf("stdout %q does not end in %q", stdout, " revoked keys"+under)
 			}
 			wantField(t, m, "version", tt.version)
 			wantField(t, m, "publishedAt", "2027-01-31T23:59:59.999Z")
@@ -201,6 +279,24 @@ func TestManifestRefusals(t *testing.T) {
 		{name: "revoked: a key the file still lists", revoked: ssh.FingerprintSHA256(active) + "\n", signers: signers, code: 1, err: "is isshoni-update-1, which deploy/keys/update_signers still lists"},
 		{name: "revoked: too many", revoked: manyFingerprints(65), code: 1, err: "lists 65 keys, above the 64"},
 		{name: "signers unreadable", signers: "isshoni-update nothing\n", code: 1, err: "update_signers line 1: no key"},
+		{name: "test releases URL for a stable version", args: []string{"-releases", testBase}, code: 1, err: "a stable release's manifest points into https://github.com/MoonWX/isshoni/releases"},
+		{name: "test releases URL for an rc", args: []string{"-version", "0.3.0-rc.1", "-releases", "https://example.com/releases"}, minVersion: "0.2.0\n", code: 1, err: "another releases URL is only for a ci version"},
+		{name: "releases URL: http elsewhere", args: ciReleases("http://localhost:8123"), code: 1, err: "want https://…, or http://127.0.0.1:<port>"},
+		{name: "releases URL: http without a port", args: ciReleases("http://127.0.0.1"), code: 1, err: "want https://…, or http://127.0.0.1:<port>"},
+		{name: "releases URL: port 0", args: ciReleases("http://127.0.0.1:0"), code: 1, err: "want https://…, or http://127.0.0.1:<port>"},
+		{name: "releases URL: port with a leading zero", args: ciReleases("http://127.0.0.1:08123"), code: 1, err: "want https://…, or http://127.0.0.1:<port>"},
+		{name: "releases URL: another scheme", args: ciReleases("ftp://127.0.0.1:21"), code: 1, err: "want https://…, or http://127.0.0.1:<port>"},
+		{name: "releases URL: no host", args: ciReleases("https:///releases"), code: 1, err: "want https://…, or http://127.0.0.1:<port>"},
+		{name: "releases URL: no scheme", args: ciReleases("127.0.0.1:8123"), code: 1, err: `-releases "127.0.0.1:8123"`},
+		{name: "releases URL: trailing slash", args: ciReleases("https://127.0.0.1:8443/"), code: 1, err: "without a trailing slash"},
+		{name: "releases URL: query", args: ciReleases("https://127.0.0.1:8443?x=1"), code: 1, err: "without a trailing slash, query"},
+		{name: "releases URL: empty query", args: ciReleases("https://127.0.0.1:8443?"), code: 1, err: "without a trailing slash, query"},
+		{name: "releases URL: fragment", args: ciReleases("https://127.0.0.1:8443#x"), code: 1, err: "without a trailing slash, query"},
+		{name: "releases URL: empty fragment", args: ciReleases("https://127.0.0.1:8443#"), code: 1, err: "without a trailing slash, query"},
+		{name: "releases URL: user", args: ciReleases("https://u@example.com"), code: 1, err: "without a trailing slash, query, fragment or user"},
+		{name: "releases URL: dot segment", args: ciReleases("https://example.com/a/../b"), code: 1, err: "without a trailing slash"},
+		{name: "releases URL: escaped path", args: ciReleases("https://example.com/a%2Fb"), code: 1, err: "without a trailing slash"},
+		{name: "releases URL: upper-case scheme", args: ciReleases("HTTPS://example.com"), code: 1, err: "without a trailing slash"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -254,6 +350,9 @@ func TestManifestRefusals(t *testing.T) {
 		}
 	})
 }
+
+// ciReleases returns the arguments of a ci version's manifest with the releases URL base.
+func ciReleases(base string) []string { return []string{"-version", "0.0.1-ci.2", "-releases", base} }
 
 // manyFingerprints returns n distinct fingerprint lines.
 func manyFingerprints(n int) string {

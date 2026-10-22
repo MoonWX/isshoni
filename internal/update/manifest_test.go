@@ -104,6 +104,32 @@ func TestParseManifestDesktoppkgGolden(t *testing.T) {
 	}
 }
 
+// TestParseManifestDesktoppkgTestBase parses the updater e2e manifest that tools/desktoppkg manifest writes with
+// -releases for its golden test: an updatetest build whose ISSHONI_UPDATE_TEST_BASE is that releases URL accepts it
+// (06 §8.11, §16), and the default rules refuse it.
+func TestParseManifestDesktoppkgTestBase(t *testing.T) {
+	const base = "http://127.0.0.1:8123" // desktoppkg's testBase
+	golden := readText(t, filepath.Join("..", "..", "tools", "desktoppkg", "testdata", "manifest", "test-base", ManifestName))
+	m, err := parseManifest(golden, rules{releases: base, testBuild: true})
+	if err != nil {
+		t.Fatalf("desktoppkg's test-base manifest under %s: %v", base, err)
+	}
+	a, ok := m.Artifact("windows", "amd64")
+	if !ok || m.Version != "0.0.1-ci.2" || m.Channel != channelCI || m.NotesURL != base+"/tag/v0.0.1-ci.2" ||
+		a.URL != base+"/download/v0.0.1-ci.2/isshoni-desktop_0.0.1-ci.2_windows_amd64_setup.exe" {
+		t.Errorf("parsed %+v, artifact %+v", m, a)
+	}
+	if err := m.checkChannel(ChannelStable, true); err != nil {
+		t.Errorf("an updatetest build on the stable channel: %v", err)
+	}
+	if _, err := ParseManifest(golden); CodeOf(err) != CodeBadManifest {
+		t.Errorf("with the default rules: err = %v, want bad_manifest", err)
+	}
+	if _, err := parseManifest(golden, rules{releases: base + "/other", testBuild: true}); CodeOf(err) != CodeBadManifest {
+		t.Errorf("under another test base: err = %v, want bad_manifest", err)
+	}
+}
+
 func TestParseManifest(t *testing.T) {
 	good := manifestFields("0.2.0")
 	m, err := ParseManifest(encode(t, good))
@@ -259,7 +285,7 @@ func pad(data []byte, size int) []byte {
 
 func TestManifestTestHooksRules(t *testing.T) {
 	// ISSHONI_UPDATE_TEST_BASE replaces the releases URL in updatetest builds (06 §8.11).
-	base := "http://127.0.0.1:8123/download"
+	base := "http://127.0.0.1:8123"
 	fields := manifestFields("0.0.1-ci.2")
 	fields["notesUrl"] = base + "/tag/v0.0.1-ci.2"
 	fields = withArtifact(fields, "url", base+"/download/v0.0.1-ci.2/isshoni-desktop_0.0.1-ci.2_windows_amd64_setup.exe")

@@ -117,8 +117,10 @@ var updateTestBuild bool
 
 // rules are the parts of the manifest checks that the updatetest hooks change.
 type rules struct {
-	releases  string // ReleasesURL; ISSHONI_UPDATE_TEST_BASE replaces it in updatetest builds (06 §8.11)
-	testBuild bool   // updateTestBuild
+	// releases is ReleasesURL. ISSHONI_UPDATE_TEST_BASE replaces it in updatetest builds (06 §8.11); tools/desktoppkg
+	// manifest -releases writes the manifests for such a base.
+	releases  string
+	testBuild bool // updateTestBuild
 }
 
 func defaultRules() rules { return rules{releases: ReleasesURL, testBuild: updateTestBuild} }

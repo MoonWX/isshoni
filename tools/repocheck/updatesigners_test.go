@@ -407,11 +407,14 @@ func TestWriteUpdateKeys(t *testing.T) {
 	if after, _ := os.ReadFile(filepath.Join(root, "internal", "update", "signers.go")); !bytes.Equal(after, got) {
 		t.Error("a failed update-keys changed signers.go")
 	}
+}
 
-	// The real file's block is the empty one while deploy/keys/update_signers does not exist.
-	realBlock := strings.Join(realLines[b2+1:e2], "\n")
-	if realBlock != renderSignersBlock(nil) {
-		t.Errorf("internal/update/signers.go's block is %q, want %q", realBlock, renderSignersBlock(nil))
+// TestCommittedUpdateKeys checks the repository's own deploy/keys/update_signers and internal/update/signers.go: the
+// block embeds no key while the file does not exist, and exactly the file's keys once the owner's key PR (06 §14) adds
+// it. The test job runs this on every Go change, so a hand-edited block fails there too, not only in lint:keys.
+func TestCommittedUpdateKeys(t *testing.T) {
+	if _, _, err := checkUpdateKeys(filepath.Join("..", "..")); err != nil {
+		t.Errorf("the repository's update keys: %v", err)
 	}
 }
 
