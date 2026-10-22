@@ -97,8 +97,10 @@ var auditActions = []auditAction{
 	// §10 marks it later, but S58's DELETE /api/v1/me/devices/{id} writes it for any device row. No M1 path links
 	// a device, so TestAuditCoverage inserts one row, as M2's linking would, and revokes it over REST.
 	{action: "device.revoked", actors: byUser, targets: []string{"device"}},
-	{action: "device.refresh_reused", targets: []string{"device"}, sec: true,
-		later: "M2: no refresh tokens exist before the device flow (03 slice 15)"},
+	{action: "device.renamed", targets: []string{"device"}, inAuth: true,
+		later: "M2 02 §7.2: auth writes it (WA39); TestAuditCoverage produces it from WA47"},
+	{action: "device.refresh_reused", targets: []string{"device"}, sec: true, inAuth: true,
+		later: "M2 02 §6.2: auth writes it (WA39); TestAuditCoverage produces it from WA47"},
 	{action: "device.expired", targets: []string{"device"},
 		later: "M2 02 §8: the janitor's devices rule (WA19); TestAuditCoverage produces it from WA47"},
 }
@@ -583,8 +585,8 @@ func TestAuditActionsInSource(t *testing.T) {
 			}
 		}
 	}
-	if len(auditActions) != 35 {
-		t.Errorf("the table has %d actions; 03 §10 lists 32, M2 02 §8 adds device.approved, device.denied and "+
-			"device.expired", len(auditActions))
+	if len(auditActions) != 36 {
+		t.Errorf("the table has %d actions; 03 §10 lists 32, M2 02 §8 adds device.approved, device.denied, "+
+			"device.renamed and device.expired", len(auditActions))
 	}
 }

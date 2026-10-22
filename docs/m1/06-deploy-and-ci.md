@@ -2230,8 +2230,9 @@ ssh-keygen -t ed25519 -C isshoni-release-backup-1 -f isshoni-release-backup-1
   first release candidate.
 
 **Rotation (or a leak):**
-1. Add the new key line to `allowed_signers`, and mark the old one `valid-before="YYYYMMDD"` (OpenSSH ≥ 8.8;
-   all targets have it) or delete it on a leak.
+1. Add the new key line to `allowed_signers`, and delete the old one: at once on a leak, otherwise in a later
+   change. Don't mark it `valid-before=`: Windows 10's OpenSSH 8.1 can't parse that option, so `task lint:keys`
+   refuses it (M2 06 §7.2).
 2. Replace the secret.
 3. Cut a patch release: the site's `install.sh` then carries the new block.
 

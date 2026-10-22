@@ -123,7 +123,7 @@ describe('unusedMessages', () => {
   });
 
   it('counts what rules 2 and 3 require, with what is below it, the namespaces read whole, and $t() nesting', () => {
-    expect(READ_WHOLE).toEqual(['push']);
+    expect(READ_WHOLE).toEqual(['push', 'desktop.native']);
     const catalog = {
       errors: { internal: 'Oops', rate_limited: { wait: 'Wait' }, gone_code: 'Old' },
       fix: { firewall: { ufw: 'ufw' } },

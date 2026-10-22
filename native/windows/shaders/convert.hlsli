@@ -4,7 +4,7 @@
 // src/gpu/cpu_model.h is the CPU model of exactly this code; keep the three in step.
 //
 // Not a shader of its own: the build compiles only *_vs.hlsl, *_ps.hlsl and *_cs.hlsl (native/windows/CMakeLists.txt),
-// so a change here needs a clean build of the shaders (CI builds from scratch).
+// and each of them depends on every shaders/*.hlsli, so a change here recompiles them all.
 
 cbuffer Convert : register(b0) {
   float4 g_dest;      // x, y, width, height of the content in output (luma) pixels

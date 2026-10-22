@@ -180,8 +180,10 @@ jobs:
               - '.github/workflows/ci.yml'
             # The portable C++ (native-host). The job runs `task native:test` and `task
             # lint:native`, so the Taskfile is one of its inputs too, as for acme and e2e above.
+            # mix_report_test compares the C++ report writer with Go's audio report goldens.
             native:
               - 'native/**'
+              - 'internal/media/testdata/audio/**'
               - '.github/workflows/ci.yml'
               - 'Taskfile.yml'
             # The updater end to end (windows-desktop, from README WA88).
@@ -523,6 +525,11 @@ jobs:
           # .gitignore covers *.out.
           GOFLAGS: -coverprofile=coverage.out
         run: task test:go
+
+      # The updater's test hooks exist only under the updatetest tag (M2 06 §8.11), which
+      # test:go doesn't set: the package's tests pass in both builds, TestTestHooks only in this one.
+      - name: Updater tests with the updatetest hooks
+        run: go test -race -count=1 -tags updatetest ./internal/update/
 
       - name: Upload coverage
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

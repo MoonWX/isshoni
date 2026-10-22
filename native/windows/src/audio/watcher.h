@@ -67,7 +67,7 @@ public:
 
 private:
   std::shared_ptr<State> st_;
-  std::thread thread_;              // used by Start and Stop only (the engine's Init and Shutdown)
+  std::thread thread_;               // used by Start and Stop only (the engine's Init and Shutdown)
   std::atomic<bool> started_{false}; // what the other methods check: set once the thread runs
 };
 

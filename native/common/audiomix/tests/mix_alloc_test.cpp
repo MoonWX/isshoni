@@ -280,7 +280,7 @@ TEST(MixerAllocation, NoAllocationOnTheMixerThreadAfterStart) {
 
   // Stream A, from a device 300 ppm fast: a tone for the first minute (the ratio converges through many changes),
   // then 300 ms tone bursts every 2 s (onsets after silence, silent-bypass exits). Stream B: silent, a tone in its
-  // fourth minute, then silent again; it leaves at minute 6.
+  // fourth minute, then silent again; it leaves at minute 6 (at minute 1 of a sanitizer build's 2-minute run).
   test::Segments sa, sb;
   for (int64_t s = 0; s < minutes * 60; s += 2) {
     const auto from = static_cast<uint64_t>(s * kRate) + 1000;
@@ -350,12 +350,13 @@ TEST(MixerAllocation, NoAllocationOnTheMixerThreadAfterStart) {
   ASSERT_EQ(mixer->Start(), IM_OK);
   // The watcher's side meanwhile: levels, the silence flags, B leaving.
   LevelsSnapshot levels;
+  const int64_t leave_chunks = minutes * 6 / 10 * 60 * 100;
   bool removed = false;
   while (!clock.done.load(std::memory_order_acquire)) {
     (void)mixer->engine().ReadLevels(&levels);
     const int64_t chunks = static_cast<int64_t>(mixer->engine().counters().chunks);
     mixer->engine().SetPaused(chunks % 9000 > 8800); // a 2 s pause every 90 s
-    if (!removed && chunks > 6 * 60 * 100) {
+    if (!removed && chunks > leave_chunks) {
       b->Remove();
       removed = true;
     }
