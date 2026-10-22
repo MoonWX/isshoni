@@ -7,6 +7,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <new>
 
 #include "im/abi/status.h"
 #include "im/audio/opus_decoder.h"
@@ -22,7 +23,8 @@ struct TestDecoder {
   std::unique_ptr<audio::OpusPacketDecoder> dec; // guarded by mu
 };
 
-TestDecoder &TheTestDecoder() noexcept {
+// Throws the first allocation's bad_alloc; the next call tries again (a static whose initializer threw stays unset).
+TestDecoder &TheTestDecoder() {
   static TestDecoder *const d = new TestDecoder(); // never destroyed, like the engine (src/engine/engine.h)
   return *d;
 }
@@ -48,8 +50,8 @@ audio::AudioEngine &Engine() noexcept {
 void SetEngineForTest(audio::AudioEngine *engine) noexcept { g_override.store(engine, std::memory_order_release); }
 
 int32_t TestOpusDecode(const uint8_t *pkt, int32_t len, float *pcm, int32_t max_frames) noexcept {
-  TestDecoder &t = TheTestDecoder();
   try {
+    TestDecoder &t = TheTestDecoder();
     std::lock_guard<std::mutex> lock(t.mu);
     if (!t.dec) {
       if (const im_status st = audio::OpusPacketDecoder::Create(&t.dec); st != IM_OK) {
@@ -58,6 +60,8 @@ int32_t TestOpusDecode(const uint8_t *pkt, int32_t len, float *pcm, int32_t max_
     }
     const int32_t n = t.dec->Decode(pkt, len, pcm, max_frames);
     return n >= 0 ? n : DecodeFailed(n);
+  } catch (const std::bad_alloc &) { // the first call's TestDecoder
+    return abi::Fail(IM_ERR_INTERNAL, {}, "im_test_opus_decode: out of memory");
   } catch (...) { // std::mutex::lock's system_error
     return abi::Fail(IM_ERR_INTERNAL, {}, "im_test_opus_decode: the decoder's lock failed");
   }

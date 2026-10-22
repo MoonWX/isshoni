@@ -7,7 +7,8 @@
 //   (IM_AUDIO_MODE_EVERYTHING in im_start and im_audio_set_mode: no mixer, the fake's mode unchanged);
 // - im_start copies cfg->exclusions (shared_pid included) and hands the copy to SetRules before Mixer::Start, with
 //   the audio flags and the session's sink in the MixerConfig; without exclusions it calls no SetRules;
-// - modes OFF and TEST_TONE create no mixer;
+// - modes OFF and TEST_TONE create no mixer, and after im_init with IM_INIT_NO_AUDIO im_start calls neither SetRules
+//   nor NewMixer;
 // - im_set_paused and IM_START_PAUSED reach Mixer::SetPaused, im_audio_set_muted reaches SetMuted, each only by its
 //   own call;
 // - the fake mixer's chunks come out as Opus packets exactly 20 ms apart (the first stamped at or after epoch_ns, the
@@ -348,6 +349,13 @@ public:
     std::lock_guard<std::mutex> lock(mu_);
     calls_.push_back(std::move(call));
   }
+  // Runs apply and logs call under one lock, as SetMuted does: the mixer reads CallCount() before its flags, so only
+  // the chunk in progress can see what apply set with a count from before the entry.
+  template <class F> void LogWith(std::string call, F &&apply) {
+    std::lock_guard<std::mutex> lock(mu_);
+    apply();
+    calls_.push_back(std::move(call));
+  }
   MixerKnobs OnMixerStart(const im::audio::MixerConfig &cfg) {
     std::lock_guard<std::mutex> lock(mu_);
     calls_.push_back("Mixer::Start");
@@ -495,8 +503,8 @@ void FakeMixer::Stop() {
 }
 
 void FakeMixer::SetPaused(bool paused) {
-  paused_.store(paused); // before the log entry: a chunk mixed after the entry sees it
-  engine_->Log(paused ? "Mixer::SetPaused(1)" : "Mixer::SetPaused(0)");
+  // The flag with its log entry, under the fake's lock: a chunk mixed after the entry sees it.
+  engine_->LogWith(paused ? "Mixer::SetPaused(1)" : "Mixer::SetPaused(0)", [&] { paused_.store(paused); });
 }
 
 uint32_t FakeMixer::State() const { return engine_->state(); }
@@ -643,8 +651,9 @@ std::vector<Pkt> OfKind(const std::vector<Pkt> &pkts, uint32_t kind) {
 }
 
 // The chunks whose flags the fake mixer read after the call logged at index from and before the one at index to were
-// digital zero, at least `least` of them. The first and the last may be a fade: each call sets its flag just before
-// its log entry, so a chunk mixed in between reads the new flag but counts as mixed before the call.
+// digital zero, at least `least` of them. The first and the last may be a fade: each call sets its flag and logs its
+// entry under the fake's lock, and the mixer reads the log's length before the flags, so the one chunk in progress
+// may read the new flag but count as mixed before the call.
 ::testing::AssertionResult SilentBetween(const std::vector<Chunk> &chunks, std::size_t from, std::size_t to,
                                          std::size_t least) {
   std::vector<Level> window;
@@ -1088,6 +1097,32 @@ TEST_F(AudioBridge, ModeOffAndTheTestToneCreateNoMixer) {
   EXPECT_EQ(Fake().Count("SetRules"), 0u);
 }
 
+TEST_F(AudioBridge, AfterInitNoAudioTheStartNeverReachesTheAudioEngine) {
+  im_shutdown();
+  ASSERT_EQ(Init(IM_INIT_NO_AUDIO), IM_OK) << LastError();
+  const im_rule rules[] = {Rule(IM_RULE_APP_EXCLUDE, IM_RULE_SRC_USER, "game.exe")};
+  im_exclusions ex{};
+  ex.struct_size = sizeof ex;
+  ex.rules = rules;
+  ex.rule_count = 1;
+  const im_start_config cfg = AudioOnly(0, &ex);
+  im_session s = 0;
+  im_session_info info{};
+  info.struct_size = sizeof info;
+  const im_status st = im_start(&cfg, &s, &info);
+  // Which status is still open: 05 §4.3 says IM_ERR_BAD_STATE, the session (README WA23) runs a silent share (IM_OK,
+  // no IM_SESS_AUDIO, audio state off). Both keep the AudioEngine out of it: no SetRules and no mixer.
+  if (st == IM_OK) {
+    EXPECT_EQ(info.flags & IM_SESS_AUDIO, 0u);
+    EXPECT_EQ(info.audio_state, IM_AUDIO_STATE_OFF);
+    EXPECT_EQ(im_stop(s), IM_OK);
+  } else {
+    EXPECT_EQ(st, IM_ERR_BAD_STATE) << LastError();
+  }
+  EXPECT_EQ(Fake().Count("SetRules"), 0u);
+  EXPECT_EQ(Fake().Count("NewMixer"), 0u);
+}
+
 #if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
 TEST_F(AudioBridge, VideoWithAudioOffCreatesNoMixer) {
   im_session_info info{};
@@ -1408,6 +1443,7 @@ TEST_F(AudioBridge, TheMixersStateIsTheSessionsAudioState) {
   std::vector<char> buf(16384);
   const int32_t n = im_get_stats(s, buf.data(), static_cast<int32_t>(buf.size()));
   ASSERT_GT(n, 0) << LastError();
+  ASSERT_LT(static_cast<std::size_t>(n), buf.size()) << "buffer too small for the document";
   const std::string doc(buf.data(), static_cast<std::size_t>(n));
   const std::string audio = "\"audio\":{\"state\":\"degraded\",\"packets\":";
   const std::size_t at = doc.find(audio);
@@ -1538,6 +1574,7 @@ TEST(AudioBridgeOpus, BuildInfoNamesTheLinkedLibopus) {
   std::vector<char> buf(4096);
   const int32_t n = im_build_info(buf.data(), static_cast<int32_t>(buf.size()));
   ASSERT_GT(n, 0) << LastError();
+  ASSERT_LT(static_cast<std::size_t>(n), buf.size()) << "buffer too small for the document";
   const std::string doc(buf.data(), static_cast<std::size_t>(n));
   EXPECT_NE(doc.find(want), std::string::npos) << doc;
   EXPECT_TRUE(StartsWith(opus_get_version_string(), "libopus ")) << opus_get_version_string();

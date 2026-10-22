@@ -39,8 +39,9 @@ void SetEngineForTest(audio::AudioEngine *engine) noexcept;
 // channel written (960 for one of the engine's 20 ms packets). The process has one decoder, created by the first
 // call, whose state is kept between calls as one receiver's is: a caller decodes one stream's packets in order.
 // Calls from several threads are serialized. Negative: IM_ERR_INVALID_ARG for a max_frames too small for the packet
-// or a malformed packet, IM_ERR_INTERNAL when libopus fails otherwise; the detail starts with "im_test_opus_decode: ".
-// Arguments arrive checked (pkt and pcm non-NULL, len and max_frames positive). Works before im_init.
+// or a malformed packet, IM_ERR_INTERNAL when libopus fails otherwise or memory runs out; the detail starts with
+// "im_test_opus_decode: ". Arguments arrive checked (pkt and pcm non-NULL, len and max_frames positive). Works before
+// im_init.
 int32_t TestOpusDecode(const uint8_t *pkt, int32_t len, float *pcm, int32_t max_frames) noexcept;
 
 // opus_get_version_string() of the linked libopus ("libopus 1.5.2"): im_build_info's "opus" (04 §5.6).
