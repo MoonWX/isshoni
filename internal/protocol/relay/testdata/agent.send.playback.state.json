@@ -1,0 +1,13 @@
+{
+  "type": "agent.send",
+  "id": "52",
+  "data": {
+    "to": "c_k3v9q2m7xw4pa8d1",
+    "kind": "playback.state",
+    "payload": {
+      "playing": true,
+      "browser": "chrome",
+      "os": "windows"
+    }
+  }
+}

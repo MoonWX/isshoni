@@ -33,12 +33,17 @@ type Encoding struct {
 	MaxPixels    int        `json:"maxPixels"` // pixel budget, aspect-ratio neutral (ultrawide screens)
 }
 
-// ShareUpdate changes the label or preset of a share of the same user. The reply carries the new ShareParams.
+// ShareUpdate changes the label or preset of a share of the same user, or pauses and resumes it (M2 01 §10.3). The
+// reply carries the share's ShareParams. Any connection of the share's user may send it (01 §4.1).
+//
+// Paused is read only from a connection that has the feature share.pause active; from any other connection the hub
+// ignores it without an error, so old and new clients interoperate. Absent leaves the share's pause bit as it is,
+// true sets it, false clears it; room.state shows the bit as ShareStatusPaused.
 type ShareUpdate struct {
 	ShareID string  `json:"shareId"`
 	Label   *string `json:"label,omitempty"` // "" clears the label
 	Preset  Preset  `json:"preset,omitempty"`
-	// later (M2, feature share.pause): Paused *bool `json:"paused,omitempty"`
+	Paused  *bool   `json:"paused,omitempty"` // M2, feature share.pause: ignored without it
 }
 
 // ShareStop ends a share. It is idempotent: an unknown or already ended share replies ok.
@@ -80,16 +85,23 @@ func (p Preset) Valid() bool {
 }
 
 // ShareStatus is a share's state (01 §4.4). Clients treat unknown values as live.
+//
+// Precedence (M2 01 §10.3): stalled while the pub PC is down, else paused while the share's pause bit is set, else
+// starting or live as in M1. A share paused while starting shows paused once it would be live.
 type ShareStatus string
 
 const (
 	ShareStatusStarting ShareStatus = "starting"
 	ShareStatusLive     ShareStatus = "live"
 	ShareStatusStalled  ShareStatus = "stalled"
-	// later (M2, feature share.pause): ShareStatusPaused = "paused"
+	ShareStatusPaused   ShareStatus = "paused" // M2, feature share.pause; old clients treat it as live (01 §4.4)
 )
 
 // Valid reports whether s is a known status.
 func (s ShareStatus) Valid() bool {
-	return s == ShareStatusStarting || s == ShareStatusLive || s == ShareStatusStalled
+	switch s {
+	case ShareStatusStarting, ShareStatusLive, ShareStatusStalled, ShareStatusPaused:
+		return true
+	}
+	return false
 }

@@ -1,7 +1,6 @@
 package store
 
 import (
-	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -97,36 +96,5 @@ func TestInviteState(t *testing.T) {
 		if got := inv.State(now); got != c.want {
 			t.Errorf("%s: State = %q, want %q", c.name, got, c.want)
 		}
-	}
-}
-
-// TestLaterMethodsSayNotImplemented: the declared API that later milestones fill in (the device flow, M2) fails
-// loudly, never silently.
-func TestLaterMethodsSayNotImplemented(t *testing.T) {
-	t.Parallel()
-	db := newEnv(t).open(nil)
-	ctx := context.Background()
-	now := time.Now()
-	err := db.Write(ctx, func(q *Q) error {
-		calls := map[string]error{}
-		calls["CreateDeviceCode"] = q.CreateDeviceCode(DeviceCode{})
-		_, calls["DeviceCodeByHash"] = q.DeviceCodeByHash([]byte{1})
-		_, calls["DeviceCodeByUserCode"] = q.DeviceCodeByUserCode([]byte{1})
-		calls["DecideDeviceCode"] = q.DecideDeviceCode([]byte{1}, "approved", "x", now)
-		calls["PollDeviceCode"] = q.PollDeviceCode([]byte{1}, now, time.Second)
-		calls["CreateDevice"] = q.CreateDevice(&Device{})
-		calls["InsertDeviceToken"] = q.InsertDeviceToken(DeviceToken{})
-		_, _, _, calls["DeviceTokenByHash"] = q.DeviceTokenByHash([]byte{1}, "access", now)
-		calls["SpendRefreshToken"] = q.SpendRefreshToken([]byte{1}, []byte{2}, now)
-		calls["TouchDevice"] = q.TouchDevice("x", "", "", now)
-		for name, err := range calls {
-			if !errors.Is(err, errNotImplemented) || !strings.Contains(err.Error(), name) {
-				t.Errorf("%s = %v, want a not-implemented error naming it", name, err)
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
 	}
 }

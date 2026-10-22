@@ -19,5 +19,11 @@
 // (one per layer) and Beep packets share one capture instant every FlashEvery, which is how the A/V checks pair them.
 // ParseVideoMarker and ParseAudioMarker read the Markers back from RTP payloads (sfutest.Viewer).
 //
+// Engine (engine.go, session.go; docs/m2/01-client-core.md §6) is the media contract's test double: a media.Engine
+// whose sessions are Sources behind media.Session's controls, with the native engine's source rules (single-use
+// picks, listed sources only with Config.Listed) and re-inits on the same timeline, plus test controls (Session.Fail,
+// Emit, Calls). It also implements media.AudioController (audio_ctl.go). It passes mediatest.Conformance, and it is
+// the engine of every client core test and of the desktop app's dev and e2e builds on macOS and Linux.
+//
 // This is test code: cmd/isshoni never imports it and no release artifact contains it (06's build checks that).
 package fake

@@ -81,6 +81,7 @@ jobs:
       run-windows-go: ${{ steps.plan.outputs.run-windows-go }}
       run-desktop-macos: ${{ steps.plan.outputs.run-desktop-macos }}
       run-native-host: ${{ steps.plan.outputs.run-native-host }}
+      run-windows-native: ${{ steps.plan.outputs.run-windows-native }}
       # Task's pin from .tool-versions (06 §7.1). Go comes from go.mod, Node from .tool-versions.
       task-version: ${{ steps.plan.outputs.task-version }}
     steps:
@@ -103,7 +104,13 @@ jobs:
               - 'go.sum'
               - 'tools/**'
               - 'internal/protocol/testdata/**'
+              - 'internal/protocol/relay/testdata/**'
               - 'internal/server/tlsmgr/testdata/**'
+              # Non-Go inputs of Go tests elsewhere: the deep-link cases, the ABI layouts that
+              # internal/media/native's layout_test compares, and the test tone's golden Markers.
+              - 'internal/client/deeplink/testdata/**'
+              - 'native/common/tests/testdata/abi_layout.json'
+              - 'native/common/audio/tests/testdata/**'
               - '.golangci.yml'
               - 'tygo.yaml'
             web:
@@ -149,8 +156,8 @@ jobs:
               - 'tools/relserve/**'
               - 'tools/notices/**'
             # The Windows app (M2 06 §10.1): everything the app, its engine, its installer or
-            # its packaging reads, the SPA it bundles included. windows-go and desktop-macos run
-            # on it now; windows-native and windows-desktop join when they land.
+            # its packaging reads, the SPA it bundles included. windows-go, desktop-macos and
+            # windows-native run on it; windows-desktop joins when it lands (README WA72).
             desktop:
               - 'cmd/isshoni-desktop/**'
               - 'internal/client/**'
@@ -370,6 +377,11 @@ jobs:
           decide windows-go "$desktop" go.mod internal/client
           decide desktop-macos "$desktop" go.mod internal/client
           decide native-host "$native" Taskfile.yml .tool-versions native/CMakePresets.json native/vcpkg.json
+          # isshoni-media.dll (M2 06 §5.1) on any change to the app, its engine or its packaging: the
+          # native code, the MSVC environment and its pins, and tools/desktoppkg (dll-check).
+          decide windows-native "$desktop" go.mod native/CMakePresets.json native/vcpkg.json \
+            native/windows/CMakeLists.txt deploy/windows/msvc-env.ps1 deploy/windows/tools.json \
+            deploy/windows/dll-imports.txt tools/desktoppkg
 
           task_version=''
           if [ -e .tool-versions ]; then
@@ -1395,6 +1407,11 @@ jobs:
       - name: govulncheck ./...
         run: .bin/govulncheck ./...
 
+      # On linux cmd/isshoni-desktop is the stub of M2 06 D18, so the Windows app gets its own
+      # run (M2 03 §3.2 W20).
+      - name: govulncheck of the Windows app (GOOS=windows)
+        run: GOOS=windows GOARCH=amd64 .bin/govulncheck ./cmd/isshoni-desktop
+
   windows-go:
     # The Go packages of the Windows app that need no engine DLL, on Windows (M2 06 §10.1): the
     # client core, the updater, the media packages with the fake engine and the app's own
@@ -1580,7 +1597,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/vcpkg-cache
-          key: vcpkg-host-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg.outputs.image }}-${{ hashFiles('native/vcpkg.json', 'native/vcpkg-configuration.json') }}
+          key: vcpkg-host-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg.outputs.image }}-${{ hashFiles('native/vcpkg.json', 'native/vcpkg-configuration.json', 'native/triplets/*.cmake') }}
 
       - name: task lint:native (clang-format 18)
         if: runner.os == 'Linux'
@@ -1602,6 +1619,312 @@ jobs:
 
       - name: task native:test PRESET=host-tsan
         run: task native:test PRESET=host-tsan VCPKG_DIR="$RUNNER_TEMP/vcpkg"
+
+  windows-native:
+    # isshoni-media.dll (M2 06 §5.1, R3a; docs/m2/04 §13, §18.2): the MSVC environment of
+    # deploy/windows/msvc-env.ps1 (toolset and SDK from deploy/windows/tools.json), vcpkg at
+    # native/vcpkg.json's baseline with a binary cache, then the presets win-x64-ci (build and
+    # ctest: 04 §18.2's Windows tests and native/common's tests under MSVC) and win-x64-release
+    # (build); tools/desktoppkg dll-check on the release DLL only (exports, static: and delay:
+    # imports, VERSIONINFO); the WebView2 bootstrapper's signature; and the Go tests that need
+    # the engine DLL (ISSHONI_TEST_ENGINE_DLL), here until windows-desktop takes them over
+    # (README WA72). Uploads windows-native, kept 1 day: release\ (the shipped DLL and PDB, the
+    # vcpkg copyright files of the release tree, the bootstrapper, native-manifest.json) and ci\
+    # (the test-hooks DLL, never staged). FFmpeg joins with README WA24: the locked zip as
+    # IM_FFMPEG_ROOT, its staleness and hash checks, dll-check -ffmpeg and isshoni-native-tools.
+    needs: changes
+    if: needs.changes.outputs.run-windows-native == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      VCPKG_DISABLE_METRICS: '1'
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # one cache per job below: setup-go's key is shared by every job
+
+      - name: Find Go's module and build caches
+        id: goenv
+        run: |
+          "modcache=$(go env GOMODCACHE)" >> $env:GITHUB_OUTPUT
+          "gocache=$(go env GOCACHE)" >> $env:GITHUB_OUTPUT
+
+      - name: Cache Go modules and builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ steps.goenv.outputs.modcache }}
+            ${{ steps.goenv.outputs.gocache }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+
+      - name: MSVC environment
+        id: msvc
+        run: ./deploy/windows/msvc-env.ps1
+
+      - name: vcpkg at native/vcpkg.json's baseline
+        id: vcpkg
+        run: |
+          $baseline = [string](Get-Content -Raw -LiteralPath native/vcpkg.json | ConvertFrom-Json).'builtin-baseline'
+          if ($baseline -notmatch '^[0-9a-f]{40}$') { throw 'native/vcpkg.json has no 40-hex builtin-baseline' }
+          $root = Join-Path $env:RUNNER_TEMP 'vcpkg'
+          git init -q $root
+          git -C $root remote add origin https://github.com/microsoft/vcpkg.git
+          git -C $root fetch -q --depth 1 origin $baseline
+          if ($LASTEXITCODE -ne 0) { throw "git fetch of vcpkg $baseline failed" }
+          git -C $root checkout -q --detach FETCH_HEAD
+          # Downloads the vcpkg tool release the checkout pins and checks its SHA-512.
+          & (Join-Path $root 'bootstrap-vcpkg.bat') -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw "bootstrap-vcpkg.bat failed (exit code $LASTEXITCODE)" }
+          $cache = Join-Path $env:RUNNER_TEMP 'vcpkg-cache'
+          New-Item -ItemType Directory -Force -Path $cache | Out-Null
+          "VCPKG_ROOT=$root" >> $env:GITHUB_ENV
+          "VCPKG_BINARY_SOURCES=clear;files,$cache,readwrite" >> $env:GITHUB_ENV
+          "baseline=$baseline" >> $env:GITHUB_OUTPUT
+          "cache=$cache" >> $env:GITHUB_OUTPUT
+
+      - name: Cache vcpkg's binary packages
+        # M2 06 §5.1: keyed on the manifest, the triplet (native/triplets/ pins its toolset) and the toolset
+        # build, no restore keys.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.vcpkg.outputs.cache }}
+          key: vcpkg-x64-windows-static-${{ steps.msvc.outputs.toolset }}-${{ hashFiles('native/vcpkg.json', 'native/vcpkg-configuration.json', 'native/triplets/*.cmake') }}
+
+      - name: CMake and Ninja
+        id: tools
+        run: |
+          # The ones on PATH (the image's, or Visual Studio's once msvc-env.ps1 ran), else the copies vcpkg
+          # pins and verifies by SHA-512.
+          foreach ($tool in 'cmake', 'ninja') {
+            $cmd = Get-Command $tool -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($cmd) {
+              $path = $cmd.Source
+            } else {
+              $path = [string](& (Join-Path $env:VCPKG_ROOT 'vcpkg.exe') fetch $tool | Select-Object -Last 1)
+              if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $path.Trim())) { throw "vcpkg fetch $tool failed" }
+              $path = $path.Trim()
+            }
+            "${tool}: $path ($(& $path --version | Select-Object -First 1))"
+            "$tool=$path" >> $env:GITHUB_OUTPUT
+            if ($tool -eq 'cmake') { "ctest=$(Join-Path (Split-Path -Parent $path) 'ctest.exe')" >> $env:GITHUB_OUTPUT }
+          }
+
+      - name: win-x64-ci - configure, build and test
+        working-directory: native
+        env:
+          CMAKE: ${{ steps.tools.outputs.cmake }}
+          CTEST: ${{ steps.tools.outputs.ctest }}
+          NINJA: ${{ steps.tools.outputs.ninja }}
+        run: |
+          & $env:CMAKE --preset win-x64-ci "-DCMAKE_MAKE_PROGRAM=$env:NINJA"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:CMAKE --build --preset win-x64-ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:CTEST --preset win-x64-ci --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: The delay-load helper and /DEPENDENTLOADFLAG (README WA11's verdict)
+        if: always()
+        run: |
+          # Written by dll_search_test; it decides M2 06 §5.1's conditional load-config check.
+          $file = 'native/build/win-x64-ci/windows/dependentloadflag-verdict.txt'
+          if (-not (Test-Path -LiteralPath $file)) {
+            '::warning::dll_search_test wrote no DEPENDENTLOADFLAG verdict'
+            exit 0
+          }
+          $verdict = (Get-Content -Raw -LiteralPath $file).Trim()
+          "DEPENDENTLOADFLAG verdict: $verdict"
+          "### /DEPENDENTLOADFLAG:0x800 and the delay-load helper`n`n$verdict`n" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: win-x64-release - configure and build
+        id: release
+        working-directory: native
+        env:
+          CMAKE: ${{ steps.tools.outputs.cmake }}
+          NINJA: ${{ steps.tools.outputs.ninja }}
+          VERSION: ${{ env.ISSHONI_VERSION }}
+        run: |
+          # The four-part version of M2 06 §5.3 for CI's 0.0.0-ci.<run>: 0.0.0.<run mod 65000> (the rule
+          # tools/desktoppkg winver implements from README WA67 on).
+          if ($env:VERSION -notmatch '^(\d+)\.(\d+)\.(\d+)-ci\.(\d+)$') { throw "ISSHONI_VERSION '$env:VERSION' is not X.Y.Z-ci.N" }
+          $winver = '{0}.{1}.{2}.{3}' -f $Matches[1], $Matches[2], $Matches[3], ([int64]$Matches[4] % 65000)
+          $commit = [string](git rev-parse --short=7 HEAD)
+          & $env:CMAKE --preset win-x64-release "-DCMAKE_MAKE_PROGRAM=$env:NINJA" "-DIM_VERSION=$env:VERSION" `
+            "-DIM_WINVER=$winver" "-DIM_COMMIT=$($commit.Trim())"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:CMAKE --build --preset win-x64-release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "winver=$winver" >> $env:GITHUB_OUTPUT
+
+      - name: dumpbin of the release DLL (for the log)
+        run: |
+          $dll = 'native/build/win-x64-release/windows/isshoni-media.dll'
+          dumpbin /nologo /dependents /exports $dll
+          dumpbin /nologo /loadconfig $dll | Select-String -Pattern 'Dependent Load' -SimpleMatch
+          exit 0
+
+      - name: dll-check (the release DLL)
+        env:
+          VERSION: ${{ env.ISSHONI_VERSION }}
+          WINVER: ${{ steps.release.outputs.winver }}
+        run: |
+          $dll = Join-Path $env:GITHUB_WORKSPACE 'native/build/win-x64-release/windows/isshoni-media.dll'
+          go -C tools run ./desktoppkg dll-check -dll $dll -version $env:VERSION -winver $env:WINVER
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: The WebView2 bootstrapper (signature checked)
+        id: webview2
+        run: |
+          # M2 06 §5.1: downloaded from tools.json's URL; Authenticode Valid with exactly the pinned signer.
+          $pin = (Get-Content -Raw -LiteralPath deploy/windows/tools.json | ConvertFrom-Json).webview2Bootstrapper
+          $file = Join-Path $env:RUNNER_TEMP 'MicrosoftEdgeWebview2Setup.exe'
+          $ProgressPreference = 'SilentlyContinue'
+          for ($try = 1; ; $try++) {
+            try {
+              Invoke-WebRequest -UseBasicParsing -Uri $pin.url -OutFile $file
+              break
+            } catch {
+              if ($try -ge 3) { throw }
+              "download failed ($($_.Exception.Message)); trying again"
+              Start-Sleep -Seconds (5 * $try)
+            }
+          }
+          $sig = Get-AuthenticodeSignature -LiteralPath $file
+          if ($sig.Status -ne 'Valid') { throw "the bootstrapper's signature is $($sig.Status): $($sig.StatusMessage)" }
+          $subject = $sig.SignerCertificate.Subject
+          if ($subject -cne $pin.signer) { throw "the bootstrapper is signed by '$subject', not '$($pin.signer)'" }
+          $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant()
+          "WebView2 bootstrapper: SHA-256 $sha, signed by $subject"
+          "path=$file" >> $env:GITHUB_OUTPUT
+          "sha256=$sha" >> $env:GITHUB_OUTPUT
+          "signer=$subject" >> $env:GITHUB_OUTPUT
+
+      - name: gcc for cgo (MinGW-w64, for the race detector)
+        run: |
+          if (Get-Command gcc -ErrorAction SilentlyContinue) {
+            gcc --version | Select-Object -First 1
+            exit 0
+          }
+          foreach ($dir in 'C:\mingw64\bin', 'C:\msys64\ucrt64\bin', 'C:\msys64\mingw64\bin') {
+            if (Test-Path (Join-Path $dir 'gcc.exe')) {
+              $dir >> $env:GITHUB_PATH
+              & (Join-Path $dir 'gcc.exe') --version | Select-Object -First 1
+              exit 0
+            }
+          }
+          "::notice::no gcc on this runner image; installing MinGW-w64 with Chocolatey"
+          choco install mingw --no-progress -y
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          'C:\ProgramData\mingw64\mingw64\bin' >> $env:GITHUB_PATH
+
+      - name: go test -race ./internal/media/... with the engine DLL (win-x64-ci)
+        # The DLL-dependent Go tests (04 §18.2); they skip without ISSHONI_TEST_ENGINE_DLL, so they
+        # run here and nowhere else until windows-desktop exists (README WA72).
+        env:
+          CGO_ENABLED: '1'
+          ISSHONI_TEST_ENGINE_DLL: ${{ github.workspace }}\native\build\win-x64-ci\windows\isshoni-media.dll
+        run: |
+          go test -race -count=1 -timeout 10m ./internal/media/...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: The windows-native artifact
+        env:
+          VERSION: ${{ env.ISSHONI_VERSION }}
+          WINVER: ${{ steps.release.outputs.winver }}
+          BASELINE: ${{ steps.vcpkg.outputs.baseline }}
+          TOOLSET: ${{ steps.msvc.outputs.toolset }}
+          VS_VERSION: ${{ steps.msvc.outputs.vs-version }}
+          WINDOWS_SDK: ${{ steps.msvc.outputs.windows-sdk }}
+          WEBVIEW2: ${{ steps.webview2.outputs.path }}
+          WEBVIEW2_SHA256: ${{ steps.webview2.outputs.sha256 }}
+          WEBVIEW2_SIGNER: ${{ steps.webview2.outputs.signer }}
+        run: |
+          # M2 06 §5.1: release\ is the win-x64-release output only; ci\ holds the test-hooks DLL.
+          $out = Join-Path $env:RUNNER_TEMP 'windows-native'
+          $rel = Join-Path $out 'release'
+          $ci = Join-Path $out 'ci'
+          New-Item -ItemType Directory -Force -Path $rel, $ci | Out-Null
+          $build = 'native/build/win-x64-release'
+          Copy-Item -LiteralPath "$build/windows/isshoni-media.dll", "$build/windows/isshoni-media.pdb" -Destination $rel
+          Copy-Item -LiteralPath 'native/build/win-x64-ci/windows/isshoni-media.dll' -Destination $ci
+
+          # The vcpkg ports of the release tree (built without the tests feature, so no gtest): their
+          # copyright files and their versions from vcpkg's status database.
+          $installed = "$build/vcpkg_installed"
+          $ports = [ordered]@{}
+          $stanzas = (Get-Content -Raw -LiteralPath "$installed/vcpkg/status") -split "(?:\r?\n){2,}"
+          foreach ($stanza in $stanzas) {
+            $f = @{}
+            foreach ($line in $stanza -split "\r?\n") {
+              if ($line -match '^([A-Za-z-]+): (.*)$') { $f[$Matches[1]] = $Matches[2] }
+            }
+            if ($f['Package'] -and -not $f['Feature'] -and $f['Status'] -eq 'install ok installed' -and
+                $f['Architecture'] -eq 'x64-windows-static') {
+              $v = $f['Version']
+              if ($f['Port-Version'] -and $f['Port-Version'] -ne '0') { $v = "$v#$($f['Port-Version'])" }
+              $ports[$f['Package']] = $v
+            }
+          }
+          foreach ($port in $ports.Keys) {
+            $copyright = "$installed/x64-windows-static/share/$port/copyright"
+            if (-not (Test-Path -LiteralPath $copyright)) { throw "vcpkg port $port has no copyright file" }
+            $dest = Join-Path $rel "licenses/vcpkg/$port"
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            Copy-Item -LiteralPath $copyright -Destination $dest
+          }
+          # License files the native slices commit (README WA51: OpenH264's headers; WA50: C++/WinRT).
+          foreach ($pair in @(@('native/windows/third_party/openh264/LICENSE', 'licenses/openh264'),
+                              @('native/windows/third_party/cppwinrt/LICENSE', 'licenses/cppwinrt'))) {
+            if (Test-Path -LiteralPath $pair[0]) {
+              $dest = Join-Path $rel $pair[1]
+              New-Item -ItemType Directory -Force -Path $dest | Out-Null
+              Copy-Item -LiteralPath $pair[0] -Destination $dest
+            }
+          }
+          Copy-Item -LiteralPath $env:WEBVIEW2 -Destination $rel
+
+          $header = Get-Content -Raw -LiteralPath native/include/isshoni_media.h
+          if ($header -notmatch '#define IM_ABI_MAJOR\s+(\d+)u' ) { throw 'no IM_ABI_MAJOR in the header' }
+          $major = [int]$Matches[1]
+          if ($header -notmatch '#define IM_ABI_MINOR\s+(\d+)u' ) { throw 'no IM_ABI_MINOR in the header' }
+          $minor = [int]$Matches[1]
+          $dllSha = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $rel 'isshoni-media.dll')).Hash.ToLowerInvariant()
+          $manifest = [ordered]@{
+            version              = $env:VERSION
+            winver               = $env:WINVER
+            dll                  = [ordered]@{ name = 'isshoni-media.dll'; sha256 = $dllSha; abi = ($major * 65536 + $minor) }
+            ffmpeg               = $null # README WA24
+            vcpkg                = [ordered]@{ baseline = $env:BASELINE; ports = $ports }
+            msvcToolset          = $env:TOOLSET
+            vsInstance           = $env:VS_VERSION
+            windowsSdk           = $env:WINDOWS_SDK
+            webview2Bootstrapper = [ordered]@{ sha256 = $env:WEBVIEW2_SHA256; signer = $env:WEBVIEW2_SIGNER }
+          }
+          $json = $manifest | ConvertTo-Json -Depth 6
+          [IO.File]::WriteAllText((Join-Path $rel 'native-manifest.json'), $json + "`n", (New-Object Text.UTF8Encoding($false)))
+          $json
+          Get-ChildItem -LiteralPath $out -Recurse -File | ForEach-Object { $_.FullName.Substring($out.Length + 1) }
+
+      - name: Upload windows-native
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-native
+          path: ${{ runner.temp }}/windows-native/
+          retention-days: 1
+          if-no-files-found: error
 
   ci-ok:
     # The only required check (06 §8.6). It fails when a gating job failed or was cancelled;
@@ -1627,6 +1950,7 @@ jobs:
         windows-go,
         desktop-macos,
         native-host,
+        windows-native,
       ]
     runs-on: ubuntu-24.04
     timeout-minutes: 2

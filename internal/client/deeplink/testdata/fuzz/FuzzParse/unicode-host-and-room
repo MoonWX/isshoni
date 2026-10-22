@@ -1,0 +1,2 @@
+go test fuzz v1
+string("isshoni://b\xc3\xbccher.example:8443/r/k3m9p2qxw7ht/?x#y")

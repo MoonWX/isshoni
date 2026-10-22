@@ -608,19 +608,112 @@ tasks:
 
   desktop:dev:
     desc: Run the desktop app on this machine with the fake engine and Vite's live reload (docs/m2/03 D3)
+    # macOS only (the dev build of 03 D3; Windows builds with desktop:exe:windows). A -tags dev build of
+    # cmd/isshoni-desktop whose asset handler takes the SPA from Vite on :5173 (ISSHONI_DESKTOP_DEV_URL, 03 §5.3):
+    # edits in web/src show in the window at once. A Vite already running on :5173 (task dev:web) is used as it is;
+    # otherwise this starts one and stops it when the app quits. The engine is the fake from README WA41 on.
+    # Task's own shell gives a background job no real PID, so the script runs in sh. cgo on a Mac whose Command Line
+    # Tools are older than the SDK needs SDKROOT (CONTRIBUTING.md).
+    env:
+      ISSHONI_VERSION: '{{.VERSION}}'
+      DESKTOP_DEV_SH: |
+        set -eu
+        vite=http://localhost:5173
+        up() { curl -fsS -o /dev/null --max-time 2 "$vite/@vite/client" 2>/dev/null; }
+        if up; then
+          echo "desktop:dev: using the Vite dev server already on $vite"
+        else
+          (cd web && exec node node_modules/vite/bin/vite.js --clearScreen false) &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT INT TERM
+          n=0
+          until up; do
+            n=$((n + 1))
+            if [ "$n" -gt 120 ] || ! kill -0 "$pid" 2>/dev/null; then
+              echo "desktop:dev: Vite did not start on $vite" >&2
+              exit 1
+            fi
+            sleep 0.5
+          done
+        fi
+        ISSHONI_DESKTOP_DEV_URL=$vite go run -tags dev -ldflags "-X $VERSION_PKG.version=$ISSHONI_VERSION" ./cmd/isshoni-desktop "$@"
+      VERSION_PKG: '{{.VERSION_PKG}}'
     cmds:
-      - cmd: "echo 'desktop:dev: note: not implemented yet; README WA22 adds it with cmd/isshoni-desktop. Nothing was started.'"
+      - cmd: "echo 'desktop:dev: note: the dev build runs on macOS; on Windows build the app with task desktop:exe:windows. Nothing was started.'"
         silent: true
+        if: '{{if eq OS "darwin"}}false{{else}}true{{end}}'
+      - cmd: "echo 'desktop:dev: note: web/node_modules is missing; run task setup first.' >&2; exit 1"
+        silent: true
+        if: '{{if eq OS "darwin"}}[ ! -d web/node_modules/vite ]{{else}}false{{end}}'
+      - cmd: sh -c "$DESKTOP_DEV_SH" desktop-dev {{.CLI_ARGS}}
+        if: '{{if eq OS "darwin"}}[ -d web/node_modules/vite ]{{else}}false{{end}}'
 
   desktop:exe:windows:
     desc: >-
       Cross-build isshoni.exe (GOOS=windows, no cgo) into dist-desktop/windows_amd64/, stamped with VERSION; TAGS
       defaults to production, and other tags build into dist-desktop/windows_amd64-test/ (docs/m2/06 §5.2)
+    # 06 §5.2 steps 1 and 2 (README WA67 adds step 3's checks): the exe's resources (icon, manifest, version info),
+    # then the cross-build, then a check that the exe carries app.manifest unchanged. The resources come from
+    # cmd/isshoni-desktop/build/windows/syso.go, built in the tools/wails3 module (its graph pins tc-hib/winres for
+    # wails3's own syso step), not from `wails3 generate syso`: that one parses the manifest and writes it back
+    # without <activeCodePage> and with a System instead of a PerMonitor DPI fallback. The .syso exists only during
+    # the build and is git-ignored (cmd/isshoni-desktop/.gitignore), so the exe's vcs.modified stays false on a clean
+    # checkout. The version resource's four-part number follows 06 §5.3 (WA67 moves it to tools/desktoppkg winver).
+    preconditions:
+      - sh: '[ -f web/dist/index.html ]'
+        msg: >-
+          web/dist/index.html is missing, and isshoni.exe embeds the web app from web/dist/.
+          Run "task build:web" first (CI downloads the web job's artifact).
     vars:
       TAGS: '{{.TAGS | default "production"}}'
+      OUT: '{{if eq .TAGS "production"}}dist-desktop/windows_amd64{{else}}dist-desktop/windows_amd64-test{{end}}'
+      SYSO: cmd/isshoni-desktop/rsrc_windows_amd64.syso
+      MANIFEST: cmd/isshoni-desktop/build/windows/app.manifest
+      SYSO_TOOL: 'dist-desktop/.build/syso{{exeExt}}'
     cmds:
-      - cmd: "echo 'desktop:exe:windows: note: not implemented yet; README WA22 adds it with cmd/isshoni-desktop (WA67 adds its checks). Nothing was built (TAGS={{.TAGS}}).'"
-        silent: true
+      - cmd: |
+          set -e
+          v='{{.VERSION}}'
+          bad() { echo "desktop:exe:windows: VERSION $v is not X.Y.Z[-pre][+build]" >&2; exit 1; }
+          case $v in *-|*-+*|*+|*-.*|*.) bad ;; esac
+          core=${v%%+*}
+          pre=
+          case $core in *-*) pre=${core#*-}; core=${core%%-*} ;; esac
+          x=${core%%.*}; rest=${core#*.}
+          case $rest in *.*) ;; *) bad ;; esac
+          y=${rest%%.*}; z=${rest#*.}
+          for n in "$x" "$y" "$z"; do
+            case $n in ''|*[!0-9]*) bad ;; esac
+            if [ "$n" -gt 65535 ]; then echo "desktop:exe:windows: VERSION $v has a part above 65535" >&2; exit 1; fi
+          done
+          w=65000
+          if [ -n "$pre" ]; then
+            last=${pre##*.}
+            case $last in ''|*[!0-9]*) w=0 ;; *) w=$((last % 65000)) ;; esac
+          fi
+          winver="$x.$y.$z.$w"
+          mkdir -p dist-desktop/.build '{{.OUT}}'
+          cat > dist-desktop/.build/info.json <<EOF
+          {"fixed": {"file_version": "$winver", "product_version": "$winver"},
+           "info": {"0000": {"ProductVersion": "$v", "FileVersion": "$winver", "ProductName": "isshoni",
+            "FileDescription": "isshoni", "CompanyName": "isshoni project",
+            "LegalCopyright": "Copyright the isshoni authors. Apache-2.0.", "OriginalFilename": "isshoni.exe",
+            "InternalName": "isshoni"}}}
+          EOF
+          CGO_ENABLED=0 go build -C tools/wails3 -o '../../{{.SYSO_TOOL}}' ../../cmd/isshoni-desktop/build/windows/syso.go
+          '{{.SYSO_TOOL}}' -arch amd64 -icon cmd/isshoni-desktop/build/windows/icon.ico -manifest '{{.MANIFEST}}' \
+            -info dist-desktop/.build/info.json -out '{{.SYSO}}'
+          commit=$(git rev-parse HEAD)
+          date=$(TZ=UTC0 git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd)
+          ldflags="-s -w -H windowsgui -X {{.VERSION_PKG}}.version=$v -X {{.VERSION_PKG}}.commit=$commit"
+          ldflags="$ldflags -X {{.VERSION_PKG}}.date=$date"
+          status=0
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -tags '{{.TAGS}}' -ldflags "$ldflags" \
+            -o '{{.OUT}}/isshoni.exe' ./cmd/isshoni-desktop || status=$?
+          rm -f '{{.SYSO}}'
+          if [ "$status" -ne 0 ]; then exit "$status"; fi
+          '{{.SYSO_TOOL}}' -check '{{.OUT}}/isshoni.exe' -manifest '{{.MANIFEST}}'
+          echo "desktop:exe:windows: {{.OUT}}/isshoni.exe ($v, file version $winver, tags {{.TAGS}})"
 
   desktop:build:e2e:
     desc: Build the e2e isshoni.exe for the CDP spec (desktop:exe:windows TAGS=e2e; never shipped, docs/m2/03 §22.4)
@@ -726,11 +819,130 @@ tasks:
 
   native:build:
     desc: >-
-      Build isshoni-media.dll on a Windows PC - the MSVC environment of deploy/windows/msvc-env.ps1, then presets
-      win-x64-release and win-x64-ci with IM_FFMPEG_ROOT = the ffmpeg:fetch output in .deps/ffmpeg/
+      Build isshoni-media.dll on a Windows PC - the MSVC environment of deploy/windows/msvc-env.ps1, vcpkg at
+      native/vcpkg.json's baseline in .deps/vcpkg (VCPKG_DIR=<dir> elsewhere), then presets win-x64-release and
+      win-x64-ci (PRESETS=<names>; TEST=true also runs their ctest) with IM_FFMPEG_ROOT = the ffmpeg:fetch output in
+      .deps/ffmpeg/ when it is there (FFMPEG_ROOT=<dir> picks another)
+    vars:
+      PRESETS: '{{.PRESETS | default "win-x64-release win-x64-ci"}}'
+      TEST: '{{.TEST | default "false"}}'
+    env:
+      VCPKG_DISABLE_METRICS: '1'
+      ISSHONI_NATIVE_PRESETS: '{{.PRESETS}}'
+      ISSHONI_NATIVE_TEST: '{{.TEST}}'
+      # In Windows PowerShell 5.1 (every Windows 10 and 11 has it), as ffmpeg:build: vcpkg fetched at the
+      # baseline (shallow) and bootstrapped, its binary packages in .deps/vcpkg-cache unless VCPKG_BINARY_SOURCES
+      # or VCPKG_DEFAULT_BINARY_CACHE is set; the MSVC environment step (docs/m2/06 section 3), run as a script so
+      # its variables are this process's; CMake and Ninja from PATH (Visual Studio's, once the step ran) or the
+      # copies vcpkg pins; then each preset. Native programs run with ErrorActionPreference Continue and their exit
+      # codes decide: Windows PowerShell 5.1 can turn a native program's stderr into errors under 'Stop'.
+      ISSHONI_NATIVE_BUILD_PS1: |
+        $ErrorActionPreference = 'Stop'
+        Set-StrictMode -Version 3.0
+        $root = (Get-Location).Path
+        function Invoke-Native([string]$What, [string]$Exe, [string[]]$Arguments) {
+          $ErrorActionPreference = 'Continue'
+          & $Exe @Arguments
+          if ($LASTEXITCODE -ne 0) { throw "native:build: $What failed (exit code $LASTEXITCODE)" }
+        }
+        $deps = Join-Path $root '.deps'
+        New-Item -ItemType Directory -Force -Path $deps | Out-Null
+        $ignore = Join-Path $deps '.gitignore'
+        if (-not (Test-Path -LiteralPath $ignore)) {
+          Set-Content -LiteralPath $ignore -Encoding Ascii -Value @('# Fetched by the native and ffmpeg tasks (Taskfile.yml).', '*')
+        }
+
+        $baseline = [string](Get-Content -Raw -Path (Join-Path $root 'native\vcpkg.json') | ConvertFrom-Json).'builtin-baseline'
+        if ($baseline -notmatch '^[0-9a-f]{40}$') { throw 'native:build: native/vcpkg.json has no 40-hex builtin-baseline' }
+        $vcpkg = Join-Path $deps 'vcpkg'
+        if ($env:VCPKG_DIR) { $vcpkg = [IO.Path]::GetFullPath((Join-Path $root $env:VCPKG_DIR)) }
+        $head = ''
+        if (Test-Path -LiteralPath (Join-Path $vcpkg '.git')) {
+          $ErrorActionPreference = 'Continue'
+          $head = [string](& git -C $vcpkg rev-parse -q --verify HEAD 2>$null)
+          $ErrorActionPreference = 'Stop'
+        }
+        if ($head.Trim() -ne $baseline) {
+          Write-Host "native:build: fetching vcpkg $baseline into $vcpkg"
+          if (-not (Test-Path -LiteralPath (Join-Path $vcpkg '.git'))) {
+            New-Item -ItemType Directory -Force -Path $vcpkg | Out-Null
+            Invoke-Native 'git init' 'git' @('-C', $vcpkg, 'init', '-q')
+            Invoke-Native 'git remote add' 'git' @('-C', $vcpkg, 'remote', 'add', 'origin', 'https://github.com/microsoft/vcpkg.git')
+          }
+          Invoke-Native 'git fetch' 'git' @('-C', $vcpkg, 'fetch', '-q', '--depth', '1', 'origin', $baseline)
+          Invoke-Native 'git checkout' 'git' @('-C', $vcpkg, 'checkout', '-q', '--detach', 'FETCH_HEAD')
+          # The vcpkg tool is pinned by the checkout: fetch it again.
+          Remove-Item -LiteralPath (Join-Path $vcpkg 'vcpkg.exe') -Force -ErrorAction SilentlyContinue
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $vcpkg 'vcpkg.exe'))) {
+          Invoke-Native 'bootstrap-vcpkg.bat' (Join-Path $vcpkg 'bootstrap-vcpkg.bat') @('-disableMetrics')
+        }
+        $env:VCPKG_ROOT = $vcpkg
+        if (-not $env:VCPKG_BINARY_SOURCES -and -not $env:VCPKG_DEFAULT_BINARY_CACHE) {
+          $cache = Join-Path $deps 'vcpkg-cache'
+          New-Item -ItemType Directory -Force -Path $cache | Out-Null
+          $env:VCPKG_DEFAULT_BINARY_CACHE = $cache
+        }
+
+        $global:LASTEXITCODE = 0
+        & (Join-Path $root 'deploy\windows\msvc-env.ps1')
+        if ($LASTEXITCODE -ne 0) { throw "native:build: deploy/windows/msvc-env.ps1 failed (exit code $LASTEXITCODE)" }
+
+        $tools = @{}
+        foreach ($tool in 'cmake', 'ninja') {
+          $cmd = Get-Command $tool -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($cmd) {
+            $tools[$tool] = $cmd.Source
+          } else {
+            $ErrorActionPreference = 'Continue'
+            $fetched = [string](& (Join-Path $vcpkg 'vcpkg.exe') fetch $tool | Select-Object -Last 1)
+            $ErrorActionPreference = 'Stop'
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $fetched.Trim())) { throw "native:build: vcpkg fetch $tool failed" }
+            $tools[$tool] = $fetched.Trim()
+          }
+        }
+        $ctest = Join-Path (Split-Path -Parent $tools['cmake']) 'ctest.exe'
+
+        $ffmpeg = ''
+        if ($env:FFMPEG_ROOT) {
+          $ffmpeg = [IO.Path]::GetFullPath((Join-Path $root $env:FFMPEG_ROOT))
+        } else {
+          $found = @(Get-ChildItem -Path (Join-Path $deps 'ffmpeg') -Directory -Filter '*-win-x64' -ErrorAction SilentlyContinue |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'include\libavcodec\avcodec.h') } |
+            Sort-Object Name)
+          if ($found.Count -gt 0) { $ffmpeg = $found[-1].FullName }
+        }
+        if ($ffmpeg) {
+          Write-Host "native:build: IM_FFMPEG_ROOT=$ffmpeg"
+        } else {
+          Write-Host 'native:build: no FFmpeg build in .deps/ffmpeg (task ffmpeg:fetch): building without IM_FFMPEG_ROOT'
+        }
+
+        Push-Location (Join-Path $root 'native')
+        try {
+          foreach ($preset in ($env:ISSHONI_NATIVE_PRESETS -split '\s+' | Where-Object { $_ })) {
+            if ($preset -notmatch '^win-x64-') { throw "native:build: PRESETS: $preset is not a Windows preset (win-x64-*)" }
+            $configure = @('--preset', $preset, "-DCMAKE_MAKE_PROGRAM=$($tools['ninja'])")
+            if ($ffmpeg) { $configure += "-DIM_FFMPEG_ROOT=$ffmpeg" }
+            Invoke-Native "cmake --preset $preset" $tools['cmake'] $configure
+            Invoke-Native "cmake --build --preset $preset" $tools['cmake'] @('--build', '--preset', $preset)
+            if ($env:ISSHONI_NATIVE_TEST -eq 'true' -and $preset -ne 'win-x64-release') {
+              Invoke-Native "ctest --preset $preset" $ctest @('--preset', $preset, '--output-on-failure')
+            }
+            Write-Host "native:build: $(Join-Path $root "native\build\$preset\windows\isshoni-media.dll")"
+          }
+        } finally {
+          Pop-Location
+        }
     cmds:
-      - cmd: "echo 'native:build: note: not implemented yet; README WA11 adds it with native/windows/. Nothing was built.'"
+      - cmd: "echo 'native:build: skipped, isshoni-media.dll builds with MSVC on Windows only (on macOS and Linux, task native:test builds native/common)'"
         silent: true
+        if: '{{if eq OS "windows"}}false{{else}}true{{end}}'
+      - cmd: "echo 'native:build: note: native/windows/CMakeLists.txt or deploy/windows/msvc-env.ps1 does not exist yet, nothing to build'"
+        silent: true
+        if: '{{if eq OS "windows"}}! [ -f native/windows/CMakeLists.txt ] || ! [ -f deploy/windows/msvc-env.ps1 ]{{else}}false{{end}}'
+      - cmd: powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command '& ([scriptblock]::Create($env:ISSHONI_NATIVE_BUILD_PS1))'
+        if: '{{if eq OS "windows"}}[ -f native/windows/CMakeLists.txt ] && [ -f deploy/windows/msvc-env.ps1 ]{{else}}false{{end}}'
 
   native:dist:
     desc: >-

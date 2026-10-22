@@ -1,3 +1,9 @@
 {
-  "msvc": {"vs": "[17.0,19.0)", "toolset": "14.44", "windowsSdk": "10.0.26100.0"}
+  "nsis": {"version": "3.13", "url": "https://downloads.sourceforge.net/project/nsis/NSIS%203/3.13/nsis-3.13.zip",
+           "sha256": "ba63dffc4410ee89193e1cb5a41989991bd77c61068da17e3156d136b7b0b3d8"},
+  "msvc": {"vs": "[17.0,19.0)", "toolset": "14.44", "windowsSdk": "10.0.26100.0"},
+  "webview2Bootstrapper": {"url": "https://go.microsoft.com/fwlink/p/?LinkId=2124703",
+                           "signer": "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"},
+  "pester": "5.9.1",
+  "psScriptAnalyzer": "1.25.0"
 }

@@ -1,0 +1,11 @@
+{
+  "type": "agent.recv",
+  "data": {
+    "from": "c_9w3m5q7x2k4v6p8d",
+    "kind": "playback.stop",
+    "payload": {
+      "v": 1,
+      "roomId": "lounge"
+    }
+  }
+}

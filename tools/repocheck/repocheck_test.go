@@ -194,6 +194,20 @@ func pinTree(toolVersions, mainMod, toolsMod string) map[string]string {
 	}
 }
 
+const (
+	goodToolsJSON = `{"msvc": {"vs": "[17.0,19.0)", "toolset": "14.44", "windowsSdk": "10.0.26100.0"}}` + "\n"
+	goodTriplet   = "set(VCPKG_TARGET_ARCHITECTURE x64)\nset(VCPKG_PLATFORM_TOOLSET v143)\nset(VCPKG_PLATFORM_TOOLSET_VERSION 14.44)\n"
+)
+
+// msvcTree is a consistent pinTree with deploy/windows/tools.json and the overlay triplet ("" leaves the triplet out).
+func msvcTree(toolsJSON, triplet string) map[string]string {
+	files := withFile(pinTree(goodToolVersions, goodMainMod, goodToolsMod), "deploy/windows/tools.json", toolsJSON)
+	if triplet != "" {
+		files = withFile(files, "native/triplets/x64-windows-static.cmake", triplet)
+	}
+	return files
+}
+
 // withGoreleaserMod replaces tools/goreleaser/go.mod in a tree from pinTree.
 func withGoreleaserMod(files map[string]string, mod string) map[string]string {
 	return withFile(files, "tools/goreleaser/go.mod", mod)
@@ -364,6 +378,34 @@ func TestCheckPins(t *testing.T) {
 			files: map[string]string{".tool-versions": goodToolVersions, "go.mod": goodMainMod, "tools/go.mod": goodToolsMod,
 				"tools/goreleaser/go.mod": goodGoreleaserMod},
 			wantErr: []string{"wails3"},
+		},
+		{
+			name:  "MSVC toolset: tools.json and the triplet agree",
+			files: msvcTree(goodToolsJSON, goodTriplet),
+		},
+		{
+			name:  "MSVC toolset: a quoted version and CRLF line ends",
+			files: msvcTree(goodToolsJSON, crlf(strings.Replace(goodTriplet, "VERSION 14.44)", `VERSION "14.44")`, 1))),
+		},
+		{
+			name:    "MSVC toolset: the triplet names another",
+			files:   msvcTree(goodToolsJSON, strings.Replace(goodTriplet, "VERSION 14.44)", "VERSION 14.51)", 1)),
+			wantErr: []string{"sets VCPKG_PLATFORM_TOOLSET_VERSION 14.51 but deploy/windows/tools.json's MSVC toolset is 14.44"},
+		},
+		{
+			name:    "MSVC toolset: the triplet sets none",
+			files:   msvcTree(goodToolsJSON, "set(VCPKG_CRT_LINKAGE static)\n# set(VCPKG_PLATFORM_TOOLSET_VERSION 14.44)\n"),
+			wantErr: []string{"does not set VCPKG_PLATFORM_TOOLSET_VERSION; want 14.44"},
+		},
+		{
+			name:    "MSVC toolset: no triplet",
+			files:   msvcTree(goodToolsJSON, ""),
+			wantErr: []string{"native/triplets/x64-windows-static.cmake does not exist"},
+		},
+		{
+			name:    "MSVC toolset: tools.json without one",
+			files:   msvcTree(`{"msvc": {"vs": "[17.0,19.0)"}}`, goodTriplet),
+			wantErr: []string{`deploy/windows/tools.json has no "msvc".toolset`},
 		},
 	}
 	for _, tt := range tests {

@@ -1,0 +1,44 @@
+; The exports of isshoni-media.dll (docs/m2/04-windows-engine.md sections 5.1 and 13.1): exactly the functions that
+; native/include/isshoni_media.h declares with IM_API, undecorated, in the header's order. tests/exports_test.cpp
+; compares this list with the header, and tools/desktoppkg dll-check compares the built DLL's export table with it.
+LIBRARY isshoni-media
+EXPORTS
+    im_version
+    im_init
+    im_shutdown
+    im_build_info
+    im_set_openh264_path
+    im_clock
+    im_probe
+    im_list_sources
+    im_pick_source
+    im_cancel_pick
+    im_release_source
+    im_list_audio_apps
+    im_audio_watch
+    im_audio_unwatch
+    im_set_exclusions
+    im_audio_set_mode
+    im_audio_set_muted
+    im_audio_levels_get
+    im_audio_sound_check
+    im_start
+    im_get_session_info
+    im_next_packet
+    im_request_keyframe
+    im_set_bitrate
+    im_set_layer_active
+    im_update_layer
+    im_set_profile
+    im_set_content_hint
+    im_set_paused
+    im_set_audio_bitrate
+    im_get_stats
+    im_stop
+    im_protect_window
+    im_last_error
+    im_read_logs
+    im_abi_layout
+    im_test_render_tone
+    im_test_render_bursts
+    im_test_opus_decode

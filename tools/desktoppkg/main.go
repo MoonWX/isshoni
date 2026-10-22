@@ -13,7 +13,9 @@
 //	ffmpeg-fetch [-out DIR] [-zip FILE] [-source] [-base URL]
 //	                                download the locked FFmpeg build from the deps release, verify it against
 //	                                lock.json and unpack it; prints the folder to pass as IM_FFMPEG_ROOT (06 §4.5)
-//	dll-check                       the checks of isshoni-media.dll and the FFmpeg DLLs (06 §5.1; slice WA11)
+//	dll-check -dll FILE -version V -winver W [-ffmpeg DIR] [-load-config]
+//	                                the checks of isshoni-media.dll (exports, imports, VERSIONINFO, load config) and
+//	                                of the FFmpeg DLLs, from the PE images themselves (06 §5.1)
 //	winver <semver>                 the four-part Windows version of a SemVer (06 §5.3; slice WA67)
 //	stage [-release]                copy the install tree into dist-desktop/stage/ (06 §6.2; slices WA67, WA78)
 //	nsis                            the defines passed to makensis (06 §6.2; slice WA67)
@@ -71,7 +73,7 @@ type command struct {
 var commands = []command{
 	{"ffmpeg-inputs", "[-check]", runFFmpegInputs},
 	{"ffmpeg-fetch", "[-out DIR] [-zip FILE] [-source] [-base URL]", runFFmpegFetch},
-	{"dll-check", "(slice WA11)", runDLLCheck},
+	{"dll-check", "-dll FILE -version V -winver W [-ffmpeg DIR] [-load-config]", runDLLCheck},
 	{"winver", "<semver> (slice WA67)", runWinver},
 	{"stage", "[-release] (slices WA67, WA78)", runStage},
 	{"nsis", "(slice WA67)", runNSIS},
