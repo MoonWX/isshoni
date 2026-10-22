@@ -1,5 +1,6 @@
 #include "gpu/converter.h"
 
+#include <algorithm>
 #include <utility>
 
 #include "api/guard.h"
@@ -7,6 +8,14 @@
 #include "im/log/ring.h"
 
 namespace im::gpu {
+namespace {
+
+// The slot texture size a converter makes its first VideoProcessor for.
+video::Size ProbeInput(const ConverterConfig &config) noexcept {
+  return config.input.width != 0 && config.input.height != 0 ? config.input : config.source;
+}
+
+} // namespace
 
 im_status Converter::Create(Device &device, const ConverterConfig &config, std::unique_ptr<Converter> *out) noexcept {
   out->reset();
@@ -16,9 +25,11 @@ im_status Converter::Create(Device &device, const ConverterConfig &config, std::
       return st;
     }
     if (config.video_processor) {
-      // The slot textures start at the source's size: probe the VideoProcessor for it now (Convert creates it again
-      // when a frame's texture has another size, e.g. a rotated Desktop Duplication output).
-      if (const im_status st = c->EnsureVideoProcessor(config.source); st != IM_OK) {
+      c->vps_.reserve(kMaxVideoProcessors);
+      // The slot textures start at config.input: make the VideoProcessor for it now, on this thread (Convert makes
+      // another one only for a slot that grew).
+      VideoProcessorConverter *vp = nullptr;
+      if (const im_status st = c->VideoProcessorFor(ProbeInput(config), &vp); st != IM_OK) {
         return st;
       }
     } else {
@@ -39,18 +50,22 @@ void Converter::UseShader(std::string_view why) noexcept {
     log::Warn("gpu", "converter uses the shader", {{"why", why}});
   }
   vp_disabled_ = true;
-  vp_.reset();
+  vps_.clear();
   path_ = Path::kShader;
 }
 
-im_status Converter::EnsureVideoProcessor(video::Size input) noexcept {
+im_status Converter::VideoProcessorFor(video::Size input, VideoProcessorConverter **out) noexcept {
+  *out = nullptr;
   if (vp_disabled_) {
     return IM_OK;
   }
-  if (vp_ && vp_->input() == input && vp_->output() == config_.output.size) {
-    return IM_OK;
+  for (auto it = vps_.begin(); it != vps_.end(); ++it) {
+    if ((*it)->input() == input && (*it)->output() == config_.output.size) {
+      std::rotate(it, it + 1, vps_.end()); // the most recently used last
+      *out = vps_.back().get();
+      return IM_OK;
+    }
   }
-  vp_.reset();
   std::unique_ptr<VideoProcessorConverter> vp;
   const im_status st = VideoProcessorConverter::Create(device_, input, config_.output.size, config_.fps, &vp);
   if (st == IM_ERR_ENCODER_LOST) {
@@ -61,14 +76,15 @@ im_status Converter::EnsureVideoProcessor(video::Size input) noexcept {
     abi::ClearLastError();
     return IM_OK;
   }
-  vp_ = std::move(vp);
+  if (vps_.size() >= kMaxVideoProcessors) {
+    vps_.erase(vps_.begin()); // the least recently used
+  }
+  vps_.push_back(std::move(vp));
   path_ = Path::kVideoProcessor;
 #if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
-  if (fail_next_blt_) {
-    vp_->FailNextBltForTest();
-    fail_next_blt_ = false;
-  }
+  ++vp_created_;
 #endif
+  *out = vps_.back().get();
   return IM_OK;
 }
 
@@ -80,11 +96,18 @@ im_status Converter::Convert(const SourceFrame &src, const Nv12Target &dst) noex
   const ConvertGeometry g = Geometry(src);
   const bool empty = g.dest.width == 0 || g.dest.height == 0;
   if (!vp_disabled_ && !dst.planar() && !empty) {
-    if (const im_status st = EnsureVideoProcessor(src.texture_size); st != IM_OK) {
+    VideoProcessorConverter *vp = nullptr;
+    if (const im_status st = VideoProcessorFor(src.texture_size, &vp); st != IM_OK) {
       return st;
     }
-    if (vp_ && (g.rotation == Rotation::kIdentity || vp_->rotates())) {
-      const im_status st = vp_->Convert(src, g, dst);
+    if (vp != nullptr && (g.rotation == Rotation::kIdentity || vp->rotates())) {
+#if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
+      if (fail_next_blt_) {
+        vp->FailNextBltForTest();
+        fail_next_blt_ = false;
+      }
+#endif
+      const im_status st = vp->Convert(src, g, dst);
       if (st == IM_OK || st == IM_ERR_ENCODER_LOST || st == IM_ERR_INVALID_ARG) {
         return st;
       }
@@ -105,30 +128,21 @@ im_status Converter::Reconfigure(const ConverterConfig &config) noexcept {
     }
     return IM_OK;
   }
-  // The VideoProcessor's output size changed: Convert creates it again for the next frame.
-  if (vp_ && !(vp_->output() == config_.output.size)) {
-    vp_.reset();
-  }
-  return IM_OK;
+  // VideoProcessors for the old output size can't write the new one; the one for the slots' size is made here, not on
+  // the next frame.
+  std::erase_if(
+      vps_, [&](const std::unique_ptr<VideoProcessorConverter> &vp) { return !(vp->output() == config_.output.size); });
+  VideoProcessorConverter *vp = nullptr;
+  return VideoProcessorFor(ProbeInput(config_), &vp);
 }
 
 void Converter::ClearViews() noexcept {
   if (shader_) {
     shader_->ClearViews();
   }
-  if (vp_) {
-    vp_->ClearViews();
+  for (const std::unique_ptr<VideoProcessorConverter> &vp : vps_) {
+    vp->ClearViews();
   }
 }
-
-#if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
-void Converter::FailNextVideoProcessorBltForTest() noexcept {
-  if (vp_) {
-    vp_->FailNextBltForTest();
-  } else {
-    fail_next_blt_ = true;
-  }
-}
-#endif
 
 } // namespace im::gpu

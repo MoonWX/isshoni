@@ -8,6 +8,23 @@
 #include "im/abi/status.h"
 
 namespace im::gpu {
+namespace {
+
+// A side of a grown slot texture that holds `want`: rounded up to a multiple of kGrowStep (at most D3D11's largest
+// texture, unless `want` itself is larger, which CreateTexture2D then refuses), so a window dragged larger reallocates
+// a slot every 256 pixels of growth instead of on every frame (04 §6.1: the capture side doesn't allocate per frame),
+// and the converters see few distinct texture sizes (converter.h keeps a VideoProcessor per size).
+constexpr uint64_t kGrowStep = 256;
+
+uint32_t GrownSide(uint32_t have, uint32_t want) noexcept {
+  if (want <= have) {
+    return have;
+  }
+  const uint64_t rounded = (uint64_t{want} + kGrowStep - 1) / kGrowStep * kGrowStep;
+  return std::max(want, static_cast<uint32_t>(std::min<uint64_t>(rounded, D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)));
+}
+
+} // namespace
 
 uint64_t NewTextureId() noexcept {
   static std::atomic<uint64_t> next{0};
@@ -69,7 +86,7 @@ im_status FrameSlots::BeginWrite(video::Size content, Slot **out) noexcept {
   Slot &slot = slots_[index_.write_index()];
   *out = &slot;
   if (content.width > slot.size.width || content.height > slot.size.height) {
-    const video::Size grown{std::max(content.width, slot.size.width), std::max(content.height, slot.size.height)};
+    const video::Size grown{GrownSide(slot.size.width, content.width), GrownSide(slot.size.height, content.height)};
     if (const im_status st = Allocate(slot, grown); st != IM_OK) {
       *out = nullptr;
       return st;

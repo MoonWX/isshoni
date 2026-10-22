@@ -5,14 +5,17 @@
 //   ≤ 2 on edges; at 1:1, downscaled (bilinear), as the preview (the 2×2 box), for an odd window, a content smaller
 //   than its texture and rotated panels;
 // - the VideoProcessor against the shader output (≤ 2 on flat areas) when WARP offers one, else skipped with the
-//   reason; with the test hooks, a failed VideoProcessorBlt switching the layer to the shader;
+//   reason; with the test hooks, a failed VideoProcessorBlt switching the layer to the shader, one VideoProcessor per
+//   slot texture size (none created per frame when the slots alternate between sizes) and the first one made for
+//   ConverterConfig::input rather than on the first frame;
 // - the letterbox: geometry, bars of exactly Y 16 and Cb/Cr 128, the content against golden pictures;
 // - rotation 90/180/270 against golden pictures;
 // - pointer blending of color, masked-color and monochrome shapes against golden pictures (also cut at the frame's
 //   edge and on rotated frames), once per frame, and nothing drawn with IM_START_HIDE_CURSOR;
 // - the GPU test pattern renders: every pixel equals pattern_layout.h's model;
-// - the frame slots (newest frame wins, the reader keeps its frame, growth), the context lock and the device-loss
-//   mapping.
+// - the frame slots (newest frame wins, the reader keeps its frame, growth in steps of 256), the NV12 readback (planar
+//   sources checked; with the test hooks, the context lock free while it waits for the GPU), the context lock and the
+//   device-loss mapping.
 //
 // The goldens are text pictures in testdata/gpu/ (format: gpu_warp_support.h). With IM_GPU_GOLDEN_OUT=<folder> the
 // test writes what WARP produced there (pictures in the same format, NV12 planes as PGM) for review.
@@ -27,8 +30,10 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
@@ -223,10 +228,13 @@ Nv12Image ConvertAndRead(Device &d, Converter &conv, const SourceFrame &src) {
   return out;
 }
 
-std::unique_ptr<Converter> MakeConverter(Device &d, const OutputSize &layer, Size upright, bool video_processor) {
+// input: the slot texture size in the capture's orientation (ConverterConfig::input); empty: upright.
+std::unique_ptr<Converter> MakeConverter(Device &d, const OutputSize &layer, Size upright, bool video_processor,
+                                         Size input = {}) {
   ConverterConfig cfg;
   cfg.output = layer;
   cfg.source = upright;
+  cfg.input = input;
   cfg.fps = 60;
   cfg.video_processor = video_processor;
   std::unique_ptr<Converter> c;
@@ -409,8 +417,8 @@ int CompareVideoProcessorWithShader(Device &dev, const char *label) {
     const Texture tex = Upload(dev, tex_img);
     const Size upright = im::gpu::Upright(c.content, c.rotation);
     const OutputSize layer = im::video::ComputeOutputSize(upright, c.bounds);
-    const std::unique_ptr<Converter> vp = MakeConverter(dev, layer, upright, true);
-    const std::unique_ptr<Converter> shader = MakeConverter(dev, layer, upright, false);
+    const std::unique_ptr<Converter> vp = MakeConverter(dev, layer, upright, true, c.texture);
+    const std::unique_ptr<Converter> shader = MakeConverter(dev, layer, upright, false, c.texture);
     if (!tex.tex || !vp || !shader) {
       ADD_FAILURE() << label << ": setup failed";
       continue;
@@ -1033,16 +1041,253 @@ TEST_F(GpuWarp, FrameSlots) {
   const uint64_t old_id = w->texture_id;
   ASSERT_EQ(slots->BeginWrite(Size{100, 80}, &w), IM_OK); // the same slot: nothing was published in between
   EXPECT_NE(w->texture_id, old_id);
-  EXPECT_GE(w->size.width, 100u);
-  EXPECT_GE(w->size.height, 80u);
+  // A grown side is rounded up to a multiple of 256: a window dragged larger reallocates every 256 pixels of growth,
+  // not on every frame.
+  EXPECT_TRUE(w->size == (Size{256, 256})) << w->size.width << "x" << w->size.height;
+  const uint64_t grown_id = w->texture_id;
+  ASSERT_EQ(slots->BeginWrite(Size{250, 200}, &w), IM_OK);
+  EXPECT_EQ(w->texture_id, grown_id); // it still fits: the same texture
+  ASSERT_EQ(slots->BeginWrite(Size{300, 100}, &w), IM_OK);
+  EXPECT_NE(w->texture_id, grown_id);
+  EXPECT_TRUE(w->size == (Size{512, 256})) << w->size.width << "x" << w->size.height; // only the side that grew
   FrameMeta meta;
-  meta.content = Size{100, 80};
+  meta.content = Size{300, 100};
   slots->Publish(meta);
   t = slots->TakeLatest();
   ASSERT_TRUE(t.fresh);
-  EXPECT_TRUE(t.slot->meta.content == (Size{100, 80}));
+  EXPECT_TRUE(t.slot->meta.content == (Size{300, 100}));
   EXPECT_TRUE(t.slot->source().texture_size == t.slot->size);
 }
+
+#if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
+// The slots' textures differ in size once one grew (only the writer's slot grows): the converter keeps a
+// VideoProcessor per slot size (converter.h), so alternating sizes create none after the first frame of each.
+TEST_F(GpuWarp, ConverterKeepsAVideoProcessorPerSlotSize) {
+  std::string why;
+  if (!VideoProcessorAvailable(&why)) {
+    GTEST_SKIP() << "WARP offers no VideoProcessor: " << why;
+  }
+  const Size start{640, 360};
+  std::unique_ptr<FrameSlots> slots;
+  ASSERT_EQ(FrameSlots::Create(*dev_, start, &slots), IM_OK) << Detail();
+  const OutputSize layer = im::video::ComputeOutputSize(start, {});
+  const std::unique_ptr<Converter> conv = MakeConverter(*dev_, layer, start, true, start);
+  ASSERT_TRUE(conv);
+  if (conv->path() != Converter::Path::kVideoProcessor) {
+    GTEST_SKIP() << "WARP offers no VideoProcessor for 640x360";
+  }
+  EXPECT_EQ(conv->video_processors_created_for_test(), 1u); // Create made the one for the slots' size
+  std::unique_ptr<Nv12Surface> out;
+  ASSERT_EQ(Nv12Surface::Create(*dev_, layer.size, &out), IM_OK) << Detail();
+  std::unique_ptr<Nv12Readback> readback;
+  ASSERT_EQ(Nv12Readback::Create(*dev_, layer.size, out->planar(), &readback), IM_OK) << Detail();
+  Nv12Image img(layer.size.width, layer.size.height);
+  const im::gpu::Nv12Planes planes{img.y.data(), layer.size.width, img.uv.data(), layer.size.width};
+
+  // The reader takes every frame, so the writer fills the three slots in turn; each gets a content larger than it
+  // holds the first time round, which leaves three textures of three sizes.
+  const Size contents[3] = {{700, 400}, {1000, 600}, {1300, 800}};
+  const Size grown[3] = {{768, 512}, {1024, 768}, {1536, 1024}};
+  const uint8_t colors[3][3] = {{204, 51, 26}, {26, 179, 77}, {51, 77, 230}}; // R, G, B
+  uint32_t created_after_first_round = 0;
+  for (int i = 0; i < 15; ++i) { // three slots, converted five times each
+    SCOPED_TRACE(i);
+    const int k = i % 3;
+    Slot *w = nullptr;
+    ASSERT_EQ(slots->BeginWrite(contents[k], &w), IM_OK) << Detail();
+    EXPECT_TRUE(w->size == grown[k]) << w->size.width << "x" << w->size.height;
+    Clear(*dev_, *w, colors[k][0] / 255.0f, colors[k][1] / 255.0f, colors[k][2] / 255.0f);
+    FrameMeta meta;
+    meta.capture_ts_ns = i + 1;
+    meta.content = contents[k];
+    slots->Publish(meta);
+    const FrameSlots::Taken t = slots->TakeLatest();
+    ASSERT_TRUE(t.fresh);
+    ASSERT_EQ(conv->Convert(t.slot->source(), out->target()), IM_OK) << Detail();
+    if (i == 2) {
+      created_after_first_round = conv->video_processors_created_for_test();
+    }
+    // The frame's own color in the middle of the picture (a flat area): the VideoProcessor read the right slot. Within
+    // 3 of the model: the VideoProcessor's 2 from the shader plus the shader's 1 from the model.
+    ASSERT_EQ(readback->Read(out->target(), planes), IM_OK) << Detail();
+    const im::gpu::model::Ycc want =
+        im::gpu::model::ToYcc(im::gpu::model::Rgb{colors[k][0] / 255.0, colors[k][1] / 255.0, colors[k][2] / 255.0});
+    const uint32_t cx = layer.size.width / 2;
+    const uint32_t cy = layer.size.height / 2;
+    EXPECT_LE(std::abs(img.Y(cx, cy) - model::Code(want.y)), 3);
+    EXPECT_LE(std::abs(img.Cb(cx / 2, cy / 2) - model::Code(want.cb)), 3);
+    EXPECT_LE(std::abs(img.Cr(cx / 2, cy / 2) - model::Code(want.cr)), 3);
+  }
+  EXPECT_EQ(conv->path(), Converter::Path::kVideoProcessor);
+  // One per grown slot size in the first round, none after it (one per frame before the cache).
+  EXPECT_LE(created_after_first_round - 1, 3u);
+  EXPECT_EQ(conv->video_processors_created_for_test(), created_after_first_round);
+}
+
+// ConverterConfig::input: Create makes the VideoProcessor for the slots' texture size, so a rotated Desktop
+// Duplication session (slots in the panel's orientation, sides swapped against the upright source) creates none on
+// its first frame; Reconfigure makes the one for a new output size on its own thread too.
+TEST_F(GpuWarp, ConverterMakesItsVideoProcessorForTheSlotSize) {
+  std::string why;
+  if (!VideoProcessorAvailable(&why)) {
+    GTEST_SKIP() << "WARP offers no VideoProcessor: " << why;
+  }
+  const Size slot{1280, 720};    // a panel turned 90 degrees, as Desktop Duplication delivers it
+  const Size upright{720, 1280}; // what viewers see
+  std::unique_ptr<Converter> conv =
+      MakeConverter(*dev_, im::video::ComputeOutputSize(upright, {}), upright, true, slot);
+  ASSERT_TRUE(conv);
+  if (conv->path() != Converter::Path::kVideoProcessor) {
+    GTEST_SKIP() << "WARP offers no VideoProcessor for 1280x720 to 720x1280";
+  }
+  EXPECT_EQ(conv->video_processors_created_for_test(), 1u);
+  const BgraImage img = wt::TestImage(slot.width, slot.height, 23);
+  const Texture tex = Upload(*dev_, img);
+  ASSERT_FALSE(HasFailure());
+  const SourceFrame src = tex.Source(slot, Rotation::k90);
+  (void)ConvertAndRead(*dev_, *conv, src);
+  ASSERT_FALSE(HasFailure());
+  EXPECT_EQ(conv->video_processors_created_for_test(), 1u); // the first frame made none
+  ConverterConfig cfg = conv->config();
+  cfg.output = im::video::ComputeOutputSize(upright, LayerBounds{230400, 0, 0});
+  ASSERT_EQ(conv->Reconfigure(cfg), IM_OK) << Detail();
+  ASSERT_EQ(conv->path(), Converter::Path::kVideoProcessor);
+  EXPECT_EQ(conv->video_processors_created_for_test(), 2u);
+  (void)ConvertAndRead(*dev_, *conv, src);
+  ASSERT_FALSE(HasFailure());
+  EXPECT_EQ(conv->video_processors_created_for_test(), 2u);
+}
+#endif
+
+// ---------------------------------------------------------------------------------------------- NV12 readback
+
+// A plane texture (default usage) holding data, for the readback's planar sources.
+ComPtr<ID3D11Texture2D> PlaneTexture(Device &d, uint32_t w, uint32_t h, DXGI_FORMAT format,
+                                     const std::vector<uint8_t> &data, uint32_t bytes_per_pixel) {
+  D3D11_TEXTURE2D_DESC td{};
+  td.Width = w;
+  td.Height = h;
+  td.MipLevels = 1;
+  td.ArraySize = 1;
+  td.Format = format;
+  td.SampleDesc.Count = 1;
+  td.Usage = D3D11_USAGE_DEFAULT;
+  td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+  D3D11_SUBRESOURCE_DATA init{};
+  init.pSysMem = data.data();
+  init.SysMemPitch = w * bytes_per_pixel;
+  ComPtr<ID3D11Texture2D> t;
+  if (FAILED(d.d3d()->CreateTexture2D(&td, &init, t.GetAddressOf()))) {
+    ADD_FAILURE() << "plane texture failed";
+  }
+  return t;
+}
+
+std::vector<uint8_t> Bytes(std::size_t n, uint32_t seed) {
+  std::vector<uint8_t> v(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    v[i] = static_cast<uint8_t>((i * 7 + seed * 31 + (i >> 5)) & 0xFF);
+  }
+  return v;
+}
+
+// The planar readback (our own surfaces on a device without NV12 render targets): the planes come back as written,
+// and planes of another size or format are refused (CopyResource would copy nothing and leave the previous frame).
+TEST_F(GpuWarp, ReadbackOfPlanes) {
+  const Size size{64, 32};
+  const std::vector<uint8_t> y = Bytes(64 * 32, 1);
+  const std::vector<uint8_t> uv = Bytes(32 * 16 * 2, 2);
+  const ComPtr<ID3D11Texture2D> luma = PlaneTexture(*dev_, 64, 32, DXGI_FORMAT_R8_UNORM, y, 1);
+  const ComPtr<ID3D11Texture2D> chroma = PlaneTexture(*dev_, 32, 16, DXGI_FORMAT_R8G8_UNORM, uv, 2);
+  ASSERT_FALSE(HasFailure());
+  std::unique_ptr<Nv12Readback> readback;
+  ASSERT_EQ(Nv12Readback::Create(*dev_, size, /*planar=*/true, &readback), IM_OK) << Detail();
+  Nv12Image out(size.width, size.height);
+  const im::gpu::Nv12Planes planes{out.y.data(), size.width, out.uv.data(), size.width};
+  ASSERT_EQ(readback->Read(im::gpu::Nv12Target{nullptr, 0, luma.Get(), chroma.Get()}, planes), IM_OK) << Detail();
+  EXPECT_EQ(out.y, y);
+  EXPECT_EQ(out.uv, uv);
+
+  const std::vector<uint8_t> other = Bytes(64 * 32 * 2, 3);
+  const struct {
+    const char *name;
+    ComPtr<ID3D11Texture2D> y_plane;
+    ComPtr<ID3D11Texture2D> uv_plane;
+  } bad[] = {
+      {"short luma", PlaneTexture(*dev_, 64, 30, DXGI_FORMAT_R8_UNORM, other, 1), chroma},
+      {"luma as R8G8", PlaneTexture(*dev_, 64, 32, DXGI_FORMAT_R8G8_UNORM, other, 2), chroma},
+      {"full-size chroma", luma, PlaneTexture(*dev_, 64, 32, DXGI_FORMAT_R8G8_UNORM, other, 2)},
+      {"chroma as R8", luma, PlaneTexture(*dev_, 32, 16, DXGI_FORMAT_R8_UNORM, other, 1)},
+  };
+  ASSERT_FALSE(HasFailure());
+  for (const auto &b : bad) {
+    SCOPED_TRACE(b.name);
+    im::abi::ClearLastError();
+    EXPECT_EQ(readback->Read(im::gpu::Nv12Target{nullptr, 0, b.y_plane.Get(), b.uv_plane.Get()}, planes),
+              IM_ERR_INVALID_ARG);
+    EXPECT_NE(Detail().find("planar source"), std::string::npos) << Detail();
+  }
+  im::abi::ClearLastError();
+}
+
+#if defined(IM_TEST_HOOKS) && IM_TEST_HOOKS
+// 04 §6.1, §8.1: the readback waits for the GPU without the context lock, so the capture copy and FFmpeg's
+// submissions go on meanwhile. While it waits, another thread takes the lock.
+TEST_F(GpuWarp, ReadbackWaitsWithoutTheLock) {
+  const Size size{1280, 720};
+  const BgraImage img = wt::TestImage(size.width, size.height, 31);
+  const Texture tex = Upload(*dev_, img);
+  ASSERT_FALSE(HasFailure());
+  const std::unique_ptr<Converter> conv = MakeConverter(*dev_, im::video::ComputeOutputSize(size, {}), size, false);
+  ASSERT_TRUE(conv);
+  std::unique_ptr<Nv12Surface> surface;
+  ASSERT_EQ(Nv12Surface::Create(*dev_, size, &surface), IM_OK) << Detail();
+  std::unique_ptr<Nv12Readback> readback;
+  ASSERT_EQ(Nv12Readback::Create(*dev_, size, surface->planar(), &readback), IM_OK) << Detail();
+
+  struct Probe {
+    Device *dev = nullptr;
+    int calls = 0;
+    bool lock_free = false;
+    std::promise<void> locked;
+    std::thread other;
+  } probe;
+  probe.dev = dev_.get();
+  readback->SetWaitHookForTest(
+      [](void *ctx) {
+        auto *p = static_cast<Probe *>(ctx);
+        if (p->calls++ != 0) {
+          return;
+        }
+        std::future<void> f = p->locked.get_future();
+        p->other = std::thread([p] {
+          p->dev->Lock(); // blocks until Read releases the lock, if it holds it
+          p->dev->Unlock();
+          p->locked.set_value();
+        });
+        p->lock_free = f.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+      },
+      &probe);
+  const SourceFrame src = tex.Source(size, Rotation::kIdentity);
+  ASSERT_EQ(conv->Convert(src, surface->target()), IM_OK) << Detail(); // queued GPU work the readback waits for
+  Nv12Image got(size.width, size.height);
+  const im::gpu::Nv12Planes planes{got.y.data(), size.width, got.uv.data(), size.width};
+  const im_status st = readback->Read(surface->target(), planes);
+  if (probe.other.joinable()) {
+    probe.other.join();
+  }
+  readback->SetWaitHookForTest(nullptr, nullptr);
+  ASSERT_EQ(st, IM_OK) << Detail();
+  EXPECT_EQ(probe.calls, 1);
+  EXPECT_TRUE(probe.lock_free) << "another thread could not take the context lock while the readback waited";
+  // And the picture is the converted frame.
+  const ConvertGeometry g = conv->Geometry(src);
+  const wt::Nv12Diff d =
+      wt::CompareNv12(got, model::Convert(img, g), [&](Point p) { return model::Flat(img, g, p, 1) ? 1 : 2; });
+  EXPECT_LE(d.max_flat, 1) << d.Summary();
+  EXPECT_LE(d.max_edge, 2) << d.Summary();
+}
+#endif
 
 TEST(GpuTripleIndex, OneWriterOneReader) {
   im::gpu::TripleIndex s;

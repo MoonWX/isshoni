@@ -6,8 +6,9 @@
 // context under the context lock, so a copy is ordered before the reads without fences.
 //
 // The slots start at the source's size. A capture whose content is larger (a window grown before the resize settles,
-// 04 §7.7) grows the writer's texture in BeginWrite; textures never shrink, and each frame says how much of its texture
-// it fills (FrameMeta::content).
+// 04 §7.7) grows the writer's texture in BeginWrite, each grown side rounded up to a multiple of 256 pixels so a window
+// dragged larger reallocates a few times rather than on every frame; textures never shrink, and each frame says how
+// much of its texture it fills (FrameMeta::content).
 #pragma once
 
 #include <array>
@@ -65,8 +66,8 @@ public:
   FrameSlots &operator=(const FrameSlots &) = delete;
 
   // ---- the capture side (one writer thread at a time)
-  // The slot to fill next, grown to hold content when it doesn't (an allocation: only on growth). *out stays valid
-  // until Publish.
+  // The slot to fill next, grown to hold content when it doesn't (an allocation: only on growth, each grown side
+  // rounded up to a multiple of 256). *out stays valid until Publish.
   im_status BeginWrite(video::Size content, Slot **out) noexcept;
   // Publishes the slot BeginWrite returned as the latest frame. Returns its number.
   uint64_t Publish(const FrameMeta &meta) noexcept;
