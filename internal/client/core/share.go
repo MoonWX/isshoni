@@ -153,13 +153,16 @@ type Share struct {
 	pump   *pump
 	ctx    context.Context // the actor's: ends when end asks the actor to end the share, or when the share ends
 	cancel context.CancelFunc
+	connID string // the connection the server's share is on: share.start's (and a republish's); "" when unknown
 	// The actor's alone.
 	drv     pubDriver
 	cons    *consumer
 	profile string          // the profile the session runs: its first EventLayer's
 	seen    map[string]bool // the layers whose first EventLayer arrived
 	limits  map[string]string
-	inState bool // the share was in a room.state
+	inState bool // the share (its current id) was in a room.state
+	live    bool // the share has been live (§11.4 step 5); it stays so across a republish
+	rec     recovery
 
 	mu   sync.Mutex // guards the fields below
 	snap ShareSnapshot
@@ -221,6 +224,7 @@ func (c *Client) StartShare(ctx context.Context, r ShareRequest) (*Share, error)
 		}
 		return nil, err
 	}
+	s.takeSignal()
 	go s.actor()
 	return s, nil
 }
@@ -274,24 +278,44 @@ func (s *Share) start(ctx context.Context) (err error) {
 		s.over(startEnd(err))
 	}()
 
-	// 1. room.join, unless the connection is in the room already.
-	if c.roomID() != s.req.RoomID {
-		joined = true
-		if err := c.join(ctx, s.req.RoomID); err != nil {
-			var perr *protocol.Error
-			if errors.As(err, &perr) {
-				joined = false // the server refused it: the connection is in no room
+	// Steps 1 and 2. A request that signaling's drop cut short goes again once it is ready (§11.7): on the same
+	// connection (resumed) share.start keeps its ref, so the server answers with the share it may have made; a new
+	// connection has neither the room nor the share, and the start begins again with a new ref.
+	var params protocol.ShareParams
+	ref := newRef()
+	for {
+		seq, conn := c.readySeqNow(), c.sigConnID()
+		// 1. room.join, unless the connection is in the room already.
+		if c.roomID() != s.req.RoomID {
+			joined = true
+			if err := c.join(ctx, s.req.RoomID); err != nil {
+				var perr *protocol.Error
+				if errors.As(err, &perr) {
+					joined = false // the server refused it: the connection is in no room
+				}
+				if lostSignaling(err) && c.waitReady(ctx, seq) == nil {
+					continue
+				}
+				return requestErr(ctx, err)
+			}
+		}
+		// 2. share.start.
+		s.update(func(snap *ShareSnapshot) { snap.State = StateStarting })
+		start := protocol.ShareStart{Kind: shareKind(s.req.Source.Kind), Label: s.req.Label, Preset: s.req.Preset,
+			Audio: s.req.Audio, Ref: ref}
+		if err := c.request(ctx, protocol.MessageTypeShareStart, start, &params); err != nil {
+			if lostSignaling(err) && c.waitReady(ctx, seq) == nil {
+				if c.sigConnID() != conn {
+					ref = newRef()
+				}
+				continue
 			}
 			return requestErr(ctx, err)
 		}
-	}
-	// 2. share.start.
-	s.update(func(snap *ShareSnapshot) { snap.State = StateStarting })
-	var params protocol.ShareParams
-	start := protocol.ShareStart{Kind: shareKind(s.req.Source.Kind), Label: s.req.Label, Preset: s.req.Preset,
-		Audio: s.req.Audio, Ref: newRef()}
-	if err := c.request(ctx, protocol.MessageTypeShareStart, start, &params); err != nil {
-		return requestErr(ctx, err)
+		if c.sigConnID() == conn {
+			s.connID = conn // else unknown: the actor publishes the share again on the connection it finds
+		}
+		break
 	}
 	shareID = params.ShareID
 	s.params = params
@@ -540,8 +564,20 @@ type (
 	msgRestart   struct{ r protocol.PCRestart }
 	msgHint      struct{ h protocol.QualityHint }
 	msgError     struct{ e protocol.Error }
-	msgWelcome   struct{ resumed bool } // a welcome: resumed, or a new connection
 	msgResend    struct{ gen, neg uint32 }
+	// msgWelcome: signaling is ready (seq counts the readies), on connection connID, resumed or a new connection,
+	// in the welcome's room (a resumed welcome names the room the connection is in, "" for none).
+	msgWelcome struct {
+		seq     uint64
+		connID  string
+		resumed bool
+		roomID  string
+	}
+	// msgOffline: signaling left the ready of seq at at: the share's hold starts (§11.7).
+	msgOffline struct {
+		seq uint64
+		at  time.Time
+	}
 )
 
 // post hands a message to the actor; it never blocks. Messages to a share that has ended are dropped.
@@ -579,10 +615,16 @@ func (m *mailbox) take() []any {
 	return out
 }
 
-// actor is the share's goroutine: engine events and the session's end from the pump, the server's messages, and
-// the requests to end the share.
+// actor is the share's goroutine: engine events and the session's end from the pump, the server's messages, the
+// pub PC's looks (pubdriver.go) and the hold (recovery.go), and the requests to end the share.
 func (s *Share) actor() {
 	close(s.run)
+	tick := time.NewTicker(s.c.timing.pcPoll)
+	defer tick.Stop()
+	if req := s.begin(); req != nil {
+		s.finish(*req)
+		return
+	}
 	for {
 		select {
 		case m := <-s.pump.out:
@@ -601,6 +643,16 @@ func (s *Share) actor() {
 					s.finish(*req)
 					return
 				}
+			}
+		case <-s.rec.holdC():
+			if req := s.holdOver(); req != nil {
+				s.finish(*req)
+				return
+			}
+		case now := <-tick.C:
+			if req := s.tick(now); req != nil {
+				s.finish(*req)
+				return
 			}
 		case req := <-s.ends:
 			s.finish(req)
@@ -628,25 +680,47 @@ func (s *Share) onMessage(m any) *endRequest {
 	case msgHint:
 		s.onHint(m.h)
 	case msgRestart:
-		s.onRestart(m.r)
+		if info := s.onRestart(m.r); info != nil {
+			return &endRequest{info: *info, stop: true, leave: true}
+		}
 	case msgResend:
 		s.resend(m.gen, m.neg)
 	case msgWelcome:
-		if !m.resumed {
-			// A new connection: the server forgot the room and the share. Republishing it is §11.7's (README
-			// WA38); until then the share ends.
-			return &endRequest{info: EndInfo{Reason: EndServer, Server: protocol.EndReasonDisconnected}}
-		}
+		return s.onWelcome(m)
+	case msgOffline:
+		s.onOffline(m)
 	}
 	return nil
 }
 
-// onRoomState follows the share in room.state: it goes live when the server says so (the SFU saw its first
-// keyframe, §11.4 step 5), its watchers go to the snapshot, and a share that vanished was ended by the server.
+// onRoomState follows the share in room.state (§11.4 step 5, §11.7). A room.state that comes while signaling is
+// down is kept for the reconcile after the welcome; the first one after a resumed welcome is reconciled with the
+// server's view of a share it may have lost (reconcile).
 func (s *Share) onRoomState(st protocol.RoomState) *endRequest {
+	if !s.rec.online {
+		s.rec.offline = &st
+		return nil
+	}
+	resync := s.rec.resync
+	s.rec.resync = false
+	return s.reconcile(st, resync)
+}
+
+// reconcile follows the share in a room.state: it goes live when the server says so (the SFU saw its first
+// keyframe, §11.4 step 5), a republished one is back once its new id is live, its watchers go to the snapshot, and
+// the connection's shares that the core doesn't have are stopped (§11.7). A share that vanished was ended by the
+// server; after a resumed welcome (resync) the server lost it instead, and it is republished.
+func (s *Share) reconcile(st protocol.RoomState, resync bool) *endRequest {
 	i := slices.IndexFunc(st.Shares, func(si protocol.ShareInfo) bool { return si.ID == s.params.ShareID })
 	if i < 0 {
-		if s.inState {
+		switch {
+		case s.rec.republish:
+			// Its republish is due: the share it had is gone, and the new one isn't there yet.
+		case resync:
+			s.log.Info("the server lost the share: publishing it again", slog.String("share_id", s.params.ShareID))
+			s.rec.republish = true
+			return s.republish()
+		case s.inState:
 			// Gone without a room.event naming it (that one ends the share first, with its reason).
 			return &endRequest{info: EndInfo{Reason: EndServer}, leave: true}
 		}
@@ -654,17 +728,17 @@ func (s *Share) onRoomState(st protocol.RoomState) *endRequest {
 	}
 	s.inState = true
 	info := st.Shares[i]
-	live := false
-	s.update(func(snap *ShareSnapshot) {
-		snap.Watchers = slices.Clone(info.Watchers)
-		if snap.State == StateStarting && (info.Status == protocol.ShareStatusLive || info.Status == protocol.ShareStatusPaused) {
-			snap.State, live = StateLive, true
+	if info.Status == protocol.ShareStatusLive || info.Status == protocol.ShareStatusPaused {
+		if !s.live {
+			s.live = true
+			s.ctl.Live(time.Now())
+			s.log.Info("share live", slog.String("share_id", s.params.ShareID))
 		}
-	})
-	if live {
-		s.ctl.Live(time.Now())
-		s.log.Info("share live", slog.String("share_id", s.params.ShareID))
+		s.rec.republishing = false
 	}
+	s.update(func(snap *ShareSnapshot) { snap.Watchers = slices.Clone(info.Watchers) })
+	s.syncState()
+	s.stopOrphans(st)
 	return nil
 }
 
@@ -719,6 +793,8 @@ func (s *Share) onEngineEvent(ev media.Event) *EndInfo {
 		})
 		if first {
 			s.profile = ev.Profile
+		}
+		if first && !s.rec.republish { // a republish that is due starts the Publisher itself
 			if err := s.startPublisher(); err != nil {
 				if s.ctx.Err() != nil {
 					// end cut the offer short: the share ends with the EndInfo it asks for, which the actor takes next.
@@ -816,7 +892,7 @@ func (s *Share) startPublisher() error {
 	s.mu.Lock()
 	s.pub = pub
 	s.mu.Unlock()
-	return s.offer()
+	return s.offer(false)
 }
 
 // videoTargets returns the applied bitrate of every video layer, for Publisher.SetPacingTargets.
@@ -841,6 +917,7 @@ func (s *Share) finish(req endRequest) {
 		ctx, cancel = context.WithTimeout(context.Background(), cleanupTimeout)
 		defer cancel()
 	}
+	s.rec.stopHold()
 	s.pump.halt()
 	var stopped chan error // share.stop's result
 	if req.stop {
@@ -869,10 +946,12 @@ func (s *Share) finish(req endRequest) {
 	s.over(req.info)
 }
 
-// closePublisher closes the share's Publisher, after pc.close when tell (the server then drops the pub PC at once).
+// closePublisher closes the share's Publisher, after pc.close when tell (the server then drops the pub PC at once),
+// and forgets it: a rebuild or a republish makes the next one.
 func (s *Share) closePublisher(tell bool) {
 	s.mu.Lock()
 	pub := s.pub
+	s.pub = nil
 	s.mu.Unlock()
 	if pub == nil {
 		return
@@ -887,6 +966,7 @@ func (s *Share) closePublisher(tell bool) {
 	}
 	if s.cons != nil {
 		s.pump.detach(s.cons)
+		s.cons = nil
 	}
 }
 

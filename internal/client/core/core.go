@@ -52,6 +52,8 @@ type Options struct {
 	Logger *slog.Logger
 	// allowListed is for in-package tests only (TestCaptureToSend): Engine.Start gets Config.Listed.
 	allowListed bool
+	// timing is for in-package tests only: shorter recovery timers (recovery.go); nil = defaultTiming.
+	timing *timing
 }
 
 // Auth is exactly what 02's *deviceauth.Manager provides.
@@ -142,6 +144,7 @@ type Client struct {
 	log      *slog.Logger
 	wsURL    string
 	settings webrtc.SettingEngine
+	timing   timing
 	events   subscribers
 
 	// life ends with Close and when Run ends: it ends StartShare and StopOther calls in flight.
@@ -164,6 +167,14 @@ type Client struct {
 	dialCancel context.CancelFunc // ends the Dial in progress
 	forced     *protocol.Secret   // the forced refresh's token, for the next hello only
 	watchStats bool
+	// Signaling as the connection actor has seen it (recovery.go): readySeq counts its readies, sigReady says
+	// whether it is ready now, connID is the last ready's connection id and downAt when it last left ready.
+	// readyCh is closed and replaced at every change of them.
+	readySeq uint64
+	sigReady bool
+	connID   string
+	downAt   time.Time
+	readyCh  chan struct{}
 }
 
 // New checks o and returns a Client. It starts nothing.
@@ -210,10 +221,15 @@ func New(o Options) (*Client, error) {
 		log:      log,
 		wsURL:    strings.TrimSuffix(o.ServerURL, "/") + "/ws",
 		settings: *settings,
+		timing:   defaultTiming,
 		done:     make(chan struct{}),
 		authStop: make(chan *StopError, 1),
 		status:   Status{Conn: ConnConnecting},
 		room:     roomView{changed: make(chan struct{})},
+		readyCh:  make(chan struct{}),
+	}
+	if o.timing != nil {
+		c.timing = *o.timing
 	}
 	c.life, c.cancelLife = context.WithCancel(context.Background())
 	return c, nil
