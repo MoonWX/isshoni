@@ -16,6 +16,8 @@ import (
 	"testing/synctest"
 	"time"
 
+	"go.uber.org/goleak"
+
 	"github.com/MoonWX/isshoni/internal/client/credstore"
 	"github.com/MoonWX/isshoni/internal/client/deeplink"
 	"github.com/MoonWX/isshoni/internal/client/deviceauth"
@@ -126,6 +128,15 @@ func TestServersRoundTrip(t *testing.T) {
 		if a := again.Active(); a == nil || a.State().Origin != portOrigin(8443) {
 			t.Fatal("the active server didn't survive the restart")
 		}
+		// Before Start, the state follows the store: linked with the stored credential, unlinked without one.
+		if st := again.Active().State(); st.Status != deviceauth.StatusLinked || st.ServerName != "Alex's server" {
+			t.Fatalf("the linked server's state before Start = %s %q, want linked", st.Status, st.ServerName)
+		}
+		must(t, again.SetActive(portOrigin(9443)))
+		if st := again.Active().State(); st.Status != deviceauth.StatusUnlinked {
+			t.Fatalf("the unlinked server's state before Start = %s", st.Status)
+		}
+		must(t, again.SetActive(portOrigin(8443)))
 		if !again.Has(portOrigin(9443)) || !again.Has("HTTP://127.0.0.1:9443/") || again.Has(portOrigin(1)) {
 			t.Fatal("Has")
 		}
@@ -256,6 +267,9 @@ func TestServersCorruptFile(t *testing.T) {
 				}
 				res, err := s.Add(t.Context(), testOrigin)
 				must(t, err)
+				if st := res.Manager.State(); st.Status != deviceauth.StatusLinked {
+					t.Fatalf("state %s before Start with the kept credential, want linked", st.Status)
+				}
 				must(t, res.Manager.Start(t.Context()))
 				wantStatus(t, res.Manager, deviceauth.StatusLinked, deviceauth.NoticeNone)
 				if refs := fs.refreshes(); len(refs) != 1 || refs[0].RefreshToken != seedToken {
@@ -437,6 +451,45 @@ func TestServersForgetAllRunOnlyCredential(t *testing.T) {
 			t.Fatalf("revokes %+v", revokes)
 		}
 		wantStatus(t, res.Manager, deviceauth.StatusUnlinked, deviceauth.NoticeNone)
+	})
+}
+
+// With HTTP left nil, the package's own keep-alive Transport holds idle connections; Close closes them, so no
+// connection goroutine outlives it (internal/server/itest's goleak check has no ignore for them). A real loopback
+// server, outside any bubble: the in-memory network of the other tests never keeps a connection alive.
+func TestCloseLeavesNoConnections(t *testing.T) {
+	t.Run("Servers", func(t *testing.T) {
+		fs := newTCPFakeServer(t)
+		before := goleak.IgnoreCurrent()
+		s, err := deviceauth.OpenServers(deviceauth.ServersOptions{
+			Dir:                   t.TempDir(),
+			Store:                 credstore.NewMemory(),
+			App:                   testApp,
+			AllowInsecureLoopback: true,
+			Logger:                quiet,
+		})
+		must(t, err)
+		res, err := s.Add(t.Context(), fs.origin)
+		must(t, err)
+		must(t, res.Manager.LinkWithPassword(t.Context(), "Alex", "correct horse"))
+		must(t, s.Close())
+		if err := goleak.Find(before); err != nil {
+			t.Fatalf("goroutines outlive Close: %v", err)
+		}
+	})
+	t.Run("Manager", func(t *testing.T) {
+		fs := newTCPFakeServer(t)
+		before := goleak.IgnoreCurrent()
+		c, err := deviceauth.NewClient(fs.origin, testApp, deviceauth.ClientOptions{AllowInsecureLoopback: true})
+		must(t, err)
+		m := deviceauth.NewManager(deviceauth.ManagerOptions{Client: c, Store: credstore.NewMemory(), Logger: quiet})
+		must(t, m.LinkWithPassword(t.Context(), "Alex", "correct horse"))
+		_, err = m.AccessToken(t.Context(), true)
+		must(t, err)
+		must(t, m.Close())
+		if err := goleak.Find(before); err != nil {
+			t.Fatalf("goroutines outlive Close: %v", err)
+		}
 	})
 }
 

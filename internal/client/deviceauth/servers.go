@@ -34,7 +34,7 @@ type ServersOptions struct {
 	Dir                   string // the data root, %LOCALAPPDATA%\isshoni on Windows (03-desktop-app §14.1 passes it)
 	Store                 credstore.Store
 	App                   AppInfo
-	HTTP                  *http.Client // nil = one DefaultHTTPClient() shared by every server
+	HTTP                  *http.Client // nil = one DefaultHTTPClient() shared by every server, closed with Servers
 	AllowInsecureLoopback bool
 	OnState               func(State) // per server; State.Origin says which
 	Clock                 func() time.Time
@@ -68,11 +68,13 @@ type AddResult struct {
 // so adding a server again reuses its credential.
 //
 // OpenServers creates the managers and starts none: the app calls Start on the active one at boot and after Add or
-// SetActive. Close closes them all.
+// SetActive. Each manager reads its credential when it is made, so its State() is linked or unlinked before Start.
+// Close closes them all.
 type Servers struct {
-	o    ServersOptions
-	path string
-	log  *slog.Logger
+	o       ServersOptions
+	path    string
+	log     *slog.Logger
+	ownHTTP bool // o.HTTP is OpenServers' own DefaultHTTPClient: Close closes its idle connections
 
 	mu      sync.Mutex
 	closed  bool
@@ -94,7 +96,8 @@ func OpenServers(o ServersOptions) (*Servers, error) {
 	if o.Dir == "" || o.Store == nil {
 		return nil, errors.New("deviceauth: OpenServers needs a Dir and a Store")
 	}
-	if o.HTTP == nil {
+	ownHTTP := o.HTTP == nil
+	if ownHTTP {
 		o.HTTP = DefaultHTTPClient()
 	}
 	if o.Clock == nil {
@@ -104,10 +107,11 @@ func OpenServers(o ServersOptions) (*Servers, error) {
 		o.Logger = slog.Default()
 	}
 	s := &Servers{
-		o:    o,
-		path: filepath.Join(o.Dir, serversFile),
-		log:  o.Logger.With("component", "deviceauth"),
-		mgrs: make(map[string]*Manager),
+		o:       o,
+		path:    filepath.Join(o.Dir, serversFile),
+		log:     o.Logger.With("component", "deviceauth"),
+		ownHTTP: ownHTTP,
+		mgrs:    make(map[string]*Manager),
 	}
 	doc, err := s.load()
 	if err != nil {
@@ -125,6 +129,7 @@ func OpenServers(o ServersOptions) (*Servers, error) {
 			skipped++
 			continue
 		}
+		_ = m.load() // best effort, so State() follows the store before Start; Start reports a store error
 		s.entries = append(s.entries, cloneEntry(e))
 		s.mgrs[e.Origin] = m
 	}
@@ -224,6 +229,17 @@ func (s *Servers) Add(ctx context.Context, origin string) (AddResult, error) {
 	if err != nil {
 		return AddResult{}, badResponse(0, "the server's publicUrl isn't an origin")
 	}
+	res, err := s.addEntry(requested, adopted, info.Server.Name)
+	if err == nil && !res.Existing {
+		// A credential still stored for the server (servers.json was set aside, 02 §11.6) is linked before Start.
+		// Best effort, outside s.mu: Start reports a store error.
+		_ = res.Manager.load()
+	}
+	return res, err
+}
+
+// addEntry is Add's change of the list, under s.mu.
+func (s *Servers) addEntry(requested, adopted, name string) (AddResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -232,8 +248,8 @@ func (s *Servers) Add(ctx context.Context, origin string) (AddResult, error) {
 	if m := s.mgrs[adopted]; m != nil {
 		prev := s.active
 		s.active = adopted
-		if i := s.indexLocked(adopted); info.Server.Name != "" && s.entries[i].Name != info.Server.Name {
-			s.entries[i].Name = info.Server.Name
+		if i := s.indexLocked(adopted); name != "" && s.entries[i].Name != name {
+			s.entries[i].Name = name
 		}
 		if err := s.saveLocked(); err != nil {
 			s.active = prev
@@ -244,14 +260,14 @@ func (s *Servers) Add(ctx context.Context, origin string) (AddResult, error) {
 	if len(s.entries) >= maxServers {
 		return AddResult{}, ErrTooManyServers
 	}
-	m, err := s.newManager(adopted, info.Server.Name)
+	m, err := s.newManager(adopted, name)
 	if err != nil {
 		return AddResult{}, err
 	}
 	prev := s.active
 	s.entries = append(s.entries, ServerEntry{
 		Origin:  adopted,
-		Name:    info.Server.Name,
+		Name:    name,
 		AddedAt: s.o.Clock().UTC().Truncate(time.Millisecond),
 	})
 	s.mgrs[adopted] = m
@@ -396,7 +412,8 @@ func (s *Servers) revokeOne(ctx context.Context, origin string, m *Manager) {
 	revokeDevice(ctx, c, rand.Reader, cred, "", time.Time{}, s.o.Clock())
 }
 
-// Close closes every manager. Servers can't be used afterwards; Close is idempotent.
+// Close closes every manager, and the idle connections of the HTTP client OpenServers made itself (HTTP nil), so
+// no connection goroutine outlives it. Servers can't be used afterwards; Close is idempotent.
 func (s *Servers) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -408,6 +425,9 @@ func (s *Servers) Close() error {
 	s.mu.Unlock()
 	for _, m := range mgrs {
 		_ = m.Close()
+	}
+	if s.ownHTTP {
+		s.o.HTTP.CloseIdleConnections()
 	}
 	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -441,6 +442,53 @@ func TestStartOutcomes(t *testing.T) {
 			e.fs.with(func(fs *fakeServer) { fs.hang = nil })
 			time.Sleep(time.Minute) // the refresh times out after 15 s and is retried in the background
 			wantStatus(t, e.m, deviceauth.StatusLinked, deviceauth.NoticeNone)
+		})
+	})
+	// ctx ends while /info is still unanswered: like a network failure, offline with the refresh running in the
+	// background (02 §11.3), and ctx's error.
+	t.Run("ctx during info", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			e := newEnv(t, true)
+			e.fs.with(func(fs *fakeServer) { fs.hang = func(*http.Request) bool { return true } })
+			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+			defer cancel()
+			if err := e.m.Start(ctx); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Start = %s, want ctx's error", describe(err))
+			}
+			wantStatus(t, e.m, deviceauth.StatusOffline, deviceauth.NoticeNone)
+			e.fs.with(func(fs *fakeServer) { fs.hang = nil })
+			time.Sleep(time.Minute)
+			wantStatus(t, e.m, deviceauth.StatusLinked, deviceauth.NoticeNone)
+			if got := storedToken(t, e.store, testOrigin); got != refreshToken(1) {
+				t.Fatalf("stored %q, want the background refresh's token", got)
+			}
+		})
+	})
+	// A stored credential is linked from the start: neither State() nor OnState says unlinked while the first
+	// refresh is pending (02 §11.3: unlinked is "no credential: show Link this app").
+	t.Run("linked while the first refresh runs", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			e := newEnv(t, true)
+			e.fs.with(func(fs *fakeServer) {
+				fs.hang = func(r *http.Request) bool { return r.URL.Path == "/api/v1/device/token" }
+			})
+			done := make(chan error, 1)
+			go func() { done <- e.m.Start(t.Context()) }()
+			time.Sleep(5 * time.Second)
+			if s := e.m.State(); s.Status != deviceauth.StatusLinked {
+				t.Fatalf("state %s while Start's refresh runs, want linked", s.Status)
+			}
+			if err := <-done; err != nil { // the attempt times out after 15 s: offline, and Start returns
+				t.Fatalf("Start = %s", describe(err))
+			}
+			wantStatus(t, e.m, deviceauth.StatusOffline, deviceauth.NoticeNone)
+			e.fs.with(func(fs *fakeServer) { fs.hang = nil })
+			time.Sleep(time.Minute)
+			wantStatus(t, e.m, deviceauth.StatusLinked, deviceauth.NoticeNone)
+			events := e.log.list()
+			if len(events) == 0 || events[0] != "state:linked" || slices.Contains(events, "state:unlinked") {
+				t.Fatalf("OnState saw %v, want linked first and never unlinked", events)
+			}
 		})
 	})
 }

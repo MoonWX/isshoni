@@ -3,6 +3,7 @@ package deviceauth_test
 import (
 	"context"
 	"errors"
+	"net/http"
 	"slices"
 	"testing"
 	"testing/synctest"
@@ -343,6 +344,34 @@ func TestLinkWithPassword(t *testing.T) {
 				t.Fatalf("LinkWithPassword = %s, want ErrNetwork", describe(err))
 			}
 			wantStatus(t, e.m, deviceauth.StatusUnlinked, deviceauth.NoticeNone)
+		})
+	})
+	// A device-flow link started while the password request runs ends with the password link: no code left shown,
+	// no polling (an approved code would make a second device).
+	t.Run("a link started meanwhile", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			e := newEnv(t, false)
+			var linkErr error
+			e.fs.with(func(fs *fakeServer) {
+				fs.before = func(r *http.Request) {
+					if r.URL.Path == "/api/v1/device/password" {
+						linkErr = e.m.Link(t.Context())
+					}
+				}
+			})
+			must(t, e.m.LinkWithPassword(t.Context(), "Alex", "correct horse"))
+			must(t, linkErr)
+			if n := len(e.fs.seen("/api/v1/device/code")); n != 1 {
+				t.Fatalf("%d /device/code requests, want the link started during the password request", n)
+			}
+			if s := e.m.State(); s.Status != deviceauth.StatusLinked || s.Link != nil {
+				t.Fatalf("state %s with Link %+v, want linked without a code", s.Status, s.Link)
+			}
+			time.Sleep(11 * time.Minute)
+			if n := len(e.fs.polls()); n != 0 {
+				t.Fatalf("the device-flow link polled %d times after the password link", n)
+			}
+			wantStatus(t, e.m, deviceauth.StatusLinked, deviceauth.NoticeNone)
 		})
 	})
 }

@@ -48,9 +48,11 @@ type ManagerOptions struct {
 // and its refresh, the compat state. Safe for concurrent use.
 //
 // NewManager starts nothing. Start loads the credential and refreshes; the methods that need the credential load
-// it on first use too, so a manager also works without Start. From the first change that needs one, the manager
-// runs one goroutine of its own for the daily refresh and the 10-minute Recheck while incompatible; Link adds the
-// polling goroutine and a refresh its retry goroutine. Close stops them all and waits for them.
+// it on first use too, so a manager also works without Start. A credential found in the store makes the state
+// linked right away (offline, unlinked or incompatible follow from what the server answers), so a linked app never
+// shows unlinked while it starts; Servers loads it when it makes the manager. From the first change that needs one,
+// the manager runs one goroutine of its own for the daily refresh and the 10-minute Recheck while incompatible; Link
+// adds the polling goroutine and a refresh its retry goroutine. Close stops them all and waits for them.
 //
 // OnState is called after every change with a copy of the new State, in order, on the goroutine that made the
 // change or on one that is delivering an earlier change at that moment; never while the manager holds a lock, so
@@ -181,10 +183,11 @@ func (m *Manager) now() time.Time { return m.clock() }
 // Start loads the credential and refreshes once: linked, unlinked, offline or incompatible (02 §11.3, §13.1). It
 // asks /info first: a verdict that isn't ok enters StatusIncompatible and keeps the credential. It never blocks
 // longer than ctx: when ctx ends first, the refresh goes on in the background and ctx's error is returned. A network
-// failure leaves StatusOffline (or unlinked without a credential), returns nil, and the refresh retries in the
-// background (02 §11.4). A credential store that can't be read leaves the state unlinked and returns its error.
+// failure at /info, or ctx ending before /info answers, leaves StatusOffline when no token is usable (unlinked
+// without a credential) and the refresh retrying in the background (02 §11.4); Start then returns nil, or ctx's
+// error. A credential store that can't be read leaves the state unlinked and returns its error.
 func (m *Manager) Start(ctx context.Context) error {
-	if err := m.load(); err != nil {
+	if err := m.loadAndFlush(); err != nil {
 		return err
 	}
 	if m.isClosed() {
@@ -192,10 +195,12 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 	info, err := m.c.Info(ctx)
 	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
+		ctxErr := ctx.Err()
+		if ctxErr != nil {
+			m.log.Info("deviceauth: the server didn't answer before start's ctx ended", "origin", m.origin)
+		} else {
+			m.log.Info("deviceauth: the server can't be reached at start", "origin", m.origin, "err", err)
 		}
-		m.log.Info("deviceauth: the server can't be reached at start", "origin", m.origin, "err", err)
 		m.mu.Lock()
 		if m.cred != nil && m.state.Status != StatusIncompatible && m.state.Status != StatusLinking {
 			if m.flight == nil {
@@ -208,7 +213,7 @@ func (m *Manager) Start(ctx context.Context) error {
 		m.changedLocked()
 		m.mu.Unlock()
 		m.flush()
-		return nil
+		return ctxErr
 	}
 	check := compat.FromInfo(info, m.compatApp)
 	m.noteServerName(info.Server.Name)
@@ -372,7 +377,7 @@ func (m *Manager) AccessToken(ctx context.Context, forceRefresh bool) (protocol.
 
 // AccessTokenWithExpiry is AccessToken plus its expiry, for the desktop SPA (02 §11.7). Same forceRefresh rules.
 func (m *Manager) AccessTokenWithExpiry(ctx context.Context, forceRefresh bool) (protocol.Secret, time.Time, error) {
-	if err := m.load(); err != nil {
+	if err := m.loadAndFlush(); err != nil {
 		return "", time.Time{}, err
 	}
 	tok, exp, err := m.accessToken(ctx, forceRefresh)
@@ -479,7 +484,7 @@ func (m *Manager) SessionEnded(ctx context.Context, code protocol.ErrorCode) Sta
 	default:
 		return m.State()
 	}
-	if err := m.load(); err != nil {
+	if err := m.loadAndFlush(); err != nil {
 		return m.State()
 	}
 	m.mu.Lock()
@@ -560,7 +565,7 @@ func (m *Manager) SetIncompatible(c compat.Check) {
 // credential exists, else unlinked). Otherwise StatusIncompatible with the new check. A network failure returns the
 // ErrNetwork error and leaves the state as it was. The manager calls it every 10 minutes while incompatible.
 func (m *Manager) Recheck(ctx context.Context) (State, error) {
-	if err := m.load(); err != nil {
+	if err := m.loadAndFlush(); err != nil {
 		return m.State(), err
 	}
 	info, err := m.c.Info(ctx)
@@ -620,7 +625,7 @@ func (m *Manager) Recheck(ctx context.Context) (State, error) {
 // server couldn't be reached or answered with an error other than "this device is already gone"; the UI then says
 // "Remove {device} on your Devices page to finish". A failed deletion of the credential is returned too.
 func (m *Manager) Unlink(ctx context.Context) error {
-	loadErr := m.load()
+	loadErr := m.loadAndFlush()
 	t, ok := m.takeCredential()
 	if !ok {
 		return errClosed
@@ -665,8 +670,9 @@ func (m *Manager) State() State {
 	return m.state.clone()
 }
 
-// Close stops polling, refreshes and timers and waits for the manager's goroutines. The state stays readable; the
-// other methods answer an error afterwards. Close is idempotent.
+// Close stops polling, refreshes and timers and waits for the manager's goroutines. When the Client made its own
+// HTTP client (ClientOptions.HTTP nil), its idle connections are closed too, so their goroutines end with Close. The
+// state stays readable; the other methods answer an error afterwards. Close is idempotent.
 func (m *Manager) Close() error {
 	m.mu.Lock()
 	m.closed = true
@@ -676,13 +682,26 @@ func (m *Manager) Close() error {
 	m.mu.Unlock()
 	m.cancel()
 	m.wg.Wait()
+	if m.c.ownHTTP {
+		m.c.http.CloseIdleConnections()
+	}
 	return nil
 }
 
 // ---- credential and state helpers ----
 
+// loadAndFlush is load for the methods: a state change it makes goes to OnState right away.
+func (m *Manager) loadAndFlush() error {
+	err := m.load()
+	m.flush()
+	return err
+}
+
 // load reads the credential from the store once. ErrNotFound means not linked; any other error is returned and
-// load tries again on the next call.
+// load tries again on the next call. A credential it finds while the state is unlinked makes it linked: unlinked
+// means "no credential" (02 §11.3), and the app shows its relink screen for it. The change is queued for OnState
+// and delivered by the caller's flush; Servers loads when it makes a manager and doesn't flush (OpenServers hasn't
+// returned yet), so the change reaches OnState with the manager's first flush, Start's usually.
 func (m *Manager) load() error {
 	m.mu.Lock()
 	loaded := m.loaded
@@ -712,6 +731,10 @@ func (m *Manager) load() error {
 	m.mu.Lock()
 	m.cred = &c
 	m.loaded = true
+	if m.state.Status == StatusUnlinked {
+		m.state.Status = StatusLinked
+		m.changedLocked()
+	}
 	m.mu.Unlock()
 	return nil
 }
@@ -967,7 +990,9 @@ func (m *Manager) endLink(run *linkRun, n Notice) {
 
 // finishLink takes a link's token pair (02 §11.3 step 4): the credential first, then servers.json, then
 // StatusLinked. run is nil for a password link. It reports false when run was ended meanwhile or the manager closed;
-// nothing is stored then.
+// nothing is stored then. Any other running link ends with this one: a device-flow link that Link started while a
+// password link's request ran would otherwise keep its code shown and polling, and an approval of that code would
+// make a second device.
 func (m *Manager) finishLink(run *linkRun, resp api.DeviceTokenResponse, via string) bool {
 	m.commitMu.Lock()
 	m.mu.Lock()
@@ -988,7 +1013,8 @@ func (m *Manager) finishLink(run *linkRun, resp api.DeviceTokenResponse, via str
 	user, device := resp.User, resp.Device
 	m.setEntry(entryChange{setLink: true, user: &user, device: &device})
 	m.mu.Lock()
-	if run != nil {
+	if m.link != nil {
+		m.link.cancel()
 		m.link = nil
 		m.state.Link = nil
 	}

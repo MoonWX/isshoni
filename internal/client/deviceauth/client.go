@@ -40,12 +40,13 @@ type Client struct {
 	origin                string
 	app                   AppInfo
 	http                  *http.Client
+	ownHTTP               bool // http is the client's own DefaultHTTPClient: Manager.Close closes its idle connections
 	allowInsecureLoopback bool
 }
 
 // ClientOptions configures NewClient.
 type ClientOptions struct {
-	HTTP                  *http.Client // nil = DefaultHTTPClient(); its CheckRedirect is replaced (no redirects)
+	HTTP                  *http.Client // nil = DefaultHTTPClient(), idle conns closed by Manager.Close; no redirects
 	AllowInsecureLoopback bool         // dev builds: http://localhost, 127.0.0.1, [::1]
 }
 
@@ -79,7 +80,8 @@ func NewClient(origin string, app AppInfo, o ClientOptions) (*Client, error) {
 		hc = &cp
 	}
 	hc.CheckRedirect = noRedirect
-	return &Client{origin: norm, app: app, http: hc, allowInsecureLoopback: o.AllowInsecureLoopback}, nil
+	return &Client{origin: norm, app: app, http: hc, ownHTTP: o.HTTP == nil,
+		allowInsecureLoopback: o.AllowInsecureLoopback}, nil
 }
 
 // DefaultHTTPClient returns a new client with a timeout of 15 s, TLS 1.2 or later, the system roots,

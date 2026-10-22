@@ -145,6 +145,7 @@ type fakeServer struct {
 	password func(req api.DevicePasswordRequest) reply
 	revoke   func(r *http.Request) reply
 	hang     func(r *http.Request) bool // block until the client gives up
+	before   func(r *http.Request)      // runs first, without mu, holding the request back until it returns
 	override map[string]reply           // path → a fixed answer
 	requests []request
 	pollN    int
@@ -155,17 +156,8 @@ type fakeServer struct {
 // newFakeServer starts a fake server on the in-memory network; call it inside the bubble.
 func newFakeServer(t *testing.T) *fakeServer {
 	t.Helper()
-	fs := &fakeServer{t: t, ln: newPipeListener(), origin: testOrigin}
-	fs.info = api.Info{
-		Server:       api.InfoServer{Name: "Alex's server", Version: "0.2.0", PublicURL: testOrigin},
-		Protocol:     api.InfoProtocol{Current: protocol.Version, Min: protocol.MinVersion},
-		Registration: api.RegistrationModeInvite,
-		Features:     []string{api.InfoFeaturePasswordReset, api.InfoFeatureDeviceFlow},
-	}
-	fs.poll = func(int) reply { return apiErr(api.CodeAuthorizationPending, nil) }
-	fs.refresh = func(api.DeviceTokenRequest, int) reply { return ok(fs.pairLocked()) }
-	fs.password = func(api.DevicePasswordRequest) reply { return ok(fs.pairLocked()) }
-	fs.revoke = func(*http.Request) reply { return reply{status: http.StatusNoContent} }
+	fs := newScriptedServer(t, testOrigin)
+	fs.ln = newPipeListener()
 	fs.srv = httptest.NewUnstartedServer(http.HandlerFunc(fs.serve))
 	_ = fs.srv.Listener.Close()
 	fs.srv.Listener = fs.ln
@@ -175,6 +167,37 @@ func newFakeServer(t *testing.T) *fakeServer {
 		fs.tr.CloseIdleConnections()
 		fs.srv.Close()
 	})
+	return fs
+}
+
+// newTCPFakeServer starts the fake server on a real loopback port, outside any bubble: for the tests of what the
+// package's own keep-alive Transport leaves behind. Its origin is the port's; fs.ln and fs.tr are nil.
+func newTCPFakeServer(t *testing.T) *fakeServer {
+	t.Helper()
+	fs := newScriptedServer(t, "")
+	fs.srv = httptest.NewServer(http.HandlerFunc(fs.serve))
+	fs.with(func(fs *fakeServer) {
+		fs.origin = fs.srv.URL
+		fs.info.Server.PublicURL = fs.srv.URL
+	})
+	t.Cleanup(fs.srv.Close)
+	return fs
+}
+
+// newScriptedServer is a fake server's scripts with their defaults: /info names origin, polls are pending, and
+// refreshes and passwords get a new pair.
+func newScriptedServer(t *testing.T, origin string) *fakeServer {
+	fs := &fakeServer{t: t, origin: origin}
+	fs.info = api.Info{
+		Server:       api.InfoServer{Name: "Alex's server", Version: "0.2.0", PublicURL: origin},
+		Protocol:     api.InfoProtocol{Current: protocol.Version, Min: protocol.MinVersion},
+		Registration: api.RegistrationModeInvite,
+		Features:     []string{api.InfoFeaturePasswordReset, api.InfoFeatureDeviceFlow},
+	}
+	fs.poll = func(int) reply { return apiErr(api.CodeAuthorizationPending, nil) }
+	fs.refresh = func(api.DeviceTokenRequest, int) reply { return ok(fs.pairLocked()) }
+	fs.password = func(api.DevicePasswordRequest) reply { return ok(fs.pairLocked()) }
+	fs.revoke = func(*http.Request) reply { return reply{status: http.StatusNoContent} }
 	return fs
 }
 
@@ -241,6 +264,12 @@ func (fs *fakeServer) serve(w http.ResponseWriter, r *http.Request) {
 	fs.requests = append(fs.requests, request{
 		Method: r.Method, Path: r.URL.Path, Host: r.Host, Header: r.Header.Clone(), Body: body, At: time.Now(),
 	})
+	before := fs.before
+	fs.mu.Unlock()
+	if before != nil {
+		before(r)
+	}
+	fs.mu.Lock()
 	hang := fs.hang != nil && fs.hang(r)
 	fs.mu.Unlock()
 	if hang {
