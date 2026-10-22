@@ -273,10 +273,13 @@ type SoundCheckResult struct {
 // IM_ERR_BAD_STATE from every other call of the engine is internal (04 §12.2); the first row is the audio exception.
 // Mode validation needs no call and comes first: AudioConfig.Mode at start accepts "", AudioExcludeApps and
 // AudioTestTone, and SetAudioMode accepts AudioOff and AudioExcludeApps; any other mode (AudioEverything included,
-// docs/m2/README.md §3 item 15) is CodeInvalid, also when no session runs. Exclusions that the DLL refuses (more
-// than 512 rules, an unknown kind or source, an empty value, a malformed pid, an app id outside [a-z0-9:._-]{1,63},
-// a NUL byte) are CodeInvalid, with a Detail that names the rule's index, never its value. A report that the binding
-// can't read is ParseAudioReport's error.
+// docs/m2/README.md §3 item 15) is CodeInvalid, also when no session runs. Exclusions that the DLL refuses (05 §4.3:
+// more than 512 rules, an unknown kind or source, an empty value, a malformed pid, an app id outside
+// [a-z0-9:._-]{1,63}) come back as IM_ERR_INVALID_ARG, so CodeInvalid with a Detail that names the rule's index,
+// never its value. The binding itself refuses, without a call, a value, app id or name holding a NUL byte, which a C
+// string can't carry (the DLL would silently see a shorter string), and a value of 520 bytes or more (the header's
+// IM_MAX_RULE_VALUE counts the NUL, 05 §4.1; 05 §4.3 gives the DLL no such check): also CodeInvalid, the Detail
+// naming the rule's index. A report that the binding can't read is ParseAudioReport's error.
 type AudioController interface {
 	WatchAudio(ctx context.Context, ex Exclusions) error
 	UnwatchAudio(ctx context.Context) error

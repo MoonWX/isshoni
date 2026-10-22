@@ -7,7 +7,9 @@ import (
 	"errors"
 	"math"
 	"reflect"
+	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -209,6 +211,36 @@ func TestAudioScenarioNames(t *testing.T) {
 			t.Error("no audio")
 		}
 	})
+}
+
+// TestAudioScenarioApps: in every scenario a process belongs to one app (no two apps' pids overlap), an app's
+// sessions are among its processes, and exes are unique, since the events key rows by their exe.
+func TestAudioScenarioApps(t *testing.T) {
+	for _, name := range scenarioNames {
+		apps := audioScenarios[name]().apps
+		exes := map[string]bool{}
+		for i, a := range apps {
+			if exe := strings.ToLower(a.exe); exes[exe] {
+				t.Errorf("%s: exe %s twice", name, a.exe)
+			} else {
+				exes[exe] = true
+			}
+			if a.sessions > max(a.pids, 1) {
+				t.Errorf("%s: %s has %d sessions in %d processes", name, a.exe, a.sessions, a.pids)
+			}
+			for k := range max(a.pids, 1) {
+				pid := uint64(a.pid) + 4*uint64(k)
+				if !a.hasPID(pid) {
+					t.Errorf("%s: %s does not own its pid %d", name, a.exe, pid)
+				}
+				for _, b := range apps[i+1:] {
+					if b.hasPID(pid) {
+						t.Errorf("%s: pid %d is %s's and %s's", name, pid, a.exe, b.exe)
+					}
+				}
+			}
+		}
+	}
 }
 
 // TestAudioBeforeStart: the AudioController works before any Start, as the share sheet needs (05 §13.3); without a
@@ -603,6 +635,19 @@ func TestAudioLive(t *testing.T) {
 			t.Errorf("audio calls %+v, want %+v", audioCalls, want)
 		}
 
+		// A rule change that renames a row is no session or stream event: Spotify keeps its session and stream
+		// under the allow rule's id, and gets its exe's id back.
+		n := len(mustReport(t, e).Events)
+		_ = e.SetExclusions(ctx, with(desktopExclusions(),
+			media.Rule{Kind: media.RuleAppAllow, Source: media.SourceUser, Value: "spotify.exe", AppID: "spotify"}))
+		renamed := mustReport(t, e)
+		_ = e.SetExclusions(ctx, desktopExclusions())
+		back := mustReport(t, e)
+		if got := eventsOf(back)[n:]; !slices.Equal(got, []string{"rules_changed", "rules_changed"}) ||
+			row(renamed, "spotify").Streams != 1 || row(back, "exe:spotify.exe").Streams != 1 {
+			t.Errorf("renamed: %+v, back: %+v, events %v", renamed.Apps, back.Apps, got)
+		}
+
 		// The session ends: without a watch, the watcher stops; its streams are removed.
 		time.Sleep(time.Second)
 		_ = s.Stop()
@@ -801,9 +846,14 @@ func TestAudioNoDevice(t *testing.T) {
 		if lv := mustLevels(t, e); len(lv.Apps) != 0 || lv.MixPeakDB != silenceDB {
 			t.Errorf("levels %+v", lv)
 		}
+		// Discord's row has no session: its appearing and going are no session events.
+		if got := eventsOf(r); !slices.Equal(got, []string{"rules_changed"}) {
+			t.Errorf("events after WatchAudio: %v", got)
+		}
 		_ = e.SetExclusions(t.Context(), media.Exclusions{})
-		if r := mustReport(t, e); len(r.Apps) != 0 {
-			t.Errorf("rows without the built-in rule: %+v", r.Apps)
+		if r := mustReport(t, e); len(r.Apps) != 0 ||
+			!slices.Equal(eventsOf(r), []string{"rules_changed", "rules_changed"}) {
+			t.Errorf("without the built-in rule: rows %+v, events %v", r.Apps, eventsOf(r))
 		}
 		s := mustStart(t, e, audioConfig(desktopExclusions()))
 		if r := mustReport(t, e); !r.Live || r.Engine != engineNone || r.Counters.Streams != 0 {
@@ -900,6 +950,36 @@ func TestAudioMany(t *testing.T) {
 			}
 			seenQuiet = seenQuiet || quiet
 		}
+		// A pid is one app's: the shared pid and an instance rule each name exactly one row, also where an app with 4
+		// processes is followed by another app.
+		for _, a := range audioScenarios["many"]().apps[3:] {
+			id := "exe:" + a.exe
+			for _, pid := range []uint32{a.pid, a.pid + 4*uint32(max(a.pids, 1)-1)} { // its first and last process
+				_ = e.SetExclusions(t.Context(), media.Exclusions{FastPath: true, SharedPID: pid})
+				var shared []string
+				for _, row := range mustReport(t, e).Apps {
+					if row.Shared {
+						shared = append(shared, row.ID)
+					}
+				}
+				if !slices.Equal(shared, []string{id}) {
+					t.Errorf("SharedPID %d: shared rows %v, want %s", pid, shared, id)
+				}
+			}
+			_ = e.SetExclusions(t.Context(), media.Exclusions{FastPath: true, Rules: []media.Rule{{
+				Kind: media.RuleInstance, Source: media.SourceSelf, Value: strconv.FormatUint(uint64(a.pid), 10),
+			}}})
+			var out []string
+			for _, row := range mustReport(t, e).Apps {
+				if row.Verdict == verdictKeptOut {
+					out = append(out, row.ID+"/"+row.Reason)
+				}
+			}
+			if !slices.Equal(out, []string{id + "/isshoni"}) {
+				t.Errorf("instance %d: kept out %v, want %s", a.pid, out, id)
+			}
+		}
+		_ = e.SetExclusions(t.Context(), media.Exclusions{FastPath: true})
 		// Many apps playing on the include set: 48 streams, the rest not captured (limit).
 		s := mustStart(t, e, audioConfig(media.Exclusions{}))
 		r = mustReport(t, e)
@@ -1109,6 +1189,42 @@ func TestAudioConcurrent(t *testing.T) {
 		wg.Wait()
 		mustReport(t, e)
 	})
+}
+
+// TestAudioStartMuteRace: a SetAudioMuted that races a Start with audio and finds its session is in the report: a
+// live, muted report with a "muted" event, never a mute the report's events missed because the session ran before
+// the AudioController knew it. Real goroutines, no synctest, so the scheduler can hit the window.
+func TestAudioStartMuteRace(t *testing.T) {
+	ctx := t.Context()
+	for i := range 300 {
+		e := NewEngine(EngineConfig{})
+		started := make(chan media.Session, 1)
+		go func() {
+			s, err := e.Start(ctx, audioConfig(desktopExclusions()))
+			if err != nil {
+				t.Error(err)
+			}
+			started <- s
+		}()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			err := e.SetAudioMuted(ctx, true)
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, media.ErrAudioNotRunning) || time.Now().After(deadline) {
+				t.Fatalf("SetAudioMuted: %v", err)
+			}
+			runtime.Gosched()
+		}
+		if r := mustReport(t, e); !r.Live || !r.Muted || !slices.Contains(eventsOf(r), "muted") {
+			t.Errorf("run %d: live %v, muted %v, events %v", i, r.Live, r.Muted, eventsOf(r))
+		}
+		if s := <-started; s != nil {
+			_ = s.Stop()
+		}
+		_ = e.Close()
+	}
 }
 
 // opOf returns the Op of err's media.Error, or "".

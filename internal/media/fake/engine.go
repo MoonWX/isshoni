@@ -296,18 +296,25 @@ func (e *Engine) prunePicksLocked(now time.Time) {
 // Start consumes a picked source; a failed one keeps it. A session with audio replaces the AudioController's rule set
 // with cfg.Audio.Exclusions, as im_start does with its exclusions (05 §4.2), and runs its watcher while it lives.
 func (e *Engine) Start(ctx context.Context, cfg media.Config) (media.Session, error) {
+	// A session with audio holds the AudioController's lock from before the session exists until the controller
+	// knows it, so no SetAudioMuted or SetAudioMode finds the session (Engine.Session) before the report follows it.
+	audio := cfg.Audio != nil && e.audio.sc != nil
+	if audio {
+		e.audio.mu.Lock()
+		defer e.audio.mu.Unlock()
+	}
 	s, err := e.start(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
-	if cfg.Audio != nil {
-		e.audioSessionStarted(s, cfg.Audio.Exclusions)
+	if audio {
+		e.audioSessionStartedLocked(s, cfg.Audio.Exclusions)
 	}
 	return s, nil
 }
 
-// start is Start's checks and new Session, under e.mu. Start adds the AudioController's part after start released
-// e.mu (the lock order of audio_ctl.go's audioState).
+// start is Start's checks and new Session, under e.mu. Start holds audioState.mu around it for a session with audio
+// (audio_ctl.go's lock order: audioState.mu, then Engine.mu).
 func (e *Engine) start(ctx context.Context, cfg media.Config) (*Session, error) {
 	const op = "start"
 	if err := ctx.Err(); err != nil {

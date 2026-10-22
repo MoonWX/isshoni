@@ -186,12 +186,13 @@ var audioScenarios = map[string]func() *audioScenario{
 		return &audioScenario{apps: []scriptApp{game, spotify(), discord()}, probe: probeOK, device: deviceOK,
 			soundCheck: soundCheckLoopback}
 	},
-	// 60 apps: the share sheet's scrolling. Every ninth uses the mic, every thirteenth is silent.
+	// 60 apps: the share sheet's scrolling. Every ninth uses the mic, every thirteenth is silent. The apps are 16 pids
+	// apart, so an app's up to 4 processes (4 apart) never reach the next app's first pid.
 	"many": func() *audioScenario {
 		apps := []scriptApp{spotify(), discord(), steam()}
 		for i := 1; len(apps) < 60; i++ {
 			apps = append(apps, scriptApp{
-				exe: fmt.Sprintf("app%02d.exe", i), name: fmt.Sprintf("App %02d", i), pid: 20000 + 8*uint32(i),
+				exe: fmt.Sprintf("app%02d.exe", i), name: fmt.Sprintf("App %02d", i), pid: 20000 + 16*uint32(i),
 				pids: 1 + i%4, sessions: 1, playing: i%13 != 0, usesMic: i%9 == 0, level: steadyLevel(-20 - float64(i%20)),
 			})
 		}
@@ -200,7 +201,8 @@ var audioScenarios = map[string]func() *audioScenario{
 }
 
 // audioState is the AudioController's script and state, guarded by its own mutex. Lock order: audioState.mu, then a
-// Session's mu, then Engine.mu; no Session method takes audioState.mu.
+// Session's mu, then Engine.mu; no Session method takes audioState.mu. A Start with audio holds it while it creates
+// the session, so the session is never running without the controller knowing it.
 type audioState struct {
 	name    string
 	sc      *audioScenario // nil: an unknown scenario
@@ -508,23 +510,25 @@ func (a *audioState) addEvents(t time.Time, prev, cur media.AudioReport) {
 		ev("stream_failed", app, "")
 		ev("probe_failed", "", "")
 	}
-	// Rows: a stopped report (a one-shot snapshot) has no sessions and no streams.
+	// Rows by their scripted app (its exe, unique in a scenario), so a rule that renames a row (an app id) is no session
+	// or stream event; the session events follow a row's sessions, so a session-less row (a silent built-in voice app,
+	// the shared app) appearing or going is none. A stopped report (a one-shot snapshot) has no sessions and no streams.
 	rows := func(r media.AudioReport) map[string]media.AudioApp {
 		m := map[string]media.AudioApp{}
 		if r.State != stateStopped {
 			for _, a := range r.Apps {
-				m[a.ID] = a
+				m[a.Exe] = a
 			}
 		}
 		return m
 	}
 	before, after := rows(prev), rows(cur)
 	for _, r := range cur.Apps {
-		if _, ok := after[r.ID]; !ok {
+		if _, ok := after[r.Exe]; !ok {
 			break // stopped
 		}
-		p, ok := before[r.ID]
-		if !ok {
+		p, ok := before[r.Exe]
+		if r.Sessions > 0 && (!ok || p.Sessions == 0) {
 			ev("session_created", r.ID, "")
 		}
 		if p.Streams == 0 && r.Streams > 0 {
@@ -533,14 +537,14 @@ func (a *audioState) addEvents(t time.Time, prev, cur media.AudioReport) {
 		}
 	}
 	for _, p := range prev.Apps {
-		if _, ok := before[p.ID]; !ok {
+		if _, ok := before[p.Exe]; !ok {
 			break // stopped
 		}
-		r, ok := after[p.ID]
+		r, ok := after[p.Exe]
 		if p.Streams > 0 && r.Streams == 0 {
 			ev("stream_removed", p.ID, "")
 		}
-		if !ok && cur.State != stateStopped {
+		if p.Sessions > 0 && (!ok || r.Sessions == 0) && cur.State != stateStopped {
 			ev("session_expired", p.ID, "")
 		}
 	}
@@ -656,9 +660,11 @@ func (e *Engine) checkAudioCall(ctx context.Context, op string) error {
 	return nil
 }
 
-// checkExclusions checks ex as im_audio_watch, im_set_exclusions and im_start do (05 §4.3): at most 512 rules, known
-// kinds and sources, non-empty values under 520 bytes, decimal pids, app ids in [a-z0-9:._-]{1,63}, no NUL byte
-// (the binding's rule for strings). Details name the rule's index, never its strings.
+// checkExclusions checks ex as the binding and the DLL together do (media.AudioController's doc): im_audio_watch,
+// im_set_exclusions and im_start refuse more than 512 rules, unknown kinds and sources, empty values, malformed pids
+// and app ids outside [a-z0-9:._-]{1,63} (05 §4.3); the binding refuses, before any call, values of 520 bytes or more
+// and a NUL byte in a value, app id or name, which a C string can't carry. Details name the rule's index, never its
+// strings.
 func checkExclusions(op string, ex media.Exclusions) error {
 	if len(ex.Rules) > maxRules {
 		return errorf(media.CodeInvalid, op, "", "%d rules, at most %d", len(ex.Rules), maxRules)
@@ -918,16 +924,12 @@ func (e *Engine) SetAudioStatus(r *media.AudioStatus) {
 	e.audio.override = &c
 }
 
-// audioSessionStarted is Start's part for a session with audio: the session's Exclusions replace the rule set (as
-// im_start's do, 05 §4.2), and the watcher runs while the session lives (the script's clock starts with the session
-// when no watcher ran).
-func (e *Engine) audioSessionStarted(s *Session, ex media.Exclusions) {
+// audioSessionStartedLocked is Start's part for a session with audio, under audioState.mu, which Start took before
+// the session existed: the session's Exclusions replace the rule set (as im_start's do, 05 §4.2), and the watcher
+// runs while the session lives (the script's clock starts with the session when no watcher ran). Only for a known
+// scenario.
+func (e *Engine) audioSessionStartedLocked(s *Session, ex media.Exclusions) {
 	a := &e.audio
-	if a.sc == nil {
-		return
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
 	now := time.Now()
 	a.advanceLocked(now)
 	info := s.audioInfo()
