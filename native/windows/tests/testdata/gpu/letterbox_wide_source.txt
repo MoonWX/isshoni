@@ -1,0 +1,22 @@
+# gpu_warp_test's letterbox source (README WA33): a 120x40 window, in 4x4 blocks. Its output is 120x64 with the
+# content at y 12 and black bars above and below (04 section 8.3: "a 120x40 window -> 120x64 with bars").
+size 120 40
+scale 4
+palette
+r FFE02020
+w FFFFFFFF
+g FF20C040
+b FF2040E0
+y FFF0E020
+k FF101010
+pixels
+rrrrrrrrrrggggggggggbbbbbbbbbb
+rwwwwwwwwrggggggggggbbbbbbbbby
+rwrrrrrrwrggkkkkkkggbbbbbbbbyy
+rwrrrrrrwrggkkkkkkggbbbbbbbyyy
+rwrrrrrrwrggkkkkkkggbbbbbbyyyy
+rwrrrrrrwrggkkkkkkggbbbbbyyyyy
+rwrrrrrrwrggkkkkkkggbbbbyyyyyy
+rwrrrrrrwrggkkkkkkggbbbyyyyyyy
+rwwwwwwwwrggggggggggbbyyyyyyyy
+rrrrrrrrrrggggggggggbyyyyyyyyy

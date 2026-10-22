@@ -1,0 +1,75 @@
+# gpu_warp_test's pointer golden (README WA33): the slot after CursorOverlay::Blend of
+# the monochrome pointer at (52, 54), cut at the frame's edge,
+# over the four-quadrant background (gpu_warp_support.h). Straight alpha; the test allows 1 code value.
+size 64 64
+palette
+d FF000000
+a FF202060
+c FF206020
+. FFC0C0C0
+b FFFFFFFF
+pixels
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccccccccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccccccccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccccccccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccccccccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccccccccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccccccccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccccccccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccccccccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccccccccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccccccccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccccccccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccccccccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccccccccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccccccccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccccccccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccccccccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccccccccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccccccccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccccccccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccccccccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccccccccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccccccccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccbbbbbcbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccbdddbbbddd
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccbbbbdbdbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbcccccccccccccccccccccccccbbdbbcc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccccccbdbccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccccccbdbccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccccccbdbccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccccccbdbccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccccccbdbccc
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccccccbdbccc

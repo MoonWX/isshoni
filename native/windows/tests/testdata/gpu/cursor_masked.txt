@@ -1,0 +1,76 @@
+# gpu_warp_test's pointer golden (README WA33): the slot after CursorOverlay::Blend of
+# the masked-color pointer at (38, 5),
+# over the four-quadrant background (gpu_warp_support.h). Straight alpha; the test allows 1 code value.
+size 64 64
+palette
+c FF000000
+a FF202060
+e FF206020
+b FF20C040
+. FFC0C0C0
+d FFFFFFFF
+pixels
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaabbbbbbbbaaaaaaaaaaaaaaaaaa
+................................aaaaaabbbbbbbbaaaaaaaaaaaaaaaaaa
+................................aaaaaabbaaaabbaaaaaaaaaaaaaaaaaa
+................................aaaaaabbaaaabbaaaaaaaaaaaaaaaaaa
+................................aaaaaabbaaaabbaaaaaaaaaaaaaaaaaa
+................................aaaaaabbaaaabbaaaaaaaaaaaaaaaaaa
+................................aaaaaabbbbbbbbaaaaaaaaaaaaaaaaaa
+................................aaaaaabbbbbbbbaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaacaaaaaacaaaaaaaaaa
+................................aaaaaaaaaaaaaaacaaaacaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaacaacaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaccaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaccaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaacaacaaaaaaaaaaaa
+................................aaaaaaddddddddcaaaacaaaaaaaaaaaa
+................................aaaaaadddddddcaaaaaacaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+................................aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+ddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
