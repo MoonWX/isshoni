@@ -3,8 +3,9 @@
 // folder. 04 calls it from src/api/exports.cpp (the audio exports, after their argument checks), src/engine/ (Init and
 // Shutdown on the worker) and src/audio_bridge/ (a session's Mixer, wired to its Opus stage as the PcmSink).
 //
-// This skeleton (README WA11) has the stub AudioEngine of audio_engine_stub.cpp; README WA35 (the watcher) and WA45
-// and WA53 (capture and the mixer) replace it with 05's engine.
+// README WA11 declared this boundary with a stub engine; 05's engine is audio_engine.cpp: README WA35 the watcher half
+// (watcher.h: the process table, endpoints, session and device notifications, meters, mic detection, the report, the
+// levels and the probe flags), WA45 and WA53 the capture, the mixer and the sound check.
 //
 // Rules for the implementation (05 §4.3, §10.5): every audio call may come from any thread; COM work happens only on
 // 05's own MTA threads; rules and strings are copied during the call; audio never fails a share and never makes

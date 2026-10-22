@@ -3,7 +3,6 @@ package native
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -27,9 +26,10 @@ import (
 // cross-check, the log drain. README WA10 wrote the loader half (Open's checks, build info, clock, log drain,
 // Close); README WA23 the rest of the engine (Probe, Sources, Pick, Start, StartExtra, SourceDetail, Close stopping
 // the sessions) and the session (§12.3: Next with the event table and EventLayer synthesis, the copy and its limits,
-// ENDED, Stop, the controls, Reconfigure, Stats, PCMTap). 05's audio is in audio.go (README WA35), OpenH264 in
-// openh264.go (WA51), ProtectWindow is WA70's. session_windows.go holds the one Windows-only part of a pick (the
-// executable name of its process).
+// ENDED, Stop, the controls, Reconfigure, Stats). README WA35 routed PCM through Next (media.KindPCM, 05 §13.2) and
+// moved the start config's audio half (the single mode mapping, the exclusions) into audio.go, 05's file, which also
+// holds the audio controls. OpenH264 is in openh264.go (WA51), ProtectWindow is WA70's. session_windows.go holds the
+// one Windows-only part of a pick (the executable name of its process).
 
 // The engine and its sessions implement the contract (04 §12.2).
 var (
@@ -217,6 +217,13 @@ const (
 // once with n + 1 bytes. A document of maxCap bytes or more, or one that grew again between the two calls, is
 // internal, and so is any other unexpected answer; a negative result is the status's error.
 func callJSON(c caller, op string, p proc, maxCap int, pre ...uintptr) ([]byte, error) {
+	return callJSONWith(c, op, p, maxCap, statusError, pre...)
+}
+
+// callJSONWith is callJSON with the status → error mapping of the export's area: statusError, or 05's
+// audioStatusError for the audio exports (audio.go), which share this buffer rule (05 §13.2).
+func callJSONWith(c caller, op string, p proc, maxCap int, mapErr func(op, export string, st int32,
+	lastErr string) *media.Error, pre ...uintptr) ([]byte, error) {
 	size := min(jsonFirstCap, maxCap)
 	for retried := false; ; retried = true {
 		buf := make([]byte, size)
@@ -227,7 +234,7 @@ func callJSON(c caller, op string, p proc, maxCap int, pre ...uintptr) ([]byte, 
 		n := int32(r)
 		switch {
 		case n < 0:
-			return nil, statusError(op, p.String(), n, lastErr)
+			return nil, mapErr(op, p.String(), n, lastErr)
 		case int(n) < size:
 			return buf[:n], nil
 		case retried:
@@ -403,6 +410,8 @@ type Engine struct {
 	// probeMu orders Probe; probe is the last full probe (nil before the first).
 	probeMu sync.Mutex
 	probe   *media.Probe
+
+	audio engineAudio // 05's audio calls (audio.go)
 }
 
 // openEngine is Open's portable half, on a resolved caller: the ABI check, im_init, the clock cross-check
@@ -1146,10 +1155,9 @@ func (e *Engine) forget(s *session) {
 
 // startArgs is im_start's input in Go memory: the struct and every string and array it points to (04 §12.4).
 type startArgs struct {
-	sc    *imStartConfig
-	ex    *imExclusions
-	rules []imRule
-	strs  []*byte // source_id and the rules' strings
+	sc   *imStartConfig
+	ex   *cExclusions // 05's exclusions (audio.go), nil without
+	strs []*byte      // source_id
 }
 
 // pin pins everything the struct points to for the one im_start call and returns the struct's address.
@@ -1157,11 +1165,8 @@ func (a *startArgs) pin(pn *runtime.Pinner) uintptr {
 	for _, p := range a.strs {
 		pn.Pin(p)
 	}
-	if len(a.rules) > 0 {
-		pn.Pin(&a.rules[0])
-	}
 	if a.ex != nil {
-		pn.Pin(a.ex)
+		a.ex.pin(pn)
 	}
 	return addrOf(pn, a.sc)
 }
@@ -1242,11 +1247,16 @@ func buildStart(op string, cfg media.Config) (*startArgs, error) {
 	}
 	sc.layerCount = uint32(len(cfg.Layers))
 	if cfg.Audio != nil {
-		ac, err := startAudioConfig(op, a, cfg.Audio)
+		// 05's half of the table: the single mode mapping and the exclusions (audio.go).
+		ac, ex, err := buildAudioConfig(op, cfg.Audio)
 		if err != nil {
 			return nil, err
 		}
 		sc.audio = ac
+		if ex != nil {
+			a.ex = ex
+			sc.exclusions = &ex.ex
+		}
 	}
 	return a, nil
 }
@@ -1327,92 +1337,6 @@ func contentHint(preset string) (uint32, bool) {
 	return 0, false
 }
 
-// startAudioConfig is media.AudioConfig → im_audio_config for im_start: 05 §13.1's single mode mapping as far as a
-// start needs it ("" and exclude-apps → EXCLUDE_APPS, test-tone → TEST_TONE; everything and off → CodeInvalid
-// without a DLL call, README §3 item 15), bitrate_bps, frame_ms 20, the flags (TapPCM, TestFlags), and for
-// EXCLUDE_APPS the exclusions (05's semantics). README WA35 owns audio.go's mapping for SetAudioMode and folds this
-// one into it.
-func startAudioConfig(op string, a *startArgs, ac *media.AudioConfig) (imAudioConfig, error) {
-	var out imAudioConfig
-	switch ac.Mode {
-	case "", media.AudioExcludeApps:
-		out.mode = imAudioModeExcludeApps
-	case media.AudioTestTone:
-		out.mode = imAudioModeTestTone
-	case media.AudioEverything:
-		return out, codeError(media.CodeInvalid, op, "",
-			"Config.Audio.Mode everything is reserved and refused in M2 (docs/m2/README.md §3 item 15)")
-	case media.AudioOff:
-		return out, codeError(media.CodeInvalid, op, "",
-			"Config.Audio.Mode off is a mid-share SetAudioMode value; a session without audio has Audio nil")
-	default:
-		return out, codeError(media.CodeInvalid, op, "", "Config.Audio.Mode %q is not an audio mode", ac.Mode)
-	}
-	if ac.BitrateBPS != 0 && (ac.BitrateBPS < minAudioBitrateBPS || ac.BitrateBPS > maxAudioBitrateBPS) {
-		return out, codeError(media.CodeInvalid, op, "", "Config.Audio.BitrateBPS %d is outside %d..%d",
-			ac.BitrateBPS, minAudioBitrateBPS, maxAudioBitrateBPS)
-	}
-	if ac.TestFlags&^imAudiofTestFailProbe != 0 {
-		return out, codeError(media.CodeInvalid, op, "", "Config.Audio.TestFlags %#x: only IM_AUDIOF_TEST_FAIL_PROBE",
-			ac.TestFlags)
-	}
-	out.bitrateBPS = uint32(ac.BitrateBPS)
-	out.frameMS = 20
-	out.flags = ac.TestFlags
-	if ac.TapPCM {
-		out.flags |= imAudiofTapPCM
-	}
-	if out.mode == imAudioModeExcludeApps {
-		ex, err := startExclusions(op, a, ac.Exclusions)
-		if err != nil {
-			return out, err
-		}
-		a.sc.exclusions = ex
-	}
-	return out, nil
-}
-
-// startExclusions is media.Exclusions → im_exclusions (rules in order, KeepOutMicUsers, FastPath, SharedPID); the
-// engine checks the rules themselves (05 §4.3). README WA35's audio.go builds the same struct for SetExclusions and
-// WatchAudio.
-func startExclusions(op string, a *startArgs, x media.Exclusions) (*imExclusions, error) {
-	if len(x.Rules) > imMaxRules {
-		return nil, codeError(media.CodeInvalid, op, "", "%d exclusion rules: at most %d", len(x.Rules), imMaxRules)
-	}
-	ex := &imExclusions{structSize: uint32(unsafe.Sizeof(imExclusions{})), sharedPID: x.SharedPID}
-	if x.KeepOutMicUsers {
-		ex.flags |= imExclfKeepOutMicUsers
-	}
-	if x.FastPath {
-		ex.flags |= imExclfFastPath
-	}
-	a.rules = make([]imRule, len(x.Rules))
-	for i, r := range x.Rules {
-		v, err := a.str(op, r.Value)
-		if err != nil {
-			return nil, err
-		}
-		rule := imRule{kind: uint32(r.Kind), source: uint32(r.Source), value: v}
-		if r.AppID != "" {
-			if rule.appID, err = a.str(op, r.AppID); err != nil {
-				return nil, err
-			}
-		}
-		if r.Name != "" {
-			if rule.name, err = a.str(op, r.Name); err != nil {
-				return nil, err
-			}
-		}
-		a.rules[i] = rule
-	}
-	if len(a.rules) > 0 {
-		ex.rules = &a.rules[0]
-		ex.ruleCount = uint32(len(a.rules))
-	}
-	a.ex = ex
-	return ex, nil
-}
-
 // ---------------------------------------------------------------------------------------------------- the session
 
 // session is a running im_session, returned as a media.Session (04 §12.3). Next is for one goroutine; every other
@@ -1420,8 +1344,8 @@ func startExclusions(op string, a *startArgs, x media.Exclusions) (*imExclusions
 //
 // Locks: pull is held from each im_next_packet through the copy of its packet, and by im_stop, so the engine never
 // frees a slot Go is still copying; ctl orders the control calls among themselves (01 §7.1 item 4), never
-// im_next_packet; tapMu orders PCMTap's sends and its close; smu guards freed. Next's own state (queue, startPending,
-// lastLayer, dropWarnAt) belongs to the one goroutine that calls Next.
+// im_next_packet; smu guards freed. Next's own state (queue, startPending, lastLayer, dropWarnAt) belongs to the one
+// goroutine that calls Next.
 type session struct {
 	e       *Engine
 	c       caller
@@ -1444,11 +1368,7 @@ type session struct {
 	lastLayer    []media.Event  // Next's: each layer's last EventLayer
 	dropWarnAt   time.Time      // Next's: the last warning about a dropped packet
 
-	tapMu     sync.Mutex
-	tap       chan PCMChunk // nil unless AudioConfig.TapPCM
-	tapOpen   bool
-	tapDrops  uint64
-	tapWarnAt time.Time
+	tapPCM bool // AudioConfig.TapPCM: IM_PACKET_PCM chunks come out of Next as media.KindPCM (05 §13.2)
 
 	smu   sync.Mutex
 	freed bool // im_stop ran: the handle never reaches the DLL again
@@ -1457,13 +1377,12 @@ type session struct {
 // The session's limits (04 §12.3): the pull timeout, and each packet kind's largest size (the f arena; one Opus
 // packet with the Marker framing; one 10 ms PCM chunk; an event's JSON).
 const (
-	pullTimeoutMS  = 50
-	maxVideoBytes  = 8 << 20
-	maxAudioBytes  = 4096
-	pcmChunkBytes  = 3840
-	maxEventBytes  = 1024
-	pcmTapCapacity = 128
-	dropWarnEvery  = time.Second
+	pullTimeoutMS = 50
+	maxVideoBytes = 8 << 20
+	maxAudioBytes = 4096
+	pcmChunkBytes = 3840
+	maxEventBytes = 1024
+	dropWarnEvery = time.Second
 )
 
 // maxPacketBytes is the size limit of a packet kind (0: a kind Next doesn't take).
@@ -1501,10 +1420,7 @@ func newSession(e *Engine, h uint64, info *imSessionInfo, cfg media.Config, sc *
 	for i, l := range cfg.Layers {
 		s.rids[i] = l.RID
 	}
-	if cfg.Audio != nil && cfg.Audio.TapPCM {
-		s.tap = make(chan PCMChunk, pcmTapCapacity)
-		s.tapOpen = true
-	}
+	s.tapPCM = cfg.Audio != nil && cfg.Audio.TapPCM
 	for i := range n {
 		ev := s.layerEvent(info, i)
 		s.lastLayer[i] = ev
@@ -1537,7 +1453,8 @@ func errStopped(op string) *media.Error { return &media.Error{Code: media.CodeSt
 
 // Next returns the next packet or event (04 §12.3): it pulls with im_next_packet(s, 50 ms) in a loop, returns ctx's
 // error once ctx is done (within one pull), copies every payload into fresh memory, maps events, synthesizes
-// EventLayer before each Reinit packet (holding the packet for the next call), routes PCM to PCMTap, and turns the
+// EventLayer before each Reinit packet (holding the packet for the next call), returns PCM chunks as media.KindPCM
+// packets when the session was started with AudioConfig.TapPCM (05 §13.2), and turns the
 // ENDED event into its error (the binding then frees the session with im_stop itself). After Stop, Close or the end
 // it returns media.ErrStopped without calling the DLL.
 func (s *session) Next(ctx context.Context) (media.Packet, error) {
@@ -1635,7 +1552,7 @@ func nativeBytes(a uintptr, n int) []byte {
 	return unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&a))), n)
 }
 
-// handle turns one packet into what Next returns: deliver is false for a packet that is consumed here (PCM, a
+// handle turns one packet into what Next returns: deliver is false for a packet that is consumed here (a
 // dropped or unmapped packet), err is set for the session's end.
 func (s *session) handle(pk *pulled) (p media.Packet, deliver bool, err error) {
 	switch pk.p.kind {
@@ -1644,8 +1561,7 @@ func (s *session) handle(pk *pulled) (p media.Packet, deliver bool, err error) {
 	case imPacketAudio:
 		return s.audio(pk)
 	case imPacketPCM:
-		s.pcm(pk)
-		return media.Packet{}, false, nil
+		return s.pcm(pk)
 	case imPacketEvent:
 		return s.event(pk)
 	case imPacketDebug:
@@ -1754,31 +1670,23 @@ func (s *session) audio(pk *pulled) (media.Packet, bool, error) {
 		Data: pk.data}, true, nil
 }
 
-// pcm sends an IM_PACKET_PCM chunk to PCMTap without blocking: a full channel drops it, counted and logged at warn
-// at most once a second (04 §12.2). Next never returns PCM.
-func (s *session) pcm(pk *pulled) {
-	if len(pk.data) != pcmChunkBytes || s.captureNS(pk) < 0 {
-		s.dropped("a PCM chunk that is not 3840 bytes or captured before the epoch", pk, -1)
-		return
+// pcm turns an IM_PACKET_PCM chunk into a media.KindPCM packet (05 §13.2, 01 §5.1): 10 ms of the mix fed to Opus,
+// 480 interleaved stereo float32 frames (3840 bytes, little-endian), CaptureNS its first sample. Only a session started
+// with AudioConfig.TapPCM gets them (the core never sets it, so the pump and the publisher never see PCM); any other
+// session, and a chunk of another size or captured before the epoch, drops it with a warning (at most once a second).
+func (s *session) pcm(pk *pulled) (media.Packet, bool, error) {
+	switch {
+	case !s.tapPCM:
+		s.dropped("a PCM chunk without AudioConfig.TapPCM", pk, -1)
+		return media.Packet{}, false, nil
+	case len(pk.data) != pcmChunkBytes || pk.oversized:
+		s.dropped("a PCM chunk that is not 3840 bytes", pk, -1)
+		return media.Packet{}, false, nil
+	case s.captureNS(pk) < 0:
+		s.dropped("a PCM chunk captured before the session's epoch", pk, -1)
+		return media.Packet{}, false, nil
 	}
-	c := PCMChunk{CaptureNS: s.captureNS(pk), Frames: make([]float32, pcmChunkBytes/4)}
-	for i := range c.Frames {
-		c.Frames[i] = math.Float32frombits(binary.LittleEndian.Uint32(pk.data[4*i:]))
-	}
-	s.tapMu.Lock()
-	defer s.tapMu.Unlock()
-	if !s.tapOpen {
-		return
-	}
-	select {
-	case s.tap <- c:
-	default:
-		s.tapDrops++
-		if now := time.Now(); now.Sub(s.tapWarnAt) >= dropWarnEvery {
-			s.tapWarnAt = now
-			s.log.Warn("engine PCM tap full: chunks dropped", "dropped", s.tapDrops)
-		}
-	}
+	return media.Packet{Kind: media.KindPCM, CaptureNS: s.captureNS(pk), Data: pk.data}, true, nil
 }
 
 // eventDoc is the union of 04 §5.6's event details.
@@ -1875,7 +1783,7 @@ func (s *session) end(err error) error {
 	return err
 }
 
-// free runs im_stop once (it waits for a Next in im_next_packet, ≤ 50 ms, through the pull lock), closes PCMTap and
+// free runs im_stop once (it waits for a Next in im_next_packet, ≤ 50 ms, through the pull lock) and
 // forgets the session. Later calls return nil.
 func (s *session) free(op string) error {
 	s.pull.Lock()
@@ -1888,12 +1796,6 @@ func (s *session) free(op string) error {
 	s.freed = true
 	s.smu.Unlock()
 	r, lastErr := s.c.call(procStop, uintptr(s.h))
-	s.tapMu.Lock()
-	if s.tapOpen {
-		close(s.tap)
-		s.tapOpen = false
-	}
-	s.tapMu.Unlock()
 	s.e.forget(s)
 	if st := int32(r); st != imOK {
 		return s.e.failed(statusError(op, procStop.String(), st, lastErr))
@@ -2163,14 +2065,4 @@ func (s *session) setAudioBitrate(op string, bps int) error {
 	s.ctl.Lock()
 	defer s.ctl.Unlock()
 	return s.control(op, procSetAudioBitrate, uintptr(s.h), uintptr(bps))
-}
-
-// PCMTap returns the session's PCM chunks (buffered 128, closed when the session stops) when it was started with
-// media.AudioConfig.TapPCM, else nil (a Windows-only extra; cmd/isshoni-audiotest type-asserts
-// interface{ PCMTap() <-chan native.PCMChunk }).
-func (s *session) PCMTap() <-chan PCMChunk {
-	if s.tap == nil {
-		return nil
-	}
-	return s.tap
 }

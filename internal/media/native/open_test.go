@@ -663,7 +663,8 @@ func TestRelease(t *testing.T) {
 }
 
 // TestNotImplementedYet: the parts later slices fill answer internal/not_implemented, with the Go method as Op.
-// (README WA23 implemented Probe, Sources, Pick, Start, StartExtra, SourceDetail and the session: bridge_test.go.)
+// (README WA23 implemented Probe, Sources, Pick, Start, StartExtra, SourceDetail and the session: bridge_test.go;
+// README WA35 the audio calls and the test hooks: audio_test.go.)
 func TestNotImplementedYet(t *testing.T) {
 	f := newFakeCaller(t)
 	e := openFake(t, f, Options{})
@@ -672,26 +673,9 @@ func TestNotImplementedYet(t *testing.T) {
 	for op, err := range map[string]error{
 		"protect_window":    e.ProtectWindow(0),
 		"set_openh264_path": e.SetOpenH264Path(""),
-		"audio_watch":       e.WatchAudio(ctx, media.Exclusions{}),
-		"audio_unwatch":     e.UnwatchAudio(ctx),
-		"set_exclusions":    e.SetExclusions(ctx, media.Exclusions{}),
-		"audio_set_mode":    e.SetAudioMode(ctx, media.AudioOff),
-		"audio_set_muted":   e.SetAudioMuted(ctx, true),
-		"list_audio_apps":   second(e.AudioReport(ctx)),
-		"audio_levels_get":  second(e.AudioLevels(ctx)),
-		"audio_sound_check": second(e.SoundCheck(ctx, 0, time.Second)),
-		"audio_apps":        second(e.AudioApps(ctx)),
 		"install_openh264":  second(InstallOpenH264(ctx, nil, t.TempDir())),
 		"verify_openh264":   VerifyOpenH264("x"),
 		"remove_openh264":   RemoveOpenH264(t.TempDir()),
-	} {
-		wantError(t, err, media.CodeInternal, reasonNotImplemented, op)
-	}
-	at, _ := AudioTestHooks(e)
-	for op, err := range map[string]error{
-		"test_render_tone":   at.RenderTone("", 440, 0.5, time.Second),
-		"test_render_bursts": second(at.RenderBursts("", 2000, 0.5, 5*time.Millisecond, time.Second, 3)),
-		"test_opus_decode":   second(at.OpusDecode(nil, nil)),
 	} {
 		wantError(t, err, media.CodeInternal, reasonNotImplemented, op)
 	}
@@ -704,17 +688,6 @@ func TestNotImplementedYet(t *testing.T) {
 }
 
 func second[T any](_ T, err error) error { return err }
-
-// TestAudioTestHooks: only the engine native.Open returns has the test exports.
-func TestAudioTestHooks(t *testing.T) {
-	var other media.Engine
-	if _, err := AudioTestHooks(other); !errors.Is(err, media.ErrUnsupportedOS) {
-		t.Errorf("nil engine: %v", err)
-	}
-	if _, err := AudioTestHooks((*Engine)(nil)); !errors.Is(err, media.ErrUnsupportedOS) {
-		t.Errorf("nil *Engine: %v", err)
-	}
-}
 
 // TestSessionNow: Now is qpcNS − epoch_ns, the origin of every CaptureNS (04 §12.3).
 func TestSessionNow(t *testing.T) {

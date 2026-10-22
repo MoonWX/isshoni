@@ -53,10 +53,3 @@ type SourceDetail struct {
 	Mapped bool    // IM_SRCF_MAPPED: a Win10 monitor pick mapped to a DD output (04 §7.5)
 	Window uintptr // the HWND when identified (04 §7.6), else 0
 }
-
-// PCMChunk is one IM_PACKET_PCM chunk of a session started with media.AudioConfig.TapPCM: 10 ms of the mix fed to
-// Opus, for 05's audiotest (04 §12.2, PCMTap).
-type PCMChunk struct {
-	CaptureNS int64     // the chunk's first sample, on the clock of Session.Now
-	Frames    []float32 // 960 values: 480 interleaved stereo frames
-}
