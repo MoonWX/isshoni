@@ -2,7 +2,9 @@
 // banner's states over time, where a stopped connection sends the user, and the one reload for a stale build.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { createDesktopTestPlatform, type DesktopTestPlatform } from '../app/testing/desktop';
 import type { AppScreen } from '../app/uiStore';
+import type { DesktopFeatures, SignalStopAction } from '../platform/types';
 import { queryKeys } from '../protocol/queryKeys';
 import { BackoffMaxMs } from '../protocol/signal-client';
 import { makeError } from '../protocol/testing';
@@ -15,7 +17,15 @@ import {
   UNREACHABLE_AFTER_MS,
   type ConnectionState,
 } from './connection';
-import { createHarness, FakeShare, pickedSource, refuseConnections, tick, type Harness } from './testing/harness';
+import {
+  createHarness,
+  FakeShare,
+  pickedSource,
+  refuseConnections,
+  tick,
+  type Harness,
+  type HarnessOptions,
+} from './testing/harness';
 
 let h: Harness;
 
@@ -483,5 +493,223 @@ describe('a stale build (05 §16.4)', () => {
     expect(connection()).toMatchObject({ state: 'ready', staleBuild: true });
     expect(reload).not.toHaveBeenCalled();
     expect(h.services.ui.getState().updateReady).toBe(true);
+  });
+});
+
+describe('M2: in the desktop app (docs/m2/03 §7.2, §7.3; 02 §11.8)', () => {
+  let d: DesktopTestPlatform;
+  const me = () => h.services.queryClient.getQueryData(queryKeys.me);
+  const origin = (): string => d.platform.serverOrigin;
+
+  /**
+   * This page as the desktop app's: its kind, client, role and desktop features (over the fake bridge, whose
+   * signalStopped is DesktopPlatform's own, platform/desktop/actions.ts), signed in.
+   */
+  function desktopPage(opts: HarnessOptions = {}): void {
+    h.close();
+    d = createDesktopTestPlatform();
+    const { kind, client, role } = d.platform;
+    h = createHarness({
+      ...opts,
+      platform: {
+        kind,
+        client,
+        role,
+        versionActions: () => d.platform.versionActions(),
+        desktop: d.platform.desktop ?? null,
+        ...opts.platform,
+      },
+    });
+    h.services.queryClient.setQueryData(queryKeys.me, { user: { id: 'k3m9p2qxw7ht' } });
+  }
+
+  it('says hello as the desktop app: role viewer (C1 never publishes)', async () => {
+    desktopPage();
+    await h.connect();
+    expect(h.server.hellos[0]).toMatchObject({ client: { kind: 'desktop' }, role: 'viewer' });
+  });
+
+  it('has no stale-build reload: the build version is "" whatever is given (§7.2)', async () => {
+    const reload = vi.fn();
+    desktopPage({
+      server: { welcome: { serverVersion: '0.2.0' } },
+      platform: { versionActions: () => ({ reload }) },
+      // A browser page of this build would reload (see "a stale build" above).
+      runtime: { buildVersion: '0.1.0' },
+    });
+    await h.connect();
+    expect(connection()).toMatchObject({ state: 'ready', staleBuild: false });
+    expect(reload).not.toHaveBeenCalled();
+    expect(h.platform.storage.session.get(RELOADED_FOR_KEY)).toBeNull();
+    expect(h.hub.joins).toEqual(['lounge']);
+  });
+
+  it('session_revoked and Go still linked: Auth.SessionEnded with this page’s origin, then one redial', async () => {
+    desktopPage();
+    await h.connect();
+    h.server.error(makeError('session_revoked', 'session'));
+    expect(connection().state).toBe('stopped');
+    await tick();
+    expect(d.fake.callsOf('auth.sessionEnded')).toEqual([[origin(), 'session_revoked']]);
+    expect(h.server.hellos).toHaveLength(2);
+    expect(connection().state).toBe('ready');
+    // Nothing of M1's: no login page, no toast, no screen.
+    expect(me()).not.toBeNull();
+    expect(h.toasts()).toEqual([]);
+    expect(screen()).toBeNull();
+  });
+
+  it('the redial comes back with the next ready: a later revocation redials again', async () => {
+    desktopPage();
+    await h.connect();
+    h.server.error(makeError('session_revoked', 'session'));
+    await tick();
+    expect(connection().state).toBe('ready');
+    h.server.error(makeError('session_revoked', 'session'));
+    await tick();
+    expect(h.server.hellos).toHaveLength(3);
+    expect(connection().state).toBe('ready');
+  });
+
+  it('one redial only: stopped again before ready, M1’s reaction (["me"] cleared, so the AuthState decides)', async () => {
+    desktopPage();
+    await h.connect();
+    h.server.autoWelcome = false;
+    h.server.error(makeError('session_revoked', 'session'));
+    await tick();
+    expect(h.server.hellos).toHaveLength(2);
+    h.server.replyError(h.server.last('hello'), makeError('session_revoked', 'session'));
+    await tick();
+    expect(d.fake.callsOf('auth.sessionEnded')).toHaveLength(2);
+    expect(h.server.hellos).toHaveLength(2);
+    expect(connection().state).toBe('stopped');
+    expect(me()).toBeNull();
+    expect(h.toasts()).toEqual(['You were signed out.']);
+  });
+
+  it.each(['session_revoked', 'account_disabled', 'unauthenticated'])(
+    '%s and Go unlinked: relink, through ["me"] (no toast, no Fatal screen, no redial)',
+    async (code) => {
+      desktopPage();
+      d.fake.sessionEndStatus = 'unlinked';
+      await h.connect();
+      h.server.error(makeError(code, 'session'));
+      await tick();
+      expect(d.fake.callsOf('auth.sessionEnded')).toEqual([[origin(), code]]);
+      // RequireAuth follows the AuthState from here (app/guards.tsx): /desktop/relink or the link step.
+      expect(me()).toBeNull();
+      expect(h.toasts()).toEqual([]);
+      expect(screen()).toBeNull();
+      expect(h.server.hellos).toHaveLength(1);
+      expect(connection().state).toBe('stopped');
+    },
+  );
+
+  it.each([
+    ['client_outdated', { serverVersion: '0.3.0', minClientVersion: '0.2.5' }],
+    ['protocol_unsupported', { serverMin: 2, serverMax: 3, serverVersion: '0.9.0' }],
+  ])('%s: Auth.HelloRefused with the error, then the version screen', async (code, params) => {
+    desktopPage();
+    await h.connect();
+    h.server.error(makeError(code, 'connection', { params }));
+    await tick();
+    expect(d.fake.callsOf('auth.helloRefused')).toEqual([[origin(), { code, params }]]);
+    expect(screen()).toMatchObject({ kind: 'versionMismatch', serverVersion: params.serverVersion });
+    expect(h.server.hellos).toHaveLength(1);
+  });
+
+  it('the version screen has no reload marker: never "Reloading didn’t help" in the desktop app', async () => {
+    const outdated = makeError('client_outdated', 'connection', { params: { serverVersion: '0.3.0' } });
+    desktopPage();
+    await h.connect();
+    h.server.error(outdated);
+    await tick();
+    expect(screen()).toMatchObject({ kind: 'versionMismatch', stillStale: false });
+    expect(h.platform.storage.session.get(RELOADED_FOR_KEY)).toBeNull();
+    // Once more in this window: still not "still stale".
+    h.services.ui.getState().showScreen(null);
+    h.runtime.start();
+    await tick();
+    h.server.error(outdated);
+    await tick();
+    expect(screen()).toMatchObject({ kind: 'versionMismatch', stillStale: false });
+  });
+
+  it.each(['session_revoked', 'client_outdated'])(
+    '%s while this server is no longer the active one (not_found): stopped, nothing shown, no redial',
+    async (code) => {
+      desktopPage();
+      await h.connect();
+      // The user switched servers in another window: the bridge answers not_found, and this window reloads.
+      d.fake.active = 'https://other.example';
+      h.server.error(makeError(code, code === 'client_outdated' ? 'connection' : 'session'));
+      await tick();
+      expect(connection().state).toBe('stopped');
+      expect(h.server.hellos).toHaveLength(1);
+      expect(me()).not.toBeNull();
+      expect(screen()).toBeNull();
+      expect(h.toasts()).toEqual([]);
+    },
+  );
+
+  it('codes Go leaves to the page: M1’s reactions', async () => {
+    desktopPage();
+    await h.connect();
+    h.server.error(makeError('too_many_connections', 'connection'));
+    await tick();
+    expect(screen()).toEqual({ kind: 'fatal', reason: 'too_many_connections' });
+    expect(d.fake.calls).toEqual([]);
+  });
+
+  it('calls signalStopped with the stop’s code and params, once per stop; stop() calls nothing', async () => {
+    desktopPage();
+    const signalStopped = vi.fn<DesktopFeatures['signalStopped']>(() => Promise.resolve('wait'));
+    const features = h.platform.desktop;
+    if (!features) throw new Error('no desktop features');
+    Object.assign(features, { signalStopped });
+    await h.connect();
+    h.runtime.signal.stop();
+    expect(signalStopped).not.toHaveBeenCalled();
+    h.runtime.start();
+    await tick();
+    h.server.error(makeError('bad_message', 'connection', { params: { field: 'type' } }));
+    await tick();
+    expect(signalStopped).toHaveBeenCalledExactlyOnceWith({ code: 'bad_message', params: { field: 'type' } });
+    // wait: nothing else happens.
+    expect(screen()).toBeNull();
+  });
+
+  it('signalStopped failing (its chunk didn’t load): M1’s reaction', async () => {
+    desktopPage();
+    const features = h.platform.desktop;
+    if (!features) throw new Error('no desktop features');
+    Object.assign(features, { signalStopped: () => Promise.reject(new Error('chunk 404')) });
+    await h.connect();
+    h.server.error(makeError('session_revoked', 'session'));
+    await tick();
+    expect(me()).toBeNull();
+    expect(h.toasts()).toEqual(['You were signed out.']);
+  });
+
+  it('started again before Go answered: that connection decides, the old stop changes nothing', async () => {
+    desktopPage();
+    let answer: (a: SignalStopAction) => void = () => undefined;
+    const features = h.platform.desktop;
+    if (!features) throw new Error('no desktop features');
+    Object.assign(features, {
+      signalStopped: () =>
+        new Promise<SignalStopAction>((resolve) => {
+          answer = resolve;
+        }),
+    });
+    await h.connect();
+    h.server.error(makeError('session_revoked', 'session'));
+    h.runtime.start();
+    await tick();
+    expect(connection().state).toBe('ready');
+    answer('relink');
+    await tick();
+    expect(me()).not.toBeNull();
+    expect(h.server.hellos).toHaveLength(2);
   });
 });

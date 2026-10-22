@@ -5,6 +5,15 @@
 //
 // 01 owns the client's behaviour (heartbeat, backoff, resume, close codes; 01 §3.4, §10, §16); nothing here repeats
 // it. No React in this file (05 §3 "Layering rule").
+//
+// In the desktop app (M2, docs/m2/03 §7.2, §7.3; 02 §11.8) two things differ:
+// - no stale-build reload: the SPA is the app's own build, which a reload can't change, so the build version given
+//   to the SignalClient and to reloadIfStale is '' (isStaleBuild needs a non-empty one);
+// - a stop of this page's connection (C1) goes to platform.desktop.signalStopped() first: the app's Go side decides
+//   what it means for this server's link (Auth.SessionEnded, Auth.HelloRefused, with the page's serverOrigin), and
+//   the answer says what happens here: redial (once), relink (['me'] cleared, so RequireAuth follows the AuthState to
+//   the relink page), version (the VersionMismatch screen), wait (this server isn't active any more: the window
+//   reloads), or none (M1's reactions below).
 import type { QueryClient } from '@tanstack/react-query';
 import { createStore, type StoreApi } from 'zustand/vanilla';
 
@@ -14,7 +23,7 @@ import type { UiStore } from '../app/uiStore';
 import { i18n } from '../i18n';
 import { errorMessage } from '../lib/errorText';
 import { createLogger, type Logger } from '../lib/log';
-import type { Platform } from '../platform/types';
+import type { DesktopFeatures, Platform } from '../platform/types';
 import type { ProtocolError } from '../protocol/errors';
 import { isStaleBuild, SignalClient, type SignalState, type SignalStateInfo } from '../protocol/signal-client';
 import {
@@ -237,7 +246,7 @@ export interface ConnectionOptions {
   log?: Logger;
   /**
    * The build version compared with welcome.serverVersion, here and in the SignalClient (01 §6.1). Default: this
-   * build's. Tests set it.
+   * build's. Tests set it. The desktop app always uses '' (no stale-build check, docs/m2/03 §7.2).
    */
   buildVersion?: string;
 }
@@ -250,7 +259,9 @@ export interface ConnectionOptions {
 export function createConnection(platform: Platform, stores: Stores, opts: ConnectionOptions = {}): SignalClient {
   const log = opts.log ?? createLogger('signal');
   const { ui } = stores;
-  const buildVersion = opts.buildVersion ?? __ISSHONI_VERSION__;
+  const desktop = platform.desktop ?? null;
+  // '' turns the stale-build check off: the desktop app's SPA is its own build (docs/m2/03 §7.2, §16.3).
+  const buildVersion = desktop !== null ? '' : (opts.buildVersion ?? __ISSHONI_VERSION__);
 
   /**
    * A welcome from a server of another version than this build (05 §16.4): the shell is stale (a cached PWA; the
@@ -314,10 +325,11 @@ export function createConnection(platform: Platform, stores: Stores, opts: Conne
     const serverMax = error.params['serverMax'];
     const version = typeof serverVersion === 'string' && serverVersion !== '' ? serverVersion : undefined;
     // The screen's only action is Reload, so seeing it twice for one server version means a reload didn't help.
+    // The desktop app has no reload (its actions update the app or open the browser): no marker, never "still stale".
     const session = platform.storage.session;
     const marker = version ?? 'unknown';
-    const stillStale = session.get(RELOADED_FOR_KEY) === marker;
-    session.set(RELOADED_FOR_KEY, marker);
+    const stillStale = desktop === null && session.get(RELOADED_FOR_KEY) === marker;
+    if (desktop === null) session.set(RELOADED_FOR_KEY, marker);
     ui.getState().showScreen({
       kind: 'versionMismatch',
       serverVersion: version,
@@ -327,9 +339,8 @@ export function createConnection(platform: Platform, stores: Stores, opts: Conne
     });
   };
 
-  const stopped = (error: ProtocolError | undefined): void => {
-    if (error === undefined) return; // stop() or pagehide: on purpose
-    log.warn('signaling stopped', { code: error.code, scope: error.scope, closeCode: error.closeCode });
+  /** M1's reactions to a stop (05 §7.1): the browser's, and the desktop app's for what Go leaves to the page. */
+  const m1Stopped = (error: ProtocolError): void => {
     switch (error.code) {
       case ErrorCodeReplaced:
         return; // another socket took this connection over
@@ -352,6 +363,59 @@ export function createConnection(platform: Platform, stores: Stores, opts: Conne
     ui.getState().showScreen({ kind: 'fatal', reason: 'generic', code: error.code });
   };
 
+  /**
+   * The desktop app's one redial (docs/m2/03 §7.3): spent by a redial, given back by the next ready. A second
+   * "redial" before that gets M1's reactions instead (for session_revoked: ['me'] cleared, so the AuthState decides),
+   * so a server that keeps refusing a session Go calls linked can't make a loop.
+   */
+  let canRedial = true;
+
+  /** The desktop app (docs/m2/03 §7.3, 02 §11.8): Go decides first; see the header. */
+  const desktopStopped = (features: DesktopFeatures, error: ProtocolError): void => {
+    features.signalStopped({ code: error.code, params: error.params }).then(
+      (action) => {
+        // Started again meanwhile (a new room page, a new login): that connection's own states decide.
+        if (client.state !== 'stopped') return;
+        log.info('signaling stopped: desktop', { code: error.code, action });
+        switch (action) {
+          case 'redial':
+            if (canRedial) {
+              canRedial = false;
+              client.start();
+              return;
+            }
+            m1Stopped(error);
+            return;
+          case 'relink':
+            // RequireAuth follows the AuthState from here: /desktop/relink, or the link step (docs/m2/03 §8.3).
+            if (opts.queryClient) clearMe(opts.queryClient);
+            return;
+          case 'version':
+            versionMismatch(error);
+            return;
+          case 'wait':
+            // This server isn't the app's active one any more: the window reloads for the new one (§5.8).
+            return;
+          case 'none':
+            m1Stopped(error);
+            return;
+        }
+      },
+      (err: unknown) => {
+        // The rarely used actions' chunk didn't load: M1's reactions are still better than none.
+        log.warn('desktop signalStopped failed', { error: err });
+        if (client.state === 'stopped') m1Stopped(error);
+      },
+    );
+  };
+
+  const stopped = (error: ProtocolError | undefined): void => {
+    if (error === undefined) return; // stop() or pagehide: on purpose
+    log.warn('signaling stopped', { code: error.code, scope: error.scope, closeCode: error.closeCode });
+    if (desktop !== null) desktopStopped(desktop, error);
+    else m1Stopped(error);
+  };
+
   client.onState((state, info) => {
     const before = stores.connection.getState();
     const hadBanner = connectionBanner(before, Date.now()) !== null;
@@ -359,6 +423,7 @@ export function createConnection(platform: Platform, stores: Stores, opts: Conne
     if (state === 'stopped') {
       stopped(info.error);
     } else if (state === 'ready') {
+      canRedial = true;
       // The banner is a live region, but its text just disappears: say that the outage is over (05 §16.6).
       if (hadBanner) ui.getState().announce(i18n.t('room.connection.reconnected'));
       // ready with staleBuild (05 §16.4) was dealt with when its welcome came: reloadIfStale().

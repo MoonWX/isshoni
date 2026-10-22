@@ -4,7 +4,7 @@ import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createMemoryRouter, type RouteObject } from 'react-router';
+import { createMemoryRouter, useLocation, type RouteObject } from 'react-router';
 
 import type { Platform } from '../platform/types';
 import type { Info } from '../protocol/api.gen';
@@ -12,21 +12,25 @@ import { queryKeys } from '../protocol/queryKeys';
 import { installFakeRTC } from '../test/FakeRTCPeerConnection';
 import { apiError, apiPath, infoFixture, meFixture, server, signedIn } from '../test/msw';
 import { createTestPlatform } from '../test/platform';
-import { fragmentTokenKey, loadInfo, stashFragmentToken, startApp, type StartedApp } from './boot';
+import { desktopStartPath, fragmentTokenKey, loadInfo, stashFragmentToken, startApp, type StartedApp } from './boot';
 import { createAppRoutes } from './router';
 import { CHANNEL_NAME } from './session';
 import { useApp } from './context';
 import { useInfo } from './info';
+import { createDesktopTestPlatform } from './testing/desktop';
 
 /** Calls of the router's preloadRoute, which still does its work: what boot asks for when nothing else is given. */
 const preloadSpy = vi.hoisted(() => vi.fn<(pathname: string) => void>());
+/** The RouteTarget of each of those calls (M2). */
+const preloadTargets = vi.hoisted((): (string | undefined)[] => []);
 vi.mock('./router', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./router')>();
   return {
     ...actual,
-    preloadRoute: (pathname: string) => {
-      preloadSpy(pathname);
-      actual.preloadRoute(pathname);
+    preloadRoute: (...args: Parameters<typeof actual.preloadRoute>) => {
+      preloadSpy(args[0]);
+      preloadTargets.push(args[2]);
+      actual.preloadRoute(...args);
     },
   };
 });
@@ -84,6 +88,7 @@ function mount({
 beforeEach(() => {
   uninstallRTC = installFakeRTC();
   preloadSpy.mockClear();
+  preloadTargets.length = 0;
 });
 
 afterEach(() => {
@@ -424,6 +429,174 @@ describe('loadInfo', () => {
     await new Promise((r) => setTimeout(r, 20));
     ctl.abort();
     await expect(p).rejects.toMatchObject({ name: 'AbortError' });
+  });
+});
+
+describe('M2: boot in the desktop app (docs/m2/03 §7.2)', () => {
+  /** Shows where the router is: path, query and fragment. */
+  function Where() {
+    const { pathname, search, hash } = useLocation();
+    return (
+      <main>
+        <h1>at {pathname + search + hash}</h1>
+      </main>
+    );
+  }
+  const whereRoutes = (): RouteObject[] => [{ path: '*', Component: Where }];
+
+  /**
+   * Starts the app like main.tsx in the desktop app: a history whose replaceState moves the location that the
+   * router then starts at, as createBrowserRouter reads the page's location.
+   */
+  function mountDesktop({
+    path = '/',
+    search = '',
+    platform = createDesktopTestPlatform().platform,
+    routes = whereRoutes,
+    preload,
+  }: {
+    path?: string;
+    search?: string;
+    platform?: Platform;
+    /** 'app': boot's own default (the app's routes for the platform). */
+    routes?: (() => RouteObject[]) | 'app';
+    preload?: (pathname: string) => void;
+  } = {}) {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const urls: string[] = [];
+    const history = {
+      state: null,
+      replaceState: vi.fn((_s: unknown, _u: string, url: string) => {
+        urls.push(url);
+      }),
+    };
+    const fetchSpy = vi.spyOn(platform, 'apiFetch');
+    act(() => {
+      started = startApp(container, {
+        platform,
+        location: { pathname: path, search, hash: '' },
+        history,
+        retryDelaysMs: [0, 0, 0],
+        offlineRetryMs: 60_000,
+        createRouter: (r) => createMemoryRouter(r, { initialEntries: [urls.at(-1) ?? path + search] }),
+        ...(routes !== 'app' ? { routes } : {}),
+        ...(preload ? { preload } : {}),
+      });
+    });
+    return { urls, fetchSpy, started: started as StartedApp };
+  }
+
+  it('desktopStartPath: the desktop app’s own pages stay, every other path starts the wizard', () => {
+    expect(desktopStartPath({ pathname: '/' })).toBe('/desktop/setup');
+    expect(desktopStartPath({ pathname: '/r/lounge' })).toBe('/desktop/setup');
+    expect(desktopStartPath({ pathname: '/login' })).toBe('/desktop/setup');
+    expect(desktopStartPath({ pathname: '/desktop' })).toBe('/desktop/setup');
+    expect(desktopStartPath({ pathname: '/desktop/setup' })).toBeNull();
+    expect(desktopStartPath({ pathname: '/desktop/settings' })).toBeNull();
+  });
+
+  it('no server yet: no /info, and the router starts at /desktop/setup', async () => {
+    const platform = createDesktopTestPlatform({ server: null }).platform;
+    const preload = vi.fn();
+    const { urls, fetchSpy } = mountDesktop({ path: '/r/lounge', platform, preload });
+    expect(await screen.findByRole('heading', { name: 'at /desktop/setup' })).toBeInTheDocument();
+    expect(urls).toEqual(['/desktop/setup']);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(preload).toHaveBeenCalledExactlyOnceWith('/desktop/setup');
+  });
+
+  it('no server yet: a desktop page stays where the app opened it, with its query (?add=)', async () => {
+    const platform = createDesktopTestPlatform({ server: null }).platform;
+    const { urls, fetchSpy } = mountDesktop({
+      path: '/desktop/setup',
+      search: '?add=https%3A%2F%2Fwatch.example.com',
+      platform,
+    });
+    expect(
+      await screen.findByRole('heading', { name: 'at /desktop/setup?add=https%3A%2F%2Fwatch.example.com' }),
+    ).toBeInTheDocument();
+    expect(urls).toEqual([]);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('with a server: GET /info through apiFetch, then the app, at the path it opened', async () => {
+    const { urls, fetchSpy } = mountDesktop({ path: '/r/lounge' });
+    expect(await screen.findByRole('heading', { name: 'at /r/lounge' })).toBeInTheDocument();
+    expect(fetchSpy).toHaveBeenCalledWith('/api/v1/info', expect.anything());
+    expect(urls).toEqual([]);
+  });
+
+  it('has no secure-context check: the app’s pages come from its own asset handler', async () => {
+    Object.defineProperty(window, 'isSecureContext', { configurable: true, value: false });
+    try {
+      const { started: app } = mountDesktop({ path: '/r/lounge' });
+      expect(app.screen).toBeNull();
+      expect(await screen.findByRole('heading', { name: 'at /r/lounge' })).toBeInTheDocument();
+    } finally {
+      Object.defineProperty(window, 'isSecureContext', { configurable: true, value: true });
+    }
+  });
+
+  it('still needs WebRTC', () => {
+    uninstallRTC?.();
+    uninstallRTC = undefined;
+    const { started: app } = mountDesktop();
+    expect(app.screen).toEqual({ kind: 'unsupported' });
+  });
+
+  it('Offline gains "Switch server": the router at /desktop/settings#servers, without /info', async () => {
+    let calls = 0;
+    server.use(
+      http.get(apiPath('/api/v1/info'), () => {
+        calls++;
+        return HttpResponse.error();
+      }),
+    );
+    const { urls } = mountDesktop({ path: '/r/lounge' });
+    expect(await screen.findByRole('heading', { name: "Can't reach the server" })).toBeInTheDocument();
+    expect(calls).toBe(4);
+    await userEvent.click(screen.getByRole('button', { name: 'Switch server' }));
+    expect(await screen.findByRole('heading', { name: 'at /desktop/settings#servers' })).toBeInTheDocument();
+    expect(urls).toEqual(['/desktop/settings#servers']);
+    // The Offline screen's own retries are over.
+    act(() => {
+      window.dispatchEvent(new Event('online'));
+    });
+    await act(() => Promise.resolve());
+    expect(calls).toBe(4);
+  });
+
+  it('the browser’s Offline screen has no "Switch server"', async () => {
+    server.use(http.get(apiPath('/api/v1/info'), () => HttpResponse.error()));
+    mount();
+    expect(await screen.findByRole('heading', { name: "Can't reach the server" })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Switch server' })).not.toBeInTheDocument();
+  });
+
+  it('the default routes and preload are the desktop table’s: /desktop/settings has its page', async () => {
+    const { started: app } = mountDesktop({ path: '/desktop/settings', routes: 'app' });
+    // desktop/'s stub (WA42) until WA82 fills it.
+    expect(await screen.findByRole('heading', { name: 'Not in this build yet' })).toBeInTheDocument();
+    expect(app.services?.platform.kind).toBe('desktop');
+    expect(preloadSpy).toHaveBeenCalledExactlyOnceWith('/desktop/settings');
+    expect(preloadTargets).toEqual(['desktop']);
+  });
+
+  it('…and the browser’s default table has none: NotFound', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    act(() => {
+      started = startApp(container, {
+        platform: createTestPlatform(),
+        location: { pathname: '/desktop/settings', search: '', hash: '' },
+        history: { state: null, replaceState: vi.fn() },
+        retryDelaysMs: [],
+        createRouter: (r) => createMemoryRouter(r, { initialEntries: ['/desktop/settings'] }),
+      });
+    });
+    expect(await screen.findByRole('heading', { name: 'Nothing here' })).toBeInTheDocument();
+    expect(preloadTargets).toEqual(['browser']);
   });
 });
 

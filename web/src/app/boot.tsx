@@ -12,6 +12,16 @@
 //     a lazy chunk (05 §5), and the router that would load it only exists after this step. The two travel together.
 //  5. The QueryClient (seeded with info: app/info.ts, which pages read through useInfo()) and the router; render.
 //  6. After the first render, production builds only: register the service worker when the browser is idle.
+//
+// In the desktop app (M2, docs/m2/03 §7.2), the Platform has `desktop` features:
+//  - step 0 is unchanged (no desktop route has a fragment token);
+//  - step 1's secure-context check is the browser's only: the app's pages come from its own asset handler;
+//  - step 4: with no server yet (platform.desktop.server null) there is no /info to ask for: the router starts at
+//    /desktop/setup, or at the desktop page the app opened (desktopStartPath). Otherwise /info is asked for as in
+//    the browser, through apiFetch (a Public route: without a link it goes without Authorization), and the Offline
+//    screen gains "Switch server", which opens the router at /desktop/settings#servers without /info;
+//  - the routes are the desktop's table (app/router.tsx: RouteTarget), and so is what step 4 preloads;
+//  - step 6 has nothing to do: platform.pwa is null.
 import { StrictMode, useCallback, useEffect, useRef, useState } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { I18nextProvider } from 'react-i18next';
@@ -28,10 +38,11 @@ import { ApiError, api, configureApi, isRetryableError } from '../protocol/rest'
 import { PageSpinner } from '../ui/Spinner';
 import { App } from './App';
 import { createAppServices, type AppServices } from './context';
+import { DesktopPaths } from './guards';
 import { seedInfo } from './info';
 import { clearMe } from './me';
 import { createQueryClient } from './queryClient';
-import { createAppRoutes, preloadRoute } from './router';
+import { createAppRoutes, defaultSources, preloadRoute, routeTargetOf } from './router';
 import { AppScreenView } from './screens';
 import { listenForLogout } from './session';
 import type { AppScreen } from './uiStore';
@@ -128,6 +139,15 @@ export async function loadInfo(
   }
 }
 
+/**
+ * Step 4 in the desktop app with no server yet (docs/m2/03 §7.2): the path the router starts at, or null to start
+ * where the app opened. The desktop app's own pages need no server (they talk to the bridge: the wizard with its
+ * ?add=, Settings); every other page does, so the app starts the wizard instead.
+ */
+export function desktopStartPath(loc: Pick<Location, 'pathname'>): string | null {
+  return loc.pathname.startsWith('/desktop/') ? null : DesktopPaths.setup;
+}
+
 // ---- steps 4–5 in React ----
 
 export interface BootOptions {
@@ -140,35 +160,45 @@ export interface BootOptions {
   retryDelaysMs?: readonly number[];
   /** Default: OFFLINE_RETRY_MS. */
   offlineRetryMs?: number;
-  /** Default: createBrowserRouter (tests: createMemoryRouter). */
+  /**
+   * Default: createBrowserRouter, which starts at the page's location (tests: createMemoryRouter). Boot moves that
+   * location with `history` before it asks for the router (the desktop app's start path, "Switch server").
+   */
   createRouter?: (routes: RouteObject[]) => DataRouter;
-  /** Default: createAppRoutes(). */
+  /** Default: createAppRoutes() of the platform's RouteTarget. */
   routes?: () => RouteObject[];
   /**
    * Asks for the code of the page at a path, without waiting for it (step 4). Default: preloadRoute, which goes
-   * with the default routes; with a test's own `routes` nothing is asked for.
+   * with the default routes (of the platform's RouteTarget); with a test's own `routes` nothing is asked for.
    */
   preload?: (pathname: string) => void;
 }
 
-type Phase = { kind: 'loading' } | InfoResult;
+/** router: the app without /info (the desktop app with no server, or after the Offline screen's Switch server). */
+type Phase = { kind: 'loading' } | InfoResult | { kind: 'router' };
 
 /** Runs step 4 and shows its screens; on success builds the router (step 5) and renders the app. */
 function BootGate({
   services,
   path,
+  skipInfo,
   retryDelaysMs,
   offlineRetryMs,
   getRouter,
+  switchServer,
 }: {
   services: AppServices;
   path: string;
+  /** The desktop app with no server: render the router at once, without /info. */
+  skipInfo: boolean;
   retryDelaysMs: readonly number[];
   offlineRetryMs: number;
   /** Creates the router on the first call and returns the same one after (StrictMode renders twice). */
   getRouter: () => DataRouter;
+  /** The desktop app: moves the location to Settings → Servers, for the router that the Offline screen opens. */
+  switchServer: (() => void) | undefined;
 }) {
-  const [phase, setPhase] = useState<Phase>({ kind: 'loading' });
+  const [phase, setPhase] = useState<Phase>(skipInfo ? { kind: 'router' } : { kind: 'loading' });
   const [retrying, setRetrying] = useState(false);
   const running = useRef(false);
 
@@ -180,7 +210,8 @@ function BootGate({
       try {
         const result = await loadInfo(delays);
         if (result.kind === 'ok') seedInfo(services.queryClient, result.info);
-        setPhase(result);
+        // A try that answers after Switch server changes nothing: the router is there.
+        setPhase((p) => (p.kind === 'router' ? p : result));
       } finally {
         running.current = false;
         setRetrying(false);
@@ -190,8 +221,9 @@ function BootGate({
   );
 
   useEffect(() => {
+    if (skipInfo) return;
     void run(retryDelaysMs);
-  }, [run, retryDelaysMs]);
+  }, [run, retryDelaysMs, skipInfo]);
 
   // Offline: one more try on `online` and every offlineRetryMs (no inner retries: the interval is the backoff).
   const offline = phase.kind === 'offline';
@@ -218,6 +250,14 @@ function BootGate({
           platform={services.platform}
           onRetry={() => void run([])}
           retrying={retrying}
+          {...(switchServer !== undefined
+            ? {
+                onSwitchServer: () => {
+                  switchServer();
+                  setPhase({ kind: 'router' });
+                },
+              }
+            : {})}
         />
       );
     case 'fatal':
@@ -226,6 +266,8 @@ function BootGate({
       if (phase.info.setupRequired && path !== '/setup') {
         return <AppScreenView screen={{ kind: 'notSetUp' }} platform={services.platform} />;
       }
+      return <App services={services} router={getRouter()} />;
+    case 'router':
       return <App services={services} router={getRouter()} />;
   }
 }
@@ -250,16 +292,18 @@ export function startApp(container: Element, opts: BootOptions = {}): StartedApp
   const history = opts.history ?? globalThis.history;
   // Step 2 (first, see the header), step 0, step 3.
   const platform = opts.platform ?? detectPlatform();
+  const desktop = platform.desktop ?? null;
   stashFragmentToken(loc, history, platform.storage.session);
   const i18n = initI18n();
   const root = createRoot(container);
 
-  // Step 1.
-  const early: AppScreen | null = !globalThis.isSecureContext
-    ? { kind: 'needsHttps' }
-    : typeof globalThis.RTCPeerConnection !== 'function'
-      ? { kind: 'unsupported' }
-      : null;
+  // Step 1. The secure context is the browser's check only (docs/m2/03 §7.2).
+  const early: AppScreen | null =
+    desktop === null && !globalThis.isSecureContext
+      ? { kind: 'needsHttps' }
+      : typeof globalThis.RTCPeerConnection !== 'function'
+        ? { kind: 'unsupported' }
+        : null;
   if (early) {
     root.render(
       <StrictMode>
@@ -284,25 +328,50 @@ export function startApp(container: Element, opts: BootOptions = {}): StartedApp
   const stopLogoutListener = listenForLogout(() => {
     clearMe(services.queryClient);
   });
-  // One router for the page's life, made once /info has answered (it starts loading the first route at once).
+  // The desktop app with no server yet: no /info, and the router starts at the wizard (desktopStartPath).
+  const skipInfo = desktop !== null && desktop.server === null;
+  let path = loc.pathname;
+  const start = skipInfo ? desktopStartPath(loc) : null;
+  if (start !== null) {
+    history.replaceState(history.state, '', start);
+    path = start;
+  }
+  // One router for the page's life, made once /info has answered (it starts loading the first route at once), and
+  // at the page's location then: createBrowserRouter reads it.
   let router: DataRouter | null = null;
   const createRouter = opts.createRouter ?? createBrowserRouter;
-  const routes = opts.routes ?? createAppRoutes;
+  const target = routeTargetOf(platform);
+  const routes = opts.routes ?? (() => createAppRoutes(defaultSources(), target));
   const getRouter = (): DataRouter => (router ??= createRouter(routes()));
   // The first page's chunk, on its way before /info is asked for (BootGate's effect, after this render). Not while
   // the browser says it is offline: an import() that fails is not tried again by every browser, and the router's
   // own import of the same chunk, once the server is back, would fail with it.
-  const preload = opts.preload ?? (opts.routes === undefined ? preloadRoute : undefined);
-  if (isOnline()) preload?.(loc.pathname);
+  const preload =
+    opts.preload ??
+    (opts.routes === undefined
+      ? (pathname: string) => {
+          preloadRoute(pathname, defaultSources(), target);
+        }
+      : undefined);
+  if (isOnline()) preload?.(path);
+  // The Offline screen's "Switch server" in the desktop app: the router then starts at Settings → Servers.
+  const switchServer =
+    desktop === null
+      ? undefined
+      : () => {
+          history.replaceState(history.state, '', DesktopPaths.servers);
+        };
   root.render(
     <StrictMode>
       <I18nextProvider i18n={i18n}>
         <BootGate
           services={services}
-          path={loc.pathname}
+          path={path}
+          skipInfo={skipInfo}
           retryDelaysMs={opts.retryDelaysMs ?? INFO_RETRY_DELAYS_MS}
           offlineRetryMs={opts.offlineRetryMs ?? OFFLINE_RETRY_MS}
           getRouter={getRouter}
+          switchServer={switchServer}
         />
       </I18nextProvider>
     </StrictMode>,
