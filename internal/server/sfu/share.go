@@ -60,11 +60,21 @@ type Share struct {
 	// other than the publishing Conn's actor. A keyframe request for a paused layer does nothing
 	// (Layer.requestKeyframe), and a viewer's new request for high has the actor look at once (askedForHigh).
 	paused atomic.Uint32
-	// resumedAt holds, per video slot, when the sharer was last told to resume the layer, on the uplink policies'
-	// clock (SFU.uplinkNow), 0 for never: the publishing Conn's actor stores it before it clears the slot's bit in
-	// paused. For rateWindow after it the layer's measured rate lags what the sharer sends, and the downlink
-	// allocators weigh the layer at its maximum (allocRate).
+	// resumedAt holds, per video slot, when the sharer was last told to resume the layer, or ended its own pause of
+	// the share (sharerPaused), on the uplink policies' clock (SFU.uplinkNow), 0 for never: the publishing Conn's
+	// actor stores it before it clears the slot's bit in paused, or sharerPaused. For rateWindow after it the layer's
+	// measured rate lags what the sharer sends, and the downlink allocators weigh the layer at its maximum
+	// (allocRate).
 	resumedAt [SlotAudio]atomic.Int64
+	// sharerPaused is the sharer's own pause of the whole share (M2 01 §10.3, share.update{paused}), named apart from
+	// the layer-pausing bits in paused: while it is set, a keyframe request for the share does nothing
+	// (Layer.requestKeyframe), the native uplink estimator skips its ticks, and the downlink allocators weigh every
+	// video layer at its maximum, as a paused one (allocRate). sharerResumedAt is when the pause last ended, on the
+	// uplink policies' clock (SFU.uplinkNow), 0 for never: the estimator waits out the resume as it does a layer's.
+	// Only the publishing Conn's actor writes them (setSharerPaused); the media path and the allocators read
+	// sharerPaused.
+	sharerPaused    atomic.Bool
+	sharerResumedAt atomic.Int64
 	// up is the share's uplink control (02 §11, uplink.go). It belongs to the publishing Conn's actor, like the rest of
 	// what that Conn publishes; addShare sets it there.
 	up shareUplink
@@ -380,6 +390,42 @@ func (s *Share) attached() []*Layer {
 	return out
 }
 
+// setSharerPaused applies the sharer's own pause (M2 01 §10.3). A pause only sets Share.sharerPaused, which the
+// downlink allocators take as a pause of every video layer (allocRate). Its end works like a layer resume (02 §11):
+// it notes the time for the native uplink estimator and, for each attached video layer, in Share.resumedAt for the
+// downlink allocators (before the pause goes, so an allocator never sees a layer as neither), clears the pause, and
+// asks the publisher for one keyframe per video layer that has viewers (a DownTrack that forwards the layer or waits
+// for its keyframe): the requests made during the pause did nothing. It reports whether the state changed. Only the
+// publishing Conn's actor calls it.
+func (s *Share) setSharerPaused(paused bool) bool {
+	if paused {
+		return !s.sharerPaused.Swap(true)
+	}
+	if !s.sharerPaused.Load() {
+		return false
+	}
+	at := max(s.conn.sfu.uplinkNow(), 1)
+	s.sharerResumedAt.Store(at)
+	layers := s.attached()
+	for _, l := range layers {
+		if l.kind == webrtc.RTPCodecTypeVideo {
+			s.resumedAt[l.slot].Store(at)
+		}
+	}
+	s.sharerPaused.Store(false)
+	now := monoNow()
+	viewers := s.downTracks(webrtc.RTPCodecTypeVideo)
+	for _, l := range layers {
+		if l.kind != webrtc.RTPCodecTypeVideo {
+			continue
+		}
+		if slices.ContainsFunc(viewers, func(dt *DownTrack) bool { return dt.interest.Load()&(1<<l.slot) != 0 }) {
+			l.requestKeyframe(now)
+		}
+	}
+	return true
+}
+
 // requestKeyframe asks the publisher for a keyframe on the layer attached for slot, at most once per 500 ms and
 // layer (02 §9.7, Layer.requestKeyframe). Without a layer there it does nothing: the layer's first packets ask.
 func (s *Share) requestKeyframe(slot Slot) {
@@ -585,8 +631,9 @@ func (c *Conn) startShare(p StartShareParams) (ShareParams, error) {
 // cap as it is now, and with the layers paused that the sharer was told to pause (02 §11), so a sharer that applies
 // them pauses or resumes nothing. The params may reach another of the user's connections, not the sharer (01 §8.7), so
 // the uplink control doesn't count them as told: when the cap differs from what its last hint or StartShare said, its
-// next look sends a hint all the same. It returns sfu.share_not_found for an unknown or ended share and sfu.not_owner
-// for another Conn's.
+// next look sends a hint all the same. A Paused field pauses or resumes the whole share (M2 01 §10.3,
+// setSharerPaused); the params don't change with it. It returns sfu.share_not_found for an unknown or ended share and
+// sfu.not_owner for another Conn's.
 func (c *Conn) UpdateShare(ctx context.Context, id ShareID, u ShareUpdate) (ShareParams, error) {
 	var params ShareParams
 	err := c.do(ctx, func(context.Context) error {
@@ -616,6 +663,9 @@ func (c *Conn) updateShare(id ShareID, u ShareUpdate) (ShareParams, error) {
 	preset, ok := sh.currentPreset()
 	if !ok {
 		return ShareParams{}, newError(CodeShareNotFound, "the share ended")
+	}
+	if u.Paused != nil && sh.setSharerPaused(*u.Paused) {
+		c.log.Debug("share pause changed", "share_id", string(sh.id), "paused", *u.Paused)
 	}
 	// The cap is the admin's as it is now, which the uplink control may not have told the sharer yet. The uplink
 	// control doesn't take these params as told (shareUplink.capBps): the hub runs another connection's share.update

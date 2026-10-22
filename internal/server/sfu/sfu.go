@@ -42,6 +42,10 @@ type SFU struct {
 	// uplinkSkew is added to monoNow for the uplink policies' clock (uplinkNow): 0 but in tests, which move it on to
 	// see the 10 s of layer pausing pass.
 	uplinkSkew atomic.Int64
+	// uplinkGen counts the ticker's seconds: everySecond adds one once the layers have their new stats, before it
+	// wakes the publishers' uplink looks. ShareUplinkStats carries it, so that the native uplink estimator runs its
+	// rows once per second of stats (M2 01 §10.1), however often the policy is asked in between (nativeUplink.Tick).
+	uplinkGen atomic.Uint64
 	// fullMaxBps is the full layer's MaxBitrate under the admin's cap, in bit/s (fullLayerMax of limits): New and
 	// SetLimits set it with limits. The NACK path reads it for the retransmission budget (Share.maxBitrate), once
 	// per NACK, so it is an atomic and not a field under mu.
@@ -295,6 +299,8 @@ func (s *SFU) everySecond(now int64) {
 	for _, c := range conns {
 		c.wakeAllocator()
 	}
+	// A new second of layer stats for the uplink policies: a look from now on sees this generation (uplinkGen).
+	s.uplinkGen.Add(1)
 	for _, c := range publishers {
 		c.wakeUplink()
 	}
@@ -492,8 +498,9 @@ func (s *SFU) addShare(c *Conn, p StartShareParams) (*Share, error) {
 	}
 	sh.awaitsKeyframe.Store(true)
 	sh.audioBps.Store(int64(presetAudioBitrate(p.Preset)))
-	// The cap of the ShareParams that StartShare returns, read under s.mu, where SetLimits sets it.
-	sh.up = newShareUplink(s, s.limits.shareCap())
+	// The cap of the ShareParams that StartShare returns, read under s.mu, where SetLimits sets it. The policy follows
+	// the kind of the publishing Conn (M2 01 §10.1).
+	sh.up = newShareUplink(s, sh, c.client, s.limits.shareCap())
 	s.shares[sh.id] = sh
 	c.room.shares[sh.id] = sh
 	c.part.shares[sh.id] = sh

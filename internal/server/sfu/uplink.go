@@ -20,8 +20,9 @@ import (
 // UplinkPolicy decides a share's uplink (02 §11): the cap on what its sharer sends, and which of its layers the
 // sharer sends at all. The SFU keeps one per share, and calls Tick on the publishing Conn's actor, never two at once:
 // once a second, and in between when something may have changed what the policy decides (the admin's cap, a viewer's
-// new request for high). M1 has one policy for every publisher (the admin's cap and layer
-// pausing, m1Uplink); M2's native publishers get an estimator of their uplink.
+// new request for high). M1 has one policy for every publisher (the admin's cap and layer pausing, m1Uplink); M2's
+// native publishers, the desktop and mobile clients, get an estimator of their uplink on top of it (nativeUplink,
+// M2 01 §10.1). Every other kind (web, and the tools, which signal maps to web) keeps m1Uplink.
 type UplinkPolicy interface {
 	Tick(s ShareUplinkStats) UplinkDecision
 }
@@ -34,24 +35,40 @@ type ShareUplinkStats struct {
 	// preview layer for its bandwidth keeps the full layer flowing, and its trial upgrades try a layer that is there.
 	HighRequests int
 	Layers       []LayerUplinkStats // the video layers attached now, sorted f, h, q; paused ones included
+	// gen is the ticker's second whose layer stats these are (SFU.uplinkGen). The policy is also asked between the
+	// ticker's seconds (askedForHigh, SetLimits), on the same layer stats; a policy that counts consecutive seconds
+	// (nativeUplink) counts a generation once.
+	gen uint64
 }
 
 // LayerUplinkStats are the numbers of one video layer of a share, as it arrives.
 type LayerUplinkStats struct {
 	RID     string
 	Bitrate int           // bps, 2 s moving average (LayerInfo.Bitrate)
-	LossPct float64       // loss over the last 2 s, in percent (LayerInfo.LossPct)
+	LossPct float64       // loss over the last 2 s, in percent (LayerInfo.LossPct), after repair
 	Jitter  time.Duration // interarrival jitter (RFC 3550 §6.4.1)
 	Viewers int           // video DownTracks that forward the layer now or wait for its keyframe
+	// RawLossPct is the share of sequence numbers that were missing when a later one arrived, over the last 2 s, in
+	// percent, before any retransmission (M2 01 §10.1): the Layer's RTP loop counts each gap at the new highest
+	// sequence number, and padding counts as received. LossPct hides the congestion that NACKs repair.
+	RawLossPct float64
+	// QueueDelay is the layer's queueing-delay trend (M2 01 §10.1, delayTrend): the minimum one-way delay of the
+	// last 500 ms above its slowly rising baseline; −1 when unknown.
+	QueueDelay time.Duration
 }
 
 // UplinkDecision is what an UplinkPolicy decided.
 type UplinkDecision struct {
 	MaxBitrate int             // bps; 0 = none
 	Active     map[string]bool // per rid; nil = no change
+	// Reason is HintReasonCongestion when MaxBitrate is the native estimator's estimate, which binds below the
+	// admin's cap (M2 01 §10.1); otherwise "", MaxBitrate is the admin's cap, and the M1 rule chooses the hint's
+	// reason (lookAtUplink).
+	Reason string
 }
 
-// The reasons of a QualityHintEvent (02 §11): the cap changed, or which layers the share's viewers need did.
+// The reasons of a QualityHintEvent (02 §11): the cap changed, or which layers the share's viewers need did. M2 adds
+// HintReasonCongestion (uplink_native.go).
 const (
 	HintReasonAdmin   = "admin"
 	HintReasonViewers = "viewers"
@@ -111,14 +128,28 @@ type shareUplink struct {
 	// slot bits of the layers it was told to pause (Share.paused is the copy for other goroutines).
 	capBps int
 	paused uint32
+	// adminBps is the admin's cap that the encodings the sharer was told last are under (M2 01 §10.1: the encodings
+	// carry the admin's cap, MaxBitrate the dynamic total). Under m1Uplink it is always capBps.
+	adminBps int
 	// reason is the reason of the last hint, "" before the first: Resync tells the sharer again what the hints told
-	// it.
+	// it. hintAt is when the last hint went out, on the uplink policies' clock: a congestion hint keeps
+	// nativeHintMinGap from it.
 	reason string
+	hintAt int64
 }
 
-// newShareUplink returns the uplink control of a new share whose ShareParams carry capBps.
-func newShareUplink(s *SFU, capBps int) shareUplink {
-	return shareUplink{policy: newM1Uplink(s, s.uplinkNow), capBps: capBps}
+// newShareUplink returns the uplink control of a new share sh whose ShareParams carry capBps, for the kind of its
+// publishing Conn: the native estimator for the desktop and mobile clients (M2 01 §10.1), M1's policy for every
+// other kind.
+func newShareUplink(s *SFU, sh *Share, client ClientKind, capBps int) shareUplink {
+	u := shareUplink{capBps: capBps, adminBps: capBps}
+	switch client {
+	case ClientDesktop, ClientMobile:
+		u.policy = newNativeUplink(s, sh, s.uplinkNow)
+	default:
+		u.policy = newM1Uplink(s, s.uplinkNow)
+	}
+	return u
 }
 
 // newM1Uplink returns the M1 policy of a share that starts now, on a clock.
@@ -127,18 +158,36 @@ func newM1Uplink(s *SFU, now func() int64) *m1Uplink {
 }
 
 // hint returns the QualityHintEvent that tells the sharer of share id where its uplink stands: the cap, and the
-// encodings of its preset in the shape StartShare returns them, under the cap and with the paused layers inactive.
+// encodings of its preset in the shape StartShare returns them, under the admin's cap and with the paused layers
+// inactive.
 func (u *shareUplink) hint(id ShareID, preset Preset) QualityHintEvent {
 	return QualityHintEvent{
-		Share: id, Reason: u.reason, MaxBitrate: u.capBps, Encodings: presetEncodings(preset, u.capBps, u.paused),
+		Share: id, Reason: u.reason, MaxBitrate: u.capBps, Encodings: presetEncodings(preset, u.adminBps, u.paused),
 	}
 }
 
+// congestionDue reports whether a cap that only the native estimator moved goes to the sharer now (M2 01 §10.1, the
+// plan's hysteresis): when it differs from the cap the sharer was told by nativeHintMinChange of that (or one of the
+// two is none), and nativeHintMinGap has passed since the share's last hint. A change that isn't due waits: the next
+// look compares the cap it decides with the told one again.
+func (u *shareUplink) congestionDue(capBps int, now int64) bool {
+	if u.reason != "" && now-u.hintAt < int64(nativeHintMinGap) {
+		return false
+	}
+	told := u.capBps
+	if (told == 0) != (capBps == 0) {
+		return true
+	}
+	// The threshold in whole bit/s, so that a change of exactly 15 % counts whatever the float rounding.
+	return math.Abs(float64(capBps-told)) >= math.Round(nativeHintMinChange*float64(told))
+}
+
 // uplinkStats returns what the share's uplink policy decides by. It reads the viewers' requests as their actors
-// published them (Subscription.requested), the layers' rates of the ticker's last second and their jitter (atomics),
-// and the share's layer set under Share.mu, a leaf.
+// published them (Subscription.requested), the layers' rates, raw loss and queueing delay of the ticker's last second
+// and their jitter (atomics), and the share's layer set under Share.mu, a leaf. The generation comes first: the ticker
+// adds one only after the layers' stats are in place, so stats read after it are at least that second's.
 func (s *Share) uplinkStats(client ClientKind) ShareUplinkStats {
-	st := ShareUplinkStats{Client: client}
+	st := ShareUplinkStats{Client: client, gen: s.conn.sfu.uplinkGen.Load()}
 	viewers := s.downTracks(webrtc.RTPCodecTypeVideo)
 	for _, dt := range viewers {
 		if dt.sub.requested() == QualityHigh {
@@ -154,6 +203,8 @@ func (s *Share) uplinkStats(client ClientKind) ShareUplinkStats {
 		ls := LayerUplinkStats{
 			RID: slot.String(), Bitrate: int(l.stats.bitrate.Load()),
 			LossPct: math.Float64frombits(l.stats.lossPct.Load()), Jitter: l.jitterNow(),
+			RawLossPct: math.Float64frombits(l.stats.rawLossPct.Load()),
+			QueueDelay: time.Duration(l.stats.queueDelay.Load()),
 		}
 		for _, dt := range viewers {
 			if dt.interest.Load()&(1<<slot) != 0 {
@@ -172,13 +223,14 @@ func (s *Share) uplinkStats(client ClientKind) ShareUplinkStats {
 // (Share.maxBitrate). So a request for high made while the viewer's allocator is limited is capped unless the full
 // layer's maximum fits, rather than served at a layer measured at 0 bps; the request still counts for the uplink
 // policy (ShareUplinkStats.HighRequests), so the layer resumes, and the next trial upgrade tests a layer that flows
-// (02 §11). It reads atomics only.
+// (02 §11). The sharer's own pause of the whole share (Share.sharerPaused, M2 01 §10.3) counts as a pause of every
+// video layer, and its end as their resume (setSharerPaused stores resumedAt). It reads atomics only.
 func (s *Share) allocRate(l *Layer) int64 {
 	rate := l.stats.bitrate.Load()
 	if l.slot >= SlotAudio {
 		return rate
 	}
-	if s.paused.Load()&(1<<l.slot) != 0 {
+	if s.paused.Load()&(1<<l.slot) != 0 || s.sharerPaused.Load() {
 		return max(rate, s.maxBitrate(l.slot))
 	}
 	if at := s.resumedAt[l.slot].Load(); at != 0 && s.conn.sfu.uplinkNow()-at < int64(rateWindow) {
@@ -236,11 +288,13 @@ func (c *Conn) ownShares() []*Share {
 
 // lookAtUplink asks the share's uplink policy (02 §11) and tells the sharer what changed: a QualityHintEvent when its
 // cap or its pause state did, with the reason viewers when the pause state did (that wins over a cap that changed
-// with it), else admin. Each hint carries both, whole. A layer that resumes gets a keyframe request once the hint is
-// out, for the viewers who wait for it: a sharer that sends the layer again starts it with a keyframe of its own
-// accord, and one that never stopped it (a client that applies no encodings) is asked here. The time of the resume
-// goes to Share.resumedAt, for the downlink allocators (allocRate). It runs on the actor; a share that has ended gets
-// nothing.
+// with it), admin when the admin's cap did, and congestion when only the native estimator moved the cap (M2 01
+// §10.1). Each hint carries both, whole: MaxBitrate the decision's cap, the encodings the admin's. Pause and admin
+// changes go out at once, as in M1; a congestion change only when it is due (shareUplink.congestionDue: 15 % and
+// 2 s). A layer that resumes gets a keyframe request once the hint is out, for the viewers who wait for it: a sharer
+// that sends the layer again starts it with a keyframe of its own accord, and one that never stopped it (a client
+// that applies no encodings) is asked here. The time of the resume goes to Share.resumedAt, for the downlink
+// allocators (allocRate). It runs on the actor; a share that has ended gets nothing.
 func (c *Conn) lookAtUplink(sh *Share) {
 	up := &sh.up
 	if sh.conn != c || up.policy == nil {
@@ -264,18 +318,31 @@ func (c *Conn) lookAtUplink(sh *Share) {
 		}
 	}
 	capBps := max(d.MaxBitrate, 0)
+	adminBps := capBps // without an estimate that binds, the decision's cap is the admin's
+	if d.Reason == HintReasonCongestion {
+		adminBps = c.sfu.currentLimits().shareCap()
+	}
 	pausing := paused != up.paused
-	if !pausing && capBps == up.capBps {
+	adminChanged := adminBps != up.adminBps
+	if !pausing && !adminChanged && capBps == up.capBps {
 		return
 	}
-	resumed := up.paused &^ paused
-	up.paused, up.capBps, up.reason = paused, capBps, HintReasonAdmin
-	if pausing {
-		up.reason = HintReasonViewers
+	now := c.sfu.uplinkNow()
+	reason := HintReasonAdmin
+	switch {
+	case pausing:
+		reason = HintReasonViewers
+	case !adminChanged: // only the estimate moved the cap
+		if !up.congestionDue(capBps, now) {
+			return
+		}
+		reason = HintReasonCongestion
 	}
+	resumed := up.paused &^ paused
+	up.paused, up.capBps, up.adminBps, up.reason, up.hintAt = paused, capBps, adminBps, reason, now
 	if resumed != 0 {
 		// Before the paused bits go, so the downlink allocator never sees a resumed layer as neither (allocRate).
-		at := max(c.sfu.uplinkNow(), 1)
+		at := max(now, 1)
 		for slot := range SlotAudio {
 			if resumed&(1<<slot) != 0 {
 				sh.resumedAt[slot].Store(at)
@@ -289,13 +356,13 @@ func (c *Conn) lookAtUplink(sh *Share) {
 	if resumed == 0 {
 		return
 	}
-	now := monoNow()
+	mono := monoNow()
 	for slot := range SlotAudio {
 		if resumed&(1<<slot) == 0 {
 			continue
 		}
 		if l := sh.layer(slot); l != nil {
-			l.requestKeyframe(now)
+			l.requestKeyframe(mono)
 		}
 	}
 }

@@ -31,7 +31,11 @@
 // apart by their addresses, or under a Go client through webrtc.NewICEUDPMux, which is how the recovery tests take a
 // client's network away. On the SFU's socket a Link in front of a client's address (FaultConn.SetLink) is the
 // bottleneck of that client's downlink, with a capacity the test scripts: the RTP beyond it is lost, everything else
-// passes and takes its share (integration 16, 02 §17).
+// passes and takes its share (integration 16, 02 §17). A Link behind a client's address (FaultConn.SetInboundLink) is
+// the bottleneck of its uplink (M2 01 §10.1): M1's policer (NewLink), or a queueing Link (NewQueueLink), a FIFO delay
+// line like a home router's uplink buffer, which delays every datagram to its departure at the capacity and loses
+// the RTP that would wait longer than its limit; Link.Queued tells its depth in time. From the first queueing Link on,
+// the FaultConn reads its socket on a goroutine of its own until Close.
 //
 // rembsim (a package of its own, without the SFU or Pion) is a small copy of Chrome's receive-side estimator, which
 // the SFU's allocator tests drive in fake time and a Viewer on a Link (ViewerOptions.REMB).

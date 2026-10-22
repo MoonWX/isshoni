@@ -59,8 +59,8 @@ type CodecPolicyEvent struct {
 // QualityHintEvent goes to the publishing Conn (02 §11).
 type QualityHintEvent struct {
 	Share      ShareID
-	Reason     string // "admin" | "viewers"
-	MaxBitrate int    // bps; 0 = no cap. M1: the admin cap. M2: the native uplink estimator
+	Reason     string // "admin" | "viewers" | "congestion" (M2: the native uplink estimator moved the cap)
+	MaxBitrate int    // bps; 0 = no cap. M1: the admin cap. M2: the smaller of it and the native uplink estimate
 	// Encodings is the full current list, in the shape StartShare returns, with the admin cap and the pause state
 	// applied.
 	Encodings []EncodingParams
