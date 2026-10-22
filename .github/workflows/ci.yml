@@ -103,12 +103,11 @@ jobs:
               - 'go.mod'
               - 'go.sum'
               - 'tools/**'
-              - 'internal/protocol/testdata/**'
-              - 'internal/protocol/relay/testdata/**'
-              - 'internal/server/tlsmgr/testdata/**'
-              # Non-Go inputs of Go tests elsewhere: the deep-link cases, the ABI layouts that
-              # internal/media/native's layout_test compares, and the test tone's golden Markers.
-              - 'internal/client/deeplink/testdata/**'
+              # Every Go package's testdata (goldens, vectors, fuzz corpora), and the non-Go
+              # inputs of Go tests elsewhere: the ABI layouts that internal/media/native's
+              # layout_test compares, and the test tone's golden Markers.
+              - 'internal/**/testdata/**'
+              - 'cmd/**/testdata/**'
               - 'native/common/tests/testdata/abi_layout.json'
               - 'native/common/audio/tests/testdata/**'
               - '.golangci.yml'
@@ -146,6 +145,9 @@ jobs:
             # section lint:keys checks, README F11), runs it as deploy changes do.
             repocheck:
               - 'tools/repocheck/**'
+              # The update signers block that lint:keys compares with deploy/keys/update_signers
+              # (M2 06 §8.3).
+              - 'internal/update/signers.go'
             # Doctor's checks and their codes, which docker-smoke's doctor step pins one by one
             # (deploy/docker/test/docker-smoke.sh, README F21): a change to them runs that job.
             doctor:

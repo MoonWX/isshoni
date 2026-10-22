@@ -905,7 +905,7 @@ func (e *Engine) Sources(ctx context.Context) ([]media.Source, error) {
 	for _, m := range d.Monitors {
 		out = append(out, media.Source{ID: m.ID, Kind: media.SourceScreen, Name: m.Name, Width: m.Width,
 			Height: m.Height, MonitorID: m.ID})
-		e.details[m.ID] = SourceDetail{MonitorID: m.ID}
+		e.details[m.ID] = SourceDetail{} // a listed monitor has nothing beyond its media.Source
 	}
 	return out, nil
 }
@@ -998,11 +998,8 @@ func decodeSource(info *imSourceInfo) (media.Source, SourceDetail) {
 		src.Exe = exeOfPID(info.pid)
 	}
 	d := SourceDetail{
-		MonitorID:   src.MonitorID,
-		CapturePath: capture,
-		OSBorder:    src.OSBorder,
-		Mapped:      info.flags&imSrcfMapped != 0,
-		Window:      uintptr(info.window),
+		Mapped: info.flags&imSrcfMapped != 0,
+		Window: uintptr(info.window),
 	}
 	return src, d
 }
@@ -1046,7 +1043,7 @@ func (e *Engine) forgetDetail(id string) {
 }
 
 // SourceDetail returns the im_source_info fields media.Source lacks for a source this engine listed (Sources) or
-// picked (Pick, until its release); ok is false for any other id. 03 places the pill on MonitorID.
+// picked (Pick, until its release); ok is false for any other id. 03 places the pill on media.Source.MonitorID.
 func (e *Engine) SourceDetail(id string) (SourceDetail, bool) {
 	e.smu.Lock()
 	defer e.smu.Unlock()

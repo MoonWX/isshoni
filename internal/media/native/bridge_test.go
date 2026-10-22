@@ -1239,7 +1239,7 @@ func TestSources(t *testing.T) {
 	if !slices.Equal(got, want) {
 		t.Errorf("Sources %+v", got)
 	}
-	if d, ok := e.SourceDetail(`mon:\\.\DISPLAY1`); !ok || d.MonitorID != `mon:\\.\DISPLAY1` {
+	if d, ok := e.SourceDetail(`mon:\\.\DISPLAY1`); !ok || d != (SourceDetail{}) {
 		t.Errorf("SourceDetail %+v %v", d, ok)
 	}
 	if _, ok := e.SourceDetail("mon:other"); ok {
@@ -1275,8 +1275,7 @@ func TestPick(t *testing.T) {
 	if len(params) != 1 {
 		t.Fatalf("im_pick_source calls %d", len(params))
 	}
-	if d, ok := e.SourceDetail("pick:3"); !ok || d != (SourceDetail{CapturePath: "wgc", OSBorder: true,
-		Window: 0x1234}) {
+	if d, ok := e.SourceDetail("pick:3"); !ok || d != (SourceDetail{Window: 0x1234}) {
 		t.Errorf("SourceDetail %+v %v", d, ok)
 	}
 	e.Release("pick:3")
@@ -1305,7 +1304,7 @@ func TestPick(t *testing.T) {
 		src.Capture != "dd" || src.MonitorID != `mon:\\.\DISPLAY2` || src.Exe != "" {
 		t.Errorf("monitor pick %+v, %v", src, err)
 	}
-	if d, _ := e.SourceDetail("pick:5"); !d.Mapped || d.CapturePath != "dd" {
+	if d, _ := e.SourceDetail("pick:5"); d != (SourceDetail{Mapped: true, Window: 0x1234}) {
 		t.Errorf("SourceDetail %+v", d)
 	}
 

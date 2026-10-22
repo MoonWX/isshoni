@@ -69,8 +69,9 @@ func (p *peer) CreateShare(shareID string, meta protocol.ShareStart) (protocol.S
 	return p.shareParams(shareID, sp), nil
 }
 
-// UpdateShare implements signal.MediaPeer with Conn.UpdateShare. Only a preset reaches the SFU: a label is the
-// hub's, and an update without a preset returns the share's current ShareParams.
+// UpdateShare implements signal.MediaPeer with Conn.UpdateShare. A preset and the sharer's pause (M2 01 §10.3; the
+// hub passes Paused only from a connection with the share.pause feature) reach the SFU: a label is the hub's, and an
+// update with neither returns the share's current ShareParams.
 func (p *peer) UpdateShare(shareID string, meta protocol.ShareUpdate) (protocol.ShareParams, error) {
 	at := requestSite("UpdateShare")
 	var u sfu.ShareUpdate
@@ -80,6 +81,10 @@ func (p *peer) UpdateShare(shareID string, meta protocol.ShareUpdate) (protocol.
 			return protocol.ShareParams{}, at.badRequest("preset")
 		}
 		u.Preset = &preset
+	}
+	if meta.Paused != nil {
+		paused := *meta.Paused
+		u.Paused = &paused
 	}
 	ctx, cancel := callContext()
 	defer cancel()

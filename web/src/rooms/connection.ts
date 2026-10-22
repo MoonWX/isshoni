@@ -282,9 +282,11 @@ export function createConnection(platform: Platform, stores: Stores, opts: Conne
     return true;
   };
 
-  const { url } = platform.signaling(); // auth: later (M2), a bearer in hello.auth (01 D2)
+  // auth: the desktop's bearer provider for hello.auth (M2: docs/m2/03 §7.3, 01 D2); the browser gives none.
+  const { url, auth } = platform.signaling();
   const client = new SignalClient({
     url,
+    auth,
     client: platform.client, // 01 ClientInfo {kind: 'web', version, os, browser}
     role: platform.role, // 'full' if the platform can share, else 'viewer' (01 §6.3)
     caps: () => platform.capsNow(), // 01 detectCaps(), re-read on every (re)connect

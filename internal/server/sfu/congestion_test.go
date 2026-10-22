@@ -172,7 +172,13 @@ func TestNativeUplinkPolicer(t *testing.T) {
 
 // queueWireMax is the most the queue test's publisher may send into the link, in bit/s of datagrams: about 4 Mbit/s
 // into 3 grows the queue by a third of a second per second, so the 1 s buffer overflows about 3 s after the start.
-const queueWireMax = 4_050_000
+// The rate is measured over queueWireWindow, or up to the hint when it comes sooner (but at least 1 s): one 30 fps
+// frame of the 3.5 Mbit/s layer is about 117 kbit, so over a single second the rate moves by up to a frame's worth
+// with where the window ends, which crossed the bound in some runs.
+const (
+	queueWireMax    = 4_050_000
+	queueWireWindow = 2 * time.Second
+)
 
 // TestNativeUplinkQueue: the same publisher sending about 4 Mbit/s on the wire behind a queueing link of 3 Mbit/s with
 // a 1 s buffer, like a home router's (01 §14 C09, the SFU half of D19): the queueing delay backs the estimate off
@@ -205,15 +211,16 @@ func nativeQueueCase(t *testing.T, phase time.Duration) {
 		lost    int64
 		queued  time.Duration
 		deepest time.Duration
-		wire    = -1 // bit/s into the link over its first second
+		wire    = -1 // bit/s into the link over its first queueWireWindow
+		window  time.Duration
 	)
 	lastDelay := time.Duration(-2)
 	for deadline := limited.Add(8 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
 		queued = link.Queued()
 		deepest = max(deepest, queued)
-		if since := time.Since(limited); wire < 0 && since >= time.Second {
+		if since := time.Since(limited); wire < 0 && since >= queueWireWindow {
 			sent, _, _ := link.Counts()
-			wire = int(float64(sent) * 8 / since.Seconds())
+			wire, window = int(float64(sent)*8/since.Seconds()), since
 			t.Logf("%v after the start: %d bit/s into the link", since.Round(time.Millisecond), wire)
 		}
 		if st, ok := h.SFU.UplinkStats(share); ok && st.Layers[0].QueueDelay != lastDelay {
@@ -229,12 +236,17 @@ func nativeQueueCase(t *testing.T, phase time.Duration) {
 			break
 		}
 	}
-	_, _, lostAtHint := link.Counts()
+	sentAtHint, _, lostAtHint := link.Counts()
 	took := time.Since(limited)
+	if wire < 0 && took >= time.Second {
+		wire, window = int(float64(sentAtHint)*8/took.Seconds()), took
+		t.Logf("%v after the start: %d bit/s into the link", took.Round(time.Millisecond), wire)
+	}
 	t.Logf("arriving at %d bit/s, behind a 3 Mbit/s queue of 1 s from %v after a tick: hint %v after %v with %v "+
 		"queued (%d datagrams lost)", before, phase, got, took, queued, lostAtHint)
 	if wire > queueWireMax {
-		t.Errorf("%d bit/s went into the link in its first second, want at most %d", wire, queueWireMax)
+		t.Errorf("%d bit/s went into the link over its first %v, want at most %d", wire, window.Round(time.Millisecond),
+			queueWireMax)
 	}
 	switch {
 	case !got && lost > 0:

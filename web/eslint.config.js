@@ -9,6 +9,30 @@ import reactHooks from 'eslint-plugin-react-hooks';
 import globals from 'globals';
 import tseslint from 'typescript-eslint';
 
+// Markup that must never appear (no-restricted-syntax entries).
+const noRawMarkup = [
+  { selector: "JSXAttribute[name.name='dangerouslySetInnerHTML']", message: 'No raw HTML (CSP + XSS).' },
+  // No markup may trigger a desktop runtime call by itself (docs/m2/03 §5.6).
+  {
+    selector: 'JSXAttribute[name.name=/^(data-)?wml-/]',
+    message: 'No Wails WML attributes (docs/m2/03 §5.6).',
+  },
+];
+
+// The SPA never navigates away (docs/m2/03 §5.5): outside platform/, nothing calls window.open, location.assign or
+// location.replace, or sets location or location.href. no-restricted-properties can't match window.location.assign
+// or an assignment, hence selectors.
+const navigationMessage = 'Navigation and new windows go through the Platform (docs/m2/03 §5.5).';
+const noNavigation = [
+  "MemberExpression[property.name='open'][object.name=/^(window|globalThis|self)$/]",
+  "MemberExpression[property.name=/^(assign|replace)$/][object.name='location']",
+  "MemberExpression[property.name=/^(assign|replace)$/][object.property.name='location']",
+  "AssignmentExpression > MemberExpression.left[property.name='href'][object.name='location']",
+  "AssignmentExpression > MemberExpression.left[property.name='href'][object.property.name='location']",
+  "AssignmentExpression > Identifier.left[name='location']",
+  "AssignmentExpression > MemberExpression.left[property.name='location']",
+].map((selector) => ({ selector, message: navigationMessage }));
+
 export default defineConfig(
   // First entry: generated and build-output files are never linted.
   globalIgnores(['dist/', 'src/protocol/*.gen.ts', 'playwright-report/', 'test-results/']),
@@ -43,18 +67,16 @@ export default defineConfig(
           'jsx-attributes': { include: ['aria-label', 'aria-description', 'title', 'alt', 'placeholder', 'label'] },
         },
       ],
-      'no-restricted-syntax': [
-        'error',
-        { selector: "JSXAttribute[name.name='dangerouslySetInnerHTML']", message: 'No raw HTML (CSP + XSS).' },
-        // No markup may trigger a desktop runtime call by itself (docs/m2/03 §5.6).
-        {
-          selector: 'JSXAttribute[name.name=/^(data-)?wml-/]',
-          message: 'No Wails WML attributes (docs/m2/03 §5.6).',
-        },
-      ],
+      'no-restricted-syntax': ['error', ...noRawMarkup],
       // Use platform.storage (a try/catch wrapper that falls back to memory).
       'no-restricted-globals': ['error', 'localStorage', 'sessionStorage'],
     },
+  },
+  // The app outside platform/: no navigation either (docs/m2/03 §5.5; the platform files are exempt).
+  {
+    files: ['src/**/*.{ts,tsx}'],
+    ignores: ['src/platform/**'],
+    rules: { 'no-restricted-syntax': ['error', ...noRawMarkup, ...noNavigation] },
   },
   // No UI strings: tests and the shared test support (src/test/, src/**/testing/: the Vitest setup file, fakes, MSW
   // handlers), tooling and the service worker.

@@ -446,8 +446,10 @@ tasks:
 
   lint:keys:
     desc: >-
-      Check that the key block embedded in deploy/install.sh equals deploy/keys/allowed_signers, and that README.md's
-      "Release signing keys" section lists the fingerprint of each key in it and no other one
+      Check that the key block embedded in deploy/install.sh equals deploy/keys/allowed_signers and uses only options
+      that OpenSSH 8.1 parses, that the update signers block in internal/update/signers.go equals
+      deploy/keys/update_signers (docs/m2/06 §8.3), and that README.md's "Release signing keys" section lists the
+      fingerprint of each key in them and no other one
     cmds:
       - go -C tools run ./repocheck -root .. keys
 
@@ -1451,8 +1453,9 @@ tasks:
           [ -z "$(tail -c 1 "$keys")" ] || die "$keys must end with a newline"
           tmp=$(mktemp -d)
           trap 'rm -rf "$tmp"' EXIT
-          # Each line: the principal install.sh asks for, the namespace it verifies, an ed25519 key (06 §4.3, §9.4).
-          # Rotation adds options (valid-before="YYYYMMDD") to the namespaces field; comments and blank lines pass.
+          # Each line: the principal install.sh asks for, the namespace it verifies, an ed25519 key (06 §4.3, §9.4);
+          # comments and blank lines pass. Rotation adds the new key's line and later deletes the old one: lint:keys
+          # refuses options such as valid-before, which Windows 10's OpenSSH 8.1 does not parse (docs/m2/06 §7.2).
           n=0
           while IFS= read -r line || [ -n "$line" ]; do
             n=$((n + 1))

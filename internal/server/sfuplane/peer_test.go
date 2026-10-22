@@ -150,16 +150,20 @@ func TestCalls(t *testing.T) {
 			},
 		},
 		{
-			"UpdateShare: only a preset reaches the SFU; a label change asks for the current params",
+			"UpdateShare: only a preset and the pause reach the SFU; a label change asks for the current params",
 			func(p signal.MediaPeer) {
 				_, _ = p.UpdateShare("s_1", protocol.ShareUpdate{ShareID: "s_1", Preset: protocol.PresetText})
 				_, _ = p.UpdateShare("s_1", protocol.ShareUpdate{ShareID: "s_1", Label: ptr("new label")})
 				_, _ = p.UpdateShare("s_1", protocol.ShareUpdate{ShareID: "s_1", Label: ptr(""), Preset: protocol.PresetMovie})
+				_, _ = p.UpdateShare("s_1", protocol.ShareUpdate{ShareID: "s_1", Paused: ptr(true)})
+				_, _ = p.UpdateShare("s_1", protocol.ShareUpdate{ShareID: "s_1", Paused: ptr(false), Preset: protocol.PresetGame})
 			},
 			[]call{
 				{"UpdateShare", []any{sfu.ShareID("s_1"), sfu.ShareUpdate{Preset: ptr(sfu.PresetText)}}},
 				{"UpdateShare", []any{sfu.ShareID("s_1"), sfu.ShareUpdate{}}},
 				{"UpdateShare", []any{sfu.ShareID("s_1"), sfu.ShareUpdate{Preset: ptr(sfu.PresetMovie)}}},
+				{"UpdateShare", []any{sfu.ShareID("s_1"), sfu.ShareUpdate{Paused: ptr(true)}}},
+				{"UpdateShare", []any{sfu.ShareID("s_1"), sfu.ShareUpdate{Preset: ptr(sfu.PresetGame), Paused: ptr(false)}}},
 			},
 		},
 		{
