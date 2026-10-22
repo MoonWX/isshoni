@@ -199,8 +199,10 @@ The M1 stubs of 03 §6 get their bodies; two signatures change (marked); the res
 package store
 
 // ---- device codes ----
-// CreateDeviceCode inserts a pending code. *ConflictError{"user_code_hash"} on a user-code collision (the caller
-// draws a new code, §3); the device-code hash is a primary key and never collides in practice.
+// CreateDeviceCode inserts a pending code. DeviceCodeHash, UserCodeHash and ExpiresAt are required; a zero Interval
+// is 5 s, an empty Status "pending". *ConflictError{"user_code_hash"} on a user-code collision (the caller draws a new
+// code, §3); the device-code hash is a primary key and never collides in practice: a collision there is a plain error,
+// never a ConflictError, so it can't make the caller redraw the user code forever.
 func (q *Q) CreateDeviceCode(dc DeviceCode) error
 func (q *Q) DeviceCodeByHash(h []byte) (DeviceCode, error)     // by device_code_hash, any status; ErrNotFound
 func (q *Q) DeviceCodeByUserCode(h []byte) (DeviceCode, error) // by user_code_hash, any status; ErrNotFound
@@ -208,18 +210,23 @@ func (q *Q) DeviceCodeByUserCode(h []byte) (DeviceCode, error) // by user_code_h
 func (q *Q) CountPendingDeviceCodes(now time.Time) (int, error)
 // DecideDeviceCode (CHANGED: takes name): UPDATE … SET status = ?, user_id = ?, decided_at = now,
 // device_name = COALESCE(NULLIF(name, ''), device_name) WHERE user_code_hash = ? AND status = 'pending'
-// AND expires_at > now. 0 rows → ErrNotFound.
+// AND expires_at > now. 0 rows → ErrNotFound. A status other than "approved" or "denied", or an empty approver, is an
+// error.
 func (q *Q) DecideDeviceCode(h []byte, status string, u UserID, name string, now time.Time) error
-// PollDeviceCode sets last_poll_at = now and interval_s = interval (whole seconds).
+// PollDeviceCode sets last_poll_at = now and interval_s = interval (whole seconds, at least 1 s; shorter is an error).
+// Any status; ErrNotFound for an unknown hash.
 func (q *Q) PollDeviceCode(h []byte, now time.Time, interval time.Duration) error
-// ConsumeDeviceCode: status 'approved' → 'consumed'. 0 rows → ErrNotFound.
+// ConsumeDeviceCode: status 'approved' → 'consumed' WHERE expires_at > now, also setting last_poll_at = now (the poll
+// that collects the approval). 0 rows (unknown, pending, denied, consumed, expired) → ErrNotFound, so a code yields
+// one token pair at most.
 func (q *Q) ConsumeDeviceCode(h []byte, now time.Time) error
 
 // ---- devices ----
 func (q *Q) CreateDevice(d *Device) error                     // sets d.ID (NewID)
 func (q *Q) DeviceByID(id DeviceID) (Device, User, error)     // with its user; ErrNotFound
 func (q *Q) RenameDevice(u UserID, id DeviceID, name string) (Device, error) // ErrNotFound if not u's
-// TrimDevices deletes the user's least recently seen devices beyond keep and returns them (for audit names).
+// TrimDevices keeps the user's keep most recently seen devices (ties: the newest created stays) and deletes the rest
+// with their tokens and push subscriptions; it returns the deleted ones, least recently seen first (for audit names).
 func (q *Q) TrimDevices(u UserID, keep int) ([]Device, error)
 func (q *Q) TouchDevice(id DeviceID, ip, appVersion string, now time.Time) error // appVersion "" = keep
 // ListDevices, DeleteDevice, DeleteDevices, DeleteDeviceCodesOf, DeleteAllDeviceCodes: as built in M1.
@@ -230,9 +237,12 @@ func (q *Q) InsertDeviceToken(t DeviceToken) error
 // device's user. ErrNotFound otherwise. The caller checks the user's status.
 func (q *Q) DeviceTokenByHash(h []byte, kind string, now time.Time) (DeviceToken, Device, User, error)
 // SpendRefreshToken (CHANGED: takes exchangeHash): UPDATE … SET spent_at = now, replaced_by = ?, exchange_hash = ?
-// WHERE token_hash = ? AND kind = 'refresh' AND spent_at IS NULL. 0 rows → ErrConflict (spent in parallel).
+// WHERE token_hash = ? AND kind = 'refresh' AND spent_at IS NULL. 0 rows → an error wrapping ErrConflict (spent in
+// parallel, or gone: "the refresh token is spent or gone").
 func (q *Q) SpendRefreshToken(h, replacedBy, exchangeHash []byte, now time.Time) error
-func (q *Q) SetReplacedBy(h, replacedBy []byte) error                // the grace path's new child (§6.2)
+// SetReplacedBy points a spent refresh token at the grace path's new child (§6.2); ErrNotFound when no spent refresh
+// token has this hash (an unspent one is never changed).
+func (q *Q) SetReplacedBy(h, replacedBy []byte) error
 // SupersedeRefreshToken marks the child a grace path replaces as spent instead of deleting it (§6.2), so whoever
 // presents it later is caught as reuse: UPDATE … SET spent_at = now, replaced_by = ?, exchange_hash = NULL
 // WHERE token_hash = ? AND kind = 'refresh' AND spent_at IS NULL. 0 rows → ErrConflict (spent in parallel).
@@ -241,11 +251,17 @@ func (q *Q) SupersedeRefreshToken(h, replacedBy []byte, now time.Time) error
 // DeleteAccessTokensIssuedBy deletes the access tokens one exchange issued (kind = 'access' AND issued_by = h);
 // refresh tokens are never deleted by it.
 func (q *Q) DeleteAccessTokensIssuedBy(h []byte) (int, error)
-func (q *Q) TrimAccessTokens(id DeviceID, keep int) (int, error)     // newest `keep` live access tokens stay
+// TrimAccessTokens keeps the device's keep newest access tokens (by created_at, then expires_at) and deletes the rest;
+// it takes no now, so it counts existing rows, expired ones included (the janitor prunes those). Refresh tokens are
+// never deleted by it.
+func (q *Q) TrimAccessTokens(id DeviceID, keep int) (int, error)
 ```
 
 `Prune` (03 §4.7) gains the devices rule of §6.7 and `PruneStats.Devices`. `Stats.Devices` and `UserRow.Devices`/
-`LastSeenAt` (03 §6) already count devices.
+`LastSeenAt` (03 §6) already count devices. The store's dashboard security-event filter (`securityActions`, the Sec
+column of 03 §10 and §8) gains `device.linked` next to M1's `device.refresh_reused`: no later M2 slice changes the
+store, so WA19 added it for WA47's checks. `ErrConflict` now also stands for "spent in parallel", so its text is
+`store: conflict`. M1's not-implemented stubs and their helper are gone.
 
 ---
 
@@ -672,10 +688,12 @@ DELETE FROM devices
    AND NOT EXISTS (SELECT 1 FROM device_tokens t
                     WHERE t.device_id = devices.id AND t.kind = 'refresh'
                       AND t.spent_at IS NULL AND t.expires_at > :now)
-RETURNING id, user_id, name
+RETURNING id, name
 ```
 
-  with one `device.expired` audit row (actor `system`) per device, in the same transaction, and `PruneStats.Devices`.
+  with one `device.expired` audit row (actor `system`, target the device) per device, in device ID order, in the same
+  transaction, and `PruneStats.Devices`. `user_id` isn't returned: the row targets the device and the janitor notifies
+  nobody.
   The hour keeps the rule clear of a device being created (its first pair is inserted in the same `Write` anyway). As
   in M1 the janitor pushes nothing: the hub's `Revalidate` closes a connection whose device went (§6.5).
 - Token rows: access tokens are trimmed to the newest 5 per device at every insert and pruned at expiry; spent refresh
@@ -970,7 +988,9 @@ Golden JSON for each type goes in `internal/protocol/api/testdata/`; `task gen` 
 | `auth.login_failed` (M1) | anonymous | user (only if it exists) | as M1, also for a failed `/device/password` | the client's | as M1 |
 
 `TestAuditActionsInSource` and `TestAuditCoverage` (03 §10, README S70) gain these rows: every action above is produced
-by a real request (or the janitor) and found in `GET /api/v1/admin/audit` with its kinds and IP.
+by a real request (or the janitor) and found in `GET /api/v1/admin/audit` with its kinds and IP. `device.expired`'s
+row came with the store (group 2's integration fix, since the store names the action from WA19 on): a "later" row
+targeting `device`, with no actors listed, until WA47's `TestAuditCoverage` produces it.
 
 **Admin alert**: `refresh_token_reused` (03 §7.11), after the commit, to every admin with `adminAlerts` on.
 
@@ -1344,18 +1364,22 @@ var (
 ```go
 package credstore
 
+// Credential's RefreshToken and UserName never show in fmt output (String, GoString and Format for every verb print
+// "[redacted]") or in encoding/json (MarshalJSON redacts both, so a Credential serialized by accident carries no
+// secret); its slog LogValue has device_id and saved_at, the token redacted and the user name left out (usernames are
+// never logged, M1 §4). The stores use their own encoding.
 type Credential struct {
-	RefreshToken string    // redacted in fmt/slog
-	DeviceID     string
-	UserName     string    // display only (Credential Manager's "User name" column)
-	SavedAt      time.Time
+	RefreshToken string    // redacted
+	DeviceID     string    // the server's device id (api.DeviceRef.ID)
+	UserName     string    // display only (Credential Manager's "User name" column); redacted
+	SavedAt      time.Time // stored in UTC to the millisecond
 }
 
 type Store interface {
 	Get(origin string) (Credential, error) // ErrNotFound
 	Put(origin string, c Credential) error
 	Delete(origin string) error            // nil when it doesn't exist
-	List() ([]string, error)               // origins with a credential
+	List() ([]string, error)               // origins with a credential, sorted
 }
 
 var (
@@ -1364,13 +1388,25 @@ var (
 )
 
 type Options struct {
-	Prefix string // target prefix; default "isshoni:v1:"; tests use "isshoni-test:<random>:"
-	Dir    string // file store only (non-Windows, M2): os.UserConfigDir()/isshoni-dev
+	Prefix string       // target prefix; default "isshoni:v1:"; tests use "isshoni-test:<random>:"; no "*" or NUL
+	Dir    string       // file store only (non-Windows, M2): os.UserConfigDir()/isshoni-dev
+	Logger *slog.Logger // the store's WARNs (an unreadable credential, the plaintext file store), with
+	                    // component=credstore; nil = slog.Default()
 }
 
 func Open(o Options) (Store, error) // Windows: Credential Manager; elsewhere in M2: the file store
 func NewMemory() Store              // tests
 ```
+
+**Every store applies the same rules** (README WA21): `Put` refuses an empty or NUL-carrying origin, an empty refresh
+token, a NUL in the user name, a user name over 512 UTF-16 units (`CRED_MAX_USERNAME_LENGTH` is 513, one unit kept
+free in case the terminator counts), a target name (prefix + origin) over 32,766 units, a `SavedAt` outside the years
+0 to 9999, and a credential whose Credential Manager blob would exceed 2,560 bytes; `Get` and `Delete` refuse an
+invalid origin too. These errors wrap unexported sentinels (no new exported names). A stored credential that can't
+be read back is `ErrNotFound` with a WARN, and `List` still names its origin so `Delete` (and the uninstaller's
+`ForgetAll`) can remove it. One difference remains: Credential Manager compares target names without regard to case,
+the memory and file stores exactly; callers pass origins normalized by `deeplink.NormalizeOrigin` (lower-case host),
+so it never shows. Store methods take no context: each is a local call that never waits on the network.
 
 **Windows** (`wincred_windows.go`, ~150 lines over `windows.NewLazySystemDLL("advapi32.dll")`):
 - `CredWriteW` with a `CREDENTIALW` of `Type = CRED_TYPE_GENERIC` (1), `Persist = CRED_PERSIST_LOCAL_MACHINE` (2),
@@ -1388,9 +1424,14 @@ func NewMemory() Store              // tests
   (DPAPI binds it to the user's logon), as it can read browser cookies; `LOCAL_MACHINE` keeps it off other PCs a
   roaming profile reaches.
 
-**Other OSes in M2** (`file_other.go`): `credentials.json` in `Options.Dir`, mode 0600, the same JSON per origin,
-written atomically (temp file and rename). It exists for development and CI builds of the desktop app on macOS and
-Linux; the app logs one WARN at start ("plaintext credential store, development only"). *Later (M3)*: macOS Keychain
+**Other OSes in M2** (`file_other.go`): `credentials.json` in `Options.Dir` (created 0700), mode 0600, written
+atomically (temp file in the same folder, synced, renamed): `{"version":1,"credentials":{"<prefix + origin>":
+{<the Windows blob's fields> + "userName"}}}`, keyed like Credential Manager's target names so stores with different
+prefixes share a folder without seeing each other. Every operation reads the file again. A corrupt file is renamed
+to `credentials.json.bad` on the next `Put` (as `servers.json` does); `Get`, `List` and `Delete` leave it alone and log
+a WARN. It exists for development and CI builds of the desktop app on macOS and Linux. The file store's `Open` logs
+the one WARN at start itself ("plaintext credential store, development only", without the folder, whose path holds
+the OS account name), so 03's `main` logs none of its own. *Later (M3)*: macOS Keychain
 (cgo, `SecItemAdd`/`SecItemCopyMatching`, `kSecClassGenericPassword`, service `io.isshoni.desktop`, account = origin,
 `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`), replacing the file store on darwin. *Later (M4)*: the Linux agent
 uses the Secret Service over D-Bus (godbus, already planned for the portal) with this file store as the headless
@@ -1566,14 +1607,46 @@ type Link struct {
 	RoomID      string // "" = the server's default room
 }
 
-var ErrUnsupported = errors.New("deeplink: unsupported link")
+var (
+	ErrUnsupported   = errors.New("deeplink: unsupported link")        // well formed, a path this version doesn't know
+	ErrInvalid       = errors.New("deeplink: invalid link")            // not a link (scheme, "//", userinfo, host, port, chars)
+	ErrInvalidOrigin = errors.New("deeplink: invalid server address")  // NormalizeOrigin's; 03 maps it to invalid_address
+)
+
+const (
+	Scheme       = "isshoni" // as Build writes it; Parse accepts any case
+	MaxBytes     = 2048      // a link and an address NormalizeOrigin reads
+	MaxRoomIDLen = 64        // the room-id rule; a test checks it equals protocol.MaxOpaqueIDLen
+)
 
 func Parse(raw string) (Link, error)
 func Build(origin, roomID string) string
+func ValidRoomID(id string) bool // the room-id rule (03 §13.2's PendingRoom uses it)
 // NormalizeOrigin turns what a user typed or a link named into "https://host[:port]": the host as for links, no path
 // other than "/", no query, fragment or userinfo; http only for a loopback host when allowInsecureLoopback.
 func NormalizeOrigin(raw string, allowInsecureLoopback bool) (string, error)
 ```
+
+Errors wrap the sentinels and name the rule that failed, never any part of the input, so a caller may log them; the
+package imports only the standard library and `golang.org/x/net/idna`. Rules the code fixes where this section was
+silent (README WA20):
+- `isshoni://host` with no path is the default room, like `isshoni://host/`.
+- The no-spaces, no-control-characters and UTF-8 rules apply to the whole raw link, query included, as a property
+  of the string; the query's content is never interpreted. Bidi controls count as control characters and Unicode
+  separators as spaces.
+- Hosts: not percent-decoded (`%` fails the STD3 rules); a name whose last label is numeric or hex (`127.1`,
+  `a.0x7f`, a fullwidth `１２７.０.０.１`) is refused, since browsers and resolvers read it as IPv4; the unspecified
+  addresses (`0.0.0.0`, `::`) and multicast literals are refused (macOS and Linux connect `0.0.0.0` to loopback, so
+  "Add server 0.0.0.0?" would point at a local service; this package is reused by M3 and the mobile apps); an
+  IPv4-mapped literal is judged as the IPv4 address. A port with leading zeros and a trailing dot are refused, not
+  normalized.
+- `Build` gives the plain server link for an invalid room id, and `""` for an origin that isn't https or has a path,
+  query or userinfo. `NormalizeOrigin` trims surrounding white space, treats an address without a scheme as https,
+  accepts an unbracketed IPv6 literal only without a scheme (and then without a port), and drops the scheme's default
+  port (443, or 80 for loopback http). The loopback hosts are exactly `localhost`, `127.0.0.1` and `[::1]`.
+- `FuzzParse` and `FuzzNormalizeOrigin` skip inputs over 640 bytes: minimizing a new input from a 2 KiB seed takes the
+  whole `-fuzzminimizetime` and stops all other progress, so `links.json`'s padded cases go into the corpus unpadded;
+  the 2048-byte limit itself is covered by `TestLength` and `links.json`.
 
 `testdata/links.json` holds the cases both Go and TypeScript tests use (`appLinkFor` builds the valid ones), among
 them: `isshoni://watch.example.com/r/lounge` (ok), `ISSHONI://Watch.Example.com:443/r/lounge/` (ok, normalized),
@@ -1634,13 +1707,22 @@ const (
 	UpdateServer Verdict = "update_server"
 )
 
-type Reason string // "" (ok), "protocol_too_new", "protocol_too_old", "no_device_flow", "min_client_version"
+type Reason string
 
+const ( // README WA20 named them
+	ReasonNone             Reason = ""
+	ReasonProtocolTooNew   Reason = "protocol_too_new"
+	ReasonProtocolTooOld   Reason = "protocol_too_old"
+	ReasonNoDeviceFlow     Reason = "no_device_flow"
+	ReasonMinClientVersion Reason = "min_client_version"
+)
+
+// The JSON names are AuthState.compat's (§11.7) and the desktop bridge's incompatible_server params (03 §6.4).
 type Check struct {
-	Verdict          Verdict
-	Reason           Reason
-	ServerVersion    string
-	MinClientVersion string
+	Verdict          Verdict `json:"verdict"`
+	Reason           Reason  `json:"reason"`
+	ServerVersion    string  `json:"serverVersion"`    // "" when unknown
+	MinClientVersion string  `json:"minClientVersion"` // "" when none or unknown
 }
 
 type App struct {
@@ -1698,7 +1780,7 @@ func (a SemVer) Compare(b SemVer) int          // -1, 0, +1 by precedence (what 
 
 The hub calls `version.Below`; its M1 `semver.go` and `versionBelow` are gone, and the hub's SemVer table test moved
 with the code (`TestBelow` in `internal/version/semver_test.go`, unchanged rows plus new ones). M1's
-`docs/m1/01-protocol.md` §15.2 still lists `semver.go` among the hub's files: that line describes M1 as built.
+`docs/m1/01-protocol.md` §15.2 now names `internal/version`'s `Below` instead of the hub's `semver.go` (README WB2).
 
 ### 13.3 The screens (03-desktop-app draws them)
 
