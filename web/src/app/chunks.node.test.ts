@@ -10,7 +10,9 @@
 // - the share publisher: BrowserSharing, PublisherPC and BrowserShare (platform/browser/displayMedia.ts loads it),
 //   which must not ride along with the room's media chunk either: it waits for the first pick;
 // - the lazy namespaces of the catalog, which come with the folders that use them (05 §16.5). In Vitest the i18n
-//   module loads them all up front; a build must drop that branch (i18n/index.ts).
+//   module loads them all up front; a build must drop that branch (i18n/index.ts);
+// - M2 (docs/m2/03 §7.2): no module of @wailsio/runtime, platform/desktop/{wails,http,bindings}/, desktop/ or
+//   share/native/. DesktopPlatform itself is in the entry chunk (its own budget: platform/desktop/size.node.test.ts).
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -132,6 +134,14 @@ describe('the production build', () => {
     'viewer/ViewerLayout.tsx',
     'share/ShareSheet.tsx',
     'share/SharePanel.tsx',
+    // M2: the desktop app's pages (docs/m2/03 §7.5) and the bridge's transports (§7.2).
+    'desktop/index.ts',
+    'desktop/SetupPage.tsx',
+    'desktop/RelinkPage.tsx',
+    'desktop/SettingsPage.tsx',
+    'platform/desktop/wails/WailsBridge.ts',
+    'platform/desktop/http/HttpBridge.ts',
+    'platform/desktop/actions.ts',
   ])('loads %s on demand', (module) => {
     const holders = chunksWith(module);
     expect(holders).toHaveLength(1);
@@ -144,6 +154,36 @@ describe('the production build', () => {
     // (platform/browser/displayMedia.ts); add another file only if the shell needs it before a room is opened.
     const inShell = initialModules().filter((m) => /^(rooms|viewer|share|conntest)\//.test(m));
     expect(inShell.sort()).toEqual(['share/presets.ts']);
+  });
+
+  it('M2 (docs/m2/03 §7.2): DesktopPlatform is in the initial chunks, the Wails runtime and the desktop’s parts are not', () => {
+    const modules = initialModules();
+    expect(modules).toEqual(
+      expect.arrayContaining(['platform/detect.ts', 'platform/desktop/DesktopPlatform.ts', 'app/guards.tsx']),
+    );
+    // platform/desktop/{wails,http,bindings}/, desktop/ and share/native/: loaded on demand, inside the app only.
+    const desktopParts = modules.filter((m) =>
+      /^(platform\/desktop\/(wails|http|bindings)\/|desktop\/|share\/native\/)/.test(m),
+    );
+    expect(desktopParts).toEqual([]);
+    // No module of @wailsio/runtime at all (the package is outside src/, so look at every module id).
+    const wails = chunks
+      .filter((c) => initial.has(c.fileName))
+      .flatMap((c) => Object.keys(c.modules))
+      .filter((id) => id.includes(`${path.sep}@wailsio${path.sep}`) || id.includes('/@wailsio/'));
+    expect(wails).toEqual([]);
+  });
+
+  it('M2: the router loads desktop/ by import(), as a folder of its own', () => {
+    const desktop = chunkOf('desktop/index.ts');
+    expect(initial.has(desktop.fileName)).toBe(false);
+    expect(initialImportsOf(desktop)).toBe(1);
+    const loaded = folderChunks('desktop');
+    for (const module of ['desktop/SetupPage.tsx', 'desktop/RelinkPage.tsx', 'desktop/SettingsPage.tsx']) {
+      expect(chunksWith(module).every((file) => loaded.has(file))).toBe(true);
+    }
+    // Nothing of the room comes with it.
+    expect(loaded.has(chunkOf('rooms/index.ts').fileName)).toBe(false);
   });
 
   it('the router loads the room by import(), in one place: the branch that Vitest has is not in a build', () => {

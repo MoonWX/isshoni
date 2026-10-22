@@ -17,10 +17,12 @@ export interface AppScreenViewProps {
   /** For Offline: try again now. */
   onRetry?: () => void;
   retrying?: boolean;
+  /** For Offline in the desktop app (M2): go to Settings → Servers. */
+  onSwitchServer?: () => void;
 }
 
 /** Renders an AppScreen value (uiStore.screen, or boot's own). */
-export function AppScreenView({ screen, platform, onRetry, retrying = false }: AppScreenViewProps) {
+export function AppScreenView({ screen, platform, onRetry, retrying = false, onSwitchServer }: AppScreenViewProps) {
   switch (screen.kind) {
     case 'offline':
       return (
@@ -32,6 +34,7 @@ export function AppScreenView({ screen, platform, onRetry, retrying = false }: A
             })
           }
           retrying={retrying}
+          {...(onSwitchServer !== undefined ? { onSwitchServer } : {})}
         />
       );
     case 'needsHttps':

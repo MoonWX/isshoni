@@ -12,6 +12,20 @@
 //     a lazy chunk (05 §5), and the router that would load it only exists after this step. The two travel together.
 //  5. The QueryClient (seeded with info: app/info.ts, which pages read through useInfo()) and the router; render.
 //  6. After the first render, production builds only: register the service worker when the browser is idle.
+//
+// In the desktop app (M2, docs/m2/03 §7.2), the Platform has `desktop` features:
+//  - step 0 is unchanged (no desktop route has a fragment token);
+//  - step 1's secure-context check is the browser's only: the app's pages come from its own asset handler;
+//  - step 4: with no server yet (platform.desktop.server null) there is no /info to ask for: the router starts at
+//    /desktop/setup, or at the desktop page the app opened (desktopStartPath). The app's own pages (isDesktopPage)
+//    skip /info with a server too: they talk to the bridge only, so a link that opens the add step for a new server
+//    works while the active one is down (a deviation from §7.2's text, which asks for /info whenever there is a
+//    server). Otherwise /info is asked for as in the browser, through apiFetch (a Public route: without a link it
+//    goes without Authorization), and the Offline screen gains "Switch server", which opens the router at
+//    /desktop/settings#servers without /info. When Go refuses the token because the active server is incompatible
+//    (InfoResult 'incompatible'), the router starts at /desktop/setup, whose link step shows why, without retries;
+//  - the routes are the desktop's table (app/router.tsx: RouteTarget), and so is what step 4 preloads;
+//  - step 6 has nothing to do: platform.pwa is null.
 import { StrictMode, useCallback, useEffect, useRef, useState } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { I18nextProvider } from 'react-i18next';
@@ -27,11 +41,13 @@ import type { Info } from '../protocol/api.gen';
 import { ApiError, api, configureApi, isRetryableError } from '../protocol/rest';
 import { PageSpinner } from '../ui/Spinner';
 import { App } from './App';
+import { isIncompatibleServer } from './bridgeCodes';
 import { createAppServices, type AppServices } from './context';
+import { DesktopPaths, isDesktopPage } from './guards';
 import { seedInfo } from './info';
 import { clearMe } from './me';
 import { createQueryClient } from './queryClient';
-import { createAppRoutes, preloadRoute } from './router';
+import { createAppRoutes, defaultSources, preloadRoute, routeTargetOf } from './router';
 import { AppScreenView } from './screens';
 import { listenForLogout } from './session';
 import type { AppScreen } from './uiStore';
@@ -87,7 +103,9 @@ export function stashFragmentToken(
 export type InfoResult =
   | { readonly kind: 'ok'; readonly info: Info }
   | { readonly kind: 'offline' }
-  | { readonly kind: 'fatal'; readonly code: string };
+  | { readonly kind: 'fatal'; readonly code: string }
+  /** The desktop app only: Go gave no token, because the active server is incompatible (bridgeCodes.ts). */
+  | { readonly kind: 'incompatible' };
 
 function isInfo(v: unknown): v is Info {
   if (typeof v !== 'object' || v === null) return false;
@@ -98,7 +116,8 @@ function isInfo(v: unknown): v is Info {
 /**
  * GET /api/v1/info with retries: after each failure that may pass (no response, 5xx, server_busy, rate_limited)
  * it waits the next delay and tries again; when the delays run out it is offline. A failure that can't pass (4xx,
- * or a response that isn't Info) is fatal.
+ * or a response that isn't Info) is fatal. In the desktop app, a request that Go's incompatible_server kept from
+ * being sent is 'incompatible' at once: the server wasn't asked, and asking again changes nothing.
  */
 export async function loadInfo(
   retryDelaysMs: readonly number[] = INFO_RETRY_DELAYS_MS,
@@ -114,6 +133,10 @@ export async function loadInfo(
       return { kind: 'ok', info };
     } catch (err) {
       if (signal?.aborted) throw err;
+      if (isIncompatibleServer(err)) {
+        log.warn('GET /api/v1/info not sent: the active server is incompatible');
+        return { kind: 'incompatible' };
+      }
       if (!isRetryableError(err)) {
         log.error('GET /api/v1/info failed', { error: err });
         return { kind: 'fatal', code: err instanceof ApiError ? err.code : 'unknown' };
@@ -128,6 +151,15 @@ export async function loadInfo(
   }
 }
 
+/**
+ * Step 4 in the desktop app with no server yet (docs/m2/03 §7.2): the path the router starts at, or null to start
+ * where the app opened. The desktop app's own pages need no server (they talk to the bridge: the wizard with its
+ * ?add=, Settings); every other page does, /desktop itself included, so the app starts the wizard instead.
+ */
+export function desktopStartPath(loc: Pick<Location, 'pathname'>): string | null {
+  return isDesktopPage(loc.pathname) ? null : DesktopPaths.setup;
+}
+
 // ---- steps 4–5 in React ----
 
 export interface BootOptions {
@@ -140,37 +172,66 @@ export interface BootOptions {
   retryDelaysMs?: readonly number[];
   /** Default: OFFLINE_RETRY_MS. */
   offlineRetryMs?: number;
-  /** Default: createBrowserRouter (tests: createMemoryRouter). */
+  /**
+   * Default: createBrowserRouter, which starts at the page's location (tests: createMemoryRouter). Boot moves that
+   * location with `history` before it asks for the router (the desktop app's start path, "Switch server").
+   */
   createRouter?: (routes: RouteObject[]) => DataRouter;
-  /** Default: createAppRoutes(). */
+  /** Default: createAppRoutes() of the platform's RouteTarget. */
   routes?: () => RouteObject[];
   /**
    * Asks for the code of the page at a path, without waiting for it (step 4). Default: preloadRoute, which goes
-   * with the default routes; with a test's own `routes` nothing is asked for.
+   * with the default routes (of the platform's RouteTarget); with a test's own `routes` nothing is asked for.
    */
   preload?: (pathname: string) => void;
 }
 
-type Phase = { kind: 'loading' } | InfoResult;
+/**
+ * router: the app without /info (the desktop app with no server or on one of its own pages, after the Offline
+ * screen's Switch server, or with an incompatible server).
+ */
+type Phase = { kind: 'loading' } | Exclude<InfoResult, { kind: 'incompatible' }> | { kind: 'router' };
 
 /** Runs step 4 and shows its screens; on success builds the router (step 5) and renders the app. */
 function BootGate({
   services,
   path,
+  skipInfo,
   retryDelaysMs,
   offlineRetryMs,
   getRouter,
+  moveTo,
 }: {
   services: AppServices;
   path: string;
+  /** The desktop app with no server, or on one of its own pages: render the router at once, without /info. */
+  skipInfo: boolean;
   retryDelaysMs: readonly number[];
   offlineRetryMs: number;
   /** Creates the router on the first call and returns the same one after (StrictMode renders twice). */
   getRouter: () => DataRouter;
+  /**
+   * The desktop app: moves the location that the router, made next, starts at (the Offline screen's Switch server,
+   * an incompatible server). undefined in the browser.
+   */
+  moveTo: ((path: string) => void) | undefined;
 }) {
-  const [phase, setPhase] = useState<Phase>({ kind: 'loading' });
+  const [phase, setPhase] = useState<Phase>(skipInfo ? { kind: 'router' } : { kind: 'loading' });
   const [retrying, setRetrying] = useState(false);
   const running = useRef(false);
+  /** The router is there (or about to be): no answer of /info changes the phase any more. */
+  const routed = useRef(skipInfo);
+
+  /** The router, at path; the location moves only when nothing has made the router yet. */
+  const routeTo = useCallback(
+    (path: string): void => {
+      if (routed.current) return;
+      routed.current = true;
+      moveTo?.(path);
+      setPhase({ kind: 'router' });
+    },
+    [moveTo],
+  );
 
   const run = useCallback(
     async (delays: readonly number[]) => {
@@ -180,18 +241,27 @@ function BootGate({
       try {
         const result = await loadInfo(delays);
         if (result.kind === 'ok') seedInfo(services.queryClient, result.info);
+        // A try that answers after Switch server changes nothing: the router is there.
+        if (routed.current) return;
+        if (result.kind === 'incompatible') {
+          // The desktop app (the browser's apiFetch never gets here): the link step shows the version texts.
+          if (moveTo !== undefined) routeTo(DesktopPaths.setup);
+          else setPhase({ kind: 'fatal', code: 'incompatible_server' });
+          return;
+        }
         setPhase(result);
       } finally {
         running.current = false;
         setRetrying(false);
       }
     },
-    [services.queryClient],
+    [services.queryClient, moveTo, routeTo],
   );
 
   useEffect(() => {
+    if (skipInfo) return;
     void run(retryDelaysMs);
-  }, [run, retryDelaysMs]);
+  }, [run, retryDelaysMs, skipInfo]);
 
   // Offline: one more try on `online` and every offlineRetryMs (no inner retries: the interval is the backoff).
   const offline = phase.kind === 'offline';
@@ -218,6 +288,13 @@ function BootGate({
           platform={services.platform}
           onRetry={() => void run([])}
           retrying={retrying}
+          {...(moveTo !== undefined
+            ? {
+                onSwitchServer: () => {
+                  routeTo(DesktopPaths.servers);
+                },
+              }
+            : {})}
         />
       );
     case 'fatal':
@@ -226,6 +303,8 @@ function BootGate({
       if (phase.info.setupRequired && path !== '/setup') {
         return <AppScreenView screen={{ kind: 'notSetUp' }} platform={services.platform} />;
       }
+      return <App services={services} router={getRouter()} />;
+    case 'router':
       return <App services={services} router={getRouter()} />;
   }
 }
@@ -250,16 +329,18 @@ export function startApp(container: Element, opts: BootOptions = {}): StartedApp
   const history = opts.history ?? globalThis.history;
   // Step 2 (first, see the header), step 0, step 3.
   const platform = opts.platform ?? detectPlatform();
+  const desktop = platform.desktop ?? null;
   stashFragmentToken(loc, history, platform.storage.session);
   const i18n = initI18n();
   const root = createRoot(container);
 
-  // Step 1.
-  const early: AppScreen | null = !globalThis.isSecureContext
-    ? { kind: 'needsHttps' }
-    : typeof globalThis.RTCPeerConnection !== 'function'
-      ? { kind: 'unsupported' }
-      : null;
+  // Step 1. The secure context is the browser's check only (docs/m2/03 §7.2).
+  const early: AppScreen | null =
+    desktop === null && !globalThis.isSecureContext
+      ? { kind: 'needsHttps' }
+      : typeof globalThis.RTCPeerConnection !== 'function'
+        ? { kind: 'unsupported' }
+        : null;
   if (early) {
     root.render(
       <StrictMode>
@@ -284,25 +365,52 @@ export function startApp(container: Element, opts: BootOptions = {}): StartedApp
   const stopLogoutListener = listenForLogout(() => {
     clearMe(services.queryClient);
   });
-  // One router for the page's life, made once /info has answered (it starts loading the first route at once).
+  // The desktop app with no server yet: no /info, and the router starts at the wizard (desktopStartPath). Nor on
+  // one of the app's own pages, which need no server (see the header).
+  const skipInfo = desktop !== null && (desktop.server === null || isDesktopPage(loc.pathname));
+  let path = loc.pathname;
+  const start = desktop !== null && desktop.server === null ? desktopStartPath(loc) : null;
+  if (start !== null) {
+    history.replaceState(history.state, '', start);
+    path = start;
+  }
+  // One router for the page's life, made once /info has answered (it starts loading the first route at once), and
+  // at the page's location then: createBrowserRouter reads it.
   let router: DataRouter | null = null;
   const createRouter = opts.createRouter ?? createBrowserRouter;
-  const routes = opts.routes ?? createAppRoutes;
+  const target = routeTargetOf(platform);
+  const routes = opts.routes ?? (() => createAppRoutes(defaultSources(), target));
   const getRouter = (): DataRouter => (router ??= createRouter(routes()));
   // The first page's chunk, on its way before /info is asked for (BootGate's effect, after this render). Not while
   // the browser says it is offline: an import() that fails is not tried again by every browser, and the router's
   // own import of the same chunk, once the server is back, would fail with it.
-  const preload = opts.preload ?? (opts.routes === undefined ? preloadRoute : undefined);
-  if (isOnline()) preload?.(loc.pathname);
+  const preload =
+    opts.preload ??
+    (opts.routes === undefined
+      ? (pathname: string) => {
+          preloadRoute(pathname, defaultSources(), target);
+        }
+      : undefined);
+  if (isOnline()) preload?.(path);
+  // The desktop app: the Offline screen's "Switch server" starts the router at Settings → Servers, an incompatible
+  // server at the wizard's link step.
+  const moveTo =
+    desktop === null
+      ? undefined
+      : (to: string) => {
+          history.replaceState(history.state, '', to);
+        };
   root.render(
     <StrictMode>
       <I18nextProvider i18n={i18n}>
         <BootGate
           services={services}
-          path={loc.pathname}
+          path={path}
+          skipInfo={skipInfo}
           retryDelaysMs={opts.retryDelaysMs ?? INFO_RETRY_DELAYS_MS}
           offlineRetryMs={opts.offlineRetryMs ?? OFFLINE_RETRY_MS}
           getRouter={getRouter}
+          moveTo={moveTo}
         />
       </I18nextProvider>
     </StrictMode>,
