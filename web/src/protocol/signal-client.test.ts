@@ -15,11 +15,11 @@ import {
   ProtocolError,
 } from './errors';
 import {
+  AuthTimeoutMs,
   backoffDelay,
   BackoffMaxMs,
   BackoffMinMs,
   BackoffResetMs,
-  ConnectTimeoutMs,
   DropSocketCloseCode,
   isDevVersion,
   isStaleBuild,
@@ -1082,13 +1082,61 @@ describe('auth (M2: docs/m2/03 §7.3, 02 §11.8)', () => {
     expect(error).toHaveBeenCalledWith('SignalClient: auth() failed', expect.any(Error));
     await tick(1_000); // the second attempt (after 0.5–0.6 s) waits for an answer that never comes
     expect(c.state).toBe('connecting');
-    await tick(ConnectTimeoutMs - 300); // past its connect timeout, before the next attempt (0.8–1.2 s later)
+    await tick(AuthTimeoutMs - 300); // past its auth timeout, before the next attempt (0.8–1.2 s later)
     expect(c.state).toBe('backoff');
     expect(server.sockets).toHaveLength(0);
     await tick(BackoffMaxMs);
     expect(c.state).toBe('ready');
     expect(server.hellos.map((h) => h.auth)).toEqual([bearer('isa_t3')]);
   });
+
+  it('waits longer for auth than the desktop bridge waits for AccessToken (15 s)', async () => {
+    expect(AuthTimeoutMs).toBeGreaterThan(15_000);
+    const c = makeClient({
+      auth: () =>
+        new Promise((resolve) => {
+          setTimeout(() => {
+            resolve(bearer('isa_slow'));
+          }, 15_000);
+        }),
+    });
+    c.start();
+    await tick(15_000);
+    expect(c.state).toBe('ready');
+    expect(server.hellos.map((h) => h.auth)).toEqual([bearer('isa_slow')]);
+    expect(states()).toEqual(['connecting', 'handshaking', 'ready']);
+  });
+
+  it.each([
+    ['rejects', () => Promise.reject(new Error('server_unreachable'))],
+    ['outlasts the auth wait', () => new Promise<undefined>(() => undefined)],
+  ])(
+    'after unauthenticated, a forced call that %s leaves the refresh for the next attempt, which forces again',
+    async (_n, fail: () => Promise<P.HelloAuth | undefined>) => {
+      const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const calls: boolean[] = [];
+      const c = await readyClient({
+        auth: ({ forceRefresh }) => {
+          calls.push(forceRefresh);
+          if (calls.length === 2) return fail();
+          return Promise.resolve(bearer(`isa_t${String(calls.length)}`));
+        },
+      });
+      server.error(makeError(P.ErrorCodeUnauthenticated, P.ErrorScopeSession));
+      await tick(AuthTimeoutMs + BackoffMaxMs);
+      expect(calls).toEqual([false, true, true]);
+      expect(server.hellos.map((h) => h.auth)).toEqual([bearer('isa_t1'), bearer('isa_t3')]);
+      expect(server.hellos[1]?.resumeToken).toBeUndefined();
+      expect(c.state).toBe('ready');
+      expect(states()).not.toContain('stopped');
+      // The next attempt (a drop) asks without forceRefresh again.
+      server.drop();
+      await tick(BackoffMaxMs);
+      expect(c.state).toBe('ready');
+      expect(calls).toEqual([false, true, true, false]);
+      error.mockRestore();
+    },
+  );
 
   it.each([
     [

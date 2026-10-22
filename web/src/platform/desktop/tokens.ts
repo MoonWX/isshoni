@@ -76,9 +76,12 @@ export function createTokens(opts: TokensOptions): Tokens {
     get(force = false) {
       if (force || forceNext) {
         forceNext = false;
+        // A forced call in flight already cleared the cache: join it, so that its answer still fills the cache (two
+        // requests refused with the same token both force).
+        if (inFlight.forced) return inFlight.forced;
         // A forced call replaces whatever the cache or a plain call would give.
         clear();
-        return inFlight.forced ?? ask(true);
+        return ask(true);
       }
       if (cached !== null && now() < cached.expiresAt - TokenRenewBeforeMs) return Promise.resolve(cached.token);
       return inFlight.forced ?? inFlight.plain ?? ask(false);

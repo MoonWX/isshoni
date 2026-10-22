@@ -108,8 +108,9 @@ export interface Platform {
   readonly storage: { local: KeyValueStore; session: KeyValueStore };
   versionActions(): VersionActions;
   /**
-   * M2: the desktop app's features; null (or absent) in the browser. Optional, so that the M1 test platforms stay
-   * valid: read it as `platform.desktop ?? null`.
+   * M2: the desktop app's features; null (or absent) in the browser. Optional, so that the M1 test platforms (test/,
+   * rooms/, viewer/, account/) stay valid: read it as `platform.desktop ?? null`. docs/m2/03 §7.1 makes it required
+   * once every test platform sets `desktop: null` (WA32's blocked items).
    */
   readonly desktop?: DesktopFeatures | null;
 }
@@ -189,8 +190,10 @@ export interface PickedSource {
   /** native (M2): null (voice apps are kept out). */
   warning: 'screen-with-system-audio' | 'no-audio' | null;
   /**
-   * Owned by the provider. docs/m2/03 §7.1 makes it `MediaStream | null` (null for a native pick); that change comes
-   * with DesktopSharing (WA65), together with share/'s readers, which assume a stream today.
+   * Owned by the provider. docs/m2/03 §7.1 makes it `MediaStream | null` (null for a native pick). Not done yet:
+   * share/'s readers (BrowserSharing, BrowserShare, shareStore, SharePanel) and rooms/RoomPage assume a stream, and no
+   * slice's files cover both them and this one, so the change waits for the integrator to assign it (WA32's blocked
+   * items).
    */
   preview: MediaStream;
   /** M2, native: the picker's name for the source; shown on this PC only, never sent. */

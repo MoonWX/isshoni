@@ -225,6 +225,22 @@ describe('apiFetch (docs/m2/02 §11.8)', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it('returns the first 401, body intact, when the forced call fails (offline): the SPA 401 rule runs', async () => {
+    const { p, fake } = make();
+    fetchMock.mockImplementationOnce(() => {
+      fake.answers['auth.accessToken'] = () => Promise.reject(new BridgeError('server_unreachable'));
+      return Promise.resolve(refused('invalid_token'));
+    });
+    const res = await p.apiFetch('/api/v1/me');
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: { code: 'invalid_token' } });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fake.callsOf('auth.accessToken')).toEqual([
+      [ORIGIN, false],
+      [ORIGIN, true],
+    ]);
+  });
+
   it('rejects with the bridge error when Go cannot give a token (offline)', async () => {
     const { p, fake } = make();
     fake.answers['auth.accessToken'] = () => Promise.reject(new BridgeError('server_unreachable'));
@@ -474,6 +490,29 @@ describe('link interception (docs/m2/03 §5.5)', () => {
     expect(click(a, { button: 1 }, 'auxclick').defaultPrevented).toBe(true);
     expect(click(a, { button: 2 }, 'auxclick').defaultPrevented).toBe(false);
     expect(fake.callsOf('app.openExternal')).toEqual([['https://example.org/x']]);
+  });
+
+  it("opens the browser once when the link's own onClick opens it too, and again on a later click", async () => {
+    const { p, fake } = make();
+    const a = link('https://example.org/privacy', { target: '_blank', rel: 'noopener noreferrer' });
+    // What React's root listener does for AboutPage's ExternalLink outside the browser: bubble phase, after ours.
+    const root = (e: Event): void => {
+      e.preventDefault();
+      p.openExternal(a.href);
+    };
+    document.body.addEventListener('click', root);
+    try {
+      expect(click(a).defaultPrevented).toBe(true);
+      expect(fake.callsOf('app.openExternal')).toEqual([['https://example.org/privacy']]);
+      await new Promise((r) => setTimeout(r, 0)); // a later task: a separate click opens again
+      click(a);
+      expect(fake.callsOf('app.openExternal')).toEqual([
+        ['https://example.org/privacy'],
+        ['https://example.org/privacy'],
+      ]);
+    } finally {
+      document.body.removeEventListener('click', root);
+    }
   });
 
   it('turns window.open into openExternal and returns null', async () => {

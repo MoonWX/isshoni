@@ -105,11 +105,13 @@ export interface SignalClientOptions {
   /**
    * M2 (docs/m2/03 §7.3): before every hello, the resuming ones too, the client awaits auth({forceRefresh: false})
    * and puts the result into hello.auth (none for undefined). It is called before the socket opens, so the server's
-   * hello timeout never waits for it; a rejection or no answer within ConnectTimeoutMs fails that attempt like a failed
-   * connect. When a connection whose hello carried a token is stopped with a session-scope unauthenticated (01 §3.2),
-   * the client calls auth({forceRefresh: true}) once and reconnects as a new connection; a second unauthenticated
-   * before that connection has been ready for BackoffResetMs stops it as in M1. The browser gives none: its cookie
-   * authenticates the upgrade.
+   * hello timeout never waits for it; a rejection or no answer within AuthTimeoutMs (longer than the desktop bridge's
+   * own 15 s AccessToken budget, docs/m2/03 §20) fails that attempt like a failed connect. When a connection whose
+   * hello carried a token is stopped with a session-scope unauthenticated (01 §3.2), the client asks with
+   * forceRefresh: true and reconnects as a new connection; it keeps asking with forceRefresh in each attempt until one
+   * such call answers (a failed forced call doesn't use up the refresh). A second unauthenticated before that
+   * connection has been ready for BackoffResetMs stops it as in M1. The browser gives none: its cookie authenticates
+   * the upgrade.
    */
   auth?: HelloAuthProvider;
 }
@@ -130,6 +132,11 @@ export type StateListener = (state: SignalState, info: SignalStateInfo) => void;
 export const RequestTimeoutMs = 10_000;
 /** connecting: no open socket within this → backoff (a guard: a black-holed server could otherwise hang for long). */
 export const ConnectTimeoutMs = 10_000;
+/**
+ * opts.auth (M2): no answer within this → backoff. Longer than the desktop bridge's AccessToken budget (15 s,
+ * docs/m2/03 §20), so a slow forced refresh in Go is waited for rather than abandoned.
+ */
+export const AuthTimeoutMs = 20_000;
 /** handshaking: no welcome within this after the socket opened → backoff. */
 export const HandshakeTimeoutMs = 10_000;
 /** The ping interval when welcome.limits.pingIntervalMs is missing. */
@@ -290,7 +297,7 @@ export class SignalClient {
   #helloAuth: HelloAuth | undefined;
   /** The current socket's hello carried a token. */
   #bearer = false;
-  /** The next attempt asks opts.auth with forceRefresh. */
+  /** The next attempt asks opts.auth with forceRefresh; cleared once such a call answers. */
   #forceAuth = false;
   /** The forced refresh after an unauthenticated is spent, until a connection has been ready for BackoffResetMs. */
   #forcedRefreshUsed = false;
@@ -447,15 +454,16 @@ export class SignalClient {
     }
     // M2: the hello's token first, then the socket (opts.auth). The attempt is connecting meanwhile.
     const seq = ++this.#authSeq;
+    // #forceAuth stays set until a forced call answers: after a rejection or a timeout the next attempt forces again
+    // (Go refreshes at most once per 10 s and shares that refresh's token).
     const forceRefresh = this.#forceAuth;
-    this.#forceAuth = false;
     const current = (): boolean => seq === this.#authSeq && this.#state === 'connecting' && this.#ws === undefined;
     this.#attemptTimer.set(() => {
       if (current()) {
         this.#authSeq++;
         this.#enterBackoff({});
       }
-    }, ConnectTimeoutMs);
+    }, AuthTimeoutMs);
     this.#state = 'connecting';
     this.#emit('connecting', this.#downInfo());
     if (!current()) {
@@ -470,6 +478,7 @@ export class SignalClient {
     answer.then(
       (helloAuth) => {
         if (current()) {
+          this.#forceAuth = false;
           this.#openSocket(helloAuth ?? undefined, true);
         }
       },

@@ -74,6 +74,8 @@ export class DesktopPlatform implements Platform {
   private readonly tokens: Tokens;
   private readonly log = createLogger('desktop');
   private readonly disposeLinks: () => void;
+  /** The URL openExternal opened in this task (see there). */
+  private lastExternal: string | null = null;
 
   constructor(cfg: DesktopConfig, opts: DesktopPlatformOptions = {}) {
     const { app, server } = cfg;
@@ -153,7 +155,8 @@ export class DesktopPlatform implements Platform {
    * docs/m2/02 §11.8: a bearer from Auth.AccessToken(serverOrigin, false), credentials omitted; without a token (not
    * linked, or this page's server isn't active any more) the request goes without Authorization, so Public routes
    * (GET /info at boot) work and User routes get the server's own 401. A 401 invalid_token or unauthenticated to a
-   * request that carried a token gets one retry with a forced token; a second 401 goes to the caller.
+   * request that carried a token gets one retry with a forced token; a second 401 goes to the caller, and so does the
+   * first one when the forced call fails (offline): the SPA's 401 rule runs either way.
    */
   async apiFetch(path: `/api/${string}`, init: RequestInit = {}): Promise<Response> {
     if (this.serverOrigin === '') throw new Error('desktop: no active server');
@@ -177,7 +180,12 @@ export class DesktopPlatform implements Platform {
     const { code } = await apiErrorFromResponse(res.clone());
     if (code !== CodeInvalidToken && code !== CodeUnauthenticated) return res;
     this.tokens.rejected(token);
-    const fresh = await this.tokens.get(true);
+    let fresh: string | null;
+    try {
+      fresh = await this.tokens.get(true);
+    } catch {
+      return res;
+    }
     return fresh === null ? res : send(fresh);
   }
 
@@ -211,8 +219,23 @@ export class DesktopPlatform implements Platform {
     return null;
   }
 
-  /** App.OpenExternal: Go accepts https URLs only (docs/m2/03 §5.5); a refused URL is logged (its scheme) and dropped. */
+  /**
+   * App.OpenExternal: Go accepts https URLs only (docs/m2/03 §5.5); a refused URL is logged (its scheme) and dropped.
+   * One click can get here twice, from the link interception and from the link's own onClick, so a second call with
+   * the same URL in the same task is dropped.
+   */
   openExternal(url: string): void {
+    let key = url;
+    try {
+      key = new URL(url).href;
+    } catch {
+      // a relative URL: compared as it is
+    }
+    if (key === this.lastExternal) return;
+    this.lastExternal = key;
+    setTimeout(() => {
+      this.lastExternal = null;
+    }, 0);
     this.desktop.bridge.app.openExternal(url).catch((err: unknown) => {
       const scheme = /^([a-z][a-z\d+.-]*):/i.exec(url)?.[1] ?? '';
       this.log.warn('openExternal refused', { code: bridgeErrorCode(err) ?? 'unknown', scheme });

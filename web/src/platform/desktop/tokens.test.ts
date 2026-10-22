@@ -50,6 +50,23 @@ describe('tokens', () => {
     expect(got).toEqual(['isa_fake0001', 'isa_fake0001', 'isa_fake0001']);
     expect(fake.callsOf('auth.accessToken')).toHaveLength(1);
     await Promise.all([tokens.get(true), tokens.get(true), tokens.get()]);
+    // The joined forced call's answer is cached: the next plain call asks nothing.
+    expect(await tokens.get()).toBe('isa_fake0002');
+    expect(fake.callsOf('auth.accessToken')).toEqual([
+      [A, false],
+      [A, true],
+    ]);
+  });
+
+  it('two requests refused with the same token share one forced call, whose answer is cached', async () => {
+    const { fake, tokens } = setup();
+    const t = (await tokens.get()) ?? '';
+    tokens.rejected(t);
+    const first = tokens.get(true);
+    tokens.rejected(t); // the cache no longer holds it: nothing to do
+    const second = tokens.get(true);
+    expect(await Promise.all([first, second])).toEqual(['isa_fake0002', 'isa_fake0002']);
+    expect(await tokens.get()).toBe('isa_fake0002');
     expect(fake.callsOf('auth.accessToken')).toEqual([
       [A, false],
       [A, true],
