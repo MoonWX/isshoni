@@ -2,7 +2,6 @@ package fake
 
 import (
 	"testing"
-	"time"
 
 	"github.com/MoonWX/isshoni/internal/media"
 	"github.com/MoonWX/isshoni/internal/media/mediatest"
@@ -22,14 +21,13 @@ func TestConformanceSynthetic(t *testing.T) {
 // at the app's dev and e2e configuration (640×360, 03 §22.4), with the test tone as its audio.
 func TestConformanceDecodable(t *testing.T) {
 	t.Parallel()
-	o := mediatest.Options{Listed: true, TestTone: true, SkipBitrate: true}
 	if testing.CoverMode() != "" {
-		// decodable.go renders every sample in Go: with coverage counters (atomic under -race), a CI runner's first
-		// packets came 0.7 s and 1.4 s after Start (about 20 ms without them), and packets about 100 ms after
-		// their capture time. windows-go and desktop-macos run this without coverage, at the real bounds.
-		o.Slack = time.Second
+		// Conformance's checks run in real time, and decodable.go renders every sample in Go: with coverage counters
+		// (atomic under -race) a CI runner made the first packets 0.7–1.4 s after Start and 15 audio packets a
+		// second where 50 are due. windows-go and desktop-macos run this test without coverage.
+		t.Skip("real-time conformance checks; the jobs without coverage run them")
 	}
 	mediatest.Conformance(t, func(*testing.T) media.Engine {
 		return NewEngine(EngineConfig{Mode: Decodable, SourceSize: [2]int{640, 360}})
-	}, listed, o)
+	}, listed, mediatest.Options{Listed: true, TestTone: true, SkipBitrate: true})
 }
