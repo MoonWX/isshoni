@@ -555,7 +555,9 @@ func (s *Service) decideUserCode(ctx context.Context, p Principal, code string, 
 // DeviceToken serves both grants of POST /api/v1/device/token (#45). First device-token-ip (→ 429 rate_limited),
 // then the grant type (anything but device_code and refresh_token → 422 validation_failed {grantType: invalid}).
 // The device_code grant is deviceCodeGrant, the refresh_token grant (M2 02 §6.2) refreshTokenGrant (refresh.go),
-// whose answer to a reused token is a *RefreshReusedError that unwraps to invalid_grant {reason: reused}.
+// whose answer to a reused token is a *RefreshReusedError{UserID, DeviceID} that unwraps to *api.Error invalid_grant
+// {reason: reused}. The caller notifies {UserID}: devices when errors.As finds it (M2 02 §6.2, §8), then writes the
+// error as usual; neither ID reaches the client.
 func (s *Service) DeviceToken(ctx context.Context, in api.DeviceTokenRequest, m ReqMeta) (api.DeviceTokenResponse, error) {
 	if err := s.takeDeviceTokenIP(ctx, m); err != nil {
 		return api.DeviceTokenResponse{}, err

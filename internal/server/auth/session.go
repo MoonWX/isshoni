@@ -210,8 +210,9 @@ func (s *Service) resolve(ctx context.Context, token string) (store.Session, sto
 }
 
 // Touch is the hub's Revalidate (03 §7.4, §7.6) with M1's signature: TouchPrincipal without the principal it
-// returns. The wiring's Revalidate calls it (internal/server/wire.go, whose switch to TouchPrincipal comes with M2
-// README WA56).
+// returns. Touch keeps this signature: the principal-returning Touch of M2 02 §6.3 item 3 and §6.8 is TouchPrincipal.
+// The wiring's Revalidate calls it (internal/server/wire.go); M2 README WA56 switches wire.go's sessionService and
+// Revalidate to TouchPrincipal and copies DeviceName.
 func (s *Service) Touch(ctx context.Context, p Principal, ip netip.Addr) error {
 	_, err := s.TouchPrincipal(ctx, p, ip)
 	return err
