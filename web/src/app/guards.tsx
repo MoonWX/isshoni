@@ -20,6 +20,7 @@ import { queryKeys } from '../protocol/queryKeys';
 import { ApiError, isRetryableError } from '../protocol/rest';
 import { Button } from '../ui/Button';
 import { PageSpinner } from '../ui/Spinner';
+import { rejectionCode } from './bridgeCodes';
 import { useApp, usePlatform } from './context';
 import { useMeQuery } from './me';
 import { NotFound } from './NotFound';
@@ -36,6 +37,14 @@ export const DesktopPaths = {
   /** Settings → Servers: "Switch server" of the Offline screen. */
   servers: '/desktop/settings#servers',
 } as const;
+
+/**
+ * Whether a path is one of the desktop app's own pages (docs/m2/03 §7.5): they talk to the bridge only, so they need
+ * neither a server nor its /info (boot). Not /desktop itself, which is no page.
+ */
+export function isDesktopPage(pathname: string): boolean {
+  return /^\/desktop\/(?:setup|relink|settings)\/?$/.test(pathname);
+}
 
 /**
  * The path to return to after login, or "/" when the value is missing or unsafe: it must be a same-origin path,
@@ -98,15 +107,6 @@ export function desktopSignedOutPath(state: Pick<AuthState, 'status' | 'notice'>
     case 'offline':
       return null;
   }
-}
-
-/**
- * The code of a bridge call's rejection. The transports reject with a BridgeError (platform/desktop/errors.ts); its
- * code is read by shape, because importing errors.ts here would split it into one more chunk of the first page load.
- */
-function rejectionCode(err: unknown): string {
-  const code = (err as { code?: unknown } | null | undefined)?.code;
-  return typeof code === 'string' && code !== '' ? code : 'unknown';
 }
 
 /**

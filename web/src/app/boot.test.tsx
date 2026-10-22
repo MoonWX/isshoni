@@ -6,6 +6,7 @@ import { http, HttpResponse } from 'msw';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createMemoryRouter, useLocation, type RouteObject } from 'react-router';
 
+import { BridgeError } from '../platform/desktop/errors';
 import type { Platform } from '../platform/types';
 import type { Info } from '../protocol/api.gen';
 import { queryKeys } from '../protocol/queryKeys';
@@ -491,9 +492,20 @@ describe('M2: boot in the desktop app (docs/m2/03 §7.2)', () => {
     expect(desktopStartPath({ pathname: '/' })).toBe('/desktop/setup');
     expect(desktopStartPath({ pathname: '/r/lounge' })).toBe('/desktop/setup');
     expect(desktopStartPath({ pathname: '/login' })).toBe('/desktop/setup');
+    // /desktop itself is no page (NotFound), and neither is an unknown one.
     expect(desktopStartPath({ pathname: '/desktop' })).toBe('/desktop/setup');
+    expect(desktopStartPath({ pathname: '/desktop/' })).toBe('/desktop/setup');
+    expect(desktopStartPath({ pathname: '/desktop/nope' })).toBe('/desktop/setup');
     expect(desktopStartPath({ pathname: '/desktop/setup' })).toBeNull();
+    expect(desktopStartPath({ pathname: '/desktop/relink' })).toBeNull();
     expect(desktopStartPath({ pathname: '/desktop/settings' })).toBeNull();
+  });
+
+  it('no server yet, at /desktop/: the wizard, not an empty page', async () => {
+    const platform = createDesktopTestPlatform({ server: null }).platform;
+    const { urls } = mountDesktop({ path: '/desktop/', platform });
+    expect(await screen.findByRole('heading', { name: 'at /desktop/setup' })).toBeInTheDocument();
+    expect(urls).toEqual(['/desktop/setup']);
   });
 
   it('no server yet: no /info, and the router starts at /desktop/setup', async () => {
@@ -525,6 +537,72 @@ describe('M2: boot in the desktop app (docs/m2/03 §7.2)', () => {
     expect(await screen.findByRole('heading', { name: 'at /r/lounge' })).toBeInTheDocument();
     expect(fetchSpy).toHaveBeenCalledWith('/api/v1/info', expect.anything());
     expect(urls).toEqual([]);
+  });
+
+  it.each([
+    ['/desktop/setup', '?add=https%3A%2F%2Fnew.example.com'],
+    ['/desktop/settings', ''],
+    ['/desktop/relink', ''],
+  ])(
+    'with a server, the app’s own pages skip /info too: %s%s opens while the active server is down',
+    async (path, search) => {
+      let calls = 0;
+      server.use(
+        http.get(apiPath('/api/v1/info'), () => {
+          calls++;
+          return HttpResponse.error();
+        }),
+      );
+      const { urls, fetchSpy } = mountDesktop({ path, search });
+      expect(await screen.findByRole('heading', { name: `at ${path}${search}` })).toBeInTheDocument();
+      expect(urls).toEqual([]);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(calls).toBe(0);
+      expect(screen.queryByRole('heading', { name: "Can't reach the server" })).not.toBeInTheDocument();
+    },
+  );
+
+  it('with a server, /desktop itself is no page of the app’s: /info first, as for any other path', async () => {
+    const { fetchSpy } = mountDesktop({ path: '/desktop' });
+    expect(await screen.findByRole('heading', { name: 'at /desktop' })).toBeInTheDocument();
+    expect(fetchSpy).toHaveBeenCalledWith('/api/v1/info', expect.anything());
+  });
+
+  it('an incompatible active server (Go refuses the token): the router at /desktop/setup at once, no Offline screen', async () => {
+    // The app's own DesktopPlatform: its apiFetch asks Auth.AccessToken first, which rejects in this state
+    // (docs/m2/03 §6.2), so GET /info is never sent.
+    let calls = 0;
+    server.use(
+      http.get(apiPath('/api/v1/info'), () => {
+        calls++;
+        return HttpResponse.json(infoFixture());
+      }),
+    );
+    const d = createDesktopTestPlatform({ real: true });
+    d.fake.answers['auth.accessToken'] = () =>
+      Promise.reject(new BridgeError('incompatible_server', { verdict: 'update_app' }));
+    const { urls } = mountDesktop({ path: '/r/lounge', platform: d.platform });
+    expect(await screen.findByRole('heading', { name: 'at /desktop/setup' })).toBeInTheDocument();
+    expect(urls).toEqual(['/desktop/setup']);
+    expect(calls).toBe(0);
+    // One try: asking again changes nothing until the link step's Try again (Auth.Recheck).
+    expect(d.fake.callsOf('auth.accessToken')).toEqual([[d.platform.serverOrigin, false]]);
+    expect(screen.queryByRole('heading', { name: "Can't reach the server" })).not.toBeInTheDocument();
+  });
+
+  it('…and the same DesktopPlatform, linked: GET /info with the bearer, then the app where it opened', async () => {
+    const auth: (string | null)[] = [];
+    server.use(
+      http.get(apiPath('/api/v1/info'), ({ request }) => {
+        auth.push(request.headers.get('Authorization'));
+        return HttpResponse.json(infoFixture());
+      }),
+    );
+    const d = createDesktopTestPlatform({ real: true });
+    const { urls } = mountDesktop({ path: '/r/lounge', platform: d.platform });
+    expect(await screen.findByRole('heading', { name: 'at /r/lounge' })).toBeInTheDocument();
+    expect(urls).toEqual([]);
+    expect(auth).toEqual([`Bearer ${d.fake.issued[0] ?? ''}`]);
   });
 
   it('has no secure-context check: the app’s pages come from its own asset handler', async () => {

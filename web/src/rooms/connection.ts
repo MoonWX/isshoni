@@ -11,9 +11,9 @@
 //   to the SignalClient and to reloadIfStale is '' (isStaleBuild needs a non-empty one);
 // - a stop of this page's connection (C1) goes to platform.desktop.signalStopped() first: the app's Go side decides
 //   what it means for this server's link (Auth.SessionEnded, Auth.HelloRefused, with the page's serverOrigin), and
-//   the answer says what happens here: redial (once), relink (['me'] cleared, so RequireAuth follows the AuthState to
-//   the relink page), version (the VersionMismatch screen), wait (this server isn't active any more: the window
-//   reloads), or none (M1's reactions below).
+//   the answer says what happens here: redial (once, until a connection has stayed ready for BackoffResetMs),
+//   relink (['me'] cleared, so RequireAuth follows the AuthState to the relink page), version (the VersionMismatch
+//   screen), wait (this server isn't active any more: the window reloads), or none (M1's reactions below).
 import type { QueryClient } from '@tanstack/react-query';
 import { createStore, type StoreApi } from 'zustand/vanilla';
 
@@ -25,7 +25,13 @@ import { errorMessage } from '../lib/errorText';
 import { createLogger, type Logger } from '../lib/log';
 import type { DesktopFeatures, Platform } from '../platform/types';
 import type { ProtocolError } from '../protocol/errors';
-import { isStaleBuild, SignalClient, type SignalState, type SignalStateInfo } from '../protocol/signal-client';
+import {
+  BackoffResetMs,
+  isStaleBuild,
+  SignalClient,
+  type SignalState,
+  type SignalStateInfo,
+} from '../protocol/signal-client';
 import {
   ErrorCodeAccountDisabled,
   ErrorCodeClientOutdated,
@@ -364,11 +370,13 @@ export function createConnection(platform: Platform, stores: Stores, opts: Conne
   };
 
   /**
-   * The desktop app's one redial (docs/m2/03 §7.3): spent by a redial, given back by the next ready. A second
-   * "redial" before that gets M1's reactions instead (for session_revoked: ['me'] cleared, so the AuthState decides),
-   * so a server that keeps refusing a session Go calls linked can't make a loop.
+   * The desktop app's one redial (docs/m2/03 §7.3): spent by a redial, given back once a connection has stayed ready
+   * for BackoffResetMs, as the SignalClient does with its forced refresh. A second "redial" before that gets M1's
+   * reactions instead (for session_revoked: ['me'] cleared, so the AuthState decides), so a server that welcomes this
+   * PC and then refuses a session Go calls linked can't make a loop.
    */
   let canRedial = true;
+  let redialReset: ReturnType<typeof setTimeout> | undefined;
 
   /** The desktop app (docs/m2/03 §7.3, 02 §11.8): Go decides first; see the header. */
   const desktopStopped = (features: DesktopFeatures, error: ProtocolError): void => {
@@ -420,10 +428,18 @@ export function createConnection(platform: Platform, stores: Stores, opts: Conne
     const before = stores.connection.getState();
     const hadBanner = connectionBanner(before, Date.now()) !== null;
     before.signalChanged(state, info);
+    if (state !== 'ready') {
+      clearTimeout(redialReset);
+      redialReset = undefined;
+    }
     if (state === 'stopped') {
       stopped(info.error);
     } else if (state === 'ready') {
-      canRedial = true;
+      if (desktop !== null) {
+        redialReset ??= setTimeout(() => {
+          canRedial = true;
+        }, BackoffResetMs);
+      }
       // The banner is a live region, but its text just disappears: say that the outage is over (05 §16.6).
       if (hadBanner) ui.getState().announce(i18n.t('room.connection.reconnected'));
       // ready with staleBuild (05 §16.4) was dealt with when its welcome came: reloadIfStale().

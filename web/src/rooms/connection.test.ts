@@ -6,7 +6,7 @@ import { createDesktopTestPlatform, type DesktopTestPlatform } from '../app/test
 import type { AppScreen } from '../app/uiStore';
 import type { DesktopFeatures, SignalStopAction } from '../platform/types';
 import { queryKeys } from '../protocol/queryKeys';
-import { BackoffMaxMs } from '../protocol/signal-client';
+import { BackoffMaxMs, BackoffResetMs } from '../protocol/signal-client';
 import { makeError } from '../protocol/testing';
 import {
   connectionBanner,
@@ -559,16 +559,57 @@ describe('M2: in the desktop app (docs/m2/03 §7.2, §7.3; 02 §11.8)', () => {
     expect(screen()).toBeNull();
   });
 
-  it('the redial comes back with the next ready: a later revocation redials again', async () => {
+  it('a revocation right after the redialled welcome: M1’s reaction, not another redial (no loop)', async () => {
+    desktopPage();
+    await h.connect();
+    h.server.error(makeError('session_revoked', 'session'));
+    await tick();
+    expect(h.server.hellos).toHaveLength(2);
+    expect(connection().state).toBe('ready');
+    // Ready, but not yet for BackoffResetMs: the redial isn't back.
+    await tick(BackoffResetMs - 1);
+    h.server.error(makeError('session_revoked', 'session'));
+    await tick();
+    expect(d.fake.callsOf('auth.sessionEnded')).toHaveLength(2);
+    expect(h.server.hellos).toHaveLength(2);
+    expect(connection().state).toBe('stopped');
+    expect(me()).toBeNull();
+    expect(h.toasts()).toEqual(['You were signed out.']);
+  });
+
+  it('the redial comes back once a connection has stayed ready for BackoffResetMs: a later revocation redials again', async () => {
     desktopPage();
     await h.connect();
     h.server.error(makeError('session_revoked', 'session'));
     await tick();
     expect(connection().state).toBe('ready');
+    await tick(BackoffResetMs);
     h.server.error(makeError('session_revoked', 'session'));
     await tick();
     expect(h.server.hellos).toHaveLength(3);
     expect(connection().state).toBe('ready');
+    expect(me()).not.toBeNull();
+    expect(h.toasts()).toEqual([]);
+  });
+
+  it('a ready that ends before BackoffResetMs doesn’t count: its time isn’t added to the next one’s', async () => {
+    desktopPage();
+    await h.connect();
+    h.server.error(makeError('session_revoked', 'session'));
+    await tick();
+    expect(h.server.hellos).toHaveLength(2);
+    await tick(BackoffResetMs / 2);
+    // The network drops and the client comes back after its first backoff (0.5 s): a new ready, timed from now.
+    h.server.drop();
+    await tick(1_000);
+    expect(connection().state).toBe('ready');
+    expect(h.server.hellos).toHaveLength(3);
+    // Ready for 5 s and then for 9.5 s: neither stayed for BackoffResetMs.
+    await tick(BackoffResetMs - 1_000);
+    h.server.error(makeError('session_revoked', 'session'));
+    await tick();
+    expect(connection().state).toBe('stopped');
+    expect(me()).toBeNull();
   });
 
   it('one redial only: stopped again before ready, M1’s reaction (["me"] cleared, so the AuthState decides)', async () => {

@@ -649,6 +649,13 @@ describe('M2: the desktop app’s routes and guards (docs/m2/03 §7.5, §22.3)',
       expect(loaded).toEqual([]);
     });
 
+    it.each(['/desktop', '/desktop/'])('%s: NotFound, and desktop/ is never loaded', async (path) => {
+      const { loaded, sources } = folders();
+      renderRoute({ path, routes: createAppRoutes(sources, 'browser') });
+      expect(await screen.findByRole('heading', { name: 'Nothing here' })).toBeInTheDocument();
+      expect(loaded).toEqual([]);
+    });
+
     it('RequireDesktop on its own: NotFound for a platform without desktop features, even with the page loaded', async () => {
       const { sources } = folders();
       renderRoute({ path: '/desktop/settings', routes: createAppRoutes(sources, 'desktop') });
@@ -678,6 +685,16 @@ describe('M2: the desktop app’s routes and guards (docs/m2/03 §7.5, §22.3)',
       expect(await screen.findByRole('heading', { name: `desktop/${page}` })).toBeInTheDocument();
       expect(loaded).toEqual(['desktop']);
     });
+
+    it.each(['/desktop', '/desktop/'])(
+      '%s is no page: NotFound (not an empty layout), and nothing is loaded',
+      async (path) => {
+        const { loaded, sources } = folders();
+        renderDesktop(path, undefined, sources);
+        expect(await screen.findByRole('heading', { name: 'Nothing here' })).toBeInTheDocument();
+        expect(loaded).toEqual([]);
+      },
+    );
 
     it('the real desktop/ folder has every page: WA42’s stubs, "Not in this build yet"', async () => {
       const { router } = renderDesktop('/desktop/setup', undefined, defaultSources());
@@ -893,6 +910,47 @@ describe('M2: the desktop app’s routes and guards (docs/m2/03 §7.5, §22.3)',
       expect(router.state.location.pathname).toBe('/desktop/setup');
       expect(asked.count).toBe(0);
       expect(d.fake.calls).toEqual([]);
+    });
+
+    it('an incompatible active server: Go gives no token, so ["me"] is null with no request sent, and the link step shows why', async () => {
+      // The app's own DesktopPlatform: its apiFetch asks Auth.AccessToken first, which rejects in this state
+      // (docs/m2/03 §6.2), so /me is never sent and no 401 comes back.
+      const asked = meRequests(() => meFixture());
+      const d = createDesktopTestPlatform({ real: true });
+      d.setAuth('incompatible');
+      d.fake.answers['auth.accessToken'] = () =>
+        Promise.reject(new BridgeError('incompatible_server', { verdict: 'update_app' }));
+      const { router } = renderDesktop('/r/lounge', d);
+      expect(await screen.findByRole('heading', { name: 'desktop/SetupPage' })).toBeInTheDocument();
+      expect(router.state.location.pathname).toBe('/desktop/setup');
+      expect(asked.count).toBe(0);
+      expect(d.fake.callsOf('auth.accessToken')).toEqual([[d.platform.serverOrigin, false]]);
+      expect(screen.queryByRole('heading', { name: "Can't reach the server" })).not.toBeInTheDocument();
+    });
+
+    it('…while Go unreachable (server_unreachable) is still the Offline screen', async () => {
+      const asked = meRequests(() => meFixture());
+      const d = createDesktopTestPlatform({ real: true });
+      d.fake.answers['auth.accessToken'] = () => Promise.reject(new BridgeError('server_unreachable'));
+      renderDesktop('/r/lounge', d);
+      expect(await screen.findByRole('heading', { name: "Can't reach the server" })).toBeInTheDocument();
+      expect(asked.count).toBe(0);
+      expect(d.fake.callsOf('auth.state')).toEqual([]);
+    });
+
+    it('the real DesktopPlatform, linked: /me goes with the bearer, and the page shows', async () => {
+      const auth: (string | null)[] = [];
+      server.use(
+        http.get(apiPath('/api/v1/me'), ({ request }) => {
+          auth.push(request.headers.get('Authorization'));
+          return HttpResponse.json(meFixture());
+        }),
+      );
+      const d = createDesktopTestPlatform({ real: true });
+      renderDesktop('/r/lounge', d);
+      expect(await screen.findByRole('heading', { name: 'rooms/RoomPage' })).toBeInTheDocument();
+      expect(auth).toEqual([`Bearer ${d.fake.issued[0] ?? ''}`]);
+      expect(d.fake.issued).toHaveLength(1);
     });
 
     it('a signed-in user gets the page, and the bridge is not asked', async () => {

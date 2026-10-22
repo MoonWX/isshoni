@@ -296,6 +296,8 @@ export function createAppRoutes(
               path: 'desktop',
               Component: RequireDesktop,
               children: [
+                // /desktop itself is no page: NotFound, as in the browser (and as in M1), not an empty layout.
+                { index: true, Component: NotFound },
                 // The first-run wizard (§8.2): ?add=<origin> for a new server, ?link=1 after Auth.AddServer.
                 { path: 'setup', ...desktop.page('desktop', 'SetupPage') },
                 // The active server signed this PC out (§8.3).
