@@ -76,14 +76,28 @@
 //   - devicename.go: NormalizeDeviceName (PRECIS Nickname, 1–64 code points);
 //   - limiter.go: the device buckets and IPKey48.
 //
-// Device tokens (the refresh_token grant, bearer authentication, RenameDevice, RevokeOwnDevice and the bearer cases
-// of Touch, RevokeDevice and LogoutEverywhere) come with M2 README WA39; until then they return a not-implemented
-// error wrapping api internal (service.go).
+// Device tokens (docs/m2/02-device-auth.md §6; M2 README WA39):
+//   - refresh.go: the refresh_token grant of DeviceToken. Refresh tokens rotate on every use; a spent token that
+//     comes back revokes its device (device.refresh_reused, the refresh_token_reused alert, RefreshReusedError for
+//     httpapi's notification), except the client's retry of one refresh (the same exchangeId, any time) and a restart
+//     within 120 s of the spend (once), and in both cases only while the pair it was exchanged for is unused. A grace
+//     re-issue keeps the child it replaces as a spent row, so that a second holder who presents it trips reuse
+//     detection;
+//   - bearer.go: AuthenticateBearerToken and Authenticate's bearer path (the header's grammar and the token's shape
+//     checked before any hashing or DB access, then a 30 s cache that never outlives the token), the bearer
+//     principal with DeviceName, the device half of TouchPrincipal (Touch keeps M1's signature for the wiring) with
+//     its 5-minute last-seen write, and the after-commit steps of a device's revocation: the bearer cache forgets the
+//     device, or the user (forgetUser), before ConnCloser runs;
+//   - selfservice.go: RenameDevice (device.renamed {from, to}), RevokeOwnDevice (the app's sign-out) and the bearer
+//     cases of RevokeSession, RevokeDevice and LogoutEverywhere, with loadCaller (revoke.go) checking a device's
+//     principal inside the Write. The calls only a web session makes (Logout, ChangePassword, DeleteSelf,
+//     RevokeOtherSessions) refuse a bearer with forbidden {credential: session}.
 //
 // A call that acts for an account takes a store.Actor and reads that account inside its own transaction (actingAs
 // in service.go): the CLI acts as an admin, a user actor has the role its row has at that moment, and an account
 // that is gone or not active is forbidden. A self-service call takes the request's Principal and reads the account
-// and the caller's session the same way (loadSelf): without a live session it is unauthenticated.
+// and the caller's session the same way (loadSelf), or for a device's principal its device (loadCaller): without a
+// live session or device it is unauthenticated.
 //
 // The janitor (README S70; janitor.go): RunJanitor prunes the expired rows of §4.7 through store.DB.Prune at startup
 // and then every hour, until its context ends.

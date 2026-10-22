@@ -18,8 +18,8 @@ import (
 // (StartDeviceFlow), a logged-in friend looks it up and approves or denies it in the browser (LookupUserCode,
 // DecideUserCode), and the app's polls of the device_code grant (DeviceToken) collect the answer: a new device with
 // its first access and refresh token pair. The in-app password fallback (devicepassword.go) shares the grant's
-// success steps (linkDevice). The refresh_token grant, bearer authentication and the device calls of the Devices
-// page come with README WA39.
+// success steps (linkDevice). The refresh_token grant is refresh.go, bearer authentication bearer.go, and the device
+// calls of the Devices page are in selfservice.go (README WA39).
 
 // Audit actions written here (M2 02 §8). device.revoked {via: "cap"} is auditDeviceRevoked (selfservice.go).
 const (
@@ -33,11 +33,13 @@ const (
 const scopeDeviceLookup = "device_lookup"
 
 // The via of the device audit rows (M2 02 §8). linkedViaDeviceFlow and linkedViaPassword are also the values of
-// devices.linked_via.
+// devices.linked_via; the revokedVia values are device.revoked's.
 const (
-	linkedViaDeviceFlow = "device_flow"
-	linkedViaPassword   = "password"
-	revokedViaCap       = "cap"
+	linkedViaDeviceFlow  = "device_flow"
+	linkedViaPassword    = "password"
+	revokedViaCap        = "cap"
+	revokedViaDevicePage = "devices_page" // the owner removed it on the Devices page (DELETE /me/devices/{id})
+	revokedViaApp        = "app"          // the app signed itself out (POST /device/revoke, or its own ID there)
 )
 
 // device_codes.status values (03 §5).
@@ -149,7 +151,7 @@ func newDeviceTokenPair() (access, refresh string) {
 }
 
 // deviceHash is the stored form of a device code, a normalized user code, an access or refresh token (the whole
-// string, prefix included) and (WA39) an exchange id: HMAC-SHA-256 with the session key (M2 02 §3), so a changed
+// string, prefix included) and an exchange id: HMAC-SHA-256 with the session key (M2 02 §3), so a changed
 // session key invalidates exactly these and the sessions (03 §4.6). The shapes of the four kinds differ, and each
 // lives in its own table or kind, so one key serves them all.
 func (k Keys) deviceHash(s string) []byte { return keyedHash(k.Session, s) }
@@ -552,8 +554,8 @@ func (s *Service) decideUserCode(ctx context.Context, p Principal, code string, 
 
 // DeviceToken serves both grants of POST /api/v1/device/token (#45). First device-token-ip (→ 429 rate_limited),
 // then the grant type (anything but device_code and refresh_token → 422 validation_failed {grantType: invalid}).
-// The device_code grant is deviceCodeGrant. The refresh_token grant (M2 02 §6.2) comes with README WA39; until then
-// it is a not-implemented error that wraps internal.
+// The device_code grant is deviceCodeGrant, the refresh_token grant (M2 02 §6.2) refreshTokenGrant (refresh.go),
+// whose answer to a reused token is a *RefreshReusedError that unwraps to invalid_grant {reason: reused}.
 func (s *Service) DeviceToken(ctx context.Context, in api.DeviceTokenRequest, m ReqMeta) (api.DeviceTokenResponse, error) {
 	if err := s.takeDeviceTokenIP(ctx, m); err != nil {
 		return api.DeviceTokenResponse{}, err
@@ -562,7 +564,7 @@ func (s *Service) DeviceToken(ctx context.Context, in api.DeviceTokenRequest, m 
 	case api.GrantTypeDeviceCode:
 		return s.deviceCodeGrant(ctx, in.DeviceCode, m)
 	case api.GrantTypeRefreshToken:
-		return api.DeviceTokenResponse{}, notImplemented("DeviceToken (refresh_token grant)")
+		return s.refreshTokenGrant(ctx, in, m)
 	}
 	return api.DeviceTokenResponse{}, validationFailed(map[string]string{fieldGrantType: FieldInvalid})
 }
@@ -726,16 +728,13 @@ func (s *Service) linkDevice(q *store.Q, user store.User, d store.Device, access
 }
 
 // deviceLinked runs the steps after a link's commit: the info line "device linked" (user_id, device_id, via; never
-// the name, M2 02 §8), then the evicted devices' connections closed with ReasonDeviceRevoked (03 §7.7's order: the
-// commit first). README WA39's bearer cache forgets the evicted devices before ConnCloser runs.
+// the name, M2 02 §8), then the evicted devices leave the bearer cache and their connections are closed with
+// ReasonDeviceRevoked (devicesRevoked; 03 §7.7's order: the commit first).
 func (s *Service) deviceLinked(ctx context.Context, ld linkedDevice) {
 	s.log.LogAttrs(ctx, slog.LevelInfo, "device linked", slog.String("user_id", string(ld.user.ID)),
 		slog.String("device_id", string(ld.device.ID)), slog.String("via", ld.via))
-	if s.conns == nil {
-		return
-	}
 	for _, ev := range ld.evicted {
-		s.conns.CloseConnections(ConnSelector{UserID: ld.user.ID, DeviceID: ev.ID}, ReasonDeviceRevoked)
+		s.devicesRevoked(ld.user.ID, ev.ID)
 	}
 }
 

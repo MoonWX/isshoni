@@ -511,9 +511,10 @@ func TestLogout(t *testing.T) {
 	}
 
 	wantCode(t, e.svc.Logout(context.Background(), Principal{Method: MethodSession}, meta(ipC)), api.CodeUnauthenticated)
+	// A device signs out with RevokeOwnDevice (M2 02 §6.5); Logout is for web sessions.
 	err = e.svc.Logout(context.Background(), Principal{UserID: alex.ID, Method: MethodBearer, DeviceID: "d1d1d1d1d1d1"}, meta(ipC))
-	if !api.IsCode(err, api.CodeInternal) || !strings.Contains(err.Error(), "not implemented") {
-		t.Errorf("Logout of a device (M2): %v", err)
+	if ae := wantCode(t, err, api.CodeForbidden); ae.Params[api.ParamCredential] != "session" {
+		t.Errorf("Logout of a device: %+v, want forbidden {credential: session}", ae)
 	}
 }
 

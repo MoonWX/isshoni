@@ -16,7 +16,8 @@ import (
 )
 
 // Web sessions (03 §7.4): the cookie, the lookup with its 30 s cache, the use bookkeeping, the daily token rotation
-// and the after-commit steps of a revocation (03 §7.7). The CSRF wrapper of 03 §7.5 is here too.
+// and the after-commit steps of a revocation (03 §7.7). The CSRF wrapper of 03 §7.5 is here too, and Authenticate
+// and TouchPrincipal, which hand a device's credential to bearer.go (M2 02 §6.1, §6.3).
 
 // Session limits of 03 §7.4 and §14.
 const (
@@ -122,16 +123,18 @@ func (s *Service) CSRF(next http.Handler) http.Handler {
 
 // ---- authentication ----
 
-// Authenticate returns the caller of a REST request: the session cookie in M1 (bearer tokens in M2). A missing,
-// invalid or expired credential, or a user who is not active, is *api.Error{unauthenticated}. In M1 so is any
-// Authorization header (03 §7.5): httpapi's /api/v1 chain already answers such a request with 401 before its CSRF
-// step, on every route, and Authenticate rejects the header too for any other caller.
+// Authenticate returns the caller of a REST request (03 §7.4; M2 02 §6.1). A request with an Authorization header
+// takes the bearer path and its cookies are not read: the header must be exactly one bearer access token of a live
+// device whose user is active, else *api.Error{invalid_token} (authenticateBearer in bearer.go). A request without
+// one takes the session cookie: a missing, invalid or expired session, or a user who is not active, is
+// *api.Error{unauthenticated}.
 //
-// It also records the use (03 §7.4 "Touch"): last_seen_at, last_ip and idle_expires_at, at most once per 5 minutes
-// per session and best effort. It never rotates the token; the REST chain calls MaybeRotate for that.
+// It also records the use (03 §7.4 "Touch"; M2 02 §6.1): a session's last_seen_at, last_ip and idle_expires_at, or
+// a device's last_seen_at and last_ip, at most once per 5 minutes and best effort. It never rotates the token; the
+// REST chain calls MaybeRotate for that, which does nothing for a device.
 func (s *Service) Authenticate(r *http.Request) (Principal, error) {
 	if _, ok := r.Header["Authorization"]; ok {
-		return Principal{}, errUnauthenticated()
+		return s.authenticateBearer(r)
 	}
 	tok, ok := s.cookie.read(r)
 	if !ok {
@@ -206,21 +209,42 @@ func (s *Service) resolve(ctx context.Context, token string) (store.Session, sto
 	return sess, user, nil
 }
 
-// Touch is the hub's Revalidate (03 §7.4, §7.6). On every call it checks, from the cache or with a read, that the
-// session exists, is unexpired and belongs to an active user, and returns *api.Error{unauthenticated} otherwise:
-// that is the only error that means the credential is gone, and the hub keeps the connection on any other. It then
-// records the use at most once per 5 minutes; that write is best effort, so its failure is logged and never
-// returned. A 2-hour session therefore never idles out. (M2: a bearer principal checks its device row.)
+// Touch is the hub's Revalidate (03 §7.4, §7.6) with M1's signature: TouchPrincipal without the principal it
+// returns. The wiring's Revalidate calls it (internal/server/wire.go, whose switch to TouchPrincipal comes with M2
+// README WA56).
 func (s *Service) Touch(ctx context.Context, p Principal, ip netip.Addr) error {
-	if p.Method != MethodSession || p.UserID == "" || p.SessionID == "" {
-		return errUnauthenticated() // no devices before M2
+	_, err := s.TouchPrincipal(ctx, p, ip)
+	return err
+}
+
+// TouchPrincipal is the hub's Revalidate (03 §7.4, §7.6; M2 02 §6.3 item 3), Touch as M2 02 §6.8 has it: it returns
+// the principal. On every call it checks, from the cache or with a read, that the credential is still there, and
+// returns *api.Error{unauthenticated} otherwise: that is the only error that means the credential is gone, and the
+// hub keeps the connection on any other. It then records the use at most once per 5 minutes; that write is best
+// effort, so its failure is logged and never returned. A 2-hour session therefore never idles out.
+//
+//   - A session principal: its session exists, is unexpired and belongs to an active user. The principal comes back
+//     unchanged.
+//   - A bearer principal: its device exists, is the principal's user's, and that user is active. The principal comes
+//     back as the rows have it now, with the device's current name in DeviceName (a rename on the Devices page
+//     reaches open connections this way) and the user's current name and role. An access token's expiry does not
+//     matter here: a connection lives until its device is revoked (M2 02 §6.3).
+func (s *Service) TouchPrincipal(ctx context.Context, p Principal, ip netip.Addr) (Principal, error) {
+	switch p.Method {
+	case MethodSession:
+		if p.UserID == "" || p.SessionID == "" {
+			return Principal{}, errUnauthenticated()
+		}
+		sess, err := s.sessionOf(ctx, p)
+		if err != nil {
+			return Principal{}, err
+		}
+		s.recordUse(ctx, sess, ip)
+		return p, nil
+	case MethodBearer:
+		return s.touchDevice(ctx, p, ip)
 	}
-	sess, err := s.sessionOf(ctx, p)
-	if err != nil {
-		return err
-	}
-	s.recordUse(ctx, sess, ip)
-	return nil
+	return Principal{}, errUnauthenticated()
 }
 
 // sessionOf finds the principal's live session of an active user, from the cache or with a read.
@@ -310,7 +334,8 @@ func (s *Service) recordUse(ctx context.Context, sess store.Session, ip netip.Ad
 // The decision is re-checked inside the write, so of several parallel requests with an old token exactly one
 // rotates; the others keep the old token, which the browser replaces when that one response arrives. The rotation
 // also counts as a use: Max-Age is a fresh 30 days (or what is left of the 180). A failure is logged and the request
-// goes on with its current token; the next request tries again.
+// goes on with its current token; the next request tries again. A bearer principal has no cookie, and MaybeRotate
+// does nothing for it (M2 02 §6.1): a device's tokens rotate through the refresh_token grant.
 func (s *Service) MaybeRotate(w http.ResponseWriter, p Principal) {
 	if p.Method != MethodSession || p.SessionID == "" {
 		return

@@ -21,9 +21,10 @@ import (
 //   - a user's credentials as a whole: the revocation values below. A Write calls apply, and revocationCommitted
 //     runs the steps after the commit.
 //
-// The M2 rows (revoking one device, a replayed refresh token) come with the device flow; RevokeDevice
-// (selfservice.go) already takes one device away. A role change or a rename closes nothing: the hub is told through
-// httpapi's Signal.UserChanged, and auth only invalidates the session cache (UpdateUser in admin.go).
+// The M2 rows (M2 02 §6.5: revoking one device, the app's own sign-out, the device cap's eviction, a replayed refresh
+// token) take one device each: their Write deletes that row, and devicesRevoked (bearer.go) runs the steps after the
+// commit, the bearer cache first. A role change or a rename closes nothing: the hub is told through httpapi's
+// Signal.UserChanged, and auth only invalidates the session and bearer caches (UpdateUser in admin.go).
 
 // revocation is one row of the table of 03 §7.7 for an event that revokes a user's credentials as a whole.
 //
@@ -121,8 +122,8 @@ func (rv revocation) deleted(user store.UserID) revoked {
 }
 
 // revocationCommitted runs the steps of 03 §7.7 that follow the commit of a revocation's Write. First the session
-// cache forgets the user, so that no request is let in on a cached row (the session the rule kept is read again at
-// its next use). Then the user's connections are closed with the row's reason:
+// and bearer caches forget the user (forgetUser), so that no request is let in on a cached row (the session the rule
+// kept is read again at its next use). Then the user's connections are closed with the row's reason:
 //   - a row that takes everything closes all of them: ConnSelector{UserID};
 //   - a row that takes everything but the caller's session keeps that session's connections:
 //     ConnSelector{UserID, ExceptSessionID};
@@ -130,7 +131,7 @@ func (rv revocation) deleted(user store.UserID) revoked {
 //     selector each, like the session cap. A selector that excepts one session would also match the connections of
 //     the user's devices (M2), which that row keeps.
 func (s *Service) revocationCommitted(r revoked) {
-	s.sessions.invalidateUser(r.user)
+	s.forgetUser(r.user)
 	if s.conns == nil {
 		return
 	}
@@ -147,8 +148,11 @@ func (s *Service) revocationCommitted(r revoked) {
 
 // self is the caller of a self-service call as the database has it.
 type self struct {
-	user    store.User
+	user store.User
+	// session is the caller's web session; the zero Session for a device's principal (loadCaller).
 	session store.Session
+	// device is the caller's device for a device's principal (loadCaller); the zero Device for a web session.
+	device store.Device
 	// sessions are all session rows of the account, the caller's included, the most recently seen first (expired
 	// ones the janitor has not pruned yet included).
 	sessions []store.Session
@@ -183,6 +187,30 @@ func loadSelf(q *store.Q, p Principal, now time.Time) (self, error) {
 		}
 	}
 	return self{}, errUnauthenticated()
+}
+
+// loadCaller is loadSelf for the calls of User routes, which a device may make too (M2 02 §6.4): a session
+// principal is loadSelf's; for a bearer principal the account must be active and the device must still exist and
+// be the account's, else *api.Error{unauthenticated} (a device revoked, or its user disabled, a moment ago changes
+// nothing). me.session is then the zero Session and me.device the caller's device.
+func loadCaller(q *store.Q, p Principal, now time.Time) (self, error) {
+	if p.Method != MethodBearer {
+		return loadSelf(q, p, now)
+	}
+	dev, user, err := q.DeviceByID(p.DeviceID)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return self{}, errUnauthenticated()
+	case err != nil:
+		return self{}, err
+	case dev.UserID != p.UserID || user.Status != store.StatusActive:
+		return self{}, errUnauthenticated()
+	}
+	sessions, err := q.ListSessions(user.ID)
+	if err != nil {
+		return self{}, err
+	}
+	return self{user: user, device: dev, sessions: sessions}, nil
 }
 
 // sessionNamed returns the row with that ID from a user's session list.

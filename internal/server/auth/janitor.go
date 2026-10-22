@@ -18,9 +18,10 @@ const janitorEvery = time.Hour
 //
 // Each run is one store.DB.Prune at the service's clock: expired sessions (their push subscriptions go with them),
 // setup tokens and reset links, invites that stopped working more than 30 days ago, pending sign-ups older than
-// 14 days (each with a user.signup_expired audit row, actor system, in the same transaction), M2's device codes and
-// tokens, and audit rows older than 30 days; then the store's upkeep (a passive WAL checkpoint, and PRAGMA optimize
-// once a day). Nothing else follows a run:
+// 14 days (each with a user.signup_expired audit row, actor system, in the same transaction), M2's device codes,
+// devices without a live refresh token (each with a device.expired row, M2 02 §6.7) and tokens, and audit rows older
+// than 30 days; then the store's upkeep (a passive WAL checkpoint, and PRAGMA optimize once a day). The debug line of
+// a run counts each kind, the expired devices included; it names no row. Nothing else follows a run:
 //   - no connection is closed and the session cache is left alone: an expired session is no credential any more
 //     wherever it is looked at, and the hub finds a live connection's expired session at its next Revalidate
 //     (03 §7.6, §7.7);
@@ -64,6 +65,7 @@ func pruneAttrs(st store.PruneStats) []slog.Attr {
 		slog.Int("invites", st.Invites),
 		slog.Int("pending", st.Pending),
 		slog.Int("device_codes", st.DeviceCodes),
+		slog.Int("devices", st.Devices),
 		slog.Int("device_tokens", st.DeviceTokens),
 		slog.Int("audit", st.Audit),
 	}
