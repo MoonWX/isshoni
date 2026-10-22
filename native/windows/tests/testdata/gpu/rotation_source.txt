@@ -1,0 +1,23 @@
+# gpu_warp_test's rotation source (README WA33): a 128x64 frame as Desktop Duplication hands it over, in the panel's
+# own orientation, in 8x8 blocks. The red "F" sits at the top left, so each of rotation_90/180/270.txt shows where
+# the converters must put it (04 section 7.9: ROTATE90 turns the frame 90 degrees clockwise).
+size 128 64
+scale 8
+palette
+k FF000000
+w FFFFFFFF
+r FFE02020
+g FF20C040
+b FF2040E0
+y FFF0E020
+c FF20D0E0
+m FFD040C0
+pixels
+rrrrkkkkkkkkwwww
+rbbbkkkkkkkkwggw
+rbkkkkkkkkkkwggw
+rbbbkkkkyyyywwww
+rbkkkkkkyyyycccc
+rbkkkkkkkkkkcmmc
+rkkkkkkkkkkkcmmc
+kkkkkkkkkkkkcccc
