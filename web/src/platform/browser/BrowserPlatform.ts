@@ -45,6 +45,8 @@ export class BrowserPlatform implements Platform {
   readonly notifications: NotificationsProvider;
   readonly pwa: PwaProvider | null;
   readonly storage: { local: KeyValueStore; session: KeyValueStore };
+  /** The desktop app's features (M2): none in a browser. */
+  readonly desktop = null;
   readonly #env: DeviceEnv;
 
   constructor(opts: BrowserPlatformOptions = {}) {

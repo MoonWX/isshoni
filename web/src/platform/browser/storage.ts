@@ -61,6 +61,24 @@ export function createWebStorage(kind: WebStorageKind, storage: Storage | null =
   };
 }
 
+/**
+ * The keys in localStorage or sessionStorage, for a cleanup by prefix (the desktop's per-server keys, docs/m2/03
+ * §14.3); [] when storage is unavailable. Values a write kept in memory aren't listed: they go with the page.
+ */
+export function listWebStorageKeys(kind: WebStorageKind, storage: Storage | null = webStorage(kind)): string[] {
+  if (!storage) return [];
+  const keys: string[] = [];
+  try {
+    for (let i = 0; i < storage.length; i++) {
+      const k = storage.key(i);
+      if (k !== null) keys.push(k);
+    }
+  } catch {
+    // blocked mid-way: the keys read so far
+  }
+  return keys;
+}
+
 /** An in-memory KeyValueStore (tests, and platforms without Web Storage). */
 export function createMemoryStorage(initial?: Record<string, string>): KeyValueStore {
   const memory = new Map<string, string>(Object.entries(initial ?? {}));
