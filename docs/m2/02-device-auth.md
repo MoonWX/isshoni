@@ -1420,6 +1420,9 @@ so it never shows. Store methods take no context: each is a local call that neve
 - `CredEnumerateW(Prefix + "*", 0, …)` for `List`; `ERROR_NOT_FOUND` → empty.
 - `ERROR_NO_SUCH_LOGON_SESSION` (1312), which a process without a loaded profile gets → `ErrUnavailable`.
 - Every other Win32 error is wrapped with its number (`credstore: CredWriteW: 0x…`), never with the blob.
+- The store's `CredWriteW`, `CredReadW`, `CredDeleteW` and `CredEnumerateW` calls run one at a time (a package
+  mutex): on windows-2025, one of eight concurrent `CredWriteW` calls returned success but the credential was missing;
+  the app writes only at sign-in and token rotation.
 - Threat model, stated in `docs/security.md`: any process running as the same Windows user can read the credential
   (DPAPI binds it to the user's logon), as it can read browser cookies; `LOCAL_MACHINE` keeps it off other PCs a
   roaming profile reaches.

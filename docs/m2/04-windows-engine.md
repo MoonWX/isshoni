@@ -1900,6 +1900,9 @@ func (s *session) SetAudioBitrate(bps int) error                  // im_set_audi
 func (s *session) PCMTap() <-chan PCMChunk                        // buffered 128; nil unless AudioConfig.TapPCM
 ```
 
+- **`SourceDetail` in the code** (README §3 item 29): `internal/media/native/types.go` (WA10) still declares
+  `MonitorID`, `CapturePath` and `OSBorder` beside `Mapped` and `Window`; WA23, which owns the package next, drops them
+  (or the integrator does at group 3's merge). The struct above is the target.
 - **One session at a time** (README §3 item 28): `Start` returns `media.ErrBusy` while a session it started runs,
   whatever the configs (01 §5.1, §5.3; the core's one-share rule D12; Conformance check 9). `StartExtra` skips that
   check and runs up to the DLL's 4 video-only sessions (§6.4; audio is one session per process, and the DLL answers a

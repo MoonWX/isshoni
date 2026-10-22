@@ -396,8 +396,8 @@ font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-s
 | Status bar (link preview) | off | none needed |
 | Swipe navigation, pinch zoom | off | `touch-action` in CSS |
 | External drop (a dropped file or link navigates) | off | the SPA cancels `dragover` and `drop` on `document` |
-| User data folder | `%LOCALAPPDATA%\isshoni\WebView2`, expanded to an absolute path once at start; the same string (no trailing separator) is `audio.SelfInfo.WebViewDataDir` (§6.1) | environment variable (W13) |
-| Additional browser arguments | `--autoplay-policy=no-user-gesture-required` (viewer audio plays without the "tap to unmute"; 05 §10.3's unlock then never shows) | environment variable (W13) |
+| User data folder | `%LOCALAPPDATA%\isshoni\WebView2`, expanded to an absolute path once at start; the same string (no trailing separator) is `audio.SelfInfo.WebViewDataDir` (§6.1) | none at beta.34: Wails overwrites the variable in every build (W13); the app sets it through `WindowsOptions` (`WebviewUserDataPath`) |
+| Additional browser arguments | `--autoplay-policy=no-user-gesture-required` (viewer audio plays without the "tap to unmute"; 05 §10.3's unlock then never shows) | none at beta.34: Wails overwrites the variable in every build (W13); the app sets it through `WindowsOptions` (`AdditionalBrowserArgs`) |
 
 - **Environment scrub.** Before `application.New` (Wails reads its updater-helper variables there, WebView2 reads
   `WEBVIEW2_*` when the window's environment is created), production builds unset every environment variable whose
@@ -597,8 +597,9 @@ Wiring in `main.go` (first instance, §13.4 step 7):
   app.OnAuthState})`. `<data dir>` is `%LOCALAPPDATA%\isshoni` (§14.1): every per-PC file under one folder, which
   06's `--purge-data` removes; the Credential Manager entries it points to don't roam either.
 - `audio.New(engine.(media.AudioController), settingsStore, audio.SelfInfo{PID: uint32(os.Getpid()),
-  WebViewDataDir: <the same absolute, expanded path given to WebView2 (W13 option or env fallback), no trailing
-  separator>, Exe: os.Executable()}, log)`; `App.Run` starts `Service.Run(ctx)`, `Quit` calls `Service.Close()`.
+  WebViewDataDir: <the same absolute, expanded path given to WebView2 (`WindowsOptions.WebviewUserDataPath`, W13),
+  no trailing separator>, Exe: os.Executable()}, log)`; `App.Run` starts `Service.Run(ctx)`, `Quit` calls
+  `Service.Close()`.
 - `update.New(update.Options{CurrentVersion: version.Version(), Enabled: func() bool { return
   settings.Updates().Check && !update.PolicyDisabled() }, Channel: func() update.Channel { return
   settings.Updates().Channel }, WizardDone: settings.WizardDone, DataDir: <data dir>, Logger: log})`; `App.Run`
@@ -2301,9 +2302,10 @@ debugging port and a temporary `%LOCALAPPDATA%`, and attaches with `chromium.con
 through `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`**: at beta.34 Wails overwrites that variable (and
 `WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER`) in every build (§5.4), e2e builds included. WA72 adds an e2e-only path instead:
 `flavor_e2e.go` reads the port from an e2e-only variable or flag and appends `--remote-debugging-port=<port>` to
-Wails' `WindowsOptions.AdditionalBrowserArgs`, next to the autoplay argument; no other build compiles that file. It checks W1–W3, W5, W7, W9 (observable rows), W13, W16; then a device-flow link
-approved by a second browser context, a fake share seen by a Chrome viewer, close-to-tray while live (the window
-hides, the share continues), and Quit (share ended, process exited 0 within 3 s). W21: from the page, raw runtime
+Wails' `WindowsOptions.AdditionalBrowserArgs`, next to the autoplay argument; no other build compiles that file
+(README WA72). The spec checks W1–W3, W5, W7, W9 (observable rows), W13, W16; then a device-flow link approved by a
+second browser context, a fake share seen by a Chrome viewer, close-to-tray while live (the window hides, the share
+continues), and Quit (share ended, process exited 0 within 3 s). W21: from the page, raw runtime
 requests built as the pinned runtime builds them for `Browser.OpenURL('ms-settings:display')`,
 `Browser.OpenURL('search-ms:query=x')`, `Clipboard.Text()` and `Window.Hide()` get 403, no Settings or search window
 opens (no new top-level window of `SystemSettings.exe` or `SearchHost.exe` appears) and the main window stays

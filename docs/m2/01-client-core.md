@@ -20,7 +20,9 @@ truth for product decisions; the M1 specs are the record of what exists.
 `docs/m1/01-protocol.md` §8.10; "M1 01 §3.2" only stresses it). `02 §…` to `06 §…` and bare numbers
 are the **M2** specs (`04 §12` is `docs/m2/04-windows-engine.md` §12, `03` is `docs/m2/03-desktop-app.md`). The M1
 specs 02–06 carry an **M1** prefix (`M1 02 §9.1` is `docs/m1/02-sfu.md` §9.1, `M1 05 §13.7` is
-`docs/m1/05-web-client.md` §13.7). `README §3` is `docs/m1/README.md` §3 and `S88` an M1 slice.
+`docs/m1/05-web-client.md` §13.7). `README §3` is `docs/m1/README.md` §3 and `S88` an M1 slice, except that a
+numbered `README §3 item N` and the slice ids `README WAnn`/`WBn` are `docs/m2/README.md` (M1's §3 has no numbered
+items).
 
 Every item is marked **M2**, or **later (M3/M4/M5)** when M2 only leaves room for it.
 
@@ -1332,11 +1334,11 @@ type OwnConnection struct {
 ### 10.5 The publish PCs' settings (SFU)
 
 M1's `SettingEngine` for publish PCs (`internal/server/sfu/api.go`, `pubSettings`) stays as built, with one M2 change
-(README §3 item 31, WA28): `SetSRTPReplayProtectionWindow(4096)` (and the SRTCP window where Pion's API needs it), a
-local constant citing D7 and §8.4, so a plain retransmission from the native publisher's 4096-packet NACK responder is
-accepted however far behind the newest packet of its SSRC it is, up to 4096. Only the publish PCs get it; subscribe and
-probe PCs keep Pion's default. WA28's test sends, through `sfutest.FaultConn`, a retransmission more than 64 and up
-to 4096 packets behind and sees it accepted (§14).
+(README §3 item 31, WA28): `SetSRTPReplayProtectionWindow(4096)`, a local constant citing D7 and §8.4, so a plain
+retransmission from the native publisher's 4096-packet NACK responder is accepted however far behind the newest packet
+of its SSRC it is, up to 4096. Only the publish PCs get it; subscribe and probe PCs keep Pion's default, and the SRTCP
+window stays Pion's default on every PC (repairs are RTP). WA28's test sends, through `sfutest.FaultConn`, a
+retransmission more than 64 and up to 4096 packets behind and sees it accepted (§14).
 
 ## 11. The client core (`internal/client/core`, M2)
 
